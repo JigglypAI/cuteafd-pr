@@ -1616,6 +1616,8 @@ impl ReplayDrafter for DsparkDrafter<'_> {
         vec![ReplayMode { name: self.representation.name(), legacy_fp8: None }]
     }
 
+    fn context_window(&self) -> Option<usize> { self.cfg.window }
+
     fn context(&self, taps: &[u8], first: usize) -> Result<()> {
         let n = taps.len() / (self.cfg.taps.len() * self.cfg.hidden * 2);
         self.put_taps(taps)?;

@@ -165,6 +165,13 @@ impl PrefixFamily for MiniMaxPrefix<'_> {
         *placement = next;
         Ok(())
     }
+    fn capture_meta(&self, placement: &Placement, len: usize) -> Result<(), BoxError> {
+        // Reject before the cache reserves mark/pages or evicts an older entry.
+        if self.0.draft.as_ref().is_some_and(|draft| !draft.complete(placement.slot, len)) {
+            return Err("MiniMax incomplete draft window cannot be snapshotted".into());
+        }
+        Ok(())
+    }
     fn capture(&self, mark: MarkSlot, placement: &Placement, len: usize) -> Result<(), BoxError> {
         self.validate(placement, len)?;
         if len != placement.len { return Err("MiniMax capture is not at the committed frontier".into()); }

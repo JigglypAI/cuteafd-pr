@@ -66,6 +66,36 @@ mod tests {
     }
 
     #[test]
+    fn flash_serial_packed_and_replay_keep_original_chunks_and_ring_bytes() {
+        let (window, prompt_end) = (2048, 8192);
+        // Flash serial calls keep the last TAP_ROWS, packed calls use each
+        // segment's tap offset, and replay ingests TAP_ROWS from its origin.
+        for (origin, chunk, tap_offset) in [(0, 2048, 0), (137, 511, 79), (0, 257, 0)] {
+            let mut full = vec![0u64; window];
+            let mut candidate = full.clone();
+            let mut position = origin;
+            while position < prompt_end {
+                let count = chunk.min(prompt_end - position);
+                let keep = retain_context_chunk(Some(window), position..position + count, prompt_end);
+                for row in 0..count {
+                    let payload = ((position + row + 1) as u64) << 32
+                        | ((count as u64) << 16) | (tap_offset + row) as u64;
+                    full[(position + row) % window] = payload;
+                    if keep { candidate[(position + row) % window] = payload; }
+                }
+                position += count;
+            }
+            assert_eq!(full, candidate, "origin={origin} chunk={chunk} tap_offset={tap_offset}");
+        }
+        let flash = include_str!("../families/glm5_flash/serve.rs");
+        assert!(flash.contains("prefill_packed_draft_ends(&mut sequences, &draft_ends"));
+        assert!(flash.contains("drafter.retain_context_chunk(first..first + n, draft_end)"));
+        assert!(flash.contains("drafter.retain_context_chunk(end - n..end, draft_context_end(p, p.done))"));
+        let replay = include_str!("speculation/dflash.rs");
+        assert!(replay.contains("retain_context_chunk(drafter.context_window(), done..done + n, p)"));
+    }
+
+    #[test]
     fn whole_chunk_ingest_matches_full_ring_and_preserves_shapes() {
         let window = 4096;
         for end in [17, window, window + 1, 8192, 65536] {
