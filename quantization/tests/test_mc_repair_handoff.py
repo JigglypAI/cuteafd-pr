@@ -80,10 +80,13 @@ def setup(tmp_path):
         selected = Path(args[1]); relative = selected.relative_to('/hf-home/hub')
         local = hub / relative
         entries=[]
-        for path in local.iterdir():
+        for path in (local.iterdir() if local.is_dir() else [local]):
             if path.is_dir():entries.append(dict(name=path.name, kind='directory'));continue
-            entries.append(dict(name=path.name, kind='regular', size=path.stat().st_size,
-                                sealed=True, writing_on=None, hosts=['raptor']))
+            if path.is_symlink():
+                entries.append(dict(name=path.name,kind='symlink',size=len(os.readlink(path)),sealed=False,writing_on=None,hosts=[]))
+            else:
+                entries.append(dict(name=path.name, kind='regular', size=path.stat().st_size,
+                                    sealed=True, writing_on=None, hosts=['raptor']))
         return {'entries':entries}
     return dict(publication=receipt, root=root, hub=hub, call=call, calls=calls,
                 published=published, model=model, parent=parent, delta=delta)
@@ -196,7 +199,7 @@ def test_existing_alias_wrong_inode_fails_closed(setup):
     original=source.resolve(); original.rename(original.with_name(original.name+'.old'))
     original.write_bytes(b'old weights')
     source.unlink(); source.symlink_to(os.path.relpath(original.with_name(original.name+'.old'),source.parent))
-    with pytest.raises(ValueError,match='different inode'):run(s)
+    with pytest.raises(ValueError,match='OID inode differs'):run(s)
     assert (s['model']/'refs/main').read_text()==s['published']['parent_revision']
 
 
@@ -224,3 +227,32 @@ def test_unowned_stage_and_changed_recovery_receipt_fail_closed(setup):
     s['published']['identity']['source_revision']='unreviewed-change'
     dump(s['publication'],s['published'])
     with pytest.raises(ValueError,match='recovery identity differs'):run(s)
+
+
+def test_native_global_content_id_can_differ_from_hub_oid(setup):
+    s=setup
+    # SparkNest repository blobs/HF-OID entries may themselves alias a global
+    # native object. That native content ID is not a Hugging Face checksum.
+    global_blobs=s['hub']/'blobs/native';global_blobs.mkdir(parents=True)
+    for index,path in enumerate((s['model']/'blobs').iterdir()):
+        native=global_blobs/('native-content-'+str(index))
+        path.rename(native)
+        path.symlink_to(os.path.relpath(native,path.parent))
+        assert path.resolve().name!=path.name
+    real=s['call']
+    def import_global(*args,**kwargs):
+        result=real(*args,**kwargs)
+        if args[:2]==('hf','import'):
+            for index,path in enumerate((s['model']/'blobs').iterdir()):
+                if path.is_symlink():continue
+                native=global_blobs/('imported-native-'+str(index))
+                path.rename(native)
+                path.symlink_to(os.path.relpath(native,path.parent))
+        return result
+    s['call']=import_global
+    result=run(s)
+    assert result['status']=='passed'
+    for name,info in s['published']['files'].items():
+        path=Path(result['snapshot'])/name
+        assert path.samefile(s['model']/'blobs'/info['oid'])
+        assert path.resolve().name!=info['oid']

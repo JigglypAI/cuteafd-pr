@@ -114,15 +114,18 @@ def _local_sources(published, receipt):
 
 
 def _parent_sources(published, hub, local_names):
-    snapshot = hub / ('models--' + published['repo_id'].replace('/', '--')) / 'snapshots' / published['parent_revision']
+    repo = hub / ('models--' + published['repo_id'].replace('/', '--'))
+    snapshot = repo / 'snapshots' / published['parent_revision']
     inherited = {}
     for name in published['files'].keys() - local_names:
         path = snapshot / name
         resolved = path.resolve(strict=True)
         md = path.stat()
+        oid_alias = repo / 'blobs' / published['files'][name]['oid']
         if (not below(resolved, hub) or not stat.S_ISREG(md.st_mode)
-                or md.st_size != published['files'][name]['bytes']):
-            raise ValueError('managed parent file missing or size differs: ' + name)
+                or md.st_size != published['files'][name]['bytes']
+                or not oid_alias.samefile(path)):
+            raise ValueError('managed parent size or HF OID inode differs: ' + name)
         inherited[name] = dict(path=str(path), file_identity=file_identity(path), device=md.st_dev)
     return inherited
 
@@ -254,28 +257,30 @@ def _verify(published, hub, namespace, inherited, call):
     actual = {p.relative_to(snapshot).as_posix() for p in snapshot.rglob('*') if p.is_file() or p.is_symlink()}
     if actual != wanted.keys():
         raise ValueError('complete managed snapshot inventory differs')
-    seen = set()
-    for directory in sorted({str(Path(name).parent) for name in wanted}):
-        selection = namespace / repo_name / 'snapshots' / published['revision'] / directory
-        for row in call('ls', selection, timeout=120)['entries']:
-            if row.get('kind') == 'directory':
-                continue
-            name = (Path(directory) / row['name']).as_posix()
-            relative(name)
-            if (name not in wanted or name in seen or row.get('kind') != 'regular'
-                    or row.get('size') != wanted[name]['bytes'] or row.get('sealed') is not True
+    checked = set()
+    for name, expected in sorted(wanted.items()):
+        path = snapshot / name
+        resolved = path.resolve(strict=True)
+        oid_alias = hub / repo_name / 'blobs' / expected['oid']
+        if (path.stat().st_size != expected['bytes'] or not below(resolved, hub)
+                or not path.samefile(oid_alias)):
+            raise ValueError('managed file OID alias or size differs: ' + name)
+        if name in inherited and not path.samefile(inherited[name]['path']):
+            raise ValueError('inherited snapshot does not retain the same native inode')
+        # Snapshot entries are HF symlinks: their own size/sealed/hosts describe
+        # the link, not its weight. Query the resolved native object instead.
+        # Its content ID is SparkNest's identity, not the Hub LFS/Git OID.
+        if resolved not in checked:
+            selection = namespace / resolved.relative_to(hub)
+            entries = call('ls', selection, timeout=120)['entries']
+            if len(entries) != 1:
+                raise ValueError('native resolved object inventory differs: ' + name)
+            row = entries[0]
+            if (row.get('name') != resolved.name or row.get('kind') != 'regular'
+                    or row.get('size') != expected['bytes'] or row.get('sealed') is not True
                     or row.get('writing_on') is not None or not row.get('hosts')):
-                raise ValueError('native sealed file inventory differs: ' + name)
-            path = snapshot / name
-            if (path.stat().st_size != wanted[name]['bytes']
-                    or not below(path.resolve(strict=True), hub)
-                    or path.resolve(strict=True).name != wanted[name]['oid']):
-                raise ValueError('managed file OID alias or size differs: ' + name)
-            if name in inherited and not path.samefile(inherited[name]['path']):
-                raise ValueError('inherited snapshot does not retain the same native inode')
-            seen.add(name)
-    if seen != wanted.keys():
-        raise ValueError('native snapshot inventory is incomplete')
+                raise ValueError('native sealed object inventory differs: ' + name)
+            checked.add(resolved)
     return snapshot
 
 
