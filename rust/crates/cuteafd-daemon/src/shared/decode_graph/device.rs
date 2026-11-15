@@ -98,8 +98,15 @@ pub(crate) struct Snapshot {
     pub physical_floor: u64,
     pub reserve_policy: Option<cuteafd_loader::placement::graph_reserve::Resolved>,
     pub charged: u64,
+    /// Measured growth shares held by live executables, excluding estimates and
+    /// ghosts. A lower bound after allocator reuse, not physical arena residency.
+    pub live_bytes: u64,
+    /// ARC occupancy including reuse-backed owners and pinned graphs.
+    pub resident_bytes: u64,
+    pub hard_stopped: bool,
+    pub native_pools: NativePools,
     /// Current untracked level relative to the attach seed. Unlike `charged`
-    /// (a monotone high-water that admission and eviction depend on), this can
+    /// (the physical arena high-water retained for admission), this can
     /// fall, so a transient peak that reverses releases its credit.
     pub level: Option<u64>,
     pub pinned: u64,
@@ -139,6 +146,7 @@ struct Record {
     identity: Identity,
     cycle: Cycle,
     bytes: u64,
+    estimate: u64,
     list: Option<List>,
     previous: Option<u64>,
     next: Option<u64>,
@@ -155,6 +163,12 @@ struct Record {
     oom_warned: bool,
     permanently_eager: bool,
     stats: Box<KeyStats>,
+}
+
+impl Record {
+    fn ordering_bytes(&self) -> u64 {
+        self.bytes.max(self.estimate)
+    }
 }
 
 const HIT_INTERVAL_MS: u64 = 10_000;
@@ -239,10 +253,17 @@ pub(crate) struct Pools {
     pub exec_high_water: u64,
 }
 
+#[derive(Default, Clone, Debug, serde::Serialize)]
+pub(crate) struct NativePools {
+    pub live_nodes: u64,
+    pub live_execs: u64,
+    pub unknown_execs: u64,
+}
+
 fn may_capture(preference: Preference, estimate: u64, headroom: u64, reserve: u64,
-    arena: u64, pending_growth: u64, pending: u64, reuse: bool) -> bool {
+    charged: u64, pending_growth: u64, pending: u64, reuse: bool) -> bool {
     if preference == Preference::Eager || estimate.saturating_add(headroom) > reserve { return false }
-    reserve.saturating_sub(arena.saturating_add(pending_growth)) >= estimate.saturating_add(headroom)
+    reserve.saturating_sub(charged.saturating_add(pending_growth)) >= estimate.saturating_add(headroom)
         || (reuse && pending == 0)
 }
 
@@ -516,6 +537,7 @@ pub(crate) struct DeviceCache {
     reserve: u64,
     reserve_policy: Option<cuteafd_loader::placement::graph_reserve::Resolved>,
     charged: u64,
+    live_bytes: u64,
     level: Option<u64>,
     physical_floor: u64,
     physical_sample: Option<(Instant, u64, u64)>,
@@ -582,7 +604,7 @@ pub(crate) fn seal_cross_device_capture_on_this_thread(sealed: bool) {
 
 impl DeviceCache {
     fn new(device: i32, reserve: u64) -> Self {
-        Self { device, reserve, reserve_policy: None, charged: 0, level: None, pending_bytes: 0, next_id: 0, next_bank: 0, identity_generation: 0, recovery_generation: 0,
+        Self { device, reserve, reserve_policy: None, charged: 0, live_bytes: 0, level: None, pending_bytes: 0, next_id: 0, next_bank: 0, identity_generation: 0, recovery_generation: 0,
             physical_floor: 0, physical_sample: None, physical_floor_warned: false,
             floor_resample_pending: false, floor_resample_used: false,
             recent_target: 0, records: HashMap::new(), identities: HashMap::new(),
@@ -644,7 +666,7 @@ impl DeviceCache {
         if !self.physical_floor_warned {
             tracing::warn!(device = self.device, free, estimate, headroom, floor = self.physical_floor,
                 reserve = self.reserve, charged = self.charged,
-                "physical graph headroom below floor while graph reserve has slack; memory accounting probably has a missing owner; running eagerly");
+                "physical graph headroom below floor; running eagerly");
             self.physical_floor_warned = true;
         }
         if !self.floor_resample_used {
@@ -657,7 +679,7 @@ impl DeviceCache {
     fn unlink(&mut self, id: u64) {
         let record = &self.records[&id];
         let Some(list) = record.list else { return };
-        let (previous, next, bytes) = (record.previous, record.next, record.bytes);
+        let (previous, next, bytes) = (record.previous, record.next, record.ordering_bytes());
         if let Some(previous) = previous { self.records.get_mut(&previous).unwrap().next = next; }
         if let Some(next) = next { self.records.get_mut(&next).unwrap().previous = previous; }
         let queue = &mut self.queues[list.index()];
@@ -675,7 +697,7 @@ impl DeviceCache {
         let last = queue.last;
         queue.last = Some(id);
         if queue.first.is_none() { queue.first = Some(id); }
-        queue.bytes = queue.bytes.saturating_add(self.records[&id].bytes);
+        queue.bytes = queue.bytes.saturating_add(self.records[&id].ordering_bytes());
         queue.len += 1;
         if let Some(last) = last { self.records.get_mut(&last).unwrap().next = Some(id); }
         let record = self.records.get_mut(&id).unwrap();
@@ -684,7 +706,7 @@ impl DeviceCache {
 
     fn forget(&mut self, id: u64) {
         self.unlink(id);
-        if let Some(record) = self.records.remove(&id) { self.identities.remove(&record.identity); self.identity_generation += 1; }
+        if let Some(record) = self.records.remove(&id) { self.live_bytes = self.live_bytes.saturating_sub(record.bytes); self.identities.remove(&record.identity); self.identity_generation += 1; }
     }
 
     fn trim_ghosts(&mut self) {
@@ -726,6 +748,24 @@ impl DeviceCache {
     #[cfg(test)]
     pub fn cycle_hits(&self, cycle: Cycle) -> u64 {
         self.counters.get(&cycle).map_or(0, |counters| counters.hits)
+    }
+
+    fn native_pools(&self) -> NativePools {
+        let mut pools = NativePools::default();
+        for record in self.records.values().filter(|r| !r.permanently_eager &&
+            (r.pending_capture || r.pinned || r.pending_destroy || matches!(r.list, Some(List::Recent | List::Frequent)))) {
+            pools.live_execs += 1;
+            if let Some(nodes) = record.stats.native_nodes {
+                pools.live_nodes = pools.live_nodes.saturating_add(nodes);
+            } else { pools.unknown_execs += 1; }
+        }
+        pools
+    }
+
+    fn resident_bytes(&self) -> u64 {
+        self.records.values().filter(|r| !r.pending_capture && (r.pinned || r.pending_destroy
+            || matches!(r.list, Some(List::Recent | List::Frequent)))).fold(0u64,
+                |bytes, r| bytes.saturating_add(r.ordering_bytes()))
     }
 
     fn estimate(&self, site: Site, node_estimate: Option<u64>) -> (u64, u64) {
@@ -791,6 +831,18 @@ impl DeviceCache {
             return Miss::Eager;
         }
         let old = self.identities.get(&identity).copied();
+        // A bank must retire its old executable before recapturing this identity.
+        // Re-entering would replace its ticket while the native owner stays live.
+        if old.is_some_and(|id| {
+            let r = &self.records[&id];
+            r.pinned || r.pending_destroy || r.pending_capture || matches!(r.list, Some(List::Recent | List::Frequent))
+        }) {
+            let record = self.records.get_mut(&old.unwrap()).unwrap();
+            record.stats.event(site.cycle, 1);
+            record.stats.misses += 1;
+            self.counters.entry(site.cycle).or_default().eager_runs += 1;
+            return Miss::Eager;
+        }
         if let Some(record) = old.and_then(|id| self.records.get_mut(&id)) {
             if record.permanently_eager {
                 record.stats.event(site.cycle, 1);
@@ -810,6 +862,16 @@ impl DeviceCache {
                 }
                 record.oom = None;
             }
+        }
+        // The measured hard stop admits no new tickets, even nominal reuse.
+        // Destruction cannot return driver arena bytes or clear this stop.
+        if self.charged >= self.reserve {
+            if let Some(record) = old.and_then(|id| self.records.get_mut(&id)) {
+                record.stats.event(site.cycle, 1);
+                record.stats.misses += 1;
+            }
+            self.counters.entry(site.cycle).or_default().eager_runs += 1;
+            return Miss::Eager;
         }
         let (estimate, headroom) = self.estimate(site, node_estimate.as_ref().map(|e| e.bytes));
         let ghost = old.and_then(|id| self.records[&id].list)
@@ -879,12 +941,12 @@ impl DeviceCache {
                 self.next_id += 1;
                 let id = self.next_id;
                 self.identities.insert(identity.clone(), id);
-                self.records.insert(id, Record { identity, cycle: site.cycle, bytes: 0, list: None,
+                self.records.insert(id, Record { identity, cycle: site.cycle, bytes: 0, estimate, list: None,
                     previous: None, next: None, pinned, pending_destroy: false, pending_capture: false, frequent: false, nodes, node_rate: metadata.node_rate, graph_rate: metadata.graph_rate, parallel_width: metadata.parallel_width, spans_devices: site.spans_devices, oom: None, oom_warned: false, permanently_eager: false, stats: KeyStats::new(now) });
                 id
             };
             let record = self.records.get_mut(&id).unwrap();
-            record.bytes = estimate; record.pinned = pinned; record.pending_capture = true;
+            record.estimate = estimate; record.pinned = pinned; record.pending_capture = true;
             record.nodes = nodes; record.node_rate = metadata.node_rate;
             record.graph_rate = metadata.graph_rate; record.parallel_width = metadata.parallel_width;
             record.spans_devices |= site.spans_devices;
@@ -896,6 +958,7 @@ impl DeviceCache {
             stats.event(site.cycle, 1);
             stats.misses += 1;
             stats.ghost_hits += u64::from(ghost.is_some());
+            stats.native_nodes = None;
             stats.declared_capture_streams = metadata.parallel_width;
             stats.spans_devices |= site.spans_devices;
             if metadata.parallel_width > 1 {
@@ -909,15 +972,40 @@ impl DeviceCache {
 
             return Miss::Capture(id);
         }
-        if allowed && (ghost.is_some() || site.preference == Preference::Capture) {
-            let selected_nodes: u64 = self.records.values().filter(|r| r.pending_destroy).map(|r| r.nodes).sum();
-            let mut selected_nodes = selected_nodes;
-            let mut selected_execs = self.pending_destroy as u64;
-            while next_nodes.saturating_sub(selected_nodes) > self.pools.node_high_water
-                || next_execs.saturating_sub(selected_execs) > self.pools.exec_high_water {
+        if allowed && !room && (ghost.is_some() || site.preference == Preference::Capture) {
+            // Destroyed executables free resident pool slots, never the physical
+            // charge. Prove the blocked capture can fit before sacrificing any key.
+            let fits_after = |nodes: u64, execs: u64| {
+                let projected = if chain {
+                    self.basis.pool_bytes(next_nodes.saturating_sub(nodes).max(self.pools.node_high_water),
+                        next_execs.saturating_sub(execs).max(self.pools.exec_high_water))
+                        .saturating_sub(self.basis.pool_bytes(self.pools.node_high_water, self.pools.exec_high_water))
+                } else { self.pending_growth.saturating_add(estimate) };
+                may_capture(site.preference, projected.saturating_sub(self.pending_growth), headroom,
+                    self.reserve, self.charged, self.pending_growth, self.pending_bytes,
+                    chain && projected == 0 && !self.unmeasured)
+            };
+            let (all_nodes, all_execs) = self.records.values().filter(|r|
+                r.pending_destroy || (!r.pending_capture && matches!(r.list, Some(List::Recent | List::Frequent))))
+                .fold((0u64, 0u64), |(nodes, execs), r| (nodes.saturating_add(r.nodes), execs + 1));
+            let feasible = fits_after(all_nodes, all_execs);
+            let (mut selected_nodes, mut selected_execs) = self.records.values().filter(|r| r.pending_destroy)
+                .fold((0u64, 0u64), |(nodes, execs), r| (nodes.saturating_add(r.nodes), execs + 1));
+            let enough = |nodes, execs| fits_after(nodes, execs);
+            // Evaluate without holding an immutable borrow across ARC mutation.
+            let mut fits = enough(selected_nodes, selected_execs);
+            while feasible && !fits {
                 let Some(id) = self.mark_victim(ghost == Some(List::FrequentGhost)) else { break };
                 selected_nodes = selected_nodes.saturating_add(self.records[&id].nodes);
                 selected_execs += 1;
+                let projected = if chain {
+                    self.basis.pool_bytes(next_nodes.saturating_sub(selected_nodes).max(self.pools.node_high_water),
+                        next_execs.saturating_sub(selected_execs).max(self.pools.exec_high_water))
+                        .saturating_sub(self.basis.pool_bytes(self.pools.node_high_water, self.pools.exec_high_water))
+                } else { self.pending_growth.saturating_add(estimate) };
+                fits = may_capture(site.preference, projected.saturating_sub(self.pending_growth), headroom,
+                    self.reserve, self.charged, self.pending_growth, self.pending_bytes,
+                    chain && projected == 0 && !self.unmeasured);
             }
         }
         // A cold adaptive miss is remembered without displacing resident work.
@@ -925,7 +1013,7 @@ impl DeviceCache {
             self.next_id += 1;
             let id = self.next_id;
             self.identities.insert(identity.clone(), id);
-            self.records.insert(id, Record { identity: identity.clone(), cycle: site.cycle, bytes: estimate,
+            self.records.insert(id, Record { identity: identity.clone(), cycle: site.cycle, bytes: 0, estimate,
                 list: None, previous: None, next: None, pinned: false, pending_destroy: false, pending_capture: false, frequent: false, nodes, node_rate: metadata.node_rate, graph_rate: metadata.graph_rate, parallel_width: metadata.parallel_width, spans_devices: site.spans_devices, oom: None, oom_warned: false, permanently_eager: false, stats: KeyStats::new(now) });
             self.push(id, List::RecentGhost);
             self.trim_ghosts();
@@ -946,7 +1034,7 @@ impl DeviceCache {
     pub fn capture_oom(&mut self, id: u64) -> bool {
         let Some(record) = self.records.get_mut(&id) else { return false };
         if !record.pending_capture { return false }
-        self.pending_bytes = self.pending_bytes.saturating_sub(record.bytes);
+        self.pending_bytes = self.pending_bytes.saturating_sub(record.estimate);
         self.pools.live_nodes = self.pools.live_nodes.saturating_sub(record.nodes);
         self.pools.live_execs = self.pools.live_execs.saturating_sub(1);
         record.pending_capture = false;
@@ -969,7 +1057,7 @@ impl DeviceCache {
         let Some(record) = self.records.get_mut(&id) else { return };
         if record.permanently_eager { return }
         if record.pending_capture {
-            self.pending_bytes = self.pending_bytes.saturating_sub(record.bytes);
+            self.pending_bytes = self.pending_bytes.saturating_sub(record.estimate);
             self.pools.live_nodes = self.pools.live_nodes.saturating_sub(record.nodes);
             self.pools.live_execs = self.pools.live_execs.saturating_sub(1);
         }
@@ -980,13 +1068,16 @@ impl DeviceCache {
         tracing::info!(device = self.device, site = record.identity.site,
             key = %record.identity.shape, nodes, "small graph permanently eager");
         self.unlink(id);
+        let record = self.records.get_mut(&id).unwrap();
+        self.live_bytes = self.live_bytes.saturating_sub(record.bytes);
+        record.bytes = 0;
         // Physical charge remains a monotone high-water, including failed captures.
     }
 
     pub fn cancel_capture(&mut self, id: u64) {
         if let Some(record) = self.records.get(&id) {
             if record.pending_capture {
-                self.pending_bytes = self.pending_bytes.saturating_sub(record.bytes);
+                self.pending_bytes = self.pending_bytes.saturating_sub(record.estimate);
                 self.pools.live_nodes = self.pools.live_nodes.saturating_sub(record.nodes);
                 self.pools.live_execs = self.pools.live_execs.saturating_sub(1);
                 // Keep the in-flight growth reservation until the next sample:
@@ -1023,7 +1114,7 @@ impl DeviceCache {
     /// Called once per device after the complete multi-rank step has drained.
     /// `bytes` is the measured net graph allocation, not a sum of estimates.
     pub fn measured_capture(&mut self, bytes: u64) {
-        let pending: Vec<_> = self.records.iter().filter(|(_, r)| r.pending_capture).map(|(&id, r)| (id, r.bytes)).collect();
+        let pending: Vec<_> = self.records.iter().filter(|(_, r)| r.pending_capture).map(|(&id, r)| (id, r.estimate)).collect();
         if pending.is_empty() && !self.unmeasured && bytes == 0 { return }
         // Only successful owners surviving this completed boundary prove reuse.
         self.pools.node_high_water = self.pools.node_high_water.max(self.pools.live_nodes);
@@ -1044,7 +1135,8 @@ impl DeviceCache {
             record.stats.evicted_since_capture = false;
             // Zero physical growth can mean allocator reuse, not a zero-size
             // graph. Keep its estimate for victim ordering, never for charge.
-            record.bytes = if share > 0 { share } else { estimated };
+            self.live_bytes = self.live_bytes.saturating_sub(record.bytes).saturating_add(share);
+            record.bytes = share;
             let class = self.classes.entry(record.identity.site).or_default();
             if share > 0 { class.total = class.total.saturating_add(share); class.samples += 1; class.largest = class.largest.max(share); }
             self.counters.entry(record.cycle).or_default().captures += 1;
@@ -1055,15 +1147,9 @@ impl DeviceCache {
         self.unmeasured = false;
         self.captured_since_observation = false;
         self.charged = self.charged.saturating_add(bytes);
-        if self.charged > self.reserve {
-            tracing::warn!(device = self.device, charged = self.charged, reserve = self.reserve,
-                "graph cache measured over reserve; scheduling eviction, never refusing request");
-            let mut selected = 0u64;
-            while selected < self.charged - self.reserve {
-                let Some(id) = self.mark_victim(false) else { break };
-                selected = selected.saturating_add(self.records[&id].bytes);
-            }
-        }
+        // The driver retains its arena after exec destruction. An overshoot
+        // cannot be evicted away: only a future blocked miss may retire owners
+        // to reuse their pool slots. Never churn an already-fitting hot set.
     }
 
     pub fn destroyed(&mut self, ids: &[u64], measurement: ReleaseMeasurement) {
@@ -1073,8 +1159,11 @@ impl DeviceCache {
         let _ = measurement.released;
         if ids.iter().any(|id| self.records.contains_key(id)) { self.recovery_generation += 1; }
         for &id in ids {
+            self.unlink(id);
             let Some(record) = self.records.get_mut(&id) else { continue };
             let evicted = record.pending_destroy;
+            self.live_bytes = self.live_bytes.saturating_sub(record.bytes);
+            record.estimate = record.ordering_bytes();
             record.pending_destroy = false;
             if evicted { self.pending_destroy -= 1; }
             self.pools.live_nodes = self.pools.live_nodes.saturating_sub(record.nodes);
@@ -1088,6 +1177,7 @@ impl DeviceCache {
             // Keep the ghost's recency/frequency origin through retirement.
             let ghost = if record.frequent { List::FrequentGhost } else { List::RecentGhost };
             self.push(id, ghost);
+            self.records.get_mut(&id).unwrap().bytes = 0;
         }
         self.trim_ghosts();
     }
@@ -1121,7 +1211,7 @@ impl DeviceCache {
         for &id in ids {
             let Some(record) = self.records.get(&id) else { continue };
             if record.pending_capture {
-                self.pending_bytes = self.pending_bytes.saturating_sub(record.bytes);
+                self.pending_bytes = self.pending_bytes.saturating_sub(record.estimate);
                 self.unmeasured = true;
             }
             if record.pinned || record.pending_destroy || matches!(record.list, Some(List::Recent | List::Frequent)) {
@@ -1136,7 +1226,7 @@ impl DeviceCache {
     pub fn report_due(&mut self, elapsed: Duration) -> bool {
         if elapsed < Duration::from_secs(30) || self.interval_evictions == 0 { return false }
         tracing::info!(device = self.device, evictions = self.interval_evictions,
-            reserve = self.reserve, charged = self.charged, cycles = ?self.counters, "graph cache interval");
+            reserve = self.reserve, charged = self.charged, live_bytes = self.live_bytes, resident_bytes = self.resident_bytes(), cycles = ?self.counters, "graph cache interval");
         self.interval_evictions = 0;
         self.last_report = Instant::now();
         true
@@ -1155,7 +1245,7 @@ impl DeviceCache {
     fn trace_snapshot(&self) -> TraceSnapshot {
         let records = self.records.values().map(RawRecord::copy).collect();
         TraceSnapshot { cache: Snapshot { device: self.device, reserve: self.reserve, physical_floor: self.physical_floor,
-            reserve_policy: self.reserve_policy, charged: self.charged, level: self.level,
+            reserve_policy: self.reserve_policy, charged: self.charged, live_bytes: self.live_bytes, resident_bytes: self.resident_bytes(), hard_stopped: self.charged >= self.reserve, native_pools: self.native_pools(), level: self.level,
             pinned: self.records.values().filter(|r| r.pinned).map(|r| r.bytes).sum(),
             pending_capture: self.pending_bytes, cycles: self.counters.clone(), pools: self.pools.clone(),
             basis: self.basis, sampled_at_ms: self.started.elapsed().as_millis() as u64,
@@ -1188,7 +1278,7 @@ impl DeviceCache {
             });
             records.into_iter().take(16).map(|record| self.row(record, now)).collect()
         };
-        Snapshot { device: self.device, reserve: self.reserve, physical_floor: self.physical_floor, reserve_policy: self.reserve_policy, charged: self.charged,
+        Snapshot { device: self.device, reserve: self.reserve, physical_floor: self.physical_floor, reserve_policy: self.reserve_policy, charged: self.charged, live_bytes: self.live_bytes, resident_bytes: self.resident_bytes(), hard_stopped: self.charged >= self.reserve, native_pools: self.native_pools(),
             level: self.level,
             pinned: self.records.values().filter(|r| r.pinned).map(|r| r.bytes).sum(),
             pending_capture: self.pending_bytes, cycles: self.counters.clone(), pools: self.pools.clone(), basis: self.basis,
@@ -1251,7 +1341,7 @@ struct RawRecord {
 }
 impl RawRecord {
     fn copy(record: &Record) -> Self {
-        Self { identity: record.identity.clone(), cycle: record.cycle, bytes: record.bytes,
+        Self { identity: record.identity.clone(), cycle: record.cycle, bytes: record.ordering_bytes(),
             nodes: record.nodes, pinned: record.pinned, permanently_eager: record.permanently_eager,
             stats: (*record.stats).clone() }
     }
@@ -1349,6 +1439,178 @@ mod tests {
         cache.measured_capture(10);
         id
     }
+    #[test]
+    fn high_water_overshoot_does_not_churn_a_bounded_hot_set() {
+        let mut cache = DeviceCache::new(-996, 1000);
+        let mut hot = Vec::new();
+        for n in 0..36 { hot.push(capture(&mut cache, n, false)); }
+        // Retired/transient growth left the permanent arena over reserve.
+        cache.charged = 1010;
+        for round in 0..8 {
+            // A zero-growth completion still occurred in another bank this round.
+            cache.unmeasured = true;
+            for n in 0..36 {
+                let id = hot[n as usize];
+                if matches!(cache.records[&id].list, Some(List::Recent | List::Frequent))
+                    && !cache.pending(id) { cache.hit(id); }
+                else { let _ = cache.miss(key(n), site(Preference::Capture), None, false); }
+            }
+            cache.measured_capture(0);
+            let victims: Vec<_> = cache.records.iter().filter(|(_, r)| r.pending_destroy)
+                .map(|(&id, _)| id).collect();
+            cache.destroyed(&victims, ReleaseMeasurement { released: 0 });
+            assert_eq!(cache.counters[&Cycle::Decode].evictions, 0, "hot round {round}");
+            assert_eq!(cache.charged, 1010, "destroy must not credit physical release");
+        }
+        assert!(matches!(cache.miss(key(36), site(Preference::Capture), None, false), Miss::Eager));
+        assert_eq!(cache.pending_destroy, 0, "hard stop never churns existing owners");
+
+    }
+
+    #[test]
+    fn measured_hard_stop_freezes_new_tickets_including_reuse_and_survives_destroy() {
+        for measured in [100, 110] {
+            let mut cache = DeviceCache::new(-1002, 100);
+            let Miss::Capture(id) = cache.miss(key(1), site(Preference::Capture), None, false) else { panic!() };
+            cache.captured_topology(id, 7, 1, false);
+            cache.measured_capture(measured);
+            for _ in 0..16 {
+                cache.hit(id);
+                assert!(matches!(cache.miss(key(2), site(Preference::Capture), None, false), Miss::Eager));
+                assert_eq!(cache.pending_destroy, 0);
+                assert_eq!(cache.charged, measured);
+            }
+            cache.mark_victim(false);
+            cache.destroyed(&[id], ReleaseMeasurement { released: measured });
+            assert!(matches!(cache.miss(key(2), site(Preference::Capture), None, false), Miss::Eager));
+            assert_eq!(cache.charged, measured);
+            assert!(cache.snapshot().hard_stopped);
+        }
+    }
+
+    #[test]
+    fn native_node_counts_are_retained_independently_of_byte_estimator_units() {
+        let mut cache = DeviceCache::new(-1003, 1000);
+        let Miss::Capture(a) = cache.miss(key(1), site(Preference::Capture), None, true) else { panic!() };
+        cache.captured_topology(a, 7, 1, false);
+        cache.measured_capture(10);
+        let Miss::Capture(b) = cache.miss(key(2), site(Preference::Capture), None, false) else { panic!() };
+        cache.captured_topology(b, 13, 1, false);
+        cache.measured_capture(0);
+        assert_eq!((cache.native_pools().live_nodes, cache.native_pools().live_execs), (20, 2));
+        assert_eq!(cache.native_pools().unknown_execs, 0);
+        assert_eq!(cache.pools.live_nodes, 20, "byte-based prediction remains separate");
+        cache.mark_victim(false);
+        assert_eq!(cache.native_pools().live_nodes, 20, "selected victims still own native storage");
+        cache.destroyed(&[b], ReleaseMeasurement { released: 0 });
+        assert_eq!((cache.native_pools().live_nodes, cache.native_pools().live_execs), (7, 1));
+        cache.remove_bank(1);
+        assert_eq!(cache.native_pools().live_execs, 0);
+    }
+
+    #[test]
+    fn thirty_six_percent_measured_live_set_does_not_evict() {
+        let mut cache = DeviceCache::new(-997, 1000);
+        for n in 0..35 { capture(&mut cache, n, false); }
+        assert!(matches!(cache.miss(key(35), site(Preference::Capture), None, false), Miss::Capture(_)));
+        cache.charged = 1000;
+        cache.measured_capture(10);
+        assert_eq!(cache.pending_destroy, 0, "36% live is not over reserve");
+        assert_eq!(cache.live_bytes, 360);
+    }
+
+    #[test]
+    fn rotating_keys_reuse_a_bounded_physical_arena_without_permanent_eager() {
+        let mut cache = DeviceCache::new(-999, 100);
+        let mut allocator_slots = 0;
+        for n in 0..200 {
+            let mut ticket = cache.miss(key(n), site(Preference::Capture), None, false);
+            if matches!(ticket, Miss::Eager) {
+                let victims: Vec<_> = cache.records.iter().filter(|(_, r)| r.pending_destroy)
+                    .map(|(&id, _)| id).collect();
+                assert!(!victims.is_empty(), "a fitting rotating key must not stay eager");
+                cache.destroyed(&victims, ReleaseMeasurement { released: 0 });
+                ticket = cache.miss(key(n), site(Preference::Capture), None, false);
+            }
+            assert!(matches!(ticket, Miss::Capture(_)), "key {n} never became capturable");
+            // Ideal retaining allocator: allocate only when concurrent resident
+            // executions exceed its slots, otherwise reuse a destroyed slot.
+            let slots = cache.pools.live_execs;
+            let growth = slots.saturating_sub(allocator_slots) * 10;
+            allocator_slots = allocator_slots.max(slots);
+            cache.measured_capture(growth);
+            assert!(cache.charged <= cache.reserve, "key {n}: {}", cache.charged);
+            assert!(cache.pools.live_execs <= 9, "resident slots ratcheted at key {n}");
+            if n >= 9 { assert_eq!(growth, 0, "warmed arena grew at key {n}"); }
+        }
+        assert_eq!(cache.charged, 90);
+        assert_eq!(cache.counters[&Cycle::Decode].captures, 200);
+        assert_eq!(cache.pools.live_execs, 9);
+    }
+
+    #[test]
+    fn measured_overshoot_keeps_a_fitting_hot_set_without_boundary_eviction() {
+        let mut cache = DeviceCache::new(-1000, 100);
+        let mut ids = Vec::new();
+        for n in 0..3 {
+            let Miss::Capture(id) = cache.miss(key(n), site(Preference::Capture), None, false) else { panic!() };
+            ids.push(id);
+        }
+        cache.measured_capture(110);
+        for _ in 0..16 {
+            for &id in &ids { cache.hit(id); }
+            cache.unmeasured = true;
+            cache.measured_capture(0);
+            assert_eq!(cache.pending_destroy, 0);
+            assert_eq!(cache.counters[&Cycle::Decode].evictions, 0);
+            assert_eq!(cache.charged, 110);
+            assert_eq!(cache.pools.live_execs, 3);
+        }
+        let snapshot = serde_json::to_value(cache.snapshot()).unwrap();
+        let trace: serde_json::Value = serde_json::from_slice(&cache.trace_snapshot().bytes().unwrap()).unwrap();
+        assert_eq!(snapshot["live_bytes"], 110);
+        assert_eq!(trace["cache"]["live_bytes"], snapshot["live_bytes"]);
+        cache.remove_bank(1);
+        assert_eq!(cache.live_bytes, 0);
+        assert_eq!(cache.charged, 110);
+    }
+
+    #[test]
+    fn zero_share_pool_owners_are_reusable_and_futile_pressure_does_not_evict() {
+        let mut cache = DeviceCache::new(-1001, 100);
+        let estimate = || Some(Estimate { bytes: 10, nodes: None, node_rate: 1, graph_rate: 0, parallel_width: 1 });
+        for n in 0..9 {
+            let Miss::Capture(_) = cache.miss(key(n), site(Preference::Capture), estimate(), false) else { panic!() };
+        }
+        cache.measured_capture(90);
+        // Reused owners must still count as pool occupancy and be evictable.
+        assert!(matches!(cache.miss(key(10), site(Preference::Capture), estimate(), false), Miss::Eager));
+        let victims: Vec<_> = cache.records.iter().filter(|(_, r)| r.pending_destroy).map(|(&id, _)| id).collect();
+        assert_eq!(victims.len(), 1);
+        cache.destroyed(&victims, ReleaseMeasurement { released: 0 });
+        assert!(matches!(cache.miss(key(10), site(Preference::Capture), estimate(), false), Miss::Capture(_)));
+        cache.measured_capture(0);
+        let charged = cache.charged;
+        cache.chain_only = false;
+        assert!(matches!(cache.miss(key(11), site(Preference::Capture), estimate(), false), Miss::Eager));
+        assert_eq!(cache.pending_destroy, 0, "non-chain physical growth cannot be made to fit by eviction");
+        assert_eq!(cache.charged, charged);
+    }
+
+    #[test]
+    fn estimate_only_records_do_not_count_as_measured_live_bytes() {
+        let mut cache = DeviceCache::new(-998, 1000);
+        let Miss::Capture(id) = cache.miss(key(1), site(Preference::Capture), None, false) else { panic!() };
+        cache.measured_capture(0);
+        assert_eq!(cache.records[&id].bytes, 0);
+        assert_eq!(cache.live_bytes, 0);
+        assert_eq!(cache.records[&id].estimate, 10);
+        assert_eq!(cache.queues[List::Recent.index()].bytes, 10);
+        assert_eq!(cache.charged, 0);
+        cache.remove_drained(&[id]);
+        assert_eq!(cache.live_bytes, 0);
+    }
+
     #[test]
     fn rejected_small_graph_trace_has_no_executable_or_permanent_bytes() {
         for basis in [Basis::Bytes, Basis::Nodes { node_rate: 2560, graph_rate: 65536 }] {
@@ -1681,7 +1943,7 @@ mod tests {
         cache.reserve_policy = Some(policy);
         let snapshot = serde_json::to_value(cache.snapshot()).unwrap();
         assert_eq!(snapshot["reserve"], 120_000_000);
-        assert_eq!(snapshot["charged"], 0); // live graph arena, not the admission charge
+        assert_eq!(snapshot["charged"], 0); // physical high-water, not the admitted reserve
         let policy = &snapshot["reserve_policy"];
         assert_eq!(policy["base_bytes"], 100_000_000);
         assert_eq!(policy["extra_bytes"], 50_000_000);
@@ -1940,6 +2202,7 @@ mod tests {
         assert_eq!((cache.pools.node_high_water, cache.pools.exec_high_water), (0, 0));
         assert_eq!(cache.pools.live_nodes, 0);
         assert!(matches!(cache.miss(key(2), site(Preference::Capture), None, false), Miss::Eager));
+        assert_eq!(cache.pending_destroy, 0, "failed captures prove no reusable pool capacity");
     }
 
     #[test]
@@ -2043,7 +2306,8 @@ mod observer_tests {
         let site = Site { name: "observer-fixture", cycle: Cycle::Decode,
             preference: Preference::Capture, bootstrap: 10, basis: Basis::Bytes,
             spans_devices: false };
-        let key = Identity { bank: 1, site: site.name, key: 1, shape: "1".into() };
+        let next = cache.next_id + 1;
+        let key = Identity { bank: 1, site: site.name, key: next, shape: next.to_string().into() };
         assert!(matches!(cache.miss(key, site, None, false), Miss::Capture(_)));
     }
 

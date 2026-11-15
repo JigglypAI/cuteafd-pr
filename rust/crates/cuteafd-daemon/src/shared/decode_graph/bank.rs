@@ -455,6 +455,7 @@ mod device_tests {
             let ticket = bank.cache_ticket(&key, false, None).expect("victim capacity reusable without idle");
             bank.cache_commit(key, Exec(drops.clone()), ticket, 1, 1, false);
             bank.cache_measured(0);
+            assert_eq!(bank.len(), 1, "rotating identities must not accumulate resident execs");
         }
         assert_eq!(super::super::device::snapshots().into_iter().find(|row| row.device == -318).unwrap().charged, 10);
     }
