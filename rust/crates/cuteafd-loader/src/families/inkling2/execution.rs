@@ -53,6 +53,15 @@ impl UnitLayout {
         }
         Ok(Self { rows, blocks, buffers })
     }
+    /// Serving binds per-layer state from the persistent request bank. Scratch
+    /// must not also allocate cold-golden copies of those physical owners.
+    pub fn serving(cfg: &Inkling2Config, rows: usize, context: usize) -> Result<Self> {
+        let mut layout = Self::new(cfg, rows, context)?;
+        for name in ["ring", "global_cache", "attn_conv_history", "mlp_conv_history",
+            "k_conv_history", "v_conv_history"] { layout.buffers.remove(name); }
+        Ok(layout)
+    }
+
     pub fn bytes(&self) -> Result<usize> {
         self.buffers.values().try_fold(0usize, |sum, bytes| sum.checked_add(*bytes).context("Inkling owner sum overflow"))
     }
@@ -105,6 +114,53 @@ impl SequenceLayout {
     }
 }
 
+/// Persistent whole-head state on one physical rank. Logical pool pages come
+/// from the shared prefix pool; each global layer retains its own page plane.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CacheLayout {
+    pub layers: Vec<SequenceLayout>,
+    pub offsets: Vec<usize>,
+    pub sequence_bytes: usize,
+    pub sequences: usize,
+    pub pool_pages: usize,
+    pub page_bytes: usize,
+    pub global_layers: Vec<usize>,
+}
+impl CacheLayout {
+    pub fn new(cfg: &Inkling2Config, sequences: usize, pool_pages: usize) -> Result<Self> {
+        ensure!(sequences > 0 && sequences <= i32::MAX as usize && pool_pages > 0
+            && pool_pages <= i32::MAX as usize && cfg.layers == cfg.local.len(), "Inkling cache capacity");
+        let layers = cfg.local.iter().map(|&local| SequenceLayout::new(cfg, local, 1))
+            .collect::<Result<Vec<_>>>()?;
+        let mut sequence_bytes = 0usize;
+        let offsets = layers.iter().map(|layer| {
+            let offset = sequence_bytes;
+            sequence_bytes = sequence_bytes.checked_add(layer.bytes).context("Inkling cache mark overflow")?;
+            Ok(offset)
+        }).collect::<Result<Vec<_>>>()?;
+        let page_bytes = cfg.kv_heads.checked_mul(cfg.head_dim).and_then(|v| v.checked_mul(4 * 64))
+            .context("Inkling cache page overflow")?;
+        let global_layers = cfg.local.iter().enumerate().filter_map(|(layer, &local)| (!local).then_some(layer)).collect();
+        Ok(Self { layers, offsets, sequence_bytes, sequences, pool_pages, page_bytes, global_layers })
+    }
+    pub fn active_bytes(&self) -> Result<usize> {
+        self.sequence_bytes.checked_mul(self.sequences).context("Inkling active cache overflow")
+    }
+    pub fn retained_bytes(&self, marks: usize) -> Result<usize> {
+        self.sequence_bytes.checked_mul(marks).context("Inkling retained marks overflow")
+    }
+    pub fn layer_page_bytes(&self) -> Result<usize> {
+        self.page_bytes.checked_mul(self.pool_pages).context("Inkling global cache overflow")
+    }
+    pub fn field(&self, sequence: usize, layer: usize, name: &str) -> Result<std::ops::Range<usize>> {
+        ensure!(sequence < self.sequences && layer < self.layers.len(), "Inkling cache address outside bank");
+        let field = self.layers[layer].field(name)?;
+        let at = sequence.checked_mul(self.sequence_bytes).and_then(|v| v.checked_add(self.offsets[layer]))
+            .and_then(|v| v.checked_add(field.start)).context("Inkling cache field offset overflow")?;
+        Ok(at..at.checked_add(field.len()).context("Inkling cache field end overflow")?)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ResidualSite {
     /// Completed blocks present before attention, including the embedding block.
@@ -130,6 +186,36 @@ mod tests {
     fn cfg() -> Inkling2Config {
         Inkling2Config::from_hf(&serde_json::from_str(include_str!("fixtures/config.json")).unwrap()).unwrap()
     }
+    #[test]
+    fn persistent_cache_layout_separates_layers_requests_and_unit_scratch() -> Result<()> {
+        let cfg = cfg();
+        let cache = CacheLayout::new(&cfg, 3, 19)?;
+        assert_eq!(cache.global_layers.len(), 8);
+        assert_eq!(cache.page_bytes, 64*4096);
+        assert_eq!(cache.active_bytes()?, cache.sequence_bytes*3);
+        assert_eq!(cache.retained_bytes(7)?, cache.sequence_bytes*7);
+        let mut spans = Vec::new();
+        for sequence in 0..3 {
+            for layer in 0..cfg.layers {
+                for name in ["ring", "k_conv_history", "v_conv_history", "attn_conv_history", "mlp_conv_history"] {
+                    let span = cache.field(sequence, layer, name)?;
+                    if !span.is_empty() { spans.push(span); }
+                }
+            }
+        }
+        spans.sort_by_key(|span| span.start);
+        let mut end = 0;
+        for span in spans { assert_eq!(span.start, end); end = span.end; }
+        assert_eq!(end, cache.active_bytes()?);
+        assert!(cache.field(3,0,"ring").is_err());
+        assert!(cache.field(0,cfg.layers,"ring").is_err());
+        let unit = UnitLayout::serving(&cfg, 64, 8192)?;
+        for name in ["ring", "global_cache", "attn_conv_history", "mlp_conv_history", "k_conv_history", "v_conv_history"] {
+            assert!(!unit.buffers.contains_key(name));
+        }
+        Ok(())
+    }
+
     #[test]
     fn six_layer_residual_boundaries_preserve_embedding_block() {
         let cfg = cfg();
