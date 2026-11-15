@@ -219,10 +219,10 @@ fn snapshot_metadata_survives_the_host_tier() {
         family.fake.mem.borrow_mut().advance(10_000_000);
         cache.tick();
     }
-    let promotions = cache.stats().promotions;
+    let promotions = cache.stats().host_promotions;
     let (back, _) = lag_serve(&mut cache, &family, 3, &first, 16);
     assert_eq!(back.resume, first.len());
-    assert_eq!(cache.stats().promotions, promotions + 1, "the hit came from the host tier");
+    assert_eq!(cache.stats().host_promotions, promotions + 1, "the hit came from the host tier");
     assert_eq!(family.restored.borrow().last().cloned().flatten(), Some(LagMeta { frontier: 13, tag: 13 }));
     let mut p = back.placement;
     let mut longer = first.clone();

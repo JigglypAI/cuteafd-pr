@@ -141,7 +141,7 @@ fn run(args: &Args, engine: &engine::MimoEngine<'_>, tokens: &[u32]) -> Result<(
         ensure!(kv_rows(engine, &restored, 0, capacity)? == straight_final, "rank KV differs after greedy continuation");
         ensure!(engine.library.cuda_get_device()? == current, "host restore changed the caller's CUDA device");
         let after = cache.stats();
-        ensure!(after.promotions == before.promotions + 1, "host promotion was not recorded");
+        ensure!(after.host_promotions == before.host_promotions + 1, "host promotion was not recorded");
         ensure!(after.restore_failures == 0 && after.host_store_skips == 0,
             "host gate hid a failed restore or skipped store");
         println!("{}", serde_json::json!({"gate":"mimo-rank-host", "round":round, "frontier":at,
