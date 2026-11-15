@@ -185,6 +185,11 @@ impl Family for MistralLarge4 {
     }
     fn id(&self) -> &'static str { "mistral_large4" }
     fn runtime(&self) -> RuntimeStatus { RuntimeStatus::Serving }
+    fn attention_prefill_precision(&self) -> crate::plan::attention_precision::PrefillPrecisionSupport {
+        crate::plan::attention_precision::PrefillPrecisionSupport {
+            modes: &[crate::plan::attention_precision::AttentionPrecision::Fp8], fp8_core_auto: None,
+            source: "the sparse-MLA MG prefill export runs FP8 QK and PV; its BF16 mode is fork work/mg-bf16-support (#2141)" }
+    }
     fn decode_lanes(&self) -> crate::plan::decode_lanes::LaneSupport {
         crate::plan::decode_lanes::LaneSupport::One {
             reason: "one lane until a two-lane A/B wins: top-4 of 128 wide (6144) experts makes each Spark \

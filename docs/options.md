@@ -393,6 +393,7 @@ Each key is also a global `cuteafd` flag (`--gpu-memory-cap`, `--kv-max-tokens`,
 | `CORE_VIEW` | unset (= `original`) | `original`, `k8-compact`, `k6-compact`, `fp8-compact` | Immutable MC dense-core view. Plain checkpoints support original only. FP8 converts exactly original `core_tensors` from its BF16 index with the shared block-128 recipe; no alternate index reads. Flash supports its full MC core. Muse supports q/k/v/o roles but refuses an MC that additionally selects head, gate or pre/post-expert roles; Kimi/GLM unsupported roles likewise refuse before payload loading. Step-5 admits executable O roles only. Already-FP8 sources refuse. |
 | `ATTENTION_PLACEMENT` | `auto` | `auto`, `context`, `layers`, `heads` | Per-family defaults and refusals are in the table below. |
 | `ATTENTION_PLAN_ROWS` | `auto` | `auto`, positive int | Decode/verify reduction plan rows. |
+| `ATTENTION_PREFILL_PRECISION` | `auto` | `auto`, `bf16`, `fp8` | Operand precision of the attention kernel's own QK and PV products at prefill (FP32 accumulate either way): `bf16` or `fp8` for Q, K, V and P. Not a weight format (`CORE_VIEW`), a projection activation format (the `*_FP8_PREFILL` keys) or the KV cache format; decode attention has no key. `auto` is the family's mode for the checkpoint's core view, and `cuteafd plan` prints the resolved mode and its reason. Today `auto` is each family's existing prefill program: GLM 5.3, ML4 and GLM Flash `fp8`; V4.1 and V4 BF16 QK with FP8 PV (not a selectable value); every other family `bf16`. A mode with no exported program is refused by name at plan time. Plan and `./run.sh` use `--attention-prefill-precision`. |
 | `MAX_CONTEXT_TOKENS` | `auto` | `auto`, 1–1048576 | `auto`: serve min(model maximum context, admitted pool). A number pins context and requires the pool to cover it. Plan and every serve command use `--max-context-tokens` with `auto` or a number; explicit CLI overrides the config. Compiled workspace/table extent is internal, not a user context setting. |
 | `MAX_OUTPUT_TOKENS` | `131072` | integer | Generation cap. |
 | `KV_CACHE` | family default | `bf16`, `fp8`; MiMo also `int8` | See the precision table below. |
@@ -782,6 +783,7 @@ original core is already FP8, not an MC publication.
 | `CORE_VIEW` | ✗ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | `ATTENTION_PLACEMENT` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | `ATTENTION_PLAN_ROWS` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✓ | ✓ | ✓ |
+| `ATTENTION_PREFILL_PRECISION` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | `MAX_CONTEXT_TOKENS` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | `MAX_OUTPUT_TOKENS` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | `KV_CACHE` | ✗ | ✗ | ✗ | ✗ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ |

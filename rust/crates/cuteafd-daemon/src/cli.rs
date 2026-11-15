@@ -553,6 +553,9 @@ pub(crate) struct PlanArgs {
     /// Decode views: V4.1 requires 2, MiMo accepts 1 or 2, other families require 1.
     #[arg(long, value_parser = clap::value_parser!(u8).range(1..=2))]
     pub(crate) decode_lanes: Option<u8>,
+    /// Prefill attention QK/PV precision: auto is the family default for the checkpoint's core view.
+    #[arg(long, default_value = "auto", value_parser = ["auto", "bf16", "fp8"])]
+    pub(crate) attention_prefill_precision: String,
     /// Rows one continuous prefill call streams for --layout (0: the family
     /// default). Shared by every units-span family (launcher PREFILL_SPAN_ROWS).
     #[arg(long, default_value_t = 0)]

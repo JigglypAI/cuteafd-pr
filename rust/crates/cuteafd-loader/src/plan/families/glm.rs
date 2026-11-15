@@ -65,6 +65,11 @@ impl Family for Glm {
     }
     fn exlr8_execution(&self) -> Exlr8Execution { self.exlr8 }
     fn decode_lanes(&self) -> crate::plan::decode_lanes::LaneSupport { self.decode_lanes }
+    fn attention_prefill_precision(&self) -> crate::plan::attention_precision::PrefillPrecisionSupport {
+        crate::plan::attention_precision::PrefillPrecisionSupport {
+            modes: &[crate::plan::attention_precision::AttentionPrecision::Fp8], fp8_core_auto: None,
+            source: "the sparse-MLA MG prefill export runs FP8 QK and PV; its BF16 mode is fork work/mg-bf16-support (#2141)" }
+    }
     fn spark_decode(&self) -> Option<crate::plan::spark_executions::SparkDecode> {
         Some(crate::plan::spark_executions::SparkDecode { rows: self.decode_rows })
     }

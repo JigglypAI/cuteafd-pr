@@ -26,6 +26,8 @@ fn options(args: &PlanArgs) -> Result<PlanOptions, PlanError> {
     let mut options = PlanOptions {
         fp8_prefill: args.fp8_prefill.clone(),
         decode_lanes: args.decode_lanes,
+        attention_prefill_precision: args.attention_prefill_precision.parse().map_err(|reason| PlanError::InvalidOption {
+            option: cuteafd_loader::plan::attention_precision::OPTION, reason })?,
         mapped_scale_preload_bytes: cuteafd_loader::plan::mapped_scale_preload_bytes(args.mapped_scale_preload_gib)?,
         mapped_scale_host_budget_bytes: None,
         draft_ownership: None,
@@ -1372,6 +1374,7 @@ mod tests {
             context_tokens: Some(262144),
             prefill_rows: 0, expert_usage: Some(false),
             prefill_waves: 0, prefill_span_rows: 0, decode_lanes: None,
+            attention_prefill_precision: "auto".into(),
             decode_rows: 64,
             index_cache: crate::families::glm5_flash::engine::IndexCache::Keys,
             replay_records: crate::cli::PlanReplayRecords::Own,
