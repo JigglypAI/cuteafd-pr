@@ -145,7 +145,7 @@ impl Builder<'_> {
             |member| member.strip_prefix(stem).is_some_and(|rest| rest.starts_with('.')),
             |candidate| (candidate == stem).then_some(CoreContract { family: "Inkling 2", widths: &[6, 8],
                 split: if split.is_none() { CoreSplit::Whole } else if axis == 0 { CoreSplit::Output } else { CoreSplit::Input },
-                padded_outputs: false, view_varying: true }))?;
+                padded_outputs: stem == "model.llm.unembed", view_varying: true }))?;
         let projection = projections.remove(stem).context("Inkling core projection headers absent")?;
         let layout = CoreWeightLayout::new(&projection,
             if axis == 0 { TrellisSide::Output } else { TrellisSide::Input }, split.unwrap_or(0),

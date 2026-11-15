@@ -302,7 +302,8 @@ fn compact_core_headers_preserve_native_keeps_and_plan_exact_trellis_arenas() ->
                 || (name.contains(".attn.") && name.ends_with(".weight") && shape.len() == 2
                     && shape.iter().all(|width| width % 128 == 0));
             if selected {
-                compact.extend(testing::exl3(name.strip_suffix(".weight").unwrap(), shape[0], shape[1], bits));
+                let outputs = if name == "model.llm.unembed.weight" { shape[0].next_multiple_of(128) } else { shape[0] };
+                compact.extend(testing::exl3(name.strip_suffix(".weight").unwrap(), outputs, shape[1], bits));
             } else { compact.push((name.clone(), *dtype, shape.clone())); }
         }
         testing::write_snapshot(dir.path(), &config, &compact, None);
