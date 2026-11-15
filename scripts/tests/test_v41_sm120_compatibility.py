@@ -419,7 +419,10 @@ def test_exl3_segments_manifest_uses_fork_formula_without_allocating(monkeypatch
             'packed_route_indices', 'block_expert_ids', 'packed_route_count', 'expert_offsets', 'expert_counts')})
 
     monkeypatch.setitem(sys.modules, 'export_b12x_exl3_routes_aot', SimpleNamespace(export=routes))
-    monkeypatch.setattr(exporter, 'write_bridge', lambda *args: None)
+    def bridge(output, manifest):
+        manifest['objects'][0]['pointer_slots'] = ['rotation_input_ptr', 'rotation_gate', 'rotation_up', 'fc2']
+        manifest['objects'][1]['pointer_slots'] = ['fc2_ptr', 'output_ptr']
+    monkeypatch.setattr(exporter, 'write_bridge', bridge)
     meta = exporter.export(tmp_path, 512, 256, 8192, (4, 5), 'packed', 8,
                            hidden=6144, warp_specialized=True, wire_input=wire,
                            row_addresses=True, route_block=64)
@@ -446,6 +449,8 @@ def test_exl3_segments_manifest_uses_fork_formula_without_allocating(monkeypatch
         assert meta['buffers'][alias]['allocation'] == 'rotation_gate'
         assert meta['buffers'][alias]['arena_offset'] == meta['buffers']['rotation_gate']['arena_offset']
     assert meta['requires_route_preparation'] and meta['route_preparation']
+    assert meta['objects'][0]['pointer_bindings'] == ['input', 'rotation_gate', 'rotation_up', 'fc2']
+    assert meta['objects'][1]['pointer_bindings'] == ['fc2', 'output']
 
 
 @pytest.mark.parametrize("blocks", [1, 2])

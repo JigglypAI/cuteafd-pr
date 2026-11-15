@@ -1002,7 +1002,7 @@ def test_gate_options_match_real_package(tmp_path, monkeypatch, geometry, compac
     build_root.mkdir()
     _, _, calls, _ = fixture.PackageProfileTests().build_fixture(
         build_root, role, bits, geometry=geometry,
-        capacities=capacities, compact=compact,
+        capacities=capacities, compact=compact, segments=True,
         profiles=() if compact else tuple(p[0] for p in package.profiles_for_role(role, geometry)))
     expected = [(call.args[1], call.args[3], call.kwargs) for call in calls
                 if bool(call.kwargs.get("compact_weights")) == compact]
@@ -1034,6 +1034,15 @@ def test_gate_options_match_real_package(tmp_path, monkeypatch, geometry, compac
         assert any(options.get("decode_schedule") == package.PURE_EVICT_FIRST for _, options in recorded)
     else:
         assert any(options.get("warp_specialized") for _, options in recorded)
+
+
+def test_spark_exl3_groups_include_every_ordinary_tier_family():
+    jobs = compare_sm.jobs('all')
+    ordinary = [(name, exporter, args) for name, exporter, args in jobs
+                if exporter == 'package_exl3_aot.py' and not name.startswith('exl3-compact-')
+                and not name.endswith('-spark')]
+    for name, exporter, args in ordinary:
+        assert (name + '-spark', exporter, [*args, '--role', 'spark', '--source-package-layouts']) in jobs
 
 
 @pytest.mark.parametrize('supports_segments', [False, True])

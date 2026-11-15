@@ -1071,14 +1071,15 @@ SEGMENT_MAX_ROWS = 8192
 
 def segment_export_options(geometry: str, role: str, width: int, *, compact: bool = False) -> dict | None:
     """One format-matched row-address program per shipping WS Spark layout."""
-    if (role != 'spark' or compact
+    if (role != 'spark' or compact or GEOMETRIES[geometry][0] % 512
             or not any(warp_specialized(geometry, role, width, rows)
                        for rows in (256, 1024, 2048, 2752, 4096))):
         return None
     options = dict(hidden=GEOMETRIES[geometry][0], warp_specialized=True,
                    row_addresses=True, route_block=64,
                    tile=(64, 256 if width % 256 == 0 else 128, 64, 256))
-    if geometry == 'glm':
+    # Spark requests carry K32 wire even when ordinary cores decode to BF16.
+    if GEOMETRIES[geometry][0] % 512 == 0:
         options.update(wire_input=True, ws_input_stages=3)
     if activation(geometry) != 'silu':
         options['activation'] = activation(geometry)

@@ -376,6 +376,11 @@ def jobs(scope):
     # Muse Spark: TP-resident K4/K5 experts; the generic partial epilogue is separate.
     result.append(("exl3-muse-k45", "package_exl3_aot.py",
                    ["--geometry", "muse", "--capacities", EXL3_CAPACITIES, "--bits", "4,5"]))
+    # Include ordinary Spark programs and their additive row-address siblings.
+    # Keep baseline packages free to use their own layout inventory and API.
+    result.extend((name + '-spark', exporter, [*args, '--role', 'spark', '--source-package-layouts'])
+                  for name, exporter, args in list(result)
+                  if exporter == 'package_exl3_aot.py' and not name.startswith('exl3-compact-'))
     result.extend((f"context-split-{geometry}", "export_b12x_dsv4_aot.py",
                    ["--geometry", geometry, "--context-split-only"])
                   for geometry in ("flash", "pro", "glm", "glmf"))

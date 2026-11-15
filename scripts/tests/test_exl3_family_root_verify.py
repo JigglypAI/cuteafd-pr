@@ -228,7 +228,7 @@ def test_segments_follow_shipping_spark_layouts_and_native_ingress(geometry):
     for profile, width, *_ in tool.build_profiles('spark', geometry):
         options = tool.segment_export_options(geometry, 'spark', width)
         assert options['row_addresses'] and options['warp_specialized']
-        assert options.get('wire_input', False) == (geometry == 'glm')
+        assert options.get('wire_input', False) == (tool.GEOMETRIES[geometry][0] % 512 == 0)
         assert options['hidden'] == tool.GEOMETRIES[geometry][0]
         assert options['route_block'] >= 16
         assert width % options['tile'][1] == 0

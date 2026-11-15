@@ -356,6 +356,10 @@ def export(output: Path, intermediate: int, experts: int, capacity: int,
     if getattr(launch, "decode_schedule", None) is not None:
         manifest["decode_schedule"] = launch.decode_schedule
     write_bridge(output, manifest)
+    if row_addresses:
+        bindings = {'rotation_input_ptr': 'input', 'output_ptr': 'output', 'fc2_ptr': 'fc2'}
+        for obj in objects:
+            obj['pointer_bindings'] = [bindings.get(name, name) for name in obj.get('pointer_slots', [])]
     if not direct:
         from export_b12x_exl3_routes_aot import export as export_routes
         route_manifest = export_routes(output / 'routes', capacity, experts, topk, block_m)
