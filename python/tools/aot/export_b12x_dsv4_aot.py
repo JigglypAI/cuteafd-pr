@@ -169,7 +169,7 @@ def mc_fp8_core_shapes():
 
 def mc_fp8_f32_shapes():
     # GLM shared down is K-split; dense down F32 shapes already exist.
-    return {(6144, 2048), (6144, 1024)}
+    return {(6144, 2048), (6144, 1024), (6144, 6144)}
 
 
 def native_fp8_head_shapes():
