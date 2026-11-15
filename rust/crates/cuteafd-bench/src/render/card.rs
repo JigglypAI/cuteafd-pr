@@ -194,6 +194,7 @@ pub fn card_svg(report: &Report) -> String {
         doc.text(pad, 205.0, Font::new(12.0, t.ink2), &fit(&precision.label(), 12.0, WIDTH - 2.0 * pad));
     }
     let color = t.status(status);
+    // Include the MC core prefix in the measured width; long badges still fit the cap.
     let width = (text_width(&badge, 14.0) + 36.0).min(520.0);
     doc.text(pad, HEIGHT - 28.0, Font::new(13.0, t.muted), &fit(&build, 13.0, WIDTH - 2.0 * pad - width - 24.0));
     doc.rect_attrs(WIDTH - pad - width, HEIGHT - 46.0, width, 34.0, 17.0,

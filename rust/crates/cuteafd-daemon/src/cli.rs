@@ -343,11 +343,12 @@ pub(crate) fn publish_core_view(view: &cuteafd_loader::plan::checkpoint::Checkpo
 }
 
 pub(crate) fn core_view_settings(view: &cuteafd_loader::plan::checkpoint::CheckpointView)
-    -> [(&'static str, Option<String>); 3] {
+    -> [(&'static str, Option<String>); 4] {
     let declared = view.declared_view();
     [("core-view", declared.map(|v| v.name().to_owned())),
         ("core-view-fingerprint", declared.map(|_| view.fingerprint().to_owned())),
-        ("core-fp8-recipe", declared.map(|_| view.fp8_recipe().unwrap_or("none").to_owned()))]
+        ("core-fp8-recipe", declared.map(|_| view.fp8_recipe().unwrap_or("none").to_owned())),
+        ("core-original-dtype", view.original_core_dtype().map(str::to_owned))]
 }
 
 #[derive(Debug, Clone, Args)]
@@ -849,14 +850,15 @@ mod tests {
             let view = CheckpointView::select(mc.path(), mode)?;
             assert_eq!(super::core_view_settings(&view), [("core-view", Some(mode.name().to_owned())),
                 ("core-view-fingerprint", Some(view.fingerprint().to_owned())),
-                ("core-fp8-recipe", Some(recipe.to_owned()))]);
+                ("core-fp8-recipe", Some(recipe.to_owned())),
+                ("core-original-dtype", Some("BF16".into()))]);
         }
         // A plain (K4/K6-core, vendor FP8 or BF16) checkpoint has no view to report.
         let plain = tempfile::tempdir()?;
         testing::write_snapshot(plain.path(), &testing::kimi_k3_config(), &testing::kimi_k3_tensors(false), None);
         let view = CheckpointView::select(plain.path(), CoreView::Original)?;
         assert_eq!(super::core_view_settings(&view),
-            [("core-view", None), ("core-view-fingerprint", None), ("core-fp8-recipe", None)]);
+            [("core-view", None), ("core-view-fingerprint", None), ("core-fp8-recipe", None), ("core-original-dtype", None)]);
         let mut context = cuteafd_bench::context::ServerContext { settings: vec![cuteafd_bench::report::Setting {
             name: "core-view".into(), value: Some("original".into()), default: Some("original".into()),
             source: "default".into() }], ..Default::default() };

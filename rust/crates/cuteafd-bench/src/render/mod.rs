@@ -65,6 +65,23 @@ pub fn date(rfc3339: &str) -> &str {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn card_prefixes_mc_quality_and_preserves_badge_width_limit() {
+        let mut report = crate::sample::full_report();
+        let before = super::card::card_svg(&report);
+        assert!(!before.contains("Core BF16"));
+        for dtype in ["BF16", "K8", "K6", "FP8"] {
+            report.baseline.as_mut().unwrap().quality.core_dtype = Some(dtype.into());
+            let svg = super::card::card_svg(&report);
+            assert!(svg.contains(&format!("Core {dtype} · KL")), "{dtype}");
+            let badge = svg.lines().find(|line| line.contains("height=\"34\""))
+                .expect("quality chip");
+            let width: f64 = badge.split("width=\"").nth(1).unwrap()
+                .split('"').next().unwrap().parse().unwrap();
+            assert!(width <= 520.0);
+        }
+    }
+
+    #[test]
     fn card_marks_adaptive_and_fixed_drafts() {
         let mut report = crate::sample::full_report();
         for (mode, label) in [("adaptive", "adaptive draft"), ("fixed 4", "fixed draft 4")] {

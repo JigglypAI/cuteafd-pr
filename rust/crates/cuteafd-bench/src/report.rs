@@ -126,6 +126,19 @@ impl ServerInfo {
             .and_then(|s| s.value.as_deref())
     }
 
+    /// MC identity comes from resolved server settings, never the checkpoint name.
+    pub fn mc_core_dtype(&self) -> Option<String> {
+        let original = self.setting("core-original-dtype");
+        let dtype = match self.setting("core-view").or_else(|| self.setting("CUTEAFD_CORE_VIEW")) {
+            Some("k8-compact") => "K8",
+            Some("k6-compact") => "K6",
+            Some("fp8-compact") => "FP8",
+            Some("original") | None => original?,
+            _ => return None,
+        };
+        Some(dtype.to_ascii_uppercase())
+    }
+
     /// The chart and basic sweep stop at C8 on cards with at most 32 GiB per GPU.
     pub fn card_levels(&self) -> &'static [usize] {
         let used: Vec<_> = self.hardware.gpus.iter().filter(|g| g.used).collect();
@@ -897,6 +910,9 @@ impl CheckStatus {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Quality {
+    /// Served dense-core type for MC checkpoints; absent in historical/non-MC reports.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub core_dtype: Option<String>,
     /// Fail if any gated check failed; Pass if every gated check that ran passed.
     pub status: CheckStatus,
     pub checks: Vec<Check>,
@@ -967,7 +983,10 @@ impl Quality {
                 _ => "quality not verified".into(),
             };
         }
-        badge
+        match &self.core_dtype {
+            Some(dtype) => format!("Core {dtype} · {badge}"),
+            None => badge,
+        }
     }
 }
 
@@ -1189,6 +1208,43 @@ mod tests {
         let old: Hardware = serde_json::from_value(json!({"gpus": [{"index": 0, "name": "RTX PRO 6000",
             "power_limit_w": 325.0, "used": true}]})).unwrap();
         assert_eq!(old.line(), "1× RTX PRO 6000 @ 325 W");
+    }
+
+    #[test]
+    fn mc_core_badges_use_resolved_metadata_and_keep_old_reports_unchanged() {
+        let mut server = ServerInfo::default();
+        let mut fidelity = Check::new("fidelity", "Logit fidelity");
+        fidelity.status = CheckStatus::Pass;
+        fidelity.set("kl", 0.006);
+        fidelity.set("top1", 0.976);
+        let mut quality = Quality { checks: vec![fidelity], ..Quality::default() };
+        let plain = "KL 0.006 · top-1 97.6%";
+        assert_eq!(quality.badge(), plain);
+        assert_eq!(server.mc_core_dtype(), None);
+        for (view, original, expected) in [
+            (Some("original"), "BF16", "BF16"),
+            (None, "BF16", "BF16"),
+            (Some("original"), "FP8", "FP8"),
+            (None, "FP8", "FP8"),
+            (Some("k8-compact"), "BF16", "K8"),
+            (Some("k6-compact"), "BF16", "K6"),
+            (Some("fp8-compact"), "BF16", "FP8"),
+        ] {
+            server.configuration.settings = vec![Setting { name: "core-original-dtype".into(),
+                value: Some(original.into()), ..Setting::default() }];
+            if let Some(view) = view {
+                server.configuration.settings.push(Setting { name: "core-view".into(),
+                    value: Some(view.into()), ..Setting::default() });
+            }
+            quality.core_dtype = server.mc_core_dtype();
+            assert_eq!(quality.badge(), format!("Core {expected} · {plain}"));
+        }
+        server.configuration.settings = vec![Setting { name: "core-view".into(),
+            value: Some("original".into()), ..Setting::default() }];
+        assert_eq!(server.mc_core_dtype(), None); // No assumed BF16 original.
+        let old: Quality = serde_json::from_value(json!({"status":"pass", "checks":[]})).unwrap();
+        assert_eq!(old.badge(), "quality ✓");
+        assert!(serde_json::to_value(old).unwrap().get("core_dtype").is_none());
     }
 
     #[test]

@@ -168,7 +168,7 @@ pub fn run(client: &Client, info: &ServerInfo, progress: &Progress, run_id: &str
     let mut run = Run {
         client, info, progress, max_context,
         baseline: Baseline { fingerprint: fingerprint.into(), run_id: run_id.into(), created: now_rfc3339(),
-            card: BasicCard { thinking: Some(info.configuration.thinking_label().into()), capacity: Some(capacity), ..BasicCard::default() }, quality: Quality::default(), seconds: 0.0, thermal: None, fabric: vec![] },
+            card: BasicCard { thinking: Some(info.configuration.thinking_label().into()), capacity: Some(capacity), ..BasicCard::default() }, quality: Quality { core_dtype: info.mc_core_dtype(), ..Quality::default() }, seconds: 0.0, thermal: None, fabric: vec![] },
     };
     // Warm-up: first-use workspaces, graphs and tables (untimed), and a two-point
     // fit of tokens per reference token for the prefill case.
