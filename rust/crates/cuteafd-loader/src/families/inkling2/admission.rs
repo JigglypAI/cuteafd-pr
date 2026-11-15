@@ -107,11 +107,9 @@ pub fn local_package(catalog: &crate::OfficialV41Catalog, manifest: Option<&Path
     workspace().unwrap_or_else(|error| LocalPackage::Missing(format!("{error:#}")))
 }
 
-/// Spark charges per onboarding count and rank: header-exact expert slices
-/// (whole intermediate blocks per rank), endpoint I/O, typed execution owners
-/// sized by the shared segment formulas at the covering export, and the
-/// shared worker runtime residual. The per-package scratch census joins with
-/// the package (stage 3); until then the scratch term is the formula bound.
+/// Spark charges use the shared catalog's physical resident layout, the
+/// shared typed-owner census, and endpoint I/O once per rank. Missing census
+/// inputs remain explicit errors; no checkpoint-byte fraction sizes scratch.
 pub fn spark_charges(catalog: &crate::OfficialV41Catalog, experts: &[LayerExperts], routed: &[usize], ranks: usize,
     prefill: PrefillShape, ingress: cuteafd_core::SparkIngress) -> anyhow::Result<Vec<Vec<SparkCharge>>> {
     if ranks == 0 { return Ok(vec![Vec::new(); routed.len() + 1]); }
