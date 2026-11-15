@@ -636,8 +636,10 @@ residency: allocator reuse can make a resident graph's share zero. ARC keeps
 reuse-backed owners evictable and weights them by max(measured share, estimate),
 including pinned owners in `resident_bytes`. A blocked miss first proves that
 retiring every eligible owner could make the capture fit, then selects only the
-needed victims. Boundary overshoot retires resident occupancy, never a constant
-`charged - reserve` target. No estimate is added to the physical charge.
+needed victims. Capture completion never evicts: destruction cannot shrink the
+measured physical arena, so overshoot is not a reducible eviction target.
+`live_bytes` and `resident_bytes` are diagnostics; neither decides pressure or
+physical admission. No estimate is added to the physical charge.
 Reconciliation uses the settled current level while retaining high-water for
 admission. Bounded physical memory is mandatory; eager fallback or churn is
 preferable to admitting unbounded growth.

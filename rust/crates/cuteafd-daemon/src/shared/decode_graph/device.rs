@@ -1115,17 +1115,9 @@ impl DeviceCache {
         self.unmeasured = false;
         self.captured_since_observation = false;
         self.charged = self.charged.saturating_add(bytes);
-        if self.live_bytes > self.reserve {
-            tracing::warn!(device = self.device, charged = self.charged, live_bytes = self.live_bytes, reserve = self.reserve,
-                "graph cache measured live set over reserve; scheduling eviction, never refusing request");
-            let resident = self.resident_bytes();
-            let mut selected = self.records.values().filter(|r| r.pending_destroy)
-                .fold(0u64, |bytes, r| bytes.saturating_add(r.ordering_bytes()));
-            while resident.saturating_sub(selected) > self.reserve {
-                let Some(id) = self.mark_victim(false) else { break };
-                selected = selected.saturating_add(self.records[&id].ordering_bytes());
-            }
-        }
+        // The driver retains its arena after exec destruction. An overshoot
+        // cannot be evicted away: only a future blocked miss may retire owners
+        // to reuse their pool slots. Never churn an already-fitting hot set.
     }
 
     pub fn destroyed(&mut self, ids: &[u64], measurement: ReleaseMeasurement) {
@@ -1487,27 +1479,26 @@ mod tests {
     }
 
     #[test]
-    fn measured_overshoot_selects_only_the_live_excess_once() {
+    fn measured_overshoot_keeps_a_fitting_hot_set_without_boundary_eviction() {
         let mut cache = DeviceCache::new(-1000, 100);
-        let Miss::Capture(a) = cache.miss(key(1), site(Preference::Capture), None, false) else { panic!() };
-        cache.measured_capture(30);
-        let Miss::Capture(b) = cache.miss(key(2), site(Preference::Capture),
-            Some(Estimate { bytes: 10, nodes: None, node_rate: 1, graph_rate: 0, parallel_width: 1 }), false)
-            else { panic!() };
-        cache.measured_capture(80);
-        assert_eq!(cache.live_bytes, 110);
-        assert_eq!(cache.pending_destroy, 1);
-        cache.unmeasured = true;
-        cache.measured_capture(0);
-        assert_eq!(cache.pending_destroy, 1, "do not count the same live excess twice");
-        let victim = if cache.pending(a) { a } else { b };
-        cache.destroyed(&[victim], ReleaseMeasurement { released: 0 });
-        assert!(cache.live_bytes <= cache.reserve);
-        assert_eq!(cache.charged, 110);
-        assert_eq!(cache.live_bytes, cache.records.values().map(|r| r.bytes).sum::<u64>());
+        let mut ids = Vec::new();
+        for n in 0..3 {
+            let Miss::Capture(id) = cache.miss(key(n), site(Preference::Capture), None, false) else { panic!() };
+            ids.push(id);
+        }
+        cache.measured_capture(110);
+        for _ in 0..16 {
+            for &id in &ids { cache.hit(id); }
+            cache.unmeasured = true;
+            cache.measured_capture(0);
+            assert_eq!(cache.pending_destroy, 0);
+            assert_eq!(cache.counters[&Cycle::Decode].evictions, 0);
+            assert_eq!(cache.charged, 110);
+            assert_eq!(cache.pools.live_execs, 3);
+        }
         let snapshot = serde_json::to_value(cache.snapshot()).unwrap();
         let trace: serde_json::Value = serde_json::from_slice(&cache.trace_snapshot().bytes().unwrap()).unwrap();
-        assert_eq!(snapshot["live_bytes"], cache.live_bytes);
+        assert_eq!(snapshot["live_bytes"], 110);
         assert_eq!(trace["cache"]["live_bytes"], snapshot["live_bytes"]);
         cache.remove_bank(1);
         assert_eq!(cache.live_bytes, 0);
@@ -1525,7 +1516,7 @@ mod tests {
         // Reused owners must still count as pool occupancy and be evictable.
         assert!(matches!(cache.miss(key(10), site(Preference::Capture), estimate(), false), Miss::Eager));
         let victims: Vec<_> = cache.records.iter().filter(|(_, r)| r.pending_destroy).map(|(&id, _)| id).collect();
-        assert!(!victims.is_empty());
+        assert_eq!(victims.len(), 1);
         cache.destroyed(&victims, ReleaseMeasurement { released: 0 });
         assert!(matches!(cache.miss(key(10), site(Preference::Capture), estimate(), false), Miss::Capture(_)));
         cache.measured_capture(0);
@@ -2245,7 +2236,8 @@ mod observer_tests {
         let site = Site { name: "observer-fixture", cycle: Cycle::Decode,
             preference: Preference::Capture, bootstrap: 10, basis: Basis::Bytes,
             spans_devices: false };
-        let key = Identity { bank: 1, site: site.name, key: 1, shape: "1".into() };
+        let next = cache.next_id + 1;
+        let key = Identity { bank: 1, site: site.name, key: next, shape: next.to_string().into() };
         assert!(matches!(cache.miss(key, site, None, false), Miss::Capture(_)));
     }
 
