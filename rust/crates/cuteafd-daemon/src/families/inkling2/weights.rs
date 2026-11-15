@@ -113,6 +113,39 @@ impl<'a> TargetWeights<'a> {
 mod tests {
     use super::*;
     #[test]
+    fn push_records_source_and_generated_final_view_without_reading_or_host_transform() -> Result<()> {
+        use cuteafd_ffi::native_library_lifetime_fixture::Fixture;
+        use cuteafd_loader::plan::testing::{t, write_snapshot};
+        let directory = tempfile::tempdir()?;
+        write_snapshot(directory.path(), &serde_json::json!({}), &[
+            t("model.llm.layers.0.attn.rel_logits_proj.proj", "BF16", &[16, 1024])], None);
+        let checkpoint = Checkpoint::open(directory.path())?;
+        let layout = CoordinatorWeights { rank: 0, layers: vec![0], core: BTreeMap::new(),
+            arena: WeightArenaLayout::new("inkling2/target/0", [(
+                "model.llm.layers.0.attn.rel_logits_proj.proj".into(), 16*1024*2)])? };
+        let fixture = Fixture::build_for_tests()?;
+        let library = fixture.load()?;
+        let device = Device { library: &library, id: 0 };
+        let (weights, records) = crate::shared::experts::rtx::dense::recording(||
+            TargetWeights::record_push(device, &checkpoint, &layout))?;
+        assert_eq!(records.operands.len(), 1, "padded view is generated, never delivered as payload");
+        assert_eq!(records.finishes.len(), 1);
+        let source = weights.operand("model.llm.layers.0.attn.rel_logits_proj.proj")?.buffer;
+        let output = weights.operand("model.llm.layers.0.attn.rel_logits_proj.padded")?.buffer;
+        assert_ne!(source.ptr, output.ptr);
+        assert_eq!(output.bytes, 1024*64*2);
+        assert!(matches!(records.finishes[0], crate::shared::experts::rtx::dense::Finish::PaddedTranspose {
+            source: recorded, output: generated, rows: 16, cols: 1024, padded_cols: 64, ..
+        } if recorded.ptr == source.ptr && generated.ptr == output.ptr));
+        let rank = crate::shared::experts::rtx::dense::RankLayout::new(records.operands, records.steps, device.id)?
+            .with_finishes(&records.finishes);
+        assert_eq!(rank.generated.len(), 1);
+        assert_eq!(rank.generated[0].ptr, output.ptr);
+        assert_eq!(rank.operands.len(), 1);
+        Ok(())
+    }
+
+    #[test]
     fn relative_transpose_preserves_bf16_bits_and_exact_zero_padding() {
         let source = (0..16*1024).flat_map(|n| ((n*29%65536) as u16).to_le_bytes()).collect::<Vec<_>>();
         let padded = transpose_relative(&source).unwrap();
