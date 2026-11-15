@@ -122,6 +122,40 @@ pub(crate) fn prepare<'a>(library: &'a NativeLibrary, programs: &'a Programs<'a>
     Ok(Prepared { kernels: kernels.context("Inkling kernel preload did not run")?, encoding, eos, inputs, admitted, runtime, module_pins, exl3_modules })
 }
 
+/// Admitted grouped delivery entry, still not a public serving executor. The
+/// endpoint is selected before target allocation and native views remain private
+/// until both push participants and Spark workers commit their exact assignment.
+pub(crate) fn deliver<'a>(library: &'a NativeLibrary,
+    view: &cuteafd_loader::plan::checkpoint::CheckpointView, checkpoint: &Checkpoint,
+    prepared: &Prepared<'a>, options: &Options<'_>)
+    -> Result<(super::weights::TargetWeights<'a>, Vec<Vec<crate::shared::experts::rtx::push::PushedExperts<'a>>>)> {
+    use crate::shared::{memory::device::Device, placement::{spark_rings, SparkAdmission}};
+    use cuteafd_core::{ExpertGeometry, SparkEndpoint};
+    use cuteafd_loader::placement::SparkWorkingSet;
+    use cuteafd_transport::{worker_selection::ModelAdmission, TcpTransportConfig};
+    let catalog = cuteafd_loader::read_expert_catalog_view(view)?;
+    let inputs = &prepared.inputs;
+    let admitted = &prepared.admitted;
+    let working = SparkWorkingSet { rtx_layers: inputs.routed[..admitted.onboard].to_vec(),
+        spark_layers: inputs.routed[admitted.onboard..].to_vec(), spark_ranks: inputs.spark_ranks,
+        prefill_lanes: inkling2::LANES };
+    let ingress = inkling2::ingress(inputs.experts.first().and_then(|layer| layer.storage));
+    ensure!(inputs.experts.iter().all(|layer| inkling2::ingress(layer.storage) == ingress),
+        "Inkling initial delivered execution requires uniform native K32 expert ingress");
+    let endpoint = SparkEndpoint { ring_depth: None, capacity: u32::try_from(inputs.prefill.rows)?,
+        ingress, partial_reply_bytes: None };
+    let config = TcpTransportConfig::default();
+    let model = ModelAdmission::for_clients(ExpertGeometry::INKLING2, endpoint,
+        spark_rings(config.max_frame_bytes)?, 1,
+        inkling2::spark_executions(inputs.prefill, catalog.exl3().is_some())?)?;
+    let spark = SparkAdmission::plan_view(view, ExpertGeometry::INKLING2, Some(&catalog),
+        &working, inputs.spark_ranks, model, None)?;
+    let (target, membership) = super::weights::PendingTarget::prepare(Device { library, id: options.device },
+        view, checkpoint, &catalog, inputs, admitted)?;
+    let pending = spark.start_with(options.peers, Some(membership))?;
+    target.finish(&catalog, pending)
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -135,5 +169,9 @@ mod tests {
         assert!(source.contains("inputs.admit(inkling2::request("));
         assert!(!source.contains("ready_tx"));
         assert!(!source.contains("TargetWeights::load"));
+        assert!(source.contains("SparkAdmission::plan_view("));
+        assert!(source.contains("PendingTarget::prepare("));
+        assert!(source.contains("spark.start_with(options.peers, Some(membership))"));
+        assert!(source.contains("target.finish(&catalog, pending)"));
     }
 }
