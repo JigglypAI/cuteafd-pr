@@ -1866,7 +1866,8 @@ mod tests {
         let manifest = std::path::PathBuf::from(std::env::var("CUTEAFD_PROGRAM_MANIFEST")?);
         let programs = library.programs()?.with_manifest(&manifest)?;
         let snapshot = std::path::PathBuf::from(std::env::var("CUTEAFD_TEST_DRAFT_SNAPSHOT")?);
-        let device = Device { library: &library, id: 1 };
+        let id = std::env::var("CUTEAFD_CACHE_TEST_DEVICE").context("oracle harness visible device missing")?.parse()?;
+        let device = Device { library: &library, id };
         let stream = Stream::new(device)?;
         let positions = 65536 + 4096;
         let rope = Allocation::new(device, positions * 256, TEST)?;
@@ -1874,14 +1875,14 @@ mod tests {
             &crate::families::minimax_m3::cache::rotary_bytes(positions, 1e7)))?;
         let cfg = DsparkConfig::read(&snapshot)?;
         let window = cfg.window.context("oracle requires window")?;
-        let requests = DsparkDrafter::arena_requests(&snapshot, GlmDraftRepresentation::Bf16Only, 1)?
-            .remove(&1).context("oracle weight requests")?;
+        let requests = DsparkDrafter::arena_requests(&snapshot, GlmDraftRepresentation::Bf16Only, id)?
+            .remove(&id).context("oracle weight requests")?;
         let arena = DeviceWeightArena::new(device, cuteafd_loader::serving_capacity::WeightArenaLayout::new(
             "window-oracle", requests)?, ArenaTag::drafter_weights("window-oracle"))?;
         let drafter = device.run(|| DsparkDrafter::load_native_with(&library, &programs,
             super::super::dflash::TargetProjection::Bf16, &snapshot, stream.raw,
             1, 1, vec![0; cfg.hidden * 2], rope.buffer, positions,
-            |id, name, bytes| { ensure!(id == 1, "oracle device"); arena.view(name, bytes) }))?;
+            |id, name, bytes| { ensure!(id == device.id, "oracle device"); arena.view(name, bytes) }))?;
         let planes = drafter.window_planes(0)?;
         let marks = WindowSnapshots::new(&stream, planes.iter().map(|plane| plane.bytes).collect(), 2)?;
         let pitch = cfg.taps.len() * cfg.hidden * 2;
