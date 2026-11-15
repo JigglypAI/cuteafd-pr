@@ -1960,7 +1960,16 @@ fn fp8_compact_step_outputs_and_mtp_have_exact_final_storage() -> anyhow::Result
         assert_eq!(actual.dtype, original.dtype);
         assert_eq!(actual.allocation_bytes, original.allocation_bytes);
     }
-    let target = coordinator::RankWeightLayout::from_checkpoint(&fp8, 0, 2)?;
+    // Match executable ownership: SWA is head-split, CSA stays whole.
+    // The diagnostic from_checkpoint TP layout also splits CSA and cannot be
+    // validated against the executor's preweight native selection.
+    let modes = (0..cfg.layers).map(|layer| if cfg.full[layer] {
+        crate::placement::LayerMode::Whole { gpu: ((layer / 4) % 2) as u8,
+            ffn: crate::placement::FfnMode::Owner }
+    } else { crate::placement::LayerMode::HeadSplit }).collect::<Vec<_>>();
+    let owners = ownership::ExecutionOwnership::new(&cfg, 2, ownership::plan(&modes, 0, 1))?;
+    let targets = (0..2).map(|rank| coordinator::RankWeightLayout::for_execution(&fp8, rank, &owners))
+        .collect::<anyhow::Result<Vec<_>>>()?;
     // Final storage admission validates the dedicated output scratch ABI.
     for rows in [1, 64, 65, 2048, 4096] {
         use crate::placement::inventory::ProgramsManifest;
@@ -1979,11 +1988,13 @@ fn fp8_compact_step_outputs_and_mtp_have_exact_final_storage() -> anyhow::Result
             entry(12288, ProjectionOutput::Bf16, scratch), entry(6144, ProjectionOutput::F32, scratch)]}));
         let exact = native::NativeSelection::resolve(&contract, &cfg, 2, 3, rows, Some(&manifest(256)?))?;
         exact.validate_layout(&mtp, rows)?;
-        exact.validate_layout(&target, rows)?;
+        for target in &targets { exact.validate_layout(target, rows)?; }
         let oversized = native::NativeSelection::resolve(&contract, &cfg, 2, 3, rows, Some(&manifest(1 << 30)?))?;
         // The target still uses FP8 scratch; the native MTP no longer does.
         oversized.validate_layout(&mtp, rows)?;
-        assert!(oversized.validate_layout(&target, rows).unwrap_err().is::<native::NativeOwnerMismatch>());
+        for target in &targets {
+            assert!(oversized.validate_layout(target, rows).unwrap_err().is::<native::NativeOwnerMismatch>());
+        }
         let mut stale = entry(6144, ProjectionOutput::F32, 256);
         stale["geometry"]["output_dtype"] = serde_json::json!("torch.bfloat16");
         let bad = ProgramsManifest::from_manifest(&serde_json::json!({"programs":[
