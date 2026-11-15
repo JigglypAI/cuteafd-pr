@@ -145,7 +145,7 @@ fn exl3_checkpoint_accepts_per_expert_k4_modules_split_by_row_parity() {
     assert!(report.config_error.is_none(), "{:?}", report.config_error);
     assert!(report.unclassified.is_empty(), "{:?}", report.unclassified);
     assert!(report.components.iter().all(|c| c.rejected == 0), "{:?}", report.components);
-    assert_eq!(report.experts.unwrap().package, "inkling2:exl3-k4");
+    assert_eq!(report.experts.unwrap().package, "inkling2:exl3-k45");
     let checkpoint = Checkpoint::open(dir.path()).unwrap();
     assert_eq!(expert_storage(&checkpoint, 0).unwrap(), ExpertStorage::Exl3 { bits: 4 });
 }

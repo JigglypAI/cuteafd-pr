@@ -448,7 +448,7 @@ impl FamilyModel for Model {
         } else if operand.is_inkling_nvfp4() {
             ("inkling2:nvfp4a4", 16)
         } else if operand.exl3_bits().is_some_and(|bits| bits == 4) {
-            ("inkling2:exl3-k4", 128)
+            ("inkling2:exl3-k45", 128)
         } else { return None; };
         Some(ExpertContract {
             package: package.into(), block,
