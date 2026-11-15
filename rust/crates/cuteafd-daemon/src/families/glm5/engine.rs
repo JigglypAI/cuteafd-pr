@@ -3381,21 +3381,23 @@ pub(crate) fn tensor_fp8_prefill() -> bool {
 }
 
 /// Prefill sparse MLA kernel of glm_mla_prefill.cu (its `kernel` argument), or None for the
-/// b12x program: CUTEAFD_MLA_PREFILL=e4m3-p2 (2, the default: E4M3 query, two-term E4M3 P),
-/// e4m3 (1: one-term P), e4m3-q2 (3: two-term query), e4m3-q2p2 (4), f16 (0: the F16 kernel)
-/// or b12x.
+/// b12x program: CUTEAFD_MLA_PREFILL=e4m3-q2p2 (4, the default: two-term E4M3 query and P,
+/// about 7 significant bits each), e4m3-p2 (2: one-term query, the former default), e4m3-q2
+/// (3: one-term P), e4m3 (1: one-term query and P), f16 (0: the F16 kernel) or b12x. A
+/// one-term query carries 3 mantissa bits into every score: 5-9% relative output error on the
+/// native selftest against 0.18% for the two-term kernels and F16.
 pub(crate) fn native_mla_prefill() -> Option<i32> {
     static KERNEL: std::sync::OnceLock<Option<i32>> = std::sync::OnceLock::new();
     *KERNEL.get_or_init(|| match std::env::var("CUTEAFD_MLA_PREFILL").as_deref() {
         Ok("b12x") => None,
         Ok("f16") => Some(0),
         Ok("e4m3") => Some(1),
-        Ok("e4m3-p2") | Err(_) => Some(2),
+        Ok("e4m3-p2") => Some(2),
         Ok("e4m3-q2") => Some(3),
-        Ok("e4m3-q2p2") => Some(4),
+        Ok("e4m3-q2p2") | Err(_) => Some(4),
         Ok(other) => {
-            tracing::warn!(value = other, "unknown CUTEAFD_MLA_PREFILL; using e4m3-p2");
-            Some(2)
+            tracing::warn!(value = other, "unknown CUTEAFD_MLA_PREFILL; using e4m3-q2p2");
+            Some(4)
         }
     })
 }

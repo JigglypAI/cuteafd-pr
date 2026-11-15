@@ -412,7 +412,7 @@ mla_prefill_kernel(const bf16* __restrict__ q, const uint8_t* __restrict__ kv, c
 
 
 // ---------------------------------------------------------------------------
-// E4M3 tensor-core kernel (kernel 2, two-term P, is the engine default): QK and
+// E4M3 tensor-core kernel (kernel 4, two-term query and P, is the engine default): QK and
 // PV on mma.m16n8k32.e4m3 (twice the F16 rate on SM120), the records' codes
 // copied as stored (cp.async, no dequantization), RoPE on BF16 tensor cores.
 //
