@@ -151,8 +151,8 @@ def program_shards(catalog, workers):
     if len(set(names)) != len(names) or len(set(labels)) != len(labels):
         raise ValueError("program catalog contains duplicate names or labels")
     count = min(workers, len(programs))
-    return [[label for program in programs[index::count] for label in program["labels"]]
-            for index in range(count)]
+    return [[label for program in programs[len(programs) * index // count:len(programs) * (index + 1) // count]
+             for label in program["labels"]] for index in range(count)]
 
 
 def merge_program_shards(catalog, directories, output):
@@ -200,7 +200,7 @@ def merge_program_shards(catalog, directories, output):
     for name, data in (("program-records.json", records), ("comparison-plans.json", {label: plans[label] for label in labels})):
         (output / name).write_text(json.dumps(data, indent=2, sort_keys=name == "program-records.json") + "\n")
     context = contexts[0]
-    context["source_reads_sha256"] = {name: value for part in contexts for name, value in part["source_reads_sha256"].items()}
+    context["source_reads_sha256"] = dict(sorted({name: value for part in contexts for name, value in part["source_reads_sha256"].items()}.items()))
     context["seconds"] = sum(part["seconds"] for part in contexts)
     context["backend_reuse"] = {key: sum(part.get("backend_reuse", {}).get(key, 0) for part in contexts) for key in ("hits", "misses")}
     (output / "comparison-context.json").write_text(json.dumps(context, indent=2) + "\n")

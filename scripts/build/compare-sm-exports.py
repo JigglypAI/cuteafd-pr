@@ -816,6 +816,7 @@ def worker(payload):
             runpy.run_path(str(path), run_name="__main__", init_globals={
                 "_record_construction": recorded_construction,
                 "_program_records": ProgramRecords(),
+                "_disable_program_cache": recorder is not None and recorder.scoped,
                 "_catalog_only": payload.get("catalog_only", False),
                 "_selected_object_labels": payload.get("selected_objects")})
     if torch.cuda.get_device_properties(0).multi_processor_count != payload["sms"]:
@@ -840,6 +841,16 @@ def worker(payload):
         scoped = recorder.scoped
         recorder.scoped = False
         summary["source_reads_sha256"] = recorder.reads()
+        if scoped:
+            # Worker import order and cache bookkeeping are not semantic inputs.
+            # A conservative job inventory makes its skip independent of shards.
+            inventory = [source for directory in ("python/tools", "third_party/sparkinfer/b12x")
+                         for source in (ROOT / directory).rglob("*.py")]
+            inventory += [ROOT / "rust/crates/cuteafd-core/src/dspark_verify.rs",
+                          ROOT / "scripts/build/verify-sparkinfer-source.py"]
+            summary["source_reads_sha256"].update({str(source.relative_to(ROOT)): sha(source.read_bytes())
+                                                 for source in inventory if source.is_file()})
+            summary["source_reads_sha256"] = dict(sorted(summary["source_reads_sha256"].items()))
         recorder.scoped = scoped
         summary["stage0_inputs"] = records_module.stage0_inputs(ROOT, payload, capability)
         if backend_cache is not None:

@@ -1876,7 +1876,8 @@ def main() -> None:
     # Per-program reuse (python/tools/lib/_export_cache.py): only under the export
     # cache's recorder. Programs compile independently of which others the
     # geometry list requests; their recipes read every argument except these.
-    program_cache = _export_cache.ProgramCache(output) if _export_cache else None
+    program_cache = (_export_cache.ProgramCache(output)
+                     if _export_cache and not globals().get("_disable_program_cache") else None)
     if program_cache is not None:
         program_cache.start()
     for family, suffix, op, params, thunk in work:

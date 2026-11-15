@@ -837,7 +837,7 @@ def test_program_shards_keep_card_plans_together_and_reject_duplicates():
     spec.loader.exec_module(publisher)
     catalog = {"programs": [{"name": "a", "labels": ["a_sm170", "a_sm188"]},
                             {"name": "b", "labels": ["b"]}, {"name": "c", "labels": ["c"]}]}
-    assert publisher.program_shards(catalog, 2) == [["a_sm170", "a_sm188", "c"], ["b"]]
+    assert publisher.program_shards(catalog, 2) == [["a_sm170", "a_sm188"], ["b", "c"]]
     catalog["programs"].append(catalog["programs"][0])
     with pytest.raises(ValueError, match="duplicate"):
         publisher.program_shards(catalog, 2)
