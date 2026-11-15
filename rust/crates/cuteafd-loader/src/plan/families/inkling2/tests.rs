@@ -136,6 +136,14 @@ fn mixed_native_checkpoint_reads_each_layers_storage_from_its_headers() {
         assert!(layer.half[0] >= layer.half[1], "{layer:?}");
     }
     assert_eq!(experts[3].whole, 4 * (2 * 2304 * 4608 + 4608 * 2304) + 4 * (2 * 2304 * 144 + 4608 * 72));
+    let catalog = crate::read_expert_catalog(dir.path()).unwrap();
+    let tensors = catalog.fp8().unwrap();
+    let groups = tensors.homogeneous_layers(&[0, 1, 2, 3]).unwrap();
+    assert_eq!(groups.len(), 2);
+    assert_eq!(groups[0].1, [0, 1, 2]);
+    assert!(groups[0].0.dynamic_nvfp4());
+    assert_eq!(groups[1].1, [3]);
+    assert_eq!(groups[1].0.format(), crate::formats::fp8_experts::ExpertFormat::Mxfp8);
 }
 
 #[test]
@@ -148,6 +156,8 @@ fn exl3_checkpoint_accepts_per_expert_k4_modules_split_by_row_parity() {
     assert_eq!(report.experts.unwrap().package, "inkling2:exl3-k45");
     let checkpoint = Checkpoint::open(dir.path()).unwrap();
     assert_eq!(expert_storage(&checkpoint, 0).unwrap(), ExpertStorage::Exl3 { bits: 4 });
+    let catalog = crate::read_expert_catalog(dir.path()).unwrap();
+    assert_eq!(catalog.exl3().unwrap().decoder_tiers(), &[4, 5]);
 }
 
 #[test]
