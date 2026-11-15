@@ -248,17 +248,15 @@ impl Layout {
                 operand(
                     "key_cache",
                     "uint8",
-                    format!("[pool_pages,64,{h},128] E4M3 bytes"),
+                    format!("[pool_pages,64,{}] scaled E4M3 records", kv_plane_record_bytes(h as usize)),
                     "in",
                 ),
                 operand(
                     "value_cache",
                     "uint8",
-                    format!("[pool_pages,64,{h},128] E4M3 bytes"),
+                    format!("[pool_pages,64,{}] scaled E4M3 records", kv_plane_record_bytes(h as usize)),
                     "in",
                 ),
-                operand("k_descale", "float32", format!("[batch,{h}]"), "in"),
-                operand("v_descale", "float32", format!("[batch,{h}]"), "in"),
                 operand("page_table", "int32", "[batch,table_stride]", "in"),
                 operand(
                     "cache_lengths",
@@ -330,6 +328,9 @@ impl Layout {
                 ("page_rows", 64),
                 ("query_heads", 16 * kv_heads),
                 ("kv_heads", kv_heads),
+                ("record_bytes", kv_plane_record_bytes(kv_heads as usize) as u32),
+                ("scale_offset", kv_heads * 128 * 64),
+                ("scale_stride", kv_plane_record_bytes(kv_heads as usize) as u32 - kv_heads * 128),
                 ("head_dim", 128),
                 ("block_tokens", 128),
                 ("topk", 16),
@@ -454,8 +455,6 @@ pub struct AttentionBatch {
     pub query: Buffer,
     pub keys: Buffer,
     pub values: Buffer,
-    pub key_scales: Buffer,
-    pub value_scales: Buffer,
     pub pages: Buffer,
     pub lengths: Buffer,
     pub query_offsets: Buffer,
@@ -464,6 +463,9 @@ pub struct AttentionBatch {
     pub lse: Buffer,
     pub scratch: Buffer,
 }
+/// Inline E4M3 payload and per-head FP32 scales, padded to a 16-byte row.
+pub const fn kv_plane_record_bytes(heads: usize) -> usize { (heads * 132 + 15) / 16 * 16 }
+
 fn bytes(count: usize, width: usize) -> Result<usize> {
     count
         .checked_mul(width)
@@ -545,7 +547,7 @@ impl Layout {
         )?;
         Ok(buffers)
     }
-    fn attention(self, b: AttentionBatch) -> Result<[Buffer; 12]> {
+    fn attention(self, b: AttentionBatch) -> Result<[Buffer; 10]> {
         self.check_rows(b.rows)?;
         pages(b.pool_pages, b.table_stride)?;
         if self.mode.index()
@@ -560,8 +562,6 @@ impl Layout {
             b.query,
             b.keys,
             b.values,
-            b.key_scales,
-            b.value_scales,
             b.pages,
             b.lengths,
             b.query_offsets,
@@ -574,10 +574,8 @@ impl Layout {
             buffers,
             [
                 bytes(b.rows, self.query_heads() as usize * 256)?,
-                bytes(b.pool_pages, self.kv_heads as usize * 8192)?,
-                bytes(b.pool_pages, self.kv_heads as usize * 8192)?,
-                bytes(b.batch, self.kv_heads as usize * 4)?,
-                bytes(b.batch, self.kv_heads as usize * 4)?,
+                bytes(b.pool_pages, kv_plane_record_bytes(self.kv_heads as usize) * 64)?,
+                bytes(b.pool_pages, kv_plane_record_bytes(self.kv_heads as usize) * 64)?,
                 bytes(bytes(b.batch, b.table_stride)?, 4)?,
                 bytes(b.batch, 4)?,
                 bytes(b.batch + 1, 4)?,
@@ -728,6 +726,9 @@ mod tests {
                 geometry[key] = json!(n);
             }
             geometry["softmax_scale"] = json!(0.08838834764831845);
+            geometry["record_bytes"] = json!(528);
+            geometry["scale_offset"] = json!(32768);
+            geometry["scale_stride"] = json!(16);
         }
         let operands = layout.operands();
         let spec = ProgramSpec {
@@ -804,6 +805,9 @@ mod tests {
             else {
                 spec.geometry["query_heads"] = json!(32);
                 spec.geometry["kv_heads"] = json!(2);
+                spec.geometry["record_bytes"] = json!(272);
+                spec.geometry["scale_offset"] = json!(16384);
+                spec.geometry["scale_stride"] = json!(16);
             }
             spec.scratch.insert("scratch".into(), layout.scratch);
             let entry = json!({"op":if mode.index() { "minimax_index" } else { "minimax_attention" },
@@ -825,35 +829,30 @@ mod tests {
     }
 
     #[test]
-    fn narrow_attention_requires_packed_rank_local_descales_and_exact_extents() {
+    fn narrow_attention_requires_scaled_rank_local_records_and_exact_extents() {
         for mode in [Mode::AttentionDecode, Mode::AttentionExtend] {
             for rows in [1, 2, 63, 64] {
                 let layout = Layout::for_heads(mode, 64, 64).unwrap();
-                let [query, keys, values, key_scales, value_scales, pages, lengths, query_offsets, selections, output, lse, scratch] = buffers();
+                let [query, keys, values, pages, lengths, query_offsets, selections, output, lse, scratch] = buffers();
                 let exact = |b: Buffer, bytes| Buffer { bytes, ..b };
                 let batch = rows;
                 let b = AttentionBatch { rows, batch, table_stride: 33, pool_pages: 2,
-                    query: exact(query, rows * 8192), keys: exact(keys, 2 * 16384),
-                    values: exact(values, 2 * 16384), key_scales: exact(key_scales, batch * 8),
-                    value_scales: exact(value_scales, batch * 8), pages: exact(pages, batch * 33 * 4),
+                    query: exact(query, rows * 8192), keys: exact(keys, 2 * 17408),
+                    values: exact(values, 2 * 17408), pages: exact(pages, batch * 33 * 4),
                     lengths: exact(lengths, batch * 4), query_offsets: exact(query_offsets, (batch + 1) * 4),
                     selections: exact(selections, 2 * 64 * 16 * 4), output: exact(output, rows * 8192),
                     lse: exact(lse, rows * 128), scratch: exact(scratch, layout.scratch as usize) };
                 assert!(layout.attention(b).is_ok());
                 assert!(Layout::new(mode, 64, 64).unwrap().attention(b).is_err());
-                for i in 0..12 {
+                for i in 0..10 {
                     let mut short = b;
                     let target = match i { 0 => &mut short.query, 1 => &mut short.keys,
-                        2 => &mut short.values, 3 => &mut short.key_scales, 4 => &mut short.value_scales,
-                        5 => &mut short.pages, 6 => &mut short.lengths, 7 => &mut short.query_offsets,
-                        8 => &mut short.selections, 9 => &mut short.output, 10 => &mut short.lse,
+                        2 => &mut short.values, 3 => &mut short.pages, 4 => &mut short.lengths, 5 => &mut short.query_offsets,
+                        6 => &mut short.selections, 7 => &mut short.output, 8 => &mut short.lse,
                         _ => &mut short.scratch };
                     target.bytes -= 1;
                     assert!(layout.attention(short).is_err(), "{mode:?} operand {i}");
                 }
-                let offset = Buffer { ptr: (key_scales.ptr as usize + 8) as *mut c_void, ..b.key_scales };
-                assert!(layout.attention(AttentionBatch { key_scales: offset, ..b }).is_err());
-                assert!(layout.attention(AttentionBatch { value_scales: offset, ..b }).is_err());
                 assert!(layout.attention(AttentionBatch { output: b.query, ..b }).is_err());
                 assert!(layout.attention(AttentionBatch { keys: Buffer { device_id: 1, ..b.keys }, ..b }).is_err());
             }
@@ -1026,7 +1025,7 @@ mod tests {
             .is_err());
         for mode in [Mode::AttentionDecode, Mode::AttentionExtend] {
             let layout = Layout::new(mode, 64, 16).unwrap();
-            let [query, keys, values, key_scales, value_scales, pages, lengths, query_offsets, selections, output, lse, scratch] =
+            let [query, keys, values, pages, lengths, query_offsets, selections, output, lse, scratch] =
                 buffers();
             let b = AttentionBatch {
                 rows: 2,
@@ -1036,8 +1035,6 @@ mod tests {
                 query,
                 keys,
                 values,
-                key_scales,
-                value_scales,
                 pages,
                 lengths,
                 query_offsets,

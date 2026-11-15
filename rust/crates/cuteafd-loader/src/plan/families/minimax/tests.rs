@@ -313,9 +313,9 @@ fn cache_geometry_preserves_native_fp8_pages_and_physical_layer_owners() {
     let checkpoint = Checkpoint::open(dir.path()).unwrap();
     let model = MINIMAX_M3.open(&checkpoint).unwrap();
     let rows = crate::placement::families::minimax_m3::PAGE_ROWS;
-    let kv = rows * cfg.kv_heads as u64 * cfg.head_dim as u64;
+    let kv = rows * cuteafd_ffi::minimax_m3::kv_plane_record_bytes(cfg.kv_heads) as u64;
     let index = rows * (cfg.msa.index_dim as u64 + 4);
-    assert_eq!((kv, kv, index), (32768, 32768, 8448));
+    assert_eq!((kv, kv, index), (33792, 33792, 8448));
     let manifest: serde_json::Value = serde_json::from_str(include_str!(
         "../../../../../cuteafd-ffi/tests/fixtures/minimax_msa_programs.json")).unwrap();
     let mut cache_operands = 0;
@@ -323,7 +323,7 @@ fn cache_geometry_preserves_native_fp8_pages_and_physical_layer_owners() {
         .flat_map(|program| program["pointers"].as_array().unwrap())
         .filter(|pointer| matches!(pointer["name"].as_str(), Some("key_cache" | "value_cache"))) {
         assert_eq!(pointer["dtype"], "uint8");
-        assert_eq!(pointer["shape"], "[pool_pages,64,4,128] E4M3 bytes");
+        assert_eq!(pointer["shape"], "[pool_pages,64,528] scaled E4M3 records");
         cache_operands += 1;
     }
     assert_eq!(cache_operands, 4);
@@ -1399,7 +1399,7 @@ fn request_descriptor_allocations_equal_recipe_on_one_and_two_rtx() {
                     add(&mut expected, &format!("{prefix}.metadata"), location, metadata.buffers());
                     let uploads = capacity.metadata_uploads(prefill);
                     assert_eq!(uploads.iter().map(|(name, _)| *name).collect::<Vec<_>>(),
-                        if prefill { vec!["positions", "slots", "batch_ids", "causal_lengths", "cache_lengths", "query_offsets"] }
+                        if prefill { vec!["positions", "slots", "causal_lengths", "cache_lengths", "query_offsets"] }
                         else { vec!["positions", "slots", "causal_lengths", "cache_lengths"] });
                     add(&mut expected, &format!("{prefix}.metadata"), Location::PINNED,
                         uploads.into_iter().map(|(name, bytes)| (format!("{name}.upload"), bytes)));
@@ -1555,13 +1555,13 @@ fn heads_recipe_fixture_with_experts(experts: usize) -> (tempfile::TempDir, crat
             let layout = cuteafd_ffi::minimax_m3::Layout::for_heads(mode, rows, extent).unwrap();
             entry["name"] = layout.name().into();
             if index { entry["geometry"]["heads"] = 2.into(); }
-            else { entry["geometry"]["query_heads"] = 32.into(); entry["geometry"]["kv_heads"] = 2.into(); }
+            else { entry["geometry"]["query_heads"] = 32.into(); entry["geometry"]["kv_heads"] = 2.into(); entry["geometry"]["record_bytes"] = 272.into(); entry["geometry"]["scale_offset"] = 16384.into(); entry["geometry"]["scale_stride"] = 16.into(); }
             entry["scratch_bytes_at_capacity"]["scratch"] = layout.scratch.into();
             for pointer in entry["pointers"].as_array_mut().unwrap() {
                 let shape = pointer["shape"].as_str().unwrap();
                 pointer["shape"] = if pointer["name"] == "scratch" { format!("[{}]", layout.scratch) }
                     else if pointer["name"] == "q2k_indices" { shape.replacen("[4,", "[2,", 1) }
-                    else { shape.replace(",4]", ",2]").replace(",4,128]", ",2,128]").replace("[rows,64", "[rows,32") }.into();
+                    else { shape.replace(",4]", ",2]").replace(",4,128]", ",2,128]").replace(",528]", ",272]").replace("[rows,64", "[rows,32") }.into();
             }
         } else if name == "minimax_norm_rope_h64" || name == "minimax_norm_rope_h4" {
             let whole = if name.ends_with("h64") { 64 } else { 4 };
@@ -1577,14 +1577,16 @@ fn heads_recipe_fixture_with_experts(experts: usize) -> (tempfile::TempDir, crat
             entry["geometry"]["heads"] = 2.into();
             entry["scratch_bytes_at_capacity"]["scratch"] = (4096 * 5 * 128 * 2).into();
             for pointer in entry["pointers"].as_array_mut().unwrap() {
-                pointer["shape"] = pointer["shape"].as_str().unwrap().replace(",4,128]", ",2,128]")
+                pointer["shape"] = pointer["shape"].as_str().unwrap().replace(",4,128]", ",2,128]").replace(",528]", ",272]")
                     .replace(",4]", ",2]").replace(",9,128]", ",5,128]").into();
             }
         } else if name == "minimax_kv_pack" {
             entry["name"] = "minimax_kv_pack_h2".into();
             entry["geometry"]["heads"] = 2.into();
+            entry["geometry"]["record_bytes"] = 272.into();
+            entry["geometry"]["scale_offset"] = 16384.into(); entry["geometry"]["scale_stride"] = 16.into();
             for pointer in entry["pointers"].as_array_mut().unwrap() {
-                pointer["shape"] = pointer["shape"].as_str().unwrap().replace(",4", ",2").into();
+                pointer["shape"] = pointer["shape"].as_str().unwrap().replace(",4", ",2").replace(",528]", ",272]").into();
             }
         }
     }
@@ -1633,7 +1635,7 @@ fn heads_recipe_matches_native_cache_units_peer_slots_and_one_tail_per_backing()
                 let id = if let Some(plane) = name.strip_prefix("layer.") {
                     let (layer, plane) = plane.split_once('.').unwrap();
                     let plane = match plane { "keys" => "keys", "values" => "values", "index" => "index", _ => panic!() };
-                    assert_eq!(bytes, if plane == "index" { 8448 } else { 16384 });
+                    assert_eq!(bytes, if plane == "index" { 8448 } else { 17408 });
                     Owner::HeadsKv { gpu, layer: layer.parse().unwrap(), plane }.id()
                 } else { format!("{}.{}", Owner::Cache { gpu }.id(), name) };
                 assert_eq!(allocations.get(&id), Some(&(location, bytes)), "{id}");
@@ -1704,15 +1706,23 @@ fn explicit_heads_and_layers_both_qualify_serving() {
 fn heads_cache_geometry_keeps_one_replicated_index_per_rank() {
     use crate::serving_capacity::{CacheOptions, KvPlacement};
     use crate::placement::AttentionPlacement;
-    let (dir, _, _) = fixture();
+    let (dir, config, _) = fixture();
+    let cfg = MiniMaxM3Config::from_hf(&config).unwrap();
     let model = MINIMAX_M3.open(&Checkpoint::open(dir.path()).unwrap()).unwrap();
     let geometry = model.cache_geometry(CacheOptions { coordinator_ranks: 2,
         attention_placement: Some(AttentionPlacement::Heads), ..Default::default() }).unwrap().unwrap();
     assert_eq!(geometry.placement, KvPlacement::PartitionedHeads);
     let automatic = model.cache_geometry(CacheOptions { coordinator_ranks: 2, ..Default::default() }).unwrap().unwrap();
     assert_eq!(automatic, geometry);
-    for rank in geometry.ranks {
-        assert_eq!(rank.persistent_unit_bytes, 4 * (16384 + 16384 + 8448));
+    for (gpu, rank) in geometry.ranks.into_iter().enumerate() {
+        use crate::families::minimax_m3::execution::{HeadsLayout, MsaCache};
+        let release = MiniMaxM3Config::from_hf(&serde_json::from_str(include_str!(
+            "../../../families/minimax_m3/fixtures/config.json")).unwrap()).unwrap();
+        let native = MsaCache::for_heads(&HeadsLayout::new(&release, gpu as u8, 16).unwrap(),
+            1, 1, 64).unwrap();
+        let bytes = native.page_planes().into_iter().map(|(_, bytes)| bytes).sum::<u64>() * cfg.layers as u64;
+        assert_eq!(rank.persistent_unit_bytes, bytes, "planner must charge the native scaled records");
+        assert_eq!(bytes, 4 * (17408 + 17408 + 8448));
     }
 }
 
@@ -1881,8 +1891,8 @@ fn heads_gather_uses_sliced_targets_mount_sources_and_replicated_host_prefix_pag
     assert_eq!(layers.owners, crate::placement::families::minimax_m3::layer_owners(60, 2));
     let geometry = |bytes: u64| cuteafd_core::prefix::HostCacheGeometry {
         unit_rows: 64, page_bytes: bytes * 60, mark_bytes: 0, draft_bytes: 0 };
-    assert_eq!(heads.host_prefix.chunk_bytes, geometry(2 * (16384 + 16384 + 8448)).chunk_bytes().min(1 << 30));
-    assert_eq!(layers.host_prefix.chunk_bytes, geometry(32768 + 32768 + 8448).chunk_bytes().min(1 << 30));
+    assert_eq!(heads.host_prefix.chunk_bytes, geometry(2 * (17408 + 17408 + 8448)).chunk_bytes().min(1 << 30));
+    assert_eq!(layers.host_prefix.chunk_bytes, geometry(33792 + 33792 + 8448).chunk_bytes().min(1 << 30));
     assert!(layers.push_host_envelopes.iter().all(Option::is_none));
     // A namespace requires push even when expert candidates are mount-only.
     // Count zero can still load the target through the admitted ring-only route.

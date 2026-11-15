@@ -140,14 +140,11 @@ pub(crate) struct Request {
     pub pool_pages: usize,
     pub positions: Buffer,
     pub slots: Buffer,
-    pub batch_ids: Buffer,
     pub cos_sin: Buffer,
     pub pages: Buffer,
     pub causal_lengths: Buffer,
     pub cache_lengths: Buffer,
     pub query_offsets: Buffer,
-    pub key_descale: Buffer,
-    pub value_descale: Buffer,
     pub key_cache: Buffer,
     pub value_cache: Buffer,
     pub index_cache: Buffer,
@@ -198,7 +195,6 @@ impl Workspace<'_> {
         Ok(minimax_m3::AttentionBatch {
             rows: r.rows, batch, table_stride: r.table_stride, pool_pages: r.pool_pages,
             query: self.plane("attention.query")?, keys: r.key_cache, values: r.value_cache,
-            key_scales: r.key_descale, value_scales: r.value_descale,
             pages: r.pages, lengths: r.cache_lengths, query_offsets: r.query_offsets,
             selections: self.plane("selections")?, output: self.plane("attention.output")?,
             lse: self.plane("attention.lse")?, scratch: self.plane("attention.scratch")?,
@@ -269,9 +265,8 @@ impl Workspace<'_> {
                     output: key, scratch: self.plane(kernels.key.layout.kind.name())?,
                 }, stream.raw)?;
                 kernels.kv.kv(forward::KvBatch {
-                    rows: r.rows, batch, pool_pages: r.pool_pages,
-                    key, value: p.value, slots: r.slots, batch_ids: r.batch_ids,
-                    key_descale: r.key_descale, value_descale: r.value_descale,
+                    rows: r.rows, pool_pages: r.pool_pages,
+                    key, value: p.value, slots: r.slots,
                     key_cache: r.key_cache, value_cache: r.value_cache,
                 }, stream.raw)?;
                 kernels.index.index(producers::IndexProducerBatch {
@@ -381,13 +376,13 @@ mod tests {
                     entry["capacity_rows"].as_u64().unwrap() as u32, extent as u32).unwrap();
                 entry["name"] = layout.name().into();
                 if index { entry["geometry"]["heads"] = 2.into(); }
-                else { entry["geometry"]["query_heads"] = 32.into(); entry["geometry"]["kv_heads"] = 2.into(); }
+                else { entry["geometry"]["query_heads"] = 32.into(); entry["geometry"]["kv_heads"] = 2.into(); entry["geometry"]["record_bytes"] = 272.into(); entry["geometry"]["scale_offset"] = 16384.into(); entry["geometry"]["scale_stride"] = 16.into(); }
                 entry["scratch_bytes_at_capacity"]["scratch"] = layout.scratch.into();
                 for pointer in entry["pointers"].as_array_mut().unwrap() {
                     let shape = pointer["shape"].as_str().unwrap();
                     pointer["shape"] = if pointer["name"] == "scratch" { format!("[{}]", layout.scratch) }
                         else if pointer["name"] == "q2k_indices" { shape.replacen("[4,", "[2,", 1) }
-                        else { shape.replace(",4]", ",2]").replace(",4,128]", ",2,128]")
+                        else { shape.replace(",4]", ",2]").replace(",4,128]", ",2,128]").replace(",528]", ",272]")
                             .replace("[rows,64", "[rows,32") }.into();
                 }
                 continue;
@@ -419,15 +414,17 @@ mod tests {
                 for pointer in entry["pointers"].as_array_mut().unwrap() {
                     let shape = pointer["shape"].as_str().unwrap();
                     pointer["shape"] = if kind == producers::Kind::IndexHeads {
-                        shape.replace(",4,128]", ",2,128]").replace(",4]", ",2]")
+                        shape.replace(",4,128]", ",2,128]").replace(",528]", ",272]").replace(",4]", ",2]")
                             .replace(",9,128]", ",5,128]")
                     } else { shape.replace(&from, &to) }.into();
                 }
             } else if name == "minimax_kv_pack" {
                 entry["name"] = "minimax_kv_pack_h2".into();
                 entry["geometry"]["heads"] = 2.into();
+                entry["geometry"]["record_bytes"] = 272.into();
+                entry["geometry"]["scale_offset"] = 16384.into(); entry["geometry"]["scale_stride"] = 16.into();
                 for pointer in entry["pointers"].as_array_mut().unwrap() {
-                    pointer["shape"] = pointer["shape"].as_str().unwrap().replace(",4", ",2").into();
+                    pointer["shape"] = pointer["shape"].as_str().unwrap().replace(",4", ",2").replace(",528]", ",272]").into();
                 }
             }
         }
@@ -517,9 +514,9 @@ mod tests {
         let buffer = Buffer::default();
         let mut request = Request { rows: 1, context: 1, positions_capacity: 4097,
             table_width: 68, table_stride: 68, pool_pages: 65,
-            positions: buffer, slots: buffer, batch_ids: buffer, cos_sin: buffer,
+            positions: buffer, slots: buffer, cos_sin: buffer,
             pages: buffer, causal_lengths: buffer, cache_lengths: buffer,
-            query_offsets: buffer, key_descale: buffer, value_descale: buffer,
+            query_offsets: buffer,
             key_cache: buffer, value_cache: buffer, index_cache: buffer };
         for context in [1, 63, 64, 65, 4095, 4096, 4097] {
             request.context = context;
@@ -560,16 +557,23 @@ mod tests {
 
     fn native_seed(device: Device<'_>, request: Request, tokens: usize) -> Result<()> {
         let pages = tokens.div_ceil(64);
-        for (buffer, stride) in [(request.key_cache, 32768), (request.value_cache, 32768),
+        let record_bytes = cuteafd_ffi::minimax_m3::kv_plane_record_bytes(4);
+        for (buffer, stride) in [(request.key_cache, 64 * record_bytes), (request.value_cache, 64 * record_bytes),
             (request.index_cache, 8448)] {
             let mut bytes = vec![0; pages * stride];
             for (page, record) in bytes.chunks_exact_mut(stride).enumerate() {
-                let key_bytes = if stride == 8448 { 8192 } else { stride };
-                for (at, value) in record[..key_bytes].iter_mut().enumerate() {
-                    *value = [0x28, 0xb0, 0x38, 0xa8][(page * 7 + at * 3 + at / 128) % 4];
-                }
                 if stride == 8448 {
-                    for value in record[key_bytes..].chunks_exact_mut(4) { value.copy_from_slice(&1f32.to_le_bytes()); }
+                    for (at, value) in record[..8192].iter_mut().enumerate() {
+                        *value = [0x28, 0xb0, 0x38, 0xa8][(page * 7 + at * 3 + at / 128) % 4];
+                    }
+                    for value in record[8192..].chunks_exact_mut(4) { value.copy_from_slice(&1f32.to_le_bytes()); }
+                } else {
+                    for (row, token) in record[..32768].chunks_exact_mut(512).enumerate() {
+                        for (at, value) in token[..512].iter_mut().enumerate() {
+                            *value = [0x28, 0xb0, 0x38, 0xa8][(page * 7 + row + at * 3 + at / 128) % 4];
+                        }
+                    }
+                    for value in record[32768..].chunks_exact_mut(4) { value.copy_from_slice(&1f32.to_le_bytes()); }
                 }
             }
             device.run(|| {

@@ -90,6 +90,11 @@ MiniMax M3.1 Flash supports public `cuteafd serve --family minimax_m3` and
 trace-free serving cards (#1856).
 Use a build containing MiniMax native exports: MXFP8 dense math, NVFP4 W4A4
 experts, FP8 MSA KV/index, GPU embedding and device token selection.
+MSA K/V use per-token, per-KV-head FP32 `amax/448` scales. Each 64-token
+page keeps aligned E4M3 payload rows followed by a 16-byte-aligned scale plane
+in the same backing; admission and exact prefix snapshots include both. K or V
+pages occupy 33,792 bytes for whole-head ownership and 17,408 bytes per Heads
+rank. There is no unscaled FP8 KV mode.
 On one RTX, `ATTENTION_PLACEMENT=auto|heads` selects whole ownership. On two RTX,
 `auto|heads` selects native head splitting with half KV and replicated index.
 Explicit `layers` keeps contiguous attention and FP32 split FFNs. Boot-C16 split
