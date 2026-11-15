@@ -640,6 +640,7 @@ def test_inkling2_dispatch_package_codes_cmake_and_placement_scopes_agree(monkey
                  # Full producer inventory is checked by test_inkling2_producer_exports;
                  # this isolated dispatcher test needs no CUDA/compiler imports.
                  "inkling2_producer_programs": lambda rows: [],
+                 "inkling2_load_programs": lambda: [],
                  "inkling2_input_quant_program": lambda: "native-wire",
                  "compile_draft_bf16_projection": lambda k, n, output: (k, n, output)}
     exec(compile(ast.Module(body=[helper, shapes, branch], type_ignores=[]), "dispatch", "exec"), namespace)
