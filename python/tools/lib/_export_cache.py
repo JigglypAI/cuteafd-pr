@@ -944,7 +944,9 @@ def still_valid(roots: Roots, checks: dict) -> bool:
     """Source observations must not have changed while the export ran."""
     for check, expected in checks.items():
         if check.startswith(("file|src:", "list|src:", "import|src:", "stat|src:")):
-            if evaluate(roots, check) != expected:
+            actual = evaluate(roots, check)
+            if actual != expected:
+                stats("source-check-changed", check=check, expected=expected, actual=actual)
                 return False
     return True
 

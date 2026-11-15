@@ -783,3 +783,47 @@ def test_identity_and_reports_are_deterministic():
     assert records.stable_hash({"ir": "a", "target": [12, 0]}) == records.stable_hash({"target": [12, 0], "ir": "a"})
     assert records.stable_hash({"ir": "a"}) != records.stable_hash({"ir": "b"})
     assert records.change_report({"k": {}}, {"k": {}})["changed"] == []
+
+
+def test_recorded_hash_snapshot_rejects_mutation_before_publication(tmp_path):
+    source = tmp_path / "recipe.py"
+    source.write_text("TILE = 64\n")
+    recorder = records.Recorder(tmp_path, tmp_path / "output")
+    recorder.frames.add("recipe.py")
+    before = recorder.reads()
+    assert recorder.reads() == before
+    source.write_text("TILE = 128\n")
+    assert recorder.reads() == before
+    with pytest.raises(ValueError, match="recorded source changed.*recipe.py"):
+        recorder.validate_sources()
+
+
+def test_profile_cache_keeps_changing_module_bindings(tmp_path):
+    import types
+    recorder = records.Recorder(tmp_path, tmp_path / "output")
+    module = types.ModuleType("policy")
+    first, second = tmp_path / "first.py", tmp_path / "second.py"
+    first.write_text("TILE = 64\n")
+    second.write_text("TILE = 128\n")
+    module.__file__ = str(first)
+    recorder._record_dependencies([module])
+    module.__file__ = str(second)
+    recorder._record_dependencies([module])
+    assert recorder.frames == {"first.py", "second.py"}
+
+
+def test_exported_record_is_owned_by_each_name(tmp_path, fake_cutlass):
+    output = tmp_path / "output"
+    output.mkdir()
+    recorder = records.Recorder(tmp_path, output).install()
+    try:
+        ir = fake_cutlass.generate_original_ir(None)[0]
+        executor = fake_cutlass.compile_and_cache(None, ir)
+        executor.export_to_c(output, "first", "prefix_first")
+        executor.export_to_c(output, "second", "prefix_second")
+        assert recorder.exports["first.o"]["export_prefix"] == "prefix_first"
+        assert recorder.exports["second.o"]["export_prefix"] == "prefix_second"
+        recorder.exports["second.o"]["source_reads_sha256"]["only_second"] = "hash"
+        assert "only_second" not in recorder.exports["first.o"]["source_reads_sha256"]
+    finally:
+        stop_recorder(recorder)

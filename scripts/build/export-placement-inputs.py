@@ -189,8 +189,8 @@ def verified_metadata_bytes(path, lock):
 
 
 def verify_job_metadata(previous, current, lock, name):
-    old = {path.relative_to(previous): path for path in previous.rglob("*.json")}
-    new = {path.relative_to(current): path for path in current.rglob("*.json")}
+    old = {path.relative_to(previous): path for path in previous.rglob("*.json") if path.name != "program-timings.json"}
+    new = {path.relative_to(current): path for path in current.rglob("*.json") if path.name != "program-timings.json"}
     changed = sorted(str(path) for path in old.keys() | new.keys()
                      if path not in old or path not in new
                      or verified_metadata_bytes(old[path], lock) != verified_metadata_bytes(new[path], lock))
@@ -346,7 +346,7 @@ def publish(destination, staging, timeout, workers, previous=None, expect=None,
     # Preserve only the exact metadata needed to replay a job, not heavy objects.
     for name, _, _ in jobs:
         for source in (staging / name).rglob("*.json"):
-            if source.name == "export.log":
+            if source.name in ("export.log", "program-timings.json"):
                 continue
             target = destination / ".workers" / name / source.relative_to(staging / name)
             target.parent.mkdir(parents=True, exist_ok=True)
