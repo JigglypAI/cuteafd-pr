@@ -176,6 +176,7 @@ int cudaGraphInstantiate(void** exec, void*, int) {
   if (!status || partial_exec) { *exec = reinterpret_cast<void*>(0x2000); ++live_execs; }
   return status;
 }
+int cudaGraphUpload(void*, void*) { return outcome(6); }
 int cudaGraphDestroy(void*) { assert(live_graphs > 0); --live_graphs; return outcome(4); }
 int cudaGraphExecDestroy(void*) { assert(live_execs > 0); --live_execs; return outcome(5); }
 int cudaGraphGetNodes(void*, void**, size_t* nodes) { *nodes = graph_nodes; return 0; }
@@ -255,7 +256,7 @@ int main() {
   }
   census = false;
   // All three end-capture APIs share recovery, including partially returned execs.
-  for (int wrapper : {0, 1, 2}) for (int failure : {2, 3, 4}) {
+  for (int wrapper : {0, 1, 2}) for (int failure : {2, 3, 4, 6}) {
     point = failure; injected = failure == 2 ? cudaErrorStreamCaptureInvalidated : cudaErrorMemoryAllocation;
     partial_exec = true;
     assert(cuteafd_cuda_graph_begin_capture(stream) == CUTEAFD_STATUS_OK);
@@ -269,7 +270,7 @@ int main() {
       assert(status == CUTEAFD_STATUS_OK);
       cudaGraphDestroy(info.graph); cudaGraphExecDestroy(info.graph_exec); cudaGetLastError();
     } else {
-      const auto expected = failure == 3 ? CUTEAFD_STATUS_ALLOCATION_FAILED : CUTEAFD_STATUS_INTERNAL_ERROR;
+      const auto expected = (failure == 3 || failure == 6) ? CUTEAFD_STATUS_ALLOCATION_FAILED : CUTEAFD_STATUS_INTERNAL_ERROR;
       assert(status == expected && exec == nullptr && info.graph == nullptr);
     }
     assert(!active && live_graphs == 0 && live_execs == 0 && peer_wait_abortable() == 0);

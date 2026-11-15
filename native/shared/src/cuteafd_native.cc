@@ -1899,6 +1899,15 @@ static cuteafd_status_t end_capture_retained(void* cuda_stream,
     cuteafd::diagnostic_cuda(cudaGraphDestroy(graph));
     return fail(CUTEAFD_STATUS_INTERNAL_ERROR, "cudaGraphInstantiate returned a null graph exec");
   }
+  // Include upload allocation in the capture's measured window, not a later
+  // first replay. This enqueues no graph execution or host synchronization.
+  err = cuteafd::diagnostic_cuda(cudaGraphUpload(graph_exec, reinterpret_cast<cudaStream_t>(cuda_stream)));
+  if (err != cudaSuccess) {
+    cuteafd::diagnostic_cuda(cudaGraphExecDestroy(graph_exec));
+    cuteafd::diagnostic_cuda(cudaGraphDestroy(graph));
+    return fail_cuda(err == cudaErrorMemoryAllocation ? CUTEAFD_STATUS_ALLOCATION_FAILED : CUTEAFD_STATUS_INTERNAL_ERROR,
+                     "cudaGraphUpload failed", err);
+  }
   cuteafd_status_t status = fill_cuda_graph_capture_info(graph, graph_exec, out);
   if (status != CUTEAFD_STATUS_OK) {
     cuteafd::diagnostic_cuda(cudaGraphExecDestroy(graph_exec));
