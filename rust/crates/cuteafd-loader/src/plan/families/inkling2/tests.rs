@@ -110,7 +110,8 @@ fn inkling_mxfp8_inventory_is_planned_not_executable() {
     assert!(spec.notes.iter().any(|note| note.contains("MXFP8 W8A8 layers 0..=3")), "{:?}", spec.notes);
     let experts = report.experts.expect("routed expert contract");
     assert_eq!(experts.package, "inkling2:mxfp8");
-    assert!(experts.spark_worlds.is_empty(), "no Inkling 2 Spark package ships yet: {:?}", experts.spark_worlds);
+    assert!(experts.spark_worlds.contains(&3) && experts.spark_worlds.contains(&6),
+        "registered native width-class recipes cover TP3/TP6: {:?}", experts.spark_worlds);
 }
 
 #[test]
