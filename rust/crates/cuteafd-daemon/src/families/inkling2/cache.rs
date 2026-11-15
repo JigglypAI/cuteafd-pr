@@ -217,6 +217,64 @@ mod tests {
     use cuteafd_loader::families::inkling2::{execution::UnitLayout, Inkling2Config};
 
     #[test]
+    fn shared_cache_restores_prompt_and_turn_marks_without_reconstruction() -> Result<()> {
+        use cuteafd_engine::prefix::{After, PrefixCache, PrefixConfig, PrefixFamily, SnapshotKind};
+        use crate::shared::prefix::CudaCopyEngine;
+        let fixture = Fixture::build_for_tests()?;
+        let library = fixture.load()?;
+        fixture.immediate_copies(&library)?;
+        let device = Device { library: &library, id: 0 };
+        let reader = Rc::new(Stream::new(device)?);
+        let mut cfg = Inkling2Config::from_hf(&serde_json::from_str(include_str!(
+            "../../../../cuteafd-loader/src/families/inkling2/fixtures/config.json"))?)?;
+        cfg.layers = 2;
+        cfg.local = vec![true, false];
+        let bank = Rc::new(CacheBank::new(vec![reader], CacheLayout::new(&cfg, 2, 8)?, 3)?);
+        let family = InklingPrefix::new(bank.clone());
+        let mut cache: PrefixCache<CudaCopyEngine<'_>> = PrefixCache::new(family.layout(),
+            PrefixConfig { entries: 3, mark_slots: 3, keep_logits: true, min_tokens: 1 }, None)?;
+        let tokens = (0..65).collect::<Vec<u32>>();
+        let mut source = cache.admit(&family, &tokens, 128, false,
+            |units| Placement { units, slot: 0, len: 0, state_len: 0 })?.placement;
+        let state = bank.sequence(0)?;
+        let prompt = vec![0x17; state.bytes];
+        library.copy_h2d(state, &prompt)?;
+        for &page in &source.units {
+            let buffer = bank.page(1, page as usize)?;
+            library.copy_h2d(buffer, &vec![page as u8 + 0x30; buffer.bytes])?;
+        }
+        source.len = tokens.len(); source.state_len = tokens.len();
+        assert!(cache.capture(&family, SnapshotKind::Prompt, &tokens, &source, After::from_logits(&[1., 0.], true))?);
+        cache.release(&family, &source.units)?;
+        let restored = cache.admit(&family, &tokens, 128, false,
+            |units| Placement { units, slot: 1, len: 0, state_len: 0 })?;
+        assert_eq!(restored.resume, tokens.len());
+        let mut observed = vec![0; state.bytes];
+        library.copy_d2h(&mut observed, bank.sequence(1)?)?;
+        assert_eq!(observed, prompt);
+        let mut continued = restored.placement;
+        let turn = vec![0x6b; state.bytes];
+        library.copy_h2d(bank.sequence(1)?, &turn)?;
+        let mut turn_tokens = tokens.clone(); turn_tokens.push(91);
+        continued.len = turn_tokens.len(); continued.state_len = turn_tokens.len();
+        assert!(cache.capture(&family, SnapshotKind::Turn, &turn_tokens, &continued, After::from_logits(&[0., 1.], true))?);
+        cache.release(&family, &continued.units)?;
+        let restored = cache.admit(&family, &turn_tokens, 128, false,
+            |units| Placement { units, slot: 0, len: 0, state_len: 0 })?;
+        assert_eq!(restored.resume, turn_tokens.len());
+        library.copy_d2h(&mut observed, bank.sequence(0)?)?;
+        assert_eq!(observed, turn);
+        cache.release(&family, &restored.placement.units)?;
+        let restored = cache.admit(&family, &tokens, 128, false,
+            |units| Placement { units, slot: 1, len: 0, state_len: 0 })?;
+        assert_eq!(restored.resume, tokens.len());
+        library.copy_d2h(&mut observed, bank.sequence(1)?)?;
+        assert_eq!(observed, prompt, "turn divergence must not mutate the prompt mark");
+        cache.release(&family, &restored.placement.units)?;
+        Ok(())
+    }
+
+    #[test]
     fn persistent_cache_marks_copy_exact_bytes_and_fence_only_registered_readers() -> Result<()> {
         let fixture = Fixture::build_for_tests()?;
         let library = fixture.load()?;

@@ -32,6 +32,9 @@ impl Stateful<'_, '_> {
             && self.owners.len() <= self.waves.waves() && self.onboarded == self.local.len()
             && self.onboarded <= self.cfg.layers && self.placement_version != 0,
             "Inkling stateful prefill owners/identity differ");
+        let stream = &self.owners.first().context("Inkling prefill has no unit owners")?.stream;
+        ensure!(self.owners.iter().all(|owner| std::rc::Rc::ptr_eq(&owner.stream, stream)),
+            "Inkling causal state requires one ordered issuing stream");
         ensure!(units.iter().all(|unit| unit.segments.is_empty() && unit.sequence < self.placements.len()
             && unit.slot < self.owners.len() && unit.layers == (0..self.cfg.layers)),
             "Inkling singleton prefill unit differs from admitted request");
@@ -143,4 +146,42 @@ pub(crate) fn layer<'a>(kernels: &Kernels<'a>, owner: &impl UnitBuffers<'a>, tar
     let mut units = sequence_units(rows, owner.layout().rows.next_multiple_of(64), 1, cfg.layers)?;
     for unit in &mut units { unit.layers = index..index+1; }
     run_prefill_units(&mut Hooks { kernels, owner, target, experts, cfg }, &units, 1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cuteafd_transport::{ExpertProtocolV2RouteEntry, ExpertV2Dtype};
+
+    #[test]
+    fn requests_keep_real_request_origins_and_exact_mxfp8_wire() -> Result<()> {
+        let routes = (0..16).map(|index| ExpertProtocolV2RouteEntry {
+            row_index: index/8, expert_id: index, gate_weight: 0.125,
+        }).collect();
+        let request = request(17, 4, 5, 83, 1087, 2, routes, vec![0; 2*4752].into())?;
+        assert_eq!(request.header.hidden_dtype, ExpertV2Dtype::Fp8E4m3Ue8m0K32);
+        assert_eq!(request.header.hidden_row_stride_bytes, 4752);
+        assert_eq!(request.rows[0].source_request_id, 83);
+        assert_eq!(request.rows[0].token_position, 1087);
+        assert_eq!(request.rows[1].token_position, 1088);
+        assert_eq!(request.rows[1].route_offset, 8);
+        assert_eq!(request.rows[1].route_count, 8);
+        assert_ne!(request.header.flags & cuteafd_transport::expert::EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn persistent_units_use_shared_waves_without_host_waits_or_a_private_scheduler() {
+        let source = include_str!("prefill.rs").split("#[cfg(test)]").next().unwrap();
+        assert!(source.contains("impl PrefillHooks for Stateful"));
+        assert!(source.contains("run_prefill_units(self, units, waves)"));
+        assert!(source.contains("self.waves.send("));
+        assert!(source.contains("self.waves.land("));
+        assert!(source.contains("self.waves.reduce("));
+        assert!(source.contains("layers::prepare_routes("));
+        assert!(source.contains("layers::join_experts("));
+        assert!(!source.contains("for layer in"));
+        assert!(!source.contains("cuda_stream_synchronize"));
+        assert!(!source.contains(".drain("));
+    }
 }
