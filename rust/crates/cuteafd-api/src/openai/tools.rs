@@ -49,6 +49,8 @@ pub(super) enum ToolSyntax {
     MistralCalls,
     /// MiniMax namespaced recursive XML; never another family's grammar.
     MiniMaxXml,
+    /// Inkling native channel containing {name, args}.
+    InklingJson,
 }
 
 pub(super) struct ToolConstraints {
@@ -145,6 +147,18 @@ impl ToolConstraints {
                 .with_context(|| format!("invalid parameters for tool {}", tool.name))?) } else { None };
             validators.insert(tool.name.clone(), validator);
             tags.push(match syntax {
+                ToolSyntax::InklingJson => {
+                    // xgrammar v0.2.3 widens multi-branch allOf to any JSON.
+                    // Explicit parameter schemas are already validated as objects;
+                    // only the absent-parameters {} default needs its native type.
+                    let args = if schema.get("type").is_none() { json!({"type":"object"}) } else { schema };
+                    json!({"type":"tag",
+                        "begin":format!("<|message_model|>{}<|content_invoke_tool_json|>", tool.name),
+                        "content":{"type":"ds41_json_schema", "strict":true, "json_schema":{
+                            "type":"object", "properties":{"name":{"const":tool.name}, "args":args},
+                            "required":["name", "args"], "additionalProperties":false}},
+                        "end":"<|end_message|>"})
+                }
                 ToolSyntax::MiniMaxXml => json!({"type":"tag",
                     "begin":format!("]<]minimax[>[<invoke name=\"{}\">", tool.name),
                     "content":{"type":"minimax_tool_schema", "strict":true, "json_schema":schema},
@@ -188,6 +202,11 @@ impl ToolConstraints {
             return Ok(Some(Self { required, format: None, triggered: None, parallel, validators }));
         }
         let (format, triggered) = match syntax {
+            ToolSyntax::InklingJson => {
+                let calls = json!({"type":"tags_with_separator", "tags":tags, "separator":"",
+                    "at_least_one":true, "stop_after_first":!parallel});
+                (calls.clone(), calls)
+            }
             ToolSyntax::MiniMaxXml => {
                 let calls = json!({"type":"tag", "begin":"]<]minimax[>[<tool_call>\n",
                     "content":{"type":"tags_with_separator", "tags":tags, "separator":"\n",

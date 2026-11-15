@@ -1,0 +1,596 @@
+{
+  "source": "thinkingmachines/Inkling-2-Small-MXFP8@3febc62259ee92ea36e2fb6e8303371c4eb3922c",
+  "transformers": "4.57.1",
+  "jinja2": "3.1.6",
+  "template_sha256": "74eb94918c5410bfab8d0af83ce1204fa8af08531f742c18ff4758b92b602d37",
+  "tokenizer_sha256": "7f332727f9a3f093dd452a39cc978e6757627e5dad1b0673aa4e75174f236dd6",
+  "cases": [
+    {
+      "name": "official_tools_high",
+      "body": {
+        "messages": [
+          {
+            "role": "system",
+            "content": "Inspect the repository."
+          },
+          {
+            "role": "user",
+            "content": "Read README.md, then explain it."
+          }
+        ],
+        "reasoning_effort": "high",
+        "tools": [
+          {
+            "type": "function",
+            "function": {
+              "name": "read_file",
+              "description": "Read a file",
+              "parameters": {
+                "type": "object",
+                "properties": {
+                  "path": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "path"
+                ]
+              }
+            }
+          }
+        ]
+      },
+      "prompt": "<|message_system|>tool_declare<|content_xml|>[{\"description\":\"Read a file\",\"name\":\"read_file\",\"parameters\":{\"properties\":{\"path\":{\"type\":\"string\"}},\"required\":[\"path\"],\"type\":\"object\"},\"type\":\"function\"}]<|end_message|><|message_system|><|content_text|>Inspect the repository.<|end_message|><|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>Read README.md, then explain it.<|end_message|>"
+    },
+    {
+      "name": "system_user_default",
+      "body": {
+        "messages": [
+          {
+            "role": "system",
+            "content": "Inspect the repository."
+          },
+          {
+            "role": "user",
+            "content": "Read README.md, then explain it."
+          }
+        ]
+      },
+      "prompt": "<|message_system|><|content_text|>Inspect the repository.<|end_message|><|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>Read README.md, then explain it.<|end_message|>"
+    },
+    {
+      "name": "systems_only",
+      "body": {
+        "messages": [
+          {
+            "role": "system",
+            "content": "Only system."
+          }
+        ]
+      },
+      "prompt": "<|message_system|><|content_text|>Only system.<|end_message|><|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|>"
+    },
+    {
+      "name": "effort_none",
+      "body": {
+        "messages": [
+          {
+            "role": "user",
+            "content": "Hi"
+          }
+        ],
+        "reasoning_effort": "none"
+      },
+      "prompt": "<|message_system|><|content_text|>Thinking effort level: 0<|end_message|><|message_user|><|content_text|>Hi<|end_message|>"
+    },
+    {
+      "name": "effort_minimal",
+      "body": {
+        "messages": [
+          {
+            "role": "user",
+            "content": "Hi"
+          }
+        ],
+        "reasoning_effort": "minimal"
+      },
+      "prompt": "<|message_system|><|content_text|>Thinking effort level: 0.1<|end_message|><|message_user|><|content_text|>Hi<|end_message|>"
+    },
+    {
+      "name": "effort_low",
+      "body": {
+        "messages": [
+          {
+            "role": "user",
+            "content": "Hi"
+          }
+        ],
+        "reasoning_effort": "low"
+      },
+      "prompt": "<|message_system|><|content_text|>Thinking effort level: 0.2<|end_message|><|message_user|><|content_text|>Hi<|end_message|>"
+    },
+    {
+      "name": "effort_medium",
+      "body": {
+        "messages": [
+          {
+            "role": "user",
+            "content": "Hi"
+          }
+        ],
+        "reasoning_effort": "medium"
+      },
+      "prompt": "<|message_system|><|content_text|>Thinking effort level: 0.7<|end_message|><|message_user|><|content_text|>Hi<|end_message|>"
+    },
+    {
+      "name": "effort_high",
+      "body": {
+        "messages": [
+          {
+            "role": "user",
+            "content": "Hi"
+          }
+        ],
+        "reasoning_effort": "high"
+      },
+      "prompt": "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>Hi<|end_message|>"
+    },
+    {
+      "name": "effort_xhigh",
+      "body": {
+        "messages": [
+          {
+            "role": "user",
+            "content": "Hi"
+          }
+        ],
+        "reasoning_effort": "xhigh"
+      },
+      "prompt": "<|message_system|><|content_text|>Thinking effort level: 0.99<|end_message|><|message_user|><|content_text|>Hi<|end_message|>"
+    },
+    {
+      "name": "effort_max",
+      "body": {
+        "messages": [
+          {
+            "role": "user",
+            "content": "Hi"
+          }
+        ],
+        "reasoning_effort": "max"
+      },
+      "prompt": "<|message_system|><|content_text|>Thinking effort level: 0.99<|end_message|><|message_user|><|content_text|>Hi<|end_message|>"
+    },
+    {
+      "name": "effort_0",
+      "body": {
+        "messages": [
+          {
+            "role": "user",
+            "content": "Hi"
+          }
+        ],
+        "reasoning_effort": 0
+      },
+      "prompt": "<|message_system|><|content_text|>Thinking effort level: 0<|end_message|><|message_user|><|content_text|>Hi<|end_message|>"
+    },
+    {
+      "name": "effort_0.15",
+      "body": {
+        "messages": [
+          {
+            "role": "user",
+            "content": "Hi"
+          }
+        ],
+        "reasoning_effort": 0.15
+      },
+      "prompt": "<|message_system|><|content_text|>Thinking effort level: 0.15<|end_message|><|message_user|><|content_text|>Hi<|end_message|>"
+    },
+    {
+      "name": "effort_0.99",
+      "body": {
+        "messages": [
+          {
+            "role": "user",
+            "content": "Hi"
+          }
+        ],
+        "reasoning_effort": 0.99
+      },
+      "prompt": "<|message_system|><|content_text|>Thinking effort level: 0.99<|end_message|><|message_user|><|content_text|>Hi<|end_message|>"
+    },
+    {
+      "name": "official_completion_plain",
+      "body": {
+        "messages": [
+          {
+            "role": "system",
+            "content": "Inspect the repository."
+          },
+          {
+            "role": "user",
+            "content": "Read README.md, then explain it."
+          },
+          {
+            "role": "assistant",
+            "content": "A short answer.\n"
+          }
+        ],
+        "reasoning_effort": "high",
+        "tools": [
+          {
+            "type": "function",
+            "function": {
+              "name": "read_file",
+              "description": "Read a file",
+              "parameters": {
+                "type": "object",
+                "properties": {
+                  "path": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "path"
+                ]
+              }
+            }
+          }
+        ]
+      },
+      "prompt": "<|message_system|>tool_declare<|content_xml|>[{\"description\":\"Read a file\",\"name\":\"read_file\",\"parameters\":{\"properties\":{\"path\":{\"type\":\"string\"}},\"required\":[\"path\"],\"type\":\"object\"},\"type\":\"function\"}]<|end_message|><|message_system|><|content_text|>Inspect the repository.<|end_message|><|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>Read README.md, then explain it.<|end_message|><|message_model|><|content_text|>A short answer.\n<|end_message|><|content_model_end_sampling|>"
+    },
+    {
+      "name": "official_completion_reasoning",
+      "body": {
+        "messages": [
+          {
+            "role": "system",
+            "content": "Inspect the repository."
+          },
+          {
+            "role": "user",
+            "content": "Read README.md, then explain it."
+          },
+          {
+            "role": "assistant",
+            "content": "A short answer.\n",
+            "reasoning_content": "First inspect the repository.\n"
+          }
+        ],
+        "reasoning_effort": "high",
+        "tools": [
+          {
+            "type": "function",
+            "function": {
+              "name": "read_file",
+              "description": "Read a file",
+              "parameters": {
+                "type": "object",
+                "properties": {
+                  "path": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "path"
+                ]
+              }
+            }
+          }
+        ]
+      },
+      "prompt": "<|message_system|>tool_declare<|content_xml|>[{\"description\":\"Read a file\",\"name\":\"read_file\",\"parameters\":{\"properties\":{\"path\":{\"type\":\"string\"}},\"required\":[\"path\"],\"type\":\"object\"},\"type\":\"function\"}]<|end_message|><|message_system|><|content_text|>Inspect the repository.<|end_message|><|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>Read README.md, then explain it.<|end_message|><|message_model|><|content_thinking|>First inspect the repository.\n<|end_message|><|message_model|><|content_text|>A short answer.\n<|end_message|><|content_model_end_sampling|>"
+    },
+    {
+      "name": "official_completion_tool",
+      "body": {
+        "messages": [
+          {
+            "role": "system",
+            "content": "Inspect the repository."
+          },
+          {
+            "role": "user",
+            "content": "Read README.md, then explain it."
+          },
+          {
+            "role": "assistant",
+            "content": null,
+            "reasoning_content": "First inspect the repository.\n",
+            "tool_calls": [
+              {
+                "id": "call0",
+                "type": "function",
+                "function": {
+                  "name": "read_file",
+                  "arguments": "{\"path\":\"README.md\",\"end\":5}"
+                }
+              }
+            ]
+          }
+        ],
+        "reasoning_effort": "high",
+        "tools": [
+          {
+            "type": "function",
+            "function": {
+              "name": "read_file",
+              "description": "Read a file",
+              "parameters": {
+                "type": "object",
+                "properties": {
+                  "path": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "path"
+                ]
+              }
+            }
+          }
+        ]
+      },
+      "prompt": "<|message_system|>tool_declare<|content_xml|>[{\"description\":\"Read a file\",\"name\":\"read_file\",\"parameters\":{\"properties\":{\"path\":{\"type\":\"string\"}},\"required\":[\"path\"],\"type\":\"object\"},\"type\":\"function\"}]<|end_message|><|message_system|><|content_text|>Inspect the repository.<|end_message|><|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>Read README.md, then explain it.<|end_message|><|message_model|><|content_thinking|>First inspect the repository.\n<|end_message|><|message_model|>read_file<|content_invoke_tool_json|>{\"name\":\"read_file\",\"args\":{\"end\":5,\"path\":\"README.md\"}}<|end_message|><|content_model_end_sampling|>"
+    },
+    {
+      "name": "official_tool_reply_tool",
+      "body": {
+        "messages": [
+          {
+            "role": "system",
+            "content": "Inspect the repository."
+          },
+          {
+            "role": "user",
+            "content": "Read README.md, then explain it."
+          },
+          {
+            "role": "assistant",
+            "content": null,
+            "reasoning_content": "First inspect the repository.\n",
+            "tool_calls": [
+              {
+                "id": "call0",
+                "type": "function",
+                "function": {
+                  "name": "read_file",
+                  "arguments": "{\"path\":\"README.md\",\"end\":5}"
+                }
+              }
+            ]
+          },
+          {
+            "role": "tool",
+            "tool_call_id": "call0",
+            "content": "# Project\n"
+          },
+          {
+            "role": "user",
+            "content": "Explain that title."
+          }
+        ],
+        "reasoning_effort": "high",
+        "tools": [
+          {
+            "type": "function",
+            "function": {
+              "name": "read_file",
+              "description": "Read a file",
+              "parameters": {
+                "type": "object",
+                "properties": {
+                  "path": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "path"
+                ]
+              }
+            }
+          }
+        ]
+      },
+      "prompt": "<|message_system|>tool_declare<|content_xml|>[{\"description\":\"Read a file\",\"name\":\"read_file\",\"parameters\":{\"properties\":{\"path\":{\"type\":\"string\"}},\"required\":[\"path\"],\"type\":\"object\"},\"type\":\"function\"}]<|end_message|><|message_system|><|content_text|>Inspect the repository.<|end_message|><|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>Read README.md, then explain it.<|end_message|><|message_model|><|content_thinking|>First inspect the repository.\n<|end_message|><|message_model|>read_file<|content_invoke_tool_json|>{\"name\":\"read_file\",\"args\":{\"end\":5,\"path\":\"README.md\"}}<|end_message|><|content_model_end_sampling|><|message_tool|>read_file<|content_text|># Project\n<|end_message|><|message_user|><|content_text|>Explain that title.<|end_message|>"
+    },
+    {
+      "name": "official_completion_parallel",
+      "body": {
+        "messages": [
+          {
+            "role": "system",
+            "content": "Inspect the repository."
+          },
+          {
+            "role": "user",
+            "content": "Read README.md, then explain it."
+          },
+          {
+            "role": "assistant",
+            "content": null,
+            "reasoning_content": "First inspect the repository.\n",
+            "tool_calls": [
+              {
+                "id": "call0",
+                "type": "function",
+                "function": {
+                  "name": "read_file",
+                  "arguments": "{\"path\":\"README.md\",\"end\":5}"
+                }
+              },
+              {
+                "id": "call1",
+                "type": "function",
+                "function": {
+                  "name": "read_file",
+                  "arguments": {
+                    "path": "src/lib.rs",
+                    "nested": {
+                      "z": "<&é'",
+                      "a": true
+                    }
+                  }
+                }
+              }
+            ]
+          }
+        ],
+        "reasoning_effort": "high",
+        "tools": [
+          {
+            "type": "function",
+            "function": {
+              "name": "read_file",
+              "description": "Read a file",
+              "parameters": {
+                "type": "object",
+                "properties": {
+                  "path": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "path"
+                ]
+              }
+            }
+          }
+        ]
+      },
+      "prompt": "<|message_system|>tool_declare<|content_xml|>[{\"description\":\"Read a file\",\"name\":\"read_file\",\"parameters\":{\"properties\":{\"path\":{\"type\":\"string\"}},\"required\":[\"path\"],\"type\":\"object\"},\"type\":\"function\"}]<|end_message|><|message_system|><|content_text|>Inspect the repository.<|end_message|><|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>Read README.md, then explain it.<|end_message|><|message_model|><|content_thinking|>First inspect the repository.\n<|end_message|><|message_model|>read_file<|content_invoke_tool_json|>{\"name\":\"read_file\",\"args\":{\"end\":5,\"path\":\"README.md\"}}<|end_message|><|message_model|>read_file<|content_invoke_tool_json|>{\"name\":\"read_file\",\"args\":{\"nested\":{\"a\":true,\"z\":\"<&é'\"},\"path\":\"src/lib.rs\"}}<|end_message|><|content_model_end_sampling|>"
+    },
+    {
+      "name": "official_tool_reply_parallel",
+      "body": {
+        "messages": [
+          {
+            "role": "system",
+            "content": "Inspect the repository."
+          },
+          {
+            "role": "user",
+            "content": "Read README.md, then explain it."
+          },
+          {
+            "role": "assistant",
+            "content": null,
+            "reasoning_content": "First inspect the repository.\n",
+            "tool_calls": [
+              {
+                "id": "call0",
+                "type": "function",
+                "function": {
+                  "name": "read_file",
+                  "arguments": "{\"path\":\"README.md\",\"end\":5}"
+                }
+              },
+              {
+                "id": "call1",
+                "type": "function",
+                "function": {
+                  "name": "read_file",
+                  "arguments": {
+                    "path": "src/lib.rs",
+                    "nested": {
+                      "z": "<&é'",
+                      "a": true
+                    }
+                  }
+                }
+              }
+            ]
+          },
+          {
+            "role": "tool",
+            "tool_call_id": "call0",
+            "content": "# Project\n"
+          },
+          {
+            "role": "user",
+            "content": "Explain that title."
+          }
+        ],
+        "reasoning_effort": "high",
+        "tools": [
+          {
+            "type": "function",
+            "function": {
+              "name": "read_file",
+              "description": "Read a file",
+              "parameters": {
+                "type": "object",
+                "properties": {
+                  "path": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "path"
+                ]
+              }
+            }
+          }
+        ]
+      },
+      "prompt": "<|message_system|>tool_declare<|content_xml|>[{\"description\":\"Read a file\",\"name\":\"read_file\",\"parameters\":{\"properties\":{\"path\":{\"type\":\"string\"}},\"required\":[\"path\"],\"type\":\"object\"},\"type\":\"function\"}]<|end_message|><|message_system|><|content_text|>Inspect the repository.<|end_message|><|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>Read README.md, then explain it.<|end_message|><|message_model|><|content_thinking|>First inspect the repository.\n<|end_message|><|message_model|>read_file<|content_invoke_tool_json|>{\"name\":\"read_file\",\"args\":{\"end\":5,\"path\":\"README.md\"}}<|end_message|><|message_model|>read_file<|content_invoke_tool_json|>{\"name\":\"read_file\",\"args\":{\"nested\":{\"a\":true,\"z\":\"<&é'\"},\"path\":\"src/lib.rs\"}}<|end_message|><|content_model_end_sampling|><|message_tool|>read_file<|content_text|># Project\n<|end_message|><|message_user|><|content_text|>Explain that title.<|end_message|>"
+    },
+    {
+      "name": "content_parts",
+      "body": {
+        "messages": [
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "text",
+                "text": "First\n"
+              },
+              {
+                "type": "input_text",
+                "text": " second"
+              }
+            ]
+          },
+          {
+            "role": "assistant",
+            "name": "writer",
+            "content": "Ready."
+          },
+          {
+            "role": "tool",
+            "name": "read_file",
+            "content": "Explicit name"
+          }
+        ]
+      },
+      "prompt": "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>First\n<|end_message|><|message_user|><|content_text|> second<|end_message|><|message_model|>writer<|content_text|>Ready.<|end_message|><|content_model_end_sampling|><|message_tool|>read_file<|content_text|>Explicit name<|end_message|>"
+    },
+    {
+      "name": "tool_declare_unicode_html",
+      "body": {
+        "messages": [
+          {
+            "role": "user",
+            "content": "Hi"
+          }
+        ],
+        "tools": [
+          {
+            "type": "function",
+            "function": {
+              "name": "read_file",
+              "description": "Read <&é'",
+              "parameters": {
+                "type": "object"
+              }
+            }
+          }
+        ]
+      },
+      "prompt": "<|message_system|>tool_declare<|content_xml|>[{\"description\":\"Read <&é'\",\"name\":\"read_file\",\"parameters\":{\"type\":\"object\"},\"type\":\"function\"}]<|end_message|><|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>Hi<|end_message|>"
+    }
+  ]
+}

@@ -18,6 +18,8 @@ pub trait TextParser: Send {
     fn finish(&mut self) -> Vec<OutputChunk>;
     fn stop(&self) -> Option<&GlmStop>;
     fn tool_calls(&self) -> usize;
+    /// A native parser may reject malformed or truncated protocol output.
+    fn error(&self) -> Option<String> { None }
 }
 
 impl TextParser for GlmOutputParser {
@@ -82,6 +84,10 @@ impl<G: ChunkGenerator, P: TextParser> GlmStreamProcessor<G, P> {
                         parser.push(&content)
                     }
                 };
+                if let Some(detail) = parser.error() {
+                    yield Err(StreamError::Decode { detail });
+                    return;
+                }
                 if !started {
                     started = true;
                     for out in generator.generate(OutputChunk::Start { system_fingerprint: None, usage: prompt_usage }).await {
@@ -98,7 +104,12 @@ impl<G: ChunkGenerator, P: TextParser> GlmStreamProcessor<G, P> {
                     yield Ok(out);
                 }
             }
-            for output in parser.finish() {
+            let outputs = parser.finish();
+            if let Some(detail) = parser.error() {
+                yield Err(StreamError::Decode { detail });
+                return;
+            }
+            for output in outputs {
                 for out in generator.generate(output).await { yield Ok(out); }
             }
             let calls = parser.tool_calls() > 0;

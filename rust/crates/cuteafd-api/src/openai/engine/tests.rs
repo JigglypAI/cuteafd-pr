@@ -285,6 +285,8 @@ fn sse_events(text: &str) -> Vec<Value> {
 async fn tool_calls_round_trip_through_every_protocol() {
     // Each family emits its own call syntax; each protocol must surface the call.
     let cases: Vec<(ModelProfile, &'static str)> = vec![
+        (ModelProfile::new("test-inkling", ModelEncoding::Inkling(Arc::new(crate::openai::chat::inkling2::fixtures::encoding()))),
+            "<|message_model|>read_file<|content_invoke_tool_json|>{\"name\":\"read_file\",\"args\":{\"path\":\"a.txt\"}}<|end_message|>"),
         (ModelProfile::new("test-qwen", ModelEncoding::Qwen(Arc::new(qwen4::fixtures::encoding()))),
             "<tool_call>\n<function=read_file>\n<parameter=path>\na.txt\n</parameter>\n</function>\n</tool_call>"),
         (ModelProfile::new("test-glm", ModelEncoding::Glm(Arc::new(glm5::fixtures::encoding()))),
