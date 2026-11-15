@@ -242,7 +242,14 @@ fn spark_charges_match_shared_group_arenas_and_typed_owner_census() -> anyhow::R
                 assert_eq!(charges[0][rank].experts,expected);
                 let owners = executions.workspace_bytes(|extent| crate::plan::layout::spark_slots::catalog_owner_bytes(
                     &catalog,"inkling2",&working,rank,extent))?.unwrap().total().unwrap();
-                assert!(charges[0][rank].owners >= owners);
+                let rings = crate::plan::layout::spark_ring_geometry(shared::LANES as usize);
+                let rings = cuteafd_core::SparkRings { max_frame_bytes:rings.max_frame_bytes,depth:rings.depth,
+                    slot_bytes:rings.slot_bytes,alignment:rings.alignment };
+                let endpoint = cuteafd_core::SparkEndpoint { ring_depth:None,capacity:shape.rows as u32,
+                    ingress,partial_reply_bytes:None };
+                let io = working.rank_endpoints_io(rank,cuteafd_core::ExpertGeometry::INKLING2,&[endpoint],rings)?;
+                assert_eq!(charges[0][rank].owners, owners+io.intake+io.host_exchange+io.row_indices
+                    +io.mapped_rings+io.endpoint_staging);
             }
         }
     }
