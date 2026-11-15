@@ -342,7 +342,9 @@ fn nvfp4_operand(experts: usize, n: usize, k: usize, salt: usize, divisor: bool)
 /// row-addressed NVFP4 A4 package: units staged from mapped frames and flushed
 /// as one wave must write every member's reply byte-identical to that unit run
 /// alone through the same worker (#2191). One Spark; the package is any
-/// `fp8-<family>-nvfp4a4/<layout>` Spark export with a segmented program.
+/// `fp8-<family>-nvfp4a4/<layout>` Spark export with a segmented program,
+/// over BF16 rows or exact NVFP4 wire rows (`nvfp4_input`). Expert timing is
+/// on: one span per singleton and per merged wave.
 #[test]
 #[ignore = "requires an SM121 Spark, CUTEAFD_NATIVE_LIB and a Spark NVFP4 A4 CUTEAFD_NVFP4_SEGMENT_PACKAGE"]
 fn nvfp4_merged_waves_are_byte_identical_to_singleton_units() -> Result<()> {
@@ -374,7 +376,8 @@ fn nvfp4_merged_waves_are_byte_identical_to_singleton_units() -> Result<()> {
     let module = unsafe { Fp8MoeModule::load(&directory)? };
     let info = module.info().clone();
     ensure!(info.weights == Fp8MoeWeights::Nvfp4 && !info.wire_input && module.segment_recipe().is_some(),
-        "merged-wave oracle requires a BF16-input NVFP4 package with a row-addressed program");
+        "merged-wave oracle requires a BF16- or NVFP4-input NVFP4 package with a row-addressed program");
+    let nvfp4_wire = info.nvfp4_input;
     let (hidden, topk, experts) = (info.hidden, info.topk, info.experts);
     let divisor = info.scale_convention == cuteafd_ffi::fp8_moe::Fp8MoeScaleConvention::Divisor;
     let mut regions = Vec::new();
@@ -392,6 +395,11 @@ fn nvfp4_merged_waves_are_byte_identical_to_singleton_units() -> Result<()> {
     let capacity = info.capacity_for(unit).context("package lacks a covering capacity")?;
     let extent = cuteafd_core::OwnerExtent { owner: cuteafd_core::ExecutionOwner::Prefill,
         capacity: unit as u32, compiled: capacity as u32, staging_rows: unit as u32, buffered_units: 3 };
+    let timing_dir = std::env::temp_dir().join(format!("nvfp4-wave-timing-{}", std::process::id()));
+    std::fs::create_dir_all(&timing_dir)?;
+    std::env::set_var("CUTEAFD_EXPERT_TIMING", "1");
+    std::env::set_var("CUTEAFD_PROFILE_DIR", &timing_dir);
+    std::env::set_var("CUTEAFD_PROFILE_HOST", "oracle");
     let scratch = Rc::new(DeviceAllocation::new(&library, weights.owner_scratch_bytes(extent)?, crate::shared::memory::TEST)?);
     let mut worker = worker::Fp8Worker::with_extent(&library, weights.clone(), unit as u32, Some(scratch), Some(extent))?;
     worker.prepare_waves(extent)?;
@@ -418,18 +426,37 @@ fn nvfp4_merged_waves_are_byte_identical_to_singleton_units() -> Result<()> {
             sorted.dedup();
             ensure!(sorted.len() == topk, "oracle routes repeat an expert within a row");
         }
+        // Exact NVFP4 wire rows: packed E2M1, finite E4M3 K16 block scales,
+        // a positive F32 row amax and 12 zero bytes; otherwise BF16 rows.
+        let row_bytes = cuteafd_core::nvfp4_wire_row_bytes(hidden);
+        let payload: Vec<u8> = if nvfp4_wire {
+            (0..count as usize).flat_map(|row| {
+                let mut bytes = vec![0u8; row_bytes];
+                for (at, value) in bytes[..hidden / 2].iter_mut().enumerate() {
+                    *value = ((at * 37 + row * 11 + unit_index * 53) % 251) as u8;
+                }
+                for (group, scale) in bytes[hidden / 2..hidden / 2 + hidden / 16].iter_mut().enumerate() {
+                    *scale = 0x30 + ((row + group + unit_index) % 16) as u8;
+                }
+                let amax = 1.0f32 + ((row * 7 + unit_index) % 13) as f32 / 8.0;
+                bytes[hidden / 2 + hidden / 16..hidden / 2 + hidden / 16 + 4].copy_from_slice(&amax.to_le_bytes());
+                bytes
+            }).collect()
+        } else {
+            (0..count as usize * hidden).flat_map(|at| {
+                let value = bf16((((at * 31 + unit_index * 977) % 509) as f32 - 254.0) / (64.0 + unit_index as f32 * 8.0));
+                ((value.to_bits() >> 16) as u16).to_le_bytes()
+            }).collect()
+        };
         let mut owned = ExpertProtocolV2Request::new(500 + unit_index as u64, 17, 3, hidden as u32,
-            ExpertV2Dtype::Bf16,
+            if nvfp4_wire { ExpertV2Dtype::Nvfp4E2m1E4m3K16Amax } else { ExpertV2Dtype::Bf16 },
             (0..count).map(|row| ExpertProtocolV2RowDescriptor { row_id: u64::from(row),
                 source_kind: ExpertV2SourceKind::Prefill, source_request_id: unit_index as u64,
                 token_position: u64::from(row), route_offset: row * topk as u32, route_count: topk as u32 }).collect(),
             ids.iter().enumerate().map(|(route, &expert_id)| ExpertProtocolV2RouteEntry {
                 row_index: (route / topk) as u32, expert_id,
                 gate_weight: ((route % topk + 1 + unit_index) as f32) / 16.0 }).collect(),
-            (0..count as usize * hidden).flat_map(|at| {
-                let value = bf16((((at * 31 + unit_index * 977) % 509) as f32 - 254.0) / (64.0 + unit_index as f32 * 8.0));
-                ((value.to_bits() >> 16) as u16).to_le_bytes()
-            }).collect())?;
+            payload)?;
         owned.header.flags |= EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16;
         let encoded = owned.encode()?;
         let mut frame = HostAllocation::new(&library, encoded.len(), crate::shared::memory::TEST)?;
@@ -481,5 +508,16 @@ fn nvfp4_merged_waves_are_byte_identical_to_singleton_units() -> Result<()> {
     }
     ensure!(worker.wave_flushes() - flushes_before == 6 && worker.merged_waves() >= 6,
         "every pair must flush as one merged launch");
+    drop(worker);
+    let samples = std::fs::read_to_string(timing_dir.join("expert-timing-oracle-rank0.jsonl"))?;
+    let samples = samples.lines().map(serde_json::from_str::<serde_json::Value>).collect::<Result<Vec<_>, _>>()?;
+    let published = samples.iter().map(|sample| sample["request_id"].as_u64().unwrap_or(u64::MAX)).collect::<Vec<_>>();
+    ensure!(published == [500, 501, 502, 503, 504, 500, 501, 502, 503, 500, 504],
+        "expected one timing span per singleton and per merged wave, got {published:?}");
+    ensure!(samples.iter().all(|sample| sample["compute_us"].as_f64().is_some_and(|us| us > 0.0)),
+        "timing span without measured compute");
+    std::fs::remove_dir_all(&timing_dir)?;
+    eprintln!("NVFP4 merged waves ({}): {} timing spans for 5 singletons + 6 waves",
+        if nvfp4_wire { "NVFP4 wire" } else { "BF16" }, samples.len());
     Ok(())
 }

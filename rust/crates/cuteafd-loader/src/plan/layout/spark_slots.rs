@@ -204,13 +204,21 @@ pub(crate) fn nvfp4_owner_bytes(family: &str, geometry: cuteafd_core::ExpertGeom
 
 /// [`nvfp4_owner_bytes`] with the exact NVFP4 wire ingress: the same package
 /// scratch (the NVFP4-wire sibling's regions equal the BF16-input ones), and
-/// the device input plane holds wire rows instead of BF16 rows.
+/// the device input plane, including every staged unit's slice of a merged
+/// wave, holds wire rows instead of BF16 rows (the worker sizes both from the
+/// package's `input_row_bytes`).
 pub(crate) fn nvfp4_owner_bytes_for(family: &str, geometry: cuteafd_core::ExpertGeometry, width: u32,
     extent: cuteafd_core::OwnerExtent, nvfp4_wire: bool) -> anyhow::Result<cuteafd_core::OwnerBytes> {
     let mut bytes = nvfp4_owner_bytes(family, geometry, width, extent)?;
     if nvfp4_wire {
         let hidden = geometry.hidden as usize;
-        let saved = (2 * hidden - cuteafd_core::nvfp4_wire_row_bytes(hidden)) as u64 * u64::from(extent.capacity);
+        // Input rows the BF16 charge holds: the ordinary plane, or the staged
+        // slices when the owner merges waves (they cover the plane).
+        let rows = match (extent.segment_rows(), extent.staged_rows()) {
+            (Some(_), Some(staged)) => staged.max(extent.capacity),
+            _ => extent.capacity,
+        };
+        let saved = (2 * hidden - cuteafd_core::nvfp4_wire_row_bytes(hidden)) as u64 * u64::from(rows);
         bytes.io = bytes.io.checked_sub(saved).context("NVFP4 wire owner input below BF16")?;
     }
     Ok(bytes)
@@ -665,6 +673,26 @@ mod tests {
                     }
                 }
             }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn nvfp4_wire_owner_charges_wire_rows_for_the_plane_and_staged_slices() -> anyhow::Result<()> {
+        let geometry = cuteafd_core::ExpertGeometry::MINIMAX_M3;
+        let hidden = u64::from(geometry.hidden);
+        let delta = 2 * hidden - cuteafd_core::nvfp4_wire_row_bytes(geometry.hidden as usize) as u64;
+        let unit = cuteafd_core::OwnerExtent { owner: cuteafd_core::ExecutionOwner::Prefill, capacity: 2752,
+            compiled: 4096, staging_rows: 2752, buffered_units: 3 };
+        let decode = cuteafd_core::OwnerExtent { owner: cuteafd_core::ExecutionOwner::Decode(0), capacity: 80,
+            compiled: 80, staging_rows: 80, buffered_units: 1 };
+        for (extent, rows) in [(unit, u64::from(unit.staged_rows().unwrap())), (decode, 80)] {
+            let bf16 = nvfp4_owner_bytes_for("minimax_m3", geometry, 768, extent, false)?;
+            let wire = nvfp4_owner_bytes_for("minimax_m3", geometry, 768, extent, true)?;
+            // The worker sizes the ordinary plane and every staged unit's slice
+            // from the package's input row (fp8 worker `input_row_bytes`).
+            assert_eq!(bf16.io - wire.io, rows * delta, "{extent:?}");
+            assert_eq!((bf16.scratch, bf16.pinned_staging), (wire.scratch, wire.pinned_staging));
         }
         Ok(())
     }
