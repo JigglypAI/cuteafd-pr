@@ -43,6 +43,11 @@ def test_persistent_layer_state_is_borrowed_and_metadata_uses_retained_uploads()
     assert 'probe::head_spans(rows, self.rows)' in head
     assert 'scoring.record(' in head
     assert 'ScoreLogits::Recorded' in head
+    embedding = head.split('pub fn embed_unit(')[1].split('pub fn project(')[0]
+    assert 'uploads.upload(' in embedding
+    assert 'owner.buffer("first")?' in embedding
+    assert 'owner.buffer("projection_input")?' in embedding
+    assert '.drain(' not in embedding and 'copy_h2d(' not in embedding
     prefill = (FAMILY/'prefill.rs').read_text()
     assert 'for member in members(unit)' in prefill
     assert 'owner.segment_metadata(' in prefill

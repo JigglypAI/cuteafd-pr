@@ -63,6 +63,31 @@ impl<'a> Head<'a> {
                 owner.buffer("partial")?, false, Precision::F32, tokens.len())
         })
     }
+    /// Prefill embedding uses existing unit planes, not the bounded vocabulary
+    /// head's <=64-row token/normalization storage. `first` is metadata scratch
+    /// until segment_metadata publishes convolution starts before attention.
+    pub fn embed_unit(&self, k: &Kernels<'a>, owner: &UnitOwner<'a>, target: &TargetWeights<'_>,
+        cfg: &Inkling2Config, tokens: &[u32], uploads: &mut crate::shared::token_table::RetainedUploads<'a>) -> Result<()> {
+        ensure!(!tokens.is_empty() && tokens.len() <= owner.layout.rows
+            && tokens.iter().all(|&token| (token as usize) < cfg.unpadded_vocab_size)
+            && owner.stream.raw == self.stream.raw && owner.stream.device.id == self.stream.device.id,
+            "Inkling prefill embedding exceeds admitted owner/stream");
+        let bytes = tokens.iter().flat_map(|token| token.to_le_bytes()).collect::<Vec<_>>();
+        self.stream.device.run(|| {
+            // SAFETY: shared upload retains source until the gather reads token
+            // IDs; segment metadata overwrites the same plane later in order.
+            unsafe {
+                uploads.upload(owner.buffer("first")?, &bytes, self.stream.raw)?;
+                self.stream.device.library.cuda_embedding_lookup_bf16_async(target.operand("model.llm.embed.weight")?.buffer,
+                    owner.buffer("first")?, owner.buffer("projection_input")?, tokens.len(), cfg.vocab_size, cfg.hidden, self.stream.raw)?;
+                self.stream.device.library.cuda_zero_bytes_async(owner.buffer("branch")?, tokens.len()*cfg.hidden*4, self.stream.raw)?;
+                self.stream.device.library.cuda_accumulate_bf16_to_f32_async(owner.buffer("projection_input")?, owner.buffer("branch")?,
+                    tokens.len()*cfg.hidden, self.stream.raw)?;
+            }
+            k.norm(owner, owner.buffer("branch")?, target.operand("model.llm.embed_norm.weight")?.buffer,
+                owner.buffer("partial")?, false, Precision::F32, tokens.len())
+        })
+    }
     pub fn project(&self, k: &Kernels<'a>, owner: &impl UnitBuffers<'a>, target: &TargetWeights<'_>,
         cfg: &Inkling2Config, rows: usize, candidates: usize) -> Result<Buffer> {
         ensure!(rows>0 && rows<=self.rows && owner.stream().raw == self.stream.raw
