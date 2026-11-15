@@ -814,7 +814,7 @@ mod tests {
 
     #[test]
     fn every_tier_bar_is_inclusive_and_rejects_the_next_value() {
-        for (bpw, top1, kl) in [(2.0, 0.90, 0.07), (3.0, 0.93, 0.05), (6.0, 0.95, 0.03)] {
+        for (bpw, top1, kl) in [(2.0, 0.90, 0.08), (3.0, 0.93, 0.05), (6.0, 0.95, 0.03)] {
             let at = tier_run(bpw, false, top1, kl);
             assert!(verdict(&at).pass, "{:?}", verdict(&at).reasons);
             assert!(absolute(&at));

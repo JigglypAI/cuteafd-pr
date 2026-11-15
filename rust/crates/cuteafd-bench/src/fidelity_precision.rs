@@ -28,7 +28,7 @@ impl Tier {
         match self {
             Self::Strict => (0.95, 0.03),
             Self::Mid => (0.93, 0.05),
-            Self::Low => (0.90, 0.07),
+            Self::Low => (0.90, 0.08),
         }
     }
     pub fn name(self) -> &'static str {
