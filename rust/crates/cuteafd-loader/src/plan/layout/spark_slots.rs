@@ -141,6 +141,15 @@ pub(crate) fn native_catalog_owner_bytes(catalog: &crate::OfficialV41Catalog, fa
     fp8_owner_bytes(family, geometry, &formats, extent)
 }
 
+/// Same catalog-owner dispatch for the EXL3 families. Missing recorded scratch
+/// is an explicit shared census error, never a family-local extrapolation.
+pub(crate) fn catalog_owner_bytes(catalog: &crate::OfficialV41Catalog, family: &str,
+    working: &SparkWorkingSet, rank: usize, extent: cuteafd_core::OwnerExtent)
+    -> anyhow::Result<cuteafd_core::OwnerBytes> {
+    if catalog.fp8().is_some() { native_catalog_owner_bytes(catalog, family, working, rank, extent) }
+    else { exl3_owner_bytes(family, catalog.routed_experts().geometry()?, extent) }
+}
+
 /// One native NVFP4 owner on the shared FP8-family worker: the installed
 /// package's measured scratch at the compiled export (census), BF16 ingress
 /// I/O at the owner's capacity, and packed route staging per queued unit.

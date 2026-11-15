@@ -147,33 +147,14 @@ pub fn spark_charges(catalog: &crate::OfficialV41Catalog, experts: &[LayerExpert
         (0..ranks).map(|rank| {
             if count == routed.len() { return Ok(SparkCharge { experts: 0, owners: 0, runtime: 0 }); }
             let io = working.rank_endpoints_io(rank, geometry, &[endpoint], rings)?;
-            let width = u32::try_from(catalog.routed_experts().intermediate.div_ceil(128 * ranks) * 128)?;
-            let owners = executions.workspace_bytes(|extent| owner_bytes(geometry, width, extent, ingress))?
+            let owners = executions.workspace_bytes(|extent|
+                crate::plan::layout::spark_slots::catalog_owner_bytes(catalog, "inkling2", &working, rank, extent))?
                 .and_then(|bytes| bytes.total()).context("Inkling 2 Spark owner sum overflow")?;
             let owners = [io.intake, io.host_exchange, io.row_indices, io.mapped_rings, io.endpoint_staging, owners]
                 .into_iter().try_fold(0u64, |sum, bytes| sum.checked_add(bytes)).context("Inkling 2 Spark owners")?;
             Ok(SparkCharge { experts: per_layer[rank][count..].iter().sum(), owners, runtime })
         }).collect()
     }).collect()
-}
-
-/// One FP8-family owner at the shared segment formulas: streamed intermediate
-/// scratch at the compiled export, stream-ordered I/O at the owner's capacity
-/// and packed route staging per queued unit. The installed package's measured
-/// census replaces the scratch term when the package ships (stage 3).
-fn owner_bytes(geometry: cuteafd_core::ExpertGeometry, width: u32, extent: cuteafd_core::OwnerExtent,
-    ingress: cuteafd_core::SparkIngress) -> anyhow::Result<cuteafd_core::OwnerBytes> {
-    let rows = extent.compiled;
-    let scratch = cuteafd_core::spark_executions::segment_scratch_bytes(geometry.hidden, geometry.experts, geometry.topk,
-        cuteafd_core::spark_executions::SegmentArithmetic::Stream {
-            act_row_bytes: width.checked_mul(2).context("activation width overflow")? },
-        rows, cuteafd_core::spark_executions::SEGMENT_MAX_ROWS)
-        .context("Inkling 2 segment scratch overflow")?;
-    let hidden = u64::from(geometry.hidden);
-    let input = u64::from(extent.capacity) * ingress.request_row_bytes(geometry.hidden as usize) as u64;
-    let io = input + u64::from(extent.capacity) * (8 * u64::from(geometry.topk) + 2 * hidden)
-        + u64::from(rows) * (16 + u64::from(geometry.topk) * 8);
-    Ok(cuteafd_core::OwnerBytes { scratch, io, pinned_staging: u64::from(extent.staging_rows) * u64::from(geometry.topk) * 8 })
 }
 
 /// Gather every admitted owner fact into the shared recipe.
