@@ -1105,6 +1105,12 @@ impl Fp8ExpertTensors {
         let image = self.push_matrix_slice(name, image)?;
         let file = self.reader.open(&self.snapshot.join(&source.shard))?;
         out.fill(0);
+        if image.width == image.source_pitch && image.width == image.destination_pitch {
+            let bytes = image.rows.checked_mul(image.width).context("expert contiguous extent overflow")?;
+            file.read_exact_at(&mut out[..bytes], source.offset.checked_add(image.source_offset as u64)
+                .context("expert source offset overflow")?)?;
+            return Ok(());
+        }
         for row in 0..image.rows {
             let at = image.source_offset.checked_add(row.checked_mul(image.source_pitch)
                 .context("expert source row overflow")?).context("expert source offset overflow")?;
