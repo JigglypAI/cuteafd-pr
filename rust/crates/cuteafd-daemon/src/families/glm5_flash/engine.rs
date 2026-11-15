@@ -5851,7 +5851,9 @@ mod prefill_lane_tests {
             // Fork #303 selects packed native consumers only for (N,K) 6784x4096,
             // 7424x4096 and 8192x2048. No GLM Flash shape selected; registered
             // arithmetic, routes and thresholds are unchanged (export audit: zero GLM Flash changes).
-            ("integration/cuteafd/_fp8_weights.py", 0x79d7_b9c1_b570_7812_u64),
+            // Fork #312 adds native A8/F32 prefill exports and forwards output dtype;
+            // registered decode routes are unchanged, with identical exported objects.
+            ("integration/cuteafd/_fp8_weights.py", 0x11aa_c0a2_a784_5d42_u64),
             // The #252 NC rewrite preserves scaled BF16 operands, per-warp K/MMA order,
             // FP32 accumulation and ascending-warp fold. It changes load/prefetch scheduling,
             // grid order and vectorized fold/store pairs, not per-output arithmetic.
