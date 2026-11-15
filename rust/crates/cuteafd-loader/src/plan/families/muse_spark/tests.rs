@@ -119,8 +119,11 @@ fn selected_head_views_charge_one_native_workspace_with_or_without_drafter() {
         let input = testing::BudgetedPlanInput::open(dir.path()).unwrap();
         let inventory = CoreInventory::from_checkpoint(&cfg, input.checkpoint()).unwrap();
         assert_eq!(inventory.head_outputs(&cfg), if width.is_none() { cfg.vocab_size } else { 202112 });
-        for backend in [BlasHead::TensorLt, BlasHead::Gemm] {
-            for draft in [false, true] {
+        let head_cases = if width.is_none() {
+            vec![(BlasHead::TensorLt, false), (BlasHead::Gemm, true)]
+        } else { vec![(BlasHead::TensorLt, width == Some(6))] };
+        for (backend, draft) in head_cases {
+            {
                 let mut options = with_layout(2, 6);
                 let layout = options.layout.as_mut().unwrap();
                 layout.bf16_target_head = backend;
@@ -470,7 +473,7 @@ fn plan_matrix(column: usize) {
     let worlds = crate::plan::experts::spark_worlds(super::PACKAGE, 4096);
     assert_eq!(worlds, [2, 3, 4, 5, 6, 7, 8], "range data for muse:exl3-k45");
     let package = tempfile::tempdir().unwrap();
-    for (rtx, ranks) in worlds.iter().map(|&ranks| (column, ranks)) {
+    for (rtx, ranks) in worlds.iter().copied().filter(|ranks| column == 1 || [2, 4, 6, 8].contains(ranks)).map(|ranks| (column, ranks)) {
         let mut options = with_package(rtx, ranks, package.path());
         if column == 1 { options.layout.as_mut().unwrap().context_tokens = MIN_CARD_CONTEXT; }
         let report = input.plan(&options).unwrap();

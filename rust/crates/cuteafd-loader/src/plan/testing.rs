@@ -1589,6 +1589,11 @@ pub fn step5_fixture(kind: &str) -> (Value, Vec<Tensor>) {
 
 /// Published K4 expert/K6 core headers, shared by loader and daemon regressions.
 pub fn write_step5_exl3_snapshot(dir: &Path) {
+    write_step5_exl3_snapshot_layers(dir, &(3..91).collect::<Vec<_>>());
+}
+
+/// Preserve the full core geometry while including only requested routed layers.
+pub fn write_step5_exl3_snapshot_layers(dir: &Path, expert_layers: &[usize]) {
     fs::create_dir_all(dir).unwrap();
     let (mut config, tensors) = step5_fixture("bf16");
     let declaration = serde_json::json!({"quant_method": "exl3", "format": "exl3", "checkpoint_format": "exl3",
@@ -1623,6 +1628,7 @@ pub fn write_step5_exl3_snapshot(dir: &Path) {
     for (name, dtype, shape) in tensors {
         if let Some(stem) = name.strip_suffix(".weight").filter(|_| shape.len() == 3 && name.contains(".moe.")) {
             let layer: usize = stem.split('.').nth(2).unwrap().parse().unwrap();
+            if !expert_layers.contains(&layer) { continue; }
             let bits = if layer >= 88 { 6 } else { 4 };
             let (base, proj) = stem.rsplit_once('.').unwrap();
             for expert in 0..shape[0] {

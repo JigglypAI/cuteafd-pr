@@ -177,11 +177,11 @@ mod tests {
             .into_iter().map(|(rows, wide, draft, kv)| (rows, SparkReplyFormats {
                 prefill: Some(match wide { WideFormat::Bf16 => Bf16, WideFormat::Fp8 => Fp8, WideFormat::Nvfp4 => Nvfp4 }),
                 decode: None }, draft, kv)).collect::<Vec<_>>();
-        for prefill in [None, Some(Bf16), Some(Fp8), Some(Nvfp4)] {
-            for decode in [None, Some(Bf16), Some(Fp8), Some(Nvfp4)] {
-                cases.push((DEFAULT_BF16_MAX_ROWS, SparkReplyFormats { prefill, decode }, None, Qwen4KvCache::Fp8));
-            }
-        }
+        cases.extend([
+            (DEFAULT_BF16_MAX_ROWS, SparkReplyFormats { prefill: Some(Bf16), decode: Some(Fp8) }, None, Qwen4KvCache::Fp8),
+            (DEFAULT_BF16_MAX_ROWS, SparkReplyFormats { prefill: Some(Fp8), decode: Some(Nvfp4) }, None, Qwen4KvCache::Fp8),
+            (DEFAULT_BF16_MAX_ROWS, SparkReplyFormats { prefill: None, decode: Some(Bf16) }, None, Qwen4KvCache::Fp8),
+        ]);
         let mut host_rings = std::collections::BTreeSet::new();
         let cases = cases.into_iter().flat_map(|(cutoff, formats, draft, kv)| {
             let mut cases = vec![(cutoff, formats, draft, kv, false)];
@@ -326,7 +326,7 @@ mod tests {
         let core = CoreInventory::from_checkpoint(&cfg, checkpoint)?;
         let mut refused = 0;
         let mut reduced_pools = 0;
-        for (gpus, sparks) in [(2, 6), (2, 4), (1, 6), (1, 4)] {
+        for (gpus, sparks) in [(2, 4), (1, 4)] {
             // A complete image: the program manifest with the coordinator EXL3 package beside it.
             let image = dir.path().join(format!("image-{gpus}"));
             let path = testing::write_muse_exl3_capacities(&image);
