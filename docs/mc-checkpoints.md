@@ -125,10 +125,15 @@ normal inventory validates selected shard headers afterward.
 Publish only after this format specification has been reviewed.
 [`wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K4-MC`](https://huggingface.co/wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K4-MC)
 is published at `91a8dbc9c12e790c65aa1a38c6aede6a3e23a77d`, with BF16
-`original` (default), `k8-compact` and `k6-compact`. The runtime-derived
-`fp8-compact` selector converts the published original core as described above.
-See its [min](../examples/configs/glm53-flash-exl3-k4-mc-min.config) and
+`original` (default), `k8-compact` and `k6-compact`. Whole-core
+`fp8-compact` is `na` for this checkpoint: the executor refuses conversion
+of the selected original core. See its
+[min](../examples/configs/glm53-flash-exl3-k4-mc-min.config) and
 [max](../examples/configs/glm53-flash-exl3-k4-mc-max.config) configs.
+Max K8/K6 supplementary comparisons live in
+`scripts/bench/release-smoke-v51-mc-core-comparison.json`, separate from
+the original-view release row. The original max baseline still uses FP8-QK
+MLA attention; rerun it when BF16 attention lands (#2146).
 The GLM 5.3 and Step-5 publications are also available:
 
 | Repository (`wrldsuksgo2mars/`) | Pinned revision | Views |
