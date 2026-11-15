@@ -991,7 +991,7 @@ fn host_transport_uses_resolved_small_and_large_card_slots_only() {
     let dir = snapshot(&all_layers());
     let input = testing::BudgetedPlanInput::open(dir.path()).unwrap();
     let cfg = crate::families::muse_spark::MuseSparkConfig::from_hf(&testing::muse_spark_config()).unwrap();
-    for (bytes, slots) in [(32 << 30, 8), (crate::placement::inventory::PRO_TOTAL_BYTES, 16)] {
+    for (bytes, slots) in [(32 << 30, 16), (crate::placement::inventory::PRO_TOTAL_BYTES, 16)] {
         let mut options = with_layout(1, 6);
         options.layout.as_mut().unwrap().rtx_bytes = vec![bytes];
         options.layout.as_mut().unwrap().context_tokens = 1024;

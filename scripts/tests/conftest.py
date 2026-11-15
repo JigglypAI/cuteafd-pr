@@ -193,8 +193,11 @@ def no_live_cache(tmp_path_factory):
     patch.setenv("XDG_CACHE_HOME", str(root / ".cache"))
     patch.setenv("CUTEAFD_BUILD_ROOT", str(root / "builds"))
     patch.setenv("CUTEAFD_TEST_BUILD_ROOT", str(root / "builds"))
-    from launcher_sandbox import SimCluster
+    from launcher_sandbox import SimCluster, seed_checkpoint_metadata
     patch.setenv("CUTEAFD_TEST_HOST", SimCluster().env()["CUTEAFD_TEST_HOST"])
+    hub = root / ".cache/huggingface"
+    seed_checkpoint_metadata(hub)
+    patch.setenv("HF_HOME", str(hub))
     yield root
     patch.undo()
 

@@ -212,3 +212,50 @@ class SimCluster:
 
     def devices(self):
         return fake_gpus(self.gpus, total_mib=self.gpu_bytes >> 20)
+
+
+def seed_checkpoint_metadata(hf):
+    """Build-scope tests consume a shared miniature hub, never installed models."""
+    import copy
+    from test_example_configs import CHECKPOINTS, GLM5, GLMF, MIMO, QWEN
+    checkpoints = copy.deepcopy(CHECKPOINTS)
+    aliases = {
+        "wrldsuksgo2mars/GLM-5.3-EXL3-K4-MC": GLM5,
+        "wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K4-MC": GLMF,
+        "wrldsuksgo2mars/Step-5-Preview-EXL3-K4-MC": {"model_type": "step5_vl", "text_config": {
+            "model_type": "step5", "num_hidden_layers": 92, "moe_layer_list": list(range(3, 91))}},
+        "wrldsuksgo2mars/Muse-Spark-Open-EXL3-K4-MC": {"model_type": "muse_spark", "text_config": {
+            "num_hidden_layers": 62, "mlp_layer_types": ["sparse"] * 62}},
+        "wrldsuksgo2mars/Muse-Spark-Open-EXL3-K4-Core-K6": {"model_type": "muse_spark", "text_config": {
+            "num_hidden_layers": 62, "mlp_layer_types": ["sparse"] * 62}},
+        "wrldsuksgo2mars/Kimi-K3-EXL3-K2": {"model_type": "kimi_k3", "text_config": {
+            "num_hidden_layers": 93, "first_k_dense_replace": 1}},
+        "MiniMaxAI/MiniMax-M3.1-Flash": {"model_type": "minimax_m3_vl", "text_config": {
+            "num_hidden_layers": 3, "moe_layer_freq": [0, 1, 1]}},
+    }
+    checkpoints.update(copy.deepcopy(aliases))
+    for name, config in checkpoints.items():
+        if "EXL3" in name:
+            config["quantization_config"] = {"quant_method": "exl3"}
+        if config.get("model_type") == "qwen3_5":
+            wide = "3.8" in name
+            text = config["text_config"]
+            text.update(hidden_size=5120 if wide else 4096, intermediate_size=17408 if wide else 12288,
+                        num_hidden_layers=64 if wide else 32, num_attention_heads=24 if wide else 16,
+                        num_key_value_heads=4, linear_num_key_heads=16, linear_num_value_heads=48 if wide else 32)
+            text["layer_types"] = ["linear_attention"] * (text["num_hidden_layers"] - 1) + ["full_attention"]
+        root = Path(hf) / "hub" / ("models--" + name.replace("/", "--"))
+        snapshot = root / "snapshots/fixture"
+        snapshot.mkdir(parents=True, exist_ok=True)
+        (snapshot / "config.json").write_text(json.dumps(config))
+        (root / "refs").mkdir(exist_ok=True)
+        (root / "refs/main").write_text("fixture")
+    repo = Path(__file__).resolve().parents[2]
+    for path in (repo / "examples/configs").glob("*.config"):
+        values = dict(line.split("=", 1) for line in path.read_text().splitlines()
+                      if line and not line.startswith("#") and "=" in line)
+        model, revision = values.get("MODEL_ID"), values.get("MODEL_REVISION")
+        if model in checkpoints and revision:
+            root = Path(hf) / "hub" / ("models--" + model.replace("/", "--")) / "snapshots"
+            if not (root / revision).exists():
+                (root / revision).symlink_to("fixture", target_is_directory=True)
