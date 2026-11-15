@@ -725,7 +725,7 @@ def test_inkling2_dispatch_package_codes_cmake_and_placement_scopes_agree(monkey
     assert derived["CUTEAFD_RELEASE_EXPERT_FAMILIES"] == "inkling2:mxfp8"
     required = release.requirements(tmp_path, matrix, "inkling2")[0]
     assert required["programs"] == ["inkling2"] and required["experts"] == ["inkling2:mxfp8"]
-    assert required["spark_experts"] == []
+    assert required["spark_experts"] == ["inkling2:mxfp8"]
 
     placement = load("inkling2_placement_inputs", "scripts/build/export-placement-inputs.py")
     jobs = {name: (exporter, args) for name, exporter, args in placement.export_jobs()}
