@@ -9,6 +9,18 @@ use cuteafd_engine::{media::{EncodeJob, EmbeddingCache, MediaKeys, RequestMedia}
     prefix::{PrefixCache, PrefixConfig, PrefixFamily, RefPagePool}};
 use std::{cell::RefCell, collections::BTreeSet, path::Path};
 
+fn check_writable(placement: &Placement, rows: usize, context: usize, pool: &RefPagePool) -> Result<()> {
+    let end = placement.len.checked_add(rows).context("Inkling append extent overflow")?;
+    ensure!(rows > 0 && end <= context && end.div_ceil(64) <= placement.units.len(), "Inkling append exceeds reserved pages");
+    let mut writable = BTreeSet::new();
+    for position in placement.len..end {
+        let page = placement.units[position/64];
+        ensure!(pool.refs(page) == 1 && writable.insert((page, position%64)),
+            "Inkling append requires private nonaliased COW pages");
+    }
+    Ok(())
+}
+
 #[derive(Default)]
 pub(crate) struct Draft;
 impl scheduler::DraftState for Draft {
@@ -48,15 +60,8 @@ impl<'a> InklingBackend<'a> {
         ensure!(!tokens.is_empty() && tokens.iter().all(|&token| (token as usize) < self.vocab)
             && placement.len == placement.state_len && placement.slot < self.concurrency,
             "Inkling append token/frontier/slot differs");
-        let end = placement.len.checked_add(tokens.len()).context("Inkling append extent overflow")?;
-        ensure!(end <= self.context && end.div_ceil(64) <= placement.units.len(), "Inkling append exceeds reserved pages");
-        let mut writable = BTreeSet::new();
-        for position in placement.len..end {
-            let page = placement.units[position/64];
-            ensure!(pool.refs(page) == 1 && writable.insert((page, position%64)),
-                "Inkling append requires private nonaliased COW pages");
-        }
-        Ok(())
+        check_writable(placement, tokens.len(), self.context, pool)
+
     }
     fn append(&self, placement: &mut Placement, tokens: &[u32], heads: bool, pool: &RefPagePool,
         callback: &mut dyn FnMut(usize, usize, DeviceLogits) -> Result<()>) -> Result<()> {
@@ -236,4 +241,36 @@ impl<'a> Backend<'a> for InklingBackend<'a> {
     fn probe_begin(&self, _: usize) {}
     fn probe_end(&self) {}
     fn probe_finish<T>(&self, _: impl FnOnce(&RoundRoutes, &[Option<f64>]) -> T) -> Option<T> { None }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn append_writes_only_reserved_private_nonaliased_pages() -> Result<()> {
+        let mut pool = RefPagePool::new(4, 64);
+        let units = pool.alloc_for(0..2)?;
+        let placement = Placement { units: units.clone(), slot: 0, len: 63, state_len: 63 };
+        check_writable(&placement, 3, 128, &pool)?;
+        pool.share(&units[..1]);
+        assert!(check_writable(&placement, 3, 128, &pool).is_err());
+        pool.release(&units[..1]);
+        let alias = Placement { units: vec![units[0], units[0]], len: 0, state_len: 0, ..placement.clone() };
+        assert!(check_writable(&alias, 128, 128, &pool).is_err());
+        assert!(check_writable(&placement, 66, 128, &pool).is_err());
+        assert!(check_writable(&placement, 0, 128, &pool).is_err());
+        Ok(())
+    }
+    #[test]
+    fn adapter_uses_shared_scheduler_units_prefix_and_streamed_scoring() {
+        let source = include_str!("backend.rs").split("#[cfg(test)]").next().unwrap();
+        assert!(source.contains("Backend<'a> for InklingBackend"));
+        assert!(source.contains("PrefixCache::new("));
+        assert!(source.contains("registered_retained("));
+        assert!(source.contains("prefill_packing::plan("));
+        assert!(source.contains("streamed_prefill_scoring(&self) -> bool { true }"));
+        assert!(!source.contains("tokio::select!"));
+        assert!(!source.contains("loop {"));
+        assert!(!source.contains("for layer in"));
+    }
 }
