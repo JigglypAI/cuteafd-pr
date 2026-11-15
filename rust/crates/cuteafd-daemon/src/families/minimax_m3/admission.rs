@@ -269,8 +269,8 @@ mod tests {
 
         let sample = serve_admission::Sample { total: 96 << 30, cap: 96 << 30, free: 94 << 30, pending_code: 0 };
         let error = serve_admission::admit(request(1024), &[sample; 2], Onboard::Layers(0)).unwrap_err();
-        assert!(error.downcast_ref::<ServingRefusal>().is_none(), "{error:#}");
-        assert!(!format!("{error:#}").contains("not qualified"));
+        assert!(matches!(error.downcast_ref::<ServingRefusal>(), Some(ServingRefusal::Plan(_))), "{error:#}");
+        assert!(format!("{error:#}").contains("not the MiniMax-M3.1-Flash release"));
         Ok(())
     }
 
