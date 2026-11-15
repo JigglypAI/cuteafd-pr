@@ -235,8 +235,8 @@ impl KeyStats {
 #[derive(Default, Clone)]
 struct SizeClass { total: u64, samples: u64, largest: u64 }
 
-/// Optional #1612 rates and node count. Estimates decide capture permission;
-/// only measured arena growth contributes to the physical charge.
+/// Optional legacy estimator metadata. Byte estimates order ARC records and
+/// physical-floor projections; measured memory controls hard and soft stops.
 #[derive(Clone)]
 pub(crate) struct Estimate {
     pub bytes: u64,
@@ -583,6 +583,7 @@ pub(crate) struct DeviceCache {
     floor_resample_used: bool,
     soft: SoftState,
     measurement_failed: bool,
+    failed_measurement_credit: u64,
     pending_bytes: u64,
     next_id: u64,
     next_bank: u64,
@@ -644,7 +645,7 @@ pub(crate) fn seal_cross_device_capture_on_this_thread(sealed: bool) {
 impl DeviceCache {
     fn new(device: i32, reserve: u64) -> Self {
         Self { device, reserve, reserve_policy: None, charged: 0, live_bytes: 0, level: None, pending_bytes: 0, next_id: 0, next_bank: 0, identity_generation: 0, recovery_generation: 0,
-            soft: SoftState::new(reserve), measurement_failed: false, physical_floor: 0, physical_sample: None, physical_floor_warned: false,
+            soft: SoftState::new(reserve), measurement_failed: false, failed_measurement_credit: 0, physical_floor: 0, physical_sample: None, physical_floor_warned: false,
             floor_resample_pending: false, floor_resample_used: false,
             recent_target: 0, records: HashMap::new(), identities: HashMap::new(),
             queues: std::array::from_fn(|_| Queue::default()), classes: HashMap::new(),
@@ -1122,8 +1123,8 @@ impl DeviceCache {
         record.stats.spans_devices |= spans_devices;
     }
 
-    pub fn completed_capture(&mut self, id: u64) {
-        let Some(query) = &self.memory_query else { return };
+    pub fn completed_capture(&mut self, id: u64) -> bool {
+        let Some(query) = &self.memory_query else { return true };
         let sample = query.sample(self.device);
         match sample {
             Ok((free, total)) => {
@@ -1132,14 +1133,19 @@ impl DeviceCache {
                 self.level = Some(level);
                 self.sample_physical(free as u64, tracked);
                 self.settle_captures(growth, Some(id));
+                true
             }
             Err(error) => {
                 // Without a physical observation another capture cannot be safe.
                 tracing::warn!(%error, device = self.device, "capture measurement failed; freezing capture");
                 self.measurement_failed = true;
+                let fallback = self.records.get(&id).map_or(0, |record| record.estimate);
+                self.charged = self.charged.saturating_add(fallback);
+                self.failed_measurement_credit = self.failed_measurement_credit.saturating_add(fallback);
                 self.cancel_capture(id);
                 self.unmeasured = self.records.values().any(|r| r.pending_capture);
                 if !self.unmeasured { self.pending_growth = 0; self.captured_since_observation = false; }
+                false
             }
         }
     }
@@ -1219,7 +1225,9 @@ impl DeviceCache {
         self.pending_bytes = self.pending_bytes.saturating_sub(settled_bytes);
         self.unmeasured = self.records.values().any(|r| r.pending_capture);
         if !self.unmeasured { self.pending_growth = 0; self.captured_since_observation = false; }
-        self.charged = self.charged.saturating_add(bytes);
+        let credited = bytes.min(self.failed_measurement_credit);
+        self.failed_measurement_credit -= credited;
+        self.charged = self.charged.saturating_add(bytes - credited);
         self.apply_soft_pressure(bytes, completed);
     }
 
@@ -1526,6 +1534,65 @@ mod tests {
         cache.measured_capture(10);
         id
     }
+    #[test]
+    fn completed_capture_measures_once_and_failure_cancels_without_fake_charge() -> anyhow::Result<()> {
+        let fixture = cuteafd_ffi::native_library_lifetime_fixture::Fixture::build_for_tests()?;
+        let library = fixture.load()?;
+        fixture.configure_memory_usage(&library, 6, 64 << 20, 0)?;
+        let mut cache = test_cache(6, 32 << 20);
+        cache.observer.observe(64 << 20, 64 << 20, 0, 0, 0);
+        cache.memory_query = Some(library.physical_memory_query()?);
+        let Miss::Capture(a) = cache.miss(key(1), site(Preference::Capture), None, false) else { panic!() };
+        cache.captured_topology(a, 7, 1, false);
+        fixture.configure_memory_usage(&library, 6, 64 << 20, 2 << 20)?;
+        assert!(cache.completed_capture(a));
+        assert_eq!(cache.charged, 2 << 20);
+        assert_eq!(cache.level, Some(2 << 20));
+        assert!(!cache.needs_boundary());
+        let (growth, level) = cache.observer.observe(62 << 20, 64 << 20, 0, 0, 0);
+        cache.level = Some(level);
+        cache.measured_capture(growth);
+        assert_eq!(cache.charged, 2 << 20, "GLM-shaped whole-step observer must not charge commit twice");
+        let Miss::Capture(b) = cache.miss(key(2), site(Preference::Capture), None, false) else { panic!() };
+        cache.captured_topology(b, 11, 1, false);
+        fixture.configure_memory(&library, 6, 0)?;
+        assert!(!cache.completed_capture(b));
+        assert_eq!(cache.charged, 4 << 20, "failed sample conservatively charges the retained exec estimate");
+        assert_eq!(cache.failed_measurement_credit, 2 << 20);
+        assert!(!cache.records.contains_key(&b));
+        assert!(!cache.needs_boundary());
+        assert!(cache.measurement_failed);
+        fixture.configure_memory_usage(&library, 6, 64 << 20, 4 << 20)?;
+        let (growth, _) = cache.observer.observe(60 << 20, 64 << 20, 0, 0, 0);
+        cache.measured_capture(growth);
+        assert_eq!(cache.charged, 4 << 20, "successful later sample cannot double-charge fallback credit");
+        assert_eq!(cache.failed_measurement_credit, 0);
+        assert!(matches!(cache.miss(key(3), site(Preference::Capture), None, false), Miss::Eager));
+        Ok(())
+    }
+
+    #[test]
+    fn zero_soft_disables_capture_and_unknown_nodes_do_not_disable_known_pressure() {
+        let mut empty = DeviceCache::new(-1008, GRAPH_CHUNK);
+        assert!(matches!(empty.miss(key(1), site(Preference::Capture), None, false), Miss::Eager));
+        let mut cache = test_cache(-1009, 16 * GRAPH_CHUNK);
+        let capture_site = Site { bootstrap: 1, ..site(Preference::Capture) };
+        let Miss::Capture(unknown) = cache.miss(key(1), capture_site, None, false) else { panic!() };
+        cache.captured_topology(unknown, 0, 0, false);
+        cache.measured_capture(GRAPH_CHUNK);
+        for n in 2..16 {
+            if cache.charged >= cache.reserve { break }
+            if let Miss::Capture(id) = cache.miss(key(n), capture_site, None, false) {
+                cache.captured_topology(id, 10, 1, false);
+                cache.measured_capture(GRAPH_CHUNK);
+                let victims: Vec<_> = cache.records.iter().filter(|(_, r)| r.pending_destroy).map(|(&id, _)| id).collect();
+                cache.destroyed(&victims, ReleaseMeasurement { released: 0 });
+            }
+        }
+        assert!(cache.soft.measured_bytes.is_some());
+        assert!(!cache.pending(unknown), "unknown owner remains measured-only, not a zero-node victim");
+    }
+
     #[test]
     fn single_owner_measurement_preserves_another_outstanding_ticket() {
         let mut cache = test_cache(-1006, 64 * GRAPH_CHUNK);

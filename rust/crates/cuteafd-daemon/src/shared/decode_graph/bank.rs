@@ -226,9 +226,14 @@ impl<K: Hash + Eq + Clone + std::fmt::Debug, E> GraphBank<K, E> {
         assert!(std::sync::Arc::ptr_eq(&binding.cache, &ticket.cache), "graph ticket belongs to a different device cache");
         assert!(!ticket.committed, "graph capture ticket already settled");
         self.cache_topology(ticket.id, nodes, width, spans_devices);
-        self.cache_insert(key, exec, ticket.id, ticket.pinned);
+        self.cache_insert(key.clone(), exec, ticket.id, ticket.pinned);
         ticket.committed = true;
-        ticket.cache.lock().unwrap_or_else(|p| p.into_inner()).completed_capture(ticket.id);
+        let retained = ticket.cache.lock().unwrap_or_else(|p| p.into_inner()).completed_capture(ticket.id);
+        if !retained {
+            // The caller may already hold the raw executable for its first
+            // launch. Retain its owner until ordinary drained bank teardown.
+            if let Some(entry) = self.entries.get_mut(&key) { entry.cached = None; }
+        }
     }
 
     /// Cancel a failed capture, backing off allocation failures by exact key.
@@ -396,6 +401,32 @@ mod device_tests {
     use super::*;
     use super::super::device::{Cycle, Miss, Preference, ReleaseMeasurement, Site};
     fn site() -> Site { Site { name: "bank-test", cycle: Cycle::Decode, preference: Preference::Capture, bootstrap: 10, basis: super::super::device::Basis::Bytes, spans_devices: false } }
+    #[test]
+    fn failed_commit_measurement_retains_owner_and_charges_until_drained_teardown() -> anyhow::Result<()> {
+        use std::{cell::Cell, rc::Rc};
+        struct Exec(Rc<Cell<usize>>);
+        impl Drop for Exec { fn drop(&mut self) { self.0.set(self.0.get() + 1); } }
+        let fixture = cuteafd_ffi::native_library_lifetime_fixture::Fixture::build_for_tests()?;
+        let library = fixture.load()?;
+        fixture.configure_memory_usage(&library, 6, 64 << 20, 0)?;
+        let mut bank = GraphBank::new();
+        bank.attach_device(&library, 6, 32 << 20, site())?;
+        let ticket = bank.cache_ticket(&1, false, None).unwrap();
+        let drops = Rc::new(Cell::new(0));
+        fixture.configure_memory(&library, 6, 0)?;
+        bank.cache_commit(1, Exec(drops.clone()), ticket, 7, 1, false);
+        assert_eq!(drops.get(), 0, "raw first launch may still use the retained executable");
+        assert!(bank.cached_launch(&1).is_some());
+        assert!(!bank.cache_needs_boundary());
+        let snapshot = super::super::device::snapshots().into_iter().find(|row| row.device == 6).unwrap();
+        assert_eq!(snapshot.charged, 10, "retained owner is conservatively charged");
+        assert!(snapshot.hard_stopped);
+        assert!(bank.cache_ticket(&2, false, None).is_none());
+        bank.cache_clear_drained();
+        assert_eq!(drops.get(), 1);
+        Ok(())
+    }
+
     #[test]
     fn device_eviction_destroys_only_after_successful_drain() {
         use std::{cell::Cell, rc::Rc};
