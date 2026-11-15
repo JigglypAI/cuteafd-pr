@@ -11,14 +11,15 @@ use crate::serving_capacity::Exl3Epilogue;
 /// MiMo/Step rows include their BF16-input siblings.
 const CENSUS_CAPACITIES: [u32; 8] = cuteafd_core::EXL3_CAPACITIES;
 
-fn group_scratch(family: &str, format: ExpertFormat, compiled: u32) -> anyhow::Result<u64> {
+fn group_scratch(family: &str, format: ExpertFormat, width: u32, compiled: u32) -> anyhow::Result<u64> {
     use std::sync::OnceLock;
-    static CENSUS: OnceLock<Vec<(String, String, Vec<u64>)>> = OnceLock::new();
+    static CENSUS: OnceLock<Vec<(String, String, Option<u32>, Vec<u64>)>> = OnceLock::new();
     let census = CENSUS.get_or_init(|| {
         let rows: Vec<serde_json::Value> = serde_json::from_str(include_str!("spark_slot_census.json"))
             .expect("bundled Spark slot census is valid JSON");
         rows.into_iter().map(|row| (row["family"].as_str().unwrap_or_default().to_owned(),
             row["format"].as_str().unwrap_or_default().to_owned(),
+            row["width"].as_u64().and_then(|width| width.try_into().ok()),
             row["scratch"].as_array().map(|values| values.iter().filter_map(serde_json::Value::as_u64).collect())
                 .unwrap_or_default())).collect()
     });
@@ -28,9 +29,11 @@ fn group_scratch(family: &str, format: ExpertFormat, compiled: u32) -> anyhow::R
     };
     let index = CENSUS_CAPACITIES.iter().position(|&rows| rows == compiled)
         .ok_or_else(|| anyhow::anyhow!("no Spark scratch census at export m{compiled}"))?;
-    census.iter().filter(|(f, k, _)| f == family && k == format_name)
+    let has_widths = census.iter().any(|(f, k, width, _)| f == family && k == format_name && width.is_some());
+    census.iter().filter(|(f, k, measured_width, _)| f == family && k == format_name
+            && (!has_widths || *measured_width == Some(width)))
         .filter_map(|(.., scratch)| scratch.get(index).copied()).max()
-        .ok_or_else(|| anyhow::anyhow!("no calibrated Spark slot scratch for {family}/{format:?}; add the package census or manifest-backed sizing (#776)"))
+        .ok_or_else(|| anyhow::anyhow!("no calibrated Spark slot scratch for {family}/{format:?} width{width}; add the package census or manifest-backed sizing (#776)"))
 }
 
 /// Stream-ordered device input/route/output planes of one owner at `rows`.
@@ -104,7 +107,7 @@ fn fp8_owner_bytes(family: &str, geometry: cuteafd_core::ExpertGeometry, formats
     let mut address_staging = 0;
     let hidden = u64::from(geometry.hidden);
     for &(format, width) in formats {
-        scratch = scratch.max(group_scratch(family, format, extent.compiled)?);
+        scratch = scratch.max(group_scratch(family, format, width, extent.compiled)?);
         io += group_io_bytes(family, format, geometry, extent.capacity);
         // Installed row-addressed recipes and their smallest member units.
         let (minimum, arithmetic) = match format {
@@ -417,7 +420,7 @@ mod tests {
     fn inkling_native_census_uses_exporter_bytes_and_shared_mixed_owner_sum() -> anyhow::Result<()> {
         let geometry = cuteafd_core::ExpertGeometry::INKLING2;
         for (format, scratch) in [(ExpertFormat::Mxfp8, 400_695_296), (ExpertFormat::Nvfp4, 780_804_096)] {
-            assert_eq!(group_scratch("inkling2", format, 4096)?, scratch);
+            assert_eq!(group_scratch("inkling2", format, 1152, 4096)?, scratch);
             let one = fp8_owner_bytes("inkling2", geometry, &[(format, 1152)], extent(2752, 4096))?;
             assert_eq!(one.scratch, scratch);
             let mut queued = extent(2752, 4096);
@@ -430,6 +433,13 @@ mod tests {
         assert_eq!(both.io, group_io_bytes("inkling2", ExpertFormat::Mxfp8, geometry, 2752)
             + group_io_bytes("inkling2", ExpertFormat::Nvfp4, geometry, 2752));
         assert_eq!(both.pinned_staging, 2752 * 8 * 8 * 2);
+        for format in [ExpertFormat::Mxfp8, ExpertFormat::Nvfp4] {
+            let narrow = group_scratch("inkling2", format, 256, 4096)?;
+            let wide = group_scratch("inkling2", format, 1152, 4096)?;
+            assert!(narrow < wide, "narrow owner must not borrow widest scratch");
+            assert!(group_scratch("inkling2", format, 320, 4096).is_err(),
+                "an unrecorded width cannot borrow a neighbour or a margin");
+        }
         Ok(())
     }
 
@@ -602,7 +612,7 @@ mod tests {
         let partial = fp8_owner_bytes("glm5", geometry, &[(ExpertFormat::Nvfp4, 1024)], extent(2752, 4096)).unwrap();
         assert_eq!(partial.scratch, prefill.scratch);
         assert_eq!(prefill.io - partial.io, (4096 - 2752) * (4 * 6144 + 8 * 8));
-        assert!(group_scratch("glm5", ExpertFormat::Nvfp4, 64).is_err());
+        assert!(group_scratch("glm5", ExpertFormat::Nvfp4, 1024, 64).is_err());
     }
 
     #[test]
@@ -616,8 +626,8 @@ mod tests {
             let executions = admit_family("step5", &SparkBackend::Fp8.exports(), None, unit, waves)?;
             let prefill = executions.owners().last().unwrap();
             let actual = fp8_owner_bytes("step5", geometry, &formats, prefill)?;
-            assert_eq!(actual.scratch, group_scratch("step5", ExpertFormat::Fp8Block128, compiled)?
-                .max(group_scratch("step5", ExpertFormat::Bf16, compiled)?));
+            assert_eq!(actual.scratch, group_scratch("step5", ExpertFormat::Fp8Block128, 384, compiled)?
+                .max(group_scratch("step5", ExpertFormat::Bf16, 384, compiled)?));
             assert_eq!(actual.io, maximum.io / 4096 * unit);
             scratch.push(actual.scratch);
         }

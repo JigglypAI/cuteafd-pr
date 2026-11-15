@@ -9659,6 +9659,7 @@
   "package": "fp8-inkling2-mxfp8/tp2",
   "family": "inkling2",
   "format": "mxfp8",
+  "width": 1152,
   "hidden": 4608,
   "topk": 8,
   "bf16": false,
@@ -9673,13 +9674,12 @@
    400695296
   ],
   "source": {
-   "method": "static exporter metadata fp8_moe_scratch_bytes, capacity_scratch maximum across retained forms",
+   "method": "static exporter fp8_moe_scratch_bytes and capacity_scratch across retained forms",
    "compute": [
     12,
     1
    ],
    "sms": 48,
-   "intermediate": 1152,
    "fork": "166a52c66599631e7c7c359b4fd37dbee3e67538"
   }
  },
@@ -9687,6 +9687,7 @@
   "package": "fp8-inkling2-mxfp8/tp3",
   "family": "inkling2",
   "format": "mxfp8",
+  "width": 768,
   "hidden": 4608,
   "topk": 8,
   "bf16": false,
@@ -9701,13 +9702,12 @@
    367927296
   ],
   "source": {
-   "method": "static exporter metadata fp8_moe_scratch_bytes, capacity_scratch maximum across retained forms",
+   "method": "static exporter fp8_moe_scratch_bytes and capacity_scratch across retained forms",
    "compute": [
     12,
     1
    ],
    "sms": 48,
-   "intermediate": 768,
    "fork": "166a52c66599631e7c7c359b4fd37dbee3e67538"
   }
  },
@@ -9715,6 +9715,7 @@
   "package": "fp8-inkling2-mxfp8/tp4",
   "family": "inkling2",
   "format": "mxfp8",
+  "width": 640,
   "hidden": 4608,
   "topk": 8,
   "bf16": false,
@@ -9729,20 +9730,48 @@
    357441536
   ],
   "source": {
-   "method": "static exporter metadata fp8_moe_scratch_bytes, capacity_scratch maximum across retained forms",
+   "method": "static exporter fp8_moe_scratch_bytes and capacity_scratch across retained forms",
    "compute": [
     12,
     1
    ],
    "sms": 48,
-   "intermediate": 640,
    "fork": "166a52c66599631e7c7c359b4fd37dbee3e67538"
   }
  },
  {
-  "package": "fp8-inkling2-mxfp8/tp5",
+  "package": "fp8-inkling2-mxfp8/tp4-w640",
   "family": "inkling2",
   "format": "mxfp8",
+  "width": 640,
+  "hidden": 4608,
+  "topk": 8,
+  "bf16": false,
+  "scratch": [
+   856064,
+   12284928,
+   39374848,
+   53312512,
+   114138112,
+   357441536,
+   357441536,
+   357441536
+  ],
+  "source": {
+   "method": "static exporter fp8_moe_scratch_bytes and capacity_scratch across retained forms",
+   "compute": [
+    12,
+    1
+   ],
+   "sms": 48,
+   "fork": "166a52c66599631e7c7c359b4fd37dbee3e67538"
+  }
+ },
+ {
+  "package": "fp8-inkling2-mxfp8/tp4-w512",
+  "family": "inkling2",
+  "format": "mxfp8",
+  "width": 512,
   "hidden": 4608,
   "topk": 8,
   "bf16": false,
@@ -9757,13 +9786,96 @@
    345645056
   ],
   "source": {
-   "method": "static exporter metadata fp8_moe_scratch_bytes, capacity_scratch maximum across retained forms",
+   "method": "static exporter fp8_moe_scratch_bytes and capacity_scratch across retained forms",
    "compute": [
     12,
     1
    ],
    "sms": 48,
-   "intermediate": 512,
+   "fork": "166a52c66599631e7c7c359b4fd37dbee3e67538"
+  }
+ },
+ {
+  "package": "fp8-inkling2-mxfp8/tp5",
+  "family": "inkling2",
+  "format": "mxfp8",
+  "width": 512,
+  "hidden": 4608,
+  "topk": 8,
+  "bf16": false,
+  "scratch": [
+   690176,
+   9907200,
+   32204800,
+   45939712,
+   105880576,
+   345645056,
+   345645056,
+   345645056
+  ],
+  "source": {
+   "method": "static exporter fp8_moe_scratch_bytes and capacity_scratch across retained forms",
+   "compute": [
+    12,
+    1
+   ],
+   "sms": 48,
+   "fork": "166a52c66599631e7c7c359b4fd37dbee3e67538"
+  }
+ },
+ {
+  "package": "fp8-inkling2-mxfp8/tp5-w512",
+  "family": "inkling2",
+  "format": "mxfp8",
+  "width": 512,
+  "hidden": 4608,
+  "topk": 8,
+  "bf16": false,
+  "scratch": [
+   690176,
+   9907200,
+   32204800,
+   45939712,
+   105880576,
+   345645056,
+   345645056,
+   345645056
+  ],
+  "source": {
+   "method": "static exporter fp8_moe_scratch_bytes and capacity_scratch across retained forms",
+   "compute": [
+    12,
+    1
+   ],
+   "sms": 48,
+   "fork": "166a52c66599631e7c7c359b4fd37dbee3e67538"
+  }
+ },
+ {
+  "package": "fp8-inkling2-mxfp8/tp5-w384",
+  "family": "inkling2",
+  "format": "mxfp8",
+  "width": 384,
+  "hidden": 4608,
+  "topk": 8,
+  "bf16": false,
+  "scratch": [
+   542720,
+   7793664,
+   25831424,
+   39386112,
+   98540544,
+   335159296,
+   335159296,
+   335159296
+  ],
+  "source": {
+   "method": "static exporter fp8_moe_scratch_bytes and capacity_scratch across retained forms",
+   "compute": [
+    12,
+    1
+   ],
+   "sms": 48,
    "fork": "166a52c66599631e7c7c359b4fd37dbee3e67538"
   }
  },
@@ -9771,6 +9883,7 @@
   "package": "fp8-inkling2-mxfp8/tp6",
   "family": "inkling2",
   "format": "mxfp8",
+  "width": 384,
   "hidden": 4608,
   "topk": 8,
   "bf16": false,
@@ -9785,13 +9898,12 @@
    335159296
   ],
   "source": {
-   "method": "static exporter metadata fp8_moe_scratch_bytes, capacity_scratch maximum across retained forms",
+   "method": "static exporter fp8_moe_scratch_bytes and capacity_scratch across retained forms",
    "compute": [
     12,
     1
    ],
    "sms": 48,
-   "intermediate": 384,
    "fork": "166a52c66599631e7c7c359b4fd37dbee3e67538"
   }
  },
@@ -9799,6 +9911,7 @@
   "package": "fp8-inkling2-mxfp8/tp7",
   "family": "inkling2",
   "format": "mxfp8",
+  "width": 384,
   "hidden": 4608,
   "topk": 8,
   "bf16": false,
@@ -9813,13 +9926,68 @@
    335159296
   ],
   "source": {
-   "method": "static exporter metadata fp8_moe_scratch_bytes, capacity_scratch maximum across retained forms",
+   "method": "static exporter fp8_moe_scratch_bytes and capacity_scratch across retained forms",
    "compute": [
     12,
     1
    ],
    "sms": 48,
-   "intermediate": 384,
+   "fork": "166a52c66599631e7c7c359b4fd37dbee3e67538"
+  }
+ },
+ {
+  "package": "fp8-inkling2-mxfp8/tp7-w384",
+  "family": "inkling2",
+  "format": "mxfp8",
+  "width": 384,
+  "hidden": 4608,
+  "topk": 8,
+  "bf16": false,
+  "scratch": [
+   542720,
+   7793664,
+   25831424,
+   39386112,
+   98540544,
+   335159296,
+   335159296,
+   335159296
+  ],
+  "source": {
+   "method": "static exporter fp8_moe_scratch_bytes and capacity_scratch across retained forms",
+   "compute": [
+    12,
+    1
+   ],
+   "sms": 48,
+   "fork": "166a52c66599631e7c7c359b4fd37dbee3e67538"
+  }
+ },
+ {
+  "package": "fp8-inkling2-mxfp8/tp7-w256",
+  "family": "inkling2",
+  "format": "mxfp8",
+  "width": 256,
+  "hidden": 4608,
+  "topk": 8,
+  "bf16": false,
+  "scratch": [
+   395264,
+   5680128,
+   19458048,
+   32832512,
+   91200512,
+   324673536,
+   324673536,
+   324673536
+  ],
+  "source": {
+   "method": "static exporter fp8_moe_scratch_bytes and capacity_scratch across retained forms",
+   "compute": [
+    12,
+    1
+   ],
+   "sms": 48,
    "fork": "166a52c66599631e7c7c359b4fd37dbee3e67538"
   }
  },
@@ -9827,6 +9995,7 @@
   "package": "fp8-inkling2-mxfp8/tp8",
   "family": "inkling2",
   "format": "mxfp8",
+  "width": 384,
   "hidden": 4608,
   "topk": 8,
   "bf16": false,
@@ -9841,13 +10010,68 @@
    335159296
   ],
   "source": {
-   "method": "static exporter metadata fp8_moe_scratch_bytes, capacity_scratch maximum across retained forms",
+   "method": "static exporter fp8_moe_scratch_bytes and capacity_scratch across retained forms",
    "compute": [
     12,
     1
    ],
    "sms": 48,
-   "intermediate": 384,
+   "fork": "166a52c66599631e7c7c359b4fd37dbee3e67538"
+  }
+ },
+ {
+  "package": "fp8-inkling2-mxfp8/tp8-w384",
+  "family": "inkling2",
+  "format": "mxfp8",
+  "width": 384,
+  "hidden": 4608,
+  "topk": 8,
+  "bf16": false,
+  "scratch": [
+   542720,
+   7793664,
+   25831424,
+   39386112,
+   98540544,
+   335159296,
+   335159296,
+   335159296
+  ],
+  "source": {
+   "method": "static exporter fp8_moe_scratch_bytes and capacity_scratch across retained forms",
+   "compute": [
+    12,
+    1
+   ],
+   "sms": 48,
+   "fork": "166a52c66599631e7c7c359b4fd37dbee3e67538"
+  }
+ },
+ {
+  "package": "fp8-inkling2-mxfp8/tp8-w256",
+  "family": "inkling2",
+  "format": "mxfp8",
+  "width": 256,
+  "hidden": 4608,
+  "topk": 8,
+  "bf16": false,
+  "scratch": [
+   395264,
+   5680128,
+   19458048,
+   32832512,
+   91200512,
+   324673536,
+   324673536,
+   324673536
+  ],
+  "source": {
+   "method": "static exporter fp8_moe_scratch_bytes and capacity_scratch across retained forms",
+   "compute": [
+    12,
+    1
+   ],
+   "sms": 48,
    "fork": "166a52c66599631e7c7c359b4fd37dbee3e67538"
   }
  },
@@ -9855,6 +10079,7 @@
   "package": "fp8-inkling2-nvfp4a4/tp2",
   "family": "inkling2",
   "format": "nvfp4",
+  "width": 1152,
   "hidden": 4608,
   "topk": 8,
   "bf16": true,
@@ -9869,13 +10094,12 @@
    780804096
   ],
   "source": {
-   "method": "static exporter metadata fp8_moe_scratch_bytes, capacity_scratch maximum across retained forms",
+   "method": "static exporter fp8_moe_scratch_bytes and capacity_scratch across retained forms",
    "compute": [
     12,
     1
    ],
    "sms": 48,
-   "intermediate": 1152,
    "fork": "166a52c66599631e7c7c359b4fd37dbee3e67538"
   }
  },
@@ -9883,6 +10107,7 @@
   "package": "fp8-inkling2-nvfp4a4/tp3",
   "family": "inkling2",
   "format": "nvfp4",
+  "width": 768,
   "hidden": 4608,
   "topk": 8,
   "bf16": true,
@@ -9897,13 +10122,12 @@
    692330496
   ],
   "source": {
-   "method": "static exporter metadata fp8_moe_scratch_bytes, capacity_scratch maximum across retained forms",
+   "method": "static exporter fp8_moe_scratch_bytes and capacity_scratch across retained forms",
    "compute": [
     12,
     1
    ],
    "sms": 48,
-   "intermediate": 768,
    "fork": "166a52c66599631e7c7c359b4fd37dbee3e67538"
   }
  },
@@ -9911,6 +10135,7 @@
   "package": "fp8-inkling2-nvfp4a4/tp4",
   "family": "inkling2",
   "format": "nvfp4",
+  "width": 640,
   "hidden": 4608,
   "topk": 8,
   "bf16": true,
@@ -9925,20 +10150,48 @@
    662839296
   ],
   "source": {
-   "method": "static exporter metadata fp8_moe_scratch_bytes, capacity_scratch maximum across retained forms",
+   "method": "static exporter fp8_moe_scratch_bytes and capacity_scratch across retained forms",
    "compute": [
     12,
     1
    ],
    "sms": 48,
-   "intermediate": 640,
    "fork": "166a52c66599631e7c7c359b4fd37dbee3e67538"
   }
  },
  {
-  "package": "fp8-inkling2-nvfp4a4/tp5",
+  "package": "fp8-inkling2-nvfp4a4/tp4-w640",
   "family": "inkling2",
   "format": "nvfp4",
+  "width": 640,
+  "hidden": 4608,
+  "topk": 8,
+  "bf16": true,
+  "scratch": [
+   5151744,
+   73842688,
+   225000448,
+   244186112,
+   327916544,
+   662839296,
+   662839296,
+   662839296
+  ],
+  "source": {
+   "method": "static exporter fp8_moe_scratch_bytes and capacity_scratch across retained forms",
+   "compute": [
+    12,
+    1
+   ],
+   "sms": 48,
+   "fork": "166a52c66599631e7c7c359b4fd37dbee3e67538"
+  }
+ },
+ {
+  "package": "fp8-inkling2-nvfp4a4/tp4-w512",
+  "family": "inkling2",
+  "format": "nvfp4",
+  "width": 512,
   "hidden": 4608,
   "topk": 8,
   "bf16": true,
@@ -9953,13 +10206,96 @@
    633348096
   ],
   "source": {
-   "method": "static exporter metadata fp8_moe_scratch_bytes, capacity_scratch maximum across retained forms",
+   "method": "static exporter fp8_moe_scratch_bytes and capacity_scratch across retained forms",
    "compute": [
     12,
     1
    ],
    "sms": 48,
-   "intermediate": 512,
+   "fork": "166a52c66599631e7c7c359b4fd37dbee3e67538"
+  }
+ },
+ {
+  "package": "fp8-inkling2-nvfp4a4/tp5",
+  "family": "inkling2",
+  "format": "nvfp4",
+  "width": 512,
+  "hidden": 4608,
+  "topk": 8,
+  "bf16": true,
+  "scratch": [
+   4737024,
+   67898368,
+   207075328,
+   225754112,
+   307272704,
+   633348096,
+   633348096,
+   633348096
+  ],
+  "source": {
+   "method": "static exporter fp8_moe_scratch_bytes and capacity_scratch across retained forms",
+   "compute": [
+    12,
+    1
+   ],
+   "sms": 48,
+   "fork": "166a52c66599631e7c7c359b4fd37dbee3e67538"
+  }
+ },
+ {
+  "package": "fp8-inkling2-nvfp4a4/tp5-w512",
+  "family": "inkling2",
+  "format": "nvfp4",
+  "width": 512,
+  "hidden": 4608,
+  "topk": 8,
+  "bf16": true,
+  "scratch": [
+   4737024,
+   67898368,
+   207075328,
+   225754112,
+   307272704,
+   633348096,
+   633348096,
+   633348096
+  ],
+  "source": {
+   "method": "static exporter fp8_moe_scratch_bytes and capacity_scratch across retained forms",
+   "compute": [
+    12,
+    1
+   ],
+   "sms": 48,
+   "fork": "166a52c66599631e7c7c359b4fd37dbee3e67538"
+  }
+ },
+ {
+  "package": "fp8-inkling2-nvfp4a4/tp5-w384",
+  "family": "inkling2",
+  "format": "nvfp4",
+  "width": 384,
+  "hidden": 4608,
+  "topk": 8,
+  "bf16": true,
+  "scratch": [
+   4322304,
+   61954048,
+   189150208,
+   207322112,
+   286628864,
+   603856896,
+   603856896,
+   603856896
+  ],
+  "source": {
+   "method": "static exporter fp8_moe_scratch_bytes and capacity_scratch across retained forms",
+   "compute": [
+    12,
+    1
+   ],
+   "sms": 48,
    "fork": "166a52c66599631e7c7c359b4fd37dbee3e67538"
   }
  },
@@ -9967,6 +10303,7 @@
   "package": "fp8-inkling2-nvfp4a4/tp6",
   "family": "inkling2",
   "format": "nvfp4",
+  "width": 384,
   "hidden": 4608,
   "topk": 8,
   "bf16": true,
@@ -9981,13 +10318,12 @@
    603856896
   ],
   "source": {
-   "method": "static exporter metadata fp8_moe_scratch_bytes, capacity_scratch maximum across retained forms",
+   "method": "static exporter fp8_moe_scratch_bytes and capacity_scratch across retained forms",
    "compute": [
     12,
     1
    ],
    "sms": 48,
-   "intermediate": 384,
    "fork": "166a52c66599631e7c7c359b4fd37dbee3e67538"
   }
  },
@@ -9995,6 +10331,7 @@
   "package": "fp8-inkling2-nvfp4a4/tp7",
   "family": "inkling2",
   "format": "nvfp4",
+  "width": 384,
   "hidden": 4608,
   "topk": 8,
   "bf16": true,
@@ -10009,13 +10346,68 @@
    603856896
   ],
   "source": {
-   "method": "static exporter metadata fp8_moe_scratch_bytes, capacity_scratch maximum across retained forms",
+   "method": "static exporter fp8_moe_scratch_bytes and capacity_scratch across retained forms",
    "compute": [
     12,
     1
    ],
    "sms": 48,
-   "intermediate": 384,
+   "fork": "166a52c66599631e7c7c359b4fd37dbee3e67538"
+  }
+ },
+ {
+  "package": "fp8-inkling2-nvfp4a4/tp7-w384",
+  "family": "inkling2",
+  "format": "nvfp4",
+  "width": 384,
+  "hidden": 4608,
+  "topk": 8,
+  "bf16": true,
+  "scratch": [
+   4322304,
+   61954048,
+   189150208,
+   207322112,
+   286628864,
+   603856896,
+   603856896,
+   603856896
+  ],
+  "source": {
+   "method": "static exporter fp8_moe_scratch_bytes and capacity_scratch across retained forms",
+   "compute": [
+    12,
+    1
+   ],
+   "sms": 48,
+   "fork": "166a52c66599631e7c7c359b4fd37dbee3e67538"
+  }
+ },
+ {
+  "package": "fp8-inkling2-nvfp4a4/tp7-w256",
+  "family": "inkling2",
+  "format": "nvfp4",
+  "width": 256,
+  "hidden": 4608,
+  "topk": 8,
+  "bf16": true,
+  "scratch": [
+   3907584,
+   56009728,
+   171225088,
+   188890112,
+   265985024,
+   574365696,
+   574365696,
+   574365696
+  ],
+  "source": {
+   "method": "static exporter fp8_moe_scratch_bytes and capacity_scratch across retained forms",
+   "compute": [
+    12,
+    1
+   ],
+   "sms": 48,
    "fork": "166a52c66599631e7c7c359b4fd37dbee3e67538"
   }
  },
@@ -10023,6 +10415,7 @@
   "package": "fp8-inkling2-nvfp4a4/tp8",
   "family": "inkling2",
   "format": "nvfp4",
+  "width": 384,
   "hidden": 4608,
   "topk": 8,
   "bf16": true,
@@ -10037,13 +10430,68 @@
    603856896
   ],
   "source": {
-   "method": "static exporter metadata fp8_moe_scratch_bytes, capacity_scratch maximum across retained forms",
+   "method": "static exporter fp8_moe_scratch_bytes and capacity_scratch across retained forms",
    "compute": [
     12,
     1
    ],
    "sms": 48,
-   "intermediate": 384,
+   "fork": "166a52c66599631e7c7c359b4fd37dbee3e67538"
+  }
+ },
+ {
+  "package": "fp8-inkling2-nvfp4a4/tp8-w384",
+  "family": "inkling2",
+  "format": "nvfp4",
+  "width": 384,
+  "hidden": 4608,
+  "topk": 8,
+  "bf16": true,
+  "scratch": [
+   4322304,
+   61954048,
+   189150208,
+   207322112,
+   286628864,
+   603856896,
+   603856896,
+   603856896
+  ],
+  "source": {
+   "method": "static exporter fp8_moe_scratch_bytes and capacity_scratch across retained forms",
+   "compute": [
+    12,
+    1
+   ],
+   "sms": 48,
+   "fork": "166a52c66599631e7c7c359b4fd37dbee3e67538"
+  }
+ },
+ {
+  "package": "fp8-inkling2-nvfp4a4/tp8-w256",
+  "family": "inkling2",
+  "format": "nvfp4",
+  "width": 256,
+  "hidden": 4608,
+  "topk": 8,
+  "bf16": true,
+  "scratch": [
+   3907584,
+   56009728,
+   171225088,
+   188890112,
+   265985024,
+   574365696,
+   574365696,
+   574365696
+  ],
+  "source": {
+   "method": "static exporter fp8_moe_scratch_bytes and capacity_scratch across retained forms",
+   "compute": [
+    12,
+    1
+   ],
+   "sms": 48,
    "fork": "166a52c66599631e7c7c359b4fd37dbee3e67538"
   }
  }
