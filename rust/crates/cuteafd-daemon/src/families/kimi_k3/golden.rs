@@ -901,6 +901,7 @@ fn load_target<'a, const RANKS: usize>(args: &GoldenArgs, library: &'a Arc<cutea
         context: cuteafd_loader::placement::planner::Context::pinned(cuteafd_loader::families::kimi_k3::COMPILED_CONTEXT as u64), slots: 1, marks: 1, max_context: cuteafd_loader::families::kimi_k3::COMPILED_CONTEXT,
         pool_tokens: Some(1_048_576), graphs, draft: None, ffn_mode: args.ffn_mode(),
         hosted_layers: args.hosted(cfg)?, verify_rows: verify, prefix: None,
+        #[cfg(test)] prove_serve_admission: false,
     })
 }
 
@@ -922,7 +923,7 @@ fn native(args: &GoldenArgs, checkpoint: &cuteafd_loader::plan::Checkpoint,
     let graphs = args.startup_graphs()?;
     ensure!(args.device >= 0 && args.split_device.is_none_or(|peer| peer >= 0 && peer != args.device),
         "Kimi golden devices must name distinct physical owners");
-    let super::startup::Loaded { engine, admission_free, admitted_bytes, ownership } = match args.split_device {
+    let super::startup::Loaded { engine, admission_free, admitted_bytes, ownership, .. } = match args.split_device {
         Some(peer) => load_target(args, &library, &programs, checkpoint, full, cfg,
             [args.device, peer], prefill, graphs, verify.unwrap_or(0))?,
         None => load_target(args, &library, &programs, checkpoint, full, cfg,

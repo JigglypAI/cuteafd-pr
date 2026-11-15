@@ -64,6 +64,7 @@ pub(super) fn check_prefix(full: &KimiK3Config, selected: &KimiK3Config) -> Resu
 /// All demands are still future to the two post-module CUDA samples. The
 /// engine supplies its native programs' lane extents, exchange, graphs and
 /// page tables; global weights, token IO and state banks add their own demands.
+#[cfg_attr(test, derive(Clone))]
 pub(crate) struct Inputs<'a, const RANKS: usize = 2> {
     pub skip_routed_experts: bool,
     pub expert_usage: bool,
@@ -101,6 +102,7 @@ pub(crate) struct Inputs<'a, const RANKS: usize = 2> {
 }
 
 /// CPU-planned native residency; no backend owner allocates before solve.
+#[cfg_attr(test, derive(Clone))]
 pub(crate) struct RtxInventory {
     pub package: std::path::PathBuf,
     pub costs: Vec<Vec<Bytes2>>,

@@ -95,7 +95,25 @@ fn k31_raw_and_streamed_scoring_match_ordinary_c16() -> Result<()> {
     // Only the prequalification runtime refusal differs from serving. Every
     // allocation, graph, pool, context and onboarding input stays identical.
     options.role = startup::Role::Golden { skip_routed_experts: false };
-    options.hosted_layers = Some(super::golden::hosted_layers(&std::env::var("CUTEAFD_GOLDEN_EXPERT_LAYERS")?)?);
+    options.prove_serve_admission = true;
+    // Use the serving working set, not the golden runner's all-layer seed hint.
+    // WorkerSelection still loads only the native solver's admitted layers.
+    ensure!(options.hosted_layers.is_none(), "paired proof must not override serving ownership");
+    let offline = cuteafd_loader::plan::PlanInput::open_view(&view)?.plan(
+        &cuteafd_loader::plan::PlanOptions {
+            attention_placement: cuteafd_loader::placement::attention::parse(&args.attention_placement)
+                .map_err(anyhow::Error::msg)?,
+            vision: cuteafd_loader::plan::MediaMode::Off,
+            audio: cuteafd_loader::plan::MediaMode::Off,
+            placement: cuteafd_loader::plan::ExpertPlacement::Sparks { ranks: 6 },
+            layout: Some(cuteafd_loader::plan::layout::LayoutOptions {
+                rtx_bytes: vec![cuteafd_loader::placement::inventory::PRO_TOTAL_BYTES; 2],
+                concurrency: 16, workspace_manifest: Some(args.manifest.clone()),
+                mla_kv: args.kv_cache, onboard: Some(args.rtx_expert_layers),
+                spark_allocation_budget_bytes: Some(108 << 30), ..Default::default()
+            }), ..Default::default()
+        })?;
+    let offline_pool = offline.memory_layout.as_ref().context("offline proof memory layout")?.pool_tokens;
     startup::preflight(&args.manifest, &args.native_lib)?;
     // SAFETY: golden-run supplies the sealed library; all borrowers drop first.
     let library = Arc::new(unsafe { cuteafd_ffi::NativeLibrary::load(&args.native_lib)? });
@@ -107,6 +125,18 @@ fn k31_raw_and_streamed_scoring_match_ordinary_c16() -> Result<()> {
     let geometry = engine.geometry()?;
     ensure!(geometry.slots == 16 && geometry.prefill_rows == prefill.span_rows as usize,
         "paired runtime differs from ordinary admission");
+    ensure!(loaded.ownership.inactive_seeded_layers == 0 && loaded.ownership.inactive_loaded_layers == 0,
+        "paired golden must not seed or load beyond the serving working set");
+    let admission_proof = loaded.admission_proof.as_ref().context("missing paired Serve admission proof")?;
+    let actual = &admission_proof["paired_golden"];
+    ensure!(actual["pool_tokens"].as_u64() == Some((family.layout().pages * 64) as u64)
+        && actual["max_context"].as_u64() == Some(geometry.max_context as u64)
+        && actual["kv_format"] == args.kv_cache.label()
+        && actual["onboard_layers"].as_u64() == Some(loaded.ownership.rtx_expert_layers as u64)
+        && actual["spark_layers"] == json!(loaded.ownership.spark_layers),
+        "loaded engine differs from the preallocation Serve admission proof");
+    // Same admitted extent/parity/reserved pages as serving; the diagnostic
+    // allocator is sufficient for exactness because both arms reuse the same IDs.
     let mut pool = super::prefix::diagnostic_pool(family.layout());
     let reference_root = std::path::PathBuf::from(std::env::var("CUTEAFD_GOLDEN_FIXTURES")?);
     let manifest_bytes = std::fs::read(reference_root.join("manifest.json"))?;
@@ -200,7 +230,10 @@ fn k31_raw_and_streamed_scoring_match_ordinary_c16() -> Result<()> {
             "concurrency":16, "state_slots":slots, "marks":marks,
             "prefill":{"unit_rows":prefill.unit_rows,"waves":prefill.waves,"span_rows":prefill.span_rows},
             "pool_pages":family.layout().pages, "context":geometry.max_context,
-            "ownership":loaded.ownership, "reference_manifest_sha256":cuteafd_bench::fidelity_dataset::KIMI_K31_MANIFEST_SHA256,
+            "ownership":loaded.ownership, "admission":admission_proof,
+            "offline_estimated_pool_tokens":offline_pool,
+            "offline_pool_is_reference_only":"estimated CUDA/module baseline; exact Serve comparison uses measured startup inputs",
+            "reference_manifest_sha256":cuteafd_bench::fidelity_dataset::KIMI_K31_MANIFEST_SHA256,
             "windows":results}))?;
     Ok(())
 }
