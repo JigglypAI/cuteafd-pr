@@ -23,6 +23,7 @@ pub(crate) struct DraftPrefix<'a> {
     pub drafter: Rc<crate::shared::speculation::block_dspark::DsparkDrafter<'a>>,
     pub marks: crate::shared::speculation::block_dspark::WindowSnapshots<'a>,
     pub frontiers: std::cell::RefCell<Vec<usize>>,
+    pub prompt_ends: std::cell::RefCell<Vec<usize>>,
     pub slots: usize,
 }
 impl DraftPrefix<'_> {

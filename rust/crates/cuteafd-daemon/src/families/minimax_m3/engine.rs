@@ -498,7 +498,7 @@ trait SlotArithmetic {
     fn router(&mut self, layer: usize, unit: &Unit) -> Result<()>;
     fn ffn(&mut self, layer: usize, unit: &Unit, shared: bool) -> Result<()>;
     fn join(&mut self, layer: usize, unit: &Unit) -> Result<()>;
-    fn capture_target(&self, _layer:usize, _unit:&Unit) -> Result<()> { Ok(()) }
+    fn capture_target(&self, _layer:usize, _unit:&Unit, _requests:&[ServingRequest<'_>]) -> Result<()> { Ok(()) }
     fn head(&mut self, unit: &Unit, requests: &[ServingRequest<'_>]) -> Result<()>;
     fn commit(&mut self, unit: &Unit, requests: &mut [ServingRequest<'_>]) -> Result<()>;
     fn abort_split(&self) {}
@@ -617,7 +617,6 @@ impl<F: FnMut(usize, Range<usize>, DeviceLogits) -> Result<()>> SlotArithmetic f
                 let tag = super::heads::Tag { unit: unit.slot, layer, rows: unit.rows.len(),
                     kind: super::heads::Reduction::Ffn { shared: false } };
                 heads.reduce(&self.storage.ranks, [&a, &b], [tag; 2])?;
-                for owner in [&*a, &*b] { owner.post_fold_tap_enqueue(layer, unit.rows.len())?; }
             }
             return Ok(());
         }
@@ -661,7 +660,6 @@ impl<F: FnMut(usize, Range<usize>, DeviceLogits) -> Result<()>> SlotArithmetic f
             heads.reduce(&self.storage.ranks, [&a, &b], [tag; 2])?;
             for owner in [&*a, &*b] {
                 owner.joined();
-                owner.post_fold_tap_enqueue(layer, unit.rows.len())?;
             }
             return Ok(());
         }
@@ -674,9 +672,22 @@ impl<F: FnMut(usize, Range<usize>, DeviceLogits) -> Result<()>> SlotArithmetic f
             rank.prefill[unit.slot].borrow().join_routed(&rank.kernels, unit.rows.len())
         }
     }
-    fn capture_target(&self,layer:usize,unit:&Unit) -> Result<()> {
-        self.storage.ranks.last().context("MiniMax tap rank missing")?.prefill[unit.slot]
-            .borrow().post_fold_tap_enqueue(layer,unit.rows.len())
+    fn capture_target(&self,layer:usize,unit:&Unit,requests:&[ServingRequest<'_>]) -> Result<()> {
+        let Some(draft) = &self.storage.draft_prefix else { return Ok(()) };
+        let owner = self.storage.ranks.last().context("MiniMax tap rank missing")?.prefill[unit.slot].borrow();
+        for segment in &unit.segments {
+            let request = &requests[segment.sequence];
+            let end = draft.prompt_ends.borrow()[request.placement.slot].max(request.start + request.tokens.len());
+            for first in (0..segment.rows.len()).step_by(crate::shared::speculation::dflash::TAP_ROWS) {
+                let rows = (segment.rows.len() - first).min(crate::shared::speculation::dflash::TAP_ROWS);
+                let position = segment.tokens.start + first;
+                if request.kind == ExpertV2SourceKind::Decode || crate::shared::speculation::retain_context_chunk(
+                    draft.drafter.cfg.window, position..position + rows, end) {
+                    owner.post_fold_tap_span(layer, segment.rows.start + first, rows)?;
+                }
+            }
+        }
+        Ok(())
     }
     fn head(&mut self, unit: &Unit, requests: &[ServingRequest<'_>]) -> Result<()> {
         let rank = &self.storage.ranks[if self.storage.ranks.len() == 2 { 1 } else { 0 }];
@@ -698,11 +709,16 @@ impl<F: FnMut(usize, Range<usize>, DeviceLogits) -> Result<()>> SlotArithmetic f
                         // SAFETY: retained unit and verify buffers are disjoint on head stream.
                         unsafe { owner.stream.device.library.copy_d2d_async(to,from,count * pitch,owner.stream.raw)?; }
                     } else {
-                        // SAFETY: producer taps survive until this unit commits; shared stream orders copy/update.
-                        unsafe { draft.drafter.capture_concatenated(source,segment.rows.start + first,count,0,owner.stream.raw)?; }
-                        let rows=(0..count).map(|tap_row| crate::shared::speculation::dflash::ContextRow {
-                            tap_row,slot:request.placement.slot,position:segment.tokens.start + first + tap_row }).collect::<Vec<_>>();
-                        draft.drafter.update(&rows)?;
+                        let start = segment.tokens.start + first;
+                        if crate::shared::speculation::retain_context_chunk(draft.drafter.cfg.window,
+                            start..start + count, draft.prompt_ends.borrow()[request.placement.slot]
+                                .max(request.start + request.tokens.len())) {
+                            // SAFETY: producer taps survive this unit; the stream orders copy/update.
+                            unsafe { draft.drafter.capture_concatenated(source,segment.rows.start + first,count,0,owner.stream.raw)?; }
+                            let rows=(0..count).map(|tap_row| crate::shared::speculation::dflash::ContextRow {
+                                tap_row,slot:request.placement.slot,position:start + tap_row }).collect::<Vec<_>>();
+                            draft.drafter.update(&rows)?;
+                        }
                         draft.advance(request.placement.slot,segment.tokens.start + first,count)?;
                     }
                 }
@@ -775,7 +791,7 @@ impl<'t, 'a, A: SlotArithmetic> PrefillHooks for ServingHooks<'_, '_, 't, 'a, A>
             self.land_experts(layer, unit, ticket)
         } else {
             let result = self.arithmetic.ffn(layer, unit, false)
-                .and_then(|()| self.arithmetic.capture_target(layer,unit));
+                .and_then(|()| self.arithmetic.capture_target(layer,unit,self.requests));
             abort_hook_error(self.arithmetic, result)
         }
     }
@@ -798,7 +814,7 @@ impl<'t, 'a, A: SlotArithmetic> PrefillHooks for ServingHooks<'_, '_, 't, 'a, A>
     }
     fn land_experts(&mut self, layer: usize, unit: &Unit, ticket: Self::Ticket) -> Result<()> {
         ticket.land_guarded(|| self.arithmetic.abort_split())?;
-        let result = self.arithmetic.join(layer, unit).and_then(|()| self.arithmetic.capture_target(layer,unit));
+        let result = self.arithmetic.join(layer, unit).and_then(|()| self.arithmetic.capture_target(layer,unit,self.requests));
         abort_hook_error(self.arithmetic, result)
     }
     fn end_unit(&mut self, unit: &Unit) -> Result<()> {

@@ -301,6 +301,11 @@ impl<'a> Drafter<'a> {
         }
     }
 
+    pub fn retain_context_chunk(&self, positions: std::ops::Range<usize>, end: usize) -> bool {
+        let window = match self { Self::Dspark(d) => d.cfg.window, _ => None };
+        crate::shared::speculation::retain_context_chunk(window, positions, end)
+    }
+
     pub fn update(&self, rows: &[ContextRow]) -> Result<()> {
         match self {
             Self::Dflash2(d) => d.update(rows),

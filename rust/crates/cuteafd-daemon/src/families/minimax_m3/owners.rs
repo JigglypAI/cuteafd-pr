@@ -237,7 +237,8 @@ impl<'a> Owners<'a> {
             let marks=WindowSnapshots::new(&head_stream,planes,native.marks)?;
             ensure!(marks.mark_bytes() == native.mark_bytes,"MiniMax draft mark extent differs from admission");
             let prefix=Rc::new(super::prefix::DraftPrefix { drafter,marks,
-                frontiers:RefCell::new(vec![0;inputs.sequences as usize]),slots:native.marks });
+                frontiers:RefCell::new(vec![0;inputs.sequences as usize]),
+                prompt_ends:RefCell::new(vec![0;inputs.sequences as usize]),slots:native.marks });
             let logits=Allocation::new(head_stream.device,native.verify_rows * inputs.cfg.vocab_size * 4,
                 Tag::drafter_workspace("minimax/verify/logits"))?;
             let taps=Allocation::new(head_stream.device,native.verify_rows * 5 * inputs.cfg.hidden * 2,

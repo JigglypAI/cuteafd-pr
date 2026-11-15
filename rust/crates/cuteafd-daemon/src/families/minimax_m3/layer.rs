@@ -43,15 +43,19 @@ impl<'a> TargetTapWriter<'a> {
         inventory.host(&format!("{name}.layers"),&self.layers)
     }
     fn enqueue(&self, layer:usize, rows:usize, residual:Buffer) -> Result<()> {
+        self.enqueue_span(layer, 0, rows, residual)
+    }
+    fn enqueue_span(&self, layer:usize, first:usize, rows:usize, residual:Buffer) -> Result<()> {
         let Some(column) = self.layers.iter().position(|&tap| tap == layer) else { return Ok(()) };
-        ensure!(rows > 0 && rows <= self.rows && residual.device_id == self.stream.device.id
-            && residual.bytes >= rows * 6144 * 4, "MiniMax target tap live extent");
+        ensure!(rows > 0 && first + rows <= self.rows && residual.device_id == self.stream.device.id
+            && residual.bytes >= (first + rows) * 6144 * 4, "MiniMax target tap live extent");
         self.stream.device.run(|| {
             // SAFETY: the unit/graph retains all storage on this ordered stream;
             // padded rows write private tap scratch and are never consumed as live state.
             unsafe {
-                self.narrow.launch(residual.ptr,self.scratch.buffer.ptr,rows * 6144,self.stream.raw)?;
-                self.stream.device.library.glm_dflash_tap(self.scratch.buffer.ptr,self.output.buffer.ptr,
+                self.narrow.launch(residual.ptr.wrapping_byte_add(first * 6144 * 4),self.scratch.buffer.ptr,rows * 6144,self.stream.raw)?;
+                self.stream.device.library.glm_dflash_tap(self.scratch.buffer.ptr,
+                    self.output.buffer.ptr.wrapping_byte_add(first * self.layers.len() * 6144 * 2),
                     rows,6144,self.layers.len() * 6144,column * 6144,self.stream.raw)
             }
         })
@@ -328,6 +332,12 @@ impl<'a> UnitOwner<'a> {
     pub fn post_fold_tap_enqueue(&self, layer:usize, rows:usize) -> Result<()> {
         match &self.target_taps {
             Some(writer) => writer.enqueue(layer,rows,self.plane("residual")?),
+            None => Ok(()),
+        }
+    }
+    pub fn post_fold_tap_span(&self, layer: usize, first: usize, rows: usize) -> Result<()> {
+        match &self.target_taps {
+            Some(writer) => writer.enqueue_span(layer, first, rows, self.plane("residual")?),
             None => Ok(()),
         }
     }
