@@ -517,7 +517,17 @@ fn observe_device_sampled(device: i32,
     let Some(cache) = existing_cache(device) else { return Ok(()) };
     let mut cache = cache.lock().unwrap_or_else(|p| p.into_inner());
     if cache.needs_boundary() {
-        let (free, total, tracked, rounding, unclaimed) = sample()?;
+        let (free, total, tracked, rounding, unclaimed) = match sample() {
+            Ok(sample) => sample,
+            Err(error) => {
+                tracing::warn!(%error, device, "boundary graph measurement failed; capture disabled, serving eagerly");
+                cache.measurement_failed = true;
+                cache.floor_resample_pending = false;
+                cache.unmeasured = false;
+                cache.boundary();
+                return Ok(());
+            }
+        };
         let (growth, level) = cache.observer.observe(free, total, tracked, rounding, unclaimed);
         cache.level = Some(level);
         cache.sample_physical(free, tracked);
@@ -973,17 +983,7 @@ impl DeviceCache {
         // key, so a GRAPH_TRACE run still lists it for the layout's prewarm set.
         let sealed = site.spans_devices && cross_device_capture_sealed();
         let allowed = site.preference != Preference::Eager && estimate > 0 && !sealed;
-        let room = if self.soft.measured_bytes.is_none() { self.pending_destroy == 0 }
-            else {
-                let new_nodes = old.and_then(|id| self.records[&id].stats.native_nodes).filter(|n| *n > 0)
-                    .or_else(|| self.records.values().filter(|r| r.identity.site == site.name)
-                        .filter_map(|r| r.stats.native_nodes).max())
-                    .or_else(|| self.records.values().filter_map(|r| r.stats.native_nodes).max());
-                if let Some(nodes) = new_nodes {
-                    self.make_soft_room(nodes, None) && self.pending_destroy == 0
-                } else { true }
-            };
-        if allowed && room {
+        if allowed {
             // No CUDA query or ticket for a planned physical-headroom miss.
             if !self.physical_room(estimate, headroom) {
                 return self.floor_skip(old, site.cycle);
@@ -1006,6 +1006,20 @@ impl DeviceCache {
             if !self.physical_room(estimate, headroom) {
                 if !self.unmeasured { self.captured_since_observation = false; }
                 return self.floor_skip(old, site.cycle);
+            }
+            let room = if self.soft.measured_bytes.is_none() { self.pending_destroy == 0 }
+                else {
+                let new_nodes = old.and_then(|id| self.records[&id].stats.native_nodes).filter(|n| *n > 0)
+                    .or_else(|| self.records.values().filter(|r| r.identity.site == site.name)
+                        .filter_map(|r| r.stats.native_nodes).max())
+                    .or_else(|| self.records.values().filter_map(|r| r.stats.native_nodes).max());
+                if let Some(nodes) = new_nodes {
+                    self.make_soft_room(nodes, None) && self.pending_destroy == 0
+                } else { true }
+            };
+            if !room {
+                self.counters.entry(site.cycle).or_default().eager_runs += 1;
+                return Miss::Eager;
             }
             let id = if let Some(id) = old { self.unlink(id); id } else {
                 self.next_id += 1;
@@ -1084,6 +1098,7 @@ impl DeviceCache {
         self.push(id, ghost);
         self.sync_inventory(id);
         self.trim_ghosts();
+        if self.measurement_failed { self.unmeasured = self.records.values().any(|r| r.pending_capture); }
         warn
     }
 
@@ -1108,6 +1123,7 @@ impl DeviceCache {
         self.live_bytes = self.live_bytes.saturating_sub(record.bytes);
         record.bytes = 0;
         self.sync_inventory(id);
+        if self.measurement_failed { self.unmeasured = self.records.values().any(|r| r.pending_capture); }
         // Physical charge remains a monotone high-water, including failed captures.
     }
 
@@ -1122,6 +1138,7 @@ impl DeviceCache {
             }
         }
         self.forget(id);
+        if self.measurement_failed { self.unmeasured = self.records.values().any(|r| r.pending_capture); }
     }
 
     pub fn captured_topology(&mut self, id: u64, nodes: u64, width: usize, spans_devices: bool) {
@@ -1186,7 +1203,7 @@ impl DeviceCache {
         let mut nodes = native.live_nodes.saturating_sub(selected);
         if !self.soft.fits(nodes.saturating_sub(reclaimable).saturating_add(incoming_nodes)) { return false }
         while !self.soft.fits(nodes.saturating_add(incoming_nodes)) {
-            let Some(id) = self.select_victim(excluded, true) else { return false };
+            let Some(id) = self.select_victim(excluded, false) else { return false };
             nodes = nodes.saturating_sub(self.records[&id].stats.native_nodes.unwrap_or(0));
         }
         true
@@ -1203,7 +1220,7 @@ impl DeviceCache {
                 .map(|r| r.stats.native_nodes.unwrap_or(0)).sum::<u64>();
             // A pinned-heavy startup sample cannot establish a usable ARC budget.
             if u128::from(pinned_nodes) * u128::from(self.charged)
-                > u128::from(self.soft.limit) * u128::from(native.live_nodes) { return }
+                >= u128::from(self.soft.limit) * u128::from(native.live_nodes) { return }
             self.soft.measured_bytes = Some(self.charged);
             self.soft.measured_nodes = Some(native.live_nodes);
         }
@@ -1607,6 +1624,53 @@ mod tests {
         assert_eq!(cache.failed_measurement_credit, 0);
         assert!(matches!(cache.miss(key(3), site(Preference::Capture), None, false), Miss::Eager));
         Ok(())
+    }
+
+    #[test]
+    fn noncapturable_misses_never_select_soft_victims() {
+        let mut cache = test_cache(-1011, 1000);
+        for n in 0..4 {
+            let id = capture(&mut cache, n, false);
+            cache.captured_topology(id, 10, 1, false);
+        }
+        cache.soft.measured_bytes = Some(100);
+        cache.soft.measured_nodes = Some(40);
+        cache.soft.limit = 100;
+        cache.charged = 100;
+        assert!(matches!(cache.miss(key(10), site(Preference::Eager), None, false), Miss::Eager));
+        assert_eq!(cache.pending_destroy, 0);
+        cache.physical_floor = 100;
+        cache.sample_physical(1, 0);
+        assert!(matches!(cache.miss(key(11), site(Preference::Capture), None, false), Miss::Eager));
+        assert_eq!(cache.pending_destroy, 0);
+        cache.physical_floor = 0;
+        seal_cross_device_capture_on_this_thread(true);
+        let peer = Site { spans_devices: true, ..site(Preference::Capture) };
+        assert!(matches!(cache.miss(key(12), peer, None, false), Miss::Eager));
+        seal_cross_device_capture_on_this_thread(false);
+        assert_eq!(cache.pending_destroy, 0);
+    }
+
+    #[test]
+    fn pinned_equality_defers_soft_freeze_and_failed_boundary_is_not_serving_error() {
+        let mut cache = test_cache(-1012, 1000);
+        let id = capture(&mut cache, 1, true);
+        cache.captured_topology(id, 10, 1, false);
+        cache.soft.limit = 100;
+        cache.soft.margin = 900;
+        cache.charged = 100;
+        cache.apply_soft_pressure(0, Some(id));
+        assert!(cache.soft.measured_bytes.is_none());
+        let device = -1013;
+        let shared = device_cache_sampled(device, 1000, Basis::Bytes, || Ok((1000, 1000, 0, 0, 0))).unwrap();
+        {
+            let mut cache = shared.lock().unwrap();
+            let Miss::Capture(id) = cache.miss(key(1), site(Preference::Capture), None, false) else { panic!() };
+            cache.cancel_capture(id);
+        }
+        assert!(observe_device_sampled(device, || anyhow::bail!("fixture physical query failure")).is_ok());
+        assert!(shared.lock().unwrap().measurement_failed);
+        assert!(!shared.lock().unwrap().needs_boundary());
     }
 
     #[test]

@@ -873,7 +873,6 @@ pub(crate) struct MimoEngine<'a> {
     /// The startup prewarm completed; serving misses capture-or-run-eager.
     graphs_warmed: Cell<bool>,
     /// Physical and tracked bytes per rank before the first capture miss.
-    graph_before: RefCell<Option<Vec<GraphMemorySample>>>,
     graphs_first_touch: Cell<bool>,
 }
 
@@ -963,7 +962,7 @@ impl<'a> MimoEngine<'a> {
             output_fp8_decode: true, kv_cache,
             decode_graphs: false, graphs: RefCell::new(crate::shared::decode_graph::GraphBank::new()),
             graph_layout: None, graphs_warming: Cell::new(false), graphs_warmed: Cell::new(false),
-            graph_before: RefCell::new(None), graphs_first_touch: Cell::new(false) })
+            graphs_first_touch: Cell::new(false) })
     }
 
     /// Layer `layer`'s KV storage: the paged record pool (full attention; page `p` holds
@@ -2462,12 +2461,7 @@ impl<'a> MimoEngine<'a> {
     /// The completed multi-rank step is the only measurement boundary: every
     /// rank's captures are drained together, then untracked device growth is
     /// charged to pending captures, excluding separately owned lazy storage.
-    fn graph_boundary(&self, _before: &[GraphMemorySample]) -> Result<()> {
-        for rank in 0..self.ranks() {
-            let stream = self.stream_of(rank);
-            // SAFETY: the complete multi-rank step has queued all consumers.
-            self.on(rank, || unsafe { self.library.cuda_stream_synchronize(stream) })?;
-        }
+    fn graph_boundary(&self) -> Result<()> {
         for rank in 0..self.ranks() {
             let graphs = if rank == 0 { &self.graphs } else { &self.peer.as_ref().unwrap().graphs };
             graphs.borrow_mut().cache_tick();
@@ -2478,15 +2472,11 @@ impl<'a> MimoEngine<'a> {
         Ok(())
     }
 
-    /// Ends a step: the first capture miss sampled `graph_before`, so that net
-    /// growth is measured once the whole step is drained, then pinned-hit
-    /// counts flush at the boundary.
+    /// Flush pinned hits and settle failed captures at a completed step only.
     fn graph_end_of_step(&self) -> Result<()> {
-        let before = self.graph_before.borrow_mut().take();
-        if let Some(before) = before { self.graph_boundary(&before)?; }
-        else if self.graphs.borrow().cache_needs_boundary()
+        if self.graphs.borrow().cache_needs_boundary()
             || self.peer.as_ref().is_some_and(|peer| peer.graphs.borrow().cache_needs_boundary()) {
-            self.graph_boundary(&self.graph_allocation_samples()?)?;
+            self.graph_boundary()?;
         }
         self.graphs.borrow_mut().cache_tick();
         if let Some(peer) = &self.peer { peer.graphs.borrow_mut().cache_tick(); }
@@ -2516,12 +2506,6 @@ impl<'a> MimoEngine<'a> {
         let pinned = self.graph_pinned(key.rows);
         let Some(ticket) =
             graphs.borrow_mut().cache_ticket(&key, pinned, None) else { return segment() };
-        if self.graph_before.borrow().is_none() {
-            match self.graph_allocation_samples() {
-                Ok(samples) => *self.graph_before.borrow_mut() = Some(samples),
-                Err(error) => { drop(ticket); return Err(error); }
-            }
-        }
         // No synchronization here: the other rank's segments may not be queued
         // yet. SAFETY: capture records launches on this rank's persistent stream.
         if let Err(error) = self.on(rank, || unsafe { crate::shared::decode_graph::begin_capture(&self.library, stream, &ticket) }) {
@@ -3532,7 +3516,6 @@ mod tests {
         engine.graph(0, key, || { calls.set(calls.get() + 1); Ok(()) })?;
         // A transient lane bank must not discard the engine's controller or
         // consume the capture's original allocation baseline on reattachment.
-        let before_free = engine.graph_before.borrow().as_ref().unwrap()[0].free;
         for _ in 0..2 {
             let mut temporary = crate::shared::decode_graph::GraphBank::<GraphKey, ()>::new();
             temporary.attach_device(&library, 7, engine.graph_layout.as_ref().unwrap().reserves[0],
@@ -3548,7 +3531,6 @@ mod tests {
             assert_eq!(cache.reserve_policy, Some(engine.graph_layout.as_ref().unwrap().policies[0]));
             assert_eq!(cache.pending_capture, 0, "successful commit was already measured exactly once");
             assert!(cache.cycles.values().any(|cycle| cycle.captures > 0));
-            assert_eq!(engine.graph_before.borrow().as_ref().unwrap()[0].free, before_free);
         }
         engine.graph_end_of_step()?;
         assert_eq!(calls.get(), 1);
@@ -3591,7 +3573,7 @@ mod tests {
         assert!(!sample.contains("cuda_stream_synchronize"));
         let boundary = source.split_once("fn graph_boundary(").unwrap().1
             .split_once("fn graph_end_of_step(").unwrap().0;
-        assert!(boundary.contains("cuda_stream_synchronize"));
+        assert!(!boundary.contains("cuda_stream_synchronize"));
         assert!(boundary.contains("device::observe_device"));
         assert!(!boundary.contains("cache_measured"));
     }
