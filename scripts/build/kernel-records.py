@@ -366,6 +366,7 @@ class Recorder:
         self.backend_seconds = 0.0
         self.overheads = {name: 0.0 for name in ("reads_seconds", "profile_seconds", "audit_seconds", "construction_seconds")}
         self.read_counts = []
+        self.dependency_paths = {}
 
     def _start(self, code, offset):
         frame = sys._getframe(1)
@@ -441,7 +442,9 @@ class Recorder:
             for dependency in (module, value):
                 filename = getattr(dependency, "__file__", None)
                 if filename is not None:
-                    source = source_name(filename, self.root)
+                    if filename not in self.dependency_paths:
+                        self.dependency_paths[filename] = source_name(filename, self.root)
+                    source = self.dependency_paths[filename]
                     if source:
                         self.frames.add(source)
 
