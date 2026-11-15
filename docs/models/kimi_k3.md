@@ -22,7 +22,9 @@ addresses): [max](../../examples/configs/kimi-k3-exl3-k6-max.config).
 [Max starting config](../../examples/configs/kimi-k31-exl3-k2-mc-max.config):
 MC original BF16 core, 2 RTX + 6 Sparks, automatic pool/context/onboarding,
 speculation off. `CORE_VIEW=k6-compact` and the standalone native Core-K6
-checkpoint are also qualified; K8 remains Planned and whole-core FP8 refuses.
+checkpoint are also qualified. MC revision `1455b31b` corrects compact-view
+metadata (unchanged weight shards); older `d6c4b6ce` compact views refuse (#2118).
+K8 remains Planned and whole-core FP8 refuses.
 K3 DFlash2 hidden-state compatibility remains independently unqualified.
 The minimum configuration remains blocked by #2082, without cap/pool workarounds.
 
