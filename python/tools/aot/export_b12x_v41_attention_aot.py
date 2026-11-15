@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Export native-scale BF16 QK/PV attention and sink merge from SparkInfer."""
+"""Export direct native FP4 attention and sink merge from verified SparkInfer."""
 
 import sys as _sys
 from pathlib import Path as _Path
@@ -53,7 +53,6 @@ def main():
                     partial_bytes_per_row=args.heads*10*512*2, lse_bytes_per_row=args.heads*10*4,
                     live_rows="runtime argument; caller validates allocated capacity",
                     format="FP8 window / FP4 indexed; separate value and scale planes",
-                    compute=dict(qk="bf16", pv="bf16", partials="bf16", native_scales=True),
                     abi=dict(pointers=pointers, i32=["rows"], stream="stream"), artifacts=artifacts)
     manifest_path.write_text(json.dumps(manifest, indent=2)+"\n")
     print(manifest_path)
