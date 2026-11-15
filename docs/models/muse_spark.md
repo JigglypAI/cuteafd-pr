@@ -49,6 +49,52 @@ vocabulary head and pre/post-expert projections refuse by role before payload
 reads (#1796). The existing attention-only executor cannot silently skip them.
 Towers and routed experts are shared, not converted with the core.
 
+### Max-card core comparison
+
+Supplementary Release smoke, 2 RTX PRO 6000 + 6 Sparks, the same MC revision
+and DFlash2 revision as above. Both cards reuse clean build `ac64e40ee` and
+its matching launcher; one warmed launch per view, measured on different days
+(original Nov 14, K8 Nov 15), not an interleaved A/B. Automatic placement stays
+on: the smaller K8 core admits one RTX expert layer instead of zero and fills
+the 2M-token target pool. Rates are emitted tok/s; card C16 uses distinct
+prompts, not the separate code-decode sweep.
+
+| Core view | Card C1 code | Card distinct C16 aggregate | Card 8K prefill | Generated KL / top-1 | KV pool tokens | RTX expert layers | Report |
+| --- | ---: | ---: | ---: | --- | ---: | ---: | --- |
+| `original` | 71.57 | 117.35 | 3361.93 | 0.007085 / 97.60% | 2,009,152 | 0 | [Release smoke](../../benchmarks/muse_spark/2026-11-14-smoke-muse-spark-open-exl3-k4-mc-2rtx-6spark-muse-spark-exl3-k4-mc-max-cand-r1/report.svg) |
+| `k8-compact` | 75.96 | 119.02 | 3225.67 | 0.006341 / 97.60% | 2,097,152 | 1 | [Release smoke](../../benchmarks/muse_spark/2026-11-15-smoke-muse-spark-open-exl3-k4-mc-2rtx-6spark-muse-mc-k8-compact-max-k8-r1/report.svg) |
+
+K8's **separate code-decode sweep** measures C1 61.00, C16 aggregate 257.88
+and post-C16 C1 75.21 tok/s, with one untimed warm batch at each concurrency.
+The original card has no equivalent sweep or post-C1 measurement. The 257.88
+sweep result must not be compared with either card's distinct-C16 column.
+Quick fidelity passes over 1,832 generated rows / 4,096 total rows, and lossless
+DFlash2 checks pass. Prompt-end/turn-end and cold-recompute byte proofs pass;
+the short fresh-continuation shape remains uncovered, as on original.
+
+| Baseline-window telemetry (GPU0 / GPU1) | `original` | `k8-compact` |
+| --- | --- | --- |
+| End-window NVML free memory, MiB | 926.25 / 1951.25 | 1054.25 / 3287.25 |
+| Power-cap slowdown, s | 6.985 / 5.984 | 6.002 / 8.987 |
+| Software / hardware thermal slowdown, s | 0 / 0 on both GPUs | 0 / 0 on both GPUs |
+| Busy SM clock, MHz | 2727 / 2832 | 2671 / 2815 |
+| Peak temperature, C | 64 / 70 | 65 / 72 |
+| Minimum T.Limit headroom, C | 30 / 27 | 30 / 25 |
+
+Free memory is a point-in-time sample after the baseline, not minimum headroom
+or an allocation ledger. Both runs used gpu-powerd's 850 W shared budget;
+original limits ranged 400-450 W, K8 GPU0 425-435 W and GPU1 410-425 W.
+The K8 sweep had zero power-cap or thermal slowdown; its GPU1 busy clock was
+2841 MHz (GPU0 had no samples meeting the busy threshold).
+
+Quiet-host preflight passed before enqueue and at fair-queue grant: no builds
+or gates, CPU and memory PSI avg10 both zero. During the first timed K8 card
+C1, memory PSI rose to 0.45 (prose C1 0.24), above the requested 0.1 quiet bar;
+CPU PSI stayed zero and page-scan rate was zero. Card C16, 8K prefill and all
+separate sweep windows recorded zero CPU/memory PSI. Treat the observed C1
++6.1%, distinct-C16 +1.4% and prefill -4.1% as one-session observations,
+not fully quiet, statistically established speed changes. No rerun was taken.
+
 ## Architecture
 
 Every one of the 62 layers is a mixture of experts; there is no dense FFN and
