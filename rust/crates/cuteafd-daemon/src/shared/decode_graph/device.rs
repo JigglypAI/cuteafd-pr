@@ -3,6 +3,7 @@
 //! synchronization. Per-graph storage requires explicit drained retirement.
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize)]
@@ -91,6 +92,7 @@ pub(crate) struct Counters {
     pub physical_floor_skips: u64,
     pub eager_awaiting_destroy: u64,
     pub eager_vampire: u64,
+    pub eager_projected_hard_stop: u64,
     pub eager_soft_room: u64,
     pub eager_hard_stop: u64,
     pub eager_sealed: u64,
@@ -147,6 +149,14 @@ struct LaneEpoch {
     completed: u64,
     active: bool,
     vampires: HashSet<Identity>,
+}
+
+#[derive(Default)]
+struct EpochClock {
+    index: AtomicU64,
+    completed: AtomicU64,
+    active: AtomicBool,
+    pending: AtomicUsize,
 }
 
 struct LaggedCredit {
@@ -630,6 +640,7 @@ pub(crate) unsafe fn observe_completed(library: &cuteafd_ffi::NativeLibrary,
 /// # Safety
 /// The visitor contains only this lane's persistent-storage banks. At start,
 /// every launch from its previous cycle and commit has completed.
+#[cfg(test)]
 pub(crate) unsafe fn lane_cycle(lane: usize, begin: bool,
     mut visit: impl FnMut(&mut GraphVisitor<'_>) -> anyhow::Result<()>) -> anyhow::Result<()> {
     let mut devices = std::collections::BTreeSet::new();
@@ -648,6 +659,52 @@ pub(crate) unsafe fn lane_cycle(lane: usize, begin: bool,
         })?;
     }
     Ok(())
+}
+
+pub(crate) struct LaneCycles {
+    lane: usize,
+    clocks: Vec<Arc<[EpochClock; 2]>>,
+}
+
+impl LaneCycles {
+    pub fn register(lane: usize,
+        mut visit: impl FnMut(&mut GraphVisitor<'_>) -> anyhow::Result<()>) -> anyhow::Result<Self> {
+        let mut devices = std::collections::BTreeSet::new();
+        visit(&mut |device, _, _, bank| { bank.lane_owner(lane); devices.insert(device); Ok(()) })?;
+        let clocks = devices.into_iter().filter_map(existing_cache)
+            .map(|cache| cache.lock().unwrap_or_else(|p| p.into_inner()).clocks.clone()).collect();
+        Ok(Self { lane, clocks })
+    }
+
+    /// # Safety
+    /// Every previous-round consumer has completed. The visitor contains only
+    /// this registered lane's persistent-storage banks.
+    pub unsafe fn begin(&mut self,
+        mut visit: impl FnMut(&mut GraphVisitor<'_>) -> anyhow::Result<()>) -> anyhow::Result<()> {
+        let mut pending = false;
+        for clocks in &self.clocks {
+            let clock = &clocks[self.lane];
+            assert!(!clock.active.swap(true, Ordering::AcqRel), "graph lane cycle already active");
+            clock.index.fetch_add(1, Ordering::AcqRel);
+            pending |= clock.pending.load(Ordering::Acquire) > 0;
+        }
+        if pending {
+            visit(&mut |_, _, _, bank| {
+                // SAFETY: forwarded lane-local persistent-storage contract.
+                unsafe { bank.evict_persistent(); }
+                Ok(())
+            })?;
+        }
+        Ok(())
+    }
+
+    pub fn complete(&mut self) {
+        for clocks in &self.clocks {
+            let clock = &clocks[self.lane];
+            clock.completed.store(clock.index.load(Ordering::Acquire), Ordering::Release);
+            clock.active.store(false, Ordering::Release);
+        }
+    }
 }
 
 pub(crate) struct DeviceCache {
@@ -688,10 +745,12 @@ pub(crate) struct DeviceCache {
     pending_destroy: usize,
     bank_lanes: HashMap<u64, usize>,
     lanes: [LaneEpoch; 2],
+    clocks: Arc<[EpochClock; 2]>,
     lagged: Vec<LaggedCredit>,
     epochs: EpochStats,
     reuse_captures: HashSet<u64>,
     selected_epochs: HashMap<u64, [u64; 2]>,
+    pending_lanes: [usize; 2],
     observer: GrowthObserver,
     memory_query: Option<cuteafd_ffi::PhysicalMemoryQuery>,
     captured_since_observation: bool,
@@ -743,8 +802,8 @@ impl DeviceCache {
             queues: std::array::from_fn(|_| Queue::default()), classes: HashMap::new(),
             pending_growth: 0, pools: Pools::default(), basis: Basis::Bytes,
             chain_only: true, unmeasured: false, pending_destroy: 0,
-            bank_lanes: HashMap::new(), lanes: std::array::from_fn(|_| LaneEpoch::default()),
-            lagged: Vec::new(), epochs: EpochStats::default(), reuse_captures: HashSet::new(), selected_epochs: HashMap::new(),
+            bank_lanes: HashMap::new(), lanes: std::array::from_fn(|_| LaneEpoch::default()), clocks: Arc::new(std::array::from_fn(|_| EpochClock::default())),
+            lagged: Vec::new(), epochs: EpochStats::default(), reuse_captures: HashSet::new(), selected_epochs: HashMap::new(), pending_lanes: [0; 2],
             observer: GrowthObserver::default(), memory_query: None, captured_since_observation: false,
             counters: HashMap::new(), started: Instant::now(), clock_ms: 0, last_report: Instant::now(),
             interval_evictions: 0, trace: std::env::var_os("CUTEAFD_GRAPH_TRACE").and_then(|path| {
@@ -757,27 +816,46 @@ impl DeviceCache {
     pub fn bank(&mut self) -> u64 { self.next_bank += 1; self.next_bank }
     pub fn assign_bank_lane(&mut self, bank: u64, lane: usize) {
         assert!(lane < self.lanes.len());
+        let old = self.bank_lane(bank);
+        if old != lane {
+            let pending = self.records.values().filter(|r| r.identity.bank == bank && r.pending_destroy).count();
+            self.pending_lanes[old] -= pending;
+            self.pending_lanes[lane] += pending;
+            self.clocks[old].pending.fetch_sub(pending, Ordering::AcqRel);
+            self.clocks[lane].pending.fetch_add(pending, Ordering::Release);
+        }
         self.bank_lanes.insert(bank, lane);
     }
 
     fn bank_lane(&self, bank: u64) -> usize { self.bank_lanes.get(&bank).copied().unwrap_or(0) }
 
+    #[cfg(test)]
     fn begin_lane(&mut self, lane: usize) {
-        let epoch = &mut self.lanes[lane];
-        assert!(!epoch.active, "graph lane cycle already active");
-        epoch.index = epoch.index.checked_add(1).expect("graph cycle exhausted");
-        epoch.active = true;
-        epoch.vampires.clear();
-        self.epochs.cycles[lane] = epoch.index;
-        self.credit_completed();
+        let clock = &self.clocks[lane];
+        assert!(!clock.active.swap(true, Ordering::AcqRel), "graph lane cycle already active");
+        clock.index.fetch_add(1, Ordering::AcqRel);
+        self.refresh_cycles();
     }
 
+    #[cfg(test)]
     fn complete_lane(&mut self, lane: usize) {
-        let epoch = &mut self.lanes[lane];
-        epoch.completed = epoch.index;
-        epoch.active = false;
-        epoch.vampires.clear();
-        self.epochs.completed[lane] = epoch.completed;
+        let clock = &self.clocks[lane];
+        clock.completed.store(clock.index.load(Ordering::Acquire), Ordering::Release);
+        clock.active.store(false, Ordering::Release);
+        self.refresh_cycles();
+    }
+
+    fn refresh_cycles(&mut self) {
+        for (lane, clock) in self.lanes.iter_mut().zip(self.clocks.iter()) {
+            let index = clock.index.load(Ordering::Acquire);
+            let completed = clock.completed.load(Ordering::Acquire);
+            if lane.index != index || lane.completed != completed { lane.vampires.clear(); }
+            lane.index = index;
+            lane.completed = completed;
+            lane.active = clock.active.load(Ordering::Acquire);
+        }
+        self.epochs.cycles = self.lanes.each_ref().map(|lane| lane.index);
+        self.epochs.completed = self.lanes.each_ref().map(|lane| lane.completed);
         self.credit_completed();
     }
 
@@ -790,24 +868,48 @@ impl DeviceCache {
             }
             !ready
         });
+        for credit in &mut self.lagged {
+            for (until, lane) in credit.until.iter_mut().zip(&self.lanes) {
+                if lane.completed >= *until { *until = 0; }
+            }
+        }
+        let mut i = 0;
+        while i < self.lagged.len() {
+            let mut j = i + 1;
+            while j < self.lagged.len() {
+                if self.lagged[i].until == self.lagged[j].until {
+                    let credit = self.lagged.swap_remove(j);
+                    self.lagged[i].nodes += credit.nodes;
+                    self.lagged[i].pool_nodes += credit.pool_nodes;
+                    self.lagged[i].execs += credit.execs;
+                } else { j += 1; }
+            }
+            i += 1;
+        }
         self.epochs.uncredited_nodes = self.lagged.iter().map(|credit| credit.nodes).sum();
     }
 
     pub(super) fn serial_boundary(&mut self) {
+        self.refresh_cycles();
         if self.lanes.iter().any(|lane| lane.active) { return }
-        self.complete_lane(0);
-        self.lanes[0].index = self.lanes[0].index.checked_add(1).expect("graph cycle exhausted");
-        self.epochs.cycles[0] = self.lanes[0].index;
+        for clock in self.clocks.iter() {
+            clock.completed.store(clock.index.load(Ordering::Acquire), Ordering::Release);
+            clock.index.fetch_add(1, Ordering::AcqRel);
+        }
+        self.refresh_cycles();
     }
     pub fn reserve(&self) -> u64 { self.reserve }
     pub fn identity_generation(&self) -> u64 { self.identity_generation }
-    pub fn retains_identity(&self, identity: &Identity) -> bool { self.identities.contains_key(identity) }
+    pub fn retains_identity(&self, identity: &Identity) -> bool {
+        self.identities.contains_key(identity) || self.lanes.iter().any(|lane| lane.vampires.contains(identity))
+    }
     pub fn needs_boundary(&self) -> bool {
         self.unmeasured || self.failed_measurement_credit > 0 || self.pending_destroy > 0 || self.floor_resample_pending
     }
     pub fn has_pending_victims(&self) -> bool { self.pending_destroy > 0 }
     pub fn pending(&self, id: u64) -> bool { self.records.get(&id).is_some_and(|r| r.pending_destroy) }
-    pub fn persistent_victim_ready(&self, id: u64) -> bool {
+    pub fn persistent_victim_ready(&mut self, id: u64) -> bool {
+        self.refresh_cycles();
         self.records.get(&id).is_some_and(|record| {
             let lane = self.bank_lane(record.identity.bank);
             record.pending_destroy && self.selected_epochs.get(&id).is_none_or(|until|
@@ -890,6 +992,7 @@ impl DeviceCache {
     }
 
     fn forget(&mut self, id: u64) {
+        self.reuse_captures.remove(&id);
         self.unlink(id);
         if let Some(record) = self.records.remove(&id) {
             let old = record.accounted;
@@ -978,6 +1081,7 @@ impl DeviceCache {
     pub(super) fn mark_victim(&mut self, _frequent_ghost: bool) -> Option<u64> { self.select_victim(None) }
 
     fn select_victim(&mut self, excluded: Option<u64>) -> Option<u64> {
+        self.refresh_cycles();
         let recent = &self.queues[List::Recent.index()];
         let prefer_recent = recent.first.is_some() && (recent.bytes > self.recent_target);
         let first = if prefer_recent { List::Recent } else { List::Frequent };
@@ -1000,9 +1104,11 @@ impl DeviceCache {
         self.records.get_mut(&id).unwrap().frequent = frequent;
         self.records.get_mut(&id).unwrap().pending_destroy = true;
         self.pending_destroy += 1;
-        self.selected_epochs.insert(id, self.lanes.each_ref().map(|lane| lane.index));
+        self.selected_epochs.insert(id, self.lanes.each_ref().map(|lane| if lane.active { lane.index } else { lane.completed }));
         let lane = self.bank_lane(self.records[&id].identity.bank);
         self.epochs.selections[lane] += 1;
+        self.pending_lanes[lane] += 1;
+        self.clocks[lane].pending.fetch_add(1, Ordering::Release);
         Some(id)
     }
 
@@ -1020,6 +1126,7 @@ impl DeviceCache {
     }
 
     pub fn miss(&mut self, identity: Identity, site: Site, node_estimate: Option<Estimate>, pinned: bool) -> Miss {
+        self.refresh_cycles();
         let now = self.started.elapsed().as_millis() as u64;
         self.counters.entry(site.cycle).or_default().misses += 1;
         let compatible = site.basis == self.basis && match (self.basis, &node_estimate) {
@@ -1117,6 +1224,7 @@ impl DeviceCache {
         // key, so a GRAPH_TRACE run still lists it for the layout's prewarm set.
         let sealed = site.spans_devices && cross_device_capture_sealed();
         let allowed = site.preference != Preference::Eager && estimate > 0 && !sealed;
+        let mut projected_hard_stop = false;
         if allowed && !vampire {
             // No CUDA query or ticket for a planned physical-headroom miss.
             if !self.physical_room(estimate, headroom) {
@@ -1156,7 +1264,9 @@ impl DeviceCache {
             if evicted { self.lanes[lane].vampires.insert(identity.clone()); }
             // Selected owners and lagged chunks still consume capacity. Only
             // their owner's next cycle can destroy them; no device-wide gate.
-            let hard_room = self.charged.saturating_add(projected) <= self.reserve;
+            let hard_room = self.soft.measured_bytes.is_none()
+                || self.charged.saturating_add(projected) <= self.reserve;
+            projected_hard_stop = !hard_room;
             if room && !evicted && hard_room {
             let id = if let Some(id) = old { self.unlink(id); id } else {
                 self.next_id += 1;
@@ -1217,6 +1327,7 @@ impl DeviceCache {
         if sealed { counters.eager_sealed += 1; }
         else if site.preference == Preference::Eager { counters.eager_preference += 1; }
         else if vampire { counters.eager_vampire += 1; }
+        else if projected_hard_stop { counters.eager_projected_hard_stop += 1; }
         else if self.soft.measured_bytes.is_some() { counters.eager_soft_room += 1; }
         else { counters.eager_other += 1; }
         Miss::Eager
@@ -1444,6 +1555,7 @@ impl DeviceCache {
     }
 
     pub fn destroyed(&mut self, ids: &[u64], measurement: ReleaseMeasurement) {
+        self.refresh_cycles();
         if ids.iter().any(|id| self.records.contains_key(id)) { self.floor_resample_used = false; }
         // Observed free deltas remain available to alternate accounting adapters;
         // the default driver-arena model never credits physical release.
@@ -1452,6 +1564,11 @@ impl DeviceCache {
         for &id in ids {
             self.unlink(id);
             let until = self.selected_epochs.remove(&id);
+            if let Some(record) = self.records.get(&id).filter(|r| r.pending_destroy) {
+                let lane = self.bank_lane(record.identity.bank);
+                self.pending_lanes[lane] -= 1;
+                self.clocks[lane].pending.fetch_sub(1, Ordering::AcqRel);
+            }
             let Some(record) = self.records.get_mut(&id) else { continue };
             let evicted = record.pending_destroy;
             self.live_bytes = self.live_bytes.saturating_sub(record.bytes);
@@ -1459,7 +1576,10 @@ impl DeviceCache {
             record.pending_destroy = false;
             record.pinned = false;
             if evicted { self.pending_destroy -= 1; }
-            if let Some(until) = until.filter(|until| self.lanes.iter().zip(*until).any(|(lane, epoch)| lane.completed < epoch)) {
+            if let Some(mut until) = until.filter(|until| self.lanes.iter().zip(*until).any(|(lane, epoch)| lane.completed < epoch)) {
+                for (epoch, lane) in until.iter_mut().zip(&self.lanes) {
+                    if lane.completed >= *epoch { *epoch = 0; }
+                }
                 // Coalesce by in-flight frontier: at most K independently
                 // advancing cycles retain capacity, rather than one chunk/key.
                 if let Some(chunk) = self.lagged.iter_mut().find(|chunk| chunk.until == until) {
@@ -1487,6 +1607,7 @@ impl DeviceCache {
             self.sync_inventory(id);
         }
         self.credit_completed();
+        if !self.lanes.iter().any(|lane| lane.active) { self.serial_boundary(); }
         self.trim_ghosts();
     }
 
@@ -1520,6 +1641,11 @@ impl DeviceCache {
             self.selected_epochs.remove(&id);
             self.reuse_captures.remove(&id);
             let Some(record) = self.records.get(&id) else { continue };
+            if record.pending_destroy {
+                let lane = self.bank_lane(record.identity.bank);
+                self.pending_lanes[lane] -= 1;
+                self.clocks[lane].pending.fetch_sub(1, Ordering::AcqRel);
+            }
             if record.pending_capture {
                 self.pending_bytes = self.pending_bytes.saturating_sub(record.estimate);
                 self.unmeasured = true;
@@ -1561,7 +1687,7 @@ impl DeviceCache {
             pending_capture: self.pending_bytes, cycles: self.counters.clone(), pools: self.pools.clone(),
             basis: self.basis, sampled_at_ms: self.started.elapsed().as_millis() as u64,
             telemetry_bytes: self.records.len() * std::mem::size_of::<KeyStats>(),
-            top_hits: Vec::new(), top_churn: Vec::new(), rankings_age_ms: self.ranked_at.elapsed().as_millis() as u64, epochs: self.epochs.clone() },
+            top_hits: Vec::new(), top_churn: Vec::new(), rankings_age_ms: self.ranked_at.elapsed().as_millis() as u64, epochs: self.epoch_snapshot() },
             records, classes: self.classes.clone() }
     }
 
@@ -1596,13 +1722,20 @@ impl DeviceCache {
         self.ranked_at = Instant::now();
     }
 
+    fn epoch_snapshot(&self) -> EpochStats {
+        let mut epochs = self.epochs.clone();
+        epochs.cycles = self.clocks.as_ref().each_ref().map(|clock| clock.index.load(Ordering::Acquire));
+        epochs.completed = self.clocks.as_ref().each_ref().map(|clock| clock.completed.load(Ordering::Acquire));
+        epochs
+    }
+
     fn snapshot(&self) -> Snapshot {
         let now = self.started.elapsed().as_millis() as u64;
         Snapshot { device: self.device, reserve: self.reserve, physical_floor: self.physical_floor, reserve_policy: self.reserve_policy, charged: self.charged, live_bytes: self.live_bytes, resident_estimated_bytes: self.resident_bytes(), hard_stopped: self.charged >= self.reserve || self.measurement_failed || self.soft.limit == 0, native_pools: self.native_pools(), soft: self.soft,
             level: self.level,
             pinned: self.inventory.pinned,
             pending_capture: self.pending_bytes, cycles: self.counters.clone(), pools: self.pools.clone(), basis: self.basis,
-            sampled_at_ms: now, telemetry_bytes: self.records.len() * std::mem::size_of::<KeyStats>(), top_hits: self.ranked_hits.clone(), top_churn: self.ranked_churn.clone(), rankings_age_ms: self.ranked_at.elapsed().as_millis() as u64, epochs: self.epochs.clone() }
+            sampled_at_ms: now, telemetry_bytes: self.records.len() * std::mem::size_of::<KeyStats>(), top_hits: self.ranked_hits.clone(), top_churn: self.ranked_churn.clone(), rankings_age_ms: self.ranked_at.elapsed().as_millis() as u64, epochs: self.epoch_snapshot() }
     }
 
     fn row(&self, record: &Record, now: u64) -> TraceRow {
@@ -1775,6 +1908,106 @@ mod tests {
         cache.measured_capture(10);
         id
     }
+    fn epoch_fixture() -> DeviceCache {
+        let mut cache = test_cache(-1020, 1000);
+        for n in 0..4 {
+            let id = capture(&mut cache, n, false);
+            cache.captured_topology(id, 10, 1, false);
+        }
+        cache.soft.measured_bytes = Some(100);
+        cache.soft.measured_nodes = Some(40);
+        cache.soft.limit = 100;
+        cache.charged = 100;
+        cache
+    }
+
+    #[test]
+    fn cycle_vampire_selects_once_and_unrelated_fitting_miss_can_capture() {
+        let mut cache = epoch_fixture();
+        cache.begin_lane(0);
+        assert!(matches!(cache.miss(key(4), site(Preference::Capture), None, false), Miss::Eager));
+        let selected = cache.pending_destroy;
+        assert_eq!(selected, 1);
+        for _ in 0..10 {
+            assert!(matches!(cache.miss(key(4), site(Preference::Capture), None, false), Miss::Eager));
+        }
+        assert_eq!(cache.pending_destroy, selected, "a vampire cannot evict twice in its cycle");
+        assert_eq!(cache.counters[&Cycle::Decode].eager_vampire, 10);
+        // Unrelated misses are not blocked merely by pending owners.
+        cache.soft.limit = 200;
+        assert!(matches!(cache.miss(key(5), site(Preference::Capture), None, false), Miss::Capture(_)));
+        cache.complete_lane(0);
+        cache.begin_lane(0);
+        assert!(!cache.lanes[0].vampires.contains(&key(4)));
+    }
+
+    #[test]
+    fn cycle_k1_and_k2_retirement_credit_waits_for_inflight_frontier() {
+        for k in [1, 2] {
+            let mut cache = epoch_fixture();
+            cache.begin_lane(0);
+            if k == 2 { cache.begin_lane(1); }
+            let id = cache.mark_victim(false).unwrap();
+            assert!(!cache.persistent_victim_ready(id), "own in-flight launch must survive");
+            let pool_nodes = cache.pools.live_nodes;
+            cache.complete_lane(0);
+            cache.begin_lane(0);
+            assert!(cache.persistent_victim_ready(id));
+            cache.destroyed(&[id], ReleaseMeasurement { released: 0 });
+            if k == 2 {
+                assert_eq!(cache.pools.live_nodes, pool_nodes, "peer's in-flight cycle retains credit");
+                assert_eq!(cache.epochs.uncredited_nodes, 10);
+                assert!(!cache.make_soft_room(10, None), "uncredited nodes do not fit incoming work");
+                cache.complete_lane(1);
+            }
+            assert_eq!(cache.pools.live_nodes, pool_nodes - 10);
+            assert_eq!(cache.epochs.uncredited_nodes, 0);
+            assert_eq!(cache.charged, 100, "physical high-water never falls on destruction");
+        }
+    }
+
+    #[test]
+    fn cycle_credited_reuse_preserves_physical_high_water_and_reports_driver_growth() {
+        let mut cache = epoch_fixture();
+        cache.begin_lane(0);
+        let id = cache.mark_victim(false).unwrap();
+        cache.complete_lane(0);
+        cache.begin_lane(0);
+        cache.destroyed(&[id], ReleaseMeasurement { released: 0 });
+        // Bootstrap is the actual 10-node graph in this synthetic byte model.
+        cache.classes.clear();
+        let Miss::Capture(reused) = cache.miss(key(4), site(Preference::Capture), None, false) else { panic!() };
+        cache.captured_topology(reused, 10, 1, false);
+        cache.measured_capture(0);
+        assert_eq!(cache.charged, 100);
+        assert_eq!(cache.epochs.reuse_growth_bytes, 0);
+        cache.soft.limit = 200;
+        cache.pools.node_high_water += 10;
+        cache.pools.exec_high_water += 1;
+        let Miss::Capture(grew) = cache.miss(key(5), site(Preference::Capture), None, false) else { panic!() };
+        cache.captured_topology(grew, 10, 1, false);
+        cache.measured_capture(3);
+        assert_eq!(cache.charged, 103);
+        assert_eq!(cache.epochs.reuse_growth_bytes, 3);
+    }
+
+    #[test]
+    fn cycle_uncredited_chunks_cannot_finance_hard_cap_growth() {
+        let mut cache = epoch_fixture();
+        cache.reserve = 105;
+        cache.begin_lane(0);
+        cache.begin_lane(1);
+        let id = cache.mark_victim(false).unwrap();
+        cache.complete_lane(0);
+        cache.begin_lane(0);
+        cache.destroyed(&[id], ReleaseMeasurement { released: 0 });
+        cache.soft.limit = 1000;
+        cache.classes.clear();
+        assert!(matches!(cache.miss(key(4), site(Preference::Capture), None, false), Miss::Eager));
+        assert_eq!(cache.charged, 100);
+        assert!(!cache.unmeasured);
+    }
+
     #[test]
     fn completed_capture_measures_once_and_failure_cancels_without_fake_charge() -> anyhow::Result<()> {
         let fixture = cuteafd_ffi::native_library_lifetime_fixture::Fixture::build_for_tests()?;
