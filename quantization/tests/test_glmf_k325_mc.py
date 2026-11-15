@@ -14,17 +14,29 @@ import mc_publish
 from test_mc_package import dump, fixture, indexed, tensors
 
 
-def setup(tmp_path, monkeypatch):
+def setup(tmp_path, monkeypatch, *, include_mtp=False):
     args = fixture(tmp_path, monkeypatch)
     module = 'model.language_model.layers.3.mlp.experts.0.gate_proj'
     geometry = dict(in_features=128, out_features=128, stored_out_features=128)
     shared = {'norm.weight': torch.ones(128, dtype=torch.bfloat16),
               'model.language_model.layers.45.norm.weight': torch.ones(128, dtype=torch.bfloat16)}
-    indexed(args['parent'], {'mixed.safetensors': tensors('head', geometry, 6) | tensors(module, geometry, 4) | shared})
+    mtp = 'model.language_model.layers.45.self_attn.q_b_proj'
+    packed_mtp = tensors(mtp, geometry, 4) if include_mtp else {}
+    indexed(args['parent'], {'mixed.safetensors': tensors('head', geometry, 6) | tensors(module, geometry, 4) | shared | packed_mtp})
     q = package.load_json(args['parent'] / 'quantize_config.json')
     q['tensor_storage'][module] = dict(bits_per_weight=4, stored_tensors={n: dict(
         torch_dtype=package.DTYPES[dtype], shape=shape) for n, (dtype, shape) in package.packed_specs(module, dict(geometry, bits=4)).items()})
     q['module_include'].append('^' + module.replace('.', r'\.') + '$')
+    if include_mtp:
+        recipe, selection = package.family_recipe('glmf')
+        recipe.reviewed_core_modules = lambda **kwargs: selection | {mtp: dict(geometry, bits=4)}
+        indexed(args['source'], {'source.safetensors': {
+            'head.weight': torch.ones(128,128,dtype=torch.bfloat16),
+            mtp + '.weight': torch.full((128,128), 3, dtype=torch.bfloat16)}})
+        q['tensor_storage'][mtp] = dict(bits_per_weight=4, stored_tensors={n: dict(
+            torch_dtype=package.DTYPES[dtype], shape=shape) for n, (dtype, shape)
+            in package.packed_specs(mtp, dict(geometry, bits=4)).items()})
+        q['module_include'].append('^' + mtp.replace('.', r'\.') + '$')
     dump(args['parent'], 'quantize_config.json', q)
     (args['parent'] / 'README.md').write_text('---\nlicense: mit\n---\n# Parent\n')
     package.assemble(**args)
@@ -77,6 +89,41 @@ def test_independent_audit_rejects_expert_tamper(tmp_path, monkeypatch):
         stream.write(b'X')
     with pytest.raises(ValueError, match='committed file'):
         mixed.validate(args['output'])
+
+
+def test_corrected_parent_mtp_is_restored_in_original_and_repacked_in_compact(tmp_path, monkeypatch):
+    args = setup(tmp_path, monkeypatch, include_mtp=True)
+    revision = 'a' * 40
+    audit = package.load_json(args['parent_audit'])
+    audit['commit'] = revision
+    dump(tmp_path, 'audit.json', audit)
+    mixed.assemble(**args, parent_revision=revision)
+    mtp = 'model.language_model.layers.45.self_attn.q_b_proj'
+    state = package.load_json(args['output'] / 'package-state.json')
+    assert state['identity']['parent_revision'] == revision
+    for view in ('original', 'k8-compact', 'k6-compact'):
+        inv = package.inventory(args['output'], package.mc_manifest.FILES[view][0])
+        if view == 'original':
+            assert inv['specs'][mtp + '.weight'] == ('BF16', [128,128])
+            assert mtp + '.trellis' not in inv['mapping']
+        else:
+            assert mtp + '.weight' not in inv['mapping']
+            assert mtp + '.trellis' in state['core_tensors'][view]
+            assert inv['mapping'][mtp + '.trellis'].startswith('compact-mtp-')
+    physical_mtp = [key for key in state['tensor_origins'] if key.endswith(':' + mtp + '.trellis')]
+    assert len(physical_mtp) == 1
+    assert 'default view preserves the original native layer-45 MTP core' in (args['output'] / 'README.md').read_text()
+
+
+def test_rejects_parent_with_missing_original_mtp_before_output(tmp_path, monkeypatch):
+    args = setup(tmp_path, monkeypatch)
+    recipe, selection = package.family_recipe('glmf')
+    recipe.reviewed_core_modules = lambda **kwargs: selection | {
+        'model.language_model.layers.45.self_attn.q_b_proj':
+            dict(in_features=128, out_features=128, stored_out_features=128, bits=4)}
+    with pytest.raises(ValueError, match='complete native core including MTP'):
+        mixed.assemble(**args)
+    assert not args['output'].exists()
 
 
 def test_wrong_published_parent_refused_before_output(tmp_path, monkeypatch):

@@ -39,7 +39,8 @@ def fixture(tmp_path, monkeypatch, family='glmf', calibration_key='samples', cal
     geometry = dict(in_features=128, out_features=128, stored_out_features=128, bits=8)
     selection = {'head': geometry}
     recipe = SimpleNamespace(BASE_REPO='test/source', BASE_REVISION='source-sha',
-        source_names=lambda module, g: (module + '.weight',))
+        source_names=lambda module, g: (module + '.weight',),
+        reviewed_core_modules=lambda **kwargs: selection)
     monkeypatch.setattr(package, 'family_recipe', lambda family: (recipe, selection))
     monkeypatch.setitem(package.PARENTS, family, ('test-parent', 'parent-sha'))
     shared = {'expert.weight': torch.ones(128, 128, dtype=torch.bfloat16)}
@@ -134,14 +135,14 @@ def test_mc_all_views_byte_exact_and_shared_parent_copy(tmp_path, monkeypatch):
 def test_view_metadata_rewrites_nested_quantization_configs(bits):
     from copy import deepcopy
 
-    inline = dict(quant_method='exl3', core_bits=6, head_bits=6,
+    inline = dict(quant_method='exl3', core_bits=6, head_bits=6, mtp_bits=4,
                   per_module_metadata='quantize_config.json:tensor_storage')
     config = dict(quantization_config=deepcopy(inline),
                   text_config=dict(quantization_config=deepcopy(inline)),
                   components=[dict(text_config=dict(quantization_config=deepcopy(inline)))])
     before = deepcopy(config)
     filename = 'quantize_config.json' if bits is None else f'quantize_config.k{bits}.json'
-    quant, rewritten = package.view_metadata(dict(tensor_storage={}, module_include=[]),
+    quant, rewritten = package.view_metadata(dict(tensor_storage={}, module_include=[], mtp_bits=4),
         config, {}, {}, bits=bits, quantize_file=filename)
     blocks = [rewritten['quantization_config'], rewritten['text_config']['quantization_config'],
               rewritten['components'][0]['text_config']['quantization_config']]
@@ -150,6 +151,8 @@ def test_view_metadata_rewrites_nested_quantization_configs(bits):
         assert block['per_module_metadata'] == quant['per_module_metadata'] == filename + ':tensor_storage'
         for field in ('core_bits', 'head_bits'):
             assert (field not in block) if bits is None else block[field] == bits
+        assert ('mtp_bits' not in block) if bits is None else block['mtp_bits'] == 4
+    assert ('mtp_bits' not in quant) if bits is None else quant['mtp_bits'] == 4
     assert config == before
 
 
@@ -503,26 +506,58 @@ def test_seed_families_register_target_core_only(family, count, mtp_layer):
     assert len(package.PARENTS[family][1]) == 40
 
 
-@pytest.mark.parametrize('family,mtp_count', [('step5',27), ('glm5',8)])
-def test_seed_mc_preserves_shared_k4_mtp_across_views(tmp_path, monkeypatch, family, mtp_count):
+@pytest.mark.parametrize('family', ['step5', 'glm5', 'glmf'])
+def test_mc_restores_original_mtp_without_new_compact_encodes(tmp_path, monkeypatch, family):
     args = fixture(tmp_path, monkeypatch, family=family)
     geometry = dict(in_features=128,out_features=128,stored_out_features=128,bits=4)
-    shared_mtp = tensors('model.layers.999.mtp', geometry, 4)
+    module = 'model.layers.999.mtp'
+    packed_mtp = tensors(module, geometry, 4)
+    recipe, selection = package.family_recipe(family)
+    recipe.reviewed_core_modules = lambda **kwargs: selection | {module: geometry}
+    original_mtp = {module + '.weight': torch.arange(128*128, dtype=torch.float32).reshape(128,128).bfloat16()}
+    indexed(args['source'], {'source.safetensors': original_mtp | {'head.weight': original_mtp[module + '.weight'].clone()}})
     parent = args['parent']
-    indexed(parent, {'mixed.safetensors': tensors('head',geometry,6) | shared_mtp})
+    indexed(parent, {'mixed.safetensors': tensors('head',geometry,6) | packed_mtp})
     quant = package.load_json(parent/'quantize_config.json')
-    quant['tensor_storage']['model.layers.999.mtp'] = dict(bits_per_weight=4,
+    quant['tensor_storage'][module] = dict(bits_per_weight=4,
         stored_tensors={name: dict(shape=shape, torch_dtype=package.DTYPES[dtype])
-                       for name, (dtype, shape) in packed_specs('model.layers.999.mtp', geometry).items()})
+                       for name, (dtype, shape) in packed_specs(module, geometry).items()})
+    quant['module_include'].append('^model\\.layers\\.999\\.mtp$')
     dump(parent,'quantize_config.json',quant)
-    package.assemble(**args)
+    result = package.assemble(**args)
+    assert len(result['original_core_tensor_sha256']) == 2
+    state = package.load_json(args['output'] / 'package-state.json')
     for view in ('original','k8-compact','k6-compact'):
         index_name = package.mc_manifest.FILES[view][0]
         mapping = package.load_json(args['output']/index_name)['weight_map']
-        assert all(mapping[name]=='mixed.safetensors' for name in shared_mtp)
+        q = package.load_json(args['output'] / package.mc_manifest.FILES[view][2])
+        if view == 'original':
+            assert not packed_mtp.keys() & mapping.keys()
+            assert module + '.weight' in mapping
+            assert module not in q['tensor_storage']
+            assert module + '.weight' in state['core_tensors'][view]
+            import re
+            assert not any(re.search(p, module) for p in q['module_include'])
+        else:
+            assert all(mapping[name]=='mixed.safetensors' for name in packed_mtp)
+            assert module + '.weight' not in mapping
+            assert q['tensor_storage'][module]['bits_per_weight'] == 4
+            assert packed_mtp.keys() <= set(state['core_tensors'][view])
+    manifest = package.load_json(args['output'] / 'cuteafd-mc.json')
+    package.mc_manifest.validate(manifest, args['output'])
     card = (args['output']/'README.md').read_text()
-    assert f'({mtp_count} modules)' in card
-    assert 'neither restored to BF16 nor encoded at K8' in card
+    assert '1 MTP matrices' in card
+    assert 'Compact views preserve the existing K4 MTP' in card
+
+
+@pytest.mark.parametrize('family,count', [('glmf',8), ('glm5',8), ('step5',27)])
+def test_original_selection_includes_all_mtp_but_compact_selection_stays_frozen(family, count):
+    recipe, compact = package.family_recipe(family)
+    original = package.original_core_selection(family, recipe, compact)
+    mtp = original.keys() - compact.keys()
+    assert len(mtp) == count
+    assert all(original[m]['group'] == 'mtp_core' and original[m]['bits'] == 4 for m in mtp)
+    assert all('.experts.' not in m for m in original)
 
 
 @pytest.mark.parametrize('family', ['step5', 'glm5'])

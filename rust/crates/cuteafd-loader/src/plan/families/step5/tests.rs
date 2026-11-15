@@ -1923,7 +1923,10 @@ fn fp8_compact_step_outputs_and_mtp_have_exact_final_storage() -> anyhow::Result
     let cfg = Config::parse(&fp8)?;
     let contract = coordinator::CoordinatorContract::from_checkpoint(&fp8)?;
     let selection = native::NativeSelection::resolve(&contract, &cfg, 2, 3, 2048, None)?;
-    assert_eq!(selection.requirements.len(), 95);
+    assert_eq!(selection.requirements.len(), cfg.layers);
+    assert!(selection.requirements.iter().all(|requirement| requirement.layout.stem
+        .strip_prefix("model.layers.").and_then(|rest| rest.split('.').next())
+        .and_then(|layer| layer.parse::<usize>().ok()).is_some_and(|layer| layer < cfg.layers)));
     assert_eq!(selection.resolved.programs, ["native_attention_n4096_k12288_m4096", "native_attention_n4096_k6144_m4096_f32"]);
     assert_eq!(selection.resolved.fp8_scratch_bytes, 256);
     for ranks in [1,2] {
@@ -1948,7 +1951,25 @@ fn fp8_compact_step_outputs_and_mtp_have_exact_final_storage() -> anyhow::Result
     }
     let mtp = coordinator::RankWeightLayout::mtp_from_contract(&fp8, &contract, 3)?;
     selection.validate_layout(&mtp, 2048)?;
-    assert_eq!(mtp.operands.iter().filter(|w| w.dtype == DType::F8E4M3).count(), 3);
+    assert_eq!(mtp.operands.iter().filter(|w| w.dtype == DType::F8E4M3).count(), 0);
+    let original_contract = coordinator::CoordinatorContract::from_checkpoint(&bf16)?;
+    let original_mtp = coordinator::RankWeightLayout::mtp_from_contract(&bf16, &original_contract, 3)?;
+    assert_eq!(mtp.operands.len(), original_mtp.operands.len());
+    for (actual, original) in mtp.operands.iter().zip(&original_mtp.operands) {
+        assert_eq!(actual.name, original.name);
+        assert_eq!(actual.dtype, original.dtype);
+        assert_eq!(actual.allocation_bytes, original.allocation_bytes);
+    }
+    // Match executable ownership: SWA is head-split, CSA stays whole.
+    // The diagnostic from_checkpoint TP layout also splits CSA and cannot be
+    // validated against the executor's preweight native selection.
+    let modes = (0..cfg.layers).map(|layer| if cfg.full[layer] {
+        crate::placement::LayerMode::Whole { gpu: ((layer / 4) % 2) as u8,
+            ffn: crate::placement::FfnMode::Owner }
+    } else { crate::placement::LayerMode::HeadSplit }).collect::<Vec<_>>();
+    let owners = ownership::ExecutionOwnership::new(&cfg, 2, ownership::plan(&modes, 0, 1))?;
+    let targets = (0..2).map(|rank| coordinator::RankWeightLayout::for_execution(&fp8, rank, &owners))
+        .collect::<anyhow::Result<Vec<_>>>()?;
     // Final storage admission validates the dedicated output scratch ABI.
     for rows in [1, 64, 65, 2048, 4096] {
         use crate::placement::inventory::ProgramsManifest;
@@ -1967,8 +1988,13 @@ fn fp8_compact_step_outputs_and_mtp_have_exact_final_storage() -> anyhow::Result
             entry(12288, ProjectionOutput::Bf16, scratch), entry(6144, ProjectionOutput::F32, scratch)]}));
         let exact = native::NativeSelection::resolve(&contract, &cfg, 2, 3, rows, Some(&manifest(256)?))?;
         exact.validate_layout(&mtp, rows)?;
+        for target in &targets { exact.validate_layout(target, rows)?; }
         let oversized = native::NativeSelection::resolve(&contract, &cfg, 2, 3, rows, Some(&manifest(1 << 30)?))?;
-        assert!(oversized.validate_layout(&mtp, rows).unwrap_err().is::<native::NativeOwnerMismatch>());
+        // The target still uses FP8 scratch; the native MTP no longer does.
+        oversized.validate_layout(&mtp, rows)?;
+        for target in &targets {
+            assert!(oversized.validate_layout(target, rows).unwrap_err().is::<native::NativeOwnerMismatch>());
+        }
         let mut stale = entry(6144, ProjectionOutput::F32, 256);
         stale["geometry"]["output_dtype"] = serde_json::json!("torch.bfloat16");
         let bad = ProgramsManifest::from_manifest(&serde_json::json!({"programs":[

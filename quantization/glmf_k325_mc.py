@@ -33,6 +33,12 @@ def plan_inputs(parent, experts):
     views = {v['name']: package.inventory(parent, v['index']) for v in manifest['variants']}
     core = {v['name']: set(v['core_tensors']) for v in manifest['variants']}
     original = views['original']
+    recipe, compact_selection = package.family_recipe('glmf')
+    restore = package.original_core_selection('glmf', recipe, compact_selection)
+    for module, geometry in restore.items():
+        if original['specs'].get(module + '.weight') != (
+                'BF16', [geometry['out_features'], geometry['in_features']]):
+            raise ValueError('parent original view must restore the complete native core including MTP: ' + module)
     old_experts = {n for n in original['mapping'] if target_expert(n)}
     source = package.full_parent_inventory(experts)
     selected = {n for n in source['mapping'] if target_expert(n)}
@@ -55,18 +61,21 @@ def plan_inputs(parent, experts):
     return manifest, views, core, source, selected, modules, set(shared)
 
 
-def assemble(parent, experts, output, parent_audit):
+def assemble(parent, experts, output, parent_audit, *, parent_revision=None):
     parent, experts, output = map(lambda p: Path(p).resolve(), (parent, experts, output))
     if any(output == p or output in p.parents or p in output.parents for p in (parent, experts)):
         raise ValueError('output must be disjoint from immutable inputs')
     audit = package.load_json(parent_audit)
-    if audit['commit'] != PARENT_REVISION or audit['repo_id'] != 'wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K4-MC':
+    parent_revision = PARENT_REVISION if parent_revision is None else parent_revision
+    if (not re.fullmatch('[0-9a-f]{40}', parent_revision)
+            or audit['commit'] != parent_revision
+            or audit['repo_id'] != 'wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K4-MC'):
         raise ValueError('parent must be independently verified published K4 MC')
     if experts.name != EXPERT_REVISION:
         raise ValueError('expert source must be exact pinned snapshot')
     manifest, views, core, source, selected, modules, shared = plan_inputs(parent, experts)
     source_commit = subprocess.check_output(['git', '-C', str(Path(__file__).resolve().parents[1]), 'rev-parse', 'HEAD'], text=True).strip()
-    identity = dict(schema='cuteafd-k325-mc-package-v1', family='glmf-k325', parent_revision=PARENT_REVISION,
+    identity = dict(schema='cuteafd-k325-mc-package-v1', family='glmf-k325', parent_revision=parent_revision,
                     expert_repo=EXPERT_REPO, expert_revision=EXPERT_REVISION, source_commit=source_commit,
                     parent_audit_sha256=sha256_file(parent_audit))
     output.mkdir(parents=True, exist_ok=True)
@@ -113,22 +122,41 @@ def assemble(parent, experts, output, parent_audit):
             remaining -= physical
     repack(remaining, original, 'shared-native', common)
     locations.update({common[n] + ':' + n: dict(name=n, target=common[n], root=str(parent), shard=original['mapping'][n], kind='shared-parent') for n in shared})
+    # Reuse the same physical parent MTP representation in both compact views.
+    # Target K6/K8 tensors share names but differ in shape/storage, so compare
+    # the actual parent shard mapping as well as headers before sharing.
+    compact_views = [v for v in views if v != 'original']
+    common_compact = set.intersection(*(core[v] for v in compact_views))
+    first_compact = views[compact_views[0]]
+    common_compact = {n for n in common_compact if all(
+        views[v]['mapping'][n] == first_compact['mapping'][n]
+        and views[v]['specs'][n] == first_compact['specs'][n] for v in compact_views)}
+    compact_mapping = {}
+    repack(common_compact, first_compact, 'compact-mtp', compact_mapping)
+    locations.update({compact_mapping[n] + ':' + n: dict(name=n, target=compact_mapping[n],
+        root=str(parent), shard=first_compact['mapping'][n], kind='compact-mtp') for n in common_compact})
     weights = {}
     package_storage = package.load_json(experts / 'quantize_config.json')['tensor_storage']
     for view, inv in views.items():
-        mapping = {}
+        mapping = dict(compact_mapping) if view != 'original' else {}
+        remaining_core = core[view] - mapping.keys()
         if view == 'k6-compact':
-            repack(core[view], inv, 'k6-core', mapping)
+            repack(remaining_core, inv, 'k6-core', mapping)
         else:
-            for shard in sorted({inv['mapping'][n] for n in core[view]}):
+            for shard in sorted({inv['mapping'][n] for n in remaining_core}):
                 physical = set(inv['headers'][shard]) - {'__metadata__'}
-                if not physical <= core[view]:
-                    raise ValueError('original/K8 shard unexpectedly mixed')
-                link(shard)
-                copies[shard] = shard
-                mapping.update({n: shard for n in physical})
+                if physical <= remaining_core:
+                    link(shard)
+                    copies[shard] = shard
+                    mapping.update({n: shard for n in physical})
+                    remaining_core -= physical
+            # Corrected compact views classify their existing K4 MTP tensors
+            # as core. Their parent shard may also contain routed experts;
+            # copy only the selected spans into this clean K3.25 package.
+            repack(remaining_core, inv, view + '-core', mapping)
         weights[view] = common | mapping
-        locations.update({mapping[n] + ':' + n: dict(name=n, target=mapping[n], root=str(parent), shard=inv['mapping'][n], kind=view) for n in core[view]})
+        locations.update({mapping[n] + ':' + n: dict(name=n, target=mapping[n], root=str(parent), shard=inv['mapping'][n], kind=view)
+                          for n in core[view] if n not in common_compact or view == 'original'})
         index_file, config_file, quant_file, _ = package.mc_manifest.FILES[view]
         config = package.load_json(parent / config_file)
         quant = package.load_json(parent / quant_file)
@@ -137,7 +165,7 @@ def assemble(parent, experts, output, parent_audit):
         quant['bits'] = config['quantization_config']['bits'] = package.load_json(experts / 'quantize_config.json')['bits']
         quant['meta'] = dict(package_sources=dict(
             target_experts=dict(repo=EXPERT_REPO, revision=EXPERT_REVISION, layers=[3, 44]),
-            core_shared_mtp=dict(repo=audit['repo_id'], revision=PARENT_REVISION)),
+            core_shared_mtp=dict(repo=audit['repo_id'], revision=parent_revision)),
             historical_parent_meta=quant.get('meta'))
         sizes = inv['sizes'] | {n: source['sizes'][n] for n in selected}
         atomic_json(output / index_file, dict(metadata=dict(total_size=sum(sizes[n] for n in weights[view])), weight_map=dict(sorted(weights[view].items()))))
@@ -165,8 +193,8 @@ def assemble(parent, experts, output, parent_audit):
     (output / 'README.md').write_text(front + '\n# GLM 5.3 Flash EXL3 K3.25 MC\n\n'
         'Original BF16 core is the default; K8 and K6 are complete alternate views.\n'
         'Target layers 3-44 use byte-exact mixed K3/K4 experts from `' + EXPERT_REPO + '@' + EXPERT_REVISION + '`.\n'
-        'The entire layer-45 MTP drafter remains K4 from the parent MC. No vendor FP8 core payload is retained.\n'
-        'Core, shared native tensors and bundled media assets derive from the verified K4 MC at `' + PARENT_REVISION + '`.\n'
+        'The default view preserves the original native layer-45 MTP core; compact views retain the parent K4 MTP encodes. No vendor FP8 core payload is retained.\n'
+        'Core, shared native tensors and bundled media assets derive from the verified K4 MC at `' + parent_revision + '`.\n'
         'This repack makes no new serving-performance or quality claim. See package-validation.json for byte proofs.\n')
     (output / '.gitattributes').write_text('*.safetensors filter=lfs diff=lfs merge=lfs -text\n')
     new += ['README.md', '.gitattributes']
@@ -254,6 +282,7 @@ def main():
     parser.add_argument('--parent', type=Path, required=True)
     parser.add_argument('--experts', type=Path, required=True)
     parser.add_argument('--parent-audit', type=Path, required=True)
+    parser.add_argument('--parent-revision', help='Explicit pinned corrected K4 MC revision; must match its audit')
     parser.add_argument('--output', type=Path, required=True)
     args = parser.parse_args()
     print(json.dumps(assemble(**vars(args)), sort_keys=True), flush=True)

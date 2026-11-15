@@ -450,6 +450,13 @@ fn exl3_expert_bits(checkpoint: &Checkpoint, stem: &str) -> Result<usize> {
 }
 
 impl Family for Step5 {
+    fn fp8_native_mtp_layers(&self, config: &serde_json::Value)
+        -> Option<(&'static str, std::ops::Range<usize>)> {
+        let text = config.get("text_config").unwrap_or(config);
+        let first = crate::plan::checkpoint::opt_usize_field(text, "num_hidden_layers")?;
+        let count = crate::plan::checkpoint::opt_usize_field(text, "num_nextn_predict_layers")?;
+        Some(("model.layers.", first..first.checked_add(count)?))
+    }
     fn decode_lanes(&self) -> crate::plan::decode_lanes::LaneSupport {
         crate::plan::decode_lanes::LaneSupport::One {
             reason: "a second lane needs its own decode link, separate from the shared prefill link; low priority (#744)" }

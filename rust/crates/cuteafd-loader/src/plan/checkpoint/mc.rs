@@ -271,6 +271,56 @@ mod tests {
         Ok(())
     }
     #[test]
+    fn restored_mtp_core_stays_native_in_derived_fp8_view() -> Result<()> {
+        use crate::plan::testing::{t, write_mc_snapshot};
+        for (architecture, model_type, prefix, layers, mtp, nested) in [
+            ("GlmMoeDsaForCausalLM", "glm_moe_dsa", "model.layers.", 78, 1, false),
+            ("Glm5NextForConditionalGeneration", "glm5_next_text", "model.language_model.layers.", 45, 1, true),
+            ("Step5ForConditionalGeneration", "step5", "model.layers.", 92, 3, true),
+        ] {
+            let text = serde_json::json!({"model_type":model_type,
+                "num_hidden_layers":layers, "num_nextn_predict_layers":mtp});
+            let config = if nested { serde_json::json!({"architectures":[architecture], "text_config":text}) }
+                else { let mut config = text; config["architectures"] = serde_json::json!([architecture]); config };
+            let target = format!("{prefix}{}.self_attn.q_proj.weight", layers - 1);
+            let first_mtp = format!("{prefix}{layers}.eh_proj.weight");
+            let last_mtp = format!("{prefix}{}.transformer.shared_head.output.weight", layers + mtp - 1);
+            let outside_mtp = format!("{prefix}{}.unknown_proj.weight", layers + mtp);
+            let mut names = vec!["lm_head.weight".to_owned(), target.clone(),
+                first_mtp.clone(), last_mtp.clone(), outside_mtp.clone()];
+            names.sort();
+            names.dedup();
+            let shapes = names.iter().map(|name| (name.clone(), vec![128,128])).collect();
+            let tensors = names.iter().map(|name| t(name, "BF16", &[128,128])).collect::<Vec<_>>();
+            let dir = tempfile::tempdir()?;
+            write_mc_snapshot(dir.path(), &config, &tensors, &shapes);
+            // View selection must remain metadata-only, including its MTP policy.
+            for entry in std::fs::read_dir(dir.path())? {
+                let path = entry?.path();
+                if path.extension().is_some_and(|extension| extension == "safetensors") {
+                    std::fs::remove_file(path)?;
+                }
+            }
+            for mode in [CoreView::Original, CoreView::K6Compact, CoreView::K8Compact] {
+                assert!(CheckpointView::select(dir.path(), mode)?.fp8_tensors().is_empty());
+            }
+            let selected = CheckpointView::select(dir.path(), CoreView::Fp8Compact)?;
+            let expected = names.into_iter().filter(|name| name != &first_mtp && name != &last_mtp).collect::<Vec<_>>();
+            assert_eq!(selected.fp8_tensors(), expected, "{model_type}");
+            assert!(!selected.converts_to_fp8(&first_mtp));
+            assert!(!selected.converts_to_fp8(&last_mtp));
+            // This is an exact declared stage range, not a broad unknown-role filter.
+            assert!(selected.converts_to_fp8(&outside_mtp));
+            let checkpoint = crate::plan::Checkpoint { view: Some(selected), snapshot: dir.path().into(),
+                config, quantize_config: None, weight_map: BTreeMap::new(), tensors: Vec::new(),
+                missing_shards: Vec::new(), shard_bytes: 0 };
+            let error = checkpoint.validate_fp8_roles(model_type, |_| crate::formats::native_attention::Fp8Role::exact("unknown", false))
+                .unwrap_err().to_string();
+            assert!(error.contains("cannot execute block FP8"));
+        }
+        Ok(())
+    }
+    #[test]
     fn selected_bytes_are_authenticated_and_immutable() -> Result<()> {
         let dir = copy_fixture();
         let selected = CheckpointView::select(dir.path(), CoreView::K8Compact)?;
