@@ -622,3 +622,19 @@ fn native_two_rtx_uses_exact_contiguous_owners_and_one_backing_per_rank() {
         assert!(report.memory_layout.as_ref().unwrap().devices.is_empty());
     }
 }
+
+
+#[test]
+fn native_single_rtx_context_hint_never_claims_an_executable_context_layout() {
+    let (dir, mut options, _, _) = native_planner_fixture();
+    options.attention_placement = Some(crate::placement::AttentionPlacement::Context);
+    let refused = plan::plan(dir.path(), &options).unwrap();
+    assert!(!refused.executable() && !refused.fits && !refused.placement_supported);
+    assert!(refused.hints.iter().any(|hint| hint.what.contains("context attention")
+        && hint.how.contains("partitioned KV") && hint.how.contains("#2133")), "{:?}", refused.hints);
+    assert!(refused.memory_layout.as_ref().unwrap().devices.is_empty());
+    options.attention_placement = None;
+    let automatic = plan::plan(dir.path(), &options).unwrap();
+    assert!(automatic.executable());
+    assert_eq!(automatic.attention_placement, crate::placement::AttentionPlacement::Heads);
+}

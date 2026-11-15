@@ -120,8 +120,20 @@ fn prepare(facts: &DenseFacts<'_>, owners: &[u8], arenas: &[WeightArenaLayout; 2
             ComponentKind::DriverPageTables { .. } => false,
             ComponentKind::Allocation { template, .. } if rank == 1 && template.id == "weights.upload" => false,
             ComponentKind::Allowance(owner) if rank == 1 && owner.location == Location::HOST => false,
+            ComponentKind::Allowance(owner) if owner.source.starts_with("dense Qwen driver stream slabs (") => false,
             _ => true,
         });
+        // Each rank has its execution stream and PrefixCopies stream. The
+        // registered host tier adds store/restore streams and their two probes
+        // on every registered device, although its quota is charged only once.
+        let peak = 2 + if facts.host_prefix.quota_bytes > 0 { 4 } else { 0 };
+        let slabs = cuda_stream_slab_bytes(peak)?;
+        contract.components.push(Component { activation: Activation::always(),
+            bytes: ByteCurve::fixed(slabs, maximum),
+            kind: ComponentKind::Allowance(Allowance { location: Location::coordinator(0),
+                bytes: slabs, lifetime: Lifetime::RESIDENT, assumed: false,
+                source: format!("dense Qwen driver stream slabs ({peak} peak live streams, \
+                    SM120 driver/runtime13020 LAZY, #1511 2026-11-08)") }) });
         for component in &mut contract.components { namespace(component, rank); }
         contracts.push(contract);
     }
@@ -151,6 +163,51 @@ fn prepare(facts: &DenseFacts<'_>, owners: &[u8], arenas: &[WeightArenaLayout; 2
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn both_rank_stream_slab_owners_match_execution_prefix_and_host_copy_streams() {
+        let (dir, _, buffers, _) = crate::families::qwen3_5::tests::native_planner_fixture();
+        let checkpoint = crate::plan::checkpoint::Checkpoint::open(dir.path()).unwrap();
+        let cfg = Qwen35Config::from_hf(&checkpoint.config).unwrap();
+        let weights = NativeWeights::native(&checkpoint, &cfg, cuteafd_core::DType::F32).unwrap();
+        let target = crate::families::qwen3_5::weight_layout::target_arena(&checkpoint, &cfg,
+            cuteafd_core::DType::F32, crate::families::qwen3_5::weight_layout::DenseFormat::Bf16).unwrap();
+        let owners = (0..cfg.attention.len()).map(|i| u8::from(i >= 2)).collect::<Vec<_>>();
+        let arenas = crate::families::qwen3_5::weight_layout::placed_arenas(&target, &owners).unwrap();
+        for host in [false, true] {
+            let facts = DenseFacts { cfg: &cfg, weights: &weights, target_arena: &target, buffers: &buffers,
+                slots: 4, record_bytes: 4096, graph_variant: "fixture".into(), graphs_enabled: false,
+                drafter: None, blas_head: serving::BlasHead::Native, serving: None,
+                host_prefix: serving::HostPrefixOwners { quota_bytes: if host { 1 << 30 } else { 0 },
+                    chunk_bytes: if host { 256 << 20 } else { 0 } }, verify_check: false };
+            let contract = prepare(&facts, &owners, &arenas).unwrap();
+            let execution = 1;
+            let prefix_copies = 1;
+            let host_store_restore = if host { 2 } else { 0 };
+            let host_completion_probes = if host { 2 } else { 0 };
+            let created = execution + prefix_copies + host_store_restore + host_completion_probes;
+            assert_eq!(created, if host { 6 } else { 2 });
+            for rank in [0, 1] {
+                let slabs = contract.components.iter().filter_map(|component| match &component.kind {
+                    ComponentKind::Allowance(owner) if owner.location == Location::coordinator(rank)
+                        && owner.source.starts_with("dense Qwen driver stream slabs (") => Some((component, owner)),
+                    _ => None,
+                }).collect::<Vec<_>>();
+                assert_eq!(slabs.len(), 1, "rank {rank}: one named owner, no legacy double charge");
+                assert_eq!(slabs[0].1.bytes, cuda_stream_slab_bytes(created).unwrap());
+                assert_eq!(slabs[0].1.bytes, if host { 4 << 20 } else { 2 << 20 });
+                assert!(slabs[0].1.source.contains(&format!("{created} peak live streams")));
+                assert_eq!(slabs[0].0.bytes.at(1).unwrap(), slabs[0].1.bytes);
+            }
+            // The peer receives host streams, not a second pinned host quota.
+            let pinned = contract.components.iter().filter_map(|component| match &component.kind {
+                ComponentKind::Allocation { template, .. } if template.group == "retained host prefix chunk" => Some(template),
+                _ => None,
+            }).collect::<Vec<_>>();
+            assert_eq!(pinned.len(), if host { 4 } else { 0 });
+            assert!(pinned.iter().all(|allocation| !allocation.id.starts_with("rtx1.")));
+        }
+    }
 
     #[test]
     fn speculation_alone_selects_common_signed_domain_and_exact_owner_balance() {

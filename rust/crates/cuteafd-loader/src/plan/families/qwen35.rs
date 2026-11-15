@@ -131,6 +131,11 @@ fn native_layout(cfg: &crate::families::qwen3_5::Qwen35Config, input: &crate::pl
     let ranks = options.rtx_bytes.len();
     ensure!((1..=2).contains(&ranks) && (report.spark_ranks == 0 || spark_vision),
         "dense Qwen needs one or two coordinator GPUs and zero expert Sparks");
+    if ranks == 1 && report.requested_attention == Some(crate::placement::AttentionPlacement::Context) {
+        report.refuse_placement("dense Qwen context attention needs two coordinator GPUs and native context exports".into(),
+            "Select automatic single-rank placement, or add partitioned KV and shared softmax-merge exports (#2133). No context executor runs on one RTX.");
+        return Ok(MemoryLayout { devices: vec![], pool_tokens: 0, waste: vec![], notes: vec![] });
+    }
     if ranks == 1 && report.requested_attention == Some(crate::placement::AttentionPlacement::Layers) {
         report.refuse_placement("dense Qwen layer ranges need two coordinator GPUs".into(),
             "Select two RTX ranks or automatic single-rank placement.");
