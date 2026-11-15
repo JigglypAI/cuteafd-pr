@@ -988,7 +988,9 @@ impl<'a> GlmLoader<'a> {
                         &layout, [shape[0], shape[1]],
                         checkpoint.converts_to_fp8(&format!("{}.weight", layout.stem)))?;
                     let records = attention_records(self.catalog.snapshot(), &selected,
-                        checkpoint.projection_view(&layout.stem), &layout, cuteafd_loader::formats::native_attention::Fp8Role::exact("projection", true), crate::shared::fp8_linear::Fp8Scales::Amax,
+                        checkpoint.projection_view(&layout.stem), &layout,
+                        cuteafd_loader::families::glm5::core::fp8_role(cfg, &format!("{}.weight", layout.stem)),
+                        crate::shared::fp8_linear::Fp8Scales::Amax,
                         values.buffer, scales.as_ref().map(|s| s.buffer))?;
                     let mount = crate::shared::experts::rtx::dense::DenseLoad::mount(self.library);
                     mount.admit_mount(receipt)?;

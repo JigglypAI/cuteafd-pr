@@ -127,7 +127,9 @@ pub fn native_attention_mount(
 ) -> Result<crate::shared::dense_read::MountLoad> {
     use crate::shared::dense_read::{MountLoad, ReadBatch, STEP_BYTES};
     let [n, k] = layout.shape;
-    ensure!(n > 0 && k > 0 && source_shape[0] >= n && source_shape[1] >= k,
+    let padded_rows = convert_bf16 && layout.split == crate::formats::trellis_core::CoreSplit::Whole
+        && n == source_shape[0].next_multiple_of(128);
+    ensure!(n > 0 && k > 0 && (source_shape[0] >= n || padded_rows) && source_shape[1] >= k,
         "native attention mount geometry");
     let width = if layout.fp8 && !convert_bf16 { 1 } else { 2 };
     let row_bytes = source_shape[1].checked_mul(width).context("native source row overflow")?;
@@ -135,7 +137,7 @@ pub fn native_attention_mount(
     if convert_bf16 {
         ensure!(layout.fp8 && n % 128 == 0 && k % 128 == 0,
             "native FP8 conversion requires whole blocks");
-        let rows = n.min((cuteafd_ffi::push_ring::DEFAULT_SLOT_BYTES / packed_width / 128).max(1) * 128);
+        let rows = source_shape[0].min((cuteafd_ffi::push_ring::DEFAULT_SLOT_BYTES / packed_width / 128).max(1) * 128);
         let mut load = MountLoad::read(ReadBatch::new(rows, row_bytes, packed_width, usize::MAX)?);
         load.pinned_tables = cuteafd_ffi::programs::fp8_load_table_bytes(rows, 1)? as u64;
         return Ok(load);
