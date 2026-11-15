@@ -705,6 +705,12 @@ impl LaneCycles {
             clock.active.store(false, Ordering::Release);
         }
     }
+
+    pub fn abandon(&mut self) {
+        // An error is not a completed-cycle proof. Existing submission guards
+        // drain the owners; only a later successful cycle may release credit.
+        for clocks in &self.clocks { clocks[self.lane].active.store(false, Ordering::Release); }
+    }
 }
 
 pub(crate) struct DeviceCache {
@@ -816,6 +822,7 @@ impl DeviceCache {
     pub fn bank(&mut self) -> u64 { self.next_bank += 1; self.next_bank }
     pub fn assign_bank_lane(&mut self, bank: u64, lane: usize) {
         assert!(lane < self.lanes.len());
+        if self.bank_lanes.get(&bank) == Some(&lane) { return }
         let old = self.bank_lane(bank);
         if old != lane {
             let pending = self.records.values().filter(|r| r.identity.bank == bank && r.pending_destroy).count();
@@ -1565,9 +1572,12 @@ impl DeviceCache {
         if ids.iter().any(|id| self.records.contains_key(id)) { self.recovery_generation += 1; }
         for &id in ids {
             self.unlink(id);
+            let owner = self.records.get(&id).map(|record| self.bank_lane(record.identity.bank));
             let until = self.selected_epochs.remove(&id).map(|mut until| {
-                for (epoch, lane) in until.iter_mut().zip(&self.lanes) {
-                    if lane.active { *epoch = (*epoch).max(lane.index); }
+                for (index, (epoch, lane)) in until.iter_mut().zip(&self.lanes).enumerate() {
+                    // The owner's new cycle has not launched yet: retirement
+                    // runs first. Peers may already be replaying retained keys.
+                    if Some(index) != owner && lane.active { *epoch = (*epoch).max(lane.index); }
                 }
                 until
             });

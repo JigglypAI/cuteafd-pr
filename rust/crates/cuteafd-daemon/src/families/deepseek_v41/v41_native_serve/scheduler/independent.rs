@@ -415,19 +415,19 @@ async fn lane<'a, P: VerificationTarget<'a>, C: DraftChain<'a>>(lease: LaneLease
                 // commit must drain/discard this lane before the outer reset.
                 pass.discard(batch)
             } else { Ok(()) };
-            // Commit/discard settled this lane; no bank traversal on hit-only rounds.
-            graph_cycles.complete();
             operation?;
             stopped_capture?;
             discarded?;
+            // Commit/discard settled this lane; no bank traversal on hit-only rounds.
+            graph_cycles.complete();
             // Give already-ready remote completions an opportunity to run before
             // queuing another draft on the shared RTX.
             tokio::task::yield_now().await;
         }
     }.await;
-    // Also reset epoch bookkeeping on early validation/draft failures. Storage
-    // ownership and the existing submission guards still own device drainage.
-    graph_cycles.complete();
+    // Do not manufacture a completed frontier from an early validation/draft
+    // error; the existing submission guards still own device drainage.
+    if result.is_ok() { graph_cycles.complete(); } else { graph_cycles.abandon(); }
     result
 }
 
