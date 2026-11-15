@@ -571,6 +571,7 @@ fn spark_hosts_count(cfg: &std::collections::BTreeMap<String, String>) -> Result
 fn resolve_speculator(args: &mut PlanArgs, snapshot: &std::path::Path, family: &str,
     cfg: &std::collections::BTreeMap<String, String>) -> Result<()> {
     let default = match family {
+        "minimax_m3" => "dspark",
         "glm5" | "glm5_flash" | "muse_spark" => "dflash2",
         "qwen3_5" if serde_json::from_slice::<serde_json::Value>(&std::fs::read(snapshot.join("config.json"))?)
             .is_ok_and(|config| config.get("text_config").unwrap_or(&config)["hidden_size"] == 5120) => "dspark",
@@ -1509,6 +1510,34 @@ mod tests {
         assert_eq!(file_args(input.clone(), target.path()).unwrap().tp2_dflash, Some(false));
         std::fs::write(&config, "SPECULATOR=off\nTP2_DFLASH=auto\nVISION=off\nAUDIO=off\n").unwrap();
         assert!(file_args(input, target.path()).is_err());
+    }
+
+    #[test]
+    fn minimax_speculator_defaults_on_for_every_placement_and_preserves_off() {
+        use cuteafd_loader::plan::spec::DraftOwnership;
+        let target = tempfile::tempdir().unwrap();
+        for gpus in [1, 2] {
+            for placement in ["auto", "heads", "layers"] {
+                for configured in [None, Some("auto"), Some("off"), Some("dspark")] {
+                    for explicit in ["auto", "off", "dspark"] {
+                        let mut input = args(target.path(), 4, false);
+                        input.rtx = gpus;
+                        input.attention_placement = placement.into();
+                        input.speculator = explicit.into();
+                        let cfg = configured.map(|mode| ("SPECULATOR".into(), mode.into()))
+                            .into_iter().collect();
+                        resolve_speculator(&mut input, target.path(), "minimax_m3", &cfg).unwrap();
+                        let enabled = explicit != "off" && !(explicit == "auto" && configured == Some("off"));
+                        assert_eq!(input.speculator, if enabled { "dspark" } else { "off" });
+                        assert_eq!(DraftOwnership::selected("minimax_m3", &input.speculator),
+                            if enabled { DraftOwnership::BundledDspark } else { DraftOwnership::None });
+                        input.no_speculator = true;
+                        resolve_speculator(&mut input, target.path(), "minimax_m3", &cfg).unwrap();
+                        assert_eq!(input.speculator, "off");
+                    }
+                }
+            }
+        }
     }
 
     #[test]

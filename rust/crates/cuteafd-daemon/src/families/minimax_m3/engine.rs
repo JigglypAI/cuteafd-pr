@@ -29,7 +29,7 @@ pub(crate) struct Requests {
 
 impl Requests {
     pub fn new(capacity: RequestCapacity, context: usize, layers: usize, waves: usize) -> Result<Self> {
-        ensure!(RequestCapacity::new(u64::from(capacity.decode.rows), u64::from(capacity.prefill.rows))? == capacity,
+        ensure!(capacity.validate()? == capacity,
             "MiniMax request capacity differs from admission");
         ensure!(context > 0 && layers > 0, "MiniMax request geometry must be positive");
         super::admission::serve_admission::validate_prefill(cuteafd_loader::placement::planner::PrefillShape {
@@ -39,11 +39,11 @@ impl Requests {
     }
 
     fn validate(&self, requests: &[RequestRows]) -> Result<()> {
-        ensure!(!requests.is_empty() && requests.len() <= self.capacity.decode.requests as usize,
+        ensure!(!requests.is_empty() && requests.len() <= self.capacity.requests as usize,
             "MiniMax request batch exceeds admitted concurrency");
         let mut slots = BTreeSet::new();
         for request in requests {
-            ensure!(request.slot < self.capacity.decode.requests as usize && slots.insert(request.slot),
+            ensure!(request.slot < self.capacity.requests as usize && slots.insert(request.slot),
                 "MiniMax duplicate or unadmitted request slot");
             ensure!(request.rows > 0 && request.start.checked_add(request.rows)
                 .is_some_and(|end| end <= self.context), "MiniMax request exceeds admitted context");
@@ -52,11 +52,16 @@ impl Requests {
     }
 
     pub fn decode_rows(&self, requests: &[RequestRows]) -> Result<usize> {
-        self.validate(requests)?;
-        ensure!(requests.iter().all(|request| request.rows == 1),
-            "MiniMax native decode requires one row per request");
-        ensure!(requests.len() <= self.capacity.execution_rows() as usize,
-            "MiniMax native decode exceeds admitted execution rows");
+        ensure!(!requests.is_empty() && requests.len() <= self.capacity.decode.rows as usize,
+            "MiniMax native queries exceed admitted row capacity");
+        let mut frontiers = std::collections::BTreeMap::new();
+        for request in requests {
+            let previous = frontiers.insert(request.slot, request.start);
+            ensure!(request.slot < self.capacity.requests as usize && request.rows == 1
+                && request.start < self.context
+                && previous.is_none_or(|start| start + 1 == request.start),
+                "MiniMax native queries require unique or contiguous causal positions per slot");
+        }
         Ok(requests.len())
     }
 
@@ -806,6 +811,29 @@ impl<'t, 'a, A: SlotArithmetic> PrefillHooks for ServingHooks<'_, '_, 't, 'a, A>
     }
 }
 
+fn validate_native_queries(schedule: &Requests, requests: &[ServingRequest<'_>]) -> Result<usize> {
+    let rows = schedule.decode_rows(&requests.iter().map(|request| RequestRows {
+        slot: request.placement.slot, start: request.start, rows: request.tokens.len(),
+    }).collect::<Vec<_>>())?;
+    let mut identities = std::collections::BTreeMap::new();
+    for request in requests {
+        let previous = identities.insert(request.placement.slot,
+            (request.identity, request.start, &request.placement.units));
+        ensure!(request.identity != 0 && request.start == request.placement.len
+            && previous.is_none_or(|(identity, start, pages)| identity == request.identity
+                && start + 1 == request.start && pages == &request.placement.units),
+            "MiniMax native query identity/pages/frontier differs");
+    }
+    Ok(rows)
+}
+
+fn query_cycle(requests: &[ServingRequest<'_>]) -> crate::shared::decode_graph::device::Cycle {
+    let mut slots = BTreeSet::new();
+    if requests.iter().any(|request| !slots.insert(request.placement.slot)) {
+        crate::shared::decode_graph::device::Cycle::Verify
+    } else { crate::shared::decode_graph::device::Cycle::Decode }
+}
+
 fn decode_section(captured: bool, bucket: usize, live: usize,
     graph: impl FnOnce(usize) -> Result<()>, eager: impl FnOnce(usize) -> Result<()>) -> Result<()> {
     if captured { graph(bucket) } else { eager(live) }
@@ -908,24 +936,18 @@ impl<'a> ServingPrefill<'a> {
         -> Result<DeviceLogits> {
         ensure!(!self.terminal, "MiniMax decode serving is terminal");
         validate_execution_streams(storage)?;
-        let rows = schedule.decode_rows(&requests.iter().map(|request| RequestRows {
-            slot: request.placement.slot, start: request.start, rows: request.tokens.len(),
-        }).collect::<Vec<_>>())?;
+        let rows = validate_native_queries(schedule, requests)?;
         ensure!(graphs.len() == storage.ranks.len(), "MiniMax decode graph rank count differs");
         if storage.heads.is_some() { return self.decode_heads(storage, cfg, schedule, requests, rows, graphs, captured); }
         if storage.split.is_some() { return self.decode_split(storage, cfg, schedule, requests, rows, graphs, captured); }
         let graphs = &mut graphs[0];
         let rank = &storage.ranks[0];
         let graph_rows = if captured { graphs.row_key(rows)? } else { rows };
-        graphs.cycle(crate::shared::decode_graph::device::Cycle::Decode);
+        graphs.cycle(query_cycle(requests));
         let result = (|| {
             let mut state = storage.requests.borrow_mut();
             ensure!(state.capacity == schedule.capacity, "MiniMax decode capacity differs from storage");
-            let mut identities = BTreeSet::new();
-            for request in requests {
-                ensure!(request.start == request.placement.len && request.identity != 0
-                    && identities.insert(request.identity), "MiniMax decode identity/frontier differs");
-            }
+            validate_native_queries(schedule, requests)?;
             let placements = requests.iter().map(|request| &*request.placement).collect::<Vec<_>>();
             let cache = &mut state.ranks[0];
             cache.bank.prepare_decode(&mut cache.decode, &placements)?;
@@ -1055,17 +1077,13 @@ impl<'a> ServingPrefill<'a> {
         let graph_rows = if captured { graphs[0].row_key(rows)? } else { rows };
         ensure!(graphs.iter().all(|graph| graph.row_key(rows).ok() == Some(graph_rows)) || !captured,
             "MiniMax Heads graph row buckets differ between ranks");
-        for graph in graphs.iter_mut() { graph.cycle(crate::shared::decode_graph::device::Cycle::Decode); }
+        for graph in graphs.iter_mut() { graph.cycle(query_cycle(requests)); }
         let heads = storage.heads.as_ref().context("MiniMax Heads owner missing")?;
         let result = (|| {
             heads.require_live()?;
             let mut state = storage.requests.borrow_mut();
             ensure!(state.capacity == schedule.capacity, "MiniMax Heads request capacity differs");
-            let mut identities = BTreeSet::new();
-            for request in requests {
-                ensure!(request.start == request.placement.len && request.identity != 0
-                    && identities.insert(request.identity), "MiniMax Heads identity/frontier differs");
-            }
+            validate_native_queries(schedule, requests)?;
             let placements = requests.iter().map(|request| &*request.placement).collect::<Vec<_>>();
             for cache in &mut state.ranks { cache.bank.prepare_decode(&mut cache.decode, &placements)?; }
             let ids = state.tokens.upload(&requests.iter().map(|request| request.tokens[0]).collect::<Vec<_>>())?;
@@ -1206,15 +1224,11 @@ impl<'a> ServingPrefill<'a> {
         let graph_rows = if captured { graphs[0].row_key(rows)? } else { rows };
         ensure!(graphs.iter().all(|graph| graph.row_key(rows).ok() == Some(graph_rows)) || !captured,
             "MiniMax split graph row buckets differ between ranks");
-        for graph in graphs.iter_mut() { graph.cycle(crate::shared::decode_graph::device::Cycle::Decode); }
+        for graph in graphs.iter_mut() { graph.cycle(query_cycle(requests)); }
         let result = (|| {
             let mut state = storage.requests.borrow_mut();
             ensure!(state.capacity == schedule.capacity, "MiniMax split decode capacity differs");
-            let mut identities = BTreeSet::new();
-            for request in requests {
-                ensure!(request.start == request.placement.len && request.identity != 0
-                    && identities.insert(request.identity), "MiniMax split decode identity/frontier differs");
-            }
+            validate_native_queries(schedule, requests)?;
             let placements = requests.iter().map(|request| &*request.placement).collect::<Vec<_>>();
             for cache in &mut state.ranks { cache.bank.prepare_decode(&mut cache.decode, &placements)?; }
             let ids = state.tokens.upload(&requests.iter().map(|request| request.tokens[0]).collect::<Vec<_>>())?;
@@ -1606,6 +1620,31 @@ mod tests {
     }
 
     #[test]
+    fn heads_flattened_queries_share_identity_validation_and_verify_cycle() -> Result<()> {
+        let schedule = Requests::new(RequestCapacity::with_queries(4, 64, 32)?, 4096, 60, 3)?;
+        let mut placements = (0..4).map(|row| Placement { units: vec![3, 7], slot: 2, len: 63 + row })
+            .collect::<Vec<_>>();
+        let token = [17];
+        let mut requests = placements.iter_mut().map(|placement| ServingRequest {
+            identity: 91, kind: ExpertV2SourceKind::Decode, start: placement.len,
+            heads: placement.len..placement.len + 1, tokens: &token, placement }).collect::<Vec<_>>();
+        assert_eq!(validate_native_queries(&schedule, &requests)?, 4);
+        assert_eq!(query_cycle(&requests), crate::shared::decode_graph::device::Cycle::Verify);
+        requests[2].identity = 92;
+        assert!(validate_native_queries(&schedule, &requests).is_err());
+        requests[2].identity = 91;
+        requests[2].placement.units[0] = 9;
+        assert!(validate_native_queries(&schedule, &requests).is_err());
+        let source = include_str!("engine.rs");
+        for name in ["    pub fn decode(", "    fn decode_heads(", "    fn decode_split("] {
+            let body = source.split_once(name).unwrap().1;
+            assert!(body.contains("validate_native_queries(schedule, requests)?"));
+            assert!(body.contains("cycle(query_cycle(requests))"));
+        }
+        Ok(())
+    }
+
+    #[test]
     fn heads_decode_graphs_only_fixed_row_projections_router_and_ffn() {
         let source = include_str!("engine.rs");
         let decode = source.split_once("    fn decode_heads(").unwrap().1
@@ -1948,8 +1987,12 @@ mod tests {
         let schedule = Requests::new(capacity, 4096, 60, 3)?;
         let mut batch = requests(2, 1);
         batch[1].slot = batch[0].slot;
-        assert!(schedule.decode_rows(&batch).is_err());
+        assert_eq!(schedule.decode_rows(&batch)?, 2);
         assert!(schedule.verify_units(&batch).is_err());
+        batch[1].start = batch[0].start;
+        assert!(schedule.decode_rows(&batch).is_err());
+        batch[1].start = batch[0].start + 2;
+        assert!(schedule.decode_rows(&batch).is_err());
         batch[1].slot = 64;
         assert!(schedule.verify_units(&batch).is_err());
         batch[1].slot = 1;

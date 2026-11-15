@@ -394,22 +394,6 @@ def test_optional_levers_are_default_off_and_documented():
             assert key in MATRIX, f"lever {key} is absent from the family support table"
             assert key in DEFAULTS, f"lever {key} has no documented default"
             default = DEFAULTS[key]
-            if key == "SPECULATOR":
-                # MiniMax is documented separately from the legacy family matrix;
-                # its default is off even though other families default to drafting.
-                assert lever["families"] == ["MiniMax M3.1 Flash"]
-                assert "`SPECULATOR=dspark` (unset/auto = off)" in lever["enable"]
-                assert key in family_keys("minimax_m3")
-                launcher = (ROOT / "scripts/launch/run-family.sh").read_text()
-                selection = launcher.split('speculator="$(get SPECULATOR)"', 1)[1].split(
-                    'case "$family:$speculator" in', 1)[0]
-                for value in ("", "auto", "off", "dspark"):
-                    script = 'speculator="$1"; family=minimax_m3; ' + selection
-                    result = subprocess.run(["bash", "-c", script + '\nprintf "%s" "$speculator"', "_", value],
-                        capture_output=True, text=True)
-                    assert result.returncode == 0, result.stderr
-                    assert result.stdout == (value if value in {"off", "dspark"} else "off")
-                continue
             if key == "KV_CACHE":
                 assert lever["families"] == ["Muse"]
                 assert default == "family default"
@@ -421,6 +405,23 @@ def test_optional_levers_are_default_off_and_documented():
                 assert family in COLUMNS, f"lever {key} names unknown family column {family}"
                 assert MATRIX[key][family], f"lever {key} is not accepted by {family}"
     assert seen
+
+
+def test_minimax_bundled_dspark_is_a_family_default_not_an_optional_lever():
+    assert all("SPECULATOR" not in lever["keys"] for lever in LEVERS)
+    assert "SPECULATOR" in family_keys("minimax_m3")
+    text = DOC.read_text()
+    assert "`SPECULATOR=dspark` is the default" in text
+    assert "`SPECULATOR=off`" in text and "`--dspark=false`" in text
+    launcher = (ROOT / "scripts/launch/run-family.sh").read_text()
+    selection = launcher.split('speculator="$(get SPECULATOR)"', 1)[1].split(
+        'case "$family:$speculator" in', 1)[0]
+    for value in ("", "auto", "off", "dspark"):
+        script = 'speculator="$1"; family=minimax_m3; ' + selection
+        result = subprocess.run(["bash", "-c", script + '\nprintf "%s" "$speculator"', "_", value],
+            capture_output=True, text=True)
+        assert result.returncode == 0, result.stderr
+        assert result.stdout == ("off" if value == "off" else "dspark")
 
 
 def test_optional_levers_section_is_near_the_top_and_linked():

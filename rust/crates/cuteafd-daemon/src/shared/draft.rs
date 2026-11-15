@@ -66,15 +66,26 @@ pub(crate) fn timing_profile() -> bool {
 
 /// The configured draft mode; an unknown value keeps the simple policy.
 pub(crate) fn draft_mode() -> cuteafd_core::DraftMode {
+    draft_mode_with_default(cuteafd_core::DraftMode::Simple)
+}
+
+/// Select a family fallback before probes or policies first read the mode.
+/// Explicit overrides still win; later readers share this choice.
+pub(crate) fn draft_mode_with_default(default: cuteafd_core::DraftMode) -> cuteafd_core::DraftMode {
     static MODE: std::sync::OnceLock<cuteafd_core::DraftMode> = std::sync::OnceLock::new();
     *MODE.get_or_init(|| {
         let value = std::env::var("CUTEAFD_DRAFT_POLICY").unwrap_or_default();
-        let mode = cuteafd_core::DraftMode::parse(&value).unwrap_or_else(|| {
-            tracing::warn!(value, "unknown CUTEAFD_DRAFT_POLICY; using simple");
-            cuteafd_core::DraftMode::Simple
-        });
+        let mode = resolve_draft_mode(&value, default);
         tracing::info!(mode = mode.label(), "draft length policy selected");
         mode
+    })
+}
+
+fn resolve_draft_mode(value: &str, default: cuteafd_core::DraftMode) -> cuteafd_core::DraftMode {
+    if value.is_empty() { return default; }
+    cuteafd_core::DraftMode::parse(value).unwrap_or_else(|| {
+        tracing::warn!(value, "unknown CUTEAFD_DRAFT_POLICY; using simple");
+        cuteafd_core::DraftMode::Simple
     })
 }
 
@@ -92,4 +103,21 @@ pub(crate) unsafe fn launch_bf16_head(head: &cuteafd_ffi::programs::VocabularyHe
     let rows = u32::try_from(rows).map_err(|_| anyhow::anyhow!("drafter head row count exceeds u32"))?;
     // SAFETY: the caller retains the checked geometry, buffers and workspace.
     unsafe { head.launch_tensor_op(input, weight, logits, rows, stream) }
+}
+
+#[cfg(test)]
+mod mode_tests {
+    use super::*;
+    use cuteafd_core::DraftMode;
+
+    #[test]
+    fn family_fallback_preserves_explicit_policy_and_global_simple_default() {
+        for default in [DraftMode::Simple, DraftMode::Shared] {
+            assert_eq!(resolve_draft_mode("", default), default);
+            for mode in [DraftMode::Simple, DraftMode::Shared, DraftMode::SimpleRc, DraftMode::SimpleDerived] {
+                assert_eq!(resolve_draft_mode(mode.label(), default), mode);
+            }
+            assert_eq!(resolve_draft_mode("unknown", default), DraftMode::Simple);
+        }
+    }
 }
