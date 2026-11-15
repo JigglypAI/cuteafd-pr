@@ -799,6 +799,7 @@ def worker(payload):
         records_module = load_file("placement_kernel_records", ROOT / "scripts/build/kernel-records.py")
         backend_cache = records_module.install_backend_cache(payload.get("backend_cache"))
         recorder = records_module.Recorder(ROOT, output).install()
+        recorder.scoped = payload["exporter"] == "export_b12x_dsv4_aot.py"
         PROGRAM_RECORDER = recorder
         # runpy exporters receive a worker-local hook, not a serving dependency.
     start = time.monotonic()
@@ -827,6 +828,8 @@ def worker(payload):
             runpy.run_path(str(path), run_name="__main__", init_globals={
                 "_record_construction": recorded_construction,
                 "_program_records": ProgramRecords(),
+                "_disable_program_cache": recorder is not None and recorder.scoped,
+                "_catalog_only": payload.get("catalog_only", False),
                 "_selected_object_labels": payload.get("selected_objects")})
     if torch.cuda.get_device_properties(0).multi_processor_count != payload["sms"]:
         raise RuntimeError("exporter changed the synthetic SM count")
@@ -847,7 +850,20 @@ def worker(payload):
     if recorder is not None:
         inspector = load_file("placement_cuda_images", ROOT / "scripts/qualify/deepseek_v41/inspect-cute-object.py")
         program_records = recorder.finish(inspector, summary, plans)
+        scoped = recorder.scoped
+        recorder.scoped = False
         summary["source_reads_sha256"] = recorder.reads()
+        if scoped:
+            # Worker import order and cache bookkeeping are not semantic inputs.
+            # A conservative job inventory makes its skip independent of shards.
+            inventory = [source for directory in ("python/tools", "third_party/sparkinfer/b12x")
+                         for source in (ROOT / directory).rglob("*.py")]
+            inventory += [ROOT / "rust/crates/cuteafd-core/src/dspark_verify.rs",
+                          ROOT / "scripts/build/verify-sparkinfer-source.py"]
+            summary["source_reads_sha256"].update({str(source.relative_to(ROOT)): sha(source.read_bytes())
+                                                 for source in inventory if source.is_file()})
+            summary["source_reads_sha256"] = dict(sorted(summary["source_reads_sha256"].items()))
+        recorder.scoped = scoped
         summary["stage0_inputs"] = records_module.stage0_inputs(ROOT, payload, capability)
         if backend_cache is not None:
             summary["backend_reuse"] = {"hits": backend_cache.hits, "misses": backend_cache.misses}
@@ -1198,7 +1214,14 @@ def main():
     parser.add_argument("--_worker", help=argparse.SUPPRESS)
     args = parser.parse_args()
     if args._worker:
-        worker(json.loads(args._worker))
+        payload = json.loads(args._worker)
+        if payload.get("host_admission"):
+            sys.path.insert(0, str(ROOT / "python/tools/lib"))
+            from _export_jobs import export_slot
+            with export_slot():
+                worker(payload)
+        else:
+            worker(payload)
         return 0
     if args.v4_placement_inputs:
         if args.workers < 1 or args.timeout < 1:
