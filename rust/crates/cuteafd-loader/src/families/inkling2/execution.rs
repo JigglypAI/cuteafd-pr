@@ -58,6 +58,53 @@ impl UnitLayout {
     }
 }
 
+/// Byte layout of one layer's exact per-sequence mark. KV records are BF16;
+/// convolution histories preserve the native producers' FP32 inputs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SequenceLayout {
+    pub ring_rows: usize,
+    pub kv_width: usize,
+    pub fields: BTreeMap<String, std::ops::Range<usize>>,
+    pub bytes: usize,
+}
+
+impl SequenceLayout {
+    /// `kv_parts` splits KV heads only. Hidden-stream convolution inputs are
+    /// replicated under both head and context splitting.
+    pub fn new(cfg: &Inkling2Config, local: bool, kv_parts: usize) -> Result<Self> {
+        ensure!(matches!(kv_parts, 1 | 2) && cfg.kv_heads > 0
+            && cfg.kv_heads % kv_parts == 0 && cfg.head_dim > 0 && cfg.hidden > 0
+            && cfg.sconv_kernel > 1, "Inkling sequence state geometry");
+        let kv_width = (cfg.kv_heads / kv_parts).checked_mul(cfg.head_dim)
+            .context("Inkling sequence KV width overflow")?;
+        let ring_rows = if local {
+            usize::try_from(cuteafd_core::prefix::swa_ring(u64::try_from(cfg.window)?, 64, 64)
+                .context("Inkling sequence ring geometry")?.rows)?
+        } else { 0 };
+        let lags = cfg.sconv_kernel - 1;
+        let mut fields = BTreeMap::new();
+        let mut bytes = 0usize;
+        for (name, rows, width, element) in [
+            ("ring", ring_rows, kv_width, 4),
+            ("k_conv_history", lags, kv_width, 4),
+            ("v_conv_history", lags, kv_width, 4),
+            ("attn_conv_history", lags, cfg.hidden, 4),
+            ("mlp_conv_history", lags, cfg.hidden, 4),
+        ] {
+            let size = rows.checked_mul(width).and_then(|n| n.checked_mul(element))
+                .context("Inkling sequence field overflow")?;
+            let end = bytes.checked_add(size).context("Inkling sequence mark overflow")?;
+            fields.insert(name.into(), bytes..end);
+            bytes = end;
+        }
+        Ok(Self { ring_rows, kv_width, fields, bytes })
+    }
+
+    pub fn field(&self, name: &str) -> Result<std::ops::Range<usize>> {
+        self.fields.get(name).cloned().with_context(|| format!("Inkling sequence lacks {name}"))
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ResidualSite {
     /// Completed blocks present before attention, including the embedding block.
@@ -93,6 +140,39 @@ mod tests {
                 (attn, mlp, if global { 3 } else { 1 }));
         }
     }
+    #[test]
+    fn sequence_marks_preserve_fp32_lags_and_split_only_kv_heads() {
+        let cfg = cfg();
+        for local in [false, true] {
+            for parts in [1, 2] {
+                let layout = SequenceLayout::new(&cfg, local, parts).unwrap();
+                let kv = 1024 / parts;
+                assert_eq!(layout.ring_rows, if local { 1088 } else { 0 });
+                assert_eq!(layout.kv_width, kv);
+                assert_eq!(layout.field("ring").unwrap().len(), layout.ring_rows * kv * 4);
+                for name in ["k_conv_history", "v_conv_history"] {
+                    assert_eq!(layout.field(name).unwrap().len(), 3 * kv * 4);
+                }
+                for name in ["attn_conv_history", "mlp_conv_history"] {
+                    assert_eq!(layout.field(name).unwrap().len(), 3 * 4608 * 4);
+                }
+                let mut spans = layout.fields.values().cloned().collect::<Vec<_>>();
+                spans.sort_by_key(|span| span.start);
+                let mut end = 0;
+                for span in spans { assert_eq!(span.start, end); end = span.end; }
+                assert_eq!(end, layout.bytes);
+                assert!(layout.field("missing").is_err());
+            }
+        }
+        for parts in [0, 3, usize::MAX] { assert!(SequenceLayout::new(&cfg, true, parts).is_err()); }
+        let mut invalid = cfg;
+        invalid.sconv_kernel = 0;
+        assert!(SequenceLayout::new(&invalid, true, 1).is_err());
+        invalid.sconv_kernel = 4;
+        invalid.hidden = usize::MAX;
+        assert!(SequenceLayout::new(&invalid, true, 1).is_err());
+    }
+
     #[test]
     fn every_unit_owner_has_checked_named_extent() {
         let cfg = cfg();

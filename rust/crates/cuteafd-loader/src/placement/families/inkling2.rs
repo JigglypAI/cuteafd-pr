@@ -237,15 +237,12 @@ pub struct SequenceState {
 
 impl SequenceState {
     pub fn new(cfg: &Inkling2Config, local: bool) -> Result<Self, Refusal> {
-        let kv_row = (cfg.kv_heads * cfg.head_dim * 2) as u64;
-        let ring = if local {
-            let ring = cuteafd_core::prefix::swa_ring(cfg.window as u64, u64::from(DECODE_ROWS), PAGE_ROWS)
-                .ok_or_else(|| invalid("sliding-window ring geometry"))?;
-            ring.rows.checked_mul(2 * kv_row).ok_or(Refusal::Overflow("Inkling 2 SWA ring"))?
-        } else { 0 };
-        let kv_lags = (cfg.sconv_kernel as u64 - 1) * 2 * kv_row;
-        let lags = kv_lags + (cfg.sconv_kernel as u64 - 1) * 2 * cfg.hidden as u64 * 2;
-        Ok(Self { ring_bytes: ring, lag_bytes: lags, kv_lag_bytes: kv_lags })
+        let layout = crate::families::inkling2::execution::SequenceLayout::new(cfg, local, 1)
+            .map_err(|error| invalid(error.to_string()))?;
+        let ring = layout.fields["ring"].len();
+        let kv_lags = layout.fields["k_conv_history"].len() + layout.fields["v_conv_history"].len();
+        Ok(Self { ring_bytes: ring as u64, lag_bytes: (layout.bytes - ring) as u64,
+            kv_lag_bytes: kv_lags as u64 })
     }
 }
 
@@ -768,11 +765,17 @@ mod tests {
         let local = SequenceState::new(&cfg, true).unwrap();
         // 1024 + 64 rows of K and V at 8 x 128 BF16 each.
         assert_eq!(local.ring_bytes, 1088 * 2 * 2048);
-        // 3 lag rows of K, V (1024 each) and the attention/MLP hidden streams (4608 each), BF16.
-        assert_eq!(local.lag_bytes, 3 * (2 * 2048 + 2 * 9216));
+        // Histories preserve F32 convolution inputs, not the BF16 KV records.
+        assert_eq!(local.lag_bytes, 3 * (2 * 4096 + 2 * 18432));
         let global = SequenceState::new(&cfg, false).unwrap();
         assert_eq!(global.ring_bytes, 0);
         assert_eq!(global.lag_bytes, local.lag_bytes);
-        assert_eq!(local.kv_lag_bytes, 3 * 2 * 2048);
+        assert_eq!(local.kv_lag_bytes, 3 * 2 * 4096);
+        for local_layer in [false, true] {
+            let whole = SequenceState::new(&cfg, local_layer).unwrap();
+            let split = crate::families::inkling2::execution::SequenceLayout::new(&cfg, local_layer, 2).unwrap();
+            assert_eq!(split.bytes as u64, whole.ring_bytes / 2 + whole.kv_lag_bytes / 2
+                + whole.lag_bytes - whole.kv_lag_bytes);
+        }
     }
 }
