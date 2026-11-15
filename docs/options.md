@@ -533,14 +533,17 @@ Each key is also a global `cuteafd` flag (`--gpu-memory-cap`, `--kv-max-tokens`,
 | `MEDIA_FEATURES_DIR`, `AUDIO_FEATURES_DIR` | unset | absolute dir | Encoder feature caches. |
 | `CHAT_TEMPLATE_FROM` | checkpoint | snapshot dir | GLM Flash template source when the checkpoint's template cannot mark images. |
 
-Kimi K3.1 (`kimi_k31`) is recognized by the shared Kimi family for CPU header
-and core-view inspection. Original and K6/K8 compact cores receive complete
-memory plans, including context-parity index caches and prefill workspaces.
-All remain `Planned`, not launchable, pending full-model and compact-core
-qualification (#1777); dense MLA is not a fallback. K3 DFlash2 hidden-state compatibility is unqualified,
-and requesting a drafter for K3.1 refuses explicitly. MC `original`,
-`k8-compact` and `k6-compact` retain native BF16 indexer weights;
-`fp8-compact` refuses until whole-core conversion is implemented.
+Kimi K3.1 (`kimi_k31`) uses the shared Kimi engine. MC `original` (BF16),
+MC `k6-compact` and standalone native Core-K6 are launchable with real Spark
+experts after accepted full-model fidelity and partial paired scoring proof
+(#1777/#2128: 77 exact windows, zero mismatches, explicitly accepted by TJ).
+The [max example](../examples/configs/kimi-k31-exl3-k2-mc-max.config) selects
+MC `CORE_VIEW=original`, 2 RTX + 6 Sparks and automatic pool/onboarding.
+The 1-RTX minimum stays blocked by #2082; no raised Spark cap or tiny-pool
+workaround is supplied. K8 compact remains `Planned` because fidelity is
+unmeasured; whole-core `fp8-compact` remains unsupported and unqualified.
+All accepted views retain native BF16 indexer weights. K3 DFlash2 hidden-state
+compatibility is independently unqualified: requesting a K3.1 drafter refuses.
 
 Kimi K3 and Step-5 are text-only; dense Qwen has media off. GLM 5.3 / ML4,
 GLM Flash, MiMo, Qwen4 and Muse carry their own towers. Native GLM Flash EXLR8

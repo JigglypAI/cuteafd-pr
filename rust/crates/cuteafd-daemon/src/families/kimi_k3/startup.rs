@@ -41,7 +41,6 @@ impl Role {
     }
 
     fn validate(self, cfg: &KimiK3Config, peers: usize, draft: bool) -> Result<()> {
-        cfg.validate_attention_role(matches!(self, Self::Golden { .. }))?;
         if self.skip_routed_experts() {
             ensure!(peers == 0 && !draft, "Kimi --skip-routed-experts golden requires zero Spark peers and no drafter");
         } else {
@@ -81,6 +80,8 @@ pub(crate) struct Options<'a, const RANKS: usize = 2> {
     /// Exact speculative verify widths given startup graphs; 0 = the drafter's block.
     pub verify_rows: usize,
     pub prefix: Option<&'a crate::shared::prefix::PrefixArgs>,
+    #[cfg(test)]
+    pub prove_serve_admission: bool,
 }
 
 pub(crate) struct Loaded<'a> {
@@ -88,6 +89,8 @@ pub(crate) struct Loaded<'a> {
     pub admission_free: Vec<u64>,
     pub admitted_bytes: Vec<u64>,
     pub ownership: Ownership,
+    #[cfg(test)]
+    pub admission_proof: Option<serde_json::Value>,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -135,6 +138,8 @@ pub(crate) fn load<'a, const RANKS: usize>(library: &'a Arc<cuteafd_ffi::NativeL
     ensure!(spark_ranks <= cuteafd_core::MAX_SPARK_WORLD, "Kimi Spark peer inventory exceeds eight");
     let core = cuteafd_loader::plan::families::kimi::core_inventory(checkpoint)?;
     core.validate_runtime_groups(full)?;
+    ensure!(options.role != Role::Serve || core.serving_qualified(full),
+        "Kimi K3.1 serving is qualified for BF16 original and native K6 cores only; K8/FP8 remain Planned (#1777)");
     let graph_core = cuteafd_loader::serving_capacity::kimi_prewarm::KimiCoreFormat::from_inventory(&core);
     if RANKS == 2 {
         ensure!(crate::shared::peer_split::probed_device(library, options.devices[0], Some(options.devices[1]))?
@@ -292,13 +297,32 @@ pub(crate) fn load<'a, const RANKS: usize>(library: &'a Arc<cuteafd_ffi::NativeL
     }).collect::<Vec<_>>().try_into().map_err(|_| anyhow::anyhow!("Kimi GPU sample count"))?;
     let peer_receive = [core.attention_receive_bytes(unit, RANKS)?,
         core.attention_receive_bytes(unit.min(64), RANKS)?];
-    let mut admitted = admission::admit(admission::Inputs { skip_routed_experts, expert_usage: options.expert_usage_reader.configure(options.expert_usage, false).map_err(anyhow::Error::msg)?, cfg, core,
+    let inputs = admission::Inputs { skip_routed_experts, expert_usage: options.expert_usage_reader.configure(options.expert_usage, false).map_err(anyhow::Error::msg)?, cfg, core,
         resident_weight_limit: crate::shared::memory::budget::resident_weight_limit(), cache_format: options.cache_format, gpus, devices: options.devices,
         peer_access: RANKS == 2, spark_ranks, attention: options.attention, context: context_layout, serving_context: options.context, requested_pool: options.pool_tokens,
         state_slots: options.slots, prefix_marks: options.marks, rows, lanes: 1, waves: options.waves,
         unit_rows: options.prefill_rows, lane_layouts, fixed,
         startup: reserve_demands, pool_bounded: vec![], rtx,
-        spark_budget, draft: draft_layout.clone(), verify_rows, prefix: options.prefix })?;
+        spark_budget, draft: draft_layout.clone(), verify_rows, prefix: options.prefix };
+    #[cfg(test)]
+    let serve_plan = if options.prove_serve_admission {
+        ensure!(!Role::Serve.skip_routed_experts() && !inputs.skip_routed_experts
+            && options.draft.is_none(), "paired admission requires ordinary full target without a drafter");
+        // Role validation is the unearned qualification gate only. Serve has
+        // no distinct solver inputs; use its exact measured CPU admission.
+        let mut serve_inputs = inputs.clone();
+        serve_inputs.skip_routed_experts = Role::Serve.skip_routed_experts();
+        Some(admission::admit(serve_inputs)?)
+    } else { None };
+    let mut admitted = admission::admit(inputs)?;
+    #[cfg(test)]
+    let admission_proof = serve_plan.as_ref().map(|serve| -> Result<_> {
+        let ordinary = admission_snapshot(serve, options.context, options.cache_format)?;
+        let actual = admission_snapshot(&admitted, options.context, options.cache_format)?;
+        ensure!(ordinary == actual, "paired Golden admission differs from ordinary Serve admission");
+        Ok(serde_json::json!({"ordinary_serve":ordinary,"paired_golden":actual,
+            "equal_before_allocation":true,"baseline":"same exact post-module native inventory"}))
+    }).transpose()?;
     options.max_context = usize::try_from(options.context.served(admitted.placement.pool_tokens))?;
     {
         use sha2::{Digest, Sha256};
@@ -448,7 +472,25 @@ pub(crate) fn load<'a, const RANKS: usize>(library: &'a Arc<cuteafd_ffi::NativeL
             }
         }
     }
-    Ok(Loaded { engine, admission_free, admitted_bytes, ownership })
+    Ok(Loaded { engine, admission_free, admitted_bytes, ownership,
+        #[cfg(test)] admission_proof,
+    })
+}
+
+#[cfg(test)]
+fn admission_snapshot(admitted: &admission::Admission<'_>,
+    context: cuteafd_loader::placement::planner::Context, format: cuteafd_core::MlaCacheFormat)
+    -> Result<serde_json::Value> {
+    let graph_keys = admitted.graph_set.as_ref().map(|set|
+        set.keys.iter().map(|key| format!("{key:?}")).collect::<Vec<_>>());
+    Ok(serde_json::json!({"pool_tokens":admitted.placement.pool_tokens,
+        "max_context":context.served(admitted.placement.pool_tokens),
+        "kv_format":format.label(), "placement":admitted.placement,
+        "onboard_layers":admitted.placement.onboard_layers,
+        "spark_layers":admitted.working_set().spark_layers,
+        "marks":{"legacy_slots":admitted.mark_selection.legacy_slots,
+            "slots":admitted.mark_selection.slots,"reason":admitted.mark_selection.reduction_reason},
+        "graph_keys":graph_keys}))
 }
 
 fn check_attention(attention: Option<cuteafd_loader::placement::AttentionPlacement>, ranks: usize, graphs: bool) -> Result<()> {
@@ -493,7 +535,7 @@ mod tests {
             assert!(skipped.validate(&cfg, 0, true).is_err());
             assert!(Role::Serve.validate(&cfg, 0, false).is_err());
             assert!(Role::Golden { skip_routed_experts: false }.validate(&cfg, 0, false).is_err());
-            assert_eq!(Role::Serve.validate(&cfg, 6, false).is_ok(), cfg.dsa.is_none());
+            Role::Serve.validate(&cfg, 6, false)?;
         }
         Ok(())
     }
