@@ -364,6 +364,8 @@ class Recorder:
         self.executor_timings = {}
         self.frontend_seconds = 0.0
         self.backend_seconds = 0.0
+        self.overheads = {name: 0.0 for name in ("reads_seconds", "profile_seconds", "audit_seconds", "construction_seconds")}
+        self.read_counts = []
 
     def _start(self, code, offset):
         frame = sys._getframe(1)
@@ -391,6 +393,7 @@ class Recorder:
 
     def construct(self, function, *args, **kwargs):
         """Trace the entire recipe, including launch construction and scratch."""
+        started = time.monotonic()
         self.latest = []
         self.construction = True
         try:
@@ -400,14 +403,18 @@ class Recorder:
             for record in self.latest:
                 record["source_reads_sha256"].update(reads)
             self.construction = False
+            self.overheads["construction_seconds"] += time.monotonic() - started
 
     def _audit(self, event, args):
+        started = time.monotonic()
         if self.active and event == "open" and args and isinstance(args[0], (str, bytes, os.PathLike)):
             path = source_name(args[0], self.root)
             if path and not path.startswith(str(self.output)):
                 self.opened.add(path)
+        self.overheads["audit_seconds"] += time.monotonic() - started
 
     def _profile(self, frame, event, arg):
+        started = time.monotonic()
         if event == "call":
             filename = frame.f_code.co_filename
             if filename not in self.frame_paths:
@@ -424,6 +431,7 @@ class Recorder:
                          *frame.f_code.co_freevars, *frame.f_code.co_cellvars)
                 self._record_dependencies(frame.f_locals.get(name) for name in names)
                 self._record_dependencies(frame.f_globals.get(name) for name in frame.f_code.co_names)
+        self.overheads["profile_seconds"] += time.monotonic() - started
 
     def _record_dependencies(self, values):
         for value in values:
@@ -438,6 +446,7 @@ class Recorder:
                         self.frames.add(source)
 
     def reads(self):
+        started = time.monotonic()
         paths = self.opened | self.frames
         for name in set(sys.modules) - self.imported:
             module = sys.modules.get(name)
@@ -450,6 +459,8 @@ class Recorder:
             return {path: digest((self.root / path).read_bytes()) for path in sorted(paths)}
         finally:
             self.active = active
+            self.overheads["reads_seconds"] += time.monotonic() - started
+            self.read_counts.append(len(paths))
 
     def patch(self, cls, method, replacement):
         original = getattr(cls, method)
@@ -528,6 +539,7 @@ class Recorder:
         return self
 
     def finish(self, inspector, context, plans):
+        started = time.monotonic()
         self.stop_monitoring()
         self.active = False
         for cls, method, original in reversed(self.restores):
@@ -561,6 +573,8 @@ class Recorder:
                                  "plan": plans.get(path.stem)}
         (self.output / "program-timings.json").write_text(json.dumps({
             "stage0_seconds": self.frontend_seconds, "backend_seconds": self.backend_seconds,
+            "overheads": {**self.overheads, "finish_seconds": time.monotonic() - started},
+            "read_set_sizes": self.read_counts,
             "programs": {key: value for key, value in self.timings.items() if isinstance(key, str)},
         }, indent=2, sort_keys=True) + "\n")
         (self.output / "program-records.json").write_text(json.dumps(records, indent=2, sort_keys=True) + "\n")
