@@ -705,7 +705,7 @@ def test_inkling2_dispatch_package_codes_cmake_and_placement_scopes_agree(monkey
     _, scopes = aot.config_scopes(dict(FAMILY="inkling2", MODEL_ID="fixture/Inkling-2-Small-MXFP8", SPARK_COUNT="4"))
     assert scopes["CUTEAFD_WIP_INKLING2_AOT"] == "ON"
     assert scopes["CUTEAFD_WIP_COORDINATOR_EXPERT_FAMILIES"] == "inkling2:mxfp8"
-    assert scopes["CUTEAFD_WIP_EXPERT_FAMILIES"] == ""
+    assert scopes["CUTEAFD_WIP_EXPERT_FAMILIES"] == "inkling2:mxfp8"
     assert cmake_flags("coordinator", scopes)["CUTEAFD_ENABLE_INKLING2_AOT"] == "ON"
 
     def load(name, relative):
@@ -725,7 +725,7 @@ def test_inkling2_dispatch_package_codes_cmake_and_placement_scopes_agree(monkey
     assert derived["CUTEAFD_RELEASE_EXPERT_FAMILIES"] == "inkling2:mxfp8"
     required = release.requirements(tmp_path, matrix, "inkling2")[0]
     assert required["programs"] == ["inkling2"] and required["experts"] == ["inkling2:mxfp8"]
-    assert required["spark_experts"] == []
+    assert required["spark_experts"] == ["inkling2:mxfp8"]
 
     placement = load("inkling2_placement_inputs", "scripts/build/export-placement-inputs.py")
     jobs = {name: (exporter, args) for name, exporter, args in placement.export_jobs()}

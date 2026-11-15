@@ -93,7 +93,7 @@ impl RankPlan {
             let planes = RegionLayout::fp8(&tensors, world, rank, slicing)?;
             // Do not silently widen the worker-reported checkpoint admission.
             ensure!(
-                planes.padding_bytes() == 0,
+                planes.padding_bytes() == 0 || tensors.dynamic_nvfp4(),
                 "native push plane alignment exceeds mount admission"
             );
             let offsets = planes.addresses(256)?;
@@ -220,7 +220,7 @@ impl RankPlan {
                     let (source, _) = tensors.push_source(&names[0])?;
                     builder.fp8_matrix(
                         &source,
-                        weight,
+                        tensors.push_matrix_slice(&names[0], weight)?,
                         destination(rank, &layer.planes[2 * index], expert * w_bytes, w_bytes)?,
                     )?;
                     if tensors.format() == ExpertFormat::Bf16 {
@@ -251,14 +251,15 @@ impl RankPlan {
                     }
                     builder.fp8_matrix(
                         &source,
-                        image,
+                        tensors.push_matrix_slice(&names[1], image)?,
                         destination(rank, &layer.planes[2 * index + 1], at, extent)?,
                     )?;
                     if tensors.format() == ExpertFormat::Nvfp4 {
-                        for (name, offset) in names[2..].iter().zip([
-                            experts * s_bytes + expert * 4,
-                            experts * s_bytes + experts * 4 + expert * 4,
-                        ]) {
+                        let offsets = if tensors.dynamic_nvfp4() {
+                            vec![experts * s_bytes + expert * 4]
+                        } else { vec![experts * s_bytes + expert * 4,
+                            experts * s_bytes + experts * 4 + expert * 4] };
+                        for (name, offset) in names[2..].iter().zip(offsets) {
                             let (source, dtype) = tensors.push_source(name)?;
                             ensure!(
                                 dtype == DType::F32 && source.bytes == 4,
@@ -272,6 +273,13 @@ impl RankPlan {
                             )?;
                         }
                     }
+                }
+                if tensors.dynamic_nvfp4() {
+                    let names = source_names(&tensors, layer.layer, 0, projection);
+                    let (source, dtype) = tensors.push_source(&names[3])?;
+                    ensure!(dtype == DType::F32 && source.bytes == 4, "dynamic NVFP4 denominator must be F32");
+                    builder.contiguous(&source, 0, 4,
+                        destination(rank, &layer.planes[2 * index + 1], experts * s_bytes + experts * 4, 4)?)?;
                 }
             }
         }
@@ -362,7 +370,7 @@ fn initialize(
         if tensors.format() == ExpertFormat::Nvfp4 {
             let start = plane.start + experts * grid;
             scalars.push(start..plane.end);
-            inputs.push(start + experts * 4..plane.end);
+            if !tensors.dynamic_nvfp4() { inputs.push(start + experts * 4..plane.end); }
         }
     }
     let inputs = (!inputs.is_empty()).then(|| (inputs[0].clone(), inputs[1].clone(), layer.layer));

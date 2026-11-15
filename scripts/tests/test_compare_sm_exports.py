@@ -123,17 +123,23 @@ def test_native_attention_groups_cover_checkpoint_shapes_and_f32_partials():
     programs = exporter.native_attention_programs()
     muse_core = {(4096,8192),(1024,8192),(512,8192),(2048,8192),(8192,2048)}
     expected = {f"n{n}_k{k}_m{rows}{suffix}"
-                for n,k in set().union(*shapes.values()) | muse_core for rows in (64,4096)
-                for suffix in (("", "_f32") if (n,k) in exporter.native_attention_f32_shapes() | {(8192,2048)} else ("",))}
-    expected.add("n202112_k8192_m64_f32")
-    assert "n202112_k8192_m4096_f32" not in expected, "head is microbatched at64rows"
+                for n,k in set().union(*shapes.values(), *exporter.mc_fp8_core_shapes().values()) | muse_core for rows in (64,4096)
+                for suffix in (("", "_f32") if (n,k) in exporter.native_attention_f32_shapes() | exporter.mc_fp8_f32_shapes() | {(8192,2048)} else ("",))}
+    assert exporter.native_fp8_head_shapes() == {(202112,8192),(154880,6144),(128896,4096)}
+    for n,k in exporter.native_fp8_head_shapes():
+        expected.add(f"n{n}_k{k}_m64_f32")
+        assert f"n{n}_k{k}_m4096_f32" not in expected, "head is microbatched at64rows"
+    assert exporter.mc_fp8_core_shapes()["glm"] >= {(640,6144),(1024,6144),(6144,1024),(6144,2048)}
+    assert exporter.mc_fp8_core_shapes()["step5"] >= {(384,4096),(768,4096),(4096,8192),(4096,13824)}
+    assert exporter.mc_fp8_f32_shapes() == {(6144,1024),(6144,2048)}
     assert len(programs) == len(expected) and {p[0] for p in programs} == expected
     jobs = {job[0]: job[1:] for job in compare_sm.jobs("all")}
     assert jobs["native-attention-fp8"] == ("export_b12x_dsv4_aot.py",
         ["--geometry", "native_attention", "--only", ",".join(p[0] for p in programs)])
     stems = {f"k{k}_n{n}" for family, family_shapes in shapes.items() if family != "ml4"
              for n,k in family_shapes}
-    stems |= {"k6144_n512", "k6144_n576", "k8192_n512", "k8192_n1024", "k8192_n4096", "k8192_n2048"}
+    stems |= {"k6144_n512", "k6144_n576", "k8192_n512", "k8192_n1024", "k8192_n4096", "k8192_n2048",
+              "k1024_n6144", "k6144_n6144", "k6144_n12288"}
     assert exporter.native_attention_bf16_shapes() == {
         (int(stem.split("_")[0][1:]), int(stem.split("_")[1][1:])) for stem in stems}
     assert all("native-core" in exporter.draft_bf16_shapes()[shape]
@@ -155,6 +161,7 @@ def test_native_attention_groups_cover_checkpoint_shapes_and_f32_partials():
     native_bf16 = {(k,n) for family, family_shapes in shapes.items() if family != "ml4"
                    for n,k in family_shapes}
     native_bf16.update((6144, n) for n in (512, 576))
+    native_bf16.update(((1024,6144),(6144,6144),(6144,12288)))
     native_bf16.update((8192, n) for n in (512, 1024, 2048, 4096))
     assert native_bf16 <= namespace["shapes"]().keys()
     assert namespace["F32_SHAPES"] == {(k,n) for n,k in exporter.native_attention_bf16_f32_shapes()}

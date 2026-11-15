@@ -217,13 +217,18 @@ impl SparkExecutionInventory {
 
     /// The selected schedule's actual capacity manifests, not a coordinator
     /// export. The existing helper preserves alias/shared/private LUT semantics.
-    pub fn exl3(manifests: &[Value], physical_sms: u32, compiled: u32, live: u32,
+    pub fn exl3(manifests: &[Value], geometry: cuteafd_core::ExpertGeometry,
+        physical_sms: u32, compiled: u32, live: u32,
         retained: &[u32], load: SparkLoadInventory) -> Result<Self> {
         capacities(compiled, live, retained)?;
-        let expected = cuteafd_core::Exl3RowPolicy::Nearest.capacities(live as usize)
+        if geometry.hidden == 0 || geometry.hidden % 32 != 0 || geometry.experts == 0 || geometry.topk == 0
+            || geometry.topk > geometry.experts || geometry.intermediate == 0 {
+            return Err(invalid("EXL3 checkpoint geometry is empty or invalid"));
+        }
+        let expected = cuteafd_core::Exl3RowPolicy::for_geometry(geometry).capacities(live as usize)
             .map_err(|e| invalid(e.to_string()))?;
         if retained != expected || expected.last() != Some(&compiled) {
-            return Err(invalid("EXL3 retained states differ from V4.1 row policy"));
+            return Err(invalid("EXL3 retained states differ from checkpoint row policy"));
         }
         if physical_sms == 0 || manifests.len() != retained.len() {
             return Err(invalid("EXL3 manifest/retained state count mismatch"));
@@ -233,10 +238,11 @@ impl SparkExecutionInventory {
         for (manifest, &rows) in manifests.iter().zip(retained) {
             let intermediate = number(manifest, "intermediate")?;
             if manifest["schema"] != "cuteafd.v41-exl3-aot.v1" || manifest["output_dtype"] != "bf16"
-                || number(manifest, "hidden")? != 5120 || number(manifest, "experts")? != 384
-                || number(manifest, "top_k")? != 6 || number(manifest, "sms")? != physical_sms as u64
+                || number(manifest, "hidden")? != u64::from(geometry.hidden)
+                || number(manifest, "experts")? != u64::from(geometry.experts)
+                || number(manifest, "top_k")? != u64::from(geometry.topk) || number(manifest, "sms")? != physical_sms as u64
                 || number(manifest, "capacity")? != rows as u64 || intermediate == 0
-                || intermediate > 2304 || intermediate % 128 != 0
+                || intermediate > u64::from(geometry.intermediate) || intermediate % 128 != 0
                 || width.is_some_and(|w| w != intermediate) {
                 return Err(invalid("EXL3 package geometry/capacity/physical SM mismatch"));
             }
@@ -249,9 +255,10 @@ impl SparkExecutionInventory {
             physical_sms, logical_intermediate: width.unwrap() as u32, stored_intermediate: width.unwrap() as u32,
             manifests: sources, retained: SparkMemoryDomains {
                 device: vec![item(Category::Workspace, "exl3_retained_capacity_arenas", arena, Basis::Exact),
-                    item(Category::Workspace, "expert_hidden", mul(&[live as u64, 5280])?, Basis::Formula),
-                    item(Category::Workspace, "expert_routes", mul(&[live as u64, 6, 8])?, Basis::Formula)],
-                pinned: vec![item(Category::Workspace, "expert_route_staging", mul(&[live as u64, 6, 8])?, Basis::Formula)],
+                    item(Category::Workspace, "expert_hidden", mul(&[live as u64,
+                        u64::from(geometry.hidden) + u64::from(geometry.hidden) / 32])?, Basis::Formula),
+                    item(Category::Workspace, "expert_routes", mul(&[live as u64, u64::from(geometry.topk), 8])?, Basis::Formula)],
+                pinned: vec![item(Category::Workspace, "expert_route_staging", mul(&[live as u64, u64::from(geometry.topk), 8])?, Basis::Formula)],
                 host: vec![] }, load })
     }
 }
@@ -807,12 +814,32 @@ mod tests {
                 "scratch":{"bytes":rows*100,"allocation":"scratch","dtype":"bf16","zero_on_create":false},
                 "alias":{"bytes":99999,"allocation":"scratch","dtype":"bf16","zero_on_create":false},
                 "state":{"bytes":0,"allocation":"state","dtype":"i32","zero_on_create":true}}})).collect();
-        let e = SparkExecutionInventory::exl3(&manifests,48,80,16,&[1,16,80],load()).unwrap();
+        let e = SparkExecutionInventory::exl3(&manifests, cuteafd_core::ExpertGeometry::DEEPSEEK_V41,48,80,16,&[1,16,80],load()).unwrap();
         assert_eq!(e.retained.device[0].bytes,8000 + 3*(32+16));
         assert_eq!(e.retained.device[1].bytes,16*5280);
-        assert!(SparkExecutionInventory::exl3(&manifests,47,80,16,&[1,16,80],load()).is_err());
-        assert!(SparkExecutionInventory::exl3(&manifests[2..],48,80,16,&[80],load()).is_err());
+        assert!(SparkExecutionInventory::exl3(&manifests, cuteafd_core::ExpertGeometry::DEEPSEEK_V41,47,80,16,&[1,16,80],load()).is_err());
+        assert!(SparkExecutionInventory::exl3(&manifests[2..], cuteafd_core::ExpertGeometry::DEEPSEEK_V41,48,80,16,&[80],load()).is_err());
     }
+    #[test]
+    fn exl3_geometry_is_attested_by_the_checkpoint_not_a_family_constant() {
+        for geometry in [cuteafd_core::ExpertGeometry::INKLING2, cuteafd_core::ExpertGeometry::GLM5,
+            cuteafd_core::ExpertGeometry::MIMO_V2_FLASH] {
+            let manifests: Vec<_> = [1u32,16,80].into_iter().map(|rows| json!({
+                "schema":"cuteafd.v41-exl3-aot.v1","output_dtype":"bf16","hidden":geometry.hidden,
+                "intermediate":128,"experts":geometry.experts,"top_k":geometry.topk,"sms":48,"capacity":rows,
+                "sparkinfer_revision":"test","input_format":"e4m3_k32","trellis_lut":{"bytes":32},
+                "buffers":{"scratch":{"bytes":rows*100,"allocation":"scratch","dtype":"bf16","zero_on_create":false}}})).collect();
+            let inventory = SparkExecutionInventory::exl3(&manifests, geometry,48,80,16,&[1,16,80],load()).unwrap();
+            assert_eq!(inventory.retained.device[1].bytes,16*(u64::from(geometry.hidden)+u64::from(geometry.hidden)/32));
+            assert_eq!(inventory.retained.device[2].bytes,16*u64::from(geometry.topk)*8);
+            for key in ["hidden", "experts", "top_k"] {
+                let mut wrong = manifests.clone();
+                wrong[0][key] = json!(1);
+                assert!(SparkExecutionInventory::exl3(&wrong,geometry,48,80,16,&[1,16,80],load()).is_err());
+            }
+        }
+    }
+
     #[test]
     fn runtime_requires_isolated_evidence_and_matching_package() {
         let e=execution(); let a=assignment();

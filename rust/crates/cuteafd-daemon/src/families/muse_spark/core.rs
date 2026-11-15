@@ -16,7 +16,7 @@ pub(crate) struct CorePrograms<'a> {
     projections: BTreeMap<(ProjectionKey, ProjectionOutput), Projection<'a>>,
     pub(crate) scratch: Option<ProjectionScratch<'a>>,
     native: NativePrograms<'a>,
-    native_head: Option<cuteafd_ffi::native_attention::Fp8Projections<'a>>,
+    native_head: Option<crate::shared::target_head::BlockFp8Head<'a>>,
 }
 
 struct NativePrograms<'a> {
@@ -58,9 +58,8 @@ impl<'a> NativePrograms<'a> {
         let fp8 = load_fp8(ProjectionOutput::Bf16, Output::Bf16)?;
         let fp8_f32 = load_fp8(ProjectionOutput::F32, Output::F32)?;
         if let Some(head) = &admitted.native_head {
-            let [n, k] = head.shape;
-            let registry = device.run(|| Ok(Fp8Projections::load(programs, &[(k, n)], 64, Output::F32)?))?;
-            required = required.max(registry.scratch_bytes(k, n)?);
+            let registry = device.run(|| crate::shared::target_head::BlockFp8Head::load(programs, head.shape))?;
+            required = required.max(registry.scratch_bytes()?);
         }
         ensure!(u64::try_from(required)? == admitted.native_programs.fp8_scratch_bytes,
             "Muse native scratch differs from exact admission");
@@ -103,30 +102,7 @@ fn dtype(output: ProjectionOutput) -> TrellisDType {
     match output { ProjectionOutput::Bf16 => TrellisDType::Bf16, ProjectionOutput::F32 => TrellisDType::F32 }
 }
 
-/// Visit exact BF16-input/F32-output row views before reusing the head scratch.
-pub(crate) fn head_chunks(rows: usize, input: Buffer, output: Buffer, k: usize, n: usize,
-    mut launch: impl FnMut(usize, Buffer, Buffer) -> Result<()>) -> Result<()> {
-    let extent = |width: usize, element: usize| -> Result<usize> {
-        rows.checked_mul(width).and_then(|v| v.checked_mul(element)).filter(|&v| v > 0)
-            .context("Muse head typed extent overflow or empty")
-    };
-    let (input_bytes, output_bytes) = (extent(k, 2)?, extent(n, 4)?);
-    ensure!(input.bytes >= input_bytes && output.bytes >= output_bytes,
-        "Muse head input/output exceeds admitted extent");
-    let start = input.ptr as usize;
-    let end = start.checked_add(input_bytes).context("Muse head input address overflow")?;
-    let out = output.ptr as usize;
-    let out_end = out.checked_add(output_bytes).context("Muse head output address overflow")?;
-    ensure!(start != 0 && out != 0 && (end <= out || out_end <= start), "Muse head input/output aliases or is null");
-    for first in (0..rows).step_by(cuteafd_loader::families::muse_spark::lane::HEAD_ROWS) {
-        let count = (rows - first).min(cuteafd_loader::families::muse_spark::lane::HEAD_ROWS);
-        let view = |buffer: Buffer, stride: usize| Buffer {
-            ptr: buffer.ptr.cast::<u8>().wrapping_add(first * stride).cast(), bytes: count * stride, ..buffer
-        };
-        launch(count, view(input, k * 2), view(output, n * 4))?;
-    }
-    Ok(())
-}
+pub(crate) use crate::shared::target_head::head_chunks;
 
 impl<'a> CorePrograms<'a> {
     /// Every admitted K6 and native projection program, bound without the lane
@@ -185,9 +161,7 @@ impl<'a> CorePrograms<'a> {
         native.scratch = if native_scratch == 0 { None }
             else { Some(Allocation::new(device, native_scratch, Tag::workspace("muse/core-scratch"))?) };
         let native_head = admitted.native_head.as_ref().map(|head| device.run(|| {
-            let [n, k] = head.shape;
-            Ok(cuteafd_ffi::native_attention::Fp8Projections::load(programs, &[(k, n)], 64,
-                cuteafd_ffi::draft_projection::ProjectionOutput::F32)?)
+            crate::shared::target_head::BlockFp8Head::load(programs, head.shape)
         })).transpose()?;
         Ok(Self { projections, scratch, exact_cap, native, native_head })
     }
@@ -203,13 +177,7 @@ impl<'a> CorePrograms<'a> {
         weight: &super::weights::NativeWeights<'_>, output: Buffer, stream: *mut c_void) -> Result<()> {
         let registry = self.native_head.as_ref().context("Muse FP8 head program absent")?;
         let scratch = self.native.scratch.as_ref().context("Muse FP8 head scratch absent")?.buffer;
-        let scales = weight.scales.as_ref().context("Muse FP8 head scales absent")?.buffer;
-        let [n, k] = weight.layout.shape;
-        head_chunks(rows, input, output, k, n, |count, x, y| {
-            // SAFETY: head chunks validate disjoint typed extents; rank retains all owners through the stream.
-            unsafe { registry.launch(x.ptr, weight.values.buffer.ptr, scales.ptr, y, scratch, count, k, n, stream)?; }
-            Ok(())
-        })
+        registry.launch(rows, input, weight, output, scratch, stream)
     }
 
     fn projection(&self, weights: &CoreWeights<'_>, output: ProjectionOutput) -> Result<&Projection<'a>> {

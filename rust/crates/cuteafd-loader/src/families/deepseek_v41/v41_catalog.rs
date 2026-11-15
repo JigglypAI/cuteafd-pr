@@ -919,6 +919,16 @@ pub(crate) fn expert_catalog_from_checkpoint(checkpoint: &crate::plan::Checkpoin
 
 fn read_expert_catalog_with_checkpoint(snapshot: &Path, config: &serde_json::Value,
     checkpoint: Option<&crate::plan::Checkpoint>) -> Result<OfficialV41Catalog> {
+    if config["model_type"] == "inkling2" {
+        let cfg = crate::families::inkling2::Inkling2Config::from_hf(config)?;
+        let shape = RoutedExpertShape { layers: cfg.layers, first_layer: 0,
+            experts: cfg.experts, topk: cfg.topk, hidden: cfg.hidden, intermediate: cfg.intermediate,
+            draft_stages: 0, draft_experts: 0 };
+        if config["quantization_config"]["quant_method"] == "exl3" {
+            return exl3_catalog_or_read(snapshot, shape, &[4, 5], checkpoint);
+        }
+        return fp8_catalog(snapshot, shape);
+    }
     if config["model_type"] == "minimax_m3_vl" {
         let cfg = crate::families::minimax_m3::config::MiniMaxM3Config::from_hf(config)?;
         let first_layer = cfg.moe.iter().position(|&moe| moe).context("MiniMax M3 has no routed layers")?;

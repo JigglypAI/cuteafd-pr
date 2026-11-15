@@ -282,12 +282,13 @@ GEOMETRIES = {
     'ml4': (6144, 6144, 128, 4),
     # Step-5: 352 experts, top-8, post-SiLU clamp at 7 (K4 experts, K6 tails 88-90).
     'step5': (4096, 1536, 352, 8),
+    'inkling2': (4608, 2304, 384, 8),
 }
 # SwiGLU clamp per geometry; None is the unclamped SwiGLU (b12x const-expr
 # elides the clamp). DeepSeek clamps at 10.
-SWIGLU_LIMITS = {'glm': None, 'qwen4': None, 'kimik3': None, 'step5': 7.0, 'muse': None, 'ml4': None}
+SWIGLU_LIMITS = {'glm': None, 'qwen4': None, 'kimik3': None, 'step5': 7.0, 'muse': None, 'ml4': None, 'inkling2': None}
 # Activation per geometry, mirroring cuteafd_core::ExpertGeometry::activation.
-ACTIVATIONS = {'kimik3': 'situ', 'step5': 'silu_post_clamp'}
+ACTIVATIONS = {'kimik3': 'situ', 'step5': 'silu_post_clamp', 'inkling2': 'situ'}
 
 
 def activation(geometry: str) -> str:

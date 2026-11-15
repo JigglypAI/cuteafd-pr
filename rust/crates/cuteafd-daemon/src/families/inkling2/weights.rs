@@ -16,11 +16,7 @@ pub(crate) struct TargetWeights<'a> {
 }
 
 pub(crate) fn execution_arena(layout: &CoordinatorWeights) -> Result<WeightArenaLayout> {
-    let mut tensors = layout.arena.views().iter().map(|(name, view)| (name.clone(), view.bytes())).collect::<Vec<_>>();
-    for &layer in &layout.layers {
-        tensors.push((format!("model.llm.layers.{layer}.attn.rel_logits_proj.padded"), 1024*64*2));
-    }
-    WeightArenaLayout::new(layout.arena.id(), tensors)
+    layout.execution_arena()
 }
 
 fn transpose_relative(source: &[u8]) -> Result<Vec<u8>> {
@@ -37,6 +33,8 @@ fn transpose_relative(source: &[u8]) -> Result<Vec<u8>> {
 
 impl<'a> TargetWeights<'a> {
     pub fn load(device: Device<'a>, checkpoint: &Checkpoint, layout: &CoordinatorWeights) -> Result<Self> {
+        ensure!(layout.core.is_empty(),
+            "Inkling compact core is planned; shared native trellis execution binds with the serving stage");
         ensure!(layout.rank == 0 && layout.arena.views().keys().all(|name| !name.contains('#')),
             "Inkling stage2 core mount requires whole coordinator operands");
         ensure!(!crate::shared::experts::rtx::dense::is_recording(),

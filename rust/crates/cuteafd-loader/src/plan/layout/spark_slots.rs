@@ -11,26 +11,29 @@ use crate::serving_capacity::Exl3Epilogue;
 /// MiMo/Step rows include their BF16-input siblings.
 const CENSUS_CAPACITIES: [u32; 8] = cuteafd_core::EXL3_CAPACITIES;
 
-fn group_scratch(family: &str, format: ExpertFormat, compiled: u32) -> anyhow::Result<u64> {
+fn group_scratch(family: &str, format: ExpertFormat, width: u32, compiled: u32) -> anyhow::Result<u64> {
     use std::sync::OnceLock;
-    static CENSUS: OnceLock<Vec<(String, String, Vec<u64>)>> = OnceLock::new();
+    static CENSUS: OnceLock<Vec<(String, String, Option<u32>, Vec<u64>)>> = OnceLock::new();
     let census = CENSUS.get_or_init(|| {
         let rows: Vec<serde_json::Value> = serde_json::from_str(include_str!("spark_slot_census.json"))
             .expect("bundled Spark slot census is valid JSON");
         rows.into_iter().map(|row| (row["family"].as_str().unwrap_or_default().to_owned(),
             row["format"].as_str().unwrap_or_default().to_owned(),
+            row["width"].as_u64().and_then(|width| width.try_into().ok()),
             row["scratch"].as_array().map(|values| values.iter().filter_map(serde_json::Value::as_u64).collect())
                 .unwrap_or_default())).collect()
     });
     let format_name = match format {
         ExpertFormat::Fp8Block128 => "fp8", ExpertFormat::Mxfp4 => "mxfp4",
-        ExpertFormat::Nvfp4 => "nvfp4", ExpertFormat::Bf16 => "bf16", _ => "",
+        ExpertFormat::Nvfp4 => "nvfp4", ExpertFormat::Bf16 => "bf16", ExpertFormat::Mxfp8 => "mxfp8",
     };
     let index = CENSUS_CAPACITIES.iter().position(|&rows| rows == compiled)
         .ok_or_else(|| anyhow::anyhow!("no Spark scratch census at export m{compiled}"))?;
-    census.iter().filter(|(f, k, _)| f == family && k == format_name)
+    let has_widths = census.iter().any(|(f, k, width, _)| f == family && k == format_name && width.is_some());
+    census.iter().filter(|(f, k, measured_width, _)| f == family && k == format_name
+            && (!has_widths || *measured_width == Some(width)))
         .filter_map(|(.., scratch)| scratch.get(index).copied()).max()
-        .ok_or_else(|| anyhow::anyhow!("no calibrated Spark slot scratch for {family}/{format:?}; add the package census or manifest-backed sizing (#776)"))
+        .ok_or_else(|| anyhow::anyhow!("no calibrated Spark slot scratch for {family}/{format:?} width{width}; add the package census or manifest-backed sizing (#776)"))
 }
 
 /// Stream-ordered device input/route/output planes of one owner at `rows`.
@@ -49,8 +52,13 @@ fn group_io_bytes(family: &str, format: ExpertFormat, geometry: cuteafd_core::Ex
 /// layers of one group do not.
 fn native_groups(input: &super::super::PlanInput, family: &str, working: &SparkWorkingSet, rank: usize)
     -> anyhow::Result<Option<(cuteafd_core::ExpertGeometry, Vec<(ExpertFormat, u32)>)>> {
+    native_catalog_groups(input.expert_catalog()?, family, working, rank)
+}
+
+fn native_catalog_groups(catalog: &crate::OfficialV41Catalog, family: &str,
+    working: &SparkWorkingSet, rank: usize)
+    -> anyhow::Result<Option<(cuteafd_core::ExpertGeometry, Vec<(ExpertFormat, u32)>)>> {
     if !working.selected_ranks().contains(&rank) { return Ok(None); }
-    let catalog = input.expert_catalog()?;
     let Some(tensors) = catalog.fp8() else { return Ok(None); };
     let shape = tensors.shape();
     let geometry = cuteafd_core::ExpertGeometry { hidden: u32::try_from(shape.hidden)?,
@@ -70,7 +78,8 @@ fn native_groups(input: &super::super::PlanInput, family: &str, working: &SparkW
             other => other,
         };
         let format_name = match format {
-            ExpertFormat::Nvfp4 => "nvfp4", ExpertFormat::Bf16 => "bf16", _ => "fp8",
+            ExpertFormat::Nvfp4 => "nvfp4", ExpertFormat::Bf16 => "bf16",
+            ExpertFormat::Mxfp8 => "mxfp8", _ => "fp8",
         };
         let recipe = super::super::experts::spark_recipe(&format!("{package_family}:{format_name}"),
             shape.intermediate, working.spark_ranks)?;
@@ -98,8 +107,11 @@ fn fp8_owner_bytes(family: &str, geometry: cuteafd_core::ExpertGeometry, formats
     let mut address_staging = 0;
     let hidden = u64::from(geometry.hidden);
     for &(format, width) in formats {
-        scratch = scratch.max(group_scratch(family, format, extent.compiled)?);
+        scratch = scratch.max(group_scratch(family, format, width, extent.compiled)?);
         io += group_io_bytes(family, format, geometry, extent.capacity);
+        // Inkling's NVFP4 is dynamic-amax, not the static NVFP4 row-addressed
+        // recipe. Its wave staging stays parked until a served card exists.
+        if family == "inkling2" { continue; }
         // Installed row-addressed recipes and their smallest member units.
         let (minimum, arithmetic) = match format {
             // Every installed form is retained; W8A16 is the largest stream arena.
@@ -123,6 +135,63 @@ fn fp8_owner_bytes(family: &str, geometry: cuteafd_core::ExpertGeometry, formats
     }
     Ok(cuteafd_core::OwnerBytes { scratch, io,
         pinned_staging: u64::from(extent.staging_rows) * u64::from(geometry.topk) * 8 * formats.len() as u64 + address_staging })
+}
+
+/// Catalog adapter for callers that already resolved immutable checkpoint
+/// selection. Uses exactly the shared group census and physical owner sum.
+pub(crate) fn native_catalog_owner_bytes(catalog: &crate::OfficialV41Catalog, family: &str,
+    working: &SparkWorkingSet, rank: usize, extent: cuteafd_core::OwnerExtent)
+    -> anyhow::Result<cuteafd_core::OwnerBytes> {
+    let Some((geometry, formats)) = native_catalog_groups(catalog, family, working, rank)?
+        else { return Ok(Default::default()) };
+    fp8_owner_bytes(family, geometry, &formats, extent)
+}
+
+/// Same catalog-owner dispatch for the EXL3 families. Missing recorded scratch
+/// is an explicit shared census error, never a family-local extrapolation.
+pub(crate) fn catalog_owner_bytes(catalog: &crate::OfficialV41Catalog, family: &str,
+    working: &SparkWorkingSet, rank: usize, extent: cuteafd_core::OwnerExtent)
+    -> anyhow::Result<cuteafd_core::OwnerBytes> {
+    if catalog.fp8().is_some() { return native_catalog_owner_bytes(catalog, family, working, rank, extent); }
+    let geometry = catalog.routed_experts().geometry()?;
+    static RECORDED: std::sync::OnceLock<Vec<serde_json::Value>> = std::sync::OnceLock::new();
+    let rows = RECORDED.get_or_init(|| serde_json::from_str(include_str!("spark_slot_census.json"))
+        .expect("bundled Spark owner census is valid JSON"));
+    if !rows.iter().any(|row| row["family"] == family && row["format"] == "exl3" && row["width"].is_number()) {
+        return exl3_owner_bytes(family, geometry, extent, None);
+    }
+    let mut widths = Vec::new();
+    for &layer in &working.spark_layers {
+        let residency = catalog.exl3_spark_residency(crate::V41Exl3Layer::Backbone(layer), working.spark_ranks, rank)?;
+        let key = (u32::try_from(residency.intermediate)?, residency.unit_map.is_some());
+        if !widths.contains(&key) { widths.push(key); }
+    }
+    anyhow::ensure!(widths.len() == 1, "EXL3 worker requires one retained width/ABI, found {widths:?}");
+    recorded_exl3_owner_bytes(rows, family, geometry, widths[0].0, widths[0].1, extent)
+}
+
+fn recorded_exl3_owner_bytes(rows: &[serde_json::Value], family: &str,
+    geometry: cuteafd_core::ExpertGeometry, width: u32, compact: bool, extent: cuteafd_core::OwnerExtent)
+    -> anyhow::Result<cuteafd_core::OwnerBytes> {
+    let row = rows.iter().find(|row| row["family"] == family && row["format"] == "exl3"
+        && row["width"].as_u64() == Some(u64::from(width))
+        && row["compact"].as_bool().unwrap_or(false) == compact)
+        .with_context(|| format!("no EXL3 owner census for {family} width{width} compact={compact}"))?;
+    let capacities = cuteafd_core::Exl3RowPolicy::for_geometry(geometry).capacities(extent.capacity as usize)?;
+    anyhow::ensure!(capacities.last() == Some(&extent.compiled), "EXL3 retained exports differ from owner extent");
+    let recorded = row["manifests"].as_array().context("EXL3 census manifests absent")?;
+    let manifests = capacities.iter().map(|&capacity| recorded.iter()
+        .find(|manifest| manifest["capacity"].as_u64() == Some(u64::from(capacity)))
+        .cloned().with_context(|| format!("EXL3 census lacks width{width}/m{capacity}")))
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    anyhow::ensure!(manifests.iter().all(|manifest| manifest["hidden"].as_u64() == Some(u64::from(geometry.hidden))
+        && manifest["experts"].as_u64() == Some(u64::from(geometry.experts))
+        && manifest["top_k"].as_u64() == Some(u64::from(geometry.topk))), "EXL3 census/checkpoint geometry mismatch");
+    let scratch = crate::serving_capacity::exl3_workspace_bytes(&manifests, true, Exl3Epilogue::Sum)?;
+    let io = u64::from(extent.capacity).checked_mul(u64::from(geometry.hidden) * 33 / 32
+        + u64::from(geometry.topk) * 8).context("EXL3 owner I/O overflow")?;
+    Ok(cuteafd_core::OwnerBytes { scratch, io,
+        pinned_staging: u64::from(extent.staging_rows) * u64::from(geometry.topk) * 8 })
 }
 
 /// One native NVFP4 owner on the shared FP8-family worker: the installed
@@ -389,6 +458,53 @@ mod tests {
     }
 
     #[test]
+    fn inkling_native_census_uses_exporter_bytes_and_shared_mixed_owner_sum() -> anyhow::Result<()> {
+        let geometry = cuteafd_core::ExpertGeometry::INKLING2;
+        for (format, scratch) in [(ExpertFormat::Mxfp8, 400_695_296), (ExpertFormat::Nvfp4, 780_804_096)] {
+            assert_eq!(group_scratch("inkling2", format, 1152, 4096)?, scratch);
+            let one = fp8_owner_bytes("inkling2", geometry, &[(format, 1152)], extent(2752, 4096))?;
+            assert_eq!(one.scratch, scratch);
+            let mut queued = extent(2752, 4096);
+            queued.buffered_units = 3;
+            assert_eq!(fp8_owner_bytes("inkling2", geometry, &[(format, 1152)], queued)?, one);
+        }
+        let both = fp8_owner_bytes("inkling2", geometry,
+            &[(ExpertFormat::Mxfp8, 1152), (ExpertFormat::Nvfp4, 1152)], extent(2752, 4096))?;
+        assert_eq!(both.scratch, 780_804_096);
+        assert_eq!(both.io, group_io_bytes("inkling2", ExpertFormat::Mxfp8, geometry, 2752)
+            + group_io_bytes("inkling2", ExpertFormat::Nvfp4, geometry, 2752));
+        assert_eq!(both.pinned_staging, 2752 * 8 * 8 * 2);
+        for format in [ExpertFormat::Mxfp8, ExpertFormat::Nvfp4] {
+            let narrow = group_scratch("inkling2", format, 256, 4096)?;
+            let wide = group_scratch("inkling2", format, 1152, 4096)?;
+            assert!(narrow < wide, "narrow owner must not borrow widest scratch");
+            assert!(group_scratch("inkling2", format, 320, 4096).is_err(),
+                "an unrecorded width cannot borrow a neighbour or a margin");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn recorded_exl3_widths_keep_aliases_and_private_capacity_owners_exact() -> anyhow::Result<()> {
+        let rows: Vec<serde_json::Value> = serde_json::from_str(include_str!("spark_slot_census.json"))?;
+        let geometry = cuteafd_core::ExpertGeometry::INKLING2;
+        for (width, expected) in [(256, 516_083_772), (384, 541_249_596), (512, 566_415_420),
+            (640, 591_581_244), (768, 616_747_068), (1152, 692_244_540), (2304, 918_736_956)] {
+            let owner = recorded_exl3_owner_bytes(&rows, "inkling2", geometry, width, false, extent(4096,4096))?;
+            assert_eq!(owner.scratch, expected);
+            assert_eq!(owner.io, 4096*(4608+144+64));
+        }
+        for (width, expected) in [(384, 541_249_596), (512, 566_415_420), (640, 591_581_244)] {
+            assert_eq!(recorded_exl3_owner_bytes(&rows, "inkling2", geometry, width, true,
+                extent(4096,4096))?.scratch, expected);
+        }
+        assert!(recorded_exl3_owner_bytes(&rows, "inkling2", geometry, 256, true, extent(4096,4096)).is_err(),
+            "same width's noncompact export is not compact ABI evidence");
+        assert!(recorded_exl3_owner_bytes(&rows, "inkling2", geometry, 320, false, extent(4096,4096)).is_err());
+        Ok(())
+    }
+
+    #[test]
     fn native_width_states_sum_scratch_but_share_io_and_route_staging() -> anyhow::Result<()> {
         use cuteafd_core::tp_units::native_spark_artifacts;
         for (geometry, coded) in [(cuteafd_core::ExpertGeometry::DEEPSEEK_V41, true),
@@ -433,7 +549,8 @@ mod tests {
             let family = row["family"].as_str().unwrap();
             let format = match row["format"].as_str().unwrap() {
                 "fp8" => ExpertFormat::Fp8Block128, "mxfp4" => ExpertFormat::Mxfp4,
-                "nvfp4" => ExpertFormat::Nvfp4, "bf16" => ExpertFormat::Bf16, _ => unreachable!(),
+                "nvfp4" => ExpertFormat::Nvfp4, "bf16" => ExpertFormat::Bf16,
+                "mxfp8" => ExpertFormat::Mxfp8, _ => unreachable!(),
             };
             let hidden = row["hidden"].as_u64().unwrap();
             let topk = row["topk"].as_u64().unwrap();
@@ -443,8 +560,13 @@ mod tests {
             for (index, compiled) in CENSUS_CAPACITIES.into_iter().enumerate() {
                 let rows = u64::from(compiled);
                 let exact = row["scratch"][index].as_u64().unwrap() + rows * (input + 8 * topk + 2 * hidden);
-                let owner = fp8_owner_bytes(family, geometry, &[(format, 128)], extent(compiled, compiled)).unwrap();
-                assert!(owner.scratch + owner.io >= exact, "{package} m{compiled}: planner < census {exact}");
+                let width = row["width"].as_u64().unwrap_or(128) as u32;
+                let owner = fp8_owner_bytes(family, geometry, &[(format, width)], extent(compiled, compiled)).unwrap();
+                if row["width"].is_number() {
+                    assert_eq!(owner.scratch + owner.io, exact, "{package} m{compiled}: width-qualified owner differs");
+                } else {
+                    assert!(owner.scratch + owner.io >= exact, "{package} m{compiled}: planner < census {exact}");
+                }
                 assert_eq!(owner.pinned_staging, rows * topk * 8, "each unit retains packed route planes");
             }
         }
@@ -557,7 +679,7 @@ mod tests {
         let partial = fp8_owner_bytes("glm5", geometry, &[(ExpertFormat::Nvfp4, 1024)], extent(2752, 4096)).unwrap();
         assert_eq!(partial.scratch, prefill.scratch);
         assert_eq!(prefill.io - partial.io, (4096 - 2752) * (4 * 6144 + 8 * 8));
-        assert!(group_scratch("glm5", ExpertFormat::Nvfp4, 64).is_err());
+        assert!(group_scratch("glm5", ExpertFormat::Nvfp4, 1024, 64).is_err());
     }
 
     #[test]
@@ -571,8 +693,8 @@ mod tests {
             let executions = admit_family("step5", &SparkBackend::Fp8.exports(), None, unit, waves)?;
             let prefill = executions.owners().last().unwrap();
             let actual = fp8_owner_bytes("step5", geometry, &formats, prefill)?;
-            assert_eq!(actual.scratch, group_scratch("step5", ExpertFormat::Fp8Block128, compiled)?
-                .max(group_scratch("step5", ExpertFormat::Bf16, compiled)?));
+            assert_eq!(actual.scratch, group_scratch("step5", ExpertFormat::Fp8Block128, 384, compiled)?
+                .max(group_scratch("step5", ExpertFormat::Bf16, 384, compiled)?));
             assert_eq!(actual.io, maximum.io / 4096 * unit);
             scratch.push(actual.scratch);
         }

@@ -18,8 +18,8 @@
 //! The tensor route pins one cuBLASLt algorithm/tile with split-K disabled at load;
 //! decode and verify must not choose different reductions based on row count.
 
-use anyhow::{bail, Result};
-use cuteafd_ffi::programs::VocabularyHead;
+use anyhow::{bail, ensure, Context, Result};
+use cuteafd_ffi::{programs::{Programs, VocabularyHead}, CuteafdDeviceBuffer as Buffer};
 use std::ffi::c_void;
 
 /// How target logits run through a BF16 head.
@@ -95,9 +95,132 @@ pub(crate) unsafe fn launch(mode: TargetHead, head: &VocabularyHead<'_>, x: *con
     }
 }
 
+/// Typed head row views, shared by target and drafter calls at the stored
+/// vocabulary width. Validate the complete batch before launching any chunk.
+pub(crate) fn head_chunks(rows: usize, input: Buffer, output: Buffer, k: usize, n: usize,
+    mut launch: impl FnMut(usize, Buffer, Buffer) -> Result<()>) -> Result<()> {
+    let extent = |width: usize, element: usize| -> Result<usize> {
+        rows.checked_mul(width).and_then(|v| v.checked_mul(element)).filter(|&v| v > 0)
+            .context("head typed extent overflow or empty")
+    };
+    let (input_bytes, output_bytes) = (extent(k, 2)?, extent(n, 4)?);
+    ensure!(input.bytes >= input_bytes && output.bytes >= output_bytes,
+        "head input/output exceeds admitted extent");
+    let start = input.ptr as usize;
+    let end = start.checked_add(input_bytes).context("head input address overflow")?;
+    let out = output.ptr as usize;
+    let out_end = out.checked_add(output_bytes).context("head output address overflow")?;
+    ensure!(start != 0 && out != 0 && (end <= out || out_end <= start), "head input/output aliases or is null");
+    for first in (0..rows).step_by(64) {
+        let count = (rows - first).min(64);
+        let view = |buffer: Buffer, stride: usize| Buffer {
+            ptr: buffer.ptr.cast::<u8>().wrapping_add(first * stride).cast(), bytes: count * stride, ..buffer
+        };
+        launch(count, view(input, k * 2), view(output, n * 4))?;
+    }
+    Ok(())
+}
+
+/// Allocation-free block-FP8 vocabulary projection. Families retain the same
+/// admitted weight arena and serialized scratch; crop/softcap remain outside.
+pub(crate) struct BlockFp8Head<'a> {
+    registry: cuteafd_ffi::native_attention::Fp8Projections<'a>,
+    shape: [usize; 2],
+}
+
+impl<'a> BlockFp8Head<'a> {
+    pub(crate) fn load(programs: &'a Programs<'a>, shape: [usize; 2]) -> Result<Self> {
+        let [n, k] = shape;
+        Ok(Self { registry: cuteafd_ffi::native_attention::Fp8Projections::load(programs,
+            &[(k,n)], 64, cuteafd_ffi::draft_projection::ProjectionOutput::F32)?, shape })
+    }
+
+    pub(crate) fn scratch_bytes(&self) -> Result<usize> {
+        Ok(self.registry.scratch_bytes(self.shape[1], self.shape[0])?)
+    }
+
+    pub(crate) fn launch(&self, rows: usize, input: Buffer,
+        weights: &crate::shared::native_attention::NativeAttentionWeights<'_>,
+        output: Buffer, scratch: Buffer, stream: *mut c_void) -> Result<()> {
+        use cuteafd_loader::formats::trellis_core::CoreSplit;
+        ensure!(weights.layout.shape == self.shape && weights.layout.fp8
+            && weights.layout.ranks == 1 && weights.layout.rank == 0
+            && weights.layout.split == CoreSplit::Whole,
+            "block FP8 head differs from bound whole-owner shape");
+        let scales = weights.scales.as_ref().context("block FP8 head scales absent")?.buffer;
+        ensure!([input.device_id, weights.values.buffer.device_id, scales.device_id, scratch.device_id]
+            .into_iter().all(|device| device == output.device_id)
+            && scratch.bytes >= self.scratch_bytes()?, "block FP8 head device/scratch differs from admission");
+        let [n, k] = self.shape;
+        head_chunks(rows, input, output, k, n, |count, x, y| {
+            // SAFETY: typed disjoint row views, admitted weights and serialized
+            // scratch remain live on this device until the caller drains stream.
+            unsafe { self.registry.launch(x.ptr, weights.values.buffer.ptr, scales.ptr,
+                y, scratch, count, k, n, stream)?; }
+            Ok(())
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "requires sealed SM120 native FP8 head exports"]
+    fn shared_block_fp8_head_matches_muse_legacy_launch_bytes() -> Result<()> {
+        use crate::shared::{memory::{DeviceAllocation, device::cache_test_device, TEST},
+            native_attention::NativeAttentionWeights};
+        use cuteafd_loader::formats::{native_attention::NativeLayout, trellis_core::CoreSplit};
+        // SAFETY: this explicit GPU test uses the slot's sealed native ABI.
+        let library = unsafe { cuteafd_ffi::NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
+        let device = cache_test_device(&library)?;
+        let programs = library.programs()?.with_manifest(std::path::Path::new(
+            &std::env::var("CUTEAFD_PROGRAM_MANIFEST")?))?;
+        let (n, k) = (202112usize, 8192usize);
+        let rows = 129usize;
+        let shared = BlockFp8Head::load(&programs, [n,k])?;
+        let legacy = cuteafd_ffi::native_attention::Fp8Projections::load(&programs, &[(k,n)], 64,
+            cuteafd_ffi::draft_projection::ProjectionOutput::F32)?;
+        let weights = NativeAttentionWeights {
+            layout: NativeLayout { stem:"lm_head".into(),shape:[n,k],fp8:true,rank:0,ranks:1,split:CoreSplit::Whole },
+            values: DeviceAllocation::new(&library,n*k,TEST)?,
+            scales: Some(DeviceAllocation::new(&library,n/128*(k/128)*4,TEST)?),
+        };
+        let input = DeviceAllocation::new(&library,rows*k*2,TEST)?;
+        let output = DeviceAllocation::new(&library,rows*n*4,TEST)?;
+        let expected = DeviceAllocation::new(&library,rows*n*4,TEST)?;
+        let scratch = DeviceAllocation::new(&library,shared.scratch_bytes()?,TEST)?;
+        let weight_bytes: Vec<u8> = (0..n*k).map(|i| [0x38u8,0xb8,0x30,0xb0][i%4]).collect();
+        let input_bytes: Vec<u8> = (0..rows*k).flat_map(|i| {
+            let value = ((i*17%97) as f32 - 48.) / 32.;
+            ((value.to_bits()>>16) as u16).to_le_bytes()
+        }).collect();
+        let scale_bytes: Vec<u8> = (0..n/128*(k/128)).flat_map(|i| (0.01f32+(i%7) as f32*0.001).to_le_bytes()).collect();
+        library.copy_h2d(weights.values.buffer,&weight_bytes)?;
+        library.copy_h2d(weights.scales.as_ref().unwrap().buffer,&scale_bytes)?;
+        library.copy_h2d(input.buffer,&input_bytes)?;
+        for rows in [1,16,63,64,65,80,128,129] {
+            // This is Muse's pre-extraction invocation: same m64 registry and
+            // whole stored-width chunks, before family-specific crop/softcap.
+            head_chunks(rows,input.buffer,expected.buffer,k,n,|count,x,y| {
+                // SAFETY: test owns disjoint buffers and drains before reading.
+                unsafe { legacy.launch(x.ptr,weights.values.buffer.ptr,
+                    weights.scales.as_ref().unwrap().buffer.ptr,y,scratch.buffer,count,k,n,std::ptr::null_mut())?; }
+                Ok(())
+            })?;
+            shared.launch(rows,input.buffer,&weights,output.buffer,scratch.buffer,std::ptr::null_mut())?;
+            // SAFETY: both launches use the current device's default stream.
+            unsafe { library.cuda_stream_synchronize(std::ptr::null_mut())?; }
+            let mut actual = vec![0u8;rows*n*4];
+            let mut reference = vec![0u8;rows*n*4];
+            library.copy_d2h(&mut actual,output.buffer)?;
+            library.copy_d2h(&mut reference,expected.buffer)?;
+            assert_eq!(actual,reference,"Muse shared head changed bytes at {rows} rows");
+        }
+        assert_eq!(device.id,output.buffer.device_id);
+        Ok(())
+    }
 
     /// Unset and `tensor` take tensor cores; `exact` never does; anything else is refused.
     #[test]
