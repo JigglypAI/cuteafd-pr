@@ -139,6 +139,8 @@ pub(crate) struct EpochStats {
     pub cycles: [u64; 2],
     pub completed: [u64; 2],
     pub selections: [u64; 2],
+    pub pending: [usize; 2],
+    pub lagged_chunks: usize,
     pub uncredited_nodes: u64,
     pub reuse_growth_bytes: u64,
 }
@@ -900,8 +902,8 @@ impl DeviceCache {
         self.refresh_cycles();
         if self.lanes.iter().any(|lane| lane.active) { return }
         for clock in self.clocks.iter() {
-            clock.completed.store(clock.index.load(Ordering::Acquire), Ordering::Release);
-            clock.index.fetch_add(1, Ordering::AcqRel);
+            let next = clock.index.fetch_add(1, Ordering::AcqRel) + 1;
+            clock.completed.store(next, Ordering::Release);
         }
         self.refresh_cycles();
     }
@@ -1113,7 +1115,7 @@ impl DeviceCache {
         self.pending_destroy += 1;
         // A selected executable can still be replayed by its owner before
         // retirement. Include every subsequently started cycle when destroying.
-        self.selected_epochs.insert(id, self.lanes.each_ref().map(|lane| if lane.active { lane.index } else { lane.completed }));
+        self.selected_epochs.insert(id, self.lanes.each_ref().map(|lane| lane.index));
         let lane = self.bank_lane(self.records[&id].identity.bank);
         self.epochs.selections[lane] += 1;
         self.pending_lanes[lane] += 1;
@@ -1370,6 +1372,7 @@ impl DeviceCache {
     /// Retain exact rejected identities outside ARC's evictable ghost lists.
     /// Captured commands did not run and no executable was instantiated.
     pub fn capture_too_small(&mut self, id: u64, nodes: usize) {
+        self.reuse_captures.remove(&id);
         let Some(record) = self.records.get_mut(&id) else { return };
         if record.permanently_eager { return }
         if record.pending_capture {
@@ -1412,6 +1415,7 @@ impl DeviceCache {
         let spans_devices = spans_devices || record.spans_devices;
         record.spans_devices = spans_devices;
         if width != 1 || spans_devices {
+            self.reuse_captures.remove(&id);
             // Previously reserved chain discounts are no longer justified,
             // including pending captures elsewhere on this device.
             self.pending_growth = self.pending_growth.max(self.pending_bytes);
@@ -1741,6 +1745,8 @@ impl DeviceCache {
 
     fn epoch_snapshot(&self) -> EpochStats {
         let mut epochs = self.epochs.clone();
+        epochs.pending = self.pending_lanes;
+        epochs.lagged_chunks = self.lagged.len();
         epochs.cycles = self.clocks.as_ref().each_ref().map(|clock| clock.index.load(Ordering::Acquire));
         epochs.completed = self.clocks.as_ref().each_ref().map(|clock| clock.completed.load(Ordering::Acquire));
         epochs
@@ -1998,6 +2004,49 @@ mod tests {
             assert_eq!(cache.epochs.uncredited_nodes, 0);
             assert_eq!(cache.charged, 100, "physical high-water never falls on destruction");
         }
+    }
+
+    #[test]
+    fn cycle_abandon_is_not_completion_and_cannot_release_peer_credit() -> anyhow::Result<()> {
+        let mut cache = epoch_fixture();
+        let mut cycles = LaneCycles { lane: 0, clocks: vec![cache.clocks.clone()] };
+        // SAFETY: no native work in this policy fixture.
+        unsafe { cycles.begin(|_| Ok(())) }?;
+        cycles.abandon();
+        let victim = cache.mark_victim(false).unwrap();
+        assert!(!cache.persistent_victim_ready(victim));
+        // An explicit completed serial boundary provides the missing proof.
+        cache.serial_boundary();
+        assert!(cache.persistent_victim_ready(victim));
+        cache.destroyed(&[victim], ReleaseMeasurement { released: 0 });
+        assert!(cache.lagged.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn cycle_peer_selected_after_abandon_waits_until_serial_drain() -> anyhow::Result<()> {
+        let mut cache = epoch_fixture();
+        cache.assign_bank_lane(1, 1);
+        let mut abandoned = LaneCycles { lane: 0, clocks: vec![cache.clocks.clone()] };
+        // SAFETY: synthetic policy clocks contain no native work.
+        unsafe { abandoned.begin(|_| Ok(())) }?;
+        abandoned.abandon();
+        cache.begin_lane(1);
+        let victim = cache.mark_victim(false).unwrap();
+        cache.complete_lane(1);
+        cache.begin_lane(1);
+        cache.destroyed(&[victim], ReleaseMeasurement { released: 0 });
+        assert_eq!(cache.epochs.uncredited_nodes, 10, "abandoned A frontier still blocks B's credit");
+        cache.complete_lane(1);
+        // Repeated failures cannot strand capacity beyond the next drained boundary.
+        for _ in 0..3 {
+            unsafe { abandoned.begin(|_| Ok(())) }?;
+            abandoned.abandon();
+        }
+        cache.serial_boundary();
+        assert_eq!(cache.epochs.uncredited_nodes, 0);
+        assert!(cache.lagged.is_empty());
+        Ok(())
     }
 
     #[test]

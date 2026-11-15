@@ -477,9 +477,9 @@ mod device_tests {
     fn cycle_handle_hit_only_round_never_visits_or_locks_banks_and_survives_reuse() -> anyhow::Result<()> {
         use super::super::device;
         let mut bank = GraphBank::<usize, usize>::new();
-        bank.attach_device_for_test(-321, 64 << 20, site())?;
+        bank.attach_device_for_test(-395, 64 << 20, site())?;
         let mut cycles = device::LaneCycles::register(0,
-            |visit| visit(-321, "bank-test", false, &mut bank))?;
+            |visit| visit(-395, "bank-test", false, &mut bank))?;
         let cache = bank.device.as_ref().unwrap().cache.clone();
         // Keeping the controller locked makes a mutex on the boundary deadlock;
         // the visitor must not run and must not allocate/rebuild an inventory.
@@ -499,7 +499,7 @@ mod device_tests {
             unsafe { cycles.begin(|_| panic!("reused bank lost its lane handle")) }?;
             cycles.complete();
         }
-        assert_eq!(device::snapshots().into_iter().find(|row| row.device == -321).unwrap().charged, 10);
+        assert_eq!(device::snapshots().into_iter().find(|row| row.device == -395).unwrap().charged, 10);
         Ok(())
     }
 
@@ -512,7 +512,7 @@ mod device_tests {
         let drops = [Rc::new(Cell::new(0)), Rc::new(Cell::new(0))];
         let mut banks = [GraphBank::new(), GraphBank::new()];
         for lane in 0..2 {
-            banks[lane].attach_device_for_test(-320, 64 << 20, site())?;
+            banks[lane].attach_device_for_test(-394, 64 << 20, site())?;
             banks[lane].cache_lane_owner(lane);
             let ticket = banks[lane].cache_ticket(&1, false, None).unwrap();
             banks[lane].cache_commit(1, Exec(drops[lane].clone()), ticket, 10, 1, false);
@@ -521,29 +521,29 @@ mod device_tests {
         let cache = banks[0].device.as_ref().unwrap().cache.clone();
         // SAFETY: fixture owners contain counters, not captured allocations.
         for lane in 0..2 { unsafe { device::lane_cycle(lane, true,
-            |visit| visit(-320, "bank-test", false, &mut banks[lane])) }?; }
+            |visit| visit(-394, "bank-test", false, &mut banks[lane])) }?; }
         let victim = cache.lock().unwrap().mark_victim(false).unwrap();
         let owner = banks.iter().position(|bank| bank.entries.values()
             .any(|entry| entry.cached.is_some_and(|(id, _)| id == victim))).unwrap();
         let peer = 1 - owner;
         // SAFETY: completed peer, allocation-free fixture.
         unsafe {
-            device::lane_cycle(peer, false, |visit| visit(-320, "bank-test", false, &mut banks[peer]))?;
-            device::lane_cycle(peer, true, |visit| visit(-320, "bank-test", false, &mut banks[peer]))?;
+            device::lane_cycle(peer, false, |visit| visit(-394, "bank-test", false, &mut banks[peer]))?;
+            device::lane_cycle(peer, true, |visit| visit(-394, "bank-test", false, &mut banks[peer]))?;
         }
         assert_eq!(drops[owner].get(), 0, "a peer cycle must not touch the owner's bank");
         // Even a mistaken all-bank visitor cannot destroy an in-flight owner.
         unsafe { banks[owner].evict_persistent(); }
         assert_eq!(drops[owner].get(), 0);
         unsafe {
-            device::lane_cycle(owner, false, |visit| visit(-320, "bank-test", false, &mut banks[owner]))?;
-            device::lane_cycle(owner, true, |visit| visit(-320, "bank-test", false, &mut banks[owner]))?;
+            device::lane_cycle(owner, false, |visit| visit(-394, "bank-test", false, &mut banks[owner]))?;
+            device::lane_cycle(owner, true, |visit| visit(-394, "bank-test", false, &mut banks[owner]))?;
         }
         assert_eq!(drops[owner].get(), 1);
         assert_eq!(drops[peer].get(), 0);
-        assert_eq!(device::snapshots().into_iter().find(|row| row.device == -320).unwrap().charged, 20);
+        assert_eq!(device::snapshots().into_iter().find(|row| row.device == -394).unwrap().charged, 20);
         for lane in 0..2 {
-            unsafe { device::lane_cycle(lane, false, |visit| visit(-320, "bank-test", false, &mut banks[lane]))?; }
+            unsafe { device::lane_cycle(lane, false, |visit| visit(-394, "bank-test", false, &mut banks[lane]))?; }
         }
         Ok(())
     }
