@@ -356,14 +356,21 @@ fn nvfp4_merged_waves_are_byte_identical_to_singleton_units() -> Result<()> {
     let library = unsafe { NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
     library.cuda_set_device(0)?;
     let directory = PathBuf::from(std::env::var("CUTEAFD_NVFP4_SEGMENT_PACKAGE")?);
+    // The process geometry is fixed before anything reads it: the family whose
+    // routed shape the package was exported for.
+    // SAFETY: static package metadata only; no CUDA state or allocation.
+    let metadata = unsafe { Fp8MoeMetadata::read(&directory) }?;
+    use cuteafd_core::ExpertGeometry as G;
+    let shape = [G::MINIMAX_M3, G::GLM5_FLASH, G::GLM5, G::QWEN4, G::STEP5, G::INKLING2].into_iter().find(|g| g.hidden as usize == metadata.info.hidden
+        && g.experts as usize == metadata.info.experts && g.topk as usize == metadata.info.topk
+        && g.intermediate as usize == metadata.info.intermediate).context("package shape is no known family")?;
+    cuteafd_core::set_expert_geometry(shape)
+        .map_err(|set| anyhow::anyhow!("process geometry already {set:?}; run this test alone"))?;
     // SAFETY: the selected native package targets the current CUDA device.
     let module = unsafe { Fp8MoeModule::load(&directory)? };
     let info = module.info().clone();
     ensure!(info.weights == Fp8MoeWeights::Nvfp4 && !info.wire_input && module.segment_recipe().is_some(),
         "merged-wave oracle requires a BF16-input NVFP4 package with a row-addressed program");
-    cuteafd_core::set_expert_geometry(cuteafd_core::ExpertGeometry { hidden: info.hidden as u32,
-        experts: info.experts as u32, topk: info.topk as u32, intermediate: info.intermediate as u32, layers: 1 })
-        .map_err(|_| anyhow::anyhow!("geometry already set in this process; run this test alone"))?;
     let (hidden, topk, experts) = (info.hidden, info.topk, info.experts);
     let divisor = info.scale_convention == cuteafd_ffi::fp8_moe::Fp8MoeScaleConvention::Divisor;
     let mut regions = Vec::new();
