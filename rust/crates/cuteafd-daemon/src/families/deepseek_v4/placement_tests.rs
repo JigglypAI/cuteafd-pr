@@ -163,7 +163,7 @@ fn runtime_with_host(shared: &Shared, case: &Case<'_>, layout: &MemoryLayout, tp
         max_context: case.context as usize, prefix: Some(&cli.prefix), expert_workspace: tp1_available.then_some(expert_workspace),
         tp2_workspace: if case.rtx == 2 { cuteafd_loader::serving_capacity::deepseek_v4_tp2_workspace(
             &catalog, Some(case.manifest), max_rows).ok().map(|b| [b; 2]) } else { None },
-        exchange_f32: case.exchange_f32, physical: Vec::new(), host_memory: (128 << 30, 128 << 30) };
+        exchange_f32: case.exchange_f32, physical: Vec::new(), host_memory: cuteafd_loader::plan::testing::SimulatedHost::raptor().host_ram };
     let facts = admission::inputs(&cli.engine, &inputs)?;
     let placement = admission::admit(&facts)?.placement;
     crate::shared::context::pool_context("deepseek_v4", facts.serving_context, usize::try_from(placement.pool_tokens)?)?;
@@ -958,7 +958,7 @@ fn runtime_measured(shared: &Shared, case: &Case<'_>, fixture: &Fixture) -> anyh
         max_context: case.context as usize, prefix: Some(&cli.prefix), expert_workspace: Some(expert_workspace),
         tp2_workspace: if case.rtx == 2 { cuteafd_loader::serving_capacity::deepseek_v4_tp2_workspace(
             &catalog, Some(case.manifest), max_rows).ok().map(|b| [b; 2]) } else { None },
-        exchange_f32: case.exchange_f32, physical: Vec::new(), host_memory: (128 << 30, 128 << 30) };
+        exchange_f32: case.exchange_f32, physical: Vec::new(), host_memory: cuteafd_loader::plan::testing::SimulatedHost::raptor().host_ram };
     let facts = admission::inputs(&cli.engine, &inputs)?;
     Ok(admission::admit(&facts)?.placement)
 }

@@ -311,7 +311,7 @@ fn v4_inputs(report: &PlanReport, input: &super::super::PlanInput, options: &Lay
     let expert_workspace = if catalog.exl3().is_some() { exl3_workspace.unwrap_or(160 * MIB * shape.prefill_rows / 4096) }
         else { crate::serving_capacity::deepseek_v4_native_workspace(routed.hidden as u64, routed.intermediate as u64,
             routed.experts as u64, routed.topk as u64, shape.prefill_rows.max(shape.decode_rows))? };
-    let host = options.host_memory.map(Ok).unwrap_or_else(crate::formats::mapped_preload::host_memory_before_process)?;
+    let host = super::recipe_host_memory(options)?;
     let id = if cfg.dim == 4096 { "dsv4f" } else { "dsv4p" };
     // Each coordinator GPU's CUDA context and selected-program code: the
     // baseline's `context_bytes` and the matching `loaded code` remainder,

@@ -830,7 +830,7 @@ mod tests {
         use cuteafd_loader::placement::{families::qwen3_5, planner};
         use cuteafd_core::memory_layout::{Basis, Category, Item};
         let budgets = qwen3_5::sampled_budgets(80 << 30, 96 << 30, None,
-            (128 << 30, 128 << 30))?;
+            cuteafd_loader::plan::testing::SimulatedHost::raptor().host_ram)?;
         let gpu = &budgets[0];
         assert_eq!(gpu.id, "rtx0");
         assert_eq!(gpu.locations, vec![planner::Location::coordinator(0)]);
@@ -902,7 +902,7 @@ mod tests {
                 prefill: Pin::Exact(PrefillShape { rows: 4096, waves: 1 }), operation: Operation::Serving,
                 resident_weight_limit: None, spark_reply_formats: Default::default() },
                 qwen3_5::forecast_budgets(cuteafd_loader::placement::ArchContext::for_device("sm_120", 96 << 30),
-                    96 << 30, 0, (128 << 30, 128 << 30))?,
+                    96 << 30, 0, cuteafd_loader::plan::testing::SimulatedHost::raptor().host_ram)?,
                 DenseFacts { graph_variant: "fixture".into(), graphs_enabled: true, cfg: &cfg, weights: &weights, target_arena: &target_arena, buffers: &buffers, slots: 4,
                     record_bytes: 4096, drafter: None,
                     blas_head: cuteafd_loader::placement::planner::serving::BlasHead::TensorLt, serving: None, host_prefix: owner, verify_check: false })?;

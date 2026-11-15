@@ -203,7 +203,7 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
             &encoder_hardware(true, &devices[..ranks], &sparks, options), 0, 0, 1));
     }
     if encoders.is_empty() { anyhow::bail!("requested bundled encoder has no executable device"); }
-    let host = options.host_memory.map(Ok).unwrap_or_else(crate::formats::mapped_preload::host_memory_before_process)?;
+    let host = super::recipe_host_memory(options)?;
     let host_facts = admission::HostFacts::prepare(&checkpoint.config,
         &checkpoint.tensors.iter().map(|tensor| &tensor.meta).collect::<Vec<_>>(),
         PrefillShape { rows, waves: slots as u64 }, ranks, spark_ranks, context, shape.concurrency,

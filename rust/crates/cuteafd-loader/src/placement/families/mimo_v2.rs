@@ -260,7 +260,7 @@ mod tests {
             budgets: admission::production_budgets(&vec![(96 << 30, 96 << 30); ranks],
                 &[0; 2][..ranks], vec![crate::placement::planner::Baseline::Forecast {
                     occupied: 0, source: "unit test".into(), assumed: false }; ranks],
-                (128 << 30, 128 << 30), 108 << 30, 6).unwrap(),
+                crate::plan::testing::SimulatedHost::raptor().host_ram, 108 << 30, 6).unwrap(),
         }
     }
 
@@ -650,7 +650,7 @@ mod tests {
         let mut prepared = input(&cfg, &spark, &no_spark, 1, context);
         prepared.budgets = admission::production_budgets(&[(1 << 30, 1 << 30)], &[0],
             vec![crate::placement::planner::Baseline::Forecast { occupied: 0,
-                source: "unit test".into(), assumed: false }], (128 << 30, 128 << 30),
+                source: "unit test".into(), assumed: false }], crate::plan::testing::SimulatedHost::raptor().host_ram,
             108 << 30, 6).unwrap();
         let prepared = prepared.prepare().unwrap();
         let request = admission::production_request(context, None, Onboard::Auto,

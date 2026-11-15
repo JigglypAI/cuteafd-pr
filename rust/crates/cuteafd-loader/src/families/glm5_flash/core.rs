@@ -580,7 +580,7 @@ mod tests {
             let targets = crate::families::glm5_flash::weight_layout::target_options(input.checkpoint(), &cfg,
                 &vec![crate::placement::LayerMode::HeadSplit; cfg.layers], gpus, representation, embedding, None)?;
             let mut draft_owners = crate::placement::families::glm5_flash::admission::ProcessOwners::new(
-                (128 << 30, 128 << 30), 0);
+                crate::plan::testing::SimulatedHost::raptor().host_ram, 0);
             draft_owners.draft(&draft, crate::plan::layout::LayoutOptions::default().glmf_draft_representation, gpus, false)?;
             let draft_home = layout.devices.iter().take(gpus).position(|device| device.items.iter().any(|item|
                 item.group == "allocation granularity" && item.format.starts_with("glm5_flash/draft/"))).unwrap();

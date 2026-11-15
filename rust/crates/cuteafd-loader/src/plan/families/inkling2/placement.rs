@@ -61,7 +61,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
             return empty(notes);
         }
     };
-    let host = match opts.host_memory.map(Ok).unwrap_or_else(crate::formats::mapped_preload::host_memory) {
+    let host = match crate::plan::layout::planner_host_memory(opts.host_memory, crate::plan::layout::HostMemorySample::Raw) {
         Ok(memory) => memory,
         Err(error) => {
             report.refuse_placement(format!("Inkling 2 host inventory refused: {error:#}"), "Provide a host memory sample.");

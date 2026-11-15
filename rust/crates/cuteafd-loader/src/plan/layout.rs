@@ -254,6 +254,9 @@ impl Default for LayoutOptions {
             host_cache_bytes: None,
             spark_reply_formats: cuteafd_core::spark_reply::requested(),
             media_cache_bytes: None,
+            #[cfg(test)]
+            host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram),
+            #[cfg(not(test))]
             host_memory: None,
             inventory: false,
             rtx_bytes: vec![crate::placement::inventory::PRO_TOTAL_BYTES],
@@ -678,6 +681,23 @@ fn resolved_context(policy: ContextPolicy, requested: u64, checkpoint: u64, mani
 #[cfg(test)]
 mod draft_prefix_tests {
     use super::*;
+
+    #[test]
+    fn planner_host_defaults_and_sample_modes_use_the_same_fixture() {
+        let fixture = crate::plan::testing::SimulatedHost::raptor();
+        let options = LayoutOptions::default();
+        assert_eq!(options.host_memory, Some(fixture.host_ram));
+        assert_eq!(recipe_host_memory(&options).unwrap(), fixture.host_ram);
+        assert_eq!(planner_host_memory(options.host_memory, HostMemorySample::Raw).unwrap(), fixture.host_ram);
+        let customized = crate::plan::testing::SimulatedHost { host_ram: (20 << 30, 15 << 30), ..fixture };
+        assert_eq!(recipe_host_memory(&customized.layout()).unwrap(), customized.host_ram);
+    }
+
+    #[test]
+    #[should_panic(expected = "planner tests must inject LayoutOptions.host_memory")]
+    fn planner_host_missing_fixture_never_falls_back_to_live_ram() {
+        let _ = planner_host_memory(None, HostMemorySample::Raw);
+    }
 
     #[test]
     fn shared_shape_preserves_admitted_span_instead_of_unit_width() -> anyhow::Result<()> {
@@ -1595,20 +1615,30 @@ pub(crate) fn engram_row_bytes(checkpoint: &super::Checkpoint) -> anyhow::Result
     Ok(bytes)
 }
 
-/// Host capacity for a whole-process recipe: the caller's sample, or one read
-/// before this process claims memory. Inventory-only plans synthesize their
-/// options, so tests take the same 128 GiB convention every planner fixture
-/// injects instead of live memory, keeping repeated plans identical.
-pub(crate) fn recipe_host_memory(options: &LayoutOptions) -> anyhow::Result<(u64, u64)> {
-    match options.host_memory {
+#[derive(Clone, Copy)]
+pub(crate) enum HostMemorySample { Raw, BeforeProcess }
+
+/// One planner probe boundary. Keep legacy raw samples distinct from recipes
+/// charging the whole process envelope; harmonizing that policy is #2178.
+pub(crate) fn planner_host_memory(memory: Option<(u64, u64)>, sample: HostMemorySample) -> anyhow::Result<(u64, u64)> {
+    let _ = sample;
+    match memory {
         Some(memory) => Ok(memory),
         None => {
             #[cfg(test)]
-            { Ok(crate::plan::testing::SimulatedHost::raptor().host_ram) }
+            panic!("planner tests must inject LayoutOptions.host_memory");
             #[cfg(not(test))]
-            { crate::formats::mapped_preload::host_memory_before_process() }
+            match sample {
+                HostMemorySample::Raw => crate::formats::mapped_preload::host_memory(),
+                HostMemorySample::BeforeProcess => crate::formats::mapped_preload::host_memory_before_process(),
+            }
         }
     }
+}
+
+/// Host capacity for a recipe that charges its whole-process envelope.
+pub(crate) fn recipe_host_memory(options: &LayoutOptions) -> anyhow::Result<(u64, u64)> {
+    planner_host_memory(options.host_memory, HostMemorySample::BeforeProcess)
 }
 
 /// Coordinator host Spark transport: registered rings, egress request slots
@@ -1640,15 +1670,7 @@ pub(crate) fn charge_host(report: &mut PlanReport, options: &LayoutOptions, inpu
     use cuteafd_core::memory_layout::{HostLayout, ItemLifetime, host_logits_bytes};
     let Some(spec) = report.spec.as_ref() else { return Ok(()) };
     let family = report.family.as_deref().unwrap_or("");
-    let (total, available) = match options.host_memory {
-        Some(memory) => memory,
-        None => {
-            #[cfg(test)]
-            panic!("planner tests must inject LayoutOptions.host_memory");
-            #[cfg(not(test))]
-            crate::formats::mapped_preload::host_memory()?
-        }
-    };
+    let (total, available) = planner_host_memory(options.host_memory, HostMemorySample::Raw)?;
     // Native plans keep only coordinator devices in their memory layout.
     let ranks = report.spark_ranks;
     let rows = report.prefill_span_rows.unwrap_or(options.prefill_rows.max(4096));

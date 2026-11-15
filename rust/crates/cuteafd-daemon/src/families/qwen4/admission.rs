@@ -1039,7 +1039,7 @@ mod tests {
                 pending_code_bytes: [0; 2], mark_slots: 0, max_context: 131072, requested_pool: None,
                 spark_ranks: 0, onboard: Onboard::Auto,
                 host: super::host_owners_with_memory(&args, &cfg, 4, mtp, 2, 0, false, None,
-                    host_embedding, Vec::new(), (128 << 30, 128 << 30))?, encoders: Default::default() })?;
+                    host_embedding, Vec::new(), cuteafd_loader::plan::testing::SimulatedHost::raptor().host_ram)?, encoders: Default::default() })?;
             assert_eq!(runtime.pool_tokens, if capacities.iter().any(|&bytes| bytes <= 32 << 30) { 1 << 20 } else { 2 << 20 });
             assert_eq!(runtime.pool_tokens, layout.pool_tokens);
             assert_eq!(runtime.tp2.unwrap().layers, 4);

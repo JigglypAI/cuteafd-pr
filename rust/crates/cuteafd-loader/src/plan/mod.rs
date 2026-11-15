@@ -1300,8 +1300,12 @@ fn plan_unrestricted(input: &PlanInput, options: &PlanOptions) -> Result<PlanRep
     report.unclassified = census.unclassified.clone();
     let ReportCensus { mapped_names, scales, scale_bytes, table_bytes, .. } = *census;
     let host_budget = if scales == 0 && table_bytes == 0 { 0 } else {
-        options.mapped_scale_host_budget_bytes.unwrap_or_else(||
-            crate::formats::mapped_preload::host_budget_bytes().unwrap_or(0))
+        options.mapped_scale_host_budget_bytes.unwrap_or_else(|| {
+            let defaults = layout::LayoutOptions::default();
+            layout::planner_host_memory(options.layout.as_ref().unwrap_or(&defaults).host_memory,
+                layout::HostMemorySample::Raw)
+                .map_or(0, |(total, available)| available.saturating_sub(total / 10))
+        })
     };
     report.mapped_placement = crate::formats::mapped_preload::MappedPlacement::resolve(
         mapped_names, scales, scale_bytes, options.mapped_scale_preload_bytes, host_budget)

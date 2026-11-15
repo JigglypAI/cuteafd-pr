@@ -3238,7 +3238,7 @@ fn v4_contract_owns_exact_host_tier_and_refuses_host_shortfall() {
     let options = |host: (u64, u64), cache: Option<u64>| PlanOptions { layout: Some(layout::LayoutOptions {
         host_memory: Some(host), host_cache_bytes: cache, pool_tokens: Some(32768), ..Default::default() }),
         ..sparks(4) };
-    let planned = plan(dir.path(), &options((128 << 30, 128 << 30), Some(0))).unwrap();
+    let planned = plan(dir.path(), &options(crate::plan::testing::SimulatedHost::raptor().host_ram, Some(0))).unwrap();
     assert!(planned.placement_supported, "{}", render(&planned));
     // The contract declares the host tier; no generic estimate runs beside it.
     assert!(planned.host_ledger.is_none());
@@ -3256,7 +3256,7 @@ fn v4_contract_owns_exact_host_tier_and_refuses_host_shortfall() {
         device.items.iter().all(|item| item.group != "Spark egress")));
     // A retained prefix quota is a host owner resolved before admission.
     let quota = 4 << 30;
-    let prefixed = plan(dir.path(), &options((128 << 30, 128 << 30), Some(quota))).unwrap();
+    let prefixed = plan(dir.path(), &options(crate::plan::testing::SimulatedHost::raptor().host_ram, Some(quota))).unwrap();
     assert!(prefixed.placement_supported, "{}", render(&prefixed));
     assert_eq!(prefixed.host_budget_bytes, quota);
     let ready = owned(prefixed.phase_ledger.as_ref().unwrap(), Phase::Ready);

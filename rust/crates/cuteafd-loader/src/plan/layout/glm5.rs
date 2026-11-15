@@ -454,7 +454,7 @@ fn production_serving(options: &LayoutOptions, checkpoint: &Checkpoint, cfg: &Gl
                 else { GlmDraftRepresentation::Fp8Only }, GlmDraftCapacity::new(slots, sequences, draft.block)?,
                 sms, 0, options.draft_kv_cache)?
         };
-    let host = options.host_memory.map(Ok).unwrap_or_else(crate::formats::mapped_preload::host_memory_before_process)?;
+    let host = super::recipe_host_memory(options)?;
     let cache = if let Some(ml4) = cfg.variant.ml4() {
         crate::serving_capacity::mistral_large4_cache_geometry(ml4, 1)?
     } else { crate::serving_capacity::glm_cache_geometry(cfg, cfg.layers, 1)? };
@@ -580,7 +580,7 @@ fn placement(report: &PlanReport, input: &crate::plan::PlanInput, options: &Layo
         if checkpoint.spark_input_is_bf16() { cuteafd_core::SparkIngress::Bf16 } else { cuteafd_core::SparkIngress::Fp8K32 },
         cuteafd_core::SparkRings { max_frame_bytes: 64 << 20, depth: 8, slot_bytes: 8 << 20, alignment: 4096 },
         options.spark_reply_formats)?;
-    let host = options.host_memory.map(Ok).unwrap_or_else(crate::formats::mapped_preload::host_memory_before_process)?;
+    let host = super::recipe_host_memory(options)?;
     let budgets = production_budgets(&options.rtx_bytes[..gpus].iter().map(|&n| (n, n)).collect::<Vec<_>>(),
         crate::placement::reserve::gpu("glm5"), host, (8 << 30).max(host.0 / 10), &vec![options.spark_bytes; spark_ranks])?;
     let request = production_request(crate::placement::planner::Context::resolve(context, (options.context_tokens > 0).then_some(options.context_tokens)), options.pool_tokens, onboard, prefill, operation,
@@ -723,7 +723,7 @@ pub(crate) fn native_layout_with_metadata(checkpoint: &Checkpoint, options: &Lay
         depth: 8, slot_bytes: 8 << 20, alignment: 4096 };
     let (decode_link, prefill_link) = production_links(&cfg, spark_ranks, prefill,
         cuteafd_core::SparkIngress::Fp8K32, rings, options.spark_reply_formats)?;
-    let host = options.host_memory.map(Ok).unwrap_or_else(crate::formats::mapped_preload::host_memory_before_process)?;
+    let host = super::recipe_host_memory(options)?;
     let budgets = production_budgets(&options.rtx_bytes.iter().map(|&n| (n, n)).collect::<Vec<_>>(),
         crate::placement::reserve::gpu("glm5"), host, (8 << 30).max(host.0 / 10), &vec![options.spark_bytes; spark_ranks])?;
     let operation = Operation::Serving;
