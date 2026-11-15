@@ -226,7 +226,7 @@ impl Bench {
         for attempt in 0..60 {
             if self.info.lock().is_ok_and(|i| i.is_some()) { return; }
             if let Some(base) = crate::context::loopback() {
-                let mut client = Client::new(&base, None, Arc::new(AtomicBool::new(false))).with_api_key(self.api_key.get().cloned());
+                let mut client = Client::new(&base, None, Arc::new(AtomicBool::new(false))).with_local_probes().with_api_key(self.api_key.get().cloned());
                 match client.discover() {
                     Ok(_) => { self.server_info(&client.model); return; }
                     Err(error) => last = Some(error),
@@ -493,7 +493,7 @@ impl Bench {
             }
         }
         let _release = Release(self.clone(), active.id.clone());
-        let mut client = Client::new(&base, Some(active.token), active.cancel).with_api_key(self.api_key.get().cloned());
+        let mut client = Client::new(&base, Some(active.token), active.cancel).with_local_probes().with_api_key(self.api_key.get().cloned());
         client.discover()?;
         let model = client.model.clone();
         let mut value = if let Some(fixture) = fixture {
@@ -647,7 +647,7 @@ impl Bench {
         plan: &[PlannedPanel], skip_baseline: bool, lossless_set: Option<&panels::lossless::CaseSet>,
         lossless_dump: Option<&panels::lossless::RowDump>, context_load: &panels::context_load::Options, fabric: bool)
         -> anyhow::Result<()> {
-        let mut client = Client::new(base, Some(active.token.clone()), active.cancel.clone()).with_api_key(self.api_key.get().cloned()).with_fabric(fabric);
+        let mut client = Client::new(base, Some(active.token.clone()), active.cancel.clone()).with_local_probes().with_api_key(self.api_key.get().cloned()).with_fabric(fabric);
         let record = client.discover()?;
         let max_context = record["max_context_tokens"].as_u64().unwrap_or(8192);
         let max_output = record["max_output_tokens"].as_u64().unwrap_or(4096);
@@ -844,7 +844,7 @@ impl Bench {
 
     /// Once a second while a run is active: progress, ETA, the live strip, partial results.
     fn tick(&self, report: &Arc<Mutex<Report>>, progress: &Progress, done: &AtomicBool, base: &str, fabric: bool) {
-        let stats_client = Client::new(base, None, Arc::new(AtomicBool::new(false))).with_api_key(self.api_key.get().cloned()).with_fabric(fabric);
+        let stats_client = Client::new(base, None, Arc::new(AtomicBool::new(false))).with_local_probes().with_api_key(self.api_key.get().cloned()).with_fabric(fabric);
         let mut last: Option<(Instant, f64)> = None;
         let mut revision = u64::MAX;
         let mut fabric_before = None;

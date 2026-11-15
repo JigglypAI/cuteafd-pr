@@ -457,7 +457,7 @@ mod tests {
 
     fn run_fake(set: &CaseSet, dump: Option<(&RowDump, &std::path::Path)>) -> (Value, Vec<ProbeSpec>) {
         let (base, engine) = fake_engine(set.cases.len() * 2);
-        let mut client = crate::client::Client::new(&base, None, std::sync::Arc::new(Default::default()));
+        let mut client = crate::client::Client::new(&base, None, std::sync::Arc::new(Default::default())).with_local_probes();
         client.model = "fake".into();
         let mut info = ServerInfo::default();
         info.configuration.speculator = Some("dflash".into());
