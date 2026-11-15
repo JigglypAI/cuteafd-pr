@@ -57,7 +57,7 @@ def finished(tmp_path, monkeypatch):
     for ordinal in range(1,4):
         filename=f"model-{ordinal:05d}-of-00003.safetensors"
         name=f"layer-{ordinal}.native"
-        receipt=commit_safetensors(export/filename,{name:torch.ones(1,dtype=torch.bfloat16)})
+        receipt=commit_safetensors(export/filename,{name:torch.ones(1,dtype=torch.bfloat16)}, hash_algorithm="sha256")
         receipt.update(identity=identity,filename=filename,payload_bytes=2,tensors=1)
         if ordinal!=3:receipt["layer"]=ordinal-1
         rp=export/(f"layer-{ordinal-1:03d}-receipt.json" if ordinal!=3 else "extras-receipt.json")

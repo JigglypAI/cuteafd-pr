@@ -39,7 +39,7 @@ from safetensors.torch import load_file
 from kimi_k3.prepare_corpus import load_token_records
 from kimi_k3.uniform_k2.storage import (
     RollingBoundary, assemble_shard, atomic_json, canonical, commit_safetensors,
-    file_identity, fsync_directory, read_header, sha256_file, verify_receipt,
+    file_identity, fsync_directory, read_header, scratch_receipt, sha256_file, verify_receipt,
 )
 from gptqmodel.utils.kimi_k3 import KimiK3Source, prepare_moe, situ
 from gptqmodel.exllamav3.modules.quant.exl3_lib.quantize import quantize_exl3, reconstruct_exl3_tensors
@@ -291,9 +291,8 @@ def capture_layer(block, boundary, current, records, directory, progress, identi
             mapping._mmap.close()
             path = directory / names[key]
             with path.open("rb") as file:
-                checksum = hashlib.file_digest(file, "sha256").hexdigest()
                 os.fsync(file.fileno())
-            files[names[key]] = dict(sha256=checksum, file_identity=file_identity(path))
+            files[names[key]] = scratch_receipt(path)
         maps.clear()
         fsync_directory(directory)
         manifest = dict(identity=identity, layer=block.layer_idx, tokens=tokens, batches=batches, files=files)

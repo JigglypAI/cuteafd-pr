@@ -12,7 +12,7 @@ from safetensors.torch import load_file
 
 from kimi_k3.core_k6.storage import StageStore
 from kimi_k3.uniform_k2.storage import (atomic_json, commit_safetensors, file_identity,
-    fsync_directory, sha256_file, verify_receipt)
+    fsync_directory, scratch_receipt, verify_receipt)
 
 
 def load_tensors(path, device="cuda:0"):
@@ -181,7 +181,7 @@ class RouteSpool:
                 path=root/name
                 with path.open("rb") as f:
                     os.fsync(f.fileno())
-                files[name]=dict(sha256=sha256_file(path),file_identity=file_identity(path))
+                files[name]=scratch_receipt(path)
             fsync_directory(root)
             atomic_json(root/"manifest.json",dict(identity=identity,tokens=tokens,width=width,experts=experts,files=files))
         finally:

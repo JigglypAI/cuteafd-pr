@@ -20,7 +20,7 @@ from safetensors.torch import load_file
 REPO = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(REPO / 'quantization'))
 from kimi_k3.uniform_k2.storage import (atomic_json, canonical, read_header,
-    sha256_file, verify_receipt)
+    checksum_fields, checksum_identity, sha256_file, verify_receipt)
 from . import numerical
 
 SCHEMA = 'cuteafd-muse-native-reference-origin-v1'
@@ -102,8 +102,14 @@ def _source_receipt(root, relative, old_identity, tokens):
     if (set(tensors) != {'hidden'} or tensors['hidden']['dtype'] != 'BF16'
             or tensors['hidden']['shape'] != [1, tokens, NATIVE_WIDTH]):
         raise ValueError('old reference is not a native BF16 hidden-state bank')
-    return dict(relative=relative, sha256=receipt['sha256'], file_identity=receipt['file_identity'],
+    return dict(relative=relative, **checksum_fields(receipt), file_identity=receipt['file_identity'],
         receipt_sha256=sha256_file(receipt_path), tokens=tokens)
+
+
+def _teacher_checksum(entry):
+    if 'sha256' in entry:
+        return dict(teacher_sha256=entry['sha256'])
+    return dict(teacher_checksum=checksum_identity(entry))
 
 
 def native_origin(oldroot, current_identity, repo=REPO):
@@ -250,7 +256,7 @@ def _check_completed(pilot, source, records, root, identity, oldroot, origin, la
         _equal_native(fresh['hidden'], expected)
         proof = checks[index]
         if (proof != dict(index=index, split=split, id=row['id'], tokens=len(row['input_ids']),
-                teacher_relative=relative, teacher_sha256=entry['sha256'],
+                teacher_relative=relative, **_teacher_checksum(entry),
                 teacher_receipt_sha256=entry['receipt_sha256'], byte_exact=True,
                 tensor_sha256=hashlib.sha256(_bytes(expected).numpy().tobytes()).hexdigest())):
             raise ValueError('fresh native output comparison provenance differs')
@@ -331,7 +337,7 @@ def capture_from_native(source, records, newroot, newidentity, oldroot):
                         expected, entry = _teacher(oldroot, origin, output_relative)
                         _equal_native(output, expected)
                         proof = dict(index=index, split=split, id=row['id'], tokens=len(row['input_ids']),
-                            teacher_relative=output_relative, teacher_sha256=entry['sha256'],
+                            teacher_relative=output_relative, **_teacher_checksum(entry),
                             teacher_receipt_sha256=entry['receipt_sha256'], byte_exact=True,
                             tensor_sha256=hashlib.sha256(_bytes(output).numpy().tobytes()).hexdigest())
                         checks.append(proof)

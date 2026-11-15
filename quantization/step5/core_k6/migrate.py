@@ -28,7 +28,7 @@ if __package__ in (None, ""):
     __package__ = "step5.core_k6"
 
 from kimi_k3.uniform_k2.storage import (
-    atomic_json, canonical, file_identity, fsync_directory, read_header, sha256_file, verify_receipt,
+    atomic_json, canonical, checksum_fields, file_identity, fsync_directory, read_header, sha256_file, verify_receipt,
 )
 
 OLD_ROOT_COMMIT = "39df3b71e"
@@ -60,7 +60,7 @@ def checked_file(path, receipt=None):
         raise ValueError("missing or unsafe migration object: " + str(path))
     if receipt is not None:
         verify_receipt(path, receipt, checksum=True)
-        return dict(sha256=receipt["sha256"],file_identity=file_identity(path))
+        return dict(checksum_fields(receipt), file_identity=file_identity(path))
     return dict(sha256=sha256_file(path), file_identity=file_identity(path))
 
 
@@ -74,7 +74,7 @@ class Objects:
             self.files[str(path)] = checked_file(path, receipt)
         elif receipt is not None:
             recorded = self.files[str(path)]
-            if recorded != {key:receipt[key] for key in ("sha256", "file_identity")}:
+            if recorded != dict(checksum_fields(receipt), file_identity=receipt["file_identity"]):
                 raise ValueError("inconsistent receipts for the same migration object")
         return self.files[str(path)]
 

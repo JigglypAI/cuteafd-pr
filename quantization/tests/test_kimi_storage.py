@@ -48,7 +48,7 @@ class KimiStorageTest(unittest.TestCase):
             self.assertEqual(restarted.current(), initial)
             restarted.retire_old()
             self.assertEqual(old_path.read_bytes(), old_bytes)
-            self.assertTrue((boundary.directory(0) / "batch-000.safetensors.partial").exists())
+            self.assertEqual(list(boundary.directory(0).iterdir()), [])
             # An aborted write is retried without replacing the committed bank.
             batch = self.make_batch(restarted, 0, 2)
             restarted.commit(0, [batch])

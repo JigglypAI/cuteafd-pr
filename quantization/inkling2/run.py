@@ -19,9 +19,8 @@ import time
 import numpy as np
 import torch
 import torch.nn.functional as F
-from safetensors.torch import load_file
 
-from kimi_k3.uniform_k2.storage import atomic_json, canonical, commit_safetensors, verify_receipt, file_identity
+from kimi_k3.uniform_k2.storage import atomic_json, canonical, file_identity
 from kimi_k3.core_k6.storage import StageStore
 from glm5.core_k6.storage import ProjectionStore
 from . import numerical, recipe
@@ -114,30 +113,16 @@ def raw(acc):
 
 
 def save_stage(store, name, tensors, metadata=None):
-    prior = store.load(name)
-    if prior is not None:
-        return prior
-    directory = store.directory(name)
-    directory.mkdir(parents=True, exist_ok=True)
-    # A phase has no numerical standing before its complete manifest. Rewrite
-    # only these task-owned batch leaves, never a committed successor.
-    for path in directory.iterdir():
-        if path.is_symlink() or not path.is_file() or not (path.name.endswith('.safetensors')
-                or path.name.endswith('.safetensors.partial')) or not path.name[:5].isdigit():
-            raise ValueError('unexpected uncommitted phase leaf: ' + path.name)
-        path.unlink()
-    entries = []
-    for index, values in tensors:
-        if any(not bool(torch.isfinite(v).all()) for v in values.values()):
-            raise ValueError('nonfinite successor activation; do not reuse partial phase')
-        filename = f'{index:05d}.safetensors'
-        receipt = commit_safetensors(directory/filename, values)
-        entries.append(dict(filename=filename, **receipt))
-    return store.commit(name, entries, metadata)
+    def checked():
+        for index, values in tensors:
+            if any(not bool(torch.isfinite(v).all()) for v in values.values()):
+                raise ValueError('nonfinite successor activation; do not reuse partial phase')
+            yield index, values
+    return store.write_batches(name, checked(), metadata)
 
 
 def load_entry(store, name, index, device):
-    return {k: v.to(device) for k, v in load_file(str(store.directory(name)/f'{index:05d}.safetensors')).items()}
+    return store.read_batch(name, index, device=device)
 
 
 def state_tensors(state):

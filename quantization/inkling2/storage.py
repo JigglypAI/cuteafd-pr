@@ -12,7 +12,7 @@ import torch
 from glm5.core_k6.storage import ProjectionStore, load_tensors
 from kimi_k3.core_k6.storage import StageStore
 from kimi_k3.uniform_k2.storage import (atomic_json, file_identity,
-    fsync_directory, sha256_file, verify_receipt)
+    fsync_directory, scratch_receipt, verify_receipt)
 
 ROUTE_SCHEMA = "inkling2-route-spool-v1"
 STATE_SCHEMA = "inkling2-attnres-state-v1"
@@ -162,7 +162,7 @@ class RouteSpool:
             for name, _ in _FILES.values():
                 with (root / name).open("rb") as stream:
                     os.fsync(stream.fileno())
-                files[name] = dict(sha256=sha256_file(root / name), file_identity=file_identity(root / name))
+                files[name] = scratch_receipt(root / name)
             fsync_directory(root)
             atomic_json(root / "manifest.json", dict(schema=ROUTE_SCHEMA, identity=identity, layer=layer,
                 tokens=tokens, width=width, experts=experts, minimum=minimum,
