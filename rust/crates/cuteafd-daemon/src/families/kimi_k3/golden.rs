@@ -392,7 +392,7 @@ fn compare(actual: &[f32], expected: &[f32]) -> Result<(f64, f64)> {
     Ok((ab / (aa.sqrt() * bb.sqrt()), (dd / bb).sqrt()))
 }
 
-fn hosted_layers(value: &str) -> Result<Vec<usize>> {
+pub(super) fn hosted_layers(value: &str) -> Result<Vec<usize>> {
     if value.is_empty() { return Ok(vec![]); }
     value.split(',').map(|s| s.parse::<usize>().context("Kimi hosted layer ID")).collect()
 }
