@@ -17,7 +17,7 @@ from inkling2.export import DirectMCWriter
 REVISION = '1' * 40
 
 
-def completed_export(tmp_path):
+def completed_export(tmp_path, *, attributes=True):
     args, entries, final = export_fixture(tmp_path)
     assets = tmp_path / 'assets'
     assets.mkdir()
@@ -25,7 +25,8 @@ def completed_export(tmp_path):
     (assets / '.gitattributes').write_text('*.safetensors filter=lfs diff=lfs merge=lfs -text\n')
     writer = DirectMCWriter(**args)
     writer.write_group('layer-000', **entries)
-    writer.finalize(**final, assets={n: assets / n for n in ('README.md', '.gitattributes')})
+    writer.finalize(**final, assets={n: assets / n for n in
+        (('README.md', '.gitattributes') if attributes else ('README.md',))})
     return args['output']
 
 
@@ -48,9 +49,19 @@ class Hub:
                 lfs=SimpleNamespace(sha256=v['sha256']) if n.endswith('.safetensors') else None)
                 for n, v in self.remote.items()])
 
+    def _prepare_upload_folder_additions(self, folder_path, path_in_repo='', **kwargs):
+        from huggingface_hub import CommitOperationAdd
+        return [CommitOperationAdd(name, Path(folder_path) / name)
+                for name in kwargs['allow_patterns']]
+
     def upload_folder(self, **kwargs):
         self.uploads += 1
         assert set(kwargs['allow_patterns']) == set(self.files)
+        for operation in self._prepare_upload_folder_additions(
+                kwargs['folder_path'], allow_patterns=kwargs['allow_patterns']):
+            assert operation.upload_info.is_hashed
+            assert operation.upload_info.sha256.hex() == self.files[operation.path_in_repo]['sha256']
+            assert operation._is_uploaded is False
         assert 'delete_patterns' not in kwargs
         assert 'parent_repo' not in kwargs
         self.revision = REVISION
@@ -85,6 +96,90 @@ def test_publication_uses_streaming_receipts_and_metadata_only(tmp_path, monkeyp
     shutil.rmtree(output)
     assert publish.publish(output, root, api=api, anonymous_api=api) == receipt
     assert api.uploads == 1
+
+
+def test_publish_supplies_missing_protocol_metadata_without_rewriting_sealed_package(tmp_path, monkeypatch):
+    # Match Runner.seal: it supplies README/tokenizer assets, not .gitattributes.
+    output = completed_export(tmp_path, attributes=False)
+    sealed = {name: (output / name).read_bytes() for name in
+              ('package-state.json', 'package-validation.json', 'package-provenance.json')}
+    assert '.gitattributes' not in publish.load(output / 'package-state.json')['new_files']
+    real_open = Path.open
+
+    def no_weight_reads(path, *args, **kwargs):
+        if str(path).endswith('.safetensors'):
+            pytest.fail('publication metadata recovery reread weights')
+        return real_open(path, *args, **kwargs)
+
+    class PreparedHub(Hub):
+        def upload_folder(self, **kwargs):
+            self.files = publish.publication_inventory(output)['files']
+            return super().upload_folder(**kwargs)
+
+    monkeypatch.setattr(Path, 'open', no_weight_reads)
+    api, root = PreparedHub({}), tmp_path / 'publication'
+    saved = publish.publish(output, root, api=api, anonymous_api=api)
+    assert saved['status'] == 'passed'
+    assert (output / '.gitattributes').read_bytes() == publish.LFS_ATTRIBUTES
+    assert all((output / name).read_bytes() == raw for name, raw in sealed.items())
+    assert publish.load(root / 'publication-metadata.json')['role'] == 'publication-only-protocol-metadata'
+    before = file_identity(output / '.gitattributes')
+    publish.prepare_publication_metadata(output, root)
+    assert file_identity(output / '.gitattributes') == before
+    assert not list(output.glob('.gitattributes.*.tmp'))
+
+
+@pytest.mark.parametrize('kind', ['conflict', 'symlink'])
+def test_unsealed_publication_attributes_are_never_overwritten(tmp_path, kind):
+    output = completed_export(tmp_path, attributes=False)
+    path = output / '.gitattributes'
+    if kind == 'conflict':
+        path.write_bytes(b'foreign rules\n')
+    else:
+        path.symlink_to(output / 'README.md')
+    with pytest.raises(ValueError, match='attributes|symlink'):
+        publish.prepare_publication_metadata(output, tmp_path / 'publication')
+    assert path.is_symlink() if kind == 'symlink' else path.read_bytes() == b'foreign rules\n'
+
+
+def test_native_folder_pipeline_gets_known_sha_and_restores_client_builder(tmp_path, monkeypatch):
+    from huggingface_hub import HfApi
+    import huggingface_hub._upload_pipeline as pipeline
+    import huggingface_hub.lfs as lfs
+    output = completed_export(tmp_path)
+    files = publish.publication_inventory(output)['files']
+    api = HfApi(token=False)
+    monkeypatch.setattr(api, '_validate_yaml', lambda *a, **kw: None)
+    monkeypatch.setattr(api, '_prepare_folder_deletions', lambda **kw: [])
+
+    def no_extra_hash(*args, **kwargs):
+        pytest.fail('SDK attempted an extra payload SHA pass')
+
+    monkeypatch.setattr(lfs, 'sha_fileobj', no_extra_hash)
+
+    def native(client, **kwargs):
+        assert client is api and not kwargs['delete_operations']
+        operations = kwargs['add_operations']
+        assert {op.path_in_repo for op in operations} == set(files)
+        for op in operations:
+            assert op.upload_info.is_hashed
+            assert op.upload_info.sha256.hex() == files[op.path_in_repo]['sha256']
+            assert op._is_uploaded is False
+        return 'native-pipeline'
+
+    monkeypatch.setattr(pipeline, 'pipelined_upload', native)
+    arguments = dict(repo_id=publish.TARGET_REPO, repo_type='model', folder_path=str(output),
+                     allow_patterns=sorted(files))
+    assert publish._upload_with_writer_hashes(api, arguments, files) == 'native-pipeline'
+    assert '_prepare_upload_folder_additions' not in vars(api)
+
+    def interrupted(client, **kwargs):
+        raise OSError('native transfer interrupted')
+
+    monkeypatch.setattr(pipeline, 'pipelined_upload', interrupted)
+    with pytest.raises(OSError, match='interrupted'):
+        publish._upload_with_writer_hashes(api, arguments, files)
+    assert '_prepare_upload_folder_additions' not in vars(api)
 
 
 def test_partial_native_upload_resumes_exact_allowlist(tmp_path):
@@ -122,6 +217,31 @@ def test_remote_metadata_mismatch_fails(tmp_path, change):
         api.remote[shard][change] = 1 if change == 'bytes' else '0' * 64
     with pytest.raises(ValueError, match='Hub file'):
         publish.verify_hub(api, REVISION, files)
+
+
+def test_normalized_hub_metadata_download_stays_in_task_cache(tmp_path, monkeypatch):
+    import huggingface_hub
+    output = completed_export(tmp_path)
+    files = publish.publication_inventory(output)['files']
+    api, root = Hub(files), tmp_path / 'publication'
+    shard = next(name for name in files if name.endswith('.safetensors'))
+    api.normalized = (output / '.gitattributes').read_bytes() + (
+        shard + ' filter=lfs diff=lfs merge=lfs -text\n').encode()
+    downloads = []
+
+    def download(repo, name, **kwargs):
+        assert repo == publish.TARGET_REPO and name == '.gitattributes'
+        assert kwargs['revision'] == REVISION
+        assert kwargs['local_dir'] == root / 'hub-metadata'
+        downloads.append(name)
+        path = kwargs['local_dir'] / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(api.normalized)
+        return str(path)
+
+    monkeypatch.setattr(huggingface_hub, 'hf_hub_download', download)
+    assert publish.publish(output, root, api=api, anonymous_api=api)['status'] == 'passed'
+    assert downloads == ['.gitattributes']
 
 
 def test_only_literal_appended_hub_attributes_are_accepted(tmp_path):
@@ -225,7 +345,9 @@ class Nest:
                 steps[0]['copies'].append(dict(name='main', path=str(handoff.NAMESPACE / handoff.MODEL / 'refs/main'),
                     group=str(handoff.NAMESPACE / handoff.MODEL / 'refs'), size=len(REVISION)))
             goal = dict(goal='offgrid' if offgrid else 'place', selector='hf:' + publish.TARGET_REPO,
-                hub=str(handoff.NAMESPACE), hosts=[] if offgrid else list(handoff.TARGETS), factor=1 / 8, by_speed=False)
+                hub=str(handoff.NAMESPACE), hosts=[] if offgrid else
+                [args[i + 1] for i, value in enumerate(args) if value == '--host'],
+                factor=1 / 8, by_speed=False)
             self.plans[number] = dict(id=number, feasible=True, blocked=[], goal=goal, steps=steps)
             return self.plans[number]
         if args[0] == 'ls':
@@ -261,6 +383,20 @@ def test_hardlink_import_native_spread_resume_and_guarded_retirement(tmp_path):
     assert Path(published['source_snapshot']).exists() and managed.exists()
     assert (root / 'publication-complete.json').exists()
     assert handoff.retire(root, inspect=lambda paths: None)['paths'] == []
+
+
+@pytest.mark.parametrize('replacement', ['raptor', 'raptor:d1', 'kakapo', 'raptor:d3'])
+def test_native_goal_disk_aliases_do_not_allow_other_targets(tmp_path, replacement):
+    _, _, _, published = storage_fixture(tmp_path)
+    nest = Nest(published)
+    arguments = ('plan', '--place', 'hf:' + publish.TARGET_REPO, '--factor', '1/8',
+                 *(value for host in handoff.TARGET_ARGS for value in ('--host', host)))
+    plan = nest(*arguments)
+    assert plan['goal']['hosts'] == list(handoff.TARGET_ARGS)
+    assert handoff.check_plan(plan, REVISION, published['files']) == plan
+    plan['goal']['hosts'][0] = replacement
+    with pytest.raises(ValueError, match='authorized even eight-place spread'):
+        handoff.check_plan(plan, REVISION, published['files'])
 
 
 @pytest.mark.parametrize('failure', ['unfinished', 'failed', 'count', 'not-terminal'])
@@ -309,6 +445,121 @@ def test_cleanup_rejects_busy_or_unrelated_payloads(tmp_path):
     with pytest.raises(RuntimeError, match='process uses'):
         handoff.retire(root, inspect=busy)
     assert stage.exists() and Path(published['output']).exists()
+    assert not (root / 'retired-receipts').exists()
+
+
+@pytest.mark.parametrize('argv,comm,expected', [
+    ([b'sshd-session: tj@notty', b''], 'sshd-session', True),
+    ([b'sshd-session: tj@pts/5', b'', b''], 'sshd-session', True),
+    ([b'sshd-session: tj@pts/8  ', b''], 'sshd-session', True),
+    ([b'sshd-session: tj@pts/5 command', b''], 'sshd-session', False),
+    ([b'sshd-session: tj@pts/5', b'command'], 'sshd-session', False),
+    ([b'sshd-session: tj@pts/5', b''], 'python', False),
+    ([b'sshd-session: other@pts/5', b''], 'sshd-session', False),
+    ([b'sshd-session: tj@pts/x', b''], 'sshd-session', False),
+    ([b'python', b''], 'python', False),
+])
+def test_unreadable_ssh_infrastructure_is_exact(argv, comm, expected):
+    assert handoff._known_unreadable_process(argv, comm) is expected
+
+
+def test_cleanup_retains_receipts_before_removing_any_payload(tmp_path, monkeypatch):
+    root, stage, managed, published = storage_fixture(tmp_path)
+    handoff.handoff(root, stage, call=Nest(published), managed=managed)
+    output = Path(published['output'])
+    packed = root / 'production/packed'
+    packed.mkdir(parents=True)
+    activation = root / 'production/activations'
+    (activation / 'layer-000').mkdir(parents=True)
+    taps = root / 'production/target-taps'
+    (taps / 'layer-000').mkdir(parents=True)
+    build = tmp_path / '.cache/cuteafd/builds/inkling2-test'
+    (build / 'release-staging').mkdir(parents=True)
+    monkeypatch.setattr(Path, 'home', classmethod(lambda cls: tmp_path))
+    kept = {
+        'output/package-state.json': output / 'package-state.json',
+        'output/events.jsonl': output / 'events.jsonl',
+        'stage/.inkling2-owned-stage.json': stage / '.inkling2-owned-stage.json',
+        'intermediates/production/packed/projection-000.json': packed / 'projection-000.json',
+        'intermediates/production/activations/layer-000/manifest.json': activation / 'layer-000/manifest.json',
+        'intermediates/production/target-taps/layer-000/manifest.json': taps / 'layer-000/manifest.json',
+        'build/release-staging/build.log': build / 'release-staging/build.log',
+        'build/release-staging/errors.csv': build / 'release-staging/errors.csv',
+    }
+    for name, source in kept.items():
+        if not source.exists():
+            source.write_text(name)
+    original = {name: source.stat().st_ino for name, source in kept.items()}
+    (activation / 'layer-000/payload.safetensors').write_bytes(b'payload')
+    error_csv = root / 'per-module-errors.csv'
+    error_csv.write_text('preserve original')
+    real_rmtree = handoff.shutil.rmtree
+    archive = root / 'retired-receipts'
+
+    def checked_remove(path):
+        assert all((archive / name).stat().st_ino == inode for name, inode in original.items())
+        return real_rmtree(path)
+
+    def no_payload_open(path, *args, **kwargs):
+        if path.suffix == '.safetensors':
+            pytest.fail('cleanup opened payload bytes')
+        return real_open(path, *args, **kwargs)
+
+    real_open = Path.open
+    monkeypatch.setattr(Path, 'open', no_payload_open)
+    monkeypatch.setattr(handoff.shutil, 'rmtree', checked_remove)
+    inspected = []
+    result = handoff.retire(root, intermediates=[packed, activation, taps], build_root=build,
+                            inspect=lambda paths: inspected.extend(paths))
+    assert result['retained_metadata_files'] == len(kept)
+    assert set(inspected) == {output, stage, packed, activation, taps, build / 'release-staging'}
+    assert all(not path.exists() for path in inspected)
+    assert error_csv.read_text() == 'preserve original'
+    assert not list(archive.rglob('*.safetensors'))
+    assert publish.load(archive / '.inkling2-owned-archive.json')['identity'] == result['identity']
+    assert handoff.retire(root, inspect=lambda _: None)['paths'] == []
+
+
+@pytest.mark.parametrize('conflict', ['file', 'symlink', 'ownership'])
+def test_cleanup_archive_retry_and_conflicts_preserve_payloads(tmp_path, monkeypatch, conflict):
+    root, stage, managed, published = storage_fixture(tmp_path)
+    complete = handoff.handoff(root, stage, call=Nest(published), managed=managed)
+    output = Path(published['output'])
+    archive = root / 'retired-receipts'
+    real_link = handoff.os.link
+    calls = []
+
+    def interrupted(source, target):
+        calls.append(target)
+        if len(calls) == 2:
+            raise OSError('archive interrupted')
+        return real_link(source, target)
+
+    monkeypatch.setattr(handoff.os, 'link', interrupted)
+    with pytest.raises(OSError, match='archive interrupted'):
+        handoff.retire(root, inspect=lambda _: None)
+    assert output.exists() and stage.exists()
+    target = archive / 'output/package-state.json'
+    assert target.samefile(output / 'package-state.json')
+    monkeypatch.setattr(handoff.os, 'link', real_link)
+    if conflict == 'ownership':
+        atomic_json(archive / '.inkling2-owned-archive.json', dict(identity={'wrong': True}))
+    else:
+        target.unlink()
+        if conflict == 'file':
+            target.write_text('foreign')
+        else:
+            target.symlink_to(output / 'package-state.json')
+    with pytest.raises(ValueError, match='archive|symlink'):
+        handoff.retire(root, inspect=lambda _: None)
+    assert output.exists() and stage.exists()
+    if conflict == 'ownership':
+        atomic_json(archive / '.inkling2-owned-archive.json',
+            dict(schema='cuteafd-inkling2-retired-receipts-v1', identity=complete['identity']))
+    else:
+        target.unlink()
+        real_link(output / 'package-state.json', target)
+    assert handoff.retire(root, inspect=lambda _: None)['status'] == 'passed'
 
 
 def test_staging_rejects_symlink_and_existing_unowned_leaf(tmp_path):
