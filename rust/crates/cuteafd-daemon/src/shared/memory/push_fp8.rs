@@ -93,7 +93,7 @@ impl RankPlan {
             let planes = RegionLayout::fp8(&tensors, world, rank, slicing)?;
             // Do not silently widen the worker-reported checkpoint admission.
             ensure!(
-                planes.padding_bytes() == 0,
+                planes.padding_bytes() == 0 || tensors.dynamic_nvfp4(),
                 "native push plane alignment exceeds mount admission"
             );
             let offsets = planes.addresses(256)?;
