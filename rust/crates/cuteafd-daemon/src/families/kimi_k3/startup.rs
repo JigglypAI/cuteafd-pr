@@ -41,7 +41,6 @@ impl Role {
     }
 
     fn validate(self, cfg: &KimiK3Config, peers: usize, draft: bool) -> Result<()> {
-        cfg.validate_attention_role(matches!(self, Self::Golden { .. }))?;
         if self.skip_routed_experts() {
             ensure!(peers == 0 && !draft, "Kimi --skip-routed-experts golden requires zero Spark peers and no drafter");
         } else {
@@ -139,6 +138,8 @@ pub(crate) fn load<'a, const RANKS: usize>(library: &'a Arc<cuteafd_ffi::NativeL
     ensure!(spark_ranks <= cuteafd_core::MAX_SPARK_WORLD, "Kimi Spark peer inventory exceeds eight");
     let core = cuteafd_loader::plan::families::kimi::core_inventory(checkpoint)?;
     core.validate_runtime_groups(full)?;
+    ensure!(options.role != Role::Serve || core.serving_qualified(full),
+        "Kimi K3.1 serving is qualified for BF16 original and native K6 cores only; K8/FP8 remain Planned (#1777)");
     let graph_core = cuteafd_loader::serving_capacity::kimi_prewarm::KimiCoreFormat::from_inventory(&core);
     if RANKS == 2 {
         ensure!(crate::shared::peer_split::probed_device(library, options.devices[0], Some(options.devices[1]))?
@@ -534,7 +535,7 @@ mod tests {
             assert!(skipped.validate(&cfg, 0, true).is_err());
             assert!(Role::Serve.validate(&cfg, 0, false).is_err());
             assert!(Role::Golden { skip_routed_experts: false }.validate(&cfg, 0, false).is_err());
-            assert_eq!(Role::Serve.validate(&cfg, 6, false).is_ok(), cfg.dsa.is_none());
+            Role::Serve.validate(&cfg, 6, false)?;
         }
         Ok(())
     }

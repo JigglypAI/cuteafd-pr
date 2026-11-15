@@ -255,18 +255,6 @@ impl KimiK3Config {
         Ok(())
     }
 
-    /// Serving and planning remain closed until the sparse golden is qualified.
-    pub fn validate_attention_runtime(&self) -> Result<()> {
-        self.validate_attention_role(false)
-    }
-
-    /// Explicit golden entry point; never selected from checkpoint metadata.
-    pub fn validate_attention_role(&self, golden: bool) -> Result<()> {
-        ensure!(golden || self.dsa.is_none(),
-            "Kimi K3.1 Gated DSA serving is unqualified; use the explicit golden diagnostic (#1777)");
-        Ok(())
-    }
-
     /// Layers that open a new attention-residual block (their input becomes a
     /// stored candidate). Layer 0's block is the embedding.
     pub fn block_starts(&self) -> impl Iterator<Item = usize> + '_ {
@@ -316,7 +304,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn k31_schedule_indexer_and_fail_closed_execution() -> Result<()> {
+    fn k31_schedule_indexer_and_independent_speculation_guard() -> Result<()> {
         let cfg = KimiK3Config::from_hf(&k31_config())?;
         cfg.release_geometry()?;
         assert_eq!(cfg.family_id(), "kimi_k3");
@@ -326,12 +314,8 @@ pub(crate) mod tests {
         assert_eq!(index.key_heads, 1);
         assert_eq!(index.key_cache_bytes(64, 2)?, 16384);
         assert_eq!(index.selection_bytes(16)?, 16 * 2048 * 4);
-        assert!(cfg.validate_attention_runtime().unwrap_err().to_string().contains("Gated DSA"));
-        cfg.validate_attention_role(true)?;
-        assert!(cfg.validate_attention_role(false).is_err());
         cfg.validate_speculation(false)?;
         assert!(cfg.validate_speculation(true).is_err());
-        KimiK3Config::from_hf(&release_config())?.validate_attention_runtime()?;
         for (key,value) in [("index_rope_dim",json!(64)),("index_k_norm_type",json!("rmsnorm")),
             ("index_topk_freq",json!(2)),("index_skip_topk_offset",json!(0)),("dsa_layers",json!([4]))] {
             let mut config = k31_config();
@@ -344,7 +328,6 @@ pub(crate) mod tests {
     #[test]
     fn k31_drafter_compatibility_is_independent_of_target_serving_qualification() -> Result<()> {
         let target = KimiK3Config::from_hf(&k31_config())?;
-        target.validate_attention_role(true)?;
         target.validate_speculation(false)?;
         let error = target.validate_speculation(true).unwrap_err().to_string();
         assert!(error.contains("hidden-state compatibility is unqualified"), "{error}");

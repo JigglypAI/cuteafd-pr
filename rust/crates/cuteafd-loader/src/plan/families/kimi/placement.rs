@@ -40,14 +40,12 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
     let rows = prefill.span_rows as usize;
     let unit = prefill.unit_rows as usize;
     let cfg = model.cfg();
-    if cfg.dsa.is_some() {
+    if !model.core.serving_qualified(cfg) {
         report.runtime = Some(crate::plan::RuntimeStatus::Planned);
         if !report.hints.iter().any(|h| h.what.contains("Kimi K3.1 serving remains gated")) {
             report.hints.push(crate::plan::Hint {
-                what: if !model.core.projections.is_empty() || !model.core.native.is_empty() {
-                    "Kimi K3.1 serving remains gated pending full-model qualification; K6/K8 core views unqualified on K3.1 (#1777)".into()
-                } else { "Kimi K3.1 serving remains gated pending full-model qualification (#1777)".into() },
-                how: "Placement and memory accounting are computed above; run kimi-golden in Stage 1 and unlock serve-kimi in Stage 4.".into(),
+                what: "Kimi K3.1 K8/FP8 core serving remains Planned: fidelity is unmeasured (#1777)".into(),
+                how: "Use CORE_VIEW=original (BF16) or k6-compact, or the native standalone Core-K6 checkpoint.".into(),
             });
         }
     }
