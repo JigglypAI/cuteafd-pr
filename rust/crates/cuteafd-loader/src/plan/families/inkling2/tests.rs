@@ -204,6 +204,52 @@ fn installed_local_native_owners_use_shared_workspace_requests_once() -> anyhow:
 }
 
 #[test]
+fn spark_charges_match_shared_group_arenas_and_typed_owner_census() -> anyhow::Result<()> {
+    use crate::families::inkling2::{admission::spark_charges, experts::layer_experts};
+    use crate::placement::{SparkAssignment, SparkResidentLayout, SparkWorkingSet};
+    use crate::placement::families::inkling2::{self as shared, SparkCharge};
+    use crate::placement::planner::PrefillShape;
+    for kind in [Fixture::Mxfp8, Fixture::Mixed] {
+        let (dir, config, _) = fixture(kind);
+        let checkpoint = Checkpoint::open(dir.path())?;
+        let cfg = Inkling2Config::from_hf(&config)?;
+        let catalog = crate::read_expert_catalog(dir.path())?;
+        let layers = (0..cfg.layers).collect::<Vec<_>>();
+        let experts = layer_experts(&checkpoint, &cfg)?;
+        for world in [3, 6] {
+            let shape = PrefillShape { rows: 256, waves: 3 };
+            let ingress = if kind == Fixture::Mxfp8 { cuteafd_core::SparkIngress::Fp8K32 }
+                else if kind == Fixture::Mixed { cuteafd_core::SparkIngress::Native }
+                else { cuteafd_core::SparkIngress::Bf16 };
+            let charges = spark_charges(&catalog, &experts, &layers, world, shape, ingress)?;
+            assert_eq!(charges.len(), layers.len()+1);
+            assert!(charges.last().unwrap().iter().all(|charge| *charge == SparkCharge { experts:0,owners:0,runtime:0 }));
+            let executions = shared::spark_executions(shape, kind == Fixture::Exl3)?;
+            for rank in 0..world {
+                let working = SparkWorkingSet { rtx_layers:vec![], spark_layers:layers.clone(),
+                    spark_ranks:world,prefill_lanes:shared::LANES };
+                let groups = if let Some(tensors) = catalog.fp8() {
+                    tensors.homogeneous_layers(&layers)?.into_iter().map(|(view,layers)| {
+                        let format = if view.dynamic_nvfp4() {"nvfp4a4"} else {"mxfp8"};
+                        let recipe = crate::plan::experts::spark_recipe(&format!("inkling2:{format}"),cfg.intermediate,world)?;
+                        Ok((layers,SparkResidentLayout::Fp8{world,rank,slicing:recipe.slicing}))
+                    }).collect::<anyhow::Result<Vec<_>>>()?
+                } else { vec![(layers.clone(),SparkResidentLayout::Exl3{world,rank})] };
+                let expected = groups.into_iter().try_fold(0u64,|sum,(layers,layout)| -> anyhow::Result<u64> {
+                    let group = SparkWorkingSet { spark_layers:layers,..working.clone() };
+                    Ok(sum+SparkAssignment::resident_from_catalog(&catalog,&group,rank,layout)?.resident_bytes)
+                })?;
+                assert_eq!(charges[0][rank].experts,expected);
+                let owners = executions.workspace_bytes(|extent| crate::plan::layout::spark_slots::catalog_owner_bytes(
+                    &catalog,"inkling2",&working,rank,extent))?.unwrap().total().unwrap();
+                assert!(charges[0][rank].owners >= owners);
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
 fn structural_open_names_missing_tensors_and_accepts_reports_drift_per_tensor() {
     let (dir, small, tensors) = fixture(Fixture::Mxfp8);
     // A missing conv tensor is a typed open error naming it.
