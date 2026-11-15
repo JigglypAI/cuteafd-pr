@@ -10,12 +10,15 @@ enum Fixture { Mxfp8, Mixed, Exl3 }
 /// appear). Expert storage follows `fixture` per layer, as the three target
 /// checkpoints store them.
 fn fixture(kind: Fixture) -> (tempfile::TempDir, serde_json::Value, Vec<testing::Tensor>) {
+    fixture_with_experts(kind, 4, 2)
+}
+fn fixture_with_experts(kind: Fixture, experts: usize, topk: usize) -> (tempfile::TempDir, serde_json::Value, Vec<testing::Tensor>) {
     let dir = tempfile::tempdir().unwrap();
     let mut small = crate::families::inkling2::config::tests::release_config();
     small["text_config"]["num_hidden_layers"] = 4.into();
     small["text_config"]["local_layer_ids"] = serde_json::json!([0, 1, 2]);
-    small["text_config"]["n_routed_experts"] = 4.into();
-    small["text_config"]["num_experts_per_tok"] = 2.into();
+    small["text_config"]["n_routed_experts"] = experts.into();
+    small["text_config"]["num_experts_per_tok"] = topk.into();
     small["text_config"]["n_layers_per_attn_res_block"] = 2.into();
     small["mtp_config"]["target_layer_ids"] = serde_json::json!([1, 4]);
     let c = Inkling2Config::from_hf(&small).unwrap();
@@ -176,7 +179,7 @@ fn exl3_checkpoint_accepts_per_expert_k4_modules_split_by_row_parity() {
 fn installed_exl3_onboarding_keeps_descriptor_arenas_and_each_workspace_request() -> anyhow::Result<()> {
     use crate::families::inkling2::admission::local_package;
     use crate::placement::families::inkling2::LocalPackage;
-    let (dir, _, _) = fixture(Fixture::Exl3);
+    let (dir, _, _) = fixture_with_experts(Fixture::Exl3, 384, 8);
     let catalog = crate::read_expert_catalog(dir.path())?;
     let install = tempfile::tempdir()?;
     let share = install.path().join("share");
@@ -186,7 +189,7 @@ fn installed_exl3_onboarding_keeps_descriptor_arenas_and_each_workspace_request(
         let root = install.path().join(format!("lib/exl3/exl3-inkling2-k45/rtx-tp{tp}/m1"));
         std::fs::create_dir_all(&root)?;
         std::fs::write(root.join("v41_exl3.json"), serde_json::to_vec(&serde_json::json!({
-            "capacity": 1, "hidden": 4608, "intermediate":2304/tp, "experts":4,
+            "capacity": 1, "hidden": 4608, "intermediate":2304/tp, "experts":384,
             "input_format":"e4m3_k32", "trellis_lut":{"bytes":1234},
             "buffers":{"scratch":{"bytes":2345678,"allocation":"scratch","dtype":"f32","zero_on_create":false},
                 "state":{"bytes":64,"allocation":"state","dtype":"i32","zero_on_create":true}}
