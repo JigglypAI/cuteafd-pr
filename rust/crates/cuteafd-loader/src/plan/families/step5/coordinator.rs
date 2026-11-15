@@ -331,7 +331,7 @@ impl RankWeightLayout {
             (0..depth).any(|stage| name.starts_with(&format!("model.layers.{}.", cfg.layers + stage))))
             .cloned();
         let weights = NativeDenseLayout::from_headers(checkpoint, declarations)?;
-        let mut layout = Self::from_native(&weights, 0, 1, None)?;
+        let mut layout = Self::from_native(&weights, 0, 1, None, &contract.fp8_tensors)?;
         for operand in &mut layout.operands { operand.slice = WeightSlice::Replicated; }
         layout.attach_core(&cfg, &contract.core, None, |layer| layer >= cfg.layers && layer < cfg.layers + depth)?;
         layout.select_core_view(&contract.fp8_tensors)?;
@@ -358,7 +358,8 @@ impl RankWeightLayout {
             .ok_or_else(|| anyhow::anyhow!("Step-5 stage weight size overflow"))?;
         // 16 operands, with BF16 gate/up packed as one; native gate and up stay separate.
         let native = layout.core.len() - usize::from(layout.core.keys().any(|n| n.ends_with(".mlp.up_proj.weight")));
-        ensure!(layout.operands.len() + native == 16, "Step-5 predictor operand inventory");
+        let split_up = layout.operands.iter().filter(|operand| operand.name.ends_with(".mlp.up_proj.weight")).count();
+        ensure!(layout.operands.len() + native == 16 + split_up, "Step-5 predictor operand inventory");
         Ok(layout)
     }
 
@@ -373,7 +374,7 @@ impl RankWeightLayout {
         rank: usize, ranks: usize, ownership: Option<&super::ownership::ExecutionOwnership>) -> Result<Self> {
         let _construction = tracing::debug_span!("step5_rank_layout_construction", rank).entered();
         if let Some(ownership) = ownership { ownership.validate_config(cfg)?; }
-        let mut layout = Self::from_native(&contract.weights, rank, ranks, ownership)?;
+        let mut layout = Self::from_native(&contract.weights, rank, ranks, ownership, &contract.fp8_tensors)?;
         layout.attach_core(cfg, &contract.core, ownership, |layer| layer < cfg.layers)?;
         layout.select_core_view(&contract.fp8_tensors)?;
         Ok(layout)
@@ -443,7 +444,7 @@ impl RankWeightLayout {
     }
 
     fn from_native(weights: &NativeDenseLayout, rank: usize, ranks: usize,
-        ownership: Option<&super::ownership::ExecutionOwnership>) -> Result<Self> {
+        ownership: Option<&super::ownership::ExecutionOwnership>, fp8_tensors: &[String]) -> Result<Self> {
         ensure!(
             matches!(ranks, 1 | 2) && rank < ranks,
             "Step-5 coordinator rank geometry"
@@ -475,13 +476,17 @@ impl RankWeightLayout {
                     split_ranks = 1;
                 }
             }
-            if name.ends_with(".up_proj.weight") {
-                continue;
+            // A metadata-selected member cannot disappear into a BF16 fused
+            // owner: keep gate/up separate if either projection is selected.
+            let separate = |base: &str| ["gate", "up"].iter().any(|leaf|
+                fp8_tensors.contains(&format!("{base}.{leaf}_proj.weight")));
+            if let Some(base) = name.strip_suffix(".up_proj.weight") {
+                if !separate(base) { continue; }
             }
             let mut selected = vec![source.clone()];
             let mut shape = source.meta.shape.clone();
             let mut output_name = name.clone();
-            if let Some(base) = name.strip_suffix(".gate_proj.weight") {
+            if let Some(base) = name.strip_suffix(".gate_proj.weight").filter(|base| !separate(base)) {
                 let up = format!("{base}.up_proj.weight");
                 let up = sources
                     .get(up.as_str())
@@ -1001,6 +1006,33 @@ mod tests {
             assert_eq!(parts.iter().sum::<usize>(), core.bytes, "{}", core.stem);
         }
         arena
+    }
+
+    #[test]
+    fn metadata_selected_ffn_members_keep_independent_final_owners() -> Result<()> {
+        let dir = snapshot("fp8");
+        let cp = Checkpoint::open(dir.path())?;
+        let contract = CoordinatorContract::from_checkpoint(&cp)?;
+        let names = ["model.layers.0.mlp.gate_proj.weight", "model.layers.0.mlp.up_proj.weight"];
+        for selected in [vec![names[0].to_owned()], vec![names[1].to_owned()],
+            names.iter().map(|name| (*name).to_owned()).collect()] {
+            let mut layout = RankWeightLayout::from_native(&contract.weights, 0, 1, None, &selected)?;
+            layout.select_core_view(&selected)?;
+            assert!(!layout.operands.iter().any(|owner| owner.name == "model.layers.0.mlp.gate_up_proj.weight"));
+            for name in names {
+                let owner = layout.operands.iter().find(|owner| owner.name == name).unwrap();
+                assert_eq!(owner.sources.len(), 1);
+                assert_eq!(owner.sources[0].meta.name, name);
+                let converted = selected.iter().any(|selected| selected == name);
+                assert_eq!(owner.dtype, if converted { DType::F8E4M3 } else { DType::Bf16 });
+                assert_eq!(owner.allocation_bytes, owner.native_layout(0,1)?.bytes()?);
+            }
+            let arena = layout.arena_layout("step5/selection-test", |_| true)?;
+            for name in names { assert!(arena.view(name).is_some()); }
+            // An unrelated BF16 FFN retains its existing fused owner.
+            assert!(layout.operands.iter().any(|owner| owner.name == "model.layers.1.mlp.gate_up_proj.weight"));
+        }
+        Ok(())
     }
 
     #[test]
