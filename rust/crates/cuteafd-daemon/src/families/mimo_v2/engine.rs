@@ -2458,9 +2458,8 @@ impl<'a> MimoEngine<'a> {
         self.graph_allocation_samples()
     }
 
-    /// The completed multi-rank step is the only measurement boundary: every
-    /// rank's captures are drained together, then untracked device growth is
-    /// charged to pending captures, excluding separately owned lazy storage.
+    /// Successful captures are measured by their bank commits. This completed
+    /// step only flushes hits, observes failed captures and retires ARC victims.
     fn graph_boundary(&self) -> Result<()> {
         for rank in 0..self.ranks() {
             let graphs = if rank == 0 { &self.graphs } else { &self.peer.as_ref().unwrap().graphs };
@@ -3565,7 +3564,7 @@ mod tests {
     }
 
     #[test]
-    fn capture_baseline_never_drains_a_partial_peer_step() {
+    fn allocation_inventory_never_drains_and_graph_boundary_uses_shared_observer() {
         let source = include_str!("engine.rs");
         let sample = source.split_once("fn graph_allocation_samples(").unwrap().1
             .split_once("fn graph_memory_samples(").unwrap().0;

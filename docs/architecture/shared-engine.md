@@ -632,7 +632,12 @@ remain outstanding; below the soft crossing they are not assigned a byte-model
 admission budget, so hard-stop overshoot may include the already-admitted batch.
 The native node count arrives after capture; above soft, known incoming geometry
 reserves node capacity before ticket issuance and excludes its new owner from
-that settle's victim set. Unknown geometry remains measured-only and LRU-evictable.
+that settle's victim set. A replacement miss may run eagerly for one completed
+step while its victims retire, then capture on retry without synchronization;
+continued rotation beyond capacity can churn. Known supplied node estimates take
+precedence over same-site history; unseen/unknown geometry remains measured-only
+and ARC-evictable on mixed known-node devices. An all-unknown device cannot form
+a node ratio and stays measured-only until native counts become available.
 Once measured `charged` reaches the admitted reserve, every new capture ticket
 stops, nominal reuse included; existing graphs keep replaying and misses run
 eagerly. Destruction cannot clear that terminal hard stop. A representative
@@ -647,7 +652,8 @@ At measured `charged >= soft`, known native live nodes freeze the ratio
 overhead. No fit, seed or per-family rate is used. Only while measured memory is
 above soft does ARC select victims until remaining nodes times that frozen
 ratio fit soft. Selected owners count until actual destruction and are credited
-once; pinned excess terminates without looping. Below soft there is no eviction
+once; freeze waits until pinned owners leave room for at least one typical
+unpinned graph, and pinned excess terminates without looping. Below soft there is no eviction
 or ratio math. A measured hard stop overrides all replacement decisions.
 Native node and executable counts are reported separately from byte-estimator
 units (`native_pools`), including zero-growth reuse and pinned owners. Unknown

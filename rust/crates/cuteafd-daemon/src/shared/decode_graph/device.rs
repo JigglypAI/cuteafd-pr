@@ -523,7 +523,12 @@ fn observe_device_sampled(device: i32,
                 tracing::warn!(%error, device, "boundary graph measurement failed; capture disabled, serving eagerly");
                 cache.measurement_failed = true;
                 cache.floor_resample_pending = false;
+                let pending: Vec<_> = cache.records.iter().filter(|(_, r)| r.pending_capture).map(|(&id, _)| id).collect();
+                for id in pending { cache.cancel_capture(id); }
                 cache.unmeasured = false;
+                cache.pending_bytes = 0;
+                cache.pending_growth = 0;
+                cache.captured_since_observation = false;
                 cache.boundary();
                 return Ok(());
             }
@@ -531,7 +536,7 @@ fn observe_device_sampled(device: i32,
         let (growth, level) = cache.observer.observe(free, total, tracked, rounding, unclaimed);
         cache.level = Some(level);
         cache.sample_physical(free, tracked);
-        if cache.unmeasured { cache.measured_capture(growth); }
+        if cache.unmeasured || cache.failed_measurement_credit > 0 { cache.measured_capture(growth); }
     }
     cache.boundary();
     Ok(())
@@ -684,7 +689,7 @@ impl DeviceCache {
     pub fn identity_generation(&self) -> u64 { self.identity_generation }
     pub fn retains_identity(&self, identity: &Identity) -> bool { self.identities.contains_key(identity) }
     pub fn needs_boundary(&self) -> bool {
-        self.unmeasured || self.pending_destroy > 0 || self.floor_resample_pending
+        self.unmeasured || self.failed_measurement_credit > 0 || self.pending_destroy > 0 || self.floor_resample_pending
     }
     pub fn has_pending_victims(&self) -> bool { self.pending_destroy > 0 }
     pub fn pending(&self, id: u64) -> bool { self.records.get(&id).is_some_and(|r| r.pending_destroy) }
@@ -800,7 +805,9 @@ impl DeviceCache {
         let (pinned, pending) = (record.pinned, record.pending_destroy);
         record.stats.hit(cycle, 1, now);
         self.counters.entry(cycle).or_default().hits += 1;
-        if !pinned && !pending { self.push(id, List::Frequent); }
+        if !pinned && !pending && matches!(record.list, Some(List::Recent | List::Frequent)) {
+            self.push(id, List::Frequent);
+        }
     }
 
     /// Pinned hits accumulate in the bank, without a lock or ARC mutation.
@@ -847,9 +854,9 @@ impl DeviceCache {
     }
 
     #[cfg(test)]
-    pub(super) fn mark_victim(&mut self, _frequent_ghost: bool) -> Option<u64> { self.select_victim(None, false) }
+    pub(super) fn mark_victim(&mut self, _frequent_ghost: bool) -> Option<u64> { self.select_victim(None) }
 
-    fn select_victim(&mut self, excluded: Option<u64>, known_only: bool) -> Option<u64> {
+    fn select_victim(&mut self, excluded: Option<u64>) -> Option<u64> {
         let recent = &self.queues[List::Recent.index()];
         let prefer_recent = recent.first.is_some() && (recent.bytes > self.recent_target);
         let first = if prefer_recent { List::Recent } else { List::Frequent };
@@ -859,8 +866,7 @@ impl DeviceCache {
             let mut next = self.queues[list.index()].first;
             while let Some(id) = next {
                 let record = &self.records[&id];
-                if !record.pending_capture && Some(id) != excluded
-                    && (!known_only || record.stats.native_nodes.is_some_and(|nodes| nodes > 0)) {
+                if !record.pending_capture && Some(id) != excluded {
                     selected = Some(id); break;
                 }
                 next = record.next;
@@ -1009,18 +1015,15 @@ impl DeviceCache {
             }
             let room = if self.soft.measured_bytes.is_none() { self.pending_destroy == 0 }
                 else {
-                let new_nodes = old.and_then(|id| self.records[&id].stats.native_nodes).filter(|n| *n > 0)
+                let new_nodes = metadata.nodes.filter(|nodes| *nodes > 0).or_else(|| old.and_then(|id| self.records[&id].stats.native_nodes).filter(|n| *n > 0))
                     .or_else(|| self.records.values().filter(|r| r.identity.site == site.name)
                         .filter_map(|r| r.stats.native_nodes).max())
-                    .or_else(|| self.records.values().filter_map(|r| r.stats.native_nodes).max());
+                    ;
                 if let Some(nodes) = new_nodes {
                     self.make_soft_room(nodes, None) && self.pending_destroy == 0
-                } else { true }
+                } else { self.pending_destroy == 0 }
             };
-            if !room {
-                self.counters.entry(site.cycle).or_default().eager_runs += 1;
-                return Miss::Eager;
-            }
+            if room {
             let id = if let Some(id) = old { self.unlink(id); id } else {
                 self.next_id += 1;
                 let id = self.next_id;
@@ -1056,6 +1059,7 @@ impl DeviceCache {
 
             self.sync_inventory(id);
             return Miss::Capture(id);
+            }
         }
         // A cold adaptive miss is remembered without displacing resident work.
         if old.is_none() && estimate > 0 {
@@ -1203,7 +1207,7 @@ impl DeviceCache {
         let mut nodes = native.live_nodes.saturating_sub(selected);
         if !self.soft.fits(nodes.saturating_sub(reclaimable).saturating_add(incoming_nodes)) { return false }
         while !self.soft.fits(nodes.saturating_add(incoming_nodes)) {
-            let Some(id) = self.select_victim(excluded, false) else { return false };
+            let Some(id) = self.select_victim(excluded) else { return false };
             nodes = nodes.saturating_sub(self.records[&id].stats.native_nodes.unwrap_or(0));
         }
         true
@@ -1219,8 +1223,11 @@ impl DeviceCache {
             let pinned_nodes = self.records.values().filter(|r| r.pinned)
                 .map(|r| r.stats.native_nodes.unwrap_or(0)).sum::<u64>();
             // A pinned-heavy startup sample cannot establish a usable ARC budget.
-            if u128::from(pinned_nodes) * u128::from(self.charged)
-                >= u128::from(self.soft.limit) * u128::from(native.live_nodes) { return }
+            let typical = self.records.values().filter(|r| !r.pinned && !r.pending_capture
+                && matches!(r.list, Some(List::Recent | List::Frequent)))
+                .filter_map(|r| r.stats.native_nodes).filter(|nodes| *nodes > 0).max().unwrap_or(1);
+            if u128::from(pinned_nodes.saturating_add(typical)) * u128::from(self.charged)
+                > u128::from(self.soft.limit) * u128::from(native.live_nodes) { return }
             self.soft.measured_bytes = Some(self.charged);
             self.soft.measured_nodes = Some(native.live_nodes);
         }
@@ -1288,6 +1295,7 @@ impl DeviceCache {
             self.live_bytes = self.live_bytes.saturating_sub(record.bytes);
             record.estimate = record.ordering_bytes();
             record.pending_destroy = false;
+            record.pinned = false;
             if evicted { self.pending_destroy -= 1; }
             self.pools.live_nodes = self.pools.live_nodes.saturating_sub(record.nodes);
             self.pools.live_execs = self.pools.live_execs.saturating_sub(1);
@@ -1618,12 +1626,58 @@ mod tests {
         assert!(!cache.needs_boundary());
         assert!(cache.measurement_failed);
         fixture.configure_memory_usage(&library, 6, 64 << 20, 4 << 20)?;
-        let (growth, _) = cache.observer.observe(60 << 20, 64 << 20, 0, 0, 0);
-        cache.measured_capture(growth);
+        let shared = Arc::new(Mutex::new(cache));
+        DEVICES.get_or_init(Mutex::default).lock().unwrap().insert(6, Arc::downgrade(&shared));
+        observe_device_sampled(6, || Ok((60 << 20, 64 << 20, 0, 0, 0))).unwrap();
+        let mut cache = shared.lock().unwrap();
         assert_eq!(cache.charged, 4 << 20, "successful later sample cannot double-charge fallback credit");
         assert_eq!(cache.failed_measurement_credit, 0);
         assert!(matches!(cache.miss(key(3), site(Preference::Capture), None, false), Miss::Eager));
         Ok(())
+    }
+
+    #[test]
+    fn soft_failure_remembers_requested_key_and_retries_after_one_retirement() {
+        let mut cache = test_cache(-1014, 1000);
+        for n in 0..4 {
+            let id = capture(&mut cache, n, false);
+            cache.captured_topology(id, 10, 1, false);
+        }
+        cache.soft.measured_bytes = Some(100);
+        cache.soft.measured_nodes = Some(40);
+        cache.soft.limit = 100;
+        cache.charged = 100;
+        assert!(matches!(cache.miss(key(4), site(Preference::Capture), None, false), Miss::Eager));
+        let ghost = cache.identities[&key(4)];
+        assert_eq!(cache.records[&ghost].stats.misses, 1);
+        assert_eq!(cache.records[&ghost].list, Some(List::RecentGhost));
+        assert_eq!(cache.pending_destroy, 1);
+        let victims: Vec<_> = cache.records.iter().filter(|(_, r)| r.pending_destroy).map(|(&id, _)| id).collect();
+        cache.destroyed(&victims, ReleaseMeasurement { released: 0 });
+        assert!(matches!(cache.miss(key(4), site(Preference::Capture), None, false), Miss::Capture(id) if id == ghost));
+    }
+
+    #[test]
+    fn near_pinned_soft_budget_waits_for_a_typical_unpinned_shape() {
+        let mut cache = test_cache(-1015, 1000);
+        let pinned = capture(&mut cache, 1, true);
+        cache.captured_topology(pinned, 90, 1, false);
+        let free = capture(&mut cache, 2, false);
+        cache.captured_topology(free, 10, 1, false);
+        cache.soft.margin = 990;
+        cache.soft.limit = 10;
+        cache.charged = 11;
+        cache.apply_soft_pressure(0, Some(free));
+        assert!(cache.soft.measured_bytes.is_none(), "less than one unpinned graph must not freeze the ratio");
+        assert_eq!(cache.pending_destroy, 0);
+        cache.hit(free);
+        assert_eq!(cache.native_pools().live_nodes, 100);
+        cache.mark_victim(false);
+        cache.destroyed(&[free], ReleaseMeasurement { released: 0 });
+        cache.hit(free);
+        assert_eq!(cache.native_pools().live_nodes, 90, "ghost hit must not resurrect inventory");
+        cache.destroyed(&[pinned], ReleaseMeasurement { released: 0 });
+        assert_eq!(cache.native_pools().live_execs, 0, "destroy clears a pinned owner's residency");
     }
 
     #[test]
