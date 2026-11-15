@@ -373,7 +373,7 @@ static void mock_launch(void** args, int) {{
     # Execute the fork's pure scratch formula, not a second copy of the bridge
     # arithmetic. Only route selection is synthetic in this mocked package.
     layout_env = {"Fp8MoeGeometry": SimpleNamespace,
-                  "_resolve": lambda route, *args: route,
+                  "_resolve": lambda route, *args, geometry=None: route,
                   "_mxfp4_down_a8": lambda *args: False}
     helper_sources = {
         "fp8_moe.py": {"_ALIGN", "TILE_M", "_align", "_grouped_rows", "_regions",

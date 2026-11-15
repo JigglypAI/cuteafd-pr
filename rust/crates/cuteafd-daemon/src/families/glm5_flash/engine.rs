@@ -5814,7 +5814,9 @@ mod prefill_lane_tests {
             // Fork #269 makes Kimi BF16 wide prefill opt-in; GLM leaves bf16_wide off
             // and bf16_wide_min_rows None, preserving its routes. The pin-bump CHANGES
             // receipt changes only kimik3_* / draft_bf16_*: all GLM objects are identical.
-            ("integration/cuteafd/glmf.py", 0xe9850fac36cb38d5_u64),
+            // Fork #317 adds opt-in channel-scale expanded-prefill siblings;
+            // the default row128 routes and existing program metadata stay unchanged.
+            ("integration/cuteafd/glmf.py", 0x7b6b_c5eb_62ca_13ac_u64),
             // b729115b uses canonical BF16 MMA at every positive row count.
             // Hugh Madden fork #30 (TMA fences before consumer_release): fence-only change.
             // Fork #136 adds only an optional weight TMA cache policy; MMA and K order are unchanged.
@@ -5849,7 +5851,9 @@ mod prefill_lane_tests {
             // Fork #303 selects packed native consumers only for (N,K) 6784x4096,
             // 7424x4096 and 8192x2048. No GLM Flash shape selected; registered
             // arithmetic, routes and thresholds are unchanged (export audit: zero GLM Flash changes).
-            ("integration/cuteafd/_fp8_weights.py", 0x79d7_b9c1_b570_7812_u64),
+            // Fork #312 adds native A8/F32 prefill exports and forwards output dtype;
+            // registered decode routes are unchanged, with identical exported objects.
+            ("integration/cuteafd/_fp8_weights.py", 0x11aa_c0a2_a784_5d42_u64),
             // The #252 NC rewrite preserves scaled BF16 operands, per-warp K/MMA order,
             // FP32 accumulation and ascending-warp fold. It changes load/prefetch scheduling,
             // grid order and vectorized fold/store pairs, not per-output arithmetic.
