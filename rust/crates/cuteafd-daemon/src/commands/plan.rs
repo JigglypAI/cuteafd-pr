@@ -924,13 +924,10 @@ mod tests {
             .join("../../../examples/configs/kimi-k3-exl3-k6-min.config");
         let cfg = launch_config(Some(&config))?;
         let hf_home = std::env::var_os("CUTEAFD_DEPLOYMENT_TEST_HF_HOME").map(PathBuf::from)
-            .unwrap_or_else(default_hf_home);
+            .expect("CUTEAFD_DEPLOYMENT_TEST_HF_HOME is required");
         let snapshot = cuteafd_loader::model_cache_dir(&hf_home, &cfg["MODEL_ID"])
             .join("snapshots").join(&cfg["MODEL_REVISION"]);
-        if !snapshot.is_dir() {
-            eprintln!("installed Kimi minimum checkpoint absent; skipping installed context check");
-            return Ok(());
-        }
+        anyhow::ensure!(snapshot.is_dir(), "required installed Kimi checkpoint missing: {}", snapshot.display());
         let manifest = std::env::var_os("CUTEAFD_DEPLOYMENT_TEST_PROGRAMS").map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from(std::env::var_os("HOME").unwrap())
                 .join(".cache/cuteafd/builds/placement-inputs/current/share/PROGRAMS.json"));

@@ -47,18 +47,15 @@ fn query_head_vectors_plan_contiguous_push_slices_tp1_tp2_tp4() -> Result<()> {
 
 #[test]
 fn tp2_peer_router_names_match_installed_checkpoint_headers() -> Result<()> {
-    let home = std::env::var_os("HF_HOME").map(std::path::PathBuf::from)
-        .unwrap_or_else(|| std::path::PathBuf::from(std::env::var_os("HOME").unwrap()).join(".cache/huggingface"));
+    let home = std::env::var_os("CUTEAFD_DEPLOYMENT_TEST_HF_HOME").map(std::path::PathBuf::from)
+        .expect("CUTEAFD_DEPLOYMENT_TEST_HF_HOME is required");
     let models = [
         ("zai-org--GLM-5.3", "aca966e4e02791568aa6a4ced368624b3d897f42", "model.safetensors.index.json", true),
         ("mistralai--Mistral-Large-4-1T-A52B", "f12dabdc0c1e99e7f7924461a6f308859b05af4d", "consolidated.safetensors.index.json", false),
     ];
     for (model, revision, index_file, bias) in models {
         let snapshot = home.join("hub").join(format!("models--{model}")).join("snapshots").join(revision);
-        if !snapshot.join("config.json").is_file() {
-            eprintln!("checkpoint headers unavailable: {}", snapshot.display());
-            continue;
-        }
+        assert!(snapshot.join("config.json").is_file(), "required installed checkpoint missing: {}", snapshot.display());
         let cfg = GlmDsaConfig::read(&snapshot)?;
         let index: serde_json::Value = serde_json::from_slice(&std::fs::read(snapshot.join(index_file))?)?;
         let mut headers = HashMap::new();
@@ -101,17 +98,14 @@ fn attention_residency_does_not_depend_on_optional_operand_names() {
 
 #[test]
 fn attention_residency_matches_installed_variant_checkpoint_headers() -> Result<()> {
-    let home = std::env::var_os("HF_HOME").map(std::path::PathBuf::from)
-        .unwrap_or_else(|| std::path::PathBuf::from(std::env::var_os("HOME").unwrap()).join(".cache/huggingface"));
+    let home = std::env::var_os("CUTEAFD_DEPLOYMENT_TEST_HF_HOME").map(std::path::PathBuf::from)
+        .expect("CUTEAFD_DEPLOYMENT_TEST_HF_HOME is required");
     for (model, revision, index_file, q_lora) in [
         ("zai-org--GLM-5.3", "aca966e4e02791568aa6a4ced368624b3d897f42", "model.safetensors.index.json", true),
         ("mistralai--Mistral-Large-4-1T-A52B", "f12dabdc0c1e99e7f7924461a6f308859b05af4d", "consolidated.safetensors.index.json", false),
     ] {
         let snapshot = home.join("hub").join(format!("models--{model}")).join("snapshots").join(revision);
-        if !snapshot.join("config.json").is_file() {
-            eprintln!("checkpoint headers unavailable: {}", snapshot.display());
-            continue;
-        }
+        assert!(snapshot.join("config.json").is_file(), "required installed checkpoint missing: {}", snapshot.display());
         let cfg = GlmDsaConfig::read(&snapshot)?;
         let index: serde_json::Value = serde_json::from_slice(&std::fs::read(snapshot.join(index_file))?)?;
         let mut headers = HashMap::new();

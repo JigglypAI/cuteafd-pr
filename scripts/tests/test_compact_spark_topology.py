@@ -94,27 +94,6 @@ release_stop_wip_containers
                               capture_output=True,
                               env=dict(os.environ, DRY_RUN='1', SPARK_COUNT='2', **env))
 
-    @unittest.skipUnless(HELPER.exists(), 'manual WIP helper lives in ignored runs/')
-    def test_wip_commands_have_world_two_peers_and_ceiling(self):
-        result = self.helper('start-experts', '3')
-        self.assertEqual(result.returncode, 0, result.stderr)
-        commands = [shlex.split(line[len('DRY RUN:'):]) for line in result.stdout.splitlines()
-                    if line.startswith('DRY RUN:')]
-        self.assertEqual(len(commands), 2)
-        for rank, command in enumerate(commands):
-            self.assertIn(f'--rank {rank} --world 2', command[-1])
-            self.assertIn('--capacity 256', command[-1])
-        result = self.helper('start-coordinator', '1')
-        self.assertEqual(result.returncode, 0, result.stderr)
-        command = shlex.split(result.stdout.splitlines()[0][len('DRY RUN:'):])[-1]
-        self.assertIn('--gpu-memory-cap 32GiB', command)
-        self.assertIn('--kv-pool-size 2GiB', command)
-        self.assertIn('--prefill-batch-tokens 256', command)
-        self.assertIn('--peers 10.55.0.1:19441,10.55.0.2:19441 --rtx-gpus 1', command)
-        for args in [('start-coordinator', '2'),
-                     ('start-coordinator', '1', '--gpu-memory-cap', '80GiB')]:
-            self.assertEqual(self.helper(*args).returncode, 2)
-        self.assertEqual(self.helper('start-coordinator', '1', GPU_MEMORY_CAP='33GiB').returncode, 2)
 
 
     # --- v10 three-rank profiles: implicit compact TP3, explicit native bypass --

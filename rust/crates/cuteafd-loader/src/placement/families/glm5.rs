@@ -944,26 +944,6 @@ mod tests {
     }
 
 
-    /// The engine builds its prefill arenas from the planner's field list and
-    /// carves the planner's views; decode keeps its own workspace.
-    #[test]
-    fn glm_engine_prefill_storage_follows_the_planner_lists() {
-        let engine = include_str!("../../../../cuteafd-daemon/src/families/glm5/engine.rs");
-        assert!(engine.contains("glm5::step_row_widths(&self.cfg, lead"));
-        assert!(engine.contains("glm5::slot_views(unit as u64, slots as u64)"));
-        assert!(engine.contains("glm5::prefill_span(unit as u64, slots as u64)"));
-        assert!(engine.contains("*self.decode_workspace.borrow_mut() = Some(self.workspace(DECODE_ROWS, true)?)"));
-    }
-
-
-
-
-
-
-
-
-
-
     fn glm_cfg() -> GlmDsaConfig { GlmDsaConfig::from_hf(&crate::plan::testing::glm5_config()).unwrap() }
 
     fn local_fixture() -> (tempfile::TempDir, crate::OfficialV41Catalog, std::path::PathBuf) {

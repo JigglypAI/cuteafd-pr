@@ -158,3 +158,27 @@ def launcher_inputs(tmp_path_factory):
     launcher_sandbox.configure(tmp_path_factory.mktemp("launcher-inputs"))
     yield
     launcher_sandbox.configure(None)
+
+
+def pytest_addoption(parser):
+    parser.addoption("--container-torch", action="store_true",
+                     help="collect container-only reference and offline DSL tests")
+
+
+def pytest_configure(config):
+    config.addinivalue_line("markers", "container_torch: needs the matching dev container's reference/DSL dependencies")
+    config.addinivalue_line("markers", "installed_checkpoint: explicit real-checkpoint qualification")
+
+
+def pytest_ignore_collect(collection_path, config):
+    return (not config.getoption("--container-torch") and collection_path.name in {
+        "test_muse_mistral_reference.py", "test_inkling2_reference.py", "test_minimax_m3_reference.py"})
+
+
+def pytest_collection_modifyitems(config, items):
+    if config.getoption("--container-torch"):
+        return
+    removed = [item for item in items if item.get_closest_marker("container_torch")]
+    if removed:
+        config.hook.pytest_deselected(items=removed)
+        items[:] = [item for item in items if not item.get_closest_marker("container_torch")]

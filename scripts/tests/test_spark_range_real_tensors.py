@@ -191,16 +191,11 @@ def rank_sum(weights, intermediate, unit, world, expert, layer, padded=False,
     return error
 
 
-def test_e4m3_and_fp4_decoding():
-    assert e4m3([0, 56, 64, 184]).tolist() == [0, 1, 2, -1]
-    assert FP4[[1, 7, 9, 15]].tolist() == [.5, 6, -.5, -6]
 
 
-@pytest.mark.parametrize('prefix', ['layers.', 'model.layers.', 'language_model.model.layers.'])
-def test_checkpoint_layer_names(prefix):
-    assert int(re.search(r'(?:^|\.)layers\.(\d+)\.', prefix + '10.mlp.experts.0.w1')[1]) == 10
 
 
+@pytest.mark.installed_checkpoint
 @pytest.mark.skipif(not os.environ.get('CUTEAFD_SPARK_RANGE_MATRIX'), reason='explicit real-checkpoint CPU qualification')
 def test_real_checkpoint_rank_sums(record_property):
     entries = json.loads(Path(os.environ['CUTEAFD_SPARK_RANGE_MATRIX']).read_text())

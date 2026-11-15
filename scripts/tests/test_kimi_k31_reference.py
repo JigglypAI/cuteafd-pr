@@ -133,6 +133,7 @@ def hand_forward(torch, attention, hidden):
     return torch.stack(result)[None], selections
 
 
+@pytest.mark.container_torch
 @pytest.mark.parametrize("topk,length", [(8, 5), (2, 5), (2, 131)])
 def test_gated_dsa_matches_hand_causal_selection(topk, length):
     torch = pytest.importorskip("torch")
@@ -153,6 +154,7 @@ def test_gated_dsa_matches_hand_causal_selection(topk, length):
     torch.testing.assert_close(a(changed)[:, :3], actual[:, :3], rtol=0, atol=0)
 
 
+@pytest.mark.container_torch
 def test_topk_ties_choose_lower_id_and_invalid_slots_stay_masked():
     torch = pytest.importorskip("torch")
     from shape_invariant import fixed_index_topk
@@ -170,6 +172,7 @@ def test_topk_ties_choose_lower_id_and_invalid_slots_stay_masked():
     torch.testing.assert_close(a(hidden).double(), expected, rtol=2e-5, atol=2e-6)
 
 
+@pytest.mark.container_torch
 def test_dsa_config_eps_without_mutating_k3_or_non_dsa_layers():
     torch = pytest.importorskip("torch")
     reference, c = tiny_reference(torch), config()
@@ -209,6 +212,7 @@ def test_new_root_loader_dispatches_without_changing_k3(monkeypatch, tmp_path):
         model.source_identity(tmp_path / ("a" * 40))
 
 
+@pytest.mark.container_torch
 @pytest.mark.parametrize("drift,allowed", [(1e-7, True), (.01, False)])
 def test_teacher_forced_routes_gate_arithmetic_not_f32_cutoff_ties(tmp_path, drift, allowed):
     torch = pytest.importorskip("torch")
@@ -258,6 +262,7 @@ def test_teacher_forced_routes_gate_arithmetic_not_f32_cutoff_ties(tmp_path, dri
     assert not torch.equal(natural_ids, eager_ids)
 
 
+@pytest.mark.container_torch
 def test_forced_route_hook_restores_after_failure():
     torch = pytest.importorskip("torch")
     import torch.nn.functional as F
@@ -271,6 +276,7 @@ def test_forced_route_hook_restores_after_failure():
     assert not gate._forward_hooks and not gate._forward_pre_hooks
 
 
+@pytest.mark.container_torch
 def test_ml4_shared_score_reduction_preserves_math():
     torch = pytest.importorskip("torch")
     from families.mistral_large4.ops import indexer_score_reduction
@@ -281,6 +287,7 @@ def test_ml4_shared_score_reduction_preserves_math():
     assert torch.equal(indexer_score_reduction(q, k, w), expected)
 
 
+@pytest.mark.container_torch
 def test_rust_golden_vectors_match_pinned_python_reference():
     import hashlib
     import json
@@ -347,6 +354,7 @@ def test_skipped_quick_windows_preserve_full_and_prefix_defaults():
             execution_windows(changed, skip_routed=True)
 
 
+@pytest.mark.container_torch
 def test_skipped_routed_diagnostic_keeps_router_and_shared_only():
     torch = pytest.importorskip("torch")
     calls = []
@@ -410,6 +418,7 @@ def test_arithmetic_diagnostic_is_explicit_single_window_and_cannot_qualify():
             diagnostic_rows(value)
 
 
+@pytest.mark.container_torch
 def test_diagnostic_capture_retains_exact_prefix_and_ffn_without_mutation(tmp_path):
     import json
     import numpy as np

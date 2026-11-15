@@ -784,6 +784,41 @@ mod tests {
     }
 
     #[test]
+    fn reused_header_contract_preserves_boundary_candidates() -> Result<()> {
+        use super::super::{coordinator::{CoordinatorContract, RankWeightLayout}, native};
+        let fixture = super::super::tests::exl3_snapshot();
+        let checkpoint = Checkpoint::open(fixture.path())?;
+        let cfg = Config::parse(&checkpoint)?;
+        let contract = CoordinatorContract::from_checkpoint(&checkpoint)?;
+        let mut inputs = inputs(2);
+        inputs.requested_pool = None;
+        inputs.context = EXTENT;
+        inputs.serving_context = crate::placement::planner::Context::pinned(EXTENT);
+        inputs.inventory.spark_ranks = 6;
+        inputs.kv_format = crate::families::qwen4::Qwen4KvCache::Fp8;
+        let mut recipes = Vec::new();
+        for boundary in [0, 48, 92] {
+            let owners = (0..cfg.layers).map(|layer| u8::from(layer >= boundary)).collect::<Vec<_>>();
+            let ownership = inputs.ownership_for(&cfg, &owners)?;
+            let mut legacy = Vec::new();
+            let mut reused = Vec::new();
+            for rank in 0..2 {
+                // Reproduce the old independent header builds, not the optimized wrapper.
+                let old_contract = CoordinatorContract::from_checkpoint(&checkpoint)?;
+                let old_layout = RankWeightLayout::for_execution(&checkpoint, rank, &ownership)?;
+                legacy.push(native::rank_admission_for_layout(&old_contract, &cfg, &old_layout,
+                    &ownership, rank, inputs.unit_rows(), inputs.rows, inputs.logit_rows())?);
+                reused.push(native::rank_admission_from_contract(&contract, &cfg, &ownership, rank,
+                    inputs.unit_rows(), inputs.rows, inputs.logit_rows())?);
+            }
+            assert_eq!(legacy, reused, "CSA boundary {boundary}");
+            recipes.push((ownership.execution().modes().to_vec(), legacy, reused));
+        }
+        assert_eq!(recipes.len(), 3);
+        Ok(())
+    }
+
+    #[test]
     fn reused_header_contract_preserves_every_candidate_and_resolved_plan() -> Result<()> {
         use super::super::{coordinator::{CoordinatorContract, RankWeightLayout}, native};
         let fixture = super::super::tests::exl3_snapshot();

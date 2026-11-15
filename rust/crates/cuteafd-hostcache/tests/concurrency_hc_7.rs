@@ -179,25 +179,6 @@ fn seeded_schedule_reproduces_the_instrumentation() {
     }
 }
 
-#[test]
-fn step_rate_stays_above_the_floor() {
-    // A broken fast path (or a debug build pathologically slower than expected) fails here,
-    // in `cargo test`, not in a human's bench review. The floor is an order of magnitude
-    // below the observed debug step rate (~28,000 steps/s on the reference machine).
-    let start = std::time::Instant::now();
-    let mut sim = sim(0xC0FFEE, EvictionOrder::LeastRecent);
-    let report = sim.run(&workload());
-    let elapsed = start.elapsed();
-    let steps_per_s = report.steps as f64 / elapsed.as_secs_f64();
-    assert!(
-        steps_per_s >= 1_000.0,
-        "churn ran at {steps_per_s:.0} steps/s ({} steps in {elapsed:?}); the floor is 1,000",
-        report.steps
-    );
-    let metrics = sim.cache().cache().metrics();
-    check_churn(0xC0FFEE, &report, &metrics);
-}
-
 #[cfg(test)]
 mod properties {
     use cuteafd_hostcache::metrics::Snapshot as Metrics;

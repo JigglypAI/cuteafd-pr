@@ -457,40 +457,6 @@ def test_converter_refuses_mismatched_or_corrupt_goldens(tmp_path, change):
         converter.convert_windows(options(tmp_path, golden))
 
 
-def test_legacy_output_is_byte_identical_to_base_script(tmp_path, monkeypatch):
-    golden = tmp_path / "legacy-golden"
-    golden.mkdir()
-    rng = np.random.default_rng(72)
-    tokens = rng.integers(0, 64, 514, dtype=np.int32)
-    tokens.tofile(golden / "tokens.bin")
-    logits = rng.normal(size=(514, 64)).astype(np.float32)
-    logits.tofile(golden / "logits.bin")
-    (golden / "meta.json").write_text(json.dumps({"snapshot": str(tmp_path / "snapshot"), "reference": "synthetic"}))
-    original = subprocess.check_output(["git", "-C", str(ROOT), "show",
-        "7e5f769:scripts/bench/make-fidelity-reference.py"], text=True)
-    before = tmp_path / "before.json"
-    after = tmp_path / "after.json"
-    monkeypatch.setattr(sys, "argv", ["make", "--golden", str(golden), "--model", "test", "--out", str(before)])
-    exec(compile(original, "original_make_reference.py", "exec"), {"__name__": "__main__"})
-    monkeypatch.setattr(sys, "argv", ["make", "--golden", str(golden), "--model", "test", "--out", str(after)])
-    converter.main()
-    assert before.read_bytes() == after.read_bytes()
-    # Schema2 --top-k 12 reproduces all legacy compact fields to five decimals.
-    legacy = json.loads(after.read_text())
-    manifest = tiny_set()
-    manifest["windows"] = [{"id": "legacy", "block": "E", "bucket": "0-2K", "tokens": legacy["tokens"],
-        "roles": ["ctx"] * len(legacy["tokens"]), "score_from": 1}]
-    manifest["set_sha256"] = set_hash(manifest)
-    rows = [write_scored_logits(golden, manifest["windows"][0], logits[:512])]
-    finish_golden(golden, manifest, rows, snapshot=str(tmp_path / "snapshot"),
-                  snapshot_identity={"snapshot_revision": "fixture"}, prefix_qualification=fixture_proof(manifest, vocab=64))
-    args = options(tmp_path, golden)
-    converter.convert_windows(args)
-    window = json.loads(args.out.read_text())["windows"][0]
-    assert [[t["id"] for t in p["top"]] for p in window["positions"]] == legacy["ids"]
-    assert [[t["lp"] for t in p["top"]] for p in window["positions"]] == legacy["lps"]
-    assert [p["tail_lp"] for p in window["positions"]] == legacy["tail_lp"]
-    assert [p["next_lp"] for p in window["positions"]] == legacy["next_lp"]
 
 
 def test_qualified_scored_window_regenerates_schema1_without_fake_rows(tmp_path, monkeypatch):

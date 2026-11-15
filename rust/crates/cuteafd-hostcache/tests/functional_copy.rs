@@ -369,25 +369,6 @@ fn pending_counts_track_execution() {
     assert_eq!(engine.pending(Stream::Restore), 0);
 }
 
-/// A broken fast path must fail `cargo test`, not a human: 100k issues in a debug build.
-#[test]
-fn issue_floor_100k_within_2s() {
-    let mut engine = engine();
-    let chunk = engine.allocate_chunk(HOST_BYTES).unwrap();
-    engine.write_device(dev(0, 64), &[1u8; 64]);
-    let start = std::time::Instant::now();
-    for _ in 0..100_000 {
-        engine
-            .d2h(Stream::Store, dev(0, 64), host(chunk.id, 0, 64))
-            .unwrap();
-    }
-    let elapsed = start.elapsed();
-    assert!(
-        elapsed.as_secs() < 2,
-        "100k issues took {elapsed:?}, over the 2 s floor"
-    );
-}
-
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(256))]
 

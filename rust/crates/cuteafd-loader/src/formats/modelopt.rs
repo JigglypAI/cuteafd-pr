@@ -386,8 +386,9 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires explicit installed-checkpoint input"]
     fn official_nvfp4_inventories_preserve_every_tensor_declaration() {
-        let Some(root) = std::env::var_os("CUTEAFD_MODELOPT_INVENTORY_ROOT") else { return };
+        let root = std::env::var_os("CUTEAFD_MODELOPT_INVENTORY_ROOT").expect("set CUTEAFD_MODELOPT_INVENTORY_ROOT for this installed test");
         let root = std::path::PathBuf::from(root);
         // Freeze the pre-owner-fix lookup independently of declared(): equality
         // includes the algorithm, declaring module and exact exclusion glob.

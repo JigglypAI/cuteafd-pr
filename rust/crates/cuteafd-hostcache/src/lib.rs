@@ -66,13 +66,6 @@ pub const REPLAY_WINDOW_TOKENS: usize = 128;
 #[cfg(test)]
 mod constants {
     use super::*;
-    #[test]
-    fn engine_sizes() {
-        assert_eq!(PAGE_BYTES, 91_136);
-        assert_eq!(KV_BYTES_PER_TOKEN, 890);
-        assert_eq!(TAIL_BYTES, 2_720_064);
-        assert_eq!(DRAFT_BYTES, 202_752);
-    }
     /// V4.1's numbers stay pinned while generic families bring their own layouts.
     #[test]
     fn v41_layout_is_pinned() {

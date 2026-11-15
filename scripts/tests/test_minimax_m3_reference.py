@@ -6,6 +6,8 @@ from pathlib import Path
 import sys
 
 import pytest
+
+pytestmark = pytest.mark.container_torch
 torch = pytest.importorskip("torch")
 from safetensors.torch import save_file
 

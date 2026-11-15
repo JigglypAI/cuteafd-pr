@@ -1717,10 +1717,9 @@ mod mounted_tests {
     }
 
     #[test]
+    #[ignore = "requires explicit installed-checkpoint input"]
     fn inspect_checkpoint_when_explicitly_supplied() {
-        let Some(snapshot) = std::env::var_os("CUTEAFD_EXLR8_TEST_SNAPSHOT") else {
-            return;
-        };
+        let snapshot = std::env::var_os("CUTEAFD_EXLR8_TEST_SNAPSHOT").expect("set CUTEAFD_EXLR8_TEST_SNAPSHOT for this installed test");
         let root = std::path::Path::new(&snapshot);
         assert!(super::recognizes(root).unwrap());
         let report = super::inspect(root, "bit325", 6, 2, 100 << 30, 80 << 30).unwrap();

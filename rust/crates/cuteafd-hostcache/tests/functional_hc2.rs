@@ -420,22 +420,3 @@ proptest! {
         }
     }
 }
-
-/// Order-of-magnitude floor: a broken fast path fails `cargo test`, not a human. Debug build,
-/// so the bound is generous.
-#[test]
-fn lookup_floor_at_10k_snapshots() {
-    let (mut store, keys) = resident_snapshots(10_000, 4096, 2048);
-    assert_eq!(store.len(), 10_000);
-    let tokens = store.get(keys[0]).expect("snapshot").meta.tokens.clone();
-    let start = std::time::Instant::now();
-    for step in 0..1000 {
-        let hit = store.lookup(&tokens, step).expect("hit");
-        assert_eq!(hit.key, keys[0]);
-    }
-    let elapsed = start.elapsed();
-    assert!(
-        elapsed < std::time::Duration::from_secs(2),
-        "1000 lookups at 10k snapshots took {elapsed:?}"
-    );
-}

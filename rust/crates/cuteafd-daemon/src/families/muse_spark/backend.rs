@@ -626,9 +626,11 @@ mod tests {
     #[test]
     fn message_starts_are_the_checkpoints() {
         assert_eq!(cuteafd_api::openai::chat::muse::START, "<|start|>");
-        let snapshots = std::path::Path::new(
-            "/mnt/sparknest/hf-home/hub/models--meta-models--Muse-Spark-Open-816B-A42B/snapshots");
-        let Some(Ok(snapshot)) = std::fs::read_dir(snapshots).ok().and_then(|mut entries| entries.next()) else { return };
+        let snapshots = std::path::PathBuf::from(std::env::var_os("CUTEAFD_DEPLOYMENT_TEST_HF_HOME")
+            .expect("CUTEAFD_DEPLOYMENT_TEST_HF_HOME is required"))
+            .join("hub/models--meta-models--Muse-Spark-Open-816B-A42B/snapshots");
+        let snapshot = std::fs::read_dir(snapshots).expect("installed Muse snapshots")
+            .next().expect("installed Muse snapshot").expect("read installed Muse snapshot");
         assert_eq!(crate::shared::prefix::marker_ids(&snapshot.path(), &["<|start|>"]).unwrap(), vec![200_022]);
     }
 
