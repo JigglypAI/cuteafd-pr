@@ -27,6 +27,44 @@ Rubric, each 1–5 (5 best), plus wall time:
 
 ## Log
 
+### 2026-11-15 V4.1 BF16 Attention Duel: R1 Landed, R2 Active
+
+Carbon High, driven by DeepSeek Flash, wins R1 with `497d1760`: decode each
+native mixed FP8/FP4 record once into swizzled BF16 SMEM, reuse it for QK/PV,
+and vectorize Q and scale loads. Organizer-only SM120 measurements cover both
+32/64 heads, every live row 1-64, spread/peaked scores, fixed capacity 64 and
+warmed graph replay. Output and LSE hashes are identical in all 256 cells;
+all 256 beat native FP8. Median old-BF16/new speedup is 1.517x (64 heads) and
+1.498x (32 heads), minimum 1.337x. Four focused attention files pass 19 GPU
+tests. The 13-group MLA source audit compares 594 programs: 592 objects are
+byte-identical, only the two V4.1 stems change, headers are identical and no
+programs are added/removed. Power and thermal counter deltas are zero, max
+62 C, minimum T.Limit 37 C. Clean kernel-only fork #330 lands as `ff198298`;
+benchmark-only harness remains separate in #327.
+
+DeepSeek's R1 `e6d9cdb6` hoists metadata, probability fragments and source
+flags. It also passes 19 GPU tests and all 256 exact output/LSE hashes, but
+old-BF16/new median is 0.955x for both head counts; no cell reaches FP8 speed.
+Organizer extraction finds producer registers 148 -> 168, stack 0 -> 8 B,
+LOCAL 0 in both, versus Carbon's 165 registers and no stack/local storage.
+Two initial CuTe trace failures require a corrective commit; the entrant
+amends/force-pushes a pushed message once (identical tree), acknowledges the
+process violation and makes subsequent corrections as follow-up commits.
+
+Provisional R1 scores: Carbon Correct 5, Judgement 4, Quality 4, Creative 5,
+about 30 minutes to a sealed candidate; DeepSeek Correct 4, Judgement 2,
+Quality 3, Creative 3, about 10 minutes to its first candidate plus trace
+correction. The driver checks scope, commit, clean tree and offline evidence;
+organizer checks every numerical, timing and export claim. No entrant runs
+GPU measurements or changes the benchmark/oracle. R2 is active on top of the
+landed winner, targeting both register and SMEM budgets for two CTAs/SM;
+no R2 speed, residency or final-duel claim is established yet.
+
+Evidence: cuteafd #2158; fork #328/#329/#330; `baseline.json`,
+`ds-round1.json`, `carbon-round1.json`, `round1-table.txt` and
+`carbon-r1-fullaudit-target/audit/comparison.json` under
+`~/.cache/cuteafd/builds/v41-attn-duel/`.
+
 ### 2026-11-15 Native MXFP4 Duel: Final Measured Dispositions
 
 Three rounds per entrant are complete. DeepSeek Flash's final `de8d3490`
