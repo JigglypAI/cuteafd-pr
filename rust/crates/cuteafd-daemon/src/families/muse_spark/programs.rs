@@ -99,8 +99,6 @@ mod tests {
         serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap()
     }
 
-    /// Every bound program's pointer order is the exported manifest's (the
-    /// fixture comes from the pinned exporters' SM188 export).
     #[test]
     fn scaled_kv_replaces_only_producers_attention_and_commit() {
         use cuteafd_loader::families::muse_spark::cache::MuseKvCache;
@@ -120,6 +118,8 @@ mod tests {
         }
     }
 
+    /// The pinned SM188 fixture remains the BF16 ABI; scaled programs keep
+    /// identical pointer order and use distinct names until the next export.
     #[test]
     fn bound_pointers_match_the_exported_manifests() {
         let abi = exported();

@@ -65,7 +65,7 @@ impl<'a> RankPrograms<'a> {
         use crate::shared::prefill_packing::{coordinator_row_cap, ProgramRows};
         let inventory = programs::required_with_format(ranks, format)?;
         let exact_cap = coordinator_row_cap(programs, inventory.iter().map(|(name, _)| {
-            let role = if name.contains("attention_full_") || name.contains("attention_swa_") || name.ends_with("swa_commit") {
+            let role = if name.contains("attention_full_") || name.contains("attention_swa_") || name.ends_with("swa_commit") || name.ends_with("swa_commit_kv_fp8") {
                 ProgramRows::SequenceLocal
             } else { ProgramRows::PackedRows };
             (name.as_str(), role)

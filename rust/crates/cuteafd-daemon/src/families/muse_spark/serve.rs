@@ -640,6 +640,21 @@ mod tests {
         Ok(args)
     }
 
+    #[test]
+    fn target_kv_selection_does_not_change_the_drafter() -> Result<()> {
+        use cuteafd_loader::families::muse_spark::cache::MuseKvCache;
+        use cuteafd_loader::families::qwen4::Qwen4KvCache;
+        assert_eq!(args(&[])?.kv_cache, MuseKvCache::Bf16);
+        let selected = args(&["--kv-cache", "fp8"])?;
+        assert_eq!(selected.kv_cache, MuseKvCache::Fp8);
+        assert_eq!(selected.draft_kv_cache, Qwen4KvCache::Fp8);
+        let selected = args(&["--kv-cache", "fp8", "--draft-kv-cache", "bf16"])?;
+        assert_eq!(selected.kv_cache, MuseKvCache::Fp8);
+        assert_eq!(selected.draft_kv_cache, Qwen4KvCache::Bf16);
+        assert!(args(&["--kv-cache", "int8"]).is_err());
+        Ok(())
+    }
+
     fn trace_tokens(manifest: &serde_json::Value, id: &str, count: usize) -> Result<Vec<u32>> {
         let windows = manifest["windows"].as_array().context("activation trace windows")?;
         let selected = windows.iter().filter(|window| window["id"].as_str() == Some(id)).collect::<Vec<_>>();

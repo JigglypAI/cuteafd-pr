@@ -36,6 +36,22 @@ pub fn program_families(gpus: usize) -> &'static [&'static str] {
     if gpus == 2 { &["muse", "muse2"] } else { &["muse"] }
 }
 
+/// Only the selected immutable KV format can be loaded in one process. Do not
+/// charge the dormant format's modules alongside the actual runtime selection.
+pub fn program_set(manifest: &serde_json::Value, gpus: usize,
+    format: crate::families::muse_spark::cache::MuseKvCache) -> ProgramSet {
+    let mut set = ProgramSet::from_manifest(manifest, program_families(gpus));
+    let keep = |name: &str| {
+        let kv = name.contains("_qk_norm_") || name.contains("_attention_full_")
+            || name.contains("_attention_swa_") || name.contains("_swa_commit");
+        !kv || name.ends_with("_kv_fp8")
+            == (format == crate::families::muse_spark::cache::MuseKvCache::Fp8)
+    };
+    set.names.retain(|name| keep(name));
+    set.scratch.retain(|(name, _)| keep(name));
+    set
+}
+
 /// Native code a rank holds beyond its CUDA context once ready: offline the
 /// full allowance (`pending` = allowance), live what the sample has not yet
 /// loaded. One group name on both edges.

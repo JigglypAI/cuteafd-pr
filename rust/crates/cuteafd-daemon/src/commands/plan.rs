@@ -1223,6 +1223,18 @@ mod tests {
     }
 
     #[test]
+    fn muse_plan_preserves_bf16_until_fp8_quality_qualification() {
+        use cuteafd_loader::families::muse_spark::cache::MuseKvCache;
+        let mut args = args(std::path::Path::new("/model"), 6, false);
+        assert_eq!(options(&args).unwrap().layout.unwrap().muse_kv, MuseKvCache::Bf16);
+        for (selected, format) in [(cuteafd_core::MlaCacheFormat::Bf16, MuseKvCache::Bf16),
+            (cuteafd_core::MlaCacheFormat::Fp8, MuseKvCache::Fp8)] {
+            args.kv_format = Some(selected);
+            assert_eq!(options(&args).unwrap().layout.unwrap().muse_kv, format);
+        }
+    }
+
+    #[test]
     fn kimi_plan_defaults_to_fp8_and_preserves_explicit_bf16() {
         use cuteafd_core::MlaCacheFormat;
         let mut args = args(std::path::Path::new("/model"), 6, false);

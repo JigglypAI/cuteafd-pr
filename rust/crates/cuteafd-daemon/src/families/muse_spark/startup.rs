@@ -5,7 +5,7 @@
 use super::programs;
 use anyhow::{ensure, Context, Result};
 use cuteafd_loader::{families::muse_spark::{core::CoreInventory, MuseSparkConfig},
-    placement::{families::muse_spark as shared, Onboard, ProgramSet}};
+    placement::{families::muse_spark as shared, Onboard}};
 use std::path::Path;
 
 /// Every program a coordinator layout binds is in the image's manifest, before
@@ -72,7 +72,7 @@ pub(crate) fn admit(options: Options<'_>) -> Result<shared::AdmittedMuse> {
     let gpus = options.measured.len();
     shared::executor(gpus)?;
     ensure!(options.projections.len() == gpus, "Muse native projection rank count differs from samples");
-    let programs = ProgramSet::from_manifest(options.manifest, shared::program_families(gpus));
+    let programs = shared::program_set(options.manifest, gpus, options.kv_cache);
     let mut fixed = Vec::with_capacity(gpus);
     let mut budgets = Vec::with_capacity(gpus + options.spark_ranks);
     for (rank, sample) in options.measured.iter().enumerate() {
@@ -194,8 +194,10 @@ mod tests {
             if draft.is_some() { cases.push((cutoff, formats, draft, kv, true)); }
             cases
         });
-        for (cutoff_rows, formats, drafter, draft_kv, tp2) in cases {
-            let label = format!("cutoff {cutoff_rows} {formats:?} drafter {drafter:?} {draft_kv:?} TP2={tp2}");
+        let cases = cases.flat_map(|case| [cuteafd_loader::families::muse_spark::cache::MuseKvCache::Bf16,
+            cuteafd_loader::families::muse_spark::cache::MuseKvCache::Fp8].into_iter().map(move |format| (case, format)));
+        for ((cutoff_rows, formats, drafter, draft_kv, tp2), target_kv) in cases {
+            let label = format!("cutoff {cutoff_rows} {formats:?} drafter {drafter:?} {draft_kv:?} TP2={tp2} target={target_kv:?}");
             let snapshot = drafter.map(|name| -> Result<_> {
                 let dir = tempfile::tempdir()?;
                 let config: serde_json::Value = serde_json::from_slice(&std::fs::read(drafters.join(name))?)?;
@@ -207,7 +209,7 @@ mod tests {
                 Ok(dir)
             }).transpose()?;
             let opts = LayoutOptions { context_tokens: 786432, host_memory: Some(cuteafd_loader::plan::testing::SimulatedHost { host_ram: (256 << 30, 256 << 30), ..cuteafd_loader::plan::testing::SimulatedHost::raptor() }.host_ram), rtx_bytes: vec![total; gpus],
-                head_split: true, tp2_dflash: tp2, host_cache_bytes: Some(0), workspace_manifest: Some(path.clone()),
+                head_split: true, tp2_dflash: tp2, muse_kv: target_kv, host_cache_bytes: Some(0), workspace_manifest: Some(path.clone()),
                 muse_partial_bf16_max_rows: cutoff_rows, spark_reply_formats: formats, draft_kv_cache: draft_kv,
                 muse_drafter_snapshot: snapshot.as_ref().map(|d| d.path().to_path_buf()), ..Default::default() };
             let report = input.plan(&PlanOptions { placement: ExpertPlacement::from_spark_ranks(sparks),
@@ -274,7 +276,7 @@ mod tests {
             let arch = cuteafd_loader::placement::ArchContext::for_device("sm_120", total);
             let live = crate::commands::bench::assert_resolved_family_seam("muse_spark", &[], || {
                 crate::commands::bench::fixture_prefix().resolve_entries(16);
-                admit(Options { kv_cache: Default::default(), host: shared::HostInput { total: 256 << 30, available: 256 << 30,
+                admit(Options { kv_cache: target_kv, host: shared::HostInput { total: 256 << 30, available: 256 << 30,
                 reserve: 8 << 30, prefix_bytes: Some(0), prefix_entries: opts.mimo_prefix_entries,
                 media_bytes: opts.media_cache_bytes, device_sampling: true }, cfg: &cfg, core: &core, catalog: input.expert_catalog()?,
                 manifest: &preflight(&path, gpus)?,
@@ -285,7 +287,7 @@ mod tests {
 
                 headroom_bytes: cuteafd_loader::placement::reserve::gpu("muse_spark"), spark_ranks: sparks, prefill, slots: 16,
                 mark_slots: cuteafd_core::prefix::mark_slots_with_host(16, opts.mimo_prefix_entries,
-                    shared::mark_bytes(&cfg, 1), opts.mimo_prefix_mark_bytes, false),
+                    shared::mark_bytes_with_format(&cfg, 1, target_kv), opts.mimo_prefix_mark_bytes, false),
                 max_context: Some(opts.context_tokens), pool_tokens: None, onboard: Onboard::Auto,
                 spark_budget_bytes: cuteafd_loader::plan::DEFAULT_SPARK_BUDGET_BYTES,
                 partial_bf16_max_rows: cutoff_rows, partial_reply_formats: formats,

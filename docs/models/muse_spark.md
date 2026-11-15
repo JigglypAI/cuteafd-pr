@@ -1,5 +1,15 @@
 # Muse Spark
 
+Target KV storage accepts `KV_CACHE=bf16` (the current default) or experimental
+`KV_CACHE=fp8`. FP8 stores native E4M3 K/V plus independent FP32 amax/448
+scales for every token and KV head, for full and sliding attention. One aligned
+record contains K, V, K scales and V scales: 2176 B/token/layer on one RTX or
+1088 B/rank with two RTX, including scales and without padding. BF16 records
+use 4096/2048 B respectively. Exact prefix marks retain the complete records;
+BF16 and FP8 prefix namespaces never mix. `DRAFT_KV_CACHE` remains independent.
+FP8 serving speed and Standard fidelity qualification are pending; it is not
+the default until the family quality and paired-quality bars pass.
+
 `meta-models/Muse-Spark-Open-816B-A42B` (`MuseSparkForConditionalGeneration`,
 text `muse_spark_text`) serves text from an MC EXL3 publication: K4 routed
 experts split per expert, the original BF16 core by default, and complete

@@ -9,7 +9,7 @@ use super::Model;
 use anyhow::Context as _;
 use crate::placement::families::muse_spark as shared;
 use crate::placement::planner::{Operation, PrefillShape};
-use crate::placement::{ArchContext, AttentionPlacement, Demand, Onboard, ProgramSet, ResidentWeights,
+use crate::placement::{ArchContext, AttentionPlacement, Demand, Onboard, ResidentWeights,
     SparkWorkingSet};
 use crate::plan::{Component, ExpertPlacement, PlanReport};
 use cuteafd_core::memory_layout::{Basis, Category, DeviceKind, DeviceLayout, Item, MemoryLayout};
@@ -236,12 +236,13 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
     memory.notes.push(format!("Muse K6 core: {} header-native projections ({}); payload + H128 vectors charged",
         model.core.projections.len(), if model.core.complete(cfg) { "complete" } else { "partial: BF16 rest" }));
     let placed = admitted.placement;
+    let record = opts.muse_kv.record_bytes(cfg.kv_heads, cfg.head_dim);
     let rings = crate::placement::families::muse_spark::ring_rows(cfg).unwrap_or(0)
-        * cfg.kv_record_bytes() as u64 * cfg.sliding_layers() as u64;
+        * record as u64 * cfg.sliding_layers() as u64;
     memory.pool_tokens = placed.pool_tokens;
     memory.notes.push(format!("Muse selected RTX expert layers: {}; pool {} tokens; full-layer KV {} B/token over {} \
         layers; sliding rings {} B/sequence over {} layers", placed.onboard_layers, placed.pool_tokens,
-        cfg.kv_record_bytes() * cfg.full_layers(), cfg.full_layers(), rings, cfg.sliding_layers()));
+        record * cfg.full_layers(), cfg.full_layers(), rings, cfg.sliding_layers()));
     for gpu in 0..gpus {
         let mut device = DeviceLayout { kind: DeviceKind::Rtx, index: gpu as u32, capacity_bytes: cards[gpu].physical_bytes.min(cards[gpu].logical_bytes), worker_budget_bytes: 0,
             items: placed.items[gpu].clone(), kv_tokens: placed.pool_tokens };
@@ -296,7 +297,7 @@ fn planned_code(input: &crate::plan::PlanInput, opts: &crate::plan::layout::Layo
         path.is_file().then_some(path) });
     let Some(path) = path else { return Ok(Vec::new()) };
     let manifest = input.manifest(path)?;
-    let programs = ProgramSet::from_manifest(&manifest, crate::placement::families::muse_spark::program_families(gpus));
+    let programs = shared::program_set(&manifest, gpus, opts.muse_kv);
     (0..gpus).map(|rank| {
         let mut programs = programs.clone();
         projections[rank].include_native_programs(&mut programs);

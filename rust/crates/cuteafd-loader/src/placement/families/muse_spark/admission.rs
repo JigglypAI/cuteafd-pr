@@ -1078,6 +1078,25 @@ mod contract_tests {
     use super::*;
 
     #[test]
+    fn program_inventory_retains_only_the_selected_kv_modules() {
+        use crate::families::muse_spark::cache::MuseKvCache;
+        let manifest = serde_json::json!({"programs": [
+            {"name":"muse_qk_norm_rope_swa"}, {"name":"muse_qk_norm_rope_swa_kv_fp8"},
+            {"name":"muse2_attention_full_decode"}, {"name":"muse2_attention_full_decode_kv_fp8"},
+            {"name":"muse2_swa_commit"}, {"name":"muse2_swa_commit_kv_fp8"},
+            {"name":"muse2_attention_output"}, {"name":"muse_router"}, {"name":"step5_norm"}]});
+        for format in [MuseKvCache::Bf16, MuseKvCache::Fp8] {
+            let set = super::super::program_set(&manifest, 2, format);
+            assert_eq!(set.names.len(), 5);
+            assert!(set.names.iter().any(|name| name == "muse_router"));
+            assert!(set.names.iter().any(|name| name == "muse2_attention_output"));
+            for name in set.names.iter().filter(|name| !matches!(name.as_str(), "muse_router" | "muse2_attention_output")) {
+                assert_eq!(name.ends_with("_kv_fp8"), format == MuseKvCache::Fp8);
+            }
+        }
+    }
+
+    #[test]
     fn inline_scale_alias_is_aligned_exact_and_never_a_second_charge() {
         for (heads, record) in [(16usize, 2176u64), (8, 1088)] {
             let payload = (heads * 128) as u64;

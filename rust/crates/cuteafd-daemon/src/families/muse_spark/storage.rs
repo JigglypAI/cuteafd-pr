@@ -115,10 +115,12 @@ mod tests {
     #[test]
     fn ring_extents_equal_the_admitted_charge() -> Result<()> {
         let cfg = MuseSparkConfig::from_hf(&cuteafd_loader::plan::testing::muse_spark_config())?;
-        for ranks in [1usize, 2] {
-            let cache = MuseCacheLayout::new(&cfg, ranks)?;
+        for (ranks, format) in [1usize, 2].into_iter().flat_map(|rank|
+            [cuteafd_loader::families::muse_spark::cache::MuseKvCache::Bf16,
+             cuteafd_loader::families::muse_spark::cache::MuseKvCache::Fp8].into_iter().map(move |format| (rank, format))) {
+            let cache = MuseCacheLayout::with_format(&cfg, ranks, format)?;
             let extents = KvExtents::new(&cfg, &cache, 1 << 20, 16)?;
-            let record = cfg.kv_record_bytes() as u64;
+            let record = format.record_bytes(cfg.kv_heads, cfg.head_dim) as u64;
             let rings = cfg.sliding_layers() as u64 * cuteafd_loader::placement::families::muse_spark::ring_rows(&cfg)?
                 * record * 16 / ranks as u64;
             assert_eq!(extents.ring_bytes() as u64, rings);
