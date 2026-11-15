@@ -408,7 +408,7 @@ Each key is also a global `cuteafd` flag (`--gpu-memory-cap`, `--kv-max-tokens`,
 | `GLM5_FLASH_DECODE_ROWS` | `auto` (64) | `auto`, `64`, `128` | GLM Flash decode rows. |
 | `DECODE_LANES` | `1` | `1`, `2` | V4.1/MiMo forward decode lanes. |
 | `DECODE_SHARE` | `0.2` | `[0, 1)` | Share of time running requests keep while prompts prefill; 0 prefills whole prompts. |
-| `DECODE_GRAPHS` | MiMo, dense Qwen, Muse and Step-5 `on` | `on`, `off` | Dense Qwen graphs complete decode/verify layers on its supported single-RTX layouts; prefill stays eager. With graphs off, its graph reserve is zero and page-table geometry stays on the original eager path. MiMo bounded per-layer CUDA graph replay, keyed by checkpoint and layout. Muse Spark defaults to `on` for bounded rank-local decode/verify segments; its prefill stays eager. Step-5 bounds decode/verify sections around eager KV staging and host joins; prefill remains eager. Step-5 selects trace-owned row geometries per native format, dense core, RTX count and Spark count from `step5_prewarm.json`, fitting pinned-first then a heat-ordered prefix across all ranks; startup uses disposable full-step transactions without publishing KV state. The shipped EXL3 K4+Core-K6 layouts (1 RTX + 3 Sparks and 2 RTX + 6 Sparks) retain their historical measured geometry pins. The shipped min/max traces select 58/59 replayed row geometries, respectively; min pins sustained row46 and max has no sustained pins. Capture-only rows remain lazy. Other Step-5 layouts have no borrowed pins or measured base. Standalone `plan --mimo-decode-graphs on\|off` and `--step5-decode-graphs on\|off` match serving defaults. |
+| `DECODE_GRAPHS` | MiMo, dense Qwen, Muse and Step-5 `on` | `on`, `off` | Dense Qwen graphs complete rank-local decode/verify layers on one or two RTX GPUs; shared residual hops between whole-layer owners and prefill stay eager. Two-rank layouts use separate untraced bootstrap reserves, never single-rank trace pins. With graphs off, its graph reserve is zero and page-table geometry stays on the original eager path. MiMo bounded per-layer CUDA graph replay, keyed by checkpoint and layout. Muse Spark defaults to `on` for bounded rank-local decode/verify segments; its prefill stays eager. Step-5 bounds decode/verify sections around eager KV staging and host joins; prefill remains eager. Step-5 selects trace-owned row geometries per native format, dense core, RTX count and Spark count from `step5_prewarm.json`, fitting pinned-first then a heat-ordered prefix across all ranks; startup uses disposable full-step transactions without publishing KV state. The shipped EXL3 K4+Core-K6 layouts (1 RTX + 3 Sparks and 2 RTX + 6 Sparks) retain their historical measured geometry pins. The shipped min/max traces select 58/59 replayed row geometries, respectively; min pins sustained row46 and max has no sustained pins. Capture-only rows remain lazy. Other Step-5 layouts have no borrowed pins or measured base. Standalone `plan --mimo-decode-graphs on\|off` and `--step5-decode-graphs on\|off` match serving defaults. |
 | `KV_DECODE_RESERVE_CHUNK` | unset | tokens | Decode-chunk KV reserve top-up. |
 | `KV_RESERVE_DRAIN_BUFFER` | unset | 0 = whole remaining output | Drain buffer. |
 | `KV_EARLY_TERMINATION_MIN_OUTPUT_TOKENS` | unset | `-1` or non-negative | Early termination floor. |
@@ -619,18 +619,22 @@ family's planner and runtime policy):
 
 | Value | V4.1 | V4 | GLM 5.3 / ML4 | GLM Flash | MiMo | Qwen4 | Qwen dense | Kimi K3 | Step-5 | Muse |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| `auto` (default) | ✓ layers¹ | ✓ context | ✓ context | ✓ context | ✓ heads | ✓ layers | ✓ heads² | ✓ context⁴ | ✓ layers | ✓ heads |
+| `auto` (default) | ✓ layers¹ | ✓ context | ✓ context | ✓ context | ✓ heads | ✓ layers | ✓ layers² | ✓ context⁴ | ✓ layers | ✓ heads |
 | `heads` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✓⁴ | ✗ | ✗ |
 | `context` | ✗ | ✓ | ✓ | ✓ | ✗ | ✗ | ✗ | ✓⁴ | ✗ | ✗ |
-| `layers` | ✗ | ✗ | ✓ (explicit; auto stays context)³ | ✓ (explicit; auto stays context) | ✗ | ✓ | ✗ | ✓ | ✗ | ✗ |
+| `layers` | ✗ | ✗ | ✓ (explicit; auto stays context)³ | ✓ (explicit; auto stays context) | ✗ | ✓ | ✓ (two RTX) | ✓ | ✗ | ✗ |
 
 `✓` means the launch path accepts the value; `✗` means it stops with the
 family's attention-placement error.
 
 ¹ V4.1 is `layers` on two GPUs and `heads` on one; an explicit `heads` is
-accepted on either. ² Dense Qwen is a single-device executor: `auto` resolves
-to `heads`, and an explicit `heads` is refused until a multi-GPU executor is
-qualified. ³ Native GLM 5.3 EXLR8 runs `context` (the auto default) and
+accepted on either. ² Dense Qwen `auto` retains one whole owner on one RTX;
+on two RTX it selects solver-admitted contiguous whole-layer ranges, as does
+explicit `layers`. Per-rank native arenas, GDN/KV, prefix marks and lazy decode
+graphs remain local; the shared residual-hop mechanism joins the ranges. This
+primarily adds memory capacity, not parallel layer compute. Explicit `heads`
+and `context` name the missing native sharded exports (#2133), without fallback.
+Single-rank graph traces/pins are never borrowed by the two-rank layout. ³ Native GLM 5.3 EXLR8 runs `context` (the auto default) and
 explicit `heads` or two-GPU `layers` (#1305, #1308); the planner refuses a
 mode whose image lacks its programs. ⁴ Kimi K3 accepts explicit `heads`,
 `context` and `layers` for MLA layers on two GPUs; `auto` selects `context`
@@ -778,7 +782,7 @@ original core is already FP8, not an MC publication.
 | `HOST_CACHE_BYTES` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | **Attention and KV** | | | | | | | | | | |
 | `CORE_VIEW` | ✗ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| `ATTENTION_PLACEMENT` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✓ | ✓ | ✓ |
+| `ATTENTION_PLACEMENT` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | `ATTENTION_PLAN_ROWS` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✓ | ✓ | ✓ |
 | `MAX_CONTEXT_TOKENS` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | `MAX_OUTPUT_TOKENS` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
