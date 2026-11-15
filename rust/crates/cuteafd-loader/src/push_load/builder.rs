@@ -753,6 +753,9 @@ impl Builder {
         }
         self.fp8_matrix(&source, tensors.push_matrix_slice(&names[1], s)?, scale)?;
         if tensors.format() == ExpertFormat::Nvfp4 {
+            if tensors.dynamic_nvfp4() {
+                return Err(invalid("dynamic NVFP4 globals belong to the shared rank-plan tail, not per-expert images"));
+            }
             let image = tensors
                 .slice_bytes_with(projection, world, rank, slicing)?
                 .1 as u64;

@@ -59,6 +59,7 @@ pub(crate) fn validate_checkpoint_contract(info: &Fp8MoeInfo, tensors: &Fp8Exper
             ExpertFormat::Fp8Block128 => Fp8MoeWeights::Fp8,
             ExpertFormat::Mxfp4 => Fp8MoeWeights::Mxfp4,
             ExpertFormat::Mxfp8 => Fp8MoeWeights::Mxfp8,
+            ExpertFormat::Nvfp4 if view.dynamic_nvfp4() => Fp8MoeWeights::Nvfp4Dynamic,
             ExpertFormat::Nvfp4 => Fp8MoeWeights::Nvfp4,
         };
         ensure!(info.weights == weights,
@@ -66,7 +67,7 @@ pub(crate) fn validate_checkpoint_contract(info: &Fp8MoeInfo, tensors: &Fp8Exper
             view.format(), info.weights);
         ensure!(view.rank_width(tp, rank, slicing)? == info.slice,
             "expert layer {layer}: package slice {} differs from checkpoint TP{tp} rank {rank}", info.slice);
-        ensure!(!matches!(weights, Fp8MoeWeights::Bf16 | Fp8MoeWeights::Nvfp4) || !info.wire_input,
+        ensure!(!matches!(weights, Fp8MoeWeights::Bf16 | Fp8MoeWeights::Nvfp4 | Fp8MoeWeights::Nvfp4Dynamic) || !info.wire_input,
             "expert layer {layer}: native BF16/NVFP4 weights require BF16 input");
         if weights == Fp8MoeWeights::Nvfp4 {
             use cuteafd_ffi::fp8_moe::Fp8MoeScaleConvention;
@@ -351,8 +352,10 @@ impl<'a> Fp8Layer<'a> {
             let mut scales = vec![0u8; load.scales];
             // NVFP4: the experts' FP32 alphas, then their input scales, follow the scale grids.
             let (grids, scalars) = scales.split_at_mut(experts * s_bytes);
-            let nvfp4 = !scalars.is_empty();
-            let (alphas, inputs) = scalars.split_at_mut(scalars.len() / 2);
+            let nvfp4 = !scalars.is_empty() && !tensors.dynamic_nvfp4();
+            if tensors.dynamic_nvfp4() { scalars.copy_from_slice(&tensors.dynamic_globals(layer, projection)?); }
+            let scalar_len = if nvfp4 { scalars.len() } else { 0 };
+            let (alphas, inputs) = scalars[..scalar_len].split_at_mut(scalar_len / 2);
             let mut alpha_slots: Vec<(&mut [u8], &mut [u8])> =
                 alphas.chunks_exact_mut(4).zip(inputs.chunks_exact_mut(4)).collect();
             alpha_slots.resize_with(experts, Default::default);
@@ -598,8 +601,10 @@ impl<'a> Fp8Weights<'a> {
         }).transpose()?;
         let layer_bytes = Fp8Layer::bytes_for(tensors, tp, rank, slicing)?;
         let weight_read_bytes = tensors.weight_read_bytes_with(tp, rank, slicing)?;
-        ensure!(weight_read_bytes > 0 && weight_read_bytes.checked_mul(shape.experts) == Some(layer_bytes),
-            "FP8 layer read extent does not divide into experts");
+        let replicated_reads = if tensors.dynamic_nvfp4() { (shape.experts - 1) * 4 * 3 } else { 0 };
+        ensure!(weight_read_bytes > 0 && weight_read_bytes.checked_mul(shape.experts)
+            == layer_bytes.checked_add(replicated_reads),
+            "FP8 layer read extent disagrees with expert payload and replicated globals");
         let resident_bytes = resident_admission(layer_bytes, layers.len(), budget)?;
         tracing::info!(resident_bytes, budget, bf16_package = ?bf16_directory,
             "FP8 resident expert allocation admitted");
@@ -768,7 +773,9 @@ impl<'a> Fp8Weights<'a> {
                                 for scalar in 0..2 {
                                     let source = offsets[slot] + sizes[slot].0 + sizes[slot].1 - 8 + scalar * 4;
                                     upload(devices[rank], host.buffer, source, regions[2 * slot + 1].as_ref().unwrap().buffer,
-                                        grid_bytes + scalar * tensors.shape().experts * 4 + expert * 4,
+                                        grid_bytes + if tensors.dynamic_nvfp4() && scalar == 1 {
+                                            tensors.shape().experts * 4
+                                        } else { scalar * tensors.shape().experts * 4 + expert * 4 },
                                         Fp8MatrixSlice { source_offset: 0, source_pitch: 4, destination_pitch: 4,
                                             width: 4, rows: 1, destination_bytes: 4 }, full_bytes, streams[rank].raw)?;
                                 }
