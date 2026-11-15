@@ -154,9 +154,14 @@ impl HostInput {
     }
 
     pub fn quotas(self, cfg: &MuseSparkConfig, context: u64, slots: u64) -> Result<HostAdmission, Refusal> {
+        self.quotas_with_format(cfg, context, slots, crate::families::muse_spark::cache::MuseKvCache::Bf16)
+    }
+
+    pub fn quotas_with_format(self, cfg: &MuseSparkConfig, context: u64, slots: u64,
+        format: crate::families::muse_spark::cache::MuseKvCache) -> Result<HostAdmission, Refusal> {
         let geometry = cuteafd_core::prefix::HostCacheGeometry { unit_rows: PAGE_ROWS,
-            page_bytes: cfg.full_layers() as u64 * cfg.kv_record_bytes() as u64 * PAGE_ROWS,
-            mark_bytes: mark_bytes(cfg, 1), draft_bytes: 0 };
+            page_bytes: cfg.full_layers() as u64 * format.record_bytes(cfg.kv_heads, cfg.head_dim) as u64 * PAGE_ROWS,
+            mark_bytes: super::mark_bytes_with_format(cfg, 1, format), draft_bytes: 0 };
         let prefix_bytes = if self.prefix_entries == 0 { 0 } else {
             geometry.resolve(self.prefix_bytes, context, slots, self.total, geometry.chunk_bytes())
                 .ok_or_else(|| invalid("host prefix quota geometry overflow"))? };
@@ -171,6 +176,7 @@ impl HostInput {
 /// Everything Muse knows before a solve: geometry, budgets and header-exact
 /// cost tables, identical on the planned and measured edges.
 pub struct ProductionInput<'a> {
+    pub kv_cache: crate::families::muse_spark::cache::MuseKvCache,
     pub cfg: &'a MuseSparkConfig,
     pub core: &'a CoreInventory,
     /// Preweight resolution retained unchanged through admission and owner checks.
@@ -203,6 +209,7 @@ pub struct ProductionInput<'a> {
 
 /// The prepared recipe plus everything the caller reports from it.
 pub struct PreparedMuse<'a> {
+    kv_cache: crate::families::muse_spark::cache::MuseKvCache,
     pub recipe: MuseRecipe<'a>,
     budgets: Vec<Budget>,
     local: LocalPackage,
@@ -217,6 +224,7 @@ pub struct PreparedMuse<'a> {
 
 /// The one admitted answer. Both edges read the same fields.
 pub struct AdmittedMuse {
+    pub kv_cache: crate::families::muse_spark::cache::MuseKvCache,
     pub placement: Placement,
     pub spark: SparkWorkingSet,
     pub solved: ResolvedPlan,
@@ -324,7 +332,7 @@ fn tower_options(media: &MediaOptions, gpus: usize, sparks: usize)
 
 impl<'a> ProductionInput<'a> {
     pub fn prepare(self) -> Result<PreparedMuse<'a>, Refusal> {
-        let ProductionInput { cfg, core, projections, catalog, mut budgets, host, prefill, bf16_target_head, slots, mark_slots,
+        let ProductionInput { kv_cache, cfg, core, projections, catalog, mut budgets, host, prefill, bf16_target_head, slots, mark_slots,
             context, maximum_pool_tokens, partial_bf16_max_rows, partial_reply_formats, local, drafter, fixed,
             media } = self;
         let coordinator = budgets.iter().filter(|budget| budget.locations.iter()
@@ -343,7 +351,7 @@ impl<'a> ProductionInput<'a> {
         if !catalog.per_expert_output_norm() {
             return Err(invalid("Spark experts must carry their post-expert norm"));
         }
-        let host_quotas = host.quotas(cfg, context, slots)?;
+        let host_quotas = host.quotas_with_format(cfg, context, slots, kv_cache)?;
         budgets.push(host.budget());
         let gpus = coordinator;
         let pair = gpus == 2;
@@ -356,10 +364,10 @@ impl<'a> ProductionInput<'a> {
         let slots_usize = usize::try_from(slots).map_err(|_| Refusal::Overflow("Muse slots"))?;
         let unit_rows = usize::try_from(prefill.unit_rows).map_err(|_| Refusal::Overflow("Muse prefill rows"))?;
         let waves = usize::try_from(prefill.waves).map_err(|_| Refusal::Overflow("Muse prefill waves"))?;
-        let record = cfg.kv_record_bytes() as u64;
+        let record = kv_cache.record_bytes(cfg.kv_heads, cfg.head_dim) as u64;
         let rings = cfg.sliding_layers() as u64 * ring_rows(cfg).map_err(anyhow_refusal)? * record;
-        let marks = mark_bytes(cfg, 1);
-        let lane = crate::families::muse_spark::lane::LanePlanes::with_waves(cfg, gpus, unit_rows, waves)
+        let marks = super::mark_bytes_with_format(cfg, 1, kv_cache);
+        let lane = crate::families::muse_spark::lane::LanePlanes::with_format(cfg, gpus, unit_rows, waves, kv_cache)
             .and_then(|planes| planes.bytes()).map_err(anyhow_refusal)? as u64;
         let tables = step_tables(unit_rows, slots_usize, context, waves).map_err(anyhow_refusal)?.bytes()
             as u64;
@@ -664,7 +672,7 @@ impl<'a> ProductionInput<'a> {
             prefill: PrefillShape { rows: prefill.unit_rows, waves: prefill.waves }, attention,
             spark_ranks, encoders, modes: (media.vision, media.audio), cases, peaks, local: local.clone(),
             drafter: drafter.clone(), head_backend: if global.head.is_none() { bf16_target_head } else { serving::BlasHead::Native } };
-        Ok(PreparedMuse { recipe, budgets, local, drafter, layouts, global, projections,
+        Ok(PreparedMuse { kv_cache, recipe, budgets, local, drafter, layouts, global, projections,
             spark_budget, host: host_quotas, push })
     }
 }
@@ -1014,7 +1022,7 @@ fn solve_sampled(request: Request, mut budgets: Vec<Budget>, recipe: &MuseRecipe
 impl PreparedMuse<'_> {
     /// The single admission solve. Planner and serving call this one verb.
     pub fn admit(self, request: Request) -> Result<AdmittedMuse, Refusal> {
-        let PreparedMuse { recipe, budgets, local, drafter, layouts, global, projections,
+        let PreparedMuse { kv_cache, recipe, budgets, local, drafter, layouts, global, projections,
             spark_budget, mut host, push } = self;
         let started = std::time::Instant::now();
         let solved = solve_sampled(request, budgets, &recipe)?;
@@ -1024,7 +1032,7 @@ impl PreparedMuse<'_> {
         let push = push.get(placement.onboard_layers).ok_or_else(|| invalid("push onboarding extent"))?.clone();
         let media = recipe.media(&solved)?;
         if media.vision.admitted_bytes() == 0 && media.audio.admitted_bytes() == 0 { host.media_bytes = 0; }
-        Ok(AdmittedMuse { placement, spark, draft_home: solved.decisions.draft_home, solved, media, local,
+        Ok(AdmittedMuse { kv_cache, placement, spark, draft_home: solved.decisions.draft_home, solved, media, local,
             drafter, layouts, global, projections, spark_budget, solve_us, host, push })
     }
 }

@@ -11,11 +11,16 @@ use std::path::Path;
 /// Every program a coordinator layout binds is in the image's manifest, before
 /// any module load or device query.
 pub(crate) fn preflight(manifest: &Path, gpus: usize) -> Result<serde_json::Value> {
+    preflight_with_format(manifest, gpus, Default::default())
+}
+
+pub(crate) fn preflight_with_format(manifest: &Path, gpus: usize,
+    format: cuteafd_loader::families::muse_spark::cache::MuseKvCache) -> Result<serde_json::Value> {
     let inventory: serde_json::Value = serde_json::from_slice(&std::fs::read(manifest)
         .with_context(|| format!("Muse program manifest {}", manifest.display()))?)?;
     let names = inventory["programs"].as_array().context("Muse PROGRAMS.json has no program list")?
         .iter().filter_map(|program| program["name"].as_str()).collect::<std::collections::BTreeSet<_>>();
-    let mut required = programs::required(gpus)?.into_iter().map(|(name, _)| name).collect::<Vec<_>>();
+    let mut required = programs::required_with_format(gpus, format)?.into_iter().map(|(name, _)| name).collect::<Vec<_>>();
     // The shared rotary-table builder (sliding layers, span 64).
     required.push(programs::ROPE_TABLES.into());
     let missing = required.into_iter().filter(|name| !names.contains(name.as_str())).collect::<Vec<_>>();
@@ -33,6 +38,7 @@ pub(crate) struct Measured {
 }
 
 pub(crate) struct Options<'a> {
+    pub kv_cache: cuteafd_loader::families::muse_spark::cache::MuseKvCache,
     pub cfg: &'a MuseSparkConfig,
     pub core: &'a CoreInventory,
     pub projections: Vec<cuteafd_loader::families::muse_spark::weight_layout::RankProjections>,
@@ -85,7 +91,7 @@ pub(crate) fn admit(options: Options<'_>) -> Result<shared::AdmittedMuse> {
     let maximum_pool_tokens = shared::maximum_pool_tokens(&capacities, context, options.pool_tokens);
     let media = options.media.unwrap_or(shared::MediaOptions { vision: cuteafd_loader::plan::MediaMode::Off,
         audio: cuteafd_loader::plan::MediaMode::Off, replicas: 1, vision_bytes: (0, 0), audio_bytes: (0, 0) });
-    let prepared = shared::ProductionInput { cfg: options.cfg, core: options.core, projections: options.projections,
+    let prepared = shared::ProductionInput { kv_cache: options.kv_cache, cfg: options.cfg, core: options.core, projections: options.projections,
         catalog: options.catalog,
         budgets, host: options.host, prefill: options.prefill,
         bf16_target_head: crate::shared::target_head::TargetHead::configured().blas_head(true), slots: options.slots,
@@ -268,7 +274,7 @@ mod tests {
             let arch = cuteafd_loader::placement::ArchContext::for_device("sm_120", total);
             let live = crate::commands::bench::assert_resolved_family_seam("muse_spark", &[], || {
                 crate::commands::bench::fixture_prefix().resolve_entries(16);
-                admit(Options { host: shared::HostInput { total: 256 << 30, available: 256 << 30,
+                admit(Options { kv_cache: Default::default(), host: shared::HostInput { total: 256 << 30, available: 256 << 30,
                 reserve: 8 << 30, prefix_bytes: Some(0), prefix_entries: opts.mimo_prefix_entries,
                 media_bytes: opts.media_cache_bytes, device_sampling: true }, cfg: &cfg, core: &core, catalog: input.expert_catalog()?,
                 manifest: &preflight(&path, gpus)?,
@@ -347,7 +353,7 @@ mod tests {
             assert_eq!((report.prefill_unit_rows, report.prefill_waves), (Some(prefill.unit_rows), Some(prefill.waves)));
             let arch = cuteafd_loader::placement::ArchContext::for_device("sm_120", total);
             let inventory = preflight(&path, gpus)?;
-            let live = admit(Options { host: shared::HostInput { total: 256 << 30, available: 256 << 30,
+            let live = admit(Options { kv_cache: Default::default(), host: shared::HostInput { total: 256 << 30, available: 256 << 30,
                 reserve: 8 << 30, prefix_bytes: Some(0), prefix_entries: opts.mimo_prefix_entries,
                 media_bytes: opts.media_cache_bytes, device_sampling: true }, cfg: &cfg, core: &core, catalog: input.expert_catalog()?,
                 manifest: &inventory,
@@ -393,7 +399,7 @@ mod tests {
                 std::fs::remove_dir_all(image.join("share/exl3"))?;
                 let local = shared::local_workspace(input.expert_catalog()?, Some(&path), gpus, prefill.unit_rows)?;
                 assert!(matches!(local, shared::LocalPackage::Missing(_)));
-                let error = admit(Options { host: shared::HostInput { total: 256 << 30, available: 256 << 30,
+                let error = admit(Options { kv_cache: Default::default(), host: shared::HostInput { total: 256 << 30, available: 256 << 30,
                     reserve: 8 << 30, prefix_bytes: Some(0), prefix_entries: opts.mimo_prefix_entries,
                     media_bytes: opts.media_cache_bytes, device_sampling: true }, cfg: &cfg, core: &core, catalog: input.expert_catalog()?,
                     manifest: &inventory,
@@ -470,7 +476,7 @@ mod tests {
             cuteafd_loader::plan::Family::prefill_limits(&cuteafd_loader::plan::families::muse_spark::MUSE_SPARK),
             Default::default())?;
         let arch = cuteafd_loader::placement::ArchContext::for_device("sm_120", total);
-        let built = admit(Options { host: shared::HostInput { total: 256 << 30, available: 256 << 30,
+        let built = admit(Options { kv_cache: Default::default(), host: shared::HostInput { total: 256 << 30, available: 256 << 30,
                 reserve: 8 << 30, prefix_bytes: Some(0), prefix_entries: opts.mimo_prefix_entries,
                 media_bytes: opts.media_cache_bytes, device_sampling: true }, cfg: &cfg, core: &core, catalog: input.expert_catalog()?,
             manifest: &preflight(&path, gpus)?,

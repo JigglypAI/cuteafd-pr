@@ -78,12 +78,12 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
     };
     // GPU marks follow the shared prefix rule: host-tier retention keeps only staging slots.
     let mark_slots = opts.prefix_slots.unwrap_or_else(|| cuteafd_core::prefix::mark_slots_with_host(slots,
-        opts.mimo_prefix_entries, crate::placement::families::muse_spark::mark_bytes(cfg, 1),
+        opts.mimo_prefix_entries, crate::placement::families::muse_spark::mark_bytes_with_format(cfg, 1, opts.muse_kv),
         opts.mimo_prefix_mark_bytes, opts.host_cache_bytes != Some(0)));
     if opts.host_cache_bytes == Some(0) {
         memory.notes.push(format!("Muse host prefix tier off: retains {mark_slots} exact prefix marks; \
             {} B/mark across {gpus} GPU(s), device mark budget {} B{}",
-            crate::placement::families::muse_spark::mark_bytes(cfg, 1), opts.mimo_prefix_mark_bytes,
+            crate::placement::families::muse_spark::mark_bytes_with_format(cfg, 1, opts.muse_kv), opts.mimo_prefix_mark_bytes,
             if opts.prefix_slots.is_some() { " (explicit slot override)" } else { "" }));
     }
     let onboard = opts.resolve_onboard(catalog.routed_experts().routed_layers()).unwrap_or(Onboard::Auto);
@@ -178,7 +178,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
             reason: format!("{mode:?} tower not admitted: joint memory contract refused") };
         if component == Component::Vision { report.encoder = Some(encoder); } else { report.audio_encoder = Some(encoder); }
     }
-    let facts = shared::ProductionInput { cfg, core: &model.core, projections, catalog, budgets, host, prefill,
+    let facts = shared::ProductionInput { kv_cache: opts.muse_kv, cfg, core: &model.core, projections, catalog, budgets, host, prefill,
          bf16_target_head: opts.bf16_target_head, slots, mark_slots, context, maximum_pool_tokens,
         partial_bf16_max_rows: opts.muse_partial_bf16_max_rows, partial_reply_formats: opts.spark_reply_formats,
         local, drafter, fixed, media };

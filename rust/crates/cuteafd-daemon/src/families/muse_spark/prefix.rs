@@ -51,7 +51,12 @@ impl crate::shared::qwen::scheduler::Placement for Placement {
 
 /// Bytes of one mark summed over the coordinator ranks (each keeps its KV heads).
 pub(crate) fn mark_bytes(cfg: &MuseSparkConfig, ranks: usize) -> Result<usize> {
-    let cache = MuseCacheLayout::new(cfg, ranks)?;
+    mark_bytes_with_format(cfg, ranks, Default::default())
+}
+
+pub(crate) fn mark_bytes_with_format(cfg: &MuseSparkConfig, ranks: usize,
+    format: cuteafd_loader::families::muse_spark::cache::MuseKvCache) -> Result<usize> {
+    let cache = MuseCacheLayout::with_format(cfg, ranks, format)?;
     Ok(usize::try_from(MuseStateLayout::new(cfg, &cache, 1)?.mark_bytes())? * ranks)
 }
 
@@ -79,7 +84,9 @@ impl<'r, 'a> MusePrefix<'r, 'a> {
         let _memory_scope = cuteafd_ffi::memory_ledger::scope("prefix");
         ensure!(!ranks.is_empty() && streams.len() == ranks.len(), "Muse prefix ranks and streams");
         let library = ranks[0].device.library;
-        let cache = MuseCacheLayout::new(cfg, ranks.len())?;
+        let format = ranks[0].kv.format;
+        ensure!(ranks.iter().all(|rank| rank.kv.format == format), "Muse prefix KV formats differ");
+        let cache = MuseCacheLayout::with_format(cfg, ranks.len(), format)?;
         let state = MuseStateLayout::new(cfg, &cache, sequences)?;
         let record = usize::try_from(cache.record_bytes)?;
         let mut full = Vec::new();
@@ -136,7 +143,7 @@ impl<'r, 'a> MusePrefix<'r, 'a> {
 impl PrefixFamily for MusePrefix<'_, '_> {
     type Placement = Placement;
 
-    fn record_format(&self) -> &'static str { "muse_bf16_kv_v1" }
+    fn record_format(&self) -> &'static str { self.ranks[0].kv.format.record_format() }
 
     fn layout(&self) -> FamilyLayout {
         FamilyLayout { page_rows: PAGE_ROWS as usize, pages: self.pages, page_bytes: self.page_bytes(),

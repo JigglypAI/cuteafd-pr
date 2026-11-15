@@ -99,7 +99,12 @@ pub fn ring_rows(cfg: &MuseSparkConfig) -> Result<u64> {
 
 /// Bytes of one retained mark on one rank: each sliding layer's visible window.
 pub fn mark_bytes(cfg: &MuseSparkConfig, ranks: usize) -> u64 {
-    (cfg.sliding_layers() * cfg.window * cfg.kv_record_bytes() / ranks) as u64
+    mark_bytes_with_format(cfg, ranks, crate::families::muse_spark::cache::MuseKvCache::Bf16)
+}
+
+pub fn mark_bytes_with_format(cfg: &MuseSparkConfig, ranks: usize,
+    format: crate::families::muse_spark::cache::MuseKvCache) -> u64 {
+    (cfg.sliding_layers() * cfg.window * format.record_bytes(cfg.kv_heads / ranks, cfg.head_dim)) as u64
 }
 
 /// The step metadata a rank allocates: a bank per in-flight prefill slot and a

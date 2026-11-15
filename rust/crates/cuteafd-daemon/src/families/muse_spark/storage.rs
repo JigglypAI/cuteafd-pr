@@ -44,6 +44,7 @@ pub(crate) struct RankKv<'a> {
     pub rings: Allocation<'a>,
     pub layers: Vec<LayerKv>,
     pub extents: KvExtents,
+    pub format: cuteafd_loader::families::muse_spark::cache::MuseKvCache,
 }
 
 impl<'a> RankKv<'a> {
@@ -76,7 +77,7 @@ impl<'a> RankKv<'a> {
                 LayerKv::Ring { ring: view(rings.buffer, at, extents.layer_rings) }
             }
         }).collect();
-        Ok(Self { pool, rings, layers, extents })
+        Ok(Self { pool, rings, layers, extents, format: cache.format })
     }
 }
 

@@ -60,16 +60,31 @@ pub(crate) fn prefix(ranks: usize) -> Result<&'static str> {
 
 /// Every program a coordinator rank binds, as (exported name, pointer order).
 pub(crate) fn required(ranks: usize) -> Result<Vec<(String, &'static [&'static str])>> {
+    required_with_format(ranks, cuteafd_loader::families::muse_spark::cache::MuseKvCache::Bf16)
+}
+
+pub(crate) fn required_with_format(ranks: usize,
+    format: cuteafd_loader::families::muse_spark::cache::MuseKvCache) -> Result<Vec<(String, &'static [&'static str])>> {
     let head = prefix(ranks)?;
     Ok(POINTWISE.iter().map(|(stem, pointers)| (format!("muse_{stem}"), *pointers))
-        .chain(PER_HEADS.iter().map(|(stem, pointers)| (format!("{head}_{stem}"), *pointers)))
+        .chain(PER_HEADS.iter().map(|(stem, pointers)| {
+            let suffix = if format == cuteafd_loader::families::muse_spark::cache::MuseKvCache::Fp8
+                && (stem.starts_with("qk_norm_") || stem.starts_with("attention_full_")
+                    || stem.starts_with("attention_swa_") || *stem == "swa_commit") { "_kv_fp8" } else { "" };
+            (format!("{head}_{stem}{suffix}"), *pointers)
+        })))
         .collect())
 }
 
 /// Resolve every required program on the current device: a missing program or
 /// a drifted pointer order fails startup before any allocation.
 pub(crate) fn bind<'a>(programs: &'a Programs<'a>, ranks: usize) -> Result<Vec<(String, Program<'a>)>> {
-    required(ranks)?.into_iter().map(|(name, pointers)| {
+    bind_with_format(programs, ranks, cuteafd_loader::families::muse_spark::cache::MuseKvCache::Bf16)
+}
+
+pub(crate) fn bind_with_format<'a>(programs: &'a Programs<'a>, ranks: usize,
+    format: cuteafd_loader::families::muse_spark::cache::MuseKvCache) -> Result<Vec<(String, Program<'a>)>> {
+    required_with_format(ranks, format)?.into_iter().map(|(name, pointers)| {
         let program = programs.program(&name, pointers)?;
         Ok((name, program))
     }).collect()

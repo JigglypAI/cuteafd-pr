@@ -242,7 +242,7 @@ impl FamilyModel for Model {
     fn native_serving_admission(&self) -> bool { true }
     fn cache_geometry(&self, options: crate::serving_capacity::CacheOptions)
         -> Result<Option<crate::serving_capacity::FamilyCacheGeometry>, crate::serving_capacity::CacheGeometryError> {
-        crate::families::muse_spark::cache::MuseCacheLayout::new(&self.cfg, options.coordinator_ranks)
+        crate::families::muse_spark::cache::MuseCacheLayout::with_format(&self.cfg, options.coordinator_ranks, options.muse_kv)
             .map(|layout| Some(layout.geometry))
     }
     fn activation(&self, layer: usize, _shared: bool) -> Option<FfnActivation> {

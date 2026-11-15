@@ -155,6 +155,7 @@ pub struct CacheOptions {
     pub dense_qwen_kv: crate::families::qwen4::Qwen4KvCache,
     pub qwen_kv: Qwen4KvCache,
     pub step5_kv: Qwen4KvCache,
+    pub muse_kv: crate::families::muse_spark::cache::MuseKvCache,
     pub mla_kv: cuteafd_core::MlaCacheFormat,
     /// One staged prefill unit (one wave's rows): the largest step a shared
     /// prefill kernel reads at once. Rings sized by the whole multi-wave span
@@ -183,6 +184,7 @@ impl Default for CacheOptions {
             dense_qwen_kv: crate::families::qwen4::Qwen4KvCache::Fp8,
             qwen_kv: Qwen4KvCache::default(),
             step5_kv: Qwen4KvCache::Bf16,
+            muse_kv: Default::default(),
             mla_kv: Default::default(),
             prefill_rows: 4096,
             prefill_span_rows: 0,

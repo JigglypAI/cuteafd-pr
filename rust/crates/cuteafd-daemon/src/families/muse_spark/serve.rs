@@ -57,6 +57,9 @@ pub(crate) struct ServeArgs {
     /// Fixed draft depth; absent lets the shared policy choose up to the drafter's block.
     #[command(flatten)]
     pub draft_length: crate::shared::draft::length::DraftLength,
+    /// Target KV storage. FP8 remains opt-in until quality qualification.
+    #[arg(long, default_value = "bf16")]
+    pub kv_cache: cuteafd_loader::families::muse_spark::cache::MuseKvCache,
     /// The drafter's ring storage (independent of weight precision).
     #[arg(long, default_value = "fp8")]
     pub draft_kv_cache: cuteafd_loader::families::qwen4::Qwen4KvCache,
@@ -163,7 +166,7 @@ pub(super) fn with_backend<T>(args: &ServeArgs, run: impl FnOnce(&super::backend
     let core = CoreInventory::from_checkpoint(&cfg, &checkpoint)?;
     let device_ids = args.devices();
     let gpus = device_ids.len();
-    let manifest = startup::preflight(&args.manifest, gpus)?;
+    let manifest = startup::preflight_with_format(&args.manifest, gpus, args.kv_cache)?;
     let catalog = cuteafd_loader::read_expert_catalog_view(&view)?;
     // SAFETY: every native owner drops on this worker before the library.
     let library = Arc::new(unsafe { cuteafd_ffi::NativeLibrary::load(&args.native_lib)? });
@@ -195,12 +198,12 @@ pub(super) fn with_backend<T>(args: &ServeArgs, run: impl FnOnce(&super::backend
         _ => local_package.as_ref().ok().map(|(path, _)| path.clone()),
     };
     let expert_modules = preload_modules(&devices, &programs, &projections, prefill.unit_rows,
-        package_path.as_deref())?;
+        package_path.as_deref(), args.kv_cache)?;
     let inventory = RuntimeInventory::measure(&library, &device_ids, InventoryPhase::PreWeight,
         |_| Ok(()))?;
     crate::shared::inventory::startup_probe(&library, &device_ids, "muse-preweight", Default::default())?;
     let (host_total, host_available) = cuteafd_loader::formats::mapped_preload::host_memory()?;
-    let built = startup::admit(startup::Options { host: cuteafd_loader::placement::families::muse_spark::HostInput {
+    let built = startup::admit(startup::Options { kv_cache: args.kv_cache, host: cuteafd_loader::placement::families::muse_spark::HostInput {
         total: host_total, available: host_available, reserve: args.prefix.host_cache_headroom_bytes,
         prefix_bytes: match args.prefix.host_cache_bytes {
             crate::shared::prefix::budget::HostBudget::Auto => None,
@@ -213,7 +216,7 @@ pub(super) fn with_backend<T>(args: &ServeArgs, run: impl FnOnce(&super::backend
         headroom_bytes: cuteafd_loader::placement::reserve::gpu("muse_spark"), spark_ranks: args.peers.len(), prefill: args.prefill()?,
          slots: u64::from(args.max_sequences),
         mark_slots: args.prefix.mark_rule(usize::from(args.max_sequences))
-            .slots(cuteafd_loader::placement::families::muse_spark::mark_bytes(&cfg, 1) as usize) as u64,
+            .slots(cuteafd_loader::placement::families::muse_spark::mark_bytes_with_format(&cfg, 1, args.kv_cache) as usize) as u64,
         max_context: args.max_context.filter(|&tokens| tokens > 0),
         pool_tokens: args.pool_tokens.filter(|&tokens| tokens > 0), onboard: args.rtx_expert_layers,
         spark_budget_bytes: args.spark_budget_bytes(),
@@ -447,7 +450,8 @@ pub(super) fn with_backend<T>(args: &ServeArgs, run: impl FnOnce(&super::backend
 fn preload_modules<'a>(devices: &[crate::shared::memory::device::Device<'a>],
     programs: &[cuteafd_ffi::programs::Programs<'a>],
     projections: &[cuteafd_loader::families::muse_spark::weight_layout::RankProjections],
-    unit_rows: u64, package: Option<&std::path::Path>)
+    unit_rows: u64, package: Option<&std::path::Path>,
+    kv_cache: cuteafd_loader::families::muse_spark::cache::MuseKvCache)
     -> Result<Vec<Option<Vec<crate::shared::experts::exl3::execution::Exl3Modules<'a>>>>> {
     use crate::shared::experts::rtx::{exl3::Exl3Tp2, RtxSelectionPolicy};
     let ranks = devices.len();
@@ -456,7 +460,7 @@ fn preload_modules<'a>(devices: &[crate::shared::memory::device::Device<'a>],
         let rank_programs = programs.get(rank).context("Muse preload programs")?;
         let admitted = projections.get(rank).context("Muse preload projections")?;
         device.run(|| {
-            for (name, pointers) in super::programs::required(ranks)? {
+            for (name, pointers) in super::programs::required_with_format(ranks, kv_cache)? {
                 rank_programs.program(&name, pointers)?;
             }
             rank_programs.program(super::programs::ROPE_TABLES, &["cos", "sin"])?;
