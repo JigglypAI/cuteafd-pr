@@ -330,6 +330,10 @@ pub(crate) type SharedCache = Arc<Mutex<DeviceCache>>;
 // After teardown the next serving lifetime must sample a fresh baseline.
 static DEVICES: OnceLock<Mutex<HashMap<i32, std::sync::Weak<Mutex<DeviceCache>>>>> = OnceLock::new();
 static PHYSICAL_FLOOR: OnceLock<Option<String>> = OnceLock::new();
+#[cfg(test)]
+thread_local! {
+    static TEST_CONTROLLERS: std::cell::RefCell<Vec<std::sync::Weak<Mutex<DeviceCache>>>> = const { std::cell::RefCell::new(Vec::new()) };
+}
 
 pub(crate) fn set_physical_floor(text: Option<String>) -> anyhow::Result<()> {
     cuteafd_loader::placement::graph_reserve::physical_floor(text.as_deref(), 0, 0)?;
@@ -399,6 +403,8 @@ pub(super) fn device_cache_sampled(device: i32, reserve: u64, basis: Basis,
     controller.sample_physical(free, tracked);
     let cache = Arc::new(Mutex::new(controller));
     devices.insert(device, Arc::downgrade(&cache));
+    #[cfg(test)]
+    TEST_CONTROLLERS.with(|owned| owned.borrow_mut().push(Arc::downgrade(&cache)));
     Ok(cache)
 }
 
@@ -415,7 +421,12 @@ pub(crate) fn set_reserve_policy(device: i32, policy: cuteafd_loader::placement:
 
 pub(crate) fn snapshots() -> Vec<Snapshot> {
     let caches: Vec<_> = DEVICES.get_or_init(Mutex::default).lock().unwrap_or_else(|p| p.into_inner())
-        .values().filter_map(std::sync::Weak::upgrade).collect();
+        .values().filter(|cache| {
+            #[cfg(test)]
+            { return TEST_CONTROLLERS.with(|owned| owned.borrow().iter().any(|weak| std::sync::Weak::ptr_eq(weak, cache))); }
+            #[cfg(not(test))]
+            { let _ = cache; true }
+        }).filter_map(std::sync::Weak::upgrade).collect();
     let mut rows: Vec<_> = caches.iter().map(|cache| cache.lock().unwrap_or_else(|p| p.into_inner()).snapshot()).collect();
     rows.sort_by_key(|row| row.device);
     rows
@@ -563,6 +574,7 @@ pub(crate) struct DeviceCache {
     floor_resample_pending: bool,
     floor_resample_used: bool,
     soft: SoftState,
+    measurement_failed: bool,
     pending_bytes: u64,
     next_id: u64,
     next_bank: u64,
@@ -624,7 +636,7 @@ pub(crate) fn seal_cross_device_capture_on_this_thread(sealed: bool) {
 impl DeviceCache {
     fn new(device: i32, reserve: u64) -> Self {
         Self { device, reserve, reserve_policy: None, charged: 0, live_bytes: 0, level: None, pending_bytes: 0, next_id: 0, next_bank: 0, identity_generation: 0, recovery_generation: 0,
-            soft: SoftState::new(reserve), physical_floor: 0, physical_sample: None, physical_floor_warned: false,
+            soft: SoftState::new(reserve), measurement_failed: false, physical_floor: 0, physical_sample: None, physical_floor_warned: false,
             floor_resample_pending: false, floor_resample_used: false,
             recent_target: 0, records: HashMap::new(), identities: HashMap::new(),
             queues: std::array::from_fn(|_| Queue::default()), classes: HashMap::new(),
@@ -884,7 +896,7 @@ impl DeviceCache {
         }
         // The measured hard stop admits no new tickets, even nominal reuse.
         // Destruction cannot return driver arena bytes or clear this stop.
-        if self.charged >= self.reserve {
+        if self.charged >= self.reserve || self.measurement_failed {
             if let Some(record) = old.and_then(|id| self.records.get_mut(&id)) {
                 record.stats.event(site.cycle, 1);
                 record.stats.misses += 1;
@@ -1107,7 +1119,7 @@ impl DeviceCache {
             Err(error) => {
                 // Without a physical observation another capture cannot be safe.
                 tracing::warn!(%error, device = self.device, "capture measurement failed; freezing capture");
-                self.charged = self.charged.max(self.reserve);
+                self.measurement_failed = true;
             }
         }
     }
@@ -1118,7 +1130,7 @@ impl DeviceCache {
         if self.soft.measured_bytes.is_none() {
             self.soft.margin = self.soft.margin.max(growth.div_ceil(GRAPH_CHUNK).saturating_mul(GRAPH_CHUNK));
             self.soft.limit = self.reserve.saturating_sub(self.soft.margin);
-            if self.charged < self.soft.limit || native.live_nodes == 0 || native.unknown_execs != 0 { return }
+            if self.charged < self.soft.limit || native.live_nodes == 0 || native.unknown_execs != 0 || self.unmeasured { return }
             self.soft.measured_bytes = Some(self.charged);
             self.soft.measured_nodes = Some(native.live_nodes);
         }
@@ -1143,8 +1155,10 @@ impl DeviceCache {
             .map(|(&id, r)| (id, r.estimate)).collect();
         if pending.is_empty() && !self.unmeasured && bytes == 0 { return }
         // Only successful owners surviving this completed boundary prove reuse.
-        self.pools.node_high_water = self.pools.node_high_water.max(self.pools.live_nodes);
-        self.pools.exec_high_water = self.pools.exec_high_water.max(self.pools.live_execs);
+        let outstanding: Vec<_> = self.records.iter().filter(|(&id, r)| r.pending_capture && completed.is_some_and(|done| id != done)).collect();
+        let outstanding_nodes = outstanding.iter().map(|(_, r)| r.nodes).sum::<u64>();
+        self.pools.node_high_water = self.pools.node_high_water.max(self.pools.live_nodes.saturating_sub(outstanding_nodes));
+        self.pools.exec_high_water = self.pools.exec_high_water.max(self.pools.live_execs.saturating_sub(outstanding.len() as u64));
         let settled_bytes = pending.iter().map(|(_, bytes)| *bytes).sum::<u64>();
         let total = settled_bytes.max(1);
         let mut remaining = bytes;
@@ -1269,7 +1283,7 @@ impl DeviceCache {
     fn trace_snapshot(&self) -> TraceSnapshot {
         let records = self.records.values().map(RawRecord::copy).collect();
         TraceSnapshot { cache: Snapshot { device: self.device, reserve: self.reserve, physical_floor: self.physical_floor,
-            reserve_policy: self.reserve_policy, charged: self.charged, live_bytes: self.live_bytes, resident_bytes: self.resident_bytes(), hard_stopped: self.charged >= self.reserve, native_pools: self.native_pools(), soft: self.soft, level: self.level,
+            reserve_policy: self.reserve_policy, charged: self.charged, live_bytes: self.live_bytes, resident_bytes: self.resident_bytes(), hard_stopped: self.charged >= self.reserve || self.measurement_failed, native_pools: self.native_pools(), soft: self.soft, level: self.level,
             pinned: self.records.values().filter(|r| r.pinned).map(|r| r.bytes).sum(),
             pending_capture: self.pending_bytes, cycles: self.counters.clone(), pools: self.pools.clone(),
             basis: self.basis, sampled_at_ms: self.started.elapsed().as_millis() as u64,
@@ -1302,7 +1316,7 @@ impl DeviceCache {
             });
             records.into_iter().take(16).map(|record| self.row(record, now)).collect()
         };
-        Snapshot { device: self.device, reserve: self.reserve, physical_floor: self.physical_floor, reserve_policy: self.reserve_policy, charged: self.charged, live_bytes: self.live_bytes, resident_bytes: self.resident_bytes(), hard_stopped: self.charged >= self.reserve, native_pools: self.native_pools(), soft: self.soft,
+        Snapshot { device: self.device, reserve: self.reserve, physical_floor: self.physical_floor, reserve_policy: self.reserve_policy, charged: self.charged, live_bytes: self.live_bytes, resident_bytes: self.resident_bytes(), hard_stopped: self.charged >= self.reserve || self.measurement_failed, native_pools: self.native_pools(), soft: self.soft,
             level: self.level,
             pinned: self.records.values().filter(|r| r.pinned).map(|r| r.bytes).sum(),
             pending_capture: self.pending_bytes, cycles: self.counters.clone(), pools: self.pools.clone(), basis: self.basis,
@@ -1345,7 +1359,12 @@ impl Drop for DeviceCache {
 
 pub(crate) fn shutdown_traces() {
     let caches: Vec<_> = DEVICES.get_or_init(Mutex::default).lock().unwrap_or_else(|p| p.into_inner())
-        .values().filter_map(std::sync::Weak::upgrade).collect();
+        .values().filter(|cache| {
+            #[cfg(test)]
+            { return TEST_CONTROLLERS.with(|owned| owned.borrow().iter().any(|weak| std::sync::Weak::ptr_eq(weak, cache))); }
+            #[cfg(not(test))]
+            { let _ = cache; true }
+        }).filter_map(std::sync::Weak::upgrade).collect();
     for cache in caches {
         let writer = cache.lock().unwrap_or_else(|p| p.into_inner()).finish_trace();
         // No cache lock is held while waiting for JSON or filesystem work.
@@ -1463,6 +1482,27 @@ mod tests {
         cache.measured_capture(10);
         id
     }
+    #[test]
+    fn single_owner_measurement_preserves_another_outstanding_ticket() {
+        let mut cache = DeviceCache::new(-1006, 64 * GRAPH_CHUNK);
+        let Miss::Capture(a) = cache.miss(key(1), site(Preference::Capture), None, false) else { panic!() };
+        let Miss::Capture(b) = cache.miss(key(2), site(Preference::Capture), None, false) else { panic!() };
+        cache.captured_topology(a, 7, 1, false);
+        cache.settle_captures(GRAPH_CHUNK, Some(a));
+        assert!(!cache.records[&a].pending_capture);
+        assert!(cache.records[&b].pending_capture);
+        assert!(cache.unmeasured);
+        assert_eq!(cache.pending_bytes, 10);
+        assert_eq!(cache.pools.exec_high_water, 1);
+        cache.captured_topology(b, 11, 1, false);
+        cache.settle_captures(0, Some(b));
+        assert!(!cache.unmeasured);
+        assert_eq!(cache.pending_bytes, 0);
+        assert_eq!(cache.charged, GRAPH_CHUNK);
+        assert_eq!(cache.native_pools().live_nodes, 18);
+        assert_eq!(cache.counters[&Cycle::Decode].captures, 2);
+    }
+
     #[test]
     fn soft_ratio_and_margin_freeze_from_measured_crossing_and_ignore_reuse_shares() {
         let mut cache = DeviceCache::new(-1004, 16 * GRAPH_CHUNK);
@@ -1947,6 +1987,7 @@ mod tests {
         {
             let mut registry = DEVICES.get_or_init(Mutex::default).lock().unwrap();
             registry.insert(-703, weak.clone());
+            TEST_CONTROLLERS.with(|owned| owned.borrow_mut().push(weak.clone()));
             registry.insert(-704, std::sync::Weak::new());
         }
         shutdown_traces();

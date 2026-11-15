@@ -625,24 +625,33 @@ an explicit total for the same rank. `GPU_RESERVE` cannot erase graph ownership
 Driver graph storage is a monotone measured high-water: destruction can release
 ARC live capacity without freeing visible physical bytes. Cancelled captures
 still require observation, since failed instantiation can grow driver storage.
-Qualified single-device chains reuse node/executable pools; fan-out and explicit
-peer-spanning captures do not receive chain discounts. Native width and span
-matter, not just node count (#1626). Fresh growth is admitted against the
-physical `charged` high-water plus pending growth and headroom. Once measured
-`charged` reaches the admitted reserve, every new capture ticket stops, including
-nominal reuse; existing graphs keep replaying and misses run eagerly. Destruction
-cannot clear that hard stop. Below the stop, qualified chain-pool reuse remains
-possible; failed or non-chain captures cannot manufacture physical credit.
+Successful bank commits measure device memory after every capture, before another
+capture can hide its allocation; other outstanding tickets remain reserved.
+Once measured `charged` reaches the admitted reserve, every new capture ticket
+stops, nominal reuse included; existing graphs keep replaying and misses run
+eagerly. Destruction cannot clear that terminal hard stop. A representative
+SM120 experiment retained 224 MiB after destroying 1024 48-node executables,
+synchronizing and calling `cudaDeviceGraphMemTrim`; same- and different-shape
+recapture reused it with zero growth (#2154). There is no drain/trim reset path.
+
+Before the first soft crossing, the margin is the largest measured capture
+growth rounded up to 2 MiB, with a one-chunk minimum; soft is hard minus margin.
+At measured `charged >= soft`, known native live nodes freeze the ratio
+`charged / live_nodes` and margin for that device lifetime, including executable
+overhead. No fit, seed or per-family rate is used. Only while measured memory is
+above soft does ARC select victims until remaining nodes times that frozen
+ratio fit soft. Selected owners count until actual destruction and are credited
+once; pinned excess terminates without looping. Below soft there is no eviction
+or ratio math. A measured hard stop overrides all replacement decisions.
 Native node and executable counts are reported separately from byte-estimator
 units (`native_pools`), including zero-growth reuse and pinned owners. Unknown
 metadata is counted explicitly, never treated as a zero-node executable.
 Measured `live_bytes` contains surviving capture-growth shares, not physical
 residency: allocator reuse can make a resident graph's share zero. ARC keeps
 reuse-backed owners evictable and weights them by max(measured share, estimate),
-including pinned owners in `resident_bytes`. A blocked miss first proves that
-retiring every eligible owner could make the capture fit, then selects only the
-needed victims. Capture completion never evicts: destruction cannot shrink the
-measured physical arena, so overshoot is not a reducible eviction target.
+including pinned owners in `resident_bytes`. These share/estimate weights do
+not decide admission or pressure: the soft policy uses measured memory and the
+frozen native-node ratio, never a constant `charged - reserve` eviction target.
 `live_bytes` and `resident_bytes` are diagnostics; neither decides pressure or
 physical admission. No estimate is added to the physical charge.
 Reconciliation uses the settled current level while retaining high-water for
