@@ -447,14 +447,17 @@ mod device_tests {
         let ticket = bank.cache_ticket(&1, false, None).unwrap();
         bank.cache_commit(1, Exec(drops.clone()), ticket, 1, 1, false);
         bank.cache_measured(10);
+        assert!(bank.cache_ticket(&2, false, None).is_none());
+        // SAFETY: fixture executables own no captured buffers or native work.
+        unsafe { bank.cache_evict_persistent(); }
+        assert_eq!(drops.get(), 1);
         for key in 2..20 {
-            assert!(bank.cache_ticket(&key, false, None).is_none());
-            // SAFETY: fixture executables own no captured buffers or native work.
-            unsafe { bank.cache_evict_persistent(); }
-            assert_eq!(drops.get(), key - 1);
-            let ticket = bank.cache_ticket(&key, false, None).expect("victim capacity reusable without idle");
+            let ticket = bank.cache_ticket(&key, false, None).expect("warmed capacity reusable without idle");
             bank.cache_commit(key, Exec(drops.clone()), ticket, 1, 1, false);
             bank.cache_measured(0);
+            // SAFETY: the same allocation-free fixture remains live.
+            unsafe { bank.cache_evict_persistent(); }
+            assert_eq!(drops.get(), 1, "zero-growth captures must not repeat the old eviction");
         }
         assert_eq!(super::super::device::snapshots().into_iter().find(|row| row.device == -318).unwrap().charged, 10);
     }

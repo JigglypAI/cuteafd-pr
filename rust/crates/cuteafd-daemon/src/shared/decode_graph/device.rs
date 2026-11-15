@@ -98,7 +98,8 @@ pub(crate) struct Snapshot {
     pub physical_floor: u64,
     pub reserve_policy: Option<cuteafd_loader::placement::graph_reserve::Resolved>,
     pub charged: u64,
-    /// Measured shares held by live executables, excluding estimates and ghosts.
+    /// Measured growth shares held by live executables, excluding estimates and
+    /// ghosts. A lower bound after allocator reuse, not physical arena residency.
     pub live_bytes: u64,
     /// Current untracked level relative to the attach seed. Unlike `charged`
     /// (the physical arena high-water retained for admission), this can
@@ -745,7 +746,16 @@ impl DeviceCache {
         (estimate, class.map_or(estimate, |c| c.largest.max(estimate)))
     }
 
+    #[cfg(test)]
     fn mark_victim(&mut self, frequent_ghost: bool) -> Option<u64> {
+        self.select_victim(frequent_ghost, false)
+    }
+
+    fn mark_pressure_victim(&mut self, frequent_ghost: bool) -> Option<u64> {
+        self.select_victim(frequent_ghost, true)
+    }
+
+    fn select_victim(&mut self, frequent_ghost: bool, measured_only: bool) -> Option<u64> {
         let recent = &self.queues[List::Recent.index()];
         let prefer_recent = recent.first.is_some() && (recent.bytes > self.recent_target
             || (frequent_ghost && recent.bytes == self.recent_target));
@@ -756,7 +766,9 @@ impl DeviceCache {
             let mut next = self.queues[list.index()].first;
             while let Some(id) = next {
                 let record = &self.records[&id];
-                if !record.pending_capture {
+                // A reuse-only owner has no measured share to retire. Evicting
+                // it cannot reduce byte pressure and can churn an entire hot set.
+                if !record.pending_capture && (!measured_only || record.bytes > 0) {
                     selected = Some(id); break;
                 }
                 next = record.next;
@@ -936,7 +948,7 @@ impl DeviceCache {
                     self.pending_bytes, chain && projected == 0 && !self.unmeasured) { break }
                 // An individually oversized capture cannot be made admissible by eviction.
                 if headroom.saturating_add(estimate) > self.reserve { break }
-                let Some(id) = self.mark_victim(ghost == Some(List::FrequentGhost)) else { break };
+                let Some(id) = self.mark_pressure_victim(ghost == Some(List::FrequentGhost)) else { break };
                 selected_bytes = selected_bytes.saturating_add(self.records[&id].bytes);
                 selected_nodes = selected_nodes.saturating_add(self.records[&id].nodes);
                 selected_execs += 1;
@@ -1087,7 +1099,7 @@ impl DeviceCache {
             let mut selected = self.records.values().filter(|r| r.pending_destroy)
                 .fold(0u64, |bytes, r| bytes.saturating_add(r.bytes));
             while self.live_bytes.saturating_sub(selected) > self.reserve {
-                let Some(id) = self.mark_victim(false) else { break };
+                let Some(id) = self.mark_pressure_victim(false) else { break };
                 selected = selected.saturating_add(self.records[&id].bytes);
             }
         }
@@ -1475,6 +1487,58 @@ mod tests {
         cache.remove_bank(1);
         assert_eq!(cache.live_bytes, 0);
         assert_eq!(cache.charged, 110);
+    }
+
+    #[test]
+    fn pressure_skips_zero_share_owners_and_settles_after_real_retirement() {
+        for boundary_pressure in [false, true] {
+            let mut cache = DeviceCache::new(-1001, 1000);
+            let capture_site = site(Preference::Capture);
+            let mut zero_share = Vec::new();
+            for n in 0..64 {
+                let Miss::Capture(id) = cache.miss(key(n), capture_site, None, false) else { panic!() };
+                cache.measured_capture(0);
+                zero_share.push(id);
+            }
+            let mut owners = Vec::new();
+            for n in 64..67 {
+                let Miss::Capture(id) = cache.miss(key(n), capture_site, None, false) else { panic!() };
+                owners.push(id);
+            }
+            cache.measured_capture(if boundary_pressure { 1010 } else { 990 });
+            if !boundary_pressure {
+                assert!(matches!(cache.miss(key(67), capture_site, None, false), Miss::Eager));
+            }
+            let victims: Vec<_> = owners.iter().copied().filter(|&id| cache.pending(id)).collect();
+            assert_eq!(victims.len(), if boundary_pressure { 1 } else { 2 });
+            assert_eq!(cache.pending_destroy, victims.len(), "only positive-byte owners make progress");
+            assert!(zero_share.iter().all(|&id| !cache.pending(id)));
+            let warm_charge = cache.charged;
+            cache.destroyed(&victims, ReleaseMeasurement { released: 0 });
+            for &id in &victims {
+                let identity = cache.records[&id].identity.clone();
+                let estimate = Some(Estimate { bytes: 10, nodes: None, node_rate: 1, graph_rate: 0, parallel_width: 1 });
+                assert!(matches!(cache.miss(identity, capture_site, estimate, false), Miss::Capture(reused) if reused == id));
+                cache.measured_capture(0);
+            }
+            for _ in 0..8 {
+                for &id in zero_share.iter().chain(owners.iter()) { cache.hit(id); }
+                cache.unmeasured = true;
+                cache.measured_capture(0);
+                assert_eq!(cache.pending_destroy, 0);
+                assert_eq!(cache.charged, warm_charge);
+                assert_eq!(cache.counters[&Cycle::Decode].evictions, victims.len() as u64);
+            }
+            // Pinned pressure cannot be fixed by sweeping the remaining zero shares.
+            for id in owners {
+                cache.unlink(id);
+                cache.records.get_mut(&id).unwrap().pinned = true;
+            }
+            cache.live_bytes = cache.reserve + 1;
+            assert!(cache.mark_pressure_victim(false).is_none());
+            assert!(matches!(cache.miss(key(68), capture_site, None, false), Miss::Eager));
+            assert_eq!(cache.pending_destroy, 0);
+        }
     }
 
     #[test]
