@@ -1,5 +1,5 @@
 //! Family arithmetic over caller-owned native producers and expert dispatch.
-use super::{experts::Dispatcher, owners::UnitOwner, weights::TargetWeights};
+use super::{experts::Dispatcher, owners::UnitBuffers, weights::TargetWeights};
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::{draft_projection::{DraftProjections, ProjectionOutput}, inkling2::{Attention, Kind, Route},
     inkling2::producers::{Op, Precision, Producer}, programs::Programs, CuteafdDeviceBuffer as Buffer};
@@ -55,49 +55,49 @@ impl<'a> Kernels<'a> {
     fn producer(&self, op: Op) -> Result<&Producer<'a>> {
         self.producers.get(&op.name()?).context("Inkling producer not bound at startup")
     }
-    pub fn norm(&self, owner: &UnitOwner<'_>, input: Buffer, weight: Buffer, output: Buffer,
+    pub fn norm(&self, owner: &impl UnitBuffers<'_>, input: Buffer, weight: Buffer, output: Buffer,
         value: bool, precision: Precision, rows: usize) -> Result<()> {
         // SAFETY: the family supplies disjoint admitted typed input/output views;
         // retained unit stream orders the producer and all consuming projections.
         unsafe { self.producer(Op::Norm { value, precision })?.launch(&[input, weight, output],
-            rows, None, owner.stream.raw) }
+            rows, None, owner.stream().raw) }
     }
-    pub fn convolution(&self, owner: &UnitOwner<'_>, input: Buffer, weight: Buffer, dynamic: Buffer,
+    pub fn convolution(&self, owner: &impl UnitBuffers<'_>, input: Buffer, weight: Buffer, dynamic: Buffer,
         output: Buffer, history: &str, width: usize, global: bool, rows: usize) -> Result<()> {
         // SAFETY: native F32 planes and BF16 taps are retained by unit/weights;
         // metadata addresses the unit's exclusive history and valid packed rows.
         unsafe { self.producer(Op::Convolution { width, dynamic: global, precision: Precision::F32 })?
             .launch(&[input, weight, dynamic, owner.buffer(history)?, owner.buffer("first")?,
-                owner.buffer("conv_slots")?, output], rows, None, owner.stream.raw) }
+                owner.buffer("conv_slots")?, output], rows, None, owner.stream().raw) }
     }
-    pub fn residual(&self, owner: &UnitOwner<'_>, query: Buffer, addend: Buffer, output: Buffer,
+    pub fn residual(&self, owner: &impl UnitBuffers<'_>, query: Buffer, addend: Buffer, output: Buffer,
         rows: usize, queries: usize, candidates: usize, add: bool) -> Result<()> {
         // SAFETY: caller initialized each candidate in the F32 arena; the query
         // and optional addend are retained through the mix on the unit stream.
         unsafe { self.producer(Op::Residual { queries, addend: add })?.launch(&[
             owner.buffer("residual_arena")?, addend, query, output], rows,
-            Some((owner.layout.rows, candidates)), owner.stream.raw) }
+            Some((owner.layout().rows, candidates)), owner.stream().raw) }
     }
-    pub fn route(&self, owner: &UnitOwner<'_>, logits: Buffer, bias: Buffer, rows: usize) -> Result<()> {
+    pub fn route(&self, owner: &impl UnitBuffers<'_>, logits: Buffer, bias: Buffer, rows: usize) -> Result<()> {
         // SAFETY: native F32 logits/bias and output routes have admitted extents.
         unsafe { self.producer(Op::Router)?.launch(&[logits, bias, owner.buffer("route_ids")?,
-            owner.buffer("route_weights")?], rows, None, owner.stream.raw) }
+            owner.buffer("route_weights")?], rows, None, owner.stream().raw) }
     }
-    pub fn project(&self, owner: &UnitOwner<'_>, input: Buffer, weight: Buffer, output: Buffer,
+    pub fn project(&self, owner: &impl UnitBuffers<'_>, input: Buffer, weight: Buffer, output: Buffer,
         rows: usize, k: usize, n: usize) -> Result<()> {
         ensure!(input.bytes >= rows*k*2 && weight.bytes >= n*k*2 && output.bytes >= rows*n*4,
             "Inkling projection exceeds admitted views");
         // SAFETY: checked BF16 input/weight extents and F32 destination; arena
         // and unit retain every pointer on the preloaded shared projection stream.
-        unsafe { self.projections.launch_checked(input.ptr, weight.ptr, output, rows, k, n, owner.stream.raw)?; }
+        unsafe { self.projections.launch_checked(input.ptr, weight.ptr, output, rows, k, n, owner.stream().raw)?; }
         Ok(())
     }
 }
 
 /// Route/MLP stage has no knowledge of checkpoint expert format or transport.
-pub(crate) fn routed_ffn(kernels: &Kernels<'_>, owner: &UnitOwner<'_>, target: &TargetWeights<'_>,
+pub(crate) fn routed_ffn(kernels: &Kernels<'_>, owner: &impl UnitBuffers<'_>, target: &TargetWeights<'_>,
     experts: &dyn Dispatcher, cfg: &Inkling2Config, layer: usize, rows: usize) -> Result<()> {
-    ensure!(layer < cfg.layers && rows > 0 && rows <= owner.layout.rows, "Inkling FFN layer/rows differ");
+    ensure!(layer < cfg.layers && rows > 0 && rows <= owner.layout().rows, "Inkling FFN layer/rows differ");
     let prefix = format!("model.llm.layers.{layer}");
     kernels.project(owner, owner.buffer("projection_input")?, target.operand(&format!("{prefix}.mlp.gate.weight"))?.buffer,
         owner.buffer("route_logits")?, rows, cfg.hidden, cfg.experts)?;
@@ -108,9 +108,9 @@ pub(crate) fn routed_ffn(kernels: &Kernels<'_>, owner: &UnitOwner<'_>, target: &
     // input is retained; unused MMA pointer is valid and never dereferenced.
     unsafe { kernels.quant.launch(&[owner.buffer("projection_input")?.ptr, wire.ptr,
         wire.ptr.cast::<u8>().wrapping_add(cfg.hidden).cast(), wire.ptr],
-        &[cuteafd_ffi::programs::Scalar::I32(rows as i32), cuteafd_ffi::programs::Scalar::I32(grid as i32)], owner.stream.raw)?; }
+        &[cuteafd_ffi::programs::Scalar::I32(rows as i32), cuteafd_ffi::programs::Scalar::I32(grid as i32)], owner.stream().raw)?; }
     experts.enqueue(owner.buffer("expert_wire")?, owner.buffer("route_ids")?, owner.buffer("route_weights")?,
-        owner.buffer("expert_output")?, rows, &owner.stream)
+        owner.buffer("expert_output")?, rows, owner.stream())
 }
 
 pub(crate) fn residual_site(cfg: &Inkling2Config, layer: usize) -> Result<ResidualSite> {
@@ -124,7 +124,7 @@ fn slice(buffer: Buffer, offset: usize, bytes: usize) -> Result<Buffer> {
 
 /// Cold one-sequence attention: every cache row is produced before the native
 /// ring/paged attention program, without host synchronization on the layer path.
-pub(crate) fn attention(k: &Kernels<'_>, owner: &UnitOwner<'_>, target: &TargetWeights<'_>,
+pub(crate) fn attention(k: &Kernels<'_>, owner: &impl UnitBuffers<'_>, target: &TargetWeights<'_>,
     cfg: &Inkling2Config, layer: usize, rows: usize, input: Buffer) -> Result<()> {
     use cuteafd_ffi::inkling2::{Batch, Global, Local};
     let local = cfg.local[layer];
@@ -161,18 +161,18 @@ pub(crate) fn attention(k: &Kernels<'_>, owner: &UnitOwner<'_>, target: &TargetW
         // SAFETY: checked native producer geometry, admitted typed planes and
         // immutable scales are retained and stream-ordered until unit drain.
         unsafe { k.producer(Op::Clip { relative, key, global: !local && !key, precision: Precision::F32 })?
-            .launch(&[b(source)?, scale, b("positions")?, b(output)?], rows, None, owner.stream.raw)?; }
+            .launch(&[b(source)?, scale, b("positions")?, b(output)?], rows, None, owner.stream().raw)?; }
     }
     k.norm(owner, b("conv_v")?, b("conv_v")?, b("v_norm")?, true, Precision::F32, rows)?;
-    let l = owner.stream.device.library;
+    let l = owner.stream().device.library;
     // SAFETY: retained unit owns disjoint source/destination planes. The padded
     // relative row starts zero and only its logical16 columns are overwritten.
     unsafe {
-        k.narrow.launch(b("q_clipped")?.ptr, b("q_bf16")?.ptr, rows*6144, owner.stream.raw)?;
-        k.narrow.launch(b("r_clipped")?.ptr, b("relative_source")?.ptr, rows*768, owner.stream.raw)?;
-        l.cuda_zero_bytes_async(b("relative_input")?, rows*48*64*2, owner.stream.raw)?;
+        k.narrow.launch(b("q_clipped")?.ptr, b("q_bf16")?.ptr, rows*6144, owner.stream().raw)?;
+        k.narrow.launch(b("r_clipped")?.ptr, b("relative_source")?.ptr, rows*768, owner.stream().raw)?;
+        l.cuda_zero_bytes_async(b("relative_input")?, rows*48*64*2, owner.stream().raw)?;
         // Disjoint source and destination; columns16..63 stay exact zero.
-        l.copy_d2d_2d_async(b("relative_input")?, 64*2, b("relative_source")?, 16*2, 16*2, rows*48, owner.stream.raw)?;
+        l.copy_d2d_2d_async(b("relative_input")?, 64*2, b("relative_source")?, 16*2, 16*2, rows*48, owner.stream().raw)?;
     }
     // A token contributes48 independent head rows. Bound each projection call
     // by its4096-row export without changing the ordered-K16 reduction.
@@ -187,28 +187,28 @@ pub(crate) fn attention(k: &Kernels<'_>, owner: &UnitOwner<'_>, target: &TargetW
     // SAFETY: relative F32 bias narrows into admitted BF16 bias; pack writes
     // unique causal cache slots after both K and V producers on this stream.
     unsafe {
-        k.narrow.launch(b("relative_f32")?.ptr, b("relative")?.ptr, rows*48*1024, owner.stream.raw)?;
+        k.narrow.launch(b("relative_f32")?.ptr, b("relative")?.ptr, rows*48*1024, owner.stream().raw)?;
         k.producer(Op::KvPack { precision: Precision::F32 })?.launch(&[b("k_clipped")?, b("v_norm")?,
-            b("cache_slots")?, if local { b("kv_step")? } else { b("global_cache")? }], rows, None, owner.stream.raw)?;
+            b("cache_slots")?, if local { b("kv_step")? } else { b("global_cache")? }], rows, None, owner.stream().raw)?;
     }
     let batch = Batch { rows, q: b("q_bf16")?, kv: if local { b("kv_step")? } else { b("global_cache")? },
         positions: b("positions")?, relative: b("relative")?, sinks: b("sinks")?, output: b("attended")?, scratch: b("attention_scratch")? };
     if local {
-        k.local.local(batch, Local { ring: b("ring")?, ring_count: 1, ring_slots: b("ring_slots")?, first: b("first")? }, owner.stream.raw)?;
+        k.local.local(batch, Local { ring: b("ring")?, ring_count: 1, ring_slots: b("ring_slots")?, first: b("first")? }, owner.stream().raw)?;
     } else {
         k.global.global(batch, Global { pages: b("global_cache")?.bytes/(64*4096), page_table: b("page_table")?,
-            table_width: owner.layout.buffers["page_table"]/4, splits: 1 }, owner.stream.raw)?;
+            table_width: owner.layout().buffers["page_table"]/4, splits: 1 }, owner.stream().raw)?;
     }
     // F32 gate producer consumes F32 attended values. Widen BF16 through a
     // zeroed F32 destination before gating; no host data path.
     // SAFETY: q has6144 F32 values per row and is no longer read by attention;
     // it is safely reused as widened attention scratch on the same stream.
     unsafe {
-        l.cuda_zero_bytes_async(b("q")?, rows*6144*4, owner.stream.raw)?;
-        l.cuda_accumulate_bf16_to_f32_async(b("attended")?, b("q")?, rows*6144, owner.stream.raw)?;
+        l.cuda_zero_bytes_async(b("q")?, rows*6144*4, owner.stream().raw)?;
+        l.cuda_accumulate_bf16_to_f32_async(b("attended")?, b("q")?, rows*6144, owner.stream().raw)?;
         k.producer(Op::Gate { situ: false, precision: Precision::F32 })?.launch(&[b("q")?, b("gate")?, b("gate")?,
-            b("q_clipped")?], rows, None, owner.stream.raw)?;
-        k.narrow.launch(b("q_clipped")?.ptr, b("gated")?.ptr, rows*6144, owner.stream.raw)?;
+            b("q_clipped")?], rows, None, owner.stream().raw)?;
+        k.narrow.launch(b("q_clipped")?.ptr, b("gated")?.ptr, rows*6144, owner.stream().raw)?;
     }
     k.project(owner, b("gated")?, weight("attn.wo_ud.weight")?, b("branch")?, rows, 6144, 4608)?;
     k.convolution(owner, b("branch")?, weight("attn_sconv.weight")?, b("branch")?, b("attention")?,
@@ -217,7 +217,7 @@ pub(crate) fn attention(k: &Kernels<'_>, owner: &UnitOwner<'_>, target: &TargetW
 
 /// Complete layer over a cold, contiguous one-sequence unit. Embedding and
 /// completed six-layer block values remain F32 throughout residual mixing.
-pub(crate) fn begin_layer(k: &Kernels<'_>, owner: &UnitOwner<'_>, target: &TargetWeights<'_>,
+pub(crate) fn begin_layer(k: &Kernels<'_>, owner: &impl UnitBuffers<'_>, target: &TargetWeights<'_>,
     cfg: &Inkling2Config, index: usize, rows: usize) -> Result<()> {
     let site = residual_site(cfg, index)?;
     let b = |name: &str| owner.buffer(name);
@@ -229,8 +229,8 @@ pub(crate) fn begin_layer(k: &Kernels<'_>, owner: &UnitOwner<'_>, target: &Targe
         slice(output, 0, rows*cfg.hidden*4)?
     };
     attention(k, owner, target, cfg, index, rows, input)?;
-    let library = owner.stream.device.library;
-    let stride = owner.layout.rows*cfg.hidden*4;
+    let library = owner.stream().device.library;
+    let stride = owner.layout().rows*cfg.hidden*4;
     let arena = b("residual_arena")?;
     if site.starts_block {
         // First layer of a block: freeze its incoming partial as a completed
@@ -238,17 +238,17 @@ pub(crate) fn begin_layer(k: &Kernels<'_>, owner: &UnitOwner<'_>, target: &Targe
         // SAFETY: arena slots are disjoint retained views on the same stream.
         unsafe {
             library.copy_d2d_async(slice(arena, (site.attention_candidates-1)*stride, rows*cfg.hidden*4)?,
-                partial, rows*cfg.hidden*4, owner.stream.raw)?;
+                partial, rows*cfg.hidden*4, owner.stream().raw)?;
             library.copy_d2d_async(slice(arena, (site.mlp_candidates-1)*stride, rows*cfg.hidden*4)?,
-                b("attention")?, rows*cfg.hidden*4, owner.stream.raw)?;
+                b("attention")?, rows*cfg.hidden*4, owner.stream().raw)?;
         }
     } else {
         // SAFETY: add writes an independent branch; the following copy publishes
         // the new partial candidate after its complete F32 sum.
         unsafe {
-            k.add.launch(partial, b("attention")?, b("branch")?, rows*cfg.hidden, owner.stream.raw)?;
+            k.add.launch(partial, b("attention")?, b("branch")?, rows*cfg.hidden, owner.stream().raw)?;
             library.copy_d2d_async(slice(arena, (site.mlp_candidates-1)*stride, rows*cfg.hidden*4)?,
-                b("branch")?, rows*cfg.hidden*4, owner.stream.raw)?;
+                b("branch")?, rows*cfg.hidden*4, owner.stream().raw)?;
         }
     }
     k.residual(owner, target.operand(&format!("model.llm.attn_res.mlp_queries.{index}"))?.buffer,
@@ -257,20 +257,20 @@ pub(crate) fn begin_layer(k: &Kernels<'_>, owner: &UnitOwner<'_>, target: &Targe
         b("projection_input")?, false, Precision::Bf16, rows)
 }
 
-pub(crate) fn finish_layer(k: &Kernels<'_>, owner: &UnitOwner<'_>, target: &TargetWeights<'_>,
+pub(crate) fn finish_layer(k: &Kernels<'_>, owner: &impl UnitBuffers<'_>, target: &TargetWeights<'_>,
     experts: &dyn Dispatcher, cfg: &Inkling2Config, index: usize, rows: usize) -> Result<()> {
     let site = residual_site(cfg, index)?;
     let b = |name: &str| owner.buffer(name);
-    let library = owner.stream.device.library;
+    let library = owner.stream().device.library;
     let arena = b("residual_arena")?;
-    let stride = owner.layout.rows*cfg.hidden*4;
+    let stride = owner.layout().rows*cfg.hidden*4;
     let partial = b("partial")?;
     routed_ffn(k, owner, target, experts, cfg, index, rows)?;
     // SAFETY: expert BF16 output widens into an independently zeroed F32
     // plane; no extra weight representation or host synchronization is used.
     unsafe {
-        library.cuda_zero_bytes_async(b("mlp")?, rows*cfg.hidden*4, owner.stream.raw)?;
-        library.cuda_accumulate_bf16_to_f32_async(b("expert_output")?, b("mlp")?, rows*cfg.hidden, owner.stream.raw)?;
+        library.cuda_zero_bytes_async(b("mlp")?, rows*cfg.hidden*4, owner.stream().raw)?;
+        library.cuda_accumulate_bf16_to_f32_async(b("expert_output")?, b("mlp")?, rows*cfg.hidden, owner.stream().raw)?;
     }
     k.convolution(owner, b("mlp")?, target.operand(&format!("model.llm.layers.{index}.mlp_sconv.weight"))?.buffer,
         b("mlp")?, b("mixed")?, "mlp_conv_history", cfg.hidden, false, rows)?;
@@ -278,9 +278,9 @@ pub(crate) fn finish_layer(k: &Kernels<'_>, owner: &UnitOwner<'_>, target: &Targ
     // SAFETY: result is retained F32 partial; completed immutable candidates
     // are unchanged, and only the final mutable arena slot is refreshed.
     unsafe {
-        k.add.launch(base, b("mixed")?, partial, rows*cfg.hidden, owner.stream.raw)?;
+        k.add.launch(base, b("mixed")?, partial, rows*cfg.hidden, owner.stream().raw)?;
         library.copy_d2d_async(slice(arena, (site.mlp_candidates-1)*stride, rows*cfg.hidden*4)?,
-            partial, rows*cfg.hidden*4, owner.stream.raw)?;
+            partial, rows*cfg.hidden*4, owner.stream().raw)?;
     }
     Ok(())
 }

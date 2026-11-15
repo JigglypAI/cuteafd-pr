@@ -1,16 +1,16 @@
 //! Shared executor adapter for one cold native golden layer; no private loop.
-use super::{experts::Dispatcher, layers::{self, Kernels}, owners::UnitOwner, weights::TargetWeights};
+use super::{experts::Dispatcher, layers::{self, Kernels}, owners::UnitBuffers, weights::TargetWeights};
 use crate::shared::prefill_pipeline::{run_prefill_units, sequence_units, FfnRoute, PrefillHooks, Unit};
 use anyhow::{bail, Result};
 use cuteafd_loader::families::inkling2::Inkling2Config;
 
-pub(crate) fn layer(kernels: &Kernels<'_>, owner: &UnitOwner<'_>, target: &TargetWeights<'_>,
+pub(crate) fn layer<'a>(kernels: &Kernels<'a>, owner: &impl UnitBuffers<'a>, target: &TargetWeights<'a>,
     experts: &dyn Dispatcher, cfg: &Inkling2Config, index: usize, rows: usize) -> Result<()> {
-    struct Hooks<'b, 'a> {
-        kernels: &'b Kernels<'a>, owner: &'b UnitOwner<'a>, target: &'b TargetWeights<'a>,
+    struct Hooks<'b, 'a, O> {
+        kernels: &'b Kernels<'a>, owner: &'b O, target: &'b TargetWeights<'a>,
         experts: &'b dyn Dispatcher, cfg: &'b Inkling2Config,
     }
-    impl PrefillHooks for Hooks<'_, '_> {
+    impl<'a, O: UnitBuffers<'a>> PrefillHooks for Hooks<'_, 'a, O> {
         type Ticket = ();
         fn route(&self, _: usize) -> FfnRoute { FfnRoute::Local }
         fn begin_unit(&mut self, _: &Unit) -> Result<()> { Ok(()) }
@@ -25,7 +25,7 @@ pub(crate) fn layer(kernels: &Kernels<'_>, owner: &UnitOwner<'_>, target: &Targe
         fn end_unit(&mut self, _: &Unit) -> Result<()> { Ok(()) }
         fn commit_unit(&mut self, _: &Unit) -> Result<()> { Ok(()) }
     }
-    let mut units = sequence_units(rows, owner.layout.rows.next_multiple_of(64), 1, cfg.layers)?;
+    let mut units = sequence_units(rows, owner.layout().rows.next_multiple_of(64), 1, cfg.layers)?;
     for unit in &mut units { unit.layers = index..index+1; }
     run_prefill_units(&mut Hooks { kernels, owner, target, experts, cfg }, &units, 1)
 }

@@ -59,6 +59,7 @@ impl UnitLayout {
         let mut layout = Self::new(cfg, rows, context)?;
         for name in ["ring", "global_cache", "attn_conv_history", "mlp_conv_history",
             "k_conv_history", "v_conv_history"] { layout.buffers.remove(name); }
+        layout.buffers.insert("global_slots".into(), rows.checked_mul(8).context("Inkling physical slot extent overflow")?);
         Ok(layout)
     }
 
@@ -161,6 +162,41 @@ impl CacheLayout {
     }
 }
 
+/// One contiguous request segment. Physical pages are supplied by the shared
+/// refcounted pool, never inferred from logical positions or sequence IDs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnitMetadata {
+    pub positions: Vec<i64>,
+    pub local_slots: Vec<i64>,
+    pub global_slots: Vec<i64>,
+    pub ring_slots: Vec<i64>,
+    pub first: Vec<i32>,
+    pub conv_slots: Vec<i64>,
+    pub page_table: Vec<i32>,
+}
+impl UnitMetadata {
+    pub fn new(cfg: &Inkling2Config, span: std::ops::Range<usize>, pages: &[u32],
+        pool_pages: usize) -> Result<Self> {
+        ensure!(span.start < span.end && span.len() <= 4096 && span.end <= cfg.max_position,
+            "Inkling segment outside context/export");
+        ensure!(pages.len() >= span.end.div_ceil(64)
+            && pages.iter().all(|&page| (page as usize) < pool_pages && page <= i32::MAX as u32),
+            "Inkling segment lacks valid physical pages");
+        let unique = pages.iter().copied().collect::<std::collections::BTreeSet<_>>();
+        ensure!(unique.len() == pages.len(), "Inkling request aliases physical KV pages");
+        let ring = SequenceLayout::new(cfg, true, 1)?.ring_rows;
+        Ok(Self {
+            positions: span.clone().map(|row| row as i64).collect(),
+            local_slots: (0..span.len()).map(|row| row as i64).collect(),
+            global_slots: span.clone().map(|row| i64::from(pages[row/64])*64 + (row%64) as i64).collect(),
+            ring_slots: span.clone().map(|row| (row%ring) as i64).collect(),
+            first: vec![0; span.len()], conv_slots: vec![0; span.len()],
+            page_table: pages.iter().map(|&page| page as i32).collect(),
+        })
+    }
+    pub fn rows(&self) -> usize { self.positions.len() }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ResidualSite {
     /// Completed blocks present before attention, including the embedding block.
@@ -185,6 +221,26 @@ mod tests {
     use super::*;
     fn cfg() -> Inkling2Config {
         Inkling2Config::from_hf(&serde_json::from_str(include_str!("fixtures/config.json")).unwrap()).unwrap()
+    }
+    #[test]
+    fn unit_metadata_uses_physical_pages_and_resets_only_chunk_local_indices() -> Result<()> {
+        let cfg = cfg();
+        let mut pages = (0..24).rev().collect::<Vec<u32>>();
+        let first = UnitMetadata::new(&cfg, 63..67, &pages, 24)?;
+        assert_eq!(first.positions, [63, 64, 65, 66]);
+        assert_eq!(first.global_slots, [23*64+63, 22*64, 22*64+1, 22*64+2]);
+        assert_eq!(first.local_slots, [0, 1, 2, 3]);
+        assert_eq!(first.first, [0; 4]);
+        assert_eq!(first.conv_slots, [0; 4]);
+        let wrapped = UnitMetadata::new(&cfg, 1087..1090, &pages, 24)?;
+        assert_eq!(wrapped.ring_slots, [1087, 0, 1]);
+        assert_eq!(wrapped.positions, [1087, 1088, 1089]);
+        pages[1] = pages[0];
+        assert!(UnitMetadata::new(&cfg, 0..2, &pages, 24).is_err());
+        assert!(UnitMetadata::new(&cfg, 64..66, &[0], 24).is_err());
+        assert!(UnitMetadata::new(&cfg, 0..2, &[24], 24).is_err());
+        assert!(UnitMetadata::new(&cfg, 0..4097, &(0..65).collect::<Vec<_>>(), 65).is_err());
+        Ok(())
     }
     #[test]
     fn persistent_cache_layout_separates_layers_requests_and_unit_scratch() -> Result<()> {

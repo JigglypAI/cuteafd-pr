@@ -25,6 +25,13 @@ pub(crate) struct CacheBank<'a> {
     mark_slots: usize,
 }
 impl<'a> CacheBank<'a> {
+    pub fn require_reader(&self, stream: &Stream<'_>) -> Result<()> {
+        ensure!(self.readers.iter().any(|reader| reader.raw == stream.raw
+            && reader.device.id == stream.device.id
+            && std::ptr::eq(reader.device.library, stream.device.library)),
+            "Inkling arithmetic stream is not fenced by persistent cache");
+        Ok(())
+    }
     /// All requests, including tails, are admitted before construction.
     pub fn new(readers: Vec<Rc<Stream<'a>>>, layout: CacheLayout, mark_slots: usize) -> Result<Self> {
         let first = readers.first().context("Inkling cache requires readers")?;
