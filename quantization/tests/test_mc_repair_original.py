@@ -184,3 +184,22 @@ def test_bad_reuse_fails_before_any_output_link(tmp_path,monkeypatch,bad):
     with pytest.raises(ValueError):
         repair.prepare('glmf',p,s,output,reuse=donor)
     assert not output.exists()
+
+
+@pytest.mark.parametrize('valid', [True, False])
+def test_cached_source_revision_alias_proof(tmp_path, monkeypatch, valid):
+    p, source, output, module, raw = fixture(tmp_path, monkeypatch)
+    index_hash = repair.sha256_file(source / 'model.safetensors.index.json')
+    proof = dict(status='passed', repo_id='test/source', pinned_revision='source',
+                 pinned_index_sha256=index_hash, shards=[dict(shard='source.safetensors',
+                 tensors=[module+'.weight'], cached_path=str(source/'source.safetensors'),
+                 bytes=(source/'source.safetensors').stat().st_size + (0 if valid else 1))])
+    path = tmp_path/'source-proof.json'
+    path.write_text(json.dumps(proof))
+    if valid:
+        result = repair.prepare('glmf', p, source, output, source_identity=path)
+        assert result['source_alias_proof'] == proof
+    else:
+        with pytest.raises(ValueError, match='source alias'):
+            repair.prepare('glmf', p, source, output, source_identity=path)
+        assert not output.exists()
