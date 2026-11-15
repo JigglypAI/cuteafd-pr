@@ -510,9 +510,10 @@ class Recorder:
                         paths.add(dependency)
                         pending.append(dependency)
         if self.scoped:
-            runtime = "third_party/sparkinfer/b12x/_lib/runtime_patches.py"
-            if (self.root / runtime).is_file():
-                paths.add(runtime)
+            for name in ("runtime_patches.py", "compile_pool.py"):
+                runtime = "third_party/sparkinfer/b12x/_lib/" + name
+                if (self.root / runtime).is_file():
+                    paths.add(runtime)
         if not self.scoped:
             for name in set(sys.modules) - self.imported:
                 module = sys.modules.get(name)

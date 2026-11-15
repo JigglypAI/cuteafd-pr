@@ -1155,6 +1155,8 @@ def v4_placement_inputs(destination, staging, timeout, workers, previous=None, b
                         shutil.copy2(source, copied)
     for name, _, _ in exports:
         for source in (staging / name).rglob("*.json"):
+            if source.name == "program-timings.json":
+                continue
             target = destination / ".workers" / name / source.relative_to(staging / name)
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(source, target)
