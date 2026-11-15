@@ -626,7 +626,8 @@ mod tests {
                 device: args.device, split_device: args.split_device, peers: &args.peers,
                 native_lib: &args.native_lib, manifest_path: &args.manifest,
                 split_wire: super::super::dense::PartialPrecision::DEFAULT,
-                attention_placement: cuteafd_loader::placement::attention::parse(&args.attention_placement).map_err(anyhow::Error::msg)?,
+                attention_placement: cuteafd_loader::placement::attention::parse(&args.attention_placement).map_err(anyhow::Error::msg)?
+                    .unwrap_or(cuteafd_loader::placement::AttentionPlacement::Heads),
                 prefill: PrefillShape { rows: prefill.unit_rows, waves: prefill.waves },
                 sequences: 4, context_tokens: 0, pool_tokens: None,
                 onboard: args.rtx_expert_layers.resolve(cfg.moe.iter().filter(|&&moe| moe).count()),
