@@ -189,6 +189,7 @@ mod tests {
             (ExpertFormat::Fp8Block128, 4096, 2048, 8),
             (ExpertFormat::Mxfp4, 7168, 2048, 10),
             (ExpertFormat::Nvfp4, 6144, 3072, 4),
+            (ExpertFormat::Mxfp8, 4608, 2304, 8),
         ] {
             let root = tempfile::tempdir()?;
             let mut weights = Vec::new();
@@ -207,7 +208,7 @@ mod tests {
             let tensors = Fp8ExpertTensors::read(root.path(), RoutedExpertShape { layers: 10, first_layer: 3,
                 experts: 1, topk, hidden, intermediate, draft_stages: 0, draft_experts: 0 })?;
             let mut info = Fp8MoeInfo { hidden, intermediate, slice: intermediate, experts: 1, topk, tp: 1,
-                wire_input: false, nvfp4_input: false, swiglu_limit: tensors.shape().geometry()?.swiglu_limit().unwrap_or(0.0),
+                wire_input: format == ExpertFormat::Mxfp8, nvfp4_input: false, swiglu_limit: tensors.shape().geometry()?.swiglu_limit().unwrap_or(0.0),
                 swiglu_alpha: 1.0, swiglu_beta: 0.0, activation: Fp8MoeActivation::SiluBf16Product,
                 projection: Fp8MoeProjection::Bf16, capacities: vec![1, 16, 4096], scale_convention: cuteafd_ffi::fp8_moe::Fp8MoeScaleConvention::Multiplier, weights: match format {
                     ExpertFormat::Fp8Block128 => Fp8MoeWeights::Fp8,
@@ -223,8 +224,9 @@ mod tests {
             assert!(validate_info(&info, &tensors, &[3], Slicing::Blocks(128), 0).is_err());
             assert!(validate_info(&info, &tensors, &[3], Slicing::Blocks(128), 4097).is_err());
             info.wire_input = true;
-            assert!(validate_info(&info, &tensors, &[3], Slicing::Blocks(128), 16).is_err());
-            info.wire_input = false;
+            assert_eq!(validate_info(&info, &tensors, &[3], Slicing::Blocks(128), 16).is_ok(),
+                format == ExpertFormat::Mxfp8);
+            info.wire_input = format == ExpertFormat::Mxfp8;
             info.tp = 2;
             assert!(validate_info(&info, &tensors, &[3], Slicing::Blocks(128), 16).is_err());
             info.tp = 1;

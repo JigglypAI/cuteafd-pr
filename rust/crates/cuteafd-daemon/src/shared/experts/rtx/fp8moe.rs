@@ -387,6 +387,7 @@ mod tests {
             (ExpertFormat::Mxfp4, 4096, 1280, 8),
             (ExpertFormat::Mxfp4, 7168, 2048, 10),
             (ExpertFormat::Nvfp4, 2560, 640, 8),
+            (ExpertFormat::Mxfp8, 4608, 2304, 8),
         ] {
             let root = tempfile::tempdir()?;
             let mut weights = Vec::new();
@@ -406,7 +407,7 @@ mod tests {
                 experts: 1, topk, hidden, intermediate, draft_stages: 0, draft_experts: 0 })?;
             for rank in 0..2 {
                 let mut info = Fp8MoeInfo { hidden, intermediate, slice: tensors.rank_width(2, rank, Slicing::Blocks(128))?,
-                    experts: 1, topk, tp: 2, wire_input: false, nvfp4_input: false,
+                    experts: 1, topk, tp: 2, wire_input: format == ExpertFormat::Mxfp8, nvfp4_input: false,
                     swiglu_limit: tensors.shape().geometry()?.swiglu_limit().unwrap_or(0.0), swiglu_alpha: 1.0, swiglu_beta: 0.0, activation: cuteafd_ffi::fp8_moe::Fp8MoeActivation::SiluBf16Product, projection: cuteafd_ffi::fp8_moe::Fp8MoeProjection::Bf16, capacities: vec![1, 16, 4096],
                     scale_convention: cuteafd_ffi::fp8_moe::Fp8MoeScaleConvention::Multiplier, weights: match format { ExpertFormat::Fp8Block128 => Fp8MoeWeights::Fp8,
                         ExpertFormat::Mxfp4 => Fp8MoeWeights::Mxfp4,
@@ -417,7 +418,8 @@ mod tests {
                 assert!(validate_info(&info, &tensors, &[0], 2, Slicing::Blocks(128), 16).is_err());
                 assert!(validate_info(&info, &tensors, &[0], rank, Slicing::Blocks(128), 4097).is_err());
                 info.wire_input = true;
-                assert!(validate_info(&info, &tensors, &[0], rank, Slicing::Blocks(128), 16).is_err());
+                assert_eq!(validate_info(&info, &tensors, &[0], rank, Slicing::Blocks(128), 16).is_ok(),
+                    format == ExpertFormat::Mxfp8);
                 info.wire_input = false;
                 info.tp = 1;
                 assert!(validate_info(&info, &tensors, &[0], rank, Slicing::Blocks(128), 16).is_err());
