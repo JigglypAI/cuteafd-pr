@@ -925,7 +925,7 @@ fn read_expert_catalog_with_checkpoint(snapshot: &Path, config: &serde_json::Val
             experts: cfg.experts, topk: cfg.topk, hidden: cfg.hidden, intermediate: cfg.intermediate,
             draft_stages: 0, draft_experts: 0 };
         if config["quantization_config"]["quant_method"] == "exl3" {
-            return exl3_catalog_or_read(snapshot, shape, &[4], checkpoint);
+            return exl3_catalog_or_read(snapshot, shape, &[4, 5], checkpoint);
         }
         return fp8_catalog(snapshot, shape);
     }

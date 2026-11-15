@@ -608,7 +608,7 @@ def build(args: argparse.Namespace) -> None:
                          f"(use --cross-sm121 on an SM120 host)")
     base = GEOMETRIES[args.geometry]
     capacities = sorted({int(v) for v in args.capacities.split(",")})
-    unit = 16 if base.weights == "nvfp4" else 32 if base.weights == "mxfp4" else 128
+    unit = 16 if base.weights == "nvfp4" else 32 if base.weights in ("mxfp4", "mxfp8") else 128
     if getattr(args, "all_spark_counts", False) and (args.role != "spark" or args.layouts):
         raise SystemExit("--all-spark-counts requires Spark role without --layouts")
     from spark_packages import geometry_worlds

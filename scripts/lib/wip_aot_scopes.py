@@ -203,13 +203,16 @@ def family_scopes(cards, config_reader):
             # Biased-sink GQA attention programs, and the MXFP8 W8A8 expert package every
             # non-EXL3 checkpoint needs (all layers of the MXFP8 release, 40-47 of the
             # official one, whose layers 0-39 are native dynamic-amax NVFP4 W4A4).
-            # Coordinator only: Spark packages follow the engine's expert formats.
             env['CUTEAFD_WIP_INKLING2_AOT'] = 'ON'
             model = str(values.get('MODEL_ID') or values.get('MODEL') or '')
-            if model_id_format(model) != 'exl3':
+            if model_id_format(model) == 'exl3':
+                scopes.add('inkling2:exl3-k45')
+            else:
                 scopes.add('inkling2:mxfp8')
                 if 'mxfp8' not in model.lower():
                     scopes.add('inkling2:nvfp4a4')
+            if count:
+                counts.add(f'inkling2={count}')
         if family == 'mistral_large4':
             # The GLM engine's ml4 variant: its own coordinator programs and K6
             # core (ML4_AOT), EXL3 K4/K5 experts at the card's Spark TP.
@@ -266,7 +269,7 @@ def family_scopes(cards, config_reader):
                     env['CUTEAFD_WIP_MIMO_GEOMETRIES'] = ';'.join(sorted(set(env.get('CUTEAFD_WIP_MIMO_GEOMETRIES', '').split(';')) - {''} | wanted))
         card_scopes, scopes = scopes, scopes_before | scopes
         if count:
-            spark_scopes |= {scope for scope in card_scopes if not scope.startswith(('glmfdense:', 'inkling2:mxfp8', 'inkling2:nvfp4a4'))}
+            spark_scopes |= {scope for scope in card_scopes if not scope.startswith('glmfdense:')}
     env.update(CUTEAFD_WIP_COORDINATOR_EXPERT_FAMILIES=';'.join(sorted(scopes)),
                CUTEAFD_WIP_GENERIC_SPARK_COUNTS=';'.join(sorted(counts)),
                CUTEAFD_WIP_EXPERT_FAMILIES=';'.join(sorted(spark_scopes)),

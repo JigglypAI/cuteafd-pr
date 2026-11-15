@@ -108,7 +108,7 @@ pub fn spark_package_worlds(family: &str, format: &str) -> Vec<usize> {
     let intermediate = entry["intermediate"].as_u64().unwrap_or(0) as usize;
     let exl3 = format == "exl3";
     let native = matches!(family, "v41" | "dsv4f" | "dsv4p") && !exl3;
-    let unit = if native || matches!(family, "mimof" | "mimop") { 32 } else { 128 };
+    let unit = if native || matches!(family, "mimof" | "mimop") || format == "mxfp8" { 32 } else { 128 };
     let available = seeds.into_iter().flat_map(|world|
         package_width_keys(intermediate, unit, world, exl3, native, false)).collect::<std::collections::BTreeSet<_>>();
     (1..=crate::MAX_SPARK_WORLD).filter(|&world| {
