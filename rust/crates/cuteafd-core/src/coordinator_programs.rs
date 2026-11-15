@@ -175,7 +175,11 @@ impl MlaDraftProgramLayout {
 pub struct MlaDraftLayoutError;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SparseAttentionBackend { NativeFp32, Bf16Aot }
+pub enum SparseAttentionBackend {
+    NativeFp32,
+    /// Native FP8/FP4 records dequantized for BF16 QK/PV, with ten BF16 splits.
+    Bf16Aot,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SparseAttentionRecipe {
