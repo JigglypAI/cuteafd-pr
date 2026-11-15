@@ -27,6 +27,52 @@ Rubric, each 1–5 (5 best), plus wall time:
 
 ## Log
 
+### 2026-11-15 MiniMax Scaled FP8 KV Attention Duel: Carbon R1 Wins
+
+Carbon High, driven by DeepSeek Flash, seals `93450d8c` on fork #339:
+16-byte asynchronous scale-plane ingress alongside the payload and a shared
+sparse page/address hoist. Decode scale storage aliases the existing arena;
+extend adds 1,024 B. Page layout, FP32 scales, packer and downstream arithmetic
+are unchanged. Organizer-only SM120 graph-replay measurements put C1/C16 at
+29.643/30.883 us versus same-session shipping 29.336/30.539 us: 1.0105/1.0113x,
+inside the <=1.05x bar and faster than the BF16 reference's 30.834/32.312 us.
+Shipping, Carbon and BF16 have zero thermal or power-cap slowdown, max 46-47 C,
+minimum T.Limit headroom 45-46 C and busy SM clock 2,610 MHz.
+
+DeepSeek's register-only `293fcb31` on fork #338 hoists addresses and issues
+K/V scale loads before the payload wait. It reduces the old scaled cost by
+about 14%, but remains 1.109/1.108x shipping in its decisive session. Against
+Carbon in the same session it measures 32.898/34.296 us; that arm has 0.237 s
+of software power-cap, zero thermal slowdown. Both entrants independently
+pass 175 GPU tests and all 522 output plus 522 LSE digests are byte-identical
+to `45e6c582`; 54 CPU contracts/architecture checks pass. DeepSeek's extend
+per-row max/best is 1.0399, without an adjacent jump above 10%.
+
+Carbon's broader sparse helper is not inline-scale-only: the generic extend
+planner can set `msa_block_sparse=True`. Both arms pass the 48 existing sparse
+and end-to-end tests; semantic digest completion, Carbon row/resource gates
+and the targeted whole/half-head export audit are pending at this checkpoint.
+Initial sparse LSE hashes included unconsumed padding and fake-launch output;
+receipts now exclude those undefined bytes, without kernel/tolerance changes.
+The engine audit group gains explicit half-head stems in a separate tested
+commit. No whole-tree export comparison is scheduled.
+
+Provisional scores: Carbon Correct 5, Judgement 4, Quality 4, Creative 5;
+DeepSeek Correct 5, Judgement 4, Quality 4, Creative 3. Carbon takes 24m00s
+from GO to commit, 33m36s from launch to seal, three driver steers, zero
+503/retries and unknown peak context. DeepSeek seals in 1m57s after GO;
+its first-finisher bonus is not spent: after cross-feedback it concedes with
+no credible hypothesis beating Carbon. Driver inventory/occupancy overclaims
+require organizer corrections; DeepSeek's speculative bar-relaxation and
+page-table-defect framing are also corrected. Neither entrant runs GPU tests
+or changes the benchmark/oracles. Stop after R1 rather than chasing beyond
+the satisfied bar. Final landing remains gated by the pending checks.
+
+Evidence: fork #335/#337/#338/#339, engine #2174; organizer `baseline.json`,
+`carbon-round1-timing.json`, `carbon-round1-oracle.json`, `ds-round1-oracle.json`,
+`ds-round1-rowcurve.json`, `shared-sparse-reach.json` and
+`sparse-receipt-adjustments.json` under `~/.cache/cuteafd/builds/minimax-kv-duel/`.
+
 ### 2026-11-15 V4.1 BF16 Attention Duel: Carbon Wins, Merged
 
 Carbon High, driven by DeepSeek Flash, wins R1 with `497d1760`: decode each
