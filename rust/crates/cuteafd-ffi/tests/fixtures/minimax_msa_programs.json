@@ -188,7 +188,9 @@
         "block_tokens": 128,
         "topk": 16,
         "mode": "decode",
-        "softmax_scale": 0.08838834764831845
+        "softmax_scale": 0.08838834764831845,
+        "record_bytes": 528,
+        "scale_offset": 512
       },
       "pointers": [
         {
@@ -200,25 +202,13 @@
         {
           "name": "key_cache",
           "dtype": "uint8",
-          "shape": "[pool_pages,64,4,128] E4M3 bytes",
+          "shape": "[pool_pages,64,528] scaled E4M3 records",
           "role": "in"
         },
         {
           "name": "value_cache",
           "dtype": "uint8",
-          "shape": "[pool_pages,64,4,128] E4M3 bytes",
-          "role": "in"
-        },
-        {
-          "name": "k_descale",
-          "dtype": "float32",
-          "shape": "[batch,4]",
-          "role": "in"
-        },
-        {
-          "name": "v_descale",
-          "dtype": "float32",
-          "shape": "[batch,4]",
+          "shape": "[pool_pages,64,528] scaled E4M3 records",
           "role": "in"
         },
         {
@@ -306,7 +296,9 @@
         "block_tokens": 128,
         "topk": 16,
         "mode": "extend",
-        "softmax_scale": 0.08838834764831845
+        "softmax_scale": 0.08838834764831845,
+        "record_bytes": 528,
+        "scale_offset": 512
       },
       "pointers": [
         {
@@ -318,25 +310,13 @@
         {
           "name": "key_cache",
           "dtype": "uint8",
-          "shape": "[pool_pages,64,4,128] E4M3 bytes",
+          "shape": "[pool_pages,64,528] scaled E4M3 records",
           "role": "in"
         },
         {
           "name": "value_cache",
           "dtype": "uint8",
-          "shape": "[pool_pages,64,4,128] E4M3 bytes",
-          "role": "in"
-        },
-        {
-          "name": "k_descale",
-          "dtype": "float32",
-          "shape": "[batch,4]",
-          "role": "in"
-        },
-        {
-          "name": "v_descale",
-          "dtype": "float32",
-          "shape": "[batch,4]",
+          "shape": "[pool_pages,64,528] scaled E4M3 records",
           "role": "in"
         },
         {

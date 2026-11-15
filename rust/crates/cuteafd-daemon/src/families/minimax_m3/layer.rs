@@ -882,12 +882,12 @@ mod tests {
     fn diagnose_attention(owner: &UnitOwner<'_>, request: attention::Request,
         extend: &AttentionDiagnostic, decode: &AttentionDiagnostic) -> Result<()> {
         let integers = |bytes: Vec<u8>| bytes.chunks_exact(4).map(|v| i32::from_le_bytes(v.try_into().unwrap())).collect::<Vec<_>>();
-        let floats = |bytes: Vec<u8>| bytes.chunks_exact(4).map(|v| f32::from_le_bytes(v.try_into().unwrap())).collect::<Vec<_>>();
         let pages = integers(read_buffer(owner, request.pages)?);
-        let kd = floats(read_buffer(owner, request.key_descale)?);
-        let vd = floats(read_buffer(owner, request.value_descale)?);
         let key = read_buffer(owner, request.key_cache)?;
         let value = read_buffer(owner, request.value_cache)?;
+        let record = cuteafd_ffi::minimax_m3::kv_plane_record_bytes(4);
+        let scale = |bytes: &[u8], row: usize, head: usize| f32::from_le_bytes(
+            bytes[row * record + 512 + head * 4..row * record + 516 + head * 4].try_into().unwrap());
         let mut outputs = Vec::new();
         for (route, diagnostic) in [("extend", extend), ("decode", decode)] {
             let mut reference = vec![0.0f32; 8192];
@@ -897,10 +897,11 @@ mod tests {
                 let mut maximum = f32::NEG_INFINITY;
                 for (token, score) in scores.iter_mut().enumerate() {
                     if diagnostic.selections[kv_head].contains(&((token / 128) as i32)) {
-                        let base = (usize::try_from(pages[token / 64])? * 64 + token % 64) * 512 + kv_head * 128;
+                        let row = usize::try_from(pages[token / 64])? * 64 + token % 64;
+                        let base = row * record + kv_head * 128;
                         let mut dot = 0.0f32;
                         for column in 0..128 {
-                            dot += diagnostic.query[head * 128 + column] * (e4m3(key[base + column]) * kd[kv_head]);
+                            dot += diagnostic.query[head * 128 + column] * (e4m3(key[base + column]) * scale(&key, row, kv_head));
                         }
                         *score = dot * 128.0f32.sqrt().recip();
                         maximum = maximum.max(*score);
@@ -911,9 +912,10 @@ mod tests {
                 for score in &mut scores { *score = (*score - maximum).exp(); denominator += *score; }
                 for (token, score) in scores.into_iter().enumerate() {
                     let probability = score / denominator;
-                    let base = (usize::try_from(pages[token / 64])? * 64 + token % 64) * 512 + kv_head * 128;
+                    let row = usize::try_from(pages[token / 64])? * 64 + token % 64;
+                        let base = row * record + kv_head * 128;
                     for column in 0..128 {
-                        reference[head * 128 + column] += probability * (e4m3(value[base + column]) * vd[kv_head]);
+                        reference[head * 128 + column] += probability * (e4m3(value[base + column]) * scale(&value, row, kv_head));
                     }
                 }
             }

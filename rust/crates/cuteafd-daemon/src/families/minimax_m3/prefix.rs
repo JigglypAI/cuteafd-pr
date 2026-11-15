@@ -64,8 +64,8 @@ impl<'a> MiniMaxPrefix<'a> {
         for (rank, bank) in banks.iter().enumerate() {
             copies.ordered(rank, |stream| bank.reserve_tables(stream))?;
         }
-        let record_format = if heads { "minimax_msa_fp8_kv_index_heads_tp2_v1" }
-            else { "minimax_msa_fp8_kv_index_v1" };
+        let record_format = if heads { "minimax_msa_scaled_fp8_kv_index_heads_tp2_v2" }
+            else { "minimax_msa_scaled_fp8_kv_index_v2" };
         Ok(Self(Rc::new(Inner { copies, banks, scratch: residual_scratch, layout, record_format })))
     }
 
@@ -277,10 +277,10 @@ mod tests {
         }
         let scratch = Rc::new(Allocation::new(banks[0].stream.device, 256, Tag::workspace("minimax/unit"))?);
         let family = MiniMaxPrefix::new(banks, scratch)?;
-        assert_eq!(family.layout().page_bytes, cfg.layers * 2 * (16384 + 16384 + 8448));
-        assert_eq!(family.record_format(), "minimax_msa_fp8_kv_index_heads_tp2_v1");
+        assert_eq!(family.layout().page_bytes, cfg.layers * 2 * (17408 + 17408 + 8448));
+        assert_eq!(family.record_format(), "minimax_msa_scaled_fp8_kv_index_heads_tp2_v2");
         let layers = self::family(&library, 4)?;
-        assert_eq!(layers.record_format(), "minimax_msa_fp8_kv_index_v1");
+        assert_eq!(layers.record_format(), "minimax_msa_scaled_fp8_kv_index_v2");
         assert_ne!(family.record_format(), layers.record_format(), "host snapshots cannot cross layout namespaces");
         for (rank, bank) in family.0.banks.iter().enumerate() {
             for (plane, bytes) in bank.layout.page_planes() {
@@ -421,7 +421,7 @@ mod tests {
         // SAFETY: all CUDA banks, streams and snapshots retire before the library.
         let library = unsafe { NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
         let family = heads_family(&library, 20)?;
-        assert_eq!(family.record_format(), "minimax_msa_fp8_kv_index_heads_tp2_v1");
+        assert_eq!(family.record_format(), "minimax_msa_scaled_fp8_kv_index_heads_tp2_v2");
         assert!(family.0.banks.iter().all(|bank| bank.model_layers == 60 && bank.layers == (0..60)
             && bank.layout.kv_heads() == 2));
         prompt_and_turn_restore(&family)?;

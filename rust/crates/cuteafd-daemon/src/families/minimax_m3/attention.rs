@@ -140,14 +140,11 @@ pub(crate) struct Request {
     pub pool_pages: usize,
     pub positions: Buffer,
     pub slots: Buffer,
-    pub batch_ids: Buffer,
     pub cos_sin: Buffer,
     pub pages: Buffer,
     pub causal_lengths: Buffer,
     pub cache_lengths: Buffer,
     pub query_offsets: Buffer,
-    pub key_descale: Buffer,
-    pub value_descale: Buffer,
     pub key_cache: Buffer,
     pub value_cache: Buffer,
     pub index_cache: Buffer,
@@ -198,7 +195,6 @@ impl Workspace<'_> {
         Ok(minimax_m3::AttentionBatch {
             rows: r.rows, batch, table_stride: r.table_stride, pool_pages: r.pool_pages,
             query: self.plane("attention.query")?, keys: r.key_cache, values: r.value_cache,
-            key_scales: r.key_descale, value_scales: r.value_descale,
             pages: r.pages, lengths: r.cache_lengths, query_offsets: r.query_offsets,
             selections: self.plane("selections")?, output: self.plane("attention.output")?,
             lse: self.plane("attention.lse")?, scratch: self.plane("attention.scratch")?,
@@ -269,9 +265,8 @@ impl Workspace<'_> {
                     output: key, scratch: self.plane(kernels.key.layout.kind.name())?,
                 }, stream.raw)?;
                 kernels.kv.kv(forward::KvBatch {
-                    rows: r.rows, batch, pool_pages: r.pool_pages,
-                    key, value: p.value, slots: r.slots, batch_ids: r.batch_ids,
-                    key_descale: r.key_descale, value_descale: r.value_descale,
+                    rows: r.rows, pool_pages: r.pool_pages,
+                    key, value: p.value, slots: r.slots,
                     key_cache: r.key_cache, value_cache: r.value_cache,
                 }, stream.raw)?;
                 kernels.index.index(producers::IndexProducerBatch {
@@ -517,9 +512,9 @@ mod tests {
         let buffer = Buffer::default();
         let mut request = Request { rows: 1, context: 1, positions_capacity: 4097,
             table_width: 68, table_stride: 68, pool_pages: 65,
-            positions: buffer, slots: buffer, batch_ids: buffer, cos_sin: buffer,
+            positions: buffer, slots: buffer, cos_sin: buffer,
             pages: buffer, causal_lengths: buffer, cache_lengths: buffer,
-            query_offsets: buffer, key_descale: buffer, value_descale: buffer,
+            query_offsets: buffer,
             key_cache: buffer, value_cache: buffer, index_cache: buffer };
         for context in [1, 63, 64, 65, 4095, 4096, 4097] {
             request.context = context;

@@ -315,7 +315,7 @@ fn cache_geometry_preserves_native_fp8_pages_and_physical_layer_owners() {
     let rows = crate::placement::families::minimax_m3::PAGE_ROWS;
     let kv = rows * cfg.kv_heads as u64 * cfg.head_dim as u64;
     let index = rows * (cfg.msa.index_dim as u64 + 4);
-    assert_eq!((kv, kv, index), (32768, 32768, 8448));
+    assert_eq!((kv, kv, index), (33792, 33792, 8448));
     let manifest: serde_json::Value = serde_json::from_str(include_str!(
         "../../../../../cuteafd-ffi/tests/fixtures/minimax_msa_programs.json")).unwrap();
     let mut cache_operands = 0;
@@ -1633,7 +1633,7 @@ fn heads_recipe_matches_native_cache_units_peer_slots_and_one_tail_per_backing()
                 let id = if let Some(plane) = name.strip_prefix("layer.") {
                     let (layer, plane) = plane.split_once('.').unwrap();
                     let plane = match plane { "keys" => "keys", "values" => "values", "index" => "index", _ => panic!() };
-                    assert_eq!(bytes, if plane == "index" { 8448 } else { 16384 });
+                    assert_eq!(bytes, if plane == "index" { 8448 } else { 17408 });
                     Owner::HeadsKv { gpu, layer: layer.parse().unwrap(), plane }.id()
                 } else { format!("{}.{}", Owner::Cache { gpu }.id(), name) };
                 assert_eq!(allocations.get(&id), Some(&(location, bytes)), "{id}");
@@ -1712,7 +1712,7 @@ fn heads_cache_geometry_keeps_one_replicated_index_per_rank() {
     let automatic = model.cache_geometry(CacheOptions { coordinator_ranks: 2, ..Default::default() }).unwrap().unwrap();
     assert_eq!(automatic, geometry);
     for rank in geometry.ranks {
-        assert_eq!(rank.persistent_unit_bytes, 4 * (16384 + 16384 + 8448));
+        assert_eq!(rank.persistent_unit_bytes, 4 * (17408 + 17408 + 8448));
     }
 }
 
@@ -1881,8 +1881,8 @@ fn heads_gather_uses_sliced_targets_mount_sources_and_replicated_host_prefix_pag
     assert_eq!(layers.owners, crate::placement::families::minimax_m3::layer_owners(60, 2));
     let geometry = |bytes: u64| cuteafd_core::prefix::HostCacheGeometry {
         unit_rows: 64, page_bytes: bytes * 60, mark_bytes: 0, draft_bytes: 0 };
-    assert_eq!(heads.host_prefix.chunk_bytes, geometry(2 * (16384 + 16384 + 8448)).chunk_bytes().min(1 << 30));
-    assert_eq!(layers.host_prefix.chunk_bytes, geometry(32768 + 32768 + 8448).chunk_bytes().min(1 << 30));
+    assert_eq!(heads.host_prefix.chunk_bytes, geometry(2 * (17408 + 17408 + 8448)).chunk_bytes().min(1 << 30));
+    assert_eq!(layers.host_prefix.chunk_bytes, geometry(33792 + 33792 + 8448).chunk_bytes().min(1 << 30));
     assert!(layers.push_host_envelopes.iter().all(Option::is_none));
     // A namespace requires push even when expert candidates are mount-only.
     // Count zero can still load the target through the admitted ring-only route.

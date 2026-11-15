@@ -120,7 +120,9 @@
       "geometry": {
         "heads": 4,
         "head_dim": 128,
-        "page_rows": 64
+        "page_rows": 64,
+        "record_bytes": 528,
+        "scale_offset": 512
       },
       "pointers": [
         {
@@ -142,33 +144,15 @@
           "role": "in"
         },
         {
-          "name": "batch_ids",
-          "dtype": "int32",
-          "shape": "[rows]",
-          "role": "in"
-        },
-        {
-          "name": "k_descale",
-          "dtype": "float32",
-          "shape": "[batch,4]",
-          "role": "in"
-        },
-        {
-          "name": "v_descale",
-          "dtype": "float32",
-          "shape": "[batch,4]",
-          "role": "in"
-        },
-        {
           "name": "key_cache",
           "dtype": "uint8",
-          "shape": "[pages,64,4,128]",
+          "shape": "[pages,64,528] scaled E4M3 records",
           "role": "out"
         },
         {
           "name": "value_cache",
           "dtype": "uint8",
-          "shape": "[pages,64,4,128]",
+          "shape": "[pages,64,528] scaled E4M3 records",
           "role": "out"
         }
       ],

@@ -80,7 +80,7 @@ impl<'a> Cache<'a> {
         let offsets = [0i32, span.len() as i32].iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>();
         self.stream.device.run(|| {
             for (name, bytes) in [("positions", positions), ("slots", slots),
-                ("batch_ids", vec![0; span.len() * 4]), ("causal_lengths", causal),
+                ("causal_lengths", causal),
                 ("cache_lengths", (span.end as i32).to_le_bytes().to_vec()),
                 ("query_offsets", offsets)] {
                 self.stream.device.library.copy_h2d(metadata.plane(name)?, &bytes)?;
@@ -100,10 +100,9 @@ impl<'a> Cache<'a> {
             positions_capacity: self.tokens, table_width: self.layout.table_width as usize,
             table_stride: self.layout.table_width as usize, pool_pages: self.layout.pool_pages as usize,
             positions: metadata.plane("positions")?, slots: metadata.plane("slots")?,
-            batch_ids: metadata.plane("batch_ids")?, cos_sin: self.cos_sin.buffer,
+            cos_sin: self.cos_sin.buffer,
             pages: self.plane("page_table")?, causal_lengths: metadata.plane("causal_lengths")?,
             cache_lengths: metadata.plane("cache_lengths")?, query_offsets: metadata.plane("query_offsets")?,
-            key_descale: metadata.plane("key_descale")?, value_descale: metadata.plane("value_descale")?,
             key_cache: self.plane(&format!("layer.{layer}.keys"))?,
             value_cache: self.plane(&format!("layer.{layer}.values"))?,
             index_cache: self.plane(&format!("layer.{layer}.index"))? })
@@ -112,7 +111,7 @@ impl<'a> Cache<'a> {
 
 pub(crate) const PAGE_ROWS: usize = 64;
 pub(crate) const PAGE_PLANES: [(&str, usize); 3] =
-    [("keys", 32768), ("values", 32768), ("index", 8448)];
+    [("keys", 33792), ("values", 33792), ("index", 8448)];
 
 /// Request state contains references and a logical frontier, never device storage.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -558,13 +557,10 @@ impl<'a> PageBank<'a> {
             table_stride: width, pool_pages: self.layout.pool_pages as usize,
             positions: if decode { metadata.plane("positions")? } else { plane("positions", row * 8, prepared.rows * 8)? },
             slots: if decode { metadata.plane("slots")? } else { plane("slots", row * 8, prepared.rows * 8)? },
-            batch_ids: if decode { metadata.plane("batch_ids")? } else { plane("batch_ids", row * 4, prepared.rows * 4)? },
             causal_lengths: if decode { metadata.plane("causal_lengths")? }
                 else { plane("causal_lengths", row * 4, prepared.rows * 4)? },
             cache_lengths: if decode { metadata.plane("cache_lengths")? } else { plane("cache_lengths", block, 4)? },
             query_offsets: if decode { metadata.plane("query_offsets")? } else { plane("query_offsets", block, 8)? },
-            key_descale: if decode { metadata.plane("key_descale")? } else { plane("key_descale", block, 16)? },
-            value_descale: if decode { metadata.plane("value_descale")? } else { plane("value_descale", block, 16)? },
             cos_sin: self.cos_sin.buffer,
             pages: if decode { self.plane("decode_table")? }
                 else { view(self.plane("page_table")?, prepared.slot * width * 4, width * 4)? },
@@ -667,13 +663,8 @@ impl<'a> Metadata<'a> {
             segments: Vec::new(), bank_table: None, decode: false, planes };
         metadata.stream.device.run(|| {
             let library = metadata.stream.device.library;
-            for name in ["key_descale", "value_descale"] {
-                let dst = metadata.plane(name)?;
-                let bytes = (0..dst.bytes / 4).flat_map(|_| 1.0f32.to_le_bytes()).collect::<Vec<_>>();
-                library.copy_h2d(dst, &bytes)?;
-            }
             if mode == MetadataMode::Decode {
-                for name in ["batch_ids", "query_offsets"] {
+                for name in ["query_offsets"] {
                     let dst = metadata.plane(name)?;
                     let bytes = (0..dst.bytes / 4).flat_map(|i| (i as i32).to_le_bytes()).collect::<Vec<_>>();
                     library.copy_h2d(dst, &bytes)?;
@@ -796,8 +787,8 @@ mod tests {
         assert!(bank.decode_request(&metadata, 0).is_err());
         for (index, segment) in segments.iter().enumerate() {
             let r = segment.request;
-            for buffer in [r.positions, r.slots, r.batch_ids, r.causal_lengths,
-                r.cache_lengths, r.query_offsets, r.key_descale, r.value_descale, r.pages] {
+            for buffer in [r.positions, r.slots, r.causal_lengths,
+                r.cache_lengths, r.query_offsets, r.pages] {
                 assert_eq!(buffer.ptr as usize % 16, 0);
             }
             assert_eq!(r.pages.ptr, bank.plane("page_table")?.ptr
@@ -809,7 +800,6 @@ mod tests {
                         .flat_map(|value| (value as i64).to_le_bytes()).collect::<Vec<_>>());
                 assert_eq!(read(&library, r.query_offsets, 8)?,
                     [0, r.rows as i32].into_iter().flat_map(i32::to_le_bytes).collect::<Vec<_>>());
-                assert_eq!(read(&library, r.batch_ids, r.rows * 4)?, vec![0; r.rows * 4]);
                 assert_eq!(read(&library, r.cache_lengths, 4)?, (r.context as i32).to_le_bytes());
                 Ok(())
             })?;
@@ -833,8 +823,6 @@ mod tests {
                 let r = decode.request;
                 assert_eq!(read(&library, r.positions, active.len() * 8)?,
                     active.iter().flat_map(|p| (p.len as i64).to_le_bytes()).collect::<Vec<_>>());
-                assert_eq!(read(&library, r.batch_ids, active.len() * 4)?,
-                    (0..active.len()).flat_map(|i| (i as i32).to_le_bytes()).collect::<Vec<_>>());
                 assert_eq!(read(&library, r.cache_lengths, active.len() * 4)?,
                     active.iter().flat_map(|p| ((p.len + 1) as i32).to_le_bytes()).collect::<Vec<_>>());
                 assert_eq!(read(&library, r.query_offsets, (active.len() + 1) * 4)?,
@@ -889,11 +877,7 @@ mod tests {
                         assert_eq!(staging.bytes, allocation.buffer.bytes);
                         pinned += staging.bytes;
                     }
-                    if matches!(name.as_str(), "key_descale" | "value_descale") {
-                        assert_eq!(device.run(|| read(&library, allocation.buffer, allocation.buffer.bytes))?,
-                            (0..allocation.buffer.bytes / 4).flat_map(|_| 1.0f32.to_le_bytes()).collect::<Vec<_>>());
-                    }
-                    if owner.mode == MetadataMode::Decode && matches!(name.as_str(), "batch_ids" | "query_offsets") {
+                    if owner.mode == MetadataMode::Decode && name == "query_offsets" {
                         assert_eq!(device.run(|| read(&library, allocation.buffer, allocation.buffer.bytes))?,
                             (0..allocation.buffer.bytes / 4).flat_map(|i| (i as i32).to_le_bytes()).collect::<Vec<_>>());
                     }
@@ -904,7 +888,7 @@ mod tests {
                 let expected = match owner.mode {
                     MetadataMode::Cold => 0,
                     MetadataMode::Decode => mutable,
-                    MetadataMode::Prefill => mutable + buffers["batch_ids"] + buffers["query_offsets"],
+                    MetadataMode::Prefill => mutable + buffers["query_offsets"],
                 };
                 assert_eq!(pinned as u64, expected);
             }
@@ -1334,8 +1318,6 @@ mod tests {
             assert_eq!(read(&library, b.query_offsets, 8)?,
                 [0i32, 64].into_iter().flat_map(i32::to_le_bytes).collect::<Vec<_>>());
             assert_eq!(read(&library, b.cache_lengths, 4)?, 129i32.to_le_bytes());
-            assert_eq!(read(&library, b.key_descale, 16)?,
-                [1f32; 4].into_iter().flat_map(f32::to_le_bytes).collect::<Vec<_>>());
             let rope = read(&library, a.cos_sin, 256)?;
             assert_eq!(&rope[..128], [1f32; 32].into_iter().flat_map(f32::to_le_bytes).collect::<Vec<_>>());
             assert_eq!(&rope[128..], &[0; 128]);

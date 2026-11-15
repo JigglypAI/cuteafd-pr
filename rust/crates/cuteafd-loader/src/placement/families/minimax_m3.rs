@@ -66,11 +66,11 @@ impl RequestCapacity {
     }
 
     /// Retained ordered H2D payloads, one per mutable metadata destination.
-    /// Decode batch IDs/offsets are startup iotas; descales are startup ones.
+    /// Decode offsets are startup iotas; other planes have ordered uploads.
     pub fn metadata_uploads(self, prefill: bool) -> Vec<(&'static str, u64)> {
         self.metadata(prefill).buffers().into_iter().filter(|(name, _)| matches!(*name,
             "positions" | "slots" | "causal_lengths" | "cache_lengths")
-            || (prefill && matches!(*name, "batch_ids" | "query_offsets"))).collect()
+            || (prefill && *name == "query_offsets")).collect()
     }
 
     /// Globals only; the constructor derives the physical per-layer pool separately.
