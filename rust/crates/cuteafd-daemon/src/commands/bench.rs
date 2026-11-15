@@ -79,6 +79,9 @@ pub(crate) struct RunArgs {
     /// PROBE_DUMP_ROOT; the panel's pass names the run directory and its manifest.json.
     #[arg(long, value_name = "CASES:START-END", value_parser = cuteafd_bench::panels::lossless::RowDump::parse)]
     pub(crate) lossless_dump: Option<cuteafd_bench::panels::lossless::RowDump>,
+    /// Run spec_lossless_set with N cases in flight at once per arm (default 1: one at a time).
+    #[arg(long, value_name = "N", value_parser = clap::value_parser!(usize).range(1..=64))]
+    pub(crate) lossless_concurrency: Option<usize>,
     /// Shared base context lengths for context_load (256..1048576 tokens).
     #[arg(long, value_parser = cuteafd_bench::panels::context_load::parse_lengths_arg)]
     pub(crate) context_lengths: Option<String>,
@@ -173,7 +176,7 @@ pub(crate) fn run(args: BenchArgs) -> Result<()> {
             let lossless_set = run.lossless_set.as_deref().map(cuteafd_bench::panels::lossless::CaseSet::load).transpose()?;
             let options = cuteafd_bench::cli::RunOptions { url: run.url, profile: run.profile, panels: run.panels,
                 passes, baseline: None, fabric: run.fabric, export: run.export, out: run.out, label: None, root: run.root, api_key: run.api_key, quiet: false, deadline: None,
-                lossless_set, lossless_dump: run.lossless_dump, context_lengths: run.context_lengths.as_deref().map(cuteafd_bench::sweep::parse_lengths).transpose().map_err(anyhow::Error::msg)?,
+                lossless_set, lossless_dump: run.lossless_dump, lossless_concurrency: run.lossless_concurrency, context_lengths: run.context_lengths.as_deref().map(cuteafd_bench::sweep::parse_lengths).transpose().map_err(anyhow::Error::msg)?,
                 context_levels: run.context_levels.as_deref().map(cuteafd_bench::sweep::parse_levels).transpose().map_err(anyhow::Error::msg)?, context_suffix: run.context_suffix };
             let (report, dir) = cuteafd_bench::cli::run(&options)?;
             println!("{}", dir.display());

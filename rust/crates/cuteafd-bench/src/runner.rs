@@ -48,6 +48,9 @@ pub struct RunRequest {
     /// Opt-in row dumps for selected `spec_lossless_set` cases.
     #[serde(default)]
     pub lossless_dump: Option<panels::lossless::RowDump>,
+    /// `spec_lossless_set` cases in flight at once per arm (default 1).
+    #[serde(default)]
+    pub lossless_concurrency: Option<usize>,
     #[serde(default)]
     pub context_lengths: Option<Vec<u64>>,
     #[serde(default)]
@@ -521,6 +524,11 @@ impl Bench {
                 .and_then(|()| panels::lossless::RowDump::root().map(drop)).map_err(StartError::InvalidSet)?;
         }
         let lossless_dump = request.lossless_dump.clone();
+        let lossless_concurrency = request.lossless_concurrency.unwrap_or(1);
+        if !(1..=panels::lossless::MAX_CONCURRENCY).contains(&lossless_concurrency) {
+            return Err(StartError::InvalidSet(format!("lossless_concurrency must be 1-{}",
+                panels::lossless::MAX_CONCURRENCY)));
+        }
         let defaults = panels::context_load::Options::default();
         let context_load = panels::context_load::Options {
             lengths: request.context_lengths.clone().unwrap_or(defaults.lengths),
@@ -570,7 +578,7 @@ impl Bench {
         // clients), so its console text is allowed until it retires.
         let text = BenchText::enable(self);
         std::thread::Builder::new().name("cuteafd-bench".into()).spawn(move || {
-            bench.execute(active, base, plan, report, text, skip_baseline, lossless_set, lossless_dump, context_load, fabric);
+            bench.execute(active, base, plan, report, text, skip_baseline, lossless_set, lossless_dump, lossless_concurrency, context_load, fabric);
         }).expect("spawn the benchmark thread");
         Ok(id)
     }
@@ -585,7 +593,7 @@ impl Bench {
 
     fn execute(self: Arc<Self>, active: ActiveRun, base: String, plan: Vec<PlannedPanel>,
         report: Arc<Mutex<Report>>, text: Option<BenchText>, skip_baseline: bool,
-        lossless_set: Option<panels::lossless::CaseSet>, lossless_dump: Option<panels::lossless::RowDump>,
+        lossless_set: Option<panels::lossless::CaseSet>, lossless_dump: Option<panels::lossless::RowDump>, lossless_concurrency: usize,
         context_load: panels::context_load::Options, fabric: bool) {
         let id = active.id.clone();
         let progress = Progress::default();
@@ -597,7 +605,7 @@ impl Bench {
                 .spawn(move || bench.tick(&report, &progress, &done, &base, fabric)).ok()
         };
         let outcome = self.run_plan(&active, &base, &report, &progress, &plan, skip_baseline, lossless_set.as_ref(),
-            lossless_dump.as_ref(), &context_load, fabric);
+            lossless_dump.as_ref(), lossless_concurrency, &context_load, fabric);
         {
             let mut r = report.lock().expect("report lock");
             r.finished = Some(now_rfc3339());
@@ -645,7 +653,8 @@ impl Bench {
 
     fn run_plan(&self, active: &ActiveRun, base: &str, report: &Arc<Mutex<Report>>, progress: &Progress,
         plan: &[PlannedPanel], skip_baseline: bool, lossless_set: Option<&panels::lossless::CaseSet>,
-        lossless_dump: Option<&panels::lossless::RowDump>, context_load: &panels::context_load::Options, fabric: bool)
+        lossless_dump: Option<&panels::lossless::RowDump>, lossless_concurrency: usize,
+        context_load: &panels::context_load::Options, fabric: bool)
         -> anyhow::Result<()> {
         let mut client = Client::new(base, Some(active.token.clone()), active.cancel.clone()).with_local_probes().with_api_key(self.api_key.get().cloned()).with_fabric(fabric);
         let record = client.discover()?;
@@ -720,7 +729,7 @@ impl Bench {
                 client.check()?;
                 self.begin(active, panel.id(), estimate, remaining, total, pass, planned.passes, progress);
                 let ctx = Ctx { client: &client, info: &info, baseline: baseline.as_ref(), rates, progress, pass,
-                    history: &earlier, max_context, max_output, lossless_set, lossless_dump, context_load };
+                    history: &earlier, max_context, max_output, lossless_set, lossless_dump, lossless_concurrency, context_load };
                 let counters_before = panels::common::phase_counters(&client);
                 let thermal_mark = client.thermal_mark();
                 let fabric_mark = client.fabric_mark();
