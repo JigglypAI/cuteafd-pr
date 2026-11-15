@@ -51,6 +51,10 @@ impl<'a> RetainedUploads<'a> {
             stream: std::ptr::null_mut(), failed: false, exhaustion_waits: 0 })
     }
 
+    /// Existing device alias; startup records it through Census::mapped, never
+    /// as a second physical backing in Inventory.
+    pub fn mapped_alias(&self) -> CuteafdDeviceBuffer { self.alias }
+
     /// Passive inventory: the mapped address describes the pinned backing, not
     /// a second device allocation. Event handles are host diagnostics only.
     pub fn allocation_receipts(&self, inventory: &mut super::memory::receipts::Inventory<'_>, name: &str) -> Result<()> {
@@ -157,7 +161,14 @@ mod retained_inventory_tests {
         assert!(inventory.receipts.iter().all(|receipt| receipt.allocation.location != Location::coordinator(0)),
             "mapped alias must never be charged as device memory");
         assert!(inventory.receipts.iter().any(|receipt| receipt.allocation.id == "fixture.uploads.events"));
-        assert_eq!(owner.alias.bytes, owner.storage.buffer.bytes);
+        assert_eq!(owner.mapped_alias().bytes, owner.storage.buffer.bytes);
+        let mut census = super::super::memory::receipts::Census::default();
+        census.owners(inventory.receipts);
+        census.mapped("fixture.uploads.mapped".into(), "fixture.uploads".into(), owner.mapped_alias(), devices)?;
+        census.normalize(cuteafd_loader::placement::planner::PhaseOrder::TARGET_THEN_DRAFT)?;
+        assert_eq!(census.aliases[0].bytes, shape.capacity_bytes()? as u64);
+        assert_eq!(census.aliases[0].backing, "fixture.uploads");
+        assert_eq!(fixture.events()?, before);
         Ok(())
     }
 }
