@@ -67,6 +67,10 @@ fn options(args: &PlanArgs) -> Result<PlanOptions, PlanError> {
                     cuteafd_core::MlaCacheFormat::Bf16 => cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16,
                     cuteafd_core::MlaCacheFormat::Fp8 => cuteafd_loader::families::qwen4::Qwen4KvCache::Fp8,
                 }).unwrap_or_default(),
+                muse_kv: args.kv_format.map(|format| match format {
+                    cuteafd_core::MlaCacheFormat::Bf16 => cuteafd_loader::families::muse_spark::cache::MuseKvCache::Bf16,
+                    cuteafd_core::MlaCacheFormat::Fp8 => cuteafd_loader::families::muse_spark::cache::MuseKvCache::Fp8,
+                }).unwrap_or_default(),
                 mla_kv: args.kv_format.unwrap_or_default(),
                 qwen_representation: cuteafd_loader::families::qwen4::resident::Qwen4Representation {
                     fp8_projections: args.fp8_decode, fp8_head: args.mtp_fp8_head },
@@ -1216,6 +1220,18 @@ mod tests {
             (cuteafd_core::MlaCacheFormat::Fp8, Qwen4KvCache::Fp8)] {
             args.kv_format = Some(selected);
             assert_eq!(options(&args).unwrap().layout.unwrap().step5_kv, format);
+        }
+    }
+
+    #[test]
+    fn muse_plan_preserves_bf16_until_fp8_quality_qualification() {
+        use cuteafd_loader::families::muse_spark::cache::MuseKvCache;
+        let mut args = args(std::path::Path::new("/model"), 6, false);
+        assert_eq!(options(&args).unwrap().layout.unwrap().muse_kv, MuseKvCache::Bf16);
+        for (selected, format) in [(cuteafd_core::MlaCacheFormat::Bf16, MuseKvCache::Bf16),
+            (cuteafd_core::MlaCacheFormat::Fp8, MuseKvCache::Fp8)] {
+            args.kv_format = Some(selected);
+            assert_eq!(options(&args).unwrap().layout.unwrap().muse_kv, format);
         }
     }
 

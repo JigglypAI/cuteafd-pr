@@ -410,8 +410,13 @@ def test_optional_levers_are_default_off_and_documented():
                     assert result.returncode == 0, result.stderr
                     assert result.stdout == (value if value in {"off", "dspark"} else "off")
                 continue
-            assert default.startswith(("off", "unset")), \
-                f"lever {key} default is {default!r}, not off/unset"
+            if key == "KV_CACHE":
+                assert lever["families"] == ["Muse"]
+                assert default == "family default"
+                assert 'muse_kv_cache="$(get KV_CACHE bf16)"' in (ROOT / "scripts/launch/run-family.sh").read_text()
+            else:
+                assert default.startswith(("off", "unset")), \
+                    f"lever {key} default is {default!r}, not off/unset"
             for family in lever["families"]:
                 assert family in COLUMNS, f"lever {key} names unknown family column {family}"
                 assert MATRIX[key][family], f"lever {key} is not accepted by {family}"
@@ -440,3 +445,20 @@ def test_qwen_pool_first_onboarding_documents_whole_and_hybrid_tp2():
     assert "`RTX_EXPERT_LAYERS=auto` is pool-first on one or two RTX devices" in text
     assert "Spark-backed layouts: whole routed layers on one RTX, TP2 halves on two" in text
     assert "`--rtx-expert-layers` does not require `--split-device`" in text
+
+
+def test_muse_target_kv_precision_is_opt_in_and_draft_is_independent():
+    for _, header, rows in tables(DOC.read_text().splitlines()):
+        if header == ["Value", *COLUMNS] and any(label(row[0]) == "bf16" for row in rows):
+            precision = {label(row[0]): dict(zip(COLUMNS, row[1:])) for row in rows}
+            assert precision["bf16"]["Muse"] == "✓ (default)"
+            assert precision["fp8"]["Muse"] == "✓ (opt-in)"
+            break
+    else:
+        raise AssertionError("missing KV precision table")
+    assert "KV_CACHE" in family_keys("muse_spark")
+    assert "DRAFT_KV_CACHE" in family_keys("muse_spark")
+    launcher = (ROOT / "scripts/launch/run-family.sh").read_text()
+    assert 'family_args+=(--kv-cache "$muse_kv_cache")' in launcher
+    assert 'plan_draft_args+=(--kv-cache "$muse_kv_cache")' in launcher
+    assert 'muse_draft_kv="$(get DRAFT_KV_CACHE fp8)"' in launcher

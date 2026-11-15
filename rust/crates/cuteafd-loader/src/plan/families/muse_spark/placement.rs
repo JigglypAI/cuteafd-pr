@@ -9,7 +9,7 @@ use super::Model;
 use anyhow::Context as _;
 use crate::placement::families::muse_spark as shared;
 use crate::placement::planner::{Operation, PrefillShape};
-use crate::placement::{ArchContext, AttentionPlacement, Demand, Onboard, ProgramSet, ResidentWeights,
+use crate::placement::{ArchContext, AttentionPlacement, Demand, Onboard, ResidentWeights,
     SparkWorkingSet};
 use crate::plan::{Component, ExpertPlacement, PlanReport};
 use cuteafd_core::memory_layout::{Basis, Category, DeviceKind, DeviceLayout, Item, MemoryLayout};
@@ -78,12 +78,12 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
     };
     // GPU marks follow the shared prefix rule: host-tier retention keeps only staging slots.
     let mark_slots = opts.prefix_slots.unwrap_or_else(|| cuteafd_core::prefix::mark_slots_with_host(slots,
-        opts.mimo_prefix_entries, crate::placement::families::muse_spark::mark_bytes(cfg, 1),
+        opts.mimo_prefix_entries, crate::placement::families::muse_spark::mark_bytes_with_format(cfg, 1, opts.muse_kv),
         opts.mimo_prefix_mark_bytes, opts.host_cache_bytes != Some(0)));
     if opts.host_cache_bytes == Some(0) {
         memory.notes.push(format!("Muse host prefix tier off: retains {mark_slots} exact prefix marks; \
             {} B/mark across {gpus} GPU(s), device mark budget {} B{}",
-            crate::placement::families::muse_spark::mark_bytes(cfg, 1), opts.mimo_prefix_mark_bytes,
+            crate::placement::families::muse_spark::mark_bytes_with_format(cfg, 1, opts.muse_kv), opts.mimo_prefix_mark_bytes,
             if opts.prefix_slots.is_some() { " (explicit slot override)" } else { "" }));
     }
     let onboard = opts.resolve_onboard(catalog.routed_experts().routed_layers()).unwrap_or(Onboard::Auto);
@@ -178,7 +178,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
             reason: format!("{mode:?} tower not admitted: joint memory contract refused") };
         if component == Component::Vision { report.encoder = Some(encoder); } else { report.audio_encoder = Some(encoder); }
     }
-    let facts = shared::ProductionInput { cfg, core: &model.core, projections, catalog, budgets, host, prefill,
+    let facts = shared::ProductionInput { kv_cache: opts.muse_kv, cfg, core: &model.core, projections, catalog, budgets, host, prefill,
          bf16_target_head: opts.bf16_target_head, slots, mark_slots, context, maximum_pool_tokens,
         partial_bf16_max_rows: opts.muse_partial_bf16_max_rows, partial_reply_formats: opts.spark_reply_formats,
         local, drafter, fixed, media };
@@ -236,12 +236,13 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
     memory.notes.push(format!("Muse K6 core: {} header-native projections ({}); payload + H128 vectors charged",
         model.core.projections.len(), if model.core.complete(cfg) { "complete" } else { "partial: BF16 rest" }));
     let placed = admitted.placement;
+    let record = opts.muse_kv.record_bytes(cfg.kv_heads, cfg.head_dim);
     let rings = crate::placement::families::muse_spark::ring_rows(cfg).unwrap_or(0)
-        * cfg.kv_record_bytes() as u64 * cfg.sliding_layers() as u64;
+        * record as u64 * cfg.sliding_layers() as u64;
     memory.pool_tokens = placed.pool_tokens;
     memory.notes.push(format!("Muse selected RTX expert layers: {}; pool {} tokens; full-layer KV {} B/token over {} \
         layers; sliding rings {} B/sequence over {} layers", placed.onboard_layers, placed.pool_tokens,
-        cfg.kv_record_bytes() * cfg.full_layers(), cfg.full_layers(), rings, cfg.sliding_layers()));
+        record * cfg.full_layers(), cfg.full_layers(), rings, cfg.sliding_layers()));
     for gpu in 0..gpus {
         let mut device = DeviceLayout { kind: DeviceKind::Rtx, index: gpu as u32, capacity_bytes: cards[gpu].physical_bytes.min(cards[gpu].logical_bytes), worker_budget_bytes: 0,
             items: placed.items[gpu].clone(), kv_tokens: placed.pool_tokens };
@@ -296,7 +297,7 @@ fn planned_code(input: &crate::plan::PlanInput, opts: &crate::plan::layout::Layo
         path.is_file().then_some(path) });
     let Some(path) = path else { return Ok(Vec::new()) };
     let manifest = input.manifest(path)?;
-    let programs = ProgramSet::from_manifest(&manifest, crate::placement::families::muse_spark::program_families(gpus));
+    let programs = shared::program_set(&manifest, gpus, opts.muse_kv);
     (0..gpus).map(|rank| {
         let mut programs = programs.clone();
         projections[rank].include_native_programs(&mut programs);

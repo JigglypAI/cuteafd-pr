@@ -1175,8 +1175,14 @@ fn host_retention_exceeds_device_banks_and_counts_shared_pages_once() {
 
 #[test]
 fn host_snapshot_rejects_a_different_record_format_before_copying() {
+    different_record_format_is_cold("qwen4_e4m3_token_head_f32_v1", "qwen4_bf16_v1");
+    different_record_format_is_cold("muse_fp8_head_scales_kv_v1", "muse_bf16_kv_v1");
+    different_record_format_is_cold("muse_bf16_kv_v1", "muse_fp8_head_scales_kv_v1");
+}
+
+fn different_record_format_is_cold(saved: &'static str, other: &'static str) {
     let fake = Fake::new(24, 4, 8);
-    fake.record_format.set("qwen4_e4m3_token_head_f32_v1");
+    fake.record_format.set(saved);
     let mut cache = cache(&fake, 8, 1 << 20);
     let prompt = seq(100, 26);
     let (_, _, p) = serve(&mut cache, &fake, 0, &prompt, &[], 32);
@@ -1185,14 +1191,14 @@ fn host_snapshot_rejects_a_different_record_format_before_copying() {
     cache.release(&fake, &p.pages).unwrap();
     assert_eq!(cache.stats().host.unwrap().stores_completed, 1);
     cache.clear(&fake).unwrap();
-    fake.record_format.set("qwen4_bf16_v1");
+    fake.record_format.set(other);
     let hit = cache.admit(&fake, &prompt, 32, false,
         |pages| Placement { pages, ring: 1, len: 0, ring_from: 0 }).unwrap();
     assert_eq!(hit.resume, 0);
     assert_eq!(cache.stats().promotions, 0);
     assert_eq!(cache.stats().host.unwrap().restores, 0);
     cache.release(&fake, &hit.placement.pages).unwrap();
-    fake.record_format.set("qwen4_e4m3_token_head_f32_v1");
+    fake.record_format.set(saved);
     let (resume, _, p) = serve(&mut cache, &fake, 2, &prompt, &[], 32);
     assert_eq!(resume, prompt.len());
     assert_eq!(cache.stats().promotions, 1);

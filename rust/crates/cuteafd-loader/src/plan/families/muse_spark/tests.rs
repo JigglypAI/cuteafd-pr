@@ -1033,3 +1033,43 @@ fn routed_experts_declare_the_partial_reply_epilogue() {
     assert!(!Exl3Epilogue::PartialReplies.allocates("output"));
     assert!(Exl3Epilogue::Sum.allocates("output"));
 }
+
+#[test]
+fn kv_formats_price_exact_pool_ring_marks_and_lane_without_duplicate_scales() {
+    use crate::families::muse_spark::cache::{MuseKvCache, PAGE_ROWS};
+    let dir = snapshot(&all_layers());
+    let input = testing::BudgetedPlanInput::open(dir.path()).unwrap();
+    let package = tempfile::tempdir().unwrap();
+    for (gpus, sparks) in [(1usize, 4), (2, 6)] {
+        let mut options = with_package(gpus, sparks, package.path());
+        let layout = options.layout.as_mut().unwrap();
+        layout.pool_tokens = Some(262144);
+        layout.context_tokens = 131072;
+        layout.concurrency = 16;
+        layout.onboard = Some(crate::placement::OnboardSetting::Layers(0));
+        layout.host_cache_bytes = Some(0);
+        layout.prefix_slots = Some(1);
+        for format in [MuseKvCache::Bf16, MuseKvCache::Fp8] {
+            options.layout.as_mut().unwrap().muse_kv = format;
+            let report = input.plan(&options).unwrap();
+            assert!(report.fits, "{gpus} {format:?}: {:?}", report.hints);
+            let placed = report.solver_placement.as_ref().unwrap();
+            assert_eq!(placed.pool_tokens, 262144);
+            let record = format.record_bytes(16 / gpus, 64) as u64;
+            for rank in 0..gpus {
+                let group = |prefix: &str| placed.items[rank].iter().filter(|item| item.group.starts_with(prefix))
+                    .map(|item| item.bytes).sum::<u64>();
+                assert_eq!(group("full-layer KV"), 262144 * 16 * record);
+                assert_eq!(group("sliding rings"), 46 * 2112 * 16 * record);
+                assert_eq!(group("Muse exact sliding marks"), 46 * 2048 * record);
+                assert_eq!(group("Muse KV FP32 scale plane"), 0, "aliases never add a charge");
+                let cfg = crate::families::muse_spark::MuseSparkConfig::from_hf(&testing::muse_spark_config()).unwrap();
+                let shape = report.prefill_unit_rows.unwrap() as usize;
+                let waves = report.prefill_waves.unwrap() as usize;
+                let lane = crate::families::muse_spark::lane::LanePlanes::with_format(&cfg, gpus, shape, waves, format).unwrap();
+                assert_eq!(group("Muse lane planes"), lane.bytes().unwrap() as u64);
+            }
+            assert_eq!(record * PAGE_ROWS % 16, 0);
+        }
+    }
+}

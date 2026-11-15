@@ -154,9 +154,14 @@ impl HostInput {
     }
 
     pub fn quotas(self, cfg: &MuseSparkConfig, context: u64, slots: u64) -> Result<HostAdmission, Refusal> {
+        self.quotas_with_format(cfg, context, slots, crate::families::muse_spark::cache::MuseKvCache::Bf16)
+    }
+
+    pub fn quotas_with_format(self, cfg: &MuseSparkConfig, context: u64, slots: u64,
+        format: crate::families::muse_spark::cache::MuseKvCache) -> Result<HostAdmission, Refusal> {
         let geometry = cuteafd_core::prefix::HostCacheGeometry { unit_rows: PAGE_ROWS,
-            page_bytes: cfg.full_layers() as u64 * cfg.kv_record_bytes() as u64 * PAGE_ROWS,
-            mark_bytes: mark_bytes(cfg, 1), draft_bytes: 0 };
+            page_bytes: cfg.full_layers() as u64 * format.record_bytes(cfg.kv_heads, cfg.head_dim) as u64 * PAGE_ROWS,
+            mark_bytes: super::mark_bytes_with_format(cfg, 1, format), draft_bytes: 0 };
         let prefix_bytes = if self.prefix_entries == 0 { 0 } else {
             geometry.resolve(self.prefix_bytes, context, slots, self.total, geometry.chunk_bytes())
                 .ok_or_else(|| invalid("host prefix quota geometry overflow"))? };
@@ -171,6 +176,7 @@ impl HostInput {
 /// Everything Muse knows before a solve: geometry, budgets and header-exact
 /// cost tables, identical on the planned and measured edges.
 pub struct ProductionInput<'a> {
+    pub kv_cache: crate::families::muse_spark::cache::MuseKvCache,
     pub cfg: &'a MuseSparkConfig,
     pub core: &'a CoreInventory,
     /// Preweight resolution retained unchanged through admission and owner checks.
@@ -203,6 +209,7 @@ pub struct ProductionInput<'a> {
 
 /// The prepared recipe plus everything the caller reports from it.
 pub struct PreparedMuse<'a> {
+    kv_cache: crate::families::muse_spark::cache::MuseKvCache,
     pub recipe: MuseRecipe<'a>,
     budgets: Vec<Budget>,
     local: LocalPackage,
@@ -217,6 +224,7 @@ pub struct PreparedMuse<'a> {
 
 /// The one admitted answer. Both edges read the same fields.
 pub struct AdmittedMuse {
+    pub kv_cache: crate::families::muse_spark::cache::MuseKvCache,
     pub placement: Placement,
     pub spark: SparkWorkingSet,
     pub solved: ResolvedPlan,
@@ -322,9 +330,26 @@ fn tower_options(media: &MediaOptions, gpus: usize, sparks: usize)
         .collect())
 }
 
+/// Strided inline descales alias their record backing. `bytes` is the address
+/// envelope, not a second charge; shape names only the FP32 scale elements.
+fn scale_alias(id: String, backing: String, location: Location, lifetime: Lifetime,
+    payload: u64, record: u64, heads: usize, bytes: ByteCurve, rows: ByteCurve, maximum: u64) -> Component {
+    let mut owner = Allocation::buffer(id, location, bytes.at(1).expect("validated scale extent"), lifetime,
+        Category::Kv, format!("Muse KV FP32 scale plane (record stride {record} B)"));
+    owner.view = Some(View { backing, offset: payload });
+    owner.dtype = "f32".into();
+    owner.alignment = 16;
+    owner.shape = vec![1, 2, heads as u64];
+    let mut component = Component::allocation(owner, bytes, false, maximum);
+    if let ComponentKind::Allocation { shape, .. } = &mut component.kind {
+        *shape = vec![rows, ByteCurve::fixed(2, maximum), ByteCurve::fixed(heads as u64, maximum)];
+    }
+    component
+}
+
 impl<'a> ProductionInput<'a> {
     pub fn prepare(self) -> Result<PreparedMuse<'a>, Refusal> {
-        let ProductionInput { cfg, core, projections, catalog, mut budgets, host, prefill, bf16_target_head, slots, mark_slots,
+        let ProductionInput { kv_cache, cfg, core, projections, catalog, mut budgets, host, prefill, bf16_target_head, slots, mark_slots,
             context, maximum_pool_tokens, partial_bf16_max_rows, partial_reply_formats, local, drafter, fixed,
             media } = self;
         let coordinator = budgets.iter().filter(|budget| budget.locations.iter()
@@ -343,7 +368,7 @@ impl<'a> ProductionInput<'a> {
         if !catalog.per_expert_output_norm() {
             return Err(invalid("Spark experts must carry their post-expert norm"));
         }
-        let host_quotas = host.quotas(cfg, context, slots)?;
+        let host_quotas = host.quotas_with_format(cfg, context, slots, kv_cache)?;
         budgets.push(host.budget());
         let gpus = coordinator;
         let pair = gpus == 2;
@@ -356,10 +381,10 @@ impl<'a> ProductionInput<'a> {
         let slots_usize = usize::try_from(slots).map_err(|_| Refusal::Overflow("Muse slots"))?;
         let unit_rows = usize::try_from(prefill.unit_rows).map_err(|_| Refusal::Overflow("Muse prefill rows"))?;
         let waves = usize::try_from(prefill.waves).map_err(|_| Refusal::Overflow("Muse prefill waves"))?;
-        let record = cfg.kv_record_bytes() as u64;
+        let record = kv_cache.record_bytes(cfg.kv_heads, cfg.head_dim) as u64;
         let rings = cfg.sliding_layers() as u64 * ring_rows(cfg).map_err(anyhow_refusal)? * record;
-        let marks = mark_bytes(cfg, 1);
-        let lane = crate::families::muse_spark::lane::LanePlanes::with_waves(cfg, gpus, unit_rows, waves)
+        let marks = super::mark_bytes_with_format(cfg, 1, kv_cache);
+        let lane = crate::families::muse_spark::lane::LanePlanes::with_format(cfg, gpus, unit_rows, waves, kv_cache)
             .and_then(|planes| planes.bytes()).map_err(anyhow_refusal)? as u64;
         let tables = step_tables(unit_rows, slots_usize, context, waves).map_err(anyhow_refusal)?.bytes()
             as u64;
@@ -436,6 +461,16 @@ impl<'a> ProductionInput<'a> {
             components.extend(buffer(format!("muse.rings.{gpu}"), location, rings * slots / gpus as u64,
                 Lifetime::RESIDENT, Category::Kv,
                 &format!("sliding rings, {slots} sequences x {} layers", cfg.sliding_layers()), maximum_pages));
+            if kv_cache == crate::families::muse_spark::cache::MuseKvCache::Fp8 {
+                let payload = kv_cache.payload_bytes(cfg.kv_heads / gpus, cfg.head_dim) as u64;
+                let rank_record = record / gpus as u64;
+                let rows = cfg.sliding_layers() as u64 * ring_rows(cfg).map_err(anyhow_refusal)? * slots;
+                components.push(scale_alias(format!("muse.rings.{gpu}.scales"),
+                    format!("muse.rings.{gpu}"), location, Lifetime::RESIDENT,
+                    payload, rank_record, cfg.kv_heads / gpus,
+                    ByteCurve::fixed(rows * rank_record - payload, maximum_pages),
+                    ByteCurve::fixed(rows, maximum_pages), maximum_pages));
+            }
             if mark_slots > 0 {
                 components.extend(buffer(format!("muse.marks.{gpu}"), location, marks * mark_slots / gpus as u64,
                     Lifetime::RESIDENT, Category::Prefix,
@@ -466,7 +501,7 @@ impl<'a> ProductionInput<'a> {
             }
             components.extend(buffer(format!("muse.rope.{gpu}"), location, rope, Lifetime::RESIDENT,
                 Category::Workspace, "Muse RoPE tables", maximum_pages));
-            // Full layers page BF16 K+V records: the pool's only slope, split
+            // Full layers page complete payload+scale records: the only pool slope, split
             // across a head-split pair like every other per-layer owner.
             let slope = record.checked_mul(PAGE_ROWS).ok_or(Refusal::Overflow("Muse full-layer KV"))?
                 / gpus as u64;
@@ -476,6 +511,15 @@ impl<'a> ProductionInput<'a> {
                     Allocation::buffer(format!("muse.kv.{gpu}.{layer}"), location, slope, Lifetime::TARGET,
                         Category::Kv, "full-layer KV (paged K+V records)"),
                     ByteCurve::linear(slope, slope, maximum_pages), false, maximum_pages));
+                if kv_cache == crate::families::muse_spark::cache::MuseKvCache::Fp8 {
+                    let payload = kv_cache.payload_bytes(cfg.kv_heads / gpus, cfg.head_dim) as u64;
+                    let rank_record = record / gpus as u64;
+                    components.push(scale_alias(format!("muse.kv.{gpu}.{layer}.scales"),
+                        format!("muse.kv.{gpu}.{layer}"), location, Lifetime::TARGET,
+                        payload, rank_record, cfg.kv_heads / gpus,
+                        ByteCurve::linear(slope - payload, slope, maximum_pages),
+                        ByteCurve::linear(PAGE_ROWS, PAGE_ROWS, maximum_pages), maximum_pages));
+                }
             }
         }
         components.extend(buffer("muse.combine".into(), Location::coordinator(0), combine, Lifetime::RESIDENT,
@@ -666,7 +710,7 @@ impl<'a> ProductionInput<'a> {
             prefill: PrefillShape { rows: prefill.unit_rows, waves: prefill.waves }, attention,
             spark_ranks, encoders, modes: (media.vision, media.audio), cases, peaks, local: local.clone(),
             drafter: drafter.clone(), head_backend: if global.head.is_none() && global.head_native.is_none() { bf16_target_head } else { serving::BlasHead::Native } };
-        Ok(PreparedMuse { recipe, budgets, local, drafter, layouts, global, projections,
+        Ok(PreparedMuse { kv_cache, recipe, budgets, local, drafter, layouts, global, projections,
             spark_budget, host: host_quotas, push })
     }
 }
@@ -1016,7 +1060,7 @@ fn solve_sampled(request: Request, mut budgets: Vec<Budget>, recipe: &MuseRecipe
 impl PreparedMuse<'_> {
     /// The single admission solve. Planner and serving call this one verb.
     pub fn admit(self, request: Request) -> Result<AdmittedMuse, Refusal> {
-        let PreparedMuse { recipe, budgets, local, drafter, layouts, global, projections,
+        let PreparedMuse { kv_cache, recipe, budgets, local, drafter, layouts, global, projections,
             spark_budget, mut host, push } = self;
         let started = std::time::Instant::now();
         let solved = solve_sampled(request, budgets, &recipe)?;
@@ -1026,7 +1070,7 @@ impl PreparedMuse<'_> {
         let push = push.get(placement.onboard_layers).ok_or_else(|| invalid("push onboarding extent"))?.clone();
         let media = recipe.media(&solved)?;
         if media.vision.admitted_bytes() == 0 && media.audio.admitted_bytes() == 0 { host.media_bytes = 0; }
-        Ok(AdmittedMuse { placement, spark, draft_home: solved.decisions.draft_home, solved, media, local,
+        Ok(AdmittedMuse { kv_cache, placement, spark, draft_home: solved.decisions.draft_home, solved, media, local,
             drafter, layouts, global, projections, spark_budget, solve_us, host, push })
     }
 }
@@ -1034,6 +1078,45 @@ impl PreparedMuse<'_> {
 #[cfg(test)]
 mod contract_tests {
     use super::*;
+
+    #[test]
+    fn program_inventory_retains_only_the_selected_kv_modules() {
+        use crate::families::muse_spark::cache::MuseKvCache;
+        let manifest = serde_json::json!({"programs": [
+            {"name":"muse_qk_norm_rope_swa"}, {"name":"muse_qk_norm_rope_swa_kv_fp8"},
+            {"name":"muse2_attention_full_decode"}, {"name":"muse2_attention_full_decode_kv_fp8"},
+            {"name":"muse2_swa_commit"}, {"name":"muse2_swa_commit_kv_fp8"},
+            {"name":"muse2_attention_output"}, {"name":"muse_router"}, {"name":"step5_norm"}]});
+        for format in [MuseKvCache::Bf16, MuseKvCache::Fp8] {
+            let set = super::super::program_set(&manifest, 2, format);
+            assert_eq!(set.names.len(), 5);
+            assert!(set.names.iter().any(|name| name == "muse_router"));
+            assert!(set.names.iter().any(|name| name == "muse2_attention_output"));
+            for name in set.names.iter().filter(|name| !matches!(name.as_str(), "muse_router" | "muse2_attention_output")) {
+                assert_eq!(name.ends_with("_kv_fp8"), format == MuseKvCache::Fp8);
+            }
+        }
+    }
+
+    #[test]
+    fn inline_scale_alias_is_aligned_exact_and_never_a_second_charge() {
+        for (heads, record) in [(16usize, 2176u64), (8, 1088)] {
+            let payload = (heads * 128) as u64;
+            let slope = record * PAGE_ROWS;
+            let alias = scale_alias("kv.scales".into(), "kv".into(), Location::coordinator(0),
+                Lifetime::TARGET, payload, record, heads,
+                ByteCurve::linear(slope - payload, slope, 8), ByteCurve::linear(PAGE_ROWS, PAGE_ROWS, 8), 8);
+            let ComponentKind::Allocation { template, offset, shape, .. } = alias.kind else { panic!("scale alias") };
+            assert_eq!(template.view.unwrap(), View { backing: "kv".into(), offset: payload });
+            assert_eq!(payload % template.alignment, 0);
+            for pages in [1u64, 2, 8] {
+                assert_eq!(offset.as_ref().unwrap().at(pages).unwrap() + alias.bytes.at(pages).unwrap(), pages * slope);
+                assert_eq!(shape[0].at(pages).unwrap(), pages * PAGE_ROWS);
+                assert_eq!(shape[1].at(pages).unwrap() * shape[2].at(pages).unwrap() * 4,
+                    record - payload);
+            }
+        }
+    }
 
     #[test]
     fn blas_joint_towers_share_only_their_selected_process_thread() {
