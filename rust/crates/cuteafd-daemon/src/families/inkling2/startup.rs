@@ -10,6 +10,7 @@ use cuteafd_loader::{families::inkling2::{admission::{gather, Coordinator, Facts
         AttentionPlacement, Onboard, ResidentWeights}, plan::Checkpoint};
 use std::{net::SocketAddr, path::Path, sync::Arc};
 
+#[derive(Clone, Copy)]
 pub(crate) struct Options<'a> {
     pub device: i32,
     pub peers: &'a [SocketAddr],
@@ -154,6 +155,59 @@ pub(crate) fn deliver<'a>(library: &'a NativeLibrary,
         view, checkpoint, &catalog, inputs, admitted)?;
     let pending = spark.start_with(options.peers, Some(membership))?;
     target.finish(&catalog, pending)
+}
+
+/// Construct only the initial whole-rank execution after exact shared
+/// admission and required grouped delivery. The public scheduler/readiness
+/// edge is intentionally separate and remains unqualified until native gates.
+pub(crate) fn whole<'a>(library: &'a Arc<NativeLibrary>, programs: &'a Programs<'a>,
+    view: &cuteafd_loader::plan::checkpoint::CheckpointView, checkpoint: &Checkpoint,
+    cfg: &Inkling2Config, options: Options<'_>) -> Result<(super::engine::Execution<'a>, InklingInputs, AdmittedInkling, ModelEncoding)> {
+    use crate::shared::{memory::device::{Device, Stream}, spark_intake::SparkLink};
+    use cuteafd_transport::{expert::{SparkWorld, EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16},
+        ExpertV2Dtype, SparkSessionShape, TcpTransportConfig};
+    let prepared = prepare(library, programs, checkpoint, cfg, Options { ..options })?;
+    let (target, pushed) = deliver(library, view, checkpoint, &prepared, &options)?;
+    let Prepared { kernels, encoding, inputs, admitted, module_pins, exl3_modules, .. } = prepared;
+    let device = Device { library, id: options.device };
+    let stream = std::rc::Rc::new(Stream::new(device)?);
+    let requests = super::owners::RequestOwners::whole(stream.clone(), &inputs, &admitted)?;
+    let head = super::head::Head::new(stream.clone(), cfg, 64)?;
+    let catalog = cuteafd_loader::read_expert_catalog_view(view)?;
+    let backings = match &inputs.local {
+        inkling2::LocalPackage::Installed { backings } => backings[admitted.onboard].as_slice(),
+        _ if admitted.onboard == 0 => &[],
+        _ => anyhow::bail!("Inkling admitted resident backend absent"),
+    };
+    let mut ranks = pushed.into_iter();
+    let sets = ranks.next().context("Inkling committed coordinator rank absent")?;
+    ensure!(ranks.next().is_none() && sets.len() == backings.len(), "Inkling pushed expert set/rank count differs");
+    let mut local = Vec::<Box<dyn super::experts::Dispatcher + 'a>>::new();
+    for (backing, set) in backings.iter().zip(sets) {
+        let handles = super::experts::Resident::from_pushed(stream.clone(), &catalog, options.native_lib,
+            backing, usize::try_from(inputs.prefill.rows.max(64))?, set)?;
+        local.extend(handles.into_iter().map(|owner| Box::new(owner) as Box<dyn super::experts::Dispatcher>));
+    }
+    ensure!(local.len() == admitted.onboard, "Inkling resident layer handle count differs");
+    let geometry = inputs.links.first().context("Inkling admitted Spark link absent")?.clone();
+    let mut link = device.run(|| SparkLink::prepared(library, SparkWorld::canonical(options.peers.len())?,
+        options.peers, TcpTransportConfig::default(), geometry))?;
+    link.enable_terminal_ownership(Arc::clone(library))?;
+    let mut session = SparkSessionShape::new(u32::try_from(inputs.prefill.rows)?, u32::try_from(cfg.hidden)?, u32::try_from(cfg.topk)?,
+        ExpertV2Dtype::Fp8E4m3Ue8m0K32)?;
+    session.flags |= EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16;
+    device.run(|| link.bootstrap(&session))?;
+    let execution = super::engine::Execution::new(link, requests, head, target, kernels, local, cfg.clone())?;
+    let physical = [options.device];
+    let devices = cuteafd_loader::placement::planner::CoordinatorDevices::new(&physical)?;
+    let mut inventory = crate::shared::memory::receipts::Inventory::new(devices, "retained",
+        cuteafd_loader::placement::planner::Lifetime::TARGET, cuteafd_core::memory_layout::Category::Workspace, "Inkling requests");
+    let mut census = crate::shared::memory::receipts::Census::default();
+    execution.requests.allocation_receipts(&mut inventory, &mut census, devices)?;
+    super::admission::reconcile_requests(&admitted.solved, &inputs, &inventory.receipts)?;
+    // Runtime backends now retain the same code sampled before weights.
+    drop(module_pins); drop(exl3_modules);
+    Ok((execution, inputs, admitted, encoding))
 }
 
 #[cfg(test)]
