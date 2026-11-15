@@ -610,6 +610,144 @@ mod tests {
     use std::rc::Rc;
 
     #[test]
+    #[ignore = "requires sealed MiniMax model, native library and three/four Spark workers"]
+    fn native_zero_proposal_matches_eager_verify_logits_and_taps() -> Result<()> {
+        use clap::Parser;
+        use sha2::{Digest, Sha256};
+        use std::sync::Arc;
+        use cuteafd_loader::{plan::Checkpoint, placement::planner::PrefillShape};
+        let snapshot = std::env::var("CUTEAFD_GOLDEN_SNAPSHOT")?;
+        let native = std::env::var("CUTEAFD_NATIVE_LIB")?;
+        let manifest = std::env::var("CUTEAFD_PROGRAM_MANIFEST")?;
+        let peers = std::env::var("CUTEAFD_GOLDEN_PEERS")?;
+        let mut argv = vec!["cuteafd", "serve-minimax", "--snapshot", &snapshot,
+            "--native-lib", &native, "--manifest", &manifest, "--peers", &peers,
+            "--max-sequences", "4", "--dspark"];
+        let split = std::env::var("CUTEAFD_MINIMAX_PROOF_SPLIT").unwrap_or_else(|_| "off".into());
+        if split == "on" { argv.extend(["--split-device", "1"]); }
+        let crate::cli::Commands::ServeMinimax(mut args) = crate::cli::Cli::try_parse_from(argv)?.command
+            else { unreachable!() };
+        args.prefix.resolve_entries(4);
+        let view = args.attention.select(&args.snapshot)?;
+        args.attention.validate_view(&view)?;
+        let checkpoint = Checkpoint::coordinator_view(&view, false, false)?;
+        let cfg = MiniMaxM3Config::from_hf(&checkpoint.config)?;
+        let prefill = cuteafd_loader::serving_capacity::prefill_waves::prefill_shape(args.peers.len(),
+            cuteafd_loader::plan::Family::prefill_limits(&cuteafd_loader::plan::families::minimax::MINIMAX_M3),
+            Default::default())?;
+        // SAFETY: the sealed native library outlives all admitted owners/streams.
+        let library = Arc::new(unsafe { NativeLibrary::load(&args.native_lib)? });
+        let programs = library.programs()?.with_manifest(&args.manifest)?;
+        let loaded = super::super::startup::load(&library, &programs, &view, &checkpoint, &cfg,
+            super::super::startup::Options {
+                device: args.device, split_device: args.split_device, peers: &args.peers,
+                native_lib: &args.native_lib, manifest_path: &args.manifest,
+                split_wire: super::super::dense::PartialPrecision::DEFAULT,
+                prefill: PrefillShape { rows: prefill.unit_rows, waves: prefill.waves },
+                sequences: 4, context_tokens: 0, pool_tokens: None,
+                onboard: args.rtx_expert_layers.resolve(cfg.moe.iter().filter(|&&moe| moe).count()),
+                prefix: &args.prefix, expert_usage: args.expert_usage,
+                usage_reader: args.expert_usage_reader.clone(),
+                resident_weights: crate::shared::memory::budget::resident_weight_limit(), draft: true,
+            })?;
+        let context = usize::try_from(loaded.admitted.solved.served_context())?;
+        let backend = MiniMaxBackend::new(&loaded.owners, &cfg, loaded.execution, context,
+            loaded.host_prefix, args.prefill_packing)?;
+        let family = &backend.owners.storage.prefix;
+        let layout = family.layout();
+        let mut pool = RefPagePool::new(layout.pages, layout.page_rows);
+        let tokenizer = cuteafd_loader::LoadedTokenizer::from_snapshot(&args.snapshot)?;
+        let text = "Write a Rust function that merges two sorted slices. Explain bounds, empty inputs, duplicate elements, and why the result stays sorted.\n";
+        let tokens = tokenizer.encode_ids(&text.repeat(32))?;
+        let prompt: usize = 64;
+        let steps: usize = 256;
+        ensure!(tokens.len() >= prompt + steps + 4 && context >= prompt + steps,
+            "MiniMax width-exact prompt exceeds admitted context");
+        let tap_pitch = backend.owners.storage.draft_prefix.as_ref().context("missing proof draft")?
+            .drafter.cfg.taps.len() * cfg.hidden * 2;
+        let read = |buffer: Buffer, bytes: usize| -> Result<Vec<u8>> {
+            backend.drain()?;
+            let buffer = super::super::cache::view(buffer, 0, bytes)?;
+            let mut output = vec![0; bytes];
+            library.cuda_set_device(buffer.device_id)?;
+            library.copy_d2h(&mut output, buffer)?;
+            Ok(output)
+        };
+        let mut digest = Sha256::new();
+        let mut compared_rows = 0;
+        for width in [1, 4] {
+            let mut placements = (0..width).map(|slot| -> Result<_> {
+                let mut placement = Placement { units: pool.alloc((prompt + steps).div_ceil(PAGE_ROWS))?, slot, len: 0 };
+                family.bind(&mut placement).map_err(|error| anyhow::anyhow!(error.to_string()))?;
+                backend.identities.borrow_mut().insert(slot, (slot + 1) as u64);
+                Ok(placement)
+            }).collect::<Result<Vec<_>>>()?;
+            let mut states = (0..width).map(|_| DraftState::default()).collect::<Vec<_>>();
+            for (slot, placement) in placements.iter_mut().enumerate() {
+                backend.prefill_device(placement, &tokens[slot..slot + prompt], 0, &pool)?;
+            }
+            for step in 0..steps {
+                let position = prompt + step;
+                let inputs = (0..width).map(|slot| tokens[slot + position]).collect::<Vec<_>>();
+                let mut rows = placements.iter_mut().zip(&inputs).map(|(placement, token)|
+                    (placement, std::slice::from_ref(token))).collect::<Vec<_>>();
+                let native_first = step % 2 == 0;
+                let first = if native_first { backend.verify_device(&mut rows, false, &pool)? }
+                    else { backend.verify_staged(&mut rows, &pool)? }.context("missing first-route logits")?;
+                let first_logits = read(Buffer { ptr: first.ptr.cast_mut(), bytes: width * cfg.vocab_size * 4,
+                    device_id: backend.owners.storage.ranks.last().unwrap().decode.borrow().stream.device.id,
+                    ..Default::default() }, width * cfg.vocab_size * 4)?;
+                let taps = backend.owners.storage.verify_taps.as_ref().context("missing native proof taps")?.buffer;
+                let first_taps = read(taps, width * tap_pitch)?;
+                ensure!(rows.iter().all(|(placement, _)| placement.len == position),
+                    "zero-proposal route published before accept");
+                ensure!(backend.pending.borrow_mut().take().is_some(), "first route did not stage a receipt");
+                let second = if native_first { backend.verify_staged(&mut rows, &pool)? }
+                    else { backend.verify_device(&mut rows, false, &pool)? }.context("missing second-route logits")?;
+                let second_logits = read(Buffer { ptr: second.ptr.cast_mut(), bytes: width * cfg.vocab_size * 4,
+                    device_id: taps.device_id, ..Default::default() }, width * cfg.vocab_size * 4)?;
+                let second_taps = read(taps, width * tap_pitch)?;
+                ensure!(first_logits == second_logits, "native/eager logits differ at C{width} position {position}");
+                ensure!(first_taps == second_taps, "native/eager taps differ at C{width} position {position}");
+                ensure!(first_logits.chunks_exact(4).all(|word|
+                    f32::from_le_bytes(word.try_into().unwrap()).is_finite()), "nonfinite native proof logits");
+                digest.update((width as u64).to_le_bytes());
+                digest.update((position as u64).to_le_bytes());
+                digest.update(&first_logits);
+                digest.update(&first_taps);
+                drop(rows);
+                let mut verified = placements.iter_mut().zip(&mut states).zip(&inputs).enumerate()
+                    .map(|(slot, ((placement, state), token))| scheduler::Verified {
+                        placement, seq: state, start: position, history: (slot + 1) as u64,
+                        rows: std::slice::from_ref(token), first_row: slot,
+                        kept: Some((1, *token)), finished: false, neural: true,
+                    }).collect::<Vec<_>>();
+                backend.accept(&mut verified, false)?;
+                ensure!(verified.iter().all(|request| request.placement.len == position + 1),
+                    "paired zero-proposal target commit differs");
+                for slot in 0..width {
+                    ensure!(backend.owners.storage.draft_prefix.as_ref().unwrap().frontier(slot)? == position + 1,
+                        "paired zero-proposal draft frontier differs");
+                }
+                compared_rows += width;
+            }
+            for placement in &mut placements {
+                backend.cancel(placement)?;
+                family.discard(placement).map_err(|error| anyhow::anyhow!(error.to_string()))?;
+                pool.release(&placement.units);
+            }
+        }
+        let report = serde_json::json!({"byte_identical_logits":true, "byte_identical_taps":true,
+            "widths":[1,4], "tokens_per_width":steps, "rows":compared_rows,
+            "sha256":format!("{:x}", digest.finalize())});
+        println!("MiniMax native zero-proposal exactness: {report}");
+        if let Ok(output) = std::env::var("CUTEAFD_GOLDEN_OUT") {
+            std::fs::write(Path::new(&output).join("native-zero-proposal.json"), serde_json::to_vec_pretty(&report)?)?;
+        }
+        Ok(())
+    }
+
+    #[test]
     fn policy_probe_observes_each_round_and_updates_only_live_concurrency_bucket() {
         use crate::shared::draft::{resource,clock::RoundTimes,evidence::DraftSource};
         let geometry=cuteafd_core::PolicyGeometry { layers:vec![cuteafd_core::LayerResource {
