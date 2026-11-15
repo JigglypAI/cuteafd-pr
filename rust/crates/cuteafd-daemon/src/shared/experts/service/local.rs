@@ -467,6 +467,7 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
                     epilogue)?
             };
             execution.defer(usize::from(extent.buffered_units), extent.staging_rows as usize, extent.owner)?;
+            execution.prepare_waves(extent)?;
             if partial_replies {
                 let programs = programs.as_ref().context("partial replies need the image's PROGRAMS.json")?;
                 let super::backend::Execution::Exl3(worker) = &mut execution else {

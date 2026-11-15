@@ -371,6 +371,15 @@ pub(super) enum Execution<'w, 'a> {
     Exlr8(super::exlr8::Worker<'w, 'a>),
 }
 impl<'w, 'a> Execution<'w, 'a> {
+    /// Allocate a prefill owner's merged-wave staging after `defer` (FP8
+    /// prepares its own at construction; other backends do not merge yet).
+    pub(super) fn prepare_waves(&mut self, extent: cuteafd_core::OwnerExtent) -> Result<()> {
+        match self {
+            Self::Exl3(execution) => execution.prepare_waves(extent),
+            Self::Fp8(_) | Self::Full(_) | Self::Exlr8(_) => Ok(()),
+        }
+    }
+
     /// Launch every staged unit (shared wave staging, `execution::waves`).
     pub(super) fn flush_staged(&mut self) -> Result<()> {
         match self {
@@ -746,12 +755,17 @@ pub(super) fn load_exl3<'a>(
     config.validate_exl3_residency(catalog, &exl3_directory)?;
 
     let epilogue = Exl3Epilogue::for_catalog(catalog);
-    let workspace = spark_execution_workspace(config, |capacity, _, staging_rows, _| {
+    let segments = Exl3Worker::segments_directory(&exl3_directory, epilogue);
+    let workspace = spark_execution_workspace(config, |capacity, _, staging_rows, extent| {
         let device = Exl3Worker::plan(&exl3_directory, capacity, config.exl3_schedule, epilogue)
             .context("EXL3 checkpoint requires matching native AOT artifacts; set --exl3-aot-dir for a custom export")?;
         let staging = (staging_rows as usize).checked_mul(cuteafd_core::expert_geometry().topk as usize * 8)
             .context("EXL3 route staging overflow")?;
-        Ok((device, 0, staging))
+        // A prefill owner's merged waves: segments arena, staged slices and
+        // tables (device) plus row-address descriptors per queued unit.
+        let waves = Exl3Worker::wave_bytes(segments.as_deref(), extent)?;
+        let descriptors = if waves > 0 { super::super::execution::waves::WaveStaging::pinned_bytes(extent) } else { 0 };
+        Ok((device, waves, staging + descriptors))
     })?;
     let workspace = usize::try_from(workspace.total().context("EXL3 owner workspace overflow")?)?;
     let layers = config.resident_layers(catalog.routed_experts().layers)?;
