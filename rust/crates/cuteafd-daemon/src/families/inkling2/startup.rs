@@ -14,6 +14,7 @@ pub(crate) struct Options<'a> {
     pub device: i32,
     pub peers: &'a [SocketAddr],
     pub manifest: &'a Path,
+    pub native_lib: &'a Path,
     pub prefill: PrefillShape,
     pub sequences: u64,
     pub context_tokens: u64,
@@ -33,6 +34,9 @@ pub(crate) struct Prepared<'a> {
     pub inputs: InklingInputs,
     pub admitted: AdmittedInkling,
     pub runtime: RuntimeInventory,
+    /// Expert code belongs to the sampled baseline until its runtime binds.
+    pub module_pins: Vec<cuteafd_ffi::fp8_moe::Fp8MoeModule>,
+    pub exl3_modules: Vec<crate::shared::experts::exl3::execution::Exl3Modules<'a>>,
 }
 
 fn validate(options: &Options<'_>, cfg: &Inkling2Config) -> Result<()> {
@@ -60,12 +64,34 @@ pub(crate) fn prepare<'a>(library: &'a NativeLibrary, programs: &'a Programs<'a>
     ensure!(eos == [200006], "Inkling checkpoint EOS differs from its native sampling-end marker");
     cuteafd_core::set_expert_geometry(cuteafd_core::ExpertGeometry::INKLING2)
         .map_err(|geometry| anyhow::anyhow!("Inkling requires isolated process geometry, found {geometry:?}"))?;
+    let catalog = match &checkpoint.view {
+        Some(view) => cuteafd_loader::read_expert_catalog_view(view)?,
+        None => cuteafd_loader::read_expert_catalog(&checkpoint.snapshot)?,
+    };
+    let mut module_pins = Vec::new();
+    let mut exl3_modules = Vec::new();
     let mut kernels = None;
     let runtime = RuntimeInventory::measure(library, &[options.device], InventoryPhase::PreWeight, |_| {
         // Static load finish is explicitly checked before any push owner exists.
         // Missing pin/export is a named startup error, never a host fallback.
         programs.program("inkling2_padded_transpose_bf16_r16_c1024_p64", &["source", "output"])?;
         kernels = Some(Kernels::bind(programs)?);
+        if let Some(tensors) = catalog.fp8() {
+            let layers = (0..cfg.layers).collect::<Vec<_>>();
+            for (view, _) in tensors.homogeneous_layers(&layers)? {
+                let directory = crate::shared::experts::fp8::package_directory(options.native_lib, 1, view.format());
+                // SAFETY: trusted installed static expert package; retained
+                // across sampling and final backend binding, no weight storage.
+                module_pins.push(unsafe { cuteafd_ffi::fp8_moe::Fp8MoeModule::load(&directory)? });
+            }
+        } else if catalog.exl3().is_some() {
+            let directory = options.native_lib.parent().context("Inkling native library directory absent")?
+                .join("exl3/exl3-inkling2-k45/rtx-tp1");
+            exl3_modules = crate::shared::experts::rtx::exl3::Exl3Tp2::preload_whole_modules(
+                crate::shared::memory::device::Device { library, id: options.device }, &directory,
+                usize::try_from(options.prefill.rows.max(64))?, cuteafd_core::ExpertGeometry::INKLING2,
+                crate::shared::experts::rtx::RtxSelectionPolicy::FirstCapacity)?;
+        }
         Ok(())
     })?;
     let policy = cuteafd_core::memory_policy::MemoryPolicy::current();
@@ -93,7 +119,7 @@ pub(crate) fn prepare<'a>(library: &'a NativeLibrary, programs: &'a Programs<'a>
     runtime.record("inkling2", &runtime.gpus.iter().map(|sample| sample.free_bytes).collect::<Vec<_>>());
     cuteafd_bench::context::ResolvedSettings::placement(&admitted.placement).publish();
     cuteafd_bench::context::set_resolved("max-context-tokens", &admitted.solved.served_context().to_string());
-    Ok(Prepared { kernels: kernels.context("Inkling kernel preload did not run")?, encoding, eos, inputs, admitted, runtime })
+    Ok(Prepared { kernels: kernels.context("Inkling kernel preload did not run")?, encoding, eos, inputs, admitted, runtime, module_pins, exl3_modules })
 }
 
 #[cfg(test)]
