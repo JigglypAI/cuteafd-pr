@@ -50,9 +50,9 @@ A separate clean-master port of DeepSeek's idea qualifies only V4.1 TP6
 compact-code A8 decode on SM121: 13 matched cells are byte-identical, live-1
 speedup 1.087-1.110x, all other measured TP6 cells win/tie. TP3's master gain
 shrinks to about 1.02x, versus 1.06-1.12x on the experimental unification
-branch; TP3 stays off. Fork #323 is still gated on the final narrowed-head
-native oracle. CPU contracts pass and the targeted export audit changes
-exactly TP6 m1/m16/m64, with TP3 and prefill objects unchanged.
+branch; TP3 stays off. Fork #323 is ready: the final TP6-only head passes 46 native V4 oracle
+cases and 378 CPU contracts. The targeted export audit changes exactly
+TP6 m1/m16/m64, with TP3 and prefill objects unchanged.
 
 Evidence: cuteafd #2129, fork #318/#320/#321/#323; organizer receipts under
 `~/.cache/cuteafd/builds/mxfp4-duel/receipts/`. Final round scores and
