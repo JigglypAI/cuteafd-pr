@@ -13,6 +13,7 @@ pub const FP8_RECIPE: &str = "row-major-e4m3-f32-block128-rne-amax448-v1";
 pub struct CheckpointView {
     snapshot: PathBuf,
     mode: CoreView,
+    original_core_dtype: Option<String>,
     config_name: String,
     index_name: String,
     quant_names: Vec<String>,
@@ -120,7 +121,7 @@ impl CheckpointView {
             ensure!(mc.is_none(), "MC view requires selected index {index_name}");
             None
         };
-        Ok(Self { snapshot: snapshot.into(), mode, config_name: config_name.into(), index_name,
+        Ok(Self { snapshot: snapshot.into(), mode, original_core_dtype: mc.as_ref().map(|(m, _)| m.original_core_dtype.clone()), config_name: config_name.into(), index_name,
             quant_names, fingerprint: format!("{:x}", hash.finalize()), config: Arc::new(config),
             quantize_config, weight_map, fp8_tensors: Arc::new(fp8_tensors), metadata_digests, classification_headers: Arc::default() })
     }
@@ -133,6 +134,7 @@ impl CheckpointView {
 
     pub fn snapshot(&self) -> &Path { &self.snapshot }
     pub fn mode(&self) -> CoreView { self.mode }
+    pub fn original_core_dtype(&self) -> Option<&str> { self.original_core_dtype.as_deref() }
     pub fn is_mc(&self) -> bool { self.metadata_digests.contains_key(MC_MANIFEST) }
     /// The core view this checkpoint serves, when it declares views at all (an MC checkpoint
     /// with `cuteafd-mc.json`). A plain checkpoint has only its own core: `None`, not

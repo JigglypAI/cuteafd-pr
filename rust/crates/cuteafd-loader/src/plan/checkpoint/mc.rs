@@ -71,7 +71,7 @@ pub(super) struct Variant {
 pub(super) struct Manifest {
     schema: String,
     source: Source,
-    original_core_dtype: String,
+    pub(super) original_core_dtype: String,
     shared_inventory_sha256: String,
     variants: Vec<Variant>,
 }

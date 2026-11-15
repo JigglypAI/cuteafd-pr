@@ -406,6 +406,8 @@ const PRECISION_SETTINGS: &[&str] = &["CUTEAFD_V41_FP8_HEAD", "fp8-head", "kda-f
 const QUANT_SELECTION_SETTINGS: &[&str] = &[
     // The served checkpoint snapshot (the same path as the server's top-level snapshot).
     "snapshot",
+    // MC original dtype is checkpoint identity, not a same-checkpoint precision switch.
+    "core-original-dtype",
     // Which published EXLR8 expert manifest (per-expert bit allocation) the native arm loads.
     "exlr8-manifest",
 ];
