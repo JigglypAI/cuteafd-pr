@@ -313,7 +313,7 @@ impl<'a> UnitOwner<'a> {
             routed_boundary: Rc::new(super::experts::Boundary::new(kernels.device)?),
             attention: kernels.attention.as_ref().map(|attention| if prefill { attention::Workspace::new(attention) }
                 else { attention::Workspace::new_decode(attention) }).transpose()?,
-            split: None, stream, rows, planes })
+            split: None, stream, rows, planes, target_taps: None })
     }
     fn heads(&self) -> bool { self.planes.contains_key("reduction") }
     pub fn is_split(&self) -> bool { self.split.is_some() }
