@@ -70,6 +70,36 @@ impl<'a> TargetWeights<'a> {
         }
         Ok(Self { rank: layout.rank, layers: layout.layers.clone(), operands })
     }
+    /// Header-only delivery records plus generated final views. This entry is
+    /// not used by serving until the padded-transpose fork export is pinned.
+    pub fn record_push(device: Device<'a>, checkpoint: &Checkpoint, layout: &CoordinatorWeights) -> Result<Self> {
+        use crate::shared::experts::rtx::dense::Finish;
+        ensure!(crate::shared::experts::rtx::dense::is_recording(), "Inkling push weights require shared delivery recording");
+        ensure!(layout.core.is_empty() && layout.rank == 0
+            && layout.arena.views().keys().all(|name| !name.contains('#')),
+            "Inkling initial push requires original whole-rank target operands");
+        let dense = DenseLoad::mount(device.library);
+        let arena = DeviceWeightArena::new(device, layout.execution_arena()?, ArenaTag::weights("inkling2/target"))?;
+        let mut operands = BTreeMap::new();
+        for (name, view) in layout.arena.views() {
+            let rect = Rect::tensor(checkpoint, name, None, None)?;
+            ensure!(rect.bytes() == view.bytes(), "Inkling push header differs from admitted view {name}");
+            let owner = arena.view(name, view.bytes())?;
+            dense.operand(Operand { device: device.id, buffer: owner.buffer, lands: vec![(rect, 0)], bytes: view.bytes() })?;
+            operands.insert(name.clone(), owner);
+        }
+        for &layer in &layout.layers {
+            let prefix = format!("model.llm.layers.{layer}.attn.rel_logits_proj");
+            let source = operands.get(&format!("{prefix}.proj")).context("Inkling push relative source absent")?.buffer;
+            let output = arena.view(&format!("{prefix}.padded"), 1024*64*2)?;
+            dense.finish(Finish::PaddedTranspose { source, output: output.buffer, dtype: cuteafd_core::DType::Bf16,
+                rows: 16, cols: 1024, padded_cols: 64 }, std::ptr::null_mut())?;
+            operands.insert(format!("{prefix}.padded"), output);
+        }
+        // Generated views have no delivery Operand: shared DenseArena executes
+        // every registered finish and drains before publishing rank Done.
+        Ok(Self { rank: layout.rank, layers: layout.layers.clone(), operands })
+    }
     pub fn operand(&self, name: &str) -> Result<&Allocation<'a>> {
         self.operands.get(name).with_context(|| format!("Inkling target lacks operand {name}"))
     }

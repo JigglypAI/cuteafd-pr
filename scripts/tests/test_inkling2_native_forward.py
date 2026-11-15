@@ -61,6 +61,11 @@ def test_arenas_are_single_backings_and_head_is_shared():
     assert 'DeviceWeightArena::new' in weights and 'DenseLoad::mount' in weights
     assert 'DeviceWeightArena::new' in experts and 'DenseLoad::mount' in experts
     assert 'dequant' not in experts.lower()
+    push = weights.split('pub fn record_push(')[1].split('pub fn operand(')[0]
+    assert 'Finish::PaddedTranspose' in push
+    assert 'dense.operand(' in push and 'dense.finish(' in push
+    assert 'Rect::tensor(' in push
+    assert 'transpose_relative(' not in push and '.read(' not in push and 'copy_h2d(' not in push
     assert 'transpose_relative' in weights
     assert 'padding_zero_exact = true' in weights
     head = (FAMILY/'head.rs').read_text()
