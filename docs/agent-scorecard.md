@@ -27,7 +27,7 @@ Rubric, each 1–5 (5 best), plus wall time:
 
 ## Log
 
-### 2026-11-15 V4.1 BF16 Attention Duel: R1 Landed, Final Dispatch Round Active
+### 2026-11-15 V4.1 BF16 Attention Duel: Carbon Wins, Merged
 
 Carbon High, driven by DeepSeek Flash, wins R1 with `497d1760`: decode each
 native mixed FP8/FP4 record once into swizzled BF16 SMEM, reuse it for QK/PV,
@@ -81,9 +81,39 @@ It then overgeneralizes its failed geometry as requiring swapped operands for
 all two-CTA designs; the organizer corrects this against Carbon's measured
 slice-streaming design. No third round is authorized for DeepSeek.
 
-Evidence: cuteafd #2158; fork #328/#329/#330; `baseline.json`,
-`ds-round1.json`, `carbon-round1.json`, `round1-table.txt` and
-`carbon-r1-fullaudit-target/audit/comparison.json` under
+Carbon R3 `085b33e5` fixes both issues with one exported AOT program carrying
+both device functions and a generated host launch branch. The threshold is
+ceil(runtime SM count / (head blocks * 10 splits)), cached per device after a
+runtime two-CTA eligibility check; query failure falls back to R1. The first
+R3 seal exported only the Python dispatcher's R1 fallback; organizer review
+rejects that incomplete production path before timing. The final gate invokes
+compile -> export_to_c -> generated C wrapper -> CUDA graph replay, not a
+Python selector. Output and LSE hashes are exact in 256/256 cells; no cell
+regresses R1 beyond summed observed sample ranges. Median R1/R3 is 1.215x
+(64 heads) and 1.148x (32 heads). Nineteen GPU tests pass in 7.72 s and the
+594-program audit again changes only two stems. Counter deltas remain zero,
+max 63 C, minimum T.Limit 36 C. Clean fork #336 merges as `c4b17e26`.
+
+The crossover has a known wave jump, not a false below-10% claim: 64 heads
+live 4 -> 5 is 10.29 -> 14.36 us (+39.6% raw, +11.6% per row); 32 heads live
+9 -> 10 is 10.26 -> 14.35 us (+39.9% raw, +25.9% per row). R1 alone jumps
+about 59%/58% at those same boundaries. Runtime rows * head blocks * splits
+crosses the SM count; R3 reduces that staircase. Main accepts this explicit
+row-curve explanation. Real RTX 5090 qualification is unmeasured; its threshold
+must use its own runtime SM count, not the PRO 6000's measured 5/10 rows.
+
+Final scores across the duel: Carbon Correct 5, Judgement 4, Quality 4,
+Creative 5; DeepSeek Correct 2, Judgement 2, Quality 2, Creative 3. Carbon seals
+R1 in about 30 min, R2 in 31 min and the final real-AOT correction about
+38 min into R3. DeepSeek R1 is numerically exact after trace corrections but
+slower; its R2 never qualifies. Both negative results are retained. No fourth
+round or unfinished DeepSeek spine is recommended. Superseded fork drafts
+#328/#329 are closed; benchmark-only harness #327 is separate.
+
+Evidence: cuteafd #2158/#2160; fork #330/#336; `baseline.json`,
+`ds-round1.json`, `carbon-round1.json`, `carbon-round2.json`,
+`carbon-round3.json`, `round1-table.txt`, `round2-table.txt`, `round3-table.txt`,
+`carbon-r2-target/occupancy.json` and the final audit comparison receipt under
 `~/.cache/cuteafd/builds/v41-attn-duel/`.
 
 ### 2026-11-15 Native MXFP4 Duel: Final Measured Dispositions
