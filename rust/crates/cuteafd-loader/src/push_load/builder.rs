@@ -732,7 +732,7 @@ impl Builder {
         let names = tensors.projection_source_names(layer, expert, projection);
         let [w, mut s] = tensors.projection_slices(projection, world, rank, slicing)?;
         let (source, _) = tensors.push_source(&names[0])?;
-        self.fp8_matrix(&source, w, weight)?;
+        self.fp8_matrix(&source, tensors.push_matrix_slice(&names[0], w)?, weight)?;
         if tensors.format() == ExpertFormat::Bf16 {
             return Ok(());
         }
@@ -751,7 +751,7 @@ impl Builder {
                 *value /= 2;
             }
         }
-        self.fp8_matrix(&source, s, scale)?;
+        self.fp8_matrix(&source, tensors.push_matrix_slice(&names[1], s)?, scale)?;
         if tensors.format() == ExpertFormat::Nvfp4 {
             let image = tensors
                 .slice_bytes_with(projection, world, rank, slicing)?

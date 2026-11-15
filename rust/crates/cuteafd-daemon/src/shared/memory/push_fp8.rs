@@ -220,7 +220,7 @@ impl RankPlan {
                     let (source, _) = tensors.push_source(&names[0])?;
                     builder.fp8_matrix(
                         &source,
-                        weight,
+                        tensors.push_matrix_slice(&names[0], weight)?,
                         destination(rank, &layer.planes[2 * index], expert * w_bytes, w_bytes)?,
                     )?;
                     if tensors.format() == ExpertFormat::Bf16 {
@@ -251,7 +251,7 @@ impl RankPlan {
                     }
                     builder.fp8_matrix(
                         &source,
-                        image,
+                        tensors.push_matrix_slice(&names[1], image)?,
                         destination(rank, &layer.planes[2 * index + 1], at, extent)?,
                     )?;
                     if tensors.format() == ExpertFormat::Nvfp4 {

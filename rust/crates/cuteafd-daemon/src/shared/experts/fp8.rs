@@ -58,6 +58,7 @@ pub(crate) fn validate_checkpoint_contract(info: &Fp8MoeInfo, tensors: &Fp8Exper
             ExpertFormat::Bf16 => Fp8MoeWeights::Bf16,
             ExpertFormat::Fp8Block128 => Fp8MoeWeights::Fp8,
             ExpertFormat::Mxfp4 => Fp8MoeWeights::Mxfp4,
+            ExpertFormat::Mxfp8 => Fp8MoeWeights::Mxfp8,
             ExpertFormat::Nvfp4 => Fp8MoeWeights::Nvfp4,
         };
         ensure!(info.weights == weights,
