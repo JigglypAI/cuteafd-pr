@@ -75,6 +75,7 @@ SCHEMA = "cuteafd.fp8moe-package.v1"
 ROLE_LAYOUTS = {"coordinator": ("tp1", "tp2")}
 ABI_VERSION = 6
 STORAGE = {"fp8": 1, "mxfp4": 2, "nvfp4a4": 4, "bf16": 5, "mxfp8": 6, "nvfp4dyn": 7}
+REPLY_LAYOUT_STORAGES = (1, 2, 4, 5, 6)
 ACTIVATION = {"silu_bf16_product": 1, "silu_post_clamp_fp32_product": 2, "swigluoai": 3, "situ": 4}
 PROJECTION = {"bf16": 1}
 ROLE_COMPUTE = {"spark": (12, 1), "coordinator": (12, 0)}
@@ -131,6 +132,11 @@ def bridge_source(programs: list[dict], info: list[int]) -> str:
         f'  {{{p["capacity"]}u, {p["scratch"]}ull, {FORMS.index(p["form"])}u, {int(p.get("segmented", False))}u, {p.get("minimum_rows", 0)}u, {p.get("act_row_bytes", 0)}u, {int(p.get("core_only", False))}u, _mlir_cuteafd_{p["stem"]}_cuda_init, '
         f'_mlir_cuteafd_{p["stem"]}_cuda_load_to_device, {p["entry"]}}}' for p in programs)
     layout_rows = []
+    # The bridge's reply layout derives the down output's offset for these storages only:
+    # the dynamic-amax (7) and divisor-convention (8) NVFP4 routes lay their scratch out
+    # differently and their combine may be unweighted (#2187), so no compressed reply.
+    if any(p.get("core_only", False) for p in programs) and (info[0] >> 8) & 0xff not in REPLY_LAYOUT_STORAGES:
+        raise ValueError("compressed replies are not supported for this expert storage")
     for p in programs:
         if not p.get("core_only", False):
             continue
