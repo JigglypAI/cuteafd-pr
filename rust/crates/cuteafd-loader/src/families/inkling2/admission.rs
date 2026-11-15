@@ -83,27 +83,50 @@ pub fn local_package(catalog: &crate::OfficialV41Catalog, manifest: Option<&Path
     gpus: usize, rows: u64) -> LocalPackage {
     let workspace = || -> anyhow::Result<LocalPackage> {
         anyhow::ensure!((1..=2).contains(&gpus), "Inkling local package requires one or two ranks");
-        let mut workspace = [0u64; 2];
-        if let Some(tensors) = catalog.fp8() {
-            let layers = (catalog.routed_experts().first_layer..catalog.routed_experts().layers).collect::<Vec<_>>();
-            let groups = tensors.homogeneous_layers(&layers)?;
-            let bytes = groups.iter().try_fold(0u64, |sum, (view, _)| -> anyhow::Result<u64> {
-                let requests = crate::placement::rtx_onboard::fp8_workspace_requests(view,
+        let routed = catalog.routed_experts();
+        let layers = (routed.first_layer..routed.layers).collect::<Vec<_>>();
+        let mut backings = vec![Vec::new()];
+        for count in 1..=layers.len() {
+            let selected = &layers[..count];
+            let mut owners = Vec::new();
+            if let Some(tensors) = catalog.fp8() {
+                for (view, group_layers) in tensors.homogeneous_layers(selected)? {
+                    let requests = crate::placement::rtx_onboard::fp8_workspace_requests(&view,
+                        manifest, rows, gpus, "inkling2")?;
+                    let scratch = *requests.first().context("native package scratch absent")?;
+                    let (scratch, output, _) = crate::serving_capacity::fp8moe_tp2_workspace(usize::try_from(scratch)?,
+                        routed.hidden, usize::try_from(rows)?)?;
+                    for gpu in 0..gpus {
+                        let regions = crate::serving_capacity::fp8_expert_regions(&view.for_coordinator(),
+                            &group_layers, gpus, gpu, crate::formats::fp8_experts::Slicing::Blocks(128))?;
+                        let id = crate::serving_capacity::expert_weight_arena_id("fp8", gpu as i32, &regions)?;
+                        owners.push(crate::placement::families::inkling2::LocalBacking { gpu,
+                            layers: group_layers.clone(), arena: crate::serving_capacity::WeightArenaLayout::new(id, regions)?,
+                            workspace: vec![("scratch".into(), scratch as u64), ("output".into(), output as u64)] });
+                    }
+                }
+            } else {
+                let requests = crate::placement::rtx_onboard::expert_workspace_requests(catalog,
                     manifest, rows, gpus, "inkling2")?;
-                let scratch = *requests.first().context("native package scratch absent")?;
-                let (_, _, bytes) = crate::serving_capacity::fp8moe_tp2_workspace(usize::try_from(scratch)?,
-                    catalog.routed_experts().hidden, usize::try_from(rows)?)?;
-                sum.checked_add(bytes as u64).context("Inkling native backend owners overflow")
-            })?;
-            workspace[..gpus].fill(bytes);
-        } else {
-            let requests = crate::placement::rtx_onboard::expert_workspace_requests(catalog,
-                manifest, rows, gpus, "inkling2")?;
-            let bytes = requests.into_iter().try_fold(0u64, |sum, bytes| sum.checked_add(bytes)
-                .context("Inkling EXL3 local workspace overflow"))?;
-            workspace[..gpus].fill(bytes);
+                for gpu in 0..gpus {
+                    let regions = selected.iter().map(|&layer| {
+                        let layout = catalog.exl3().context("Inkling EXL3 manifest absent")?
+                            .residency(crate::V41Exl3Layer::Backbone(layer), gpus, gpu)?;
+                        let name = if gpus == 1 { format!("BackboneFull {{ layer: {layer} }}.0") }
+                            else { format!("BackboneTp2 {{ layer: {layer}, rank: {gpu} }}.0") };
+                        Ok((name, layout.device_arena_layout()?.1))
+                    }).collect::<anyhow::Result<Vec<_>>>()?;
+                    let id = crate::serving_capacity::expert_weight_arena_id("exl3", gpu as i32, &regions)?;
+                    let last = requests.len().checked_sub(1).context("EXL3 output owner absent")?;
+                    let workspace = requests.iter().enumerate().map(|(index, &bytes)|
+                        (if index == last { "output".into() } else { format!("scratch.{index}") }, bytes)).collect();
+                    owners.push(crate::placement::families::inkling2::LocalBacking { gpu, layers: selected.to_vec(),
+                        arena: crate::serving_capacity::WeightArenaLayout::new(id, regions)?, workspace });
+                }
+            }
+            backings.push(owners);
         }
-        Ok(LocalPackage::Installed { workspace })
+        Ok(LocalPackage::Installed { backings })
     };
     workspace().unwrap_or_else(|error| LocalPackage::Missing(format!("{error:#}")))
 }

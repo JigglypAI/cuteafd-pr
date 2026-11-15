@@ -89,10 +89,20 @@ fn refusal(error: anyhow::Error) -> Refusal { invalid(format!("{error:#}")) }
 /// The installed coordinator expert package for the checkpoint's storage.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LocalPackage {
-    /// Executor workspace per GPU at the admitted unit (TP1 or TP2 layout).
-    Installed { workspace: [u64; 2] },
+    /// One weight arena and distinct workspace requests per homogeneous backend,
+    /// for every admitted onboarding prefix, in logical coordinator-rank order.
+    Installed { backings: Vec<Vec<LocalBacking>> },
     /// No package beside the manifest: onboarding counts above zero are refused.
     Missing(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalBacking {
+    pub gpu: usize,
+    pub layers: Vec<usize>,
+    pub arena: WeightArenaLayout,
+    /// Named physical requests, never an aggregate CUDA allocation.
+    pub workspace: Vec<(String, u64)>,
 }
 
 /// One Spark rank's charges at one onboarding count (layers `count..` remote).
@@ -375,13 +385,15 @@ impl InklingInputs {
     fn arena_bytes(&self, count: usize) -> Result<[u64; 2], Refusal> {
         let mut out = [0u64; 2];
         if count == 0 { return Ok(out); }
-        let LocalPackage::Installed { workspace } = &self.local else {
+        let LocalPackage::Installed { backings } = &self.local else {
             return Err(invalid("onboarded layers need an installed Inkling 2 RTX expert package"));
         };
-        for gpu in 0..self.gpus {
-            let weights = self.experts[..count].iter().try_fold(0u64, |sum, layer| sum.checked_add(
-                if self.gpus == 2 { layer.half[gpu] } else { layer.whole })).ok_or(Refusal::Overflow("Inkling 2 expert arena"))?;
-            out[gpu] = weights.checked_add(workspace[gpu]).ok_or(Refusal::Overflow("Inkling 2 expert arena"))?;
+        for backing in backings.get(count).ok_or_else(|| invalid("missing onboarding owner prefix"))? {
+            if backing.gpu >= self.gpus { return Err(invalid("local backend rank outside placement")); }
+            let workspace = backing.workspace.iter().try_fold(0u64, |sum, (_, bytes)| sum.checked_add(*bytes))
+                .ok_or(Refusal::Overflow("Inkling expert workspace"))?;
+            out[backing.gpu] = out[backing.gpu].checked_add(backing.arena.bytes() as u64)
+                .and_then(|bytes| bytes.checked_add(workspace)).ok_or(Refusal::Overflow("Inkling local backend"))?;
         }
         Ok(out)
     }
@@ -587,23 +599,18 @@ impl Recipe for InklingInputs {
                 requires.push(Requires { when: Choice { variable: onboard, option }, any_of: vec![] });
                 continue;
             }
-            let arenas = self.arena_bytes(count)?;
-            for gpu in 0..self.gpus {
-                if arenas[gpu] == 0 { continue; }
-                let weights = arenas[gpu] - match &self.local {
-                    LocalPackage::Installed { workspace } => workspace[gpu], LocalPackage::Missing(_) => 0 };
-                let group = if pair { format!("TP2 expert layer halves 0..{count}") }
-                    else { format!("resident routed layers 0..{count}") };
-                let id = format!("inkling2.experts.{gpu}.{count}");
-                let location = Location::coordinator(gpu as u8);
-                let owner = Allocation::buffer(&id, location, arenas[gpu], Lifetime::RESIDENT, Category::Experts, group);
-                let mut resident = Component::resident_weight(
-                    ResidentWeight::from_allocation(&owner, ResidentWeights(weights)), ByteCurve::fixed(weights, maximum));
-                resident.activation = activation.clone();
-                components.push(resident);
-                let mut arena = Component::allocation(owner, ByteCurve::fixed(arenas[gpu], maximum), false, maximum);
-                arena.activation = activation.clone();
-                components.push(arena);
+            if count > 0 {
+                let LocalPackage::Installed { backings } = &self.local else { unreachable!() };
+                for (group, backing) in backings.get(count).ok_or_else(|| invalid("missing onboarding owner prefix"))?.iter().enumerate() {
+                    let location = Location::coordinator(backing.gpu as u8);
+                    components.extend(with(weight_arena_components(&backing.arena, location, Lifetime::RESIDENT,
+                        maximum, MemoryKind::Experts)?, &activation));
+                    for (name, bytes) in &backing.workspace {
+                        components.extend(with(buffer(format!("inkling2.expert_workspace.{}.{}.{}.{}", backing.gpu, count, group, name),
+                            location, *bytes, Lifetime::RESIDENT, Category::Workspace,
+                            "installed homogeneous expert backend request", maximum).into_iter().collect(), &activation));
+                    }
+                }
             }
             if count < self.routed.len() {
                 for (rank, charge) in self.spark[count].iter().enumerate() {

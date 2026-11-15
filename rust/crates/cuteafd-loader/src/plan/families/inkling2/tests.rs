@@ -193,10 +193,27 @@ fn installed_local_native_owners_use_shared_workspace_requests_once() -> anyhow:
                 "activation":"situ","projection":"bf16","swiglu_alpha":1.0,"swiglu_beta":0.0,
                 "swiglu_limit":0.0,"capacities":[{"capacity":80,"scratch_bytes":scratch}]}}}))?)?;
     }
-    let LocalPackage::Installed { workspace } = local_package(&catalog, Some(&manifest), 2, rows)
+    let LocalPackage::Installed { backings } = local_package(&catalog, Some(&manifest), 2, rows)
         else { anyhow::bail!("complete native package owners were not admitted") };
     let output = rows * catalog.routed_experts().hidden as u64 * 2;
-    assert_eq!(workspace, [12345 + 23456 + 2 * output; 2]);
+    assert_eq!(backings.len(), 5);
+    assert!(backings[0].is_empty());
+    assert_eq!(backings[1].len(), 2, "one homogeneous group per physical rank");
+    assert_eq!(backings[4].len(), 4, "mixed formats retain two independently retired backends per rank");
+    for gpu in 0..2 {
+        let workspace = backings[4].iter().filter(|backing| backing.gpu == gpu)
+            .flat_map(|backing| &backing.workspace).map(|(_, bytes)| bytes).sum::<u64>();
+        assert_eq!(workspace, 12345 + 23456 + 2*output);
+        for backing in backings[4].iter().filter(|backing| backing.gpu == gpu) {
+            let tensors = catalog.fp8().unwrap().for_coordinator().for_layer_metadata(backing.layers[0])?;
+            let regions = crate::serving_capacity::fp8_expert_regions(&tensors, &backing.layers, 2, gpu,
+                crate::formats::fp8_experts::Slicing::Blocks(128))?;
+            let id = crate::serving_capacity::expert_weight_arena_id("fp8", gpu as i32, &regions)?;
+            let runtime = crate::serving_capacity::WeightArenaLayout::new(id, regions)?;
+            assert_eq!(backing.arena, runtime, "planner backing must be the shared runtime arena");
+            assert_eq!(backing.workspace[1], ("output".into(), output));
+        }
+    }
     // Each native group is independently retained; no TP2 output from the
     // shared request list is charged again beside each backend's output.
     assert!(matches!(local_package(&catalog, Some(&manifest), 2, 81), LocalPackage::Missing(_)));
@@ -360,10 +377,22 @@ fn shared_recipe_charges_every_owner_once_on_one_and_two_rtx() {
         let budgets = (0..gpus).map(|gpu| shared::planned_budget(gpu as u8, 96 << 30, 96 << 30, 1 << 30))
             .chain((0..ranks).map(|rank| shared::spark_budget(rank as u8, 100 << 30)))
             .chain([crate::placement::families::kimi::host_budget(512 << 30, 480 << 30)]).collect();
+        let catalog = crate::read_expert_catalog(dir.path()).unwrap();
+        let local = LocalPackage::Installed { backings: (0..=routed.len()).map(|count| {
+            if count == 0 { return vec![]; }
+            (0..gpus).map(|gpu| {
+                let layers = routed[..count].to_vec();
+                let regions = crate::serving_capacity::fp8_expert_regions(&catalog.fp8().unwrap().for_coordinator(),
+                    &layers, gpus, gpu, crate::formats::fp8_experts::Slicing::Blocks(128)).unwrap();
+                let id = crate::serving_capacity::expert_weight_arena_id("fp8", gpu as i32, &regions).unwrap();
+                shared::LocalBacking { gpu, layers, arena: crate::serving_capacity::WeightArenaLayout::new(id, regions).unwrap(),
+                    workspace: vec![("scratch".into(), (64 << 20) - 1024*4608*2), ("output".into(), 1024*4608*2)] }
+            }).collect()
+        }).collect() };
         let inputs = InklingInputs { cfg: cfg.clone(), gpus, spark_ranks: ranks, context: Context::automatic(1 << 20),
             maximum_pool_tokens: 4 << 20, prefill, sequences: 16, prefix_entries: 8, prefix_mark_budget: 2 << 30, targets: targets.clone(), placement, modes: modes.clone(),
             routed: routed.clone(), experts,
-            local: LocalPackage::Installed { workspace: [64 << 20, if gpus == 2 { 64 << 20 } else { 0 }] },
+            local,
             spark: (0..=routed.len()).map(charge).collect(),
             links: shared::spark_link((gpus - 1) as u8, ranks, prefill, Default::default(), cuteafd_core::SparkIngress::Fp8K32).unwrap(),
             spark_reply_formats: Default::default(), drafter: None, vision: None, budgets,
