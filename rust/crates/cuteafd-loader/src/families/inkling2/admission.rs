@@ -135,19 +135,16 @@ pub fn spark_charges(catalog: &crate::OfficialV41Catalog, experts: &[LayerExpert
             let owners = [io.intake, io.host_exchange, io.row_indices, io.mapped_rings, io.endpoint_staging, owners]
                 .into_iter().try_fold(0u64, |sum, bytes| sum.checked_add(bytes)).context("Inkling 2 Spark owners")?;
             let resident = if let Some(tensors) = catalog.fp8() {
-                // Preserve the worker's independently retained homogeneous
-                // package arenas. Shared packing accounts inter-plane gaps once.
-                tensors.homogeneous_layers(&working.spark_layers)?.into_iter()
-                    .try_fold(0u64, |sum, (view, layers)| -> anyhow::Result<u64> {
+                // The shared native worker packs all homogeneous groups in
+                // one physical arena, in group/projection order.
+                let regions = tensors.homogeneous_layers(&working.spark_layers)?.into_iter()
+                    .map(|(view, layers)| -> anyhow::Result<Vec<(String, usize)>> {
                         let format = if view.dynamic_nvfp4() { "nvfp4a4" } else { "mxfp8" };
                         let recipe = crate::plan::experts::spark_recipe(&format!("inkling2:{format}"),
                             catalog.routed_experts().intermediate, ranks)?;
-                        let group = SparkWorkingSet { spark_layers: layers, ..working.clone() };
-                        let bytes = crate::placement::SparkAssignment::resident_from_catalog(catalog, &group,
-                            rank, crate::placement::SparkResidentLayout::Fp8 { world: ranks, rank,
-                                slicing: recipe.slicing })?.resident_bytes;
-                        sum.checked_add(bytes).context("native Spark group arenas overflow")
-                    })?
+                        crate::serving_capacity::fp8_expert_regions(&view, &layers, ranks, rank, recipe.slicing)
+                    }).collect::<anyhow::Result<Vec<_>>>()?.into_iter().flatten();
+                crate::serving_capacity::WeightArenaLayout::new("inkling2/spark-residency", regions)?.bytes() as u64
             } else {
                 crate::placement::SparkAssignment::resident_from_catalog(catalog, &working, rank,
                     crate::placement::SparkResidentLayout::Exl3 { world: ranks, rank })?.resident_bytes

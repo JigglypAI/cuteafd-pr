@@ -228,17 +228,16 @@ fn spark_charges_match_shared_group_arenas_and_typed_owner_census() -> anyhow::R
             for rank in 0..world {
                 let working = SparkWorkingSet { rtx_layers:vec![], spark_layers:layers.clone(),
                     spark_ranks:world,prefill_lanes:shared::LANES };
-                let groups = if let Some(tensors) = catalog.fp8() {
-                    tensors.homogeneous_layers(&layers)?.into_iter().map(|(view,layers)| {
+                let expected = if let Some(tensors) = catalog.fp8() {
+                    let regions = tensors.homogeneous_layers(&layers)?.into_iter().map(|(view,layers)| {
                         let format = if view.dynamic_nvfp4() {"nvfp4a4"} else {"mxfp8"};
                         let recipe = crate::plan::experts::spark_recipe(&format!("inkling2:{format}"),cfg.intermediate,world)?;
-                        Ok((layers,SparkResidentLayout::Fp8{world,rank,slicing:recipe.slicing}))
-                    }).collect::<anyhow::Result<Vec<_>>>()?
-                } else { vec![(layers.clone(),SparkResidentLayout::Exl3{world,rank})] };
-                let expected = groups.into_iter().try_fold(0u64,|sum,(layers,layout)| -> anyhow::Result<u64> {
-                    let group = SparkWorkingSet { spark_layers:layers,..working.clone() };
-                    Ok(sum+SparkAssignment::resident_from_catalog(&catalog,&group,rank,layout)?.resident_bytes)
-                })?;
+                        crate::serving_capacity::fp8_expert_regions(&view,&layers,world,rank,recipe.slicing)
+                    }).collect::<anyhow::Result<Vec<_>>>()?.into_iter().flatten();
+                    crate::serving_capacity::WeightArenaLayout::new("worker-fixture",regions)?.bytes() as u64
+                } else {
+                    SparkAssignment::resident_from_catalog(&catalog,&working,rank,SparkResidentLayout::Exl3{world,rank})?.resident_bytes
+                };
                 assert_eq!(charges[0][rank].experts,expected);
                 let owners = executions.workspace_bytes(|extent| crate::plan::layout::spark_slots::catalog_owner_bytes(
                     &catalog,"inkling2",&working,rank,extent))?.unwrap().total().unwrap();
