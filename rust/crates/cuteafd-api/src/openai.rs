@@ -2213,6 +2213,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn inkling_complete_call_cut_before_channel_end_returns_length_not_error() {
+        for streaming in [false, true] {
+            let (tx, mut rx) = mpsc::channel::<NativeRequest>(1);
+            let worker = tokio::spawn(async move {
+                let job = rx.recv().await.unwrap();
+                job.events.send(Ok(InferenceChunk::Text { content:
+                    "<|message_model|>read_file<|content_invoke_tool_json|>{\"name\":\"read_file\",\"args\":{\"path\": \"README.md\"}}".into(), content_tokens:8 })).unwrap();
+                let _ = job.events.send(Ok(InferenceChunk::Finish { finish_reason: InferenceFinishReason::Length }));
+            });
+            let profile = ModelProfile::new("inkling-test", ModelEncoding::Inkling(Arc::new(inkling2::fixtures::encoding())));
+            let app = router_for_model(tx, NativeLimits::default(), Arc::new(Mutex::new(Value::Null)),
+                std::time::Duration::from_secs(5), ConsoleHub::disabled(), profile);
+            let body = json!({"model":"inkling-test", "messages":[{"role":"user", "content":"Read"}],
+                "stream":streaming, "max_tokens":8, "tools":[{"type":"function", "function":{"name":"read_file", "parameters":{"type":"object"}}}]});
+            let response = app.oneshot(axum::http::Request::post("/v1/chat/completions")
+                .header("content-type", "application/json").body(Body::from(body.to_string())).unwrap()).await.unwrap();
+            let status = response.status();
+            let bytes = axum::body::to_bytes(response.into_body(), 1 << 20).await.unwrap();
+            assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&bytes));
+            if streaming {
+                let text = std::str::from_utf8(&bytes).unwrap();
+                assert!(text.contains("data: [DONE]") && text.contains("\"finish_reason\":\"length\""), "{text}");
+                assert!(text.contains("read_file"), "{text}");
+            } else {
+                let value: Value = serde_json::from_slice(&bytes).unwrap();
+                assert_eq!(value["choices"][0]["finish_reason"], "length");
+                let call = &value["choices"][0]["message"]["tool_calls"][0];
+                assert_eq!(call["function"]["name"], "read_file");
+                assert_eq!(call["function"]["arguments"], r#"{"path": "README.md"}"#);
+            }
+            worker.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
     async fn inkling_malformed_or_truncated_output_is_an_error_not_a_partial_call() {
         for streaming in [false, true] {
             for wire in ["<|message_model|>read_file<|content_invoke_tool_json|>{bad}<|end_message|>",

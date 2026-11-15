@@ -267,6 +267,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn inkling_native_tool_schema_rejects_null_and_enforces_strict_parameters() -> Result<()> {
+        use anyhow::Context;
+        use cuteafd_api::openai::{self, ModelEncoding, ModelProfile, NativeLimits, NativeRequest};
+        use axum::{body::Body, http::Request};
+        use serde_json::json;
+        use tower::ServiceExt;
+        let Some(path) = std::env::var_os("CUTEAFD_NATIVE_LIB") else {
+            eprintln!("skipping: CUTEAFD_NATIVE_LIB is not set");
+            return Ok(());
+        };
+        // SAFETY: the test retains the native DSO until all compilers/matchers drop.
+        let library = unsafe { NativeLibrary::load(path)? };
+        let temp = tempfile::tempdir()?;
+        let tokenizer = temp.path().join("grammar-tokenizer");
+        std::fs::create_dir(&tokenizer)?;
+        cuteafd_loader::plan::testing::write_kimi_tokenizer(&tokenizer);
+        std::fs::write(temp.path().join("chat_template.jinja"), "{{ messages[0].content }}")?;
+        let markers = [(200001, "<|message_model|>"), (200008, "<|content_thinking|>"),
+            (200004, "<|content_text|>"), (200049, "<|content_invoke_tool_json|>"),
+            (200010, "<|end_message|>"), (200006, "<|content_model_end_sampling|>")];
+        let added: serde_json::Map<String, serde_json::Value> = markers.into_iter()
+            .map(|(id, content)| (id.to_string(), json!({"content":content}))).collect();
+        std::fs::write(temp.path().join("tokenizer_config.json"), json!({"added_tokens_decoder":added}).to_string())?;
+        let encoding = Arc::new(openai::chat::inkling2::InklingEncoding::from_snapshot(temp.path())?);
+        let mut compiler = Compiler::with_vocab(&library, tokenizer.join("tokenizer.json"), 512, vec![257]);
+        for strict_parameters in [false, true] {
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<NativeRequest>(1);
+            let profile = ModelProfile::new("inkling-fixture", ModelEncoding::Inkling(encoding.clone()));
+            let app = openai::router_for_model(tx, NativeLimits::default(), Arc::new(std::sync::Mutex::new(serde_json::Value::Null)),
+                std::time::Duration::from_secs(25), openai::ConsoleHub::disabled(), profile);
+            let mut function = json!({"name":"lookup", "strict":true});
+            if strict_parameters {
+                function["parameters"] = json!({"type":"object", "properties":{"x":{"type":"string", "enum":["a"]}},
+                    "required":["x"], "additionalProperties":false});
+            }
+            let body = json!({"model":"inkling-fixture", "messages":[{"role":"user", "content":"Call lookup"}],
+                "tool_choice":"required", "tools":[{"type":"function", "function":function}]});
+            let task = tokio::spawn(async move { app.oneshot(Request::post("/v1/chat/completions")
+                .header("content-type", "application/json").body(Body::from(body.to_string())).unwrap()).await.unwrap() });
+            let request = tokio::time::timeout(std::time::Duration::from_secs(10), rx.recv()).await?.context("API did not admit native schema request")?;
+            let spec = request.constraint.as_ref().context("required Inkling tool has no native constraint")?;
+            assert!(!spec.0.contains("allOf"));
+            let wire = |args: &str| format!("<|message_model|>lookup<|content_invoke_tool_json|>{{\"name\":\"lookup\",\"args\":{args}}}<|end_message|>");
+            let good = wire(if strict_parameters { r#"{"x":"a"}"# } else { "{}" });
+            let mut valid = compiler.matcher(spec)?;
+            for byte in good.bytes() { valid.accept(u32::from(byte))?; }
+            assert!(valid.matcher.is_completed()?);
+            let mut invalid_arguments = vec!["null", "[]"];
+            if strict_parameters { invalid_arguments.extend([r#"{"x":"b"}"#, "{}", r#"{"x":"a","extra":true}"#]); }
+            for args in invalid_arguments {
+                let mut invalid = compiler.matcher(spec)?;
+                assert!(wire(args).bytes().any(|byte| invalid.accept(u32::from(byte)).is_err()),
+                    "native compiler accepted strict_parameters={strict_parameters} args={args}");
+            }
+            task.abort();
+            let _ = task.await;
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn kimi_xtml_constraints_use_native_string_tags() {
         use cuteafd_api::openai::{self, ModelEncoding, ModelProfile, NativeLimits, NativeRequest};
         use axum::{body::Body, http::Request};

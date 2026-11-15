@@ -198,6 +198,7 @@ fn tool_arguments_stream_before_close_and_match_buffered_bytes_at_every_split() 
     }
     let expected = collect(&[wire], false);
     assert_eq!(expected.len(), 1);
+    assert!(expected[0].1.starts_with(r#"{"path": "README.md", "nested": "#));
     let parallel = format!("{}{}", wire.strip_suffix(EOS).unwrap(), wire);
     assert_eq!(collect(&[&parallel], true), collect(&[&parallel], false));
     let reordered = "<|content_invoke_tool_json|>{\"args\":{\"path\":\"README.md\"},\"name\":\"read_file\"}<|end_message|>";
@@ -225,4 +226,44 @@ fn strict_parameterless_tool_schema_still_requires_object_arguments() {
     assert!(validator.is_valid(&json!({"name":"read_file", "args":{}})));
     assert!(!validator.is_valid(&json!({"name":"read_file", "args":[]})));
     assert!(!validator.is_valid(&json!({"name":"read_file", "args":"bad"})));
+}
+
+#[test]
+fn complete_call_cut_before_end_message_is_retained_but_incomplete_json_is_not() {
+    let wire = "<|message_model|>read_file<|content_invoke_tool_json|>{\"name\":\"read_file\",\"args\":{\"path\": \"README.md\"}}";
+    for streaming in [false, true] {
+        let mut parser = InklingOutputParser::with_stream_args(options(), streaming);
+        let mut output = parser.push(wire).unwrap();
+        output.extend(parser.finish().unwrap());
+        assert_eq!(parser.tool_calls(), 1);
+        assert!(output.iter().any(|chunk| matches!(chunk, OutputChunk::ToolCall { tool_name, .. } if tool_name == "read_file")));
+    }
+    let result = parsed(&[wire], options());
+    assert_eq!(result.2, vec![("read_file".into(), json!({"path":"README.md"}))]);
+    let mut parser = InklingOutputParser::new(options());
+    parser.push(wire.strip_suffix('}').unwrap()).unwrap();
+    assert!(matches!(parser.finish(), Err(InklingParseError::Truncated("tool call"))));
+}
+
+#[test]
+fn markerless_output_stays_empty_and_warns_instead_of_silently_disappearing() {
+    use std::sync::{Arc, Mutex};
+    #[derive(Clone)]
+    struct Log(Arc<Mutex<Vec<u8>>>);
+    impl std::io::Write for Log {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+    }
+    let bytes = Arc::new(Mutex::new(Vec::new()));
+    let sink = Log(bytes.clone());
+    let subscriber = tracing_subscriber::fmt().with_ansi(false).without_time()
+        .with_max_level(tracing::Level::WARN).with_writer(move || sink.clone()).finish();
+    tracing::subscriber::with_default(subscriber, || {
+        assert_eq!(parsed(&["no", " channels\n"], options()), (String::new(), String::new(), Vec::new()));
+    });
+    let log = String::from_utf8(bytes.lock().unwrap().clone()).unwrap();
+    assert!(log.contains("Inkling completion contained no recognized content channels"), "{log}");
 }

@@ -72,6 +72,7 @@ pub struct InklingOutputParser {
     error: Option<InklingParseError>,
     stream_args: ArgStream,
     arguments: Option<Arguments>,
+    channels: usize,
 }
 
 impl InklingOutputParser {
@@ -81,7 +82,7 @@ impl InklingOutputParser {
         options.stop_sequences.retain(|text| !text.is_empty());
         Self { options, mode: Mode::Boundary, pending: String::new(), recipient: String::new(),
             call: String::new(), calls: 0, stop: None, error: None,
-            stream_args: ArgStream::new(stream_args), arguments: None }
+            stream_args: ArgStream::new(stream_args), arguments: None, channels: 0 }
     }
 
     pub fn push(&mut self, text: &str) -> Result<Vec<OutputChunk>, InklingParseError> {
@@ -98,7 +99,16 @@ impl InklingOutputParser {
     pub fn finish(&mut self) -> Result<Vec<OutputChunk>, InklingParseError> {
         if let Some(error) = &self.error { return Err(error.clone()); }
         let result = self.drain(true).and_then(|mut outputs| {
-            if self.mode == Mode::Call { return Err(InklingParseError::Truncated("tool call")); }
+            if self.mode == Mode::Call {
+                if serde_json::from_str::<Value>(&self.call).is_err() {
+                    return Err(InklingParseError::Truncated("tool call"));
+                }
+                self.complete_call(&mut outputs)?;
+                self.mode = Mode::Boundary;
+            }
+            if self.channels == 0 {
+                tracing::warn!("Inkling completion contained no recognized content channels");
+            }
             if matches!(self.mode, Mode::Text | Mode::Thinking) {
                 let tail = std::mem::take(&mut self.pending);
                 self.emit(tail, &mut outputs);
@@ -169,12 +179,12 @@ impl InklingOutputParser {
                     self.stop = Some(GlmStop::Marker(EOS.into()));
                     self.pending.clear();
                 }
-                (Mode::Boundary | Mode::Header, THINK) => { self.mode = Mode::Thinking; }
+                (Mode::Boundary | Mode::Header, THINK) => { self.mode = Mode::Thinking; self.channels += 1; }
                 (Mode::Boundary | Mode::Header, TEXT | "<|content_tool_error|>" | "<|content_invoke_tool_text|>") => {
-                    self.mode = Mode::Text;
+                    self.mode = Mode::Text; self.channels += 1;
                 }
                 (Mode::Boundary | Mode::Header, CALL) => {
-                    self.mode = Mode::Call; self.call.clear(); self.arguments = None;
+                    self.mode = Mode::Call; self.call.clear(); self.arguments = None; self.channels += 1;
                 }
                 (Mode::Thinking | Mode::Text, END) => { self.mode = Mode::Boundary; self.recipient.clear(); }
                 (Mode::Call, END) => {
@@ -233,6 +243,8 @@ impl InklingOutputParser {
         self.valid_name(name)?;
         if self.arguments.is_none() {
             // Noncanonical key order can put args before name; buffer that case.
+            // Preserve raw argument spelling (whitespace and key order), so
+            // buffered calls and concatenated streaming deltas are byte-identical.
             let arguments = if let Some((_, start)) = arguments_prefix(&self.call) {
                 let mut scan = Arguments { start, scanned: start, ..Arguments::default() };
                 let end = scan.advance(&self.call);
