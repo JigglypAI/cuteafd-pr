@@ -13,6 +13,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 import hashlib
 import importlib.util
+import inspect
 import json
 import multiprocessing
 import os
@@ -732,6 +733,13 @@ def _export_exl3(extra, output):
                 for schedule, schedule_options in package.decode_schedule_variants(geometry, role, profile, rows):
                     recorded_construction(export, output / profile / f"m{rows}-{schedule}", width, experts, rows, bits, "auto", topk,
                            dtype, **{**options, **schedule_options})
+        # Baselines before row-address support must still export ordinary cells.
+        if hasattr(package, 'segment_export_options') and 'row_addresses' in inspect.signature(export).parameters:
+            options = package.segment_export_options(geometry, role, width, compact=compact)
+            if options is not None:
+                recorded_construction(export, output / profile / f'm{package.SEGMENT_MAX_ROWS}-segments',
+                                      width, experts, package.SEGMENT_MAX_ROWS, bits, 'auto', topk,
+                                      'bf16', compile_only=True, **options)
 
 
 def export_exl3_routes(extra, output):

@@ -150,11 +150,19 @@ def verify(package: Path, revision: str | None = None, runtime: Path | None = No
             raise ValueError(f'EXL3 variant input format mismatch: {directory}')
         # The variant records its exact compiled schedule, including defaults.
         # Explicit schedule siblings must still carry a schedule and suffix.
+        segments = meta.get('row_addresses', False)
+        if variant.get('row_addresses', False) != segments:
+            raise ValueError(f'EXL3 variant row-address mismatch: {directory}')
+        if segments and (manifest['role'] != 'spark' or compact or meta['capacity'] != SEGMENT_MAX_ROWS
+                         or meta['output_dtype'] != 'bf16' or not meta.get('warp_specialized')
+                         or meta.get('input_format') not in ('bf16', 'e4m3_k32')
+                         or variant.get('schedule') is not None):
+            raise ValueError(f'EXL3 invalid segments contract: {directory}')
         schedule = variant.get('schedule')
         if (variant.get('decode_schedule') != meta.get('decode_schedule')
                 or (schedule is not None and meta.get('decode_schedule') is None)
                 or directory.rsplit('/', 1)[-1] != f"m{meta['capacity']}"
-                + ('' if schedule is None else f'-{schedule}')):
+                + ('-segments' if segments else '' if schedule is None else f'-{schedule}')):
             raise ValueError(f'EXL3 variant decode schedule mismatch: {directory}')
         if variant.get('token_major_rotation', False) != meta.get('token_major_rotation', False):
             raise ValueError(f'EXL3 variant input rotation mismatch: {directory}')
@@ -1058,6 +1066,27 @@ def compile_variants(payloads, jobs):
         pool.shutdown(wait=True, cancel_futures=True)
 
 
+SEGMENT_MAX_ROWS = 8192
+
+
+def segment_export_options(geometry: str, role: str, width: int, *, compact: bool = False) -> dict | None:
+    """One format-matched row-address program per shipping WS Spark layout."""
+    if (role != 'spark' or compact
+            or not any(warp_specialized(geometry, role, width, rows)
+                       for rows in (256, 1024, 2048, 2752, 4096))):
+        return None
+    options = dict(hidden=GEOMETRIES[geometry][0], warp_specialized=True,
+                   row_addresses=True, route_block=64,
+                   tile=(64, 256 if width % 256 == 0 else 128, 64, 256))
+    if geometry == 'glm':
+        options.update(wire_input=True, ws_input_stages=3)
+    if activation(geometry) != 'silu':
+        options['activation'] = activation(geometry)
+    if (limit := swiglu_limit(geometry)) != 10.0:
+        options['swiglu_limit'] = limit
+    return options
+
+
 def package_capacities(geometry: str, requested: str) -> list[int]:
     capacities = sorted(set(int(v) for v in requested.split(',')))
     # Kimi K3 pads a <=2752-row prefill unit into merged waves of up to three
@@ -1179,6 +1208,10 @@ def build(args: argparse.Namespace) -> None:
                 for schedule, run_options in exports:
                     pending.append((width, experts, capacity, topk, dtype, run_options,
                                     destinations, schedule, requested))
+            segment_options = segment_export_options(geometry, args.role, width, compact=compact)
+            if segment_options is not None:
+                pending.append((width, experts, SEGMENT_MAX_ROWS, topk, 'bf16', segment_options,
+                                destinations, 'segments', None))
         from _export_jobs import export_jobs, gpu_workers, park_context_lease
         jobs = min(gpu_workers(export_jobs()), len(pending))
         # The planner's context idles while its workers run; free its host lease.
@@ -1239,7 +1272,9 @@ def build(args: argparse.Namespace) -> None:
                     variant['ws_input_stages'] = meta['ws_input_stages']
                 if 'input_format' in meta:
                     variant['input_format'] = meta['input_format']
-                if schedule is not None:
+                if meta.get('row_addresses'):
+                    variant['row_addresses'] = True
+                if schedule is not None and schedule != 'segments':
                     variant['schedule'] = schedule
                 if meta.get('decode_schedule') is not None:
                     variant['decode_schedule'] = meta['decode_schedule']
