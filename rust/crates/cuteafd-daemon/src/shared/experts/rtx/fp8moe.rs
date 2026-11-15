@@ -62,7 +62,7 @@ pub(crate) struct Fp8MoeTp2<'a> {
 
 impl<'a> Fp8MoeTp2<'a> {
     pub(crate) fn packed_row_cap(&self, rows: usize) -> Result<usize> {
-        self.experts.packed_row_cap(true, rows)
+        self.experts.packed_row_cap(!self.experts.wire_input(), rows)
     }
 
     /// Static package ABI only: no CUDA initialization or device allocation.
