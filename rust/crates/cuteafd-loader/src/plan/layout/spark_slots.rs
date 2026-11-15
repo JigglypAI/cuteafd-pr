@@ -24,7 +24,7 @@ fn group_scratch(family: &str, format: ExpertFormat, compiled: u32) -> anyhow::R
     });
     let format_name = match format {
         ExpertFormat::Fp8Block128 => "fp8", ExpertFormat::Mxfp4 => "mxfp4",
-        ExpertFormat::Nvfp4 => "nvfp4", ExpertFormat::Bf16 => "bf16", _ => "",
+        ExpertFormat::Nvfp4 => "nvfp4", ExpertFormat::Bf16 => "bf16", ExpertFormat::Mxfp8 => "mxfp8",
     };
     let index = CENSUS_CAPACITIES.iter().position(|&rows| rows == compiled)
         .ok_or_else(|| anyhow::anyhow!("no Spark scratch census at export m{compiled}"))?;
@@ -49,8 +49,13 @@ fn group_io_bytes(family: &str, format: ExpertFormat, geometry: cuteafd_core::Ex
 /// layers of one group do not.
 fn native_groups(input: &super::super::PlanInput, family: &str, working: &SparkWorkingSet, rank: usize)
     -> anyhow::Result<Option<(cuteafd_core::ExpertGeometry, Vec<(ExpertFormat, u32)>)>> {
+    native_catalog_groups(input.expert_catalog()?, family, working, rank)
+}
+
+fn native_catalog_groups(catalog: &crate::OfficialV41Catalog, family: &str,
+    working: &SparkWorkingSet, rank: usize)
+    -> anyhow::Result<Option<(cuteafd_core::ExpertGeometry, Vec<(ExpertFormat, u32)>)>> {
     if !working.selected_ranks().contains(&rank) { return Ok(None); }
-    let catalog = input.expert_catalog()?;
     let Some(tensors) = catalog.fp8() else { return Ok(None); };
     let shape = tensors.shape();
     let geometry = cuteafd_core::ExpertGeometry { hidden: u32::try_from(shape.hidden)?,
@@ -70,7 +75,8 @@ fn native_groups(input: &super::super::PlanInput, family: &str, working: &SparkW
             other => other,
         };
         let format_name = match format {
-            ExpertFormat::Nvfp4 => "nvfp4", ExpertFormat::Bf16 => "bf16", _ => "fp8",
+            ExpertFormat::Nvfp4 => "nvfp4", ExpertFormat::Bf16 => "bf16",
+            ExpertFormat::Mxfp8 => "mxfp8", _ => "fp8",
         };
         let recipe = super::super::experts::spark_recipe(&format!("{package_family}:{format_name}"),
             shape.intermediate, working.spark_ranks)?;
@@ -123,6 +129,16 @@ fn fp8_owner_bytes(family: &str, geometry: cuteafd_core::ExpertGeometry, formats
     }
     Ok(cuteafd_core::OwnerBytes { scratch, io,
         pinned_staging: u64::from(extent.staging_rows) * u64::from(geometry.topk) * 8 * formats.len() as u64 + address_staging })
+}
+
+/// Catalog adapter for callers that already resolved immutable checkpoint
+/// selection. Uses exactly the shared group census and physical owner sum.
+pub(crate) fn native_catalog_owner_bytes(catalog: &crate::OfficialV41Catalog, family: &str,
+    working: &SparkWorkingSet, rank: usize, extent: cuteafd_core::OwnerExtent)
+    -> anyhow::Result<cuteafd_core::OwnerBytes> {
+    let Some((geometry, formats)) = native_catalog_groups(catalog, family, working, rank)?
+        else { return Ok(Default::default()) };
+    fp8_owner_bytes(family, geometry, &formats, extent)
 }
 
 /// One native NVFP4 owner on the shared FP8-family worker: the installed
@@ -386,6 +402,26 @@ mod tests {
     fn extent(capacity: u32, compiled: u32) -> cuteafd_core::OwnerExtent {
         cuteafd_core::OwnerExtent { owner: cuteafd_core::ExecutionOwner::Prefill, capacity, compiled,
             staging_rows: capacity, buffered_units: 1 }
+    }
+
+    #[test]
+    fn inkling_native_census_uses_exporter_bytes_and_shared_mixed_owner_sum() -> anyhow::Result<()> {
+        let geometry = cuteafd_core::ExpertGeometry::INKLING2;
+        for (format, scratch) in [(ExpertFormat::Mxfp8, 400_695_296), (ExpertFormat::Nvfp4, 780_804_096)] {
+            assert_eq!(group_scratch("inkling2", format, 4096)?, scratch);
+            let one = fp8_owner_bytes("inkling2", geometry, &[(format, 1152)], extent(2752, 4096))?;
+            assert_eq!(one.scratch, scratch);
+            let mut queued = extent(2752, 4096);
+            queued.buffered_units = 3;
+            assert_eq!(fp8_owner_bytes("inkling2", geometry, &[(format, 1152)], queued)?, one);
+        }
+        let both = fp8_owner_bytes("inkling2", geometry,
+            &[(ExpertFormat::Mxfp8, 1152), (ExpertFormat::Nvfp4, 1152)], extent(2752, 4096))?;
+        assert_eq!(both.scratch, 780_804_096);
+        assert_eq!(both.io, group_io_bytes("inkling2", ExpertFormat::Mxfp8, geometry, 2752)
+            + group_io_bytes("inkling2", ExpertFormat::Nvfp4, geometry, 2752));
+        assert_eq!(both.pinned_staging, 2752 * 8 * 8 * 2);
+        Ok(())
     }
 
     #[test]
