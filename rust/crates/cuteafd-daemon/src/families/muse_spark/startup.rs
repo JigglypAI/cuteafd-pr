@@ -207,6 +207,11 @@ mod tests {
             let report = input.plan(&PlanOptions { placement: ExpertPlacement::from_spark_ranks(sparks),
                 layout: Some(opts.clone()), ..Default::default() })?;
             let planned = report.solver_placement.clone().unwrap_or_else(|| panic!("{label}: {:?}", report.hints));
+            let prefill = cuteafd_loader::serving_capacity::prefill_waves::PrefillPlan {
+                unit_rows: report.prefill_unit_rows.context("resolved unit rows")?,
+                waves: report.prefill_waves.context("resolved waves")?,
+                span_rows: report.prefill_span_rows.context("resolved span rows")?,
+            };
             if cutoff_rows == DEFAULT_BF16_MAX_ROWS && formats.prefill == Some(Nvfp4) && formats.decode.is_none() && drafter.is_none() {
                 for rank in 0..2 {
                     let items = &report.solver_placement.as_ref().unwrap().items[rank];
@@ -226,7 +231,6 @@ mod tests {
                 assert_eq!(charged, (stored + trimmed) as u64);
                 assert!(placement.items[0].iter().all(|item| item.group != "Muse head logits"), "head rank only");
                 let placement = report.solver_placement.clone().context("placed")?;
-                let prefill = cuteafd_loader::serving_capacity::prefill_waves::PrefillPlan { unit_rows: 2752, waves: 3, span_rows: 8256 };
                 let plan = super::super::admission::spark_plan(&placement, prefill, Cutoff::new(64, 1)?, 16, 6)?;
                 assert_eq!(plan.working.spark_layers.len() + placement.onboard_layers, 62);
                 assert!(plan.working.spark_layers.iter().all(|layer| !plan.working.rtx_layers.contains(layer)));
@@ -239,12 +243,12 @@ mod tests {
                 assert_eq!(rings, plan.model.ring_bytes(cuteafd_core::ExpertGeometry::MUSE_SPARK)? as u64);
                 // Step metadata: the runtime's StepStorage extent is the charged item.
                 let charged = placement.items[0].iter().find(|item| item.group == "Muse step metadata").context("charge")?.bytes;
-                let tables = shared::step_tables(2752, 16, opts.context_tokens, 3)?;
+                let tables = shared::step_tables(prefill.unit_rows as usize, 16, opts.context_tokens, prefill.waves as usize)?;
                 assert_eq!(charged, tables.bytes() as u64);
                 // The coordinator intake the link allocates (ranks x waves x unit x row) is the charge.
                 let (row, planes) = shared::intake(&cuteafd_loader::families::muse_spark::MuseSparkConfig::from_hf(
                     &testing::muse_spark_config())?, prefill, Cutoff::new(64, 1)?, 16, 6)?;
-                assert_eq!(planes, 6 * cuteafd_core::serving_capacity::spark_intake_allocation_bytes((3 * 2752 * row) as u64)?);
+                assert_eq!(planes, 6 * cuteafd_core::serving_capacity::spark_intake_allocation_bytes(prefill.span_rows * row as u64)?);
                 let charged = placement.items[0].iter().find(|item| item.group == "Muse Spark partial reply planes")
                     .context("intake charge")?.bytes;
                 assert_eq!(charged, planes);
