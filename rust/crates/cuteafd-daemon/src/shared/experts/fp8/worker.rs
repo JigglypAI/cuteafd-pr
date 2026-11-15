@@ -49,14 +49,13 @@ fn device_part(buffer: CuteafdDeviceBuffer, offset: usize, bytes: usize) -> Resu
     Ok(CuteafdDeviceBuffer { ptr: buffer.ptr.cast::<u8>().wrapping_add(offset).cast(), bytes, ..buffer })
 }
 
-/// The package's ingress row: FP8 K32 wire rows or BF16 rows (NVFP4/BF16 weights).
-fn input_row_bytes(info: &cuteafd_ffi::fp8_moe::Fp8MoeInfo) -> usize {
-    if info.wire_input { info.wire_row_bytes() } else { info.hidden * 2 }
-}
+/// The package's ingress row: FP8 K32 wire rows, exact NVFP4 wire rows, or BF16 rows.
+fn input_row_bytes(info: &cuteafd_ffi::fp8_moe::Fp8MoeInfo) -> usize { info.input_row_bytes() }
 
 /// The input dtype a package's row-addressed program reads.
 fn segment_input_dtype(info: &cuteafd_ffi::fp8_moe::Fp8MoeInfo) -> ExpertV2Dtype {
-    if info.wire_input { ExpertV2Dtype::Fp8E4m3Ue8m0K32 } else { ExpertV2Dtype::Bf16 }
+    if info.nvfp4_input { ExpertV2Dtype::Nvfp4E2m1E4m3K16Amax }
+    else if info.wire_input { ExpertV2Dtype::Fp8E4m3Ue8m0K32 } else { ExpertV2Dtype::Bf16 }
 }
 
 /// Queue one wave's expert math on `stream` (no copies, no fences).
