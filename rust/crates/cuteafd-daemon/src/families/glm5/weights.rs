@@ -630,7 +630,7 @@ impl<'a> GlmLoader<'a> {
     }
 
     /// Whether `names` run as the checkpoint's BF16 tensors (the BF16 programs): every one is
-    /// BF16 and CUTEAFD_GLM_BF16=native asks for them ([`bf16_programs`]).
+    /// BF16 and outside the metadata-selected native MC core.
     fn bf16_native(&self, names: &[String]) -> Result<bool> {
         if !bf16_programs() {
             return Ok(false);
@@ -1323,14 +1323,8 @@ impl<'a> GlmLoader<'a> {
     }
 }
 
-/// BF16 checkpoint weights (nvidia/GLM-5.3-NVFP4's attention, indexer and shared experts) run
-/// as-is on the BF16 programs with CUTEAFD_GLM_BF16=native; by default they are quantized to
-/// 128x128 FP8 blocks at load (power-of-two scales) for the FP8 programs: BF16 reads twice
-/// the bytes (one RTX PRO 6000, coordinator alone: C1 step 28.6 vs 21.0 ms, 8K prefill 3.35
-/// vs 2.74 s), a decision pending in PLAN.md Phase 5.
-pub(crate) fn bf16_programs() -> bool {
-    cuteafd_loader::families::glm5::native_bf16()
-}
+/// Nonselected BF16 operands preserve their checkpoint representation.
+pub(crate) fn bf16_programs() -> bool { true }
 
 #[cfg(test)]
 #[path = "weights_tests.rs"]

@@ -167,8 +167,7 @@ impl Family for Glm {
                      quantized to those blocks at load (the only resident copy).".into()
                 } else {
                     "PLAN.md Phase 5 S2: serve-glm prefills per-tensor FP8 MLPs as static W8A8 and quantizes BF16 \
-                     MLA / shared-expert weights to FP8 blocks at load (CUTEAFD_GLM_BF16=native: the BF16 programs \
-                     on the checkpoint's own weights).".into()
+                     selected original MC core weights to FP8 blocks at load; unselected operands stay native.".into()
                 },
             });
         }
@@ -457,7 +456,7 @@ enum GlmCacheConfig {
 /// scales): the checkpoint's own blocks, a ModelOpt per-tensor FP8 weight
 /// under a uniform grid (prefill: static W8A8 on its input_scale), or a
 /// ModelOpt release's BF16 weight quantized to blocks at load
-/// (`GlmLoader::with_fp8`; CUTEAFD_GLM_BF16=native keeps it BF16 instead).
+/// (selected only through the MC core_tensors inventory).
 const GLM5_DECODE_FP8: &[&str] = &["q_a_proj", "kv_a_proj_with_mqa", "q_b_proj", "o_proj", "gate_proj", "up_proj", "down_proj"];
 
 impl GlmModel {

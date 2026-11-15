@@ -1196,7 +1196,7 @@ impl Opened {
         let storage = match push_policy { crate::shared::experts::rtx::push::PushPolicy::Mount => LocalStorage::Mount,
             crate::shared::experts::rtx::push::PushPolicy::Required => LocalStorage::Push };
         let target = if let Some(checkpoint) = &checkpoint {
-            TargetFacts::checkpoint(checkpoint, layers, devices.len(), owners.as_deref(), cuteafd_loader::families::glm5::native_bf16(),
+            TargetFacts::checkpoint(checkpoint, layers, devices.len(), owners.as_deref(), true,
                 &[if host_embedding { EmbeddingHome::HostPinned } else { EmbeddingHome::Device(0) }], core.as_ref())?
         } else {
             let config = serde_json::from_slice(&std::fs::read(self.snapshot.join("config.json"))?)?;

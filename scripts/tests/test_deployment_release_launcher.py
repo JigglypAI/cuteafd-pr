@@ -255,8 +255,6 @@ def test_deployment_preserves_release_container_commands(
             anchor = "--device-budget-bytes" if old["host"] != "coordinator" else "--embedding-placement"
             position = before["command"].index(anchor) + 2
             before["command"][position:position] = ["--core-view", "original"]
-        if old["host"] == "coordinator" and entry["family"] == "glm5":
-            before["env"]["CUTEAFD_GLM_BF16"] = "native"
         if old["host"] == "coordinator" and entry["family"] == "glm5_flash":
             position = before["command"].index("--kda-fp8") + 1
             before["command"][position] = "off"

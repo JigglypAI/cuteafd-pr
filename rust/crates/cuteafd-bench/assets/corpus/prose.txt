@@ -395,7 +395,7 @@ MLPs prefill as static W8A8 on their own input_scale / weight_scale (plain
 E4M3 MMAs; decode GEMVs read the same bytes under a uniform grid): NLL 2.4827 /
 KL 0.0580, MLP 1.4x faster than block W8A8 at 4096 rows. Its BF16 attention,
 indexer and shared experts quantize to FP8 blocks at load by default; with
-`CUTEAFD_GLM_BF16=native` they run as-is on the BF16 programs (one or two
+the checkpoint-native path they run as-is on the BF16 programs (one or two
 RTX): KL 0.0491, but C1 step 41.7 vs 34.3 ms with the Sparks (coordinator
 alone 28.6 vs 19.2 ms one RTX, 19.8 vs 16.1 two), coordinator 8K prefill
 3.35 vs 2.75 s (2.36 vs 2.07), weights 32.3 vs 17.6 GiB. FP8 blocks stay the

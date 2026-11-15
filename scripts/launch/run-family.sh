@@ -2338,15 +2338,7 @@ case "$family" in
   deepseek_v4)
     [[ -z "$(get PREFILL_SPAN_ROWS)" ]] || lane_env_args+=(-e "CUTEAFD_PREFILL_SPAN_ROWS=$(get PREFILL_SPAN_ROWS)")
     ;;
-  glm5)
-    # Plan and serve resolve the same explicit target conversion policy.
-    glm_bf16="$(get CUTEAFD_GLM_BF16 "${CUTEAFD_GLM_BF16:-native}")"
-    case "$glm_bf16" in
-      native|fp8) lane_env_args+=(-e "CUTEAFD_GLM_BF16=$glm_bf16") ;;
-      *) release_die "CUTEAFD_GLM_BF16 must be native or fp8" ;;
-    esac
-    ;;
-  glm5_flash|qwen4|qwen3_5|kimi_k3|step5|muse_spark|mimo_v2|minimax_m3) ;;
+  glm5|glm5_flash|qwen4|qwen3_5|kimi_k3|step5|muse_spark|mimo_v2|minimax_m3) ;;
   *) echo "missing worker endpoint geometry for $family" >&2; exit 2 ;;
 esac
 if [[ -n "$expert_input" && "$expert_input" != fp8 && "$ranks" == 0 ]]; then
