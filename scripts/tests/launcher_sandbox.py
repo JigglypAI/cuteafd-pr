@@ -235,6 +235,9 @@ def seed_checkpoint_metadata(hf):
     }
     checkpoints.update(copy.deepcopy(aliases))
     for name, config in checkpoints.items():
+        config = copy.deepcopy(config)
+        if "NVFP4" in name:
+            config["quantization_config"] = {"quant_method": "modelopt", "quant_algo": "NVFP4"}
         if "EXL3" in name:
             config["quantization_config"] = {"quant_method": "exl3"}
         if config.get("model_type") == "qwen3_5":
