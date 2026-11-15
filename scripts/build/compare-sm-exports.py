@@ -497,8 +497,9 @@ def routed_package_layouts(package, geometry, base, role):
     build = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "build")
     selected = []
     for node in build.body:
+        # The layout policy ends where the input-format/wire selection begins.
         if isinstance(node, ast.Assign) and any(
-                isinstance(name, ast.Name) and name.id == "wire"
+                isinstance(name, ast.Name) and name.id in ("kind", "wire")
                 for target in node.targets
                 for name in (target.elts if isinstance(target, ast.Tuple) else [target])):
             break

@@ -1349,7 +1349,8 @@ def test_source_routed_layouts_stop_at_tuple_wire_assignment(tmp_path, monkeypat
 def build(args):
     capacities = []
     layouts = args.layouts.split(',')
-    wire, nvfp4_input = False, False
+    kind = input_kind(args.role, args.input)
+    wire, nvfp4_input = kind == 'wire', kind == 'nvfp4'
     raise AssertionError('must not enter compilation')
 ''')
     monkeypatch.setattr(compare_sm, 'ROOT', tmp_path)
