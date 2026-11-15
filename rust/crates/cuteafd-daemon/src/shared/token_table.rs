@@ -51,6 +51,17 @@ impl<'a> RetainedUploads<'a> {
             stream: std::ptr::null_mut(), failed: false, exhaustion_waits: 0 })
     }
 
+    /// Passive inventory: the mapped address describes the pinned backing, not
+    /// a second device allocation. Event handles are host diagnostics only.
+    pub fn allocation_receipts(&self, inventory: &mut super::memory::receipts::Inventory<'_>, name: &str) -> Result<()> {
+        inventory.pinned(name, self.storage.buffer)?;
+        inventory.host(&format!("{name}.events"), &self.events)?;
+        inventory.host_backing(&format!("{name}.mapped-alias"), &self.alias as *const _ as u64,
+            std::mem::size_of_val(&self.alias) as u64)?;
+        inventory.host_backing(&format!("{name}.previous-reader"), &self.previous_reader as *const _ as u64,
+            std::mem::size_of_val(&self.previous_reader) as u64)
+    }
+
     /// # Safety
     /// Destination and stream remain live through the queued read and every
     /// destination consumer/rewrite runs in this stream's order. Large uploads
@@ -117,6 +128,40 @@ impl<'a> RetainedUploads<'a> {
         Ok(())
     }
 }
+#[cfg(test)]
+mod retained_inventory_tests {
+    use super::*;
+    use super::super::memory::receipts::Inventory;
+    use cuteafd_core::memory_layout::Category;
+    use cuteafd_ffi::native_library_lifetime_fixture::Fixture;
+    use cuteafd_loader::placement::planner::{CoordinatorDevices, Lifetime, Location};
+
+    #[test]
+    fn retained_upload_receipts_match_planned_pinned_bytes_without_native_work() -> Result<()> {
+        let fixture = Fixture::build_for_tests()?;
+        let library = fixture.load()?;
+        let mut shape = UploadShape::default();
+        shape.append(&[64*8, 64*4, 17*4], 3)?;
+        let owner = RetainedUploads::new(Device { library: &library, id: 0 }, shape)?;
+        let physical = [0];
+        let devices = CoordinatorDevices::new(&physical)?;
+        let before = fixture.events()?;
+        let mut inventory = Inventory::new(devices, "fixture", Lifetime::TARGET, Category::Staging, "retained uploads");
+        owner.allocation_receipts(&mut inventory, "uploads")?;
+        assert_eq!(fixture.events()?, before, "passive receipts must not allocate, copy or wait");
+        let pinned = inventory.receipts.iter().filter(|receipt| receipt.allocation.location == Location::PINNED)
+            .collect::<Vec<_>>();
+        assert_eq!(pinned.len(), 1);
+        assert_eq!(pinned[0].allocation.bytes, shape.capacity_bytes()? as u64);
+        assert_eq!(pinned[0].address, owner.storage.buffer.ptr as u64);
+        assert!(inventory.receipts.iter().all(|receipt| receipt.allocation.location != Location::coordinator(0)),
+            "mapped alias must never be charged as device memory");
+        assert!(inventory.receipts.iter().any(|receipt| receipt.allocation.id == "fixture.uploads.events"));
+        assert_eq!(owner.alias.bytes, owner.storage.buffer.bytes);
+        Ok(())
+    }
+}
+
 impl Drop for RetainedUploads<'_> {
     fn drop(&mut self) {
         while let Some(fence) = self.cursor.oldest() {
