@@ -230,7 +230,20 @@ def test_bridge_rejects_invalid_core_scratch_layout(change):
                "entry": "mock_launch", "core_only": True, "segmented": False,
                "act_row_bytes": 2048, "reply_layouts": [layout]}
     with pytest.raises(ValueError, match="reply scratch"):
-        package_tool.bridge_source([program], [0] * 16)
+        package_tool.bridge_source([program], [1 << 8] + [0] * 15)
+
+
+@pytest.mark.parametrize("storage", [7, 8])
+def test_bridge_refuses_compressed_replies_without_a_known_down_output(storage):
+    """#2187: the bridge derives y only for storages it lays out; dynamic-amax (7) and
+    divisor-convention (8) NVFP4 have their own scratch and possibly unweighted combine."""
+    layout = {"end_rows": 80, "route": 3, "metadata_bytes": 2048, "a4_split": 0}
+    program = {"stem": "mock", "capacity": 80, "scratch": 65536, "form": "auto",
+               "entry": "mock_launch", "core_only": True, "segmented": False,
+               "act_row_bytes": 2048, "reply_layouts": [layout]}
+    with pytest.raises(ValueError, match="compressed replies are not supported"):
+        package_tool.bridge_source([program], [storage << 8] + [0] * 15)
+    assert storage not in package_tool.REPLY_LAYOUT_STORAGES
 
 
 @pytest.mark.parametrize("geometry", [
