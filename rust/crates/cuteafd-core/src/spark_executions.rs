@@ -138,6 +138,19 @@ pub const EXL3_SEGMENT_REGIONS: [&str; 12] = ["block_expert_ids", "packed_route_
     "fc2_scratch", "workspace"];
 
 impl Exl3SegmentGeometry {
+    /// The shipped Spark segments program for one rank's stored width: the
+    /// exporter's fixed WS policy (64-row route blocks, the SM121 AOT
+    /// workspace of 48 SMs, the compiled 8192-row maximum). The planner
+    /// derives it; the worker requires the installed package to equal it.
+    pub fn for_spark(hidden: u32, width: u32, topk: u32, experts: u32) -> Self {
+        const BLOCK: u32 = 64;
+        let routes = u64::from(SEGMENT_MAX_ROWS) * u64::from(topk);
+        let bound = routes + u64::from(experts) * u64::from(BLOCK - 1);
+        let slots = if routes < u64::from(experts) { (routes * u64::from(BLOCK)).min(bound) } else { bound };
+        Self { maximum: SEGMENT_MAX_ROWS, hidden, intermediate: width, topk, experts, block: BLOCK,
+            max_m_blocks: u32::try_from(slots.div_ceil(u64::from(BLOCK))).unwrap_or(u32::MAX), workspace_sms: 48 }
+    }
+
     /// Byte sizes of every region at `rows` live rows, in arena order (fork
     /// `exl3_ws_segment_scratch_regions`). Each region starts on 256 bytes.
     /// The block-expert table keeps the compiled maximum, fixing later offsets
@@ -363,6 +376,11 @@ mod tests {
         assert_eq!(offsets[8], 1_006_967_296, "output-address table offset");
         assert!(glm.layout(8193).is_none() && glm.layout(0).is_none());
         assert!(Exl3SegmentGeometry { max_m_blocks: 1, ..glm }.layout(1).is_none(), "undersized block table");
+        // The planner's derivation equals the exported GLM TP4 and GLM Flash TP2 programs.
+        assert_eq!(Exl3SegmentGeometry::for_spark(6144, 512, 8, 256), glm);
+        let flash = Exl3SegmentGeometry::for_spark(4096, 1024, 8, 288);
+        assert_eq!(flash.max_m_blocks, 1308);
+        assert_eq!(flash.layout(8192).unwrap().1, 939_934_208, "exported GLM Flash TP2 arena");
     }
 
     #[test]

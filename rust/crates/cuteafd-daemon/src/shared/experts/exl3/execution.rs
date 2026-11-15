@@ -265,6 +265,9 @@ impl Manifest {
         ensure!(self.row_addresses && self.wire_input()? && self.output_dtype == "bf16",
             "EXL3 segment program must be row-addressed FP8 K32 input with BF16 output");
         let geometry = self.segment_geometry.context("EXL3 segment program lacks its geometry")?;
+        ensure!(geometry == cuteafd_core::spark_executions::Exl3SegmentGeometry::for_spark(
+            geometry.hidden, geometry.intermediate, geometry.topk, geometry.experts),
+            "EXL3 segment program differs from the planner's Spark segment policy");
         ensure!(geometry.maximum as usize == self.capacity && geometry.hidden as usize == self.hidden
             && geometry.intermediate as usize == self.intermediate && geometry.topk as usize == self.top_k
             && geometry.experts as usize == self.experts && geometry.block as usize == self.route_block
