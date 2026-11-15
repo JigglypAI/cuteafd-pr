@@ -376,13 +376,13 @@ mod tests {
                     entry["capacity_rows"].as_u64().unwrap() as u32, extent as u32).unwrap();
                 entry["name"] = layout.name().into();
                 if index { entry["geometry"]["heads"] = 2.into(); }
-                else { entry["geometry"]["query_heads"] = 32.into(); entry["geometry"]["kv_heads"] = 2.into(); }
+                else { entry["geometry"]["query_heads"] = 32.into(); entry["geometry"]["kv_heads"] = 2.into(); entry["geometry"]["record_bytes"] = 272.into(); entry["geometry"]["scale_offset"] = 256.into(); }
                 entry["scratch_bytes_at_capacity"]["scratch"] = layout.scratch.into();
                 for pointer in entry["pointers"].as_array_mut().unwrap() {
                     let shape = pointer["shape"].as_str().unwrap();
                     pointer["shape"] = if pointer["name"] == "scratch" { format!("[{}]", layout.scratch) }
                         else if pointer["name"] == "q2k_indices" { shape.replacen("[4,", "[2,", 1) }
-                        else { shape.replace(",4]", ",2]").replace(",4,128]", ",2,128]")
+                        else { shape.replace(",4]", ",2]").replace(",4,128]", ",2,128]").replace(",528]", ",272]")
                             .replace("[rows,64", "[rows,32") }.into();
                 }
                 continue;
@@ -414,15 +414,17 @@ mod tests {
                 for pointer in entry["pointers"].as_array_mut().unwrap() {
                     let shape = pointer["shape"].as_str().unwrap();
                     pointer["shape"] = if kind == producers::Kind::IndexHeads {
-                        shape.replace(",4,128]", ",2,128]").replace(",4]", ",2]")
+                        shape.replace(",4,128]", ",2,128]").replace(",528]", ",272]").replace(",4]", ",2]")
                             .replace(",9,128]", ",5,128]")
                     } else { shape.replace(&from, &to) }.into();
                 }
             } else if name == "minimax_kv_pack" {
                 entry["name"] = "minimax_kv_pack_h2".into();
                 entry["geometry"]["heads"] = 2.into();
+                entry["geometry"]["record_bytes"] = 272.into();
+                entry["geometry"]["scale_offset"] = 256.into();
                 for pointer in entry["pointers"].as_array_mut().unwrap() {
-                    pointer["shape"] = pointer["shape"].as_str().unwrap().replace(",4", ",2").into();
+                    pointer["shape"] = pointer["shape"].as_str().unwrap().replace(",4", ",2").replace(",528]", ",272]").into();
                 }
             }
         }
@@ -555,16 +557,23 @@ mod tests {
 
     fn native_seed(device: Device<'_>, request: Request, tokens: usize) -> Result<()> {
         let pages = tokens.div_ceil(64);
-        for (buffer, stride) in [(request.key_cache, 32768), (request.value_cache, 32768),
+        let record_bytes = cuteafd_ffi::minimax_m3::kv_plane_record_bytes(4);
+        for (buffer, stride) in [(request.key_cache, 64 * record_bytes), (request.value_cache, 64 * record_bytes),
             (request.index_cache, 8448)] {
             let mut bytes = vec![0; pages * stride];
             for (page, record) in bytes.chunks_exact_mut(stride).enumerate() {
-                let key_bytes = if stride == 8448 { 8192 } else { stride };
-                for (at, value) in record[..key_bytes].iter_mut().enumerate() {
-                    *value = [0x28, 0xb0, 0x38, 0xa8][(page * 7 + at * 3 + at / 128) % 4];
-                }
                 if stride == 8448 {
-                    for value in record[key_bytes..].chunks_exact_mut(4) { value.copy_from_slice(&1f32.to_le_bytes()); }
+                    for (at, value) in record[..8192].iter_mut().enumerate() {
+                        *value = [0x28, 0xb0, 0x38, 0xa8][(page * 7 + at * 3 + at / 128) % 4];
+                    }
+                    for value in record[8192..].chunks_exact_mut(4) { value.copy_from_slice(&1f32.to_le_bytes()); }
+                } else {
+                    for (row, token) in record.chunks_exact_mut(record_bytes).enumerate() {
+                        for (at, value) in token[..512].iter_mut().enumerate() {
+                            *value = [0x28, 0xb0, 0x38, 0xa8][(page * 7 + row + at * 3 + at / 128) % 4];
+                        }
+                        for value in token[512..528].chunks_exact_mut(4) { value.copy_from_slice(&1f32.to_le_bytes()); }
+                    }
                 }
             }
             device.run(|| {
