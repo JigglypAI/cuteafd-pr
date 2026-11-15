@@ -1293,6 +1293,11 @@ impl<'a> DsparkDrafter<'a> {
     }
 
     fn workspace(&self, sequences: usize) -> Result<Workspace<'a>> {
+        let device = device::Device { library: self.library, id: self.hidden_norm.buffer.device_id };
+        device.run(|| self.workspace_on_device(sequences))
+    }
+
+    fn workspace_on_device(&self, sequences: usize) -> Result<Workspace<'a>> {
         let _memory_scope = cuteafd_ffi::memory_ledger::scope("drafter/workspace");
         let c = &self.cfg;
         let rows = sequences * c.block;
@@ -1741,6 +1746,20 @@ mod tests {
                             8,64,Qwen4KvCache::Bf16,&mut allocate)
                     })?;
                     assert_eq!(requested.into_inner(),expected);
+                    device.library.cuda_set_device(0)?;
+                    drafter.prepare_workspace()?;
+                    assert_eq!(device.library.cuda_get_device()?, 0, "workspace preparation restores caller device");
+                    {
+                    let workspace = drafter.workspace.borrow();
+                    let workspace = workspace.as_ref().context("prepared reversed-device workspace missing")?;
+                    for owner in [&workspace.h, &workspace.n, &workspace.qkv, &workspace.q,
+                        &workspace.k, &workspace.v, &workspace.attn, &workspace.delta, &workspace.gate_up,
+                        &workspace.act, &workspace.logits, &workspace.anchors, &workspace.ids,
+                        &workspace.tokens, &workspace.confidence, &workspace.positions, &workspace.tables,
+                        &workspace.attention_workspace, &workspace.markov_workspace, &workspace._head_workspace] {
+                        assert_eq!(owner.buffer.device_id, device.id, "workspace owner follows drafter, not caller");
+                    }
+                    }
                     Ok(drafter)
                 }
                 let baseline = run(device,&programs,&snapshot,representation,None,&expected)?;
