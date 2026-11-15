@@ -188,9 +188,9 @@ pub fn gather(request: &FactsRequest<'_>) -> Result<InklingInputs, Refused> {
     let local = local_package(&catalog, request.manifest_path, gpus, shape.rows.max(u64::from(shared::DECODE_ROWS)));
     // Mixed native checkpoints (NVFP4 then MXFP8) keep the per-layer native
     // ingress; the link is sized for its widest request row (BF16).
-    let ingress = if storage.iter().all(|s| *s == ExpertStorage::Mxfp8) { cuteafd_core::SparkIngress::Fp8K32 }
-        else if storage.iter().any(|s| *s == ExpertStorage::Mxfp8) { cuteafd_core::SparkIngress::Native }
-        else { cuteafd_core::SparkIngress::Bf16 };
+    let first_wire = shared::ingress(storage.first().copied());
+    let ingress = if storage.iter().all(|&storage| shared::ingress(Some(storage)) == first_wire) { first_wire }
+        else { cuteafd_core::SparkIngress::Native };
     let spark = spark_charges(&catalog, &experts, &routed, ranks, shape, ingress)
         .map_err(|error| refused(format!("Inkling 2 Spark inventory refused: {error:#}"),
             "Use a Spark world of 2..=8 ranks."))?;

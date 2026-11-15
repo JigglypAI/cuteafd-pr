@@ -380,9 +380,9 @@ impl Family for Inkling2 {
     fn optional(&self, component: Component) -> bool {
         matches!(component, Component::Vision | Component::Speculator)
     }
-    /// The shared expert catalog gains fused `w13`/`w2` readers with the Spark
-    /// packages (stage 3); the stage-1 planner reads expert headers directly.
-    fn expert_catalog(&self) -> bool { false }
+    /// Native fused and EXL3 operands use the shared catalog; this capability
+    /// validates storage and package selection, not serving qualification.
+    fn expert_catalog(&self) -> bool { true }
 }
 
 impl FamilyModel for Model {

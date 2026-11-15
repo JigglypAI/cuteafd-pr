@@ -185,13 +185,13 @@ pub fn request(context: Context, pool: Option<u64>, onboard: crate::placement::O
         prefill: Pin::Exact(prefill), operation, resident_weight_limit, spark_reply_formats: replies }
 }
 
-/// The Spark request wire for a layer's expert storage: MXFP8 experts
-/// consume the checkpoint's own group-32 E4M3 + UE8M0 activations (the K32
-/// frame the FP8 families already send), NVFP4 and EXL3 experts consume BF16
-/// rows and quantize or dequantize on the Spark.
+/// Installed backend input contract: native MXFP8 and shared EXL3 workers
+/// consume FP8 K32 transport rows; dynamic NVFP4 quantizes BF16 on the Spark.
+/// EXL3 weight payloads remain native trellis throughout.
 pub fn ingress(storage: Option<crate::plan::families::inkling2::ExpertStorage>) -> cuteafd_core::SparkIngress {
     match storage {
-        Some(crate::plan::families::inkling2::ExpertStorage::Mxfp8) => cuteafd_core::SparkIngress::Fp8K32,
+        Some(crate::plan::families::inkling2::ExpertStorage::Mxfp8
+            | crate::plan::families::inkling2::ExpertStorage::Exl3 { .. }) => cuteafd_core::SparkIngress::Fp8K32,
         _ => cuteafd_core::SparkIngress::Bf16,
     }
 }
@@ -742,6 +742,14 @@ mod tests {
         let layers = layer_modes(&cfg, 2, AttentionPlacement::Layers);
         assert_eq!(layers.iter().filter(|m| matches!(m, LayerMode::Whole { gpu: 0, .. })).count(), 24);
         assert!(matches!(layers[47], LayerMode::Whole { gpu: 1, .. }));
+    }
+
+    #[test]
+    fn ingress_matches_shared_exl3_and_native_package_inputs() {
+        use crate::plan::families::inkling2::ExpertStorage;
+        assert_eq!(ingress(Some(ExpertStorage::Mxfp8)), cuteafd_core::SparkIngress::Fp8K32);
+        assert_eq!(ingress(Some(ExpertStorage::Exl3 { bits: 4 })), cuteafd_core::SparkIngress::Fp8K32);
+        assert_eq!(ingress(Some(ExpertStorage::Nvfp4)), cuteafd_core::SparkIngress::Bf16);
     }
 
     #[test]
