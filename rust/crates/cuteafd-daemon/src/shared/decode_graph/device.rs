@@ -90,7 +90,6 @@ pub(crate) struct Counters {
     pub eager_runs: u64,
     pub evictions: u64,
     pub physical_floor_skips: u64,
-    pub eager_awaiting_destroy: u64,
     pub eager_vampire: u64,
     pub eager_projected_hard_stop: u64,
     pub eager_soft_room: u64,
@@ -625,16 +624,16 @@ pub(crate) unsafe fn observe_completed(library: &cuteafd_ffi::NativeLibrary,
     mut visit: impl FnMut(&mut GraphVisitor<'_>) -> anyhow::Result<()>) -> anyhow::Result<()> {
     let mut devices = std::collections::BTreeSet::new();
     visit(&mut |device, _, _, bank| { bank.tick(); devices.insert(device); Ok(()) })?;
-    for &device in &devices { observe_device(library, device)?; }
+    for &device in &devices {
+        observe_device(library, device)?;
+        if let Some(cache) = existing_cache(device) { cache.lock().unwrap_or_else(|p| p.into_inner()).serial_boundary(); }
+    }
     visit(&mut |_, _, _, bank| {
         // SAFETY: serving banks retain only borrowed handles of persistent engine
         // buffers (or ()); their containing pipelines order buffer reuse.
         unsafe { bank.evict_persistent(); }
         Ok(())
     })?;
-    for device in devices {
-        if let Some(cache) = existing_cache(device) { cache.lock().unwrap_or_else(|p| p.into_inner()).serial_boundary(); }
-    }
     Ok(())
 }
 
@@ -686,7 +685,12 @@ impl LaneCycles {
         let mut pending = false;
         for clocks in &self.clocks {
             let clock = &clocks[self.lane];
-            assert!(!clock.active.swap(true, Ordering::AcqRel), "graph lane cycle already active");
+            // The current-thread lane executor never overlaps begin/serial
+            // boundaries. A cancelled future can leave active set: quarantine
+            // its index rather than panic or pretend it completed.
+            if clock.active.swap(true, Ordering::AcqRel) {
+                tracing::warn!(lane = self.lane, "resetting cancelled graph cycle without completion credit");
+            }
             clock.index.fetch_add(1, Ordering::AcqRel);
             pending |= clock.pending.load(Ordering::Acquire) > 0;
         }
@@ -709,8 +713,9 @@ impl LaneCycles {
     }
 
     pub fn abandon(&mut self) {
-        // An error is not a completed-cycle proof. Existing submission guards
-        // drain the owners; only a later successful cycle may release credit.
+        // An error is not a completed-cycle proof. A later successful cycle,
+        // or the scheduler's fail_round + reset_connections drained boundary,
+        // can release credit; clearing active alone cannot.
         for clocks in &self.clocks { clocks[self.lane].active.store(false, Ordering::Release); }
     }
 }
@@ -828,15 +833,17 @@ impl DeviceCache {
         let old = self.bank_lane(bank);
         if old != lane {
             let pending = self.records.values().filter(|r| r.identity.bank == bank && r.pending_destroy).count();
-            self.pending_lanes[old] -= pending;
+            self.pending_lanes[old] = self.pending_lanes[old].checked_sub(pending)
+                .expect("graph pending lane ownership mismatch");
             self.pending_lanes[lane] += pending;
-            self.clocks[old].pending.fetch_sub(pending, Ordering::AcqRel);
+            let previous = self.clocks[old].pending.fetch_sub(pending, Ordering::AcqRel);
+            debug_assert!(previous >= pending, "graph pending lane atomic mismatch");
             self.clocks[lane].pending.fetch_add(pending, Ordering::Release);
         }
         self.bank_lanes.insert(bank, lane);
     }
 
-    fn bank_lane(&self, bank: u64) -> usize { self.bank_lanes.get(&bank).copied().unwrap_or(0) }
+    pub(super) fn bank_lane(&self, bank: u64) -> usize { self.bank_lanes.get(&bank).copied().unwrap_or(0) }
 
     #[cfg(test)]
     fn begin_lane(&mut self, lane: usize) {
@@ -854,7 +861,7 @@ impl DeviceCache {
         self.refresh_cycles();
     }
 
-    fn refresh_cycles(&mut self) {
+    pub(super) fn refresh_cycles(&mut self) {
         for (lane, clock) in self.lanes.iter_mut().zip(self.clocks.iter()) {
             let index = clock.index.load(Ordering::Acquire);
             let completed = clock.completed.load(Ordering::Acquire);
@@ -898,6 +905,9 @@ impl DeviceCache {
         self.epochs.uncredited_nodes = self.lagged.iter().map(|credit| credit.nodes).sum();
     }
 
+    // Called only by the serial executor after drainage (V4.1 failures pass
+    // fail_round + reset_connections first). The current-thread LaneSet polls
+    // begin/complete and these boundaries serially; not a multi-thread barrier.
     pub(super) fn serial_boundary(&mut self) {
         self.refresh_cycles();
         if self.lanes.iter().any(|lane| lane.active) { return }
@@ -917,12 +927,14 @@ impl DeviceCache {
     }
     pub fn has_pending_victims(&self) -> bool { self.pending_destroy > 0 }
     pub fn pending(&self, id: u64) -> bool { self.records.get(&id).is_some_and(|r| r.pending_destroy) }
-    pub fn persistent_victim_ready(&mut self, id: u64) -> bool {
-        self.refresh_cycles();
+    pub fn persistent_victim_ready(&self, id: u64) -> bool {
         self.records.get(&id).is_some_and(|record| {
             let lane = self.bank_lane(record.identity.bank);
-            record.pending_destroy && self.selected_epochs.get(&id).is_none_or(|until|
-                self.lanes[lane].completed >= until[lane])
+            let epoch = &self.lanes[lane];
+            let closed = if epoch.active { epoch.completed >= epoch.index.saturating_sub(1) }
+                else { epoch.completed >= epoch.index };
+            record.pending_destroy && closed && self.selected_epochs.get(&id).is_none_or(|until|
+                epoch.completed >= until[lane])
         })
     }
 
@@ -1260,8 +1272,11 @@ impl DeviceCache {
                 if !self.unmeasured { self.captured_since_observation = false; }
                 return self.floor_skip(old, site.cycle);
             }
+            let hard_room = self.soft.measured_bytes.is_none()
+                || self.charged.saturating_add(projected) <= self.reserve;
+            projected_hard_stop = !hard_room;
             let selected_before = self.pending_destroy;
-            let room = if self.soft.measured_bytes.is_none() { true }
+            let room = if !hard_room { false } else if self.soft.measured_bytes.is_none() { true }
                 else {
                 let new_nodes = metadata.nodes.filter(|nodes| *nodes > 0).or_else(|| old.and_then(|id| self.records[&id].stats.native_nodes).filter(|n| *n > 0))
                     .or_else(|| self.records.values().filter(|r| r.identity.site == site.name)
@@ -1275,9 +1290,6 @@ impl DeviceCache {
             if evicted { self.lanes[lane].vampires.insert(identity.clone()); }
             // Selected owners and lagged chunks still consume capacity. Only
             // their owner's next cycle can destroy them; no device-wide gate.
-            let hard_room = self.soft.measured_bytes.is_none()
-                || self.charged.saturating_add(projected) <= self.reserve;
-            projected_hard_stop = !hard_room;
             if room && !evicted && hard_room {
             let id = if let Some(id) = old { self.unlink(id); id } else {
                 self.next_id += 1;
@@ -1348,6 +1360,7 @@ impl DeviceCache {
     /// survived, but driver growth still needs the ordinary completed sample.
     /// Returns true only for the key's first OOM warning while it is retained.
     pub fn capture_oom(&mut self, id: u64) -> bool {
+        self.reuse_captures.remove(&id);
         let Some(record) = self.records.get_mut(&id) else { return false };
         if !record.pending_capture { return false }
         self.pending_bytes = self.pending_bytes.saturating_sub(record.estimate);
@@ -1649,6 +1662,7 @@ impl DeviceCache {
         }
         let ids: Vec<_> = self.records.iter().filter(|(_, r)| r.identity.bank == bank).map(|(&id, _)| id).collect();
         self.remove_drained(&ids);
+        self.bank_lanes.remove(&bank);
     }
 
     /// Forget destroyed owners, never crediting physical driver-arena release.

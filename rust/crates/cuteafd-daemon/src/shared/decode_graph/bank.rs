@@ -270,7 +270,9 @@ impl<K: Hash + Eq + Clone + std::fmt::Debug, E> GraphBank<K, E> {
             let mut cache = shared.lock().unwrap_or_else(|p| p.into_inner());
             binding.flush(&mut cache);
             binding.pinned_counts.clear();
+            let lane = cache.bank_lane(binding.bank);
             cache.remove_bank(binding.bank);
+            cache.assign_bank_lane(binding.bank, lane);
         }
     }
 
@@ -327,6 +329,7 @@ impl<K: Hash + Eq + Clone + std::fmt::Debug, E> GraphBank<K, E> {
         let victims: Vec<_> = {
             let mut cache = binding.cache.lock().unwrap_or_else(|p| p.into_inner());
             if !cache.has_pending_victims() { return }
+            cache.refresh_cycles();
             self.entries.iter().filter_map(|(key, entry)| entry.cached
                 .filter(|(id, _)| cache.persistent_victim_ready(*id)).map(|(id, _)| (key.clone(), id))).collect()
         };
