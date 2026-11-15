@@ -837,20 +837,21 @@ fn native_owner_shares_scratch_and_sums_quant_and_bf16_tail_io() -> anyhow::Resu
         // The census bound is the maximum over every installed TP package.
         let tail_scratch = 580_747_264;
         let geometry = input.expert_catalog()?.routed_experts().geometry()?;
-        let quant_scratch = if format == "fp8" {
-            let width = geometry.intermediate / u32::try_from(ranks)?;
-            let segmented = cuteafd_core::spark_executions::segment_scratch_bytes(
-                geometry.hidden, geometry.experts, geometry.topk, width * 2,
-                prefill.segment_rows().unwrap(), cuteafd_core::spark_executions::SEGMENT_MAX_ROWS).unwrap();
-            assert!(segmented > quant_scratch, "admitted stream arena exceeds singleton census");
-            segmented.max(quant_scratch)
-        } else { quant_scratch };
+        // Both quant groups merge waves: FP8 streams and NVFP4 W4A4 BF16 rows.
+        let width = geometry.intermediate / u32::try_from(ranks)?;
+        let arithmetic = if format == "fp8" {
+            cuteafd_core::spark_executions::SegmentArithmetic::Stream { act_row_bytes: width * 2 }
+        } else { cuteafd_core::spark_executions::SegmentArithmetic::Nvfp4A4 { slice: width } };
+        let segmented = cuteafd_core::spark_executions::segment_scratch_bytes(
+            geometry.hidden, geometry.experts, geometry.topk, arithmetic,
+            prefill.segment_rows().unwrap(), cuteafd_core::spark_executions::SEGMENT_MAX_ROWS).unwrap();
+        let quant_scratch = segmented.max(quant_scratch);
         assert_eq!(quant.scratch, quant_scratch);
         assert_eq!(mixed.scratch, quant.scratch.max(tail.scratch));
         assert_eq!(mixed.scratch, tail_scratch.max(quant_scratch));
         assert_eq!(mixed.io, quant.io + tail.io);
         assert_eq!(mixed.pinned_staging, quant.pinned_staging + tail.pinned_staging);
-        let segment_addresses = if format == "fp8" { u64::from(prefill.staging_rows) * 16 } else { 0 };
+        let segment_addresses = u64::from(prefill.staging_rows) * 16;
         assert_eq!(mixed.pinned_staging,
             2 * u64::from(prefill.staging_rows) * u64::from(geometry.topk) * 8 + segment_addresses);
     }

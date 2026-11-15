@@ -1394,8 +1394,8 @@ def test_spark_routed_object_set_matches_production_including_core(tmp_path, mon
         return SimpleNamespace(export_to_c=lambda *args: None)
     forms = lambda g, rows, wire: ["w8a16"] if rows > 16 else []
     module = SimpleNamespace(GEOMETRIES={"mimo": geometry}, compile_fp8_moe_aot=compile_program,
-        fp8_moe_scratch_bytes=lambda *args: 64, fp8_moe_segment_scratch_bytes=lambda *args: 128,
-        prefill_forms=forms)
+        fp8_moe_scratch_bytes=lambda *args: 64, fp8_moe_segment_scratch_bytes=lambda *args, **kwargs: 128,
+        prefill_forms=forms, nvfp4_a4_fused=lambda: True)
     monkeypatch.setitem(sys.modules, "b12x.integration.cuteafd", SimpleNamespace(
         exportable_compilation=nullcontext, validate_exported_header=lambda *args: {"argument_count": 13}))
     monkeypatch.setitem(sys.modules, "b12x.integration.cuteafd.fp8_moe", module)
@@ -1423,6 +1423,7 @@ def test_spark_routed_object_set_matches_production_including_core(tmp_path, mon
     end = next(i for i, n in enumerate(loop.body) if isinstance(n, ast.For)
                and isinstance(n.target, ast.Tuple) and len(n.target.elts) == 4)
     env = {**vars(package), "capacities": [16, 4096], "prefill_forms": forms, "g": geometry, "wire": wire,
+           "nvfp4_a4_fused": lambda: True,
            "args": SimpleNamespace(role="spark")}
     exec(compile(ast.Module(body=loop.body[begin:end], type_ignores=[]), "production_recipes", "exec"), env)
     expected = {(rows, form, segmented, core) for rows, form, segmented, core in env["exports"]}

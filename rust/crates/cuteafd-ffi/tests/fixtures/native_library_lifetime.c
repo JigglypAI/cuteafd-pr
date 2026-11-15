@@ -317,13 +317,13 @@ int cuteafd_fp8moe_launch(void *ctx, uint32_t capacity, void **ptrs, int rows, v
 }
 int cuteafd_fp8moe_segment_info(uint32_t form, uint32_t *maximum, uint32_t *minimum, uint32_t *act) {
     if (form > 2) return 1;
-    *maximum = fp8_segments ? 16384 : 0;
+    *maximum = fp8_segments ? 8192 : 0;
     *minimum = fp8_segments ? 769 : 0;
     *act = fp8_segments ? 2 * fp8_words[2] : 0; return 0;
 }
 int cuteafd_fp8moe_segment_scratch_bytes(uint32_t rows, uint64_t *bytes) {
-    if (!fp8_segments || !rows || rows > 16384) return 1;
-    uint64_t pairs = (uint64_t)rows * fp8_words[4], bound = 16384ull * fp8_words[4];
+    if (!fp8_segments || !rows || rows > 8192) return 1;
+    uint64_t pairs = (uint64_t)rows * fp8_words[4], bound = 8192ull * fp8_words[4];
     uint64_t experts = fp8_words[3];
     uint64_t tiles = (pairs + 127) / 128 + (pairs < experts ? pairs : experts);
     uint64_t max_tiles = (bound + 127) / 128 + (bound < experts ? bound : experts);

@@ -555,9 +555,15 @@ def export_routed(extra, output, selected_objects=None):
     role = extra[extra.index("--role") + 1] if "--role" in extra else "coordinator"
     requested_input = extra[extra.index("--input") + 1] if "--input" in extra else None
     wire = indirect or package.input_kind(role, base.weights, requested_input) == "wire"
-    segmented = indirect or (role == "spark" and wire and base.weights in ("fp8", "mxfp4"))
-    if segmented:
+    # Spark packages carry the row-addressed programs the exporter emits
+    # (`segmented_forms`); coordinator and --row-addresses runs need only the
+    # segment API, so a baseline fork without it still compares ordinary programs.
+    segment_forms = ()
+    if role == "spark" or indirect:
         from b12x.integration.cuteafd.fp8_moe import fp8_moe_segment_scratch_bytes
+    if role == "spark" and not indirect:
+        from b12x.integration.cuteafd.fp8_moe import nvfp4_a4_fused
+        segment_forms = package.segmented_forms(base, wire, nvfp4_a4_fused())
     records = []
     layout_metadata = {}
     for layout in dict.fromkeys(layouts):
@@ -575,8 +581,8 @@ def export_routed(extra, output, selected_objects=None):
         }
         forms = [(rows, "auto", indirect) for rows in capacities]
         forms += [(rows, form, indirect) for rows in capacities for form in prefill_forms(g, rows, wire)]
-        if segmented and not indirect:
-            forms += [(package.SEGMENT_MAX_ROWS, form, True) for form in package.FORMS]
+        if not indirect:
+            forms += [(package.SEGMENT_MAX_ROWS, form, True) for form in segment_forms]
         forms = [(rows, form, addresses, core) for rows, form, addresses in forms
                  for core in routed_core_variants(package, role, g.weights)]
         for rows, form, row_addresses, core_only in forms:
@@ -593,7 +599,8 @@ def export_routed(extra, output, selected_objects=None):
                         max_rows=package.SEGMENT_MAX_ROWS if row_addresses else rows, wire=wire, prefill=form,
                         **({"row_addresses": True} if row_addresses else {}),
                         **({"core_only": True} if core_only else {}))
-                scratch = (fp8_moe_segment_scratch_bytes(g, rows, package.SEGMENT_MAX_ROWS, form)
+                scratch = (fp8_moe_segment_scratch_bytes(g, rows, package.SEGMENT_MAX_ROWS, form,
+                               **({} if wire else {"wire": False}))
                            if row_addresses else fp8_moe_scratch_bytes(g, "auto", rows, wire, form))
                 return program, scratch
             program, scratch = recorded_construction(construct)
