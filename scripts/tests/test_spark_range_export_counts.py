@@ -71,7 +71,7 @@ def test_glmf_package_witness_is_the_live_mc_checkpoint():
     entries = json.loads((ROOT / 'scripts/build/spark-package-ranges.json').read_text())['entries']
     expected = {
         'model': 'wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K4-MC',
-        'revision': '91a8dbc9c12e790c65aa1a38c6aede6a3e23a77d',
+        'revision': '558931fe149f59b49d19b2376a692bd7a12fb8b7',
         # Measured 42 layers, 288 experts, three K4 projections plus native auxiliaries.
         'routed_expert_bytes': 42 * 288 * 3 * (4096 * 2048 // 2 + 2 * (4096 + 2048) + 4),
     }

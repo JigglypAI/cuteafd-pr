@@ -8,7 +8,10 @@ contract; safetensors headers remain authoritative for payload types and shapes.
 
 One repository contains EXL3 experts, shared non-core tensors and complete,
 mutually exclusive dense-core variants. Non-core tensors (including embeddings,
-kept-native projections, towers and drafters) are stored once. An index exposes
+kept-native projections, towers and independent drafters) are stored once.
+Bundled MTP core is variant-dependent: repaired original views restore its
+source BF16 matrices, while stored compact views retain their existing K4
+MTP matrices. MTP routed expert encodes remain in the shared inventory. An index exposes
 exactly one variant; unselected tensors are never inventoried or loaded. A
 referenced shard may physically hold unselected core tensors: GLM Flash and
 Muse share expert shards with K6 core buffers, allowing server-side shard copies
@@ -30,7 +33,10 @@ aliases or fallback to another compact width are supported.
 
 `fp8-compact` has no files or stored variant. It reads exactly the `original`
 variant's `core_tensors` IDs and its BF16 index, config and quantization metadata;
-it never opens a K6/K8 index. Those IDs alone select conversion. Plain checkpoints
+it never opens a K6/K8 index. Those IDs alone select conversion for owned
+operands. GLM and GLM Flash use external drafters: native MTP core and experts
+are unused speculator roles, so they are neither loaded nor converted even
+when the original inventory declares their BF16 core. Plain checkpoints
 have no definition and refuse this selector, including the former plain GLM
 Flash conversion path. The shared push loader converts each selected BF16 matrix
 into its final arena slot: row-major E4M3, FP32 scales per 128x128 block,
@@ -43,8 +49,9 @@ its MC core, including the vocabulary head, KDA q/k/v/o, MLA and dense/shared
 FFNs. Muse currently executes block FP8 q/k/v/o; a selected vocabulary head,
 attention gate or pre/post-expert projection refuses by tensor name, role and
 family until its executor lands. Kimi and GLM refuse unsupported selected roles;
-Step-5 uses the same metadata mechanism for its executable O projections. A view
-never silently skips an unsupported tensor or converts an already-FP8 source.
+Step-5 uses the same metadata mechanism for its executable O projections. An owned
+unsupported tensor always refuses; unused external-drafter MTP is excluded
+by ownership, never partially converted. Already-FP8 sources refuse conversion.
 KDA/head conversion keys remain engine extras for weights outside the selected
 view. Activation-pass keys select W8A8 execution, not target-weight conversion.
 
@@ -124,7 +131,7 @@ normal inventory validates selected shard headers afterward.
 
 Publish only after this format specification has been reviewed.
 [`wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K4-MC`](https://huggingface.co/wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K4-MC)
-is published at `91a8dbc9c12e790c65aa1a38c6aede6a3e23a77d`, with BF16
+is published at `558931fe149f59b49d19b2376a692bd7a12fb8b7`, with BF16
 `original` (default), `k8-compact` and `k6-compact`. The runtime-derived
 `fp8-compact` view converts the selected original core to block FP8;
 the family inventory supports its attention, dense/shared FFN and head roles.
@@ -138,8 +145,8 @@ The GLM 5.3 and Step-5 publications are also available:
 
 | Repository (`wrldsuksgo2mars/`) | Pinned revision | Views |
 | --- | --- | --- |
-| `GLM-5.3-EXL3-K4-MC` | `c39486376dee84e5faa4904e014e07d7b6e76405` | original BF16 (default), k8-compact, k6-compact |
-| `Step-5-Preview-EXL3-K4-MC` | `4483a4bd874e8c360aec486ea72bd31d1ad7a247` | original BF16 (default), k8-compact, k6-compact |
+| `GLM-5.3-EXL3-K4-MC` | `2e42b53e61f0f59f664c915fe2424ce9c9fa5f8e` | original BF16 (default), k8-compact, k6-compact |
+| `Step-5-Preview-EXL3-K4-MC` | `aedda90d25bd02bb6520bcaf88e06e6c9bc932c4` | original BF16 (default), k8-compact, k6-compact |
 
 Both replace their standalone original/K6 release rows while keeping historical
 reports. See [GLM 5.3](models/glm5.md#core-views) and

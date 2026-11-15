@@ -1,0 +1,1 @@
+{"kept_tensors":{"model.layers.2.eh_proj.weight":{"shape":[128,128],"torch_dtype":"bfloat16"}},"lm_head":false,"module_include":["^(?!(?:model\\.layers\\.2\\.eh_proj)$)(?:.*)"],"per_module_metadata":"quantize_config.json:tensor_storage","tensor_storage":{"expert":{"bits_per_weight":4}}}

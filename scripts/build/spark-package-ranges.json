@@ -100,7 +100,7 @@
         },
         {
           "model": "wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K4-MC",
-          "revision": "91a8dbc9c12e790c65aa1a38c6aede6a3e23a77d",
+          "revision": "558931fe149f59b49d19b2376a692bd7a12fb8b7",
           "routed_expert_bytes": 152648955648
         }
       ]
@@ -390,7 +390,7 @@
         },
         {
           "model": "wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K4-MC",
-          "revision": "91a8dbc9c12e790c65aa1a38c6aede6a3e23a77d",
+          "revision": "558931fe149f59b49d19b2376a692bd7a12fb8b7",
           "routed_expert_bytes": 152648955648
         }
       ]

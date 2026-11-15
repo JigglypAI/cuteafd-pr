@@ -462,3 +462,16 @@ def test_muse_target_kv_precision_is_opt_in_and_draft_is_independent():
     assert 'family_args+=(--kv-cache "$muse_kv_cache")' in launcher
     assert 'plan_draft_args+=(--kv-cache "$muse_kv_cache")' in launcher
     assert 'muse_draft_kv="$(get DRAFT_KV_CACHE fp8)"' in launcher
+
+
+def test_mc_mtp_docs_distinguish_original_core_from_unchanged_experts():
+    text = DOC.read_text()
+    assert "projections stay K4 in every view" not in text
+    assert "restore native BF16 MTP core matrices in `original`" in text
+    assert "MTP routed experts are unchanged" in text
+    assert "neither loaded nor charged" in text
+    assert "not converted by `fp8-compact`" in text
+    for family in ["glm5", "glm5_flash", "step5"]:
+        doc = (ROOT / "docs" / "models" / f"{family}.md").read_text()
+        core = doc.split("## Core views", 1)[1].split("\n## ", 1)[0]
+        assert "MTP core" in core and "BF16" in core and "K4 MTP" in core
