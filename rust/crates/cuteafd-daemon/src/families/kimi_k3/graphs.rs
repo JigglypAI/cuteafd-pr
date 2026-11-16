@@ -452,7 +452,7 @@ mod tests {
         assert!(source.find("if !capture_worthwhile(nodes)").unwrap()
             < source.find("self.bank.cache_commit").unwrap());
         assert!(!source.contains("Residual("));
-        let device = include_str!("device.rs").split("#[cfg(test)]").next().unwrap();
+        let device = include_str!("device.rs").split("\n#[cfg(test)]\nmod ").next().unwrap();
         let attention = device.split("    pub(crate) fn attention(&mut self").nth(1).unwrap()
             .split("    /// The recorded attention segment").next().unwrap();
         assert!(attention.find("residual_body(MixSite::Attention(layer)").unwrap()

@@ -1326,6 +1326,13 @@ impl<'a> LocalLane<'a> {
     }
 
     pub(crate) fn context_dsa_dump(&self, layer: usize, rows: usize) -> Result<()> {
+        #[cfg(test)]
+        if self.rank == 0 && self.context_dsa_diagnostic()
+            && super::context::multirow_oracle::recording() {
+            let owner = &self.context.as_ref().context("Kimi oracle needs Context")?.0.ranks[0];
+            super::context::multirow_oracle::record(self.stream(), layer, rows,
+                owner.buffer("DSA merged indices")?, owner.buffer("DSA merged scores")?)?;
+        }
         let Some(dump) = self.dsa_dump.as_deref().filter(|_| self.rank == 0 && self.programs.dsa.is_some()) else {
             return Ok(());
         };
@@ -3202,7 +3209,7 @@ mod tests {
 
     #[test]
     fn persistent_local_lane_never_drains_per_operator_and_keeps_device_routes() {
-        let source = include_str!("device.rs").split("#[cfg(test)]").next().unwrap();
+        let source = include_str!("device.rs").split("\n#[cfg(test)]\nmod ").next().unwrap();
         let owner = source.split("pub(crate) struct LocalLane").nth(1).unwrap().split("/// Head handles").next().unwrap();
         assert!(owner.contains("programs: Rc<NativePrograms"));
         assert!(owner.contains("layers: Vec<Rc<super::weights::LayerWeights"));
@@ -3334,7 +3341,7 @@ mod tests {
         for (rank, rows) in [(2, 1), (0, 0), (1, 8257)] {
             assert!(IoLayout::new(&cfg, rank, rows).is_err());
         }
-        let source = include_str!("device.rs").split("#[cfg(test)]").next().unwrap();
+        let source = include_str!("device.rs").split("\n#[cfg(test)]\nmod ").next().unwrap();
         assert!(source.contains(".vocabulary_head_rows("));
         assert!(source.contains("crate::shared::target_head::launch("));
         assert!(!source.contains(".vocab_head_rows("));
@@ -3625,7 +3632,7 @@ mod tests {
         }
         // Production has no second-stream arena user; peer/intake operands are
         // separate. Keep the native launch stream contract visible to this guard.
-        let source = include_str!("device.rs").split("#[cfg(test)]").next().unwrap();
+        let source = include_str!("device.rs").split("\n#[cfg(test)]\nmod ").next().unwrap();
         let operators = source.split("pub(crate) fn attention(&mut self").nth(1).unwrap()
             .split("/// A scheduler-owned sequence stretch").next().unwrap();
         assert!(!operators.contains("Stream::new"));
