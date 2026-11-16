@@ -597,6 +597,8 @@ artifact. Full-model generation/benchmark evaluation has not been performed.
 def publish(export, root, repo_id):
     from huggingface_hub import HfApi, hf_hub_download, snapshot_download
     from huggingface_hub.constants import HF_HUB_CACHE
+    from kimi_k3.uniform_k2.publish import install_upload_compat
+    install_upload_compat()
     api = HfApi()
     api.create_repo(repo_id, repo_type="model", exist_ok=True, private=False)
     # The resumable large-folder API retains upload hashes/tasks under export's

@@ -5,7 +5,6 @@ import argparse
 from datetime import datetime, timezone
 import fcntl
 import hashlib
-import importlib.metadata
 import json
 import os
 from pathlib import Path, PurePosixPath
@@ -16,6 +15,7 @@ import tempfile
 if __package__ in (None, ''):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from hub_requirements import require_qualified_hub
 from kimi_k3.uniform_k2.storage import atomic_json, canonical, file_identity, fsync_directory, verify_receipt
 
 TARGET_REPO = 'wrldsuksgo2mars/Inkling-2-Small-EXL3-K4-MC'
@@ -206,8 +206,7 @@ def _check_sources(files):
 
 def _upload_with_writer_hashes(api, arguments, files):
     """Keep the native folder pipeline, supplying its lazy SHA fields from receipts."""
-    if importlib.metadata.version('huggingface_hub') != '2.2.0':
-        raise ValueError('receipt-backed native folder upload requires qualified huggingface_hub 2.2.0')
+    require_qualified_hub()
     builder = getattr(api, '_prepare_upload_folder_additions', None)
     if not callable(builder):
         raise ValueError('native folder operation builder is unavailable')

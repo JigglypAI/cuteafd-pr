@@ -6,10 +6,10 @@ from __future__ import annotations
 
 import fcntl
 import hashlib
-import importlib.metadata
 import json
 from pathlib import Path
 
+from hub_requirements import require_qualified_hub
 from kimi_k3.uniform_k2.storage import atomic_json, sha256_file
 
 
@@ -108,12 +108,10 @@ def publish(output, state_root, approved_packet, *, api=None):
     """Publish exactly the separately reviewed packet. Never call before approval."""
     from huggingface_hub import CommitOperationAdd, CommitOperationCopy, HfApi
     from huggingface_hub.errors import RepositoryNotFoundError
-    from huggingface_hub.utils._runtime import is_xet_available
     from upload_model import _remote, _restored_operation
     from write_export import _fingerprint
 
-    if importlib.metadata.version('huggingface_hub') != '1.26.1' or not is_xet_available():
-        raise ValueError('publication requires qualified huggingface_hub 1.26.1 with Xet')
+    require_qualified_hub()
     output, state_root = Path(output).resolve(), Path(state_root).resolve()
     if output == state_root or output in state_root.parents or state_root in output.parents:
         raise ValueError('upload state must be disjoint from package')

@@ -9,11 +9,11 @@ import argparse
 from datetime import datetime, timezone
 import fcntl
 import hashlib
-import importlib.metadata
 import json
 from pathlib import Path
 import re
 
+from hub_requirements import require_qualified_hub
 from kimi_k3.uniform_k2.storage import atomic_json, file_identity
 
 PARENTS = {
@@ -177,8 +177,7 @@ def publish(delta, root, *, api=None, anonymous_api=None, fetch_metadata=None):
     """Commit a delta once and recover interruption using exact remote metadata."""
     from huggingface_hub import HfApi, CommitOperationAdd, hf_hub_download
 
-    if importlib.metadata.version('huggingface_hub') != '2.2.0':
-        raise ValueError('repair publication requires qualified huggingface_hub 2.2.0')
+    require_qualified_hub()
     root, delta = Path(root).absolute(), Path(delta).absolute()
     if root == delta or root in delta.parents or delta in root.parents:
         raise ValueError('repair delta and publication receipts must be disjoint')

@@ -1412,7 +1412,9 @@ All 62 component tests pass (`reports/component-tests-cache-card.log`).
 
 ### Upload receipts and publication integration
 
-`upload_model.py` uses qualified `huggingface_hub==1.26.1` with Xet enabled.
+`upload_model.py` and the other publication entrypoints require the shared
+`hub_requirements.py` qualification: `huggingface_hub==1.33.0` with Xet enabled.
+The self-contained CPU test environment recipe is in the root `PLAN.md`.
 Its lazy upload metadata reads only a bounded file sample at operation creation;
 Xet computes the large-file SHA during transfer rather than a separate hashing
 pass. Completed preuploads persist their returned blob ID, size, upload mode and

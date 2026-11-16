@@ -11,6 +11,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import mc_repair_publish as repair
+import hub_requirements
 from kimi_k3.uniform_k2.storage import file_identity
 
 REVISION = '1' * 40
@@ -193,7 +194,7 @@ def test_wrong_sdk_and_private_repository_fail_closed(tmp_path, monkeypatch):
     hub.private = True
     with pytest.raises(ValueError, match='public'):
         repair.publish(delta, tmp_path/'private', api=hub, anonymous_api=hub)
-    monkeypatch.setattr(repair.importlib.metadata, 'version', lambda name: '1.0.0')
-    with pytest.raises(ValueError, match='2.2.0'):
+    monkeypatch.setattr(hub_requirements.importlib.metadata, 'version', lambda name: '1.0.0')
+    with pytest.raises(ValueError, match='1.33.0'):
         repair.publish(delta, tmp_path/'wrong-sdk', api=hub, anonymous_api=hub)
     assert hub.calls == []

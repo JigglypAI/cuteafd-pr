@@ -13,6 +13,8 @@ import struct
 import time
 import urllib.request
 
+from hub_requirements import require_qualified_hub
+
 SOURCE = "deepseek-ai/DeepSeek-V4.1-Flash-1017"
 REVISION = "1bae0e1088993b9b82de08f59de5be5a34e42170"
 TARGET = "wrldsuksgo2mars/DeepSeek-V4.1-Flash-1017-StridedPLE"
@@ -285,6 +287,7 @@ class SshFile(io.BufferedIOBase):
 
 
 def upload(args):
+    require_qualified_hub()
     from contextlib import ExitStack
     from huggingface_hub import HfApi, CommitOperationAdd
     output, source = args.output, args.source

@@ -1,5 +1,51 @@
 # CuteAFD plan
 
+## Quantization CPU tests and Hub qualification (2026-11-16)
+
+All quant publishers use `quantization/hub_requirements.py` to require the same
+`huggingface-hub==1.33.0` with Xet enabled. This is the newest Hub 1.x accepted
+by the pinned Transformers and tokenizers; Hub 2.2.0 fails Transformers' import
+version check. Real-SDK offline tests cover lazy hashes, Xet selection,
+`preupload_lfs_files`, receipt-restored adds and cross-repo server-side LFS copies.
+No test uploads weights. The default CPU gate runs `scripts/tests`, not
+`quantization/tests`; its exact requirements also pin Hub 1.33.0.
+
+Run the quant suite in a self-contained task environment, never by borrowing
+another checkout's site-packages. Initialize pinned submodules first. From the
+checkout root (all environment/build paths below are task-owned root NVMe):
+
+```bash
+scripts/dev/submodule-init-local
+TASK=$HOME/.cache/cuteafd/builds/quant-cpu-tests
+scripts/build/assert-build-filesystem.py "$TASK"
+mkdir -p "$TASK/tmp"
+uv venv --python 3.12 "$TASK/venv"
+uv pip sync --python "$TASK/venv/bin/python" scripts/dev/gate-requirements.txt
+uv pip install --python "$TASK/venv/bin/python" 'torch==2.15.0+cpu' \
+  --index-url https://download.pytorch.org/whl/cpu
+uv pip install --python "$TASK/venv/bin/python" 'huggingface-hub==1.33.0' \
+  -e ./third_party/transformers \
+  'accelerate==1.15.0' 'pypcre==0.6.6' 'psutil==7.2.2' 'xxhash==4.1.0' \
+  'tokenicer==0.0.14' 'logbar==0.4.16' 'defuser==0.0.31' 'datasets==5.2.0' \
+  'device-smi==0.5.7' 'threadpoolctl==3.8.0' 'requests==2.34.2' 'protobuf==7.36.2'
+uv pip check --python "$TASK/venv/bin/python"
+CUDA_VISIBLE_DEVICES='' OMP_NUM_THREADS=2 HF_HOME=/mnt/sparknest/hf-home \
+  TMPDIR="$TASK/tmp" \
+  PYTHONPATH="$PWD/third_party/gptqmodel:$PWD/third_party/transformers/src" \
+  "$TASK/venv/bin/python" -m pytest -q -rs quantization/tests \
+  --basetemp="$TASK/tmp/pytest"
+```
+
+Launch long setup/test commands as background systemd user units with logs and
+exit receipts. GPTQModel is imported directly from the pinned source (no CUDA
+extension build or second engine checkout). Do not use this extra-dependency
+venv as the default CPU gate's exact-package venv. Checkpoint witnesses resolve
+`HF_HUB_CACHE`, then `HF_HOME/hub`, then the SDK cache default at the pinned
+revision, and skip explicitly if required local files/shards are absent; they
+never download. CPU numerical witnesses still run; CUDA device cases skip
+separately when their device is unavailable. Muse's official-5.22.1-only
+witnesses retain their existing explicit skips with this pinned Transformers.
+
 ## Kimi K3.1 Pro qualification
 
 K2/Core-K6 and original-default MC checkpoint publication, native placement

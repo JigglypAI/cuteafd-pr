@@ -4,11 +4,15 @@ import importlib.util
 import json
 from pathlib import Path
 import struct
+import sys
+
+import huggingface_hub
 
 import numpy as np
 import pytest
 
 ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT / "quantization"))
 SPEC = importlib.util.spec_from_file_location("strided_engram", ROOT / "quantization/strided_engram.py")
 repack = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(repack)
@@ -129,7 +133,8 @@ def test_segmented_upload_inventory_and_storage_declaration(tmp_path, monkeypatc
             operations_seen.extend(operations)
             return types.SimpleNamespace(oid="commit")
 
-    monkeypatch.setitem(sys.modules, "huggingface_hub", types.SimpleNamespace(HfApi=Api, CommitOperationAdd=Operation))
+    monkeypatch.setattr(huggingface_hub, "HfApi", Api)
+    monkeypatch.setattr(huggingface_hub, "CommitOperationAdd", Operation)
     args = types.SimpleNamespace(source=source, output=output, remote_output_host=None)
     repack.upload(args)
     assert len(operations_seen) == len(siblings) + 6

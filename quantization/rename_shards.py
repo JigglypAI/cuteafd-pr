@@ -12,6 +12,8 @@ from pathlib import Path
 import re
 
 from huggingface_hub import CommitOperationAdd, CommitOperationCopy, CommitOperationDelete, HfApi
+from hub_requirements import require_qualified_hub
+
 from export_assets import asset_target
 from materialize_cache import materialize_cache
 from upload_model import _remote
@@ -93,6 +95,7 @@ def run(manifest, source_state, state, output, parent, *, publish=False):
                          weight_upload_bytes=0, metadata_bytes=len(payload))), flush=True)
     if not publish:
         return
+    require_qualified_hub()
     if info.sha == parent:
         operations = [CommitOperationCopy(src_path_in_repo=src, path_in_repo=dst, src_revision=parent)
                       for src, dst in mapping.items()]

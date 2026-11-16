@@ -5,15 +5,14 @@ recovery; this module adds no retry loop. SDK transport retries remain SDK-owned
 """
 import fcntl
 import hashlib
-import importlib.metadata
 import json
 from pathlib import Path
 
 from huggingface_hub import CommitOperationAdd, HfApi
 from huggingface_hub.errors import RepositoryNotFoundError
 from huggingface_hub.hf_api import RepoFile
-from huggingface_hub.utils._runtime import is_xet_available
 
+from hub_requirements import require_qualified_hub
 from export_assets import asset_target
 from write_export import _fingerprint, _publish_json
 
@@ -41,8 +40,7 @@ def _restored_operation(name, path, record):
 
 
 def upload_artifact(output, state_root, repo_id, *, resume=False, api=None, progress=None):
-    if importlib.metadata.version("huggingface_hub") != "1.26.1" or not is_xet_available():
-        raise ValueError("upload requires qualified huggingface_hub 1.26.1 with Xet enabled")
+    require_qualified_hub()
     from huggingface_hub.utils import validate_repo_id
     validate_repo_id(repo_id)
     output, state_root = Path(output).resolve(strict=True), Path(state_root).resolve()
