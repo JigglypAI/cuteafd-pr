@@ -2,7 +2,7 @@
 //! Padding is absent from native state tables and scattered into zeroed physical outputs.
 use super::*;
 use crate::shared::{prefix::view, qwen::{MarkLayout, REPLAY_ROWS},
-    speculation::target::{AcceptedPrefix, BlockVerifyTarget, HiddenTap, VerifyOutput, VerifyRequest},
+    speculation::target::{AcceptedPrefix, BlockVerifyTarget, HiddenTap, VerifyOutput, VerifyRequest, TapSite},
     token_io::DeviceLogits};
 use std::{rc::Rc, sync::atomic::{AtomicU64, Ordering}};
 
@@ -117,13 +117,13 @@ impl<'a> DenseEngine<'a> {
         }
         rows.push(rows[0]);
         let (logits, taps) = {
-            let output = self.verify(&original, VerifyRequest { rows: &rows, tap_layers: &layers })?;
+            let output = self.verify(&original, VerifyRequest { rows: &rows, tap_sites: &layers.iter().copied().map(TapSite::LayerExit).collect::<Vec<_>>() })?;
             (output.logits, output.taps.to_vec())
         };
         let actual = logits.to_host(self.stream.device.library)?;
         let mut tap_bytes = Vec::new();
         for (&layer, tap) in layers.iter().zip(&taps) {
-            ensure!(tap.layer == layer && tap.rows == rows.len() && tap.hidden == self.cfg.hidden,
+            ensure!(tap.site == TapSite::LayerExit(layer) && tap.rows == rows.len() && tap.hidden == self.cfg.hidden,
                 "dense verify tap ordering/shape differs");
             let mut bytes = vec![0; rows.len() * self.cfg.hidden * 2];
             self.stream.device.library.copy_d2h(&mut bytes, CuteafdDeviceBuffer { ptr: tap.ptr.cast_mut(),
@@ -164,7 +164,7 @@ impl<'a> DenseEngine<'a> {
         reset(self)?;
         for keep in 0..=7 {
             let mark = self.checkpoint(&[0])?;
-            self.verify(&mark, VerifyRequest { rows: &rows, tap_layers: &[] })?;
+            self.verify(&mark, VerifyRequest { rows: &rows, tap_sites: &[] })?;
             self.commit(&mark, &[AcceptedPrefix { slot: 0, rows: keep }])?;
             // The commit stays queued on the target stream; host reads use the default stream.
             self.drain()?;
@@ -191,7 +191,7 @@ impl<'a> DenseEngine<'a> {
         let mark = self.checkpoint(&[0])?;
         let nonzero = tokens[3..7].iter().enumerate().map(|(i, &token)| VerifyRow {
             slot: 0, position: 3 + i, token: Some(token) }).collect::<Vec<_>>();
-        self.verify(&mark, VerifyRequest { rows: &nonzero, tap_layers: &[] })?;
+        self.verify(&mark, VerifyRequest { rows: &nonzero, tap_sites: &[] })?;
         self.restore(&mark)?;
         let restored = self.evaluate(&tokens[3..7], |_, _| Ok(()))?;
         ensure!(continuation.iter().map(|v| v.to_bits()).eq(restored.iter().map(|v| v.to_bits())),
@@ -238,7 +238,7 @@ impl<'a> DenseEngine<'a> {
             rows.push(padding);
         }
         let mark = self.checkpoint(&[1, 0])?;
-        let actual = self.verify(&mark, VerifyRequest { rows: &rows, tap_layers: &[] })?
+        let actual = self.verify(&mark, VerifyRequest { rows: &rows, tap_sites: &[] })?
             .logits.to_host(library)?;
         self.restore(&mark)?;
         for (physical, row) in rows.iter().enumerate() {
@@ -254,7 +254,7 @@ impl<'a> DenseEngine<'a> {
         for kept in [[0, 3], [1, 2], [4, 0], [2, 3]] {
             reset(self)?;
             let mark = self.checkpoint(&[1, 0])?;
-            self.verify(&mark, VerifyRequest { rows: &rows, tap_layers: &[] })?;
+            self.verify(&mark, VerifyRequest { rows: &rows, tap_sites: &[] })?;
             self.commit(&mark, &[AcceptedPrefix { slot: 0, rows: kept[0] },
                 AcceptedPrefix { slot: 1, rows: kept[1] }])?;
             let actual = state(self)?;
@@ -283,14 +283,14 @@ impl<'a> DenseEngine<'a> {
         };
         reset(self)?;
         let mark = self.checkpoint(&[1, 0])?;
-        let expected_logits = self.verify(&mark, VerifyRequest { rows: &rows, tap_layers: &[] })?
+        let expected_logits = self.verify(&mark, VerifyRequest { rows: &rows, tap_sites: &[] })?
             .logits.to_host(library)?;
         self.commit(&mark, &[AcceptedPrefix { slot: 0, rows: 4 }, AcceptedPrefix { slot: 1, rows: 3 }])?;
         let expected_state = state(self)?;
         let expected_kv = kv(self)?;
         reset(self)?;
         let stale = self.checkpoint(&[1, 0])?;
-        let actual = self.decode_device(&[1, 0], VerifyRequest { rows: &rows, tap_layers: &[] })?.to_host(library)?;
+        let actual = self.decode_device(&[1, 0], VerifyRequest { rows: &rows, tap_sites: &[] })?.to_host(library)?;
         ensure!(actual.iter().map(|v| v.to_bits()).eq(expected_logits.iter().map(|v| v.to_bits()))
             && state(self)? == expected_state && kv(self)? == expected_kv,
             "dense direct multislot logits, KV or recurrent state differ from full speculative commit");
@@ -298,7 +298,7 @@ impl<'a> DenseEngine<'a> {
             && self.verification.pending.is_none(), "dense direct decode did not retire committed inputs");
         ensure!(self.restore(&stale).is_err(), "dense direct decode retained a stale transactional mark");
         let invalid = [VerifyRow { slot: 0, position: 6, token: Some(tokens[0]) }];
-        ensure!(self.decode_device(&[0], VerifyRequest { rows: &invalid, tap_layers: &[] }).is_err()
+        ensure!(self.decode_device(&[0], VerifyRequest { rows: &invalid, tap_sites: &[] }).is_err()
             && self.healthy && state(self)? == expected_state && kv(self)? == expected_kv,
             "dense invalid direct decode changed committed state");
         for slot in 0..self.slots.len() { self.reset_slot(slot)?; }
@@ -359,14 +359,15 @@ impl<'a> DenseEngine<'a> {
         let plan = rows::Rows::new(&request, self.cfg.attention.len(), self.cfg.vocab, &marked,
             self.cfg.max_context, self.pool_tokens)?;
         self.verification.invalidate()?;
-        self.verify_rows(plan, request.rows.len(), request.tap_layers, false)?;
+        self.verify_rows(plan, request.rows.len(), request.tap_sites, false)?;
         Ok(DeviceLogits { ptr: self.verification.logits.buffer.ptr, rows: request.rows.len(),
             vocab: self.cfg.vocab, stride: self.cfg.vocab, stream: self.stream.raw, greedy: None })
     }
 
     pub(crate) fn verify_taps(&self) -> &[HiddenTap] { &self.verification.taps }
 
-    pub(super) fn verify_rows(&mut self, plan: rows::Rows, rows: usize, layers: &[usize], speculative: bool) -> Result<()> {
+    pub(super) fn verify_rows(&mut self, plan: rows::Rows, rows: usize, layers: &[TapSite], speculative: bool) -> Result<()> {
+        ensure!(layers.iter().all(|site| matches!(site, TapSite::LayerExit(_))), "dense target does not bind entry/final-norm sites yet");
         let result = self.enqueue_verify_rows(plan, rows, layers, speculative);
         // Failed captures can still grow driver storage. Observe only after
         // the whole single-rank submission, on successful and failed paths.
@@ -374,7 +375,7 @@ impl<'a> DenseEngine<'a> {
         result.and(completed)
     }
 
-    fn enqueue_verify_rows(&mut self, mut plan: rows::Rows, rows: usize, layers: &[usize], speculative: bool) -> Result<()> {
+    fn enqueue_verify_rows(&mut self, mut plan: rows::Rows, rows: usize, layers: &[TapSite], speculative: bool) -> Result<()> {
         self.healthy = false;
         self.graphs.cycle(speculative);
         if let Some(peer) = &self.peer { peer.graphs.cycle(speculative); }
@@ -399,8 +400,8 @@ impl<'a> DenseEngine<'a> {
             library.cuda_zero_bytes_async(self.verification.hidden.buffer, layers.len() * rows * self.cfg.hidden * 2,
                 self.stream.raw)?;
         }
-        self.verification.taps = layers.iter().enumerate().map(|(index, &layer)| HiddenTap {
-            layer, ptr: self.verification.hidden.buffer.ptr.cast::<u8>().wrapping_add(index * rows * self.cfg.hidden * 2).cast(),
+        self.verification.taps = layers.iter().enumerate().map(|(index, &site)| HiddenTap {
+            site, ptr: self.verification.hidden.buffer.ptr.cast::<u8>().wrapping_add(index * rows * self.cfg.hidden * 2).cast(),
             rows, hidden: self.cfg.hidden, stride: self.cfg.hidden, stream: self.stream.raw }).collect();
         if !tokens.is_empty() {
             self.row_tables(&plan)?;
@@ -408,7 +409,7 @@ impl<'a> DenseEngine<'a> {
             let step = Step { rows: tokens.len(), capacity: REPLAY_ROWS, table_stride: plan.stride, splits: 1, speculative };
             for index in 0..self.weights.layers.len() {
                 self.graph_layer(index, &step)?;
-                if let Some(tap) = layers.iter().position(|&layer| layer == index) {
+                if let Some(tap) = layers.iter().position(|&layer| layer == TapSite::LayerExit(index)) {
                     let hidden = self.primary_tap(index, tokens.len())?;
                     let width = self.cfg.hidden * 2;
                     for (active, &row) in physical.iter().enumerate() {
@@ -473,7 +474,7 @@ impl<'a> BlockVerifyTarget for DenseEngine<'a> {
         // its first verify. Reused marks still restore, including invalid requests.
         if mark.fresh.needs_restore() { self.restore_mark(mark)?; }
         let plan = active?;
-        if let Err(error) = self.verify_rows(plan, request.rows.len(), request.tap_layers, true) {
+        if let Err(error) = self.verify_rows(plan, request.rows.len(), request.tap_sites, true) {
             self.restore_mark(mark).context("restoring dense checkpoint after failed verify")?;
             return Err(error);
         }
@@ -541,10 +542,10 @@ mod tests {
         let rows = [padding, VerifyRow { slot: 0, position: 17, token: Some(3) }, padding,
             VerifyRow { slot: 0, position: 18, token: Some(4) }];
         let starts = [(0, rows::Slot { position: 17, pages: vec![] })];
-        let plan = rows::Rows::new(&VerifyRequest { rows: &rows, tap_layers: &[28, 4, 16] },
+        let plan = rows::Rows::new(&VerifyRequest { rows: &rows, tap_sites: &[TapSite::LayerExit(28), TapSite::LayerExit(4), TapSite::LayerExit(16)] },
             cfg.attention.len(), cfg.vocab, &starts, cfg.max_context, 64).unwrap();
         assert_eq!((plan.tokens, plan.physical), (vec![3, 4], vec![1, 3]));
-        assert!(rows::Rows::new(&VerifyRequest { rows: &rows, tap_layers: &[] },
+        assert!(rows::Rows::new(&VerifyRequest { rows: &rows, tap_sites: &[] },
             cfg.attention.len(), cfg.vocab, &starts, cfg.max_context, 18).is_err());
     }
 
@@ -552,7 +553,7 @@ mod tests {
     fn commit_counts_only_retained_active_inputs_and_requires_exact_slot_set() {
         let cfg = config();
         let inputs = (0..7).map(|position| VerifyRow { slot: 0, position, token: Some(3) }).collect::<Vec<_>>();
-        let plan = rows::Rows::new(&VerifyRequest { rows: &inputs, tap_layers: &[] }, cfg.attention.len(), cfg.vocab,
+        let plan = rows::Rows::new(&VerifyRequest { rows: &inputs, tap_sites: &[] }, cfg.attention.len(), cfg.vocab,
             &[(0, rows::Slot { position: 0, pages: vec![] })], cfg.max_context, 64).unwrap();
         for keep in 0..=7 {
             assert_eq!(plan.accepted(&[AcceptedPrefix { slot: 0, rows: keep }]).unwrap(), [0, 0, keep as i32]);

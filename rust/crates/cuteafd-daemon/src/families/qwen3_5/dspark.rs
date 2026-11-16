@@ -255,7 +255,7 @@ pub(super) fn spec_decode<'a>(args: &GoldenArgs, library: &'a NativeLibrary, pro
         let rows: Vec<_> = inputs.iter().enumerate().map(|(index, &token)| VerifyRow {
             slot: 0, position: position + index, token: Some(token) }).collect();
         let verify_start = Instant::now();
-        let result = verify_commit(&mut engine, &[0], VerifyRequest { rows: &rows, tap_layers: &draft_cfg.taps }, |verified| {
+        let result = verify_commit(&mut engine, &[0], VerifyRequest { rows: &rows, tap_sites: &draft_cfg.taps.iter().copied().map(cuteafd_core::TapSite::LayerExit).collect::<Vec<_>>() }, |verified| {
             let logits = verified.logits.to_host(library)?;
             let target = logits.chunks_exact(cfg.vocab).map(argmax).collect::<Result<Vec<_>>>()?;
             let result = verify_dspark_greedy_vocab(&inputs, &target, None, room, cfg.vocab)
@@ -392,7 +392,7 @@ mod tests {
             let rows = prompts.iter().enumerate().flat_map(|(slot, prompt)| teacher.iter().enumerate()
                 .map(move |(offset, &token)| VerifyRow { slot, position: prompt.len() + offset, token: Some(token) }))
                 .collect::<Vec<_>>();
-            let values = engine.verify(&mark, VerifyRequest { rows: &rows, tap_layers: &[] })?.logits.to_host(&library)?;
+            let values = engine.verify(&mark, VerifyRequest { rows: &rows, tap_sites: &[] })?.logits.to_host(&library)?;
             regression::target_dump(&output, sequences, cfg.vocab, &values)?;
             engine.restore(&mark)?;
             for slot in slots { drafter.discard_context(slot)?; engine.reset_slot(slot)?; }

@@ -363,10 +363,11 @@ impl<'e, 'a> Backend<'a> for DenseBackend<'e, 'a> {
             rows.extend(tokens.iter().enumerate().map(|(offset, &token)| VerifyRow {
                 slot: placement.slot, position: placement.len + offset, token: Some(token) }));
         }
-        let mtp_layers = [engine.cfg.attention.len() - 1];
-        let request = VerifyRequest { rows: &rows,
-            tap_layers: if self.mtp.is_some() { &mtp_layers }
-                else { self.drafter.as_ref().map_or(&[], |draft| draft.cfg.taps.as_slice()) } };
+        // Preserve current MTP input semantics; its FinalNorm investigation is #2327.
+        let tap_sites = if self.mtp.is_some() { vec![cuteafd_core::TapSite::LayerExit(engine.cfg.attention.len()-1)] }
+            else { self.drafter.as_ref().map_or_else(Vec::new, |draft|
+                draft.cfg.taps.iter().copied().map(cuteafd_core::TapSite::LayerExit).collect()) };
+        let request = VerifyRequest { rows: &rows, tap_sites: &tap_sites };
         let output = if speculative {
             let mark = engine.checkpoint(&slots)?;
             let output = match engine.verify(&mark, request) {
