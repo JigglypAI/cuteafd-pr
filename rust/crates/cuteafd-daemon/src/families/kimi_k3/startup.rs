@@ -125,7 +125,7 @@ pub(crate) fn load<'a, const RANKS: usize>(library: &'a Arc<cuteafd_ffi::NativeL
     checkpoint: &cuteafd_loader::plan::Checkpoint, full: &KimiK3Config,
     cfg: &KimiK3Config, mut options: Options<'_, RANKS>) -> Result<Loaded<'a>> {
     ensure!(matches!(RANKS, 1 | 2), "Kimi startup requires one or two physical devices");
-    full.validate_speculation(options.draft.is_some())?;
+    full.validate_speculation(options.draft.as_ref().map(super::draft::Options::kind).transpose()?)?;
     options.role.validate(full, options.peers.len(), options.draft.is_some())?;
     let skip_routed_experts = options.role.skip_routed_experts();
     let mut memory = memory_phases(library, &options.devices)?;

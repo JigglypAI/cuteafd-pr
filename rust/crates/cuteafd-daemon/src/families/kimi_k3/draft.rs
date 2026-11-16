@@ -19,6 +19,13 @@ pub(crate) struct Options {
 }
 
 impl Options {
+    pub(crate) fn kind(&self) -> Result<cuteafd_loader::families::kimi_k3::draft::DraftKind> {
+        use cuteafd_loader::families::kimi_k3::draft::DraftKind;
+        Ok(if crate::shared::speculation::block_dspark::is_dspark(&self.snapshot)? {
+            DraftKind::BlockDspark
+        } else { DraftKind::MlaDflash })
+    }
+
     pub(crate) fn representation(&self) -> GlmDraftRepresentation {
         if self.fp8 { GlmDraftRepresentation::Fp8Only } else { GlmDraftRepresentation::Bf16Only }
     }
