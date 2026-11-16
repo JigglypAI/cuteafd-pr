@@ -436,6 +436,31 @@ fn serving_header_inventory_preserves_remote_native_expert_scales() -> anyhow::R
 }
 
 #[test]
+fn bundled_recurrent_census_uses_shared_shapes_and_rejects_native_drift() -> anyhow::Result<()> {
+    use crate::formats::block_dspark::recurrent::{source_shapes, RecurrentBlockConfig};
+    use crate::plan::spec::DraftOwnership;
+    let (dir, config, mut tensors) = fixture(Fixture::Mxfp8);
+    for (name, shape) in source_shapes(&RecurrentBlockConfig::from_hf(&config)?)? {
+        tensors.push(testing::t(format!("mtp.{name}"), "BF16", &shape));
+    }
+    let options = PlanOptions { draft_ownership: Some(DraftOwnership::BundledDspark), ..Default::default() };
+    testing::write_snapshot(dir.path(), &config, &tensors, None);
+    let report = plan::plan(dir.path(), &options)?;
+    assert!(report.config_error.is_none(), "{:?}", report.config_error);
+    let draft = report.components.iter().find(|c| c.component == Component::Speculator).unwrap();
+    assert!(draft.tensors > 70 && draft.rejected == 0, "{draft:?}");
+    let norm = tensors.iter_mut().find(|t| t.0 == "mtp.norm.weight").unwrap();
+    norm.1 = "F32";
+    let drift = tempfile::tempdir()?;
+    testing::write_snapshot(drift.path(), &config, &tensors, None);
+    let report = plan::plan(drift.path(), &options)?;
+    let draft = report.components.iter().find(|c| c.component == Component::Speculator).unwrap();
+    assert_eq!(draft.rejected, 1, "{draft:?}");
+    assert!(draft.rejections[0].tensor.contains("mtp.norm"));
+    Ok(())
+}
+
+#[test]
 fn structural_open_names_missing_tensors_and_accepts_reports_drift_per_tensor() {
     let (dir, small, tensors) = fixture(Fixture::Mxfp8);
     // A missing conv tensor is a typed open error naming it.
