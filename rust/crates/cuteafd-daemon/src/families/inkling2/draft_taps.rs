@@ -13,7 +13,7 @@ pub(crate) struct TapBuffer<'a>{
     capacity:usize,
     hidden:usize,
     taps:usize,
-    layers:BTreeMap<usize,usize>,
+    layers:BTreeMap<cuteafd_core::TapSite,usize>,
 }
 impl<'a> TapBuffer<'a>{
     pub fn new(stream:Rc<Stream<'a>>,config:&RecurrentBlockConfig,rows:usize)->Result<Self>{
@@ -21,11 +21,11 @@ impl<'a> TapBuffer<'a>{
         ensure!(rows>0 && rows<=4096,"Inkling tap staging row capacity");
         let output=Allocation::new(stream.device,rows*taps*hidden*2,Tag::drafter_workspace("inkling2/target-taps"))?;
         let narrow=Allocation::new(stream.device,rows*hidden*2,Tag::drafter_workspace("inkling2/target-tap-narrow"))?;
-        let layers=config.transformer.target_layers.iter().copied().enumerate().map(|(tap,layer)|(layer,tap)).collect();
+        let layers=config.taps.iter().copied().enumerate().map(|(tap,site)|(site,tap)).collect();
         Ok(Self{stream,output,narrow,capacity:rows,hidden,taps,layers})
     }
     pub fn entry(&self,layer:usize,raw_partial:Buffer,rows:usize)->Result<()> {
-        let Some(&tap)=self.layers.get(&layer)else{return Ok(());};
+        let Some(&tap)=self.layers.get(&cuteafd_core::TapSite::LayerEntry(layer))else{return Ok(());};
         ensure!(rows>0 && rows<=self.capacity && raw_partial.bytes>=rows*self.hidden*4,"Inkling tap source exceeds owner");
         let library=self.stream.device.library;
         // SAFETY: target partial is live F32 on same stream; narrow and scatter
@@ -35,8 +35,8 @@ impl<'a> TapBuffer<'a>{
                 bytes:self.output.buffer.bytes-tap*self.hidden*2,..self.output.buffer},self.taps*self.hidden*2,
                 self.narrow.buffer,self.hidden*2,self.hidden*2,rows,self.stream.raw)}
     }
-    pub fn final_norm(&self,layer:usize,hidden:Buffer,first:usize,rows:usize)->Result<()> {
-        let Some(&tap)=self.layers.get(&layer)else{return Ok(());};
+    pub fn final_norm(&self,hidden:Buffer,first:usize,rows:usize)->Result<()> {
+        let Some(&tap)=self.layers.get(&cuteafd_core::TapSite::FinalNorm)else{return Ok(());};
         ensure!(rows>0 && first.checked_add(rows).is_some_and(|end|end<=self.capacity)
             && hidden.bytes>=rows*self.hidden*2,"Inkling final tap outside staging");
         let offset=(first*self.taps+tap)*self.hidden*2;

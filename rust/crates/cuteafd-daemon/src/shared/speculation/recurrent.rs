@@ -11,7 +11,18 @@ pub(crate) struct Drafter<'a> {
     pub context:ContextBank,
     live:Cell<bool>,
 }
-impl Drafter<'_> {
+impl<'a> Drafter<'a> {
+    pub fn whole(lead:Rank<'a>,context:ContextBank)->Result<Self>{
+        ensure!(lead.layout.rank.ranks==1,"whole recurrent constructor requires one rank");
+        Ok(Self{lead,split:None,context,live:Cell::new(true)})
+    }
+    pub fn reset_context(&self,slot:usize,origin:usize)->Result<()> {
+        self.lead.stream.drain()?;
+        self.context.state.borrow_mut().reset(slot,origin)
+    }
+    pub fn frontier(&self,slot:usize)->Result<(usize,usize)>{
+        let state=self.context.state.borrow();Ok(state.pool.frontier(state.binding(slot)?)?)
+    }
     pub fn draft(&self,sequences:&[DraftSeq],embedding:Buffer,embed_norm:Buffer,head:Buffer)->Result<Vec<Draft>> {
         ensure!(self.live.get(),"recurrent drafter is terminal");
         let result=(||{

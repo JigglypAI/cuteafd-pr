@@ -14,3 +14,4 @@ pub(crate) mod backend;
 pub(crate) mod serve;
 pub(crate) mod draft_taps;
 pub(crate) mod verify;
+pub(crate) mod draft;
