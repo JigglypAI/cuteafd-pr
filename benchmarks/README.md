@@ -456,6 +456,7 @@ historical recipe; new release launches use the v5 matrix.
 
 ## minimax_m3
 
+- 2026-11-16 · Release smoke · MiniMaxAI/MiniMax-M3.1-Flash · 2× RTX PRO 6000 @ gpu-powerd 425/425 W + 6× DGX Spark · build 234a3be516d5 · [report](minimax_m3/2026-11-16-smoke-minimax-m3-1-flash-2rtx-6spark-minimax-6spark-smoke-cand-r1/report.svg)
 - 2026-11-16 · Release smoke · MiniMaxAI/MiniMax-M3.1-Flash · 2× RTX PRO 6000 @ gpu-powerd 425/425 W (395–450) + 4× DGX Spark · build ab605b69a8d9 · [report](minimax_m3/2026-11-16-smoke-minimax-m3-1-flash-2rtx-4spark-minimax-dspark-heads-current-r1/report.svg)
 - 2026-11-16 · Release smoke · MiniMaxAI/MiniMax-M3.1-Flash · 1× RTX PRO 6000 @ gpu-powerd 425 W (425–450) + 3× DGX Spark · build ab605b69a8d9 · [report](minimax_m3/2026-11-16-smoke-minimax-m3-1-flash-1rtx-3spark-minimax-dspark-1rtx-current-r1/report.svg)
 - 2026-11-14 · Release smoke · MiniMaxAI/MiniMax-M3.1-Flash · 1× RTX PRO 6000 @ gpu-powerd 425 W (425–450) + 3× DGX Spark · build 4269c4b1f6be · [report](minimax_m3/2026-11-14-smoke-minimax-m3-1-flash-1rtx-3spark-minimax-selector-1rtx/report.svg)
