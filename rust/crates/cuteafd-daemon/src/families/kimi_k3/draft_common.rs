@@ -58,12 +58,7 @@ impl<'a> CommonDraft<'a> {
         match self {
             Self::Mla(d) => d.update_with(rows,ready),
             Self::Block { draft:d,frontiers } => {
-                let mut ends=frontiers.borrow().clone();
-                for row in rows {
-                    let end=ends.get_mut(row.slot).context("block draft slot outside admission")?;
-                    ensure!(row.position==end.1,"block draft context must append canonical rows");
-                    end.1=end.1.checked_add(1).context("block frontier overflow")?;
-                }
+                let ends=append_frontiers(&frontiers.borrow(),rows)?;
                 ready()?;
                 d.update(rows)?;
                 *frontiers.borrow_mut()=ends;
@@ -153,5 +148,37 @@ impl<'a> CommonDraft<'a> {
     }
     pub fn restore_mla_pages(&self,slot:usize,a:&Attachment,end:usize)->std::result::Result<(),BoxError> {
         match self { Self::Mla(d)=>d.restore_mla_pages(slot,a,end),Self::Block { .. }=>Err("window draft has no page attachments".into()) }
+    }
+}
+
+fn append_frontiers(frontiers:&[(usize,usize)],rows:&[ContextRow])->Result<Vec<(usize,usize)>> {
+    let mut ends=frontiers.to_vec();
+    for row in rows {
+        let end=ends.get_mut(row.slot).context("block draft slot outside admission")?;
+        ensure!(row.position==end.1,"block draft context must append canonical rows");
+        end.1=end.1.checked_add(1).context("block frontier overflow")?;
+    }
+    Ok(ends)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn window_frontiers_are_exact_across_wrap_concurrency_and_failure() -> Result<()> {
+        let before=vec![(0,2047),(8192,8192)];
+        let rows=[ContextRow { tap_row:0,slot:0,position:2047 },
+            ContextRow { tap_row:1,slot:1,position:8192 },
+            ContextRow { tap_row:2,slot:0,position:2048 }];
+        assert_eq!(append_frontiers(&before,&rows)?,[(0,2049),(8192,8193)]);
+        for bad in [ContextRow { tap_row:0,slot:0,position:2046 },
+            ContextRow { tap_row:0,slot:0,position:2048 },
+            ContextRow { tap_row:0,slot:2,position:0 }] {
+            assert!(append_frontiers(&before,&[bad]).is_err());
+            assert_eq!(before,[(0,2047),(8192,8192)]);
+        }
+        let duplicate=[rows[0],rows[0]];
+        assert!(append_frontiers(&before,&duplicate).is_err());
+        Ok(())
     }
 }

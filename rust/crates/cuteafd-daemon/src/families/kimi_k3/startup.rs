@@ -161,7 +161,7 @@ pub(crate) fn load<'a, const RANKS: usize>(library: &'a Arc<cuteafd_ffi::NativeL
     ensure!(RANKS == 2 || !options.draft.as_ref().is_some_and(|draft| draft.tp2_dflash),
         "Kimi TP2 DFlash requires two physical coordinator GPUs");
     let draft_layout = options.draft.as_ref().map(|draft| devices[head].run(||
-        draft.layout(options.slots, options.max_context, library.sm_count()?))).transpose()?;
+        draft.layout(options.slots, options.max_context, library.sm_count()?,head))).transpose()?;
     // Resolve native modules before the measured baseline, while retaining their handles.
     let _draft_modules = options.draft.as_ref().filter(|_| matches!(draft_layout,
         Some(cuteafd_loader::families::kimi_k3::draft::DraftLayout::Mla(_)))).map(|_| devices[head].run(|| {

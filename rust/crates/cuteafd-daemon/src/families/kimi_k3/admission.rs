@@ -1320,7 +1320,7 @@ pub(super) mod tests {
         println!("spark minimum_onboard={} max_four_expert_bytes={}", spark.minimum_rtx_layers()?,
             (0..6).map(|rank| spark.rank_bytes(rank, 4)).collect::<Result<Vec<_>>>()?.into_iter().max().unwrap());
         let context = std::env::var("CUTEAFD_KIMI_REPLAY_CONTEXT").ok().map(|v| v.parse::<usize>()).transpose()?.unwrap_or(1 << 20);
-        let draft = super::super::draft::Options { snapshot: path("CUTEAFD_KIMI_DRAFT")?, fp8: true, tp2_dflash: false, cache_format: cuteafd_core::MlaCacheFormat::Bf16, draft_kv_cache: Default::default() }.layout(8, context, 188)?;
+        let draft = super::super::draft::Options { snapshot: path("CUTEAFD_KIMI_DRAFT")?, fp8: true, tp2_dflash: false, cache_format: cuteafd_core::MlaCacheFormat::Bf16, draft_kv_cache: Default::default() }.layout(8, context, 188,1)?;
         // Sealed program manifests and the failed card's post-module CUDA samples.
         // These are CPU arithmetic inputs, not a new hardware measurement.
         let scratch = NativeScratch { kda: 629_464_064, mla: [168_296_448, 101_056_512, 201_326_592] };

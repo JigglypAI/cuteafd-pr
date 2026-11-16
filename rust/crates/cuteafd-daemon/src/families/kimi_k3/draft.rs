@@ -31,11 +31,11 @@ impl Options {
         Ok(MlaDflashConfig::read(&self.snapshot)?.block)
     }
 
-    pub(crate) fn layout(&self,slots:usize,context:usize,sms:usize)->Result<DraftLayout> {
+    pub(crate) fn layout(&self,slots:usize,context:usize,sms:usize,head_rank:usize)->Result<DraftLayout> {
         if crate::shared::speculation::block_dspark::is_dspark(&self.snapshot)? {
             ensure!(!self.fp8 && !self.tp2_dflash,"block dSpark uses native BF16 on head GPU");
             return Ok(DraftLayout::Block(cuteafd_loader::formats::block_dspark::BlockDsparkRuntimeLayout::with_kv(
-                &self.snapshot,slots,slots.min(8),sms,"kimi/draft/1",self.draft_kv_cache)?));
+                &self.snapshot,slots,slots.min(8),sms,&format!("kimi/draft/{head_rank}"),self.draft_kv_cache)?));
         }
         let cfg=MlaDflashConfig::read(&self.snapshot)?;
         Ok(cfg.runtime_layout(self.representation(),GlmDraftCapacity::new(slots,slots.min(8),cfg.block)?,
@@ -417,20 +417,22 @@ impl<'a> NativeDraft<'a> {
             ensure!(marks.len()==live.len()+1,"block draft mark geometry differs");
             let library=self.device().library;
             let (origin,end)=self.frontier(slot)?;
-            if capture {
+            let restored=if capture {
                 let bytes=[(origin as u64).to_le_bytes(),(end as u64).to_le_bytes()].concat();
                 library.copy_h2d(marks[0],&bytes)?;
-            }
+                None
+            } else {
+                let mut bytes=[0u8;16]; library.copy_d2h(&mut bytes,marks[0])?;
+                let origin=usize::try_from(u64::from_le_bytes(bytes[..8].try_into()?))?;
+                let end=usize::try_from(u64::from_le_bytes(bytes[8..].try_into()?))?;
+                ensure!(origin<=end,"block mark frontier invalid");
+                Some((origin,end))
+            };
             for (saved,live) in marks[1..].iter().zip(live) {
                 let (to,from)=if capture { (*saved,live) } else { (live,*saved) };
                 library.copy_d2d(to,from,to.bytes)?;
             }
-            if !capture {
-                let mut bytes=[0u8;16]; library.copy_d2h(&mut bytes,marks[0])?;
-                let origin=usize::try_from(u64::from_le_bytes(bytes[..8].try_into()?))?;
-                let end=usize::try_from(u64::from_le_bytes(bytes[8..].try_into()?))?;
-                self.common().restore_frontier(slot,origin,end)?;
-            }
+            if let Some((origin,end))=restored { self.common().restore_frontier(slot,origin,end)?; }
             Ok(())
         })
     }
