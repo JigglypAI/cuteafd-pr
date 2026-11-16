@@ -237,6 +237,54 @@ def test_expert_codec_scope_installs_nonempty_program_manifest(tmp_path, scope):
     assert result.returncode != 0
 
 
+@pytest.mark.parametrize('role,arch', [('coordinator', 120), ('expert', 121)])
+def test_v41_only_scope_preserves_native_segment_program_manifest(tmp_path, role, arch):
+    spec = importlib.util.spec_from_file_location('v41_scopes', ROOT / 'scripts/lib/wip_aot_scopes.py')
+    scopes = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(scopes)
+    card = dict(config='fixture', family='deepseek_v41', set=dict(MODEL_ID='deepseek-ai/DeepSeek-V4.1-Flash-1017',
+        EXPERT_FORMAT='native', SPARK_COUNT='4'))
+    derived = scopes.family_scopes([card], lambda _: {})
+    assert derived['CUTEAFD_WIP_V41_AOT'] == 'ON'
+    assert derived.get('CUTEAFD_WIP_DSV4_AOT', 'OFF') == 'OFF'
+    cmake = (ROOT / 'native/cmake/shared/dsv4_programs.cmake').read_text()
+    logic = cmake[:cmake.index('set(CUTEAFD_DSV4_EXPORT_ARGS')]
+    configure = tmp_path / 'native-v41.cmake'
+    configure.write_text(f'set(CUTEAFD_CUDA_ARCHITECTURES {arch})\n'
+        'set(CUTEAFD_CONTEXT_SPLIT_AOT OFF)\nset(CUTEAFD_ENABLE_V41_EXPERT_AOT ON)\n' + logic
+        + '\nmessage(STATUS "GEOMETRY=${CUTEAFD_PROGRAM_GEOMETRY}")\n')
+    result = subprocess.run(['cmake', '-P', str(configure)], capture_output=True, text=True, timeout=10)
+    assert result.returncode == 0, result.stderr
+    assert 'native_experts' in result.stdout
+    build, output = tmp_path / 'build', tmp_path / 'output'
+    generated = build / 'native/dsv4_programs/dsv4_programs.json'
+    generated.parent.mkdir(parents=True)
+    # These are the exporter's width keys across every supported V4.1 Spark TP count.
+    sys.path.insert(0, str(ROOT / 'python/tools/lib'))
+    try:
+        from spark_packages import native_spark_artifacts
+        widths = sorted({a.logical for values in native_spark_artifacts('v41').values() for a in values})
+    finally:
+        sys.path.pop(0)
+    assert len(widths) == 9
+    programs = [dict(name=f'native_experts_v41_w{width}_segments') for width in widths]
+    generated.write_text(json.dumps(dict(schema=1, programs=programs)))
+    output.mkdir()
+    script = (ROOT / 'scripts/build/build-wip-artifacts.sh').read_text()
+    block = '# Generic-family tables' + script.split('# Generic-family tables', 1)[1].split('# Publish this build', 1)[0]
+    env = dict(PATH=os.environ['PATH'], role=role, v41_expert_aot='ON',
+        build_dir=str(build), output_dir=str(output), **derived)
+    for hit in ['0', '1']:
+        result = subprocess.run(['bash', '-c', 'set -euo pipefail\n' + block],
+            env={**env, 'native_hit': hit}, capture_output=True, text=True, timeout=10)
+        assert result.returncode == 0, result.stderr
+        assert json.loads((output / 'PROGRAMS.json').read_text())['programs'] == programs
+    generated.unlink()
+    result = subprocess.run(['bash', '-c', 'set -euo pipefail\n' + block], env={**env, 'native_hit': '0'},
+        capture_output=True, text=True, timeout=10)
+    assert result.returncode != 0, 'missing current manifest must not seal an empty table'
+
+
 @pytest.mark.parametrize('role', ['coordinator', 'expert'])
 @pytest.mark.parametrize('enabled', [False, True])
 @pytest.mark.parametrize('family', ['GLMF', 'QWEN_DENSE'])
