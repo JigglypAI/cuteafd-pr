@@ -133,7 +133,9 @@ impl CaptureTicket {
     pub fn capture_result<T>(&mut self, result: anyhow::Result<T>) -> anyhow::Result<T> {
         if let Err(error) = &result {
             if !self.committed {
-                if capture_failed(&self.cache, self.id, error) {
+                if self.updated {
+                    self.cache.lock().unwrap_or_else(|p| p.into_inner()).remove_drained(&[self.id]);
+                } else if capture_failed(&self.cache, self.id, error) {
                     tracing::warn!(%error, "graph capture unavailable");
                 }
                 self.committed = true;
@@ -286,7 +288,10 @@ impl<K: Hash + Eq + Clone + std::fmt::Debug, E> GraphBank<K, E> {
 
     /// Consume a failed reservation without cancelling its retained OOM ghost.
     pub fn cache_ticket_failed(&mut self, mut ticket: CaptureTicket, error: &anyhow::Error) -> bool {
-        let warn = if ticket.committed { false } else { self.cache_capture_failed(ticket.id, error) };
+        let warn = if ticket.committed { false } else if ticket.updated {
+            ticket.cache.lock().unwrap_or_else(|p| p.into_inner()).remove_drained(&[ticket.id]);
+            true
+        } else { self.cache_capture_failed(ticket.id, error) };
         ticket.committed = true;
         warn
     }
