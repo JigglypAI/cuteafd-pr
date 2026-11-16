@@ -129,7 +129,10 @@ fn mixed_native_checkpoint_reads_each_layers_storage_from_its_headers() {
     assert!(spec.notes.iter().any(|note| note.contains("native NVFP4 W4A4 (per-token amax, fouroversix) layers 0..=2")
         && note.contains("MXFP8 W8A8 layers 3..=3")), "{:?}", spec.notes);
     // Two packages, one contract: the plan names both and keeps the common worlds.
-    assert_eq!(report.experts.unwrap().package, "inkling2:mxfp8 + inkling2:nvfp4a4");
+    let contract = report.experts.unwrap();
+    assert_eq!(contract.package, "inkling2:mxfp8 + inkling2:nvfp4a4");
+    assert!(contract.spark_worlds.contains(&6), "compatible K32/K16 ownership must remain admitted");
+    assert!(!contract.spark_worlds.contains(&5), "unequal mixed row ranges must remain refused");
     let cfg = Inkling2Config::from_hf(&checkpoint.config).unwrap();
     let experts = crate::families::inkling2::experts::layer_experts(&checkpoint, &cfg).unwrap();
     // NVFP4 holds half the codes plus twice the scales of MXFP8; both halves cover the whole.
