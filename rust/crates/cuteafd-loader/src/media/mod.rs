@@ -3,6 +3,8 @@ pub mod audio;
 pub mod audio_tower;
 pub mod pcm_audio;
 mod decode;
+mod checkerboard;
+pub use checkerboard::{BlendRounding, Checkerboard};
 mod exif;
 mod groups;
 pub mod inkling;
@@ -81,15 +83,8 @@ impl DecodedPixels {
     /// Checkerboard is a family choice made after resize (Kimi) or before any
     /// padding (Inkling), never a global decoder behavior change.
     pub fn checkerboard(self) -> RgbImage {
-        match self {
-            Self::Rgb(image) => image,
-            Self::Rgba {width,height,data} => RgbImage {width,height,data:data.chunks_exact(4).enumerate().flat_map(|(index,pixel)| {
-                let x=index%width as usize;let y=index/width as usize;
-                let background=if (x/8+y/8)%2==0 {204} else {153};
-                let opacity=u32::from(pixel[3]);
-                (0..3).map(move |c| ((u32::from(pixel[c])*opacity+background*(255-opacity)+127)/255) as u8)
-            }).collect()},
-        }
+        Checkerboard::new(8,204,153,true,BlendRounding::Nearest)
+            .expect("fixed checkerboard policy").composite(self).expect("decoded pixel extent")
     }
     pub fn into_rgb(self, alpha: AlphaPolicy) -> RgbImage {
         match self {
