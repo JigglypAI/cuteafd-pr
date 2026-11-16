@@ -11,22 +11,33 @@ use std::{path::PathBuf, rc::Rc};
 pub(crate) struct GoldenArgs {
     #[command(flatten)] pub attention: crate::cli::CoreViewArgs,
     #[arg(long)] pub snapshot: PathBuf,
-    #[arg(long, env="CUTEAFD_NATIVE_LIB")] native_lib: PathBuf,
-    #[arg(long, default_value="/opt/cuteafd/share/PROGRAMS.json")] manifest: PathBuf,
-    #[arg(long="kv-cache", default_value="fp8")] kv_format: cuteafd_loader::families::inkling2::InklingKvCache,
+    #[arg(long, env="CUTEAFD_NATIVE_LIB")] pub native_lib: PathBuf,
+    #[arg(long, default_value="/opt/cuteafd/share/PROGRAMS.json")] pub manifest: PathBuf,
+    #[arg(long="kv-cache", default_value="fp8")] pub kv_format: cuteafd_loader::families::inkling2::InklingKvCache,
     /// JSON array of token ids; no tokenizer or prompt preprocessing in golden.
-    #[arg(long)] tokens: PathBuf,
+    #[arg(long)] pub tokens: PathBuf,
     /// Prefix stops after this zero-based layer; no full-model claim if <47.
     #[arg(long, default_value_t=0)] last_layer: usize,
-    #[arg(long, default_value_t=0)] device: i32,
+    #[arg(long, default_value_t=0)] pub device: i32,
     /// Existing parent; files are created below this new directory.
-    #[arg(long)] save_logits: PathBuf,
+    #[arg(long)] pub save_logits: PathBuf,
     #[arg(long)] nll: bool,
     /// Optional raw FP32 matching partial-prefix reference logits.
     #[arg(long)] golden: Option<PathBuf>,
     #[arg(long)] check_headers: bool,
     /// Diagnostic native hidden/routes/logits at selected zero-based layers.
     #[arg(long, value_delimiter=',')] tap_layers: Vec<usize>,
+    /// Compare the actual served target's teacher-forced decode/verify widths.
+    #[arg(long, value_delimiter=',')] pub width_invariance: Vec<usize>,
+    #[arg(long, default_value_t=64)] pub prefill: usize,
+    #[arg(long, value_delimiter=',')] pub peers: Vec<std::net::SocketAddr>,
+    #[arg(long, default_value="auto")] pub rtx_expert_layers: cuteafd_loader::placement::OnboardSetting,
+    #[arg(long)] pub pool_tokens: Option<u64>,
+    #[arg(long, default_value_t=16)] pub max_sequences: usize,
+    #[arg(long, default_value_t=4096)] pub prefill_rows: usize,
+    #[arg(long, default_value_t=3)] pub prefill_waves: u64,
+    #[arg(long, default_value="fp8")] pub draft_kv_cache: cuteafd_loader::families::qwen4::Qwen4KvCache,
+    #[command(flatten)] pub prefix: crate::shared::prefix::PrefixArgs,
 }
 
 pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
@@ -38,7 +49,8 @@ fn raw(buffer: cuteafd_ffi::CuteafdDeviceBuffer, bytes: usize) -> Result<cuteafd
     Ok(cuteafd_ffi::CuteafdDeviceBuffer { bytes, ..buffer })
 }
 
-fn run(args: GoldenArgs) -> Result<()> {
+fn run(mut args: GoldenArgs) -> Result<()> {
+    if !args.width_invariance.is_empty(){return super::width_invariance::run(&mut args);}
     ensure!(args.nll, "Inkling cold golden requires --nll");
     let view = args.attention.selected_view.clone().map(Ok).unwrap_or_else(|| args.attention.select(&args.snapshot))?;
     args.attention.validate_view(&view)?;

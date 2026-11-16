@@ -423,6 +423,21 @@ serving remains refused until qualification. The flag is unavailable to serve.
 prefill rows as F32 `logits.bin` for same-engine build or core-view comparisons.
 The option is listed in CLI help so the sealed golden runner can validate it.
 
+`cuteafd golden --family inkling2 --width-invariance 1,8 --tokens TOKENS.json
+--prefill N --peers HOST:PORT,... --save-logits DIR` compares teacher-forced
+serial decode with actual block verification after an identical admitted prefix.
+This path loads the selected MC original target through serving startup and its
+required push transaction with real Spark experts. `--rtx-expert-layers`,
+`--pool-tokens`, `--max-sequences`, `--prefill-rows`, `--prefill-waves`, target
+`--kv-cache`, `--draft-kv-cache` and shared prefix args select the served shape.
+Widths are 1..8 total verify rows (anchor included), independently of the
+64-row packed physical capacity. Exact prompt-end SWA/FIR marks are restored
+before each width; width 1 repeats after the wide pass. The JSON receipt names
+the first differing layer, stage and operand per row, including route ids,
+weights and expert outputs; no tolerance or automatic numerical fix applies.
+Run through `scripts/bench/golden-run.py --family inkling2 --spark-hosts ...`.
+Without `--width-invariance`, Inkling retains its cold native-MXFP8 golden path.
+
 `cuteafd step5-golden --golden TOKENS_DIR --nll --last-layer 91` accepts a
 `tokens.bin`-only directory for same-engine core-view comparisons (2..4096 U32
 tokens). No `--window` is needed; `--save-logits` retains the actual selected

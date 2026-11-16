@@ -17,6 +17,7 @@ pub(crate) struct Execution<'a> {
     pub local: Vec<Box<dyn Dispatcher + 'a>>,
     pub cfg: Inkling2Config,
     pub draft:Option<std::rc::Rc<super::draft::Binding<'a>>>,
+    pub width_trace:Option<std::cell::RefCell<super::width_invariance::Trace>>,
     ingress: Vec<cuteafd_core::SparkIngress>,
     next_identity: u64,
     terminal: bool,
@@ -35,7 +36,7 @@ impl<'a> Execution<'a> {
             Site { name: "inkling2.whole", cycle: Cycle::Other, preference: Preference::Eager,
                 bootstrap: 0, basis: Basis::Bytes, spans_devices: false })?;
         tracing::warn!(graph_reserve, "Inkling unqualified graph layout starts eager with no borrowed prewarm or pins");
-        Ok(Self { graphs, link, requests, head, target, kernels, local, cfg, ingress, next_identity: 1, terminal: false, draft:None })
+        Ok(Self { graphs, link, requests, head, target, kernels, local, cfg, ingress, next_identity: 1, terminal: false, draft:None, width_trace:None })
     }
 
     /// Tokens are submitted suffixes; placement frontiers define their origins
@@ -49,7 +50,7 @@ impl<'a> Execution<'a> {
         let result = (|| {
             let waves = self.link.exchange()?;
             let mut io = TokenIo { kernels: &self.kernels, head: &self.head, cache: &self.requests.cache,
-                target: &self.target, cfg: &self.cfg, tokens, starts: &starts, slots: &slots, retained_rows: false, draft:self.draft.as_deref(),publish_draft:true,on_logits };
+                target: &self.target, cfg: &self.cfg, tokens, starts: &starts, slots: &slots, retained_rows: false, draft:self.draft.as_deref(),publish_draft:true,trace:None,on_logits };
             Stateful { kernels: &self.kernels, owners: &self.requests.prefill, cache: &self.requests.cache,
                 target: &self.target, cfg: &self.cfg, ingress: &self.ingress, placements, uploads: &mut self.requests.prefill_uploads,
                 waves, onboarded: self.local.len(), local: &self.local, next_identity: &mut self.next_identity,
@@ -73,7 +74,7 @@ impl<'a> Execution<'a> {
         let result = (|| {
             let waves = self.link.exchange()?;
             let mut io = TokenIo { kernels: &self.kernels, head: &self.head, cache: &self.requests.cache,
-                target: &self.target, cfg: &self.cfg, tokens, starts: &starts, slots: &slots, retained_rows: true, draft:self.draft.as_deref(),publish_draft:false,
+                target: &self.target, cfg: &self.cfg, tokens, starts: &starts, slots: &slots, retained_rows: true, draft:self.draft.as_deref(),publish_draft:false,trace:self.width_trace.as_ref(),
                 on_logits: &mut |_, _, _| Ok(()) };
             Stateful { kernels: &self.kernels, owners: std::slice::from_ref(&self.requests.decode),
                 cache: &self.requests.cache, target: &self.target, cfg: &self.cfg, ingress: &self.ingress, placements,

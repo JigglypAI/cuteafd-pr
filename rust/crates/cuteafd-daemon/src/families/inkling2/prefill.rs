@@ -12,6 +12,7 @@ pub(crate) trait UnitIo<'a> {
         uploads: &mut crate::shared::token_table::RetainedUploads<'a>) -> Result<()>;
     fn end(&mut self, unit: &Unit, owner: &super::owners::UnitOwner<'a>) -> Result<()>;
     fn tap(&mut self,_layer:usize,_unit:&Unit,_owner:&super::owners::UnitOwner<'a>)->Result<()> {Ok(())}
+    fn stage(&mut self,_layer:usize,_stage:&str,_unit:&Unit,_owner:&super::owners::UnitOwner<'a>)->Result<()> {Ok(())}
 }
 /// Token/head edge for ordinary prefill and bounded streamed scoring. The
 /// callback consumes scratch logits before another head tile overwrites them.
@@ -28,9 +29,13 @@ pub(crate) struct TokenIo<'s, 'a> {
     pub retained_rows: bool,
     pub draft:Option<&'s super::draft::Binding<'a>>,
     pub publish_draft:bool,
+    pub trace:Option<&'s std::cell::RefCell<super::width_invariance::Trace>>,
     pub on_logits: &'s mut dyn FnMut(usize, usize, crate::shared::token_io::DeviceLogits) -> Result<()>,
 }
 impl<'a> UnitIo<'a> for TokenIo<'_, 'a> {
+    fn stage(&mut self,layer:usize,stage:&str,unit:&Unit,owner:&super::owners::UnitOwner<'a>)->Result<()>{
+        if let Some(trace)=self.trace{trace.borrow_mut().capture(layer,stage,unit.rows.len(),owner)?;}Ok(())
+    }
     fn tap(&mut self,layer:usize,unit:&Unit,owner:&super::owners::UnitOwner<'a>)->Result<()> {
         if let Some(draft)=self.draft {
             draft.taps(self.retained_rows,unit.slot)?.entry(layer,owner.buffer("partial")?,unit.rows.len())?;
@@ -127,7 +132,9 @@ impl Stateful<'_, '_> {
         let members = self.packed_members(unit)?;
         let state = super::owners::PackedLayerUnit { unit: owner, cache: self.cache, layer, members: &members,
             uploads: std::cell::RefCell::new(&mut self.uploads[unit.slot]) };
-        layers::join_experts(self.kernels, &state, self.target, self.cfg, layer, unit.rows.len())
+        self.io.stage(layer,"experts",unit,owner)?;
+        layers::join_experts(self.kernels, &state, self.target, self.cfg, layer, unit.rows.len())?;
+        self.io.stage(layer,"exit",unit,owner)
     }
 }
 
@@ -161,11 +168,13 @@ impl PrefillHooks for Stateful<'_, '_> {
     fn attention(&mut self, layer: usize, unit: &Unit) -> Result<()> {
         let owner = &self.owners[unit.slot];
         self.io.tap(layer,unit,owner)?;
+        self.io.stage(layer,"entry",unit,owner)?;
         let members = self.packed_members(unit)?;
         owner.packed_metadata(layer, self.cache, &members, &mut self.uploads[unit.slot])?;
         let state = super::owners::PackedLayerUnit { unit: owner, cache: self.cache, layer, members: &members,
             uploads: std::cell::RefCell::new(&mut self.uploads[unit.slot]) };
-        layers::begin_layer(self.kernels, &state, self.target, self.cfg, layer, unit.rows.len())
+        layers::begin_layer(self.kernels, &state, self.target, self.cfg, layer, unit.rows.len())?;
+        self.io.stage(layer,"attention",unit,owner)
     }
     fn local_ffn(&mut self, layer: usize, unit: &Unit) -> Result<()> {
         let owner = &self.owners[unit.slot];
