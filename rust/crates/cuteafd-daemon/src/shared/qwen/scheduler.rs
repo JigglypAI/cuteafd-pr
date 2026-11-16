@@ -186,6 +186,8 @@ pub(crate) trait Backend<'a> {
         draft: &mut Self::Draft) -> Result<()>;
     fn draft(&self, sequences: &mut [DraftSeq<'_, Self::Placement, Self::Draft>], timing: &mut DraftTiming, selector: &mut crate::shared::token_io::TokenSelector<'_>)
         -> Result<Vec<Vec<u32>>>;
+    /// Optional current-proposal evidence; omission preserves history-only policy exactly.
+    fn draft_evidence(&self, _draft: &Self::Draft) -> Option<&[f32]> { None }
     fn accept(&self, verified: &mut [Verified<'_, Self::Placement, Self::Draft, Self::History>],
         speculative: bool) -> Result<()>;
     /// Drop any unaccepted replay owned by this request before its storage is released.
@@ -1340,6 +1342,14 @@ impl<'a, B: Backend<'a>> LaneCommit for Accept<'_, '_, 'a, B> {
     }
 }
 
+fn apply_draft_evidence(prior:&mut Vec<f64>,history:&DraftHistory,head:Option<&[f32]>,rows:usize)
+    -> Result<()> {
+    let Some(head)=head else { return Ok(()) };
+    ensure!(head.len()>=rows,"draft evidence shorter than current proposal");
+    *prior=resource::head_confidence(history,&head[..rows]);
+    Ok(())
+}
+
 /// Price the optional block separately from its verify lengths. Every active
 /// request still contributes an anchor when the concurrency-local policy skips.
 fn select_neural_round(policy: &mut cuteafd_core::DraftPolicy, candidates: &[resource::Candidate<'_>],
@@ -1405,6 +1415,10 @@ async fn decode_round<'a, B: Backend<'a>>(lease: LaneLease<'_>, engine: &B, geom
                 drafted_requests = depths.iter().filter(|&&n| n > 0).count();
                 drafted_width = depths.iter().copied().max().unwrap_or(0);
                 let proposals = round_clock.draft(|| engine.draft(&mut seqs, &mut lane.timing, selector))?;
+                drop(seqs);
+                for ((request,prior),proposal) in active.iter().zip(&mut neural_confidence).zip(&proposals) {
+                    apply_draft_evidence(prior,&request.outcomes,engine.draft_evidence(&request.draft),proposal.len())?;
+                }
                 proposals
             } else {
                 vec![Vec::new(); active.len()]
@@ -2064,6 +2078,28 @@ mod loop_abort_tests {
 mod draft_action_tests {
     use super::*;
     use crate::shared::draft::{clock::RoundTimes, evidence::DraftSource};
+
+    #[test]
+    fn omitted_evidence_keeps_existing_minimax_history_policy_bytes() -> Result<()> {
+        // MiniMax intentionally inherits Backend's history-only default.
+        let source=include_str!("../../families/minimax_m3/backend.rs");
+        assert!(!source.contains("fn draft_evidence("));
+        let mut history=DraftHistory::default();
+        history.observe(7,4);
+        history.observe(7,2);
+        for rows in [0,1,4,7] {
+            let mut prior=DraftHistory::acceptance(&[&history],&[rows]).remove(0);
+            let before=prior.iter().map(|p|p.to_bits()).collect::<Vec<_>>();
+            apply_draft_evidence(&mut prior,&history,None,rows)?;
+            assert_eq!(prior.iter().map(|p|p.to_bits()).collect::<Vec<_>>(),before);
+        }
+        let head=[0.9,0.7,0.5];
+        let mut prior=Vec::new();
+        apply_draft_evidence(&mut prior,&history,Some(&head),2)?;
+        assert_eq!(prior,resource::head_confidence(&history,&head[..2]));
+        assert!(apply_draft_evidence(&mut prior,&history,Some(&head),4).is_err());
+        Ok(())
+    }
 
     fn geometry() -> cuteafd_core::PolicyGeometry {
         cuteafd_core::PolicyGeometry {
