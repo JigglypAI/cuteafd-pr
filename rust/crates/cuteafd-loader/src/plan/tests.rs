@@ -7,6 +7,16 @@ use crate::placement::AttentionPlacement;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 
+fn plan_spark_count(snapshot: &std::path::Path, options: &PlanOptions, available: usize,
+    explicit: Option<usize>) -> Result<PlanReport, PlanError> {
+    let mut options = options.clone();
+    if let Some(layout) = &mut options.layout {
+        let manifest = snapshot.join("share/PROGRAMS.json");
+        if layout.workspace_manifest.is_none() && manifest.is_file() { layout.workspace_manifest = Some(manifest); }
+    }
+    super::plan_spark_count(snapshot, &options, available, explicit)
+}
+
 #[test]
 fn solved_phase_ledger_preserves_chronology_and_renders_each_physical_peak() {
     use crate::placement::planner::{self, Allocation, Allowance, Baseline, Budget, Contract,
@@ -719,7 +729,12 @@ fn check_concurrency_plan_cell(
     c: u64,
     options: &PlanOptions,
 ) -> PlanReport {
-    let (report, phases) = input.plan_with_timings(options);
+    let mut options = options.clone();
+    if let Some(layout) = &mut options.layout {
+        let manifest = input.checkpoint().snapshot.join("share/PROGRAMS.json");
+        if layout.workspace_manifest.is_none() && manifest.is_file() { layout.workspace_manifest = Some(manifest); }
+    }
+    let (report, phases) = input.plan_with_timings(&options);
     assert!(phases.total() < std::time::Duration::from_secs(10),
         "{label} C{c} GPUs={gpus} Sparks={ranks}: {phases:?}");
     let report = report.unwrap();

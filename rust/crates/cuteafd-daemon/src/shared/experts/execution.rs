@@ -630,8 +630,8 @@ impl<'weights, 'library> ExpertExecution<'weights, 'library> {
             return Ok(false);
         }
         let (kernel, _, _) = self.execution_state(request.rows())?;
-        let recipe = self.library.native_expert_reduction(&kernel.info())?;
-        let eligible = recipe.implementation == 2 && self.segments.is_some();
+        let eligible = self.reduction_plan.as_ref().is_some_and(|plan|
+            plan.merges_stream_capacity(kernel.info().capacity_rows as usize)) && self.segments.is_some();
         self.dispatch_waves(Some(waves::Arrival { request, input, output,
             layer: request.layer() as usize, executor_id }), eligible)
     }
