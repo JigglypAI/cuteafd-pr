@@ -65,6 +65,19 @@ mod tests {
                 &contract,
             )
             .unwrap();
+            let hwc_expected = match (h, w) {
+                (13, 17) => "5600054d347417aad6031db4ef68dab5c6539dcfb95e19a5f37fc171765940cf",
+                (432, 640) => "095b9344ce7046df713d388dfed0af6202bc7458a03fec7541c8a46ff1dfa8ff",
+                (640, 432) => "11d4bb0a9afa3cbd7477075dd705ae46ec9bcc6297655e6c0bcc5d9527ce3c4e",
+                (672, 672) => "97dac130616a513af1612a23731fffea294709a21eacec6dcca72686b2f50ac5",
+                (1009, 731) => "99f7fccbaa0f266f284a8eb9671159e532505a27ad467cfd88eb66e876aaf3e7",
+                _ => unreachable!("pinned oracle cases"),
+            };
+            assert_eq!(
+                format!("{:x}", Sha256::digest(&out.data)),
+                hwc_expected,
+                "PillowHWC source{h}x{w}"
+            );
             // SGLang's resize_frames returns CHW uint8; the Rust payload is HWC.
             // Hash an explicit CHW view on both sides, not differently laid-out bytes.
             let chw = (0..3)
