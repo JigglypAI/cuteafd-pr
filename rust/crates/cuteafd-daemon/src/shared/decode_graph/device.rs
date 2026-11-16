@@ -91,6 +91,7 @@ pub(crate) struct Counters {
     pub evictions: u64,
     pub physical_floor_skips: u64,
     pub eager_vampire: u64,
+    pub hot_guard_skips: u64,
     pub eager_projected_hard_stop: u64,
     pub eager_soft_room: u64,
     pub eager_hard_stop: u64,
@@ -1154,8 +1155,10 @@ impl DeviceCache {
             let mut next = self.queues[list.index()].first;
             while let Some(id) = next {
                 let record = &self.records[&id];
-                if !record.pending_capture && Some(id) != excluded && !self.hot(record) {
-                    selected = Some(id); break;
+                if !record.pending_capture && Some(id) != excluded {
+                    if self.hot(record) {
+                        self.counters.entry(record.cycle).or_default().hot_guard_skips += 1;
+                    } else { selected = Some(id); break; }
                 }
                 next = record.next;
             }
