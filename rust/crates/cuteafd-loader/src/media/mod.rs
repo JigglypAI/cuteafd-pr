@@ -28,7 +28,7 @@ impl AudioTowerKind {
 }
 
 pub use cuteafd_core::{ImageKey, MediaSpan};
-pub use decode::{decode, decode_bounded, AlphaPolicy, DecodePolicy};
+pub use decode::{decode, decode_bounded, decode_pixels_bounded, AlphaPolicy, DecodePolicy};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 pub use spans::{ExpandedMediaPrompt, MistralSpanExpander, SpanExpander};
@@ -53,6 +53,52 @@ pub struct RgbImage {
     pub width: u32,
     pub height: u32,
     pub data: Vec<u8>,
+}
+/// Decoded pixels retain alpha until the family's preprocessing chooses when
+/// to composite it. RGB stays RGB, so existing families allocate no extra plane.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DecodedPixels { Rgb(RgbImage), Rgba {width:u32,height:u32,data:Vec<u8>} }
+impl DecodedPixels {
+    pub fn dimensions(&self) -> [u32;2] { match self {
+        Self::Rgb(image) => [image.width,image.height], Self::Rgba {width,height,..} => [*width,*height] } }
+    pub fn bytes(&self) -> usize { match self {Self::Rgb(image)=>image.data.len(),Self::Rgba {data,..}=>data.len()} }
+    pub fn resize(self,width:u32,height:u32,filter:Resample) -> Result<Self> {
+        if width==0 || height==0 || u64::from(width)*u64::from(height)>64<<20 {
+            return Err(invalid("resized dimensions must be positive and at most 64 megapixels"));
+        }
+        Ok(match self {
+            Self::Rgb(image) => Self::Rgb(resize::resize(&image,width,height,filter)),
+            Self::Rgba {width:iw,height:ih,data} => {
+                if data.len()!=iw as usize*ih as usize*4 {return Err(invalid("RGBA extent differs from dimensions"))}
+                Self::Rgba {width,height,data:resize::resize_rgba(&data,iw,ih,width,height,filter)}
+            }
+        })
+    }
+    /// Checkerboard is a family choice made after resize (Kimi) or before any
+    /// padding (Inkling), never a global decoder behavior change.
+    pub fn checkerboard(self) -> RgbImage {
+        match self {
+            Self::Rgb(image) => image,
+            Self::Rgba {width,height,data} => RgbImage {width,height,data:data.chunks_exact(4).enumerate().flat_map(|(index,pixel)| {
+                let x=index%width as usize;let y=index/width as usize;
+                let background=if (x/8+y/8)%2==0 {204} else {153};
+                let opacity=u32::from(pixel[3]);
+                (0..3).map(move |c| ((u32::from(pixel[c])*opacity+background*(255-opacity)+127)/255) as u8)
+            }).collect()},
+        }
+    }
+    pub fn into_rgb(self, alpha: AlphaPolicy) -> RgbImage {
+        match self {
+            Self::Rgb(image) => image,
+            Self::Rgba {width,height,data} => RgbImage {width,height,data:data.chunks_exact(4).flat_map(|pixel| {
+                let opacity=u32::from(pixel[3]);
+                (0..3).map(move |c| match alpha {
+                    AlphaPolicy::Drop => pixel[c],
+                    AlphaPolicy::White => ((u32::from(pixel[c])*opacity+255*(255-opacity)+127)/255) as u8,
+                })
+            }).collect()},
+        }
+    }
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ImageGrid {
@@ -443,8 +489,13 @@ fn glm_resize(height: u32, width: u32, factor: u32, min: u64, max: u64) -> Resul
 pub trait ImageProcessor: Send + Sync {
     fn config(&self) -> &ProcessorConfig;
     fn prepare_rgb(&self, image: RgbImage, encoder: EncoderId) -> Result<PreparedImage>;
+    fn prepare_pixels(&self,image:DecodedPixels,encoder:EncoderId) -> Result<PreparedImage> {
+        // Existing processors retain their historical composite-before-resize
+        // bytes; new families can override this hook and resize RGBA first.
+        self.prepare_rgb(image.into_rgb(self.config().decode.alpha),encoder)
+    }
     fn prepare(&self, encoded: &[u8], encoder: EncoderId) -> Result<PreparedImage> {
-        self.prepare_rgb(decode(encoded, self.config().decode)?, encoder)
+        self.prepare_pixels(decode_pixels_bounded(encoded,self.config().decode,usize::MAX)?,encoder)
     }
 }
 impl ImageProcessor for ProcessorConfig {
