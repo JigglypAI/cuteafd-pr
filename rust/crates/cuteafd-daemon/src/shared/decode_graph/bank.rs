@@ -269,6 +269,7 @@ impl<K: Hash + Eq + Clone + std::fmt::Debug, E> GraphBank<K, E> {
         assert!(std::sync::Arc::ptr_eq(&binding.cache, &ticket.cache), "graph ticket belongs to a different device cache");
         assert!(!ticket.committed, "graph capture ticket already settled");
         if !ticket.updated { self.cache_topology(ticket.id, nodes, width, spans_devices); }
+        ticket.cache.lock().unwrap_or_else(|p| p.into_inner()).segment_launched(ticket.id);
         self.cache_insert(key.clone(), exec, ticket.id, ticket.pinned);
         ticket.committed = true;
         let retained = ticket.updated || ticket.cache.lock().unwrap_or_else(|p| p.into_inner()).completed_capture(ticket.id);
