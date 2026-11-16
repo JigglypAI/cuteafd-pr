@@ -1629,7 +1629,8 @@ mod tests {
             for page_rows in [64, 128] {
                 let facts = crate::placement::families::kimi::draft_facts(&layout, page_rows, 16, 1).unwrap();
                 assert!(facts.context_split);
-                let (gpu, arena) = facts.arena.as_ref().unwrap();
+                assert_eq!(facts.arenas.len(),1);
+                let (gpu, arena) = &facts.arenas[0];
                 assert_eq!(*gpu, 1);
                 assert_eq!(arena.id(), "kimi/draft/1");
                 assert_eq!(arena.payload_bytes() as u64, layout.weights().resident_bytes().unwrap());
