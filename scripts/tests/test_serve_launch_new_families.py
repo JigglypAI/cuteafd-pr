@@ -41,7 +41,7 @@ def _kimi(tmp_path: Path, keys: str = "", *, wip: bool = True, **kwargs):
 
 def _line(result, needle: str) -> str:
     assert result.returncode == 0, result.stderr
-    return next(line for line in result.stderr.splitlines() if needle in line)
+    return next(line for line in result.stderr.splitlines() if needle in line and "--resolve-settings-only" not in line)
 
 
 def _flag(line: str, flag: str) -> str | None:
