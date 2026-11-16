@@ -22,6 +22,23 @@ def package_entry(family: str, format: str) -> dict:
     return json.loads(RANGES_PATH.read_text())['entries'][f'{family}:{format}']
 
 
+def native_layout(family: str, format: str) -> dict:
+    """Shared format units/storage; no family-width dispatch in callers."""
+    return package_entry(family, format)['native_layout']
+
+
+def geometry_native_layout(geometry: str) -> dict | None:
+    family, _, format = geometry.partition('_')
+    format = (format or 'fp8').removesuffix('a4')
+    entry = json.loads(RANGES_PATH.read_text())['entries'].get(f'{family}:{format}')
+    return entry['native_layout'] if entry else None
+
+
+def ownership_unit(family: str, format: str, world: int) -> int:
+    policy = native_layout(family, format)
+    return policy['unit_columns'] if world in policy['exact_worlds'] else policy['legacy_unit_columns']
+
+
 def checkpoint_expert_format(model: str) -> str | None:
     target = model.strip().lower()
     if not target:
@@ -61,7 +78,7 @@ def package_worlds(family: str, format: str) -> list[int]:
     exl3 = format.startswith('exl3')
     native = family in ('v41', 'dsv4f', 'dsv4p') and not exl3
     nvfp4 = format in ('nvfp4', 'nvfp4a4')
-    unit = 16 if nvfp4 else 32 if native or family in ('mimof', 'mimop') else 128
+    unit = native_layout(family, format)['coverage_unit_columns']
     intermediate = entry['intermediate']
     options = dict(exl3=exl3, native=native, nvfp4=nvfp4)
     available = set().union(*(width_keys(intermediate, unit, n, **options) for n in entry['worlds']))

@@ -230,6 +230,18 @@ concurrency point is that limit.
 <td width="27%" valign="top"><a href="benchmarks/minimax_m3/2026-11-16-smoke-minimax-m3-1-flash-1rtx-3spark-minimax-dspark-1rtx-current-r1/card.svg"><img src="benchmarks/minimax_m3/2026-11-16-smoke-minimax-m3-1-flash-1rtx-3spark-minimax-dspark-1rtx-current-r1/card.svg" alt="MiniMaxAI/MiniMax-M3.1-Flash on 1× RTX PRO 6000 @ gpu-powerd 425 W (425–450) + 3× DGX Spark"></a><br><sub>1× RTX + 3× Spark</sub></td>
 <td width="27%" valign="top"><a href="benchmarks/minimax_m3/2026-11-16-smoke-minimax-m3-1-flash-2rtx-4spark-minimax-dspark-heads-current-r1/card.svg"><img src="benchmarks/minimax_m3/2026-11-16-smoke-minimax-m3-1-flash-2rtx-4spark-minimax-dspark-heads-current-r1/card.svg" alt="MiniMaxAI/MiniMax-M3.1-Flash on 2× RTX PRO 6000 @ gpu-powerd 425/425 W (395–450) + 4× DGX Spark"></a><br><sub>2× RTX + 4× Spark</sub></td>
 </tr>
+<tr>
+<td width="19%" valign="top"><a href="docs/models/inkling2.md"><b>inkling2</b></a><br><sub>thinkingmachines/Inkling-2-Small</sub><br><sub></sub></td>
+<td width="27%" valign="top">pending<br><sub>Not measured; four-Spark RTX PRO 6000 qualification first.</sub></td>
+<td width="27%" valign="top">pending<br><sub>1 RTX + 4 Sparks serving/fidelity and Release smoke qualification pending (#1930).</sub></td>
+<td width="27%" valign="top">pending<br><sub>Multi-RTX Inkling serving is not qualified (#1930).</sub></td>
+</tr>
+<tr>
+<td width="19%" valign="top"><a href="docs/models/inkling2.md"><b>inkling2</b></a><br><sub>wrldsuksgo2mars/Inkling-2-Small-EXL3-K4-MC</sub><br><sub></sub></td>
+<td width="27%" valign="top">pending<br><sub>Not measured; four-Spark RTX PRO 6000 qualification first.</sub></td>
+<td width="27%" valign="top">pending<br><sub>1 RTX + 4 Sparks serving/fidelity and Release smoke qualification pending (#1930).</sub></td>
+<td width="27%" valign="top">pending<br><sub>Multi-RTX Inkling serving is not qualified (#1930).</sub></td>
+</tr>
 </table>
 
 Each card is one launch of the basic profile: tok/s for C1 decode and concurrent decode with thinking off (each stream its own prompt; earlier cards sent one code prompt to every stream, which shares experts and drafts and reads higher), cold exactly-8,192-token prefill, logit fidelity against the family golden reference, prefix-cache restore exactness and lossless speculation. Older releases, other profiles and every report: [benchmarks](benchmarks/README.md).

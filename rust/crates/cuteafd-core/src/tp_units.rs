@@ -26,6 +26,31 @@ pub fn spark_package_entry(key: &str) -> &'static serde_json::Value {
         "../../../../scripts/build/spark-package-ranges.json")).expect("checked package ranges"))["entries"][key]
 }
 
+/// Checkpoint-native source units and explicitly exported exact-storage worlds.
+/// The same JSON record is consumed by Python package/export tooling.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct NativeLayout {
+    pub unit_columns: usize,
+    pub legacy_unit_columns: usize,
+    pub coverage_unit_columns: usize,
+    pub storage_alignment: usize,
+    pub exact_worlds: Vec<usize>,
+}
+
+impl NativeLayout {
+    pub fn exact_storage(&self, world: usize) -> bool { self.exact_worlds.contains(&world) }
+
+    pub fn ownership_unit(&self, world: usize) -> usize {
+        if self.exact_storage(world) { self.unit_columns } else { self.legacy_unit_columns }
+    }
+}
+
+pub fn native_layout(family: &str, format: &str) -> NativeLayout {
+    let format = if format.starts_with("exl3") { "exl3" } else { format.strip_suffix("a4").unwrap_or(format) };
+    serde_json::from_value(spark_package_entry(&format!("{family}:{format}"))["native_layout"].clone())
+        .expect("package native layout policy")
+}
+
 /// Additive width-keyed native ABI roles never encode Spark count or rank.
 pub const NATIVE_WIDTH_ROLE_BASE: u32 = 65536;
 
@@ -108,7 +133,7 @@ pub fn spark_package_worlds(family: &str, format: &str) -> Vec<usize> {
     let intermediate = entry["intermediate"].as_u64().unwrap_or(0) as usize;
     let exl3 = format == "exl3";
     let native = matches!(family, "v41" | "dsv4f" | "dsv4p") && !exl3;
-    let unit = if native || matches!(family, "mimof" | "mimop") { 32 } else { 128 };
+    let unit = native_layout(family, format).coverage_unit_columns;
     let available = seeds.into_iter().flat_map(|world|
         package_width_keys(intermediate, unit, world, exl3, native, false)).collect::<std::collections::BTreeSet<_>>();
     (1..=crate::MAX_SPARK_WORLD).filter(|&world| {

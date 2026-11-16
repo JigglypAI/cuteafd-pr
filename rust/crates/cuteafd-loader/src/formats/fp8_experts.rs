@@ -620,12 +620,27 @@ impl Fp8ExpertTensors {
         else { cuteafd_core::tp_units::layer_rule(units, tp) }
     }
 
-    pub fn exact_slicing(&self, _tp: usize) -> Slicing {
-        Slicing::Blocks(if self.coordinator { 128 } else { self.block() })
+    fn exact_storage_policy(&self, tp: usize) -> Option<cuteafd_core::tp_units::NativeLayout> {
+        if self.coordinator { return None; }
+        let geometry = self.shape.geometry().ok()?;
+        let family = geometry.family()?;
+        let format = match self.format {
+            ExpertFormat::Bf16 => "bf16", ExpertFormat::Fp8Block128 => "fp8",
+            ExpertFormat::Mxfp4 => "mxfp4", ExpertFormat::Mxfp8 => "mxfp8", ExpertFormat::Nvfp4 => "nvfp4",
+        };
+        let entry = cuteafd_core::tp_units::spark_package_entry(&format!("{family}:{format}"));
+        serde_json::from_value::<cuteafd_core::tp_units::NativeLayout>(entry["native_layout"].clone()).ok()
+            .filter(|policy| policy.exact_storage(tp))
+    }
+
+    pub fn exact_slicing(&self, tp: usize) -> Slicing {
+        Slicing::Blocks(if self.coordinator { 128 } else {
+            self.exact_storage_policy(tp).map_or(self.block(), |policy| policy.ownership_unit(tp))
+        })
     }
 
     fn needs_nvfp4_padding(&self, tp: usize) -> bool {
-        self.format == ExpertFormat::Nvfp4 && !self.coordinator
+        self.format == ExpertFormat::Nvfp4 && !self.coordinator && self.exact_storage_policy(tp).is_none()
             && (tp == 0 || self.shape.intermediate == 0 || self.shape.intermediate % (128 * tp) != 0)
     }
 
@@ -640,7 +655,8 @@ impl Fp8ExpertTensors {
         if self.needs_nvfp4_padding(tp) {
             Slicing::Padded
         } else if directory.file_name().and_then(|name| name.to_str()).is_some_and(|name| name.contains("-w"))
-            || (tp > 0 && self.shape.intermediate > 0 && self.shape.intermediate % (self.block() * tp) == 0) {
+            || (self.exact_storage_policy(tp).is_none() && tp > 0 && self.shape.intermediate > 0
+                && self.shape.intermediate % (self.block() * tp) == 0) {
             self.exact_slicing(tp)
         } else { Slicing::Padded }
     }
@@ -810,7 +826,8 @@ impl Fp8ExpertTensors {
         let Slicing::Blocks(g) = slicing else { return self.rank_range(tp, rank) };
         ensure!(rank < tp, "rank {rank} of TP{tp}");
         let i = self.shape.intermediate;
-        ensure!(g > 0 && g % self.block() == 0 && i % g == 0 && i / g >= tp,
+        let source_unit = self.exact_storage_policy(tp).map_or(self.block(), |policy| policy.unit_columns);
+        ensure!(g > 0 && g % source_unit == 0 && i % g == 0 && i / g >= tp,
             "intermediate {i} does not split into whole {g}-row blocks over {tp} ranks");
         let rule = self.slice_rule(i / g, tp);
         let map = cuteafd_core::tp_units::RankUnits::new(rule, 1, i, g, self.slice_layer, tp, rank)?;
@@ -1398,6 +1415,24 @@ mod tests {
     }
 
     #[test]
+    fn exact_world_native_packages_store_four_unpadded_checkpoint_slices() -> Result<()> {
+        for format in [ExpertFormat::Mxfp8, ExpertFormat::Nvfp4] {
+            let mut tensors = catalog(format, 2304);
+            tensors.shape.hidden = 4608;
+            tensors.shape.experts = 384;
+            let unit = if format == ExpertFormat::Mxfp8 { 32 } else { 16 };
+            assert_eq!(tensors.exact_slicing(4), Slicing::Blocks(unit));
+            assert!(!tensors.needs_nvfp4_padding(4));
+            for rank in 0..4 {
+                assert_eq!(tensors.rank_range_with(4, rank, tensors.exact_slicing(4))?, (rank * 576, 576));
+                assert_eq!(tensors.rank_width(4, rank, tensors.exact_slicing(4))?, 576);
+            }
+            assert_eq!(tensors.for_coordinator().exact_slicing(4), Slicing::Blocks(128));
+        }
+        Ok(())
+    }
+
+    #[test]
     fn mxfp8_h128_ownership_matches_exporter_widths_without_splitting_k32_scales() -> Result<()> {
         let mut tensors = catalog(ExpertFormat::Mxfp8, 2304);
         tensors.shape.hidden = 4608;
@@ -1408,16 +1443,17 @@ mod tests {
         assert!(exporter.contains("def exact_widths(intermediate: int, tp: int, unit: int = 128)"));
         for world in 2..=8 {
             let recipe = crate::plan::experts::spark_recipe("inkling2:mxfp8", 2304, world)?;
-            assert_eq!(recipe.slicing, Slicing::Blocks(128));
+            let unit = cuteafd_core::tp_units::native_layout("inkling2", "mxfp8").ownership_unit(world);
+            assert_eq!(recipe.slicing, Slicing::Blocks(unit));
             let mut covered = vec![false; 2304];
             let mut widths = Vec::new();
             for rank in 0..world {
                 let (first, width) = tensors.rank_range_with(world, rank, recipe.slicing)?;
-                let blocks = 2304 / 128;
-                let exported = (blocks / world + usize::from(rank < blocks % world)) * 128;
+                let blocks = 2304 / unit;
+                let exported = (blocks / world + usize::from(rank < blocks % world)) * unit;
                 widths.push(width);
                 assert_eq!(width, exported);
-                assert_eq!(first % 128, 0);
+                assert_eq!(first % unit, 0);
                 assert_eq!(first % 32, 0);
                 assert_eq!(width % 32, 0);
                 for value in &mut covered[first..first + width] { assert!(!*value); *value = true; }

@@ -336,6 +336,38 @@
         "status": "current",
         "report": "benchmarks/minimax_m3/2026-11-16-smoke-minimax-m3-1-flash-2rtx-4spark-minimax-dspark-heads-current-r1"
       }
+    },
+    {
+      "family": "inkling2",
+      "checkpoint": "thinkingmachines/Inkling-2-Small",
+      "5090": {
+        "status": "pending",
+        "reason": "Not measured; four-Spark RTX PRO 6000 qualification first."
+      },
+      "1rtx": {
+        "status": "pending",
+        "reason": "1 RTX + 4 Sparks serving/fidelity and Release smoke qualification pending (#1930)."
+      },
+      "2rtx": {
+        "status": "pending",
+        "reason": "Multi-RTX Inkling serving is not qualified (#1930)."
+      }
+    },
+    {
+      "family": "inkling2",
+      "checkpoint": "wrldsuksgo2mars/Inkling-2-Small-EXL3-K4-MC",
+      "5090": {
+        "status": "pending",
+        "reason": "Not measured; four-Spark RTX PRO 6000 qualification first."
+      },
+      "1rtx": {
+        "status": "pending",
+        "reason": "1 RTX + 4 Sparks serving/fidelity and Release smoke qualification pending (#1930)."
+      },
+      "2rtx": {
+        "status": "pending",
+        "reason": "Multi-RTX Inkling serving is not qualified (#1930)."
+      }
     }
   ],
   "retired": [

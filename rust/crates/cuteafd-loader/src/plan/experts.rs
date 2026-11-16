@@ -229,9 +229,10 @@ pub fn spark_recipe(package: &str, intermediate: usize, world: usize) -> Result<
     if !(exl3 || nvfp4 || mxfp4 || fp8 || bf16 || mxfp8) {
         return Err(SparkRecipeRefusal::UnknownPackage(package.into()));
     }
-    let block = if nvfp4 { 16 } else if mxfp8 { 128 } else if native && mxfp4 {
+    let policy = cuteafd_core::tp_units::native_layout(family, format);
+    let block = if native && mxfp4 {
         cuteafd_core::mxfp4_layouts::ownership_unit(intermediate, world)
-    } else if mxfp4 { 32 } else { 128 };
+    } else { policy.ownership_unit(world) };
     if !(1..=8).contains(&world) || intermediate == 0 || intermediate % block != 0 || intermediate / block < world {
         return Err(SparkRecipeRefusal::GeometryInvalid { intermediate, world, block });
     }
@@ -243,9 +244,10 @@ pub fn spark_recipe(package: &str, intermediate: usize, world: usize) -> Result<
         return Err(SparkRecipeRefusal::Deprecated { package: key.into(), world, worlds });
     }
     let packaged_intermediate = coverage["intermediate"].as_u64().unwrap_or(0) as usize;
-    let required = package_width_keys(intermediate, block, world, exl3, native, nvfp4);
+    let required = package_width_keys(intermediate, block, world, exl3, native, nvfp4 && !policy.exact_storage(world));
     let available = worlds.iter().flat_map(|&count|
-        package_width_keys(packaged_intermediate, block, count, exl3, native, nvfp4))
+        package_width_keys(packaged_intermediate, if native && mxfp4 { block } else { policy.ownership_unit(count) },
+            count, exl3, native, nvfp4 && !policy.exact_storage(count)))
         .collect::<std::collections::BTreeSet<_>>();
     if required.is_empty() || !required.iter().all(|width| available.contains(width)) {
         return Err(SparkRecipeRefusal::MissingPackage { package: key.into(), world });
@@ -260,7 +262,8 @@ pub fn spark_recipe(package: &str, intermediate: usize, world: usize) -> Result<
         cuteafd_core::tp_units::native_spark_artifacts(hidden, intermediate, world)
             .map_err(SparkRecipeRefusal::Placement)?
     } else { Vec::new() };
-    let exact = exl3 || mxfp4 || (!native && (!nvfp4 || intermediate % (128 * world) == 0));
+    let exact = policy.exact_storage(world) || exl3 || mxfp4
+        || (!native && (!nvfp4 || intermediate % (policy.storage_alignment * world) == 0));
     let widths = if compact {
         vec![(intermediate / block).div_ceil(world) * block; world]
     } else if exact {
@@ -283,7 +286,8 @@ pub fn spark_recipe(package: &str, intermediate: usize, world: usize) -> Result<
     } else if exl3 {
         let tag = if compact { "-compact" } else { "" };
         (0..world).map(|rank| format!("tp{world}{tag}-rank{rank}")).collect()
-    } else if exact && widths.iter().any(|width| *width != widths[0]) {
+    } else if exact && (widths.iter().any(|width| *width != widths[0])
+        || policy.exact_storage(world)) {
         let mut unique = widths.clone(); unique.sort_unstable_by(|a, b| b.cmp(a)); unique.dedup();
         unique.into_iter().map(|width| format!("tp{world}-w{width}")).collect()
     } else { vec![format!("tp{world}")] };
@@ -550,6 +554,12 @@ mod tests {
         let nvfp4 = spark_recipe("inkling2:nvfp4a4", 2304, 6).unwrap();
         assert_ne!(mxfp8.slicing, nvfp4.slicing);
         assert!(mxfp8.same_ownership(&nvfp4));
+        let four = spark_recipe(packages, 2304, 4).unwrap();
+        assert_eq!(four.widths, vec![576; 4]);
+        assert_eq!(four.stored_widths, vec![576; 4]);
+        assert_eq!(four.required_layouts, vec!["tp4-w576"]);
+        assert_eq!(four.slicing, crate::formats::fp8_experts::Slicing::Blocks(32));
+        assert_eq!(four.rule, cuteafd_core::tp_units::UnitRule::Contiguous);
         assert_eq!(spark_recipe(packages, 2304, 6).unwrap(), mxfp8);
         assert_eq!(spark_recipe("inkling2:nvfp4a4 + inkling2:mxfp8", 2304, 6).unwrap(), nvfp4);
         assert!(matches!(spark_recipe("inkling2:mxfp8 + unknown:missing", 2304, 6),
