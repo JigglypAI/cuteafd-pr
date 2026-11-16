@@ -1175,7 +1175,7 @@ pub(crate) fn charge_spark_devices(report: &mut PlanReport, model: &dyn super::F
         }
         let family = report.family.as_deref().unwrap_or_default();
         let charged = spark_executions(input, family, options).and_then(|executions|
-            spark_slots::charge_executions(device, input, working, family, &executions));
+            spark_slots::charge_installed_executions(device, input, working, family, &executions, options));
         if let Err(error) = charged {
             report.placement_supported = false;
             notes.push(format!("{}: {error:#}", what(device)));

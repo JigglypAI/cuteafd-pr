@@ -347,8 +347,7 @@ fn mxfp4_owner_bytes(geometry: cuteafd_core::ExpertGeometry,
             scratch = scratch.checked_add(bytes).context("native width scratch sum overflow")?;
         }
     }
-    let waves = cuteafd_core::spark_executions::wave_staging_layout(extent, geometry.hidden * 33 / 32,
-        geometry.topk, 1).context("native staging layout overflow")?;
+    let waves = crate::serving_capacity::spark_waves::staging(extent, geometry)?;
     Ok(cuteafd_core::OwnerBytes { scratch,
         io: u64::from(extent.capacity) * (u64::from(geometry.hidden) * 97 / 32
             + u64::from(geometry.topk) * 8) + waves.plane_bytes + waves.table_bytes,
@@ -416,14 +415,7 @@ pub(crate) fn owner_bytes(input: &super::super::PlanInput, working: &SparkWorkin
             (_, SparkBackend::Exl3(_)) if family == "muse_spark" => muse_owner_bytes(world, extent),
             (_, SparkBackend::Exl3(_)) if family == "mistral_large4" => ml4_owner_bytes(world, extent),
             (_, SparkBackend::Exl3(_)) => exl3_owner_bytes(&family, geometry, extent, segment_width),
-            (_, SparkBackend::Exlr8) => {
-                let mut bytes = legacy_owner_bytes(&family, geometry, extent);
-                let waves = cuteafd_core::spark_executions::wave_staging_layout(extent, geometry.hidden * 33 / 32,
-                    geometry.topk, 1).context("EXLR8 staging layout overflow")?;
-                bytes.io += waves.plane_bytes + waves.table_bytes;
-                bytes.pinned_staging += waves.pinned_per_unit;
-                Ok(bytes)
-            }
+            (_, SparkBackend::Exlr8) => Ok(legacy_owner_bytes(&family, geometry, extent)),
             (_, SparkBackend::Native | SparkBackend::V41 | SparkBackend::Fp8) =>
                 Ok(legacy_owner_bytes(&family, geometry, extent)),
         }
@@ -441,6 +433,30 @@ pub(crate) fn charge_executions(device: &mut DeviceLayout, input: &super::super:
         return crate::families::kimi_k3::spark::charge(device, working.spark_ranks, executions);
     }
     charge_owners(device, executions, owner_bytes(input, working, family, device.index as usize)?)
+}
+
+/// Installed wave programs are part of the same owner, not an extra arena charge.
+pub(crate) fn charge_installed_executions(device: &mut DeviceLayout, input: &super::super::PlanInput,
+    working: &SparkWorkingSet, family: &str, executions: &cuteafd_core::SparkExecutions,
+    options: &LayoutOptions) -> anyhow::Result<()> {
+    if family == "kimi_k3" { return charge_executions(device, input, working, family, executions); }
+    let catalog = input.expert_catalog()?;
+    let backend = crate::plan::spark_executions::SparkBackend::for_catalog(catalog)?;
+    let geometry = catalog.routed_experts().geometry()?;
+    let native = backend.is_native_census() && catalog.nvfp4().is_none();
+    if !native { return charge_executions(device, input, working, family, executions); }
+    let path = options.workspace_manifest.as_deref().unwrap_or_else(|| std::path::Path::new("/opt/cuteafd/share/PROGRAMS.json"));
+    let programs = input.manifest(path)?;
+    let rank = device.index as usize;
+    let widths = if native { mxfp4_rank_artifacts(catalog, working, rank)?.into_iter().map(|a| a.logical).collect::<Vec<_>>() }
+        else { Vec::new() };
+    let bytes = owner_bytes(input, working, family, rank)?;
+    charge_owners(device, executions, |extent| {
+        let mut owner = bytes(extent)?;
+        let scratch = crate::serving_capacity::spark_waves::native_scratch(&programs, extent, geometry, widths.iter().copied())?;
+        owner.scratch = owner.scratch.checked_add(scratch).context("installed wave scratch overflow")?;
+        Ok(owner)
+    })
 }
 
 /// Record the owner sum, crediting only bytes the legacy first-slot residual
@@ -556,7 +572,9 @@ mod tests {
                     let buffered = mxfp4_owner_bytes(geometry, &artifacts, coded,
                         cuteafd_core::OwnerExtent { buffered_units: 3, ..shape })?;
                     assert_eq!(buffered.scratch, total.scratch);
-                    assert_eq!(buffered.io, total.io + 2 * waves.plane_bytes);
+                    let extra = crate::serving_capacity::spark_waves::staging(
+                        cuteafd_core::OwnerExtent { buffered_units: 3, ..shape }, geometry).unwrap();
+                    assert_eq!(buffered.io, total.io + extra.plane_bytes + extra.table_bytes - waves.plane_bytes - waves.table_bytes);
                     assert_eq!(buffered.pinned_staging, total.pinned_staging);
                 }
             }

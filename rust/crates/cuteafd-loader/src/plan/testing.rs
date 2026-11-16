@@ -891,7 +891,25 @@ pub fn write_qwen4_exl3_capacities(dir: &Path, tiers: &str) -> std::path::PathBu
     }
     let programs = share.join("PROGRAMS.json");
     fs::create_dir_all(&share).unwrap();
-    fs::write(&programs, b"{}").unwrap();
+    let mut segment_programs = Vec::new();
+    for (family, geometry) in [("v41", cuteafd_core::ExpertGeometry::DEEPSEEK_V41),
+        ("dsv4f", cuteafd_core::ExpertGeometry::DEEPSEEK_V4_FLASH), ("dsv4p", cuteafd_core::ExpertGeometry::DEEPSEEK_V4_PRO)] {
+        let mut widths = std::collections::BTreeSet::new();
+        for world in 2..=8 {
+            widths.extend(cuteafd_core::tp_units::native_spark_artifacts(geometry.hidden as usize,
+                geometry.intermediate as usize, world).unwrap().into_iter().map(|a| a.logical));
+        }
+        for width in widths {
+            segment_programs.push(json!({"name":format!("native_experts_{family}_w{width}_segments"),
+                "capacity_rows":8192,"pointers":[],"scalars":[{"type":"int32"}],
+                "geometry":{"max_rows":8192,"row_addresses":true,"hidden":geometry.hidden,
+                    "intermediate":width,"experts":geometry.experts,"topk":geometry.topk},
+                "scratch_bytes_at_capacity":{"meta":4096,"pair_row":196608,"pair_pos":196608,
+                    "act":width*128,"grouped_routing":196608,"grouped_route":196608,
+                    "partial":8192u64*u64::from(geometry.topk)*u64::from(geometry.hidden)*4}}));
+        }
+    }
+    fs::write(&programs, serde_json::to_vec(&json!({"programs":segment_programs})).unwrap()).unwrap();
     programs
 }
 

@@ -200,10 +200,16 @@ fn load_weights<'a>(
             .context("native Spark route staging overflow")?;
         let geometry = cuteafd_core::expert_geometry();
         let waves = if nvfp4 { Default::default() } else {
-            cuteafd_core::spark_executions::wave_staging_layout(extent, geometry.hidden * 33 / 32,
-                geometry.topk, 1).context("native staging layout overflow")?
+            cuteafd_loader::serving_capacity::spark_waves::staging(extent, geometry)?
         };
-        Ok((scratch, device - scratch + usize::try_from(waves.plane_bytes + waves.table_bytes)?,
+        let segments = if !nvfp4 && extent.segment_rows().is_some() {
+            let path = config.library.parent().context("native library directory")?.join("../share/PROGRAMS.json");
+            let manifest = serde_json::from_reader(std::fs::File::open(path)?)?;
+            let widths = layers.iter().map(|&layer| config.selection(layer)?.native_shard().map(|shard| shard.width))
+                .collect::<Result<Vec<_>>>()?;
+            cuteafd_loader::serving_capacity::spark_waves::native_scratch(&manifest, extent, geometry, widths)?
+        } else { 0 };
+        Ok((scratch + usize::try_from(segments)?, device - scratch + usize::try_from(waves.plane_bytes + waves.table_bytes)?,
             staging + usize::try_from(waves.pinned_per_unit)?))
     })?;
     let workspace = usize::try_from(workspace.total().context("native Spark workspace overflow")?)?;

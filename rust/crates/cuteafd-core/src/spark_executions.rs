@@ -126,6 +126,20 @@ pub fn wave_staging_layout(extent: OwnerExtent, row_bytes: u32, topk: u32,
     })
 }
 
+/// Manifest-declared scratch planes, packed once at their package capacity.
+/// All users allocate the same aligned views; no payload/arena double charge.
+pub fn wave_scratch_layout<'a>(planes: impl IntoIterator<Item = (&'a str, u64)>) -> Option<(Vec<(String, u64, u64)>, u64)> {
+    let mut end = 0u64;
+    let mut ranges = Vec::new();
+    for (name, bytes) in planes {
+        if bytes == 0 || ranges.iter().any(|(old, _, _)| old == name) { return None; }
+        let offset = end.checked_add(15)?.checked_div(16)?.checked_mul(16)?;
+        end = offset.checked_add(bytes)?;
+        ranges.push((name.to_owned(), offset, bytes));
+    }
+    Some((ranges, end))
+}
+
 /// Device inputs for a segmented owner: per-slot staged rows of `row_bytes`
 /// (the ingress row: FP8 K32, BF16, or a packed wire), sharing the ordinary
 /// plane of `capacity` rows. A separate fallback plane (`sibling_row_bytes`,

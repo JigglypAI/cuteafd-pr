@@ -298,6 +298,14 @@ impl<'a> WaveStaging<'a> {
     pub(crate) fn stage(&mut self, arrival: Arrival<'_, '_>, pending: &mut PendingUnits<'a>,
         routes: &mut dyn UnitRoutes<'a>, stream: *mut c_void, launch: &mut dyn FnMut(&Wave<'_>) -> Result<()>)
         -> Result<bool> {
+        self.stage_with_merge(arrival, pending, routes, stream, launch, true)
+    }
+
+    /// Recipe-ineligible units still stage, but flush on both sides so mixed
+    /// recipes can never share a row-addressed launch.
+    pub(crate) fn stage_with_merge(&mut self, arrival: Arrival<'_, '_>, pending: &mut PendingUnits<'a>,
+        routes: &mut dyn UnitRoutes<'a>, stream: *mut c_void, launch: &mut dyn FnMut(&Wave<'_>) -> Result<()>,
+        merge_eligible: bool) -> Result<bool> {
         let request = arrival.request;
         let rows = request.rows() as usize;
         let Some(stride) = self.stride(request) else {
@@ -305,7 +313,7 @@ impl<'a> WaveStaging<'a> {
             return Ok(false)
         };
         let (input_dtype, output_dtype) = (request.input_dtype(), request.output_dtype());
-        let singleton = rows < self.minimum_rows;
+        let singleton = singleton_boundary(rows, self.minimum_rows, merge_eligible);
         if singleton {
             tracing::debug!(target: "cuteafd::spark_coalesce", rows, reason = "singleton_recipe", "Spark staged boundary");
             self.flush(pending, routes, stream, launch)?;
@@ -357,12 +365,32 @@ impl<'a> WaveStaging<'a> {
     }
 }
 
+fn singleton_boundary(rows: usize, minimum_rows: usize, merge_eligible: bool) -> bool {
+    !merge_eligible || rows < minimum_rows
+}
+
 fn staged_rows_after(staged: &[StagedUnit]) -> usize {
     staged.iter().map(|unit| unit.identity.2 as usize).sum()
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn mixed_recipe_units_flush_before_and_after_the_singleton() {
+        use super::singleton_boundary;
+        // STREAM, slice fallback, STREAM, STREAM: only the last pair can merge.
+        let mut staged = 0;
+        let mut launches = Vec::new();
+        for eligible in [true, false, true, true] {
+            let singleton = singleton_boundary(2752, 1, eligible);
+            if singleton && staged > 0 { launches.push(staged); staged = 0; }
+            staged += 1;
+            if singleton || staged == 2 { launches.push(staged); staged = 0; }
+        }
+        assert_eq!(launches, [1, 1, 2]);
+        assert_eq!(staged, 0);
+    }
+
     #[test]
     fn staging_boundaries_flush_without_waiting_for_stream_idle() {
         let source = include_str!("waves.rs");

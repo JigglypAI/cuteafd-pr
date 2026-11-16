@@ -10,6 +10,25 @@ fn invalid(message: impl Into<String>) -> ManifestError {
     ManifestError(message.into())
 }
 
+fn ordinary_spec(spec: &ProgramSpec) -> Result<Option<ProgramSpec>, ManifestError> {
+    let Some(name) = spec.name.strip_suffix("_segments") else { return Ok(None); };
+    if !["grouped_group", "a16_grouped", "a8_grouped"].iter().any(|suffix| name.ends_with(suffix))
+        || spec.capacity_rows != 8192 || spec.geometry["max_rows"] != 8192
+        || spec.geometry["row_addresses"] != true {
+        return Err(invalid("row-addressed EXLR8 requires named 8192-row grouped ABI"));
+    }
+    let mut ordinary = spec.clone();
+    ordinary.name = name.into();
+    ordinary.capacity_rows = 4096;
+    ordinary.geometry["max_rows"] = 4096.into();
+    ordinary.geometry.as_object_mut().ok_or_else(|| invalid("segment geometry missing"))?.remove("row_addresses");
+    for pointer in &mut ordinary.pointers {
+        if pointer == "input_rows" { *pointer = "x".into(); }
+        if pointer == "output_rows" { *pointer = "output".into(); }
+    }
+    Ok(Some(ordinary))
+}
+
 /// Checkpoint-calibrated expert kernel namespace and numerical contract.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum KernelFamily { Glm, GlmFlash }
@@ -121,6 +140,7 @@ impl KernelFamily {
 
     /// Names identify the numerical contract; shape and clamp never select a fallback.
     pub fn of(spec: &ProgramSpec) -> Result<(Self, KernelKind), ManifestError> {
+        if let Some(ordinary) = ordinary_spec(spec)? { return Self::of(&ordinary); }
         let (family, suffix) = if let Some(suffix) = spec.name.strip_prefix("exlr8_glmf_") {
             (Self::GlmFlash, suffix)
         } else if let Some(suffix) = spec.name.strip_prefix("exlr8_") {
@@ -182,6 +202,7 @@ pub const COMPACT_GROUP_ROWS: usize = 16;
 
 /// Read the route-slot stride from the named export ABI, never a missing-field default.
 pub fn group_rows(spec: &ProgramSpec) -> Result<usize, ManifestError> {
+    if let Some(ordinary) = ordinary_spec(spec)? { return group_rows(&ordinary); }
     let (_, kind) = KernelFamily::of(spec)?;
     let (abi, capacity, grouped) = match kind.arithmetic_kind() {
         KernelKind::Decode | KernelKind::Routed | KernelKind::Shared => (3, 64, false),
@@ -212,6 +233,7 @@ pub fn group_rows(spec: &ProgramSpec) -> Result<usize, ManifestError> {
 }
 
 pub fn validate(spec: &ProgramSpec) -> Result<(), ManifestError> {
+    if let Some(ordinary) = ordinary_spec(spec)? { return validate(&ordinary); }
     let field = |name: &str| {
         spec.geometry[name]
             .as_u64()
@@ -336,6 +358,29 @@ pub fn validate(spec: &ProgramSpec) -> Result<(), ManifestError> {
 }
 
 pub fn validate_entry(spec: &ProgramSpec, entry: &serde_json::Value) -> Result<(), ManifestError> {
+    if let Some(ordinary) = ordinary_spec(spec)? {
+        let mut entry = entry.clone();
+        entry["capacity_rows"] = 4096.into();
+        entry["geometry"] = ordinary.geometry.clone();
+        let pointers = entry["pointers"].as_array_mut().ok_or_else(|| invalid("segment pointer descriptors"))?;
+        for pointer in pointers {
+            match pointer["name"].as_str() {
+                Some("input_rows") if pointer["dtype"] == "int64" && pointer["shape"] == "[rows]" => {
+                    pointer["name"] = "x".into(); pointer["dtype"] = "uint8".into();
+                    let hidden = spec.geometry["hidden"].as_u64().ok_or_else(|| invalid("segment hidden"))?;
+                    pointer["shape"] = format!("[rows,{}]", hidden * 33 / 32).into();
+                }
+                Some("output_rows") if pointer["dtype"] == "int64" && pointer["shape"] == "[rows]" => {
+                    pointer["name"] = "output".into(); pointer["dtype"] = "bfloat16".into();
+                    let hidden = spec.geometry["hidden"].as_u64().ok_or_else(|| invalid("segment hidden"))?;
+                    pointer["shape"] = format!("[rows,{hidden}]").into();
+                }
+                Some("input_rows" | "output_rows") => return Err(invalid("segment row table dtype/shape")),
+                _ => {}
+            }
+        }
+        return validate_entry(&ordinary, &entry);
+    }
     if spec.name.ends_with("_reply_1") || spec.name.ends_with("_reply_2") {
         return validate_reply_entry(spec, entry);
     }

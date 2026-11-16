@@ -214,10 +214,26 @@ impl<'a> Weights<'a> {
             Self::Exlr8(_) => true, _ => false };
         let remaining = if staged {
             let geometry = cuteafd_core::expert_geometry();
-            let waves = cuteafd_core::spark_executions::wave_staging_layout(extent, geometry.hidden * 33 / 32,
-                geometry.topk, 1).context("singleton staging layout overflow")?;
-            remaining.checked_sub(usize::try_from(waves.plane_bytes + waves.table_bytes)?)
-                .context("staged input plane and tables exceed device budget")?
+            let waves = cuteafd_loader::serving_capacity::spark_waves::staging(extent, geometry)?;
+            let segments = match self {
+                Self::Full(weights) if extent.segment_rows().is_some() => {
+                    let path = config.library.parent().context("native library directory")?.join("../share/PROGRAMS.json");
+                    let manifest = serde_json::from_reader(std::fs::File::open(path)?)?;
+                    let widths = weights.iter().map(|weight| weight.layer.native_shard().map(|shard| shard.width))
+                        .collect::<Result<Vec<_>>>()?;
+                    cuteafd_loader::serving_capacity::spark_waves::native_scratch(&manifest, extent, geometry, widths)?
+                }
+                Self::Exlr8(weights) if extent.segment_rows().is_some() && extent.staging_rows > 64 => {
+                    let path = config.library.parent().context("EXLR8 library directory")?.join("../share/PROGRAMS.json");
+                    let manifest = serde_json::from_reader(std::fs::File::open(path)?)?;
+                    let units = weights.iter().map(|weight| weight.layout.compact_unit_limit()).max().context("EXLR8 weights empty")?;
+                    cuteafd_loader::serving_capacity::spark_waves::exlr8_scratch(&manifest, extent, geometry, units,
+                        config.exlr8_prefill_activations)?
+                }
+                _ => 0,
+            };
+            remaining.checked_sub(usize::try_from(waves.plane_bytes + waves.table_bytes + segments)?)
+                .context("staged input plane, tables and merged arena exceed device budget")?
         } else { remaining };
         Ok(match self {
             Self::Exlr8(weights) => Execution::Exlr8(super::exlr8::Worker::new(library,
@@ -225,6 +241,8 @@ impl<'a> Weights<'a> {
             Self::Full(weights) => {
                 let mut execution = ExpertWeights::execution_layers(weights, compiled, config.capacity, remaining)?;
                 execution.install_worker_timing(config.rank)?;
+                execution.prepare_segments(&config.library.parent().context("native library directory")?.join("../share/PROGRAMS.json"),
+                    extent, weights.iter().map(|weight| weight.layer.native_shard().map(|shard| shard.width)).collect::<Result<Vec<_>>>()?.into_iter())?;
                 Execution::Full(execution)
             }
             Self::Exl3(weights) => {

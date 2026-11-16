@@ -46,12 +46,13 @@ enum Variant {
     DecodeGrouped,
     /// 4096-row grouped prefill.
     Prefill,
+    Segments,
 }
 
 
 impl Variant {
     fn owned_units(self) -> bool { self != Self::SharedDecode }
-    fn unit_tables(self) -> bool { matches!(self, Self::DecodeGrouped | Self::Prefill) }
+    fn unit_tables(self) -> bool { matches!(self, Self::DecodeGrouped | Self::Prefill | Self::Segments) }
 }
 
 fn program_names(
@@ -66,6 +67,7 @@ fn program_names(
             Variant::DecodeCompact => ExecutionVariant::DecodeCompact,
             Variant::DecodeGrouped => ExecutionVariant::DecodeGrouped,
             Variant::Prefill => ExecutionVariant::Prefill,
+            Variant::Segments => ExecutionVariant::Segments,
         }
     };
     (variant.program(family, activations), variant.group(family))
@@ -89,6 +91,7 @@ const K1_POINTERS: &[&str] = &[
 
 fn pointers(set: ExpertSet, variant: Variant) -> Vec<&'static str> {
     let mut names = K1_POINTERS.to_vec();
+    if variant == Variant::Segments { names[11] = "output_rows"; }
     if set == ExpertSet::Routed && variant.unit_tables() {
         names.extend(["unit_count", "unit_map"]);
     }
@@ -154,6 +157,7 @@ impl Workspace {
             Variant::DecodeCompact => ExecutionVariant::DecodeCompact,
             Variant::DecodeGrouped => ExecutionVariant::DecodeGrouped,
             Variant::Prefill => ExecutionVariant::Prefill,
+            Variant::Segments => ExecutionVariant::Segments,
         };
         let layout = execution_workspace(spec, rows, set, variant, unit_limit, activations)?;
         Ok(Self { ranges: layout.ranges, bytes: layout.bytes, rows: layout.rows,
@@ -307,7 +311,7 @@ impl<'a> Exlr8Execution<'a> {
         let (k1_name, group_name) = program_names(family, set, variant, activations);
         let k1 = programs.program(k1_name, &pointers(set, variant))?;
         let prefix = match family { KernelFamily::Glm => "exlr8", KernelFamily::GlmFlash => "exlr8_glmf" };
-        let (reply, reply_core, reply_epilogue) = if set == ExpertSet::Routed
+        let (reply, reply_core, reply_epilogue) = if variant != Variant::Segments && set == ExpertSet::Routed
             && programs.contains(&format!("{prefix}_a16_serving_core")) {
             if variant == Variant::DecodeCompact {
                 let core = programs.program(&format!("{prefix}_a16_serving_core"), &pointers(set, variant))?;
@@ -331,7 +335,7 @@ impl<'a> Exlr8Execution<'a> {
             group_name,
             &[
                 "ids",
-                "x",
+                if variant == Variant::Segments { "input_rows" } else { "x" },
                 "signs_in",
                 "group_expert",
                 "route_slots",
@@ -493,6 +497,38 @@ impl<'a> Exlr8Execution<'a> {
             "EXLR8 fused reply buffer mismatch");
         // SAFETY: checked exclusive output, same retained sources as the BF16 path.
         unsafe { self.run_to(weights, rows, Some((index, output)), None, stream) }
+    }
+
+    pub(crate) fn segment_workspace_bytes(programs: &'a Programs<'a>, family: KernelFamily,
+        rows: usize, unit_limit: usize, activations: Exlr8PrefillActivations) -> Result<usize> {
+        Self::workspace_bytes_for(programs, family, rows, ExpertSet::Routed, Variant::Segments, unit_limit, activations)
+    }
+
+    pub(crate) fn new_segments(library: &'a NativeLibrary, programs: &'a Programs<'a>, family: KernelFamily,
+        rows: usize, available: usize, unit_limit: usize, activations: Exlr8PrefillActivations) -> Result<Self> {
+        Self::new_for(library, programs, family, rows, available, ExpertSet::Routed, Variant::Segments, unit_limit, activations)
+    }
+
+    /// # Safety
+    /// Caller retains row tables, staged routes, weights and workspace until every member fence.
+    pub(crate) unsafe fn run_segments(&self, weights: &Exlr8Weights<'_>, wave: &super::super::execution::waves::Wave<'_>,
+        stream: *mut c_void) -> Result<()> {
+        // SAFETY: retained row tables and arena views match the validated segment ABI.
+        unsafe {
+            self.group.launch(&[wave.ids.ptr, wave.input.ptr, weights.signs(false)?.ptr,
+                self.buffer(4)?.ptr, self.buffer(5)?.ptr, self.buffer(6)?.ptr, self.buffer(7)?.ptr, self.buffer(10)?.ptr],
+                &[Scalar::I32(wave.rows.try_into()?), Scalar::I32(self.group_cta_limit)], stream)?;
+            let intermediate = view(self.buffer(9)?, 0, self.intermediate_bytes)?;
+            let fc2 = view(self.buffer(9)?, self.intermediate_bytes, self.buffer(9)?.bytes - self.intermediate_bytes)?;
+            let units = weights.compact()?;
+            self.k1.launch(&[self.buffer(10)?.ptr, weights.pointers()?.ptr, weights.bits()?.ptr,
+                self.buffer(4)?.ptr, self.buffer(5)?.ptr, self.buffer(6)?.ptr, wave.weights.ptr, self.buffer(8)?.ptr,
+                intermediate.ptr, fc2.ptr, weights.signs(true)?.ptr, wave.output.ptr, self.buffer(7)?.ptr,
+                units[0].ptr, units[1].ptr],
+                &[Scalar::I32(wave.rows.try_into()?), Scalar::I32(self.cta_limit), Scalar::I32(self.layout.unit_limit.try_into()?),
+                    Scalar::I32(self.l2_bytes)], stream)?;
+        }
+        Ok(())
     }
 
     /// # Safety

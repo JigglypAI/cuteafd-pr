@@ -354,7 +354,7 @@ pub fn execution_workspace_layout(
     fc1_scratch: usize, intermediate_scratch: usize, fc2_scratch: usize,
     set: ExpertSet,
 ) -> anyhow::Result<([(usize, usize); 11], usize)> {
-    ensure!(matches!((max_rows, group_rows), (64, 16) | (4096, 16 | 32 | 64))
+    ensure!(matches!((max_rows, group_rows), (64, 16) | (4096 | 8192, 16 | 32 | 64))
         && (max_rows == 64 || set == ExpertSet::Routed)
         && rows > 0 && rows <= max_rows && hidden > 0 && hidden % 128 == 0
         && top_k > 0 && max_groups > 0,

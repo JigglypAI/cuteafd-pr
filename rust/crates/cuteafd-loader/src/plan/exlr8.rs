@@ -18,7 +18,7 @@ use super::format::{
 pub mod residency;
 pub mod dense;
 pub mod native;
-mod workspace;
+pub(crate) mod workspace;
 pub use workspace::{execution_workspace_from_manifest, execution_workspace, routed_workspace, shared_execution_workspace, shared_workspace, ExecutionVariant, ExecutionWorkspace};
 
 /// Native selection is distinct from the ordinary GLM launch description.
@@ -259,6 +259,28 @@ pub(super) fn native_plan_of(input: &super::PlanInput, selected: &str,
                 | cuteafd_core::memory_layout::Category::Embedding | cuteafd_core::memory_layout::Category::Experts)).map(|i| i.bytes).sum())]);
     let mut memory = memory;
     append_spark_devices(&mut memory, layout, &residents)?;
+    if selected_world > 0 {
+        let executions = super::layout::spark_executions(input, family.id(), layout)?;
+        let geometry = input.expert_catalog()?.routed_experts().geometry()?;
+        for device in memory.devices.iter_mut().filter(|device| device.kind == cuteafd_core::memory_layout::DeviceKind::Spark) {
+            let rank = device.index as usize;
+            let units = (first_spark..layers).map(|layer| metadata.admission_geometry(layer, selected_world, rank,
+                residency::ExpertSet::Routed).map(|(_, units)| units)).collect::<std::result::Result<Vec<_>, _>>()?
+                .into_iter().max().unwrap_or(1);
+            let waves = executions.workspace_bytes(|extent| -> Result<cuteafd_core::OwnerBytes> {
+                let staging = crate::serving_capacity::spark_waves::staging(extent, geometry)?;
+                Ok(cuteafd_core::OwnerBytes {
+                    scratch: crate::serving_capacity::spark_waves::exlr8_scratch(&programs, extent, geometry,
+                        units, layout.exlr8_prefill_activations)?,
+                    io: staging.plane_bytes + staging.table_bytes, pinned_staging: staging.pinned_per_unit,
+                })
+            })?.context("EXLR8 wave owner sum overflow")?;
+            device.items.retain(|item| item.group != "merged expert waves");
+            device.items.push(cuteafd_core::memory_layout::Item::new(cuteafd_core::memory_layout::Category::Workspace,
+                "merged expert waves", "manifest-sized arena, staged inputs, route/address tables and pinned descriptors",
+                waves.total().context("EXLR8 wave owner bytes overflow")?, cuteafd_core::memory_layout::Basis::Exact));
+        }
+    }
     append_spark_encoder(&mut memory, report.encoder.as_ref())?;
     let context = if layout.context_tokens > 0 { layout.context_tokens } else {
         report.cache_requirements.as_ref().and_then(|cache| cache.checkpoint_max_context_tokens).unwrap_or(0) };

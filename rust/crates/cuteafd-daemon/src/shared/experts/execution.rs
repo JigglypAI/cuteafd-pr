@@ -9,6 +9,7 @@ use cuteafd_ffi::{
 use std::ffi::c_void;
 pub(crate) mod timing;
 pub(crate) mod waves;
+mod native_waves;
 mod grouping;
 pub(crate) use grouping::{ExpertGroupingError, InstalledExpertGrouping};
 use timing::ExpertTiming;
@@ -158,6 +159,7 @@ pub(crate) struct ExpertExecution<'weights, 'library> {
     live_capacity: u32,
     budget: ExpertExecutionBudget,
     waves: Option<waves::WaveStaging<'library>>,
+    segments: Option<native_waves::NativeSegments<'library>>,
     staged_plane: Option<DeviceAllocation<'library>>,
     timing_units: std::collections::VecDeque<bool>,
 }
@@ -383,7 +385,7 @@ impl<'library> ExpertWeights<'library> {
             alternate_widths: Vec::new(),
             live_capacity: live,
             budget,
-            waves: None, staged_plane: None, timing_units: Default::default(),
+            waves: None, segments: None, staged_plane: None, timing_units: Default::default(),
         })
     }
 }
@@ -428,6 +430,7 @@ impl<'weights, 'library> ExpertExecution<'weights, 'library> {
     /// Rebind uncaptured launch arguments; the stream orders shared workspace use.
     /// Captured graphs retain weight addresses and cannot be rebound.
     pub fn bind_layer(&mut self, weights: &'weights ExpertWeights<'library>) -> Result<()> {
+        if self._weights.layer != weights.layer { self.flush_staged()?; }
         ensure!(
             std::ptr::eq(self.library, weights.buffers[0].library),
             "expert layer belongs to a different native library"
@@ -578,16 +581,25 @@ impl<'weights, 'library> ExpertExecution<'weights, 'library> {
         Ok(report)
     }
 
+    pub(crate) fn prepare_segments(&mut self, path: &std::path::Path, extent: cuteafd_core::OwnerExtent,
+        widths: impl Iterator<Item = usize>) -> Result<()> {
+        if !self._weights.is_nvfp4() && extent.segment_rows().is_some() {
+            self.segments = Some(native_waves::NativeSegments::load(self.library, path, widths)?);
+        }
+        Ok(())
+    }
+
     pub(crate) fn prepare_waves(&mut self, extent: cuteafd_core::OwnerExtent) -> Result<()> {
         if self._weights.is_nvfp4() { return Ok(()); }
         let geometry = cuteafd_core::expert_geometry();
         let row = self.kernel.info().input_row_bytes()?;
-        let layout = cuteafd_core::spark_executions::wave_staging_layout(extent, row.try_into()?, geometry.topk, 1)
+        let max_units = if extent.buffered_units > 1 { cuteafd_core::spark_executions::MAX_MERGED_UNITS } else { 1 };
+        let layout = cuteafd_core::spark_executions::wave_staging_layout(extent, row.try_into()?, geometry.topk, max_units)
             .context("native staging layout overflow")?;
         if layout.rows == 0 { return Ok(()); }
         let plane = DeviceAllocation::new(self.library, layout.plane_bytes.try_into()?,
             crate::shared::memory::Tag::workspace("experts/workspace/staged_units"))?;
-        self.waves = waves::WaveStaging::with_max_units(self.library, extent, plane.buffer, row, 1, 1)?;
+        self.waves = waves::WaveStaging::with_max_units(self.library, extent, plane.buffer, row, 1, max_units)?;
         self.staged_plane = Some(plane);
         self.timing_units = std::collections::VecDeque::with_capacity(extent.buffered_units as usize);
         Ok(())
@@ -600,49 +612,47 @@ impl<'weights, 'library> ExpertExecution<'weights, 'library> {
     }
 
     pub(crate) fn flush_staged(&mut self) -> Result<()> {
-        // The singleton cap flushes during stage, before this layer can rebind.
-        ensure!(!self.has_staged(), "native singleton wave was not flushed at submission");
+        self.dispatch_waves(None, false)?;
         Ok(())
     }
 
     fn stage(&mut self, request: &cuteafd_transport::expert::BackboneRequest<'_>, input: CuteafdDeviceBuffer,
         output: CuteafdDeviceBuffer, executor_id: u64) -> Result<bool> {
-        let Some(waves) = &mut self.waves else { return Ok(false); };
-        if request.partial_plan()?.is_some() { waves.bypass(request.rows(), waves::Bypass::PartialReply); return Ok(false); }
-        if request.output_dtype() != cuteafd_transport::ExpertV2Dtype::Bf16 {
-            waves.bypass(request.rows(), waves::Bypass::CompressedReply); return Ok(false);
+        if self.waves.is_none() { return Ok(false); }
+        if request.partial_plan()?.is_some() {
+            self.flush_staged()?;
+            self.waves.as_mut().unwrap().bypass(request.rows(), waves::Bypass::PartialReply);
+            return Ok(false);
         }
-        let (kernel, slots, _) = Self::select_state(request.rows(), &self.kernel, &self.slots, &self.scratch,
-            &self.decode, &self.small, &self.reduction_plan)?;
-        let stream = self.stream.as_ref().context("native staged worker needs an owned stream")?.raw;
-        let reducer = self.compact_reducer.as_ref().context("native staged worker needs compact output")?;
-        let timing = &self.worker_timing;
-        let timing_units = &mut self.timing_units;
-        waves.stage(waves::Arrival { request, input, output, layer: request.layer() as usize, executor_id },
-            &mut self.pending, &mut self.route_staging, stream,
-            &mut |wave| {
-                ensure!(!wave.segmented && wave.members.len() == 1, "native worker only stages singleton waves");
-                let mut pointers = *slots;
-                pointers[0] = wave.input.ptr;
-                pointers[1] = wave.ids.ptr;
-                pointers[2] = wave.weights.ptr;
-                // SAFETY: the staging owner retains all inputs, routes, scratch and the mapped reply through its fence.
-                unsafe {
-                    if let Some(timing) = timing { timing.record(0, stream)?; }
-                    kernel.launch(&V41ExpertLaunchArgs::new(kernel.info(), pointers, wave.rows as u32, stream)?)?;
-                    match kernel.output_kind() {
-                        cuteafd_ffi::V41ExpertOutputKind::Fp32Tokens =>
-                            reducer.compact_tokens(slots[41].cast(), wave.output.ptr.cast(), wave.rows as u32, stream)?,
-                        cuteafd_ffi::V41ExpertOutputKind::Bf16Routes =>
-                            reducer.compact_bf16_routes(slots[41].cast(), wave.output.ptr.cast(), wave.rows as u32, stream)?,
-                        cuteafd_ffi::V41ExpertOutputKind::Fp32Routes =>
-                            reducer.compact(slots[41].cast(), wave.output.ptr.cast(), wave.rows as u32, stream)?,
-                    }
-                    if let Some(timing) = timing { timing.record(1, stream)?; }
-                }
-                timing_units.push_back(true);
-                Ok(())
-            })
+        if request.output_dtype() != cuteafd_transport::ExpertV2Dtype::Bf16 {
+            self.flush_staged()?;
+            self.waves.as_mut().unwrap().bypass(request.rows(), waves::Bypass::CompressedReply);
+            return Ok(false);
+        }
+        let (kernel, _, _) = self.execution_state(request.rows())?;
+        let recipe = self.library.native_expert_reduction(&kernel.info())?;
+        let eligible = recipe.implementation == 2 && self.segments.is_some();
+        self.dispatch_waves(Some(waves::Arrival { request, input, output,
+            layer: request.layer() as usize, executor_id }), eligible)
+    }
+
+    fn dispatch_waves(&mut self, arrival: Option<waves::Arrival<'_, '_>>, merge: bool) -> Result<bool> {
+        let stream = self.stream();
+        let Some(waves) = &mut self.waves else { return Ok(false); };
+        let mut launch = native_waves::NativeWaveLaunch {
+            kernel: &self.kernel, slots: &self.slots, scratch: &self.scratch, decode: &self.decode,
+            small: &self.small, reduction: &self.reduction_plan,
+            reducer: self.compact_reducer.as_ref().context("native staged worker needs compact output")?,
+            segments: &self.segments, timing: &self.worker_timing, timing_units: &mut self.timing_units,
+            stream, width: self.kernel.info().logical_intermediate as usize, weights: self._weights.buffers.each_ref().map(|w| w.buffer.ptr),
+        };
+        if let Some(arrival) = arrival {
+            waves.stage_with_merge(arrival, &mut self.pending, &mut self.route_staging, stream,
+                &mut |wave| launch.launch(wave), merge)
+        } else {
+            waves.flush(&mut self.pending, &self.route_staging, stream, &mut |wave| launch.launch(wave))?;
+            Ok(false)
+        }
     }
 
     /// Leave mapped requests queued at return (see `deferred`).

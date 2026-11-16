@@ -5,7 +5,7 @@ use cuteafd_ffi::{exlr8::{KernelFamily, KernelKind}, programs::ProgramSpec};
 use serde_json::Value;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ExecutionVariant { SharedDecode, DecodeCompact, DecodeGrouped, Prefill }
+pub enum ExecutionVariant { SharedDecode, DecodeCompact, DecodeGrouped, Prefill, Segments }
 
 impl ExecutionVariant {
     pub fn program(self, family: KernelFamily, activations: PrefillActivations) -> &'static str {
@@ -13,6 +13,12 @@ impl ExecutionVariant {
             Self::SharedDecode => KernelKind::Shared,
             Self::DecodeCompact => KernelKind::Routed,
             Self::DecodeGrouped => KernelKind::GroupedDecode,
+            Self::Segments => return match (family, activations) {
+                (KernelFamily::Glm, PrefillActivations::A16) => "exlr8_a16_grouped_segments",
+                (KernelFamily::Glm, PrefillActivations::A8) => "exlr8_a8_grouped_segments",
+                (KernelFamily::GlmFlash, PrefillActivations::A16) => "exlr8_glmf_a16_grouped_segments",
+                (KernelFamily::GlmFlash, PrefillActivations::A8) => "exlr8_glmf_a8_grouped_segments",
+            },
             Self::Prefill => match activations {
                 PrefillActivations::A16 => KernelKind::GroupedA16,
                 PrefillActivations::A8 => KernelKind::GroupedA8,
@@ -25,6 +31,8 @@ impl ExecutionVariant {
             Self::SharedDecode => KernelKind::SharedGroup,
             Self::DecodeCompact | Self::DecodeGrouped => KernelKind::Group,
             Self::Prefill => KernelKind::GroupedGroup,
+            Self::Segments => return match family { KernelFamily::Glm => "exlr8_grouped_group_segments",
+                KernelFamily::GlmFlash => "exlr8_glmf_grouped_group_segments" },
         })
     }
 }
@@ -99,7 +107,7 @@ pub fn execution_workspace(spec: &ProgramSpec, rows: usize, set: ExpertSet,
     ensure!(spec.name == variant.program(family, activations) && spec.geometry["abi_version"] == 3,
         "EXLR8 execution requires fused rotation ABI v3");
     ensure!(rows > 0 && rows <= spec.capacity_rows as usize, "EXLR8 rows outside admitted K1 capacity");
-    ensure!(variant != ExecutionVariant::Prefill || rows > cuteafd_core::expert_geometry::EXLR8_EXECUTION_ROWS,
+    ensure!(!matches!(variant, ExecutionVariant::Prefill | ExecutionVariant::Segments) || rows > cuteafd_core::expert_geometry::EXLR8_EXECUTION_ROWS,
         "EXLR8 prefill instance is only admitted above the K1 row limit");
     let dimension = |name| -> Result<usize> {
         usize::try_from(spec.geometry[name].as_u64().context("missing K1 geometry")?)
@@ -110,13 +118,13 @@ pub fn execution_workspace(spec: &ProgramSpec, rows: usize, set: ExpertSet,
     let max_groups = dimension("max_groups")?;
     let units = dimension("units")?;
     let compact = set == ExpertSet::Routed;
-    let unit_tables = matches!(variant, ExecutionVariant::DecodeGrouped | ExecutionVariant::Prefill);
+    let unit_tables = matches!(variant, ExecutionVariant::DecodeGrouped | ExecutionVariant::Prefill | ExecutionVariant::Segments);
     ensure!(!compact || (1..=units).contains(&unit_limit), "invalid compact unit limit");
     let scratch = |name: &str| -> Result<usize> {
         let bytes = usize::try_from(*spec.scratch.get(name).context("missing K1 scratch")?)?;
         let owned = match variant {
             ExecutionVariant::DecodeCompact => name == "fc1",
-            ExecutionVariant::DecodeGrouped | ExecutionVariant::Prefill => name != "fc2",
+            ExecutionVariant::DecodeGrouped | ExecutionVariant::Prefill | ExecutionVariant::Segments => name != "fc2",
             ExecutionVariant::SharedDecode => false,
         };
         if compact && owned {
@@ -132,7 +140,7 @@ pub fn execution_workspace(spec: &ProgramSpec, rows: usize, set: ExpertSet,
         unit_limit: if compact { unit_limit } else { units }, intermediate_bytes, compact, unit_tables })
 }
 
-pub(super) fn program_spec(programs: &Value, name: &str) -> Result<ProgramSpec> {
+pub(crate) fn program_spec(programs: &Value, name: &str) -> Result<ProgramSpec> {
     let entries = programs["programs"].as_array().context("PROGRAMS.json programs must be an array")?;
     let matches = entries.iter().filter(|entry| entry["name"] == name).collect::<Vec<_>>();
     ensure!(matches.len() == 1, "PROGRAMS.json requires one {name}");
@@ -212,7 +220,7 @@ mod tests {
 
     fn entry(variant: ExecutionVariant, activations: PrefillActivations) -> Value {
         let prefill = variant == ExecutionVariant::Prefill;
-        let grouped = matches!(variant, ExecutionVariant::DecodeGrouped | ExecutionVariant::Prefill);
+        let grouped = matches!(variant, ExecutionVariant::DecodeGrouped | ExecutionVariant::Prefill | ExecutionVariant::Segments);
         let (rows, groups) = if prefill { (4096u64, 4096u64) } else { (64, 512) };
         let mut pointers = vec!["x", "pointers", "bits", "group_expert", "route_slots", "route_group_lane",
             "route_weights", "fc1", "intermediate", "fc2", "signs_out", "output", "group_count"];
