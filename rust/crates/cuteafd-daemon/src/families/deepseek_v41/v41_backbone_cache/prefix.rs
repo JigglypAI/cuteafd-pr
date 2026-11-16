@@ -226,12 +226,18 @@ impl<'a> BackboneCache<'a> {
             let mut new_windows = Vec::with_capacity(windows.len());
             let mut new_sources = Vec::with_capacity(sources.len());
             for (state, old) in self.windows.iter_mut().zip(windows) {
-                state.release(old)?;
-                new_windows.push(state.begin_request(lease.slot, id)?);
+                let device = state.device;
+                new_windows.push(device.run(|| {
+                    state.release(old)?;
+                    state.begin_request(lease.slot, id)
+                })?);
             }
             for (state, old) in self.sources.iter_mut().zip(sources) {
-                state.release(old)?;
-                new_sources.push(state.begin_request(lease.slot, id)?);
+                let device = state.device;
+                new_sources.push(device.run(|| {
+                    state.release(old)?;
+                    state.begin_request(lease.slot, id)
+                })?);
             }
             Ok((new_windows, new_sources))
         })();
@@ -243,7 +249,7 @@ impl<'a> BackboneCache<'a> {
         request.windows = windows.try_into().ok().expect("40 windows");
         request.sources = sources.try_into().ok().expect("four sources");
         request.end = 0;
-        request.version += 1;
+        request.version = 0;
         request.phase = CachePhase::Full;
         request.publication.clear();
         Ok(())
@@ -486,6 +492,7 @@ mod rollback_tests {
             assert_eq!(state.committed_end(lease)?, 0);
             assert_eq!(state.binding(lease)?.1, 0);
         }
+        bank.begin_encoder(lease, 1173)?;
         bank.release(&[lease, fresh])?;
         Ok(())
     }

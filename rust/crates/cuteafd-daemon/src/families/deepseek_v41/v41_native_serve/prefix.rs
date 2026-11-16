@@ -208,6 +208,12 @@ impl<'a, C: DraftChain<'a>> PrefixFamily<V41Meta> for V41Prefix<'_, 'a, '_, C> {
     fn bind(&self, placement: &mut V41Placement) -> Result<(), BoxError> {
         self.bind_units(placement, 0).map_err(boxed)
     }
+    fn quarantine(&self, placement: &mut V41Placement) {
+        self.requests.borrow_mut().detach_prefix_units(placement.lease);
+    }
+    fn placement_slot(&self, placement: &V41Placement) -> Option<usize> {
+        self.requests.borrow().slot_index(placement.lease).ok()
+    }
     fn discard(&self, placement: &mut V41Placement) -> Result<(), BoxError> {
         self.requests.borrow_mut().discard_prefix(placement.lease).map_err(boxed)?;
         if let (Some(id), Some(draft)) = (placement.draft, self.draft.borrow_mut().as_deref_mut()) {

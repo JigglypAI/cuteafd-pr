@@ -857,6 +857,32 @@ fn a_failed_discard_stops_admission_and_quarantines_its_pages() {
 }
 
 #[test]
+fn failed_restore_drain_stops_admission_and_keeps_pages_quarantined() {
+    let fake = Fake::new(32, 4, 4);
+    let mut cache = cache(&fake, 4, 0);
+    let (_, _, original) = serve(&mut cache, &fake, 0, &seq(100, 20), &[], 24);
+    cache.release(&fake, &original.pages).unwrap();
+    let free = cache.pool().free();
+    fake.fail_restore.set(true);
+    fake.fail_drain.set(true);
+    let builds = Cell::new(0);
+    let result = cache.admit(&fake, &seq(100, 21), 24, false, |pages| {
+        builds.set(builds.get() + 1);
+        Placement { pages, ring: 1, len: 0, ring_from: 0 }
+    });
+    assert!(matches!(result, Err(super::cache::PrefixError::Rollback { .. })));
+    assert_eq!(builds.get(), 1);
+    assert_eq!(cache.stats().quarantined, 1);
+    assert!(cache.pool().free() < free);
+    // A later successful drain does not silently recycle an unknown binding. Restart
+    // destroys the cache; until then gauges continue to expose the lost capacity.
+    fake.fail_drain.set(false);
+    cache.clear(&fake).unwrap();
+    assert!(cache.pool().free() < cache.pool().capacity());
+    assert_eq!(cache.stats().quarantined, 1);
+}
+
+#[test]
 fn disabled_cache_is_a_plain_allocator() {
     let fake = Fake::new(8, 2, 0);
     let mut cache = cache(&fake, 0, 1 << 20);

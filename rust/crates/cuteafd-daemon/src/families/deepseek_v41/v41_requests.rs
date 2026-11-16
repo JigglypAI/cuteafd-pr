@@ -344,16 +344,12 @@ impl<'a> Requests<'a> {
         self.request(lease)?;
         Ok(&self.units[lease_slot(&self.slots, lease)?])
     }
-    /// Forget a live request's units without releasing them: the prefix engine already owns
-    /// their references (it abandons a placement whose restore failed).
-    pub fn take_units(&mut self, lease: CacheLease) -> Vec<u32> {
-        lease_slot(&self.slots, lease).map(|slot| std::mem::take(&mut self.units[slot])).unwrap_or_default()
+    /// Host-only detachment: quarantined engine references must never enter released_units.
+    pub fn detach_prefix_units(&mut self, lease: CacheLease) {
+        if let Ok(slot) = lease_slot(&self.slots, lease) { self.units[slot].clear(); }
     }
-    /// Drop a released request's queued units (the prefix engine releases them itself).
-    pub fn forget_released_units(&mut self, units: &[u32]) {
-        if let Some(i) = self.released_units.iter().rposition(|queued| queued == units) {
-            self.released_units.swap_remove(i);
-        }
+    pub fn slot_index(&self, lease: CacheLease) -> Result<usize> {
+        lease_slot(&self.slots, lease)
     }
     /// Units of released requests, for the prefix engine to unreference (after it drains).
     pub fn take_released_units(&mut self) -> Vec<Vec<u32>> {

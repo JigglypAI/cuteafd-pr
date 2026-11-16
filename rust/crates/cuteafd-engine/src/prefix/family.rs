@@ -323,6 +323,17 @@ pub trait PrefixFamily<M: Clone + Default = ()> {
         let _ = placement;
         Ok(())
     }
+    /// Detach host-only ownership after a fatal rollback, without touching device state.
+    /// The cache keeps the page references quarantined; later caller cleanup must not release
+    /// those same references through a family-owned retirement queue.
+    fn quarantine(&self, placement: &mut Self::Placement) {
+        let _ = placement;
+    }
+    /// Optional request slot for fatal-rollback diagnostics (never used for ownership).
+    fn placement_slot(&self, placement: &Self::Placement) -> Option<usize> {
+        let _ = placement;
+        None
+    }
     /// The cache abandons a bound placement whose restore failed (its pages go back to the pool
     /// once the family drained): reset whatever `bind` and a partial restore installed.
     /// Success leaves the caller's slot/lease ready for a fresh cold placement, even after a
