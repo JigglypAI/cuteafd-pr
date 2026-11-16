@@ -6874,3 +6874,22 @@ fn unreadable_quantization_metadata_does_not_fit() {
     assert!(report.memory_layout.is_none());
     assert!(!report.executable());
 }
+
+
+#[test]
+fn missing_native_wave_program_is_a_named_unsupported_result() {
+    let dir = v4_snapshot();
+    let manifest = dir.path().join("missing-wave.json");
+    std::fs::write(&manifest, json!({"programs":[]}).to_string()).unwrap();
+    let options = PlanOptions { layout: Some(layout::LayoutOptions {
+        host_memory: Some(SimulatedHost::raptor().host_ram),
+        workspace_manifest: Some(manifest), rtx_bytes: vec![crate::placement::inventory::PRO_TOTAL_BYTES],
+        onboard: Some(crate::placement::OnboardSetting::Layers(0)),
+        context_tokens: 32768, pool_tokens: Some(32768), ..Default::default()
+    }), ..sparks(2) };
+    let report = plan_spark_count(dir.path(), &options, 2, Some(2)).unwrap();
+    assert!(!report.wip_launchable());
+    let reasons = report.hints.iter().map(|h| h.what.as_str()).collect::<Vec<_>>().join("; ");
+    assert!(reasons.contains("missing native_experts_dsv4f_w1024_segments in PROGRAMS.json; republish placement inputs"), "{reasons}");
+    assert!(!reasons.contains("checkpoint tensors or required package artifacts unavailable"), "{reasons}");
+}

@@ -263,10 +263,11 @@ fn assert_equal(shared: &Shared, case: &Case<'_>, label: &str) -> Placement {
 
 fn synthetic(dir: &Path) -> PathBuf {
     cuteafd_loader::plan::testing::write_v4_snapshot(dir);
-    let manifest = serde_json::json!({"capacities": {"prefill_rows": 4096, "decode_rows": 64, "max_context": 1048576},
+    let mut manifest = serde_json::json!({"capacities": {"prefill_rows": 4096, "decode_rows": 64, "max_context": 1048576},
         "programs": [{"family": "dsv4f", "name": "dsv4f_sparse_mla_decode_c128_m64", "params": {"indexed_width": 8192}},
             {"name": "dsv4f_index_topk_decode_m64", "scratch_bytes_at_capacity": {"scratch": 8653824}},
             {"name": "dsv4f_index_topk_prefill_m4096", "scratch_bytes_at_capacity": {"scratch": 558007296}}]});
+    cuteafd_loader::plan::testing::append_native_segment_programs(&mut manifest);
     let path = dir.join("PROGRAMS.json");
     std::fs::write(&path, manifest.to_string()).unwrap();
     path

@@ -96,6 +96,8 @@ impl BudgetedPlanInput {
         { options.inventory_host_memory = Some(self.host.host_ram); }
         if let Some(layout) = &mut options.layout {
             layout.host_memory.get_or_insert(self.host.host_ram);
+            let manifest = self.checkpoint().snapshot.join("share/PROGRAMS.json");
+            if layout.workspace_manifest.is_none() && manifest.is_file() { layout.workspace_manifest = Some(manifest); }
         }
         let (result, phases) = self.input.plan_with_timings(&options);
         eprintln!("full-plan {:?} ranks={} phases={phases:?}", self.checkpoint().snapshot, options.placement.spark_ranks());
@@ -891,25 +893,7 @@ pub fn write_qwen4_exl3_capacities(dir: &Path, tiers: &str) -> std::path::PathBu
     }
     let programs = share.join("PROGRAMS.json");
     fs::create_dir_all(&share).unwrap();
-    let mut segment_programs = Vec::new();
-    for (family, geometry) in [("v41", cuteafd_core::ExpertGeometry::DEEPSEEK_V41),
-        ("dsv4f", cuteafd_core::ExpertGeometry::DEEPSEEK_V4_FLASH), ("dsv4p", cuteafd_core::ExpertGeometry::DEEPSEEK_V4_PRO)] {
-        let mut widths = std::collections::BTreeSet::new();
-        for world in 2..=8 {
-            widths.extend(cuteafd_core::tp_units::native_spark_artifacts(geometry.hidden as usize,
-                geometry.intermediate as usize, world).unwrap().into_iter().map(|a| a.logical));
-        }
-        for width in widths {
-            segment_programs.push(json!({"name":format!("native_experts_{family}_w{width}_segments"),
-                "capacity_rows":8192,"pointers":[],"scalars":[{"type":"int32"}],
-                "geometry":{"max_rows":8192,"row_addresses":true,"hidden":geometry.hidden,
-                    "intermediate":width,"experts":geometry.experts,"topk":geometry.topk},
-                "scratch_bytes_at_capacity":{"meta":4096,"pair_row":196608,"pair_pos":196608,
-                    "act":width*128,"grouped_routing":196608,"grouped_route":196608,
-                    "partial":8192u64*u64::from(geometry.topk)*u64::from(geometry.hidden)*4}}));
-        }
-    }
-    fs::write(&programs, serde_json::to_vec(&json!({"programs":segment_programs})).unwrap()).unwrap();
+    fs::write(&programs, b"{}").unwrap();
     programs
 }
 
@@ -1072,6 +1056,11 @@ fn write_v4_snapshot_format(path: &Path, stages: usize, pro: bool, exl3_experts:
     write_snapshot(path, &hf, &tensors, None);
     std::fs::create_dir_all(path.join("inference")).unwrap();
     std::fs::write(path.join("inference/config.json"), serde_json::to_vec(&args).unwrap()).unwrap();
+    if !exl3_experts {
+        std::fs::create_dir_all(path.join("share")).unwrap();
+        std::fs::write(path.join("share/PROGRAMS.json"), serde_json::to_vec(&json!({
+            "programs":native_segment_programs()})).unwrap()).unwrap();
+    }
 }
 
 /// Complete native coordinator operands; routed experts are added separately.
@@ -1138,12 +1127,43 @@ pub fn write_v41_exl3_snapshot(dir: &Path, bits: usize) {
     write_v41_snapshot_format(dir, false, Some(bits));
 }
 
+/// Manifest-only native segment inventory for synthetic planner snapshots.
+pub fn native_segment_programs() -> Vec<Value> {
+    let mut segment_programs = Vec::new();
+    for (family, geometry) in [("v41", cuteafd_core::ExpertGeometry::DEEPSEEK_V41),
+        ("dsv4f", cuteafd_core::ExpertGeometry::DEEPSEEK_V4_FLASH), ("dsv4p", cuteafd_core::ExpertGeometry::DEEPSEEK_V4_PRO)] {
+        let mut widths = std::collections::BTreeSet::new();
+        for world in 2..=8 {
+            widths.extend(cuteafd_core::tp_units::native_spark_artifacts(geometry.hidden as usize,
+                geometry.intermediate as usize, world).unwrap().into_iter().map(|a| a.logical));
+        }
+        for width in widths {
+            segment_programs.push(json!({"name":format!("native_experts_{family}_w{width}_segments"),
+                "capacity_rows":8192,"pointers":[],"scalars":[{"type":"int32"}],
+                "geometry":{"max_rows":8192,"row_addresses":true,"hidden":geometry.hidden,
+                    "intermediate":width,"experts":geometry.experts,"topk":geometry.topk},
+                "scratch_bytes_at_capacity":{"meta":4096,"pair_row":196608,"pair_pos":196608,
+                    "act":width*128,"grouped_routing":196608,"grouped_route":196608,
+                    "partial":8192u64*u64::from(geometry.topk)*u64::from(geometry.hidden)*4}}));
+        }
+    }
+    segment_programs
+}
+
+pub fn append_native_segment_programs(manifest: &mut Value) {
+    let object = manifest.as_object_mut().expect("fixture manifest object");
+    let programs = object.entry("programs").or_insert_with(|| json!([])).as_array_mut().unwrap();
+    for entry in native_segment_programs() {
+        if !programs.iter().any(|old| old["name"] == entry["name"]) { programs.push(entry); }
+    }
+}
+
 /// Bounded synthetic published allocation inputs, not performance estimates.
 pub fn write_v41_workspaces(dir: &Path) -> std::path::PathBuf {
     let share = dir.join("share");
     fs::create_dir_all(share.join("V41_EXPERT_WORKSPACES")).unwrap();
     let programs = share.join("PROGRAMS.json");
-    fs::write(&programs, b"{}").unwrap();
+    fs::write(&programs, serde_json::to_vec(&json!({"programs":native_segment_programs()})).unwrap()).unwrap();
     for ranks in [1, 2] {
         let role = if ranks == 1 { "rtx_backbone" } else { "rtx_tp2" };
         for format in ["mxfp4", "nvfp4"] {

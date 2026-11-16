@@ -31,6 +31,9 @@ pub fn native_scratch(programs: &serde_json::Value, extent: OwnerExtent, geometr
     let family = geometry.family().context("unknown native family")?;
     widths.into_iter().try_fold(0, |maximum, width| {
         let name = format!("native_experts_{family}_w{width}_segments");
+        ensure!(programs["programs"].as_array().is_some_and(|entries|
+            entries.iter().filter(|entry| entry["name"] == name).count() == 1),
+            "missing {name} in PROGRAMS.json; republish placement inputs");
         let spec = crate::plan::exlr8::workspace::program_spec(programs, &name)?;
         Ok(maximum.max(native_segment_layout(&spec, geometry, width)?.1))
     })
@@ -44,4 +47,31 @@ pub fn exlr8_scratch(programs: &serde_json::Value, extent: OwnerExtent, geometry
     let layout = crate::plan::exlr8::execution_workspace_from_manifest(programs, family, rows as usize,
         crate::plan::exlr8::ExecutionVariant::Segments, unit_limit, activations)?;
     Ok(layout.bytes.try_into()?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn missing_native_segments_name_the_export_and_republication() {
+        let extent = OwnerExtent { owner: cuteafd_core::ExecutionOwner::Prefill, capacity: 2752,
+            compiled: 4096, staging_rows: 2752, buffered_units: 3 };
+        let error = native_scratch(&serde_json::json!({"programs":[]}), extent,
+            ExpertGeometry::DEEPSEEK_V4_FLASH, [1024]).unwrap_err();
+        assert_eq!(error.to_string(), "missing native_experts_dsv4f_w1024_segments in PROGRAMS.json; republish placement inputs");
+    }
+
+    #[test]
+    fn native_widths_share_one_maximum_arena_and_planner_layout() -> Result<()> {
+        let programs = serde_json::json!({"programs":crate::plan::testing::native_segment_programs()});
+        let geometry = ExpertGeometry::DEEPSEEK_V41;
+        let extent = OwnerExtent { owner: cuteafd_core::ExecutionOwner::Prefill, capacity: 2752,
+            compiled: 4096, staging_rows: 2752, buffered_units: 3 };
+        let first = native_scratch(&programs, extent, geometry, [448])?;
+        let second = native_scratch(&programs, extent, geometry, [512])?;
+        assert_eq!(native_scratch(&programs, extent, geometry, [448, 512, 448])?, first.max(second));
+        assert_eq!(native_scratch(&programs, OwnerExtent { owner: cuteafd_core::ExecutionOwner::Decode(0), ..extent },
+            geometry, [448,512])?, 0);
+        Ok(())
+    }
 }

@@ -1178,7 +1178,9 @@ pub(crate) fn charge_spark_devices(report: &mut PlanReport, model: &dyn super::F
             spark_slots::charge_installed_executions(device, input, working, family, &executions, options));
         if let Err(error) = charged {
             report.placement_supported = false;
-            notes.push(format!("{}: {error:#}", what(device)));
+            let reason = format!("{}: {error:#}", what(device));
+            notes.push(reason.clone());
+            report.hints.push(super::Hint { what: reason, how: "Republish the named placement inputs before planning or serving.".into() });
         }
     }
 }
