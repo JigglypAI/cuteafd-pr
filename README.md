@@ -242,6 +242,12 @@ concurrency point is that limit.
 <td width="27%" valign="top"><a href="benchmarks/inkling2/2026-11-16-smoke-inkling-2-small-exl3-k4-mc-1rtx-4spark-inkling2-exl3-min-cand-r1/card.svg"><img src="benchmarks/inkling2/2026-11-16-smoke-inkling-2-small-exl3-k4-mc-1rtx-4spark-inkling2-exl3-min-cand-r1/card.svg" alt="wrldsuksgo2mars/Inkling-2-Small-EXL3-K4-MC on 1× RTX PRO 6000 @ gpu-powerd 425 W (425–450) + 4× DGX Spark"></a><br><sub>1× RTX + 4× Spark</sub></td>
 <td width="27%" valign="top">pending<br><sub>Multi-RTX Inkling serving is not qualified (#1930).</sub></td>
 </tr>
+<tr>
+<td width="19%" valign="top"><a href="docs/models/inkling2.md"><b>inkling2</b></a><br><sub>thinkingmachines/Inkling-2-Small-MXFP8</sub><br><sub>fp8-tensor/ue8m0</sub></td>
+<td width="27%" valign="top">pending<br><sub>Not measured.</sub></td>
+<td width="27%" valign="top"><a href="benchmarks/inkling2/2026-11-16-smoke-inkling-2-small-mxfp8-1rtx-6spark-inkling2-mxfp8-recard-cand-r1/card.svg"><img src="benchmarks/inkling2/2026-11-16-smoke-inkling-2-small-mxfp8-1rtx-6spark-inkling2-mxfp8-recard-cand-r1/card.svg" alt="thinkingmachines/Inkling-2-Small-MXFP8 on 1× RTX PRO 6000 @ gpu-powerd 425 W (425–450) + 6× DGX Spark"></a><br><sub>1× RTX + 6× Spark</sub></td>
+<td width="27%" valign="top">pending<br><sub>Multi-RTX Inkling serving is not qualified (#1930).</sub></td>
+</tr>
 </table>
 
 Each card is one launch of the basic profile: tok/s for C1 decode and concurrent decode with thinking off (each stream its own prompt; earlier cards sent one code prompt to every stream, which shares experts and drafts and reads higher), cold exactly-8,192-token prefill, logit fidelity against the family golden reference, prefix-cache restore exactness and lossless speculation. Older releases, other profiles and every report: [benchmarks](benchmarks/README.md).

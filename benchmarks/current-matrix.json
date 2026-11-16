@@ -368,6 +368,22 @@
         "status": "pending",
         "reason": "Multi-RTX Inkling serving is not qualified (#1930)."
       }
+    },
+    {
+      "family": "inkling2",
+      "checkpoint": "thinkingmachines/Inkling-2-Small-MXFP8",
+      "5090": {
+        "status": "pending",
+        "reason": "Not measured."
+      },
+      "1rtx": {
+        "status": "current",
+        "report": "benchmarks/inkling2/2026-11-16-smoke-inkling-2-small-mxfp8-1rtx-6spark-inkling2-mxfp8-recard-cand-r1"
+      },
+      "2rtx": {
+        "status": "pending",
+        "reason": "Multi-RTX Inkling serving is not qualified (#1930)."
+      }
     }
   ],
   "retired": [
