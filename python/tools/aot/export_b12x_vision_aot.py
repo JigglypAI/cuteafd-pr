@@ -43,44 +43,6 @@ def perception_names(kind):
     return ["vision_"+name for name in names]
 
 
-def perception_builders(kind):
-    from b12x.integration.cuteafd import media,perception,perception_forward,image_resize
-    from b12x.integration.cuteafd import perception_pixels
-    h,i,p,o = (1024,4096,1200,4608) if kind == "inkling2" else (1536,8960,588,4096)
-    inkling = kind == "inkling2"
-    result = {
-        f"pe_norm_h{h}":lambda:perception_forward.compile_layer_norm_aot(hidden=h,vendor_rsqrt=inkling),
-        f"pe_scale_h{h}":lambda:perception.compile_scaled_residual_aot(width=h),
-        f"pe_position_h{h}":lambda:perception_forward.compile_learned_position_aot(hidden=h,grid=32 if inkling else 52,class_token=inkling,torch_bilinear=not inkling),
-        f"pe_rotary_d{h//16}":lambda:perception.compile_rotary_2d_aot(heads=16,dim=h//16,class_token=inkling),
-    }
-    for w,n in ((h,3*h),(h,h),(h,i),(i,h)):
-        result[f"biased_projection_h{w}_o{n}"] = lambda w=w,n=n:media.compile_biased_projection_aot(width=w,outputs=n)
-    result[f"projection_h{p}_o{h}"] = lambda:media.compile_patch_projection_aot(width=p,outputs=h)
-    if inkling:
-        result["pe_rgb_p20"] = lambda:perception_pixels.compile_pixel_patches_aot(patch=20)
-        result["pe_merge_h1024"] = lambda:perception.compile_merge2_aot(width=1024,class_token=True)
-        for w,n in ((4096,4096),(4096,4608)):
-            name = f"pe_patch_projection_h{w}_o{n}" if n == 4096 else f"projection_h{w}_o{n}"
-            result[name] = lambda w=w,n=n:media.compile_patch_projection_aot(width=w,outputs=n)
-        result["gelu_h4096"] = lambda:media.compile_gelu_aot(width=4096)
-    else:
-        result.update({"rgb_normalize":image_resize.compile_rgb_normalize_aot,
-            "resize_coefficients_bilinear":lambda:image_resize.compile_resize_coefficients_aot(filter="bilinear"),
-            "resize_horizontal":lambda:image_resize.compile_resize_pass_aot(vertical=False),
-            "resize_vertical":lambda:image_resize.compile_resize_pass_aot(vertical=True),
-            "pe_patches_p14":lambda:perception_forward.compile_normalized_patches_aot(patch=14),
-            "pe_conv_lower_h1536":lambda:perception.compile_conv3_stride2_lower_aot(channels=1536),
-            "pe_conv_lower_h3072":lambda:perception.compile_conv3_stride2_lower_aot(channels=3072),
-            "pe_quick_gelu_h8960":lambda:perception.compile_quick_gelu_aot(width=8960)})
-        for w,n in ((13824,3072),(27648,6144)):
-            result[f"biased_projection_h{w}_o{n}"] = lambda w=w,n=n:media.compile_biased_projection_aot(width=w,outputs=n)
-        result["pe_patch_projection_h6144_o4096"] = lambda:media.compile_patch_projection_aot(width=6144,outputs=4096)
-    if ["vision_"+name for name in result] != perception_names(kind):
-        raise ValueError("PE declaration inventory differs from CMake")
-    return result
-
-
 def tile_for_head_dim(head_dim):
     if head_dim <= 0 or head_dim > 128 or head_dim % 8:
         raise ValueError("vision head dimension must be an aligned value in 8..128")
@@ -219,6 +181,44 @@ def main():
         print(manifest_path, flush=True)
     if torch.cuda.is_initialized():
         raise RuntimeError("offline vision export initialized CUDA")
+
+
+def perception_builders(kind):
+    from b12x.integration.cuteafd import media,perception,perception_forward,image_resize
+    from b12x.integration.cuteafd import perception_pixels
+    h,i,p,o = (1024,4096,1200,4608) if kind == "inkling2" else (1536,8960,588,4096)
+    inkling = kind == "inkling2"
+    result = {
+        f"pe_norm_h{h}":lambda:perception_forward.compile_layer_norm_aot(hidden=h,vendor_rsqrt=inkling),
+        f"pe_scale_h{h}":lambda:perception.compile_scaled_residual_aot(width=h),
+        f"pe_position_h{h}":lambda:perception_forward.compile_learned_position_aot(hidden=h,grid=32 if inkling else 52,class_token=inkling,torch_bilinear=not inkling),
+        f"pe_rotary_d{h//16}":lambda:perception.compile_rotary_2d_aot(heads=16,dim=h//16,class_token=inkling),
+    }
+    for w,n in ((h,3*h),(h,h),(h,i),(i,h)):
+        result[f"biased_projection_h{w}_o{n}"] = lambda w=w,n=n:media.compile_biased_projection_aot(width=w,outputs=n)
+    result[f"projection_h{p}_o{h}"] = lambda:media.compile_patch_projection_aot(width=p,outputs=h)
+    if inkling:
+        result["pe_rgb_p20"] = lambda:perception_pixels.compile_pixel_patches_aot(patch=20)
+        result["pe_merge_h1024"] = lambda:perception.compile_merge2_aot(width=1024,class_token=True)
+        for w,n in ((4096,4096),(4096,4608)):
+            name = f"pe_patch_projection_h{w}_o{n}" if n == 4096 else f"projection_h{w}_o{n}"
+            result[name] = lambda w=w,n=n:media.compile_patch_projection_aot(width=w,outputs=n)
+        result["gelu_h4096"] = lambda:media.compile_gelu_aot(width=4096)
+    else:
+        result.update({"rgb_normalize":image_resize.compile_rgb_normalize_aot,
+            "resize_coefficients_bilinear":lambda:image_resize.compile_resize_coefficients_aot(filter="bilinear"),
+            "resize_horizontal":lambda:image_resize.compile_resize_pass_aot(vertical=False),
+            "resize_vertical":lambda:image_resize.compile_resize_pass_aot(vertical=True),
+            "pe_patches_p14":lambda:perception_forward.compile_normalized_patches_aot(patch=14),
+            "pe_conv_lower_h1536":lambda:perception.compile_conv3_stride2_lower_aot(channels=1536),
+            "pe_conv_lower_h3072":lambda:perception.compile_conv3_stride2_lower_aot(channels=3072),
+            "pe_quick_gelu_h8960":lambda:perception.compile_quick_gelu_aot(width=8960)})
+        for w,n in ((13824,3072),(27648,6144)):
+            result[f"biased_projection_h{w}_o{n}"] = lambda w=w,n=n:media.compile_biased_projection_aot(width=w,outputs=n)
+        result["pe_patch_projection_h6144_o4096"] = lambda:media.compile_patch_projection_aot(width=6144,outputs=4096)
+    if ["vision_"+name for name in result] != perception_names(kind):
+        raise ValueError("PE declaration inventory differs from CMake")
+    return result
 
 
 def builders(group, *, head_dim=96, hidden=1536, bf16_products=False,

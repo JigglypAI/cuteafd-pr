@@ -132,7 +132,7 @@ int encode_perception(Owner* o,const uint8_t* rgb,uint64_t rgb_bytes,const float
     // Vendor computes head_dim**-0.5 in double before the FP32 scalar cast.
     // Float sqrt then reciprocal is one ULP low at Step's D96.
     PE_RUN(cuteafd_vision_attention_launch(o->attention,o->q,o->k,o->v,o->attn,
-      o->lse,o->cu_seqlens,float(1.0/std::sqrt(double(s.head_dim))),stream));
+      o->lse,o->cu_seqlens,float(1.0/::sqrt(double(s.head_dim))),stream));
     PE_RUN(pe_projection(o,o->attn,b.proj,b.proj_bias,o->muse_proj,int(n),s.hidden,s.hidden));
     PE_RUN(pe_program(o,"vision_pe_scale_h"+h,{x,o->muse_proj,w+p.scale1[layer],xt},{uint64_t(n)}));std::swap(x,xt);
     PE_RUN(pe_norm(o,x,b.norm2,s.norm2_bias[layer],o->norm,int(n)));
