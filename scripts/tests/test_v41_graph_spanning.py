@@ -55,6 +55,15 @@ def test_v41_peer_wrappers_and_commit_metadata_preserve_scope():
     assert "self.graphs.cache_insert(layer,weights,rows,graph,ticket,nodes as u64,width,spans)" in projection
     assert "self.gather_graphs.cache_insert(0,weights,rows,graph,ticket,nodes as u64,width,true)" in projection
     assert projection.index("owner.storage.stream.complete().await?") < projection.index("rank.capture_ready(layer,rows)?")
-    for file in ("v41_experts/dspark/chain/distributed.rs", "v41_experts/dspark/terminal/distributed.rs"):
-        assert "f(device, site, true, bank)" in (FAMILY / file).read_text()
-    assert "half.get_mut().spans_devices = true" in (FAMILY / "v41_sparse_attention/dual.rs").read_text()
+    assert "f(device, site, true, bank)" in (FAMILY / "v41_experts/dspark/chain/distributed.rs").read_text()
+    dual = (FAMILY / "v41_sparse_attention/dual.rs").read_text()
+    assert "half.get_mut().spans_devices = true" not in dual
+    assert "exec,ticket,nodes as u64,width,spans)" in dual
+    terminal = (FAMILY / "v41_experts/dspark/terminal/distributed.rs").read_text()
+    assert "self.terminal.get_mut().visit_graph_banks(f)?" in terminal
+    poll = terminal.split("pub fn poll(", 1)[1]
+    assert poll.index("cuda_stream_query") < poll.index("self.capture_stage")
+    assert poll.index("poll_copy_logits()?") < poll.index("self.enqueue_stage(requests, true)")
+    lane = (FAMILY / "v41_backbone_lane.rs").read_text()
+    completion = lane.split("impl<'s, 'w, 'a> PendingLaneFfn", 1)[1]
+    assert completion.index("finish_tp2_then") < completion.index("}).await?") < completion.index("graphs.capture_ready")

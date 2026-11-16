@@ -784,7 +784,7 @@ pub(crate) struct BackboneLane<'w, 'a> {
 impl<'w, 'a> BackboneLane<'w, 'a> {
     pub(crate) fn visit_graph_banks(&mut self, f: &mut dyn FnMut(i32, &'static str, bool, &mut dyn crate::shared::decode_graph::CacheAttached) -> Result<()>) -> Result<()> {
         if let Some(graphs) = &mut self.tp2_ffn_graphs {
-            f(graphs.device.id, "tp2_ffn", true, &mut graphs.bank)?;
+            f(graphs.device.id, "tp2_ffn", false, &mut graphs.bank)?;
         }
         if let Some(sparse) = &mut self.sparse { sparse.visit_graph_banks(f)?; }
         if let Some(sparse) = &mut self.dual_sparse { sparse.visit_graph_banks(f)?; }

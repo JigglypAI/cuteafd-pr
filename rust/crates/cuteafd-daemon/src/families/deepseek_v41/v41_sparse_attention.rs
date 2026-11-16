@@ -123,7 +123,6 @@ pub(crate) struct LocalSparseAttentionWave<'a,const HEADS:usize> {
     // For other paths, complete external-pointer and launch-geometry fingerprints are checked
     // against live proposals before every replay. Inactive graphs never launch.
     graphs: GraphBank<(usize, Vec<usize>), GraphOwner<'a, ()>>,
-    spans_devices: bool,
     warmed_kernels: u16,
     cold: Option<ColdSparse>,
 }
@@ -188,7 +187,7 @@ impl<'a,const HEADS:usize> LocalSparseAttentionWave<'a,HEADS> {
             replay_staging: LayerStaging::new(library, capacity * 8, 40, "v41/sparse-replay")?,
             storage, window: crate::shared::memory::row_window::RowWindow::NONE,
             capacity, batch_rows: batch, attention_plan: None, decode: false,
-            graphs: GraphBank::new(), spans_devices: false, warmed_kernels: 0, cold: None,
+            graphs: GraphBank::new(), warmed_kernels: 0, cold: None,
         })
     }
     pub(crate) fn select_window(&mut self, window: crate::shared::memory::row_window::RowWindow) -> Result<()> {
@@ -330,13 +329,13 @@ impl<'a,const HEADS:usize> LocalSparseAttentionWave<'a,HEADS> {
         // SAFETY: the lane guard retains all captured cache/selection/tail storage.
         let owner = unsafe { GraphOwner::new(self.storage.stream.library, device, graph, ())? };
         self.graphs.census_capture_device_key("sparse_attention", device, &key, graph);
-        self.graphs.cache_commit(key, owner, ticket, nodes as u64, width, spans || self.spans_devices);
+        self.graphs.cache_commit(key, owner, ticket, nodes as u64, width, spans);
         Ok(())
     }
     pub(crate) fn visit_graph_banks(&mut self,
         f: &mut dyn FnMut(i32, &'static str, bool, &mut dyn crate::shared::decode_graph::CacheAttached) -> Result<()>,
     ) -> Result<()> {
-        f(self.storage.query.buffer.device_id, "sparse_attention", self.spans_devices, &mut self.graphs)
+        f(self.storage.query.buffer.device_id, "sparse_attention", false, &mut self.graphs)
     }
     unsafe fn enqueue(
         &self,

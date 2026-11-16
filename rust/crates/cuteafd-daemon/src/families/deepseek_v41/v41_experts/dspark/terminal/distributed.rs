@@ -341,8 +341,8 @@ impl Drop for DistributedDsparkTerminal<'_, '_> {
 
 impl DistributedDsparkTerminal<'_, '_> {
     pub(crate) fn visit_graph_banks(&mut self, f: &mut super::super::chain::GraphVisitor<'_>) -> Result<()> {
-        f(self.terminal.device.id, "dspark_distributed_terminal", true, &mut self.graphs)?;
-        self.terminal.get_mut().visit_graph_banks(&mut |device, site, _, bank| f(device, site, true, bank))?;
+        f(self.terminal.device.id, "dspark_distributed_terminal", false, &mut self.graphs)?;
+        self.terminal.get_mut().visit_graph_banks(f)?;
         Ok(())
     }
 }

@@ -91,9 +91,8 @@ impl<'a> DualAttentionWave<'a> {
     pub(crate) fn on_storage(storage: std::rc::Rc<DualAttentionStorage<'a>>) -> Result<Self> {
         let devices = std::array::from_fn::<_, 2, _>(|i| Device {
             library: storage.halves[i].stream.library, id: storage.halves[i].query.buffer.device_id });
-        let mut halves = [devices[0].own(|| CompactSparseAttentionWave::on_storage(storage.halves[0].clone()))?,
+        let halves = [devices[0].own(|| CompactSparseAttentionWave::on_storage(storage.halves[0].clone()))?,
             devices[1].own(|| CompactSparseAttentionWave::on_storage(storage.halves[1].clone()))?];
-        for half in &mut halves { half.get_mut().spans_devices = true; }
         Ok(Self {
             halves,
             capacity: storage.capacity, storage, window: crate::shared::memory::row_window::RowWindow::NONE,
@@ -130,7 +129,7 @@ impl<'a> DualAttentionWave<'a> {
         f: &mut dyn FnMut(i32, &'static str, bool, &mut dyn crate::shared::decode_graph::CacheAttached) -> Result<()>,
     ) -> Result<()> {
         for half in &mut self.halves { half.get_mut().visit_graph_banks(f)?; }
-        f(self.halves[0].device.id, "dual_attention_tail", true, &mut self.tails)
+        f(self.halves[0].device.id, "dual_attention_tail", false, &mut self.tails)
     }
     pub fn drain(&mut self) -> Result<()> {
         // Always attempt both drains, even if the first device reports an error.
@@ -200,7 +199,7 @@ impl<'a> DualAttentionWave<'a> {
             ticket.capture_result(crate::shared::decode_graph::begin_capture(&library, stream, &ticket))?;
             let queued=tail.enqueue(&attention,stream);
             let captured={ let captured = crate::shared::decode_graph::end_capture(&library, stream, &mut ticket); ticket.capture_result(captured) };
-            let (graph,nodes,width,_spans,inspection)=match (queued,captured) {
+            let (graph,nodes,width,spans,inspection)=match (queued,captured) {
                 (Ok(()),Ok(graph))=>graph,
                 (Err(error),Ok((graph,_,_,_,_)))=> { library.cuda_graph_exec_destroy(graph)?;return Err(error); },
                 (Ok(()),Err(error)) if cuteafd_ffi::is_small_graph(&error) => {
@@ -216,7 +215,7 @@ impl<'a> DualAttentionWave<'a> {
             tracing::debug!(target:"cuteafd::graph_capture",site="dual_attention_tail",
                 layer,rows,device=owner.id,key=?key,bank=?(&wave.tails as *const _),
                 "captured graph binding");
-            wave.tails.cache_commit((layer,key),exec,ticket,nodes as u64,width,true);
+            wave.tails.cache_commit((layer,key),exec,ticket,nodes as u64,width,spans);
             crate::shared::decode_graph::launch(&library, graph,stream)
         })?;
         owner.future(wave.halves[0].wait_chain()).await?;
