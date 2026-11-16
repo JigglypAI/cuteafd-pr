@@ -126,9 +126,8 @@ def test_inkling_hidden_dispatch_reduce_compact_and_wire():
             wire[:, 4608:] = 127  # UE8M0 1.0
             restored = torch.empty_like(reduced)
             planes = (ptr * 4)(routes.data_ptr(), routes.data_ptr(), routes.data_ptr(), routes.data_ptr())
-            stream = torch.cuda.current_stream().cuda_stream
-
             def launch():
+                stream = torch.cuda.current_stream().cuda_stream
                 assert compact(routes.data_ptr(), compacted.data_ptr(), rows, stream) == 0
                 assert reduce(planes, None, reduced.data_ptr(), rows, 4, 6, stream) == 0
                 assert decode(handle, wire.data_ptr(), wire.numel(), restored.data_ptr(), restored.numel()*2, rows, stream) == 0
