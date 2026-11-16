@@ -808,7 +808,11 @@ impl Built {
 pub(crate) fn build(profile: &ModelProfile, limits: NativeLimits, headers: &axum::http::HeaderMap, mut body: Value)
     -> Result<Built, Rejection> {
     if matches!(profile.encoding, ModelEncoding::MiniMax(_)) {
-        minimax::vision::validate_policy(&body).map_err(Rejection::bad)?;
+        minimax::vision::validate_policy(&body).map_err(|message| Rejection {
+            status:StatusCode::BAD_REQUEST,message:message.clone(),retry:false,
+            response:Some((StatusCode::BAD_REQUEST,Json(json!({"error":{
+                "message":message,"type":"invalid_request_error","param":"max_pixels"}}))).into_response()),
+        })?;
     }
     images::guard_content(&body, profile.capabilities).map_err(Rejection::bad)?;
     let probe = headers.get(probe::HEADER).and_then(|v| v.to_str().ok()).and_then(|id| probe::registry().claim(id));
