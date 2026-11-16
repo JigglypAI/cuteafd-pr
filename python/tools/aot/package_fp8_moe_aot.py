@@ -471,7 +471,7 @@ extern "C" int32_t cuteafd_fp8moe_launch_segments(void* context, void* const* po
 def exact_widths(intermediate: int, tp: int, unit: int = 128) -> list[int]:
     """Stored widths of TP ranks owning whole 128-row blocks exactly (TP6 of
     2048: 384, 384, 384, 384, 256, 256), as the worker's exact layouts expect."""
-    if unit not in (16, 32, 128):
+    if unit not in (16, 32, 64, 128):
         return []
     blocks = intermediate // unit
     if not 1 <= tp <= 8 or intermediate % unit or blocks < tp:
@@ -518,13 +518,13 @@ def layout_geometry(base, layout: str):
         raise SystemExit(f"{layout}: Spark TP must be in 1..8")
     if not exact_widths(base.intermediate, tp, 16 if base.weights == "nvfp4" else 32 if base.weights == "mxfp4" else 128):
         raise SystemExit(f"{layout}: intermediate {base.intermediate} needs a nonempty whole-H128 slice per rank")
-    from spark_packages import geometry_native_layout
+    from spark_packages import geometry_native_layout, layout_ownership_unit
     policy = geometry_native_layout(getattr(base, 'name', ''))
     g = base.with_tp(tp)
     if width:
         widths = exact_widths(base.intermediate, tp)
         if policy and tp in policy['exact_worlds']:
-            widths += exact_widths(base.intermediate, tp, policy['unit_columns'])
+            widths += exact_widths(base.intermediate, tp, layout_ownership_unit(policy, base.intermediate, tp))
         if base.weights == "mxfp4":
             widths += exact_widths(base.intermediate, tp, 32)
         if int(width) not in widths:
@@ -641,13 +641,13 @@ def build(args: argparse.Namespace) -> None:
             if f"tp{tp}" in layouts and base.intermediate // 128 % tp:
                 layouts += [f"tp{tp}-w{width}" for width in sorted(set(exact_widths(base.intermediate, tp, 32)), reverse=True)
                             if f"tp{tp}-w{width}" not in layouts]
-    from spark_packages import geometry_native_layout
+    from spark_packages import geometry_native_layout, layout_ownership_unit
     policy = geometry_native_layout(args.geometry)
     if args.exact_slices and args.role == 'spark' and policy:
         for tp in policy['exact_worlds']:
             if f'tp{tp}' in layouts:
                 layouts += [f'tp{tp}-w{width}' for width in sorted(set(
-                    exact_widths(base.intermediate, tp, policy['unit_columns'])), reverse=True)
+                    exact_widths(base.intermediate, tp, layout_ownership_unit(policy, base.intermediate, tp))), reverse=True)
                     if f'tp{tp}-w{width}' not in layouts]
     kind = input_kind(args.role, base.weights, args.input)
     wire, nvfp4_input = kind == "wire", kind == "nvfp4"

@@ -87,7 +87,7 @@ def test_inkling_native_and_two_tier_exl3_profiles_cover_tp3_tp6():
 
 def test_native_layout_exact_worlds_preserve_other_source_and_storage_units():
     packages = module('native_layout_policy', ROOT / 'python/tools/lib/spark_packages.py')
-    for kind, native, legacy in [('mxfp8', 32, 128), ('nvfp4', 16, 16)]:
+    for kind, native, legacy in [('mxfp8', 32, 128), ('nvfp4', 64, 16)]:
         policy = packages.native_layout('inkling2', kind)
         assert policy['exact_worlds'] == [4]
         assert packages.ownership_unit('inkling2', kind, 4) == native
@@ -245,3 +245,20 @@ def test_whole_matrix_exl3_count_enumeration(record_property):
     output = os.environ.get('CUTEAFD_SPARK_RANGE_EXPORT_RESULTS')
     if output:
         Path(output).write_text(json.dumps(dict(exl3_objects=results, layout_keys=keys), indent=2) + '\n')
+
+
+def test_computed_nvfp4_units_minimize_slowest_exact_rank():
+    packages = module('computed_nvfp4_units', ROOT / 'python/tools/lib/spark_packages.py')
+    native = module('computed_nvfp4_widths', ROOT / 'python/tools/aot/package_fp8_moe_aot.py')
+    for intermediate, world, unit, widths in [
+        (3072, 5, 128, [640, 640, 640, 640, 512]),
+        (2304, 4, 64, [576] * 4), (640, 4, 32, [160] * 4),
+    ]:
+        assert packages.nvfp4_ownership_unit(intermediate, world) == unit
+        assert native.exact_widths(intermediate, world, unit) == widths
+        assert sum(widths) == intermediate
+    # Existing V4.1 S576 ownership and byte offsets remain unchanged (#928).
+    assert packages.layout_policy().ownership_unit(2304, 4) == 32
+    shards = [packages.native_shard(4, rank, layer) for layer in range(4) for rank in range(4)]
+    assert [(first, artifact.logical, artifact.stored) for first, artifact in shards] == [
+        (rank * 576, 576, 576) for layer in range(4) for rank in range(4)]
