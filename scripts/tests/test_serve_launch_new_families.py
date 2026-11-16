@@ -71,6 +71,34 @@ def test_inkling_native_launcher_composes_shared_argv_and_rejects_pair(tmp_path:
     assert pair.returncode == 2 and "one coordinator GPU" in pair.stderr
 
 
+@pytest.mark.parametrize("cache", ["fp8", "bf16"])
+def test_inkling_bundled_drafter_matches_plan_and_serve(tmp_path: Path, cache: str) -> None:
+    config = {"model_type": "inkling2", "text_config": {"num_hidden_layers": 48}}
+    keys = (f"SPARK_COUNT=6\nRTX_GPUS=1\nSPECULATOR=dspark\nDRAFT_KV_CACHE={cache}\n"
+            "VISION=off\nAUDIO=off\n" + SIX)
+    result = _family_launch_result(tmp_path, config, "thinkingmachines/Inkling-2-Small-MXFP8", keys,
+        physical_gpus=(0,), extra_args=("--wip", "inkling"), encoder_plan=PLANNED)
+    serve = _line(result, "serve-inkling2 --snapshot")
+    plan = _line(result, "cuteafd plan --snapshot")
+    assert "--dspark" in shlex.split(serve)
+    assert _flag(plan, "--speculator") == "dspark"
+    assert _flag(serve, "--draft-kv-cache") == _flag(plan, "--draft-kv-cache") == cache
+    assert "--draft-fp8" not in shlex.split(serve)
+
+
+@pytest.mark.parametrize("setting, message", [
+    ("DRAFT_KV_CACHE=fp16", "DRAFT_KV_CACHE must be bf16 or fp8"),
+    ("SPECULATOR_FP8=on", "Inkling SPECULATOR_FP8 must be auto or off"),
+    ("SPECULATOR=dflash2", "SPECULATOR=dflash2 does not apply to inkling2"),
+])
+def test_inkling_drafter_rejects_unsupported_modes(tmp_path: Path, setting: str, message: str) -> None:
+    config = {"model_type": "inkling2", "text_config": {"num_hidden_layers": 48}}
+    keys = "SPARK_COUNT=6\nRTX_GPUS=1\nSPECULATOR=dspark\nVISION=off\nAUDIO=off\n" + SIX + setting + "\n"
+    result = _family_launch_result(tmp_path, config, "thinkingmachines/Inkling-2-Small-MXFP8", keys,
+        physical_gpus=(0,), extra_args=("--wip", "inkling"), encoder_plan=PLANNED)
+    assert result.returncode == 2 and message in result.stderr
+
+
 def test_minimax_qualified_card_opens_one_rtx_three_sparks_public_launch(tmp_path: Path) -> None:
     config = {"model_type": "minimax_m3_vl", "text_config": {
         "num_hidden_layers": 60, "moe_layer_freq": [0] * 3 + [1] * 57}}

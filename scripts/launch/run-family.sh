@@ -1668,7 +1668,7 @@ if [[ -z "$speculator" ]]; then
 
 fi
 case "$family:$speculator" in
-  minimax_m3:dspark) ;;
+  minimax_m3:dspark|inkling2:dspark) ;;
   qwen4:mtp|qwen4:auto) ;;
   glm5:dspark) [[ "$checkpoint_family" == mistral_large4 ]] ||
     { echo "SPECULATOR=dspark does not apply to $family" >&2; exit 2; } ;; # The MTP layer's experts stay local even with Spark backbone experts.
@@ -2015,6 +2015,15 @@ if [[ $family == inkling2 ]]; then
   case "$inkling_kv" in bf16|fp8) ;; *) release_die "KV_CACHE must be bf16 or fp8" ;; esac
   family_args+=(--kv-cache "$inkling_kv")
   family_args+=(--rtx-expert-layers "$(get RTX_EXPERT_LAYERS auto)")
+  inkling_draft_kv="$(get DRAFT_KV_CACHE fp8)"
+  case "$inkling_draft_kv" in bf16|fp8) ;; *) release_die "DRAFT_KV_CACHE must be bf16 or fp8" ;; esac
+  case "$(get SPECULATOR_FP8 auto)" in
+    auto|off) ;;
+    *) release_die "Inkling SPECULATOR_FP8 must be auto or off (checkpoint-native drafter)" ;;
+  esac
+  if [[ "$speculator" == dspark ]]; then
+    family_args+=(--dspark --draft-kv-cache "$inkling_draft_kv")
+  fi
 fi
 if [[ $family == minimax_m3 ]]; then
   local_layers="$(get RTX_EXPERT_LAYERS auto)"
@@ -2472,7 +2481,10 @@ audio_encoder_hash=""
   fi
   [[ -z "$(get SPARK_PREFILL_REPLY_FORMAT)" ]] || plan_draft_args+=(--spark-prefill-reply-format "$(get SPARK_PREFILL_REPLY_FORMAT)")
   [[ -z "$(get SPARK_DECODE_REPLY_FORMAT)" ]] || plan_draft_args+=(--spark-decode-reply-format "$(get SPARK_DECODE_REPLY_FORMAT)")
-  if [[ "$family" == inkling2 ]]; then plan_draft_args+=(--kv-cache "$inkling_kv"); fi
+  if [[ "$family" == inkling2 ]]; then
+    plan_draft_args+=(--kv-cache "$inkling_kv")
+    if [[ "$speculator" == dspark ]]; then plan_draft_args+=(--draft-kv-cache "$inkling_draft_kv"); fi
+  fi
   if [[ "$family" == minimax_m3 || "$family" == inkling2 ]]; then
     plan_draft_args+=(--prefix-cache-entries "$effective_prefix_entries")
     [[ -z "$(get PREFIX_CACHE_MARK_MIB)" ]] || plan_draft_args+=(--prefix-cache-mark-mib "$(get PREFIX_CACHE_MARK_MIB)")
