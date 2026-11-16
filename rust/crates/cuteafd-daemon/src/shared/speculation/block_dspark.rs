@@ -436,6 +436,15 @@ struct DraftLayer<'a> {
     v_ring: Dev<'a>,
 }
 
+struct MarkovHead<'a> {
+    w1:Dev<'a>, w2:Dev<'a>, norms:Dev<'a>, confidence_w:Dev<'a>, confidence_b:Dev<'a>,
+}
+struct HeadWorkspace<'a> {
+    logits:Dev<'a>,tokens:Dev<'a>,confidence:Dev<'a>,markov:Dev<'a>,
+    landing:crate::shared::memory::HostAllocation<'a>,
+    head:Option<VocabularyHead<'a>>, _head_workspace:Dev<'a>,
+}
+
 struct Workspace<'a> {
     sequences: usize,
     h: Dev<'a>,
@@ -448,20 +457,15 @@ struct Workspace<'a> {
     delta: Dev<'a>,
     gate_up: Dev<'a>,
     act: Dev<'a>,
-    logits: Dev<'a>,
+    output: Option<HeadWorkspace<'a>>,
     anchors: Dev<'a>,
     ids: Dev<'a>,
-    tokens: Dev<'a>,
-    confidence: Dev<'a>,
-    /// Pinned landing of `tokens` then `confidence`: both download behind the
-    /// round's one host wait.
-    landing: crate::shared::memory::HostAllocation<'a>,
     positions: Dev<'a>,
     tables: Dev<'a>,
     attention_workspace: Dev<'a>,
-    markov_workspace: Dev<'a>,
-    head: Option<VocabularyHead<'a>>,
-    _head_workspace: Dev<'a>,
+}
+impl<'a> Workspace<'a> {
+    fn output(&self)->Result<&HeadWorkspace<'a>> { self.output.as_ref().context("peer block drafter has no head workspace") }
 }
 
 /// The target head inside a draft step.
@@ -548,12 +552,11 @@ pub(crate) struct DsparkDrafter<'a> {
     fc: Matrix<'a>,
     hidden_norm: Dev<'a>,
     norm: Dev<'a>,
-    markov_w1: Dev<'a>,
-    markov_w2: Dev<'a>,
-    /// Row norms of `markov_w2` (FP32): the exact pruning bound of the Markov argmax.
-    markov_norms: Dev<'a>,
-    confidence_w: Dev<'a>,
-    confidence_b: Dev<'a>,
+    head: Option<MarkovHead<'a>>,
+    head_split: Option<super::gqa_tp2::GqaHeadSplit<'a,DsparkDrafter<'a>>>,
+    physical_rank:usize,
+    physical_ranks:usize,
+    lead:usize,
     layers: Vec<DraftLayer<'a>>,
     /// [TAP_ROWS, taps * hidden] BF16: the last step's tapped rows.
     pub taps: Dev<'a>,
@@ -608,9 +611,11 @@ impl<'a> DsparkDrafter<'a> {
                 owner.inventory(inventory, &format!("{prefix}.layer.{index}.{name}"))?;
             }
         }
-        for (name, owner) in [("hidden_norm", &self.hidden_norm), ("norm", &self.norm), ("markov_w1", &self.markov_w1),
-            ("markov_w2", &self.markov_w2), ("markov_norms", &self.markov_norms), ("confidence_w", &self.confidence_w),
-            ("confidence_b", &self.confidence_b)] { owner.inventory(inventory, &format!("{prefix}.{name}"))?; }
+        for (name,owner) in [("hidden_norm",&self.hidden_norm),("norm",&self.norm)] { owner.inventory(inventory,&format!("{prefix}.{name}"))?; }
+        if let Some(head)=&self.head {
+            for (name,owner) in [("markov_w1",&head.w1),("markov_w2",&head.w2),("markov_norms",&head.norms),
+                ("confidence_w",&head.confidence_w),("confidence_b",&head.confidence_b)] { owner.inventory(inventory,&format!("{prefix}.{name}"))?; }
+        }
         if let Some(owner) = &self.inv_freq { owner.inventory(inventory, &format!("{prefix}.inv_freq"))?; }
         Ok(())
     }
@@ -705,8 +710,28 @@ impl<'a> DsparkDrafter<'a> {
         scales: fp8_linear::Fp8Scales, fp8_rows: fp8_linear::Fp8Rows, context_capacity: usize, target_tokens: usize,
         kv_cache: cuteafd_loader::families::qwen4::Qwen4KvCache, native_rope: Option<(CuteafdDeviceBuffer,usize)>,
         allocate: &mut WeightAllocator<'a, '_>) -> Result<Self> {
+        Self::load_rank_with(library,programs,target_projection,snapshot,tensors,stream,slots,max_sequences,
+            mask_row,representation,scales,fp8_rows,context_capacity,target_tokens,kv_cache,native_rope,
+            0,1,0,allocate)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn load_rank_with(library:&'a NativeLibrary,programs:&'a cuteafd_ffi::programs::Programs<'a>,
+        target_projection:super::dflash::TargetProjection,snapshot:&Path,tensors:HashMap<String,Vec<u8>>,
+        stream:*mut c_void,slots:usize,max_sequences:usize,mask_row:Vec<u8>,representation:GlmDraftRepresentation,
+        scales:fp8_linear::Fp8Scales,fp8_rows:fp8_linear::Fp8Rows,context_capacity:usize,target_tokens:usize,
+        kv_cache:cuteafd_loader::families::qwen4::Qwen4KvCache,native_rope:Option<(CuteafdDeviceBuffer,usize)>,
+        physical_rank:usize,physical_ranks:usize,lead:usize,allocate:&mut WeightAllocator<'a,'_>)->Result<Self> {
         let _memory_scope = cuteafd_ffi::memory_ledger::scope("drafter");
-        let cfg = DsparkConfig::read(snapshot)?;
+        let mut cfg = DsparkConfig::read(snapshot)?;
+        ensure!(matches!(physical_ranks,1|2) && physical_rank<physical_ranks && lead<physical_ranks,
+            "invalid block physical rank inventory");
+        if physical_ranks==2 {
+            ensure!(native_rope.is_none() && representation==GlmDraftRepresentation::Bf16Only
+                && cfg.window.is_some() && cfg.heads%2==0 && cfg.kv_heads%2==0 && cfg.intermediate%2==0,
+                "block TP2 requires checkpoint-native BF16 GQA with divisible heads/neurons");
+            cfg.heads/=2; cfg.kv_heads/=2; cfg.intermediate/=2;
+        }
         ensure!(cfg.backbone.is_qwen3(cfg.head_dim) == native_rope.is_none(),
             "dSpark backbone needs its declared native arithmetic bindings");
         let h = cfg.hidden;
@@ -733,7 +758,7 @@ impl<'a> DsparkDrafter<'a> {
             context_capacity, target_tokens, kv_cache)?;
         tracing::info!(resident_bytes = residency.owned, scratch_bytes = residency.scratch, kv_cache = %kv_cache, "dSpark shared readiness inventory");
         ensure!((1..=MAX_SEQUENCES).contains(&max_sequences), "dSpark drafts take 1..={MAX_SEQUENCES} sequences");
-        let load = if native_rope.is_some() { Load::open(library, snapshot)? }
+        let load = if native_rope.is_some() || physical_ranks==2 { Load::open(library, snapshot)? }
             else { Load::with_tensors(library, snapshot, tensors)? }.with_allocator(allocate);
         let native_shapes = [(h, cfg.q_width()), (h,cfg.kv_width()), (cfg.q_width(),h),
             (h,cfg.intermediate), (cfg.intermediate,h)];
@@ -750,7 +775,17 @@ impl<'a> DsparkDrafter<'a> {
             Ok(allocation)
         };
         let (h, kv, inter) = (cfg.hidden, cfg.kv_width(), cfg.intermediate);
-        let weights = weight_recipe(snapshot, |name, shape| load.tensor(name, shape),
+        let weights=if physical_ranks==2 {
+            let source=cuteafd_loader::formats::block_dspark::BlockDsparkConfig::read(snapshot)?;
+            cuteafd_loader::formats::block_dspark::block_dspark_rank_recipe(&source,physical_rank,physical_ranks,lead,
+                |name,shape|load.tensor(name,shape),|parts,columns,axis| {
+                    match axis {
+                        Some(axis)=>load.matrix_shard(parts,columns,axis,physical_rank,physical_ranks,false,scales,stream),
+                        None=>load.matrix(parts,columns,false,scales,stream),
+                    }.map(Matrix::Legacy)
+                })?
+        } else {
+            let weights = weight_recipe(snapshot, |name, shape| load.tensor(name, shape),
             |parts, cols| {
                 if let Some(workspace) = &native_workspace {
                     if parts.len() == 1 && parts[0].0.ends_with("dspark.fc.weight") {
@@ -760,6 +795,10 @@ impl<'a> DsparkDrafter<'a> {
                 }
                 load.matrix(parts, cols, representation == GlmDraftRepresentation::Fp8Only, scales, stream).map(Matrix::Legacy)
             })?;
+            cuteafd_loader::formats::block_dspark::BlockDsparkRankWeights { layers:weights.layers,fc:weights.fc,
+                hidden_norm:weights.hidden_norm,norm:weights.norm,
+                head:Some((weights.markov_w1,weights.markov_w2,weights.confidence_w,weights.confidence_b)) }
+        };
         let layers = weights.layers.into_iter().map(|layer| -> Result<_> {
             Ok(DraftLayer { input_norm: layer.input_norm, post_norm: layer.post_norm, qkv: layer.qkv,
                 q_norm: layer.q_norm, k_norm: layer.k_norm, o: layer.o, gate_up: layer.gate_up, down: layer.down,
@@ -775,8 +814,11 @@ impl<'a> DsparkDrafter<'a> {
                 Some(fp8_linear::scratch_rows(library, TAP_ROWS.max(max_sequences * cfg.block), &shapes, fp8_rows)?)
             }
         };
-        let markov_norms = load.allocation("markov_norms", cfg.vocab * 4)?;
-        load.row_norms(weights.markov_w2.buffer, markov_norms.buffer, cfg.vocab, cfg.rank, stream)?;
+        let head=weights.head.map(|(w1,w2,confidence_w,confidence_b)|->Result<_> {
+            let norms=load.allocation("markov_norms",cfg.vocab*4)?;
+            load.row_norms(w2.buffer,norms.buffer,cfg.vocab,cfg.rank,stream)?;
+            Ok(MarkovHead { w1,w2,norms,confidence_w,confidence_b })
+        }).transpose()?;
         Ok(Self {
             kv_cache,
             library,
@@ -800,8 +842,7 @@ impl<'a> DsparkDrafter<'a> {
             inv_freq: if native_rope.is_some() { None } else {
                 cfg.rotary.as_ref().map(|plan| upload("inv_freq", bytes_of(&plan.inv_freq))).transpose()? },
             fc: weights.fc, hidden_norm: weights.hidden_norm, norm: weights.norm,
-            markov_w1: weights.markov_w1, markov_w2: weights.markov_w2, markov_norms,
-            confidence_w: weights.confidence_w, confidence_b: weights.confidence_b,
+            head,head_split:None,physical_rank,physical_ranks,lead,
             layers,
             taps: zeroed(TAP_ROWS * taps * 2, Tag::drafter_workspace("shared/dspark-taps"))?,
             fused: zeroed(TAP_ROWS * h * 2, Tag::drafter_workspace("shared/dspark-context-update"))?,
@@ -845,13 +886,17 @@ impl<'a> DsparkDrafter<'a> {
             for (name,owner) in [("h",&workspace.h),("n",&workspace.n),("qkv",&workspace.qkv),
                 ("q",&workspace.q),("k",&workspace.k),("v",&workspace.v),("attn",&workspace.attn),
                 ("delta",&workspace.delta),("gate_up",&workspace.gate_up),("act",&workspace.act),
-                ("logits",&workspace.logits),("anchors",&workspace.anchors),("ids",&workspace.ids),
-                ("tokens",&workspace.tokens),("confidence",&workspace.confidence),("positions",&workspace.positions),
-                ("tables",&workspace.tables),("head",&workspace._head_workspace),
-                ("attention",&workspace.attention_workspace),("markov",&workspace.markov_workspace)] {
+                ("anchors",&workspace.anchors),("ids",&workspace.ids),("positions",&workspace.positions),
+                ("tables",&workspace.tables),("attention",&workspace.attention_workspace)] {
                 owner.inventory(&mut inventory,&format!("workspace.{name}"))?;
             }
-            inventory.pinned("workspace.landing",workspace.landing.buffer)?;
+            if let Some(output)=&workspace.output {
+                for (name,owner) in [("logits",&output.logits),("tokens",&output.tokens),("confidence",&output.confidence),
+                    ("head",&output._head_workspace),("markov",&output.markov)] {
+                    owner.inventory(&mut inventory,&format!("workspace.{name}"))?;
+                }
+                inventory.pinned("workspace.landing",output.landing.buffer)?;
+            }
         }
         for receipt in &mut inventory.receipts {
             if receipt.allocation.id.starts_with(&format!("{prefix}..")) {
@@ -892,10 +937,10 @@ impl<'a> DsparkDrafter<'a> {
                 out.push((format!("layer.{index}.{name}"), owner.buffer));
             }
         }
-        for (name, owner) in [("hidden_norm", &self.hidden_norm), ("norm", &self.norm), ("markov_w1", &self.markov_w1),
-            ("markov_w2", &self.markov_w2), ("markov_norms", &self.markov_norms), ("confidence_w", &self.confidence_w),
-            ("confidence_b", &self.confidence_b)] {
-            out.push((name.into(), owner.buffer));
+        for (name,owner) in [("hidden_norm",&self.hidden_norm),("norm",&self.norm)] { out.push((name.into(),owner.buffer)); }
+        if let Some(head)=&self.head {
+            for (name,owner) in [("markov_w1",&head.w1),("markov_w2",&head.w2),("markov_norms",&head.norms),
+                ("confidence_w",&head.confidence_w),("confidence_b",&head.confidence_b)] { out.push((name.into(),owner.buffer)); }
         }
         out
     }
@@ -1342,7 +1387,19 @@ impl<'a> DsparkDrafter<'a> {
         let c = &self.cfg;
         let rows = sequences * c.block;
         let alloc = |bytes: usize| DeviceAllocation::new(self.library, bytes.max(256), Tag::drafter_workspace("shared/dspark"));
-        let head_workspace = alloc(VOCABULARY_HEAD_WORKSPACE)?;
+        let output=if self.head.is_some() {
+            let head_workspace=alloc(VOCABULARY_HEAD_WORKSPACE)?;
+            Some(HeadWorkspace {
+                logits:alloc(rows*c.vocab*4)?,tokens:alloc(rows*4)?,confidence:alloc(rows*4)?,
+                markov:alloc(self.library.glmf_dspark_markov_workspace(sequences,c.block)?)?,
+                landing:crate::shared::memory::HostAllocation::new(self.library,rows*8,Tag::staging("shared/dspark-landing"))?,
+                head:if self.target_projection==super::dflash::TargetProjection::Bf16 {
+                    // SAFETY: retained head workspace outlives the borrowed vocabulary handle.
+                    Some(unsafe { self.library.vocabulary_head_rows(head_workspace.buffer.ptr,c.hidden as u32,
+                        rows as u32,c.vocab as u32,cuteafd_ffi::programs::HeadMode::Gemm)? })
+                } else { None },_head_workspace:head_workspace,
+            })
+        } else { None };
         let attention_workspace = {
             let _scope = cuteafd_ffi::memory_ledger::scope("workspace/draft-attention");
             alloc(self.library.block_dspark_attention_workspace(sequences, c.heads, c.kv_heads, c.block,
@@ -1360,22 +1417,12 @@ impl<'a> DsparkDrafter<'a> {
             delta: alloc(rows * c.hidden * 2)?,
             gate_up: alloc(rows * 2 * c.intermediate * 2)?,
             act: alloc(rows * c.intermediate * 2)?,
-            logits: alloc(rows * c.vocab * 4)?,
+            output,
             anchors: alloc(sequences * 4)?,
             ids: alloc(rows * 4)?,
-            tokens: alloc(rows * 4)?,
-            confidence: alloc(rows * 4)?,
-            landing: crate::shared::memory::HostAllocation::new(self.library, rows * 8, Tag::staging("shared/dspark-landing"))?,
             positions: alloc(rows * 8)?,
             tables: alloc(3 * sequences * 4)?,
             attention_workspace,
-            markov_workspace: alloc(self.library.glmf_dspark_markov_workspace(sequences, c.block)?)?,
-            head: if self.target_projection == super::dflash::TargetProjection::Bf16 {
-                // SAFETY: the retained scratch drops after the borrowed native head.
-                Some(unsafe { self.library.vocabulary_head_rows(head_workspace.buffer.ptr, c.hidden as u32,
-                    rows as u32, c.vocab as u32, cuteafd_ffi::programs::HeadMode::Gemm)? })
-            } else { None },
-            _head_workspace: head_workspace,
         })
     }
 
@@ -1558,31 +1605,31 @@ impl<'a> DsparkDrafter<'a> {
                 }
             }
             match head {
-                HeadRef::Bf16(weight) if serving => crate::shared::draft::launch_bf16_head(w.head.as_ref().context("BF16 dSpark head was not prepared before serving")?,
-                    w.n.buffer.ptr.cast(), weight.cast(), w.logits.buffer.ptr.cast(), rows, s)?,
-                HeadRef::Bf16(weight) => crate::shared::speculation::dflash::launch_draft_head(l, w.head.as_ref().context("BF16 dSpark head was not prepared before serving")?, w.n.buffer.ptr,
-                    weight, w.logits.buffer.ptr.cast(), rows, h, c.vocab, s, self.head_mode.get())?,
-                HeadRef::Launch(launch) => launch(w.n.buffer.ptr.cast_const(), w.logits.buffer.ptr.cast(), rows, s)?,
+                HeadRef::Bf16(weight) if serving => crate::shared::draft::launch_bf16_head(w.output()?.head.as_ref().context("BF16 dSpark head was not prepared before serving")?,
+                    w.n.buffer.ptr.cast(), weight.cast(), w.output()?.logits.buffer.ptr.cast(), rows, s)?,
+                HeadRef::Bf16(weight) => crate::shared::speculation::dflash::launch_draft_head(l, w.output()?.head.as_ref().context("BF16 dSpark head was not prepared before serving")?, w.n.buffer.ptr,
+                    weight, w.output()?.logits.buffer.ptr.cast(), rows, h, c.vocab, s, self.head_mode.get())?,
+                HeadRef::Launch(launch) => launch(w.n.buffer.ptr.cast_const(), w.output()?.logits.buffer.ptr.cast(), rows, s)?,
             }
-            l.glmf_dspark_markov(w.logits.buffer.ptr, self.markov_w1.buffer.ptr, self.markov_w2.buffer.ptr,
-                self.markov_norms.buffer.ptr, w.anchors.buffer.ptr, w.tokens.buffer.ptr, w.markov_workspace.buffer.ptr, s_count, block, c.vocab,
+            l.glmf_dspark_markov(w.output()?.logits.buffer.ptr, self.head.as_ref().context("block Markov head absent")?.w1.buffer.ptr, self.head.as_ref().context("block Markov head absent")?.w2.buffer.ptr,
+                self.head.as_ref().context("block Markov head absent")?.norms.buffer.ptr, w.anchors.buffer.ptr, w.output()?.tokens.buffer.ptr, w.output()?.markov.buffer.ptr, s_count, block, c.vocab,
                 c.rank, s)?;
-            l.glmf_dspark_confidence(w.n.buffer.ptr, self.markov_w1.buffer.ptr, self.confidence_w.buffer.ptr,
-                self.confidence_b.buffer.ptr, w.anchors.buffer.ptr, w.tokens.buffer.ptr, w.confidence.buffer.ptr,
+            l.glmf_dspark_confidence(w.n.buffer.ptr, self.head.as_ref().context("block Markov head absent")?.w1.buffer.ptr, self.head.as_ref().context("block confidence head absent")?.confidence_w.buffer.ptr,
+                self.head.as_ref().context("block confidence head absent")?.confidence_b.buffer.ptr, w.anchors.buffer.ptr, w.output()?.tokens.buffer.ptr, w.output()?.confidence.buffer.ptr,
                 s_count, block, h, c.rank, s)?;
             // The round's results download on its stream; one host wait then
             // covers the round and both copies (no second, synchronous drain).
             // SAFETY: the device buffers hold `rows` words; the landing is
             // pinned, owned by the workspace and read only after the wait.
             let landing = |offset: usize| cuteafd_ffi::CuteafdHostBuffer {
-                ptr: w.landing.buffer.ptr.cast::<u8>().add(offset).cast(), bytes: rows * 4, ..w.landing.buffer };
-            l.copy_d2h_host_buffer_async(landing(0), CuteafdDeviceBuffer { bytes: rows * 4, ..w.tokens.buffer },
+                ptr: w.output()?.landing.buffer.ptr.cast::<u8>().add(offset).cast(), bytes: rows * 4, ..w.output()?.landing.buffer };
+            l.copy_d2h_host_buffer_async(landing(0), CuteafdDeviceBuffer { bytes: rows * 4, ..w.output()?.tokens.buffer },
                 rows * 4, s)?;
-            l.copy_d2h_host_buffer_async(landing(rows * 4), CuteafdDeviceBuffer { bytes: rows * 4, ..w.confidence.buffer },
+            l.copy_d2h_host_buffer_async(landing(rows * 4), CuteafdDeviceBuffer { bytes: rows * 4, ..w.output()?.confidence.buffer },
                 rows * 4, s)?;
             self.round.borrow_mut().wait(s)?;
         }
-        let (tokens, confidence) = w.landing.bytes()[..rows * 8].split_at(rows * 4);
+        let (tokens, confidence) = w.output()?.landing.bytes()[..rows * 8].split_at(rows * 4);
         let word = |b: &[u8], i: usize| u32::from_le_bytes(b[i * 4..i * 4 + 4].try_into().unwrap());
         Ok((0..s_count).map(|i| Draft {
             tokens: (0..block).map(|j| word(&tokens, i * block + j)).collect(),
@@ -1607,9 +1654,9 @@ impl<'a> DsparkDrafter<'a> {
         let w = slot.as_ref().context("no draft step ran")?;
         let bytes = sequences.checked_mul(self.cfg.block).and_then(|n| n.checked_mul(self.cfg.vocab))
             .and_then(|n| n.checked_mul(4)).context("draft logit readback overflow")?;
-        ensure!(sequences > 0 && bytes <= w.logits.buffer.bytes, "draft logit readback exceeds arena");
+        ensure!(sequences > 0 && bytes <= w.output()?.logits.buffer.bytes, "draft logit readback exceeds arena");
         let mut host = vec![0; bytes];
-        self.library.copy_d2h(&mut host, CuteafdDeviceBuffer { bytes, ..w.logits.buffer })?;
+        self.library.copy_d2h(&mut host, CuteafdDeviceBuffer { bytes, ..w.output()?.logits.buffer })?;
         Ok(host.chunks_exact(4).map(|word| f32::from_le_bytes(word.try_into().unwrap())).collect())
     }
 
