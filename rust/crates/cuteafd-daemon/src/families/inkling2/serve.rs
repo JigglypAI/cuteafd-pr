@@ -71,6 +71,7 @@ pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
             // opening headers does not load or allocate the remote weights.
             let checkpoint = Checkpoint::open_view(&view)?;
             let cfg = Inkling2Config::from_hf(&checkpoint.config)?;
+            cuteafd_bench::context::set_family("inkling2");
             cuteafd_core::set_expert_geometry(cuteafd_core::ExpertGeometry::INKLING2)
                 .map_err(|previous| anyhow::anyhow!("Inkling process geometry already fixed to {previous:?}"))?;
             // SAFETY: every device, transport and graph owner retires inside
@@ -169,6 +170,7 @@ mod tests {
         let source = include_str!("serve.rs").split("#[cfg(test)]").next().unwrap();
         assert!(source.contains("scheduler::schedule(&backend"));
         assert!(source.contains("Checkpoint::open_view(&view)?"));
+        assert!(source.contains("context::set_family(\"inkling2\")"));
         assert!(!source.contains("Checkpoint::coordinator_view("));
         assert!(source.contains("forward_initialization("));
         assert!(source.contains("finish_scheduler(&mut worker"));
