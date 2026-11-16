@@ -36,8 +36,32 @@ def geometry_native_layout(geometry: str) -> dict | None:
 
 def ownership_unit(family: str, format: str, world: int) -> int:
     policy = native_layout(family, format)
-    return policy['unit_columns'] if world in policy['exact_worlds'] else policy['legacy_unit_columns']
+    return layout_ownership_unit(policy, package_entry(family, format)['intermediate'], world)
 
+
+
+def nvfp4_ownership_unit(intermediate: int, world: int) -> int:
+    """Same integer minimax rule as cuteafd_core::tp_units; never stored padding.
+
+    Coarse alignment costs: builds/nvfp4-duel-astra/results/paired-summary.json
+    (2026-11-16, fork PR #360). Not fitted absolute latency predictions.
+    """
+    def cost(width):
+        return width * (100 if width % 128 == 0 else 103 if width % 64 == 0
+                        else 106 if width % 32 == 0 else 112)
+    def score(unit):
+        units = intermediate // unit
+        return max(cost(units // world * unit), cost(-(-units // world) * unit)), -unit
+    candidates = [unit for unit in (16, 32, 64, 128)
+                  if 1 <= world <= 8 and intermediate % unit == 0 and intermediate // unit >= world]
+    return min(candidates, key=score) if candidates else 16
+
+
+def layout_ownership_unit(policy: dict, intermediate: int, world: int) -> int:
+    if world not in policy['exact_worlds']:
+        return policy['legacy_unit_columns']
+    return (nvfp4_ownership_unit(intermediate, world) if policy['unit_columns'] == 16
+            else policy['unit_columns'])
 
 def checkpoint_expert_format(model: str) -> str | None:
     target = model.strip().lower()

@@ -40,9 +40,28 @@ pub struct NativeLayout {
 impl NativeLayout {
     pub fn exact_storage(&self, world: usize) -> bool { self.exact_worlds.contains(&world) }
 
-    pub fn ownership_unit(&self, world: usize) -> usize {
-        if self.exact_storage(world) { self.unit_columns } else { self.legacy_unit_columns }
+    pub fn ownership_unit(&self, intermediate: usize, world: usize) -> usize {
+        if !self.exact_storage(world) { return self.legacy_unit_columns; }
+        if self.unit_columns == 16 { nvfp4_ownership_unit(intermediate, world) }
+        else { self.unit_columns }
     }
+}
+
+/// Minimize the slowest exact rank, not total bytes or the average rank.
+/// Coarse alignment costs from the Astra paired curves (2026-11-16):
+/// builds/nvfp4-duel-astra/results/paired-summary.json, fork PR #360.
+/// These are an integer heuristic, not fitted absolute latency predictions.
+pub fn nvfp4_ownership_unit(intermediate: usize, world: usize) -> usize {
+    [16usize, 32, 64, 128].into_iter()
+        .filter(|&unit| world > 0 && world <= 8 && intermediate % unit == 0 && intermediate / unit >= world)
+        .min_by_key(|&unit| {
+            let units = intermediate / unit;
+            let cost = |width: usize| width as u128 * if width % 128 == 0 { 100 }
+                else if width % 64 == 0 { 103 } else if width % 32 == 0 { 106 } else { 112 };
+            let low = units / world * unit;
+            let high = units.div_ceil(world) * unit;
+            (cost(low).max(cost(high)), std::cmp::Reverse(unit))
+        }).unwrap_or(16)
 }
 
 pub fn native_layout(family: &str, format: &str) -> NativeLayout {
@@ -341,6 +360,25 @@ impl RankUnits {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn nvfp4_minimax_rank_alignment_and_unchanged_mxfp4() {
+        for (intermediate, world, unit, expected) in [
+            (3072, 5, 128, vec![640, 640, 640, 640, 512]),
+            (2304, 4, 64, vec![576; 4]), (640, 4, 32, vec![160; 4]),
+        ] {
+            assert_eq!(super::nvfp4_ownership_unit(intermediate, world), unit);
+            let widths: Vec<_> = (0..world).map(|rank|
+                super::LayerShard::new(intermediate, unit, 0, world, rank).unwrap().width).collect();
+            assert_eq!(widths, expected);
+            assert_eq!(widths.iter().sum::<usize>(), intermediate);
+        }
+        assert_eq!(crate::mxfp4_layouts::ownership_unit(2304, 4), 32);
+        for layer in 0..4 { for rank in 0..4 {
+            let shard = super::LayerShard::new(2304, 32, layer, 4, rank).unwrap();
+            assert_eq!((shard.first, shard.width), (rank * 576, 576));
+        }}
+    }
+
     use super::*;
 
     #[test]

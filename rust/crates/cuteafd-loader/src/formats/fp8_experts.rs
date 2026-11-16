@@ -635,7 +635,7 @@ impl Fp8ExpertTensors {
 
     pub fn exact_slicing(&self, tp: usize) -> Slicing {
         Slicing::Blocks(if self.coordinator { 128 } else {
-            self.exact_storage_policy(tp).map_or(self.block(), |policy| policy.ownership_unit(tp))
+            self.exact_storage_policy(tp).map_or(self.block(), |policy| policy.ownership_unit(self.shape.intermediate, tp))
         })
     }
 
@@ -1421,7 +1421,7 @@ mod tests {
             let mut tensors = catalog(format, 2304);
             tensors.shape.hidden = 4608;
             tensors.shape.experts = 384;
-            let unit = if format == ExpertFormat::Mxfp8 { 32 } else { 16 };
+            let unit = if format == ExpertFormat::Mxfp8 { 32 } else { 64 };
             assert_eq!(tensors.exact_slicing(4), Slicing::Blocks(unit));
             assert!(!tensors.needs_nvfp4_padding(4));
             for rank in 0..4 {
@@ -1444,7 +1444,7 @@ mod tests {
         assert!(exporter.contains("def exact_widths(intermediate: int, tp: int, unit: int = 128)"));
         for world in 2..=8 {
             let recipe = crate::plan::experts::spark_recipe("inkling2:mxfp8", 2304, world)?;
-            let unit = cuteafd_core::tp_units::native_layout("inkling2", "mxfp8").ownership_unit(world);
+            let unit = cuteafd_core::tp_units::native_layout("inkling2", "mxfp8").ownership_unit(2304, world);
             assert_eq!(recipe.slicing, Slicing::Blocks(unit));
             let mut covered = vec![false; 2304];
             let mut widths = Vec::new();
