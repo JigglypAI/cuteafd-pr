@@ -1258,11 +1258,16 @@ impl DeviceCache {
     /// each hit visible to pressure and donor selection before this fold.
     pub(super) fn batched_hits(&mut self, id: u64, cycle: Cycle, count: u64) {
         if count == 0 { return }
-        let Some(record) = self.records.get(&id) else { return };
-        if !self.owns(id, record.identity.bank) { return }
-        let record = self.records.get_mut(&id).unwrap();
-        let promote = !record.pinned && !record.pending_destroy && matches!(record.list, Some(List::Recent | List::Frequent));
-        self.pinned_hits(id, cycle, count);
+        let Some(record) = self.records.get_mut(&id) else { return };
+        if !(record.pinned || record.pending_capture || record.pending_destroy ||
+            matches!(record.list, Some(List::Recent | List::Frequent))) { return }
+        let promote = !record.pinned && !record.pending_destroy && record.list == Some(List::Recent);
+        record.stats.hit(cycle, count, self.clock_ms);
+        let site = record.identity.site;
+        self.counters.entry(cycle).or_default().hits += count;
+        self.update_sites.entry(site).or_default().entry(cycle).or_default().hits += count;
+        // Frequent residents are a FIFO. Last-use tokens protect hot owners;
+        // replay need not remove/reinsert an already frequent node each cycle.
         if promote { self.push(id, List::Frequent); }
     }
 
