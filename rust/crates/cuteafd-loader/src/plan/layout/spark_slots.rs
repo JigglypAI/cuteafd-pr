@@ -512,6 +512,9 @@ mod tests {
             let narrow = group_scratch("inkling2", format, 256, 4096)?;
             let wide = group_scratch("inkling2", format, 1152, 4096)?;
             assert!(narrow < wide, "narrow owner must not borrow widest scratch");
+            let exact = group_scratch("inkling2", format, 576, 4096)?;
+            assert_eq!(exact, if format == ExpertFormat::Mxfp8 { 352_198_656 } else { 648_093_696 });
+            assert!(narrow < exact && exact < wide);
             assert!(group_scratch("inkling2", format, 320, 4096).is_err(),
                 "an unrecorded width cannot borrow a neighbour or a margin");
         }
