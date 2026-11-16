@@ -1235,9 +1235,12 @@ def capture_native_exlr8_launch(snapshot: Path, deployment_path: Path, temporary
     deployment = json.loads(deployment_path.read_text())
     config = json.loads((snapshot / "config.json").read_text())
     ranks, gpus = deployment["spark_ranks"], deployment["rtx_gpus"]
-    keys = (f"SPARK_COUNT={ranks}\nRTX_GPUS={gpus}\nSPECULATOR=off\nVISION=off\nAUDIO=off\n"
+    keys = (f"SPARK_COUNT={ranks}\nRTX_GPUS={gpus}\nSPECULATOR={deployment['speculator']}\n"
+            f"VISION={deployment['report']['vision']}\nAUDIO=off\n"
             f"EXLR8_MANIFEST={deployment['exlr8']['manifest']}\n"
             f"ATTENTION_PLACEMENT={'context' if gpus == 2 else 'heads'}\n")
+    if deployment["speculator"] == "dflash2":
+        keys += "SPECULATOR_MODEL_ID=incoai/GLM-5.3-DFlash2\n"
     keys += "".join(f"SPARK_{rank}_HOST=worker-{rank}\nSPARK_{rank}_LANE_A=192.0.2.{rank + 1}\n"
                     for rank in range(ranks))
     result = _family_launch_result(temporary, config, "test/glm53-exlr8", keys,

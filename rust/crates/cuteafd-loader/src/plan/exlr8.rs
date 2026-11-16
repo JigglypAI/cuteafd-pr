@@ -131,20 +131,31 @@ fn native_options(selected: &str, options: &super::PlanOptions, speculator: &str
 pub(crate) fn spark_candidate_bytes(metadata: &residency::MetadataInput, programs: &Value,
     geometry: cuteafd_core::ExpertGeometry, executions: &cuteafd_core::SparkExecutions,
     world: usize, layers: &[usize], activations: PrefillActivations) -> Result<Vec<Vec<u64>>> {
-    (0..=layers.len()).map(|count| {
-        (0..world).map(|rank| {
-            if count == layers.len() { return Ok(0); }
-            let facts = layers[count..].iter().map(|&layer| metadata.admission_geometry(layer, world, rank,
-                residency::ExpertSet::Routed)).collect::<std::result::Result<Vec<_>, _>>()?;
-            let weights = facts.iter().try_fold(0u64, |sum, (bytes, _)| sum.checked_add(*bytes as u64))
+    let mut costs = vec![vec![0; world]; layers.len() + 1];
+    let mut weights = vec![0u64; world];
+    let mut units = vec![0; world];
+    let mut workspaces = BTreeMap::new();
+    // Each suffix adds one layer. Execution arenas depend on its widest unit
+    // count, not the onboarding count or rank, so validate each width only once.
+    for count in (0..layers.len()).rev() {
+        for rank in 0..world {
+            let (bytes, width) = metadata.admission_geometry(layers[count], world, rank,
+                residency::ExpertSet::Routed)?;
+            weights[rank] = weights[rank].checked_add(bytes as u64)
                 .context("EXLR8 candidate weight sum overflow")?;
-            let units = facts.iter().map(|(_, units)| *units).max().context("EXLR8 candidate has no layers")?;
-            weights.checked_add(crate::serving_capacity::spark_waves::exlr8_worker_bytes(programs, executions,
-                geometry, units, activations)?).and_then(|bytes| bytes.checked_add(
-                    cuteafd_core::memory_layout::spark_runtime_reserve_bytes(weights)?))
-                .context("EXLR8 candidate total overflow")
-        }).collect()
-    }).collect()
+            units[rank] = units[rank].max(width);
+            let workspace = match workspaces.entry(units[rank]) {
+                std::collections::btree_map::Entry::Occupied(entry) => *entry.get(),
+                std::collections::btree_map::Entry::Vacant(entry) => *entry.insert(
+                    crate::serving_capacity::spark_waves::exlr8_worker_bytes(programs, executions,
+                        geometry, units[rank], activations)?),
+            };
+            costs[count][rank] = weights[rank].checked_add(workspace).and_then(|bytes| bytes.checked_add(
+                cuteafd_core::memory_layout::spark_runtime_reserve_bytes(weights[rank])?))
+                .context("EXLR8 candidate total overflow")?;
+        }
+    }
+    Ok(costs)
 }
 
 pub(super) fn native_plan_of(input: &super::PlanInput, selected: &str,
@@ -173,7 +184,7 @@ pub(super) fn native_plan_of(input: &super::PlanInput, selected: &str,
     let metadata = if uncached_census_enabled() { metadata.without_census_cache() } else { metadata };
     let set_id = metadata.identity.clone();
     let shared = shared_expert_resident(&metadata, &(first_moe_layer..layers).collect::<Vec<_>>(), gpu_count)?;
-    let programs = read_json(resolved_layout.workspace_manifest.as_deref()
+    let programs = input.manifest(resolved_layout.workspace_manifest.as_deref()
         .unwrap_or_else(|| Path::new("/opt/cuteafd/share/PROGRAMS.json")))?;
     let records = dense::DenseRecord::inventory(snapshot)?;
     let selection = dense::DenseSelection::from_hf(&checkpoint.config)?;
@@ -1342,6 +1353,45 @@ mod tests {
     use super::*;
     use serde_json::json;
     use std::io::Write;
+
+    #[test]
+    fn suffix_candidate_costs_equal_independent_suffix_censuses() -> Result<()> {
+        use crate::plan::{spark_executions::{admit_family, SparkBackend}, testing::exlr8};
+        let root = tempfile::tempdir()?;
+        exlr8::glm_admission_snapshot(root.path());
+        let metadata = residency::MetadataInput::open(root.path(), "k4")?;
+        let programs = exlr8::glm_admission_programs();
+        let geometry = cuteafd_core::ExpertGeometry { hidden: 6144, intermediate: 2048,
+            experts: 256, topk: 8, layers: 2 };
+        for world in [1, 4, 6, 8] {
+            for activations in [PrefillActivations::A16, PrefillActivations::A8] {
+                let executions = admit_family("glm5", &SparkBackend::Exlr8.exports(), None, 2752, 3)?;
+                // Repeated layer IDs exercise nonempty suffixes without a second
+                // checkpoint; the baseline independently sums every suffix.
+                let layers = [1, 1, 1];
+                let costs = spark_candidate_bytes(&metadata, &programs, geometry, &executions,
+                    world, &layers, activations)?;
+                for count in 0..=layers.len() {
+                    for rank in 0..world {
+                        let expected = if count == layers.len() { 0 } else {
+                            let facts = layers[count..].iter().map(|&layer|
+                                metadata.admission_geometry(layer, world, rank, residency::ExpertSet::Routed))
+                                .collect::<std::result::Result<Vec<_>, _>>()?;
+                            let weights = facts.iter().map(|(bytes, _)| *bytes as u64).sum::<u64>();
+                            let units = facts.iter().map(|(_, units)| *units).max().unwrap();
+                            weights + crate::serving_capacity::spark_waves::exlr8_worker_bytes(
+                                &programs, &executions, geometry, units, activations)?
+                                + cuteafd_core::memory_layout::spark_runtime_reserve_bytes(weights).unwrap()
+                        };
+                        assert_eq!(costs[count][rank], expected, "world={world} count={count} rank={rank}");
+                    }
+                }
+                assert_eq!(spark_candidate_bytes(&metadata, &programs, geometry, &executions,
+                    world, &[], activations)?, vec![vec![0; world]]);
+            }
+        }
+        Ok(())
+    }
 
     #[test]
     fn native_min_max_worker_devices_preserve_residents_and_rtx_layout() {

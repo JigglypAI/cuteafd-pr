@@ -537,7 +537,7 @@ fn run_installed_glm_exlr8_worker_budget(hf_home: Option<std::ffi::OsString>,
             command.args(["30", env!("CARGO_BIN_EXE_cuteafd"), "plan"])
                 .arg(&snapshot).args(["--deployment", "--config"]).arg(&example)
                 .args(["--rtx", gpus, "--spark-ranks", &ranks.to_string(),
-                    "--vision", "off", "--audio", "off", "--speculator", "off",
+                    "--vision", config["VISION"], "--audio", "off", "--speculator", config["SPECULATOR"],
                     "--exlr8-manifest", config["EXLR8_MANIFEST"]])
                 ;
             command.arg("--workspace-manifest").arg(&programs);
