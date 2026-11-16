@@ -121,6 +121,7 @@ mod first_request_tests {
 /// Startup-miss variants are cumulative too: each distinct shape a sealed graph
 /// set lacked with its eager run count, so a client sees which one to add.
 pub(crate) fn graph_capture_stats(stats: &mut serde_json::Value) {
+    stats["totals"] = crate::shared::console::totals::snapshot();
     static PREVIOUS: std::sync::Mutex<Vec<(String, u64)>> = std::sync::Mutex::new(Vec::new());
     let mut previous = PREVIOUS.lock().unwrap_or_else(|p| p.into_inner());
     let tables = cuteafd_loader::mapped_table_stats_with_intervals();

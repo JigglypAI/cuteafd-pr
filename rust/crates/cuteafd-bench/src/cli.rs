@@ -133,6 +133,28 @@ fn check_context_suffix(report: &mut Report, requested: u64) {
     }
 }
 
+/// An older server may ignore unknown fields: require evidence of the configured run.
+fn check_panel_config(report: &mut Report, configs: &crate::panel_config::PanelConfigs) {
+    for (panel, config) in configs {
+        let options = match panel.as_str() {
+            "decode_content" => crate::panels::speed::DecodeOptions::parse(config).ok(),
+            _ => None,
+        };
+        let supported = options.is_some_and(|options| report.panels.iter().find(|p| &p.id == panel).is_some_and(|p|
+            !p.passes.is_empty() && p.passes.iter().all(|pass| {
+                let rows = pass["rows"].as_array();
+                pass.get("sampling") == Some(&options.sampling()) && rows.is_some_and(|rows|
+                    !rows.is_empty() && options.contents.as_ref().is_none_or(|contents|
+                        rows.len() == contents.len() && contents.iter().all(|content|
+                            rows.iter().any(|r| r["content"].as_str() == Some(content.as_str())))))
+            })));
+        if !supported {
+            report.status = RunStatus::Failed;
+            report.error = Some(format!("server did not record requested {panel} panel-config settings"));
+        }
+    }
+}
+
 /// Starts a run on `options.url`, follows it to the end and writes the exports.
 pub fn run(options: &RunOptions) -> Result<(Report, PathBuf)> {
     crate::panel_config::validate(&options.panel_config)?;
@@ -200,6 +222,7 @@ pub fn run(options: &RunOptions) -> Result<(Report, PathBuf)> {
     // server went away cannot carry a verdict the data no longer earns.
     let mut report = crate::quality::under_current_rule(&report);
     check_context_suffix(&mut report, options.context_suffix.unwrap_or(0));
+    check_panel_config(&mut report, &options.panel_config);
     let written = write_exports(&report, &dir, &options.export)?;
     if !options.quiet {
         if let Some(card) = report.baseline.as_ref().map(|b| &b.card) {
@@ -335,6 +358,23 @@ pub fn write_bytes_if_changed(path: &Path, bytes: &[u8]) -> Result<bool> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn older_server_cannot_silently_ignore_sampled_panel_config() {
+        let configs = std::collections::BTreeMap::from([("decode_content".into(),
+            serde_json::json!({"contents":["code"],"temperature":1.0,"top_p":0.95,"seed":42}))]);
+        let mut report = crate::sample::report(false);
+        report.panels.retain(|p| p.id != "decode_content");
+        report.panels.push(crate::report::PanelResult { id:"decode_content".into(),
+            passes:vec![serde_json::json!({"rows":[{"content":"code"}]})], ..Default::default() });
+        super::check_panel_config(&mut report, &configs);
+        assert_eq!(report.status, crate::report::RunStatus::Failed);
+        report.status = crate::report::RunStatus::Done;
+        report.panels.last_mut().unwrap().passes[0]["sampling"] =
+            serde_json::json!({"temperature":1.0,"top_p":0.95,"seed":42});
+        super::check_panel_config(&mut report, &configs);
+        assert_eq!(report.status, crate::report::RunStatus::Done);
+    }
+
     #[test]
     fn old_server_ignoring_suffix_cannot_return_a_passing_report() {
         let mut report = crate::sample::report(false);

@@ -133,7 +133,7 @@ impl DecodeOptions {
         body
     }
 
-    fn sampling(&self) -> Value {
+    pub(crate) fn sampling(&self) -> Value {
         let mut settings = json!({"temperature": self.temperature.unwrap_or(0.0)});
         if let Some(top_p) = self.top_p { settings["top_p"] = json!(top_p); }
         if let Some(seed) = self.seed { settings["seed"] = json!(seed); }

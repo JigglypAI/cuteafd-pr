@@ -853,6 +853,21 @@ fn startup(doc: &mut Doc, t: &Theme, v: &Value, w: f64) -> f64 {
 #[cfg(test)]
 mod context_load_tests {
     #[test]
+    fn sampled_decode_report_shows_settings_rate_and_bonus_length() {
+        let value = serde_json::json!({"sampling":{"temperature":1.0,"top_p":0.95,"seed":42},
+            "rows":[{"content":"code","tok_s":60,"tokens":256,"acceptance":0.75,"acceptance_length":4.0}]});
+        for width in [360.0, 700.0] {
+            let mut doc = super::Doc::new(width, 200.0);
+            super::decode_content(&mut doc, &super::super::theme::NORMAL, &value, width);
+            let svg = doc.finish();
+            for label in ["temperature 1.0", "top_p 0.95", "seed 42", "75% accepted", "4.00 length"] {
+                assert!(svg.contains(label), "{label}");
+            }
+            super::super::png::png(&svg, 1.0).unwrap();
+        }
+    }
+
+    #[test]
     fn fidelity_panel_shows_recorded_precision_and_root_reason() {
         let mut value = serde_json::json!({"decode":{}});
         for root in [false, true] {
