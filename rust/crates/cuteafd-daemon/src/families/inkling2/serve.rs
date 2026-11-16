@@ -13,13 +13,14 @@ pub(crate) struct ServeArgs {
     #[arg(long, default_value_t=0)] pub device: i32,
     #[arg(long, value_delimiter=',')] pub peers: Vec<SocketAddr>,
     #[arg(long)] pub pool_tokens: Option<u64>,
-    #[arg(long="max-context-tokens")] pub max_context: Option<usize>,
+    #[arg(long="max-context-tokens", value_parser=crate::shared::context::parse_tokens::<usize>)]
+    pub max_context: Option<usize>,
     #[arg(long, default_value="auto")] pub rtx_expert_layers: cuteafd_loader::placement::OnboardSetting,
     #[arg(long, default_value_t=16)] pub max_sequences: usize,
     #[arg(long, default_value="0.0.0.0:8000")] pub listen: String,
     #[arg(long)] pub model_id: Option<String>,
     #[arg(long)] pub prefill_rows: Option<usize>,
-    #[arg(long)] pub prefill_waves: Option<u8>,
+    #[arg(long, value_parser=clap::value_parser!(u8).range(1..=3))] pub prefill_waves: Option<u8>,
     #[command(flatten)] pub prefix: PrefixArgs,
     #[command(flatten)] pub draft_length: crate::shared::draft::length::DraftLength,
     #[command(flatten)] pub decode_share: crate::shared::prefill_share::DecodeShareArgs,
@@ -124,6 +125,40 @@ pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use clap::Parser;
+
+    #[test]
+    fn launcher_argv_and_resolved_startup_seam_match() -> anyhow::Result<()> {
+        let argv = ["cuteafd", "--gpu-memory-cap", "97250MiB", "serve-inkling2",
+            "--snapshot", "/model", "--coordinator-weight-budget-gib", "94.97",
+            "--native-lib", "/opt/cuteafd/lib/libcuteafd_native.so",
+            "--peers", "10.55.0.1:19923,10.55.0.2:19923,10.55.0.3:19923,10.55.0.4:19923,10.55.0.5:19923,10.55.0.6:19923",
+            "--listen", "0.0.0.0:8823", "--max-sequences", "16", "--max-context-tokens", "auto",
+            "--max-output-tokens", "131072", "--embedding-placement", "gpu", "--core-view", "original",
+            "--prefix-cache-entries", "20", "--host-cache-bytes", "auto", "--rtx-expert-layers", "auto",
+            "--prefill-rows", "2752", "--prefill-waves", "3"];
+        let crate::cli::Commands::ServeInkling2(mut args) = crate::cli::Cli::try_parse_from(argv)?.command
+            else { anyhow::bail!("Inkling command not parsed") };
+        assert_eq!((args.max_context, args.max_sequences, args.peers.len()), (Some(0), 16, 6));
+        crate::commands::bench::assert_resolved_family_seam("serve-inkling2", &[], || {
+            args.prefix.resolve_entries(args.max_sequences);
+            let prefill = args.prefill()?;
+            assert_eq!((prefill.unit_rows, prefill.waves), (2752, 3));
+            cuteafd_bench::context::ResolvedSettings::default()
+                .value("max-context-tokens", 262144).value("pool-tokens", 2097152)
+                .value("rtx-expert-layers", 0).value("prefill-rows", prefill.unit_rows)
+                .value("prefill-waves", prefill.waves).publish();
+            Ok(())
+        })?;
+        for invalid in ["0", "01", "1048577"] {
+            let mut bad = argv.to_vec();
+            let at = bad.iter().position(|value| *value == "--max-context-tokens").unwrap();
+            bad[at+1] = invalid;
+            assert!(crate::cli::Cli::try_parse_from(bad).is_err());
+        }
+        Ok(())
+    }
+
     #[test]
     fn shared_scheduler_owns_lanes_commit_and_last_fallible_readiness() {
         let source = include_str!("serve.rs").split("#[cfg(test)]").next().unwrap();

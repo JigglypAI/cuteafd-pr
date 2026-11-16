@@ -329,6 +329,33 @@ fn spark_charges_match_shared_group_arenas_and_typed_owner_census() -> anyhow::R
 }
 
 #[test]
+fn installed_native_minimum_is_six_sparks_with_full_pool() -> anyhow::Result<()> {
+    use std::path::PathBuf;
+    use crate::plan::{ExpertPlacement, MediaMode, layout::LayoutOptions};
+    let home = PathBuf::from(std::env::var_os("CUTEAFD_DEPLOYMENT_TEST_HF_HOME")
+        .expect("CUTEAFD_DEPLOYMENT_TEST_HF_HOME is required"));
+    let snapshot = crate::model_cache_dir(&home, "thinkingmachines/Inkling-2-Small-MXFP8")
+        .join("snapshots/3febc62259ee92ea36e2fb6e8303371c4eb3922c");
+    let manifest = PathBuf::from(std::env::var_os("CUTEAFD_DEPLOYMENT_TEST_PROGRAMS")
+        .expect("CUTEAFD_DEPLOYMENT_TEST_PROGRAMS is required"));
+    anyhow::ensure!(snapshot.is_dir() && manifest.is_file(), "installed Inkling inputs missing");
+    let input = testing::BudgetedPlanInput::open(&snapshot)?;
+    let options = PlanOptions { placement: ExpertPlacement::from_spark_ranks(6),
+        vision: MediaMode::Off, audio: MediaMode::Off,
+        layout: Some(LayoutOptions { workspace_manifest: Some(manifest), ..Default::default() }),
+        ..Default::default() };
+    let report = input.plan(&options)?;
+    assert_eq!(report.runtime, Some(RuntimeStatus::Planned));
+    assert!(report.fits && report.placement_supported && report.native_serving_admitted, "{:?}", report.hints);
+    assert!(report.wip_launchable() && !report.executable());
+    assert_eq!(report.memory_layout.as_ref().unwrap().pool_tokens, 2_097_152);
+    let refused = input.plan(&PlanOptions { placement: ExpertPlacement::from_spark_ranks(5), ..options })?;
+    assert!(!refused.fits && !refused.placement_supported);
+    assert!(refused.hints.iter().any(|hint| hint.what.contains("joint admission refused")), "{:?}", refused.hints);
+    Ok(())
+}
+
+#[test]
 fn structural_open_names_missing_tensors_and_accepts_reports_drift_per_tensor() {
     let (dir, small, tensors) = fixture(Fixture::Mxfp8);
     // A missing conv tensor is a typed open error naming it.

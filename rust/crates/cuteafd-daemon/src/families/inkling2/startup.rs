@@ -166,8 +166,13 @@ pub(crate) fn whole<'a>(library: &'a Arc<NativeLibrary>, programs: &'a Programs<
     use crate::shared::{memory::device::{Device, Stream}, spark_intake::SparkLink};
     use cuteafd_transport::{expert::{SparkWorld, EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16},
         ExpertV2Dtype, SparkSessionShape, TcpTransportConfig};
+    let phase = crate::shared::memory::load_timing::Split::start();
     let prepared = prepare(library, programs, checkpoint, cfg, Options { ..options })?;
+    phase.log("inkling2 code and admission");
+    let phase = crate::shared::memory::load_timing::Split::start();
     let (target, pushed) = deliver(library, view, checkpoint, &prepared, &options)?;
+    phase.log("inkling2 grouped weight delivery");
+    let phase = crate::shared::memory::load_timing::Split::start();
     let Prepared { kernels, encoding, inputs, admitted, module_pins, exl3_modules, .. } = prepared;
     let device = Device { library, id: options.device };
     let stream = std::rc::Rc::new(Stream::new(device)?);
@@ -207,6 +212,7 @@ pub(crate) fn whole<'a>(library: &'a Arc<NativeLibrary>, programs: &'a Programs<
     super::admission::reconcile_requests(&admitted.solved, &inputs, &inventory.receipts)?;
     // Runtime backends now retain the same code sampled before weights.
     drop(module_pins); drop(exl3_modules);
+    phase.log("inkling2 request owners and transport bootstrap");
     Ok((execution, inputs, admitted, encoding))
 }
 
