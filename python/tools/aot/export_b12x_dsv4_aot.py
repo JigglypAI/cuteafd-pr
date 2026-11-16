@@ -279,6 +279,38 @@ def draft_bf16_shapes():
     return result
 
 
+def inkling_draft_programs():
+    from functools import partial
+    from b12x.integration.cuteafd import inkling_drafter as draft
+    out = []
+    for name in ("dflare_mix", "mask_init", "recurrent_gate", "head_fold", "logit_finish", "residual_norm"):
+        out.append((name, name, {"max_rows": 64 if name in ("mask_init", "recurrent_gate")
+                    else 448 if name == "logit_finish" else 4096}, getattr(draft, f"compile_inkling_{name}_aot")))
+    for q, k in ((48, 8), (24, 4), (0, 8), (0, 4)):
+        out.append((f"qk_norm_rope_q{q}_k{k}", "qk_norm_rope", {"max_rows": 4096},
+                    partial(draft.compile_inkling_qk_norm_rope_aot, q_heads=q, kv_heads=k)))
+    for width in (18432, 9216):
+        out.append((f"silu_mul_i{width}", "silu_mul", {"max_rows": 4096},
+                    partial(draft.compile_inkling_silu_mul_aot, intermediate=width)))
+    for width in (768, 201024):
+        suffix = "f32" if width == 768 else "bf16"
+        out.append((f"bias_add_w{width}_{suffix}", "bias_add", {"max_rows": 448},
+                    partial(draft.compile_inkling_bias_add_aot, width=width)))
+    for heads in (8, 4):
+        for kv_format in ("fp8", "bf16"):
+            out.append((f"kv_store_k{heads}_{kv_format}", "kv_store", {"max_rows": 4096},
+                        partial(draft.compile_inkling_kv_store_aot, kv_heads=heads, kv_format=kv_format)))
+    return out
+
+
+def inkling_draft_projection_shapes(ranks):
+    if ranks not in (1, 2):
+        raise ValueError("recurrent draft projections require TP1 or TP2")
+    h, q, kv, inter = 4608, 6144//ranks, 1024//ranks, 18432//ranks
+    return {(h, q), (h, kv), (q, h), (h, inter), (inter, h),
+            (9728, 768), (256, 201024), (4608, 201024)}
+
+
 def inkling2_projection_shapes():
     """(K,N) of released native core operands, including small sink/tap projections."""
     return {(4608, 6144), (4608, 768), (4608, 1024), (4608, 48),
@@ -2021,6 +2053,13 @@ def main() -> None:
         work += [("inkling2", *item) for item in inkling2_attention_programs(args.decode_rows, args.prefill_rows)]
         work += [("inkling2", *item) for item in inkling2_producer_programs(args.prefill_rows)]
         work += [("inkling2", *item) for item in inkling2_load_programs()]
+        work += [("inkling_draft", *item) for item in inkling_draft_programs()]
+        for k, n in sorted(inkling_draft_projection_shapes(1) | inkling_draft_projection_shapes(2)):
+            work.append(("draft_bf16", f"k{k}_n{n}", "bf16_projection", {"max_rows": 4096},
+                         lambda k=k, n=n: compile_draft_bf16_projection(k, n)))
+        for k, n in ((9728, 768), (256, 201024)):
+            work.append(("draft_bf16", f"k{k}_n{n}_f32", "bf16_projection", {"max_rows": 4096},
+                         lambda k=k, n=n: compile_draft_bf16_projection(k, n, "f32")))
         work.append(("inkling2", "expert_input_quant", "expert_input_quant", {"max_rows": 4096},
                      inkling2_input_quant_program))
         # Share DraftProjections unchanged. The D16 relative bias projection

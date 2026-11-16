@@ -92,3 +92,80 @@ mod tests {
         Ok(())
     }
 }
+
+/// Physical rank-local mutable owners. Projections and the target adapter use
+/// the same inventory; full context cache bytes are a pool-dependent curve.
+#[derive(Debug, Clone)]
+pub struct RecurrentRuntimeLayout {
+    pub rank: super::RecurrentRank,
+    pub slots: usize,
+    pub sequences: usize,
+    pub context_rows: usize,
+    pub buffers: Vec<(String, usize)>,
+    pub kv_cache: Qwen4KvCache,
+    pub cache: DraftCacheLayout,
+    pub window_mark_bytes: usize,
+}
+
+impl RecurrentRuntimeLayout {
+    pub fn new(config: &RecurrentBlockConfig, slots: usize, sequences: usize,
+        context_rows: usize, context: usize, target_tokens: usize, sms: usize,
+        kv_cache: Qwen4KvCache, rank: usize, ranks: usize, lead: usize) -> Result<Self> {
+        ensure!(sequences > 0 && sequences <= slots && context_rows > 0 && context_rows <= 4096 && sms > 0,
+            "recurrent draft work capacity outside native exports");
+        let local = config.rank(rank, ranks, lead)?;
+        let cache = config.cache_layout(slots, context, target_tokens, kv_cache, rank, ranks, lead)?;
+        let c = &config.transformer;
+        let (h, r) = (c.hidden, c.markov_rank);
+        let rows = sequences.checked_mul(c.block).context("draft rows overflow")?;
+        let q = local.heads.checked_mul(c.head_dim).context("draft q overflow")?;
+        let kv = local.kv_heads.checked_mul(c.head_dim).context("draft kv overflow")?;
+        let mul = |values: &[usize]| values.iter().try_fold(1usize, |n, value| n.checked_mul(*value))
+            .context("recurrent runtime owner extent overflow");
+        let mut buffers = Vec::new();
+        let mut add = |name: String, bytes: usize| {
+            buffers.push((name, crate::serving_capacity::WeightArenaLayout::allocation_bytes(bytes)));
+        };
+        for (layer, bytes) in cache.layer_bytes.iter().enumerate() {
+            for plane in ["k", "v"] { add(format!("cache.layer.{layer}.{plane}"), bytes/2); }
+        }
+        if cache.page_table_bytes > 0 { add("cache.tables".into(), usize::try_from(cache.page_table_bytes)?); }
+        add("cache.last_features".into(), mul(&[slots, h, 2])?);
+        for (name, width, element) in [("taps", mul(&[config.taps.len(), h])?, 2),
+            ("mixed", h, 2), ("kv", 2*kv, 2), ("key", kv, 2), ("value", kv, 2),
+            ("positions", 1, 8), ("destinations", 1, 8)] {
+            add(format!("context.{name}"), mul(&[context_rows, width, element])?);
+        }
+        for (name, width, element) in [("residual", h, 2), ("residual_next", h, 2),
+            ("normalized", h, 2), ("qkv", q+2*kv, 2), ("query", q, 2), ("key", kv, 2),
+            ("value", kv, 2), ("attention", q, 2), ("partial", h, 2),
+            ("gate_up", 2*local.intermediate, 2), ("activated", local.intermediate, 2),
+            ("positions", 1, 8)] {
+            add(format!("step.{name}"), mul(&[rows, width, element])?);
+        }
+        add("projection.bf16".into(), mul(&[context_rows.max(rows), local.intermediate.max(q).max(h), 2])?);
+        add("step.anchors".into(), mul(&[sequences, h, 2])?);
+        add("step.ids".into(), mul(&[sequences, 4])?);
+        add("step.tables".into(), mul(&[sequences, 3, 4])?);
+        let attention_keys = context.checked_add(c.block).context("draft attention keys overflow")?;
+        add("step.attention_workspace".into(), usize::try_from(crate::serving_capacity::draft_attention_workspace_bytes(
+            sequences as u64, local.kv_heads as u64,
+            (local.heads/local.kv_heads*c.block).div_ceil(32) as u64,
+            attention_keys as u64, c.head_dim as u64, sms as u64)?)?);
+        // Immutable rotary frequencies are tiny, unlike a max-position cos/sin table.
+        add("rotary.frequencies".into(), c.head_dim/2*4);
+        if rank == lead {
+            for (name, width, element) in [("hidden", h, 2), ("f_rnn", h, 2), ("state", r, 2),
+                ("next_state", r, 2), ("latent", r, 2), ("previous_embedding", r, 2),
+                ("inputs", config.recurrent_input_width()?, 2), ("projection", 3*r, 4),
+                ("raw", 3*r, 4), ("base", config.padded_vocab, 2),
+                ("correction_f32", config.padded_vocab, 4), ("correction", config.padded_vocab, 2),
+                ("logits_bf16", config.valid_vocab, 2), ("logits", config.valid_vocab, 4),
+                ("tokens", c.block-1, 4), ("previous", 1, 4), ("status", 1, 4)] {
+                add(format!("head.{name}"), mul(&[sequences, width, element])?);
+            }
+        }
+        Ok(Self { rank: local, slots, sequences, context_rows, buffers, kv_cache, cache,
+            window_mark_bytes: config.window_mark_bytes(kv_cache, rank, ranks, lead)? })
+    }
+}

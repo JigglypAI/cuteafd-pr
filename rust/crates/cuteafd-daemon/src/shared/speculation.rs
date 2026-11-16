@@ -1,6 +1,8 @@
 //! Shared speculative draft helpers; serving lifecycles stay with each family.
 
 pub(crate) mod block_dspark;
+pub(crate) mod recurrent_weights;
+pub(crate) mod recurrent_forward;
 pub(crate) mod dflash;
 pub(crate) mod gqa_tp2;
 pub(crate) mod target;
