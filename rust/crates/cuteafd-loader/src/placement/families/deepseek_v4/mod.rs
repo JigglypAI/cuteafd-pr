@@ -98,6 +98,7 @@ pub struct V4Inputs {
 /// Native C4 context kernel scratch, read from the selected AOT manifest.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct V4Context {
+    pub selector_tile: Option<cuteafd_core::coordinator_programs::scored_decode::ScoredDecodeTile>,
     pub topk_scratch: u64,
     pub partial_scratch: u64,
 }
@@ -116,7 +117,8 @@ pub fn manifest_context(manifest: &serde_json::Value, family: &str, heads: usize
         name.starts_with(&format!("{family}_sparse_mla_partial_h{begin}_s"))
             && name.ends_with(&format!("_m{decode_rows}"))))
         .map(|p| p["scratch_bytes_at_capacity"]["scratch"].as_u64().unwrap_or(0)).max();
-    Some(V4Context { topk_scratch: lookup(&format!("{family}_scored_index_topk_decode_m{decode_rows}"))?,
+    Some(V4Context { selector_tile: cuteafd_core::coordinator_programs::scored_decode::ScoredDecodeTile::from_geometry(
+        &programs.iter().find(|p| p["name"] == format!("{family}_scored_index_topk_decode_m{decode_rows}"))?["geometry"]).ok()?, topk_scratch: lookup(&format!("{family}_scored_index_topk_decode_m{decode_rows}"))?,
         partial_scratch: partial(0)?.max(partial(heads / 2)?) })
 }
 
@@ -140,7 +142,9 @@ pub fn context_workspace(cfg: &DeepseekV4Config, extent: u64, prefill_rows: u64,
     let commit = 4 * 3 * context_commit_units(prefill_rows) * 8;
     let mut out = vec![("candidates", decode_rows * cfg.index_topk as u64 * 8),
         ("own-head partial", partial), ("peer-head partial", partial),
-        ("scored top-k scratch", context.topk_scratch), ("partial scratch", context.partial_scratch),
+        ("scored top-k scratch", context.selector_tile.map_or(context.topk_scratch, |tile|
+            tile.bytes(cuteafd_core::coordinator_programs::scored_decode::admitted_pages(extent, 256))
+                .expect("validated deployment selector capacity"))), ("partial scratch", context.partial_scratch),
         ("gather tables", (prefill_lanes + crate::serving_capacity::V4_PACKED_MEMBERS as u64) * 2 * half * 4), ("local selected lengths", decode_rows * 4),
         ("empty window lengths", decode_rows * 4)];
     out.extend((0..prefill_lanes + crate::serving_capacity::V4_PACKED_MEMBERS as u64).map(|_| ("commit blocks", commit)));
@@ -403,7 +407,7 @@ mod default_tests {
             cfg.index_topk = topk;
             cfg.compress_ratios = vec![4; c4_layers];
             for rows in [1, 64, 65, 128] {
-                let scratch = V4Context { topk_scratch: 12345, partial_scratch: 56789 };
+                let scratch = V4Context { selector_tile: None, topk_scratch: 12345, partial_scratch: 56789 };
                 let buffers = context_buffers(&cfg, 1 << 20, 4096, rows, 2, scratch);
                 let workspace = context_workspace(&cfg, 1 << 20, 4096, rows, 2, scratch);
                 assert_eq!(buffers.lanes, 1);
@@ -495,7 +499,7 @@ mod default_tests {
             input.cache_stages = 3;
             input.attention = Some(attention);
             input.context = (attention == AttentionPlacement::Context)
-                .then_some(V4Context { topk_scratch: 12345, partial_scratch: 56789 });
+                .then_some(V4Context { selector_tile: None, topk_scratch: 12345, partial_scratch: 56789 });
             let prepared = prepare(&input).unwrap();
             let solved = prepared.admit(production_request(&input)).unwrap().solved;
             for gpu in 0..2u8 {
@@ -704,7 +708,7 @@ mod default_tests {
             serde_json::json!({"name":name,"scratch_bytes_at_capacity":{"scratch":i as u64 * 1024}}))
             .collect::<Vec<_>>()});
         assert_eq!(manifest_context(&manifest, "dsv4f", 64, 64),
-            Some(V4Context { topk_scratch: 0, partial_scratch: 6144 }));
+            Some(V4Context { selector_tile: None, topk_scratch: 0, partial_scratch: 6144 }));
         for missing in 0..names.len() {
             let mut incomplete = manifest.clone();
             incomplete["programs"].as_array_mut().unwrap().remove(missing);
