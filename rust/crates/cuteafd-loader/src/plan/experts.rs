@@ -232,7 +232,7 @@ pub fn spark_recipe(package: &str, intermediate: usize, world: usize) -> Result<
     let policy = cuteafd_core::tp_units::native_layout(family, format);
     let block = if native && mxfp4 {
         cuteafd_core::mxfp4_layouts::ownership_unit(intermediate, world)
-    } else { policy.ownership_unit(world) };
+    } else { policy.ownership_unit(intermediate, world) };
     if !(1..=8).contains(&world) || intermediate == 0 || intermediate % block != 0 || intermediate / block < world {
         return Err(SparkRecipeRefusal::GeometryInvalid { intermediate, world, block });
     }
@@ -246,7 +246,7 @@ pub fn spark_recipe(package: &str, intermediate: usize, world: usize) -> Result<
     let packaged_intermediate = coverage["intermediate"].as_u64().unwrap_or(0) as usize;
     let required = package_width_keys(intermediate, block, world, exl3, native, nvfp4 && !policy.exact_storage(world));
     let available = worlds.iter().flat_map(|&count|
-        package_width_keys(packaged_intermediate, if native && mxfp4 { block } else { policy.ownership_unit(count) },
+        package_width_keys(packaged_intermediate, if native && mxfp4 { block } else { policy.ownership_unit(packaged_intermediate, count) },
             count, exl3, native, nvfp4 && !policy.exact_storage(count)))
         .collect::<std::collections::BTreeSet<_>>();
     if required.is_empty() || !required.iter().all(|width| available.contains(width)) {
