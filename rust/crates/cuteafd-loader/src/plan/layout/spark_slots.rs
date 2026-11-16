@@ -160,14 +160,15 @@ pub(crate) fn catalog_owner_bytes(catalog: &crate::OfficialV41Catalog, family: &
     if !rows.iter().any(|row| row["family"] == family && row["format"] == "exl3" && row["width"].is_number()) {
         return exl3_owner_bytes(family, geometry, extent, None);
     }
-    let mut widths = Vec::new();
-    for &layer in &working.spark_layers {
-        let residency = catalog.exl3_spark_residency(crate::V41Exl3Layer::Backbone(layer), working.spark_ranks, rank)?;
-        let key = (u32::try_from(residency.intermediate)?, residency.unit_map.is_some());
-        if !widths.contains(&key) { widths.push(key); }
-    }
-    anyhow::ensure!(widths.len() == 1, "EXL3 worker requires one retained width/ABI, found {widths:?}");
-    recorded_exl3_owner_bytes(rows, family, geometry, widths[0].0, widths[0].1, extent)
+    anyhow::ensure!(!working.spark_layers.is_empty(), "EXL3 worker has no retained layers");
+    let package_family = geometry.family().context("EXL3 worker geometry has no package family")?;
+    let tiers = catalog.exl3().context("EXL3 worker needs its catalog")?.decoder_tiers()
+        .iter().map(usize::to_string).collect::<String>();
+    let recipe = super::super::experts::spark_recipe(&format!("{package_family}:exl3-k{tiers}"),
+        geometry.intermediate as usize, working.spark_ranks)?;
+    let width = *recipe.stored_widths.get(rank).context("EXL3 worker rank outside recipe")?;
+    let compact = recipe.rule == cuteafd_core::tp_units::UnitRule::Rotated;
+    recorded_exl3_owner_bytes(rows, family, geometry, width.try_into()?, compact, extent)
 }
 
 fn recorded_exl3_owner_bytes(rows: &[serde_json::Value], family: &str,

@@ -72,7 +72,15 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
         .collect::<Vec<_>>();
     let spark_bytes = opts.spark_capacities(ranks).into_iter().max().unwrap_or(0);
     let sequences = opts.resolved_concurrency("inkling2");
-    let request = FactsRequest { checkpoint: input.checkpoint(), cfg, kv_format: opts.inkling_kv, manifest_path: manifest_path.as_deref(),
+    let catalog = match input.expert_catalog() {
+        Ok(catalog) => catalog,
+        Err(error) => {
+            report.refuse_placement(format!("Inkling 2 shared expert catalog refused: {error:#}"),
+                "Provide complete expert headers for the selected checkpoint view.");
+            return empty(notes);
+        }
+    };
+    let request = FactsRequest { checkpoint: input.checkpoint(), catalog, cfg, kv_format: opts.inkling_kv, manifest_path: manifest_path.as_deref(),
         manifest, coordinator: Coordinator::Planned { cards: cards.clone() }, attention, spark_ranks: ranks,
         spark_bytes, prefill: shape, context_tokens: opts.context_tokens, pool_tokens: opts.pool_tokens, sequences,
         host, host_cache_bytes: opts.host_cache_bytes, prefix_entries: opts.prefix_entries("inkling2"),

@@ -97,6 +97,28 @@ fn fixture_with_experts(kind: Fixture, experts: usize, topk: usize) -> (tempfile
 }
 
 #[test]
+fn layout_reuses_one_immutable_catalog_across_candidates() -> anyhow::Result<()> {
+    let (dir, _, _) = fixture(Fixture::Exl3);
+    let input = plan::PlanInput::open(dir.path())?;
+    let catalog = input.expert_catalog()? as *const crate::OfficialV41Catalog;
+    for entry in std::fs::read_dir(dir.path())? {
+        let path = entry?.path();
+        if path.extension().is_some_and(|extension| extension == "safetensors") {
+            std::fs::remove_file(path)?;
+        }
+    }
+    for ranks in [3, 6, 3] {
+        let report = input.plan(&PlanOptions { placement: plan::ExpertPlacement::from_spark_ranks(ranks),
+            vision: plan::MediaMode::Off, audio: plan::MediaMode::Off,
+            layout: Some(plan::layout::LayoutOptions::default()), ..Default::default() })?;
+        assert!(report.memory_layout.as_ref().is_some_and(|layout| !layout.devices.is_empty()), "{:?}", report.hints);
+        assert!(!report.hints.iter().any(|hint| hint.what.contains("catalog refused")), "{:?}", report.hints);
+        assert_eq!(catalog, input.expert_catalog()? as *const crate::OfficialV41Catalog);
+    }
+    Ok(())
+}
+
+#[test]
 fn inkling_mxfp8_inventory_is_planned_not_executable() {
     let (dir, _, _) = fixture(Fixture::Mxfp8);
     let report = plan::plan(dir.path(), &PlanOptions::default()).unwrap();

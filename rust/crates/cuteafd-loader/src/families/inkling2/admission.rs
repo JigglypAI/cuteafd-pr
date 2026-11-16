@@ -53,6 +53,7 @@ impl Coordinator {
 /// Every operator input admission reads, resolved once by the caller.
 pub struct FactsRequest<'a> {
     pub checkpoint: &'a crate::plan::Checkpoint,
+    pub catalog: &'a crate::OfficialV41Catalog,
     pub cfg: &'a Inkling2Config,
     pub kv_format: super::InklingKvCache,
     pub manifest_path: Option<&'a Path>,
@@ -182,8 +183,11 @@ pub fn spark_charges(catalog: &crate::OfficialV41Catalog, experts: &[LayerExpert
                     }).collect::<anyhow::Result<Vec<_>>>()?.into_iter().flatten();
                 crate::serving_capacity::WeightArenaLayout::new("inkling2/spark-residency", regions)?.bytes() as u64
             } else {
-                crate::placement::SparkAssignment::resident_from_catalog(catalog, &working, rank,
-                    crate::placement::SparkResidentLayout::Exl3 { world: ranks, rank })?.resident_bytes
+                let regions = working.spark_layers.iter().map(|&layer|
+                    catalog.exl3_spark_arena_bytes(layer, ranks).map(|bytes| bytes[rank]))
+                    .collect::<anyhow::Result<Vec<_>>>()?;
+                crate::serving_capacity::PackedWeightRegions::new(regions.into_iter()
+                    .map(usize::try_from).collect::<Result<Vec<_>, _>>()?)?.bytes as u64
             };
             Ok(SparkCharge { experts: resident, owners, runtime })
         }).collect()
@@ -216,11 +220,7 @@ pub fn gather(request: &FactsRequest<'_>) -> Result<InklingInputs, Refused> {
         format!("Inkling 2 routed expert inventory refused: {error:#}"),
         "Provide every routed layer's fused MXFP8/NVFP4 headers or per-expert EXL3 modules."))?;
     let storage = experts.iter().map(|layer| layer.storage.expect("inventory names every layer's storage")).collect::<Vec<_>>();
-    let catalog = match &request.checkpoint.view {
-        Some(view) => crate::read_expert_catalog_view(view),
-        None => crate::read_expert_catalog(&request.checkpoint.snapshot),
-    }.map_err(|error| refused(format!("Inkling 2 shared expert catalog refused: {error:#}"),
-        "Provide complete expert headers for the selected checkpoint view."))?;
+    let catalog = request.catalog;
     let local = local_package(&catalog, request.manifest_path, gpus, shape.rows.max(u64::from(shared::DECODE_ROWS)));
     // Mixed native checkpoints (NVFP4 then MXFP8) keep the per-layer native
     // ingress; the link is sized for its widest request row (BF16).
