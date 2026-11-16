@@ -140,7 +140,9 @@ pub(crate) fn spark_candidate_bytes(metadata: &residency::MetadataInput, program
                 .context("EXLR8 candidate weight sum overflow")?;
             let units = facts.iter().map(|(_, units)| *units).max().context("EXLR8 candidate has no layers")?;
             weights.checked_add(crate::serving_capacity::spark_waves::exlr8_worker_bytes(programs, executions,
-                geometry, units, activations)?).context("EXLR8 candidate total overflow")
+                geometry, units, activations)?).and_then(|bytes| bytes.checked_add(
+                    cuteafd_core::memory_layout::spark_runtime_reserve_bytes(weights)?))
+                .context("EXLR8 candidate total overflow")
         }).collect()
     }).collect()
 }
@@ -296,7 +298,7 @@ pub(super) fn native_plan_of(input: &super::PlanInput, selected: &str,
     }
     append_spark_encoder(&mut memory, report.encoder.as_ref())?;
     for device in memory.devices.iter().filter(|device| device.kind == cuteafd_core::memory_layout::DeviceKind::Spark) {
-        let cap = device.capacity_bytes.min(options.spark_budget());
+        let cap = device.capacity_bytes.min(device.worker_budget_bytes);
         let used = device.used_bytes();
         if used > cap {
             report.refuse_placement(format!("EXLR8 spark{} weights + execution owners need {used} bytes, cap {cap}, shortfall {} bytes",
@@ -343,7 +345,7 @@ fn append_spark_devices(memory: &mut cuteafd_core::memory_layout::MemoryLayout,
     for (rank, &bytes) in residents.iter().enumerate() {
         if !memory.devices.iter().any(|device| device.kind == DeviceKind::Spark && device.index as usize == rank) {
             memory.devices.push(DeviceLayout { kind: DeviceKind::Spark, index: rank as u32,
-                capacity_bytes: layout.spark_bytes, worker_budget_bytes: layout.spark_bytes,
+                capacity_bytes: layout.spark_bytes, worker_budget_bytes: layout.spark_allocation_budget_bytes.unwrap_or(layout.spark_bytes),
                 items: Vec::new(), kv_tokens: 0 });
         }
         let device = memory.devices.iter_mut().find(|device|
