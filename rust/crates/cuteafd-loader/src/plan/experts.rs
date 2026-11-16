@@ -273,7 +273,7 @@ pub fn spark_recipe(package: &str, intermediate: usize, world: usize) -> Result<
         vec![stored_slice(intermediate, block, world)
             .ok_or(SparkRecipeRefusal::GeometryInvalid { intermediate, world, block })?; world]
     };
-    let stored_widths = widths.iter().map(|&logical| {
+    let stored_widths: Vec<usize> = widths.iter().map(|&logical| {
         if !native_artifacts.is_empty() {
             native_artifacts.iter().find(|artifact| artifact.logical == logical).expect("derived artifact").stored
         } else if mxfp4 {
@@ -288,7 +288,7 @@ pub fn spark_recipe(package: &str, intermediate: usize, world: usize) -> Result<
         (0..world).map(|rank| format!("tp{world}{tag}-rank{rank}")).collect()
     } else if exact && (widths.iter().any(|width| *width != widths[0])
         || policy.exact_storage(world)) {
-        let mut unique = widths.clone(); unique.sort_unstable_by(|a, b| b.cmp(a)); unique.dedup();
+        let mut unique = stored_widths.clone(); unique.sort_unstable_by(|a, b| b.cmp(a)); unique.dedup();
         unique.into_iter().map(|width| format!("tp{world}-w{width}")).collect()
     } else { vec![format!("tp{world}")] };
     Ok(SparkRecipe { slicing: if exact { Slicing::Blocks(block) } else { Slicing::Padded }, widths, stored_widths, rule, required_layouts, native_artifacts })

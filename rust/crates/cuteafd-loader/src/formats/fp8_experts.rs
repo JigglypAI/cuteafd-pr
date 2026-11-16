@@ -250,8 +250,8 @@ fn exact_layout_directory_with(directory: &Path, tensors: &Fp8ExpertTensors, tp:
     let (Some(package), Some(layout)) = (directory.parent(), directory.file_name().and_then(|name| name.to_str()))
         else { return padded; };
     let exact = tensors.exact_slicing(tp);
-    let paths = (0..tp).map(|rank| tensors.rank_range_with(tp, rank, exact).ok()
-        .map(|(_, logical)| package.join(format!("{layout}-w{logical}")))).collect::<Option<Vec<_>>>();
+    let paths = (0..tp).map(|rank| tensors.rank_width(tp, rank, exact).ok()
+        .map(|stored| package.join(format!("{layout}-w{stored}")))).collect::<Option<Vec<_>>>();
     match paths {
         Some(paths) if paths.iter().all(|path| path.is_dir()) => (paths[rank].clone(), exact),
         _ => padded,
