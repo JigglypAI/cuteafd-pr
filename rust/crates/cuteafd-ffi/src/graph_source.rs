@@ -18,6 +18,7 @@ pub struct GraphSource<'a> {
     pub width: usize,
     pub spans_devices: bool,
     pub signature: Vec<u64>,
+    pub inspection_error: Option<String>,
 }
 
 /// Lifetime-pinned host counter reader. Called at telemetry/retirement boundaries.
@@ -55,12 +56,14 @@ impl NativeLibrary {
         let status = unsafe { end(stream, &mut raw, &mut nodes, &mut width, &mut spans, &mut signature, &mut words) };
         if status == CUTEAFD_STATUS_GRAPH_TOO_SMALL { return Err(SmallGraphCapture { nodes }.into()) }
         self.status_to_result("cuda_graph_capture_source", status)?;
+        // Read immediately: later instantiate/update calls overwrite native TLS.
+        let inspection_error = (width == 0).then(|| self.last_error().unwrap_or_default());
         let signature = if words == 0 { Vec::new() } else {
             anyhow::ensure!(!signature.is_null(), "null graph topology signature");
             // SAFETY: source owns these words until its destruction below.
             unsafe { std::slice::from_raw_parts(signature, words) }.to_vec()
         };
-        Ok(GraphSource { library: self, raw, nodes, width, spans_devices: spans != 0, signature })
+        Ok(GraphSource { library: self, raw, nodes, width, spans_devices: spans != 0, signature, inspection_error })
     }
 
     /// Invalidates a cache-owned handle before removing its cache identity.

@@ -573,13 +573,13 @@ int cuteafd_cuda_graph_capture_source(void *stream, void **out, size_t *nodes,
     (void)stream;
     *out = NULL; *nodes = *width = *words = 0; *spans = 0; *signature = NULL;
     if (capture_status == 10) { *nodes = 2; return capture_status; }
-    if (capture_status) return capture_status;
+    if (capture_status && capture_status != 11) return capture_status;
     struct fixture_graph_source *source = malloc(sizeof(*source));
     if (!source) return 1;
     source->device = current_device;
     static const uint64_t shape[] = {3, 0, 1, 0, 1, 0, 1, 0};
     *signature = shape; *words = sizeof(shape) / sizeof(shape[0]);
-    *nodes = 1; *width = 1; *out = source;
+    *nodes = 1; *width = capture_status == 11 ? 0 : 1; *out = source;
     return 0;
 }
 int cuteafd_cuda_graph_source_instantiate(void *source, void *stream, void **exec) {

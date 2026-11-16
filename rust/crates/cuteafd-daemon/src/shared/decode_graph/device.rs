@@ -249,6 +249,7 @@ struct Record {
     oom: Option<OomBackoff>,
     oom_warned: bool,
     permanently_eager: bool,
+    signature: Option<Vec<u64>>,
     stats: Box<KeyStats>,
     accounted: Inventory,
 }
@@ -258,7 +259,7 @@ struct Inventory { nodes: u64, execs: u64, unknown: u64, resident: u64, pinned: 
 
 impl Record {
     fn ordering_bytes(&self) -> u64 {
-        self.bytes.max(self.estimate)
+        if self.bytes > 0 { self.bytes } else { self.estimate }
     }
 }
 
@@ -401,6 +402,7 @@ pub(crate) struct TraceRow {
     executables: u64,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     permanently_eager: bool,
+    signature: Option<Vec<u64>>,
     basis: Basis,
     permanent_bytes: u64,
     pinned: bool,
@@ -724,6 +726,9 @@ pub(crate) struct LaneCycles {
 impl LaneCycles {
     pub fn register(lane: usize, concurrent_cycles: usize,
         mut visit: impl FnMut(&mut GraphVisitor<'_>) -> anyhow::Result<()>) -> anyhow::Result<Self> {
+        // K bounds simultaneously in-flight decode/prefill operations (V4.1's
+        // dual lane = 2). In-flight cycles protect every graph they may launch:
+        // retire only after completion, and never update a live lane's operands.
         anyhow::ensure!((1..=2).contains(&concurrent_cycles) && lane < concurrent_cycles,
             "invalid graph lane/concurrent cycle count");
         let mut devices = std::collections::BTreeSet::new();
@@ -1324,7 +1329,7 @@ impl DeviceCache {
         Ok(())
     }
 
-    pub(super) fn source_capture_failed(&mut self, id: u64) {
+    pub(super) fn source_capture_failed(&mut self, id: u64, small: Option<usize>) {
         if let Some(request) = self.update_requests.remove(&id) {
             // End/begin failures precede any update. Settle through the ordinary
             // miss accounting, without retaining a source-only reservation.
@@ -1335,6 +1340,16 @@ impl DeviceCache {
             counters.eager_other += 1;
             let counters = self.site_counters(request.site.name, request.site.cycle, request.identity.bank);
             counters.misses += 1; counters.eager_runs += 1; counters.eager_other += 1;
+            if small.is_some() {
+                if let Some(old) = self.identities.get(&request.identity).copied() { self.forget(old); }
+                self.identities.insert(request.identity.clone(), id);
+                self.records.insert(id, Record { last_used: None, identity: request.identity, cycle: request.site.cycle,
+                    bytes: 0, estimate: 0, list: None, previous: None, next: None, pinned: false,
+                    pending_destroy: false, pending_capture: false, frequent: false, nodes: 0,
+                    node_rate: 1, graph_rate: 0, parallel_width: 0, spans_devices: request.site.spans_devices,
+                    oom: None, oom_warned: false, permanently_eager: false, signature: None,
+                    stats: KeyStats::new(self.clock_ms), accounted: Inventory::default() });
+            }
         }
     }
 
@@ -1348,6 +1363,9 @@ impl DeviceCache {
     pub(super) fn update_ticket(&mut self, identity: Identity, site: Site,
         estimate: Option<Estimate>, pinned: bool) -> Option<u64> {
         self.refresh_cycles();
+        // Only one live source may settle this exact key. Otherwise re-keying
+        // could forget a resident executable without retiring its pool charge.
+        if self.update_requests.values().any(|request| request.identity == identity) { return None }
         self.site_counters(site.name, site.cycle, identity.bank);
         let hard = self.charged >= self.reserve;
         if self.reserve == 0 || self.measurement_failed || self.soft.limit == 0 ||
@@ -1359,8 +1377,15 @@ impl DeviceCache {
                     matches!(r.list, Some(List::Recent | List::Frequent))
             }) || (!hard && self.charged < self.soft.limit) { return None }
         self.donor_candidates.retain(|_, lanes| lanes.iter().any(|lane| lane.first.is_some()));
-        let any_cold = self.donor_candidates.values().any(|lanes| lanes.iter().any(|lane|
-            lane.first.is_some_and(|id| self.donor_age(id).is_some())));
+        let signature = self.identities.get(&identity).and_then(|id| self.records[id].signature.clone());
+        // Unknown or non-kernel topologies never justify a hard-cap capture.
+        // Below hard, one source inspection can teach a retained ghost its key.
+        let any_cold = match signature {
+            Some(signature) => self.cold_donor(&signature).is_some(),
+            None if hard => false,
+            None => self.donor_candidates.values().any(|lanes| lanes.iter().any(|lane|
+                lane.first.is_some_and(|id| self.donor_age(id).is_some()))),
+        };
         if !any_cold {
             let counters = self.counters.entry(site.cycle).or_default();
             if hard { counters.no_cold_donor_hard += 1 } else { counters.no_cold_donor_soft += 1 }
@@ -1436,6 +1461,7 @@ impl DeviceCache {
 
     pub(super) fn register_native(&mut self, id: u64, exec: usize, signature: Vec<u64>) {
         self.remove_donor_candidate(id);
+        if let Some(record) = self.records.get_mut(&id) { record.signature = Some(signature.clone()); }
         self.native_graphs.insert(id, NativeGraph { exec, counted_launches: 0, signature, indexed: None, previous: None, next: None });
         self.insert_donor_candidate(id);
     }
@@ -1447,6 +1473,13 @@ impl DeviceCache {
         update: impl FnOnce(usize) -> anyhow::Result<bool>,
         retain: impl FnOnce(usize) -> anyhow::Result<usize>, invalidate: impl FnOnce(usize)) -> Option<usize> {
         let request = self.update_requests.remove(&id)?;
+        assert!(!self.update_requests.values().any(|other| other.identity == request.identity),
+            "duplicate graph update ticket");
+        if let Some(old) = self.identities.get(&request.identity) {
+            let old = &self.records[old];
+            assert!(!old.pinned && !old.pending_capture && !old.pending_destroy &&
+                !matches!(old.list, Some(List::Recent | List::Frequent)), "update would forget a resident graph");
+        }
         let donor = self.cold_donor_for_request(id, &request);
         let Some(donor) = donor else {
             let counters = self.counters.entry(request.site.cycle).or_default();
@@ -1496,6 +1529,7 @@ impl DeviceCache {
         record.identity = request.identity.clone();
         record.cycle = request.site.cycle;
         record.pinned = request.pinned;
+        record.spans_devices = request.site.spans_devices;
         record.last_used = Some(self.lanes[self.bank_lane(request.identity.bank)].index);
         record.previous = None; record.next = None; record.list = None;
         let native_nodes = record.stats.native_nodes;
@@ -1527,17 +1561,25 @@ impl DeviceCache {
     }
 
     fn cold_donor_for_request(&mut self, id: u64, _request: &UpdateRequest) -> Option<u64> {
-        let signature = self.take_native(id)?.signature;
+        let signature = self.native_graphs.get(&id)?.signature.clone();
         self.cold_donor(&signature)
     }
 
     pub(super) fn fallback_update(&mut self, id: u64) -> Miss {
         let request = self.update_requests.remove(&id).expect("active update request");
-        self.take_native(id);
-        self.miss(request.identity, request.site, request.estimate, request.pinned)
+        let signature = self.take_native(id).map(|native| native.signature);
+        let identity = request.identity.clone();
+        let result = self.miss(request.identity, request.site, request.estimate, request.pinned);
+        if let Some(record) = self.identities.get(&identity).and_then(|id| self.records.get_mut(id)) {
+            record.signature = signature;
+        }
+        result
     }
 
     pub(super) fn updating(&self, id: u64) -> bool { self.update_requests.contains_key(&id) }
+
+    #[cfg(test)]
+    pub(super) fn set_soft_limit_for_fixture(&mut self, limit: u64) { self.soft.limit = limit; }
 
     #[cfg(test)]
     pub(super) fn advance_for_update_fixture(&mut self, lane: usize, cycles: usize) {
@@ -1549,6 +1591,11 @@ impl DeviceCache {
         let now = self.started.elapsed().as_millis() as u64;
         self.counters.entry(site.cycle).or_default().misses += 1;
         self.site_counters(site.name, site.cycle, identity.bank).misses += 1;
+        if self.update_requests.values().any(|request| request.identity == identity) {
+            self.counters.entry(site.cycle).or_default().eager_runs += 1;
+            self.site_counters(site.name, site.cycle, identity.bank).eager_runs += 1;
+            return Miss::Eager;
+        }
         let compatible = site.basis == self.basis && match (self.basis, &node_estimate) {
             (Basis::Bytes, None | Some(Estimate { nodes: None, .. })) => true,
             (Basis::Nodes { node_rate, graph_rate }, Some(estimate)) =>
@@ -1715,7 +1762,7 @@ impl DeviceCache {
                 let id = self.next_id;
                 self.identities.insert(identity.clone(), id);
                 self.records.insert(id, Record { last_used: None, identity, cycle: site.cycle, bytes: 0, estimate, list: None,
-                    previous: None, next: None, pinned, pending_destroy: false, pending_capture: false, frequent: false, nodes, node_rate: metadata.node_rate, graph_rate: metadata.graph_rate, parallel_width: metadata.parallel_width, spans_devices: site.spans_devices, oom: None, oom_warned: false, permanently_eager: false, stats: KeyStats::new(now), accounted: Inventory::default() });
+                    previous: None, next: None, pinned, pending_destroy: false, pending_capture: false, frequent: false, nodes, node_rate: metadata.node_rate, graph_rate: metadata.graph_rate, parallel_width: metadata.parallel_width, spans_devices: site.spans_devices, oom: None, oom_warned: false, permanently_eager: false, signature: None, stats: KeyStats::new(now), accounted: Inventory::default() });
                 id
             };
             let record = self.records.get_mut(&id).unwrap();
@@ -1755,7 +1802,7 @@ impl DeviceCache {
             let id = self.next_id;
             self.identities.insert(identity.clone(), id);
             self.records.insert(id, Record { last_used: None, identity: identity.clone(), cycle: site.cycle, bytes: 0, estimate,
-                list: None, previous: None, next: None, pinned: false, pending_destroy: false, pending_capture: false, frequent: false, nodes, node_rate: metadata.node_rate, graph_rate: metadata.graph_rate, parallel_width: metadata.parallel_width, spans_devices: site.spans_devices, oom: None, oom_warned: false, permanently_eager: false, stats: KeyStats::new(now), accounted: Inventory::default() });
+                list: None, previous: None, next: None, pinned: false, pending_destroy: false, pending_capture: false, frequent: false, nodes, node_rate: metadata.node_rate, graph_rate: metadata.graph_rate, parallel_width: metadata.parallel_width, spans_devices: site.spans_devices, oom: None, oom_warned: false, permanently_eager: false, signature: None, stats: KeyStats::new(now), accounted: Inventory::default() });
             self.push(id, List::RecentGhost);
             self.trim_ghosts();
         }
@@ -2278,6 +2325,7 @@ struct RawRecord {
     nodes: u64,
     pinned: bool,
     permanently_eager: bool,
+    signature: Option<Vec<u64>>,
     resident: bool,
     stats: KeyStats,
 }
@@ -2428,6 +2476,73 @@ mod tests {
             estimate: None, hard: cache.charged >= cache.reserve, pinned: false });
         cache.register_native(id, 0, vec![3, 7, 11]);
         id
+    }
+
+    #[test]
+    fn measured_ordering_share_replaces_estimate_even_when_smaller() {
+        let (mut cache, donor) = aged_update_fixture(2, false);
+        cache.unlink(donor);
+        let record = cache.records.get_mut(&donor).unwrap();
+        record.estimate = 100;
+        record.bytes = 10;
+        assert_eq!(record.ordering_bytes(), 10);
+        cache.push(donor, List::Recent);
+        assert_eq!(cache.queues[List::Recent.index()].bytes, 10);
+        cache.unlink(donor);
+        cache.records.get_mut(&donor).unwrap().bytes = 0;
+        assert_eq!(cache.records[&donor].ordering_bytes(), 100);
+    }
+
+    #[test]
+    fn small_source_only_capture_is_permanently_eager_above_soft_cap() {
+        let (mut cache, _) = aged_update_fixture(2, false);
+        let identity = key(2);
+        let id = cache.update_ticket(identity.clone(), site(Preference::Capture), None, false).unwrap();
+        cache.source_capture_failed(id, Some(2));
+        cache.capture_too_small(id, 2);
+        assert!(cache.records[&id].permanently_eager);
+        for _ in 0..10 {
+            assert!(cache.update_ticket(identity.clone(), site(Preference::Capture), None, false).is_none());
+            assert!(matches!(cache.miss(identity.clone(), site(Preference::Capture), None, false), Miss::Eager));
+        }
+    }
+
+    #[test]
+    fn hard_cap_unknown_empty_and_mismatched_signatures_never_capture() {
+        for signature in [None, Some(vec![]), Some(vec![42])] {
+            let (mut cache, _) = aged_update_fixture(2, false);
+            // Remember a ghost while soft-limited, as an earlier failed donor
+            // search would do, then reach the measured hard stop.
+            cache.soft.measured_bytes = Some(10);
+            cache.soft.measured_nodes = Some(10);
+            let _ = cache.miss(key(2), site(Preference::Capture), None, false);
+            if let Some(id) = cache.identities.get(&key(2)) {
+                cache.records.get_mut(id).unwrap().signature = signature;
+            }
+            cache.charged = cache.reserve;
+            for _ in 0..10 {
+                assert!(cache.update_ticket(key(2), site(Preference::Capture), None, false).is_none());
+                assert!(matches!(cache.miss(key(2), site(Preference::Capture), None, false), Miss::Eager));
+            }
+            assert!(cache.update_requests.is_empty());
+        }
+    }
+
+    #[test]
+    fn failed_donor_search_remembers_signature_and_duplicate_ticket_is_eager() {
+        let (mut cache, _) = aged_update_fixture(2, false);
+        let id = cache.update_ticket(key(2), site(Preference::Capture), None, false).unwrap();
+        assert!(cache.update_ticket(key(2), site(Preference::Capture), None, false).is_none());
+        assert!(matches!(cache.miss(key(2), site(Preference::Capture), None, false), Miss::Eager));
+        cache.register_native(id, 0, vec![99]);
+        assert!(cache.finish_update(id, |_| panic!(), |_| panic!(), |_| panic!()).is_none());
+        // Force ordinary fallback to retain an ARC ghost, not a new executable.
+        cache.soft.measured_bytes = Some(10);
+        cache.soft.measured_nodes = Some(10);
+        assert!(matches!(cache.fallback_update(id), Miss::Eager));
+        assert_eq!(cache.records[&cache.identities[&key(2)]].signature.as_deref(), Some(&[99][..]));
+        cache.charged = cache.reserve;
+        for _ in 0..10 { assert!(cache.update_ticket(key(2), site(Preference::Capture), None, false).is_none()); }
     }
 
     #[test]

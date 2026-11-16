@@ -79,7 +79,7 @@ pub(crate) struct CaptureTicket {
 
 fn capture_failed(cache: &super::device::SharedCache, id: u64, error: &anyhow::Error) -> bool {
     let mut cache = cache.lock().unwrap_or_else(|p| p.into_inner());
-    cache.source_capture_failed(id);
+    cache.source_capture_failed(id, error.downcast_ref::<cuteafd_ffi::SmallGraphCapture>().map(|small| small.nodes));
     if let Some(small) = error.downcast_ref::<cuteafd_ffi::SmallGraphCapture>() {
         cache.capture_too_small(id, small.nodes);
         false
@@ -103,6 +103,7 @@ impl CaptureTicket {
     pub fn complete_source(&mut self, library: &cuteafd_ffi::NativeLibrary,
         source: cuteafd_ffi::GraphSource<'_>, stream: *mut std::ffi::c_void)
         -> anyhow::Result<(*mut std::ffi::c_void, usize, usize, bool, Option<String>)> {
+        let inspection_error = source.inspection_error.clone();
         let mut cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());
         if cache.updating(self.id) {
             cache.register_native(self.id, 0, source.signature.clone());
@@ -113,7 +114,7 @@ impl CaptureTicket {
                     tracing::error!(%error, "invalidating rejected donor");
                 } }) {
                 self.updated = true;
-                return Ok((exec as *mut _, source.nodes, source.width, source.spans_devices, None));
+                return Ok((exec as *mut _, source.nodes, source.width, source.spans_devices, inspection_error));
             }
             match cache.fallback_update(self.id) {
                 super::device::Miss::Capture(id) => self.id = id,
@@ -123,9 +124,13 @@ impl CaptureTicket {
                 }
             }
         }
+        // Instantiation/upload and budget sampling may block. Telemetry and
+        // physical observers must not wait on CUDA while holding this mutex.
+        drop(cache);
         let exec = source.instantiate(stream)?;
-        cache.register_native(self.id, exec as usize, source.signature.clone());
-        Ok((exec, source.nodes, source.width, source.spans_devices, None))
+        self.cache.lock().unwrap_or_else(|p| p.into_inner())
+            .register_native(self.id, exec as usize, source.signature.clone());
+        Ok((exec, source.nodes, source.width, source.spans_devices, inspection_error))
     }
 
     /// Keep native results and error precedence; settle failure before Drop can
@@ -487,7 +492,7 @@ mod device_tests {
         let mut receiver = GraphBank::new();
         // Synthetic cache isolates the global device registry from fixture GPU0.
         for bank in [&mut donor, &mut receiver] {
-            bank.attach_device_for_test(-164_405, 10, site())?;
+            bank.attach_device_for_test(-164_405, 100, site())?;
         }
         donor.cache_lane_owner(1);
         receiver.cache_lane_owner(0);
@@ -501,7 +506,8 @@ mod device_tests {
         donor.cache_measured(10);
         let cache = donor.device.as_ref().unwrap().cache.clone();
         cache.lock().unwrap().advance_for_update_fixture(1, 2);
-        let mut ticket = receiver.cache_ticket(&2, false, None).expect("hard-cap source update admitted");
+        cache.lock().unwrap().set_soft_limit_for_fixture(10);
+        let mut ticket = receiver.cache_ticket(&2, false, None).expect("soft-cap source update admitted");
         // SAFETY: source-only fixture records no work.
         let source = unsafe { library.cuda_graph_capture_source(std::ptr::null_mut())? };
         let (new, nodes, width, spans, _) = ticket.complete_source(&library, source, std::ptr::null_mut())?;
@@ -519,8 +525,28 @@ mod device_tests {
         let snapshot = super::super::device::snapshots().into_iter().find(|row| row.device == -164_405).unwrap();
         assert_eq!(snapshot.charged, 10);
         assert_eq!(snapshot.live_bytes, 10);
-        assert_eq!(snapshot.cycles[&Cycle::Decode].updates_hard, 1);
+        assert_eq!(snapshot.cycles[&Cycle::Decode].updates_soft, 1);
         drop(receiver);
+        Ok(())
+    }
+
+    #[test]
+    fn failed_inspection_survives_source_completion_for_family_retention_policy() -> anyhow::Result<()> {
+        let fixture = cuteafd_ffi::native_library_lifetime_fixture::Fixture::build_for_tests()?;
+        let library = fixture.load()?;
+        fixture.configure_capture(&library, 11)?;
+        let mut bank: GraphBank<u32, ()> = GraphBank::new();
+        bank.attach_device_for_test(-164_406, 100, site())?;
+        let mut ticket = bank.cache_ticket(&1, false, None).unwrap();
+        // SAFETY: CPU fixture owns no CUDA work or operands.
+        let source = unsafe { library.cuda_graph_capture_source(std::ptr::null_mut())? };
+        assert_eq!(source.inspection_error.as_deref(), Some("injected CPU fixture failure"));
+        fixture.configure_capture(&library, 0)?;
+        let (raw, _, width, _, inspected) = ticket.complete_source(&library, source, std::ptr::null_mut())?;
+        assert_eq!(width, 0);
+        assert_eq!(inspected.as_deref(), Some("injected CPU fixture failure"));
+        // SAFETY: fresh fixture executable has never launched.
+        unsafe { library.cuda_graph_exec_destroy(raw)?; }
         Ok(())
     }
 

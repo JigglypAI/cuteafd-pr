@@ -1901,6 +1901,10 @@ extern "C" cuteafd_status_t cuteafd_cuda_graph_capture_source(void* stream, void
   captured->signature = transferable_signature(captured->graph, *nodes);
   *signature = captured->signature.data(); *words = captured->signature.size();
   *source = captured.release();
+  if (inspection != cudaSuccess) {
+    (void)fail_cuda(CUTEAFD_STATUS_INTERNAL_ERROR, "source graph topology inspection", inspection);
+    return CUTEAFD_STATUS_OK;  // Source is valid; callers decide whether to retain unknown topology.
+  }
   return ok();
 #else
   return fail(CUTEAFD_STATUS_CUDA_UNAVAILABLE, "CUDA graph source unavailable");
@@ -1972,11 +1976,15 @@ extern "C" cuteafd_status_t cuteafd_cuda_graph_source_transfer(void* source, voi
 
 extern "C" cuteafd_status_t cuteafd_cuda_graph_exec_invalidate(void* donor) {
 #if CUTEAFD_NATIVE_ENABLE_CUDA
-  std::lock_guard<std::mutex> guard(graph_handles_mutex);
-  const auto found = graph_handles.find(donor);
-  if (found == graph_handles.end() || !found->second->exec) return ok();
-  const auto status = cuteafd::diagnostic_cuda(cudaGraphExecDestroy(found->second->exec));
-  found->second->exec = nullptr;
+  cudaGraphExec_t target = nullptr;
+  {
+    std::lock_guard<std::mutex> guard(graph_handles_mutex);
+    const auto found = graph_handles.find(donor);
+    if (found == graph_handles.end() || !found->second->exec) return ok();
+    target = found->second->exec;
+    found->second->exec = nullptr;
+  }
+  const auto status = cuteafd::diagnostic_cuda(cudaGraphExecDestroy(target));
   if (status != cudaSuccess) return fail_cuda(CUTEAFD_STATUS_INTERNAL_ERROR, "invalidate donor", status);
   return ok();
 #else
@@ -2106,14 +2114,16 @@ extern "C" cuteafd_status_t cuteafd_cuda_graph_launch(void* cuda_graph_exec, voi
   }
 #if CUTEAFD_NATIVE_ENABLE_CUDA
   // Source-path handles are tagged; legacy/test raw CUDA handles remain valid.
-  // A bank owns its handle through the submitted launch. Cache transfer only
-  // touches cold owners on the same serialized lane executor, never queued work.
+  // Serialize the handle read AND submission against update/transfer/destroy.
+  // Cold-owner epoch checks additionally protect already submitted device work.
+  std::lock_guard<std::mutex> guard(graph_handles_mutex);
   GraphHandle* counted = nullptr;
   auto target = reinterpret_cast<cudaGraphExec_t>(cuda_graph_exec);
   if (reinterpret_cast<uintptr_t>(cuda_graph_exec) & uintptr_t(1)) {
-    auto* handle = reinterpret_cast<GraphHandle*>(reinterpret_cast<uintptr_t>(cuda_graph_exec) & ~uintptr_t(1));
-    counted = handle;
-    target = handle->exec;
+    const auto found = graph_handles.find(cuda_graph_exec);
+    if (found == graph_handles.end()) return fail(CUTEAFD_STATUS_INVALID_ARGUMENT, "unknown graph handle");
+    counted = found->second.get();
+    target = counted->exec;
     if (!target) return fail(CUTEAFD_STATUS_INVALID_ARGUMENT, "stale transferred graph handle");
   }
   cudaError_t err = cudaGraphLaunch(target,
@@ -2198,13 +2208,17 @@ extern "C" cuteafd_status_t cuteafd_cuda_graph_exec_destroy(void* cuda_graph_exe
     return ok();
   }
 #if CUTEAFD_NATIVE_ENABLE_CUDA
-  std::lock_guard<std::mutex> guard(graph_handles_mutex);
-  const auto handle = graph_handles.find(cuda_graph_exec);
   auto target = reinterpret_cast<cudaGraphExec_t>(cuda_graph_exec);
-  if (handle != graph_handles.end()) {
-    target = handle->second->exec;
-    graph_handles.erase(handle);
-    if (!target) return ok();
+  {
+    std::lock_guard<std::mutex> guard(graph_handles_mutex);
+    const auto handle = graph_handles.find(cuda_graph_exec);
+    if (handle != graph_handles.end()) {
+      target = handle->second->exec;
+      graph_handles.erase(handle);
+      if (!target) return ok();
+    } else if (reinterpret_cast<uintptr_t>(cuda_graph_exec) & uintptr_t(1)) {
+      return fail(CUTEAFD_STATUS_INVALID_ARGUMENT, "unknown graph handle");
+    }
   }
   cudaError_t err = cudaGraphExecDestroy(target);
   if (err != cudaSuccess) {
