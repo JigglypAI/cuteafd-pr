@@ -56,6 +56,7 @@ pub struct GlmScratch {
 /// PROGRAMS.json or the loaded table (the planner and runtime pass the same).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct GlmContext {
+    pub selector_tile: Option<cuteafd_core::coordinator_programs::scored_decode::ScoredDecodeTile>,
     /// `glm_scored_index_topk_decode_m64` scratch.
     pub topk_scratch: u64,
     /// Largest `glm_sparse_mla_partial_h*_s*_m64` scratch.
@@ -101,7 +102,7 @@ pub fn context_programs<'n>(cfg: &GlmDsaConfig, names: impl IntoIterator<Item = 
         lookup(&context_gather(cfg, kind))?;
         partial_scratch = partial_scratch.max(partial(kind, 0)?).max(partial(kind, cfg.heads / 2)?);
     }
-    Some(GlmContext { topk_scratch: lookup(&format!("{family}_{}", CONTEXT_PROGRAMS[0]))?, partial_scratch })
+    Some(GlmContext { selector_tile: None, topk_scratch: lookup(&format!("{family}_{}", CONTEXT_PROGRAMS[0]))?, partial_scratch })
 }
 
 /// Index records per page (64 keys) and their bytes (64 x 128 E4M3, 64 FP32 scales).
@@ -135,7 +136,9 @@ pub fn context_workspace(cfg: &GlmDsaConfig, extent: u64, prefill_rows: u64, lan
     let contracts = cfg.attention_kinds().len() as u64;
     let commit = 3 * (contracts + 2) * context_commit_pages(prefill_rows) * 8;
     let mut out = vec![("candidates", rows * k * 8), ("own-head partial", partial), ("peer-head partial", partial),
-        ("scored top-k scratch", context.topk_scratch), ("partial scratch", context.partial_scratch),
+        ("scored top-k scratch", context.selector_tile.map_or(context.topk_scratch, |tile|
+            tile.bytes(cuteafd_core::coordinator_programs::scored_decode::admitted_pages(extent, PAGE_ROWS))
+                .expect("validated deployment selector capacity"))), ("partial scratch", context.partial_scratch),
         ("gather tables", 2 * half * 4)];
     out.extend((0..lanes).map(|_| ("commit blocks", commit)));
     out
@@ -164,6 +167,8 @@ pub fn manifest_context(cfg: &GlmDsaConfig, manifest: &serde_json::Value, sms: u
         .map(|p| p["scratch_bytes_at_capacity"]["scratch"].as_u64().unwrap_or(0));
     let names = programs.iter().filter_map(|p| p["name"].as_str());
     let mut context = context_programs(cfg, names, lookup)?;
+    context.selector_tile = cuteafd_core::coordinator_programs::scored_decode::ScoredDecodeTile::from_geometry(
+        &programs.iter().find(|p| p["name"] == format!("{}_{}", cfg.program_family(), CONTEXT_PROGRAMS[0]))?["geometry"]).ok()?;
     context.partial_scratch = cfg.attention_kinds().iter().flat_map(|kind| [0, cfg.heads / 2].map(|begin| (*kind, begin)))
         .map(|(kind, begin)| {
             let name = cuteafd_core::coordinator_programs::attention_partial_program_of(
@@ -186,7 +191,7 @@ pub fn manifest_context_for_cards(cfg: &GlmDsaConfig, manifest: &serde_json::Val
             |name| family.contains(name))?;
         let Some(card) = manifest_context(cfg, &selected, sm_count, &plan) else { return Ok(None) };
         context = Some(match context {
-            Some(previous) => GlmContext { topk_scratch: previous.topk_scratch.max(card.topk_scratch),
+            Some(previous) => GlmContext { selector_tile: card.selector_tile, topk_scratch: previous.topk_scratch.max(card.topk_scratch),
                 partial_scratch: previous.partial_scratch.max(card.partial_scratch) },
             None => card,
         });
@@ -1452,7 +1457,30 @@ mod tests {
 
 
 
-    const CONTEXT_SCRATCH: GlmContext = GlmContext { topk_scratch: 3 << 20, partial_scratch: 9 << 20 };
+    #[test]
+    fn deployment_selector_tile_matches_capture_bound_and_single_owner() {
+        use cuteafd_core::coordinator_programs::scored_decode::{admitted_pages, ScoredDecodeTile};
+        let cfg = glm_cfg();
+        let geometry = serde_json::json!({"admitted_tile": {"prefix_bytes": 1051648,
+            "capacity_rows": 64, "capacity_pages": 16384, "page_rows": 64,
+            "tile_rows": 32, "tile_columns": 512, "element_bytes": 4}});
+        let tile = ScoredDecodeTile::from_geometry(&geometry).unwrap().unwrap();
+        let context = GlmContext { selector_tile: Some(tile), topk_scratch: 269487104, partial_scratch: 0 };
+        for extent in [129, 131072, 524288, 1048576] {
+            let allocations = context_workspace(&cfg, extent, 4096, 3, context);
+            let owners = allocations.iter().filter(|(name, _)| *name == "scored top-k scratch").collect::<Vec<_>>();
+            assert_eq!(owners.len(), 1);
+            let captured = admitted_pages(extent, PAGE_ROWS);
+            assert_eq!(owners[0].1, tile.bytes(captured).unwrap());
+            for live in [0, 1, captured / 2, captured] {
+                assert!(live <= captured);
+                assert_eq!(context_workspace(&cfg, extent, 4096, 3, context), allocations,
+                    "live request width must not change the deployment charge");
+            }
+        }
+    }
+
+    const CONTEXT_SCRATCH: GlmContext = GlmContext { selector_tile: None, topk_scratch: 3 << 20, partial_scratch: 9 << 20 };
 
 
 
@@ -1466,7 +1494,7 @@ mod tests {
         let scratch = |name: &str| names.contains(&name).then(|| if name.ends_with("s4_m64") { 900 }
             else if name.contains("topk") { 70 } else { 100 });
         let cfg = config();
-        assert_eq!(context_programs(&cfg, names, scratch), Some(GlmContext { topk_scratch: 70, partial_scratch: 900 }));
+        assert_eq!(context_programs(&cfg, names, scratch), Some(GlmContext { selector_tile: None, topk_scratch: 70, partial_scratch: 900 }));
         for missing in names[..5].iter().chain(&names[5..6]) {
             let kept: Vec<_> = names.iter().copied().filter(|n| n != missing).collect();
             assert_eq!(context_programs(&cfg, kept.iter().copied(), |n| kept.contains(&n).then_some(1)), None, "{missing}");
@@ -1500,7 +1528,7 @@ mod tests {
                     manifest["programs"].as_array().unwrap().iter().find(|p| p["name"] == name).unwrap()
                         ["scratch_bytes_at_capacity"]["scratch"].as_u64().unwrap()
                 }).max().unwrap();
-                assert_eq!(selected, GlmContext { topk_scratch: 70, partial_scratch: runtime_scratch });
+                assert_eq!(selected, GlmContext { selector_tile: None, topk_scratch: 70, partial_scratch: runtime_scratch });
                 assert_eq!(selected.partial_scratch, if rows == 1 || (rows <= 8 && sms == 170) { 900 }
                     else if rows <= 8 { 1800 } else { 100 });
             }

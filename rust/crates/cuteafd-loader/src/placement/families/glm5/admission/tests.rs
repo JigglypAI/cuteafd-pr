@@ -711,7 +711,7 @@ fn recipe(cfg: &GlmDsaConfig) -> GlmRecipe<'_> {
                 context: Some(super::super::exchanges::ContextOwners {
                     extent: recipe.context,
                     prefill: shape,
-                    scratch: super::super::GlmContext {
+                    scratch: super::super::GlmContext { selector_tile: None,
                         topk_scratch: 512,
                         partial_scratch: 1024,
                     },
