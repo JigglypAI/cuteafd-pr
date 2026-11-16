@@ -2094,9 +2094,7 @@ if [[ $serve != serve-dsv4 ]]; then
       esac
     elif [[ $family == kimi_k3 ]]; then
       case "$(get SPECULATOR_FP8 auto)" in
-        auto) ;;
-        on) family_args+=(--draft-fp8 true) ;;
-        off) family_args+=(--draft-fp8 false) ;;
+        auto|on|off) ;; # Planner resolves this key and emits the sole serve flag below.
         *) release_die "Kimi SPECULATOR_FP8 must be auto, on or off" ;;
       esac
     elif [[ $family == glm5 || $family == glm5_flash ]]; then

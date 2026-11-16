@@ -5847,8 +5847,10 @@ def test_kimi_draft_weights_and_kv_are_independent(tmp_path, precision, flag, kv
     assert result.returncode == 0, result.stderr
     serve = next(line for line in result.stderr.splitlines() if "cuteafd serve-kimi" in line)
     assert f"--draft-fp8 {flag}" in serve and f"--draft-kv-cache {kv}" in serve
+    assert shlex.split(serve).count("--draft-fp8") == 1, serve
     plans = [line for line in result.stderr.splitlines() if "cuteafd plan" in line and "--resolve-settings-only" not in line]
-    assert plans and all(f"--draft-fp8 {flag}" in line for line in plans)
+    assert plans
+    assert all("SPECULATOR_FP8" in line or "--config" in line for line in plans)
 
 
 def test_kimi_shared_speculation_trace_reaches_coordinator(tmp_path):
