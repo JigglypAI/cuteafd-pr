@@ -1473,6 +1473,7 @@ impl DeviceCache {
     fn donor_age(&self, id: u64) -> Option<u64> {
         let record = self.records.get(&id)?;
         if record.pinned || record.pending_capture || record.pending_destroy ||
+            (record.spans_devices && cross_device_capture_sealed()) ||
             !matches!(record.list, Some(List::Recent | List::Frequent)) ||
             !self.native_graphs.contains_key(&id) { return None }
         let lane = self.bank_lane(record.identity.bank);
@@ -2552,6 +2553,18 @@ mod tests {
         cache.charged = if hard { 1000 } else { 10 };
         (cache, donor)
     }
+    #[test]
+    fn sealed_spanning_donor_cannot_transfer_to_a_local_requester() {
+        let (mut cache, donor) = aged_update_fixture(5, false);
+        cache.records.get_mut(&donor).unwrap().spans_devices = true;
+        cache.donor_always = true;
+        seal_cross_device_capture_on_this_thread(true);
+        let result = cache.update_ticket(key(2), site(Preference::Capture), None, false);
+        seal_cross_device_capture_on_this_thread(false);
+        assert!(result.is_none());
+        assert!(cache.owns(donor, 1));
+    }
+
     #[test]
     fn donor_always_reuses_below_soft_without_changing_default() {
         let (mut cache, donor) = aged_update_fixture(5, false);
