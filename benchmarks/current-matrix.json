@@ -93,8 +93,8 @@
         "reason": "original BF16 core doesn't fit: RTX load needs 121.96 GB vs 101.87 GB available; K6 Spark 0 load needs 121.86 GB vs 115.96 GB available"
       },
       "2rtx": {
-        "status": "pending",
-        "reason": "K3.1 smoke quick quality regressed (KL 0.986 vs accepted 0.076); investigating #1777"
+        "status": "current",
+        "report": "benchmarks/kimi_k31/2026-11-16-smoke-kimi-k3-1-pro-exl3-k2-mc-2rtx-6spark-kimi-k31-mc-original-max"
       }
     },
     {

@@ -398,6 +398,8 @@ historical recipe; new release launches use the v5 matrix.
 
 ## Kimi K3
 
+- 2026-11-16 · Release smoke (supplementary K6 modes comparison, `k6-compact`) · wrldsuksgo2mars/Kimi-K3.1-Pro-EXL3-K2-MC · 2× RTX PRO 6000 @ gpu-powerd 425/425 W (400–450) + 6× DGX Spark · build e28c5e263bb6 · [report](kimi_k31/2026-11-16-smoke-kimi-k3-1-pro-exl3-k2-mc-2rtx-6spark-kimi-k31-mc-k6-compact-max/report.svg)
+- 2026-11-16 · Release smoke · wrldsuksgo2mars/Kimi-K3.1-Pro-EXL3-K2-MC · 2× RTX PRO 6000 @ gpu-powerd 425/425 W (395–450) + 6× DGX Spark · build e28c5e263bb6 · [report](kimi_k31/2026-11-16-smoke-kimi-k3-1-pro-exl3-k2-mc-2rtx-6spark-kimi-k31-mc-original-max/report.svg)
 - 2026-11-10 · Release smoke · wrldsuksgo2mars/Kimi-K3-EXL3-K2-Core-K6-HQA · 2× RTX PRO 6000 @ gpu-powerd 450/450 W (300–550) + 6× DGX Spark · build v5.0.0-rc1 · [report](kimi_k3/2026-11-10-smoke-kimi-k3-exl3-k2-core-k6-hqa-2rtx-6spark-kimi-k3-max-fp8-compact/report.svg)
 - 2026-11-10 · Release smoke · wrldsuksgo2mars/Kimi-K3-EXL3-K2-Core-K6-HQA · 2× RTX PRO 6000 @ gpu-powerd 450/450 W (300–550) + 6× DGX Spark · build v5.0.0-rc1 · [report](kimi_k3/2026-11-10-smoke-kimi-k3-exl3-k2-core-k6-hqa-2rtx-6spark-kimi-k3-max-hqa/report.svg)
 - 2026-11-10 · Release smoke · wrldsuksgo2mars/Kimi-K3-EXL3-K2-Core-K6 · 1× RTX PRO 6000 @ gpu-powerd 485 W (430–600) + 6× DGX Spark · build v5.0.0-rc1 · [report](kimi_k3/2026-11-10-smoke-kimi-k3-exl3-k2-core-k6-1rtx-6spark-kimi-k3-min/report.svg)
