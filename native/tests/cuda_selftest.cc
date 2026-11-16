@@ -2658,6 +2658,64 @@ void test_cuda_graph_topology_chain_and_fork() {
   free_buffer(&buffer);
 }
 
+void test_cuda_graph_source_transfer_rewrites_all_kernel_pointers() {
+  constexpr size_t count = 5120, bytes = count * sizeof(uint16_t);
+  auto old_input = device_buffer(bytes), old_output = device_buffer(bytes);
+  auto new_input = device_buffer(bytes), new_output = device_buffer(bytes);
+  std::vector<uint16_t> values(count, 0x3f80);
+  copy_h2d(old_input, values);
+  std::fill(values.begin(), values.end(), 0x4000);
+  copy_h2d(new_input, values);
+  cudaStream_t stream = nullptr;
+  require_cuda(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), "transfer stream");
+  auto record = [&](cuteafd_device_buffer_t input, cuteafd_device_buffer_t output) {
+    const uint16_t* planes[8] = {static_cast<const uint16_t*>(input.ptr)};
+    for (int n = 0; n < 3; ++n)
+      require_cuda(static_cast<cudaError_t>(cuteafd_reduce_compact_bf16_eight_planes_async(planes, nullptr,
+          static_cast<uint16_t*>(output.ptr), 1, 1, stream)), "transfer kernel");
+  };
+  record(old_input, old_output);
+  record(new_input, new_output);
+  require_cuda(cudaStreamSynchronize(stream), "transfer warmup");
+  size_t nodes = 0, width = 0, words = 0;
+  int spans = 0;
+  const uint64_t* signature = nullptr;
+  void *first = nullptr, *second = nullptr, *donor = nullptr, *receiver = nullptr;
+  require_status(cuteafd_cuda_graph_begin_capture(stream), "transfer first begin");
+  record(old_input, old_output);
+  require_status(cuteafd_cuda_graph_capture_source(stream, &first, &nodes, &width, &spans, &signature, &words), "transfer first source");
+  assert(nodes == 3 && words != 0);
+  const std::vector<uint64_t> expected(signature, signature + words);
+  require_status(cuteafd_cuda_graph_source_instantiate(first, stream, &donor), "transfer instantiate");
+  require_cuda(cudaStreamSynchronize(stream), "transfer upload complete");
+  require_status(cuteafd_cuda_graph_begin_capture(stream), "transfer second begin");
+  record(new_input, new_output);
+  require_status(cuteafd_cuda_graph_capture_source(stream, &second, &nodes, &width, &spans, &signature, &words), "transfer second source");
+  assert(expected == std::vector<uint64_t>(signature, signature + words));
+  int status = -1, result = -1;
+  require_status(cuteafd_cuda_graph_source_update(second, donor, &status, &result), "transfer update");
+  assert(status == cudaSuccess && result == cudaGraphExecUpdateSuccess);
+  require_status(cuteafd_cuda_graph_source_transfer(second, donor, &receiver), "transfer owner");
+  require_status(cuteafd_cuda_graph_source_destroy(first), "transfer first destroy");
+  require_status(cuteafd_cuda_graph_source_destroy(second), "transfer second destroy");
+  require_status(cuteafd_cuda_graph_exec_destroy(donor), "transfer old handle destroy");
+  free_buffer(&old_input);
+  free_buffer(&old_output);
+  require_cuda(cudaMemset(new_output.ptr, 0, bytes), "transfer reset new output");
+  require_status(cuteafd_cuda_graph_launch(receiver, stream), "transfer launch new owner");
+  require_cuda(cudaStreamSynchronize(stream), "transfer completion");
+  assert(copy_d2h<uint16_t>(new_output, count) == values);
+  require_status(cuteafd_cuda_graph_exec_destroy(receiver), "transfer receiver destroy");
+  // Non-kernel nodes must never expose a transferable topology signature.
+  require_status(cuteafd_cuda_graph_begin_capture(stream), "transfer nonkernel begin");
+  for (int n = 0; n < 3; ++n) require_cuda(cudaMemsetAsync(new_output.ptr, n, bytes, stream), "transfer memset");
+  require_status(cuteafd_cuda_graph_capture_source(stream, &first, &nodes, &width, &spans, &signature, &words), "transfer nonkernel source");
+  assert(words == 0);
+  require_status(cuteafd_cuda_graph_source_destroy(first), "transfer nonkernel destroy");
+  require_cuda(cudaStreamDestroy(stream), "transfer stream destroy");
+  free_buffer(&new_input); free_buffer(&new_output);
+}
+
 void test_cuda_graph_programmatic_edges_and_diagnostic_recovery() {
   constexpr size_t bytes = 5120 * sizeof(uint16_t);
   auto input = device_buffer(bytes);
@@ -3126,7 +3184,8 @@ int main(int argc, char** argv) {
   if (argc == 2 && std::strcmp(argv[1], "--graph-topology-only") == 0) {
     test_cuda_graph_topology_chain_and_fork();
     test_cuda_graph_programmatic_edges_and_diagnostic_recovery();
-    std::cout << "test result: ok. 3 passed; 0 failed\n";
+    test_cuda_graph_source_transfer_rewrites_all_kernel_pointers();
+    std::cout << "test result: ok. 4 passed; 0 failed\n";
     return 0;
   }
   test_peer_copy_optional_query_failure_is_recoverable();
@@ -3179,6 +3238,7 @@ int main(int argc, char** argv) {
   test_cuda_mla_kv_mxfp4_pack_roundtrip_matches_representable_values();
   test_cuda_graph_topology_chain_and_fork();
   test_cuda_graph_programmatic_edges_and_diagnostic_recovery();
+  test_cuda_graph_source_transfer_rewrites_all_kernel_pointers();
   test_cuda_graph_replay_matches_uncaptured();
   test_cuda_graph_bf16_replay_matches_uncaptured();
   test_nvfp4_pack_unpack_or_skip_with_reason();
