@@ -330,6 +330,7 @@ mod load_order_tests {
 pub(crate) struct ExpertReductionPlan {
     decode: Vec<(usize, usize)>,
     decode_rows: usize,
+    stream_capacities: Vec<(usize, cuteafd_ffi::V41ExpertReduction)>,
 }
 
 impl ExpertReductionPlan {
@@ -360,7 +361,7 @@ impl ExpertReductionPlan {
             "expert package has no export covering {} decode rows with canonical m1 reduction {canonical:?}; admitted capacity/recipes: {variants:?}; export a matching capacity",
             maximum.min(decode_rows));
         let decode_rows = decode.last().unwrap().0;
-        Ok(Self { decode, decode_rows })
+        Ok(Self { decode, decode_rows, stream_capacities: Vec::new() })
     }
 
     /// One compiled-recipe check for all native families and routed-expert owners.
@@ -396,7 +397,18 @@ impl ExpertReductionPlan {
             .context("native package needs canonical m1 reduction")?.1;
         ensure!(variants.iter().all(|(capacity, recipe)| *capacity > decode_rows || recipe == canonical),
             "native decode capacities must share one slice/fold recipe");
-        Self::new(variants, decode_rows)
+        let mut plan = Self::new(variants, decode_rows)?;
+        plan.stream_capacities = variants.iter().filter_map(|(capacity, recipe)|
+            (recipe.implementation == 2).then_some((*capacity, *recipe))).collect();
+        Ok(plan)
+    }
+
+    pub(crate) fn merges_stream_capacity(&self, capacity: usize) -> bool {
+        self.stream_recipe(capacity).is_some()
+    }
+
+    pub(crate) fn stream_recipe(&self, capacity: usize) -> Option<cuteafd_ffi::V41ExpertReduction> {
+        self.stream_capacities.iter().find(|(rows, _)| *rows == capacity).map(|(_, recipe)| *recipe)
     }
 
     pub(crate) fn execution_index(
@@ -453,6 +465,24 @@ mod reduction_tests {
                 plane_count: 5, ..recipe };
             assert!(ExpertReductionPlan::native_recipes(&bad, 80).is_err(), "capacity {}", bad[index].0);
         }
+    }
+
+    #[test]
+    fn cached_stream_eligibility_matches_each_installed_capacity_attestation() {
+        use cuteafd_ffi::V41ExpertReduction;
+        let slices = V41ExpertReduction { version: 1, slice_width: 128, fc2_k_steps: 4,
+            plane_count: 3, plane_fold: 1, implementation: 1, mma_k: 32,
+            block_threads: 128, fc1_k_stage: 128 };
+        let stream = V41ExpertReduction { implementation: 2, plane_fold: 3, ..slices };
+        let variants = [(4096, stream), (1, slices), (80, slices), (256, slices), (1024, stream)];
+        let plan = ExpertReductionPlan::native_recipes(&variants, 80).unwrap();
+        for (capacity, recipe) in variants {
+            assert_eq!(plan.merges_stream_capacity(capacity), recipe.implementation == 2);
+        }
+        assert!(!plan.merges_stream_capacity(8192));
+        let stage = include_str!("experts/execution.rs").split("    fn stage(").nth(1).unwrap()
+            .split("    fn dispatch_waves(").next().unwrap();
+        assert!(!stage.contains("native_expert_reduction"));
     }
 
     #[test]

@@ -168,6 +168,31 @@ pub fn glm_admission_programs() -> Value {
                 .into_iter().map(|(name,dtype,shape,role)| json!({"name":name,"dtype":dtype,"shape":shape,"role":role})).collect::<Vec<_>>()),
             "scalars":[{"type":"int32"},{"type":"int32"}],"scratch_bytes_at_capacity":{}}),
     ]);
+    // Every Spark owner uses the same manifest ABI as production; payloads
+    // remain absent because these fixtures run metadata-only admission.
+    let entries = manifest["programs"].as_array_mut().unwrap();
+    for (suffix, capacity, tile, groups) in [("a16_serving", 64u64, 16u64, 512u64),
+        ("a16_grouped64", 64, 16, 512), ("a16_grouped", 4096, 64, 768),
+        ("a8_grouped", 4096, 64, 768), ("a16_grouped_segments", 8192, 64, 1280),
+        ("a8_grouped_segments", 8192, 64, 1280)] {
+        let grouped = suffix != "a16_serving";
+        let segments = suffix.ends_with("_segments");
+        let mut names = pointers.to_vec();
+        if segments { names[11] = "output_rows"; }
+        if grouped { names.extend(["unit_count", "unit_map"]); }
+        let mut geometry = json!({"abi_version":3,"hidden":6144,"units":16,"top_k":8,
+            "max_groups":groups,"max_rows":capacity,"split_k_blocks":8,"fc1_splits":6,"ctas_per_sm":2});
+        if grouped { geometry["group_rows"] = tile.into(); }
+        else { geometry["serving_variant"] = "k1_k23_coalesced".into(); }
+        if suffix == "a16_grouped64" { geometry["fc2_partials"] = "f32".into(); }
+        if suffix.starts_with("a8_") { geometry["activations"] = "a8".into(); }
+        if segments { geometry["row_addresses"] = true.into(); }
+        entries.push(json!({"name":format!("exlr8_{suffix}"),"capacity_rows":capacity,"geometry":geometry,
+            "pointers":names.iter().map(|name|json!({"name":name})).collect::<Vec<_>>(),
+            "scalars":(0..if grouped {4} else {2}).map(|_|json!({"type":"int32"})).collect::<Vec<_>>(),
+            "scratch_bytes_at_capacity":{"fc1":groups*16*2*6*tile*128*4,
+                "intermediate":groups*16*tile*128*2,"fc2":groups*tile*6144*4}}));
+    }
     manifest
 }
 
@@ -186,7 +211,7 @@ pub fn glm_admission_snapshot(root: &Path) {
     let mut index = Vec::new();
     for projection in 0..3 {
         for u in 0..16 {
-            index.extend_from_slice(&((65536 + (projection * 16 + u) * unit) as i64).to_le_bytes());
+            index.extend_from_slice(&((65536 + (3 * 256 * 16 + projection * 16 + u) * unit) as i64).to_le_bytes());
             index.extend_from_slice(&(unit as i64).to_le_bytes());
         }
     }
@@ -199,14 +224,37 @@ pub fn glm_admission_snapshot(root: &Path) {
     for (projection, channel, block) in [("gate","svh","su_block"), ("up","svh","su_block"), ("down","suh","sv_block")] {
         tensors.push((format!("shared.k4.{projection}.{channel}"), "F16", vec![1,2048], vec![0;4096]));
         tensors.push((format!("shared.k4.{projection}.{block}"), "F16", vec![1,48], vec![0;96]));
+        tensors.push((format!("k4.{projection}.{channel}"), "F16", vec![256,2048], vec![0;256*4096]));
+        tensors.push((format!("k4.{projection}.{block}"), "F16", vec![256,48], vec![0;256*96]));
     }
+    let mut routed_index = Vec::new();
+    for expert in 0..256 { for projection in 0..3 { for u in 0..16 {
+        routed_index.extend_from_slice(&((65536 + ((projection * 256 + expert) * 16 + u) * unit) as i64).to_le_bytes());
+        routed_index.extend_from_slice(&(unit as i64).to_le_bytes());
+    }}}
+    tensors.push(("k4.index".into(), "I64", vec![256,3,16,2], routed_index));
+    tensors.push(("k4.checksum".into(), "U64", vec![256,3,16], vec![0;256*3*16*8]));
     write(&root.join("experts/exlr8-layer-001.index.safetensors"), metadata.clone(), tensors);
     let mut weight_metadata = metadata;
     weight_metadata["k"] = json!("4");
     weight_metadata["pad_halves"] = json!("false");
-    write(&root.join("experts/exlr8-layer-001.k4.safetensors"), weight_metadata,
+    let payloads = ["gate","up","down"].into_iter().map(|projection|
+        (format!("trellis.{projection}"), "U8", vec![256*16*unit])).chain(
         ["gate","up","down"].into_iter().map(|projection|
-            (format!("shared.trellis.{projection}"), "U8", vec![16*unit], vec![0;16*unit])).collect());
+            (format!("shared.trellis.{projection}"), "U8", vec![16*unit]))).collect::<Vec<_>>();
+    // Use a fixed header region so the real index offsets stay canonical,
+    // but leave the multi-GiB zero carriers sparse on disk.
+    let mut offset = 0usize;
+    let mut header = serde_json::Map::from_iter([("__metadata__".into(), weight_metadata)]);
+    for (name, dtype, shape) in &payloads {
+        let bytes = shape.iter().product::<usize>();
+        header.insert(name.clone(), json!({"dtype":dtype,"shape":shape,"data_offsets":[offset,offset+bytes]}));
+        offset += bytes;
+    }
+    let bytes = serde_json::to_vec(&header).unwrap();
+    let mut file = File::create(root.join("experts/exlr8-layer-001.k4.safetensors")).unwrap();
+    file.write_all(&65528u64.to_le_bytes()).unwrap(); file.write_all(&bytes).unwrap();
+    file.write_all(&vec![b' ';65528-bytes.len()]).unwrap(); file.set_len((65536+offset) as u64).unwrap();
     write(&root.join("dense/exlr8-vocabulary.safetensors"),
         json!({"format":"exlr8-v2", "scheme":"exlr8-e4m3-v2"}), vec![
             ("model.embed_tokens.weight".into(), "BF16", vec![64,6144], vec![0;64*6144*2]),

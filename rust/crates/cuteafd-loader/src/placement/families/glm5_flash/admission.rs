@@ -25,6 +25,9 @@ pub struct ProcessOwners {
     pub links: Vec<PreparedSparkLink>,
     /// Physical media ranks remain available when their expert package is absent.
     pub remote_experts: bool,
+    /// EXLR8 weights plus all execution owners per onboarding count and rank.
+    pub spark_candidates: Vec<Vec<u64>>,
+    pub spark_cap: Option<u64>,
     /// Additional admitted media hosts, independent of expert peers.
     pub physical_sparks: usize,
     pub native_load: Option<NativeLoad>,
@@ -216,7 +219,7 @@ impl NativeLoad {
 
 impl ProcessOwners {
     pub fn new(host: (u64, u64), host_headroom: u64) -> Self {
-        Self { host, host_headroom, allocations: vec![], links: vec![], remote_experts: true, physical_sparks: 0, native_load: None, mount_load: None,
+        Self { host, host_headroom, allocations: vec![], links: vec![], remote_experts: true, spark_candidates: vec![], spark_cap: None, physical_sparks: 0, native_load: None, mount_load: None,
             encoders: vec![], auto_vision: false, media_cache_bytes: 0, alternate_resident: None,
             target_arenas: vec![], alternate_target_arenas: vec![], shared_arenas: vec![], draft_arenas: vec![], push_host: None,
             draft_push: None, draft_tp2: vec![] }
@@ -828,7 +831,7 @@ fn prepare_fixed<'a>(i: &'a GlmfInputs<'a>, sms: usize, rtx_experts: bool, proce
     for rank in 0..physical_sparks {
         budgets.push(p::Budget { id: format!("spark{rank}"), locations: vec![p::Location {
             device: p::Device::Spark(rank as u8), domain: p::Domain::Managed }],
-            physical_bytes: 121 << 30, logical_bytes: 121 << 30, headroom: 0,
+            physical_bytes: process.spark_cap.unwrap_or(121 << 30), logical_bytes: process.spark_cap.unwrap_or(121 << 30), headroom: 0,
             baseline: p::Baseline::Forecast { occupied: 0,
                 source: "Spark worker physical capacity; worker owners supplied by caller".into(), assumed: true } });
     }
@@ -1077,6 +1080,16 @@ fn prepare_fixed<'a>(i: &'a GlmfInputs<'a>, sms: usize, rtx_experts: bool, proce
     for (option, &count) in counts.iter().enumerate() {
         let activation = if routed.is_empty() { p::Activation::always() }
             else { p::Activation::choice(onboard_variable, option) };
+        if let Some(ranks) = process.spark_candidates.get(count) {
+            for (rank, &bytes) in ranks.iter().enumerate().filter(|(_, bytes)| **bytes > 0) {
+                let owner = p::Allocation::buffer(format!("exlr8.spark{rank}.owners.count{count}"),
+                    p::Location { device: p::Device::Spark(rank as u8), domain: p::Domain::Managed },
+                    bytes, p::Lifetime::RESIDENT, Category::Workspace, "EXLR8 Spark weights + execution owners");
+                let mut owner = p::Component::allocation(owner, p::ByteCurve::fixed(bytes, maximum), false, maximum);
+                owner.activation = activation.clone();
+                contract.components.push(owner);
+            }
+        }
         let working = GlmfWorkingSet::candidate(i, count).map_err(invalid)?;
         let workspace = if working.spark_ranks == 0 { &i.local_workspace } else { &i.workspace };
         for (index, row) in working.demands(workspace).enumerate() {

@@ -15,6 +15,7 @@ mod deepseek;
 pub mod step5;
 pub mod step5_graphs;
 mod spark_intake;
+pub mod spark_waves;
 pub mod prefill_waves;
 mod owner_tp2;
 pub use owner_tp2::OwnerTp2Rows;

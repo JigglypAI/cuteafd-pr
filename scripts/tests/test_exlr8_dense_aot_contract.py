@@ -732,7 +732,7 @@ def test_inkling2_dispatch_package_codes_cmake_and_placement_scopes_agree(monkey
     jobs = {name: (exporter, args) for name, exporter, args in placement.export_jobs()}
     args = jobs["programs"][1]
     geometries = args[args.index("--geometry") + 1].split(",")
-    assert geometries[-2:] == ["minimax", "inkling2"]
+    assert geometries[-3:] == ["minimax", "inkling2", "native_experts"]
     for package, geometry in (("fp8-inkling2-mxfp8", "inkling2_mxfp8"), ("fp8-inkling2-nvfp4a4", "inkling2_nvfp4")):
         assert jobs["fp8/" + package] == ("package_fp8_moe_aot.py", [
             "--geometry", geometry, "--capacities", placement.fp8_capacities(),

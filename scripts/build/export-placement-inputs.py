@@ -89,7 +89,7 @@ def export_jobs():
     experts.update(("inkling2:mxfp8", "inkling2:nvfp4a4", "inkling2:exl3-k45"))
     geometries = [*compare.GEOMETRIES, "kimik3", "kimik31", "muse", "muse2", "ml4",
                   "dense_trellis_k6", "kimi_split", "expert_partial", "expert_reply",
-                  "glm_stage", "glm2_stage", "glmf_stage", "glmf2_stage", "exlr8", "exlr8_dense", "minimax", "inkling2"]
+                  "glm_stage", "glm2_stage", "glmf_stage", "glmf2_stage", "exlr8", "exlr8_dense", "minimax", "inkling2", "native_experts"]
     jobs = [("programs", "export_b12x_dsv4_aot.py", [
         "--geometry", ",".join(geometries), "--max-context", "1048576",
         "--decode-rows", "64", "--prefill-rows", "4096", "--context-split", "on",

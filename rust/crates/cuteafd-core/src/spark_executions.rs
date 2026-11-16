@@ -92,6 +92,54 @@ impl OwnerExtent {
     }
 }
 
+/// Physical staging allocations: the plane and tables are charged once per
+/// owner; pinned descriptors are charged once per retained unit.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct WaveStagingLayout {
+    pub rows: u32,
+    pub plane_bytes: u64,
+    pub table_bytes: u64,
+    pub pinned_per_unit: u64,
+}
+
+/// Shared planner/runtime staging layout. A singleton cap stages even a
+/// one-unit prefill owner; the default merged cap preserves its existing
+/// eligibility and byte extents exactly. Decode never stages.
+pub fn wave_staging_layout(extent: OwnerExtent, row_bytes: u32, topk: u32,
+    max_units: u32) -> Option<WaveStagingLayout> {
+    if max_units == 0 || max_units > MAX_MERGED_UNITS || row_bytes == 0 || row_bytes % 16 != 0 {
+        return None;
+    }
+    let rows = if max_units == 1 {
+        if !matches!(extent.owner, ExecutionOwner::Prefill) { return Some(WaveStagingLayout::default()); }
+        if extent.buffered_units == 0 || extent.staging_rows == 0 { return None; }
+        extent.staging_rows
+    } else {
+        let Some(rows) = extent.segment_rows() else { return Some(WaveStagingLayout::default()); };
+        rows
+    };
+    let staged = u64::from(extent.staging_rows).checked_mul(u64::from(extent.buffered_units))?;
+    Some(WaveStagingLayout { rows,
+        plane_bytes: staged.checked_mul(u64::from(row_bytes))?,
+        table_bytes: u64::from(rows).checked_mul(16u64.checked_add(u64::from(topk).checked_mul(8)?)?)?,
+        pinned_per_unit: u64::from(extent.staging_rows).checked_mul(16)?,
+    })
+}
+
+/// Manifest-declared scratch planes, packed once at their package capacity.
+/// All users allocate the same aligned views; no payload/arena double charge.
+pub fn wave_scratch_layout<'a>(planes: impl IntoIterator<Item = (&'a str, u64)>) -> Option<(Vec<(String, u64, u64)>, u64)> {
+    let mut end = 0u64;
+    let mut ranges = Vec::new();
+    for (name, bytes) in planes {
+        if bytes == 0 || ranges.iter().any(|(old, _, _)| old == name) { return None; }
+        let offset = end.checked_add(15)?.checked_div(16)?.checked_mul(16)?;
+        end = offset.checked_add(bytes)?;
+        ranges.push((name.to_owned(), offset, bytes));
+    }
+    Some((ranges, end))
+}
+
 /// Device inputs for a segmented owner: per-slot staged rows of `row_bytes`
 /// (the ingress row: FP8 K32, BF16, or a packed wire), sharing the ordinary
 /// plane of `capacity` rows. A separate fallback plane (`sibling_row_bytes`,
@@ -595,6 +643,37 @@ mod expert_capacity_tests {
             let mut invalid = value;
             invalid["decode_capacities"] = serde_json::json!([1,16,128]);
             assert!(ExpertExportCapacities::from_manifest(&invalid).is_err());
+        }
+    }
+}
+
+#[cfg(test)]
+mod wave_staging_tests {
+    use super::*;
+
+    #[test]
+    fn singleton_staging_and_default_merged_layout_have_exact_physical_extents() {
+        for units in 1..=4 {
+            for unit in [128, 2048, 2752, 4096] {
+                let extent = OwnerExtent { owner: ExecutionOwner::Prefill, capacity: unit,
+                    compiled: 4096, staging_rows: unit, buffered_units: units };
+                for (row, topk) in [(5280, 6), (8448, 8), (8192, 8), (2304, 8)] {
+                    let single = wave_staging_layout(extent, row, topk, 1).unwrap();
+                    assert_eq!(single.rows, unit);
+                    assert_eq!(single.plane_bytes, u64::from(unit) * u64::from(units) * u64::from(row));
+                    assert_eq!(single.table_bytes, u64::from(unit) * (16 + u64::from(topk) * 8));
+                    assert_eq!(single.pinned_per_unit, u64::from(unit) * 16);
+                    let merged = wave_staging_layout(extent, row, topk, MAX_MERGED_UNITS).unwrap();
+                    if let Some(rows) = extent.segment_rows() {
+                        assert_eq!(merged.rows, rows);
+                        assert_eq!(merged.plane_bytes, u64::from(extent.staged_rows().unwrap()) * u64::from(row));
+                        assert_eq!(merged.table_bytes, u64::from(rows) * (16 + u64::from(topk) * 8));
+                        assert_eq!(merged.pinned_per_unit, u64::from(unit) * 16);
+                    } else { assert_eq!(merged, WaveStagingLayout::default()); }
+                    assert_eq!(wave_staging_layout(OwnerExtent { owner: ExecutionOwner::Decode(0), ..extent },
+                        row, topk, 1).unwrap(), WaveStagingLayout::default());
+                }
+            }
         }
     }
 }
