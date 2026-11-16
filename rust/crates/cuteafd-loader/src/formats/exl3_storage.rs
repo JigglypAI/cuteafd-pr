@@ -672,14 +672,14 @@ mod tests {
         for pointer in ["/stored_tensors/m.up_proj.trellis/shape/2", "/bits_per_weight"] {
             let mut corrupt = document.clone();
             *corrupt["tensor_storage"]["m.up_proj"].pointer_mut(pointer).unwrap() = serde_json::json!(3);
-            let error = check(&corrupt).unwrap_err().to_string();
+            let error = format!("{:#}", check(&corrupt).unwrap_err());
             assert!(error.contains("m.up_proj"), "{error}");
             assert!(parse_storage_map("quantize_config.json", &corrupt["tensor_storage"])
                 .and_then(|map| verify_storage_map("quantize_config.json", &map, &derived)).is_err());
         }
         let mut missing = document;
         missing["tensor_storage"]["m.up_proj"]["stored_tensors"].as_object_mut().unwrap().remove("m.up_proj.trellis");
-        let error = check(&missing).unwrap_err().to_string();
+        let error = format!("{:#}", check(&missing).unwrap_err());
         assert!(error.contains("m.up_proj"), "{error}");
     }
 
