@@ -11,6 +11,7 @@ use std::{path::Path, rc::Rc};
 /// The forward knows only normalized inputs/routes and the stream-ordered
 /// output. EXL3 K4 can supply the same boundary without editing layer math.
 pub(crate) trait Dispatcher {
+    fn wire_input(&self) -> bool { true }
     fn enqueue(&self, input: Buffer, ids: Buffer, weights: Buffer, output: Buffer,
         rows: usize, stream: &Stream<'_>) -> Result<()>;
 }
@@ -27,8 +28,8 @@ impl<'a> Resident<'a> {
     pub fn new(layer: usize, backend: Box<dyn crate::shared::experts::rtx::RtxExpertLayer + 'a>,
         stream: Rc<Stream<'a>>) -> Result<Self> {
         ensure!(backend.shard() == crate::shared::experts::rtx::RtxShard::Whole
-            && backend.uses_fp8_input() && backend.layers().contains(&layer) && backend.device() == stream.device.id,
-            "Inkling resident adapter requires a whole native K32 backend");
+            && backend.layers().contains(&layer) && backend.device() == stream.device.id,
+            "Inkling resident adapter requires a whole native backend");
         Ok(Self { layer, backend: Rc::new(std::cell::RefCell::new(backend)), stream })
     }
     /// Bind already committed push payloads through the shared whole executor;
@@ -73,6 +74,7 @@ impl<'a> Resident<'a> {
     }
 }
 impl Dispatcher for Resident<'_> {
+    fn wire_input(&self) -> bool { self.backend.borrow().uses_fp8_input() }
     fn enqueue(&self, input: Buffer, ids: Buffer, weights: Buffer, output: Buffer,
         rows: usize, stream: &Stream<'_>) -> Result<()> {
         use crate::shared::experts::rtx::{ExpertInput, PartialDtype, PartialLayout, Routes};
@@ -82,14 +84,17 @@ impl Dispatcher for Resident<'_> {
         ensure!(rows > 0 && backend.device() == stream.device.id
             && backend.partial_layout(rows)? == PartialLayout::Tokens && output.bytes >= rows*4608*2,
             "Inkling resident owner/output layout differs");
-        for (buffer, bytes) in [(input, rows*4752), (ids, rows*8*4), (weights, rows*8*4), (output, rows*4608*2)] {
+        let wire = backend.uses_fp8_input();
+        let input_bytes = rows * if wire { 4752 } else { 4608*2 };
+        for (buffer, bytes) in [(input, input_bytes), (ids, rows*8*4), (weights, rows*8*4), (output, rows*4608*2)] {
             ensure!(buffer.device_id == stream.device.id && buffer.bytes >= bytes && !buffer.ptr.is_null()
                 && buffer.flags == 0 && buffer.ptr as usize % 16 == 0, "Inkling resident native operand differs");
         }
         stream.device.run(|| {
-            // SAFETY: unit retains K32 input/routes and output; shared backend
-            // retains its immutable arena and serial execution workspace.
-            unsafe { backend.enqueue(self.layer, rows, ExpertInput::Fp8K32(input.ptr),
+            // SAFETY: unit retains package-typed input/routes and output; shared
+            // backend retains its immutable arena and serial execution workspace.
+            let input = if wire { ExpertInput::Fp8K32(input.ptr) } else { ExpertInput::Bf16(input.ptr) };
+            unsafe { backend.enqueue(self.layer, rows, input,
                 Routes { ids: ids.ptr, weights: weights.ptr }, stream.raw, &mut || {})?; }
             let element = if backend.partial() == PartialDtype::F32 { 4 } else { 2 };
             let source = Buffer { ptr: backend.output(), bytes: rows*4608*element, ..output };
@@ -126,7 +131,8 @@ mod resident_tests {
         fn output(&self) -> *mut c_void { self.output.buffer.ptr }
         unsafe fn enqueue(&mut self, layer: usize, rows: usize, input: ExpertInput, _routes: Routes,
             _stream: *mut c_void, _abort: &mut dyn FnMut()) -> Result<()> {
-            ensure!(layer == 0 && rows == 2 && matches!(input, ExpertInput::Fp8K32(_)),
+            ensure!(layer == 0 && rows == 2 && matches!((self.wire, input),
+                (true, ExpertInput::Fp8K32(_)) | (false, ExpertInput::Bf16(_))),
                 "resident test lost native ingress");
             self.output.device.library.copy_h2d(self.output.buffer, &vec![0x4d; rows*4608*2])
         }
@@ -153,6 +159,12 @@ mod resident_tests {
         assert!(observed.iter().all(|&byte| byte == 0x4d));
         let other = Stream::new(device)?;
         assert!(resident.enqueue(input.buffer, ids.buffer, weights.buffer, output.buffer, 2, &other).is_err());
+        let backend = Backend { output: alloc(2*4608*2)?, wire: false };
+        let native = Resident::new(0, Box::new(backend), stream.clone())?;
+        assert!(!native.wire_input());
+        let bf16 = alloc(2*4608*2)?;
+        native.enqueue(bf16.buffer, ids.buffer, weights.buffer, output.buffer, 2, &stream)?;
+        assert!(native.enqueue(input.buffer, ids.buffer, weights.buffer, output.buffer, 2, &stream).is_err());
         assert!(Resident::new(0, Box::new(Backend { output: alloc(32)?, wire: false }), stream.clone()).is_err());
         let handles = Resident::for_layers(Box::new(Backend { output: alloc(2*4608*2)?, wire: true }), stream.clone())?;
         assert_eq!(handles.len(), 1);

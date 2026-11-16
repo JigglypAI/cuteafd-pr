@@ -141,8 +141,8 @@ pub(crate) fn deliver<'a>(library: &'a NativeLibrary,
         spark_layers: inputs.routed[admitted.onboard..].to_vec(), spark_ranks: inputs.spark_ranks,
         prefill_lanes: inkling2::LANES };
     let ingress = inkling2::ingress(inputs.experts.first().and_then(|layer| layer.storage));
-    ensure!(inputs.experts.iter().all(|layer| inkling2::ingress(layer.storage) == ingress),
-        "Inkling initial delivered execution requires uniform native K32 expert ingress");
+    let ingress = if inputs.experts.iter().all(|layer| inkling2::ingress(layer.storage) == ingress) { ingress }
+        else { cuteafd_core::SparkIngress::Native };
     let endpoint = SparkEndpoint { ring_depth: None, capacity: u32::try_from(inputs.prefill.rows)?,
         ingress, partial_reply_bytes: None };
     let config = TcpTransportConfig::default();
@@ -201,10 +201,13 @@ pub(crate) fn whole<'a>(library: &'a Arc<NativeLibrary>, programs: &'a Programs<
         options.peers, TcpTransportConfig::default(), geometry))?;
     link.enable_terminal_ownership(Arc::clone(library))?;
     let mut session = SparkSessionShape::new(u32::try_from(inputs.prefill.rows)?, u32::try_from(cfg.hidden)?, u32::try_from(cfg.topk)?,
-        ExpertV2Dtype::Fp8E4m3Ue8m0K32)?;
+        if inputs.experts.iter().all(|layer| inkling2::ingress(layer.storage) == cuteafd_core::SparkIngress::Fp8K32) {
+            ExpertV2Dtype::Fp8E4m3Ue8m0K32
+        } else { ExpertV2Dtype::Bf16 })?;
     session.flags |= EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16;
     device.run(|| link.bootstrap(&session))?;
-    let execution = super::engine::Execution::new(link, requests, head, target, kernels, local, cfg.clone(), inputs.graph_reserve[0])?;
+    let execution = super::engine::Execution::new(link, requests, head, target, kernels, local, cfg.clone(), inputs.graph_reserve[0],
+        inputs.experts.iter().map(|layer| inkling2::ingress(layer.storage)).collect())?;
     let physical = [options.device];
     let devices = cuteafd_loader::placement::planner::CoordinatorDevices::new(&physical)?;
     let mut inventory = crate::shared::memory::receipts::Inventory::new(devices, "retained",

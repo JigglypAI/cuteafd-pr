@@ -103,7 +103,8 @@ impl<'a> Kernels<'a> {
 pub(crate) fn routed_ffn<'a>(kernels: &Kernels<'a>, owner: &impl UnitBuffers<'a>, target: &TargetWeights<'_>,
     experts: &dyn Dispatcher, cfg: &Inkling2Config, layer: usize, rows: usize) -> Result<()> {
     prepare_routes(kernels, owner, target, cfg, layer, rows)?;
-    experts.enqueue(owner.buffer("expert_wire")?, owner.buffer("route_ids")?, owner.buffer("route_weights")?,
+    let input = owner.buffer(if experts.wire_input() { "expert_wire" } else { "projection_input" })?;
+    experts.enqueue(input, owner.buffer("route_ids")?, owner.buffer("route_weights")?,
         owner.buffer("expert_output")?, rows, owner.stream())
 }
 

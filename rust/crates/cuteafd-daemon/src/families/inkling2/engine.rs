@@ -16,6 +16,7 @@ pub(crate) struct Execution<'a> {
     pub kernels: Kernels<'a>,
     pub local: Vec<Box<dyn Dispatcher + 'a>>,
     pub cfg: Inkling2Config,
+    ingress: Vec<cuteafd_core::SparkIngress>,
     next_identity: u64,
     terminal: bool,
 }
@@ -23,9 +24,9 @@ impl<'a> Execution<'a> {
     pub fn require_live(&self) -> Result<()> { ensure!(!self.terminal, "Inkling execution is terminal"); Ok(()) }
     pub fn new(link: SparkLink<'a>, requests: RequestOwners<'a>, head: Head<'a>,
         target: TargetWeights<'a>, kernels: Kernels<'a>, local: Vec<Box<dyn Dispatcher + 'a>>,
-        cfg: Inkling2Config, graph_reserve: u64) -> Result<Self> {
+        cfg: Inkling2Config, graph_reserve: u64, ingress: Vec<cuteafd_core::SparkIngress>) -> Result<Self> {
         ensure!(target.rank == 0 && target.layers.iter().copied().eq(0..cfg.layers)
-            && !requests.prefill.is_empty() && local.len() <= cfg.layers,
+            && !requests.prefill.is_empty() && local.len() <= cfg.layers && ingress.len() == cfg.layers,
             "Inkling whole execution differs from admitted owners");
         use crate::shared::decode_graph::{GraphBank, device::{Basis, Cycle, Preference, Site}};
         let mut graphs = GraphBank::with_family("inkling2");
@@ -33,7 +34,7 @@ impl<'a> Execution<'a> {
             Site { name: "inkling2.whole", cycle: Cycle::Other, preference: Preference::Eager,
                 bootstrap: 0, basis: Basis::Bytes, spans_devices: false })?;
         tracing::warn!(graph_reserve, "Inkling unqualified graph layout starts eager with no borrowed prewarm or pins");
-        Ok(Self { graphs, link, requests, head, target, kernels, local, cfg, next_identity: 1, terminal: false })
+        Ok(Self { graphs, link, requests, head, target, kernels, local, cfg, ingress, next_identity: 1, terminal: false })
     }
 
     /// Tokens are submitted suffixes; placement frontiers define their origins
@@ -49,7 +50,7 @@ impl<'a> Execution<'a> {
             let mut io = TokenIo { kernels: &self.kernels, head: &self.head, cache: &self.requests.cache,
                 target: &self.target, cfg: &self.cfg, tokens, starts: &starts, slots: &slots, retained_rows: false, on_logits };
             Stateful { kernels: &self.kernels, owners: &self.requests.prefill, cache: &self.requests.cache,
-                target: &self.target, cfg: &self.cfg, placements, uploads: &mut self.requests.prefill_uploads,
+                target: &self.target, cfg: &self.cfg, ingress: &self.ingress, placements, uploads: &mut self.requests.prefill_uploads,
                 waves, onboarded: self.local.len(), local: &self.local, next_identity: &mut self.next_identity,
                 placement_version: version, kind: cuteafd_transport::ExpertV2SourceKind::Prefill, io: &mut io }.run(units)?;
             self.requests.decode.stream.drain()?;
@@ -74,7 +75,7 @@ impl<'a> Execution<'a> {
                 target: &self.target, cfg: &self.cfg, tokens, starts: &starts, slots: &slots, retained_rows: true,
                 on_logits: &mut |_, _, _| Ok(()) };
             Stateful { kernels: &self.kernels, owners: std::slice::from_ref(&self.requests.decode),
-                cache: &self.requests.cache, target: &self.target, cfg: &self.cfg, placements,
+                cache: &self.requests.cache, target: &self.target, cfg: &self.cfg, ingress: &self.ingress, placements,
                 uploads: std::slice::from_mut(&mut self.requests.decode_uploads), waves,
                 onboarded: self.local.len(), local: &self.local, next_identity: &mut self.next_identity,
                 placement_version: version, kind: cuteafd_transport::ExpertV2SourceKind::Decode, io: &mut io }.run(std::slice::from_ref(unit))?;
