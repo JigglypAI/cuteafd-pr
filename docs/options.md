@@ -580,11 +580,15 @@ unmeasured; whole-core `fp8-compact` remains unsupported and unqualified.
 All accepted views retain native BF16 indexer weights. K3 DFlash2 hidden-state
 compatibility is independently unqualified. `SPECULATOR=dspark` selects the
 checkpoint-native Inferact K3.1 block drafter (override with `SPECULATOR_MODEL_ID`
-and `SPECULATOR_MODEL_REVISION`), with native BF16 weights on the target head
-GPU and independent `DRAFT_KV_CACHE=fp8|bf16` window rings (default FP8).
-`SPECULATOR=off` remains the default. This opt-in is still blocked by the K3.1
-DSA multi-row verification qualification gate (#2261); it is not yet a served
-performance claim. `TP2_DFLASH` does not apply to the GQA block drafter.
+and `SPECULATOR_MODEL_REVISION`), with native BF16 weights and independent
+`DRAFT_KV_CACHE=fp8|bf16` window rings (default FP8). One coordinator runs TP1;
+two coordinators split query/KV heads and FFN neurons across both devices,
+with per-rank packed arenas, local rings and exact local prefix marks. FC and
+norms are replicated; only the head GPU owns Markov/confidence and borrows the
+target vocabulary head. The shared GQA TP2 reduction uses drafter-private
+exchange flags, never target exchange slots. `SPECULATOR=off` remains the
+default. Full-model served lossless qualification is still pending (#2261);
+this is not a performance claim. `TP2_DFLASH` does not select this GQA split.
 
 Kimi K3 and Step-5 are text-only; dense Qwen has media off. GLM 5.3 / ML4,
 GLM Flash, MiMo, Qwen4 and Muse carry their own towers. Native GLM Flash EXLR8
@@ -808,8 +812,8 @@ accepts `KV_CACHE=bf16` (default) or experimental `fp8`: native E4M3 payloads
 with per-token/per-head FP32 K/V scales on both full and sliding layers.
 Muse FP8 passes absolute fidelity but fails paired quality and C1 default bars;
 it remains opt-in (measurements in the performance-levers table). GLM families and
-Muse expose independent `DRAFT_KV_CACHE` (`bf16`/`fp8`, default `fp8`) for the
-drafter ring; it never changes the target cache format.
+Muse, MiMo and Kimi block dSpark expose independent `DRAFT_KV_CACHE`
+(`bf16`/`fp8`, default `fp8`) for drafter rings; it never changes target KV.
 
 Media:
 
