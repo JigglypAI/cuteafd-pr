@@ -106,8 +106,14 @@ impl<'a> CommonDraft<'a> {
         match self { Self::Mla(d)=>d.mla_snapshot_buffers(),Self::Block { draft:d,.. }=>
             (0..d.slots).map(|slot|d.window_planes(slot)).collect::<Result<Vec<_>>>().map(|v|v.into_iter().flatten().collect()) }
     }
+    pub fn bind_cooperative_producers(&mut self,producers:&[crate::shared::peer_split::RankDevice])->Result<()> {
+        match self { Self::Mla(_)=>Ok(()),Self::Block { draft,.. }=>draft.bind_cooperative_producers(producers) }
+    }
     pub fn abort(&self)->Result<()> {
         match self { Self::Mla(_)=>Ok(()),Self::Block { draft,.. }=>draft.abort() }
+    }
+    pub fn finish_terminal(&self,drained:bool) {
+        if let Self::Block { draft,.. }=self { draft.finish_terminal(drained); }
     }
     pub fn require_live(&self)->Result<()> {
         match self { Self::Mla(_)=>Ok(()),Self::Block { draft,.. }=>draft.require_live() }

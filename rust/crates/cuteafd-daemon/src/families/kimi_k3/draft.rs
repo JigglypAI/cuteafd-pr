@@ -197,7 +197,7 @@ impl<'a> NativeDraft<'a> {
         // these owners before target binding without a host payload read.
         let file = if matches!(layout,DraftLayout::Block(_)) || crate::shared::experts::rtx::dense::is_recording() { Vec::new() }
             else { std::fs::read(options.snapshot.join("model.safetensors"))? };
-        let draft = match layout {
+        let mut draft = match layout {
             DraftLayout::Mla(_) => {
                 let draft=admission.allocate_draft(bridge.stream().device,programs,&options.snapshot,file,
                     bridge.stream().raw,options.representation(),Fp8Scales::Amax,Fp8Rows::W8a16,exchange)?;
@@ -209,6 +209,7 @@ impl<'a> NativeDraft<'a> {
             DraftLayout::BlockTp2 { .. }=>admission.allocate_block_tp2(bridge.stream().device,programs,
                 &options.snapshot,bridge.stream().raw)?,
         };
+        draft.bind_cooperative_producers(&ranks)?;
         let demands = cuteafd_loader::families::kimi_k3::draft::bridge_demands(
             layout, admission.lane_rows(), streams.len())?;
         let device = streams[0].device;
@@ -470,7 +471,9 @@ impl<'a> NativeDraft<'a> {
         for marks in &self.block_marks { marks.drain()?; }
         self.bridge.synchronize()?; self.common().drain_mla()
     }
-    pub(crate) fn finish_terminal(&self, drained: bool) { self.bridge.finish_terminal(drained); }
+    pub(crate) fn finish_terminal(&self, drained: bool) {
+        self.bridge.finish_terminal(drained); self.common().finish_terminal(drained);
+    }
 
     pub(crate) fn propose(&self, sequences: &[DraftSeq]) -> Result<Vec<Draft>> {
         let draft = &self.owners.draft;
@@ -559,6 +562,19 @@ mod tests {
         assert!(load.contains("if rank==lead { lead_stream } else { peer_stream.raw }"));
         assert!(load.contains("PeerExchange::new_abortable(library,rank_streams,1,slot,slot)"));
         assert!(load.contains("block-dspark-tp2-private"));
+        let ordering=block.split("fn order_cooperative_producers").nth(1).unwrap()
+            .split("pub(crate) fn require_live").next().unwrap();
+        assert!(ordering.contains("require_cooperative_producer_event(rank,*producer,event.device.id,event.raw)"));
+        assert!(ordering.find("cuda_event_record(event.raw,producer.stream)").unwrap()
+            <ordering.find("cuda_stream_wait_event(split.exchange.stream(rank),event.raw)").unwrap());
+        for (start,end) in [("fn update_on_device","pub(crate) fn reset_context"),("fn forward_tp2","fn norm_first")] {
+            let operation=block.split(start).nth(1).unwrap().split(end).next().unwrap();
+            assert!(operation.find("self.order_cooperative_producers()?").unwrap()
+                <operation.find("split.exchange.wait(").unwrap(),"{start}: spinner precedes producer event");
+        }
+        let update=block.split("fn update_on_device").nth(1).unwrap().split("pub(crate) fn reset_context").next().unwrap();
+        assert!(update.find("ensure!(last < TAP_ROWS").unwrap()<update.find("split.exchange.push_to").unwrap());
+        assert!(update.find("duplicate block dSpark tap destination").unwrap()<update.find("split.exchange.push_to").unwrap());
         let binding=include_str!("draft.rs");
         assert!(binding.contains("&options.snapshot,bridge.stream().raw)?"));
         let remote=include_str!("../../shared/draft/remote.rs");

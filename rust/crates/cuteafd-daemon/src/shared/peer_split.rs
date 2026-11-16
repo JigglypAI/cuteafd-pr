@@ -545,6 +545,18 @@ impl<'a> PeerExchange<'a> {
         check_cooperative_wait_stream(self.ranks[rank], producer)
     }
 
+    /// An independent waiter must join a retained event on the same device as
+    /// its cooperative producer before submitting any resident exchange wait.
+    pub(crate) fn require_cooperative_producer_event(&self,rank:usize,producer:RankDevice,
+        event_device:i32,event:*mut c_void)->Result<()> {
+        ensure!(rank<2,"invalid cooperative peer-wait rank {rank}");
+        if self.require_cooperative_producer_stream(rank,producer).is_ok() { return Ok(()); }
+        ensure!(self.device(rank)==producer.device && event_device==producer.device
+            && !producer.stream.is_null() && !event.is_null(),
+            "independent resident peer wait requires its cooperative producer event");
+        Ok(())
+    }
+
     pub fn stream(&self, rank: usize) -> *mut c_void {
         self.ranks[rank].stream
     }

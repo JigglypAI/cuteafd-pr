@@ -566,6 +566,8 @@ pub(crate) struct DsparkDrafter<'a> {
     norm: Dev<'a>,
     head: Option<MarkovHead<'a>>,
     head_split: Option<super::gqa_tp2::GqaHeadSplit<'a,DsparkDrafter<'a>>>,
+    // Target producer streams outlive the family draft; events fence every private wait.
+    cooperative_producers:Vec<(crate::shared::peer_split::RankDevice,device::Event<'a>)>,
     physical_rank:usize,
     physical_ranks:usize,
     lead:usize,
@@ -888,7 +890,7 @@ impl<'a> DsparkDrafter<'a> {
             inv_freq: if native_rope.is_some() { None } else {
                 cfg.rotary.as_ref().map(|plan| upload("inv_freq", bytes_of(&plan.inv_freq))).transpose()? },
             fc: weights.fc, hidden_norm: weights.hidden_norm, norm: weights.norm,
-            head,head_split:None,physical_rank,physical_ranks,lead,
+            head,head_split:None,cooperative_producers:Vec::new(),physical_rank,physical_ranks,lead,
             layers,
             taps: zeroed(TAP_ROWS * taps * 2, Tag::drafter_workspace("shared/dspark-taps"))?,
             fused: zeroed(TAP_ROWS * h * 2, Tag::drafter_workspace("shared/dspark-context-update"))?,
@@ -1124,20 +1126,6 @@ impl<'a> DsparkDrafter<'a> {
     }
 
     fn update_on_device(&self, rows: &[ContextRow]) -> Result<()> {
-        if let Some(split)=&self.head_split {
-            if !rows.is_empty() {
-                let first=rows.iter().map(|r|r.tap_row).min().unwrap();
-                let last=rows.iter().map(|r|r.tap_row).max().unwrap();
-                let stride=self.cfg.taps.len()*self.cfg.hidden*2;
-                split.exchange.push_to(split.lead,crate::shared::peer_split::DIRECT,
-                    self.taps.buffer.ptr.wrapping_byte_add(first*stride),
-                    split.peer.taps.buffer.ptr.wrapping_byte_add(first*stride),(last-first+1)*stride)?;
-                split.exchange.wait(1-split.lead,crate::shared::peer_split::DIRECT)?;
-                split.peer.device.run(||split.peer.update_on_device(rows))?;
-                split.exchange.signal(1-split.lead,crate::shared::peer_split::DIRECT)?;
-                split.exchange.wait(split.lead,crate::shared::peer_split::DIRECT)?;
-            }
-        }
         if rows.is_empty() {
             return Ok(());
         }
@@ -1175,6 +1163,21 @@ impl<'a> DsparkDrafter<'a> {
             for row in rows {
                 slots[row.tap_row - first] = self.cfg.context_row(row.slot, row.position, self.slots,
                     self.context_capacity)?;
+            }
+        }
+        self.order_cooperative_producers()?;
+        if let Some(split)=&self.head_split {
+            if !rows.is_empty() {
+                let first=rows.iter().map(|r|r.tap_row).min().unwrap();
+                let last=rows.iter().map(|r|r.tap_row).max().unwrap();
+                let stride=self.cfg.taps.len()*self.cfg.hidden*2;
+                split.exchange.push_to(split.lead,crate::shared::peer_split::DIRECT,
+                    self.taps.buffer.ptr.wrapping_byte_add(first*stride),
+                    split.peer.taps.buffer.ptr.wrapping_byte_add(first*stride),(last-first+1)*stride)?;
+                split.exchange.wait(1-split.lead,crate::shared::peer_split::DIRECT)?;
+                split.peer.device.run(||split.peer.update_on_device(rows))?;
+                split.exchange.signal(1-split.lead,crate::shared::peer_split::DIRECT)?;
+                split.exchange.wait(split.lead,crate::shared::peer_split::DIRECT)?;
             }
         }
         self.put(&self.context_positions, bytes_of(&positions))?;
@@ -1444,17 +1447,61 @@ impl<'a> DsparkDrafter<'a> {
         })
     }
 
+    pub(crate) fn bind_cooperative_producers(&mut self,producers:&[crate::shared::peer_split::RankDevice])->Result<()> {
+        if let Some(split)=&self.head_split {
+            ensure!(producers.len()==2 && self.cooperative_producers.is_empty(),"block cooperative producers already bound/missing");
+            for (rank,&producer) in producers.iter().enumerate() {
+                let event=device::Event::new(device::Device { library:self.library,id:producer.device })?;
+                split.exchange.require_cooperative_producer_event(rank,producer,event.device.id,event.raw)?;
+                self.cooperative_producers.push((producer,event));
+            }
+        }
+        Ok(())
+    }
+    fn order_cooperative_producers(&self)->Result<()> {
+        if let Some(split)=&self.head_split {
+            ensure!(self.cooperative_producers.len()==2,"block TP2 producer events must be bound before exchange waits");
+            for (rank,(producer,event)) in self.cooperative_producers.iter().enumerate() {
+                split.exchange.require_cooperative_producer_event(rank,*producer,event.device.id,event.raw)?;
+                event.device.run(|| {
+                    // SAFETY: the target retains this producer stream and this
+                    // event through draft retirement; waiter is its local private stream.
+                    unsafe {
+                        self.library.cuda_event_record(event.raw,producer.stream)?;
+                        self.library.cuda_stream_wait_event(split.exchange.stream(rank),event.raw)
+                    }
+                })?;
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn require_live(&self)->Result<()> {
         self.head_split.as_ref().map_or(Ok(()),|s|s.exchange.require_live())
     }
     pub(crate) fn abort(&self)->Result<()> {
-        self.head_split.as_ref().map_or(Ok(()),|s|s.exchange.publish_abort())
+        use crate::shared::peer_split::TerminalState;
+        self.head_split.as_ref().map_or(Ok(()),|s|match s.exchange.terminal_state() {
+            TerminalState::Aborting|TerminalState::Drained=>Ok(()),
+            _=>s.exchange.publish_abort(),
+        })
+    }
+    pub(crate) fn finish_terminal(&self,drained:bool) {
+        if let Some(split)=&self.head_split {
+            if split.exchange.terminal_state()==crate::shared::peer_split::TerminalState::Aborting {
+                split.exchange.finish_terminal(drained);
+            }
+        }
     }
     pub(crate) fn checked<T>(&self,work:impl FnOnce()->Result<T>)->Result<T> {
         self.require_live()?;
-        let result=work();
-        if result.is_err() { self.abort()?; }
-        result
+        match work() {
+            Ok(value)=>Ok(value),
+            Err(error)=>match self.abort() {
+                Ok(())=>Err(error),
+                Err(abort)=>Err(error.context(format!("block draft abort publication failed: {abort:#}"))),
+            }
+        }
     }
 
     pub(crate) fn drain(&self) -> Result<()> {
@@ -1526,6 +1573,7 @@ impl<'a> DsparkDrafter<'a> {
     fn forward_tp2(&self,w:&Workspace<'a>,split:&super::gqa_tp2::GqaHeadSplit<'a,Self>,
         positions:&[i64],tables:&[i32],sequences:usize,max_keys:usize)->Result<()> {
         use crate::shared::peer_split::DIRECT;
+        self.order_cooperative_producers()?;
         let rows=sequences*self.cfg.block; let h=self.cfg.hidden;
         let peer_work=split.peer.workspace.borrow(); let pw=peer_work.as_ref().context("block TP2 peer scratch not prepared")?;
         split.peer.device.run(|| { split.peer.put(&pw.positions,bytes_of(positions))?; split.peer.put(&pw.tables,bytes_of(tables)) })?;
@@ -1888,7 +1936,7 @@ mod tests {
         let library=fixture.load()?;
         for rank in 0..2 { fixture.configure_memory(&library,rank,1<<30)?; }
         fixture.immediate_copies(&library)?; fixture.quiet_events(&library,true)?;
-        fixture.peer_abort_initialization(&library)?;
+        fixture.peer_ordering_model(&library)?;
         let root=tempfile::tempdir_in(fixture.directory())?;
         let config=serde_json::json!({"architectures":["DSparkDraftModel"],"speculators_model_type":"dspark",
             "aux_hidden_state_layer_ids":[1],"block_size":2,"confidence_head_with_markov":true,
@@ -1924,7 +1972,7 @@ mod tests {
             let arenas=layouts.iter().enumerate().map(|(rank,l)|DeviceWeightArena::new(devices[rank],l.weights.clone(),
                 crate::shared::memory::TEST_ARENA)).collect::<Result<Vec<_>>>()?;
             let stream=Stream::new(devices[lead])?;
-            let draft=devices[lead].own(||DsparkDrafter::load_tp2_with(&library,&programs,
+            let mut draft=devices[lead].own(||DsparkDrafter::load_tp2_with(&library,&programs,
                 super::super::dflash::TargetProjection::Native,root.path(),2,2,kv,[0,1],stream.raw,lead,
                 |physical,name,bytes|arenas[physical as usize].view(name,bytes)))?;
             let split=draft.head_split.as_ref().context("missing paired block owner")?;
@@ -1952,6 +2000,37 @@ mod tests {
                 let planned=layouts[rank].weights.bytes() as u64+layouts[rank].demands(rank as u8).iter().map(|d|d.bytes).sum::<u64>();
                 assert_eq!(actual,planned,"rank {rank}, lead {lead}, KV {kv}: every physical backing must be charged once");
             }
+            let producers=[Stream::new(devices[0])?,Stream::new(devices[1])?];
+            let ranks=[0,1].map(|rank|crate::shared::peer_split::RankDevice { device:rank as i32,stream:producers[rank].raw });
+            draft.bind_cooperative_producers(&ranks)?;
+            draft.order_cooperative_producers()?;
+            let split=draft.head_split.as_ref().unwrap();
+            let (producer,event)=&draft.cooperative_producers[1-lead];
+            assert!(split.exchange.require_cooperative_producer_event(1-lead,*producer,event.device.id,std::ptr::null_mut()).is_err());
+            assert!(split.exchange.require_cooperative_producer_event(1-lead,*producer,1-event.device.id,event.raw).is_err());
+            let invalid=ContextRow { tap_row:TAP_ROWS,slot:0,position:0 };
+            let error=draft.update(&[invalid]).unwrap_err();
+            assert!(format!("{error:#}").contains("past"));
+            assert_eq!(split.exchange.terminal_state(),crate::shared::peer_split::TerminalState::Aborting);
+            // Same sequence as Engine::shutdown: abort again, ordered teardown,
+            // terminal completion, then repeated shutdown must remain harmless.
+            let steps=RefCell::new(Vec::new());
+            let shutdown=||->Result<()> {
+                draft.abort()?;
+                crate::shared::experts::rtx::pair::teardown(&mut crate::shared::experts::rtx::pair::Teardown {
+                    abort:||{ steps.borrow_mut().push("abort"); draft.abort() },
+                    ranks:||{ steps.borrow_mut().push("ranks"); draft.drain() },
+                    links:||{ steps.borrow_mut().push("links"); Ok(()) },
+                    copies:||{ steps.borrow_mut().push("copies"); draft.drain() },
+                    graphs:||{ steps.borrow_mut().push("graphs"); Ok(()) },
+                    finish:|drained|{ steps.borrow_mut().push("finish"); draft.finish_terminal(drained); },
+                })
+            };
+            shutdown()?;
+            assert_eq!(steps.borrow().as_slice(),["abort","ranks","links","copies","graphs","finish"]);
+            assert_eq!(split.exchange.terminal_state(),crate::shared::peer_split::TerminalState::Drained);
+            draft.abort()?;
+            shutdown()?;
             draft.drain()?;
         } }
         Ok(())
