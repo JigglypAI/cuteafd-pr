@@ -1,0 +1,88 @@
+{
+  "verdict": {
+    "pass": true,
+    "scoring_policy": "minimax-generated-aggregate",
+    "informational": [
+      "context rows",
+      "per-window metrics (including sensitivity-floor windows)",
+      "confident top-1 and top-3"
+    ],
+    "generated": {
+      "positions": 12679,
+      "missing": 0,
+      "non_finite": 0,
+      "nll": 1.426339211827052,
+      "ref_nll": 1.4334570202796129,
+      "kl": 0.03706102098479799,
+      "top1": 0.9438441517469665,
+      "confident_positions": 10167,
+      "confident_top1": 0.9847545982098947,
+      "top3_contained": 0.9966874359176414,
+      "agree_text": 0.6700843915135145,
+      "records": []
+    },
+    "context": {
+      "positions": 5753,
+      "missing": 0,
+      "non_finite": 0,
+      "nll": 6.396771586883493,
+      "ref_nll": 6.339382033548392,
+      "kl": 1.8473519417522162,
+      "top1": 0.6301060316356917,
+      "confident_positions": 3889,
+      "confident_top1": 0.7665209565440987,
+      "top3_contained": 0.7646445332870107,
+      "agree_text": 0.35529289066574943,
+      "records": []
+    },
+    "top1_min": 0.93,
+    "kl_max": 0.05,
+    "confident_top1_min": 0.96,
+    "top3_min": 0.97,
+    "reasons": [],
+    "label": "reference; common policy floor, not engine calibration"
+  },
+  "prefill_verdict": {
+    "pass": true,
+    "scoring_policy": "minimax-generated-aggregate",
+    "informational": [
+      "context rows",
+      "per-window metrics (including sensitivity-floor windows)",
+      "confident top-1 and top-3"
+    ],
+    "generated": {
+      "positions": 12080,
+      "missing": 0,
+      "non_finite": 0,
+      "nll": 1.217906653906584,
+      "ref_nll": 1.22138629048883,
+      "kl": 0.02126332028493079,
+      "top1": 0.9452814569534445,
+      "confident_positions": 10018,
+      "confident_top1": 0.9844280295468157,
+      "top3_contained": 0.9974337748342237,
+      "agree_text": 0.7060430463574889,
+      "records": []
+    },
+    "context": {
+      "positions": 6352,
+      "missing": 0,
+      "non_finite": 0,
+      "nll": 6.729492828910126,
+      "ref_nll": 6.521826498579426,
+      "kl": 1.8336295933463052,
+      "top1": 0.644993702770753,
+      "confident_positions": 4321,
+      "confident_top1": 0.7704235130756769,
+      "top3_contained": 0.7690491183878744,
+      "agree_text": 0.3406801007556569,
+      "records": []
+    },
+    "top1_min": 0.93,
+    "kl_max": 0.05,
+    "confident_top1_min": 0.96,
+    "top3_min": 0.97,
+    "reasons": [],
+    "label": "reference; common policy floor, not engine calibration"
+  }
+}
