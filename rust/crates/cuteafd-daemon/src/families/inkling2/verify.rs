@@ -6,7 +6,8 @@ use cuteafd_ffi::{fir_history::{Commit,Layout},programs::Programs,CuteafdDeviceB
 use std::{cell::{Cell,RefCell},rc::Rc,sync::atomic::{AtomicU64,Ordering}};
 
 static NEXT_OWNER:AtomicU64=AtomicU64::new(1);
-pub(crate) struct Mark<'a>{owner:u64,generation:u64,checkpoint:Rc<Allocation<'a>>,slots:Vec<(usize,usize)>}
+pub(crate) struct Mark<'a>{owner:u64,generation:u64,checkpoint:Rc<Allocation<'a>>,pub slots:Vec<(usize,usize)>}
+pub(crate) struct TargetMark<'a>{pub conv:Mark<'a>,pub placements:Vec<super::cache::Placement>}
 pub(crate) struct Submitted{pub slot:usize,pub start:usize,pub first:usize,pub rows:usize}
 pub(crate) struct Verify<'a>{
  pub checkpoint:Rc<Allocation<'a>>,pub replay:Allocation<'a>,table:Allocation<'a>,
