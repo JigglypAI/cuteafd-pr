@@ -245,7 +245,7 @@ fn k31_context_multirow_verify_matches_sequential() -> Result<()> {
                     graphs: true, ffn_mode: Default::default(), hosted_layers: None, draft: None, verify_rows: 8, prefix: None,
                     prove_serve_admission: false,
                 })?;
-            println!("K31_MULTIROW_LAYOUT view={label} layers=4 routed=skipped ranks=2 attention=Context context={CONTEXT} graphs=off (startup graphs reserved)");
+            println!("K31_MULTIROW_LAYOUT view={label} layers=4 routed=skipped ranks=2 attention=Context context={CONTEXT} context_graphs=on optional_kda_ffn_graphs=off");
             for n in WIDTHS {
                 for history in HISTORIES { case(&loaded.engine, &[history], &tokens, n, &label, &mut failures)?; }
                 case(&loaded.engine, &HISTORIES, &tokens, n, &label, &mut failures)?;
