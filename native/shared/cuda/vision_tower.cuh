@@ -9,10 +9,14 @@ struct GenericTowerStorage {
   int32_t* lengths=nullptr;
 };
 
+bool generic_extent(const cuteafd_vision_spec& s,uint64_t offset,size_t bytes,size_t alignment=2) {
+  return offset!=UINT64_MAX && offset%alignment==0 && offset<=s.weight_bytes && bytes<=s.weight_bytes-offset;
+}
+
 bool generic_norm_extent(const cuteafd_vision_spec& s,const cuteafd_vision_tower_norm& n,uint32_t width) {
   if(!n.kind)return n.epsilon==0.f && n.weight==UINT64_MAX && n.bias==UINT64_MAX;
-  if((n.kind!=1 && n.kind!=2) || !isfinite(n.epsilon) || n.epsilon<=0.f || !extent(s,n.weight,size_t(width)*2))return false;
-  return n.bias==UINT64_MAX || (n.kind==1 && extent(s,n.bias,size_t(width)*2));
+  if((n.kind!=1 && n.kind!=2) || !isfinite(n.epsilon) || n.epsilon<=0.f || !generic_extent(s,n.weight,size_t(width)*2))return false;
+  return n.bias==UINT64_MAX || (n.kind==1 && generic_extent(s,n.bias,size_t(width)*2));
 }
 
 bool generic_projector_extent(const cuteafd_vision_spec& s,const cuteafd_vision_tower_projector& p) {
@@ -20,9 +24,9 @@ bool generic_projector_extent(const cuteafd_vision_spec& s,const cuteafd_vision_
     p.fc1==UINT64_MAX && p.fc1_bias==UINT64_MAX && p.fc2==UINT64_MAX && p.fc2_bias==UINT64_MAX;
   if(p.kind!=1 || (p.activation!=1 && p.activation!=2) || p.reserved || !p.input_width || !p.hidden_width || !p.output_width ||
      p.input_width>32768 || p.hidden_width>32768 || p.output_width>32768)return false;
-  return extent(s,p.fc1,size_t(p.input_width)*p.hidden_width*2) && extent(s,p.fc2,size_t(p.hidden_width)*p.output_width*2) &&
-    (p.fc1_bias==UINT64_MAX || extent(s,p.fc1_bias,size_t(p.hidden_width)*2)) &&
-    (p.fc2_bias==UINT64_MAX || extent(s,p.fc2_bias,size_t(p.output_width)*2));
+  return generic_extent(s,p.fc1,size_t(p.input_width)*p.hidden_width*2) && generic_extent(s,p.fc2,size_t(p.hidden_width)*p.output_width*2) &&
+    (p.fc1_bias==UINT64_MAX || generic_extent(s,p.fc1_bias,size_t(p.hidden_width)*2)) &&
+    (p.fc2_bias==UINT64_MAX || generic_extent(s,p.fc2_bias,size_t(p.output_width)*2));
 }
 
 bool valid_generic_tower(const cuteafd_vision_spec& s) {
@@ -41,7 +45,7 @@ bool valid_generic_tower(const cuteafd_vision_spec& s) {
   uint64_t rotated=0;
   for(int axis=0;axis<3;++axis) {
     uint32_t dim=t.rotary_axis_dims[axis];rotated+=dim;
-    if(dim%2 || (dim ? !extent(s,t.inv_freq[axis],size_t(dim/2)*4) : t.inv_freq[axis]!=UINT64_MAX))return false;
+    if(dim%2 || (dim ? !generic_extent(s,t.inv_freq[axis],size_t(dim/2)*4,4) : t.inv_freq[axis]!=UINT64_MAX))return false;
   }
   if(rotated!=t.rotated_dims || rotated+t.passthrough_dims!=s.head_dim || t.rotary_kind>2)return false;
   if((!t.rotary_kind && rotated) || (t.rotary_kind==1 && (!t.rotary_axis_dims[0] || !t.rotary_axis_dims[1] || !t.rotary_axis_dims[2])) ||
@@ -49,7 +53,7 @@ bool valid_generic_tower(const cuteafd_vision_spec& s) {
   if(!t.absolute_kind) {
     if(t.position_height || t.position_width || t.interpolation || t.absolute_position!=UINT64_MAX)return false;
   } else if(t.absolute_kind!=1 || !t.position_height || t.position_height>512 || !t.position_width || t.position_width>512 ||
-     t.interpolation!=1 || !extent(s,t.absolute_position,size_t(t.position_height)*t.position_width*s.hidden*2))return false;
+     t.interpolation!=1 || !generic_extent(s,t.absolute_position,size_t(t.position_height)*t.position_width*s.hidden*2))return false;
   for(const auto& p:t.projectors)if(!generic_projector_extent(s,p))return false;
   const auto& first=t.projectors[0];const auto& second=t.projectors[1];
   if(first.kind!=1)return false;
@@ -58,17 +62,17 @@ bool valid_generic_tower(const cuteafd_vision_spec& s) {
   } else if(t.projection_order==2) {
     if(first.input_width!=s.hidden || second.kind!=1 || uint64_t(first.output_width)*4!=second.input_width || second.output_width!=s.output_width)return false;
   } else return false;
-  if(!extent(s,s.patch,size_t(s.hidden)*3*t.temporal_patch*s.patch_size*s.patch_size*2) ||
-     (s.patch_bias!=UINT64_MAX && !extent(s,s.patch_bias,size_t(s.hidden)*2)))return false;
+  if(!generic_extent(s,s.patch,size_t(s.hidden)*3*t.temporal_patch*s.patch_size*s.patch_size*2) ||
+     (s.patch_bias!=UINT64_MAX && !generic_extent(s,s.patch_bias,size_t(s.hidden)*2)))return false;
   for(uint32_t layer=0;layer<s.depth;++layer) {
     const auto& b=s.blocks[layer];
     const uint64_t offsets[]={b.qkv,b.proj,b.gate_up,b.down,b.norm1,b.norm2};
     const size_t sizes[]={size_t(3)*t.attention_width*s.hidden*2,size_t(t.attention_width)*s.hidden*2,
       size_t(s.intermediate)*s.hidden*2,size_t(s.hidden)*s.intermediate*2,size_t(s.hidden)*2,size_t(s.hidden)*2};
-    for(int field=0;field<6;++field)if(!extent(s,offsets[field],sizes[field]))return false;
+    for(int field=0;field<6;++field)if(!generic_extent(s,offsets[field],sizes[field]))return false;
     const uint64_t biases[]={b.qkv_bias,b.proj_bias,b.gate_up_bias,b.down_bias,s.norm1_bias[layer],s.norm2_bias[layer]};
     const size_t widths[]={size_t(3)*t.attention_width,s.hidden,s.intermediate,s.hidden,s.hidden,s.hidden};
-    for(int field=0;field<6;++field)if(biases[field]!=UINT64_MAX && !extent(s,biases[field],widths[field]*2))return false;
+    for(int field=0;field<6;++field)if(biases[field]!=UINT64_MAX && !generic_extent(s,biases[field],widths[field]*2))return false;
     if(t.block_norm_kind==2 && (s.norm1_bias[layer]!=UINT64_MAX || s.norm2_bias[layer]!=UINT64_MAX))return false;
     if(b.window || b.column_order || b.key0_bias!=UINT64_MAX || s.q_norm[layer]!=UINT64_MAX || s.k_norm[layer]!=UINT64_MAX)return false;
   }
