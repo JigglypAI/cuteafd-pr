@@ -534,7 +534,7 @@ Each key is also a global `cuteafd` flag (`--gpu-memory-cap`, `--kv-max-tokens`,
 | `DRAFT_CONTEXT_SLOTS` | `max(20, drafts)` | positive int | GLM/MiMo drafter context slots. |
 | `DRAFT_SEQUENCES` | engine default | positive int | Maximum drafts in one batch. |
 | `SPECULATION_TRACE` | unset | absolute path | JSONL speculation trace. |
-| `GLM5_FLASH_DRAFT_LINEAR` | auto by drafter | `w8a16`, `wide`, `w8a8` | GLM Flash drafter GEMM. |
+| `GLM5_FLASH_DRAFT_LINEAR` | auto by drafter | `w8a16`, `wide`, `w8a8` | GLM Flash drafter GEMM; Rust resolves `w8a8` with an external FP8 drafter, `w8a16` otherwise. |
 
 ## Prefill
 
@@ -1020,3 +1020,11 @@ original core is already FP8, not an MC publication.
 MiniMax one-RTX accepted keys and retained qualification gates are listed in
 [MiniMax Serving](#minimax-serving); its family column is listed separately until
 two-RTX serving qualification completes (#1856).
+
+`cuteafd plan --config FILE` and the launcher share deterministic GLM Flash index,
+replay and draft-linear defaults. Plan reports `resolved_settings` with explicit,
+config or auto-rule provenance, plus `planning_inputs` identifying simulated or
+explicit device capacity and estimated runtime owners. The plan
+`--coordinator-weight-budget-gib` default follows this capacity (including
+`--gpu-memory-cap`); the launcher passes Qwen occupancy as an explicit adjusted
+capacity. Explicit weight ceilings override that derivation.

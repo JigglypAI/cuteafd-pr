@@ -167,11 +167,11 @@ fn resolve_settings(args: &mut PlanArgs, family: &str, cfg: &std::collections::B
         let configured = |key: &str| cfg.get(key).map(String::as_str);
         let index = defaults::glmf_index_cache(args.index_cache.map(|v| v.to_possible_value().unwrap().get_name().to_owned()).as_deref(),
             configured("GLM5_FLASH_INDEX_CACHE"), args.rtx);
-        args.index_cache = Some(crate::families::glm5_flash::engine::IndexCache::from_str(&index.value, false).map_err(anyhow::Error::msg)?);
+        args.index_cache = Some(crate::families::glm5_flash::engine::IndexCache::from_str(&index.value, false).map_err(|e| anyhow::anyhow!("GLM5_FLASH_INDEX_CACHE must be keys or compact: {e}"))?);
         resolved.insert("index_cache".into(), setting(index));
         let linear = defaults::glmf_draft_linear(args.draft_linear.map(|v| v.to_possible_value().unwrap().get_name().to_owned()).as_deref(),
             configured("GLM5_FLASH_DRAFT_LINEAR"), args.speculator != "off" && args.draft_fp8.unwrap_or(configured("SPECULATOR_FP8") != Some("off")));
-        args.draft_linear = Some(crate::shared::fp8_linear::Fp8Rows::from_str(&linear.value, false).map_err(anyhow::Error::msg)?);
+        args.draft_linear = Some(crate::shared::fp8_linear::Fp8Rows::from_str(&linear.value, false).map_err(|e| anyhow::anyhow!("GLM5_FLASH_DRAFT_LINEAR must be w8a16, wide or w8a8: {e}"))?);
         resolved.insert("draft_linear".into(), setting(linear));
         if args.draft_fp8.is_none() {
             args.draft_fp8 = match configured("SPECULATOR_FP8") {
@@ -220,6 +220,36 @@ fn print_settings(value: &serde_json::Value) {
         for (name, resolved) in settings { println!("  {name}: {} ({})", resolved["value"], resolved["provenance"].as_str().unwrap_or("")); }
     }
     println!("planning inputs: {}", value["planning_inputs"]);
+}
+
+fn resolve_config(args: &mut PlanArgs, cfg: &std::collections::BTreeMap<String, String>) -> Result<()> {
+    let get = |key: &str| cfg.get(key).filter(|v| !v.is_empty());
+    macro_rules! configured {
+        ($field:ident, $key:literal) => {
+            if !args.explicit_settings.contains(stringify!($field)) {
+                if let Some(value) = get($key) { args.$field = value.parse().with_context(|| $key)?; }
+            }
+        };
+    }
+    configured!(rtx, "RTX_GPUS");
+    configured!(attention_placement, "ATTENTION_PLACEMENT");
+    configured!(prefill_rows, "PREFILL_ROWS");
+    if args.pool_tokens.is_none() { args.pool_tokens = get("POOL_TOKENS").filter(|v| *v != "auto").map(|v| v.parse().context("POOL_TOKENS")).transpose()?; }
+    if args.exlr8_manifest.is_none() { args.exlr8_manifest = get("EXLR8_MANIFEST").cloned(); }
+    if !args.explicit_settings.contains("core_view") {
+        if let Some(value) = get("CORE_VIEW") { args.attention.core_view = value.parse().map_err(anyhow::Error::msg)?; }
+    }
+    if args.kv_format.is_none() { args.kv_format = get("KV_CACHE").map(|v| v.parse().map_err(anyhow::Error::msg)).transpose()?; }
+    if !args.explicit_settings.contains("vision") { if let Some(value) = get("VISION") { args.vision = value.parse().map_err(anyhow::Error::msg)?; } }
+    if !args.explicit_settings.contains("audio") { if let Some(value) = get("AUDIO") { args.audio = value.parse().map_err(anyhow::Error::msg)?; } }
+    if !args.explicit_settings.contains("host_cache_bytes") {
+        if let Some(value) = get("HOST_CACHE_BYTES") { args.host_cache_bytes = value.parse().map_err(anyhow::Error::msg)?; }
+    }
+    if args.rtx_expert_layers.is_none() { args.rtx_expert_layers = get("RTX_EXPERT_LAYERS").filter(|v| *v != "auto").map(|v| v.parse().map_err(anyhow::Error::msg)).transpose()?; }
+    if !args.explicit_settings.contains("native_mtp_layers") {
+        if let Some(value) = get("SPECULATOR_DEPTH") { args.native_mtp_layers = value.parse().context("SPECULATOR_DEPTH")?; }
+    }
+    Ok(())
 }
 
 fn resolve_context_tokens(args: &mut PlanArgs, cfg: &std::collections::BTreeMap<String, String>) -> Result<()> {
@@ -345,6 +375,7 @@ fn run_plan_with_host(mut args: PlanArgs) -> Result<()> {
     }
     if args.config.is_some() {
         let cfg = launch_config(args.config.as_deref())?;
+        resolve_config(&mut args, &cfg)?;
         resolve_expert_usage(&mut args, &cfg)?;
         resolve_context_tokens(&mut args, &cfg)?;
         args.available_sparks = (0..8).take_while(|rank|
@@ -390,7 +421,9 @@ fn run_plan_with_host(mut args: PlanArgs) -> Result<()> {
     let view = args.attention.select(&snapshot)?;
     let cfg = launch_config(args.config.as_deref())?;
     let family_config = view.config()?;
-    let family = if cuteafd_loader::plan::exlr8::recognizes(&snapshot)? {
+    let family = if args.resolve_settings_only && family_config["model_type"] == "glm5_next" {
+        "glm5_flash"
+    } else if cuteafd_loader::plan::exlr8::recognizes(&snapshot)? {
         cuteafd_loader::plan::exlr8::architecture(&family_config)?
     } else {
         let checkpoint = cuteafd_loader::plan::Checkpoint::inventory_view(&view)?;
@@ -1468,6 +1501,7 @@ mod tests {
 
     fn args(model: &std::path::Path, spark_ranks: usize, require_ready: bool) -> PlanArgs {
         PlanArgs {
+            explicit_settings: Default::default(),
             test_host_memory: Some(cuteafd_loader::plan::testing::SimulatedHost::raptor().host_ram),
             fp8_prefill: Default::default(),
             attention: Default::default(),
@@ -2204,7 +2238,7 @@ mod tests {
             let options = options(&args).unwrap();
             assert_eq!(options.coordinator_gpu_budget_bytes, bytes);
             assert_eq!(options.layout.unwrap().rtx_bytes, vec![bytes; 2]);
-            assert_eq!(options.coordinator_budget_bytes, cuteafd_loader::placement::ResidentWeights::DEFAULT_LIMIT.0);
+            assert_eq!(options.coordinator_budget_bytes, bytes);
         }
         let cli = crate::cli::Cli::try_parse_from(["cuteafd", "plan", "/not-read"]).unwrap();
         let crate::cli::Commands::Plan(plan_args) = cli.command else { panic!("plan") };

@@ -805,15 +805,14 @@ done
 release_reject_unused_keys deepseek_v41 $(_v41_allowed_keys)
 readiness_args=(--require-ready)
 [[ -z "$wip_slot" ]] || readiness_args=()
-# Plan and serve admit resident weights against the same resolved budget.
-v41_weight_budget_gib="$(release_gib "$profile_cap")"
 count_plan="$(docker run --rm --network none "${count_mounts[@]}" "$COORDINATOR_DOCKER_INFERENCE" \
   "${count_command[@]}" plan "$(readlink -f "$hf_home/$snapshot_rel")" --fp8-prefill "$(get FP8_PREFILL auto)" --vision "$VISION" --audio off \
   --deployment "${readiness_args[@]}" "${count_args[@]}" --rtx "$RELEASE_RTX_GPUS" \
-  "${plan_memory_args[@]}" --gpu-memory-cap "$profile_cap" --coordinator-weight-budget-gib "$v41_weight_budget_gib" \
+  "${plan_memory_args[@]}" --gpu-memory-cap "$profile_cap" \
   --pool-tokens "$count_pool" --prefill-rows "$count_prefill" --max-context-tokens "$MAX_CONTEXT_TOKENS" \
   --concurrency "$CONCURRENCY" --prefix-cache-entries "$PREFIX_CACHE_ENTRIES" --host-cache-bytes "$HOST_CACHE_BYTES")"
 release_validate_deployment "$count_plan" deepseek_v41
+v41_weight_budget_gib="$(jq -er '.resolved_settings.coordinator_weight_budget_gib.value' <<<"$count_plan")"
 release_deployment_spark_roles "$count_plan" "$SPARK_COUNT"
 release_admit_coordinator_gpus "$gpu_uuid_csv" "$count_plan" ${RELEASE_RECLAIM_ARGS[@]+"${RELEASE_RECLAIM_ARGS[@]}"}
 resolved_decode_lanes="$(jq -er ' .decode_lanes | select(. == 2)' <<<"$count_plan")" ||
@@ -1566,11 +1565,6 @@ fi
 # 2 Sparks and 2 RTX + 4 Sparks) for each checkpoint. DFlash2 led on every one
 # measured (2026-10-04: wrldsuksgo2mars EXL3 K3.25, nvidia NVFP4, brandonmusic
 # tr3 4bpw; agentic 1.3-1.5x dSpark); SPECULATOR=dspark selects the RedHat dSpark.
-glm5_flash_speculator() {
-  case "$1" in
-    *) echo "dflash2 incoai/GLM-5.3-Flash-DFlash2" ;;
-  esac
-}
 # Qualification is for these official checkpoints, not a shape-compatible sibling.
 mimo_flash_mopd=0 mimo_bundled_dflash=0
 [[ "$family:$model" != mimo_v2:XiaomiMiMo/MiMo-V2.6-Flash-MOPD ]] || mimo_flash_mopd=1
@@ -1595,14 +1589,11 @@ if [[ -z "$speculator" ]]; then
     echo "note: GLM 5.3 drafts with DFlash2 ($default_drafter); SPECULATOR=off disables it" >&2
   fi
   if [[ $speculator == off && $family == glm5_flash ]]; then
-    read -r speculator default_drafter <<<"$(glm5_flash_speculator "$model")"
-    if [[ -d "$hub/models--${default_drafter//\//--}" ]]; then
-      echo "note: GLM 5.3 Flash drafts with $speculator ($default_drafter) for $model; SPECULATOR=off disables it" >&2
-    else
-      echo "warning: GLM 5.3 Flash drafts with $speculator by default but $default_drafter is not downloaded" \
-        "(hf download $default_drafter); serving without a drafter" >&2
-      speculator=off default_drafter=""
-    fi
+    # Rust owns the conditional missing-default-drafter fallback. This header-only
+    # query uses the same resolver as placement, before any drafter is fetched.
+    glmf_defaults="$(docker run --rm --network none -e "HF_HOME=$container_hf_home"       "${generic_worker_mounts[@]}" "${wip_mount_args[@]}" -v "$config:/run/cuteafd-plan.config:ro"       "$coordinator_image" cuteafd plan "$snapshot" --config /run/cuteafd-plan.config --resolve-settings-only)"
+    speculator="$(jq -er '.speculator' <<<"$glmf_defaults")"
+    default_drafter="$(jq -er '.default_drafter' <<<"$glmf_defaults")"
   fi
   if [[ $speculator == off && $mimo_bundled_dflash == 1 ]]; then
     speculator=dflash2
@@ -2152,20 +2143,7 @@ if [[ $family == glm5_flash ]]; then
     partials) ;;
     *) echo "GLM5_FLASH_KDA_SPLIT must be auto or partials" >&2; exit 2 ;;
   esac
-  # GLM5_FLASH_INDEX_CACHE: auto selects compact on one GPU, keys on a split.
-  # keys: every token's BF16 key | gate
-  # row beside its latent record, 11,804 B per token) or compact (the pooled keys plus each
-  # sequence's open pool, 6,172 B per token, the same pooled keys bit for bit; one GPU only,
-  # a head split keeps keys).
-  index_eligible=0; index_reason="head split keeps token keys"
-  [[ $head_split != 0 ]] || { index_eligible=1; index_reason="one GPU; bit-identical pooled keys"; }
-  index_cache="$(release_glmf_auto GLM5_FLASH_INDEX_CACHE "$(get GLM5_FLASH_INDEX_CACHE auto)" \
-    compact keys "$index_eligible" "$index_reason")"
-  case "$index_cache" in
-    ""|keys) ;;
-    compact) family_args+=(--index-cache compact) ;;
-    *) echo "GLM5_FLASH_INDEX_CACHE must be keys or compact" >&2; exit 2 ;;
-  esac
+  # Index cache is resolved by Rust with the admitted topology below.
   # Continuous row units share one Spark link; every in-flight wave owns an intake plane.
   prefill_waves="$(get PREFILL_WAVES)"
   if [[ -n "$prefill_waves" ]]; then
@@ -2193,17 +2171,7 @@ if [[ $family == glm5_flash ]]; then
     off) family_args+=(--fp8-head false) ;;
     auto|packed) family_args+=(--fp8-head "$fp8_head") ;;
   esac
-  # GLM5_FLASH_DRAFT_LINEAR: w8a8 with an FP8 drafter; w8a16 runs the W8A16 GEMV in passes of
-  # 64 rows), wide (the same bits in passes of 128 rows) or w8a8 (past one draft block, E4M3
-  # activations per row and 128-wide K block on FP8 tensor cores). Drafts only.
-  draft_linear_default=w8a16
-  if [[ "$draft_model_args" != 0 && "$(get SPECULATOR_FP8 auto)" != off ]]; then draft_linear_default=w8a8; fi
-  draft_linear="$(get GLM5_FLASH_DRAFT_LINEAR "$draft_linear_default")"
-  case "$draft_linear" in
-    ""|w8a16) ;;
-    wide|w8a8) family_args+=(--draft-linear "$draft_linear") ;;
-    *) echo "GLM5_FLASH_DRAFT_LINEAR must be w8a16, wide or w8a8" >&2; exit 2 ;;
-  esac
+  # Draft GEMM mode is resolved by Rust with the drafter policy below.
   # GLM5_FLASH_TARGET_HEAD: GLM 5.3 Flash's own spelling of TARGET_HEAD (--target-head). auto
   # (default) forwards nothing: the shared setting applies (tensor cores at every row count over the
   # BF16 head; the FP8 and packed heads run their own GEMVs). exact (diagnostic) keeps the pedantic
@@ -2286,22 +2254,7 @@ if [[ $family == glm5_flash ]]; then
   # PREFIX_CACHE_MARK_MIB: the device budget of the prefix mark arena, MiB (unset: serve-glmf's
   # 2048), as for MiMo; the host-off legacy arena retains its per-sequence floor.
   [[ -z "$(get PREFIX_CACHE_MARK_MIB)" ]] || family_args+=(--prefix-cache-mark-mib "$(get PREFIX_CACHE_MARK_MIB)")
-  # GLM5_FLASH_REPLAY_RECORDS: auto shares when eligible; own keeps their
-  # own 321 MB, 642 MB with GLM5_FLASH_DECODE_ROWS=128) or shared (the prefill lanes' scratch, which
-  # no decode step reads). One GPU whose pool is sized from measured memory (an automatic pool with
-  # Spark experts).
-  requested_replay_records="$(get GLM5_FLASH_REPLAY_RECORDS auto)"
-  case "$requested_replay_records" in
-    ""|auto|own) ;;
-    shared)
-      if [[ $head_split != 0 ]]; then
-        echo "GLM5_FLASH_REPLAY_RECORDS=shared keeps the records in one GPU's prefill scratch; serve it without a head split" >&2
-        exit 2
-      fi
-      family_args+=(--replay-records shared) ;;
-    *) echo "GLM5_FLASH_REPLAY_RECORDS must be own or shared" >&2; exit 2 ;;
-  esac
-  glmf_replay_pos=${#family_args[@]}
+  # Replay ownership is resolved alongside expert admission in Rust.
   # GLM5_FLASH_DECODE_ROWS: auto keeps 64; 128 remains opt-in after the C16 cost-model gate. With
   # 128 a step of more than 64 rows runs the wide _m128 programs (a build with
   # CUTEAFD_GLMF_WIDE_DECODE_ROWS=128) and a verify step schedules up to the GPU's whole sparse MLA
@@ -2374,8 +2327,6 @@ audio_encoder_hash=""
     # Subtract that explicit used-memory term from the CUDA/logical capacity.
     plan_cap="$(python3 -c 'import sys;f,t,b=map(int,sys.argv[1:]);print(max(1,b-(t-f)*2**20))' "$free_mib" "$total_mib" "$profile_cap")"
   fi
-  # Plan and serve admit resident weights against the same resolved budget.
-  coordinator_weight_budget_gib="$(release_gib "$plan_cap")"
   plan_draft_args=(--concurrency "$effective_concurrency" --mapped-scale-preload-gib "$(get MAPPED_SCALE_PRELOAD_GIB 0)")
   if [[ ( "$family" == mimo_v2 || "$family" == kimi_k3 || "$family" == glm5_flash || "$family" == muse_spark ) && "$tp2_dflash" != auto ]]; then
     plan_draft_args+=(--tp2-dflash "$tp2_dflash_bool")
@@ -2448,17 +2399,8 @@ audio_encoder_hash=""
     # Draft-head arithmetic borrows the same target weight, not a second resident head.
     plan_draft_args+=(--draft-head exact)
   fi
-  [[ "$family" != glm5_flash || "${index_cache:-keys}" != compact ]] || plan_draft_args+=(--index-cache compact)
   # GLM 5.3 Flash: the server's prefix-mark store, so the plan reserves an arena only when serve-glmf allocates one.
   [[ "$family" != glm5_flash || -z "${prefix_marks:-}" ]] || plan_draft_args+=(--prefix-marks "$prefix_marks")
-  # GLM 5.3 Flash: shared replay records (GLM5_FLASH_REPLAY_RECORDS above) live in the prefill
-  # scratch, so the plan does not charge their own copy either.
-  if [[ "$family" == glm5_flash ]]; then
-    case "${requested_replay_records:-auto}" in
-      shared) plan_draft_args+=(--replay-records shared) ;;
-      ""|auto) plan_draft_args+=(--replay-records auto) ;;
-    esac
-  fi
   # GLM 5.3 Flash plans the decode rows serving takes (GLM5_FLASH_DECODE_ROWS above): 128 rows
   # charge their wider decode workspace, selector, replay records and expert intake, as serving
   # admits them, before an encoder placement is chosen.
@@ -2547,20 +2489,18 @@ audio_encoder_hash=""
   [[ -z "$(get KV_POOL_SIZE)" ]] || deployment_args+=(--kv-pool-size "$(get KV_POOL_SIZE)")
   readiness_args=(--require-ready)
   [[ -z "$wip_slot" ]] || readiness_args=()
-  plan_config_mounts=()
-  if [[ "$family" == deepseek_v4 ]]; then
-    # Pass the resolved value, including explicit off, to default-on admission.
-    plan_config_text="$(printf '%s=%s\n' TP2_DSPARK_EXPERTS "$TP2_DSPARK_EXPERTS"
-      for ((rank = 0; rank < available_sparks; rank++)); do
-        printf '%s=%s\n' "SPARK_${rank}_HOST" "$(get "SPARK_${rank}_HOST")"
-      done)"
-    plan_config_dir="$HOME/.cache/cuteafd/run-config"
-    mkdir -p "$plan_config_dir"
-    plan_config="$plan_config_dir/plan-$(printf '%s\n' "$plan_config_text" | sha256sum | cut -c1-16).config"
-    printf '%s\n' "$plan_config_text" >"$plan_config.tmp.$$" && mv "$plan_config.tmp.$$" "$plan_config"
-    count_args+=(--config /run/cuteafd-plan.config)
-    plan_config_mounts=(-v "$plan_config:/run/cuteafd-plan.config:ro")
-  fi
+  # Preserve file provenance; CLI flags above remain explicit overrides.
+  plan_config_dir="$HOME/.cache/cuteafd/run-config"
+  mkdir -p "$plan_config_dir"
+  plan_config_text="$(cat "$config"; printf '\n';
+    for ((rank = 0; rank < available_sparks; rank++)); do
+      printf '%s=%s\n' "SPARK_${rank}_HOST" "$(get "SPARK_${rank}_HOST")"
+    done
+    [[ "$family" != deepseek_v4 ]] || printf 'TP2_DSPARK_EXPERTS=%s\n' "$TP2_DSPARK_EXPERTS")"
+  plan_config="$plan_config_dir/plan-$(printf '%s\n' "$plan_config_text" | sha256sum | cut -c1-16).config"
+  printf '%s\n' "$plan_config_text" >"$plan_config.tmp.$$" && mv "$plan_config.tmp.$$" "$plan_config"
+  count_args+=(--config /run/cuteafd-plan.config)
+  plan_config_mounts=(-v "$plan_config:/run/cuteafd-plan.config:ro")
   # Keep checkpoint paths unchanged inside the full namespace mount. The plan
   # admits under the same instrumentation the server will launch with, so a
   # profiled run (e.g. PROFILE=census) plans what that server actually charges.
@@ -2591,7 +2531,7 @@ audio_encoder_hash=""
   plan_json="$(docker run --rm --network none ${plan_profile_env[@]+"${plan_profile_env[@]}"} "${lane_env_args[@]}" -e "HF_HOME=$container_hf_home" "${generic_worker_mounts[@]}" "${chat_template_mounts[@]}" "${wip_mount_args[@]}" "${plan_config_mounts[@]}" \
     "$coordinator_image" cuteafd plan "$snapshot" --fp8-prefill "$(get FP8_PREFILL auto)" --attention-placement "$attention_placement" --vision "$vision" --audio "$audio" --deployment "${readiness_args[@]}" \
     "${deployment_args[@]}" "${count_args[@]}" "${exlr8_plan_args[@]}" "${core_view_args[@]}" "${plan_memory_args[@]}" \
-    --rtx "$plan_rtx" --gpu-memory-cap "$plan_cap" --coordinator-weight-budget-gib "$coordinator_weight_budget_gib" --pool-tokens "$plan_pool" --vision-replicas "$vision_replicas" "${plan_draft_args[@]}")"
+    --rtx "$plan_rtx" --gpu-memory-cap "$plan_cap" --pool-tokens "$plan_pool" --vision-replicas "$vision_replicas" "${plan_draft_args[@]}")"
   release_validate_deployment "$plan_json" "$checkpoint_family"
   RELEASE_RECLAIM_ARGS=()
   ((restart == 0)) || release_coordinator_reclaim_args "$coordinator_name"
@@ -2616,20 +2556,13 @@ audio_encoder_hash=""
     [[ "$speculator" != mtp ]] || family_args+=(--mtp "$(get SPECULATOR_DEPTH "$mtp_depth")")
     echo "Qwen planner selected SPECULATOR=$speculator (admitted Spark expert world $spark_expert_world)"
   fi
+  coordinator_weight_budget_gib="$(jq -er '.resolved_settings.coordinator_weight_budget_gib.value' <<<"$deployment_json")"
   if [[ "$family" == glm5_flash ]]; then
-    resolved_replay_records="$(jq -er '.replay_records | select(. == "own" or . == "shared")' <<<"$deployment_json")" ||
-      release_die "GLM Flash deployment does not name resolved replay records"
-    replay_eligible=0
-    if [[ "$resolved_replay_records" == shared ]]; then
-      replay_eligible=1; replay_reason="one GPU; automatic measured pool with Spark experts"
-    elif [[ $head_split != 0 ]]; then replay_reason="head split keeps its own records"
-    elif [[ $glmf_pool != 0 ]]; then replay_reason="fixed pool keeps its own records"
-    else replay_reason="local experts keep their own records"; fi
-    replay_records="$(release_glmf_auto GLM5_FLASH_REPLAY_RECORDS "${requested_replay_records:-auto}" \
-      shared own "$replay_eligible" "$replay_reason")"
-    if [[ "${requested_replay_records:-auto}" != shared && "$replay_records" == shared ]]; then
-      family_args=("${family_args[@]:0:glmf_replay_pos}" --replay-records shared "${family_args[@]:glmf_replay_pos}")
-    fi
+    for setting in index_cache draft_linear replay_records; do
+      resolved="$(jq -er --arg key "$setting" '.resolved_settings[$key].value' <<<"$deployment_json")"
+      family_args+=("--${setting//_/-}" "$resolved")
+      echo "GLM5_FLASH_${setting^^}=$(jq -r --arg key "$setting" '.resolved_settings[$key].provenance' <<<"$deployment_json") -> $resolved" >&2
+    done
   fi
   if ((spark_expert_world == 0)); then
     case "$family" in

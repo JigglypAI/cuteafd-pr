@@ -25,7 +25,7 @@ import subprocess
 import sys
 import tempfile
 from inspect import getsource
-from launcher_sandbox import copy_tree, copy_launcher_shared_inputs, fake_deployment_memory_layout
+from launcher_sandbox import copy_tree, copy_launcher_shared_inputs, fake_deployment_memory_layout, fake_resolved_settings
 
 ROOT = Path(__file__).resolve().parents[2]
 FIXTURES = ROOT / "scripts" / "tests" / "fixtures" / "v41-launch"
@@ -160,7 +160,7 @@ if tool == "docker":
                 report["replay_records"] = response["replay_records"] = resolved
             if family == "mimo_v2":
                 report["prefill_lanes"] = response["prefill_waves"]
-            response.update(spark_expert_world=int(ranks), spark_roles=[dict(rank=i, experts=True, layers=[], encoder=response.get("encoder") if i == 0 else None, audio_encoder=None, drafter=None) for i in range(int(ranks))], version=1, family=family, executable=True, wip_launchable=True,
+            response.update(resolved_settings=fake_resolved_settings(args, family, ranks), spark_expert_world=int(ranks), spark_roles=[dict(rank=i, experts=True, layers=[], encoder=response.get("encoder") if i == 0 else None, audio_encoder=None, drafter=None) for i in range(int(ranks))], version=1, family=family, executable=True, wip_launchable=True,
                 report=report, spark_admission="coordinator_authoritative",
                 launch={"family": family, "first_expert_layer": int(os.environ.get("CAPTURE_FIRST_LAYER", "0")),
                         "last_expert_layer": json.loads(os.environ.get("CAPTURE_LAST_LAYER", "null"))},
@@ -244,7 +244,7 @@ sys.exit(0)
 
 
 def stub_text() -> str:
-    return STUB.replace("import json, os, sys, subprocess", getsource(fake_deployment_memory_layout) + "\nimport json, os, sys, subprocess").replace("UUIDS[i]", f"{list(GPU_UUIDS)!r}[i]").replace("PCI[i]", f"{list(GPU_PCI)!r}[i]") \
+    return STUB.replace("import json, os, sys, subprocess", getsource(fake_deployment_memory_layout) + "\n" + getsource(fake_resolved_settings) + "\nimport json, os, sys, subprocess").replace("UUIDS[i]", f"{list(GPU_UUIDS)!r}[i]").replace("PCI[i]", f"{list(GPU_PCI)!r}[i]") \
         .replace("PCI.index(selector) if selector in PCI", f"{list(GPU_PCI)!r}.index(selector) if selector in {list(GPU_PCI)!r}")
 
 

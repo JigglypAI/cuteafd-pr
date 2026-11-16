@@ -1022,7 +1022,7 @@ def _family_launch_result(tmp_path: Path, family_config: dict, model: str, keys:
                 stream.write('case "$*" in *spark_tp_roles*|*"python3 -"*"tp"[1-8]*) echo "${STUB_SPARK_ROLES:-tp2}" ;; *"docker container inspect"*) exit 1 ;; esac\n')
         if tool == "docker":
             stub = (bin_dir / tool).read_text()
-            intercept = ('case "$*" in *" plan "*"--deployment"*) exec python3 "$STUB_DEPLOYMENT" "$@" ;; '
+            intercept = ('case "$*" in *" plan "*"--resolve-settings-only"*|*" plan "*"--deployment"*) exec python3 "$STUB_DEPLOYMENT" "$@" ;; '
                          'inspect*State.Status*) echo running; exit 0 ;; esac\n')
             if probe_fails:
                 # A slot binary that predates the family's serve command rejects it.
@@ -1060,8 +1060,16 @@ exec python3 -c "$code" "$@"
             '#!/usr/bin/env bash\nprintf \'{"object":"list","data":[{"id":"%s"}]}\\n\' '
             '"${STUB_SERVED_MODEL_ID:-deepseek-ai/DeepSeek-V4.1-Flash}"\n')
     deployment_stub = tmp_path / "deployment-stub.py"
-    deployment_stub.write_text("""import json, os, re, subprocess, sys
+    import inspect
+    from launcher_sandbox import fake_resolved_settings
+    deployment_stub.write_text(inspect.getsource(fake_resolved_settings) + "\n" + """import json, os, re, subprocess, sys
 args = sys.argv[1:]
+if "--resolve-settings-only" in args:
+    from pathlib import Path
+    hf = Path(os.environ["HF_HOME"])
+    selected = "dflash2" if (hf / "hub/models--incoai--GLM-5.3-Flash-DFlash2").is_dir() else "off"
+    print(json.dumps(dict(speculator=selected, default_drafter="incoai/GLM-5.3-Flash-DFlash2")))
+    sys.exit(0)
 if os.environ.get("STUB_REAL_PLANNER"):
     # The stub runs on the host, so honor the container's bind namespace.
     binds = []
@@ -1162,6 +1170,9 @@ deployment = dict(encoder=report.get("encoder"), audio_encoder=report.get("audio
     memory_layout=dict(devices=[dict(kind="rtx", index=i, items=[dict(category="weights", bytes=int(os.environ["STUB_PLAN_RTX_BYTES"])),
                                                                  dict(category="kv", bytes=64 << 30)]) for i in range(gpus)] +
                                [dict(kind="spark", index=role["rank"], capacity_bytes=spark_capacity, worker_budget_bytes=spark_capacity, items=[]) for role in roles]))
+deployment["resolved_settings"] = fake_resolved_settings(args, family, expert_world)
+if family == "glm5_flash":
+    deployment["replay_records"] = report["replay_records"] = deployment["resolved_settings"]["replay_records"]["value"]
 deployment.update(json.loads(os.environ["STUB_DEPLOYMENT_OVERRIDES"]))
 if deployment.get("wip_launchable") == "absent":
     deployment.pop("wip_launchable")

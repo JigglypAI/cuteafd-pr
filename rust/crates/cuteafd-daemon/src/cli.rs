@@ -145,7 +145,7 @@ pub(crate) struct Cli {
     #[command(flatten)]
     pub(crate) memory: MemoryArgs,
     /// Retained checkpoint weights per coordinator GPU, including drafter
-    /// weights (default 80 GiB); independent of KV, workspace and total memory.
+    /// weights (plan: device capacity after caps; serve: 80 GiB); independent of KV and workspace.
     #[arg(long, global = true)]
     pub(crate) coordinator_weight_budget_gib: Option<f64>,
     /// How host threads wait while serving: `block` (default: each
@@ -356,6 +356,8 @@ pub(crate) fn core_view_settings(view: &cuteafd_loader::plan::checkpoint::Checkp
 
 #[derive(Debug, Clone, Args)]
 pub(crate) struct PlanArgs {
+    #[arg(skip)]
+    pub(crate) explicit_settings: std::collections::BTreeSet<String>,
     #[cfg(test)]
     #[arg(skip)]
     pub(crate) test_host_memory: Option<(u64, u64)>,
