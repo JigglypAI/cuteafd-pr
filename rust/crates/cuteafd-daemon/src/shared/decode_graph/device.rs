@@ -2404,6 +2404,8 @@ mod tests {
             let Miss::Capture(id) = cache.miss(key(n), capture_site, None, false) else { panic!() };
             cache.captured_topology(id, 10, 1, false);
             cache.measured_capture(GRAPH_CHUNK);
+            cache.serial_boundary();
+            cache.serial_boundary();
         }
         assert!(cache.soft.measured_bytes.is_some());
         assert!(matches!(cache.miss(key(15), capture_site, None, false), Miss::Eager));
