@@ -30,19 +30,48 @@ fn plan_accepts_the_global_memory_policy_and_refuses_removed_budget_flags() {
 }
 
 #[test]
-fn removed_speculator_config_keys_match_launcher_refusal() {
-    let temporary = tempfile::tempdir().unwrap();
-    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
-    for key in ["DFLASH", "MTP"] {
-        let config = temporary.path().join("launch.config");
-        std::fs::write(&config, format!("MODEL_ID=test/model\n{key}=on\n")).unwrap();
-        let plan = test_command(env!("CARGO_BIN_EXE_cuteafd"))
-            .args(["plan", "/not-read", "--config"]).arg(&config).output().unwrap();
-        let launch = test_command("bash").arg(root.join("run.sh")).arg("--config").arg(&config).output().unwrap();
-        for output in [plan, launch] {
-            assert!(!output.status.success());
-            assert!(String::from_utf8_lossy(&output.stderr).contains(&format!("unknown configuration key: {key}")),
-                "{}", String::from_utf8_lossy(&output.stderr));
+fn unknown_config_keys_do_not_change_settings() {
+    let snapshot = tempfile::tempdir().unwrap();
+    std::fs::write(snapshot.path().join("config.json"), r#"{"model_type":"glm5_next"}"#).unwrap();
+    for key in ["DFLASH", "MTP", "UNRECOGNIZED_KEY"] {
+        let config = snapshot.path().join("launch.config");
+        std::fs::write(&config, format!("SPECULATOR=off\n{key}=on\n")).unwrap();
+        let output = test_command(env!("CARGO_BIN_EXE_cuteafd"))
+            .args(["plan", snapshot.path().to_str().unwrap(), "--resolve-settings-only", "--config"])
+            .arg(&config).output().unwrap();
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(value["speculator"], "off");
+    }
+}
+
+#[test]
+fn settings_query_rejects_shared_replay_before_placement() {
+    let snapshot = tempfile::tempdir().unwrap();
+    std::fs::write(snapshot.path().join("config.json"), r#"{"model_type":"glm5_next"}"#).unwrap();
+    let config = snapshot.path().join("launch.config");
+    std::fs::write(&config, "GLM5_FLASH_REPLAY_RECORDS=shared\n").unwrap();
+    let output = test_command(env!("CARGO_BIN_EXE_cuteafd"))
+        .args(["plan", snapshot.path().to_str().unwrap(), "--resolve-settings-only", "--rtx", "2", "--config"])
+        .arg(&config).output().unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("serve it without a head split"));
+}
+
+#[test]
+fn mimo_automatic_drafter_uses_official_identity_not_directory() {
+    let snapshot = tempfile::tempdir().unwrap();
+    std::fs::write(snapshot.path().join("config.json"), r#"{"model_type":"mimo_v2"}"#).unwrap();
+    for present in [false, true] {
+        if present { std::fs::create_dir(snapshot.path().join("dflash")).unwrap(); }
+        for (id, expected) in [("XiaomiMiMo/MiMo-V2.6-Flash-MOPD", "dflash2"),
+            ("XiaomiMiMo/MiMo-V2.6-Pro-MOPD", "dflash2"), ("community/lookalike", "off")] {
+            let output = test_command(env!("CARGO_BIN_EXE_cuteafd"))
+                .args(["plan", snapshot.path().to_str().unwrap(), "--resolve-settings-only", "--checkpoint-model-id", id])
+                .output().unwrap();
+            assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+            let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(value["speculator"], expected, "{id}, directory={present}");
         }
     }
 }

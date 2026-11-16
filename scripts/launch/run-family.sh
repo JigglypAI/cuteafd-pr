@@ -1590,7 +1590,7 @@ if [[ -z "$speculator" ]]; then
   if [[ $speculator == off && $family == glm5_flash ]]; then
     # Rust owns the conditional missing-default-drafter fallback. This header-only
     # query uses the same resolver as placement, before any drafter is fetched.
-    glmf_defaults="$(docker run --rm --network none -e "HF_HOME=$container_hf_home"       "${generic_worker_mounts[@]}" "${wip_mount_args[@]}" -v "$config:/run/cuteafd-plan.config:ro"       "$coordinator_image" cuteafd plan "$snapshot" --config /run/cuteafd-plan.config --resolve-settings-only)"
+    glmf_defaults="$(docker run --rm --network none -e "HF_HOME=$container_hf_home"       "${generic_worker_mounts[@]}" "${wip_mount_args[@]}" -v "$config:/run/cuteafd-plan.config:ro"       "$coordinator_image" cuteafd plan "$snapshot" --config /run/cuteafd-plan.config --checkpoint-model-id "$model" --resolve-settings-only)"
     speculator="$(jq -er '.speculator' <<<"$glmf_defaults")"
     default_drafter="$(jq -er '.default_drafter' <<<"$glmf_defaults")"
     if [[ "$speculator" == off ]]; then
@@ -1600,7 +1600,7 @@ if [[ -z "$speculator" ]]; then
     fi
   fi
   if [[ $speculator == off && $family == mimo_v2 ]]; then
-    mimo_defaults="$(docker run --rm --network none -e "HF_HOME=$container_hf_home"       "${generic_worker_mounts[@]}" "${wip_mount_args[@]}" -v "$config:/run/cuteafd-plan.config:ro"       "$coordinator_image" cuteafd plan "$snapshot" --config /run/cuteafd-plan.config --resolve-settings-only)"
+    mimo_defaults="$(docker run --rm --network none -e "HF_HOME=$container_hf_home"       "${generic_worker_mounts[@]}" "${wip_mount_args[@]}" -v "$config:/run/cuteafd-plan.config:ro"       "$coordinator_image" cuteafd plan "$snapshot" --config /run/cuteafd-plan.config --checkpoint-model-id "$model" --resolve-settings-only)"
     speculator="$(jq -er '.speculator' <<<"$mimo_defaults")"
   fi
   if [[ $speculator == off && $dsv4_dspark == 1 ]]; then
@@ -2368,7 +2368,7 @@ audio_encoder_hash=""
     [[ -z "$(get PREFIX_CACHE_MARK_MIB)" ]] || plan_draft_args+=(--prefix-cache-mark-mib "$(get PREFIX_CACHE_MARK_MIB)")
   fi
   if [[ "$family" == mimo_v2 ]]; then
-    plan_draft_args+=(--mimo-swa-kv-cache "$mimo_swa_kv")
+    plan_draft_args+=(--mimo-kv-cache "${mimo_kv:-int8}" --mimo-swa-kv-cache "$mimo_swa_kv")
     plan_draft_args+=(--prefix-cache-entries "$effective_prefix_entries")
     plan_draft_args+=(--expert-input "${expert_input:-fp8}")
     [[ -z "$(get PREFILL_ROWS)" ]] || plan_draft_args+=(--prefill-rows "$(get PREFILL_ROWS)")
@@ -2486,10 +2486,16 @@ audio_encoder_hash=""
   [[ -z "$(get KV_POOL_SIZE)" ]] || deployment_args+=(--kv-pool-size "$(get KV_POOL_SIZE)")
   readiness_args=(--require-ready)
   [[ -z "$wip_slot" ]] || readiness_args=()
-  # Preserve file provenance; CLI flags above remain explicit overrides.
+  # Only unresolved settings enter the config channel. Every other serving
+  # choice is already represented by the composed argv above.
   plan_config_dir="$HOME/.cache/cuteafd/run-config"
   mkdir -p "$plan_config_dir"
-  plan_config_text="$(cat "$config"; printf '\n';
+  plan_config_text="$(for key in MODEL_ID MODEL_REVISION SPECULATOR_MODEL_ID SPECULATOR_MODEL_REVISION \
+      GLM5_FLASH_INDEX_CACHE GLM5_FLASH_REPLAY_RECORDS GLM5_FLASH_DRAFT_LINEAR SPECULATOR_FP8 \
+      SPECULATOR_DEPTH TP2_DFLASH TP2_DSPARK_EXPERTS; do
+      value="$(get "$key")"
+      [[ -z "$value" ]] || printf '%s=%s\n' "$key" "$value"
+    done
     for ((rank = 0; rank < available_sparks; rank++)); do
       printf '%s=%s\n' "SPARK_${rank}_HOST" "$(get "SPARK_${rank}_HOST")"
     done
@@ -2528,7 +2534,7 @@ audio_encoder_hash=""
   plan_json="$(docker run --rm --network none ${plan_profile_env[@]+"${plan_profile_env[@]}"} "${lane_env_args[@]}" -e "HF_HOME=$container_hf_home" "${generic_worker_mounts[@]}" "${chat_template_mounts[@]}" "${wip_mount_args[@]}" "${plan_config_mounts[@]}" \
     "$coordinator_image" cuteafd plan "$snapshot" --fp8-prefill "$(get FP8_PREFILL auto)" --attention-placement "$attention_placement" --vision "$vision" --audio "$audio" --deployment "${readiness_args[@]}" \
     "${deployment_args[@]}" "${count_args[@]}" "${exlr8_plan_args[@]}" "${core_view_args[@]}" "${plan_memory_args[@]}" \
-    --rtx "$plan_rtx" --gpu-memory-cap "$plan_cap" --pool-tokens "$plan_pool" --vision-replicas "$vision_replicas" "${plan_draft_args[@]}")"
+    --checkpoint-model-id "$model" --rtx "$plan_rtx" --gpu-memory-cap "$plan_cap" --pool-tokens "$plan_pool" --vision-replicas "$vision_replicas" "${plan_draft_args[@]}")"
   release_validate_deployment "$plan_json" "$checkpoint_family"
   RELEASE_RECLAIM_ARGS=()
   ((restart == 0)) || release_coordinator_reclaim_args "$coordinator_name"

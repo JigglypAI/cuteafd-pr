@@ -1070,7 +1070,7 @@ if "--resolve-settings-only" in args:
     hf = Path(os.environ["HF_HOME"])
     checkpoint = json.loads(os.environ["STUB_CHECKPOINT"])
     if checkpoint.get("model_type", "").startswith("mimo"):
-        selected = "dflash2" if (Path(os.environ["STUB_CONFIG_PATH"]).parent / "dflash").is_dir() else "off"
+        selected = "off"
         if os.environ.get("STUB_MODEL_ID") in ("XiaomiMiMo/MiMo-V2.6-Flash-MOPD", "XiaomiMiMo/MiMo-V2.6-Pro-MOPD"):
             selected = "dflash2"
     else:

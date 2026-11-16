@@ -52,10 +52,10 @@ pub fn kimi_draft_fp8(explicit: Option<bool>, dflash: bool) -> Resolved<bool> {
     selected(explicit, None, dflash, "FP8 for explicit Kimi DFlash2")
 }
 
-pub fn mimo_speculator(explicit: Option<&str>, configured: Option<&str>, bundled_dflash: bool) -> Resolved<String> {
+pub fn mimo_speculator(explicit: Option<&str>, configured: Option<&str>, model_id: &str) -> Resolved<String> {
     selected(explicit.filter(|v| !v.is_empty() && *v != "auto").map(str::to_owned),
         configured.filter(|_| explicit.is_none()).filter(|v| !v.is_empty() && *v != "auto").map(str::to_owned),
-        if bundled_dflash { "dflash2" } else { "off" }.into(), "bundled MiMo DFlash2 when present; off otherwise")
+        if matches!(model_id, "XiaomiMiMo/MiMo-V2.6-Flash-MOPD" | "XiaomiMiMo/MiMo-V2.6-Pro-MOPD") { "dflash2" } else { "off" }.into(), "DFlash2 for official MiMo V2.6 Flash/Pro MOPD model ids; off otherwise")
 }
 
 pub fn mimo_mtp_depth(explicit: Option<usize>, configured: Option<usize>, mtp: bool) -> Resolved<usize> {
@@ -80,9 +80,9 @@ mod tests {
         assert_eq!(coordinator_weight_budget(None, None, 32 << 30).value, 32.0);
         assert_eq!(coordinator_weight_budget(Some(20.0), None, 32 << 30).value, 20.0);
         assert_eq!(glmf_replay_records(Some("auto"), Some("shared"), 2, true, true).value, "own");
-        assert_eq!(mimo_speculator(None, None, false).value, "off");
-        assert_eq!(mimo_speculator(None, None, true).value, "dflash2");
-        assert_eq!(mimo_speculator(Some("mtp"), Some("off"), true).value, "mtp");
+        assert_eq!(mimo_speculator(None, None, "community/lookalike").value, "off");
+        assert_eq!(mimo_speculator(None, None, "XiaomiMiMo/MiMo-V2.6-Flash-MOPD").value, "dflash2");
+        assert_eq!(mimo_speculator(Some("mtp"), Some("off"), "XiaomiMiMo/MiMo-V2.6-Pro-MOPD").value, "mtp");
         assert_eq!(mimo_mtp_depth(None, None, true).value, 1);
         assert_eq!(mimo_mtp_depth(Some(3), Some(2), true).value, 3);
         assert!(kimi_draft_fp8(None, true).value);

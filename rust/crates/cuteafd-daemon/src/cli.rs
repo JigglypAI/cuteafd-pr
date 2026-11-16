@@ -417,6 +417,9 @@ pub(crate) struct PlanArgs {
     pub(crate) memory: MemoryArgs,
     #[arg(long, default_value_t = false)]
     pub(crate) json: bool,
+    /// Original Hugging Face identity when MODEL is a mounted snapshot path.
+    #[arg(long, hide = true)]
+    pub(crate) checkpoint_model_id: Option<String>,
     /// Resolve deterministic launch settings without computing placement.
     #[arg(long, hide = true)]
     pub(crate) resolve_settings_only: bool,
@@ -626,6 +629,9 @@ pub(crate) struct PlanArgs {
     /// MiMo sliding and native-MTP ring format for --layout (matches serving).
     #[arg(long, value_enum, default_value = "int8")]
     pub(crate) mimo_swa_kv_cache: crate::families::mimo_v2::SwaKvCacheArg,
+    /// MiMo full-attention KV format; separate from MLA cache formats.
+    #[arg(long, value_enum, default_value = "int8")]
+    pub(crate) mimo_kv_cache: crate::families::mimo_v2::KvCacheArg,
     /// MiMo Spark activation format for --layout (matches serve-mimo).
     #[arg(long, value_enum, default_value = "fp8")]
     pub(crate) expert_input: crate::families::mimo_v2::engine::ExpertInput,

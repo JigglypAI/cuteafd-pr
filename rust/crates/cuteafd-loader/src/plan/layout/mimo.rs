@@ -302,7 +302,7 @@ pub(super) fn profile(checkpoint: &super::super::Checkpoint, options: &LayoutOpt
     let fp8_output = output_formats.values().any(|&r| r == R::Fp8);
     let lanes = if options.prefill_lanes > 0 { options.prefill_lanes } else { prefill_shape(spark_ranks, None)?.waves } as usize;
     let rings = options.mimo_rings();
-    let cache = crate::serving_capacity::mimo_cache_geometry(&cfg, cfg.layers, ranks, MimoKvFormats { full: MimoKvCache::Int8, sliding: options.mimo_swa_kv }, selected_mtp(checkpoint, options))?;
+    let cache = crate::serving_capacity::mimo_cache_geometry(&cfg, cfg.layers, ranks, MimoKvFormats { full: options.mimo_full_kv, sliding: options.mimo_swa_kv }, selected_mtp(checkpoint, options))?;
     let dir = mimo_dflash_dir(checkpoint, options).unwrap_or_default();
     let draft = if mimo_dflash_dir(checkpoint, options).is_some() && dir.join("dflash_draft_model.safetensors").is_file() {
         Some(draft_config::DflashConfig::read(&dir)?)
@@ -349,7 +349,7 @@ pub(super) fn profile(checkpoint: &super::super::Checkpoint, options: &LayoutOpt
                 if rank == 0 { rings } else { 0 })?);
         }
         let workspaces = workspace_options(&cfg, ranks, rank, rows as usize, context as usize,
-            lanes, spark_ranks > 0, options.mimo_expert_input, MimoKvFormats { full: MimoKvCache::Int8, sliding: options.mimo_swa_kv }, mtp,
+            lanes, spark_ranks > 0, options.mimo_expert_input, MimoKvFormats { full: options.mimo_full_kv, sliding: options.mimo_swa_kv }, mtp,
             MimoPrefillOutput::LastRow,
             fp8_output, |name| {
                 let Some(manifest) = manifest else { return Ok(0); };
@@ -369,7 +369,7 @@ pub(super) fn profile(checkpoint: &super::super::Checkpoint, options: &LayoutOpt
     }, &MimoCapacityOptions { checkpoint_max_context_tokens:
         crate::serving_capacity::checkpoint_context_limit(&checkpoint.config)?
             .context("MiMo checkpoint lacks max_position_embeddings")?,
-        max_context_tokens: context, rings, mark_slots: marks, kv_cache: MimoKvFormats { full: MimoKvCache::Int8, sliding: options.mimo_swa_kv },
+        max_context_tokens: context, rings, mark_slots: marks, kv_cache: MimoKvFormats { full: options.mimo_full_kv, sliding: options.mimo_swa_kv },
         ranks: runtime, host_prefix_bytes: 0 })?)
 }
 
@@ -403,7 +403,7 @@ fn offline_host(checkpoint: &super::super::Checkpoint, options: &LayoutOptions, 
     ranks: usize, rows: u64, concurrency: u64, context: u64, media_cache: u64)
     -> Result<crate::placement::families::mimo_v2::admission::HostOwners> {
     let cache = crate::serving_capacity::mimo_cache_geometry(cfg, cfg.layers, ranks,
-        MimoKvFormats { full: MimoKvCache::Int8, sliding: options.mimo_swa_kv }, selected_mtp(checkpoint, options))?;
+        MimoKvFormats { full: options.mimo_full_kv, sliding: options.mimo_swa_kv }, selected_mtp(checkpoint, options))?;
     let mut mark_bytes = cache.ranks.iter().map(|rank| rank.retained_mark_bytes).sum::<u64>();
     if let Some(dir) = mimo_dflash_dir(checkpoint, options).filter(|_| options.mimo_prefix_draft) {
         if dir.join("config.json").is_file() {
@@ -546,7 +546,7 @@ fn apply_selected(input: &super::super::PlanInput, options: &LayoutOptions,
         .map(|(&target, &media)| target.checked_add(media)).collect::<Result<Vec<_>, _>>()?;
     let (experts, expert_workspace, tp2_workspace, onboard) = expert_costs(input, &cfg, options, ranks, spark_ranks, rows)?;
     let lanes = if options.prefill_lanes > 0 { options.prefill_lanes } else { prefill_shape(spark_ranks, None)?.waves } as usize;
-    let kv = MimoKvFormats { full: MimoKvCache::Int8, sliding: options.mimo_swa_kv };
+    let kv = MimoKvFormats { full: options.mimo_full_kv, sliding: options.mimo_swa_kv };
     let maximum_pool_tokens = admission::maximum_pool_tokens(&options.rtx_bytes[..ranks], context,
         options.pool_tokens, profiles.steady.pool_unit_rows);
     let prefill = PrefillShape { rows, waves: lanes as u64 };

@@ -112,6 +112,7 @@ fn options(args: &PlanArgs) -> Result<PlanOptions, PlanError> {
                 mimo_prefix_draft: args.mimo_prefix_draft,
                 mimo_rings: args.mimo_rings,
                 mimo_swa_kv: args.mimo_swa_kv_cache.into(),
+                mimo_full_kv: args.mimo_kv_cache.into(),
                 mimo_expert_input: args.expert_input.into(),
                 draft_sequences: args.draft_sequences,
                 draft_kv_cache: args.draft_kv_cache,
@@ -187,6 +188,8 @@ fn resolve_settings(args: &mut PlanArgs, family: &str, cfg: &std::collections::B
                 _ => anyhow::bail!("GLM5_FLASH_REPLAY_RECORDS must be auto, own or shared"),
             });
         }
+        anyhow::ensure!(args.rtx == 1 || args.replay_records != Some(crate::cli::PlanReplayRecords::Shared),
+            "GLM5_FLASH_REPLAY_RECORDS=shared keeps the records in one GPU's prefill scratch; serve it without a head split");
     }
     if family == "kimi_k3" {
         let fp8 = defaults::kimi_draft_fp8(args.draft_fp8, args.speculator == "dflash2");
@@ -254,10 +257,8 @@ fn resolve_config(args: &mut PlanArgs, cfg: &std::collections::BTreeMap<String, 
         if let Some(value) = get("RTX_GPUS").filter(|v| *v != "auto") { args.rtx = value.parse().context("RTX_GPUS")?; }
     }
     configured!(attention_placement, "ATTENTION_PLACEMENT");
-    configured!(prefill_rows, "PREFILL_ROWS");
     configured!(concurrency, "CONCURRENCY");
     configured!(prefill_waves, "PREFILL_WAVES");
-    configured!(prefill_span_rows, "PREFILL_SPAN_ROWS");
     if !args.explicit_settings.contains("fp8_prefill") {
         if let Some(value) = get("FP8_PREFILL") { args.fp8_prefill = value.parse().map_err(anyhow::Error::msg)?; }
     }
@@ -274,14 +275,35 @@ fn resolve_config(args: &mut PlanArgs, cfg: &std::collections::BTreeMap<String, 
     if !args.explicit_settings.contains("core_view") {
         if let Some(value) = get("CORE_VIEW") { args.attention.core_view = value.parse()?; }
     }
-    if args.kv_format.is_none() { args.kv_format = get("KV_CACHE").map(|v| v.parse().map_err(anyhow::Error::msg)).transpose()?; }
     if !args.explicit_settings.contains("vision") { if let Some(value) = get("VISION") { args.vision = value.parse().map_err(anyhow::Error::msg)?; } }
     if !args.explicit_settings.contains("audio") { if let Some(value) = get("AUDIO") { args.audio = value.parse().map_err(anyhow::Error::msg)?; } }
     if !args.explicit_settings.contains("host_cache_bytes") {
         if let Some(value) = get("HOST_CACHE_BYTES") { args.host_cache_bytes = value.parse().map_err(anyhow::Error::msg)?; }
     }
     if args.rtx_expert_layers.is_none() { args.rtx_expert_layers = get("RTX_EXPERT_LAYERS").filter(|v| *v != "auto").map(|v| v.parse().map_err(anyhow::Error::msg)).transpose()?; }
-    if !args.explicit_settings.contains("native_mtp_layers") {
+    Ok(())
+}
+
+fn resolve_family_config(args: &mut PlanArgs, family: &str, cfg: &std::collections::BTreeMap<String, String>) -> Result<()> {
+    use clap::ValueEnum;
+    let get = |key: &str| cfg.get(key).filter(|v| !v.is_empty());
+    if !args.explicit_settings.contains("prefill_rows") {
+        if family == "qwen3_5" { args.prefill_rows = 4096; }
+        else if let Some(value) = get("PREFILL_ROWS").or_else(|| get("PREFILL_BATCH_TOKENS")) {
+            args.prefill_rows = value.parse().context("PREFILL_ROWS/PREFILL_BATCH_TOKENS")?;
+        }
+    }
+    if family == "glm5" && !args.explicit_settings.contains("prefill_span_rows") {
+        if let Some(value) = get("PREFILL_SPAN_ROWS") { args.prefill_span_rows = value.parse().context("PREFILL_SPAN_ROWS")?; }
+    }
+    if family == "mimo_v2" {
+        if !args.explicit_settings.contains("mimo_kv_cache") {
+            if let Some(value) = get("KV_CACHE") { args.mimo_kv_cache = crate::families::mimo_v2::KvCacheArg::from_str(value, false).map_err(anyhow::Error::msg)?; }
+        }
+    } else if matches!(family, "qwen4" | "qwen3_5" | "kimi_k3" | "step5" | "muse_spark") && args.kv_format.is_none() {
+        args.kv_format = get("KV_CACHE").map(|v| v.parse().map_err(anyhow::Error::msg)).transpose()?;
+    }
+    if matches!(family, "qwen4" | "step5") && !args.explicit_settings.contains("native_mtp_layers") {
         if let Some(value) = get("SPECULATOR_DEPTH") { args.native_mtp_layers = value.parse().context("SPECULATOR_DEPTH")?; }
     }
     Ok(())
@@ -460,7 +482,8 @@ fn run_plan_with_host(mut args: PlanArgs) -> Result<()> {
         None => cuteafd_loader::read_json_file::<serde_json::Value>(&snapshot.join("config.json"))?,
     };
     let cfg = launch_config(args.config.as_deref())?;
-    let family = if args.resolve_settings_only && family_config["model_type"] == "glm5_next" {
+    let family = if args.resolve_settings_only && (family_config["model_type"] == "glm5_next"
+        || family_config["architectures"].as_array().is_some_and(|a| a.iter().any(|v| v == "Glm5NextForConditionalGeneration"))) {
         "glm5_flash"
     } else if args.resolve_settings_only && family_config["model_type"].as_str().is_some_and(|v| v.starts_with("mimo")) {
         "mimo_v2"
@@ -472,6 +495,7 @@ fn run_plan_with_host(mut args: PlanArgs) -> Result<()> {
             tensors: vec![], missing_shards: vec![], shard_bytes: 0 };
         cuteafd_loader::plan::family::detect(&checkpoint).map_or("", |family| family.id())
     };
+    resolve_family_config(&mut args, family, &cfg)?;
     let requested_speculator = args.speculator.clone();
     resolve_speculator(&mut args, &snapshot, family, &cfg)?;
     let replay_explicit = args.replay_records;
@@ -485,7 +509,7 @@ fn run_plan_with_host(mut args: PlanArgs) -> Result<()> {
     if family == "mimo_v2" {
         settings.insert("speculator".into(), setting(cuteafd_core::launch_settings::mimo_speculator(
             (requested_speculator != "auto" || args.explicit_settings.contains("speculator")).then_some(requested_speculator.as_str()),
-            cfg.get("SPECULATOR").map(String::as_str), snapshot.join("dflash").is_dir())));
+            cfg.get("SPECULATOR").map(String::as_str), checkpoint_model_id(&args, &cfg))));
     }
     if (args.no_speculator || args.include_speculator || args.drafter_snapshot.is_some())
         && matches!(family, "glm5_flash" | "mimo_v2") {
@@ -740,9 +764,6 @@ fn launch_config(path: Option<&std::path::Path>) -> Result<std::collections::BTr
         (!key.is_empty() && key.bytes().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == b'_'))
             .then(|| (key.to_owned(), value.to_owned()))
     }).collect();
-    for key in ["DFLASH", "MTP"] {
-        anyhow::ensure!(!configured.contains_key(key), "unknown configuration key: {key}");
-    }
     Ok(configured)
 }
 
@@ -760,6 +781,11 @@ fn spark_hosts_count(cfg: &std::collections::BTreeMap<String, String>) -> Result
     Ok(Some(seen.len()))
 }
 
+fn checkpoint_model_id<'a>(args: &'a PlanArgs, cfg: &'a std::collections::BTreeMap<String, String>) -> &'a str {
+    args.checkpoint_model_id.as_deref().or_else(|| cfg.get("MODEL_ID").map(String::as_str))
+        .unwrap_or(&args.model)
+}
+
 const GLMF_DEFAULT_DRAFTER: &str = "incoai/GLM-5.3-Flash-DFlash2";
 
 fn resolve_speculator(args: &mut PlanArgs, snapshot: &std::path::Path, family: &str,
@@ -769,7 +795,7 @@ fn resolve_speculator(args: &mut PlanArgs, snapshot: &std::path::Path, family: &
         "glm5" | "glm5_flash" | "muse_spark" => "dflash2",
         "qwen3_5" if serde_json::from_slice::<serde_json::Value>(&std::fs::read(snapshot.join("config.json"))?)
             .is_ok_and(|config| config.get("text_config").unwrap_or(&config)["hidden_size"] == 5120) => "dspark",
-        "mimo_v2" if snapshot.join("dflash").is_dir() => "dflash2",
+        "mimo_v2" if matches!(checkpoint_model_id(args, cfg), "XiaomiMiMo/MiMo-V2.6-Flash-MOPD" | "XiaomiMiMo/MiMo-V2.6-Pro-MOPD") => "dflash2",
         "qwen4" | "step5" if args.native_mtp_layers > 0 => "mtp",
         "deepseek_v4" | "deepseek_v41" if args.native_mtp_layers > 0 => "dspark",
         _ => "off",
@@ -783,7 +809,7 @@ fn resolve_speculator(args: &mut PlanArgs, snapshot: &std::path::Path, family: &
     if family == "mimo_v2" && !args.no_speculator {
         args.speculator = cuteafd_core::launch_settings::mimo_speculator(
             (args.speculator != "auto" || args.explicit_settings.contains("speculator")).then_some(args.speculator.as_str()),
-            cfg.get("SPECULATOR").map(String::as_str), snapshot.join("dflash").is_dir()).value;
+            cfg.get("SPECULATOR").map(String::as_str), checkpoint_model_id(args, cfg)).value;
     }
     if args.speculator == "auto" {
         args.speculator = cfg.get("SPECULATOR").cloned().unwrap_or_else(|| {
@@ -1598,6 +1624,7 @@ mod tests {
             memory: crate::cli::MemoryArgs { spark_memory_cap: Some(100 << 30), ..Default::default() },
             json: true,
             resolve_settings_only: false,
+            checkpoint_model_id: None,
             deployment: false, deployment_peers: vec![],
             kv_pool_size: None,
             files: false, role: None, host: None, file_layout: None, fetch_parallel: 2, fetch: false, destination: None, source: None, forward_agent: false,
@@ -1640,6 +1667,7 @@ mod tests {
             mimo_prefix_draft: false,
             mimo_rings: 0,
             mimo_swa_kv_cache: crate::families::mimo_v2::SwaKvCacheArg::Int8,
+            mimo_kv_cache: crate::families::mimo_v2::KvCacheArg::Int8,
             expert_input: crate::families::mimo_v2::engine::ExpertInput::Fp8,
             draft_sequences: None,
             draft_context_slots: None,
@@ -1894,6 +1922,7 @@ mod tests {
             if name == "mimo26-flash" { std::fs::create_dir(target.path().join("dflash")).unwrap(); }
             let draft = tempfile::tempdir().unwrap();
             let mut auto = args(target.path(), 4, false);
+            if name == "mimo26-flash" { auto.checkpoint_model_id = Some("XiaomiMiMo/MiMo-V2.6-Flash-MOPD".into()); }
             // Resolve policy independently of the machine's HF cache.
             if name.starts_with("glm") { auto.drafter_snapshot = Some(draft.path().into()); }
             let automatic = file_args(auto.clone(), target.path()).unwrap();
@@ -2178,6 +2207,65 @@ mod tests {
     }
 
     #[test]
+    fn ingested_config_keys_match_explicit_family_planner_argv() {
+        use clap::Parser;
+        let families = ["deepseek_v41", "deepseek_v4", "glm5", "glm5_flash", "kimi_k3", "mimo_v2",
+            "qwen4", "qwen3_5", "step5", "muse_spark", "minimax_m3", "mistral_large4"];
+        let common = [("RTX_GPUS", "2", "--rtx", "2"),
+            ("ATTENTION_PLACEMENT", "heads", "--attention-placement", "heads"),
+            ("CONCURRENCY", "4", "--concurrency", "4"),
+            ("PREFILL_WAVES", "2", "--prefill-waves", "2"),
+            ("FP8_PREFILL", "off", "--fp8-prefill", "off"),
+            ("GPU_MEMORY_CAP", "32GiB", "--gpu-memory-cap", "32GiB"),
+            ("SPARK_MEMORY_CAP", "110GiB", "--spark-memory-cap", "110GiB"),
+            ("POOL_TOKENS", "65536", "--pool-tokens", "65536"),
+            ("EXLR8_MANIFEST", "k4", "--exlr8-manifest", "k4"),
+            ("EXLR8_PREFILL_ACTIVATIONS", "a8", "--exlr8-prefill-activations", "a8"),
+            ("CHAT_TEMPLATE_FROM", "vendor/template", "--chat-template-from", "vendor/template"),
+            ("CORE_VIEW", "fp8-compact", "--core-view", "fp8-compact"),
+            ("VISION", "rtx", "--vision", "rtx"), ("AUDIO", "off", "--audio", "off"),
+            ("HOST_CACHE_BYTES", "2GiB", "--host-cache-bytes", "2GiB"),
+            ("RTX_EXPERT_LAYERS", "0", "--rtx-expert-layers", "0"),
+            ("MAX_CONTEXT_TOKENS", "65536", "--max-context-tokens", "65536"),
+            ("EXPERT_USAGE", "off", "--expert-usage", "false")];
+        for family in families {
+            let mut cases = common.to_vec();
+            if family != "qwen3_5" { cases.push(("PREFILL_ROWS", "1024", "--prefill-rows", "1024")); }
+            if family == "glm5" { cases.push(("PREFILL_SPAN_ROWS", "4096", "--prefill-span-rows", "4096")); }
+            if family == "mimo_v2" { for value in ["int8", "bf16"] { cases.push(("KV_CACHE", value, "--mimo-kv-cache", value)); } }
+            else if matches!(family, "qwen4" | "qwen3_5" | "kimi_k3" | "step5" | "muse_spark") {
+                cases.push(("KV_CACHE", "bf16", "--kv-cache", "bf16"));
+            }
+            if matches!(family, "qwen4" | "step5") { cases.push(("SPECULATOR_DEPTH", "2", "--native-mtp-layers", "2")); }
+            for (key, configured, flag, value) in cases {
+                let parse = |extra: &[&str]| {
+                    let mut argv = vec!["cuteafd", "plan", "/unused", "--layout"];
+                    if flag == "--expert-usage" && !extra.is_empty() { argv.push("--expert-usage=false"); }
+                    else { argv.extend_from_slice(extra); }
+                    let cli = crate::cli::Cli::try_parse_from(argv).unwrap();
+                    let crate::cli::Commands::Plan(mut args) = cli.command else { panic!("plan") };
+                    args.memory = cli.memory; args.vision = cli.vision.unwrap_or(args.vision); args.audio = cli.audio.unwrap_or(args.audio);
+                    args
+                };
+                let cfg = [(key.into(), configured.into())].into_iter().collect();
+                let mut from_config = parse(&[]);
+                resolve_config(&mut from_config, &cfg).unwrap();
+                resolve_family_config(&mut from_config, family, &cfg).unwrap();
+                resolve_context_tokens(&mut from_config, &cfg).unwrap();
+                resolve_expert_usage(&mut from_config, &cfg).unwrap();
+                let mut explicit = parse(&[flag, value]);
+                resolve_family_config(&mut explicit, family, &Default::default()).unwrap();
+                // The dense executor always uses its fixed 4096-row serving unit.
+                if family == "qwen3_5" { explicit.prefill_rows = 4096; }
+                assert_eq!(format!("{:?}", options(&from_config).unwrap()), format!("{:?}", options(&explicit).unwrap()), "{family} {key}");
+                assert_eq!(from_config.attention.core_view, explicit.attention.core_view, "{family} {key}");
+                assert_eq!(from_config.exlr8_manifest, explicit.exlr8_manifest, "{family} {key}");
+                assert_eq!(from_config.chat_template_from, explicit.chat_template_from, "{family} {key}");
+            }
+        }
+    }
+
+    #[test]
     fn media_modes_parse_on_every_command_and_invalid_modes_fail() {
         use clap::Parser;
         let cli = crate::cli::Cli::try_parse_from(["cuteafd", "plan", "/not-read", "--vision", "off", "--audio", "auto"]).unwrap();
@@ -2209,6 +2297,7 @@ mod tests {
         }
         std::fs::create_dir(dir.path().join("dflash")).unwrap();
         let mut request = args(dir.path(), 4, false);
+        request.checkpoint_model_id = Some("XiaomiMiMo/MiMo-V2.6-Flash-MOPD".into());
         resolve_speculator(&mut request, dir.path(), "mimo_v2", &Default::default()).unwrap();
         assert_eq!(request.speculator, "dflash2");
         let mut request = args(dir.path(), 4, false);

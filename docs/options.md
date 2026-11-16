@@ -1030,6 +1030,8 @@ explicit device capacity and estimated runtime owners. The plan
 capacity. Explicit weight ceilings override that derivation.
 
 Kimi DFlash2 planning resolves the configured external drafter snapshot and
-defaults its weights to FP8, as the launcher does. MiMo without a bundled DFlash
-defaults speculation off; explicit MTP defaults to one stage. These settings
-are resolved in Rust for both config planning and launching.
+defaults its weights to FP8, as the launcher does. MiMo defaults DFlash2 only for the official
+`XiaomiMiMo/MiMo-V2.6-{Flash,Pro}-MOPD` model ids; other ids default off; explicit MTP defaults to one stage. These settings
+are resolved in Rust for both config planning and launching. MiMo plan uses
+`--mimo-kv-cache int8|bf16` for its full-attention records (separate from the
+MLA `--kv-cache`), matching the launcher's `KV_CACHE`.
