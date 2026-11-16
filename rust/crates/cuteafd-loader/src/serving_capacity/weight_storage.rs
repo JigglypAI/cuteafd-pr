@@ -20,7 +20,7 @@ impl WeightArenaView {
 
 impl WeightArenaLayout {
     pub const ALIGNMENT: usize = 256;
-    pub const fn allocation_bytes(bytes: usize) -> usize { bytes.max(Self::ALIGNMENT) }
+    pub const fn allocation_bytes(bytes: usize) -> usize { if bytes < Self::ALIGNMENT { Self::ALIGNMENT } else { bytes } }
     /// Preserve cudaMalloc's 256-byte alignment for every consumer (including
     /// the native K6 dispatcher and TMA's 16-byte tensor-map bases).
     pub fn new(id: impl Into<String>, tensors: impl IntoIterator<Item = (String, usize)>) -> Result<Self> {

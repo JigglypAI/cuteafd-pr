@@ -93,6 +93,9 @@ pub struct BlockDsparkRuntimeLayout {
     pub weights: crate::serving_capacity::WeightArenaLayout,
     pub buffers: Vec<(String, usize)>,
     pub host_landing: usize,
+    /// Sole shared GqaHeadSplit allocation, not allocated from `buffers`.
+    pub reduction_bytes: usize,
+    pub reduction_peer: bool,
 }
 
 impl BlockDsparkRuntimeLayout {
@@ -149,7 +152,8 @@ impl BlockDsparkRuntimeLayout {
             sequences as u64, config.kv_heads as u64,
             mul(&[config.heads / config.kv_heads, config.block])?.div_ceil(32) as u64,
             add(&[window, config.block])? as u64, config.head_dim as u64, sms as u64)?)?);
-        Ok(Self { config, kv_cache, weight_requests, capacity, weights, buffers, host_landing:mul(&[rows,8])? })
+        Ok(Self { config, kv_cache, weight_requests, capacity, weights, buffers, host_landing:mul(&[rows,8])?,
+            reduction_bytes:0,reduction_peer:false })
     }
 
     /// Rank-local body workspace sized from the source checkpoint. Each peer
@@ -193,8 +197,8 @@ impl BlockDsparkRuntimeLayout {
                 |"workspace.confidence"|"workspace.head"|"workspace.markov"));
             layout.host_landing=0;
         }
-        // Ledger descriptor only: GqaHeadSplit is the sole runtime allocator.
-        layout.buffers.push(("tp2.reduced".into(),crate::serving_capacity::WeightArenaLayout::allocation_bytes(mul(&[rows,h,2])?)));
+        layout.reduction_bytes=crate::serving_capacity::WeightArenaLayout::allocation_bytes(mul(&[rows,h,2])?);
+        layout.reduction_peer=rank!=lead;
         Ok(layout)
     }
 
@@ -209,8 +213,13 @@ impl BlockDsparkRuntimeLayout {
 
     pub fn demands(&self, gpu: u8) -> Vec<crate::placement::Demand> {
         use cuteafd_core::memory_layout::{Basis, Category};
-        self.buffers.iter().map(|(name, bytes)| crate::placement::Demand::new(gpu,
-            Category::Drafter, format!("block dSpark {name}"), *bytes as u64, Basis::Exact)).collect()
+        let mut demands=self.buffers.iter().map(|(name, bytes)| crate::placement::Demand::new(gpu,
+            Category::Drafter, format!("block dSpark {name}"), *bytes as u64, Basis::Exact)).collect::<Vec<_>>();
+        if self.reduction_bytes>0 {
+            demands.push(crate::placement::Demand::new(gpu,if self.reduction_peer { Category::Transport } else { Category::Drafter },
+                "block dSpark shared TP2 reduction",self.reduction_bytes as u64,Basis::Exact));
+        }
+        demands
     }
 }
 
@@ -849,7 +858,13 @@ mod tests {
         assert_eq!(peer.weights.view("layers.0.self_attn.o_proj.weight").unwrap().bytes()*2,
             one.weights.view("layers.0.self_attn.o_proj.weight").unwrap().bytes());
         for local in [&lead,&peer] {
-            assert!(local.buffers.contains(&("tp2.reduced".into(),local.capacity.block_rows*local.config.hidden*2)));
+            let reduction=local.capacity.block_rows*local.config.hidden*2;
+            assert_eq!(local.reduction_bytes,reduction);
+            assert!(!local.buffers.iter().any(|(name,_)|name.contains("reduc")));
+            let demands=local.demands(1);
+            assert_eq!(demands.iter().filter(|d|d.group=="block dSpark shared TP2 reduction").count(),1);
+            assert_eq!(demands.iter().map(|d|d.bytes).sum::<u64>(),
+                local.buffers.iter().map(|(_,n)|*n as u64).sum::<u64>()+reduction as u64);
         }
         for physical_lead in [0,1] {
             for rank in 0..2 {
