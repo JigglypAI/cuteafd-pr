@@ -200,6 +200,17 @@ mod tests {
 
     #[test]
     fn tally_derives_counts_from_round_shapes() {
+        // Isolate global lifetime counters from other threaded test fixtures.
+        const CHILD: &str = "CUTEAFD_V41_DRAFT_TOTAL_FIXTURE_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new("/usr/bin/timeout")
+                .args(["--signal=KILL", "30"]).arg(std::env::current_exe().unwrap())
+                .args(["--exact", "families::deepseek_v41::v41_native_serve::console::tests::tally_derives_counts_from_round_shapes",
+                    "--nocapture", "--test-threads=1"])
+                .env(CHILD, "1").status().unwrap();
+            assert!(status.success(), "isolated V4.1 tally fixture failed: {status}");
+            return;
+        }
         // Two requests: 5 drafted, 4 verified, 2 accepted; and an anchor-only row.
         let inputs = vec![vec![10, 11, 12, 13, 14], vec![20]];
         let proposal = Proposal { drafted: vec![5, 0], tokens: Vec::new() };
@@ -208,7 +219,7 @@ mod tests {
         let passes: u64 = tally.drafted.iter().zip(&tally.verified)
             .map(|(&d, &v)| totals::draft_verify_pass(d.into(), v.into())).sum();
         assert_eq!(passes, 1, "anchor-only sequence is not a draft pass");
-        assert!(totals::snapshot()["draft_verify_passes"].as_u64().unwrap() >= before + passes);
+        assert_eq!(totals::snapshot()["draft_verify_passes"].as_u64().unwrap(), before + passes);
         assert_eq!(&tally.verified[..2], &[4, 0]);
         assert_eq!(&tally.accepted[..2], &[2, 0]);
         assert_eq!(&tally.emitted[..2], &[3, 1]);
@@ -221,6 +232,16 @@ mod tests {
         assert!(round.layer_us[0].is_nan() && round.layer_us[1] == 5.0);
         let stage = |key: &str| round.stages.iter().find(|(k, _)| *k == key).map(|&(_, v)| v);
         assert_eq!((stage("draft"), stage("rcollect"), stage("lroute")), (Some(1.0), Some(5.0), None));
+        assert_eq!(totals::snapshot()["draft_verify_passes"].as_u64().unwrap(), before + 1,
+            "console round construction must not count the same verification twice");
+        let plain = Tally::new(Proposal { drafted: vec![0], tokens: Vec::new() },
+            &[vec![20]], &[1], &[vec![21]], None);
+        assert_eq!(totals::snapshot()["draft_verify_passes"].as_u64().unwrap(), before + 1,
+            "an anchor-only tally must add zero draft verify passes");
+        let _round = plain.round(0, false, Instant::now(), 0, 0, 0, &[], FfnSplit::default(),
+            [(9, false, true)].into_iter());
+        assert_eq!(totals::snapshot()["draft_verify_passes"].as_u64().unwrap(), before + 1,
+            "an anchor-only console round must also add zero");
     }
 
     #[test]
