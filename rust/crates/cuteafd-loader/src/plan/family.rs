@@ -172,6 +172,9 @@ pub trait Family: Sync {
     /// This config-only boundary is separate from executable FP8 role validation.
     fn fp8_native_mtp_layers(&self, _config: &serde_json::Value)
         -> Option<(&'static str, std::ops::Range<usize>)> { None }
+    /// The native MTP non-routed core has a qualified FP8 executor under MC
+    /// selection. Experts never enter core_tensors; this is not a global mode.
+    fn fp8_mtp_core_qualified(&self) -> bool { false }
     /// Header-only routed storage evidence needed before opening a role. Names
     /// and formats remain family facts; the shared view owns the header pass.
     fn eager_expert_header(&self, _name: &str) -> bool { false }

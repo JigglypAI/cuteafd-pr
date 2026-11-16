@@ -271,7 +271,7 @@ mod tests {
         Ok(())
     }
     #[test]
-    fn restored_mtp_core_stays_native_in_derived_fp8_view() -> Result<()> {
+    fn restored_mtp_conversion_follows_family_executor_qualification() -> Result<()> {
         use crate::plan::testing::{t, write_mc_snapshot};
         for (architecture, model_type, prefix, layers, mtp, nested) in [
             ("GlmMoeDsaForCausalLM", "glm_moe_dsa", "model.layers.", 78, 1, false),
@@ -305,10 +305,11 @@ mod tests {
                 assert!(CheckpointView::select(dir.path(), mode)?.fp8_tensors().is_empty());
             }
             let selected = CheckpointView::select(dir.path(), CoreView::Fp8Compact)?;
-            let expected = names.into_iter().filter(|name| name != &first_mtp && name != &last_mtp).collect::<Vec<_>>();
+            let qualified = model_type == "step5";
+            let expected = names.into_iter().filter(|name| qualified || (name != &first_mtp && name != &last_mtp)).collect::<Vec<_>>();
             assert_eq!(selected.fp8_tensors(), expected, "{model_type}");
-            assert!(!selected.converts_to_fp8(&first_mtp));
-            assert!(!selected.converts_to_fp8(&last_mtp));
+            assert_eq!(selected.converts_to_fp8(&first_mtp), qualified);
+            assert_eq!(selected.converts_to_fp8(&last_mtp), qualified);
             // This is an exact declared stage range, not a broad unknown-role filter.
             assert!(selected.converts_to_fp8(&outside_mtp));
             let checkpoint = crate::plan::Checkpoint { view: Some(selected), snapshot: dir.path().into(),
@@ -320,6 +321,26 @@ mod tests {
         }
         Ok(())
     }
+    #[test]
+    #[ignore = "installed repaired Step MC selection receipt, metadata-only"]
+    fn installed_step_fp8_selection_matches_served_qualification_inventory() -> Result<()> {
+        let home = std::env::var_os("CUTEAFD_DEPLOYMENT_TEST_HF_HOME").context("installed HF home required")?;
+        let snapshot = Path::new(&home).join("hub/models--wrldsuksgo2mars--Step-5-Preview-EXL3-K4-MC/snapshots/aedda90d25bd02bb6520bcaf88e06e6c9bc932c4");
+        let selected = CheckpointView::select(&snapshot, CoreView::Fp8Compact)?;
+        let original = Manifest::read(&snapshot)?.unwrap().0.select(CoreView::Original)?.core_tensors.clone();
+        assert_eq!(selected.fp8_tensors(), original);
+        assert_eq!(selected.fp8_tensors().len(), 672);
+        let mut bytes = selected.fp8_tensors().join("\n"); bytes.push('\n');
+        assert_eq!(format!("{:x}", Sha256::digest(bytes.as_bytes())),
+            "b58637d2336ff20d7a6e7daf1758e33296007f7d60776c9ebf2504fa42b6a94a");
+        let mtp = selected.fp8_tensors().iter().filter(|name| crate::plan::names::indexed(name,"model.layers.")
+            .is_some_and(|(layer,_)| (92..95).contains(&layer))).collect::<Vec<_>>();
+        assert_eq!(mtp.len(), 27);
+        assert!(selected.fp8_tensors().iter().all(|name| !name.contains(".experts.")));
+        println!("served_step_fp8_inventory count=672 mtp=27 sha256=b58637d2336ff20d7a6e7daf1758e33296007f7d60776c9ebf2504fa42b6a94a");
+        Ok(())
+    }
+
     #[test]
     fn selected_bytes_are_authenticated_and_immutable() -> Result<()> {
         let dir = copy_fixture();

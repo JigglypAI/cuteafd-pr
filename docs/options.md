@@ -99,7 +99,7 @@ The exact-8192 prefill point had 0/0 versus 1/1 s power-cap slowdown, with
 busy clocks 2647/2726 versus 2693/2752 MHz and identical 2752-row unit shapes.
 The prefill cost is retained explicitly; no A8 speedup is claimed.
 
-MC `fp8-compact` converts the original variant's `core_tensors`, except GLM, GLM Flash and Step-5 MTP stages, which retain original source precision; published
+MC `fp8-compact` converts the original variant's `core_tensors`, except unused GLM/GLM Flash native MTP stages. Step-5's qualified native FP8 MTP executor includes its selected non-routed MTP core; published
 Flash MCs include KDA and the target head. Explicit KDA/head conversion keys apply
 only beyond that metadata-selected scope. No precision lever changes KV defaults.
 

@@ -7,7 +7,7 @@ use sha2::{Digest, Sha256};
 use std::{collections::BTreeMap, io::Read, path::{Path, PathBuf}, sync::Arc};
 
 /// Changing the converter or target/MTP selection invalidates only derived FP8 identities.
-pub const FP8_RECIPE: &str = "row-major-e4m3-f32-block128-rne-amax448-native-mtp-v2";
+pub const FP8_RECIPE: &str = "row-major-e4m3-f32-block128-rne-amax448-qualified-mtp-v3";
 
 #[derive(Debug, Clone)]
 pub struct CheckpointView {
@@ -82,6 +82,7 @@ impl CheckpointView {
                 config: config.clone(), quantize_config: None, weight_map: BTreeMap::new(),
                 tensors: Vec::new(), missing_shards: Vec::new(), shard_bytes: 0 };
             let native_mtp = crate::plan::family::detect(&metadata)
+                .filter(|family| !family.fp8_mtp_core_qualified())
                 .and_then(|family| family.fp8_native_mtp_layers(&config));
             variant.context("fp8-compact requires MC original core_tensors")?.core_tensors.iter()
                 .filter(|name| !native_mtp.as_ref().is_some_and(|(prefix, layers)|
@@ -134,7 +135,7 @@ impl CheckpointView {
             quantize_config, weight_map, fp8_tensors: Arc::new(fp8_tensors), metadata_digests, classification_headers: Arc::default() })
     }
 
-    /// Original core tensor IDs, retaining family-declared native MTP stages.
+    /// Original core IDs, excluding only family-declared unqualified native MTP.
     pub fn fp8_tensors(&self) -> &[String] { &self.fp8_tensors }
     pub fn converts_to_fp8(&self, name: &str) -> bool {
         self.fp8_tensors.binary_search_by(|tensor| tensor.as_str().cmp(name)).is_ok()

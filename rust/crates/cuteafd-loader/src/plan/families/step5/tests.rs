@@ -1915,7 +1915,11 @@ fn fp8_compact_step_outputs_and_mtp_have_exact_final_storage() -> anyhow::Result
                 DType::I16 => "I16", DType::I32 => "I32", DType::U8 => "U8", DType::F8E4M3 => "F8_E4M3",
                 _ => panic!("fixture dtype") }, tensor.meta.shape.clone())).collect::<Vec<_>>();
     tensors.extend(expected.iter().map(|(name, shape)| (name.clone(), "BF16", shape.clone())));
-    let shapes = original.tensors.iter().filter(|tensor| tensor.meta.name.ends_with(".self_attn.o_proj.weight"))
+    // #2207 target-only selection remains independently supported: native MTP
+    // is unchanged when the manifest does not select it, even after qualification.
+    let shapes = original.tensors.iter().filter(|tensor| tensor.meta.name.ends_with(".self_attn.o_proj.weight")
+        && tensor.meta.name.strip_prefix("model.layers.").and_then(|rest|rest.split('.').next())
+            .and_then(|layer|layer.parse::<usize>().ok()).is_some_and(|layer|layer < 92))
         .map(|tensor| (tensor.meta.name.clone(), tensor.meta.shape.clone())).collect();
     testing::write_mc_snapshot(fixture.path(), &original.config, &tensors, &shapes);
     let fp8 = Checkpoint::open_view(&CheckpointView::select(fixture.path(), CoreView::Fp8Compact)?)?;
