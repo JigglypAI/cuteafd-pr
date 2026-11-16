@@ -7,6 +7,7 @@ use anyhow::{ensure, Result};
 pub enum DraftLayout {
     Mla(MlaDraftRuntimeLayout),
     Block(BlockDsparkRuntimeLayout),
+    BlockTp2 { ranks: Box<[BlockDsparkRuntimeLayout;2]>, lead:usize },
 }
 
 impl From<MlaDraftRuntimeLayout> for DraftLayout {
@@ -15,16 +16,16 @@ impl From<MlaDraftRuntimeLayout> for DraftLayout {
 
 impl DraftLayout {
     pub fn capacity(&self) -> GlmDraftCapacity {
-        match self { Self::Mla(l) => l.capacity(), Self::Block(l) => l.capacity }
+        match self { Self::Mla(l) => l.capacity(), Self::Block(l) => l.capacity, Self::BlockTp2 { ranks,lead }=>ranks[*lead].capacity }
     }
     pub fn target_hidden(&self) -> usize {
-        match self { Self::Mla(l) => l.target_hidden(), Self::Block(l) => l.config.hidden }
+        match self { Self::Mla(l) => l.target_hidden(), Self::Block(l) => l.config.hidden, Self::BlockTp2 { ranks,lead }=>ranks[*lead].config.hidden }
     }
     pub fn target_vocab(&self) -> usize {
-        match self { Self::Mla(l) => l.target_vocab(), Self::Block(l) => l.config.vocab }
+        match self { Self::Mla(l) => l.target_vocab(), Self::Block(l) => l.config.vocab, Self::BlockTp2 { ranks,lead }=>ranks[*lead].config.vocab }
     }
     pub fn target_taps(&self) -> &[usize] {
-        match self { Self::Mla(l) => l.target_taps(), Self::Block(l) => &l.config.taps }
+        match self { Self::Mla(l) => l.target_taps(), Self::Block(l) => &l.config.taps, Self::BlockTp2 { ranks,lead }=>&ranks[*lead].config.taps }
     }
     pub fn context_split(&self) -> bool {
         matches!(self, Self::Mla(l) if l.context_split())
@@ -33,16 +34,17 @@ impl DraftLayout {
         match self {
             Self::Mla(l) => Ok(Self::Mla(l.with_context_split(enabled)?)),
             Self::Block(l) => { ensure!(!enabled,"GQA block draft has no MLA Context split"); Ok(Self::Block(l)) }
+            other @ Self::BlockTp2 { .. }=>{ ensure!(!enabled,"GQA head split is not MLA Context split"); Ok(other) }
         }
     }
     pub fn window_mark_bytes(&self) -> Result<usize> {
-        match self { Self::Mla(l) => Ok(l.window_mark_bytes()?), Self::Block(l) => l.window_mark_bytes() }
+        match self { Self::Mla(l) => Ok(l.window_mark_bytes()?), Self::Block(l) => l.window_mark_bytes(),Self::BlockTp2 { ranks,.. }=>ranks.iter().try_fold(0usize,|sum,r|sum.checked_add(r.window_mark_bytes()?).ok_or_else(||anyhow::anyhow!("TP2 window mark overflow"))) }
     }
     pub fn weight_arena_requests(&self) -> Vec<(String, usize)> {
-        match self { Self::Mla(l) => l.weight_arena_requests(), Self::Block(l) => l.weight_requests.clone() }
+        match self { Self::Mla(l) => l.weight_arena_requests(), Self::Block(l) => l.weight_requests.clone(),Self::BlockTp2 { ranks,lead }=>ranks[*lead].weight_requests.clone() }
     }
     pub fn with_pool_tokens(&self, tokens: usize) -> Result<Self> {
-        Ok(match self { Self::Mla(l) => Self::Mla(l.with_pool_tokens(tokens)?), Self::Block(l) => Self::Block(l.clone()) })
+        Ok(match self { Self::Mla(l) => Self::Mla(l.with_pool_tokens(tokens)?), Self::Block(l) => Self::Block(l.clone()),Self::BlockTp2 { ranks,lead }=>Self::BlockTp2 { ranks:ranks.clone(),lead:*lead } })
     }
     pub fn validate_capacity(&self, slots: usize, rows: usize, context: usize,
         cache: cuteafd_core::MlaCacheFormat) -> Result<()> {
@@ -53,6 +55,7 @@ impl DraftLayout {
                 && l.cache().layers.iter().all(|layer| layer.slots() == slots),
                 "Kimi MLA drafter cache differs from target capacity"),
             Self::Block(l) => ensure!(l.config.window.is_some(), "block drafter requires window-bounded KV"),
+            Self::BlockTp2 { ranks,lead }=>ensure!(*lead<2 && ranks.iter().all(|r|r.config.window.is_some() && r.capacity.context_slots==slots),"invalid TP2 block capacity"),
         }
         Ok(())
     }
@@ -69,7 +72,15 @@ impl DraftLayout {
                     .ok_or_else(|| anyhow::anyhow!("block draft total overflow"))?;
                 Ok((DrafterDemand::itemized(owned,gpu),Demand::new(gpu,Category::Drafter,
                     "block dSpark load peak including owners",peak,Basis::Exact)))
+            }            Self::BlockTp2 { ranks,lead }=>{
+                ensure!(usize::from(gpu)==*lead,"TP2 block lead differs from placement");
+                let owned=ranks.iter().enumerate().flat_map(|(rank,l)|l.demands(rank as u8)).collect::<Vec<_>>();
+                let peak=owned.iter().try_fold(0u64,|sum,d|sum.checked_add(d.bytes))
+                    .ok_or_else(||anyhow::anyhow!("TP2 block owners overflow"))?;
+                Ok((DrafterDemand::itemized(owned,gpu),Demand::new(gpu,Category::Drafter,
+                    "block dSpark load peak including owners",peak,Basis::Exact)))
             }
+
         }
     }
 }

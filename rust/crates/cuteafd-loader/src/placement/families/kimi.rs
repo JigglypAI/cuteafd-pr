@@ -162,7 +162,7 @@ pub struct DraftOwner {
 #[derive(Debug, Clone)]
 pub struct Draft {
     pub context_split: bool,
-    pub arena: Option<(u8, crate::serving_capacity::WeightArenaLayout)>,
+    pub arenas: Vec<(u8, crate::serving_capacity::WeightArenaLayout)>,
     pub owners: Vec<DraftOwner>,
     pub staging_at_first: u64,
     pub staging_per_page: u64,
@@ -231,6 +231,14 @@ pub fn draft_facts(layout: &crate::formats::dflash::MlaDraftRuntimeLayout,
 pub fn draft_layout_facts(layout: &DraftLayout, page_rows: u64, maximum_pages: u64, gpu: u8)
     -> anyhow::Result<Draft> {
     use anyhow::Context;
+    if let DraftLayout::BlockTp2 { ranks,lead }=layout {
+        anyhow::ensure!(*lead==usize::from(gpu),"block TP2 lead differs from planner");
+        let owners=ranks.iter().enumerate().flat_map(|(rank,l)|l.demands(rank as u8)).map(|d|DraftOwner {
+            gpu:d.gpu,category:d.category,group:d.group,bytes_at_first:d.bytes,bytes_per_page:0,
+            weights_at_first:0,weights_per_page:0 }).collect();
+        return Ok(Draft { context_split:false,arenas:ranks.iter().enumerate()
+            .map(|(rank,l)|(rank as u8,l.weights.clone())).collect(),owners,staging_at_first:0,staging_per_page:0 });
+    }
     let multiple = if layout.context_split() && page_rows == 64 { 2 } else { 1 };
     anyhow::ensure!(maximum_pages >= multiple, "Kimi draft pool cannot hold one physical pair");
     let at = |pages: u64| -> anyhow::Result<(Vec<(u8, String, Category, u64, u64)>, u64)> {
@@ -280,7 +288,7 @@ pub fn draft_layout_facts(layout: &DraftLayout, page_rows: u64, maximum_pages: u
     let owners = owners.into_iter().filter(|owner| !matches!(owner.group.as_str(), "MLA DFlash owned weights" | "block dSpark owned weights")).collect::<Vec<_>>();
     anyhow::ensure!(owners.iter().all(|owner| owner.weights_at_first == 0 && owner.weights_per_page == 0),
         "Kimi draft immutable owner outside its arena");
-    Ok(Draft { context_split: layout.context_split(), arena: Some((gpu, arena)), owners,
+    Ok(Draft { context_split: layout.context_split(), arenas: vec![(gpu, arena)], owners,
         staging_at_first: staging_one.checked_sub(staging_per_page * (multiple - 1)).context("Kimi draft staging intercept")?,
         staging_per_page })
 }
@@ -917,7 +925,7 @@ impl Recipe for KimiRecipe {
             // Kimi constructs the drafter before target loading, so its backing
             // already exists throughout Load (unlike post-target GQA drafters).
             let lifetime = Lifetime::RESIDENT;
-            if let Some((gpu, arena)) = &draft.arena {
+            for (gpu, arena) in &draft.arenas {
                 contract.components.extend(weight_arena_components(arena, Location::coordinator(*gpu), lifetime, self.maximum_pages, cuteafd_core::memory_layout::MemoryKind::DrafterWeights)?);
             }
             for (index, owner) in draft.owners.iter().enumerate() {
@@ -1236,7 +1244,7 @@ mod tests {
     fn draft_resident_weights_are_counted_once_in_target_load_peak() {
         let mut recipe = recipe();
         let arena = crate::serving_capacity::WeightArenaLayout::new("kimi/draft/0", [("weights".into(), 512)]).unwrap();
-        recipe.draft = Some(Draft { context_split: false, arena: Some((0, arena)), owners: vec![],
+        recipe.draft = Some(Draft { context_split: false, arenas: vec![(0, arena)], owners: vec![],
             staging_at_first: 128, staging_per_page: 0 });
         let contract = recipe.prepare(&single()).unwrap();
         let selected = vec![0; contract.variables.len()];
@@ -1273,7 +1281,7 @@ mod tests {
                         let mut recipe = recipe();
                         recipe.gpus = gpus;
                         recipe.lanes = lanes;
-                        recipe.draft = draft.then(|| Draft { context_split: false, arena: None, owners: vec![],
+                        recipe.draft = draft.then(|| Draft { context_split: false, arenas: vec![], owners: vec![],
                             staging_at_first: 0, staging_per_page: 0 });
                         recipe.owners.clear();
                         recipe.blas_owners(head).unwrap();
@@ -1537,7 +1545,7 @@ mod tests {
         recipe.layer_attention = vec![ModeBytes { whole: 100, split: [50; 2] }; 2];
         recipe.experts = None;
         recipe.arenas = vec![Arena { count: 0, peak: vec![0; 2], resident: vec![0; 2], weights: vec![0; 2] }];
-        recipe.draft = Some(Draft { context_split: true, arena: None, staging_at_first: 100,
+        recipe.draft = Some(Draft { context_split: true, arenas: vec![], staging_at_first: 100,
             staging_per_page: 0, owners: (0..2).map(|gpu| DraftOwner { gpu,
                 category: Category::Drafter, group: "physical draft cache".into(),
                 bytes_at_first: 32, bytes_per_page: 32, weights_at_first: 0,

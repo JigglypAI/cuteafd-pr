@@ -199,6 +199,7 @@ impl<'a> NativeDraft<'a> {
             }
             DraftLayout::Block(_) => admission.allocate_block_draft(bridge.stream().device,programs,
                 &options.snapshot,bridge.stream().raw)?,
+            DraftLayout::BlockTp2 { .. }=>anyhow::bail!("shared block TP2 runtime binding not constructed yet"),
         };
         let demands = cuteafd_loader::families::kimi_k3::draft::bridge_demands(
             layout, admission.lane_rows(), streams.len())?;
