@@ -21,6 +21,7 @@ pub(crate) struct Options<'a> {
     pub context_tokens: u64,
     pub pool_tokens: Option<u64>,
     pub kv_format: cuteafd_loader::families::inkling2::InklingKvCache,
+    pub drafter:Option<cuteafd_loader::families::qwen4::Qwen4KvCache>,
     pub onboard: Onboard,
     pub prefix: &'a PrefixArgs,
     pub resident_weights: ResidentWeights,
@@ -80,6 +81,9 @@ pub(crate) fn prepare<'a>(library: &'a NativeLibrary, programs: &'a Programs<'a>
         // Missing pin/export is a named startup error, never a host fallback.
         programs.program("inkling2_padded_transpose_bf16_r16_c1024_p64", &["source", "output"])?;
         kernels = Some(Kernels::bind(programs, options.kv_format)?);
+        if options.drafter.is_some(){
+            programs.load_matching(|name|name.starts_with("inkling_draft_")||name.starts_with("draft_bf16_")||name=="fir_history_commit")?;
+        }
         if let Some(tensors) = catalog.fp8() {
             let layers = (0..cfg.layers).collect::<Vec<_>>();
             for (view, _) in tensors.homogeneous_layers(&layers)? {
@@ -106,7 +110,8 @@ pub(crate) fn prepare<'a>(library: &'a NativeLibrary, programs: &'a Programs<'a>
         HostBudget::Auto => None, HostBudget::Bytes(bytes) => Some(bytes),
     };
     let manifest = Arc::new(serde_json::from_slice(&std::fs::read(options.manifest)?)?);
-    let request = FactsRequest { kv_format: options.kv_format, drafter: None, checkpoint, catalog: &catalog, cfg, manifest_path: Some(options.manifest), manifest: Some(manifest),
+    let request = FactsRequest { kv_format: options.kv_format, drafter: options.drafter.map(|kv_cache|cuteafd_loader::families::inkling2::draft::Selection{
+        kv_cache,sms:library.sm_count().unwrap_or(1) as usize}), checkpoint, catalog: &catalog, cfg, manifest_path: Some(options.manifest), manifest: Some(manifest),
         coordinator: Coordinator::Measured { samples, loaded_code: vec![0] }, attention: AttentionPlacement::Heads,
         spark_ranks: options.peers.len(), spark_bytes: cuteafd_loader::serving_capacity::spark_memory::runtime_bytes(&options.peers.iter().map(ToString::to_string).collect::<Vec<_>>())?.into_iter().max().unwrap_or(0),
         prefill: options.prefill, context_tokens: options.context_tokens, pool_tokens: options.pool_tokens,
@@ -178,7 +183,6 @@ pub(crate) fn whole<'a>(library: &'a Arc<NativeLibrary>, programs: &'a Programs<
     cuteafd_bench::context::phase("Inkling code and admission");
     let phase = crate::shared::memory::load_timing::Split::start();
     let (target, pushed, draft_weights) = deliver(library, view, checkpoint, &prepared, &options)?;
-    ensure!(draft_weights.is_none(), "bundled drafter delivered before its serving executor binding");
     phase.log("inkling2 grouped weight delivery");
     cuteafd_bench::context::phase("Inkling grouped weight delivery");
     let phase = crate::shared::memory::load_timing::Split::start();
@@ -213,8 +217,21 @@ pub(crate) fn whole<'a>(library: &'a Arc<NativeLibrary>, programs: &'a Programs<
         } else { ExpertV2Dtype::Bf16 })?;
     session.flags |= EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16;
     device.run(|| link.bootstrap(&session))?;
-    let execution = super::engine::Execution::new(link, requests, head, target, kernels, local, cfg.clone(), inputs.graph_reserve[0],
+    let mut execution = super::engine::Execution::new(link, requests, head, target, kernels, local, cfg.clone(), inputs.graph_reserve[0],
         inputs.experts.iter().map(|layer| inkling2::ingress(layer.storage)).collect())?;
+    if let Some(weights)=draft_weights{
+        let facts=inputs.drafter.as_ref().context("delivered drafter has no admission facts")?;
+        let mut layout=facts.layout.clone();
+        for rank in &mut layout.runtime{
+            *rank=cuteafd_loader::formats::block_dspark::recurrent::runtime::RecurrentRuntimeLayout::new(&layout.config,
+                rank.slots,rank.sequences,rank.context_rows,usize::try_from(inputs.context.maximum)?,
+                usize::try_from(admitted.solved.pool_tokens)?,library.sm_count()? as usize,rank.kv_cache,
+                rank.rank.rank,rank.rank.ranks,rank.rank.lead)?;
+        }
+        execution.draft=Some(std::rc::Rc::new(super::draft::Binding::new(programs,stream.clone(),weights,layout,
+            &admitted.solved,execution.target.operand("model.llm.unembed.weight")?.buffer,
+            usize::try_from(inputs.prefill.rows)?,usize::try_from(inputs.prefill.waves)?)?));
+    }
     let physical = [options.device];
     let devices = cuteafd_loader::placement::planner::CoordinatorDevices::new(&physical)?;
     let mut inventory = crate::shared::memory::receipts::Inventory::new(devices, "retained",

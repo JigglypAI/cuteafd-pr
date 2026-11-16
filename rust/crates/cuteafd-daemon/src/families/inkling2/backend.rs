@@ -68,7 +68,8 @@ impl<'a> InklingBackend<'a> {
         let vocab = execution.cfg.unpadded_vocab_size;
         let selector = plan.facts.allocations.iter().filter(|owner| owner.id.starts_with("selector.")).cloned().collect::<Vec<_>>();
         ensure!(!selector.is_empty(), "Inkling selector was not admitted before startup");
-        Ok(Self { execution: RefCell::new(execution), family: InklingPrefix::new(cache), library,
+        let family=InklingPrefix::with_draft(cache,execution.draft.clone());
+        Ok(Self { execution: RefCell::new(execution), family, library,
             context, concurrency, unit_rows, waves, vocab, host, profile: RefCell::new([0.; 2]),
             pending: RefCell::new(None), selector, selector_ready: std::cell::Cell::new(false) })
     }

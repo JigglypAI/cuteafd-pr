@@ -84,7 +84,7 @@ pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
                     native_lib: &worker_args.native_lib, manifest: &worker_args.manifest,
                     prefill: PrefillShape { rows: prefill.unit_rows, waves: prefill.waves },
                     sequences: worker_args.max_sequences as u64, context_tokens: worker_args.max_context.unwrap_or(0) as u64,
-                    pool_tokens: worker_args.pool_tokens, kv_format: worker_args.kv_format, onboard: worker_args.rtx_expert_layers.resolve(cfg.layers),
+                    pool_tokens: worker_args.pool_tokens, kv_format: worker_args.kv_format, drafter:None, onboard: worker_args.rtx_expert_layers.resolve(cfg.layers),
                     prefix: &worker_args.prefix, resident_weights: crate::shared::memory::budget::resident_weight_limit(),
                     expert_usage: false })?;
             let context = usize::try_from(admitted.solved.served_context())?;
