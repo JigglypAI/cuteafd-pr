@@ -64,6 +64,16 @@ impl<'a> Kernels<'a> {
     }
     pub fn convolution(&self, owner: &impl UnitBuffers<'a>, input: Buffer, weight: Buffer, dynamic: Buffer,
         output: Buffer, history: &str, width: usize, global: bool, rows: usize) -> Result<()> {
+        if let Some((unit, cache, layer, members)) = owner.packed() {
+            for member in members {
+                let segment = unit.segment(cache, member.sequence, layer, member.rows.clone())?;
+                let span = |buffer: Buffer, columns: usize| slice(buffer, member.rows.start*columns*4, member.rows.len()*columns*4);
+                self.convolution(&segment, span(input, width)?, weight,
+                    if global { span(dynamic, 32)? } else { dynamic }, span(output, width)?,
+                    history, width, global, member.rows.len())?;
+            }
+            return Ok(());
+        }
         // SAFETY: native F32 planes and BF16 taps are retained by unit/weights;
         // metadata addresses the unit's exclusive history and valid packed rows.
         unsafe { self.producer(Op::Convolution { width, dynamic: global, precision: Precision::F32 })?
@@ -138,7 +148,6 @@ fn slice(buffer: Buffer, offset: usize, bytes: usize) -> Result<Buffer> {
 /// ring/paged attention program, without host synchronization on the layer path.
 pub(crate) fn attention<'a>(k: &Kernels<'a>, owner: &impl UnitBuffers<'a>, target: &TargetWeights<'_>,
     cfg: &Inkling2Config, layer: usize, rows: usize, input: Buffer) -> Result<()> {
-    use cuteafd_ffi::inkling2::{Batch, Global, Local};
     let local = cfg.local[layer];
     let prefix = format!("model.llm.layers.{layer}");
     let weight = |name: &str| -> Result<Buffer> { Ok(target.operand(&format!("{prefix}.{name}"))?.buffer) };
@@ -196,20 +205,16 @@ pub(crate) fn attention<'a>(k: &Kernels<'a>, owner: &impl UnitBuffers<'a>, targe
             count, 64, 1024)?;
         first += count;
     }
-    // SAFETY: relative F32 bias narrows into admitted BF16 bias; pack writes
-    // unique causal cache slots after both K and V producers on this stream.
-    unsafe {
-        k.narrow.launch(b("relative_f32")?.ptr, b("relative")?.ptr, rows*48*1024, owner.stream().raw)?;
-        k.producer(Op::KvPack { precision: Precision::F32 })?.launch(&[b("k_clipped")?, b("v_norm")?,
-            b("cache_slots")?, if local { b("kv_step")? } else { b("global_cache")? }], rows, None, owner.stream().raw)?;
-    }
-    let batch = Batch { rows, q: b("q_bf16")?, kv: if local { b("kv_step")? } else { b("global_cache")? },
-        positions: b("positions")?, relative: b("relative")?, sinks: b("sinks")?, output: b("attended")?, scratch: b("attention_scratch")? };
-    if local {
-        k.local.local(batch, Local { ring: b("ring")?, ring_count: 1, ring_slots: b("ring_slots")?, first: b("first")? }, owner.stream().raw)?;
+    // SAFETY: retained F32 relative biases narrow into the whole-unit BF16 plane.
+    unsafe { k.narrow.launch(b("relative_f32")?.ptr, b("relative")?.ptr, rows*48*1024, owner.stream().raw)?; }
+    if let Some((unit, cache, layer, members)) = owner.packed() {
+        for member in members {
+            if !local { owner.prepare_page_table(&member.metadata.page_table)?; }
+            let segment = unit.segment(cache, member.sequence, layer, member.rows.clone())?;
+            attention_cache(k, &segment, cfg, layer, member.rows.len())?;
+        }
     } else {
-        k.global.global(batch, Global { pages: b("global_cache")?.bytes/(64*4096), page_table: b("page_table")?,
-            table_width: owner.layout().buffers["page_table"]/4, splits: 1 }, owner.stream().raw)?;
+        attention_cache(k, owner, cfg, layer, rows)?;
     }
     // F32 gate producer consumes F32 attended values. Widen BF16 through a
     // zeroed F32 destination before gating; no host data path.
@@ -225,6 +230,25 @@ pub(crate) fn attention<'a>(k: &Kernels<'a>, owner: &impl UnitBuffers<'a>, targe
     k.project(owner, b("gated")?, weight("attn.wo_ud.weight")?, b("branch")?, rows, 6144, 4608)?;
     k.convolution(owner, b("branch")?, weight("attn_sconv.weight")?, b("branch")?, b("attention")?,
         "attn_conv_history", 4608, false, rows)
+}
+
+fn attention_cache<'a>(k: &Kernels<'a>, owner: &impl UnitBuffers<'a>, cfg: &Inkling2Config,
+    layer: usize, rows: usize) -> Result<()> {
+    use cuteafd_ffi::inkling2::{Batch, Global, Local};
+    let local = cfg.local[layer];
+    let b = |name: &str| owner.buffer(name);
+    // SAFETY: the per-sequence view retains private cache slots and writes only
+    // its own scratch rows before attention consumes them on the same stream.
+    unsafe { k.producer(Op::KvPack { precision: Precision::F32 })?.launch(&[b("k_clipped")?, b("v_norm")?,
+        b("cache_slots")?, if local { b("kv_step")? } else { b("global_cache")? }], rows, None, owner.stream().raw)?; }
+    let batch = Batch { rows, q: b("q_bf16")?, kv: if local { b("kv_step")? } else { b("global_cache")? },
+        positions: b("positions")?, relative: b("relative")?, sinks: b("sinks")?, output: b("attended")?, scratch: b("attention_scratch")? };
+    if local {
+        k.local.local(batch, Local { ring: b("ring")?, ring_count: 1, ring_slots: b("ring_slots")?, first: b("first")? }, owner.stream().raw)
+    } else {
+        k.global.global(batch, Global { pages: b("global_cache")?.bytes/(64*4096), page_table: b("page_table")?,
+            table_width: owner.layout().buffers["page_table"]/4, splits: 1 }, owner.stream().raw)
+    }
 }
 
 /// Complete layer over a cold, contiguous one-sequence unit. Embedding and
