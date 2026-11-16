@@ -4,7 +4,7 @@
 use super::{device::{IoLayout, TokenIo, Lane, LaneLayout, LocalLane, NativePrograms}, mla::{CacheBank, CacheLayout}, state::{KdaBank, KdaLayout}, weights::{GlobalLayout, GlobalWeights, LayerLayout, LayerWeights}};
 use crate::shared::memory::device::{Device, DeviceOwner, Stream};
 use crate::shared::speculation::dflash::DflashDrafter;
-use cuteafd_loader::formats::dflash::MlaDraftRuntimeLayout;
+use cuteafd_loader::families::kimi_k3::draft::DraftLayout;
 use std::rc::{Rc, Weak};
 use anyhow::{ensure, Context, Result};
 use cuteafd_core::memory_layout::{Basis, Behaviour, Category, MemoryKind};
@@ -95,7 +95,7 @@ pub(crate) struct Inputs<'a, const RANKS: usize = 2> {
     pub pool_bounded: Vec<BoundedDemand>,
     pub rtx: Option<RtxInventory>,
     pub spark_budget: Option<SparkBudgetInventory>,
-    pub draft: Option<MlaDraftRuntimeLayout>,
+    pub draft: Option<DraftLayout>,
     /// Exact speculative verify widths with startup graphs: the drafter's block, else 0.
     pub verify_rows: usize,
     pub prefix: Option<&'a crate::shared::prefix::PrefixArgs>,
@@ -146,7 +146,7 @@ pub(crate) struct Admission<'a> {
     core: cuteafd_loader::families::kimi_k3::core::CoreInventory,
     rtx: Option<RtxInventory>,
     rtx_loaded: bool,
-    draft: Option<MlaDraftRuntimeLayout>,
+    draft: Option<DraftLayout>,
     draft_allocated: bool,
     draft_marks_allocated: bool,
     context: Option<cuteafd_loader::families::kimi_k3::context::ContextLayout>,
@@ -232,6 +232,7 @@ impl<'a> Admission<'a> {
         let target_projection = crate::shared::speculation::dflash::TargetProjection::from_bf16(
             !self.core.projections.contains_key("language_model.lm_head"));
         self.allocate_draft_with(device.id, |layout| device.own(|| {
+            let DraftLayout::Mla(layout) = layout else { anyhow::bail!("MLA allocator requires MLA layout") };
             let split = if layout.context_split() {
                 let (streams, peer) = exchange.context("Kimi Context draft requires target exchange")?;
                 Some(crate::shared::speculation::dflash::context_split::ContextOwner::allocate(
@@ -254,7 +255,31 @@ impl<'a> Admission<'a> {
         }))
     }
 
-    fn check_draft(&self, device: i32) -> Result<&MlaDraftRuntimeLayout> {
+    pub(crate) fn allocate_block_draft(&mut self,device:Device<'a>,
+        programs:&'a cuteafd_ffi::programs::Programs<'a>,snapshot:&std::path::Path,stream:*mut std::ffi::c_void)
+        ->Result<DeviceOwner<'a,super::draft_common::CommonDraft<'a>>> {
+        use crate::shared::{speculation::block_dspark::DsparkDrafter,fp8_linear::{Fp8Scales,Fp8Rows},
+            memory::weight_arena::DeviceWeightArena};
+        use cuteafd_loader::families::{glm5::draft_representation::GlmDraftRepresentation,qwen4::Qwen4KvCache};
+        let target_projection=crate::shared::speculation::dflash::TargetProjection::from_bf16(
+            !self.core.projections.contains_key("language_model.lm_head"));
+        self.allocate_draft_with(device.id,|layout|device.own(|| {
+            let DraftLayout::Block(layout)=layout else { anyhow::bail!("block allocator requires block layout") };
+            let arena=DeviceWeightArena::new(device,layout.weights.clone(),ArenaTag::drafter_weights("kimi/draft"))?;
+            let tensors=if crate::shared::experts::rtx::dense::is_recording() { Default::default() }
+                else { crate::shared::speculation::block_dspark::prefetch(snapshot).join()
+                    .map_err(|_|anyhow::anyhow!("block draft reader panicked"))?? };
+            let draft=DsparkDrafter::load_with(device.library,programs,target_projection,snapshot,tensors,stream,
+                layout.capacity.context_slots,layout.capacity.max_batch_sequences,vec![0;layout.config.hidden*2],
+                GlmDraftRepresentation::Bf16Only,Fp8Scales::Amax,Fp8Rows::W8a16,Qwen4KvCache::Bf16,
+                |physical,name,bytes| { ensure!(physical==device.id,"block draft physical arena changed"); arena.view(name,bytes) })?;
+            draft.prepare_workspace()?;
+            Ok(super::draft_common::CommonDraft::Block { draft,
+                frontiers:std::cell::RefCell::new(vec![(0,0);layout.capacity.context_slots]) })
+        }))
+    }
+
+    fn check_draft(&self, device: i32) -> Result<&DraftLayout> {
         let head = self.devices.len() - 1;
         ensure!(device == self.devices[head] && !self.draft_allocated,
             "Kimi draft allocation differs from admitted rank or was already attempted");
@@ -271,7 +296,7 @@ impl<'a> Admission<'a> {
             format!("kimi/draft/{head}"), layout.weight_arena_requests())?;
         reconcile_arena(head, &arena, MemoryKind::DrafterWeights, &self.receipt.facts)?;
         let (demand, _) = layout.demands(head as u8)?;
-        for demand in demand.owned.into_iter().filter(|owner| owner.group != "MLA DFlash owned weights") {
+        for demand in demand.owned.into_iter().filter(|owner| !matches!(owner.group.as_str(),"MLA DFlash owned weights"|"block dSpark owned weights")) {
             let rank = usize::from(demand.gpu);
             ensure!(rank < self.devices.len(), "Kimi draft physical owner absent");
             let charges = self.placement.items[rank].iter().filter(|item| item.group == demand.group).collect::<Vec<_>>();
@@ -283,7 +308,7 @@ impl<'a> Admission<'a> {
     }
 
     fn allocate_draft_with<T>(&mut self, device: i32,
-        allocate: impl FnOnce(MlaDraftRuntimeLayout) -> Result<T>) -> Result<T> {
+        allocate: impl FnOnce(DraftLayout) -> Result<T>) -> Result<T> {
         let layout = self.check_draft(device)?.clone();
         // A partial native allocation must never become an uncharged retry.
         self.draft_allocated = true;
@@ -307,7 +332,7 @@ impl<'a> Admission<'a> {
         (bytes > 0).then(|| crate::shared::memory::device::Allocation::new(device, bytes,
             crate::shared::memory::Tag::prefix("kimi/draft-marks")).map(Rc::new)).transpose()
     }
-    pub(crate) fn draft_layout(&self) -> Option<&MlaDraftRuntimeLayout> { self.draft.as_ref() }
+    pub(crate) fn draft_layout(&self) -> Option<&DraftLayout> { self.draft.as_ref() }
 
     /// Hops, the peer exchange and Spark waves serve one prefill unit.
     pub(crate) fn execution_plan(&self) -> Result<LayerExecutionPlan> {
@@ -856,7 +881,7 @@ pub(crate) fn admit<'a, const RANKS: usize>(mut inputs: Inputs<'_, RANKS>) -> Re
             contract::PrefillShape { rows: unit_rows as u64, waves: inputs_waves as u64 },
             crate::shared::placement::spark_rings(cuteafd_transport::TcpTransportConfig::default().max_frame_bytes)?,
             cuteafd_core::spark_reply::requested())?,
-        draft: draft.as_ref().map(|layout| kimi::draft_facts(layout, page_rows, maximum_pages, (RANKS - 1) as u8)).transpose()?,
+        draft: draft.as_ref().map(|layout| kimi::draft_layout_facts(layout, page_rows, maximum_pages, (RANKS - 1) as u8)).transpose()?,
         fixed, shaped, owners: Vec::new(),
     };
     recipe.arena_padding(cfg, &core)?;
@@ -1035,12 +1060,7 @@ fn request<const RANKS: usize>(mut i: Inputs<'_, RANKS>) -> Result<PlacementRequ
     ensure!(i.lane_layouts.iter().flatten().all(|layout| layout.max_context() == context),
         "Kimi lanes must share the compiled context extent");
     if let Some(layout) = &i.draft {
-        ensure!(layout.cache_format() == i.cache_format
-            && layout.capacity().context_slots == i.state_slots
-            && layout.capacity().max_batch_sequences <= i.rows.min(64)
-            && layout.program().context == context
-            && layout.cache().layers.iter().all(|layer| layer.slots() == i.state_slots),
-            "Kimi drafter capacity differs from admitted KDA slots or lane context/rows");
+        layout.validate_capacity(i.state_slots,i.rows,context,i.cache_format)?;
         ensure!(layout.target_hidden() == cfg.hidden && layout.target_vocab() == cfg.vocab_size
             && layout.target_taps().iter().all(|&layer| layer < cfg.layers),
             "Kimi drafter taps, embedding or vocabulary differ from target inventory");
@@ -1725,12 +1745,12 @@ pub(super) mod tests {
         Ok(())
     }
 
-    fn draft_layout(slots: usize, sequences: usize, context: usize) -> MlaDraftRuntimeLayout {
+    fn draft_layout(slots: usize, sequences: usize, context: usize) -> DraftLayout {
         draft_layout_with_cache(slots, sequences, context, cuteafd_core::MlaCacheFormat::Bf16)
     }
 
     fn draft_layout_with_cache(slots: usize, sequences: usize, context: usize,
-        cache: cuteafd_core::MlaCacheFormat) -> MlaDraftRuntimeLayout {
+        cache: cuteafd_core::MlaCacheFormat) -> DraftLayout {
         use cuteafd_loader::{formats::dflash::MlaDflashConfig,
             families::glm5::draft_representation::{GlmDraftCapacity, GlmDraftRepresentation}};
         let config = serde_json::json!({"architectures":["DFlash2DraftModel"], "hidden_size":7168,
@@ -1750,7 +1770,7 @@ pub(super) mod tests {
                 "conv_kernel_size":2, "conv_group_size":16, "selector_rank":256,
                 "selector_top_k":16, "target_layer_ids":[0,1], "mask_token_id":163592}});
         MlaDflashConfig::from_json(&config).unwrap().runtime_layout(GlmDraftRepresentation::Fp8Only,
-            GlmDraftCapacity::new(slots, sequences, 8).unwrap(), context, slots * context, 188, 2, cache).unwrap()
+            GlmDraftCapacity::new(slots, sequences, 8).unwrap(), context, slots * context, 188, 2, cache).unwrap().into()
     }
 
     #[test]

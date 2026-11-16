@@ -1317,6 +1317,13 @@ impl<'a> DsparkDrafter<'a> {
         })
     }
 
+    pub(crate) fn drain(&self) -> Result<()> {
+        self.on_device(|| {
+            // SAFETY: this owner retains its stream and every draft operand through retirement.
+            unsafe { self.library.cuda_stream_synchronize(self.stream) }
+        })
+    }
+
     /// Explicit serving startup admission; other callers retain lazy allocation.
     pub(crate) fn prepare_workspace(&self) -> Result<()> {
         if self.workspace.borrow().is_none() {

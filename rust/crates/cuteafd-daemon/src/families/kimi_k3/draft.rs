@@ -1,12 +1,12 @@
 //! Kimi's binding of the shared MLA DFlash executor to local or remote streams.
-use super::weights::GlobalWeights;
+use super::{weights::GlobalWeights,draft_common::CommonDraft};
 use crate::shared::{draft::remote::{Prepared, RemoteBridge}, fp8_linear::{Fp8Rows, Fp8Scales},
     memory::{device::{Allocation, DeviceOwner, Stream}, Tag}, peer_split::{RankDevice, TerminalState},
     speculation::dflash::{ContextRow, DflashDrafter, Draft, DraftSeq, TargetHead, TAP_ROWS}};
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::{CuteafdDeviceBuffer, programs::Programs};
 use cuteafd_loader::{families::glm5::draft_representation::{GlmDraftCapacity, GlmDraftRepresentation},
-    formats::dflash::{MlaDflashConfig, MlaDraftRuntimeLayout}, placement::Demand};
+    formats::dflash::{MlaDflashConfig, MlaDraftRuntimeLayout}, families::kimi_k3::draft::DraftLayout, placement::Demand};
 use std::{cell::{Cell, RefCell}, path::PathBuf, rc::Rc};
 
 #[derive(Clone, Debug)]
@@ -23,18 +23,30 @@ impl Options {
     }
 
     /// Exact verify widths with startup graphs: anchor plus a full draft block.
-    pub(crate) fn verify_rows(&self) -> Result<usize> { Ok(MlaDflashConfig::read(&self.snapshot)?.block) }
-
-    pub(crate) fn layout(&self, slots: usize, context: usize, sms: usize) -> Result<MlaDraftRuntimeLayout> {
-        let cfg = MlaDflashConfig::read(&self.snapshot)?;
-        cfg.runtime_layout(self.representation(), GlmDraftCapacity::new(slots, slots.min(8), cfg.block)?,
-            context, slots.checked_mul(context).context("draft pool overflow")?, sms, Fp8Rows::W8a16.code() as u8, self.cache_format)?.with_context_split(self.tp2_dflash).map_err(Into::into)
+    pub(crate) fn verify_rows(&self) -> Result<usize> {
+        if crate::shared::speculation::block_dspark::is_dspark(&self.snapshot)? {
+            return Ok(cuteafd_loader::formats::block_dspark::BlockDsparkConfig::read(&self.snapshot)?.block + 1);
+        }
+        Ok(MlaDflashConfig::read(&self.snapshot)?.block)
     }
+
+    pub(crate) fn layout(&self,slots:usize,context:usize,sms:usize)->Result<DraftLayout> {
+        if crate::shared::speculation::block_dspark::is_dspark(&self.snapshot)? {
+            ensure!(!self.fp8 && !self.tp2_dflash,"block dSpark uses native BF16 on head GPU");
+            return Ok(DraftLayout::Block(cuteafd_loader::formats::block_dspark::BlockDsparkRuntimeLayout::new(
+                &self.snapshot,slots,slots.min(8),sms,"kimi/draft/1")?));
+        }
+        let cfg=MlaDflashConfig::read(&self.snapshot)?;
+        Ok(cfg.runtime_layout(self.representation(),GlmDraftCapacity::new(slots,slots.min(8),cfg.block)?,
+            context,slots.checked_mul(context).context("draft pool overflow")?,sms,Fp8Rows::W8a16.code() as u8,
+            self.cache_format)?.with_context_split(self.tp2_dflash)?.into())
+    }
+
 }
 
 /// The target's tap staging holds one prefill call's `rows` (the lane rows).
-pub(crate) fn bridge_demands(layout: &MlaDraftRuntimeLayout, rows: usize) -> Result<Vec<Demand>> {
-    cuteafd_loader::families::kimi_k3::draft_bridge_demands(layout, rows)
+pub(crate) fn bridge_demands(layout: &DraftLayout, rows: usize) -> Result<Vec<Demand>> {
+    cuteafd_loader::families::kimi_k3::draft::bridge_demands(layout, rows, 2)
 }
 
 /// Field order is intentional: the common executor drops before its borrowed
@@ -112,7 +124,7 @@ impl<'a> Bridge<'a> {
 }
 
 pub(crate) struct NativeDraft<'a> {
-    owners: Owners<DeviceOwner<'a, DflashDrafter<'a>>, Option<Vec<Rc<GlobalWeights<'a>>>>>,
+    owners: Owners<DeviceOwner<'a, CommonDraft<'a>>, Option<Vec<Rc<GlobalWeights<'a>>>>>,
     taps: Allocation<'a>,
     ids: Allocation<'a>,
     input: Allocation<'a>,
@@ -134,7 +146,7 @@ pub(crate) struct NativeDraft<'a> {
 
 // Kimi constructs this owner before loading target weights. Shared post-target
 // drafters retain their DraftLoad default instead of inheriting Kimi's chronology.
-fn common_draft_receipts(draft: &DflashDrafter<'_>,
+pub(super) fn common_draft_receipts(draft: &DflashDrafter<'_>,
     devices: cuteafd_loader::placement::planner::CoordinatorDevices<'_>)
     -> Result<Vec<cuteafd_loader::placement::planner::Receipt>> {
     draft.allocation_receipts_with_lifetime(devices, "kimi.draft",
@@ -144,20 +156,22 @@ fn common_draft_receipts(draft: &DflashDrafter<'_>,
 impl<'a> NativeDraft<'a> {
     pub(crate) fn allocation_receipts(&self, devices: cuteafd_loader::placement::planner::CoordinatorDevices<'_>)
         -> Result<Vec<cuteafd_loader::placement::planner::Receipt>> {
-        self.owners.draft.device.run(|| common_draft_receipts(&self.owners.draft, devices))
+        self.owners.draft.device.run(|| self.owners.draft.allocation_receipts(devices))
     }
 
     pub(crate) fn load(admission: &mut super::admission::Admission<'a>,
         programs: &'a Programs<'a>, options: &Options, streams: [Rc<Stream<'a>>; 2],
-        layout: &MlaDraftRuntimeLayout) -> Result<Self> {
+        layout: &DraftLayout) -> Result<Self> {
         Self::load_for_ranks(admission, programs, options, streams.to_vec(), layout, None)
     }
 
     pub(crate) fn load_for_ranks(admission: &mut super::admission::Admission<'a>,
         programs: &'a Programs<'a>, options: &Options, streams: Vec<Rc<Stream<'a>>>,
-        layout: &MlaDraftRuntimeLayout,
+        layout: &DraftLayout,
         exchange: Option<([Rc<Stream<'a>>; 2], Rc<crate::shared::peer_split::PeerExchange<'a>>)>) -> Result<Self> {
-        ensure!(options.cache_format == layout.cache_format(), "Kimi draft options/admission cache records differ");
+        if let DraftLayout::Mla(layout) = layout {
+            ensure!(options.cache_format == layout.cache_format(), "Kimi draft options/admission cache records differ");
+        }
         ensure!(matches!(streams.len(), 1 | 2)
             && (streams.len() == 1 || streams[0].device.id != streams[1].device.id),
             "Kimi draft requires one or two distinct physical owners");
@@ -173,11 +187,19 @@ impl<'a> NativeDraft<'a> {
         };
         // Recording preserves admitted allocation order; the shared group fills
         // these owners before target binding without a host payload read.
-        let file = if crate::shared::experts::rtx::dense::is_recording() { Vec::new() }
+        let file = if matches!(layout,DraftLayout::Block(_)) || crate::shared::experts::rtx::dense::is_recording() { Vec::new() }
             else { std::fs::read(options.snapshot.join("model.safetensors"))? };
-        let draft = admission.allocate_draft(bridge.stream().device, programs, &options.snapshot, file,
-            bridge.stream().raw, options.representation(), Fp8Scales::Amax, Fp8Rows::W8a16, exchange)?;
-        let demands = cuteafd_loader::families::kimi_k3::draft_bridge_demands_for_ranks(
+        let draft = match layout {
+            DraftLayout::Mla(_) => {
+                let draft=admission.allocate_draft(bridge.stream().device,programs,&options.snapshot,file,
+                    bridge.stream().raw,options.representation(),Fp8Scales::Amax,Fp8Rows::W8a16,exchange)?;
+                let device=draft.device;
+                device.own(|| Ok(CommonDraft::Mla(draft.into_inner())))?
+            }
+            DraftLayout::Block(_) => admission.allocate_block_draft(bridge.stream().device,programs,
+                &options.snapshot,bridge.stream().raw)?,
+        };
+        let demands = cuteafd_loader::families::kimi_k3::draft::bridge_demands(
             layout, admission.lane_rows(), streams.len())?;
         let device = streams[0].device;
         let allocate = |name| -> Result<Allocation<'a>> {
@@ -187,7 +209,7 @@ impl<'a> NativeDraft<'a> {
         let marks = usize::try_from(admission.mark_selection.slots)?;
         let window_bytes = layout.window_mark_bytes()?;
         let window_marks = admission.allocate_draft_marks(streams[head].device)?;
-        Ok(Self { window_marks, window_bytes, programs, k6_head: None, cache_format: layout.cache_format(), marks, owners: Owners { draft, target: None }, taps: allocate("DFlash bridge taps")?,
+        Ok(Self { window_marks, window_bytes, programs, k6_head: None, cache_format: options.cache_format, marks, owners: Owners { draft, target: None }, taps: allocate("DFlash bridge taps")?,
             ids: allocate("DFlash bridge input ids")?, input: allocate("DFlash bridge gathered input")?,
             bridge, producer: RefCell::new(crate::shared::memory::device::Event::new(device)?),
             consumed: RefCell::new(crate::shared::memory::device::Event::new(streams[head].device)?),
@@ -209,7 +231,7 @@ impl<'a> NativeDraft<'a> {
             "Kimi draft target already bound or physical inventory differs");
         let head = target.len() - 1;
         for (rank, owner) in target.iter().enumerate() { owner.check_device(self.target_streams[rank].device)?; }
-        let cfg = &self.owners.draft.cfg;
+        let cfg = self.owners.draft.geometry();
         ensure!(target[0].buffer("embedding")?.bytes == cfg.vocab * cfg.hidden * 2,
             "Kimi draft target embedding differs from admitted BF16 geometry");
         if let Some(weight) = &target[head].core_head {
@@ -248,11 +270,11 @@ impl<'a> NativeDraft<'a> {
     fn gather(&self, tokens: &[u32]) -> Result<()> {
         let draft = &self.owners.draft;
         ensure!(!tokens.is_empty() && tokens.len() * 4 <= self.ids.buffer.bytes
-            && tokens.iter().all(|&id| (id as usize) < draft.cfg.vocab), "Kimi draft embedding IDs exceed admission");
+            && tokens.iter().all(|&id| (id as usize) < draft.geometry().vocab), "Kimi draft embedding IDs exceed admission");
         let weights = self.owners.target.as_ref().context("Kimi draft target is not bound")?;
         let table = weights[0].buffer("embedding")?;
         let ids = crate::shared::prefix::view(self.ids.buffer, 0, tokens.len() * 4)?;
-        let output = crate::shared::prefix::view(self.input.buffer, 0, tokens.len() * draft.cfg.hidden * 2)?;
+        let output = crate::shared::prefix::view(self.input.buffer, 0, tokens.len() * draft.geometry().hidden * 2)?;
         let data = tokens.iter().flat_map(|id| id.to_le_bytes()).collect::<Vec<_>>();
         let stream = match &self.bridge {
             Bridge::Remote(bridge) => bridge.exchange.stream(0),
@@ -263,7 +285,7 @@ impl<'a> NativeDraft<'a> {
             unsafe {
                 draft.device.library.copy_h2d_ordered(self.ids.buffer, &data, stream)?;
                 draft.device.library.cuda_embedding_lookup_bf16_async(table, ids, output, tokens.len(),
-                    draft.cfg.vocab, draft.cfg.hidden, stream)
+                    draft.geometry().vocab, draft.geometry().hidden, stream)
             }
         })
     }
@@ -275,7 +297,7 @@ impl<'a> NativeDraft<'a> {
     pub(crate) fn tap_at(&self, layer: usize, local: &mut super::device::LocalLane<'a>,
         rows: usize, to: usize) -> Result<()> {
         let Some(index) = self.owners.draft.tap_index(layer) else { return Ok(()) };
-        let cfg = &self.owners.draft.cfg;
+        let cfg = self.owners.draft.geometry();
         let offset = tap_offset(to, rows, cfg.taps.len() * cfg.hidden, self.tap_rows())?;
         ensure!(Rc::ptr_eq(local.stream(), &self.target_streams[0]),
             "Kimi draft taps exceed staging or use the wrong producer stream");
@@ -308,7 +330,7 @@ impl<'a> NativeDraft<'a> {
 
     /// Rows of the target's tap staging (one prefill call's lane rows).
     fn tap_rows(&self) -> usize {
-        let cfg = &self.owners.draft.cfg;
+        let cfg = self.owners.draft.geometry();
         self.taps.buffer.bytes / (cfg.taps.len() * cfg.hidden * 2)
     }
 
@@ -317,7 +339,7 @@ impl<'a> NativeDraft<'a> {
         let last = rows.iter().map(|r| r.tap_row).max().unwrap();
         let rebased = rows.iter().map(|r| ContextRow { tap_row: r.tap_row - first, ..*r }).collect::<Vec<_>>();
         let draft = &self.owners.draft;
-        let pitch = draft.cfg.taps.len() * draft.cfg.hidden * 2;
+        let pitch = draft.geometry().taps.len() * draft.geometry().hidden * 2;
         self.bridge.checked(|| draft.device.run(|| {
             draft.update_with(&rebased, || {
                 self.producer.borrow_mut().record(&self.target_streams[0])?;
@@ -331,7 +353,7 @@ impl<'a> NativeDraft<'a> {
                         // SAFETY: checked source frontier and rebased destination fit their owners.
                         let plane = unsafe { cuteafd_ffi::peer_exchange::PeerPlane {
                             source: self.taps.buffer.ptr.cast::<u8>().add(first * pitch).cast(),
-                            destination: draft.taps.buffer.ptr,
+                            destination: draft.taps().ptr,
                             rows: (last - first + 1) as u64, row_bytes: pitch as u64,
                             source_pitch: pitch as u64, destination_pitch: pitch as u64,
                         } };
@@ -340,7 +362,7 @@ impl<'a> NativeDraft<'a> {
                     Bridge::Local { .. } => {
                         let bytes = (last - first + 1) * pitch;
                         let source = crate::shared::prefix::view(self.taps.buffer, first * pitch, bytes)?;
-                        self.bridge.copy_local(draft.taps.buffer, source, bytes, Some(&self.producer.borrow()))
+                        self.bridge.copy_local(draft.taps(), source, bytes, Some(&self.producer.borrow()))
                     }
                 }
             })?;
@@ -365,7 +387,7 @@ impl<'a> NativeDraft<'a> {
     }
 
     pub(crate) fn device(&self) -> crate::shared::memory::device::Device<'a> { self.owners.draft.device }
-    pub(crate) fn common(&self) -> &DflashDrafter<'a> { &self.owners.draft }
+    pub(crate) fn common(&self) -> &CommonDraft<'a> { &self.owners.draft }
     pub(crate) fn frontier(&self, slot: usize) -> Result<(usize, usize)> { self.common().mla_frontier(slot) }
     pub(crate) fn mark_owner(&self) -> Option<Rc<Allocation<'a>>> { self.window_marks.clone() }
     pub(crate) fn mark_bytes(&self) -> usize { self.window_bytes }
@@ -374,20 +396,46 @@ impl<'a> NativeDraft<'a> {
         let window_marks = self.window_marks.as_ref().context("Kimi draft prefix marks are disabled")?;
         let windows = self.common().mla_window_segments(0)?;
         let mut offset = mark * self.window_bytes;
-        windows.into_iter().map(|window| {
+        if self.common().is_block() { offset += 16; }
+        let mut parts = windows.into_iter().map(|window| {
             let view = crate::shared::prefix::view(window_marks.buffer, offset, window.bytes)?;
             offset += window.bytes;
             Ok(view)
-        }).collect()
+        }).collect::<Result<Vec<_>>>()?;
+        if self.common().is_block() {
+            parts.insert(0,crate::shared::prefix::view(window_marks.buffer,mark*self.window_bytes,16)?);
+        }
+        Ok(parts)
     }
     pub(crate) fn move_mark(&self, mark: usize, slot: usize, capture: bool) -> Result<()> {
         let marks = self.mark_segments(mark)?;
         self.drain()?;
-        self.owners.draft.device.run(|| self.common().copy_mla_windows(slot, &marks, capture))
+        self.owners.draft.device.run(|| {
+            if !self.common().is_block() { return self.common().copy_mla_windows(slot,&marks,capture); }
+            let live=self.common().mla_window_segments(slot)?;
+            ensure!(marks.len()==live.len()+1,"block draft mark geometry differs");
+            let library=self.device().library;
+            let (origin,end)=self.frontier(slot)?;
+            if capture {
+                let bytes=[(origin as u64).to_le_bytes(),(end as u64).to_le_bytes()].concat();
+                library.copy_h2d(marks[0],&bytes)?;
+            }
+            for (saved,live) in marks[1..].iter().zip(live) {
+                let (to,from)=if capture { (*saved,live) } else { (live,*saved) };
+                library.copy_d2d(to,from,to.bytes)?;
+            }
+            if !capture {
+                let mut bytes=[0u8;16]; library.copy_d2h(&mut bytes,marks[0])?;
+                let origin=usize::try_from(u64::from_le_bytes(bytes[..8].try_into()?))?;
+                let end=usize::try_from(u64::from_le_bytes(bytes[8..].try_into()?))?;
+                self.common().restore_frontier(slot,origin,end)?;
+            }
+            Ok(())
+        })
     }
 
     pub(crate) fn max_batch_sequences(&self) -> usize { self.owners.draft.max_batch_sequences() }
-    pub(crate) fn drafts(&self) -> usize { self.owners.draft.cfg.drafts() }
+    pub(crate) fn drafts(&self) -> usize { self.owners.draft.drafts() }
     pub(crate) fn require_live(&self) -> Result<()> { self.bridge.require_live() }
     pub(crate) fn abort(&self) -> Result<()> { self.bridge.abort() }
     pub(crate) fn drain(&self) -> Result<()> { self.bridge.synchronize()?; self.common().drain_mla() }
@@ -403,7 +451,7 @@ impl<'a> NativeDraft<'a> {
             let input = |tokens: &[u32], output: CuteafdDeviceBuffer, stream| {
                 ensure!(stream == self.bridge.stream().raw, "Kimi draft input stream differs from bridge");
                 self.gather(tokens)?;
-                let bytes = tokens.len() * draft.cfg.hidden * 2;
+                let bytes = tokens.len() * draft.geometry().hidden * 2;
                 match &self.bridge {
                     Bridge::Remote(bridge) => bridge.send_input(self.input.buffer.ptr.cast_const(), output.ptr, bytes),
                     Bridge::Local { .. } => self.bridge.copy_local(output, self.input.buffer, bytes, None),
@@ -413,7 +461,7 @@ impl<'a> NativeDraft<'a> {
                 Some((projection, scratch)) => {
                     let weight = target[head].core_head.as_ref().context("Kimi draft K6 target head absent")?;
                     let device = self.target_streams[head].device.id;
-                    let (hidden, vocab) = (draft.cfg.hidden, draft.cfg.vocab);
+                    let (hidden, vocab) = (draft.geometry().hidden, draft.geometry().vocab);
                     TargetHead::Launch(Box::new(move |x, logits, rows, stream| {
                         ensure!(stream == self.bridge.stream().raw, "Kimi draft K6 head stream differs from bridge");
                         let input = CuteafdDeviceBuffer { ptr: x.cast_mut(), bytes: rows * hidden * 2, device_id: device, flags: 0 };
@@ -671,7 +719,7 @@ mod tests {
                 backend.draft(&mut batch, &mut scheduler::DraftTiming::default(), &mut crate::shared::token_io::TokenSelector::new(&library,
                     crate::shared::token_io::SelectPlacement::Device, backend.geometry().vocab_size, 1)?)
             };
-            regression::draft_dump(&output, sequences, draft.drafts(), draft.common().cfg.block,
+            regression::draft_dump(&output, sequences, draft.drafts(), draft.common().geometry().block,
                 cfg.vocab_size, || Ok((propose(&mut states)?, draft.common().last_logits(sequences)?)))?;
             // Fixed teacher-forced rows keep target comparison independent of draft agreement.
             let rows = regression::teacher_rows();
