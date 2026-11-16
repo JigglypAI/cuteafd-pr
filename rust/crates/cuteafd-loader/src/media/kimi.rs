@@ -99,7 +99,7 @@ impl KimiProcessor {
         let patches = u64::from(canvas[0] / self.patch) * u64::from(canvas[1] / self.patch);
         let tokens = usize::try_from(patches / u64::from(self.merge * self.merge))
             .map_err(|_| invalid("Kimi token count overflow"))?;
-        if patches > self.patch_limit || tokens > max_tokens || max_tokens == 0 {
+        if patches > u64::from(crate::families::kimi_k3::vision::MAX_IMAGE_PATCHES) || tokens > max_tokens || max_tokens == 0 {
             return Err(invalid(
                 "Kimi padded image exceeds admitted encoder capacity",
             ));
@@ -282,8 +282,34 @@ mod tests {
             p.geometry(7069, 1833).unwrap(),
             ([7069, 1833], [7084, 1848])
         );
-        // Shared ceilings remain nominal until the full boundary encoder runs.
         assert_eq!(7084u64 / 14 * (1848 / 14), 66792);
+    }
+    #[test]
+    fn declared_maximum_is_derived_from_floor_patch_then_merge_padding() {
+        use crate::families::kimi_k3::vision::{MAX_IMAGE_PATCHES,MAX_IMAGE_TOKENS};
+        let p=KimiProcessor::from_config(&config()).unwrap();
+        let mut largest=0u64;
+        // Before resize, all unscaled floor-patch pairs have product<=65536.
+        // Within each pair the largest image is14*floor+13 pixels (side cap
+        //7168). Padding each such source to28 bounds that pair's whole cell.
+        for h in 1..=512u32 {for w in 1..=512u32 {
+            if u64::from(h)*u64::from(w)>65536 {continue;}
+            let height=(h*14+13).min(7168);let width=(w*14+13).min(7168);
+            let (_,canvas)=p.geometry(width,height).unwrap();
+            largest=largest.max(u64::from(canvas[0]/14)*u64::from(canvas[1]/14));
+        }}
+        assert_eq!(largest,u64::from(MAX_IMAGE_PATCHES));
+        assert_eq!(MAX_IMAGE_TOKENS,16698);
+        let data=[37u8,91,173].into_iter().cycle().take(7069*1833*3).collect();
+        let prepared=p.prepare(DecodedPixels::Rgb(RgbImage {width:7069,height:1833,data}),
+            EncoderId([1;32]),MAX_IMAGE_TOKENS as usize).unwrap();
+        assert_eq!(prepared.tokens,16698);
+        assert_eq!(prepared.grid,ImageGrid {t:1,h:132,w:506});
+        assert_eq!(format!("{:x}",Sha256::digest(prepared.rgb8)),
+            "9556acb8c702f537f348e707683ec2a92362e593b7021293b94b9757ec06c363");
+        let data=vec![37;7069*1833*3];
+        assert!(p.prepare(DecodedPixels::Rgb(RgbImage {width:7069,height:1833,data}),
+            EncoderId([1;32]),MAX_IMAGE_TOKENS as usize-1).is_err());
     }
     #[test]
     fn config_numerics_and_identity_are_explicit() {

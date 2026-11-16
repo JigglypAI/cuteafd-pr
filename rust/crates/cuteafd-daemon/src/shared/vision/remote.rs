@@ -17,8 +17,8 @@ use std::{
 // All image descriptors use explicit source/canvas/content metadata. Older
 // peers reject this magic before reading a frame with the new field layout.
 const MAGIC: &[u8; 8] = b"CAFDVI03";
-const MAX_PATCHES: u32 = 65_536;
-const MAX_OUTPUT_ROWS: u32 = 16_384;
+const MAX_PATCHES: u32 = cuteafd_core::media::MAX_DECLARED_IMAGE_PATCHES;
+const MAX_OUTPUT_ROWS: u32 = cuteafd_core::media::MAX_DECLARED_IMAGE_OUTPUT_ROWS;
 const MAX_CANVAS_PIXELS: u64 = 64 << 20;
 const MAX_WIDTH: u32 = 16_384;
 const MAX_ERROR: usize = 1024;
@@ -1030,6 +1030,22 @@ where
 mod tests {
     use super::*;
     use cuteafd_engine::media::FakeEncoder;
+    #[test]
+    fn exact_declared_kimi_padding_capacity_roundtrips_without_wire_change() {
+        use cuteafd_loader::families::kimi_k3::vision::{MAX_IMAGE_PATCHES,MAX_IMAGE_TOKENS,MAX_IMAGE_CANVAS_PIXELS};
+        assert_eq!(MAGIC,b"CAFDVI03");
+        assert_eq!(MAX_PATCHES,MAX_IMAGE_PATCHES);assert_eq!(MAX_OUTPUT_ROWS,MAX_IMAGE_TOKENS);
+        let mut declared=handshake();declared.max_patches=MAX_IMAGE_PATCHES;
+        declared.max_output_rows=MAX_IMAGE_TOKENS;declared.max_canvas_pixels=MAX_IMAGE_CANVAS_PIXELS;
+        declared.patch_size=14;declared.merge_size=2;declared.validate().unwrap();
+        let geometry=cuteafd_core::media::ImagePixels {source:[7069,1833],canvas:[7084,1848],content:[0,0,7069,1833]};
+        let job=EncodeJob::image_with_pixels(ImageKey([8;32]),[1,132,506],
+            vec![0;7084*1848*3].into(),geometry,MAX_IMAGE_TOKENS as usize,7168);
+        declared.validate_job(&job).unwrap();
+        let mut smaller=declared.clone();smaller.max_patches=65536;smaller.max_output_rows=16384;
+        assert!(smaller.validate_job(&job).is_err());
+        declared.max_output_rows+=1;assert!(declared.validate().is_err());
+    }
     #[test]
     fn source_geometry_roundtrips_and_declared_capacity_is_enforced() {
         let mut h = handshake();
