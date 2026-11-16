@@ -72,11 +72,16 @@ impl<'a> Kernels<'a> {
     }
     pub fn residual(&self, owner: &impl UnitBuffers<'a>, query: Buffer, addend: Buffer, output: Buffer,
         rows: usize, queries: usize, candidates: usize, add: bool) -> Result<()> {
-        // SAFETY: caller initialized each candidate in the F32 arena; the query
-        // and optional addend are retained through the mix on the unit stream.
-        unsafe { self.producer(Op::Residual { queries, addend: add })?.launch(&[
-            owner.buffer("residual_arena")?, addend, query, output], rows,
-            Some((owner.layout().rows, candidates)), owner.stream().raw) }
+        for query_index in 0..queries {
+            let query = slice(query, query_index*4608*4, 4608*4)?;
+            let output = slice(output, query_index*owner.layout().rows*4608*4, rows*4608*4)?;
+            // SAFETY: one query writes one segment at the original plane pitch;
+            // the source arena retains that pitch across packed members.
+            unsafe { self.producer(Op::Residual { queries: 1, addend: add })?.launch(&[
+                owner.buffer("residual_arena")?, addend, query, output], rows,
+                Some((owner.layout().rows, candidates)), owner.stream().raw)?; }
+        }
+        Ok(())
     }
     pub fn route(&self, owner: &impl UnitBuffers<'a>, logits: Buffer, bias: Buffer, rows: usize) -> Result<()> {
         // SAFETY: native F32 logits/bias and output routes have admitted extents.
@@ -97,6 +102,14 @@ impl<'a> Kernels<'a> {
 /// Route/MLP stage has no knowledge of checkpoint expert format or transport.
 pub(crate) fn routed_ffn<'a>(kernels: &Kernels<'a>, owner: &impl UnitBuffers<'a>, target: &TargetWeights<'_>,
     experts: &dyn Dispatcher, cfg: &Inkling2Config, layer: usize, rows: usize) -> Result<()> {
+    prepare_routes(kernels, owner, target, cfg, layer, rows)?;
+    let input = owner.buffer(if experts.wire_input() { "expert_wire" } else { "projection_input" })?;
+    experts.enqueue(input, owner.buffer("route_ids")?, owner.buffer("route_weights")?,
+        owner.buffer("expert_output")?, rows, owner.stream())
+}
+
+pub(crate) fn prepare_routes<'a>(kernels: &Kernels<'a>, owner: &impl UnitBuffers<'a>, target: &TargetWeights<'_>,
+    cfg: &Inkling2Config, layer: usize, rows: usize) -> Result<()> {
     ensure!(layer < cfg.layers && rows > 0 && rows <= owner.layout().rows, "Inkling FFN layer/rows differ");
     let prefix = format!("model.llm.layers.{layer}");
     kernels.project(owner, owner.buffer("projection_input")?, target.operand(&format!("{prefix}.mlp.gate.weight"))?.buffer,
@@ -109,8 +122,7 @@ pub(crate) fn routed_ffn<'a>(kernels: &Kernels<'a>, owner: &impl UnitBuffers<'a>
     unsafe { kernels.quant.launch(&[owner.buffer("projection_input")?.ptr, wire.ptr,
         wire.ptr.cast::<u8>().wrapping_add(cfg.hidden).cast(), wire.ptr],
         &[cuteafd_ffi::programs::Scalar::I32(rows as i32), cuteafd_ffi::programs::Scalar::I32(grid as i32)], owner.stream().raw)?; }
-    experts.enqueue(owner.buffer("expert_wire")?, owner.buffer("route_ids")?, owner.buffer("route_weights")?,
-        owner.buffer("expert_output")?, rows, owner.stream())
+    Ok(())
 }
 
 pub(crate) fn residual_site(cfg: &Inkling2Config, layer: usize) -> Result<ResidualSite> {
@@ -141,7 +153,7 @@ pub(crate) fn attention<'a>(k: &Kernels<'a>, owner: &impl UnitBuffers<'a>, targe
         ("v", "wv_dv", "v", "conv_v", "v_conv_history")] {
         if !local {
             let query = if branch == "k" { 1 } else { 2 };
-            let mixed = slice(owner.buffer("global_mixes")?, query*rows*4608*4, rows*4608*4)?;
+            let mixed = slice(owner.buffer("global_mixes")?, query*owner.layout().rows*4608*4, rows*4608*4)?;
             k.norm(owner, mixed, weight(&format!("{branch}_input_norm.weight"))?, b("projection_input")?,
                 false, Precision::Bf16, rows)?;
         }
@@ -259,13 +271,18 @@ pub(crate) fn begin_layer<'a>(k: &Kernels<'a>, owner: &impl UnitBuffers<'a>, tar
 
 pub(crate) fn finish_layer<'a>(k: &Kernels<'a>, owner: &impl UnitBuffers<'a>, target: &TargetWeights<'_>,
     experts: &dyn Dispatcher, cfg: &Inkling2Config, index: usize, rows: usize) -> Result<()> {
+    routed_ffn(k, owner, target, experts, cfg, index, rows)?;
+    join_experts(k, owner, target, cfg, index, rows)
+}
+
+pub(crate) fn join_experts<'a>(k: &Kernels<'a>, owner: &impl UnitBuffers<'a>, target: &TargetWeights<'_>,
+    cfg: &Inkling2Config, index: usize, rows: usize) -> Result<()> {
     let site = residual_site(cfg, index)?;
     let b = |name: &str| owner.buffer(name);
     let library = owner.stream().device.library;
     let arena = b("residual_arena")?;
     let stride = owner.layout().rows*cfg.hidden*4;
     let partial = b("partial")?;
-    routed_ffn(k, owner, target, experts, cfg, index, rows)?;
     // SAFETY: expert BF16 output widens into an independently zeroed F32
     // plane; no extra weight representation or host synchronization is used.
     unsafe {

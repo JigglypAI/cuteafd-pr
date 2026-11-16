@@ -38,6 +38,25 @@ def test_persistent_layer_state_is_borrowed_and_metadata_uses_retained_uploads()
     layer = (FAMILY/'layers.rs').read_text()
     assert "owner: &impl UnitBuffers<'a>" in layer
     assert 'Allocation::new' not in layer
+    head = (FAMILY/'head.rs').read_text()
+    assert 'self.rows <= 64' in head
+    assert 'probe::head_spans(rows, self.rows)' in head
+    assert 'scoring.record(' in head
+    assert 'ScoreLogits::Recorded' in head
+    embedding = head.split('pub fn embed_unit(')[1].split('pub fn project(')[0]
+    assert 'uploads.upload(' in embedding
+    assert 'owner.buffer("first")?' in embedding
+    assert 'owner.buffer("projection_input")?' in embedding
+    assert '.drain(' not in embedding and 'copy_h2d(' not in embedding
+    prefill = (FAMILY/'prefill.rs').read_text()
+    assert 'for member in members(unit)' in prefill
+    assert 'owner.segment_metadata(' in prefill
+    assert 'unit.reply_origins()' in prefill
+    assert 'layers::routed_ffn(self.kernels, owner,' in prefill
+    assert 'impl<\'a> UnitIo<\'a> for TokenIo' in prefill
+    assert 'self.head.embed_unit(' in prefill
+    assert 'probe::head_spans(member.rows.len(), 64)' in prefill
+    assert '(self.on_logits)(member.sequence,' in prefill
 
 
 def test_arenas_are_single_backings_and_head_is_shared():
@@ -46,6 +65,18 @@ def test_arenas_are_single_backings_and_head_is_shared():
     assert 'DeviceWeightArena::new' in weights and 'DenseLoad::mount' in weights
     assert 'DeviceWeightArena::new' in experts and 'DenseLoad::mount' in experts
     assert 'dequant' not in experts.lower()
+    resident = experts.split('pub fn from_pushed(')[1].split('/// All admitted layers')[0]
+    assert 'Whole::from_pushed(' in resident and 'Exl3Tp2::pushed_whole_weights(' in resident
+    assert 'backend.workspace_bytes() == workspace' in resident
+    assert 'Whole::load(' not in resident and 'load_whole_weights(' not in resident
+    push = weights.split('pub fn record_push(')[1].split('pub fn operand(')[0]
+    assert 'Finish::PaddedTranspose' in push
+    assert 'CoordinatorPush::prepare_view_admitted' in weights
+    assert 'PushPolicy::Required.committed(received)' in weights
+    assert 'load_while_admitting(Some(pending)' in weights
+    assert 'dense.operand(' in push and 'dense.finish(' in push
+    assert 'Rect::tensor(' in push
+    assert 'transpose_relative(' not in push and '.read(' not in push and 'copy_h2d(' not in push
     assert 'transpose_relative' in weights
     assert 'padding_zero_exact = true' in weights
     head = (FAMILY/'head.rs').read_text()
