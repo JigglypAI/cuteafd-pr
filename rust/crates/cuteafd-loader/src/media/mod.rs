@@ -9,7 +9,7 @@ mod exif;
 mod groups;
 pub mod inkling;
 pub mod kimi;
-pub use groups::{ImageFragment,PreparedImageGroup};
+pub use groups::{ImageFragment,ImagePromptLayout,PreparedImageGroup};
 mod muse;
 pub mod minimax;
 pub mod muse_vision;
@@ -159,6 +159,8 @@ pub enum ImageFamily {
     /// Mistral Large 4's Pixtral processor: longest edge 1540, 28-pixel merged
     /// cells, no temporal axis and no pad canvas.
     Mistral,
+    Inkling2,
+    Step5,
 }
 /// Reference processor parameters; all identity-affecting choices live here.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -202,12 +204,14 @@ impl ProcessorConfig {
             ImageFamily::Muse => (14, 1, 4096, [0.5; 3], [0.5; 3]),
             // Longest edge in pixels (min/max are edge bounds for Mistral).
             ImageFamily::Mistral => (14, 1, MISTRAL_LONGEST_EDGE, CLIP_MEAN, CLIP_STD),
+            ImageFamily::Inkling2 => (20, 1, 64 << 20, CLIP_MEAN, CLIP_STD),
+            ImageFamily::Step5 => (14, 1, 3024 * 3024, CLIP_MEAN, CLIP_STD),
         };
         Self {
-            resample: if family == ImageFamily::Muse { Resample::Lanczos } else { Resample::Bicubic },
+            resample: match family {ImageFamily::Muse=>Resample::Lanczos,ImageFamily::Step5=>Resample::Bilinear,_=>Resample::Bicubic},
             family,
             patch,
-            merge: 2,
+            merge: if family==ImageFamily::Step5 {4} else {2},
             temporal: 2,
             mean,
             std,
@@ -224,6 +228,23 @@ impl ProcessorConfig {
     /// HF AutoProcessor reads preprocessor_config.json. It takes precedence
     /// over MiMo config.json's conflicting embedded processor_config (D3).
     pub fn from_snapshot(snapshot: &Path, family: ImageFamily) -> Result<Self> {
+        if matches!(family,ImageFamily::Inkling2|ImageFamily::Step5) {
+            let cfg:serde_json::Value=crate::read_json_file(&snapshot.join("config.json"))
+                .map_err(|e| MediaError::Config(e.to_string()))?;
+            let geometry=perception_vision::PerceptionGeometry::from_config(&cfg).map_err(MediaError::Config)?;
+            let expected=if family==ImageFamily::Inkling2 {perception_vision::PerceptionKind::Inkling2} else {perception_vision::PerceptionKind::Step5};
+            if geometry.kind!=expected {return Err(MediaError::Config("PE processor/checkpoint family mismatch".into()));}
+            // Step has no processor side file: its pinned official class declares
+            // CLIP + bilinear728/504. Inkling's nominal0.5 describes a later boundary.
+            let path=snapshot.join("processor_config.json");
+            if path.exists() && family==ImageFamily::Inkling2 {
+                let processor:serde_json::Value=crate::read_json_file(&path).map_err(|e| MediaError::Config(e.to_string()))?;
+                if processor["image_processor"]["image_processor_type"]!="Inkling2ImageProcessor" {
+                    return Err(MediaError::Config("unsupported Inkling processor class".into()));
+                }
+            }
+            let config=Self::for_family(family);config.validate()?;return Ok(config);
+        }
         // GLM's standard HF snapshot embeds image/video processors in this file.
         // MiMo/Qwen keep their existing AutoProcessor precedence unchanged.
         let file = if matches!(family, ImageFamily::GlmFlash | ImageFamily::Muse | ImageFamily::Mistral) {
@@ -371,6 +392,14 @@ impl ProcessorConfig {
                 "invalid processor geometry, budget or normalization".into(),
             ));
         }
+        if matches!(self.family,ImageFamily::Inkling2|ImageFamily::Step5) {
+            let expected=Self::for_family(self.family);
+            if self.patch!=expected.patch || self.merge!=expected.merge || self.temporal!=expected.temporal
+                || self.mean!=expected.mean || self.std!=expected.std || self.resample!=expected.resample {
+                return Err(MediaError::Config("PE processor numerics differ from pinned bundled class".into()));
+            }
+            return Ok(());
+        }
         if self.family == ImageFamily::Mistral {
             return Ok(());
         }
@@ -399,7 +428,43 @@ impl ProcessorConfig {
             Resample::Bilinear => b"cuteafd-preprocess-v1:pillow-bilinear".as_slice(),
         });
         hash.update(serde_json::to_vec(self).expect("processor parameters serialize"));
+        if let Some(source)=self.normalization_source() {
+            hash.update(source.as_bytes());
+            for value in self.normalization_parameters() {hash.update(value.to_le_bytes());}
+        }
         PreprocessId(hash.finalize().into())
+    }
+    /// Owner parameters are part of PE preprocessing identity. Legacy tables
+    /// retain the exact LUT layout and operation order they have always used.
+    pub fn normalization_parameters(&self) -> [f32;768] {
+        match self.family {
+            ImageFamily::Inkling2 | ImageFamily::Step5 => {
+                let mut parameters=[0.0;768];
+                for channel in 0..3 {
+                    parameters[channel]=self.mean[channel] as f32;
+                    parameters[channel+3]=if self.family==ImageFamily::Inkling2 {
+                        [0.26862954f32,0.2613026,0.2757771][channel]
+                    } else {self.std[channel] as f32};
+                    parameters[channel+6]=self.std[channel] as f32;
+                }
+                parameters
+            }
+            _=>std::array::from_fn(|i| {let c=i/256;let pixel=((i%256) as f64*(1.0/255.0)) as f32;
+                (pixel-self.mean[c] as f32)/self.std[c] as f32})
+        }
+    }
+    pub fn normalization_source(&self) -> Option<&'static str> {
+        match self.family {
+            ImageFamily::Inkling2=>Some("Inkling bundled vision.py sha256=34525c3b6afb44851de1f0341f60f6006760256c5e507b18cf5167a17497117c:processor-CLIP-bf16/encoder-CLIP-remap"),
+            ImageFamily::Step5=>Some("Step bundled step3_processor.py sha256=ce0265261a6bffaf40b98911ef5b9babe30d20443af83a4c8ecf251ce6a861fa:Step3VisionProcessor/Step3VLImageProcessor:CLIP-bilinear-antialias728/504"),
+            _=>None,
+        }
+    }
+    pub fn prepare_group(&self,pixels:DecodedPixels,encoder:EncoderId,layout:&ImagePromptLayout) -> Result<PreparedImageGroup> {
+        self.validate()?;
+        if self.family==ImageFamily::Step5 {return step5::prepare_group(self,pixels,encoder,layout);}
+        let ImagePromptLayout::Single {placeholder}=layout else {return Err(invalid("single-view processor needs a single prompt layout"));};
+        Ok(PreparedImageGroup::single(Arc::new(self.prepare_pixels(pixels,encoder)?),*placeholder))
     }
     pub fn resize_shape(&self, height: u32, width: u32) -> Result<(u32, u32)> {
         self.validate()?;
@@ -504,7 +569,20 @@ impl ImageProcessor for ProcessorConfig {
     fn config(&self) -> &ProcessorConfig {
         self
     }
+    fn prepare_pixels(&self,image:DecodedPixels,encoder:EncoderId) -> Result<PreparedImage> {
+        if self.family==ImageFamily::Inkling2 {
+            self.validate()?;
+            let mut prepared=inkling::prepare(image,encoder,self.max_image_tokens)?;
+            prepared.processor=self.id();
+            prepared.key=PreparedImage::key_for_pixels(encoder,prepared.processor,prepared.grid,&prepared.rgb8,prepared.pixels)?;
+            return Ok(prepared);
+        }
+        if self.family==ImageFamily::Step5 {return Err(invalid("Step images need grouped local/global preparation"));}
+        self.prepare_rgb(image.into_rgb(self.decode.alpha),encoder)
+    }
     fn prepare_rgb(&self, image: RgbImage, encoder: EncoderId) -> Result<PreparedImage> {
+        if self.family==ImageFamily::Inkling2 {return self.prepare_pixels(DecodedPixels::Rgb(image),encoder);}
+        if self.family==ImageFamily::Step5 {return Err(invalid("Step images need grouped local/global preparation"));}
         let (height, width) = self.resize_shape(image.height, image.width)?;
         if image.data.len() != image.width as usize * image.height as usize * 3 {
             return Err(invalid("RGB byte extent differs from dimensions"));

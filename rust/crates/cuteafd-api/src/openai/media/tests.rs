@@ -313,3 +313,24 @@ async fn generic_route_prepares_history_and_reports_image_usage() {
         worker.await.unwrap();
     }
 }
+
+#[test]
+fn step_local_global_prepare_expands_prompt_end_to_end() {
+    use cuteafd_loader::media::ImagePromptLayout;
+    let preparer=MediaPreparer::new(ProcessorConfig::for_family(ImageFamily::Step5),EncoderId([3;32]),ImageUrlFetch::Off,1).unwrap();
+    let source=MediaSource {url:format!("data:image/png;base64,{}",STANDARD.encode(include_bytes!("../fixtures/step5-group.png"))),low:false};
+    let layout=ImagePromptLayout::LocalGlobal {placeholder:7,local_start:10,local_end:11,newline:12,global_start:13,global_end:14};
+    let (groups,expanded)=preparer.prepare_and_expand(&[source.clone()],&[1,7,2],&layout,32,1024).unwrap();
+    assert_eq!(groups.len(),1);let group=&groups[0];
+    assert_eq!(group.source,[896,812]);assert_eq!(group.images.len(),5);
+    assert_eq!(group.feature_rows().unwrap(),493);
+    assert_eq!(expanded.media.iter().map(|span|(span.start,span.len)).collect::<Vec<_>>(),vec![(2,81),(85,81),(169,81),(252,81),(335,169)]);
+    assert_eq!(expanded.tokens.len(),506);
+    assert_eq!(&expanded.tokens[166..169],&[11,12,10]);
+    assert_eq!(&expanded.tokens[333..335],&[11,13]);
+    assert_eq!(expanded.tokens[504],14);
+    assert_eq!(expanded.media.iter().map(|span|span.key).collect::<Vec<_>>(),group.keys_in_prompt_order().map(Into::into).collect::<Vec<_>>());
+    assert!(preparer.prepare_and_expand(&[source.clone()],&[1,7,2],&layout,32,505).is_err());
+    let bad=ImagePromptLayout::LocalGlobal {placeholder:7,local_start:32,local_end:11,newline:12,global_start:13,global_end:14};
+    assert!(preparer.prepare_and_expand(&[source],&[1,7,2],&bad,32,1024).is_err());
+}

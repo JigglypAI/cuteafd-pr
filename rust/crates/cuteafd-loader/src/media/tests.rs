@@ -438,3 +438,22 @@ fn mistral_expansion_refuses_bare_markers_and_mismatched_spans() {
     wrong.tokens += 1;
     assert!(expander.expand(&[10], &[wrong], 64).is_err());
 }
+
+#[test]
+fn pe_normalization_identity_keys_both_inkling_round_boundaries() {
+    let inkling=ProcessorConfig::for_family(ImageFamily::Inkling2);
+    let parameters=inkling.normalization_parameters();
+    assert_eq!(parameters[4].to_bits(),0.2613026f32.to_bits());
+    assert_eq!(parameters[7].to_bits(),0.26130258f32.to_bits());
+    assert_ne!(parameters[4].to_bits(),parameters[7].to_bits());
+    assert!(inkling.normalization_source().unwrap().contains("sha256="));
+    let step=ProcessorConfig::for_family(ImageFamily::Step5);
+    assert_eq!(step.merge,4);assert_eq!(step.resample,Resample::Bilinear);
+    assert_eq!(&step.normalization_parameters()[..3],&parameters[..3]);
+    assert_ne!(inkling.id(),step.id());
+    for family in [ImageFamily::Mimo,ImageFamily::Qwen,ImageFamily::GlmFlash,ImageFamily::Muse,ImageFamily::Mistral] {
+        let config=ProcessorConfig::for_family(family);let table=config.normalization_parameters();
+        for i in 0..768 {let c=i/256;let value=((i%256) as f64*(1.0/255.0)) as f32;
+            assert_eq!(table[i].to_bits(),((value-config.mean[c] as f32)/config.std[c] as f32).to_bits());}
+    }
+}
