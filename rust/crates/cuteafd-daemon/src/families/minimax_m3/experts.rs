@@ -495,8 +495,8 @@ mod tests {
         let fixture = Fixture::build_for_tests()?;
         let library = fixture.load()?;
         let device = Device { library: &library, id: 0 };
-        let dir = tempfile::tempdir_in(fixture.directory())?;
-        let (_, cfg) = super::super::owners::tests::snapshot(dir.path())?;
+        let cfg = cuteafd_loader::families::minimax_m3::MiniMaxM3Config::from_hf(
+            &serde_json::from_str(include_str!("../../../../cuteafd-loader/src/families/minimax_m3/fixtures/config.json"))?)?;
         let layout = cuteafd_loader::families::minimax_m3::execution::HeadsLayout::new(&cfg, 0, 1)?;
         let gate_bytes = layout.buffers().into_iter().find(|(name, _)| *name == "gate")
             .context("Heads gate scratch missing")?.1;
