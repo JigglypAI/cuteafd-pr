@@ -105,14 +105,14 @@ size_t scratch_generic_tower(const cuteafd_vision_spec& s,unsigned char* arena,G
     take(out.preprojected,n*t.projectors[0].output_width*2);phase();
   }
   const size_t projected=t.projection_order==2?t.projectors[0].output_width:h;
-  take(out.grouped,units*4*projected*2);
-  size_t hidden_bytes=0,result_bytes=0;
-  for(int stage=0;stage<2;++stage) {
-    const auto& p=t.projectors[stage];
-    const size_t rows=(t.projection_order==2 && stage==0)?n:units;
-    if(p.kind) {hidden_bytes=std::max(hidden_bytes,rows*p.hidden_width*2);result_bytes=std::max(result_bytes,rows*p.output_width*2);}
-  }
-  take(out.projector,hidden_bytes);take(out.projector_result,result_bytes);phase();
+  const auto& final_projector=t.projectors[t.projection_order==2?1:0];
+  const size_t result_bytes=units*final_projector.output_width*2;
+  // Keep the final linear result at the same offset as postnorm's source.
+  // Kimi group/input and FC1 activation live after it, disjoint through FC2.
+  take(out.projector_result,result_bytes);
+  if(t.projection_order==2)out.grouped=out.preprojected; // Already patch-group-major.
+  else take(out.grouped,units*4*projected*2);
+  take(out.projector,units*final_projector.hidden_width*2);phase();
   take(out.postnorm_input,result_bytes);take(out.output,units*s.output_width*2);phase();
   return phase_base+peak;
 }
