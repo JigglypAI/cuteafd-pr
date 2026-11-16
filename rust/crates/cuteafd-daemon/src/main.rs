@@ -374,8 +374,13 @@ async fn run() -> Result<()> {
             initial_wait, initial_reply, initial_weight_budget, initial_graph_floor.clone(), initial_graph_policy),
     };
     let no_prewarm = initial_graph_policy.0 || family_graph_policy.0;
-    anyhow::ensure!(!no_prewarm || matches!(&command, Commands::ServeNative(_) | Commands::ServeGlmf(_)),
-        "--graph-no-prewarm is supported only by V4.1 and GLM Flash serving");
+    let prewarm_supported = match &command {
+        Commands::ServeNative(args) => args.rtx_gpus == 1,
+        Commands::ServeGlmf(args) => args.engine.split_device.is_none(),
+        _ => false,
+    };
+    anyhow::ensure!(!no_prewarm || prewarm_supported,
+        "--graph-no-prewarm requires single-GPU V4.1 or GLM Flash; cross-device runtime instantiation can deadlock behind peer waits (#1878)");
     shared::decode_graph::configure(no_prewarm, initial_graph_policy.1 || family_graph_policy.1);
     if let Some((role, directory)) = shared::memory_report::dump_location(&matches) {
         let host = std::env::var("CUTEAFD_PROFILE_HOST").unwrap_or_else(|_| {

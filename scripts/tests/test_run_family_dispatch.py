@@ -5786,7 +5786,7 @@ def test_graph_cache_experiment_flags_are_cli_only(tmp_path, prewarm, donor):
               "mlp_layer_types": ["sparse"] * 2,
               "layer_types": ["linear_attention", "deepseek_sparse_attention"]}
     result = _family_launch_result(tmp_path, config, "test/glmf",
-        f"GRAPH_PREWARM={prewarm}\nGRAPH_DONOR_ALWAYS={donor}\n")
+        f"RTX_GPUS=1\nGRAPH_PREWARM={prewarm}\nGRAPH_DONOR_ALWAYS={donor}\n")
     assert result.returncode == 0, result.stderr
     serve = shlex.split(next(line for line in result.stderr.splitlines()
         if "serve-glmf" in line and "--snapshot" in line))
@@ -5802,3 +5802,13 @@ def test_graph_prewarm_off_refuses_unqualified_family(tmp_path):
     assert result.returncode == 2, result.stderr
     assert "supported only for deepseek_v41 (V4.1) and glm5_flash (GLM Flash)" in result.stderr
     assert "serve-glm --snapshot" not in result.stderr
+
+
+def test_graph_prewarm_off_refuses_cross_device_graphs(tmp_path):
+    config = {"model_type": "glm5_next", "num_hidden_layers": 2,
+              "mlp_layer_types": ["sparse"] * 2,
+              "layer_types": ["linear_attention", "deepseek_sparse_attention"]}
+    result = _family_launch_result(tmp_path, config, "test/glmf",
+        "RTX_GPUS=2\nGRAPH_PREWARM=off\n")
+    assert result.returncode == 2, result.stderr
+    assert "runtime cross-device graph instantiation can deadlock" in result.stderr

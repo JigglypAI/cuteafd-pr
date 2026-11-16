@@ -395,7 +395,12 @@ def test_optional_levers_are_default_off_and_documented():
             assert key in MATRIX, f"lever {key} is absent from the family support table"
             assert key in DEFAULTS, f"lever {key} has no documented default"
             default = DEFAULTS[key]
-            if key == "KV_CACHE":
+            if key == "GRAPH_PREWARM":
+                assert lever["families"] == ["V4.1", "GLM Flash"]
+                assert default == "on"
+                assert "`GRAPH_PREWARM=off`" in DOC.read_text()
+                assert 'case "$(get GRAPH_PREWARM on)"' in (ROOT / "scripts/launch/run-family.sh").read_text()
+            elif key == "KV_CACHE":
                 assert lever["families"] == ["Muse"]
                 assert default == "family default"
                 assert 'muse_kv_cache="$(get KV_CACHE bf16)"' in (ROOT / "scripts/launch/run-family.sh").read_text()

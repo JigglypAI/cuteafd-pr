@@ -1440,8 +1440,10 @@ impl DeviceCache {
         let any_cold = match signature {
             Some(signature) => self.cold_donor(&signature).is_some(),
             None if hard => false,
-            None => self.donor_candidates.values().any(|lanes| lanes.iter().any(|lane|
-                lane.first.is_some_and(|id| self.donor_age(id).is_some()))),
+            None => {
+                let signatures: Vec<_> = self.donor_candidates.keys().cloned().collect();
+                signatures.iter().any(|signature| self.cold_donor(signature).is_some())
+            },
         };
         if !any_cold {
             let counters = self.counters.entry(site.cycle).or_default();
@@ -2562,6 +2564,23 @@ mod tests {
         assert!(!cache.owns(donor, 1));
         assert!(cache.owns(ticket, 1));
         assert_eq!(cache.charged, 10);
+    }
+
+    #[test]
+    fn lazy_hit_at_queue_head_does_not_hide_a_cold_donor() {
+        let (mut cache, older) = aged_update_fixture(5, false);
+        cache.soft.limit = 999;
+        let younger = capture(&mut cache, 2, false);
+        cache.register_native(younger, 303, vec![3, 7, 11]);
+        cache.advance_for_update_fixture(0, 5);
+        let token = cache.hit_token(older);
+        token.hit(cache.lanes[0].index);
+        cache.soft.limit = cache.charged;
+        let ticket = cache.update_ticket(key(3), site(Preference::Capture), None, false)
+            .expect("unknown requester repairs touched FIFO head before precheck");
+        cache.register_native(ticket, 0, vec![3, 7, 11]);
+        assert_eq!(cache.finish_update(ticket, |exec| { assert_eq!(exec, 303); Ok(true) }, |_| Ok(404), |_| panic!()), Some(404));
+        assert!(cache.owns(older, 1));
     }
 
     #[test]
