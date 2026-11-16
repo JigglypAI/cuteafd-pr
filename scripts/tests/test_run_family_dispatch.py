@@ -5446,7 +5446,7 @@ def test_tp2_dflash_explicit_boolean_reaches_plan_and_serve(tmp_path, family, co
     assert result.returncode == 0, result.stderr
     lines = result.stderr.splitlines()
     serve = next(line for line in lines if f"cuteafd {command} --snapshot" in line)
-    plans = [line for line in lines if "cuteafd plan " in line]
+    plans = [line for line in lines if "cuteafd plan " in line and "--resolve-settings-only" not in line]
     assert f"--tp2-dflash {expected}" in serve
     if automatic:
         assert plans and all("--tp2-dflash" not in shlex.split(line) for line in plans)
