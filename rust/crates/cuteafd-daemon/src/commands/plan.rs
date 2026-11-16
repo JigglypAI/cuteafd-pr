@@ -487,6 +487,11 @@ fn run_plan_with_host(mut args: PlanArgs) -> Result<()> {
             (requested_speculator != "auto" || args.explicit_settings.contains("speculator")).then_some(requested_speculator.as_str()),
             cfg.get("SPECULATOR").map(String::as_str), snapshot.join("dflash").is_dir())));
     }
+    if (args.no_speculator || args.include_speculator || args.drafter_snapshot.is_some())
+        && matches!(family, "glm5_flash" | "mimo_v2") {
+        settings.insert("speculator".into(), setting(cuteafd_core::launch_settings::selected(
+            Some(args.speculator.clone()), None, args.speculator.clone(), "explicit speculator inventory override")));
+    }
     if args.resolve_settings_only {
         let mut output = resolved_output(serde_json::json!({"family": family}), &args, settings, &cfg, replay_explicit);
         output["speculator"] = serde_json::json!(args.speculator);

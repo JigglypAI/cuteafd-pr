@@ -48,6 +48,27 @@ fn removed_speculator_config_keys_match_launcher_refusal() {
 }
 
 #[test]
+fn settings_query_reports_final_explicit_speculator_overrides() {
+    for family in ["glm5_next", "mimo_v2"] {
+        let snapshot = tempfile::tempdir().unwrap();
+        std::fs::write(snapshot.path().join("config.json"), serde_json::json!({"model_type": family}).to_string()).unwrap();
+        let config = snapshot.path().join("launch.config");
+        for (configured, flag, expected) in [("dflash2", "--no-speculator", "off"),
+            ("off", "--include-speculator", if family == "glm5_next" { "dflash2" } else { "mtp" })] {
+            std::fs::write(&config, format!("SPECULATOR={configured}\n")).unwrap();
+            let output = test_command(env!("CARGO_BIN_EXE_cuteafd"))
+                .args(["plan", snapshot.path().to_str().unwrap(), "--resolve-settings-only", "--config"])
+                .arg(&config).arg(flag).output().unwrap();
+            assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+            let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(value["speculator"], expected);
+            assert_eq!(value["resolved_settings"]["speculator"]["value"], expected);
+            assert_eq!(value["resolved_settings"]["speculator"]["provenance"], "explicit");
+        }
+    }
+}
+
+#[test]
 fn settings_only_needs_config_not_checkpoint_inventory() {
     let snapshot = tempfile::tempdir().unwrap();
     std::fs::write(snapshot.path().join("config.json"), r#"{"model_type":"glm5_next"}"#).unwrap();
