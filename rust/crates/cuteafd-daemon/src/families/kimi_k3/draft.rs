@@ -531,6 +531,27 @@ mod tests {
     const TARGET_TAP_ROWS: usize = 4096;
 
     #[test]
+    fn block_tp2_private_flags_follow_target_producer_event_on_lead_stream() {
+        let block=include_str!("../../shared/speculation/block_dspark.rs");
+        let load=block.split("pub(crate) fn load_tp2_with").nth(1).unwrap()
+            .split("/// Uploads the drafter").next().unwrap();
+        assert!(load.contains("if rank==lead { lead_stream } else { peer_stream.raw }"));
+        assert!(load.contains("PeerExchange::new_abortable(library,rank_streams,1,slot,slot)"));
+        assert!(load.contains("block-dspark-tp2-private"));
+        let binding=include_str!("draft.rs");
+        assert!(binding.contains("&options.snapshot,bridge.stream().raw)?"));
+        let remote=include_str!("../../shared/draft/remote.rs");
+        let publish=remote.split("pub fn publish_context").nth(1).unwrap()
+            .split("pub fn acknowledge_context").next().unwrap();
+        let produced=publish.find("cuda_event_record(self.target_ready.raw, self.target_peer.stream)").unwrap();
+        let waited=publish.find("cuda_stream_wait_event(self.stream.raw, self.target_ready.raw)").unwrap();
+        assert!(produced<waited && waited<publish.find("self.exchange.wait(1, CONTEXT)").unwrap());
+        let update=binding.split("fn update_slice").nth(1).unwrap().split("pub(crate) fn reset").next().unwrap();
+        assert!(update.find("self.producer.borrow_mut().record(&self.target_streams[0])").unwrap()
+            <update.find("bridge.publish_context").unwrap());
+    }
+
+    #[test]
     fn draft_arena_census_counts_load_and_matches_admitted_startup_without_double_charge() -> Result<()> {
         use cuteafd_loader::placement::planner::{CoordinatorDevices, Location, Phase, PhaseOrder};
         crate::shared::speculation::dflash::physical_tests::with_mla_arena_fixture(|draft, layout, planned| {
