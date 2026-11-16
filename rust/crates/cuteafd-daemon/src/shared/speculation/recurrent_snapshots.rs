@@ -46,6 +46,7 @@ impl<'a> Marks<'a> {
         ensure!(stride==rank.layout.window_mark_bytes,"recurrent mark planes differ from admission");
         Ok(Self{local:WindowSnapshots::new(&rank.stream,planes,marks)?})
     }
+    pub fn backing(&self)->std::rc::Rc<crate::shared::memory::device::Allocation<'a>>{self.local.backing()}
     pub fn bytes(&self)->usize {self.local.mark_bytes()}
     pub fn mark(&self,index:usize)->Result<Buffer>{self.local.mark(index)}
     pub fn capture(&self,rank:&Rank<'a>,slot:usize,mark:usize,origin:usize,frontier:usize)->Result<()> {

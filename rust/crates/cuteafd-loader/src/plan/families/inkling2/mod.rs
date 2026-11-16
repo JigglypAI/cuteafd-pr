@@ -396,12 +396,15 @@ impl Family for Inkling2 {
         Some(TensorRole::layer(component, layer))
     }
     fn component_hint(&self, component: Component) -> Option<Hint> {
+        if component == Component::Speculator {
+            return Some(Hint { what:"Inkling bundled dSpark served qualification is pending".into(),
+                how:"Select SPECULATOR=dspark in a matching WIP build; cold/warm target-lossless and emitted-speed gates remain pending (#2320).".into() });
+        }
         let how = match component {
             Component::Attention => "Export the biased-sink GQA tile (per-token per-head sinks, distance-indexed additive bias, window 1024), the short-conv (static and dynamic taps), L2-clip and output-gate kernels; see #1930 measure-first notes.",
             Component::ResidualMix => "Generalize the Kimi attn_res softmax mix to hidden 4608 (#1934 S2).",
             Component::RoutedExpert => "Export routed MXFP8 W8A8 and native NVFP4 W4A4 (per-token amax, fouroversix) experts with SiTU and route-weight-before-FC2 quantization, and register the EXL3 K4 geometry (4608, 2304, 384, 8, situ); see #1930 kernel notes.",
             Component::Vision => "Wire the bundled PE-Lang ViT (2-D rotary, layer scale) and 2x2 merge projector through shared media admission with their own arena.",
-            Component::Speculator => "Wire the bundled dSpark (block 8, rnn_hidden Markov head with f_rnn and head fold) through shared speculation; generalize DraftHeadOps::RnnMarkov (#1934 S4).",
             _ => "Add the Inkling 2 serving hooks over the shared scheduler, fixed-depth packed prefill and bounded graph cache; admit named owners and packed arenas through the shared recipe.",
         };
         Some(Hint { what: format!("Inkling 2 {} execution is not implemented in this build", component.label()), how: how.into() })

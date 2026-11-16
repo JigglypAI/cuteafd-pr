@@ -177,6 +177,10 @@ pub(crate) struct InklingPrefix<'a> { bank:Rc<CacheBank<'a>>, draft:Option<Rc<su
 impl<'a> InklingPrefix<'a> {
     pub fn new(bank: Rc<CacheBank<'a>>) -> Self { Self {bank,draft:None} }
     pub fn with_draft(bank:Rc<CacheBank<'a>>,draft:Option<Rc<super::draft::Binding<'a>>>)->Self{Self{bank,draft}}
+    pub fn snapshot_owners(&self)->Vec<Rc<dyn crate::shared::prefix::cuda_copy::SnapshotOwner+'a>>{
+        let mut owners:Vec<Rc<dyn crate::shared::prefix::cuda_copy::SnapshotOwner+'a>>=vec![self.bank.clone()];
+        if let Some(draft)=&self.draft{owners.push(draft.clone());}owners
+    }
     fn validate(&self, placement: &Placement, len: usize) -> Result<()> {
         ensure!(placement.slot < self.bank.layout.sequences && len.div_ceil(64) <= placement.units.len()
             && placement.units.iter().all(|&page| (page as usize) < self.bank.layout.pool_pages),

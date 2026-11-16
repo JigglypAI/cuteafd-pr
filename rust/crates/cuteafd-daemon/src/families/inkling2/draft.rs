@@ -8,6 +8,18 @@ use cuteafd_ffi::{programs::Programs,CuteafdDeviceBuffer as Buffer};
 use cuteafd_loader::{families::inkling2::draft::DraftLayout,placement::planner::ResolvedPlan};
 use std::{cell::RefCell,rc::Rc};
 
+fn snapshot_buffers(config:&cuteafd_loader::formats::block_dspark::recurrent::RecurrentBlockConfig,
+    buffers:&std::collections::BTreeMap<String,crate::shared::memory::device::Allocation<'_>>,
+    marks:Option<Buffer>)->Result<Vec<Buffer>>{
+    let mut output=marks.into_iter().collect::<Vec<_>>();
+    for (layer,policy) in config.context.iter().enumerate(){
+        if matches!(policy,cuteafd_loader::formats::block_dspark::recurrent::ContextPolicy::Full){
+            for plane in ["k","v"]{output.push(buffers.get(&format!("cache.layer.{layer}.{plane}"))
+                .context("Inkling snapshot full KV owner missing")?.buffer);}
+        }
+    }Ok(output)
+}
+
 pub(crate) struct Binding<'a>{
     pub drafter:Rc<Drafter<'a>>,
     pub marks:Option<Marks<'a>>,
@@ -15,6 +27,12 @@ pub(crate) struct Binding<'a>{
     pub prefill:Vec<TapBuffer<'a>>,
     pub decode:TapBuffer<'a>,
     pub layout:DraftLayout,
+}
+impl crate::shared::prefix::cuda_copy::SnapshotOwner for Binding<'_>{
+    fn snapshot_buffers(&self)->Result<Vec<Buffer>>{
+        snapshot_buffers(&self.layout.config,&self.drafter.lead.buffers,
+            self.marks.as_ref().map(|marks|marks.backing().buffer))
+    }
 }
 impl<'a> Binding<'a>{
     pub fn new(programs:&'a Programs<'a>,stream:Rc<Stream<'a>>,weights:Weights<'a>,layout:DraftLayout,
@@ -55,5 +73,53 @@ impl<'a> Binding<'a>{
             self.drafter.context.append(&self.drafter.lead,slot,start+offset,
                 Buffer{ptr:output.ptr.wrapping_byte_add(position),bytes:count*pitch,..output},count)?;
         }Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests{
+    use super::*;
+    use crate::shared::{memory::{device::{Allocation,Device},Tag},prefix::{CudaCopyEngine,cuda_copy::{range,SnapshotOwner}},
+        speculation::block_dspark::WindowSnapshots};
+    use cuteafd_hostcache::{copy::{CopyEngine,Stream as CopyStream},pool::{PinnedMemory,HostRange}};
+    struct SnapshotFixture<'a>{config:cuteafd_loader::formats::block_dspark::recurrent::RecurrentBlockConfig,
+        buffers:std::collections::BTreeMap<String,Allocation<'a>>,marks:WindowSnapshots<'a>}
+    impl SnapshotOwner for SnapshotFixture<'_>{fn snapshot_buffers(&self)->Result<Vec<Buffer>>{
+        snapshot_buffers(&self.config,&self.buffers,Some(self.marks.backing().buffer))
+    }}
+    #[test]
+    fn registered_draft_marks_and_full_pages_restore_exact_bytes()->Result<()>{
+        let fixture=cuteafd_ffi::native_library_lifetime_fixture::Fixture::build_for_tests()?;
+        let library=fixture.load()?;fixture.immediate_copies(&library)?;
+        let device=Device{library:&library,id:0};let stream=Rc::new(Stream::new(device)?);
+        let config=cuteafd_loader::formats::block_dspark::recurrent::RecurrentBlockConfig::from_hf(&serde_json::from_str(include_str!(
+            "../../../../cuteafd-loader/src/families/inkling2/fixtures/config.json"))?)?;
+        let mut buffers=std::collections::BTreeMap::new();
+        for (layer,policy) in config.context.iter().enumerate(){if matches!(policy,
+            cuteafd_loader::formats::block_dspark::recurrent::ContextPolicy::Full){
+            for plane in ["k","v"]{buffers.insert(format!("cache.layer.{layer}.{plane}"),
+                Allocation::new(device,2*64*32,Tag::drafter_kv("test/full-pages"))?);}
+        }}
+        let owner=Rc::new(SnapshotFixture{config,buffers,marks:WindowSnapshots::new(&stream,vec![256],2)?});
+        let registered=owner.snapshot_buffers()?;
+        let contains=|segment:Buffer|registered.iter().any(|buffer|buffer.ptr as usize<=segment.ptr as usize
+            && segment.ptr as usize+segment.bytes<=buffer.ptr as usize+buffer.bytes);
+        let mut segments=(0..2).map(|slot|owner.marks.mark(slot)).collect::<Result<Vec<_>>>()?;
+        for buffer in owner.buffers.values(){for page in 0..2{segments.push(Buffer{
+            ptr:buffer.buffer.ptr.wrapping_byte_add(page*64*32),bytes:64*32,..buffer.buffer});}}
+        assert!(segments.iter().copied().all(contains));
+        let originals=segments.iter().enumerate().map(|(index,segment)|vec![index as u8+17;segment.bytes]).collect::<Vec<_>>();
+        for (segment,bytes) in segments.iter().zip(&originals){library.copy_h2d(*segment,bytes)?;}
+        let mut engine=CudaCopyEngine::registered_retained(&library,vec![],vec![owner.clone()])?;
+        let chunk=engine.allocate_chunk(segments.iter().map(|segment|segment.bytes).sum())?;
+        let mut offset=0;
+        let copies=segments.iter().map(|segment|{let host=HostRange{chunk:chunk.id,offset,bytes:segment.bytes};offset+=segment.bytes;(range(*segment),host)}).collect::<Vec<_>>();
+        engine.d2h_many(CopyStream::Store,&copies)?;engine.synchronize(CopyStream::Store)?;
+        for segment in &segments{library.copy_h2d(*segment,&vec![0;segment.bytes])?;}
+        engine.h2d_many(CopyStream::Restore,&copies.iter().map(|(device,host)|(*host,*device)).collect::<Vec<_>>())?;
+        engine.synchronize(CopyStream::Restore)?;
+        for (segment,expected) in segments.iter().zip(&originals){let mut actual=vec![0;segment.bytes];library.copy_d2h(&mut actual,*segment)?;assert_eq!(&actual,expected);}
+        let weak=Rc::downgrade(&owner);drop(owner);assert!(weak.upgrade().is_some());
+        engine.release_chunk(chunk)?;drop(engine);assert!(weak.upgrade().is_none());Ok(())
     }
 }
