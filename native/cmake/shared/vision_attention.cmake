@@ -136,6 +136,21 @@ cuteafd_vision_owner_entry(d128 HEAD_DIM 128 POINTWISE_GROUP pixtral
   PROGRAMS vision_attention_d128_full ARGS --group attention --head-dim 128
   POINTWISE_PROGRAMS vision_axial_rotary_d128_bf16 vision_rms_bf16_gamma_h2048
   POINTWISE_ARGS --group pointwise --head-dim 128 --hidden 2048 --bf16-products --bf16-before-gamma)
+foreach(kind inkling2 step5)
+  if(kind STREQUAL "inkling2")
+    set(dim 64)
+  else()
+    set(dim 96)
+  endif()
+  execute_process(COMMAND "${Python3_EXECUTABLE}" "${muse_exporter}" --list-perception-programs --perception ${kind}
+    RESULT_VARIABLE pe_status OUTPUT_VARIABLE pe_programs OUTPUT_STRIP_TRAILING_WHITESPACE)
+  if(NOT pe_status EQUAL 0 OR NOT pe_programs)
+    message(FATAL_ERROR "Cannot read ${kind} PE export inventory")
+  endif()
+  cuteafd_vision_owner_entry(pe_${kind} HEAD_DIM ${dim} POINTWISE_GROUP pe_${kind}
+    PROGRAMS vision_attention_d${dim}_full ARGS --group attention --head-dim ${dim}
+    POINTWISE_PROGRAMS ${pe_programs} POINTWISE_ARGS --group perception --perception ${kind})
+endforeach()
 get_property(owner_outputs GLOBAL PROPERTY CUTEAFD_VISION_OWNER_OUTPUTS)
 list(APPEND CUTEAFD_VISION_ATTENTION_OUTPUTS ${owner_outputs})
 list(REMOVE_DUPLICATES CUTEAFD_VISION_ATTENTION_OUTPUTS)
