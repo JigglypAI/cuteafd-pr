@@ -15,6 +15,8 @@ const SELECT: usize = 4 * 4104;
 
 /// Native output ABI scratch, a dedicated plane in each attention workspace.
 pub const OUTPUT_SCRATCH_BYTES: usize = 256;
+/// Canonical m64 F32 head programs have one exact serialized scratch owner.
+pub const FP8_HEAD_SCRATCH_BYTES: usize = 256;
 pub const SWA_OUTPUT_SCRATCH: usize = 16;
 pub const CSA_OUTPUT_SCRATCH: usize = 32;
 
@@ -102,9 +104,35 @@ impl NativeSelection {
                 split: if split { CoreSplit::Input } else { CoreSplit::Whole },
             }, output: if split { ProjectionOutput::F32 } else { ProjectionOutput::Bf16 } });
         }
+        for name in contract.fp8_tensors.iter().filter(|name| !name.ends_with(".self_attn.o_proj.weight")
+            && !super::coordinator::is_vocabulary_head(name)) {
+            let layer=name.strip_prefix("model.layers.").and_then(|rest|rest.split('.').next())
+                .and_then(|layer|layer.parse::<usize>().ok()).context("Step FP8 selected layer missing")?;
+            if layer>=cfg.layers+depth {continue;}
+            let shape=super::exl3::expected(cfg).get(name).cloned().context("Step selected core shape missing")?;
+            let split=layer<cfg.layers && !cfg.full[layer] && ranks==2 && ["q","k","v"].iter()
+                .any(|leaf|name.ends_with(&format!(".self_attn.{leaf}_proj.weight")));
+            requirements.push(NativeRequirement {layout:NativeLayout {stem:name.strip_suffix(".weight").unwrap().into(),
+                shape:[shape[0]/if split {2}else{1},shape[1]],fp8:true,rank:0,ranks:if split {2}else{1},
+                split:if split {CoreSplit::Output}else{CoreSplit::Whole}},output:ProjectionOutput::Bf16});
+        }
+        let heads = std::iter::once("lm_head.weight".to_owned()).chain((0..depth)
+            .map(|stage| format!("model.layers.{}.transformer.shared_head.output.weight",cfg.layers+stage)))
+            .filter(|name| contract.fp8_tensors.contains(name)).map(|name| NativeRequirement {
+                layout: NativeLayout { stem:name.strip_suffix(".weight").unwrap().into(),
+                    shape:[cfg.vocab,cfg.hidden],fp8:true,rank:0,ranks:1,split:CoreSplit::Whole },
+                output:ProjectionOutput::F32 }).collect::<Vec<_>>();
         let requests = requirements.iter().map(|request| NativeProgram {
             layout: &request.layout, output: request.output }).collect::<Vec<_>>();
-        let resolved = NativePrograms::resolve(&requests, rows, manifest)?;
+        let mut resolved = NativePrograms::resolve(&requests, rows, manifest)?;
+        let head_requests = heads.iter().map(|head| NativeProgram {layout:&head.layout,output:head.output}).collect::<Vec<_>>();
+        let head_programs = NativePrograms::resolve(&head_requests,64,manifest)?;
+        ensure!(heads.is_empty() || head_programs.fp8_scratch_bytes == FP8_HEAD_SCRATCH_BYTES as u64,
+            "Step-5 FP8 head scratch differs from canonical admitted owner");
+        resolved.programs.extend(head_programs.programs);
+        resolved.programs.sort();resolved.programs.dedup();
+        resolved.fp8_scratch_bytes=resolved.fp8_scratch_bytes.max(head_programs.fp8_scratch_bytes);
+        requirements.extend(heads);
         Ok(Self { requirements, rows, resolved })
     }
 
@@ -126,7 +154,8 @@ impl NativeSelection {
             let mixed = stem.strip_suffix(".o_proj").is_some_and(|prefix| ["q", "k", "v"].iter()
                 .all(|leaf| layout.core.contains_key(&format!("{prefix}.{leaf}_proj.weight"))));
             if !mixed && operand.dtype != cuteafd_core::DType::F8E4M3 { continue; }
-            let output = if operand.slice == super::coordinator::WeightSlice::Cols && layout.ranks == 2 {
+            let output = if super::coordinator::is_vocabulary_head(&operand.name)
+                || operand.slice == super::coordinator::WeightSlice::Cols && layout.ranks == 2 {
                 ProjectionOutput::F32
             } else { ProjectionOutput::Bf16 };
             let request = self.requirements.iter().find(|request| request.layout.stem == stem)
@@ -141,7 +170,7 @@ impl NativeSelection {
             }
         }
         for request in &self.requirements {
-            let prefix = request.layout.stem.strip_suffix("o_proj").expect("output requirement");
+            let Some(prefix) = request.layout.stem.strip_suffix("o_proj") else { continue };
             if !layout.core.contains_key(&format!("{prefix}q_proj.weight")) { continue; }
             ensure!(layout.operands.iter().any(|operand| operand.name == format!("{}.weight", request.layout.stem)),
                 mismatch(&request.layout.stem, "owned QKV lacks its selected native output"));
@@ -471,9 +500,11 @@ pub fn rank_admission_for_layout(contract: &CoordinatorContract, cfg: &Config, l
     } else { 0 };
     if rank == ownership.execution().spec().head_gpu as usize {
         // Only logit planes reuse the arena; native scratch lives with the head's private owners.
-        let head_scratch = layout.core.get("lm_head.weight").map(|core|
+        let head_scratch = if layout.operands.iter().any(|owner| owner.name == "lm_head.weight" && owner.dtype == cuteafd_core::DType::F8E4M3) {
+            FP8_HEAD_SCRATCH_BYTES as u64
+        } else { layout.core.get("lm_head.weight").map(|core|
             crate::formats::head::native_private_scratch(core.shape, unit)?.packed_bytes())
-            .transpose()?.unwrap_or(0) as u64;
+            .transpose()?.unwrap_or(0) as u64 };
         if head_scratch > 0 { private_requests.push(head_scratch); }
         immutable = immutable.checked_add(head_scratch).context("Step-5 private head scratch overflow")?;
         workspace = with_arena_phase(workspace, projection_bytes, plane_bytes(&head_planes(logits)?)?)?;
@@ -485,7 +516,9 @@ pub fn rank_admission_for_layout(contract: &CoordinatorContract, cfg: &Config, l
         private_requests,
         drafter_requests: Vec::new(),
         vocabulary_heads: if rank == usize::from(ownership.execution().spec().head_gpu)
-            && !layout.core.contains_key("lm_head.weight") { vec!["target".into()] } else { vec![] },
+            && !layout.core.contains_key("lm_head.weight")
+            && !layout.operands.iter().any(|owner| owner.name == "lm_head.weight" && owner.dtype == cuteafd_core::DType::F8E4M3)
+            { vec!["target".into()] } else { vec![] },
         projection_bytes,
         workspace,
     })
@@ -493,14 +526,25 @@ pub fn rank_admission_for_layout(contract: &CoordinatorContract, cfg: &Config, l
 
 /// The one serialized native projection scratch a rank's layers share, placed
 /// after its FFN region; zero when the rank owns no native operand.
-pub fn native_scratch_bytes(layout: &RankWeightLayout, unit: usize) -> Result<u64> {
-    let mut merged: Option<crate::formats::trellis_core::ProjectionScratchLayout> = None;
-    for core in layout.core.iter().filter(|(name, _)| name.as_str() != "lm_head.weight").map(|(_, core)| core) {
-        let [n, k] = core.shape;
-        let next = crate::formats::trellis_core::ProjectionScratchLayout::new(k, n, unit)?;
-        match &mut merged { Some(layout) => layout.merge(&next)?, None => merged = Some(next) }
+pub fn projection_scratch_layout(layout:&RankWeightLayout,rows:usize,
+    select:impl Fn(&str)->bool)->Result<Option<crate::formats::trellis_core::ProjectionScratchLayout>> {
+    use crate::formats::trellis_core::ProjectionScratchLayout;
+    let mut merged:Option<ProjectionScratchLayout>=None;
+    for (name,core) in layout.core.iter().filter(|(name,_)|select(name)) {
+        let _=name;
+        let next=ProjectionScratchLayout::new(core.shape[1],core.shape[0],rows)?;
+        match &mut merged {Some(layout)=>layout.merge(&next)?,None=>merged=Some(next)}
     }
-    Ok(merged.map(|layout| layout.packed_bytes()).transpose()?.map_or(0, |bytes| bytes as u64))
+    if layout.operands.iter().any(|owner|owner.fp8() && select(&owner.name)) {
+        let next=ProjectionScratchLayout {rows,extents:std::collections::BTreeMap::from([("fp8",256)])};
+        match &mut merged {Some(layout)=>layout.merge(&next)?,None=>merged=Some(next)}
+    }
+    Ok(merged)
+}
+
+pub fn native_scratch_bytes(layout:&RankWeightLayout,unit:usize)->Result<u64> {
+    Ok(projection_scratch_layout(layout,unit,|name|!super::coordinator::is_vocabulary_head(name))?
+        .map(|layout|layout.packed_bytes()).transpose()?.unwrap_or(0) as u64)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -545,9 +589,18 @@ pub fn mtp_native_scratch_requests(checkpoint: &Checkpoint, contract: &Coordinat
             let next = ProjectionScratchLayout::new(k, n, if owner == "head" { rows.head } else { rows.layer })?;
             match owners.get_mut(owner) { Some(layout) => layout.merge(&next)?, None => { owners.insert(owner, next); } }
         }
-        for layout in owners.values() {
-            requests.push(layout.packed_bytes()? as u64);
+        let groups=layout.operands.iter().filter(|owner|owner.fp8()).map(|owner|
+            if super::coordinator::is_vocabulary_head(&owner.name) {"head"}
+            else if owner.name.contains(".self_attn.") {"attention"}
+            else if owner.name.contains(".mlp.") {"dense"} else {"eh"})
+            .collect::<std::collections::BTreeSet<_>>();
+        for group in groups {
+            let next=ProjectionScratchLayout {rows:if group=="head" {rows.head}else{rows.layer},
+                extents:std::collections::BTreeMap::from([("fp8",256)])};
+            match owners.get_mut(group) {Some(layout)=>layout.merge(&next)?,None=>{owners.insert(group,next);}}
         }
+        for layout in owners.values() {requests.push(layout.packed_bytes()? as u64);}
+
     }
     Ok(requests)
 }

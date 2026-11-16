@@ -127,7 +127,9 @@ pub fn native_attention_mount(
 ) -> Result<crate::shared::dense_read::MountLoad> {
     use crate::shared::dense_read::{MountLoad, ReadBatch, STEP_BYTES};
     let [n, k] = layout.shape;
-    ensure!(n > 0 && k > 0 && source_shape[0] >= n && source_shape[1] >= k,
+    let padded_rows = convert_bf16 && layout.split == crate::formats::trellis_core::CoreSplit::Whole
+        && n == source_shape[0].next_multiple_of(128);
+    ensure!(n > 0 && k > 0 && (source_shape[0] >= n || padded_rows) && source_shape[1] >= k,
         "native attention mount geometry");
     let width = if layout.fp8 && !convert_bf16 { 1 } else { 2 };
     let row_bytes = source_shape[1].checked_mul(width).context("native source row overflow")?;
@@ -135,7 +137,7 @@ pub fn native_attention_mount(
     if convert_bf16 {
         ensure!(layout.fp8 && n % 128 == 0 && k % 128 == 0,
             "native FP8 conversion requires whole blocks");
-        let rows = n.min((cuteafd_ffi::push_ring::DEFAULT_SLOT_BYTES / packed_width / 128).max(1) * 128);
+        let rows = source_shape[0].min((cuteafd_ffi::push_ring::DEFAULT_SLOT_BYTES / packed_width / 128).max(1) * 128);
         let mut load = MountLoad::read(ReadBatch::new(rows, row_bytes, packed_width, usize::MAX)?);
         load.pinned_tables = cuteafd_ffi::programs::fp8_load_table_bytes(rows, 1)? as u64;
         return Ok(load);
@@ -767,6 +769,15 @@ impl WeightInventory {
                 1,
             )?;
             out.core(0, "core.head", "lm_head", &layout, projection.source_bytes)?;
+        } else if let Some(head) = core.native.get(cfg.head()) {
+            let [n,k] = head.shape;
+            out.add(0,"native.head.values","lm_head","fp8",product(&[n as u64,k as u64])?.max(256))?;
+            out.add(0,"native.head.scales","lm_head","fp8-scale",product(&[(n/128) as u64,(k/128) as u64,4])?.max(256))?;
+            let source = headers.matrix(&format!("{}.weight",cfg.head()))?;
+            out.attention_mount.merge(native_attention_mount(&crate::formats::native_attention::NativeLayout {
+                stem:cfg.head().into(),shape:head.shape,fp8:true,rank:0,ranks:1,
+                split:crate::formats::trellis_core::CoreSplit::Whole },
+                [usize::try_from(source[0])?,usize::try_from(source[1])?],true)?);
         } else {
             let head_name = format!("{}.weight", cfg.head());
             let head = headers.get(&head_name)?;

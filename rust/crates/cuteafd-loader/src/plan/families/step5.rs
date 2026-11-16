@@ -450,6 +450,8 @@ fn exl3_expert_bits(checkpoint: &Checkpoint, stem: &str) -> Result<usize> {
 }
 
 impl Family for Step5 {
+    // Qualified on repaired MC aedda90d: strict10/10 and Standard generated rows.
+    fn fp8_mtp_core_qualified(&self) -> bool { true }
     fn fp8_native_mtp_layers(&self, config: &serde_json::Value)
         -> Option<(&'static str, std::ops::Range<usize>)> {
         let text = config.get("text_config").unwrap_or(config);

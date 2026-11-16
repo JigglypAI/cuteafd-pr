@@ -178,7 +178,69 @@ fn projection_key(weights: &CoreWeights<'_>) -> (usize, usize, usize, &'static s
     (weights.shape[1], weights.shape[0], if weights.side == TrellisSide::Input { 2 } else { 1 }, book(weights), weights.bits)
 }
 
-pub(crate) use crate::shared::dense_trellis::{CoreHead, head_launch};
+pub(crate) use crate::shared::dense_trellis::head_launch;
+
+/// GLM retains its own target/drafter scratch, while the FP8 launch is shared
+/// with Muse and Step. Both formats enforce same-stream FIFO before reuse.
+pub(crate) enum CoreHead<'a> {
+    Trellis(crate::shared::dense_trellis::CoreHead<'a>),
+    Fp8 { executor: crate::shared::target_head::BlockFp8Head<'a>, scratch: Allocation<'a>,
+        device:Device<'a>,stream:*mut c_void },
+}
+impl<'a> CoreHead<'a> {
+    pub(crate) fn new(programs:&'a Programs<'a>,weights:&super::weights::GlmHead<'a>,rows:usize,
+        device:Device<'a>,stream:*mut c_void,admitted:&cuteafd_loader::families::glm5::core::CoreRankLayout,
+        draft:bool,tag:Tag) -> Result<Self> {
+        match weights {
+            super::weights::GlmHead::K6(weights) => {
+                let layout = if draft { &admitted.draft_head } else { &admitted.target_head }
+                    .as_ref().context("GLM trellis head scratch not admitted")?;
+                Ok(Self::Trellis(crate::shared::dense_trellis::CoreHead::new(programs,weights,rows,
+                    device,stream,layout,tag)?))
+            }
+            super::weights::GlmHead::BlockFp8(weights) => {
+                let executor = device.run(|| crate::shared::target_head::BlockFp8Head::load(programs,weights.layout.shape))?;
+                let bytes = if draft { admitted.fp8_draft_head_scratch } else { admitted.fp8_head_scratch }
+                    .context("GLM FP8 head scratch not admitted")?;
+                ensure!(bytes == executor.scratch_bytes()?,"GLM FP8 head scratch differs from admission");
+                Ok(Self::Fp8 { executor,scratch:Allocation::new(device,bytes,tag)?,device,stream })
+            }
+            _ => anyhow::bail!("GLM native head binding received BF16/row-FP8 head"),
+        }
+    }
+    pub(crate) fn launch(&self,weights:&super::weights::GlmHead<'_>,input:Buffer,output:Buffer,
+        rows:usize,stream:*mut c_void) -> Result<()> {
+        match (self,weights) {
+            (Self::Trellis(head),super::weights::GlmHead::K6(weights)) => head.launch(weights,input,output,rows,stream),
+            (Self::Fp8 { executor,scratch,device,stream:bound },super::weights::GlmHead::BlockFp8(weights)) => {
+                ensure!(stream == *bound,"GLM shared FP8 head scratch borrowed on foreign stream");
+                device.run(|| executor.launch(rows,input,weights,output,scratch.buffer,stream))
+            }
+            _ => anyhow::bail!("GLM native head binding/storage differs"),
+        }
+    }
+    pub(crate) fn target<'s>(&'s self,weights:&'s super::weights::GlmHead<'_>)
+        -> crate::shared::speculation::dflash::TargetHead<'s> {
+        crate::shared::speculation::dflash::TargetHead::Launch(Box::new(move |input,logits,rows,stream| {
+            let (device,k,n) = match (self,weights) {
+                (Self::Trellis(_),super::weights::GlmHead::K6(weights)) =>
+                    (weights.payload.buffer.device_id,weights.shape[1],weights.shape[0]),
+                (Self::Fp8 { device,.. },super::weights::GlmHead::BlockFp8(weights)) =>
+                    (device.id,weights.layout.shape[1],weights.layout.shape[0]),
+                _ => anyhow::bail!("GLM borrowed native head storage differs"),
+            };
+            let buffer = |ptr,bytes| Buffer { ptr,bytes,device_id:device,flags:0 };
+            self.launch(weights,buffer(input.cast_mut(),rows*k*2),buffer(logits.cast(),rows*n*4),rows,stream)
+        }))
+    }
+    pub(crate) fn allocation_scratch(&self) -> Option<&ProjectionScratch<'a>> {
+        match self { Self::Trellis(head) => Some(head.allocation_scratch()),Self::Fp8 {..} => None }
+    }
+    pub(crate) fn fp8_scratch(&self) -> Option<Buffer> {
+        match self { Self::Fp8 { scratch,..} => Some(scratch.buffer),_=>None }
+    }
+}
+
 
 /// Copy only logical columns after the complete stored-N transform has run.
 pub(crate) fn pack_layout(rows: usize, stored: usize, logical: usize, pitch: usize, column: usize)

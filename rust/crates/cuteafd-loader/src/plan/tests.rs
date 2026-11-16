@@ -6384,7 +6384,7 @@ fn glm_tied_embedding_keeps_device_owner_in_shared_admission() {
     let checkpoint = Checkpoint::open(dir.path()).unwrap();
     let cfg = crate::families::glm5::GlmDsaConfig::from_hf(&checkpoint.config).unwrap();
     let mut weights = crate::placement::families::glm5::weights::WeightInventory::from_checkpoint(
-        &checkpoint, 1, cfg.layers, None, crate::families::glm5::native_bf16(), false,
+        &checkpoint, 1, cfg.layers, None, true, false,
         crate::placement::planner::EmbeddingHome::Device(0)).unwrap();
     weights.add_rotary(65536, cfg.qk_rope_head_dim).unwrap();
     let embedding = weights.owners.iter().find(|owner| owner.allocation.id == "glm.weights.embedding").unwrap();

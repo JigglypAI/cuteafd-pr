@@ -591,9 +591,6 @@ fn precision_optimizations(family: &str, options: &PlanOptions) -> Vec<String> {
     let mut active = Vec::new();
     match family {
         "glm5" => {
-            if !crate::families::glm5::native_bf16() {
-                active.push("attention, indexer and dense/shared experts: explicit load-time FP8 block weights (CUTEAFD_GLM_BF16=fp8)".into());
-            }
             if !options.layout.as_ref().is_some_and(|layout| layout.glm5_drafter_disabled || layout.glm5_draft_bf16) {
                 active.push("external drafter: FP8 weights (existing launcher default)".into());
             }

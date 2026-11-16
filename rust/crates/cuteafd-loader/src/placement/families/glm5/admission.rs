@@ -1082,7 +1082,7 @@ impl<'a> ProductionInput<'a> {
                     }).collect(), split_heads: self.gpus == 2 && owners.is_none(),
                     router: count > 0 && device == 1,
                     native_head: recipe.hooks[device as usize].value.core.as_ref()
-                        .is_some_and(|core| core.target_head.is_some()),
+                        .is_some_and(|core| core.target_head.is_some() || core.fp8_head_scratch.is_some()),
                     decode: Some(self.scratch[0]), prefill: Some((self.prefill, self.scratch[1])),
                     payload_row_bytes: if count > 0 && self.gpus == 2 {
                         self.cfg.hidden as u64 * self.exchange_element_bytes

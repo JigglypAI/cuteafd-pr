@@ -559,19 +559,20 @@ pub(super) fn global_routes(
                 1,
             )?),
         )?;
+    } else if let Some(head) = core.native.get(cfg.head()) {
+        r.push(false,"head",Operation::NativeAttention(cuteafd_loader::formats::native_attention::NativeLayout {
+            stem:cfg.head().into(),shape:head.shape,fp8:true,rank:0,ranks:1,
+            split:cuteafd_loader::formats::trellis_core::CoreSplit::Whole }))?;
     } else {
-        r.push(
-            false,
-            "head",
-            Operation::Tensor(format!("{}.weight", cfg.head())),
-        )?;
+        r.push(false,"head",Operation::Tensor(format!("{}.weight", cfg.head())))?;
     }
     for mut route in r.routes {
         for request in &mut route.requests {
             request.id = request
                 .id
                 .replace(".layer.0.operand.", ".")
-                .replace(".layer.0.core.", ".core.");
+                .replace(".layer.0.core.", ".core.")
+                .replace(".layer.0.native.", ".native.");
         }
         receive(route)?;
     }

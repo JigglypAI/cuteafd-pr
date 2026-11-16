@@ -215,7 +215,7 @@ fn exl3_publication_lays_out_on_the_glm_engine() {
             crate::placement::families::glm5::attention_owners(&cfg, cfg.layers).unwrap());
         let mut weights = crate::placement::families::glm5::weights::WeightInventory::from_checkpoint(
             &checkpoint, gpus, cfg.layers, layer_owners.as_deref(),
-            crate::families::glm5::native_bf16(), false,
+            true, false,
             crate::placement::planner::EmbeddingHome::Device(0)).unwrap();
         weights.add_rotary(1 << 20, cfg.qk_rope_head_dim).unwrap();
         let arenas = weights.coordinator_arenas().unwrap();

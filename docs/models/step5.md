@@ -55,10 +55,41 @@ Plain checkpoints refuse compact selectors. Release cards select `original`;
 max-layout compact comparisons use the separate
 `scripts/bench/release-smoke-v51-mc-core-comparison.json` matrix.
 
-`fp8-compact` is **not supported** for this MC. Step-5's block-FP8 executor
-supports O projections only; the MC's complete core also selects q/k/v,
-dense/shared FFNs and the head, so role validation refuses it by tensor name.
-The comparison is `na`; no partial conversion is presented as a whole-core view.
+`fp8-compact` is an explicit, quality-affecting opt-in over exactly the
+original view's selected q/k/v/o, dense/shared FFN, EH and vocabulary-head
+matrices, including the three MTP stages' non-routed core. Native E4M3 values
+and F32 block-128 scales occupy the existing target and independently retired
+MTP arenas; no resident BF16 shadow or expert conversion is introduced.
+Heads use the shared executor with private scratch. Unselected keep tensors
+and routed EXL3 experts retain their checkpoint formats. Requires the v52e
+coordinator projection exports; `original` remains the default.
+
+Max-card qualification on 2026-11-16 passes generated Standard quality and
+strict MTP-depth-3 losslessness (10/10 cases, token IDs and row hashes exact).
+One warmed launch per view on 2 RTX PRO 6000 + 6 Sparks, 425 W/card,
+checkpoint `aedda90d25bd02bb6520bcaf88e06e6c9bc932c4`:
+
+| Metric | Original | FP8 compact |
+| --- | ---: | ---: |
+| C1 emitted tok/s | 59.87 | 68.98 |
+| C16 emitted tok/s | 216.73 | 266.95 |
+| 8K prefill tok/s | 2740 | 2562 |
+| KV pool tokens | 2097152 | 2097152 |
+| Onboarded RTX expert layers | 13 | 19 |
+| Generated decode KL / top-1 | 0.01337 / 96.069% | 0.01597 / 95.166% |
+| Generated prefill KL / top-1 | 0.01164 / 96.008% | 0.01429 / 95.811% |
+
+The original arm uses engine `42a9b82b1`; FP8 replay uses `a0751bf38`, whose
+only intervening runtime change fixes FP8-only scratch inventory. Original
+execution is unchanged, and all 106 saved prompt hashes match the replay.
+Decode has zero power-cap/thermal slowdown; GPU0/GPU1 busy C16 clocks are
+2779/2845 MHz original and 2782/2841 FP8. Prefill incurs about 1-4 power-cap
+GPU-seconds per point, no thermal slowdown, maximum 73 C and minimum T.Limit
+headroom 24 C. Corrected CUDA peaks are GPU0 96.02 to 100.50 GB and GPU1
+100.01 to 98.68 GB; additional onboarding uses the freed weight capacity.
+Absolute quality bars pass; no paired non-inferiority claim is made. Reference
+is still reference-only qualified, not engine calibrated. PR #2214 and tasks
+`v5x-mc-fp8-step-max-fixed` / `v5x-mc-fp8-step-scratch-fixed` retain evidence.
 
 Standard fidelity (2026-11-13) uses the published 32 decode + 32 prefill
 windows rooted at `stepfun-ai/Step-5-Preview-BF16`, on the min card. Both paths use

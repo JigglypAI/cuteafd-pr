@@ -63,24 +63,6 @@ def _run(repo: Path, hf: Path, *args: str) -> subprocess.CompletedProcess[str]:
                           capture_output=True, text=True, timeout=60)
 
 
-@pytest.mark.parametrize("value,resolved", [(None, "native"), ("native", "native"), ("fp8", "fp8")])
-def test_glm_target_conversion_policy_reaches_plan_and_serve(tmp_path, value, resolved):
-    keys = "SPECULATOR=off\nVISION=off\nAUDIO=off\n"
-    if value is not None:
-        keys += f"CUTEAFD_GLM_BF16={value}\n"
-    result = _family_launch_result(tmp_path, {"model_type": "glm_moe_dsa", "num_hidden_layers": 4, "first_k_dense_replace": 3}, "test/glm", keys)
-    assert result.returncode == 0, result.stderr
-    for command in ["cuteafd plan", "cuteafd serve-glm"]:
-        launch = next(line for line in result.stderr.splitlines() if command in line)
-        assert f"CUTEAFD_GLM_BF16={resolved}" in launch
-
-
-def test_glm_target_conversion_policy_refuses_unknown_value(tmp_path):
-    result = _family_launch_result(tmp_path, {"model_type": "glm_moe_dsa", "num_hidden_layers": 4, "first_k_dense_replace": 3}, "test/glm", "CUTEAFD_GLM_BF16=auto\n")
-    assert result.returncode == 2
-    assert "CUTEAFD_GLM_BF16 must be native or fp8" in result.stderr
-
-
 @pytest.mark.parametrize("gpus", [1, 2])
 @pytest.mark.parametrize("attention", ["auto", "heads", "context", "layers"])
 @pytest.mark.parametrize("wip", [False, True])

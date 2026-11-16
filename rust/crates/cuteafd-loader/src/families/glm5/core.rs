@@ -188,6 +188,18 @@ pub fn native_output(layout: &NativeLayout) -> cuteafd_ffi::draft_projection::Pr
     else { ProjectionOutput::Bf16 }
 }
 
+/// Executable metadata-selected roles, with explicit block padding.
+pub fn fp8_role(cfg: &GlmDsaConfig, name: &str) -> crate::formats::native_attention::Fp8Role {
+    use crate::formats::native_attention::Fp8Role;
+    let stem = name.strip_suffix(".weight").unwrap_or(name);
+    let supported = cfg.variant.is_glm() && split(cfg, stem).is_some();
+    let role = if stem == cfg.head() { "vocabulary head" }
+        else if stem.contains(".self_attn.") { "attention projection" } else { "FFN projection" };
+    if stem == cfg.head() || (0..cfg.layers).any(|layer| cfg.stem(layer, Op::KvA).as_deref() == Some(stem)) {
+        Fp8Role::padded(role, supported, 128)
+    } else { Fp8Role::exact(role, supported) }
+}
+
 impl CoreInventory {
     pub fn from_checkpoint(cfg: &GlmDsaConfig, checkpoint: &Checkpoint) -> Result<Self> {
         validate_native_attention(cfg, checkpoint)?;
@@ -199,29 +211,28 @@ impl CoreInventory {
                 && !leaf.starts_with("experts.") && !leaf.contains(".experts."));
         // kv_a may store N128 padding (RoPE latent N576 -> N640).
         let kv_a: std::collections::BTreeSet<String> = (0..cfg.layers).filter_map(|l| cfg.stem(l, Op::KvA)).collect();
-        checkpoint.validate_fp8_roles("GLM", |name| {
-            let stem = name.strip_suffix(".weight").unwrap_or(name);
-            let role = if stem.ends_with("lm_head") { "vocabulary head" }
-                else if stem.contains(".self_attn.") { "attention projection" }
-                else if stem.contains(".mlp.") { "FFN projection" } else { "non-core" };
-            crate::formats::native_attention::Fp8Role::exact(role, false)
-        })?;
+        checkpoint.validate_fp8_roles("GLM", |name| fp8_role(cfg, name))?;
         let projections = read_projections(checkpoint, &expected(cfg), selected,
             |stem| split(cfg, stem).map(|split| CoreContract { family: if cfg.variant.is_glm() { "GLM 5.3" } else { "Mistral Large 4" }, widths: core_widths(cfg), split,
                 view_varying: true, padded_outputs: kv_a.contains(stem) }))?;
         let mut inventory = Self { projections, native: BTreeMap::new() };
         let shapes = expected(cfg);
         for layer in 0..cfg.layers {
-            let operands = core_operands(cfg, layer).into_iter().filter(|(_, op, _)|
-                matches!(op, Op::QA | Op::KvA | Op::QB | Op::O)
-                    || cfg.variant.ml4().is_some() && matches!(op, Op::Gate | Op::Up | Op::Down))
-                .filter_map(|(_, op, split)| cfg.stem(layer, op).map(|stem| (stem, split)))
+            let operands = core_operands(cfg, layer).into_iter()
+                .filter(|(_,op,_)| matches!(op,Op::QA | Op::KvA | Op::QB | Op::O | Op::Gate | Op::Up | Op::Down))
+                .filter_map(|(_, op, split)| cfg.stem(layer, op).map(|stem| (stem, op, split)))
                 .collect::<Vec<_>>();
-            let staged = cfg.variant.ml4().is_some()
-                || operands.iter().any(|(stem, _)| inventory.projections.contains_key(stem));
-            if !staged { continue; }
-            for (stem, split) in operands {
-                if inventory.projections.contains_key(&stem) { continue; }
+            let attention = |op| matches!(op, Op::QA | Op::KvA | Op::QB | Op::O);
+            for (stem, op, split) in &operands {
+                let staged = cfg.variant.ml4().is_some() || operands.iter().any(|(member, member_op, _)|
+                    attention(*member_op) == attention(*op)
+                        && (inventory.projections.contains_key(member)
+                            || checkpoint.converts_to_fp8(&format!("{member}.weight"))));
+                // Stage complete logical groups, retaining unselected members
+                // as native BF16. Never turn a group flag into quant selection.
+                if !staged { continue; }
+                let split = *split;
+                if inventory.projections.contains_key(stem) { continue; }
                 let selected = checkpoint.projection(&stem)?;
                 let crate::plan::checkpoint::ProjectionStorage::Native { dtype, shape } = &selected.storage else { continue; };
                 let expected = shapes.get(&format!("{stem}.weight")).context("GLM native shape")?;
@@ -234,10 +245,23 @@ impl CoreInventory {
                             tensor: format!("{stem}.weight"), found: "E4M3".into() }.into());
                     }
                 }
-                inventory.native.insert(stem.clone(), NativeProjection { shape: [shape[0], shape[1]], split,
-                    fp8: *dtype == cuteafd_core::DType::F8E4M3
-                        || checkpoint.converts_to_fp8(&format!("{stem}.weight")) });
+                let converted = checkpoint.converts_to_fp8(&format!("{stem}.weight"));
+                let stored = if converted { fp8_role(cfg, &format!("{stem}.weight")).stored_shape([shape[0],shape[1]])? }
+                    else { [shape[0],shape[1]] };
+                inventory.native.insert(stem.clone(), NativeProjection { shape: stored, split,
+                    fp8: *dtype == cuteafd_core::DType::F8E4M3 || converted });
             }
+        }
+        let head_name = format!("{}.weight", cfg.head());
+        if checkpoint.converts_to_fp8(&head_name) {
+            let selected = checkpoint.projection(cfg.head())?;
+            let crate::plan::checkpoint::ProjectionStorage::Native { dtype, shape } = &selected.storage
+                else { anyhow::bail!("selected FP8 head is not native"); };
+            ensure!(*dtype == cuteafd_core::DType::Bf16 && *shape == [cfg.vocab_size,cfg.hidden],
+                "selected FP8 vocabulary header differs from logical head");
+            inventory.native.insert(cfg.head().into(), NativeProjection {
+                shape: fp8_role(cfg, &head_name).stored_shape([shape[0],shape[1]])?,
+                fp8: true, split: CoreSplit::Whole });
         }
         inventory.validate_groups(cfg)?;
         Ok(inventory)
@@ -328,6 +352,9 @@ pub struct CoreRankLayout {
     /// Decode and prefill target launches are serialized on the rank-0 stream.
     pub target_head: Option<ProjectionScratchLayout>,
     pub draft_head: Option<ProjectionScratchLayout>,
+    /// Independent target/drafter scratch for the shared block-FP8 head executor.
+    pub fp8_head_scratch: Option<usize>,
+    pub fp8_draft_head_scratch: Option<usize>,
     pub retained_rows: usize,
     pub receive_suffix: usize,
 }
@@ -343,6 +370,7 @@ impl CoreRankLayout {
         }
         if let Some(stages) = &self.stages { for stage in stages { add(stage.bytes()?)?; } }
         for bytes in self.native_scratch { add(bytes)?; }
+        for bytes in self.fp8_head_scratch.iter().chain(&self.fp8_draft_head_scratch) { add(*bytes)?; }
         // Native attention keeps F32 partials; K6 down keeps its BF16 wire ABI.
         add(self.retained_rows.checked_mul(hidden).and_then(|n| n.checked_mul(self.attention_partial_bytes + self.down_partial_bytes + 4))
             .context("GLM K6 retained plane extent overflow")?)?;
@@ -394,6 +422,7 @@ impl CoreCharges {
             }
         }
         let head = core.get_weight(cfg.head()).map(|p| CoreWeightLayout::new(p, TrellisSide::Output, 0, 1)).transpose()?;
+        let fp8_head = core.native.get(cfg.head());
         let mut programs = std::collections::BTreeSet::new();
         let mut geometries = std::collections::BTreeSet::new();
         for weight in bodies.iter().flatten().chain(head.iter()) {
@@ -403,8 +432,16 @@ impl CoreCharges {
             }
         }
         use crate::placement::planner::native_attention::{NativeProgram, NativePrograms};
-        let native_manifest = native.iter().any(|weights| !weights.is_empty())
+        let native_manifest = (native.iter().any(|weights| !weights.is_empty()) || fp8_head.is_some())
             .then(|| crate::placement::inventory::ProgramsManifest::from_manifest(manifest)).transpose()?;
+        let fp8_head_scratch = fp8_head.map(|head| -> Result<usize> {
+            let layout = NativeLayout { stem: cfg.head().into(), shape: head.shape, fp8:true,
+                rank:0,ranks:1,split:CoreSplit::Whole };
+            let selected = NativePrograms::resolve(&[NativeProgram { layout:&layout,
+                output:cuteafd_ffi::draft_projection::ProjectionOutput::F32 }],64,native_manifest.as_ref())?;
+            programs.extend(selected.programs);
+            Ok(usize::try_from(selected.fp8_scratch_bytes)?)
+        }).transpose()?;
         let mut native_scratch = vec![[0usize; 2]; ranks];
         for (rank, weights) in native.iter().enumerate() {
             let requests = weights.iter().map(|layout| NativeProgram { layout,
@@ -463,7 +500,7 @@ impl CoreCharges {
                     programs.insert(name);
                 }
             }
-        } else if bodies.iter().any(|body| !body.is_empty()) {
+        } else if bodies.iter().any(|body| !body.is_empty()) || native.iter().any(|weights| !weights.is_empty()) {
             let entries = manifest["programs"].as_array().context("GLM K6 stage program inventory")?;
             for prefix in if owners.is_some() { vec!["glm", "glm2"] }
                 else if ranks == 2 { vec!["glm2"] } else { vec!["glm"] } {
@@ -490,7 +527,7 @@ impl CoreCharges {
         let attention_partial_bytes = if native.iter().flatten().any(|w|
             w.split == CoreSplit::Input && w.ranks > 1) { 4 } else { 2 };
         let down_partial_bytes = if native.iter().flatten().any(|w|
-            w.stem.ends_with(".w2") && w.split == CoreSplit::Input && w.ranks > 1) { 4 } else { 2 };
+            (w.stem.ends_with(".w2") || w.stem.ends_with(".down_proj")) && w.split == CoreSplit::Input && w.ranks > 1) { 4 } else { 2 };
         let split = bodies.iter().flatten().any(|w| w.side == TrellisSide::Input)
             || attention_partial_bytes == 4;
         let scratch = |body: &[CoreWeightLayout], rows| -> Result<Option<ProjectionScratchLayout>> {
@@ -519,6 +556,8 @@ impl CoreCharges {
                     .and_then(|n| n.checked_mul(unit.max(64))).and_then(|n| n.checked_mul(cfg.hidden))
                     .and_then(|n| n.checked_mul(attention_partial_bytes)).context("GLM K6 receive suffix overflow")? } else { 0 },
                 native: native[rank].clone(), native_scratch: native_scratch[rank], attention_partial_bytes,
+                fp8_head_scratch: if rank == 0 { fp8_head_scratch } else { None },
+                fp8_draft_head_scratch: if rank == 0 && draft_rows.is_some() { fp8_head_scratch } else { None },
                 body, target_head, draft_head, down_partial_bytes,
             });
         }
@@ -644,6 +683,52 @@ mod tests {
     }
 
     #[test]
+    fn fp8_body_selection_preserves_unselected_group_members_and_keep_roles() -> Result<()> {
+        use crate::plan::{checkpoint::{CheckpointView, CoreView}, testing};
+        let mut config = testing::glm5_config();
+        config["vocab_size"] = serde_json::json!(128);
+        config["quantization_config"] = testing::exl3_compact(4);
+        let cfg = GlmDsaConfig::from_hf(&config)?;
+        let shapes = expected(&cfg);
+        let mut tensors = testing::glm5_tensors(|stem,n,k| testing::exl3(stem,n,k,4));
+        tensors.retain(|(name,_,_)| !name.ends_with("weight_scale_inv"));
+        for (name, dtype, shape) in &mut tensors {
+            if *dtype == "F8_E4M3" { *dtype = "BF16"; }
+            if name == "lm_head.weight" || name == "model.embed_tokens.weight" { shape[0] = 128; }
+        }
+        for selected in [vec![Op::KvA], vec![Op::Gate], vec![Op::Gate,Op::Up,Op::Down]] {
+            let selected = selected.iter().map(|op| {
+                let name = cfg.weight(0,*op).unwrap(); (name.clone(), shapes[&name].clone())
+            }).collect::<BTreeMap<_,_>>();
+            let dir = tempfile::tempdir()?;
+            testing::write_mc_snapshot(dir.path(),&config,&tensors,&selected);
+            let cp = Checkpoint::open_view(&CheckpointView::select(dir.path(),CoreView::Fp8Compact)?)?;
+            let core = CoreInventory::from_checkpoint(&cfg,&cp)?;
+            for (stem, projection) in &core.native {
+                assert_eq!(projection.fp8,selected.contains_key(&format!("{stem}.weight")),"{stem}");
+            }
+            for op in [Op::KvB,Op::IndexQ,Op::IndexK,Op::IndexWeights] {
+                let stem = cfg.stem(0,op).unwrap();
+                assert!(!core.native.contains_key(&stem));
+                assert!(!cp.converts_to_fp8(&format!("{stem}.weight")));
+                assert_eq!(cp.header(&format!("{stem}.weight")).unwrap().dtype,cuteafd_core::DType::Bf16);
+            }
+            if selected.contains_key(&cfg.weight(0,Op::KvA).unwrap()) {
+                assert_eq!(core.native[&cfg.stem(0,Op::KvA).unwrap()].shape,[640,6144]);
+                assert_eq!(core.native.len(),4);
+            } else { assert_eq!(core.native.len(),3); }
+            for ranks in [1,2] {
+                let owners = core.layer_native(&cfg,0,ranks,None)?;
+                for rank in owners { for layout in rank.values() {
+                    assert_eq!(layout.fp8,selected.contains_key(&format!("{}.weight",layout.stem)));
+                    assert!(layout.bytes()? > 0);
+                } }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
     fn repaired_mc_original_mtp_is_not_loaded_or_charged_to_target() -> Result<()> {
         use crate::plan::{checkpoint::{CheckpointView, CoreView, ProjectionStorage}, testing,
             family::Family, families::glm::GLM5, files::{required_tensors, ReadRole}, Component};
@@ -691,7 +776,8 @@ mod tests {
         // Whole-core GLM FP8 remains a separate executor qualification, not a silent skip.
         let fp8 = crate::plan::Checkpoint::open_view(&CheckpointView::select(dir.path(), CoreView::Fp8Compact)?)?;
         assert!(mtp.keys().all(|name| !fp8.converts_to_fp8(name)));
-        assert!(CoreInventory::from_checkpoint(&cfg, &fp8).unwrap_err().to_string().contains("cannot execute block FP8"));
+        let core = CoreInventory::from_checkpoint(&cfg, &fp8)?;
+        assert!(core.native.get(cfg.head()).is_some_and(|head| head.fp8));
         Ok(())
     }
 
