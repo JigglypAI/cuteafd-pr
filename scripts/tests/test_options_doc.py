@@ -400,6 +400,11 @@ def test_optional_levers_are_default_off_and_documented():
                 assert default == "on"
                 assert "`GRAPH_PREWARM=off`" in DOC.read_text()
                 assert 'case "$(get GRAPH_PREWARM on)"' in (ROOT / "scripts/launch/run-family.sh").read_text()
+            elif key == "GRAPH_DONOR_COLD_LAG":
+                assert default == "0"
+                assert lever["families"] == COLUMNS
+                assert '`GRAPH_DONOR_ALWAYS=on GRAPH_DONOR_COLD_LAG=16`' in DOC.read_text()
+                assert 'graph_donor_cold_lag="$(get GRAPH_DONOR_COLD_LAG 0)"' in (ROOT / "scripts/launch/run-family.sh").read_text()
             elif key == "KV_CACHE":
                 assert lever["families"] == ["Muse"]
                 assert default == "family default"

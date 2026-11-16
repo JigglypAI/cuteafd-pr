@@ -869,6 +869,7 @@ pub(crate) struct DeviceCache {
     pending_lanes: [usize; 2],
     concurrent_cycles: u64,
     donor_always: bool,
+    donor_cold_lag: u64,
     lane_max_cycles: [u64; 2],
     site_lanes: HashMap<&'static str, u8>,
     update_sites: std::collections::BTreeMap<&'static str, HashMap<Cycle, Counters>>,
@@ -929,7 +930,7 @@ impl DeviceCache {
             pending_growth: 0, pools: Pools::default(), basis: Basis::Bytes,
             chain_only: true, unmeasured: false, pending_destroy: 0,
             bank_lanes: HashMap::new(), lanes: std::array::from_fn(|_| LaneEpoch::default()), clocks: Arc::new(std::array::from_fn(|_| EpochClock::default())),
-            lagged: Vec::new(), epochs: EpochStats::default(), reuse_captures: HashSet::new(), selected_epochs: HashMap::new(), pending_lanes: [0; 2], concurrent_cycles: 1, donor_always: super::donor_always(), lane_max_cycles: [1; 2], site_lanes: HashMap::new(), update_sites: Default::default(), native_graphs: HashMap::new(), bank_native: HashMap::new(), donor_candidates: HashMap::new(), update_requests: HashMap::new(),
+            lagged: Vec::new(), epochs: EpochStats::default(), reuse_captures: HashSet::new(), selected_epochs: HashMap::new(), pending_lanes: [0; 2], concurrent_cycles: 1, donor_always: super::donor_always(), donor_cold_lag: super::donor_cold_lag(), lane_max_cycles: [1; 2], site_lanes: HashMap::new(), update_sites: Default::default(), native_graphs: HashMap::new(), bank_native: HashMap::new(), donor_candidates: HashMap::new(), update_requests: HashMap::new(),
             observer: GrowthObserver::default(), memory_query: None, launch_query: None, captured_since_observation: false,
             counters: HashMap::new(), started: Instant::now(), clock_ms: 0, last_report: Instant::now(),
             interval_evictions: 0, trace: std::env::var_os("CUTEAFD_GRAPH_TRACE").and_then(|path| {
@@ -1498,7 +1499,12 @@ impl DeviceCache {
             !self.native_graphs.contains_key(&id) { return None }
         let lane = self.bank_lane(record.identity.bank);
         let age = self.lanes[lane].index.saturating_sub(record.used()?);
-        (age > self.lane_max_cycles[lane]).then_some(age)
+        // Pressure keeps the safety floor K; optional extra lag only protects
+        // reusable shapes while donor-always is operating below the soft cap.
+        let lag = if self.donor_always && self.charged < self.soft.limit && self.charged < self.reserve {
+            self.donor_cold_lag
+        } else { 0 };
+        (age > self.lane_max_cycles[lane].saturating_add(lag)).then_some(age)
     }
 
     fn insert_donor_candidate(&mut self, id: u64) {
@@ -2646,6 +2652,62 @@ mod tests {
         assert!(!cache.owns(donor, 1));
         assert!(cache.owns(ticket, 1));
         assert_eq!(cache.charged, 10);
+    }
+
+    #[test]
+    fn donor_cold_lag_boundary_applies_only_below_soft_cap() {
+        for k in [1, 2] {
+            for lag in [0, 16] {
+                for pressure in [false, true] {
+                    for age in 0..=k + lag + 1 {
+                        let (mut cache, donor) = aged_update_fixture(age, false);
+                        cache.donor_always = true;
+                        cache.donor_cold_lag = lag;
+                        cache.lane_max_cycles[0] = k;
+                        cache.soft.limit = if pressure { cache.charged } else { 500 };
+                        let eligible = age > k + if pressure { 0 } else { lag };
+                        assert_eq!(cache.cold_donor(&[3, 7, 11]), eligible.then_some(donor));
+                        let ticket = cache.update_ticket(key(2), site(Preference::Capture), None, false);
+                        assert_eq!(ticket.is_some(), eligible, "K={k}, lag={lag}, age={age}, pressure={pressure}");
+                        if let Some(ticket) = ticket {
+                            cache.register_native(ticket, 0, vec![3, 7, 11]);
+                            assert_eq!(cache.finish_update(ticket, |_| Ok(true), |_| Ok(202), |_| panic!()), Some(202));
+                            assert!(!cache.owns(donor, 1));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn donor_cold_lag_does_not_change_hard_pressure_or_overflow() {
+        for k in [1, 2] {
+            for age in 0..=k + 1 {
+                let (mut cache, donor) = aged_update_fixture(age, true);
+                cache.donor_always = true;
+                cache.donor_cold_lag = u64::MAX;
+                cache.lane_max_cycles[0] = k;
+                assert_eq!(cache.cold_donor(&[3, 7, 11]), (age > k).then_some(donor));
+            }
+        }
+        let (mut cache, _) = aged_update_fixture(40, false);
+        cache.donor_always = true;
+        cache.donor_cold_lag = u64::MAX;
+        cache.soft.limit = 500;
+        assert!(cache.cold_donor(&[3, 7, 11]).is_none(), "K + lag must not wrap below the safety floor");
+    }
+
+    #[test]
+    fn donor_cold_lag_is_rechecked_before_transfer() {
+        let (mut cache, donor) = aged_update_fixture(5, false);
+        cache.donor_always = true;
+        cache.donor_cold_lag = 16;
+        let ticket = cache.update_ticket(key(2), site(Preference::Capture), None, false).unwrap();
+        cache.register_native(ticket, 0, vec![3, 7, 11]);
+        cache.soft.limit = 500;
+        assert!(cache.finish_update(ticket, |_| panic!("donor is no longer cold"), |_| panic!(), |_| panic!()).is_none());
+        assert!(cache.owns(donor, 1));
     }
 
     #[test]

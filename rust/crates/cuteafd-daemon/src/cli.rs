@@ -130,6 +130,9 @@ pub(crate) struct Cli {
     /// Prefer a cold compatible donor even below the graph soft cap.
     #[arg(long, global = true)]
     pub(crate) graph_donor_always: bool,
+    /// Extra idle cycles required of below-soft-cap donors (requires donor-always when non-zero).
+    #[arg(long, global = true, default_value_t = 0)]
+    pub(crate) graph_donor_cold_lag: u64,
     /// Minimum physical GPU free bytes after graph capture (default MEMORY_PADDING/2); size or gpuN=size, 0 disables.
     #[arg(long, global = true)]
     pub(crate) graph_disable_low_mem: Option<String>,
@@ -1164,6 +1167,23 @@ mod tests {
             panic!("expected DeepSeek V4 golden");
         };
         assert!(!args.nll && args.save_logits.is_some() && args.prefill == Some(512));
+    }
+
+    #[test]
+    fn graph_donor_cold_lag_is_a_typed_cli_option() {
+        use clap::Parser;
+        let base = ["cuteafd", "bench-rdma-ring"];
+        assert_eq!(super::Cli::try_parse_from(base).unwrap().graph_donor_cold_lag, 0);
+        for lag in ["0", "16", "18446744073709551615"] {
+            let cli = super::Cli::try_parse_from(base.into_iter().chain([
+                "--graph-donor-always", "--graph-donor-cold-lag", lag])).unwrap();
+            assert!(cli.graph_donor_always);
+            assert_eq!(cli.graph_donor_cold_lag, lag.parse::<u64>().unwrap());
+        }
+        for lag in ["-1", "cold", "18446744073709551616"] {
+            assert!(super::Cli::try_parse_from(base.into_iter().chain([
+                "--graph-donor-cold-lag", lag])).is_err());
+        }
     }
 
     #[test]

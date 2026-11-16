@@ -480,11 +480,18 @@ case "$(get GRAPH_PREWARM on)" in
     graph_policy_args+=(--graph-no-prewarm) ;;
   *) release_die 'GRAPH_PREWARM must be on or off' ;;
 esac
-case "$(get GRAPH_DONOR_ALWAYS off)" in
+graph_donor_always="$(get GRAPH_DONOR_ALWAYS off)"
+case "$graph_donor_always" in
   on) graph_policy_args+=(--graph-donor-always) ;;
   off) ;;
   *) release_die 'GRAPH_DONOR_ALWAYS must be on or off' ;;
 esac
+graph_donor_cold_lag="$(get GRAPH_DONOR_COLD_LAG 0)"
+[[ "$graph_donor_cold_lag" =~ ^[0-9]+$ ]] || release_die 'GRAPH_DONOR_COLD_LAG must be a non-negative integer'
+if [[ "$graph_donor_cold_lag" =~ [1-9] ]]; then
+  [[ "$graph_donor_always" == on ]] || release_die 'GRAPH_DONOR_COLD_LAG requires GRAPH_DONOR_ALWAYS=on when non-zero'
+  graph_policy_args+=(--graph-donor-cold-lag "$graph_donor_cold_lag")
+fi
 if [[ "$family" == qwen3_5 ]]; then
   case "$(get DECODE_GRAPHS on)" in
     on) graph_census_args+=(-e CUTEAFD_QWEN35_GRAPHS=1) ;;

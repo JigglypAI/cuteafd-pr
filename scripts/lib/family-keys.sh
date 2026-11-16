@@ -34,7 +34,7 @@ _spark_slot_keys() {
 _family_allowed_keys() {
   local checkpoint_family="${2:-$1}" registry_dir
   registry_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-  printf '%s\n' CORE_VIEW FP8_PREFILL ATTENTION_PREFILL_PRECISION GRAPH_PREWARM GRAPH_DONOR_ALWAYS
+  printf '%s\n' CORE_VIEW FP8_PREFILL ATTENTION_PREFILL_PRECISION GRAPH_PREWARM GRAPH_DONOR_ALWAYS GRAPH_DONOR_COLD_LAG
   cat <<'EOF'
 VISION
 AUDIO
@@ -461,6 +461,7 @@ _v41_allowed_keys() {
   cat <<'EOF'
 GRAPH_PREWARM
 GRAPH_DONOR_ALWAYS
+GRAPH_DONOR_COLD_LAG
 EXPERT_USAGE
 ADDR
 API_KEY_FILE
