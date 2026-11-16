@@ -44,6 +44,28 @@ def test_inkling_view_declaration_is_mirrored_in_quantize_config(view, filename)
     assert inline['activation_quantization']['block_size'] == 32
 
 
+@pytest.mark.parametrize('core_bits', [None, 8, 6])
+def test_gptqmodel_mc_schema_preserves_provenance_and_declarations(core_bits):
+    from inkling2 import recipe
+    pointer = 'quantize_config.json:tensor_storage'
+    previous = dict(quant_method='exl3', format='mcg', per_module_metadata=pointer,
+                    activation_quantization=recipe.ACTIVATION_QUANTIZATION)
+    metadata = dict(tensor_storage={}, retained_native_tensors={}, provenance={'producer': 'test'},
+                    core_view='original' if core_bits is None else f'k{core_bits}-compact',
+                    upstream_activations='k8-compact', **previous)
+    quant, config = package.gptqmodel_mc_view(dict(quantization_config=previous), metadata,
+        bits=4, core_bits=core_bits, module_include=[])
+    for key in ('quant_method', 'method', 'format', 'checkpoint_format'):
+        assert quant[key] == 'exl3'
+    assert quant['codebook'] == 'mcg' and quant['group_size'] == -1 and quant['desc_act'] is False
+    assert all(quant[k] == v for k, v in config['quantization_config'].items())
+    assert quant['meta']['source_quantization_config'] == previous
+    for key in ('core_view', 'provenance', 'upstream_activations', 'activation_quantization'):
+        assert key not in quant and quant['meta'][key] == metadata[key]
+    assert ('core_bits' in quant) == (core_bits is not None)
+    assert metadata['format'] == 'mcg'
+
+
 @pytest.mark.parametrize('family', ['kimi_k31', 'glm5', 'glm5_flash', 'muse_spark', 'mistral_large4'])
 def test_shared_storage_builder_preserves_recorded_family_recipes(family):
     import importlib

@@ -11,6 +11,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import sys
@@ -20,7 +21,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from mc_package import quantize_config_for_view, tensor_storage_entry
+from mc_package import gptqmodel_mc_view, quantize_config_for_view, tensor_storage_entry
 from kimi_k3.uniform_k2.storage import atomic_json, canonical, file_identity
 from kimi_k3.core_k6.storage import StageStore
 from glm5.core_k6.storage import ProjectionStore
@@ -507,6 +508,9 @@ class Runner:
                     n+'.weight': dict(dtype='BF16', shape=[g['out_features'], g['in_features']])
                     for n,g in selected.items()}), provenance=self.identity,
                 core_view=view, upstream_activations='k8-compact')
+            quantizes[view], configs[view] = gptqmodel_mc_view(config, quantizes[view],
+                bits=4, core_bits=bits, module_include=['^' + re.escape(n) + '$'
+                    for n in sorted(modules)])
         assets = {p.name:p for p in self.header.snapshot.iterdir() if p.is_file()
             and p.name in ('tokenizer.json', 'tokenizer_config.json', 'chat_template.jinja',
                 'generation_config.json', 'special_tokens_map.json', 'preprocessor_config.json',

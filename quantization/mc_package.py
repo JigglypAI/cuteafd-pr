@@ -54,6 +54,29 @@ def quantize_config_for_view(quantization_config, **metadata):
     return dict(metadata, **deepcopy(quantization_config))
 
 
+def gptqmodel_mc_view(config, metadata, *, bits, core_bits=None, module_include):
+    """Package MC storage using GPTQModel's declaration and provenance schema."""
+    config, metadata = deepcopy(config), deepcopy(metadata)
+    previous = config['quantization_config']
+    declaration = dict(quant_method='exl3', format='exl3', checkpoint_format='exl3',
+                       bits=bits, per_module_metadata=previous['per_module_metadata'])
+    if core_bits is not None:
+        declaration['core_bits'] = core_bits
+    config['quantization_config'] = declaration
+    meta = metadata.setdefault('meta', {})
+    meta['source_quantization_config'] = previous
+    for key in ('provenance', 'core_view', 'upstream_activations', 'activation_quantization'):
+        if key in metadata:
+            meta[key] = metadata.pop(key)
+    metadata.pop('format', None)
+    storage = metadata['tensor_storage']
+    metadata.update(method='exl3', codebook='mcg', out_scales='auto', group_size=-1,
+                    desc_act=False, module_include=list(module_include),
+                    lm_head=any(name == 'lm_head' or name.endswith('.lm_head') or name == 'output'
+                                for name in storage))
+    return quantize_config_for_view(declaration, **metadata), config
+
+
 def family_recipe(family):
     """Return the completed numerical selection used by compact encodes."""
     if family == 'glmf':
