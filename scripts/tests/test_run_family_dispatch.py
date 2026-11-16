@@ -5849,3 +5849,14 @@ def test_kimi_draft_weights_and_kv_are_independent(tmp_path, precision, flag, kv
     assert f"--draft-fp8 {flag}" in serve and f"--draft-kv-cache {kv}" in serve
     plans = [line for line in result.stderr.splitlines() if "cuteafd plan" in line and "--resolve-settings-only" not in line]
     assert plans and all(f"--draft-fp8 {flag}" in line for line in plans)
+
+
+def test_kimi_shared_speculation_trace_reaches_coordinator(tmp_path):
+    config = {"model_type":"kimi_k31","text_config":{"model_type":"kimi_linear", "num_hidden_layers":93,
+        "first_k_dense_replace":1,"moe_layer_freq":1}}
+    trace = tmp_path / "speculation.jsonl"
+    result = _family_launch_result(tmp_path, config, "test/kimi",
+        f"SPECULATOR=off\nSPECULATION_TRACE={trace}\nVISION=off\nAUDIO=off\n")
+    assert result.returncode == 0, result.stderr
+    serve = next(line for line in result.stderr.splitlines() if "cuteafd serve-kimi" in line)
+    assert f"CUTEAFD_SPECULATION_TRACE={trace}" in serve
