@@ -243,7 +243,7 @@ impl<'a> BackboneCache<'a> {
         })();
         let (windows, sources) = match reset {
             Ok(reset) => reset,
-            Err(error) => { self.poisoned = true; return Err(error); }
+            Err(error) => { self.poison(&error); return Err(error); }
         };
         let request = self.requests[lease.slot].as_mut().expect("validated prefix request");
         request.windows = windows.try_into().ok().expect("40 windows");
@@ -453,6 +453,43 @@ impl<'a> BackboneCache<'a> {
 mod rollback_tests {
     use super::*;
     use cuteafd_ffi::native_library_lifetime_fixture::Fixture;
+
+    #[test]
+    fn poisoned_backbone_marks_idle_health_unavailable_without_an_admission() -> Result<()> {
+        const CHILD: &str = "CUTEAFD_V41_POISON_HEALTH_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe()?)
+                .args(["--exact", "families::deepseek_v41::v41_backbone_cache::prefix::rollback_tests::poisoned_backbone_marks_idle_health_unavailable_without_an_admission", "--nocapture"])
+                .env(CHILD, "1").status()?;
+            ensure!(status.success(), "isolated poison/health regression failed");
+            return Ok(());
+        }
+        let fixture = Fixture::build_for_tests()?;
+        let lib = fixture.load()?;
+        fixture.immediate_copies(&lib)?;
+        let mut bank = BackboneCache::new(&lib, 1, [4, 4, 4, 8], usize::MAX)?;
+        tokio::runtime::Runtime::new()?.block_on(async {
+            use axum::{body::Body, http::{Request, StatusCode}};
+            use tower::ServiceExt;
+            let (queue, mut receive) = tokio::sync::mpsc::channel(1);
+            let mut profile = cuteafd_api::openai::ModelProfile::default();
+            profile.engine_health = Some(cuteafd_api::openai::health::HealthWitness(
+                std::sync::Arc::new(cuteafd_transport::health::failure_reason)));
+            let app = cuteafd_api::openai::router_for_model(queue, Default::default(),
+                std::sync::Arc::new(std::sync::Mutex::new(serde_json::Value::Null)),
+                std::time::Duration::from_secs(1), cuteafd_api::openai::ConsoleHub::disabled(), profile);
+            let get = || Request::get("/health").body(Body::empty()).unwrap();
+            assert_eq!(app.clone().oneshot(get()).await?.status(), StatusCode::OK);
+            bank.poison(&anyhow::anyhow!("injected prefix reset failure"));
+            let response = app.oneshot(get()).await?;
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            let body = axum::body::to_bytes(response.into_body(), 4096).await?;
+            assert!(String::from_utf8_lossy(&body).contains("injected prefix reset failure"));
+            assert!(receive.try_recv().is_err(), "health must not require another admission");
+            anyhow::Ok(())
+        })?;
+        Ok(())
+    }
 
     #[test]
     fn failed_restore_keeps_lease_and_cold_rebinds_after_partial_layers() -> Result<()> {

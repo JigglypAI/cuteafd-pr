@@ -1042,21 +1042,46 @@ def image_prefix_probe(url, dest):
     for variant, entries, padding in [('even', 120, ''), ('odd', 120, ' x'), ('long', 4096, '')]:
         prefix = f'Run {nonce} {variant}. Reference notes. ' + ' '.join(
             f'Entry {i} is code {i * 7}.' for i in range(entries)) + padding
+        # Count the same image/question template, without generation, to exercise actual
+        # odd/even prompt frontiers rather than guessing from a character's tokenization.
+        desired = 1 if variant == 'odd' else 0
+        for pad in range(16):
+            candidate = prefix + ' x' * pad
+            counted = http(url, '/v1/responses/input_tokens', dict(model=model,
+                input=[dict(role='user', content=[dict(type='input_text', text=candidate),
+                    dict(type='input_image', image_url=image),
+                    dict(type='input_text', text='Is there red in the image? yes/no.')])],
+                reasoning=dict(effort='none')), timeout=120)
+            if counted.get('exact_token_count') is not True:
+                raise ValueError('image-prefix boundary probe requires exact token counts')
+            if counted['input_tokens'] % 2 == desired:
+                prefix, prompt_tokens = candidate, counted['input_tokens']
+                break
+        else:
+            raise ValueError(f'{variant}: could not select an exact prompt frontier parity')
+        save(dest / f'image-prefix-{variant}-boundary.json',
+             dict(input_tokens=prompt_tokens, parity=desired, padding=pad))
         requests = [
             ('text-a', False, 'What is the code of entry 3? Number only.', r'\b21\b'),
             ('text-b', False, 'What is the code of entry 5? Number only.', r'\b35\b'),
             ('image-a', True, 'Which colours are in the image? Brief.', r'(?is)(?=.*\bred\b)(?=.*\bblue\b)'),
             ('image-b', True, 'Is there red in the image? yes/no.', r'\byes\b'),
         ]
-        for label, with_image, question, expected in requests:
+        previous_content = previous_answer = None
+        for label, with_image, question, expected in requests + [('next-turn', True, 'Is there red in the image? yes/no.', r'\byes\b')]:
             content = [dict(type='text', text=prefix)]
             if with_image:
                 content.append(dict(type='image_url', image_url=dict(url=image)))
             content.append(dict(type='text', text=question))
+            messages = [dict(role='user', content=content)]
+            if label == 'next-turn':
+                messages = [dict(role='user', content=previous_content),
+                            dict(role='assistant', content=previous_answer),
+                            dict(role='user', content=question)]
             receipt = dest / f'image-prefix-{variant}-{label}.json'
             try:
                 response = http(url, '/v1/chat/completions', dict(model=model,
-                    messages=[dict(role='user', content=content)], max_tokens=32,
+                    messages=messages, max_tokens=32,
                     reasoning_effort='none', temperature=0, stream=False), timeout=600)
             except Exception as error:
                 save(receipt, dict(error=str(error)))
@@ -1068,6 +1093,8 @@ def image_prefix_probe(url, dest):
             usage = response['usage']
             cached = usage.get('prompt_cache_hit_tokens', 0)
             source = usage.get('prefix_cache_source')
+            if label == 'image-b' and usage['prompt_tokens'] != prompt_tokens:
+                raise ValueError(f'{variant}: count and serving frontiers differ: {usage} != {prompt_tokens}')
             # Exact-only families deliberately miss on divergence, while page/replay
             # families may reuse the common prefix. Both are valid if provenance agrees.
             if label == 'text-a' and (cached != 0 or source != 'miss'):
@@ -1075,6 +1102,10 @@ def image_prefix_probe(url, dest):
             if label != 'text-a' and (source not in {'miss', 'device', 'host'}
                     or (cached > 0) != (source != 'miss')):
                 raise ValueError(f'{variant}/{label}: inconsistent prefix provenance: {usage}')
+            if label == 'next-turn' and not (cached > 0 and source in {'device', 'host'}):
+                raise ValueError(f'{variant}/{label}: exact image ancestor did not hit: {usage}')
+            if label == 'image-b':
+                previous_content, previous_answer = content, answer
             results.append(dict(variant=variant, request=label, answer=answer, cached=cached, source=source))
     return results
 

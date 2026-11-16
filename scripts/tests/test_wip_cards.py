@@ -4063,8 +4063,15 @@ def test_image_prefix_probe_receipts_and_http_failure(tmp_path, monkeypatch, fai
             self.wfile.write(json.dumps({'data': [{'id': 'test'}]}).encode())
         def do_POST(self):
             body = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
+            if self.path == '/v1/responses/input_tokens':
+                prefix = body['input'][0]['content'][0]['text']
+                count = 1201 if ' odd.' in prefix else 1200
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(json.dumps(dict(exact_token_count=True, input_tokens=count)).encode())
+                return
             calls.append(body)
-            index = (len(calls) - 1) % 4
+            index = (len(calls) - 1) % 5
             if fail_fourth and len(calls) == 4:
                 self.send_response(500)
                 self.end_headers()
@@ -4073,8 +4080,10 @@ def test_image_prefix_probe_receipts_and_http_failure(tmp_path, monkeypatch, fai
             self.send_response(200)
             self.end_headers()
             self.wfile.write(json.dumps({'choices': [{'message': {'content':
-                ['21', '35', 'Red and blue.', 'Yes.'][index]}}], 'usage': {
-                'prompt_cache_hit_tokens': 0, 'prefix_cache_source': 'miss'}}).encode())
+                ['21', '35', 'Red and blue.', 'Yes.', 'Yes.'][index]}}], 'usage': {
+                'prompt_tokens': 1201 if ' odd.' in body['messages'][0]['content'][0]['text'] else 1200,
+                'prompt_cache_hit_tokens': 1200 if index == 4 else 0,
+                'prefix_cache_source': 'device' if index == 4 else 'miss'}}).encode())
     server = ThreadingHTTPServer(('127.0.0.1', 0), Server)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -4087,10 +4096,11 @@ def test_image_prefix_probe_receipts_and_http_failure(tmp_path, monkeypatch, fai
             assert 'HTTP 500' in json.loads((tmp_path / 'image-prefix-even-image-b.json').read_text())['error']
             assert len(calls) == 4
         else:
-            assert len(cards.image_prefix_probe(url, tmp_path)) == 12
-            assert len(list(tmp_path.glob('image-prefix-*.json'))) == 12
+            assert len(cards.image_prefix_probe(url, tmp_path)) == 15
+            assert len(list(tmp_path.glob('image-prefix-*.json'))) == 18
             assert calls[0]['messages'][0]['content'][0] == calls[3]['messages'][0]['content'][0]
-            assert len(calls[8]['messages'][0]['content'][0]['text']) > 100_000
+            assert len(calls[10]['messages'][0]['content'][0]['text']) > 100_000
+            assert len(calls[4]['messages']) == 3
     finally:
         server.shutdown()
         server.server_close()

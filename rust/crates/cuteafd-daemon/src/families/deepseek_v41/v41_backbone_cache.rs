@@ -384,6 +384,11 @@ impl<'a> BackboneCache<'a> {
             poisoned: false,
         })
     }
+    fn poison(&mut self, cause: &anyhow::Error) {
+        self.poisoned = true;
+        cuteafd_transport::health::record_failure(format!(
+            "V4.1 backbone cache requires restart after initialization or cleanup failure: {cause:#}"));
+    }
     fn healthy(&self) -> Result<()> {
         ensure!(
             !self.poisoned,
@@ -436,7 +441,7 @@ impl<'a> BackboneCache<'a> {
         if let Err(error) = acquired {
             // A failed device initialization can leave unknown component state.
             // Revoke all acquired leases and require reconstruction of the bank.
-            self.poisoned = true;
+            self.poison(&error);
             for (state, lease) in self.windows.iter_mut().zip(windows) {
                 let _ = state.release(lease);
             }
@@ -744,7 +749,7 @@ impl<'a> BackboneCache<'a> {
             }
         }
         if let Some(e) = first_error {
-            self.poisoned = true;
+            self.poison(&e);
             return Err(e);
         }
         Ok(())

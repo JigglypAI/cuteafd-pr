@@ -866,8 +866,10 @@ fn failed_restore_drain_stops_admission_and_keeps_pages_quarantined() {
     fake.fail_restore.set(true);
     fake.fail_drain.set(true);
     let builds = Cell::new(0);
+    let forked = RefCell::new(Vec::new());
     let result = cache.admit(&fake, &seq(100, 21), 24, false, |pages| {
         builds.set(builds.get() + 1);
+        *forked.borrow_mut() = pages.clone();
         Placement { pages, ring: 1, len: 0, ring_from: 0 }
     });
     assert!(matches!(result, Err(super::cache::PrefixError::Rollback { .. })));
@@ -876,7 +878,7 @@ fn failed_restore_drain_stops_admission_and_keeps_pages_quarantined() {
     assert!(cache.pool().free() < free);
     // A later successful drain does not silently recycle an unknown binding. Restart
     // destroys the cache; until then gauges continue to expose the lost capacity.
-    let quarantined = cache.quarantine.last().unwrap()._pages.clone();
+    let quarantined = forked.into_inner();
     fake.fail_drain.set(false);
     cache.clear(&fake).unwrap();
     assert!(cache.pool().free() < cache.pool().capacity());
