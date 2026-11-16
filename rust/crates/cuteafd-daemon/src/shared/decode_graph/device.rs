@@ -1519,6 +1519,10 @@ impl DeviceCache {
             loop {
                 let Some(id) = self.donor_candidates.get(signature)?.get(lane)?.first else { break };
                 let record = &self.records[&id];
+                if record.spans_devices && cross_device_capture_sealed() {
+                    self.remove_donor_candidate(id);
+                    continue;
+                }
                 let used = record.used();
                 if used == record.last_used { break }
                 self.remove_donor_candidate(id);
