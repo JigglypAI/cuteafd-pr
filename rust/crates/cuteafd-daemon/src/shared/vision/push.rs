@@ -272,8 +272,8 @@ pub(crate) mod tests {
     fn muse_vision_pcm_share_a_checked_group_without_changing_resident_bytes() {
         let root = tempfile::tempdir().unwrap();
         cuteafd_loader::plan::testing::write_muse_media_snapshot(root.path(), &[0]);
-        super::super::constants::assert_original_table(&vision);
         let vision = TowerSpec::muse(root.path(), 4096).unwrap();
+        super::super::constants::assert_original_table(&vision);
         assert_vision_plan(root.path(), &vision);
         let pcm = PcmTowerSpec::from_snapshot(root.path(), 19200).unwrap();
         let records = Contribution::prepare(0, Some((&vision, 4096)),
