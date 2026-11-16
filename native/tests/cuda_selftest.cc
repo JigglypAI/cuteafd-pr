@@ -2643,6 +2643,7 @@ void test_cuda_graph_topology_chain_and_fork() {
       require_cuda(cudaEventRecord(join, peer), "topology join record");
     }
     require_cuda(cudaMemsetAsync(buffer.ptr, 2, sizeof(uint32_t), lead), "topology lead node");
+    require_cuda(cudaMemsetAsync(buffer.ptr, 3, sizeof(uint32_t), lead), "topology third node");
     if (parallel) require_cuda(cudaStreamWaitEvent(lead, join, 0), "topology join wait");
     void* exec = nullptr;
     size_t nodes = 0, width = 0;
@@ -3313,6 +3314,11 @@ int main(int argc, char** argv) {
   }
   if (argc == 2 && std::strcmp(argv[1], "--graph-peer-only") == 0) {
     test_cuda_graph_peer_attribution();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--graph-transfer-only") == 0) {
+    test_cuda_graph_source_transfer_rewrites_all_kernel_pointers();
+    std::cout << "test result: ok. 1 passed; 0 failed\n";
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--graph-update-probe-only") == 0) {
