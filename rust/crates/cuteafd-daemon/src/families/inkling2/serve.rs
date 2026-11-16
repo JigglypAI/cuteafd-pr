@@ -47,6 +47,7 @@ pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
         "Inkling initial serving requires admitted GPU embedding and selection");
     args.prefix.resolve_entries(args.max_sequences);
     let prefill = args.prefill()?;
+    cuteafd_bench::context::ResolvedSettings::prefill(prefill).publish();
     let encoding = ModelEncoding::Inkling(Arc::new(InklingEncoding::from_snapshot(&args.snapshot)?));
     let eos = encoding.eos_token_ids();
     ensure!(eos == [200006], "Inkling native EOS differs");
