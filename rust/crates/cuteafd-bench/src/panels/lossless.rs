@@ -513,7 +513,7 @@ mod tests {
         let context_load = crate::panels::context_load::Options::default();
         let ctx = Ctx { client: &client, info: &info, baseline: None, rates: Rates::default(), progress: &progress,
             pass: 1, history: &[], max_context: 8192, max_output: 4096, lossless_set: Some(set),
-            lossless_dump: dump.map(|(d, _)| d), lossless_concurrency: concurrency, context_load: &context_load };
+            lossless_dump: dump.map(|(d, _)| d), lossless_concurrency: concurrency, context_load: &context_load, panel_config: None };
         run_cases(&ctx, dump).unwrap()
     }
 

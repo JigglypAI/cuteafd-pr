@@ -227,6 +227,7 @@ pub(crate) mod totals {
     static PREFILL: AtomicU64 = AtomicU64::new(0);
     static OUTPUT: AtomicU64 = AtomicU64::new(0);
     static ROUNDS: AtomicU64 = AtomicU64::new(0);
+    static DRAFT_PASSES: AtomicU64 = AtomicU64::new(0);
     static DRAFTED: AtomicU64 = AtomicU64::new(0);
     static VERIFIED: AtomicU64 = AtomicU64::new(0);
     static ACCEPTED: AtomicU64 = AtomicU64::new(0);
@@ -243,7 +244,12 @@ pub(crate) mod totals {
     /// A reply the loop guard aborted.
     pub fn loop_abort() { LOOP_ABORTS.fetch_add(1, Relaxed); }
     pub fn output(tokens: usize) { OUTPUT.fetch_add(tokens as u64, Relaxed); }
-    pub fn round(drafted: u64, verified: u64, accepted: u64, emitted: u64) {
+    /// One verification step per sequence that had a draft, including rejected drafts.
+    pub fn draft_verify_pass(drafted: usize, verified: usize) -> u64 {
+        u64::from(drafted.max(verified) > 0)
+    }
+    pub fn round(drafted: u64, verified: u64, accepted: u64, emitted: u64, draft_passes: u64) {
+        DRAFT_PASSES.fetch_add(draft_passes, Relaxed);
         ROUNDS.fetch_add(1, Relaxed);
         DRAFTED.fetch_add(drafted, Relaxed);
         VERIFIED.fetch_add(verified, Relaxed);
@@ -260,6 +266,7 @@ pub(crate) mod totals {
             "output_tokens": OUTPUT.load(Relaxed),
             "verification_rounds": ROUNDS.load(Relaxed),
             "drafted_tokens": DRAFTED.load(Relaxed),
+            "draft_verify_passes": DRAFT_PASSES.load(Relaxed),
             "verified_drafts": VERIFIED.load(Relaxed),
             "accepted_drafts": ACCEPTED.load(Relaxed),
             "loop_aborts": LOOP_ABORTS.load(Relaxed),
@@ -445,7 +452,7 @@ pub(crate) struct Step {
     live: Option<Live>,
     text: bool,
     requests: Vec<RoundRequest>,
-    tally: [u64; 4],
+    tally: [u64; 5],
 }
 
 impl Step {
@@ -454,7 +461,7 @@ impl Step {
         let live = live();
         if live.is_some() { LAYER_MARKS.with(|marks| *marks.borrow_mut() = Some(Vec::with_capacity(128))); }
         Self { started: Instant::now(), lane: lane as u8, live, text: live.is_some_and(Live::text),
-            requests: Vec::new(), tally: [0; 4] }
+            requests: Vec::new(), tally: [0; 5] }
     }
 
     /// Whether the round event will be built (callers skip extra timing otherwise).
@@ -473,6 +480,7 @@ impl Step {
         self.tally[1] += verified as u64;
         self.tally[2] += accepted as u64;
         self.tally[3] += emitted.len() as u64;
+        self.tally[4] += totals::draft_verify_pass(proposal.len(), verified);
         if self.live.is_none() { return; }
         let byte = |n: usize| n.min(255) as u8;
         self.requests.push(RoundRequest { id: ticket.id, drafted: byte(proposal.len().max(verified)),
@@ -484,8 +492,8 @@ impl Step {
     /// Count the round; with a viewer, send it with the stage times `stages`
     /// returns (microseconds by the layout's stage keys).
     pub fn end(mut self, stages: impl FnOnce() -> Vec<(&'static str, f64)>) {
-        let [drafted, verified, accepted, emitted] = self.tally;
-        totals::round(drafted, verified, accepted, emitted);
+        let [drafted, verified, accepted, emitted, passes] = self.tally;
+        totals::round(drafted, verified, accepted, emitted, passes);
         let Some(live) = self.live else { return };
         let marks = LAYER_MARKS.with(|marks| marks.borrow_mut().take()).unwrap_or_default();
         let stages = stages().into_iter().map(|(key, us)| (key, us as f32)).collect();
@@ -540,7 +548,7 @@ mod tests {
     fn step_counts_members_without_a_viewer() {
         let ticket = Ticket { id: 7, lane: 0, done: true, finished: false, usage: None };
         let mut step = Step { started: Instant::now(), lane: 0, live: None, text: false, requests: Vec::new(),
-            tally: [0; 4] };
+            tally: [0; 5] };
         // 5 drafted, 3 verified, 2 accepted (3 emitted); then a plain decode row.
         step.member(&ticket, &[1, 2, 3, 4, 5], 3, &[1, 2, 9], false, false);
         step.member(&ticket, &[], 0, &[4], true, true);
@@ -633,6 +641,22 @@ mod tests {
         // Unarmed marks are dropped.
         layer_mark(3);
         assert!(LAYER_MARKS.with(|marks| marks.borrow().is_none()));
+    }
+
+    #[test]
+    fn draft_passes_count_sequences_not_batches_or_anchor_only_steps() {
+        assert_eq!(totals::draft_verify_pass(0, 0), 0);
+        assert_eq!(totals::draft_verify_pass(4, 0), 1, "a wholly rejected draft is a pass");
+        assert_eq!(totals::draft_verify_pass(0, 3), 1, "verified rows imply a draft");
+        let ticket = admit(5, 0, 10, false, 0, Instant::now(), None);
+        let mut step = Step::begin(0);
+        step.member(&ticket, &[1, 2], 2, &[3, 4], false, false);
+        step.member(&ticket, &[1], 1, &[3], false, false);
+        step.member(&ticket, &[], 0, &[3], false, true);
+        assert_eq!(step.tally, [3, 3, 1, 4, 2]);
+        let before = totals::snapshot()["draft_verify_passes"].as_u64().unwrap();
+        step.end(Vec::new);
+        assert!(totals::snapshot()["draft_verify_passes"].as_u64().unwrap() >= before + 2);
     }
 
     #[test]

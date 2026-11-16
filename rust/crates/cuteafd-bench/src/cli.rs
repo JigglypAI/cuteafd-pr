@@ -39,6 +39,7 @@ pub struct RunOptions {
     pub context_lengths: Option<Vec<u64>>,
     pub context_levels: Option<Vec<usize>>,
     pub context_suffix: Option<u64>,
+    pub panel_config: crate::panel_config::PanelConfigs,
 }
 
 fn agent() -> ureq::Agent {
@@ -134,6 +135,7 @@ fn check_context_suffix(report: &mut Report, requested: u64) {
 
 /// Starts a run on `options.url`, follows it to the end and writes the exports.
 pub fn run(options: &RunOptions) -> Result<(Report, PathBuf)> {
+    crate::panel_config::validate(&options.panel_config)?;
     let base = options.url.trim_end_matches('/').to_string();
     let agent = agent();
     let mut body = json!({});
@@ -156,6 +158,7 @@ pub fn run(options: &RunOptions) -> Result<(Report, PathBuf)> {
     if let Some(lengths) = &options.context_lengths { body["context_lengths"] = json!(lengths); }
     if let Some(levels) = &options.context_levels { body["context_levels"] = json!(levels); }
     if let Some(suffix) = options.context_suffix { body["context_suffix"] = json!(suffix); }
+    if !options.panel_config.is_empty() { body["panel_config"] = json!(options.panel_config); }
     let response = authorize(agent.post(&format!("{base}/v1/bench/runs")), &options.api_key)
         .send_json(body);
     let id = match response {

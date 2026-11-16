@@ -168,6 +168,8 @@ pub struct Entry {
     pub context_levels: Option<Vec<usize>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_suffix: Option<u64>,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub panel_config: crate::panel_config::PanelConfigs,
 }
 
 /// `open` runs once after the sweep's first warm-up, just before its first
@@ -531,6 +533,8 @@ impl Entry {
             context_lengths: self.context_lengths.clone().or_else(|| defaults.context_lengths.clone()),
             context_levels: self.context_levels.clone().or_else(|| defaults.context_levels.clone()),
             context_suffix: self.context_suffix.or(defaults.context_suffix),
+            panel_config: defaults.panel_config.iter().chain(self.panel_config.iter())
+                .map(|(k, v)| (k.clone(), v.clone())).collect(),
         }
     }
 
@@ -1015,6 +1019,7 @@ pub fn run(args: SmokeArgs) -> Result<()> {
             dump.validate(&set.unwrap_or_else(crate::panels::lossless::CaseSet::default_set))
                 .map_err(|e| anyhow::anyhow!("{}: lossless_dump: {e}", entry.name))?;
         }
+        crate::panel_config::validate(&entry.panel_config)?;
         let defaults = crate::panels::context_load::Options::default();
         crate::panels::context_load::Options {
             lengths: entry.context_lengths.clone().unwrap_or(defaults.lengths),
@@ -1042,6 +1047,7 @@ pub fn run(args: SmokeArgs) -> Result<()> {
     eprintln!("{} entries, {} to run, build {build}, up to {} at once", entries.len(), pending.len(), args.parallel);
     if args.dry_run {
         for e in &pending {
+            if !e.panel_config.is_empty() { eprintln!("  panel_config={}", serde_json::json!(e.panel_config)); }
             eprintln!("  {} api_key_file={} family={} gpus={:?} sparks={:?} locks={:?} levels={:?} post_load_c1={} post_load_repeat={} prefill_lengths={:?} prefill_repeat={} prefill_idle_seconds={} prefill_purge={} sweep_tokens={} baseline={} window={} lossless_set={} lossless_dump={:?} context_lengths={:?} context_levels={:?} context_suffix={} fabric={} worker_stop={} set={:?}",
                 e.name, e.set.get("API_KEY_FILE").map_or("-", String::as_str), e.family.as_deref().unwrap_or("?"), e.gpus, e.sparks, locks_for(e), e.levels,
                 e.post_load_c1.unwrap_or(false), e.post_load_repeat.unwrap_or(false), e.prefill_lengths,
@@ -1615,7 +1621,7 @@ fn run_entry(entry: &Entry, repo: &Path, out_root: &Path, configs: &Path, logs: 
             api_key: api_key.clone(), quiet: true,
             deadline: Some(Duration::from_secs(entry.run_timeout_s.unwrap_or(900))),
             lossless_set: entry.lossless_set.as_ref().map(|p| crate::panels::lossless::CaseSet::load(&repo.join(p)))
-                .transpose()?, lossless_dump: entry.lossless_dump.clone(), lossless_concurrency: entry.lossless_concurrency, context_lengths: entry.context_lengths.clone(), context_levels: entry.context_levels.clone(), context_suffix: entry.context_suffix };
+                .transpose()?, lossless_dump: entry.lossless_dump.clone(), lossless_concurrency: entry.lossless_concurrency, context_lengths: entry.context_lengths.clone(), context_levels: entry.context_levels.clone(), context_suffix: entry.context_suffix, panel_config: entry.panel_config.clone() };
         let (mut report, dir) = crate::cli::run(&options)?;
         // Publication markers are runner metadata, not serving defaults. This
         // also works against images built before these markers existed.
@@ -1879,6 +1885,19 @@ mod tests {
         parent.unlock().unwrap();
         drop(parent);
         assert!(check.try_lock().is_ok());
+    }
+
+    #[test]
+    fn panel_configs_merge_by_panel_and_roundtrip() {
+        let defaults = Entry { panel_config: std::collections::BTreeMap::from([("decode_content".into(),
+            serde_json::json!({"temperature":1.0,"top_p":0.95}))]), ..Entry::default() };
+        assert_eq!(Entry::default().merged(&defaults).panel_config, defaults.panel_config);
+        let own = Entry { panel_config: std::collections::BTreeMap::from([("decode_content".into(),
+            serde_json::json!({"contents":["code"],"temperature":0}))]), ..Entry::default() };
+        assert_eq!(own.merged(&defaults).panel_config, own.panel_config);
+        let encoded = serde_json::to_value(&own).unwrap();
+        assert_eq!(serde_json::from_value::<Entry>(encoded).unwrap(), own);
+        assert!(serde_json::to_value(Entry::default()).unwrap().get("panel_config").is_none());
     }
 
     #[test]

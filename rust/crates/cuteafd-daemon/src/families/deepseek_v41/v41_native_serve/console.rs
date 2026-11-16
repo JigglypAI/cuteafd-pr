@@ -56,7 +56,9 @@ impl Tally {
                 .min(usize::from(tally.emitted[index]).saturating_sub(1)) as u8;
         }
         let sum = |values: &[u8]| values.iter().map(|&v| u64::from(v)).sum::<u64>();
-        totals::round(sum(&tally.drafted), sum(&tally.verified), sum(&tally.accepted), sum(&tally.emitted));
+        let passes = tally.drafted.iter().zip(&tally.verified)
+            .map(|(&drafted, &verified)| totals::draft_verify_pass(drafted.into(), verified.into())).sum();
+        totals::round(sum(&tally.drafted), sum(&tally.verified), sum(&tally.accepted), sum(&tally.emitted), passes);
         if live.is_some_and(Live::text) { tally.emissions = emissions.to_vec(); }
         tally
     }
@@ -201,7 +203,12 @@ mod tests {
         // Two requests: 5 drafted, 4 verified, 2 accepted; and an anchor-only row.
         let inputs = vec![vec![10, 11, 12, 13, 14], vec![20]];
         let proposal = Proposal { drafted: vec![5, 0], tokens: Vec::new() };
+        let before = totals::snapshot()["draft_verify_passes"].as_u64().unwrap();
         let tally = Tally::new(proposal, &inputs, &[3, 1], &[vec![11, 12, 99], vec![21]], None);
+        let passes: u64 = tally.drafted.iter().zip(&tally.verified)
+            .map(|(&d, &v)| totals::draft_verify_pass(d.into(), v.into())).sum();
+        assert_eq!(passes, 1, "anchor-only sequence is not a draft pass");
+        assert!(totals::snapshot()["draft_verify_passes"].as_u64().unwrap() >= before + passes);
         assert_eq!(&tally.verified[..2], &[4, 0]);
         assert_eq!(&tally.accepted[..2], &[2, 0]);
         assert_eq!(&tally.emitted[..2], &[3, 1]);

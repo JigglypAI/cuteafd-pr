@@ -340,17 +340,25 @@ fn fidelity_path(doc: &mut Doc, t: &Theme, x: f64, y0: f64, w: f64, path: &str, 
 fn decode_content(doc: &mut Doc, t: &Theme, v: &Value, w: f64) -> f64 {
     let rows: Vec<(String, f64, &str, String)> = v["rows"].as_array().map(|rows| rows.iter().map(|r| {
         let content = r["content"].as_str().unwrap_or("?").to_string();
-        let note = match num(r, "acceptance") {
+        let mut note = match num(r, "acceptance") {
             Some(a) => format!("{:.0}% accepted", 100.0 * a),
             None => format!("{} tokens", r["tokens"].as_u64().unwrap_or(0)),
         };
+        if let Some(length) = num(r, "acceptance_length") { note.push_str(&format!(" · {length:.2} length")); }
         let color = content_color(t, &content);
         (content, num(r, "tok_s").unwrap_or(0.0), color, note)
     }).collect()).unwrap_or_default();
     if rows.is_empty() {
         return empty(doc, t, "no measurements yet");
     }
-    hbars(doc, t, 0.0, 0.0, w, &rows, "tps")
+    let y = if let Some(settings) = v.get("sampling") {
+        let mut label = format!("temperature {}", settings["temperature"]);
+        if let Some(top_p) = settings.get("top_p") { label.push_str(&format!(" · top_p {top_p}")); }
+        if let Some(seed) = settings.get("seed") { label.push_str(&format!(" · seed {seed}")); }
+        doc.text(0.0, 12.0, Font::new(10.0, t.muted), &super::svg::fit(&label, 10.0, w));
+        24.0
+    } else { 0.0 };
+    y + hbars(doc, t, 0.0, y, w, &rows, "tps")
 }
 
 /// Two groups of bars: the C16 mixed waves (aggregate, with the per-request
