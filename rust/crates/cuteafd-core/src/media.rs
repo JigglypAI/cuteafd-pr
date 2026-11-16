@@ -23,13 +23,19 @@ impl MediaKey {
             Self::Audio(key) => &key.0,
         }
     }
-    pub fn is_audio(self) -> bool { matches!(self, Self::Audio(_)) }
+    pub fn is_audio(self) -> bool {
+        matches!(self, Self::Audio(_))
+    }
 }
 impl From<ImageKey> for MediaKey {
-    fn from(key: ImageKey) -> Self { Self::Image(key) }
+    fn from(key: ImageKey) -> Self {
+        Self::Image(key)
+    }
 }
 impl From<AudioKey> for MediaKey {
-    fn from(key: AudioKey) -> Self { Self::Audio(key) }
+    fn from(key: AudioKey) -> Self {
+        Self::Audio(key)
+    }
 }
 impl std::hash::Hash for MediaKey {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
@@ -54,7 +60,8 @@ impl Serialize for MediaKey {
         match self {
             Self::Image(key) => SerializedMediaKey::Image(*key),
             Self::Audio(key) => SerializedMediaKey::Audio { audio: *key },
-        }.serialize(serializer)
+        }
+        .serialize(serializer)
     }
 }
 impl<'de> Deserialize<'de> for MediaKey {
@@ -77,17 +84,27 @@ pub struct ImagePixels {
 }
 impl ImagePixels {
     pub fn full(width: u32, height: u32) -> Self {
-        Self {source:[width,height],canvas:[width,height],content:[0,0,width,height]}
+        Self {
+            source: [width, height],
+            canvas: [width, height],
+            content: [0, 0, width, height],
+        }
     }
     pub fn valid(self) -> bool {
-        let [width,height] = self.canvas;
-        let [x,y,w,h] = self.content;
-        !self.source.contains(&0) && width>0 && height>0 && w>0 && h>0
-            && x.checked_add(w).is_some_and(|end| end<=width)
-            && y.checked_add(h).is_some_and(|end| end<=height)
-            && u64::from(width)*u64::from(height)<=64<<20
+        let [width, height] = self.canvas;
+        let [x, y, w, h] = self.content;
+        !self.source.contains(&0)
+            && width > 0
+            && height > 0
+            && w > 0
+            && h > 0
+            && x.checked_add(w).is_some_and(|end| end <= width)
+            && y.checked_add(h).is_some_and(|end| end <= height)
+            && u64::from(width) * u64::from(height) <= 64 << 20
     }
-    pub fn padded(self) -> bool { self.content != [0,0,self.canvas[0],self.canvas[1]] }
+    pub fn padded(self) -> bool {
+        self.content != [0, 0, self.canvas[0], self.canvas[1]]
+    }
 }
 
 /// Merge-2 image rows shared by processors, encoders and probe admission.
@@ -97,15 +114,79 @@ pub struct ImageTokenGeometry {
     pub row_markers: u32,
 }
 impl ImageTokenGeometry {
-    pub const MERGED: Self = Self { merge: 2, row_markers: 0 };
-    pub const ROW_MARKERS: Self = Self { merge: 2, row_markers: 1 };
+    pub const MERGED: Self = Self {
+        merge: 2,
+        row_markers: 0,
+    };
+    pub const ROW_MARKERS: Self = Self {
+        merge: 2,
+        row_markers: 1,
+    };
 
     pub fn extent(self, grid: [u32; 3]) -> Option<(usize, usize, usize)> {
         let [t, h, w] = grid;
-        if t != 1 || self.merge == 0 || self.row_markers > 1 || h == 0 || w == 0
-            || h % self.merge != 0 || w % self.merge != 0 { return None; }
+        if t != 1
+            || self.merge == 0
+            || self.row_markers > 1
+            || h == 0
+            || w == 0
+            || h % self.merge != 0
+            || w % self.merge != 0
+        {
+            return None;
+        }
         let (h, w) = ((h / self.merge) as usize, (w / self.merge) as usize);
-        Some((h, w, h.checked_mul(w.checked_add(self.row_markers as usize)?)?))
+        Some((
+            h,
+            w,
+            h.checked_mul(w.checked_add(self.row_markers as usize)?)?,
+        ))
+    }
+}
+
+/// One image owner's declared limits, shared by local and remote admission.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ImageEncodeLimits {
+    pub max_patches: u32,
+    pub max_output_rows: u32,
+    pub max_canvas_pixels: u64,
+    pub geometry: ImageTokenGeometry,
+}
+impl ImageEncodeLimits {
+    pub fn validate(
+        self,
+        grid: [u32; 3],
+        pixels: ImagePixels,
+        rows: u64,
+        bytes: u64,
+    ) -> Result<(), &'static str> {
+        if self.max_patches == 0
+            || self.max_patches > 65536
+            || self.max_output_rows == 0
+            || self.max_output_rows > 16384
+            || self.max_canvas_pixels == 0
+            || self.max_canvas_pixels > 64 << 20
+        {
+            return Err("invalid image owner capacity");
+        }
+        let patches = u64::from(grid[1]) * u64::from(grid[2]);
+        let canvas = u64::from(pixels.canvas[0]) * u64::from(pixels.canvas[1]);
+        let expected = self
+            .geometry
+            .extent(grid)
+            .ok_or("invalid still image patch grid")?
+            .2 as u64;
+        if !pixels.valid()
+            || patches > u64::from(self.max_patches)
+            || rows == 0
+            || rows != expected
+            || rows > u64::from(self.max_output_rows)
+            || canvas > self.max_canvas_pixels
+            || canvas.checked_mul(3) != Some(bytes)
+        {
+            return Err("image source/grid/output exceeds declared capacity");
+        }
+        Ok(())
     }
 }
 
@@ -118,17 +199,25 @@ pub enum AudioTokenGeometry {
     PcmPatches { samples_per_token: usize },
 }
 impl AudioTokenGeometry {
-    pub fn is_mimo(&self) -> bool { *self == Self::MimoRvq }
+    pub fn is_mimo(&self) -> bool {
+        *self == Self::MimoRvq
+    }
     pub fn tokens(self, samples: usize) -> Option<usize> {
-        if samples == 0 || samples > 7_200_000 { return None; }
+        if samples == 0 || samples > 7_200_000 {
+            return None;
+        }
         match self {
             Self::MimoRvq => {
-                if samples <= 480 { return None; }
+                if samples <= 480 {
+                    return None;
+                }
                 let frames = samples / 240 + 1;
                 let codes = (frames / 6000) * 1500 + (frames % 6000).div_ceil(2).div_ceil(2);
                 Some(codes.div_ceil(4))
             }
-            Self::PcmPatches { samples_per_token: 0 } => None,
+            Self::PcmPatches {
+                samples_per_token: 0,
+            } => None,
             Self::PcmPatches { samples_per_token } => Some(samples.div_ceil(samples_per_token)),
         }
     }
@@ -154,12 +243,21 @@ mod tests {
 
     #[test]
     fn image_content_extent_preserves_source_and_rejects_overflow() {
-        let mut pixels = ImagePixels::full(640,480);
-        assert!(pixels.valid());assert!(!pixels.padded());
-        pixels.source=[1234,777];pixels.content=[0,0,639,479];
-        assert!(pixels.valid());assert!(pixels.padded());
-        for content in [[0,0,0,1],[0,0,641,480],[u32::MAX,0,2,1],[0,u32::MAX,1,2]] {
-            pixels.content=content;assert!(!pixels.valid());
+        let mut pixels = ImagePixels::full(640, 480);
+        assert!(pixels.valid());
+        assert!(!pixels.padded());
+        pixels.source = [1234, 777];
+        pixels.content = [0, 0, 639, 479];
+        assert!(pixels.valid());
+        assert!(pixels.padded());
+        for content in [
+            [0, 0, 0, 1],
+            [0, 0, 641, 480],
+            [u32::MAX, 0, 2, 1],
+            [0, u32::MAX, 1, 2],
+        ] {
+            pixels.content = content;
+            assert!(!pixels.valid());
         }
     }
 
@@ -167,10 +265,18 @@ mod tests {
     fn image_geometry_preserves_merged_families_and_row_markers() {
         for h in (2..=110).step_by(2) {
             for w in (2..=110).step_by(2) {
-                assert_eq!(ImageTokenGeometry::MERGED.extent([1, h, w]),
-                    Some(((h / 2) as usize, (w / 2) as usize, (h * w / 4) as usize)));
-                assert_eq!(ImageTokenGeometry::ROW_MARKERS.extent([1, h, w]),
-                    Some(((h / 2) as usize, (w / 2) as usize, (h / 2 * (w / 2 + 1)) as usize)));
+                assert_eq!(
+                    ImageTokenGeometry::MERGED.extent([1, h, w]),
+                    Some(((h / 2) as usize, (w / 2) as usize, (h * w / 4) as usize))
+                );
+                assert_eq!(
+                    ImageTokenGeometry::ROW_MARKERS.extent([1, h, w]),
+                    Some((
+                        (h / 2) as usize,
+                        (w / 2) as usize,
+                        (h / 2 * (w / 2 + 1)) as usize
+                    ))
+                );
             }
         }
         for grid in [[0, 4, 4], [2, 4, 4], [1, 0, 4], [1, 3, 4], [1, 4, 3]] {
@@ -181,12 +287,22 @@ mod tests {
 
     #[test]
     fn audio_patch_geometry_matches_all_stage_stride_boundaries() {
-        let patch = AudioTokenGeometry::PcmPatches { samples_per_token: 16 * 6 * 5 * 4 };
+        let patch = AudioTokenGeometry::PcmPatches {
+            samples_per_token: 16 * 6 * 5 * 4,
+        };
         for samples in [1, 16, 96, 480, 481, 1919, 1920, 1921, 24000, 7_200_000] {
             assert_eq!(patch.tokens(samples), Some(samples.div_ceil(1920)));
         }
-        for invalid in [0, 7_200_001, usize::MAX] { assert_eq!(patch.tokens(invalid), None); }
-        assert_eq!(AudioTokenGeometry::PcmPatches { samples_per_token: 0 }.tokens(1), None);
+        for invalid in [0, 7_200_001, usize::MAX] {
+            assert_eq!(patch.tokens(invalid), None);
+        }
+        assert_eq!(
+            AudioTokenGeometry::PcmPatches {
+                samples_per_token: 0
+            }
+            .tokens(1),
+            None
+        );
         assert_eq!(AudioTokenGeometry::MimoRvq.tokens(480), None);
         assert_eq!(AudioTokenGeometry::MimoRvq.tokens(24000), Some(7));
     }
@@ -208,12 +324,23 @@ mod tests {
         use std::hash::{Hash, Hasher};
         let image = ImageKey([0xab; 32]);
         let audio = MediaKey::Audio(AudioKey(image.0));
-        assert_eq!(serde_json::to_vec(&MediaKey::Image(image)).unwrap(), serde_json::to_vec(&image).unwrap());
-        assert_eq!(serde_json::from_slice::<MediaKey>(&serde_json::to_vec(&audio).unwrap()).unwrap(), audio);
+        assert_eq!(
+            serde_json::to_vec(&MediaKey::Image(image)).unwrap(),
+            serde_json::to_vec(&image).unwrap()
+        );
+        assert_eq!(
+            serde_json::from_slice::<MediaKey>(&serde_json::to_vec(&audio).unwrap()).unwrap(),
+            audio
+        );
         let hash = |value: &dyn Fn(&mut std::collections::hash_map::DefaultHasher)| {
-            let mut h = std::collections::hash_map::DefaultHasher::new(); value(&mut h); h.finish()
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            value(&mut h);
+            h.finish()
         };
-        assert_eq!(hash(&|h| image.hash(h)), hash(&|h| MediaKey::Image(image).hash(h)));
+        assert_eq!(
+            hash(&|h| image.hash(h)),
+            hash(&|h| MediaKey::Image(image).hash(h))
+        );
         assert_ne!(hash(&|h| audio.hash(h)), hash(&|h| image.hash(h)));
     }
 

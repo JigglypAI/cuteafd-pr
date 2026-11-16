@@ -98,9 +98,10 @@ def remote(args):
     results = {"address": args.address, "sm": 121, "samples": {}, "byte_exact": True}
     with socket.create_connection((host, int(port)), timeout=60) as stream:
         stream.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-        header = receive(stream, 88)
-        magic, identity, plan, patches, width, patch, merge = struct.unpack("<8s32s32s4I", header)
-        assert magic == b"CAFDVI01" and plan.hex() == args.plan_hash
+        header = receive(stream, 104)
+        magic, identity, plan, patches, width, patch, merge, markers, max_rows, max_canvas = struct.unpack("<8s32s32s6IQ", header)
+        assert magic == b"CAFDVI03" and plan.hex() == args.plan_hash
+        assert markers == 0 and max_rows >= 4096 and max_canvas >= 16384 * 16 * 16
         assert identity.hex() == args.reference.with_suffix(".id").read_text().strip(), "remote/local EncoderId mismatch"
         assert (patches, patch, merge) == (16384, 16, 2)
         results["encoder_id"] = identity.hex()
@@ -110,7 +111,9 @@ def remote(args):
             for tokens in ((4096, 1024, 256) if repeat % 2 else (256, 1024, 4096)):
                 h, w, rgb = gate.fixture(tokens)
                 key = hashlib.sha256(rgb.tobytes()).digest()
-                request = struct.pack("<I32s3IQQ", 1, key, 1, h, w, tokens, rgb.nbytes)
+                request = struct.pack("<I32s11IQQ", 1, key, 1, h, w,
+                    w * patch, h * patch, w * patch, h * patch, 0, 0, w * patch, h * patch,
+                    tokens, rgb.nbytes)
                 start = time.perf_counter()
                 stream.sendall(request)
                 stream.sendall(rgb.tobytes())

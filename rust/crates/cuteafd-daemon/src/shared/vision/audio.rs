@@ -329,6 +329,7 @@ mod tests {
             .submit(EncodeJob {
                 rgb: Arc::from([]),
                 grid: [0, 0],
+                pixels: None,
                 lut: Arc::new([0.0; 768]),
                 output: vec![],
             })

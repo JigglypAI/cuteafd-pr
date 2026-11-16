@@ -14,11 +14,12 @@ use std::{
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
-const MAGIC: &[u8; 8] = b"CAFDVI01";
-/// Merge-2 towers that also emit marker rows (Mistral's `[IMG_BREAK]`/`[IMG_END]`):
-/// the CAFDVI01 fields plus the marker rows after each merged row.
-const MAGIC_ROW_MARKERS: &[u8; 8] = b"CAFDVI02";
-const MAX_PATCHES: u32 = 16_384;
+// All image descriptors use explicit source/canvas/content metadata. Older
+// peers reject this magic before reading a frame with the new field layout.
+const MAGIC: &[u8; 8] = b"CAFDVI03";
+const MAX_PATCHES: u32 = 65_536;
+const MAX_OUTPUT_ROWS: u32 = 16_384;
+const MAX_CANVAS_PIXELS: u64 = 64 << 20;
 const MAX_WIDTH: u32 = 16_384;
 const MAX_ERROR: usize = 1024;
 type Result<T> = std::result::Result<T, MediaError>;
@@ -30,6 +31,8 @@ fn error(value: impl std::fmt::Display) -> MediaError {
 pub struct EncoderHandshake {
     pub encoder_id: EncoderId,
     pub max_patches: u32,
+    pub max_output_rows: u32,
+    pub max_canvas_pixels: u64,
     pub output_width: u32,
     pub patch_size: u32,
     pub merge_size: u32,
@@ -43,12 +46,17 @@ impl EncoderHandshake {
     fn validate(&self) -> Result<()> {
         if self.max_patches == 0
             || self.max_patches > MAX_PATCHES
+            || self.max_output_rows == 0
+            || self.max_output_rows > MAX_OUTPUT_ROWS
+            || self.max_canvas_pixels == 0
+            || self.max_canvas_pixels > MAX_CANVAS_PIXELS
             || self.output_width == 0
             || self.output_width > MAX_WIDTH
-            || ![14, 16].contains(&self.patch_size)
-            || ![2, 3].contains(&self.merge_size)
+            || ![14, 16, 20].contains(&self.patch_size)
+            || ![2, 3, 4].contains(&self.merge_size)
             || (self.merge_size == 3 && (self.patch_size != 14 || self.output_width != 5120))
-            || self.row_markers > 1 || (self.row_markers == 1 && self.merge_size != 2)
+            || self.row_markers > 1
+            || (self.row_markers == 1 && self.merge_size != 2)
         {
             return Err(error("invalid encoder capacity/geometry"));
         }
@@ -63,6 +71,8 @@ impl EncoderHandshake {
             || self.patch_size != expected.patch_size
             || self.merge_size != expected.merge_size
             || self.row_markers != expected.row_markers
+            || self.max_output_rows < expected.max_output_rows
+            || self.max_canvas_pixels < expected.max_canvas_pixels
             || self.max_patches < expected.max_patches
         {
             return Err(error("vision encoder identity/placement/capacity mismatch"));
@@ -70,8 +80,7 @@ impl EncoderHandshake {
         Ok(())
     }
     fn write(&self, stream: &mut Wire) -> Result<()> {
-        stream.write_all(if self.merge_size == 3 { b"CAFDV401" } else if self.row_markers > 0 { MAGIC_ROW_MARKERS }
-            else { MAGIC }).map_err(error)?;
+        stream.write_all(MAGIC).map_err(error)?;
         stream.write_all(&self.encoder_id.0).map_err(error)?;
         stream.write_all(&self.plan_hash).map_err(error)?;
         for value in [
@@ -82,37 +91,82 @@ impl EncoderHandshake {
         ] {
             put_u32(stream, value)?;
         }
-        if self.row_markers > 0 { put_u32(stream, self.row_markers)?; }
+        put_u32(stream, self.row_markers)?;
+        put_u32(stream, self.max_output_rows)?;
+        put_u64(stream, self.max_canvas_pixels)?;
         Ok(())
     }
     fn tokens(&self, h: u32, w: u32) -> u64 {
-        if self.merge_size == 3 { u64::from(h.div_ceil(3)) * (u64::from(w.div_ceil(3)) + 1) + 2 }
-        else { cuteafd_core::media::ImageTokenGeometry { merge: self.merge_size, row_markers: self.row_markers }
-            .extent([1, h, w]).map_or(0, |(_, _, rows)| rows as u64) }
-    }
-    fn input_bytes(&self, patches: u64) -> u64 {
-        patches.saturating_mul(u64::from(self.patch_size).pow(2)).saturating_mul(3)
-            .saturating_mul(if self.merge_size == 3 { 2 } else { 1 })
-    }
-    fn validate_job(&self, job: &EncodeJob) -> Result<usize> {
-        let ([t, h, w], rgb8) = job.image_input()?;
-        let pixels = job.pixels(self.patch_size)?;
-        if pixels.padded() || pixels.canvas != [w.saturating_mul(self.patch_size),h.saturating_mul(self.patch_size)] {
-            return Err(error("remote encoder does not carry padded source geometry"));
+        if self.merge_size == 3 {
+            u64::from(h.div_ceil(3)) * (u64::from(w.div_ceil(3)) + 1) + 2
+        } else {
+            cuteafd_core::media::ImageTokenGeometry {
+                merge: self.merge_size,
+                row_markers: self.row_markers,
+            }
+            .extent([1, h, w])
+            .map_or(0, |(_, _, rows)| rows as u64)
         }
+    }
+    pub(super) fn image_limits(&self) -> cuteafd_core::media::ImageEncodeLimits {
+        cuteafd_core::media::ImageEncodeLimits {
+            max_patches: self.max_patches,
+            max_output_rows: self.max_output_rows,
+            max_canvas_pixels: self.max_canvas_pixels,
+            geometry: cuteafd_core::media::ImageTokenGeometry {
+                merge: self.merge_size,
+                row_markers: self.row_markers,
+            },
+        }
+    }
+    fn validate_frame(
+        &self,
+        grid: [u32; 3],
+        pixels: cuteafd_core::media::ImagePixels,
+        tokens: u64,
+        bytes: u64,
+    ) -> Result<()> {
+        if self.merge_size != 3 {
+            return self
+                .image_limits()
+                .validate(grid, pixels, tokens, bytes)
+                .map_err(|_| MediaError::Features);
+        }
+        let [t, h, w] = grid;
         let patches = u64::from(h) * u64::from(w);
-        let rgb_bytes = self.input_bytes(patches);
+        let canvas = u64::from(pixels.canvas[0]) * u64::from(pixels.canvas[1]);
+        let payload = canvas
+            .checked_mul(3)
+            .and_then(|n| n.checked_mul(if self.merge_size == 3 { 2 } else { 1 }));
         if t != 1
             || h == 0
             || w == 0
-            || (self.merge_size == 2 && (h % 2 != 0 || w % 2 != 0))
             || patches > u64::from(self.max_patches)
-            || job.tokens as u64 != self.tokens(h, w)
-            || (self.merge_size == 3 && job.tokens > 1024)
-            || job.hidden_width != self.output_width as usize
-            || rgb8.len() as u64 != rgb_bytes
+            || (self.merge_size != 3 && (h % self.merge_size != 0 || w % self.merge_size != 0))
+            || !pixels.valid()
+            || canvas > self.max_canvas_pixels
+            || payload != Some(bytes)
+            || tokens == 0
+            || tokens > u64::from(self.max_output_rows)
+            || tokens != self.tokens(h, w)
         {
-            return Err(error("invalid image grid/RGB8/output geometry"));
+            return Err(MediaError::Features);
+        }
+        Ok(())
+    }
+    fn validate_job(&self, job: &EncodeJob) -> Result<usize> {
+        if self.merge_size != 3 {
+            job.validate()?;
+        }
+        let (grid, rgb8) = job.image_input()?;
+        self.validate_frame(
+            grid,
+            job.pixels(self.patch_size)?,
+            job.tokens as u64,
+            rgb8.len() as u64,
+        )?;
+        if job.hidden_width != self.output_width as usize {
+            return Err(MediaError::Features);
         }
         job.feature_bytes()
     }
@@ -125,7 +179,7 @@ pub struct AudioHandshake {
     pub output_width: u32,
     pub geometry: cuteafd_core::media::AudioTokenGeometry,
 }
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 enum Handshake {
     Image(EncoderHandshake),
     Audio(AudioHandshake),
@@ -146,12 +200,17 @@ impl Handshake {
             Self::Image(value) => value.validate(),
             Self::Audio(value) => {
                 cuteafd_loader::media::audio::AudioGeometry::for_policy(
-                    value.max_samples as usize, value.geometry,
+                    value.max_samples as usize,
+                    value.geometry,
                 )
                 .map_err(error)?;
                 let valid_width = match value.geometry {
-                    cuteafd_core::media::AudioTokenGeometry::MimoRvq => [4096, 6144].contains(&value.output_width),
-                    cuteafd_core::media::AudioTokenGeometry::PcmPatches { samples_per_token: 1920 } => value.output_width == 8192,
+                    cuteafd_core::media::AudioTokenGeometry::MimoRvq => {
+                        [4096, 6144].contains(&value.output_width)
+                    }
+                    cuteafd_core::media::AudioTokenGeometry::PcmPatches {
+                        samples_per_token: 1920,
+                    } => value.output_width == 8192,
                     _ => false,
                 };
                 if !valid_width {
@@ -189,7 +248,9 @@ impl Handshake {
                 stream.write_all(&value.plan_hash).map_err(error)?;
                 let policy = match value.geometry {
                     cuteafd_core::media::AudioTokenGeometry::MimoRvq => 4,
-                    cuteafd_core::media::AudioTokenGeometry::PcmPatches { samples_per_token } => samples_per_token as u32,
+                    cuteafd_core::media::AudioTokenGeometry::PcmPatches { samples_per_token } => {
+                        samples_per_token as u32
+                    }
                 };
                 for n in [value.max_samples, value.output_width, 24000, policy] {
                     put_u32(stream, n)?;
@@ -200,7 +261,7 @@ impl Handshake {
     }
     fn read(stream: &mut Wire) -> Result<Self> {
         let magic = read_array::<8>(stream)?;
-        if &magic != MAGIC && &magic != MAGIC_ROW_MARKERS && &magic != b"CAFDV401" && &magic != b"CAFDAU01" {
+        if &magic != MAGIC && &magic != b"CAFDAU01" {
             return Err(error("unsupported encoder wire version"));
         }
         let encoder_id = EncoderId(read_array(stream)?);
@@ -211,12 +272,10 @@ impl Handshake {
             get_u32(stream)?,
             get_u32(stream)?,
         ];
-        let value = if (&magic == MAGIC && merge == 2) || (&magic == b"CAFDV401" && merge == 3)
-            || (&magic == MAGIC_ROW_MARKERS && merge == 2) {
-            let row_markers = if &magic == MAGIC_ROW_MARKERS { get_u32(stream)? } else { 0 };
-            if &magic == MAGIC_ROW_MARKERS && row_markers == 0 {
-                return Err(error("row-marker wire without marker rows"));
-            }
+        let value = if &magic == MAGIC {
+            let row_markers = get_u32(stream)?;
+            let max_output_rows = get_u32(stream)?;
+            let max_canvas_pixels = get_u64(stream)?;
             Self::Image(EncoderHandshake {
                 encoder_id,
                 plan_hash,
@@ -225,6 +284,8 @@ impl Handshake {
                 patch_size: patch,
                 merge_size: merge,
                 row_markers,
+                max_output_rows,
+                max_canvas_pixels,
             })
         } else if &magic == b"CAFDAU01" && patch == 24000 && [4, 1920].contains(&merge) {
             Self::Audio(AudioHandshake {
@@ -232,8 +293,13 @@ impl Handshake {
                 plan_hash,
                 max_samples: capacity,
                 output_width,
-                geometry: if merge == 4 { cuteafd_core::media::AudioTokenGeometry::MimoRvq }
-                    else { cuteafd_core::media::AudioTokenGeometry::PcmPatches { samples_per_token: merge as usize } },
+                geometry: if merge == 4 {
+                    cuteafd_core::media::AudioTokenGeometry::MimoRvq
+                } else {
+                    cuteafd_core::media::AudioTokenGeometry::PcmPatches {
+                        samples_per_token: merge as usize,
+                    }
+                },
             })
         } else {
             return Err(error("unsupported encoder wire version/geometry"));
@@ -248,8 +314,11 @@ impl Handshake {
                 let cuteafd_engine::media::EncodeInput::Audio { pcm, .. } = &job.input else {
                     return Err(error("audio peer refuses image"));
                 };
-                let geometry = cuteafd_loader::media::audio::AudioGeometry::for_policy(pcm.len(), value.geometry)
-                    .map_err(error)?;
+                let geometry = cuteafd_loader::media::audio::AudioGeometry::for_policy(
+                    pcm.len(),
+                    value.geometry,
+                )
+                .map_err(error)?;
                 if !matches!(&job.input, cuteafd_engine::media::EncodeInput::Audio { geometry, .. } if *geometry == value.geometry)
                     || !job.key.is_audio()
                     || pcm.len() > value.max_samples as usize
@@ -412,6 +481,7 @@ impl RemoteEncoder {
             let failure = failed.clone();
             let health = this.healthy.clone();
             let (queue, jobs) = mpsc::sync_channel::<Work>(128);
+            let expected = expected.clone();
             let owner = thread::Builder::new()
                 .name("remote-vision-owner".into())
                 .spawn(move || {
@@ -435,7 +505,7 @@ impl RemoteEncoder {
                         let result = if failure.load(Ordering::Acquire) {
                             Err(error("vision encoder unavailable"))
                         } else {
-                            exchange(&mut stream, &work.job)
+                            exchange(&mut stream, &work.job, &expected)
                         };
                         if result.is_err() {
                             failure.store(true, Ordering::Release);
@@ -542,7 +612,7 @@ fn ping(s: &mut Wire) -> Result<()> {
     }
     Ok(())
 }
-fn exchange(s: &mut Wire, job: &EncodeJob) -> Result<EncodeOutput> {
+fn exchange(s: &mut Wire, job: &EncodeJob, handshake: &Handshake) -> Result<EncodeOutput> {
     s.frame();
     match &job.input {
         cuteafd_engine::media::EncodeInput::Image { grid, rgb8, .. } => {
@@ -550,6 +620,18 @@ fn exchange(s: &mut Wire, job: &EncodeJob) -> Result<EncodeOutput> {
             s.write_all(job.key.bytes()).map_err(error)?;
             for &n in grid {
                 put_u32(s, n)?;
+            }
+            let Handshake::Image(handshake) = handshake else {
+                return Err(error("image job on audio wire"));
+            };
+            let pixels = job.pixels(handshake.patch_size)?;
+            for value in pixels
+                .source
+                .into_iter()
+                .chain(pixels.canvas)
+                .chain(pixels.content)
+            {
+                put_u32(s, value)?;
             }
             put_u64(s, job.tokens as u64)?;
             put_u64(s, rgb8.len() as u64)?;
@@ -611,10 +693,16 @@ impl EncoderServer {
     ) -> Result<Self> {
         Self::start_shared(address, handshake, Arc::new(service), lut, timeout)
     }
-    pub fn start_shared(address: SocketAddr, handshake: EncoderHandshake, service: Arc<EncoderService>,
-        lut: Arc<[f32; 768]>, timeout: Duration) -> Result<Self> {
+    pub fn start_shared(
+        address: SocketAddr,
+        handshake: EncoderHandshake,
+        service: Arc<EncoderService>,
+        lut: Arc<[f32; 768]>,
+        timeout: Duration,
+    ) -> Result<Self> {
         handshake.validate()?;
         let health = service.clone();
+        let patch_size = handshake.patch_size;
         Self::start_backend(
             address,
             handshake.into(),
@@ -626,6 +714,7 @@ impl EncoderServer {
                     .submit(NativeJob {
                         rgb: rgb8.clone(),
                         grid: [grid[1] as usize, grid[2] as usize],
+                        pixels: Some(job.pixels(patch_size)?),
                         lut: lut.clone(),
                         output: vec![0; job.tokens * job.hidden_width],
                     })
@@ -658,8 +747,12 @@ impl EncoderServer {
     ) -> Result<Self> {
         Self::start_audio_shared(address, handshake, Arc::new(service), timeout)
     }
-    pub fn start_audio_shared(address: SocketAddr, handshake: AudioHandshake, service: Arc<EncoderService>,
-        timeout: Duration) -> Result<Self> {
+    pub fn start_audio_shared(
+        address: SocketAddr,
+        handshake: AudioHandshake,
+        service: Arc<EncoderService>,
+        timeout: Duration,
+    ) -> Result<Self> {
         let health = service.clone();
         Self::start_backend(
             address,
@@ -675,7 +768,11 @@ impl EncoderServer {
                     .submit_audio(super::audio::AudioEncodeJob {
                         pcm: pcm.clone(),
                         output: vec![0; rows],
-                        fp32_scratch: if service.audio_geometry().is_some_and(|g| g.is_mimo()) { vec![0.0; rows] } else { Vec::new() },
+                        fp32_scratch: if service.audio_geometry().is_some_and(|g| g.is_mimo()) {
+                            vec![0.0; rows]
+                        } else {
+                            Vec::new()
+                        },
                     })
                     .map_err(error)?;
                 let output = loop {
@@ -697,11 +794,19 @@ impl EncoderServer {
         )
     }
     /// Family edge backend; transport, heartbeat and bounded frames stay shared.
-    pub fn start_image_backend<F, H>(address: SocketAddr, handshake: EncoderHandshake,
-        timeout: Duration, healthy: H, encode: F) -> Result<Self>
-    where F: FnMut(&EncodeJob) -> Result<EncodeOutput> + Send + 'static,
+    pub fn start_image_backend<F, H>(
+        address: SocketAddr,
+        handshake: EncoderHandshake,
+        timeout: Duration,
+        healthy: H,
+        encode: F,
+    ) -> Result<Self>
+    where
+        F: FnMut(&EncodeJob) -> Result<EncodeOutput> + Send + 'static,
         H: Fn() -> bool + Send + 'static,
-    { Self::start_backend(address, handshake.into(), timeout, healthy, encode) }
+    {
+        Self::start_backend(address, handshake.into(), timeout, healthy, encode)
+    }
 
     fn start_backend<F, H>(
         address: SocketAddr,
@@ -812,31 +917,42 @@ where
             (1, Handshake::Image(handshake)) => {
                 let key: cuteafd_core::MediaKey = ImageKey(read_array(s)?).into();
                 let grid = [get_u32(s)?, get_u32(s)?, get_u32(s)?];
+                let pixels = cuteafd_core::media::ImagePixels {
+                    source: [get_u32(s)?, get_u32(s)?],
+                    canvas: [get_u32(s)?, get_u32(s)?],
+                    content: [get_u32(s)?, get_u32(s)?, get_u32(s)?, get_u32(s)?],
+                };
                 let tokens = get_u64(s)?;
                 let len = get_u64(s)?;
-                let patches = u64::from(grid[1]) * u64::from(grid[2]);
-                if grid[0] != 1
-                    || patches == 0
-                    || patches > u64::from(handshake.max_patches)
-                    || (handshake.merge_size == 2 && (grid[1] % 2 != 0 || grid[2] % 2 != 0))
-                    || tokens != handshake.tokens(grid[1], grid[2])
-                    || (handshake.merge_size == 3 && tokens > 1024)
-                    || len != handshake.input_bytes(patches)
-                {
-                    return Err(error("invalid vision frame before allocation"));
-                }
+                handshake.validate_frame(grid, pixels, tokens, len)?;
                 let mut rgb = vec![0; len as usize];
                 s.read_exact(&mut rgb).map_err(error)?;
-                let job = EncodeJob::image(
+                let mut job = EncodeJob::image_with_pixels(
                     match key {
                         cuteafd_core::MediaKey::Image(key) => key,
                         _ => unreachable!(),
                     },
                     grid,
                     rgb.into(),
+                    pixels,
                     tokens as usize,
                     handshake.output_width as usize,
                 );
+                // V4.1 carries normalized BF16 patch bytes, not an RGB8 canvas.
+                if handshake.merge_size == 3 {
+                    if pixels
+                        != cuteafd_core::media::ImagePixels::full(
+                            grid[2] * handshake.patch_size,
+                            grid[1] * handshake.patch_size,
+                        )
+                    {
+                        return Err(error("V4.1 patch frames cannot carry pixel padding"));
+                    }
+                    if let cuteafd_engine::media::EncodeInput::Image { pixels, .. } = &mut job.input
+                    {
+                        *pixels = None;
+                    }
+                }
                 job
             }
             (2, Handshake::Audio(handshake)) => {
@@ -844,8 +960,11 @@ where
                 let samples = get_u32(s)? as usize;
                 let tokens = get_u64(s)?;
                 let len = get_u64(s)?;
-                let geometry = cuteafd_loader::media::audio::AudioGeometry::for_policy(samples, handshake.geometry)
-                    .map_err(error)?;
+                let geometry = cuteafd_loader::media::audio::AudioGeometry::for_policy(
+                    samples,
+                    handshake.geometry,
+                )
+                .map_err(error)?;
                 if samples > handshake.max_samples as usize
                     || tokens != geometry.tokens as u64
                     || len != samples as u64 * 4
@@ -912,8 +1031,93 @@ mod tests {
     use super::*;
     use cuteafd_engine::media::FakeEncoder;
     #[test]
+    fn source_geometry_roundtrips_and_declared_capacity_is_enforced() {
+        let mut h = handshake();
+        h.max_patches = 65536;
+        h.max_output_rows = 16384;
+        h.max_canvas_pixels = 64 << 20;
+        h.validate().unwrap();
+        let pixels = cuteafd_core::media::ImagePixels {
+            source: [896, 812],
+            canvas: [32, 32],
+            content: [1, 2, 29, 28],
+        };
+        let job = EncodeJob::image_with_pixels(
+            ImageKey([8; 32]),
+            [1, 256, 256],
+            vec![1; 32 * 32 * 3].into(),
+            pixels,
+            16384,
+            4096,
+        );
+        h.validate_job(&job).unwrap();
+        let expected = pixels;
+        let server = EncoderServer::start_image_backend(
+            "127.0.0.1:0".parse().unwrap(),
+            h.clone(),
+            Duration::from_secs(2),
+            || true,
+            move |job| {
+                assert_eq!(job.pixels(16).unwrap(), expected);
+                Ok(EncodeOutput {
+                    key: job.key,
+                    features: vec![0; job.feature_bytes()?].into(),
+                    elapsed_ms: 0.0,
+                })
+            },
+        )
+        .unwrap();
+        // Small explicit row count exercises actual transport without a large feature allocation.
+        let job = EncodeJob::image_with_pixels(
+            ImageKey([8; 32]),
+            [1, 4, 4],
+            vec![1; 32 * 32 * 3].into(),
+            pixels,
+            4,
+            4096,
+        );
+        let mut client =
+            RemoteEncoder::connect(vec![server.address], h.clone(), Duration::from_secs(2))
+                .unwrap();
+        let ticket = client.submit(job).unwrap();
+        let end = Instant::now() + Duration::from_secs(2);
+        loop {
+            if let Some(result) = client.poll(ticket) {
+                result.unwrap();
+                break;
+            }
+            assert!(Instant::now() < end);
+            thread::yield_now();
+        }
+        let mut too_small = h.clone();
+        too_small.max_output_rows = 3;
+        assert!(h.compatible(&too_small).is_ok());
+        assert!(too_small.compatible(&h).is_err());
+        assert!(h.validate_frame([1, 4, 4], pixels, 4, 1).is_err());
+        let mut invalid = pixels;
+        invalid.content = [u32::MAX, 0, 1, 1];
+        assert!(h
+            .validate_frame([1, 4, 4], invalid, 4, 32 * 32 * 3)
+            .is_err());
+        assert!(h.validate_frame([2, 4, 4], pixels, 4, 32 * 32 * 3).is_err());
+    }
+    #[test]
+    fn old_image_wire_versions_fail_before_frame_fields_are_read() {
+        for magic in [b"CAFDVI01", b"CAFDVI02", b"CAFDV401"] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let mut socket = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+            let (peer, _) = listener.accept().unwrap();
+            socket.write_all(magic).unwrap();
+            let mut wire = Wire::new(peer, Duration::from_secs(1)).unwrap();
+            assert!(Handshake::read(&mut wire)
+                .unwrap_err()
+                .to_string()
+                .contains("wire version"));
+        }
+    }
+    #[test]
     fn rgb_wire_handshake_and_payload_remain_identical() {
-        // MiMo/GLM Flash use patch16; Qwen uses patch14. Both retain CAFDVI01.
+        // Every RGB tower uses the same versioned pixel descriptor.
         for patch in [16u32, 14] {
             let mut h = handshake();
             h.patch_size = patch;
@@ -922,39 +1126,84 @@ mod tests {
             let (mut peer, _) = listener.accept().unwrap();
             let mut wire = Wire::new(socket, Duration::from_secs(2)).unwrap();
             h.write(&mut wire).unwrap();
-            let mut actual = vec![0; 88];
+            let mut actual = vec![0; 104];
             peer.read_exact(&mut actual).unwrap();
-            let mut expected = b"CAFDVI01".to_vec();
-            expected.extend_from_slice(&[7;32]); expected.extend_from_slice(&[9;32]);
-            for n in [16384u32, 4096, patch, 2] { expected.extend_from_slice(&n.to_le_bytes()); }
+            let mut expected = b"CAFDVI03".to_vec();
+            expected.extend_from_slice(&[7; 32]);
+            expected.extend_from_slice(&[9; 32]);
+            for n in [16384u32, 4096, patch, 2, 0, 4096] {
+                expected.extend_from_slice(&n.to_le_bytes());
+            }
+            expected.extend_from_slice(&(16384u64 * 16 * 16).to_le_bytes());
             assert_eq!(actual, expected);
-            let job = EncodeJob::image(ImageKey([3;32]), [1,2,2], vec![11; (4*patch*patch*3) as usize].into(), 1, 4096);
+            let job = EncodeJob::image(
+                ImageKey([3; 32]),
+                [1, 2, 2],
+                vec![11; (4 * patch * patch * 3) as usize].into(),
+                1,
+                4096,
+            );
             let mut expected = 1u32.to_le_bytes().to_vec();
-            expected.extend_from_slice(&[3;32]);
-            for n in [1u32,2,2] { expected.extend_from_slice(&n.to_le_bytes()); }
+            expected.extend_from_slice(&[3; 32]);
+            for n in [1u32, 2, 2] {
+                expected.extend_from_slice(&n.to_le_bytes());
+            }
+            for n in [
+                2 * patch,
+                2 * patch,
+                2 * patch,
+                2 * patch,
+                0,
+                0,
+                2 * patch,
+                2 * patch,
+            ] {
+                expected.extend_from_slice(&n.to_le_bytes());
+            }
             expected.extend_from_slice(&1u64.to_le_bytes());
-            expected.extend_from_slice(&(4u64*u64::from(patch).pow(2)*3).to_le_bytes());
-            expected.extend_from_slice(&vec![11; (4*patch*patch*3) as usize]);
+            expected.extend_from_slice(&(4u64 * u64::from(patch).pow(2) * 3).to_le_bytes());
+            expected.extend_from_slice(&vec![11; (4 * patch * patch * 3) as usize]);
             let owner = thread::spawn(move || {
-                let mut actual = vec![0; expected.len()]; peer.read_exact(&mut actual).unwrap(); assert_eq!(actual,expected);
-                peer.write_all(&0u32.to_le_bytes()).unwrap(); peer.write_all(&[3;32]).unwrap();
-                peer.write_all(&0u64.to_le_bytes()).unwrap(); peer.write_all(&8192u64.to_le_bytes()).unwrap();
-                peer.write_all(&vec![0;8192]).unwrap();
+                let mut actual = vec![0; expected.len()];
+                peer.read_exact(&mut actual).unwrap();
+                assert_eq!(actual, expected);
+                peer.write_all(&0u32.to_le_bytes()).unwrap();
+                peer.write_all(&[3; 32]).unwrap();
+                peer.write_all(&0u64.to_le_bytes()).unwrap();
+                peer.write_all(&8192u64.to_le_bytes()).unwrap();
+                peer.write_all(&vec![0; 8192]).unwrap();
             });
-            exchange(&mut wire, &job).unwrap(); owner.join().unwrap();
+            exchange(&mut wire, &job, &Handshake::Image(h)).unwrap();
+            owner.join().unwrap();
         }
     }
     /// Mistral's Pixtral span: (h/2) x (w/2 + 1) rows on its own wire tag; existing towers keep
-    /// CAFDVI01 byte for byte, and a client of the other geometry is refused.
+    /// the common descriptor carries row-marker geometry explicitly.
     #[test]
     fn row_marker_spans_count_their_breaks_on_their_own_wire_tag() {
-        let mut h = handshake(); h.patch_size = 14; h.output_width = 6144; h.max_patches = 12_100; h.row_markers = 1;
+        let mut h = handshake();
+        h.patch_size = 14;
+        h.output_width = 6144;
+        h.max_patches = 12_100;
+        h.row_markers = 1;
         h.validate().unwrap();
         assert_eq!(h.tokens(110, 110), 55 * 56);
         assert_eq!(h.tokens(6, 4), 3 * 3);
-        let job = EncodeJob::image(ImageKey([3; 32]), [1, 6, 4], vec![0; 24 * 588].into(), 9, 6144);
+        let job = EncodeJob::image(
+            ImageKey([3; 32]),
+            [1, 6, 4],
+            vec![0; 24 * 588].into(),
+            9,
+            6144,
+        );
         assert_eq!(h.validate_job(&job).unwrap(), 9 * 6144 * 2);
-        let merged_only = EncodeJob::image(ImageKey([3; 32]), [1, 6, 4], vec![0; 24 * 588].into(), 6, 6144);
+        let merged_only = EncodeJob::image(
+            ImageKey([3; 32]),
+            [1, 6, 4],
+            vec![0; 24 * 588].into(),
+            6,
+            6144,
+        );
         assert!(h.validate_job(&merged_only).is_err());
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let socket = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
@@ -962,37 +1211,87 @@ mod tests {
         let mut writer = Wire::new(socket, Duration::from_secs(2)).unwrap();
         let mut reader = Wire::new(peer, Duration::from_secs(2)).unwrap();
         h.write(&mut writer).unwrap();
-        assert!(matches!(Handshake::read(&mut reader).unwrap(), Handshake::Image(back) if back == h));
+        assert!(
+            matches!(Handshake::read(&mut reader).unwrap(), Handshake::Image(back) if back == h)
+        );
         let plain = handshake();
         plain.write(&mut writer).unwrap();
-        assert!(matches!(Handshake::read(&mut reader).unwrap(), Handshake::Image(back) if back.row_markers == 0));
+        assert!(
+            matches!(Handshake::read(&mut reader).unwrap(), Handshake::Image(back) if back.row_markers == 0)
+        );
         assert!(plain.compatible(&h).is_err() && h.compatible(&plain).is_err());
-        let mut bad = h.clone(); bad.merge_size = 3; bad.output_width = 5120;
+        let mut bad = h.clone();
+        bad.merge_size = 3;
+        bad.output_width = 5120;
         assert!(bad.validate().is_err());
     }
 
     #[test]
     fn v41_bf16_patch_frames_count_complete_spans_and_refuse_1058() {
-        let mut h = handshake(); h.merge_size=3; h.patch_size=14; h.output_width=5120; h.max_patches=9216;
-        let job = EncodeJob::image(ImageKey([1;32]),[1,93,93],vec![0;93*93*588*2].into(),994,5120);
-        assert_eq!(h.validate_job(&job).unwrap(),994*10240);
-        let rejected = EncodeJob::image(ImageKey([1;32]),[1,96,96],vec![0;96*96*588*2].into(),1058,5120);
+        let mut h = handshake();
+        h.max_output_rows = 1024;
+        h.merge_size = 3;
+        h.patch_size = 14;
+        h.output_width = 5120;
+        h.max_patches = 9216;
+        let job = EncodeJob::image(
+            ImageKey([1; 32]),
+            [1, 93, 93],
+            vec![0; 93 * 93 * 588 * 2].into(),
+            994,
+            5120,
+        );
+        assert_eq!(h.validate_job(&job).unwrap(), 994 * 10240);
+        let rejected = EncodeJob::image(
+            ImageKey([1; 32]),
+            [1, 96, 96],
+            vec![0; 96 * 96 * 588 * 2].into(),
+            1058,
+            5120,
+        );
         assert!(h.validate_job(&rejected).is_err());
-        let oversized = EncodeJob::image(ImageKey([2;32]), [1,u32::MAX,u32::MAX], vec![].into(), 1, 5120);
+        let oversized = EncodeJob::image(
+            ImageKey([2; 32]),
+            [1, u32::MAX, u32::MAX],
+            vec![].into(),
+            1,
+            5120,
+        );
         assert!(h.validate_job(&oversized).is_err());
-        let server = EncoderServer::start_image_backend("127.0.0.1:0".parse().unwrap(),h.clone(),Duration::from_secs(2),||true,
-            |job| Ok(EncodeOutput { key:job.key, features:FakeEncoder::features(job)?, elapsed_ms:0.0 })).unwrap();
-        let mut client = RemoteEncoder::connect(vec![server.address],h,Duration::from_secs(2)).unwrap();
+        let server = EncoderServer::start_image_backend(
+            "127.0.0.1:0".parse().unwrap(),
+            h.clone(),
+            Duration::from_secs(2),
+            || true,
+            |job| {
+                Ok(EncodeOutput {
+                    key: job.key,
+                    features: FakeEncoder::features(job)?,
+                    elapsed_ms: 0.0,
+                })
+            },
+        )
+        .unwrap();
+        let mut client =
+            RemoteEncoder::connect(vec![server.address], h, Duration::from_secs(2)).unwrap();
         let expected = FakeEncoder::features(&job).unwrap();
         let ticket = client.submit(job).unwrap();
-        let end = Instant::now()+Duration::from_secs(2);
-        loop { if let Some(result)=client.poll(ticket) { assert_eq!(result.unwrap().features,expected); break; }
-            assert!(Instant::now()<end); thread::sleep(Duration::from_millis(1)); }
+        let end = Instant::now() + Duration::from_secs(2);
+        loop {
+            if let Some(result) = client.poll(ticket) {
+                assert_eq!(result.unwrap().features, expected);
+                break;
+            }
+            assert!(Instant::now() < end);
+            thread::sleep(Duration::from_millis(1));
+        }
     }
     fn handshake() -> EncoderHandshake {
         EncoderHandshake {
             encoder_id: EncoderId([7; 32]),
             max_patches: 16_384,
+            max_output_rows: 4096,
+            max_canvas_pixels: 16_384 * 16 * 16,
             output_width: 4096,
             patch_size: 16,
             merge_size: 2,
@@ -1080,17 +1379,40 @@ mod tests {
     #[test]
     fn pcm_audio_loopback_preserves_policy_and_exact_rows() {
         use cuteafd_core::media::AudioTokenGeometry;
-        let geometry = AudioTokenGeometry::PcmPatches { samples_per_token: 1920 };
-        let handshake = AudioHandshake { geometry, output_width: 8192, ..audio_handshake() };
-        let server = EncoderServer::start_backend("127.0.0.1:0".parse().unwrap(), handshake.clone().into(),
-            Duration::from_secs(2), || true, |job| Ok(EncodeOutput {
-                key: job.key, features: FakeEncoder::features(job)?, elapsed_ms: 1.0,
-            })).unwrap();
-        let mut client = RemoteEncoder::connect_audio(vec![server.address], handshake, Duration::from_secs(2)).unwrap();
+        let geometry = AudioTokenGeometry::PcmPatches {
+            samples_per_token: 1920,
+        };
+        let handshake = AudioHandshake {
+            geometry,
+            output_width: 8192,
+            ..audio_handshake()
+        };
+        let server = EncoderServer::start_backend(
+            "127.0.0.1:0".parse().unwrap(),
+            handshake.clone().into(),
+            Duration::from_secs(2),
+            || true,
+            |job| {
+                Ok(EncodeOutput {
+                    key: job.key,
+                    features: FakeEncoder::features(job)?,
+                    elapsed_ms: 1.0,
+                })
+            },
+        )
+        .unwrap();
+        let mut client =
+            RemoteEncoder::connect_audio(vec![server.address], handshake, Duration::from_secs(2))
+                .unwrap();
         assert!(client.submit(audio_job()).is_err());
         for samples in [1usize, 1919, 1920, 1921, 30721] {
-            let job = EncodeJob::audio_with_geometry(AudioKey([samples as u8; 32]), vec![0.25; samples].into(),
-                samples.div_ceil(1920), 8192, geometry);
+            let job = EncodeJob::audio_with_geometry(
+                AudioKey([samples as u8; 32]),
+                vec![0.25; samples].into(),
+                samples.div_ceil(1920),
+                8192,
+                geometry,
+            );
             let expected = FakeEncoder::features(&job).unwrap();
             let id = client.submit(job).unwrap();
             assert_eq!(wait(&mut client, id).unwrap().features, expected);
@@ -1219,20 +1541,24 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let peer = thread::spawn(move || {
             let (mut socket, _) = listener.accept().unwrap();
-            let mut headers = [0; 88];
+            let mut headers = [0; 104];
             socket.read_exact(&mut headers).unwrap();
-            let mut expected = b"CAFDVI01".to_vec();
+            let mut expected = b"CAFDVI03".to_vec();
             expected.extend([7; 32]);
             expected.extend([9; 32]);
-            for n in [16384u32, 4096, 16, 2] {
+            for n in [16384u32, 4096, 16, 2, 0, 4096] {
                 expected.extend(n.to_le_bytes());
             }
+            expected.extend((16384u64 * 16 * 16).to_le_bytes());
             assert_eq!(headers.as_slice(), expected);
-            let mut frame = vec![0; 64 + 4 * 4 * 768];
+            let mut frame = vec![0; 96 + 4 * 4 * 768];
             socket.read_exact(&mut frame).unwrap();
             let mut expected = 1u32.to_le_bytes().to_vec();
             expected.extend([5; 32]);
             for n in [1u32, 4, 4] {
+                expected.extend(n.to_le_bytes());
+            }
+            for n in [64u32, 64, 64, 64, 0, 0, 64, 64] {
                 expected.extend(n.to_le_bytes());
             }
             expected.extend(4u64.to_le_bytes());
@@ -1248,7 +1574,13 @@ mod tests {
         let mut wire =
             Wire::new(TcpStream::connect(address).unwrap(), Duration::from_secs(2)).unwrap();
         Handshake::Image(handshake()).write(&mut wire).unwrap();
-        assert_eq!(exchange(&mut wire, &job(5)).unwrap().features.len(), 32768);
+        assert_eq!(
+            exchange(&mut wire, &job(5), &Handshake::Image(handshake()))
+                .unwrap()
+                .features
+                .len(),
+            32768
+        );
         peer.join().unwrap();
     }
     #[test]
@@ -1364,7 +1696,9 @@ mod tests {
     #[test]
     fn saturated_owner_queue_is_transient_without_poisoning_health() {
         let server = server();
-        let mut client = RemoteEncoder::connect(vec![server.address], handshake(), Duration::from_secs(1)).unwrap();
+        let mut client =
+            RemoteEncoder::connect(vec![server.address], handshake(), Duration::from_secs(1))
+                .unwrap();
         // Detach a bounded queue from its worker so saturation is deterministic.
         let (queue, receiver) = mpsc::sync_channel(1);
         let original = client.replicas[0].queue.replace(queue);

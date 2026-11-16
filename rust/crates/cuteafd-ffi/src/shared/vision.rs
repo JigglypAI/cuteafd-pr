@@ -1,8 +1,8 @@
 //! Resident ViT owner. Construct, use and drop on its dedicated CUDA thread.
 mod tower;
-pub use tower::{TowerExtension, TowerNorm, TowerProjector};
 use libloading::Library;
 use std::{ffi::c_void, fmt, marker::PhantomData, path::Path, rc::Rc, sync::Arc};
+pub use tower::{TowerExtension, TowerNorm, TowerProjector};
 
 pub const ENCODER_NUMERICS: u32 = 1;
 pub const NO_VISION_OFFSET: u64 = u64::MAX;
@@ -13,9 +13,15 @@ pub const MISTRAL_RESERVED: u32 = 4;
 /// row per merged row for a span-writing tower.
 pub fn output_rows(grid: [usize; 2], span_markers: bool) -> usize {
     let [h, w] = grid;
-    let (Ok(h), Ok(w)) = (u32::try_from(h), u32::try_from(w)) else { return 0; };
-    cuteafd_core::media::ImageTokenGeometry { merge: 2, row_markers: u32::from(span_markers) }
-        .extent([1, h, w]).map_or(0, |(_, _, rows)| rows)
+    let (Ok(h), Ok(w)) = (u32::try_from(h), u32::try_from(w)) else {
+        return 0;
+    };
+    cuteafd_core::media::ImageTokenGeometry {
+        merge: 2,
+        row_markers: u32::from(span_markers),
+    }
+    .extent([1, h, w])
+    .map_or(0, |(_, _, rows)| rows)
 }
 
 #[repr(C)]
@@ -157,7 +163,9 @@ struct VisionSpecView {
 }
 impl std::ops::Deref for VisionSpecView {
     type Target = RawVisionSpec;
-    fn deref(&self) -> &Self::Target { &self.raw }
+    fn deref(&self) -> &Self::Target {
+        &self.raw
+    }
 }
 
 impl VisionSpec {
@@ -176,29 +184,56 @@ impl VisionSpec {
     // Native registration deep-copies every layer before returning.
     fn raw(&self) -> Result<VisionSpecView, VisionError> {
         let depth = self.depth as usize;
-        if depth == 0 || self.blocks.len() != depth
-            || [&self.norm1_bias, &self.norm2_bias, &self.q_norm, &self.k_norm]
-                .iter().any(|v| v.len() != depth) {
-            return Err(VisionError::InvalidInput("vision layer storage/depth mismatch"));
+        if depth == 0
+            || self.blocks.len() != depth
+            || [
+                &self.norm1_bias,
+                &self.norm2_bias,
+                &self.q_norm,
+                &self.k_norm,
+            ]
+            .iter()
+            .any(|v| v.len() != depth)
+        {
+            return Err(VisionError::InvalidInput(
+                "vision layer storage/depth mismatch",
+            ));
         }
-        let perception = self.perception.as_ref().map(|pe| {
-            if pe.scale1.len() != depth || pe.scale2.len() != depth {
-                return Err(VisionError::InvalidInput("vision layer-scale storage/depth mismatch"));
-            }
-            Ok(Box::new(RawPerceptionSpec {
-                activation:pe.activation, position_grid:pe.position_grid,
-                class_token:pe.class_token, output_kind:pe.output_kind,
-                ln_pre:pe.ln_pre, ln_pre_bias:pe.ln_pre_bias,
-                class_embedding:pe.class_embedding, class_position:pe.class_position,
-                downsample1:pe.downsample1, downsample1_bias:pe.downsample1_bias,
-                downsample2:pe.downsample2, downsample2_bias:pe.downsample2_bias,
-                scale1:pe.scale1.as_ptr(), scale2:pe.scale2.as_ptr(),
-            }))
-        }).transpose()?;
-        let tower = self.tower.as_ref().map(|tower| {
-            tower.validate(self)?;
-            Ok::<_, VisionError>(Box::new(*tower))
-        }).transpose()?;
+        let perception = self
+            .perception
+            .as_ref()
+            .map(|pe| {
+                if pe.scale1.len() != depth || pe.scale2.len() != depth {
+                    return Err(VisionError::InvalidInput(
+                        "vision layer-scale storage/depth mismatch",
+                    ));
+                }
+                Ok(Box::new(RawPerceptionSpec {
+                    activation: pe.activation,
+                    position_grid: pe.position_grid,
+                    class_token: pe.class_token,
+                    output_kind: pe.output_kind,
+                    ln_pre: pe.ln_pre,
+                    ln_pre_bias: pe.ln_pre_bias,
+                    class_embedding: pe.class_embedding,
+                    class_position: pe.class_position,
+                    downsample1: pe.downsample1,
+                    downsample1_bias: pe.downsample1_bias,
+                    downsample2: pe.downsample2,
+                    downsample2_bias: pe.downsample2_bias,
+                    scale1: pe.scale1.as_ptr(),
+                    scale2: pe.scale2.as_ptr(),
+                }))
+            })
+            .transpose()?;
+        let tower = self
+            .tower
+            .as_ref()
+            .map(|tower| {
+                tower.validate(self)?;
+                Ok::<_, VisionError>(Box::new(*tower))
+            })
+            .transpose()?;
         let raw = RawVisionSpec {
             storage_abi: 5,
             abi_version: self.abi_version,
@@ -235,10 +270,13 @@ impl VisionSpec {
             perception: perception.as_deref().map_or(std::ptr::null(), |pe| pe),
             tower: tower.as_deref().map_or(std::ptr::null(), |tower| tower),
         };
-        Ok(VisionSpecView { raw, _perception:perception, _tower:tower })
+        Ok(VisionSpecView {
+            raw,
+            _perception: perception,
+            _tower: tower,
+        })
     }
 }
-
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -276,7 +314,10 @@ impl fmt::Display for VisionError {
 }
 impl std::error::Error for VisionError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self { Self::Failure(error) => Some(error.as_ref()), _ => None }
+        match self {
+            Self::Failure(error) => Some(error.as_ref()),
+            _ => None,
+        }
     }
 }
 impl From<libloading::Error> for VisionError {
@@ -285,18 +326,28 @@ impl From<libloading::Error> for VisionError {
     }
 }
 #[cfg(feature = "test-support")]
-pub fn check_for_test(status: i32) -> Result<(), VisionError> { check(status) }
+pub fn check_for_test(status: i32) -> Result<(), VisionError> {
+    check(status)
+}
 fn check(status: i32) -> Result<(), VisionError> {
     if status == 0 {
         crate::memory_ledger::fault::clear_failure();
         Ok(())
     } else {
-        Err(VisionError::Failure(crate::memory_ledger::capture_failure(anyhow::Error::new(VisionError::Native(status)))))
+        Err(VisionError::Failure(crate::memory_ledger::capture_failure(
+            anyhow::Error::new(VisionError::Native(status)),
+        )))
     }
 }
 
 type Required = unsafe extern "C" fn(*const RawVisionSpec, *mut VisionLedger) -> i32;
-type Create = unsafe extern "C" fn(*const RawVisionSpec, i32, u64, *const super::media_backings::RawTags, *mut *mut c_void) -> i32;
+type Create = unsafe extern "C" fn(
+    *const RawVisionSpec,
+    i32,
+    u64,
+    *const super::media_backings::RawTags,
+    *mut *mut c_void,
+) -> i32;
 type Upload = unsafe extern "C" fn(*mut c_void, u64, *const u8, u64) -> i32;
 type Observer = unsafe extern "C" fn(*mut c_void, i32, *const c_void, i32, i32, i32) -> i32;
 type Encode = unsafe extern "C" fn(
@@ -304,6 +355,24 @@ type Encode = unsafe extern "C" fn(
     *const u8,
     u64,
     *const f32,
+    i32,
+    i32,
+    *mut u16,
+    u64,
+    Option<Observer>,
+    *mut c_void,
+) -> i32;
+type EncodePixels = unsafe extern "C" fn(
+    *mut c_void,
+    *const u8,
+    u64,
+    *const f32,
+    i32,
+    i32,
+    i32,
+    i32,
+    i32,
+    i32,
     i32,
     i32,
     *mut u16,
@@ -324,6 +393,8 @@ pub struct NativeVision {
     /// Mistral's Pixtral tower (reserved 4) emits its whole LM span: one
     /// [IMG_BREAK]/[IMG_END] row after each merged row of [IMG] rows.
     span_markers: bool,
+    source_pixels: bool,
+    merge: usize,
     backings: super::media_backings::MediaBackings,
     // CUDA and the BLAS handle never migrate away from their owner thread.
     _thread: PhantomData<Rc<()>>,
@@ -342,15 +413,24 @@ impl NativeVision {
         }
     }
     /// `tags` name the tower's weight arena and scratch arena in the ledger.
-    pub fn prepare(path: &Path, spec: &VisionSpec, device: i32, admitted: u64, tags: crate::memory_ledger::MediaTags)
-        -> Result<Self, VisionError> {
+    pub fn prepare(
+        path: &Path,
+        spec: &VisionSpec,
+        device: i32,
+        admitted: u64,
+        tags: crate::memory_ledger::MediaTags,
+    ) -> Result<Self, VisionError> {
         Self::load_inner(path, spec, device, admitted, None, tags)
     }
     /// Existing admitted arena; the caller retains this owner until external writes drain.
     pub fn weight_arena(&self) -> Result<usize, VisionError> {
         // SAFETY: exact header ABI; the owner is live and confined to this thread.
         unsafe {
-            let get = self._library.get::<unsafe extern "C" fn(*mut c_void, *mut *mut c_void) -> i32>(b"cuteafd_vision_weight_arena")?;
+            let get = self
+                ._library
+                .get::<unsafe extern "C" fn(*mut c_void, *mut *mut c_void) -> i32>(
+                    b"cuteafd_vision_weight_arena",
+                )?;
             let mut arena = std::ptr::null_mut();
             check(get(self.owner, &mut arena))?;
             Ok(arena as usize)
@@ -358,12 +438,25 @@ impl NativeVision {
     }
     pub fn upload_range(&self, offset: u64, bytes: &[u8]) -> Result<(), VisionError> {
         // SAFETY: native checks the range and drains the host upload before return.
-        unsafe { check(self._library.get::<Upload>(b"cuteafd_vision_upload")?(self.owner, offset, bytes.as_ptr(), bytes.len() as u64)) }
+        unsafe {
+            check(self._library.get::<Upload>(b"cuteafd_vision_upload")?(
+                self.owner,
+                offset,
+                bytes.as_ptr(),
+                bytes.len() as u64,
+            ))
+        }
     }
     /// External push streams must already be drained by the group receiver.
     pub fn commit_weights(&mut self) -> Result<(), VisionError> {
         // SAFETY: exact header ABI and live thread-confined owner.
-        unsafe { check(self._library.get::<unsafe extern "C" fn(*mut c_void) -> i32>(b"cuteafd_vision_commit_weights")?(self.owner)) }
+        unsafe {
+            check(self
+                ._library
+                .get::<unsafe extern "C" fn(*mut c_void) -> i32>(
+                    b"cuteafd_vision_commit_weights",
+                )?(self.owner))
+        }
     }
     /// Check admission before native weights, scratch or cuBLAS allocations.
     /// `weights` must be the complete initialized arena described by `spec`.
@@ -377,8 +470,14 @@ impl NativeVision {
     ) -> Result<Self, VisionError> {
         Self::load_inner(path, spec, device, admitted_bytes, Some(weights), tags)
     }
-    fn load_inner(path: &Path, spec: &VisionSpec, device: i32, admitted_bytes: u64, weights: Option<&[u8]>,
-        tags: crate::memory_ledger::MediaTags) -> Result<Self, VisionError> {
+    fn load_inner(
+        path: &Path,
+        spec: &VisionSpec,
+        device: i32,
+        admitted_bytes: u64,
+        weights: Option<&[u8]>,
+        tags: crate::memory_ledger::MediaTags,
+    ) -> Result<Self, VisionError> {
         if weights.is_some_and(|w| w.len() as u64 != spec.weight_bytes) {
             return Err(VisionError::InvalidInput(
                 "vision weight arena length mismatch",
@@ -406,22 +505,57 @@ impl NativeVision {
                 _library: library,
                 max_tokens: spec.max_tokens as usize,
                 output_width: spec.output_width as usize,
-                patch_size: if spec.abi_version == 1 { 16 } else { spec.patch_size as usize },
+                patch_size: if spec.abi_version == 1 {
+                    16
+                } else {
+                    spec.patch_size as usize
+                },
                 span_markers: spec.abi_version == 2 && spec.reserved == MISTRAL_RESERVED,
+                source_pixels: spec.perception.is_some(),
+                merge: if spec
+                    .perception
+                    .as_ref()
+                    .is_some_and(|pe| pe.output_kind == 1)
+                {
+                    4
+                } else {
+                    2
+                },
                 backings: Default::default(),
                 _thread: PhantomData,
             };
-            let native = super::media_backings::NativeTags::new(tags).map_err(VisionError::Native)?;
-            let status = create(&spec.raw()?.raw, device, admitted_bytes, &native.raw(), &mut result.owner);
+            let native =
+                super::media_backings::NativeTags::new(tags).map_err(VisionError::Native)?;
+            let status = create(
+                &spec.raw()?.raw,
+                device,
+                admitted_bytes,
+                &native.raw(),
+                &mut result.owner,
+            );
             // Each backing native still holds is recorded, success or not; on
             // failure Drop destroys the owner and retires what native frees.
-            match super::media_backings::MediaBackings::created(&result._library, "cuteafd_vision", status,
-                result.owner, device, tags) {
+            match super::media_backings::MediaBackings::created(
+                &result._library,
+                "cuteafd_vision",
+                status,
+                result.owner,
+                device,
+                tags,
+            ) {
                 Ok(backings) => result.backings = backings,
-                Err((status, backings)) => { result.backings = backings; return Err(VisionError::Native(status)); }
+                Err((status, backings)) => {
+                    result.backings = backings;
+                    return Err(VisionError::Native(status));
+                }
             }
             if let Some(weights) = weights {
-                check(upload(result.owner, 0, weights.as_ptr(), weights.len() as u64))?;
+                check(upload(
+                    result.owner,
+                    0,
+                    weights.as_ptr(),
+                    weights.len() as u64,
+                ))?;
             }
             Ok(result)
         }
@@ -468,6 +602,63 @@ impl NativeVision {
             )
         })
     }
+    /// Preserve original source dimensions while validating the actual RGB canvas.
+    /// Existing full-canvas towers take their unchanged encode entry point.
+    pub fn encode_pixels_into(
+        &mut self,
+        rgb: &[u8],
+        grid: [usize; 2],
+        pixels: cuteafd_core::media::ImagePixels,
+        parameters: &[f32; 768],
+        output: &mut [u16],
+    ) -> Result<(), VisionError> {
+        validate_pixel_geometry(grid, pixels, self.patch_size, self.source_pixels)?;
+        if !self.source_pixels {
+            return self.encode_into(rgb, grid, parameters, output);
+        }
+        let [h, w] = grid;
+        let rows = (h / self.merge)
+            .checked_mul(w / self.merge)
+            .ok_or(VisionError::InvalidInput("image output rows overflow"))?;
+        if h == 0
+            || w == 0
+            || h % self.merge != 0
+            || w % self.merge != 0
+            || rows > self.max_tokens
+            || rows.checked_mul(self.output_width) != Some(output.len())
+            || u64::from(pixels.canvas[0]) * u64::from(pixels.canvas[1]) * 3 != rgb.len() as u64
+        {
+            return Err(VisionError::InvalidInput(
+                "source/grid/output extent mismatch",
+            ));
+        }
+        let [x, y, width, height] = pixels.content;
+        // SAFETY: validated host buffers remain live through the synchronous
+        // owner call, which drains its stream on success and failure.
+        unsafe {
+            let encode = self
+                ._library
+                .get::<EncodePixels>(b"cuteafd_vision_encode_pixels")?;
+            check(encode(
+                self.owner,
+                rgb.as_ptr(),
+                rgb.len() as u64,
+                parameters.as_ptr(),
+                h as i32,
+                w as i32,
+                pixels.canvas[1] as i32,
+                pixels.canvas[0] as i32,
+                x as i32,
+                y as i32,
+                width as i32,
+                height as i32,
+                output.as_mut_ptr(),
+                std::mem::size_of_val(output) as u64,
+                None,
+                std::ptr::null_mut(),
+            ))
+        }
+    }
     pub fn ledger(&self) -> Result<VisionLedger, VisionError> {
         let mut ledger = VisionLedger::default();
         // SAFETY: exclusive owner is live on this thread; native writes one ledger.
@@ -475,12 +666,46 @@ impl NativeVision {
         Ok(ledger)
     }
 }
+fn validate_pixel_geometry(
+    grid: [usize; 2],
+    pixels: cuteafd_core::media::ImagePixels,
+    patch: usize,
+    source_pixels: bool,
+) -> Result<(), VisionError> {
+    if !pixels.valid()
+        || grid.iter().any(|&side| side > i32::MAX as usize)
+        || pixels
+            .canvas
+            .iter()
+            .chain(pixels.content.iter())
+            .any(|&side| side > i32::MAX as u32)
+    {
+        return Err(VisionError::InvalidInput("invalid source/content geometry"));
+    }
+    let width = grid[1]
+        .checked_mul(patch)
+        .and_then(|side| u32::try_from(side).ok());
+    let height = grid[0]
+        .checked_mul(patch)
+        .and_then(|side| u32::try_from(side).ok());
+    if !source_pixels
+        && (pixels.padded() || Some(pixels.canvas[0]) != width || Some(pixels.canvas[1]) != height)
+    {
+        return Err(VisionError::InvalidInput(
+            "tower does not support source/content geometry",
+        ));
+    }
+    Ok(())
+}
 impl Drop for NativeVision {
     fn drop(&mut self) {
         if !self.owner.is_null() {
             // SAFETY: destroy drains before freeing; library remains loaded.
             // Only backings native reports as freed leave the ledger.
-            let status = unsafe { self.backings.destroy(&self._library, "cuteafd_vision", self.owner) };
+            let status = unsafe {
+                self.backings
+                    .destroy(&self._library, "cuteafd_vision", self.owner)
+            };
             if status != 0 {
                 tracing::error!(status, "vision teardown failed");
             }
@@ -509,28 +734,74 @@ impl crate::NativeLibrary {
 impl EmbeddingInjection<'_> {
     /// Stages host rows into caller-owned scratch before any consumer reuses it.
     /// Indices are checked on the host; all producers/consumers use this stream.
-    pub fn inject_host(&self, features: &[u8], indices: &[u32], feature_scratch: crate::CuteafdDeviceBuffer,
-        index_scratch: crate::CuteafdDeviceBuffer, output: crate::CuteafdDeviceBuffer,
-        rows: usize, width: usize, copies: usize, stream: *mut c_void) -> Result<(), VisionError> {
-        if indices.is_empty() { return Ok(()); }
-        validate_injection(feature_scratch, index_scratch, output, indices.len(), rows, width, copies)?;
+    pub fn inject_host(
+        &self,
+        features: &[u8],
+        indices: &[u32],
+        feature_scratch: crate::CuteafdDeviceBuffer,
+        index_scratch: crate::CuteafdDeviceBuffer,
+        output: crate::CuteafdDeviceBuffer,
+        rows: usize,
+        width: usize,
+        copies: usize,
+        stream: *mut c_void,
+    ) -> Result<(), VisionError> {
+        if indices.is_empty() {
+            return Ok(());
+        }
+        validate_injection(
+            feature_scratch,
+            index_scratch,
+            output,
+            indices.len(),
+            rows,
+            width,
+            copies,
+        )?;
         if features.len() != indices.len() * width * 2
             || indices.iter().any(|&i| i as usize >= rows)
-            || indices.windows(2).any(|pair| pair[0] >= pair[1]) {
+            || indices.windows(2).any(|pair| pair[0] >= pair[1])
+        {
             return Err(VisionError::InvalidInput("host embedding rows/indices"));
         }
         // SAFETY: the caller's stream owns the scratch; drain its previous readers before staging.
         unsafe { self._library.cuda_stream_synchronize(stream) }
             .map_err(|e| VisionError::Runtime(e.to_string()))?;
-        self._library.copy_h2d(crate::CuteafdDeviceBuffer { bytes: features.len(), ..feature_scratch }, features)
+        self._library
+            .copy_h2d(
+                crate::CuteafdDeviceBuffer {
+                    bytes: features.len(),
+                    ..feature_scratch
+                },
+                features,
+            )
             .map_err(|e| VisionError::Runtime(e.to_string()))?;
         let index_bytes: Vec<u8> = indices.iter().flat_map(|i| i.to_le_bytes()).collect();
-        self._library.copy_h2d(crate::CuteafdDeviceBuffer { bytes: index_bytes.len(), ..index_scratch }, &index_bytes)
+        self._library
+            .copy_h2d(
+                crate::CuteafdDeviceBuffer {
+                    bytes: index_bytes.len(),
+                    ..index_scratch
+                },
+                &index_bytes,
+            )
             .map_err(|e| VisionError::Runtime(e.to_string()))?;
         // SAFETY: extents and sorted unique indices validated; scratch/output remain owned by the engine.
-        unsafe { self.launch(feature_scratch, index_scratch, output, indices.len(), rows, width, copies, stream)? };
+        unsafe {
+            self.launch(
+                feature_scratch,
+                index_scratch,
+                output,
+                indices.len(),
+                rows,
+                width,
+                copies,
+                stream,
+            )?
+        };
         // SAFETY: finish reading the temporary index table before its normal producer overwrites it.
-        unsafe { self._library.cuda_stream_synchronize(stream) }.map_err(|e| VisionError::Runtime(e.to_string()))
+        unsafe { self._library.cuda_stream_synchronize(stream) }
+            .map_err(|e| VisionError::Runtime(e.to_string()))
     }
 
     /// # Safety
@@ -606,6 +877,20 @@ fn validate_injection(
 mod tests {
     use super::*;
     #[test]
+    fn legacy_towers_refuse_nontrivial_pixel_geometry_before_native_dispatch() {
+        use cuteafd_core::media::ImagePixels;
+        let mut pixels=ImagePixels::full(64,64);
+        pixels.source=[1234,777];
+        assert!(validate_pixel_geometry([4,4],pixels,16,false).is_ok());
+        pixels.content=[0,0,63,64];
+        assert!(matches!(validate_pixel_geometry([4,4],pixels,16,false),Err(VisionError::InvalidInput(_))));
+        assert!(validate_pixel_geometry([4,4],pixels,16,true).is_ok());
+        pixels=ImagePixels::full(100,80);
+        assert!(validate_pixel_geometry([4,4],pixels,16,false).is_err());
+        pixels.content=[u32::MAX,0,1,1];
+        assert!(validate_pixel_geometry([4,4],pixels,16,true).is_err());
+    }
+    #[test]
     fn injection_rejects_bad_extents_and_devices_before_launch() {
         let buffer = crate::CuteafdDeviceBuffer {
             ptr: 0x1000usize as *mut c_void,
@@ -634,8 +919,11 @@ mod tests {
     #[test]
     fn layer_storage_follows_depth_and_rejects_ragged_views() {
         for depth in [24, 27, 28, 30, 50] {
-            let mut spec = VisionSpec { q_norm: vec![NO_VISION_OFFSET; depth],
-                ..Default::default() }.with_depth(depth);
+            let mut spec = VisionSpec {
+                q_norm: vec![NO_VISION_OFFSET; depth],
+                ..Default::default()
+            }
+            .with_depth(depth);
             spec.blocks[depth - 1].norm1 = 1234;
             let raw = spec.raw().unwrap();
             assert_eq!(raw.depth as usize, depth);
@@ -654,15 +942,30 @@ mod tests {
 
     #[test]
     fn perception_view_owns_extension_and_checks_scale_depth() {
-        let mut spec = VisionSpec { perception:Some(PerceptionSpec {
-            scale1:vec![16;23], scale2:vec![32;23], ..Default::default()
-        }), ..Default::default() }.with_depth(23);
+        let mut spec = VisionSpec {
+            perception: Some(PerceptionSpec {
+                scale1: vec![16; 23],
+                scale2: vec![32; 23],
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+        .with_depth(23);
         let view = spec.raw().unwrap();
         assert_eq!(view.storage_abi, 5);
-        assert_eq!(view.perception, view._perception.as_deref().unwrap() as *const _);
+        assert_eq!(
+            view.perception,
+            view._perception.as_deref().unwrap() as *const _
+        );
         let moved = view;
-        assert_eq!(moved.perception, moved._perception.as_deref().unwrap() as *const _);
-        assert_eq!(moved._perception.as_ref().unwrap().scale1, spec.perception.as_ref().unwrap().scale1.as_ptr());
+        assert_eq!(
+            moved.perception,
+            moved._perception.as_deref().unwrap() as *const _
+        );
+        assert_eq!(
+            moved._perception.as_ref().unwrap().scale1,
+            spec.perception.as_ref().unwrap().scale1.as_ptr()
+        );
         spec.perception.as_mut().unwrap().scale2.pop();
         assert!(spec.raw().is_err());
         let plain = VisionSpec::default().with_depth(47).raw().unwrap();
