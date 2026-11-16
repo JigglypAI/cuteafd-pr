@@ -2111,7 +2111,7 @@ extern "C" cuteafd_status_t cuteafd_cuda_graph_launch(void* cuda_graph_exec, voi
   GraphHandle* counted = nullptr;
   auto target = reinterpret_cast<cudaGraphExec_t>(cuda_graph_exec);
   if (reinterpret_cast<uintptr_t>(cuda_graph_exec) & uintptr_t(1)) {
-    auto* handle = reinterpret_cast<const GraphHandle*>(reinterpret_cast<uintptr_t>(cuda_graph_exec) & ~uintptr_t(1));
+    auto* handle = reinterpret_cast<GraphHandle*>(reinterpret_cast<uintptr_t>(cuda_graph_exec) & ~uintptr_t(1));
     counted = handle;
     target = handle->exec;
     if (!target) return fail(CUTEAFD_STATUS_INVALID_ARGUMENT, "stale transferred graph handle");

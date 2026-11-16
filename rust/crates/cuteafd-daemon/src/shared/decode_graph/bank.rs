@@ -205,6 +205,7 @@ impl<K: Hash + Eq + Clone + std::fmt::Debug, E> GraphBank<K, E> {
             cache.sample_clock();
             if binding.site.cycle != cycle {
                 binding.flush(&mut cache);
+                cache.bank_cycle(binding.bank, cycle);
                 binding.site.cycle = cycle;
             }
         }
