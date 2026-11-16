@@ -825,7 +825,7 @@ mod tests {
             ] {
                 let mut record = template.clone();
                 record.tensor = format!("model.layers.{layer}.self_attn.{leaf}.weight");
-                record.shape = shape;
+                record.shape = shape.to_vec();
                 records.push(record);
             }
         }
