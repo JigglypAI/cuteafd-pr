@@ -8,6 +8,9 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#ifdef NDEBUG
+#undef NDEBUG
+#endif
 #include <cassert>
 #include <cmath>
 #include <chrono>
