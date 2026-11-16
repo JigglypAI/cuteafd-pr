@@ -783,6 +783,18 @@ int cuteafd_copy_d2d_async(struct device_buffer dst, struct device_buffer src,
     return pack_status;
 }
 
+int cuteafd_sm_copy_regions(void *const *destinations, const void *const *sources,
+    const uint64_t *bytes, uint32_t count, void *stream) {
+    if (!immediate_copies || extent_only || !destinations || !sources || !bytes ||
+        !stream || count < 1 || count > 4) return 1;
+    for (uint32_t i = 0; i < count; ++i) {
+        if (!destinations[i] || !sources[i]) return 1;
+        memcpy(destinations[i], sources[i], (size_t)bytes[i]);
+    }
+    event('C');
+    return pack_status;
+}
+
 int cuteafd_copy_peer_async(struct device_buffer dst, struct device_buffer src,
     size_t bytes, void *stream) {
     if (!peer_model || bytes > dst.bytes || bytes > src.bytes || dst.device_id != current_device) return 1;

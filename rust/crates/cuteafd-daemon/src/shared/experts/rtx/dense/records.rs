@@ -260,6 +260,7 @@ impl Finish {
                 let name = format!("inkling2_padded_transpose_{suffix}_r{rows}_c{cols}_p{padded_cols}");
                 let programs = library.programs()?;
                 let program = programs.program(&name, &["source", "output"])?;
+                ensure!(program.spec().scalar_kinds.is_empty(), "padded transpose load program has unexpected runtime scalars");
                 // SAFETY: checked disjoint native storage extents on this GPU;
                 // both final arena views survive the caller's completion drain.
                 unsafe { program.launch(&[source.ptr, output.ptr], &[], stream) }

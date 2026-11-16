@@ -64,6 +64,21 @@ impl UnitLayout {
         Ok(layout)
     }
 
+    /// Exact pinned source schedule for one unit's full layer walk. Each
+    /// segment uploads five i64 row tables and one i32 start table twice per
+    /// layer (attention and MLP lag join). Only global layers upload page IDs.
+    pub fn upload_shape(&self, cfg: &Inkling2Config, members: usize) -> Result<crate::shared::token_table::UploadShape> {
+        ensure!(members > 0 && members <= self.rows, "Inkling upload member count outside unit");
+        let mut shape = crate::shared::token_table::UploadShape::default();
+        let repeats = cfg.layers.checked_mul(2).context("Inkling upload repetitions overflow")?;
+        shape.append(&[self.rows*8, self.rows*8, self.rows*8, self.rows*8, self.rows*8, self.rows*4], repeats)?;
+        shape.fragment(6, repeats.checked_mul(members-1).context("Inkling upload fragments overflow")?)?;
+        shape.append(&[self.buffers["page_table"]], cfg.global_layers().len().checked_mul(2)
+            .and_then(|count| count.checked_mul(members)).context("Inkling page upload repetitions overflow")?)?;
+        shape.append(&[self.rows*4], 1)?;
+        Ok(shape)
+    }
+
     pub fn bytes(&self) -> Result<usize> {
         self.buffers.values().try_fold(0usize, |sum, bytes| sum.checked_add(*bytes).context("Inkling owner sum overflow"))
     }
@@ -222,6 +237,24 @@ mod tests {
     use super::*;
     fn cfg() -> Inkling2Config {
         Inkling2Config::from_hf(&serde_json::from_str(include_str!("fixtures/config.json")).unwrap()).unwrap()
+    }
+    #[test]
+    fn metadata_upload_shape_covers_every_segment_and_physical_source_once() -> Result<()> {
+        let cfg = cfg();
+        let layout = UnitLayout::serving(&cfg, 2752, 1 << 20)?;
+        for members in [1usize, 2, 16] {
+            let shape = layout.upload_shape(&cfg, members)?;
+            let mut expected = crate::shared::token_table::UploadShape::default();
+            expected.append(&[2752*8, 2752*8, 2752*8, 2752*8, 2752*8, 2752*4], cfg.layers*2)?;
+            expected.fragment(6, cfg.layers*2*(members-1))?;
+            expected.append(&[65536], cfg.global_layers().len()*2*members)?;
+            expected.append(&[2752*4], 1)?;
+            assert_eq!(shape, expected);
+            assert!(shape.capacity_bytes()? >= shape.bytes);
+        }
+        assert!(layout.upload_shape(&cfg, 0).is_err());
+        assert!(layout.upload_shape(&cfg, 2753).is_err());
+        Ok(())
     }
     #[test]
     fn unit_metadata_uses_physical_pages_and_resets_only_chunk_local_indices() -> Result<()> {

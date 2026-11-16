@@ -270,6 +270,23 @@ pub fn gather(request: &FactsRequest<'_>) -> Result<InklingInputs, Refused> {
             geometry.chunk_bytes()).unwrap_or(0);
         serving::HostPrefixOwners { quota_bytes: quota, chunk_bytes: geometry.chunk_bytes().min(quota.max(1)) }
     };
+    let push_required = match crate::push_load::namespace(&request.checkpoint.snapshot) {
+        Ok(_) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound && error.raw_os_error().is_none()
+            && request.checkpoint.snapshot.exists() => false,
+        Err(error) => return Err(refused(format!("Inkling checkpoint namespace refused: {error}"),
+            "Restore SparkNest namespace metadata; required push cannot fall back to mount.")),
+    };
+    let push_host = (0..=routed.len()).map(|count| {
+        if !push_required { return Ok(None); }
+        let backings = match &local {
+            LocalPackage::Installed { backings } => backings[count].as_slice(),
+            LocalPackage::Missing(_) if count == 0 => &[],
+            LocalPackage::Missing(_) => return Ok(None),
+        };
+        super::weight_layout::push_host_envelope(&catalog, backings, gpus).map(Some)
+    }).collect::<anyhow::Result<Vec<_>>>().map_err(|error| refused(format!("Inkling push host inventory refused: {error:#}"),
+        "Provide complete native push source/descriptor headers."))?;
     let physical = (0..gpus).map(|gpu| request.coordinator.physical(gpu)).collect::<Vec<_>>();
     let maximum_pool_tokens = crate::placement::PoolPolicy::resolve(&physical, context, request.pool_tokens,
         page_rows).maximum_tokens();
@@ -282,5 +299,5 @@ pub fn gather(request: &FactsRequest<'_>) -> Result<InklingInputs, Refused> {
         head: request.head, host_prefix, device_sampling: true,
         expert_usage: request.expert_usage.then(|| cuteafd_core::expert_usage::Geometry { layers: cfg.layers,
             experts: cfg.experts, topk: cfg.topk, routed_layers: routed }),
-        resident_weight_limit: Some(request.resident_weight_limit), mount })
+        resident_weight_limit: Some(request.resident_weight_limit), mount, push_host })
 }

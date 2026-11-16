@@ -243,6 +243,7 @@ def draft_bf16_shapes():
     families = {
         "dspark-qwen": (5120, 40, 8, 128, 10240, 5),
         "dspark-kimi": (7168, 64, 16, 64, 14336, 5),
+        "dspark-kimi-k31": (7168, 96, 16, 64, 14336, 5),
         "dflash2-glm": (6144, 64, 8, 128, 12288, 6),
         "dflash2-glmf": (4096, 32, 8, 128, 12288, 5),
         "dflash-qwen27": (5120, 32, 8, 128, 17408, 5),
@@ -254,7 +255,7 @@ def draft_bf16_shapes():
         "dflash2-muse-nvidia": (8192, 128, 16, 64, 24576, 5),
     }
     for family in ("dflash-mimo-pro", "dflash-mimo-flash", "dflash2-glmf",
-                   "dflash2-muse-radix", "dflash2-muse-nvidia"):
+                   "dflash2-muse-radix", "dflash2-muse-nvidia", "dspark-kimi-k31"):
         h, heads, kv, d, inter, taps = families[family]
         families[f"{family}-tp2"] = (h, heads // 2, kv // 2, d, inter // 2, taps)
     result = {}

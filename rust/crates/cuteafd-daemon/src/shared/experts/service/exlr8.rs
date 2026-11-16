@@ -12,13 +12,6 @@ const K1_ROWS: usize = cuteafd_core::expert_geometry::EXLR8_EXECUTION_ROWS;
 
 const PREFILL_ROWS: usize = 4096;
 
-// Temporary #2282 guard until the corrected EXLR8 segmented launch is pinned.
-const SEGMENTED_GROUP_BLOCK: u32 = 256;
-
-fn merge_unit_limit(experts: u32) -> u32 {
-    if experts > SEGMENTED_GROUP_BLOCK { 1 } else { cuteafd_core::spark_executions::MAX_MERGED_UNITS }
-}
-
 fn chunks(rows: usize) -> impl Iterator<Item = (usize, usize)> {
     let capacity = if rows <= K1_ROWS { K1_ROWS } else { PREFILL_ROWS };
     (0..rows).step_by(capacity).map(move |first| (first, (rows - first).min(capacity)))
@@ -209,18 +202,17 @@ impl<'w, 'a> Worker<'w, 'a> {
     }
     pub(super) fn prepare_waves(&mut self, extent: cuteafd_core::OwnerExtent) -> Result<()> {
         let geometry = cuteafd_core::expert_geometry();
-        let max_units = merge_unit_limit(geometry.experts);
         let row = geometry.hidden * 33 / 32;
         let layout = cuteafd_loader::serving_capacity::spark_waves::staging_for_input(extent, geometry, row)?;
         if layout.rows == 0 { return Ok(()); }
-        if let Some(rows) = extent.segment_rows().filter(|_| max_units > 1 && extent.staging_rows > K1_ROWS as u32) {
+        if let Some(rows) = extent.segment_rows().filter(|_| extent.staging_rows > K1_ROWS as u32) {
             self.segments = Some(Exlr8Execution::new_segments(self.library, self.programs, self.family,
                 rows as usize, usize::MAX, self.unit_limit, self.activations)?);
         }
         let plane = crate::shared::memory::DeviceAllocation::new(self.library, layout.plane_bytes.try_into()?,
             crate::shared::memory::Tag::workspace("experts/workspace/staged_units"))?;
-        self.waves = super::super::execution::waves::WaveStaging::with_max_units(self.library, extent,
-            plane.buffer, row as usize, 1, max_units)?;
+        self.waves = super::super::execution::waves::WaveStaging::new(self.library, extent,
+            plane.buffer, row as usize, 1)?;
         self.staged_plane = Some(plane);
         self.timing_units = std::collections::VecDeque::with_capacity(extent.buffered_units as usize);
         Ok(())
@@ -524,19 +516,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn segmented_launch_domain_bypasses_wide_exlr8_experts_only() {
-        use cuteafd_core::ExpertGeometry;
-        assert_eq!(merge_unit_limit(ExpertGeometry::GLM5_FLASH.experts), 1);
-        assert_eq!(merge_unit_limit(257), 1);
-        assert_eq!(merge_unit_limit(512), 1);
-        assert_eq!(merge_unit_limit(ExpertGeometry::GLM5.experts),
-            cuteafd_core::spark_executions::MAX_MERGED_UNITS);
+    fn glmf_exlr8_segments_merge_again_with_expert_domain_launch() -> Result<()> {
+        use cuteafd_core::{ExecutionOwner, ExpertGeometry, OwnerExtent};
+        let extent = OwnerExtent { owner: ExecutionOwner::Prefill, capacity: 2752,
+            compiled: 4096, staging_rows: 2752, buffered_units: 3 };
+        for geometry in [ExpertGeometry::GLM5_FLASH, ExpertGeometry::GLM5] {
+            let layout = cuteafd_loader::serving_capacity::spark_waves::staging(extent, geometry)?;
+            assert_eq!(layout.rows, 5504);
+            assert_eq!(extent.segment_rows(), Some(layout.rows));
+        }
         let source = include_str!("exlr8.rs").split("#[cfg(test)]").next().unwrap();
-        assert!(source.contains("max_units > 1 && extent.staging_rows > K1_ROWS as u32"));
-        assert!(source.contains("plane.buffer, row as usize, 1, max_units"));
-        let native = include_str!("../fp8/worker.rs");
-        assert!(native.contains("WaveStaging::new(self.library, extent, plane, row, minimum)"),
-            "native V4.1 wave merging does not inherit the EXLR8-only guard");
+        assert!(source.contains("extent.segment_rows().filter(|_| extent.staging_rows > K1_ROWS as u32)"));
+        assert!(source.contains("WaveStaging::new(self.library, extent,\n            plane.buffer, row as usize, 1)"));
+        Ok(())
     }
 
     #[test]

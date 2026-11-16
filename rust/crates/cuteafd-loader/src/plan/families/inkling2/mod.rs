@@ -479,6 +479,7 @@ impl FamilyModel for Model {
         })
     }
     fn contract_admission(&self) -> bool { true }
+    fn native_serving_admission(&self) -> bool { true }
     fn placement(&self, input: &crate::plan::PlanInput, report: &mut crate::plan::PlanReport,
         options: &mut crate::plan::layout::LayoutOptions, requested: crate::plan::ExpertPlacement)
         -> Option<anyhow::Result<cuteafd_core::memory_layout::MemoryLayout>> {

@@ -12,6 +12,53 @@ use crate::formats::{dense_trellis::TrellisSide,
     trellis_core::{CoreContract, CoreSplit, CoreWeightLayout}};
 use std::collections::BTreeMap;
 
+/// Header-only shared push receive owners for one onboarding candidate.
+/// Dense core sources land unchanged; the relative transpose writes its final
+/// generated device view without any additional host staging.
+pub fn push_host_envelope(catalog: &crate::OfficialV41Catalog,
+    backings: &[crate::placement::families::inkling2::LocalBacking], gpus: usize)
+    -> Result<crate::push_load::PushHostEnvelope> {
+    use crate::formats::fp8_experts::{ExpertFormat, Fp8Projection, Slicing};
+    ensure!(matches!(gpus, 1 | 2), "Inkling push rank geometry");
+    let mut scratch = vec![0u64; gpus];
+    for backing in backings {
+        ensure!(backing.gpu < gpus, "Inkling push backend rank outside coordinator world");
+        let bytes = if let Some(tensors) = catalog.fp8() {
+            let mut peak = 0usize;
+            for &layer in &backing.layers {
+                let view = tensors.for_coordinator().for_layer_metadata(layer)?;
+                let mut scalars = Vec::new();
+                let mut expand = Vec::new();
+                for projection in Fp8Projection::ALL {
+                    let (_, grid) = view.slice_bytes_with(projection, gpus, backing.gpu, Slicing::Blocks(128))?;
+                    if view.format() == ExpertFormat::Nvfp4 {
+                        scalars.push(view.scale_region_bytes_with(projection, gpus, backing.gpu, Slicing::Blocks(128))?
+                            .checked_sub(view.shape().experts.checked_mul(grid).context("Inkling push scale extent")?)
+                            .context("Inkling push scalar region precedes scale grid")?);
+                    }
+                    let [_, image] = view.projection_slices(projection, gpus, backing.gpu, Slicing::Blocks(128))?;
+                    if image.rows > 0 && image.width > 0 && image.width < image.destination_pitch {
+                        expand.push((image.width, image.destination_pitch));
+                    }
+                }
+                peak = peak.max(crate::push_load::fp8_host_scratch([], scalars, None, expand)?);
+            }
+            peak as u64
+        } else {
+            let exl3 = catalog.exl3().context("Inkling push requires a native or EXL3 catalog")?;
+            backing.layers.iter().try_fold(0u64, |bytes, &layer| {
+                let residency = exl3.residency(crate::V41Exl3Layer::Backbone(layer), gpus, backing.gpu)?;
+                let markers = residency.loads.iter().filter(|load| load.tensor.ends_with(".trellis")).count() as u64;
+                bytes.checked_add(markers.checked_mul(4).context("Inkling push MCG extent")?)
+                    .context("Inkling push MCG owner overflow")
+            })?
+        };
+        scratch[backing.gpu] = scratch[backing.gpu].checked_add(bytes).context("Inkling push group host overflow")?;
+    }
+    Ok(crate::push_load::PushHostEnvelope::new(scratch, vec![0; gpus],
+        cuteafd_ffi::push_ring::DEFAULT_SLOTS as u64, cuteafd_ffi::push_ring::DEFAULT_SLOT_BYTES as u64)?)
+}
+
 /// A target core's immutable views. Expert onboarding, media and the bundled
 /// drafter are independently retired scopes and must not be added here.
 #[derive(Debug, Clone, PartialEq, Eq)]
