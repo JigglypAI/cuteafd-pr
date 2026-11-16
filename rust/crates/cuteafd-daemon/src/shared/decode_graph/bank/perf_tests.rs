@@ -25,8 +25,8 @@ fn cache_hot_paths_nanoseconds() {
         let banks = fixture(-39000 - threads as i32);
         let chunks = banks.len() / threads;
         let barrier = Arc::new(Barrier::new(threads));
+        let mut banks = banks;
         std::thread::scope(|scope| {
-            let mut banks = banks;
             for (worker, banks) in banks.chunks_mut(chunks).enumerate() {
                 let barrier = barrier.clone();
                 scope.spawn(move || {
