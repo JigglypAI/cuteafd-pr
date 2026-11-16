@@ -75,6 +75,35 @@ def test_two_target_counts():
     assert compare_sm.parse_sms("188,170") == (188, 170)
 
 
+@pytest.mark.parametrize("role,capability", [("coordinator", (12, 0)), ("spark", (12, 1))])
+@pytest.mark.parametrize("group", ["native-experts", "exlr8", "exlr8-glmf"])
+def test_segment_groups_follow_comparison_role(group, role, capability):
+    _, exporter, extra = next(job for job in compare_sm.jobs("all") if job[0] == group)
+    args = compare_sm.comparison_job_args(exporter, extra, role)
+    assert exporter == "export_b12x_dsv4_aot.py"
+    if group == "native-experts":
+        assert args == ["--geometry", "native_experts"]
+    else:
+        assert args[-2:] == ["--exlr8-role", role]
+    assert compare_sm.worker_capability({"exporter": exporter, "args": args, "role": role}) == capability
+
+
+@pytest.mark.parametrize("exporter,args", [
+    ("export_b12x_slices_aot.py", ["--role", "spark_w384"]),
+    ("package_exl3_aot.py", ["--role", "spark"]),
+    ("package_exl3_aot.py", ["--compact-companions"]),
+    ("package_fp8_moe_aot.py", ["--role", "spark"]),
+])
+def test_existing_spark_workers_keep_sm121(exporter, args):
+    assert compare_sm.worker_capability({"exporter": exporter, "args": args}) == (12, 1)
+
+
+def test_comparison_role_does_not_retarget_reply_or_backbone():
+    for geometry in ("expert_reply", "flash", "inkling2"):
+        payload = {"exporter": "export_b12x_dsv4_aot.py", "args": ["--geometry", geometry], "role": "spark"}
+        assert compare_sm.worker_capability(payload) == (12, 0)
+
+
 @pytest.mark.parametrize("scope", ["all", "suspects"])
 @pytest.mark.parametrize("geometry,names", [
     ("flash", "index_topk_prefill_m4096"),
