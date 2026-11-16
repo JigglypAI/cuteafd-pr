@@ -9,6 +9,7 @@ pub(crate) mod recurrent_step;
 pub(crate) mod recurrent_cache;
 pub(crate) mod recurrent_tp2;
 pub(crate) mod recurrent_snapshots;
+pub(crate) mod recurrent_pages;
 pub(crate) mod recurrent;
 #[cfg(test)]
 pub(crate) mod recurrent_oracle;
