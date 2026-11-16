@@ -1280,7 +1280,13 @@ impl DeviceCache {
 
     pub(super) fn source_capture_failed(&mut self, id: u64) {
         if let Some(request) = self.update_requests.remove(&id) {
-            self.counters.entry(request.site.cycle).or_default().misses += 1;
+            // End/begin failures precede any update. Settle through the ordinary
+            // miss accounting, without retaining a source-only reservation.
+            self.native_graphs.remove(&id);
+            let counters = self.counters.entry(request.site.cycle).or_default();
+            counters.misses += 1;
+            counters.eager_runs += 1;
+            counters.eager_other += 1;
         }
     }
 
