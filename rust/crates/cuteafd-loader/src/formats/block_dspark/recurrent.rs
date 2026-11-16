@@ -1,5 +1,8 @@
 //! Recurrent-hidden block drafters: explicit context mixtures and head-parallel
 //! operands, separate from the vanilla head's feature projector/confidence head.
+pub mod loading;
+pub mod runtime;
+
 use anyhow::{ensure, Context, Result};
 use serde_json::Value;
 use std::{collections::BTreeMap, ops::Range};
