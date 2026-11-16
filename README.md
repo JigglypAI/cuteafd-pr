@@ -237,9 +237,9 @@ concurrency point is that limit.
 <td width="27%" valign="top">pending<br><sub>Multi-RTX Inkling serving is not qualified (#1930).</sub></td>
 </tr>
 <tr>
-<td width="19%" valign="top"><a href="docs/models/inkling2.md"><b>inkling2</b></a><br><sub>wrldsuksgo2mars/Inkling-2-Small-EXL3-K4-MC</sub><br><sub></sub></td>
+<td width="19%" valign="top"><a href="docs/models/inkling2.md"><b>inkling2</b></a><br><sub>wrldsuksgo2mars/Inkling-2-Small-EXL3-K4-MC</sub><br><sub>exl3-k4</sub></td>
 <td width="27%" valign="top">pending<br><sub>Not measured; four-Spark RTX PRO 6000 qualification first.</sub></td>
-<td width="27%" valign="top">pending<br><sub>1 RTX + 4 Sparks serving/fidelity and Release smoke qualification pending (#1930).</sub></td>
+<td width="27%" valign="top"><a href="benchmarks/inkling2/2026-11-16-smoke-inkling-2-small-exl3-k4-mc-1rtx-4spark-inkling2-exl3-min-cand-r1/card.svg"><img src="benchmarks/inkling2/2026-11-16-smoke-inkling-2-small-exl3-k4-mc-1rtx-4spark-inkling2-exl3-min-cand-r1/card.svg" alt="wrldsuksgo2mars/Inkling-2-Small-EXL3-K4-MC on 1× RTX PRO 6000 @ gpu-powerd 425 W (425–450) + 4× DGX Spark"></a><br><sub>1× RTX + 4× Spark</sub></td>
 <td width="27%" valign="top">pending<br><sub>Multi-RTX Inkling serving is not qualified (#1930).</sub></td>
 </tr>
 </table>
