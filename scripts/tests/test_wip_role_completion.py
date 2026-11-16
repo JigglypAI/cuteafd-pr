@@ -242,7 +242,7 @@ def test_v41_only_scope_preserves_native_segment_program_manifest(tmp_path, role
     spec = importlib.util.spec_from_file_location('v41_scopes', ROOT / 'scripts/lib/wip_aot_scopes.py')
     scopes = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(scopes)
-    card = dict(family='deepseek_v41', set=dict(MODEL_ID='deepseek-ai/DeepSeek-V4.1-Flash-1017',
+    card = dict(config='fixture', family='deepseek_v41', set=dict(MODEL_ID='deepseek-ai/DeepSeek-V4.1-Flash-1017',
         EXPERT_FORMAT='native', SPARK_COUNT='4'))
     derived = scopes.family_scopes([card], lambda _: {})
     assert derived['CUTEAFD_WIP_V41_AOT'] == 'ON'
