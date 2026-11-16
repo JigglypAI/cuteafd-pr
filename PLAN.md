@@ -23,7 +23,9 @@ uv venv --python 3.12 "$TASK/venv"
 uv pip sync --python "$TASK/venv/bin/python" scripts/dev/gate-requirements.txt
 uv pip install --python "$TASK/venv/bin/python" 'torch==2.15.0+cpu' \
   --index-url https://download.pytorch.org/whl/cpu
-uv pip install --python "$TASK/venv/bin/python" ./third_party/transformers
+mkdir -p "$TASK/transformers"
+git -C third_party/transformers archive HEAD | tar -x -C "$TASK/transformers"
+uv pip install --python "$TASK/venv/bin/python" "$TASK/transformers"
 uv pip install --python "$TASK/venv/bin/python" 'huggingface-hub==1.33.0' \
   'accelerate==1.15.0' 'pypcre==0.6.6' 'psutil==7.2.2' 'xxhash==4.1.0' \
   'tokenicer==0.0.14' 'logbar==0.4.16' 'defuser==0.0.31' 'datasets==5.2.0' \
@@ -37,9 +39,11 @@ CUDA_VISIBLE_DEVICES='' OMP_NUM_THREADS=2 HF_HOME=/mnt/sparknest/hf-home \
 ```
 
 Launch long setup/test commands as background systemd user units with logs and
-exit receipts. Install Transformers non-editably: editable installs leave
-`src/transformers.egg-info` in the pinned source tree and invalidate its content
-lock. The test command still imports that pinned source through `PYTHONPATH`.
+exit receipts. Build the non-editable Transformers wheel from the task-owned
+archive, never from the locked submodule: both editable installs and ordinary
+wheel builds can leave `src/transformers.egg-info` in their source tree and
+invalidate its content lock. The test command still imports the pinned submodule
+through `PYTHONPATH`.
 GPTQModel is imported directly from the pinned source (no CUDA
 extension build or second engine checkout). Do not use this extra-dependency
 venv as the default CPU gate's exact-package venv. Checkpoint witnesses resolve
