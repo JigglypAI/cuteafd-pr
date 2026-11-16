@@ -2437,6 +2437,9 @@ mod tests {
     }
 
     pub(super) fn terminal_sse_error(bytes: &[u8]) -> Value {
+        terminal_sse_error_type(bytes, "native_v41_error")
+    }
+    fn terminal_sse_error_type(bytes: &[u8], error_type: &str) -> Value {
         let text = std::str::from_utf8(bytes).unwrap();
         assert!(!text.split("\n\n").any(|frame| frame == "data: [DONE]"),
             "failed streams must not finish successfully: {text}");
@@ -2449,7 +2452,7 @@ mod tests {
             choices.iter().any(|choice| !choice["finish_reason"].is_null()))),
             "failed streams must not emit a success finish chunk: {text}");
         let last = frames.last().unwrap();
-        assert_eq!(last["error"]["type"], "native_v41_error");
+        assert_eq!(last["error"]["type"], error_type);
         last.clone()
     }
     fn strict_schema_body(thinking_disabled: bool, schema: Value) -> Body {
@@ -2993,7 +2996,7 @@ mod tests {
                 assert_eq!(response.status(), if streaming && ready { StatusCode::OK } else { StatusCode::TOO_MANY_REQUESTS });
                 if !(streaming && ready) { assert_eq!(response.headers()["retry-after"], "1"); }
                 let body = axum::body::to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
-                let value: Value = if streaming && ready { terminal_sse_error(&body) } else { serde_json::from_slice(&body).unwrap() };
+                let value: Value = if streaming && ready { terminal_sse_error_type(&body, "rate_limit_error") } else { serde_json::from_slice(&body).unwrap() };
                 assert_eq!(value["error"]["code"], "retry");
                 assert_eq!(value["error"]["status"], 429);
                 assert_eq!(value["error"]["type"], "rate_limit_error");
