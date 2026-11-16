@@ -1069,6 +1069,15 @@ if "--resolve-settings-only" in args:
     from pathlib import Path
     hf = Path(os.environ["HF_HOME"])
     checkpoint = json.loads(os.environ["STUB_CHECKPOINT"])
+    if checkpoint.get("model_type", "") in ("kimi_k3", "kimi_k31"):
+        selected = args[args.index("--speculator") + 1] if "--speculator" in args else "off"
+        if selected == "auto": selected = "off"
+        if selected not in ("off", "dflash2", "dspark"):
+            print(f"SPECULATOR={selected} does not apply to kimi_k3", file=sys.stderr)
+            sys.exit(2)
+        print(json.dumps(dict(speculator=selected, default_drafter="Inferact/Kimi-K3.1-Pro-DSpark",
+            default_drafter_revision="e4e6e6261e9f8b6d5f249f9627eb6b109d762d5f")))
+        sys.exit(0)
     if checkpoint.get("model_type", "").startswith("mimo"):
         selected = "off"
         if (args[args.index("--checkpoint-model-id") + 1] if "--checkpoint-model-id" in args else None) in ("XiaomiMiMo/MiMo-V2.6-Flash-MOPD", "XiaomiMiMo/MiMo-V2.6-Pro-MOPD"):
