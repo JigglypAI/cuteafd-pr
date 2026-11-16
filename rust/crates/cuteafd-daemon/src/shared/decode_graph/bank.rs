@@ -269,7 +269,6 @@ impl<K: Hash + Eq + Clone + std::fmt::Debug, E> GraphBank<K, E> {
         assert!(std::sync::Arc::ptr_eq(&binding.cache, &ticket.cache), "graph ticket belongs to a different device cache");
         assert!(!ticket.committed, "graph capture ticket already settled");
         if !ticket.updated { self.cache_topology(ticket.id, nodes, width, spans_devices); }
-        ticket.cache.lock().unwrap_or_else(|p| p.into_inner()).segment_launched(ticket.id);
         self.cache_insert(key.clone(), exec, ticket.id, ticket.pinned);
         ticket.committed = true;
         let retained = ticket.updated || ticket.cache.lock().unwrap_or_else(|p| p.into_inner()).completed_capture(ticket.id);
@@ -309,6 +308,10 @@ impl<K: Hash + Eq + Clone + std::fmt::Debug, E> GraphBank<K, E> {
 
     /// Explicit teardown only, after the caller drains all consumers.
     pub fn cache_clear_drained(&mut self) {
+        if let Some(binding) = &self.device {
+            let ids: Vec<_> = self.entries.values().filter_map(|entry| entry.cached.map(|(id, _)| id)).collect();
+            binding.cache.lock().unwrap_or_else(|p| p.into_inner()).retire_native_counts(&ids);
+        }
         self.entries.clear();
         self.cache_keys.clear();
         self.retired.clear();
@@ -327,6 +330,9 @@ impl<K: Hash + Eq + Clone + std::fmt::Debug, E> GraphBank<K, E> {
     pub fn cache_remove_drained(&mut self, matches: impl Fn(&K) -> bool) {
         let keys: Vec<_> = self.entries.keys().filter(|key| matches(key)).cloned().collect();
         let ids: Vec<_> = keys.iter().filter_map(|key| self.entries.get(key)?.cached.map(|(id, _)| id)).collect();
+        if let Some(binding) = &self.device {
+            binding.cache.lock().unwrap_or_else(|p| p.into_inner()).retire_native_counts(&ids);
+        }
         for key in keys { self.entries.remove(&key); }
         if let Some(binding) = &self.device {
             binding.cache.lock().unwrap_or_else(|p| p.into_inner()).remove_drained(&ids);
@@ -381,6 +387,8 @@ impl<K: Hash + Eq + Clone + std::fmt::Debug, E> GraphBank<K, E> {
             self.entries.iter().filter_map(|(key, entry)| entry.cached
                 .filter(|(id, _)| cache.persistent_victim_ready(*id)).map(|(id, _)| (key.clone(), id))).collect()
         };
+        binding.cache.lock().unwrap_or_else(|p| p.into_inner()).retire_native_counts(
+            &victims.iter().map(|(_, id)| *id).collect::<Vec<_>>());
         for (key, _) in &victims { self.entries.remove(key); }
         if !victims.is_empty() {
             binding.cache.lock().unwrap_or_else(|p| p.into_inner()).destroyed(
@@ -403,6 +411,8 @@ impl<K: Hash + Eq + Clone + std::fmt::Debug, E> GraphBank<K, E> {
         };
         if !victims.is_empty() {
             drain()?;
+            binding.cache.lock().unwrap_or_else(|p| p.into_inner()).retire_native_counts(
+                &victims.iter().map(|(_, id)| *id).collect::<Vec<_>>());
             for (key, _) in &victims { if let Some(entry) = self.entries.remove(key) { self.retired.push(entry.exec); } }
             // drain_retired's ordering, with the already completed drain proof.
             self.retired.clear();

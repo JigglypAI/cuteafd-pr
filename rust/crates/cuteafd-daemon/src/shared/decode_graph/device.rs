@@ -445,6 +445,7 @@ pub(crate) fn device_cache(library: &cuteafd_ffi::NativeLibrary, device: i32,
     if device < 0 { return device_cache_sampled(device, reserve, basis, || Ok((0, 0, 0, 0, 0))) }
     let cache = device_cache_sampled(device, reserve, basis, || memory_sample(library, device))?;
     let mut controller = cache.lock().unwrap_or_else(|p| p.into_inner());
+    if controller.launch_query.is_none() { controller.launch_query = Some(library.graph_launch_query()?); }
     if controller.memory_query.is_none() { controller.memory_query = Some(library.physical_memory_query()?); }
     drop(controller);
     Ok(cache)
@@ -838,6 +839,7 @@ pub(crate) struct DeviceCache {
     update_requests: HashMap<u64, UpdateRequest>,
     observer: GrowthObserver,
     memory_query: Option<cuteafd_ffi::PhysicalMemoryQuery>,
+    launch_query: Option<cuteafd_ffi::GraphLaunchQuery>,
     captured_since_observation: bool,
     counters: HashMap<Cycle, Counters>,
     started: Instant,
@@ -889,7 +891,7 @@ impl DeviceCache {
             chain_only: true, unmeasured: false, pending_destroy: 0,
             bank_lanes: HashMap::new(), lanes: std::array::from_fn(|_| LaneEpoch::default()), clocks: Arc::new(std::array::from_fn(|_| EpochClock::default())),
             lagged: Vec::new(), epochs: EpochStats::default(), reuse_captures: HashSet::new(), selected_epochs: HashMap::new(), pending_lanes: [0; 2], concurrent_cycles: 1, lane_max_cycles: [1; 2], site_lanes: HashMap::new(), update_sites: Default::default(), native_graphs: HashMap::new(), donor_candidates: HashMap::new(), update_requests: HashMap::new(),
-            observer: GrowthObserver::default(), memory_query: None, captured_since_observation: false,
+            observer: GrowthObserver::default(), memory_query: None, launch_query: None, captured_since_observation: false,
             counters: HashMap::new(), started: Instant::now(), clock_ms: 0, last_report: Instant::now(),
             interval_evictions: 0, trace: std::env::var_os("CUTEAFD_GRAPH_TRACE").and_then(|path| {
                 TraceWriter::new(std::path::PathBuf::from(path).with_extension(format!("device-{device}.json")))
@@ -904,16 +906,39 @@ impl DeviceCache {
         self.update_sites.entry(site).or_default().entry(cycle).or_default()
     }
 
-    pub(super) fn segment_launched(&mut self, id: u64) {
-        let Some(record) = self.records.get(&id) else { return };
-        let (site, cycle, bank) = (record.identity.site, record.cycle, record.identity.bank);
-        self.counters.entry(cycle).or_default().segments_launched += 1;
-        self.site_counters(site, cycle, bank).segments_launched += 1;
+    pub(super) fn retire_native_counts(&mut self, ids: &[u64]) {
+        for &id in ids { self.remove_donor_candidate(id); self.take_native(id); }
+    }
+
+    fn take_native(&mut self, id: u64) -> Option<NativeGraph> {
+        let native = self.native_graphs.remove(&id)?;
+        if let (Some(query), Some(record)) = (&self.launch_query, self.records.get(&id)) {
+            if native.exec != 0 {
+                let count = query.sample(native.exec);
+                self.counters.entry(record.cycle).or_default().segments_launched += count;
+                self.update_sites.entry(record.identity.site).or_default().entry(record.cycle).or_default().segments_launched += count;
+            }
+        }
+        Some(native)
+    }
+
+    fn launch_counts(&self) -> (HashMap<Cycle, Counters>, std::collections::BTreeMap<&'static str, HashMap<Cycle, Counters>>) {
+        let (mut cycles, mut sites) = (self.counters.clone(), self.update_sites.clone());
+        if let Some(query) = &self.launch_query {
+            for (&id, native) in &self.native_graphs {
+                if native.exec == 0 { continue }
+                let Some(record) = self.records.get(&id) else { continue };
+                let count = query.sample(native.exec);
+                cycles.entry(record.cycle).or_default().segments_launched += count;
+                sites.entry(record.identity.site).or_default().entry(record.cycle).or_default().segments_launched += count;
+            }
+        }
+        (cycles, sites)
     }
 
     fn per_cycle(&self) -> std::collections::BTreeMap<&'static str, HashMap<Cycle, PerCycle>> {
         let completed = self.clocks.as_ref().each_ref().map(|clock| clock.completed.load(Ordering::Acquire));
-        self.update_sites.iter().map(|(&site, cycles)| {
+        self.launch_counts().1.iter().map(|(&site, cycles)| {
             let lanes = self.site_lanes.get(site).copied().unwrap_or(0);
             let owner_cycles: u64 = completed.iter().enumerate().filter(|(lane, _)| lanes & (1 << lane) != 0)
                 .map(|(_, count)| count).sum();
@@ -1124,7 +1149,7 @@ impl DeviceCache {
     fn forget(&mut self, id: u64) {
         if !self.records.contains_key(&id) { return }
         self.remove_donor_candidate(id);
-        self.native_graphs.remove(&id);
+        self.take_native(id);
         self.reuse_captures.remove(&id);
         self.unlink(id);
         if let Some(record) = self.records.remove(&id) {
@@ -1167,9 +1192,7 @@ impl DeviceCache {
         let promote = !record.pinned && !record.pending_destroy && matches!(record.list, Some(List::Recent | List::Frequent));
         record.stats.hit(cycle, 1, now);
         self.counters.entry(cycle).or_default().hits += 1;
-        self.counters.entry(cycle).or_default().segments_launched += 1;
         self.site_counters(self.records[&id].identity.site, cycle, bank).hits += 1;
-        self.site_counters(self.records[&id].identity.site, cycle, bank).segments_launched += 1;
         if changed { self.remove_donor_candidate(id); self.insert_donor_candidate(id); }
         if promote {
             self.push(id, List::Frequent);
@@ -1182,12 +1205,10 @@ impl DeviceCache {
         let now = self.clock_ms;
         if let Some(record) = self.records.get_mut(&id) { record.stats.hit(cycle, count, now); }
         self.counters.entry(cycle).or_default().hits += count;
-        self.counters.entry(cycle).or_default().segments_launched += count;
         if let Some(record) = self.records.get(&id) {
             let (site, bank) = (record.identity.site, record.identity.bank);
             let counters = self.site_counters(site, cycle, bank);
             counters.hits += count;
-            counters.segments_launched += count;
         }
     }
 
@@ -1290,7 +1311,7 @@ impl DeviceCache {
         if let Some(request) = self.update_requests.remove(&id) {
             // End/begin failures precede any update. Settle through the ordinary
             // miss accounting, without retaining a source-only reservation.
-            self.native_graphs.remove(&id);
+            self.take_native(id);
             let counters = self.counters.entry(request.site.cycle).or_default();
             counters.misses += 1;
             counters.eager_runs += 1;
@@ -1320,6 +1341,7 @@ impl DeviceCache {
                 r.pinned || r.pending_capture || r.pending_destroy || r.permanently_eager || r.oom.is_some() ||
                     matches!(r.list, Some(List::Recent | List::Frequent))
             }) || (!hard && self.charged < self.soft.limit) { return None }
+        self.donor_candidates.retain(|_, lanes| lanes.iter().any(|lane| lane.first.is_some()));
         let any_cold = self.donor_candidates.values().any(|lanes| lanes.iter().any(|lane|
             lane.first.is_some_and(|id| self.donor_age(id).is_some())));
         if !any_cold {
@@ -1396,6 +1418,7 @@ impl DeviceCache {
     }
 
     pub(super) fn register_native(&mut self, id: u64, exec: usize, signature: Vec<u64>) {
+        self.remove_donor_candidate(id);
         self.native_graphs.insert(id, NativeGraph { exec, signature, indexed: None, previous: None, next: None });
         self.insert_donor_candidate(id);
     }
@@ -1442,6 +1465,7 @@ impl DeviceCache {
         }
         self.remove_donor_candidate(donor);
         self.unlink(donor);
+        let mut native = self.take_native(donor).unwrap();
         let mut record = self.records.remove(&donor).unwrap();
         let mut ghost = record.clone();
         ghost.bytes = 0;
@@ -1449,7 +1473,6 @@ impl DeviceCache {
         ghost.list = None; ghost.previous = None; ghost.next = None;
         self.records.insert(donor, ghost);
         self.push(donor, List::RecentGhost);
-        let mut native = self.native_graphs.remove(&donor).unwrap();
         native.exec = transferred;
         native.indexed = None;
         record.identity = request.identity.clone();
@@ -1486,13 +1509,13 @@ impl DeviceCache {
     }
 
     fn cold_donor_for_request(&mut self, id: u64, request: &UpdateRequest) -> Option<u64> {
-        let signature = self.native_graphs.remove(&id)?.signature;
+        let signature = self.take_native(id)?.signature;
         self.cold_donor(&signature)
     }
 
     pub(super) fn fallback_update(&mut self, id: u64) -> Miss {
         let request = self.update_requests.remove(&id).expect("active update request");
-        self.native_graphs.remove(&id);
+        self.take_native(id);
         self.miss(request.identity, request.site, request.estimate, request.pinned)
     }
 
@@ -1794,7 +1817,7 @@ impl DeviceCache {
     pub fn cancel_capture(&mut self, id: u64) {
         self.update_requests.remove(&id);
         self.remove_donor_candidate(id);
-        self.native_graphs.remove(&id);
+        self.take_native(id);
         if let Some(record) = self.records.get(&id) {
             if record.pending_capture {
                 self.pending_bytes = self.pending_bytes.saturating_sub(record.estimate);
@@ -1976,6 +1999,7 @@ impl DeviceCache {
         // the default driver-arena model never credits physical release.
         let _ = measurement.released;
         if ids.iter().any(|id| self.records.contains_key(id)) { self.recovery_generation += 1; }
+        self.retire_native_counts(ids);
         for &id in ids {
             self.unlink(id);
             let owner = self.records.get(&id).map(|record| self.bank_lane(record.identity.bank));
@@ -2042,15 +2066,17 @@ impl DeviceCache {
         if self.trace.is_some() {
             if self.retired_trace.is_none() { self.retired_trace = Some(self.trace_snapshot()); }
             // Each retiring bank flushes its last pinned hits just before here.
+            let (cycles, update_sites) = self.launch_counts();
+            let per_cycle = self.per_cycle();
             if let Some(snapshot) = &mut self.retired_trace {
                 for row in snapshot.records.iter_mut().filter(|r| r.identity.bank == bank) {
                     if let Some(record) = self.identities.get(&row.identity).and_then(|id| self.records.get(id)) {
                         *row = RawRecord::copy(record);
                     }
                 }
-                snapshot.cache.cycles = self.counters.clone();
-                snapshot.cache.update_sites = self.update_sites.clone();
-                snapshot.cache.per_cycle = self.per_cycle();
+                snapshot.cache.cycles = cycles;
+                snapshot.cache.update_sites = update_sites;
+                snapshot.cache.per_cycle = per_cycle;
             }
         }
         let ids: Vec<_> = self.records.iter().filter(|(_, r)| r.identity.bank == bank).map(|(&id, _)| id).collect();
@@ -2113,10 +2139,10 @@ impl DeviceCache {
         TraceSnapshot { cache: Snapshot { device: self.device, reserve: self.reserve, physical_floor: self.physical_floor,
             reserve_policy: self.reserve_policy, charged: self.charged, live_bytes: self.live_bytes, resident_estimated_bytes: self.resident_bytes(), hard_stopped: self.charged >= self.reserve || self.measurement_failed || self.soft.limit == 0, native_pools: self.native_pools(), soft: self.soft, level: self.level,
             pinned: self.inventory.pinned,
-            pending_capture: self.pending_bytes, cycles: self.counters.clone(), pools: self.pools.clone(),
+            pending_capture: self.pending_bytes, cycles: self.launch_counts().0, pools: self.pools.clone(),
             basis: self.basis, sampled_at_ms: self.started.elapsed().as_millis() as u64,
             telemetry_bytes: self.records.len() * std::mem::size_of::<KeyStats>(),
-            top_hits: Vec::new(), top_churn: Vec::new(), rankings_age_ms: self.ranked_at.elapsed().as_millis() as u64, epochs: self.epoch_snapshot(), per_cycle: self.per_cycle(), update_sites: self.update_sites.clone() },
+            top_hits: Vec::new(), top_churn: Vec::new(), rankings_age_ms: self.ranked_at.elapsed().as_millis() as u64, epochs: self.epoch_snapshot(), per_cycle: self.per_cycle(), update_sites: self.launch_counts().1 },
             records, classes: self.classes.clone() }
     }
 
@@ -2165,8 +2191,8 @@ impl DeviceCache {
         Snapshot { device: self.device, reserve: self.reserve, physical_floor: self.physical_floor, reserve_policy: self.reserve_policy, charged: self.charged, live_bytes: self.live_bytes, resident_estimated_bytes: self.resident_bytes(), hard_stopped: self.charged >= self.reserve || self.measurement_failed || self.soft.limit == 0, native_pools: self.native_pools(), soft: self.soft,
             level: self.level,
             pinned: self.inventory.pinned,
-            pending_capture: self.pending_bytes, cycles: self.counters.clone(), pools: self.pools.clone(), basis: self.basis,
-            sampled_at_ms: now, telemetry_bytes: self.records.len() * std::mem::size_of::<KeyStats>(), top_hits: self.ranked_hits.clone(), top_churn: self.ranked_churn.clone(), rankings_age_ms: self.ranked_at.elapsed().as_millis() as u64, epochs: self.epoch_snapshot(), per_cycle: self.per_cycle(), update_sites: self.update_sites.clone() }
+            pending_capture: self.pending_bytes, cycles: self.launch_counts().0, pools: self.pools.clone(), basis: self.basis,
+            sampled_at_ms: now, telemetry_bytes: self.records.len() * std::mem::size_of::<KeyStats>(), top_hits: self.ranked_hits.clone(), top_churn: self.ranked_churn.clone(), rankings_age_ms: self.ranked_at.elapsed().as_millis() as u64, epochs: self.epoch_snapshot(), per_cycle: self.per_cycle(), update_sites: self.launch_counts().1 }
     }
 
     fn row(&self, record: &Record, now: u64) -> TraceRow {
