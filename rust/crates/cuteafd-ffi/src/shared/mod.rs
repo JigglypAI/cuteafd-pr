@@ -11,6 +11,7 @@ pub mod mla_draft;
 pub mod draft_projection;
 pub mod recurrent_draft;
 pub mod fir_history;
+pub mod fir_replay;
 pub mod native_attention;
 pub mod native_dense;
 pub mod native_dense_glue;
