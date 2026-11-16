@@ -1587,7 +1587,7 @@ def test_combined_exl3_reply_exports_cover_supported_geometries_without_sm_sizin
     shapes = next(ast.literal_eval(node.value) for node in function.body
                   if isinstance(node, ast.Assign)
                   and any(isinstance(t, ast.Name) and t.id == "shapes" for t in node.targets))
-    assert set(shapes) == {(2560, 10), (3584, 16), (4096, 6), (4096, 8),
+    assert set(shapes) == {(2560, 10), (3584, 16), (4096, 6), (4096, 8), (4608, 8),
                            (5120, 6), (6144, 4), (6144, 8), (7168, 6)}
     assert len(shapes) == len(set(shapes))
     source = ast.get_source_segment(path.read_text(), function)
@@ -1613,7 +1613,7 @@ def test_combined_exl3_reply_export_operand_and_scalar_abi(monkeypatch):
     monkeypatch.setitem(sys.modules, "torch", SimpleNamespace(
         float16="fp16", uint8="u8", float32="fp32", int32="i32"))
     jobs = exporter.exl3_reply_programs(8256)
-    assert len(jobs) == 16
+    assert len(jobs) == 18
     for suffix, op, params, thunk in jobs:
         program = thunk()
         kernel, = program.args

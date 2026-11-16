@@ -62,7 +62,7 @@ def exl3_reply_programs(max_rows):
     from b12x.moe._shared.kernels.w4a16.kernel import W4A16TopKSumKernel
     import torch
 
-    shapes = ((2560, 10), (3584, 16), (4096, 6), (4096, 8),
+    shapes = ((2560, 10), (3584, 16), (4096, 6), (4096, 8), (4608, 8),
               (5120, 6), (6144, 4), (6144, 8), (7168, 6))
 
     def compile_one(width, topk, format):
@@ -1797,7 +1797,7 @@ def main() -> None:
             if os.environ.get("CUTEAFD_BUILD_KIND", "development") == "release":
                 work += [(name, *item) for item in exl3_reply_programs(args.prefill_rows)]
                 from native_reply import compile_native_reply_aot
-                for width in (2048, 2560, 3072, 3584, 4096, 5120, 6144, 7168, 8192):
+                for width in (2048, 2560, 3072, 3584, 4096, 4608, 5120, 6144, 7168, 8192):
                     for format in (1, 2):
                         work.append((name, f"native_h{width}_{format}", "expert_reply",
                                      {"max_rows": args.prefill_rows},
