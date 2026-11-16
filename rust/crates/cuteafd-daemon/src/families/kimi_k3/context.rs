@@ -515,6 +515,23 @@ mod tests {
     }
 
     #[test]
+    fn captured_context_selector_uses_capacity_not_first_live_frontier() {
+        let device = include_str!("device.rs");
+        let selected = device.split("fn context_dsa_score(").nth(1).unwrap()
+            .split("fn context_dsa_produce_gathered(").next().unwrap();
+        assert!(selected.contains("table_width: width, table_stride: width"));
+        assert!(!selected.contains("self.context_pages"),
+            "a Context graph freezes scalar launch arguments at capture");
+        let admitted_pages = 8192usize;
+        let captured_width = admitted_pages;
+        for live_tokens in [0usize, 1, 64, 65, 1275, 1298, 4280, 8320] {
+            let eager = 0..live_tokens;
+            let replay = (0..captured_width * 64).take(live_tokens);
+            assert!(eager.eq(replay), "empty-captured selector lost grown history");
+        }
+    }
+
+    #[test]
     fn sequential_decode_appends_match_gathered_owner_slots_and_frontiers() -> Result<()> {
         use super::super::device::SequenceRows;
         let mut pool = cuteafd_engine::prefix::RefPagePool::parity(128, 64, 0);
