@@ -44,7 +44,8 @@ fn placement_input_source_hashes(root: &std::path::Path) -> anyhow::Result<Value
     use sha2::{Digest, Sha256};
     let mut files = v4_placement_source_hashes(root)?;
     let mut paths = ["scripts/build/export-placement-inputs.py", "scripts/build/kernel-records.py", "scripts/build/release-scope.py",
-        "scripts/lib/wip_aot_scopes.py", "native/cmake/shared/fp8_moe.cmake"].map(|path| root.join(path)).to_vec();
+        "scripts/lib/wip_aot_scopes.py", "native/cmake/shared/fp8_moe.cmake",
+        "rust/crates/cuteafd-loader/src/serving_capacity/spark_memory.json"].map(|path| root.join(path)).to_vec();
     let matrix: Value = serde_json::from_slice(&fs::read(root.join("benchmarks/current-matrix.json"))?)?;
     let retired = matrix["retired"].as_array().ok_or_else(|| anyhow::anyhow!("missing retired config list"))?
         .iter().filter_map(|entry| entry["config"].as_str()).collect::<std::collections::BTreeSet<_>>();
@@ -247,12 +248,14 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path();
         for relative in ["python/tools/aot", "python/tools/lib", "scripts/build", "scripts/lib",
-            "examples/configs", "benchmarks", "native/cmake/shared"] {
+            "examples/configs", "benchmarks", "native/cmake/shared",
+            "rust/crates/cuteafd-loader/src/serving_capacity"] {
             fs::create_dir_all(root.join(relative)).unwrap();
         }
         for relative in ["scripts/build/compare-sm-exports.py", "scripts/build/export-placement-inputs.py",
             "scripts/build/kernel-records.py", "scripts/build/release-scope.py", "scripts/lib/wip_aot_scopes.py",
-            "examples/configs/live.config", "examples/configs/retired.config", "native/cmake/shared/fp8_moe.cmake"] {
+            "examples/configs/live.config", "examples/configs/retired.config", "native/cmake/shared/fp8_moe.cmake",
+            "rust/crates/cuteafd-loader/src/serving_capacity/spark_memory.json"] {
             fs::write(root.join(relative), "original").unwrap();
         }
         let matrix = root.join("benchmarks/current-matrix.json");

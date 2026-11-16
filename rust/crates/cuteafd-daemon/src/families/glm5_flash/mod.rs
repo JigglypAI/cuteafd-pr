@@ -2134,6 +2134,8 @@ impl Opened {
         let host = cuteafd_loader::formats::mapped_preload::host_memory_before_process()?;
         let headroom = args.serving_prefix.as_ref().map_or(8 << 30, |prefix| prefix.host_cache_headroom_bytes).max(host.0 / 10);
         let mut process = admission::admission::ProcessOwners::new(host, headroom);
+        process.spark_rank_caps = cuteafd_loader::serving_capacity::spark_memory::runtime_bytes(
+            &args.peers.iter().map(ToString::to_string).collect::<Vec<_>>())?;
         if split && attention.mode == placement::AttentionPlacement::Layers && native_admission.is_none()
             && core_charge.is_none() {
             process.alternate_resident = Some(runtime_resident_weights(&headers, &self.cfg, layers, devices.len(),

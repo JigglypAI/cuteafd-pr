@@ -300,8 +300,8 @@ def test_spark_budget_default_is_planner_owned_and_explicit_ceiling_wins(tmp_pat
 
 @pytest.mark.parametrize("devices", [[], [{"kind": "spark", "index": 0, "capacity_bytes": 121 << 30}],
     [{"kind": "spark", "index": 0, "worker_budget_bytes": 0}],
-    [{"kind": "spark", "index": i, "worker_budget_bytes": (108 - i) << 30} for i in range(4)]])
-def test_spark_workers_reject_missing_zero_or_nonuniform_planner_budgets(tmp_path, devices):
+    ])
+def test_spark_workers_reject_missing_or_zero_planner_budgets(tmp_path, devices):
     result = _family_launch_result(tmp_path,
         {"model_type": "glm_moe_dsa", "num_hidden_layers": 4, "first_k_dense_replace": 3}, "test/budget",
         "SPARK_COUNT=4\nRTX_GPUS=1\nSPECULATOR=off\nVISION=off\nAUDIO=off\n",
@@ -309,8 +309,25 @@ def test_spark_workers_reject_missing_zero_or_nonuniform_planner_budgets(tmp_pat
             {"kind": "rtx", "index": 0, "capacity_bytes": 96 << 30, "worker_budget_bytes": 0,
              "items": [], "kv_tokens": 0}, *devices]}})
     assert result.returncode != 0
-    assert "no uniform Spark worker allocation ceiling" in result.stderr
+    assert "no Spark worker allocation ceiling" in result.stderr
     assert "cuteafd expertd-native" not in result.stderr
+
+
+def test_spark_workers_keep_distinct_per_rank_planner_budgets(tmp_path):
+    devices = [{"kind": "spark", "index": i, "worker_budget_bytes": (116 - i) << 30}
+               for i in range(4)]
+    result = _family_launch_result(tmp_path,
+        {"model_type": "glm_moe_dsa", "num_hidden_layers": 4, "first_k_dense_replace": 3}, "test/budget",
+        "SPARK_COUNT=4\nRTX_GPUS=1\nSPECULATOR=off\nVISION=off\nAUDIO=off\n",
+        deployment_overrides={"memory_layout": {"devices": [
+            {"kind": "rtx", "index": 0, "capacity_bytes": 96 << 30, "worker_budget_bytes": 0,
+             "items": [], "kv_tokens": 0}, *devices]}})
+    assert result.returncode == 0, result.stderr
+    workers = [line for line in result.stderr.splitlines() if "cuteafd expertd-native" in line]
+    assert len(workers) == 4
+    for rank in range(4):
+        assert any(f"--rank {rank} " in worker and f"--device-budget-bytes {(116 - rank) << 30}" in worker
+                   for worker in workers)
 
 
 

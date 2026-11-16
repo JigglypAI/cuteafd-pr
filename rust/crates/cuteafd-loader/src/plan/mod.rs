@@ -1455,8 +1455,8 @@ fn plan_unrestricted(input: &PlanInput, options: &PlanOptions) -> Result<PlanRep
     }
     if options.layout.is_none() {
         // A tensor-only inventory does not request an external speculation checkpoint.
-        let mut inventory = layout::LayoutOptions { rtx_bytes: vec![options.coordinator_gpu_budget_bytes], spark_bytes: options.spark_budget(),
-            spark_allocation_budget_bytes: Some(options.spark_budget()), glm5_drafter_disabled: true,
+        let mut inventory = layout::LayoutOptions { rtx_bytes: vec![options.coordinator_gpu_budget_bytes], spark_bytes: options.spark_budget_bytes.unwrap_or(0),
+            spark_allocation_budget_bytes: options.spark_budget_bytes, glm5_drafter_disabled: true,
             glmf_drafter_disabled: true, native_mtp_layers: if ownership.uses_checkpoint() { 3 } else { 0 },
             weight_budget_bytes: options.coordinator_budget_bytes, inventory: true, ..options.inventory_layout() };
         let _ = family_layout(model, input, &mut report, &mut inventory, options.placement)?;

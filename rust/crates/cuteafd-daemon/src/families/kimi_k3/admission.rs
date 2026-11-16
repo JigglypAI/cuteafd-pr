@@ -930,8 +930,8 @@ pub(crate) fn admit<'a, const RANKS: usize>(mut inputs: Inputs<'_, RANKS>) -> Re
     if let Some(budget) = &spark_budget {
         for rank in 0..budget.resident.len() {
             let bytes = budget.rank_bytes(rank, placement.onboard_layers)?;
-            ensure!(bytes <= budget.budget, "Kimi selected Spark working set exceeds estimated budget");
-            tracing::info!(rank, retained_bytes = bytes, budget_bytes = budget.budget,
+            ensure!(bytes <= budget.rank_budget(rank), "Kimi selected Spark working set exceeds estimated budget");
+            tracing::info!(rank, retained_bytes = bytes, budget_bytes = budget.rank_budget(rank),
                 reserve = "estimated; pending load/steady census", "Kimi Spark budget selection");
         }
     }

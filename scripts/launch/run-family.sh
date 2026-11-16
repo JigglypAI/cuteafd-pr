@@ -810,7 +810,7 @@ if ((dry_run == 0 && RELEASE_AVAILABLE_SPARKS > 0)) && [[ -z "$(get SPARK_MEMORY
   done
   spark_memory_samples="$(release_spark_memory_samples "${sample_hosts[@]}")" || exit 1
   count_args+=(--spark-memory-samples "$spark_memory_samples")
-  memory_policy_args+=(--spark-memory-samples "$spark_memory_samples")
+
 fi
 release_reject_unused_keys deepseek_v41 $(_v41_allowed_keys)
 readiness_args=(--require-ready)
@@ -1141,6 +1141,7 @@ done
 [[ -z "$(get DECODE_SHARE)" ]] || args+=(--decode-share "$(get DECODE_SHARE)")
 [[ -z "${V41_PREFILL_RESERVE_ROWS:-}" ]] || args+=(--prefill-reserve-rows "$V41_PREFILL_RESERVE_ROWS")
 args+=("${memory_policy_args[@]}" --coordinator-weight-budget-gib "$v41_weight_budget_gib")
+[[ -z "$spark_memory_samples" ]] || args+=(--spark-memory-samples "$spark_memory_samples")
 [[ -z "${SERVED_MODEL_ID:-}" ]] || args+=(--model-id "$SERVED_MODEL_ID")
 args+=("${api_args[@]}")
 args+=(--http-queue-depth "${HTTP_QUEUE_DEPTH:-$CONCURRENCY}" --http-queue-wait-ms "$HTTP_QUEUE_WAIT_MS")
@@ -2507,7 +2508,7 @@ audio_encoder_hash=""
     for ((rank = 0; rank < available_sparks; rank++)); do sample_hosts+=("$(get "SPARK_${rank}_HOST")"); done
     spark_memory_samples="$(release_spark_memory_samples "${sample_hosts[@]}")" || exit 1
     deployment_args+=(--spark-memory-samples "$spark_memory_samples")
-    memory_policy_args+=(--spark-memory-samples "$spark_memory_samples")
+    family_args+=(--spark-memory-samples "$spark_memory_samples")
   fi
   [[ -z "$(get KV_POOL_SIZE)" ]] || deployment_args+=(--kv-pool-size "$(get KV_POOL_SIZE)")
   readiness_args=(--require-ready)

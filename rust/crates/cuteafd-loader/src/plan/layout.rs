@@ -207,7 +207,8 @@ pub struct LayoutOptions {
 
 impl LayoutOptions {
     pub fn spark_capacity(&self, rank: usize) -> u64 {
-        if self.spark_bytes > 0 { self.spark_bytes }
+        if let Some(bytes) = self.spark_allocation_budget_bytes { bytes }
+        else if self.spark_bytes > 0 { self.spark_bytes }
         else { self.spark_rank_bytes.get(rank).copied().unwrap_or(0) }
     }
 
@@ -1904,4 +1905,28 @@ pub(crate) fn charge_host(report: &mut PlanReport, options: &LayoutOptions, inpu
     }
     report.host_ledger = Some(host);
     Ok(())
+}
+
+#[cfg(test)]
+mod spark_capacity_tests {
+    use super::*;
+
+    #[test]
+    fn measured_rank_capacities_reach_solver_and_explicit_cap_wins() {
+        use crate::placement::planner::{Baseline, Budget, Device, Domain, Location};
+        let mut options = LayoutOptions::default();
+        options.spark_rank_bytes = vec![121_300_648 * 1024, 121_171_588 * 1024];
+        let mut budgets = (0..2).map(|rank| Budget { id: format!("spark{rank}"),
+            locations: vec![Location { device: Device::Spark(rank), domain: Domain::Managed }],
+            physical_bytes: 1, logical_bytes: 1, headroom: 0,
+            baseline: Baseline::Forecast { occupied: 0, source: "test".into(), assumed: false },
+        }).collect::<Vec<_>>();
+        options.apply_spark_capacities(&mut budgets);
+        assert_eq!(budgets.iter().map(|budget| budget.physical_bytes).collect::<Vec<_>>(), options.spark_rank_bytes);
+        assert_eq!(options.spark_capacity(2), 0, "unknown rank fails closed");
+        options.spark_allocation_budget_bytes = Some(82 << 30);
+        options.apply_spark_capacities(&mut budgets);
+        assert!(budgets.iter().all(|budget| budget.physical_bytes == 82 << 30 && budget.logical_bytes == 82 << 30));
+        assert_eq!(options.spark_capacity(7), 82 << 30);
+    }
 }
