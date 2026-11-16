@@ -1591,15 +1591,15 @@ fn place(report: &mut PlanReport, options: &PlanOptions, spec: &ModelSpec, model
     let contract = contracts.first().cloned().map(|mut first| {
         for other in &contracts[1..] {
             first.spark_worlds.retain(|w| other.spark_worlds.contains(w));
-            if first.block != other.block {
-                first.spark_worlds.clear();
-            }
             if other.local.is_err() {
                 first.local = other.local.clone();
             }
             if !first.package.split(" + ").any(|p| p == other.package) {
                 first.package = format!("{} + {}", first.package, other.package);
             }
+        }
+        if let Some(intermediate) = spec.moe.as_ref().map(|moe| moe.intermediate) {
+            first.spark_worlds.retain(|&world| experts::spark_recipe(&first.package, intermediate, world).is_ok());
         }
         first
     });

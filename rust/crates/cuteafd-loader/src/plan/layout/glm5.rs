@@ -692,7 +692,7 @@ pub(crate) fn native_layout_with_metadata(checkpoint: &Checkpoint, options: &Lay
             let manifest_path = options.workspace_manifest.as_deref()
                 .unwrap_or_else(|| std::path::Path::new("/opt/cuteafd/share/PROGRAMS.json"));
             Some(glm::exlr8_inventory_with_metadata(&checkpoint.snapshot, manifest_path, cfg.layers,
-                gpu_count, rows, lanes, glm::local_exchange_f32()?, options.exlr8_prefill_activations, metadata)?)
+                gpu_count, rows, lanes, glm::local_exchange_f32()?, options.exlr8_prefill_activations, metadata, &manifest)?)
         };
     let physical = LocalPhysicalInput { layers: (cfg.first_moe_layer..cfg.layers).collect(),
         max_rows: rows.max(glm::DECODE_ROWS) as usize, lanes: lanes as usize, storage: LocalStorage::for_snapshot(&checkpoint.snapshot)?,

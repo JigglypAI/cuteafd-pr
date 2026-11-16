@@ -744,13 +744,14 @@ pub fn exlr8_inventory(snapshot: &std::path::Path, selected: &str, manifest: &st
     selected_layers: usize, world: usize, rows: u64, lanes: u64, exchange_f32: bool,
     activations: crate::plan::exlr8::PrefillActivations) -> anyhow::Result<LocalInventory> {
     let input = crate::plan::exlr8::residency::MetadataInput::open(snapshot, selected)?;
-    exlr8_inventory_with_metadata(snapshot, manifest, selected_layers, world, rows, lanes, exchange_f32, activations, &input)
+    let programs = crate::plan::checkpoint::read_json(manifest)?;
+    exlr8_inventory_with_metadata(snapshot, manifest, selected_layers, world, rows, lanes, exchange_f32, activations, &input, &programs)
 }
 
 pub(crate) fn exlr8_inventory_with_metadata(snapshot: &std::path::Path, manifest: &std::path::Path,
     selected_layers: usize, world: usize, rows: u64, lanes: u64, exchange_f32: bool,
-    activations: crate::plan::exlr8::PrefillActivations, input: &crate::plan::exlr8::residency::MetadataInput)
-    -> anyhow::Result<LocalInventory> {
+    activations: crate::plan::exlr8::PrefillActivations, input: &crate::plan::exlr8::residency::MetadataInput,
+    programs: &serde_json::Value) -> anyhow::Result<LocalInventory> {
     anyhow::ensure!((1..=2).contains(&world) && !exchange_f32,
         "GLM EXLR8 uses one or two ranks and BF16 routed output");
     let config = crate::plan::checkpoint::read_json(&snapshot.join("config.json"))?;
@@ -758,7 +759,6 @@ pub(crate) fn exlr8_inventory_with_metadata(snapshot: &std::path::Path, manifest
     anyhow::ensure!(cfg.hidden == 6144 && cfg.moe_intermediate == 2048 && cfg.experts == 256
         && cfg.topk == 8 && (cfg.first_moe_layer..=cfg.layers).contains(&selected_layers)
         && (1..=4).contains(&lanes), "GLM EXLR8 TP2 geometry/layer extent");
-    let programs = crate::plan::checkpoint::read_json(manifest)?;
     let mut unit_limit = 0;
     for layer in cfg.first_moe_layer..selected_layers { for rank in 0..world {
         unit_limit = unit_limit.max(input.admission_geometry(layer, world, rank,
