@@ -49,6 +49,11 @@ def tensor_storage_entry(geometry, stored_tensors, *, mcg_multiplier=MCG,
     return entry
 
 
+def quantize_config_for_view(quantization_config, **metadata):
+    """Mirror the view's inline declaration into its per-module metadata file."""
+    return dict(metadata, **deepcopy(quantization_config))
+
+
 def family_recipe(family):
     """Return the completed numerical selection used by compact encodes."""
     if family == 'glmf':
@@ -302,6 +307,7 @@ def view_metadata(parent_quant, parent_config, selection, specs, *, bits, quanti
                 rewrite_inline(child)
 
     rewrite_inline(config)
+    quant = quantize_config_for_view(config.get('quantization_config', {}), **quant)
     return quant, config
 
 

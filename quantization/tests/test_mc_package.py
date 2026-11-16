@@ -29,6 +29,21 @@ def test_tensor_storage_entry_matches_kimi_schema_and_preserves_optional_multipl
     assert inkling_entry(geometry, stored, mul1_multiplier=0.5) == dict(kimi, mul1_multiplier=0.5)
 
 
+@pytest.mark.parametrize('view,filename', [('original', 'quantize_config.json'),
+    ('k8-compact', 'quantize_config.k8.json'), ('k6-compact', 'quantize_config.k6.json')])
+def test_inkling_view_declaration_is_mirrored_in_quantize_config(view, filename):
+    from inkling2 import recipe
+    from inkling2.run import quantize_config_for_view
+
+    inline = dict(quant_method='exl3', format='mcg',
+        per_module_metadata=filename + ':tensor_storage',
+        activation_quantization=recipe.ACTIVATION_QUANTIZATION)
+    result = quantize_config_for_view(inline, tensor_storage={}, core_view=view)
+    assert all(result[key] == value for key, value in inline.items())
+    result['activation_quantization']['block_size'] = 64
+    assert inline['activation_quantization']['block_size'] == 32
+
+
 @pytest.mark.parametrize('family', ['kimi_k31', 'glm5', 'glm5_flash', 'muse_spark', 'mistral_large4'])
 def test_shared_storage_builder_preserves_recorded_family_recipes(family):
     import importlib
@@ -172,7 +187,9 @@ def test_mc_all_views_byte_exact_and_shared_parent_copy(tmp_path, monkeypatch):
 def test_view_metadata_rewrites_nested_quantization_configs(bits):
     from copy import deepcopy
 
-    inline = dict(quant_method='exl3', core_bits=6, head_bits=6, mtp_bits=4,
+    inline = dict(quant_method='exl3', format='mcg', core_bits=6, head_bits=6, mtp_bits=4,
+                  activation_quantization=dict(block_size=32, format='mxfp8_e4m3',
+                      rounding='nearest', scale_dtype='ue8m0'),
                   per_module_metadata='quantize_config.json:tensor_storage')
     config = dict(quantization_config=deepcopy(inline),
                   text_config=dict(quantization_config=deepcopy(inline)),
@@ -184,6 +201,7 @@ def test_view_metadata_rewrites_nested_quantization_configs(bits):
     blocks = [rewritten['quantization_config'], rewritten['text_config']['quantization_config'],
               rewritten['components'][0]['text_config']['quantization_config']]
     for block in blocks:
+        assert all(quant[key] == value for key, value in block.items())
         assert block['quant_method'] == 'exl3'
         assert block['per_module_metadata'] == quant['per_module_metadata'] == filename + ':tensor_storage'
         for field in ('core_bits', 'head_bits'):
