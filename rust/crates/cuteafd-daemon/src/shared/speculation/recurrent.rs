@@ -37,8 +37,9 @@ impl Drafter<'_> {
             }
             self.lead.recurrent_tokens(sequences.len(),self.lead.buffer("step.ids")?,head)?;
             self.lead.stream.drain()?;
-            let mut bytes=vec![0;sequences.len()*self.lead.config.predictions()*4];
-            lib.copy_d2h(&mut bytes,Buffer{bytes:bytes.len(),..self.lead.buffer("head.tokens")?})?;
+            let count=sequences.len()*self.lead.config.predictions()*4;
+            let mut bytes=vec![0;count];
+            lib.copy_d2h(&mut bytes,Buffer{bytes:count,..self.lead.buffer("head.tokens")?})?;
             let tokens=bytes.chunks_exact(4).map(|v|u32::from_le_bytes(v.try_into().unwrap())).collect::<Vec<_>>();
             Ok(tokens.chunks_exact(self.lead.config.predictions()).map(|tokens|Draft{tokens:tokens.to_vec(),features:vec![],confidence:vec![]}).collect())
         })();
