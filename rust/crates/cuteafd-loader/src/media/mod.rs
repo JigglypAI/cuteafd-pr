@@ -10,6 +10,7 @@ mod groups;
 pub mod inkling;
 pub use groups::{ImageFragment,PreparedImageGroup};
 mod muse;
+pub mod minimax;
 pub mod muse_vision;
 pub mod perception_vision;
 mod resize;
