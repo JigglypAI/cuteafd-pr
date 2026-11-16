@@ -140,6 +140,27 @@ fn inkling_mxfp8_inventory_is_planned_not_executable() {
 }
 
 #[test]
+fn mixed_four_rank_assignment_uses_each_layers_native_unit() -> anyhow::Result<()> {
+    use crate::placement::{SparkAssignment, SparkResidentLayout, SparkWorkingSet};
+    use crate::formats::fp8_experts::Slicing;
+    let (dir, _, _) = fixture_with_experts(Fixture::Mixed, 384, 8);
+    let catalog = crate::read_expert_catalog(dir.path())?;
+    let working = SparkWorkingSet { spark_layers: (0..4).collect(), spark_ranks: 4,
+        prefill_lanes: 1, ..Default::default() };
+    for unit in [16, 32, 64] {
+        for rank in 0..4 {
+            let assignment = SparkAssignment::resident_from_catalog(&catalog, &working, rank,
+                SparkResidentLayout::Fp8 { world: 4, rank, slicing: Slicing::Blocks(unit) })?;
+            assert_eq!(assignment.slices.len(), 4);
+            for slice in assignment.slices {
+                assert_eq!((slice.first, slice.width, slice.stored_width), ((rank * 576) as u32, 576, 576));
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
 fn mixed_native_checkpoint_reads_each_layers_storage_from_its_headers() {
     let (dir, _, _) = fixture(Fixture::Mixed);
     let checkpoint = Checkpoint::open(dir.path()).unwrap();

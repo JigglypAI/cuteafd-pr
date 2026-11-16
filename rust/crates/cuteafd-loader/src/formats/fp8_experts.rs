@@ -828,7 +828,8 @@ impl Fp8ExpertTensors {
         let i = self.shape.intermediate;
         let source_unit = self.exact_storage_policy(tp).map_or(self.block(), |policy| policy.unit_columns);
         ensure!(g > 0 && g % source_unit == 0 && i % g == 0 && i / g >= tp,
-            "intermediate {i} does not split into whole {g}-row blocks over {tp} ranks");
+            "intermediate {i} does not split into whole {g}-row blocks over {tp} ranks: source_unit={source_unit} rank={rank} layer={} format={:?}",
+            self.slice_layer, self.format);
         let rule = self.slice_rule(i / g, tp);
         let map = cuteafd_core::tp_units::RankUnits::new(rule, 1, i, g, self.slice_layer, tp, rank)?;
         let ranges = map.column_ranges(0)?;
