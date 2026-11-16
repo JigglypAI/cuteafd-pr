@@ -1968,11 +1968,12 @@ mod tests {
                     {
                     let workspace = drafter.workspace.borrow();
                     let workspace = workspace.as_ref().context("prepared reversed-device workspace missing")?;
+                    let output=workspace.output()?;
                     for owner in [&workspace.h, &workspace.n, &workspace.qkv, &workspace.q,
                         &workspace.k, &workspace.v, &workspace.attn, &workspace.delta, &workspace.gate_up,
-                        &workspace.act, &workspace.logits, &workspace.anchors, &workspace.ids,
-                        &workspace.tokens, &workspace.confidence, &workspace.positions, &workspace.tables,
-                        &workspace.attention_workspace, &workspace.markov_workspace, &workspace._head_workspace] {
+                        &workspace.act, &output.logits, &workspace.anchors, &workspace.ids,
+                        &output.tokens, &output.confidence, &workspace.positions, &workspace.tables,
+                        &workspace.attention_workspace, &output.markov, &output._head_workspace] {
                         assert_eq!(owner.buffer.device_id, device.id, "workspace owner follows drafter, not caller");
                     }
                     }
