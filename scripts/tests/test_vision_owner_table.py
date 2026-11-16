@@ -73,7 +73,7 @@ include(\"{ROOT}/native/cmake/shared/vision_attention.cmake\")
     assert result.returncode == 0, result.stderr
     entries = json.loads((tmp_path / "build/vision_attention/entries.json").read_text())
     assert [(e["head_dim"], e["windowed"], e["pointwise_group"]) for e in entries] == [
-        (64, False, ""), (72, False, ""), (96, False, "muse"), (96, True, "muse"), (128, False, "pixtral")]
+        (64, False, ""), (72, False, ""), (96, False, "muse"), (96, True, "muse"), (128, False, "pixtral"), (64, False, "pe_inkling2"), (96, False, "pe_step5")]
     assert entries[0]["programs"] == ["vision_attention_d64"]
     assert entries[1]["programs"] == ["vision_attention_d72"]
     exporter = ROOT / "python/tools/aot/export_b12x_vision_aot.py"
@@ -86,7 +86,7 @@ include(\"{ROOT}/native/cmake/shared/vision_attention.cmake\")
     assert entries[2]["programs"][1:] == entries[3]["programs"][1:]
     rules = (tmp_path / "build/CMakeFiles/cuteafd_vision_attention_export.dir/build.make").read_text()
     exports = [line for line in rules.splitlines() if "-E env" in line and "export_b12x_vision_aot.py" in line]
-    assert len(exports) == 6, exports  # legacy + Pixtral pair + two attention + shared pointwise
+    assert len(exports) == 9, exports  # Step reuses Muse's full attention export
     legacy = [line for line in exports if "--group" not in line]
     assert len(legacy) == 1
     assert legacy[0].endswith("--output-dir " + str(tmp_path / "build/vision_attention") + " --capability 120")
@@ -94,13 +94,56 @@ include(\"{ROOT}/native/cmake/shared/vision_attention.cmake\")
     windows = next(line for line in exports if "/d96_windows " in line)
     assert "--windowed" not in full
     assert windows.endswith("--group attention --head-dim 96 --windowed")
-    pixtral = entries[-1]
+    pixtral = entries[4]
     assert pixtral["programs"][0] == "vision_attention_d128_full"
     assert [p["name"] for p in pixtral["programs"][1:]] == [
         "vision_axial_rotary_d128_bf16", "vision_rms_bf16_gamma_h2048"]
+    for item, kind, dim in zip(entries[5:], ("inkling2", "step5"), (64, 96), strict=True):
+        inventory = subprocess.check_output(["python3", str(exporter), "--list-perception-programs", "--perception", kind], text=True).strip().split(";")
+        assert item["programs"][0] == f"vision_attention_d{dim}_full"
+        assert [p["name"] for p in item["programs"][1:]] == inventory
+        assert len(inventory) == (14 if kind == "inkling2" else 20)
+    inkling_export = next(line for line in exports if "--group perception --perception inkling2" in line)
+    assert "--omit-program vision_gelu_h4096" in inkling_export
+    assert entries[5]["programs"][-1]["directory"].endswith("pointwise_muse")
+    assert "vision_pe_patch_projection_h4096_o4096" in [p["name"] for p in entries[5]["programs"][1:]]
+    assert "vision_pe_patch_projection_h6144_o4096" in [p["name"] for p in entries[6]["programs"][1:]]
+    step = entries[6]
+    assert step["directory"] == entries[2]["directory"]
+    borrowed = [p for p in step["programs"][1:] if p["directory"].endswith("pointwise_muse")]
+    assert [p["name"] for p in borrowed] == [p["name"] for p in entries[2]["programs"][1:] if p in borrowed]
+    assert len(borrowed) == 4
+    step_export = next(line for line in exports if "--group perception --perception step5" in line)
+    assert step_export.count("--omit-program") == 4
+    for program in borrowed:
+        assert f'--omit-program {program["name"]}' in step_export
+        assert not any(Path(p).name == program["name"] + ".o" and "pointwise_pe_step5" in p
+                       for p in rules.split())
     legacy_rule = rules.split("vision_attention/vision_attention_d64.h:", 1)[1].split("vision_attention/vision_attention_d64.o:", 1)[0]
     assert "--group attention" not in legacy_rule
     assert "--group pointwise" not in legacy_rule
+
+
+def test_cmake_rejects_borrowing_an_undeclared_program(tmp_path):
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "CMakeLists.txt").write_text(f"""
+cmake_minimum_required(VERSION 3.24)
+project(vision_owner NONE)
+set(CUTEAFD_ENABLE_CUDA ON)
+set(CUTEAFD_CUDA_ARCHITECTURES 120)
+set(Python3_EXECUTABLE python3)
+add_custom_target(cuteafd_verify_sparkinfer_source)
+include(\"{ROOT}/native/cmake/shared/vision_attention.cmake\")
+cuteafd_vision_owner_entry(bad HEAD_DIM 64 POINTWISE_GROUP invalid
+  PROGRAMS vision_attention_d64_full ARGS --group attention --head-dim 64
+  POINTWISE_PROGRAMS vision_missing POINTWISE_ARGS --group transformer
+  BORROW_POINTWISE_GROUP muse BORROW_POINTWISE_PROGRAMS vision_missing)
+""")
+    result = subprocess.run(["cmake", "-S", str(source), "-B", str(tmp_path / "build")],
+                            capture_output=True, text=True)
+    assert result.returncode != 0
+    assert "does not export vision_missing" in result.stderr
 
 
 def test_native_table_lifetimes_failures_and_dispatch_without_cuda(tmp_path):

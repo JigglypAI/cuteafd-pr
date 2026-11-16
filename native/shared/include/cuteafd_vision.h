@@ -106,6 +106,15 @@ int32_t cuteafd_vision_encode(void* owner, const uint8_t* rgb, uint64_t rgb_byte
                              const float* lut, int32_t grid_h, int32_t grid_w,
                              uint16_t* output, uint64_t output_bytes,
                              cuteafd_vision_observer observer, void* observer_context);
+/* PE source pixels are not necessarily the final patch canvas (Step tensor
+ * resize); content rectangle preserves Inkling's raw -1 padding. Parameters
+ * use mean[3], processor_std[3], encoder_std[3] at the start of a 768-float view. */
+int32_t cuteafd_vision_encode_pixels(void* owner, const uint8_t* rgb, uint64_t rgb_bytes,
+                             const float* parameters, int32_t grid_h, int32_t grid_w,
+                             int32_t source_h, int32_t source_w, int32_t content_x, int32_t content_y,
+                             int32_t content_w, int32_t content_h,
+                             uint16_t* output, uint64_t output_bytes,
+                             cuteafd_vision_observer observer, void* observer_context);
 int32_t cuteafd_vision_get_ledger(void* owner, cuteafd_vision_ledger*);
 int32_t cuteafd_vision_destroy(void* owner);
 // Passive: the owner's two device backings; no device change or synchronization.

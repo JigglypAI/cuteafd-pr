@@ -14,7 +14,7 @@ set(CUTEAFD_VISION_ATTENTION_OUTPUTS)
 # command (legacy keeps its byte-identical two-object command below). Without it,
 # ARGS exports the supplied PROGRAMS as one group in an isolated directory.
 function(cuteafd_vision_owner_entry name)
-  cmake_parse_arguments(E "WINDOWED" "HEAD_DIM;POINTWISE_GROUP;DIRECTORY" "PROGRAMS;ARGS;POINTWISE_PROGRAMS;POINTWISE_ARGS" ${ARGN})
+  cmake_parse_arguments(E "WINDOWED" "HEAD_DIM;POINTWISE_GROUP;DIRECTORY;BORROW_POINTWISE_GROUP" "PROGRAMS;ARGS;POINTWISE_PROGRAMS;POINTWISE_ARGS;BORROW_POINTWISE_PROGRAMS" ${ARGN})
   if(NOT E_HEAD_DIM OR NOT E_PROGRAMS OR E_UNPARSED_ARGUMENTS)
     message(FATAL_ERROR "Incomplete vision owner entry ${name}")
   endif()
@@ -58,7 +58,25 @@ function(cuteafd_vision_owner_entry name)
     endif()
     set(pointwise_directory "${CUTEAFD_VISION_ATTENTION_DIR}/pointwise_${E_POINTWISE_GROUP}")
     set(pointwise_outputs)
+    set(pointwise_export_args ${E_POINTWISE_ARGS})
+    foreach(stem IN LISTS E_BORROW_POINTWISE_PROGRAMS)
+      if(NOT stem IN_LIST E_POINTWISE_PROGRAMS)
+        message(FATAL_ERROR "Borrowed vision program ${stem} missing from owner inventory")
+      endif()
+    endforeach()
     foreach(stem IN LISTS E_POINTWISE_PROGRAMS)
+      if(stem IN_LIST E_BORROW_POINTWISE_PROGRAMS)
+        get_property(borrowed_programs GLOBAL PROPERTY "CUTEAFD_VISION_GROUP_PROGRAMS_${E_BORROW_POINTWISE_GROUP}")
+        if(NOT stem IN_LIST borrowed_programs)
+          message(FATAL_ERROR "Vision group ${E_BORROW_POINTWISE_GROUP} does not export ${stem}")
+        endif()
+        set(borrowed_directory "${CUTEAFD_VISION_ATTENTION_DIR}/pointwise_${E_BORROW_POINTWISE_GROUP}")
+        string(JSON size LENGTH "${programs}")
+        string(JSON programs SET "${programs}" ${size}
+          "{\"directory\":\"${borrowed_directory}\",\"name\":\"${stem}\"}")
+        list(APPEND pointwise_export_args --omit-program ${stem})
+        continue()
+      endif()
       foreach(ext h o)
         list(APPEND pointwise_outputs "${pointwise_directory}/${stem}.${ext}")
       endforeach()
@@ -68,7 +86,8 @@ function(cuteafd_vision_owner_entry name)
       string(JSON programs SET "${programs}" ${size}
         "{\"directory\":\"${pointwise_directory}\",\"name\":\"${stem}\"}")
     endforeach()
-    string(JOIN ";" pointwise_signature ${E_POINTWISE_PROGRAMS} ${E_POINTWISE_ARGS})
+    set_property(GLOBAL PROPERTY "CUTEAFD_VISION_GROUP_PROGRAMS_${E_POINTWISE_GROUP}" "${E_POINTWISE_PROGRAMS}")
+    string(JOIN ";" pointwise_signature ${E_POINTWISE_PROGRAMS} ${pointwise_export_args})
     get_property(existing_signature GLOBAL PROPERTY "CUTEAFD_VISION_POINTWISE_${E_POINTWISE_GROUP}")
     if(existing_signature AND NOT existing_signature STREQUAL pointwise_signature)
       message(FATAL_ERROR "Conflicting vision pointwise group ${E_POINTWISE_GROUP}")
@@ -79,7 +98,7 @@ function(cuteafd_vision_owner_entry name)
       COMMAND ${CUTEAFD_SPARKINFER_VERIFY_COMMAND}
       COMMAND "${CMAKE_COMMAND}" -E env ${CUTEAFD_SPARKINFER_PYTHON_ENV}
         ${CUTEAFD_EXPORT_LAUNCHER} "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/aot/export_b12x_vision_aot.py"
-        --output-dir "${pointwise_directory}" --capability ${CUTEAFD_VISION_CAPABILITY} ${E_POINTWISE_ARGS}
+        --output-dir "${pointwise_directory}" --capability ${CUTEAFD_VISION_CAPABILITY} ${pointwise_export_args}
       DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/aot/export_b12x_vision_aot.py"
         ${CUTEAFD_SPARKINFER_PROVENANCE_INPUTS} ${CUTEAFD_SPARKINFER_EXPORT_INPUTS}
       COMMENT "Exporting vision owner ${name} pointwise group" VERBATIM)
@@ -136,6 +155,31 @@ cuteafd_vision_owner_entry(d128 HEAD_DIM 128 POINTWISE_GROUP pixtral
   PROGRAMS vision_attention_d128_full ARGS --group attention --head-dim 128
   POINTWISE_PROGRAMS vision_axial_rotary_d128_bf16 vision_rms_bf16_gamma_h2048
   POINTWISE_ARGS --group pointwise --head-dim 128 --hidden 2048 --bf16-products --bf16-before-gamma)
+# Lender groups must precede their borrowers; the helper validates availability.
+foreach(kind inkling2 step5)
+  if(kind STREQUAL "inkling2")
+    set(dim 64)
+  else()
+    set(dim 96)
+  endif()
+  execute_process(COMMAND "${Python3_EXECUTABLE}" "${muse_exporter}" --list-perception-programs --perception ${kind}
+    RESULT_VARIABLE pe_status OUTPUT_VARIABLE pe_programs OUTPUT_STRIP_TRAILING_WHITESPACE)
+  if(NOT pe_status EQUAL 0 OR NOT pe_programs)
+    message(FATAL_ERROR "Cannot read ${kind} PE export inventory")
+  endif()
+  set(shared_attention)
+  set(borrowed_programs vision_gelu_h4096)
+  if(kind STREQUAL "step5")
+    set(shared_attention DIRECTORY "${CUTEAFD_VISION_ATTENTION_DIR}/d96_full")
+    set(borrowed_programs
+      vision_biased_projection_h1536_o4608 vision_biased_projection_h1536_o1536
+      vision_biased_projection_h1536_o8960 vision_biased_projection_h8960_o1536)
+  endif()
+  cuteafd_vision_owner_entry(pe_${kind} HEAD_DIM ${dim} POINTWISE_GROUP pe_${kind} ${shared_attention}
+    PROGRAMS vision_attention_d${dim}_full ARGS --group attention --head-dim ${dim}
+    BORROW_POINTWISE_GROUP muse BORROW_POINTWISE_PROGRAMS ${borrowed_programs}
+    POINTWISE_PROGRAMS ${pe_programs} POINTWISE_ARGS --group perception --perception ${kind})
+endforeach()
 get_property(owner_outputs GLOBAL PROPERTY CUTEAFD_VISION_OWNER_OUTPUTS)
 list(APPEND CUTEAFD_VISION_ATTENTION_OUTPUTS ${owner_outputs})
 list(REMOVE_DUPLICATES CUTEAFD_VISION_ATTENTION_OUTPUTS)
