@@ -13,6 +13,43 @@ pub(crate) trait UnitBuffers<'a> {
     fn stream(&self) -> &Stream<'a>;
     fn layout(&self) -> &UnitLayout;
     fn buffer(&self, name: &str) -> Result<Buffer>;
+    fn packed(&self) -> Option<(&UnitOwner<'a>, &super::cache::CacheBank<'a>, usize, &[PackedMember])> { None }
+    fn prepare_page_table(&self, _pages: &[i32]) -> Result<()> { anyhow::bail!("Inkling owner has no packed page-table uploader") }
+}
+
+#[derive(Clone)]
+pub(crate) struct PackedMember {
+    pub sequence: usize,
+    pub rows: std::ops::Range<usize>,
+    pub metadata: cuteafd_loader::families::inkling2::execution::UnitMetadata,
+}
+
+pub(crate) struct PackedLayerUnit<'u, 'a> {
+    pub unit: &'u UnitOwner<'a>,
+    pub cache: &'u super::cache::CacheBank<'a>,
+    pub layer: usize,
+    pub members: &'u [PackedMember],
+    pub uploads: std::cell::RefCell<&'u mut crate::shared::token_table::RetainedUploads<'a>>,
+}
+impl<'a> UnitBuffers<'a> for PackedLayerUnit<'_, 'a> {
+    fn stream(&self) -> &Stream<'a> { &self.unit.stream }
+    fn layout(&self) -> &UnitLayout { &self.unit.layout }
+    fn buffer(&self, name: &str) -> Result<Buffer> {
+        match name {
+            "global_cache" => self.cache.global(self.layer),
+            "cache_slots" if self.cache.layout.global_layers.contains(&self.layer) => self.unit.buffer("global_slots"),
+            _ => self.unit.buffer(name),
+        }
+    }
+    fn packed(&self) -> Option<(&UnitOwner<'a>, &super::cache::CacheBank<'a>, usize, &[PackedMember])> {
+        Some((self.unit, self.cache, self.layer, self.members))
+    }
+    fn prepare_page_table(&self, pages: &[i32]) -> Result<()> {
+        let bytes = pages.iter().flat_map(|value| value.to_le_bytes()).collect::<Vec<_>>();
+        // SAFETY: the retained upload owner fences its immutable source; the
+        // per-sequence cache launch consumes this table before the next upload.
+        unsafe { self.uploads.borrow_mut().upload(self.unit.buffer("page_table")?, &bytes, self.unit.stream.raw) }
+    }
 }
 
 pub(crate) struct LayerUnit<'u, 'a> {
@@ -100,6 +137,38 @@ impl<'a> UnitOwner<'a> {
             }
             Ok(())
         })
+    }
+    pub fn packed_metadata(&self, layer: usize, cache: &super::cache::CacheBank<'a>, members: &[PackedMember],
+        uploads: &mut crate::shared::token_table::RetainedUploads<'a>) -> Result<()> {
+        let rows = members.last().context("Inkling packed metadata is empty")?.rows.end;
+        let mut positions = Vec::with_capacity(rows);
+        let mut local = Vec::with_capacity(rows);
+        let mut global = Vec::with_capacity(rows);
+        let mut ring = Vec::with_capacity(rows);
+        let mut conv = Vec::with_capacity(rows);
+        let mut first = Vec::with_capacity(rows);
+        for member in members {
+            ensure!(member.rows.start == positions.len() && member.metadata.rows() == member.rows.len(),
+                "Inkling packed metadata members do not cover unit rows");
+            positions.extend_from_slice(&member.metadata.positions);
+            local.extend_from_slice(&member.metadata.local_slots);
+            global.extend_from_slice(&member.metadata.global_slots);
+            ring.extend_from_slice(&member.metadata.ring_slots);
+            conv.extend_from_slice(&member.metadata.conv_slots);
+            first.extend(std::iter::repeat_n(0i32, member.rows.len()));
+        }
+        ensure!(rows <= self.layout.rows && layer < cache.layout.layers.len(), "Inkling packed metadata extent differs");
+        for (name, values) in [("positions", positions), ("cache_slots", local), ("global_slots", global),
+            ("ring_slots", ring), ("conv_slots", conv)] {
+            let bytes = values.iter().flat_map(|value| value.to_le_bytes()).collect::<Vec<_>>();
+            // SAFETY: each whole-row destination is admitted and the immutable
+            // packed source stays fenced through every arithmetic consumer.
+            unsafe { uploads.upload(self.buffer(name)?, &bytes, self.stream.raw)?; }
+        }
+        let bytes = first.iter().flat_map(|value| value.to_le_bytes()).collect::<Vec<_>>();
+        // SAFETY: same whole-unit metadata source lifetime.
+        unsafe { uploads.upload(self.buffer("first")?, &bytes, self.stream.raw)?; }
+        Ok(())
     }
     /// Caller admits each named physical request and its allocation tail first.
     pub fn new(stream: Rc<Stream<'a>>, layout: UnitLayout) -> Result<Self> {
@@ -217,4 +286,49 @@ impl<'a> UnitBuffers<'a> for UnitOwner<'a> {
 }
 impl Drop for UnitOwner<'_> {
     fn drop(&mut self) { self.stream.drain_or_abort("Inkling unit owners"); }
+}
+
+#[cfg(test)]
+mod packed_tests {
+    use super::*;
+    use cuteafd_ffi::native_library_lifetime_fixture::Fixture;
+    use cuteafd_loader::families::inkling2::{execution::{CacheLayout, UnitMetadata}, Inkling2Config};
+
+    #[test]
+    fn packed_metadata_keeps_sequence_frontiers_and_whole_row_offsets() -> Result<()> {
+        let fixture = Fixture::build_for_tests()?;
+        let library = fixture.load()?;
+        fixture.immediate_copies(&library)?;
+        fixture.configure_device_flags(&library, 0)?;
+        let device = crate::shared::memory::device::Device { library: &library, id: 0 };
+        let stream = Rc::new(Stream::new(device)?);
+        let mut cfg = Inkling2Config::from_hf(&serde_json::from_str(include_str!(
+            "../../../../cuteafd-loader/src/families/inkling2/fixtures/config.json"))?)?;
+        cfg.layers = 2;
+        cfg.local = vec![true, false];
+        let cache = super::super::cache::CacheBank::new(vec![stream.clone()], CacheLayout::new(&cfg, 2, 4)?, 0)?;
+        let unit = UnitOwner::new(stream.clone(), UnitLayout::serving(&cfg, 4, 128)?)?;
+        let mut uploads = unit.uploads(&cfg, 2)?;
+        let members = vec![
+            PackedMember { sequence: 1, rows: 0..1, metadata: UnitMetadata::new(&cfg, 63..64, &[2], 4)? },
+            PackedMember { sequence: 0, rows: 1..4, metadata: UnitMetadata::new(&cfg, 65..68, &[0, 3], 4)? },
+        ];
+        unit.packed_metadata(1, &cache, &members, &mut uploads)?;
+        stream.drain()?;
+        let values = |name: &str| -> Result<Vec<i64>> {
+            let buffer = unit.buffer(name)?;
+            let mut bytes = vec![0; buffer.bytes];
+            library.copy_d2h(&mut bytes, buffer)?;
+            Ok(bytes.chunks_exact(8).map(|b| i64::from_le_bytes(b.try_into().unwrap())).collect())
+        };
+        assert_eq!(values("positions")?, [63, 65, 66, 67]);
+        assert_eq!(values("cache_slots")?, [0, 0, 1, 2]);
+        assert_eq!(values("global_slots")?, [191, 193, 194, 195]);
+        assert_eq!(values("conv_slots")?, [0; 4]);
+        let packed = PackedLayerUnit { unit: &unit, cache: &cache, layer: 1, members: &members,
+            uploads: std::cell::RefCell::new(&mut uploads) };
+        assert_eq!(packed.buffer("partial")?.ptr, unit.buffer("partial")?.ptr);
+        assert_eq!(packed.buffer("cache_slots")?.ptr, unit.buffer("global_slots")?.ptr);
+        Ok(())
+    }
 }

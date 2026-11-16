@@ -34,17 +34,21 @@ impl<'a> UnitIo<'a> for TokenIo<'_, 'a> {
         self.head.embed_unit(self.kernels, owner, self.target, self.cfg, &tokens, uploads)
     }
     fn end(&mut self, unit: &Unit, owner: &super::owners::UnitOwner<'a>) -> Result<()> {
-        for member in members(unit) {
-            if !member.head { continue; }
-            let sequence = *self.slots.get(member.sequence).context("Inkling head sequence slot absent")?;
-            for span in crate::shared::probe::head_spans(member.rows.len(), 64)? {
-                let rows = member.rows.start+span.start..member.rows.start+span.end;
-                let state = owner.segment(self.cache, sequence, self.cfg.layers-1, rows)?;
-                let output_row = if self.retained_rows { member.rows.start+span.start } else { 0 };
-                let logits = self.head.project_at(self.kernels, &state, self.target, self.cfg, span.len(),
-                    self.cfg.residual_blocks()+1, output_row)?;
-                (self.on_logits)(member.sequence, member.tokens.start+span.start+1,
-                    crate::shared::token_io::DeviceLogits { ptr: logits.ptr, rows: span.len(),
+        let members = members(unit);
+        if !members.iter().any(|member| member.head) { return Ok(()); }
+        let sequence = *self.slots.get(members[0].sequence).context("Inkling head sequence slot absent")?;
+        for span in crate::shared::probe::head_spans(unit.rows.len(), 64)? {
+            let state = owner.segment(self.cache, sequence, self.cfg.layers-1, span.clone())?;
+            let output_row = if self.retained_rows { span.start } else { 0 };
+            let logits = self.head.project_at(self.kernels, &state, self.target, self.cfg, span.len(),
+                self.cfg.residual_blocks()+1, output_row)?;
+            for member in members.iter().filter(|member| member.head) {
+                let first = span.start.max(member.rows.start);
+                let end = span.end.min(member.rows.end);
+                if first >= end { continue; }
+                let offset = (first-span.start)*self.cfg.unpadded_vocab_size*4;
+                (self.on_logits)(member.sequence, member.tokens.start+first-member.rows.start+1,
+                    crate::shared::token_io::DeviceLogits { ptr: logits.ptr.wrapping_byte_add(offset), rows: end-first,
                         vocab: self.cfg.unpadded_vocab_size, stride: self.cfg.unpadded_vocab_size,
                         stream: owner.stream.raw, greedy: None })?;
             }
@@ -85,18 +89,20 @@ impl Stateful<'_, '_> {
         let waves = self.owners.len();
         run_prefill_units(self, units, waves)
     }
+    fn packed_members(&self, unit: &Unit) -> Result<Vec<super::owners::PackedMember>> {
+        members(unit).into_iter().map(|member| {
+            let placement = &self.placements[member.sequence];
+            Ok(super::owners::PackedMember { sequence: placement.slot, rows: member.rows,
+                metadata: cuteafd_loader::families::inkling2::execution::UnitMetadata::new(self.cfg,
+                    member.tokens, &placement.units, self.cache.layout.pool_pages)? })
+        }).collect()
+    }
     fn join(&mut self, layer: usize, unit: &Unit) -> Result<()> {
         let owner = &self.owners[unit.slot];
-        for member in members(unit) {
-            let placement = &self.placements[member.sequence];
-            let metadata = cuteafd_loader::families::inkling2::execution::UnitMetadata::new(self.cfg,
-                member.tokens.clone(), &placement.units, self.cache.layout.pool_pages)?;
-            owner.segment_metadata(self.cache, placement.slot, layer, member.rows.clone(), &metadata,
-                &mut self.uploads[unit.slot])?;
-            let state = owner.segment(self.cache, placement.slot, layer, member.rows.clone())?;
-            layers::join_experts(self.kernels, &state, self.target, self.cfg, layer, member.rows.len())?;
-        }
-        Ok(())
+        let members = self.packed_members(unit)?;
+        let state = super::owners::PackedLayerUnit { unit: owner, cache: self.cache, layer, members: &members,
+            uploads: std::cell::RefCell::new(&mut self.uploads[unit.slot]) };
+        layers::join_experts(self.kernels, &state, self.target, self.cfg, layer, unit.rows.len())
     }
 }
 
@@ -129,16 +135,11 @@ impl PrefillHooks for Stateful<'_, '_> {
     }
     fn attention(&mut self, layer: usize, unit: &Unit) -> Result<()> {
         let owner = &self.owners[unit.slot];
-        for member in members(unit) {
-            let placement = &self.placements[member.sequence];
-            let metadata = cuteafd_loader::families::inkling2::execution::UnitMetadata::new(self.cfg,
-                member.tokens.clone(), &placement.units, self.cache.layout.pool_pages)?;
-            owner.segment_metadata(self.cache, placement.slot, layer, member.rows.clone(), &metadata,
-                &mut self.uploads[unit.slot])?;
-            let state = owner.segment(self.cache, placement.slot, layer, member.rows.clone())?;
-            layers::begin_layer(self.kernels, &state, self.target, self.cfg, layer, member.rows.len())?;
-        }
-        Ok(())
+        let members = self.packed_members(unit)?;
+        owner.packed_metadata(layer, self.cache, &members, &mut self.uploads[unit.slot])?;
+        let state = super::owners::PackedLayerUnit { unit: owner, cache: self.cache, layer, members: &members,
+            uploads: std::cell::RefCell::new(&mut self.uploads[unit.slot]) };
+        layers::begin_layer(self.kernels, &state, self.target, self.cfg, layer, unit.rows.len())
     }
     fn local_ffn(&mut self, layer: usize, unit: &Unit) -> Result<()> {
         let owner = &self.owners[unit.slot];
