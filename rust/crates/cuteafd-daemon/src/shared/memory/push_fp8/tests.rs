@@ -742,3 +742,64 @@ fn installed_native_scratch_matches_legacy() -> Result<()> {
     }
     Ok(())
 }
+
+#[test]
+fn mixed_tp4_native_admission_equals_physical_arena_with_scalar_tails() -> Result<()> {
+    use cuteafd_loader::plan::testing::t;
+    use cuteafd_loader::serving_capacity::{fp8_expert_regions, WeightArenaLayout};
+    let root = tempfile::tempdir()?;
+    let mut config: serde_json::Value = serde_json::from_str(include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"), "/../cuteafd-loader/src/families/inkling2/fixtures/config.json")))?;
+    config["text_config"]["num_hidden_layers"] = 4.into();
+    config["text_config"]["local_layer_ids"] = serde_json::json!([0, 1, 2]);
+    config["text_config"]["n_layers_per_attn_res_block"] = 2.into();
+    config["mtp_config"]["target_layer_ids"] = serde_json::json!([1, 4]);
+    let (experts, hidden, intermediate) = (384, 4608, 2304);
+    let mut headers = Vec::new();
+    for layer in 0..4 {
+        let prefix = format!("model.llm.layers.{layer}.mlp.experts");
+        for (projection, rows, cols) in [("w13", 2 * intermediate, hidden), ("w2", hidden, intermediate)] {
+            if layer < 3 {
+                headers.extend([
+                    t(format!("{prefix}.{projection}_weight"), "U8", &[experts, rows, cols / 2]),
+                    t(format!("{prefix}.{projection}_weight_scale"), "F8_E4M3", &[experts, rows, cols / 16]),
+                    t(format!("{prefix}.{projection}_weight_amax"), "F32", &[experts]),
+                    t(format!("{prefix}.{projection}_weight_outer_scale_denominator"), "F32", &[1]),
+                ]);
+            } else {
+                headers.extend([
+                    t(format!("{prefix}.{projection}_weight"), "F8_E4M3", &[experts, rows, cols]),
+                    t(format!("{prefix}.{projection}_weight_scale"), "U8", &[experts, rows, cols / 32]),
+                ]);
+            }
+        }
+    }
+    write_snapshot(root.path(), &config, &headers, None);
+    let catalog = cuteafd_loader::read_expert_catalog(root.path())?;
+    let tensors = catalog.fp8().context("mixed fixture native catalog")?;
+    for rank in 0..4 {
+        let layers = (0..4).map(|layer| {
+            let view = tensors.for_layer_metadata(layer)?;
+            Ok((layer, view.exact_slicing(4)))
+        }).collect::<Result<Vec<_>>>()?;
+        let regions = layers.iter().map(|&(layer, slicing)|
+            fp8_expert_regions(tensors, &[layer], 4, rank, slicing))
+            .collect::<Result<Vec<_>>>()?.into_iter().flatten().collect::<Vec<_>>();
+        let layout = WeightArenaLayout::new("mixed-native-oracle", regions)?;
+        let payload = layers.iter().try_fold(0usize, |sum, &(layer, slicing)| -> Result<usize> {
+            Ok(sum + tensors.for_layer_metadata(layer)?.layer_load(layer, 4, rank, slicing)?.resident)
+        })?;
+        assert_eq!(layout.bytes() - payload, 3 * 3 * 252);
+        let plan = RankPlan::new(&catalog, &layers, 4, rank, layout.bytes())?;
+        assert_eq!(plan.layout.bytes(), layout.bytes());
+        assert!(RankPlan::new(&catalog, &layers, 4, rank, payload).is_err());
+        for layer in &plan.layers {
+            assert_eq!((layer.slice.width, layer.slice.stored_width), (576, 576));
+            for (index, plane) in layer.planes.iter().enumerate() {
+                let view = layout.view(&format!("{}.{index}", layer.layer)).context("plane view")?;
+                assert_eq!((plane.start, plane.len()), (view.offset(), view.bytes()));
+            }
+        }
+    }
+    Ok(())
+}
