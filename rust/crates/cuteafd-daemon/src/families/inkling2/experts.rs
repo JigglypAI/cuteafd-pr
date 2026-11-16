@@ -30,6 +30,9 @@ impl<'a> Resident<'a> {
         ensure!(backend.shard() == crate::shared::experts::rtx::RtxShard::Whole
             && backend.layers().contains(&layer) && backend.device() == stream.device.id,
             "Inkling resident adapter requires a whole native backend");
+        let element = if backend.partial() == crate::shared::experts::rtx::PartialDtype::F32 { 4 } else { 2 };
+        ensure!(!backend.output().is_null() && backend.workspace_bytes() >= 4608*element,
+            "Inkling resident workspace cannot hold one output row");
         Ok(Self { layer, backend: Rc::new(std::cell::RefCell::new(backend)), stream })
     }
     /// Bind already committed push payloads through the shared whole executor;
@@ -84,6 +87,10 @@ impl Dispatcher for Resident<'_> {
         ensure!(rows > 0 && backend.device() == stream.device.id
             && backend.partial_layout(rows)? == PartialLayout::Tokens && output.bytes >= rows*4608*2,
             "Inkling resident owner/output layout differs");
+        let element = if backend.partial() == PartialDtype::F32 { 4 } else { 2 };
+        let result_bytes = rows.checked_mul(4608*element).context("Inkling resident output extent overflow")?;
+        ensure!(!backend.output().is_null() && backend.workspace_bytes() >= result_bytes,
+            "Inkling resident workspace cannot hold submitted output rows");
         let wire = backend.uses_fp8_input();
         let input_bytes = rows * if wire { 4752 } else { 4608*2 };
         for (buffer, bytes) in [(input, input_bytes), (ids, rows*8*4), (weights, rows*8*4), (output, rows*4608*2)] {
@@ -165,7 +172,12 @@ mod resident_tests {
         let bf16 = alloc(2*4608*2)?;
         native.enqueue(bf16.buffer, ids.buffer, weights.buffer, output.buffer, 2, &stream)?;
         assert!(native.enqueue(input.buffer, ids.buffer, weights.buffer, output.buffer, 2, &stream).is_err());
-        assert!(Resident::new(0, Box::new(Backend { output: alloc(32)?, wire: false }), stream.clone()).is_err());
+        for wire in [false, true] {
+            assert!(Resident::new(0, Box::new(Backend { output: alloc(32)?, wire }), stream.clone()).is_err());
+            let one = Resident::new(0, Box::new(Backend { output: alloc(4608*2)?, wire }), stream.clone())?;
+            let source = if wire { input.buffer } else { bf16.buffer };
+            assert!(one.enqueue(source, ids.buffer, weights.buffer, output.buffer, 2, &stream).is_err());
+        }
         let handles = Resident::for_layers(Box::new(Backend { output: alloc(2*4608*2)?, wire: true }), stream.clone())?;
         assert_eq!(handles.len(), 1);
         assert_eq!(handles[0].layer, 0);
