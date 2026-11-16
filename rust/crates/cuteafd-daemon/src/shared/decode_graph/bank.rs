@@ -62,6 +62,7 @@ struct DeviceBinding {
     site: super::device::Site,
     pinned_hits: u64,
     pinned_counts: Vec<(u64, u64)>,
+    touched: Vec<usize>,
     clocks: std::sync::Arc<[super::device::EpochClock; 2]>,
     lane: usize,
 }
@@ -70,7 +71,8 @@ impl DeviceBinding {
     fn flush(&mut self, cache: &mut super::device::DeviceCache) {
         if std::mem::take(&mut self.pinned_hits) == 0 { return }
         cache.sample_clock();
-        for (id, count) in &mut self.pinned_counts {
+        for slot in self.touched.drain(..) {
+            let (id, count) = &mut self.pinned_counts[slot];
             cache.batched_hits(*id, self.site.cycle, std::mem::take(count));
         }
     }
@@ -194,7 +196,7 @@ impl<K: Hash + Eq + Clone + std::fmt::Debug, E> GraphBank<K, E> {
         let cache = super::device::device_cache(library, device, reserve, site.basis)?;
         let bank = cache.lock().unwrap_or_else(|p| p.into_inner()).bank();
         let (clocks, lane) = cache.lock().unwrap_or_else(|p| p.into_inner()).bank_clock(bank);
-        self.device = Some(DeviceBinding { cache, bank, site, pinned_hits: 0, pinned_counts: Vec::new(), clocks, lane });
+        self.device = Some(DeviceBinding { cache, bank, site, pinned_hits: 0, pinned_counts: Vec::new(), touched: Vec::new(), clocks, lane });
         Ok(())
     }
 
@@ -206,7 +208,7 @@ impl<K: Hash + Eq + Clone + std::fmt::Debug, E> GraphBank<K, E> {
         let cache = super::device::device_cache_sampled(device, reserve, site.basis, || Ok((0, 0, 0, 0, 0)))?;
         let bank = cache.lock().unwrap_or_else(|p| p.into_inner()).bank();
         let (clocks, lane) = cache.lock().unwrap_or_else(|p| p.into_inner()).bank_clock(bank);
-        self.device = Some(DeviceBinding { cache, bank, site, pinned_hits: 0, pinned_counts: Vec::new(), clocks, lane });
+        self.device = Some(DeviceBinding { cache, bank, site, pinned_hits: 0, pinned_counts: Vec::new(), touched: Vec::new(), clocks, lane });
         Ok(())
     }
 
@@ -234,7 +236,10 @@ impl<K: Hash + Eq + Clone + std::fmt::Debug, E> GraphBank<K, E> {
                 token.hit(binding.clocks[binding.lane].index.load(std::sync::atomic::Ordering::Relaxed));
             }
             binding.pinned_hits += 1;
-            binding.pinned_counts[entry.pinned_slot.expect("cache hit slot")].1 += 1;
+            let slot = entry.pinned_slot.expect("cache hit slot");
+            let count = &mut binding.pinned_counts[slot].1;
+            if *count == 0 { binding.touched.push(slot); }
+            *count += 1;
         }
         Some(&entry.exec)
     }
@@ -261,6 +266,10 @@ impl<K: Hash + Eq + Clone + std::fmt::Debug, E> GraphBank<K, E> {
         let pinned_slot = self.device.as_mut().map(|binding| {
             let slot = binding.pinned_counts.len();
             binding.pinned_counts.push((id, 0));
+            // Reserve on insertion, not the first hit of a new cycle.
+            if binding.touched.capacity() < binding.pinned_counts.len() {
+                binding.touched.reserve(binding.pinned_counts.len() - binding.touched.len());
+            }
             slot
         });
         let token = self.device.as_ref().map(|binding|
@@ -358,17 +367,18 @@ impl<K: Hash + Eq + Clone + std::fmt::Debug, E> GraphBank<K, E> {
             let shared = binding.cache.clone();
             let mut cache = shared.lock().unwrap_or_else(|p| p.into_inner());
             binding.flush(&mut cache);
-            self.entries.retain(|_, entry| entry.valid());
-            // Reuse counter slots after churn; retired generations must not make
-            // this bank's cycle fold grow without bound.
-            binding.pinned_counts.clear();
-            for entry in self.entries.values_mut() {
-                if let Some((id, _)) = entry.cached {
-                    entry.pinned_slot = Some(binding.pinned_counts.len());
-                    binding.pinned_counts.push((id, 0));
+            let changed = self.cache_keys_dirty || self.cache_key_generation != cache.identity_generation();
+            if changed || binding.pinned_counts.len() > self.entries.len() {
+                self.entries.retain(|_, entry| entry.valid());
+                binding.pinned_counts.clear();
+                for entry in self.entries.values_mut() {
+                    if let Some((id, _)) = entry.cached {
+                        entry.pinned_slot = Some(binding.pinned_counts.len());
+                        binding.pinned_counts.push((id, 0));
+                    }
                 }
             }
-            if self.cache_keys_dirty || self.cache_key_generation != cache.identity_generation() {
+            if changed {
                 self.cache_keys.retain(|_, identity| cache.retains_identity(identity));
                 self.cache_keys_dirty = false;
                 self.cache_key_generation = cache.identity_generation();
@@ -1056,3 +1066,6 @@ impl<K: Hash + Eq + Clone + std::fmt::Debug, E> super::CacheAttached for GraphBa
 
 #[cfg(test)]
 mod perf_tests;
+
+#[cfg(test)]
+mod perf_mixed_tests;
