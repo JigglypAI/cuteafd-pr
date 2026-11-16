@@ -293,8 +293,7 @@ impl<'a> RequestOwners<'a> {
         let context = usize::try_from(inputs.context.maximum)?;
         let pages = usize::try_from(admitted.solved.pool_tokens.div_ceil(64))?;
         let cache_layout = cuteafd_loader::families::inkling2::execution::CacheLayout::with_format(cfg, sequences, pages, inputs.kv_format)?;
-        let mark_slots = usize::try_from(cuteafd_core::prefix::mark_slots_with_host(inputs.sequences, inputs.prefix_entries,
-            cache_layout.sequence_bytes as u64, inputs.prefix_mark_budget, inputs.host_prefix.quota_bytes > 0))?;
+        let mark_slots = inputs.prefix_mark_slots;
         let decode_layout = UnitLayout::serving_format(cfg, 64, context, inputs.kv_format, sequences)?;
         let prefill_layout = UnitLayout::serving_format(cfg, usize::try_from(inputs.prefill.rows)?, context, inputs.kv_format, sequences)?;
         let owner = |id: &str, bytes: usize, location| -> Result<()> {

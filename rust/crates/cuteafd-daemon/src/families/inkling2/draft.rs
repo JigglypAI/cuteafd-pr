@@ -18,7 +18,7 @@ pub(crate) struct Binding<'a>{
 }
 impl<'a> Binding<'a>{
     pub fn new(programs:&'a Programs<'a>,stream:Rc<Stream<'a>>,weights:Weights<'a>,layout:DraftLayout,
-        admitted:&ResolvedPlan,target_head:Buffer,prefill_rows:usize,waves:usize)->Result<Self>{
+        admitted:&ResolvedPlan,target_head:Buffer,prefill_rows:usize,waves:usize,mark_slots:usize)->Result<Self>{
         ensure!(layout.weights.len()==1 && layout.runtime.len()==1,"Inkling target binding currently runs whole rank");
         let runtime=&layout.runtime[0];
         let check=|id:&str,bytes:usize|->Result<()>{
@@ -28,14 +28,14 @@ impl<'a> Binding<'a>{
         check(layout.weights[0].arena.id(),layout.weights[0].arena.bytes())?;
         for (name,bytes) in &runtime.buffers{check(&format!("inkling2.draft.0.{name}"),*bytes)?;}
         for (name,bytes) in &layout.target{check(&format!("inkling2.draft.target.{name}"),*bytes)?;}
-        if layout.marks>0{check("inkling2.draft.0.marks",runtime.window_mark_bytes*layout.marks)?;}
+        if mark_slots>0{check("inkling2.draft.0.marks",runtime.window_mark_bytes*mark_slots)?;}
         let kernels=ProgramsForRank::load(programs,&weights,&layout.config,runtime,stream.device)?;
         let rank=Rank::allocate(weights,Rc::clone(&stream),layout.config.clone(),runtime.clone(),kernels)?;
         rank.initialize_derived()?;rank.fold_head(target_head)?;
         let context=ContextBank{state:RefCell::new(ContextState::new(runtime.slots,
             usize::try_from(admitted.served_context())?,runtime.cache.target_tokens,0x494e4b4d5450)?)};
         let drafter=Rc::new(Drafter::whole(rank,context)?);
-        let marks=(layout.marks>0).then(||Marks::new(&drafter.lead,layout.marks)).transpose()?;
+        let marks=(mark_slots>0).then(||Marks::new(&drafter.lead,mark_slots)).transpose()?;
         let verify=Verify::new(programs,Rc::clone(&stream),runtime.slots,11264)?;
         let prefill=(0..waves).map(|_|TapBuffer::new(Rc::clone(&stream),&layout.config,prefill_rows)).collect::<Result<Vec<_>>>()?;
         let decode=TapBuffer::new(Rc::clone(&stream),&layout.config,64)?;

@@ -4,6 +4,13 @@ use crate::{formats::block_dspark::recurrent::{loading::{RecurrentSource,Recurre
     plan::checkpoint::CheckpointView};
 use anyhow::{ensure,Context,Result};
 
+/// Target and drafter banks share this single combined-budget slot count.
+pub fn prefix_mark_slots(sequences:u64,entries:u64,target_bytes:u64,draft_bytes:u64,
+    budget:u64,host:bool)->Result<usize>{
+    let bytes=target_bytes.checked_add(draft_bytes).context("Inkling combined mark bytes overflow")?;
+    Ok(usize::try_from(cuteafd_core::prefix::mark_slots_with_host(sequences,entries,bytes,budget,host))?)
+}
+
 #[derive(Debug,Clone,Copy)]
 pub struct Selection {pub kv_cache:Qwen4KvCache,pub sms:usize}
 
@@ -12,13 +19,12 @@ pub struct DraftLayout {
     pub config:RecurrentBlockConfig,
     pub weights:Vec<RecurrentWeightLayout>,
     pub runtime:Vec<RecurrentRuntimeLayout>,
-    pub marks:usize,
     /// Target-side tap and exact FIR verification storage, independent of pool.
     pub target:Vec<(String,usize)>,
 }
 impl DraftLayout {
     pub fn new(view:&CheckpointView,ranks:usize,slots:usize,sequences:usize,context:usize,pool:usize,
-        prefill:usize,waves:usize,sms:usize,format:Qwen4KvCache,marks:usize)->Result<Self>{
+        prefill:usize,waves:usize,sms:usize,format:Qwen4KvCache)->Result<Self>{
         ensure!(matches!(ranks,1|2) && slots>0 && sequences>0 && prefill>0 && waves>0,"recurrent draft fact geometry");
         let source=RecurrentSource::open(view)?;
         let lead=ranks-1;
@@ -49,6 +55,6 @@ impl DraftLayout {
         target.push(("verify.checkpoint".into(),conv.bytes()?));
         target.push(("verify.replay".into(),extent(&[48,64,conv.width,4])?));
         target.push(("verify.table".into(),64*12));
-        Ok(Self{config:source.config,weights,runtime,marks,target})
+        Ok(Self{config:source.config,weights,runtime,target})
     }
 }

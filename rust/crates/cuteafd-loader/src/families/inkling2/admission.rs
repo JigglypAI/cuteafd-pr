@@ -298,19 +298,20 @@ pub fn gather(request: &FactsRequest<'_>) -> Result<InklingInputs, Refused> {
     let physical = (0..gpus).map(|gpu| request.coordinator.physical(gpu)).collect::<Vec<_>>();
     let maximum_pool_tokens = crate::placement::PoolPolicy::resolve(&physical, context, request.pool_tokens,
         page_rows).maximum_tokens();
+    let prefix_mark_slots=super::draft::prefix_mark_slots(request.sequences,request.prefix_entries,
+        mark_bytes,draft_mark,request.prefix_mark_budget,host_prefix.quota_bytes>0)
+        .map_err(|error|refused(format!("Inkling prefix slots refused: {error:#}"),"Check combined mark extent."))?;
     let drafter=request.drafter.map(|selection| {
         let view=request.checkpoint.view.as_ref().context("bundled drafter needs selected checkpoint view")?;
-        let marks=cuteafd_core::prefix::mark_slots_with_host(request.sequences,request.prefix_entries,
-            mark_bytes+draft_mark,request.prefix_mark_budget,host_prefix.quota_bytes>0) as usize;
         super::draft::DraftLayout::new(view,gpus,usize::try_from(request.sequences)?,
             usize::try_from(request.sequences)?.min(8),usize::try_from(context)?,usize::try_from(maximum_pool_tokens)?,
-            usize::try_from(shape.rows)?,usize::try_from(shape.waves)?,selection.sms,selection.kv_cache,marks)
+            usize::try_from(shape.rows)?,usize::try_from(shape.waves)?,selection.sms,selection.kv_cache)
             .map(|layout|shared::Drafter{layout})
     }).transpose().map_err(|error|refused(format!("bundled drafter inventory refused: {error:#}"),"Check MTP tensor headers and exports."))?;
     Ok(InklingInputs { cfg: cfg.clone(), kv_format: request.kv_format, gpus, spark_ranks: ranks,
         context: Context::resolve(context, (request.context_tokens > 0).then_some(request.context_tokens)),
         maximum_pool_tokens, prefill: shape, sequences: request.sequences, prefix_entries: request.prefix_entries,
-        prefix_mark_budget: request.prefix_mark_budget, targets, placement, modes,
+        prefix_mark_budget: request.prefix_mark_budget, prefix_mark_slots, targets, placement, modes,
         routed: routed.clone(), experts, local, spark, links,
         spark_reply_formats: request.replies, drafter, vision: None, budgets, code, graph_reserve,
         head: request.head, host_prefix, device_sampling: true,

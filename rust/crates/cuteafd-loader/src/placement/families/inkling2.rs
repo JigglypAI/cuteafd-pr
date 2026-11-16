@@ -144,6 +144,8 @@ pub struct InklingInputs {
     pub sequences: u64,
     pub prefix_entries: u64,
     pub prefix_mark_budget: u64,
+    /// One combined-budget count, consumed by target and optional draft banks.
+    pub prefix_mark_slots: usize,
     /// Per-rank target arenas (one per coordinator GPU).
     pub targets: Vec<CoordinatorWeights>,
     /// The resolved attention placement and every layer's mode under it.
@@ -479,8 +481,7 @@ impl InklingInputs {
         out.extend(buffer(format!("inkling2.cache.{gpu}.conv"), location, conv, Lifetime::TARGET, Category::Kv,
             "contiguous FP32 convolution lag backing", maximum));
         let per_sequence = rings.checked_add(conv).ok_or(Refusal::Overflow("Inkling complete sequence state"))? / sequences;
-        let slots = cuteafd_core::prefix::mark_slots_with_host(self.sequences, self.prefix_entries,
-            self.mark_bytes()?, self.prefix_mark_budget, self.host_prefix.quota_bytes > 0);
+        let slots = self.prefix_mark_slots as u64;
         let retained = per_sequence.checked_mul(slots).ok_or(Refusal::Overflow("Inkling prefix marks"))?;
         out.extend(buffer(format!("inkling2.cache.{gpu}.marks"), location, retained, Lifetime::TARGET, Category::Prefix,
             "exact retained SWA and FP32 convolution marks", maximum));
@@ -676,8 +677,8 @@ impl Recipe for InklingInputs {
                         components.extend(buffer(id,location,*bytes as u64,lifetime,Category::Drafter,"recurrent fixed owner",maximum));
                     }
                 }
-                if draft.layout.marks>0 {
-                    let bytes=work.window_mark_bytes.checked_mul(draft.layout.marks).ok_or(Refusal::Overflow("draft marks"))? as u64;
+                if self.prefix_mark_slots>0 {
+                    let bytes=work.window_mark_bytes.checked_mul(self.prefix_mark_slots).ok_or(Refusal::Overflow("draft marks"))? as u64;
                     components.extend(buffer(format!("inkling2.draft.{rank}.marks"),location,bytes,lifetime,Category::Drafter,
                         "exact drafter window and last-feature marks",maximum));
                 }

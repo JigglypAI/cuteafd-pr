@@ -266,7 +266,8 @@ impl<'a> Backend<'a> for InklingBackend<'a> {
         ensure!(sequences.iter().map(|sequence| sequence.placement.slot).collect::<BTreeSet<_>>().len() == sequences.len(),
             "Inkling packed members alias a request state slot");
         let chunks = sequences.iter().map(|sequence| {
-            ensure!(!sequence.neural && sequence.start == sequence.placement.len, "Inkling packed start/drafter differs");
+            ensure!(sequence.start == sequence.placement.len, "Inkling packed start differs");
+            ensure!(!sequence.neural || self.execution.borrow().draft.is_some(), "Inkling packed neural prefill needs admitted drafter");
             self.check(sequence.placement, sequence.tokens, pool)?;
             Ok((sequence.start, sequence.tokens.len()))
         }).collect::<Result<Vec<_>>>()?;
@@ -288,7 +289,12 @@ impl<'a> Backend<'a> for InklingBackend<'a> {
             }
             Ok(())
         })?;
-        for (sequence, placement) in sequences.iter_mut().zip(placements) { *sequence.placement = placement; }
+        for (sequence, placement) in sequences.iter_mut().zip(placements) {
+            *sequence.placement = placement;
+            if sequence.neural {
+                self.prefill_draft(sequence.placement, sequence.start, sequence.tokens, sequence.next, sequence.draft)?;
+            }
+        }
         last.into_iter().map(|outcome| outcome.context("Inkling packed member last-row callback missing")).collect()
     }
     fn verify_device(&self, sequences: &mut [(&mut Placement, &[u32])], speculative: bool, pool: &RefPagePool) -> Result<Option<DeviceLogits>> {
@@ -372,6 +378,15 @@ impl<'a> Backend<'a> for InklingBackend<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn packed_neural_prefill_updates_context_and_anchor_before_returning() {
+        let source = include_str!("backend.rs").split("#[cfg(test)]").next().unwrap();
+        let packed = source.split("fn prefill_packed(").nth(1).unwrap().split("fn verify_device(").next().unwrap();
+        assert!(!packed.contains("!sequence.neural &&"));
+        assert!(packed.contains("self.prefill_draft(sequence.placement, sequence.start, sequence.tokens, sequence.next, sequence.draft)?"));
+        assert!(packed.find("*sequence.placement = placement;").unwrap() < packed.find("self.prefill_draft(").unwrap());
+    }
 
     #[test]
     fn decode_members_share_admitted_rows_without_overlapping_logits() -> Result<()> {

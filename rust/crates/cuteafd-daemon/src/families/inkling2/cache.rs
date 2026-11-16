@@ -358,6 +358,44 @@ mod tests {
     }
 
     #[test]
+    fn target_and_draft_banks_share_combined_budget_and_last_slot_bounds() -> Result<()> {
+        use crate::shared::speculation::block_dspark::WindowSnapshots;
+        use cuteafd_loader::families::inkling2::draft::prefix_mark_slots;
+        let fixture = Fixture::build_for_tests()?;
+        let library = fixture.load()?;
+        fixture.immediate_copies(&library)?;
+        let device = Device { library: &library, id: 0 };
+        let mut cfg = Inkling2Config::from_hf(&serde_json::from_str(include_str!(
+            "../../../../cuteafd-loader/src/families/inkling2/fixtures/config.json"))?)?;
+        cfg.layers = 2; cfg.local = vec![true, false];
+        let planes = vec![4096];
+        let (draft_bytes, _) = WindowSnapshots::bytes(&planes, 1)?;
+        for host in [false, true] {
+            let reader = Rc::new(Stream::new(device)?);
+            let layout = CacheLayout::new(&cfg, 2, 1)?;
+            let budget = 3 * (layout.sequence_bytes + draft_bytes) as u64;
+            let slots = prefix_mark_slots(2, 4, layout.sequence_bytes as u64, draft_bytes as u64, budget, host)?;
+            assert_eq!(slots, if host { 2 } else { 3 });
+            let target = CacheBank::new(vec![reader.clone()], layout, slots)?;
+            let draft = WindowSnapshots::new(&reader, planes.clone(), slots)?;
+            assert_eq!(target.mark_slots(), draft.backing().buffer.bytes / draft.mark_bytes());
+            let live = Allocation::new(device, planes[0], Tag::drafter_kv("test/inkling-draft-plane"))?;
+            library.copy_h2d(live.buffer, &vec![0x5a; planes[0]])?;
+            target.capture(0, slots - 1)?;
+            // SAFETY: fixture-backed, disjoint live/mark allocations remain alive
+            // through both registered copy fences and the final drain.
+            unsafe { draft.capture(slots - 1, &[live.buffer], 0, 64)?; }
+            target.drain()?; draft.drain()?;
+            assert!(target.mark(slots).is_err());
+            assert!(draft.mark(slots).is_err());
+            let mut saved = vec![0; draft.mark_bytes()];
+            library.copy_d2h(&mut saved, draft.mark(slots - 1)?)?;
+            assert!(saved[16..16 + planes[0]].iter().all(|&byte| byte == 0x5a));
+        }
+        Ok(())
+    }
+
+    #[test]
     fn persistent_cache_marks_copy_exact_bytes_and_fence_only_registered_readers() -> Result<()> {
         cache_mark_oracle(cuteafd_loader::families::inkling2::InklingKvCache::Bf16)
     }

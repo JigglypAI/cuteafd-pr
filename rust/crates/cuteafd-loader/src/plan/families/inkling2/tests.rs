@@ -553,7 +553,11 @@ fn shared_recipe_charges_every_owner_once_on_one_and_two_rtx() {
             }).collect()
         }).collect() };
         let inputs = InklingInputs { cfg: cfg.clone(), kv_format: crate::families::inkling2::InklingKvCache::Bf16, gpus, spark_ranks: ranks, context: Context::automatic(1 << 20),
-            maximum_pool_tokens: 4 << 20, prefill, sequences: 16, prefix_entries: 8, prefix_mark_budget: 2 << 30, targets: targets.clone(), placement, modes: modes.clone(),
+            maximum_pool_tokens: 4 << 20, prefill, sequences: 16, prefix_entries: 8, prefix_mark_budget: 2 << 30,
+            prefix_mark_slots: crate::families::inkling2::draft::prefix_mark_slots(16, 8,
+                (0..cfg.layers).map(|layer| shared::SequenceState::new(&cfg,cfg.local[layer]).unwrap())
+                    .map(|state|state.ring_bytes+state.lag_bytes).sum(), 0, 2 << 30, false).unwrap(),
+            targets: targets.clone(), placement, modes: modes.clone(),
             routed: routed.clone(), experts,
             local,
             spark: (0..=routed.len()).map(charge).collect(),

@@ -79,7 +79,7 @@ def test_inkling_bundled_drafter_matches_plan_and_serve(tmp_path: Path, cache: s
     result = _family_launch_result(tmp_path, config, "thinkingmachines/Inkling-2-Small-MXFP8", keys,
         physical_gpus=(0,), extra_args=("--wip", "inkling"), encoder_plan=PLANNED)
     serve = _line(result, "serve-inkling2 --snapshot")
-    plan = _line(result, "cuteafd plan --snapshot")
+    plan = _line(result, "cuteafd plan")
     assert "--dspark" in shlex.split(serve)
     assert _flag(plan, "--speculator") == "dspark"
     assert _flag(serve, "--draft-kv-cache") == _flag(plan, "--draft-kv-cache") == cache
