@@ -1621,8 +1621,9 @@ impl<'a> DsparkDrafter<'a> {
             // covers the round and both copies (no second, synchronous drain).
             // SAFETY: the device buffers hold `rows` words; the landing is
             // pinned, owned by the workspace and read only after the wait.
+            let output=w.output()?;
             let landing = |offset: usize| cuteafd_ffi::CuteafdHostBuffer {
-                ptr: w.output()?.landing.buffer.ptr.cast::<u8>().add(offset).cast(), bytes: rows * 4, ..w.output()?.landing.buffer };
+                ptr: output.landing.buffer.ptr.cast::<u8>().add(offset).cast(), bytes: rows * 4, ..output.landing.buffer };
             l.copy_d2h_host_buffer_async(landing(0), CuteafdDeviceBuffer { bytes: rows * 4, ..w.output()?.tokens.buffer },
                 rows * 4, s)?;
             l.copy_d2h_host_buffer_async(landing(rows * 4), CuteafdDeviceBuffer { bytes: rows * 4, ..w.output()?.confidence.buffer },
