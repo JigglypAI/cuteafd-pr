@@ -2236,6 +2236,22 @@ mod tests {
             ("MAX_CONTEXT_TOKENS", "65536", "--max-context-tokens", "65536"),
             ("EXPERT_USAGE", "off", "--expert-usage", "false")];
         for family in families {
+            // Unsupported family knobs must not leak into planner charging.
+            let mut ignored = vec![];
+            if matches!(family, "glm5" | "glm5_flash" | "deepseek_v4" | "deepseek_v41" | "minimax_m3" | "mistral_large4") {
+                ignored.extend([("KV_CACHE", "int8"), ("SPECULATOR_DEPTH", "not-a-depth")]);
+            }
+            if family != "glm5" { ignored.push(("PREFILL_SPAN_ROWS", "not-rows")); }
+            for (key, value) in ignored {
+                let cli = crate::cli::Cli::try_parse_from(["cuteafd", "plan", "/unused", "--layout"]).unwrap();
+                let crate::cli::Commands::Plan(mut baseline) = cli.command else { panic!("plan") };
+                resolve_family_config(&mut baseline, family, &Default::default()).unwrap();
+                let mut configured = baseline.clone();
+                let cfg = [(key.into(), value.into())].into_iter().collect();
+                resolve_config(&mut configured, &cfg).unwrap();
+                resolve_family_config(&mut configured, family, &cfg).unwrap();
+                assert_eq!(format!("{:?}", options(&baseline).unwrap()), format!("{:?}", options(&configured).unwrap()), "{family} ignores {key}");
+            }
             let mut cases = common.to_vec();
             if matches!(family, "step5" | "deepseek_v41") { cases.push(("PREFILL_BATCH_TOKENS", "1024", "--prefill-rows", "1024")); }
             else if family != "qwen3_5" { cases.push(("PREFILL_ROWS", "1024", "--prefill-rows", "1024")); }

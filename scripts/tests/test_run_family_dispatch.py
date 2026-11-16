@@ -1071,7 +1071,7 @@ if "--resolve-settings-only" in args:
     checkpoint = json.loads(os.environ["STUB_CHECKPOINT"])
     if checkpoint.get("model_type", "").startswith("mimo"):
         selected = "off"
-        if os.environ.get("STUB_MODEL_ID") in ("XiaomiMiMo/MiMo-V2.6-Flash-MOPD", "XiaomiMiMo/MiMo-V2.6-Pro-MOPD"):
+        if (args[args.index("--checkpoint-model-id") + 1] if "--checkpoint-model-id" in args else None) in ("XiaomiMiMo/MiMo-V2.6-Flash-MOPD", "XiaomiMiMo/MiMo-V2.6-Pro-MOPD"):
             selected = "dflash2"
     else:
         selected = "dflash2" if (hf / "hub/models--incoai--GLM-5.3-Flash-DFlash2").is_dir() else "off"
@@ -5696,7 +5696,7 @@ def test_nondefault_config_handoff_matches_composed_serving_values(tmp_path, fam
         keys += f"{prefill}=1024\nRTX_EXPERT_LAYERS=0\n"
     has_kv = family in ("mimo_v2", "qwen4", "qwen3_5", "kimi_k3", "step5", "muse_spark")
     if has_kv:
-        keys += "KV_CACHE=" + ("int8" if family == "mimo_v2" else "bf16") + "\n"
+        keys += "KV_CACHE=bf16\n"
     result = _family_launch_result(tmp_path, configs[family], "deepseek-ai/DeepSeek-V4.1-Flash" if family == "deepseek_v41" else "test/nondefaults",
         keys, physical_gpus=(0,), root_launcher=True, extra_args=("--wip", "nondefaults"),
         encoder_plan={"placement_supported": True, "fits": True, "encoder_plan_hash": "ab" * 32, "spark_ranks": count},
@@ -5717,3 +5717,17 @@ def test_nondefault_config_handoff_matches_composed_serving_values(tmp_path, fam
         text = Path(mount.rsplit(":", 2)[0]).read_text()
         for key in ("KV_CACHE", "PREFILL_ROWS", "RTX_EXPERT_LAYERS", "MAX_CONTEXT_TOKENS", "EXLR8_MANIFEST", "EXLR8_PREFILL_ACTIVATIONS"):
             assert not any(line.startswith(key + "=") for line in text.splitlines()), (family, key, text)
+
+
+def test_glmf_default_query_does_not_apply_unresolved_split_config(tmp_path):
+    result = _family_launch_result(tmp_path, SPLIT_CONFIGS["glm5_flash"], "test/glmf-query",
+        "RTX_GPUS=2\nCOORDINATOR_SPLIT=off\nGLM5_FLASH_REPLAY_RECORDS=shared\nVISION=off\nAUDIO=off\n")
+    assert result.returncode == 0, result.stderr
+    query = next(shlex.split(line) for line in result.stderr.splitlines() if "--resolve-settings-only" in line)
+    assert "--config" not in query, query
+    assert "--checkpoint-model-id" in query, query
+    plan = next(shlex.split(line) for line in result.stderr.splitlines() if " plan " in line and "--deployment" in line)
+    assert plan[plan.index("--rtx") + 1] == "1", plan
+    serve = next(shlex.split(line) for line in result.stderr.splitlines() if line.startswith("docker run -d") and "serve-glmf" in line)
+    assert "--split-device" not in serve
+    assert serve[serve.index("--replay-records") + 1] == "shared"

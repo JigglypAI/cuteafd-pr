@@ -1590,7 +1590,7 @@ if [[ -z "$speculator" ]]; then
   if [[ $speculator == off && $family == glm5_flash ]]; then
     # Rust owns the conditional missing-default-drafter fallback. This header-only
     # query uses the same resolver as placement, before any drafter is fetched.
-    glmf_defaults="$(docker run --rm --network none -e "HF_HOME=$container_hf_home"       "${generic_worker_mounts[@]}" "${wip_mount_args[@]}" -v "$config:/run/cuteafd-plan.config:ro"       "$coordinator_image" cuteafd plan "$snapshot" --config /run/cuteafd-plan.config --checkpoint-model-id "$model" --resolve-settings-only)"
+    glmf_defaults="$(docker run --rm --network none -e "HF_HOME=$container_hf_home"       "${generic_worker_mounts[@]}" "${wip_mount_args[@]}" "$coordinator_image" cuteafd plan "$snapshot" --checkpoint-model-id "$model" --resolve-settings-only)"
     speculator="$(jq -er '.speculator' <<<"$glmf_defaults")"
     default_drafter="$(jq -er '.default_drafter' <<<"$glmf_defaults")"
     if [[ "$speculator" == off ]]; then
@@ -1600,7 +1600,7 @@ if [[ -z "$speculator" ]]; then
     fi
   fi
   if [[ $speculator == off && $family == mimo_v2 ]]; then
-    mimo_defaults="$(docker run --rm --network none -e "HF_HOME=$container_hf_home"       "${generic_worker_mounts[@]}" "${wip_mount_args[@]}" -v "$config:/run/cuteafd-plan.config:ro"       "$coordinator_image" cuteafd plan "$snapshot" --config /run/cuteafd-plan.config --checkpoint-model-id "$model" --resolve-settings-only)"
+    mimo_defaults="$(docker run --rm --network none -e "HF_HOME=$container_hf_home"       "${generic_worker_mounts[@]}" "${wip_mount_args[@]}" "$coordinator_image" cuteafd plan "$snapshot" --checkpoint-model-id "$model" --resolve-settings-only)"
     speculator="$(jq -er '.speculator' <<<"$mimo_defaults")"
   fi
   if [[ $speculator == off && $dsv4_dspark == 1 ]]; then
