@@ -451,7 +451,7 @@ fn host_tier_stores_each_page_once_and_restores_replicas_to_both_gpus() {
     let (resume, tokens, mut q) = serve(&mut cache, &fake, 2, &next, &[], 48);
     assert_eq!(resume, 27);
     let stats = cache.stats();
-    assert_eq!((stats.promotions, stats.host.unwrap().restores, stats.restore_failures), (1, 1, 0));
+    assert_eq!((stats.host_promotions, stats.host.unwrap().restores, stats.restore_failures), (1, 1, 0));
     assert_eq!(fake.replica_copies.get() - replicas, 7 + 1, "7 pages' replicated rows and one mark");
     let mut longer = tokens;
     longer.push(9);
@@ -461,7 +461,7 @@ fn host_tier_stores_each_page_once_and_restores_replicas_to_both_gpus() {
     cache.clear(&fake).unwrap();
     fake.lie_about_owners.set(true);
     let admitted = cache.admit(&fake, &next, 48, false, |pages| Placement { pages, ring: 3, len: 0 }).unwrap();
-    assert_eq!((admitted.resume, cache.stats().promotions), (0, 1));
+    assert_eq!((admitted.resume, cache.stats().host_promotions), (0, 1));
     fake.lie_about_owners.set(false);
     cache.release(&fake, &admitted.placement.pages).unwrap();
     cache.clear(&fake).unwrap();
@@ -551,6 +551,6 @@ fn host_only_marks_restore_exact_owned_pages_and_replicas_with_two_slots() {
         cache.release(&fake, &p.pages).unwrap();
         assert_eq!(cache.arena().in_use(), 0);
     }
-    assert_eq!((cache.stats().mark_promotions, cache.stats().promotions), (8, 0));
+    assert_eq!((cache.stats().mark_promotions, cache.stats().host_promotions), (8, 0));
     assert!(fake.replica_copies.get() >= 8);
 }

@@ -850,7 +850,7 @@ fn host_tier_restores_evicted_snapshots_exactly_and_shares_identical_prefixes() 
     let (resume, _, mut p) = serve(&mut cache, &fake, 2, &next, &[], 40);
     assert_eq!(resume, first.len());
     let stats = cache.stats();
-    assert_eq!((stats.promotions, stats.mark_promotions, stats.host.unwrap().restores), (1, 0, 1));
+    assert_eq!((stats.host_promotions, stats.mark_promotions, stats.host.unwrap().restores), (1, 0, 1));
     let mut longer = next.clone();
     longer.push(7);
     fake.forward(&mut p, &longer).unwrap();
@@ -979,7 +979,7 @@ fn typed_draft_pages_follow_target_device_and_host_restores_exactly() {
             state.bindings[1] = None;
             cache.release(&fake, &admitted.placement.pages).unwrap();
         }
-        assert_eq!(cache.stats().promotions, 1);
+        assert_eq!(cache.stats().host_promotions, 1);
         cache.clear(&fake).unwrap();
         let mut state = fake.draft.borrow_mut();
         let state = state.as_mut().unwrap();
@@ -1072,7 +1072,7 @@ fn family_metadata_survives_host_promotion_and_tail_cow() {
         Metadata { len: 13, logical_pages: 4, generation: 100 },
         Metadata { len: 21, logical_pages: 6, generation: 101 },
     ]);
-    assert_eq!(cache.stats().promotions, 2);
+    assert_eq!(cache.stats().host_promotions, 2);
     cache.clear(&family).unwrap();
     assert_eq!(cache.pool().free(), 64);
 
@@ -1195,13 +1195,13 @@ fn different_record_format_is_cold(saved: &'static str, other: &'static str) {
     let hit = cache.admit(&fake, &prompt, 32, false,
         |pages| Placement { pages, ring: 1, len: 0, ring_from: 0 }).unwrap();
     assert_eq!(hit.resume, 0);
-    assert_eq!(cache.stats().promotions, 0);
+    assert_eq!(cache.stats().host_promotions, 0);
     assert_eq!(cache.stats().host.unwrap().restores, 0);
     cache.release(&fake, &hit.placement.pages).unwrap();
     fake.record_format.set(saved);
     let (resume, _, p) = serve(&mut cache, &fake, 2, &prompt, &[], 32);
     assert_eq!(resume, prompt.len());
-    assert_eq!(cache.stats().promotions, 1);
+    assert_eq!(cache.stats().host_promotions, 1);
     assert_eq!(cache.stats().host.unwrap().restores, 1);
     cache.release(&fake, &p.pages).unwrap();
 }
@@ -1233,7 +1233,7 @@ fn pages_only_family_restores_from_device_and_host_without_a_mark() {
     let (resume, _, mut q) = serve(&mut cache, &fake, 2, &next, &[], 40);
     assert_eq!(resume, next.len());
     let stats = cache.stats();
-    assert_eq!((stats.promotions, stats.marks_in_use, stats.host.unwrap().restores), (1, 0, 1));
+    assert_eq!((stats.host_promotions, stats.marks_in_use, stats.host.unwrap().restores), (1, 0, 1));
     let mut longer = next.clone();
     longer.push(7);
     fake.forward(&mut q, &longer).unwrap();
@@ -1500,7 +1500,7 @@ fn pool_page_marks_round_trip_exactly_on_the_device_and_through_the_host_tier() 
     let (resume, _, mut r) = serve(&mut cache, &fake, 2, &fork, &[], 40);
     assert_eq!(resume, next.len());
     let stats = cache.stats();
-    assert_eq!((stats.promotions, stats.mark_promotions, stats.host.unwrap().restores), (1, 1, 2));
+    assert_eq!((stats.host_promotions, stats.mark_promotions, stats.host.unwrap().restores), (1, 1, 2));
     let mut longest = fork.clone();
     longest.push(9);
     fake.forward(&mut r, &longest).unwrap();
@@ -1592,7 +1592,7 @@ fn pool_mark_evictions_reach_the_host_tier_and_come_back_exactly() {
     let (resume, _, mut c) = serve(&mut cache, &fake, 2, &next, &[], 16);
     assert_eq!(resume, first.len());
     let stats = cache.stats();
-    assert_eq!((stats.promotions, stats.host.unwrap().restores, stats.evictions, stats.host_evict_waits), (1, 1, 2, 2));
+    assert_eq!((stats.host_promotions, stats.host.unwrap().restores, stats.evictions, stats.host_evict_waits), (1, 1, 2, 2));
     let mut longer = next.clone();
     longer.push(6);
     fake.forward(&mut c, &longer).unwrap();
@@ -1744,7 +1744,7 @@ fn two_slot_host_working_set_retains_pages_and_promotes_only_marks_under_pressur
             assert_eq!(cache.stats().marks_in_use, 0);
         }
         assert_eq!(cache.stats().pages_retained, pages_before);
-        assert_eq!((cache.stats().mark_promotions, cache.stats().promotions), (12, 0));
+        assert_eq!((cache.stats().mark_promotions, cache.stats().host_promotions), (12, 0));
         assert_eq!((cache.stats().host_hits, cache.stats().device_hits), (12, 0));
     }
 }
