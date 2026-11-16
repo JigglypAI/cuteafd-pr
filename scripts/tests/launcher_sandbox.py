@@ -283,6 +283,8 @@ def seed_checkpoint_metadata(hf):
             "model_type": "kimi_linear", "num_hidden_layers": 93, "first_k_dense_replace": 1}},
         "MiniMaxAI/MiniMax-M3.1-Flash": {"model_type": "minimax_m3_vl", "text_config": {
             "num_hidden_layers": 3, "moe_layer_freq": [0, 1, 1]}},
+        "thinkingmachines/Inkling-2-Small-MXFP8": {"model_type": "inkling2", "text_config": {
+            "num_hidden_layers": 48}, "quantization_config": {"quant_method": "mxfp8"}},
     }
     checkpoints.update(copy.deepcopy(aliases))
     for name, config in checkpoints.items():
