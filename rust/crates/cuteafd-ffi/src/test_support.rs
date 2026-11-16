@@ -5,6 +5,15 @@ use libloading::Library;
 use std::ffi::c_void;
 use std::sync::{atomic::{AtomicBool, Ordering}, Arc};
 
+/// Open the matching native library supplied by the sealed-slot test runner.
+/// This helper exists only with the `test-support` feature.
+pub fn load_sealed_library(path: &std::path::Path) -> Result<NativeLibrary> {
+    ensure!(path.is_absolute() && path.is_file(), "sealed native test library must be an existing absolute path");
+    // SAFETY: the test harness supplies our ABI-matched, checksum-verified WIP
+    // artifact. NativeLibrary retains the DSO for every borrowed native owner.
+    unsafe { NativeLibrary::load(path) }
+}
+
 /// Holds one CUDA stream until a separate thread releases it. Drop also
 /// releases and drains, so an assertion failure cannot strand the callback.
 pub struct CudaStreamGate<'a> {
