@@ -31,6 +31,7 @@ FAMILIES = {
     "Kimi K3": "kimi_k3",
     "Step-5": "step5",
     "Muse": "muse_spark",
+    "Inkling": "inkling2",
 }
 COLUMNS = list(FAMILIES)
 
@@ -216,7 +217,7 @@ def test_unset_defaults_preserve_resolved_value_annotations(monkeypatch, tmp_pat
 
 def test_graph_reserve_keys_are_separate_and_bounded_cache_families_only():
     # Families on the bounded graph cache (#1627) take the reserve keys.
-    bounded = {"mimo_v2", "kimi_k3", "glm5", "glm5_flash", "qwen4", "deepseek_v4", "deepseek_v41", "qwen3_5", "muse_spark", "step5"}
+    bounded = {"mimo_v2", "kimi_k3", "glm5", "glm5_flash", "qwen4", "deepseek_v4", "deepseek_v41", "qwen3_5", "muse_spark", "step5", "inkling2"}
     for family in FAMILIES.values():
         keys = family_keys(family)
         assert "GRAPH_RESERVE" not in keys
@@ -436,7 +437,7 @@ def test_embedding_value_support_and_expert_usage_adapters():
     text = DOC.read_text()
     section = text.split("Token embedding placement (`EMBEDDING`", 1)[1].split("Speculator", 1)[0]
     host = next(line for line in section.splitlines() if line.startswith("| `host` |"))
-    assert [cell.strip() for cell in host.split("|")[2:-1]] == ["✓"] * 7 + ["✗"] * 3
+    assert [cell.strip() for cell in host.split("|")[2:-1]] == ["✓"] * 7 + ["✗"] * 4
     assert {family for family in COLUMNS if MATRIX["EXPERT_USAGE"][family]} == {
         "V4.1", "V4", "GLM 5.3 / ML4", "MiMo", "Kimi K3"}
 

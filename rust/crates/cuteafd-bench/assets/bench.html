@@ -589,7 +589,8 @@ function tableFor(id, comparedResult = null) {
             Array.isArray(histogram) ? histogram.join(' / ') : 'unavailable (legacy)'];
         });
       }))  + '</details>' : '';
-    if (pass && pass.table) return `<h3 class="label">pass ${i + 1}</h3>` + tableHtml(pass.table.columns, pass.table.rows) + mapped;
+    const sampling = pass?.sampling ? `<p class="label">${fmt.esc(Object.entries(pass.sampling).map(([k, v]) => `${k} ${v}`).join(' · '))}</p>` : '';
+    if (pass && pass.table) return `<h3 class="label">pass ${i + 1}</h3>` + sampling + tableHtml(pass.table.columns, pass.table.rows) + mapped;
     const rows = Object.entries(pass || {}).filter(([, v]) => typeof v !== 'object').map(([k, v]) => [k, v]);
     return `<h3 class="label">pass ${i + 1}</h3>` + tableHtml(['field', 'value'], rows) + mapped;
   }).join('');

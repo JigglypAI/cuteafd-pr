@@ -33,6 +33,26 @@ def catalog(monkeypatch, families=("glm", "glmf")):
     return namespace["programs"](families=families)
 
 
+def test_segmented_group_launch_covers_the_pinned_expert_domain():
+    path = ROOT / "third_party/sparkinfer/b12x/integration/cuteafd/exlr8_glue.py"
+    tree = ast.parse(path.read_text())
+    group = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "_Group")
+    initializer = next(node for node in group.body if isinstance(node, ast.FunctionDef) and node.name == "__init__")
+    domain = next(node.value for node in initializer.body if isinstance(node, ast.Assign)
+                  and any(isinstance(target, ast.Attribute) and target.attr == "expert_domain"
+                          for target in node.targets))
+    expression = compile(ast.Expression(domain), str(path), "eval")
+    for experts in (1, 256, 257, 288, 512):
+        block = eval(expression, {"experts": experts})
+        assert experts <= block <= 1024
+        assert block == (256 if experts <= 256 else 512)
+    segments = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "_GroupSegments")
+    launch = next(node for node in ast.walk(segments) if isinstance(node, ast.Call)
+                  and isinstance(node.func, ast.Attribute) and node.func.attr == "launch")
+    block = next(keyword.value for keyword in launch.keywords if keyword.arg == "block")
+    assert ast.unparse(block) == "(self.expert_domain, 1, 1)"
+
+
 def test_dense_trellis_catalog_has_native_full_shapes(monkeypatch):
     entries = catalog(monkeypatch)[:4]
     assert [name for name, _, _, _ in entries] == [

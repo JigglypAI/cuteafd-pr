@@ -1,9 +1,13 @@
 # Inkling 2 Small
 
-Inkling 2 Small is being ported as a first-class family on the shared engine
-([#1930](https://github.com/tpurtell/cuteafd/issues/1930), v5.2). Nothing is
-served yet; this page records the checkpoint facts the port is built on, read
-from each checkpoint's own `config.json` and safetensors headers.
+Inkling 2 Small is being qualified as a first-class family on the shared engine
+([#1930](https://github.com/tpurtell/cuteafd/issues/1930), v5.2). The initial
+text-only public path is `cuteafd serve --family inkling2` or `./run.sh --wip
+SLOT`, with one RTX and 2-8 Sparks. Startup, native cold-prefill/cache exactness,
+fidelity and served smoke are pending; dispatch alone does not qualify them.
+This page records checkpoint facts read from each checkpoint's own `config.json`
+and safetensors headers. See [Inkling options](../options.md#inkling-serving)
+for the accepted launch keys and current execution limits.
 
 ## Architecture
 

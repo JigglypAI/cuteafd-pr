@@ -19,6 +19,7 @@ pub mod fidelity_precision;
 pub mod fidelity_rows;
 pub mod http;
 pub mod panels;
+pub mod panel_config;
 pub mod profiles;
 pub mod prefill;
 pub mod publish;

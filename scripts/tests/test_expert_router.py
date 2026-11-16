@@ -69,8 +69,9 @@ def test_native_wide_dispatch_and_reducer_width():
     assert "else if(experts>512 || topk>8)" in source
     assert "select_wide_kernel<true><<<rows,1024,0,s>>>" in source
     assert "select_wide_kernel<false><<<rows,1024,0,s>>>" in source
-    assert "CUTEAFD_HIDDEN_CASE(3584, __VA_ARGS__)" in (
-        ROOT / "native/shared/cuda/expert_hidden.cuh").read_text()
+    hidden = (ROOT / "native/shared/cuda/expert_hidden.cuh").read_text()
+    for width in (3584, 4608):
+        assert f"CUTEAFD_HIDDEN_CASE({width}, __VA_ARGS__)" in hidden
 
 
 def test_v41_reference_qualifier_parses_optional_library():

@@ -297,6 +297,26 @@ fn profile_with_health(mut profile: ModelProfile) -> ModelProfile {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn every_serving_profile_publishes_shared_draft_pass_totals() {
+        use axum::{body::Body, http::Request};
+        use tower::ServiceExt;
+        let snapshot = tempfile::tempdir().unwrap();
+        cuteafd_loader::plan::testing::write_kimi_tokenizer(snapshot.path());
+        let policy = ApiArgs::default().load().unwrap();
+        let profile = cuteafd_api::openai::ModelProfile::new("test", cuteafd_api::openai::ModelEncoding::DeepseekV41);
+        let profile = policy.serve(profile, snapshot.path()).unwrap();
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let router = cuteafd_api::openai::router_for_model(tx, Default::default(),
+            Arc::new(std::sync::Mutex::new(serde_json::json!({"verify":{"drafted_tokens":99}}))),
+            std::time::Duration::from_secs(1), cuteafd_api::openai::ConsoleHub::disabled(), profile);
+        let response = router.oneshot(Request::get("/v1/stats").body(Body::empty()).unwrap()).await.unwrap();
+        let stats: serde_json::Value = serde_json::from_slice(&axum::body::to_bytes(response.into_body(), 1 << 20).await.unwrap()).unwrap();
+        assert!(stats["totals"]["draft_verify_passes"].is_u64());
+        assert!(stats["totals"]["accepted_drafts"].is_u64());
+        assert_eq!(stats["verify"]["drafted_tokens"], 99, "preserve private diagnostics");
+    }
+
     #[test]
     fn sigterm_closes_monitor_but_preserves_completion_grace() {
         const CHILD: &str = "CUTEAFD_HTTP_DRAIN_CHILD";

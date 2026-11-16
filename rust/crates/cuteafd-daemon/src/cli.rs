@@ -223,6 +223,9 @@ pub(crate) enum Commands {
     /// Qualify a native coordinator-only Inkling target prefix.
     #[command(hide = true)]
     Inkling2Golden(crate::families::inkling2::golden::GoldenArgs),
+    /// Serve Inkling through the shared scheduler on one RTX and Spark experts.
+    #[command(hide = true)]
+    ServeInkling2(crate::families::inkling2::serve::ServeArgs),
     /// Qualify MiniMax whole-rank serving on the shared scheduler.
     #[command(hide = true)]
     ServeMinimax(crate::families::minimax_m3::serve::ServeArgs),

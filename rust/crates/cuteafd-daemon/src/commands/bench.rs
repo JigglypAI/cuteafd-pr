@@ -91,6 +91,9 @@ pub(crate) struct RunArgs {
     /// Additional fresh suffix tokens per context_load request (0..1048576; default 0).
     #[arg(long, value_parser = clap::value_parser!(u64).range(0..=1048576))]
     pub(crate) context_suffix: Option<u64>,
+    /// Explicit panel configuration, e.g. decode_content={"contents":["code"],"temperature":1.0,"top_p":0.95,"seed":42}.
+    #[arg(long, value_name = "PANEL=JSON", value_parser = cuteafd_bench::panel_config::parse)]
+    pub(crate) panel_config: Vec<(String, serde_json::Value)>,
     /// Exports to write: svg (report, card, panels), png (report, card), json.
     #[arg(long, value_delimiter = ',', default_value = "svg,png,json")]
     pub(crate) export: Vec<String>,
@@ -177,7 +180,7 @@ pub(crate) fn run(args: BenchArgs) -> Result<()> {
             let options = cuteafd_bench::cli::RunOptions { url: run.url, profile: run.profile, panels: run.panels,
                 passes, baseline: None, fabric: run.fabric, export: run.export, out: run.out, label: None, root: run.root, api_key: run.api_key, quiet: false, deadline: None,
                 lossless_set, lossless_dump: run.lossless_dump, lossless_concurrency: run.lossless_concurrency, context_lengths: run.context_lengths.as_deref().map(cuteafd_bench::sweep::parse_lengths).transpose().map_err(anyhow::Error::msg)?,
-                context_levels: run.context_levels.as_deref().map(cuteafd_bench::sweep::parse_levels).transpose().map_err(anyhow::Error::msg)?, context_suffix: run.context_suffix };
+                context_levels: run.context_levels.as_deref().map(cuteafd_bench::sweep::parse_levels).transpose().map_err(anyhow::Error::msg)?, context_suffix: run.context_suffix, panel_config: run.panel_config.into_iter().collect() };
             let (report, dir) = cuteafd_bench::cli::run(&options)?;
             println!("{}", dir.display());
             if report.quality_failed() {
@@ -416,6 +419,15 @@ pub(crate) fn assert_resolved_seam<T>(family: &str, names: &[&str], seam: impl F
 mod tests {
     use super::*;
     use clap::FromArgMatches;
+
+    #[test]
+    fn sampled_decode_panel_config_parses_on_bench_cli() {
+        let parsed = crate::cli::Cli::command().try_get_matches_from(["cuteafd", "bench", "--panels",
+            "decode_content", "--panel-config", "decode_content={\"contents\":[\"code\"],\"temperature\":1.0,\"top_p\":0.95,\"seed\":42}"]).unwrap();
+        let bench = BenchArgs::from_arg_matches(parsed.subcommand().unwrap().1).unwrap();
+        assert_eq!(bench.run.panel_config[0].0, "decode_content");
+        assert_eq!(bench.run.panel_config[0].1["seed"], 42);
+    }
 
     #[test]
     fn derived_cli_requests_are_not_effective_runtime_values() {

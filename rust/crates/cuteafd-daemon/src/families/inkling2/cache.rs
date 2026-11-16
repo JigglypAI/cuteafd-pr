@@ -107,6 +107,7 @@ impl<'a> CacheBank<'a> {
         // source/destination until the shared prefix fence drains.
         unsafe { self.copies.copy_d2d(&copies) }
     }
+    pub fn mark_slots(&self) -> usize { self.mark_slots }
     pub fn drain(&self) -> Result<()> { self.copies.drain() }
     pub fn inventory(&self, inventory: &mut Inventory<'_>) -> Result<()> {
         let location = inventory.location(self.readers[0].device.id)?;
@@ -217,6 +218,64 @@ mod tests {
     use cuteafd_loader::families::inkling2::{execution::UnitLayout, Inkling2Config};
 
     #[test]
+    fn shared_cache_restores_prompt_and_turn_marks_without_reconstruction() -> Result<()> {
+        use cuteafd_engine::prefix::{After, PrefixCache, PrefixConfig, PrefixFamily, SnapshotKind};
+        use crate::shared::prefix::CudaCopyEngine;
+        let fixture = Fixture::build_for_tests()?;
+        let library = fixture.load()?;
+        fixture.immediate_copies(&library)?;
+        let device = Device { library: &library, id: 0 };
+        let reader = Rc::new(Stream::new(device)?);
+        let mut cfg = Inkling2Config::from_hf(&serde_json::from_str(include_str!(
+            "../../../../cuteafd-loader/src/families/inkling2/fixtures/config.json"))?)?;
+        cfg.layers = 2;
+        cfg.local = vec![true, false];
+        let bank = Rc::new(CacheBank::new(vec![reader], CacheLayout::new(&cfg, 2, 8)?, 3)?);
+        let family = InklingPrefix::new(bank.clone());
+        let mut cache: PrefixCache<CudaCopyEngine<'_>> = PrefixCache::new(family.layout(),
+            PrefixConfig { entries: 3, mark_slots: 3, keep_logits: true, min_tokens: 1 }, None)?;
+        let tokens = (0..65).collect::<Vec<u32>>();
+        let mut source = cache.admit(&family, &tokens, 128, false,
+            |units| Placement { units, slot: 0, len: 0, state_len: 0 })?.placement;
+        let state = bank.sequence(0)?;
+        let prompt = vec![0x17; state.bytes];
+        library.copy_h2d(state, &prompt)?;
+        for &page in &source.units {
+            let buffer = bank.page(1, page as usize)?;
+            library.copy_h2d(buffer, &vec![page as u8 + 0x30; buffer.bytes])?;
+        }
+        source.len = tokens.len(); source.state_len = tokens.len();
+        assert!(cache.capture(&family, SnapshotKind::Prompt, &tokens, &source, After::from_logits(&[1., 0.], true))?);
+        cache.release(&family, &source.units)?;
+        let restored = cache.admit(&family, &tokens, 128, false,
+            |units| Placement { units, slot: 1, len: 0, state_len: 0 })?;
+        assert_eq!(restored.resume, tokens.len());
+        let mut observed = vec![0; state.bytes];
+        library.copy_d2h(&mut observed, bank.sequence(1)?)?;
+        assert_eq!(observed, prompt);
+        let mut continued = restored.placement;
+        let turn = vec![0x6b; state.bytes];
+        library.copy_h2d(bank.sequence(1)?, &turn)?;
+        let mut turn_tokens = tokens.clone(); turn_tokens.push(91);
+        continued.len = turn_tokens.len(); continued.state_len = turn_tokens.len();
+        assert!(cache.capture(&family, SnapshotKind::Turn, &turn_tokens, &continued, After::from_logits(&[0., 1.], true))?);
+        cache.release(&family, &continued.units)?;
+        let restored = cache.admit(&family, &turn_tokens, 128, false,
+            |units| Placement { units, slot: 0, len: 0, state_len: 0 })?;
+        assert_eq!(restored.resume, turn_tokens.len());
+        library.copy_d2h(&mut observed, bank.sequence(0)?)?;
+        assert_eq!(observed, turn);
+        cache.release(&family, &restored.placement.units)?;
+        let restored = cache.admit(&family, &tokens, 128, false,
+            |units| Placement { units, slot: 1, len: 0, state_len: 0 })?;
+        assert_eq!(restored.resume, tokens.len());
+        library.copy_d2h(&mut observed, bank.sequence(1)?)?;
+        assert_eq!(observed, prompt, "turn divergence must not mutate the prompt mark");
+        cache.release(&family, &restored.placement.units)?;
+        Ok(())
+    }
+
+    #[test]
     fn persistent_cache_marks_copy_exact_bytes_and_fence_only_registered_readers() -> Result<()> {
         let fixture = Fixture::build_for_tests()?;
         let library = fixture.load()?;
@@ -250,6 +309,20 @@ mod tests {
         assert_eq!(restored_page, page_pattern);
         let unit = super::super::owners::UnitOwner::new(reader, UnitLayout::serving(&cfg, 64, 256)?)?;
         assert!(unit.bind(&cache, 1, 0).is_ok());
+        use super::super::owners::UnitBuffers;
+        let segment = unit.segment(&cache, 1, 0, 7..19)?;
+        for (name, stride) in [("partial", 4608*4), ("q", 6144*4), ("relative", 48*1024*2),
+            ("cache_slots", 8), ("first", 4), ("expert_output", 4608*2)] {
+            let whole = unit.buffer(name)?;
+            let sliced = segment.buffer(name)?;
+            assert_eq!(sliced.ptr as usize - whole.ptr as usize, 7*stride, "{name}");
+            assert_eq!(sliced.bytes, 12*stride, "{name}");
+        }
+        let arena = segment.buffer("residual_arena")?;
+        assert_eq!(arena.ptr as usize - unit.buffer("residual_arena")?.ptr as usize, 7*4608*4);
+        assert_eq!(segment.layout().rows, 64, "completed-block pitch must remain the admitted unit width");
+        assert_eq!(segment.buffer("ring")?.ptr, cache.field(1, 0, "ring")?.ptr);
+        assert!(unit.segment(&cache, 0, 0, 63..65).is_err());
         assert!(unit.bind(&cache, 2, 0).is_err());
         assert!(unit.bind(&cache, 0, 2).is_err());
         let stranger = Rc::new(Stream::new(device)?);
@@ -289,6 +362,13 @@ mod tests {
         family.discard(&mut destination).map_err(|e| anyhow::anyhow!("{e}"))?;
         assert_eq!(destination.state_len, 0);
         Ok(())
+    }
+}
+
+impl crate::shared::prefix::cuda_copy::SnapshotOwner for CacheBank<'_> {
+    fn snapshot_buffers(&self) -> Result<Vec<Buffer>> {
+        Ok(std::iter::once(self.active.buffer).chain(self.marks.iter().map(|owner| owner.buffer))
+            .chain(self.pages.values().map(|owner| owner.buffer)).collect())
     }
 }
 

@@ -2852,6 +2852,17 @@ def build_arms(builds, arms, cards, state, task, dry, seed=DEFAULT_SEED):
             print('# identical build scopes ' + json.dumps(scopes, sort_keys=True))
 
 
+def parse_panel_config(text):
+    """Keep arbitrary panel objects intact; the bench binary owns their schema."""
+    panel, sep, body = text.partition('=')
+    if not sep or not panel:
+        raise ValueError('--panel-config needs PANEL=JSON')
+    value = json.loads(body)
+    if not isinstance(value, dict):
+        raise ValueError('--panel-config JSON must be an object')
+    return panel, value
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--kit', default='gate',
@@ -2888,6 +2899,8 @@ def main():
                         help='with --probe memory: stop only a verified card WIP worker if host MemAvailable falls below 512 MiB')
     parser.add_argument('--panels', metavar='LIST', help='run these server panels on every card instead of its profile '
                         '(comma list; "baseline" for the basic card + quick quality alone; "none" for no server profile)')
+    parser.add_argument('--panel-config', action='append', default=[], metavar='PANEL=JSON',
+                        help='explicit per-panel configuration; repeat for different panels (default greedy)')
     parser.add_argument('--lossless-set', type=Path, metavar='FILE', help='case file for the spec_lossless_set panel '
                         '(JSON [{id, prompt, nonce}]); default: the shipped scripts/bench/fixtures/spec-lossless-set-v1.json')
     parser.add_argument('--dump-lossless-rows', metavar='CASES:START-END', help='spec_lossless_set: dump full-vocabulary F32 '
@@ -3075,6 +3088,10 @@ def main():
             card['profile'] = profile
             if (listed or not (levels or prefill_lengths)) and 'baseline' not in listed:
                 card['baseline'] = False  # Explicit panels alone, or a probe-only readiness run; list baseline to keep it.
+    try:
+        panel_config = dict(parse_panel_config(text) for text in args.panel_config)
+    except ValueError as error:
+        parser.error(str(error))
     lossless_set = None
     if args.lossless_set is not None:
         lossless_set = load_lossless_set(args.lossless_set)
@@ -3089,6 +3106,8 @@ def main():
         if not any('spec_lossless_set' in requested_panels(card.get('profile', 'smoke'), binary=panel_binary(args.binary, arms)) for card in cards):
             parser.error('--dump-lossless-rows needs --panels with spec_lossless_set')
     for card in cards:
+        if panel_config:
+            card['panel_config'] = {**card.get('panel_config', {}), **panel_config}
         if context_lengths is not None:
             card['context_lengths'] = context_lengths
         if context_levels is not None:
@@ -3259,6 +3278,7 @@ def main():
         (['lossless_dump'] if any(job['entry'].get('lossless_dump') for job in jobs) else []) + \
         (['context_lengths'] if context_lengths is not None else []) + (['context_levels'] if context_levels is not None else []) + \
         (['context_suffix'] if args.context_suffix is not None else []) + \
+        (['panel_config'] if panel_config else []) + \
         (['worker_stop'] if any(job['entry']['set'].get('PROFILE_SPARK') for job in jobs) else [])
     for job in {j['launcher']['repo']: j for j in reversed(jobs)}.values():
         requested_panels(job['entry'].get('profile', 'smoke'), binary=job['binary'])

@@ -52,6 +52,25 @@ def _flag(line: str, flag: str) -> str | None:
     return tokens[tokens.index(flag) + 1] if flag in tokens else None
 
 
+def test_inkling_native_launcher_composes_shared_argv_and_rejects_pair(tmp_path: Path) -> None:
+    config = {"model_type": "inkling2", "text_config": {"num_hidden_layers": 48}}
+    keys = "SPARK_COUNT=6\nRTX_GPUS=1\nSPECULATOR=off\nVISION=off\nAUDIO=off\n" + SIX
+    result = _family_launch_result(tmp_path / "whole", config, "thinkingmachines/Inkling-2-Small-MXFP8", keys,
+        physical_gpus=(0,), extra_args=("--wip", "inkling"), encoder_plan=PLANNED,
+        deployment_overrides={"prefill_unit_rows": 2752, "prefill_waves": 3})
+    serve = _line(result, "serve-inkling2 --snapshot")
+    assert _flag(serve, "--peers") == ",".join(f"10.0.0.{i + 1}:19441" for i in range(6))
+    assert _flag(serve, "--max-context-tokens") == "auto"
+    assert _flag(serve, "--core-view") == "original"
+    assert (_flag(serve, "--prefill-rows"), _flag(serve, "--prefill-waves")) == ("2752", "3")
+    assert _flag(serve, "--rtx-expert-layers") == "auto"
+    for flag in ("--split-device", "--attention-placement", "--vision", "--audio", "--dspark", "--prefill-packing"):
+        assert flag not in shlex.split(serve)
+    pair = _family_launch_result(tmp_path / "pair", config, "thinkingmachines/Inkling-2-Small-MXFP8",
+        keys.replace("RTX_GPUS=1", "RTX_GPUS=2"), extra_args=("--wip", "inkling"), encoder_plan=PLANNED)
+    assert pair.returncode == 2 and "one coordinator GPU" in pair.stderr
+
+
 def test_minimax_qualified_card_opens_one_rtx_three_sparks_public_launch(tmp_path: Path) -> None:
     config = {"model_type": "minimax_m3_vl", "text_config": {
         "num_hidden_layers": 60, "moe_layer_freq": [0] * 3 + [1] * 57}}

@@ -248,6 +248,14 @@ fn installed_local_native_owners_use_shared_workspace_requests_once() -> anyhow:
     assert!(backings[0].is_empty());
     assert_eq!(backings[1].len(), 2, "one homogeneous group per physical rank");
     assert_eq!(backings[4].len(), 4, "mixed formats retain two independently retired backends per rank");
+    let host = crate::families::inkling2::weight_layout::push_host_envelope(&catalog, &backings[4], 2)?;
+    assert_eq!(host.dense_bytes, [0, 0], "raw dense delivery and device transpose need no staged host transform");
+    assert_eq!(host.retained_bytes, [0, 0]);
+    assert_eq!(host.slots, cuteafd_ffi::push_ring::DEFAULT_SLOTS as u64);
+    assert_eq!(host.slot_bytes, cuteafd_ffi::push_ring::DEFAULT_SLOT_BYTES as u64);
+    assert!(host.expert_bytes.iter().all(|&bytes| bytes > 0), "native dynamic scalar validation is explicit");
+    let empty_host = crate::families::inkling2::weight_layout::push_host_envelope(&catalog, &backings[0], 2)?;
+    assert_eq!(empty_host.expert_bytes, [0, 0]);
     for gpu in 0..2 {
         let workspace = backings[4].iter().filter(|backing| backing.gpu == gpu)
             .flat_map(|backing| &backing.workspace).map(|(_, bytes)| bytes).sum::<u64>();
@@ -317,6 +325,49 @@ fn spark_charges_match_shared_group_arenas_and_typed_owner_census() -> anyhow::R
             }
         }
     }
+    Ok(())
+}
+
+#[test]
+fn installed_native_minimum_is_six_sparks_with_full_pool() -> anyhow::Result<()> {
+    use std::path::PathBuf;
+    use crate::plan::{ExpertPlacement, MediaMode, layout::LayoutOptions};
+    let home = PathBuf::from(std::env::var_os("CUTEAFD_DEPLOYMENT_TEST_HF_HOME")
+        .expect("CUTEAFD_DEPLOYMENT_TEST_HF_HOME is required"));
+    let snapshot = crate::model_cache_dir(&home, "thinkingmachines/Inkling-2-Small-MXFP8")
+        .join("snapshots/3febc62259ee92ea36e2fb6e8303371c4eb3922c");
+    let manifest = PathBuf::from(std::env::var_os("CUTEAFD_DEPLOYMENT_TEST_PROGRAMS")
+        .expect("CUTEAFD_DEPLOYMENT_TEST_PROGRAMS is required"));
+    anyhow::ensure!(snapshot.is_dir() && manifest.is_file(), "installed Inkling inputs missing");
+    let input = testing::BudgetedPlanInput::open(&snapshot)?;
+    let options = PlanOptions { placement: ExpertPlacement::from_spark_ranks(6),
+        vision: MediaMode::Off, audio: MediaMode::Off,
+        layout: Some(LayoutOptions { workspace_manifest: Some(manifest), ..Default::default() }),
+        ..Default::default() };
+    let report = input.plan(&options)?;
+    assert_eq!(report.runtime, Some(RuntimeStatus::Planned));
+    assert!(report.fits && report.placement_supported && report.native_serving_admitted, "{:?}", report.hints);
+    assert!(report.wip_launchable() && !report.executable());
+    assert_eq!(report.memory_layout.as_ref().unwrap().pool_tokens, 2_097_152);
+    let refused = input.plan(&PlanOptions { placement: ExpertPlacement::from_spark_ranks(5), ..options })?;
+    assert!(!refused.fits && !refused.placement_supported);
+    assert!(refused.hints.iter().any(|hint| hint.what.contains("joint admission refused")), "{:?}", refused.hints);
+    Ok(())
+}
+
+#[test]
+fn serving_header_inventory_preserves_remote_native_expert_scales() -> anyhow::Result<()> {
+    use crate::families::inkling2::experts::layer_experts;
+    let (directory, config, _) = fixture(Fixture::Mxfp8);
+    let view = crate::plan::checkpoint::CheckpointView::select(directory.path(),
+        crate::plan::checkpoint::CoreView::Original)?;
+    let cfg = Inkling2Config::from_hf(&config)?;
+    let coordinator = Checkpoint::coordinator_view(&view, false, false)?;
+    assert!(layer_experts(&coordinator, &cfg).is_err());
+    let inventory = Checkpoint::open_view(&view)?;
+    let experts = layer_experts(&inventory, &cfg)?;
+    assert_eq!(experts.len(), cfg.layers);
+    assert!(experts.iter().all(|layer| layer.source > 0 && layer.whole > 0));
     Ok(())
 }
 
@@ -447,7 +498,8 @@ fn shared_recipe_charges_every_owner_once_on_one_and_two_rtx() {
             code: vec![64 << 20; gpus], graph_reserve: vec![500 << 20; gpus], head: serving::BlasHead::Gemm,
             host_prefix: serving::HostPrefixOwners { quota_bytes: 0, chunk_bytes: 0 }, device_sampling: true,
             expert_usage: None, resident_weight_limit: None,
-            mount: targets.iter().map(|t| t.mount_load(&checkpoint).unwrap()).collect() };
+            mount: targets.iter().map(|t| t.mount_load(&checkpoint).unwrap()).collect(),
+            push_host: vec![None; routed.len()+1] };
         let request = shared::request(inputs.context, None, crate::placement::Onboard::Auto, prefill,
             crate::placement::planner::Operation::Serving, None, Default::default());
         let contract = inputs.prepare(&request).unwrap();
@@ -494,11 +546,14 @@ fn shared_recipe_charges_every_owner_once_on_one_and_two_rtx() {
                 .chain((0..prefill.waves).map(|slot| (format!("inkling2.unit.{gpu}.{slot}"), prefill.rows as usize))) {
                 let expected = crate::families::inkling2::execution::UnitLayout::serving(&cfg, rows, 1 << 20).unwrap();
                 let actual = contract.components.iter().filter_map(|component| match &component.kind {
-                    ComponentKind::Allocation { template, .. } => template.id.strip_prefix(&format!("{prefix}."))
+                    ComponentKind::Allocation { template, .. } if template.location == Location::coordinator(gpu as u8) => template.id.strip_prefix(&format!("{prefix}."))
                         .map(|name| (name.to_owned(), component.bytes.at(1).unwrap() as usize)),
                     _ => None,
                 }).collect::<std::collections::BTreeMap<_, _>>();
                 assert_eq!(actual, expected.buffers, "{prefix}");
+                let upload = contract.components.iter().find(|component| matches!(&component.kind,
+                    ComponentKind::Allocation { template, .. } if template.id == format!("{prefix}.uploads"))).unwrap();
+                assert_eq!(upload.bytes.at(1).unwrap(), expected.upload_shape(&cfg, 16.min(rows)).unwrap().capacity_bytes().unwrap() as u64);
             }
         }
         if gpus == 1 {

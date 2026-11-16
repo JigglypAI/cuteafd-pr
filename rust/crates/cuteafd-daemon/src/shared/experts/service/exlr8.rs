@@ -211,8 +211,8 @@ impl<'w, 'a> Worker<'w, 'a> {
         }
         let plane = crate::shared::memory::DeviceAllocation::new(self.library, layout.plane_bytes.try_into()?,
             crate::shared::memory::Tag::workspace("experts/workspace/staged_units"))?;
-        self.waves = super::super::execution::waves::WaveStaging::with_max_units(self.library, extent,
-            plane.buffer, row as usize, 1, cuteafd_core::spark_executions::MAX_MERGED_UNITS)?;
+        self.waves = super::super::execution::waves::WaveStaging::new(self.library, extent,
+            plane.buffer, row as usize, 1)?;
         self.staged_plane = Some(plane);
         self.timing_units = std::collections::VecDeque::with_capacity(extent.buffered_units as usize);
         Ok(())
@@ -514,6 +514,23 @@ unsafe fn library_copy(library: &NativeLibrary, target: CuteafdDeviceBuffer,
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn glmf_exlr8_segments_merge_again_with_expert_domain_launch() -> Result<()> {
+        use cuteafd_core::{ExecutionOwner, ExpertGeometry, OwnerExtent};
+        let extent = OwnerExtent { owner: ExecutionOwner::Prefill, capacity: 2752,
+            compiled: 4096, staging_rows: 2752, buffered_units: 3 };
+        for geometry in [ExpertGeometry::GLM5_FLASH, ExpertGeometry::GLM5] {
+            let layout = cuteafd_loader::serving_capacity::spark_waves::staging(extent, geometry)?;
+            assert_eq!(layout.rows, 5504);
+            assert_eq!(extent.segment_rows(), Some(layout.rows));
+        }
+        let source = include_str!("exlr8.rs").split("#[cfg(test)]").next().unwrap();
+        assert!(source.contains("extent.segment_rows().filter(|_| extent.staging_rows > K1_ROWS as u32)"));
+        assert!(source.contains("WaveStaging::new(self.library, extent,\n            plane.buffer, row as usize, 1)"));
+        Ok(())
+    }
+
     #[test]
     fn exlr8_load_order_starts_after_peak_admission() {
         let source = include_str!("exlr8.rs").split("#[cfg(test)]").next().unwrap();
