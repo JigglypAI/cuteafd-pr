@@ -36,6 +36,19 @@ PARENTS = {
 }
 
 
+def tensor_storage_entry(geometry, stored_tensors, *, mcg_multiplier=MCG,
+                         mul1_multiplier=None, **extra):
+    """Build the common EXL3 record without discarding family-specific fields."""
+    entry = dict(quant_format='exl3', bits_per_weight=geometry['bits'],
+                 mcg_multiplier=mcg_multiplier,
+                 **{key: geometry[key] for key in
+                    ('in_features', 'out_features', 'stored_out_features')},
+                 stored_tensors=stored_tensors, **extra)
+    if mul1_multiplier is not None:
+        entry['mul1_multiplier'] = mul1_multiplier
+    return entry
+
+
 def family_recipe(family):
     """Return the completed numerical selection used by compact encodes."""
     if family == 'glmf':
@@ -249,9 +262,9 @@ def view_metadata(parent_quant, parent_config, selection, specs, *, bits, quanti
             del storage[module]
         else:
             entry = storage[module]
-            entry.update(bits_per_weight=bits, mcg_multiplier=MCG,
-                         stored_tensors={name: dict(shape=shape, torch_dtype=DTYPES[dtype])
-                            for name, (dtype, shape) in packed_specs(module, dict(geometry, bits=bits)).items()})
+            entry.update(tensor_storage_entry(dict(geometry, bits=bits),
+                         {name: dict(shape=shape, torch_dtype=DTYPES[dtype])
+                          for name, (dtype, shape) in packed_specs(module, dict(geometry, bits=bits)).items()}))
     if bits is None:
         quant['module_include'] = exact_patterns(quant['module_include'],
                                                 parent_quant['tensor_storage'], set(selection))

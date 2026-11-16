@@ -13,6 +13,43 @@ import mc_package as package
 from core_export import packed_specs
 
 
+def test_tensor_storage_entry_matches_kimi_schema_and_preserves_optional_multiplier():
+    from inkling2.run import tensor_storage_entry as inkling_entry
+
+    geometry = dict(bits=6, in_features=256, out_features=192, stored_out_features=256)
+    stored = {name: dict(shape=shape, torch_dtype=package.DTYPES[dtype])
+              for name, (dtype, shape) in packed_specs('head', geometry).items()}
+    kimi = dict(quant_format='exl3', bits_per_weight=6, mcg_multiplier=package.MCG,
+                in_features=256, out_features=192, stored_out_features=256,
+                stored_tensors=stored)
+    assert inkling_entry is package.tensor_storage_entry
+    assert inkling_entry(geometry, stored) == kimi
+    assert set(kimi) == {'quant_format', 'bits_per_weight', 'mcg_multiplier',
+                         'in_features', 'out_features', 'stored_out_features', 'stored_tensors'}
+    assert inkling_entry(geometry, stored, mul1_multiplier=0.5) == dict(kimi, mul1_multiplier=0.5)
+
+
+@pytest.mark.parametrize('family', ['kimi_k31', 'glm5', 'glm5_flash', 'muse_spark', 'mistral_large4'])
+def test_shared_storage_builder_preserves_recorded_family_recipes(family):
+    import importlib
+    from kimi_k3.uniform_k2.storage import canonical
+
+    leaf = 'k2_core_k6' if family == 'kimi_k31' else 'core_k6'
+    recipe = importlib.import_module(f'{family}.{leaf}.recipe')
+    for module, geometry in recipe.reviewed_modules().items():
+        stored = {name: dict(shape=shape, torch_dtype=package.DTYPES[dtype])
+                  for name, (dtype, shape) in recipe.packed_specs(module, geometry).items()}
+        extra = dict(sharded_side=geometry.get('sharded_side', 1)) if family == 'muse_spark' else {}
+        previous = dict(quant_format='exl3', bits_per_weight=geometry['bits'],
+                        mcg_multiplier=recipe.MCG_MULTIPLIER,
+                        **{key: geometry[key] for key in
+                           ('in_features', 'out_features', 'stored_out_features')},
+                        **extra, stored_tensors=stored)
+        current = package.tensor_storage_entry(geometry, stored,
+                    mcg_multiplier=recipe.MCG_MULTIPLIER, **extra)
+        assert canonical(current) == canonical(previous)
+
+
 def dump(root, name, data):
     (root / name).write_text(json.dumps(data))
 

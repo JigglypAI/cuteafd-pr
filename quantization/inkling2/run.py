@@ -20,6 +20,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
+from mc_package import tensor_storage_entry
 from kimi_k3.uniform_k2.storage import atomic_json, canonical, file_identity
 from kimi_k3.core_k6.storage import StageStore
 from glm5.core_k6.storage import ProjectionStore
@@ -496,9 +497,9 @@ class Runner:
             config['quantization_config'] = dict(quant_method='exl3', format='mcg',
                 per_module_metadata=metadata_pointer, activation_quantization=recipe.ACTIVATION_QUANTIZATION)
             modules = self.experts | ({} if bits is None else self.core[bits])
-            storage = {name: dict(bits_per_weight=g['bits'], stored_tensors={n: dict(shape=shape,
-                torch_dtype=dtype_names[dtype]) for n, (dtype, shape) in recipe.packed_specs(name, g).items()})
-                for name, g in modules.items()}
+            storage = {name: tensor_storage_entry(g, {n: dict(shape=shape,
+                torch_dtype=dtype_names[dtype]) for n, (dtype, shape) in recipe.packed_specs(name, g).items()},
+                mcg_multiplier=recipe.MCG_MULTIPLIER) for name, g in modules.items()}
             configs[view] = config
             quantizes[view] = dict(quant_method='exl3', tensor_storage=storage,
                 per_module_metadata=metadata_pointer,
