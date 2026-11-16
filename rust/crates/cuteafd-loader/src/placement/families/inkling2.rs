@@ -438,7 +438,8 @@ impl InklingInputs {
         // keep no pool pages: their window lives in the per-sequence ring.
         let record_bytes = self.kv_format.record_bytes(cfg.kv_heads, cfg.head_dim) as u64;
         let page_rows = self.page_rows();
-        let mut marks = 0u64;
+        let mut rings = 0u64;
+        let mut conv = 0u64;
         for (layer, &mode) in self.modes.iter().enumerate() {
             // This rank's share of the layer's KV heads: all of a whole layer it
             // owns, half of a split layer, none of a layer another GPU owns.
@@ -462,8 +463,10 @@ impl InklingInputs {
             // under a split (the residual is replicated), the K/V lags split.
             let ring = state.ring_bytes * num / den;
             let lags = if den == 1 { state.lag_bytes } else { state.kv_lag_bytes / 2 + (state.lag_bytes - state.kv_lag_bytes) };
-            marks = marks.checked_add((ring + lags).checked_mul(sequences)
-                .ok_or(Refusal::Overflow("Inkling 2 sequence state"))?).ok_or(Refusal::Overflow("Inkling 2 sequence state"))?;
+            rings = rings.checked_add(ring.checked_mul(sequences)
+                .ok_or(Refusal::Overflow("Inkling ring state"))?).ok_or(Refusal::Overflow("Inkling ring state"))?;
+            conv = conv.checked_add(lags.checked_mul(sequences)
+                .ok_or(Refusal::Overflow("Inkling convolution state"))?).ok_or(Refusal::Overflow("Inkling convolution state"))?;
         }
         if self.modes.iter().any(|mode| *mode == LayerMode::ContextSplit) {
             for demand in self.context_buffers().demands().map_err(|error| invalid(error))?
@@ -475,9 +478,11 @@ impl InklingInputs {
         // Sliding-window rings and short-conv lag rows for every admitted
         // sequence: the prefix-mark arena a snapshot copies (byte-identical
         // restores), sized by concurrency, not context.
-        out.extend(buffer(format!("inkling2.cache.{gpu}.active"), location, marks, Lifetime::TARGET, Category::Kv,
-            "active SWA rings and FP32 convolution lags", maximum));
-        let per_sequence = marks / sequences;
+        out.extend(buffer(format!("inkling2.cache.{gpu}.active"), location, rings, Lifetime::TARGET, Category::Kv,
+            "active SWA rings", maximum));
+        out.extend(buffer(format!("inkling2.cache.{gpu}.conv"), location, conv, Lifetime::TARGET, Category::Kv,
+            "contiguous FP32 convolution lag backing", maximum));
+        let per_sequence = rings.checked_add(conv).ok_or(Refusal::Overflow("Inkling complete sequence state"))? / sequences;
         let slots = cuteafd_core::prefix::mark_slots_with_host(self.sequences, self.prefix_entries,
             self.mark_bytes()?, self.prefix_mark_budget, self.host_prefix.quota_bytes > 0);
         let retained = per_sequence.checked_mul(slots).ok_or(Refusal::Overflow("Inkling prefix marks"))?;

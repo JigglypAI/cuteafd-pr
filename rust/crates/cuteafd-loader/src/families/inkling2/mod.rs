@@ -19,8 +19,8 @@ impl InklingKvCache {
     }
     pub fn name(self) -> &'static str { match self { Self::Bf16 => "bf16", Self::Fp8 => "fp8" } }
     pub fn record_format(self) -> &'static str { match self {
-        Self::Bf16 => "inkling2_bf16_kv_f32_conv_whole_v1",
-        Self::Fp8 => "inkling2_fp8_head_scales_kv_f32_conv_whole_v2",
+        Self::Bf16 => "inkling2_bf16_kv_f32_conv_contiguous_v3",
+        Self::Fp8 => "inkling2_fp8_head_scales_kv_f32_conv_contiguous_v3",
     } }
 }
 impl std::str::FromStr for InklingKvCache {

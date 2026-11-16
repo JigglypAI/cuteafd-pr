@@ -146,8 +146,11 @@ impl SequenceLayout {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CacheLayout {
     pub layers: Vec<SequenceLayout>,
-    pub offsets: Vec<usize>,
+    /// Serialized mark bytes: all rings followed by the contiguous FIR bank.
     pub sequence_bytes: usize,
+    pub ring_sequence_bytes: usize,
+    pub ring_offsets: Vec<usize>,
+    pub conv: super::conv::ConvLayout,
     pub sequences: usize,
     pub pool_pages: usize,
     pub page_bytes: usize,
@@ -164,18 +167,26 @@ impl CacheLayout {
         let layers = cfg.local.iter().map(|&local| SequenceLayout::new(cfg, local, 1))
             .collect::<Result<Vec<_>>>()?;
         let mut sequence_bytes = 0usize;
-        let offsets = layers.iter().map(|layer| {
-            let offset = sequence_bytes;
+        for layer in &layers {
             sequence_bytes = sequence_bytes.checked_add(layer.bytes).context("Inkling cache mark overflow")?;
-            Ok(offset)
-        }).collect::<Result<Vec<_>>>()?;
+        }
         let page_bytes = kv_format.record_bytes(cfg.kv_heads, cfg.head_dim).checked_mul(64)
             .context("Inkling cache page overflow")?;
         let global_layers = cfg.local.iter().enumerate().filter_map(|(layer, &local)| (!local).then_some(layer)).collect();
-        Ok(Self { layers, offsets, sequence_bytes, sequences, pool_pages, page_bytes, kv_format, global_layers })
+        let mut ring_sequence_bytes = 0usize;
+        let ring_offsets = layers.iter().map(|layer| {
+            let offset = ring_sequence_bytes;
+            ring_sequence_bytes = ring_sequence_bytes.checked_add(layer.fields["ring"].len())
+                .context("Inkling ring state bytes overflow")?;
+            Ok(offset)
+        }).collect::<Result<Vec<_>>>()?;
+        let conv = super::conv::ConvLayout::new(sequences, cfg.layers, cfg.hidden, cfg.kv_heads*cfg.head_dim)?;
+        ensure!(sequence_bytes == ring_sequence_bytes + conv.slot_stride*4, "Inkling serialized state inventory differs");
+        Ok(Self { layers, sequence_bytes, ring_sequence_bytes, ring_offsets, conv,
+            sequences, pool_pages, page_bytes, kv_format, global_layers })
     }
     pub fn active_bytes(&self) -> Result<usize> {
-        self.sequence_bytes.checked_mul(self.sequences).context("Inkling active cache overflow")
+        self.ring_sequence_bytes.checked_mul(self.sequences).context("Inkling active ring cache overflow")
     }
     pub fn retained_bytes(&self, marks: usize) -> Result<usize> {
         self.sequence_bytes.checked_mul(marks).context("Inkling retained marks overflow")
@@ -183,13 +194,15 @@ impl CacheLayout {
     pub fn layer_page_bytes(&self) -> Result<usize> {
         self.page_bytes.checked_mul(self.pool_pages).context("Inkling global cache overflow")
     }
-    pub fn field(&self, sequence: usize, layer: usize, name: &str) -> Result<std::ops::Range<usize>> {
-        ensure!(sequence < self.sequences && layer < self.layers.len(), "Inkling cache address outside bank");
-        let field = self.layers[layer].field(name)?;
-        let at = sequence.checked_mul(self.sequence_bytes).and_then(|v| v.checked_add(self.offsets[layer]))
-            .and_then(|v| v.checked_add(field.start)).context("Inkling cache field offset overflow")?;
-        Ok(at..at.checked_add(field.len()).context("Inkling cache field end overflow")?)
+    pub fn ring_field(&self, sequence: usize, layer: usize) -> Result<std::ops::Range<usize>> {
+        ensure!(sequence < self.sequences && layer < self.layers.len(), "Inkling ring field outside bank");
+        let at = sequence.checked_mul(self.ring_sequence_bytes).and_then(|n|n.checked_add(self.ring_offsets[layer]))
+            .context("Inkling ring address overflow")?;
+        let bytes = self.layers[layer].fields["ring"].len();
+        ensure!(bytes > 0, "Inkling global layer has no sliding ring");
+        Ok(at..at.checked_add(bytes).context("Inkling ring field end overflow")?)
     }
+
 }
 
 /// One contiguous request segment. Physical pages are supplied by the shared
@@ -308,23 +321,21 @@ mod tests {
         let cache = CacheLayout::new(&cfg, 3, 19)?;
         assert_eq!(cache.global_layers.len(), 8);
         assert_eq!(cache.page_bytes, 64*4096);
-        assert_eq!(cache.active_bytes()?, cache.sequence_bytes*3);
+        assert_eq!(cache.active_bytes()? + cache.conv.bytes()?, cache.sequence_bytes*3);
         assert_eq!(cache.retained_bytes(7)?, cache.sequence_bytes*7);
         let mut spans = Vec::new();
         for sequence in 0..3 {
-            for layer in 0..cfg.layers {
-                for name in ["ring", "k_conv_history", "v_conv_history", "attn_conv_history", "mlp_conv_history"] {
-                    let span = cache.field(sequence, layer, name)?;
-                    if !span.is_empty() { spans.push(span); }
-                }
+            for layer in cfg.local.iter().enumerate().filter_map(|(i,&local)|local.then_some(i)) {
+                spans.push(cache.ring_field(sequence, layer)?);
             }
         }
-        spans.sort_by_key(|span| span.start);
-        let mut end = 0;
-        for span in spans { assert_eq!(span.start, end); end = span.end; }
-        assert_eq!(end, cache.active_bytes()?);
-        assert!(cache.field(3,0,"ring").is_err());
-        assert!(cache.field(0,cfg.layers,"ring").is_err());
+        spans.sort_by_key(|span|span.start);
+        let mut end=0;
+        for span in spans { assert_eq!(span.start,end);end=span.end; }
+        assert_eq!(end,cache.active_bytes()?);
+        assert!(cache.ring_field(3,0).is_err());
+        assert!(cache.ring_field(0,cfg.layers).is_err());
+        assert_eq!(cache.conv.width,11264);
         let unit = UnitLayout::serving(&cfg, 64, 8192)?;
         for name in ["ring", "global_cache", "attn_conv_history", "mlp_conv_history", "k_conv_history", "v_conv_history"] {
             assert!(!unit.buffers.contains_key(name));

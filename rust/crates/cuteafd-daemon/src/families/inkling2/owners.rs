@@ -13,6 +13,7 @@ pub(crate) trait UnitBuffers<'a> {
     fn stream(&self) -> &Stream<'a>;
     fn layout(&self) -> &UnitLayout;
     fn buffer(&self, name: &str) -> Result<Buffer>;
+    fn convolution_strides(&self) -> Option<(usize, usize, usize)> { None }
     fn packed(&self) -> Option<(&UnitOwner<'a>, &super::cache::CacheBank<'a>, usize, &[PackedMember])> { None }
     fn prepare_page_table(&self, _pages: &[i32]) -> Result<()> { anyhow::bail!("Inkling owner has no packed page-table uploader") }
 }
@@ -32,6 +33,9 @@ pub(crate) struct PackedLayerUnit<'u, 'a> {
     pub uploads: std::cell::RefCell<&'u mut crate::shared::token_table::RetainedUploads<'a>>,
 }
 impl<'a> UnitBuffers<'a> for PackedLayerUnit<'_, 'a> {
+    fn convolution_strides(&self) -> Option<(usize, usize, usize)> {
+        Some((self.cache.layout.conv.slot_stride, self.cache.layout.conv.lag_stride, self.cache.layout.sequences))
+    }
     fn stream(&self) -> &Stream<'a> { &self.unit.stream }
     fn layout(&self) -> &UnitLayout { &self.unit.layout }
     fn buffer(&self, name: &str) -> Result<Buffer> {
@@ -62,6 +66,9 @@ pub(crate) struct LayerUnit<'u, 'a> {
     rows: std::ops::Range<usize>,
 }
 impl<'a> UnitBuffers<'a> for LayerUnit<'_, 'a> {
+    fn convolution_strides(&self) -> Option<(usize, usize, usize)> {
+        Some((self.cache.layout.conv.slot_stride, self.cache.layout.conv.lag_stride, 1))
+    }
     fn stream(&self) -> &Stream<'a> { &self.unit.stream }
     fn layout(&self) -> &UnitLayout { &self.unit.layout }
     fn buffer(&self, name: &str) -> Result<Buffer> {
@@ -283,6 +290,7 @@ impl<'a> RequestOwners<'a> {
         };
         let device = Location::coordinator(0);
         owner("inkling2.cache.0.active", cache_layout.active_bytes()?, device)?;
+        owner("inkling2.cache.0.conv", cache_layout.conv.bytes()?, device)?;
         if mark_slots > 0 { owner("inkling2.cache.0.marks", cache_layout.retained_bytes(mark_slots)?, device)?; }
         for &layer in &cache_layout.global_layers {
             let bytes = usize::try_from(cuteafd_loader::placement::planner::sm120_request_backing(cache_layout.layer_page_bytes()? as u64)?)?;

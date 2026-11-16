@@ -663,6 +663,7 @@ def test_inkling2_dispatch_package_codes_cmake_and_placement_scopes_agree(monkey
                  "inkling2_load_programs": lambda: [],
                  # Recurrent primitive and TP geometry inventories have their own tests.
                  "inkling_draft_programs": lambda: [],
+                 "inkling_fir_programs": lambda: [],
                  "inkling_draft_projection_shapes": lambda ranks: set(),
                  "inkling2_input_quant_program": lambda: "native-wire",
                  "compile_draft_bf16_projection": lambda k, n, output="bf16": (k, n, output)}

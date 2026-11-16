@@ -19,6 +19,7 @@ pub(crate) struct CacheBank<'a> {
     copies: PrefixCopies<'a>,
     readers: Vec<Rc<Stream<'a>>>,
     active: Allocation<'a>,
+    conv: Allocation<'a>,
     marks: Option<Allocation<'a>>,
     pages: BTreeMap<usize, Allocation<'a>>,
     pub layout: CacheLayout,
@@ -39,6 +40,7 @@ impl<'a> CacheBank<'a> {
         ensure!(readers.iter().all(|stream| stream.device.id == device.id
             && std::ptr::eq(stream.device.library, device.library)), "Inkling cache reader devices differ");
         let active = Allocation::new(device, layout.active_bytes()?, Tag::kv("inkling2/sequence-state"))?;
+        let conv = Allocation::new(device, layout.conv.bytes()?, Tag::kv("inkling2/convolution-state"))?;
         let marks = (mark_slots > 0).then(|| Allocation::new(device, layout.retained_bytes(mark_slots)?,
             Tag::new(cuteafd_core::memory_layout::MemoryKind::Prefix, "inkling2/prefix-marks"))).transpose()?;
         let pages = layout.global_layers.iter().map(|&layer| Ok((layer,
@@ -46,23 +48,33 @@ impl<'a> CacheBank<'a> {
             .collect::<Result<BTreeMap<_, _>>>()?;
         let copies = PrefixCopies::new(device.library, vec![readers.iter().map(|stream|
             Reader { device: stream.device.id, stream: stream.raw }).collect()])?;
-        let bank = Self { copies, readers, active, marks, pages, layout, mark_slots };
+        let bank = Self { copies, readers, active, conv, marks, pages, layout, mark_slots };
         bank.copies.ordered(0, |stream| {
             // SAFETY: all allocations succeeded before initialization; the bank
             // retains every destination and joins readers on both sides.
-            unsafe { device.library.cuda_zero_bytes_async(bank.active.buffer, bank.active.buffer.bytes, stream)?; }
+            unsafe {
+                device.library.cuda_zero_bytes_async(bank.active.buffer, bank.active.buffer.bytes, stream)?;
+                device.library.cuda_zero_bytes_async(bank.conv.buffer, bank.conv.buffer.bytes, stream)?;
+            }
             Ok(())
         })?;
         Ok(bank)
     }
     pub fn field(&self, sequence: usize, layer: usize, name: &str) -> Result<Buffer> {
-        let span = self.layout.field(sequence, layer, name)?;
-        view(self.active.buffer, span.start, span.len())
+        if name == "ring" {
+            let span = self.layout.ring_field(sequence, layer)?;
+            return view(self.active.buffer, span.start, span.len());
+        }
+        let (span, _) = self.layout.conv.field(sequence, layer, name)?;
+        view(self.conv.buffer, span.start, span.len())
     }
     pub fn field_bank(&self, layer: usize, name: &str) -> Result<Buffer> {
-        let span = self.layout.field(0, layer, name)?;
-        view(self.active.buffer, span.start,
-            (self.layout.sequences-1)*self.layout.sequence_bytes + span.len())
+        let first = self.field(0, layer, name)?;
+        let stride = if name == "ring" { self.layout.ring_sequence_bytes }
+            else { self.layout.conv.slot_stride*4 };
+        let backing = if name == "ring" { self.active.buffer } else { self.conv.buffer };
+        view(backing, first.ptr as usize-backing.ptr as usize,
+            (self.layout.sequences-1)*stride + first.bytes)
     }
     pub fn global(&self, layer: usize) -> Result<Buffer> {
         self.pages.get(&layer).map(|owner| owner.buffer).context("Inkling layer has no global KV pages")
@@ -71,9 +83,9 @@ impl<'a> CacheBank<'a> {
         ensure!(page < self.layout.pool_pages, "Inkling physical page outside pool");
         view(self.global(layer)?, page*self.layout.page_bytes, self.layout.page_bytes)
     }
-    fn sequence(&self, sequence: usize) -> Result<Buffer> {
+    fn rings_for_sequence(&self, sequence: usize) -> Result<Buffer> {
         ensure!(sequence < self.layout.sequences, "Inkling sequence outside cache");
-        view(self.active.buffer, sequence*self.layout.sequence_bytes, self.layout.sequence_bytes)
+        view(self.active.buffer, sequence*self.layout.ring_sequence_bytes, self.layout.ring_sequence_bytes)
     }
     pub fn mark(&self, slot: usize) -> Result<Buffer> {
         ensure!(slot < self.mark_slots, "Inkling mark outside arena");
@@ -81,18 +93,36 @@ impl<'a> CacheBank<'a> {
             slot*self.layout.sequence_bytes, self.layout.sequence_bytes)
     }
     pub fn reset(&self, sequence: usize) -> Result<()> {
-        let dst = self.sequence(sequence)?;
+        let rings = self.rings_for_sequence(sequence)?;
+        let conv = self.conv_for_sequence(sequence)?;
         self.copies.ordered(0, |stream| {
             // SAFETY: copy fences join every arithmetic reader before overwrite.
-            unsafe { self.readers[0].device.library.cuda_zero_bytes_async(dst, dst.bytes, stream) }
+            unsafe {
+                self.readers[0].device.library.cuda_zero_bytes_async(rings, rings.bytes, stream)?;
+                self.readers[0].device.library.cuda_zero_bytes_async(conv, conv.bytes, stream)
+            }
         })
     }
-    pub fn capture(&self, sequence: usize, slot: usize) -> Result<()> {
-        self.copy(self.mark(slot)?, self.sequence(sequence)?)
+    pub fn conv_for_sequence(&self, sequence: usize) -> Result<Buffer> {
+        ensure!(sequence < self.layout.sequences, "Inkling convolution sequence outside cache");
+        let bytes = self.layout.conv.slot_stride*4;
+        view(self.conv.buffer, sequence*bytes, bytes)
     }
-    pub fn restore(&self, slot: usize, sequence: usize) -> Result<()> {
-        self.copy(self.sequence(sequence)?, self.mark(slot)?)
+    pub fn conv_backing(&self) -> Buffer { self.conv.buffer }
+    fn state_copy(&self, sequence: usize, slot: usize, capture: bool) -> Result<()> {
+        let mark = self.mark(slot)?;
+        let rings = self.rings_for_sequence(sequence)?;
+        let conv = self.conv_for_sequence(sequence)?;
+        let saved_rings = view(mark, 0, rings.bytes)?;
+        let saved_conv = view(mark, rings.bytes, conv.bytes)?;
+        let copies = if capture { vec![(0, saved_rings, rings), (0, saved_conv, conv)] }
+            else { vec![(0, rings, saved_rings), (0, conv, saved_conv)] };
+        // SAFETY: exact disjoint ring/convolution views share registered readers;
+        // one prefix fence orders both backings before snapshot publication.
+        unsafe { self.copies.copy_d2d(&copies) }
     }
+    pub fn capture(&self, sequence: usize, slot: usize) -> Result<()> { self.state_copy(sequence, slot, true) }
+    pub fn restore(&self, slot: usize, sequence: usize) -> Result<()> { self.state_copy(sequence, slot, false) }
     fn copy(&self, dst: Buffer, src: Buffer) -> Result<()> {
         ensure!(dst.bytes == src.bytes && dst.ptr != src.ptr, "Inkling cache copy extent/alias");
         // SAFETY: checked disjoint sequence/mark regions survive all fenced
@@ -119,6 +149,7 @@ impl<'a> CacheBank<'a> {
         let cuteafd_loader::placement::planner::Device::Coordinator(gpu) = location.device
             else { anyhow::bail!("Inkling cache is not coordinator-owned"); };
         self.active.inventory(inventory, &format!("inkling2.cache.{gpu}.active"))?;
+        self.conv.inventory(inventory, &format!("inkling2.cache.{gpu}.conv"))?;
         if let Some(marks) = &self.marks { marks.inventory(inventory, &format!("inkling2.cache.{gpu}.marks"))?; }
         for (layer, owner) in &self.pages { owner.inventory(inventory, &format!("inkling2.kv.{layer}.{gpu}.records"))?; }
         self.copies.allocation_receipts(inventory, &format!("inkling2.cache.{gpu}.copies"))
@@ -242,7 +273,7 @@ mod tests {
         let tokens = (0..65).collect::<Vec<u32>>();
         let mut source = cache.admit(&family, &tokens, 128, false,
             |units| Placement { units, slot: 0, len: 0, state_len: 0 })?.placement;
-        let state = bank.sequence(0)?;
+        let state = bank.rings_for_sequence(0)?;
         let prompt = vec![0x17; state.bytes];
         library.copy_h2d(state, &prompt)?;
         for &page in &source.units {
@@ -256,11 +287,11 @@ mod tests {
             |units| Placement { units, slot: 1, len: 0, state_len: 0 })?;
         assert_eq!(restored.resume, tokens.len());
         let mut observed = vec![0; state.bytes];
-        library.copy_d2h(&mut observed, bank.sequence(1)?)?;
+        library.copy_d2h(&mut observed, bank.rings_for_sequence(1)?)?;
         assert_eq!(observed, prompt);
         let mut continued = restored.placement;
         let turn = vec![0x6b; state.bytes];
-        library.copy_h2d(bank.sequence(1)?, &turn)?;
+        library.copy_h2d(bank.rings_for_sequence(1)?, &turn)?;
         let mut turn_tokens = tokens.clone(); turn_tokens.push(91);
         continued.len = turn_tokens.len(); continued.state_len = turn_tokens.len();
         assert!(cache.capture(&family, SnapshotKind::Turn, &turn_tokens, &continued, After::from_logits(&[0., 1.], true))?);
@@ -268,13 +299,13 @@ mod tests {
         let restored = cache.admit(&family, &turn_tokens, 128, false,
             |units| Placement { units, slot: 0, len: 0, state_len: 0 })?;
         assert_eq!(restored.resume, turn_tokens.len());
-        library.copy_d2h(&mut observed, bank.sequence(0)?)?;
+        library.copy_d2h(&mut observed, bank.rings_for_sequence(0)?)?;
         assert_eq!(observed, turn);
         cache.release(&family, &restored.placement.units)?;
         let restored = cache.admit(&family, &tokens, 128, false,
             |units| Placement { units, slot: 1, len: 0, state_len: 0 })?;
         assert_eq!(restored.resume, tokens.len());
-        library.copy_d2h(&mut observed, bank.sequence(1)?)?;
+        library.copy_d2h(&mut observed, bank.rings_for_sequence(1)?)?;
         assert_eq!(observed, prompt, "turn divergence must not mutate the prompt mark");
         cache.release(&family, &restored.placement.units)?;
         Ok(())
@@ -301,7 +332,7 @@ mod tests {
         cfg.layers = 2;
         cfg.local = vec![true, false];
         let cache = CacheBank::new(vec![reader.clone()], CacheLayout::with_format(&cfg, 2, 3, format)?, 1)?;
-        let state = cache.sequence(0)?;
+        let state = cache.rings_for_sequence(0)?;
         let pattern = (0..state.bytes).map(|byte| (byte.wrapping_mul(17) % 251) as u8).collect::<Vec<_>>();
         library.copy_h2d(state, &pattern)?;
         cache.capture(0, 0)?;
@@ -309,9 +340,9 @@ mod tests {
         cache.restore(0, 1)?;
         cache.drain()?;
         let mut restored = vec![0; pattern.len()];
-        library.copy_d2h(&mut restored, cache.sequence(1)?)?;
+        library.copy_d2h(&mut restored, cache.rings_for_sequence(1)?)?;
         assert_eq!(restored, pattern);
-        library.copy_d2h(&mut restored, cache.sequence(0)?)?;
+        library.copy_d2h(&mut restored, cache.rings_for_sequence(0)?)?;
         assert!(restored.iter().all(|&byte| byte == 0));
         let page = cache.page(1, 0)?;
         let page_pattern = vec![0x5a; page.bytes];
@@ -350,7 +381,7 @@ mod tests {
         let cache = Rc::new(cache);
         let family = InklingPrefix::new(cache.clone());
         let mut source = Placement { units: vec![0, 1], slot: 0, len: 65, state_len: 65 };
-        library.copy_h2d(cache.sequence(0)?, &pattern)?;
+        library.copy_h2d(cache.rings_for_sequence(0)?, &pattern)?;
         family.capture(MarkSlot(0), &source, 65).map_err(|e| anyhow::anyhow!("{e}"))?;
         source.state_len = 64;
         assert!(family.capture(MarkSlot(0), &source, 65).is_err());
@@ -360,7 +391,7 @@ mod tests {
         family.restore(Some(MarkSlot(0)), &mut destination, 65).map_err(|e| anyhow::anyhow!("{e}"))?;
         family.drain().map_err(|e| anyhow::anyhow!("{e}"))?;
         assert_eq!((destination.len, destination.state_len), (65, 65));
-        library.copy_d2h(&mut restored, cache.sequence(1)?)?;
+        library.copy_d2h(&mut restored, cache.rings_for_sequence(1)?)?;
         assert_eq!(restored, pattern);
         let sentinel = vec![0x33; page.bytes];
         library.copy_h2d(cache.page(1, 2)?, &sentinel)?;
@@ -383,7 +414,7 @@ mod tests {
 
 impl crate::shared::prefix::cuda_copy::SnapshotOwner for CacheBank<'_> {
     fn snapshot_buffers(&self) -> Result<Vec<Buffer>> {
-        Ok(std::iter::once(self.active.buffer).chain(self.marks.iter().map(|owner| owner.buffer))
+        Ok([self.active.buffer,self.conv.buffer].into_iter().chain(self.marks.iter().map(|owner| owner.buffer))
             .chain(self.pages.values().map(|owner| owner.buffer)).collect())
     }
 }

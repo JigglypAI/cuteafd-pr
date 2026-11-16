@@ -303,6 +303,22 @@ def inkling_draft_programs():
     return out
 
 
+def inkling_fir_programs():
+    from functools import partial
+    from b12x.integration.cuteafd.fir_history import compile_fir_history_commit_aot
+    from b12x.integration.cuteafd.inkling2_convolution_replay import compile_inkling2_convolution_replay_aot
+    from b12x.integration.cuteafd.inkling2_convolution_strided import compile_inkling2_convolution_strided_aot
+    out = [("fir_history_commit", "fir_history_commit", {"max_rows": 64}, compile_fir_history_commit_aot)]
+    for width, dynamic in ((4608, False), (1024, False), (1024, True)):
+        kind = "dynamic" if dynamic else "static"
+        params = dict(width=width, heads=8 if dynamic else 1, dynamic=dynamic)
+        for suffix, capacity, compile_ in (("replay", 64, compile_inkling2_convolution_replay_aot),
+                                          ("strided", 4096, compile_inkling2_convolution_strided_aot)):
+            out.append((f"conv_{kind}_h{width}_f32_{suffix}", f"convolution_{suffix}", {"max_rows": capacity},
+                        partial(compile_, **params)))
+    return out
+
+
 def inkling_draft_projection_shapes(ranks):
     if ranks not in (1, 2):
         raise ValueError("recurrent draft projections require TP1 or TP2")
@@ -2054,6 +2070,10 @@ def main() -> None:
         work += [("inkling2", *item) for item in inkling2_producer_programs(args.prefill_rows)]
         work += [("inkling2", *item) for item in inkling2_load_programs()]
         work += [("inkling_draft", *item) for item in inkling_draft_programs()]
+        for suffix, op, params, compile_ in inkling_fir_programs():
+            family = "fir" if suffix == "fir_history_commit" else "inkling2"
+            name = "history_commit" if family == "fir" else suffix
+            work.append((family, name, op, params, compile_))
         for k, n in sorted(inkling_draft_projection_shapes(1) | inkling_draft_projection_shapes(2)):
             work.append(("draft_bf16", f"k{k}_n{n}", "bf16_projection", {"max_rows": 4096},
                          lambda k=k, n=n: compile_draft_bf16_projection(k, n)))

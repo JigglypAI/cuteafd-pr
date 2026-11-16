@@ -6,7 +6,7 @@ use std::ops::Range;
 pub struct ConvLayout {pub slots:usize,pub layers:usize,pub width:usize,pub lag_stride:usize,pub layer_stride:usize,pub slot_stride:usize}
 impl ConvLayout{
     pub fn new(slots:usize,layers:usize,hidden:usize,kv:usize)->Result<Self>{
-        ensure!(slots>0 && layers==48 && hidden==4608 && matches!(kv,1024|512),"Inkling FIR release geometry");
+        ensure!(slots>0 && layers>0 && layers<=48 && hidden==4608 && matches!(kv,1024|512),"Inkling FIR release geometry");
         let width=hidden.checked_mul(2).and_then(|n|n.checked_add(2*kv)).context("FIR width overflow")?;
         let layer_stride=width.checked_mul(3).context("FIR layer stride overflow")?;
         let slot_stride=layer_stride.checked_mul(layers).context("FIR slot stride overflow")?;

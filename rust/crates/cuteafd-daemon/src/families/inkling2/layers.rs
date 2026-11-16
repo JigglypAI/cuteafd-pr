@@ -14,6 +14,7 @@ pub(crate) struct Kernels<'a> {
     global_decode: Attention<'a>,
     kv_format: cuteafd_loader::families::inkling2::InklingKvCache,
     producers: BTreeMap<String, Producer<'a>>,
+    strided: BTreeMap<(usize, bool), cuteafd_ffi::fir_strided::Convolution<'a>>,
     pub add: cuteafd_ffi::F32Add<'a>,
     pub narrow: cuteafd_ffi::F32Bf16Narrow<'a>,
     quant: cuteafd_ffi::programs::Program<'a>,
@@ -49,6 +50,9 @@ impl<'a> Kernels<'a> {
             && spec.geometry["hidden"] == 4608 && spec.geometry["row_bytes"] == 4752
             && spec.geometry["amax_floor"] == 0.0 && spec.geometry["expected_m"] == 80,
             "Inkling wire quantizer ABI/geometry/floor differs");
+        let strided = [(4608, false), (1024, false), (1024, true)].into_iter().map(|geometry|
+            Ok((geometry, cuteafd_ffi::fir_strided::Convolution::load(programs, geometry.0, geometry.1)?)))
+            .collect::<Result<BTreeMap<_, _>>>()?;
         Ok(Self { projections: DraftProjections::load_with_output(programs, &[
             (4608, 6144), (4608, 768), (4608, 1024), (4608, 48), (4608, 32),
             (4608, 384), (6144, 4608), (64, 1024)], 4096, ProjectionOutput::F32)?,
@@ -58,7 +62,7 @@ impl<'a> Kernels<'a> {
             global_decode: Attention::load(programs, Kind::Global, Route::Decode, kv_format == cuteafd_loader::families::inkling2::InklingKvCache::Fp8)?, kv_format,
             add: programs.library().f32_add()?, narrow: programs.library().f32_bf16_narrow()?,
             quant,
-            sms: programs.library().sm_count()? as usize, producers })
+            sms: programs.library().sm_count()? as usize, producers, strided })
     }
     fn producer(&self, op: Op) -> Result<&Producer<'a>> {
         self.producers.get(&op.name()?).context("Inkling producer not bound at startup")
@@ -72,8 +76,14 @@ impl<'a> Kernels<'a> {
     }
     pub fn convolution(&self, owner: &impl UnitBuffers<'a>, input: Buffer, weight: Buffer, dynamic: Buffer,
         output: Buffer, history: &str, width: usize, global: bool, rows: usize) -> Result<()> {
-        let history_geometry = owner.packed().map(|(_, cache, _, _)|
-            (cache.layout.sequence_bytes/4, cache.layout.sequences));
+        if let Some((slot_stride, lag_stride, slots)) = owner.convolution_strides() {
+            // SAFETY: request-local metadata is validated by the unit, fields
+            // are strided views of the one admitted contiguous FIR backing.
+            return unsafe { self.strided.get(&(width, global)).context("strided convolution not bound")?.launch(
+                [input, weight, dynamic, owner.buffer(history)?, owner.buffer("first")?,
+                    owner.buffer("conv_slots")?, output], rows, slots, slot_stride, lag_stride, owner.stream().raw) };
+        }
+        let history_geometry = None;
         // SAFETY: native F32 planes and BF16 taps are retained by unit/weights;
         // metadata addresses the unit's exclusive history and valid packed rows.
         unsafe { self.producer(Op::Convolution { width, dynamic: global, precision: Precision::F32 })?
@@ -236,7 +246,7 @@ fn attention_cache<'a>(k: &Kernels<'a>, owner: &impl UnitBuffers<'a>, cfg: &Inkl
     let (tiles, tables, table_width, ring_stride_records) = if let Some((unit, cache, _, members)) = owner.packed() {
         (members.iter().map(|member| member.rows.len().div_ceil(10)).sum(),
             members.len(), unit.layout.buffers["page_table"]/(cache.layout.sequences*4),
-            cache.layout.sequence_bytes/4096)
+            cache.layout.ring_sequence_bytes/4096)
     } else { (rows.div_ceil(10), 1, owner.layout().buffers["page_table"]/4, 1088) };
     let batch = Batch { rows, tiles, tile_rows: b("tile_rows")?, q: b("q_bf16")?, kv: if local { b("kv_step")? } else { b("global_cache")? },
         positions: b("positions")?, relative: b("relative")?, sinks: b("sinks")?, output: b("attended")?, scratch: b("attention_scratch")? };
