@@ -276,8 +276,12 @@ pub(crate) fn parse_storage_metadata(path: &std::path::Path, bytes: &[u8],
         let mut entries = storage.0.into_iter().collect::<Vec<_>>();
         entries.sort_unstable_by(|a, b| a.0.cmp(&b.0));
         for (name, entry) in entries {
-            let Some(format) = entry.quant_format else { continue };
-            ensure!(format == "exl3", "{file} at {name}: quant_format {format} (expected exl3)");
+            if let Some(format) = entry.quant_format {
+                ensure!(format == "exl3", "{file} at {name}: quant_format {format} (expected exl3)");
+            } else if !actual.contains_key(name.as_str()) && !entry.stored_tensors.as_ref()
+                .is_some_and(|tensors| tensors.contains_key(&format!("{name}.trellis"))) {
+                continue;
+            }
             let module = actual.get(name.as_str()).with_context(|| format!("{file} disagrees with the safetensors headers at {name}: the map lists this module; the checkpoint has no such EXL3 tensors"))?;
             if let Some(multiplier) = &entry.mcg_multiplier {
                 ensure!(multiplier.as_u64() == Some(EXL3_MCG_MULTIPLIER), "{name}.mcg: MCG multiplier {multiplier} (the decoders implement 0xCBAC1FED)");
@@ -364,8 +368,8 @@ fn dtype_bytes(dtype: &DType) -> u64 {
     }
 }
 
-/// Reads a storage map's EXL3 entries. Entries without `quant_format` are
-/// unquantized modules (exllamav3 lists every module) and are skipped.
+/// Reads a storage map's EXL3 entries, recognizing trellis tensors when the
+/// optional format label is absent. Native modules without trellises are skipped.
 pub fn parse_storage_map(file: &str, storage: &Value) -> Result<Exl3StorageMap, Exl3StorageError> {
     let map_error = |module: &str, reason: String| Exl3StorageError::Map {
         file: file.to_owned(),
@@ -376,9 +380,13 @@ pub fn parse_storage_map(file: &str, storage: &Value) -> Result<Exl3StorageMap, 
         .ok_or_else(|| map_error("tensor_storage", "missing or empty".into()))?;
     let mut map = BTreeMap::new();
     for (module, entry) in entries {
-        let Some(format) = entry.get("quant_format") else { continue };
-        if format != "exl3" {
-            return Err(map_error(module, format!("quant_format {format} (expected exl3)")));
+        if let Some(format) = entry.get("quant_format") {
+            if format != "exl3" {
+                return Err(map_error(module, format!("quant_format {format} (expected exl3)")));
+            }
+        } else if !entry.get("stored_tensors").and_then(Value::as_object)
+            .is_some_and(|tensors| tensors.contains_key(&format!("{module}.trellis"))) {
+            continue;
         }
         if let Some(multiplier) = entry.get("mcg_multiplier") {
             if multiplier.as_u64() != Some(EXL3_MCG_MULTIPLIER) {
@@ -647,6 +655,32 @@ mod tests {
                 format!("{stem}.suh"): {"torch_dtype": "float16", "shape": [k]},
                 format!("{stem}.svh"): {"torch_dtype": "float16", "shape": [n]},
                 format!("{stem}.mcg"): {"torch_dtype": "int32", "shape": mcg}}})
+    }
+
+    #[test]
+    fn unlabeled_trellis_maps_cross_check_headers_without_skipping_modules() {
+        let derived = derive_storage_map(&projection("m.up_proj", 256, 512, 4, &[])).unwrap();
+        let mut entry = gptqmodel_entry("m.up_proj", 4, 512, 256, serde_json::json!([]));
+        entry.as_object_mut().unwrap().remove("quant_format");
+        let document = serde_json::json!({"tensor_storage": {"m.up_proj": entry, "m.norm": {}}});
+        let check = |document: &Value| parse_storage_metadata(std::path::Path::new("quantize_config.json"),
+            &serde_json::to_vec(document).unwrap(), Some(&derived));
+        check(&document).unwrap();
+        let parsed = parse_storage_map("quantize_config.json", &document["tensor_storage"]).unwrap();
+        verify_storage_map("quantize_config.json", &parsed, &derived).unwrap();
+        assert_eq!(parsed.len(), 1);
+        for pointer in ["/stored_tensors/m.up_proj.trellis/shape/2", "/bits_per_weight"] {
+            let mut corrupt = document.clone();
+            *corrupt["tensor_storage"]["m.up_proj"].pointer_mut(pointer).unwrap() = serde_json::json!(3);
+            let error = check(&corrupt).unwrap_err().to_string();
+            assert!(error.contains("m.up_proj"), "{error}");
+            assert!(parse_storage_map("quantize_config.json", &corrupt["tensor_storage"])
+                .and_then(|map| verify_storage_map("quantize_config.json", &map, &derived)).is_err());
+        }
+        let mut missing = document;
+        missing["tensor_storage"]["m.up_proj"]["stored_tensors"].as_object_mut().unwrap().remove("m.up_proj.trellis");
+        let error = check(&missing).unwrap_err().to_string();
+        assert!(error.contains("m.up_proj"), "{error}");
     }
 
     #[test]
