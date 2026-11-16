@@ -9,7 +9,7 @@ pub use config::{Inkling2Config, Inkling2MtpConfig, Inkling2VisionConfig};
 /// Global KV only; local rings and convolution marks retain their native precision.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum InklingKvCache { #[default] Bf16, Fp8 }
+pub enum InklingKvCache { Bf16, #[default] Fp8 }
 impl InklingKvCache {
     pub fn record_bytes(self, heads: usize, dim: usize) -> usize {
         2 * heads * dim * if self == Self::Bf16 { 2 } else { 1 }

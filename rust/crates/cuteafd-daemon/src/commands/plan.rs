@@ -1493,7 +1493,7 @@ mod tests {
     fn inkling_plan_and_config_preserve_selected_global_kv() {
         use cuteafd_loader::families::inkling2::InklingKvCache;
         let mut args = args(std::path::Path::new("/model"), 6, false);
-        assert_eq!(options(&args).unwrap().layout.unwrap().inkling_kv, InklingKvCache::Bf16);
+        assert_eq!(options(&args).unwrap().layout.unwrap().inkling_kv, InklingKvCache::Fp8);
         let config = [("KV_CACHE".into(), "fp8".into())].into_iter().collect();
         resolve_family_config(&mut args, "inkling2", &config).unwrap();
         assert_eq!(options(&args).unwrap().layout.unwrap().inkling_kv, InklingKvCache::Fp8);

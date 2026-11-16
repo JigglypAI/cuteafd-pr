@@ -13,7 +13,7 @@ pub(crate) struct GoldenArgs {
     #[arg(long)] pub snapshot: PathBuf,
     #[arg(long, env="CUTEAFD_NATIVE_LIB")] native_lib: PathBuf,
     #[arg(long, default_value="/opt/cuteafd/share/PROGRAMS.json")] manifest: PathBuf,
-    #[arg(long="kv-cache", default_value="bf16")] kv_format: cuteafd_loader::families::inkling2::InklingKvCache,
+    #[arg(long="kv-cache", default_value="fp8")] kv_format: cuteafd_loader::families::inkling2::InklingKvCache,
     /// JSON array of token ids; no tokenizer or prompt preprocessing in golden.
     #[arg(long)] tokens: PathBuf,
     /// Prefix stops after this zero-based layer; no full-model claim if <47.

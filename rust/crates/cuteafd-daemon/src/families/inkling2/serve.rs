@@ -13,7 +13,7 @@ pub(crate) struct ServeArgs {
     #[arg(long, default_value_t=0)] pub device: i32,
     #[arg(long, value_delimiter=',')] pub peers: Vec<SocketAddr>,
     #[arg(long)] pub pool_tokens: Option<u64>,
-    #[arg(long="kv-cache", default_value="bf16")] pub kv_format: cuteafd_loader::families::inkling2::InklingKvCache,
+    #[arg(long="kv-cache", default_value="fp8")] pub kv_format: cuteafd_loader::families::inkling2::InklingKvCache,
     #[arg(long="max-context-tokens", value_parser=crate::shared::context::parse_tokens::<usize>)]
     pub max_context: Option<usize>,
     #[arg(long, default_value="auto")] pub rtx_expert_layers: cuteafd_loader::placement::OnboardSetting,

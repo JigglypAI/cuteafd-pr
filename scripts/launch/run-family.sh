@@ -1973,7 +1973,7 @@ if [[ $family == muse_spark ]]; then
   [[ -z "$(get EXPERT_PARTIAL_BF16_MAX_ROWS)" ]] || family_args+=(--expert-partial-bf16-max-rows "$(get EXPERT_PARTIAL_BF16_MAX_ROWS)")
 fi
 if [[ $family == inkling2 ]]; then
-  inkling_kv="$(get KV_CACHE bf16)"
+  inkling_kv="$(get KV_CACHE fp8)"
   case "$inkling_kv" in bf16|fp8) ;; *) release_die "KV_CACHE must be bf16 or fp8" ;; esac
   family_args+=(--kv-cache "$inkling_kv")
   family_args+=(--rtx-expert-layers "$(get RTX_EXPERT_LAYERS auto)")

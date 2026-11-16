@@ -396,7 +396,7 @@ def test_optional_levers_are_default_off_and_documented():
             assert key in DEFAULTS, f"lever {key} has no documented default"
             default = DEFAULTS[key]
             if key == "KV_CACHE":
-                assert lever["families"] == ["Muse", "Inkling"]
+                assert lever["families"] == ["Muse"]
                 assert default == "family default"
                 assert 'muse_kv_cache="$(get KV_CACHE bf16)"' in (ROOT / "scripts/launch/run-family.sh").read_text()
             else:
@@ -467,10 +467,10 @@ def test_muse_target_kv_precision_is_opt_in_and_draft_is_independent():
 
 
 
-def test_inkling_global_kv_precision_keeps_bf16_until_paired_qualification():
+def test_inkling_global_kv_precision_defaults_fp8_and_accepts_bf16():
     launcher = (ROOT / "scripts/launch/run-family.sh").read_text()
     assert "KV_CACHE" in family_keys("inkling2")
-    assert 'inkling_kv="$(get KV_CACHE bf16)"' in launcher
+    assert 'inkling_kv="$(get KV_CACHE fp8)"' in launcher
     assert 'family_args+=(--kv-cache "$inkling_kv")' in launcher
     assert 'plan_draft_args+=(--kv-cache "$inkling_kv")' in launcher
     assert "2,112 bytes per global layer" in DOC.read_text()
