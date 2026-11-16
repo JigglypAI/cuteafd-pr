@@ -106,6 +106,51 @@ impl RequestUnits {
     pub fn take_released(&mut self) -> Vec<Vec<u32>> { std::mem::take(&mut self.released) }
 }
 
+#[cfg(test)]
+mod unit_retirement_tests {
+    use super::*;
+    use cuteafd_engine::prefix::RefPagePool;
+    use cuteafd_ffi::native_library_lifetime_fixture::Fixture;
+
+    #[test]
+    fn quarantined_units_survive_normal_retirement_and_pool_exhaustion() -> Result<()> {
+        let fixture = Fixture::build_for_tests()?;
+        let lib = fixture.load()?;
+        fixture.immediate_copies(&lib)?;
+        let mut bank = BackboneCache::new(&lib, 1, [8, 8, 8, 16], usize::MAX)?;
+        bank.use_engine_pages()?;
+        let mut pool = RefPagePool::new(8, 512);
+        let mut units = RequestUnits::new(1);
+        let quarantined = pool.alloc(3)?;
+        let lease = bank.begin_request(0, 91)?;
+        let pages = bank.unit_pages(&quarantined);
+        bank.bind_sources(lease, [&pages[0], &pages[1], &pages[2], &pages[3]], [0; 4])?;
+        units.live[0] = quarantined.clone();
+        // The fatal rollback hook detaches only host ownership. Once the outstanding work
+        // finally drains, normal request release must not enqueue the quarantined refs.
+        units.detach(0);
+        let retired = units.take(0);
+        bank.release(&[lease])?;
+        units.retire(retired);
+        for refs in units.take_released() { pool.release(&refs); }
+        assert_eq!(pool.free(), 5);
+        let mut later = Vec::new();
+        for id in 100..105 {
+            let refs = pool.alloc(1)?;
+            assert!(refs.iter().all(|page| !quarantined.contains(page)));
+            let lease = bank.begin_request(0, id)?;
+            let pages = bank.unit_pages(&refs);
+            bank.bind_sources(lease, [&pages[0], &pages[1], &pages[2], &pages[3]], [0; 4])?;
+            bank.release(&[lease])?;
+            later.extend(refs);
+        }
+        assert!(pool.alloc(1).is_err(), "quarantine is not admission capacity");
+        pool.release(&later);
+        assert_eq!(pool.free(), 5);
+        Ok(())
+    }
+}
+
 pub(crate) struct Requests<'a> {
     cache: BackboneCache<'a>,
     /// Per capture lane: the lease whose snapshot is queued.

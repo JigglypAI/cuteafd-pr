@@ -876,10 +876,21 @@ fn failed_restore_drain_stops_admission_and_keeps_pages_quarantined() {
     assert!(cache.pool().free() < free);
     // A later successful drain does not silently recycle an unknown binding. Restart
     // destroys the cache; until then gauges continue to expose the lost capacity.
+    let quarantined = cache.quarantine.last().unwrap()._pages.clone();
     fake.fail_drain.set(false);
     cache.clear(&fake).unwrap();
     assert!(cache.pool().free() < cache.pool().capacity());
     assert_eq!(cache.stats().quarantined, 1);
+    let mut later = Vec::new();
+    while cache.pool().free() > 0 {
+        let admitted = cache.admit_cold(&fake, ROWS, ROWS, |pages| Placement {
+            pages, ring: 2, len: 0, ring_from: 0 }).unwrap();
+        assert!(admitted.placement.pages.iter().all(|page| !quarantined.contains(page)));
+        later.extend(admitted.placement.pages);
+    }
+    assert!(cache.admit_cold(&fake, ROWS, ROWS, |pages| Placement {
+        pages, ring: 2, len: 0, ring_from: 0 }).is_err());
+    cache.release(&fake, &later).unwrap();
 }
 
 #[test]
