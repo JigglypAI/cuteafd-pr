@@ -41,7 +41,7 @@ impl NativeDsparkLayout {
         let rows = slots.checked_mul(cfg.block).context("native draft rows overflow")?;
         let context_rows = 2048usize;
         let mut buffers = Vec::new();
-        let mut add = |name:String,bytes:usize| { buffers.push((name,bytes.max(256))); };
+        let mut add = |name:String,bytes:usize| { buffers.push((name,crate::serving_capacity::WeightArenaLayout::allocation_bytes(bytes))); };
         let window = cfg.window.context("native block drafter has no window")?;
         for layer in 0..cfg.layers {
             for plane in ["k_ring","v_ring"] { add(format!("layer.{layer}.{plane}"),slots * window * kv * 2); }
@@ -124,7 +124,7 @@ impl BlockDsparkRuntimeLayout {
         let kv = mul(&[config.kv_heads, config.head_dim])?;
         let qkv = add(&[q, mul(&[2,kv])?])?;
         let mut buffers = Vec::new();
-        let mut push = |name: String, bytes: usize| buffers.push((name,bytes.max(256)));
+        let mut push = |name: String, bytes: usize| buffers.push((name,crate::serving_capacity::WeightArenaLayout::allocation_bytes(bytes)));
         for layer in 0..config.layers {
             for plane in ["k_ring", "v_ring"] {
                 push(format!("layer.{layer}.{plane}"), cache.layer_bytes[layer] / 2);
@@ -155,16 +155,16 @@ impl BlockDsparkRuntimeLayout {
     /// Rank-local body workspace sized from the source checkpoint. Each peer
     /// retains full residual rows but only its own heads, neurons and KV planes.
     pub fn for_rank(snapshot:&Path,slots:usize,sequences:usize,sms:usize,arena:&str,
-        kv_cache:crate::families::qwen4::Qwen4KvCache,rank:usize,ranks:usize)->anyhow::Result<Self> {
+        kv_cache:crate::families::qwen4::Qwen4KvCache,rank:usize,ranks:usize,lead:usize)->anyhow::Result<Self> {
         use anyhow::{ensure,Context};
-        ensure!(matches!(ranks,1|2) && rank<ranks,"invalid block draft rank");
+        ensure!(matches!(ranks,1|2) && rank<ranks && lead<ranks,"invalid block draft rank");
         let mut layout=Self::with_kv(snapshot,slots,sequences,sms,arena,kv_cache)?;
         if ranks==1 { return Ok(layout); }
         let source=layout.config.clone();
         ensure!(source.heads%ranks==0 && source.kv_heads%ranks==0 && source.intermediate%ranks==0,
             "block draft rank split cuts checkpoint dimensions");
         layout.config.heads/=ranks; layout.config.kv_heads/=ranks; layout.config.intermediate/=ranks;
-        layout.weight_requests=block_dspark_rank_arena_requests(snapshot,rank,ranks)?;
+        layout.weight_requests=block_dspark_rank_arena_requests(snapshot,rank,ranks,lead)?;
         layout.weights=crate::serving_capacity::WeightArenaLayout::new(arena,layout.weight_requests.clone())?;
         let (h,q,kv,inter,rows)=(source.hidden,layout.config.heads*source.head_dim,
             layout.config.kv_heads*source.head_dim,layout.config.intermediate,layout.capacity.block_rows);
@@ -186,14 +186,15 @@ impl BlockDsparkRuntimeLayout {
                     (window+source.block) as u64,source.head_dim as u64,sms as u64)?)?),
                 _=>None,
             };
-            if let Some(value)=resize { *bytes=value.max(256); }
+            if let Some(value)=resize { *bytes=crate::serving_capacity::WeightArenaLayout::allocation_bytes(value); }
         }
-        if rank!=0 {
+        if rank!=lead {
             layout.buffers.retain(|(name,_)|!matches!(name.as_str(),"workspace.logits"|"workspace.tokens"
                 |"workspace.confidence"|"workspace.head"|"workspace.markov"));
             layout.host_landing=0;
         }
-        layout.buffers.push(("tp2.reduced".into(),mul(&[rows,h,2])?.max(256)));
+        // Ledger descriptor only: GqaHeadSplit is the sole runtime allocator.
+        layout.buffers.push(("tp2.reduced".into(),crate::serving_capacity::WeightArenaLayout::allocation_bytes(mul(&[rows,h,2])?)));
         Ok(layout)
     }
 
@@ -834,9 +835,9 @@ mod tests {
         assert_eq!(fp8.window_mark_bytes()?,(16usize+5*2*2048*plane).div_ceil(256)*256);
         assert_eq!(one.weights,fp8.weights);
         let lead=BlockDsparkRuntimeLayout::for_rank(root.path(),1,1,188,"test/draft/1",
-            crate::families::qwen4::Qwen4KvCache::Bf16,0,2)?;
+            crate::families::qwen4::Qwen4KvCache::Bf16,0,2,0)?;
         let peer=BlockDsparkRuntimeLayout::for_rank(root.path(),1,1,188,"test/draft/0",
-            crate::families::qwen4::Qwen4KvCache::Bf16,1,2)?;
+            crate::families::qwen4::Qwen4KvCache::Bf16,1,2,0)?;
         assert_eq!((lead.config.heads,lead.config.kv_heads,lead.config.intermediate),(20,4,5120));
         assert!(lead.weights.view("markov_head.markov_w1.weight").is_some());
         assert!(peer.weights.view("markov_head.markov_w1.weight").is_none());
@@ -849,6 +850,31 @@ mod tests {
             one.weights.view("layers.0.self_attn.o_proj.weight").unwrap().bytes());
         for local in [&lead,&peer] {
             assert!(local.buffers.contains(&("tp2.reduced".into(),local.capacity.block_rows*local.config.hidden*2)));
+        }
+        for physical_lead in [0,1] {
+            for rank in 0..2 {
+                let local=BlockDsparkRuntimeLayout::for_rank(root.path(),1,1,188,&format!("test/draft/{rank}"),
+                    crate::families::qwen4::Qwen4KvCache::Bf16,rank,2,physical_lead)?;
+                assert_eq!(local.weights.view("markov_head.markov_w1.weight").is_some(),rank==physical_lead);
+                assert_eq!(local.buffers.iter().any(|(n,_)|n=="workspace.logits"),rank==physical_lead);
+            }
+        }
+        use crate::families::glm5::draft_physical::ShardAxis;
+        for rank in 0..2 {
+            let mut parts=std::collections::BTreeMap::new();
+            block_dspark_rank_recipe(&cfg,rank,2,1,|_,_|Ok(()),|source,cols,axis| {
+                for &(name,rows) in source { parts.insert(name.to_owned(),block_dspark_part_ranges(rows,cols,axis,rank,2)?); }
+                Ok(())
+            })?;
+            assert_eq!(parts["layers.0.self_attn.q_proj.weight"].0,rank*2560..(rank+1)*2560);
+            for name in ["k_proj","v_proj"] {
+                assert_eq!(parts[&format!("layers.0.self_attn.{name}.weight")].0,rank*512..(rank+1)*512);
+            }
+            for name in ["gate_proj","up_proj"] {
+                assert_eq!(parts[&format!("layers.0.mlp.{name}.weight")].0,rank*5120..(rank+1)*5120);
+            }
+            assert_eq!(parts["layers.0.self_attn.o_proj.weight"].1,rank*2560..(rank+1)*2560);
+            assert!(block_dspark_part_ranges(3,4,Some(ShardAxis::Rows),rank,2).is_err());
         }
         assert!(one.demands(1).iter().all(|d| d.gpu == 1 && d.resident_weights.0 == 0));
         assert_eq!(one.buffers.iter().map(|(n,_)| n).collect::<std::collections::BTreeSet<_>>().len(),one.buffers.len());
@@ -1182,20 +1208,37 @@ pub fn block_dspark_weight_recipe<T, M, E>(cfg: &BlockDsparkConfig,
     })
 }
 
+pub fn block_dspark_part_ranges(rows:usize,columns:usize,
+    axis:Option<crate::families::glm5::draft_physical::ShardAxis>,rank:usize,ranks:usize)
+    ->anyhow::Result<(std::ops::Range<usize>,std::ops::Range<usize>)> {
+    use crate::families::glm5::draft_physical::ShardAxis;
+    anyhow::ensure!(matches!(ranks,1|2) && rank<ranks && rows>0 && columns>0,"invalid block matrix part");
+    let mut row=0..rows; let mut column=0..columns;
+    if matches!(axis,Some(ShardAxis::Rows)) {
+        anyhow::ensure!(rows%ranks==0,"block split cuts part rows");
+        let width=rows/ranks; row=rank*width..(rank+1)*width;
+    }
+    if matches!(axis,Some(ShardAxis::Columns)) {
+        anyhow::ensure!(columns%ranks==0,"block split cuts part columns");
+        let width=columns/ranks; column=rank*width..(rank+1)*width;
+    }
+    Ok((row,column))
+}
+
 /// Rank-local checkpoint recipe. FC/norms are replicated; Markov/confidence
-/// exist only on logical rank zero (the physical head owner).
+/// exist only on the explicitly selected physical lead rank.
 pub struct BlockDsparkRankWeights<T,M> {
     pub layers: Vec<BlockDsparkLayer<T,M>>,
     pub fc:M, pub hidden_norm:T, pub norm:T,
     pub head:Option<(T,T,T,T)>,
 }
 
-pub fn block_dspark_rank_recipe<T,M>(cfg:&BlockDsparkConfig,rank:usize,ranks:usize,
+pub fn block_dspark_rank_recipe<T,M>(cfg:&BlockDsparkConfig,rank:usize,ranks:usize,lead:usize,
     mut tensor:impl FnMut(&str,&[usize])->anyhow::Result<T>,
     mut matrix:impl FnMut(&[(&str,usize)],usize,Option<crate::families::glm5::draft_physical::ShardAxis>)->anyhow::Result<M>)
     ->anyhow::Result<BlockDsparkRankWeights<T,M>> {
     use crate::families::glm5::draft_physical::ShardAxis;
-    anyhow::ensure!(matches!(ranks,1|2) && rank<ranks && cfg.heads%ranks==0
+    anyhow::ensure!(matches!(ranks,1|2) && rank<ranks && lead<ranks && cfg.heads%ranks==0
         && cfg.kv_heads%ranks==0 && cfg.intermediate%ranks==0 && cfg.dialect==DsparkDialect::Qwen3,
         "block draft rank split cuts checkpoint geometry");
     let (h,q,kv,inter)=(cfg.hidden,cfg.heads*cfg.head_dim,cfg.kv_heads*cfg.head_dim,cfg.intermediate);
@@ -1214,7 +1257,7 @@ pub fn block_dspark_rank_recipe<T,M>(cfg:&BlockDsparkConfig,rank:usize,ranks:usi
             down:matrix(&[(&format!("{p}.mlp.down_proj.weight"),h)],inter,Some(ShardAxis::Columns))?,
         })
     }).collect::<anyhow::Result<Vec<_>>>()?;
-    let head=if rank==0 { Some((tensor("markov_head.markov_w1.weight",&[cfg.vocab,cfg.rank])?,
+    let head=if rank==lead { Some((tensor("markov_head.markov_w1.weight",&[cfg.vocab,cfg.rank])?,
         tensor("markov_head.markov_w2.weight",&[cfg.vocab,cfg.rank])?,
         tensor("confidence_head.proj.weight",&[1,h+cfg.rank])?,tensor("confidence_head.proj.bias",&[1])?)) } else { None };
     Ok(BlockDsparkRankWeights { layers,head,fc:matrix(&[("fc.weight",h)],cfg.taps.len()*h,None)?,
@@ -1222,7 +1265,7 @@ pub fn block_dspark_rank_recipe<T,M>(cfg:&BlockDsparkConfig,rank:usize,ranks:usi
 }
 
 /// Header-validated final BF16 rank destinations; source tensors never convert.
-pub fn block_dspark_rank_arena_requests(snapshot:&Path,rank:usize,ranks:usize)
+pub fn block_dspark_rank_arena_requests(snapshot:&Path,rank:usize,ranks:usize,lead:usize)
     ->anyhow::Result<Vec<(String,usize)>> {
     use anyhow::{ensure,Context};
     use crate::families::glm5::draft_physical::ShardAxis;
@@ -1237,21 +1280,22 @@ pub fn block_dspark_rank_arena_requests(snapshot:&Path,rank:usize,ranks:usize)
         Ok(bytes)
     };
     let requests=std::cell::RefCell::new(Vec::new());
-    block_dspark_rank_recipe(&cfg,rank,ranks,|name,shape| {
-        requests.borrow_mut().push((name.to_owned(),validate(name,shape)?.max(256))); Ok(())
+    block_dspark_rank_recipe(&cfg,rank,ranks,lead,|name,shape| {
+        requests.borrow_mut().push((name.to_owned(),crate::serving_capacity::WeightArenaLayout::allocation_bytes(validate(name,shape)?))); Ok(())
     },|parts,cols,axis| {
         let mut bytes=0usize;
         for &(name,rows) in parts {
-            let source=validate(name,&[rows,cols])?;
-            ensure!(axis!=Some(ShardAxis::Rows) || rows%ranks==0,"block draft split cuts rows");
-            ensure!(axis!=Some(ShardAxis::Columns) || cols%ranks==0,"block draft split cuts columns");
-            bytes=bytes.checked_add(if axis.is_some() { source/ranks } else { source }).context("block rank matrix overflow")?;
+            validate(name,&[rows,cols])?;
+            let (row,column)=block_dspark_part_ranges(rows,cols,axis,rank,ranks)?;
+            let local=row.len().checked_mul(column.len()).and_then(|n|n.checked_mul(2))
+                .context("block rank part extent overflow")?;
+            bytes=bytes.checked_add(local).context("block rank matrix overflow")?;
         }
-        requests.borrow_mut().push((parts.iter().map(|(name,_)|*name).collect::<Vec<_>>().join("+"),bytes.max(256)));
+        requests.borrow_mut().push((parts.iter().map(|(name,_)|*name).collect::<Vec<_>>().join("+"),crate::serving_capacity::WeightArenaLayout::allocation_bytes(bytes)));
         Ok(())
     })?;
-    if rank==0 { requests.borrow_mut().push(("markov_norms".into(),cfg.vocab*4)); }
-    if cfg.head_dim!=64 { requests.borrow_mut().push(("inv_freq".into(),std::mem::size_of_val(cfg.rope.plan(cfg.head_dim)?.inv_freq.as_slice()).max(256))); }
+    if rank==lead { requests.borrow_mut().push(("markov_norms".into(),cfg.vocab*4)); }
+    if cfg.head_dim!=64 { requests.borrow_mut().push(("inv_freq".into(),crate::serving_capacity::WeightArenaLayout::allocation_bytes(std::mem::size_of_val(cfg.rope.plan(cfg.head_dim)?.inv_freq.as_slice())))); }
     Ok(requests.into_inner())
 }
 
@@ -1272,7 +1316,7 @@ fn native_arena_requests(cfg: &BlockDsparkConfig,
     };
     block_dspark_weight_recipe(cfg, |name, shape| {
         let bytes = tensor(name, shape, DType::Bf16, 2)?;
-        requests.borrow_mut().push((name.to_owned(), bytes.max(256)));
+        requests.borrow_mut().push((name.to_owned(), crate::serving_capacity::WeightArenaLayout::allocation_bytes(bytes)));
         Ok::<_, anyhow::Error>(())
     }, |parts, columns| {
         for &(name, rows) in parts {
@@ -1280,7 +1324,7 @@ fn native_arena_requests(cfg: &BlockDsparkConfig,
             match &header.dtype {
                 DType::Bf16 => {
                     let bytes = tensor(name, &[rows, columns], DType::Bf16, 2)?;
-                    requests.borrow_mut().push((name.to_owned(), bytes.max(256)));
+                    requests.borrow_mut().push((name.to_owned(), crate::serving_capacity::WeightArenaLayout::allocation_bytes(bytes)));
                 }
                 DType::F8E4M3 => {
                     ensure!(columns % 32 == 0, "native MXFP8 draft input must contain complete group32 scales");
@@ -1336,7 +1380,7 @@ pub fn block_dspark_arena_requests(snapshot: &Path,
         })?;
         let name = parts.iter().map(|(name, _)| *name).collect::<Vec<_>>().join("+");
         if representation == GlmDraftRepresentation::Bf16Only {
-            requests.borrow_mut().push((name, bytes.max(256)));
+            requests.borrow_mut().push((name, crate::serving_capacity::WeightArenaLayout::allocation_bytes(bytes)));
         } else {
             let rows = parts.iter().try_fold(0usize, |n, (_, rows)| n.checked_add(*rows))
                 .context("block dSpark matrix rows overflow")?;

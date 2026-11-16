@@ -19,6 +19,8 @@ impl WeightArenaView {
 }
 
 impl WeightArenaLayout {
+    pub const ALIGNMENT: usize = 256;
+    pub const fn allocation_bytes(bytes: usize) -> usize { bytes.max(Self::ALIGNMENT) }
     /// Preserve cudaMalloc's 256-byte alignment for every consumer (including
     /// the native K6 dispatcher and TMA's 16-byte tensor-map bases).
     pub fn new(id: impl Into<String>, tensors: impl IntoIterator<Item = (String, usize)>) -> Result<Self> {
@@ -54,7 +56,8 @@ impl PackedWeightRegions {
         let mut regions = Vec::new();
         let mut bytes = 0usize;
         for size in sizes {
-            bytes = bytes.checked_add(255).context("weight region alignment overflow")? & !255;
+            bytes = bytes.checked_add(WeightArenaLayout::ALIGNMENT - 1)
+                .context("weight region alignment overflow")? & !(WeightArenaLayout::ALIGNMENT - 1);
             let end = bytes.checked_add(size).context("weight region extent overflow")?;
             regions.push(bytes..end);
             bytes = end;
