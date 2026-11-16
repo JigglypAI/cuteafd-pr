@@ -6,6 +6,10 @@ use cuteafd_ffi::{CuteafdDeviceBuffer, NativeLibrary};
 use cuteafd_loader::families::kimi_k3::context::ContextLayout;
 use std::{collections::BTreeMap, rc::Rc};
 
+#[cfg(test)]
+#[path = "multirow_oracle.rs"]
+pub(super) mod multirow_oracle;
+
 pub(crate) struct Programs<'a> {
     partial: Option<([[cuteafd_ffi::KimiMlaPartial<'a>; 2]; 2],
         cuteafd_loader::families::kimi_k3::context::TilePolicy)>,

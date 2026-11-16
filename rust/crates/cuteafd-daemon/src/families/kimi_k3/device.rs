@@ -1326,6 +1326,13 @@ impl<'a> LocalLane<'a> {
     }
 
     pub(crate) fn context_dsa_dump(&self, layer: usize, rows: usize) -> Result<()> {
+        #[cfg(test)]
+        if self.rank == 0 && self.context_dsa_diagnostic()
+            && super::context::multirow_oracle::recording() {
+            let owner = &self.context.as_ref().context("Kimi oracle needs Context")?.0.ranks[0];
+            super::context::multirow_oracle::record(self.stream(), layer, rows,
+                owner.buffer("DSA merged indices")?, owner.buffer("DSA merged scores")?)?;
+        }
         let Some(dump) = self.dsa_dump.as_deref().filter(|_| self.rank == 0 && self.programs.dsa.is_some()) else {
             return Ok(());
         };
