@@ -928,6 +928,7 @@ def _family_launch_result(tmp_path: Path, family_config: dict, model: str, keys:
         copy_input(ROOT / "run.sh", repo / "run.sh")
     copy_input(launcher_source or ROOT / "scripts" / "launch" / "run-family.sh", repo / "scripts" / "launch")
     copy_input(ROOT / "scripts" / "launch" / "preflight-fp8-bf16.py", repo / "scripts" / "launch")
+    copy_input(ROOT / "scripts" / "launch" / "spark-memory-probe.py", repo / "scripts" / "launch")
     copy_input(ROOT / "scripts" / "lib" / "checkpoint-family.py", repo / "scripts" / "lib")
     copy_input(ROOT / "scripts" / "lib" / "release-common.sh", repo / "scripts" / "lib")
     from launcher_sandbox import stub_cuda_capacity
@@ -990,6 +991,7 @@ def _family_launch_result(tmp_path: Path, family_config: dict, model: str, keys:
         # run concurrently, and a two-write line (argv, then newline) lets a
         # sibling's argv slip between them and merge two lines into one.
         (bin_dir / tool).write_text('#!/usr/bin/env bash\nprintf "%s \\n" "$(basename "$0") $*" >&2\n'
+                                    + ('case "$*" in *"python3 -I -"*) echo ' + repr(json.dumps({"bytes": 124211863552, "boot_id": "fixture", "age_seconds": 0, "cached": False})) + '; exit 0 ;; esac\n' if tool == "ssh" else '')
                                     + ('case "$*" in *"docker run --rm"*"python3"*) exit 2 ;; esac\n'
                                        if preflight_error and tool == "ssh" else '') +
                                     'case "$*" in *"docker logs"*) echo "${STUB_WORKER_READY:-worker bootstrap ready}"; echo "vision encoder ready"; '

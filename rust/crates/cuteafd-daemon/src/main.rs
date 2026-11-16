@@ -333,8 +333,13 @@ async fn run() -> Result<()> {
 
         match Cli::from_arg_matches(&matches) {
             Ok(mut cli) => {
+                if let Some(samples) = &cli.spark_memory_samples {
+                    cuteafd_loader::serving_capacity::spark_memory::install_samples(samples)
+                        .expect("valid boot-keyed idle Spark memory samples");
+                }
                 cli::resolve_tp2_dflash(&mut cli.command, &matches);
                 if let Commands::Plan(args) = &mut cli.command {
+                    args.spark_memory_samples = cli.spark_memory_samples.clone();
                     if let Some((_, options)) = matches.subcommand() {
                         args.explicit_settings = options.ids().filter(|id| matches!(options.value_source(id.as_str()),
                             Some(clap::parser::ValueSource::CommandLine | clap::parser::ValueSource::EnvVariable)))

@@ -159,7 +159,8 @@ pub(crate) mod serve_admission {
         facts.coordinator = Coordinator::Measured {
             samples: samples.iter().map(|s| (s.total, s.cap, s.free)).collect(),
             loaded_code: samples.iter().map(|s| s.pending_code).collect() };
-        let inputs = gather(&facts).map_err(|refused| anyhow::anyhow!("{}; {}", refused.what, refused.how))?;
+        let mut inputs = gather(&facts).map_err(|refused| anyhow::anyhow!("{}; {}", refused.what, refused.how))?;
+        cuteafd_loader::serving_capacity::spark_memory::apply_live_budgets(&mut inputs.budgets);
         let request = shared::request(inputs.context, facts.pool_tokens, onboard, facts.prefill,
             cuteafd_loader::placement::planner::Operation::Serving, inputs.resident_weight_limit, facts.replies);
         let admitted = inputs.admit_serving(request).context("MiniMax serving admission")?;

@@ -70,8 +70,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
     };
     let cards = opts.rtx_bytes.iter().map(|&bytes| crate::placement::CoordinatorCard::planned(bytes, opts.physical_sms))
         .collect::<Vec<_>>();
-    let spark_bytes = opts.spark_allocation_budget_bytes.unwrap_or(crate::plan::DEFAULT_SPARK_BUDGET_BYTES)
-        .min(opts.spark_bytes);
+    let spark_bytes = opts.spark_capacities(ranks).into_iter().max().unwrap_or(0);
     let sequences = opts.resolved_concurrency("inkling2");
     let request = FactsRequest { checkpoint: input.checkpoint(), cfg, manifest_path: manifest_path.as_deref(),
         manifest, coordinator: Coordinator::Planned { cards: cards.clone() }, attention, spark_ranks: ranks,
@@ -80,10 +79,11 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
         prefix_mark_budget: opts.mimo_prefix_mark_bytes,
         replies: opts.spark_reply_formats, head: opts.bf16_target_head, expert_usage: opts.expert_usage,
         resident_weight_limit: ResidentWeights(opts.weight_budget_bytes) };
-    let inputs = match gather(&request) {
+    let mut inputs = match gather(&request) {
         Ok(inputs) => inputs,
         Err(refused) => { report.refuse_placement(refused.what, refused.how); return empty(notes); }
     };
+    opts.apply_spark_capacities(&mut inputs.budgets);
     if let LocalPackage::Missing(reason) = &inputs.local {
         notes.push(format!("Inkling 2 RTX onboarding unavailable: {reason}"));
     }
@@ -140,8 +140,8 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
     for rank in 0..ranks {
         let charge = inputs.spark[onboarded][rank];
         widest = widest.max(charge.experts);
-        devices.push(DeviceLayout { kind: DeviceKind::Spark, index: rank as u32, capacity_bytes: spark_bytes,
-            worker_budget_bytes: spark_bytes, kv_tokens: 0, items: vec![
+        devices.push(DeviceLayout { kind: DeviceKind::Spark, index: rank as u32, capacity_bytes: opts.spark_capacity(rank),
+            worker_budget_bytes: opts.spark_capacity(rank), kv_tokens: 0, items: vec![
                 Item::new(Category::Experts, "routed experts (header-exact intermediate slices)", &storage_note,
                     charge.experts, Basis::Exact),
                 Item::new(Category::Workspace, "Spark rank I/O and execution owners", "", charge.owners,

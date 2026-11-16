@@ -67,7 +67,7 @@ mod tests {
                 resident_weight_limit: u64::MAX, spark_reply_formats: Default::default(),
                 operation: Operation::Serving,
                 budgets: live_budgets(&vec![(1 << 40, 1 << 40, 1 << 39); ranks],
-                    &vec![cuteafd_loader::plan::layout::DEFAULT_SPARK_DEVICE_BYTES; 4])?,
+                    &cuteafd_loader::serving_capacity::spark_memory::serving_bytes()[..4])?,
             }.prepare()?.admit(production_request(4096, Some(4096), Onboard::Layers(0), prefill,
                 Operation::Serving, u64::MAX, Default::default()))?.placement;
             let spec = cuteafd_loader::placement::families::deepseek_v41::execution_hops(ranks);

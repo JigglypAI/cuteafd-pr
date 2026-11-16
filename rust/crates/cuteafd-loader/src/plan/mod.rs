@@ -522,7 +522,7 @@ impl PlanOptions {
     }
 
     /// An explicit Spark ceiling applies to the complete layout as well as
-    /// weights. Unset keeps the separate historical device/family defaults.
+    /// weights. Unset uses the per-host idle MemAvailable inventory.
     pub fn apply_spark_budget(&mut self) {
         if let (Some(bytes), Some(layout)) = (self.spark_budget_bytes, &mut self.layout) {
             layout.spark_bytes = bytes;
@@ -915,6 +915,10 @@ fn family_layout(model: &dyn FamilyModel, input: &PlanInput, report: &mut PlanRe
     options: &mut layout::LayoutOptions, requested: ExpertPlacement)
     -> anyhow::Result<cuteafd_core::memory_layout::MemoryLayout> {
     let _timer = PhaseTimer::new(&input.phases.layout, &[&input.phases.catalog]);
+    for rank in 0..requested.spark_ranks() {
+        anyhow::ensure!(options.spark_capacity(rank) > 0,
+            "missing idle MemAvailable measurement for Spark rank {rank}; supply --spark-memory-cap");
+    }
     let family = report.family.as_deref().unwrap_or("unknown");
     let concurrency = options.resolved_concurrency(family);
     if let Err(error) = cuteafd_core::concurrency::validate(family, concurrency) {

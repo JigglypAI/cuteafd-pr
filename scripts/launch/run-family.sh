@@ -802,6 +802,16 @@ for ((rank = 0; rank < RELEASE_AVAILABLE_SPARKS; rank++)); do
   deployment_peers+=("${!lane_key}:$EXPERT_PORT")
 done
 ((${#deployment_peers[@]} == 0)) || count_args+=(--deployment-peers "$(IFS=,; echo "${deployment_peers[*]}")")
+spark_memory_samples=""
+if ((dry_run == 0 && RELEASE_AVAILABLE_SPARKS > 0)) && [[ -z "$(get SPARK_MEMORY_CAP)" ]]; then
+  sample_hosts=()
+  for ((rank = 0; rank < RELEASE_AVAILABLE_SPARKS; rank++)); do
+    host_key="SPARK_${rank}_HOST"; sample_hosts+=("${!host_key}")
+  done
+  spark_memory_samples="$(release_spark_memory_samples "${sample_hosts[@]}")" || exit 1
+  count_args+=(--spark-memory-samples "$spark_memory_samples")
+  memory_policy_args+=(--spark-memory-samples "$spark_memory_samples")
+fi
 release_reject_unused_keys deepseek_v41 $(_v41_allowed_keys)
 readiness_args=(--require-ready)
 [[ -z "$wip_slot" ]] || readiness_args=()
@@ -2492,6 +2502,13 @@ audio_encoder_hash=""
     deployment_peers+=("$(get "SPARK_${rank}_LANE_A"):$port")
   done
   ((${#deployment_peers[@]} == 0)) || deployment_args+=(--deployment-peers "$(IFS=,; printf '%s' "${deployment_peers[*]}")")
+  if ((dry_run == 0 && available_sparks > 0)) && [[ "$backend" != local && -z "$(get SPARK_MEMORY_CAP)" ]]; then
+    sample_hosts=()
+    for ((rank = 0; rank < available_sparks; rank++)); do sample_hosts+=("$(get "SPARK_${rank}_HOST")"); done
+    spark_memory_samples="$(release_spark_memory_samples "${sample_hosts[@]}")" || exit 1
+    deployment_args+=(--spark-memory-samples "$spark_memory_samples")
+    memory_policy_args+=(--spark-memory-samples "$spark_memory_samples")
+  fi
   [[ -z "$(get KV_POOL_SIZE)" ]] || deployment_args+=(--kv-pool-size "$(get KV_POOL_SIZE)")
   readiness_args=(--require-ready)
   [[ -z "$wip_slot" ]] || readiness_args=()

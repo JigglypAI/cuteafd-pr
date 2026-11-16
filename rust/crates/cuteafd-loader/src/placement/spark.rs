@@ -763,6 +763,7 @@ pub struct SparkBudgetInventory {
     pub resident: Vec<Vec<u64>>,
     pub overhead: Vec<u64>,
     pub budget: u64,
+    pub rank_budgets: Vec<u64>,
 }
 
 impl SparkBudgetInventory {
@@ -784,7 +785,11 @@ impl SparkBudgetInventory {
                     sum.checked_add(bytes).context("Spark estimated overhead overflow"))?;
             overhead.push(bytes);
         }
-        Ok(Self { layers: working.spark_layers.clone(), resident, overhead, budget })
+        Ok(Self { layers: working.spark_layers.clone(), resident, overhead, budget, rank_budgets: Vec::new() })
+    }
+
+    pub fn rank_budget(&self, rank: usize) -> u64 {
+        self.rank_budgets.get(rank).copied().unwrap_or(self.budget)
     }
 
     pub fn rank_bytes(&self, rank: usize, onboard: usize) -> anyhow::Result<u64> {
@@ -805,7 +810,7 @@ impl SparkBudgetInventory {
         anyhow::ensure!(self.budget > 0 && !self.resident.is_empty(), "Spark budget must be positive with selected ranks");
         for count in 0..=self.layers.len() {
             let fits = (0..self.resident.len()).map(|rank| self.rank_bytes(rank, count))
-                .collect::<anyhow::Result<Vec<_>>>()?.into_iter().all(|bytes| bytes <= self.budget);
+                .collect::<anyhow::Result<Vec<_>>>()?.into_iter().enumerate().all(|(rank, bytes)| bytes <= self.rank_budget(rank));
             if fits { return Ok(count); }
         }
         unreachable!("empty Spark working set has zero bytes")

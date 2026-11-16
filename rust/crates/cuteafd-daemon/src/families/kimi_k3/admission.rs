@@ -872,7 +872,7 @@ pub(crate) fn admit<'a, const RANKS: usize>(mut inputs: Inputs<'_, RANKS>) -> Re
     let cards = request.inventory.gpus.iter().map(|gpu| (gpu.capacity_bytes,
         cuteafd_ffi::coordinator_gpu_budget().map_or(gpu.capacity_bytes, |limit| limit.0.min(gpu.capacity_bytes))))
         .collect::<Vec<_>>();
-    let sparks = spark_budget.as_ref().map_or_else(Vec::new, |budget| vec![budget.budget; budget.resident.len()]);
+    let sparks = spark_budget.as_ref().map_or_else(Vec::new, |budget| (0..budget.resident.len()).map(|rank| budget.rank_budget(rank)).collect());
     let mut budgets = kimi::budgets(&cards, request.inventory.gpus[0].reserve_bytes, &vec![0; RANKS], &sparks)?;
     let (host_total, host_available) = cuteafd_loader::formats::mapped_preload::host_memory()?;
     let resident = modes.iter().enumerate().fold(vec![0usize; RANKS], |mut resident, (layer, mode)| {
@@ -1435,7 +1435,7 @@ pub(super) mod tests {
             fixed: (0..RANKS).map(|rank| Demand::new(rank as u8, Category::Workspace, "native engine buffers", 1 << 20, Basis::Exact)).collect(),
             startup: vec![], pool_bounded: vec![], rtx: None,
             spark_budget: Some(SparkBudgetInventory {
-                layers: cfg.dense.iter().enumerate().filter_map(|(layer, dense)| (!dense).then_some(layer)).collect(),
+                rank_budgets: Vec::new(), layers: cfg.dense.iter().enumerate().filter_map(|(layer, dense)| (!dense).then_some(layer)).collect(),
                 resident: vec![vec![0; cfg.dense.iter().filter(|dense| !**dense).count()]; 6],
                 overhead: vec![cuteafd_core::memory_layout::spark_runtime_reserve_bytes(0).unwrap(); 6],
                 budget: 112 << 30,
@@ -1965,7 +1965,7 @@ pub(super) mod tests {
             i.rtx = Some(RtxInventory { package: "not-loaded".into(), costs: vec![vec![Bytes2 {
                 resident: 1024 * 1024, staging: 4096 }; 2]; cfg.layers], workspace: 8192, layers: selection });
             let runtime = cuteafd_core::memory_layout::spark_runtime_reserve_bytes(0).unwrap();
-            i.spark_budget = Some(SparkBudgetInventory { layers: vec![1, 2, 3, 4],
+            i.spark_budget = Some(SparkBudgetInventory { rank_budgets: Vec::new(), layers: vec![1, 2, 3, 4],
                 resident: vec![vec![100; 4]; 6], overhead: vec![runtime + 50; 6], budget: runtime + 253 });
             i
         };

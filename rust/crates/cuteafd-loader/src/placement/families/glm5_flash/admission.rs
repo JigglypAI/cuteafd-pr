@@ -28,6 +28,7 @@ pub struct ProcessOwners {
     /// EXLR8 weights plus all execution owners per onboarding count and rank.
     pub spark_candidates: Vec<Vec<u64>>,
     pub spark_cap: Option<u64>,
+    pub spark_rank_caps: Vec<u64>,
     /// Additional admitted media hosts, independent of expert peers.
     pub physical_sparks: usize,
     pub native_load: Option<NativeLoad>,
@@ -219,7 +220,7 @@ impl NativeLoad {
 
 impl ProcessOwners {
     pub fn new(host: (u64, u64), host_headroom: u64) -> Self {
-        Self { host, host_headroom, allocations: vec![], links: vec![], remote_experts: true, spark_candidates: vec![], spark_cap: None, physical_sparks: 0, native_load: None, mount_load: None,
+        Self { host, host_headroom, allocations: vec![], links: vec![], remote_experts: true, spark_candidates: vec![], spark_cap: None, spark_rank_caps: Vec::new(), physical_sparks: 0, native_load: None, mount_load: None,
             encoders: vec![], auto_vision: false, media_cache_bytes: 0, alternate_resident: None,
             target_arenas: vec![], alternate_target_arenas: vec![], shared_arenas: vec![], draft_arenas: vec![], push_host: None,
             draft_push: None, draft_tp2: vec![] }
@@ -831,7 +832,8 @@ fn prepare_fixed<'a>(i: &'a GlmfInputs<'a>, sms: usize, rtx_experts: bool, proce
     for rank in 0..physical_sparks {
         budgets.push(p::Budget { id: format!("spark{rank}"), locations: vec![p::Location {
             device: p::Device::Spark(rank as u8), domain: p::Domain::Managed }],
-            physical_bytes: process.spark_cap.unwrap_or(121 << 30), logical_bytes: process.spark_cap.unwrap_or(121 << 30), headroom: 0,
+            physical_bytes: process.spark_rank_caps.get(rank).copied().or(process.spark_cap).unwrap_or(121 << 30),
+            logical_bytes: process.spark_rank_caps.get(rank).copied().or(process.spark_cap).unwrap_or(121 << 30), headroom: 0,
             baseline: p::Baseline::Forecast { occupied: 0,
                 source: "Spark worker physical capacity; worker owners supplied by caller".into(), assumed: true } });
     }

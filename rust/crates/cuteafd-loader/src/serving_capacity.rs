@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
 
+pub mod spark_memory;
 mod deepseek;
 pub mod step5;
 pub mod step5_graphs;

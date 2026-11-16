@@ -146,6 +146,17 @@ fn options(args: &PlanArgs) -> Result<PlanOptions, PlanError> {
     };
     #[cfg(test)]
     { options.inventory_host_memory = args.test_host_memory; }
+    if let Some(layout) = &mut options.layout {
+        if args.memory.spark_memory_cap.is_none() && !args.deployment_peers.is_empty() {
+            layout.spark_rank_bytes = if let Some(samples) = &args.spark_memory_samples {
+                cuteafd_loader::serving_capacity::spark_memory::sample_bytes(samples).map_err(|error|
+                    PlanError::InvalidOption { option: "--spark-memory-samples", reason: error.to_string() })?
+            } else { args.deployment_peers.iter().map(|peer|
+                cuteafd_loader::serving_capacity::spark_memory::measured_bytes(peer)
+                    .map_err(|error| PlanError::InvalidOption { option: "--deployment-peers", reason: error.to_string() }))
+                .collect::<Result<Vec<_>, _>>()? };
+        }
+    }
     options.apply_spark_budget();
     options.validate()?;
     Ok(options)
@@ -207,6 +218,10 @@ fn resolve_settings(args: &mut PlanArgs, family: &str, cfg: &std::collections::B
 
 fn resolved_output(mut value: serde_json::Value, args: &PlanArgs, mut settings: ResolvedSettings,
     cfg: &std::collections::BTreeMap<String, String>, replay_explicit: Option<crate::cli::PlanReplayRecords>) -> serde_json::Value {
+    value["spark_memory_measurements"] = args.spark_memory_samples.as_deref()
+        .and_then(|text| serde_json::from_str(text).ok())
+        .unwrap_or_else(|| serde_json::json!({"source": "checked-in idle MemAvailable inventory",
+            "inventory": serde_json::from_str::<serde_json::Value>(cuteafd_loader::serving_capacity::spark_memory::INVENTORY).expect("inventory")}));
     if value.get("family").and_then(serde_json::Value::as_str) == Some("glm5_flash") {
         let report = value.get("report").unwrap_or(&value);
         let sparks = report.get("spark_expert_world").and_then(serde_json::Value::as_u64)
@@ -1630,7 +1645,7 @@ mod tests {
             json: true,
             resolve_settings_only: false,
             checkpoint_model_id: None,
-            deployment: false, deployment_peers: vec![],
+            deployment: false, deployment_peers: vec![], spark_memory_samples: None,
             kv_pool_size: None,
             files: false, role: None, host: None, file_layout: None, fetch_parallel: 2, fetch: false, destination: None, source: None, forward_agent: false,
             dry_run: false, force: false, include_speculator: false,
@@ -2536,7 +2551,7 @@ mod tests {
         assert_eq!(options.spark_budget(), 100 << 30);
         let layout = options.layout.unwrap();
         assert_eq!(layout.spark_allocation_budget_bytes, None);
-        assert_eq!(layout.spark_bytes, 108 << 30);
+        assert_eq!(layout.spark_capacities(6), cuteafd_loader::serving_capacity::spark_memory::serving_bytes());
     }
 
     #[test]

@@ -86,6 +86,7 @@ pub(crate) fn admit(options: Options<'_>) -> Result<shared::AdmittedMuse> {
         budgets.push(shared::measured_budget(rank as u8, sample.total_bytes, capacity, options.headroom_bytes, sample.free_bytes));
     }
     budgets.extend((0..options.spark_ranks).map(|rank| shared::spark_budget(rank as u8, options.spark_budget_bytes)));
+    cuteafd_loader::serving_capacity::spark_memory::apply_live_budgets(&mut budgets);
     let context = options.max_context.unwrap_or(options.cfg.max_position as u64);
     let capacities = options.measured.iter().map(|sample| sample.total_bytes).collect::<Vec<_>>();
     let maximum_pool_tokens = shared::maximum_pool_tokens(&capacities, context, options.pool_tokens);

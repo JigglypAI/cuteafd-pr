@@ -3601,7 +3601,7 @@ fn explicit_spark_ceiling_updates_all_layout_budgets_without_changing_defaults()
     let mut options = PlanOptions { layout: Some(layout::LayoutOptions { host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram), ..Default::default() }), ..Default::default() };
     options.apply_spark_budget();
     assert_eq!(options.spark_budget_bytes, None);
-    assert_eq!(options.layout.as_ref().unwrap().spark_bytes, 108 << 30);
+    assert_eq!(options.layout.as_ref().unwrap().spark_capacities(6), crate::serving_capacity::spark_memory::serving_bytes());
     assert_eq!(options.layout.as_ref().unwrap().spark_allocation_budget_bytes, None);
     for budget in [82 << 30, 112 << 30] {
         options.spark_budget_bytes = Some(budget);

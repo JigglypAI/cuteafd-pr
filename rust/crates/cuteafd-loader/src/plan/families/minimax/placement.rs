@@ -76,8 +76,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
     };
     let cards = opts.rtx_bytes.iter().map(|&bytes| crate::placement::CoordinatorCard::planned(bytes, opts.physical_sms))
         .collect::<Vec<_>>();
-    let spark_bytes = opts.spark_allocation_budget_bytes.unwrap_or(crate::plan::DEFAULT_SPARK_BUDGET_BYTES)
-        .min(opts.spark_bytes);
+    let spark_bytes = opts.spark_capacities(ranks).into_iter().max().unwrap_or(0);
     let sequences = opts.resolved_concurrency("minimax_m3");
     let physical_devices = (0..gpus as i32).collect::<Vec<_>>();
     let drafter=if opts.minimax_dspark {
@@ -98,10 +97,11 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
         host, host_cache_bytes: opts.host_cache_bytes, prefix_entries: opts.prefix_entries("minimax_m3"), drafter,
         replies: opts.spark_reply_formats, head: opts.bf16_target_head, expert_usage: opts.expert_usage,
         resident_weight_limit: ResidentWeights(opts.weight_budget_bytes) };
-    let inputs = match gather(&request) {
+    let mut inputs = match gather(&request) {
         Ok(inputs) => inputs,
         Err(refused) => { report.refuse_placement(refused.what, refused.how); return empty(notes); }
     };
+    opts.apply_spark_capacities(&mut inputs.budgets);
     if let LocalPackage::Missing(reason) = &inputs.local {
         notes.push(format!("MiniMax RTX onboarding unavailable: {reason}"));
     }
@@ -176,8 +176,8 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
                 return empty(notes);
             }
         };
-        devices.push(DeviceLayout { kind: DeviceKind::Spark, index: rank as u32, capacity_bytes: spark_bytes,
-            worker_budget_bytes: spark_bytes, kv_tokens: 0, items });
+        devices.push(DeviceLayout { kind: DeviceKind::Spark, index: rank as u32, capacity_bytes: opts.spark_capacity(rank),
+            worker_budget_bytes: opts.spark_capacity(rank), kv_tokens: 0, items });
     }
     report.spark_rank_share = if model.routed_bytes == 0 { 0.0 } else { widest as f64 / model.routed_bytes as f64 };
     if ranks > 0 {

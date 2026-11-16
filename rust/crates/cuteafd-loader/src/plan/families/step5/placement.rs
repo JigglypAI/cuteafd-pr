@@ -306,9 +306,7 @@ pub(super) fn layout(
         let assignment = SparkAssignment::from_catalog(&catalog, &working, rank, layout, &endpoints, rings)?;
         ensure!(
             assignment.resident_bytes
-                <= opts
-                    .spark_allocation_budget_bytes
-                    .unwrap_or(opts.spark_bytes),
+                <= opts.spark_capacity(rank),
             "Step-5 {package} TP{spark_ranks} Spark rank {rank} weights exceed allocation budget"
         );
         *report
@@ -319,7 +317,7 @@ pub(super) fn layout(
         let mut device = DeviceLayout {
             kind: DeviceKind::Spark,
             index: rank as u32,
-            capacity_bytes: opts.spark_bytes, worker_budget_bytes: opts.spark_bytes,
+            capacity_bytes: opts.spark_capacity(rank), worker_budget_bytes: opts.spark_capacity(rank),
             kv_tokens: 0,
             items: vec![
                 Item::new(

@@ -1,0 +1,15 @@
+{
+  "schema": 1,
+  "source": "issue #2082; main idle-host census 2026-11-16T08:23:41Z..2026-11-16T08:23:46Z",
+  "method": "/proc/meminfo MemAvailable in kB multiplied by 1024; zero GPU compute processes on each host; no margin",
+  "hosts": {
+    "ostrich": {"mem_available_kib": 118758096, "measured_at": "2026-11-16T08:23:41Z"},
+    "dodo": {"mem_available_kib": 120209156, "measured_at": "2026-11-16T08:23:42Z"},
+    "emu": {"mem_available_kib": 120244960, "measured_at": "2026-11-16T08:23:42Z"},
+    "kiwi": {"mem_available_kib": 120537644, "measured_at": "2026-11-16T08:23:43Z"},
+    "rhea": {"mem_available_kib": 120644804, "measured_at": "2026-11-16T08:23:44Z"},
+    "moa": {"mem_available_kib": 120540992, "measured_at": "2026-11-16T08:23:45Z"},
+    "kakapo": {"mem_available_kib": 120695860, "measured_at": "2026-11-16T08:23:45Z"},
+    "cassowary": {"mem_available_kib": 119820796, "measured_at": "2026-11-16T08:23:46Z"}
+  }
+}

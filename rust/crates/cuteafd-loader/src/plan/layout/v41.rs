@@ -223,7 +223,7 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
     physical.extend(host_facts.owners.clone());
     reserves.extend(host_facts.estimates.clone());
     let budgets = admission::production_budgets(&cards, crate::placement::reserve::gpu("deepseek_v41"), Some(host), 0,
-        &vec![options.spark_bytes; spark_ranks])?;
+        &options.spark_capacities(spark_ranks))?;
     let request = admission::production_request(crate::placement::planner::Context::resolve(context, (options.context_tokens > 0).then_some(options.context_tokens)), options.pool_tokens, onboard,
         PrefillShape { rows, waves: slots as u64 },
         Operation::Serving,

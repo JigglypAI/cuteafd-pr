@@ -53,7 +53,7 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
             items: vec![runtime], kv_tokens: 0 }
     }).collect::<Vec<_>>();
     let mut sparks = (0..expert_world).map(|rank| DeviceLayout { kind: DeviceKind::Spark,
-        index: rank as u32, capacity_bytes: options.spark_bytes, worker_budget_bytes: options.spark_bytes, kv_tokens: 0,
+        index: rank as u32, capacity_bytes: options.spark_capacity(rank), worker_budget_bytes: options.spark_capacity(rank), kv_tokens: 0,
         items: vec![cuteafd_core::memory_layout::spark_worker_process_resident_item(),
             Item::new(Category::Runtime, "context+modules", "", 512 * MIB, Basis::Calibrated)] }).collect::<Vec<_>>();
     if all_onboarded {
@@ -553,14 +553,15 @@ fn apply_selected(input: &super::super::PlanInput, options: &LayoutOptions,
     let operation = Operation::Serving;
     let embedding = if use_host_embedding(checkpoint, options) { EmbeddingHome::HostPinned }
         else { EmbeddingHome::Device(0) };
-    let budgets = admission::production_budgets(
+    let mut budgets = admission::production_budgets(
         &options.rtx_bytes[..ranks].iter().map(|&bytes| (bytes, bytes)).collect::<Vec<_>>(),
         &(0..ranks).map(|_| admission::device_headroom()).collect::<Vec<_>>(),
         devices.iter().map(|device| Baseline::Forecast { occupied: device.used_bytes(),
             source: "retained checkpoint and media owners before the shared MiMo contract".into(),
             assumed: false }).collect(),
         super::recipe_host_memory(options)?,
-        options.spark_bytes, spark_ranks)?;
+        options.spark_capacities(spark_ranks).into_iter().max().unwrap_or(0), spark_ranks)?;
+    options.apply_spark_capacities(&mut budgets);
     let request = admission::production_request(crate::placement::planner::Context::resolve(context, (options.context_tokens > 0).then_some(options.context_tokens)), options.pool_tokens, onboard, prefill,
         operation, ResidentWeights(options.weight_budget_bytes), options.spark_reply_formats);
     let mut prepared = ProductionInput {

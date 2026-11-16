@@ -582,7 +582,7 @@ fn placement(report: &PlanReport, input: &crate::plan::PlanInput, options: &Layo
         options.spark_reply_formats)?;
     let host = super::recipe_host_memory(options)?;
     let budgets = production_budgets(&options.rtx_bytes[..gpus].iter().map(|&n| (n, n)).collect::<Vec<_>>(),
-        crate::placement::reserve::gpu("glm5"), host, (8 << 30).max(host.0 / 10), &vec![options.spark_bytes; spark_ranks])?;
+        crate::placement::reserve::gpu("glm5"), host, (8 << 30).max(host.0 / 10), &options.spark_capacities(spark_ranks))?;
     let request = production_request(crate::placement::planner::Context::resolve(context, (options.context_tokens > 0).then_some(options.context_tokens)), options.pool_tokens, onboard, prefill, operation,
         crate::placement::ResidentWeights(options.weight_budget_bytes), options.spark_reply_formats);
     let mut prepared = ProductionInput { expert_usage: options.expert_usage, cfg: &cfg, layers: cfg.layers, context, maximum_pool_tokens,
@@ -725,7 +725,7 @@ pub(crate) fn native_layout_with_metadata(checkpoint: &Checkpoint, options: &Lay
         cuteafd_core::SparkIngress::Fp8K32, rings, options.spark_reply_formats)?;
     let host = super::recipe_host_memory(options)?;
     let budgets = production_budgets(&options.rtx_bytes.iter().map(|&n| (n, n)).collect::<Vec<_>>(),
-        crate::placement::reserve::gpu("glm5"), host, (8 << 30).max(host.0 / 10), &vec![options.spark_allocation_budget_bytes.unwrap_or(options.spark_bytes); spark_ranks])?;
+        crate::placement::reserve::gpu("glm5"), host, (8 << 30).max(host.0 / 10), &options.spark_capacities(spark_ranks))?;
     let operation = Operation::Serving;
     let request = production_request(crate::placement::planner::Context::resolve(context, (options.context_tokens > 0).then_some(options.context_tokens)), options.pool_tokens, onboard, prefill, operation,
         crate::placement::ResidentWeights(options.weight_budget_bytes), options.spark_reply_formats);

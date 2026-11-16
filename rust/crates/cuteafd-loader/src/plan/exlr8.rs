@@ -356,7 +356,7 @@ fn append_spark_devices(memory: &mut cuteafd_core::memory_layout::MemoryLayout,
     for (rank, &bytes) in residents.iter().enumerate() {
         if !memory.devices.iter().any(|device| device.kind == DeviceKind::Spark && device.index as usize == rank) {
             memory.devices.push(DeviceLayout { kind: DeviceKind::Spark, index: rank as u32,
-                capacity_bytes: layout.spark_bytes, worker_budget_bytes: layout.spark_allocation_budget_bytes.unwrap_or(layout.spark_bytes),
+                capacity_bytes: layout.spark_capacity(rank), worker_budget_bytes: layout.spark_capacity(rank),
                 items: Vec::new(), kv_tokens: 0 });
         }
         let device = memory.devices.iter_mut().find(|device|
@@ -1463,8 +1463,8 @@ mod tests {
         let runtime = 512 << 20;
         let experts = 105_213_559_040;
         let mut memory = MemoryLayout { devices: vec![DeviceLayout {
-            kind: DeviceKind::Spark, index: 0, capacity_bytes: layout.spark_bytes,
-            worker_budget_bytes: layout.spark_bytes, kv_tokens: 0,
+            kind: DeviceKind::Spark, index: 0, capacity_bytes: layout.spark_capacity(0),
+            worker_budget_bytes: layout.spark_capacity(0), kv_tokens: 0,
             items: vec![Item::new(Category::Runtime, "context+modules", "tower only", runtime, Basis::Calibrated),
                 Item::new(Category::Weights, "vision weights", "bundled encoder", encoder.weights, Basis::Exact),
                 Item::new(Category::Workspace, "vision scratch", "bundled encoder", encoder.scratch, Basis::Formula)],
@@ -1474,7 +1474,7 @@ mod tests {
         assert_eq!(memory.devices.len(), 1);
         let device = &memory.devices[0];
         assert_eq!((device.kind, device.index), (DeviceKind::Spark, 0));
-        assert_eq!(device.worker_budget_bytes, layout.spark_bytes);
+        assert_eq!(device.worker_budget_bytes, layout.spark_capacity(0));
         assert_eq!(device.items.len(), 6);
         assert_eq!(device.items.iter().filter(|item| item.category == Category::Experts)
             .map(|item| item.bytes).sum::<u64>(), experts);
