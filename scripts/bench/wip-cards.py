@@ -995,7 +995,7 @@ def merge_census_marker(job):
     now = validate_census_clock(sample['now_s'])
     log = dest / 'smoke' / 'logs' / (job['entry']['name'] + '.coordinator.log')
     text = log.read_text()
-    offsets = []
+    offsets, queries = [], []
     decoder = json.JSONDecoder()
     for raw in text.splitlines():
         line = ANSI.sub('', raw)
@@ -1003,11 +1003,14 @@ def merge_census_marker(job):
             continue
         stamp = datetime.datetime.fromisoformat(line.split()[0].replace('Z', '+00:00')).timestamp()
         queried = validate_census_clock(decoder.raw_decode(line.split('current=', 1)[1])[0]['queried_s'])
-        if now < queried:
-            raise ValueError('final census sample precedes daemon thermal anchor')
+        # Every anchor, including teardown queries logged after the final
+        # sample, only fixes the server-to-wall clock offset; ordering does not.
         offsets.append(stamp - queried)
+        queries.append(queried)
     if not offsets or max(offsets) - min(offsets) > .050:
         raise ValueError('missing or inconsistent daemon thermal clock anchors')
+    if now < min(queries):
+        raise ValueError('final census sample precedes every daemon thermal anchor')
     stamp = datetime.datetime.fromtimestamp(statistics.median(offsets) + now, datetime.timezone.utc)
     marker = (stamp.isoformat(timespec='microseconds').replace('+00:00', 'Z')
               + ' INFO cuteafd::bench_census: final server thermal sample'
