@@ -96,7 +96,8 @@ impl BudgetedPlanInput {
         {
             options.inventory_host_memory = Some(self.host.host_ram);
             let manifest = self.checkpoint().snapshot.join("share/PROGRAMS.json");
-            if manifest.is_file() { options.inventory_workspace_manifest = Some(manifest); }
+            if matches!(self.checkpoint().config["model_type"].as_str(), Some("deepseek_v4" | "deepseek_v41"))
+                && manifest.is_file() { options.inventory_workspace_manifest = Some(manifest); }
         }
         if let Some(layout) = &mut options.layout {
             layout.host_memory.get_or_insert(self.host.host_ram);
