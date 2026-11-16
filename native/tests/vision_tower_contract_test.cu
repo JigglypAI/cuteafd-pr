@@ -1,7 +1,6 @@
 // CPU-only descriptor/scratch checks; nvcc compiles both architectures but no
 // device is queried, no kernel runs and no backing allocation is made.
 #include "../shared/cuda/vision_runtime.cu"
-#include "../shared/cuda/vision_tower.cuh"
 #include <array>
 
 int main() {

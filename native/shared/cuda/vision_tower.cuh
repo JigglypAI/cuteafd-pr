@@ -1,14 +1,5 @@
 // Independent still-image extension helpers. Included after Owner and the shared
 // extent/alignment helpers; PE and existing tower arithmetic are not modified.
-struct GenericTowerStorage {
-  uint16_t *x=nullptr,*next=nullptr,*norm=nullptr,*qkv_norm=nullptr,*patches=nullptr,*qkv=nullptr;
-  uint16_t *q=nullptr,*k=nullptr,*v=nullptr,*attention=nullptr,*projection=nullptr;
-  uint16_t *mlp=nullptr,*position=nullptr,*grouped=nullptr,*projector=nullptr,*projector_result=nullptr,*output=nullptr;
-  float *cosines=nullptr,*sines=nullptr,*lse=nullptr,*lut=nullptr;
-  uint8_t* rgb=nullptr;
-  int32_t* lengths=nullptr;
-};
-
 bool generic_extent(const cuteafd_vision_spec& s,uint64_t offset,size_t bytes,size_t alignment=2) {
   return offset!=UINT64_MAX && offset%alignment==0 && offset<=s.weight_bytes && bytes<=s.weight_bytes-offset;
 }

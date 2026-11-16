@@ -4,6 +4,7 @@
 // is donated from Hugh Madden's mimo26f-afd v1.3.0 (see vision.cu).
 #include "vision.cu"
 #include "media_feature_norm.cuh"
+#include "vision_tower_storage.cuh"
 #include <cstddef>
 #include <cstring>
 #include <type_traits>
@@ -38,6 +39,8 @@ struct Owner {
   std::vector<cuteafd_vision_block> blocks;
   std::vector<uint64_t> norm1_bias, norm2_bias, q_norm, k_norm;
   cuteafd_vision_perception perception{};
+  cuteafd_vision_tower generic_tower{};
+  GenericTowerStorage generic_storage{};
   std::vector<uint64_t> scale1, scale2;
   cuteafd_vision_ledger ledger{};
   int device = 0;
@@ -77,11 +80,13 @@ bool copy_spec(Owner& o, const cuteafd_vision_spec& s) {
       o.perception.scale1=o.scale1.data();o.perception.scale2=o.scale2.data();
     }
   } catch (const std::bad_alloc&) { return false; }
+  if(s.tower)o.generic_tower=*s.tower;
   o.spec=s;
   o.spec.blocks=o.blocks.data(); o.spec.norm1_bias=o.norm1_bias.data();
   o.spec.norm2_bias=o.norm2_bias.data(); o.spec.q_norm=o.q_norm.data();
   o.spec.k_norm=o.k_norm.data();
   o.spec.perception=s.perception ? &o.perception : nullptr;
+  o.spec.tower=s.tower ? &o.generic_tower : nullptr;
   return true;
 }
 int device_ok(Owner* o) {
@@ -190,6 +195,7 @@ int mha_attention(Owner* o,int n) {
 #endif
 #include "vision_muse.cuh"
 #include "vision_perception.cuh"
+#include "vision_tower.cuh"
 #ifdef CUTEAFD_HAVE_VISION_ATTENTION_AOT
 #include "vision_mistral.cuh"
 #endif
@@ -218,6 +224,7 @@ bool valid_tower(const cuteafd_vision_spec& s) {
 size_t scratch_tower(Owner* o) {
   const auto& s=o->spec;
   if(s.perception)return scratch_perception(o);
+  if(s.tower)return scratch_generic_tower(s,o->arena,o->generic_storage);
   if(s.abi_version==2 && s.reserved==2)return scratch_qwen(o,s.max_tokens,s.output_width);
   if(s.abi_version==2 && s.reserved==5)return scratch_muse(o,s.max_tokens,s.output_width);
 #ifdef CUTEAFD_HAVE_GLM_VISION
@@ -235,7 +242,7 @@ extern "C" int32_t cuteafd_vision_required(const cuteafd_vision_spec* s, cuteafd
   Owner o;
   if(!copy_spec(o,*s))return cudaErrorMemoryAllocation;
   size_t bytes=scratch_tower(&o);
-  size_t blas_bytes=(s->perception || (s->abi_version==2 && s->reserved==5)) ? 0 : BLAS_BYTES;
+  size_t blas_bytes=(s->perception || s->tower || (s->abi_version==2 && s->reserved==5)) ? 0 : BLAS_BYTES;
   *out={s->weight_bytes,bytes-blas_bytes,blas_bytes,0,0}; return 0;
 }
 extern "C" int32_t cuteafd_vision_get_backings(void* owner, cuteafd_media_backings* out) {
