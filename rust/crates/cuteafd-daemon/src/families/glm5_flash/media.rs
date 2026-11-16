@@ -254,7 +254,7 @@ pub(super) fn prepare(job: NativeRequest, tokens: Vec<u32>, config: &serde_json:
     crate::shared::probe::image_echo(&job, &spans)?;
     let media = RequestMedia::new(spans.clone(), hidden, tokens.len())?;
     let keys = MediaKeys::new(&tokens, vocabulary as u32, &spans)?;
-    let jobs = job.media.iter().map(|image| EncodeJob::image(image.key, [image.grid.t, image.grid.h, image.grid.w], image.rgb8.clone(), image.tokens, hidden)).collect();
+    let jobs = job.media.iter().map(|image| EncodeJob::image_with_pixels(image.key, [image.grid.t, image.grid.h, image.grid.w], image.rgb8.clone(), image.pixels, image.tokens, hidden)).collect();
     Ok((Prompt { job, tokens, keys }, media, jobs))
 }
 
@@ -406,7 +406,7 @@ mod tests {
     }
     fn image() -> Arc<PreparedImage> {
         Arc::new(PreparedImage { key: ImageKey([7; 32]), encoder: cuteafd_loader::media::EncoderId([0; 32]), processor: cuteafd_loader::media::PreprocessId([0; 32]), grid: ImageGrid { t: 1, h: 4, w: 4 },
-            rgb8: Arc::from(vec![0; 4 * 4 * 14 * 14 * 3]), tokens: 4 })
+            rgb8: Arc::from(vec![0; 4 * 4 * 14 * 14 * 3]), pixels:cuteafd_core::media::ImagePixels::full(56,56), tokens: 4 })
     }
     fn feature_request() -> (Prompt, RequestMedia, serde_json::Value) {
         use cuteafd_api::openai::probe::{Probe, ProbeSpec, ProbeMedia, ProbeFixture, ProbeImageUrl};

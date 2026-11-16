@@ -300,7 +300,7 @@ pub(super) fn prepare(job: NativeRequest, tokens: Vec<u32>, config: &serde_json:
     }
     let media = RequestMedia::new(spans.clone(), hidden, tokens.len())?;
     let keys = MediaKeys::new(&tokens, vocabulary as u32, &spans)?;
-    let jobs = job.media.iter().map(|image| EncodeJob::image(image.key, [image.grid.t, image.grid.h, image.grid.w], image.rgb8.clone(), image.tokens, hidden))
+    let jobs = job.media.iter().map(|image| EncodeJob::image_with_pixels(image.key, [image.grid.t, image.grid.h, image.grid.w], image.rgb8.clone(), image.pixels, image.tokens, hidden))
         .chain(job.audio.iter().map(|clip| EncodeJob::audio(clip.key, clip.pcm.clone(), clip.geometry.tokens, hidden))).collect();
     Ok((Prompt { job, tokens, keys }, media, jobs))
 }
@@ -600,7 +600,7 @@ mod tests {
     }
     fn image() -> Arc<PreparedImage> {
         Arc::new(PreparedImage { key: ImageKey([7; 32]), encoder: cuteafd_loader::media::EncoderId([0; 32]), processor: cuteafd_loader::media::PreprocessId([0; 32]), grid: ImageGrid { t: 1, h: 4, w: 4 },
-            rgb8: Arc::from(vec![0; 4 * 4 * 768]), tokens: 4 })
+            rgb8: Arc::from(vec![0; 4 * 4 * 768]), pixels:cuteafd_core::media::ImagePixels::full(64,64), tokens: 4 })
     }
     #[test]
     fn mixed_image_audio_jobs_and_span_identities_remain_in_prompt_order() {

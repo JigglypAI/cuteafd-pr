@@ -152,7 +152,7 @@ impl Binding {
                 && image.grid.w % 2 == 0 && image.tokens == (image.grid.h as usize * image.grid.w as usize) / 4,
                 "Muse image grid/token count differs; video is unsupported");
             inputs.push((TowerKind::Image, image.tokens, image.key.into()));
-            jobs.push(EncodeJob::image(image.key, [1, image.grid.h, image.grid.w], image.rgb8.clone(), image.tokens, hidden));
+            jobs.push(EncodeJob::image_with_pixels(image.key, [1, image.grid.h, image.grid.w], image.rgb8.clone(), image.pixels, image.tokens, hidden));
         }
         for clip in &job.audio {
             ensure!(clip.geometry.policy == policy && policy.tokens(clip.pcm.len()) == Some(clip.geometry.tokens),
@@ -548,10 +548,10 @@ mod tests {
         use cuteafd_loader::media::{EncoderId, ImageGrid, PreparedImage, PreprocessId};
         let grid = ImageGrid { t: 1, h: 2, w: 2 };
         let processor = PreprocessId([2; 32]);
-        let rgb: Arc<[u8]> = Arc::from([37; 48]);
+        let rgb: Arc<[u8]> = Arc::from([37; 28*28*3]);
         let source = PreparedImage::key_for(EncoderId([120; 32]), processor, grid, &rgb);
         let image = Arc::new(PreparedImage { key: PreparedImage::key_for(EncoderId([121; 32]), processor, grid, &rgb),
-            encoder: EncoderId([121; 32]), processor, grid, rgb8: rgb, tokens: 1 });
+            encoder: EncoderId([121; 32]), processor, grid, rgb8: rgb, pixels:cuteafd_core::media::ImagePixels::full(28,28), tokens: 1 });
         let tokens = vec![1, 8, 7, 9, 2];
         let span = ProbeMedia { start: 2, len: 1, kind: "image".into(), key: key_hex(source.into()),
             grid: [1, 2, 2], identity: Some(ProbeImageIdentity { encoder: "78".repeat(32), processor: "02".repeat(32) }),

@@ -36,12 +36,16 @@ impl LocalEncoder {
     fn validate(&self, job: &media::EncodeJob) -> Result<(), MediaError> {
         job.validate()?;
         if job.hidden_width != self.width { return Err(MediaError::Features); }
-        let EncodeInput::Image { grid: [t, h, w], rgb8 } = &job.input else {
+        let EncodeInput::Image { grid: [t, h, w], rgb8, .. } = &job.input else {
             return if matches!(&job.input, EncodeInput::Audio { geometry, .. } if Some(*geometry) == self.service.audio_geometry())
                 && self.service.audio_ledger.is_some() { Ok(()) }
                 else { Err(MediaError::Encoder("audio encoder not loaded".into())) };
         };
         let (t, h, w) = (*t, *h, *w);
+        let pixels = job.pixels(self.patch_size as u32)?;
+        if pixels.padded() || pixels.canvas != [w.saturating_mul(self.patch_size as u32),h.saturating_mul(self.patch_size as u32)] {
+            return Err(MediaError::Encoder("tower does not accept padded source geometry yet".into()));
+        }
         let patches = (h as usize).checked_mul(w as usize).ok_or(MediaError::Features)?;
         if t != 1 || h == 0 || w == 0 || h % 2 != 0 || w % 2 != 0
             || job.tokens != cuteafd_ffi::vision::output_rows([h as usize, w as usize], self.span_markers)
@@ -69,7 +73,7 @@ impl EncoderClient for LocalEncoder {
             let pending = self.queue.pop_front()?;
             let output = vec![0; pending.job.tokens * self.width];
             let submitted = match &pending.job.input {
-                EncodeInput::Image { grid, rgb8 } => self.service.submit(EncodeJob {
+                EncodeInput::Image { grid, rgb8, .. } => self.service.submit(EncodeJob {
                     rgb: rgb8.clone(), grid: [grid[1] as usize, grid[2] as usize],
                     lut: self.lut.clone(), output }),
                 EncodeInput::Audio { pcm, .. } => self.service.submit_audio(super::audio::AudioEncodeJob {
@@ -179,7 +183,7 @@ mod tests {
             let mut job = media::EncodeJob::image(ImageKey([0;32]), [1,2,2], vec![0;bytes].into(), 1, 2);
             assert!(encoder.validate(&job).is_ok());
             let wrong_patch = if config.patch == 14 { 16 } else { 14 };
-            job.input = EncodeInput::Image { grid: [1,2,2], rgb8: vec![0;wrong_patch * wrong_patch * 3 * 4].into() };
+            job.input = EncodeInput::Image { grid: [1,2,2], rgb8: vec![0;wrong_patch * wrong_patch * 3 * 4].into(), pixels:None };
             assert!(matches!(encoder.validate(&job), Err(MediaError::Features)));
         }
     }

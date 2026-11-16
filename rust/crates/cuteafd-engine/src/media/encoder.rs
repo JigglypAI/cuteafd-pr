@@ -4,7 +4,7 @@ use std::{collections::HashMap, sync::Arc};
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum EncodeInput {
-    Image { grid: [u32; 3], rgb8: Arc<[u8]> },
+    Image { grid: [u32; 3], rgb8: Arc<[u8]>, pixels: Option<cuteafd_core::media::ImagePixels> },
     /// One complete clip of canonical finite mono FP32 PCM at 24 kHz.
     Audio { pcm: Arc<[f32]>, geometry: AudioTokenGeometry },
 }
@@ -18,12 +18,24 @@ pub struct EncodeJob {
 impl EncodeJob {
     pub fn image_input(&self) -> Result<([u32; 3], &Arc<[u8]>), MediaError> {
         match (&self.key, &self.input) {
-            (MediaKey::Image(_), EncodeInput::Image { grid, rgb8 }) => Ok((*grid, rgb8)),
+            (MediaKey::Image(_), EncodeInput::Image { grid, rgb8, .. }) => Ok((*grid, rgb8)),
             _ => Err(MediaError::Features),
         }
     }
     pub fn image(key: ImageKey, grid: [u32; 3], rgb8: Arc<[u8]>, tokens: usize, hidden_width: usize) -> Self {
-        Self { key: key.into(), input: EncodeInput::Image { grid, rgb8 }, tokens, hidden_width }
+        Self { key: key.into(), input: EncodeInput::Image { grid, rgb8, pixels:None }, tokens, hidden_width }
+    }
+    pub fn image_with_pixels(key: ImageKey, grid: [u32;3], rgb8: Arc<[u8]>, pixels: cuteafd_core::media::ImagePixels,
+        tokens: usize, hidden_width: usize) -> Self {
+        Self {key:key.into(),input:EncodeInput::Image {grid,rgb8,pixels:Some(pixels)},tokens,hidden_width}
+    }
+    pub fn pixels(&self, patch: u32) -> Result<cuteafd_core::media::ImagePixels,MediaError> {
+        let EncodeInput::Image {grid,pixels,..} = &self.input else {return Err(MediaError::Features)};
+        let width = grid[2].checked_mul(patch).ok_or(MediaError::Features)?;
+        let height = grid[1].checked_mul(patch).ok_or(MediaError::Features)?;
+        let pixels = pixels.unwrap_or_else(|| cuteafd_core::media::ImagePixels::full(width,height));
+        if !pixels.valid() {return Err(MediaError::Features)}
+        Ok(pixels)
     }
     pub fn audio(key: AudioKey, pcm: Arc<[f32]>, tokens: usize, hidden_width: usize) -> Self {
         Self::audio_with_geometry(key, pcm, tokens, hidden_width, AudioTokenGeometry::MimoRvq)
@@ -38,7 +50,8 @@ impl EncodeJob {
     pub fn validate(&self) -> Result<(), MediaError> {
         self.feature_bytes()?;
         match (&self.key, &self.input) {
-            (MediaKey::Image(_), EncodeInput::Image { grid, rgb8 }) if !grid.contains(&0) && !rgb8.is_empty() => Ok(()),
+            (MediaKey::Image(_), EncodeInput::Image { grid, rgb8, pixels }) if !grid.contains(&0) && !rgb8.is_empty()
+                && pixels.is_none_or(|pixels| pixels.valid() && u64::from(pixels.canvas[0])*u64::from(pixels.canvas[1])*3==rgb8.len() as u64) => Ok(()),
             (MediaKey::Audio(_), EncodeInput::Audio { pcm, geometry }) => {
                 if geometry.tokens(pcm.len()) != Some(self.tokens) || pcm.iter().any(|x| !x.is_finite()) {
                     return Err(MediaError::Features);
@@ -127,6 +140,18 @@ impl EncoderClient for FakeEncoder {
 #[cfg(test)]
 mod audio_geometry_tests {
     use super::*;
+    #[test]
+    fn image_source_pixels_are_distinct_from_grid_and_canvas() {
+        use cuteafd_core::media::ImagePixels;
+        let plain = EncodeJob::image(ImageKey([0;32]),[1,2,2],vec![0;32*32*3].into(),1,16);
+        assert_eq!(plain.pixels(16).unwrap(),ImagePixels::full(32,32));
+        let pixels = ImagePixels {source:[23,29],canvas:[40,40],content:[0,0,23,29]};
+        let mut padded = EncodeJob::image_with_pixels(ImageKey([1;32]),[1,2,2],vec![0;40*40*3].into(),pixels,1,16);
+        assert!(padded.validate().is_ok());assert_eq!(padded.pixels(20).unwrap(),pixels);
+        if let EncodeInput::Image {pixels,..} = &mut padded.input {pixels.as_mut().unwrap().content=[0,0,41,40];}
+        assert!(padded.validate().is_err());
+        assert!(plain.pixels(u32::MAX).is_err());
+    }
     #[test]
     fn audio_admission_uses_declared_geometry_not_mimo_counts() {
         let policy = AudioTokenGeometry::PcmPatches { samples_per_token: 1920 };

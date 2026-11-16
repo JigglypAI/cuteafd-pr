@@ -66,6 +66,30 @@ impl<'de> Deserialize<'de> for MediaKey {
     }
 }
 
+/// Pixel geometry independent of the encoder's patch grid. Source dimensions
+/// remain available to prompt templates after resize/crop; content marks valid
+/// RGB inside a canvas whose padding can have a distinct normalized value.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ImagePixels {
+    pub source: [u32; 2], // width, height before preprocessing
+    pub canvas: [u32; 2],
+    pub content: [u32; 4], // x, y, width, height in canvas pixels
+}
+impl ImagePixels {
+    pub fn full(width: u32, height: u32) -> Self {
+        Self {source:[width,height],canvas:[width,height],content:[0,0,width,height]}
+    }
+    pub fn valid(self) -> bool {
+        let [width,height] = self.canvas;
+        let [x,y,w,h] = self.content;
+        !self.source.contains(&0) && width>0 && height>0 && w>0 && h>0
+            && x.checked_add(w).is_some_and(|end| end<=width)
+            && y.checked_add(h).is_some_and(|end| end<=height)
+            && u64::from(width)*u64::from(height)<=64<<20
+    }
+    pub fn padded(self) -> bool { self.content != [0,0,self.canvas[0],self.canvas[1]] }
+}
+
 /// Merge-2 image rows shared by processors, encoders and probe admission.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ImageTokenGeometry {
@@ -127,6 +151,17 @@ impl MediaSpan {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn image_content_extent_preserves_source_and_rejects_overflow() {
+        let mut pixels = ImagePixels::full(640,480);
+        assert!(pixels.valid());assert!(!pixels.padded());
+        pixels.source=[1234,777];pixels.content=[0,0,639,479];
+        assert!(pixels.valid());assert!(pixels.padded());
+        for content in [[0,0,0,1],[0,0,641,480],[u32::MAX,0,2,1],[0,u32::MAX,1,2]] {
+            pixels.content=content;assert!(!pixels.valid());
+        }
+    }
 
     #[test]
     fn image_geometry_preserves_merged_families_and_row_markers() {
