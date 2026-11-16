@@ -17,8 +17,8 @@ runs sampled C1 code decode. `scripts/bench/wip-cards.py` accepts the same
 repeatable `--panel-config PANEL=JSON` option; smoke matrix entries/defaults use
 `"panel_config":{"decode_content":{"contents":["code"],"temperature":1.0,
 "top_p":0.95,"seed":42}}`. Entry settings replace defaults for the same panel.
-The in-server run API accepts this same `panel_config` map. Currently only
-`decode_content` accepts a configuration; unknown panels and fields fail before
+The in-server run API accepts this same `panel_config` map. The `decode_content` and
+`spec_lossless_set` panels accept configuration; unknown panels and fields fail before
 running. This does not change the baseline, concurrency sweep or goldens.
 
 `decode_content` fields are optional: `contents` selects unique names from
@@ -29,6 +29,21 @@ by default). Explicit settings are recorded per content row and displayed on
 the report. A seed repeats the sampling RNG; prompt nonces and dynamic scheduling
 still need matching conditions for fully reproducible comparisons. Unconfigured
 requests retain exactly their historical greedy body.
+
+`cuteafd bench --panels spec_lossless_set --panel-config 'spec_lossless_set={"warm":true}'`
+opts into prefix-restore qualification (default `warm:false`, the unchanged cold
+probe pair). For each case it first primes with the same prompt text and a cold,
+speculation-on request, then measures speculation-on with `cold:false`. The
+comparison oracle remains the case's cold speculation-off arm, never the priming
+output. Every measured restore must report `cached_tokens > 0`; otherwise the
+case fails with "restore not exercised". Strict generated-token and row-hash
+comparison still applies; streamed content/reasoning bytes and tool calls must
+also equal the off arm. Warm rows report cached tokens, identical generated-token
+prefix length, output equality and the first differing row. Existing row dumps
+capture the measured on/off arms, not the primer. `lossless_concurrency` still
+bounds cases per arm; each case's prime completes before its warm measurement.
+The same map works through the run API, smoke `panel_config` and wip-cards;
+unknown settings fail validation. This opt-in adds no launch key or env knob.
 
 Draft acceptance rate remains accepted draft tokens / proposed draft tokens.
 Acceptance length is **1 + accepted draft tokens / draft verify passes**: one

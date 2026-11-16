@@ -25,6 +25,18 @@ pub const MAX_CONCURRENCY: usize = 64;
 const MAX_PROMPT_BYTES: usize = 32 * 1024;
 const MAX_NONCE_CHARS: usize = 128;
 
+/// Optional cache-restore qualification; the default preserves cold probe pairs.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Options {
+    #[serde(default)]
+    pub warm: bool,
+}
+
+impl Options {
+    pub fn parse(value: &Value) -> Result<Self> { Ok(serde_json::from_value(value.clone())?) }
+}
+
 /// One case: the request text is `[{nonce}] {prompt}`, the baseline's form.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -213,6 +225,10 @@ pub struct Verdict {
     pub prefix_noise_max: f64,
     pub prefix_noise_median: f64,
     pub reason: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cached_tokens: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_identical: Option<bool>,
 }
 
 /// Strict lossless judgment: equal ids, every off row present in the drafted
@@ -264,7 +280,7 @@ pub fn judge(id: &str, on: &ProbeRecord, off: &ProbeRecord) -> Verdict {
         divergent_tokens: first_token.map(|at| [a.get(at).copied(), b.get(at).copied()]), rows_compared: compared,
         rows_differ: differ.len(), first_row_divergence: first_row, margin_off, margin_on,
         prefix_rows_compared: noise.compared, prefix_rows_identical: noise.identical, prefix_noise_max: noise.max,
-        prefix_noise_median: noise.median, reason }
+        prefix_noise_median: noise.median, reason, cached_tokens: None, output_identical: None }
 }
 
 /// The probe pair as kept evidence: ids, row hashes and top two per row.
@@ -345,8 +361,9 @@ fn run_cases(ctx: &Ctx<'_>, dump: Option<(&RowDump, &std::path::Path)>) -> Resul
         Some(set) => set,
         None => { default = CaseSet::default_set(); &default }
     };
+    let warm = ctx.panel_config.map(Options::parse).transpose()?.unwrap_or_default().warm;
     let speculator = ctx.info.configuration.speculator.clone().unwrap_or_default();
-    let spec = |off: bool| ProbeSpec { cold: true, no_speculation: off, pair_exempt: true, record_rows: TOKENS as usize, top_k: 2,
+    let spec = |off: bool| ProbeSpec { cold: off || !warm, no_speculation: off, pair_exempt: true, record_rows: TOKENS as usize, top_k: 2,
         ..ProbeSpec::default() };
     // A new run directory: the probes' leaves are exclusive and never overwrite an earlier run.
     let run_dir = dump.map(|(_, root)| -> Result<std::path::PathBuf> {
@@ -366,7 +383,7 @@ fn run_cases(ctx: &Ctx<'_>, dump: Option<(&RowDump, &std::path::Path)>) -> Resul
     // All drafts-on requests in waves of `n`, then all drafts-off ones: the arms never overlap.
     let total = set.cases.len();
     let mut waves = Vec::new();
-    let mut arms: [Vec<Option<ProbeRecord>>; 2] = [vec![None; total], vec![None; total]];
+    let mut arms: [Vec<Option<crate::client::Chat>>; 2] = [vec![None; total], vec![None; total]];
     // N = 1 keeps today's order (each case's on then off); N > 1 runs the arms apart.
     let mut schedule: Vec<(bool, std::ops::Range<usize>)> = Vec::new();
     if n == 1 {
@@ -384,16 +401,25 @@ fn run_cases(ctx: &Ctx<'_>, dump: Option<(&RowDump, &std::path::Path)>) -> Resul
                 format!("lossless {label} {}-{}/{total}", range.start + 1, range.end));
             let in_flight = std::sync::atomic::AtomicUsize::new(0);
             let max = std::sync::atomic::AtomicUsize::new(0);
-            let results: Vec<Result<ProbeRecord>> = std::thread::scope(|scope| {
+            let results: Vec<Result<crate::client::Chat>> = std::thread::scope(|scope| {
                 let handles: Vec<_> = wave.iter().map(|case| {
                     let (in_flight, max, spec) = (&in_flight, &max, arm_spec(case, off));
-                    scope.spawn(move || -> Result<ProbeRecord> {
+                    scope.spawn(move || -> Result<crate::client::Chat> {
                         use std::sync::atomic::Ordering::SeqCst;
                         max.fetch_max(in_flight.fetch_add(1, SeqCst) + 1, SeqCst);
+                        if warm && !off {
+                            let prime = ctx.client.chat(plain(ctx.client, &case.text(), TOKENS), Some(ProbeSpec {
+                                cold: true, pair_exempt: true, ..ProbeSpec::default()
+                            })).with_context(|| format!("{} cache prime", case.id))?;
+                            let record = probe_of(&prime)?;
+                            anyhow::ensure!(honoured(record) && record.cold && !record.no_speculation,
+                                "{}: engine did not honour cold speculation-on priming", case.id);
+                        }
                         let reply = ctx.client.chat(plain(ctx.client, &case.text(), TOKENS), Some(spec));
                         in_flight.fetch_sub(1, SeqCst);
                         let reply = reply.with_context(|| format!("{} drafts {label}", case.id))?;
-                        Ok(probe_of(&reply)?.clone())
+                        probe_of(&reply)?;
+                        Ok(reply)
                     })
                 }).collect();
                 handles.into_iter().map(|h| h.join().unwrap_or_else(|_| Err(anyhow::anyhow!("request thread panicked")))).collect()
@@ -401,7 +427,7 @@ fn run_cases(ctx: &Ctx<'_>, dump: Option<(&RowDump, &std::path::Path)>) -> Resul
             for (i, result) in range.clone().zip(results) {
                 let record = result?;
                 if !off {
-                    anyhow::ensure!(honoured(&record), "this engine does not run benchmark probes");
+                    anyhow::ensure!(honoured(probe_of(&record)?), "this engine does not run benchmark probes");
                 }
                 arms[off as usize][i] = Some(record);
             }
@@ -414,11 +440,26 @@ fn run_cases(ctx: &Ctx<'_>, dump: Option<(&RowDump, &std::path::Path)>) -> Resul
     let mut kept = serde_json::Map::new();
     for (i, case) in set.cases.iter().enumerate() {
         let selected = dump.filter(|(d, _)| d.cases.contains(&case.id)).map(|(d, _)| d);
-        let (on, off) = (arms[0][i].as_ref().unwrap(), arms[1][i].as_ref().unwrap());
+        let (on_chat, off_chat) = (arms[0][i].as_ref().unwrap(), arms[1][i].as_ref().unwrap());
+        let (on, off) = (probe_of(on_chat)?, probe_of(off_chat)?);
         let mut verdict = judge(&case.id, on, off);
-        if verdict.pass && !(on.cold && off.cold && off.no_speculation && !on.no_speculation) {
+        if verdict.pass && !(on.cold == !warm && off.cold && off.no_speculation && !on.no_speculation) {
             verdict.pass = false;
             verdict.reason = "the engine did not honour cold / drafts-off as asked".into();
+        }
+        if warm {
+            let identical = on_chat.content.as_bytes() == off_chat.content.as_bytes()
+                && on_chat.reasoning.as_bytes() == off_chat.reasoning.as_bytes()
+                && on_chat.tool_calls == off_chat.tool_calls;
+            verdict.cached_tokens = Some(on.cached_tokens);
+            verdict.output_identical = Some(identical);
+            if on.cached_tokens == 0 {
+                verdict.pass = false;
+                verdict.reason = "restore not exercised: measured cached_tokens is zero".into();
+            } else if !identical {
+                verdict.pass = false;
+                verdict.reason = format!("restored drafts-on output bytes differ from cold drafts-off; {}", verdict.reason);
+            }
         }
         if let (Some(d), Some(dir)) = (selected, &run_dir) {
             dumped.push(json!({"id": case.id, "nonce": case.nonce, "prompt_tokens": off.prompt_ids.len(),
@@ -436,6 +477,13 @@ fn run_cases(ctx: &Ctx<'_>, dump: Option<(&RowDump, &std::path::Path)>) -> Resul
         ctx.progress.partial(aggregate(set, &speculator, &verdicts, serde_json::Map::new()));
     }
     let mut value = aggregate(set, &speculator, &verdicts, kept);
+    if warm {
+        value["warm"] = json!(true);
+        value["table"]["columns"].as_array_mut().unwrap().extend([json!("cached tokens"), json!("identical prefix"), json!("output identical")]);
+        for (row, verdict) in value["table"]["rows"].as_array_mut().unwrap().iter_mut().zip(&verdicts) {
+            row.as_array_mut().unwrap().extend([json!(verdict.cached_tokens), json!(verdict.identical_prefix), json!(verdict.output_identical)]);
+        }
+    }
     if n > 1 {
         value["concurrency"] = json!({"n": n, "waves": waves});
     }
@@ -505,6 +553,11 @@ mod tests {
     }
 
     fn run_against(base: &str, set: &CaseSet, dump: Option<(&RowDump, &std::path::Path)>, concurrency: usize) -> Value {
+        run_configured(base, set, dump, concurrency, None)
+    }
+
+    fn run_configured(base: &str, set: &CaseSet, dump: Option<(&RowDump, &std::path::Path)>, concurrency: usize,
+        panel_config: Option<&Value>) -> Value {
         let mut client = crate::client::Client::new(base, None, std::sync::Arc::new(Default::default())).with_local_probes();
         client.model = "fake".into();
         let mut info = ServerInfo::default();
@@ -513,8 +566,107 @@ mod tests {
         let context_load = crate::panels::context_load::Options::default();
         let ctx = Ctx { client: &client, info: &info, baseline: None, rates: Rates::default(), progress: &progress,
             pass: 1, history: &[], max_context: 8192, max_output: 4096, lossless_set: Some(set),
-            lossless_dump: dump.map(|(d, _)| d), lossless_concurrency: concurrency, context_load: &context_load, panel_config: None };
+            lossless_dump: dump.map(|(d, _)| d), lossless_concurrency: concurrency, context_load: &context_load, panel_config };
         run_cases(&ctx, dump).unwrap()
+    }
+
+    /// One complete cold/warm case, preserving both request bodies and probe controls.
+    fn restore_fixture(warm: bool, cached: usize, bad_output: bool, bad_row: bool) -> (Value, Vec<(Value, ProbeSpec)>) {
+        use std::io::{BufRead, Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let worker = std::thread::spawn(move || {
+            let mut seen = Vec::new();
+            for index in 0..if warm { 3 } else { 2 } {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+                let mut reader = std::io::BufReader::new(socket.try_clone().unwrap());
+                let (mut id, mut length) = (String::new(), 0usize);
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    if line == "\r\n" { break; }
+                    let lower = line.to_lowercase();
+                    if let Some(v) = lower.strip_prefix(&format!("{}:", cuteafd_api::openai::probe::HEADER)) { id = v.trim().into(); }
+                    if let Some(v) = lower.strip_prefix("content-length:") { length = v.trim().parse().unwrap(); }
+                }
+                let mut bytes = vec![0; length];
+                reader.read_exact(&mut bytes).unwrap();
+                let body: Value = serde_json::from_slice(&bytes).unwrap();
+                let probe = cuteafd_api::openai::probe::registry().claim(&id).unwrap();
+                let prime = warm && index == 0;
+                let measured = !probe.spec.no_speculation && !prime;
+                probe.admitted("fake", &[9; 10], if measured { cached } else { 0 });
+                for row in 0..TOKENS as usize {
+                    let lift = if measured && bad_row && row == 7 { 0.5 } else { 0.0 };
+                    probe.row(10 + row, &[2.0 + lift, 1.0]);
+                    probe.token(0);
+                }
+                // Prime intentionally differs: only the off arm is the oracle.
+                let text = if prime { "prime only" } else if measured && bad_output { "wrong" } else { "answer" };
+                let event = json!({"choices":[{"delta":{"content":text},"finish_reason":"stop"}]});
+                write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n\
+                    data: {event}\n\ndata: [DONE]\n\n").unwrap();
+                seen.push((body, probe.spec.clone()));
+            }
+            seen
+        });
+        let config = json!({"warm":warm});
+        let value = run_configured(&base, &set(1), None, 1, warm.then_some(&config));
+        (value, worker.join().unwrap())
+    }
+
+    #[test]
+    fn warm_restores_after_cold_speculating_prime_and_compares_off_arm() {
+        let (value, seen) = restore_fixture(true, 8, false, false);
+        assert_eq!(value["gate"], "pass", "{value}");
+        assert_eq!(value["warm"], true);
+        assert_eq!(seen.len(), 3);
+        assert_eq!(seen.iter().map(|(_, s)| (s.cold, s.no_speculation)).collect::<Vec<_>>(),
+            [(true, false), (false, false), (true, true)]);
+        assert!(seen.windows(2).all(|w| w[0].0 == w[1].0), "prime and both arms use identical bodies");
+        assert_eq!(value["rows"][0]["cached_tokens"], 8);
+        assert_eq!(value["rows"][0]["identical_prefix"], TOKENS);
+        assert_eq!(value["rows"][0]["output_identical"], true);
+        assert!(value["rows"][0]["first_row_divergence"].is_null());
+        assert_eq!(value["evidence"]["c0"]["on"]["cold"], false);
+        assert_eq!(value["evidence"]["c0"]["off"]["no_speculation"], true);
+    }
+
+    #[test]
+    fn warm_zero_cached_tokens_fails_even_with_identical_output() {
+        let (value, _) = restore_fixture(true, 0, false, false);
+        assert_eq!(value["gate"], "fail");
+        assert_eq!(value["rows"][0]["reason"], "restore not exercised: measured cached_tokens is zero");
+        assert_eq!(value["rows"][0]["output_identical"], true);
+    }
+
+    #[test]
+    fn warm_compares_output_bytes_and_first_mismatching_row_to_cold_off() {
+        let (value, _) = restore_fixture(true, 8, true, false);
+        assert_eq!(value["gate"], "fail");
+        assert_eq!(value["rows"][0]["output_identical"], false);
+        assert_eq!(value["rows"][0]["identical_prefix"], TOKENS, "ids alone cannot prove byte equality");
+        let (value, _) = restore_fixture(true, 8, false, true);
+        assert_eq!(value["gate"], "fail");
+        assert_eq!(value["rows"][0]["first_row_divergence"], 7);
+    }
+
+    #[test]
+    fn default_cold_request_bodies_and_probe_controls_are_unchanged() {
+        let (value, seen) = restore_fixture(false, 0, false, false);
+        assert_eq!(seen.len(), 2);
+        assert!(value.get("warm").is_none());
+        assert!(value["rows"][0].get("cached_tokens").is_none());
+        for ((body, spec), off) in seen.iter().zip([false, true]) {
+            let expected = json!({"messages":[{"role":"user","content":"[n0] p"}],"max_tokens":128,
+                "temperature":0,"thinking":{"type":"disabled"},"model":"fake","stream":true,
+                "stream_options":{"include_usage":true}});
+            assert_eq!(serde_json::to_vec(body).unwrap(), serde_json::to_vec(&expected).unwrap());
+            let expected = ProbeSpec { cold:true, no_speculation:off, pair_exempt:true,
+                record_rows:TOKENS as usize, top_k:2, ..Default::default() };
+            assert_eq!(serde_json::to_vec(spec).unwrap(), serde_json::to_vec(&expected).unwrap());
+        }
     }
 
     /// A threaded fake engine that holds each request until `hold` are in flight (or a timeout), so

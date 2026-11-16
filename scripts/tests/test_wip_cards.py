@@ -4014,3 +4014,15 @@ def test_sampled_panel_config_reaches_matrix(entry, tmp_path, monkeypatch):
 def test_panel_config_rejects_non_objects(text):
     with pytest.raises(ValueError):
         cards.parse_panel_config(text)
+
+
+def test_warm_lossless_panel_config_reaches_matrix(entry, tmp_path, monkeypatch):
+    kit = _kit(tmp_path, entry)
+    state = tmp_path / 'warm-lossless-state'
+    monkeypatch.setattr(sys, 'argv', ['wip-cards', '--kit', str(kit), '--cards', 'v41-min', '--matrix',
+        '--arm', 'a=b:s', '--state', str(state), '--panels', 'spec_lossless_set',
+        '--panel-config', 'spec_lossless_set={"warm":true}', '--dry-run'])
+    assert cards.main() == 0
+    e = json.loads(next(state.glob('*/matrix.json')).read_text())['entries'][0]
+    assert e['profile'] == 'panels:spec_lossless_set' and e['baseline'] is False
+    assert e['panel_config'] == {'spec_lossless_set': {'warm': True}}
