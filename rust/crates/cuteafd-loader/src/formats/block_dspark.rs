@@ -4,6 +4,8 @@ use serde::Deserialize;
 use serde_json::Value;
 use std::path::Path;
 
+pub mod recurrent;
+
 /// The native Markov kernel tiles independent sequences over fixed 32-sequence arrays.
 pub const MAX_SEQUENCES: usize = cuteafd_core::concurrency::MAX_CONCURRENCY as usize;
 /// Tiled reductions and context spans stream through one drafter-private slot.
