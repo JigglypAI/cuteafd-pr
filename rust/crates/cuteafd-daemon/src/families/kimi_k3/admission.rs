@@ -281,7 +281,7 @@ impl<'a> Admission<'a> {
 
     pub(crate) fn allocate_block_tp2(&mut self,device:Device<'a>,
         programs:&'a cuteafd_ffi::programs::Programs<'a>,snapshot:&std::path::Path,
-        exchange:Rc<crate::shared::peer_split::PeerExchange<'a>>)
+        stream:*mut std::ffi::c_void)
         ->Result<DeviceOwner<'a,super::draft_common::CommonDraft<'a>>> {
         use crate::shared::{speculation::block_dspark::DsparkDrafter,memory::weight_arena::DeviceWeightArena};
         let physical=self.devices.clone();
@@ -295,7 +295,8 @@ impl<'a> Admission<'a> {
             }).collect::<Result<std::collections::BTreeMap<_,_>>>()?;
             let capacity=ranks[lead].capacity;
             let draft=DsparkDrafter::load_tp2_with(device.library,programs,projection,snapshot,
-                capacity.context_slots,capacity.max_batch_sequences,ranks[lead].kv_cache,exchange,lead,
+                capacity.context_slots,capacity.max_batch_sequences,ranks[lead].kv_cache,
+                [physical[0],physical[1]],stream,lead,
                 |physical,name,bytes|arenas.get(&physical).context("paired block arena owner absent")?.view(name,bytes))?;
             Ok(super::draft_common::CommonDraft::Block { draft,
                 frontiers:std::cell::RefCell::new(vec![(0,0);capacity.context_slots]) })
@@ -954,7 +955,8 @@ pub(crate) fn admit<'a, const RANKS: usize>(mut inputs: Inputs<'_, RANKS>) -> Re
     let scoring_bytes = kimi::host_scoring_bytes(rows.min(64), rows, cfg.vocab_size)?;
     recipe.owners.push(kimi::host_scoring_owner(scoring_bytes, maximum_pages));
     recipe.owners.push(kimi::host_upload_owner(maximum_pages));
-    recipe.owners.extend(kimi::stream_slab_owners(RANKS, maximum_pages)?);
+    recipe.owners.extend(kimi::stream_slab_owners_with_block(RANKS,maximum_pages,
+        matches!(draft,Some(DraftLayout::BlockTp2 { .. })))?);
     let push_host = kimi::selected_push_host_envelope(cfg, &core, RANKS)?;
     if !skip_routed_experts { recipe.owners.extend(kimi::push_host_owners(&push_host, maximum_pages)?); }
     recipe.owners.extend(kimi::native_load_owners(&core, RANKS, maximum_pages)?);

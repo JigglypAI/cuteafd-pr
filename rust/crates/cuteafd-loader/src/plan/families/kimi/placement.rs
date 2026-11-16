@@ -6,6 +6,12 @@ use crate::placement::families::kimi::{self, ExpertProfile, FixedOwner, KimiReci
 use crate::{placement::*, plan::{Component, ExpertPlacement, PlanReport}};
 use cuteafd_core::memory_layout::{Basis, Category, DeviceKind, DeviceLayout, Item, MemoryLayout};
 
+fn raw_speculator_is_block(snapshot:Option<&std::path::Path>)->bool {
+    snapshot.and_then(|s|std::fs::read(s.join("config.json")).ok())
+        .and_then(|b|serde_json::from_slice::<serde_json::Value>(&b).ok())
+        .is_some_and(|v|v["speculators_model_type"]=="dspark")
+}
+
 const GIB: u64 = 1 << 30;
 const COMPILED_CAPACITY: u64 = crate::families::kimi_k3::COMPILED_CONTEXT as u64;
 const PAGE: u64 = 64;
@@ -552,7 +558,8 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
     };
     recipe.owners.push(kimi::host_scoring_owner(scoring_bytes, maximum_pages));
     recipe.owners.push(kimi::host_upload_owner(maximum_pages));
-    match kimi::stream_slab_owners(gpus, maximum_pages) {
+    match kimi::stream_slab_owners_with_block(gpus,maximum_pages,
+        raw_speculator_is_block(opts.kimi_drafter_snapshot.as_deref()) && gpus==2) {
         Ok(owners) => recipe.owners.extend(owners),
         Err(error) => { report.refuse_placement(format!("Kimi stream slab owners refused: {error}"),
             "Use supported coordinator stream counts."); return memory; }

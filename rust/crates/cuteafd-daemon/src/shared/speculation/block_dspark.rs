@@ -576,6 +576,8 @@ pub(crate) struct DsparkDrafter<'a> {
     /// How the FP8 GEMMs run (--draft-linear), and the latest mode the FP8 scratch serves.
     fp8_rows: Cell<fp8_linear::Fp8Rows>,
     fp8_admitted: fp8_linear::Fp8Rows,
+    // Shared exchange drops before this peer stream, whose device body it borrows.
+    peer_stream:Option<device::Stream<'a>>,
 }
 
 fn at(dev: &Dev<'_>, bytes: usize) -> *mut c_void {
@@ -624,9 +626,15 @@ impl<'a> DsparkDrafter<'a> {
     pub(crate) fn load_tp2_with(library:&'a NativeLibrary,programs:&'a cuteafd_ffi::programs::Programs<'a>,
         target_projection:super::dflash::TargetProjection,snapshot:&Path,slots:usize,sequences:usize,
         kv:cuteafd_loader::families::qwen4::Qwen4KvCache,
-        exchange:Rc<crate::shared::peer_split::PeerExchange<'a>>,lead:usize,
+        devices:[i32;2],lead_stream:*mut c_void,lead:usize,
         mut allocate:impl FnMut(i32,&str,usize)->Result<device::Allocation<'a>>)->Result<Self> {
-        ensure!(lead<2 && library.cuda_get_device()?==exchange.device(lead),"block TP2 current device differs from lead");
+        ensure!(lead<2 && library.cuda_get_device()?==devices[lead] && !lead_stream.is_null(),"block TP2 current device differs from lead");
+        let peer_stream=device::Stream::new(device::Device { library,id:devices[1-lead] })?;
+        let rank_streams=std::array::from_fn(|rank|crate::shared::peer_split::RankDevice {
+            device:devices[rank],stream:if rank==lead { lead_stream } else { peer_stream.raw } });
+        let slot=cuteafd_loader::formats::block_dspark::BLOCK_TP2_EXCHANGE_BYTES;
+        let exchange=Rc::new(crate::shared::peer_split::PeerExchange::new_abortable(library,rank_streams,1,slot,slot)?);
+        exchange.trace_identity("block-dspark-tp2-private");
         let cfg=DsparkConfig::read(snapshot)?;
         let window=cfg.window.context("block TP2 requires sliding window")?;
         let mut load=|rank,projection|Self::load_rank_with(library,programs,projection,snapshot,HashMap::new(),
@@ -642,6 +650,7 @@ impl<'a> DsparkDrafter<'a> {
             .context("block TP2 reduce extent overflow")?;
         body.head_split=Some(super::gqa_tp2::GqaHeadSplit::new(peer,exchange,lead,bytes,
             [Tag::drafter_workspace("shared/block-dspark-reduce"),Tag::transport("shared/block-dspark-reduce")])?);
+        body.peer_stream=Some(peer_stream);
         Ok(body)
     }
 
@@ -883,6 +892,7 @@ impl<'a> DsparkDrafter<'a> {
             head_mode: Cell::new(DraftHead::Exact),
             fp8_rows: Cell::new(fp8_rows),
             fp8_admitted: fp8_rows,
+            peer_stream:None,
             cfg,
         })
     }

@@ -6,6 +6,8 @@ use std::path::Path;
 
 /// The native Markov kernel tiles independent sequences over fixed 32-sequence arrays.
 pub const MAX_SEQUENCES: usize = cuteafd_core::concurrency::MAX_CONCURRENCY as usize;
+/// Tiled reductions and context spans stream through one drafter-private slot.
+pub const BLOCK_TP2_EXCHANGE_BYTES: usize = 65_536;
 pub const fn supports_sequences(sequences: usize) -> bool {
     sequences > 0 && sequences <= MAX_SEQUENCES
 }
@@ -96,6 +98,8 @@ pub struct BlockDsparkRuntimeLayout {
     /// Sole shared GqaHeadSplit allocation, not allocated from `buffers`.
     pub reduction_bytes: usize,
     pub reduction_peer: bool,
+    /// Allocated only by the retained PeerExchange, never the body workspace.
+    pub exchange_buffers: Vec<(String,usize)>,
 }
 
 impl BlockDsparkRuntimeLayout {
@@ -153,7 +157,7 @@ impl BlockDsparkRuntimeLayout {
             mul(&[config.heads / config.kv_heads, config.block])?.div_ceil(32) as u64,
             add(&[window, config.block])? as u64, config.head_dim as u64, sms as u64)?)?);
         Ok(Self { config, kv_cache, weight_requests, capacity, weights, buffers, host_landing:mul(&[rows,8])?,
-            reduction_bytes:0,reduction_peer:false })
+            reduction_bytes:0,reduction_peer:false,exchange_buffers:Vec::new() })
     }
 
     /// Rank-local body workspace sized from the source checkpoint. Each peer
@@ -199,6 +203,12 @@ impl BlockDsparkRuntimeLayout {
         }
         layout.reduction_bytes=crate::serving_capacity::WeightArenaLayout::allocation_bytes(mul(&[rows,h,2])?);
         layout.reduction_peer=rank!=lead;
+        let transport=crate::serving_capacity::PeerStorageLayout::new(1,BLOCK_TP2_EXCHANGE_BYTES,
+            crate::serving_capacity::peer_wait_diagnostics())?;
+        layout.exchange_buffers.extend([("tp2.exchange.recv".into(),transport.receive_bytes),
+            ("tp2.exchange.control".into(),transport.control_bytes),
+            ("tp2.exchange.abort".into(),crate::serving_capacity::WeightArenaLayout::ALIGNMENT)]);
+        if transport.progress_bytes>0 { layout.exchange_buffers.push(("tp2.exchange.progress".into(),transport.progress_bytes)); }
         Ok(layout)
     }
 
@@ -215,6 +225,8 @@ impl BlockDsparkRuntimeLayout {
         use cuteafd_core::memory_layout::{Basis, Category};
         let mut demands=self.buffers.iter().map(|(name, bytes)| crate::placement::Demand::new(gpu,
             Category::Drafter, format!("block dSpark {name}"), *bytes as u64, Basis::Exact)).collect::<Vec<_>>();
+        demands.extend(self.exchange_buffers.iter().map(|(name,bytes)|crate::placement::Demand::new(gpu,
+            Category::Transport,format!("block dSpark {name}"),*bytes as u64,Basis::Exact)));
         if self.reduction_bytes>0 {
             demands.push(crate::placement::Demand::new(gpu,if self.reduction_peer { Category::Transport } else { Category::Drafter },
                 "block dSpark shared TP2 reduction",self.reduction_bytes as u64,Basis::Exact));
@@ -864,7 +876,8 @@ mod tests {
             let demands=local.demands(1);
             assert_eq!(demands.iter().filter(|d|d.group=="block dSpark shared TP2 reduction").count(),1);
             assert_eq!(demands.iter().map(|d|d.bytes).sum::<u64>(),
-                local.buffers.iter().map(|(_,n)|*n as u64).sum::<u64>()+reduction as u64);
+                local.buffers.iter().map(|(_,n)|*n as u64).sum::<u64>()+reduction as u64
+                    +local.exchange_buffers.iter().map(|(_,n)|*n as u64).sum::<u64>());
         }
         for physical_lead in [0,1] {
             for rank in 0..2 {

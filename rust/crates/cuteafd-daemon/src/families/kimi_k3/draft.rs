@@ -205,7 +205,7 @@ impl<'a> NativeDraft<'a> {
             DraftLayout::Block(_) => admission.allocate_block_draft(bridge.stream().device,programs,
                 &options.snapshot,bridge.stream().raw)?,
             DraftLayout::BlockTp2 { .. }=>admission.allocate_block_tp2(bridge.stream().device,programs,
-                &options.snapshot,exchange.context("paired block drafter requires target exchange")?.1)?,
+                &options.snapshot,bridge.stream().raw)?,
         };
         let demands = cuteafd_loader::families::kimi_k3::draft::bridge_demands(
             layout, admission.lane_rows(), streams.len())?;

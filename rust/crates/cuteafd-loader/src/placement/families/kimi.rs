@@ -1022,14 +1022,20 @@ pub fn host_upload_owner(maximum: u64) -> Component {
 /// stream, so one owner per coordinator GPU charges the startup live peak. This
 /// is not a cudaMalloc request and receives no allocation-tail charge (#1511).
 pub fn stream_slab_owners(ranks: usize, maximum: u64) -> Result<Vec<Component>, Refusal> {
-    let peak = crate::plan::families::kimi::startup_peak_live_streams();
-    let bytes = cuda_stream_slab_bytes(peak)?;
-    Ok((0..ranks).map(|rank| Component {
+    stream_slab_owners_with_block(ranks,maximum,false)
+}
+pub fn stream_slab_owners_with_block(ranks:usize,maximum:u64,block_tp2:bool)->Result<Vec<Component>,Refusal> {
+    let base = crate::plan::families::kimi::startup_peak_live_streams();
+    (0..ranks).map(|rank| {
+    // Dedicated exchange adds one abort publisher per GPU and a peer compute stream.
+    let peak=base+if block_tp2 { if rank+1==ranks { 1 } else { 2 } } else { 0 };
+    let bytes=cuda_stream_slab_bytes(peak)?;
+    Ok(Component {
         activation: Activation::always(), bytes: ByteCurve::fixed(bytes, maximum),
         kind: ComponentKind::Allowance(Allowance { location: Location::coordinator(rank as u8),
             bytes, lifetime: Lifetime::RESIDENT, assumed: false,
             source: format!("kimi/driver-stream-slabs/gpu{rank} ({peak} peak live streams, SM120 driver/runtime 13020 LAZY, #1511 2026-11-08)") }),
-    }).collect())
+    }) }).collect()
 }
 
 pub fn host_scoring_bytes(decode_rows: usize, prefill_rows: usize, vocab: usize) -> Result<u64, Refusal> {
