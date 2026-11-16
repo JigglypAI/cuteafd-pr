@@ -334,7 +334,7 @@
       },
       "2rtx": {
         "status": "current",
-        "report": "benchmarks/minimax_m3/2026-11-16-smoke-minimax-m3-1-flash-2rtx-4spark-minimax-dspark-heads-current-r1"
+        "report": "benchmarks/minimax_m3/2026-11-16-smoke-minimax-m3-1-flash-2rtx-6spark-minimax-6spark-smoke-cand-r1"
       }
     },
     {

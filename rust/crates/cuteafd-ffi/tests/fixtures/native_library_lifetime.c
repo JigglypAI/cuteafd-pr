@@ -538,13 +538,15 @@ int cuteafd_alloc_managed_device_buffer(size_t bytes, struct device_buffer *out,
 
 static int capture_status;
 void fixture_configure_capture(int status) { capture_status = status; }
-struct graph_exec { int device; size_t bytes; };
+struct graph_exec { int device; size_t bytes; int invalid; uint64_t launches; };
 int cuteafd_cuda_graph_end_capture(void *stream, void **out) {
     (void)stream;
     if (capture_status) return capture_status;
     struct graph_exec *graph = malloc(sizeof(*graph));
     if (!graph) return 1;
     graph->device = current_device;
+    graph->invalid = 0;
+    graph->launches = 0;
     graph->bytes = graph_bytes;
     memory_used[current_device] += graph_bytes;
     *out = graph;
@@ -565,16 +567,63 @@ int cuteafd_cuda_graph_end_capture_topology(void *stream, void **out,
     *nodes = *width = 1;
     return 0;
 }
+struct fixture_graph_source { int device; };
+int cuteafd_cuda_graph_capture_source(void *stream, void **out, size_t *nodes,
+    size_t *width, int *spans, const uint64_t **signature, size_t *words) {
+    (void)stream;
+    *out = NULL; *nodes = *width = *words = 0; *spans = 0; *signature = NULL;
+    if (capture_status == 10) { *nodes = 2; return capture_status; }
+    if (capture_status && capture_status != 11) return capture_status;
+    struct fixture_graph_source *source = malloc(sizeof(*source));
+    if (!source) return 1;
+    source->device = current_device;
+    static const uint64_t shape[] = {3, 0, 1, 0, 1, 0, 1, 0};
+    *signature = shape; *words = sizeof(shape) / sizeof(shape[0]);
+    *nodes = 1; *width = capture_status == 11 ? 0 : 1; *out = source;
+    return 0;
+}
+int cuteafd_cuda_graph_source_instantiate(void *source, void *stream, void **exec) {
+    if (!source) return 1;
+    return cuteafd_cuda_graph_end_capture(stream, exec);
+}
+int cuteafd_cuda_graph_source_update(void *source, void *exec, int *status, int *result) {
+    if (!source || !exec) return 1;
+    *status = 0; *result = 0; event('U'); return 0;
+}
+int cuteafd_cuda_graph_source_transfer(void *source, void *donor, void **out) {
+    if (!source || !donor) return 1;
+    struct graph_exec *old = donor;
+    if (old->invalid) return 1;
+    struct graph_exec *next = malloc(sizeof(*next));
+    if (!next) return 1;
+    *next = *old;
+    next->launches = 0;
+    old->invalid = 1;
+    *out = next;
+    return 0;
+}
+int cuteafd_cuda_graph_exec_invalidate(void *donor) {
+    struct graph_exec *graph = donor;
+    if (!graph || graph->invalid) return 0;
+    memory_used[graph->device] -= graph->bytes;
+    graph->invalid = 1;
+    return 0;
+}
+int cuteafd_cuda_graph_source_destroy(void *source) { free(source); return 0; }
 int cuteafd_cuda_graph_launch(void *handle, void *stream) {
     (void)stream;
     struct graph_exec *graph = handle;
-    if (!graph || graph->device != current_device) return 1;
+    if (!graph || graph->invalid || graph->device != current_device) return 1;
+    ++graph->launches;
     event('L');
     return 0;
 }
+int cuteafd_cuda_graph_launch_count(void *handle, uint64_t *out) {
+    *out = ((struct graph_exec *)handle)->launches; return 0;
+}
 int cuteafd_cuda_graph_exec_destroy(void *handle) {
     struct graph_exec *graph = handle;
-    memory_used[graph->device] -= graph->bytes;
+    if (!graph->invalid) memory_used[graph->device] -= graph->bytes;
     free(graph);
     event('g');
     return 0;

@@ -555,7 +555,7 @@ pub(super) fn worker(mut args: crate::cli::NativeServeArgs, mut receive: mpsc::R
     drop(visit);
     // The loader list is a best-effort preference, not a sealed capture set.
     // Other shapes remain eligible for lazy bounded capture.
-    {
+    if crate::shared::decode_graph::prewarm_enabled() {
         let memory = || -> Result<Vec<usize>> {
             devices.iter().map(|device| device.run(|| lib.cuda_memory_info().map(|(free, _)| free)))
                 .collect()

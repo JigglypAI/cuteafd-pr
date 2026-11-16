@@ -396,7 +396,7 @@ impl IndexQueryWave<'_, '_> {
             ticket.capture_result(crate::shared::decode_graph::begin_capture(&self.storage.stream.library, self.storage.stream.raw, &ticket))?;
         }
         let launched = unsafe { self.enqueue(rows) };
-        let captured = unsafe { ticket.capture_result(self.storage.stream.library.cuda_graph_end_capture_topology(self.storage.stream.raw)) };
+        let captured = unsafe { let captured = crate::shared::decode_graph::end_capture(&self.storage.stream.library, self.storage.stream.raw, &mut ticket); ticket.capture_result(captured) };
         match (launched, captured) {
             (Ok(()), Ok((graph, nodes, width, spans, _))) => {
                 if let Err(error) = unsafe {

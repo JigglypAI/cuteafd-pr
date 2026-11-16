@@ -336,7 +336,7 @@ impl<'a> Graphs<'a> {
         for &key in keys {
             if !prewarm_selected(kimi_layout(core, ranks), key, false) || self.cached(&key) { continue }
             let pinned = pinned(core, ranks, key);
-            let Some(ticket) = self.bank.cache_ticket(&key, pinned, None) else { continue };
+            let Some(mut ticket) = self.bank.cache_ticket(&key, pinned, None) else { continue };
             if self.capture(stream, key, ticket, &mut || body(key))? { captured += 1; }
         }
         Ok(captured)
@@ -356,7 +356,7 @@ impl<'a> Graphs<'a> {
             return Ok(());
         }
         if !allow_capture { return body() }
-        let Some(ticket) = self.bank.cache_ticket(&key, pinned, None) else { return body() };
+        let Some(mut ticket) = self.bank.cache_ticket(&key, pinned, None) else { return body() };
         // The body is recorded on this lane's stream; on refusal it runs eagerly
         // instead. Its own nested cache lookups are disabled by the caller, so
         // the recorded segment is the eager kernel sequence.
@@ -373,7 +373,7 @@ impl<'a> Graphs<'a> {
     /// Capture `body` and own the executable. `false` means the capture was
     /// declined or failed to instantiate: the caller must run the body eagerly.
     /// The ticket cancels every failed path, including by drop.
-    fn capture(&mut self, stream: &Stream<'a>, key: Key, ticket: CaptureTicket,
+    fn capture(&mut self, stream: &Stream<'a>, key: Key, mut ticket: CaptureTicket,
         body: &mut impl FnMut() -> Result<()>) -> Result<bool> {
         // SAFETY: the lane is the only writer on this persistent stream for the
         // duration of the step body; every captured pointer is pinned by LocalLane.
@@ -387,7 +387,7 @@ impl<'a> Graphs<'a> {
         let submitted = body();
         // SAFETY: ends the matching capture on this same retained stream.
         let ended = stream.device.run(|| unsafe {
-            stream.device.library.cuda_graph_end_capture_topology(stream.raw) });
+            crate::shared::decode_graph::end_capture(&stream.device.library, stream.raw, &mut ticket) });
         match (submitted, ended) {
             (Ok(()), Ok((raw, nodes, width, spans, inspection_error))) => {
                 if let Some(error) = inspection_error {

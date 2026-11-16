@@ -183,7 +183,7 @@ impl<'w,'a> Tp2FfnGraphs<'w,'a> {
             block.restore_ffn_graph_warmup(binding,rows)?;
             ticket.capture_result(crate::shared::decode_graph::begin_capture(&self.device.library, stream, &ticket))?;
             let queued=block.enqueue_ffn(binding,rows,projected,stream);
-            let captured=ticket.capture_result(self.device.library.cuda_graph_end_capture_topology(stream));
+            let captured={ let captured = crate::shared::decode_graph::end_capture(&self.device.library, stream, &mut ticket); ticket.capture_result(captured) };
             match (queued,captured) {
                 (Ok(_),Ok((graph,nodes,width,spans,_)))=> {
                     if let Err(error)=self.bank.cache_insert(binding.layer(),weights,rows as u32,graph,ticket,nodes as u64,width,spans) {
@@ -784,7 +784,7 @@ pub(crate) struct BackboneLane<'w, 'a> {
 impl<'w, 'a> BackboneLane<'w, 'a> {
     pub(crate) fn visit_graph_banks(&mut self, f: &mut dyn FnMut(i32, &'static str, bool, &mut dyn crate::shared::decode_graph::CacheAttached) -> Result<()>) -> Result<()> {
         if let Some(graphs) = &mut self.tp2_ffn_graphs {
-            f(graphs.device.id, "tp2_ffn", true, &mut graphs.bank)?;
+            f(graphs.device.id, "tp2_ffn", false, &mut graphs.bank)?;
         }
         if let Some(sparse) = &mut self.sparse { sparse.visit_graph_banks(f)?; }
         if let Some(sparse) = &mut self.dual_sparse { sparse.visit_graph_banks(f)?; }

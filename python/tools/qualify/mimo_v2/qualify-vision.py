@@ -22,6 +22,12 @@ FIELDS = "qkv qkv_bias proj proj_bias gate_up gate_up_bias down down_bias norm1 
 class Block(C.Structure):
     _fields_ = [(k, C.c_uint64) for k in FIELDS] + [("window", C.c_int32), ("column_order", C.c_int32)]
 
+class PerceptionSpec(C.Structure):
+    _fields_ = [(k, C.c_uint32) for k in ("activation", "position_grid", "class_token", "output_kind")]
+    _fields_ += [(k, C.c_uint64) for k in ("ln_pre", "ln_pre_bias", "class_embedding", "class_position",
+        "downsample1", "downsample1_bias", "downsample2", "downsample2_bias")]
+    _fields_ += [(k, C.POINTER(C.c_uint64)) for k in ("scale1", "scale2")]
+
 class Spec(C.Structure):
     _fields_ = [(k, C.c_uint32) for k in ("storage_abi", "abi_version", "max_tokens", "output_width", "reserved")]
     _fields_ += [(k, C.c_uint64) for k in ("weight_bytes", "patch", "merger_norm", "merger_fc1", "merger_fc2", "inv_freq")]
@@ -33,10 +39,11 @@ class Spec(C.Structure):
         "patch_bias", "pos_embed", "merger_norm_bias", "merger_fc1_bias", "merger_fc2_bias")]
     _fields_ += [("merger_extra", C.c_uint64 * 8)]
     _fields_ += [(k, C.POINTER(C.c_uint64)) for k in ("norm1_bias", "norm2_bias", "q_norm", "k_norm")]
+    _fields_ += [("perception", C.POINTER(PerceptionSpec))]
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.storage_abi = 3
+        self.storage_abi = 4
         # Keep every backing allocation alive through required/create. Native
         # registration copies these arrays before the synchronous call returns.
         self._layer_storage = {"blocks": (Block * self.depth)()}

@@ -2253,9 +2253,13 @@ def test_capture_ticket_native_failures_always_report_backoff():
                         path.read_text(), flags=re.MULTILINE | re.DOTALL)
         if ".cache_ticket(" not in source and path.name != "dual.rs":
             continue
-        for native in re.finditer(r"(?:decode_graph::begin_capture|\.cuda_graph_end_capture_topology)\(", source):
+        for native in re.finditer(r"(?:decode_graph::begin_capture|decode_graph::end_capture|\.cuda_graph_end_capture_topology)\(", source):
             prefix = source[max(0, native.start() - 180):native.start()]
-            assert re.search(r"(?:plan\.)?ticket\.capture_result\([^;{}]*$", prefix), path
+            if "decode_graph::end_capture(" in native.group():
+                suffix = source[native.start():native.start() + 280]
+                assert re.search(r"(?:plan\.)?ticket\.capture_result\(captured\)", suffix), path
+            else:
+                assert re.search(r"(?:plan\.)?ticket\.capture_result\([^;{}]*$", prefix), path
             checked += 1
     assert checked >= 44, "the remaining V4.1 capture inventory must stay covered"
     for family, file, api in [

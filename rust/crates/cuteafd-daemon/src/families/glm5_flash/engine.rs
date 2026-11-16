@@ -1824,6 +1824,11 @@ impl<'a> GlmfEngine<'a> {
     pub fn warm_decode_graphs(&self, sequences: usize, speculation: bool) -> Result<bool> {
         if !self.use_graphs { return Ok(false); }
         check_decode_thresholds(&self.buckets, sequences, speculation)?;
+        if !crate::shared::decode_graph::prewarm_enabled() {
+            // Startup is skipped, not graphing: permit first-use runtime tickets.
+            self.graphs_warmed.set(true);
+            return Ok(false);
+        }
         tracing::info!(plain_rows = ?self.buckets.plain, spec_rows = ?self.buckets.spec, decode_rows = self.decode_rows,
             verify_rows = self.verify_rows, "GLM Flash decode buckets pass the projection thresholds");
         let layout = self.graph_layout();
@@ -4663,7 +4668,7 @@ impl<'a> GlmfEngine<'a> {
             return self.masked_segment(segment);
         }
         let pinned = self.graph_pinned(&key);
-        let Some(ticket) =
+        let Some(mut ticket) =
             graphs.borrow_mut().cache_ticket(&key, pinned, None) else {
             return self.masked_segment(segment);
         };
@@ -4679,7 +4684,7 @@ impl<'a> GlmfEngine<'a> {
         // rank 1's routed-layer shared FFN and its publication stay in `peer_segment`'s
         // host wrapper, so eager, captured and replayed steps queue the same pushes.
         let captured = self.masked_segment(&segment);
-        let exec = self.on(rank, || unsafe { self.library.cuda_graph_end_capture_topology(stream) });
+        let exec = self.on(rank, || unsafe { crate::shared::decode_graph::end_capture(&self.library, stream, &mut ticket) });
         if let Err(error) = captured {
             graphs.borrow_mut().cache_ticket_failed(ticket, exec.as_ref().err().unwrap_or(&error));
             if let Ok((raw, _, _, _, _)) = exec {

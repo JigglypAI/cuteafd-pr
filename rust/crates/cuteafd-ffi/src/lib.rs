@@ -40,6 +40,8 @@ pub use shared::v41_experts::{
 pub use shared::rtx_combine::{RtxPartialDtype, RtxTp2Combine};
 pub use shared::expert_usage;
 mod cuda_runtime;
+mod graph_source;
+pub use graph_source::{GraphLaunchQuery, GraphSource, GraphUpdateResult};
 pub mod host_isa;
 pub mod memory_ledger;
 pub mod load_timing;
@@ -562,8 +564,12 @@ pub const CUTEAFD_STATUS_CAPTURE_REQUIRES_PREPARE: CuteafdStatus = 9;
 pub struct SmallGraphCapture { pub nodes: usize }
 
 pub fn is_small_graph(error: &anyhow::Error) -> bool {
-    error.downcast_ref::<SmallGraphCapture>().is_some()
+    error.downcast_ref::<SmallGraphCapture>().is_some() || error.downcast_ref::<GraphCacheEager>().is_some()
 }
+
+#[derive(Debug, thiserror::Error)]
+#[error("graph cache selected eager after source capture")]
+pub struct GraphCacheEager;
 
 pub const CUTEAFD_STATUS_GRAPH_TOO_SMALL: CuteafdStatus = 10;
 pub const CUTEAFD_DEVICE_BUFFER_FLAG_HOST_FALLBACK: u64 = 1;

@@ -277,3 +277,15 @@ fn compact_wave_batch_graph_consumes_local_buffers() -> Result<()> {
     }
     Ok(())
 }
+
+#[test]
+fn sparse_startup_has_keyed_capture_hit_and_census_identity() -> Result<()> {
+    let production = include_str!("../v41_sparse_attention.rs");
+    let insertion = production.split("fn insert_graph(").nth(1).unwrap().split("pub(crate) fn visit_graph_banks").next().unwrap();
+    assert!(insertion.contains("census_capture_device_key(\"sparse_attention\", device, &key, graph)"));
+    assert!(production.contains("self.graphs.cache_ticket(&key"));
+    assert!(production.contains("self.graphs.cached_launch("));
+    crate::shared::decode_graph::census::keyed_site_fixture("sparse_attention", -164_403,
+        (3usize, vec![16usize, 1, 32, 0]),
+        "families::deepseek_v41::v41_sparse_attention::prefix_tests::sparse_startup_has_keyed_capture_hit_and_census_identity")
+}

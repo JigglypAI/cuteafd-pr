@@ -534,3 +534,10 @@ def test_wait_wake_flags_are_wired():
     assert "result['woke'] = 'progress'" in source
     assert "result['woke'] = 'context'" in source
     assert "result['woke'] = 'quiet'" in source
+
+
+def test_agy_pins_carbon_high_unless_model_or_effort_given():
+    meta = {'executable': 'agy', 'cwd': '/w'}
+    assert driver.Agy().command(meta)[-2:] == ['--model', 'gemini-4-carbon-high']
+    assert driver.Agy().command({**meta, 'model': 'gemini-4-argon-high'})[-2:] == ['--model', 'gemini-4-argon-high']
+    assert driver.Agy().command({**meta, 'effort': 'low'})[-2:] == ['--effort', 'low']

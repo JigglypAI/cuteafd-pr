@@ -142,8 +142,8 @@ def test_head72_uses_the_b12x_le128_tile():
 def test_vision_pointer_count_abi_matches_c_rust():
     gate = module("python/tools/qualify/qwen4/qualify-vision.py", "qwen_vision_gate")
     assert ctypes.sizeof(gate.Block) == 96
-    assert ctypes.sizeof(gate.common.Spec) == 256
-    assert ctypes.sizeof(gate.Spec) == 256
+    assert ctypes.sizeof(gate.common.Spec) == 264
+    assert ctypes.sizeof(gate.Spec) == 264
     assert gate.Spec.blocks.offset == 72
     assert gate.Spec.hidden.offset == 80
     assert gate.Spec.patch_bias.offset == 120
@@ -390,7 +390,7 @@ def test_qwen_graph_cache_precedes_ready_and_diagnostics_bypass_capture():
     replay = engine[engine.index("    fn replay(&self, key: GraphKey"):engine.index("    fn miss_graph(")]
     assert "if !self.graph_capture.get() || (!self.graph_warmed.get() && !self.warming_graphs.get()) {" in replay
     assert "if !self.warming_graphs.get() { self.miss_graph(key); }" in replay
-    assert "let Some(ticket) = ticket else {" in replay
+    assert "let Some(mut ticket) = ticket else {" in replay
     assert 'crate::shared::decode_graph::note_eager("qwen4", &variant' in engine
     assert "segment()?;\n            return self.ple_consumed(&key);" in replay
     graphed = engine[engine.index("    fn decode_graphed("):engine.index("    fn replay(")]
@@ -620,7 +620,7 @@ def packed_spec_fields(snapshot, family, placements=None):
     values = []
     layers = ("blocks", "norm1_bias", "norm2_bias", "q_norm", "k_norm")
     for name, _ in spec._fields_:
-        if name in layers or name == "storage_abi":
+        if name in layers or name in ("storage_abi", "perception"):
             continue
         value = getattr(spec, name)
         if name == "norm_eps":
@@ -653,7 +653,8 @@ def test_ctypes_storage_is_owned_at_tower_depth(depth):
     spec.blocks[depth - 1].norm1 = 1234
     spec.q_norm[depth - 1] = gate.common.NO_OFFSET
     gc.collect()
-    assert spec.storage_abi == 3
+    assert spec.storage_abi == 4
+    assert not spec.perception
     assert len(spec._layer_storage["blocks"]) == depth
     assert spec.blocks[depth - 1].norm1 == 1234
     assert spec.q_norm[depth - 1] == gate.common.NO_OFFSET

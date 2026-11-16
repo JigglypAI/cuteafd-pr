@@ -259,7 +259,7 @@ impl<'a> TargetHeadWave<'a, '_> {
             ticket.capture_result(crate::shared::decode_graph::begin_capture(&self.stream.library, self.stream.raw, &ticket))?;
         }
         let launched = unsafe { self.enqueue(rows) };
-        let captured = unsafe { ticket.capture_result(self.stream.library.cuda_graph_end_capture_topology(self.stream.raw)) };
+        let captured = unsafe { let captured = crate::shared::decode_graph::end_capture(&self.stream.library, self.stream.raw, &mut ticket); ticket.capture_result(captured) };
         match (launched, captured) {
             (Ok(()), Ok((graph, nodes, width, spans, _))) => {
                 // SAFETY: warmup drained and the wave owns every captured pointer.

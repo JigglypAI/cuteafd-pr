@@ -6,6 +6,7 @@ mod decode;
 mod exif;
 mod muse;
 pub mod muse_vision;
+pub mod perception_vision;
 mod resize;
 mod spans;
 

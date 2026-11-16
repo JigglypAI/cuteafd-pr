@@ -269,7 +269,7 @@ impl<'w, 'a> AttentionQueryWave<'w, 'a> {
     pub(crate) fn visit_graph_banks(&mut self, f: &mut dyn FnMut(i32, &'static str, bool, &mut dyn CacheAttached) -> Result<()>) -> Result<()> {
         let device = self.input().device_id;
         f(device, "v41.attention.query", false, &mut self.graphs)?;
-        f(device, "v41.attention.query.tp2_prefix", true, &mut self.tp2_prefix_graphs)
+        f(device, "v41.attention.query.tp2_prefix", false, &mut self.tp2_prefix_graphs)
     }
 
     /// Reuse this lane's storage with another layer's weights. Existing output
@@ -459,12 +459,12 @@ impl AttentionQueryWave<'_, '_> {
             ticket.capture_result(crate::shared::decode_graph::begin_capture(&self.storage.stream.library, self.storage.stream.raw, &ticket))?;
         }
         let launched = unsafe { if prefix { self.enqueue_rank(rows) } else { self.enqueue(rows) } };
-        let captured = unsafe { ticket.capture_result(self.storage.stream.library.cuda_graph_end_capture_topology(self.storage.stream.raw)) };
+        let captured = unsafe { let captured = crate::shared::decode_graph::end_capture(&self.storage.stream.library, self.storage.stream.raw, &mut ticket); ticket.capture_result(captured) };
         match (launched, captured) {
             (Ok(()), Ok((graph, nodes, width, spans, _))) => {
                 let graphs = if prefix { &mut self.tp2_prefix_graphs } else { &mut self.graphs };
                 if let Err(error) = unsafe {
-                    graphs.cache_insert(self.weights.layer, self.weights, rows, graph, ticket, nodes as u64, width, spans || prefix)
+                    graphs.cache_insert(self.weights.layer, self.weights, rows, graph, ticket, nodes as u64, width, spans)
                 } {
                     unsafe {
                         self.storage.stream.library.cuda_graph_exec_destroy(graph)?;
@@ -1010,7 +1010,7 @@ mod bounded_graph_tests {
             // captures and this source-inventory test itself.
             let production = source.split("#[cfg(test)]\nmod bounded_graph_tests").next().unwrap();
             assert_eq!(production.matches("decode_graph::begin_capture(").count(), count);
-            assert_eq!(production.matches(".cuda_graph_end_capture_topology(").count(), count);
+            assert_eq!(production.matches("decode_graph::end_capture(").count(), count);
             assert_eq!(production.matches(".cache_ticket(").count(), count);
             assert_eq!(production.matches(".cache_insert(").count(), count);
             assert!(production.contains("fn visit_graph_banks("));

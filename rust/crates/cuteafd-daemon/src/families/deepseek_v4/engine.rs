@@ -1339,7 +1339,7 @@ impl<'a> Engine<'a> {
             return self.on(rank, || unsafe { crate::shared::decode_graph::launch(&self.library, graph.0, stream) });
         }
         let pinned = self.graph_pinned(&key);
-        let ticket = match graphs.borrow_mut().cache_ticket(&key, pinned, None) {
+        let mut ticket = match graphs.borrow_mut().cache_ticket(&key, pinned, None) {
             Some(ticket) => ticket,
             None => {
                 self.graph_eager.set(self.graph_eager.get() + 1);
@@ -1360,7 +1360,7 @@ impl<'a> Engine<'a> {
             return segment();
         }
         let captured = segment();
-        let exec = self.on(rank, || unsafe { self.library.cuda_graph_end_capture_topology(stream) });
+        let exec = self.on(rank, || unsafe { crate::shared::decode_graph::end_capture(&self.library, stream, &mut ticket) });
         if let Err(error) = captured {
             graphs.borrow_mut().cache_ticket_failed(ticket, exec.as_ref().err().unwrap_or(&error));
             if let Ok((raw, _, _, _, _)) = exec { drop(GraphExec(raw, self.library)); }

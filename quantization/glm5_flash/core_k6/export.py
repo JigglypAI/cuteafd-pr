@@ -10,6 +10,8 @@ import re
 import shutil
 import struct
 
+from mc_package import tensor_storage_entry
+
 from kimi_k3.uniform_k2.storage import (assemble_shard, atomic_json, canonical,
                                        fsync_directory, read_header, verify_receipt)
 from .recipe import (BASE_REPO, BASE_REVISION, BASE_PAYLOAD_BYTES, BASE_TENSOR_COUNT,
@@ -339,11 +341,10 @@ def finalize_export(source, selection, head_replacements, export, identity, evid
         raise ValueError("final export tensor/payload inventory differs")
     tensor_storage = {}
     for module, geometry in selection.items():
-        tensor_storage[module] = dict(quant_format="exl3", bits_per_weight=geometry["bits"],
-            mcg_multiplier=MCG_MULTIPLIER, in_features=geometry["in_features"],
-            out_features=geometry["out_features"], stored_out_features=geometry["stored_out_features"],
-            stored_tensors={name: dict(shape=shape, torch_dtype=_DTYPES[dtype])
-                            for name, (dtype, shape) in packed_specs(module, geometry).items()})
+        tensor_storage[module] = tensor_storage_entry(geometry,
+            {name: dict(shape=shape, torch_dtype=_DTYPES[dtype])
+             for name, (dtype, shape) in packed_specs(module, geometry).items()},
+            mcg_multiplier=MCG_MULTIPLIER)
     declaration = dict(quant_method="exl3", format="exl3", checkpoint_format="exl3",
         bits=4., core_bits=6., mtp_bits=4., head_bits=6.,
         per_module_metadata="quantize_config.json:tensor_storage")

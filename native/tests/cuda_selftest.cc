@@ -8,13 +8,19 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#ifdef NDEBUG
+#undef NDEBUG
+#endif
 #include <cassert>
 #include <cmath>
+#include <chrono>
 #include <cstring>
 #include <iostream>
 #include <numeric>
 #include <unordered_map>
 #include <vector>
+
+extern "C" const void* cuteafd_test_graph_spin_kernel();
 
 namespace {
 
@@ -2637,6 +2643,7 @@ void test_cuda_graph_topology_chain_and_fork() {
       require_cuda(cudaEventRecord(join, peer), "topology join record");
     }
     require_cuda(cudaMemsetAsync(buffer.ptr, 2, sizeof(uint32_t), lead), "topology lead node");
+    require_cuda(cudaMemsetAsync(buffer.ptr, 3, sizeof(uint32_t), lead), "topology third node");
     if (parallel) require_cuda(cudaStreamWaitEvent(lead, join, 0), "topology join wait");
     void* exec = nullptr;
     size_t nodes = 0, width = 0;
@@ -2656,6 +2663,192 @@ void test_cuda_graph_topology_chain_and_fork() {
   require_cuda(cudaStreamDestroy(peer), "topology peer destroy");
   require_cuda(cudaStreamDestroy(lead), "topology lead destroy");
   free_buffer(&buffer);
+}
+
+void test_cuda_graph_inflight_update_measurement() {
+  using Clock = std::chrono::steady_clock;
+  auto us = [](auto start) { return std::chrono::duration<double, std::micro>(Clock::now() - start).count(); };
+  cudaStream_t streams[2];
+  for (auto& stream : streams) require_cuda(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), "update probe stream");
+  auto output = device_buffer(2 * sizeof(uint32_t));
+  auto stamps = device_buffer(4 * sizeof(uint64_t));
+  uint64_t duration = 8'000'000;
+  auto* output0 = static_cast<uint32_t*>(output.ptr);
+  auto* output1 = output0 + 1;
+  auto* time0 = static_cast<uint64_t*>(stamps.ptr);
+  auto* time1 = time0 + 2;
+  uint32_t old_value = 17, new_value = 29;
+  auto params = [&](void** args) {
+    cudaKernelNodeParams node{};
+    node.func = const_cast<void*>(cuteafd_test_graph_spin_kernel());
+    node.gridDim = dim3(1); node.blockDim = dim3(1); node.kernelParams = args;
+    return node;
+  };
+  for (bool set_params : {false, true}) {
+    std::vector<double> host;
+    for (int trial = -1; trial < 8; ++trial) {
+      cudaGraph_t first = nullptr, second = nullptr;
+      cudaGraphNode_t old_node = nullptr, new_node = nullptr;
+      require_cuda(cudaGraphCreate(&first, 0), "update probe first graph");
+      require_cuda(cudaGraphCreate(&second, 0), "update probe second graph");
+      void* old_args[] = {&duration, &output0, &old_value, &time0};
+      void* new_args[] = {&duration, &output1, &new_value, &time1};
+      auto old_params = params(old_args), new_params = params(new_args);
+      require_cuda(cudaGraphAddKernelNode(&old_node, first, nullptr, 0, &old_params), "update probe old node");
+      require_cuda(cudaGraphAddKernelNode(&new_node, second, nullptr, 0, &new_params), "update probe new node");
+      cudaGraphExec_t exec = nullptr;
+      require_cuda(cudaGraphInstantiate(&exec, first, 0), "update probe instantiate");
+      require_cuda(cudaGraphUpload(exec, streams[0]), "update probe upload");
+      require_cuda(cudaStreamSynchronize(streams[0]), "update probe upload complete");
+      require_cuda(cudaMemset(output.ptr, 0, output.bytes), "update probe clear");
+      require_cuda(cudaGraphLaunch(exec, streams[0]), "update probe old launch");
+      cudaEvent_t pending = nullptr;
+      require_cuda(cudaEventCreateWithFlags(&pending, cudaEventDisableTiming), "update probe pending event");
+      require_cuda(cudaEventRecord(pending, streams[0]), "update probe pending record");
+      assert(cudaEventQuery(pending) == cudaErrorNotReady);
+      const auto start = Clock::now();
+      if (set_params) {
+        require_cuda(cudaGraphExecKernelNodeSetParams(exec, old_node, &new_params), "update probe set params");
+      } else {
+        cudaGraphExecUpdateResultInfo result{};
+        require_cuda(cudaGraphExecUpdate(exec, second, &result), "update probe update");
+        assert(result.result == cudaGraphExecUpdateSuccess);
+      }
+      const double update_us = us(start);
+      require_cuda(cudaGraphLaunch(exec, streams[1]), "update probe new launch");
+      for (auto stream : streams) require_cuda(cudaStreamSynchronize(stream), "update probe completion");
+      const auto values = copy_d2h<uint32_t>(output, 2);
+      const auto times = copy_d2h<uint64_t>(stamps, 4);
+      assert(values[0] == old_value && values[1] == new_value);
+      assert(times[2] >= times[1]);
+      if (trial >= 0) {
+        host.push_back(update_us);
+        std::cout << "{\"sample\":\"graph_inflight_update\",\"api\":\"" << (set_params ? "kernel_set_params" : "exec_update")
+            << "\",\"trial\":" << trial << ",\"host_us\":" << update_us
+            << ",\"first_kernel_us\":" << (times[1]-times[0])/1000.0
+            << ",\"second_start_after_first_end_us\":" << (times[2]-times[1])/1000.0
+            << ",\"correct\":true,\"ordered_two_streams\":true}\n";
+      }
+      require_cuda(cudaEventDestroy(pending), "update probe pending destroy");
+      require_cuda(cudaGraphExecDestroy(exec), "update probe exec destroy");
+      require_cuda(cudaGraphDestroy(first), "update probe first destroy");
+      require_cuda(cudaGraphDestroy(second), "update probe second destroy");
+    }
+    std::sort(host.begin(), host.end());
+    std::cout << "{\"sample\":\"graph_inflight_update_summary\",\"api\":\"" << (set_params ? "kernel_set_params" : "exec_update")
+        << "\",\"median_us\":" << (host[3]+host[4])/2 << ",\"max_us\":" << host.back() << "}\n";
+  }
+  // A real V4.1 reduction kernel repeated to the census segment's node band.
+  constexpr size_t count = 5120, bytes = count * sizeof(uint16_t);
+  auto input = device_buffer(bytes), result = device_buffer(bytes);
+  require_cuda(cudaMemset(input.ptr, 0, bytes), "update cost input");
+  const uint16_t* planes[8] = {static_cast<const uint16_t*>(input.ptr)};
+  auto segment = [&] {
+    for (int node = 0; node < 48; ++node)
+      require_cuda(static_cast<cudaError_t>(cuteafd_reduce_compact_bf16_eight_planes_async(planes, nullptr,
+          static_cast<uint16_t*>(result.ptr), 1, 1, streams[0])), "update cost reduction");
+  };
+  segment(); require_cuda(cudaStreamSynchronize(streams[0]), "update cost warmup");
+  cudaGraph_t source = nullptr;
+  require_cuda(cudaStreamBeginCapture(streams[0], cudaStreamCaptureModeThreadLocal), "update cost begin");
+  segment(); require_cuda(cudaStreamEndCapture(streams[0], &source), "update cost end");
+  cudaGraphExec_t exec = nullptr;
+  require_cuda(cudaGraphInstantiate(&exec, source, 0), "update cost instantiate");
+  require_cuda(cudaGraphUpload(exec, streams[0]), "update cost upload");
+  require_cuda(cudaStreamSynchronize(streams[0]), "update cost ready");
+  constexpr int repeats = 10'000;
+  for (bool update : {false, true}) {
+    double host_total_us = 0;
+    const auto batch_start = Clock::now();
+    for (int batch = 0; batch < repeats / 8; ++batch) {
+      const auto start = Clock::now();
+      for (int n = 0; n < 8; ++n) {
+        if (update) {
+          cudaGraphExecUpdateResultInfo info{};
+          require_cuda(cudaGraphExecUpdate(exec, source, &info), "update cost update");
+          assert(info.result == cudaGraphExecUpdateSuccess);
+        }
+        require_cuda(cudaGraphLaunch(exec, streams[0]), "update cost launch");
+      }
+      host_total_us += us(start);
+      // Drain outside the host API timer, before submission queue backpressure.
+      require_cuda(cudaStreamSynchronize(streams[0]), "update cost batch drain");
+    }
+    size_t nodes = 0;
+    require_cuda(cudaGraphGetNodes(source, nullptr, &nodes), "update cost node count");
+    std::cout << "{\"sample\":\"graph_update_launch_cost\",\"update\":" << (update ? "true" : "false")
+        << ",\"nodes\":" << nodes << ",\"repeats\":" << repeats
+        << ",\"batch\":8,\"host_us_per_launch\":" << host_total_us / repeats
+        << ",\"including_drains_us_per_launch\":" << us(batch_start) / repeats << "}\n";
+  }
+  int driver = 0, runtime = 0; cudaDeviceProp properties{};
+  require_cuda(cudaDriverGetVersion(&driver), "update probe driver");
+  require_cuda(cudaRuntimeGetVersion(&runtime), "update probe runtime");
+  require_cuda(cudaGetDeviceProperties(&properties, 0), "update probe device");
+  std::cout << "{\"sample\":\"graph_update_environment\",\"driver\":" << driver << ",\"runtime\":" << runtime
+      << ",\"sm\":" << properties.major*10+properties.minor << ",\"device\":\"" << properties.name << "\"}\n";
+  require_cuda(cudaGraphExecDestroy(exec), "update cost destroy exec");
+  require_cuda(cudaGraphDestroy(source), "update cost destroy source");
+  for (auto stream : streams) require_cuda(cudaStreamDestroy(stream), "update probe stream destroy");
+  free_buffer(&input); free_buffer(&result); free_buffer(&output); free_buffer(&stamps);
+}
+
+void test_cuda_graph_source_transfer_rewrites_all_kernel_pointers() {
+  constexpr size_t count = 5120, bytes = count * sizeof(uint16_t);
+  auto old_input = device_buffer(bytes), old_output = device_buffer(bytes);
+  auto new_input = device_buffer(bytes), new_output = device_buffer(bytes);
+  std::vector<uint16_t> values(count, 0x3f80);
+  copy_h2d(old_input, values);
+  std::fill(values.begin(), values.end(), 0x4000);
+  copy_h2d(new_input, values);
+  cudaStream_t stream = nullptr;
+  require_cuda(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), "transfer stream");
+  auto record = [&](cuteafd_device_buffer_t input, cuteafd_device_buffer_t output) {
+    const uint16_t* planes[8] = {static_cast<const uint16_t*>(input.ptr)};
+    for (int n = 0; n < 3; ++n)
+      require_cuda(static_cast<cudaError_t>(cuteafd_reduce_compact_bf16_eight_planes_async(planes, nullptr,
+          static_cast<uint16_t*>(output.ptr), 1, 1, stream)), "transfer kernel");
+  };
+  record(old_input, old_output);
+  record(new_input, new_output);
+  require_cuda(cudaStreamSynchronize(stream), "transfer warmup");
+  size_t nodes = 0, width = 0, words = 0;
+  int spans = 0;
+  const uint64_t* signature = nullptr;
+  void *first = nullptr, *second = nullptr, *donor = nullptr, *receiver = nullptr;
+  require_status(cuteafd_cuda_graph_begin_capture(stream), "transfer first begin");
+  record(old_input, old_output);
+  require_status(cuteafd_cuda_graph_capture_source(stream, &first, &nodes, &width, &spans, &signature, &words), "transfer first source");
+  assert(nodes == 3 && words != 0);
+  const std::vector<uint64_t> expected(signature, signature + words);
+  require_status(cuteafd_cuda_graph_source_instantiate(first, stream, &donor), "transfer instantiate");
+  require_cuda(cudaStreamSynchronize(stream), "transfer upload complete");
+  require_status(cuteafd_cuda_graph_begin_capture(stream), "transfer second begin");
+  record(new_input, new_output);
+  require_status(cuteafd_cuda_graph_capture_source(stream, &second, &nodes, &width, &spans, &signature, &words), "transfer second source");
+  assert(expected == std::vector<uint64_t>(signature, signature + words));
+  int status = -1, result = -1;
+  require_status(cuteafd_cuda_graph_source_update(second, donor, &status, &result), "transfer update");
+  assert(status == cudaSuccess && result == cudaGraphExecUpdateSuccess);
+  require_status(cuteafd_cuda_graph_source_transfer(second, donor, &receiver), "transfer owner");
+  require_status(cuteafd_cuda_graph_source_destroy(first), "transfer first destroy");
+  require_status(cuteafd_cuda_graph_source_destroy(second), "transfer second destroy");
+  require_status(cuteafd_cuda_graph_exec_destroy(donor), "transfer old handle destroy");
+  free_buffer(&old_input);
+  free_buffer(&old_output);
+  require_cuda(cudaMemset(new_output.ptr, 0, bytes), "transfer reset new output");
+  require_status(cuteafd_cuda_graph_launch(receiver, stream), "transfer launch new owner");
+  require_cuda(cudaStreamSynchronize(stream), "transfer completion");
+  assert(copy_d2h<uint16_t>(new_output, count) == values);
+  require_status(cuteafd_cuda_graph_exec_destroy(receiver), "transfer receiver destroy");
+  // Non-kernel nodes must never expose a transferable topology signature.
+  require_status(cuteafd_cuda_graph_begin_capture(stream), "transfer nonkernel begin");
+  for (int n = 0; n < 3; ++n) require_cuda(cudaMemsetAsync(new_output.ptr, n, bytes, stream), "transfer memset");
+  require_status(cuteafd_cuda_graph_capture_source(stream, &first, &nodes, &width, &spans, &signature, &words), "transfer nonkernel source");
+  assert(words == 0);
+  require_status(cuteafd_cuda_graph_source_destroy(first), "transfer nonkernel destroy");
+  require_cuda(cudaStreamDestroy(stream), "transfer stream destroy");
+  free_buffer(&new_input); free_buffer(&new_output);
 }
 
 void test_cuda_graph_programmatic_edges_and_diagnostic_recovery() {
@@ -3123,10 +3316,21 @@ int main(int argc, char** argv) {
     test_cuda_graph_peer_attribution();
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--graph-transfer-only") == 0) {
+    test_cuda_graph_source_transfer_rewrites_all_kernel_pointers();
+    std::cout << "test result: ok. 1 passed; 0 failed\n";
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--graph-update-probe-only") == 0) {
+    test_cuda_graph_inflight_update_measurement();
+    std::cout << "test result: ok. 3 passed; 0 failed\n";
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--graph-topology-only") == 0) {
     test_cuda_graph_topology_chain_and_fork();
     test_cuda_graph_programmatic_edges_and_diagnostic_recovery();
-    std::cout << "test result: ok. 3 passed; 0 failed\n";
+    test_cuda_graph_source_transfer_rewrites_all_kernel_pointers();
+    std::cout << "test result: ok. 4 passed; 0 failed\n";
     return 0;
   }
   test_peer_copy_optional_query_failure_is_recoverable();
@@ -3179,6 +3383,7 @@ int main(int argc, char** argv) {
   test_cuda_mla_kv_mxfp4_pack_roundtrip_matches_representable_values();
   test_cuda_graph_topology_chain_and_fork();
   test_cuda_graph_programmatic_edges_and_diagnostic_recovery();
+  test_cuda_graph_source_transfer_rewrites_all_kernel_pointers();
   test_cuda_graph_replay_matches_uncaptured();
   test_cuda_graph_bf16_replay_matches_uncaptured();
   test_nvfp4_pack_unpack_or_skip_with_reason();

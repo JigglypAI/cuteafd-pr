@@ -9,6 +9,7 @@
 #include "rdma_traffic_class.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cerrno>
 #include <chrono>
@@ -18,8 +19,10 @@
 #include <cstring>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <new>
 #include <string>
+#include <thread>
 #include <vector>
 #include <unordered_map>
 
@@ -1818,6 +1821,204 @@ extern "C" cuteafd_status_t cuteafd_cuda_graph_end_capture_topology(
 #endif
 }
 
+#if CUTEAFD_NATIVE_ENABLE_CUDA
+namespace {
+struct GraphHandle {
+  cudaGraphExec_t exec = nullptr;
+  std::atomic<uint64_t> launches{0};
+  const std::thread::id executor = std::this_thread::get_id();
+};
+// GraphOwner pins the handle through every synchronous launch. All mutation of
+// one executable is on its owning executor (both V4.1 lanes are polled there).
+// Telemetry may run elsewhere, but only reads the atomic counter under the
+// registry mutex. The registry protects lookup/lifetime on rare paths, not replay.
+bool graph_executor(const GraphHandle& handle) {
+  return handle.executor == std::this_thread::get_id();
+}
+std::mutex graph_handles_mutex;
+std::unordered_map<void*, std::unique_ptr<GraphHandle>> graph_handles;
+void* own_graph_exec(cudaGraphExec_t exec) {
+  auto handle = std::make_unique<GraphHandle>();
+  handle->exec = exec;
+  void* key = reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(handle.get()) | uintptr_t(1));
+  graph_handles.emplace(key, std::move(handle));
+  return key;
+}
+struct GraphSource {
+  cudaGraph_t graph = nullptr;
+  std::vector<uint64_t> signature;
+  ~GraphSource() { if (graph) cuteafd::diagnostic_cuda(cudaGraphDestroy(graph)); }
+};
+// Exact census signature: ordered node kinds/function identities and sorted,
+// annotated edges. Only kernels can transfer: updating every kernel parameter
+// replaces every captured pointer, with no host/allocation/memcpy state retained.
+std::vector<uint64_t> transferable_signature(cudaGraph_t graph, size_t count) {
+  std::vector<cudaGraphNode_t> nodes(count);
+  if (cuteafd::diagnostic_cuda(cudaGraphGetNodes(graph, nodes.data(), &count)) != cudaSuccess) return {};
+  std::vector<uint64_t> signature{count};
+  std::unordered_map<cudaGraphNode_t, size_t> indices;
+  for (size_t n = 0; n < count; ++n) {
+    cudaGraphNodeType kind;
+    if (cuteafd::diagnostic_cuda(cudaGraphNodeGetType(nodes[n], &kind)) != cudaSuccess ||
+        kind != cudaGraphNodeTypeKernel) return {};
+    CUDA_KERNEL_NODE_PARAMS params{};
+    if (cuGraphKernelNodeGetParams(reinterpret_cast<CUgraphNode>(nodes[n]), &params) != CUDA_SUCCESS ||
+        !params.func) return {};
+    signature.push_back(static_cast<uint64_t>(kind));
+    signature.push_back(reinterpret_cast<uintptr_t>(params.func));
+    indices[nodes[n]] = n;
+  }
+  size_t capacity = std::max(size_t(1), count);
+  if (capacity > std::numeric_limits<size_t>::max() / 64) return {};
+  const size_t cap = capacity * 64;
+  std::vector<cudaGraphNode_t> from, to;
+  std::vector<cudaGraphEdgeData> data;
+  size_t edges;
+  for (;;) {
+    from.resize(capacity); to.resize(capacity); data.resize(capacity);
+    edges = capacity;
+    if (cuteafd::diagnostic_cuda(cudaGraphGetEdges(graph, from.data(), to.data(), data.data(), &edges)) != cudaSuccess) return {};
+    if (edges < capacity) break;
+    if (capacity == cap) return {};
+    capacity = std::min(cap, capacity * 2);
+  }
+  std::vector<std::array<uint64_t, 5>> ordered;
+  for (size_t e = 0; e < edges; ++e) {
+    if (!indices.count(from[e]) || !indices.count(to[e])) return {};
+    ordered.push_back({indices[from[e]], indices[to[e]], data[e].from_port, data[e].to_port, data[e].type});
+  }
+  std::sort(ordered.begin(), ordered.end());
+  signature.push_back(edges);
+  for (const auto& edge : ordered) signature.insert(signature.end(), edge.begin(), edge.end());
+  return signature;
+}
+}
+#endif
+
+extern "C" cuteafd_status_t cuteafd_cuda_graph_capture_source(void* stream, void** source,
+    size_t* nodes, size_t* width, int* spans, const uint64_t** signature, size_t* words) {
+  if (!source || !nodes || !width || !spans || !signature || !words)
+    return fail(CUTEAFD_STATUS_INVALID_ARGUMENT, "null graph source output");
+  *source = nullptr; *nodes = *width = *words = 0; *spans = 0; *signature = nullptr;
+#if CUTEAFD_NATIVE_ENABLE_CUDA
+  auto captured = std::make_unique<GraphSource>();
+  auto err = cuteafd::diagnostic_cuda(cudaStreamEndCapture(reinterpret_cast<cudaStream_t>(stream), &captured->graph));
+  if (err != cudaSuccess) return fail_cuda(CUTEAFD_STATUS_INTERNAL_ERROR, "cudaStreamEndCapture failed", err);
+  if (!captured->graph) return fail(CUTEAFD_STATUS_INTERNAL_ERROR, "null captured source");
+  err = cuteafd::diagnostic_cuda(cudaGraphGetNodes(captured->graph, nullptr, nodes));
+  if (err != cudaSuccess) return fail_cuda(CUTEAFD_STATUS_INTERNAL_ERROR, "source graph nodes", err);
+  if (*nodes <= 2) return CUTEAFD_STATUS_GRAPH_TOO_SMALL;
+  const auto inspection = cuteafd::inspect_graph_topology(captured->graph, nodes, width, spans);
+  if (inspection != cudaSuccess) *width = 0;
+  captured->signature = transferable_signature(captured->graph, *nodes);
+  *signature = captured->signature.data(); *words = captured->signature.size();
+  *source = captured.release();
+  if (inspection != cudaSuccess) {
+    (void)fail_cuda(CUTEAFD_STATUS_INTERNAL_ERROR, "source graph topology inspection", inspection);
+    return CUTEAFD_STATUS_OK;  // Source is valid; callers decide whether to retain unknown topology.
+  }
+  return ok();
+#else
+  return fail(CUTEAFD_STATUS_CUDA_UNAVAILABLE, "CUDA graph source unavailable");
+#endif
+}
+
+extern "C" cuteafd_status_t cuteafd_cuda_graph_source_instantiate(void* source, void* stream, void** exec) {
+  if (!source || !exec) return fail(CUTEAFD_STATUS_INVALID_ARGUMENT, "null graph instantiate input");
+  *exec = nullptr;
+#if CUTEAFD_NATIVE_ENABLE_CUDA
+  auto graph = static_cast<GraphSource*>(source)->graph;
+  cudaGraphExec_t target = nullptr;
+  size_t before = 0, after = 0, total = 0;
+  const bool census = graph_census_enabled();
+  const auto before_status = census ? cuteafd::diagnostic_cuda(cudaMemGetInfo(&before, &total)) : cudaSuccess;
+  auto err = CUTEAFD_CHECK_MEMORY("cudaGraphInstantiate", "cuda", cudaGraphInstantiate(&target, graph, 0), 0, 0, graph);
+  const auto after_status = census ? cuteafd::diagnostic_cuda(cudaMemGetInfo(&after, &total)) : cudaSuccess;
+  if (err == cudaSuccess) err = cuteafd::diagnostic_cuda(cudaGraphUpload(target, reinterpret_cast<cudaStream_t>(stream)));
+  if (err != cudaSuccess) {
+    if (target) cuteafd::diagnostic_cuda(cudaGraphExecDestroy(target));
+    return fail_cuda(err == cudaErrorMemoryAllocation ? CUTEAFD_STATUS_ALLOCATION_FAILED : CUTEAFD_STATUS_INTERNAL_ERROR,
+        "source graph instantiate/upload", cuteafd::diagnostic_cuda(err));
+  }
+  std::lock_guard<std::mutex> guard(graph_handles_mutex);
+  *exec = own_graph_exec(target);
+  if (census) record_graph_census(graph, reinterpret_cast<cudaGraphExec_t>(*exec), before_status, before, after_status, after);
+  return ok();
+#else
+  return fail(CUTEAFD_STATUS_CUDA_UNAVAILABLE, "CUDA graph instantiate unavailable");
+#endif
+}
+
+extern "C" cuteafd_status_t cuteafd_cuda_graph_source_update(void* source, void* exec,
+    int* cuda_status, int* update_result) {
+  if (!source || !exec || !cuda_status || !update_result)
+    return fail(CUTEAFD_STATUS_INVALID_ARGUMENT, "null graph source update input");
+#if CUTEAFD_NATIVE_ENABLE_CUDA
+  std::lock_guard<std::mutex> guard(graph_handles_mutex);
+  const auto found = graph_handles.find(exec);
+  if (found == graph_handles.end() || !found->second->exec)
+    return fail(CUTEAFD_STATUS_INVALID_ARGUMENT, "invalid donor executable");
+  if (!graph_executor(*found->second))
+    return fail(CUTEAFD_STATUS_INVALID_ARGUMENT, "graph update must run on its owning executor thread");
+  cudaGraphExecUpdateResultInfo result{};
+  const auto status = cudaGraphExecUpdate(found->second->exec, static_cast<GraphSource*>(source)->graph, &result);
+  *cuda_status = static_cast<int>(cuteafd::diagnostic_cuda(status));
+  *update_result = static_cast<int>(result.result);
+  return ok();
+#else
+  return fail(CUTEAFD_STATUS_CUDA_UNAVAILABLE, "CUDA graph source update unavailable");
+#endif
+}
+
+extern "C" cuteafd_status_t cuteafd_cuda_graph_source_transfer(void* source, void* donor, void** out) {
+#if CUTEAFD_NATIVE_ENABLE_CUDA
+  if (!source || !out) return fail(CUTEAFD_STATUS_INVALID_ARGUMENT, "null transfer input");
+  std::lock_guard<std::mutex> guard(graph_handles_mutex);
+  const auto found = graph_handles.find(donor);
+  if (found == graph_handles.end() || !found->second->exec)
+    return fail(CUTEAFD_STATUS_INVALID_ARGUMENT, "invalid transfer donor");
+  if (!graph_executor(*found->second))
+    return fail(CUTEAFD_STATUS_INVALID_ARGUMENT, "graph transfer must run on its owning executor thread");
+  auto exec = found->second->exec;
+  found->second->exec = nullptr;
+  *out = own_graph_exec(exec);
+  if (graph_census_enabled()) record_graph_census(static_cast<GraphSource*>(source)->graph,
+      reinterpret_cast<cudaGraphExec_t>(*out), cudaSuccess, 0, cudaSuccess, 0);
+  return ok();
+#else
+  return fail(CUTEAFD_STATUS_CUDA_UNAVAILABLE, "CUDA graph transfer unavailable");
+#endif
+}
+
+extern "C" cuteafd_status_t cuteafd_cuda_graph_exec_invalidate(void* donor) {
+#if CUTEAFD_NATIVE_ENABLE_CUDA
+  cudaGraphExec_t target = nullptr;
+  {
+    std::lock_guard<std::mutex> guard(graph_handles_mutex);
+    const auto found = graph_handles.find(donor);
+    if (found == graph_handles.end() || !found->second->exec) return ok();
+    if (!graph_executor(*found->second))
+      return fail(CUTEAFD_STATUS_INVALID_ARGUMENT, "graph invalidation must run on its owning executor thread");
+    target = found->second->exec;
+    found->second->exec = nullptr;
+  }
+  const auto status = cuteafd::diagnostic_cuda(cudaGraphExecDestroy(target));
+  if (status != cudaSuccess) return fail_cuda(CUTEAFD_STATUS_INTERNAL_ERROR, "invalidate donor", status);
+  return ok();
+#else
+  return fail(CUTEAFD_STATUS_CUDA_UNAVAILABLE, "CUDA graph invalidation unavailable");
+#endif
+}
+
+extern "C" cuteafd_status_t cuteafd_cuda_graph_source_destroy(void* source) {
+#if CUTEAFD_NATIVE_ENABLE_CUDA
+  delete static_cast<GraphSource*>(source);
+  return ok();
+#else
+  return fail(CUTEAFD_STATUS_CUDA_UNAVAILABLE, "CUDA graph source destroy unavailable");
+#endif
+}
+
 extern "C" cuteafd_status_t cuteafd_cuda_graph_end_capture_retained(
     void* cuda_stream, cuteafd_cuda_graph_capture_info_t* out) {
   return end_capture_retained(cuda_stream, out, false);
@@ -1930,15 +2131,43 @@ extern "C" cuteafd_status_t cuteafd_cuda_graph_launch(void* cuda_graph_exec, voi
     return fail(CUTEAFD_STATUS_INVALID_ARGUMENT, "CUDA graph launch stream is null");
   }
 #if CUTEAFD_NATIVE_ENABLE_CUDA
-  cudaError_t err = cudaGraphLaunch(reinterpret_cast<cudaGraphExec_t>(cuda_graph_exec),
+  // The caller retains GraphOwner until submission returns. A transferred old
+  // owner retains its own tombstone, so stale generations fail without a map
+  // lookup and cannot name the receiver's new executable.
+  GraphHandle* counted = nullptr;
+  auto target = reinterpret_cast<cudaGraphExec_t>(cuda_graph_exec);
+  if (reinterpret_cast<uintptr_t>(cuda_graph_exec) & uintptr_t(1)) {
+    counted = reinterpret_cast<GraphHandle*>(reinterpret_cast<uintptr_t>(cuda_graph_exec) & ~uintptr_t(1));
+    if (!graph_executor(*counted))
+      return fail(CUTEAFD_STATUS_INVALID_ARGUMENT, "graph launch must run on its owning executor thread");
+    target = counted->exec;
+    if (!target) return fail(CUTEAFD_STATUS_INVALID_ARGUMENT, "stale transferred graph handle");
+  }
+  cudaError_t err = cudaGraphLaunch(target,
                                     reinterpret_cast<cudaStream_t>(cuda_stream));
   if (err != cudaSuccess) {
     return fail_cuda(CUTEAFD_STATUS_INTERNAL_ERROR, "cudaGraphLaunch failed", err);
   }
+  if (counted) counted->launches.fetch_add(1, std::memory_order_relaxed);
   return ok();
 #else
   return fail(CUTEAFD_STATUS_CUDA_UNAVAILABLE,
               "CUDA graph launch is unavailable in this build");
+#endif
+}
+
+// The serving executor serializes launch, snapshot and retirement on its host
+// thread. This is a host counter read only: no device query or synchronization.
+extern "C" cuteafd_status_t cuteafd_cuda_graph_launch_count(void* exec, uint64_t* out) {
+  if (!out) return fail(CUTEAFD_STATUS_INVALID_ARGUMENT, "null graph launch count");
+#if CUTEAFD_NATIVE_ENABLE_CUDA
+  std::lock_guard<std::mutex> guard(graph_handles_mutex);
+  const auto found = graph_handles.find(exec);
+  if (found == graph_handles.end()) return fail(CUTEAFD_STATUS_INVALID_ARGUMENT, "unknown graph handle");
+  *out = found->second->launches.load(std::memory_order_relaxed);
+  return ok();
+#else
+  return fail(CUTEAFD_STATUS_CUDA_UNAVAILABLE, "graph launch count unavailable");
 #endif
 }
 
@@ -1996,7 +2225,21 @@ extern "C" cuteafd_status_t cuteafd_cuda_graph_exec_destroy(void* cuda_graph_exe
     return ok();
   }
 #if CUTEAFD_NATIVE_ENABLE_CUDA
-  cudaError_t err = cudaGraphExecDestroy(reinterpret_cast<cudaGraphExec_t>(cuda_graph_exec));
+  auto target = reinterpret_cast<cudaGraphExec_t>(cuda_graph_exec);
+  {
+    std::lock_guard<std::mutex> guard(graph_handles_mutex);
+    const auto handle = graph_handles.find(cuda_graph_exec);
+    if (handle != graph_handles.end()) {
+      if (!graph_executor(*handle->second))
+        return fail(CUTEAFD_STATUS_INVALID_ARGUMENT, "graph destruction must run on its owning executor thread");
+      target = handle->second->exec;
+      graph_handles.erase(handle);
+      if (!target) return ok();
+    } else if (reinterpret_cast<uintptr_t>(cuda_graph_exec) & uintptr_t(1)) {
+      return fail(CUTEAFD_STATUS_INVALID_ARGUMENT, "unknown graph handle");
+    }
+  }
+  cudaError_t err = cudaGraphExecDestroy(target);
   if (err != cudaSuccess) {
     return fail_cuda(CUTEAFD_STATUS_INTERNAL_ERROR, "cudaGraphExecDestroy failed", err);
   }

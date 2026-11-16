@@ -712,7 +712,7 @@ impl WindowWave<'_, '_> {
                 super::graph_policy::pinned_shape(self.storage.input.buffer.device_id, row as u32), None) else { continue };
             unsafe { ticket.capture_result(crate::shared::decode_graph::begin_capture(&library, stream, &ticket))?; }
             let queued = unsafe { self.enqueue(row) };
-            let captured = unsafe { ticket.capture_result(library.cuda_graph_end_capture_topology(stream)) };
+            let captured = unsafe { let captured = crate::shared::decode_graph::end_capture(&library, stream, &mut ticket); ticket.capture_result(captured) };
             match (queued, captured) {
                 (Ok(()), Ok((graph, nodes, width, spans, _))) => self.insert_graph(row, state.owner, graph, ticket, nodes as u64, width, spans)?,
                 (Err(error), Ok((graph, ..))) => {
@@ -775,7 +775,7 @@ impl WindowWave<'_, '_> {
             if let Some(mut ticket) = ticket {
                 unsafe { ticket.capture_result(crate::shared::decode_graph::begin_capture(&self.stream().library, self.stream().raw, &ticket))?; }
                 let queued = unsafe { self.enqueue(prepared.rows) };
-                let captured = unsafe { ticket.capture_result(self.stream().library.cuda_graph_end_capture_topology(self.stream().raw)) };
+                let captured = unsafe { let captured = crate::shared::decode_graph::end_capture(&self.stream().library, self.stream().raw, &mut ticket); ticket.capture_result(captured) };
                 match (queued, captured) {
                     (Ok(()), Ok((graph, nodes, width, spans, _))) => {
                         self.insert_graph(prepared.rows, state.owner, graph, ticket, nodes as u64, width, spans)?;
@@ -896,7 +896,7 @@ impl WindowWave<'_, '_> {
             ticket.capture_result(crate::shared::decode_graph::begin_capture(&self.stream().library, self.stream().raw, &ticket))?;
         }
         let launched = unsafe { self.enqueue(p.rows) };
-        let captured = unsafe { ticket.capture_result(self.stream().library.cuda_graph_end_capture_topology(self.stream().raw)) };
+        let captured = unsafe { let captured = crate::shared::decode_graph::end_capture(&self.stream().library, self.stream().raw, &mut ticket); ticket.capture_result(captured) };
         match (launched, captured) {
             (Ok(()), Ok((g, nodes, width, spans, _))) => self.insert_graph(p.rows, state.owner, g, ticket, nodes as u64, width, spans)?,
             (Err(e), Ok((g, ..))) => {

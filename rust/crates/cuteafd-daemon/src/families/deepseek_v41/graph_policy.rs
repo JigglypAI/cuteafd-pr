@@ -1,5 +1,6 @@
 //! Captured shapes per backbone layer, sharing the containing lane's buffers.
 use anyhow::{ensure, Result};
+mod spanning;
 
 pub(super) const MAX_DECODE_ROWS: u32 = cuteafd_core::V41_VERIFY_ROWS as u32;
 
@@ -105,7 +106,7 @@ pub(crate) fn attach(library: &cuteafd_ffi::NativeLibrary, ranks: usize,
             false, base, extra).map_err(anyhow::Error::msg)?;
         bank.attach(library, device, policy.bytes, Site { name: site_name(name), cycle: Cycle::Other,
             preference: Preference::Adaptive, bootstrap: 2 << 20, basis: Basis::Bytes,
-            spans_devices: spans || ranks > 1 })?;
+            spans_devices: spanning::spans(name, spans)? })?;
         crate::shared::decode_graph::device::set_reserve_policy(device, policy)
     })
 }

@@ -3,7 +3,7 @@
 Native MiniMax M3.1 Flash serves through the shared scheduler, continuous
 prefill executor, Spark exchange, exact prefix cache and device token selector.
 Qualified layouts are one RTX PRO 6000 with three Sparks or two RTX PRO 6000
-with four Sparks, using the checkpoint's
+with six Sparks (the max card; four Sparks remains qualified), using the checkpoint's
 MXFP8 dense core, NVFP4 W4A4 routed experts and FP8 MSA KV/index storage.
 
 ## Launch
@@ -219,10 +219,42 @@ thermal slowdown, busy clocks 2790.2 / 2850.1 MHz, maximum 61 C and minimum
 headroom 34 C. The two-cell build scope includes both Spark TP3 and TP4;
 shared `wip-cards` derives this union automatically.
 
+## Six-Spark Max Card
+
+The [2026-11-16 Release smoke](../../benchmarks/minimax_m3/2026-11-16-smoke-minimax-m3-1-flash-2rtx-6spark-minimax-6spark-smoke-cand-r1/report.svg)
+at `234a3be51` selects six Sparks for the max card. The
+[max config](../../examples/configs/minimax-m31-flash-nvfp4-max.config) retains
+Heads, native dSpark, the automatic 2,089,408-token FP8 pool and zero onboarded
+layers. The intermediate dimension divides into 512 columns per Spark.
+
+| Metric (tok/s) | Published four Sparks | Six Sparks | Ratio |
+| --- | ---: | ---: | ---: |
+| C1 code | 59.66 | 70.57 | 1.183 |
+| C4 | 86.93 | 123.19 | 1.417 |
+| C8 | 123.90 | 156.80 | 1.266 |
+| C16 | 161.85 | 213.99 | 1.322 |
+| 8K prefill | 2562 | 2579 | 1.007 |
+
+These are same-day published observations, not interleaved identical-build A/B.
+One warmed launch per layout supplies the card. The six-Spark basic window
+records zero power-cap and thermal slowdown, busy clocks 2791 / 2844 MHz,
+maximum temperatures 55 / 60 C and minimum T.Limit headroom 39 / 33 C at
+425 / 425 W. The four-Spark basic window also records zero slowdown. Advisory
+host page reclaim at C8/C16/8K remains in the report; it does not trigger a
+repeat session. Readiness is 26.55 s.
+
+Standard generated-aggregate fidelity passes decode (12,679 rows, KL 0.0370610,
+top-1 94.3844%) and prefill (12,080 rows, KL 0.0212633, top-1 94.5281%), with
+zero missing/non-finite rows on both paths. Bars remain KL <= 0.05 and
+top-1 >= 93%; context and per-window scores are informational. The basic card
+also passes quick generated fidelity (KL 0.0229594, top-1 95.9056%) and
+lossless speculation. No launch defaults change.
+
 ## Changelog
 
 | Date | Change | Evidence |
 | --- | --- | --- |
+| 2026-11-16 | Select six Sparks for the two-RTX Heads max card; retain dSpark, auto pool and zero onboarded layers. | One warmed Release smoke at `234a3be51`: C1/C16 70.57/213.99 tok/s, 1.183x/1.322x the same-day published four-Spark card; zero power-cap/thermal slowdown. Standard generated decode/prefill fidelity passes; #1856. |
 | 2026-11-14 | Qualify public one-RTX native serving, exact prefix restores, tool grammar and named baseline/graph memory owners. | Basic card at `3a70a3768`, generated aggregate fidelity pass; two-RTX and narrow heads remain gated by #1856. |
 | 2026-11-14 | Qualify public two-RTX contiguous attention and FP32 split FFNs; eager split sections, native TP2 experts and exact shared prefix state. | Golden and mixed card at `60831478b`; narrow heads/media/drafts remain pending #1856. |
 | 2026-11-15 | Replay bounded TP2 router, split FFN and fold/publication sections with per-rank measured graph owners. | Same-build C1/C16/8K A/B is throughput-neutral; generated graph/eager and real-row padding oracles are byte-exact; #2112. |

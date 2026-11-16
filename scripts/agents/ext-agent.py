@@ -134,6 +134,11 @@ class Grok(Adapter):
 
 
 class Agy(Adapter):
+    # Antigravity's own default model changes underneath us (it drifted to
+    # Argon/medium); pin the roster default from USING_AGENTS.md unless the
+    # caller names a model or only an effort for the CLI's current model.
+    default_model = 'gemini-4-carbon-high'
+
     def command(self, meta):
         cmd = [meta['executable'], '--add-dir', meta['cwd']]
         if meta.get('auto_approve'):
@@ -142,6 +147,8 @@ class Agy(Adapter):
             cmd += ['--model', meta['model']]
         elif meta.get('effort'):
             cmd += ['--effort', meta['effort']]
+        else:
+            cmd += ['--model', self.default_model]
         return cmd
 
 

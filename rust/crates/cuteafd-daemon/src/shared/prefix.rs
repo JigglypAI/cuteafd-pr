@@ -42,7 +42,7 @@ pub(crate) struct PrefixArgs {
     #[arg(long, default_value = "8GiB", value_parser = parse_bytes)]
     pub host_cache_headroom_bytes: u64,
     /// Shortest snapshot the host tier keeps.
-    #[arg(long, default_value_t = 512)]
+    #[arg(long, default_value_t = cuteafd_core::prefix::DEFAULT_HOST_CACHE_MIN_TOKENS)]
     pub host_cache_min_tokens: u32,
     /// Intermediate snapshot points (off by default; agentic sessions hit prompt-end and
     /// turn-end snapshots): one every N prefilled tokens at a chunk end (0 = none, e.g. 8192).
