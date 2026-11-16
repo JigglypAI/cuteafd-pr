@@ -44,8 +44,8 @@ impl<'w, 'a, W> LayerGraphs<'w, 'a, W> {
     cache_methods!((usize, u32));
 
     pub fn cached_launch(&mut self, layer: usize, weights: &W, rows: u32) -> Option<(*mut c_void, u32)> {
-        if !std::ptr::eq(self.bank.get(&(layer, rows))?.pins, weights) { return None; }
-        self.bank.cached_launch(&(layer, rows)).map(|owner| (owner.raw, rows))
+        let owner = self.bank.cached_launch(&(layer, rows))?;
+        std::ptr::eq(owner.pins, weights).then_some((owner.raw, rows))
     }
 
     /// # Safety

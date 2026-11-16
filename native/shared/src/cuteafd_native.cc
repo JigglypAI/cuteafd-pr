@@ -1827,7 +1827,7 @@ std::mutex graph_handles_mutex;
 std::unordered_map<void*, std::unique_ptr<GraphHandle>> graph_handles;
 void* own_graph_exec(cudaGraphExec_t exec) {
   auto handle = std::make_unique<GraphHandle>(GraphHandle{exec});
-  void* key = handle.get();
+  void* key = reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(handle.get()) | uintptr_t(1));
   graph_handles.emplace(key, std::move(handle));
   return key;
 }
@@ -2104,11 +2104,13 @@ extern "C" cuteafd_status_t cuteafd_cuda_graph_launch(void* cuda_graph_exec, voi
     return fail(CUTEAFD_STATUS_INVALID_ARGUMENT, "CUDA graph launch stream is null");
   }
 #if CUTEAFD_NATIVE_ENABLE_CUDA
-  std::unique_lock<std::mutex> handles_guard(graph_handles_mutex);
-  const auto handle = graph_handles.find(cuda_graph_exec);
+  // Source-path handles are tagged; legacy/test raw CUDA handles remain valid.
+  // A bank owns its handle through the submitted launch. Cache transfer only
+  // touches cold owners on the same serialized lane executor, never queued work.
   auto target = reinterpret_cast<cudaGraphExec_t>(cuda_graph_exec);
-  if (handle != graph_handles.end()) {
-    target = handle->second->exec;
+  if (reinterpret_cast<uintptr_t>(cuda_graph_exec) & uintptr_t(1)) {
+    const auto* handle = reinterpret_cast<const GraphHandle*>(reinterpret_cast<uintptr_t>(cuda_graph_exec) & ~uintptr_t(1));
+    target = handle->exec;
     if (!target) return fail(CUTEAFD_STATUS_INVALID_ARGUMENT, "stale transferred graph handle");
   }
   cudaError_t err = cudaGraphLaunch(target,

@@ -138,6 +138,7 @@ pub(crate) struct Snapshot {
     pub rankings_age_ms: u64,
     pub epochs: EpochStats,
     pub reuse_ages: ReuseAges,
+    pub update_sites: std::collections::BTreeMap<&'static str, HashMap<Cycle, Counters>>,
 }
 
 #[derive(Clone, Debug, serde::Serialize)]
@@ -853,6 +854,7 @@ pub(crate) struct DeviceCache {
     reuse_ages: ReuseAges,
     age_log_cycles: u64,
     age_soft_crossed: bool,
+    update_sites: std::collections::BTreeMap<&'static str, HashMap<Cycle, Counters>>,
     native_graphs: HashMap<u64, NativeGraph>,
     update_requests: HashMap<u64, UpdateRequest>,
     observer: GrowthObserver,
@@ -907,7 +909,7 @@ impl DeviceCache {
             pending_growth: 0, pools: Pools::default(), basis: Basis::Bytes,
             chain_only: true, unmeasured: false, pending_destroy: 0,
             bank_lanes: HashMap::new(), lanes: std::array::from_fn(|_| LaneEpoch::default()), clocks: Arc::new(std::array::from_fn(|_| EpochClock::default())),
-            lagged: Vec::new(), epochs: EpochStats::default(), reuse_captures: HashSet::new(), selected_epochs: HashMap::new(), pending_lanes: [0; 2], concurrent_cycles: 1, lane_max_cycles: [1; 2], reuse_ages: ReuseAges::default(), age_log_cycles: 0, age_soft_crossed: false, native_graphs: HashMap::new(), update_requests: HashMap::new(),
+            lagged: Vec::new(), epochs: EpochStats::default(), reuse_captures: HashSet::new(), selected_epochs: HashMap::new(), pending_lanes: [0; 2], concurrent_cycles: 1, lane_max_cycles: [1; 2], reuse_ages: ReuseAges::default(), age_log_cycles: 0, age_soft_crossed: false, update_sites: Default::default(), native_graphs: HashMap::new(), update_requests: HashMap::new(),
             observer: GrowthObserver::default(), memory_query: None, captured_since_observation: false,
             counters: HashMap::new(), started: Instant::now(), clock_ms: 0, last_report: Instant::now(),
             interval_evictions: 0, trace: std::env::var_os("CUTEAFD_GRAPH_TRACE").and_then(|path| {
@@ -967,7 +969,9 @@ impl DeviceCache {
         let cycles = self.lanes.iter().map(|lane| lane.index).sum::<u64>();
         if cycles.saturating_sub(self.age_log_cycles) >= 1_000 {
             self.age_log_cycles = cycles;
-            tracing::info!(device = self.device, cycles, reuse_ages = ?self.reuse_ages.quantiles(), "graph reuse age census");
+            tracing::info!(device = self.device, cycles, reuse_ages = %serde_json::to_string(&self.reuse_ages.quantiles()).unwrap_or_default(),
+                counters = %serde_json::to_string(&self.counters).unwrap_or_default(),
+                update_sites = %serde_json::to_string(&self.update_sites).unwrap_or_default(), "graph reuse age census");
         }
     }
 
@@ -1303,6 +1307,8 @@ impl DeviceCache {
         if !any_cold {
             let counters = self.counters.entry(site.cycle).or_default();
             if hard { counters.no_cold_donor_hard += 1 } else { counters.no_cold_donor_soft += 1 }
+            let counters = self.update_sites.entry(site.name).or_default().entry(site.cycle).or_default();
+            if hard { counters.no_cold_donor_hard += 1 } else { counters.no_cold_donor_soft += 1 }
             return None;
         }
         self.next_id += 1;
@@ -1340,6 +1346,8 @@ impl DeviceCache {
         let Some(donor) = donor else {
             let counters = self.counters.entry(request.site.cycle).or_default();
             if request.hard { counters.no_cold_donor_hard += 1 } else { counters.no_cold_donor_soft += 1 }
+            let counters = self.update_sites.entry(request.site.name).or_default().entry(request.site.cycle).or_default();
+            if request.hard { counters.no_cold_donor_hard += 1 } else { counters.no_cold_donor_soft += 1 }
             self.update_requests.insert(id, request);
             return None;
         };
@@ -1348,6 +1356,7 @@ impl DeviceCache {
             invalidate(exec);
             self.remove_drained(&[donor]);
             self.counters.entry(request.site.cycle).or_default().update_failures += 1;
+            self.update_sites.entry(request.site.name).or_default().entry(request.site.cycle).or_default().update_failures += 1;
             self.update_requests.insert(id, request);
             return None;
         }
@@ -1358,11 +1367,19 @@ impl DeviceCache {
                 invalidate(exec);
                 self.remove_drained(&[donor]);
                 self.counters.entry(request.site.cycle).or_default().update_failures += 1;
+                self.update_sites.entry(request.site.name).or_default().entry(request.site.cycle).or_default().update_failures += 1;
                 self.update_requests.insert(id, request);
                 return None;
             }
         };
-        if let Some(old) = self.identities.get(&request.identity).copied() { self.forget(old); }
+        if let Some(old) = self.identities.get(&request.identity).copied() {
+            let record = &self.records[&old];
+            if let Some(last) = record.last_used {
+                let lane = self.bank_lane(record.identity.bank);
+                self.reuse_ages.record(self.lanes[lane].index.saturating_sub(last));
+            }
+            self.forget(old);
+        }
         self.unlink(donor);
         let mut record = self.records.remove(&donor).unwrap();
         let mut ghost = record.clone();
@@ -1379,7 +1396,12 @@ impl DeviceCache {
         record.last_used = Some(self.lanes[self.bank_lane(request.identity.bank)].index);
         record.previous = None; record.next = None; record.list = None;
         let native_nodes = record.stats.native_nodes;
+        let declared_capture_streams = record.stats.declared_capture_streams;
+        let max_parallel_width = record.stats.max_parallel_width;
         record.stats = KeyStats::new(self.clock_ms);
+        record.stats.declared_capture_streams = declared_capture_streams;
+        record.stats.max_parallel_width = max_parallel_width;
+        record.stats.spans_devices = record.spans_devices;
         record.stats.event(request.site.cycle, 1);
         record.stats.misses = 1;
         record.stats.native_nodes = native_nodes;
@@ -1393,6 +1415,8 @@ impl DeviceCache {
         self.trim_ghosts();
         let counters = self.counters.entry(request.site.cycle).or_default();
         counters.misses += 1;
+        if request.hard { counters.updates_hard += 1 } else { counters.updates_soft += 1 }
+        let counters = self.update_sites.entry(request.site.name).or_default().entry(request.site.cycle).or_default();
         if request.hard { counters.updates_hard += 1 } else { counters.updates_soft += 1 }
         Some(transferred)
     }
@@ -1409,6 +1433,11 @@ impl DeviceCache {
     }
 
     pub(super) fn updating(&self, id: u64) -> bool { self.update_requests.contains_key(&id) }
+
+    #[cfg(test)]
+    pub(super) fn advance_for_update_fixture(&mut self, lane: usize, cycles: usize) {
+        for _ in 0..cycles { self.begin_lane(lane); self.complete_lane(lane); }
+    }
 
     pub fn miss(&mut self, identity: Identity, site: Site, node_estimate: Option<Estimate>, pinned: bool) -> Miss {
         self.refresh_cycles();
@@ -1860,11 +1889,11 @@ impl DeviceCache {
         let credited = bytes.min(self.failed_measurement_credit);
         self.failed_measurement_credit -= credited;
         self.charged = self.charged.saturating_add(bytes - credited);
+        self.apply_soft_pressure(bytes, completed);
         if !self.age_soft_crossed && self.charged >= self.soft.limit {
             self.age_soft_crossed = true;
-            tracing::info!(device = self.device, reuse_ages = ?self.reuse_ages.quantiles(), "graph soft cap reuse ages");
+            tracing::info!(device = self.device, reuse_ages = %serde_json::to_string(&self.reuse_ages.quantiles()).unwrap_or_default(), "graph soft cap reuse ages");
         }
-        self.apply_soft_pressure(bytes, completed);
     }
 
     pub fn destroyed(&mut self, ids: &[u64], measurement: ReleaseMeasurement) {
@@ -2011,7 +2040,7 @@ impl DeviceCache {
             pending_capture: self.pending_bytes, cycles: self.counters.clone(), pools: self.pools.clone(),
             basis: self.basis, sampled_at_ms: self.started.elapsed().as_millis() as u64,
             telemetry_bytes: self.records.len() * std::mem::size_of::<KeyStats>(),
-            top_hits: Vec::new(), top_churn: Vec::new(), rankings_age_ms: self.ranked_at.elapsed().as_millis() as u64, epochs: self.epoch_snapshot(), reuse_ages: self.reuse_ages.quantiles() },
+            top_hits: Vec::new(), top_churn: Vec::new(), rankings_age_ms: self.ranked_at.elapsed().as_millis() as u64, epochs: self.epoch_snapshot(), reuse_ages: self.reuse_ages.quantiles(), update_sites: self.update_sites.clone() },
             records, classes: self.classes.clone() }
     }
 
@@ -2061,7 +2090,7 @@ impl DeviceCache {
             level: self.level,
             pinned: self.inventory.pinned,
             pending_capture: self.pending_bytes, cycles: self.counters.clone(), pools: self.pools.clone(), basis: self.basis,
-            sampled_at_ms: now, telemetry_bytes: self.records.len() * std::mem::size_of::<KeyStats>(), top_hits: self.ranked_hits.clone(), top_churn: self.ranked_churn.clone(), rankings_age_ms: self.ranked_at.elapsed().as_millis() as u64, epochs: self.epoch_snapshot(), reuse_ages: self.reuse_ages.quantiles() }
+            sampled_at_ms: now, telemetry_bytes: self.records.len() * std::mem::size_of::<KeyStats>(), top_hits: self.ranked_hits.clone(), top_churn: self.ranked_churn.clone(), rankings_age_ms: self.ranked_at.elapsed().as_millis() as u64, epochs: self.epoch_snapshot(), reuse_ages: self.reuse_ages.quantiles(), update_sites: self.update_sites.clone() }
     }
 
     fn row(&self, record: &Record, now: u64) -> TraceRow {
@@ -2253,7 +2282,8 @@ mod tests {
         let mut cache = test_cache(-1030, 1000);
         let donor = capture(&mut cache, 1, false);
         cache.register_native(donor, 101, vec![3, 7, 11]);
-        let last = cache.records[&donor].last_used.unwrap();
+        let last = cache.lanes[0].index;
+        cache.records.get_mut(&donor).unwrap().last_used = Some(last);
         while cache.lanes[0].index < last + age {
             cache.begin_lane(0); cache.complete_lane(0);
         }
@@ -2297,7 +2327,7 @@ mod tests {
         cache.soft.measured_bytes = Some(10);
         cache.soft.measured_nodes = Some(10);
         cache.soft.limit = 10;
-        cache.records.get_mut(&donor).unwrap().stats.native_nodes = Some(10);
+        cache.captured_topology(donor, 10, 1, false);
         let id = update_request(&mut cache, key(2));
         assert_eq!(cache.finish_update(id, |_| panic!(), |_| panic!(), |_| panic!()), None);
         assert!(matches!(cache.fallback_update(id), Miss::Eager));
@@ -2327,7 +2357,8 @@ mod tests {
         let (mut cache, donor) = aged_update_fixture(0, false);
         cache.assign_bank_lane(1, 1);
         cache.lane_max_cycles = [1, 2];
-        cache.records.get_mut(&donor).unwrap().last_used = Some(0);
+        let owner_start = cache.lanes[1].index;
+        cache.records.get_mut(&donor).unwrap().last_used = Some(owner_start);
         for _ in 0..100 { cache.begin_lane(0); cache.complete_lane(0); }
         assert!(cache.cold_donor(&[3, 7, 11], false).is_none());
         for _ in 0..32 { cache.begin_lane(1); cache.complete_lane(1); }
@@ -2376,8 +2407,18 @@ mod tests {
     fn cold_donor_search_microseconds() {
         use std::hint::black_box;
         let mut cache = test_cache(-1032, 1_000_000);
-        for n in 0..22_000 {
-            let id = capture(&mut cache, n, false);
+        let initial = capture(&mut cache, 0, false);
+        for n in 1..22_000 {
+            let mut record = cache.records[&initial].clone();
+            record.identity = key(n);
+            record.list = None; record.previous = None; record.next = None;
+            record.accounted = Inventory::default();
+            cache.next_id += 1;
+            let id = cache.next_id;
+            cache.identities.insert(record.identity.clone(), id);
+            cache.records.insert(id, record);
+            cache.push(id, List::Recent);
+            cache.sync_inventory(id);
             cache.register_native(id, n as usize + 1, vec![3, n % 41]);
         }
         for _ in 0..40 { cache.begin_lane(0); cache.complete_lane(0); }

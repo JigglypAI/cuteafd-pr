@@ -224,6 +224,7 @@ impl<K: Hash + Eq + Clone + std::fmt::Debug, E> GraphBank<K, E> {
     }
 
     pub fn cache_miss(&mut self, key: &K, pinned: bool, node_estimate: Option<super::device::Estimate>) -> super::device::Miss {
+        if self.entries.contains_key(key) && !self.valid_entry(key) { self.entries.remove(key); }
         let Some(binding) = &self.device else { return super::device::Miss::Eager };
         let identity = if let Some(identity) = self.cache_keys.get(key) { identity.clone() } else {
             self.next_cache_key = self.next_cache_key.checked_add(1).expect("graph key identity exhausted");
@@ -459,6 +460,53 @@ mod device_tests {
     use super::*;
     use super::super::device::{Cycle, Miss, Preference, ReleaseMeasurement, Site};
     fn site() -> Site { Site { name: "bank-test", cycle: Cycle::Decode, preference: Preference::Capture, bootstrap: 10, basis: super::super::device::Basis::Bytes, spans_devices: false } }
+    #[test]
+    fn cross_bank_native_update_invalidates_old_key_and_survives_donor_drop() -> anyhow::Result<()> {
+        use super::super::GraphOwner;
+        let fixture = cuteafd_ffi::native_library_lifetime_fixture::Fixture::build_for_tests()?;
+        let library = fixture.load()?;
+        fixture.configure_memory_usage(&library, 0, 128 << 20, 0)?;
+        let mut donor = GraphBank::new();
+        let mut receiver = GraphBank::new();
+        // Synthetic cache isolates the global device registry from fixture GPU0.
+        for bank in [&mut donor, &mut receiver] {
+            bank.attach_device_for_test(-164_405, 10, site())?;
+        }
+        donor.cache_lane_owner(1);
+        receiver.cache_lane_owner(0);
+        let mut ticket = donor.cache_ticket(&1, false, None).unwrap();
+        // SAFETY: no fixture device work or captured allocations.
+        let source = unsafe { library.cuda_graph_capture_source(std::ptr::null_mut())? };
+        let (raw, nodes, width, spans, _) = ticket.complete_source(&library, source, std::ptr::null_mut())?;
+        // SAFETY: fixture graph never uses device allocations.
+        let owner = unsafe { GraphOwner::new(&library, 0, raw, ())? };
+        donor.cache_commit(1, owner, ticket, nodes as u64, width, spans);
+        donor.cache_measured(10);
+        let cache = donor.device.as_ref().unwrap().cache.clone();
+        cache.lock().unwrap().advance_for_update_fixture(1, 2);
+        let mut ticket = receiver.cache_ticket(&2, false, None).expect("hard-cap source update admitted");
+        // SAFETY: source-only fixture records no work.
+        let source = unsafe { library.cuda_graph_capture_source(std::ptr::null_mut())? };
+        let (new, nodes, width, spans, _) = ticket.complete_source(&library, source, std::ptr::null_mut())?;
+        assert_ne!(new, raw);
+        // SAFETY: receiver owns the transferred generation.
+        let owner = unsafe { GraphOwner::new(&library, 0, new, ())? };
+        receiver.cache_commit(2, owner, ticket, nodes as u64, width, spans);
+        assert!(donor.cached_launch(&1).is_none());
+        assert!(donor.get(&1).is_none());
+        assert!(!donor.contains(&1));
+        assert!(receiver.cached_launch(&2).is_some());
+        drop(donor);
+        // SAFETY: new owner remains live after the old bank's generation retires.
+        unsafe { library.cuda_graph_launch(new, std::ptr::null_mut())?; }
+        let snapshot = super::super::device::snapshots().into_iter().find(|row| row.device == -164_405).unwrap();
+        assert_eq!(snapshot.charged, 10);
+        assert_eq!(snapshot.live_bytes, 10);
+        assert_eq!(snapshot.cycles[&Cycle::Decode].updates_hard, 1);
+        drop(receiver);
+        Ok(())
+    }
+
     #[test]
     fn failed_commit_measurement_retains_owner_and_charges_until_drained_teardown() -> anyhow::Result<()> {
         use std::{cell::Cell, rc::Rc};

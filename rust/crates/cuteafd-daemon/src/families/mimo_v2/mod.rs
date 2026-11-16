@@ -793,7 +793,7 @@ mod source_format_tests {
     #[test]
     fn serving_decode_graph_misses_go_through_the_bounded_cache() {
         let source = include_str!("engine.rs");
-        let miss = source.split_once("let Some(ticket) =")
+        let miss = source.split_once("let Some(mut ticket) =")
             .expect("the serving miss asks the bounded cache").1;
         assert!(miss.trim_start().starts_with("graphs.borrow_mut().cache_ticket(&key, pinned, None)"),
             "a miss is admitted by the device cache, not a sealed startup inventory");
