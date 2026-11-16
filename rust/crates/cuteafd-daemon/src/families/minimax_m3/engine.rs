@@ -1096,7 +1096,7 @@ impl<'a> ServingPrefill<'a> {
                     rows, &a.stream, ids, a.dense.producer_destination(), a.plane("residual")?)?; }
                 heads.replicate([&a, &b], "residual", rows * cfg.hidden * 4)?;
             }
-            let source = storage.ranks[0].decode.borrow().routed_rows(rows)?;
+            let source = storage.ranks[0].decode.borrow().routed_rows_for(rows, self.nvfp4_wire())?;
             for layer in 0..cfg.layers {
                 for gpu in 0..2 {
                     let rank = &storage.ranks[gpu];
@@ -1657,7 +1657,7 @@ mod tests {
         assert!(decode.contains("decode_attention("));
         assert!(decode.contains("heads.reduce("));
         assert!(decode.contains("row_key(rows)"));
-        assert!(decode.contains("let source = storage.ranks[0].decode.borrow().routed_rows(rows)?"));
+        assert!(decode.contains("let source = storage.ranks[0].decode.borrow().routed_rows_for(rows, self.nvfp4_wire())?"));
         assert!(decode.contains("layer, rows, kind: super::heads::Reduction::Attention"));
         let owners = include_str!("owners.rs");
         let prewarm = owners.split_once("    fn prewarm_heads(").unwrap().1
