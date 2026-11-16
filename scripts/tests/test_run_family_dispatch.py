@@ -975,6 +975,8 @@ def _family_launch_result(tmp_path: Path, family_config: dict, model: str, keys:
     if "CORE_VIEW=k6-compact" in keys:
         selected = hf / "hub" / f"models--{model.replace('/', '--')}" / "snapshots" / ("a" * 40 if native_v41 else "abc")
         (selected / "config.k6.json").write_text(json.dumps(family_config))
+    if "SPECULATOR_MODEL_ID=test/draft" in keys:
+        _snapshot(hf, "test/draft", {"speculators_model_type":"dspark"})
     if checkpoint_source is not None:
         staged = hf / "hub" / f"models--{model.replace('/', '--')}" / "snapshots" / ("a" * 40 if native_v41 else "abc")
         # Header fixtures have huge sparse tensor payloads; never materialize them.
@@ -5833,3 +5835,17 @@ def test_graph_prewarm_off_refuses_cross_device_graphs(tmp_path):
         "RTX_GPUS=2\nGRAPH_PREWARM=off\n")
     assert result.returncode == 2, result.stderr
     assert "runtime cross-device graph instantiation can deadlock" in result.stderr
+
+
+@pytest.mark.parametrize("precision,flag", [("on", "true"), ("off", "false")])
+@pytest.mark.parametrize("kv", ["bf16", "fp8"])
+def test_kimi_draft_weights_and_kv_are_independent(tmp_path, precision, flag, kv):
+    config = {"model_type":"kimi_k31","text_config":{"model_type":"kimi_linear", "num_hidden_layers":93,
+        "first_k_dense_replace":1,"moe_layer_freq":1}}
+    result = _family_launch_result(tmp_path, config, "test/kimi",
+        f"SPECULATOR=dspark\nSPECULATOR_MODEL_ID=test/draft\nSPECULATOR_FP8={precision}\nDRAFT_KV_CACHE={kv}\nVISION=off\nAUDIO=off\n")
+    assert result.returncode == 0, result.stderr
+    serve = next(line for line in result.stderr.splitlines() if "cuteafd serve-kimi" in line)
+    assert f"--draft-fp8 {flag}" in serve and f"--draft-kv-cache {kv}" in serve
+    plans = [line for line in result.stderr.splitlines() if "cuteafd plan" in line and "--resolve-settings-only" not in line]
+    assert plans and all(f"--draft-fp8 {flag}" in line for line in plans)

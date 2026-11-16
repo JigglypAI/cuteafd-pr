@@ -176,7 +176,9 @@ pub(crate) fn load<'a, const RANKS: usize>(library: &'a Arc<cuteafd_ffi::NativeL
             DraftLayout::BlockTp2 { ranks,.. }=>ranks.iter().enumerate().collect(),
             DraftLayout::Mla(_)=>Vec::new(),
         };
-        locals.into_iter().map(|(rank,local)|devices[rank].run(|| {
+        locals.into_iter().filter(|(_,local)|local.representation ==
+            cuteafd_loader::families::glm5::draft_representation::GlmDraftRepresentation::Bf16Only)
+            .map(|(rank,local)|devices[rank].run(|| {
             let rows=2048usize.max(local.capacity.block_rows).max(programs.capacities().decode_rows.unwrap_or(0));
             Ok(cuteafd_ffi::draft_projection::DraftProjections::load(programs,&local.projection_shapes(),rows)?)
         })).collect::<Result<Vec<_>>>()?
