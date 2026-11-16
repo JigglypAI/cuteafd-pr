@@ -144,6 +144,10 @@ impl<'a> UnitOwner<'a> {
         uploads: &mut crate::shared::token_table::RetainedUploads<'a>) -> Result<()> {
         ensure!(cache.layout.sequence_bytes % 4096 == 0,
             "Inkling sequence bank must have an integral record stride");
+        ensure!(members.len() <= cache.layout.sequences
+            && members.iter().all(|member| member.sequence < cache.layout.sequences)
+            && members.iter().map(|member| member.sequence).collect::<std::collections::BTreeSet<_>>().len() == members.len(),
+            "Inkling packed cache members alias or exceed admitted request slots");
         let rows = members.last().context("Inkling packed metadata is empty")?.rows.end;
         let mut positions = Vec::with_capacity(rows);
         let mut local = Vec::with_capacity(rows);

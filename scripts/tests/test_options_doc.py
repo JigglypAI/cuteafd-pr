@@ -466,6 +466,15 @@ def test_muse_target_kv_precision_is_opt_in_and_draft_is_independent():
     assert 'muse_draft_kv="$(get DRAFT_KV_CACHE fp8)"' in launcher
 
 
+
+def test_inkling_global_kv_precision_keeps_bf16_until_paired_qualification():
+    launcher = (ROOT / "scripts/launch/run-family.sh").read_text()
+    assert "KV_CACHE" in family_keys("inkling2")
+    assert 'inkling_kv="$(get KV_CACHE bf16)"' in launcher
+    assert 'family_args+=(--kv-cache "$inkling_kv")' in launcher
+    assert 'plan_draft_args+=(--kv-cache "$inkling_kv")' in launcher
+    assert "2,112 bytes per global layer" in DOC.read_text()
+
 def test_mc_mtp_docs_distinguish_original_core_from_unchanged_experts():
     text = DOC.read_text()
     assert "projections stay K4 in every view" not in text

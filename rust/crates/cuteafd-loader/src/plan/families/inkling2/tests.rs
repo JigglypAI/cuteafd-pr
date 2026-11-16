@@ -349,6 +349,14 @@ fn installed_native_minimum_is_six_sparks_with_full_pool() -> anyhow::Result<()>
     assert!(report.fits && report.placement_supported && report.native_serving_admitted, "{:?}", report.hints);
     assert!(report.wip_launchable() && !report.executable());
     assert_eq!(report.memory_layout.as_ref().unwrap().pool_tokens, 2_097_152);
+    let mut fp8_options = options.clone();
+    fp8_options.layout.as_mut().unwrap().inkling_kv = crate::families::inkling2::InklingKvCache::Fp8;
+    let fp8 = input.plan(&fp8_options)?;
+    assert!(fp8.fits && fp8.placement_supported && fp8.native_serving_admitted, "{:?}", fp8.hints);
+    assert_eq!(fp8.memory_layout.as_ref().unwrap().pool_tokens, 2_097_152);
+    println!("Inkling native 1RTX+6S pool2097152: BF16->FP8 onboard {:?}->{:?}, global KV 64GiB->33GiB",
+        report.onboard_layers, fp8.onboard_layers);
+    assert!(fp8.onboard_layers > report.onboard_layers, "freed global KV must admit more native expert layers");
     let refused = input.plan(&PlanOptions { placement: ExpertPlacement::from_spark_ranks(5), ..options })?;
     assert!(!refused.fits && !refused.placement_supported);
     assert!(refused.hints.iter().any(|hint| hint.what.contains("joint admission refused")), "{:?}", refused.hints);
@@ -604,7 +612,30 @@ fn shared_recipe_charges_every_owner_once_on_one_and_two_rtx() {
             assert!(contract.components.iter().any(|c| matches!(&c.kind, ComponentKind::Allocation { template, .. }
                 if template.id == format!("inkling2.cache.{gpu}.active"))), "rtx{gpu} marks");
         }
-        let admitted = inputs.admit(request).unwrap();
+        let admitted = inputs.admit(request.clone()).unwrap();
+        let mut fp8_inputs = inputs.clone();
+        fp8_inputs.kv_format = crate::families::inkling2::InklingKvCache::Fp8;
+        let fp8_contract = fp8_inputs.prepare(&request).unwrap();
+        for component in &contract.components {
+            let ComponentKind::Allocation { template, .. } = &component.kind else { continue };
+            if !template.id.starts_with("inkling2.kv.") { continue; }
+            let fp8 = fp8_contract.components.iter().find(|candidate| matches!(&candidate.kind,
+                ComponentKind::Allocation { template: other, .. } if other.id == template.id)).unwrap();
+            let bf16_bytes = component.bytes.at(2048).unwrap();
+            let fp8_bytes = fp8.bytes.at(2048).unwrap();
+            // Admission includes exactly one measured allocation tail, so
+            // compare each record-format payload through the allocator recipe.
+            let mode = if placement == AttentionPlacement::Context && gpus == 2 { 2 } else { 1 };
+            let heads = if gpus == 2 && placement != AttentionPlacement::Layers { cfg.kv_heads/2 } else { cfg.kv_heads };
+            let tokens = 2048*64*mode;
+            assert_eq!(bf16_bytes, crate::placement::planner::sm120_request_backing(
+                (tokens*4*heads*cfg.head_dim) as u64).unwrap());
+            assert_eq!(fp8_bytes, crate::placement::planner::sm120_request_backing(
+                (tokens*(2*heads*cfg.head_dim+8*heads)) as u64).unwrap());
+        }
+        let fp8_admitted = fp8_inputs.admit(request).unwrap();
+        assert!(fp8_admitted.solved.pool_tokens >= admitted.solved.pool_tokens);
+        assert!(fp8_admitted.onboard >= admitted.onboard);
         assert!(admitted.solved.pool_tokens >= 1 << 20, "{placement:?} on {gpus} GPUs: {}", admitted.solved.pool_tokens);
         assert!(admitted.placement.layers.iter().all(|l| shared::INKLING2.runs(l.mode)));
         assert_eq!(admitted.placement.attention_placement, if gpus == 2 { placement } else { AttentionPlacement::Heads });

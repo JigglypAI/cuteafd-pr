@@ -282,6 +282,15 @@ mod tests {
 
     #[test]
     fn persistent_cache_marks_copy_exact_bytes_and_fence_only_registered_readers() -> Result<()> {
+        cache_mark_oracle(cuteafd_loader::families::inkling2::InklingKvCache::Bf16)
+    }
+
+    #[test]
+    fn fp8_cache_marks_and_tail_scales_restore_byte_exactly() -> Result<()> {
+        cache_mark_oracle(cuteafd_loader::families::inkling2::InklingKvCache::Fp8)
+    }
+
+    fn cache_mark_oracle(format: cuteafd_loader::families::inkling2::InklingKvCache) -> Result<()> {
         let fixture = Fixture::build_for_tests()?;
         let library = fixture.load()?;
         fixture.immediate_copies(&library)?;
@@ -291,7 +300,7 @@ mod tests {
             "../../../../cuteafd-loader/src/families/inkling2/fixtures/config.json"))?)?;
         cfg.layers = 2;
         cfg.local = vec![true, false];
-        let cache = CacheBank::new(vec![reader.clone()], CacheLayout::new(&cfg, 2, 3)?, 1)?;
+        let cache = CacheBank::new(vec![reader.clone()], CacheLayout::with_format(&cfg, 2, 3, format)?, 1)?;
         let state = cache.sequence(0)?;
         let pattern = (0..state.bytes).map(|byte| (byte.wrapping_mul(17) % 251) as u8).collect::<Vec<_>>();
         library.copy_h2d(state, &pattern)?;
@@ -359,8 +368,9 @@ mod tests {
             .map_err(|e| anyhow::anyhow!("{e}"))?;
         family.drain().map_err(|e| anyhow::anyhow!("{e}"))?;
         library.copy_d2h(&mut restored_page, cache.page(1, 2)?)?;
-        assert_eq!(&restored_page[..4096], &page_pattern[..4096]);
-        assert_eq!(&restored_page[4096..], &sentinel[4096..]);
+        let record_bytes = format.record_bytes(cfg.kv_heads, cfg.head_dim);
+        assert_eq!(&restored_page[..record_bytes], &page_pattern[..record_bytes]);
+        assert_eq!(&restored_page[record_bytes..], &sentinel[record_bytes..]);
         assert_eq!(family.page_segments(0).len(), 1);
         assert_eq!(family.mark_segments(MarkSlot(0)).len(), 1);
         assert!(family.extend_pages(&mut destination, &[0]).is_err());
@@ -369,94 +379,6 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn fp8_cache_marks_and_tail_scales_restore_byte_exactly() -> Result<()> {
-        let fixture = Fixture::build_for_tests()?;
-        let library = fixture.load()?;
-        fixture.immediate_copies(&library)?;
-        let device = Device { library: &library, id: 0 };
-        let reader = Rc::new(Stream::new(device)?);
-        let mut cfg = Inkling2Config::from_hf(&serde_json::from_str(include_str!(
-            "../../../../cuteafd-loader/src/families/inkling2/fixtures/config.json"))?)?;
-        cfg.layers = 2;
-        cfg.local = vec![true, false];
-        let cache = CacheBank::new(vec![reader.clone()], CacheLayout::with_format(&cfg, 2, 3, cuteafd_loader::families::inkling2::InklingKvCache::Fp8)?, 1)?;
-        let state = cache.sequence(0)?;
-        let pattern = (0..state.bytes).map(|byte| (byte.wrapping_mul(17) % 251) as u8).collect::<Vec<_>>();
-        library.copy_h2d(state, &pattern)?;
-        cache.capture(0, 0)?;
-        cache.reset(0)?;
-        cache.restore(0, 1)?;
-        cache.drain()?;
-        let mut restored = vec![0; pattern.len()];
-        library.copy_d2h(&mut restored, cache.sequence(1)?)?;
-        assert_eq!(restored, pattern);
-        library.copy_d2h(&mut restored, cache.sequence(0)?)?;
-        assert!(restored.iter().all(|&byte| byte == 0));
-        let page = cache.page(1, 0)?;
-        let page_pattern = vec![0x5a; page.bytes];
-        library.copy_h2d(page, &page_pattern)?;
-        cache.copy_page(0, 2)?;
-        cache.drain()?;
-        let mut restored_page = vec![0; page.bytes];
-        library.copy_d2h(&mut restored_page, cache.page(1, 2)?)?;
-        assert_eq!(restored_page, page_pattern);
-        let unit = super::super::owners::UnitOwner::new(reader, UnitLayout::serving(&cfg, 64, 256)?)?;
-        assert!(unit.bind(&cache, 1, 0).is_ok());
-        use super::super::owners::UnitBuffers;
-        let segment = unit.segment(&cache, 1, 0, 7..19)?;
-        for (name, stride) in [("partial", 4608*4), ("q", 6144*4), ("relative", 48*1024*2),
-            ("cache_slots", 8), ("first", 4), ("expert_output", 4608*2)] {
-            let whole = unit.buffer(name)?;
-            let sliced = segment.buffer(name)?;
-            assert_eq!(sliced.ptr as usize - whole.ptr as usize, 7*stride, "{name}");
-            assert_eq!(sliced.bytes, 12*stride, "{name}");
-        }
-        let arena = segment.buffer("residual_arena")?;
-        assert_eq!(arena.ptr as usize - unit.buffer("residual_arena")?.ptr as usize, 7*4608*4);
-        assert_eq!(segment.layout().rows, 64, "completed-block pitch must remain the admitted unit width");
-        assert_eq!(segment.buffer("ring")?.ptr, cache.field(1, 0, "ring")?.ptr);
-        assert!(unit.segment(&cache, 0, 0, 63..65).is_err());
-        assert!(unit.bind(&cache, 2, 0).is_err());
-        assert!(unit.bind(&cache, 0, 2).is_err());
-        let stranger = Rc::new(Stream::new(device)?);
-        assert!(cache.require_reader(&stranger).is_err());
-        let unit = super::super::owners::UnitOwner::new(stranger, UnitLayout::serving(&cfg, 64, 256)?)?;
-        assert!(unit.bind(&cache, 0, 0).is_err());
-        assert!(cache.field(0, 1, "ring").is_err());
-        assert!(cache.copy_page(0, 0).is_err());
-        assert!(cache.copy_page(0, 3).is_err());
-        use cuteafd_engine::prefix::{MarkSlot, PrefixFamily, TailCopy};
-        let cache = Rc::new(cache);
-        let family = InklingPrefix::new(cache.clone());
-        let mut source = Placement { units: vec![0, 1], slot: 0, len: 65, state_len: 65 };
-        library.copy_h2d(cache.sequence(0)?, &pattern)?;
-        family.capture(MarkSlot(0), &source, 65).map_err(|e| anyhow::anyhow!("{e}"))?;
-        source.state_len = 64;
-        assert!(family.capture(MarkSlot(0), &source, 65).is_err());
-        let mut destination = Placement { units: vec![0, 2], slot: 1, len: 0, state_len: 0 };
-        family.bind(&mut destination).map_err(|e| anyhow::anyhow!("{e}"))?;
-        assert!(family.restore(None, &mut destination, 65).is_err());
-        family.restore(Some(MarkSlot(0)), &mut destination, 65).map_err(|e| anyhow::anyhow!("{e}"))?;
-        family.drain().map_err(|e| anyhow::anyhow!("{e}"))?;
-        assert_eq!((destination.len, destination.state_len), (65, 65));
-        library.copy_d2h(&mut restored, cache.sequence(1)?)?;
-        assert_eq!(restored, pattern);
-        let sentinel = vec![0x33; page.bytes];
-        library.copy_h2d(cache.page(1, 2)?, &sentinel)?;
-        family.copy_rows(TailCopy { from: 0, to: 2, rows: 1, owner: None })
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
-        family.drain().map_err(|e| anyhow::anyhow!("{e}"))?;
-        library.copy_d2h(&mut restored_page, cache.page(1, 2)?)?;
-        assert_eq!(&restored_page[..2112], &page_pattern[..2112]);
-        assert_eq!(&restored_page[2112..], &sentinel[2112..]);
-        assert_eq!(family.page_segments(0).len(), 1);
-        assert_eq!(family.mark_segments(MarkSlot(0)).len(), 1);
-        assert!(family.extend_pages(&mut destination, &[0]).is_err());
-        family.discard(&mut destination).map_err(|e| anyhow::anyhow!("{e}"))?;
-        assert_eq!(destination.state_len, 0);
-        Ok(())
-    }
 }
 
 impl crate::shared::prefix::cuda_copy::SnapshotOwner for CacheBank<'_> {
