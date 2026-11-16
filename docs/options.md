@@ -32,11 +32,13 @@ requests retain exactly their historical greedy body.
 
 `cuteafd bench --panels spec_lossless_set --panel-config 'spec_lossless_set={"warm":true}'`
 opts into prefix-restore qualification (default `warm:false`, the unchanged cold
-probe pair). For each case it first primes with the same prompt text and a cold,
-speculation-on request, then measures speculation-on with `cold:false`. The
-comparison oracle remains the case's cold speculation-off arm, never the priming
-output. Every measured restore must report `cached_tokens > 0`; otherwise the
-case fails with "restore not exercised". Strict generated-token and row-hash
+probe pair). Warm sets add deterministic shared reference context, with served-tokenizer
+counts proving at least 1,024 total prompt tokens and twice the configured host-retention
+minimum. For each case it first primes that full prompt with a cache-eligible
+speculation-on request (`cold:false`), then measures the identical full prompt
+with speculation on. The comparison oracle remains the case's cold speculation-off
+arm, never the priming output. Every measured restore must cover the entire
+prompt-end snapshot (`cached_tokens >= prompt_tokens`); partial or absent restores fail. Strict generated-token and row-hash
 comparison still applies; streamed content/reasoning bytes and tool calls must
 also equal the off arm. Warm rows report cached tokens, identical generated-token
 prefix length, output equality and the first differing row. Existing row dumps
