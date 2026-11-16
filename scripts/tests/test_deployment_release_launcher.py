@@ -182,6 +182,17 @@ def test_deployment_preserves_release_container_commands(
                                         for peer in endpoints)
                     position = before["command"].index("--encoder-revision") + 2
                     before["command"][position:position] = ["--vision-peer-ranks", physical]
+                # Resolved enum flags can move later in argv; retain the exact
+                # values and uniqueness checks, not an irrelevant ordering.
+                for flag in ("--index-cache", "--replay-records", "--draft-linear"):
+                    if flag in before["command"]:
+                        position = before["command"].index(flag)
+                        expected_value = before["command"][position + 1]
+                        actual = after["command"].index(flag)
+                        assert after["command"].count(flag) == 1
+                        assert after["command"][actual + 1] == expected_value
+                        del before["command"][position:position + 2]
+                        del after["command"][actual:actual + 2]
                 # The span is exactly the live rows (no old 16384 span).
                 position = before["command"].index("--console-secret-file")
                 before["command"][position:position] = ["--prefill-rows", str(unit), "--prefill-waves", str(waves),
@@ -264,8 +275,8 @@ def test_deployment_preserves_release_container_commands(
         if old["host"] == "coordinator" and "--coordinator-weight-budget-gib" not in before["command"]:
             # Serve admits resident weights against the planner's budget; historical
             # captures predate passing it and fell back to the 80 GiB default.
-            planned = {plan[plan.index("--coordinator-weight-budget-gib") + 1]
-                       for plan in current["plans"] if "--coordinator-weight-budget-gib" in plan}
+            planned = {str(int(plan[plan.index("--gpu-memory-cap") + 1]) / 2**30)
+                       for plan in current["plans"] if "--gpu-memory-cap" in plan}
             assert len(planned) == 1, (entry["name"], planned)
             budget = planned.pop()
             command = after["command"]

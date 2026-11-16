@@ -322,7 +322,7 @@ def test_installed_deployment_inventory_is_enabled_for_both_tiers(tmp_path, monk
                        str(tmp_path / '.cache/cuteafd/builds/placement-inputs/current/share/PROGRAMS.json'))
     assert all(call['CUTEAFD_DEPLOYMENT_TEST_PROGRAMS'] == manifest for call in calls)
     assert result['deployment_test_programs'] == manifest
-    assert calls[1].get('CUTEAFD_TEST_PYTHON') == ('/gate-venv/bin/python' if full else None)
+    assert calls[1].get('CUTEAFD_TEST_PYTHON') == '/gate-venv/bin/python'
     assert 'CUTEAFD_TEST_PYTHON' not in env
     assert ('CUTEAFD_DEPLOYMENT_TEST_HF_HOME' in env) == (inventory == 'override')
 

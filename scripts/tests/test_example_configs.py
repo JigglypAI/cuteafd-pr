@@ -181,12 +181,17 @@ def _family_launch(tmp_path: Path, config: Path) -> subprocess.CompletedProcess[
             str(hf / "hub" / f"models--{keys(config)['MODEL_ID'].replace('/', '--')}" / "snapshots/abc/config.json")], text=True).split()
         family, _, first, last = described
         stub = tmp_path / "deployment.py"
-        stub.write_text("""import json, sys
+        from inspect import getsource
+        from launcher_sandbox import fake_resolved_settings
+        stub.write_text(getsource(fake_resolved_settings) + "\n" + """import json, sys
 args = sys.argv[1:]
 def value(flag, default=None):
     return args[args.index(flag) + 1] if flag in args else default
 report = json.loads(REPORT)
 family, first, last = FAMILY, FIRST, LAST
+if "--resolve-settings-only" in args:
+    print(json.dumps(dict(speculator="dflash2", default_drafter="incoai/GLM-5.3-Flash-DFlash2")))
+    sys.exit(0)
 if family == "glm5_flash":
     # Launch coverage uses a whole-drafter plan, not a synthetic memory-fit decision.
     report["tp2_dflash"] = value("--tp2-dflash", "false") == "true"
@@ -197,7 +202,7 @@ selected = value("--speculator", "off")
 if family == "qwen4" and selected == "auto":
     # Both Qwen4 starting checkpoints qualify; dense Qwen is a separate family.
     selected = "mtp" if report["spark_ranks"] == 0 else "off"
-print(json.dumps(dict(report, spark_expert_world=report["spark_ranks"],
+print(json.dumps(dict(report, resolved_settings=fake_resolved_settings(args, family, report["spark_ranks"]), spark_expert_world=report["spark_ranks"],
     spark_roles=[dict(rank=i, experts=True, layers=[], encoder=report.get("encoder") if i == 0 else None,
                       audio_encoder=None, drafter=None) for i in range(report["spark_ranks"])], version=1, family=family, executable=True, report=report,
     launch=dict(family=family, first_expert_layer=first, last_expert_layer=last),

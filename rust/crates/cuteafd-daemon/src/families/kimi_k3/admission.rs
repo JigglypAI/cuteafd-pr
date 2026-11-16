@@ -2143,7 +2143,7 @@ pub(super) mod tests {
                 "--audio".into(), "off".into(), "--require-ready".into(),
             ])?;
             let crate::cli::Commands::Plan(mut args) = cli.command else { panic!("plan command") };
-            args.coordinator_weight_budget_gib = cli.coordinator_weight_budget_gib.context("global cap")?;
+            args.coordinator_weight_budget_gib = Some(cli.coordinator_weight_budget_gib.context("global cap")?);
             args.memory = cli.memory;
             let planned = crate::commands::plan::run_plan(args);
             let mut i = inputs(&cfg);

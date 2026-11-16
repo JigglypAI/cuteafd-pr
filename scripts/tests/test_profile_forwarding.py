@@ -111,12 +111,12 @@ def test_plan_preflight_admits_under_the_launch_instrumentation(tmp_path):
     prof.mkdir()
     plain = _family_launch_result(tmp_path / 'plain', GLMF_TWO_LAYER, 'test/glmf', '')
     assert plain.returncode == 0, plain.stderr
-    plan = next(line for line in plain.stderr.splitlines() if 'cuteafd plan' in line)
+    plan = next(line for line in plain.stderr.splitlines() if 'cuteafd plan' in line and '--deployment' in line)
     assert 'CUTEAFD_GRAPH_CENSUS' not in plan
     census = _family_launch_result(tmp_path / 'census', GLMF_TWO_LAYER, 'test/glmf',
                                    f'PROFILE=census\nPROFILE_DIR={prof}\n')
     assert census.returncode == 0, census.stderr
-    plan = next(line for line in census.stderr.splitlines() if 'cuteafd plan' in line)
+    plan = next(line for line in census.stderr.splitlines() if 'cuteafd plan' in line and '--deployment' in line)
     for flag in ('CUTEAFD_GRAPH_CENSUS=1', 'CUTEAFD_STARTUP_MEMORY_PROBE=1', f'CUTEAFD_PROFILE_DIR={prof}'):
         assert flag in plan, (flag, plan)
 
@@ -130,7 +130,7 @@ def test_graph_reserve_policy_reaches_plan_and_coordinator_not_workers(tmp_path,
     config = {"model_type": "glm_moe_dsa", "num_hidden_layers": 4, "first_k_dense_replace": 3}
     result = _family_launch_result(tmp_path, config, "test/glm", keys)
     assert result.returncode == 0, result.stderr
-    plan = next(line for line in result.stderr.splitlines() if 'cuteafd plan' in line)
+    plan = next(line for line in result.stderr.splitlines() if 'cuteafd plan' in line and '--deployment' in line)
     coordinator = next(line for line in result.stderr.splitlines() if 'cuteafd serve-glm' in line)
     for line in (plan, coordinator):
         for value in expected:

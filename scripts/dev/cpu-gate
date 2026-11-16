@@ -538,7 +538,7 @@ def cargo(source, root, args, env):
     if 'error' in result:
         return {**result, 'status': 'failed'}
     full = getattr(args, 'full', False)
-    if full and not args.skip_live_planners:
+    if not args.skip_live_planners:
         # Installed launcher checks import the same pytest helpers as the script suite.
         env['CUTEAFD_TEST_PYTHON'] = str(python_for(source))
     if not args.skip_live_planners:

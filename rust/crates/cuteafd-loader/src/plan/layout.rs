@@ -148,6 +148,7 @@ pub struct LayoutOptions {
     pub mimo_rings: u64,
     /// Sliding/native-MTP ring storage, independent of the full-attention pool.
     pub mimo_swa_kv: crate::families::mimo_v2::MimoKvCache,
+    pub mimo_full_kv: crate::families::mimo_v2::MimoKvCache,
     /// MiMo Spark activation format, matching serving's --expert-input.
     pub mimo_expert_input: crate::families::mimo_v2::MimoExpertInput,
     /// Drafter batch override; absent uses the family serving default.
@@ -314,6 +315,7 @@ impl Default for LayoutOptions {
             mimo_prefix_draft: false,
             mimo_rings: 0,
             mimo_swa_kv: crate::families::mimo_v2::MimoKvFormats::default().sliding,
+            mimo_full_kv: crate::families::mimo_v2::MimoKvCache::Int8,
             mimo_expert_input: Default::default(),
             draft_sequences: None,
             v41_draft_width: 5,
@@ -1532,7 +1534,7 @@ fn selected_host_geometry(report: &mut PlanReport, options: &LayoutOptions, chec
     let selected = CacheOptions { coordinator_ranks: ranks,
         attention_placement: Some(report.attention_placement),
         native_mtp_layers: if matches!(id, "deepseek_v4" | "qwen4") { shape.native_layers } else { 0 },
-        mimo_kv: crate::families::mimo_v2::MimoKvFormats { full: crate::families::mimo_v2::MimoKvCache::Int8, sliding: options.mimo_swa_kv },
+        mimo_kv: crate::families::mimo_v2::MimoKvFormats { full: options.mimo_full_kv, sliding: options.mimo_swa_kv },
         dense_qwen_kv: options.dense_qwen_kv, qwen_kv: options.qwen_kv, mla_kv: options.mla_kv,
         step5_kv: options.step5_kv, muse_kv: options.muse_kv,
         prefill_rows: report.prefill_unit_rows.unwrap_or(admitted_rows.unwrap_or(shape.prefill_rows)),

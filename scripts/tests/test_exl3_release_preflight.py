@@ -1,7 +1,7 @@
 """Exercise the real launcher without contacting Docker, SSH or a GPU."""
 import json
 from inspect import getsource
-from launcher_sandbox import fake_deployment_memory_layout
+from launcher_sandbox import fake_deployment_memory_layout, fake_resolved_settings
 import os
 from pathlib import Path
 import subprocess
@@ -10,7 +10,7 @@ import tempfile
 import unittest
 
 ROOT = Path(__file__).resolve().parents[2]
-MOCK = getsource(fake_deployment_memory_layout) + r'''
+MOCK = getsource(fake_deployment_memory_layout) + "\n" + getsource(fake_resolved_settings) + r'''
 import json, os, subprocess, sys
 from pathlib import Path
 tool = Path(sys.argv[0]).name
@@ -37,7 +37,7 @@ if tool == 'docker':
             return args[args.index(flag) + 1] if flag in args else default
         ranks = int(value('--spark-ranks'))
         gpus = int(value('--rtx', '1'))
-        print(json.dumps(dict(spark_expert_world=ranks,
+        print(json.dumps(dict(resolved_settings=fake_resolved_settings(args, "deepseek_v41", ranks), spark_expert_world=ranks,
             spark_roles=[dict(rank=i, experts=True, layers=[], encoder=None, audio_encoder=None, drafter=None) for i in range(ranks)], spark_ranks=ranks, prefill_unit_rows=rows or 1024,
             prefill_waves=1, prefill_span_rows=rows or 1024, prefill_reserve_rows=8192, decode_lanes=2,
             version=1, family='deepseek_v41', executable=True, wip_launchable=True,

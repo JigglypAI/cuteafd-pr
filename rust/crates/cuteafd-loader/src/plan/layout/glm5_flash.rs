@@ -77,7 +77,7 @@ fn layout_with_native(report: &mut PlanReport, model: &dyn super::super::FamilyM
     let mut notes = vec![format!("resolved context {context} tokens")];
     let ranks = if options.head_split && options.rtx_bytes.len() >= 2 { 2 } else { 1 };
     report.replay_records = Some(if options.glmf_shared_replay
-        || (options.glmf_auto_replay && ranks == 1 && options.pool_tokens.filter(|&n| n > 0).is_none() && expert_world > 0) {
+        || (options.glmf_auto_replay && cuteafd_core::launch_settings::glmf_replay_records(None, None, ranks, options.pool_tokens.filter(|&n| n > 0).is_none(), expert_world > 0).value == "shared") {
         "shared"
     } else {
         "own"
@@ -210,7 +210,7 @@ fn layout_with_native(report: &mut PlanReport, model: &dyn super::super::FamilyM
             options.glmf_mark_lanes.unwrap_or(sequences), options.prefix_entries("glm5_flash"),
             geometry.ranks.iter().map(|r| r.retained_mark_bytes).sum(), options.mimo_prefix_mark_bytes, options.host_cache_bytes != Some(0)));
         let shared_replay = options.glmf_shared_replay
-            || (options.glmf_auto_replay && ranks == 1 && options.pool_tokens.filter(|&n| n > 0).is_none() && expert_world > 0);
+            || (options.glmf_auto_replay && cuteafd_core::launch_settings::glmf_replay_records(None, None, ranks, options.pool_tokens.filter(|&n| n > 0).is_none(), expert_world > 0).value == "shared");
         let shared = if shared_replay { crate::serving_capacity::glm_flash_kda_replay_bytes_rows(&cfg, cfg.layers, ranks, decode_rows)? } else { 0 };
         let local_shared = if options.glmf_shared_replay { shared } else { 0 };
         let step_workspace = |placement: &ExpertPlacement, lanes, shared| manifest.and_then(|m|
@@ -485,7 +485,7 @@ fn layout_with_native(report: &mut PlanReport, model: &dyn super::super::FamilyM
     match admitted {
         Ok((placed, working)) => {
             report.replay_records = Some(if options.glmf_shared_replay
-                || (options.glmf_auto_replay && ranks == 1 && options.pool_tokens.filter(|&n| n > 0).is_none() && working.spark_ranks > 0) {
+                || (options.glmf_auto_replay && cuteafd_core::launch_settings::glmf_replay_records(None, None, ranks, options.pool_tokens.filter(|&n| n > 0).is_none(), working.spark_ranks > 0).value == "shared") {
                 "shared"
             } else {
                 "own"

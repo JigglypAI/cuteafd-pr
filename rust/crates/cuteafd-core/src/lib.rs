@@ -42,6 +42,7 @@ mod engram;
 pub mod prefix;
 pub mod serving_capacity;
 pub mod concurrency;
+pub mod launch_settings;
 pub mod thermal;
 pub mod push_outcome;
 pub mod memory_layout;

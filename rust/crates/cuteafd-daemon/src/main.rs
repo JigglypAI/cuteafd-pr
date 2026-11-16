@@ -333,6 +333,13 @@ async fn run() -> Result<()> {
         match Cli::from_arg_matches(&matches) {
             Ok(mut cli) => {
                 cli::resolve_tp2_dflash(&mut cli.command, &matches);
+                if let Commands::Plan(args) = &mut cli.command {
+                    if let Some((_, options)) = matches.subcommand() {
+                        args.explicit_settings = options.ids().filter(|id| matches!(options.value_source(id.as_str()),
+                            Some(clap::parser::ValueSource::CommandLine | clap::parser::ValueSource::EnvVariable)))
+                            .map(|id| id.to_string()).collect();
+                    }
+                }
                 (cli.command, matches, cli.memory, cli.vision, cli.audio, cli.max_image_tokens, cli.image_url_fetch,
                     cuteafd_transport::wait_policy::WaitPolicy { wait: cli.host_wait,
                         idle_park: std::time::Duration::from_secs_f64(cli.idle_park_seconds) }, cuteafd_core::spark_reply::SparkReplyFormats {
@@ -413,7 +420,7 @@ async fn run() -> Result<()> {
         family_fetch.or(initial_fetch).unwrap_or(cuteafd_api::openai::media::ImageUrlFetch::Public))?;
     let weight_budget_gib = family_weight_budget.or(initial_weight_budget);
     if let Commands::Plan(args) = &mut command {
-        args.coordinator_weight_budget_gib = weight_budget_gib.unwrap_or(80.0);
+        args.coordinator_weight_budget_gib = weight_budget_gib;
     } else if let Some(gib) = weight_budget_gib {
         let bytes = cuteafd_loader::plan::budget_bytes("--coordinator-weight-budget-gib", gib)?;
         shared::memory::budget::set_resident_weight_limit(cuteafd_loader::placement::ResidentWeights(bytes))?;

@@ -145,7 +145,7 @@ pub(crate) struct Cli {
     #[command(flatten)]
     pub(crate) memory: MemoryArgs,
     /// Retained checkpoint weights per coordinator GPU, including drafter
-    /// weights (default 80 GiB); independent of KV, workspace and total memory.
+    /// weights (plan: device capacity after caps; serve: 80 GiB); independent of KV and workspace.
     #[arg(long, global = true)]
     pub(crate) coordinator_weight_budget_gib: Option<f64>,
     /// How host threads wait while serving: `block` (default: each
@@ -356,6 +356,8 @@ pub(crate) fn core_view_settings(view: &cuteafd_loader::plan::checkpoint::Checkp
 
 #[derive(Debug, Clone, Args)]
 pub(crate) struct PlanArgs {
+    #[arg(skip)]
+    pub(crate) explicit_settings: std::collections::BTreeSet<String>,
     #[cfg(test)]
     #[arg(skip)]
     pub(crate) test_host_memory: Option<(u64, u64)>,
@@ -408,13 +410,19 @@ pub(crate) struct PlanArgs {
     #[arg(long, conflicts_with_all = ["deployment", "files", "fetch", "role"])]
     pub(crate) spark_range: bool,
     /// Resolved global resident-weight ceiling, including drafter weights.
-    #[arg(skip = 80.0)]
-    pub(crate) coordinator_weight_budget_gib: f64,
+    #[arg(skip)]
+    pub(crate) coordinator_weight_budget_gib: Option<f64>,
     /// Resolved global memory policy (caps, reserves, KV target/min/max).
     #[arg(skip)]
     pub(crate) memory: MemoryArgs,
     #[arg(long, default_value_t = false)]
     pub(crate) json: bool,
+    /// Original Hugging Face identity when MODEL is a mounted snapshot path.
+    #[arg(long, hide = true)]
+    pub(crate) checkpoint_model_id: Option<String>,
+    /// Resolve deterministic launch settings without computing placement.
+    #[arg(long, hide = true)]
+    pub(crate) resolve_settings_only: bool,
     /// Emit typed launch decisions; live artifact verification stays with the launcher.
     #[arg(long, conflicts_with_all = ["files", "fetch", "role", "file_layout"])]
     pub(crate) deployment: bool,
@@ -477,8 +485,8 @@ pub(crate) struct PlanArgs {
     #[arg(long, action = clap::ArgAction::Set)]
     pub(crate) draft_fp8: Option<bool>,
     /// GLM Flash FP8 drafter GEMM row mode.
-    #[arg(long, default_value = "w8a16")]
-    pub(crate) draft_linear: crate::shared::fp8_linear::Fp8Rows,
+    #[arg(long)]
+    pub(crate) draft_linear: Option<crate::shared::fp8_linear::Fp8Rows>,
     /// Separately configured vision checkpoint to include in JSON inventory.
     #[arg(long)]
     pub(crate) vision_snapshot: Option<PathBuf>,
@@ -572,12 +580,12 @@ pub(crate) struct PlanArgs {
     #[arg(long, default_value_t = 64, value_parser = plan_decode_rows)]
     pub(crate) decode_rows: u64,
     /// GLM 5.3 Flash's DSA index storage for --layout (compact is single-GPU only).
-    #[arg(long, value_enum, default_value = "keys")]
-    pub(crate) index_cache: crate::families::glm5_flash::engine::IndexCache,
+    #[arg(long, value_enum)]
+    pub(crate) index_cache: Option<crate::families::glm5_flash::engine::IndexCache>,
     /// GLM 5.3 Flash's replay records for --layout (`shared`: in the prefill scratch, one GPU;
     /// `auto`: `shared` on one GPU with an automatic pool and admitted Spark experts, else `own`).
-    #[arg(long, value_enum, default_value = "own")]
-    pub(crate) replay_records: PlanReplayRecords,
+    #[arg(long, value_enum)]
+    pub(crate) replay_records: Option<PlanReplayRecords>,
     /// Concurrent sequences for --layout (0: family serving default; otherwise 8 at <=32 GiB, 16 above).
     #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(u64).range(0..=64))]
     pub(crate) concurrency: u64,
@@ -621,6 +629,9 @@ pub(crate) struct PlanArgs {
     /// MiMo sliding and native-MTP ring format for --layout (matches serving).
     #[arg(long, value_enum, default_value = "int8")]
     pub(crate) mimo_swa_kv_cache: crate::families::mimo_v2::SwaKvCacheArg,
+    /// MiMo full-attention KV format; separate from MLA cache formats.
+    #[arg(long, value_enum, default_value = "int8")]
+    pub(crate) mimo_kv_cache: crate::families::mimo_v2::KvCacheArg,
     /// MiMo Spark activation format for --layout (matches serve-mimo).
     #[arg(long, value_enum, default_value = "fp8")]
     pub(crate) expert_input: crate::families::mimo_v2::engine::ExpertInput,

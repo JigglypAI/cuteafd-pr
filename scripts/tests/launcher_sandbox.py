@@ -84,6 +84,52 @@ def fake_deployment_memory_layout(rtx, ranks, spark_memory_cap=None):
     ]}
 
 
+def fake_resolved_settings(args, family, sparks):
+    """Canned launch-ABI response; real resolver/fit parity uses the CPU binary."""
+    from pathlib import Path
+    def value(flag, default=None):
+        return args[args.index(flag) + 1] if flag in args else default
+    config = {}
+    path = value("--config")
+    if path:
+        for index, arg in enumerate(args[:-1]):
+            if arg in ("-v", "--volume"):
+                parts = args[index + 1].split(":")
+                if len(parts) > 1 and parts[1] == path:
+                    path = parts[0]
+        if Path(path).is_file():
+            config = dict(line.split("=", 1) for line in Path(path).read_text().splitlines()
+                          if "=" in line and not line.startswith("#"))
+    def resolved(flag, key, auto):
+        explicit = value(flag)
+        configured = config.get(key)
+        raw = explicit if explicit is not None else configured
+        return {"value": auto if raw in (None, "", "auto") else raw,
+                "provenance": "explicit" if explicit else "config" if configured not in (None, "", "auto") else "auto"}
+    tp = int(value("--rtx", "1"))
+    shared = tp == 1 and int(value("--pool-tokens", "0") or 0) == 0 and int(sparks) > 0
+    result = {"coordinator_weight_budget_gib": {
+        "value": int(value("--gpu-memory-cap", str(96 << 30))) / 2**30, "provenance": "auto"}}
+    if family == "kimi_k3":
+        result["draft_fp8"] = {"value": True, "provenance": "auto"}
+    if family == "mimo_v2":
+        result["native_mtp_layers"] = {"value": int(config.get("SPECULATOR_DEPTH") or 1) if value("--speculator") == "mtp" else 0, "provenance": "auto"}
+    if family == "glm5_flash":
+        result.update(index_cache=resolved("--index-cache", "GLM5_FLASH_INDEX_CACHE", "compact" if tp == 1 else "keys"),
+            draft_linear=resolved("--draft-linear", "GLM5_FLASH_DRAFT_LINEAR",
+                "w8a8" if value("--speculator", "off") != "off" and config.get("SPECULATOR_FP8") != "off" else "w8a16"),
+            replay_records=resolved("--replay-records", "GLM5_FLASH_REPLAY_RECORDS", "shared" if shared else "own"))
+        if result["index_cache"]["value"] not in ("keys", "compact"):
+            raise SystemExit("GLM5_FLASH_INDEX_CACHE must be keys or compact")
+        if result["draft_linear"]["value"] not in ("w8a16", "wide", "w8a8"):
+            raise SystemExit("GLM5_FLASH_DRAFT_LINEAR must be w8a16, wide or w8a8")
+        if result["replay_records"]["value"] not in ("own", "shared"):
+            raise SystemExit("GLM5_FLASH_REPLAY_RECORDS must be own or shared")
+        if result["replay_records"]["value"] == "shared" and tp != 1:
+            raise SystemExit("GLM5_FLASH_REPLAY_RECORDS=shared keeps the records in one GPU's prefill scratch; serve it without a head split")
+    return result
+
+
 def stub_cuda_capacity(common, total_bytes):
     """Launcher captures fake the host; driver/UUID behavior has its own unit tests."""
     common = Path(common)

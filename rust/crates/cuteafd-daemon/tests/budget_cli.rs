@@ -30,6 +30,89 @@ fn plan_accepts_the_global_memory_policy_and_refuses_removed_budget_flags() {
 }
 
 #[test]
+fn unknown_config_keys_do_not_change_settings() {
+    let snapshot = tempfile::tempdir().unwrap();
+    std::fs::write(snapshot.path().join("config.json"), r#"{"model_type":"glm5_next"}"#).unwrap();
+    for key in ["DFLASH", "MTP", "UNRECOGNIZED_KEY"] {
+        let config = snapshot.path().join("launch.config");
+        std::fs::write(&config, format!("SPECULATOR=off\n{key}=on\n")).unwrap();
+        let output = test_command(env!("CARGO_BIN_EXE_cuteafd"))
+            .args(["plan", snapshot.path().to_str().unwrap(), "--resolve-settings-only", "--config"])
+            .arg(&config).output().unwrap();
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(value["speculator"], "off");
+    }
+}
+
+#[test]
+fn settings_query_rejects_shared_replay_before_placement() {
+    let snapshot = tempfile::tempdir().unwrap();
+    std::fs::write(snapshot.path().join("config.json"), r#"{"model_type":"glm5_next"}"#).unwrap();
+    let config = snapshot.path().join("launch.config");
+    std::fs::write(&config, "GLM5_FLASH_REPLAY_RECORDS=shared\n").unwrap();
+    let output = test_command(env!("CARGO_BIN_EXE_cuteafd"))
+        .args(["plan", snapshot.path().to_str().unwrap(), "--resolve-settings-only", "--rtx", "2", "--config"])
+        .arg(&config).output().unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("serve it without a head split"));
+}
+
+#[test]
+fn mimo_automatic_drafter_uses_official_identity_not_directory() {
+    let snapshot = tempfile::tempdir().unwrap();
+    std::fs::write(snapshot.path().join("config.json"), r#"{"model_type":"mimo_v2"}"#).unwrap();
+    for present in [false, true] {
+        if present { std::fs::create_dir(snapshot.path().join("dflash")).unwrap(); }
+        for (id, expected) in [("XiaomiMiMo/MiMo-V2.6-Flash-MOPD", "dflash2"),
+            ("XiaomiMiMo/MiMo-V2.6-Pro-MOPD", "dflash2"), ("community/lookalike", "off")] {
+            let output = test_command(env!("CARGO_BIN_EXE_cuteafd"))
+                .args(["plan", snapshot.path().to_str().unwrap(), "--resolve-settings-only", "--checkpoint-model-id", id])
+                .output().unwrap();
+            assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+            let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(value["speculator"], expected, "{id}, directory={present}");
+        }
+    }
+}
+
+#[test]
+fn settings_query_reports_final_explicit_speculator_overrides() {
+    for family in ["glm5_next", "mimo_v2"] {
+        let snapshot = tempfile::tempdir().unwrap();
+        std::fs::write(snapshot.path().join("config.json"), serde_json::json!({"model_type": family}).to_string()).unwrap();
+        let config = snapshot.path().join("launch.config");
+        for (configured, flag, expected) in [("dflash2", "--no-speculator", "off"),
+            ("off", "--include-speculator", if family == "glm5_next" { "dflash2" } else { "mtp" })] {
+            std::fs::write(&config, format!("SPECULATOR={configured}\n")).unwrap();
+            let output = test_command(env!("CARGO_BIN_EXE_cuteafd"))
+                .args(["plan", snapshot.path().to_str().unwrap(), "--resolve-settings-only", "--config"])
+                .arg(&config).arg(flag).output().unwrap();
+            assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+            let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(value["speculator"], expected);
+            assert_eq!(value["resolved_settings"]["speculator"]["value"], expected);
+            assert_eq!(value["resolved_settings"]["speculator"]["provenance"], "explicit");
+        }
+    }
+}
+
+#[test]
+fn settings_only_needs_config_not_checkpoint_inventory() {
+    let snapshot = tempfile::tempdir().unwrap();
+    std::fs::write(snapshot.path().join("config.json"), r#"{"model_type":"glm5_next"}"#).unwrap();
+    // A malformed MC manifest and absent tensor index prove this never selects a view.
+    std::fs::write(snapshot.path().join("cuteafd-mc.json"), "not json").unwrap();
+    let output = test_command(env!("CARGO_BIN_EXE_cuteafd"))
+        .args(["plan", snapshot.path().to_str().unwrap(), "--resolve-settings-only", "--speculator", "off"])
+        .output().unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let settings: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(settings["resolved_settings"]["index_cache"]["value"], "compact");
+    assert_eq!(settings["resolved_settings"]["draft_linear"]["value"], "w8a16");
+}
+
+#[test]
 fn budgeted_inventory_plans_carry_their_host_across_crate_boundaries() {
     use cuteafd_loader::plan::{self, testing::{self, BudgetedPlanInput, SimulatedHost}};
     let snapshot = tempfile::tempdir().unwrap();
@@ -902,6 +985,28 @@ fn installed_example_memory_args_share_launcher_profile_and_weight_budget() {
         let args = installed_launcher_memory_args(&root, configured);
         assert_eq!(args[1].parse::<u64>().unwrap(), expected);
         assert_eq!(args[3].parse::<f64>().unwrap(), expected as f64 / (1u64 << 30) as f64);
+    }
+}
+
+#[test]
+fn installed_launcher_and_direct_config_resolver_parity() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
+    let hf_home = require_installed_hf_home("installed_launcher_and_direct_config_resolver_parity",
+        std::env::var_os("CUTEAFD_DEPLOYMENT_TEST_HF_HOME"));
+    let programs = installed_example_programs(std::env::var_os("CUTEAFD_DEPLOYMENT_TEST_PROGRAMS").map(Into::into),
+        &std::path::PathBuf::from(std::env::var_os("HOME").expect("HOME")));
+    let matrix: serde_json::Value = serde_json::from_slice(&std::fs::read(root.join("benchmarks/current-matrix.json")).unwrap()).unwrap();
+    let retired = retired_configs(&matrix);
+    let mut examples = std::fs::read_dir(root.join("examples/configs")).unwrap()
+        .map(|entry| entry.unwrap().path()).filter(|path| path.extension().is_some_and(|v| v == "config")
+            && !retired.contains(path.strip_prefix(&root).unwrap().to_str().unwrap())).collect::<Vec<_>>();
+    examples.sort();
+    for example in examples {
+        let raw = std::fs::read_to_string(&example).unwrap();
+        let config = raw.lines().filter_map(|line| line.split_once('=')).collect::<std::collections::BTreeMap<_, _>>();
+        let snapshot = require_installed_snapshot(example.to_str().unwrap(), config["MODEL_ID"], config.get("MODEL_REVISION").copied(), &hf_home);
+        eprintln!("resolver parity: {}", example.display());
+        installed_real_planner_launch(&root, "capture_resolver_config_parity", &snapshot, &example, &programs, &hf_home);
     }
 }
 
