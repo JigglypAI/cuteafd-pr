@@ -1250,6 +1250,15 @@ def test_projected_operand_data_contract_matches_exporter_declarations():
     assert actual == contracts
 
 
+def test_kimi_k31_dspark_exports_checkpoint_native_gqa_projections(exporter):
+    shapes = exporter.draft_bf16_shapes()
+    expected = {(35840, 7168), (7168, 8192), (7168, 2048),
+                (6144, 7168), (7168, 28672), (14336, 7168)}
+    assert {shape for shape, families in shapes.items() if "dspark-kimi-k31" in families} == expected
+    old = {shape for shape, families in shapes.items() if "dspark-kimi" in families}
+    assert expected - old == {(7168, 8192), (6144, 7168)}
+
+
 def test_glmf_tp2_drafter_exports_every_rank_local_projection(exporter):
     shapes = exporter.draft_bf16_shapes()
     expected = {(20480, 4096), (4096, 3072), (4096, 1024),
