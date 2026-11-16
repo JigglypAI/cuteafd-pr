@@ -137,7 +137,13 @@ impl PerceptionGeometry {
         out
     }
 
-    /// One aligned BF16 arena; return physical bytes, not payload plus backing.
+    /// Reference constants: Inkling uses Python float64 power then F32, while
+    /// Step builds CPU Torch F32 1/pow(10000, arange(0,48,2)/48). These immutable
+    /// bit patterns are checked against the pinned vendor builders on both GPUs.
+    pub fn inv_freq(self) -> Vec<f32> { self.kind.inv_freq() }
+
+    /// One aligned BF16 arena plus its immutable FP32 frequencies; return
+    /// physical bytes, never payload plus backing.
     pub fn resident_weights<'a>(self, tensors: impl Iterator<Item=&'a SafetensorsTensorMetadata>) -> Result<u64, String> {
         let mut catalog = BTreeMap::new();
         for tensor in tensors.filter(|t| self.is_tensor(&t.name)) {
@@ -158,8 +164,25 @@ impl PerceptionGeometry {
             }
             bytes = bytes.div_ceil(256)*256 + extent;
         }
-        Ok(bytes.div_ceil(256)*256)
+        Ok(bytes.div_ceil(256)*256 + self.inv_freq().len() as u64*4)
     }
+}
+
+impl PerceptionKind {
+    pub fn inv_freq(self) -> Vec<f32> {
+        let bits: &[u32] = match self {
+            PerceptionKind::Inkling2 => &[0x3f800000,0x3f0ff59a,0x3ea1e89b,0x3e361887,
+                0x3dcccccd,0x3d6655c3,0x3d0186e2,0x3c91ad39,0x3c23d70a,0x3bb8449c,
+                0x3b4f3e37,0x3ae91528,0x3a83126f,0x3a136a16,0x39a5cb5f,0x393a7753],
+            PerceptionKind::Step5 => &[0x3f800000,0x3f2e6928,0x3eeda63c,0x3ea1e89b,
+                0x3e5c9d35,0x3e164d7a,0x3dcccccd,0x3d8b8754,0x3d3e1e95,0x3d0186e3,
+                0x3cb07dc7,0x3c707bf6,0x3c23d70a,0x3bdf3ee9,0x3b98187a,0x3b4f3e38,
+                0x3b0d3169,0x3ac0632e,0x3a83126f,0x3a3298ba,0x39f35a5c,0x39a5cb60,
+                0x3961e8a7,0x3919e8f2],
+        };
+        bits.iter().copied().map(f32::from_bits).collect()
+    }
+
 }
 
 #[cfg(test)]
@@ -185,7 +208,7 @@ mod tests {
             let tensors = headers(g);
             assert_eq!(tensors.len(),count);
             let checkpoint_bytes = match kind { PerceptionKind::Inkling2 => 655_386_624, PerceptionKind::Step5 => 3_962_029_568 };
-            assert_eq!(g.resident_weights(tensors.iter()).unwrap(),checkpoint_bytes);
+            assert_eq!(g.resident_weights(tensors.iter()).unwrap(),checkpoint_bytes+g.inv_freq().len() as u64*4);
             assert_eq!(checkpoint_bytes, tensors.iter().map(|t| t.byte_length).sum::<u64>());
             assert!(g.resident_weights(tensors.iter().skip(1)).is_err());
             let mut wrong = tensors.clone(); wrong[0].dtype = DType::F32;

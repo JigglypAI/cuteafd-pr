@@ -421,7 +421,9 @@ impl TowerSpec {
     }
     fn frequency_bytes(&self) -> Vec<u8> {
         if self.native.inv_freq == NO_VISION_OFFSET { return Vec::new(); }
-        let values = if self.native.reserved == mistral::RESERVED {
+        let values = if self.native.perception.is_some() {
+            perception::inv_freq(self.native.reserved)
+        } else if self.native.reserved == mistral::RESERVED {
             mistral::axial_inv_freq().into_iter().collect::<Vec<_>>()
         } else {
             let frequencies = if self.native.abi_version == 2 { self.native.head_dim as usize / 4 } else { 16 };

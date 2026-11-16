@@ -152,7 +152,7 @@ impl Binding {
                 && image.grid.w % 2 == 0 && image.tokens == (image.grid.h as usize * image.grid.w as usize) / 4,
                 "Muse image grid/token count differs; video is unsupported");
             inputs.push((TowerKind::Image, image.tokens, image.key.into()));
-            jobs.push(EncodeJob::image(image.key, [1, image.grid.h, image.grid.w], image.rgb8.clone(), image.tokens, hidden));
+            jobs.push(EncodeJob::image_with_pixels(image.key, [1, image.grid.h, image.grid.w], image.rgb8.clone(), image.pixels, image.tokens, hidden));
         }
         for clip in &job.audio {
             ensure!(clip.geometry.policy == policy && policy.tokens(clip.pcm.len()) == Some(clip.geometry.tokens),

@@ -141,6 +141,18 @@ impl EncoderClient for FakeEncoder {
 mod audio_geometry_tests {
     use super::*;
     #[test]
+    fn image_source_pixels_are_distinct_from_grid_and_canvas() {
+        use cuteafd_core::media::ImagePixels;
+        let plain = EncodeJob::image(ImageKey([0;32]),[1,2,2],vec![0;32*32*3].into(),1,16);
+        assert_eq!(plain.pixels(16).unwrap(),ImagePixels::full(32,32));
+        let pixels = ImagePixels {source:[23,29],canvas:[40,40],content:[0,0,23,29]};
+        let mut padded = EncodeJob::image_with_pixels(ImageKey([1;32]),[1,2,2],vec![0;40*40*3].into(),pixels,1,16);
+        assert!(padded.validate().is_ok());assert_eq!(padded.pixels(20).unwrap(),pixels);
+        if let EncodeInput::Image {pixels,..} = &mut padded.input {pixels.as_mut().unwrap().content=[0,0,41,40];}
+        assert!(padded.validate().is_err());
+        assert!(plain.pixels(u32::MAX).is_err());
+    }
+    #[test]
     fn audio_admission_uses_declared_geometry_not_mimo_counts() {
         let policy = AudioTokenGeometry::PcmPatches { samples_per_token: 1920 };
         for samples in [1usize, 480, 481, 1920, 1921, 24000] {

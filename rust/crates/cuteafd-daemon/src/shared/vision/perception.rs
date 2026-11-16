@@ -3,6 +3,11 @@ use super::*;
 use cuteafd_ffi::vision::PerceptionSpec;
 use cuteafd_loader::media::perception_vision::{PerceptionGeometry, PerceptionKind};
 
+pub(super) fn inv_freq(kind: u32) -> Vec<f32> {
+    match kind {6 => PerceptionKind::Inkling2.inv_freq(),7 => PerceptionKind::Step5.inv_freq(),
+        _ => Vec::new() }
+}
+
 impl TowerSpec {
     pub fn perception(snapshot: &Path, max_tokens: usize) -> Result<Self> {
         let cfg: serde_json::Value = cuteafd_loader::read_json_file(&snapshot.join("config.json"))?;
@@ -29,7 +34,7 @@ impl TowerSpec {
             reads.push(TensorRead { path:path.clone(),metadata:metadata.clone(),destination:cursor,vector:false });
             cursor += metadata.byte_length as usize;
         }
-        if cursor.div_ceil(256)*256 != bytes as usize {
+        if cursor.div_ceil(256)*256+g.inv_freq().len()*4 != bytes as usize {
             return Err(VisionError::Unsupported("PE planner/packing arena mismatch".into()));
         }
         let inkling = g.kind == PerceptionKind::Inkling2;
@@ -47,7 +52,7 @@ impl TowerSpec {
             hidden:g.hidden as u32,heads:g.heads as u32,kv_heads:g.heads as u32,
             head_dim:(g.hidden/g.heads) as u32,intermediate:g.intermediate as u32,
             patch_size:g.patch as u32,merger_width:(4*g.hidden) as u32,norm_eps:1e-5,
-            inv_freq:NO_VISION_OFFSET,patch_bias:NO_VISION_OFFSET,
+            inv_freq:(cursor.div_ceil(256)*256) as u64,patch_bias:NO_VISION_OFFSET,
             merger_norm:NO_VISION_OFFSET,merger_norm_bias:NO_VISION_OFFSET,
             merger_fc1:NO_VISION_OFFSET,merger_fc2:NO_VISION_OFFSET,
             merger_fc1_bias:NO_VISION_OFFSET,merger_fc2_bias:NO_VISION_OFFSET,
@@ -144,12 +149,13 @@ mod tests {
             assert_eq!(pe.scale2.len(),tower.native.depth as usize);
             assert!(pe.scale1.iter().all(|offset| offset%256==0 && *offset<tower.native.weight_bytes));
             assert!(tower.reads.iter().all(|read| !read.vector && read.destination%256==0));
-            assert!(tower.frequency_bytes().is_empty());
+            assert_eq!(tower.frequency_bytes().len(),if inkling {64} else {96});
+            assert_eq!(tower.native.inv_freq+tower.frequency_bytes().len() as u64,tower.native.weight_bytes);
             let contribution = push::Contribution::prepare(0,Some((&tower,0x100000)),None,None,None).unwrap();
             let records = contribution.records();
             assert_eq!(records.operands.len(),tower.reads.len());
             assert!(records.steps.is_empty());
-            assert_eq!(records.operands.iter().map(|operand| operand.bytes as u64).sum::<u64>(),tower.native.weight_bytes);
+            assert_eq!(records.operands.iter().map(|operand| operand.bytes as u64).sum::<u64>()+tower.frequency_bytes().len() as u64,tower.native.weight_bytes);
             assert!(TowerSpec::perception(directory.path(),0).is_err());
             assert!(TowerSpec::perception(directory.path(),4097).is_err());
         }

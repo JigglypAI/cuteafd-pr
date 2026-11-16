@@ -254,7 +254,7 @@ pub(super) fn prepare(job: NativeRequest, tokens: Vec<u32>, config: &serde_json:
     crate::shared::probe::image_echo(&job, &spans)?;
     let media = RequestMedia::new(spans.clone(), hidden, tokens.len())?;
     let keys = MediaKeys::new(&tokens, vocabulary as u32, &spans)?;
-    let jobs = job.media.iter().map(|image| EncodeJob::image(image.key, [image.grid.t, image.grid.h, image.grid.w], image.rgb8.clone(), image.tokens, hidden)).collect();
+    let jobs = job.media.iter().map(|image| EncodeJob::image_with_pixels(image.key, [image.grid.t, image.grid.h, image.grid.w], image.rgb8.clone(), image.pixels, image.tokens, hidden)).collect();
     Ok((Prompt { job, tokens, keys }, media, jobs))
 }
 
