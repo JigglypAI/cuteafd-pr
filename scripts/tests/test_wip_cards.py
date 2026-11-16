@@ -2527,6 +2527,7 @@ def test_every_required_smoke_field_is_advertised_by_the_dry_run():
     dry_run = (ROOT / 'rust/crates/cuteafd-bench/src/smoke.rs').read_text()
     line = next(text for text in dry_run.splitlines() if 'api_key_file={}' in text)
     advertised = set(re.findall(r'([a-z_0-9]+)=\{', line))
+    assert 'lossless_concurrency' in required
     assert required <= advertised, sorted(required - advertised)
 
 

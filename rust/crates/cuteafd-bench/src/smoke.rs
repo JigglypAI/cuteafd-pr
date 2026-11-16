@@ -1047,12 +1047,12 @@ pub fn run(args: SmokeArgs) -> Result<()> {
     eprintln!("{} entries, {} to run, build {build}, up to {} at once", entries.len(), pending.len(), args.parallel);
     if args.dry_run {
         for e in &pending {
-            eprintln!("  {} api_key_file={} family={} gpus={:?} sparks={:?} locks={:?} levels={:?} post_load_c1={} post_load_repeat={} prefill_lengths={:?} prefill_repeat={} prefill_idle_seconds={} prefill_purge={} sweep_tokens={} baseline={} window={} lossless_set={} lossless_dump={:?} context_lengths={:?} context_levels={:?} context_suffix={} panel_config={} fabric={} worker_stop={} set={:?}",
+            eprintln!("  {} api_key_file={} family={} gpus={:?} sparks={:?} locks={:?} levels={:?} post_load_c1={} post_load_repeat={} prefill_lengths={:?} prefill_repeat={} prefill_idle_seconds={} prefill_purge={} sweep_tokens={} baseline={} window={} lossless_set={} lossless_dump={:?} lossless_concurrency={} context_lengths={:?} context_levels={:?} context_suffix={} panel_config={} fabric={} worker_stop={} set={:?}",
                 e.name, e.set.get("API_KEY_FILE").map_or("-", String::as_str), e.family.as_deref().unwrap_or("?"), e.gpus, e.sparks, locks_for(e), e.levels,
                 e.post_load_c1.unwrap_or(false), e.post_load_repeat.unwrap_or(false), e.prefill_lengths,
                 e.prefill_repeat.unwrap_or(false), e.prefill_idle_seconds.unwrap_or(0.0), e.prefill_purge.is_some(),
                 e.sweep_tokens.unwrap_or(crate::sweep::TOKENS), e.baseline.unwrap_or(true), e.window.is_some(),
-                e.lossless_set.as_deref().unwrap_or("default"), e.lossless_dump, e.context_lengths, e.context_levels, e.context_suffix.unwrap_or(0), serde_json::json!(e.panel_config), e.fabric.unwrap_or(true),
+                e.lossless_set.as_deref().unwrap_or("default"), e.lossless_dump, e.lossless_concurrency.unwrap_or(1), e.context_lengths, e.context_levels, e.context_suffix.unwrap_or(0), serde_json::json!(e.panel_config), e.fabric.unwrap_or(true),
                 WORKER_STOP, e.set);
         }
         return Ok(());
