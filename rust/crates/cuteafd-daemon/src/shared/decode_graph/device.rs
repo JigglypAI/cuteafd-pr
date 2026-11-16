@@ -752,6 +752,7 @@ impl LaneCycles {
                 let mut cache = cache.lock().unwrap_or_else(|p| p.into_inner());
                 cache.concurrent_cycles = concurrent_cycles as u64;
                 cache.lane_max_cycles[lane] = concurrent_cycles as u64;
+                cache.donor_epoch = None;
                 HIT_EPOCHS.with(|epochs| { epochs.borrow_mut().insert(cache.device,
                     cache.clocks.as_ref().each_ref().map(|clock| clock.index.load(Ordering::Acquire))); });
                 cache.clocks.clone()
@@ -1339,6 +1340,9 @@ impl DeviceCache {
     fn refresh_donors(&mut self, hard: bool) {
         let epoch = (self.lanes.each_ref().map(|lane| lane.index), hard);
         if self.donor_epoch == Some(epoch) { return }
+        // Rebuild once for a changed owner clock, never once per layer miss.
+        // Hits/selection/transfers remove candidates immediately; newly captured
+        // records cannot become cold until an owner epoch advances.
         self.donor_candidates.clear();
         for (&id, native) in &self.native_graphs {
             if !native.signature.is_empty() && self.donor_age(id, hard).is_some() {
