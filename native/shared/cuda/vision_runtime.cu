@@ -20,7 +20,9 @@ static_assert(offsetof(cuteafd_vision_spec, blocks) == 72, "vision blocks ABI");
 static_assert(offsetof(cuteafd_vision_spec, hidden) == 80, "vision geometry ABI");
 static_assert(offsetof(cuteafd_vision_spec, patch_bias) == 120, "vision bias ABI");
 static_assert(offsetof(cuteafd_vision_spec, norm1_bias) == 224, "vision norm ABI");
-static_assert(sizeof(cuteafd_vision_spec) == 256, "vision pointer/count ABI");
+static_assert(offsetof(cuteafd_vision_spec, perception) == 256, "vision extension ABI");
+static_assert(sizeof(cuteafd_vision_perception) == 96, "PE extension ABI");
+static_assert(sizeof(cuteafd_vision_spec) == 264, "vision pointer/count ABI");
 
 namespace {
 constexpr size_t BLAS_BYTES = 4 * 1024 * 1024;
@@ -30,6 +32,8 @@ struct Owner {
   cuteafd_vision_spec spec{};
   std::vector<cuteafd_vision_block> blocks;
   std::vector<uint64_t> norm1_bias, norm2_bias, q_norm, k_norm;
+  cuteafd_vision_perception perception{};
+  std::vector<uint64_t> scale1, scale2;
   cuteafd_vision_ledger ledger{};
   int device = 0;
   cudaStream_t stream = nullptr;
@@ -58,11 +62,18 @@ bool copy_spec(Owner& o, const cuteafd_vision_spec& s) {
     o.norm2_bias.assign(s.norm2_bias,s.norm2_bias+s.depth);
     o.q_norm.assign(s.q_norm,s.q_norm+s.depth);
     o.k_norm.assign(s.k_norm,s.k_norm+s.depth);
+    if(s.perception) {
+      o.perception=*s.perception;
+      o.scale1.assign(s.perception->scale1,s.perception->scale1+s.depth);
+      o.scale2.assign(s.perception->scale2,s.perception->scale2+s.depth);
+      o.perception.scale1=o.scale1.data();o.perception.scale2=o.scale2.data();
+    }
   } catch (const std::bad_alloc&) { return false; }
   o.spec=s;
   o.spec.blocks=o.blocks.data(); o.spec.norm1_bias=o.norm1_bias.data();
   o.spec.norm2_bias=o.norm2_bias.data(); o.spec.q_norm=o.q_norm.data();
   o.spec.k_norm=o.k_norm.data();
+  o.spec.perception=s.perception ? &o.perception : nullptr;
   return true;
 }
 int device_ok(Owner* o) {
@@ -174,8 +185,11 @@ int mha_attention(Owner* o,int n) {
 #include "vision_mistral.cuh"
 #endif
 bool valid_tower(const cuteafd_vision_spec& s) {
-  if(s.storage_abi!=3 || !s.depth || !s.blocks || !s.norm1_bias ||
+  if(s.storage_abi!=4 || !s.depth || !s.blocks || !s.norm1_bias ||
      !s.norm2_bias || !s.q_norm || !s.k_norm)return false;
+  // The PE storage contract is staged before its kernels; never dispatch it
+  // through another tower merely because the hidden geometry happens to match.
+  if(s.perception)return false;
   if(s.abi_version==1)return valid_spec(s);
 #ifdef CUTEAFD_HAVE_VISION_ATTENTION_AOT
   if(s.reserved==2)return valid_qwen(s);

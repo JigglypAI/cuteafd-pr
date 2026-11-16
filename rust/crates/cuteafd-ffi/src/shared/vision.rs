@@ -34,6 +34,42 @@ pub struct VisionBlock {
     pub column_order: i32,
 }
 
+/// PE-specific facts; other tower contracts keep their own position/output rules.
+#[derive(Clone, Debug, Default)]
+pub struct PerceptionSpec {
+    pub activation: u32,
+    pub position_grid: u32,
+    pub class_token: u32,
+    pub output_kind: u32,
+    pub ln_pre: u64,
+    pub ln_pre_bias: u64,
+    pub class_embedding: u64,
+    pub class_position: u64,
+    pub downsample1: u64,
+    pub downsample1_bias: u64,
+    pub downsample2: u64,
+    pub downsample2_bias: u64,
+    pub scale1: Vec<u64>,
+    pub scale2: Vec<u64>,
+}
+#[repr(C)]
+struct RawPerceptionSpec {
+    activation: u32,
+    position_grid: u32,
+    class_token: u32,
+    output_kind: u32,
+    ln_pre: u64,
+    ln_pre_bias: u64,
+    class_embedding: u64,
+    class_position: u64,
+    downsample1: u64,
+    downsample1_bias: u64,
+    downsample2: u64,
+    downsample2_bias: u64,
+    scale1: *const u64,
+    scale2: *const u64,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct VisionSpec {
     pub abi_version: u32,
@@ -68,6 +104,7 @@ pub struct VisionSpec {
     pub norm2_bias: Vec<u64>,
     pub q_norm: Vec<u64>,
     pub k_norm: Vec<u64>,
+    pub perception: Option<PerceptionSpec>,
 }
 
 #[repr(C)]
@@ -105,6 +142,17 @@ struct RawVisionSpec {
     norm2_bias: *const u64,
     q_norm: *const u64,
     k_norm: *const u64,
+    perception: *const RawPerceptionSpec,
+}
+
+struct VisionSpecView {
+    raw: RawVisionSpec,
+    // The box keeps the extension address stable while this view moves.
+    _perception: Option<Box<RawPerceptionSpec>>,
+}
+impl std::ops::Deref for VisionSpecView {
+    type Target = RawVisionSpec;
+    fn deref(&self) -> &Self::Target { &self.raw }
 }
 
 impl VisionSpec {
@@ -121,15 +169,29 @@ impl VisionSpec {
 
     // The raw view stays private and is borrowed only for synchronous FFI calls.
     // Native registration deep-copies every layer before returning.
-    fn raw(&self) -> Result<RawVisionSpec, VisionError> {
+    fn raw(&self) -> Result<VisionSpecView, VisionError> {
         let depth = self.depth as usize;
         if depth == 0 || self.blocks.len() != depth
             || [&self.norm1_bias, &self.norm2_bias, &self.q_norm, &self.k_norm]
                 .iter().any(|v| v.len() != depth) {
             return Err(VisionError::InvalidInput("vision layer storage/depth mismatch"));
         }
-        Ok(RawVisionSpec {
-            storage_abi: 3,
+        let perception = self.perception.as_ref().map(|pe| {
+            if pe.scale1.len() != depth || pe.scale2.len() != depth {
+                return Err(VisionError::InvalidInput("vision layer-scale storage/depth mismatch"));
+            }
+            Ok(Box::new(RawPerceptionSpec {
+                activation:pe.activation, position_grid:pe.position_grid,
+                class_token:pe.class_token, output_kind:pe.output_kind,
+                ln_pre:pe.ln_pre, ln_pre_bias:pe.ln_pre_bias,
+                class_embedding:pe.class_embedding, class_position:pe.class_position,
+                downsample1:pe.downsample1, downsample1_bias:pe.downsample1_bias,
+                downsample2:pe.downsample2, downsample2_bias:pe.downsample2_bias,
+                scale1:pe.scale1.as_ptr(), scale2:pe.scale2.as_ptr(),
+            }))
+        }).transpose()?;
+        let raw = RawVisionSpec {
+            storage_abi: 4,
             abi_version: self.abi_version,
             max_tokens: self.max_tokens,
             output_width: self.output_width,
@@ -161,7 +223,9 @@ impl VisionSpec {
             norm2_bias: self.norm2_bias.as_ptr(),
             q_norm: self.q_norm.as_ptr(),
             k_norm: self.k_norm.as_ptr(),
-        })
+            perception: perception.as_deref().map_or(std::ptr::null(), |pe| pe),
+        };
+        Ok(VisionSpecView { raw, _perception:perception })
     }
 }
 
@@ -579,10 +643,29 @@ mod tests {
     }
 
     #[test]
+    fn perception_view_owns_extension_and_checks_scale_depth() {
+        let mut spec = VisionSpec { perception:Some(PerceptionSpec {
+            scale1:vec![16;23], scale2:vec![32;23], ..Default::default()
+        }), ..Default::default() }.with_depth(23);
+        let view = spec.raw().unwrap();
+        assert_eq!(view.storage_abi, 4);
+        assert_eq!(view.perception, view._perception.as_deref().unwrap() as *const _);
+        let moved = view;
+        assert_eq!(moved.perception, moved._perception.as_deref().unwrap() as *const _);
+        assert_eq!(moved._perception.as_ref().unwrap().scale1, spec.perception.as_ref().unwrap().scale1.as_ptr());
+        spec.perception.as_mut().unwrap().scale2.pop();
+        assert!(spec.raw().is_err());
+        let plain = VisionSpec::default().with_depth(47).raw().unwrap();
+        assert!(plain.perception.is_null());
+    }
+
+    #[test]
     fn c_header_layout_is_stable() {
         assert_eq!(std::mem::size_of::<VisionBlock>(), 96);
         assert_eq!(std::mem::size_of::<VisionLedger>(), 40);
-        assert_eq!(std::mem::size_of::<RawVisionSpec>(), 256);
+        assert_eq!(std::mem::size_of::<RawVisionSpec>(), 264);
+        assert_eq!(std::mem::size_of::<RawPerceptionSpec>(), 96);
+        assert_eq!(std::mem::offset_of!(RawVisionSpec, perception), 256);
         assert_eq!(std::mem::offset_of!(RawVisionSpec, blocks), 72);
         assert_eq!(std::mem::offset_of!(RawVisionSpec, hidden), 80);
         assert_eq!(std::mem::offset_of!(RawVisionSpec, patch_bias), 120);
