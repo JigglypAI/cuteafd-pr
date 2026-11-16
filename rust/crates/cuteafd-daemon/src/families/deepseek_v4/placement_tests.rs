@@ -82,7 +82,7 @@ fn planned(shared: &Shared, case: &Case<'_>) -> (MemoryLayout, bool, Vec<String>
 
 fn plan_options(case: &Case<'_>, host: bool) -> PlanOptions {
     PlanOptions { placement: ExpertPlacement::from_spark_ranks(case.sparks),
-        layout: Some(LayoutOptions { host_memory: Some(cuteafd_loader::plan::testing::SimulatedHost::raptor().host_ram), rtx_bytes: (0..case.rtx).map(|g| if g == 1 { case.peer_budget.unwrap_or(case.budget) } else { case.budget }).collect(), context_tokens: case.context,
+        layout: Some(LayoutOptions { spark_bytes: 121 << 30, host_memory: Some(cuteafd_loader::plan::testing::SimulatedHost::raptor().host_ram), rtx_bytes: (0..case.rtx).map(|g| if g == 1 { case.peer_budget.unwrap_or(case.budget) } else { case.budget }).collect(), context_tokens: case.context,
             // Retained measured fixtures and the direct EngineArgs default are C8.
             concurrency: 8, expert_usage: true, physical_sms: case.physical_sms, host_cache_bytes: if host { None } else { Some(0) }, workspace_manifest: Some(case.manifest.to_path_buf()), onboard: case.onboard, exchange_f32: case.exchange_f32,
             native_mtp_layers: if case.dspark { 3 } else { 0 }, tp2_dspark_experts: case.tp2_draft, ..Default::default() }),

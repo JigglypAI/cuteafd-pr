@@ -2731,7 +2731,7 @@ def test_glmf_invalid_fp8_options_fail_before_workers_launch(tmp_path, key, valu
                                   f"GLM5_FLASH_KDA_FP8=off\n{key}={value}\n")
     assert result.returncode != 0 and message in result.stderr
     assert not any(line.startswith(("docker ", "ssh ", "nest ")) and "cuteafd plan" not in line
-                   for line in result.stderr.splitlines())
+                   and "python3 -I -" not in line for line in result.stderr.splitlines())
 
 
 @pytest.mark.parametrize("layout,physical_gpus", [("RTX_GPUS=1\n", (0, 1)), ("RTX_GPUS=auto\n", (0,)),
@@ -2900,7 +2900,7 @@ def test_glmf_draft_linear_rejects_unknown_values_before_launch(tmp_path):
     assert result.returncode != 0 and "GLM5_FLASH_DRAFT_LINEAR must be w8a16, wide or w8a8" in result.stderr, \
         result.stderr
     assert not any(line.startswith(("docker ", "ssh ", "nest ")) and "cuteafd plan" not in line
-                   for line in result.stderr.splitlines())
+                   and "python3 -I -" not in line for line in result.stderr.splitlines())
 
 
 @pytest.mark.parametrize("keys,env", [
@@ -3326,7 +3326,7 @@ def test_glmf_replay_records_reject_unsupported_layouts_before_launch(tmp_path, 
                                   keys)
     assert result.returncode != 0 and message in result.stderr, result.stderr
     assert not any(line.startswith(("docker ", "ssh ", "nest ")) and "cuteafd plan" not in line
-                   for line in result.stderr.splitlines())
+                   and "python3 -I -" not in line for line in result.stderr.splitlines())
 
 
 @pytest.mark.parametrize("keys,forwarded", [("", False), ("GLM5_FLASH_DECODE_ROWS=64\n", False),

@@ -263,6 +263,10 @@ mod tests {
         fs::write(&matrix, json!({"retired": retired, "cells": [{"report": "old"}]}).to_string()).unwrap();
         let before = placement_input_source_hashes(root).unwrap();
         assert!(before.get("examples/configs/retired.config").is_none());
+        let measured = root.join("rust/crates/cuteafd-loader/src/serving_capacity/spark_memory.json");
+        fs::write(&measured, "refreshed idle sample").unwrap();
+        assert_ne!(placement_input_source_hashes(root).unwrap(), before);
+        fs::write(measured, "original").unwrap();
         fs::write(root.join("examples/configs/retired.config"), "retired edit").unwrap();
         fs::write(&matrix, json!({"retired": retired, "cells": [{"report": "new"}]}).to_string()).unwrap();
         assert_eq!(placement_input_source_hashes(root).unwrap(), before);

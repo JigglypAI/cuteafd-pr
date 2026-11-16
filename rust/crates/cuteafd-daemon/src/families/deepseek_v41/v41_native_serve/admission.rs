@@ -1053,7 +1053,7 @@ mod admission_tests {
             "--native-lib",
             "/unused.so",
             "--peers",
-            "127.0.0.1:19441",
+            "10.55.0.1:19441",
         ])
         .unwrap();
         let crate::cli::Commands::ServeNative(args) = cli.command else {

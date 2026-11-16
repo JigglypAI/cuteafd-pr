@@ -916,8 +916,12 @@ fn family_layout(model: &dyn FamilyModel, input: &PlanInput, report: &mut PlanRe
     -> anyhow::Result<cuteafd_core::memory_layout::MemoryLayout> {
     let _timer = PhaseTimer::new(&input.phases.layout, &[&input.phases.catalog]);
     for rank in 0..requested.spark_ranks() {
-        anyhow::ensure!(options.spark_capacity(rank) > 0,
-            "missing idle MemAvailable measurement for Spark rank {rank}; supply --spark-memory-cap");
+        if options.spark_capacity(rank) == 0 {
+            report.refuse_placement(format!("missing idle MemAvailable measurement for Spark rank {rank}"),
+                "Supply --spark-memory-cap or measured host inventory.");
+            return Ok(cuteafd_core::memory_layout::MemoryLayout { devices: vec![], pool_tokens: 0,
+                waste: vec![], notes: vec![] });
+        }
     }
     let family = report.family.as_deref().unwrap_or("unknown");
     let concurrency = options.resolved_concurrency(family);
@@ -1267,7 +1271,10 @@ fn plan_unrestricted(input: &PlanInput, options: &PlanOptions) -> Result<PlanRep
     let mut resolved = options.clone();
     if let Some(layout) = &mut resolved.layout { layout.decode_lanes = report.decode_lanes; }
     resolved.apply_spark_budget();
-    resolved.spark_budget_bytes = Some(options.spark_budget_bytes.unwrap_or_else(|| model.spark_budget_bytes()));
+    resolved.spark_budget_bytes = Some(options.spark_budget_bytes.unwrap_or_else(||
+        options.layout.as_ref().map(|layout| layout.spark_capacities(options.placement.spark_ranks())
+            .into_iter().max().unwrap_or_else(|| model.spark_budget_bytes()))
+            .unwrap_or_else(|| crate::serving_capacity::spark_memory::serving_bytes().into_iter().max().unwrap())));
     let options = &resolved;
     report.spark_budget_bytes = options.spark_budget();
     let spec = model.spec();

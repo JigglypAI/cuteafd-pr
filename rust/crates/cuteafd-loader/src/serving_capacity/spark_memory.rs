@@ -26,6 +26,7 @@ static LIVE: OnceLock<Vec<u64>> = OnceLock::new();
 
 pub fn sample_bytes(samples: &str) -> Result<Vec<u64>> {
     let rows: Vec<serde_json::Value> = serde_json::from_str(samples)?;
+    anyhow::ensure!(!rows.is_empty() && rows.len() <= 8, "Spark samples require 1..8 ranks");
     rows.iter().map(|row| {
         let bytes = row["bytes"].as_u64().filter(|bytes| *bytes > 0)
             .context("missing positive idle MemAvailable sample")?;
@@ -77,6 +78,17 @@ pub fn runtime_bytes(peers: &[String]) -> Result<Vec<u64>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn live_samples_are_per_rank_and_missing_measurements_fail_closed() {
+        let samples = r#"[{"bytes":123,"boot_id":"a","age_seconds":0},
+            {"bytes":456,"boot_id":"b","age_seconds":17}]"#;
+        assert_eq!(sample_bytes(samples).unwrap(), vec![123, 456]);
+        for invalid in ["[]", r#"[{"bytes":0,"boot_id":"a","age_seconds":0}]"#,
+            r#"[{"bytes":123,"age_seconds":0}]"#, r#"[{"bytes":123,"boot_id":"a"}]"#] {
+            assert!(sample_bytes(invalid).is_err(), "{invalid}");
+        }
+    }
 
     #[test]
     fn exact_per_host_measurements_and_missing_fail_closed() {

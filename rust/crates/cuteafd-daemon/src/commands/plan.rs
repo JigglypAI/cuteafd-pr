@@ -2532,6 +2532,21 @@ mod tests {
     }
 
     #[test]
+    fn deployment_peers_select_measured_rank_capacities_and_explicit_wins() {
+        let mut request = args(std::path::Path::new("/not-read"), 2, false);
+        request.memory.spark_memory_cap = None;
+        request.deployment_peers = vec!["10.55.0.5:19441".into(), "10.55.0.1:19441".into()];
+        let layout = options(&request).unwrap().layout.unwrap();
+        assert_eq!(layout.spark_capacities(2), vec![
+            cuteafd_loader::serving_capacity::spark_memory::measured_bytes("rhea").unwrap(),
+            cuteafd_loader::serving_capacity::spark_memory::measured_bytes("ostrich").unwrap()]);
+        request.deployment_peers[0] = "unknown:19441".into();
+        assert!(options(&request).is_err());
+        request.memory.spark_memory_cap = Some(82 << 30);
+        assert_eq!(options(&request).unwrap().layout.unwrap().spark_capacities(2), vec![82 << 30; 2]);
+    }
+
+    #[test]
     fn spark_encoder_admission_honors_runtime_budget() {
         let mut request = args(std::path::Path::new("/not-read"), 4, false);
         request.memory.spark_memory_cap = Some(82 << 30);

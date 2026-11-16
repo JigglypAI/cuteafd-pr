@@ -364,7 +364,7 @@ fn release_headers_classify_native_text_without_installed_artifacts() {
     assert!(report.components.iter().filter(|c| c.component != Component::Vision).all(|c| c.rejected == 0));
     assert!(!report.hints.iter().any(|h| h.what.contains("W9") || h.what.contains("Kimi K3 attention")));
     // The family's own Spark budget, shown in the report and its rendering.
-    assert_eq!(report.spark_budget_bytes, crate::plan::DEFAULT_SPARK_BUDGET_BYTES);
+    assert_eq!(report.spark_budget_bytes, crate::serving_capacity::spark_memory::serving_bytes().into_iter().max().unwrap());
     // Serving status does not make the default single-GPU header plan fit.
     assert!(!report.executable());
     assert!(report.hints.iter().any(|hint| hint.what.contains("Kimi header inventory refused: missing projection")),
