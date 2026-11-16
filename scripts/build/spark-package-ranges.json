@@ -44,7 +44,7 @@
       "worlds": [2, 3, 4, 5, 6, 7, 8],
       "checkpoints": [{
         "model": "wrldsuksgo2mars/Inkling-2-Small-EXL3-K4-MC",
-        "revision": "2721c0af3752dd2c82113cc17fd3b958d768f310",
+        "revision": "6caa0ba08eb564ddc88b98df06ac73e853cc559e",
         "routed_expert_bytes": 294298804224
       }]
     },
