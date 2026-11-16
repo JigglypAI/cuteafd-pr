@@ -13,7 +13,7 @@
 //! checkpoint's own `[IMG_BREAK]`/`[IMG_END]` embedding rows (copied from
 //! `tok_embeddings`) into those positions, so the injected span is exactly
 //! what the LM's embedding gather would produce for the marker tokens.
-use super::{Result, TensorRead, TowerSpec, VisionError};
+use super::{ConstantRegion, Result, TensorRead, TowerSpec, VisionError};
 pub use cuteafd_loader::families::mistral_large4::vision::*;
 use cuteafd_core::DType;
 use cuteafd_ffi::vision::{VisionBlock, VisionSpec, NO_VISION_OFFSET};
@@ -142,7 +142,9 @@ impl TowerSpec {
         native.inv_freq = cursor as u64;
         native.weight_bytes = (cursor + (HEAD_DIM / 2) * 4) as u64;
         debug_assert_eq!(native.weight_bytes, resident_weight_bytes());
-        Ok(Self { native, reads })
+        let constant=ConstantRegion::fp32("rotary.inv_freq",native.inv_freq,axial_inv_freq(),
+            "919b230eb","Pixtral vendor axial FP32 frequency recipe",include_str!("mistral.rs"));
+        Self::from_parts_with_constants(native,reads,vec![constant])
     }
 }
 
@@ -166,6 +168,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         testing::write_mistral_large4_snapshot(dir.path(), Some(&[1]), true);
         let spec = TowerSpec::from_snapshot(dir.path(), MAX_MERGED_TOKENS).unwrap();
+        super::super::constants::assert_original_table(&spec);
         assert_eq!(spec.native.reserved, RESERVED);
         assert_eq!(spec.reads.len(), tower_tensors().len() + 2);
         assert_eq!(spec.native.weight_bytes, resident_weight_bytes());

@@ -4,6 +4,8 @@
 mod glm_flash;
 mod muse;
 mod perception;
+mod constants;
+pub(crate) use constants::ConstantRegion;
 pub mod mistral;
 mod qwen;
 pub mod local;
@@ -141,12 +143,16 @@ pub(crate) struct TensorRead {
 pub struct TowerSpec {
     pub native: VisionSpec,
     reads: Vec<TensorRead>,
+    constants: Vec<ConstantRegion>,
 }
 impl TowerSpec {
     /// Family-owned builders provide header plans; shared runtime retains ownership.
     /// Does not advertise executable dispatch or read any tensor payload.
     #[allow(dead_code)] // Consumed by family builders in the next additive step.
     pub(crate) fn from_parts(native: VisionSpec, reads: Vec<TensorRead>) -> Result<Self> {
+        Self::from_parts_with_constants(native, reads, Vec::new())
+    }
+    pub(crate) fn from_parts_with_constants(native: VisionSpec, reads: Vec<TensorRead>, constants: Vec<ConstantRegion>) -> Result<Self> {
         let mut ranges = Vec::new();
         for read in &reads {
             let source = usize::try_from(read.metadata.byte_length)
@@ -169,7 +175,17 @@ impl TowerSpec {
             return Err(VisionError::Unsupported("overlapping tower read destinations".into()));
         }
         if let Some(tower) = native.tower.as_ref() { tower.validate(&native)?; }
-        Ok(Self { native, reads })
+        constants::validate_regions(&constants, native.weight_bytes,
+            ranges.iter().map(|&(start,end)| (start as u64,(end-start) as u64)))
+            .map_err(VisionError::Unsupported)?;
+        Ok(Self { native, reads, constants })
+    }
+    pub(crate) fn constant_regions(&self) -> &[ConstantRegion] { &self.constants }
+    fn validate_constants(&self) -> Result<()> {
+        constants::validate_regions(&self.constants,self.native.weight_bytes,
+            self.reads.iter().map(|read| (read.destination as u64,
+                read.metadata.byte_length.saturating_mul(if read.vector {2} else {1}))))
+            .map_err(VisionError::Unsupported)
     }
     #[allow(dead_code)] // Family modules outside this parent use the same catalog.
     pub(crate) fn catalog(snapshot: &Path, prefix: &str) -> Result<BTreeMap<String, (PathBuf, SafetensorsTensorMetadata)>> {
@@ -370,7 +386,10 @@ impl TowerSpec {
         cursor = (cursor + 255) & !255;
         native.inv_freq = cursor as u64;
         native.weight_bytes = (cursor + 64) as u64;
-        Ok(Self { native, reads })
+        let constant = ConstantRegion::fp32("rotary.inv_freq",native.inv_freq,
+            (0..16).map(|i| axial_frequency(i,16)),"919b230eb",
+            "f32 reciprocal pow(theta=10000,index/16)",include_str!("vision.rs"));
+        Self::from_parts_with_constants(native,reads,vec![constant])
     }
     /// Canonical header extents, sorted by tensor name; no tower payload is read.
     pub fn encoder_id(&self, revision: &str, sm: u32) -> cuteafd_loader::media::EncoderId {
@@ -390,10 +409,17 @@ impl TowerSpec {
             headers.insert("feature_norm_eps".into(), serde_json::json!(self.native.norm_eps.to_bits()));
             2
         } else { 1 };
+        for region in self.constant_regions() {
+            headers.insert(format!("constant:{}",region.name),serde_json::json!({
+                "offset":region.offset,"alignment":region.alignment,"bytes":region.bytes.len(),
+                "source_revision":region.provenance.source_revision,"recipe":region.provenance.recipe,
+                "source_sha256":region.provenance.source_sha256,"content_sha256":region.provenance.content_sha256}));
+        }
         cuteafd_loader::media::EncoderId::derive(family, revision, &headers, numerics, sm)
     }
 
     fn load_weights(&self) -> Result<Vec<u8>> {
+        self.validate_constants()?;
         let mut weights = vec![0u8; self.native.weight_bytes as usize];
         for read in &self.reads {
             let m = &read.metadata;
@@ -412,24 +438,11 @@ impl TowerSpec {
                 file.read_exact(&mut weights[start..start + m.byte_length as usize])?;
             }
         }
-        let constants = self.frequency_bytes();
-        if !constants.is_empty() {
-            let at = self.native.inv_freq as usize;
-            weights[at..at + constants.len()].copy_from_slice(&constants);
+        for region in self.constant_regions() {
+            let at=region.offset as usize;
+            weights[at..at+region.bytes.len()].copy_from_slice(&region.bytes);
         }
         Ok(weights)
-    }
-    fn frequency_bytes(&self) -> Vec<u8> {
-        if self.native.inv_freq == NO_VISION_OFFSET { return Vec::new(); }
-        let values = if self.native.perception.is_some() {
-            perception::inv_freq(self.native.reserved)
-        } else if self.native.reserved == mistral::RESERVED {
-            mistral::axial_inv_freq().into_iter().collect::<Vec<_>>()
-        } else {
-            let frequencies = if self.native.abi_version == 2 { self.native.head_dim as usize / 4 } else { 16 };
-            (0..frequencies).map(|i| axial_frequency(i, frequencies)).collect()
-        };
-        values.into_iter().flat_map(f32::to_le_bytes).collect()
     }
 }
 
@@ -452,17 +465,21 @@ pub struct VitRuntime {
 }
 impl VitRuntime {
     fn prepare(spec: TowerSpec, library: &Path, device: i32, admitted: u64) -> Result<Self> {
+        spec.validate_constants()?;
         let native = NativeVision::prepare(library, &spec.native, device, admitted, cuteafd_ffi::memory_ledger::MediaTags::new("media/vision"))?;
         Ok(Self { native, spec })
     }
     fn weight_arena(&self) -> Result<usize> {
         let address = self.native.weight_arena()?;
-        let constants = self.spec.frequency_bytes();
-        if !constants.is_empty() { self.native.upload_range(self.spec.native.inv_freq, &constants)?; }
+        self.spec.validate_constants()?;
+        for region in self.spec.constant_regions() {
+            self.native.upload_range(region.offset, &region.bytes)?;
+        }
         Ok(address)
     }
     /// `admitted_bytes` comes from the placement memory ledger, not cudaMemGetInfo.
     pub fn load(spec: TowerSpec, library: &Path, device: i32, admitted_bytes: u64) -> Result<Self> {
+        spec.validate_constants()?;
         let required = NativeVision::required(library, &spec.native)?;
         if required.total_bytes() > admitted_bytes {
             return Err(VisionError::Unsupported(format!(
@@ -1118,6 +1135,7 @@ mod tests {
                 destination: 0,
                 vector: true,
             }],
+            constants:vec![ConstantRegion::fp32("rotary.inv_freq",128,[1.0],"test","one float","fixture")],
         };
         let arena = spec.load_weights().unwrap();
         assert_eq!(&arena[0..4], &1.0f32.to_le_bytes());

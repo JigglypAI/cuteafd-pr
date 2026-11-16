@@ -93,7 +93,10 @@ impl TowerSpec {
         cursor = (cursor + 255) & !255;
         native.inv_freq = cursor as u64;
         native.weight_bytes = (cursor + 18 * 4) as u64;
-        Ok(Self { native, reads })
+        let constant=ConstantRegion::fp32("rotary.inv_freq",native.inv_freq,
+            (0..18).map(|i| axial_frequency(i,18)),"919b230eb",
+            "f32 reciprocal pow(theta=10000,index/18)",include_str!("qwen.rs"));
+        Self::from_parts_with_constants(native,reads,vec![constant])
     }
 }
 
@@ -149,6 +152,7 @@ mod tests {
     fn qwen_headers_match_biased_head72_tower_without_lm_reads() {
         let dir = snapshot();
         let spec = TowerSpec::from_snapshot(dir.path(), 4096).unwrap();
+        super::super::constants::assert_original_table(&spec);
         super::super::tests::assert_ctypes_spec(dir.path(), "qwen4", &spec);
         super::super::push::tests::assert_vision_plan(dir.path(), &spec);
         assert_eq!(spec.image_family(), cuteafd_loader::media::ImageFamily::Qwen);

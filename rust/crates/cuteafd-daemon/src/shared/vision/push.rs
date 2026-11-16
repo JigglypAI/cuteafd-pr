@@ -55,10 +55,10 @@ impl Contribution {
         }
         let mut reserved = Vec::new();
         if let Some((spec, address)) = vision {
-            let constants = spec.frequency_bytes();
-            if !constants.is_empty() {
-                let start = usize::try_from(spec.native.inv_freq)?;
-                let end = start.checked_add(constants.len()).context("vision constants overflow")?;
+            spec.validate_constants()?;
+            for region in spec.constant_regions() {
+                let start = usize::try_from(region.offset)?;
+                let end = start.checked_add(region.bytes.len()).context("vision constants overflow")?;
                 ensure!(end <= spec.native.weight_bytes as usize, "vision constants outside admitted arena");
                 reserved.push((device, address.checked_add(start).context("vision constants address overflow")?,
                     address.checked_add(end).context("vision constants address overflow")?));
@@ -272,6 +272,7 @@ pub(crate) mod tests {
     fn muse_vision_pcm_share_a_checked_group_without_changing_resident_bytes() {
         let root = tempfile::tempdir().unwrap();
         cuteafd_loader::plan::testing::write_muse_media_snapshot(root.path(), &[0]);
+        super::super::constants::assert_original_table(&vision);
         let vision = TowerSpec::muse(root.path(), 4096).unwrap();
         assert_vision_plan(root.path(), &vision);
         let pcm = PcmTowerSpec::from_snapshot(root.path(), 19200).unwrap();
@@ -298,9 +299,10 @@ pub(crate) mod tests {
         }).collect::<Vec<_>>();
         let vision = TowerSpec { native: cuteafd_ffi::vision::VisionSpec {
             abi_version: 2, head_dim: 8, inv_freq: 512, weight_bytes: 520, ..Default::default()
-        }, reads };
+        }, reads, constants:vec![super::super::ConstantRegion::fp32("rotary.inv_freq",512,
+            [1.0,0.01],"test","two FP32 constants","fixture")] };
         seed_payloads(vision.reads.iter().map(|read| (read.path.as_path(), &read.metadata)));
-        let constants = vision.frequency_bytes();
+        let constants = &vision.constants[0].bytes;
         assert_replayed_arena(root.path(), &vision.load_weights()?,
             Some((vision.native.inv_freq as usize, &constants)), |address|
                 Ok(Contribution::prepare(0, Some((&vision, address)), None, None, None)?.records()))?;
@@ -311,7 +313,7 @@ pub(crate) mod tests {
         for read in &mut pcm.reads { read.vector = false; }
         let expected = pcm.load_weights()?;
         assert_replayed_arena(root.path(), &expected,
-            Some((pcm.native.inv_freq as usize, &pcm.frequency_bytes())), |address| {
+            Some((pcm.constants[0].offset as usize, &pcm.constants[0].bytes)), |address| {
                 let mut records = Records::default();
                 for read in &pcm.reads {
                     append(&mut records, 0, address, pcm.native.weight_bytes as usize,
