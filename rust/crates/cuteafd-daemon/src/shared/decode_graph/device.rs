@@ -172,8 +172,8 @@ struct LaneEpoch {
 }
 
 #[derive(Default)]
-struct EpochClock {
-    index: AtomicU64,
+pub(super) struct EpochClock {
+    pub(super) index: AtomicU64,
     completed: AtomicU64,
     active: AtomicBool,
     pending: AtomicUsize,
@@ -202,6 +202,8 @@ struct Queue { first: Option<u64>, last: Option<u64>, bytes: u64, len: usize }
 struct DonorQueue { first: Option<u64>, last: Option<u64> }
 
 struct NativeGraph {
+    bank: u64,
+    launch_cycle: Cycle,
     exec: usize,
     counted_launches: u64,
     signature: Vec<u64>,
@@ -227,8 +229,26 @@ struct OomBackoff {
     recovery_generation: u64,
 }
 
+/// One resident generation. Banks retain this allocation, never the controller
+/// lock, across lookups. A retired generation is never made valid again.
+#[derive(Default)]
+pub(super) struct HitToken {
+    valid: AtomicBool,
+    last_used: AtomicU64,
+}
+impl HitToken {
+    pub(super) fn valid(&self) -> bool { self.valid.load(Ordering::Acquire) }
+    pub(super) fn hit(&self, epoch: u64) {
+        if self.last_used.load(Ordering::Relaxed) != epoch {
+            self.last_used.store(epoch, Ordering::Release);
+        }
+    }
+    fn invalidate(&self) { self.valid.store(false, Ordering::Release); }
+}
+
 #[derive(Clone)]
 struct Record {
+    token: Option<Arc<HitToken>>,
     last_used: Option<u64>,
     identity: Identity,
     cycle: Cycle,
@@ -258,6 +278,13 @@ struct Record {
 struct Inventory { nodes: u64, execs: u64, unknown: u64, resident: u64, pinned: u64 }
 
 impl Record {
+    fn used(&self) -> Option<u64> {
+        let observed = self.token.as_ref().map(|token| token.last_used.load(Ordering::Acquire));
+        self.last_used.into_iter().chain(observed).max()
+    }
+    fn invalidate(&mut self) {
+        if let Some(token) = self.token.take() { token.invalidate(); }
+    }
     fn ordering_bytes(&self) -> u64 {
         if self.bytes > 0 { self.bytes } else { self.estimate }
     }
@@ -840,6 +867,7 @@ pub(crate) struct DeviceCache {
     site_lanes: HashMap<&'static str, u8>,
     update_sites: std::collections::BTreeMap<&'static str, HashMap<Cycle, Counters>>,
     native_graphs: HashMap<u64, NativeGraph>,
+    bank_native: HashMap<u64, HashSet<u64>>,
     donor_candidates: HashMap<Vec<u64>, [DonorQueue; 2]>,
     update_requests: HashMap<u64, UpdateRequest>,
     observer: GrowthObserver,
@@ -895,7 +923,7 @@ impl DeviceCache {
             pending_growth: 0, pools: Pools::default(), basis: Basis::Bytes,
             chain_only: true, unmeasured: false, pending_destroy: 0,
             bank_lanes: HashMap::new(), lanes: std::array::from_fn(|_| LaneEpoch::default()), clocks: Arc::new(std::array::from_fn(|_| EpochClock::default())),
-            lagged: Vec::new(), epochs: EpochStats::default(), reuse_captures: HashSet::new(), selected_epochs: HashMap::new(), pending_lanes: [0; 2], concurrent_cycles: 1, lane_max_cycles: [1; 2], site_lanes: HashMap::new(), update_sites: Default::default(), native_graphs: HashMap::new(), donor_candidates: HashMap::new(), update_requests: HashMap::new(),
+            lagged: Vec::new(), epochs: EpochStats::default(), reuse_captures: HashSet::new(), selected_epochs: HashMap::new(), pending_lanes: [0; 2], concurrent_cycles: 1, lane_max_cycles: [1; 2], site_lanes: HashMap::new(), update_sites: Default::default(), native_graphs: HashMap::new(), bank_native: HashMap::new(), donor_candidates: HashMap::new(), update_requests: HashMap::new(),
             observer: GrowthObserver::default(), memory_query: None, launch_query: None, captured_since_observation: false,
             counters: HashMap::new(), started: Instant::now(), clock_ms: 0, last_report: Instant::now(),
             interval_evictions: 0, trace: std::env::var_os("CUTEAFD_GRAPH_TRACE").and_then(|path| {
@@ -917,11 +945,12 @@ impl DeviceCache {
 
     fn take_native(&mut self, id: u64) -> Option<NativeGraph> {
         let native = self.native_graphs.remove(&id)?;
+        if let Some(ids) = self.bank_native.get_mut(&native.bank) { ids.remove(&id); }
         if let (Some(query), Some(record)) = (&self.launch_query, self.records.get(&id)) {
             if native.exec != 0 {
                 let count = query.sample(native.exec).saturating_sub(native.counted_launches);
-                self.counters.entry(record.cycle).or_default().segments_launched += count;
-                self.update_sites.entry(record.identity.site).or_default().entry(record.cycle).or_default().segments_launched += count;
+                self.counters.entry(native.launch_cycle).or_default().segments_launched += count;
+                self.update_sites.entry(record.identity.site).or_default().entry(native.launch_cycle).or_default().segments_launched += count;
             }
         }
         Some(native)
@@ -934,8 +963,8 @@ impl DeviceCache {
                 if native.exec == 0 { continue }
                 let Some(record) = self.records.get(&id) else { continue };
                 let count = query.sample(native.exec).saturating_sub(native.counted_launches);
-                cycles.entry(record.cycle).or_default().segments_launched += count;
-                sites.entry(record.identity.site).or_default().entry(record.cycle).or_default().segments_launched += count;
+                cycles.entry(native.launch_cycle).or_default().segments_launched += count;
+                sites.entry(record.identity.site).or_default().entry(native.launch_cycle).or_default().segments_launched += count;
             }
         }
         (cycles, sites)
@@ -955,18 +984,20 @@ impl DeviceCache {
     }
 
     pub(super) fn bank_cycle(&mut self, bank: u64, cycle: Cycle) {
-        for (&id, record) in self.records.iter_mut().filter(|(_, record)| record.identity.bank == bank) {
-            if record.cycle == cycle { continue }
-            if let (Some(query), Some(native)) = (&self.launch_query, self.native_graphs.get_mut(&id)) {
+        let Some(ids) = self.bank_native.get(&bank) else { return };
+        for id in ids {
+            let native = self.native_graphs.get_mut(id).expect("bank native membership");
+            if native.launch_cycle == cycle { continue }
+            if let (Some(query), Some(record)) = (&self.launch_query, self.records.get(id)) {
                 if native.exec != 0 {
                     let total = query.sample(native.exec);
                     let delta = total.saturating_sub(native.counted_launches);
-                    self.counters.entry(record.cycle).or_default().segments_launched += delta;
-                    self.update_sites.entry(record.identity.site).or_default().entry(record.cycle).or_default().segments_launched += delta;
+                    self.counters.entry(native.launch_cycle).or_default().segments_launched += delta;
+                    self.update_sites.entry(record.identity.site).or_default().entry(native.launch_cycle).or_default().segments_launched += delta;
                     native.counted_launches = total;
                 }
             }
-            record.cycle = cycle;
+            native.launch_cycle = cycle;
         }
     }
 
@@ -1173,7 +1204,8 @@ impl DeviceCache {
         self.take_native(id);
         self.reuse_captures.remove(&id);
         self.unlink(id);
-        if let Some(record) = self.records.remove(&id) {
+        if let Some(mut record) = self.records.remove(&id) {
+            record.invalidate();
             let old = record.accounted;
             self.inventory.nodes = self.inventory.nodes.saturating_sub(old.nodes);
             self.inventory.execs = self.inventory.execs.saturating_sub(old.execs);
@@ -1218,6 +1250,18 @@ impl DeviceCache {
         if promote {
             self.push(id, List::Frequent);
         }
+    }
+
+    /// Fold bank-local counters once per cycle. The shared token already made
+    /// each hit visible to pressure and donor selection before this fold.
+    pub(super) fn batched_hits(&mut self, id: u64, cycle: Cycle, count: u64) {
+        if count == 0 { return }
+        let Some(record) = self.records.get(&id) else { return };
+        if !self.owns(id, record.identity.bank) { return }
+        let record = self.records.get_mut(&id).unwrap();
+        let promote = !record.pinned && !record.pending_destroy && matches!(record.list, Some(List::Recent | List::Frequent));
+        self.pinned_hits(id, cycle, count);
+        if promote { self.push(id, List::Frequent); }
     }
 
     /// Pinned hits accumulate in the bank, without a lock or ARC mutation.
@@ -1273,7 +1317,7 @@ impl DeviceCache {
 
     fn hot(&self, record: &Record) -> bool {
         let lane = self.bank_lane(record.identity.bank);
-        record.last_used.is_some_and(|used| used > self.lanes[lane].index.saturating_sub(self.concurrent_cycles)
+        record.used().is_some_and(|used| used > self.lanes[lane].index.saturating_sub(self.concurrent_cycles)
             || (self.lanes[lane].index < self.concurrent_cycles && used == 0))
     }
 
@@ -1342,7 +1386,7 @@ impl DeviceCache {
             if small.is_some() {
                 if let Some(old) = self.identities.get(&request.identity).copied() { self.forget(old); }
                 self.identities.insert(request.identity.clone(), id);
-                self.records.insert(id, Record { last_used: None, identity: request.identity, cycle: request.site.cycle,
+                self.records.insert(id, Record { token: None, last_used: None, identity: request.identity, cycle: request.site.cycle,
                     bytes: 0, estimate: 0, list: None, previous: None, next: None, pinned: false,
                     pending_destroy: false, pending_capture: false, frequent: false, nodes: 0,
                     node_rate: 1, graph_rate: 0, parallel_width: 0, spans_devices: request.site.spans_devices,
@@ -1350,6 +1394,18 @@ impl DeviceCache {
                     stats: KeyStats::new(self.clock_ms), accounted: Inventory::default() });
             }
         }
+    }
+
+    pub(super) fn hit_token(&mut self, id: u64) -> Arc<HitToken> {
+        let record = self.records.get_mut(&id).expect("resident graph identity");
+        record.token.get_or_insert_with(|| Arc::new(HitToken {
+            valid: AtomicBool::new(true),
+            last_used: AtomicU64::new(record.last_used.unwrap_or(0)),
+        })).clone()
+    }
+
+    pub(super) fn bank_clock(&self, bank: u64) -> (Arc<[EpochClock; 2]>, usize) {
+        (self.clocks.clone(), self.bank_lane(bank))
     }
 
     pub(super) fn owns(&self, id: u64, bank: u64) -> bool {
@@ -1416,7 +1472,7 @@ impl DeviceCache {
             !matches!(record.list, Some(List::Recent | List::Frequent)) ||
             !self.native_graphs.contains_key(&id) { return None }
         let lane = self.bank_lane(record.identity.bank);
-        let age = self.lanes[lane].index.saturating_sub(record.last_used?);
+        let age = self.lanes[lane].index.saturating_sub(record.used()?);
         (age > self.lane_max_cycles[lane]).then_some(age)
     }
 
@@ -1452,6 +1508,19 @@ impl DeviceCache {
     fn cold_donor(&mut self, signature: &[u64]) -> Option<u64> {
         self.refresh_cycles();
         if signature.is_empty() { return None }
+        // Hits only stamp their token. Repair touched queue heads on a miss,
+        // never relink FIFO nodes (or take the cache mutex) on a replay.
+        for lane in 0..self.lanes.len() {
+            loop {
+                let Some(id) = self.donor_candidates.get(signature)?.get(lane)?.first else { break };
+                let record = &self.records[&id];
+                let used = record.used();
+                if used == record.last_used { break }
+                self.remove_donor_candidate(id);
+                self.records.get_mut(&id).unwrap().last_used = used;
+                self.insert_donor_candidate(id);
+            }
+        }
         self.donor_candidates.get(signature)?.iter().filter_map(|lane| {
             let id = lane.first?;
             self.donor_age(id).map(|age| (id, age))
@@ -1461,7 +1530,11 @@ impl DeviceCache {
     pub(super) fn register_native(&mut self, id: u64, exec: usize, signature: Vec<u64>) {
         self.remove_donor_candidate(id);
         if let Some(record) = self.records.get_mut(&id) { record.signature = Some(signature.clone()); }
-        self.native_graphs.insert(id, NativeGraph { exec, counted_launches: 0, signature, indexed: None, previous: None, next: None });
+        let (bank, launch_cycle) = self.records.get(&id).map(|r| (r.identity.bank, r.cycle))
+            .or_else(|| self.update_requests.get(&id).map(|r| (r.identity.bank, r.site.cycle)))
+            .expect("native graph requires a capture ticket");
+        self.bank_native.entry(bank).or_default().insert(id);
+        self.native_graphs.insert(id, NativeGraph { bank, launch_cycle, exec, counted_launches: 0, signature, indexed: None, previous: None, next: None });
         self.insert_donor_candidate(id);
     }
 
@@ -1516,12 +1589,15 @@ impl DeviceCache {
         self.unlink(donor);
         let mut native = self.take_native(donor).unwrap();
         let mut record = self.records.remove(&donor).unwrap();
+        record.invalidate();
         let mut ghost = record.clone();
         ghost.bytes = 0;
         ghost.accounted = Inventory::default();
         ghost.list = None; ghost.previous = None; ghost.next = None;
         self.records.insert(donor, ghost);
         self.push(donor, List::RecentGhost);
+        native.bank = request.identity.bank;
+        native.launch_cycle = request.site.cycle;
         native.exec = transferred;
         native.counted_launches = 0;
         native.indexed = None;
@@ -1545,6 +1621,7 @@ impl DeviceCache {
         self.site_counters(request.site.name, request.site.cycle, request.identity.bank).misses += 1;
         self.identities.insert(request.identity, id);
         self.records.insert(id, record);
+        self.bank_native.entry(native.bank).or_default().insert(id);
         self.native_graphs.insert(id, native);
         if !request.pinned { self.push(id, List::Recent); }
         self.insert_donor_candidate(id);
@@ -1760,7 +1837,7 @@ impl DeviceCache {
                 self.next_id += 1;
                 let id = self.next_id;
                 self.identities.insert(identity.clone(), id);
-                self.records.insert(id, Record { last_used: None, identity, cycle: site.cycle, bytes: 0, estimate, list: None,
+                self.records.insert(id, Record { token: None, last_used: None, identity, cycle: site.cycle, bytes: 0, estimate, list: None,
                     previous: None, next: None, pinned, pending_destroy: false, pending_capture: false, frequent: false, nodes, node_rate: metadata.node_rate, graph_rate: metadata.graph_rate, parallel_width: metadata.parallel_width, spans_devices: site.spans_devices, oom: None, oom_warned: false, permanently_eager: false, signature: None, stats: KeyStats::new(now), accounted: Inventory::default() });
                 id
             };
@@ -1800,7 +1877,7 @@ impl DeviceCache {
             self.next_id += 1;
             let id = self.next_id;
             self.identities.insert(identity.clone(), id);
-            self.records.insert(id, Record { last_used: None, identity: identity.clone(), cycle: site.cycle, bytes: 0, estimate,
+            self.records.insert(id, Record { token: None, last_used: None, identity: identity.clone(), cycle: site.cycle, bytes: 0, estimate,
                 list: None, previous: None, next: None, pinned: false, pending_destroy: false, pending_capture: false, frequent: false, nodes, node_rate: metadata.node_rate, graph_rate: metadata.graph_rate, parallel_width: metadata.parallel_width, spans_devices: site.spans_devices, oom: None, oom_warned: false, permanently_eager: false, signature: None, stats: KeyStats::new(now), accounted: Inventory::default() });
             self.push(id, List::RecentGhost);
             self.trim_ghosts();
@@ -1867,6 +1944,7 @@ impl DeviceCache {
             self.pools.live_nodes = self.pools.live_nodes.saturating_sub(record.nodes);
             self.pools.live_execs = self.pools.live_execs.saturating_sub(1);
         }
+        record.invalidate();
         record.pending_capture = false;
         record.pinned = false;
         record.permanently_eager = true;
@@ -2087,6 +2165,7 @@ impl DeviceCache {
             }
             let Some(record) = self.records.get_mut(&id) else { continue };
             let evicted = record.pending_destroy;
+            record.invalidate();
             self.live_bytes = self.live_bytes.saturating_sub(record.bytes);
             record.estimate = record.ordering_bytes();
             record.pending_destroy = false;
