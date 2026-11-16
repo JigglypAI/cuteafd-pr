@@ -13,7 +13,7 @@ impl Trace{
         let fields:&[(&str,usize)]=match stage{
             "entry"=>&[("partial",4608*4)],
             "attention"=>&[("attention",4608*4),("projection_input",4608*2)],
-            "experts"=>&[("projection_input",4608*2),("route_logits",384*4),("route_ids",8*4),("route_weights",8*4),("expert_output",4608*2)],
+            "experts"=>&[("projection_input",4608*2),("expert_wire",4752),("route_logits",384*4),("route_ids",8*4),("route_weights",8*4),("expert_output",4608*2)],
             "exit"=>&[("partial",4608*4)],_=>anyhow::bail!("unknown Inkling width trace stage {stage}")};
         owner.stream.drain()?;
         let buffers=fields.iter().map(|&(name,stride)|{
@@ -58,14 +58,24 @@ fn compare(candidate:&Trace,reference:&[Trace],logits:&[u8],base_logits:&[Vec<u8
         ensure!(candidate.samples.len()==base.samples.len(),"width trace stage inventory differs");
         for (sample,other) in candidate.samples.iter().zip(&base.samples){
             ensure!(sample.layer==other.layer && sample.stage==other.stage && other.rows==1,"width trace order differs");
-            for (name,data) in &sample.buffers{
+            let order:Vec<&str>=if sample.stage=="experts"{
+                vec!["projection_input","expert_wire","route_logits","route_ids","route_weights","expert_output"]
+            }else{sample.buffers.keys().map(String::as_str).collect()};
+            let mut equality=BTreeMap::new();
+            let mut operand=None;
+            for name in order{
+                let data=sample.buffers.get(name).context("candidate stage operand missing")?;
                 let baseline=other.buffers.get(name).context("reference stage operand missing")?;
                 ensure!(data.len()==sample.rows*baseline.len(),"width trace operand pitch differs");
                 let actual=&data[row*baseline.len()..(row+1)*baseline.len()];
-                if actual!=baseline{
-                    first=Some(serde_json::json!({"row":row,"layer":sample.layer,"stage":sample.stage,"operand":name,
-                        "different_bytes":actual.iter().zip(baseline).filter(|(a,b)|a!=b).count()}));break;
+                equality.insert(name,actual==baseline);
+                if actual!=baseline && operand.is_none(){
+                    operand=Some((name,actual.iter().zip(baseline).filter(|(a,b)|a!=b).count()));
                 }
+            }
+            if let Some((name,bytes))=operand{
+                first=Some(serde_json::json!({"row":row,"layer":sample.layer,"stage":sample.stage,"operand":name,
+                    "different_bytes":bytes,"operands_equal":equality}));
             }
             if first.is_some(){break;}
         }
