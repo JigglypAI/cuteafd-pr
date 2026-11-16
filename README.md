@@ -231,9 +231,9 @@ concurrency point is that limit.
 <td width="27%" valign="top"><a href="benchmarks/minimax_m3/2026-11-16-smoke-minimax-m3-1-flash-2rtx-4spark-minimax-dspark-heads-current-r1/card.svg"><img src="benchmarks/minimax_m3/2026-11-16-smoke-minimax-m3-1-flash-2rtx-4spark-minimax-dspark-heads-current-r1/card.svg" alt="MiniMaxAI/MiniMax-M3.1-Flash on 2× RTX PRO 6000 @ gpu-powerd 425/425 W (395–450) + 4× DGX Spark"></a><br><sub>2× RTX + 4× Spark</sub></td>
 </tr>
 <tr>
-<td width="19%" valign="top"><a href="docs/models/inkling2.md"><b>inkling2</b></a><br><sub>thinkingmachines/Inkling-2-Small</sub><br><sub></sub></td>
+<td width="19%" valign="top"><a href="docs/models/inkling2.md"><b>inkling2</b></a><br><sub>thinkingmachines/Inkling-2-Small</sub><br><sub>fp8-tensor/ue8m0+nvfp4-g16-amax</sub></td>
 <td width="27%" valign="top">pending<br><sub>Not measured; four-Spark RTX PRO 6000 qualification first.</sub></td>
-<td width="27%" valign="top">pending<br><sub>1 RTX + 4 Sparks serving/fidelity and Release smoke qualification pending (#1930).</sub></td>
+<td width="27%" valign="top"><a href="benchmarks/inkling2/2026-11-16-smoke-inkling-2-small-1rtx-4spark-inkling2-nvfp4-min-cand-r1/card.svg"><img src="benchmarks/inkling2/2026-11-16-smoke-inkling-2-small-1rtx-4spark-inkling2-nvfp4-min-cand-r1/card.svg" alt="thinkingmachines/Inkling-2-Small on 1× RTX PRO 6000 @ gpu-powerd 440 W (425–450) + 4× DGX Spark"></a><br><sub>1× RTX + 4× Spark</sub></td>
 <td width="27%" valign="top">pending<br><sub>Multi-RTX Inkling serving is not qualified (#1930).</sub></td>
 </tr>
 <tr>

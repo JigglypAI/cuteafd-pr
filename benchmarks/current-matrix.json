@@ -345,8 +345,8 @@
         "reason": "Not measured; four-Spark RTX PRO 6000 qualification first."
       },
       "1rtx": {
-        "status": "pending",
-        "reason": "1 RTX + 4 Sparks serving/fidelity and Release smoke qualification pending (#1930)."
+        "status": "current",
+        "report": "benchmarks/inkling2/2026-11-16-smoke-inkling-2-small-1rtx-4spark-inkling2-nvfp4-min-cand-r1"
       },
       "2rtx": {
         "status": "pending",
