@@ -807,6 +807,9 @@ impl Built {
 /// free of side effects except claiming a benchmark probe.
 pub(crate) fn build(profile: &ModelProfile, limits: NativeLimits, headers: &axum::http::HeaderMap, mut body: Value)
     -> Result<Built, Rejection> {
+    if matches!(profile.encoding, ModelEncoding::MiniMax(_)) {
+        minimax::vision::validate_policy(&body).map_err(Rejection::bad)?;
+    }
     images::guard_content(&body, profile.capabilities).map_err(Rejection::bad)?;
     let probe = headers.get(probe::HEADER).and_then(|v| v.to_str().ok()).and_then(|id| probe::registry().claim(id));
     if let Some(p) = &probe {
@@ -2265,6 +2268,24 @@ mod tests {
             }
             worker.await.unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn minimax_pixel_override_returns_typed_400_before_admission() {
+        let (tx,mut rx)=mpsc::channel::<NativeRequest>(1);
+        let profile=ModelProfile::new("minimax-test",ModelEncoding::MiniMax(Arc::new(minimax::fixtures::encoding())));
+        let app=router_for_model(tx,NativeLimits::default(),Arc::new(Mutex::new(Value::Null)),
+            std::time::Duration::from_secs(5),ConsoleHub::disabled(),profile);
+        let body=json!({"model":"minimax-test","messages":[{"role":"user","content":"describe"}],
+            "mm_processor_kwargs":{"max_pixels":451584}});
+        let response=app.oneshot(axum::http::Request::post("/v1/chat/completions")
+            .header("content-type","application/json").body(Body::from(body.to_string())).unwrap()).await.unwrap();
+        assert_eq!(response.status(),StatusCode::BAD_REQUEST);
+        let bytes=axum::body::to_bytes(response.into_body(),1<<20).await.unwrap();
+        let value:Value=serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value["error"]["type"],"invalid_request_error");
+        assert!(value["error"]["message"].as_str().unwrap().contains("max_pixels"));
+        assert!(rx.try_recv().is_err());
     }
 
     #[tokio::test]
