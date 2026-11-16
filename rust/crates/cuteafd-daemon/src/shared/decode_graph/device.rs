@@ -1352,7 +1352,11 @@ impl DeviceCache {
         self.donor_candidates.clear();
         for (&id, native) in &self.native_graphs {
             if !native.signature.is_empty() && self.donor_age(id, hard).is_some() {
-                self.donor_candidates.entry(native.signature.clone()).or_default().insert(id);
+                if let Some(candidates) = self.donor_candidates.get_mut(native.signature.as_slice()) {
+                    candidates.insert(id);
+                } else {
+                    self.donor_candidates.insert(native.signature.clone(), HashSet::from([id]));
+                }
             }
         }
         self.donor_epoch = Some(epoch);
