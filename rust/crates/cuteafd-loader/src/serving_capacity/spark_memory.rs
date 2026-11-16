@@ -12,7 +12,7 @@ pub fn measured_bytes(host: &str) -> Result<u64> {
     let host = (0..6).find(|rank| host == format!("10.55.0.{}", rank + 1)
         || host == format!("10.55.1.{}", rank + 1)).map_or(host, |rank| SERVING_HOSTS[rank]);
     let kib = table["hosts"][host]["mem_available_kib"].as_u64()
-        .with_context(|| format!("missing idle MemAvailable measurement for Spark {host}; supply --spark-memory-cap"))?;
+        .with_context(|| format!("missing idle MemAvailable measurement for Spark {host} in serving_capacity/spark_memory.json; supply --spark-memory-cap"))?;
     let bytes = kib.checked_mul(1024).context("Spark MemAvailable bytes overflow")?;
     if bytes == 0 { bail!("empty MemAvailable measurement for Spark {host}"); }
     Ok(bytes)

@@ -529,16 +529,14 @@ mod tests {
     /// V4.1 plans and deploys on the canonical wire at every world its MXFP4
     /// package range names (2..=8, 7 and 8 CPU-gated only) from its planner
     /// minimum up, and refuses below it. The full checkpoint's routed experts
-    /// need three Sparks, so two is refused on fit, not on wire. TP4 keeps the
+    /// now fit two measured-capacity Sparks. TP4 keeps the
     /// legacy shard; every other world names its native Spark TP role.
     #[test]
     fn v41_plans_and_deploys_every_registry_world_on_the_canonical_wire() {
         let worlds = cuteafd_core::tp_units::spark_package_worlds("v41", "mxfp4");
         assert_eq!(worlds, [2, 3, 4, 5, 6, 7, 8]);
         let (_dir, below) = fixture(2, 2);
-        assert!(!below.executable());
-        assert!(below.hints.iter().any(|hint| hint.what.contains("Spark count 2 refused")
-            || hint.how.contains("Spark count 2 refused")), "{:?}", below.hints);
+        assert!(below.executable(), "{}", crate::plan::render(&below));
         for ranks in 3..=cuteafd_core::MAX_SPARK_WORLD {
             let (_dir, report) = fixture(2, ranks);
             assert!(report.executable(), "TP{ranks}: {}", crate::plan::render(&report));

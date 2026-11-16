@@ -455,7 +455,9 @@ idle sample from its current boot ID; missing or reboot-stale samples fail
 closed with a stop-first hint. Plans retain sample timestamps, uptime and age.
 Offline and simulated plans use the provenance-stamped per-host
 `serving_capacity/spark_memory.json` inventory in configured rank order; unknown
-hosts require an explicit cap or live measurement. Rank-to-host order is not
+hosts require an explicit cap or live measurement. Direct `plan --config` resolves
+named hosts in config rank order; `REPLACE-ME` placeholders or no host list use
+labelled simulated canonical inventory. Rank-to-host order is not
 rearranged. Workers also check live allocatable memory before loading weights.
 `--spark-memory-samples` is the launcher's JSON measurement handoff to plan and
 serve, not a user policy knob. Explicit `SPARK_MEMORY_CAP` /

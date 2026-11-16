@@ -81,8 +81,8 @@ fn complete_checkpoint_preserves_recipe_refusals_at_every_spark_count() {
         assert!(!report.hints.iter().any(|hint| hint.what.contains("missing projection")), "{:?}", report.hints);
         if expected.is_err() {
             assert!(!report.fits && !report.placement_supported);
-            assert!(report.hints.iter().any(|hint| hint.what.contains("routed experts need")
-                && hint.what.contains("over the 108 GiB budget")),
+            assert!(report.hints.iter().any(|hint| hint.what.contains("memory budget 'spark")
+                && hint.what.contains("115964116992")),
                 "TP{ranks}: {:?}", report.hints);
         } else {
             assert!(!report.hints.iter().any(|hint| hint.what.contains("no exported width class")),
