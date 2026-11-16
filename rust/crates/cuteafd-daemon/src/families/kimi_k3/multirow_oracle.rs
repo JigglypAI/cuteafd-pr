@@ -125,7 +125,8 @@ fn case(engine: &Engine<'_>, histories: &[usize], tokens: &[Vec<u32>], n: usize,
                 (p, &tokens[s][histories[s] + row..histories[s] + row + 1])).collect::<Vec<_>>();
             read_logits(engine, engine.step_device(&mut batch, &pool, histories.len(), false)?)
         })?;
-        ensure!(!selected.is_empty(), "oracle did not observe a Context DSA selector");
+        ensure!(engine.target_view().config()?["model_type"] != "kimi_k31" || !selected.is_empty(),
+            "oracle did not observe a Context DSA selector");
         let vocab = values.len() / histories.len();
         for (s, logits) in values.chunks_exact(vocab).enumerate() { sequential[s].push(logits.to_vec()); }
         for (layer, rows) in selected { selection.entry(layer).or_default().push(rows); }
@@ -142,7 +143,17 @@ fn case(engine: &Engine<'_>, histories: &[usize], tokens: &[Vec<u32>], n: usize,
         Ok(Ok(()))
     })?;
     for outcome in outcomes { outcome?; }
+    let packed_state_equal = digests(engine, &placements)? == states[n - 1];
+    let k31 = engine.target_view().config()?["model_type"] == "kimi_k31";
+    let vocab = sequential[0][0].len();
+    for s in 0..histories.len() { for r in 0..n {
+        println!("KIMI_PACKED_PREFILL {}", serde_json::json!({"view":label,"k31":k31,
+            "histories":histories,"n":n,"slot":s,"row":r,
+            "difference":difference(&sequential[s][r], &floor[s][r * vocab..(r + 1) * vocab])?,
+            "committed_state_identical":packed_state_equal}));
+    }}
     dispose(engine, &mut placements)?;
+    if !k31 { return Ok(()); }
     for keep in [n, n / 2].into_iter().filter(|&k| k > 0) {
         let (pool, mut placements) = prepare(engine, histories, tokens)?;
         let (values, selected) = capture(|| {
@@ -201,7 +212,13 @@ fn metrics_and_required_matrix() -> Result<()> {
 
 #[test]
 #[ignore = "requires K3.1 MC checkpoint, two RTX GPUs and sealed WIP programs"]
-fn k31_context_multirow_verify_matches_sequential() -> Result<()> {
+fn k31_context_multirow_verify_matches_sequential() -> Result<()> { run_checkpoint(true) }
+
+#[test]
+#[ignore = "requires K3 K6 checkpoint, two RTX GPUs and sealed WIP programs"]
+fn k3_context_packed_prefill_matches_sequential() -> Result<()> { run_checkpoint(false) }
+
+fn run_checkpoint(k31: bool) -> Result<()> {
     use cuteafd_loader::plan::checkpoint::{CheckpointView, CoreView};
     cuteafd_core::set_expert_geometry(cuteafd_core::ExpertGeometry::KIMI_K3)
         .map_err(|_| anyhow::anyhow!("oracle requires an isolated process"))?;
@@ -220,11 +237,12 @@ fn k31_context_multirow_verify_matches_sequential() -> Result<()> {
     }
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
     let mut failures = 0;
-    for view in [CoreView::Original, CoreView::K6Compact] {
+    let views = if k31 { &[CoreView::Original, CoreView::K6Compact][..] } else { &[CoreView::Original][..] };
+    for &view in views {
         let view = CheckpointView::select(&snapshot, view)?;
         let checkpoint = cuteafd_loader::plan::Checkpoint::coordinator_view(&view, false, false)?;
         let full = cuteafd_loader::families::kimi_k3::config::KimiK3Config::from_hf(&checkpoint.config)?;
-        ensure!(full.dsa.is_some(), "K3.1 checkpoint required");
+        ensure!(full.dsa.is_some() == k31, "oracle checkpoint family differs");
         let cfg = super::super::admission::prefix(&full, 4)?;
         use cuteafd_loader::families::kimi_k3::config::KimiAttention;
         // Attention geometry and DSA semantics are global checkpoint fields.
