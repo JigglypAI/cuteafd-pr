@@ -58,12 +58,29 @@ impl LaneSet {
 
     /// Poll two lanes to completion. Neither is cancelled when the other fails;
     /// a failing lane stops its peers at their next boundary ([`LaneLease::run`]).
-    /// The first lane's error wins when both fail.
+    /// A round-wide fault outranks a request-local fault. Otherwise the first
+    /// lane's error wins; keep its peer's error as text, not a downcastable cause.
     pub async fn join(&self, first: impl Future<Output = Result<()>>, second: impl Future<Output = Result<()>>)
         -> Result<()> {
         let joined = std::pin::pin!(async { tokio::join!(first, second) });
         let (first, second) = paced(joined).await;
-        first.and(second)
+        match (first, second) {
+            (Err(first), Err(second)) => {
+                let local = |error: &anyhow::Error| error.is::<super::RequestFailure>();
+                if local(&first) && !local(&second) {
+                    Err(second.context(format!("peer lane also failed: {first:#}")))
+                } else if !local(&first) {
+                    Err(first.context(format!("peer lane also failed: {second:#}")))
+                } else {
+                    Err(super::RequestFailures([
+                        first.downcast_ref::<super::RequestFailure>().unwrap().clone(),
+                        second.downcast_ref::<super::RequestFailure>().unwrap().clone(),
+                    ]).into())
+                }
+            }
+            (Err(error), _) | (_, Err(error)) => Err(error),
+            _ => Ok(()),
+        }
     }
 }
 
@@ -257,7 +274,7 @@ mod tests {
         let ran = RefCell::new(Vec::new());
         assert!(block_on(set.join(record(&ran, 0, false), record(&ran, 1, false))).is_ok());
         let error = block_on(set.join(record(&ran, 0, true), record(&ran, 1, true))).unwrap_err();
-        assert_eq!(error.to_string(), "lane 0");
+        assert_eq!(error.root_cause().to_string(), "lane 0");
         assert_eq!(*ran.borrow(), [0, 1, 0, 1]);
     }
 

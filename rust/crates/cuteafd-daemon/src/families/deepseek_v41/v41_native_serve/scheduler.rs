@@ -2135,16 +2135,12 @@ fn single_lane_round<'w, 'a>(lib: &'a NativeLibrary, runtime: &tokio::runtime::R
     bound_inputs(&mut inputs);
     let draft_us = draft_start.elapsed().as_micros() as u64;
     let prepare_start = Instant::now();
-    let mut batch = Some(prepare_decode_lane(requests, active, members, &inputs, speculative)?);
-    let prepare_us = prepare_start.elapsed().as_micros() as u64;
-    let prepared_us = started.elapsed().as_micros() as u64;
     let compact = !tracing::enabled!(target: "cuteafd::logit_trace", tracing::Level::DEBUG)
         && !probe_rows_wanted(active, members)
         && members.iter().all(|&slot| {
             let request = active[slot].as_ref().unwrap();
             request.constraint.is_none() && request.job.sampling.is_greedy()
         });
-    let batch_id = batch.as_ref().unwrap().cache()?.identity();
     // Chunk-4a scope: a round is device-selected whenever the layout supports
     // the terminal and at least one row is device-servable. Each row's own
     // parameters then decide its kernels (K1, K1->K2 or K1->K3->K4->K5), and a
@@ -2156,9 +2152,14 @@ fn single_lane_round<'w, 'a>(lib: &'a NativeLibrary, runtime: &tokio::runtime::R
     //
     // A traced round still takes this path, but `SamplingRound::trace_rows` then
     // downloads every row for `top_two`.
-    if !compact && round_has_device_rows(active, members) {
-        let round = build_sampling_round(active, members, &inputs,
-            tracing::enabled!(target: "cuteafd::logit_trace", tracing::Level::DEBUG))?;
+    let sampling_round = (!compact && round_has_device_rows(active, members)).then(||
+        build_sampling_round(active, members, &inputs,
+            tracing::enabled!(target: "cuteafd::logit_trace", tracing::Level::DEBUG))).transpose()?;
+    let mut batch = Some(prepare_decode_lane(requests, active, members, &inputs, speculative)?);
+    let prepare_us = prepare_start.elapsed().as_micros() as u64;
+    let prepared_us = started.elapsed().as_micros() as u64;
+    let batch_id = batch.as_ref().unwrap().cache()?.identity();
+    if let Some(round) = sampling_round {
         pass.set_capture(capture);
         let next = runtime.block_on(execute_sampled_rows(pass, requests,
             batch.as_mut().unwrap(), transport, &round));

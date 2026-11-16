@@ -4,12 +4,17 @@ pub(crate) mod lanes;
 
 /// A host-side validation failure attributed to one request, before executing
 /// its round. Device/transport errors must never be wrapped in this type.
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Clone, thiserror::Error)]
 #[error("request {id}: {message}; retry the request")]
 pub(crate) struct RequestFailure {
     pub id: u64,
     pub message: String,
 }
+/// Two independently rejected requests at the same drained lane boundary.
+#[derive(Debug, thiserror::Error)]
+#[error("both lanes rejected requests: {}; {}", .0[0], .0[1])]
+pub(crate) struct RequestFailures(pub [RequestFailure; 2]);
+
 impl RequestFailure {
     pub fn new(id: u64, message: impl ToString) -> Self { Self { id, message: message.to_string() } }
     pub fn retry(&self) -> cuteafd_api::openai::NativeFailure {

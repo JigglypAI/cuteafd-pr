@@ -74,6 +74,12 @@ pub(super) fn handle<M: RoundMember>(active: &mut [Option<M>], error: &anyhow::E
     if let Some(failure) = error.downcast_ref::<crate::shared::serve::RequestFailure>() {
         if fail_request(active, failure) { return Ok(()); }
     }
+    if let Some(failures) = error.downcast_ref::<crate::shared::serve::RequestFailures>() {
+        if failures.0.iter().all(|failure| active.iter().flatten().any(|member| member.id() == failure.id)) {
+            for failure in &failures.0 { fail_request(active, failure); }
+            return Ok(());
+        }
+    }
     fail_round(active, error);
     reset()
 }
@@ -400,6 +406,41 @@ pub(super) mod tests {
         let mut releaser = FakeReleaser { leases: leases(3), retired: 0, fail_on: None };
         assert_eq!(retire_done(&mut active, &mut releaser).retired, 3);
         assert!(releaser.leases.is_empty());
+    }
+
+    #[test]
+    fn simultaneous_lane_request_and_device_fault_fails_round_and_resets() {
+        use crate::shared::serve::{lanes::LaneSet, RequestFailure};
+        for reverse in [false, true] {
+            let errors = ErrorLog::default();
+            let mut active = round(3, 0, &errors);
+            let runtime = tokio::runtime::Builder::new_current_thread().build().unwrap();
+            let local = anyhow::Error::new(RequestFailure::new(0, "member shape differs"));
+            let device = fault("device execution fault");
+            let (first, second) = if reverse { (device, local) } else { (local, device) };
+            let error = runtime.block_on(LaneSet::default().run(|_| async { Err(first) }, |_| async { Err(second) })).unwrap_err();
+            assert_eq!(error.root_cause().to_string(), "device execution fault");
+            assert!(format!("{error:#}").contains("member shape differs"));
+            assert!(!error.is::<RequestFailure>(), "local fault is context text, not a downcastable cause");
+            let mut resets = 0;
+            handle(&mut active, &error, || { resets += 1; Ok(()) }).unwrap();
+            assert_eq!(resets, 1);
+            assert_eq!(errors.lock().unwrap().len(), 3);
+        }
+    }
+
+    #[test]
+    fn simultaneous_request_failures_retire_both_without_resetting_peer() {
+        use crate::shared::serve::{lanes::LaneSet, RequestFailure};
+        let errors = ErrorLog::default();
+        let mut active = round(3, 0, &errors);
+        let runtime = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        let error = runtime.block_on(LaneSet::default().join(
+            async { Err(RequestFailure::new(0, "shape").into()) },
+            async { Err(RequestFailure::new(1, "capacity").into()) })).unwrap_err();
+        handle(&mut active, &error, || panic!("local faults must not reset links")).unwrap();
+        assert_eq!(errors.lock().unwrap().len(), 2);
+        assert!(!active[2].as_ref().unwrap().done);
     }
 
     #[test]
