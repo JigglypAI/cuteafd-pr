@@ -2,7 +2,7 @@
 pub mod audio;
 use anyhow::{ensure, Context, Result};
 use cuteafd_loader::media::{
-    decode_bounded, EncoderId, ImageProcessor, PreparedImage, PreprocessId, ProcessorConfig,
+    decode_pixels_bounded, EncoderId, ImageProcessor, PreparedImage, PreprocessId, ProcessorConfig,
 };
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -268,19 +268,19 @@ impl MediaPreparer {
                     "at most {} new images may need decode",
                     self.limits.decode_misses
                 );
-                let rgb = decode_bounded(
+                let pixels = decode_pixels_bounded(
                     &bytes,
                     config.decode,
                     self.limits.decoded_bytes.saturating_sub(decoded_bytes),
                 )?;
                 decoded_bytes = decoded_bytes
-                    .checked_add(rgb.data.len())
+                    .checked_add(pixels.bytes())
                     .context("decoded image byte count overflow")?;
                 ensure!(
                     decoded_bytes <= self.limits.decoded_bytes,
                     "decoded images exceed 64 MiB request limit"
                 );
-                let image = Arc::new(config.prepare_rgb(rgb, self.encoder)?);
+                let image = Arc::new(config.prepare_pixels(pixels, self.encoder)?);
                 result.decode_misses += 1;
                 let mut memo = self
                     .memo

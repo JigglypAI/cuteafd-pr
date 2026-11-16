@@ -1,4 +1,4 @@
-use super::{exif, invalid, MediaError, Result, RgbImage};
+use super::{exif, invalid, DecodedPixels, MediaError, Result, RgbImage};
 use image::{DynamicImage, ImageDecoder, ImageReader, Limits};
 use serde::{Deserialize, Serialize};
 use std::io::Cursor;
@@ -37,9 +37,18 @@ pub fn decode(encoded: &[u8], policy: DecodePolicy) -> Result<RgbImage> {
 }
 /// Check the request's remaining RGB budget from the header before allocation.
 pub fn decode_bounded(encoded: &[u8], policy: DecodePolicy, rgb_budget: usize) -> Result<RgbImage> {
-    let admit = |width, height| -> Result<()> {
+    Ok(decode_pixels_inner(encoded,policy,rgb_budget,false)?.into_rgb(policy.alpha))
+}
+
+/// Preserve alpha for family-specific resize/composite; charge the actual
+/// decoded channel count before allocation rather than assuming RGB storage.
+pub fn decode_pixels_bounded(encoded: &[u8], policy: DecodePolicy, budget: usize) -> Result<DecodedPixels> {
+    decode_pixels_inner(encoded,policy,budget,true)
+}
+fn decode_pixels_inner(encoded: &[u8], policy: DecodePolicy, rgb_budget: usize, preserve_alpha: bool) -> Result<DecodedPixels> {
+    let admit = |width, height, channels| -> Result<()> {
         dimensions(width, height)?;
-        if u64::from(width) * u64::from(height) * 3 > rgb_budget as u64 {
+        if u64::from(width) * u64::from(height) * channels > rgb_budget as u64 {
             return Err(invalid("decoded images exceed request byte limit"));
         }
         Ok(())
@@ -58,7 +67,7 @@ pub fn decode_bounded(encoded: &[u8], policy: DecodePolicy, rgb_budget: usize) -
             u32::try_from(header.width).map_err(|_| invalid("JPEG width overflow"))?,
             u32::try_from(header.height).map_err(|_| invalid("JPEG height overflow"))?,
         );
-        admit(width, height)?;
+        admit(width, height,3)?;
         let cmyk = matches!(
             header.colorspace,
             turbojpeg::Colorspace::CMYK | turbojpeg::Colorspace::YCCK
@@ -111,7 +120,8 @@ pub fn decode_bounded(encoded: &[u8], policy: DecodePolicy, rgb_budget: usize) -
         reader.limits(limits);
         let mut decoder = reader.into_decoder().map_err(|e| err(e.to_string()))?;
         let (width, height) = decoder.dimensions();
-        admit(width, height)?;
+        let keep_alpha = preserve_alpha && decoder.color_type().has_alpha();
+        admit(width,height,if keep_alpha {4} else {3})?;
         let metadata = if policy.exif_transpose {
             decoder.exif_metadata().map_err(|e| err(e.to_string()))?
         } else {
@@ -158,6 +168,10 @@ pub fn decode_bounded(encoded: &[u8], policy: DecodePolicy, rgb_budget: usize) -
             ),
             other => other,
         };
+        if keep_alpha {
+            let rgba = decoded.to_rgba8().into_raw();
+            return Ok(orient_rgba(width,height,rgba,if policy.exif_transpose {orientation} else {1}));
+        }
         let data = match decoded {
             // Pillow's integer-mode 16-bit grayscale conversion clamps, not scales.
             DynamicImage::ImageLuma16(gray) => gray
@@ -187,11 +201,21 @@ pub fn decode_bounded(encoded: &[u8], policy: DecodePolicy, rgb_budget: usize) -
             orientation,
         )
     };
-    Ok(if policy.exif_transpose {
+    Ok(DecodedPixels::Rgb(if policy.exif_transpose {
         exif::apply(rgb, orientation)
     } else {
         rgb
-    })
+    }))
+}
+
+fn orient_rgba(width:u32,height:u32,data:Vec<u8>,orientation:i64) -> DecodedPixels {
+    if !(2..=8).contains(&orientation) {return DecodedPixels::Rgba {width,height,data}}
+    // Reuse the byte-exact existing coordinate transform for RGB and alpha.
+    let rgb=RgbImage {width,height,data:data.chunks_exact(4).flat_map(|p| p[..3].iter().copied()).collect()};
+    let alpha=RgbImage {width,height,data:data.chunks_exact(4).flat_map(|p| [p[3];3]).collect()};
+    let rgb=exif::apply(rgb,orientation);let alpha=exif::apply(alpha,orientation);
+    let data=rgb.data.chunks_exact(3).zip(alpha.data.chunks_exact(3)).flat_map(|(p,a)| [p[0],p[1],p[2],a[0]]).collect();
+    DecodedPixels::Rgba {width:rgb.width,height:rgb.height,data}
 }
 
 fn jpeg_orientation(bytes: &[u8]) -> i64 {

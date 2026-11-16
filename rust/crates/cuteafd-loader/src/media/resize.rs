@@ -139,6 +139,29 @@ pub(crate) fn resize_bicubic(img: &RgbImage, width: u32, height: u32) -> RgbImag
     resize(img, width, height, Resample::Bicubic)
 }
 
+/// Pillow RGBA.resize converts to premultiplied RGBa before filtering and
+/// unpremultiplies afterwards. Keep alpha until the family's final composite.
+pub(crate) fn resize_rgba(data: &[u8], iw:u32, ih:u32, width:u32, height:u32, filter:Resample) -> Vec<u8> {
+    if (iw,ih)==(width,height) {return data.to_vec()}
+    let mut premultiplied=Vec::with_capacity(iw as usize*ih as usize*3);
+    let mut alpha=Vec::with_capacity(premultiplied.capacity());
+    for pixel in data.chunks_exact(4) {
+        let a=u32::from(pixel[3]);
+        for c in 0..3 {
+            let value=u32::from(pixel[c])*a+128;
+            premultiplied.push((((value>>8)+value)>>8) as u8);
+            alpha.push(pixel[3]);
+        }
+    }
+    let rgb=resize(&RgbImage {width:iw,height:ih,data:premultiplied},width,height,filter);
+    let alpha=resize(&RgbImage {width:iw,height:ih,data:alpha},width,height,filter);
+    rgb.data.chunks_exact(3).zip(alpha.data.chunks_exact(3)).flat_map(|(pixel,alpha)| {
+        let a=u32::from(alpha[0]);
+        let channel=|c| if a==0 {0} else {(255*u32::from(pixel[c])/a).min(255) as u8};
+        [channel(0),channel(1),channel(2),alpha[0]]
+    }).collect()
+}
+
 pub(crate) fn resize(img: &RgbImage, width: u32, height: u32, filter: Resample) -> RgbImage {
     let (iw, ih) = (img.width as usize, img.height as usize);
     let (ow, oh) = (width as usize, height as usize);
@@ -249,6 +272,15 @@ fn horizontal_row(s: &[u8], d: &mut [u8], c: &Coeffs) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rgba_bicubic_preserves_pillow_premultiply_boundaries() {
+        let raw=(0..7*5*4).map(|i| ((i*37+13)%256) as u8).collect::<Vec<_>>();
+        assert_eq!(resize_rgba(&raw,7,5,7,5,Resample::Bicubic),raw);
+        // Pillow 12.3 Image.frombytes(RGBA,(7,5),raw).resize((3,2),BICUBIC).
+        assert_eq!(resize_rgba(&raw,7,5,3,2,Resample::Bicubic),
+            [52,87,115,93,117,132,130,135,144,108,144,120,88,126,113,121,142,117,151,165,78,114,153,111]);
+    }
 
     #[test]
     fn identity_and_degenerate_sizes() {

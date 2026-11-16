@@ -275,6 +275,22 @@ fn decode_policy_and_header_admission() {
 }
 
 #[test]
+fn alpha_preserving_decode_charges_rgba_and_defers_composite() {
+    let data=vec![10,20,30,0,100,150,200,128];
+    let image=image::RgbaImage::from_raw(2,1,data.clone()).unwrap();
+    let mut encoded=std::io::Cursor::new(Vec::new());
+    image::DynamicImage::ImageRgba8(image).write_to(&mut encoded,image::ImageFormat::Png).unwrap();
+    let encoded=encoded.into_inner();
+    assert!(decode_pixels_bounded(&encoded,DecodePolicy::default(),7).is_err());
+    let decoded=decode_pixels_bounded(&encoded,DecodePolicy::default(),8).unwrap();
+    assert_eq!(decoded.dimensions(),[2,1]);assert_eq!(decoded.bytes(),8);
+    assert_eq!(decoded,DecodedPixels::Rgba {width:2,height:1,data});
+    assert_eq!(decoded.clone().into_rgb(AlphaPolicy::Drop),decode(&encoded,DecodePolicy::default()).unwrap());
+    assert_eq!(decoded.clone().into_rgb(AlphaPolicy::White),decode(&encoded,DecodePolicy {alpha:AlphaPolicy::White,..Default::default()}).unwrap());
+    assert_eq!(decoded.checkerboard().data,[204,204,204,152,177,202]);
+}
+
+#[test]
 fn png_xmp_orientation_matches_pillow_fallback() {
     let image = image::RgbImage::from_raw(2, 1, vec![1, 2, 3, 4, 5, 6]).unwrap();
     let mut encoded = std::io::Cursor::new(Vec::new());
