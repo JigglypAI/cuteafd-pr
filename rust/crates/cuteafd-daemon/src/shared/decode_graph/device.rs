@@ -402,7 +402,6 @@ pub(crate) struct TraceRow {
     executables: u64,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     permanently_eager: bool,
-    signature: Option<Vec<u64>>,
     basis: Basis,
     permanent_bytes: u64,
     pinned: bool,
@@ -2325,7 +2324,6 @@ struct RawRecord {
     nodes: u64,
     pinned: bool,
     permanently_eager: bool,
-    signature: Option<Vec<u64>>,
     resident: bool,
     stats: KeyStats,
 }
