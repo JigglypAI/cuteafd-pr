@@ -1028,7 +1028,7 @@ mod anchor_fallback_tests {
             assert!(runtime.restore_mark(1, 63, mark.buffer).is_err());
             assert!(runtime.requests.contains_key(&1), "restore must retain failed request ownership");
             assert!(runtime.drain_prefix().is_err());
-            assert!(runtime.release(1).is_err());
+            runtime.release(1)?; // Poisoned component ownership remains held, not recycled.
             assert!(runtime.admit(1).is_err(), "failed ring slot must never be readmitted");
             assert!(runtime.windows[0].begin_request(0, 99).is_err());
             assert!(runtime.windows[0].request_id(lease).is_err(), "poisoned ring is unreadable");
