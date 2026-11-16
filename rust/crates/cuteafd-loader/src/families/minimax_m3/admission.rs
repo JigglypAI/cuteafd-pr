@@ -66,6 +66,7 @@ pub struct FactsRequest<'a> {
     pub physical_devices: &'a [i32],
     pub spark_ranks: usize,
     pub spark_bytes: u64,
+    pub spark_rank_bytes: Vec<u64>,
     pub prefill: PrefillShape,
     /// Explicit context, or 0 for the checkpoint's maximum.
     pub context_tokens: u64,
@@ -385,7 +386,7 @@ pub fn gather(request: &FactsRequest<'_>) -> Result<MiniMaxInputs, Refused> {
                 "Provide a valid post-module CUDA memory sample."))).collect::<Result<Vec<_>, _>>()?,
     };
     let mut budgets = (0..gpus).map(|gpu| request.coordinator.budget(gpu)).collect::<Vec<_>>();
-    budgets.extend((0..ranks).map(|rank| shared::spark_budget(rank as u8, request.spark_bytes)));
+    budgets.extend((0..ranks).map(|rank| shared::spark_budget(rank as u8, request.spark_rank_bytes.get(rank).copied().unwrap_or(request.spark_bytes))));
     let (host_total, host_available) = request.host;
     budgets.push(crate::placement::families::kimi::host_budget(host_total, host_available));
     // A host prefix snapshot retains both replicated index planes for heads.

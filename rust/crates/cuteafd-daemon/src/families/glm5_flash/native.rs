@@ -241,7 +241,7 @@ mod tests {
                     let input = GlmfInputs { cfg: &cfg, layers: cfg.layers, attention, resident: resident.clone(),
                         gpus: vec![(96 << 30, Baseline::Planned { context_bytes: 0, loaded_bytes: 0 }); ranks],
                         ..native_test_inputs(&cfg, ranks) };
-                    let mut process = ProcessOwners::new((512 << 30, 512 << 30), 8 << 30);
+                    let mut process = ProcessOwners::new((512 << 30, 512 << 30), 8 << 30).with_spark_capacities(cuteafd_loader::serving_capacity::spark_memory::serving_bytes());
                     process.target(&checkpoint, &input, Some((&facts, &metadata)))?;
                     for home in 0..ranks {
                         let runtime = Admission::target_layouts(&facts, &dense, &cfg, home)?;

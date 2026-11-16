@@ -35,13 +35,14 @@ def test_predeclared_inkling_producer_stems(monkeypatch):
     stems = [p[0] for p in programs]
     expected = []
     for suffix in ['bf16', 'f32']:
-        expected += [f'conv_static_h4608_{suffix}', f'conv_static_h1024_{suffix}', f'conv_dynamic_h1024_{suffix}']
+        expected += [f'conv_static_h4608_{suffix}_v2', f'conv_static_h1024_{suffix}_v2', f'conv_dynamic_h1024_{suffix}_v2']
         expected += [f'clip_{kind}_{name}_{suffix}' for kind, names in [('local', ['q', 'k', 'r']), ('global', ['q', 'r'])] for name in names]
         expected += [f'gate_h6144_{suffix}', f'situ_h2304_{suffix}', f'norm_h4608_{suffix}',
-                     f'norm_v_h8_d128_{suffix}', f'kv_pack_{suffix}']
+                     f'norm_v_h8_d128_{suffix}']
+        expected += [f'kv_pack_{fmt}_{suffix}_v2' for fmt in ['bf16', 'fp8']]
     expected += ['residual_q1_keep', 'residual_q1_add', 'residual_q3_keep', 'residual_q3_add', 'router_e384_k8']
     assert stems == expected
-    assert len(stems) == len(set(stems)) == 31
+    assert len(stems) == len(set(stems)) == 33
     for stem, _, params, compiler in programs:
         import json
         json.dumps(params)

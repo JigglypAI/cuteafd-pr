@@ -27,7 +27,7 @@ pub struct ProcessOwners {
     pub remote_experts: bool,
     /// EXLR8 weights plus all execution owners per onboarding count and rank.
     pub spark_candidates: Vec<Vec<u64>>,
-    pub spark_cap: Option<u64>,
+    pub spark_rank_caps: Vec<u64>,
     /// Additional admitted media hosts, independent of expert peers.
     pub physical_sparks: usize,
     pub native_load: Option<NativeLoad>,
@@ -219,10 +219,15 @@ impl NativeLoad {
 
 impl ProcessOwners {
     pub fn new(host: (u64, u64), host_headroom: u64) -> Self {
-        Self { host, host_headroom, allocations: vec![], links: vec![], remote_experts: true, spark_candidates: vec![], spark_cap: None, physical_sparks: 0, native_load: None, mount_load: None,
+        Self { host, host_headroom, allocations: vec![], links: vec![], remote_experts: true, spark_candidates: vec![], spark_rank_caps: Vec::new(), physical_sparks: 0, native_load: None, mount_load: None,
             encoders: vec![], auto_vision: false, media_cache_bytes: 0, alternate_resident: None,
             target_arenas: vec![], alternate_target_arenas: vec![], shared_arenas: vec![], draft_arenas: vec![], push_host: None,
             draft_push: None, draft_tp2: vec![] }
+    }
+
+    pub fn with_spark_capacities(mut self, bytes: Vec<u64>) -> Self {
+        self.spark_rank_caps = bytes;
+        self
     }
 
     pub fn draft(&mut self, snapshot: &std::path::Path,
@@ -831,7 +836,10 @@ fn prepare_fixed<'a>(i: &'a GlmfInputs<'a>, sms: usize, rtx_experts: bool, proce
     for rank in 0..physical_sparks {
         budgets.push(p::Budget { id: format!("spark{rank}"), locations: vec![p::Location {
             device: p::Device::Spark(rank as u8), domain: p::Domain::Managed }],
-            physical_bytes: process.spark_cap.unwrap_or(121 << 30), logical_bytes: process.spark_cap.unwrap_or(121 << 30), headroom: 0,
+            physical_bytes: process.spark_rank_caps.get(rank).copied().filter(|bytes| *bytes > 0)
+                .ok_or_else(|| invalid(&format!("missing measured capacity for physical Spark rank {rank}")))?,
+            logical_bytes: process.spark_rank_caps.get(rank).copied().filter(|bytes| *bytes > 0)
+                .ok_or_else(|| invalid(&format!("missing measured capacity for physical Spark rank {rank}")))?, headroom: 0,
             baseline: p::Baseline::Forecast { occupied: 0,
                 source: "Spark worker physical capacity; worker owners supplied by caller".into(), assumed: true } });
     }
@@ -1225,6 +1233,11 @@ impl PreparedGlmf<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn measured_process(host: (u64, u64), headroom: u64) -> ProcessOwners {
+        let mut process = ProcessOwners::new(host, headroom);
+        process.spark_rank_caps = crate::serving_capacity::spark_memory::serving_bytes();
+        process
+    }
     use crate::plan::exlr8::residency::{ExpertSet, Residency};
 
     #[test]
@@ -1240,7 +1253,7 @@ mod tests {
             }
             for reserve in [None, Some(0), Some(200 << 20)] {
                 MemoryPolicy { gpu_reserve: reserve, ..Default::default() }.scoped(|| {
-                    let mut reference = prepare(&input, 188, true, ProcessOwners::new((512 << 30, 512 << 30), 8 << 30)).unwrap();
+                    let mut reference = prepare(&input, 188, true, measured_process((512 << 30, 512 << 30), 8 << 30)).unwrap();
                     reference.recipe.contract.components.retain(|component| !matches!(&component.kind,
                         p::ComponentKind::Allowance(owner) if crate::placement::sampled_baseline::is_source(&owner.source)));
                     for rank in 0..gpus {
@@ -1248,7 +1261,7 @@ mod tests {
                             free: input.gpus[rank].0 - samples[rank], phase: p::Phase::Load, source: "reference".into() };
                     }
                     let before = reference.admit().unwrap().solved;
-                    let plan = prepare(&input, 188, true, ProcessOwners::new((512 << 30, 512 << 30), 8 << 30))
+                    let plan = prepare(&input, 188, true, measured_process((512 << 30, 512 << 30), 8 << 30))
                         .unwrap().admit().unwrap().solved;
                     assert_eq!(plan.pool_tokens, before.pool_tokens);
                     assert_eq!(plan.decisions, before.decisions);
@@ -1283,7 +1296,7 @@ mod tests {
             input.drafter_bytes = 0;
             input.drafter_weights = ResidentWeights(0);
             input.requested_pool = Some(262_144);
-            let solved = prepare(&input, 188, true, ProcessOwners::new((512 << 30, 512 << 30), 8 << 30))
+            let solved = prepare(&input, 188, true, measured_process((512 << 30, 512 << 30), 8 << 30))
                 .unwrap().admit().unwrap().solved;
             let slabs = p::cuda_stream_slab_bytes(startup_peak_live_streams(ranks)).unwrap();
             for rank in 0..ranks {
@@ -1314,7 +1327,7 @@ mod tests {
             input.resident = crate::families::glm5_flash::resident::resident_weights_placed(
                 &checkpoint, &cfg, cfg.layers, ranks, input.representation,
                 input.attention.mode, 0).map_err(anyhow::Error::msg)?;
-            let mut process = ProcessOwners::new((512 << 30, 512 << 30), 8 << 30);
+            let mut process = measured_process((512 << 30, 512 << 30), 8 << 30);
             if ranks == 2 {
                 process.alternate_resident = Some(crate::families::glm5_flash::resident::resident_weights_placed(
                     &checkpoint, &cfg, cfg.layers, ranks, input.representation,
@@ -1397,7 +1410,7 @@ mod tests {
             input.drafter_bytes = 0;
             input.drafter_weights = ResidentWeights(0);
             input.requested_pool = Some(262_144);
-            let mut process = ProcessOwners::new((512 << 30, 512 << 30), 8 << 30);
+            let mut process = measured_process((512 << 30, 512 << 30), 8 << 30);
             process.draft_tp2 = super::super::drafter_tp2_inventory(snapshot.path(),
                 GlmDraftCapacity::new(8, 8, draft.block)?, &[188, 188], representation, 2, Qwen4KvCache::Bf16)?;
             process.draft(snapshot.path(), representation, 2, true)?;
@@ -1444,7 +1457,7 @@ mod tests {
             input.blas_head = head;
             input.requested_pool = Some(262_144);
             if !draft { input.drafter_bytes = 0; input.drafter_weights = ResidentWeights(0); }
-            let mut process = ProcessOwners::new((512 << 30, 512 << 30), 8 << 30);
+            let mut process = measured_process((512 << 30, 512 << 30), 8 << 30);
             process.encoders = vec![EncoderPlacement { kind: EncoderKind::Rtx { gpu: 1 },
                 weights: 1024, scratch: 4096, replicas: vec![], reason: "test".into(), shortfall: 0 }];
             process.serving(&input, 32 << 30, 256 << 20, 0, 0).unwrap();
@@ -1481,12 +1494,17 @@ mod tests {
         input.drafter_bytes = 0;
         input.drafter_weights = ResidentWeights(0);
         input.requested_pool = Some(262_144);
-        let mut process = ProcessOwners::new((512 << 30, 512 << 30), 8 << 30);
-        process.physical_sparks = 2;
-        process.encoders = vec![EncoderPlacement { kind: EncoderKind::Spark { rank: 0 },
-            weights: 1024, scratch: 4096, replicas: vec![1], reason: "test".into(), shortfall: 0 }];
+        let mut process = measured_process((512 << 30, 512 << 30), 8 << 30);
+        input.spark_ranks = 1;
+        process.physical_sparks = 3;
+        process.spark_rank_caps = vec![118 << 30, 117 << 30, 116 << 30];
+        process.encoders = vec![EncoderPlacement { kind: EncoderKind::Spark { rank: 2 },
+            weights: 1024, scratch: 4096, replicas: vec![], reason: "test".into(), shortfall: 0 }];
         let solved = prepare(&input, 188, true, process).unwrap().admit().unwrap().solved;
-        for rank in [0, 1] {
+        let media = solved.budgets.iter().find(|budget| budget.id == "spark2").unwrap();
+        assert_eq!(media.physical_bytes, 116 << 30);
+        assert_eq!(media.logical_bytes, 116 << 30);
+        for rank in [2] {
             let location = p::Location { device: p::Device::Spark(rank), domain: p::Domain::Managed };
             let owners = solved.facts.allowances.iter().filter(|owner| owner.location == location
                 && owner.lifetime.contains(p::Phase::Ready, solved.facts.phase_order)).collect::<Vec<_>>();
@@ -1531,7 +1549,7 @@ mod tests {
         let host = crate::push_load::PushHostEnvelope::new(vec![0], vec![6 << 20], 128, 1 << 20).unwrap();
         let draft = DraftPush { host: host.clone(), device_scratch: 32 << 20 };
         let solve = |push: Option<DraftPush>| {
-            let mut process = ProcessOwners::new((512 << 30, 512 << 30), 8 << 30);
+            let mut process = measured_process((512 << 30, 512 << 30), 8 << 30);
             process.draft_push = push;
             prepare(&input, 188, true, process).unwrap().admit().unwrap().solved
         };
@@ -1598,18 +1616,18 @@ mod tests {
         input.spark_ranks = 2;
 
         // Admitted Spark experts succeed.
-        let process = ProcessOwners::new((512 << 30, 512 << 30), 8 << 30);
+        let process = measured_process((512 << 30, 512 << 30), 8 << 30);
         assert!(prepare(&input, 188, true, process).is_ok());
 
         // Media-only Spark ranks without remote experts refuse shared replay.
-        let mut media_only = ProcessOwners::new((512 << 30, 512 << 30), 8 << 30);
+        let mut media_only = measured_process((512 << 30, 512 << 30), 8 << 30);
         media_only.remote_experts = false;
         let err = prepare(&input, 188, true, media_only).err().unwrap().to_string();
         assert!(err.contains("--replay-records shared needs one coordinator GPU with Spark experts"), "{err}");
 
         // Onboarding all routed layers to RTX leaves admitted expert world 0 and refuses shared replay.
         input.onboard = Onboard::Layers(routed);
-        let process = ProcessOwners::new((512 << 30, 512 << 30), 8 << 30);
+        let process = measured_process((512 << 30, 512 << 30), 8 << 30);
         let err = prepare(&input, 188, true, process).err().unwrap().to_string();
         assert!(err.contains("--replay-records shared needs one coordinator GPU with Spark experts"), "{err}");
     }

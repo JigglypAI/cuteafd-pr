@@ -36,6 +36,8 @@ impl<'a> UnitBuffers<'a> for PackedLayerUnit<'_, 'a> {
     fn layout(&self) -> &UnitLayout { &self.unit.layout }
     fn buffer(&self, name: &str) -> Result<Buffer> {
         match name {
+            "ring" | "attn_conv_history" | "mlp_conv_history" | "k_conv_history" | "v_conv_history" =>
+                self.cache.field_bank(self.layer, name),
             "global_cache" => self.cache.global(self.layer),
             "cache_slots" if self.cache.layout.global_layers.contains(&self.layer) => self.unit.buffer("global_slots"),
             _ => self.unit.buffer(name),
@@ -140,6 +142,12 @@ impl<'a> UnitOwner<'a> {
     }
     pub fn packed_metadata(&self, layer: usize, cache: &super::cache::CacheBank<'a>, members: &[PackedMember],
         uploads: &mut crate::shared::token_table::RetainedUploads<'a>) -> Result<()> {
+        ensure!(cache.layout.sequence_bytes % 4096 == 0,
+            "Inkling sequence bank must have an integral record stride");
+        ensure!(members.len() <= cache.layout.sequences
+            && members.iter().all(|member| member.sequence < cache.layout.sequences)
+            && members.iter().map(|member| member.sequence).collect::<std::collections::BTreeSet<_>>().len() == members.len(),
+            "Inkling packed cache members alias or exceed admitted request slots");
         let rows = members.last().context("Inkling packed metadata is empty")?.rows.end;
         let mut positions = Vec::with_capacity(rows);
         let mut local = Vec::with_capacity(rows);
@@ -151,11 +159,12 @@ impl<'a> UnitOwner<'a> {
             ensure!(member.rows.start == positions.len() && member.metadata.rows() == member.rows.len(),
                 "Inkling packed metadata members do not cover unit rows");
             positions.extend_from_slice(&member.metadata.positions);
-            local.extend_from_slice(&member.metadata.local_slots);
+            local.extend(member.metadata.local_slots.iter().map(|&slot| slot + member.rows.start as i64));
             global.extend_from_slice(&member.metadata.global_slots);
-            ring.extend_from_slice(&member.metadata.ring_slots);
-            conv.extend_from_slice(&member.metadata.conv_slots);
-            first.extend(std::iter::repeat_n(0i32, member.rows.len()));
+            ring.extend(member.metadata.ring_slots.iter().map(|&slot|
+                slot + (member.sequence * cache.layout.sequence_bytes / 4096) as i64));
+            conv.extend(std::iter::repeat_n(member.sequence as i64, member.rows.len()));
+            first.extend(std::iter::repeat_n(member.rows.start as i32, member.rows.len()));
         }
         ensure!(rows <= self.layout.rows && layer < cache.layout.layers.len(), "Inkling packed metadata extent differs");
         for (name, values) in [("positions", positions), ("cache_slots", local), ("global_slots", global),
@@ -168,6 +177,24 @@ impl<'a> UnitOwner<'a> {
         let bytes = first.iter().flat_map(|value| value.to_le_bytes()).collect::<Vec<_>>();
         // SAFETY: same whole-unit metadata source lifetime.
         unsafe { uploads.upload(self.buffer("first")?, &bytes, self.stream.raw)?; }
+        let step = 10;
+        let tiles = members.iter().flat_map(|member| member.rows.clone().step_by(step))
+            .map(|row| row as i32).collect::<Vec<_>>();
+        let indices = members.iter().enumerate().flat_map(|(table, member)|
+            std::iter::repeat_n(table as i32, member.rows.len())).collect::<Vec<_>>();
+        let width = self.layout.buffers["page_table"] / (cache.layout.sequences*4);
+        let mut pages = vec![0i32; members.len()*width];
+        for (table, member) in members.iter().enumerate() {
+            ensure!(member.metadata.page_table.len() <= width, "Inkling member page table exceeds stride");
+            pages[table*width..table*width+member.metadata.page_table.len()]
+                .copy_from_slice(&member.metadata.page_table);
+        }
+        for (name, values) in [("tile_rows", tiles), ("table_indices", indices), ("page_table", pages)] {
+            if name == "page_table" && !cache.layout.global_layers.contains(&layer) { continue; }
+            let bytes = values.iter().flat_map(|value| value.to_le_bytes()).collect::<Vec<_>>();
+            // SAFETY: retained uploads fence immutable sources through the entire packed layer.
+            unsafe { uploads.upload(self.buffer(name)?, &bytes, self.stream.raw)?; }
+        }
         Ok(())
     }
     /// Caller admits each named physical request and its allocation tail first.
@@ -242,11 +269,11 @@ impl<'a> RequestOwners<'a> {
         let sequences = usize::try_from(inputs.sequences)?;
         let context = usize::try_from(inputs.context.maximum)?;
         let pages = usize::try_from(admitted.solved.pool_tokens.div_ceil(64))?;
-        let cache_layout = cuteafd_loader::families::inkling2::execution::CacheLayout::new(cfg, sequences, pages)?;
+        let cache_layout = cuteafd_loader::families::inkling2::execution::CacheLayout::with_format(cfg, sequences, pages, inputs.kv_format)?;
         let mark_slots = usize::try_from(cuteafd_core::prefix::mark_slots_with_host(inputs.sequences, inputs.prefix_entries,
             cache_layout.sequence_bytes as u64, inputs.prefix_mark_budget, inputs.host_prefix.quota_bytes > 0))?;
-        let decode_layout = UnitLayout::serving(cfg, 64, context)?;
-        let prefill_layout = UnitLayout::serving(cfg, usize::try_from(inputs.prefill.rows)?, context)?;
+        let decode_layout = UnitLayout::serving_format(cfg, 64, context, inputs.kv_format, sequences)?;
+        let prefill_layout = UnitLayout::serving_format(cfg, usize::try_from(inputs.prefill.rows)?, context, inputs.kv_format, sequences)?;
         let owner = |id: &str, bytes: usize, location| -> Result<()> {
             let allocation = admitted.solved.facts.allocations.iter().find(|allocation| allocation.id == id)
                 .with_context(|| format!("Inkling unadmitted runtime owner {id}"))?;
@@ -307,7 +334,7 @@ mod packed_tests {
         cfg.layers = 2;
         cfg.local = vec![true, false];
         let cache = super::super::cache::CacheBank::new(vec![stream.clone()], CacheLayout::new(&cfg, 2, 4)?, 0)?;
-        let unit = UnitOwner::new(stream.clone(), UnitLayout::serving(&cfg, 4, 128)?)?;
+        let unit = UnitOwner::new(stream.clone(), UnitLayout::serving_format(&cfg, 4, 128, Default::default(), 2)?)?;
         let mut uploads = unit.uploads(&cfg, 2)?;
         let members = vec![
             PackedMember { sequence: 1, rows: 0..1, metadata: UnitMetadata::new(&cfg, 63..64, &[2], 4)? },
@@ -322,9 +349,21 @@ mod packed_tests {
             Ok(bytes.chunks_exact(8).map(|b| i64::from_le_bytes(b.try_into().unwrap())).collect())
         };
         assert_eq!(values("positions")?, [63, 65, 66, 67]);
-        assert_eq!(values("cache_slots")?, [0, 0, 1, 2]);
+        assert_eq!(values("cache_slots")?, [0, 1, 2, 3]);
         assert_eq!(values("global_slots")?, [191, 193, 194, 195]);
-        assert_eq!(values("conv_slots")?, [0; 4]);
+        assert_eq!(values("conv_slots")?, [1, 0, 0, 0]);
+        let i32_values = |name: &str| -> Result<Vec<i32>> {
+            let buffer = unit.buffer(name)?;
+            let mut bytes = vec![0; buffer.bytes];
+            library.copy_d2h(&mut bytes, buffer)?;
+            Ok(bytes.chunks_exact(4).map(|b| i32::from_le_bytes(b.try_into().unwrap())).collect())
+        };
+        assert_eq!(i32_values("first")?, [0, 1, 1, 1]);
+        assert_eq!(i32_values("table_indices")?, [0, 1, 1, 1]);
+        assert_eq!(&i32_values("tile_rows")?[..2], [0, 1]);
+        assert_eq!(i32_values("page_table")?, [2, 0, 0, 3]);
+        let stride = cache.layout.sequence_bytes/4096;
+        assert_eq!(values("ring_slots")?, [stride as i64+63, 65, 66, 67]);
         let packed = PackedLayerUnit { unit: &unit, cache: &cache, layer: 1, members: &members,
             uploads: std::cell::RefCell::new(&mut uploads) };
         assert_eq!(packed.buffer("partial")?.ptr, unit.buffer("partial")?.ptr);

@@ -17,9 +17,6 @@ pub(crate) mod spark_slots;
 
 const GIB: u64 = 1 << 30;
 const MIB: u64 = 1 << 20;
-/// Historical offline GB10 device capacity estimate, not a measured admission.
-/// Kept distinct from the family's weights-only default until load/steady census.
-pub const DEFAULT_SPARK_DEVICE_BYTES: u64 = 108 * GIB;
 // 2026-10-07 SM120/SM121 resident ledger at the fixed 4096-image-token capacity:
 // native scratch_glm's aligned arenas, including its dedicated 4 MiB BLAS workspace.
 const GLM_FLASH_ENCODER_SCRATCH_BYTES: u64 = 791_907_584;
@@ -50,8 +47,10 @@ pub struct LayoutOptions {
     pub host_embedding: bool,
     /// Explicit device placement disables the memory-constrained auto profile.
     pub force_gpu_embedding: bool,
-    /// Usable bytes of one Spark rank (unified memory).
+    /// Explicit uniform Spark ceiling; zero selects per-host measured capacity.
     pub spark_bytes: u64,
+    /// Idle MemAvailable for each physical rank, in configured host order.
+    pub spark_rank_bytes: Vec<u64>,
     /// Runtime allocation ceiling, distinct from unified physical memory.
     pub spark_allocation_budget_bytes: Option<u64>,
     /// Two coordinator GPUs split attention heads (generic families) rather
@@ -187,6 +186,7 @@ pub struct LayoutOptions {
     pub qwen_kv: crate::families::qwen4::Qwen4KvCache,
     pub step5_kv: crate::families::qwen4::Qwen4KvCache,
     pub muse_kv: crate::families::muse_spark::cache::MuseKvCache,
+    pub inkling_kv: crate::families::inkling2::InklingKvCache,
     /// Selected Qwen projection/head residency, matching serve-qwen4.
     pub qwen_representation: crate::families::qwen4::resident::Qwen4Representation,
     /// Qwen immutable attention scratch override.
@@ -207,6 +207,29 @@ pub struct LayoutOptions {
 }
 
 impl LayoutOptions {
+    pub fn spark_capacity(&self, rank: usize) -> u64 {
+        if let Some(bytes) = self.spark_allocation_budget_bytes { bytes }
+        else if self.spark_bytes > 0 { self.spark_bytes }
+        else { self.spark_rank_bytes.get(rank).copied().unwrap_or(0) }
+    }
+
+    pub fn spark_capacities(&self, ranks: usize) -> Vec<u64> {
+        (0..ranks).map(|rank| self.spark_capacity(rank)).collect()
+    }
+
+    pub fn apply_spark_capacities(&self, budgets: &mut [crate::placement::planner::Budget]) {
+        use crate::placement::planner::Device;
+        for budget in budgets {
+            if let Some(rank) = budget.locations.iter().find_map(|location| match location.device {
+                Device::Spark(rank) => Some(usize::from(rank)), _ => None,
+            }) {
+                let bytes = self.spark_capacity(rank);
+                budget.physical_bytes = bytes;
+                budget.logical_bytes = bytes;
+            }
+        }
+    }
+
     pub fn resolved_spark_reply_format(&self, partial: bool) -> cuteafd_core::SparkReplyFormat {
         self.spark_reply_formats.prefill(partial)
     }
@@ -266,7 +289,8 @@ impl Default for LayoutOptions {
             vision_replicas: 1,
             host_embedding: false,
             force_gpu_embedding: false,
-            spark_bytes: DEFAULT_SPARK_DEVICE_BYTES,
+            spark_bytes: 0,
+            spark_rank_bytes: crate::serving_capacity::spark_memory::serving_bytes(),
             spark_allocation_budget_bytes: None,
             head_split: true,
             prefill_rows: 0,
@@ -338,6 +362,7 @@ impl Default for LayoutOptions {
             qwen_kv: Default::default(),
             step5_kv: crate::families::qwen4::Qwen4KvCache::Fp8,
             muse_kv: Default::default(),
+            inkling_kv: Default::default(),
             qwen_representation: crate::families::qwen4::resident::Qwen4Representation {
                 fp8_projections: false, fp8_head: false },
             qwen_attention_plan_rows: None,
@@ -1066,12 +1091,9 @@ pub(crate) fn mapped_table_note(report: &PlanReport, notes: &mut Vec<String>) {
 /// replaces these with the worker's own measurement.
 #[derive(Debug, Clone, Copy)]
 pub struct SparkCharges {
-    /// Observed host footprint, charged against physical memory (the usable
-    /// inventory's 13 GiB host exclusion is added back to capacity).
-    pub host_bytes: Option<u64>,
     /// Non-I/O wave residual at 4096 capacity rows.
     pub wave_bytes: u64,
-    /// Basis of the host and runtime charges.
+    /// Basis of runtime charges.
     pub basis: Basis,
 }
 
@@ -1117,12 +1139,8 @@ pub(crate) fn spark_devices(report: &mut PlanReport, model: &dyn super::FamilyMo
         .map(|c| c.formats.keys().cloned().collect::<Vec<_>>().join("+")).unwrap_or_default();
     let (slices, padded) = spark_slices(report, model, ranks, routed);
     let mut devices = slices.into_iter().enumerate().map(|(rank, stored)| {
-        let mut device = DeviceLayout { kind: DeviceKind::Spark, index: rank as u32, capacity_bytes: options.spark_bytes, worker_budget_bytes: options.spark_bytes,
+        let mut device = DeviceLayout { kind: DeviceKind::Spark, index: rank as u32, capacity_bytes: options.spark_capacity(rank), worker_budget_bytes: options.spark_capacity(rank),
             items: Vec::new(), kv_tokens: 0 };
-        if let Some(host) = charges.host_bytes {
-            device.capacity_bytes += 13 * GIB;
-            device.items.push(Item::new(Category::Reserved, "host OS+sparknestd", "", host, charges.basis));
-        }
         device.items.push(Item::new(Category::Experts, "routed_expert", format.clone(), stored, Basis::Exact));
         device
     }).collect::<Vec<_>>();
@@ -1139,7 +1157,7 @@ pub(crate) fn spark_devices(report: &mut PlanReport, model: &dyn super::FamilyMo
 pub(crate) fn ensure_tower_spark(devices: &mut Vec<DeviceLayout>, rank: usize, options: &LayoutOptions) {
     if devices.iter().any(|device| device.kind == DeviceKind::Spark && device.index as usize == rank) { return; }
     devices.push(DeviceLayout { kind: DeviceKind::Spark, index: rank as u32,
-        capacity_bytes: options.spark_bytes, worker_budget_bytes: options.spark_bytes,
+        capacity_bytes: options.spark_capacity(rank), worker_budget_bytes: options.spark_capacity(rank),
         kv_tokens: 0, items: vec![Item::new(Category::Runtime, "context+modules", "tower only", 512 * MIB, Basis::Calibrated)] });
 }
 
@@ -1882,4 +1900,28 @@ pub(crate) fn charge_host(report: &mut PlanReport, options: &LayoutOptions, inpu
     }
     report.host_ledger = Some(host);
     Ok(())
+}
+
+#[cfg(test)]
+mod spark_capacity_tests {
+    use super::*;
+
+    #[test]
+    fn measured_rank_capacities_reach_solver_and_explicit_cap_wins() {
+        use crate::placement::planner::{Baseline, Budget, Device, Domain, Location};
+        let mut options = LayoutOptions::default();
+        options.spark_rank_bytes = vec![121_300_648 * 1024, 121_171_588 * 1024];
+        let mut budgets = (0..2).map(|rank| Budget { id: format!("spark{rank}"),
+            locations: vec![Location { device: Device::Spark(rank), domain: Domain::Managed }],
+            physical_bytes: 1, logical_bytes: 1, headroom: 0,
+            baseline: Baseline::Forecast { occupied: 0, source: "test".into(), assumed: false },
+        }).collect::<Vec<_>>();
+        options.apply_spark_capacities(&mut budgets);
+        assert_eq!(budgets.iter().map(|budget| budget.physical_bytes).collect::<Vec<_>>(), options.spark_rank_bytes);
+        assert_eq!(options.spark_capacity(2), 0, "unknown rank fails closed");
+        options.spark_allocation_budget_bytes = Some(82 << 30);
+        options.apply_spark_capacities(&mut budgets);
+        assert!(budgets.iter().all(|budget| budget.physical_bytes == 82 << 30 && budget.logical_bytes == 82 << 30));
+        assert_eq!(options.spark_capacity(7), 82 << 30);
+    }
 }

@@ -815,8 +815,9 @@ pub fn budgets(inputs: &RuntimeInputs) -> Result<Vec<Budget>, Refusal> {
             headroom: gpu.reserve_bytes,
         });
     }
-    let bytes = crate::plan::DEFAULT_SPARK_BUDGET_BYTES;
     for rank in 0..inputs.inventory.spark_ranks {
+        let bytes = *inputs.spark_bytes.get(rank).filter(|bytes| **bytes > 0)
+            .ok_or_else(|| Refusal::InvalidFact(format!("missing measured capacity for Step-5 Spark rank {rank}")))?;
         budgets.push(Budget {
             id: format!("spark{rank}"),
             locations: vec![Location {

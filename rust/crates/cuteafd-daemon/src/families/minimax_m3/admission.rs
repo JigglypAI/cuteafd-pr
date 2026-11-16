@@ -159,7 +159,10 @@ pub(crate) mod serve_admission {
         facts.coordinator = Coordinator::Measured {
             samples: samples.iter().map(|s| (s.total, s.cap, s.free)).collect(),
             loaded_code: samples.iter().map(|s| s.pending_code).collect() };
-        let inputs = gather(&facts).map_err(|refused| anyhow::anyhow!("{}; {}", refused.what, refused.how))?;
+        let mut inputs = gather(&facts).map_err(|refused| anyhow::anyhow!("{}; {}", refused.what, refused.how))?;
+        if !facts.spark_rank_bytes.is_empty() {
+            cuteafd_loader::serving_capacity::spark_memory::apply_rank_budgets(&mut inputs.budgets, &facts.spark_rank_bytes)?;
+        }
         let request = shared::request(inputs.context, facts.pool_tokens, onboard, facts.prefill,
             cuteafd_loader::placement::planner::Operation::Serving, inputs.resident_weight_limit, facts.replies);
         let admitted = inputs.admit_serving(request).context("MiniMax serving admission")?;
@@ -251,7 +254,7 @@ mod tests {
         let catalog = cuteafd_loader::read_expert_catalog(dir.path())?;
         let manifest_path = dir.path().join("PROGRAMS.json");
         let manifest = std::sync::Arc::new(serde_json::json!({"programs":[]}));
-        let request = |rows| FactsRequest { checkpoint: &checkpoint, cfg: &cfg, catalog: &catalog,
+        let request = |rows| FactsRequest { spark_rank_bytes: Vec::new(), checkpoint: &checkpoint, cfg: &cfg, catalog: &catalog,
             manifest_path: &manifest_path, manifest: manifest.clone(),
             coordinator: Coordinator::Planned { cards: vec![CoordinatorCard {
                 physical_bytes: 96 << 30, logical_bytes: 96 << 30 }; 2] },

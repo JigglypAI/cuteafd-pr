@@ -643,7 +643,7 @@ pub(crate) mod tests {
     }
 
     fn contract(input: &GlmfInputs<'_>) -> Result<admission::AdmittedGlmf, planner::Refusal> {
-        admission::prepare(input, 188, true, admission::ProcessOwners::new((512 << 30, 512 << 30), 8 << 30))?.admit()
+        admission::prepare(input, 188, true, admission::ProcessOwners::new((512 << 30, 512 << 30), 8 << 30).with_spark_capacities(crate::serving_capacity::spark_memory::serving_bytes()))?.admit()
     }
 
     fn admitted_case(input: &GlmfInputs<'_>, automatic_context: bool, sms: usize,
@@ -651,7 +651,7 @@ pub(crate) mod tests {
         -> Result<(Placement, admission::GlmfGraphs, GlmfWorkingSet), planner::Refusal> {
         let mut input = input.clone();
         input.context = crate::placement::planner::Context::resolve(input.max_context, (!automatic_context).then_some(input.max_context));
-        let mut process = admission::ProcessOwners::new((512 << 30, 512 << 30), 8 << 30);
+        let mut process = admission::ProcessOwners::new((512 << 30, 512 << 30), 8 << 30).with_spark_capacities(crate::serving_capacity::spark_memory::serving_bytes());
         process.alternate_resident = alternate.map(<[GlmfResidentRank]>::to_vec);
         let selected = admission::prepare(&input, sms, rtx_experts, process)?.admit()?;
         Ok((selected.placement, selected.graphs, selected.working))
@@ -690,7 +690,7 @@ pub(crate) mod tests {
         for ranks in [1, 2] {
             let input = inputs(&cfg, ranks, inventory::PRO_TOTAL_BYTES);
             let before = contract(&input).unwrap();
-            let mut process = admission::ProcessOwners::new((512 << 30, 512 << 30), 8 << 30);
+            let mut process = admission::ProcessOwners::new((512 << 30, 512 << 30), 8 << 30).with_spark_capacities(crate::serving_capacity::spark_memory::serving_bytes());
             let receipt = crate::shared::dense_read::MountLoad { pinned_source: 32 << 20,
                 full_row_cache: 64 << 20, pinned_tables: 1 << 20 };
             process.mount_load = Some(receipt);
@@ -889,7 +889,7 @@ pub(crate) mod tests {
         let encoder = |kind| EncoderPlacement { kind, weights: 123456, scratch: 654321,
             replicas: vec![], reason: "test physical owner".into(), shortfall: 0 };
         for kind in [EncoderKind::Off, EncoderKind::Rtx { gpu: 1 }, EncoderKind::Spark { rank: 2 }] {
-            let mut process = admission::ProcessOwners::new((512 << 30, 512 << 30), 8 << 30);
+            let mut process = admission::ProcessOwners::new((512 << 30, 512 << 30), 8 << 30).with_spark_capacities(crate::serving_capacity::spark_memory::serving_bytes());
             process.encoders = vec![encoder(kind.clone())];
             process.media_cache_bytes = 7654321;
             let admitted = admission::prepare(&input, 188, true, process).unwrap().admit().unwrap();
@@ -908,13 +908,13 @@ pub(crate) mod tests {
             }
         }
         for kind in [EncoderKind::Rtx { gpu: 2 }, EncoderKind::Spark { rank: 4 }] {
-            let mut process = admission::ProcessOwners::new((512 << 30, 512 << 30), 8 << 30);
+            let mut process = admission::ProcessOwners::new((512 << 30, 512 << 30), 8 << 30).with_spark_capacities(crate::serving_capacity::spark_memory::serving_bytes());
             process.encoders = vec![encoder(kind)];
             assert!(matches!(admission::prepare(&input, 188, true, process), Err(planner::Refusal::InvalidFact(_))));
         }
         input.onboard = Onboard::Layers(input.experts.len());
         input.spark_ranks = 0;
-        let mut process = admission::ProcessOwners::new((512 << 30, 512 << 30), 8 << 30);
+        let mut process = admission::ProcessOwners::new((512 << 30, 512 << 30), 8 << 30).with_spark_capacities(crate::serving_capacity::spark_memory::serving_bytes());
         process.encoders = vec![encoder(EncoderKind::Spark { rank: 0 })];
         process.physical_sparks = 1;
         let admitted = admission::prepare(&input, 188, true, process).unwrap().admit().unwrap();
@@ -922,7 +922,7 @@ pub(crate) mod tests {
         assert!(admitted.solved.facts.allocations.iter().filter(|owner| owner.id.starts_with("glmf.encoder."))
             .all(|owner| owner.location.device == planner::Device::Spark(0)));
         assert_eq!(admitted.encoder.unwrap().kind, EncoderKind::Spark { rank: 0 });
-        let mut process = admission::ProcessOwners::new((1 << 30, 1 << 30), 0);
+        let mut process = admission::ProcessOwners::new((1 << 30, 1 << 30), 0).with_spark_capacities(crate::serving_capacity::spark_memory::serving_bytes());
         for (id, location) in [("host", planner::Location::HOST), ("pinned", planner::Location::PINNED)] {
             process.allocations.push(planner::Allocation::buffer(id, location, 600 << 20,
                 planner::Lifetime::RESIDENT, Category::Staging, id));
@@ -1491,7 +1491,7 @@ pub(crate) mod tests {
         input.drafter_scratch = scratch;
         input.drafter_bridge = drafter_bridge_inventory(&config, 8, 8).unwrap();
         for home in [0, 1] {
-            let mut process = admission::ProcessOwners::new((512 << 30, 512 << 30), 8 << 30);
+            let mut process = admission::ProcessOwners::new((512 << 30, 512 << 30), 8 << 30).with_spark_capacities(crate::serving_capacity::spark_memory::serving_bytes());
             // Domains and component activations must be prepared together, so bias
             // the complete physical inventory rather than rewriting a solved home.
             input.resident[(1 - home) as usize].weights += 16 << 30;
@@ -1716,7 +1716,7 @@ pub(crate) mod tests {
             input.attention.mode = mode;
             input.index = if mode == AttentionPlacement::Heads { cache::GlmfIndexCache::Keys }
                 else { cache::GlmfIndexCache::Compact };
-            let process = admission::ProcessOwners::new((512 << 30, 512 << 30), 8 << 30);
+            let process = admission::ProcessOwners::new((512 << 30, 512 << 30), 8 << 30).with_spark_capacities(crate::serving_capacity::spark_memory::serving_bytes());
             let prepared = admission::prepare(&input, 188, true, process).unwrap();
             let solved = prepared.admit().unwrap();
             let count = solved.placement.items.iter().flatten().filter(|item|

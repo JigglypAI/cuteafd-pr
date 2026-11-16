@@ -567,7 +567,7 @@ impl<'a> ProductionInput<'a> {
             .any(|location| matches!(location.device, Device::Spark(0))))
             .map_or(0, |budget| budget.physical_bytes);
         let spark_budget = if spark_ranks == 0 {
-            SparkBudgetInventory { layers: working.spark_layers.clone(), resident: vec![], overhead: vec![], budget: 0 }
+            SparkBudgetInventory { rank_budgets: Vec::new(), layers: working.spark_layers.clone(), resident: vec![], overhead: vec![], budget: 0 }
         } else {
             SparkBudgetInventory::exl3(catalog, &working, &[endpoint], spark_rings, spark_bytes,
                 spark_reserve_bytes(spark_ranks, prefill.waves, prefill.unit_rows).map_err(anyhow_refusal)?)

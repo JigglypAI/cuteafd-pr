@@ -6,8 +6,8 @@ use crate::families::deepseek_v4::{DeepseekV4Config, resident::resident_operands
 use crate::placement::{families::deepseek_v4 as v4, Baseline, FfnMode, LayerMode, Onboard};
 use crate::placement::planner::Pin;
 
-/// Observed Spark host footprint and non-I/O wave residual (P11 replaces both).
-const SPARK: SparkCharges = SparkCharges { host_bytes: Some(13 * GIB), wave_bytes: gib(35), basis: Basis::Estimated };
+/// Non-I/O wave residual; host services are already excluded by MemAvailable.
+const SPARK: SparkCharges = SparkCharges { wave_bytes: gib(35), basis: Basis::Estimated };
 
 /// V4's resident inventory shared with the runtime weight loader. All
 /// non-embedding weights are explicit admission demands, so the solver sees

@@ -19,6 +19,7 @@ pub struct SimulatedHost {
     pub gpu_count: usize,
     pub gpu_bytes: u64,
     pub spark_count: usize,
+    /// Explicit simulated ceiling; zero uses the measured per-host inventory.
     pub spark_bytes: u64,
 }
 
@@ -32,7 +33,7 @@ impl SimulatedHost {
         Self { host_ram: (Self::RAPTOR_RAM_BYTES, Self::RAPTOR_RAM_BYTES - Self::SYSTEM_RESERVE_BYTES),
             // AGENTS.md cluster inventory; card bytes come from the CUDA-measured inventory.
             gpu_count: 2, gpu_bytes: crate::placement::inventory::PRO_TOTAL_BYTES,
-            spark_count: 6, spark_bytes: 121 << 30 }
+            spark_count: 6, spark_bytes: 0 }
     }
 
     pub fn layout(&self) -> super::layout::LayoutOptions {
@@ -100,6 +101,11 @@ impl BudgetedPlanInput {
                 && manifest.is_file() { options.inventory_workspace_manifest = Some(manifest); }
         }
         if let Some(layout) = &mut options.layout {
+            // Synthetic worlds 7/8 repeat an explicitly measured serving-host capacity;
+            // production's serving pool remains the six RoCE hosts.
+            if options.placement.spark_ranks() > 6 && layout.spark_rank_bytes.len() == 6 {
+                layout.spark_rank_bytes.extend([crate::serving_capacity::spark_memory::measured_bytes("ostrich").unwrap(); 2]);
+            }
             layout.host_memory.get_or_insert(self.host.host_ram);
             let manifest = self.checkpoint().snapshot.join("share/PROGRAMS.json");
             if layout.workspace_manifest.is_none() && manifest.is_file() { layout.workspace_manifest = Some(manifest); }

@@ -152,6 +152,12 @@ def test_shared_launcher_matches_the_private_v41_path(case: str, tmp_root) -> No
             # Old captures confused the weight ceiling (100 GiB) with the
             # planner's automatic CUDA allocation ceiling (108 GiB).
             expected_command[expected_command.index("--device-budget-bytes") + 1] = str(108 << 30)
+        if role == "coordinator":
+            position = after["command"].index("--spark-memory-samples")
+            samples = json.loads(after["command"][position + 1])
+            assert samples and all(sample["bytes"] == 124211863552 and sample["boot_id"] == "fixture"
+                                   for sample in samples)
+            del after["command"][position:position + 2]
         assert flag_values(after["command"]) == flag_values(expected_command), where
     # S5 replaces report JSON with the planner-owned deployment. Only the
     # preflight argv changes; all serving commands and fingerprint env above
@@ -211,6 +217,11 @@ def test_shared_launcher_matches_the_private_v41_path(case: str, tmp_root) -> No
             position = expected.index("--coordinator-weight-budget-gib")
             del expected[position:position + 2]
         expected_plans.append(expected)
+    for plan in current["plans"]:
+        if "--spark-memory-samples" in plan:
+            position = plan.index("--spark-memory-samples")
+            assert all(sample["boot_id"] == "fixture" for sample in json.loads(plan[position + 1]))
+            del plan[position:position + 2]
     assert current["plans"] == expected_plans, case
 
 

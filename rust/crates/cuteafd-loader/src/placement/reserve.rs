@@ -126,12 +126,6 @@ pub fn gpu_component(bytes: u64) -> u64 {
     MemoryPolicy::current().component(DeviceKind::Gpu, bytes)
 }
 
-/// The per-Spark cap for runtime admission: `SPARK_MEMORY_CAP`, else the
-/// shared Spark device default.
-pub fn spark_cap() -> u64 {
-    MemoryPolicy::current().spark_cap_bytes(crate::plan::layout::DEFAULT_SPARK_DEVICE_BYTES)
-}
-
 /// A built-in Spark reserve component's charged bytes (0 under `SPARK_RESERVE`).
 pub fn spark_component(bytes: u64) -> u64 {
     MemoryPolicy::current().component(DeviceKind::Spark, bytes)

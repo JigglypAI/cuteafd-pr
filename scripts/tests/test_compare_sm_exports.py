@@ -1959,7 +1959,8 @@ def test_placement_fingerprints_only_live_config_contents(tmp_path, monkeypatch)
     for relative in ('scripts/build/export-placement-inputs.py', 'scripts/build/release-scope.py',
                      'scripts/build/kernel-records.py', 'scripts/lib/wip_aot_scopes.py', 'examples/configs/live.config',
                      'examples/configs/retired.config', 'benchmarks/current-matrix.json',
-                     'native/cmake/shared/fp8_moe.cmake'):
+                     'native/cmake/shared/fp8_moe.cmake',
+                     'rust/crates/cuteafd-loader/src/serving_capacity/spark_memory.json'):
         path = tmp_path / relative
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text('original')

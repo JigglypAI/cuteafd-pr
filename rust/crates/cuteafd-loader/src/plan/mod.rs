@@ -522,7 +522,7 @@ impl PlanOptions {
     }
 
     /// An explicit Spark ceiling applies to the complete layout as well as
-    /// weights. Unset keeps the separate historical device/family defaults.
+    /// weights. Unset uses the per-host idle MemAvailable inventory.
     pub fn apply_spark_budget(&mut self) {
         if let (Some(bytes), Some(layout)) = (self.spark_budget_bytes, &mut self.layout) {
             layout.spark_bytes = bytes;
@@ -545,8 +545,10 @@ impl PlanOptions {
                 });
             }
         }
+        if self.spark_budget_bytes == Some(0) {
+            return Err(PlanError::InvalidOption { option: "Spark budget", reason: "must be positive".into() });
+        }
         for (option, bytes) in [
-            ("Spark budget", self.spark_budget_bytes.unwrap_or(DEFAULT_SPARK_BUDGET_BYTES)),
             ("coordinator weight budget", self.coordinator_budget_bytes),
             ("coordinator GPU budget", self.coordinator_gpu_budget_bytes),
         ] {
@@ -564,15 +566,15 @@ pub fn mapped_scale_preload_bytes(gib: f64) -> Result<u64, PlanError> {
 }
 
 
-/// The shared routed-expert weight budget per Spark rank, for families
-/// without their own (`FamilyModel::spark_budget_bytes`).
-pub const DEFAULT_SPARK_BUDGET_BYTES: u64 = 100 << 30;
-
 impl PlanOptions {
-    /// Routed-expert bytes per Spark rank: explicit, else the shared default
-    /// (`plan` resolves an unset budget to the family's before using it).
-    pub fn spark_budget(&self) -> u64 {
-        self.spark_budget_bytes.unwrap_or(DEFAULT_SPARK_BUDGET_BYTES)
+    pub fn spark_capacities(&self, ranks: usize) -> Vec<u64> {
+        if let Some(bytes) = self.spark_budget_bytes { return vec![bytes; ranks]; }
+        self.layout.as_ref().cloned().unwrap_or_default().spark_capacities(ranks)
+    }
+
+    /// Display/header upper bound only; the complete layout admits each rank.
+    pub fn maximum_spark_capacity(&self) -> u64 {
+        self.spark_capacities(self.placement.spark_ranks()).into_iter().max().unwrap_or(0)
     }
 }
 
@@ -915,6 +917,14 @@ fn family_layout(model: &dyn FamilyModel, input: &PlanInput, report: &mut PlanRe
     options: &mut layout::LayoutOptions, requested: ExpertPlacement)
     -> anyhow::Result<cuteafd_core::memory_layout::MemoryLayout> {
     let _timer = PhaseTimer::new(&input.phases.layout, &[&input.phases.catalog]);
+    for rank in 0..requested.spark_ranks() {
+        if options.spark_capacity(rank) == 0 {
+            report.refuse_placement(format!("missing idle MemAvailable measurement for Spark rank {rank}"),
+                "Supply --spark-memory-cap or measured host inventory.");
+            return Ok(cuteafd_core::memory_layout::MemoryLayout { devices: vec![], pool_tokens: 0,
+                waste: vec![], notes: vec![] });
+        }
+    }
     let family = report.family.as_deref().unwrap_or("unknown");
     let concurrency = options.resolved_concurrency(family);
     if let Err(error) = cuteafd_core::concurrency::validate(family, concurrency) {
@@ -1026,7 +1036,7 @@ pub(crate) fn empty_report(input: &PlanInput, options: &PlanOptions) -> anyhow::
         phase_ledger: None,
         admission_timing: None,
         attention_placement: options.attention_placement.unwrap_or_default(),
-        spark_budget_bytes: options.spark_budget(),
+        spark_budget_bytes: options.maximum_spark_capacity(),
         requested_attention: options.attention_placement,
         vision: options.vision,
         audio: resolve_audio_config(options.audio, &checkpoint.snapshot, &checkpoint.config)?,
@@ -1258,14 +1268,13 @@ fn plan_unrestricted(input: &PlanInput, options: &PlanOptions) -> Result<PlanRep
         }
     };
     report.vision = model.vision_mode(options.vision);
-    // An unset Spark budget is the family's own (Kimi K3 admits more than the
-    // shared default); an explicit --spark-memory-cap always wins.
+    // Header screening uses the measured inventory too; exact per-rank admission
+    // below decides fit. An explicit --spark-memory-cap always wins.
     let mut resolved = options.clone();
     if let Some(layout) = &mut resolved.layout { layout.decode_lanes = report.decode_lanes; }
     resolved.apply_spark_budget();
-    resolved.spark_budget_bytes = Some(options.spark_budget_bytes.unwrap_or_else(|| model.spark_budget_bytes()));
     let options = &resolved;
-    report.spark_budget_bytes = options.spark_budget();
+    report.spark_budget_bytes = options.maximum_spark_capacity();
     let spec = model.spec();
     report.spec = Some(spec.clone());
     let ownership = options.draft_ownership.unwrap_or_else(|| {
@@ -1451,8 +1460,8 @@ fn plan_unrestricted(input: &PlanInput, options: &PlanOptions) -> Result<PlanRep
     }
     if options.layout.is_none() {
         // A tensor-only inventory does not request an external speculation checkpoint.
-        let mut inventory = layout::LayoutOptions { rtx_bytes: vec![options.coordinator_gpu_budget_bytes], spark_bytes: options.spark_budget(),
-            spark_allocation_budget_bytes: Some(options.spark_budget()), glm5_drafter_disabled: true,
+        let mut inventory = layout::LayoutOptions { rtx_bytes: vec![options.coordinator_gpu_budget_bytes], spark_bytes: options.spark_budget_bytes.unwrap_or(0),
+            spark_allocation_budget_bytes: options.spark_budget_bytes, glm5_drafter_disabled: true,
             glmf_drafter_disabled: true, native_mtp_layers: if ownership.uses_checkpoint() { 3 } else { 0 },
             weight_budget_bytes: options.coordinator_budget_bytes, inventory: true, ..options.inventory_layout() };
         let _ = family_layout(model, input, &mut report, &mut inventory, options.placement)?;
@@ -1630,7 +1639,7 @@ fn place(report: &mut PlanReport, options: &PlanOptions, spec: &ModelSpec, model
                 recipe.stored_widths.iter().max().map(|&slice| slice as f64 / i as f64)
             }
         };
-        let fits_on = |ranks: usize| share(ranks).is_some_and(|s| routed as f64 * s <= options.spark_budget() as f64);
+        let fits_on = |ranks: usize| share(ranks).is_some_and(|s| routed as f64 * s <= options.maximum_spark_capacity() as f64);
         report.min_spark_ranks = contract.as_ref().and_then(|c| c.spark_worlds.iter().copied().find(|&r| fits_on(r)));
         let advice = match report.min_spark_ranks {
             Some(ranks) => format!("Use {ranks} Spark ranks (--spark-ranks {ranks})"),
@@ -1664,13 +1673,13 @@ fn place(report: &mut PlanReport, options: &PlanOptions, spec: &ModelSpec, model
                             contract.package, intermediate.unwrap_or(0), contract.block),
                         how: format!("{advice}; adding a package cannot repair empty or unaligned expert slices."),
                     });
-                } else if !fits_on(ranks) {
+                } else if !fits_on(ranks) && options.layout.is_none() {
                     report.fits = false;
                     report.placement_supported &= contract.spark_worlds.contains(&ranks);
                     report.hints.push(Hint {
                         what: format!("routed experts need {:.1} GiB on the widest of {ranks} Spark ranks, over the \
                             {:.0} GiB budget", gib(routed as f64 * report.spark_rank_share),
-                            gib(options.spark_budget() as f64)),
+                            gib(options.maximum_spark_capacity() as f64)),
                         how: format!("{advice}, keep bottom layers' experts resident on the RTX cards, or quantize \
                             the experts further (EXL3 K2-K3)."),
                     });

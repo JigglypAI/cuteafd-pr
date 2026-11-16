@@ -174,7 +174,7 @@ EOF
     [[ "$1" != muse_spark ]] || printf '%s\n' TP2_DFLASH KV_CACHE RTX_EXPERT_LAYERS SPECULATOR_MODEL_ID SPECULATOR_MODEL_REVISION SPECULATION_TRACE DRAFT_KV_CACHE PREFILL_ROWS PREFILL_WAVES PREFILL_PACKING EXPERT_PARTIAL_BF16_MAX_ROWS
     [[ "$1" != muse_spark ]] || printf '%s\n' VISION_REPLICAS DECODE_GRAPHS GPU_GRAPH_RESERVE GPU_GRAPH_RESERVE_EXTRA GPU_GRAPH_RESERVE_EXTRA_CAP GRAPH_TRACE
     [[ "$1" != minimax_m3 ]] || printf '%s\n' RTX_EXPERT_LAYERS PREFILL_ROWS PREFILL_WAVES PREFILL_PACKING GPU_GRAPH_RESERVE GPU_GRAPH_RESERVE_EXTRA GPU_GRAPH_RESERVE_EXTRA_CAP GRAPH_TRACE SPECULATION_TRACE DRAFT_POLICY
-    [[ "$1" != inkling2 ]] || printf '%s\n' RTX_EXPERT_LAYERS PREFILL_ROWS PREFILL_WAVES GPU_GRAPH_RESERVE GPU_GRAPH_RESERVE_EXTRA GPU_GRAPH_RESERVE_EXTRA_CAP GRAPH_TRACE
+    [[ "$1" != inkling2 ]] || printf '%s\n' KV_CACHE RTX_EXPERT_LAYERS PREFILL_ROWS PREFILL_WAVES GPU_GRAPH_RESERVE GPU_GRAPH_RESERVE_EXTRA GPU_GRAPH_RESERVE_EXTRA_CAP GRAPH_TRACE
     _spark_slot_keys HOST LANE_A
     return
   fi
@@ -447,14 +447,14 @@ release_spark_worker_budget() {
     [.memory_layout.devices[] | select(.kind == "spark") |
       select(.index as $index | any($experts[]; . == $index)) | .worker_budget_bytes] |
     select(length == $ranks and all(.[]; type == "number" and . > 0)) |
-    unique | select(length == 1) | .[0]' <<<"$deployment" ||
-    release_die "the deployment plan names no uniform Spark worker allocation ceiling"
+    max' <<<"$deployment" ||
+    release_die "the deployment plan names no Spark worker allocation ceiling"
 }
 release_spark_role_budget() {
   jq -er --argjson rank "$2" '
     [.memory_layout.devices[] | select(.kind == "spark" and .index == $rank) | .worker_budget_bytes] |
     select(length == 1 and all(.[]; type == "number" and . > 0)) | .[0]' <<<"$1" ||
-    release_die "the deployment plan names no uniform Spark worker allocation ceiling for rank $2"
+    release_die "the deployment plan names no Spark worker allocation ceiling for rank $2"
 }
 # DeepSeek V4.1 reads shell variables after release_load_config, not get().
 _v41_allowed_keys() {

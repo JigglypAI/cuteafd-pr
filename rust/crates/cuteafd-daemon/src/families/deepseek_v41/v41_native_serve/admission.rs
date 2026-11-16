@@ -629,7 +629,7 @@ pub(super) fn resolve_with_owners(
     let limit = crate::shared::memory::budget::resident_weight_limit().0;
     let formats = cuteafd_core::spark_reply::requested();
     let sparks =
-        vec![cuteafd_loader::plan::layout::DEFAULT_SPARK_DEVICE_BYTES; args.peers.len()];
+        cuteafd_loader::serving_capacity::spark_memory::runtime_bytes(&args.peers.iter().map(ToString::to_string).collect::<Vec<_>>())?;
     #[cfg(not(test))]
     let host_memory = cuteafd_loader::formats::mapped_preload::host_memory_before_process()?;
     #[cfg(test)]
@@ -1053,7 +1053,7 @@ mod admission_tests {
             "--native-lib",
             "/unused.so",
             "--peers",
-            "127.0.0.1:19441",
+            "10.55.0.1:19441",
         ])
         .unwrap();
         let crate::cli::Commands::ServeNative(args) = cli.command else {

@@ -154,6 +154,7 @@ def _stubs(tmp_path: Path) -> Path:
         if tool == "docker":
             body += 'case "$*" in *"PROGRAMS.json"*) exit 1 ;; esac\n'
         if tool == "ssh":
+            body += 'case "$*" in *"python3 -I -"*) echo ' + repr(json.dumps({"bytes": 124211863552, "boot_id": "fixture", "age_seconds": 0, "cached": False})) + '; exit 0 ;; esac\n'
             body += 'case "$*" in *"docker logs"*) echo "worker ready" ;; esac\n'
         (bin_dir / tool).write_text(body)
         (bin_dir / tool).chmod(0o755)

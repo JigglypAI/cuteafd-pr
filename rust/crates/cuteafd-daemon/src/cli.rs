@@ -50,7 +50,7 @@ pub(crate) struct MemoryArgs {
     /// Total per-GPU ceiling (default: the full device). Leaves SM count and L2 unchanged.
     #[arg(long, global = true, value_parser = parse_size)]
     pub(crate) gpu_memory_cap: Option<u64>,
-    /// Total per-Spark ceiling (default: the family's Spark default). Leaves room for the OS.
+    /// Total per-Spark ceiling (default: each host's idle MemAvailable).
     #[arg(long, global = true, value_parser = parse_size)]
     pub(crate) spark_memory_cap: Option<u64>,
     /// Whole GPU reserve; every built-in GPU reserve component becomes 0. Still inside the cap.
@@ -121,6 +121,9 @@ fn parse_idle_park(text: &str) -> std::result::Result<f64, String> {
 #[derive(Debug, Parser)]
 #[command(name = "cuteafd", about = "CUTEAFD phase0 runtime CLI")]
 pub(crate) struct Cli {
+    /// Per-rank idle MemAvailable samples from the launcher (JSON, boot-keyed).
+    #[arg(long, global = true)]
+    pub(crate) spark_memory_samples: Option<String>,
     /// Minimum physical GPU free bytes after graph capture (default MEMORY_PADDING/2); size or gpuN=size, 0 disables.
     #[arg(long, global = true)]
     pub(crate) graph_disable_low_mem: Option<String>,
@@ -432,6 +435,8 @@ pub(crate) struct PlanArgs {
     /// Ordered endpoint inventory; selected ranks take its prefix.
     #[arg(long = "deployment-peers", requires = "deployment", value_delimiter = ',')]
     pub(crate) deployment_peers: Vec<String>,
+    #[arg(skip)]
+    pub(crate) spark_memory_samples: Option<String>,
     /// Preserve launch admission spelling; checked by the native admission parser.
     #[arg(long, requires = "deployment")]
     pub(crate) kv_pool_size: Option<String>,

@@ -333,8 +333,15 @@ async fn run() -> Result<()> {
 
         match Cli::from_arg_matches(&matches) {
             Ok(mut cli) => {
+                if let Some(samples) = &cli.spark_memory_samples {
+                    if let Err(error) = cuteafd_loader::serving_capacity::spark_memory::install_samples(samples) {
+                        clap::Error::raw(clap::error::ErrorKind::ValueValidation,
+                            format!("invalid --spark-memory-samples: {error}")).exit();
+                    }
+                }
                 cli::resolve_tp2_dflash(&mut cli.command, &matches);
                 if let Commands::Plan(args) = &mut cli.command {
+                    args.spark_memory_samples = cli.spark_memory_samples.clone();
                     if let Some((_, options)) = matches.subcommand() {
                         args.explicit_settings = options.ids().filter(|id| matches!(options.value_source(id.as_str()),
                             Some(clap::parser::ValueSource::CommandLine | clap::parser::ValueSource::EnvVariable)))

@@ -193,7 +193,7 @@ pub(crate) fn load<'a, const RANKS: usize>(library: &'a Arc<cuteafd_ffi::NativeL
     memory.sample("modules-draft-context")?;
     // The per-Spark cap (`SPARK_MEMORY_CAP`), else Kimi's estimated complete ceiling.
     let spark_budget_bytes = cuteafd_core::memory_policy::MemoryPolicy::current()
-        .spark_cap_bytes(cuteafd_loader::families::kimi_k3::SPARK_DEFAULT_BUDGET_BYTES);
+        .spark_cap_bytes(cuteafd_loader::serving_capacity::spark_memory::serving_bytes().into_iter().max().unwrap_or(0));
     let (spark_budget, rtx) = if skip_routed_experts { (None, None) } else {
     let catalog = cuteafd_loader::read_expert_catalog_view(checkpoint.view.as_ref()
         .context("Kimi startup requires the immutable selected checkpoint view")?)?;
@@ -203,10 +203,11 @@ pub(crate) fn load<'a, const RANKS: usize>(library: &'a Arc<cuteafd_ffi::NativeL
     let working = cuteafd_loader::placement::SparkWorkingSet { rtx_layers: vec![],
         spark_layers: cfg.dense.iter().enumerate().filter_map(|(layer, dense)| (!dense).then_some(layer)).collect(),
         spark_ranks, prefill_lanes: 1 };
-    let spark_budget = cuteafd_loader::placement::SparkBudgetInventory::exl3(&catalog, &working,
+    let mut spark_budget = cuteafd_loader::placement::SparkBudgetInventory::exl3(&catalog, &working,
         &[cuteafd_core::SparkEndpoint { ring_depth: None, capacity: u32::try_from(unit)?, ingress: cuteafd_core::SparkIngress::Fp8K32, partial_reply_bytes: None }],
         model, spark_budget_bytes,
         cuteafd_loader::families::kimi_k3::spark::reserve_bytes(spark_ranks, options.waves as u64, unit as u64)?)?;
+    spark_budget.rank_budgets = cuteafd_loader::serving_capacity::spark_memory::runtime_bytes(&options.peers.iter().map(ToString::to_string).collect::<Vec<_>>())?;
     let rtx = if onboard.layers(routed) == Some(0) { None } else {
         let tiers = catalog.exl3().context("Kimi TP2 experts require EXL3 checkpoint")?.decoder_tiers();
         let package = crate::shared::experts::exl3::aot_layout_directory(

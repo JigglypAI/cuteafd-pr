@@ -59,6 +59,11 @@ impl<'a> CacheBank<'a> {
         let span = self.layout.field(sequence, layer, name)?;
         view(self.active.buffer, span.start, span.len())
     }
+    pub fn field_bank(&self, layer: usize, name: &str) -> Result<Buffer> {
+        let span = self.layout.field(0, layer, name)?;
+        view(self.active.buffer, span.start,
+            (self.layout.sequences-1)*self.layout.sequence_bytes + span.len())
+    }
     pub fn global(&self, layer: usize) -> Result<Buffer> {
         self.pages.get(&layer).map(|owner| owner.buffer).context("Inkling layer has no global KV pages")
     }
@@ -151,7 +156,7 @@ impl<'a> InklingPrefix<'a> {
 }
 impl cuteafd_engine::prefix::PrefixFamily for InklingPrefix<'_> {
     type Placement = Placement;
-    fn record_format(&self) -> &'static str { "inkling2_bf16_kv_f32_conv_whole_v1" }
+    fn record_format(&self) -> &'static str { self.0.layout.kv_format.record_format() }
     fn layout(&self) -> cuteafd_engine::prefix::FamilyLayout {
         use cuteafd_engine::prefix::{FamilyLayout, MarkStore, ReuseRule};
         FamilyLayout { page_rows: 64, pages: self.0.layout.pool_pages,
@@ -277,6 +282,15 @@ mod tests {
 
     #[test]
     fn persistent_cache_marks_copy_exact_bytes_and_fence_only_registered_readers() -> Result<()> {
+        cache_mark_oracle(cuteafd_loader::families::inkling2::InklingKvCache::Bf16)
+    }
+
+    #[test]
+    fn fp8_cache_marks_and_tail_scales_restore_byte_exactly() -> Result<()> {
+        cache_mark_oracle(cuteafd_loader::families::inkling2::InklingKvCache::Fp8)
+    }
+
+    fn cache_mark_oracle(format: cuteafd_loader::families::inkling2::InklingKvCache) -> Result<()> {
         let fixture = Fixture::build_for_tests()?;
         let library = fixture.load()?;
         fixture.immediate_copies(&library)?;
@@ -286,7 +300,7 @@ mod tests {
             "../../../../cuteafd-loader/src/families/inkling2/fixtures/config.json"))?)?;
         cfg.layers = 2;
         cfg.local = vec![true, false];
-        let cache = CacheBank::new(vec![reader.clone()], CacheLayout::new(&cfg, 2, 3)?, 1)?;
+        let cache = CacheBank::new(vec![reader.clone()], CacheLayout::with_format(&cfg, 2, 3, format)?, 1)?;
         let state = cache.sequence(0)?;
         let pattern = (0..state.bytes).map(|byte| (byte.wrapping_mul(17) % 251) as u8).collect::<Vec<_>>();
         library.copy_h2d(state, &pattern)?;
@@ -354,8 +368,9 @@ mod tests {
             .map_err(|e| anyhow::anyhow!("{e}"))?;
         family.drain().map_err(|e| anyhow::anyhow!("{e}"))?;
         library.copy_d2h(&mut restored_page, cache.page(1, 2)?)?;
-        assert_eq!(&restored_page[..4096], &page_pattern[..4096]);
-        assert_eq!(&restored_page[4096..], &sentinel[4096..]);
+        let record_bytes = format.record_bytes(cfg.kv_heads, cfg.head_dim);
+        assert_eq!(&restored_page[..record_bytes], &page_pattern[..record_bytes]);
+        assert_eq!(&restored_page[record_bytes..], &sentinel[record_bytes..]);
         assert_eq!(family.page_segments(0).len(), 1);
         assert_eq!(family.mark_segments(MarkSlot(0)).len(), 1);
         assert!(family.extend_pages(&mut destination, &[0]).is_err());
@@ -363,6 +378,7 @@ mod tests {
         assert_eq!(destination.state_len, 0);
         Ok(())
     }
+
 }
 
 impl crate::shared::prefix::cuda_copy::SnapshotOwner for CacheBank<'_> {

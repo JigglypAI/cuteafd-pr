@@ -36,6 +36,16 @@ pub(crate) struct RemoteVision {
     physical_ranks: Option<Vec<usize>>,
 }
 impl RemoteVision {
+    pub(crate) fn capacity_peers(&self, experts: Option<&str>) -> Vec<String> {
+        let mut peers = experts.unwrap_or("").split(',').filter(|peer| !peer.is_empty())
+            .map(str::to_owned).collect::<Vec<_>>();
+        for (index, address) in self.addresses.iter().enumerate() {
+            let rank = self.physical_ranks.as_ref().map_or(index, |ranks| ranks[index]);
+            peers.resize(peers.len().max(rank + 1), String::new());
+            peers[rank] = address.to_string();
+        }
+        peers
+    }
     pub(crate) fn revision(&self) -> &str { &self.revision }
     pub(crate) fn plan_hash(&self) -> [u8; 32] { self.plan_hash }
     /// Connects every replica with the coordinator's expected handshake.

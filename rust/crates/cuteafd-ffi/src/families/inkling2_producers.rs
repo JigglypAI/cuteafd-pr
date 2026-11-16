@@ -17,7 +17,7 @@ pub enum Op {
     Router,
     Gate { situ: bool, precision: Precision },
     Norm { value: bool, precision: Precision },
-    KvPack { precision: Precision },
+    KvPack { precision: Precision, fp8: bool },
 }
 impl Op {
     pub fn name(self) -> Result<String> {
@@ -25,7 +25,7 @@ impl Op {
             Self::Convolution { width, dynamic, precision } => {
                 ensure!(matches!((width, dynamic), (4608, false) | (1024, false) | (1024, true)),
                     "Inkling convolution geometry unsupported");
-                format!("conv_{}_h{width}_{}", if dynamic { "dynamic" } else { "static" }, precision.suffix())
+                format!("conv_{}_h{width}_{}_v2", if dynamic { "dynamic" } else { "static" }, precision.suffix())
             }
             Self::Clip { relative, key, global, precision } => {
                 ensure!(!(relative && key) && !(key && global), "Inkling clip site unsupported");
@@ -40,7 +40,7 @@ impl Op {
             Self::Gate { situ, precision } => format!("{}_h{}_{}", if situ { "situ" } else { "gate" },
                 if situ { 2304 } else { 6144 }, precision.suffix()),
             Self::Norm { value, precision } => format!("norm_{}_{}", if value { "v_h8_d128" } else { "h4608" }, precision.suffix()),
-            Self::KvPack { precision } => format!("kv_pack_{}", precision.suffix()),
+            Self::KvPack { precision, fp8 } => format!("kv_pack_{}_{}_v2", if fp8 { "fp8" } else { "bf16" }, precision.suffix()),
         }))
     }
     fn pointers(self) -> &'static [&'static str] {
@@ -61,7 +61,7 @@ impl<'a> Producer<'a> {
     pub fn load(programs: &'a Programs<'a>, op: Op) -> Result<Self> {
         let program = programs.program(&op.name()?, op.pointers())?;
         let spec = program.spec();
-        let kinds: &[u8] = if matches!(op, Op::Residual { .. }) { b"iii" } else { b"i" };
+        let kinds: &[u8] = if matches!(op, Op::Residual { .. }) { b"iii" } else if matches!(op, Op::Convolution { .. }) { b"il" } else { b"i" };
         ensure!(spec.capacity_rows > 0 && spec.capacity_rows <= 4096 && spec.scalar_kinds == kinds
             && spec.scratch.is_empty(), "Inkling producer export capacity/scalars/scratch differs");
         let g = &spec.geometry;
@@ -70,6 +70,7 @@ impl<'a> Producer<'a> {
         };
         match op {
             Op::Convolution { width, dynamic, .. } => {
+                equal("cache_abi", 2.into())?;
                 equal("width", width.into())?; equal("taps", 4.into())?;
                 equal("heads", if dynamic { 8.into() } else { 1.into() })?;
                 equal("dynamic", dynamic.into())?; equal("history", "newest_first".into())?;
@@ -102,7 +103,11 @@ impl<'a> Producer<'a> {
                 equal("weighted", (!value).into())?; equal("eps", 1e-6.into())?;
                 equal("output_dtype", match precision { Precision::Bf16 => "torch.bfloat16", Precision::F32 => "torch.float32" }.into())?;
             }
-            Op::KvPack { precision } => {
+            Op::KvPack { precision, fp8 } => {
+                equal("cache_abi", 2.into())?;
+                equal("kv_format", if fp8 { "fp8" } else { "bf16" }.into())?;
+                equal("record_bytes", if fp8 { 2112 } else { 4096 }.into())?;
+                equal("scale_offset", if fp8 { 2048 } else { 0 }.into())?;
                 equal("heads", 8.into())?; equal("dim", 128.into())?;
                 equal("input_dtype", match precision { Precision::Bf16 => "torch.bfloat16", Precision::F32 => "torch.float32" }.into())?;
             }
@@ -126,6 +131,17 @@ impl<'a> Producer<'a> {
                 ensure!(arena_rows >= rows && arena_rows <= i32::MAX as usize && (1..=9).contains(&candidates),
                     "Inkling residual arena/candidates differ");
                 scalars.extend([Scalar::I32(arena_rows as i32), Scalar::I32(candidates as i32)]);
+            }
+            (Op::Convolution { width, .. }, Some((stride, slots))) => {
+                ensure!(stride >= 3*width && stride <= i64::MAX as usize && slots > 0
+                    && buffers[3].bytes >= (slots-1).checked_mul(stride).and_then(|n| n.checked_add(3*width))
+                        .and_then(|n| n.checked_mul(4)).unwrap_or(usize::MAX),
+                    "Inkling convolution history stride/extent differs");
+                scalars.push(Scalar::I64(stride as i64));
+            }
+            (Op::Convolution { width, precision, .. }, None) => {
+                ensure!(buffers[3].bytes >= 3*width*precision.bytes(), "Inkling history too short");
+                scalars.push(Scalar::I64((3*width) as i64));
             }
             (Op::Residual { .. }, None) | (_, Some(_)) => anyhow::bail!("Inkling producer residual scalar ABI differs"),
             (_, None) => {}

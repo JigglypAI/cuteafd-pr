@@ -67,6 +67,10 @@ fn options(args: &PlanArgs) -> Result<PlanOptions, PlanError> {
                     cuteafd_core::MlaCacheFormat::Bf16 => cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16,
                     cuteafd_core::MlaCacheFormat::Fp8 => cuteafd_loader::families::qwen4::Qwen4KvCache::Fp8,
                 }).unwrap_or_default(),
+                inkling_kv: args.kv_format.map(|format| match format {
+                    cuteafd_core::MlaCacheFormat::Bf16 => cuteafd_loader::families::inkling2::InklingKvCache::Bf16,
+                    cuteafd_core::MlaCacheFormat::Fp8 => cuteafd_loader::families::inkling2::InklingKvCache::Fp8,
+                }).unwrap_or_default(),
                 muse_kv: args.kv_format.map(|format| match format {
                     cuteafd_core::MlaCacheFormat::Bf16 => cuteafd_loader::families::muse_spark::cache::MuseKvCache::Bf16,
                     cuteafd_core::MlaCacheFormat::Fp8 => cuteafd_loader::families::muse_spark::cache::MuseKvCache::Fp8,
@@ -146,9 +150,44 @@ fn options(args: &PlanArgs) -> Result<PlanOptions, PlanError> {
     };
     #[cfg(test)]
     { options.inventory_host_memory = args.test_host_memory; }
+    if let Some(layout) = &mut options.layout {
+        if args.memory.spark_memory_cap.is_none() {
+            let invalid = |error: anyhow::Error| PlanError::InvalidOption {
+                option: "Spark memory inventory", reason: error.to_string() };
+            layout.spark_rank_bytes = if let Some(samples) = &args.spark_memory_samples {
+                cuteafd_loader::serving_capacity::spark_memory::sample_bytes(samples).map_err(invalid)?
+            } else {
+                let cfg = launch_config(args.config.as_deref()).map_err(invalid)?;
+                let hosts = configured_spark_hosts(&cfg).into_iter()
+                    .take(args.spark_ranks.unwrap_or(args.available_sparks)).collect::<Vec<_>>();
+                if args.spark_ranks == Some(0) {
+                    Vec::new()
+                } else if hosts.iter().any(|host| host.starts_with("REPLACE-ME")) {
+                    cuteafd_loader::serving_capacity::spark_memory::serving_bytes()
+                } else if !hosts.is_empty() {
+                    hosts.iter().map(|host| cuteafd_loader::serving_capacity::spark_memory::measured_bytes(host))
+                        .collect::<anyhow::Result<Vec<_>>>().map_err(invalid)?
+                } else if !args.deployment_peers.is_empty() {
+                    args.deployment_peers.iter().take(args.spark_ranks.unwrap_or(args.available_sparks))
+                        .map(|peer| cuteafd_loader::serving_capacity::spark_memory::measured_bytes(peer))
+                        .collect::<anyhow::Result<Vec<_>>>().map_err(invalid)?
+                } else {
+                    cuteafd_loader::serving_capacity::spark_memory::serving_bytes()
+                }
+            };
+        }
+    }
     options.apply_spark_budget();
     options.validate()?;
     Ok(options)
+}
+
+fn configured_spark_hosts(cfg: &std::collections::BTreeMap<String, String>) -> Vec<String> {
+    if let Some(hosts) = cfg.get("SPARK_HOSTS").filter(|hosts| !hosts.is_empty()) {
+        return hosts.split(',').map(str::to_owned).collect();
+    }
+    (0..8).map_while(|rank| cfg.get(&format!("SPARK_{rank}_HOST"))
+        .filter(|host| !host.is_empty()).cloned()).collect()
 }
 
 type ResolvedSettings = std::collections::BTreeMap<String, cuteafd_core::launch_settings::Resolved<serde_json::Value>>;
@@ -207,6 +246,12 @@ fn resolve_settings(args: &mut PlanArgs, family: &str, cfg: &std::collections::B
 
 fn resolved_output(mut value: serde_json::Value, args: &PlanArgs, mut settings: ResolvedSettings,
     cfg: &std::collections::BTreeMap<String, String>, replay_explicit: Option<crate::cli::PlanReplayRecords>) -> serde_json::Value {
+    value["spark_memory_measurements"] = if let Some(bytes) = args.memory.spark_memory_cap {
+        serde_json::json!({"source": "explicit --spark-memory-cap", "bytes": bytes})
+    } else { args.spark_memory_samples.as_deref()
+        .and_then(|text| serde_json::from_str(text).ok())
+        .unwrap_or_else(|| serde_json::json!({"source": if configured_spark_hosts(cfg).is_empty() || configured_spark_hosts(cfg).iter().any(|host| host.starts_with("REPLACE-ME")) { "simulated canonical inventory" } else { "checked-in per-host idle MemAvailable inventory" },
+            "inventory": serde_json::from_str::<serde_json::Value>(cuteafd_loader::serving_capacity::spark_memory::INVENTORY).expect("inventory")})) };
     if value.get("family").and_then(serde_json::Value::as_str) == Some("glm5_flash") {
         let report = value.get("report").unwrap_or(&value);
         let sparks = report.get("spark_expert_world").and_then(serde_json::Value::as_u64)
@@ -305,7 +350,7 @@ fn resolve_family_config(args: &mut PlanArgs, family: &str, cfg: &std::collectio
         if !args.explicit_settings.contains("mimo_kv_cache") {
             if let Some(value) = get("KV_CACHE") { args.mimo_kv_cache = crate::families::mimo_v2::KvCacheArg::from_str(value, false).map_err(anyhow::Error::msg)?; }
         }
-    } else if matches!(family, "qwen4" | "qwen3_5" | "kimi_k3" | "step5" | "muse_spark") && args.kv_format.is_none() {
+    } else if matches!(family, "qwen4" | "qwen3_5" | "kimi_k3" | "step5" | "muse_spark" | "inkling2") && args.kv_format.is_none() {
         args.kv_format = get("KV_CACHE").map(|v| v.parse().map_err(anyhow::Error::msg)).transpose()?;
     }
     if matches!(family, "qwen4" | "step5") && !args.explicit_settings.contains("native_mtp_layers") {
@@ -570,7 +615,7 @@ fn run_plan_with_host(mut args: PlanArgs) -> Result<()> {
         let report = cuteafd_loader::plan::exlr8::inspect(&snapshot,
             args.exlr8_manifest.as_deref().unwrap_or("bit325"),
             args.spark_ranks.unwrap_or(args.available_sparks), args.rtx,
-            options.spark_budget(), options.coordinator_budget_bytes)?;
+            &options.spark_capacities(args.spark_ranks.unwrap_or(args.available_sparks)), options.coordinator_budget_bytes)?;
         if args.json { println!("{}", serde_json::to_string_pretty(&report)?); }
         else { print!("{}", report.render()); }
         anyhow::ensure!(!args.require_ready, "EXLR8 is unsupported: add the kernels listed in the plan");
@@ -1486,6 +1531,19 @@ mod tests {
     }
 
     #[test]
+    fn inkling_plan_and_config_preserve_selected_global_kv() {
+        use cuteafd_loader::families::inkling2::InklingKvCache;
+        let mut args = args(std::path::Path::new("/model"), 6, false);
+        assert_eq!(options(&args).unwrap().layout.unwrap().inkling_kv, InklingKvCache::Fp8);
+        let config = [("KV_CACHE".into(), "fp8".into())].into_iter().collect();
+        resolve_family_config(&mut args, "inkling2", &config).unwrap();
+        assert_eq!(options(&args).unwrap().layout.unwrap().inkling_kv, InklingKvCache::Fp8);
+        args.kv_format = Some(cuteafd_core::MlaCacheFormat::Bf16);
+        resolve_family_config(&mut args, "inkling2", &config).unwrap();
+        assert_eq!(options(&args).unwrap().layout.unwrap().inkling_kv, InklingKvCache::Bf16);
+    }
+
+    #[test]
     fn kimi_plan_defaults_to_fp8_and_preserves_explicit_bf16() {
         use cuteafd_core::MlaCacheFormat;
         let mut args = args(std::path::Path::new("/model"), 6, false);
@@ -1643,7 +1701,7 @@ mod tests {
             json: true,
             resolve_settings_only: false,
             checkpoint_model_id: None,
-            deployment: false, deployment_peers: vec![],
+            deployment: false, deployment_peers: vec![], spark_memory_samples: None,
             kv_pool_size: None,
             files: false, role: None, host: None, file_layout: None, fetch_parallel: 2, fetch: false, destination: None, source: None, forward_agent: false,
             dry_run: false, force: false, include_speculator: false,
@@ -2530,6 +2588,44 @@ mod tests {
     }
 
     #[test]
+    fn named_config_hosts_select_inventory_and_placeholders_are_simulated() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = directory.path().join("hosts.config");
+        let mut request = args(std::path::Path::new("/not-read"), 2, false);
+        request.memory.spark_memory_cap = None;
+        request.config = Some(config.clone());
+        request.deployment_peers = vec!["192.0.2.1:19441".into(), "192.0.2.2:19441".into()];
+        std::fs::write(&config, "SPARK_0_HOST=rhea\nSPARK_1_HOST=ostrich\n").unwrap();
+        let layout = options(&request).unwrap().layout.unwrap();
+        assert_eq!(layout.spark_capacity(0), cuteafd_loader::serving_capacity::spark_memory::measured_bytes("rhea").unwrap());
+        assert_eq!(layout.spark_capacity(1), cuteafd_loader::serving_capacity::spark_memory::measured_bytes("ostrich").unwrap());
+        std::fs::write(&config, "SPARK_0_HOST=unknown\n").unwrap();
+        request.spark_ranks = Some(0);
+        assert!(options(&request).unwrap().layout.unwrap().spark_rank_bytes.is_empty());
+        request.spark_ranks = Some(2);
+        let error = options(&request).unwrap_err().to_string();
+        assert!(error.contains("unknown") && error.contains("spark_memory.json"));
+        std::fs::write(&config, "SPARK_0_HOST=REPLACE-ME-spark-0\n").unwrap();
+        assert_eq!(options(&request).unwrap().layout.unwrap().spark_capacities(6),
+            cuteafd_loader::serving_capacity::spark_memory::serving_bytes());
+    }
+
+    #[test]
+    fn deployment_peers_select_measured_rank_capacities_and_explicit_wins() {
+        let mut request = args(std::path::Path::new("/not-read"), 2, false);
+        request.memory.spark_memory_cap = None;
+        request.deployment_peers = vec!["10.55.0.5:19441".into(), "10.55.0.1:19441".into()];
+        let layout = options(&request).unwrap().layout.unwrap();
+        assert_eq!(layout.spark_capacities(2), vec![
+            cuteafd_loader::serving_capacity::spark_memory::measured_bytes("rhea").unwrap(),
+            cuteafd_loader::serving_capacity::spark_memory::measured_bytes("ostrich").unwrap()]);
+        request.deployment_peers[0] = "unknown:19441".into();
+        assert!(options(&request).is_err());
+        request.memory.spark_memory_cap = Some(82 << 30);
+        assert_eq!(options(&request).unwrap().layout.unwrap().spark_capacities(2), vec![82 << 30; 2]);
+    }
+
+    #[test]
     fn spark_encoder_admission_honors_runtime_budget() {
         let mut request = args(std::path::Path::new("/not-read"), 4, false);
         request.memory.spark_memory_cap = Some(82 << 30);
@@ -2546,10 +2642,10 @@ mod tests {
         request.memory.spark_memory_cap = None;
         let options = options(&request).unwrap();
         assert_eq!(options.spark_budget_bytes, None);
-        assert_eq!(options.spark_budget(), 100 << 30);
+        assert_eq!(options.maximum_spark_capacity(), cuteafd_loader::serving_capacity::spark_memory::serving_bytes().into_iter().max().unwrap());
         let layout = options.layout.unwrap();
         assert_eq!(layout.spark_allocation_budget_bytes, None);
-        assert_eq!(layout.spark_bytes, 108 << 30);
+        assert_eq!(layout.spark_capacities(6), cuteafd_loader::serving_capacity::spark_memory::serving_bytes());
     }
 
     #[test]

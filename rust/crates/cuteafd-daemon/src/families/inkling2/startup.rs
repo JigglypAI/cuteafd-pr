@@ -20,6 +20,7 @@ pub(crate) struct Options<'a> {
     pub sequences: u64,
     pub context_tokens: u64,
     pub pool_tokens: Option<u64>,
+    pub kv_format: cuteafd_loader::families::inkling2::InklingKvCache,
     pub onboard: Onboard,
     pub prefix: &'a PrefixArgs,
     pub resident_weights: ResidentWeights,
@@ -76,7 +77,7 @@ pub(crate) fn prepare<'a>(library: &'a NativeLibrary, programs: &'a Programs<'a>
         // Static load finish is explicitly checked before any push owner exists.
         // Missing pin/export is a named startup error, never a host fallback.
         programs.program("inkling2_padded_transpose_bf16_r16_c1024_p64", &["source", "output"])?;
-        kernels = Some(Kernels::bind(programs)?);
+        kernels = Some(Kernels::bind(programs, options.kv_format)?);
         if let Some(tensors) = catalog.fp8() {
             let layers = (0..cfg.layers).collect::<Vec<_>>();
             for (view, _) in tensors.homogeneous_layers(&layers)? {
@@ -103,9 +104,9 @@ pub(crate) fn prepare<'a>(library: &'a NativeLibrary, programs: &'a Programs<'a>
         HostBudget::Auto => None, HostBudget::Bytes(bytes) => Some(bytes),
     };
     let manifest = Arc::new(serde_json::from_slice(&std::fs::read(options.manifest)?)?);
-    let request = FactsRequest { checkpoint, cfg, manifest_path: Some(options.manifest), manifest: Some(manifest),
+    let request = FactsRequest { kv_format: options.kv_format, checkpoint, cfg, manifest_path: Some(options.manifest), manifest: Some(manifest),
         coordinator: Coordinator::Measured { samples, loaded_code: vec![0] }, attention: AttentionPlacement::Heads,
-        spark_ranks: options.peers.len(), spark_bytes: policy.spark_cap_bytes(100 << 30),
+        spark_ranks: options.peers.len(), spark_bytes: cuteafd_loader::serving_capacity::spark_memory::runtime_bytes(&options.peers.iter().map(ToString::to_string).collect::<Vec<_>>())?.into_iter().max().unwrap_or(0),
         prefill: options.prefill, context_tokens: options.context_tokens, pool_tokens: options.pool_tokens,
         sequences: options.sequences, host, host_cache_bytes,
         prefix_entries: options.prefix.prefix_cache_entries as u64,
@@ -113,7 +114,9 @@ pub(crate) fn prepare<'a>(library: &'a NativeLibrary, programs: &'a Programs<'a>
         replies: cuteafd_core::spark_reply::requested(),
         head: crate::shared::target_head::TargetHead::configured().blas_head(true),
         expert_usage: options.expert_usage, resident_weight_limit: options.resident_weights };
-    let inputs = gather(&request)?;
+    let mut inputs = gather(&request)?;
+    cuteafd_loader::serving_capacity::spark_memory::apply_rank_budgets(&mut inputs.budgets,
+        &cuteafd_loader::serving_capacity::spark_memory::runtime_bytes(&options.peers.iter().map(ToString::to_string).collect::<Vec<_>>())?)?;
     let admitted = inputs.admit(inkling2::request(inputs.context, options.pool_tokens, options.onboard,
         options.prefill, cuteafd_loader::placement::planner::Operation::Serving,
         inputs.resident_weight_limit, request.replies))?;

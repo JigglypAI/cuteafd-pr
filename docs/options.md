@@ -71,7 +71,7 @@ default-off performance lever adds its row here in the same PR (AGENTS.md).
 | `L2_PREFETCH` | V4.1, MiMo, Qwen4 | `L2_PREFETCH=auto` or a MiB count (unset = off; GLM 5.3 and GLM Flash already default it to `auto`) | Pulls the next layer's weights into L2 while a one-lane decode step waits on its Spark exchange. V4.1 1× RTX 5090 + 4 Sparks: every C1 cell +1.7–3.9%, C4/C8 and 8K prefill unchanged (#623); GLM 5.3 weighted +4.4%, GLM Flash C1 +6–15% (2026-09-30). | None in values (outputs byte-identical); only extra L2 traffic. |
 | `QWEN_FP8_DECODE` | Qwen4 | `QWEN_FP8_DECODE=on` (unset = checkpoint BF16) | Holds the GDN/attention projections as one resident E4M3 copy; with `QWEN_FP8_HEAD=on`, 1× RTX code C1 222→247 tok/s, C4 441→489, 8K prefill 6100→6177 (2026-10-03). | Converts target projections to FP8 at load: golden KL 0.036→0.046, top-1 88.5%→86.7%; fails the KL gate, so opt-in only. |
 | `CORE_VIEW` | GLM 5.3 / ML4, GLM Flash, Kimi K3, Step-5, Muse | `CORE_VIEW=k8-compact`, `k6-compact` or `fp8-compact` (unset = original) | Stored MC core or generic load-time block FP8 of exactly the original variant's `core_tensors`; BF16 index only. GLM Flash K4 MC, 2 RTX PRO 6000 / 0 Sparks, DFlash2, fixed 425/425 W (2026-11-12): FP8 vs original C1/C16/8K prefill 171.12/741.93/7837.57 to 196.74/772.56/7741.92 tok/s (+15.0%/+4.1%/-1.2%); pool 1628160 to 2097152. K6 is non-inferior on both measured Standard-v2 paths, with +22.8% C1 and -12.5% 8K prefill vs original. Muse K4 MC `fp8-compact` is measured below (+15.2% C1, C16 flat, -5.1% 8K prefill; larger pool). GLM/Step whole-core FP8, 2 RTX PRO 6000 + 6 Sparks, 425 W/card (2026-11-16): GLM C1/C16/8K 49.04/180.68/3392 to 53.52/191.81/3122 tok/s (+9.1%/+6.2%/-8.0%), onboarded layers 5 to 8; Step 59.87/216.73/2740 to 68.98/266.95/2562 (+15.2%/+23.2%/-6.5%), onboarded layers 13 to 19. Both keep the 2,097,152-token pool; one warmed launch per arm, strict lossless 10/10. Step FP8 replay matches all 106 saved original prompt hashes. No thermal slowdown; prefill power-cap windows differ. Requires v52e exports. Other checkpoints unmeasured. | K8/K6 and FP8 quantize target weights. FP8 uses E4M3 + FP32 128x128 block scales. GLM generated Standard decode/prefill KL 0.03686/0.03100 to 0.04530/0.03880, top-1 94.544%/95.177% to 94.091%/94.775%; Step KL 0.01337/0.01164 to 0.01597/0.01429, top-1 96.069%/96.008% to 95.166%/95.811%. Absolute family bars pass; no paired non-inferiority claim. Original stays default. Matched Standard-v2 generated positions: FP8-minus-original KL to official BF16 ancestry +0.00289 decode/+0.00325 prefill, top-1 -0.013/-0.526 percentage points; absolute ancestry gates pass, paired decode non-inferiority passes but prefill fails (0.005 margin). Those figures ran W8A8 prefill over every group; W8A16 prefill (`FP8_PREFILL=off`) also fails prefill non-inferiority (top-1 loss 0.00263, upper95 0.00614). FP8 stays opt-in. Unsupported executor roles refuse by tensor name, never skip. Plain checkpoints refuse every compact selector, including the former plain Flash FP8 path. |
-| `KV_CACHE` | Muse | `KV_CACHE=fp8` (default `bf16`) | K4 MC original, dev `5e28a1d30`, RTX PRO 6000 (2026-11-16): 1 RTX + 4 Sparks, speculation off, pool 510,272 to 1,056,768 tokens (2.071x), served context 510,272 to 1,048,576. Separate quiet 2 RTX + 6 Sparks pair with default NVIDIA DFlash2: C1 70.81 to 65.08 emitted tok/s (0.919x), C16 253.03 to 257.81 (1.019x), pool 2,009,216 to 2,097,152 and onboarded layers 0 to 9. One warmed launch per arm; no power-cap or thermal slowdown in timed windows. | Lossy native E4M3 target KV with per-token/head FP32 scales. Standard max generated decode: KL 0.00968 to 0.01689 (+0.00721), top-1 97.149% to 96.594% (-0.555 pp); prefill KL +0.00625, top-1 -0.716 pp. Absolute family bars pass, but paired quality and C1 default bars fail: remains opt-in. BF16 stays default; drafter storage is independent. |
+| `KV_CACHE` | Muse | `KV_CACHE=fp8` (default `bf16`) | Muse K4 MC original, dev `5e28a1d30`, RTX PRO 6000 (2026-11-16): 1 RTX + 4 Sparks, speculation off, pool 510,272 to 1,056,768 tokens (2.071x), served context 510,272 to 1,048,576. Separate quiet 2 RTX + 6 Sparks pair with default NVIDIA DFlash2: C1 70.81 to 65.08 emitted tok/s (0.919x), C16 253.03 to 257.81 (1.019x), pool 2,009,216 to 2,097,152 and onboarded layers 0 to 9. One warmed launch per arm; no power-cap or thermal slowdown in timed windows. | Lossy native E4M3 target KV with per-token/head FP32 scales. Standard max generated decode: KL 0.00968 to 0.01689 (+0.00721), top-1 97.149% to 96.594% (-0.555 pp); prefill KL +0.00625, top-1 -0.716 pp. Absolute family bars pass, but paired quality and C1 default bars fail: remains opt-in. BF16 stays default; drafter storage is independent. |
 | `QWEN_FP8_HEAD` | Qwen4 | `QWEN_FP8_HEAD=on` (unset = BF16) | Converts the shared target/MTP head to one E4M3 backing. Historical combined measurement is in the decode row; standalone effect unmeasured. | Changes target logits; the draft reads the same head, not a separate draft-only FP8 copy. |
 | `MIMO_FP8_HEAD`, `MIMO_FP8_O_PROJ` | MiMo | Set either to `on` (unset/auto = checkpoint) | Explicitly converts a BF16 target head or O projection; native FP8 stays FP8. Unmeasured. | Target-weight quantization, independent of drafter precision. |
 | `GLM5_FLASH_FP8_HEAD` | GLM Flash | `GLM5_FLASH_FP8_HEAD=on` (unset/auto = checkpoint BF16 on TP1 and TP2) | Converts the shared target/draft head to E4M3 on either topology; unmeasured. `packed` is a separate exact BF16 option on one GPU. | Changes target logits; metadata-selected block-FP8 and native trellis/EXLR8 heads ignore this setting; no second copy is created. |
@@ -199,9 +199,11 @@ explicit `heads`, `layers`, `context` and multi-RTX serving refuse. Set
 `PREFIX_CACHE_ENTRIES`, `HOST_CACHE_BYTES`, KV reservation and loop-abort keys,
 plus `RTX_EXPERT_LAYERS=auto|all|N`, `PREFILL_ROWS` (a multiple of 64 up to
 4096), `PREFILL_WAVES` (1-3), `GPU_GRAPH_RESERVE`, its extra/cap keys and
-`GRAPH_TRACE`. `PREFILL_PACKING` and `KV_CACHE` are not selectable launch keys:
-KV uses native BF16 interleaved planes, convolution/residual state uses F32,
-and prefix restores preserve captured state exactly. Report the admitted KV
+`GRAPH_TRACE` and `KV_CACHE=bf16|fp8`. `PREFILL_PACKING` is not a selectable
+launch key. Global KV defaults to FP8; BF16 remains an explicit option;
+FP8 stores native E4M3 payloads with per-token/head FP32 K/V scales. Local
+rings stay BF16, convolution/residual state stays F32, and prefix restores
+preserve captured state exactly. Report the admitted KV
 pool rather than assuming the default target fits these owners.
 
 ### MiniMax Serving
@@ -495,6 +497,25 @@ plus `FAMILY_RESERVE` and the explicit per-coordinator-GPU `release padding` all
 not physical driver page tables or startup graph owners (including node padding).
 Startup and `cuteafd plan` print one line per device with the cap,
 weights, workspaces, every reserve component and the KV target, min, max and pool.
+Sparks use each host's idle `/proc/meminfo` `MemAvailable` (GB10 unified
+memory reclaims clean file cache; neither `MemFree` nor CUDA free is capacity).
+The launcher refreshes a host-local idle sample when no GPU compute process is
+resident. A busy host, including a server about to restart, uses only the last
+idle sample from its current boot ID; missing or reboot-stale samples fail
+closed with a stop-first hint. On `--restart`, this coordinator and selected
+host/port workers stop before the idle probe, even if subsequent admission
+refuses. Dry runs skip teardown and live probing. Plans retain sample
+timestamps, uptime and age.
+Offline and simulated plans use the provenance-stamped per-host
+`serving_capacity/spark_memory.json` inventory in configured rank order; unknown
+hosts require an explicit cap or live measurement. Direct `plan --config` resolves
+named hosts in config rank order; `REPLACE-ME` placeholders or no host list use
+labelled simulated canonical inventory. Rank-to-host order is not
+rearranged. Workers also check live allocatable memory before loading weights.
+`--spark-memory-samples` is the launcher's JSON measurement handoff to plan and
+serve, not a user policy knob. Explicit `SPARK_MEMORY_CAP` /
+`--spark-memory-cap` wins over measurements.
+
 The coordinator charges the SM121 worker process census (1,596,606,464 B,
 moa/driver 580.178.04, 2026-11-07, #1454) inside `SPARK_MEMORY_CAP`:
 steady anonymous PSS + file PSS + context-phase consumption, subtracting
@@ -552,7 +573,7 @@ Each key is also a global `cuteafd` flag (`--gpu-memory-cap`, `--kv-max-tokens`,
 | `KV_MIN_TOKENS` | min(256K, model max context, KV target), on every layout | positive count | Refuse automatic pools below this; missing the target is fine down to it. Automatic context serves min(model max context, admitted pool); an explicit context still requires the pool to cover it. |
 | `KV_MAX_TOKENS` | the target | positive count, at least the target | After an automatic layout is fixed, the pool grows into free memory up to this. A pinned `RTX_EXPERT_LAYERS` already makes the pool the output (it fills what is left). |
 | `GPU_MEMORY_CAP` | full device | size | Total per-GPU ceiling for plan, serve and golden; leaves SM count and L2 unchanged. |
-| `SPARK_MEMORY_CAP` | the family's Spark default | size | Total per-Spark engine ceiling, including worker process residency and routed weights; the outside-cap gap leaves room for OS/services. |
+| `SPARK_MEMORY_CAP` | each host's measured idle `MemAvailable` | size | Explicit total per-Spark engine ceiling overrides measured capacities, including worker process residency and routed weights. No extra margin. |
 | `GPU_RESERVE` | auto | size | Sets the total GPU reserve; built-in reserve components (including release padding) become 0, but physical driver page tables, named sampled pre-weight occupancy and the bounded graph-cache reserve stay charged. Still inside the cap. |
 | `SPARK_RESERVE` | auto | size | Replaces Spark reserve components, not arena driver metadata or actual ring/workspace/staging owners; these survive even a zero override. |
 | `MEMORY_PADDING` | `100MiB` | size | Explicit per-coordinator-GPU release padding, inside the cap; `0` disables only padding. `GPU_RESERVE` replaces it. Global flag: `--memory-padding`. |
@@ -653,8 +674,10 @@ experts after accepted full-model fidelity and partial paired scoring proof
 (#1777/#2128: 77 exact windows, zero mismatches, explicitly accepted by TJ).
 The [max example](../examples/configs/kimi-k31-exl3-k2-mc-max.config) selects
 MC `CORE_VIEW=original`, 2 RTX + 6 Sparks and automatic pool/onboarding.
-The 1-RTX minimum stays blocked by #2082; no raised Spark cap or tiny-pool
-workaround is supplied. K8 compact remains `Planned` because fidelity is
+With measured idle Spark capacities (#2082), MC `k6-compact` plans on
+1 RTX + 6 Sparks with an automatic 2,081,152-token pool and no RTX expert
+onboarding; this is a CPU placement result, not a new serving benchmark.
+K8 compact remains `Planned` because fidelity is
 unmeasured; whole-core `fp8-compact` remains unsupported and unqualified.
 All accepted views retain native BF16 indexer weights. K3 DFlash2 hidden-state
 compatibility is independently unqualified. `SPECULATOR=dspark` selects the
@@ -881,8 +904,8 @@ KV precision (`KV_CACHE`; `SWA_KV_CACHE` is MiMo only):
 
 | Value | V4.1 | V4 | GLM 5.3 / ML4 | GLM Flash | MiMo | Qwen4 | Qwen dense | Kimi K3 | Step-5 | Muse | Inkling |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| `bf16` | n/a (fixed) | n/a | n/a | n/a | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ (default) | n/a (fixed) |
-| `fp8` | n/a | n/a | n/a | n/a | ✗ | ✓ (default) | ✓ (default) | ✓ (default) | ✓ (default) | ✓ (opt-in) | n/a |
+| `bf16` | n/a (fixed) | n/a | n/a | n/a | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ (default) | ✓ |
+| `fp8` | n/a | n/a | n/a | n/a | ✗ | ✓ (default) | ✓ (default) | ✓ (default) | ✓ (default) | ✓ (opt-in) | ✓ (default) |
 | `int8` | n/a | n/a | n/a | n/a | ✓ (default) | ✗ | ✗ | ✗ | ✗ | n/a | n/a |
 | `SWA_KV_CACHE` `fp8` | n/a | n/a | n/a | n/a | ✓ | n/a | n/a | n/a | n/a | n/a | n/a |
 
@@ -893,6 +916,11 @@ Muse FP8 passes absolute fidelity but fails paired quality and C1 default bars;
 it remains opt-in (measurements in the performance-levers table). GLM families and
 Muse, MiMo and Kimi block dSpark expose independent `DRAFT_KV_CACHE`
 (`bf16`/`fp8`, default `fp8`) for drafter rings; it never changes target KV.
+
+Inkling defaults to `KV_CACHE=fp8`; `bf16` is an explicit option for global layers. FP8 records hold 2,048 E4M3 payload bytes
+plus 16 FP32 per-token/head K/V scales: exactly 2,112 bytes per global layer
+per pool token, versus 4,096 bytes in BF16. Local rings stay BF16 and
+convolution marks stay FP32. Tail copies include the scales byte-exactly.
 
 Media:
 
@@ -985,7 +1013,7 @@ original core is already FP8, not an MC publication.
 | `ATTENTION_PREFILL_PRECISION` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | `MAX_CONTEXT_TOKENS` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | `MAX_OUTPUT_TOKENS` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| `KV_CACHE` | ✗ | ✗ | ✗ | ✗ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ |
+| `KV_CACHE` | ✗ | ✗ | ✗ | ✗ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | `SWA_KV_CACHE` | ✗ | ✗ | ✗ | ✗ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
 | `DRAFT_KV_CACHE` | ✗ | ✗ | ✓ | ✓ | ✓ | ✗ | ✗ | ✓ | ✗ | ✓ | ✗ |
 | `PREFIX_CACHE_ENTRIES` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |

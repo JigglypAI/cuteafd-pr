@@ -680,18 +680,22 @@ def test_inkling2_dispatch_package_codes_cmake_and_placement_scopes_agree(monkey
         else:
             assert op == "bf16_projection" and family == "draft_bf16"
             assert thunk()[2] == "f32"
-    assert len(namespace["work"]) == 4 + 1 + 8
+    assert len(namespace["work"]) == 6 + 1 + 8
     assert names == [
-        ("inkling2_local_attention_decode_m64", dict(kind="local", route="decode", max_rows=64)),
-        ("inkling2_local_attention_prefill_m4096", dict(kind="local", route="prefill", max_rows=4096)),
-        ("inkling2_global_attention_decode_m64", dict(kind="global", route="decode", max_rows=64)),
-        ("inkling2_global_attention_prefill_m4096", dict(kind="global", route="prefill", max_rows=4096)),
+        (f"inkling2_{kind}_attention_{route}_{fmt}_v2_m{rows}",
+         dict(kind=kind, route=route, max_rows=rows, kv_format=fmt))
+        for kind in ("local", "global")
+        for fmt in (("bf16", "fp8") if kind == "global" else ("bf16",))
+        for route, rows in (("decode", 64), ("prefill", 4096))
     ]
     # Non-default capacities reach the pinned compiler and the stem.
     custom = namespace["inkling2_attention_programs"](16, 2048)
     assert [(suffix, thunk()["max_rows"]) for suffix, _, _, thunk in custom] == [
-        ("local_attention_decode_m16", 16), ("local_attention_prefill_m2048", 2048),
-        ("global_attention_decode_m16", 16), ("global_attention_prefill_m2048", 2048)]
+        (f"{kind}_attention_{route}_{fmt}_v2_m{rows}", rows)
+        for kind in ("local", "global")
+        for fmt in (("bf16", "fp8") if kind == "global" else ("bf16",))
+        for route, rows in (("decode", 16), ("prefill", 2048))
+    ]
     # Appended after every existing program, like MiniMax: the per-geometry loop skips it.
     source = (ROOT / "python/tools/aot/export_b12x_dsv4_aot.py").read_text()
     assert 'if name in ("minimax", "inkling2"):\n            continue' in source

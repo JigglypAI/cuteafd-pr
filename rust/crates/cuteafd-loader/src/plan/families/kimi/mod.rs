@@ -27,12 +27,6 @@ const TEXT: &str = "language_model.model.";
 const HEAD: &str = "language_model.lm_head.";
 const GIB: u64 = 1 << 30;
 
-/// Complete per-rank allocation ceiling without `--spark-memory-cap`.
-/// Exact TP6 header arenas and endpoint I/O plus an estimated runtime/workspace
-/// reserve constrain RTX onboarding alongside marks and the selected context floor.
-/// The default remains estimated until the first full worker load/steady census.
-pub const SPARK_BUDGET_BYTES: u64 = crate::families::kimi_k3::SPARK_DEFAULT_BUDGET_BYTES;
-
 /// The EXL3 expert package Kimi K3 uses: H3584/E896/K16/I3072, uniform K2 in
 /// the K2/K3 tier set, TP6 width 512.
 pub const PACKAGE: &str = "kimik3:exl3-k23";
@@ -373,7 +367,6 @@ impl FamilyModel for Model {
         }
         Ok(Some(geometry))
     }
-    fn spark_budget_bytes(&self) -> u64 { SPARK_BUDGET_BYTES }
     fn activation(&self, layer: usize, _shared: bool) -> Option<FfnActivation> {
         (layer < self.cfg.layers).then(|| self.cfg.activation())
     }

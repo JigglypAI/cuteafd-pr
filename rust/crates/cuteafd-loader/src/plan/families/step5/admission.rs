@@ -176,6 +176,7 @@ const EXECUTOR: ExecutorModes = crate::placement::families::STEP5;
 /// absolute additional peaks above that same sample, not steady-state deltas.
 #[derive(Clone)]
 pub struct RuntimeInputs {
+    pub spark_bytes: Vec<u64>,
     pub graph_layout: Option<crate::serving_capacity::step5_graphs::Step5GraphLayout>,
     pub decode_graphs: bool,
     pub host: HostInputs,
@@ -596,7 +597,7 @@ mod tests {
         }
     }
     fn inputs(ranks: usize) -> RuntimeInputs {
-        RuntimeInputs { graph_layout: None, decode_graphs: false, bf16_target_head: crate::placement::planner::serving::BlasHead::TensorLt,
+        RuntimeInputs { spark_bytes: crate::plan::testing::SimulatedHost::raptor().layout().spark_capacities(8), graph_layout: None, decode_graphs: false, bf16_target_head: crate::placement::planner::serving::BlasHead::TensorLt,
             host: Default::default(), resident_weight_limit: None, spark_reply_format: cuteafd_core::SparkReplyFormat::Bf16,
                 kv_format: crate::families::qwen4::Qwen4KvCache::Bf16,
             waves: 1, unit: 0,
@@ -645,6 +646,21 @@ mod tests {
                 o.ranks()
             ])
         })
+    }
+
+    #[test]
+    fn spark_solver_uses_each_measured_or_explicit_capacity() {
+        let mut input = inputs(1);
+        input.spark_bytes = vec![123, 456, 789, 1011];
+        let budgets = crate::placement::families::step5::budgets(&input).unwrap();
+        let sparks = budgets.iter().filter(|budget| budget.id.starts_with("spark"))
+            .map(|budget| budget.physical_bytes).collect::<Vec<_>>();
+        assert_eq!(sparks, input.spark_bytes);
+        input.spark_bytes = vec![82 << 30; 4];
+        assert!(crate::placement::families::step5::budgets(&input).unwrap().iter()
+            .filter(|budget| budget.id.starts_with("spark")).all(|budget| budget.physical_bytes == 82 << 30));
+        input.spark_bytes.pop();
+        assert!(crate::placement::families::step5::budgets(&input).is_err());
     }
 
     #[test]
