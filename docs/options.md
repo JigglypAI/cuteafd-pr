@@ -650,7 +650,7 @@ Each key is also a global `cuteafd` flag (`--gpu-memory-cap`, `--kv-max-tokens`,
 | `MAX_OUTPUT_TOKENS` | `131072` | integer | Generation cap. |
 | `KV_CACHE` | family default | `bf16`, `fp8`; MiMo also `int8` | See the precision table below. |
 | `SWA_KV_CACHE` | `int8` | `bf16`, `int8`, `fp8` | MiMo sliding/MTP rings. |
-| `DRAFT_KV_CACHE` | `fp8` | `bf16`, `fp8` | Drafter ring storage (GLM 5.3, GLM Flash, MiMo, Muse, Kimi GQA block dSpark; Kimi MLA DFlash2 follows target KV). |
+| `DRAFT_KV_CACHE` | Kimi K3.1 MC original TP2: `bf16`; otherwise `fp8` | `bf16`, `fp8` | Drafter ring storage (GLM 5.3, GLM Flash, MiMo, Muse, Kimi GQA block dSpark; Kimi MLA DFlash2 follows target KV). |
 | `PREFIX_CACHE_ENTRIES` | `auto` | `auto`, non-negative | Snapshot entries; auto derives from context × concurrency. |
 | `PREFIX_CACHE_MARK_MIB` | unset | MiB | Recurrent/ring state retained per mark. |
 | `PREFIX_PARTIAL` | `off` | `on`, `off` | MiMo approximate partial reuse; off keeps exact restores only. Every other family, V4.1 included, restores exact snapshot frontiers only and refuses `on`. |
@@ -670,7 +670,7 @@ Each key is also a global `cuteafd` flag (`--gpu-memory-cap`, `--kv-max-tokens`,
 
 | Key | Default | Values | Notes |
 | --- | --- | --- | --- |
-| `SPECULATOR` | family default | `auto` (Qwen4), `off`, `dflash2`, `dspark`, `mtp` | Which fail is in the table below. |
+| `SPECULATOR` | family default | `auto` (Qwen4/Kimi), `off`, `dflash2`, `dspark`, `mtp` | Which fail is in the table below. |
 | `SPECULATOR_MODEL_ID` | family default | HF repo id | External drafter checkpoint. |
 | `SPECULATOR_MODEL_REVISION` | empty | 40–64 lowercase hex | Drafter revision. |
 | `SPECULATOR_DEPTH` | 3 for local Qwen/Step-5, else 1 | positive int | Native MTP draft depth. |
@@ -736,9 +736,18 @@ two coordinators split query/KV heads and FFN neurons across both devices,
 with per-rank packed arenas, local rings and exact local prefix marks. FC and
 norms are replicated; only the head GPU owns Markov/confidence and borrows the
 target vocabulary head. The shared GQA TP2 reduction uses drafter-private
-exchange flags, never target exchange slots. `SPECULATOR=off` remains the
-default. Full-model served lossless qualification is still pending (#2261);
-this is not a performance claim. `TP2_DFLASH` does not select this GQA split.
+exchange flags, never target exchange slots. Unset/`auto` `SPECULATOR` defaults to DSpark for
+`wrldsuksgo2mars/Kimi-K3.1-Pro-EXL3-K2-MC`, `CORE_VIEW=original`, TP2,
+target FP8 KV and drafter BF16 KV; this layout defaults the drafter ring to BF16.
+Qualification does not key on revision metadata or Spark count: the coordinator-local
+drafter split is unchanged by expert-world size. The measured card used six Sparks.
+Explicit `SPECULATOR=off` wins, including the max example's pinned off value.
+K6/K8/FP8 compact views, TP1, other checkpoints, target BF16 KV and draft FP8 KV
+remain default-off (explicit opt-in is available). Cold and full-prompt warm strict
+sets passed 10/10; warmed emitted C1/C16 off-to-on was 15.32/116.18 to
+46.31/138.65 tok/s (3.02x/1.19x), no thermal/power-cap seconds at 425 W/card.
+Sampled code acceptance length 1.95 does not establish compatibility with the
+reported 4.16 reference; investigation is #2312. Evidence: #2261. `TP2_DFLASH` does not select this GQA split.
 
 Kimi K3 and Step-5 are text-only; dense Qwen has media off. GLM 5.3 / ML4,
 GLM Flash, MiMo, Qwen4 and Muse carry their own towers. Native GLM Flash EXLR8
@@ -931,7 +940,7 @@ Speculator (`SPECULATOR`):
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | `off` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ (default) |
 | `dflash2` | ✗ | ✗ | ✓ (default) | ✓ (default) | ✓ | ✗ | ✗ | ✓ (default) | ✗ | ✓ (default) | ✗ |
-| `dspark` | ✓ (default) | ✓ (default) | ✓ (Mistral Large 4 only) | ✓ | ✗ | ✗ | ✓ (default unless hidden is 5120) | ✓ (K3.1 opt-in; qualification gate) | ✗ | ✗ | ✗ |
+| `dspark` | ✓ (default) | ✓ (default) | ✓ (Mistral Large 4 only) | ✓ | ✗ | ✗ | ✓ (default unless hidden is 5120) | ✓ (K3.1 MC original TP2 default; otherwise opt-in) | ✗ | ✗ | ✗ |
 | `mtp` | ✗ | ✗ | ✗ | ✗ | ✓ | ✓ (default) | ✓ (local EXL3/NVFP4 default, depth 3) | ✗ | ✓ (default) | ✗ | ✗ |
 
 Qwen4 unset/`auto` selects native MTP (depth 3) only for qualified local

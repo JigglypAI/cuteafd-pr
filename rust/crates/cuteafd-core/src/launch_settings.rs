@@ -55,11 +55,30 @@ pub struct KimiSpeculatorError(String);
 pub const KIMI_K31_DSPARK: &str = "Inferact/Kimi-K3.1-Pro-DSpark";
 pub const KIMI_K31_DSPARK_REVISION: &str = "e4e6e6261e9f8b6d5f249f9627eb6b109d762d5f";
 
-pub fn kimi_speculator(explicit:Option<&str>,configured:Option<&str>)
+pub const KIMI_K31_MC: &str = "wrldsuksgo2mars/Kimi-K3.1-Pro-EXL3-K2-MC";
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct KimiDraftQualification<'a> {
+    pub model: &'a str,
+    pub core_view: &'a str,
+    pub rtx: usize,
+    pub target_kv: &'a str,
+    pub draft_kv: &'a str,
+}
+
+impl KimiDraftQualification<'_> {
+    pub fn qualified(self) -> bool {
+        self.model == KIMI_K31_MC && self.core_view == "original" && self.rtx == 2
+            && self.target_kv == "fp8" && self.draft_kv == "bf16"
+    }
+}
+
+pub fn kimi_speculator(explicit:Option<&str>,configured:Option<&str>, qualification: KimiDraftQualification<'_>)
     -> Result<Resolved<String>,KimiSpeculatorError> {
     let resolved=selected(explicit.filter(|v|!v.is_empty() && *v!="auto").map(str::to_owned),
         configured.filter(|_|explicit.is_none()).filter(|v|!v.is_empty() && *v!="auto").map(str::to_owned),
-        "off".into(),"Kimi speculation remains opt-in until measured");
+        if qualification.qualified() { "dspark" } else { "off" }.into(),
+        "DSpark for qualified K3.1 MC original TP2 with target FP8 and draft BF16 KV; off otherwise");
     if !matches!(resolved.value.as_str(),"off"|"dflash2"|"dspark") {
         return Err(KimiSpeculatorError(resolved.value));
     }
@@ -84,6 +103,24 @@ pub fn mimo_mtp_depth(explicit: Option<usize>, configured: Option<usize>, mtp: b
 mod tests {
     use super::*;
     #[test]
+    fn kimi_defaults_only_cover_qualified_identity_view_layout_and_kv() {
+        let qualified = KimiDraftQualification { model: KIMI_K31_MC, core_view: "original", rtx: 2,
+            target_kv: "fp8", draft_kv: "bf16" };
+        assert_eq!(kimi_speculator(None, None, qualified).unwrap().value, "dspark");
+        assert_eq!(kimi_speculator(Some("auto"), Some("off"), qualified).unwrap().value, "dspark");
+        assert_eq!(kimi_speculator(Some("off"), None, qualified).unwrap().value, "off");
+        assert_eq!(kimi_speculator(None, Some("off"), qualified).unwrap().value, "off");
+        for other in [KimiDraftQualification { model: "other/model", ..qualified },
+            KimiDraftQualification { core_view: "k6-compact", ..qualified },
+            KimiDraftQualification { rtx: 1, ..qualified },
+            KimiDraftQualification { target_kv: "bf16", ..qualified },
+            KimiDraftQualification { draft_kv: "fp8", ..qualified }] {
+            assert_eq!(kimi_speculator(None, None, other).unwrap().value, "off");
+            assert_eq!(kimi_speculator(Some("dspark"), None, other).unwrap().value, "dspark");
+        }
+    }
+
+    #[test]
     fn defaults_and_precedence() {
         assert_eq!(glmf_index_cache(None, None, 1).value, "compact");
         assert_eq!(glmf_index_cache(None, None, 2).value, "keys");
@@ -103,10 +140,10 @@ mod tests {
         assert_eq!(mimo_speculator(Some("mtp"), Some("off"), "XiaomiMiMo/MiMo-V2.6-Pro-MOPD").value, "mtp");
         assert_eq!(mimo_mtp_depth(None, None, true).value, 1);
         assert_eq!(mimo_mtp_depth(Some(3), Some(2), true).value, 3);
-        assert_eq!(kimi_speculator(None,None).unwrap().value,"off");
-        assert_eq!(kimi_speculator(None,Some("dspark")).unwrap().value,"dspark");
-        assert_eq!(kimi_speculator(Some("off"),Some("dspark")).unwrap().value,"off");
-        assert!(kimi_speculator(Some("mtp"),None).is_err());
+        assert_eq!(kimi_speculator(None,None, KimiDraftQualification::default()).unwrap().value,"off");
+        assert_eq!(kimi_speculator(None,Some("dspark"), KimiDraftQualification::default()).unwrap().value,"dspark");
+        assert_eq!(kimi_speculator(Some("off"),Some("dspark"), KimiDraftQualification::default()).unwrap().value,"off");
+        assert!(kimi_speculator(Some("mtp"),None, KimiDraftQualification::default()).is_err());
         assert!(kimi_draft_fp8(None, true).value);
         assert!(!kimi_draft_fp8(Some(false), true).value);
     }

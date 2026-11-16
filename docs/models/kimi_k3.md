@@ -28,12 +28,19 @@ K8 remains Planned and whole-core FP8 refuses.
 K3 DFlash2 hidden-state compatibility remains independently unqualified.
 Inferact block dSpark integration is tracked in #2261: native BF16 weights,
 checkpoint-derived 2,048-token GQA window, rank-512 Markov confidence, shared
-policy/executor and target embedding/head. `SPECULATOR=dspark` is opt-in and
-full-model served lossless qualification is pending (#2261); the default
-stays off. TP1 runs on one RTX; TP2 splits 96 query/16 KV heads to
+policy/executor and target embedding/head. Unset/`auto` `SPECULATOR` selects DSpark for MC original on TP2 with target
+FP8 KV and draft BF16 KV; the drafter KV default for this identity/view/layout is
+BF16. Explicit off wins (the max example still pins off). Compact views, TP1,
+other checkpoints and unqualified KV dtypes remain default-off. Qualification
+is checkpoint-identity/view based, not revision based; Spark count does not change
+the coordinator-local drafter split. The six-Spark measured card passed cold and
+full-prompt warm strict sets 10/10, then emitted C1/C16 rose from 15.32/116.18 to
+46.31/138.65 tok/s (3.02x/1.19x), with no thermal/power-cap seconds at 425 W/card
+(#2261). Sampled acceptance length 1.95 versus reported 4.16 remains #2312. TP1 runs on one RTX; TP2 splits 96 query/16 KV heads to
 48/8 per rank and splits FFN neurons, with private exchange flags and local
 per-rank prefix marks. FC/norms are replicated, Markov/confidence on the head.
-`DRAFT_KV_CACHE` selects FP8 (default) or BF16 independently of target KV.
+`DRAFT_KV_CACHE` selects FP8 or BF16 independently of target KV; only the qualified
+MC original TP2 defaults to BF16, otherwise FP8 remains the explicit-drafter default.
 One-RTX K6 fit depends on pool/context and Spark capacity: the matched
 766,784-token pool at the measured post-reboot Spark capacity fits the
 Inferact drafter with two onboarded layers. The default 108 GiB Spark budget

@@ -574,13 +574,13 @@ fn run_plan_with_host(mut args: PlanArgs) -> Result<()> {
     }
     if family == "kimi_k3" {
         settings.insert("speculator".into(),setting(cuteafd_core::launch_settings::kimi_speculator(
-            (requested_speculator != "auto").then_some(requested_speculator.as_str()),cfg.get("SPECULATOR").map(String::as_str))?));
+            (requested_speculator != "auto").then_some(requested_speculator.as_str()),cfg.get("SPECULATOR").map(String::as_str), kimi_qualification(&args, &cfg))?));
     }
     if args.resolve_settings_only {
         let mut output = resolved_output(serde_json::json!({"family": family}), &args, settings, &cfg, replay_explicit);
         output["speculator"] = serde_json::json!(args.speculator);
         output["default_drafter"] = serde_json::json!(if family == "kimi_k3" { cuteafd_core::launch_settings::KIMI_K31_DSPARK } else { GLMF_DEFAULT_DRAFTER });
-        if family == "kimi_k3" { output["default_drafter_revision"]=serde_json::json!(cuteafd_core::launch_settings::KIMI_K31_DSPARK_REVISION); }
+        if family == "kimi_k3" { output["draft_kv_cache"]=serde_json::json!(kimi_qualification(&args, &cfg).draft_kv); output["default_drafter_revision"]=serde_json::json!(cuteafd_core::launch_settings::KIMI_K31_DSPARK_REVISION); }
         println!("{}", serde_json::to_string(&output)?);
         return Ok(());
     }
@@ -849,11 +849,33 @@ fn checkpoint_model_id<'a>(args: &'a PlanArgs, cfg: &'a std::collections::BTreeM
 
 const GLMF_DEFAULT_DRAFTER: &str = "incoai/GLM-5.3-Flash-DFlash2";
 
+fn kimi_qualification<'a>(args: &'a PlanArgs, cfg: &'a std::collections::BTreeMap<String, String>)
+    -> cuteafd_core::launch_settings::KimiDraftQualification<'a> {
+    use cuteafd_loader::{plan::checkpoint::CoreView, families::qwen4::Qwen4KvCache};
+    cuteafd_core::launch_settings::KimiDraftQualification {
+        model: checkpoint_model_id(args, cfg),
+        core_view: if args.attention.core_view == CoreView::Original { "original" } else { "compact" },
+        rtx: args.rtx,
+        target_kv: if args.kv_format.unwrap_or_default() == cuteafd_core::MlaCacheFormat::Fp8 { "fp8" } else { "bf16" },
+        draft_kv: if args.draft_kv_cache == Qwen4KvCache::Bf16 { "bf16" } else { "fp8" },
+    }
+}
+
+
 fn resolve_speculator(args: &mut PlanArgs, snapshot: &std::path::Path, family: &str,
     cfg: &std::collections::BTreeMap<String, String>) -> Result<()> {
     if family == "kimi_k3" {
+        if !args.explicit_settings.contains("draft_kv_cache") {
+            args.draft_kv_cache = match cfg.get("DRAFT_KV_CACHE") {
+                Some(value) => value.parse()?,
+                None if checkpoint_model_id(args, cfg) == cuteafd_core::launch_settings::KIMI_K31_MC
+                    && args.rtx == 2 && args.attention.core_view == cuteafd_loader::plan::checkpoint::CoreView::Original
+                    => cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16,
+                None => args.draft_kv_cache,
+            };
+        }
         args.speculator=cuteafd_core::launch_settings::kimi_speculator(
-            (args.speculator != "auto").then_some(args.speculator.as_str()),cfg.get("SPECULATOR").map(String::as_str))?.value;
+            (args.speculator != "auto").then_some(args.speculator.as_str()),cfg.get("SPECULATOR").map(String::as_str), kimi_qualification(&args, &cfg))?.value;
     }
     let default = match family {
         "minimax_m3" => "dspark",
@@ -1489,6 +1511,30 @@ mod tests {
         assert!(run_plan(invalid).unwrap_err().to_string().contains("published name"));
         let files = PlanArgs { files: true, ..args(root, 6, false) };
         assert!(run_plan(files).unwrap_err().to_string().contains("planner-only"));
+    }
+
+    #[test]
+    fn kimi_tp2_original_defaults_to_qualified_bf16_drafter_without_revision_or_spark_gate() {
+        use clap::Parser;
+        for sparks in [1, 4, 6, 8] {
+            let crate::cli::Commands::Plan(mut request) = crate::cli::Cli::try_parse_from([
+                "cuteafd", "plan", cuteafd_core::launch_settings::KIMI_K31_MC, "--rtx", "2",
+                "--spark-ranks", &sparks.to_string()]).unwrap().command else { panic!("plan") };
+            resolve_speculator(&mut request, std::path::Path::new("/unused"), "kimi_k3", &Default::default()).unwrap();
+            assert_eq!(request.speculator, "dspark");
+            assert_eq!(request.draft_kv_cache, cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16);
+        }
+        for flags in [vec!["--rtx", "1"], vec!["--rtx", "2", "--core-view", "k6-compact"],
+            vec!["--rtx", "2", "--draft-kv-cache", "fp8"], vec!["--rtx", "2", "--kv-cache", "bf16"],
+            vec!["--rtx", "2", "--speculator", "off"]] {
+            let draft_explicit = flags.contains(&"--draft-kv-cache");
+            let crate::cli::Commands::Plan(mut request) = crate::cli::Cli::try_parse_from(
+                ["cuteafd", "plan", cuteafd_core::launch_settings::KIMI_K31_MC].into_iter().chain(flags)).unwrap().command
+                else { panic!("plan") };
+            if draft_explicit { request.explicit_settings.insert("draft_kv_cache".into()); }
+            resolve_speculator(&mut request, std::path::Path::new("/unused"), "kimi_k3", &Default::default()).unwrap();
+            assert_eq!(request.speculator, "off");
+        }
     }
 
     #[test]
