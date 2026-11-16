@@ -143,7 +143,7 @@ def test_remote_wire_checks_byte_identity_and_collects_three_samples(tmp_path, m
     reference.with_suffix(".id").write_text("cd" * 32)
     rgb = np.array([1, 2, 3], dtype=np.uint8)
     monkeypatch.setattr(gate, "harness", lambda: SimpleNamespace(fixture=lambda n: (1, n * 4, rgb)))
-    header = struct.pack("<8s32s32s4I", b"CAFDVI01", bytes.fromhex("cd" * 32), bytes.fromhex("ab" * 32), 16384, 2, 16, 2)
+    header = struct.pack("<8s32s32s6IQ", b"CAFDVI03", bytes.fromhex("cd" * 32), bytes.fromhex("ab" * 32), 16384, 2, 16, 2, 0, 4096, 16384 * 16 * 16)
     key = hashlib.sha256(rgb.tobytes()).digest()
     payload = bytearray(header + bytes(4))
     for repeat in range(4):

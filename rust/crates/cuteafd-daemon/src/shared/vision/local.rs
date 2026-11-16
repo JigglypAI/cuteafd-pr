@@ -17,11 +17,8 @@ pub struct LocalEncoder {
     service: EncoderService,
     lut: Arc<[f32; 768]>,
     width: usize,
-    max_tokens: usize,
+    limits: cuteafd_core::media::ImageEncodeLimits,
     patch_size: usize,
-    merge: u32,
-    /// A span-writing tower (Mistral's Pixtral) emits a marker row per merged row.
-    span_markers: bool,
     queue: VecDeque<Pending>,
     running: Option<Running>,
     next: u64,
@@ -33,14 +30,35 @@ impl LocalEncoder {
         width: usize,
         max_tokens: usize,
     ) -> Self {
+        let limits = cuteafd_core::media::ImageEncodeLimits {
+            max_patches: u32::try_from(max_tokens.saturating_mul(config.merge.pow(2) as usize))
+                .unwrap_or(u32::MAX),
+            max_output_rows: u32::try_from(max_tokens).unwrap_or(u32::MAX),
+            max_canvas_pixels: (max_tokens as u64)
+                .saturating_mul(u64::from(config.merge.pow(2)))
+                .saturating_mul(u64::from(config.patch.pow(2))),
+            geometry: cuteafd_core::media::ImageTokenGeometry {
+                merge: config.merge,
+                row_markers: u32::from(
+                    config.family == cuteafd_loader::media::ImageFamily::Mistral,
+                ),
+            },
+        };
+        Self::with_limits(service, config, width, limits)
+    }
+    /// Towers with a padded/source canvas declare its physical limit explicitly.
+    pub fn with_limits(
+        service: EncoderService,
+        config: &ProcessorConfig,
+        width: usize,
+        limits: cuteafd_core::media::ImageEncodeLimits,
+    ) -> Self {
         Self {
             service,
             lut: normalization_lut(config),
             width,
-            max_tokens,
+            limits,
             patch_size: config.patch as usize,
-            merge: config.merge,
-            span_markers: config.family == cuteafd_loader::media::ImageFamily::Mistral,
             queue: VecDeque::new(),
             running: None,
             next: 0,
@@ -73,23 +91,9 @@ impl LocalEncoder {
         };
         let (t, h, w) = (*t, *h, *w);
         let pixels = job.pixels(self.patch_size as u32)?;
-        let geometry = cuteafd_core::media::ImageTokenGeometry {
-            merge: self.merge,
-            row_markers: u32::from(self.span_markers),
-        };
-        let (_, _, rows) = geometry.extent([t, h, w]).ok_or(MediaError::Features)?;
-        if t != 1
-            || h == 0
-            || w == 0
-            || h % 2 != 0
-            || w % 2 != 0
-            || job.tokens != rows
-            || job.tokens > self.max_tokens
-            || job.hidden_width != self.width
-            || u64::from(pixels.canvas[0]) * u64::from(pixels.canvas[1]) * 3 != rgb8.len() as u64
-        {
-            return Err(MediaError::Features);
-        }
+        self.limits
+            .validate([t, h, w], pixels, job.tokens as u64, rgb8.len() as u64)
+            .map_err(|message| MediaError::Encoder(message.into()))?;
         job.feature_bytes()?;
         Ok(())
     }
@@ -193,6 +197,77 @@ mod tests {
     use std::sync::{atomic::Ordering, mpsc};
     use std::time::Instant;
 
+    #[test]
+    fn kimi_canvas_boundary_is_identical_on_local_and_remote_admission() {
+        use cuteafd_core::media::{ImageEncodeLimits, ImagePixels, ImageTokenGeometry};
+        let limits = ImageEncodeLimits {
+            max_patches: 65536,
+            max_output_rows: 16384,
+            max_canvas_pixels: 65536 * 14 * 14,
+            geometry: ImageTokenGeometry::MERGED,
+        };
+        let (_send, _jobs) = mpsc::sync_channel::<super::super::Work>(2);
+        let service = EncoderService {
+            queue: Some(_send),
+            owner: None,
+            ledger: Default::default(),
+            audio_ledger: None,
+            audio_geometry: None,
+            healthy: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        };
+        let config = ProcessorConfig::for_family(cuteafd_loader::media::ImageFamily::Qwen);
+        let encoder = LocalEncoder::with_limits(service, &config, 1, limits);
+        let handshake = super::super::remote::EncoderHandshake {
+            encoder_id: cuteafd_loader::media::EncoderId([1; 32]),
+            max_patches: limits.max_patches,
+            max_output_rows: limits.max_output_rows,
+            max_canvas_pixels: limits.max_canvas_pixels,
+            output_width: 1,
+            patch_size: 14,
+            merge_size: 2,
+            row_markers: 0,
+            plan_hash: [2; 32],
+        };
+        assert_eq!(handshake.image_limits(), limits);
+        let pixels = ImagePixels {
+            source: [8192, 4096],
+            canvas: [3584, 3584],
+            content: [0, 0, 3583, 3584],
+        };
+        let bytes = (limits.max_canvas_pixels * 3) as usize;
+        let job = media::EncodeJob::image_with_pixels(
+            ImageKey([1; 32]),
+            [1, 256, 256],
+            vec![0; bytes].into(),
+            pixels,
+            16384,
+            1,
+        );
+        assert!(encoder.validate(&job).is_ok());
+        assert!(handshake
+            .image_limits()
+            .validate([1, 256, 256], pixels, 16384, bytes as u64)
+            .is_ok());
+        let mut over = pixels;
+        over.canvas = [1, limits.max_canvas_pixels as u32 + 1];
+        over.content = [0, 0, 1, over.canvas[1]];
+        let over_job = media::EncodeJob::image_with_pixels(
+            ImageKey([1; 32]),
+            [1, 256, 256],
+            vec![0; bytes + 3].into(),
+            over,
+            16384,
+            1,
+        );
+        assert!(matches!(
+            encoder.validate(&over_job),
+            Err(MediaError::Encoder(_))
+        ));
+        assert!(handshake
+            .image_limits()
+            .validate([1, 256, 256], over, 16384, (bytes + 3) as u64)
+            .is_err());
+    }
     #[test]
     fn pcm_audio_uses_shared_owner_without_fp32_scratch() {
         use cuteafd_core::media::AudioTokenGeometry;

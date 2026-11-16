@@ -108,6 +108,17 @@ impl EncoderHandshake {
             .map_or(0, |(_, _, rows)| rows as u64)
         }
     }
+    pub(super) fn image_limits(&self) -> cuteafd_core::media::ImageEncodeLimits {
+        cuteafd_core::media::ImageEncodeLimits {
+            max_patches: self.max_patches,
+            max_output_rows: self.max_output_rows,
+            max_canvas_pixels: self.max_canvas_pixels,
+            geometry: cuteafd_core::media::ImageTokenGeometry {
+                merge: self.merge_size,
+                row_markers: self.row_markers,
+            },
+        }
+    }
     fn validate_frame(
         &self,
         grid: [u32; 3],
@@ -115,6 +126,12 @@ impl EncoderHandshake {
         tokens: u64,
         bytes: u64,
     ) -> Result<()> {
+        if self.merge_size != 3 {
+            return self
+                .image_limits()
+                .validate(grid, pixels, tokens, bytes)
+                .map_err(error);
+        }
         let [t, h, w] = grid;
         let patches = u64::from(h) * u64::from(w);
         let canvas = u64::from(pixels.canvas[0]) * u64::from(pixels.canvas[1]);
@@ -164,7 +181,7 @@ pub struct AudioHandshake {
     pub output_width: u32,
     pub geometry: cuteafd_core::media::AudioTokenGeometry,
 }
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 enum Handshake {
     Image(EncoderHandshake),
     Audio(AudioHandshake),
@@ -1017,34 +1034,87 @@ mod tests {
     use cuteafd_engine::media::FakeEncoder;
     #[test]
     fn source_geometry_roundtrips_and_declared_capacity_is_enforced() {
-        let mut h=handshake();h.max_patches=65536;h.max_output_rows=16384;h.max_canvas_pixels=64<<20;
+        let mut h = handshake();
+        h.max_patches = 65536;
+        h.max_output_rows = 16384;
+        h.max_canvas_pixels = 64 << 20;
         h.validate().unwrap();
-        let pixels=cuteafd_core::media::ImagePixels {source:[896,812],canvas:[32,32],content:[1,2,29,28]};
-        let job=EncodeJob::image_with_pixels(ImageKey([8;32]),[1,256,256],vec![1;32*32*3].into(),pixels,16384,4096);
+        let pixels = cuteafd_core::media::ImagePixels {
+            source: [896, 812],
+            canvas: [32, 32],
+            content: [1, 2, 29, 28],
+        };
+        let job = EncodeJob::image_with_pixels(
+            ImageKey([8; 32]),
+            [1, 256, 256],
+            vec![1; 32 * 32 * 3].into(),
+            pixels,
+            16384,
+            4096,
+        );
         h.validate_job(&job).unwrap();
-        let expected=pixels;
-        let server=EncoderServer::start_image_backend("127.0.0.1:0".parse().unwrap(),h.clone(),Duration::from_secs(2),||true,
-            move |job| {assert_eq!(job.pixels(16).unwrap(),expected);Ok(EncodeOutput {key:job.key,features:vec![0;job.feature_bytes()?].into(),elapsed_ms:0.0})}).unwrap();
+        let expected = pixels;
+        let server = EncoderServer::start_image_backend(
+            "127.0.0.1:0".parse().unwrap(),
+            h.clone(),
+            Duration::from_secs(2),
+            || true,
+            move |job| {
+                assert_eq!(job.pixels(16).unwrap(), expected);
+                Ok(EncodeOutput {
+                    key: job.key,
+                    features: vec![0; job.feature_bytes()?].into(),
+                    elapsed_ms: 0.0,
+                })
+            },
+        )
+        .unwrap();
         // Small explicit row count exercises actual transport without a large feature allocation.
-        let job=EncodeJob::image_with_pixels(ImageKey([8;32]),[1,4,4],vec![1;32*32*3].into(),pixels,4,4096);
-        let mut client=RemoteEncoder::connect(vec![server.address],h.clone(),Duration::from_secs(2)).unwrap();
-        let ticket=client.submit(job).unwrap();let end=Instant::now()+Duration::from_secs(2);
-        loop {if let Some(result)=client.poll(ticket) {result.unwrap();break;}assert!(Instant::now()<end);thread::yield_now();}
-        let mut too_small=h.clone();too_small.max_output_rows=3;
-        assert!(h.compatible(&too_small).is_ok());assert!(too_small.compatible(&h).is_err());
-        assert!(h.validate_frame([1,4,4],pixels,4,1).is_err());
-        let mut invalid=pixels;invalid.content=[u32::MAX,0,1,1];
-        assert!(h.validate_frame([1,4,4],invalid,4,32*32*3).is_err());
-        assert!(h.validate_frame([2,4,4],pixels,4,32*32*3).is_err());
+        let job = EncodeJob::image_with_pixels(
+            ImageKey([8; 32]),
+            [1, 4, 4],
+            vec![1; 32 * 32 * 3].into(),
+            pixels,
+            4,
+            4096,
+        );
+        let mut client =
+            RemoteEncoder::connect(vec![server.address], h.clone(), Duration::from_secs(2))
+                .unwrap();
+        let ticket = client.submit(job).unwrap();
+        let end = Instant::now() + Duration::from_secs(2);
+        loop {
+            if let Some(result) = client.poll(ticket) {
+                result.unwrap();
+                break;
+            }
+            assert!(Instant::now() < end);
+            thread::yield_now();
+        }
+        let mut too_small = h.clone();
+        too_small.max_output_rows = 3;
+        assert!(h.compatible(&too_small).is_ok());
+        assert!(too_small.compatible(&h).is_err());
+        assert!(h.validate_frame([1, 4, 4], pixels, 4, 1).is_err());
+        let mut invalid = pixels;
+        invalid.content = [u32::MAX, 0, 1, 1];
+        assert!(h
+            .validate_frame([1, 4, 4], invalid, 4, 32 * 32 * 3)
+            .is_err());
+        assert!(h.validate_frame([2, 4, 4], pixels, 4, 32 * 32 * 3).is_err());
     }
     #[test]
     fn old_image_wire_versions_fail_before_frame_fields_are_read() {
-        for magic in [b"CAFDVI01",b"CAFDVI02",b"CAFDV401"] {
-            let listener=TcpListener::bind("127.0.0.1:0").unwrap();
-            let mut socket=TcpStream::connect(listener.local_addr().unwrap()).unwrap();
-            let (peer,_)=listener.accept().unwrap();socket.write_all(magic).unwrap();
-            let mut wire=Wire::new(peer,Duration::from_secs(1)).unwrap();
-            assert!(Handshake::read(&mut wire).unwrap_err().to_string().contains("wire version"));
+        for magic in [b"CAFDVI01", b"CAFDVI02", b"CAFDV401"] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let mut socket = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+            let (peer, _) = listener.accept().unwrap();
+            socket.write_all(magic).unwrap();
+            let mut wire = Wire::new(peer, Duration::from_secs(1)).unwrap();
+            assert!(Handshake::read(&mut wire)
+                .unwrap_err()
+                .to_string()
+                .contains("wire version"));
         }
     }
     #[test]
