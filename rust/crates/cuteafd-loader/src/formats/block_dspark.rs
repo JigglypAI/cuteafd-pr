@@ -152,6 +152,51 @@ impl BlockDsparkRuntimeLayout {
         Ok(Self { config, kv_cache, weight_requests, capacity, weights, buffers, host_landing:mul(&[rows,8])? })
     }
 
+    /// Rank-local body workspace sized from the source checkpoint. Each peer
+    /// retains full residual rows but only its own heads, neurons and KV planes.
+    pub fn for_rank(snapshot:&Path,slots:usize,sequences:usize,sms:usize,arena:&str,
+        kv_cache:crate::families::qwen4::Qwen4KvCache,rank:usize,ranks:usize)->anyhow::Result<Self> {
+        use anyhow::{ensure,Context};
+        ensure!(matches!(ranks,1|2) && rank<ranks,"invalid block draft rank");
+        let mut layout=Self::with_kv(snapshot,slots,sequences,sms,arena,kv_cache)?;
+        if ranks==1 { return Ok(layout); }
+        let source=layout.config.clone();
+        ensure!(source.heads%ranks==0 && source.kv_heads%ranks==0 && source.intermediate%ranks==0,
+            "block draft rank split cuts checkpoint dimensions");
+        layout.config.heads/=ranks; layout.config.kv_heads/=ranks; layout.config.intermediate/=ranks;
+        layout.weight_requests=block_dspark_rank_arena_requests(snapshot,rank,ranks)?;
+        layout.weights=crate::serving_capacity::WeightArenaLayout::new(arena,layout.weight_requests.clone())?;
+        let (h,q,kv,inter,rows)=(source.hidden,layout.config.heads*source.head_dim,
+            layout.config.kv_heads*source.head_dim,layout.config.intermediate,layout.capacity.block_rows);
+        let mul=|v:&[usize]|v.iter().try_fold(1usize,|n,x|n.checked_mul(*x)).context("block rank owner overflow");
+        let window=source.window.context("block rank window missing")?;
+        for (name,bytes) in &mut layout.buffers {
+            let resize=match name.as_str() {
+                n if n.ends_with(".k_ring") || n.ends_with(".v_ring")=>Some(mul(&[slots,window,
+                    kv_cache.plane_record_bytes(layout.config.kv_heads,source.head_dim)])?),
+                "context_kv"=>Some(mul(&[2048,2,kv,2])?),
+                "workspace.qkv"=>Some(mul(&[rows,q+2*kv,2])?),
+                "workspace.q"|"workspace.attn"=>Some(mul(&[rows,q,2])?),
+                "workspace.k"|"workspace.v"=>Some(mul(&[rows,kv,2])?),
+                "workspace.gate_up"=>Some(mul(&[rows,2,inter,2])?),
+                "workspace.act"=>Some(mul(&[rows,inter,2])?),
+                "workspace.attention"=>Some(usize::try_from(crate::serving_capacity::draft_attention_workspace_bytes(
+                    sequences as u64,layout.config.kv_heads as u64,
+                    (layout.config.heads/layout.config.kv_heads*source.block).div_ceil(32) as u64,
+                    (window+source.block) as u64,source.head_dim as u64,sms as u64)?)?),
+                _=>None,
+            };
+            if let Some(value)=resize { *bytes=value.max(256); }
+        }
+        if rank!=0 {
+            layout.buffers.retain(|(name,_)|!matches!(name.as_str(),"workspace.logits"|"workspace.tokens"
+                |"workspace.confidence"|"workspace.head"|"workspace.markov"));
+            layout.host_landing=0;
+        }
+        layout.buffers.push(("tp2.reduced".into(),mul(&[rows,h,2])?.max(256)));
+        Ok(layout)
+    }
+
     pub fn window_mark_bytes(&self) -> anyhow::Result<usize> {
         use anyhow::Context;
         let window = self.config.window.context("block runtime window missing")?;
@@ -788,6 +833,23 @@ mod tests {
         assert_eq!(total(&one)-total(&fp8),5*2*2048*(8*128*2-plane));
         assert_eq!(fp8.window_mark_bytes()?,(16usize+5*2*2048*plane).div_ceil(256)*256);
         assert_eq!(one.weights,fp8.weights);
+        let lead=BlockDsparkRuntimeLayout::for_rank(root.path(),1,1,188,"test/draft/1",
+            crate::families::qwen4::Qwen4KvCache::Bf16,0,2)?;
+        let peer=BlockDsparkRuntimeLayout::for_rank(root.path(),1,1,188,"test/draft/0",
+            crate::families::qwen4::Qwen4KvCache::Bf16,1,2)?;
+        assert_eq!((lead.config.heads,lead.config.kv_heads,lead.config.intermediate),(20,4,5120));
+        assert!(lead.weights.view("markov_head.markov_w1.weight").is_some());
+        assert!(peer.weights.view("markov_head.markov_w1.weight").is_none());
+        assert!(peer.buffers.iter().all(|(name,_)|!matches!(name.as_str(),"workspace.logits"|"workspace.markov")));
+        assert_eq!(lead.weights.view("fc.weight").unwrap().bytes(),one.weights.view("fc.weight").unwrap().bytes());
+        assert_eq!(peer.weights.view("fc.weight").unwrap().bytes(),one.weights.view("fc.weight").unwrap().bytes());
+        let qkv="layers.0.self_attn.q_proj.weight+layers.0.self_attn.k_proj.weight+layers.0.self_attn.v_proj.weight";
+        assert_eq!(lead.weights.view(qkv).unwrap().bytes()*2,one.weights.view(qkv).unwrap().bytes());
+        assert_eq!(peer.weights.view("layers.0.self_attn.o_proj.weight").unwrap().bytes()*2,
+            one.weights.view("layers.0.self_attn.o_proj.weight").unwrap().bytes());
+        for local in [&lead,&peer] {
+            assert!(local.buffers.contains(&("tp2.reduced".into(),local.capacity.block_rows*local.config.hidden*2)));
+        }
         assert!(one.demands(1).iter().all(|d| d.gpu == 1 && d.resident_weights.0 == 0));
         assert_eq!(one.buffers.iter().map(|(n,_)| n).collect::<std::collections::BTreeSet<_>>().len(),one.buffers.len());
         assert!(BlockDsparkRuntimeLayout::new(root.path(),1,2,188,"test/draft").is_err());
@@ -1118,6 +1180,79 @@ pub fn block_dspark_weight_recipe<T, M, E>(cfg: &BlockDsparkConfig,
         confidence_w: tensor("confidence_head.proj.weight", &[1, h + cfg.rank])?,
         confidence_b: tensor("confidence_head.proj.bias", &[1])?,
     })
+}
+
+/// Rank-local checkpoint recipe. FC/norms are replicated; Markov/confidence
+/// exist only on logical rank zero (the physical head owner).
+pub struct BlockDsparkRankWeights<T,M> {
+    pub layers: Vec<BlockDsparkLayer<T,M>>,
+    pub fc:M, pub hidden_norm:T, pub norm:T,
+    pub head:Option<(T,T,T,T)>,
+}
+
+pub fn block_dspark_rank_recipe<T,M>(cfg:&BlockDsparkConfig,rank:usize,ranks:usize,
+    mut tensor:impl FnMut(&str,&[usize])->anyhow::Result<T>,
+    mut matrix:impl FnMut(&[(&str,usize)],usize,Option<crate::families::glm5::draft_physical::ShardAxis>)->anyhow::Result<M>)
+    ->anyhow::Result<BlockDsparkRankWeights<T,M>> {
+    use crate::families::glm5::draft_physical::ShardAxis;
+    anyhow::ensure!(matches!(ranks,1|2) && rank<ranks && cfg.heads%ranks==0
+        && cfg.kv_heads%ranks==0 && cfg.intermediate%ranks==0 && cfg.dialect==DsparkDialect::Qwen3,
+        "block draft rank split cuts checkpoint geometry");
+    let (h,q,kv,inter)=(cfg.hidden,cfg.heads*cfg.head_dim,cfg.kv_heads*cfg.head_dim,cfg.intermediate);
+    let layers=(0..cfg.layers).map(|layer| {
+        let p=format!("layers.{layer}"); let a=format!("{p}.self_attn");
+        Ok(BlockDsparkLayer {
+            input_norm:tensor(&format!("{p}.input_layernorm.weight"),&[h])?,
+            post_norm:tensor(&format!("{p}.post_attention_layernorm.weight"),&[h])?,
+            qkv:matrix(&[(&format!("{a}.q_proj.weight"),q),(&format!("{a}.k_proj.weight"),kv),
+                (&format!("{a}.v_proj.weight"),kv)],h,Some(ShardAxis::Rows))?,
+            q_norm:tensor(&format!("{a}.q_norm.weight"),&[cfg.head_dim])?,
+            k_norm:tensor(&format!("{a}.k_norm.weight"),&[cfg.head_dim])?,
+            o:matrix(&[(&format!("{a}.o_proj.weight"),h)],q,Some(ShardAxis::Columns))?,
+            gate_up:matrix(&[(&format!("{p}.mlp.gate_proj.weight"),inter),(&format!("{p}.mlp.up_proj.weight"),inter)],
+                h,Some(ShardAxis::Rows))?,
+            down:matrix(&[(&format!("{p}.mlp.down_proj.weight"),h)],inter,Some(ShardAxis::Columns))?,
+        })
+    }).collect::<anyhow::Result<Vec<_>>>()?;
+    let head=if rank==0 { Some((tensor("markov_head.markov_w1.weight",&[cfg.vocab,cfg.rank])?,
+        tensor("markov_head.markov_w2.weight",&[cfg.vocab,cfg.rank])?,
+        tensor("confidence_head.proj.weight",&[1,h+cfg.rank])?,tensor("confidence_head.proj.bias",&[1])?)) } else { None };
+    Ok(BlockDsparkRankWeights { layers,head,fc:matrix(&[("fc.weight",h)],cfg.taps.len()*h,None)?,
+        hidden_norm:tensor("hidden_norm.weight",&[h])?,norm:tensor("norm.weight",&[h])? })
+}
+
+/// Header-validated final BF16 rank destinations; source tensors never convert.
+pub fn block_dspark_rank_arena_requests(snapshot:&Path,rank:usize,ranks:usize)
+    ->anyhow::Result<Vec<(String,usize)>> {
+    use anyhow::{ensure,Context};
+    use crate::families::glm5::draft_physical::ShardAxis;
+    let cfg=BlockDsparkConfig::read(snapshot)?;
+    let checkpoint=crate::plan::Checkpoint::open(snapshot)?;
+    let headers=checkpoint.tensors.iter().map(|t|(t.meta.name.as_str(),&t.meta)).collect::<std::collections::BTreeMap<_,_>>();
+    let validate=|name:&str,shape:&[usize]|->anyhow::Result<usize> {
+        let header=headers.get(name).with_context(||format!("block draft tensor missing: {name}"))?;
+        let bytes=shape.iter().try_fold(2usize,|n,&d|n.checked_mul(d)).context("block rank tensor overflow")?;
+        ensure!(header.dtype==cuteafd_core::DType::Bf16 && header.shape==shape && header.byte_length==bytes as u64,
+            "block draft source header differs for {name}");
+        Ok(bytes)
+    };
+    let requests=std::cell::RefCell::new(Vec::new());
+    block_dspark_rank_recipe(&cfg,rank,ranks,|name,shape| {
+        requests.borrow_mut().push((name.to_owned(),validate(name,shape)?.max(256))); Ok(())
+    },|parts,cols,axis| {
+        let mut bytes=0usize;
+        for &(name,rows) in parts {
+            let source=validate(name,&[rows,cols])?;
+            ensure!(axis!=Some(ShardAxis::Rows) || rows%ranks==0,"block draft split cuts rows");
+            ensure!(axis!=Some(ShardAxis::Columns) || cols%ranks==0,"block draft split cuts columns");
+            bytes=bytes.checked_add(if axis.is_some() { source/ranks } else { source }).context("block rank matrix overflow")?;
+        }
+        requests.borrow_mut().push((parts.iter().map(|(name,_)|*name).collect::<Vec<_>>().join("+"),bytes.max(256)));
+        Ok(())
+    })?;
+    if rank==0 { requests.borrow_mut().push(("markov_norms".into(),cfg.vocab*4)); }
+    if cfg.head_dim!=64 { requests.borrow_mut().push(("inv_freq".into(),std::mem::size_of_val(cfg.rope.plan(cfg.head_dim)?.inv_freq.as_slice()).max(256))); }
+    Ok(requests.into_inner())
 }
 
 /// Native mixed-format operands remain in their own checkpoint encoding.
