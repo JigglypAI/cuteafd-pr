@@ -128,6 +128,10 @@ pub(crate) struct Snapshot {
     /// fall, so a transient peak that reverses releases its credit.
     pub level: Option<u64>,
     pub pinned: u64,
+    /// Unevictable spanning graphs: measured growth shares, not a physical split.
+    pub spanning_bytes: u64,
+    pub spanning_nodes: u64,
+    pub spanning_execs: u64,
     pub pending_capture: u64,
     #[serde(serialize_with = "serialize_cycles")]
     pub cycles: HashMap<Cycle, Counters>,
@@ -276,7 +280,7 @@ struct Record {
 }
 
 #[derive(Default, Clone, Copy)]
-struct Inventory { nodes: u64, execs: u64, unknown: u64, resident: u64, pinned: u64 }
+struct Inventory { nodes: u64, execs: u64, unknown: u64, resident: u64, pinned: u64, spanning_bytes: u64, spanning_nodes: u64, spanning_execs: u64 }
 
 impl Record {
     fn used(&self) -> Option<u64> {
@@ -1214,6 +1218,9 @@ impl DeviceCache {
             self.inventory.unknown = self.inventory.unknown.saturating_sub(old.unknown);
             self.inventory.resident = self.inventory.resident.saturating_sub(old.resident);
             self.inventory.pinned = self.inventory.pinned.saturating_sub(old.pinned);
+            self.inventory.spanning_bytes = self.inventory.spanning_bytes.saturating_sub(old.spanning_bytes);
+            self.inventory.spanning_nodes = self.inventory.spanning_nodes.saturating_sub(old.spanning_nodes);
+            self.inventory.spanning_execs = self.inventory.spanning_execs.saturating_sub(old.spanning_execs);
             self.live_bytes = self.live_bytes.saturating_sub(record.bytes); self.identities.remove(&record.identity); self.identity_generation += 1; }
     }
 
@@ -1296,13 +1303,19 @@ impl DeviceCache {
         let next = if live { Inventory { nodes: record.stats.native_nodes.unwrap_or(0), execs: 1,
             unknown: u64::from(record.stats.native_nodes.is_none()),
             resident: if record.pending_capture { 0 } else { record.ordering_bytes() },
-            pinned: if record.pinned { record.bytes } else { 0 } } } else { Inventory::default() };
+            pinned: if record.pinned { record.bytes } else { 0 },
+            spanning_bytes: if record.spans_devices { record.bytes } else { 0 },
+            spanning_nodes: if record.spans_devices { record.stats.native_nodes.unwrap_or(0) } else { 0 },
+            spanning_execs: u64::from(record.spans_devices) } } else { Inventory::default() };
         let old = std::mem::replace(&mut record.accounted, next);
         self.inventory.nodes = self.inventory.nodes.saturating_sub(old.nodes).saturating_add(next.nodes);
         self.inventory.execs = self.inventory.execs.saturating_sub(old.execs).saturating_add(next.execs);
         self.inventory.unknown = self.inventory.unknown.saturating_sub(old.unknown).saturating_add(next.unknown);
         self.inventory.resident = self.inventory.resident.saturating_sub(old.resident).saturating_add(next.resident);
         self.inventory.pinned = self.inventory.pinned.saturating_sub(old.pinned).saturating_add(next.pinned);
+        self.inventory.spanning_bytes = self.inventory.spanning_bytes.saturating_sub(old.spanning_bytes).saturating_add(next.spanning_bytes);
+        self.inventory.spanning_nodes = self.inventory.spanning_nodes.saturating_sub(old.spanning_nodes).saturating_add(next.spanning_nodes);
+        self.inventory.spanning_execs = self.inventory.spanning_execs.saturating_sub(old.spanning_execs).saturating_add(next.spanning_execs);
     }
 
     fn native_pools(&self) -> NativePools {
@@ -1339,7 +1352,7 @@ impl DeviceCache {
             let mut next = self.queues[list.index()].first;
             while let Some(id) = next {
                 let record = &self.records[&id];
-                if !record.pending_capture && Some(id) != excluded {
+                if !record.pending_capture && !record.spans_devices && Some(id) != excluded {
                     if self.hot(record) {
                         self.counters.entry(record.cycle).or_default().hot_guard_skips += 1;
                         self.update_sites.entry(record.identity.site).or_default().entry(record.cycle).or_default().hot_guard_skips += 1;
@@ -2052,7 +2065,7 @@ impl DeviceCache {
         let native = self.native_pools();
         let selected = self.records.values().filter(|r| r.pending_destroy)
             .map(|r| r.stats.native_nodes.unwrap_or(0)).sum::<u64>();
-        let reclaimable = self.records.iter().filter(|(&id, r)| Some(id) != excluded && !r.pending_capture
+        let reclaimable = self.records.iter().filter(|(&id, r)| Some(id) != excluded && !r.pending_capture && !r.spans_devices
             && !self.hot(r) && matches!(r.list, Some(List::Recent | List::Frequent)))
             .map(|(_, r)| r.stats.native_nodes.unwrap_or(0)).sum::<u64>();
         let uncredited = self.epochs.uncredited_nodes;
@@ -2080,10 +2093,10 @@ impl DeviceCache {
             self.soft.margin = requested.min(maximum);
             self.soft.limit = self.reserve.saturating_sub(self.soft.margin);
             if self.charged < self.soft.limit || native.live_nodes == 0 || self.unmeasured { return }
-            let pinned_nodes = self.records.values().filter(|r| r.pinned)
+            let pinned_nodes = self.records.values().filter(|r| r.pinned || r.spans_devices)
                 .map(|r| r.stats.native_nodes.unwrap_or(0)).sum::<u64>();
             // A pinned-heavy startup sample cannot establish a usable ARC budget.
-            let typical = self.records.values().filter(|r| !r.pinned && !r.pending_capture
+            let typical = self.records.values().filter(|r| !r.pinned && !r.spans_devices && !r.pending_capture
                 && matches!(r.list, Some(List::Recent | List::Frequent)))
                 .filter_map(|r| r.stats.native_nodes).filter(|nodes| *nodes > 0).max().unwrap_or(1);
             if u128::from(pinned_nodes.saturating_add(typical)) * u128::from(self.charged)
@@ -2305,7 +2318,7 @@ impl DeviceCache {
         let records = self.records.values().map(RawRecord::copy).collect();
         TraceSnapshot { cache: Snapshot { device: self.device, reserve: self.reserve, physical_floor: self.physical_floor,
             reserve_policy: self.reserve_policy, charged: self.charged, live_bytes: self.live_bytes, resident_estimated_bytes: self.resident_bytes(), hard_stopped: self.charged >= self.reserve || self.measurement_failed || self.soft.limit == 0, native_pools: self.native_pools(), soft: self.soft, level: self.level,
-            pinned: self.inventory.pinned,
+            pinned: self.inventory.pinned, spanning_bytes: self.inventory.spanning_bytes, spanning_nodes: self.inventory.spanning_nodes, spanning_execs: self.inventory.spanning_execs,
             pending_capture: self.pending_bytes, cycles, pools: self.pools.clone(),
             basis: self.basis, sampled_at_ms: self.started.elapsed().as_millis() as u64,
             telemetry_bytes: self.records.len() * std::mem::size_of::<KeyStats>(),
@@ -2359,7 +2372,7 @@ impl DeviceCache {
         let now = self.started.elapsed().as_millis() as u64;
         Snapshot { device: self.device, reserve: self.reserve, physical_floor: self.physical_floor, reserve_policy: self.reserve_policy, charged: self.charged, live_bytes: self.live_bytes, resident_estimated_bytes: self.resident_bytes(), hard_stopped: self.charged >= self.reserve || self.measurement_failed || self.soft.limit == 0, native_pools: self.native_pools(), soft: self.soft,
             level: self.level,
-            pinned: self.inventory.pinned,
+            pinned: self.inventory.pinned, spanning_bytes: self.inventory.spanning_bytes, spanning_nodes: self.inventory.spanning_nodes, spanning_execs: self.inventory.spanning_execs,
             pending_capture: self.pending_bytes, cycles, pools: self.pools.clone(), basis: self.basis,
             sampled_at_ms: now, telemetry_bytes: self.records.len() * std::mem::size_of::<KeyStats>(), top_hits: self.ranked_hits.clone(), top_churn: self.ranked_churn.clone(), rankings_age_ms: self.ranked_at.elapsed().as_millis() as u64, epochs: self.epoch_snapshot(), per_cycle, update_sites }
     }
@@ -2564,6 +2577,30 @@ mod tests {
         cache.charged = if hard { 1000 } else { 10 };
         (cache, donor)
     }
+    #[test]
+    fn spanning_residents_are_unevictable_before_and_after_ready() {
+        let (mut cache, spanning) = aged_update_fixture(5, false);
+        cache.records.get_mut(&spanning).unwrap().spans_devices = true;
+        cache.captured_topology(spanning, 8, 1, true);
+        cache.soft.limit = 900;
+        let local = capture(&mut cache, 2, false);
+        cache.captured_topology(local, 8, 1, false);
+        cache.advance_for_update_fixture(0, 5);
+        assert_eq!(cache.mark_victim(false), Some(local));
+        assert!(cache.mark_victim(false).is_none(), "startup cannot select a future sealed victim");
+        seal_cross_device_capture_on_this_thread(true);
+        let victim = cache.mark_victim(false);
+        seal_cross_device_capture_on_this_thread(false);
+        assert!(victim.is_none());
+        assert!(cache.owns(spanning, 1));
+        let snapshot = cache.snapshot();
+        assert_eq!(snapshot.spanning_execs, 1);
+        assert_eq!(snapshot.spanning_nodes, 8);
+        assert_eq!(snapshot.spanning_bytes, 10);
+        cache.remove_drained(&[spanning]);
+        assert_eq!(cache.snapshot().spanning_execs, 0, "explicit drained teardown still releases ownership");
+    }
+
     #[test]
     fn donor_always_preserves_spanning_prewarm_set_at_ready() {
         let (mut cache, first) = aged_update_fixture(5, false);
