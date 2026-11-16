@@ -484,3 +484,11 @@ def test_mc_core_view_owns_glm_target_conversion_without_global_switch():
     assert "CUTEAFD_GLM_BF16" not in (ROOT / "scripts/lib/family-keys.sh").read_text()
     assert "CUTEAFD_GLM_BF16" not in (ROOT / "scripts/launch/run-family.sh").read_text()
     assert "`CORE_VIEW`" in text and "`fp8-compact`" in text
+
+
+def test_mc_fp8_lever_reports_measured_glm_and_step_quality_costs():
+    text = DOC.read_text()
+    assert "49.04/180.68/3392 to 53.52/191.81/3122" in text
+    assert "59.87/216.73/2740 to 68.98/266.95/2562" in text
+    assert "0.04530/0.03880" in text and "0.01597/0.01429" in text
+    assert "no paired non-inferiority claim" in text

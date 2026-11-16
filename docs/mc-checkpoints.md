@@ -48,9 +48,10 @@ Families declare executable roles, not conversion subsets. GLM Flash supports
 its MC core, including the vocabulary head, KDA q/k/v/o, MLA and dense/shared
 FFNs. Muse executes block FP8 q/k/v/o, selected attention gates, pre/post-expert
 projections and its padded vocabulary head. GLM and Step-5 native whole-core
-FP8 routes require the v52d coordinator exports; Step includes selected MTP
-non-routed core, while GLM native MTP remains unused. Their effect and Standard
-quality stay unmeasured until served qualification; the selector remains opt-in.
+FP8 routes require the v52e coordinator exports; Step includes selected MTP
+non-routed core, while GLM native MTP remains unused. Their max-card Standard generated quality and strict speculation losslessness
+are qualified; measured speed and quality costs are in docs/options.md and the
+family core-view sections. The selector remains opt-in.
 Kimi refuses unsupported selected roles. An owned
 unsupported tensor always refuses; unused external-drafter MTP is excluded
 by ownership, never partially converted. Already-FP8 sources refuse conversion.
@@ -154,9 +155,10 @@ Both replace their standalone original/K6 release rows while keeping historical
 reports. See [GLM 5.3](models/glm5.md#core-views) and
 [Step-5](models/step5.md#core-views) for launch overrides and pending Standard
 fidelity. Whole-core `fp8-compact` is an explicit opt-in for both with the
-v52d coordinator exports and qualified runtime routes; the selected original
+v52e coordinator exports and qualified runtime routes; the selected original
 core alone determines conversion. Unselected native roles and routed experts
-are unchanged; quality/performance remain unmeasured until qualification.
+are unchanged; max-card measured effects and quality costs are documented in
+the family core-view sections. Original remains the default.
 The main smoke entries use `original`; max K8/K6 comparisons live separately in
 `scripts/bench/release-smoke-v51-mc-core-comparison.json` and do not add
 release-table rows. Card measurements wait for kernel pin #1903.

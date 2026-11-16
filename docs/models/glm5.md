@@ -56,9 +56,31 @@ attention, dense/shared FFN and vocabulary-head matrices use native block FP8
 per projection: unselected group members, KvB and indexer tensors stay BF16.
 The native MTP layer remains unused. The head uses the shared Muse/GLM/Step
 executor with independent target/drafter scratch, not a BF16 shadow.
-Effect and quality are unmeasured until the max-card C1/C16/8K and Standard
-qualification completes; `original` remains the default. Requires the v52d
-coordinator projection exports.
+Requires the v52e coordinator projection exports. Max-card qualification on
+2026-11-16 passes Standard generated-row quality and strict DFlash2 losslessness
+(10/10 cases, token IDs and row hashes exact). `original` remains the default.
+
+One warmed launch per view on 2 RTX PRO 6000 + 6 Sparks, 425 W/card,
+checkpoint `2e42b53e61f0f59f664c915fe2424ce9c9fa5f8e`, engine `a0751bf38`:
+
+| Metric | Original | FP8 compact |
+| --- | ---: | ---: |
+| C1 emitted tok/s | 49.04 | 53.52 |
+| C16 emitted tok/s | 180.68 | 191.81 |
+| 8K prefill tok/s | 3392 | 3122 |
+| KV pool tokens | 2097152 | 2097152 |
+| Onboarded RTX expert layers | 5 | 8 |
+| Generated decode KL / top-1 | 0.03686 / 94.544% | 0.04530 / 94.091% |
+| Generated prefill KL / top-1 | 0.03100 / 95.177% | 0.03880 / 94.775% |
+
+All 106 input-determined prompt hashes match. Decode windows have zero power-cap
+or thermal slowdown; busy GPU1 C16 clocks are 2851/2833 MHz. Prefill incurs
+about 1 power-cap GPU-second on original versus 2-3 on FP8, no thermal
+slowdown, maximum 75 C and minimum T.Limit headroom 23 C across points.
+Corrected CUDA peaks (observer context removed) are GPU0 99.60 to 99.38 GB,
+GPU1 98.10 to 98.96 GB: extra onboarding consumes weight savings. Absolute
+family quality bars pass, but the added KL is not a paired non-inferiority
+claim. Evidence is retained in PR #2214 and task `v5x-mc-fp8-glm-scratch-fixed`.
 
 Standard fidelity (2026-11-13) uses the published 32 decode + 32 prefill
 windows rooted at `zai-org/GLM-5.3-BF16`, on the min card. Both paths use
