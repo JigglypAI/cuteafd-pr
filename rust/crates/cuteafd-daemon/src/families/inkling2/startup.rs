@@ -169,9 +169,11 @@ pub(crate) fn whole<'a>(library: &'a Arc<NativeLibrary>, programs: &'a Programs<
     let phase = crate::shared::memory::load_timing::Split::start();
     let prepared = prepare(library, programs, checkpoint, cfg, Options { ..options })?;
     phase.log("inkling2 code and admission");
+    cuteafd_bench::context::phase("Inkling code and admission");
     let phase = crate::shared::memory::load_timing::Split::start();
     let (target, pushed) = deliver(library, view, checkpoint, &prepared, &options)?;
     phase.log("inkling2 grouped weight delivery");
+    cuteafd_bench::context::phase("Inkling grouped weight delivery");
     let phase = crate::shared::memory::load_timing::Split::start();
     let Prepared { kernels, encoding, inputs, admitted, module_pins, exl3_modules, .. } = prepared;
     let device = Device { library, id: options.device };
@@ -213,6 +215,7 @@ pub(crate) fn whole<'a>(library: &'a Arc<NativeLibrary>, programs: &'a Programs<
     // Runtime backends now retain the same code sampled before weights.
     drop(module_pins); drop(exl3_modules);
     phase.log("inkling2 request owners and transport bootstrap");
+    cuteafd_bench::context::phase("Inkling request owners and transport bootstrap");
     Ok((execution, inputs, admitted, encoding))
 }
 

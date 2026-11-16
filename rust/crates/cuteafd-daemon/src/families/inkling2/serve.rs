@@ -136,7 +136,9 @@ mod tests {
             "--listen", "0.0.0.0:8823", "--max-sequences", "16", "--max-context-tokens", "auto",
             "--max-output-tokens", "131072", "--embedding-placement", "gpu", "--core-view", "original",
             "--prefix-cache-entries", "20", "--host-cache-bytes", "auto", "--rtx-expert-layers", "auto",
-            "--prefill-rows", "2752", "--prefill-waves", "3"];
+            "--prefill-rows", "2752", "--prefill-waves", "3",
+            "--api-key-file", "/run/cuteafd-api-key", "--enable-bench", "--usage", "on", "--gateway", "on",
+            "--console-secret-file", "/run/cuteafd-console-secret", "--usage-dir", "/run/cuteafd/usage"];
         let crate::cli::Commands::ServeInkling2(mut args) = crate::cli::Cli::try_parse_from(argv)?.command
             else { anyhow::bail!("Inkling command not parsed") };
         assert_eq!((args.max_context, args.max_sequences, args.peers.len()), (Some(0), 16, 6));

@@ -163,8 +163,13 @@ impl<'a> Backend<'a> for InklingBackend<'a> {
             let retained: std::rc::Rc<dyn crate::shared::prefix::cuda_copy::SnapshotOwner + 'a> = bank.clone();
             CudaCopyEngine::registered_retained(self.library, vec![], vec![retained]).map(|engine| (config, engine))
         }).transpose()?;
-        let cache = PrefixCache::new(self.family.layout(), PrefixConfig { entries: args.prefix_cache_entries,
+        let host_bytes = host.as_ref().map_or(0, |(config, _)| config.bytes);
+        let layout = self.family.layout();
+        let cache = PrefixCache::new(layout, PrefixConfig { entries: args.prefix_cache_entries,
             mark_slots: bank.mark_slots(), keep_logits: true, min_tokens: args.prefix_cache_min_tokens }, host)?;
+        cuteafd_bench::context::set_kv((layout.pages * layout.page_rows) as u64,
+            Some((layout.pages * layout.page_rows) as u64), layout.pages as u64,
+            self.family.record_format(), host_bytes);
         Ok((self.family.clone(), cache))
     }
     fn prepare(&self, job: NativeRequest, tokens: Vec<u32>) -> Result<(scheduler::Prompt, RequestMedia, Vec<EncodeJob>)> {
