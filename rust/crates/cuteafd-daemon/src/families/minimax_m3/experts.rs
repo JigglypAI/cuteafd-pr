@@ -490,6 +490,37 @@ mod tests {
         RoutedRows::new(allocation(6144 * 2)?, allocation(16)?, allocation(16)?, allocation(6144 * 2)?,
             Rc::new(Stream::new(device)?), Rc::new(Boundary::new(device)?), 1)
     }
+    #[test]
+    fn heads_decode_carries_admitted_wire_scratch_only_for_nvfp4() -> Result<()> {
+        let fixture = Fixture::build_for_tests()?;
+        let library = fixture.load()?;
+        let device = Device { library: &library, id: 0 };
+        let dir = tempfile::tempdir_in(fixture.directory())?;
+        let (_, cfg) = super::super::owners::tests::snapshot(dir.path())?;
+        let layout = cuteafd_loader::families::minimax_m3::execution::HeadsLayout::new(&cfg, 0, 1)?;
+        let gate_bytes = layout.buffers().into_iter().find(|(name, _)| *name == "gate")
+            .context("Heads gate scratch missing")?.1;
+        let scratch = Rc::new(Allocation::new(device, usize::try_from(gate_bytes)?,
+            Tag::workspace("minimax/test/heads-wire"))?);
+        for nvfp4 in [false, true] {
+            let rows = rows(device)?;
+            let rows = if nvfp4 { rows.with_wire(Rc::clone(&scratch))? } else { rows };
+            assert_eq!(rows.wire.is_some(), nvfp4);
+            let row_bytes = if nvfp4 { NVFP4_ROW_BYTES } else { 6144 * 2 };
+            let sources = rows.sources(RouteStaging::new(1, 4, row_bytes)?);
+            assert_eq!(sources[2].bytes, row_bytes);
+            assert_eq!(sources[2].ptr, if nvfp4 { scratch.buffer.ptr } else { rows.activation.buffer.ptr });
+        }
+        // Pin the real Heads call to the dispatcher policy rather than a
+        // wire-less convenience constructor, which would fail before staging.
+        let source = include_str!("engine.rs");
+        let heads = source.split_once("    fn decode_heads(").unwrap().1
+            .split_once("    fn decode_split(").unwrap().0;
+        assert!(heads.contains("routed_rows_for(rows, self.nvfp4_wire())?"));
+        assert!(!heads.contains(".routed_rows("));
+        Ok(())
+    }
+
     fn identities(id: u64) -> DispatchRows {
         DispatchRows { request_id: id, placement_version: 23,
             rows: vec![ExpertProtocolV2RowDescriptor { row_id: id + 100,
