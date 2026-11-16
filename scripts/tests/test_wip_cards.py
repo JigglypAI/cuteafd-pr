@@ -1382,6 +1382,23 @@ def test_census_marker_uses_server_clock_and_is_idempotent(tmp_path, monkeypatch
         cards.merge_census_marker(job)
 
 
+def test_census_marker_accepts_teardown_anchor_after_final_sample(tmp_path):
+    # A teardown thermal query logged after the final census sample is still a
+    # valid clock anchor; only a sample older than every anchor is rejected.
+    job = {'state': str(tmp_path), 'entry': {'name': 'test'}}
+    log = tmp_path / 'smoke/logs/test.coordinator.log'
+    log.parent.mkdir(parents=True)
+    (tmp_path / 'census-final-thermal.json').write_text(json.dumps({'now_s': 32.0}))
+    log.write_text('2026-11-04T12:00:01.000000Z INFO cuteafd::thermal: current={"queried_s":1.0}\n'
+                   '2026-11-04T12:00:33.625000Z INFO cuteafd::thermal: current={"queried_s":33.625}\n')
+    cards.merge_census_marker(job)
+    assert '2026-11-04T12:00:32.000000Z INFO cuteafd::bench_census:' in log.read_text()
+    (tmp_path / 'census-final-thermal.json').write_text(json.dumps({'now_s': 0.5}))
+    log.write_text('2026-11-04T12:00:01.000000Z INFO cuteafd::thermal: current={"queried_s":1.0}\n')
+    with pytest.raises(ValueError, match='precedes every daemon thermal anchor'):
+        cards.merge_census_marker(job)
+
+
 @pytest.mark.parametrize('now', [True, -1, float('nan'), float('inf'), '32'])
 def test_census_final_sample_rejects_invalid_clock(tmp_path, monkeypatch, now):
     monkeypatch.setenv('CUTEAFD_SMOKE_URL', 'http://localhost:8500')
