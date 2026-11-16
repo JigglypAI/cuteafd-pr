@@ -730,11 +730,15 @@ fn glm_flash_vision_view(args: &PlanArgs, family: &str,
 fn launch_config(path: Option<&std::path::Path>) -> Result<std::collections::BTreeMap<String, String>> {
     let Some(path) = path else { return Ok(Default::default()) };
     let text = std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-    Ok(text.lines().filter_map(|line| {
+    let configured: std::collections::BTreeMap<String, String> = text.lines().filter_map(|line| {
         let (key, value) = line.split_once('=')?;
         (!key.is_empty() && key.bytes().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == b'_'))
             .then(|| (key.to_owned(), value.to_owned()))
-    }).collect())
+    }).collect();
+    for key in ["DFLASH", "MTP"] {
+        anyhow::ensure!(!configured.contains_key(key), "unknown configuration key: {key}");
+    }
+    Ok(configured)
 }
 
 fn spark_hosts_count(cfg: &std::collections::BTreeMap<String, String>) -> Result<Option<usize>> {
@@ -778,10 +782,8 @@ fn resolve_speculator(args: &mut PlanArgs, snapshot: &std::path::Path, family: &
     }
     if args.speculator == "auto" {
         args.speculator = cfg.get("SPECULATOR").cloned().unwrap_or_else(|| {
-            if cfg.get("DFLASH").is_some_and(|v| v == "on") || cfg.get("DRAFT_MODEL_ID").is_some_and(|v| !v.is_empty()) { "dflash2".into() }
-            else if let Some(depth) = cfg.get("MTP") { if depth == "0" { "off" } else { "mtp" }.into() }
+            if cfg.get("DRAFT_MODEL_ID").is_some_and(|v| !v.is_empty()) { "dflash2".into() }
             else if let Some(mode) = cfg.get("DSPARK") { if mode == "on" { "dspark" } else { "off" }.into() }
-            else if family == "mimo_v2" && cfg.get("DFLASH").is_some_and(|v| v == "off") { "off".into() }
             else if family == "qwen4" { "auto".into() }
             else { default.into() }
         });
@@ -1928,10 +1930,10 @@ mod tests {
         input.no_speculator = true;
         assert!(file_args(input, target.path()).is_err());
         std::fs::create_dir(target.path().join("dflash")).unwrap();
-        let legacy = target.path().join("legacy.config");
-        std::fs::write(&legacy, "DFLASH=off\n").unwrap();
+        let explicit_off = target.path().join("explicit-off.config");
+        std::fs::write(&explicit_off, "SPECULATOR=off\n").unwrap();
         let mut input = args(target.path(), 4, false);
-        input.config = Some(legacy);
+        input.config = Some(explicit_off);
         assert_eq!(file_args(input, target.path()).unwrap().speculator, "off");
     }
 

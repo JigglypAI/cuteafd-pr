@@ -30,6 +30,24 @@ fn plan_accepts_the_global_memory_policy_and_refuses_removed_budget_flags() {
 }
 
 #[test]
+fn removed_speculator_config_keys_match_launcher_refusal() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
+    for key in ["DFLASH", "MTP"] {
+        let config = temporary.path().join("launch.config");
+        std::fs::write(&config, format!("MODEL_ID=test/model\n{key}=on\n")).unwrap();
+        let plan = test_command(env!("CARGO_BIN_EXE_cuteafd"))
+            .args(["plan", "/not-read", "--config"]).arg(&config).output().unwrap();
+        let launch = test_command("bash").arg(root.join("run.sh")).arg("--config").arg(&config).output().unwrap();
+        for output in [plan, launch] {
+            assert!(!output.status.success());
+            assert!(String::from_utf8_lossy(&output.stderr).contains(&format!("unknown configuration key: {key}")),
+                "{}", String::from_utf8_lossy(&output.stderr));
+        }
+    }
+}
+
+#[test]
 fn settings_only_needs_config_not_checkpoint_inventory() {
     let snapshot = tempfile::tempdir().unwrap();
     std::fs::write(snapshot.path().join("config.json"), r#"{"model_type":"glm5_next"}"#).unwrap();

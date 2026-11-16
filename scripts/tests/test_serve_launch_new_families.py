@@ -207,7 +207,8 @@ def test_kimi_dflash2_uses_one_resolved_fp8_snapshot_for_plan_and_serve(tmp_path
     if enabled:
         snapshot = str(tmp_path / f"hf/hub/models--{model.replace('/', '--')}/snapshots/{revision}")
         assert _flag(serve, "--draft") == _flag(plan, "--drafter-snapshot") == snapshot
-        assert _flag(serve, "--draft-fp8") == _flag(plan, "--draft-fp8") == "true"
+        assert _flag(serve, "--draft-fp8") == "true"
+        assert "--draft-fp8" not in plan.split(), "Rust resolves Kimi FP8 from DFlash selection"
         assert _flag(serve, "--draft-length") == "7"
     else:
         assert all(flag not in serve.split() for flag in ("--draft", "--draft-fp8", "--draft-length"))
@@ -617,10 +618,10 @@ def test_qualifying_family_capacity_uses_cuda_total(tmp_path, family):
               else _step5(tmp_path, "SPARK_COUNT=6\nRTX_GPUS=2\n" + _hosts(6), **kwargs))
     plan = _line(result, "cuteafd plan")
     assert int(_flag(plan, "--gpu-memory-cap")) == total
-    assert float(_flag(plan, "--coordinator-weight-budget-gib")) == total / 2**30
+    assert "--coordinator-weight-budget-gib" not in plan.split()
     # Serve admits resident weights against the budget the plan was made with.
     serve = _line(result, "serve-kimi --snapshot" if family == "kimi" else "serve-step5 --snapshot")
-    assert _flag(serve, "--coordinator-weight-budget-gib") == _flag(plan, "--coordinator-weight-budget-gib")
+    assert float(_flag(serve, "--coordinator-weight-budget-gib")) == total / 2**30
 
 
 @pytest.mark.parametrize("ranks", (6, 7, 8))

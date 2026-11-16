@@ -1386,7 +1386,9 @@ def capture_resolver_config_parity(snapshot: Path, example: Path, binary: Path,
         extra_args=("--wip", "real-planner-test"), extra_env={
             "STUB_REAL_PLANNER": str(binary), "STUB_REAL_SNAPSHOT": str(snapshot),
             "STUB_REAL_PROGRAMS": str(programs), "STUB_REAL_HF_HOME": str(hf_home),
-            "STUB_REAL_PLAN_OUTPUT": str(output), "CUTEAFD_CDI_CHECK": "off"})
+            "STUB_REAL_PLAN_OUTPUT": str(output), "CUTEAFD_CDI_CHECK": "off",
+            "STUB_SPARK_ROLES": f"tp{config['SPARK_COUNT']}",
+            "STUB_SERVED_MODEL_ID": "test/resolver-parity"})
     assert result.returncode == 0, result.stderr
     launched = _read_real_deployment(output)
     plans = [shlex.split(line) for line in result.stderr.splitlines()
@@ -1401,11 +1403,13 @@ def capture_resolver_config_parity(snapshot: Path, example: Path, binary: Path,
     planned = json.loads(direct.stdout)
     for key in launched["resolved_settings"]:
         assert launched["resolved_settings"][key]["value"] == planned["resolved_settings"][key]["value"], (example.name, key, launched["resolved_settings"], planned["resolved_settings"])
-    for field in ("fits", "onboard_layers"):
-        assert launched["report"][field] == planned["report"][field], (example.name, field, launched["report"][field], planned["report"][field])
+    assert launched["report"]["fits"] == planned["report"]["fits"], example.name
+    def onboard(value):
+        return value.get("estimated_placement", {}).get("onboard_layers", value["report"].get("onboard_layers"))
+    assert onboard(launched) == onboard(planned), (example.name, onboard(launched), onboard(planned))
     assert launched["memory_layout"]["pool_tokens"] == planned["memory_layout"]["pool_tokens"], (example.name, launched["memory_layout"]["pool_tokens"], planned["memory_layout"]["pool_tokens"])
     if example.name == "glm53-flash-exlr8-k4-min.config":
-        assert planned["report"]["onboard_layers"] == 18, planned
+        assert onboard(planned) == 18, planned
         assert planned["memory_layout"]["pool_tokens"] == 2_097_152, planned
         assert planned["resolved_settings"]["index_cache"]["value"] == "compact"
 
