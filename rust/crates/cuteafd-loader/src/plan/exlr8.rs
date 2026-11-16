@@ -219,7 +219,7 @@ pub(super) fn native_plan_of(input: &super::PlanInput, selected: &str,
     let first_spark = first_moe_layer + placement.onboard_layers;
     let selected_world = if first_spark == layers { 0 } else { world };
     let residents = spark_resident_bytes_of(&metadata, &(first_spark..layers).collect::<Vec<_>>(), selected_world)?;
-    ensure!(residents.iter().all(|&bytes| bytes <= options.spark_budget()),
+    ensure!(residents.iter().enumerate().all(|(rank, &bytes)| bytes <= layout.spark_capacity(rank)),
         "EXLR8 selected Spark suffix exceeds Spark budget before live workspace admission");
     let mut local_routed = 0u64;
     for layer in first_moe_layer..first_spark {
@@ -356,7 +356,7 @@ fn append_spark_devices(memory: &mut cuteafd_core::memory_layout::MemoryLayout,
     for (rank, &bytes) in residents.iter().enumerate() {
         if !memory.devices.iter().any(|device| device.kind == DeviceKind::Spark && device.index as usize == rank) {
             memory.devices.push(DeviceLayout { kind: DeviceKind::Spark, index: rank as u32,
-                capacity_bytes: layout.spark_bytes, worker_budget_bytes: layout.spark_allocation_budget_bytes.unwrap_or(layout.spark_bytes),
+                capacity_bytes: layout.spark_capacity(rank), worker_budget_bytes: layout.spark_capacity(rank),
                 items: Vec::new(), kv_tokens: 0 });
         }
         let device = memory.devices.iter_mut().find(|device|
@@ -1244,7 +1244,7 @@ pub fn inspect(
     selected: &str,
     sparks: usize,
     rtx: usize,
-    spark_budget: u64,
+    spark_budgets: &[u64],
     coordinator_budget: u64,
 ) -> Result<Exlr8Plan> {
     ensure!(
@@ -1319,7 +1319,7 @@ pub fn inspect(
                     coordinator_bytes,
                     coordinator_per_gpu_upper_bound: per_gpu,
                     weights_fit: per_gpu <= coordinator_budget
-                        && rank_bytes.iter().all(|b| *b <= spark_budget),
+                        && rank_bytes.iter().enumerate().all(|(rank, bytes)| spark_budgets.get(rank).is_some_and(|cap| *bytes <= *cap)),
                 });
             }
         }
@@ -1463,8 +1463,8 @@ mod tests {
         let runtime = 512 << 20;
         let experts = 105_213_559_040;
         let mut memory = MemoryLayout { devices: vec![DeviceLayout {
-            kind: DeviceKind::Spark, index: 0, capacity_bytes: layout.spark_bytes,
-            worker_budget_bytes: layout.spark_bytes, kv_tokens: 0,
+            kind: DeviceKind::Spark, index: 0, capacity_bytes: layout.spark_capacity(0),
+            worker_budget_bytes: layout.spark_capacity(0), kv_tokens: 0,
             items: vec![Item::new(Category::Runtime, "context+modules", "tower only", runtime, Basis::Calibrated),
                 Item::new(Category::Weights, "vision weights", "bundled encoder", encoder.weights, Basis::Exact),
                 Item::new(Category::Workspace, "vision scratch", "bundled encoder", encoder.scratch, Basis::Formula)],
@@ -1474,7 +1474,7 @@ mod tests {
         assert_eq!(memory.devices.len(), 1);
         let device = &memory.devices[0];
         assert_eq!((device.kind, device.index), (DeviceKind::Spark, 0));
-        assert_eq!(device.worker_budget_bytes, layout.spark_bytes);
+        assert_eq!(device.worker_budget_bytes, layout.spark_capacity(0));
         assert_eq!(device.items.len(), 6);
         assert_eq!(device.items.iter().filter(|item| item.category == Category::Experts)
             .map(|item| item.bytes).sum::<u64>(), experts);
@@ -1817,7 +1817,7 @@ mod mounted_tests {
         let snapshot = std::env::var_os("CUTEAFD_EXLR8_TEST_SNAPSHOT").expect("set CUTEAFD_EXLR8_TEST_SNAPSHOT for this installed test");
         let root = std::path::Path::new(&snapshot);
         assert!(super::recognizes(root).unwrap());
-        let report = super::inspect(root, "bit325", 6, 2, 100 << 30, 80 << 30).unwrap();
+        let report = super::inspect(root, "bit325", 6, 2, &[100 << 30; 6], 80 << 30).unwrap();
         assert!(!report.supported);
         assert!(report.selected_weights_fit);
         assert_eq!(report.fit.len(), report.manifests.len() * 18);

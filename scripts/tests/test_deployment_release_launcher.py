@@ -292,6 +292,12 @@ def test_deployment_preserves_release_container_commands(
         if entry["family"] == "deepseek_v41" and fingerprint in before["env"]:
             assert after["env"][fingerprint] != before["env"][fingerprint], (entry["name"], old["host"])
             before["env"][fingerprint] = after["env"][fingerprint]
+        if "--spark-memory-samples" in after["command"]:
+            position = after["command"].index("--spark-memory-samples")
+            samples = json.loads(after["command"][position + 1])
+            assert samples and all(sample["bytes"] == 124211863552 and sample["boot_id"] == "fixture"
+                                   for sample in samples)
+            del after["command"][position:position + 2]
         assert after == before, (entry["name"], old["host"])
     assert all("--deployment" in plan for plan in current["plans"])
 

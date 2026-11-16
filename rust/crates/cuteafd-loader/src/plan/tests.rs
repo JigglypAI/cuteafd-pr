@@ -3596,17 +3596,15 @@ fn invalid_budgets_are_typed_option_errors() {
 
 #[test]
 fn explicit_spark_ceiling_updates_all_layout_budgets_without_changing_defaults() {
-    assert_eq!(DEFAULT_SPARK_BUDGET_BYTES, 100 << 30);
-    assert_eq!(super::families::kimi::SPARK_BUDGET_BYTES, 108 << 30);
     let mut options = PlanOptions { layout: Some(layout::LayoutOptions { host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram), ..Default::default() }), ..Default::default() };
     options.apply_spark_budget();
     assert_eq!(options.spark_budget_bytes, None);
-    assert_eq!(options.layout.as_ref().unwrap().spark_bytes, 108 << 30);
+    assert_eq!(options.layout.as_ref().unwrap().spark_capacities(6), crate::serving_capacity::spark_memory::serving_bytes());
     assert_eq!(options.layout.as_ref().unwrap().spark_allocation_budget_bytes, None);
     for budget in [82 << 30, 112 << 30] {
         options.spark_budget_bytes = Some(budget);
         options.apply_spark_budget();
-        assert_eq!(options.spark_budget(), budget);
+        assert_eq!(options.spark_capacities(1), vec![budget]);
         assert_eq!(options.layout.as_ref().unwrap().spark_bytes, budget);
         assert_eq!(options.layout.as_ref().unwrap().spark_allocation_budget_bytes, Some(budget));
     }
@@ -3937,7 +3935,7 @@ fn glm5_flash_selected_working_set_drives_plan_request_and_runtime_buffers() {
             experts: glmf::expert_costs(&catalog, true).unwrap(),
             expert_workspace: 0, tp2_workspace: [glmf::expert_workspace(&catalog, Some(&path), 4096, 2).unwrap(); 2],
             drafter_bytes: 0, drafter_weights: placement::ResidentWeights::default(), drafter_scratch: vec![0; 2], drafter_requests: None, drafter_bridge: None, requested_pool: Some(2 << 20), onboard, };
-        let mut process = glmf::admission::ProcessOwners::new((512 << 30, 512 << 30), 8 << 30);
+        let mut process = glmf::admission::ProcessOwners::new((512 << 30, 512 << 30), 8 << 30).with_spark_capacities(crate::serving_capacity::spark_memory::serving_bytes());
         process.target(&checkpoint, &input, None).unwrap();
         process.serving(&input, 0, 0, 0, 0).unwrap();
         process.spark_link(&input, checkpoint.spark_input_is_bf16()).unwrap();

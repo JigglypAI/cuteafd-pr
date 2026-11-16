@@ -7,7 +7,6 @@ use crate::serving_capacity::qwen_graphs::QwenAdmissionInputs;
 
 /// Spark ranks at 4096 capacity rows: the observed host footprint and the
 /// non-I/O wave residual (P11 replaces both with the worker's measurement).
-const SPARK_HOST_BYTES: u64 = 13 * GIB;
 
 /// Qwen plan adapter: a dual 0-Spark layout runs whole-layer TP2 owners
 /// (`dual_layout`); every other layout serves on rtx0 (`single_layout`).
@@ -110,8 +109,7 @@ fn single_layout(report: &mut PlanReport, model: &dyn super::super::FamilyModel,
     let mut working = crate::placement::SparkWorkingSet { rtx_layers: Vec::new(),
         spark_layers: if spark_ranks > 0 { (0..model.spec().layers.len()).collect() } else { Vec::new() },
         spark_ranks, prefill_lanes: 1 };
-    let charges = SparkCharges { host_bytes: Some(SPARK_HOST_BYTES),
-        wave_bytes: crate::placement::families::qwen4::SPARK_WORKSPACE_BYTES, basis };
+    let charges = SparkCharges { wave_bytes: crate::placement::families::qwen4::SPARK_WORKSPACE_BYTES, basis };
     let endpoints = spark_endpoints("qwen4", 1);
     let mut sparks = if local {
         let mut devices = Vec::new();
@@ -559,8 +557,7 @@ fn dual_layout(report: &mut PlanReport, _model: &dyn super::super::FamilyModel,
         if !spark_layers.is_empty() {
             let working = crate::placement::SparkWorkingSet { rtx_layers, spark_layers,
                 spark_ranks: report.placement.spark_ranks(), prefill_lanes: 1 };
-            let charges = SparkCharges { host_bytes: Some(SPARK_HOST_BYTES),
-                wave_bytes: qwen4::SPARK_WORKSPACE_BYTES, basis: Basis::Formula };
+            let charges = SparkCharges { wave_bytes: qwen4::SPARK_WORKSPACE_BYTES, basis: Basis::Formula };
             sparks = spark_devices(report, _model, input, options, charges, &working,
                 spark_endpoints("qwen4", 1), &mut Vec::new(), &mut notes);
             charge_spark_devices(report, _model, input, options, charges, &working,

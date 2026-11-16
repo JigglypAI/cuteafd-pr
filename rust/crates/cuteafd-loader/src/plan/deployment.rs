@@ -219,7 +219,7 @@ mod tests {
         let report = plan_spark_count(dir.path(), &PlanOptions {
             placement: ExpertPlacement::from_spark_ranks(ranks),
             vision: crate::plan::MediaMode::Off, audio: crate::plan::MediaMode::Off,
-            layout: Some(LayoutOptions { host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram), rtx_bytes: vec![crate::placement::inventory::PRO_TOTAL_BYTES; gpus],
+            layout: Some(LayoutOptions { spark_rank_bytes: crate::serving_capacity::spark_memory::serving_bytes().into_iter().chain([crate::serving_capacity::spark_memory::measured_bytes("ostrich").unwrap(); 2]).collect(), host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram), rtx_bytes: vec![crate::placement::inventory::PRO_TOTAL_BYTES; gpus],
                 workspace_manifest: Some(manifest), pool_tokens: Some(0), tp2_dspark_experts,
                 prefill_rows: 256, context_tokens: 262_144, ..Default::default() }),
             ..Default::default()
@@ -282,8 +282,8 @@ mod tests {
             assert_eq!(deployment.roles.len(), ranks);
             for device in deployment.memory_layout.devices.iter()
                 .filter(|device| device.kind == cuteafd_core::memory_layout::DeviceKind::Spark) {
-                assert_eq!(device.worker_budget_bytes, 108 << 30);
-                assert_eq!(device.capacity_bytes, 121 << 30);
+                assert_eq!(device.worker_budget_bytes, crate::serving_capacity::spark_memory::serving_bytes()[device.index as usize]);
+                assert_eq!(device.capacity_bytes, device.worker_budget_bytes);
             }
             assert_eq!(deployment.topology, Topology { tp: ranks });
             assert_eq!(deployment.artifact_requirements.spark_tp_role.as_deref(),
@@ -529,16 +529,21 @@ mod tests {
     /// V4.1 plans and deploys on the canonical wire at every world its MXFP4
     /// package range names (2..=8, 7 and 8 CPU-gated only) from its planner
     /// minimum up, and refuses below it. The full checkpoint's routed experts
-    /// need three Sparks, so two is refused on fit, not on wire. TP4 keeps the
+    /// now fit two measured-capacity Sparks. TP4 keeps the
     /// legacy shard; every other world names its native Spark TP role.
     #[test]
     fn v41_plans_and_deploys_every_registry_world_on_the_canonical_wire() {
         let worlds = cuteafd_core::tp_units::spark_package_worlds("v41", "mxfp4");
         assert_eq!(worlds, [2, 3, 4, 5, 6, 7, 8]);
         let (_dir, below) = fixture(2, 2);
-        assert!(!below.executable());
-        assert!(below.hints.iter().any(|hint| hint.what.contains("Spark count 2 refused")
-            || hint.how.contains("Spark count 2 refused")), "{:?}", below.hints);
+        assert!(below.executable(), "{}", crate::plan::render(&below));
+        let devices = below.memory_layout.as_ref().unwrap().devices.iter()
+            .filter(|device| device.kind == cuteafd_core::memory_layout::DeviceKind::Spark).collect::<Vec<_>>();
+        assert_eq!(devices.len(), 2);
+        for device in devices {
+            assert_eq!(device.capacity_bytes, crate::serving_capacity::spark_memory::serving_bytes()[device.index as usize]);
+            assert!(device.used_bytes() <= device.capacity_bytes, "{} full ledger exceeds capacity", device.name());
+        }
         for ranks in 3..=cuteafd_core::MAX_SPARK_WORLD {
             let (_dir, report) = fixture(2, ranks);
             assert!(report.executable(), "TP{ranks}: {}", crate::plan::render(&report));

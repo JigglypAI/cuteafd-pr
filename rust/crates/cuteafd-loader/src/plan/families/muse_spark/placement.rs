@@ -156,12 +156,10 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
     };
     // The measured edge differs only in these baselines; everything else the
     // contract charges is the same fact list.
-    let spark_budget_bytes = opts.spark_allocation_budget_bytes
-        .unwrap_or(crate::plan::DEFAULT_SPARK_BUDGET_BYTES).min(opts.spark_bytes);
     let mut budgets = cards.iter().enumerate().map(|(gpu, card)| shared::planned_budget(gpu as u8,
         card.physical_bytes, card.logical_bytes, crate::placement::reserve::gpu("muse_spark"),
         ArchContext::for_device("sm_120", card.physical_bytes).context_bytes)).collect::<Vec<_>>();
-    budgets.extend((0..ranks).map(|rank| shared::spark_budget(rank as u8, spark_budget_bytes)));
+    budgets.extend((0..ranks).map(|rank| shared::spark_budget(rank as u8, opts.spark_capacity(rank))));
     let maximum_pool_tokens = crate::placement::CoordinatorCard::maximum_pool(&cards, context, opts.pool_tokens, shared::PAGE_ROWS);
     let (total, available) = match crate::plan::layout::planner_host_memory(opts.host_memory, crate::plan::layout::HostMemorySample::Raw) {
         Ok(memory) => memory,
@@ -267,7 +265,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
     for rank in 0..ranks {
         let resident = admitted.spark_budget.resident[rank][onboarded..].iter().sum::<u64>();
         widest = widest.max(resident);
-        let mut device = DeviceLayout { kind: DeviceKind::Spark, index: rank as u32, capacity_bytes: spark_budget_bytes, worker_budget_bytes: spark_budget_bytes,
+        let mut device = DeviceLayout { kind: DeviceKind::Spark, index: rank as u32, capacity_bytes: opts.spark_capacity(rank), worker_budget_bytes: opts.spark_capacity(rank),
             kv_tokens: 0, items: vec![Item::new(Category::Experts, "routed experts (intermediate slices)",
                 model.expert_formats.join("+"), resident, Basis::Exact)] };
         if let Err(error) = usize::try_from(slots).map_err(anyhow::Error::from)

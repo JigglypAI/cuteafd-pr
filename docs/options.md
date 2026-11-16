@@ -482,6 +482,25 @@ plus `FAMILY_RESERVE` and the explicit per-coordinator-GPU `release padding` all
 not physical driver page tables or startup graph owners (including node padding).
 Startup and `cuteafd plan` print one line per device with the cap,
 weights, workspaces, every reserve component and the KV target, min, max and pool.
+Sparks use each host's idle `/proc/meminfo` `MemAvailable` (GB10 unified
+memory reclaims clean file cache; neither `MemFree` nor CUDA free is capacity).
+The launcher refreshes a host-local idle sample when no GPU compute process is
+resident. A busy host, including a server about to restart, uses only the last
+idle sample from its current boot ID; missing or reboot-stale samples fail
+closed with a stop-first hint. On `--restart`, this coordinator and selected
+host/port workers stop before the idle probe, even if subsequent admission
+refuses. Dry runs skip teardown and live probing. Plans retain sample
+timestamps, uptime and age.
+Offline and simulated plans use the provenance-stamped per-host
+`serving_capacity/spark_memory.json` inventory in configured rank order; unknown
+hosts require an explicit cap or live measurement. Direct `plan --config` resolves
+named hosts in config rank order; `REPLACE-ME` placeholders or no host list use
+labelled simulated canonical inventory. Rank-to-host order is not
+rearranged. Workers also check live allocatable memory before loading weights.
+`--spark-memory-samples` is the launcher's JSON measurement handoff to plan and
+serve, not a user policy knob. Explicit `SPARK_MEMORY_CAP` /
+`--spark-memory-cap` wins over measurements.
+
 The coordinator charges the SM121 worker process census (1,596,606,464 B,
 moa/driver 580.178.04, 2026-11-07, #1454) inside `SPARK_MEMORY_CAP`:
 steady anonymous PSS + file PSS + context-phase consumption, subtracting
@@ -539,7 +558,7 @@ Each key is also a global `cuteafd` flag (`--gpu-memory-cap`, `--kv-max-tokens`,
 | `KV_MIN_TOKENS` | min(256K, model max context, KV target), on every layout | positive count | Refuse automatic pools below this; missing the target is fine down to it. Automatic context serves min(model max context, admitted pool); an explicit context still requires the pool to cover it. |
 | `KV_MAX_TOKENS` | the target | positive count, at least the target | After an automatic layout is fixed, the pool grows into free memory up to this. A pinned `RTX_EXPERT_LAYERS` already makes the pool the output (it fills what is left). |
 | `GPU_MEMORY_CAP` | full device | size | Total per-GPU ceiling for plan, serve and golden; leaves SM count and L2 unchanged. |
-| `SPARK_MEMORY_CAP` | the family's Spark default | size | Total per-Spark engine ceiling, including worker process residency and routed weights; the outside-cap gap leaves room for OS/services. |
+| `SPARK_MEMORY_CAP` | each host's measured idle `MemAvailable` | size | Explicit total per-Spark engine ceiling overrides measured capacities, including worker process residency and routed weights. No extra margin. |
 | `GPU_RESERVE` | auto | size | Sets the total GPU reserve; built-in reserve components (including release padding) become 0, but physical driver page tables, named sampled pre-weight occupancy and the bounded graph-cache reserve stay charged. Still inside the cap. |
 | `SPARK_RESERVE` | auto | size | Replaces Spark reserve components, not arena driver metadata or actual ring/workspace/staging owners; these survive even a zero override. |
 | `MEMORY_PADDING` | `100MiB` | size | Explicit per-coordinator-GPU release padding, inside the cap; `0` disables only padding. `GPU_RESERVE` replaces it. Global flag: `--memory-padding`. |
@@ -640,8 +659,10 @@ experts after accepted full-model fidelity and partial paired scoring proof
 (#1777/#2128: 77 exact windows, zero mismatches, explicitly accepted by TJ).
 The [max example](../examples/configs/kimi-k31-exl3-k2-mc-max.config) selects
 MC `CORE_VIEW=original`, 2 RTX + 6 Sparks and automatic pool/onboarding.
-The 1-RTX minimum stays blocked by #2082; no raised Spark cap or tiny-pool
-workaround is supplied. K8 compact remains `Planned` because fidelity is
+With measured idle Spark capacities (#2082), MC `k6-compact` plans on
+1 RTX + 6 Sparks with an automatic 2,081,152-token pool and no RTX expert
+onboarding; this is a CPU placement result, not a new serving benchmark.
+K8 compact remains `Planned` because fidelity is
 unmeasured; whole-core `fp8-compact` remains unsupported and unqualified.
 All accepted views retain native BF16 indexer weights. K3 DFlash2 hidden-state
 compatibility is independently unqualified. `SPECULATOR=dspark` selects the

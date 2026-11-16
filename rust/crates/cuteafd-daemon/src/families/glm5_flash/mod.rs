@@ -306,6 +306,8 @@ pub(crate) struct EngineArgs {
     pub serving_media_bytes: u64,
     #[arg(skip)]
     pub serving_encoder: Option<cuteafd_loader::plan::encoder::EncoderPlacement>,
+    #[arg(skip)]
+    pub serving_spark_peers: Vec<String>,
 }
 
 /// `--decode-rows`: the decode programs' 64 rows, or the wide programs' 128.
@@ -2157,6 +2159,12 @@ impl Opened {
         process.encoders = args.serving_encoder.iter().cloned().collect();
         process.physical_sparks = process.encoders.iter().flat_map(|encoder| encoder.spark_ranks())
             .max().map_or(0, |rank| rank + 1);
+        let expert_peers = if args.serving_spark_peers.is_empty() {
+            args.peers.as_deref().unwrap_or("").split(',')
+                .filter(|peer| !peer.is_empty()).map(str::to_owned).collect::<Vec<_>>()
+        } else { args.serving_spark_peers.clone() };
+        process.spark_rank_caps = cuteafd_loader::serving_capacity::spark_memory::runtime_physical_bytes(
+            &expert_peers, process.physical_sparks.max(spark_ranks))?;
         process.media_cache_bytes = args.serving_media_bytes;
         process.serving(&inputs, host_config.as_ref().map_or(0, |c| c.bytes),
             host_config.as_ref().map_or(0, |c| c.chunk_bytes), host_embedding, 0)?;

@@ -285,6 +285,8 @@ fn serve_loop(mut args: super::EngineArgs, mut receive: mpsc::Receiver<NativeReq
             return Ok(());
         }
     };
+    args.serving_spark_peers = remote.as_ref().map_or_else(Vec::new,
+        |remote| remote.capacity_peers(args.peers.as_deref()));
     args.serving_encoder = match super::media::ReadyVision::plan(&args, &opened.view, vision, remote.as_ref()) {
         Ok(encoder) => encoder,
         Err(error) => { let _ = ready.send(Err(error)); return Ok(()); }

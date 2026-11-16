@@ -89,11 +89,6 @@ pub trait FamilyModel: Send + Sync {
         Ok(None)
     }
 
-    /// Routed-expert weight bytes one Spark rank may hold when the operator
-    /// sets no `--spark-memory-cap`. Families whose release needs more state
-    /// the measured reason with their override.
-    fn spark_budget_bytes(&self) -> u64 { super::DEFAULT_SPARK_BUDGET_BYTES }
-
     /// Per-layer routed/dense or shared FFN arithmetic, when declared by a family.
     fn activation(&self, _layer: usize, _shared: bool) -> Option<cuteafd_core::FfnActivation> { None }
 

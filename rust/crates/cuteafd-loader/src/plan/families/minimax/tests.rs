@@ -1902,7 +1902,7 @@ fn heads_gather_uses_sliced_targets_mount_sources_and_replicated_host_prefix_pag
     let catalog = crate::read_expert_catalog(dir.path()).unwrap();
     let manifest_path = dir.path().join("PROGRAMS.json");
     std::fs::write(&manifest_path, expected.manifest.to_string()).unwrap();
-    let mut request = FactsRequest { checkpoint: &checkpoint, cfg: &cfg, catalog: &catalog,
+    let mut request = FactsRequest { spark_rank_bytes: Vec::new(), checkpoint: &checkpoint, cfg: &cfg, catalog: &catalog,
         manifest_path: &manifest_path, manifest: expected.manifest.clone(),
         coordinator: Coordinator::Planned { cards: vec![CoordinatorCard {
             physical_bytes: 96 << 30, logical_bytes: 96 << 30 }; 2] },

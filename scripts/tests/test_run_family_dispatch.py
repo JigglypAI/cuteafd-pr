@@ -300,8 +300,8 @@ def test_spark_budget_default_is_planner_owned_and_explicit_ceiling_wins(tmp_pat
 
 @pytest.mark.parametrize("devices", [[], [{"kind": "spark", "index": 0, "capacity_bytes": 121 << 30}],
     [{"kind": "spark", "index": 0, "worker_budget_bytes": 0}],
-    [{"kind": "spark", "index": i, "worker_budget_bytes": (108 - i) << 30} for i in range(4)]])
-def test_spark_workers_reject_missing_zero_or_nonuniform_planner_budgets(tmp_path, devices):
+    ])
+def test_spark_workers_reject_missing_or_zero_planner_budgets(tmp_path, devices):
     result = _family_launch_result(tmp_path,
         {"model_type": "glm_moe_dsa", "num_hidden_layers": 4, "first_k_dense_replace": 3}, "test/budget",
         "SPARK_COUNT=4\nRTX_GPUS=1\nSPECULATOR=off\nVISION=off\nAUDIO=off\n",
@@ -309,8 +309,25 @@ def test_spark_workers_reject_missing_zero_or_nonuniform_planner_budgets(tmp_pat
             {"kind": "rtx", "index": 0, "capacity_bytes": 96 << 30, "worker_budget_bytes": 0,
              "items": [], "kv_tokens": 0}, *devices]}})
     assert result.returncode != 0
-    assert "no uniform Spark worker allocation ceiling" in result.stderr
+    assert "no Spark worker allocation ceiling" in result.stderr
     assert "cuteafd expertd-native" not in result.stderr
+
+
+def test_spark_workers_keep_distinct_per_rank_planner_budgets(tmp_path):
+    devices = [{"kind": "spark", "index": i, "worker_budget_bytes": (116 - i) << 30}
+               for i in range(4)]
+    result = _family_launch_result(tmp_path,
+        {"model_type": "glm_moe_dsa", "num_hidden_layers": 4, "first_k_dense_replace": 3}, "test/budget",
+        "SPARK_COUNT=4\nRTX_GPUS=1\nSPECULATOR=off\nVISION=off\nAUDIO=off\n",
+        deployment_overrides={"memory_layout": {"devices": [
+            {"kind": "rtx", "index": 0, "capacity_bytes": 96 << 30, "worker_budget_bytes": 0,
+             "items": [], "kv_tokens": 0}, *devices]}})
+    assert result.returncode == 0, result.stderr
+    workers = [line for line in result.stderr.splitlines() if "cuteafd expertd-native" in line]
+    assert len(workers) == 4
+    for rank in range(4):
+        assert any(f"--rank {rank} " in worker and f"--device-budget-bytes {(116 - rank) << 30}" in worker
+                   for worker in workers)
 
 
 
@@ -928,6 +945,7 @@ def _family_launch_result(tmp_path: Path, family_config: dict, model: str, keys:
         copy_input(ROOT / "run.sh", repo / "run.sh")
     copy_input(launcher_source or ROOT / "scripts" / "launch" / "run-family.sh", repo / "scripts" / "launch")
     copy_input(ROOT / "scripts" / "launch" / "preflight-fp8-bf16.py", repo / "scripts" / "launch")
+    copy_input(ROOT / "scripts" / "launch" / "spark-memory-probe.py", repo / "scripts" / "launch")
     copy_input(ROOT / "scripts" / "lib" / "checkpoint-family.py", repo / "scripts" / "lib")
     copy_input(ROOT / "scripts" / "lib" / "release-common.sh", repo / "scripts" / "lib")
     from launcher_sandbox import stub_cuda_capacity
@@ -990,6 +1008,7 @@ def _family_launch_result(tmp_path: Path, family_config: dict, model: str, keys:
         # run concurrently, and a two-write line (argv, then newline) lets a
         # sibling's argv slip between them and merge two lines into one.
         (bin_dir / tool).write_text('#!/usr/bin/env bash\nprintf "%s \\n" "$(basename "$0") $*" >&2\n'
+                                    + ('case "$*" in *"python3 -I -"*) echo ' + repr(json.dumps({"bytes": 124211863552, "boot_id": "fixture", "age_seconds": 0, "cached": False})) + '; exit 0 ;; esac\n' if tool == "ssh" else '')
                                     + ('case "$*" in *"docker run --rm"*"python3"*) exit 2 ;; esac\n'
                                        if preflight_error and tool == "ssh" else '') +
                                     'case "$*" in *"docker logs"*) echo "${STUB_WORKER_READY:-worker bootstrap ready}"; echo "vision encoder ready"; '
@@ -1410,7 +1429,9 @@ def capture_resolver_config_parity(snapshot: Path, example: Path, binary: Path,
     argv = plans[0]
     direct = subprocess.run([str(binary), "plan", str(snapshot), "--deployment", "--config", str(example),
         "--hf-home", str(hf_home), "--workspace-manifest", str(programs),
-        "--gpu-memory-cap", argv[argv.index("--gpu-memory-cap") + 1]],
+        "--gpu-memory-cap", argv[argv.index("--gpu-memory-cap") + 1],
+        *(["--spark-memory-samples", json.dumps(launched["spark_memory_measurements"])]
+          if "--spark-memory-samples" in argv else [])],
         capture_output=True, text=True, timeout=30, env={**os.environ, "HF_HOME": str(hf_home)})
     assert direct.returncode == 0, direct.stderr
     planned = json.loads(direct.stdout)
@@ -1781,7 +1802,7 @@ def capture_native_exlr8_capability_deployment(deployment_path: Path) -> None:
     assert deployment["wip_launchable"] is True
     source = (ROOT / "scripts/lib/family-keys.sh").read_text()
     functions = []
-    for name in ("release_spark_worker_budget", "release_validate_deployment"):
+    for name in ("release_spark_worker_budget", "release_spark_role_budget", "release_validate_deployment"):
         match = re.search(rf"^{name}\(\) \{{\n.*?^\}}$", source, re.MULTILINE | re.DOTALL)
         assert match, f"missing actual launcher function {name}"
         functions.append(match.group())
@@ -1790,6 +1811,7 @@ release_die() { printf '%s\n' "$*" >&2; exit 1; }
 wip_slot=native-budget-test
 plan="$(cat "$1")"
 release_spark_worker_budget "$plan" "$2"
+for ((rank=0; rank<$2; rank++)); do release_spark_role_budget "$plan" "$rank"; done
 release_validate_deployment "$plan" glm5_flash
 '''
     result = subprocess.run(["bash", "-euc", script, "native-capability", str(deployment_path),
@@ -1798,8 +1820,10 @@ release_validate_deployment "$plan" glm5_flash
     devices = [device for device in deployment["memory_layout"]["devices"]
                if device["kind"] == "spark" and device["index"] in experts]
     assert len(devices) == deployment["spark_expert_world"]
-    assert {device["worker_budget_bytes"] for device in devices} == {int(result.stdout.strip())}
     assert result.returncode == 0, result.stderr
+    budgets = [int(value) for value in result.stdout.splitlines()]
+    assert budgets[0] == max(device["worker_budget_bytes"] for device in devices)
+    assert budgets[1:] == [device["worker_budget_bytes"] for device in sorted(devices, key=lambda device: device["index"])]
 
 
 def _coordinator_launches(stderr: str) -> list[list[str]]:
@@ -2721,7 +2745,7 @@ def test_glmf_invalid_fp8_options_fail_before_workers_launch(tmp_path, key, valu
                                   f"GLM5_FLASH_KDA_FP8=off\n{key}={value}\n")
     assert result.returncode != 0 and message in result.stderr
     assert not any(line.startswith(("docker ", "ssh ", "nest ")) and "cuteafd plan" not in line
-                   for line in result.stderr.splitlines())
+                   and "python3 -I -" not in line for line in result.stderr.splitlines())
 
 
 @pytest.mark.parametrize("layout,physical_gpus", [("RTX_GPUS=1\n", (0, 1)), ("RTX_GPUS=auto\n", (0,)),
@@ -2890,7 +2914,7 @@ def test_glmf_draft_linear_rejects_unknown_values_before_launch(tmp_path):
     assert result.returncode != 0 and "GLM5_FLASH_DRAFT_LINEAR must be w8a16, wide or w8a8" in result.stderr, \
         result.stderr
     assert not any(line.startswith(("docker ", "ssh ", "nest ")) and "cuteafd plan" not in line
-                   for line in result.stderr.splitlines())
+                   and "python3 -I -" not in line for line in result.stderr.splitlines())
 
 
 @pytest.mark.parametrize("keys,env", [
@@ -3316,7 +3340,7 @@ def test_glmf_replay_records_reject_unsupported_layouts_before_launch(tmp_path, 
                                   keys)
     assert result.returncode != 0 and message in result.stderr, result.stderr
     assert not any(line.startswith(("docker ", "ssh ", "nest ")) and "cuteafd plan" not in line
-                   for line in result.stderr.splitlines())
+                   and "python3 -I -" not in line for line in result.stderr.splitlines())
 
 
 @pytest.mark.parametrize("keys,forwarded", [("", False), ("GLM5_FLASH_DECODE_ROWS=64\n", False),
@@ -5743,3 +5767,16 @@ def test_glmf_default_query_does_not_apply_unresolved_split_config(tmp_path):
     serve = next(shlex.split(line) for line in result.stderr.splitlines() if line.startswith("docker run -d") and "serve-glmf" in line)
     assert "--split-device" not in serve
     assert serve[serve.index("--replay-records") + 1] == "shared"
+
+
+def test_spark_probe_is_bounded_by_selected_count_and_restart_stops_first(tmp_path):
+    result = _family_launch_result(tmp_path, {"model_type": "glm_moe_dsa", "num_hidden_layers": 4,
+        "first_k_dense_replace": 3}, "test/measured",
+        "SPARK_COUNT=2\nRTX_GPUS=1\nSPECULATOR=off\nVISION=off\nAUDIO=off\n", restart=True)
+    assert result.returncode == 0, result.stderr
+    probes = [line for line in result.stderr.splitlines() if "python3 -I -" in line]
+    assert len(probes) == 2 and all('h2 ' not in line for line in probes)
+    for rank in range(2):
+        stop = result.stderr.index(f"cuteafd-spark-expert-h{rank}-")
+        probe_at = next(result.stderr.index(line) for line in probes if f"h{rank} " in line)
+        assert stop < probe_at

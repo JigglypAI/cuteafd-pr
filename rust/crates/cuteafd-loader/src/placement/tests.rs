@@ -1758,7 +1758,7 @@ fn spark_budget_feeds_existing_tp2_pool_first_and_mark_selection() {
     let marks = (0..2).map(|gpu| Demand::new(gpu, Category::Prefix,
         "exact marks", GIB, cuteafd_core::memory_layout::Basis::Exact)).collect::<Vec<_>>();
     req.fixed = marks.iter().cloned().map(|mut demand| { demand.bytes *= 4; demand }).collect();
-    let budget = SparkBudgetInventory { layers: vec![0, 1, 2, 3],
+    let budget = SparkBudgetInventory { rank_budgets: Vec::new(), layers: vec![0, 1, 2, 3],
         resident: vec![vec![GIB; 4], vec![GIB, GIB, 2 * GIB, GIB]],
         overhead: vec![GIB; 2], budget: 4 * GIB
             + cuteafd_core::memory_layout::spark_arena_driver_overhead_bytes(3 * GIB) };

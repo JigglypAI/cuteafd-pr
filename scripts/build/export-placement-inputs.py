@@ -68,6 +68,7 @@ def source_hashes():
     # rewrites do not affect compilation; only the selected example inventory does.
     paths = [ROOT / "scripts/build/export-placement-inputs.py", ROOT / "scripts/build/kernel-records.py",
              ROOT / "scripts/build/release-scope.py", ROOT / "scripts/lib/wip_aot_scopes.py", ROOT / FP8_CAPACITY_RECIPE,
+             ROOT / "rust/crates/cuteafd-loader/src/serving_capacity/spark_memory.json",
              *(ROOT / config for config in live_configs(ROOT))]
     return {**compare.v4_placement_sources(),
             **{str(path.relative_to(ROOT)): compare.sha(path.read_bytes()) for path in paths},

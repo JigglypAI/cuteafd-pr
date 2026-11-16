@@ -329,7 +329,7 @@ fn spark_charges_match_shared_group_arenas_and_typed_owner_census() -> anyhow::R
 }
 
 #[test]
-fn installed_native_minimum_is_six_sparks_with_full_pool() -> anyhow::Result<()> {
+fn installed_native_measured_five_sparks_fit_with_exact_ledgers() -> anyhow::Result<()> {
     use std::path::PathBuf;
     use crate::plan::{ExpertPlacement, MediaMode, layout::LayoutOptions};
     let home = PathBuf::from(std::env::var_os("CUTEAFD_DEPLOYMENT_TEST_HF_HOME")
@@ -350,14 +350,27 @@ fn installed_native_minimum_is_six_sparks_with_full_pool() -> anyhow::Result<()>
     assert!(report.wip_launchable() && !report.executable());
     assert_eq!(report.memory_layout.as_ref().unwrap().pool_tokens, 2_097_152);
     let mut fp8_options = options.clone();
-    fp8_options.layout.as_mut().unwrap().inkling_kv = crate::families::inkling2::InklingKvCache::Fp8;
+    fp8_options.layout.as_mut().unwrap().inkling_kv = Default::default();
+    assert_eq!(fp8_options.layout.as_ref().unwrap().inkling_kv,
+        crate::families::inkling2::InklingKvCache::Fp8);
     let fp8 = input.plan(&fp8_options)?;
     assert!(fp8.fits && fp8.placement_supported && fp8.native_serving_admitted, "{:?}", fp8.hints);
     assert_eq!(fp8.memory_layout.as_ref().unwrap().pool_tokens, 2_097_152);
     println!("Inkling native 1RTX+6S pool2097152: BF16->FP8 onboard {:?}->{:?}, global KV 64GiB->33GiB",
         report.onboard_layers, fp8.onboard_layers);
     assert!(fp8.onboard_layers > report.onboard_layers, "freed global KV must admit more native expert layers");
-    let refused = input.plan(&PlanOptions { placement: ExpertPlacement::from_spark_ranks(5), ..options })?;
+    let five = input.plan(&PlanOptions { placement: ExpertPlacement::from_spark_ranks(5), ..fp8_options.clone() })?;
+    assert!(five.fits && five.placement_supported && five.native_serving_admitted, "{:?}", five.hints);
+    for device in five.memory_layout.as_ref().unwrap().devices.iter()
+        .filter(|device| device.kind == cuteafd_core::memory_layout::DeviceKind::Spark) {
+        assert_eq!(device.capacity_bytes, crate::serving_capacity::spark_memory::serving_bytes()[device.index as usize]);
+        assert!(device.used_bytes() <= device.capacity_bytes);
+        println!("Inkling native default FP8 five-Spark rank {}: used={} capacity={} headroom={}",
+            device.index, device.used_bytes(), device.capacity_bytes, device.capacity_bytes - device.used_bytes());
+    }
+    let refused = input.plan(&PlanOptions { placement: ExpertPlacement::from_spark_ranks(4), ..fp8_options })?;
+    println!("Inkling native default FP8 four-Spark fit={} supported={}: {:?}",
+        refused.fits, refused.placement_supported, refused.hints);
     assert!(!refused.fits && !refused.placement_supported);
     assert!(refused.hints.iter().any(|hint| hint.what.contains("joint admission refused")), "{:?}", refused.hints);
     Ok(())

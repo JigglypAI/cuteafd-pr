@@ -263,11 +263,12 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
         let rings = crate::plan::layout::spark_ring_geometry(LANES as usize);
         let endpoints = [cuteafd_core::SparkEndpoint { ring_depth: None, capacity: unit as u32,
             ingress: cuteafd_core::SparkIngress::Fp8K32, partial_reply_bytes: None }];
-        let budget = opts.spark_allocation_budget_bytes.unwrap_or(super::SPARK_BUDGET_BYTES);
-        let spark = SparkBudgetInventory::exl3(&catalog, &working, &endpoints,
+        let budget = opts.spark_capacities(ranks).into_iter().max().unwrap_or(0);
+        let mut spark = SparkBudgetInventory::exl3(&catalog, &working, &endpoints,
             cuteafd_core::SparkRings { max_frame_bytes: rings.max_frame_bytes, depth: rings.depth,
                 slot_bytes: rings.slot_bytes, alignment: rings.alignment }, budget,
             crate::families::kimi_k3::spark::reserve_bytes(ranks, admitted.waves, admitted.unit_rows)?)?;
+        spark.rank_budgets = opts.spark_capacities(ranks);
         let manifest = catalog.exl3().ok_or_else(|| anyhow::anyhow!("Kimi TP2 requires EXL3 headers"))?;
         let mut costs = vec![[Bytes2::default(); 2]; cfg.layers];
         for &layer in &working.spark_layers {
@@ -534,7 +535,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
                 weights: 0, lifetime: crate::placement::planner::Lifetime::RESIDENT, basis: Basis::Estimated });
         }
     }
-    let sparks = vec![spark_budget.budget; ranks];
+    let sparks = opts.spark_capacities(ranks);
     let (host_total, host_available) = match crate::plan::layout::planner_host_memory(
         opts.host_memory, crate::plan::layout::HostMemorySample::Raw) {
         Ok(host) => host,
@@ -661,7 +662,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
     let rings = crate::plan::layout::spark_ring_geometry(LANES as usize);
     for rank in 0..ranks {
         let resident = spark_budget.resident[rank][onboarded..].iter().sum::<u64>();
-        let mut device = DeviceLayout { kind: DeviceKind::Spark, index: rank as u32, capacity_bytes: opts.spark_bytes, worker_budget_bytes: opts.spark_bytes,
+        let mut device = DeviceLayout { kind: DeviceKind::Spark, index: rank as u32, capacity_bytes: opts.spark_capacity(rank), worker_budget_bytes: opts.spark_capacity(rank),
             kv_tokens: 0, items: vec![Item::new(Category::Experts, "routed experts (balanced H128, replicated 3584 rotations)",
                 model.expert_formats.join("+"), resident, Basis::Exact)] };
         if let Err(error) = crate::plan::layout::charge_spark_io(&mut device, &working, cuteafd_core::ExpertGeometry::KIMI_K3,

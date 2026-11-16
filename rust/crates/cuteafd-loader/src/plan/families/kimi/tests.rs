@@ -81,8 +81,8 @@ fn complete_checkpoint_preserves_recipe_refusals_at_every_spark_count() {
         assert!(!report.hints.iter().any(|hint| hint.what.contains("missing projection")), "{:?}", report.hints);
         if expected.is_err() {
             assert!(!report.fits && !report.placement_supported);
-            assert!(report.hints.iter().any(|hint| hint.what.contains("routed experts need")
-                && hint.what.contains("over the 108 GiB budget")),
+            assert!(report.hints.iter().any(|hint| hint.what.contains("memory budget 'spark")
+                && hint.what.contains("115964116992")),
                 "TP{ranks}: {:?}", report.hints);
         } else {
             assert!(!report.hints.iter().any(|hint| hint.what.contains("no exported width class")),
@@ -364,7 +364,7 @@ fn release_headers_classify_native_text_without_installed_artifacts() {
     assert!(report.components.iter().filter(|c| c.component != Component::Vision).all(|c| c.rejected == 0));
     assert!(!report.hints.iter().any(|h| h.what.contains("W9") || h.what.contains("Kimi K3 attention")));
     // The family's own Spark budget, shown in the report and its rendering.
-    assert_eq!(report.spark_budget_bytes, SPARK_BUDGET_BYTES);
+    assert_eq!(report.spark_budget_bytes, crate::serving_capacity::spark_memory::serving_bytes().into_iter().max().unwrap());
     // Serving status does not make the default single-GPU header plan fit.
     assert!(!report.executable());
     assert!(report.hints.iter().any(|hint| hint.what.contains("Kimi header inventory refused: missing projection")),

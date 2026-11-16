@@ -21,7 +21,6 @@ pub fn resolve_attention(requested: Option<crate::placement::AttentionPlacement>
     requested.unwrap_or(if ranks == 2 { crate::placement::AttentionPlacement::Context }
         else { crate::placement::AttentionPlacement::Layers })
 }
-pub const SPARK_DEFAULT_BUDGET_BYTES: u64 = 108 << 30;
 
 /// TP6 retained EXL3 arenas/private capacities plus 4096-row K32 input/routes
 /// (#762 census). GlmFlashK64 does not retain the m16 specialization.

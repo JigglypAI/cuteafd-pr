@@ -1286,7 +1286,7 @@ impl Opened {
             cuteafd_core::spark_reply::requested())?;
         let mut budgets = production_budgets(&cards, cuteafd_loader::placement::reserve::gpu("glm5"), host,
             serving.map_or(8 << 30, |(prefix, _)| prefix.host_cache_headroom_bytes).max(host.0 / 10),
-            &vec![cuteafd_loader::placement::reserve::spark_cap(); spark_ranks])?;
+            &cuteafd_loader::serving_capacity::spark_memory::runtime_bytes(&args.peers.as_deref().unwrap_or("").split(',').filter(|peer| !peer.is_empty()).map(str::to_owned).collect::<Vec<_>>())?)?;
         for (budget, sample) in budgets.iter_mut().zip(&inventory.gpus) {
             // PreWeight context_bytes already includes selected module residency;
             // ledger-tracked owners remain separately charged by the recipe.
