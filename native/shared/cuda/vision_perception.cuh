@@ -74,7 +74,8 @@ int pe_norm(Owner* o,uint16_t* x,uint64_t w,uint64_t b,uint16_t* out,int rows) {
   return pe_program(o,"vision_pe_norm_h"+std::to_string(o->spec.hidden),{x,o->weights+w,o->weights+b,out},{uint64_t(rows),eps});
 }
 int pe_projection(Owner* o,uint16_t* x,uint64_t w,uint64_t b,uint16_t* out,int rows,int input,int output) {
-  std::string name="vision_"+std::string(b==UINT64_MAX?"projection":"biased_projection")+
+  bool patch_specialization=b==UINT64_MAX && output==4096 && (input==4096 || input==6144);
+  std::string name="vision_"+std::string(patch_specialization?"pe_patch_projection":b==UINT64_MAX?"projection":"biased_projection")+
     "_h"+std::to_string(input)+"_o"+std::to_string(output);
   if(b==UINT64_MAX)return pe_program(o,name,{x,o->weights+w,out},{uint64_t(rows)});
   return pe_program(o,name,{x,o->weights+w,o->weights+b,out},{uint64_t(rows)});

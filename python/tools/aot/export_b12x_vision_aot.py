@@ -35,11 +35,11 @@ def perception_names(kind):
     names += [f"biased_projection_h{w}_o{n}" for w,n in ((h,3*h),(h,h),(h,i),(i,h))]
     names += [f"projection_h{p}_o{h}"]
     if kind == "inkling2":
-        names += ["pe_rgb_p20","pe_merge_h1024","projection_h4096_o4096","projection_h4096_o4608","gelu_h4096"]
+        names += ["pe_rgb_p20","pe_merge_h1024","pe_patch_projection_h4096_o4096","projection_h4096_o4608","gelu_h4096"]
     else:
         names += ["rgb_normalize","resize_coefficients_bilinear","resize_horizontal","resize_vertical",
             "pe_patches_p14","pe_conv_lower_h1536","pe_conv_lower_h3072","pe_quick_gelu_h8960",
-            "biased_projection_h13824_o3072","biased_projection_h27648_o6144","projection_h6144_o4096"]
+            "biased_projection_h13824_o3072","biased_projection_h27648_o6144","pe_patch_projection_h6144_o4096"]
     return ["vision_"+name for name in names]
 
 
@@ -61,7 +61,8 @@ def perception_builders(kind):
         result["pe_rgb_p20"] = lambda:perception_pixels.compile_pixel_patches_aot(patch=20)
         result["pe_merge_h1024"] = lambda:perception.compile_merge2_aot(width=1024,class_token=True)
         for w,n in ((4096,4096),(4096,4608)):
-            result[f"projection_h{w}_o{n}"] = lambda w=w,n=n:media.compile_patch_projection_aot(width=w,outputs=n)
+            name = f"pe_patch_projection_h{w}_o{n}" if n == 4096 else f"projection_h{w}_o{n}"
+            result[name] = lambda w=w,n=n:media.compile_patch_projection_aot(width=w,outputs=n)
         result["gelu_h4096"] = lambda:media.compile_gelu_aot(width=4096)
     else:
         result.update({"rgb_normalize":image_resize.compile_rgb_normalize_aot,
@@ -74,7 +75,7 @@ def perception_builders(kind):
             "pe_quick_gelu_h8960":lambda:perception.compile_quick_gelu_aot(width=8960)})
         for w,n in ((13824,3072),(27648,6144)):
             result[f"biased_projection_h{w}_o{n}"] = lambda w=w,n=n:media.compile_biased_projection_aot(width=w,outputs=n)
-        result["projection_h6144_o4096"] = lambda:media.compile_patch_projection_aot(width=6144,outputs=4096)
+        result["pe_patch_projection_h6144_o4096"] = lambda:media.compile_patch_projection_aot(width=6144,outputs=4096)
     if ["vision_"+name for name in result] != perception_names(kind):
         raise ValueError("PE declaration inventory differs from CMake")
     return result
@@ -101,6 +102,7 @@ def main():
     parser.add_argument("--with-transformer", action="store_true")
     parser.add_argument("--bf16-before-gamma", action="store_true")
     parser.add_argument("--windowed", action="store_true")
+    parser.add_argument("--omit-program", action="append", default=[])
     args = parser.parse_args()
     if args.list_transformer_programs:
         print(";".join(muse_transformer_names()))
@@ -169,6 +171,10 @@ def main():
             if args.group != "pointwise":
                 parser.error("--with-transformer requires --group pointwise")
             declarations.update(builders("transformer"))
+        omitted = set(args.omit_program)
+        unknown = omitted - {f"vision_{name}" for name in declarations}
+        if unknown:parser.error(f"unknown omitted programs: {sorted(unknown)}")
+        declarations = {name:build for name,build in declarations.items() if f"vision_{name}" not in omitted}
         export_programs(destination, "vision", declarations)
         if torch.cuda.is_initialized():
             raise RuntimeError("offline vision export initialized CUDA")
