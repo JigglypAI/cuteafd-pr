@@ -1621,7 +1621,7 @@ mod tests {
         let spark = cuteafd_loader::placement::SparkBudgetInventory::exl3(&catalog, &working,
             &[cuteafd_core::SparkEndpoint { ring_depth: None, capacity: rows as u32, ingress: cuteafd_core::SparkIngress::Fp8K32, partial_reply_bytes: None }],
             crate::shared::placement::spark_rings(cuteafd_transport::TcpTransportConfig::default().max_frame_bytes)?,
-            cuteafd_loader::families::kimi_k3::SPARK_DEFAULT_BUDGET_BYTES,
+            cuteafd_loader::serving_capacity::spark_memory::serving_bytes().into_iter().max().unwrap_or(0),
             cuteafd_loader::families::kimi_k3::spark::reserve_bytes(6, 2, rows as u64)?)?;
         let admitted = admission::admit(admission::Inputs { skip_routed_experts: false, expert_usage: false, cfg: &cfg, core: Default::default(),
             resident_weight_limit: cuteafd_loader::placement::ResidentWeights::DEFAULT_LIMIT, cache_format: cuteafd_core::MlaCacheFormat::Bf16, gpus: [GpuBudget {

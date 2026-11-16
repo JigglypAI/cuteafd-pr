@@ -147,7 +147,7 @@ fn options(args: &PlanArgs) -> Result<PlanOptions, PlanError> {
     #[cfg(test)]
     { options.inventory_host_memory = args.test_host_memory; }
     if let Some(layout) = &mut options.layout {
-        if args.memory.spark_memory_cap.is_none() && !args.deployment_peers.is_empty() {
+        if args.memory.spark_memory_cap.is_none() && (args.spark_memory_samples.is_some() || !args.deployment_peers.is_empty()) {
             layout.spark_rank_bytes = if let Some(samples) = &args.spark_memory_samples {
                 cuteafd_loader::serving_capacity::spark_memory::sample_bytes(samples).map_err(|error|
                     PlanError::InvalidOption { option: "--spark-memory-samples", reason: error.to_string() })?

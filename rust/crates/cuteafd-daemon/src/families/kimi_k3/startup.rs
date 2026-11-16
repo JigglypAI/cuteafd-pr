@@ -180,7 +180,7 @@ pub(crate) fn load<'a, const RANKS: usize>(library: &'a Arc<cuteafd_ffi::NativeL
     memory.sample("modules-draft-context")?;
     // The per-Spark cap (`SPARK_MEMORY_CAP`), else Kimi's estimated complete ceiling.
     let spark_budget_bytes = cuteafd_core::memory_policy::MemoryPolicy::current()
-        .spark_cap_bytes(cuteafd_loader::families::kimi_k3::SPARK_DEFAULT_BUDGET_BYTES);
+        .spark_cap_bytes(cuteafd_loader::serving_capacity::spark_memory::serving_bytes().into_iter().max().unwrap_or(0));
     let (spark_budget, rtx) = if skip_routed_experts { (None, None) } else {
     let catalog = cuteafd_loader::read_expert_catalog_view(checkpoint.view.as_ref()
         .context("Kimi startup requires the immutable selected checkpoint view")?)?;

@@ -3597,7 +3597,6 @@ fn invalid_budgets_are_typed_option_errors() {
 #[test]
 fn explicit_spark_ceiling_updates_all_layout_budgets_without_changing_defaults() {
     assert_eq!(DEFAULT_SPARK_BUDGET_BYTES, 100 << 30);
-    assert_eq!(super::families::kimi::SPARK_BUDGET_BYTES, 108 << 30);
     let mut options = PlanOptions { layout: Some(layout::LayoutOptions { host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram), ..Default::default() }), ..Default::default() };
     options.apply_spark_budget();
     assert_eq!(options.spark_budget_bytes, None);

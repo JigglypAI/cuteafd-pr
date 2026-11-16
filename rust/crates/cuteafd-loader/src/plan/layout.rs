@@ -1089,12 +1089,9 @@ pub(crate) fn mapped_table_note(report: &PlanReport, notes: &mut Vec<String>) {
 /// replaces these with the worker's own measurement.
 #[derive(Debug, Clone, Copy)]
 pub struct SparkCharges {
-    /// Observed host footprint, charged against physical memory (the usable
-    /// inventory's 13 GiB host exclusion is added back to capacity).
-    pub host_bytes: Option<u64>,
     /// Non-I/O wave residual at 4096 capacity rows.
     pub wave_bytes: u64,
-    /// Basis of the host and runtime charges.
+    /// Basis of runtime charges.
     pub basis: Basis,
 }
 
@@ -1142,10 +1139,6 @@ pub(crate) fn spark_devices(report: &mut PlanReport, model: &dyn super::FamilyMo
     let mut devices = slices.into_iter().enumerate().map(|(rank, stored)| {
         let mut device = DeviceLayout { kind: DeviceKind::Spark, index: rank as u32, capacity_bytes: options.spark_capacity(rank), worker_budget_bytes: options.spark_capacity(rank),
             items: Vec::new(), kv_tokens: 0 };
-        if let Some(host) = charges.host_bytes {
-            device.capacity_bytes += 13 * GIB;
-            device.items.push(Item::new(Category::Reserved, "host OS+sparknestd", "", host, charges.basis));
-        }
         device.items.push(Item::new(Category::Experts, "routed_expert", format.clone(), stored, Basis::Exact));
         device
     }).collect::<Vec<_>>();

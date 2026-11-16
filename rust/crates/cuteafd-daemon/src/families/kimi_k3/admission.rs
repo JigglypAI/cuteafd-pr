@@ -1295,7 +1295,7 @@ pub(super) mod tests {
         let spark = SparkBudgetInventory::exl3(&catalog, &working,
             &[cuteafd_core::SparkEndpoint { ring_depth: None, capacity: 4096, ingress: cuteafd_core::SparkIngress::Fp8K32, partial_reply_bytes: None }],
             crate::shared::placement::spark_rings(cuteafd_transport::TcpTransportConfig::default().max_frame_bytes)?,
-            cuteafd_loader::families::kimi_k3::SPARK_DEFAULT_BUDGET_BYTES,
+            cuteafd_loader::serving_capacity::spark_memory::serving_bytes().into_iter().max().unwrap_or(0),
             cuteafd_loader::families::kimi_k3::spark::reserve_bytes(6, 2, 4096)?)?;
         println!("spark minimum_onboard={} max_four_expert_bytes={}", spark.minimum_rtx_layers()?,
             (0..6).map(|rank| spark.rank_bytes(rank, 4)).collect::<Result<Vec<_>>>()?.into_iter().max().unwrap());

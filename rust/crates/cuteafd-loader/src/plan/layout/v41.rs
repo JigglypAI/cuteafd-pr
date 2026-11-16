@@ -11,7 +11,7 @@ use crate::placement::planner::{Lifetime, Location, Operation, PrefillShape};
 use v41::DraftInventory;
 
 const SPARK: SparkCharges = SparkCharges {
-    host_bytes: Some(9 * GIB), wave_bytes: 21 * GIB / 10, basis: Basis::Estimated,
+    wave_bytes: 21 * GIB / 10, basis: Basis::Estimated,
 };
 
 pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyModel,

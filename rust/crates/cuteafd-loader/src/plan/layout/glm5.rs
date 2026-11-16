@@ -9,7 +9,7 @@ use super::*;
 
 /// Spark worker allowances at 4096 capacity rows: the non-I/O wave residual
 /// (exact rank I/O and rings are charged from the selected working set).
-const SPARK: SparkCharges = SparkCharges { host_bytes: None, wave_bytes: gib(190), basis: Basis::Calibrated };
+const SPARK: SparkCharges = SparkCharges { wave_bytes: gib(190), basis: Basis::Calibrated };
 
 pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyModel,
     input: &crate::plan::PlanInput, options: &mut LayoutOptions) -> MemoryLayout {

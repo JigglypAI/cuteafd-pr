@@ -808,6 +808,8 @@ impl SparkBudgetInventory {
 
     pub fn minimum_rtx_layers(&self) -> anyhow::Result<usize> {
         anyhow::ensure!(self.budget > 0 && !self.resident.is_empty(), "Spark budget must be positive with selected ranks");
+        anyhow::ensure!(self.rank_budgets.is_empty() || (self.rank_budgets.len() == self.resident.len()
+            && self.rank_budgets.iter().all(|bytes| *bytes > 0)), "missing per-rank Spark capacity");
         for count in 0..=self.layers.len() {
             let fits = (0..self.resident.len()).map(|rank| self.rank_bytes(rank, count))
                 .collect::<anyhow::Result<Vec<_>>>()?.into_iter().enumerate().all(|(rank, bytes)| bytes <= self.rank_budget(rank));
