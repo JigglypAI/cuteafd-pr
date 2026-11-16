@@ -4,6 +4,7 @@ pub mod config;
 pub mod experts;
 pub mod execution;
 pub mod weight_layout;
+pub mod verify;
 pub use config::{Inkling2Config, Inkling2MtpConfig, Inkling2VisionConfig};
 
 /// Global KV only; local rings and convolution marks retain their native precision.

@@ -151,6 +151,10 @@ def main():
     parser.add_argument("--fixtures", type=Path, required=True)
     parser.add_argument("--vendor-test", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--attention-reference", action="store_true",
+                        help="diagnostic: use pinned vendor FP32 attention after measuring native stage")
+    parser.add_argument("--teacher-force-markov", action="store_true",
+                        help="diagnostic: keep reference previous token to remove recurrent cascade")
     args = parser.parse_args()
     vendor = Vendor(args.vendor_test)
     native = Native(os.environ["CUTEAFD_NATIVE_LIB"])
@@ -213,7 +217,10 @@ def main():
         check(f"{layer}.key.norm_rope", k, eager.rope(eager.norm(projections[1].view(8,8,128), w[f"{a}.k_norm.weight"], 1e-6), positions, 1e6))
         ck, cv = contexts[layer]
         attended = native.attention(q, k, v, ck, cv)
-        check(f"{layer}.attention", attended, vendor.attention(q, ck, cv, k, v, None if layer == 2 else 1024).flatten(1))
+        reference_attention = vendor.attention(q, ck, cv, k, v, None if layer == 2 else 1024).flatten(1)
+        check(f"{layer}.attention", attended, reference_attention)
+        if args.attention_reference:
+            attended = reference_attention
         delta = check(f"{layer}.o_proj", native.linear(attended, w[f"{a}.o_proj.weight"]), F.linear(attended, w[f"{a}.o_proj.weight"]))
         updated, normed = native.residual(residual, delta, w[f"{p}.post_attention_layernorm.weight"])
         refnorm, refupdated = eager.add_norm(delta, residual, w[f"{p}.post_attention_layernorm.weight"], 1e-6)
@@ -269,6 +276,8 @@ def main():
         per_position.append(entry)
         print(json.dumps(entry), flush=True)
         state = new
+        if args.teacher_force_markov:
+            previous = fixture["tokens"][step:step+1].long()
     args.output.write_text(json.dumps(dict(stages=rows, positions=per_position, vendor_source_sha256=VENDOR_SHA,
         reference_kind="vendor-authored test expressions for mix/gate/finish/attention; eager norm and torch linear diagnostics"), indent=2)+"\n")
 
