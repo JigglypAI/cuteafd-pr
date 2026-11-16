@@ -523,8 +523,8 @@ mod tests {
         assert!(core.serving_qualified(&cfg));
         core.projections.get_mut("head").unwrap().bits = 8;
         assert!(!core.serving_qualified(&cfg));
-        assert!(cfg.validate_speculation(true).is_err());
-        cfg.validate_speculation(false)?;
+        assert!(cfg.validate_speculation(Some(crate::families::kimi_k3::draft::DraftKind::MlaDflash)).is_err());
+        cfg.validate_speculation(None)?;
         Ok(())
     }
 

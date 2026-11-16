@@ -727,10 +727,12 @@ mod tests {
         let (_wedged, _) = listener.accept()?;
         let peer = client.peer_addr()?;
         transport.retired.push((client, peer));
+        let timeout = Duration::from_millis(30);
         let started = Instant::now();
-        let error = transport.drain_retired_with_timeout(Duration::from_millis(30)).unwrap_err();
+        let error = transport.drain_retired_with_timeout(timeout).unwrap_err();
         let waited = started.elapsed();
-        assert!(waited >= Duration::from_millis(30) && waited < Duration::from_secs(1), "{waited:?}");
+        // Kernel socket-timeout granularity can return slightly before Instant's bound.
+        assert!(waited >= timeout - Duration::from_millis(2) && waited < Duration::from_secs(1), "{waited:?}");
         assert!(format!("{error:#}").contains("did not release its rings"), "{error:#}");
         Ok(())
     }

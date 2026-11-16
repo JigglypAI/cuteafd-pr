@@ -3,6 +3,9 @@ use crate::formats::{block_dspark::BlockDsparkRuntimeLayout, dflash::MlaDraftRun
 use crate::families::glm5::draft_representation::GlmDraftCapacity;
 use anyhow::{ensure, Result};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DraftKind { MlaDflash, BlockDspark }
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum DraftLayout {
     Mla(MlaDraftRuntimeLayout),

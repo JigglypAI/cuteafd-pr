@@ -2046,6 +2046,26 @@ def test_lossless_set_panel_and_file_reach_the_smoke_entry(entry, tmp_path, monk
         cards.main()
 
 
+@pytest.mark.parametrize('concurrency', [1, 4, 64])
+def test_lossless_concurrency_reaches_smoke_entry(entry, tmp_path, monkeypatch, concurrency):
+    kit = _kit(tmp_path, entry)
+    state = tmp_path / 'state'
+    monkeypatch.setattr(sys, 'argv', ['wip-cards', '--kit', str(kit), '--cards', 'v41-min', '--matrix', '--arm', 'a=b:s',
+        '--state', str(state), '--panels', 'spec_lossless_set', '--lossless-concurrency', str(concurrency), '--dry-run'])
+    assert cards.main() == 0
+    e = json.loads(next(state.glob('*/matrix.json')).read_text())['entries'][0]
+    assert e['lossless_concurrency'] == concurrency
+
+
+@pytest.mark.parametrize('panels,concurrency', [('spec_lossless_set', '0'), ('spec_lossless_set', '65'), ('baseline', '4')])
+def test_lossless_concurrency_refuses_invalid_requests(entry, tmp_path, monkeypatch, panels, concurrency):
+    kit = _kit(tmp_path, entry)
+    monkeypatch.setattr(sys, 'argv', ['wip-cards', '--kit', str(kit), '--cards', 'v41-min', '--matrix', '--arm', 'a=b:s',
+        '--state', str(tmp_path / 'state'), '--panels', panels, '--lossless-concurrency', concurrency, '--dry-run'])
+    with pytest.raises(SystemExit):
+        cards.main()
+
+
 def test_lossless_row_dumps_reach_the_smoke_entry_only_when_asked(entry, tmp_path, monkeypatch):
     kit = _kit(tmp_path, entry)
     argv = ['wip-cards', '--kit', str(kit), '--cards', 'v41-min', '--matrix', '--arm', 'a=b:s',
@@ -2507,6 +2527,7 @@ def test_every_required_smoke_field_is_advertised_by_the_dry_run():
     dry_run = (ROOT / 'rust/crates/cuteafd-bench/src/smoke.rs').read_text()
     line = next(text for text in dry_run.splitlines() if 'api_key_file={}' in text)
     advertised = set(re.findall(r'([a-z_0-9]+)=\{', line))
+    assert 'lossless_concurrency' in required
     assert required <= advertised, sorted(required - advertised)
 
 

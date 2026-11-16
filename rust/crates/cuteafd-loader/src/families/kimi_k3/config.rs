@@ -248,9 +248,9 @@ impl KimiK3Config {
     pub fn kda_layers(&self) -> usize { self.attention.iter().filter(|a| **a == KimiAttention::Kda).count() }
     pub fn mla_layers(&self) -> usize { self.attention.iter().filter(|a| **a == KimiAttention::Mla).count() }
 
-    /// K3's external drafter has not been qualified against K3.1 hidden states.
-    pub fn validate_speculation(&self, enabled: bool) -> Result<()> {
-        ensure!(!enabled || self.dsa.is_none(),
+    /// K3's MLA drafter is not qualified against K3.1; native block dSpark is opt-in.
+    pub fn validate_speculation(&self, kind: Option<super::draft::DraftKind>) -> Result<()> {
+        ensure!(kind != Some(super::draft::DraftKind::MlaDflash) || self.dsa.is_none(),
             "Kimi K3.1 DFlash2 hidden-state compatibility is unqualified; use speculation off (#1777)");
         Ok(())
     }
@@ -314,8 +314,8 @@ pub(crate) mod tests {
         assert_eq!(index.key_heads, 1);
         assert_eq!(index.key_cache_bytes(64, 2)?, 16384);
         assert_eq!(index.selection_bytes(16)?, 16 * 2048 * 4);
-        cfg.validate_speculation(false)?;
-        assert!(cfg.validate_speculation(true).is_err());
+        cfg.validate_speculation(None)?;
+        assert!(cfg.validate_speculation(Some(crate::families::kimi_k3::draft::DraftKind::MlaDflash)).is_err());
         for (key,value) in [("index_rope_dim",json!(64)),("index_k_norm_type",json!("rmsnorm")),
             ("index_topk_freq",json!(2)),("index_skip_topk_offset",json!(0)),("dsa_layers",json!([4]))] {
             let mut config = k31_config();
@@ -328,8 +328,10 @@ pub(crate) mod tests {
     #[test]
     fn k31_drafter_compatibility_is_independent_of_target_serving_qualification() -> Result<()> {
         let target = KimiK3Config::from_hf(&k31_config())?;
-        target.validate_speculation(false)?;
-        let error = target.validate_speculation(true).unwrap_err().to_string();
+        use super::super::draft::DraftKind;
+        target.validate_speculation(None)?;
+        target.validate_speculation(Some(DraftKind::BlockDspark))?;
+        let error = target.validate_speculation(Some(DraftKind::MlaDflash)).unwrap_err().to_string();
         assert!(error.contains("hidden-state compatibility is unqualified"), "{error}");
         assert!(error.contains("speculation off"), "{error}");
         assert!(error.contains("#1777"), "{error}");
@@ -337,7 +339,7 @@ pub(crate) mod tests {
         let k3 = KimiK3Config::from_hf(&release_config())?;
         assert_eq!((target.hidden, target.layers, target.vocab_size),
             (k3.hidden, k3.layers, k3.vocab_size));
-        k3.validate_speculation(true)?;
+        k3.validate_speculation(Some(crate::families::kimi_k3::draft::DraftKind::MlaDflash))?;
         Ok(())
     }
 

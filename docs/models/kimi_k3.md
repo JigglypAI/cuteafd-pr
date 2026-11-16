@@ -29,8 +29,8 @@ K3 DFlash2 hidden-state compatibility remains independently unqualified.
 Inferact block dSpark integration is tracked in #2261: native BF16 weights,
 checkpoint-derived 2,048-token GQA window, rank-512 Markov confidence, shared
 policy/executor and target embedding/head. `SPECULATOR=dspark` is opt-in and
-still refuses until full-model served lossless speculation is qualified; the
-default stays off. TP1 runs on one RTX; TP2 splits 96 query/16 KV heads to
+full-model served lossless qualification is pending (#2261); the default
+stays off. TP1 runs on one RTX; TP2 splits 96 query/16 KV heads to
 48/8 per rank and splits FFN neurons, with private exchange flags and local
 per-rank prefix marks. FC/norms are replicated, Markov/confidence on the head.
 `DRAFT_KV_CACHE` selects FP8 (default) or BF16 independently of target KV.

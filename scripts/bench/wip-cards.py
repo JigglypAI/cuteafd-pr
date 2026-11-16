@@ -2903,6 +2903,7 @@ def main():
                         help='explicit per-panel configuration; repeat for different panels (default greedy)')
     parser.add_argument('--lossless-set', type=Path, metavar='FILE', help='case file for the spec_lossless_set panel '
                         '(JSON [{id, prompt, nonce}]); default: the shipped scripts/bench/fixtures/spec-lossless-set-v1.json')
+    parser.add_argument('--lossless-concurrency', type=int, metavar='N', help='spec_lossless_set cases in flight per arm (1..64)')
     parser.add_argument('--dump-lossless-rows', metavar='CASES:START-END', help='spec_lossless_set: dump full-vocabulary F32 '
                         'log-prob rows of both arms for these cases over generated tokens START..END (e.g. code-2,code-5:70-90) '
                         'to <job>/lossless-rows/spec-lossless-rows-*/ with a manifest.json; needs --panels with spec_lossless_set')
@@ -3093,6 +3094,11 @@ def main():
     except ValueError as error:
         parser.error(str(error))
     lossless_set = None
+    if args.lossless_concurrency is not None:
+        if not 1 <= args.lossless_concurrency <= 64:
+            parser.error('--lossless-concurrency must be 1-64')
+        if not any('spec_lossless_set' in requested_panels(card.get('profile', 'smoke'), binary=panel_binary(args.binary, arms)) for card in cards):
+            parser.error('--lossless-concurrency needs --panels with spec_lossless_set')
     if args.lossless_set is not None:
         lossless_set = load_lossless_set(args.lossless_set)
         if not any('spec_lossless_set' in requested_panels(card.get('profile', 'smoke'), binary=panel_binary(args.binary, arms)) for card in cards):
@@ -3116,6 +3122,8 @@ def main():
             card['context_suffix'] = args.context_suffix
         if lossless_set:
             card['lossless_set'] = lossless_set
+        if args.lossless_concurrency is not None:
+            card['lossless_concurrency'] = args.lossless_concurrency
         if lossless_dump:
             card['lossless_dump'] = lossless_dump
         if prefill_lengths:
@@ -3275,6 +3283,7 @@ def main():
         (['baseline'] if any(job['entry'].get('baseline') is False for job in jobs) else []) + \
         (['window'] if any(job['entry'].get('window') for job in jobs) else []) + \
         (['lossless_set'] if any(job['entry'].get('lossless_set') for job in jobs) else []) + \
+        (['lossless_concurrency'] if args.lossless_concurrency is not None else []) + \
         (['lossless_dump'] if any(job['entry'].get('lossless_dump') for job in jobs) else []) + \
         (['context_lengths'] if context_lengths is not None else []) + (['context_levels'] if context_levels is not None else []) + \
         (['context_suffix'] if args.context_suffix is not None else []) + \
