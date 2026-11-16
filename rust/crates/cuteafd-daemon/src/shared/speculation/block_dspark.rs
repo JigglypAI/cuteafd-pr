@@ -1874,6 +1874,51 @@ mod tests {
     use super::*;
     use crate::shared::memory::TEST;
     #[test]
+    fn admitted_rank_local_windows_restore_all_bytes_without_cross_device_copies()->Result<()> {
+        use device::{Allocation,Device,Stream};
+        let fixture=cuteafd_ffi::native_library_lifetime_fixture::Fixture::build_for_tests()?;
+        let library=fixture.load()?;
+        for rank in 0..2 { fixture.configure_memory(&library,rank,1<<30)?; }
+        fixture.immediate_copies(&library)?; fixture.quiet_events(&library,true)?;
+        let devices=[0,1].map(|id|Device { library:&library,id });
+        let streams=[Stream::new(devices[0])?,Stream::new(devices[1])?];
+        let planes=[Allocation::new(devices[0],256,TEST)?,Allocation::new(devices[1],256,TEST)?];
+        let expected=[(0..256).map(|i|(i*17) as u8).collect::<Vec<_>>(),
+            (0..256).map(|i|(i*31+7) as u8).collect::<Vec<_>>()];
+        let mut snapshots=Vec::new();
+        for rank in 0..2 {
+            let (_,bytes)=WindowSnapshots::bytes(&[256],2)?;
+            let backing=Rc::new(Allocation::new(devices[rank],bytes,Tag::prefix("test/admitted-window"))?);
+            let before=fixture.events()?;
+            let owner=WindowSnapshots::with_backing(crate::shared::prefix::Reader {
+                device:rank as i32,stream:streams[rank].raw },backing.clone(),vec![256],2)?;
+            assert!(Rc::ptr_eq(&owner.backing(),&backing));
+            let added=fixture.events()?.strip_prefix(&before).unwrap().to_owned();
+            assert!(!added.contains("device-alloc"),"admitted backing allocated twice");
+            devices[rank].run(||library.copy_h2d(planes[rank].buffer,&expected[rank]))?;
+            // SAFETY: rank-local live planes and backing outlive event-ordered copies.
+            unsafe { owner.capture(0,&[planes[rank].buffer],0,4099)?; }
+            owner.drain()?;
+            devices[rank].run(||library.copy_h2d(planes[rank].buffer,&vec![199;256]))?;
+            snapshots.push(owner);
+        }
+        assert_eq!(snapshots[0].metadata(0)?,snapshots[1].metadata(0)?);
+        for rank in 0..2 {
+            assert!(unsafe { snapshots[rank].restore(0,&[planes[1-rank].buffer],4099) }.is_err());
+            // SAFETY: initialized mark and local owner satisfy retained event fence contract.
+            unsafe { snapshots[rank].restore(0,&[planes[rank].buffer],4099)?; }
+            snapshots[rank].drain()?;
+            let mut actual=vec![0;256];
+            devices[rank].run(||library.copy_d2h(&mut actual,planes[rank].buffer))?;
+            assert_eq!(actual,expected[rank],"rank bytes including inactive region changed");
+        }
+        let copies=include_str!("../prefix/copy_stream.rs");
+        assert!(copies.find("cuda_event_record(event, reader)").unwrap()<copies.find("cuda_stream_wait_event(state.stream, event)").unwrap());
+        assert!(copies.find("cuda_event_record(state.landed, state.stream)").unwrap()<copies.find("cuda_stream_wait_event(reader, state.landed)").unwrap());
+        Ok(())
+    }
+
+    #[test]
     fn window_snapshot_restore_equals_cold_state_and_survives_slot_reuse() -> Result<()> {
         use device::{Allocation, Device, Stream};
         use cuteafd_ffi::native_library_lifetime_fixture::Fixture;

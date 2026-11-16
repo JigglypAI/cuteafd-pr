@@ -887,6 +887,14 @@ mod tests {
                 assert_eq!(local.buffers.iter().any(|(n,_)|n=="workspace.logits"),rank==physical_lead);
             }
         }
+        let paired=crate::families::kimi_k3::draft::DraftLayout::BlockTp2 {
+            ranks:Box::new([peer.clone(),lead.clone()]),lead:1 };
+        let marks=paired.window_mark_demands(1)?;
+        assert_eq!(marks.len(),2);
+        assert_eq!(marks[0].gpu,0); assert_eq!(marks[1].gpu,1);
+        assert_eq!(marks[0].bytes,peer.window_mark_bytes()? as u64);
+        assert_eq!(marks[1].bytes,lead.window_mark_bytes()? as u64);
+        assert_eq!(marks.iter().map(|m|m.bytes).sum::<u64>(),paired.window_mark_bytes()? as u64);
         use crate::families::glm5::draft_physical::ShardAxis;
         for rank in 0..2 {
             let mut parts=std::collections::BTreeMap::new();
