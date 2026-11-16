@@ -964,7 +964,7 @@ def _family_launch_result(tmp_path: Path, family_config: dict, model: str, keys:
             if child.is_file():
                 child.unlink()
         shutil.copytree(checkpoint_source, staged, dirs_exist_ok=True, copy_function=os.link)
-    if family_config.get("model_type") == "glm_moe_dsa":
+    if family_config.get("model_type") == "glm_moe_dsa" and not (hf / "hub/models--incoai--GLM-5.3-DFlash2").exists():
         _snapshot(hf, "incoai/GLM-5.3-DFlash2", {"architectures": ["DFlash2DraftModel"]})
     if family_config.get("model_type") == "muse_spark" and not (
             hf / "hub/models--nvidia--Muse-Spark-Open-816B-A42B-DFlash2").exists():
@@ -975,7 +975,8 @@ def _family_launch_result(tmp_path: Path, family_config: dict, model: str, keys:
                   json.loads((ROOT / "rust/crates/cuteafd-daemon/src/families/muse_spark/fixtures"
                               "/drafters/nvidia.json").read_text()),
                   "22e2669e4c60689f9bff0749a34d9d8e59ce7cd6")
-    if family_config.get("model_type") == "glm5_next" and (extra_env or {}).get("STUB_REAL_PLANNER"):
+    if (family_config.get("model_type") == "glm5_next" and (extra_env or {}).get("STUB_REAL_PLANNER")
+            and not (hf / "hub/models--incoai--GLM-5.3-Flash-DFlash2").exists()):
         _snapshot(hf, "incoai/GLM-5.3-Flash-DFlash2", {"architectures": ["DFlash2DraftModel"]})
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
@@ -1750,8 +1751,8 @@ def capture_mimo_real_planner_launch(snapshot: Path, example: Path, binary: Path
     assert len(serves) == 1, result.stderr
     serve = serves[0]
     serve_mtp = serve[serve.index("--mtp") + 1] if "--mtp" in serve else "0"
-    assert "--native-mtp-layers" in plans[0], plans[0]
-    assert plans[0][plans[0].index("--native-mtp-layers") + 1] == serve_mtp, (plans[0], serve)
+    assert "--native-mtp-layers" not in plans[0], plans[0]
+    assert deployment["resolved_settings"]["native_mtp_layers"]["value"] == int(serve_mtp), (deployment["resolved_settings"], serve)
     # A shipped DFlash2 config charges its drafter in the admitted layout.
     if config.get("SPECULATOR") == "dflash2":
         assert "--draft" in serve, serve

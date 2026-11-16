@@ -2190,7 +2190,7 @@ mod tests {
             ("glm5", "SPECULATOR", "off", DraftOwnership::None),
             ("mimo_v2", "SPECULATOR", "dflash2", DraftOwnership::None),
             ("mimo_v2", "SPECULATOR", "mtp", DraftOwnership::NativeMtp),
-            ("qwen4", "MTP", "0", DraftOwnership::None),
+            ("qwen4", "SPECULATOR", "off", DraftOwnership::None),
             ("deepseek_v4", "DSPARK", "off", DraftOwnership::None),
             ("deepseek_v41", "DSPARK", "on", DraftOwnership::BundledDspark),
         ] {
