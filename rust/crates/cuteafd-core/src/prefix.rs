@@ -14,6 +14,9 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
+/// Shortest snapshot retained by the default host prefix tier.
+pub const DEFAULT_HOST_CACHE_MIN_TOKENS: u32 = 512;
+
 /// Bounded retained-prefix host quota, independent of currently free RAM.
 pub const fn default_host_cache_bytes(total: u64) -> u64 {
     let quarter = total / 4;

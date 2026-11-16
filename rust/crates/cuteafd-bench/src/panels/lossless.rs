@@ -95,6 +95,23 @@ impl CaseSet {
     }
 }
 
+fn warm_set(set: &CaseSet, retention: u64, mut count: impl FnMut(&str) -> Result<u64>) -> Result<CaseSet> {
+    let minimum = retention.checked_mul(2).context("warm retention minimum overflow")?.max(1024);
+    let mut cases = Vec::with_capacity(set.cases.len());
+    for case in &set.cases {
+        let mut rows = minimum as usize;
+        let padded = loop {
+            let mut padded = case.clone();
+            padded.prompt = format!("Reference context:\n{}\n\nTask:\n{}", crate::text::corpus(73, rows), case.prompt);
+            anyhow::ensure!(padded.prompt.len() <= MAX_PROMPT_BYTES, "{}: warm prompt exceeds set byte limit", case.id);
+            if count(&padded.text())? >= minimum { break padded; }
+            rows = rows.checked_mul(2).context("warm prompt extent overflow")?;
+        };
+        cases.push(padded);
+    }
+    CaseSet::new(&format!("{}-warm", set.name), cases).map_err(anyhow::Error::msg)
+}
+
 /// A set as a client sends it with a run (`cuteafd bench --lossless-set FILE`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -362,6 +379,13 @@ fn run_cases(ctx: &Ctx<'_>, dump: Option<(&RowDump, &std::path::Path)>) -> Resul
         None => { default = CaseSet::default_set(); &default }
     };
     let warm = ctx.panel_config.map(Options::parse).transpose()?.unwrap_or_default().warm;
+    let retention = ctx.info.setting("host-cache-min-tokens").map(str::parse::<u64>).transpose()?
+        .unwrap_or(u64::from(cuteafd_core::prefix::DEFAULT_HOST_CACHE_MIN_TOKENS));
+    let padded;
+    let set = if warm {
+        padded = warm_set(set, retention, |text| ctx.client.count_chat_tokens(&plain(ctx.client, text, TOKENS)))?;
+        &padded
+    } else { set };
     let speculator = ctx.info.configuration.speculator.clone().unwrap_or_default();
     let spec = |off: bool| ProbeSpec { cold: off || !warm, no_speculation: off, pair_exempt: true, record_rows: TOKENS as usize, top_k: 2,
         ..ProbeSpec::default() };
@@ -409,11 +433,13 @@ fn run_cases(ctx: &Ctx<'_>, dump: Option<(&RowDump, &std::path::Path)>) -> Resul
                         max.fetch_max(in_flight.fetch_add(1, SeqCst) + 1, SeqCst);
                         if warm && !off {
                             let prime = ctx.client.chat(plain(ctx.client, &case.text(), TOKENS), Some(ProbeSpec {
-                                cold: true, pair_exempt: true, ..ProbeSpec::default()
+                                cold: false, pair_exempt: true, ..ProbeSpec::default()
                             })).with_context(|| format!("{} cache prime", case.id))?;
                             let record = probe_of(&prime)?;
-                            anyhow::ensure!(honoured(record) && record.cold && !record.no_speculation,
-                                "{}: engine did not honour cold speculation-on priming", case.id);
+                            anyhow::ensure!(honoured(record) && !record.cold && !record.no_speculation,
+                                "{}: engine did not honour cache-eligible speculation-on priming", case.id);
+                            anyhow::ensure!(record.prompt_ids.len() as u64 >= retention.saturating_mul(2).max(1024),
+                                "{}: warm prompt did not exceed retention minimum", case.id);
                         }
                         let reply = ctx.client.chat(plain(ctx.client, &case.text(), TOKENS), Some(spec));
                         in_flight.fetch_sub(1, SeqCst);
@@ -453,9 +479,10 @@ fn run_cases(ctx: &Ctx<'_>, dump: Option<(&RowDump, &std::path::Path)>) -> Resul
                 && on_chat.tool_calls == off_chat.tool_calls;
             verdict.cached_tokens = Some(on.cached_tokens);
             verdict.output_identical = Some(identical);
-            if on.cached_tokens == 0 {
+            if on.cached_tokens < off.prompt_ids.len() {
                 verdict.pass = false;
-                verdict.reason = "restore not exercised: measured cached_tokens is zero".into();
+                verdict.reason = format!("full prompt restore not exercised: cached {} of {} prompt tokens",
+                    on.cached_tokens, off.prompt_ids.len());
             } else if !identical {
                 verdict.pass = false;
                 verdict.reason = format!("restored drafts-on output bytes differ from cold drafts-off; {}", verdict.reason);
@@ -577,7 +604,7 @@ mod tests {
         let base = format!("http://{}", listener.local_addr().unwrap());
         let worker = std::thread::spawn(move || {
             let mut seen = Vec::new();
-            for index in 0..if warm { 3 } else { 2 } {
+            for index in 0..if warm { 4 } else { 2 } {
                 let (mut socket, _) = listener.accept().unwrap();
                 socket.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
                 let mut reader = std::io::BufReader::new(socket.try_clone().unwrap());
@@ -593,13 +620,19 @@ mod tests {
                 let mut bytes = vec![0; length];
                 reader.read_exact(&mut bytes).unwrap();
                 let body: Value = serde_json::from_slice(&bytes).unwrap();
+                if warm && index == 0 {
+                    let reply = json!({"input_tokens":1024,"exact_token_count":true}).to_string();
+                    write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}", reply.len()).unwrap();
+                    continue;
+                }
                 let probe = cuteafd_api::openai::probe::registry().claim(&id).unwrap();
-                let prime = warm && index == 0;
+                let prime = warm && index == 1;
                 let measured = !probe.spec.no_speculation && !prime;
-                probe.admitted("fake", &[9; 10], if measured { cached } else { 0 });
+                let prompt_tokens = if warm { 1024 } else { 10 };
+                probe.admitted("fake", &vec![9; prompt_tokens], if measured { cached } else { 0 });
                 for row in 0..TOKENS as usize {
                     let lift = if measured && bad_row && row == 7 { 0.5 } else { 0.0 };
-                    probe.row(10 + row, &[2.0 + lift, 1.0]);
+                    probe.row(prompt_tokens + row, &[2.0 + lift, 1.0]);
                     probe.token(0);
                 }
                 // Prime intentionally differs: only the off arm is the oracle.
@@ -617,15 +650,15 @@ mod tests {
     }
 
     #[test]
-    fn warm_restores_after_cold_speculating_prime_and_compares_off_arm() {
-        let (value, seen) = restore_fixture(true, 8, false, false);
+    fn warm_restores_after_cache_eligible_speculating_prime_and_compares_off_arm() {
+        let (value, seen) = restore_fixture(true, 1024, false, false);
         assert_eq!(value["gate"], "pass", "{value}");
         assert_eq!(value["warm"], true);
         assert_eq!(seen.len(), 3);
         assert_eq!(seen.iter().map(|(_, s)| (s.cold, s.no_speculation)).collect::<Vec<_>>(),
-            [(true, false), (false, false), (true, true)]);
+            [(false, false), (false, false), (true, true)]);
         assert!(seen.windows(2).all(|w| w[0].0 == w[1].0), "prime and both arms use identical bodies");
-        assert_eq!(value["rows"][0]["cached_tokens"], 8);
+        assert_eq!(value["rows"][0]["cached_tokens"], 1024);
         assert_eq!(value["rows"][0]["identical_prefix"], TOKENS);
         assert_eq!(value["rows"][0]["output_identical"], true);
         assert!(value["rows"][0]["first_row_divergence"].is_null());
@@ -634,20 +667,41 @@ mod tests {
     }
 
     #[test]
+    fn warm_prompts_are_deterministic_and_exceed_retention_before_requests() {
+        let retention = u64::from(cuteafd_core::prefix::DEFAULT_HOST_CACHE_MIN_TOKENS);
+        let count = |text: &str| Ok(text.split_whitespace().count() as u64);
+        let first = warm_set(&set(2), retention, count).unwrap();
+        let second = warm_set(&set(2), retention, count).unwrap();
+        assert_eq!(first, second);
+        for case in &first.cases {
+            assert!(count(&case.text()).unwrap() >= (retention * 2).max(1024));
+            assert!(case.prompt.ends_with("Task:\np"));
+        }
+        assert_ne!(first.sha256, set(2).sha256);
+    }
+
+    #[test]
+    fn warm_partial_prompt_restore_fails() {
+        let (value, _) = restore_fixture(true, 1023, false, false);
+        assert_eq!(value["gate"], "fail");
+        assert_eq!(value["rows"][0]["reason"], "full prompt restore not exercised: cached 1023 of 1024 prompt tokens");
+    }
+
+    #[test]
     fn warm_zero_cached_tokens_fails_even_with_identical_output() {
         let (value, _) = restore_fixture(true, 0, false, false);
         assert_eq!(value["gate"], "fail");
-        assert_eq!(value["rows"][0]["reason"], "restore not exercised: measured cached_tokens is zero");
+        assert_eq!(value["rows"][0]["reason"], "full prompt restore not exercised: cached 0 of 1024 prompt tokens");
         assert_eq!(value["rows"][0]["output_identical"], true);
     }
 
     #[test]
     fn warm_compares_output_bytes_and_first_mismatching_row_to_cold_off() {
-        let (value, _) = restore_fixture(true, 8, true, false);
+        let (value, _) = restore_fixture(true, 1024, true, false);
         assert_eq!(value["gate"], "fail");
         assert_eq!(value["rows"][0]["output_identical"], false);
         assert_eq!(value["rows"][0]["identical_prefix"], TOKENS, "ids alone cannot prove byte equality");
-        let (value, _) = restore_fixture(true, 8, false, true);
+        let (value, _) = restore_fixture(true, 1024, false, true);
         assert_eq!(value["gate"], "fail");
         assert_eq!(value["rows"][0]["first_row_divergence"], 7);
     }
