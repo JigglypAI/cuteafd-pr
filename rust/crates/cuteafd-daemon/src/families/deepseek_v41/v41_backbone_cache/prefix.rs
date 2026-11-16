@@ -157,8 +157,8 @@ impl<'a> BackboneCache<'a> {
     }
 
     /// Restore a snapshot into a fresh request whose source pages hold its rows through
-    /// `saved.end`. Any partially applied failure revokes the whole request after draining; no
-    /// mixed-layer frontier is observable.
+    /// `saved.end`. On error the caller must reset or release the drained request; a partially
+    /// applied restore must never execute.
     pub fn restore_mark(&mut self, lease: CacheLease, saved: &BackboneMark, mark: CuteafdDeviceBuffer) -> Result<()> {
         self.restore_retained_phase(lease, saved, mark, CachePhase::Full)
     }
@@ -205,12 +205,7 @@ impl<'a> BackboneCache<'a> {
             Ok(())
         })();
         let drained = unsafe { self.prefix_stream.library.cuda_stream_synchronize(self.prefix_stream.raw) };
-        if let Err(error) = result.and(drained) {
-            if let Err(cleanup) = self.release(&[lease]) {
-                tracing::error!(%cleanup, "releasing failed prefix restore");
-            }
-            return Err(error);
-        }
+        result.and(drained)?;
         let request = self.requests[lease.slot]
             .as_mut()
             .expect("validated prefix admission");
@@ -218,6 +213,39 @@ impl<'a> BackboneCache<'a> {
         request.phase = phase;
         request.version = 1;
         self.committed_end(lease)?;
+        Ok(())
+    }
+
+    /// Reset failed prefix state without changing the outer lease. Component leases are
+    /// replaced so neither partial positional restores nor source page bindings survive.
+    pub fn reset_prefix(&mut self, lease: CacheLease) -> Result<()> {
+        self.prefix_drain()?;
+        let request = self.request(lease)?;
+        let (id, windows, sources) = (request.id, request.windows, request.sources);
+        let reset = (|| -> Result<_> {
+            let mut new_windows = Vec::with_capacity(windows.len());
+            let mut new_sources = Vec::with_capacity(sources.len());
+            for (state, old) in self.windows.iter_mut().zip(windows) {
+                state.release(old)?;
+                new_windows.push(state.begin_request(lease.slot, id)?);
+            }
+            for (state, old) in self.sources.iter_mut().zip(sources) {
+                state.release(old)?;
+                new_sources.push(state.begin_request(lease.slot, id)?);
+            }
+            Ok((new_windows, new_sources))
+        })();
+        let (windows, sources) = match reset {
+            Ok(reset) => reset,
+            Err(error) => { self.poisoned = true; return Err(error); }
+        };
+        let request = self.requests[lease.slot].as_mut().expect("validated prefix request");
+        request.windows = windows.try_into().ok().expect("40 windows");
+        request.sources = sources.try_into().ok().expect("four sources");
+        request.end = 0;
+        request.version += 1;
+        request.phase = CachePhase::Full;
+        request.publication.clear();
         Ok(())
     }
 
@@ -412,6 +440,54 @@ impl<'a> BackboneCache<'a> {
             "encoder continuation must cover the final decoder window");
         self.test_fork(lease, saved)?;
         self.restore_encoder_continuation(lease, &saved.meta, saved.mark.buffer, prompt_end)
+    }
+}
+
+#[cfg(test)]
+mod rollback_tests {
+    use super::*;
+    use cuteafd_ffi::native_library_lifetime_fixture::Fixture;
+
+    #[test]
+    fn failed_restore_keeps_lease_and_cold_rebinds_after_partial_layers() -> Result<()> {
+        let fixture = Fixture::build_for_tests()?;
+        let lib = fixture.load()?;
+        fixture.immediate_copies(&lib)?;
+        let mut bank = BackboneCache::new(&lib, 2, [4, 4, 4, 8], usize::MAX)?;
+        bank.use_engine_pages()?;
+        let lease = bank.begin_request(0, 7)?;
+        let fresh = bank.begin_request(1, 8)?;
+        let mark = crate::shared::memory::DeviceAllocation::new(&lib, BackboneMark::BYTES,
+            crate::shared::memory::TEST)?;
+        let mut metadata = BackboneMark { end: 1173, windows: vec![(1045, 1173); 40] };
+        // Fail only after twenty windows have already been installed.
+        metadata.windows[20] = (1174, 1173);
+        let pages = bank.unit_pages(&[0, 1, 2]);
+        let refs = [&pages[0][..], &pages[1][..], &pages[2][..], &pages[3][..]];
+        bank.bind_sources(lease, refs, bank.source_rows(1173))?;
+        assert!(bank.restore_mark(lease, &metadata, mark.buffer).is_err());
+        assert_eq!(bank.request_id(lease)?, 7, "restore errors cannot release the outer lease");
+        bank.reset_prefix(lease)?;
+        // Different pages, fewer initialized rows: the stale binding used to reject this.
+        let pages = bank.unit_pages(&[3]);
+        let refs = [&pages[0][..], &pages[1][..], &pages[2][..], &pages[3][..]];
+        bank.bind_sources(lease, refs, [0; 4])?;
+        let a = bank.request(lease)?;
+        let b = bank.request(fresh)?;
+        assert_eq!((a.end, a.phase), (b.end, b.phase));
+        for ((state, &x), &y) in bank.windows.iter().zip(&a.windows).zip(&b.windows) {
+            assert_eq!(state.span(x)?, state.span(y)?);
+            let mut x_end = [0; 8]; let mut y_end = [0; 8];
+            lib.copy_d2h(&mut x_end, state.view(x)?.device_end)?;
+            lib.copy_d2h(&mut y_end, state.view(y)?.device_end)?;
+            assert_eq!(x_end, y_end);
+        }
+        for (state, &lease) in bank.sources.iter().zip(&a.sources) {
+            assert_eq!(state.committed_end(lease)?, 0);
+            assert_eq!(state.binding(lease)?.1, 0);
+        }
+        bank.release(&[lease, fresh])?;
+        Ok(())
     }
 }
 

@@ -209,14 +209,13 @@ impl<'a, C: DraftChain<'a>> PrefixFamily<V41Meta> for V41Prefix<'_, 'a, '_, C> {
         self.bind_units(placement, 0).map_err(boxed)
     }
     fn discard(&self, placement: &mut V41Placement) -> Result<(), BoxError> {
-        // The engine releases the placement's units itself: take them off the request so its
-        // release (here or by the scheduler) does not unreference them a second time. A
-        // failed restore may already have released the lease; then they were queued for
-        // reclaim instead, and are taken back from there.
-        let mut requests = self.requests.borrow_mut();
-        if requests.take_units(placement.lease).is_empty() {
-            requests.forget_released_units(&placement.units);
+        self.requests.borrow_mut().discard_prefix(placement.lease).map_err(boxed)?;
+        if let (Some(id), Some(draft)) = (placement.draft, self.draft.borrow_mut().as_deref_mut()) {
+            draft.release(id).map_err(boxed)?;
+            draft.admit(id).map_err(boxed)?;
         }
+        placement.len = 0;
+        placement.plan = None;
         Ok(())
     }
     fn restore_with(&self, mark: Option<&Mark>, saved: Option<&V41Meta>, placement: &mut V41Placement,
@@ -615,6 +614,27 @@ mod tests {
         // A branch inside the only retained frontier is a miss, not an approximate replay.
         assert!(selected(&[&tokens[..1500]], &branch).is_none());
         assert!(selected(&[&tokens[..1500]], &tokens[..1499]).is_none());
+    }
+
+    #[test]
+    fn image_straddling_divergence_declines_instead_of_planning_inexact_replay() {
+        // #2340: the old even-aligned common frontier's 128-token replay began inside
+        // this image and rounded to 972, while the encoder restarted at 1044.
+        for common in [1172, 1173, 290_001] {
+            let tokens: Vec<u32> = (0..common + 12).collect();
+            let mut branch = tokens.clone();
+            branch[common as usize] = u32::MAX;
+            assert!(selected(&[&tokens], &branch).is_none());
+            let end = common as usize;
+            let span = MediaSpan { start: end - 200, len: 192,
+                key: cuteafd_core::ImageKey([7; 32]).into() };
+            let hit = RestoreCandidate { common: end, snapshot_end: end,
+                target_end: branch.len(), resume: end, media: std::slice::from_ref(&span),
+                saved_media: std::slice::from_ref(&span) };
+            let plan = RestorePlan::under(ReuseRule::EXACT, hit);
+            assert!(plan.exact());
+            assert_eq!((plan.resume(), hit.media_safe(plan.resume())), (end, end));
+        }
     }
 
     #[test]

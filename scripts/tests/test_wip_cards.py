@@ -4047,3 +4047,51 @@ def test_warm_lossless_panel_config_reaches_matrix(entry, tmp_path, monkeypatch)
     e = json.loads(next(state.glob('*/matrix.json')).read_text())['entries'][0]
     assert e['profile'] == 'panels:spec_lossless_set' and e['baseline'] is False
     assert e['panel_config'] == {'spec_lossless_set': {'warm': True}}
+
+
+@pytest.mark.parametrize('fail_fourth', [False, True])
+def test_image_prefix_probe_receipts_and_http_failure(tmp_path, monkeypatch, fail_fourth):
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    calls = []
+    class Server(BaseHTTPRequestHandler):
+        def log_message(self, *args):
+            pass
+        def do_GET(self):
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(json.dumps({'data': [{'id': 'test'}]}).encode())
+        def do_POST(self):
+            body = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
+            calls.append(body)
+            index = (len(calls) - 1) % 4
+            if fail_fourth and len(calls) == 4:
+                self.send_response(500)
+                self.end_headers()
+                self.wfile.write(b'{"error":"injected restore failure"}')
+                return
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(json.dumps({'choices': [{'message': {'content':
+                ['21', '35', 'Red and blue.', 'Yes.'][index]}}], 'usage': {
+                'prompt_cache_hit_tokens': 0, 'prefix_cache_source': 'miss'}}).encode())
+    server = ThreadingHTTPServer(('127.0.0.1', 0), Server)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    monkeypatch.setenv('CUTEAFD_API_KEY', 'fixture')
+    try:
+        url = f'http://127.0.0.1:{server.server_port}'
+        if fail_fourth:
+            with pytest.raises(RuntimeError, match='HTTP 500'):
+                cards.image_prefix_probe(url, tmp_path)
+            assert 'HTTP 500' in json.loads((tmp_path / 'image-prefix-even-image-b.json').read_text())['error']
+            assert len(calls) == 4
+        else:
+            assert len(cards.image_prefix_probe(url, tmp_path)) == 12
+            assert len(list(tmp_path.glob('image-prefix-*.json'))) == 12
+            assert calls[0]['messages'][0]['content'][0] == calls[3]['messages'][0]['content'][0]
+            assert len(calls[8]['messages'][0]['content'][0]['text']) > 100_000
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()

@@ -48,6 +48,8 @@ pub enum PrefixError {
         #[source]
         source: BoxError,
     },
+    #[error("prefix restore rollback failed: {source}")]
+    Rollback { #[source] source: BoxError },
     #[error("snapshot of {tokens} tokens, but the placement committed {committed} (reach {reach})")]
     Frontier { tokens: usize, committed: usize, reach: usize },
     #[error(transparent)]
@@ -651,7 +653,12 @@ impl<E: CopyEngine, M: Clone + Default> PrefixCache<E, M> {
             // Drain before the pages can be handed out again; the family resets what it bound.
             self.drain(family)?;
             if let Err(error) = family.discard(&mut placement) {
-                tracing::error!(target: "cuteafd::prefix", %error, "discarding a failed restore");
+                // The slot may still name these pages. Never recycle unknown state or cold
+                // bind over it; the caller must release the failed request.
+                self.quarantine.push(Quarantined { _pages: pages,
+                    _mark: if temporary { mark } else { None }, _draft: None });
+                self.stats.quarantined += 1;
+                return Err(PrefixError::Rollback { source: error });
             }
             self.release(family, &pages)?;
             if temporary { self.give_back(family, mark)?; }

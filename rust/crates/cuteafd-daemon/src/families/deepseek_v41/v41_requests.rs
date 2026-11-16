@@ -427,14 +427,22 @@ impl<'a> Requests<'a> {
             Some(end) => self.cache.restore_encoder_continuation(lease, &saved.backbone, mark, end),
             None => self.cache.restore_mark(lease, &saved.backbone, mark),
         };
-        if let Err(error) = restored {
-            if let Err(cleanup) = self.release(lease) {
-                tracing::error!(%cleanup, "releasing failed request prefix restore");
-            }
-            return Err(error);
-        }
+        restored?;
         self.slots.iter_mut().flatten().find(|r| r.lease == lease)
             .expect("validated restored request").history = history;
+        Ok(())
+    }
+    /// Roll back a drained prefix admission without revoking its identity or images. The
+    /// prefix engine owns the detached units and releases them after this call succeeds.
+    pub fn discard_prefix(&mut self, lease: CacheLease) -> Result<()> {
+        let slot = lease_slot(&self.slots, lease)?;
+        self.prefetched.cancel_owner(&lease);
+        self.cache.reset_prefix(lease)?;
+        self.units[slot].clear();
+        let request = self.slots[slot].as_mut().expect("validated prefix request");
+        request.history = self.pipeline.new_history()?;
+        request.prefill = None;
+        request.lookahead = None;
         Ok(())
     }
     pub fn validate(&self, batch: &RequestBatch) -> Result<()> {

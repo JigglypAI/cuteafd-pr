@@ -110,6 +110,7 @@ struct Fake {
     queue: RefCell<Vec<Op>>,
     writable_lag: usize,
     fail_restore: Cell<bool>,
+    fail_discard: Cell<bool>,
     fail_copy: Cell<bool>,
     fail_drain: Cell<bool>,
     record_format: Cell<&'static str>,
@@ -134,7 +135,7 @@ impl Fake {
     fn new(pages: usize, rings: usize, slots: usize) -> Self {
         let bytes = (pages * ROWS + rings * RING + slots * WINDOW) * ROW;
         let mem = Rc::new(RefCell::new(StubCopyEngine::new(CopyModel::default(), bytes, 1 << 26)));
-        Self { mem, pages, rings, slots, writable_lag: 0, queue: RefCell::new(Vec::new()), fail_restore: Cell::new(false), fail_copy: Cell::new(false), fail_drain: Cell::new(false), record_format: Cell::new("opaque_v1"), drains: Cell::new(0),
+        Self { mem, pages, rings, slots, writable_lag: 0, queue: RefCell::new(Vec::new()), fail_restore: Cell::new(false), fail_discard: Cell::new(false), fail_copy: Cell::new(false), fail_drain: Cell::new(false), record_format: Cell::new("opaque_v1"), drains: Cell::new(0),
             rule: ReuseRule::EXACT, markless: false, pooled: false, reserved: 0, draft: RefCell::new(None) }
     }
     /// Marks in pool pages: no arena slot exists (any use of one panics). `pages` pages hand
@@ -237,6 +238,7 @@ impl PrefixFamily for Fake {
         Fake::layout(self)
     }
     fn discard(&self, placement: &mut Placement) -> Result<(), BoxError> {
+        if self.fail_discard.get() { return Err("injected discard failure".into()); }
         if let Some(draft) = self.draft.borrow_mut().as_mut() {
             if let Some(binding) = draft.bindings[placement.ring].take() { draft.pool.release(binding)?; }
         }
@@ -804,6 +806,54 @@ fn a_failed_restore_is_a_miss_and_holds_nothing() {
     cache.release(&fake, &admitted.placement.pages).unwrap();
     cache.clear(&fake).unwrap();
     assert_eq!(cache.pool().free(), 32);
+}
+
+#[test]
+fn failed_restore_fallback_is_byte_identical_to_cold() {
+    for pooled in [false, true] {
+        let fake = if pooled { Fake::pooled(64, 4) } else { Fake::new(64, 4, 4) };
+        let mut cache = cache(&fake, 4, 0);
+        let prompt = seq(100, 21);
+        let (_, _, original) = serve(&mut cache, &fake, 0, &prompt[..20], &[], 24);
+        cache.release(&fake, &original.pages).unwrap();
+        fake.fail_restore.set(true);
+        let mut fallback = cache.admit(&fake, &prompt, 24, false, |pages| Placement {
+            pages, ring: 1, len: 0, ring_from: 0 }).unwrap();
+        fake.fail_restore.set(false);
+        assert_eq!((fallback.resume, cache.stats().restore_failures), (0, 1));
+        let mut cold = cache.admit_cold(&fake, prompt.len(), 24, |pages| Placement {
+            pages, ring: 2, len: 0, ring_from: 0 }).unwrap();
+        let a = fake.forward(&mut fallback.placement, &prompt).unwrap();
+        let b = fake.forward(&mut cold.placement, &prompt).unwrap();
+        assert_eq!(a.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+            b.iter().map(|x| x.to_bits()).collect::<Vec<_>>());
+        for row in 0..prompt.len() {
+            assert_eq!(fake.mem.borrow().read_device(fake.page_row(fallback.placement.pages[row / ROWS], row % ROWS)),
+                fake.mem.borrow().read_device(fake.page_row(cold.placement.pages[row / ROWS], row % ROWS)));
+        }
+        cache.release(&fake, &fallback.placement.pages).unwrap();
+        cache.release(&fake, &cold.placement.pages).unwrap();
+        cache.clear(&fake).unwrap();
+        assert_eq!(cache.pool().free(), fake.pages - fake.reserved);
+    }
+}
+
+#[test]
+fn a_failed_discard_stops_admission_and_quarantines_its_pages() {
+    let fake = Fake::new(32, 4, 4);
+    let mut cache = cache(&fake, 4, 0);
+    let (_, _, original) = serve(&mut cache, &fake, 0, &seq(100, 20), &[], 24);
+    cache.release(&fake, &original.pages).unwrap();
+    fake.fail_restore.set(true);
+    fake.fail_discard.set(true);
+    let builds = Cell::new(0);
+    let result = cache.admit(&fake, &seq(100, 21), 24, false, |pages| {
+        builds.set(builds.get() + 1);
+        Placement { pages, ring: 1, len: 0, ring_from: 0 }
+    });
+    assert!(matches!(result, Err(super::cache::PrefixError::Rollback { .. })));
+    assert_eq!(builds.get(), 1, "no cold bind over a failed rollback");
+    assert_eq!(cache.stats().quarantined, 1);
 }
 
 #[test]

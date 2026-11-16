@@ -325,6 +325,9 @@ pub trait PrefixFamily<M: Clone + Default = ()> {
     }
     /// The cache abandons a bound placement whose restore failed (its pages go back to the pool
     /// once the family drained): reset whatever `bind` and a partial restore installed.
+    /// Success leaves the caller's slot/lease ready for a fresh cold placement, even after a
+    /// partially applied bind or restore. Restore errors must not revoke outer request leases.
+    /// Failure stops admission (no cold retry); the caller must release the failed request.
     fn discard(&self, placement: &mut Self::Placement) -> Result<(), BoxError> {
         let _ = placement;
         Ok(())

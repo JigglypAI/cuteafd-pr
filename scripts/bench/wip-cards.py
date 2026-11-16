@@ -330,7 +330,7 @@ def probe_selection(items, cards, arms):
         if card not in probes:
             raise ValueError('probe card must be selected')
         values = set(filter(None, values.split(',')))
-        if not values <= {'image', 'memory', 'console', 'fabric'}:
+        if not values <= {'image', 'image-prefix', 'memory', 'console', 'fabric'}:
             raise ValueError('unknown probe')
         if arm is None:
             probes[card] = values
@@ -490,8 +490,8 @@ def generate(entry, arm_name, arm, state, key_file, overrides, probes, expected_
                                  finish_timeout_s=OBSERVER_FINISH_TIMEOUT_S, required=True)
         if 'memory' in probes:
             entry['observer']['cleanup'] = sampler_cleanup(job)
-    if expected_pool is not None or 'image' in probes or ('memory' in probes and hosts):
-        entry['precheck'] = dict(argv=hook + ['--precheck', str(dest / 'job.json')], timeout_s=180, required=True)
+    if expected_pool is not None or probes & {'image', 'image-prefix'} or ('memory' in probes and hosts):
+        entry['precheck'] = dict(argv=hook + ['--precheck', str(dest / 'job.json')], timeout_s=1800 if 'image-prefix' in probes else 180, required=True)
     if 'memory' in probes and hosts and (entry.get('levels') or entry.get('prefill_lengths')):
         sample = dict(argv=hook + ['--spark-memory-boundary', str(dest / 'job.json')], timeout_s=20, required=True)
         window = entry.setdefault('window', dict(open=dict(argv=['true'], timeout_s=10, required=True)))
@@ -1028,6 +1028,57 @@ def red_square():
     return 'data:image/png;base64,' + base64.b64encode(png).decode()
 
 
+def image_prefix_probe(url, dest):
+    """Divergence after the same image must restore exactly or prefill cold (#2340)."""
+    model = http(url, '/v1/models')['data'][0]['id']
+    def chunk(tag, data):
+        return struct.pack('>I', len(data)) + tag + data + struct.pack('>I', zlib.crc32(tag + data))
+    raw = (b'\x00' + b'\xff\x00\x00' * 160 + b'\x00\x00\xff' * 160) * 200
+    png = (b'\x89PNG\r\n\x1a\n' + chunk(b'IHDR', struct.pack('>2I5B', 320, 200, 8, 2, 0, 0, 0))
+           + chunk(b'IDAT', zlib.compress(raw)) + chunk(b'IEND', b''))
+    image = 'data:image/png;base64,' + base64.b64encode(png).decode()
+    nonce = str(time.time_ns())
+    results = []
+    for variant, entries, padding in [('even', 120, ''), ('odd', 120, ' x'), ('long', 4096, '')]:
+        prefix = f'Run {nonce} {variant}. Reference notes. ' + ' '.join(
+            f'Entry {i} is code {i * 7}.' for i in range(entries)) + padding
+        requests = [
+            ('text-a', False, 'What is the code of entry 3? Number only.', r'\b21\b'),
+            ('text-b', False, 'What is the code of entry 5? Number only.', r'\b35\b'),
+            ('image-a', True, 'Which colours are in the image? Brief.', r'(?is)(?=.*\bred\b)(?=.*\bblue\b)'),
+            ('image-b', True, 'Is there red in the image? yes/no.', r'\byes\b'),
+        ]
+        for label, with_image, question, expected in requests:
+            content = [dict(type='text', text=prefix)]
+            if with_image:
+                content.append(dict(type='image_url', image_url=dict(url=image)))
+            content.append(dict(type='text', text=question))
+            receipt = dest / f'image-prefix-{variant}-{label}.json'
+            try:
+                response = http(url, '/v1/chat/completions', dict(model=model,
+                    messages=[dict(role='user', content=content)], max_tokens=32,
+                    reasoning_effort='none', temperature=0, stream=False), timeout=600)
+            except Exception as error:
+                save(receipt, dict(error=str(error)))
+                raise
+            save(receipt, response)
+            answer = response['choices'][0]['message'].get('content') or ''
+            if not re.search(expected, answer, re.I):
+                raise ValueError(f'{variant}/{label}: incorrect answer {answer!r}')
+            usage = response['usage']
+            cached = usage.get('prompt_cache_hit_tokens', 0)
+            source = usage.get('prefix_cache_source')
+            # Exact-only families deliberately miss on divergence, while page/replay
+            # families may reuse the common prefix. Both are valid if provenance agrees.
+            if label == 'text-a' and (cached != 0 or source != 'miss'):
+                raise ValueError(f'{variant}/{label}: unique prefix was not a miss: {usage}')
+            if label != 'text-a' and (source not in {'miss', 'device', 'host'}
+                    or (cached > 0) != (source != 'miss')):
+                raise ValueError(f'{variant}/{label}: inconsistent prefix provenance: {usage}')
+            results.append(dict(variant=variant, request=label, answer=answer, cached=cached, source=source))
+    return results
+
+
 def ready_log(job):
     name = 'cuteafd-coordinator-' + job['entry']['set']['INSTANCE']
     result = run(['docker', 'logs', name])
@@ -1052,7 +1103,7 @@ def precheck(job):
     try:
         if 'memory' in job['probes'] and job['entry'].get('sparks'):
             spark_memory_boundary(job, 'ready')
-        text = ready_log(job) if job['expected_pool'] is not None or 'image' in job['probes'] else ''
+        text = ready_log(job) if job['expected_pool'] is not None or set(job['probes']) & {'image', 'image-prefix'} else ''
         if job['expected_pool'] is not None:
             result['pool'] = admitted_pool(text)
             if result['pool'] != job['expected_pool']:
@@ -1066,6 +1117,8 @@ def precheck(job):
             result['image'] = {'model': model, 'answer': answer}
             if not re.search(r'\bred\b', answer, re.I):
                 raise ValueError('image answer does not identify red')
+        if 'image-prefix' in job['probes']:
+            result['image-prefix'] = image_prefix_probe(os.environ['CUTEAFD_SMOKE_URL'], dest)
         result['status'] = 'pass'
     except Exception as error:
         result.update(status='failed', error=str(error))
@@ -2894,7 +2947,7 @@ def main():
     parser.add_argument('--arm-env', action='append', default=[], metavar='ARM:CUTEAFD_DIAG_NAME=VALUE',
                         help='arm-specific private diagnostic in the launch environment (CUTEAFD_DIAG_* only; '
                         'the launcher forwards those to the coordinator unchanged)')
-    parser.add_argument('--probe', action='append', default=[], metavar='[ARM:]CARD:image,memory,console,fabric')
+    parser.add_argument('--probe', action='append', default=[], metavar='[ARM:]CARD:image,image-prefix,memory,console,fabric')
     parser.add_argument('--spark-memory-guard', action='store_true',
                         help='with --probe memory: stop only a verified card WIP worker if host MemAvailable falls below 512 MiB')
     parser.add_argument('--panels', metavar='LIST', help='run these server panels on every card instead of its profile '
@@ -3155,7 +3208,7 @@ def main():
         raise ValueError('override/probe names must be selected cards')
     for card in cards:
         if args.matched_prompts or args.nonce_seed is not None:
-            if args.matched_prompts and 'image' in probes[card['name']]:
+            if args.matched_prompts and probes[card['name']] & {'image', 'image-prefix'}:
                 raise ValueError('--matched-prompts cannot precede its first benchmark request with an image probe')
         requested_panels(card.get('profile', 'smoke'), binary=panel_binary(args.binary, arms))
         card['set'].update(overrides.get(card['name'], {}))
