@@ -620,6 +620,31 @@ impl<'a> DsparkDrafter<'a> {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn load_tp2_with(library:&'a NativeLibrary,programs:&'a cuteafd_ffi::programs::Programs<'a>,
+        target_projection:super::dflash::TargetProjection,snapshot:&Path,slots:usize,sequences:usize,
+        kv:cuteafd_loader::families::qwen4::Qwen4KvCache,
+        exchange:Rc<crate::shared::peer_split::PeerExchange<'a>>,lead:usize,
+        mut allocate:impl FnMut(i32,&str,usize)->Result<device::Allocation<'a>>)->Result<Self> {
+        ensure!(lead<2 && library.cuda_get_device()?==exchange.device(lead),"block TP2 current device differs from lead");
+        let cfg=DsparkConfig::read(snapshot)?;
+        let window=cfg.window.context("block TP2 requires sliding window")?;
+        let mut load=|rank,projection|Self::load_rank_with(library,programs,projection,snapshot,HashMap::new(),
+            exchange.stream(rank),slots,sequences,vec![0;cfg.hidden*2],GlmDraftRepresentation::Bf16Only,
+            fp8_linear::Fp8Scales::Amax,fp8_linear::Fp8Rows::W8a16,window,slots*window,kv,None,
+            rank,2,lead,&mut allocate);
+        let mut body=load(lead,target_projection)?;
+        let peer_device=device::Device { library,id:exchange.device(1-lead) };
+        let peer=peer_device.own(||load(1-lead,super::dflash::TargetProjection::Native).map(Box::new))?;
+        body.prepare_workspace()?;
+        peer.device.run(||peer.prepare_workspace())?;
+        let bytes=sequences.checked_mul(cfg.block).and_then(|n|n.checked_mul(cfg.hidden)).and_then(|n|n.checked_mul(2))
+            .context("block TP2 reduce extent overflow")?;
+        body.head_split=Some(super::gqa_tp2::GqaHeadSplit::new(peer,exchange,lead,bytes,
+            [Tag::drafter_workspace("shared/block-dspark-reduce"),Tag::transport("shared/block-dspark-reduce")])?);
+        Ok(body)
+    }
+
     /// Uploads the drafter's tensors (see [`prefetch`]) and allocates `slots`
     /// ring contexts; draft steps take up to `max_sequences` sequences.
     /// `mask_row` is the target embedding of the mask token; `fp8_rows` how the
@@ -1066,6 +1091,20 @@ impl<'a> DsparkDrafter<'a> {
     }
 
     fn update_on_device(&self, rows: &[ContextRow]) -> Result<()> {
+        if let Some(split)=&self.head_split {
+            if !rows.is_empty() {
+                let first=rows.iter().map(|r|r.tap_row).min().unwrap();
+                let last=rows.iter().map(|r|r.tap_row).max().unwrap();
+                let stride=self.cfg.taps.len()*self.cfg.hidden*2;
+                split.exchange.push_to(split.lead,crate::shared::peer_split::DIRECT,
+                    self.taps.buffer.ptr.wrapping_byte_add(first*stride),
+                    split.peer.taps.buffer.ptr.wrapping_byte_add(first*stride),(last-first+1)*stride)?;
+                split.exchange.wait(1-split.lead,crate::shared::peer_split::DIRECT)?;
+                split.peer.device.run(||split.peer.update_on_device(rows))?;
+                split.exchange.signal(1-split.lead,crate::shared::peer_split::DIRECT)?;
+                split.exchange.wait(split.lead,crate::shared::peer_split::DIRECT)?;
+            }
+        }
         if rows.is_empty() {
             return Ok(());
         }
@@ -1365,7 +1404,9 @@ impl<'a> DsparkDrafter<'a> {
     pub(crate) fn drain(&self) -> Result<()> {
         self.on_device(|| {
             // SAFETY: this owner retains its stream and every draft operand through retirement.
-            unsafe { self.library.cuda_stream_synchronize(self.stream) }
+            unsafe { self.library.cuda_stream_synchronize(self.stream)?; }
+            if let Some(split)=&self.head_split { split.peer.device.run(||split.peer.drain())?; }
+            Ok(())
         })
     }
 
@@ -1424,6 +1465,70 @@ impl<'a> DsparkDrafter<'a> {
             tables: alloc(3 * sequences * 4)?,
             attention_workspace,
         })
+    }
+
+    fn forward_tp2(&self,w:&Workspace<'a>,split:&super::gqa_tp2::GqaHeadSplit<'a,Self>,
+        positions:&[i64],tables:&[i32],sequences:usize,max_keys:usize)->Result<()> {
+        use crate::shared::peer_split::DIRECT;
+        let rows=sequences*self.cfg.block; let h=self.cfg.hidden;
+        let peer_work=split.peer.workspace.borrow(); let pw=peer_work.as_ref().context("block TP2 peer scratch not prepared")?;
+        split.peer.device.run(|| { split.peer.put(&pw.positions,bytes_of(positions))?; split.peer.put(&pw.tables,bytes_of(tables)) })?;
+        split.exchange.push_to(split.lead,DIRECT,w.h.buffer.ptr,pw.h.buffer.ptr,rows*h*2)?;
+        split.exchange.wait(1-split.lead,DIRECT)?;
+        self.norm_first(w,rows)?;
+        split.peer.device.run(||split.peer.norm_first(pw,rows))?;
+        for index in 0..self.layers.len() {
+            self.attention_partial(w,index,sequences,max_keys)?;
+            split.peer.device.run(||split.peer.attention_partial(pw,index,sequences,max_keys))?;
+            split.reduce([w.delta.buffer,pw.delta.buffer],rows*h)?;
+            self.ffn_partial(w,index,rows,split.reduced.buffer)?;
+            split.peer.device.run(||split.peer.ffn_partial(pw,index,rows,split.peer_reduced.buffer))?;
+            split.reduce([w.delta.buffer,pw.delta.buffer],rows*h)?;
+            self.finish_layer(w,index,rows,split.reduced.buffer)?;
+            split.peer.device.run(||split.peer.finish_layer(pw,index,rows,split.peer_reduced.buffer))?;
+        }
+        split.exchange.signal(1-split.lead,DIRECT)?;
+        split.exchange.wait(split.lead,DIRECT)
+    }
+
+    fn norm_first(&self,w:&Workspace<'_>,rows:usize)->Result<()> {
+        // SAFETY: local residual/norm owners cover the admitted block on this retained stream.
+        unsafe { self.library.glm_dflash_rmsnorm(w.h.buffer.ptr,self.layers[0].input_norm.buffer.ptr,
+            w.n.buffer.ptr,rows,self.cfg.hidden,self.cfg.eps,self.stream) }
+    }
+    fn attention_partial(&self,w:&Workspace<'_>,index:usize,sequences:usize,max_keys:usize)->Result<()> {
+        let c=&self.cfg; let layer=&self.layers[index]; let rows=sequences*c.block;
+        // SAFETY: rank-local weights and KV use the checked local-head geometry and retained stream.
+        unsafe {
+            self.linear(w.n.buffer.ptr,&layer.qkv,0,w.qkv.buffer.ptr,rows,c.hidden,c.qkv_width())?;
+            self.library.block_dspark_qk_rope(w.qkv.buffer.ptr,layer.q_norm.buffer.ptr,layer.k_norm.buffer.ptr,
+                w.positions.buffer.ptr,std::ptr::null(),self.inv_freq.as_ref().map_or(std::ptr::null(),|v|v.buffer.ptr.cast_const()),
+                w.q.buffer.ptr,w.k.buffer.ptr,w.v.buffer.ptr,rows,c.heads,c.kv_heads,c.head_dim,c.theta,
+                c.rotary.as_ref().map_or(1.,|p|p.attention_factor),c.eps,false,self.stream)?;
+            self.library.block_dspark_attention(w.q.buffer.ptr,w.k.buffer.ptr,w.v.buffer.ptr,layer.k_ring.buffer.ptr,
+                layer.v_ring.buffer.ptr,w.tables.buffer.ptr,at(&w.tables,sequences*4),at(&w.tables,sequences*8),
+                w.attn.buffer.ptr,w.attention_workspace.buffer.ptr,sequences,c.block,c.heads,c.kv_heads,self.context_capacity,
+                max_keys,c.causal,c.head_dim,1./(c.head_dim as f32).sqrt(),
+                self.kv_cache==cuteafd_loader::families::qwen4::Qwen4KvCache::Fp8,self.stream)?;
+            self.linear(w.attn.buffer.ptr,&layer.o,0,w.delta.buffer.ptr,rows,c.q_width(),c.hidden)
+        }
+    }
+    fn ffn_partial(&self,w:&Workspace<'_>,index:usize,rows:usize,delta:CuteafdDeviceBuffer)->Result<()> {
+        let c=&self.cfg; let layer=&self.layers[index];
+        // SAFETY: reduced full-hidden attention updates replicated residual before local-neuron projections.
+        unsafe {
+            self.library.glmf_dspark_add_rmsnorm(w.h.buffer.ptr,delta.ptr,layer.post_norm.buffer.ptr,
+                w.h.buffer.ptr,w.n.buffer.ptr,rows,c.hidden,c.eps,self.stream)?;
+            self.linear(w.n.buffer.ptr,&layer.gate_up,0,w.gate_up.buffer.ptr,rows,c.hidden,2*c.intermediate)?;
+            self.library.glm_dflash_silu_mul(w.gate_up.buffer.ptr,w.act.buffer.ptr,rows,c.intermediate,self.stream)?;
+            self.linear(w.act.buffer.ptr,&layer.down,0,w.delta.buffer.ptr,rows,c.intermediate,c.hidden)
+        }
+    }
+    fn finish_layer(&self,w:&Workspace<'_>,index:usize,rows:usize,delta:CuteafdDeviceBuffer)->Result<()> {
+        let next=self.layers.get(index+1).map_or(self.norm.buffer,|layer|layer.input_norm.buffer);
+        // SAFETY: shared reduction and next norm are retained full-hidden operands on this rank's stream.
+        unsafe { self.library.glmf_dspark_add_rmsnorm(w.h.buffer.ptr,delta.ptr,next.ptr,w.h.buffer.ptr,w.n.buffer.ptr,
+            rows,self.cfg.hidden,self.cfg.eps,self.stream) }
     }
 
     fn head_ref<'h>(&self, head: &'h TargetHead<'h>) -> Result<HeadRef<'h>> {
@@ -1546,6 +1651,9 @@ impl<'a> DsparkDrafter<'a> {
         // SAFETY: every workspace buffer holds `rows` rows of its width and the
         // weights their checkpoint shapes; the stream orders the chain.
         unsafe {
+            if let Some(split)=&self.head_split {
+                self.forward_tp2(w,split,&positions,&tables,s_count,max_keys)?;
+            } else {
             if let Some(native) = &self.native {
                 ensure!(positions.iter().all(|&p| p >= 0 && (p as usize) < native.positions),
                     "native draft block position exceeds admitted rotary table");
@@ -1603,6 +1711,7 @@ impl<'a> DsparkDrafter<'a> {
                     l.glmf_dspark_add_rmsnorm(w.h.buffer.ptr, w.delta.buffer.ptr, next.ptr, w.h.buffer.ptr, w.n.buffer.ptr,
                         rows, h, eps, s)?;
                 }
+            }
             }
             match head {
                 HeadRef::Bf16(weight) if serving => crate::shared::draft::launch_bf16_head(w.output()?.head.as_ref().context("BF16 dSpark head was not prepared before serving")?,
