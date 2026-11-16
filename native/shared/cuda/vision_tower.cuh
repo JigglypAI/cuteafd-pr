@@ -98,6 +98,12 @@ size_t scratch_generic_tower(const cuteafd_vision_spec& s,unsigned char* arena,G
   // Projection/grouping stages own distinct source and destination ranges.
   // Their storage aliases transformer temporaries only after final norm.
   const size_t units=s.max_tokens;
+  // MiniMax first projects each patch before grouping. Its expanded source and
+  // both first-stage linear buffers are simultaneous until the grouping launch.
+  if(t.projection_order==2) {
+    take(out.preprojector,n*t.projectors[0].hidden_width*2);
+    take(out.preprojected,n*t.projectors[0].output_width*2);phase();
+  }
   const size_t projected=t.projection_order==2?t.projectors[0].output_width:h;
   take(out.grouped,units*4*projected*2);
   size_t hidden_bytes=0,result_bytes=0;
@@ -107,7 +113,7 @@ size_t scratch_generic_tower(const cuteafd_vision_spec& s,unsigned char* arena,G
     if(p.kind) {hidden_bytes=std::max(hidden_bytes,rows*p.hidden_width*2);result_bytes=std::max(result_bytes,rows*p.output_width*2);}
   }
   take(out.projector,hidden_bytes);take(out.projector_result,result_bytes);phase();
-  take(out.projector_result,result_bytes);take(out.output,units*s.output_width*2);phase();
+  take(out.postnorm_input,result_bytes);take(out.output,units*s.output_width*2);phase();
   return phase_base+peak;
 }
 
