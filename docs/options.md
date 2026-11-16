@@ -135,6 +135,27 @@ these request values do not imply that a Planned checkpoint has a serving execut
 | --- | --- | --- | --- |
 | `reasoning_effort` (Inkling) | `high` (= 0.9) | `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, or a JSON number in `[0, 0.99]` | Native template values are 0, 0.1, 0.2, 0.7, 0.9, 0.99 and 0.99, respectively. A top-level value takes precedence over `chat_template_kwargs.reasoning_effort`; explicit thinking-off resolves to `none`. Reasoning and tool calls use native message channels. Only `<|content_model_end_sampling|>` (token 200006) ends generation; `<|end_message|>` closes a channel and is not an EOS stop. |
 
+### Inkling Serving
+
+Inkling exposes `cuteafd serve --family inkling2` and `./run.sh --wip SLOT`
+for initial text-only qualification on one RTX and 2-8 Spark expert endpoints.
+Use native MXFP8 or the MC original core; native mixed NVFP4, compact cores,
+bundled media and dSpark remain unqualified. Public dispatch is not a serving
+or fidelity qualification claim. A matching WIP build must include the Inkling
+padded-transpose load export and native expert packages.
+
+`ATTENTION_PLACEMENT=auto` and GPU embedding/device selection are required;
+explicit `heads`, `layers`, `context` and multi-RTX serving refuse. Set
+`SPECULATOR=off`, `VISION=off` and `AUDIO=off`. Inkling accepts the shared
+`CONCURRENCY`, `POOL_TOKENS=auto|N`, `MAX_CONTEXT_TOKENS`,
+`PREFIX_CACHE_ENTRIES`, `HOST_CACHE_BYTES`, KV reservation and loop-abort keys,
+plus `RTX_EXPERT_LAYERS=auto|all|N`, `PREFILL_ROWS` (a multiple of 64 up to
+4096), `PREFILL_WAVES` (1-3), `GPU_GRAPH_RESERVE`, its extra/cap keys and
+`GRAPH_TRACE`. `PREFILL_PACKING` and `KV_CACHE` are not selectable launch keys:
+KV uses native BF16 interleaved planes, convolution/residual state uses F32,
+and prefix restores preserve captured state exactly. Report the admitted KV
+pool rather than assuming the default target fits these owners.
+
 ### MiniMax Serving
 
 MiniMax M3.1 Flash supports public `cuteafd serve --family minimax_m3` and

@@ -475,7 +475,7 @@ if [[ "$family" == qwen3_5 ]]; then
     *) release_die "DECODE_GRAPHS must be on or off" ;;
   esac
 fi
-if [[ "$family" == mimo_v2 || "$family" == kimi_k3 || "$family" == glm5 || "$family" == glm5_flash || "$family" == qwen4 || "$family" == deepseek_v4 || "$family" == deepseek_v41 || "$family" == qwen3_5 || "$family" == muse_spark || "$family" == step5 || "$family" == minimax_m3 ]]; then
+if [[ "$family" == mimo_v2 || "$family" == kimi_k3 || "$family" == glm5 || "$family" == glm5_flash || "$family" == qwen4 || "$family" == deepseek_v4 || "$family" == deepseek_v41 || "$family" == qwen3_5 || "$family" == muse_spark || "$family" == step5 || "$family" == minimax_m3 || "$family" == inkling2 ]]; then
   local key graph_trace
   for key in GPU_GRAPH_RESERVE GPU_GRAPH_RESERVE_EXTRA GPU_GRAPH_RESERVE_EXTRA_CAP; do
     [[ -z "$(get "$key")" ]] || graph_census_args+=(-e "CUTEAFD_$key=$(get "$key")")
@@ -1298,7 +1298,7 @@ detected_family="$(release_config_family "$config" "$core_view")"
 core_view_args=(--core-view "$core_view")
 serve_core_view_args=()
 case "$family" in
-  glm5|glm5_flash|kimi_k3|step5|muse_spark) serve_core_view_args=("${core_view_args[@]}") ;;
+  glm5|glm5_flash|kimi_k3|step5|muse_spark|inkling2) serve_core_view_args=("${core_view_args[@]}") ;;
   *) [[ "$core_view" == original ]] || release_die "CORE_VIEW=$core_view is unsupported for $family" ;;
 esac
 
@@ -1370,6 +1370,7 @@ case "$family" in
   qwen3_5) serve=serve-qwen35 ;;
   kimi_k3) serve=serve-kimi ;;
   minimax_m3) serve=serve-minimax ;;
+  inkling2) serve=serve-inkling2 ;;
   step5) serve=serve-step5 ;;
   muse_spark) serve=serve-muse ;;
   *) echo "run-family.sh serves DeepSeek V4, GLM 5.x, GLM 5.3 Flash, MiMo V2, Qwen 3.8, Kimi K3, Step-5 and Muse Spark checkpoints, not $family (./run.sh serves DeepSeek V4.1)" >&2; exit 2 ;;
@@ -1379,7 +1380,7 @@ esac
 # token embeddings. Kimi ships no MTP head; Step-5 defaults to native MTP
 # depth 3 (SPECULATOR=off disables it).
 text_family=0
-[[ "$family" != kimi_k3 && "$family" != step5 && "$family" != minimax_m3 ]] || text_family=1
+[[ "$family" != kimi_k3 && "$family" != step5 && "$family" != minimax_m3 && "$family" != inkling2 ]] || text_family=1
 # These commands own automatic context, pool and Spark budgets independently of media.
 standalone_family=$text_family
 [[ "$family" != muse_spark ]] || standalone_family=1
@@ -1647,6 +1648,11 @@ if [[ "$split" != off ]]; then
   elif [[ "$family" == qwen3_5 && "$explicit_coordinator_gpus" != *,* ]]; then coordinator_gpu_count=1
   fi
 fi
+if [[ "$family" == inkling2 ]]; then
+  [[ "$rtx_gpus" != 2 && "$split" != heads && "$explicit_coordinator_gpus" != *,* ]] ||
+    release_die "Inkling serving requires one coordinator GPU; multi-GPU execution is not implemented"
+  coordinator_gpu_count=1
+fi
 release_resolve_coordinator_gpus "$explicit_coordinator_gpus" "$coordinator_gpu_count"
 profile_bytes="$(release_cuda_total_bytes "$RELEASE_COORDINATOR_GPU_UUID")" || release_die "cannot query coordinator CUDA capacity"
 profile="$(release_coordinator_profile "$profile_bytes" "$coordinator_budget")" || release_die "cannot resolve coordinator capacity profile"
@@ -1809,7 +1815,7 @@ kv_reserve_args=()
 [[ -z "$(get KV_EARLY_TERMINATION_MIN_OUTPUT_TOKENS)" ]] ||
   kv_reserve_args+=(--kv-early-termination-min-output-tokens "$(get KV_EARLY_TERMINATION_MIN_OUTPUT_TOKENS)")
 case $family in
-  mimo_v2|glm5|glm5_flash|qwen4|qwen3_5|deepseek_v4|kimi_k3|step5|muse_spark|minimax_m3)
+  mimo_v2|glm5|glm5_flash|qwen4|qwen3_5|deepseek_v4|kimi_k3|step5|muse_spark|minimax_m3|inkling2)
     family_args+=(--prefix-cache-entries "$effective_prefix_entries")
     [[ "$(get HOST_CACHE_BYTES auto)" == 0 ]] || family_args+=(--host-cache-bytes "$(get HOST_CACHE_BYTES auto)") ;;
 esac
@@ -1955,6 +1961,9 @@ if [[ $family == muse_spark ]]; then
   local_layers="$(get RTX_EXPERT_LAYERS auto)"
   family_args+=(--rtx-expert-layers "$local_layers")
   [[ -z "$(get EXPERT_PARTIAL_BF16_MAX_ROWS)" ]] || family_args+=(--expert-partial-bf16-max-rows "$(get EXPERT_PARTIAL_BF16_MAX_ROWS)")
+fi
+if [[ $family == inkling2 ]]; then
+  family_args+=(--rtx-expert-layers "$(get RTX_EXPERT_LAYERS auto)")
 fi
 if [[ $family == minimax_m3 ]]; then
   local_layers="$(get RTX_EXPERT_LAYERS auto)"
@@ -2294,7 +2303,7 @@ case "$family" in
   deepseek_v4)
     [[ -z "$(get PREFILL_SPAN_ROWS)" ]] || lane_env_args+=(-e "CUTEAFD_PREFILL_SPAN_ROWS=$(get PREFILL_SPAN_ROWS)")
     ;;
-  glm5|glm5_flash|qwen4|qwen3_5|kimi_k3|step5|muse_spark|mimo_v2|minimax_m3) ;;
+  glm5|glm5_flash|qwen4|qwen3_5|kimi_k3|step5|muse_spark|mimo_v2|minimax_m3|inkling2) ;;
   *) echo "missing worker endpoint geometry for $family" >&2; exit 2 ;;
 esac
 if [[ -n "$expert_input" && "$expert_input" != fp8 && "$ranks" == 0 ]]; then
@@ -2411,7 +2420,7 @@ audio_encoder_hash=""
   fi
   [[ -z "$(get SPARK_PREFILL_REPLY_FORMAT)" ]] || plan_draft_args+=(--spark-prefill-reply-format "$(get SPARK_PREFILL_REPLY_FORMAT)")
   [[ -z "$(get SPARK_DECODE_REPLY_FORMAT)" ]] || plan_draft_args+=(--spark-decode-reply-format "$(get SPARK_DECODE_REPLY_FORMAT)")
-  if [[ "$family" == minimax_m3 ]]; then
+  if [[ "$family" == minimax_m3 || "$family" == inkling2 ]]; then
     plan_draft_args+=(--prefix-cache-entries "$effective_prefix_entries")
     [[ -z "$(get PREFIX_CACHE_MARK_MIB)" ]] || plan_draft_args+=(--prefix-cache-mark-mib "$(get PREFIX_CACHE_MARK_MIB)")
     [[ -z "$(get PREFILL_ROWS)" ]] || plan_draft_args+=(--prefill-rows "$(get PREFILL_ROWS)")
@@ -2518,7 +2527,7 @@ audio_encoder_hash=""
       *) release_die "DECODE_GRAPHS must be on or off" ;;
     esac
   fi
-  if [[ "$family" == mimo_v2 || "$family" == kimi_k3 || "$family" == glm5 || "$family" == glm5_flash || "$family" == qwen4 || "$family" == deepseek_v4 || "$family" == deepseek_v41 || "$family" == qwen3_5 || "$family" == step5 || "$family" == minimax_m3 ]]; then
+  if [[ "$family" == mimo_v2 || "$family" == kimi_k3 || "$family" == glm5 || "$family" == glm5_flash || "$family" == qwen4 || "$family" == deepseek_v4 || "$family" == deepseek_v41 || "$family" == qwen3_5 || "$family" == step5 || "$family" == minimax_m3 || "$family" == inkling2 ]]; then
     for key in GPU_GRAPH_RESERVE GPU_GRAPH_RESERVE_EXTRA GPU_GRAPH_RESERVE_EXTRA_CAP SPARK_GRAPH_RESERVE; do
       [[ "$family" != kimi_k3 || "$key" != SPARK_GRAPH_RESERVE ]] || continue
       [[ -z "$(get "$key")" ]] || plan_profile_env+=(-e "CUTEAFD_$key=$(get "$key")")

@@ -1,5 +1,4 @@
-//! Inkling HTTP/request lifecycle over the shared scheduler. CLI dispatch is
-//! intentionally not registered until the v52f native load pin promotes.
+//! Inkling HTTP/request lifecycle over the shared scheduler.
 use crate::shared::{prefix::PrefixArgs, token_io::TokenIoArgs};
 use anyhow::{ensure, Context, Result};
 use cuteafd_loader::{families::inkling2::Inkling2Config, placement::planner::PrefillShape, plan::Checkpoint};
