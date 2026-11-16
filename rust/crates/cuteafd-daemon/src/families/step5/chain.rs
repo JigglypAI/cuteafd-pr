@@ -73,8 +73,7 @@ fn weight_layout(layout: &RankWeightLayout, rope: &cuteafd_loader::plan::rope::T
 fn workspace_requests(layout: &RankWeightLayout,
     layer: &cuteafd_loader::plan::families::step5::coordinator::LayerContract,
     rows: usize) -> Result<Vec<u64>> {
-    use cuteafd_loader::{formats::trellis_core::ProjectionScratchLayout,
-        plan::families::step5::native};
+    use cuteafd_loader::plan::families::step5::native;
     let mut requests = if layer.sliding.is_some() {
         native::swa_planes(rows, layer.geometry.query_heads)?.to_vec()
     } else { native::csa_planes(rows)?.to_vec() };
@@ -83,17 +82,13 @@ fn workspace_requests(layout: &RankWeightLayout,
     } else { native::routed_planes(rows)?.to_vec() });
     // Cold owners allocate every plane independently, unlike serving's
     // serialized arena. Native attention and FFN each retain packed scratch.
-    let mut scratch = std::collections::BTreeMap::<bool, ProjectionScratchLayout>::new();
     let prefix = format!("model.layers.{}.", layer.layer);
-    for (name, core) in layout.core.iter().filter(|(name, _)| name.starts_with(&prefix)) {
-        let next = ProjectionScratchLayout::new(core.shape[1], core.shape[0], rows)?;
-        let attention = name.contains(".self_attn.");
-        match scratch.get_mut(&attention) {
-            Some(owner) => owner.merge(&next)?,
-            None => { scratch.insert(attention, next); }
+    for attention in [true,false] {
+        if let Some(scratch)=native::projection_scratch_layout(layout,rows,|name|
+            name.starts_with(&prefix) && name.contains(".self_attn.")==attention)? {
+            requests.push(scratch.packed_bytes()?);
         }
     }
-    for layout in scratch.values() { requests.push(layout.packed_bytes()?); }
     Ok(requests.into_iter().map(|bytes| bytes as u64).collect())
 }
 

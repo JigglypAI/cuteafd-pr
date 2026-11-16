@@ -476,3 +476,19 @@ def test_mc_mtp_docs_distinguish_original_core_from_unchanged_experts():
         doc = (ROOT / "docs" / "models" / f"{family}.md").read_text()
         core = doc.split("## Core views", 1)[1].split("\n## ", 1)[0]
         assert "MTP core" in core and "BF16" in core and "K4 MTP" in core
+
+
+def test_mc_core_view_owns_glm_target_conversion_without_global_switch():
+    text = DOC.read_text()
+    assert "CUTEAFD_GLM_BF16" not in text
+    assert "CUTEAFD_GLM_BF16" not in (ROOT / "scripts/lib/family-keys.sh").read_text()
+    assert "CUTEAFD_GLM_BF16" not in (ROOT / "scripts/launch/run-family.sh").read_text()
+    assert "`CORE_VIEW`" in text and "`fp8-compact`" in text
+
+
+def test_mc_fp8_lever_reports_measured_glm_and_step_quality_costs():
+    text = DOC.read_text()
+    assert "49.04/180.68/3392 to 53.52/191.81/3122" in text
+    assert "59.87/216.73/2740 to 68.98/266.95/2562" in text
+    assert "0.04530/0.03880" in text and "0.01597/0.01429" in text
+    assert "no paired non-inferiority claim" in text

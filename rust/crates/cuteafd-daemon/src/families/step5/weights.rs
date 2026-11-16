@@ -100,7 +100,7 @@ pub(super) fn validate_live_buffers(device: i32, weights: &[CuteafdDeviceBuffer]
 
 pub(super) fn load_operand<'a>(
     device: Device<'a>,
-    checkpoint: &'a Checkpoint,
+    checkpoint: &Checkpoint,
     layout: &RankWeightLayout,
     operand: &WeightOperand,
     arena: Option<&DeviceWeightArena<'a>>,

@@ -157,6 +157,11 @@ impl ProjectionScratchLayout {
     }
     pub fn storage(&self) -> Result<ProjectionStorageLayout> {
         let mut owners = self.extents.clone();
+        if !owners.contains_key("partial") {
+            ensure!(owners.len() == 1 && owners.get("fp8").is_some_and(|bytes| *bytes == 256)
+                && (1..=4096).contains(&self.rows), "dense trellis native partial absent");
+            return Ok(ProjectionStorageLayout { owners, route_offsets: BTreeMap::new() });
+        }
         let partial = owners.remove("partial").context("dense trellis native partial absent")?;
         let route_offsets = BTreeMap::from([("partial", 0)]);
         owners.insert("route arena", partial);
@@ -274,6 +279,34 @@ mod tests {
     fn projection(n: usize, k: usize, split: CoreSplit) -> CoreProjection {
         CoreProjection { stem: "model.projection".into(), bits: 6, codebook: Exl3Codebook::Mcg,
             shape: [n, k], stored_outputs: n, split, source_bytes: 0 }
+    }
+
+    #[test]
+    fn fp8_only_scratch_has_one_explicit_owner_without_trellis_partial() -> Result<()> {
+        // Step body and GLM target/draft FP8 head scratch share the storage
+        // inventory contract, including recorded push planning before allocation.
+        for family in ["step5", "glm5"] {
+            for rows in [1,64,2048,4096] {
+                let fp8=ProjectionScratchLayout {rows,extents:BTreeMap::from([("fp8",256)])};
+                let storage=fp8.storage()?;
+                assert_eq!(storage.owners,BTreeMap::from([("fp8",256)]),"{family}");
+                assert!(storage.route_offsets.is_empty());
+                assert_eq!(fp8.bytes()?,256);
+                assert_eq!(fp8.packed_bytes()?,256);
+                let mut mixed=ProjectionScratchLayout::new(4096,4096,rows)?;
+                mixed.merge(&fp8)?;
+                assert!(mixed.storage()?.route_offsets.contains_key("partial"));
+                assert_eq!(mixed.storage()?.owners["fp8"],256);
+                let mut broken=mixed;
+                broken.extents.remove("partial");
+                assert!(broken.storage().is_err(),"{family}: malformed trellis must not pass asFP8");
+            }
+        }
+        for extents in [BTreeMap::new(),BTreeMap::from([("fp8",0)]),BTreeMap::from([("fp8",512)]),
+            BTreeMap::from([("rotated",256)])] {
+            assert!(ProjectionScratchLayout {rows:64,extents}.storage().is_err());
+        }
+        Ok(())
     }
 
     #[test]

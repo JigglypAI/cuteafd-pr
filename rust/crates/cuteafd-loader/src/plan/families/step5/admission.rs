@@ -518,7 +518,9 @@ pub fn admit_mtp_with_contract(checkpoint: &Checkpoint, inputs: &RuntimeInputs, 
                     .context("Step-5 predictor weight forecast overflow")?;
                 native.drafter_requests.extend(private_requests.iter().copied());
                 native.vocabulary_heads.extend((0..depth).filter(|stage| !predictor.core.contains_key(
-                    &format!("model.layers.{}.transformer.shared_head.output.weight", cfg.layers + stage)))
+                    &format!("model.layers.{}.transformer.shared_head.output.weight", cfg.layers + stage))
+                    && !predictor.operands.iter().any(|owner| owner.name == format!("model.layers.{}.transformer.shared_head.output.weight",cfg.layers+stage)
+                        && owner.dtype == cuteafd_core::DType::F8E4M3))
                     .map(|stage| format!("mtp-{stage}")));
                 native.workspace = super::native::with_arena_phase(native.workspace, native.projection_bytes, workspace)?;
             }

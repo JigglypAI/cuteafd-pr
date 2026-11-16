@@ -188,8 +188,8 @@ impl DensePlan {
             "unsupported Step-5 dense clamp {limit}"
         );
         let native_names = ["gate", "up", "down"].map(|p| format!("model.layers.{layer}.mlp.{p}_proj.weight"));
-        let native = native_names.iter().all(|name| layout.core.contains_key(name));
-        ensure!(native || native_names.iter().all(|name| !layout.core.contains_key(name)),
+        let native = native_names.iter().all(|name| layout.native_projection(name));
+        ensure!(native || native_names.iter().all(|name| !layout.native_projection(name)),
             "Step-5 layer {layer} dense FFN mixes native and BF16 operands");
         if native {
             return Self::prepare_native(programs, checkpoint, layer, rows, available, reservations, layout,
@@ -299,12 +299,12 @@ impl DensePlan {
             .context("dense norm operand missing")?.clone();
         ensure!(norm.dtype == DType::F32 && norm.shape == [HIDDEN], "Step-5 dense norm shape/dtype");
         for (name, shape) in names.iter().zip([[DENSE, HIDDEN], [DENSE, HIDDEN], [HIDDEN, DENSE]]) {
-            let core = &layout.core[name];
-            ensure!(core.shape == shape && core.ranks == 1, "{name}: native dense FFN must be whole [N,K]={shape:?}");
+            let actual=layout.projection_shape(name).context("native dense shape")?;
+            ensure!(actual == shape, "{name}: native dense FFN must be whole [N,K]={shape:?}");
         }
         let mut admission = Admission::new(rows, &[&norm], available, reservations)?;
         // Native weights are compressed; count their exact resident bytes.
-        admission.bytes = names.iter().try_fold(admission.bytes, |n, name| n.checked_add(layout.core[name].bytes as u64))
+        admission.bytes = names.iter().try_fold(admission.bytes, |n, name| n.checked_add(layout.projection_bytes(name).unwrap()))
             .context("dense native admission overflow")?;
         let activation = format!("step5_post_silu_split_w13824_c{}", limit as u32);
         let spec = programs.spec(&activation)?;

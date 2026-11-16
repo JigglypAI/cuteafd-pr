@@ -198,7 +198,7 @@ pub fn resident_owned(checkpoint: &Checkpoint, ranks: usize, layers: usize, owne
     let core = crate::families::glm5::core::CoreInventory::from_checkpoint(&cfg, checkpoint)?;
     if !core.native.is_empty() {
         return crate::placement::families::glm5::weights::WeightInventory::from_checkpoint(
-            checkpoint, ranks, layers, owners, crate::families::glm5::native_bf16(), false,
+            checkpoint, ranks, layers, owners, true, false,
             crate::placement::planner::EmbeddingHome::Device(0))?.resident_groups();
     }
     let trellis = !core.projections.is_empty();
@@ -211,7 +211,7 @@ pub fn resident_owned(checkpoint: &Checkpoint, ranks: usize, layers: usize, owne
     let mut put = |rank: usize, group: &str, format: &str, bytes: u64| {
         *groups[rank].entry((group.into(), format.into())).or_default() += bytes.max(256);
     };
-    let native = crate::families::glm5::native_bf16();
+    let native = true;
     use crate::families::glm5::names::Operand as Op;
     // Operand names come from the checkpoint's variant (GLM HF names, Mistral
     // consolidated names); a variant without an operand has no such tensor.
@@ -533,7 +533,7 @@ fn placement(report: &PlanReport, input: &crate::plan::PlanInput, options: &Layo
     let embedding = if options.host_embedding && checkpoint.require_untied_embedding(cfg.embedding()).is_ok() {
         EmbeddingHome::HostPinned
     } else { EmbeddingHome::Device(0) };
-    let target = TargetFacts::checkpoint(checkpoint, cfg.layers, gpus, owners.as_deref(), crate::families::glm5::native_bf16(), &[embedding], core)?;
+    let target = TargetFacts::checkpoint(checkpoint, cfg.layers, gpus, owners.as_deref(), true, &[embedding], core)?;
     let physical = LocalPhysicalInput { layers: (cfg.first_moe_layer..cfg.layers).collect(),
         max_rows: rows.max(glm::DECODE_ROWS) as usize, lanes: lanes as usize,
         storage: LocalStorage::for_snapshot(&checkpoint.snapshot)?,
@@ -587,7 +587,7 @@ fn placement(report: &PlanReport, input: &crate::plan::PlanInput, options: &Layo
         crate::placement::ResidentWeights(options.weight_budget_bytes), options.spark_reply_formats);
     let mut prepared = ProductionInput { expert_usage: options.expert_usage, cfg: &cfg, layers: cfg.layers, context, maximum_pool_tokens,
         attention, gpus, prefill,
-        blas_head: if core.is_some_and(|core| core.ranks[0].target_head.is_some()) { serving::BlasHead::Native }
+        blas_head: if core.is_some_and(|core| core.ranks[0].target_head.is_some() || core.ranks[0].fp8_head_scratch.is_some()) { serving::BlasHead::Native }
             else { options.bf16_target_head }, blas: vec![], target, draft, scratch: scratch.unwrap_or_default(), context_scratch: context_programs,
         exchange_element_bytes: if exchange_f32 { 4 } else { 2 }, peer_diagnostics: false,
         prefix_host: crate::families::glm5::host_prefix_enabled(gpus, attention,

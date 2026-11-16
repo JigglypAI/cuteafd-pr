@@ -53,8 +53,8 @@ impl InputPlan {
         let cfg = Config::parse(checkpoint)?;
         let prefix = format!("model.layers.{}.", cfg.layers + stage);
         let eh_name = format!("{prefix}eh_proj.weight");
-        let native = layout.core.get(&eh_name).map(|core| {
-            ensure!(core.shape == [H, 2 * H] && core.ranks == 1, "Step-5 native eh_proj geometry");
+        let native=layout.native_projection(&eh_name).then(||->Result<_> {
+            ensure!(layout.projection_shape(&eh_name)==Some([H,2*H]),"Step-5 nativeEHshape");
             Ok(eh_name.clone())
         }).transpose()?;
         let bf16_eh: &[(&str, DType, Vec<usize>)] = &[("eh_proj.weight", DType::Bf16, vec![H, 2 * H])];
@@ -72,9 +72,10 @@ impl InputPlan {
         validate_programs(programs.spec("step5_final_norm")?,
             programs.spec("step5_mtp_eh")?, rows)?;
         let native_bytes = match &native {
-            Some(name) => (layout.core[name].bytes as u64).checked_add(
-                cuteafd_loader::formats::trellis_core::ProjectionScratchLayout::new(2 * H, H, rows)?.packed_bytes()? as u64)
-                .context("Step-5 native eh overflow")?,
+            Some(name)=>layout.projection_bytes(name).unwrap().checked_add(
+                if layout.native_operand(name).is_some_and(|owner|owner.fp8()) {256}
+                else {cuteafd_loader::formats::trellis_core::ProjectionScratchLayout::new(2*H,H,rows)?.packed_bytes()? as u64})
+                .context("Step-5 nativeEHoverflow")?,
             None => 0,
         };
         let bytes = weights.iter().map(|w| w.allocation_bytes)

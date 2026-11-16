@@ -199,6 +199,15 @@ impl HookBuffers {
             }
         }
         if let Some(core) = &self.core {
+            for (name, bytes, category) in [
+                ("target_head", core.fp8_head_scratch, Category::Workspace),
+                ("draft_head", core.fp8_draft_head_scratch, Category::Drafter),
+            ] {
+                if let Some(bytes) = bytes {
+                    b.add(&format!("core.{name}.fp8_scratch"), bytes as u64,
+                        Lifetime::TARGET, category, None)?;
+                }
+            }
             // bind_core/bind_draft_core_head allocate after target KV, before warmup.
             for (name, layout, category) in [
                 ("target_head", &core.target_head, Category::Workspace),

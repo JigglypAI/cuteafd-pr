@@ -36,6 +36,7 @@ fn layouts() -> HookBuffers {
             prefill: Some(ProjectionScratchLayout::new(128, 256, 128).unwrap()),
             target_head: Some(ProjectionScratchLayout::new(128, 256, 64).unwrap()),
             draft_head: Some(ProjectionScratchLayout::new(128, 256, 96).unwrap()),
+            fp8_head_scratch: None, fp8_draft_head_scratch: None,
             retained_rows: 448,
             receive_suffix: 7,
         }),

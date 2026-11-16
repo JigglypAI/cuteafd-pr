@@ -841,11 +841,11 @@ impl<'a> GlmEngine<'a> {
             }
             self.core_programs.push(programs);
         }
-        if let super::weights::GlmHead::K6(weights) = &self.weights.head {
-            self.target_core_head = Some(Rc::new(super::core_runtime::CoreHead::new(self.programs, weights, DECODE_ROWS,
+        if matches!(&self.weights.head,super::weights::GlmHead::K6(_) | super::weights::GlmHead::BlockFp8(_)) {
+            self.target_core_head = Some(Rc::new(super::core_runtime::CoreHead::new(self.programs, &self.weights.head, DECODE_ROWS,
                 crate::shared::memory::device::Device { library: self.library, id: self.device }, self.stream,
-                admission.as_ref().and_then(|a| a.ranks[0].target_head.as_ref())
-                    .context("GLM K6 target head has no admitted scratch")?,
+                admission.as_ref().map(|a| &a.ranks[0])
+                    .context("GLM native target head has no admitted scratch")?, false,
                 Tag::workspace("glm/target-head-projection"))?));
         }
         self.core_admission = admission;
@@ -853,13 +853,14 @@ impl<'a> GlmEngine<'a> {
     }
 
     pub(crate) fn bind_draft_core_head(&mut self) -> Result<()> {
-        if let (Some(drafter), super::weights::GlmHead::K6(weights)) = (&self.drafter, &self.weights.head) {
+        if let Some(drafter) = &self.drafter {
+            if !matches!(&self.weights.head,super::weights::GlmHead::K6(_) | super::weights::GlmHead::BlockFp8(_)) { return Ok(()); }
             let rows = drafter.max_batch_sequences().checked_mul(drafter.cfg.block)
                 .context("GLM K6 drafter head row extent overflow")?;
-            self.draft_core_head = Some(super::core_runtime::CoreHead::new(self.programs, weights, rows,
+            self.draft_core_head = Some(super::core_runtime::CoreHead::new(self.programs, &self.weights.head, rows,
                 crate::shared::memory::device::Device { library: self.library, id: self.device }, self.stream,
-                self.core_admission.as_ref().and_then(|a| a.ranks[0].draft_head.as_ref())
-                    .context("GLM K6 drafter head has no admitted scratch")?,
+                self.core_admission.as_ref().map(|a| &a.ranks[0])
+                    .context("GLM native drafter head has no admitted scratch")?, true,
                 Tag::drafter_workspace("glm/draft-head-projection"))?);
         }
         Ok(())
@@ -867,8 +868,8 @@ impl<'a> GlmEngine<'a> {
 
     pub(crate) fn draft_target_head(&self) -> Result<crate::shared::speculation::dflash::TargetHead<'_>> {
         match &self.weights.head {
-            super::weights::GlmHead::K6(weights) => Ok(self.draft_core_head.as_ref()
-                .context("GLM K6 drafter head scratch not admitted")?.target(weights)),
+            super::weights::GlmHead::K6(_) | super::weights::GlmHead::BlockFp8(_) => Ok(self.draft_core_head.as_ref()
+                .context("GLM K6 drafter head scratch not admitted")?.target(&self.weights.head)),
             head => head.target(),
         }
     }
@@ -1146,7 +1147,7 @@ impl<'a> GlmEngine<'a> {
         let (cap, mode) = if decode { ("m64", "decode") } else { ("m4096", "prefill") };
         let lead = rank == 0;
         let scratch = self.step_scratch(decode)?;
-        let native_head = matches!(self.weights.head, super::weights::GlmHead::K6(_));
+        let native_head = matches!(self.weights.head, super::weights::GlmHead::K6(_) | super::weights::GlmHead::BlockFp8(_));
         let head_workspace = cuteafd_loader::placement::families::glm5::head_workspace_bytes(lead, native_head)
             .map(|bytes| self.alloc(bytes as usize).map(Buf::owned)).transpose()?;
         let topk = self.alloc(self.scratch(&format!("{}_index_topk_{mode}_{cap}", self.cfg.program_family()))?)?;
@@ -1952,13 +1953,13 @@ impl<'a> GlmEngine<'a> {
 
     fn launch_head_logits(&self, w: &Workspace<'_>, t: usize, n: usize) -> Result<()> {
         let h = self.cfg.hidden;
-        if let super::weights::GlmHead::K6(weights) = &self.weights.head {
+        if matches!(&self.weights.head,super::weights::GlmHead::K6(_) | super::weights::GlmHead::BlockFp8(_)) {
             ensure!(n <= t && t * h * 2 <= w.x.buffer.bytes && n * self.cfg.vocab_size * 4 <= w.logits.buffer.bytes,
                 "GLM K6 logits/input exceed workspace");
             let head = w.core_head.as_ref().context("GLM K6 head scratch not admitted")?;
             for first in (0..n).step_by(DECODE_ROWS) {
                 let rows = (n - first).min(DECODE_ROWS);
-                head.launch(weights,
+                head.launch(&self.weights.head,
                     crate::shared::prefix::view(w.x.buffer, (t - n + first) * h * 2, rows * h * 2)?,
                     crate::shared::prefix::view(w.logits.buffer, first * self.cfg.vocab_size * 4,
                         rows * self.cfg.vocab_size * 4)?, rows, self.stream)?;
@@ -1973,7 +1974,7 @@ impl<'a> GlmEngine<'a> {
                     crate::shared::target_head::TargetHead::configured(), w.head.as_ref().context("LM head")?,
                     x, head.buffer.ptr.cast_const(), w.logits.buffer.ptr.cast(), n, self.stream),
                 super::weights::GlmHead::RowFp8(owner) => owner.head_logits(x, w.logits.buffer.ptr.cast(), n, self.stream),
-                super::weights::GlmHead::K6(_) => unreachable!("K6 head handled before the BF16 routes"),
+                super::weights::GlmHead::K6(_) | super::weights::GlmHead::BlockFp8(_) => unreachable!("native head handled before the BF16 routes"),
             }
         }
     }

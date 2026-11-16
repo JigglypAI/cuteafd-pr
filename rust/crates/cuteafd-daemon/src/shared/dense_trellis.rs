@@ -227,10 +227,11 @@ impl ProjectionLayout {
         let buffers = self.extents.iter().zip(storage.regions).map(|((&name, &bytes), region)| {
             Ok((name, crate::shared::prefix::view(backing.buffer, region.start, bytes)?))
         }).collect::<Result<BTreeMap<_, _>>>()?;
-        let pointer = if self.extents["table"] >= GROUPS * 8 {
-            GroupedWorkspace::pointer_table(buffers["rotated"])?
-        } else { (buffers["rotated"].ptr as u64).to_le_bytes().to_vec() };
-        device.run(|| device.library.copy_h2d(buffers["table"], &pointer))?;
+        if let Some(&table_bytes)=self.extents.get("table") {
+            let pointer=if table_bytes>=GROUPS*8 {GroupedWorkspace::pointer_table(buffers["rotated"])?}
+                else {(buffers["rotated"].ptr as u64).to_le_bytes().to_vec()};
+            device.run(||device.library.copy_h2d(buffers["table"],&pointer))?;
+        }
         Ok(ProjectionScratch { _owners: BTreeMap::from([("projection arena", backing)]), buffers, rows: self.rows })
     }
     pub(crate) fn allocate<'a>(&self,device:Device<'a>,tag:Tag)->Result<ProjectionScratch<'a>> {

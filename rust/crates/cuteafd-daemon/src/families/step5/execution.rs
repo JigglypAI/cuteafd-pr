@@ -216,14 +216,8 @@ impl<'a> NativeOwners<'a> {
 /// The one serialized native projection scratch shared by a rank's layers.
 fn native_scratch_layout(layout: &RankWeightLayout, rows: usize, count: usize)
     -> Result<Option<cuteafd_loader::formats::trellis_core::ProjectionScratchLayout>> {
-    let mut merged: Option<cuteafd_loader::formats::trellis_core::ProjectionScratchLayout> = None;
-    for (name, core) in &layout.core {
-        if !(0..count).any(|layer| name.starts_with(&format!("model.layers.{layer}."))) { continue; }
-        let [n, k] = core.shape;
-        let next = cuteafd_loader::formats::trellis_core::ProjectionScratchLayout::new(k, n, rows)?;
-        match &mut merged { Some(layout) => layout.merge(&next)?, None => merged = Some(next) }
-    }
-    Ok(merged)
+    cuteafd_loader::plan::families::step5::native::projection_scratch_layout(layout,rows,|name|
+        (0..count).any(|layer|name.starts_with(&format!("model.layers.{layer}."))))
 }
 
 fn native_scratch_bytes(layout: &RankWeightLayout, rows: usize, count: usize) -> Result<u64> {
