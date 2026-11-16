@@ -25,7 +25,7 @@ def test_glm_pointer_count_abi_matches_rust():
     assert gate.Spec.hidden.offset == 80
     assert gate.Spec.patch_bias.offset == 120
     assert gate.Spec.norm1_bias.offset == 224
-    assert ctypes.sizeof(gate.Spec) == 264
+    assert ctypes.sizeof(gate.Spec) == 272
     assert gate.Spec.perception.offset == 256
 
 

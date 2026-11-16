@@ -28,8 +28,42 @@ typedef struct {
   const uint64_t *scale1, *scale2;
 } cuteafd_vision_perception;
 
+/* Independent still-image extension. All offsets address the one admitted
+ * weight arena (UINT64_MAX = absent); rotary tables are source-matched FP32.
+ * Version/size frame an append-only prefix. Never combine with perception. */
 typedef struct {
-  uint32_t storage_abi; /* 4: optional copied PE extension, host layer storage. */
+  uint32_t kind; /* 0 none, 1 LayerNorm, 2 RMSNorm. */
+  float epsilon;
+  uint64_t weight, bias;
+} cuteafd_vision_tower_norm;
+typedef struct {
+  uint32_t kind, activation; /* kind: 0 none, 1 MLP; activation: 0 none, 1 GELU, 2 tanh GELU. */
+  uint32_t input_width, hidden_width, output_width, reserved;
+  uint64_t fc1, fc1_bias, fc2, fc2_bias;
+} cuteafd_vision_tower_projector;
+typedef struct {
+  uint32_t version, size; /* 1, sizeof(cuteafd_vision_tower). */
+  uint32_t block_norm_kind, activation;
+  float block_norm_epsilon;
+  uint32_t attention_width, temporal_patch;
+  uint32_t pixel_layout; /* 0 none, 1 raster, 2 spatial-group-major. */
+  uint32_t temporal_input; /* 0 none, 1 duplicate still; no video in v1. */
+  uint32_t rotary_kind; /* 0 none, 1 split-half THW, 2 adjacent-pair WH. */
+  uint32_t rotary_axis_dims[3], rotated_dims, passthrough_dims;
+  uint64_t inv_freq[3]; /* T,H,W; axis_dims/2 FP32 elements per active axis. */
+  uint32_t absolute_kind; /* 0 none, 1 divided-fixed spatial; stills skip time. */
+  uint32_t position_height, position_width;
+  uint32_t interpolation; /* 0 none, 1 compiled FP32 half-pixel bilinear. */
+  uint64_t absolute_position;
+  cuteafd_vision_tower_norm pre_norm, final_norm;
+  uint32_t spatial_merge;
+  uint32_t projection_order; /* 0 none, 1 group-project, 2 project-group-project. */
+  cuteafd_vision_tower_projector projectors[2];
+  cuteafd_vision_tower_norm post_norm;
+} cuteafd_vision_tower;
+
+typedef struct {
+  uint32_t storage_abi; /* 5: independent optional tower extension, PE prefix unchanged. */
   uint32_t abi_version, max_tokens, output_width, reserved;
   uint64_t weight_bytes, patch, merger_norm, merger_fc1, merger_fc2, inv_freq;
   const cuteafd_vision_block* blocks;
@@ -42,6 +76,7 @@ typedef struct {
   uint64_t merger_extra[8];
   const uint64_t *norm1_bias, *norm2_bias, *q_norm, *k_norm;
   const cuteafd_vision_perception* perception; /* null for other tower contracts. */
+  const cuteafd_vision_tower* tower; /* null preserves existing arithmetic. */
 } cuteafd_vision_spec;
 
 typedef struct {

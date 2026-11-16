@@ -59,7 +59,7 @@ def packed(monkeypatch, tmp_path):
 def test_mistral_pointer_count_abi_is_the_shared_base():
     gate = load_gate()
     assert gate.Spec is gate.common.Spec and gate.Ledger is gate.common.Ledger
-    assert ctypes.sizeof(gate.Spec) == 264
+    assert ctypes.sizeof(gate.Spec) == 272
     assert gate.Spec.perception.offset == 256
 
 

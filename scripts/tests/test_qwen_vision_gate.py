@@ -142,12 +142,21 @@ def test_head72_uses_the_b12x_le128_tile():
 def test_vision_pointer_count_abi_matches_c_rust():
     gate = module("python/tools/qualify/qwen4/qualify-vision.py", "qwen_vision_gate")
     assert ctypes.sizeof(gate.Block) == 96
-    assert ctypes.sizeof(gate.common.Spec) == 264
-    assert ctypes.sizeof(gate.Spec) == 264
+    assert ctypes.sizeof(gate.common.Spec) == 272
+    assert ctypes.sizeof(gate.Spec) == 272
     assert gate.Spec.blocks.offset == 72
     assert gate.Spec.hidden.offset == 80
     assert gate.Spec.patch_bias.offset == 120
     assert gate.Spec.norm1_bias.offset == 224
+    assert gate.Spec.perception.offset == 256
+    assert gate.Spec.tower.offset == 264
+    assert ctypes.sizeof(gate.common.PerceptionSpec) == 96
+    assert ctypes.sizeof(gate.common.TowerNorm) == 24
+    assert ctypes.sizeof(gate.common.TowerProjector) == 56
+    assert ctypes.sizeof(gate.common.TowerExtension) == 304
+    assert gate.common.TowerExtension.inv_freq.offset == 64
+    assert gate.common.TowerExtension.projectors.offset == 168
+    assert gate.common.TowerExtension.post_norm.offset == 280
 
 
 def test_qwen_patch_lut_uses_host_f64_rescale_then_f32_normalize():
@@ -620,7 +629,7 @@ def packed_spec_fields(snapshot, family, placements=None):
     values = []
     layers = ("blocks", "norm1_bias", "norm2_bias", "q_norm", "k_norm")
     for name, _ in spec._fields_:
-        if name in layers or name in ("storage_abi", "perception"):
+        if name in layers or name in ("storage_abi", "perception", "tower"):
             continue
         value = getattr(spec, name)
         if name == "norm_eps":
@@ -653,7 +662,7 @@ def test_ctypes_storage_is_owned_at_tower_depth(depth):
     spec.blocks[depth - 1].norm1 = 1234
     spec.q_norm[depth - 1] = gate.common.NO_OFFSET
     gc.collect()
-    assert spec.storage_abi == 4
+    assert spec.storage_abi == 5
     assert not spec.perception
     assert len(spec._layer_storage["blocks"]) == depth
     assert spec.blocks[depth - 1].norm1 == 1234

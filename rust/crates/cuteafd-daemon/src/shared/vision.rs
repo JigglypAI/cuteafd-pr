@@ -130,11 +130,11 @@ impl MimoConfig {
 }
 
 #[derive(Clone, Debug)]
-struct TensorRead {
-    path: PathBuf,
-    metadata: SafetensorsTensorMetadata,
-    destination: usize,
-    vector: bool,
+pub(crate) struct TensorRead {
+    pub(crate) path: PathBuf,
+    pub(crate) metadata: SafetensorsTensorMetadata,
+    pub(crate) destination: usize,
+    pub(crate) vector: bool,
 }
 /// Header-only plan. It touches no tensor data until weight/scratch admission.
 #[derive(Clone, Debug)]
@@ -143,6 +143,38 @@ pub struct TowerSpec {
     reads: Vec<TensorRead>,
 }
 impl TowerSpec {
+    /// Family-owned builders provide header plans; shared runtime retains ownership.
+    /// Does not advertise executable dispatch or read any tensor payload.
+    #[allow(dead_code)] // Consumed by family builders in the next additive step.
+    pub(crate) fn from_parts(native: VisionSpec, reads: Vec<TensorRead>) -> Result<Self> {
+        let mut ranges = Vec::new();
+        for read in &reads {
+            let source = usize::try_from(read.metadata.byte_length)
+                .map_err(|_| VisionError::Unsupported("tower source extent overflow".into()))?;
+            if read.vector && read.metadata.dtype != DType::Bf16 {
+                return Err(VisionError::Unsupported("tower vector widening requires BF16".into()));
+            }
+            let bytes = source.checked_mul(if read.vector { 2 } else { 1 })
+                .ok_or_else(|| VisionError::Unsupported("tower resident extent overflow".into()))?;
+            let end = read.destination.checked_add(bytes)
+                .ok_or_else(|| VisionError::Unsupported("tower destination overflow".into()))?;
+            if bytes == 0 || end as u64 > native.weight_bytes
+                || read.metadata.byte_offset.checked_add(read.metadata.byte_length).is_none() {
+                return Err(VisionError::Unsupported("tower read outside admitted arena".into()));
+            }
+            ranges.push((read.destination, end));
+        }
+        ranges.sort_unstable();
+        if ranges.windows(2).any(|w| w[0].1 > w[1].0) {
+            return Err(VisionError::Unsupported("overlapping tower read destinations".into()));
+        }
+        if let Some(tower) = native.tower.as_ref() { tower.validate(&native)?; }
+        Ok(Self { native, reads })
+    }
+    #[allow(dead_code)] // Family modules outside this parent use the same catalog.
+    pub(crate) fn catalog(snapshot: &Path, prefix: &str) -> Result<BTreeMap<String, (PathBuf, SafetensorsTensorMetadata)>> {
+        tower_catalog(snapshot, prefix)
+    }
     /// Header-only staged source windows of this tower's pushed contribution:
     /// BF16 vectors widen in the same windows `push::Contribution` records.
     pub(crate) fn staged_rects(&self) -> Vec<crate::shared::experts::rtx::dense::Rect> {
@@ -1148,5 +1180,28 @@ mod tests {
         assert!(flag.load(Ordering::Acquire));
         drop(send);
         assert!(matches!(ticket.poll(), Err(VisionError::Unavailable)));
+    }
+}
+
+#[cfg(test)]
+mod family_builder_hook_tests {
+    use super::*;
+    fn read(destination: usize) -> TensorRead {
+        TensorRead { path: "unread.safetensors".into(), destination, vector: false,
+            metadata: SafetensorsTensorMetadata { name: "tower.weight".into(), dtype: DType::Bf16,
+                shape: vec![8], byte_offset: 0, byte_length: 16 } }
+    }
+    #[test]
+    fn family_plan_assembly_checks_extents_without_payload_reads() {
+        let native = VisionSpec { weight_bytes: 32, ..Default::default() };
+        assert!(TowerSpec::from_parts(native.clone(), vec![read(0),read(16)]).is_ok());
+        assert!(TowerSpec::from_parts(native.clone(), vec![read(0),read(8)]).is_err());
+        assert!(TowerSpec::from_parts(native.clone(), vec![read(24)]).is_err());
+        let mut bad = read(0); bad.metadata.byte_offset = u64::MAX;
+        assert!(TowerSpec::from_parts(native.clone(), vec![bad]).is_err());
+        let mut bad = read(0); bad.metadata.dtype = DType::F32; bad.vector = true;
+        assert!(TowerSpec::from_parts(native.clone(), vec![bad]).is_err());
+        let mut bad = read(0); bad.metadata.byte_length = 0;
+        assert!(TowerSpec::from_parts(native, vec![bad]).is_err());
     }
 }
