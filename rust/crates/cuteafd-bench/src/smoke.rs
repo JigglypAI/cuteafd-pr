@@ -1593,9 +1593,10 @@ fn run_entry(entry: &Entry, repo: &Path, out_root: &Path, configs: &Path, logs: 
                 crate::sweep::run_c1_windowed(&url, api_key.as_deref(), options,
                     entry.fabric.unwrap_or(true), entry.sweep_tokens.unwrap_or(crate::sweep::TOKENS), open)
             } else {
-                crate::sweep::run_windowed(&url, api_key.as_deref(), entry.levels.as_deref().unwrap_or(&[]),
+                let concurrency = entry.panel_config.get("concurrency").map(crate::sustained::Options::parse).transpose()?.unwrap_or_default();
+                crate::sweep::run_concurrency_windowed(&url, api_key.as_deref(), entry.levels.as_deref().unwrap_or(&[]),
                     entry.post_load_c1.unwrap_or(false), entry.post_load_repeat.unwrap_or(false), entry.prefill_lengths.as_deref().unwrap_or(&[]),
-                    &prefill, entry.fabric.unwrap_or(true), entry.sweep_tokens.unwrap_or(crate::sweep::TOKENS), open)
+                    &prefill, entry.fabric.unwrap_or(true), entry.sweep_tokens.unwrap_or(crate::sweep::TOKENS), open, &concurrency)
             };
             let closed = close_window(&url, &config_path);
             let sweep = sweep?;

@@ -415,15 +415,24 @@ fn concurrency(doc: &mut Doc, t: &Theme, v: &Value, w: f64) -> f64 {
         return empty(doc, t, "no measurements yet");
     }
     let max_c = points.iter().filter_map(|p| num(p, "c")).fold(1.0, f64::max).max(2.0);
-    let agg: Vec<(f64, f64)> = points.iter().filter_map(|p| Some((num(p, "c")?, num(p, "aggregate_tok_s")?))).collect();
-    let per: Vec<(f64, f64)> = points.iter().filter_map(|p| Some((num(p, "c")?, num(p, "per_request_tok_s")?))).collect();
+    let sustained: Vec<(f64, f64)> = points.iter().filter(|p| p["phase"] == "sustained")
+        .filter_map(|p| Some((num(p, "c")?, num(p, "aggregate_tok_s")?))).collect();
+    let agg: Vec<(f64, f64)> = points.iter().filter(|p| p["phase"] != "sustained")
+        .filter_map(|p| Some((num(p, "c")?, num(p, "aggregate_tok_s")?))).collect();
+    let per: Vec<(f64, f64)> = points.iter().filter(|p| p["phase"] != "sustained")
+        .filter_map(|p| Some((num(p, "c")?, num(p, "per_request_tok_s")?))).collect();
     let h = plot_height(w);
     let plot = Plot { x: 46.0, y: 26.0, w: w - 150.0, h, xs: Scale::Log2 { min: 1.0, max: max_c },
-        ys: Scale::linear_from(agg.iter().chain(&per).map(|p| p.1), true) };
-    legend(doc, t, 46.0, 10.0, &[("aggregate", t.series[0]), ("per request", t.series[1])]);
+        ys: Scale::linear_from(agg.iter().chain(&per).chain(&sustained).map(|p| p.1), true) };
+    let mut series = vec![("aggregate", t.series[0]), ("per request", t.series[1])];
+    if !sustained.is_empty() { series.push(("sustained", t.series[2])); }
+    legend(doc, t, 46.0, 10.0, &series);
     plot.axes(doc, t, "concurrent requests", "tps", &|x| format!("C{}", x as u64));
     plot.line(doc, &agg, t.series[0], agg.last().map(|p| rate(p.1)).as_deref());
     plot.line(doc, &per, t.series[1], per.last().map(|p| rate(p.1)).as_deref());
+    if !sustained.is_empty() {
+        plot.line(doc, &sustained, t.series[2], sustained.last().map(|p| format!("sustained {}", rate(p.1))).as_deref());
+    }
     26.0 + h + 36.0
 }
 

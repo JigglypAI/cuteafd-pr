@@ -17,9 +17,38 @@ runs sampled C1 code decode. `scripts/bench/wip-cards.py` accepts the same
 repeatable `--panel-config PANEL=JSON` option; smoke matrix entries/defaults use
 `"panel_config":{"decode_content":{"contents":["code"],"temperature":1.0,
 "top_p":0.95,"seed":42}}`. Entry settings replace defaults for the same panel.
-The in-server run API accepts this same `panel_config` map. The `decode_content` and
+The in-server run API accepts this same `panel_config` map. The `decode_content`, `concurrency` and
 `spec_lossless_set` panels accept configuration; unknown panels and fields fail before
-running. This does not change the baseline, concurrency sweep or goldens.
+running. This does not change the baseline or goldens.
+
+`concurrency={"sustained":true,"multiplier":4}` adds continuous-refill rows after
+the existing closed-batch concurrency rows (which retain their schema and workload).
+`sustained` defaults to false; `multiplier` is an integer in 2..64, default 4.
+The in-server concurrency panel uses its usual levels. For an external sweep use
+`wip-cards.py --levels 8,16 --panel-config 'concurrency={"sustained":true}'`
+(with the usual kit/arms), or set that same `panel_config` in the smoke matrix.
+`--sweep-tokens` still controls the external sweep's per-request output budget.
+
+At level C, C workers immediately refill from a pool of N = multiplier * C
+requests. The steady window starts at the first completion and ends when the
+last refill is dispatched, excluding initial warm-up and final drain. Requests
+are indexed before dispatch, so scheduling cannot change the prompt/nonces across
+arms. The pool uses `CUTEAFD_BENCH_NONCE_SEED` (or `sustained-v1`) and records
+`pool_sha256`; use a fresh shared seed for independent pairs to avoid cache reuse.
+The prior untimed width warm-ups and all closed-batch points run first.
+
+Sustained `aggregate_tok_s` is an **estimate**: exact final usage token totals are
+credited pro rata by each request's first-to-last-content-token overlap with the
+window, assuming uniform per-request emission (SSE text chunks are not tokens).
+This includes boundary-crossing requests without crediting their warm-up/drain
+output. `sustained` records relative window bounds, duration, initial/total/refill/
+completed and overlapping request counts, fractional token credits, the explicit
+accounting assumption, and every request's send/completion times, token span and
+exact usage total. Errors invalidate the sustained run instead of silently
+reducing concurrency. Thermal/fabric/counter observations cover the full refill
+run including its warm-up and drain, not just the steady window. External sweep
+rows use `phase: "sustained"`; wip-cards reports `sustained C8`, `sustained C16`,
+etc., separately from `sweep C8`/`sweep C16`.
 
 `decode_content` fields are optional: `contents` selects unique names from
 `code,prose,json,math,chat,translation,summary,table` (all by default),
