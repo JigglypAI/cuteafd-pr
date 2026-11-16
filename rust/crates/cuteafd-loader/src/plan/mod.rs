@@ -1266,8 +1266,8 @@ fn plan_unrestricted(input: &PlanInput, options: &PlanOptions) -> Result<PlanRep
         }
     };
     report.vision = model.vision_mode(options.vision);
-    // An unset Spark budget is the family's own (Kimi K3 admits more than the
-    // shared default); an explicit --spark-memory-cap always wins.
+    // Header screening uses the measured inventory too; exact per-rank admission
+    // below decides fit. An explicit --spark-memory-cap always wins.
     let mut resolved = options.clone();
     if let Some(layout) = &mut resolved.layout { layout.decode_lanes = report.decode_lanes; }
     resolved.apply_spark_budget();

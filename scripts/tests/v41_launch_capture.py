@@ -65,6 +65,9 @@ if tool == "ssh":
     while rest and rest[0].startswith("-"):
         rest = rest[2:] if rest[0] in ("-o", "-F", "-p", "-i", "-l") else rest[1:]
     target, command = rest[0], " ".join(rest[1:])
+    if command == "python3 -I -":
+        print(json.dumps({"bytes": 124211863552, "boot_id": "fixture", "age_seconds": 0, "cached": False}))
+        sys.exit(0)
     home = Path(os.environ["CAPTURE_ROOT"]) / "hosts" / target
     env = dict(os.environ, HOME=str(home), CAPTURE_HOST=target)
     env.pop("HF_HOME", None)

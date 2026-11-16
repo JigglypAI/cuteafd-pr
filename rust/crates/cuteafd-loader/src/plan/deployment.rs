@@ -282,8 +282,8 @@ mod tests {
             assert_eq!(deployment.roles.len(), ranks);
             for device in deployment.memory_layout.devices.iter()
                 .filter(|device| device.kind == cuteafd_core::memory_layout::DeviceKind::Spark) {
-                assert_eq!(device.worker_budget_bytes, 108 << 30);
-                assert_eq!(device.capacity_bytes, 121 << 30);
+                assert_eq!(device.worker_budget_bytes, crate::serving_capacity::spark_memory::serving_bytes()[device.index as usize]);
+                assert_eq!(device.capacity_bytes, device.worker_budget_bytes);
             }
             assert_eq!(deployment.topology, Topology { tp: ranks });
             assert_eq!(deployment.artifact_requirements.spark_tp_role.as_deref(),

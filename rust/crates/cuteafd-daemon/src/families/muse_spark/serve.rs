@@ -224,6 +224,7 @@ pub(super) fn with_backend<T>(args: &ServeArgs, run: impl FnOnce(&super::backend
         max_context: args.max_context.filter(|&tokens| tokens > 0),
         pool_tokens: args.pool_tokens.filter(|&tokens| tokens > 0), onboard: args.rtx_expert_layers,
         spark_budget_bytes: args.spark_budget_bytes(),
+        spark_rank_bytes: cuteafd_loader::serving_capacity::spark_memory::runtime_bytes(&args.peers.iter().map(ToString::to_string).collect::<Vec<_>>())?,
         partial_bf16_max_rows: args.expert_partial_bf16_max_rows,
         partial_reply_formats: cuteafd_core::spark_reply::requested(),
         local: cuteafd_loader::placement::families::muse_spark::local_workspace(&catalog,

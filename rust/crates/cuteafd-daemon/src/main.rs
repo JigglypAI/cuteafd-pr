@@ -334,8 +334,10 @@ async fn run() -> Result<()> {
         match Cli::from_arg_matches(&matches) {
             Ok(mut cli) => {
                 if let Some(samples) = &cli.spark_memory_samples {
-                    cuteafd_loader::serving_capacity::spark_memory::install_samples(samples)
-                        .expect("valid boot-keyed idle Spark memory samples");
+                    if let Err(error) = cuteafd_loader::serving_capacity::spark_memory::install_samples(samples) {
+                        clap::Error::raw(clap::error::ErrorKind::ValueValidation,
+                            format!("invalid --spark-memory-samples: {error}")).exit();
+                    }
                 }
                 cli::resolve_tp2_dflash(&mut cli.command, &matches);
                 if let Commands::Plan(args) = &mut cli.command {

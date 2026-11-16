@@ -151,7 +151,7 @@ fn options(args: &PlanArgs) -> Result<PlanOptions, PlanError> {
             layout.spark_rank_bytes = if let Some(samples) = &args.spark_memory_samples {
                 cuteafd_loader::serving_capacity::spark_memory::sample_bytes(samples).map_err(|error|
                     PlanError::InvalidOption { option: "--spark-memory-samples", reason: error.to_string() })?
-            } else { args.deployment_peers.iter().map(|peer|
+            } else { args.deployment_peers.iter().take(args.spark_ranks.unwrap_or(args.available_sparks)).map(|peer|
                 cuteafd_loader::serving_capacity::spark_memory::measured_bytes(peer)
                     .map_err(|error| PlanError::InvalidOption { option: "--deployment-peers", reason: error.to_string() }))
                 .collect::<Result<Vec<_>, _>>()? };
@@ -218,10 +218,12 @@ fn resolve_settings(args: &mut PlanArgs, family: &str, cfg: &std::collections::B
 
 fn resolved_output(mut value: serde_json::Value, args: &PlanArgs, mut settings: ResolvedSettings,
     cfg: &std::collections::BTreeMap<String, String>, replay_explicit: Option<crate::cli::PlanReplayRecords>) -> serde_json::Value {
-    value["spark_memory_measurements"] = args.spark_memory_samples.as_deref()
+    value["spark_memory_measurements"] = if let Some(bytes) = args.memory.spark_memory_cap {
+        serde_json::json!({"source": "explicit --spark-memory-cap", "bytes": bytes})
+    } else { args.spark_memory_samples.as_deref()
         .and_then(|text| serde_json::from_str(text).ok())
         .unwrap_or_else(|| serde_json::json!({"source": "checked-in idle MemAvailable inventory",
-            "inventory": serde_json::from_str::<serde_json::Value>(cuteafd_loader::serving_capacity::spark_memory::INVENTORY).expect("inventory")}));
+            "inventory": serde_json::from_str::<serde_json::Value>(cuteafd_loader::serving_capacity::spark_memory::INVENTORY).expect("inventory")})) };
     if value.get("family").and_then(serde_json::Value::as_str) == Some("glm5_flash") {
         let report = value.get("report").unwrap_or(&value);
         let sparks = report.get("spark_expert_world").and_then(serde_json::Value::as_u64)

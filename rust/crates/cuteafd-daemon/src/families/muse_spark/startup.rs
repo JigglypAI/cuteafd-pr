@@ -55,6 +55,7 @@ pub(crate) struct Options<'a> {
     pub pool_tokens: Option<u64>,
     pub onboard: Onboard,
     pub spark_budget_bytes: u64,
+    pub spark_rank_bytes: Vec<u64>,
     pub partial_bf16_max_rows: usize,
     pub partial_reply_formats: cuteafd_core::spark_reply::SparkReplyFormats,
     /// The coordinator EXL3 package state (`shared::local_workspace`).
@@ -85,7 +86,7 @@ pub(crate) fn admit(options: Options<'_>) -> Result<shared::AdmittedMuse> {
         let capacity = cuteafd_ffi::coordinator_gpu_budget().map_or(sample.total_bytes, |b| b.0.min(sample.total_bytes));
         budgets.push(shared::measured_budget(rank as u8, sample.total_bytes, capacity, options.headroom_bytes, sample.free_bytes));
     }
-    budgets.extend((0..options.spark_ranks).map(|rank| shared::spark_budget(rank as u8, options.spark_budget_bytes)));
+    budgets.extend((0..options.spark_ranks).map(|rank| shared::spark_budget(rank as u8, options.spark_rank_bytes.get(rank).copied().unwrap_or(options.spark_budget_bytes))));
     cuteafd_loader::serving_capacity::spark_memory::apply_live_budgets(&mut budgets);
     let context = options.max_context.unwrap_or(options.cfg.max_position as u64);
     let capacities = options.measured.iter().map(|sample| sample.total_bytes).collect::<Vec<_>>();
@@ -290,7 +291,8 @@ mod tests {
                 mark_slots: cuteafd_core::prefix::mark_slots_with_host(16, opts.mimo_prefix_entries,
                     shared::mark_bytes_with_format(&cfg, 1, target_kv), opts.mimo_prefix_mark_bytes, false),
                 max_context: Some(opts.context_tokens), pool_tokens: None, onboard: Onboard::Auto,
-                spark_budget_bytes: cuteafd_loader::plan::DEFAULT_SPARK_BUDGET_BYTES,
+                spark_budget_bytes: cuteafd_loader::serving_capacity::spark_memory::serving_bytes()[0],
+                spark_rank_bytes: cuteafd_loader::serving_capacity::spark_memory::serving_bytes(),
                 partial_bf16_max_rows: cutoff_rows, partial_reply_formats: formats,
                 local: shared::local_workspace(input.expert_catalog()?, Some(&path), gpus, prefill.unit_rows)?,
                 drafter: served_drafter, media: None })
@@ -370,7 +372,8 @@ mod tests {
                     shared::mark_bytes(&cfg, 1), opts.mimo_prefix_mark_bytes, opts.host_cache_bytes != Some(0)),
                 max_context: Some(opts.context_tokens),
                 pool_tokens: None, onboard: Onboard::Auto,
-                spark_budget_bytes: cuteafd_loader::plan::DEFAULT_SPARK_BUDGET_BYTES,
+                spark_budget_bytes: cuteafd_loader::serving_capacity::spark_memory::serving_bytes()[0],
+                spark_rank_bytes: cuteafd_loader::serving_capacity::spark_memory::serving_bytes(),
                 partial_bf16_max_rows: cuteafd_loader::families::muse_spark::replies::DEFAULT_BF16_MAX_ROWS,
                 partial_reply_formats: Default::default(),
                 local: shared::local_workspace(input.expert_catalog()?, Some(&path), gpus, prefill.unit_rows)?,
@@ -415,7 +418,8 @@ mod tests {
                     mark_slots: cuteafd_core::prefix::mark_slots_with_host(16, opts.mimo_prefix_entries,
                         shared::mark_bytes(&cfg, 1), opts.mimo_prefix_mark_bytes, opts.host_cache_bytes != Some(0)),
                     max_context: Some(opts.context_tokens), pool_tokens: None, onboard: Onboard::Auto,
-                    spark_budget_bytes: cuteafd_loader::plan::DEFAULT_SPARK_BUDGET_BYTES,
+                    spark_budget_bytes: cuteafd_loader::serving_capacity::spark_memory::serving_bytes()[0],
+                spark_rank_bytes: cuteafd_loader::serving_capacity::spark_memory::serving_bytes(),
                     partial_bf16_max_rows: cuteafd_loader::families::muse_spark::replies::DEFAULT_BF16_MAX_ROWS,
                     partial_reply_formats: Default::default(), local, drafter: None,
                     media: Some(shared::MediaOptions::from_checkpoint(checkpoint,
@@ -492,7 +496,8 @@ mod tests {
             mark_slots: cuteafd_core::prefix::mark_slots_with_host(16, opts.mimo_prefix_entries,
                 shared::mark_bytes(&cfg, 1), opts.mimo_prefix_mark_bytes, false),
             max_context: Some(opts.context_tokens), pool_tokens: None, onboard: Onboard::Auto,
-            spark_budget_bytes: cuteafd_loader::plan::DEFAULT_SPARK_BUDGET_BYTES,
+            spark_budget_bytes: cuteafd_loader::serving_capacity::spark_memory::serving_bytes()[0],
+                spark_rank_bytes: cuteafd_loader::serving_capacity::spark_memory::serving_bytes(),
             partial_bf16_max_rows: opts.muse_partial_bf16_max_rows, partial_reply_formats: opts.spark_reply_formats,
             local: shared::local_workspace(input.expert_catalog()?, Some(&path), gpus, prefill.unit_rows)?,
             drafter: None, media: Some(shared::MediaOptions::from_checkpoint(checkpoint, vision, audio, replicas)?) })?;
