@@ -204,7 +204,7 @@ impl<'a> BackboneCache<'a> {
             }
             Ok(())
         })();
-        let drained = unsafe { self.prefix_stream.library.cuda_stream_synchronize(self.prefix_stream.raw) };
+        let drained = self.prefix_drain();
         result.and(drained)?;
         let request = self.requests[lease.slot]
             .as_mut()
@@ -269,7 +269,15 @@ impl<'a> BackboneCache<'a> {
     /// Wait for every snapshot copy and restore queued on the prefix stream (never a compute
     /// stream: prefix copies run on their own stream).
     pub fn prefix_drain(&self) -> Result<()> {
-        unsafe { self.prefix_stream.library.cuda_stream_synchronize(self.prefix_stream.raw) }
+        // SAFETY: this stream belongs to the backbone and every queued owner remains live.
+        let result = unsafe { self.prefix_stream.library.cuda_stream_synchronize(self.prefix_stream.raw) };
+        if let Err(error) = &result {
+            // Ring/carry writes may still be in flight: page quarantine alone cannot make
+            // the request slot safe to reuse. Require process restart, not a cold retry.
+            cuteafd_transport::health::record_failure(format!(
+                "V4.1 prefix copy drain failed; restart required: {error:#}"));
+        }
+        result
     }
 
     /// Physical pages of prefix-engine `units` (512 tokens each) in every source, row order: a
@@ -480,11 +488,13 @@ mod rollback_tests {
                 std::time::Duration::from_secs(1), cuteafd_api::openai::ConsoleHub::disabled(), profile);
             let get = || Request::get("/health").body(Body::empty()).unwrap();
             assert_eq!(app.clone().oneshot(get()).await?.status(), StatusCode::OK);
-            bank.poison(&anyhow::anyhow!("injected prefix reset failure"));
+            fixture.configure_pack(&lib, 0, 1)?;
+            assert!(bank.prefix_drain().is_err());
             let response = app.oneshot(get()).await?;
             assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
             let body = axum::body::to_bytes(response.into_body(), 4096).await?;
-            assert!(String::from_utf8_lossy(&body).contains("injected prefix reset failure"));
+            assert!(String::from_utf8_lossy(&body).contains("prefix copy drain failed"));
+            fixture.configure_pack(&lib, 0, 0)?;
             assert!(receive.try_recv().is_err(), "health must not require another admission");
             anyhow::Ok(())
         })?;

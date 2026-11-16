@@ -434,11 +434,13 @@ impl<E: CopyEngine, M: Clone + Default> PrefixCache<E, M> {
         self.make_room_for(family, self.pool.need_for(0..total), None)?;
         let pages = self.pool.alloc_for(0..total)?;
         let mut placement = build(pages.clone());
-        self.dirty = true;
         let admitted = family.bind(&mut placement)
             .map_err(|source| PrefixError::Family { what: "bind", source })
             .and_then(|()| self.admit_draft(family, &mut placement, capacity.max(tokens)));
         if let Err(error) = admitted {
+            // A failing bind may already have queued writes; successful cold admission
+            // retains the existing no-copy/no-extra-drain hot path.
+            self.dirty = true;
             self.rollback(family, &mut placement, pages, None, error)?;
             unreachable!("rollback always returns the admission error");
         }

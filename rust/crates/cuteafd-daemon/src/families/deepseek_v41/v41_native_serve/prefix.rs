@@ -680,7 +680,7 @@ mod tests {
             ("queue_mark", &["self.copy_mark(lease", "cuda_stream_wait_event(stream, self.prefix_queued.0)"]),
             ("copy_mark", &["request.phase == CachePhase::Full && request.publication.is_empty()"]),
             // Restores: only a fresh admission, drained before it is observable.
-            ("restore_retained_phase", &["request.end == 0", "request.version == 0", "cuda_stream_synchronize(self.prefix_stream.raw)"]),
+            ("restore_retained_phase", &["request.end == 0", "request.version == 0", "self.prefix_drain()"]),
             ("prefix_drain", &["cuda_stream_synchronize(self.prefix_stream.raw)"]),
             // Tail copies: into a fresh fork's private page, drained before release.
             ("copy_unit_rows", &["`to` belongs to the caller's fresh fork and no reader"]),
