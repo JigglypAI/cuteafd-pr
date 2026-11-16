@@ -2,7 +2,7 @@
 // to the admitted resident owner, and all arithmetic comes from reviewed AOT.
 bool valid_perception(const cuteafd_vision_spec& s) {
   if(s.abi_version!=3 || !s.perception || s.tower || (s.reserved!=6 && s.reserved!=7) ||
-     !s.max_tokens || s.max_tokens>4096 || s.geometry_reserved || s.norm_eps!=1e-5f)return false;
+     !s.max_tokens || s.max_tokens>4096 || (s.reserved==7 && s.max_tokens<81) || s.geometry_reserved || s.norm_eps!=1e-5f)return false;
   bool ink=s.reserved==6;const auto& p=*s.perception;
   uint32_t h=ink?1024:1536,i=ink?4096:8960,d=ink?23:47;
   if(s.hidden!=h || s.depth!=d || s.heads!=16 || s.kv_heads!=16 || s.head_dim!=h/16 ||
@@ -36,10 +36,10 @@ bool valid_perception(const cuteafd_vision_spec& s) {
 
 size_t scratch_perception(Owner* o) {
   const auto& s=o->spec;bool ink=s.reserved==6;
-  size_t n=size_t(s.max_tokens)*(ink?4:16)+size_t(ink);
-  // Attention exports have one fixed16384-row allocation. Inkling includes
-  // a CLS row; its live count is checked separately before any launch.
-  n=std::min(n,size_t(16385));
+  // Step accepts the official global52 or local36 grids only. Inkling's
+  // declared merged-row capacity also includes one live CLS attention row.
+  size_t n=ink?std::min(size_t(s.max_tokens)*4+1,size_t(16384)):
+    (s.max_tokens>=169?size_t(2704):size_t(1296));
   size_t cursor=0;
   auto take=[&](auto& ptr,size_t bytes) {
     using P=typename std::remove_reference<decltype(ptr)>::type;
@@ -60,7 +60,7 @@ size_t scratch_perception(Owner* o) {
     take(o->pe_horizontal,size_t(3024)*728*3*4);take(o->pe_resized,size_t(728)*728*3*4);
     take(o->pe_ix,728*4);take(o->pe_iy,728*4);take(o->pe_nx,728*4);take(o->pe_ny,728*4);
     take(o->pe_wx,728*64*4);take(o->pe_wy,728*64*4);
-    take(o->pe_conv_lower,n/4*1536*9*2);take(o->pe_conv1,n/4*3072*2);take(o->pe_conv2,n/16*6144*2);
+    take(o->pe_conv_lower,std::max(n/4*1536*9*2,n/16*3072*9*2));take(o->pe_conv1,n/4*3072*2);take(o->pe_conv2,n/16*6144*2);
   }
   return cursor;
 }
@@ -93,7 +93,7 @@ int encode_perception(Owner* o,const uint8_t* rgb,uint64_t rgb_bytes,const float
      gh%2 || gw%2 || n>16384 || units>s.max_tokens || source_h>3024 || source_w>3024 ||
      rgb_bytes!=uint64_t(source_h)*source_w*3 || output_bytes!=uint64_t(units)*s.output_width*2 ||
      cx<0 || cy<0 || cw<=0 || ch<=0 || int64_t(cx)+cw>source_w || int64_t(cy)+ch>source_h ||
-     (ink && (source_h!=gh*20 || source_w!=gw*20)) || (!ink && (gh!=gw || (gh!=52 && gh!=36))))return cudaErrorInvalidValue;
+     (ink && (source_h!=gh*20 || source_w!=gw*20)) || (!ink && (gh!=gw || (gh!=52 && gh!=36) || cx || cy || cw!=source_w || ch!=source_h)))return cudaErrorInvalidValue;
   int e=device_ok(o);if(e)return e;auto stream=o->stream;
 #define PE_RUN(expr) do {int rc=int(expr);if(rc)return drain(o,rc);} while(0)
   PE_RUN(cudaMemcpyAsync(o->rgb,rgb,rgb_bytes,cudaMemcpyHostToDevice,stream));
