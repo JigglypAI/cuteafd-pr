@@ -71,6 +71,8 @@ pub(super) struct ContextRank<'a> {
 
 /// Both GPUs' context buffers, the exchange and the per-GPU partial programs.
 pub(super) struct V4ContextSplit<'a> {
+    admitted_pages: i32,
+    charged_extent: u64,
     ranks: [ContextRank<'a>; 2],
     /// Dropped before the head split's exchange (it borrows its abort words).
     pub exchange: ContextExchange<'a>,
@@ -134,6 +136,11 @@ impl<'a> V4ContextSplit<'a> {
                 let commit = (0..lanes as usize + cuteafd_loader::serving_capacity::V4_PACKED_MEMBERS)
                     .map(|_| next()).collect::<Result<Vec<_>>>()?;
                 ensure!(allocations.next().is_none(), "V4 context workspace list has unbound entries");
+                if let Some(tile) = context.selector_tile {
+                    let admitted = cuteafd_core::coordinator_programs::scored_decode::admitted_pages(extent as u64, 256);
+                    ensure!(topk_scratch.buffer.bytes as u64 == tile.bytes(admitted)?,
+                        "captured selector tile differs from charged allocation");
+                }
                 for zeroed in [&topk_scratch, &empty_window] {
                     engine.library.cuda_zero_bytes(zeroed.buffer, zeroed.buffer.bytes)?;
                 }
@@ -156,7 +163,8 @@ impl<'a> V4ContextSplit<'a> {
         let ranks = [build(0)?, build(1)?];
         let mut c4 = 0;
         let ordinal = cfg.compress_ratios.iter().map(|&ratio| (ratio == 4).then(|| { c4 += 1; c4 - 1 })).collect();
-        Ok(Self { ranks, exchange, staging_units, partial, ordinal,
+        Ok(Self { charged_extent: extent as u64, admitted_pages: cuteafd_core::coordinator_programs::scored_decode::admitted_pages(
+            extent as u64, 256 as u64).try_into()?, ranks, exchange, staging_units, partial, ordinal,
             commit_limit: context_commit_units(prefill) as usize })
     }
 
@@ -336,6 +344,9 @@ impl<'a> Engine<'a> {
                 let m = &self.lane.tables;
                 e.index_produce(rank, self.weights, m, w, e.attention_rope(rank, 4), self.rows, self.cap)?;
                 let own = &e.context()?.ranks[rank];
+                let admitted = e.context()?.admitted_pages;
+                ensure!(admitted as u64 == cuteafd_core::coordinator_programs::scored_decode::admitted_pages(
+                    e.context()?.charged_extent, 256), "selector deployment capacity changed after admission");
                 let k = e.cfg.index_topk;
                 let indices = view(&own.candidates, e.decode_rows * k * 4, self.t * k * 4)?.ptr;
                 let (_, index) = e.c4_pools(rank, self.layer)?;
@@ -344,7 +355,7 @@ impl<'a> Engine<'a> {
                     ("table", m.c4_page_table.buffer.ptr), ("lengths", m.c4_visible.buffer.ptr), ("indices", indices),
                     ("scores", own.candidates.buffer.ptr), ("scratch", own.topk_scratch.buffer.ptr)],
                     &[self.rows, Scalar::I32(self.width()), Scalar::I32(self.stride()), Scalar::I32(2),
-                        Scalar::I32(rank as i32)])?;
+                        Scalar::I32(rank as i32), Scalar::I32(admitted)])?;
                 Ok(Some(Candidates { scores: own.candidates.buffer.ptr, indices }))
             }
             fn merge(&mut self, scores: *mut c_void, indices: *mut c_void) -> Result<()> {
@@ -479,7 +490,7 @@ mod tests {
             (128, 1024, (0..61).map(|i| if i < 2 { 0 } else if i % 2 == 0 { 4 } else { 128 }).collect::<Vec<_>>())] {
             let cfg = cfg(heads, topk, ratios);
             let c4 = cfg.compress_ratios.iter().filter(|&&r| r == 4).count();
-            let context = V4Context { topk_scratch: 9_178_112, partial_scratch: 4_000_000 };
+            let context = V4Context { selector_tile: None, topk_scratch: 9_178_112, partial_scratch: 4_000_000 };
             let list = context_workspace(&cfg, 1 << 20, 2752, 64, 3, context);
             let charged: u64 = list.iter().map(|&(_, b)| b.max(256)).sum();
             let allocated: u64 = list.iter().filter(|(n, _)| !n.starts_with("C4 scratch")).map(|&(_, b)| b.max(256)).sum();

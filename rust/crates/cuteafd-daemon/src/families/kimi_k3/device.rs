@@ -292,6 +292,9 @@ struct DsaPrograms<'a> {
     producer: [cuteafd_ffi::KimiIndexProducer<'a>; 2],
     selector: [cuteafd_ffi::KimiIndexTopK<'a>; 2],
     scored: [cuteafd_ffi::KimiIndexTopK<'a>; 2],
+    // A second binding only: reuses the existing charged DSA selector scratch
+    // (prefill maximum742556672B), never allocates another buffer.
+    diagnostic_decode: cuteafd_ffi::KimiIndexTopK<'a>,
     partial: [[cuteafd_ffi::KimiSparseMla<'a>; 2]; 2],
     merge: cuteafd_ffi::KimiCandidateMerge<'a>,
     scratch: cuteafd_loader::families::kimi_k3::allocation::DsaScratch,
@@ -307,6 +310,8 @@ impl<'a> DsaPrograms<'a> {
             KimiIndexTopK::load(programs, 4096, pages, KimiIndexMode::Prefill, false)?];
         let scored = [KimiIndexTopK::load(programs, 64, pages, KimiIndexMode::Decode, true)?,
             KimiIndexTopK::load(programs, 4096, pages, KimiIndexMode::Prefill, true)?];
+        let diagnostic_decode = KimiIndexTopK::load(programs, 64, pages, KimiIndexMode::Decode, true)?;
+        diagnostic_decode.bind_admitted_pages(pages)?;
         let partial = [
             [KimiSparseMla::load(programs, 96, 64, format, Some(0))?,
              KimiSparseMla::load(programs, 96, 64, format, Some(48))?],
@@ -317,7 +322,7 @@ impl<'a> DsaPrograms<'a> {
             producer: producer.iter().map(|p| p.scratch_bytes()).max().unwrap(),
             selector: selector.iter().chain(scored.iter()).map(|p| p.scratch_bytes()).max().unwrap(),
         };
-        Ok(Self { producer, selector, scored, partial, row_chunk_size: KimiSparseMla::policy_chunk_size(programs)?,
+        Ok(Self { producer, selector, scored, diagnostic_decode, partial, row_chunk_size: KimiSparseMla::policy_chunk_size(programs)?,
             merge: cuteafd_ffi::KimiCandidateMerge::load(programs)?, scratch })
     }
 }
@@ -705,6 +710,9 @@ impl<'a> LocalLane<'a> {
             "Kimi context binding requires admitted parity cache on the single target lane before capture");
         owner.ranks[self.rank].check_reader(self.stream())?;
         ensure!(owner.ranks[self.rank].extent() == self.max_context(), "Kimi context binding extent differs");
+        if let Some(dsa) = &self.programs.dsa {
+            dsa.scored[0].bind_admitted_pages(owner.ranks[self.rank].compact_width())?;
+        }
         self.context = Some((owner, programs));
         Ok(())
     }
@@ -1656,7 +1664,8 @@ impl<'a> LocalLane<'a> {
                 // launch; the producer scratch view, `DSA scores` and the
                 // selector scratch are disjoint from the live route's output,
                 // and every operand is retained by this lane.
-                programs.scored[unit].launch(cuteafd_ffi::KimiIndexSelection {
+                let selector = if unit == 0 { &programs.diagnostic_decode } else { &programs.scored[unit] };
+                selector.launch(cuteafd_ffi::KimiIndexSelection {
                     rows: batch.rows, cache_pages: self.mla.pages(),
                     table_width, table_stride: table_width,
                     page_stride: 1, page_offset: 0,

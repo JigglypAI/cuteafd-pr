@@ -70,6 +70,8 @@ pub(super) struct ContextRank<'a> {
 
 /// Both GPUs' context buffers, the exchange and the per-GPU partial programs.
 pub(super) struct GlmfContextSplit<'a> {
+    admitted_pages: i32,
+    charged_extent: u64,
     ranks: [ContextRank<'a>; 2],
     /// Dropped before the head split's exchange (it borrows its abort words).
     pub exchange: ContextExchange<'a>,
@@ -117,6 +119,11 @@ impl<'a> GlmfContextSplit<'a> {
                     (next()?, next()?, next()?, next()?, next()?, next()?, next()?);
                 let commit = (0..lanes).map(|_| next()).collect::<Result<Vec<_>>>()?;
                 let identity = next()?;
+                if let Some(tile) = context.selector_tile {
+                    let admitted = cuteafd_core::coordinator_programs::scored_decode::admitted_pages(extent as u64, cfg.index_kpool as u64 * 64);
+                    ensure!(topk_scratch.buffer.bytes as u64 == tile.bytes(admitted)?,
+                        "captured selector tile differs from charged allocation");
+                }
                 engine.library.cuda_zero_bytes(topk_scratch.buffer, topk_scratch.buffer.bytes)?;
                 let map: Vec<i32> = (0..staging_units as i32).collect();
                 engine.library.copy_h2d(view(&identity, 0, map.len() * 4)?, bytes_of(&map))?;
@@ -132,7 +139,8 @@ impl<'a> GlmfContextSplit<'a> {
         };
         let (r0, s0, p0) = rank(0)?;
         let (r1, s1, p1) = rank(1)?;
-        Ok(Self { ranks: [r0, r1], exchange, staging_units, partial: [p0, p1], sink: [s0, s1] })
+        Ok(Self { charged_extent: extent as u64, admitted_pages: cuteafd_core::coordinator_programs::scored_decode::admitted_pages(
+            extent as u64, cfg.index_kpool as u64 * 64).try_into()?, ranks: [r0, r1], exchange, staging_units, partial: [p0, p1], sink: [s0, s1] })
     }
 
     /// Bytes this split allocated on each GPU beside the exchange (the solver's "context
@@ -281,6 +289,9 @@ impl<'a> GlmfEngine<'a> {
                     return Ok(None);
                 }
                 let own = &e.context.as_ref().context("context split")?.ranks[rank];
+                let admitted = e.context.as_ref().context("context split")?.admitted_pages;
+                ensure!(admitted as u64 == cuteafd_core::coordinator_programs::scored_decode::admitted_pages(
+                    e.context.as_ref().context("context split")?.charged_extent, e.cfg.index_kpool as u64 * 64), "selector deployment capacity changed after admission");
                 let k = e.cfg.index_topk / KPOOL;
                 let candidates = Candidates { scores: own.candidates.buffer.ptr,
                     indices: view(&own.candidates, DECODE_ROWS * k * 4, self.t * k * 4)?.ptr };
@@ -293,7 +304,7 @@ impl<'a> GlmfEngine<'a> {
                     ("indices", candidates.indices.cast_mut()), ("scores", candidates.scores.cast_mut()),
                     ("scratch", own.topk_scratch.buffer.ptr)],
                     &[self.rows, Scalar::I32(self.tables.context_width as i32), width, Scalar::I32(2),
-                        Scalar::I32(rank as i32)])?;
+                        Scalar::I32(rank as i32), Scalar::I32(admitted)])?;
                 Ok(Some(candidates))
             }
             fn merge(&mut self, scores: *mut c_void, indices: *mut c_void) -> Result<()> {
