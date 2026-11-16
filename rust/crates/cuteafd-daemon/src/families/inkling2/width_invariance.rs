@@ -117,6 +117,8 @@ pub(crate) fn run(args:&mut GoldenArgs)->Result<()>{
     ensure!(tokens.iter().all(|&token|(token as usize)<cfg.unpadded_vocab_size),"width oracle invalid token id");
     args.prefix.resolve_entries(args.max_sequences);
     ensure!(args.prefix.prefix_cache_entries>0,"width oracle requires exact prefix staging marks");
+    cuteafd_core::set_expert_geometry(cuteafd_core::ExpertGeometry::INKLING2)
+        .map_err(|previous|anyhow::anyhow!("Inkling width oracle requires isolated process geometry, found {previous:?}"))?;
     // SAFETY: all runtime/native owners are destroyed before this library and its programs.
     let library=Arc::new(unsafe{cuteafd_ffi::NativeLibrary::load(&args.native_lib)?});
     library.cuda_set_device(args.device)?;
