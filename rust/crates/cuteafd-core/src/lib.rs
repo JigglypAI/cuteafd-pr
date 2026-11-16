@@ -5,6 +5,8 @@ pub const HEAD_REDUCTION_PARITY_SLOTS: usize = 2;
 // WaveReceipt uses one bit per physical rank.
 const _: () = assert!(MAX_SPARK_WORLD <= u8::BITS as usize);
 
+pub mod tap_site;
+pub use tap_site::TapSite;
 pub mod tp_units;
 pub mod mxfp4_layouts;
 pub mod dense_attention;

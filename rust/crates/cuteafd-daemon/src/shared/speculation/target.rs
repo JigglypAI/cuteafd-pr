@@ -4,6 +4,7 @@ use crate::shared::token_io::DeviceLogits;
 use anyhow::{ensure, Result};
 use std::collections::BTreeMap;
 use std::ffi::c_void;
+pub(crate) use cuteafd_core::TapSite;
 
 /// One physical verify row. Padding has no token and must not access a slot,
 /// recurrent state, KV, positions or prefix metadata (even for sentinel ids).
@@ -14,11 +15,11 @@ pub(crate) struct VerifyRow {
     pub token: Option<u32>,
 }
 
-/// Requested taps are zero-based decoder block ids, after residual+FFN and
-/// before the final norm. Their order is significant, not sorted by the engine.
+/// Checkpoint-defined tap sites in projector order. Ordinary block drafters
+/// request LayerExit; entry partials and FinalNorm remain distinct arithmetic.
 pub(crate) struct VerifyRequest<'a> {
     pub rows: &'a [VerifyRow],
-    pub tap_layers: &'a [usize],
+    pub tap_sites: &'a [TapSite],
 }
 
 impl VerifyRequest<'_> {
@@ -30,9 +31,9 @@ impl VerifyRequest<'_> {
         for &(slot, position) in starts {
             ensure!(next.insert(slot, position).is_none(), "duplicate target slot {slot}");
         }
-        for (i, &layer) in self.tap_layers.iter().enumerate() {
-            ensure!(layer < layers, "target tap layer {layer} outside {layers} blocks");
-            ensure!(!self.tap_layers[..i].contains(&layer), "duplicate target tap layer {layer}");
+        for (i, &site) in self.tap_sites.iter().enumerate() {
+            ensure!(site.valid(layers), "target tap {site:?} outside {layers} blocks");
+            ensure!(!self.tap_sites[..i].contains(&site), "duplicate target tap {site:?}");
         }
         for row in self.rows {
             let Some(token) = row.token else { continue };
@@ -53,7 +54,7 @@ impl VerifyRequest<'_> {
 /// must enqueue their reads on `stream` or establish an explicit device event.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct HiddenTap {
-    pub layer: usize,
+    pub site: TapSite,
     pub ptr: *const c_void,
     pub rows: usize,
     pub hidden: usize,
@@ -66,7 +67,7 @@ pub(crate) struct VerifyOutput<'a> {
     /// One FP32 next-token distribution per physical input row. Masked rows
     /// must not be selected; active row i predicts the token after input i.
     pub logits: DeviceLogits,
-    /// Same order as VerifyRequest::tap_layers, including all physical rows.
+    /// Same order as VerifyRequest::tap_sites, including all physical rows.
     pub taps: &'a [HiddenTap],
 }
 
@@ -204,8 +205,8 @@ mod tests {
             }
             // Deliberately fail after mutation to exercise transaction rollback.
             ensure!(!self.fail_verify, "injected verify failure");
-            self.taps = request.tap_layers.iter().map(|&layer| HiddenTap {
-                layer, ptr: std::ptr::null(), rows: request.rows.len(), hidden: 5120,
+            self.taps = request.tap_sites.iter().map(|&site| HiddenTap {
+                site, ptr: std::ptr::null(), rows: request.rows.len(), hidden: 5120,
                 stride: 5128, stream: std::ptr::null_mut(),
             }).collect();
             Ok(VerifyOutput { logits: DeviceLogits { ptr: std::ptr::null(), rows: request.rows.len(),
@@ -242,10 +243,10 @@ mod tests {
     fn draft_transaction_retains_exact_recurrent_inputs_and_tap_order() {
         let mut target = RecurrentTarget::new();
         let rows = transaction_rows();
-        let layers = [52, 4, 16, 28, 40];
-        let result = verify_commit(&mut target, &[3, 7], VerifyRequest { rows: &rows, tap_layers: &layers }, |output| {
+        let layers = [52, 4, 16, 28, 40].map(TapSite::LayerExit);
+        let result = verify_commit(&mut target, &[3, 7], VerifyRequest { rows: &rows, tap_sites: &layers }, |output| {
             assert_eq!(output.logits.rows, rows.len());
-            assert_eq!(output.taps.iter().map(|tap| tap.layer).collect::<Vec<_>>(), layers);
+            assert_eq!(output.taps.iter().map(|tap| tap.site).collect::<Vec<_>>(), layers);
             assert!(output.taps.iter().all(|tap| tap.rows == rows.len() && tap.stride == 5128));
             Ok((99, vec![AcceptedPrefix { slot: 7, rows: 0 }, AcceptedPrefix { slot: 3, rows: 1 }]))
         }).unwrap();
@@ -262,7 +263,7 @@ mod tests {
             let original = target.states.clone();
             target.fail_verify = failure == 0;
             target.fail_commit = failure == 2;
-            let result = verify_commit(&mut target, &[3, 7], VerifyRequest { rows: &rows, tap_layers: &[] }, |_| {
+            let result = verify_commit(&mut target, &[3, 7], VerifyRequest { rows: &rows, tap_sites: &[] }, |_| {
                 ensure!(failure != 1, "injected consumer failure");
                 Ok(((), vec![AcceptedPrefix { slot: 3, rows: 1 }, AcceptedPrefix { slot: 7, rows: 2 }]))
             });
@@ -281,7 +282,7 @@ mod tests {
             vec![AcceptedPrefix { slot: 3, rows: 1 }, AcceptedPrefix { slot: 8, rows: 1 }]] {
             let mut target = RecurrentTarget::new();
             let original = target.states.clone();
-            assert!(verify_commit(&mut target, &[3, 7], VerifyRequest { rows: &rows, tap_layers: &[] },
+            assert!(verify_commit(&mut target, &[3, 7], VerifyRequest { rows: &rows, tap_sites: &[] },
                 |_| Ok(((), accepted))).is_err());
             assert_eq!(target.states, original);
         }
@@ -293,7 +294,7 @@ mod tests {
         for slots in [&[3][..], &[3, 3, 7][..]] {
             let mut target = RecurrentTarget::new();
             let original = target.states.clone();
-            assert!(verify_commit(&mut target, slots, VerifyRequest { rows: &rows, tap_layers: &[] },
+            assert!(verify_commit(&mut target, slots, VerifyRequest { rows: &rows, tap_sites: &[] },
                 |_| -> Result<((), Vec<AcceptedPrefix>)> { panic!("invalid request reached consumer") }).is_err());
             assert_eq!(target.states, original);
             assert_eq!(target.restores, 0);
@@ -303,10 +304,10 @@ mod tests {
     #[test]
     fn post_block_taps_keep_requested_order() {
         let rows = [VerifyRow { slot: 0, position: 17, token: Some(3) }];
-        let taps = [52, 4, 16, 28, 40];
-        let request = VerifyRequest { rows: &rows, tap_layers: &taps };
+        let taps = [52, 4, 16, 28, 40].map(TapSite::LayerExit);
+        let request = VerifyRequest { rows: &rows, tap_sites: &taps };
         request.validate(64, 248320, &[(0, 17)]).unwrap();
-        assert_eq!(request.tap_layers, &taps);
+        assert_eq!(request.tap_sites, &taps);
     }
 
     #[test]
@@ -317,7 +318,7 @@ mod tests {
             VerifyRow { slot: 7, position: 2, token: Some(5) },
             VerifyRow { slot: 3, position: 10, token: Some(6) },
         ];
-        VerifyRequest { rows: &rows, tap_layers: &[] }.validate(32, 10, &[(3, 9), (7, 2)]).unwrap();
+        VerifyRequest { rows: &rows, tap_sites: &[] }.validate(32, 10, &[(3, 9), (7, 2)]).unwrap();
     }
 
     #[test]
@@ -325,14 +326,14 @@ mod tests {
         let valid = VerifyRow { slot: 3, position: 9, token: Some(4) };
         for row in [VerifyRow { slot: 2, ..valid }, VerifyRow { position: 10, ..valid },
             VerifyRow { token: Some(10), ..valid }] {
-            assert!(VerifyRequest { rows: &[row], tap_layers: &[] }.validate(32, 10, &[(3, 9)]).is_err());
+            assert!(VerifyRequest { rows: &[row], tap_sites: &[] }.validate(32, 10, &[(3, 9)]).is_err());
         }
-        for taps in [&[32][..], &[4, 4][..]] {
-            assert!(VerifyRequest { rows: &[valid], tap_layers: taps }.validate(32, 10, &[(3, 9)]).is_err());
+        for taps in [&[TapSite::LayerExit(32)][..], &[TapSite::LayerExit(4), TapSite::LayerExit(4)][..]] {
+            assert!(VerifyRequest { rows: &[valid], tap_sites: taps }.validate(32, 10, &[(3, 9)]).is_err());
         }
-        assert!(VerifyRequest { rows: &[valid], tap_layers: &[] }.validate(32, 10, &[(3, 9), (3, 9)]).is_err());
-        assert!(VerifyRequest { rows: &[], tap_layers: &[] }.validate(32, 10, &[]).is_err());
+        assert!(VerifyRequest { rows: &[valid], tap_sites: &[] }.validate(32, 10, &[(3, 9), (3, 9)]).is_err());
+        assert!(VerifyRequest { rows: &[], tap_sites: &[] }.validate(32, 10, &[]).is_err());
         let overflow = VerifyRow { position: usize::MAX, ..valid };
-        assert!(VerifyRequest { rows: &[overflow], tap_layers: &[] }.validate(32, 10, &[(3, usize::MAX)]).is_err());
+        assert!(VerifyRequest { rows: &[overflow], tap_sites: &[] }.validate(32, 10, &[(3, usize::MAX)]).is_err());
     }
 }

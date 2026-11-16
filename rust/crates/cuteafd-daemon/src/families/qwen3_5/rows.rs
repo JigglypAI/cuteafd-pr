@@ -104,7 +104,7 @@ mod tests {
             VerifyRow { slot: 2, position: 9, token: Some(3) }, pad,
             VerifyRow { slot: 7, position: 64, token: Some(9) }, VerifyRow { slot: 2, position: 10, token: Some(4) }];
         let marked = [(2, Slot { position: 9, pages: vec![5] }), (7, Slot { position: 63, pages: vec![9, 3] })];
-        let plan = Rows::new(&VerifyRequest { rows: &rows, tap_layers: &[3, 0] }, 4, 10, &marked, 256, 1024)?;
+        let plan = Rows::new(&VerifyRequest { rows: &rows, tap_sites: &[cuteafd_core::TapSite::LayerExit(3), cuteafd_core::TapSite::LayerExit(0)] }, 4, 10, &marked, 256, 1024)?;
         assert_eq!(plan.tokens, [3, 4, 8, 9]);
         assert_eq!(plan.physical, [2, 5, 1, 4]);
         assert_eq!(plan.slots, [2, 2, 7, 7]);
@@ -125,7 +125,7 @@ mod tests {
         let pad = VerifyRow { slot: usize::MAX, position: usize::MAX, token: None };
         let marked = [(3, Slot { position: usize::MAX, pages: vec![u32::MAX] }),
             (9, Slot { position: usize::MAX, pages: vec![] })];
-        let plan = Rows::new(&VerifyRequest { rows: &[pad; 64], tap_layers: &[] }, 4, 10, &marked, 256, 256)?;
+        let plan = Rows::new(&VerifyRequest { rows: &[pad; 64], tap_sites: &[] }, 4, 10, &marked, 256, 256)?;
         assert!(plan.tokens.is_empty() && plan.pages.is_empty());
         assert_eq!(plan.accepted(&[AcceptedPrefix { slot: 9, rows: 0 }, AcceptedPrefix { slot: 3, rows: 0 }])?,
             [3, 9, 0, 0, 0, 0]);
@@ -137,10 +137,10 @@ mod tests {
         let row = VerifyRow { slot: 3, position: 64, token: Some(2) };
         for state in [Slot { position: 63, pages: vec![0, 1] }, Slot { position: 64, pages: vec![0] },
             Slot { position: 64, pages: vec![0, 4] }] {
-            assert!(Rows::new(&VerifyRequest { rows: &[row], tap_layers: &[] }, 4, 10, &[(3, state)], 256, 256).is_err());
+            assert!(Rows::new(&VerifyRequest { rows: &[row], tap_sites: &[] }, 4, 10, &[(3, state)], 256, 256).is_err());
         }
         let state = Slot { position: 64, pages: vec![0, 1] };
-        assert!(Rows::new(&VerifyRequest { rows: &[row], tap_layers: &[] }, 4, 10,
+        assert!(Rows::new(&VerifyRequest { rows: &[row], tap_sites: &[] }, 4, 10,
             &[(3, state.clone()), (3, state)], 256, 256).is_err());
     }
 }

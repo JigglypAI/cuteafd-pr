@@ -517,6 +517,10 @@ struct Layers {
 }
 
 impl BlockDsparkConfig {
+    pub fn tap_sites(&self) -> Vec<cuteafd_core::TapSite> {
+        self.taps.iter().copied().map(cuteafd_core::TapSite::LayerExit).collect()
+    }
+
     fn from_minimax(raw: &Value) -> Result<Self, DsparkConfigError> {
         use DsparkConfigError::Unsupported;
         let parsed = crate::families::minimax_m3::MiniMaxM3DsparkConfig::from_hf(raw)
@@ -961,6 +965,25 @@ mod tests {
                 "num_key_value_heads":64,"rms_norm_eps":1e-5,
                 "rope_parameters":{"rope_theta":10000.0,"rope_type":"default"},
                 "sliding_window":2048,"use_sliding_window":true,"vocab_size":154880}})
+    }
+
+    #[test]
+    fn typed_layer_exit_sites_preserve_every_existing_block_family_order() {
+        use cuteafd_core::TapSite;
+        let mut glm = qwen();
+        glm["dflash_config"]["target_layer_ids"] = json!([3, 15, 27, 39, 51]);
+        let mut kimi = qwen();
+        kimi["dflash_config"]["target_layer_ids"] = json!([2, 14, 26, 38, 50]);
+        let minimax: Value = serde_json::from_str(include_str!("../families/minimax_m3/fixtures/dspark-config.json")).unwrap();
+        for (family, raw) in [("GLM", glm), ("GLM Flash", glm_flash_speculators()),
+            ("Kimi", kimi), ("MiniMax", minimax), ("Qwen 3.5", qwen())] {
+            let cfg = BlockDsparkConfig::from_json(&raw).unwrap();
+            let before = cfg.taps.clone();
+            let after = cfg.tap_sites().into_iter().map(|site| match site {
+                TapSite::LayerExit(layer) => layer, _ => panic!("{family} changed tap arithmetic"),
+            }).collect::<Vec<_>>();
+            assert_eq!(after, before, "{family}");
+        }
     }
 
     #[test]

@@ -224,7 +224,7 @@ impl DenseEngine<'_> {
             for chunk in tokens.chunks(chunk.min(64)) {
                 let rows = chunk.iter().enumerate().map(|(offset, &token)| VerifyRow {
                     slot: 0, position: first + offset, token: Some(token) }).collect::<Vec<_>>();
-                let logits = self.decode_device(&[0], VerifyRequest { rows: &rows, tap_layers: &[] })?;
+                let logits = self.decode_device(&[0], VerifyRequest { rows: &rows, tap_sites: &[] })?;
                 crate::shared::probe::ScoringRows { consumer: &consumer, position: first }
                     .record(self.stream.device.library, 0, &logits)?;
                 first += chunk.len();
@@ -263,7 +263,7 @@ impl DenseEngine<'_> {
         let result = (|| {
             let request = [crate::shared::speculation::target::VerifyRow { slot: 0, position: 0, token: Some(0) }];
             let plan = rows::Rows::new(&crate::shared::speculation::target::VerifyRequest {
-                rows: &request, tap_layers: &[] }, self.cfg.attention.len(), self.cfg.vocab,
+                rows: &request, tap_sites: &[] }, self.cfg.attention.len(), self.cfg.vocab,
                 &[(0, self.slots[0].clone())], self.cfg.max_context, self.pool_tokens)?;
             self.verify_rows(plan, 1, &[], true)?;
             self.verification.pending = None;
@@ -281,7 +281,7 @@ impl DenseEngine<'_> {
                 let request = (0..rows).map(|offset| crate::shared::speculation::target::VerifyRow {
                     slot: 0, position: position + offset, token: Some(0) }).collect::<Vec<_>>();
                 let plan = rows::Rows::new(&crate::shared::speculation::target::VerifyRequest {
-                    rows: &request, tap_layers: &[] }, self.cfg.attention.len(), self.cfg.vocab,
+                    rows: &request, tap_sites: &[] }, self.cfg.attention.len(), self.cfg.vocab,
                     &[(0, self.slots[0].clone())], self.cfg.max_context, self.pool_tokens)?;
                 self.verify_rows(plan, rows, &[], spec)?;
                 self.verification.pending = None;

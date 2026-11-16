@@ -293,7 +293,7 @@ fn validate_target_taps(taps: &[super::target::HiddenTap], layers: &[usize], hid
     stream: *mut c_void, end: usize, n: usize) -> Result<()> {
     ensure!(taps.len() == layers.len(), "target tap count differs from draft checkpoint");
     for (tap, &layer) in taps.iter().zip(layers) {
-        ensure!(tap.layer == layer, "target tap order differs from draft checkpoint");
+        ensure!(tap.site == cuteafd_core::TapSite::LayerExit(layer), "target tap order differs from draft checkpoint");
         ensure!(tap.hidden == hidden && tap.stride >= hidden,
             "target tap hidden width or stride differs from draft checkpoint");
         ensure!(end <= tap.rows, "target tap rows exceed producer span");
@@ -2408,9 +2408,9 @@ mod tests {
         use super::super::target::HiddenTap;
         let marker = 0u8;
         let pointer = std::ptr::from_ref(&marker).cast();
-        let tap = HiddenTap { layer: 4, ptr: pointer, rows: 7, hidden: 5120, stride: 5128,
+        let tap = HiddenTap { site: cuteafd_core::TapSite::LayerExit(4), ptr: pointer, rows: 7, hidden: 5120, stride: 5128,
             stream: std::ptr::null_mut() };
-        let taps = [tap, HiddenTap { layer: 16, ..tap }];
+        let taps = [tap, HiddenTap { site: cuteafd_core::TapSite::LayerExit(16), ..tap }];
         validate_target_taps(&taps, &[4, 16], 5120, std::ptr::null_mut(), 7, 7).unwrap();
         assert!(validate_target_taps(&taps, &[16, 4], 5120, std::ptr::null_mut(), 7, 7).is_err());
         assert!(validate_target_taps(&taps, &[4], 5120, std::ptr::null_mut(), 7, 7).is_err());
