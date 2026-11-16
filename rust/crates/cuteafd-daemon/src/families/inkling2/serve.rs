@@ -95,10 +95,12 @@ pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
                 use cuteafd_engine::prefix::PrefixFamily;
                 worker_args.prefix.host_config_for(family.layout(), context, inputs.host_prefix.quota_bytes)
             }).transpose()?;
+            let drafts = execution.draft.as_ref().map_or(scheduler::Drafts::None, |draft|
+                scheduler::Drafts::Neural { depth: draft.layout.config.transformer.block - 1 });
             let backend = super::backend::InklingBackend::new(execution, context, host, &admitted.solved)?;
             library.cuda_set_device(worker_args.device)?;
             scheduler::schedule(&backend, &worker_args.snapshot, &mut receive, &worker_stats,
-                worker_args.max_sequences, scheduler::Drafts::None, worker_args.draft_length, eos,
+                worker_args.max_sequences, drafts, worker_args.draft_length, eos,
                 worker_args.decode_share, &worker_args.prefix, worker_args.loop_abort.config(),
                 worker_args.token_io.token_select, &mut crate::families::qwen3_5::serve::text_media(), None, || {
                     backend.require_live()?;

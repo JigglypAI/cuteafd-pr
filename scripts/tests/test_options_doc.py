@@ -400,6 +400,10 @@ def test_optional_levers_are_default_off_and_documented():
                 assert default == "on"
                 assert "`GRAPH_PREWARM=off`" in DOC.read_text()
                 assert 'case "$(get GRAPH_PREWARM on)"' in (ROOT / "scripts/launch/run-family.sh").read_text()
+            elif key == "SPECULATOR":
+                assert lever["families"] == ["Inkling"]
+                assert default == "family default"
+                assert "`SPECULATOR=off|dspark` defaults to `off`" in DOC.read_text()
             elif key == "KV_CACHE":
                 assert lever["families"] == ["Muse"]
                 assert default == "family default"
@@ -414,7 +418,7 @@ def test_optional_levers_are_default_off_and_documented():
 
 
 def test_minimax_bundled_dspark_is_a_family_default_not_an_optional_lever():
-    assert all("SPECULATOR" not in lever["keys"] for lever in LEVERS)
+    assert all("MiniMax" not in lever["families"] for lever in LEVERS if "SPECULATOR" in lever["keys"])
     assert "SPECULATOR" in family_keys("minimax_m3")
     text = DOC.read_text()
     assert "`SPECULATOR=dspark` is the default" in text

@@ -1813,8 +1813,8 @@ case "$speculator" in
     drafter="$(get SPECULATOR_MODEL_ID)"
     [[ -n "$drafter" ]] || drafter="$default_drafter"
     [[ "$family:$speculator" != qwen3_5:dspark || -n "$drafter" ]] || drafter=RadixArk/Qwen3.8-27B-DSpark
-    if [[ "$family:$speculator" == minimax_m3:dspark ]]; then
-      : # Bundled native drafter; --dspark is supplied with MiniMax family args.
+    if [[ "$speculator" == dspark && ( "$family" == minimax_m3 || "$family" == inkling2 ) ]]; then
+      : # Bundled native drafter; --dspark is supplied with family args.
     elif [[ $speculator == dspark && ( $family == deepseek_v4 || $checkpoint_family == mistral_large4 ) ]]; then
       dspark_args=(--dspark)
     elif [[ -n "$drafter" ]]; then
