@@ -1,9 +1,9 @@
 // Independent still-image extension helpers. Included after Owner and the shared
 // extent/alignment helpers; PE and existing tower arithmetic are not modified.
 struct GenericTowerStorage {
-  uint16_t *x=nullptr,*next=nullptr,*norm=nullptr,*patches=nullptr,*qkv=nullptr;
+  uint16_t *x=nullptr,*next=nullptr,*norm=nullptr,*qkv_norm=nullptr,*patches=nullptr,*qkv=nullptr;
   uint16_t *q=nullptr,*k=nullptr,*v=nullptr,*attention=nullptr,*projection=nullptr;
-  uint16_t *mlp=nullptr,*position=nullptr,*grouped=nullptr,*projector=nullptr,*output=nullptr;
+  uint16_t *mlp=nullptr,*position=nullptr,*grouped=nullptr,*projector=nullptr,*projector_result=nullptr,*output=nullptr;
   float *cosines=nullptr,*sines=nullptr,*lse=nullptr,*lut=nullptr;
   uint8_t* rgb=nullptr;
   int32_t* lengths=nullptr;
@@ -83,18 +83,37 @@ size_t scratch_generic_tower(const cuteafd_vision_spec& s,unsigned char* arena,G
     using P=typename std::remove_reference<decltype(pointer)>::type;
     pointer=arena?reinterpret_cast<P>(arena+cursor):nullptr;cursor+=aligned(bytes);
   };
-  take(out.x,n*h*2);take(out.next,n*h*2);take(out.norm,n*h*2);
-  take(out.patches,n*3*t.temporal_patch*s.patch_size*s.patch_size*2);
-  take(out.qkv,n*3*a*2);take(out.q,n*a*2);take(out.k,n*a*2);take(out.v,n*a*2);take(out.attention,n*a*2);
-  take(out.projection,n*h*2);take(out.mlp,n*s.intermediate*2);take(out.position,n*h*2);
+  take(out.x,n*h*2);take(out.next,n*h*2);
+  take(out.cosines,n*t.rotated_dims/2*4);take(out.sines,n*t.rotated_dims/2*4);take(out.lengths,2*4);
+  const size_t phase_base=cursor;size_t peak=0;
+  auto phase=[&]() { peak=std::max(peak,cursor-phase_base);cursor=phase_base; };
+  // Patch input dies after projection; absolute positions die after their add.
+  take(out.rgb,n*s.patch_size*s.patch_size*3);take(out.lut,768*4);
+  take(out.patches,n*3*t.temporal_patch*s.patch_size*s.patch_size*2);phase();
+  take(out.position,n*h*2);phase();
+  // Norm/QKV can occupy the first fused-QKV region plus unused rotary tail.
+  take(out.qkv,n*3*a*2);take(out.qkv_norm,n*h*2);phase();
+  // Rotary requires disjoint fused source and Q/K/V destinations. Attention
+  // reuses the old fused source for O/LSE after rotary has drained on-stream.
+  take(out.qkv,n*3*a*2);take(out.q,n*a*2);take(out.k,n*a*2);take(out.v,n*a*2);phase();
+  take(out.attention,n*a*2);take(out.lse,n*s.heads*4);phase();
+  // Attention projection writes next directly; MLP reuses the entire phase.
+  out.projection=out.next;
+  take(out.norm,n*h*2);take(out.mlp,n*s.intermediate*2);phase();
+  // Projection/grouping stages own distinct source and destination ranges.
+  // Their storage aliases transformer temporaries only after final norm.
+  const size_t units=s.max_tokens;
   const size_t projected=t.projection_order==2?t.projectors[0].output_width:h;
-  take(out.grouped,size_t(s.max_tokens)*4*projected*2);
-  size_t projector_bytes=0;
-  for(const auto& p:t.projectors)if(p.kind)projector_bytes=std::max(projector_bytes,n*std::max(p.hidden_width,p.output_width)*2);
-  take(out.projector,projector_bytes);take(out.output,size_t(s.max_tokens)*s.output_width*2);
-  take(out.cosines,n*t.rotated_dims/2*4);take(out.sines,n*t.rotated_dims/2*4);
-  take(out.rgb,n*s.patch_size*s.patch_size*3);take(out.lut,768*4);take(out.lengths,2*4);take(out.lse,n*s.heads*4);
-  return cursor;
+  take(out.grouped,units*4*projected*2);
+  size_t hidden_bytes=0,result_bytes=0;
+  for(int stage=0;stage<2;++stage) {
+    const auto& p=t.projectors[stage];
+    const size_t rows=(t.projection_order==2 && stage==0)?n:units;
+    if(p.kind) {hidden_bytes=std::max(hidden_bytes,rows*p.hidden_width*2);result_bytes=std::max(result_bytes,rows*p.output_width*2);}
+  }
+  take(out.projector,hidden_bytes);take(out.projector_result,result_bytes);phase();
+  take(out.projector_result,result_bytes);take(out.output,units*s.output_width*2);phase();
+  return phase_base+peak;
 }
 
 #ifdef CUTEAFD_HAVE_VISION_ATTENTION_AOT

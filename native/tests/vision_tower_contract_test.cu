@@ -35,7 +35,27 @@ int main() {
   t.version=2;if(valid_generic_tower(s))return 5;t.version=1;
   t.block_norm_epsilon=0;if(valid_generic_tower(s))return 6;t.block_norm_epsilon=0x1p-23f;
   t.projectors[0].input_width=1024;if(valid_generic_tower(s))return 7;t.projectors[0].input_width=4096;
-  t.inv_freq[1]=s.weight_bytes;if(valid_generic_tower(s))return 8;
+  t.inv_freq[1]=s.weight_bytes;if(valid_generic_tower(s))return 8;t.inv_freq[1]=0;
+  for(auto policy: {std::pair<uint32_t,size_t>{16384,1509949696ULL}, {4096,377487616ULL}}) {
+    s.max_tokens=policy.first;
+    GenericTowerStorage sizing;
+    size_t planned=scratch_generic_tower(s,nullptr,sizing);
+    if(planned!=policy.second)return 9;
+    // Host backing only: exact offsets verify simultaneous operands remain
+    // disjoint, while the successive stages share the same physical region.
+    std::vector<unsigned char> arena(planned);
+    GenericTowerStorage mapped;
+    if(scratch_generic_tower(s,arena.data(),mapped)!=planned)return 10;
+    size_t n=size_t(s.max_tokens)*4,h=s.hidden,a=t.attention_width;
+    auto end=[](const void* pointer,size_t bytes) {return reinterpret_cast<uintptr_t>(pointer)+bytes;};
+    if(end(mapped.qkv,n*3*a*2)>reinterpret_cast<uintptr_t>(mapped.q) ||
+       end(mapped.q,n*a*2)>reinterpret_cast<uintptr_t>(mapped.k) ||
+       end(mapped.k,n*a*2)>reinterpret_cast<uintptr_t>(mapped.v))return 11;
+    if(mapped.attention!=mapped.qkv || mapped.norm!=mapped.qkv || mapped.projection!=mapped.next)return 12;
+    if(end(mapped.qkv,n*3*a*2)>reinterpret_cast<uintptr_t>(mapped.qkv_norm))return 13;
+    if(end(mapped.norm,n*h*2)>reinterpret_cast<uintptr_t>(mapped.mlp))return 14;
+    if(end(mapped.output,size_t(s.max_tokens)*s.output_width*2)>reinterpret_cast<uintptr_t>(arena.data()+planned))return 15;
+  }
   std::printf("generic-tower-contract-pass scratch=%zu no-device-allocation\n",bytes);
   return 0;
 }
