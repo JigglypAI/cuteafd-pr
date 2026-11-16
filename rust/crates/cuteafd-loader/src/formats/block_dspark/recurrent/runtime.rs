@@ -50,7 +50,8 @@ impl RecurrentBlockConfig {
         let local = self.rank(rank, ranks, lead)?;
         let record = format.plane_record_bytes(local.kv_heads, self.transformer.head_dim)
             .checked_mul(2).context("recurrent mark record overflow")?;
-        self.context.iter().try_fold(16usize, |sum, policy| {
+        let feature=self.transformer.hidden.checked_mul(2).context("recurrent mark feature overflow")?;
+        self.context.iter().try_fold(16usize.checked_add(feature).context("recurrent mark metadata overflow")?, |sum, policy| {
             let bytes = match policy { ContextPolicy::Full => 0,
                 ContextPolicy::BlockAnchoredWindow(window) => window.checked_mul(record).context("recurrent mark plane overflow")? };
             sum.checked_add(bytes).context("recurrent mark bytes overflow")
@@ -79,7 +80,7 @@ mod tests {
                     assert_eq!(cache.full_bytes, (131072*record) as u64);
                     assert_eq!(cache.window_bytes, (4*16*1024*record) as u64);
                     assert_eq!(cache.page_table_bytes, 16*512*4);
-                    assert_eq!(c.window_mark_bytes(format, rank, ranks, 0)?, (16+4*1024*record).div_ceil(256)*256);
+                    assert_eq!(c.window_mark_bytes(format, rank, ranks, 0)?, (16+4608*2+4*1024*record).div_ceil(256)*256);
                     let wider = c.cache_layout(32, 32768, 131072, format, rank, ranks, 0)?;
                     assert_eq!(cache.full_bytes, wider.full_bytes);
                     assert_eq!(2*cache.window_bytes, wider.window_bytes);
