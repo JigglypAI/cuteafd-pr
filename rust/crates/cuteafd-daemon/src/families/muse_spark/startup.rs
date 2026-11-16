@@ -521,7 +521,7 @@ mod tests {
         assert_eq!(report.host_budget_bytes, built.host.prefix_bytes);
         for device in report.memory_layout.as_ref().context("admitted devices")?.devices.iter()
             .filter(|device| device.kind == DeviceKind::Spark) {
-            assert_eq!(device.capacity_bytes, cuteafd_loader::plan::DEFAULT_SPARK_BUDGET_BYTES);
+            assert_eq!(device.capacity_bytes, cuteafd_loader::serving_capacity::spark_memory::serving_bytes()[device.index as usize]);
             assert_eq!(device.worker_budget_bytes, device.capacity_bytes);
         }
         let admitted = &built.media;

@@ -1421,7 +1421,7 @@ def capture_resolver_config_parity(snapshot: Path, example: Path, binary: Path,
     direct = subprocess.run([str(binary), "plan", str(snapshot), "--deployment", "--config", str(example),
         "--hf-home", str(hf_home), "--workspace-manifest", str(programs),
         "--gpu-memory-cap", argv[argv.index("--gpu-memory-cap") + 1],
-        *(["--spark-memory-samples", argv[argv.index("--spark-memory-samples") + 1]]
+        *(["--spark-memory-samples", json.dumps(launched["spark_memory_measurements"])]
           if "--spark-memory-samples" in argv else [])],
         capture_output=True, text=True, timeout=30, env={**os.environ, "HF_HOME": str(hf_home)})
     assert direct.returncode == 0, direct.stderr

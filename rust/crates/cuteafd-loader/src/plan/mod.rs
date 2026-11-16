@@ -1675,7 +1675,7 @@ fn place(report: &mut PlanReport, options: &PlanOptions, spec: &ModelSpec, model
                             contract.package, intermediate.unwrap_or(0), contract.block),
                         how: format!("{advice}; adding a package cannot repair empty or unaligned expert slices."),
                     });
-                } else if !fits_on(ranks) {
+                } else if !fits_on(ranks) && options.layout.is_none() {
                     report.fits = false;
                     report.placement_supported &= contract.spark_worlds.contains(&ranks);
                     report.hints.push(Hint {

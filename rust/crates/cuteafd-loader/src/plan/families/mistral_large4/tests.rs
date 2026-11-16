@@ -205,7 +205,7 @@ fn exl3_publication_lays_out_on_the_glm_engine() {
             .collect::<Vec<_>>();
         assert_eq!(sparks.len(), ranks);
         for spark in sparks {
-            assert_eq!(spark.worker_budget_bytes, crate::serving_capacity::spark_memory::serving_bytes()[spark.index as usize], "{ranks}+{gpus}");
+            assert_eq!(spark.worker_budget_bytes, crate::serving_capacity::spark_memory::measured_bytes(["ostrich", "dodo", "emu", "kiwi", "rhea", "moa", "kakapo", "cassowary"][spark.index as usize]).unwrap(), "{ranks}+{gpus}");
             assert!(spark.worker_budget_bytes <= spark.capacity_bytes, "{ranks}+{gpus}");
         }
         // The explicit whole-layer layout avoids replicated KV.

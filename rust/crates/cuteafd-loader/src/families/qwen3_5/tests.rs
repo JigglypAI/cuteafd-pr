@@ -200,7 +200,8 @@ fn native_planner_uses_export_contract_and_exact_dense_allocations() {
         && item.bytes == buffers.prefix as u64));
     assert!(memory.notes.iter().any(|note| note.contains("bounded decode/verify graph reserve")));
     for ranks in 1..=8 {
-        let spark_options = PlanOptions { placement: ExpertPlacement::Sparks { ranks }, ..options.clone() };
+        let mut spark_options = PlanOptions { placement: ExpertPlacement::Sparks { ranks }, ..options.clone() };
+        spark_options.layout.as_mut().unwrap().spark_bytes = 121 << 30;
         let refused = plan::plan(dir.path(), &spark_options).unwrap();
         assert!(!refused.fits && !refused.placement_supported && !refused.native_serving_admitted
             && !refused.wip_launchable());
