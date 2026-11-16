@@ -9,6 +9,7 @@ use std::cell::RefCell;
 /// common stream. Each implementation retains its own device/transport owners.
 pub(crate) trait VerificationTarget<'a>: TargetCache<'a> {
     type Transport;
+    fn visit_lane_graphs(&mut self, visit: &mut crate::shared::decode_graph::device::GraphVisitor<'_>) -> Result<()>;
     fn set_route_capture(&mut self, enabled: bool) -> Result<()>;
     /// Route ids and/or pass timing (layer clock, FFN stage split).
     fn set_capture(&mut self, capture: crate::families::deepseek_v41::v41_backbone_lane::Capture) -> Result<()>;
@@ -74,6 +75,9 @@ pub(crate) trait VerificationTarget<'a>: TargetCache<'a> {
 }
 
 impl<'a> VerificationTarget<'a> for TargetPass<'_, 'a> {
+    fn visit_lane_graphs(&mut self, visit: &mut crate::shared::decode_graph::device::GraphVisitor<'_>) -> Result<()> {
+        self.visit_graph_banks(visit)
+    }
     type Transport = NativeTp4Wave<'a>;
     fn set_device_order(&mut self, on: bool) { TargetPass::set_device_order(self, on) }
     fn set_l2_prefetch(&mut self, on: bool) { TargetPass::set_l2_prefetch(self, on) }
@@ -125,6 +129,9 @@ impl<'a> VerificationTarget<'a> for TargetPass<'_, 'a> {
 }
 
 impl<'a> VerificationTarget<'a> for DistributedTargetPass<'_, 'a> {
+    fn visit_lane_graphs(&mut self, visit: &mut crate::shared::decode_graph::device::GraphVisitor<'_>) -> Result<()> {
+        self.visit_graph_banks(visit)
+    }
     type Transport = DeviceOwner<'a, NativeTp4Wave<'a>>;
     fn set_device_order(&mut self, on: bool) { DistributedTargetPass::set_device_order(self, on) }
     fn set_l2_prefetch(&mut self, on: bool) { DistributedTargetPass::set_l2_prefetch(self, on) }

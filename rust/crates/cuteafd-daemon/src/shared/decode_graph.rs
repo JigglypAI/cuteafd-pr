@@ -8,6 +8,7 @@ pub(crate) trait CacheAttached {
     fn needs_boundary(&self) -> bool;
     fn measured(&mut self, bytes: u64);
     fn tick(&mut self);
+    fn lane_owner(&mut self, lane: usize);
     /// # Safety
     /// Pins released by owner drop must not own captured allocations. Their
     /// persistent backing storage outlives every in-flight graph launch.
@@ -27,6 +28,7 @@ macro_rules! cache_attached_methods {
         fn needs_boundary(&self) -> bool { self.$field.cache_needs_boundary() }
         fn measured(&mut self, bytes: u64) { self.$field.cache_measured(bytes); }
         fn tick(&mut self) { self.$field.cache_tick(); }
+        fn lane_owner(&mut self, lane: usize) { self.$field.cache_lane_owner(lane); }
         unsafe fn evict_persistent(&mut self) {
             // SAFETY: forwarded persistent-storage contract from the visitor.
             unsafe { self.$field.cache_evict_persistent(); }

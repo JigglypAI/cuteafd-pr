@@ -9,6 +9,12 @@ pub(super) fn run<'a, P: VerificationTarget<'a>, C: DraftChain<'a>>(runtime: &to
     active: &mut [Option<Active<'a>>], draft: Option<&mut DraftRuntime<'_, 'a, C>>,
     prefixes: &mut PrefixCache<'a>, receive: &mpsc::Receiver<NativeRequest>, wake: admission::Wake<'_>,
 ) -> Result<()> {
+    first.visit_lane_graphs(&mut |_, _, _, bank| { bank.lane_owner(0); Ok(()) })?;
+    second.visit_lane_graphs(&mut |_, _, _, bank| { bank.lane_owner(1); Ok(()) })?;
+    let mut draft = draft;
+    if let Some(draft) = draft.as_deref_mut() {
+        for lane in 0..2 { draft.visit_lane_graphs(lane, &mut |_, _, _, bank| { bank.lane_owner(lane); Ok(()) })?; }
+    }
     let requests = RefCell::new(requests);
     let active = RefCell::new(active);
     let draft = RefCell::new(draft);
@@ -120,7 +126,12 @@ async fn lane<'a, P: VerificationTarget<'a>, C: DraftChain<'a>>(lease: LaneLease
     prefixes: &RefCell<&mut PrefixCache<'a>>, receive: &mpsc::Receiver<NativeRequest>, wake: admission::Wake<'_>,
 ) -> Result<()> {
     let lane = lease.index();
-    {
+    let mut graph_cycles = crate::shared::decode_graph::device::LaneCycles::register(lane, 2, |visit| {
+        pass.visit_lane_graphs(visit)?;
+        if let Some(draft) = draft.borrow_mut().as_deref_mut() { draft.visit_lane_graphs(lane, visit)?; }
+        Ok(())
+    })?;
+    let result = async {
         let mut round_id = 0u64;
         loop {
             if lease.stopping() { return Ok(()); }
@@ -165,6 +176,13 @@ async fn lane<'a, P: VerificationTarget<'a>, C: DraftChain<'a>>(lease: LaneLease
                 }
                 if short { lease.stop(); return Ok(()); }
             }
+            // SAFETY: the previous round's target/drafter commit has drained;
+            // this visitor contains only this lane's persistent-storage banks.
+            unsafe { graph_cycles.begin(|visit| {
+                pass.visit_lane_graphs(visit)?;
+                if let Some(draft) = draft.borrow_mut().as_deref_mut() { draft.visit_lane_graphs(lane, visit)?; }
+                Ok(())
+            }) }?;
             let _capture_watch = crate::shared::decode_graph::CaptureWatch::round();
             let started = Instant::now();
             // Reserve target capacity and snapshot this lane's seeds, then release
@@ -400,11 +418,17 @@ async fn lane<'a, P: VerificationTarget<'a>, C: DraftChain<'a>>(lease: LaneLease
             operation?;
             stopped_capture?;
             discarded?;
+            // Commit/discard settled this lane; no bank traversal on hit-only rounds.
+            graph_cycles.complete();
             // Give already-ready remote completions an opportunity to run before
             // queuing another draft on the shared RTX.
             tokio::task::yield_now().await;
         }
-    }
+    }.await;
+    // Do not manufacture a completed frontier from an early validation/draft
+    // error; the existing submission guards still own device drainage.
+    if result.is_ok() { graph_cycles.complete(); } else { graph_cycles.abandon(); }
+    result
 }
 
 async fn retire<'a, C: DraftChain<'a>>(lane: usize, mut request: Active<'a>, requests: &RefCell<&mut Requests<'a>>,
@@ -693,5 +717,18 @@ mod tests {
         assert!(first_output.try_recv().is_err());
         assert!(second_output.try_recv().is_err());
         assert!(peer_output.try_recv().is_err());
+    }
+}
+
+#[cfg(test)]
+mod graph_cycle_contract_tests {
+    #[test]
+    fn prefill_never_overlaps_the_joined_decode_lane_set() {
+        let scheduler = include_str!("../scheduler.rs");
+        assert!(scheduler.find("prefills.round_with(").unwrap() < scheduler.find("P::decode_round(").unwrap());
+        let independent = include_str!("independent.rs");
+        assert!(independent.contains("runtime.block_on(drive_lanes("));
+        let lanes = include_str!("../../../../shared/serve/lanes.rs");
+        assert!(lanes.contains("tokio::join!(first, second)"));
     }
 }

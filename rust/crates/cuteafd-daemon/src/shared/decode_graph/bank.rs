@@ -270,7 +270,9 @@ impl<K: Hash + Eq + Clone + std::fmt::Debug, E> GraphBank<K, E> {
             let mut cache = shared.lock().unwrap_or_else(|p| p.into_inner());
             binding.flush(&mut cache);
             binding.pinned_counts.clear();
+            let lane = cache.bank_lane(binding.bank);
             cache.remove_bank(binding.bank);
+            cache.assign_bank_lane(binding.bank, lane);
         }
     }
 
@@ -298,6 +300,12 @@ impl<K: Hash + Eq + Clone + std::fmt::Debug, E> GraphBank<K, E> {
         }
     }
 
+    pub fn cache_lane_owner(&mut self, lane: usize) {
+        if let Some(binding) = &self.device {
+            binding.cache.lock().unwrap_or_else(|p| p.into_inner()).assign_bank_lane(binding.bank, lane);
+        }
+    }
+
     pub fn cache_needs_boundary(&self) -> bool {
         self.device.as_ref().is_some_and(|binding| binding.cache.lock().unwrap_or_else(|p| p.into_inner()).needs_boundary())
     }
@@ -319,10 +327,11 @@ impl<K: Hash + Eq + Clone + std::fmt::Debug, E> GraphBank<K, E> {
     pub unsafe fn cache_evict_persistent(&mut self) {
         let Some(binding) = &mut self.device else { return };
         let victims: Vec<_> = {
-            let cache = binding.cache.lock().unwrap_or_else(|p| p.into_inner());
+            let mut cache = binding.cache.lock().unwrap_or_else(|p| p.into_inner());
             if !cache.has_pending_victims() { return }
+            cache.refresh_cycles();
             self.entries.iter().filter_map(|(key, entry)| entry.cached
-                .filter(|(id, _)| cache.pending(*id)).map(|(id, _)| (key.clone(), id))).collect()
+                .filter(|(id, _)| cache.persistent_victim_ready(*id)).map(|(id, _)| (key.clone(), id))).collect()
         };
         for (key, _) in &victims { self.entries.remove(key); }
         if !victims.is_empty() {
@@ -354,6 +363,7 @@ impl<K: Hash + Eq + Clone + std::fmt::Debug, E> GraphBank<K, E> {
                 &victims.iter().map(|(_, id)| *id).collect::<Vec<_>>(), measurement);
         }
         let mut cache = binding.cache.lock().unwrap_or_else(|p| p.into_inner());
+        cache.serial_boundary();
         if self.cache_keys_dirty || self.cache_key_generation != cache.identity_generation() {
             self.cache_keys.retain(|_, identity| cache.retains_identity(identity));
             self.cache_keys_dirty = false;
@@ -408,17 +418,17 @@ mod device_tests {
         impl Drop for Exec { fn drop(&mut self) { self.0.set(self.0.get() + 1); } }
         let fixture = cuteafd_ffi::native_library_lifetime_fixture::Fixture::build_for_tests()?;
         let library = fixture.load()?;
-        fixture.configure_memory_usage(&library, 6, 64 << 20, 0)?;
+        fixture.configure_memory_usage(&library, 4, 64 << 20, 0)?;
         let mut bank = GraphBank::new();
-        bank.attach_device(&library, 6, 32 << 20, site())?;
+        bank.attach_device(&library, 4, 32 << 20, site())?;
         let ticket = bank.cache_ticket(&1, false, None).unwrap();
         let drops = Rc::new(Cell::new(0));
-        fixture.configure_memory(&library, 6, 0)?;
+        fixture.configure_memory(&library, 4, 0)?;
         bank.cache_commit(1, Exec(drops.clone()), ticket, 7, 1, false);
         assert_eq!(drops.get(), 0, "raw first launch may still use the retained executable");
         assert!(bank.cached_launch(&1).is_some());
         assert!(bank.cache_needs_boundary(), "fallback credit awaits a recoverable physical sample");
-        let snapshot = super::super::device::snapshots().into_iter().find(|row| row.device == 6).unwrap();
+        let snapshot = super::super::device::snapshots().into_iter().find(|row| row.device == 4).unwrap();
         assert_eq!(snapshot.charged, 10, "retained owner is conservatively charged");
         assert!(snapshot.hard_stopped);
         assert!(bank.cache_ticket(&2, false, None).is_none());
@@ -439,6 +449,8 @@ mod device_tests {
         bank.cache_insert(1, Exec(drops.clone()), id, false);
         bank.cache_measured(10);
         let cache = bank.device.as_ref().unwrap().cache.clone();
+        cache.lock().unwrap().serial_boundary();
+        cache.lock().unwrap().serial_boundary();
         assert_eq!(cache.lock().unwrap().mark_victim(false), Some(id));
         assert!(bank.cache_drain(|| anyhow::bail!("not drained"), || unreachable!()).is_err());
         assert_eq!(drops.get(), 0);
@@ -467,6 +479,106 @@ mod device_tests {
     }
 
     #[test]
+    fn cycle_handle_hit_only_round_never_visits_or_locks_banks_and_survives_reuse() -> anyhow::Result<()> {
+        use super::super::device;
+        let mut bank = GraphBank::<usize, usize>::new();
+        bank.attach_device_for_test(-395, 64 << 20, site())?;
+        let mut cycles = device::LaneCycles::register(0, 1,
+            |visit| visit(-395, "bank-test", false, &mut bank))?;
+        let cache = bank.device.as_ref().unwrap().cache.clone();
+        // Keeping the controller locked makes a mutex on the boundary deadlock;
+        // the visitor must not run and must not allocate/rebuild an inventory.
+        let guard = cache.lock().unwrap();
+        for _ in 0..4 {
+            // SAFETY: no queued work, fixture contains no captured allocations.
+            unsafe { cycles.begin(|_| panic!("hit-only cycle visited banks")) }?;
+            cycles.complete();
+        }
+        drop(guard);
+        for round in 0..3 {
+            let ticket = bank.cache_ticket(&round, false, None).unwrap();
+            bank.cache_commit(round, round, ticket, 10, 1, false);
+            bank.cache_measured(if round == 0 { 10 } else { 0 });
+            bank.cache_clear_drained();
+            // SAFETY: explicit drained reuse of the same registered bank.
+            unsafe { cycles.begin(|_| panic!("reused bank lost its lane handle")) }?;
+            cycles.complete();
+        }
+        assert_eq!(device::snapshots().into_iter().find(|row| row.device == -395).unwrap().charged, 10);
+        Ok(())
+    }
+
+    #[test]
+    fn cycle_k1_pending_owner_retires_at_its_serial_boundary() -> anyhow::Result<()> {
+        use super::super::device;
+        let fixture = cuteafd_ffi::native_library_lifetime_fixture::Fixture::build_for_tests()?;
+        let library = fixture.load()?;
+        // The DSO memory table is per-library inode; the Rust graph registry
+        // is process-global. Ordinal 5 is unused by other graph-cache fixtures.
+        fixture.configure_memory_usage(&library, 5, 128 << 20, 0)?;
+        let mut bank = GraphBank::<usize, usize>::new();
+        bank.attach_device(&library, 5, 64 << 20, site())?;
+        let ticket = bank.cache_ticket(&1, false, None).unwrap();
+        bank.cache_commit(1, 1, ticket, 10, 1, false);
+        bank.cache_measured(10);
+        let cache = bank.device.as_ref().unwrap().cache.clone();
+        cache.lock().unwrap().serial_boundary();
+        cache.lock().unwrap().serial_boundary();
+        cache.lock().unwrap().mark_victim(false).unwrap();
+        // SAFETY: fixture integers own no captured allocations or native work.
+        unsafe { device::observe_completed(&library,
+            |visit| visit(5, "bank-test", false, &mut bank)) }?;
+        assert_eq!(bank.len(), 0, "the serial boundary must not strand pending owners");
+        assert!(!cache.lock().unwrap().has_pending_victims());
+        Ok(())
+    }
+
+    #[test]
+    fn cycle_owner_only_destroys_at_next_start_and_peer_retains_credit() -> anyhow::Result<()> {
+        use super::super::{CacheAttached, device};
+        use std::{cell::Cell, rc::Rc};
+        struct Exec(Rc<Cell<usize>>);
+        impl Drop for Exec { fn drop(&mut self) { self.0.set(self.0.get() + 1); } }
+        let drops = [Rc::new(Cell::new(0)), Rc::new(Cell::new(0))];
+        let mut banks = [GraphBank::new(), GraphBank::new()];
+        for lane in 0..2 {
+            banks[lane].attach_device_for_test(-394, 64 << 20, site())?;
+            banks[lane].cache_lane_owner(lane);
+            let ticket = banks[lane].cache_ticket(&1, false, None).unwrap();
+            banks[lane].cache_commit(1, Exec(drops[lane].clone()), ticket, 10, 1, false);
+            banks[lane].cache_measured(10);
+        }
+        let cache = banks[0].device.as_ref().unwrap().cache.clone();
+        // SAFETY: fixture owners contain counters, not captured allocations.
+        for lane in 0..2 { unsafe { device::lane_cycle(lane, true,
+            |visit| visit(-394, "bank-test", false, &mut banks[lane])) }?; }
+        let victim = cache.lock().unwrap().mark_victim(false).unwrap();
+        let owner = banks.iter().position(|bank| bank.entries.values()
+            .any(|entry| entry.cached.is_some_and(|(id, _)| id == victim))).unwrap();
+        let peer = 1 - owner;
+        // SAFETY: completed peer, allocation-free fixture.
+        unsafe {
+            device::lane_cycle(peer, false, |visit| visit(-394, "bank-test", false, &mut banks[peer]))?;
+            device::lane_cycle(peer, true, |visit| visit(-394, "bank-test", false, &mut banks[peer]))?;
+        }
+        assert_eq!(drops[owner].get(), 0, "a peer cycle must not touch the owner's bank");
+        // Even a mistaken all-bank visitor cannot destroy an in-flight owner.
+        unsafe { banks[owner].evict_persistent(); }
+        assert_eq!(drops[owner].get(), 0);
+        unsafe {
+            device::lane_cycle(owner, false, |visit| visit(-394, "bank-test", false, &mut banks[owner]))?;
+            device::lane_cycle(owner, true, |visit| visit(-394, "bank-test", false, &mut banks[owner]))?;
+        }
+        assert_eq!(drops[owner].get(), 1);
+        assert_eq!(drops[peer].get(), 0);
+        assert_eq!(device::snapshots().into_iter().find(|row| row.device == -394).unwrap().charged, 20);
+        for lane in 0..2 {
+            unsafe { device::lane_cycle(lane, false, |visit| visit(-394, "bank-test", false, &mut banks[lane]))?; }
+        }
+        Ok(())
+    }
+
+    #[test]
     fn persistent_victims_release_capacity_without_a_drain_or_idle_lane() {
         use std::{cell::Cell, rc::Rc};
         struct Exec(Rc<Cell<usize>>);
@@ -479,6 +591,8 @@ mod device_tests {
         bank.cache_measured(10);
         for key in 2..20 {
             let cache = bank.device.as_ref().unwrap().cache.clone();
+            cache.lock().unwrap().serial_boundary();
+            cache.lock().unwrap().serial_boundary();
             assert!(cache.lock().unwrap().mark_victim(false).is_some());
             // SAFETY: fixture executables own no captured buffers or native work.
             unsafe { bank.cache_evict_persistent(); }
@@ -739,6 +853,7 @@ impl<K: Hash + Eq + Clone + std::fmt::Debug, E> super::CacheAttached for GraphBa
     fn needs_boundary(&self) -> bool { self.cache_needs_boundary() }
     fn measured(&mut self, bytes: u64) { self.cache_measured(bytes); }
     fn tick(&mut self) { self.cache_tick(); }
+    fn lane_owner(&mut self, lane: usize) { self.cache_lane_owner(lane); }
     unsafe fn evict_persistent(&mut self) {
         // SAFETY: forwarded persistent-storage contract from the visitor.
         unsafe { self.cache_evict_persistent(); }
