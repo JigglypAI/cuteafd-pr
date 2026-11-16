@@ -1,6 +1,6 @@
 //! Native stage2 arithmetic geometry and immutable program/owner contracts.
 //! No scheduling or placement decisions live here.
-use super::Inkling2Config;
+use super::{Inkling2Config, InklingKvCache};
 use anyhow::{ensure, Context, Result};
 use std::collections::BTreeMap;
 
@@ -8,11 +8,15 @@ use std::collections::BTreeMap;
 pub struct UnitLayout {
     pub rows: usize,
     pub blocks: usize,
+    pub kv_format: InklingKvCache,
     pub buffers: BTreeMap<String, usize>,
 }
 
 impl UnitLayout {
     pub fn new(cfg: &Inkling2Config, rows: usize, context: usize) -> Result<Self> {
+        Self::with_format(cfg, rows, context, InklingKvCache::Bf16)
+    }
+    pub fn with_format(cfg: &Inkling2Config, rows: usize, context: usize, kv_format: InklingKvCache) -> Result<Self> {
         ensure!((1..=4096).contains(&rows) && rows <= context && context <= cfg.max_position,
             "Inkling arithmetic rows/context outside checkpoint/export");
         ensure!((cfg.hidden, cfg.heads, cfg.kv_heads, cfg.head_dim, cfg.d_rel, cfg.sconv_kernel)
@@ -39,12 +43,12 @@ impl UnitLayout {
             ("kv_step", 2048, 2), ("k_dynamic", 32, 4), ("v_dynamic", 32, 4),
             ("route_logits", cfg.experts, 4), ("route_ids", cfg.topk, 4), ("route_weights", cfg.topk, 4),
             ("expert_wire", cfg.hidden + cfg.hidden/32, 1), ("expert_output", cfg.hidden, 2),
-            ("positions", 1, 8), ("first", 1, 4), ("conv_slots", 1, 8), ("ring_slots", 1, 8), ("cache_slots", 1, 8)] {
+            ("table_indices", 1, 4), ("tile_rows", 1, 4), ("positions", 1, 8), ("first", 1, 4), ("conv_slots", 1, 8), ("ring_slots", 1, 8), ("cache_slots", 1, 8)] {
             add(name, width, bytes)?;
         }
         buffers.insert("attention_scratch".into(), 64 * 32 * 48 * (128*4+4));
         buffers.insert("ring".into(), 1088 * 4096);
-        buffers.insert("global_cache".into(), context.div_ceil(64).checked_mul(64*4096).context("Inkling cache overflow")?);
+        buffers.insert("global_cache".into(), context.div_ceil(64).checked_mul(64*kv_format.record_bytes(cfg.kv_heads, cfg.head_dim)).context("Inkling cache overflow")?);
         buffers.insert("page_table".into(), context.div_ceil(64)*4);
         // Cold golden reuses one layer's four conv histories serially. Serving
         // history belongs to each layer's cache owner, not this scratch layout.
@@ -52,12 +56,18 @@ impl UnitLayout {
             ("k_conv_history", 1024), ("v_conv_history", 1024)] {
             buffers.insert(name.into(), 3*width*4);
         }
-        Ok(Self { rows, blocks, buffers })
+        Ok(Self { rows, blocks, kv_format, buffers })
     }
     /// Serving binds per-layer state from the persistent request bank. Scratch
     /// must not also allocate cold-golden copies of those physical owners.
     pub fn serving(cfg: &Inkling2Config, rows: usize, context: usize) -> Result<Self> {
-        let mut layout = Self::new(cfg, rows, context)?;
+        Self::serving_format(cfg, rows, context, InklingKvCache::Bf16, 1)
+    }
+    pub fn serving_format(cfg: &Inkling2Config, rows: usize, context: usize, kv_format: InklingKvCache,
+        sequences: usize) -> Result<Self> {
+        let mut layout = Self::with_format(cfg, rows, context, kv_format)?;
+        layout.buffers.insert("page_table".into(), sequences.checked_mul(context.div_ceil(64)*4)
+            .context("Inkling request table bank overflow")?);
         for name in ["ring", "global_cache", "attn_conv_history", "mlp_conv_history",
             "k_conv_history", "v_conv_history"] { layout.buffers.remove(name); }
         layout.buffers.insert("global_slots".into(), rows.checked_mul(8).context("Inkling physical slot extent overflow")?);
@@ -71,10 +81,10 @@ impl UnitLayout {
         ensure!(members > 0 && members <= self.rows, "Inkling upload member count outside unit");
         let mut shape = crate::shared::token_table::UploadShape::default();
         let repeats = cfg.layers.checked_mul(2).context("Inkling upload repetitions overflow")?;
-        shape.append(&[self.rows*8, self.rows*8, self.rows*8, self.rows*8, self.rows*8, self.rows*4], repeats)?;
-        shape.fragment(6, repeats.checked_mul(members-1).context("Inkling upload fragments overflow")?)?;
+        shape.append(&[self.rows*8, self.rows*8, self.rows*8, self.rows*8, self.rows*8,
+            self.rows*4, self.rows*4, self.rows*4], repeats)?;
         shape.append(&[self.buffers["page_table"]], cfg.global_layers().len().checked_mul(2)
-            .and_then(|count| count.checked_mul(members)).context("Inkling page upload repetitions overflow")?)?;
+            .context("Inkling page upload repetitions overflow")?)?;
         shape.append(&[self.rows*4], 1)?;
         Ok(shape)
     }
@@ -141,10 +151,14 @@ pub struct CacheLayout {
     pub sequences: usize,
     pub pool_pages: usize,
     pub page_bytes: usize,
+    pub kv_format: InklingKvCache,
     pub global_layers: Vec<usize>,
 }
 impl CacheLayout {
     pub fn new(cfg: &Inkling2Config, sequences: usize, pool_pages: usize) -> Result<Self> {
+        Self::with_format(cfg, sequences, pool_pages, InklingKvCache::Bf16)
+    }
+    pub fn with_format(cfg: &Inkling2Config, sequences: usize, pool_pages: usize, kv_format: InklingKvCache) -> Result<Self> {
         ensure!(sequences > 0 && sequences <= i32::MAX as usize && pool_pages > 0
             && pool_pages <= i32::MAX as usize && cfg.layers == cfg.local.len(), "Inkling cache capacity");
         let layers = cfg.local.iter().map(|&local| SequenceLayout::new(cfg, local, 1))
@@ -155,10 +169,10 @@ impl CacheLayout {
             sequence_bytes = sequence_bytes.checked_add(layer.bytes).context("Inkling cache mark overflow")?;
             Ok(offset)
         }).collect::<Result<Vec<_>>>()?;
-        let page_bytes = cfg.kv_heads.checked_mul(cfg.head_dim).and_then(|v| v.checked_mul(4 * 64))
+        let page_bytes = kv_format.record_bytes(cfg.kv_heads, cfg.head_dim).checked_mul(64)
             .context("Inkling cache page overflow")?;
         let global_layers = cfg.local.iter().enumerate().filter_map(|(layer, &local)| (!local).then_some(layer)).collect();
-        Ok(Self { layers, offsets, sequence_bytes, sequences, pool_pages, page_bytes, global_layers })
+        Ok(Self { layers, offsets, sequence_bytes, sequences, pool_pages, page_bytes, kv_format, global_layers })
     }
     pub fn active_bytes(&self) -> Result<usize> {
         self.sequence_bytes.checked_mul(self.sequences).context("Inkling active cache overflow")

@@ -67,6 +67,10 @@ fn options(args: &PlanArgs) -> Result<PlanOptions, PlanError> {
                     cuteafd_core::MlaCacheFormat::Bf16 => cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16,
                     cuteafd_core::MlaCacheFormat::Fp8 => cuteafd_loader::families::qwen4::Qwen4KvCache::Fp8,
                 }).unwrap_or_default(),
+                inkling_kv: args.kv_format.map(|format| match format {
+                    cuteafd_core::MlaCacheFormat::Bf16 => cuteafd_loader::families::inkling2::InklingKvCache::Bf16,
+                    cuteafd_core::MlaCacheFormat::Fp8 => cuteafd_loader::families::inkling2::InklingKvCache::Fp8,
+                }).unwrap_or_default(),
                 muse_kv: args.kv_format.map(|format| match format {
                     cuteafd_core::MlaCacheFormat::Bf16 => cuteafd_loader::families::muse_spark::cache::MuseKvCache::Bf16,
                     cuteafd_core::MlaCacheFormat::Fp8 => cuteafd_loader::families::muse_spark::cache::MuseKvCache::Fp8,

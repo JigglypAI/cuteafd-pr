@@ -1973,6 +1973,9 @@ if [[ $family == muse_spark ]]; then
   [[ -z "$(get EXPERT_PARTIAL_BF16_MAX_ROWS)" ]] || family_args+=(--expert-partial-bf16-max-rows "$(get EXPERT_PARTIAL_BF16_MAX_ROWS)")
 fi
 if [[ $family == inkling2 ]]; then
+  inkling_kv="$(get KV_CACHE bf16)"
+  case "$inkling_kv" in bf16|fp8) ;; *) release_die "KV_CACHE must be bf16 or fp8" ;; esac
+  family_args+=(--kv-cache "$inkling_kv")
   family_args+=(--rtx-expert-layers "$(get RTX_EXPERT_LAYERS auto)")
 fi
 if [[ $family == minimax_m3 ]]; then
@@ -2431,6 +2434,7 @@ audio_encoder_hash=""
   fi
   [[ -z "$(get SPARK_PREFILL_REPLY_FORMAT)" ]] || plan_draft_args+=(--spark-prefill-reply-format "$(get SPARK_PREFILL_REPLY_FORMAT)")
   [[ -z "$(get SPARK_DECODE_REPLY_FORMAT)" ]] || plan_draft_args+=(--spark-decode-reply-format "$(get SPARK_DECODE_REPLY_FORMAT)")
+  if [[ "$family" == inkling2 ]]; then plan_draft_args+=(--kv-cache "$inkling_kv"); fi
   if [[ "$family" == minimax_m3 || "$family" == inkling2 ]]; then
     plan_draft_args+=(--prefix-cache-entries "$effective_prefix_entries")
     [[ -z "$(get PREFIX_CACHE_MARK_MIB)" ]] || plan_draft_args+=(--prefix-cache-mark-mib "$(get PREFIX_CACHE_MARK_MIB)")

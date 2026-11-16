@@ -488,7 +488,7 @@ fn shared_recipe_charges_every_owner_once_on_one_and_two_rtx() {
                     workspace: vec![("scratch".into(), (64 << 20) - 1024*4608*2), ("output".into(), 1024*4608*2)] }
             }).collect()
         }).collect() };
-        let inputs = InklingInputs { cfg: cfg.clone(), gpus, spark_ranks: ranks, context: Context::automatic(1 << 20),
+        let inputs = InklingInputs { cfg: cfg.clone(), kv_format: Default::default(), gpus, spark_ranks: ranks, context: Context::automatic(1 << 20),
             maximum_pool_tokens: 4 << 20, prefill, sequences: 16, prefix_entries: 8, prefix_mark_budget: 2 << 30, targets: targets.clone(), placement, modes: modes.clone(),
             routed: routed.clone(), experts,
             local,

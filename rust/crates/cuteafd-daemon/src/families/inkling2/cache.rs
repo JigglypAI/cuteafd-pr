@@ -59,6 +59,11 @@ impl<'a> CacheBank<'a> {
         let span = self.layout.field(sequence, layer, name)?;
         view(self.active.buffer, span.start, span.len())
     }
+    pub fn field_bank(&self, layer: usize, name: &str) -> Result<Buffer> {
+        let span = self.layout.field(0, layer, name)?;
+        view(self.active.buffer, span.start,
+            (self.layout.sequences-1)*self.layout.sequence_bytes + span.len())
+    }
     pub fn global(&self, layer: usize) -> Result<Buffer> {
         self.pages.get(&layer).map(|owner| owner.buffer).context("Inkling layer has no global KV pages")
     }
@@ -151,7 +156,7 @@ impl<'a> InklingPrefix<'a> {
 }
 impl cuteafd_engine::prefix::PrefixFamily for InklingPrefix<'_> {
     type Placement = Placement;
-    fn record_format(&self) -> &'static str { "inkling2_bf16_kv_f32_conv_whole_v1" }
+    fn record_format(&self) -> &'static str { self.0.layout.kv_format.record_format() }
     fn layout(&self) -> cuteafd_engine::prefix::FamilyLayout {
         use cuteafd_engine::prefix::{FamilyLayout, MarkStore, ReuseRule};
         FamilyLayout { page_rows: 64, pages: self.0.layout.pool_pages,
