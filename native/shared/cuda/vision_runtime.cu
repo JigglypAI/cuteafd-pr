@@ -196,6 +196,7 @@ int mha_attention(Owner* o,int n) {
 #include "vision_muse.cuh"
 #include "vision_perception.cuh"
 #include "vision_tower.cuh"
+#include "vision_tower_encode.cuh"
 #ifdef CUTEAFD_HAVE_VISION_ATTENTION_AOT
 #include "vision_mistral.cuh"
 #endif
