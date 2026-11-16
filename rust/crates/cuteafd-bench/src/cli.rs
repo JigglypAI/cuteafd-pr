@@ -136,6 +136,16 @@ fn check_context_suffix(report: &mut Report, requested: u64) {
 /// An older server may ignore unknown fields: require evidence of the configured run.
 fn check_panel_config(report: &mut Report, configs: &crate::panel_config::PanelConfigs) {
     for (panel, config) in configs {
+        if panel == "spec_lossless_set" {
+            let warm = crate::panels::lossless::Options::parse(config).map(|o| o.warm).unwrap_or(false);
+            let supported = !warm || report.panels.iter().find(|p| p.id == *panel).is_some_and(|p|
+                !p.passes.is_empty() && p.passes.iter().all(|pass| pass["warm"] == true));
+            if !supported {
+                report.status = RunStatus::Failed;
+                report.error = Some("server did not record requested warm spec_lossless_set".into());
+            }
+            continue;
+        }
         let options = match panel.as_str() {
             "decode_content" => crate::panels::speed::DecodeOptions::parse(config).ok(),
             _ => None,
@@ -358,6 +368,21 @@ pub fn write_bytes_if_changed(path: &Path, bytes: &[u8]) -> Result<bool> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn warm_lossless_requires_server_evidence_not_ignored_configuration() {
+        let configs = std::collections::BTreeMap::from([("spec_lossless_set".into(), serde_json::json!({"warm":true}))]);
+        let mut report = crate::sample::report(false);
+        report.panels.retain(|p| p.id != "spec_lossless_set");
+        report.panels.push(crate::report::PanelResult { id:"spec_lossless_set".into(),
+            passes:vec![serde_json::json!({"gate":"pass"})], ..Default::default() });
+        super::check_panel_config(&mut report, &configs);
+        assert_eq!(report.status, crate::report::RunStatus::Failed);
+        report.status = crate::report::RunStatus::Done;
+        report.panels.last_mut().unwrap().passes[0]["warm"] = serde_json::json!(true);
+        super::check_panel_config(&mut report, &configs);
+        assert_eq!(report.status, crate::report::RunStatus::Done);
+    }
+
     #[test]
     fn older_server_cannot_silently_ignore_sampled_panel_config() {
         let configs = std::collections::BTreeMap::from([("decode_content".into(),
