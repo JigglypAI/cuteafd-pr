@@ -1874,6 +1874,73 @@ mod tests {
     use super::*;
     use crate::shared::memory::TEST;
     #[test]
+    fn block_tp2_native_rank_arenas_match_physical_owner_receipts()->Result<()> {
+        use crate::shared::memory::{device::{Device,Stream},weight_arena::DeviceWeightArena};
+        use cuteafd_loader::{formats::block_dspark::{BlockDsparkConfig,BlockDsparkRuntimeLayout},
+            placement::planner::{CoordinatorDevices,Location}};
+        let fixture=cuteafd_ffi::native_library_lifetime_fixture::Fixture::build_for_tests()?;
+        let library=fixture.load()?;
+        for rank in 0..2 { fixture.configure_memory(&library,rank,1<<30)?; }
+        fixture.immediate_copies(&library)?; fixture.quiet_events(&library,true)?;
+        let root=tempfile::tempdir_in(fixture.directory())?;
+        let config=serde_json::json!({"architectures":["DSparkDraftModel"],"speculators_model_type":"dspark",
+            "aux_hidden_state_layer_ids":[1],"block_size":2,"confidence_head_with_markov":true,
+            "draft_vocab_size":16,"enable_confidence_head":true,"markov_head_type":"vanilla","markov_rank":512,
+            "mask_token_id":0,"sample_from_anchor":true,"sliding_window_non_causal":false,
+            "transformer_layer_config":{"attention_bias":false,"head_dim":64,"hidden_act":"silu",
+                "hidden_size":256,"intermediate_size":256,"layer_types":["sliding_attention"],
+                "max_position_embeddings":8192,"model_type":"qwen3","num_attention_heads":4,"num_hidden_layers":1,
+                "num_key_value_heads":2,"rms_norm_eps":1e-5,"rope_parameters":{"rope_theta":10000.,"rope_type":"default"},
+                "sliding_window":8,"vocab_size":16}});
+        std::fs::write(root.path().join("config.json"),serde_json::to_vec(&config)?)?;
+        let cfg=BlockDsparkConfig::read(root.path())?;
+        let tensors=RefCell::new(Vec::new());
+        cuteafd_loader::formats::block_dspark::block_dspark_weight_recipe(&cfg,|name,shape| {
+            tensors.borrow_mut().push(cuteafd_loader::plan::testing::t(name,"BF16",shape)); Ok::<_,anyhow::Error>(())
+        },|parts,columns| { for (name,rows) in parts { tensors.borrow_mut().push(
+            cuteafd_loader::plan::testing::t(*name,"BF16",&[*rows,columns])); } Ok(()) })?;
+        cuteafd_loader::plan::testing::write_safetensors(&root.path().join("model.safetensors"),&tensors.into_inner());
+        let entries=[(256,256),(256,128),(128,256)].into_iter().map(|(k,n)|serde_json::json!({
+            "name":format!("draft_bf16_k{k}_n{n}"),"pointers":[{"name":"x"},{"name":"w"},{"name":"out"}],
+            "scalars":[{"type":"int32"}],"capacity_rows":TAP_ROWS,"scratch_bytes_at_capacity":{},
+            "geometry":{"width":k,"outputs":n,"output_dtype":"torch.bfloat16","reduction":"ordered_k16",
+                "tiles_by_rows":[[16,1,4,16,64,6]]}})).collect::<Vec<_>>();
+        fixture.register_programs(&library,&entries)?;
+        let manifest=root.path().join("PROGRAMS.json");
+        std::fs::write(&manifest,serde_json::to_vec(&serde_json::json!({"programs":entries}))?)?;
+        let programs=library.programs()?.with_manifest(&manifest)?;
+        let devices=[0,1].map(|id|Device { library:&library,id });
+        for lead in [0,1] { for kv in [cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16,
+            cuteafd_loader::families::qwen4::Qwen4KvCache::Fp8] {
+            let layouts=[0,1].map(|rank|BlockDsparkRuntimeLayout::for_rank(root.path(),2,2,188,
+                &format!("test/block/{rank}"),kv,rank,2,lead)).into_iter().collect::<Result<Vec<_>>>()?;
+            let arenas=layouts.iter().enumerate().map(|(rank,l)|DeviceWeightArena::new(devices[rank],l.weights.clone(),
+                crate::shared::memory::TEST_ARENA)).collect::<Result<Vec<_>>>()?;
+            let stream=Stream::new(devices[lead])?;
+            let draft=devices[lead].own(||DsparkDrafter::load_tp2_with(&library,&programs,
+                super::super::dflash::TargetProjection::Native,root.path(),2,2,kv,[0,1],stream.raw,lead,
+                |physical,name,bytes|arenas[physical as usize].view(name,bytes)))?;
+            let split=draft.head_split.as_ref().context("missing paired block owner")?;
+            assert!(draft.head.is_some() && split.peer.head.is_none());
+            assert!(draft.workspace.borrow().as_ref().unwrap().output.is_some());
+            assert!(split.peer.workspace.borrow().as_ref().unwrap().output.is_none());
+            assert_eq!((draft.cfg.heads,draft.cfg.kv_heads,draft.cfg.intermediate),(2,1,128));
+            let receipts=draft.runtime_receipts(CoordinatorDevices::new(&[0,1])?,"draft")?;
+            for rank in 0..2 {
+                let roots=receipts.iter().filter(|r|r.allocation.location==Location::coordinator(rank as u8)
+                    && r.allocation.view.is_none() && r.allocation.group=="weight arena").collect::<Vec<_>>();
+                assert_eq!(roots.len(),1,"rank {rank} has duplicate/missing arena");
+                assert_eq!(roots[0].allocation.bytes,layouts[rank].weights.bytes() as u64);
+                let reduction=receipts.iter().filter(|r|r.allocation.location==Location::coordinator(rank as u8)
+                    && r.allocation.view.is_none() && r.allocation.id.ends_with("tp2.reduced")).collect::<Vec<_>>();
+                assert_eq!(reduction.len(),1); assert_eq!(reduction[0].allocation.bytes,layouts[rank].reduction_bytes as u64);
+            }
+            draft.drain()?;
+        } }
+        Ok(())
+    }
+
+    #[test]
     fn admitted_rank_local_windows_restore_all_bytes_without_cross_device_copies()->Result<()> {
         use device::{Allocation,Device,Stream};
         let fixture=cuteafd_ffi::native_library_lifetime_fixture::Fixture::build_for_tests()?;
