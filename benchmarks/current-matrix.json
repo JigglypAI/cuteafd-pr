@@ -94,7 +94,7 @@
       },
       "2rtx": {
         "status": "pending",
-        "reason": "original MC release smoke pending (#1777)"
+        "reason": "K3.1 smoke quick quality regressed (KL 0.986 vs accepted 0.076); investigating #1777"
       }
     },
     {

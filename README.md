@@ -138,7 +138,7 @@ concurrency point is that limit.
 <td width="19%" valign="top"><a href="docs/models/kimi_k3.md"><b>Kimi K3</b></a><br><sub>wrldsuksgo2mars/Kimi-K3.1-Pro-EXL3-K2-MC</sub><br><sub></sub></td>
 <td width="27%" valign="top">n/a<br><sub>doesn&#39;t fit</sub></td>
 <td width="27%" valign="top">n/a<br><sub>original BF16 core doesn&#39;t fit: RTX load needs 121.96 GB vs 101.87 GB available; K6 Spark 0 load needs 121.86 GB vs 115.96 GB available</sub></td>
-<td width="27%" valign="top">pending<br><sub>original MC release smoke pending (#1777)</sub></td>
+<td width="27%" valign="top">pending<br><sub>K3.1 smoke quick quality regressed (KL 0.986 vs accepted 0.076); investigating #1777</sub></td>
 </tr>
 <tr>
 <td width="19%" valign="top"><a href="docs/models/glm5.md"><b>GLM 5.3</b></a><br><sub>wrldsuksgo2mars/GLM-5.3-EXL3-K4-MC</sub><br><sub>exl3-k4</sub></td>
