@@ -29,6 +29,12 @@ impl DraftLayout {
     pub fn context_split(&self) -> bool {
         matches!(self, Self::Mla(l) if l.context_split())
     }
+    pub fn with_context_split(self, enabled: bool) -> Result<Self> {
+        match self {
+            Self::Mla(l) => Ok(Self::Mla(l.with_context_split(enabled)?)),
+            Self::Block(l) => { ensure!(!enabled,"GQA block draft has no MLA Context split"); Ok(Self::Block(l)) }
+        }
+    }
     pub fn window_mark_bytes(&self) -> Result<usize> {
         match self { Self::Mla(l) => l.window_mark_bytes(), Self::Block(l) => l.window_mark_bytes() }
     }

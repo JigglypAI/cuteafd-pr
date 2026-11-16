@@ -1900,9 +1900,10 @@ pub(super) mod tests {
         i.draft = Some(draft_layout(i.state_slots, i.state_slots, 1048576));
         let admitted = admit(i)?;
         let layout = admitted.draft_layout().unwrap();
-        assert_eq!(layout.paged_cache().target_tokens as u64, admitted.placement.pool_tokens);
-        assert_eq!(layout.paged_cache().full_bytes,
-            admitted.placement.pool_tokens.div_ceil(64) * 64 * layout.paged_cache().record_bytes as u64);
+        let DraftLayout::Mla(mla) = layout else { anyhow::bail!("fixture requires MLA draft") };
+        assert_eq!(mla.paged_cache().target_tokens as u64, admitted.placement.pool_tokens);
+        assert_eq!(mla.paged_cache().full_bytes,
+            admitted.placement.pool_tokens.div_ceil(64) * 64 * mla.paged_cache().record_bytes as u64);
         let set = admitted.graph_set.as_ref().context("winning owner graphs missing")?;
         super::super::graphs::check_placement(&cfg, &admitted.placement, &set.keys)?;
         for rank in 0..2 {
