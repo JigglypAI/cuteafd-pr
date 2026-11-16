@@ -46,6 +46,46 @@ def test_modern_api_refuses_nonresumable_fallback_without_xet():
     assert not hasattr(Api, "upload_large_folder")
 
 
+def test_uniform_producer_publication_qualifies_before_remote_mutation(tmp_path, monkeypatch):
+    from kimi_k3.uniform_k2 import publish as adapter, run
+    import hub_requirements
+
+    events = []
+
+    class UploadReached(Exception):
+        pass
+
+    class Api:
+        def __init__(self):
+            events.append("api")
+
+        def create_repo(self, *args, **kwargs):
+            events.append("create")
+
+        def upload_folder(self, **kwargs):
+            assert kwargs["folder_path"] == str(tmp_path / "export")
+            events.append("upload")
+            raise UploadReached
+
+    real_check = adapter.require_qualified_hub
+
+    def check():
+        events.append("qualify")
+        real_check()
+
+    monkeypatch.setattr(adapter, "require_qualified_hub", check)
+    monkeypatch.setattr("huggingface_hub.HfApi", Api)
+    with pytest.raises(UploadReached):
+        run.publish(tmp_path / "export", tmp_path / "state", "test/model")
+    assert events == ["qualify", "api", "create", "upload"]
+
+    events.clear()
+    monkeypatch.setattr(hub_requirements.importlib.metadata, "version", lambda _: "2.2.0")
+    with pytest.raises(ValueError, match="qualified huggingface_hub 1.33.0"):
+        run.publish(tmp_path / "export", tmp_path / "state", "test/model")
+    assert events == ["qualify"]
+
+
 def test_publication_entry_point_cannot_start_quantization():
     with patch.object(sys, "argv", ["publish.py"]):
         with pytest.raises(SystemExit, match="requires --publish-only"):
