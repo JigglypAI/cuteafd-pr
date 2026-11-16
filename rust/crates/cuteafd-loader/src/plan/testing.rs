@@ -93,7 +93,11 @@ impl BudgetedPlanInput {
     pub fn plan(&self, options: &super::PlanOptions) -> Result<super::PlanReport, super::PlanError> {
         let mut options = options.clone();
         #[cfg(any(test, feature = "test-support"))]
-        { options.inventory_host_memory = Some(self.host.host_ram); }
+        {
+            options.inventory_host_memory = Some(self.host.host_ram);
+            let manifest = self.checkpoint().snapshot.join("share/PROGRAMS.json");
+            if manifest.is_file() { options.inventory_workspace_manifest = Some(manifest); }
+        }
         if let Some(layout) = &mut options.layout {
             layout.host_memory.get_or_insert(self.host.host_ram);
             let manifest = self.checkpoint().snapshot.join("share/PROGRAMS.json");

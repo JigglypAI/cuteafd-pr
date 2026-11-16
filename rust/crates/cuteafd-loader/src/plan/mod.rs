@@ -452,6 +452,8 @@ pub struct PlanOptions {
     /// Test-support fact for inventory-only plans; never a CLI/config key.
     #[cfg(any(test, feature = "test-support"))]
     pub inventory_host_memory: Option<(u64, u64)>,
+    #[cfg(any(test, feature = "test-support"))]
+    pub inventory_workspace_manifest: Option<std::path::PathBuf>,
     pub fp8_prefill: fp8_prefill::Policy,
     /// None preserves each family's qualified decode-view default.
     pub decode_lanes: Option<u8>,
@@ -487,6 +489,8 @@ impl Default for PlanOptions {
         Self {
             #[cfg(any(test, feature = "test-support"))]
             inventory_host_memory: None,
+            #[cfg(any(test, feature = "test-support"))]
+            inventory_workspace_manifest: None,
             fp8_prefill: Default::default(),
             decode_lanes: None,
             attention_prefill_precision: Default::default(),
@@ -512,6 +516,8 @@ impl PlanOptions {
         let mut layout = layout::LayoutOptions::default();
         #[cfg(any(test, feature = "test-support"))]
         if let Some(memory) = self.inventory_host_memory { layout.host_memory = Some(memory); }
+        #[cfg(any(test, feature = "test-support"))]
+        { layout.workspace_manifest = self.inventory_workspace_manifest.clone(); }
         layout
     }
 

@@ -1042,7 +1042,8 @@ fn wave_plan_options(path: &Path, ranks: usize) -> PlanOptions {
         rtx_bytes: vec![crate::placement::inventory::PRO_TOTAL_BYTES], context_tokens: 32768, pool_tokens: Some(32768),
         prefix_slots: Some(0), host_cache_bytes: Some(0),
         host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram),
-        workspace_manifest: Some(path.join("absent.json")),
+        workspace_manifest: Some(if path.join("share/PROGRAMS.json").is_file() {
+            path.join("share/PROGRAMS.json") } else { path.join("absent.json") }),
         glm5_drafter_disabled: true, glmf_drafter_disabled: true,
         ..Default::default()
     }), attention_placement: Some(AttentionPlacement::Heads), ..sparks(ranks) }
