@@ -208,8 +208,7 @@ fn k31_context_multirow_verify_matches_sequential() -> Result<()> {
     let snapshot = PathBuf::from(std::env::var("CUTEAFD_GOLDEN_SNAPSHOT")?);
     let manifest = PathBuf::from(std::env::var("CUTEAFD_PROGRAM_MANIFEST")?);
     let native = PathBuf::from(std::env::var("CUTEAFD_NATIVE_LIB")?);
-    // SAFETY: the library outlives every program, engine and device owner below.
-    let library = Arc::new(unsafe { NativeLibrary::load(&native)? });
+    let library = Arc::new(cuteafd_ffi::test_support::load_sealed_library(&native)?);
     let programs = library.programs()?.with_manifest(&manifest)?;
     let tokenizer = cuteafd_loader::LoadedTokenizer::from_snapshot(&snapshot)?;
     let code = include_str!("engine.rs");
