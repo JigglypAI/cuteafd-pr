@@ -2508,15 +2508,16 @@ mod tests {
     #[test]
     fn hard_cap_unknown_empty_and_mismatched_signatures_never_capture() {
         for signature in [None, Some(vec![]), Some(vec![42])] {
-            let (mut cache, _) = aged_update_fixture(2, false);
+            let (mut cache, donor) = aged_update_fixture(2, false);
+            cache.captured_topology(donor, 10, 1, false);
             // Remember a ghost while soft-limited, as an earlier failed donor
             // search would do, then reach the measured hard stop.
             cache.soft.measured_bytes = Some(10);
             cache.soft.measured_nodes = Some(10);
-            let _ = cache.miss(key(2), site(Preference::Capture), None, false);
-            if let Some(id) = cache.identities.get(&key(2)) {
-                cache.records.get_mut(id).unwrap().signature = signature;
-            }
+            assert!(matches!(cache.miss(key(2), site(Preference::Capture), None, false), Miss::Eager));
+            let id = cache.identities[&key(2)];
+            assert_eq!(cache.records[&id].list, Some(List::RecentGhost));
+            cache.records.get_mut(&id).unwrap().signature = signature;
             cache.charged = cache.reserve;
             for _ in 0..10 {
                 assert!(cache.update_ticket(key(2), site(Preference::Capture), None, false).is_none());
@@ -2528,7 +2529,8 @@ mod tests {
 
     #[test]
     fn failed_donor_search_remembers_signature_and_duplicate_ticket_is_eager() {
-        let (mut cache, _) = aged_update_fixture(2, false);
+        let (mut cache, donor) = aged_update_fixture(2, false);
+        cache.captured_topology(donor, 10, 1, false);
         let id = cache.update_ticket(key(2), site(Preference::Capture), None, false).unwrap();
         assert!(cache.update_ticket(key(2), site(Preference::Capture), None, false).is_none());
         assert!(matches!(cache.miss(key(2), site(Preference::Capture), None, false), Miss::Eager));
