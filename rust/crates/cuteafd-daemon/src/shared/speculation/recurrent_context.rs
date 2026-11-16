@@ -1,0 +1,71 @@
+//! Context filling is shared by prefill, kept verification rows and replay.
+//! Separate context projections never read the drafter's self K/V weights.
+use super::recurrent_forward::Rank;
+use anyhow::{ensure,Result};
+use cuteafd_ffi::CuteafdDeviceBuffer as Buffer;
+
+fn bytes<T:Copy>(items:&[T])->&[u8] {
+    // SAFETY: callers supply plain numeric metadata, whose initialized byte
+    // representation is stable for the duration of the ordered staging copy.
+    unsafe{std::slice::from_raw_parts(items.as_ptr().cast(),std::mem::size_of_val(items))}
+}
+fn view(buffer:Buffer,offset:usize,bytes:usize)->Result<Buffer>{
+    ensure!(bytes>0 && offset.checked_add(bytes).is_some_and(|end|end<=buffer.bytes),"recurrent context view extent");
+    Ok(Buffer{ptr:buffer.ptr.wrapping_byte_add(offset),bytes,..buffer})
+}
+
+impl Rank<'_> {
+    /// destinations[layer] are physical rows in that layer's rank-local plane.
+    /// A caller holds a shared page-pool reservation until this stream drains,
+    /// then publishes only the accepted prefix. No rejected row is published.
+    pub fn store_context(&self,features:Buffer,positions:&[i64],destinations:&[Vec<i64>])->Result<()> {
+        let c=&self.config.transformer;let rank=self.layout.rank;
+        let rows=positions.len();let lib=self.stream.device.library;let stream=self.stream.raw;
+        ensure!(rows>0 && rows<=self.layout.context_rows && destinations.len()==c.layers
+            && destinations.iter().all(|rows_|rows_.len()==rows)
+            && positions.iter().all(|&p|p>=0 && (p as usize)<c.max_position),"recurrent context metadata differs");
+        ensure!(features.bytes>=rows*self.config.taps.len()*c.hidden*2,"recurrent target tap extent differs");
+        // SAFETY: metadata staging retains source bytes until the ordered event;
+        // destination is a permanent admitted plane on the retained stream.
+        unsafe{lib.copy_h2d_ordered(self.buffer("context.positions")?,bytes(positions),stream)?;}
+        let kv=rank.kv_heads*c.head_dim;
+        for index in 0..c.layers {
+            let layer=&self.weights.tensors.layers[index];
+            let alpha=self.weights.derived("derived.fuse_alpha")?.buffer;
+            let alpha=view(alpha,index*self.config.taps.len()*2,self.config.taps.len()*2)?;
+            // SAFETY: layer mixture uses raw ordered target taps; outputs are
+            // retained disjoint BF16 planes, gamma and alpha immutable weights.
+            unsafe{self.programs.mix.launch(&[features,alpha,layer.dflare_norm.buffer,self.buffer("context.mixed")?],
+                rows,c.rms_norm_eps as f32,0,stream)?;}
+            let names=["k_proj_ctx","v_proj_ctx"].map(|p|format!("layers.{index}.self_attn.{p}.weight"));
+            self.programs.parts(&names,&layer.context_kv,self.buffer("context.mixed")?,self.buffer("context.kv")?,
+                rows,c.hidden,&[kv,kv],lib,self.buffer("projection.bf16")?,stream)?;
+            // q_out is unused for the q_heads=0 context route, but pass a valid
+            // pointer as required by the uniform native pointer ABI.
+            unsafe{self.programs.context_rotary.launch(&[self.buffer("context.kv")?,layer.q_norm.buffer,
+                layer.context_k_norm.buffer,self.buffer("context.positions")?,self.buffer("rotary.frequencies")?,
+                self.buffer("step.query")?,self.buffer("context.key")?,self.buffer("context.value")?],
+                rows,c.rms_norm_eps as f32,0,stream)?;}
+            let capacity=self.layout.cache.layer_bytes[index]/self.layout.cache.record_bytes;
+            ensure!(destinations[index].iter().all(|&slot|slot>=0 && (slot as usize)<capacity),"recurrent KV store destination outside admitted plane");
+            // SAFETY: host plan checked every slot against the layer's physical
+            // capacity; typed store checks row sources and stream retains cache.
+            unsafe{lib.copy_h2d_ordered(self.buffer("context.destinations")?,bytes(&destinations[index]),stream)?;
+                self.programs.store.launch(&[self.buffer("context.key")?,self.buffer("context.value")?,
+                    self.buffer("context.destinations")?,self.buffer(&format!("cache.layer.{index}.k"))?,
+                    self.buffer(&format!("cache.layer.{index}.v"))?],rows,c.rms_norm_eps as f32,0,stream)?;}
+        }
+        Ok(())
+    }
+
+    /// Refresh one sequence's head feature from its last committed raw taps.
+    pub fn recurrent_feature(&self,last_taps:Buffer,output:Buffer)->Result<()> {
+        let c=&self.config.transformer;
+        let head=self.weights.tensors.head.as_ref().ok_or_else(||anyhow::anyhow!("recurrent feature requires lead head"))?;
+        let alpha=self.weights.derived("derived.fuse_alpha")?.buffer;
+        let row=view(alpha,c.layers*self.config.taps.len()*2,self.config.taps.len()*2)?;
+        // SAFETY: one complete raw feature row and immutable final mixture;
+        // output is a distinct persistent per-slot BF16 feature record.
+        unsafe{self.programs.mix.launch(&[last_taps,row,head.dflare_norm.buffer,output],1,c.rms_norm_eps as f32,0,self.stream.raw)}
+    }
+}

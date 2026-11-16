@@ -13,8 +13,8 @@ use std::{collections::BTreeMap, ffi::c_void, rc::Rc};
 type Shape = (usize,usize);
 
 pub(crate) struct ProgramsForRank<'a> {
-    plain: DraftProjections<'a>,
-    f32: DraftProjections<'a>,
+    pub(super) plain: DraftProjections<'a>,
+    pub(super) f32: DraftProjections<'a>,
     compressed: BTreeMap<String,Projection<'a>>,
     compressed_scratch: Option<ProjectionScratch<'a>>,
     pub mix: Primitive<'a>, pub init: Primitive<'a>, pub residual_norm: Primitive<'a>,
@@ -92,7 +92,7 @@ impl<'a> ProgramsForRank<'a> {
     }
 
     /// Concatenated parts preserve independent compressed rotations/calibrations.
-    fn parts(&self,names:&[String],weights:&[ProjectionWeight<'_>],input:Buffer,output:Buffer,
+    pub(super) fn parts(&self,names:&[String],weights:&[ProjectionWeight<'_>],input:Buffer,output:Buffer,
         rows:usize,k:usize,widths:&[usize],library:&cuteafd_ffi::NativeLibrary,
         scratch:Buffer,stream:*mut c_void)->Result<()> {
         ensure!(weights.len()==widths.len() && names.len()==widths.len(),"recurrent grouped operand inventory differs");

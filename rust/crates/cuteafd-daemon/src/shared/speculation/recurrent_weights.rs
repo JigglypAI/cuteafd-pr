@@ -112,3 +112,55 @@ impl<'a> Weights<'a> {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cuteafd_loader::{plan::{testing::{t,write_safetensors},checkpoint::{CheckpointView,CoreView}},
+        formats::block_dspark::recurrent::{source_shapes,RecurrentBlockConfig}};
+    #[test]
+    fn recurrent_rank_weights_record_into_one_backing_without_mount_reads()->Result<()> {
+        let folder=tempfile::tempdir()?;
+        let mut raw:serde_json::Value=serde_json::from_str(include_str!(
+            "../../../../cuteafd-loader/src/families/inkling2/fixtures/config.json"))?;
+        raw["eos_token_id"]=1.into();
+        raw["text_config"]["hidden_size"]=32.into();
+        raw["text_config"]["vocab_size"]=40.into();
+        raw["text_config"]["unpadded_vocab_size"]=34.into();
+        raw["mtp_config"]["hidden_size"]=32.into();
+        raw["mtp_config"]["intermediate_size"]=64.into();
+        raw["mtp_config"]["markov_rank"]=8.into();
+        std::fs::write(folder.path().join("config.json"),serde_json::to_vec(&raw)?)?;
+        let config=RecurrentBlockConfig::from_hf(&raw)?;
+        let tensors=source_shapes(&config)?.into_iter().map(|(name,shape)|t(format!("mtp.{name}"),"BF16",&shape)).collect::<Vec<_>>();
+        write_safetensors(&folder.path().join("mtp.safetensors"),&tensors);
+        let weight_map=tensors.iter().map(|(name,..)|(name.clone(),"mtp.safetensors")).collect::<BTreeMap<_,_>>();
+        std::fs::write(folder.path().join("model.safetensors.index.json"),serde_json::to_vec(
+            &serde_json::json!({"weight_map":weight_map}))?)?;
+        let view=CheckpointView::select(folder.path(),CoreView::Original)?;
+        let source=RecurrentSource::open(&view)?;
+        let fixture=cuteafd_ffi::native_library_lifetime_fixture::Fixture::build_for_tests()?;
+        let library=fixture.load()?;
+        let device=Device{library:&library,id:0};
+        for ranks in [1,2] {
+            for rank in 0..ranks {
+                let layout=source.rank(rank,ranks,ranks-1)?;
+                let (weights,records)=crate::shared::experts::rtx::dense::recording(||
+                    Weights::load(device,&source,layout.clone(),std::ptr::null_mut()))?;
+                let expected=layout.arena.views().keys().filter(|name|!name.starts_with("derived.")).count();
+                assert_eq!(records.operands.len(),expected);
+                assert!(records.steps.is_empty() && records.finishes.is_empty());
+                assert_eq!(weights.tensors.head.is_some(),rank==ranks-1);
+                let first_view=layout.arena.view(&records.operands[0].lands[0].0.name).unwrap();
+                let backing=records.operands[0].buffer.ptr as usize-first_view.offset();
+                for record in &records.operands {
+                    let name=&record.lands[0].0.name;
+                    let view=layout.arena.view(name).context("record outside weight arena")?;
+                    assert_eq!(record.buffer.bytes,view.bytes());
+                    assert_eq!(record.buffer.ptr as usize-backing,view.offset());
+                }
+            }
+        }
+        Ok(())
+    }
+}

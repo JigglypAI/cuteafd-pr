@@ -3,6 +3,8 @@
 pub(crate) mod block_dspark;
 pub(crate) mod recurrent_weights;
 pub(crate) mod recurrent_forward;
+pub(crate) mod recurrent_head;
+pub(crate) mod recurrent_context;
 pub(crate) mod dflash;
 pub(crate) mod gqa_tp2;
 pub(crate) mod target;
