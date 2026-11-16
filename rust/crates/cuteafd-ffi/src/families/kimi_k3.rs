@@ -343,6 +343,7 @@ pub struct KimiIndexTopK<'a> {
     program: Program<'a>, rows: usize, pages: usize, mode: KimiIndexMode,
     scored: bool, runtime_sms: Option<i32>, scratch: usize,
     admitted_pages: std::cell::Cell<Option<i32>>,
+    tile: Option<cuteafd_core::coordinator_programs::scored_decode::ScoredDecodeTile>,
 }
 impl<'a> KimiIndexTopK<'a> {
     pub fn load(programs: &'a Programs<'a>, rows: usize, pages: usize, mode: KimiIndexMode,
@@ -354,7 +355,9 @@ impl<'a> KimiIndexTopK<'a> {
             .map(|n| i32::try_from(n).map_err(|_| KimiMlaError::Invalid("index selector SM count"))).transpose()?;
         Ok(Self { program: programs.program(&name, if context { SCORED_TOPK } else { INDEX_TOPK })?,
             rows, pages, mode, scored: context, runtime_sms, scratch,
-            admitted_pages: std::cell::Cell::new(None) })
+            admitted_pages: std::cell::Cell::new(None),
+            tile: cuteafd_core::coordinator_programs::scored_decode::ScoredDecodeTile::from_geometry(
+                &programs.spec(&name)?.geometry).map_err(|_| KimiMlaError::Invalid("scored tile descriptor"))? })
     }
     /// Bind once before graph capture. All later launches use this deployment bound.
     pub fn bind_admitted_pages(&self, pages: usize) -> Result<()> {
@@ -366,16 +369,22 @@ impl<'a> KimiIndexTopK<'a> {
         Ok(())
     }
 
-    pub fn scratch_bytes(&self) -> usize { self.scratch }
+    pub fn scratch_bytes(&self) -> usize {
+        self.tile.zip(self.admitted_pages.get()).map_or(self.scratch, |(tile, pages)|
+            tile.bytes(pages as u64).expect("bound selector capacity validated") as usize)
+    }
 
     /// Table entries and causal frontiers are device metadata owned by the lane.
     /// Scratch is zero-initialized once by its admitted owner, before capture.
     pub fn launch(&self, b: KimiIndexSelection, stream: *mut c_void) -> Result<()> {
-        validate_topk_batch(b, self.rows, self.pages, self.mode, self.scored, self.scratch)?;
+        validate_topk_batch(b, self.rows, self.pages, self.mode, self.scored, self.scratch_bytes())?;
         if self.scored {
             let admitted = if self.mode == KimiIndexMode::Decode {
                 self.admitted_pages.get().ok_or(KimiMlaError::Invalid("scored decode capacity not bound"))?
             } else { 0 };
+            if self.mode == KimiIndexMode::Decode && b.table_width > admitted as usize {
+                return Err(KimiMlaError::Invalid("scored table exceeds admitted deployment capacity"));
+            }
             // SAFETY: writer aliases and extents checked; (2, rank) selects one
             // parity half through the compact table, (1, 0) the whole cache.
             unsafe { self.program.launch(&[b.query_fp8.ptr, b.head_weights.ptr, b.cache.ptr, b.table.ptr,
@@ -1609,6 +1618,90 @@ mod tests {
                 "page_rows": 64, "norm_eps": 1e-6, "kv_cache": "bf16", "max_context": context,
                 "num_splits": splits, "chunks_per_split": context.div_ceil(64).div_ceil(splits), "mode": mode.name()}),
         })
+    }
+
+
+    #[test]
+    #[ignore = "requires CUDA and a candidate native library with scored decode admitted_pages"]
+    fn scored_decode_capture_grows_to_exact_admitted_tile() -> anyhow::Result<()> {
+        use crate::NativeLibrary;
+        use cuteafd_core::coordinator_programs::scored_decode::{admitted_pages, ScoredDecodeTile};
+        // SAFETY: the library outlives programs, buffers, stream and graph below.
+        let library = unsafe { NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
+        library.cuda_set_device(0)?;
+        let programs = library.programs()?.with_manifest(std::path::Path::new(
+            &std::env::var("CUTEAFD_PROGRAM_MANIFEST")?))?;
+        let decode = KimiIndexTopK::load(&programs, 64, 16384, KimiIndexMode::Decode, true)?;
+        let eager = KimiIndexTopK::load(&programs, 64, 16384, KimiIndexMode::Decode, true)?;
+        let pages = admitted_pages(65 * 128, 64) as usize;
+        decode.bind_admitted_pages(pages)?;
+        eager.bind_admitted_pages(pages)?;
+        assert!(decode.bind_admitted_pages(pages + 1).is_err());
+        let tile = ScoredDecodeTile::from_geometry(&programs.spec("kimik31_scored_index_topk_decode_m64")?.geometry)?.unwrap();
+        assert_eq!(decode.scratch_bytes() as u64, tile.bytes(pages as u64)?);
+        let stream = library.cuda_stream_create()?;
+        let drain = || {
+            // SAFETY: this test exclusively owns the live stream until teardown.
+            unsafe { library.cuda_stream_synchronize(stream) }
+        };
+        let mut allocations = Vec::new();
+        let mut upload = |bytes: Vec<u8>| -> anyhow::Result<Buffer> {
+            let buffer = library.alloc_device_buffer(bytes.len().max(16), crate::memory_ledger::TEST)?;
+            library.copy_h2d(buffer, &bytes)?;
+            allocations.push(buffer);
+            Ok(buffer)
+        };
+        let query = upload(vec![0x38; 32 * 128])?;
+        let weights = upload(1f32.to_le_bytes().repeat(32))?;
+        let mut cache_bytes = vec![0x38; pages * 8448];
+        for page in 0..pages {
+            for row in 0..64 {
+                cache_bytes[page * 8448 + 8192 + row * 4..page * 8448 + 8192 + row * 4 + 4]
+                    .copy_from_slice(&1f32.to_le_bytes());
+            }
+        }
+        let cache = upload(cache_bytes)?;
+        let table = upload((0..pages as i32).flat_map(i32::to_le_bytes).collect())?;
+        let lengths = upload(0i32.to_le_bytes().to_vec())?;
+        let indices = upload(vec![0; 2048 * 4])?;
+        let scores = upload(vec![0; 2048 * 4])?;
+        let scratch = upload(vec![0; decode.scratch_bytes()])?;
+        let expected_indices = upload(vec![0; 2048 * 4])?;
+        let expected_scores = upload(vec![0; 2048 * 4])?;
+        drop(upload);
+        let batch = KimiIndexSelection { rows: 1, cache_pages: pages, table_width: pages,
+            table_stride: pages, page_stride: 2, page_offset: 0,
+            query_fp8: query, head_weights: weights, cache, table, lengths, indices, scores, scratch };
+        decode.launch(batch, stream)?;
+        drain()?;
+        // SAFETY: every captured pointer stays in allocations through the final drain.
+        unsafe { library.cuda_graph_begin_capture(stream)?; }
+        decode.launch(batch, stream)?;
+        // SAFETY: this test owns the active capture and every recorded buffer.
+        let graph = unsafe { library.cuda_graph_end_capture_for_test(stream)? };
+        for live_pages in [1, 17, pages] {
+            library.copy_h2d(lengths, &((live_pages * 64) as i32).to_le_bytes())?;
+            eager.launch(KimiIndexSelection { indices: expected_indices, scores: expected_scores,
+                table_width: live_pages, ..batch }, stream)?;
+            drain()?;
+            let read = |buffer: Buffer| -> anyhow::Result<Vec<u8>> {
+                let mut bytes = vec![0; buffer.bytes];
+                library.copy_d2h(&mut bytes, buffer)?;
+                Ok(bytes)
+            };
+            let expected = (read(expected_indices)?, read(expected_scores)?);
+            // SAFETY: graph, stream and all captured buffers remain live and disjoint.
+            unsafe { library.cuda_graph_launch(graph, stream)?; }
+            drain()?;
+            assert_eq!((read(indices)?, read(scores)?), expected, "growth to {live_pages} pages");
+        }
+        drain()?;
+        // SAFETY: every graph launch drained before executable destruction.
+        unsafe { library.cuda_graph_exec_destroy(graph)?; }
+        // SAFETY: this test owns the stream and every submitted operation drained.
+        unsafe { library.cuda_stream_destroy(stream)?; }
+        for mut buffer in allocations { library.free_device_buffer(&mut buffer)?; }
+        Ok(())
     }
 
     #[test]

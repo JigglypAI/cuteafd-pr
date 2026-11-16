@@ -63,6 +63,7 @@ pub(super) struct ContextRank<'a> {
 /// Both GPUs' context buffers, the exchange and the per-GPU programs.
 pub(super) struct GlmContextSplit<'a> {
     admitted_pages: i32,
+    charged_extent: u64,
     ranks: [ContextRank<'a>; 2],
     /// Dropped before the head split's exchange (it borrows its abort words).
     pub exchange: ContextExchange<'a>,
@@ -123,6 +124,11 @@ impl<'a> GlmContextSplit<'a> {
                     // SAFETY: each lane's whole commit destination lives with this split.
                     unsafe { engine.library.reserve_h2d_ordered(table.buffer, engine.stream_of(rank))?; }
                 }
+                if let Some(tile) = context.selector_tile {
+                    let admitted = cuteafd_core::coordinator_programs::scored_decode::admitted_pages(extent as u64, PAGE_ROWS as u64);
+                    ensure!(topk_scratch.buffer.bytes as u64 == tile.bytes(admitted)?,
+                        "captured selector tile differs from charged allocation");
+                }
                 engine.library.cuda_zero_bytes(topk_scratch.buffer, topk_scratch.buffer.bytes)?;
                 let view = staging_pages * (record_page_bytes(cfg) as usize + INDEX_PAGE_BYTES);
                 let staging = [engine.alloc_tagged(view, Tag::staging("glm/context-staging"))?,
@@ -134,7 +140,7 @@ impl<'a> GlmContextSplit<'a> {
         };
         let (r0, s0) = rank(0, &mut partial)?;
         let (r1, s1) = rank(1, &mut partial)?;
-        Ok(Self { admitted_pages: cuteafd_core::coordinator_programs::scored_decode::admitted_pages(
+        Ok(Self { charged_extent: extent as u64, admitted_pages: cuteafd_core::coordinator_programs::scored_decode::admitted_pages(
             extent as u64, PAGE_ROWS as u64).try_into()?, ranks: [r0, r1], exchange, staging_pages, partial, sink: [s0, s1] })
     }
 
@@ -317,7 +323,7 @@ impl<'a> GlmEngine<'a> {
                 e.index_producer(rank, w, self.index, self.layer, self.rows, "m64", cache.buffer)?;
                 let admitted = e.context.as_ref().context("context split")?.admitted_pages;
                 ensure!(admitted as u64 == cuteafd_core::coordinator_programs::scored_decode::admitted_pages(
-                    e.max_context as u64, 64), "selector deployment capacity changed after admission");
+                    e.context.as_ref().context("context split")?.charged_extent, 64), "selector deployment capacity changed after admission");
                 let k = e.cfg.index_topk;
                 let candidates = Candidates { scores: own.candidates.buffer.ptr,
                     indices: view(&own.candidates, DECODE_ROWS * k * 4, self.t * k * 4)?.ptr };

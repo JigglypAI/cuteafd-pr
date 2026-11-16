@@ -1457,6 +1457,29 @@ mod tests {
 
 
 
+    #[test]
+    fn deployment_selector_tile_matches_capture_bound_and_single_owner() {
+        use cuteafd_core::coordinator_programs::scored_decode::{admitted_pages, ScoredDecodeTile};
+        let cfg = glm_cfg();
+        let geometry = serde_json::json!({"admitted_tile": {"prefix_bytes": 1051648,
+            "capacity_rows": 64, "capacity_pages": 16384, "page_rows": 64,
+            "tile_rows": 32, "tile_columns": 512, "element_bytes": 4}});
+        let tile = ScoredDecodeTile::from_geometry(&geometry).unwrap().unwrap();
+        let context = GlmContext { selector_tile: Some(tile), topk_scratch: 269487104, partial_scratch: 0 };
+        for extent in [129, 131072, 524288, 1048576] {
+            let allocations = context_workspace(&cfg, extent, 4096, 3, context);
+            let owners = allocations.iter().filter(|(name, _)| *name == "scored top-k scratch").collect::<Vec<_>>();
+            assert_eq!(owners.len(), 1);
+            let captured = admitted_pages(extent, PAGE_ROWS);
+            assert_eq!(owners[0].1, tile.bytes(captured).unwrap());
+            for live in [0, 1, captured / 2, captured] {
+                assert!(live <= captured);
+                assert_eq!(context_workspace(&cfg, extent, 4096, 3, context), allocations,
+                    "live request width must not change the deployment charge");
+            }
+        }
+    }
+
     const CONTEXT_SCRATCH: GlmContext = GlmContext { selector_tile: None, topk_scratch: 3 << 20, partial_scratch: 9 << 20 };
 
 

@@ -72,6 +72,7 @@ pub(super) struct ContextRank<'a> {
 /// Both GPUs' context buffers, the exchange and the per-GPU partial programs.
 pub(super) struct V4ContextSplit<'a> {
     admitted_pages: i32,
+    charged_extent: u64,
     ranks: [ContextRank<'a>; 2],
     /// Dropped before the head split's exchange (it borrows its abort words).
     pub exchange: ContextExchange<'a>,
@@ -135,6 +136,11 @@ impl<'a> V4ContextSplit<'a> {
                 let commit = (0..lanes as usize + cuteafd_loader::serving_capacity::V4_PACKED_MEMBERS)
                     .map(|_| next()).collect::<Result<Vec<_>>>()?;
                 ensure!(allocations.next().is_none(), "V4 context workspace list has unbound entries");
+                if let Some(tile) = context.selector_tile {
+                    let admitted = cuteafd_core::coordinator_programs::scored_decode::admitted_pages(extent as u64, 256);
+                    ensure!(topk_scratch.buffer.bytes as u64 == tile.bytes(admitted)?,
+                        "captured selector tile differs from charged allocation");
+                }
                 for zeroed in [&topk_scratch, &empty_window] {
                     engine.library.cuda_zero_bytes(zeroed.buffer, zeroed.buffer.bytes)?;
                 }
@@ -157,7 +163,7 @@ impl<'a> V4ContextSplit<'a> {
         let ranks = [build(0)?, build(1)?];
         let mut c4 = 0;
         let ordinal = cfg.compress_ratios.iter().map(|&ratio| (ratio == 4).then(|| { c4 += 1; c4 - 1 })).collect();
-        Ok(Self { admitted_pages: cuteafd_core::coordinator_programs::scored_decode::admitted_pages(
+        Ok(Self { charged_extent: extent as u64, admitted_pages: cuteafd_core::coordinator_programs::scored_decode::admitted_pages(
             extent as u64, 256 as u64).try_into()?, ranks, exchange, staging_units, partial, ordinal,
             commit_limit: context_commit_units(prefill) as usize })
     }
@@ -340,7 +346,7 @@ impl<'a> Engine<'a> {
                 let own = &e.context()?.ranks[rank];
                 let admitted = e.context()?.admitted_pages;
                 ensure!(admitted as u64 == cuteafd_core::coordinator_programs::scored_decode::admitted_pages(
-                    e.max_context as u64, 256), "selector deployment capacity changed after admission");
+                    e.context()?.charged_extent, 256), "selector deployment capacity changed after admission");
                 let k = e.cfg.index_topk;
                 let indices = view(&own.candidates, e.decode_rows * k * 4, self.t * k * 4)?.ptr;
                 let (_, index) = e.c4_pools(rank, self.layer)?;
