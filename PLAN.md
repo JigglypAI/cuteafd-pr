@@ -23,8 +23,10 @@ uv venv --python 3.12 "$TASK/venv"
 uv pip sync --python "$TASK/venv/bin/python" scripts/dev/gate-requirements.txt
 uv pip install --python "$TASK/venv/bin/python" 'torch==2.15.0+cpu' \
   --index-url https://download.pytorch.org/whl/cpu
+mkdir -p "$TASK/transformers"
+git -C third_party/transformers archive HEAD | tar -x -C "$TASK/transformers"
+uv pip install --python "$TASK/venv/bin/python" "$TASK/transformers"
 uv pip install --python "$TASK/venv/bin/python" 'huggingface-hub==1.33.0' \
-  -e ./third_party/transformers \
   'accelerate==1.15.0' 'pypcre==0.6.6' 'psutil==7.2.2' 'xxhash==4.1.0' \
   'tokenicer==0.0.14' 'logbar==0.4.16' 'defuser==0.0.31' 'datasets==5.2.0' \
   'device-smi==0.5.7' 'threadpoolctl==3.8.0' 'requests==2.34.2' 'protobuf==7.36.2'
@@ -37,7 +39,12 @@ CUDA_VISIBLE_DEVICES='' OMP_NUM_THREADS=2 HF_HOME=/mnt/sparknest/hf-home \
 ```
 
 Launch long setup/test commands as background systemd user units with logs and
-exit receipts. GPTQModel is imported directly from the pinned source (no CUDA
+exit receipts. Build the non-editable Transformers wheel from the task-owned
+archive, never from the locked submodule: both editable installs and ordinary
+wheel builds can leave `src/transformers.egg-info` in their source tree and
+invalidate its content lock. The test command still imports the pinned submodule
+through `PYTHONPATH`.
+GPTQModel is imported directly from the pinned source (no CUDA
 extension build or second engine checkout). Do not use this extra-dependency
 venv as the default CPU gate's exact-package venv. Checkpoint witnesses resolve
 `HF_HUB_CACHE`, then `HF_HOME/hub`, then the SDK cache default at the pinned

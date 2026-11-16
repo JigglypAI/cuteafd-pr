@@ -36,6 +36,47 @@ PARENTS = {
 }
 
 
+def tensor_storage_entry(geometry, stored_tensors, *, mcg_multiplier=MCG,
+                         mul1_multiplier=None, **extra):
+    """Build the common EXL3 record without discarding family-specific fields."""
+    entry = dict(quant_format='exl3', bits_per_weight=geometry['bits'],
+                 mcg_multiplier=mcg_multiplier,
+                 **{key: geometry[key] for key in
+                    ('in_features', 'out_features', 'stored_out_features')},
+                 stored_tensors=stored_tensors, **extra)
+    if mul1_multiplier is not None:
+        entry['mul1_multiplier'] = mul1_multiplier
+    return entry
+
+
+def quantize_config_for_view(quantization_config, **metadata):
+    """Mirror the view's inline declaration into its per-module metadata file."""
+    return dict(metadata, **deepcopy(quantization_config))
+
+
+def gptqmodel_mc_view(config, metadata, *, bits, core_bits=None, module_include):
+    """Package MC storage using GPTQModel's declaration and provenance schema."""
+    config, metadata = deepcopy(config), deepcopy(metadata)
+    previous = config['quantization_config']
+    declaration = dict(quant_method='exl3', format='exl3', checkpoint_format='exl3',
+                       bits=bits, per_module_metadata=previous['per_module_metadata'])
+    if core_bits is not None:
+        declaration['core_bits'] = core_bits
+    config['quantization_config'] = declaration
+    meta = metadata.setdefault('meta', {})
+    meta['source_quantization_config'] = previous
+    for key in ('provenance', 'core_view', 'upstream_activations', 'activation_quantization'):
+        if key in metadata:
+            meta[key] = metadata.pop(key)
+    metadata.pop('format', None)
+    storage = metadata['tensor_storage']
+    metadata.update(method='exl3', codebook='mcg', out_scales='auto', group_size=-1,
+                    desc_act=False, module_include=list(module_include),
+                    lm_head=any(name == 'lm_head' or name.endswith('.lm_head') or name == 'output'
+                                for name in storage))
+    return quantize_config_for_view(declaration, **metadata), config
+
+
 def family_recipe(family):
     """Return the completed numerical selection used by compact encodes."""
     if family == 'glmf':
@@ -249,9 +290,9 @@ def view_metadata(parent_quant, parent_config, selection, specs, *, bits, quanti
             del storage[module]
         else:
             entry = storage[module]
-            entry.update(bits_per_weight=bits, mcg_multiplier=MCG,
-                         stored_tensors={name: dict(shape=shape, torch_dtype=DTYPES[dtype])
-                            for name, (dtype, shape) in packed_specs(module, dict(geometry, bits=bits)).items()})
+            entry.update(tensor_storage_entry(dict(geometry, bits=bits),
+                         {name: dict(shape=shape, torch_dtype=DTYPES[dtype])
+                          for name, (dtype, shape) in packed_specs(module, dict(geometry, bits=bits)).items()}))
     if bits is None:
         quant['module_include'] = exact_patterns(quant['module_include'],
                                                 parent_quant['tensor_storage'], set(selection))
@@ -289,6 +330,7 @@ def view_metadata(parent_quant, parent_config, selection, specs, *, bits, quanti
                 rewrite_inline(child)
 
     rewrite_inline(config)
+    quant = quantize_config_for_view(config.get('quantization_config', {}), **quant)
     return quant, config
 
 

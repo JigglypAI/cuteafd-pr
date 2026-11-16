@@ -11,6 +11,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import sys
@@ -20,6 +21,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
+from mc_package import gptqmodel_mc_view, quantize_config_for_view, tensor_storage_entry
 from kimi_k3.uniform_k2.storage import atomic_json, canonical, file_identity
 from kimi_k3.core_k6.storage import StageStore
 from glm5.core_k6.storage import ProjectionStore
@@ -496,16 +498,19 @@ class Runner:
             config['quantization_config'] = dict(quant_method='exl3', format='mcg',
                 per_module_metadata=metadata_pointer, activation_quantization=recipe.ACTIVATION_QUANTIZATION)
             modules = self.experts | ({} if bits is None else self.core[bits])
-            storage = {name: dict(bits_per_weight=g['bits'], stored_tensors={n: dict(shape=shape,
-                torch_dtype=dtype_names[dtype]) for n, (dtype, shape) in recipe.packed_specs(name, g).items()})
-                for name, g in modules.items()}
+            storage = {name: tensor_storage_entry(g, {n: dict(shape=shape,
+                torch_dtype=dtype_names[dtype]) for n, (dtype, shape) in recipe.packed_specs(name, g).items()},
+                mcg_multiplier=recipe.MCG_MULTIPLIER) for name, g in modules.items()}
             configs[view] = config
-            quantizes[view] = dict(quant_method='exl3', tensor_storage=storage,
-                per_module_metadata=metadata_pointer,
+            quantizes[view] = quantize_config_for_view(config['quantization_config'],
+                tensor_storage=storage,
                 retained_native_tensors=native | ({} if bits else {
                     n+'.weight': dict(dtype='BF16', shape=[g['out_features'], g['in_features']])
                     for n,g in selected.items()}), provenance=self.identity,
                 core_view=view, upstream_activations='k8-compact')
+            quantizes[view], configs[view] = gptqmodel_mc_view(config, quantizes[view],
+                bits=4, core_bits=bits, module_include=['^' + re.escape(n) + '$'
+                    for n in sorted(modules)])
         assets = {p.name:p for p in self.header.snapshot.iterdir() if p.is_file()
             and p.name in ('tokenizer.json', 'tokenizer_config.json', 'chat_template.jinja',
                 'generation_config.json', 'special_tokens_map.json', 'preprocessor_config.json',
