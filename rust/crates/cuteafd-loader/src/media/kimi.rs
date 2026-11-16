@@ -204,6 +204,88 @@ mod tests {
             .is_err());
     }
     #[test]
+    fn official_processor_rgb8_hwc_oracle_matches_alpha_resize_and_padding() {
+        let p = KimiProcessor::from_config(&config()).unwrap();
+        for (h, w, alpha, expected) in [
+            (
+                13,
+                17,
+                false,
+                "f3dcf2fff5f6813dbfbc645814faaf8b9cdfb709e718346ee19b1b98d28df36e",
+            ),
+            (
+                432,
+                640,
+                false,
+                "10e80e03d9abe308eb9638068d5344dd100e8c786179e8711fa5915ab7012a6b",
+            ),
+            (
+                13,
+                17,
+                true,
+                "97465b5504df6b0a661b9f2ce9394dcc281190b5abcb90e99930d4d9dd6e1741",
+            ),
+            (
+                129,
+                7201,
+                true,
+                "88ea6153c07f3c0640c1fc18c4546911d356e911236b7ad94bb621fd309e294f",
+            ),
+            (
+                28,
+                28,
+                false,
+                "33bb432d0a5684cce3434961207fa233e0000443017af202ce066ddb071b60db",
+            ),
+        ] {
+            let channels = if alpha { 4 } else { 3 };
+            let data = (0..h * w * channels)
+                .map(|index| ((index * 37 + 11) % 256) as u8)
+                .collect();
+            let decoded = if alpha {
+                DecodedPixels::Rgba {
+                    width: w,
+                    height: h,
+                    data,
+                }
+            } else {
+                DecodedPixels::Rgb(RgbImage {
+                    width: w,
+                    height: h,
+                    data,
+                })
+            };
+            let prepared = p.prepare(decoded, EncoderId([1; 32]), 16384).unwrap();
+            assert_eq!(
+                format!("{:x}", Sha256::digest(&prepared.rgb8)),
+                expected,
+                "HWC source{h}x{w} alpha{alpha}"
+            );
+        }
+    }
+    #[test]
+    fn official_padding_boundaries_are_preserved_before_admission() {
+        let p = KimiProcessor::from_config(&config()).unwrap();
+        assert_eq!(
+            p.geometry(3584, 3584).unwrap(),
+            ([3584, 3584], [3584, 3584])
+        );
+        assert_eq!(
+            p.geometry(3585, 3585).unwrap(),
+            ([3585, 3585], [3612, 3612])
+        );
+        assert_eq!(
+            p.geometry(3598, 3598).unwrap(),
+            ([3584, 3584], [3584, 3584])
+        );
+        assert_eq!(
+            p.geometry(7069, 1833).unwrap(),
+            ([7069, 1833], [7084, 1848])
+        );
+        // Shared ceilings remain nominal until the full boundary encoder runs.
+        assert_eq!(7084u64 / 14 * (1848 / 14), 66792);
+    }
+    #[test]
     fn config_numerics_and_identity_are_explicit() {
         let a = KimiProcessor::from_config(&config()).unwrap();
         let mut cfg = config();
