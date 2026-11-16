@@ -34,6 +34,11 @@ impl Options {
     pub(crate) fn layout(&self,slots:usize,context:usize,sms:usize,head_rank:usize)->Result<DraftLayout> {
         if crate::shared::speculation::block_dspark::is_dspark(&self.snapshot)? {
             ensure!(!self.fp8 && !self.tp2_dflash,"block dSpark uses native BF16 on head GPU");
+            if head_rank==1 {
+                let rank=|rank|cuteafd_loader::formats::block_dspark::BlockDsparkRuntimeLayout::for_rank(
+                    &self.snapshot,slots,slots.min(8),sms,&format!("kimi/draft/{rank}"),self.draft_kv_cache,rank,2,head_rank);
+                return Ok(DraftLayout::BlockTp2 { ranks:Box::new([rank(0)?,rank(1)?]),lead:head_rank });
+            }
             return Ok(DraftLayout::Block(cuteafd_loader::formats::block_dspark::BlockDsparkRuntimeLayout::with_kv(
                 &self.snapshot,slots,slots.min(8),sms,&format!("kimi/draft/{head_rank}"),self.draft_kv_cache)?));
         }
@@ -199,7 +204,8 @@ impl<'a> NativeDraft<'a> {
             }
             DraftLayout::Block(_) => admission.allocate_block_draft(bridge.stream().device,programs,
                 &options.snapshot,bridge.stream().raw)?,
-            DraftLayout::BlockTp2 { .. }=>anyhow::bail!("shared block TP2 runtime binding not constructed yet"),
+            DraftLayout::BlockTp2 { .. }=>admission.allocate_block_tp2(bridge.stream().device,programs,
+                &options.snapshot,exchange.context("paired block drafter requires target exchange")?.1)?,
         };
         let demands = cuteafd_loader::families::kimi_k3::draft::bridge_demands(
             layout, admission.lane_rows(), streams.len())?;
@@ -440,8 +446,8 @@ impl<'a> NativeDraft<'a> {
 
     pub(crate) fn max_batch_sequences(&self) -> usize { self.owners.draft.max_batch_sequences() }
     pub(crate) fn drafts(&self) -> usize { self.owners.draft.drafts() }
-    pub(crate) fn require_live(&self) -> Result<()> { self.bridge.require_live() }
-    pub(crate) fn abort(&self) -> Result<()> { self.bridge.abort() }
+    pub(crate) fn require_live(&self) -> Result<()> { self.bridge.require_live()?; self.common().require_live() }
+    pub(crate) fn abort(&self) -> Result<()> { let a=self.bridge.abort(); let b=self.common().abort(); a.and(b) }
     pub(crate) fn drain(&self) -> Result<()> { self.bridge.synchronize()?; self.common().drain_mla() }
     pub(crate) fn finish_terminal(&self, drained: bool) { self.bridge.finish_terminal(drained); }
 

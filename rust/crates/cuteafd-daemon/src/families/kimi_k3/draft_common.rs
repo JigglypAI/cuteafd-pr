@@ -102,6 +102,12 @@ impl<'a> CommonDraft<'a> {
         match self { Self::Mla(d)=>d.mla_snapshot_buffers(),Self::Block { draft:d,.. }=>
             (0..d.slots).map(|slot|d.window_planes(slot)).collect::<Result<Vec<_>>>().map(|v|v.into_iter().flatten().collect()) }
     }
+    pub fn abort(&self)->Result<()> {
+        match self { Self::Mla(_)=>Ok(()),Self::Block { draft,.. }=>draft.abort() }
+    }
+    pub fn require_live(&self)->Result<()> {
+        match self { Self::Mla(_)=>Ok(()),Self::Block { draft,.. }=>draft.require_live() }
+    }
     pub fn drain_mla(&self)->Result<()> {
         match self { Self::Mla(d)=>d.drain_mla(),Self::Block { draft:d,.. }=>d.drain() }
     }

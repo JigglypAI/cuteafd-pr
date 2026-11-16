@@ -928,6 +928,11 @@ impl<'a> DsparkDrafter<'a> {
                 receipt.allocation.id = receipt.allocation.id.replacen("..",".",1);
             }
         }
+        if let Some(split)=&self.head_split {
+            split.reduced.inventory(&mut inventory,"tp2.reduced")?;
+            split.peer.device.run(||split.peer_reduced.inventory(&mut inventory,"peer.tp2.reduced"))?;
+            inventory.receipts.extend(split.peer.device.run(||split.peer.runtime_receipts(devices,&format!("{prefix}.peer")))?);
+        }
         Ok(inventory.receipts)
     }
 
@@ -1087,7 +1092,7 @@ impl<'a> DsparkDrafter<'a> {
 
     /// Writes the context K/V of committed tapped rows (in tap-row order).
     pub fn update(&self, rows: &[ContextRow]) -> Result<()> {
-        self.on_device(|| self.update_on_device(rows))
+        self.checked(||self.on_device(|| self.update_on_device(rows)))
     }
 
     fn update_on_device(&self, rows: &[ContextRow]) -> Result<()> {
@@ -1204,6 +1209,7 @@ impl<'a> DsparkDrafter<'a> {
     }
 
     fn reset_context_on_device(&self, slot: usize, origin: usize) -> Result<()> {
+        if let Some(split)=&self.head_split { split.peer.device.run(||split.peer.reset_context_on_device(slot,origin))?; }
         ensure!(slot < self.slots && origin <= self.context_capacity, "block dSpark reset outside admission");
         if let Some(context) = &self.paged {
             // SAFETY: retire the previous request before releasing its page ownership.
@@ -1212,7 +1218,7 @@ impl<'a> DsparkDrafter<'a> {
             state.discard(slot)?;
             state.bindings[slot] = Some(state.pool.bind(slot, origin)?);
         } else if origin == 0 {
-            for plane in self.window_planes(slot)? {
+            for plane in self.window_planes(slot)?.into_iter().filter(|p|p.device_id==self.hidden_norm.buffer.device_id) {
                 // SAFETY: fresh slot admission precedes every new consumer;
                 // zero preserves deterministic inactive bytes for exact marks.
                 unsafe { self.library.cuda_zero_bytes_async(plane,plane.bytes,self.stream)?; }
@@ -1226,6 +1232,7 @@ impl<'a> DsparkDrafter<'a> {
     }
 
     fn discard_context_on_device(&self, slot: usize) -> Result<()> {
+        if let Some(split)=&self.head_split { split.peer.device.run(||split.peer.discard_context_on_device(slot))?; }
         ensure!(slot < self.slots, "block dSpark discard outside admission");
         if let Some(context) = &self.paged {
             // SAFETY: cancellation cannot recycle destinations still read by queued work.
@@ -1365,11 +1372,13 @@ impl<'a> DsparkDrafter<'a> {
         let bytes = self.context_capacity.checked_mul(self.kv_cache.plane_record_bytes(
             self.cfg.kv_heads, self.cfg.head_dim)).context("block dSpark window extent overflow")?;
         let offset = slot.checked_mul(bytes).context("block dSpark window offset overflow")?;
-        self.layers.iter().flat_map(|layer| [&layer.k_ring, &layer.v_ring]).map(|plane| {
+        let mut planes=self.layers.iter().flat_map(|layer| [&layer.k_ring, &layer.v_ring]).map(|plane| {
             ensure!(offset.checked_add(bytes).is_some_and(|end| end <= plane.buffer.bytes),
                 "block dSpark window plane outside retained backing");
             Ok(CuteafdDeviceBuffer { ptr: at(plane, offset), bytes, ..plane.buffer })
-        }).collect()
+        }).collect::<Result<Vec<_>>>()?;
+        if let Some(split)=&self.head_split { planes.extend(split.peer.device.run(||split.peer.window_planes(slot))?); }
+        Ok(planes)
     }
 
     fn copy_pages(&self, copies: &[cuteafd_engine::prefix::TailCopy]) -> Result<()> {
@@ -1399,6 +1408,19 @@ impl<'a> DsparkDrafter<'a> {
             // ordered uploader creates and records its event in this scope.
             unsafe { self.library.copy_h2d_ordered(dev.buffer, bytes, self.stream) }
         })
+    }
+
+    pub(crate) fn require_live(&self)->Result<()> {
+        self.head_split.as_ref().map_or(Ok(()),|s|s.exchange.require_live())
+    }
+    pub(crate) fn abort(&self)->Result<()> {
+        self.head_split.as_ref().map_or(Ok(()),|s|s.exchange.publish_abort())
+    }
+    pub(crate) fn checked<T>(&self,work:impl FnOnce()->Result<T>)->Result<T> {
+        self.require_live()?;
+        let result=work();
+        if result.is_err() { self.abort()?; }
+        result
     }
 
     pub(crate) fn drain(&self) -> Result<()> {
@@ -1568,7 +1590,7 @@ impl<'a> DsparkDrafter<'a> {
 
     fn draft_from(&self, sequences: &[DraftSeq], input: DraftInput<'_, '_>, head: HeadRef<'_>, serving: bool)
         -> Result<Vec<Draft>> {
-        self.on_device(|| self.draft_on_device(sequences, input, head, serving))
+        self.checked(||self.on_device(|| self.draft_on_device(sequences, input, head, serving)))
     }
 
     fn draft_on_device(&self, sequences: &[DraftSeq], input: DraftInput<'_, '_>, head: HeadRef<'_>, serving: bool)

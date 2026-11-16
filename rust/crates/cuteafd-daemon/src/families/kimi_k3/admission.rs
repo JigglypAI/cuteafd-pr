@@ -279,6 +279,29 @@ impl<'a> Admission<'a> {
         }))
     }
 
+    pub(crate) fn allocate_block_tp2(&mut self,device:Device<'a>,
+        programs:&'a cuteafd_ffi::programs::Programs<'a>,snapshot:&std::path::Path,
+        exchange:Rc<crate::shared::peer_split::PeerExchange<'a>>)
+        ->Result<DeviceOwner<'a,super::draft_common::CommonDraft<'a>>> {
+        use crate::shared::{speculation::block_dspark::DsparkDrafter,memory::weight_arena::DeviceWeightArena};
+        let physical=self.devices.clone();
+        let projection=crate::shared::speculation::dflash::TargetProjection::from_bf16(
+            !self.core.projections.contains_key("language_model.lm_head"));
+        self.allocate_draft_with(device.id,|layout|device.own(|| {
+            let DraftLayout::BlockTp2 { ranks,lead }=layout else { anyhow::bail!("paired block layout absent") };
+            let arenas=ranks.iter().enumerate().map(|(rank,local)| {
+                let owner=Device { library:device.library,id:physical[rank] };
+                Ok((owner.id,DeviceWeightArena::new(owner,local.weights.clone(),ArenaTag::drafter_weights("kimi/draft"))?))
+            }).collect::<Result<std::collections::BTreeMap<_,_>>>()?;
+            let capacity=ranks[lead].capacity;
+            let draft=DsparkDrafter::load_tp2_with(device.library,programs,projection,snapshot,
+                capacity.context_slots,capacity.max_batch_sequences,ranks[lead].kv_cache,exchange,lead,
+                |physical,name,bytes|arenas.get(&physical).context("paired block arena owner absent")?.view(name,bytes))?;
+            Ok(super::draft_common::CommonDraft::Block { draft,
+                frontiers:std::cell::RefCell::new(vec![(0,0);capacity.context_slots]) })
+        }))
+    }
+
     fn check_draft(&self, device: i32) -> Result<&DraftLayout> {
         let head = self.devices.len() - 1;
         ensure!(device == self.devices[head] && !self.draft_allocated,
@@ -292,9 +315,15 @@ impl<'a> Admission<'a> {
             "Kimi drafter startup peak requires allocation before target residency");
         let layout = self.draft.as_ref().context("Kimi drafter was not admitted")?;
         ensure!(draft::home(&self.placement) == Some(head as u8), "Kimi drafter must stay on target head owner");
-        let arena = cuteafd_loader::serving_capacity::WeightArenaLayout::new(
-            format!("kimi/draft/{head}"), layout.weight_arena_requests())?;
-        reconcile_arena(head, &arena, MemoryKind::DrafterWeights, &self.receipt.facts)?;
+        if let DraftLayout::BlockTp2 { ranks,.. }=layout {
+            for (rank,local) in ranks.iter().enumerate() {
+                reconcile_arena(rank,&local.weights,MemoryKind::DrafterWeights,&self.receipt.facts)?;
+            }
+        } else {
+            let arena = cuteafd_loader::serving_capacity::WeightArenaLayout::new(
+                format!("kimi/draft/{head}"), layout.weight_arena_requests())?;
+            reconcile_arena(head, &arena, MemoryKind::DrafterWeights, &self.receipt.facts)?;
+        }
         let (demand, _) = layout.demands(head as u8)?;
         for demand in demand.owned.into_iter().filter(|owner| !matches!(owner.group.as_str(),"MLA DFlash owned weights"|"block dSpark owned weights")) {
             let rank = usize::from(demand.gpu);
