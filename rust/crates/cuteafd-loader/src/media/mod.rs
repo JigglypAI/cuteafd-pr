@@ -8,6 +8,7 @@ pub use checkerboard::{BlendRounding, Checkerboard};
 mod exif;
 mod groups;
 pub mod inkling;
+pub mod kimi;
 pub use groups::{ImageFragment,PreparedImageGroup};
 mod muse;
 pub mod minimax;
