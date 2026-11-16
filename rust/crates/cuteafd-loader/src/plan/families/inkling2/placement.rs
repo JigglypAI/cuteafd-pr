@@ -12,6 +12,21 @@ use cuteafd_core::memory_layout::{Basis, Category, DeviceKind, DeviceLayout, Ite
 
 const GIB: f64 = (1u64 << 30) as f64;
 
+fn qualified_text(snapshot: &std::path::Path, view: crate::plan::checkpoint::CoreView,
+    gpus: usize, ranks: usize, vision: crate::plan::MediaMode, audio: crate::plan::MediaMode,
+    native_mtp_layers: usize) -> bool {
+    if gpus != 1 || ranks != 4 || view != crate::plan::checkpoint::CoreView::Original
+        || vision != crate::plan::MediaMode::Off || audio != crate::plan::MediaMode::Off || native_mtp_layers != 0 {
+        return false;
+    }
+    let repository = snapshot.parent().filter(|path| path.file_name().is_some_and(|name| name == "snapshots"))
+        .and_then(std::path::Path::parent).and_then(std::path::Path::file_name).and_then(|name| name.to_str());
+    let revision = snapshot.file_name().and_then(|name| name.to_str());
+    matches!((repository, revision),
+        (Some("models--thinkingmachines--Inkling-2-Small"), Some("aac974122acd33ddb0d3e1f54433a9c5dd2249ce"))
+        | (Some("models--wrldsuksgo2mars--Inkling-2-Small-EXL3-K4-MC"), Some("6caa0ba08eb564ddc88b98df06ac73e853cc559e")))
+}
+
 fn empty(notes: Vec<String>) -> MemoryLayout {
     MemoryLayout { devices: Vec::new(), pool_tokens: 0, waste: Vec::new(), notes }
 }
@@ -110,6 +125,20 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
             return empty(notes);
         }
     };
+    if qualified_text(&input.checkpoint().snapshot,
+        input.checkpoint().view.as_ref().map_or(crate::plan::checkpoint::CoreView::Original, |view| view.mode()),
+        gpus, ranks, report.vision, report.audio, opts.native_mtp_layers) {
+        report.runtime = Some(crate::plan::RuntimeStatus::Serving);
+        for component in &mut report.components {
+            if component.status == crate::plan::Status::Planned && component.rejected == 0
+                && !matches!(component.component, crate::plan::spec::Component::Vision
+                    | crate::plan::spec::Component::Audio | crate::plan::spec::Component::Speculator) {
+                component.status = crate::plan::Status::Ready;
+            }
+        }
+        report.hints.retain(|hint| !hint.what.starts_with("Inkling 2 ")
+            || !hint.what.ends_with(" execution is not implemented in this build"));
+    }
     report.phase_ledger = Some(crate::plan::SolvedPhaseLedger::from(&admitted.solved));
     report.host_budget_bytes = inputs.host_prefix.quota_bytes;
     let placed = admitted.placement;
@@ -164,4 +193,32 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
     report.solver_placement = Some(placed);
     MemoryLayout { devices, pool_tokens: report.solver_placement.as_ref().map_or(0, |p| p.pool_tokens),
         waste: Vec::new(), notes }
+}
+
+#[cfg(test)]
+mod qualification_tests {
+    use super::*;
+    use crate::plan::{checkpoint::CoreView, MediaMode};
+    #[test]
+    fn only_measured_original_text_checkpoint_layouts_are_serving_qualified() {
+        for (repository, revision) in [
+            ("models--thinkingmachines--Inkling-2-Small", "aac974122acd33ddb0d3e1f54433a9c5dd2249ce"),
+            ("models--wrldsuksgo2mars--Inkling-2-Small-EXL3-K4-MC", "6caa0ba08eb564ddc88b98df06ac73e853cc559e"),
+        ] {
+            let path = std::path::PathBuf::from(repository).join("snapshots").join(revision);
+            assert!(qualified_text(&path, CoreView::Original, 1, 4, MediaMode::Off, MediaMode::Off, 0));
+            for (view, gpus, ranks, vision, mtp) in [
+                (CoreView::Original, 2, 4, MediaMode::Off, 0),
+                (CoreView::Original, 1, 6, MediaMode::Off, 0),
+                (CoreView::K8Compact, 1, 4, MediaMode::Off, 0),
+                (CoreView::K6Compact, 1, 4, MediaMode::Off, 0),
+                (CoreView::Original, 1, 4, MediaMode::Auto, 0),
+                (CoreView::Original, 1, 4, MediaMode::Off, 1),
+            ] {
+                assert!(!qualified_text(&path, view, gpus, ranks, vision, MediaMode::Off, mtp));
+            }
+            assert!(!qualified_text(&path.with_file_name("unmeasured-revision"), CoreView::Original,
+                1, 4, MediaMode::Off, MediaMode::Off, 0));
+        }
+    }
 }
