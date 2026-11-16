@@ -1,6 +1,7 @@
 """Every V4.1 graph visitor must match its reviewed capture-site classification."""
 import re
 from pathlib import Path
+from test_resolved_report_settings import production
 
 ROOT = Path(__file__).resolve().parents[2]
 FAMILY = ROOT / "rust/crates/cuteafd-daemon/src/families/deepseek_v41"
@@ -14,7 +15,7 @@ def test_v41_site_flags_match_checked_in_classification():
     for path in FAMILY.rglob("*.rs"):
         if path.name == "spanning.rs" or path.name.endswith("tests.rs"):
             continue
-        source = path.read_text().split("#[cfg(test)]\nmod ")[0]
+        source, _ = production(path.read_text())
         for match in re.finditer(r'\bf\([^;\n]*?,\s*"([^"]+)",\s*(.+?),\s*&mut\s+', source):
             name, flag = match.groups()
             assert name in classes, (path, name, "unclassified site")
