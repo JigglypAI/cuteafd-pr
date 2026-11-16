@@ -14,6 +14,7 @@ pub mod admission;
 /// gives complete MLA attention and caches to alternating owners, keeping KDA and FFNs split.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct GlmfAttention {
+    pub selector_tile: Option<cuteafd_core::coordinator_programs::scored_decode::ScoredDecodeTile>,
     pub mode: AttentionPlacement,
     pub first_owner: u8,
     pub topk_scratch: u64,
@@ -51,7 +52,7 @@ pub fn context_programs<'n>(names: impl IntoIterator<Item = &'n str> + Clone,
         .filter_map(&lookup).max();
     CONTEXT_PROGRAMS.iter().chain(&["glmf2_kda_commit_c", "glmf_index_producer_c_m64", "glmf_index_producer_c_m4096"])
         .all(|n| lookup(n).is_some()).then_some(())?;
-    Some(GlmfAttention { mode: AttentionPlacement::Context, first_owner: 0, topk_scratch: lookup(CONTEXT_PROGRAMS[0])?,
+    Some(GlmfAttention { selector_tile: None, mode: AttentionPlacement::Context, first_owner: 0, topk_scratch: lookup(CONTEXT_PROGRAMS[0])?,
         partial_scratch: partial(0)?.max(partial(32)?) })
 }
 
@@ -59,8 +60,11 @@ pub fn context_programs<'n>(names: impl IntoIterator<Item = &'n str> + Clone,
 pub fn manifest_context(manifest: &serde_json::Value) -> Option<GlmfAttention> {
     let programs = manifest["programs"].as_array()?;
     let names = programs.iter().filter_map(|p| p["name"].as_str());
-    context_programs(names, |name| programs.iter().find(|p| p["name"].as_str() == Some(name))
-        .map(|p| p["scratch_bytes_at_capacity"]["scratch"].as_u64().unwrap_or(0)))
+    let mut context = context_programs(names, |name| programs.iter().find(|p| p["name"].as_str() == Some(name))
+        .map(|p| p["scratch_bytes_at_capacity"]["scratch"].as_u64().unwrap_or(0)))?;
+    context.selector_tile = cuteafd_core::coordinator_programs::scored_decode::ScoredDecodeTile::from_geometry(
+        &programs.iter().find(|p| p["name"] == CONTEXT_PROGRAMS[0])?["geometry"]).ok()?;
+    Some(context)
 }
 
 /// Context admission selects the same partial program as runtime, not the largest exported variant.
@@ -144,7 +148,9 @@ pub fn context_workspace(cfg: &GlmNextConfig, extent: u64, rows: u64, lanes: u64
     let gather = (2 * units * 4 + 2 * units.div_ceil(2)) * 4;
     let mut out = vec![("candidates", decode * k * 8), ("local pools", decode * (k + 1) * 4),
         ("own-head partial", partial), ("peer-head partial", partial),
-        ("scored top-k scratch", context.topk_scratch), ("partial scratch", context.partial_scratch),
+        ("scored top-k scratch", context.selector_tile.map_or(context.topk_scratch, |tile|
+            tile.bytes(cuteafd_core::coordinator_programs::scored_decode::admitted_pages(extent, 256))
+                .expect("validated deployment selector capacity"))), ("partial scratch", context.partial_scratch),
         ("gather tables", gather)];
     out.extend((0..lanes).map(|_| ("commit blocks", 3 * 3 * context_commit_units(rows) * 8)));
     // The staging view's identity pool-page map (the prefill index expansion reads it).

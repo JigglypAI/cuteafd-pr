@@ -70,6 +70,7 @@ pub(super) struct ContextRank<'a> {
 
 /// Both GPUs' context buffers, the exchange and the per-GPU partial programs.
 pub(super) struct GlmfContextSplit<'a> {
+    admitted_pages: i32,
     ranks: [ContextRank<'a>; 2],
     /// Dropped before the head split's exchange (it borrows its abort words).
     pub exchange: ContextExchange<'a>,
@@ -132,7 +133,8 @@ impl<'a> GlmfContextSplit<'a> {
         };
         let (r0, s0, p0) = rank(0)?;
         let (r1, s1, p1) = rank(1)?;
-        Ok(Self { ranks: [r0, r1], exchange, staging_units, partial: [p0, p1], sink: [s0, s1] })
+        Ok(Self { admitted_pages: cuteafd_core::coordinator_programs::scored_decode::admitted_pages(
+            extent as u64, 256 as u64).try_into()?, ranks: [r0, r1], exchange, staging_units, partial: [p0, p1], sink: [s0, s1] })
     }
 
     /// Bytes this split allocated on each GPU beside the exchange (the solver's "context
@@ -293,7 +295,7 @@ impl<'a> GlmfEngine<'a> {
                     ("indices", candidates.indices.cast_mut()), ("scores", candidates.scores.cast_mut()),
                     ("scratch", own.topk_scratch.buffer.ptr)],
                     &[self.rows, Scalar::I32(self.tables.context_width as i32), width, Scalar::I32(2),
-                        Scalar::I32(rank as i32)])?;
+                        Scalar::I32(rank as i32), Scalar::I32(e.context.as_ref().unwrap().admitted_pages)])?;
                 Ok(Some(candidates))
             }
             fn merge(&mut self, scores: *mut c_void, indices: *mut c_void) -> Result<()> {

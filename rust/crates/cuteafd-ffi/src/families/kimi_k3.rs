@@ -342,6 +342,7 @@ pub struct KimiIndexSelection {
 pub struct KimiIndexTopK<'a> {
     program: Program<'a>, rows: usize, pages: usize, mode: KimiIndexMode,
     scored: bool, runtime_sms: Option<i32>, scratch: usize,
+    admitted_pages: Option<i32>,
 }
 impl<'a> KimiIndexTopK<'a> {
     pub fn load(programs: &'a Programs<'a>, rows: usize, pages: usize, mode: KimiIndexMode,
@@ -352,7 +353,8 @@ impl<'a> KimiIndexTopK<'a> {
         let runtime_sms = runtime.then(|| programs.library().sm_count()).transpose()?
             .map(|n| i32::try_from(n).map_err(|_| KimiMlaError::Invalid("index selector SM count"))).transpose()?;
         Ok(Self { program: programs.program(&name, if context { SCORED_TOPK } else { INDEX_TOPK })?,
-            rows, pages, mode, scored: context, runtime_sms, scratch })
+            rows, pages, mode, scored: context, runtime_sms, scratch,
+            admitted_pages: (context && mode == KimiIndexMode::Decode).then_some(pages.div_ceil(2) as i32) })
     }
     pub fn scratch_bytes(&self) -> usize { self.scratch }
 
@@ -367,7 +369,8 @@ impl<'a> KimiIndexTopK<'a> {
                 b.lengths.ptr, b.indices.ptr, b.scores.ptr, b.scratch.ptr],
                 &[Scalar::I32(b.rows as i32), Scalar::I32(b.table_width as i32),
                   Scalar::I32(b.table_stride as i32), Scalar::I32(b.page_stride as i32),
-                  Scalar::I32(b.page_offset as i32)], stream)?; }
+                  Scalar::I32(b.page_offset as i32), Scalar::I32(self.admitted_pages.unwrap_or(0))]
+                    [..if self.admitted_pages.is_some() { 6 } else { 5 }], stream)?; }
         } else {
             let scalars = [Scalar::I32(b.rows as i32), Scalar::I32(b.table_width as i32),
                 Scalar::I32(b.table_stride as i32), Scalar::I32(self.runtime_sms.unwrap_or(0))];
@@ -386,7 +389,7 @@ fn validate_topk_manifest(spec: &ProgramSpec, rows: usize, pages: usize, mode: K
     let g = &spec.geometry;
     let runtime = !scored && g["runtime_sm_count"].as_bool() == Some(true);
     let pointers = if scored { SCORED_TOPK } else { INDEX_TOPK };
-    let scalars = if scored { &b"iiiii"[..] } else if runtime { &b"iiii"[..] } else { &b"iii"[..] };
+    let scalars = if scored && mode == KimiIndexMode::Decode { &b"iiiiii"[..] } else if scored { &b"iiiii"[..] } else if runtime { &b"iiii"[..] } else { &b"iii"[..] };
     if !(1..=4096).contains(&rows) || !(1..=16384).contains(&pages)
         || spec.capacity_rows as usize != rows || spec.scalar_kinds != scalars
         || spec.pointers.iter().map(String::as_str).ne(pointers.iter().copied())

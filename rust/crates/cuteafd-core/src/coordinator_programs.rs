@@ -1,4 +1,5 @@
 //! Programs belonging to one coordinator, including unsplit draft/target work.
+pub mod scored_decode;
 
 /// An immutable numerical reduction recipe hint, not an execution row limit.
 /// Choose before admission/capture and reuse it for serial decode and verification.

@@ -271,7 +271,7 @@ mod tests {
                     waves: 3,
                 },
             ] {
-                let scratch = GlmContext {
+                let scratch = GlmContext { selector_tile: None,
                     topk_scratch: 17,
                     partial_scratch: 1024,
                 };

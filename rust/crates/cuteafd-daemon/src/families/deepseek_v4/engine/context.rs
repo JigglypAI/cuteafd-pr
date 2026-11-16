@@ -71,6 +71,7 @@ pub(super) struct ContextRank<'a> {
 
 /// Both GPUs' context buffers, the exchange and the per-GPU partial programs.
 pub(super) struct V4ContextSplit<'a> {
+    admitted_pages: i32,
     ranks: [ContextRank<'a>; 2],
     /// Dropped before the head split's exchange (it borrows its abort words).
     pub exchange: ContextExchange<'a>,
@@ -156,7 +157,8 @@ impl<'a> V4ContextSplit<'a> {
         let ranks = [build(0)?, build(1)?];
         let mut c4 = 0;
         let ordinal = cfg.compress_ratios.iter().map(|&ratio| (ratio == 4).then(|| { c4 += 1; c4 - 1 })).collect();
-        Ok(Self { ranks, exchange, staging_units, partial, ordinal,
+        Ok(Self { admitted_pages: cuteafd_core::coordinator_programs::scored_decode::admitted_pages(
+            extent as u64, 256 as u64).try_into()?, ranks, exchange, staging_units, partial, ordinal,
             commit_limit: context_commit_units(prefill) as usize })
     }
 
@@ -344,7 +346,7 @@ impl<'a> Engine<'a> {
                     ("table", m.c4_page_table.buffer.ptr), ("lengths", m.c4_visible.buffer.ptr), ("indices", indices),
                     ("scores", own.candidates.buffer.ptr), ("scratch", own.topk_scratch.buffer.ptr)],
                     &[self.rows, Scalar::I32(self.width()), Scalar::I32(self.stride()), Scalar::I32(2),
-                        Scalar::I32(rank as i32)])?;
+                        Scalar::I32(rank as i32), Scalar::I32(e.context()?.admitted_pages)])?;
                 Ok(Some(Candidates { scores: own.candidates.buffer.ptr, indices }))
             }
             fn merge(&mut self, scores: *mut c_void, indices: *mut c_void) -> Result<()> {
@@ -479,7 +481,7 @@ mod tests {
             (128, 1024, (0..61).map(|i| if i < 2 { 0 } else if i % 2 == 0 { 4 } else { 128 }).collect::<Vec<_>>())] {
             let cfg = cfg(heads, topk, ratios);
             let c4 = cfg.compress_ratios.iter().filter(|&&r| r == 4).count();
-            let context = V4Context { topk_scratch: 9_178_112, partial_scratch: 4_000_000 };
+            let context = V4Context { selector_tile: None, topk_scratch: 9_178_112, partial_scratch: 4_000_000 };
             let list = context_workspace(&cfg, 1 << 20, 2752, 64, 3, context);
             let charged: u64 = list.iter().map(|&(_, b)| b.max(256)).sum();
             let allocated: u64 = list.iter().filter(|(n, _)| !n.starts_with("C4 scratch")).map(|&(_, b)| b.max(256)).sum();
