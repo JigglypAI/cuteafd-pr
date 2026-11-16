@@ -40,8 +40,10 @@ pub(crate) struct ServeArgs {
     #[arg(long, default_value_t = 16, value_parser = clap::value_parser!(u8).range(1..=64))]
     pub max_sequences: u8,
     #[arg(long)] pub model_id: Option<String>,
-    /// Opt in to a checkpoint-native MLA DFlash2 drafter.
+    /// Opt in to a checkpoint-native MLA DFlash2 or GQA block dSpark drafter.
     #[arg(long)] pub draft: Option<PathBuf>,
+    /// Independent windowed block-drafter KV record format.
+    #[arg(long,default_value="fp8")] pub draft_kv_cache: cuteafd_loader::families::qwen4::Qwen4KvCache,
     #[arg(long, default_value_t = false, action = clap::ArgAction::Set)] pub draft_fp8: bool,
     /// Split the native draft cache and attention over both physical GPUs.
     #[arg(long, default_value_t = false, action = clap::ArgAction::Set)] pub tp2_dflash: bool,
@@ -114,7 +116,7 @@ pub(super) fn startup_options<'a, const RANKS: usize>(args: &'a ServeArgs,
     slots: usize, marks: usize, prefill: cuteafd_loader::serving_capacity::prefill_waves::PrefillPlan)
     -> Result<startup::Options<'a, RANKS>> {
     let draft = args.draft.as_ref().map(|snapshot| super::draft::Options {
-        snapshot: snapshot.clone(), fp8: args.draft_fp8, tp2_dflash: args.tp2_dflash, cache_format: args.kv_cache });
+        snapshot: snapshot.clone(), fp8: args.draft_fp8, tp2_dflash: args.tp2_dflash, cache_format: args.kv_cache, draft_kv_cache: args.draft_kv_cache });
     Ok(startup::Options { role: startup::Role::Serve,
         expert_usage: args.expert_usage, expert_usage_reader: args.expert_usage_reader.clone(),
         cache_format: args.kv_cache, devices, native_lib: &args.native_lib, manifest: &args.manifest,

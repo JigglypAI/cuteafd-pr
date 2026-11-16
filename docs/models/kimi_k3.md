@@ -26,6 +26,12 @@ checkpoint are also qualified. MC revision `1455b31b` corrects compact-view
 metadata (unchanged weight shards); older `d6c4b6ce` compact views refuse (#2118).
 K8 remains Planned and whole-core FP8 refuses.
 K3 DFlash2 hidden-state compatibility remains independently unqualified.
+Inferact block dSpark integration is tracked in #2261: native BF16 weights,
+checkpoint-derived 2,048-token GQA window, rank-512 Markov confidence, shared
+policy/executor and target embedding/head. `SPECULATOR=dspark` is opt-in and
+still refuses until DSA multi-row verification is qualified; the default stays
+off. The interim drafter lives on the head GPU, not a claimed TP2 head split.
+`DRAFT_KV_CACHE` selects FP8 (default) or BF16 independently of target KV.
 The minimum configuration remains blocked by #2082, without cap/pool workarounds.
 
 Full-model BF16/K6 fidelity is accepted. TJ accepted partial paired scoring

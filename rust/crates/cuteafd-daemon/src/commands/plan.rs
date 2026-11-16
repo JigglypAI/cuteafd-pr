@@ -521,14 +521,19 @@ fn run_plan_with_host(mut args: PlanArgs) -> Result<()> {
         settings.insert("speculator".into(), setting(cuteafd_core::launch_settings::selected(
             Some(args.speculator.clone()), None, args.speculator.clone(), "explicit speculator inventory override")));
     }
+    if family == "kimi_k3" {
+        settings.insert("speculator".into(),setting(cuteafd_core::launch_settings::kimi_speculator(
+            (requested_speculator != "auto").then_some(requested_speculator.as_str()),cfg.get("SPECULATOR").map(String::as_str))?));
+    }
     if args.resolve_settings_only {
         let mut output = resolved_output(serde_json::json!({"family": family}), &args, settings, &cfg, replay_explicit);
         output["speculator"] = serde_json::json!(args.speculator);
-        output["default_drafter"] = serde_json::json!(GLMF_DEFAULT_DRAFTER);
+        output["default_drafter"] = serde_json::json!(if family == "kimi_k3" { cuteafd_core::launch_settings::KIMI_K31_DSPARK } else { GLMF_DEFAULT_DRAFTER });
+        if family == "kimi_k3" { output["default_drafter_revision"]=serde_json::json!(cuteafd_core::launch_settings::KIMI_K31_DSPARK_REVISION); }
         println!("{}", serde_json::to_string(&output)?);
         return Ok(());
     }
-    if family == "kimi_k3" && args.speculator == "dflash2" && args.drafter_snapshot.is_none() {
+    if family == "kimi_k3" && matches!(args.speculator.as_str(),"dflash2"|"dspark") && args.drafter_snapshot.is_none() {
         args.drafter_snapshot = file_args(args.clone(), &snapshot)?.drafter_snapshot;
     }
     let view = view.context("checkpoint view after settings-only dispatch")?;
@@ -618,8 +623,8 @@ fn run_plan_with_host(mut args: PlanArgs) -> Result<()> {
                 .context("Muse Spark DFlash2 planning requires its checkpoint")?);
         }
         if family == "kimi_k3" && args.speculator != "off" {
-            anyhow::ensure!(args.speculator == "dflash2" && args.drafter_snapshot.is_some(),
-                "Kimi MLA speculation requires --speculator dflash2 --drafter-snapshot SNAPSHOT");
+            anyhow::ensure!(matches!(args.speculator.as_str(),"dflash2"|"dspark") && args.drafter_snapshot.is_some(),
+                "Kimi speculation requires --speculator dflash2|dspark --drafter-snapshot SNAPSHOT");
             layout.kimi_drafter_snapshot = args.drafter_snapshot.clone();
         }
         let config = &checkpoint.config;
@@ -795,6 +800,10 @@ const GLMF_DEFAULT_DRAFTER: &str = "incoai/GLM-5.3-Flash-DFlash2";
 
 fn resolve_speculator(args: &mut PlanArgs, snapshot: &std::path::Path, family: &str,
     cfg: &std::collections::BTreeMap<String, String>) -> Result<()> {
+    if family == "kimi_k3" {
+        args.speculator=cuteafd_core::launch_settings::kimi_speculator(
+            (args.speculator != "auto").then_some(args.speculator.as_str()),cfg.get("SPECULATOR").map(String::as_str))?.value;
+    }
     let default = match family {
         "minimax_m3" => "dspark",
         "glm5" | "glm5_flash" | "muse_spark" => "dflash2",
@@ -837,7 +846,7 @@ fn resolve_speculator(args: &mut PlanArgs, snapshot: &std::path::Path, family: &
         anyhow::ensure!(args.speculator != "off", "this family has no default speculator");
     }
     let enabled = match (family, args.speculator.as_str()) {
-        (_, "off") | ("qwen3_5", "dspark" | "mtp") | ("kimi_k3" | "muse_spark", "dflash2") | ("glm5", "dflash2") | ("glm5_flash", "dflash2" | "dspark")
+        (_, "off") | ("qwen3_5", "dspark" | "mtp") | ("kimi_k3", "dflash2"|"dspark") | ("muse_spark", "dflash2") | ("glm5", "dflash2") | ("glm5_flash", "dflash2" | "dspark")
         | ("mimo_v2", "dflash2" | "mtp") | ("qwen4", "auto") | ("qwen4" | "step5", "mtp")
         | ("deepseek_v4" | "deepseek_v41" | "mistral_large4" | "minimax_m3", "dspark") => true,
         _ => false,
@@ -891,6 +900,7 @@ fn file_args(mut args: PlanArgs, snapshot: &std::path::Path) -> Result<PlanArgs>
         let model = cfg.get("SPECULATOR_MODEL_ID").or_else(|| cfg.get("DRAFT_MODEL_ID"))
             .filter(|v| !v.is_empty()).map(String::as_str).or(match (family, args.speculator.as_str()) {
                 ("qwen3_5", "dspark") => Some("RadixArk/Qwen3.8-27B-DSpark"),
+                ("kimi_k3", "dspark") => Some(cuteafd_core::launch_settings::KIMI_K31_DSPARK),
                 ("glm5", "dflash2") => Some("incoai/GLM-5.3-DFlash2"),
                 ("muse_spark", "dflash2") => Some("nvidia/Muse-Spark-Open-816B-A42B-DFlash2"),
                 ("glm5_flash", "dflash2") => Some("incoai/GLM-5.3-Flash-DFlash2"),
@@ -901,6 +911,9 @@ fn file_args(mut args: PlanArgs, snapshot: &std::path::Path) -> Result<PlanArgs>
             let hf_home = args.hf_home.clone().unwrap_or_else(default_hf_home);
             let revision = cfg.get("SPECULATOR_MODEL_REVISION").or_else(|| cfg.get("DRAFT_MODEL_REVISION"))
                 .filter(|v| !v.is_empty()).map(String::as_str).or_else(|| {
+                    if family == "kimi_k3" && model == cuteafd_core::launch_settings::KIMI_K31_DSPARK {
+                        return Some(cuteafd_core::launch_settings::KIMI_K31_DSPARK_REVISION);
+                    }
                     if family == "muse_spark" && model == "nvidia/Muse-Spark-Open-816B-A42B-DFlash2" {
                         return Some("22e2669e4c60689f9bff0749a34d9d8e59ce7cd6");
                     }

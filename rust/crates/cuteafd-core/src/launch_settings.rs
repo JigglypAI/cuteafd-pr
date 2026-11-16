@@ -48,6 +48,24 @@ pub fn coordinator_weight_budget(explicit_gib: Option<f64>, configured_gib: Opti
         "device capacity after explicit cap and occupancy adjustment")
 }
 
+#[derive(Debug,thiserror::Error)]
+#[error("unsupported Kimi SPECULATOR={0}; use off, dflash2 or dspark")]
+pub struct KimiSpeculatorError(String);
+
+pub const KIMI_K31_DSPARK: &str = "Inferact/Kimi-K3.1-Pro-DSpark";
+pub const KIMI_K31_DSPARK_REVISION: &str = "e4e6e6261e9f8b6d5f249f9627eb6b109d762d5f";
+
+pub fn kimi_speculator(explicit:Option<&str>,configured:Option<&str>)
+    -> Result<Resolved<String>,KimiSpeculatorError> {
+    let resolved=selected(explicit.filter(|v|!v.is_empty() && *v!="auto").map(str::to_owned),
+        configured.filter(|_|explicit.is_none()).filter(|v|!v.is_empty() && *v!="auto").map(str::to_owned),
+        "off".into(),"Kimi speculation remains opt-in until measured");
+    if !matches!(resolved.value.as_str(),"off"|"dflash2"|"dspark") {
+        return Err(KimiSpeculatorError(resolved.value));
+    }
+    Ok(resolved)
+}
+
 pub fn kimi_draft_fp8(explicit: Option<bool>, dflash: bool) -> Resolved<bool> {
     selected(explicit, None, dflash, "FP8 for explicit Kimi DFlash2")
 }
@@ -85,6 +103,10 @@ mod tests {
         assert_eq!(mimo_speculator(Some("mtp"), Some("off"), "XiaomiMiMo/MiMo-V2.6-Pro-MOPD").value, "mtp");
         assert_eq!(mimo_mtp_depth(None, None, true).value, 1);
         assert_eq!(mimo_mtp_depth(Some(3), Some(2), true).value, 3);
+        assert_eq!(kimi_speculator(None,None).unwrap().value,"off");
+        assert_eq!(kimi_speculator(None,Some("dspark")).unwrap().value,"dspark");
+        assert_eq!(kimi_speculator(Some("off"),Some("dspark")).unwrap().value,"off");
+        assert!(kimi_speculator(Some("mtp"),None).is_err());
         assert!(kimi_draft_fp8(None, true).value);
         assert!(!kimi_draft_fp8(Some(false), true).value);
     }

@@ -287,8 +287,8 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
         let layout = if raw["speculators_model_type"] == "dspark" {
             anyhow::ensure!(!opts.kimi_draft_fp8 && !opts.tp2_dflash,
                 "block dSpark keeps native BF16 weights on target head GPU");
-            DraftLayout::Block(crate::formats::block_dspark::BlockDsparkRuntimeLayout::new(snapshot,
-                slots,slots.min(8),opts.physical_sms.unwrap_or(188) as usize,&format!("kimi/draft/{head_rank}"))?)
+            DraftLayout::Block(crate::formats::block_dspark::BlockDsparkRuntimeLayout::with_kv(snapshot,
+                slots,slots.min(8),opts.physical_sms.unwrap_or(188) as usize,&format!("kimi/draft/{head_rank}"),opts.draft_kv_cache)?)
         } else {
             let draft = MlaDflashConfig::from_json(&raw)?;
             anyhow::ensure!(!opts.tp2_dflash || gpus == 2,

@@ -87,6 +87,7 @@ impl NativeDsparkLayout {
 #[derive(Debug, Clone, PartialEq)]
 pub struct BlockDsparkRuntimeLayout {
     pub config: BlockDsparkConfig,
+    pub kv_cache: crate::families::qwen4::Qwen4KvCache,
     pub weight_requests: Vec<(String, usize)>,
     pub capacity: crate::families::glm5::draft_representation::GlmDraftCapacity,
     pub weights: crate::serving_capacity::WeightArenaLayout,
@@ -97,6 +98,10 @@ pub struct BlockDsparkRuntimeLayout {
 impl BlockDsparkRuntimeLayout {
     pub fn new(snapshot: &Path, slots: usize, sequences: usize, sms: usize, arena: &str)
         -> anyhow::Result<Self> {
+        Self::with_kv(snapshot,slots,sequences,sms,arena,crate::families::qwen4::Qwen4KvCache::Bf16)
+    }
+    pub fn with_kv(snapshot: &Path, slots: usize, sequences: usize, sms: usize, arena: &str,
+        kv_cache:crate::families::qwen4::Qwen4KvCache) -> anyhow::Result<Self> {
         use anyhow::{ensure, Context};
         use crate::families::glm5::draft_representation::{GlmDraftCapacity, GlmDraftRepresentation};
         let config = BlockDsparkConfig::read(snapshot)?;
@@ -107,7 +112,7 @@ impl BlockDsparkRuntimeLayout {
         let capacity = GlmDraftCapacity::new(slots, sequences, config.block)?;
         let window = config.window.context("block runtime layout requires checkpoint sliding window")?;
         let cache = config.paged_cache_layout(slots, window, slots.checked_mul(window)
-            .context("block ring capacity overflow")?, crate::families::qwen4::Qwen4KvCache::Bf16)?;
+            .context("block ring capacity overflow")?, kv_cache)?;
         let weight_requests = block_dspark_arena_requests(snapshot, GlmDraftRepresentation::Bf16Only)?;
         let weights = crate::serving_capacity::WeightArenaLayout::new(arena, weight_requests.clone())?;
         let mul = |values: &[usize]| values.iter().try_fold(1usize, |n, value| n.checked_mul(*value))
@@ -144,13 +149,13 @@ impl BlockDsparkRuntimeLayout {
             sequences as u64, config.kv_heads as u64,
             mul(&[config.heads / config.kv_heads, config.block])?.div_ceil(32) as u64,
             add(&[window, config.block])? as u64, config.head_dim as u64, sms as u64)?)?);
-        Ok(Self { config, weight_requests, capacity, weights, buffers, host_landing:mul(&[rows,8])? })
+        Ok(Self { config, kv_cache, weight_requests, capacity, weights, buffers, host_landing:mul(&[rows,8])? })
     }
 
     pub fn window_mark_bytes(&self) -> anyhow::Result<usize> {
         use anyhow::Context;
         let window = self.config.window.context("block runtime window missing")?;
-        [self.config.layers,2,window,self.config.kv_heads,self.config.head_dim,2]
+        [self.config.layers,2,window,self.kv_cache.plane_record_bytes(self.config.kv_heads,self.config.head_dim)]
             .into_iter().try_fold(1usize, |n,v| n.checked_mul(v)).context("block snapshot extent overflow")?
             .checked_add(16).and_then(|n| n.checked_add(255)).map(|n| n / 256 * 256)
             .context("block snapshot alignment overflow")
@@ -777,6 +782,12 @@ mod tests {
         let total = |layout: &BlockDsparkRuntimeLayout| layout.buffers.iter().map(|(_,n)| *n).sum::<usize>();
         assert_eq!(total(&two)-total(&one),5*2*2048*8*128*2);
         assert_eq!(one.window_mark_bytes()?,(16usize+5*2*2048*8*128*2).div_ceil(256)*256);
+        let fp8=BlockDsparkRuntimeLayout::with_kv(root.path(),1,1,188,"test/draft",
+            crate::families::qwen4::Qwen4KvCache::Fp8)?;
+        let plane=crate::families::qwen4::Qwen4KvCache::Fp8.plane_record_bytes(8,128);
+        assert_eq!(total(&one)-total(&fp8),5*2*2048*(8*128*2-plane));
+        assert_eq!(fp8.window_mark_bytes()?,(16usize+5*2*2048*plane).div_ceil(256)*256);
+        assert_eq!(one.weights,fp8.weights);
         assert!(one.demands(1).iter().all(|d| d.gpu == 1 && d.resident_weights.0 == 0));
         assert_eq!(one.buffers.iter().map(|(n,_)| n).collect::<std::collections::BTreeSet<_>>().len(),one.buffers.len());
         assert!(BlockDsparkRuntimeLayout::new(root.path(),1,2,188,"test/draft").is_err());

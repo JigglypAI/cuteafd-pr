@@ -1581,6 +1581,13 @@ if [[ "$family" == minimax_m3 && ( -z "$speculator" || "$speculator" == auto ) ]
 if [[ "$family" == qwen4 && ( -z "$speculator" || "$speculator" == auto ) ]]; then speculator=auto; fi
 default_drafter=""
 [[ "$family" != muse_spark ]] || default_drafter=nvidia/Muse-Spark-Open-816B-A42B-DFlash2
+if [[ "$family" == kimi_k3 ]]; then
+  kimi_defaults="$(docker run --rm --network none -e "HF_HOME=$container_hf_home" \
+    "${generic_worker_mounts[@]}" "${wip_mount_args[@]}" "$coordinator_image" cuteafd plan "$snapshot" \
+    --checkpoint-model-id "$model" --speculator "${speculator:-auto}" --resolve-settings-only)" || exit 2
+  speculator="$(jq -er '.speculator' <<<"$kimi_defaults")"
+  if [[ "$speculator" == dspark ]]; then default_drafter="$(jq -er '.default_drafter' <<<"$kimi_defaults")"; fi
+fi
 if [[ -z "$speculator" ]]; then
   speculator=off
   if [[ $speculator == off && $family == glm5 && -z ${cfg[SPECULATOR]+set} ]]; then
@@ -1626,7 +1633,7 @@ case "$family:$speculator" in
   qwen4:mtp|qwen4:auto) ;;
   glm5:dspark) [[ "$checkpoint_family" == mistral_large4 ]] ||
     { echo "SPECULATOR=dspark does not apply to $family" >&2; exit 2; } ;; # The MTP layer's experts stay local even with Spark backbone experts.
-  *:off|qwen3_5:dspark|qwen3_5:mtp|glm5:dflash2|glm5_flash:dflash2|glm5_flash:dspark|mimo_v2:dflash2|mimo_v2:mtp|kimi_k3:dflash2|step5:mtp|muse_spark:dflash2|deepseek_v4:dspark) ;;
+  *:off|qwen3_5:dspark|qwen3_5:mtp|glm5:dflash2|glm5_flash:dflash2|glm5_flash:dspark|mimo_v2:dflash2|mimo_v2:mtp|kimi_k3:dflash2|kimi_k3:dspark|step5:mtp|muse_spark:dflash2|deepseek_v4:dspark) ;;
   *) echo "SPECULATOR=$speculator does not apply to $family" >&2; exit 2 ;;
 esac
 draft_args=()
@@ -1768,6 +1775,9 @@ case "$speculator" in
       dspark_args=(--dspark)
     elif [[ -n "$drafter" ]]; then
       draft_revision="$(get SPECULATOR_MODEL_REVISION)"
+      if [[ -z "$draft_revision" && "$family:$speculator" == kimi_k3:dspark && "$drafter" == "$default_drafter" ]]; then
+        draft_revision="$(jq -er '.default_drafter_revision' <<<"$kimi_defaults")"
+      fi
       if [[ -z "$draft_revision" && $family == muse_spark && $drafter == nvidia/Muse-Spark-Open-816B-A42B-DFlash2 ]]; then
         draft_revision=22e2669e4c60689f9bff0749a34d9d8e59ce7cd6
       fi
@@ -1777,7 +1787,7 @@ case "$speculator" in
       draft_snapshot="$(snapshot_of "$drafter" "$draft_revision")" ||
         { [[ -z "$default_drafter" ]] || echo "download it (hf download $drafter) or set SPECULATOR=off" >&2; exit 1; }
       draft_args=(--draft "$draft_snapshot")
-      if [[ "$family" == muse_spark ]]; then
+      if [[ "$family" == muse_spark || "$family:$speculator" == kimi_k3:dspark ]]; then
         muse_draft_kv="$(get DRAFT_KV_CACHE fp8)"
         case "$muse_draft_kv" in bf16|fp8) ;; *) release_die "DRAFT_KV_CACHE must be bf16 or fp8" ;; esac
         draft_args+=(--draft-kv-cache "$muse_draft_kv")
@@ -2339,8 +2349,9 @@ audio_encoder_hash=""
   if [[ "$family:$speculator" == qwen3_5:dspark ]]; then
     plan_draft_args+=(--drafter-snapshot "$draft_snapshot")
   fi
-  if [[ "$family:$speculator" == kimi_k3:dflash2 ]]; then
+  if [[ "$family" == kimi_k3 && ( "$speculator" == dflash2 || "$speculator" == dspark ) ]]; then
     plan_draft_args+=(--drafter-snapshot "$draft_snapshot")
+    if [[ "$speculator" == dspark ]]; then plan_draft_args+=(--draft-kv-cache "$(get DRAFT_KV_CACHE fp8)"); fi
   fi
   if [[ "$family:$speculator" == muse_spark:dflash2 ]]; then
     plan_draft_args+=(--drafter-snapshot "$draft_snapshot")
@@ -2560,7 +2571,7 @@ audio_encoder_hash=""
     echo "Qwen planner selected SPECULATOR=$speculator (admitted Spark expert world $spark_expert_world)"
   fi
   coordinator_weight_budget_gib="$(jq -er '.resolved_settings.coordinator_weight_budget_gib.value' <<<"$deployment_json")"
-  if [[ "$family:$speculator" == kimi_k3:dflash2 ]]; then
+  if [[ "$family" == kimi_k3 && ( "$speculator" == dflash2 || "$speculator" == dspark ) ]]; then
     draft_args+=(--draft-fp8 "$(jq -er '.resolved_settings.draft_fp8.value | tostring' <<<"$deployment_json")")
   fi
   if [[ "$family:$speculator" == mimo_v2:mtp ]]; then
