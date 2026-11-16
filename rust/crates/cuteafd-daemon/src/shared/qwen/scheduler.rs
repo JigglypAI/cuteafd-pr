@@ -1345,7 +1345,7 @@ impl<'a, B: Backend<'a>> LaneCommit for Accept<'_, '_, 'a, B> {
 fn apply_draft_evidence(prior:&mut Vec<f64>,history:&DraftHistory,head:Option<&[f32]>,rows:usize)
     -> Result<()> {
     let Some(head)=head else { return Ok(()) };
-    ensure!(head.len()>=rows,"draft evidence shorter than current proposal");
+    anyhow::ensure!(head.len()>=rows,"draft evidence shorter than current proposal");
     *prior=resource::head_confidence(history,&head[..rows]);
     Ok(())
 }
