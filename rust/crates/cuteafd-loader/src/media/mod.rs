@@ -4,6 +4,8 @@ pub mod audio_tower;
 pub mod pcm_audio;
 mod decode;
 mod exif;
+mod groups;
+pub use groups::{ImageFragment,PreparedImageGroup};
 mod muse;
 pub mod muse_vision;
 pub mod perception_vision;
