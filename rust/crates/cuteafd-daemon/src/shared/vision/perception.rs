@@ -162,6 +162,24 @@ mod tests {
         }
     }
     #[test]
+    #[ignore = "requires VISION_LIBRARY built with PE AOT; no CUDA initialization"]
+    fn native_ledger_matches_perception_scratch_contract() {
+        let library=std::path::PathBuf::from(std::env::var("VISION_LIBRARY").unwrap());
+        for inkling in [true,false] {
+            let directory=sparse_snapshot(inkling);
+            let cfg=cuteafd_loader::read_json_file(&directory.path().join("config.json")).unwrap();
+            let geometry=PerceptionGeometry::from_config(&cfg).unwrap();
+            let capacities: &[usize]=if inkling {&[1,20,169,4096]} else {&[81,168,169,4096]};
+            for &capacity in capacities {
+                let tower=TowerSpec::perception(directory.path(),capacity).unwrap();
+                let ledger=cuteafd_ffi::vision::NativeVision::required(&library,&tower.native).unwrap();
+                assert_eq!(ledger.weights,tower.native.weight_bytes);
+                assert_eq!(ledger.blas_workspace,0);
+                assert_eq!(ledger.scratch,geometry.scratch_bytes(capacity as u64).unwrap());
+            }
+        }
+    }
+    #[test]
     fn native_pe_execution_is_not_advertised_before_oracles() {
         let source = include_str!("../vision.rs");
         let dispatch = source.split("pub fn from_snapshot").nth(1).unwrap().split("pub fn row_markers").next().unwrap();

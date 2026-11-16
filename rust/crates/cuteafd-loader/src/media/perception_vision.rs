@@ -137,6 +137,29 @@ impl PerceptionGeometry {
         out
     }
 
+    /// Exact native scratch_perception backing, with runtime image extents
+    /// bounded by the admitted merged-row capacity and official Step grids.
+    pub fn scratch_bytes(self, tokens: u64) -> Result<u64, String> {
+        let inkling = self.kind == PerceptionKind::Inkling2;
+        if !(1..=4096).contains(&tokens) || (!inkling && tokens < 81) {
+            return Err("PE capacity must be 1..=4096, or 81..=4096 for Step".into());
+        }
+        let n = if inkling { (tokens * 4 + 1).min(16384) }
+            else if tokens >= 169 { 2704 } else { 1296 };
+        let h = self.hidden as u64;
+        let mut sizes = vec![n*h*2,n*h*2,n*h*2,n*3*(self.patch as u64).pow(2)*2,n*3*h*2];
+        sizes.extend([16384*h*2;4]);
+        sizes.extend([n*h*2,n*self.intermediate as u64*2,tokens*4096*2,
+            tokens*self.output as u64*2,tokens*4*h*2,2*4,16384*16*4,768*4]);
+        sizes.push(if inkling { n*20*20*3 } else { 3024*3024*3 });
+        if !inkling {
+            sizes.extend([3024*3024*3*4,3024*728*3*4,728*728*3*4,
+                728*4,728*4,728*4,728*4,728*64*4,728*64*4,
+                (n/4*1536*9*2).max(n/16*3072*9*2),n/4*3072*2,n/16*6144*2]);
+        }
+        Ok(sizes.into_iter().map(|bytes| bytes.div_ceil(256)*256).sum())
+    }
+
     /// Reference constants: Inkling uses Python float64 power then F32, while
     /// Step builds CPU Torch F32 1/pow(10000, arange(0,48,2)/48). These immutable
     /// bit patterns are checked against the pinned vendor builders on both GPUs.
@@ -221,6 +244,20 @@ mod tests {
             extra.name = match kind { PerceptionKind::Inkling2 => "model.visual.extra", PerceptionKind::Step5 => "vision_model.extra" }.into();
             wrong.push(extra); assert!(g.resident_weights(wrong.iter()).is_err());
         }
+    }
+    #[test]
+    fn scratch_capacity_includes_cls_and_both_official_step_grids() {
+        let inkling=geometry(PerceptionKind::Inkling2);
+        let step=geometry(PerceptionKind::Step5);
+        for g in [inkling,step] {
+            assert!(g.scratch_bytes(0).is_err());
+            assert!(g.scratch_bytes(4097).is_err());
+            assert_eq!(g.scratch_bytes(4096).unwrap()%256,0);
+        }
+        assert!(step.scratch_bytes(80).is_err());
+        assert!(step.scratch_bytes(82).unwrap()>step.scratch_bytes(81).unwrap());
+        assert!(step.scratch_bytes(169).unwrap()>step.scratch_bytes(168).unwrap());
+        assert!(inkling.scratch_bytes(2).unwrap()>inkling.scratch_bytes(1).unwrap());
     }
     #[test]
     fn step5_has_learned_positions_and_rotary_without_class_token() {
