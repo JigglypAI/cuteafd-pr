@@ -5,6 +5,7 @@ pub mod pcm_audio;
 mod decode;
 mod exif;
 mod groups;
+pub mod inkling;
 pub use groups::{ImageFragment,PreparedImageGroup};
 mod muse;
 pub mod muse_vision;
