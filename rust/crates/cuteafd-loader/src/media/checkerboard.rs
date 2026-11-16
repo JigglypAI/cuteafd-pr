@@ -42,7 +42,7 @@ impl Checkerboard {
     /// Read the checkpoint's transparent_bg_config object. Color values are
     /// inputs, never inferred from the model family or a global decoder default.
     pub fn from_config(value: &serde_json::Value, rounding: BlendRounding) -> Result<Self> {
-        let bad = |field| MediaError::Config(format!("invalid checkerboard {field}"));
+        let bad = |field: &str| MediaError::Config(format!("invalid checkerboard {field}"));
         if value["pattern"] != "chessboard" {
             return Err(bad("pattern"));
         }
