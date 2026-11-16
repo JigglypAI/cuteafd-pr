@@ -212,26 +212,36 @@ pub fn exchange_bytes(phase: &Phase, port: &Port) -> (Option<u64>, Option<u64>) 
      port.engine_received_bytes.map(|local| local.max(rx.unwrap_or(0))))
 }
 
-/// Only measured background traffic, host contention and a down engine port
-/// call for another A/B. Reassess raw evidence so reports from older seals do
-/// not repeat stale labels.
-pub fn rerun_reasons(phase: &Phase) -> Vec<String> {
+/// Coordinator host load during a timed phase, reported as advisory only. A
+/// 2026-11-16 calibration over same-config repeats found these bars miss most
+/// real slowdowns and flag many unaffected runs, so they never force a rerun on
+/// their own; a paired arm must also show the slowdown.
+pub fn host_load_advisories(phase: &Phase) -> Vec<String> {
     if !phase.timed { return Vec::new(); }
-    let mut reasons = Vec::new();
+    let mut advisories = Vec::new();
     if let Some(load) = &phase.host_load {
         if load.cpu_some_avg10.is_some_and(|cpu| cpu > HOST_CPU_PRESSURE_WARN) {
-            reasons.push(format!("host load: coordinator CPU pressure {:.1}% (>{}%)",
+            advisories.push(format!("host load (advisory): coordinator CPU pressure {:.1}% (>{}%)",
                 load.cpu_some_avg10.unwrap_or_default(), HOST_CPU_PRESSURE_WARN));
         }
         if load.memory_some_avg10.is_some_and(|memory| memory > HOST_MEMORY_PRESSURE_WARN) {
-            reasons.push(format!("host load: coordinator memory pressure {:.1}% (>{}%)",
+            advisories.push(format!("host load (advisory): coordinator memory pressure {:.1}% (>{}%)",
                 load.memory_some_avg10.unwrap_or_default(), HOST_MEMORY_PRESSURE_WARN));
         }
         if load.pgscan_pages_per_s.is_some_and(|scan| scan > HOST_SCAN_PAGES_PER_S_WARN) {
-            reasons.push(format!("host load: coordinator page reclaim {:.0} pages/s (>{} pages/s)",
+            advisories.push(format!("host load (advisory): coordinator page reclaim {:.0} pages/s (>{} pages/s)",
                 load.pgscan_pages_per_s.unwrap_or_default(), HOST_SCAN_PAGES_PER_S_WARN));
         }
     }
+    advisories
+}
+
+/// Only measured background traffic and a down engine port call for another
+/// A/B. Reassess raw evidence so reports from older seals do not repeat stale
+/// labels.
+pub fn rerun_reasons(phase: &Phase) -> Vec<String> {
+    if !phase.timed { return Vec::new(); }
+    let mut reasons = Vec::new();
     for p in &phase.ports {
         let label = format!("{} {}/{}", p.host, p.device, p.port);
         if (p.engine_sent_bytes.is_some_and(|n| n > 0) || p.engine_received_bytes.is_some_and(|n| n > 0))
@@ -300,6 +310,8 @@ pub fn caveats(phases: &[Phase]) -> Vec<String> {
     let mut lines = Vec::new();
     for phase in phases.iter().filter(|p| p.timed) {
         lines.extend(rerun_reasons(phase).into_iter().map(|s| format!("{}: {s}; compare in a quiet window", phase.name)));
+        lines.extend(host_load_advisories(phase).into_iter()
+            .map(|s| format!("{}: {s}; rerun only if the paired arm also shows the slowdown", phase.name)));
         for p in &phase.ports {
             if let Some(h) = &p.health {
                 if h.retransmit_judged && h.retransmit_pct.is_some_and(|n| n > h.retransmit_warn_pct.max(0.5)) {
@@ -434,6 +446,7 @@ pub fn interval(name: &str, timed: bool, before: &Snapshot, after: &Snapshot) ->
     }
     phase.host_load = host_load(before, after);
     phase.assessments.extend(rerun_reasons(&phase));
+    phase.assessments.extend(host_load_advisories(&phase));
     for host in before.hosts.keys().chain(after.hosts.keys()) {
         phase.health.insert(host.clone(), cuteafd_transport::fabric_health::verdict(phase.ports.iter()
             .filter(|p| &p.host == host).filter_map(|p| p.health.as_ref())));
@@ -674,7 +687,7 @@ mod tests {
     }
 
     #[test]
-    fn coordinator_host_load_flags_pressure_and_reclaim() {
+    fn coordinator_host_load_is_advisory_and_never_forces_a_rerun() {
         use cuteafd_transport::traffic::HostLoad as Sample;
         fn snapshot(time: f64, load: Sample) -> Snapshot {
             Snapshot { hosts: BTreeMap::from([("coordinator".into(), HostSample {
@@ -700,9 +713,13 @@ mod tests {
 
         let cpu = caveat(sample(2.0, 0.5, 0, 0, 0.4), sample(25.0, 1.0, 0, 0, 0.5), true);
         assert_eq!(cpu.len(), 1, "{cpu:?}");
-        assert!(cpu[0].contains("host load") && cpu[0].contains("CPU pressure") && cpu[0].contains("25.0%"),
+        assert!(cpu[0].contains("host load (advisory)") && cpu[0].contains("CPU pressure") && cpu[0].contains("25.0%"),
             "{cpu:?}");
-        assert!(cpu[0].contains("quiet window"), "{cpu:?}");
+        assert!(cpu[0].contains("paired arm"), "{cpu:?}");
+        let loaded = interval("decode", true, &snapshot(10.0, sample(2.0, 0.5, 0, 0, 0.4)),
+            &snapshot(20.0, sample(25.0, 9.0, 15_000, 5_000, 0.5)));
+        assert!(rerun_reasons(&loaded).is_empty(), "host load alone must not force a rerun");
+        assert_eq!(host_load_advisories(&loaded).len(), 3);
 
         let memory = caveat(sample(2.0, 0.5, 0, 0, 0.4), sample(2.0, 9.0, 0, 0, 0.5), true);
         assert_eq!(memory.len(), 1, "{memory:?}");

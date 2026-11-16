@@ -1704,10 +1704,13 @@ def classify(row, launched):
     return 'measurement'
 
 
-def fabric_rerun_reasons(phases):
-    """Reconcile wire bytes with both endpoints, including older RX meters,
-    and flag coordinator-host contention that makes timings untrustworthy."""
-    reasons = []
+def host_load_advisories(phases):
+    """Coordinator host load during timed phases, reported as advisory only.
+
+    A 2026-11-16 calibration over same-config repeats found these bars miss most
+    real slowdowns and flag many unaffected runs, so they never force a rerun on
+    their own; a paired arm must also show the slowdown."""
+    advisories = []
     for phase in phases:
         if not phase.get('timed'):
             continue
@@ -1715,13 +1718,22 @@ def fabric_rerun_reasons(phases):
         load = phase.get('host_load') or {}
         cpu = load.get('cpu_some_avg10')
         if cpu is not None and cpu > 10:
-            reasons.append(f"{name}: host load: coordinator CPU pressure {cpu:.1f}% (>10%)")
+            advisories.append(f"{name}: host load (advisory): coordinator CPU pressure {cpu:.1f}% (>10%)")
         memory = load.get('memory_some_avg10')
         if memory is not None and memory > 5:
-            reasons.append(f"{name}: host load: coordinator memory pressure {memory:.1f}% (>5%)")
+            advisories.append(f"{name}: host load (advisory): coordinator memory pressure {memory:.1f}% (>5%)")
         scan = load.get('pgscan_pages_per_s')
         if scan is not None and scan > 1000:
-            reasons.append(f"{name}: host load: coordinator page reclaim {scan:.0f} pages/s (>1000 pages/s)")
+            advisories.append(f"{name}: host load (advisory): coordinator page reclaim {scan:.0f} pages/s (>1000 pages/s)")
+    return advisories
+
+
+def fabric_rerun_reasons(phases):
+    """Reconcile wire bytes with both endpoints, including older RX meters."""
+    reasons = []
+    for phase in phases:
+        if not phase.get('timed'):
+            continue
         ports = phase.get('ports', [])
         for p in ports:
             label = f"{p.get('host')} {p.get('device')}/{p.get('port')}"
@@ -1763,7 +1775,7 @@ def fabric_rerun_reasons(phases):
 
 def fabric_assessment(phases):
     """Fabric recovery is informational; raw counters, not old labels, decide."""
-    caveats = fabric_rerun_reasons(phases)
+    caveats = fabric_rerun_reasons(phases) + host_load_advisories(phases)
     for phase in phases:
         if not phase.get('timed'):
             continue
