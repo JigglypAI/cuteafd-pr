@@ -98,6 +98,17 @@ def test_existing_spark_workers_keep_sm121(exporter, args):
     assert compare_sm.worker_capability({"exporter": exporter, "args": args}) == (12, 1)
 
 
+@pytest.mark.parametrize("geometry", ["flash", "pro", "glm", "glmf", "ml4", "kimik31"])
+def test_context_decode_groups_cover_shipping_capacity_selectors(geometry):
+    jobs = {name: args for name, _, args in compare_sm.jobs("all")}
+    args = jobs[f"dsa-decode-{geometry}-m64"]
+    assert args[args.index("--only") + 1] == "index_topk_decode_m64,scored_index_topk_decode_m64"
+    assert args[args.index("--max-context") + 1] == "1048576"
+    assert args[args.index("--context-split") + 1] == "on"
+    if geometry == "glmf":
+        assert jobs["dsa-decode-glmf-m128"][-1] == "index_topk_decode_m128"
+
+
 def test_comparison_role_does_not_retarget_reply_or_backbone():
     for geometry in ("expert_reply", "flash", "inkling2"):
         payload = {"exporter": "export_b12x_dsv4_aot.py", "args": ["--geometry", geometry], "role": "spark"}

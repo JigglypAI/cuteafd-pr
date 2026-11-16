@@ -242,6 +242,15 @@ def jobs(scope):
                        f"ffn_gate_up_i{width}_comp" for width in (3072, 6144, 16896, 33792))]))
     result.append(("kimi-routing", "export_b12x_dsv4_aot.py",
                    ["--geometry", "kimik3", "--only", "router_scores,expert_input_quant"]))
+    # Match the shipping Context decode table, including its wide GLM Flash shape.
+    for geometry in ("flash", "pro", "glm", "glmf", "ml4", "kimik31"):
+        for rows in ((64, 128) if geometry == "glmf" else (64,)):
+            names = [f"index_topk_decode_m{rows}"]
+            if rows == 64:
+                names.append(f"scored_index_topk_decode_m{rows}")
+            result.append((f"dsa-decode-{geometry}-m{rows}", "export_b12x_dsv4_aot.py",
+                           ["--geometry", geometry, "--decode-rows", str(rows),
+                            "--max-context", "1048576", "--context-split", "on", "--only", ",".join(names)]))
     # Isolate callers of the shared contiguous prefill scorer for targeted changes.
     for geometry in ("flash", "pro", "glm", "glmf", "ml4", "kimik31", "minimax"):
         names = ["index_prefill"] if geometry == "minimax" else ["index_topk_prefill_m4096"]
