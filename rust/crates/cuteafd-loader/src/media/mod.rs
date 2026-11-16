@@ -4,11 +4,15 @@ pub mod audio_tower;
 pub mod pcm_audio;
 mod decode;
 mod exif;
+mod groups;
+pub mod inkling;
+pub use groups::{ImageFragment,PreparedImageGroup};
 mod muse;
 pub mod muse_vision;
 pub mod perception_vision;
 mod resize;
 mod spans;
+pub mod step5;
 
 /// Bundled audio execution selected by the checkpoint's declaration, not its LM family.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -395,6 +399,7 @@ impl ProcessorConfig {
         hash.update(match self.resample {
             Resample::Bicubic => b"cuteafd-preprocess-v1:pillow-bicubic".as_slice(),
             Resample::Lanczos => b"cuteafd-preprocess-v1:pillow-lanczos".as_slice(),
+            Resample::Bilinear => b"cuteafd-preprocess-v1:pillow-bilinear".as_slice(),
         });
         hash.update(serde_json::to_vec(self).expect("processor parameters serialize"));
         PreprocessId(hash.finalize().into())
@@ -573,6 +578,20 @@ impl PreparedImage {
         for dim in [grid.t, grid.h, grid.w] { hash.update(dim.to_le_bytes()); }
         hash.update(rgb);
         ImageKey(hash.finalize().into())
+    }
+
+    /// Content-aware towers distinguish raw sentinel padding from real RGB0.
+    /// Keep historical full-canvas keys byte-identical; only nontrivial content
+    /// geometry adds a domain-separated identity suffix.
+    pub fn key_for_pixels(encoder:EncoderId,processor:PreprocessId,grid:ImageGrid,rgb:&[u8],pixels:cuteafd_core::media::ImagePixels) -> Result<ImageKey> {
+        if !pixels.valid() || u64::from(pixels.canvas[0])*u64::from(pixels.canvas[1])*3!=rgb.len() as u64 {
+            return Err(invalid("image content identity differs from RGB canvas"));
+        }
+        let legacy=Self::key_for(encoder,processor,grid,rgb);
+        if !pixels.padded() {return Ok(legacy)}
+        let mut hash=Sha256::new();hash.update(b"cuteafd-image-content-v1");hash.update(legacy.0);
+        for value in pixels.canvas.into_iter().chain(pixels.content) {hash.update(value.to_le_bytes());}
+        Ok(ImageKey(hash.finalize().into()))
     }
 
     /// Reference-compatible f32 patches. The encoder's RGB8/LUT path avoids

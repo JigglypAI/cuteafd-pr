@@ -9,6 +9,19 @@ fn rgb(width: u32, height: u32) -> RgbImage {
     }
 }
 #[test]
+fn padding_content_identity_does_not_collide_with_black_pixels() {
+    let encoder=EncoderId([0;32]);let processor=PreprocessId([1;32]);
+    let grid=ImageGrid {t:1,h:2,w:2};let rgb=vec![0;40*40*3];
+    let full=cuteafd_core::media::ImagePixels::full(40,40);
+    let legacy=PreparedImage::key_for(encoder,processor,grid,&rgb);
+    assert_eq!(PreparedImage::key_for_pixels(encoder,processor,grid,&rgb,full).unwrap(),legacy);
+    let padded=cuteafd_core::media::ImagePixels {source:[39,39],content:[0,0,39,39],..full};
+    let key=PreparedImage::key_for_pixels(encoder,processor,grid,&rgb,padded).unwrap();assert_ne!(key,legacy);
+    let shifted=cuteafd_core::media::ImagePixels {content:[1,1,39,39],..padded};
+    assert_ne!(PreparedImage::key_for_pixels(encoder,processor,grid,&rgb,shifted).unwrap(),key);
+}
+
+#[test]
 fn keys_cover_pixels_geometry_policy_revision_numerics_and_arch() {
     let config = ProcessorConfig::for_family(ImageFamily::Mimo);
     let headers = std::collections::BTreeMap::from([(
