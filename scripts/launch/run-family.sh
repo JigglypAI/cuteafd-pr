@@ -2558,9 +2558,12 @@ audio_encoder_hash=""
   fi
   coordinator_weight_budget_gib="$(jq -er '.resolved_settings.coordinator_weight_budget_gib.value' <<<"$deployment_json")"
   if [[ "$family" == glm5_flash ]]; then
+    resolved_replay_records="$(jq -er '.replay_records | select(. == "own" or . == "shared")' <<<"$deployment_json")" ||
+      release_die "GLM Flash deployment does not name resolved replay records"
     for setting in index_cache draft_linear replay_records; do
       resolved="$(jq -er --arg key "$setting" '.resolved_settings[$key].value' <<<"$deployment_json")"
-      family_args+=("--${setting//_/-}" "$resolved")
+      case "$setting:$resolved" in index_cache:keys|draft_linear:w8a16|replay_records:own) ;;
+        *) family_args+=("--${setting//_/-}" "$resolved") ;; esac
       echo "GLM5_FLASH_${setting^^}=$(jq -r --arg key "$setting" '.resolved_settings[$key].provenance' <<<"$deployment_json") -> $resolved" >&2
     done
   fi

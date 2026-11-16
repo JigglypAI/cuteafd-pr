@@ -1355,6 +1355,55 @@ def _capture_real_planner_launch(snapshot: Path, example: Path, binary: Path,
     return result, deployment
 
 
+def capture_resolver_config_parity(snapshot: Path, example: Path, binary: Path,
+                                   programs: Path, hf_home: Path, temporary: Path) -> None:
+    """Real launcher and direct config plan, identical explicit device inputs."""
+    raw = example.read_text()
+    config = dict(line.split("=", 1) for line in raw.splitlines()
+                  if line and not line.startswith("#") and "=" in line)
+    gpus = int(config["RTX_GPUS"])
+    hub = temporary / "hf/hub"
+    hub.mkdir(parents=True)
+    for model in (config.get("SPECULATOR_MODEL_ID"), "incoai/GLM-5.3-Flash-DFlash2",
+                  "incoai/GLM-5.3-DFlash2", "nvidia/Muse-Spark-Open-816B-A42B-DFlash2"):
+        if model:
+            cache = "models--" + model.replace("/", "--")
+            source = hf_home / "hub" / cache
+            if source.is_dir() and not (hub / cache).exists():
+                (hub / cache).symlink_to(source.resolve(), target_is_directory=True)
+    keys = "\n".join(line for line in raw.splitlines()
+                     if not line.startswith(("MODEL_ID=", "MODEL_REVISION="))) + "\nMODEL_REVISION=\n"
+    output = temporary / "resolver-deployment.json"
+    result = _family_launch_result(temporary, json.loads((snapshot / "config.json").read_text()),
+        "test/resolver-parity", keys, physical_gpus=tuple(range(gpus)), root_launcher=True,
+        cuda_total_bytes=101_973_491_712, gpu_free_mib=98304,
+        checkpoint_source=snapshot, extra_args=("--wip", "real-planner-test"), extra_env={
+            "STUB_REAL_PLANNER": str(binary), "STUB_REAL_SNAPSHOT": str(snapshot),
+            "STUB_REAL_PROGRAMS": str(programs), "STUB_REAL_HF_HOME": str(hf_home),
+            "STUB_REAL_PLAN_OUTPUT": str(output), "CUTEAFD_CDI_CHECK": "off"})
+    assert result.returncode == 0, result.stderr
+    launched = _read_real_deployment(output)
+    plans = [shlex.split(line) for line in result.stderr.splitlines()
+             if " plan " in line and "--deployment" in line]
+    assert len(plans) == 1, result.stderr
+    argv = plans[0]
+    direct = subprocess.run([str(binary), "plan", str(snapshot), "--deployment", "--config", str(example),
+        "--hf-home", str(hf_home), "--workspace-manifest", str(programs),
+        "--gpu-memory-cap", argv[argv.index("--gpu-memory-cap") + 1]],
+        capture_output=True, text=True, timeout=30, env={**os.environ, "HF_HOME": str(hf_home)})
+    assert direct.returncode == 0, direct.stderr
+    planned = json.loads(direct.stdout)
+    for key in launched["resolved_settings"]:
+        assert launched["resolved_settings"][key]["value"] == planned["resolved_settings"][key]["value"], (example.name, key, launched["resolved_settings"], planned["resolved_settings"])
+    for field in ("fits", "onboard_layers"):
+        assert launched["report"][field] == planned["report"][field], (example.name, field, launched["report"][field], planned["report"][field])
+    assert launched["memory_layout"]["pool_tokens"] == planned["memory_layout"]["pool_tokens"], (example.name, launched["memory_layout"]["pool_tokens"], planned["memory_layout"]["pool_tokens"])
+    if example.name == "glm53-flash-exlr8-k4-min.config":
+        assert planned["report"]["onboard_layers"] == 18, planned
+        assert planned["memory_layout"]["pool_tokens"] == 2_097_152, planned
+        assert planned["resolved_settings"]["index_cache"]["value"] == "compact"
+
+
 def capture_glm_real_planner_launch(snapshot: Path, example: Path, binary: Path,
                                     programs: Path, hf_home: Path, temporary: Path) -> None:
     """Exercise shipped config -> real launcher argv -> real CPU Recipe admission."""

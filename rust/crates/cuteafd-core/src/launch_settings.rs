@@ -17,14 +17,14 @@ pub fn selected<T>(explicit: Option<T>, configured: Option<T>, automatic: T, rul
 
 pub fn glmf_index_cache(explicit: Option<&str>, configured: Option<&str>, tp: usize) -> Resolved<String> {
     selected(explicit.filter(|v| !v.is_empty() && *v != "auto").map(str::to_owned),
-        configured.filter(|v| !v.is_empty() && *v != "auto").map(str::to_owned),
+        configured.filter(|_| explicit.is_none()).filter(|v| !v.is_empty() && *v != "auto").map(str::to_owned),
         if tp == 1 { "compact" } else { "keys" }.into(), "compact on TP1; keys otherwise")
 }
 
 pub fn glmf_replay_records(explicit: Option<&str>, configured: Option<&str>, tp: usize,
     auto_pool: bool, spark_experts: bool) -> Resolved<String> {
     selected(explicit.filter(|v| !v.is_empty() && *v != "auto").map(str::to_owned),
-        configured.filter(|v| !v.is_empty() && *v != "auto").map(str::to_owned),
+        configured.filter(|_| explicit.is_none()).filter(|v| !v.is_empty() && *v != "auto").map(str::to_owned),
         if tp == 1 && auto_pool && spark_experts { "shared" } else { "own" }.into(),
         "shared on TP1 with automatic pool and admitted Spark experts; own otherwise")
 }
@@ -36,7 +36,7 @@ pub fn glmf_draft_linear(explicit: Option<&str>, configured: Option<&str>, exter
 
 pub fn glmf_speculator(explicit: Option<&str>, configured: Option<&str>, default_drafter_present: bool) -> Resolved<String> {
     selected(explicit.filter(|v| !v.is_empty() && *v != "auto").map(str::to_owned),
-        configured.filter(|v| !v.is_empty() && *v != "auto").map(str::to_owned),
+        configured.filter(|_| explicit.is_none()).filter(|v| !v.is_empty() && *v != "auto").map(str::to_owned),
         if default_drafter_present { "dflash2" } else { "off" }.into(),
         "DFlash2 when the default drafter is available; off otherwise")
 }

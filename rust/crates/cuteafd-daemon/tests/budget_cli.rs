@@ -905,6 +905,28 @@ fn installed_example_memory_args_share_launcher_profile_and_weight_budget() {
     }
 }
 
+#[test]
+fn installed_launcher_and_direct_config_resolver_parity() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
+    let hf_home = require_installed_hf_home("installed_launcher_and_direct_config_resolver_parity",
+        std::env::var_os("CUTEAFD_DEPLOYMENT_TEST_HF_HOME"));
+    let programs = installed_example_programs(std::env::var_os("CUTEAFD_DEPLOYMENT_TEST_PROGRAMS").map(Into::into),
+        &std::path::PathBuf::from(std::env::var_os("HOME").expect("HOME")));
+    let matrix: serde_json::Value = serde_json::from_slice(&std::fs::read(root.join("benchmarks/current-matrix.json")).unwrap()).unwrap();
+    let retired = retired_configs(&matrix);
+    let mut examples = std::fs::read_dir(root.join("examples/configs")).unwrap()
+        .map(|entry| entry.unwrap().path()).filter(|path| path.extension().is_some_and(|v| v == "config")
+            && !retired.contains(path.strip_prefix(&root).unwrap().to_str().unwrap())).collect::<Vec<_>>();
+    examples.sort();
+    for example in examples {
+        let raw = std::fs::read_to_string(&example).unwrap();
+        let config = raw.lines().filter_map(|line| line.split_once('=')).collect::<std::collections::BTreeMap<_, _>>();
+        let snapshot = require_installed_snapshot(example.to_str().unwrap(), config["MODEL_ID"], config.get("MODEL_REVISION").copied(), &hf_home);
+        eprintln!("resolver parity: {}", example.display());
+        installed_real_planner_launch(&root, "capture_resolver_config_parity", &snapshot, &example, &programs, &hf_home);
+    }
+}
+
 fn run_installed_example_deployments(hf_home: Option<std::ffi::OsString>,
     programs_override: Option<std::path::PathBuf>, home: &std::path::Path,
     root: &std::path::Path) {

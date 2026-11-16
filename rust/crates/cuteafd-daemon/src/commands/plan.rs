@@ -205,10 +205,18 @@ fn resolved_output(mut value: serde_json::Value, args: &PlanArgs, mut settings: 
         settings.insert("replay_records".into(), setting(replay));
     }
     value["resolved_settings"] = serde_json::to_value(settings).expect("settings serialization");
+    let report = value.get("report").unwrap_or(&value);
+    let owner_items = report.pointer("/memory_layout/devices").and_then(serde_json::Value::as_array)
+        .into_iter().flatten().map(|device| serde_json::json!({
+            "kind": device["kind"], "index": device["index"],
+            "owners": device["items"].as_array().into_iter().flatten()
+                .filter(|item| item["category"] == "runtime" || item["category"] == "reserved")
+                .cloned().collect::<Vec<_>>() })).collect::<Vec<_>>();
     value["planning_inputs"] = serde_json::json!({
         "device_capacity_bytes": coordinator_bytes(args),
         "device_capacity_source": if args.memory.policy().gpu_cap.is_some() { "explicit: --gpu-memory-cap" } else { "simulated: RTX PRO 6000 CUDA total" },
         "measured_owners": "planner estimates; no live CUDA/context or fabric probe",
+        "runtime_owner_items": owner_items,
         "physical_sms": args.physical_sms,
     });
     value
@@ -236,8 +244,10 @@ fn resolve_config(args: &mut PlanArgs, cfg: &std::collections::BTreeMap<String, 
     configured!(prefill_rows, "PREFILL_ROWS");
     if args.pool_tokens.is_none() { args.pool_tokens = get("POOL_TOKENS").filter(|v| *v != "auto").map(|v| v.parse().context("POOL_TOKENS")).transpose()?; }
     if args.exlr8_manifest.is_none() { args.exlr8_manifest = get("EXLR8_MANIFEST").cloned(); }
+    if args.exlr8_prefill_activations.is_none() { args.exlr8_prefill_activations = get("EXLR8_PREFILL_ACTIVATIONS").map(|v| v.parse().context("EXLR8_PREFILL_ACTIVATIONS")).transpose()?; }
+    if args.chat_template_from.is_none() { args.chat_template_from = get("CHAT_TEMPLATE_FROM").cloned(); }
     if !args.explicit_settings.contains("core_view") {
-        if let Some(value) = get("CORE_VIEW") { args.attention.core_view = value.parse().map_err(anyhow::Error::msg)?; }
+        if let Some(value) = get("CORE_VIEW") { args.attention.core_view = value.parse()?; }
     }
     if args.kv_format.is_none() { args.kv_format = get("KV_CACHE").map(|v| v.parse().map_err(anyhow::Error::msg)).transpose()?; }
     if !args.explicit_settings.contains("vision") { if let Some(value) = get("VISION") { args.vision = value.parse().map_err(anyhow::Error::msg)?; } }
@@ -426,12 +436,21 @@ fn run_plan_with_host(mut args: PlanArgs) -> Result<()> {
     } else if cuteafd_loader::plan::exlr8::recognizes(&snapshot)? {
         cuteafd_loader::plan::exlr8::architecture(&family_config)?
     } else {
-        let checkpoint = cuteafd_loader::plan::Checkpoint::inventory_view(&view)?;
-        cuteafd_loader::plan::family::detect(&checkpoint).context("unsupported checkpoint family")?.id()
+        let checkpoint = cuteafd_loader::plan::Checkpoint { view: None, snapshot: snapshot.clone(),
+            config: family_config.clone(), quantize_config: None, weight_map: Default::default(),
+            tensors: vec![], missing_shards: vec![], shard_bytes: 0 };
+        cuteafd_loader::plan::family::detect(&checkpoint).map_or("", |family| family.id())
     };
+    let requested_speculator = args.speculator.clone();
     resolve_speculator(&mut args, &snapshot, family, &cfg)?;
     let replay_explicit = args.replay_records;
-    let settings = resolve_settings(&mut args, family, &cfg)?;
+    let mut settings = resolve_settings(&mut args, family, &cfg)?;
+    if family == "glm5_flash" {
+        let home = args.hf_home.clone().unwrap_or_else(default_hf_home);
+        settings.insert("speculator".into(), setting(cuteafd_core::launch_settings::glmf_speculator(
+            (requested_speculator != "auto" || args.explicit_settings.contains("speculator")).then_some(requested_speculator.as_str()), cfg.get("SPECULATOR").map(String::as_str),
+            cuteafd_loader::model_cache_dir(&home, GLMF_DEFAULT_DRAFTER).is_dir())));
+    }
     if args.resolve_settings_only {
         let mut output = resolved_output(serde_json::json!({"family": family}), &args, settings, &cfg, replay_explicit);
         output["speculator"] = serde_json::json!(args.speculator);
@@ -709,7 +728,7 @@ fn resolve_speculator(args: &mut PlanArgs, snapshot: &std::path::Path, family: &
     if family == "glm5_flash" && !args.no_speculator {
         let hf_home = args.hf_home.clone().unwrap_or_else(default_hf_home);
         let available = cuteafd_loader::model_cache_dir(&hf_home, GLMF_DEFAULT_DRAFTER).is_dir();
-        args.speculator = cuteafd_core::launch_settings::glmf_speculator(Some(&args.speculator),
+        args.speculator = cuteafd_core::launch_settings::glmf_speculator((args.speculator != "auto" || args.explicit_settings.contains("speculator")).then_some(args.speculator.as_str()),
             cfg.get("SPECULATOR").map(String::as_str), available).value;
     }
     if args.speculator == "auto" {
