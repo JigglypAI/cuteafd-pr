@@ -129,6 +129,8 @@ pub enum SparkRecipeRefusal {
     Deprecated { package: String, world: usize, worlds: Vec<usize> },
     #[error("unknown Spark package recipe: {0}")]
     UnknownPackage(String),
+    #[error("mixed Spark packages {package} require incompatible row ownership at TP{world}")]
+    IncompatiblePackages { package: String, world: usize },
     #[error("{0}")]
     Placement(cuteafd_core::tp_units::UnitMapError),
 }
@@ -199,6 +201,17 @@ use cuteafd_core::tp_units::package_width_keys;
 /// Package availability is separate from the CPU-qualified transport range.
 pub fn spark_recipe(package: &str, intermediate: usize, world: usize) -> Result<SparkRecipe, SparkRecipeRefusal> {
     use crate::formats::fp8_experts::Slicing;
+    if package.contains(" + ") {
+        let mut packages = package.split(" + ");
+        let first = spark_recipe(packages.next().expect("nonempty package list"), intermediate, world)?;
+        for key in packages {
+            let other = spark_recipe(key, intermediate, world)?;
+            if !first.same_ownership(&other) {
+                return Err(SparkRecipeRefusal::IncompatiblePackages { package: package.into(), world });
+            }
+        }
+        return Ok(first);
+    }
     let key = package.split_whitespace().next().unwrap_or(package);
     let (family, format) = key.split_once(':').ok_or_else(|| SparkRecipeRefusal::UnknownPackage(package.into()))?;
     let native = matches!(family, "v41" | "dsv4f" | "dsv4p");
@@ -528,6 +541,21 @@ mod tests {
             let (family, format) = package.split_once(':').unwrap();
             assert!(frozen_admitted_worlds(family, format).is_none());
         }
+    }
+
+    #[test]
+    fn mixed_quantization_blocks_validate_every_package_and_row_range() {
+        let packages = "inkling2:mxfp8 + inkling2:nvfp4a4";
+        let mxfp8 = spark_recipe("inkling2:mxfp8", 2304, 6).unwrap();
+        let nvfp4 = spark_recipe("inkling2:nvfp4a4", 2304, 6).unwrap();
+        assert_ne!(mxfp8.slicing, nvfp4.slicing);
+        assert!(mxfp8.same_ownership(&nvfp4));
+        assert_eq!(spark_recipe(packages, 2304, 6).unwrap(), mxfp8);
+        assert_eq!(spark_recipe("inkling2:nvfp4a4 + inkling2:mxfp8", 2304, 6).unwrap(), nvfp4);
+        assert!(matches!(spark_recipe("inkling2:mxfp8 + unknown:missing", 2304, 6),
+            Err(SparkRecipeRefusal::UnknownPackage(_))));
+        assert!(matches!(spark_recipe(packages, 2304, 5),
+            Err(SparkRecipeRefusal::IncompatiblePackages { world: 5, .. })));
     }
 
     #[test]
