@@ -315,6 +315,9 @@ impl<'a> GlmEngine<'a> {
                 let Some(cache) = cache else { return Ok(None) };
                 let own = &e.context.as_ref().context("context split")?.ranks[rank];
                 e.index_producer(rank, w, self.index, self.layer, self.rows, "m64", cache.buffer)?;
+                let admitted = e.context.as_ref().context("context split")?.admitted_pages;
+                ensure!(admitted as u64 == cuteafd_core::coordinator_programs::scored_decode::admitted_pages(
+                    e.max_context as u64, 64), "selector deployment capacity changed after admission");
                 let k = e.cfg.index_topk;
                 let candidates = Candidates { scores: own.candidates.buffer.ptr,
                     indices: view(&own.candidates, DECODE_ROWS * k * 4, self.t * k * 4)?.ptr };
@@ -325,7 +328,7 @@ impl<'a> GlmEngine<'a> {
                     ("indices", candidates.indices.cast_mut()), ("scores", candidates.scores.cast_mut()),
                     ("scratch", own.topk_scratch.buffer.ptr)],
                     &[self.rows, width, width, Scalar::I32(2), Scalar::I32(rank as i32),
-                        Scalar::I32(e.context.as_ref().unwrap().admitted_pages)])?;
+                        Scalar::I32(admitted)])?;
                 Ok(Some(candidates))
             }
             fn merge(&mut self, scores: *mut c_void, indices: *mut c_void) -> Result<()> {

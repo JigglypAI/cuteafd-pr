@@ -342,7 +342,7 @@ pub struct KimiIndexSelection {
 pub struct KimiIndexTopK<'a> {
     program: Program<'a>, rows: usize, pages: usize, mode: KimiIndexMode,
     scored: bool, runtime_sms: Option<i32>, scratch: usize,
-    admitted_pages: Option<i32>,
+    admitted_pages: std::cell::Cell<Option<i32>>,
 }
 impl<'a> KimiIndexTopK<'a> {
     pub fn load(programs: &'a Programs<'a>, rows: usize, pages: usize, mode: KimiIndexMode,
@@ -354,8 +354,18 @@ impl<'a> KimiIndexTopK<'a> {
             .map(|n| i32::try_from(n).map_err(|_| KimiMlaError::Invalid("index selector SM count"))).transpose()?;
         Ok(Self { program: programs.program(&name, if context { SCORED_TOPK } else { INDEX_TOPK })?,
             rows, pages, mode, scored: context, runtime_sms, scratch,
-            admitted_pages: (context && mode == KimiIndexMode::Decode).then_some(pages.div_ceil(2) as i32) })
+            admitted_pages: std::cell::Cell::new(None) })
     }
+    /// Bind once before graph capture. All later launches use this deployment bound.
+    pub fn bind_admitted_pages(&self, pages: usize) -> Result<()> {
+        if !self.scored || self.mode != KimiIndexMode::Decode || pages == 0 || pages > self.pages
+            || self.admitted_pages.get().is_some_and(|prior| prior as usize != pages) {
+            return Err(KimiMlaError::Invalid("immutable scored decode admitted pages"));
+        }
+        self.admitted_pages.set(Some(pages as i32));
+        Ok(())
+    }
+
     pub fn scratch_bytes(&self) -> usize { self.scratch }
 
     /// Table entries and causal frontiers are device metadata owned by the lane.
@@ -363,14 +373,17 @@ impl<'a> KimiIndexTopK<'a> {
     pub fn launch(&self, b: KimiIndexSelection, stream: *mut c_void) -> Result<()> {
         validate_topk_batch(b, self.rows, self.pages, self.mode, self.scored, self.scratch)?;
         if self.scored {
+            let admitted = if self.mode == KimiIndexMode::Decode {
+                self.admitted_pages.get().ok_or(KimiMlaError::Invalid("scored decode capacity not bound"))?
+            } else { 0 };
             // SAFETY: writer aliases and extents checked; (2, rank) selects one
             // parity half through the compact table, (1, 0) the whole cache.
             unsafe { self.program.launch(&[b.query_fp8.ptr, b.head_weights.ptr, b.cache.ptr, b.table.ptr,
                 b.lengths.ptr, b.indices.ptr, b.scores.ptr, b.scratch.ptr],
                 &[Scalar::I32(b.rows as i32), Scalar::I32(b.table_width as i32),
                   Scalar::I32(b.table_stride as i32), Scalar::I32(b.page_stride as i32),
-                  Scalar::I32(b.page_offset as i32), Scalar::I32(self.admitted_pages.unwrap_or(0))]
-                    [..if self.admitted_pages.is_some() { 6 } else { 5 }], stream)?; }
+                  Scalar::I32(b.page_offset as i32), Scalar::I32(admitted)]
+                    [..if self.mode == KimiIndexMode::Decode { 6 } else { 5 }], stream)?; }
         } else {
             let scalars = [Scalar::I32(b.rows as i32), Scalar::I32(b.table_width as i32),
                 Scalar::I32(b.table_stride as i32), Scalar::I32(self.runtime_sms.unwrap_or(0))];
@@ -1704,7 +1717,7 @@ mod tests {
                 let pointers = if scored { SCORED_TOPK } else { INDEX_TOPK };
                 let spec = ProgramSpec { name: "topk".into(), capacity_rows: 64,
                     pointers: pointers.iter().map(|s| (*s).into()).collect(),
-                    scalar_kinds: if scored { b"iiiii".to_vec() } else if runtime { b"iiii".to_vec() } else { b"iii".to_vec() },
+                    scalar_kinds: if scored && mode == KimiIndexMode::Decode { b"iiiiii".to_vec() } else if scored { b"iiiii".to_vec() } else if runtime { b"iiii".to_vec() } else { b"iii".to_vec() },
                     scratch: [("scratch".into(),4096)].into_iter().collect(),
                     geometry: serde_json::json!({"topk":2048,"heads":32,"max_rows":64,
                         "max_pages":16384,"mode":mode.name(),"runtime_sm_count":runtime}) };

@@ -338,6 +338,9 @@ impl<'a> Engine<'a> {
                 let m = &self.lane.tables;
                 e.index_produce(rank, self.weights, m, w, e.attention_rope(rank, 4), self.rows, self.cap)?;
                 let own = &e.context()?.ranks[rank];
+                let admitted = e.context()?.admitted_pages;
+                ensure!(admitted as u64 == cuteafd_core::coordinator_programs::scored_decode::admitted_pages(
+                    e.max_context as u64, 256), "selector deployment capacity changed after admission");
                 let k = e.cfg.index_topk;
                 let indices = view(&own.candidates, e.decode_rows * k * 4, self.t * k * 4)?.ptr;
                 let (_, index) = e.c4_pools(rank, self.layer)?;
@@ -346,7 +349,7 @@ impl<'a> Engine<'a> {
                     ("table", m.c4_page_table.buffer.ptr), ("lengths", m.c4_visible.buffer.ptr), ("indices", indices),
                     ("scores", own.candidates.buffer.ptr), ("scratch", own.topk_scratch.buffer.ptr)],
                     &[self.rows, Scalar::I32(self.width()), Scalar::I32(self.stride()), Scalar::I32(2),
-                        Scalar::I32(rank as i32), Scalar::I32(e.context()?.admitted_pages)])?;
+                        Scalar::I32(rank as i32), Scalar::I32(admitted)])?;
                 Ok(Some(Candidates { scores: own.candidates.buffer.ptr, indices }))
             }
             fn merge(&mut self, scores: *mut c_void, indices: *mut c_void) -> Result<()> {

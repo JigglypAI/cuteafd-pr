@@ -705,6 +705,9 @@ impl<'a> LocalLane<'a> {
             "Kimi context binding requires admitted parity cache on the single target lane before capture");
         owner.ranks[self.rank].check_reader(self.stream())?;
         ensure!(owner.ranks[self.rank].extent() == self.max_context(), "Kimi context binding extent differs");
+        if let Some(dsa) = &self.programs.dsa {
+            dsa.scored[0].bind_admitted_pages(owner.ranks[self.rank].compact_width())?;
+        }
         self.context = Some((owner, programs));
         Ok(())
     }
