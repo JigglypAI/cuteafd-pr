@@ -792,7 +792,7 @@ mod metadata_tests {
     }
 
     #[test]
-    fn exact_k32_slices_require_mxfp4_and_balanced_unit_widths() {
+    fn exact_native_slices_follow_each_formats_balanced_unit_widths() {
         for input in [1, 7] {
             for (tp, width) in [(6, 256), (6, 320), (6, 352), (6, 384),
                 (3, 640), (3, 672), (3, 704), (3, 768)] {
@@ -820,8 +820,25 @@ mod metadata_tests {
                 w[0] = 6 | format << 8 | 1 << 16 | 1 << 24;
                 w[2] = width;
                 w[6] = tp;
-                assert!(Fp8MoeInfo::from_words(w).is_err());
+                let unit = cuteafd_core::tp_units::native_format_unit(if format == 4 { "nvfp4" } else { "fp8" });
+                let blocks = w[5] / unit as u32;
+                let valid = width == blocks / tp * unit as u32 || width == blocks.div_ceil(tp) * unit as u32;
+                assert_eq!(Fp8MoeInfo::from_words(w).is_ok(), valid, "format{format} TP{tp} width{width}");
             }
+        }
+    }
+
+    #[test]
+    fn native_metadata_refuses_partial_microscale_slices() {
+        for (format, activation, input, width) in [(2, 1, 1, 336), (4, 1, 1, 344),
+            (6, 4, 7, 336), (7, 4, 1, 344)] {
+            let mut w = words();
+            w[0] = 6 | format << 8 | activation << 16 | 1 << 24;
+            w[2] = width;
+            w[6] = 6;
+            w[7] = input;
+            assert!(Fp8MoeMetadata::from_words_and_scratch(w, |_| panic!("partial native block queried scratch")).is_err(),
+                "format{format} width{width}");
         }
     }
 
