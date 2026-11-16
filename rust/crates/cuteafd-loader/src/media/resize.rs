@@ -66,13 +66,15 @@ pub enum Resample {
     #[default]
     Bicubic,
     Lanczos,
+    Bilinear,
 }
 impl Resample {
     pub fn is_bicubic(&self) -> bool { *self == Self::Bicubic }
-    fn support(self) -> f64 { match self { Self::Bicubic => 2.0, Self::Lanczos => 3.0 } }
+    fn support(self) -> f64 { match self { Self::Bicubic => 2.0, Self::Lanczos => 3.0, Self::Bilinear => 1.0 } }
     fn filter(self, x: f64) -> f64 {
         match self {
             Self::Bicubic => bicubic(x),
+            Self::Bilinear => (1.0-x.abs()).max(0.0),
             Self::Lanczos => {
                 if !(-3.0..3.0).contains(&x) { return 0.0; }
                 fn sinc(x: f64) -> f64 {
@@ -272,6 +274,13 @@ fn horizontal_row(s: &[u8], d: &mut [u8], c: &Coeffs) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bilinear_uint8_matches_pillow_crop_source_boundary() {
+        let image=RgbImage {width:7,height:5,data:(0..7*5*3).map(|i| ((i*17+3)%256) as u8).collect()};
+        assert_eq!(resize(&image,3,2,Resample::Bilinear).data,
+            [99,116,133,108,122,139,118,112,129,126,126,143,143,116,133,148,122,139]);
+    }
 
     #[test]
     fn rgba_bicubic_preserves_pillow_premultiply_boundaries() {

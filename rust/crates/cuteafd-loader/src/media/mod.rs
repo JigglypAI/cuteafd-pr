@@ -398,6 +398,7 @@ impl ProcessorConfig {
         hash.update(match self.resample {
             Resample::Bicubic => b"cuteafd-preprocess-v1:pillow-bicubic".as_slice(),
             Resample::Lanczos => b"cuteafd-preprocess-v1:pillow-lanczos".as_slice(),
+            Resample::Bilinear => b"cuteafd-preprocess-v1:pillow-bilinear".as_slice(),
         });
         hash.update(serde_json::to_vec(self).expect("processor parameters serialize"));
         PreprocessId(hash.finalize().into())

@@ -57,6 +57,36 @@ impl StepImagePlan {
         Ok(plan)
     }
     pub fn feature_rows(&self) -> Option<usize> {self.windows.len().checked_mul(81)?.checked_add(169)}
+
+    /// Sources for the owner-side tensor pipeline: preserve the official
+    /// intermediate PIL uint8 bilinear cap/crop, never resize to728/504 here.
+    pub fn sources(&self,image:super::RgbImage) -> Result<Vec<super::RgbImage>> {
+        if [image.width,image.height]!=self.source || image.data.len()!=image.width as usize*image.height as usize*3 {
+            return Err(invalid("Step crop source differs from planned RGB dimensions"));
+        }
+        if u64::from(self.padded[0])*u64::from(self.padded[1])>64<<20 {
+            return Err(invalid("Step padded source exceeds admitted64megapixel canvas"));
+        }
+        let mut padded=vec![0;self.padded[0] as usize*self.padded[1] as usize*3];
+        for row in 0..image.height as usize {
+            let start=row*self.padded[0] as usize*3;
+            padded[start..start+image.width as usize*3].copy_from_slice(&image.data[row*image.width as usize*3..(row+1)*image.width as usize*3]);
+        }
+        let padded=super::RgbImage {width:self.padded[0],height:self.padded[1],data:padded};
+        let global=super::resize::resize(&padded,self.capped[0],self.capped[1],super::Resample::Bilinear);
+        let canvas=super::resize::resize(&global,self.crop_canvas[0],self.crop_canvas[1],super::Resample::Bilinear);
+        let mut views=Vec::with_capacity(self.windows.len()+1);
+        for [x,y,width,height] in self.windows.iter().copied() {
+            let mut data=vec![0;width as usize*height as usize*3];
+            for row in 0..height as usize {
+                let source=((y as usize+row)*canvas.width as usize+x as usize)*3;
+                data[row*width as usize*3..(row+1)*width as usize*3].copy_from_slice(&canvas.data[source..source+width as usize*3]);
+            }
+            views.push(super::RgbImage {width,height,data});
+        }
+        views.push(global);
+        Ok(views)
+    }
 }
 
 #[cfg(test)]
