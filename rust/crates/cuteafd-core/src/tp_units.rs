@@ -26,6 +26,16 @@ pub fn spark_package_entry(key: &str) -> &'static serde_json::Value {
         "../../../../scripts/build/spark-package-ranges.json")).expect("checked package ranges"))["entries"][key]
 }
 
+/// Native microscale/storage blocks, independent of a world's ownership policy.
+/// An ownership unit may combine these blocks, never split one.
+pub fn native_format_unit(format: &str) -> usize {
+    match format {
+        "nvfp4" | "nvfp4a4" => 16,
+        "mxfp4" | "mxfp8" => 32,
+        _ => 128,
+    }
+}
+
 /// Checkpoint-native source units and explicitly exported exact-storage worlds.
 /// The same JSON record is consumed by Python package/export tooling.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]

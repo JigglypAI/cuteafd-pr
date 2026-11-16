@@ -132,17 +132,22 @@ impl Fp8MoeInfo {
                 _ => Fp8MoeWeights::Nvfp4Dynamic,
             },
         };
-        // Legacy packages store H128 exact or padded slices. Native MXFP4 may
-        // additionally store exact K32 units; recipe validation narrows support.
+        // Legacy H128 padding remains valid. Exact native widths follow the
+        // same format blocks as the loader; installed recipe checks narrow worlds.
         let exact = |unit: usize| {
             let blocks = info.intermediate / unit;
             info.intermediate % unit == 0 && info.tp > 0 && blocks >= info.tp
                 && (info.slice == blocks / info.tp * unit || info.slice == blocks.div_ceil(info.tp) * unit)
         };
+        let native_unit = cuteafd_core::tp_units::native_format_unit(match info.weights {
+            Fp8MoeWeights::Mxfp4 => "mxfp4", Fp8MoeWeights::Mxfp8 => "mxfp8",
+            Fp8MoeWeights::Nvfp4 | Fp8MoeWeights::Nvfp4Dynamic => "nvfp4",
+            Fp8MoeWeights::Fp8 => "fp8", Fp8MoeWeights::Bf16 => "bf16",
+        });
         let sliced = (info.slice % 128 == 0 && info.slice >= 128
             && (exact(128) || (info.slice * info.tp >= info.intermediate
                 && (info.slice - 128) * info.tp < info.intermediate)))
-            || (info.weights == Fp8MoeWeights::Mxfp4 && exact(32));
+            || exact(native_unit);
         ensure!(info.tp > 0 && sliced && info.hidden > 0 && info.hidden % 128 == 0
             && info.experts > 0 && (1..=16).contains(&info.topk)
             && info.swiglu_limit.is_finite() && info.swiglu_limit >= 0.0
@@ -863,6 +868,23 @@ mod inkling_tests {
         [6 | format << 8 | 4 << 16 | 1 << 24, 4608, 2304, 384, 8, 2304, 1,
             if wire { 7 } else { 1 }, 0, 2, 16, 4096, 0, 0, 0, 0, 1f32.to_bits(), 0]
     }
+    #[test]
+    fn exact_native_tp4_widths_follow_shared_format_blocks() {
+        for (storage, wire) in [(6, true), (7, false), (4, false)] {
+            let mut words = native(storage, wire);
+            if storage == 4 { words[0] = 6 | storage << 8 | 1 << 16 | 1 << 24; }
+            words[2] = 576;
+            words[6] = 4;
+            let info = Fp8MoeInfo::from_words(words).unwrap();
+            assert_eq!((info.slice, info.tp), (576, 4));
+            for invalid in [575, 577] {
+                let mut wrong = words;
+                wrong[2] = invalid;
+                assert!(Fp8MoeInfo::from_words(wrong).is_err(), "storage{storage} slice{invalid}");
+            }
+        }
+    }
+
     #[test]
     fn inkling_storage_activation_and_input_are_one_native_contract() {
         for (storage, wire, expected) in [(6, true, Fp8MoeWeights::Mxfp8),

@@ -128,12 +128,10 @@ impl ExpertFormat {
 
     /// Values per scale along K: 128 (FP8 blocks), 32 (MXFP4), 16 (NVFP4).
     pub fn group(self) -> usize {
-        match self {
-            Self::Fp8Block128 => 128,
-            Self::Mxfp4 | Self::Mxfp8 => 32,
-            Self::Nvfp4 => 16,
-            Self::Bf16 => 128,
-        }
+        cuteafd_core::tp_units::native_format_unit(match self {
+            Self::Fp8Block128 => "fp8", Self::Mxfp4 => "mxfp4", Self::Mxfp8 => "mxfp8",
+            Self::Nvfp4 => "nvfp4", Self::Bf16 => "bf16",
+        })
     }
 }
 
