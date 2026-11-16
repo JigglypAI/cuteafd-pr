@@ -953,6 +953,12 @@ impl<'a> DsparkDrafter<'a> {
         if let Some(split)=&self.head_split {
             split.reduced.inventory(&mut inventory,"tp2.reduced")?;
             split.peer.device.run(||split.peer_reduced.inventory(&mut inventory,"peer.tp2.reduced"))?;
+            let mut transport=receipts::Inventory::new(devices,prefix,
+                Lifetime { first:Phase::DraftLoad,last:Phase::Growth },Category::Transport,"block dSpark private exchange");
+            for (rank,name,buffer) in split.exchange.allocation_buffers() {
+                transport.device(&format!("tp2.exchange.{rank}.{name}"),buffer)?;
+            }
+            inventory.receipts.extend(transport.receipts);
             inventory.receipts.extend(split.peer.device.run(||split.peer.runtime_receipts(devices,&format!("{prefix}.peer")))?);
         }
         Ok(inventory.receipts)
@@ -1935,6 +1941,16 @@ mod tests {
                 let reduction=receipts.iter().filter(|r|r.allocation.location==Location::coordinator(rank as u8)
                     && r.allocation.view.is_none() && r.allocation.id.ends_with("tp2.reduced")).collect::<Vec<_>>();
                 assert_eq!(reduction.len(),1); assert_eq!(reduction[0].allocation.bytes,layouts[rank].reduction_bytes as u64);
+                let exchange=receipts.iter().filter(|r|r.allocation.location==Location::coordinator(rank as u8)
+                    && r.allocation.view.is_none() && r.allocation.id.contains("tp2.exchange.")).collect::<Vec<_>>();
+                assert_eq!(exchange.len(),layouts[rank].exchange_buffers.len());
+                assert!(exchange.iter().all(|r|r.allocation.category==cuteafd_core::memory_layout::Category::Transport));
+                assert_eq!(exchange.iter().map(|r|r.allocation.bytes).sum::<u64>(),
+                    layouts[rank].exchange_buffers.iter().map(|(_,n)|*n as u64).sum::<u64>());
+                let actual=receipts.iter().filter(|r|r.allocation.location==Location::coordinator(rank as u8)
+                    && r.allocation.view.is_none()).map(|r|r.allocation.bytes).sum::<u64>();
+                let planned=layouts[rank].weights.bytes() as u64+layouts[rank].demands(rank as u8).iter().map(|d|d.bytes).sum::<u64>();
+                assert_eq!(actual,planned,"rank {rank}, lead {lead}, KV {kv}: every physical backing must be charged once");
             }
             draft.drain()?;
         } }

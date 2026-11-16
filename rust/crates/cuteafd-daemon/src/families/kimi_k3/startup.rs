@@ -169,6 +169,18 @@ pub(crate) fn load<'a, const RANKS: usize>(library: &'a Arc<cuteafd_ffi::NativeL
         Ok([MlaDraft::load(programs, "kimik3", MlaDraftWindow::Full, options.cache_format)?,
             MlaDraft::load(programs, "kimik3", MlaDraftWindow::Sliding4096, options.cache_format)?])
     })).transpose()?;
+    let _block_projection_modules=if let Some(layout)=&draft_layout {
+        use cuteafd_loader::families::kimi_k3::draft::DraftLayout;
+        let locals=match layout {
+            DraftLayout::Block(local)=>vec![(head,local)],
+            DraftLayout::BlockTp2 { ranks,.. }=>ranks.iter().enumerate().collect(),
+            DraftLayout::Mla(_)=>Vec::new(),
+        };
+        locals.into_iter().map(|(rank,local)|devices[rank].run(|| {
+            let rows=2048usize.max(local.capacity.block_rows).max(programs.capacities().decode_rows.unwrap_or(0));
+            Ok(cuteafd_ffi::draft_projection::DraftProjections::load(programs,&local.projection_shapes(),rows)?)
+        })).collect::<Result<Vec<_>>>()?
+    } else { Vec::new() };
     memory.sample("modules-draft-mla")?;
     let _draft_context_modules = if draft_layout.as_ref().is_some_and(|layout| layout.context_split()) {
         use cuteafd_ffi::mla_draft::{MlaDraftPartial, MlaDraftCombine, MlaDraftWindow};

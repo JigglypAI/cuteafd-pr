@@ -212,6 +212,18 @@ impl BlockDsparkRuntimeLayout {
         Ok(layout)
     }
 
+    pub fn projection_shapes(&self)->Vec<(usize,usize)> {
+        let c=&self.config;
+        let (h,q,kv)=(c.hidden,c.heads*c.head_dim,c.kv_heads*c.head_dim);
+        vec![(c.taps.len()*h,h),(h,q+2*kv),(h,2*kv),(q,h),(h,2*c.intermediate),(c.intermediate,h)]
+    }
+
+    pub fn validate_projection_programs(&self,manifest:&serde_json::Value)->anyhow::Result<Vec<String>> {
+        let rows=2048usize.max(self.capacity.block_rows).max(64);
+        self.projection_shapes().into_iter().map(|(k,n)|Ok(cuteafd_ffi::draft_projection::validate_package_geometry(
+            manifest,k,n,rows)?)).collect()
+    }
+
     pub fn window_mark_bytes(&self) -> anyhow::Result<usize> {
         use anyhow::Context;
         let window = self.config.window.context("block runtime window missing")?;

@@ -312,6 +312,13 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
                 usize::try_from(context)?,slots.checked_mul(usize::try_from(context)?).context("draft pool overflow")?,
                 opts.physical_sms.unwrap_or(188) as usize,0,opts.mla_kv)?.with_context_split(opts.tp2_dflash)?)
         };
+        match &layout {
+            DraftLayout::Block(local)=>{ local.validate_projection_programs(manifest.as_ref().context("block dSpark requires installed projection inventory")?)?; }
+            DraftLayout::BlockTp2 { ranks,.. }=>{ for local in ranks.iter() {
+                local.validate_projection_programs(manifest.as_ref().context("block TP2 requires installed projection inventory")?)?;
+            } }
+            DraftLayout::Mla(_)=>{}
+        }
         anyhow::ensure!(layout.target_hidden() == cfg.hidden && layout.target_vocab() == cfg.vocab_size
             && layout.target_taps().iter().all(|&layer| layer < cfg.layers),
             "Kimi drafter target geometry differs from checkpoint");
