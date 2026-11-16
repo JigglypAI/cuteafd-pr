@@ -84,7 +84,7 @@ impl NativeDsparkLayout {
 
 /// Physical owners of the shared Qwen3 block executor, excluding target taps/head.
 /// Window rings are fixed by checkpoint geometry, independent of the target pool.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct BlockDsparkRuntimeLayout {
     pub config: BlockDsparkConfig,
     pub weight_requests: Vec<(String, usize)>,

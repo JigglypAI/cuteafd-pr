@@ -95,8 +95,13 @@ impl<'a> CommonDraft<'a> {
         *frontiers.borrow_mut().get_mut(slot).context("block draft restore slot outside admission")?=(origin,end);
         Ok(())
     }
-    pub fn mla_window_segments(&self,slot:usize)->Result<Vec<CuteafdDeviceBuffer>> {
-        match self { Self::Mla(d)=>d.mla_window_segments(slot),Self::Block { draft:d,.. }=>d.window_planes(slot) }
+    pub fn mla_window_segments(&self,slot:usize)->Result<Vec<cuteafd_hostcache::copy::DeviceRange>> {
+        match self { Self::Mla(d)=>d.mla_window_segments(slot),Self::Block { draft:d,.. }=>
+            d.window_planes(slot).map(|planes|planes.into_iter().map(crate::shared::prefix::cuda_copy::range).collect()) }
+    }
+    pub fn block_window_planes(&self,slot:usize)->Result<Vec<CuteafdDeviceBuffer>> {
+        let Self::Block { draft,.. }=self else { anyhow::bail!("expected block window planes") };
+        draft.window_planes(slot)
     }
     pub fn mla_snapshot_buffers(&self)->Result<Vec<CuteafdDeviceBuffer>> {
         match self { Self::Mla(d)=>d.mla_snapshot_buffers(),Self::Block { draft:d,.. }=>

@@ -412,7 +412,7 @@ impl<'a> NativeDraft<'a> {
         self.drain()?;
         self.owners.draft.device.run(|| {
             if !self.common().is_block() { return self.common().copy_mla_windows(slot,&marks,capture); }
-            let live=self.common().mla_window_segments(slot)?;
+            let live=self.common().block_window_planes(slot)?;
             ensure!(marks.len()==live.len()+1,"block draft mark geometry differs");
             let library=self.device().library;
             let (origin,end)=self.frontier(slot)?;

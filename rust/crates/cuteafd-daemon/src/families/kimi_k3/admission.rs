@@ -1856,8 +1856,10 @@ pub(super) mod tests {
             assert_eq!(admitted.check_draft(1)?, &layout);
             let allocated = admitted.allocate_draft_with(1, |owned| {
                 assert_eq!(owned, layout);
+                let DraftLayout::Mla(owned)=owned else { anyhow::bail!("fixture requires MLA draft") };
                 owned.allocate_with(|buffer| Ok((buffer.name.clone(), buffer.bytes)))
             })?;
+            let DraftLayout::Mla(layout)=layout else { anyhow::bail!("fixture requires MLA draft") };
             assert_eq!(allocated.iter().map(|(_, bytes)| *bytes as u64).sum::<u64>(), layout.buffer_bytes()?);
             assert!(admitted.check_draft(1).is_err());
         }
