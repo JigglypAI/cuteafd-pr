@@ -1163,8 +1163,8 @@ impl DeviceCache {
         let Some(bank) = self.records.get(&id).map(|record| record.identity.bank) else { return };
         let lane = self.bank_lane(bank);
         let epoch = hit_epoch(self.device, lane, self.lanes[lane].index);
-        if self.records[&id].last_used != Some(epoch) { self.remove_donor_candidate(id); }
         let moved_stamp = self.records[&id].last_used != Some(epoch);
+        if moved_stamp { self.remove_donor_candidate(id); }
         let record = self.records.get_mut(&id).unwrap();
         if !record.pinned {
             if let Some(last) = record.last_used { self.reuse_ages.record(epoch.saturating_sub(last)); }
@@ -2329,9 +2329,9 @@ mod tests {
     fn aged_update_fixture(age: u64, hard: bool) -> (DeviceCache, u64) {
         let mut cache = test_cache(-1030, 1000);
         let donor = capture(&mut cache, 1, false);
-        cache.register_native(donor, 101, vec![3, 7, 11]);
         let last = cache.lanes[0].index;
         cache.records.get_mut(&donor).unwrap().last_used = Some(last);
+        cache.register_native(donor, 101, vec![3, 7, 11]);
         while cache.lanes[0].index < last + age {
             cache.begin_lane(0); cache.complete_lane(0);
         }
@@ -2406,7 +2406,9 @@ mod tests {
         cache.assign_bank_lane(1, 1);
         cache.lane_max_cycles = [1, 2];
         let owner_start = cache.lanes[1].index;
+        cache.remove_donor_candidate(donor);
         cache.records.get_mut(&donor).unwrap().last_used = Some(owner_start);
+        cache.insert_donor_candidate(donor);
         for _ in 0..100 { cache.begin_lane(0); cache.complete_lane(0); }
         assert!(cache.cold_donor(&[3, 7, 11], false).is_none());
         for _ in 0..32 { cache.begin_lane(1); cache.complete_lane(1); }
