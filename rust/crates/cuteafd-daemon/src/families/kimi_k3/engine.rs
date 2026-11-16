@@ -674,10 +674,7 @@ impl<'a> Engine<'a> {
         // and those outlive every queued launch.
         unsafe { crate::shared::decode_graph::device::observe_completed(library, |visit| {
             for lane in lanes.local.iter_mut().flatten() {
-                let spans = lane.graph_spans_devices();
-                let Some(device) = lane.graph_device() else { continue };
-                let Some(owner) = lane.graph_owner() else { continue };
-                visit(device, "kimi_k3", spans, owner)?;
+                lane.visit_graphs(visit)?;
             }
             Ok(())
         }) }

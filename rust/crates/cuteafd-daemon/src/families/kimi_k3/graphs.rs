@@ -266,6 +266,7 @@ pub(crate) fn check_placement_for_ranks(cfg: &KimiK3Config, placement: &cuteafd_
 /// device's single bounded cache with the same reserve and basis.
 pub(crate) struct Graphs<'a> {
     bank: GraphBank<Key, GraphOwner<'a, ()>>,
+    context_bank: GraphBank<Key, GraphOwner<'a, ()>>,
     replays: u64,
     captured: usize,
     device: i32,
@@ -275,53 +276,74 @@ pub(crate) struct Graphs<'a> {
 impl<'a> Graphs<'a> {
     pub(crate) fn new() -> Self {
         Self { bank: GraphBank::with_family("kimi_k3"),
+            context_bank: GraphBank::with_family("kimi_k3"),
             replays: 0, captured: 0, device: -1, spans_devices: false }
     }
 
     /// Attach to `device`'s bounded cache. `bootstrap` is one more capture at the
     /// family's measured per-executable rate, used until the device is measured.
     pub(crate) fn attach(&mut self, library: &NativeLibrary, device: i32, ranks: usize,
-        rank: usize, reserve: u64) -> Result<()> {
+        rank: usize, reserve: u64, context: bool) -> Result<()> {
         self.device = device;
-        self.spans_devices = ranks > 1;
-        self.bank.attach_device(library, device, reserve, self.site(ranks, rank))
+        self.spans_devices = context;
+        self.bank.attach_device(library, device, reserve, self.site("kimi_k3.step", ranks, rank)?)?;
+        self.context_bank.attach_device(library, device, reserve, self.site("kimi_k3.context", ranks, rank)?)
     }
 
-    fn site(&self, ranks: usize, rank: usize) -> Site {
-        Site { name: "kimi_k3.step", cycle: Cycle::Other, preference: Preference::Adaptive,
+    fn site(&self, name: &'static str, ranks: usize, rank: usize) -> Result<Site> {
+        Ok(Site { name, cycle: Cycle::Other, preference: Preference::Adaptive,
             bootstrap: kimi_bootstrap(ranks, rank), basis: Basis::Bytes,
-            spans_devices: self.spans_devices }
+            spans_devices: super::graph_spanning::spans(name, self.spans_devices)? })
     }
 
     #[cfg(test)]
-    fn attach_for_test(&mut self, device: i32, ranks: usize, rank: usize, reserve: u64) -> Result<()> {
+    fn attach_for_test(&mut self, device: i32, ranks: usize, rank: usize, reserve: u64, context: bool) -> Result<()> {
         self.device = device;
-        self.spans_devices = ranks > 1;
-        self.bank.attach_device_for_test(device, reserve, self.site(ranks, rank))
+        self.spans_devices = context;
+        self.bank.attach_device_for_test(device, reserve, self.site("kimi_k3.step", ranks, rank)?)?;
+        self.context_bank.attach_device_for_test(device, reserve, self.site("kimi_k3.context", ranks, rank)?)
     }
 
     pub(crate) fn attached(&self) -> bool { self.bank.cache_attached() }
 
     /// The physical device this lane's executables live on.
     pub(crate) fn device(&self) -> i32 { self.device }
-    pub(crate) fn spans_devices(&self) -> bool { self.spans_devices }
     /// Whether any executable is resident; startup-only reconfiguration and
     /// state restore run before the first one.
     pub(crate) fn is_empty(&self) -> bool { self.captured == 0 }
 
-    pub(crate) fn cached(&self, key: &Key) -> bool { self.bank.get(key).is_some() }
+    pub(crate) fn cached(&self, key: &Key) -> bool { self.bank(key.op).get(key).is_some() }
 
-    pub(crate) fn cycle(&mut self, cycle: Cycle) { self.bank.cache_cycle(cycle); }
-    pub(crate) fn needs_boundary(&self) -> bool { self.bank.cache_needs_boundary() }
-    pub(crate) fn tick(&mut self) { self.bank.cache_tick(); }
+    pub(crate) fn cycle(&mut self, cycle: Cycle) {
+        self.bank.cache_cycle(cycle);
+        self.context_bank.cache_cycle(cycle);
+    }
+    pub(crate) fn needs_boundary(&self) -> bool {
+        self.bank.cache_needs_boundary() || self.context_bank.cache_needs_boundary()
+    }
+    pub(crate) fn tick(&mut self) { self.bank.cache_tick(); self.context_bank.cache_tick(); }
 
     /// Control surface for the engine's completed-step measurement and eviction.
-    pub(crate) fn owner(&mut self) -> &mut dyn CacheAttached { &mut self.bank }
+    pub(crate) fn visit(&mut self, visit: &mut crate::shared::decode_graph::device::GraphVisitor<'_>) -> Result<()> {
+        visit(self.device, "kimi_k3.step",
+            super::graph_spanning::spans("kimi_k3.step", self.spans_devices)?, &mut self.bank)?;
+        visit(self.device, "kimi_k3.context",
+            super::graph_spanning::spans("kimi_k3.context", self.spans_devices)?, &mut self.context_bank)
+    }
+
+    fn bank(&self, op: Op) -> &GraphBank<Key, GraphOwner<'a, ()>> {
+        if matches!(op, Op::Context { .. }) { &self.context_bank } else { &self.bank }
+    }
+
+    fn bank_mut(&mut self, op: Op) -> &mut GraphBank<Key, GraphOwner<'a, ()>> {
+        if matches!(op, Op::Context { .. }) { &mut self.context_bank } else { &mut self.bank }
+    }
 
     /// Drop every executable and this bank's cache records. The caller has
     /// already drained the lane's stream.
     pub(crate) fn clear(&mut self) {
         self.bank.cache_clear_drained();
+        self.context_bank.cache_clear_drained();
         self.captured = 0;
     }
 
@@ -336,7 +358,7 @@ impl<'a> Graphs<'a> {
         for &key in keys {
             if !prewarm_selected(kimi_layout(core, ranks), key, false) || self.cached(&key) { continue }
             let pinned = pinned(core, ranks, key);
-            let Some(mut ticket) = self.bank.cache_ticket(&key, pinned, None) else { continue };
+            let Some(mut ticket) = self.bank_mut(key.op).cache_ticket(&key, pinned, None) else { continue };
             if self.capture(stream, key, ticket, &mut || body(key))? { captured += 1; }
         }
         Ok(captured)
@@ -346,7 +368,7 @@ impl<'a> Graphs<'a> {
     /// capture it, else run the body eagerly.
     pub(crate) fn graph(&mut self, stream: &Stream<'a>, key: Key, allow_capture: bool,
         pinned: bool, mut body: impl FnMut() -> Result<()>) -> Result<()> {
-        if let Some(owner) = self.bank.cached_launch(&key) {
+        if let Some(owner) = self.bank_mut(key.op).cached_launch(&key) {
             let (device, raw) = (owner.device(), owner.raw);
             ensure!(device == stream.device.id, "Kimi graph replay device changed");
             // SAFETY: the bank owns immutable capture pointers and LocalLane
@@ -356,12 +378,12 @@ impl<'a> Graphs<'a> {
             return Ok(());
         }
         if !allow_capture { return body() }
-        let Some(mut ticket) = self.bank.cache_ticket(&key, pinned, None) else { return body() };
+        let Some(mut ticket) = self.bank_mut(key.op).cache_ticket(&key, pinned, None) else { return body() };
         // The body is recorded on this lane's stream; on refusal it runs eagerly
         // instead. Its own nested cache lookups are disabled by the caller, so
         // the recorded segment is the eager kernel sequence.
         if !self.capture(stream, key, ticket, &mut body)? { return body() }
-        let owner = self.bank.get(&key).context("inserted Kimi graph")?;
+        let owner = self.bank(key.op).get(&key).context("inserted Kimi graph")?;
         let (device, raw) = (owner.device(), owner.raw);
         ensure!(device == stream.device.id, "Kimi graph captured a foreign device");
         // SAFETY: just instantiated on this device and not yet launched.
@@ -379,7 +401,7 @@ impl<'a> Graphs<'a> {
         // duration of the step body; every captured pointer is pinned by LocalLane.
         if let Err(error) = stream.device.run(|| unsafe {
             crate::shared::decode_graph::begin_capture(&stream.device.library, stream.raw, &ticket) }) {
-            if self.bank.cache_ticket_failed(ticket, &error) {
+            if self.bank_mut(key.op).cache_ticket_failed(ticket, &error) {
                 tracing::warn!(%error, ?key, "Kimi graph capture unavailable; running eagerly");
             }
             return Ok(false);
@@ -412,23 +434,25 @@ impl<'a> Graphs<'a> {
                 };
                 crate::shared::decode_graph::census::capture_key("kimi_k3", "decode",
                     stream.raw as usize, key.rank as i32, Some(key.lane), &key, owner.raw);
-                self.bank.cache_commit(key, owner, ticket, nodes as u64, width,
-                    spans || self.spans_devices);
+                let spanning = spans || super::graph_spanning::spans(
+                    if matches!(key.op, Op::Context { .. }) { "kimi_k3.context" } else { "kimi_k3.step" },
+                    self.spans_devices)?;
+                self.bank_mut(key.op).cache_commit(key, owner, ticket, nodes as u64, width, spanning);
                 self.captured += 1;
                 Ok(true)
             }
             (Err(error), Ok((raw, ..))) => {
-                self.bank.cache_ticket_failed(ticket, &error);
+                self.bank_mut(key.op).cache_ticket_failed(ticket, &error);
                 // SAFETY: the failed capture's executable has never launched.
                 unsafe { stream.device.library.cuda_graph_exec_destroy(raw)?; }
                 Err(error)
             }
             (Err(error), Err(ended)) => {
-                self.bank.cache_ticket_failed(ticket, &ended);
+                self.bank_mut(key.op).cache_ticket_failed(ticket, &ended);
                 Err(error.context(format!("ending failed Kimi capture: {ended:#}")))
             }
             (Ok(()), Err(error)) => {
-                if self.bank.cache_ticket_failed(ticket, &error) {
+                if self.bank_mut(key.op).cache_ticket_failed(ticket, &error) {
                     tracing::warn!(%error, ?key, "Kimi graph instantiation unavailable; running eagerly");
                 }
                 Ok(false)
@@ -450,7 +474,7 @@ mod tests {
         assert!(capture_worthwhile(2));
         let source = include_str!("graphs.rs").split("#[cfg(test)]\nmod tests").next().unwrap();
         assert!(source.find("if !capture_worthwhile(nodes)").unwrap()
-            < source.find("self.bank.cache_commit").unwrap());
+            < source.find("self.bank_mut(key.op).cache_commit").unwrap());
         assert!(!source.contains("Residual("));
         let device = include_str!("device.rs").split("\n#[cfg(test)]\nmod ").next().unwrap();
         let attention = device.split("    pub(crate) fn attention(&mut self").nth(1).unwrap()
@@ -577,22 +601,49 @@ mod tests {
         let hot = Key { lane: 0, rank: 0, rows: 1, op: Op::Ffn(0) };
         // Distinct synthetic devices: the controller is per physical device.
         let mut graphs = Graphs::new();
-        graphs.attach_for_test(-901, 1, 0, 8 << 20).unwrap();
+        graphs.attach_for_test(-901, 1, 0, 8 << 20, false).unwrap();
         assert!(matches!(graphs.bank.cache_miss(&hot, true, None), Miss::Capture(_)));
         // A ticket is a reservation, not residency.
         assert!(graphs.is_empty() && !graphs.cached(&hot));
         // Zero reserve means every miss runs eagerly.
         let mut eager = Graphs::new();
-        eager.attach_for_test(-902, 1, 0, 0).unwrap();
+        eager.attach_for_test(-902, 1, 0, 0, false).unwrap();
         assert!(matches!(eager.bank.cache_miss(&hot, true, None), Miss::Eager));
         // No reserve at all also runs eagerly.
         let mut detached = Graphs::new();
         assert!(matches!(detached.bank.cache_miss(&hot, true, None), Miss::Eager));
         // One physical device has one reserve and basis.
         let mut same = Graphs::new();
-        assert!(same.attach_for_test(-901, 1, 0, 8 << 20).is_ok());
+        assert!(same.attach_for_test(-901, 1, 0, 8 << 20, false).is_ok());
         let mut other = Graphs::new();
-        assert!(other.attach_for_test(-901, 1, 0, 16 << 20).is_err());
+        assert!(other.attach_for_test(-901, 1, 0, 16 << 20, false).is_err());
+    }
+
+    #[test]
+    fn sealed_tp2_local_misses_capture_but_context_banks_and_layouts_stay_eager() {
+        use crate::shared::decode_graph::device::{Miss, seal_cross_device_capture_on_this_thread};
+        struct Unseal;
+        impl Drop for Unseal {
+            fn drop(&mut self) { seal_cross_device_capture_on_this_thread(false); }
+        }
+        let _unseal = Unseal;
+        seal_cross_device_capture_on_this_thread(true);
+        let mut local = Graphs::new();
+        local.attach_for_test(-903, 2, 0, 32 << 20, false).unwrap();
+        for op in [Op::Attention { layer: 0, speculative: false }, Op::Ffn(0)] {
+            let key = Key { lane: 0, rank: 0, rows: 3, op };
+            assert!(matches!(local.bank_mut(op).cache_miss(&key, true, None), Miss::Capture(_)));
+        }
+        let op = Op::Context { layer: 0, speculative: false };
+        let key = Key { lane: 0, rank: 0, rows: 3, op };
+        assert!(matches!(local.bank_mut(op).cache_miss(&key, true, None), Miss::Eager));
+        let mut context = Graphs::new();
+        context.attach_for_test(-904, 2, 0, 32 << 20, true).unwrap();
+        let key = Key { op: Op::Ffn(0), ..key };
+        assert!(matches!(context.bank_mut(key.op).cache_miss(&key, true, None), Miss::Eager));
+        let mut visited = Vec::new();
+        local.visit(&mut |device, name, spans, _| { visited.push((device, name.to_owned(), spans)); Ok(()) }).unwrap();
+        assert_eq!(visited, [(-903, "kimi_k3.step".into(), false), (-903, "kimi_k3.context".into(), true)]);
     }
 
     #[test]

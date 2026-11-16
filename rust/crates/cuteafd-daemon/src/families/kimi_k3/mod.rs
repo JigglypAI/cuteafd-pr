@@ -16,6 +16,7 @@ pub(crate) mod golden;
 pub(crate) mod serve;
 pub(crate) mod startup;
 pub(crate) mod graphs;
+mod graph_spanning;
 pub(crate) mod backend;
 pub(crate) mod layers;
 pub(crate) mod prefix;
