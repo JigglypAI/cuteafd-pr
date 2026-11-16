@@ -25,8 +25,10 @@ Porting a family or changing shared serve, prefill, exchange or admission code: 
   `~/.cache/cuteafd/instances/<instance>/`; never delete the shared stores
   beside `builds/` (`bench`, `fidelity`, `console`, `instances`, caches):
   Docker recreates a missing bind source root-owned and breaks the server.
-- Profiling: GPU performance counters are unlocked for users on every host
-  (`grep RmProfilingAdminOnly /proc/driver/nvidia/params` shows 0), so run
+- Profiling: GPU performance counters are unlocked for users on raptor and the
+  Sparks and seeds (`grep RmProfilingAdminOnly /proc/driver/nvidia/params` shows 0),
+  but not on maxq: it is WSL2, the Windows driver governs counters, and `ncu`
+  fails there with `ERR_NVGPUCTRPERM`. Profile SM120 kernels on raptor. Run
   Nsight Compute as yourself, launching the program under it:
   `ncu <args> <program>` on the host or in a dev container. No sudo. Never put
   anything under sudo inside a wrapper script or interpreter (`sudo python …`,
