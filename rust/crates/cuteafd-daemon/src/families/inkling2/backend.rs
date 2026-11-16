@@ -21,6 +21,18 @@ fn check_writable(placement: &Placement, rows: usize, context: usize, pool: &Ref
     Ok(())
 }
 
+fn decode_spans(widths: impl IntoIterator<Item = usize>, capacity: usize) -> Result<Vec<std::ops::Range<usize>>> {
+    let mut rows = 0usize;
+    widths.into_iter().map(|width| {
+        ensure!(width > 0, "Inkling decode member has no rows");
+        let end = rows.checked_add(width).context("Inkling decode row extent overflow")?;
+        ensure!(end <= capacity, "Inkling decode exceeds admitted {capacity}-row owner");
+        let span = rows..end;
+        rows = end;
+        Ok(span)
+    }).collect()
+}
+
 #[derive(Default)]
 pub(crate) struct Draft;
 impl scheduler::DraftState for Draft {
@@ -85,8 +97,11 @@ impl<'a> InklingBackend<'a> {
     }
     fn decode(&self, sequences: &mut [(&mut Placement, &[u32])], speculative: bool,
         pool: &RefPagePool) -> Result<Option<DeviceLogits>> {
-        ensure!(!speculative && !sequences.is_empty() && sequences.len() <= self.concurrency
-            && sequences.iter().all(|(_, tokens)| tokens.len() == 1), "Inkling initial decode supports one target row per request");
+        ensure!(!speculative && !sequences.is_empty() && sequences.len() <= self.concurrency,
+            "Inkling target decode requires non-speculative admitted requests");
+        let spans = decode_spans(sequences.iter().map(|(_, tokens)| tokens.len()),
+            self.execution.borrow().requests.decode.layout.rows)?;
+        let rows = spans.last().context("Inkling decode has no rows")?.end;
         let mut slots = BTreeSet::new();
         let mut members = Vec::new();
         let mut placements = Vec::new();
@@ -95,13 +110,14 @@ impl<'a> InklingBackend<'a> {
         for (index, (placement, tokens)) in sequences.iter().enumerate() {
             self.check(placement, tokens, pool)?;
             ensure!(slots.insert(placement.slot), "Inkling decode aliases a request state slot");
-            members.push(UnitSegment { sequence: index, rows: index..index+1, tokens: placement.len..placement.len+1,
+            members.push(UnitSegment { sequence: index, rows: spans[index].clone(),
+                tokens: placement.len..placement.len+tokens.len(),
                 prompt_end: false, snapshot: false, head: true });
             receipt.push((placement.slot, placement.len, tokens.to_vec()));
             placements.push((**placement).clone()); sources.push(*tokens);
         }
         let layers = self.execution.borrow().cfg.layers;
-        let unit = Unit { index: 0, sequence: 0, segments: members, rows: 0..sequences.len(),
+        let unit = Unit { index: 0, sequence: 0, segments: members, rows: 0..rows,
             layers: 0..layers, slot: 0, barrier: false };
         let logits = self.execution.borrow_mut().decode(&mut placements, &sources, &unit, 1)?;
         for ((placement, _), next) in sequences.iter_mut().zip(placements) { **placement = next; }
@@ -286,6 +302,16 @@ impl<'a> Backend<'a> for InklingBackend<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn decode_members_share_admitted_rows_without_overlapping_logits() -> Result<()> {
+        assert_eq!(decode_spans([1, 7, 16, 40], 64)?, vec![0..1, 1..8, 8..24, 24..64]);
+        assert_eq!(decode_spans([64], 64)?, vec![0..64]);
+        assert!(decode_spans([1, 64], 64).is_err());
+        assert!(decode_spans([0], 64).is_err());
+        assert!(decode_spans([usize::MAX, 1], usize::MAX).is_err());
+        Ok(())
+    }
     #[test]
     fn append_writes_only_reserved_private_nonaliased_pages() -> Result<()> {
         let mut pool = RefPagePool::new(4, 64);
