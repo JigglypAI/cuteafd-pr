@@ -98,7 +98,7 @@ fn fixture_with_experts(kind: Fixture, experts: usize, topk: usize) -> (tempfile
 
 #[test]
 fn layout_reuses_one_immutable_catalog_across_candidates() -> anyhow::Result<()> {
-    let (dir, _, _) = fixture(Fixture::Exl3);
+    let (dir, _, _) = fixture_with_experts(Fixture::Exl3, 384, 8);
     let input = plan::PlanInput::open(dir.path())?;
     let catalog = input.expert_catalog()? as *const crate::OfficialV41Catalog;
     for entry in std::fs::read_dir(dir.path())? {
