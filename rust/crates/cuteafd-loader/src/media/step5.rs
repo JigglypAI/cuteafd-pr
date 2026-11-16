@@ -46,11 +46,13 @@ impl StepImagePlan {
             let count=if side<=window {1} else {(side-window).div_ceil(window)+1};
             (0..count).map(|i| if i+1==count && count>1 && window*i+window>side {side-window} else {window*i}).collect::<Vec<_>>()
         };
+        let nx=if plan.crop_canvas[0]<=window {1} else {(plan.crop_canvas[0]-window).div_ceil(window)+1};
+        let ny=if plan.crop_canvas[1]<=window {1} else {(plan.crop_canvas[1]-window).div_ceil(window)+1};
+        if u64::from(nx)*u64::from(ny)>128 {return Err(invalid("Step crop count exceeds admitted per-source limit"));}
         let xs=starts(plan.crop_canvas[0]);let ys=starts(plan.crop_canvas[1]);
         for y in ys.iter().copied() {
             for x in xs.iter().copied() {plan.windows.push([x,y,window,window]);}
         }
-        if plan.windows.len()>128 {return Err(invalid("Step crop count exceeds admitted per-source limit"));}
         plan.newline_after=(0..plan.windows.len()).map(|i| (i+1)%xs.len()==0 && i+1<plan.windows.len()).collect();
         Ok(plan)
     }
