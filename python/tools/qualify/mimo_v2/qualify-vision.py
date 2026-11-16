@@ -28,6 +28,25 @@ class PerceptionSpec(C.Structure):
         "downsample1", "downsample1_bias", "downsample2", "downsample2_bias")]
     _fields_ += [(k, C.POINTER(C.c_uint64)) for k in ("scale1", "scale2")]
 
+class TowerNorm(C.Structure):
+    _fields_ = [("kind", C.c_uint32), ("epsilon", C.c_float),
+                ("weight", C.c_uint64), ("bias", C.c_uint64)]
+
+class TowerProjector(C.Structure):
+    _fields_ = [(k, C.c_uint32) for k in ("kind", "activation", "input_width", "hidden_width", "output_width", "reserved")]
+    _fields_ += [(k, C.c_uint64) for k in ("fc1", "fc1_bias", "fc2", "fc2_bias")]
+
+class TowerExtension(C.Structure):
+    _fields_ = [(k, C.c_uint32) for k in ("version", "size", "block_norm_kind", "activation")]
+    _fields_ += [("block_norm_epsilon", C.c_float)]
+    _fields_ += [(k, C.c_uint32) for k in ("attention_width", "temporal_patch", "pixel_layout", "temporal_input", "rotary_kind")]
+    _fields_ += [("rotary_axis_dims", C.c_uint32 * 3), ("rotated_dims", C.c_uint32), ("passthrough_dims", C.c_uint32)]
+    _fields_ += [("inv_freq", C.c_uint64 * 3)]
+    _fields_ += [(k, C.c_uint32) for k in ("absolute_kind", "position_height", "position_width", "interpolation")]
+    _fields_ += [("absolute_position", C.c_uint64), ("pre_norm", TowerNorm), ("final_norm", TowerNorm)]
+    _fields_ += [("spatial_merge", C.c_uint32), ("projection_order", C.c_uint32)]
+    _fields_ += [("projectors", TowerProjector * 2), ("post_norm", TowerNorm)]
+
 class Spec(C.Structure):
     _fields_ = [(k, C.c_uint32) for k in ("storage_abi", "abi_version", "max_tokens", "output_width", "reserved")]
     _fields_ += [(k, C.c_uint64) for k in ("weight_bytes", "patch", "merger_norm", "merger_fc1", "merger_fc2", "inv_freq")]
@@ -39,11 +58,11 @@ class Spec(C.Structure):
         "patch_bias", "pos_embed", "merger_norm_bias", "merger_fc1_bias", "merger_fc2_bias")]
     _fields_ += [("merger_extra", C.c_uint64 * 8)]
     _fields_ += [(k, C.POINTER(C.c_uint64)) for k in ("norm1_bias", "norm2_bias", "q_norm", "k_norm")]
-    _fields_ += [("perception", C.POINTER(PerceptionSpec))]
+    _fields_ += [("perception", C.POINTER(PerceptionSpec)), ("tower", C.POINTER(TowerExtension))]
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.storage_abi = 4
+        self.storage_abi = 5
         # Keep every backing allocation alive through required/create. Native
         # registration copies these arrays before the synchronous call returns.
         self._layer_storage = {"blocks": (Block * self.depth)()}

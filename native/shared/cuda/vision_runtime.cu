@@ -22,7 +22,11 @@ static_assert(offsetof(cuteafd_vision_spec, patch_bias) == 120, "vision bias ABI
 static_assert(offsetof(cuteafd_vision_spec, norm1_bias) == 224, "vision norm ABI");
 static_assert(offsetof(cuteafd_vision_spec, perception) == 256, "vision extension ABI");
 static_assert(sizeof(cuteafd_vision_perception) == 96, "PE extension ABI");
-static_assert(sizeof(cuteafd_vision_spec) == 264, "vision pointer/count ABI");
+static_assert(offsetof(cuteafd_vision_spec, tower) == 264, "generic tower pointer ABI");
+static_assert(sizeof(cuteafd_vision_tower_norm) == 24, "generic tower norm ABI");
+static_assert(sizeof(cuteafd_vision_tower_projector) == 56, "generic tower projector ABI");
+static_assert(sizeof(cuteafd_vision_tower) == 304, "generic tower extension ABI");
+static_assert(sizeof(cuteafd_vision_spec) == 272, "vision pointer/count ABI");
 
 namespace {
 constexpr size_t BLAS_BYTES = 4 * 1024 * 1024;
@@ -185,11 +189,14 @@ int mha_attention(Owner* o,int n) {
 #include "vision_mistral.cuh"
 #endif
 bool valid_tower(const cuteafd_vision_spec& s) {
-  if(s.storage_abi!=4 || !s.depth || !s.blocks || !s.norm1_bias ||
+  if(s.storage_abi!=5 || !s.depth || !s.blocks || !s.norm1_bias ||
      !s.norm2_bias || !s.q_norm || !s.k_norm)return false;
   // The PE storage contract is staged before its kernels; never dispatch it
   // through another tower merely because the hidden geometry happens to match.
   if(s.perception)return false;
+  // The independent arithmetic contract has no qualified kernels in this step.
+  // Reject before allocations and never reinterpret it as an existing tower.
+  if(s.tower)return false;
   if(s.abi_version==1)return valid_spec(s);
 #ifdef CUTEAFD_HAVE_VISION_ATTENTION_AOT
   if(s.reserved==2)return valid_qwen(s);

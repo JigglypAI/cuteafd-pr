@@ -1,4 +1,6 @@
 //! Resident ViT owner. Construct, use and drop on its dedicated CUDA thread.
+mod tower;
+pub use tower::{TowerExtension, TowerNorm, TowerProjector};
 use libloading::Library;
 use std::{ffi::c_void, fmt, marker::PhantomData, path::Path, rc::Rc, sync::Arc};
 
@@ -105,6 +107,7 @@ pub struct VisionSpec {
     pub q_norm: Vec<u64>,
     pub k_norm: Vec<u64>,
     pub perception: Option<PerceptionSpec>,
+    pub tower: Option<TowerExtension>,
 }
 
 #[repr(C)]
@@ -143,12 +146,14 @@ struct RawVisionSpec {
     q_norm: *const u64,
     k_norm: *const u64,
     perception: *const RawPerceptionSpec,
+    tower: *const TowerExtension,
 }
 
 struct VisionSpecView {
     raw: RawVisionSpec,
     // The box keeps the extension address stable while this view moves.
     _perception: Option<Box<RawPerceptionSpec>>,
+    _tower: Option<Box<TowerExtension>>,
 }
 impl std::ops::Deref for VisionSpecView {
     type Target = RawVisionSpec;
@@ -190,8 +195,12 @@ impl VisionSpec {
                 scale1:pe.scale1.as_ptr(), scale2:pe.scale2.as_ptr(),
             }))
         }).transpose()?;
+        let tower = self.tower.as_ref().map(|tower| {
+            tower.validate(self)?;
+            Ok::<_, VisionError>(Box::new(*tower))
+        }).transpose()?;
         let raw = RawVisionSpec {
-            storage_abi: 4,
+            storage_abi: 5,
             abi_version: self.abi_version,
             max_tokens: self.max_tokens,
             output_width: self.output_width,
@@ -224,8 +233,9 @@ impl VisionSpec {
             q_norm: self.q_norm.as_ptr(),
             k_norm: self.k_norm.as_ptr(),
             perception: perception.as_deref().map_or(std::ptr::null(), |pe| pe),
+            tower: tower.as_deref().map_or(std::ptr::null(), |tower| tower),
         };
-        Ok(VisionSpecView { raw, _perception:perception })
+        Ok(VisionSpecView { raw, _perception:perception, _tower:tower })
     }
 }
 
@@ -648,7 +658,7 @@ mod tests {
             scale1:vec![16;23], scale2:vec![32;23], ..Default::default()
         }), ..Default::default() }.with_depth(23);
         let view = spec.raw().unwrap();
-        assert_eq!(view.storage_abi, 4);
+        assert_eq!(view.storage_abi, 5);
         assert_eq!(view.perception, view._perception.as_deref().unwrap() as *const _);
         let moved = view;
         assert_eq!(moved.perception, moved._perception.as_deref().unwrap() as *const _);
@@ -663,9 +673,16 @@ mod tests {
     fn c_header_layout_is_stable() {
         assert_eq!(std::mem::size_of::<VisionBlock>(), 96);
         assert_eq!(std::mem::size_of::<VisionLedger>(), 40);
-        assert_eq!(std::mem::size_of::<RawVisionSpec>(), 264);
+        assert_eq!(std::mem::size_of::<RawVisionSpec>(), 272);
         assert_eq!(std::mem::size_of::<RawPerceptionSpec>(), 96);
         assert_eq!(std::mem::offset_of!(RawVisionSpec, perception), 256);
+        assert_eq!(std::mem::offset_of!(RawVisionSpec, tower), 264);
+        assert_eq!(std::mem::size_of::<TowerNorm>(), 24);
+        assert_eq!(std::mem::size_of::<TowerProjector>(), 56);
+        assert_eq!(std::mem::size_of::<TowerExtension>(), 304);
+        assert_eq!(std::mem::offset_of!(TowerExtension, inv_freq), 64);
+        assert_eq!(std::mem::offset_of!(TowerExtension, projectors), 168);
+        assert_eq!(std::mem::offset_of!(TowerExtension, post_norm), 280);
         assert_eq!(std::mem::offset_of!(RawVisionSpec, blocks), 72);
         assert_eq!(std::mem::offset_of!(RawVisionSpec, hidden), 80);
         assert_eq!(std::mem::offset_of!(RawVisionSpec, patch_bias), 120);

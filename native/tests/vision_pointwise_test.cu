@@ -20,9 +20,14 @@ int main() {
       cuteafd_vision_perception perception{};
       perception.scale1=scale1.data();perception.scale2=scale2.data();
       cuteafd_vision_spec spec{};
-      spec.storage_abi=4;spec.depth=depth;spec.blocks=blocks.data();
+      spec.storage_abi=5;spec.depth=depth;spec.blocks=blocks.data();
       spec.norm1_bias=n1.data();spec.norm2_bias=n2.data();
       spec.q_norm=q.data();spec.k_norm=k.data();spec.perception=&perception;
+      cuteafd_vision_tower generic{};
+      generic.version=1;generic.size=sizeof(generic);
+      spec.tower=&generic;
+      if(valid_tower(spec))return 1;
+      spec.tower=nullptr;
       if(!copy_spec(owner,spec) || owner.spec.blocks==spec.blocks ||
          owner.spec.q_norm==spec.q_norm || owner.spec.perception==spec.perception ||
          owner.spec.perception->scale1==perception.scale1)return 1;
