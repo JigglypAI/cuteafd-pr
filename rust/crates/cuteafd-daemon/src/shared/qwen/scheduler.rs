@@ -1895,6 +1895,9 @@ mod media_failure_tests {
     #[test]
     fn permanent_image_admission_and_transient_pressure_have_distinct_errors() {
         use cuteafd_engine::media::MediaError;
+        assert!(matches!(super::media_failure(MediaError::Features),
+            cuteafd_api::openai::NativeFailure::BadRequest(message)
+                if message == "media feature geometry or byte length is invalid"));
         let error = MediaError::ImageTooLarge { needed: 5242880, capacity: 2621440 };
         assert!(matches!(super::media_failure(error), cuteafd_api::openai::NativeFailure::BadRequest(message)
             if message == "image needs 5242880 bytes > media cache capacity 2621440"));

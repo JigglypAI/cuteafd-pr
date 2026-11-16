@@ -93,7 +93,7 @@ impl LocalEncoder {
         let pixels = job.pixels(self.patch_size as u32)?;
         self.limits
             .validate([t, h, w], pixels, job.tokens as u64, rgb8.len() as u64)
-            .map_err(|message| MediaError::Encoder(message.into()))?;
+            .map_err(|_| MediaError::Features)?;
         job.feature_bytes()?;
         Ok(())
     }
@@ -261,7 +261,7 @@ mod tests {
         );
         assert!(matches!(
             encoder.validate(&over_job),
-            Err(MediaError::Encoder(_))
+            Err(MediaError::Features)
         ));
         assert!(handshake
             .image_limits()

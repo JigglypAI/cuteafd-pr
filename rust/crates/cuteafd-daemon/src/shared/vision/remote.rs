@@ -130,7 +130,7 @@ impl EncoderHandshake {
             return self
                 .image_limits()
                 .validate(grid, pixels, tokens, bytes)
-                .map_err(error);
+                .map_err(|_| MediaError::Features);
         }
         let [t, h, w] = grid;
         let patches = u64::from(h) * u64::from(w);
@@ -150,9 +150,7 @@ impl EncoderHandshake {
             || tokens > u64::from(self.max_output_rows)
             || tokens != self.tokens(h, w)
         {
-            return Err(error(
-                "invalid image source/grid/output geometry before allocation",
-            ));
+            return Err(MediaError::Features);
         }
         Ok(())
     }
@@ -168,7 +166,7 @@ impl EncoderHandshake {
             rgb8.len() as u64,
         )?;
         if job.hidden_width != self.output_width as usize {
-            return Err(error("image output width differs from handshake"));
+            return Err(MediaError::Features);
         }
         job.feature_bytes()
     }

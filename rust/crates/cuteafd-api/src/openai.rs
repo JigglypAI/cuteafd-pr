@@ -2595,6 +2595,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn image_geometry_admission_is_400_for_json_and_streams() {
+        for stream in [false,true] {
+            let (tx,mut rx)=mpsc::channel::<NativeRequest>(1);
+            let message="media feature geometry or byte length is invalid";
+            let worker=tokio::spawn(async move {
+                let job=rx.recv().await.unwrap();
+                job.events.send(Err(NativeFailure::BadRequest(message.into()))).unwrap();
+            });
+            let body=json!({"model":MODEL,"messages":[{"role":"user","content":"describe image"}],"stream":stream});
+            let response=router(tx).oneshot(axum::http::Request::post("/v1/chat/completions")
+                .header("content-type","application/json").body(Body::from(body.to_string())).unwrap()).await.unwrap();
+            assert_eq!(response.status(),StatusCode::BAD_REQUEST);
+            assert!(!response.headers().contains_key(axum::http::header::RETRY_AFTER));
+            let bytes=axum::body::to_bytes(response.into_body(),1024).await.unwrap();
+            assert_eq!(serde_json::from_slice::<Value>(&bytes).unwrap()["error"]["message"],message);
+            worker.await.unwrap();
+        }
+    }
+    #[tokio::test]
     async fn media_admission_permanent_400_and_pressure_503_retry_after() {
         for stream in [false, true] {
             for permanent in [false, true] {

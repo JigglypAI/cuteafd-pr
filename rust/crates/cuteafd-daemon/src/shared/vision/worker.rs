@@ -42,8 +42,7 @@ pub fn image_handshake(
     EncoderHandshake {
         encoder_id,
         max_patches: spec.native.max_tokens * processor.merge.pow(2),
-        max_output_rows: spec.native.max_tokens
-            + u32::from(spec.row_markers() > 0) * spec.native.max_tokens.isqrt(),
+        max_output_rows: if spec.row_markers()>0 {processor.max_image_tokens as u32} else {spec.native.max_tokens},
         max_canvas_pixels: u64::from(spec.native.max_tokens)
             * u64::from(processor.merge.pow(2))
             * u64::from(processor.patch.pow(2)),
