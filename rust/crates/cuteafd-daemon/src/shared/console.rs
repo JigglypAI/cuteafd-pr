@@ -552,7 +552,7 @@ mod tests {
         // 5 drafted, 3 verified, 2 accepted (3 emitted); then a plain decode row.
         step.member(&ticket, &[1, 2, 3, 4, 5], 3, &[1, 2, 9], false, false);
         step.member(&ticket, &[], 0, &[4], true, true);
-        assert_eq!(step.tally, [5, 3, 2, 4]);
+        assert_eq!(step.tally, [5, 3, 2, 4, 1]);
         assert!(step.requests.is_empty());
     }
 
