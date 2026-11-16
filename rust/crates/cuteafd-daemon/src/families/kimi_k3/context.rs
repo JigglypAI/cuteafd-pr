@@ -515,6 +515,49 @@ mod tests {
     }
 
     #[test]
+    fn sequential_decode_appends_match_gathered_owner_slots_and_frontiers() -> Result<()> {
+        use super::super::device::SequenceRows;
+        let mut pool = cuteafd_engine::prefix::RefPagePool::parity(128, 64, 0);
+        pool.alloc_for(0..128)?;
+        let pages = (0..80).map(|page| (page % 2 + 2 * (39 - page / 2)) as u32).collect::<Vec<_>>();
+        let i64s = |bytes: &[u8]| bytes.chunks_exact(8)
+            .map(|b| i64::from_le_bytes(b.try_into().unwrap())).collect::<Vec<_>>();
+        let i32s = |bytes: &[u8]| bytes.chunks_exact(4)
+            .map(|b| i32::from_le_bytes(b.try_into().unwrap())).collect::<Vec<_>>();
+        for start in [62, 63, 64, 1275, 1298, 4280] {
+            let whole = [0, 1].map(|rank| DecodeRows::gathered(rank,
+                &[SequenceRows { slot: 0, start, rows: 4, pages: &pages }], 5120, 1, &pool));
+            let [a, b] = whole;
+            let whole = [a?, b?];
+            let mut writes = [std::collections::BTreeMap::new(), std::collections::BTreeMap::new()];
+            for position in start..start + 4 {
+                let mut total_visible = 0;
+                for rank in 0..2 {
+                    let append = DecodeRows::new(rank,
+                        &[SequenceRows { slot: 0, start: position, rows: 1, pages: &pages }], 5120, 1, &pool)?;
+                    let slot = i64s(&append.slots)[0];
+                    let visible = i32s(&append.lengths)[0] as usize;
+                    total_visible += visible;
+                    let row = position - start;
+                    assert_eq!(slot, i64s(&whole[rank].slots)[row]);
+                    assert_eq!(visible, i32s(&whole[rank].lengths)[row] as usize);
+                    assert_eq!(&append.tables[..], &whole[rank].tables[row * append.width * 4..(row + 1) * append.width * 4]);
+                    if position / 64 % 2 == rank {
+                        let physical = i64::from(pages[position / 64] >> 1) * 64 + (position % 64) as i64;
+                        assert_eq!(slot, physical);
+                        assert!(writes[rank].insert(slot, position).is_none());
+                    } else {
+                        assert_eq!(slot, -1);
+                    }
+                }
+                assert_eq!(total_visible, position + 1);
+            }
+            assert_eq!(writes.iter().map(|rank| rank.len()).sum::<usize>(), 4);
+        }
+        Ok(())
+    }
+
+    #[test]
     fn padded_decode_rows_preserve_live_metadata_and_mask_inactive_rows() -> Result<()> {
         use super::super::device::SequenceRows;
         let mut pool = cuteafd_engine::prefix::RefPagePool::parity(4, 64, 0);

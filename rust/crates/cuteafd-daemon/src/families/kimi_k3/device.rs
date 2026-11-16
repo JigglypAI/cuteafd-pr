@@ -1236,7 +1236,9 @@ impl<'a> LocalLane<'a> {
             let width = owner.compact_width();
             dsa.scored[0].launch(cuteafd_ffi::KimiIndexSelection {
                 rows, cache_pages: self.mla.local_pages(),
-                table_width: self.context_pages[self.lane.metadata_bank].max(1), table_stride: width,
+                // Context graph replay must not freeze the first request's live page count.
+                // Device shard lengths mask the admitted compact table on every step.
+                table_width: width, table_stride: width,
                 page_stride: 2, page_offset: self.rank,
                 query_fp8: query, head_weights, cache,
                 table: owner.metadata("compact page tables", self.lane.metadata_bank)?,
