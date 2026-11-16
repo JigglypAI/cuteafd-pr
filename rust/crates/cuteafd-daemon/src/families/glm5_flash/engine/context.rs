@@ -407,7 +407,8 @@ pub(super) fn rank_tables(tables: &StepTables, rank: usize, pool_pages: usize) -
     ensure!(tables.segments.is_empty(), "a packed prefill runs on one GPU");
     let mut out = StepTables { decode: tables.decode, eager: tables.eager, real_rows: tables.real_rows,
         positions: tables.positions.clone(), kda_slots: tables.kda_slots.clone(), seq_first: tables.seq_first.clone(),
-        long: tables.long, spec: tables.spec, pool_width: tables.pool_width, ..Default::default() };
+        long: tables.long, spec: tables.spec, pool_width: tables.pool_width,
+        draft_ends: tables.draft_ends.clone(), draft_chunk: tables.draft_chunk.clone(), ..Default::default() };
     let unit_of_slot = |slot: i64, per_unit: i64| (slot / per_unit) as usize;
     if !tables.decode {
         // Identity: logical record slot = position, logical pool slot = position / 4.

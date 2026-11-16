@@ -83,14 +83,23 @@ impl<'a> UnitHooks<'_, 'a, '_, '_, '_, '_, '_, '_> {
         }
         if let Some(drafter) = &e.drafter {
             if !tables.segments.is_empty() {
-                for s in tables.segments.iter().filter(|s| s.tap_rows > 0) {
-                    drafter.tap_streams_at(layer, w.streams[0].buffer.ptr, HC,
-                        s.end_row() - s.tap_rows, s.tap_rows, s.tap_offset)?;
+                for (i, s) in tables.segments.iter().enumerate().filter(|(_, s)| s.tap_rows > 0) {
+                    let first = usize::try_from(tables.positions[s.end_row() - s.tap_rows])?;
+                    let end = tables.draft_ends.get(i).copied().unwrap_or(first + s.tap_rows);
+                    if drafter.retain_context_chunk(first..first + s.tap_rows, end) {
+                        drafter.tap_streams_at(layer, w.streams[0].buffer.ptr, HC,
+                            s.end_row() - s.tap_rows, s.tap_rows, s.tap_offset)?;
+                    }
                 }
             } else {
                 let window = self.total.saturating_sub(crate::shared::speculation::dflash::TAP_ROWS);
                 let from = unit.rows.start.max(window);
-                if from < unit.rows.end {
+                let chunk = tables.draft_chunk.clone().unwrap_or_else(|| {
+                    let start = tables.positions[0] as usize - unit.rows.start;
+                    start + window..start + self.total
+                });
+                let end = tables.draft_ends.first().copied().unwrap_or(chunk.end);
+                if from < unit.rows.end && drafter.retain_context_chunk(chunk, end) {
                     drafter.tap_streams_at(layer, w.streams[0].buffer.ptr, HC,
                         from - unit.rows.start, unit.rows.end - from, from - window)?;
                 }

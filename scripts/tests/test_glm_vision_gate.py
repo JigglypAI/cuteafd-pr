@@ -192,7 +192,11 @@ def test_glm_text_cold_replay_uses_serving_decode_not_eager_scoring():
     assert "engine.verify_device(" in text and "chunk, false)?" in text
     assert "verify_media_device" not in text
     assert "engine.verify_media_device(" in media
-    assert "engine.prefill_media_device(" in media
+    assert "engine.prefill_draft_chunk(" in media
+    assert "Some(&p.media), draft_end)" in media
+    prefill = (ROOT / "rust/crates/cuteafd-daemon/src/families/glm5_flash/engine.rs").read_text().split(
+        "pub(crate) fn prefill_draft_chunk(", 1)[1].split("/// Keep ordered", 1)[0]
+    assert "self.prefill_units_draft_end(" in prefill and "false, true, media" in prefill
     engine = (ROOT / "rust/crates/cuteafd-daemon/src/families/glm5_flash/engine.rs").read_text()
     scoring = engine.split("pub fn verify_media_device(", 1)[1].split("fn decode_step(", 1)[0]
     assert "Some(media), true)" in scoring, "teacher-forced scoring remains eager"

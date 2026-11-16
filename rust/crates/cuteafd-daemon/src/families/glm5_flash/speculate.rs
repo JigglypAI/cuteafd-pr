@@ -41,13 +41,17 @@ fn stream_mean(layer: &[u8], first: usize, rows: usize, hidden: usize) -> Vec<u8
 fn prefill_with_taps(engine: &GlmfEngine<'_>, placement: &mut GlmfPlacement, tokens: &[u32],
     slot: usize) -> Result<Vec<f32>> {
     let mut logits = None;
+    let end = placement.len + tokens.len();
     for chunk in tokens.chunks(engine.prefill_capacity()) {
         let start = placement.len;
-        logits = engine.prefill(placement, chunk, None)?;
+        logits = engine.prefill_draft_chunk(placement, chunk, None, end)?
+            .map(|logits| logits.row_host(engine.library, logits.rows - 1)).transpose()?;
         if let Some(drafter) = &engine.drafter {
             let n = chunk.len().min(TAP_ROWS);
             let first = start + chunk.len() - n;
-            drafter.update(&(0..n).map(|r| ContextRow { tap_row: r, slot, position: first + r }).collect::<Vec<_>>())?;
+            if drafter.retain_context_chunk(first..first + n, end) {
+                drafter.update(&(0..n).map(|r| ContextRow { tap_row: r, slot, position: first + r }).collect::<Vec<_>>())?;
+            }
         }
     }
     logits.context("the prefill needs every layer")
@@ -80,6 +84,10 @@ pub(super) fn draft_oracle(args: &GoldenArgs, opened: &Opened, engine: &GlmfEngi
     for (index, &position) in positions.iter().enumerate() {
         while done < position {
             let n = (position - done).min(TAP_ROWS);
+            if !drafter.retain_context_chunk(done..done + n, position) {
+                done += n;
+                continue;
+            }
             let means: Vec<Vec<u8>> = layers.iter().map(|layer| stream_mean(layer, done, n, hidden)).collect();
             let mut taps = vec![0u8; n * width];
             for r in 0..n {
@@ -387,11 +395,13 @@ pub(super) fn draft_run(args: &GoldenArgs, opened: &Opened, engine: &GlmfEngine<
         // drain both target ranks before the context bridge and hide wait cycles.
         for chunk in prompt.chunks(engine.prefill_capacity()) {
             let start = fresh.len;
-            engine.prefill_device(&mut fresh, chunk)?.context("prefill needs every layer")?;
+            engine.prefill_draft_chunk(&mut fresh, chunk, None, prompt.len())?.context("prefill needs every layer")?;
             let n = chunk.len().min(TAP_ROWS);
             let first = start + chunk.len() - n;
-            drafter.update(&(0..n).map(|r| ContextRow { tap_row: r, slot: 0, position: first + r })
-                .collect::<Vec<_>>())?;
+            if drafter.retain_context_chunk(first..first + n, prompt.len()) {
+                drafter.update(&(0..n).map(|r| ContextRow { tap_row: r, slot: 0, position: first + r })
+                    .collect::<Vec<_>>())?;
+            }
         }
         engine.synchronize()?;
         let seconds = started.elapsed().as_secs_f64();

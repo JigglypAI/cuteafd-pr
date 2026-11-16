@@ -23,11 +23,30 @@ pub(crate) struct DraftPrefix<'a> {
     pub drafter: Rc<crate::shared::speculation::block_dspark::DsparkDrafter<'a>>,
     pub marks: crate::shared::speculation::block_dspark::WindowSnapshots<'a>,
     pub frontiers: std::cell::RefCell<Vec<usize>>,
+    pub prompt_ends: std::cell::RefCell<Vec<usize>>,
+    pub points: std::cell::RefCell<Vec<Vec<usize>>>,
+    pub skipped_ends: std::cell::RefCell<Vec<usize>>,
     pub slots: usize,
 }
 impl DraftPrefix<'_> {
     pub fn frontier(&self,slot:usize) -> Result<usize> {
         self.frontiers.borrow().get(slot).copied().ok_or_else(|| anyhow::anyhow!("MiniMax draft slot outside admission"))
+    }
+    pub fn ingest_end(&self, slot: usize, start: usize, fallback: usize) -> Result<usize> {
+        let prompt_ends = self.prompt_ends.borrow();
+        let points = self.points.borrow();
+        let end = prompt_ends.get(slot).copied().ok_or_else(|| anyhow::anyhow!("MiniMax draft slot outside admission"))?;
+        let points = points.get(slot).ok_or_else(|| anyhow::anyhow!("MiniMax draft slot outside admission"))?;
+        Ok(crate::shared::speculation::next_context_frontier(end.max(fallback), points, start))
+    }
+    pub fn complete(&self, slot: usize, frontier: usize) -> Result<bool> {
+        let skipped = self.skipped_ends.borrow().get(slot).copied()
+            .ok_or_else(|| anyhow::anyhow!("MiniMax draft slot outside admission"))?;
+        Ok(self.drafter.cfg.window.is_none_or(|window| crate::shared::speculation::context_window_complete(
+            window, skipped, frontier)))
+    }
+    pub fn bind_prompt(&self, slot: usize, end: usize) -> Result<()> {
+        bind_prompt_state(&mut self.prompt_ends.borrow_mut(), &mut self.points.borrow_mut(), slot, end)
     }
     pub fn advance(&self,slot:usize,start:usize,rows:usize) -> Result<()> {
         let mut frontiers=self.frontiers.borrow_mut();
@@ -36,6 +55,16 @@ impl DraftPrefix<'_> {
         *frontier=start.checked_add(rows).ok_or_else(|| anyhow::anyhow!("MiniMax draft frontier overflow"))?;
         Ok(())
     }
+}
+
+fn bind_prompt_state(prompt_ends: &mut [usize], points: &mut [Vec<usize>], slot: usize, end: usize) -> Result<()> {
+    let prompt = prompt_ends.get_mut(slot).ok_or_else(|| anyhow::anyhow!("MiniMax draft slot outside admission"))?;
+    let points = points.get_mut(slot).ok_or_else(|| anyhow::anyhow!("MiniMax draft slot outside admission"))?;
+    *prompt = end;
+    // Probe scoring returns before plan_draft_context; a reused slot must not
+    // inherit the previous request's intermediate frontiers.
+    points.clear();
+    Ok(())
 }
 
 #[derive(Clone)]
@@ -139,6 +168,7 @@ impl PrefixFamily for MiniMaxPrefix<'_> {
             if let Some(draft)=&self.0.draft {
                 draft.drafter.reset_context(placement.slot,0)?;
                 draft.frontiers.borrow_mut()[placement.slot]=0;
+                draft.skipped_ends.borrow_mut()[placement.slot]=0;
             }
         }
         Ok(self.install(placement)?)
@@ -153,11 +183,21 @@ impl PrefixFamily for MiniMaxPrefix<'_> {
         *placement = next;
         Ok(())
     }
+    fn capture_meta(&self, placement: &Placement, len: usize) -> Result<(), BoxError> {
+        // Reject before the cache reserves mark/pages or evicts an older entry.
+        if let Some(draft) = &self.0.draft {
+            if !draft.complete(placement.slot, len)? {
+                return Err("MiniMax incomplete draft window cannot be snapshotted".into());
+            }
+        }
+        Ok(())
+    }
     fn capture(&self, mark: MarkSlot, placement: &Placement, len: usize) -> Result<(), BoxError> {
         self.validate(placement, len)?;
         if len != placement.len { return Err("MiniMax capture is not at the committed frontier".into()); }
         if let Some(draft) = &self.0.draft {
             if draft.frontier(placement.slot)? != len { return Err("MiniMax draft snapshot frontier differs".into()); }
+            if !draft.complete(placement.slot, len)? { return Err("MiniMax incomplete draft window cannot be snapshotted".into()); }
             let planes=draft.drafter.window_planes(placement.slot)?;
             // SAFETY: retained drafter owns the planes and both producer/copy streams.
             unsafe { draft.marks.capture(mark.0 as usize,&planes,0,len)?; }
@@ -173,10 +213,12 @@ impl PrefixFamily for MiniMaxPrefix<'_> {
                     let (origin,end)=unsafe { draft.marks.restore(mark.0 as usize,&planes,len)? };
                     if origin != 0 { return Err("MiniMax draft snapshot has a cold reconstructed origin".into()); }
                     draft.frontiers.borrow_mut()[placement.slot]=end;
+                    draft.skipped_ends.borrow_mut()[placement.slot]=0;
                 }
                 None => {
                     if len != 0 { return Err("MiniMax speculative prefix restore requires an exact window mark".into()); }
                     draft.frontiers.borrow_mut()[placement.slot]=0;
+                    draft.skipped_ends.borrow_mut()[placement.slot]=0;
                     draft.drafter.reset_context(placement.slot,0)?;
                 }
             }
@@ -230,6 +272,29 @@ impl PrefixFamily for MiniMaxPrefix<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scored_request_reusing_slot_discards_previous_intermediate_points() -> Result<()> {
+        let mut ends = vec![0; 4];
+        let mut points = vec![Vec::new(); 4];
+        bind_prompt_state(&mut ends, &mut points, 3, 16384)?;
+        points[3] = vec![8192, 12288];
+        bind_prompt_state(&mut ends, &mut points, 3, 8192)?;
+        assert!(points[3].is_empty());
+        let (mut full, mut candidate) = (vec![0usize; 4096], vec![0usize; 4096]);
+        for start in (0..ends[3]).step_by(128) {
+            let end = crate::shared::speculation::next_context_frontier(ends[3], &points[3], start);
+            let keep = crate::shared::speculation::retain_context_chunk(Some(4096), start..start + 128, end);
+            for position in start..start + 128 {
+                full[position % 4096] = position + 1;
+                if keep { candidate[position % 4096] = position + 1; }
+            }
+        }
+        assert_eq!(full, candidate, "scored request ingests its entire live window");
+        assert!(bind_prompt_state(&mut ends, &mut points, 4, 8192).is_err());
+        Ok(())
+    }
+
     use crate::shared::{memory::device::{Device, Stream}, prefix::CudaCopyEngine};
     use cuteafd_core::memory_layout::Tag;
     use cuteafd_engine::prefix::{After, PrefixCache, PrefixConfig, SnapshotKind};

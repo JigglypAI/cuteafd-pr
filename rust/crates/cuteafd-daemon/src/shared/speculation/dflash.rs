@@ -2924,6 +2924,8 @@ pub(crate) trait ReplayDrafter {
     }
     /// Sequences a draft step takes (and ring slots).
     fn sequences(&self) -> usize;
+    /// Only block dSpark exposes a uniformly windowed per-position context.
+    fn context_window(&self) -> Option<usize> { None }
     /// Legacy dual-format implementations may retain their diagnostic arms.
     fn has_fp8(&self) -> bool { false }
     fn set_fp8(&self, _on: bool) {}
@@ -3030,7 +3032,9 @@ pub(crate) fn replay_with(drafter: &(impl ReplayDrafter + ?Sized), tokens: &[u32
         for &p in &anchors {
             while done < p {
                 let n = (p - done).min(drafter.tap_rows());
-                drafter.context(&taps(done, n)?, done)?;
+                if super::retain_context_chunk(drafter.context_window(), done..done + n, p) {
+                    drafter.context(&taps(done, n)?, done)?;
+                }
                 done += n;
             }
             let rows = embed(&[tokens[p]])?;

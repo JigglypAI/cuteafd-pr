@@ -563,6 +563,9 @@ struct StepTables {
     /// runs once per segment over its rows, with its own tables. Empty: one sequence (or a decode
     /// step, whose programs take every row's sequence from the tables).
     segments: Vec<packing::Segment>,
+    /// Complete extension ends, not the current unit/chunk ends (one per sequence).
+    draft_ends: Vec<usize>,
+    draft_chunk: Option<std::ops::Range<usize>>,
 }
 
 /// A prefill step's sequence units (its pool table: one unit per pool page); empty for decode.
@@ -3496,6 +3499,14 @@ impl<'a> GlmfEngine<'a> {
         self.prefill_step(placement, tokens, None, None, false, true, Some(media))?.map(StepLogits::device).transpose()
     }
 
+    /// Serving chunks share the complete extension end for windowed draft ingestion.
+    pub(crate) fn prefill_draft_chunk(&self, placement: &mut GlmfPlacement, tokens: &[u32],
+        media: Option<&cuteafd_engine::media::RequestMedia>, end: usize) -> Result<Option<DeviceLogits>> {
+        self.prefill_units_draft_end(placement, tokens, false, true, media,
+            if self.pipelined() { self.prefill_waves } else { 1 }, None, None, None, end)?
+            .map(StepLogits::device).transpose()
+    }
+
     /// Keep ordered all-row logits and media injection on the admitted scoring path.
     pub(crate) fn prefill_scoring_media(&self, placement: &mut GlmfPlacement, tokens: &[u32],
         media: &cuteafd_engine::media::RequestMedia) -> Result<Option<crate::shared::probe::ScoreLogits>> {
@@ -3570,7 +3581,20 @@ impl<'a> GlmfEngine<'a> {
         on_layer: Option<&mut dyn FnMut(usize, &[u8]) -> Result<()>>,
         forced: Option<&dyn Fn(usize) -> Option<Vec<u8>>>,
         scoring: Option<crate::shared::probe::ScoringRows<'_>>) -> Result<Option<StepLogits>> {
+        let end = placement.len + tokens.len();
+        self.prefill_units_draft_end(placement, tokens, all_logits, device, media, waves,
+            on_layer, forced, scoring, end)
+    }
+
+    fn prefill_units_draft_end(&self, placement: &mut GlmfPlacement, tokens: &[u32], all_logits: bool,
+        device: bool, media: Option<&cuteafd_engine::media::RequestMedia>, waves: usize,
+        on_layer: Option<&mut dyn FnMut(usize, &[u8]) -> Result<()>>,
+        forced: Option<&dyn Fn(usize) -> Option<Vec<u8>>>,
+        scoring: Option<crate::shared::probe::ScoringRows<'_>>, end: usize) -> Result<Option<StepLogits>> {
         let (start, t) = (placement.len, tokens.len());
+        // Planned points are chunk ends today. A future nonzero capture_reach
+        // may put a point inside this chunk; retaining extra context is safe.
+        let end = end.max(start + t);
         // Cuts preserve MLA page alignment and recurrent state order.
         let cuts = if on_layer.is_some() || forced.is_some() {
             ensure!(t <= self.prefill_rows, "layer diagnostics take one admitted unit");
@@ -3585,8 +3609,13 @@ impl<'a> GlmfEngine<'a> {
         let mut first = 0;
         for n in cuts {
             let mut tables = StepTables { page_table: self.columns(&placement.pages, self.table_pages),
-                pool_table: self.columns(&placement.pool_pages, self.table_pool_pages), ..Default::default() };
+                pool_table: self.columns(&placement.pool_pages, self.table_pool_pages),
+                draft_ends: vec![end], ..Default::default() };
             self.rows(placement, start + first..start + first + n, 0, &mut tables)?;
+            // Every unit fills the same tail tap chunk; judge the complete
+            // producer shape, never an individual unit's contribution to it.
+            let tail_start = start + t.saturating_sub(crate::shared::speculation::dflash::TAP_ROWS);
+            tables.draft_chunk = Some(tail_start..start + t);
             steps.push((tables, &tokens[first..first + n]));
             first += n;
         }
@@ -3713,6 +3742,15 @@ impl<'a> GlmfEngine<'a> {
     pub fn prefill_packed(&self, sequences: &mut [(&mut GlmfPlacement, &[u32])],
         on_logits: &mut dyn FnMut(usize, DeviceLogits) -> PackedOutcome)
         -> Result<(Vec<packing::Segment>, Vec<Result<()>>)> {
+        let ends = sequences.iter().map(|(placement, tokens)| placement.len + tokens.len()).collect::<Vec<_>>();
+        self.prefill_packed_draft_ends(sequences, &ends, on_logits)
+    }
+
+    pub(crate) fn prefill_packed_draft_ends(&self, sequences: &mut [(&mut GlmfPlacement, &[u32])],
+        ends: &[usize], on_logits: &mut dyn FnMut(usize, DeviceLogits) -> PackedOutcome)
+        -> Result<(Vec<packing::Segment>, Vec<Result<()>>)> {
+        ensure!(ends.len() == sequences.len() && sequences.iter().zip(ends)
+            .all(|((placement, tokens), &end)| end >= placement.len + tokens.len()), "draft packed ends differ");
         ensure!(self.packs_prefill(), "a packed prefill runs on one GPU with every layer");
         let _program_inventory = self.packed_programs.enter(|| self.packed_program_inventory())?;
         let chunks: Vec<(usize, usize)> = sequences.iter().map(|(p, tokens)| (p.len, tokens.len())).collect();
@@ -3730,6 +3768,7 @@ impl<'a> GlmfEngine<'a> {
                 .context("a packed sequence's positions past its pool pages")?);
         }
         tables.segments = segments.clone();
+        tables.draft_ends = ends.to_vec();
         let tokens: Vec<u32> = sequences.iter().flat_map(|(_, tokens)| tokens.iter().copied()).collect();
         self.step_units(&[(tables, &tokens)], 0, false, None)?;
         let lanes = self.prefill_slots_of(0, 1)?;
@@ -4329,12 +4368,20 @@ impl<'a> GlmfEngine<'a> {
             if let Some(drafter) = &self.drafter {
                 if tables.segments.is_empty() {
                     let n = t.min(crate::shared::speculation::dflash::TAP_ROWS);
-                    drafter.tap_streams(index, w.streams[cur].buffer.ptr, HC, t - n, n)?;
+                    let first = usize::try_from(tables.positions[t - n])?;
+                    let end = tables.draft_ends.first().copied().unwrap_or(first + n);
+                    if drafter.retain_context_chunk(first..first + n, end) {
+                        drafter.tap_streams(index, w.streams[cur].buffer.ptr, HC, t - n, n)?;
+                    }
                 } else {
                     // Each packed sequence's last rows, as its own pass taps them, at its tap rows.
-                    for s in tables.segments.iter().filter(|s| s.tap_rows > 0) {
-                        drafter.tap_streams_at(index, w.streams[cur].buffer.ptr, HC, s.end_row() - s.tap_rows,
-                            s.tap_rows, s.tap_offset)?;
+                    for (i, s) in tables.segments.iter().enumerate().filter(|(_, s)| s.tap_rows > 0) {
+                        let first = usize::try_from(tables.positions[s.end_row() - s.tap_rows])?;
+                        let end = tables.draft_ends.get(i).copied().unwrap_or(first + s.tap_rows);
+                        if drafter.retain_context_chunk(first..first + s.tap_rows, end) {
+                            drafter.tap_streams_at(index, w.streams[cur].buffer.ptr, HC, s.end_row() - s.tap_rows,
+                                s.tap_rows, s.tap_offset)?;
+                        }
                     }
                 }
             }

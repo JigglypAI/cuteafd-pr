@@ -270,7 +270,9 @@ def test_remote_context_wait_is_ordered_after_cooperative_target_producer():
     assert "Self::RemoteDflash(d) => d.update(rows)" in draft_dispatch
     bench = (family / "speculate.rs").read_text().split(
         "draft_prefill_bench(args, &golden", 1)[1].split("fn draft_prefill_bench", 1)[0]
-    assert bench.index("engine.prefill_device(") < bench.index("drafter.update(")
+    assert bench.index("engine.prefill_draft_chunk(") < bench.index("drafter.update(")
+    assert "chunk, None, prompt.len())" in bench
+    assert "drafter.retain_context_chunk(first..first + n, prompt.len())" in bench
     assert "for chunk in prompt.chunks" in bench
 
 

@@ -378,6 +378,16 @@ impl<'e, 'a> Backend<'a> for MiniMaxBackend<'e, 'a> {
         let identity = self.next_identity.get();
         self.next_identity.set(identity.checked_add(1).context("MiniMax request identity exhausted")?);
         self.identities.borrow_mut().insert(placement.slot, identity);
+        if let Some(draft) = &self.owners.storage.draft_prefix {
+            draft.bind_prompt(placement.slot, tokens.len())?;
+        }
+        Ok(())
+    }
+    fn plan_draft_context(&self, placement: &Placement, end: usize, points: &[usize]) -> Result<()> {
+        if let Some(draft) = &self.owners.storage.draft_prefix {
+            draft.prompt_ends.borrow_mut()[placement.slot] = end;
+            draft.points.borrow_mut()[placement.slot] = points.to_vec();
+        }
         Ok(())
     }
     fn history(&self, placement: &Placement) -> u64 { self.identities.borrow().get(&placement.slot).copied().unwrap_or(0) }

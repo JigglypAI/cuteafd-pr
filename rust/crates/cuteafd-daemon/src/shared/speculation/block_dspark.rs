@@ -1616,6 +1616,8 @@ impl ReplayDrafter for DsparkDrafter<'_> {
         vec![ReplayMode { name: self.representation.name(), legacy_fp8: None }]
     }
 
+    fn context_window(&self) -> Option<usize> { self.cfg.window }
+
     fn context(&self, taps: &[u8], first: usize) -> Result<()> {
         let n = taps.len() / (self.cfg.taps.len() * self.cfg.hidden * 2);
         self.put_taps(taps)?;
@@ -1849,6 +1851,99 @@ mod tests {
                     assert_eq!(inventory.receipts.iter().filter(|r|r.allocation.view.is_none()).count(),1);
                     assert_eq!(inventory.receipts.iter().filter(|r|r.allocation.view.is_some()).count(),expected.len());
                 }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires sealed native programs, MiniMax drafter weights and GPU1"]
+    fn installed_minimax_window_ingest_and_marks_are_byte_exact() -> Result<()> {
+        use crate::shared::memory::{device::{Allocation, Device, Stream}, weight_arena::DeviceWeightArena};
+        use cuteafd_core::memory_layout::ArenaTag;
+        // SAFETY: the matching sealed slot library is retained throughout this isolated oracle.
+        let library = unsafe { NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
+        let manifest = std::path::PathBuf::from(std::env::var("CUTEAFD_PROGRAM_MANIFEST")?);
+        let programs = library.programs()?.with_manifest(&manifest)?;
+        let snapshot = std::path::PathBuf::from(std::env::var("CUTEAFD_TEST_DRAFT_SNAPSHOT")?);
+        let id = std::env::var("CUTEAFD_CACHE_TEST_DEVICE").context("oracle harness visible device missing")?.parse()?;
+        let device = Device { library: &library, id };
+        let stream = Stream::new(device)?;
+        let positions = 65536 + 4096;
+        let rope = Allocation::new(device, positions * 256, TEST)?;
+        device.run(|| library.copy_h2d(rope.buffer,
+            &crate::families::minimax_m3::cache::rotary_bytes(positions, 1e7)))?;
+        let cfg = DsparkConfig::read(&snapshot)?;
+        let window = cfg.window.context("oracle requires window")?;
+        let requests = DsparkDrafter::arena_requests(&snapshot, GlmDraftRepresentation::Bf16Only, id)?
+            .remove(&id).context("oracle weight requests")?;
+        let arena = DeviceWeightArena::new(device, cuteafd_loader::serving_capacity::WeightArenaLayout::new(
+            "window-oracle", requests)?, ArenaTag::drafter_weights("window-oracle"))?;
+        let drafter = device.run(|| DsparkDrafter::load_native_with(&library, &programs,
+            super::super::dflash::TargetProjection::Bf16, &snapshot, stream.raw,
+            1, 1, vec![0; cfg.hidden * 2], rope.buffer, positions,
+            |id, name, bytes| { ensure!(id == device.id, "oracle device"); arena.view(name, bytes) }))?;
+        let planes = drafter.window_planes(0)?;
+        let marks = WindowSnapshots::new(&stream, planes.iter().map(|plane| plane.bytes).collect(), 2)?;
+        let pitch = cfg.taps.len() * cfg.hidden * 2;
+        let read = || -> Result<Vec<Vec<u8>>> {
+            stream.device.run(|| {
+                // SAFETY: all producers use this owned stream and planes outlive the readback.
+                unsafe { library.cuda_stream_synchronize(stream.raw)?; }
+                planes.iter().map(|&plane| {
+                    let mut bytes = vec![0; plane.bytes];
+                    library.copy_d2h(&mut bytes, plane)?;
+                    Ok(bytes)
+                }).collect()
+            })
+        };
+        let ingest = |start: usize, count: usize| -> Result<()> {
+            let taps = (0..count).flat_map(|row| (0..pitch / 2).flat_map(move |column| {
+                let value = (((start + row) * 37 + column * 11) % 251) as f32 / 128. - 1.;
+                ((value.to_bits() >> 16) as u16).to_le_bytes()
+            })).collect::<Vec<_>>();
+            drafter.put_taps(&taps)?;
+            drafter.update(&(0..count).map(|tap_row| ContextRow {
+                tap_row, slot: 0, position: start + tap_row }).collect::<Vec<_>>())
+        };
+        for end in [17, window, window + 1, 8192, 65536] {
+            // 128 is serving's partition; 257 exercises a straddling boundary.
+            for chunk in [128, 257] {
+                let mut expected = None;
+                for skip in [false, true] {
+                    drafter.reset_context(0, 0)?;
+                    for start in (0..end).step_by(chunk) {
+                        let count = chunk.min(end - start);
+                        if !skip || super::super::retain_context_chunk(cfg.window, start..start + count, end) {
+                            ingest(start, count)?;
+                        }
+                    }
+                    let actual = read()?;
+                    if let Some(expected) = &expected { ensure!(&actual == expected,
+                        "window ring bytes differ end={end} chunk={chunk}"); }
+                    else { expected = Some(actual); }
+                    // SAFETY: admitted disjoint rings survive both copy streams and restoration.
+                    unsafe { marks.capture(usize::from(skip), &planes, 0, end)?; }
+                    marks.drain()?;
+                }
+                let mut expected_mark = vec![0; marks.mark_bytes()];
+                let mut actual_mark = expected_mark.clone();
+                device.run(|| {
+                    library.copy_d2h(&mut expected_mark, marks.mark(0)?)?;
+                    library.copy_d2h(&mut actual_mark, marks.mark(1)?)
+                })?;
+                // Padding isn't state; compare origin/frontier and every physical plane.
+                let payload = 16 + planes.iter().map(|plane| plane.bytes).sum::<usize>();
+                ensure!(expected_mark[..payload] == actual_mark[..payload], "prompt snapshot bytes differ");
+                ingest(end, 17)?;
+                let expected_turn = read()?;
+                // SAFETY: initialized prompt mark and retained planes satisfy snapshot ownership.
+                ensure!(unsafe { marks.restore(1, &planes, end)? } == (0, end), "restored frontier differs");
+                marks.drain()?;
+                ensure!(read()? == expected.as_ref().unwrap().clone(), "restore differs from cold prefix");
+                ingest(end, 17)?;
+                ensure!(read()? == expected_turn, "turn continuation differs");
+                eprintln!("window ingest byte-exact: prompt={end} chunk={chunk} planes={} snapshot={payload}", planes.len());
             }
         }
         Ok(())
