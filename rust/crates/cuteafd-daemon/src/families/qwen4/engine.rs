@@ -1220,7 +1220,7 @@ impl<'a> Qwen4Engine<'a> {
                 name: "qwen4.segment", cycle: Cycle::Decode, preference: Preference::Adaptive,
                 bootstrap: cuteafd_loader::serving_capacity::qwen_graphs::QWEN_GRAPH_BYTES_PER_GRAPH,
                 basis: Basis::Bytes,
-                spans_devices: self.gdn_banks.len() > 1,
+                spans_devices: super::graph_spanning::spans("qwen4.segment")?,
             })?;
             crate::shared::decode_graph::device::set_reserve_policy(self.gdn_banks[owner].device.id, resolved)?;
             tracing::info!(rank = owner, reserve = resolved.bytes, source = resolved.source,
@@ -1242,7 +1242,8 @@ impl<'a> Qwen4Engine<'a> {
     fn visit_graphs(&self, visit: &mut crate::shared::decode_graph::device::GraphVisitor<'_>) -> Result<()> {
         let mut graphs = self.graphs.borrow_mut();
         for (owner, bank) in graphs.iter_mut().enumerate() {
-            visit(self.gdn_banks[owner].device.id, "qwen4.segment", self.gdn_banks.len() > 1, bank)?;
+            visit(self.gdn_banks[owner].device.id, "qwen4.segment",
+                super::graph_spanning::spans("qwen4.segment")?, bank)?;
         }
         Ok(())
     }
