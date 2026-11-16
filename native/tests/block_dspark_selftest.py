@@ -220,9 +220,10 @@ def markov_check(lib, baseline=None, rank=256):
         scratch = torch.full((size + 256,), 173, device="cuda", dtype=torch.uint8)
         drafts = torch.empty(sequences, block, device="cuda", dtype=torch.int32)
         def launch():
+            active_stream = torch.cuda.current_stream().cuda_stream
             assert library.cuteafd_glmf_dspark_markov(scores.data_ptr(), w1.data_ptr(), w2.data_ptr(),
                 norms.data_ptr(), previous.data_ptr(), drafts.data_ptr(), scratch.data_ptr(),
-                sequences, block, vocab, rank, stream) == 0
+                sequences, block, vocab, rank, active_stream) == 0
         launch()
         torch.cuda.synchronize()
         assert torch.all(scratch[size:] == 173), "Markov workspace overrun"

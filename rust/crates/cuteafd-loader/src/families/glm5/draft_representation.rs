@@ -341,7 +341,7 @@ pub fn block_dspark_resident_bytes(config: &serde_json::Value, slots: usize, seq
     if [h,inter,layers,heads,kvh,vocab,block,taps].iter().any(|&n| n > 1_000_000)
         || layers > 1024 || heads > 4096 || kvh > 4096 || taps > 1024 || block > 128
         || !matches!(dim, 64 | 128) || heads % kvh != 0 || taps == 0
-        || cfg.rank != 256 || !crate::formats::block_dspark::supports_sequences(sequences) || sequences > slots {
+        || !matches!(cfg.rank, 256 | 512) || !crate::formats::block_dspark::supports_sequences(sequences) || sequences > slots {
         return Err(GlmDraftStorageError::Unsupported("invalid dSpark geometry or capacity"));
     }
     let q = mul(heads, dim)?;
@@ -355,7 +355,7 @@ pub fn block_dspark_resident_bytes(config: &serde_json::Value, slots: usize, seq
     }
     let weights = sum([mul(values, if fp8 { 1 } else { 2 })?, if fp8 { mul(values / 128,4)? } else { 0 },
         mul(2,add(mul(2,h)?,mul(layers,add(mul(2,h)?,mul(2,dim)?)?)?)?)?,
-        mul(4,mul(vocab,256)?)?, mul(vocab,4)?, mul(add(h,256)?,2)?.max(256),256, if dim == 128 { dim * 2 } else { 0 }])?;
+        mul(4,mul(vocab,cfg.rank as u64)?)?, mul(vocab,4)?, mul(add(h,cfg.rank as u64)?,2)?.max(256),256, if dim == 128 { dim * 2 } else { 0 }])?;
     let rows = mul(sequences as u64,block)?;
     let owned = sum([mul(mul(mul(2,layers)?,slots as u64)?,mul(capacity, kv_cache.plane_record_bytes(kvh as usize, dim as usize) as u64)?)?,
         mul(2048,sum([mul(mul(taps,h)?,2)?,mul(h,4)?,mul(kv,4)?,12])?)?])?;
@@ -505,6 +505,34 @@ mod tests {
             assert!(block_dspark_resident_bytes(&config, usize::MAX, 1, 188,
                 GlmDraftRepresentation::Bf16Only, 0, 8192, format).is_err());
         }
+    }
+
+    #[test]
+    fn kimi_k31_dspark_inventory_uses_checkpoint_markov_rank_and_window() {
+        let mut config = serde_json::json!({"architectures":["DSparkDraftModel"],
+            "speculators_model_type":"dspark", "aux_hidden_state_layer_ids":[76,80,84,88,92],
+            "block_size":7,"markov_rank":512,"markov_head_type":"vanilla",
+            "enable_confidence_head":true,"confidence_head_with_markov":true,
+            "sample_from_anchor":true,"mask_token_id":163839,"draft_vocab_size":163840,
+            "sliding_window_non_causal":false,"transformer_layer_config":{
+                "hidden_size":7168,"intermediate_size":14336,"num_hidden_layers":5,
+                "num_attention_heads":96,"num_key_value_heads":16,"head_dim":64,
+                "rms_norm_eps":1e-5,"hidden_act":"silu","attention_bias":false,
+                "layer_types":vec!["sliding_attention";5],"sliding_window":2048,
+                "rope_parameters":{"rope_type":"default","rope_theta":10000.0},
+                "vocab_size":163840}});
+        use crate::families::qwen4::Qwen4KvCache;
+        let cfg = crate::formats::block_dspark::BlockDsparkConfig::from_json(&config).unwrap();
+        assert_eq!(cfg.taps, [75,79,83,87,91]);
+        let bytes = |config: &serde_json::Value, slots| block_dspark_paged_resident_bytes(
+            config, slots, 1, 188, GlmDraftRepresentation::Bf16Only, 0,
+            2048, 1_393_792, Qwen4KvCache::Bf16).unwrap();
+        let rank512 = bytes(&config, 1);
+        assert_eq!(bytes(&config, 2).owned - rank512.owned, 40 << 20);
+        config["markov_rank"] = serde_json::json!(256);
+        let rank256 = bytes(&config, 1);
+        assert_eq!(rank512.owned - rank256.owned, 4 * 163840 * 256 + 2 * 256);
+        assert_eq!(rank512.weights.0 - rank256.weights.0, 4 * 163840 * 256 + 2 * 256);
     }
 
     #[test]
