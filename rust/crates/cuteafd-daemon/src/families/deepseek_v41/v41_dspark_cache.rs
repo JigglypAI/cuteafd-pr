@@ -131,6 +131,7 @@ pub(crate) struct DsparkWindow<'a> {
     slot_count: usize,
     source_rows: u32,
     owner: u64,
+    poisoned: std::cell::Cell<bool>,
 }
 impl<'a> DsparkWindow<'a> {
     pub(crate) fn startup_geometry(&self) -> WindowGeometry {
@@ -176,6 +177,7 @@ impl<'a> DsparkWindow<'a> {
             slot_count: slots,
             source_rows,
             owner,
+            poisoned: std::cell::Cell::new(false),
         };
         // Inactive descriptors warm the fixed launch without reading source.
         library.copy_h2d(value.descriptors.buffer, value.staging.bytes_mut())?;
@@ -185,8 +187,16 @@ impl<'a> DsparkWindow<'a> {
         value.synchronize()?;
         Ok(value)
     }
-    fn synchronize(&self) -> Result<()> {
-        unsafe { self.stream.library.cuda_stream_synchronize(self.stream.raw) }
+    pub fn synchronize(&self) -> Result<()> {
+        ensure!(!self.poisoned.get(), "dSpark window requires restart after unproved drain");
+        // SAFETY: this window owns the stream and retains every queued source/destination.
+        let result = unsafe { self.stream.library.cuda_stream_synchronize(self.stream.raw) };
+        if let Err(error) = &result {
+            self.poisoned.set(true);
+            cuteafd_transport::health::record_failure(format!(
+                "V4.1 dSpark ring drain failed; restart required: {error:#}"));
+        }
+        result
     }
     unsafe fn enqueue(&self) -> Result<()> {
         unsafe {
@@ -201,6 +211,7 @@ impl<'a> DsparkWindow<'a> {
         }
     }
     pub fn begin_request(&mut self, slot: usize, request: u64) -> Result<WindowLease> {
+        ensure!(!self.poisoned.get(), "dSpark window requires restart after unproved drain");
         ensure!(
             slot < self.slot_count,
             "dSpark window slot exceeds capacity"
@@ -226,6 +237,7 @@ impl<'a> DsparkWindow<'a> {
         })
     }
     fn validate(&self, lease: WindowLease) -> Result<usize> {
+        ensure!(!self.poisoned.get(), "dSpark window requires restart after unproved drain");
         ensure!(
             lease.owner == self.owner && lease.slot < self.slot_count,
             "foreign dSpark cache lease"

@@ -215,6 +215,8 @@ impl<'a, C: DraftChain<'a>> PrefixFamily<V41Meta> for V41Prefix<'_, 'a, '_, C> {
         self.requests.borrow().slot_index(placement.lease).ok()
     }
     fn discard(&self, placement: &mut V41Placement) -> Result<(), BoxError> {
+        // Also prove draft ring writes drained before resetting either request owner.
+        self.drain()?;
         self.requests.borrow_mut().discard_prefix(placement.lease).map_err(boxed)?;
         if let (Some(id), Some(draft)) = (placement.draft, self.draft.borrow_mut().as_deref_mut()) {
             draft.release(id).map_err(boxed)?;
@@ -335,7 +337,10 @@ impl<'a, C: DraftChain<'a>> PrefixFamily<V41Meta> for V41Prefix<'_, 'a, '_, C> {
         requests.cache().publish_units(&[copy.to]).map_err(boxed)
     }
     fn drain(&self) -> Result<(), BoxError> {
-        self.requests.borrow().cache().prefix_drain().map_err(boxed)
+        let target = self.requests.borrow().cache().prefix_drain();
+        let draft = self.draft.borrow().as_deref().map_or(Ok(()), |draft| draft.drain_prefix());
+        if let Err(error) = &draft { self.requests.borrow().cache().poison(error); }
+        target.and(draft).map_err(boxed)
     }
     fn page_segments(&self, page: u32) -> Vec<DeviceRange> {
         self.requests.borrow().cache().unit_segments(page).into_iter().map(range).collect()

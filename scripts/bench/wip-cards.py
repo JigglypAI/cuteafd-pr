@@ -1102,7 +1102,7 @@ def image_prefix_probe(url, dest):
             if label != 'text-a' and (source not in {'miss', 'device', 'host'}
                     or (cached > 0) != (source != 'miss')):
                 raise ValueError(f'{variant}/{label}: inconsistent prefix provenance: {usage}')
-            if label == 'next-turn' and not (cached > 0 and source in {'device', 'host'}):
+            if label == 'next-turn' and not (cached >= prompt_tokens and source in {'device', 'host'}):
                 raise ValueError(f'{variant}/{label}: exact image ancestor did not hit: {usage}')
             if label == 'image-b':
                 previous_content, previous_answer = content, answer
@@ -3239,7 +3239,9 @@ def main():
         raise ValueError('override/probe names must be selected cards')
     for card in cards:
         if args.matched_prompts or args.nonce_seed is not None:
-            if args.matched_prompts and probes[card['name']] & {'image', 'image-prefix'}:
+            if args.matched_prompts and any(
+                    (probes[card['name']] | arm_probes.get(arm, {}).get(card['name'], set()))
+                    & {'image', 'image-prefix'} for arm in arms):
                 raise ValueError('--matched-prompts cannot precede its first benchmark request with an image probe')
         requested_panels(card.get('profile', 'smoke'), binary=panel_binary(args.binary, arms))
         card['set'].update(overrides.get(card['name'], {}))

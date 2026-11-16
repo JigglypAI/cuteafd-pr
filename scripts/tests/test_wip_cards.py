@@ -4049,8 +4049,8 @@ def test_warm_lossless_panel_config_reaches_matrix(entry, tmp_path, monkeypatch)
     assert e['panel_config'] == {'spec_lossless_set': {'warm': True}}
 
 
-@pytest.mark.parametrize('fail_fourth', [False, True])
-def test_image_prefix_probe_receipts_and_http_failure(tmp_path, monkeypatch, fail_fourth):
+@pytest.mark.parametrize('fail_fourth,short_hit', [(False, False), (True, False), (False, True)])
+def test_image_prefix_probe_receipts_and_http_failure(tmp_path, monkeypatch, fail_fourth, short_hit):
     import threading
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
     calls = []
@@ -4082,7 +4082,7 @@ def test_image_prefix_probe_receipts_and_http_failure(tmp_path, monkeypatch, fai
             self.wfile.write(json.dumps({'choices': [{'message': {'content':
                 ['21', '35', 'Red and blue.', 'Yes.', 'Yes.'][index]}}], 'usage': {
                 'prompt_tokens': 1201 if ' odd.' in body['messages'][0]['content'][0]['text'] else 1200,
-                'prompt_cache_hit_tokens': 1200 if index == 4 else 0,
+                'prompt_cache_hit_tokens': (1 if short_hit else (1201 if ' odd.' in body['messages'][0]['content'][0]['text'] else 1200)) if index == 4 else 0,
                 'prefix_cache_source': 'device' if index == 4 else 'miss'}}).encode())
     server = ThreadingHTTPServer(('127.0.0.1', 0), Server)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -4095,6 +4095,9 @@ def test_image_prefix_probe_receipts_and_http_failure(tmp_path, monkeypatch, fai
                 cards.image_prefix_probe(url, tmp_path)
             assert 'HTTP 500' in json.loads((tmp_path / 'image-prefix-even-image-b.json').read_text())['error']
             assert len(calls) == 4
+        elif short_hit:
+            with pytest.raises(ValueError, match='exact image ancestor did not hit'):
+                cards.image_prefix_probe(url, tmp_path)
         else:
             assert len(cards.image_prefix_probe(url, tmp_path)) == 15
             assert len(list(tmp_path.glob('image-prefix-*.json'))) == 18
@@ -4105,3 +4108,15 @@ def test_image_prefix_probe_receipts_and_http_failure(tmp_path, monkeypatch, fai
         server.shutdown()
         server.server_close()
         thread.join()
+
+
+@pytest.mark.parametrize('probe', ['image', 'image-prefix'])
+def test_matched_prompts_refuses_arm_scoped_image_probe(entry, tmp_path, monkeypatch, probe):
+    kit = tmp_path / 'kit'
+    kit.mkdir()
+    (kit / 'matrix-main.json').write_text(json.dumps(dict(entries=[entry])))
+    monkeypatch.setattr(sys, 'argv', ['wip-cards', '--kit', str(kit), '--cards', 'v41-min',
+        '--interleave', '--matched-prompts', '--arm', 'candidate=test:s',
+        '--probe', f'candidate:v41-min:{probe}', '--state', str(tmp_path / 'state'), '--dry-run'])
+    with pytest.raises(ValueError, match='image probe'):
+        cards.main()

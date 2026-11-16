@@ -86,10 +86,9 @@ impl<'a> DsparkWindow<'a> {
             )
         };
         let drained = self.synchronize();
-        if let Err(error) = copied.and(drained) {
-            self.slots[slot].request = None;
-            return Err(error);
-        }
+        // Preserve the slot owner on error; an unproved drain poisons the window and
+        // must never expose its ring storage to a replacement request.
+        copied.and(drained)?;
         self.slots[slot].end = Some(end);
         Ok(())
     }

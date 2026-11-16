@@ -156,6 +156,9 @@ impl<'w, 'a> DraftRuntime<'w, 'a> {
 }
 impl<'w, 'a, C: DraftChain<'a>> DraftRuntime<'w, 'a, C> {
     pub fn admit(&mut self, id: u64) -> Result<()> {
+        if let Some(reason) = cuteafd_transport::health::failure_reason() {
+            anyhow::bail!("draft runtime unavailable until restart: {reason}");
+        }
         let _device = self.chains[0].execution_device().map(|device| device.enter()).transpose()?;
         ensure!(!self.requests.contains_key(&id), "draft request already admitted");
         let slot = (0..self.request_limit).find(|slot| self.requests.values().all(|request| request.slot != *slot))
@@ -423,8 +426,13 @@ impl<'w, 'a, C: DraftChain<'a>> DraftRuntime<'w, 'a, C> {
         self.pending_prefix_ids[lane] = None;
         failure.map_or(Ok(()), Err)
     }
-    /// Restore request `id`'s rings at frontier `end` from `mark`. A failure releases the draft
-    /// request.
+    /// Drain every restore stream before discard can recycle a draft slot.
+    pub fn drain_prefix(&self) -> Result<()> {
+        for window in &self.windows { window.device().run(|| window.synchronize())?; }
+        Ok(())
+    }
+    /// Restore request `id`'s rings at frontier `end` from `mark`. The caller owns rollback;
+    /// errors must not release or readmit a slot whose ring copies may still be queued.
     pub fn restore_mark(&mut self, id: u64, end: u64, mark: CuteafdDeviceBuffer) -> Result<()> {
         let _device = self.chains[0].execution_device().map(|device| device.enter()).transpose()?;
         ensure!(mark.bytes == DRAFT_MARK_BYTES && mark.device_id == self.windows[0].device().id,
@@ -437,13 +445,7 @@ impl<'w, 'a, C: DraftChain<'a>> DraftRuntime<'w, 'a, C> {
             }
             Ok(())
         });
-        if let Err(error) = restored {
-            if let Err(cleanup) = self.release(id) {
-                tracing::error!(%cleanup, "releasing failed draft prefix restore");
-            }
-            return Err(error);
-        }
-        Ok(())
+        restored
     }
     #[cfg(test)]
     pub(crate) fn validate_position(&self, id: u64, end: u64) -> Result<()> {
@@ -993,6 +995,51 @@ mod anchor_fallback_tests {
     fn seeds(ids: &[u64]) -> Vec<DraftSeed> {
         ids.iter().enumerate().map(|(i, &id)| (id, 11 + i as u32, 5, 9)).collect()
     }
+    #[test]
+    fn failed_ring_restore_drain_rejects_readmission_and_idle_health() -> Result<()> {
+        const CHILD: &str = "CUTEAFD_DRAFT_RESTORE_DRAIN_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe()?)
+                .args(["--exact", "families::deepseek_v41::v41_native_serve::speculative::anchor_fallback_tests::failed_ring_restore_drain_rejects_readmission_and_idle_health", "--nocapture"])
+                .env(CHILD, "1").status()?;
+            ensure!(status.success(), "isolated draft-drain regression failed");
+            return Ok(());
+        }
+        let fixture = fixture()?;
+        let lib = fixture.load()?;
+        fixture.immediate_copies(&lib)?;
+        let mut runtime = runtime(&lib, At::Never, false)?;
+        let mark = crate::shared::memory::DeviceAllocation::new(&lib, DRAFT_MARK_BYTES,
+            crate::shared::memory::TEST)?;
+        let lease = runtime.requests[&1].leases[0];
+        tokio::runtime::Runtime::new()?.block_on(async {
+            use axum::{body::Body, http::{Request, StatusCode}};
+            use tower::ServiceExt;
+            let (queue, mut receive) = tokio::sync::mpsc::channel(1);
+            let mut profile = cuteafd_api::openai::ModelProfile::default();
+            profile.engine_health = Some(cuteafd_api::openai::health::HealthWitness(
+                std::sync::Arc::new(cuteafd_transport::health::failure_reason)));
+            let app = cuteafd_api::openai::router_for_model(queue, Default::default(),
+                std::sync::Arc::new(std::sync::Mutex::new(serde_json::Value::Null)),
+                std::time::Duration::from_secs(1), cuteafd_api::openai::ConsoleHub::disabled(), profile);
+            let get = || Request::get("/health").body(Body::empty()).unwrap();
+            assert_eq!(app.clone().oneshot(get()).await?.status(), StatusCode::OK);
+            fixture.configure_pack(&lib, 0, 1)?;
+            assert!(runtime.restore_mark(1, 63, mark.buffer).is_err());
+            assert!(runtime.requests.contains_key(&1), "restore must retain failed request ownership");
+            assert!(runtime.drain_prefix().is_err());
+            assert!(runtime.release(1).is_err());
+            assert!(runtime.admit(1).is_err(), "failed ring slot must never be readmitted");
+            assert!(runtime.windows[0].begin_request(0, 99).is_err());
+            assert!(runtime.windows[0].request_id(lease).is_err(), "poisoned ring is unreadable");
+            assert_eq!(app.oneshot(get()).await?.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert!(receive.try_recv().is_err());
+            fixture.configure_pack(&lib, 0, 0)?;
+            anyhow::Ok(())
+        })?;
+        Ok(())
+    }
+
     #[test]
     fn synchronous_proposal_records_each_failure_on_its_own_lane() -> Result<()> {
         let fixture = fixture()?;

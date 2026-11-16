@@ -188,7 +188,7 @@ pub(crate) struct BackboneCache<'a> {
     requests: Vec<Option<Request>>,
     generations: Vec<u64>,
     owner: u64,
-    poisoned: bool,
+    poisoned: std::cell::Cell<bool>,
 }
 impl<'a> BackboneCache<'a> {
     /// DCP1 storage: replicate FP8 windows and FP4 source payloads, retaining
@@ -381,17 +381,21 @@ impl<'a> BackboneCache<'a> {
             requests: (0..slots).map(|_| None).collect(),
             generations: vec![0; slots],
             owner,
-            poisoned: false,
+            poisoned: std::cell::Cell::new(false),
         })
     }
-    fn poison(&mut self, cause: &anyhow::Error) {
-        self.poisoned = true;
+    pub(crate) fn poison(&self, cause: &anyhow::Error) {
+        self.poisoned.set(true);
         cuteafd_transport::health::record_failure(format!(
             "V4.1 backbone cache requires restart after initialization or cleanup failure: {cause:#}"));
     }
     fn healthy(&self) -> Result<()> {
+        if let Some(reason) = cuteafd_transport::health::failure_reason() {
+            self.poisoned.set(true);
+            anyhow::bail!("backbone cache unavailable until restart: {reason}");
+        }
         ensure!(
-            !self.poisoned,
+            !self.poisoned.get(),
             "backbone cache must be recreated after initialization or cleanup failure"
         );
         Ok(())

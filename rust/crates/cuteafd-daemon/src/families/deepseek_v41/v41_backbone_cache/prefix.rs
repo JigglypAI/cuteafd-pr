@@ -274,8 +274,7 @@ impl<'a> BackboneCache<'a> {
         if let Err(error) = &result {
             // Ring/carry writes may still be in flight: page quarantine alone cannot make
             // the request slot safe to reuse. Require process restart, not a cold retry.
-            cuteafd_transport::health::record_failure(format!(
-                "V4.1 prefix copy drain failed; restart required: {error:#}"));
+            self.poison(&anyhow::anyhow!("V4.1 prefix copy drain failed; restart required: {error:#}"));
         }
         result
     }
@@ -489,7 +488,11 @@ mod rollback_tests {
             let get = || Request::get("/health").body(Body::empty()).unwrap();
             assert_eq!(app.clone().oneshot(get()).await?.status(), StatusCode::OK);
             fixture.configure_pack(&lib, 0, 1)?;
+            let lease = bank.begin_request(0, 7)?;
             assert!(bank.prefix_drain().is_err());
+            assert!(bank.poisoned.get());
+            assert!(bank.bind_sources(lease, [&[], &[], &[], &[]], [0; 4]).is_err());
+            assert!(bank.begin_request(0, 8).is_err(), "queued second request cannot reuse the slot");
             let response = app.oneshot(get()).await?;
             assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
             let body = axum::body::to_bytes(response.into_body(), 4096).await?;
