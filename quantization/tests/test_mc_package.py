@@ -432,7 +432,6 @@ def publisher_fixture(tmp_path, monkeypatch):
     package.assemble(**args)
     packet = mc_publish.publication_inventory(args['output'])
     api = FakePublishApi(packet)
-    monkeypatch.setattr(mc_publish.importlib.metadata, 'version', lambda name: '1.26.1')
     monkeypatch.setattr(_runtime, 'is_xet_available', lambda: True)
     monkeypatch.setattr(huggingface_hub, 'HfApi', lambda **kwargs: api)
     monkeypatch.setattr(upload_model, '_remote', lambda client, repo, rev:

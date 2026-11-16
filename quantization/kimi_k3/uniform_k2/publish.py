@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Publish a completed immutable run with either generation of the Hub API."""
+"""Publish a completed immutable run with the qualified streaming Hub API."""
 from __future__ import annotations
 
 import os
@@ -7,16 +7,18 @@ from pathlib import Path
 import runpy
 import sys
 
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+from hub_requirements import require_qualified_hub
+
 
 def install_upload_compat():
+    require_qualified_hub()
     from huggingface_hub import HfApi
 
     if hasattr(HfApi, "upload_large_folder"):
         return
-    from huggingface_hub.utils._runtime import is_xet_available
-    if not is_xet_available():
-        raise RuntimeError("Modern resumable publication requires hf_xet")
-
     # Hub 2 removed the old name. With Xet, upload_folder now provides streamed,
     # resumable, adaptive multi-commit uploads itself. Its worker/report settings
     # are managed by that pipeline rather than the retired large-folder API.

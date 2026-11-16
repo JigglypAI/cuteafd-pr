@@ -4,13 +4,14 @@ import os
 from pathlib import Path
 
 from huggingface_hub import hf_hub_download
+from huggingface_hub.constants import HF_HOME
 from write_export import _fingerprint, _publish_json
 
 
 def audit():
-    root = Path('/home/tj/.cache/cuteafd/quantization/deepseek-v41-exl3-k325-fp4ple-v1')
+    root = Path.home() / '.cache/cuteafd/quantization/deepseek-v41-exl3-k325-fp4ple-v1'
     base_state = root.parent / 'deepseek-v41-exl3-k325-v1/export-state/numbered-shards-v1'
-    hf = Path('/home/tj/.cache/huggingface')
+    hf = Path(HF_HOME)
     output = hf / 'cuteafd-exports/DeepSeek-V4.1-EXL3-K3.25-FP4PLE-v1'
     base_output = hf / 'cuteafd-exports/DeepSeek-V4.1-EXL3-K3.25-v1-numbered'
     pub = json.loads((root/'publication-complete.json').read_text())

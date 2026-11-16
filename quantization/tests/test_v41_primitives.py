@@ -6,6 +6,8 @@ import struct
 import tempfile
 import unittest
 
+from checkpoint_cache import local_snapshot
+
 import torch
 from transformers import DeepseekV41ForCausalLM, DeepseekV41TextConfig
 from transformers.models.deepseek_v41.modeling_deepseek_v41 import DeepseekV41EngramEmbedding
@@ -88,11 +90,11 @@ class V41PrimitivesTest(unittest.TestCase):
             state.advance(model.model.layers[0], "cpu")
 
     @torch.no_grad()
-    def test_expert_against_checkpoint_reference(self):
+    def _expert_against_checkpoint_reference(self, device):
+        self._require_device(device)
         # Execute the original definitions unchanged; unrelated TileLang attention
         # kernels are not needed for this floating-point expert comparison.
-        source = Path("/hf/hub/models--deepseek-ai--DeepSeek-V4.1-Flash/snapshots/"
-                      "dba1be0a40aa45a94ad051997016db3960a90277/inference/model.py")
+        source = local_snapshot(files=("inference/model.py",)) / "inference/model.py"
         tree = ast.parse(source.read_text())
         names = {"linear", "Linear", "Expert"}
         selected = ast.Module(body=[node for node in tree.body
@@ -101,19 +103,18 @@ class V41PrimitivesTest(unittest.TestCase):
         scope = dict(torch=torch, nn=torch.nn, F=torch.nn.functional,
                      default_dtype=torch.bfloat16, fp8_block_size=32)
         exec(compile(selected, str(source), "exec"), scope)
-        for device in ("cpu", "cuda:0", "cuda:1"):
-            for dtype in (torch.float32, torch.bfloat16):
-                torch.manual_seed(456)
-                original = scope["Expert"](64, 96, dtype=dtype, swiglu_limit=1.5).to(device)
-                ours = DeepSeekV41Expert(64, 96, 1.5, device=device, dtype=dtype)
-                for src, dst in ((original.w1, ours.gate_proj),
-                                 (original.w3, ours.up_proj), (original.w2, ours.down_proj)):
-                    src.weight.normal_(std=0.2)
-                    dst.weight.copy_(src.weight)
-                x = torch.randn(17, 64, device=device, dtype=dtype)
-                weights = torch.rand(17, device=device, dtype=torch.float32)
-                torch.testing.assert_close(ours(x, weights), original(x, weights[:, None]),
-                                           rtol=0, atol=0)
+        for dtype in (torch.float32, torch.bfloat16):
+            torch.manual_seed(456)
+            original = scope["Expert"](64, 96, dtype=dtype, swiglu_limit=1.5).to(device)
+            ours = DeepSeekV41Expert(64, 96, 1.5, device=device, dtype=dtype)
+            for src, dst in ((original.w1, ours.gate_proj),
+                             (original.w3, ours.up_proj), (original.w2, ours.down_proj)):
+                src.weight.normal_(std=0.2)
+                dst.weight.copy_(src.weight)
+            x = torch.randn(17, 64, device=device, dtype=dtype)
+            weights = torch.rand(17, device=device, dtype=torch.float32)
+            torch.testing.assert_close(ours(x, weights), original(x, weights[:, None]),
+                                       rtol=0, atol=0)
 
     @torch.no_grad()
     def test_defuse_full_five_layer_logits(self):
@@ -128,7 +129,8 @@ class V41PrimitivesTest(unittest.TestCase):
         self.assertEqual(sum("mlp.experts." in key for key in model.state_dict()), 60)
 
     @torch.no_grad()
-    def test_mapped_embedding_matches_transformers(self):
+    def _mapped_embedding_matches_transformers(self, device):
+        self._require_device(device)
         torch.manual_seed(321)
         weight = torch.randn(17, 256).to(torch.float8_e4m3fn)
         scale = torch.randint(122, 132, (17, 8), dtype=torch.uint8).view(torch.float8_e8m0fnu)
@@ -150,13 +152,28 @@ class V41PrimitivesTest(unittest.TestCase):
             try:
                 self.assertEqual(list(mapped.parameters()), [])
                 self.assertEqual(list(mapped.buffers()), [])
-                for device in ("cpu", "cuda:0", "cuda:1"):
-                    ids = torch.tensor([[[16, 0, 1], [3, 3, 16]]], device=device)
-                    actual = mapped(ids)
-                    torch.testing.assert_close(actual, oracle(ids), rtol=0, atol=0)
-                    self.assertEqual(mapped(torch.empty((0,), dtype=torch.long, device=device)).shape, (0, 256))
+                ids = torch.tensor([[[16, 0, 1], [3, 3, 16]]], device=device)
+                actual = mapped(ids)
+                torch.testing.assert_close(actual, oracle(ids), rtol=0, atol=0)
+                self.assertEqual(mapped(torch.empty((0,), dtype=torch.long, device=device)).shape, (0, 256))
             finally:
                 mapped.close()
+
+    def _require_device(self, device):
+        if device != "cpu" and (not torch.cuda.is_available() or torch.cuda.device_count() <= int(device[-1])):
+            self.skipTest(f"{device} is unavailable; CPU witness runs separately")
+
+
+def _device_test(method, device):
+    def test(self):
+        getattr(self, method)(device)
+    return test
+
+
+for _device in ("cpu", "cuda:0", "cuda:1"):
+    for _name in ("expert_against_checkpoint_reference", "mapped_embedding_matches_transformers"):
+        setattr(V41PrimitivesTest, f"test_{_name}_{_device.replace(':', '_')}",
+                _device_test("_" + _name, _device))
 
 
 if __name__ == "__main__":

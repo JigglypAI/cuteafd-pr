@@ -1,4 +1,4 @@
-"""Exercise publication against both Hub API generations without network/GPU."""
+"""Exercise qualified publication adapters without network/GPU."""
 import sys
 from pathlib import Path
 from unittest.mock import patch
@@ -25,13 +25,13 @@ def test_modern_api_preserves_upload_selection_and_uses_streaming_folder_api():
     assert api.received == selection
 
 
-def test_legacy_api_keeps_its_existing_resumable_implementation():
+def test_existing_adapter_is_not_replaced():
     class Api:
         def upload_large_folder(self):
             return "legacy"
 
     original = Api.upload_large_folder
-    with patch("huggingface_hub.HfApi", Api), patch("huggingface_hub.utils._runtime.is_xet_available", return_value=False):
+    with patch("huggingface_hub.HfApi", Api), patch("huggingface_hub.utils._runtime.is_xet_available", return_value=True):
         install_upload_compat()
     assert Api.upload_large_folder is original
 
@@ -41,7 +41,7 @@ def test_modern_api_refuses_nonresumable_fallback_without_xet():
         pass
 
     with patch("huggingface_hub.HfApi", Api), patch("huggingface_hub.utils._runtime.is_xet_available", return_value=False):
-        with pytest.raises(RuntimeError, match="requires hf_xet"):
+        with pytest.raises(ValueError, match="with Xet enabled"):
             install_upload_compat()
     assert not hasattr(Api, "upload_large_folder")
 

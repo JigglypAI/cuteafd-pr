@@ -12,6 +12,9 @@ import tempfile
 import time
 
 import numpy as np
+from huggingface_hub.constants import HF_HOME
+
+from hub_requirements import require_qualified_hub
 
 from export_assets import asset_target
 from stream_shard import read_header
@@ -20,10 +23,10 @@ from write_export import _fingerprint, _publish_json, _sync_dir
 BASE_REPO = 'wrldsuksgo2mars/DeepSeek-V4.1-EXL3-K3.25-v1'
 BASE_COMMIT = 'cfd4ca1d1934a8e81dd2d7515598d4ce288e8b88'
 REPO = 'wrldsuksgo2mars/DeepSeek-V4.1-EXL3-K3.25-FP4PLE-v1'
-HF = Path('/home/tj/.cache/huggingface')
+HF = Path(HF_HOME)
 BASE = HF / 'cuteafd-exports/DeepSeek-V4.1-EXL3-K3.25-v1-numbered'
-BASE_STATE = Path('/home/tj/.cache/cuteafd/quantization/deepseek-v41-exl3-k325-v1/export-state/numbered-shards-v1')
-ROOT = Path('/home/tj/.cache/cuteafd/quantization/deepseek-v41-exl3-k325-fp4ple-v1')
+BASE_STATE = Path.home() / '.cache/cuteafd/quantization/deepseek-v41-exl3-k325-v1/export-state/numbered-shards-v1'
+ROOT = Path.home() / '.cache/cuteafd/quantization/deepseek-v41-exl3-k325-fp4ple-v1'
 OUTPUT = HF / 'cuteafd-exports/DeepSeek-V4.1-EXL3-K3.25-FP4PLE-v1'
 CHUNK_ROWS = 262144  # 64 MiB source weights; total chunk storage < 128 MiB.
 
@@ -328,6 +331,7 @@ def publish(base_receipt,reused,changed):
     from huggingface_hub.errors import RepositoryNotFoundError
     from upload_model import _remote, _restored_operation
     from materialize_cache import materialize_cache
+    require_qualified_hub()
     api=HfApi()
     base_remote={n:{k:r[k] for k in ('bytes','blob')} for n,r in base_receipt['files'].items()}
     if _remote(api,BASE_REPO,BASE_COMMIT)!=base_remote:
