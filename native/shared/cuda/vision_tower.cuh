@@ -22,7 +22,7 @@ bool generic_projector_extent(const cuteafd_vision_spec& s,const cuteafd_vision_
 
 bool valid_generic_tower(const cuteafd_vision_spec& s) {
   if(!s.tower || s.perception || s.abi_version!=4 || s.geometry_reserved || !s.weight_bytes || s.weight_bytes>(5ULL<<30) ||
-     !s.max_tokens || s.max_tokens>16384 || s.patch_size!=14 || !s.blocks || !s.norm1_bias || !s.norm2_bias || !s.q_norm || !s.k_norm)return false;
+     !s.max_tokens || s.max_tokens>16698 || s.patch_size!=14 || !s.blocks || !s.norm1_bias || !s.norm2_bias || !s.q_norm || !s.k_norm)return false;
   const auto& t=*s.tower;
   if(t.version!=1 || t.size!=sizeof(t) || (t.block_norm_kind!=1 && t.block_norm_kind!=2) ||
      (t.activation!=1 && t.activation!=2) || !isfinite(t.block_norm_epsilon) || t.block_norm_epsilon<=0.f ||

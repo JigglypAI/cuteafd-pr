@@ -35,7 +35,7 @@ int main() {
   t.block_norm_epsilon=0;if(valid_generic_tower(s))return 6;t.block_norm_epsilon=0x1p-23f;
   t.projectors[0].input_width=1024;if(valid_generic_tower(s))return 7;t.projectors[0].input_width=4096;
   t.inv_freq[1]=s.weight_bytes;if(valid_generic_tower(s))return 8;t.inv_freq[1]=0;
-  for(auto policy: {std::pair<uint32_t,size_t>{16384,1509949696ULL}, {4096,377487616ULL}}) {
+  for(auto policy: {std::pair<uint32_t,size_t>{16698,1538887936ULL}, {16384,1509949696ULL}, {4096,377487616ULL}}) {
     s.max_tokens=policy.first;
     GenericTowerStorage sizing;
     size_t planned=scratch_generic_tower(s,nullptr,sizing);
