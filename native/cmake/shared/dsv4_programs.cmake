@@ -174,8 +174,9 @@ if(CUTEAFD_ENABLE_INKLING2_AOT)
     set(CUTEAFD_PROGRAM_GEOMETRY "${CUTEAFD_PROGRAM_GEOMETRY},inkling2")
   endif()
 endif()
-if(CUTEAFD_EXLR8_ROLE STREQUAL "spark" AND CUTEAFD_ENABLE_V41_EXPERT_AOT)
-  # The generic table carries native row-addressed variants beside the legacy ABI.
+if(CUTEAFD_ENABLE_V41_EXPERT_AOT)
+  # Coordinator planning reads Spark segment geometry from its own manifest;
+  # both images must carry the same native width inventory.
   set(CUTEAFD_PROGRAM_GEOMETRY "${CUTEAFD_PROGRAM_GEOMETRY},native_experts")
 endif()
 set(CUTEAFD_DSV4_DIR "${CMAKE_CURRENT_BINARY_DIR}/dsv4_programs")

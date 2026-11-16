@@ -59,12 +59,39 @@ pub fn validate_attention_format(cfg: &GlmDsaConfig, layer: usize, inventory: &C
     Ok(())
 }
 
-/// Validate the whole declared publication, including unused MTP projections.
-/// Serving owners below deliberately stop at the backbone's `cfg.layers`.
+fn validate_exlr8_attention(cfg: &GlmDsaConfig,
+    records: &[crate::plan::exlr8::dense::DenseRecord],
+    selection: &crate::plan::exlr8::dense::DenseSelection) -> Result<()> {
+    let backbone = selection.backbone(records, cfg.layers)?;
+    for layer in 0..cfg.layers {
+        for (leaf, expected) in [
+            ("q_b_proj", [cfg.heads * (cfg.qk_nope_head_dim + cfg.qk_rope_head_dim), cfg.q_lora_rank]),
+            ("o_proj", [cfg.hidden, cfg.heads * cfg.v_head_dim]),
+        ] {
+            let name = format!("{}.self_attn.{leaf}.weight", selection.layer_prefix(layer)?);
+            let mut matches = backbone.iter().filter(|record| record.tensor == name);
+            let record = matches.next().with_context(|| format!("{name}: missing native EXLR8 attention record"))?;
+            ensure!(matches.next().is_none(), "{name}: duplicate native EXLR8 attention record");
+            ensure!(record.shape == expected,
+                "{name}: expected native EXLR8 attention {expected:?}, found {:?}", record.shape);
+        }
+    }
+    Ok(())
+}
+
+/// Validate HF publication attention (including unused MTP) or EXLR8's selected
+/// native backbone records. Physical EXLR8 owners remain in its NativePlan.
 pub fn validate_native_attention(cfg: &GlmDsaConfig, checkpoint: &Checkpoint) -> Result<()> {
     use crate::plan::checkpoint::ProjectionStorage;
     use cuteafd_core::DType;
     if !cfg.variant.is_glm() { return Ok(()); }
+    let exlr8 = checkpoint.view.as_ref().is_none_or(|view| !view.mode().compact())
+        && crate::plan::exlr8::recognizes(&checkpoint.snapshot)?;
+    if exlr8 {
+        let records = crate::plan::exlr8::dense::DenseRecord::inventory(&checkpoint.snapshot)?;
+        let selection = crate::plan::exlr8::dense::DenseSelection::from_hf(&checkpoint.config)?;
+        return validate_exlr8_attention(cfg, &records, &selection);
+    }
     let layers = cfg.layers.checked_add(cfg.mtp_layers).context("GLM publication layer overflow")?;
     for layer in 0..layers {
         for (leaf, expected) in [
@@ -778,6 +805,60 @@ mod tests {
         assert!(mtp.keys().all(|name| !fp8.converts_to_fp8(name)));
         let core = CoreInventory::from_checkpoint(&cfg, &fp8)?;
         assert!(core.native.get(cfg.head()).is_some_and(|head| head.fp8));
+        Ok(())
+    }
+
+    #[test]
+    fn exlr8_attention_requires_every_backbone_record_and_logical_shape() -> Result<()> {
+        use crate::plan::exlr8::dense::{DenseRecord, DenseSelection};
+        let dir = tempfile::tempdir()?;
+        crate::plan::testing::exlr8::glm_snapshot(dir.path());
+        let config = crate::plan::testing::glm5_config();
+        let cfg = GlmDsaConfig::from_hf(&config)?;
+        let selection = DenseSelection::from_hf(&config)?;
+        let template = DenseRecord::inventory(dir.path())?.remove(0);
+        let mut records = Vec::new();
+        for layer in 0..cfg.layers {
+            for (leaf, shape) in [
+                ("q_b_proj", [cfg.heads * (cfg.qk_nope_head_dim + cfg.qk_rope_head_dim), cfg.q_lora_rank]),
+                ("o_proj", [cfg.hidden, cfg.heads * cfg.v_head_dim]),
+            ] {
+                let mut record = template.clone();
+                record.tensor = format!("model.layers.{layer}.self_attn.{leaf}.weight");
+                record.shape = shape.to_vec();
+                records.push(record);
+            }
+        }
+        validate_exlr8_attention(&cfg, &records, &selection)?;
+        let removed = records.pop().unwrap();
+        let error = validate_exlr8_attention(&cfg, &records, &selection).unwrap_err().to_string();
+        assert!(error.contains(&removed.tensor) && error.contains("missing native EXLR8 attention record"), "{error}");
+        records.push(removed.clone());
+        records.last_mut().unwrap().shape[1] -= 128;
+        let error = validate_exlr8_attention(&cfg, &records, &selection).unwrap_err().to_string();
+        assert!(error.contains(&removed.tensor) && error.contains("expected native EXLR8 attention"), "{error}");
+        records.pop();
+        records.push(removed.clone());
+        records.push(removed);
+        assert!(validate_exlr8_attention(&cfg, &records, &selection).unwrap_err().to_string().contains("duplicate"));
+        // The real header-native inventory must not bypass the same missing-record contract.
+        let checkpoint = Checkpoint::inventory(dir.path())?;
+        assert!(validate_native_attention(&cfg, &checkpoint).unwrap_err().to_string()
+            .contains("missing native EXLR8 attention record"));
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires CUTEAFD_EXLR8_TEST_SNAPSHOT installed GLM EXLR8 checkpoint headers"]
+    fn installed_exlr8_attention_validates_native_records_without_hf_projection_headers() -> Result<()> {
+        let snapshot = std::path::PathBuf::from(std::env::var_os("CUTEAFD_EXLR8_TEST_SNAPSHOT")
+            .context("CUTEAFD_EXLR8_TEST_SNAPSHOT required")?);
+        let checkpoint = Checkpoint::inventory(&snapshot)?;
+        let cfg = GlmDsaConfig::from_hf(&checkpoint.config)?;
+        validate_native_attention(&cfg, &checkpoint)?;
+        let inventory = CoreInventory::from_checkpoint(&cfg, &checkpoint)?;
+        assert!(inventory.projections.is_empty() && inventory.native.is_empty(),
+            "EXLR8 physical dense charges belong to NativePlan, not the HF core inventory");
         Ok(())
     }
 
