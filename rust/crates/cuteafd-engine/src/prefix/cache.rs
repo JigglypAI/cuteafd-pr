@@ -139,7 +139,13 @@ pub struct PrefixStats {
     /// Hits on a partial match (replay window, approximate positional state).
     pub partial_hits: u64,
     pub hit_tokens: u64,
-    pub promotions: u64,
+    /// Host-tier restores: a lookup that re-inserted the entry from the host cache
+    /// (`host_mark: Some(..)`). Not [`Self::mark_promotions`], which counts host mark
+    /// copies that do not copy resident pages.
+    ///
+    /// The wire key stays `promotions` so existing `/v1/stats` consumers do not break.
+    #[serde(rename = "promotions")]
+    pub host_promotions: u64,
     pub device_hits: u64,
     pub host_hits: u64,
     /// Host mark copies without copying already-resident KV pages.
@@ -1693,7 +1699,7 @@ impl<E: CopyEngine, M: Clone + Default> PrefixCache<E, M> {
         if let Some(evicted) = self.retained.bank_mut(hit.kind).insert(&snapshot_tokens, id) {
             self.evict(family, evicted)?;
         }
-        self.stats.promotions += 1;
+        self.stats.host_promotions += 1;
         Ok(if let Some(compatible) = compatible {
             self.device_compatible_hit(tokens, media, sampled, compatible)
         } else { self.lookup_media(tokens, media, sampled) })
