@@ -409,6 +409,13 @@ def test_optional_levers_are_default_off_and_documented():
                 assert lever["families"] == ["Muse"]
                 assert default == "family default"
                 assert 'muse_kv_cache="$(get KV_CACHE bf16)"' in (ROOT / "scripts/launch/run-family.sh").read_text()
+            elif key == "SPECULATOR_FP8":
+                assert lever["families"] == ["Kimi K3"]
+                assert default == "auto"
+                source = (ROOT / "rust/crates/cuteafd-core/src/launch_settings.rs").read_text()
+                assert 'selected(explicit, None, dflash,' in source
+                assert 'kimi_draft_fp8(args.draft_fp8, args.speculator == "dflash2")' in (
+                    ROOT / "rust/crates/cuteafd-daemon/src/commands/plan.rs").read_text()
             else:
                 assert default.startswith(("off", "unset")), \
                     f"lever {key} default is {default!r}, not off/unset"
