@@ -548,7 +548,7 @@ mod tests {
         use cuteafd_loader::media::{EncoderId, ImageGrid, PreparedImage, PreprocessId};
         let grid = ImageGrid { t: 1, h: 2, w: 2 };
         let processor = PreprocessId([2; 32]);
-        let rgb: Arc<[u8]> = Arc::from([37; 48]);
+        let rgb: Arc<[u8]> = Arc::from([37; 28*28*3]);
         let source = PreparedImage::key_for(EncoderId([120; 32]), processor, grid, &rgb);
         let image = Arc::new(PreparedImage { key: PreparedImage::key_for(EncoderId([121; 32]), processor, grid, &rgb),
             encoder: EncoderId([121; 32]), processor, grid, rgb8: rgb, pixels:cuteafd_core::media::ImagePixels::full(28,28), tokens: 1 });
