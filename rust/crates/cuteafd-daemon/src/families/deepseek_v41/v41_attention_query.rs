@@ -269,7 +269,7 @@ impl<'w, 'a> AttentionQueryWave<'w, 'a> {
     pub(crate) fn visit_graph_banks(&mut self, f: &mut dyn FnMut(i32, &'static str, bool, &mut dyn CacheAttached) -> Result<()>) -> Result<()> {
         let device = self.input().device_id;
         f(device, "v41.attention.query", false, &mut self.graphs)?;
-        f(device, "v41.attention.query.tp2_prefix", true, &mut self.tp2_prefix_graphs)
+        f(device, "v41.attention.query.tp2_prefix", false, &mut self.tp2_prefix_graphs)
     }
 
     /// Reuse this lane's storage with another layer's weights. Existing output
@@ -464,7 +464,7 @@ impl AttentionQueryWave<'_, '_> {
             (Ok(()), Ok((graph, nodes, width, spans, _))) => {
                 let graphs = if prefix { &mut self.tp2_prefix_graphs } else { &mut self.graphs };
                 if let Err(error) = unsafe {
-                    graphs.cache_insert(self.weights.layer, self.weights, rows, graph, ticket, nodes as u64, width, spans || prefix)
+                    graphs.cache_insert(self.weights.layer, self.weights, rows, graph, ticket, nodes as u64, width, spans)
                 } {
                     unsafe {
                         self.storage.stream.library.cuda_graph_exec_destroy(graph)?;
