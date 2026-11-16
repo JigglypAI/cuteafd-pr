@@ -390,7 +390,7 @@ def test_qwen_graph_cache_precedes_ready_and_diagnostics_bypass_capture():
     replay = engine[engine.index("    fn replay(&self, key: GraphKey"):engine.index("    fn miss_graph(")]
     assert "if !self.graph_capture.get() || (!self.graph_warmed.get() && !self.warming_graphs.get()) {" in replay
     assert "if !self.warming_graphs.get() { self.miss_graph(key); }" in replay
-    assert "let Some(ticket) = ticket else {" in replay
+    assert "let Some(mut ticket) = ticket else {" in replay
     assert 'crate::shared::decode_graph::note_eager("qwen4", &variant' in engine
     assert "segment()?;\n            return self.ple_consumed(&key);" in replay
     graphed = engine[engine.index("    fn decode_graphed("):engine.index("    fn replay(")]

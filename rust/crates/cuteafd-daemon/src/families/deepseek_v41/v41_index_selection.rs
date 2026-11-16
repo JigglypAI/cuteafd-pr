@@ -390,7 +390,7 @@ impl<'a> IndexSelectionWave<'a> {
         // SAFETY: only commands are recorded; real metadata is uploaded before replay.
         unsafe { ticket.capture_result(crate::shared::decode_graph::begin_capture(&self.storage.stream.library, self.storage.stream.raw, &ticket))?; }
         let recorded = unsafe { self.enqueue(query, &[source], &groups, shared, rows, 1, DECODE_WIDTH_BUCKET, false) };
-        let captured = unsafe { ticket.capture_result(self.storage.stream.library.cuda_graph_end_capture_topology(self.storage.stream.raw)) };
+        let captured = unsafe { let captured = crate::shared::decode_graph::end_capture(&self.storage.stream.library, self.storage.stream.raw, &mut ticket); ticket.capture_result(captured) };
         match (recorded, captured) {
             (Ok(()), Ok((graph, nodes, width, spans, _))) => {
                 if let Err(error) = self.insert_graph(graph, key, ticket, nodes as u64, width, spans) {
@@ -739,7 +739,7 @@ impl<'a> IndexSelectionWave<'a> {
             let launched = unsafe {
                 self.enqueue(&geometry, &sources, &groups, shared_blocks, rows, tiles, width, use_candidates)
             };
-            let captured = unsafe { ticket.capture_result(self.storage.stream.library.cuda_graph_end_capture_topology(self.storage.stream.raw)) };
+            let captured = unsafe { let captured = crate::shared::decode_graph::end_capture(&self.storage.stream.library, self.storage.stream.raw, &mut ticket); ticket.capture_result(captured) };
             match (launched, captured) {
                 (Ok(()), Ok((g, nodes, parallel_width, spans, _))) => {
                     if let Err(error) = self.insert_graph(g, fingerprint, ticket, nodes as u64, parallel_width, spans) {

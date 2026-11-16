@@ -1,5 +1,14 @@
 //! Canonical serving decode shapes and exact-key graph ownership.
 
+#[derive(Clone, Copy, Default)]
+struct Options { no_prewarm: bool, donor_always: bool }
+static OPTIONS: std::sync::OnceLock<Options> = std::sync::OnceLock::new();
+pub(crate) fn configure(no_prewarm: bool, donor_always: bool) {
+    assert!(OPTIONS.set(Options { no_prewarm, donor_always }).is_ok(), "graph policy configured twice");
+}
+pub(crate) fn prewarm_enabled() -> bool { !OPTIONS.get().copied().unwrap_or_default().no_prewarm }
+fn donor_always() -> bool { OPTIONS.get().copied().unwrap_or_default().donor_always }
+
 /// Object-safe control surface for a family's heterogeneous graph owners.
 /// The caller drains the complete submitted step before invoking `drain`.
 pub(crate) trait CacheAttached {
@@ -60,6 +69,16 @@ pub(crate) unsafe fn begin_capture(library: &cuteafd_ffi::NativeLibrary,
     ticket.require_active()?;
     // SAFETY: forwarded stream ownership and captured-storage contract.
     unsafe { library.cuda_graph_begin_capture(stream) }
+}
+
+/// # Safety
+/// The caller owns capture and retains all recorded operands through replay.
+pub(crate) unsafe fn end_capture(library: &cuteafd_ffi::NativeLibrary,
+    stream: *mut std::ffi::c_void, ticket: &mut CaptureTicket)
+    -> anyhow::Result<(*mut std::ffi::c_void, usize, usize, bool, Option<String>)> {
+    // SAFETY: forwarded stream capture and operand lifetime contract.
+    let source = unsafe { library.cuda_graph_capture_source(stream) }?;
+    ticket.complete_source(library, source, stream)
 }
 
 /// # Safety

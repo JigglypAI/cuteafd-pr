@@ -80,7 +80,7 @@ impl<'a> Graphs<'a> {
                 unsafe { crate::shared::decode_graph::launch(&stream.device.library, raw, stream.raw) }
             });
         }
-        let Some(ticket) = self.bank.borrow_mut().cache_ticket(&key, self.pins.contains(&key.rows), None) else { return work() };
+        let Some(mut ticket) = self.bank.borrow_mut().cache_ticket(&key, self.pins.contains(&key.rows), None) else { return work() };
         stream.device.run(|| {
             let library = stream.device.library;
             // SAFETY: sections contain only ordered launches on this stream, with persistent storage.
@@ -92,7 +92,7 @@ impl<'a> Graphs<'a> {
             }
             let result = work();
             // SAFETY: always end this stream's capture, including a failed section.
-            let captured = unsafe { library.cuda_graph_end_capture_topology(stream.raw) };
+            let captured = unsafe { crate::shared::decode_graph::end_capture(&library, stream.raw, &mut ticket) };
             if let Err(error) = result {
                 self.bank.borrow_mut().cache_ticket_failed(ticket, captured.as_ref().err().unwrap_or(&error));
                 if let Ok((raw, ..)) = captured {

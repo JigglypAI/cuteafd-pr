@@ -2358,7 +2358,7 @@ impl<'a> GlmEngine<'a> {
         }
         if !self.graphs_warmed.get() && !self.graphs_warming.get() { return segment(); }
         let pinned = self.prewarm_pins(&key);
-        let Some(ticket) = graphs.borrow_mut().cache_ticket(&key, pinned, self.graph_estimate(&key)) else { return segment() };
+        let Some(mut ticket) = graphs.borrow_mut().cache_ticket(&key, pinned, self.graph_estimate(&key)) else { return segment() };
         // No synchronization here: peer segments may not yet have been queued.
         // SAFETY: capture records launches on this rank's persistent stream.
         if let Err(error) = self.on(rank, || unsafe { crate::shared::decode_graph::begin_capture(&self.library, stream, &ticket) }) {
@@ -2368,7 +2368,7 @@ impl<'a> GlmEngine<'a> {
             return segment();
         }
         let captured = segment();
-        let exec = self.on(rank, || unsafe { self.library.cuda_graph_end_capture_topology(stream) });
+        let exec = self.on(rank, || unsafe { crate::shared::decode_graph::end_capture(&self.library, stream, &mut ticket) });
         if let Err(error) = captured {
             graphs.borrow_mut().cache_ticket_failed(ticket, exec.as_ref().err().unwrap_or(&error));
             if let Ok((raw, _, _, _, _)) = exec { drop(GraphExec(raw, self.library)); }

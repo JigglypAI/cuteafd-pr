@@ -740,6 +740,7 @@ fn worker(
     unsafe { // SAFETY: V4.1 graph owners borrow persistent engine storage only.
         crate::shared::decode_graph::device::observe_completed(&lib, &mut visit) }?;
     drop(visit);
+    if crate::shared::decode_graph::prewarm_enabled() {
     let local = std::array::from_fn(|layer| transport.has_local_layer(layer));
     for (site, result) in [("target pass 0", pass.capture_startup(requests.cache(), &local)),
         ("target pass 1", second.capture_startup(requests.cache(), &local))] {
@@ -756,6 +757,7 @@ fn worker(
         if let Err(error) = draft.capture_startup() {
             tracing::warn!(%error, "V4.1 best-effort draft graph prewarm failed");
         }
+    }
     }
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()

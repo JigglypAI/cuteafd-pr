@@ -124,6 +124,12 @@ pub(crate) struct Cli {
     /// Per-rank idle MemAvailable samples from the launcher (JSON, boot-keyed).
     #[arg(long, global = true)]
     pub(crate) spark_memory_samples: Option<String>,
+    /// Skip startup graph prewarm (V4.1 and GLM Flash); retain lazy runtime capture.
+    #[arg(long, global = true)]
+    pub(crate) graph_no_prewarm: bool,
+    /// Prefer a cold compatible donor even below the graph soft cap.
+    #[arg(long, global = true)]
+    pub(crate) graph_donor_always: bool,
     /// Minimum physical GPU free bytes after graph capture (default MEMORY_PADDING/2); size or gpuN=size, 0 disables.
     #[arg(long, global = true)]
     pub(crate) graph_disable_low_mem: Option<String>,

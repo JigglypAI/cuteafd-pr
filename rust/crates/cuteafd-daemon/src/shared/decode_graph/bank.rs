@@ -49,6 +49,11 @@ struct Entry<E> {
     exec: E,
     cached: Option<(u64, bool)>,
     pinned_slot: Option<usize>,
+    token: Option<std::sync::Arc<super::device::HitToken>>,
+}
+
+impl<E> Entry<E> {
+    fn valid(&self) -> bool { self.token.as_ref().is_none_or(|token| token.valid()) }
 }
 
 struct DeviceBinding {
@@ -57,14 +62,18 @@ struct DeviceBinding {
     site: super::device::Site,
     pinned_hits: u64,
     pinned_counts: Vec<(u64, u64)>,
+    touched: Vec<usize>,
+    clocks: std::sync::Arc<[super::device::EpochClock; 2]>,
+    lane: usize,
 }
 
 impl DeviceBinding {
     fn flush(&mut self, cache: &mut super::device::DeviceCache) {
         if std::mem::take(&mut self.pinned_hits) == 0 { return }
         cache.sample_clock();
-        for (id, count) in &mut self.pinned_counts {
-            cache.pinned_hits(*id, self.site.cycle, std::mem::take(count));
+        for slot in self.touched.drain(..) {
+            let (id, count) = &mut self.pinned_counts[slot];
+            cache.batched_hits(*id, self.site.cycle, std::mem::take(count));
         }
     }
 }
@@ -74,10 +83,12 @@ pub(crate) struct CaptureTicket {
     id: u64,
     pinned: bool,
     committed: bool,
+    updated: bool,
 }
 
 fn capture_failed(cache: &super::device::SharedCache, id: u64, error: &anyhow::Error) -> bool {
     let mut cache = cache.lock().unwrap_or_else(|p| p.into_inner());
+    cache.source_capture_failed(id, error.downcast_ref::<cuteafd_ffi::SmallGraphCapture>().map(|small| small.nodes));
     if let Some(small) = error.downcast_ref::<cuteafd_ffi::SmallGraphCapture>() {
         cache.capture_too_small(id, small.nodes);
         false
@@ -96,12 +107,49 @@ impl CaptureTicket {
         Ok(())
     }
 
+    /// Finish an uninstantiated capture, preferring an atomic cold-donor update.
+    /// A rejected source returns the ordinary eager sentinel used by capture sites.
+    pub fn complete_source(&mut self, library: &cuteafd_ffi::NativeLibrary,
+        source: cuteafd_ffi::GraphSource<'_>, stream: *mut std::ffi::c_void)
+        -> anyhow::Result<(*mut std::ffi::c_void, usize, usize, bool, Option<String>)> {
+        let inspection_error = source.inspection_error.clone();
+        let mut cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());
+        if cache.updating(self.id) {
+            cache.register_native(self.id, 0, source.signature.clone());
+            if let Some(exec) = cache.finish_update(self.id,
+                |exec| source.update(exec).map(|result| result.accepted()),
+                |exec| source.transfer(exec),
+                |exec| { if let Err(error) = library.cuda_graph_exec_invalidate(exec) {
+                    tracing::error!(%error, "invalidating rejected donor");
+                } }) {
+                self.updated = true;
+                return Ok((exec as *mut _, source.nodes, source.width, source.spans_devices, inspection_error));
+            }
+            match cache.fallback_update(self.id) {
+                super::device::Miss::Capture(id) => self.id = id,
+                super::device::Miss::Eager => {
+                    self.committed = true;
+                    return Err(cuteafd_ffi::GraphCacheEager.into());
+                }
+            }
+        }
+        // Instantiation/upload and budget sampling may block. Telemetry and
+        // physical observers must not wait on CUDA while holding this mutex.
+        drop(cache);
+        let exec = source.instantiate(stream)?;
+        self.cache.lock().unwrap_or_else(|p| p.into_inner())
+            .register_native(self.id, exec as usize, source.signature.clone());
+        Ok((exec, source.nodes, source.width, source.spans_devices, inspection_error))
+    }
+
     /// Keep native results and error precedence; settle failure before Drop can
     /// discard an OOM ghost. `committed` also prevents reporting twice.
     pub fn capture_result<T>(&mut self, result: anyhow::Result<T>) -> anyhow::Result<T> {
         if let Err(error) = &result {
             if !self.committed {
-                if capture_failed(&self.cache, self.id, error) {
+                if self.updated {
+                    self.cache.lock().unwrap_or_else(|p| p.into_inner()).remove_drained(&[self.id]);
+                } else if capture_failed(&self.cache, self.id, error) {
                     tracing::warn!(%error, "graph capture unavailable");
                 }
                 self.committed = true;
@@ -114,7 +162,9 @@ impl CaptureTicket {
 impl Drop for CaptureTicket {
     fn drop(&mut self) {
         if !self.committed {
-            self.cache.lock().unwrap_or_else(|p| p.into_inner()).cancel_capture(self.id);
+            let mut cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());
+            if self.updated { cache.remove_drained(&[self.id]); }
+            else { cache.cancel_capture(self.id); }
         }
     }
 }
@@ -145,7 +195,8 @@ impl<K: Hash + Eq + Clone + std::fmt::Debug, E> GraphBank<K, E> {
         anyhow::ensure!(self.entries.is_empty() && self.device.is_none(), "graph bank already attached or populated");
         let cache = super::device::device_cache(library, device, reserve, site.basis)?;
         let bank = cache.lock().unwrap_or_else(|p| p.into_inner()).bank();
-        self.device = Some(DeviceBinding { cache, bank, site, pinned_hits: 0, pinned_counts: Vec::new() });
+        let (clocks, lane) = cache.lock().unwrap_or_else(|p| p.into_inner()).bank_clock(bank);
+        self.device = Some(DeviceBinding { cache, bank, site, pinned_hits: 0, pinned_counts: Vec::new(), touched: Vec::new(), clocks, lane });
         Ok(())
     }
 
@@ -156,7 +207,8 @@ impl<K: Hash + Eq + Clone + std::fmt::Debug, E> GraphBank<K, E> {
         anyhow::ensure!(self.entries.is_empty() && self.device.is_none(), "graph bank already attached or populated");
         let cache = super::device::device_cache_sampled(device, reserve, site.basis, || Ok((0, 0, 0, 0, 0)))?;
         let bank = cache.lock().unwrap_or_else(|p| p.into_inner()).bank();
-        self.device = Some(DeviceBinding { cache, bank, site, pinned_hits: 0, pinned_counts: Vec::new() });
+        let (clocks, lane) = cache.lock().unwrap_or_else(|p| p.into_inner()).bank_clock(bank);
+        self.device = Some(DeviceBinding { cache, bank, site, pinned_hits: 0, pinned_counts: Vec::new(), touched: Vec::new(), clocks, lane });
         Ok(())
     }
 
@@ -164,11 +216,13 @@ impl<K: Hash + Eq + Clone + std::fmt::Debug, E> GraphBank<K, E> {
     /// fast path and flushing its previous cycle before switching.
     pub fn cache_cycle(&mut self, cycle: super::device::Cycle) {
         if let Some(binding) = &mut self.device {
+            if binding.site.cycle == cycle { return }
             let shared = binding.cache.clone();
             let mut cache = shared.lock().unwrap_or_else(|p| p.into_inner());
             cache.sample_clock();
             if binding.site.cycle != cycle {
                 binding.flush(&mut cache);
+                cache.bank_cycle(binding.bank, cycle);
                 binding.site.cycle = cycle;
             }
         }
@@ -176,18 +230,22 @@ impl<K: Hash + Eq + Clone + std::fmt::Debug, E> GraphBank<K, E> {
 
     pub fn cached_launch(&mut self, key: &K) -> Option<&E> {
         let entry = self.entries.get_mut(key)?;
-        if let (Some(binding), Some((id, pinned))) = (&mut self.device, entry.cached) {
-            if pinned {
-                binding.pinned_hits += 1;
-                binding.pinned_counts[entry.pinned_slot.expect("pinned cache slot")].1 += 1;
-            } else {
-                binding.cache.lock().unwrap_or_else(|p| p.into_inner()).hit_cycle(id, binding.site.cycle);
+        if !entry.valid() { return None }
+        if let (Some(binding), Some(_)) = (&mut self.device, entry.cached) {
+            if let Some(token) = &entry.token {
+                token.hit(binding.clocks[binding.lane].index.load(std::sync::atomic::Ordering::Relaxed));
             }
+            binding.pinned_hits += 1;
+            let slot = entry.pinned_slot.expect("cache hit slot");
+            let count = &mut binding.pinned_counts[slot].1;
+            if *count == 0 { binding.touched.push(slot); }
+            *count += 1;
         }
         Some(&entry.exec)
     }
 
     pub fn cache_miss(&mut self, key: &K, pinned: bool, node_estimate: Option<super::device::Estimate>) -> super::device::Miss {
+        if self.entries.contains_key(key) && !self.valid_entry(key) { self.entries.remove(key); }
         let Some(binding) = &self.device else { return super::device::Miss::Eager };
         let identity = if let Some(identity) = self.cache_keys.get(key) { identity.clone() } else {
             self.next_cache_key = self.next_cache_key.checked_add(1).expect("graph key identity exhausted");
@@ -197,18 +255,26 @@ impl<K: Hash + Eq + Clone + std::fmt::Debug, E> GraphBank<K, E> {
             self.cache_keys_dirty = true;
             identity
         };
-        binding.cache.lock().unwrap_or_else(|p| p.into_inner()).miss(identity, binding.site, node_estimate, pinned)
+        let mut cache = binding.cache.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(id) = cache.update_ticket(identity.clone(), binding.site, node_estimate.clone(), pinned) {
+            return super::device::Miss::Capture(id);
+        }
+        cache.miss(identity, binding.site, node_estimate, pinned)
     }
 
     fn cache_insert(&mut self, key: K, exec: E, id: u64, pinned: bool) {
-        let pinned_slot = if pinned {
-            self.device.as_mut().map(|binding| {
-                let slot = binding.pinned_counts.len();
-                binding.pinned_counts.push((id, 0));
-                slot
-            })
-        } else { None };
-        self.entries.insert(key, Entry { exec, cached: Some((id, pinned)), pinned_slot });
+        let pinned_slot = self.device.as_mut().map(|binding| {
+            let slot = binding.pinned_counts.len();
+            binding.pinned_counts.push((id, 0));
+            // Reserve on insertion, not the first hit of a new cycle.
+            if binding.touched.capacity() < binding.pinned_counts.len() {
+                binding.touched.reserve(binding.pinned_counts.len() - binding.touched.len());
+            }
+            slot
+        });
+        let token = self.device.as_ref().map(|binding|
+            binding.cache.lock().unwrap_or_else(|p| p.into_inner()).hit_token(id));
+        self.entries.insert(key, Entry { exec, cached: Some((id, pinned)), pinned_slot, token });
     }
 
     pub fn cache_attached(&self) -> bool { self.device.is_some() }
@@ -217,7 +283,7 @@ impl<K: Hash + Eq + Clone + std::fmt::Debug, E> GraphBank<K, E> {
     /// failed path cancels the ticket, without synchronizing a peer segment.
     pub fn cache_ticket(&mut self, key: &K, pinned: bool, estimate: Option<super::device::Estimate>) -> Option<CaptureTicket> {
         let super::device::Miss::Capture(id) = self.cache_miss(key, pinned, estimate) else { return None };
-        Some(CaptureTicket { cache: self.device.as_ref()?.cache.clone(), id, pinned, committed: false })
+        Some(CaptureTicket { cache: self.device.as_ref()?.cache.clone(), id, pinned, committed: false, updated: false })
     }
 
     pub fn cache_commit(&mut self, key: K, exec: E, mut ticket: CaptureTicket,
@@ -225,14 +291,14 @@ impl<K: Hash + Eq + Clone + std::fmt::Debug, E> GraphBank<K, E> {
         let binding = self.device.as_ref().expect("graph capture requires an attached device cache");
         assert!(std::sync::Arc::ptr_eq(&binding.cache, &ticket.cache), "graph ticket belongs to a different device cache");
         assert!(!ticket.committed, "graph capture ticket already settled");
-        self.cache_topology(ticket.id, nodes, width, spans_devices);
+        if !ticket.updated { self.cache_topology(ticket.id, nodes, width, spans_devices); }
         self.cache_insert(key.clone(), exec, ticket.id, ticket.pinned);
         ticket.committed = true;
-        let retained = ticket.cache.lock().unwrap_or_else(|p| p.into_inner()).completed_capture(ticket.id);
+        let retained = ticket.updated || ticket.cache.lock().unwrap_or_else(|p| p.into_inner()).completed_capture(ticket.id);
         if !retained {
             // The caller may already hold the raw executable for its first
             // launch. Retain its owner until ordinary drained bank teardown.
-            if let Some(entry) = self.entries.get_mut(&key) { entry.cached = None; }
+            if let Some(entry) = self.entries.get_mut(&key) { entry.cached = None; entry.token = None; }
         }
     }
 
@@ -245,7 +311,10 @@ impl<K: Hash + Eq + Clone + std::fmt::Debug, E> GraphBank<K, E> {
 
     /// Consume a failed reservation without cancelling its retained OOM ghost.
     pub fn cache_ticket_failed(&mut self, mut ticket: CaptureTicket, error: &anyhow::Error) -> bool {
-        let warn = if ticket.committed { false } else { self.cache_capture_failed(ticket.id, error) };
+        let warn = if ticket.committed { false } else if ticket.updated {
+            ticket.cache.lock().unwrap_or_else(|p| p.into_inner()).remove_drained(&[ticket.id]);
+            true
+        } else { self.cache_capture_failed(ticket.id, error) };
         ticket.committed = true;
         warn
     }
@@ -262,6 +331,10 @@ impl<K: Hash + Eq + Clone + std::fmt::Debug, E> GraphBank<K, E> {
 
     /// Explicit teardown only, after the caller drains all consumers.
     pub fn cache_clear_drained(&mut self) {
+        if let Some(binding) = &self.device {
+            let ids: Vec<_> = self.entries.values().filter_map(|entry| entry.cached.map(|(id, _)| id)).collect();
+            binding.cache.lock().unwrap_or_else(|p| p.into_inner()).retire_native_counts(&ids);
+        }
         self.entries.clear();
         self.cache_keys.clear();
         self.retired.clear();
@@ -280,6 +353,9 @@ impl<K: Hash + Eq + Clone + std::fmt::Debug, E> GraphBank<K, E> {
     pub fn cache_remove_drained(&mut self, matches: impl Fn(&K) -> bool) {
         let keys: Vec<_> = self.entries.keys().filter(|key| matches(key)).cloned().collect();
         let ids: Vec<_> = keys.iter().filter_map(|key| self.entries.get(key)?.cached.map(|(id, _)| id)).collect();
+        if let Some(binding) = &self.device {
+            binding.cache.lock().unwrap_or_else(|p| p.into_inner()).retire_native_counts(&ids);
+        }
         for key in keys { self.entries.remove(&key); }
         if let Some(binding) = &self.device {
             binding.cache.lock().unwrap_or_else(|p| p.into_inner()).remove_drained(&ids);
@@ -291,7 +367,18 @@ impl<K: Hash + Eq + Clone + std::fmt::Debug, E> GraphBank<K, E> {
             let shared = binding.cache.clone();
             let mut cache = shared.lock().unwrap_or_else(|p| p.into_inner());
             binding.flush(&mut cache);
-            if self.cache_keys_dirty || self.cache_key_generation != cache.identity_generation() {
+            let changed = self.cache_keys_dirty || self.cache_key_generation != cache.identity_generation();
+            if changed || binding.pinned_counts.len() > self.entries.len() {
+                self.entries.retain(|_, entry| entry.valid());
+                binding.pinned_counts.clear();
+                for entry in self.entries.values_mut() {
+                    if let Some((id, _)) = entry.cached {
+                        entry.pinned_slot = Some(binding.pinned_counts.len());
+                        binding.pinned_counts.push((id, 0));
+                    }
+                }
+            }
+            if changed {
                 self.cache_keys.retain(|_, identity| cache.retains_identity(identity));
                 self.cache_keys_dirty = false;
                 self.cache_key_generation = cache.identity_generation();
@@ -301,8 +388,9 @@ impl<K: Hash + Eq + Clone + std::fmt::Debug, E> GraphBank<K, E> {
     }
 
     pub fn cache_lane_owner(&mut self, lane: usize) {
-        if let Some(binding) = &self.device {
+        if let Some(binding) = &mut self.device {
             binding.cache.lock().unwrap_or_else(|p| p.into_inner()).assign_bank_lane(binding.bank, lane);
+            binding.lane = lane;
         }
     }
 
@@ -333,6 +421,8 @@ impl<K: Hash + Eq + Clone + std::fmt::Debug, E> GraphBank<K, E> {
             self.entries.iter().filter_map(|(key, entry)| entry.cached
                 .filter(|(id, _)| cache.persistent_victim_ready(*id)).map(|(id, _)| (key.clone(), id))).collect()
         };
+        binding.cache.lock().unwrap_or_else(|p| p.into_inner()).retire_native_counts(
+            &victims.iter().map(|(_, id)| *id).collect::<Vec<_>>());
         for (key, _) in &victims { self.entries.remove(key); }
         if !victims.is_empty() {
             binding.cache.lock().unwrap_or_else(|p| p.into_inner()).destroyed(
@@ -355,6 +445,8 @@ impl<K: Hash + Eq + Clone + std::fmt::Debug, E> GraphBank<K, E> {
         };
         if !victims.is_empty() {
             drain()?;
+            binding.cache.lock().unwrap_or_else(|p| p.into_inner()).retire_native_counts(
+                &victims.iter().map(|(_, id)| *id).collect::<Vec<_>>());
             for (key, _) in &victims { if let Some(entry) = self.entries.remove(key) { self.retired.push(entry.exec); } }
             // drain_retired's ordering, with the already completed drain proof.
             self.retired.clear();
@@ -384,9 +476,15 @@ impl<K: Hash + Eq + Clone + std::fmt::Debug, E> GraphBank<K, E> {
             device, None, key, exec);
     }
 
-    pub fn get(&self, key: &K) -> Option<&E> { self.entries.get(key).map(|entry| &entry.exec) }
+    fn valid_entry(&self, key: &K) -> bool {
+        self.entries.get(key).is_some_and(Entry::valid)
+    }
+    pub fn get(&self, key: &K) -> Option<&E> {
+        let entry = self.entries.get(key)?;
+        entry.valid().then_some(&entry.exec)
+    }
     pub fn len(&self) -> usize { self.entries.len() }
-    pub fn contains(&self, key: &K) -> bool { self.entries.contains_key(key) }
+    pub fn contains(&self, key: &K) -> bool { self.valid_entry(key) }
     pub fn keys(&self) -> Vec<K> { self.entries.keys().cloned().collect() }
     pub fn count(&self, matches: impl Fn(&K) -> bool) -> usize {
         self.entries.keys().filter(|key| matches(key)).count()
@@ -411,6 +509,74 @@ mod device_tests {
     use super::*;
     use super::super::device::{Cycle, Miss, Preference, ReleaseMeasurement, Site};
     fn site() -> Site { Site { name: "bank-test", cycle: Cycle::Decode, preference: Preference::Capture, bootstrap: 10, basis: super::super::device::Basis::Bytes, spans_devices: false } }
+    #[test]
+    fn cross_bank_native_update_invalidates_old_key_and_survives_donor_drop() -> anyhow::Result<()> {
+        use super::super::GraphOwner;
+        let fixture = cuteafd_ffi::native_library_lifetime_fixture::Fixture::build_for_tests()?;
+        let library = fixture.load()?;
+        fixture.configure_memory_usage(&library, 0, 128 << 20, 0)?;
+        let mut donor = GraphBank::new();
+        let mut receiver = GraphBank::new();
+        // Synthetic cache isolates the global device registry from fixture GPU0.
+        for bank in [&mut donor, &mut receiver] {
+            bank.attach_device_for_test(-164_405, 100, site())?;
+        }
+        donor.cache_lane_owner(1);
+        receiver.cache_lane_owner(0);
+        let mut ticket = donor.cache_ticket(&1, false, None).unwrap();
+        // SAFETY: no fixture device work or captured allocations.
+        let source = unsafe { library.cuda_graph_capture_source(std::ptr::null_mut())? };
+        let (raw, nodes, width, spans, _) = ticket.complete_source(&library, source, std::ptr::null_mut())?;
+        // SAFETY: fixture graph never uses device allocations.
+        let owner = unsafe { GraphOwner::new(&library, 0, raw, ())? };
+        donor.cache_commit(1, owner, ticket, nodes as u64, width, spans);
+        donor.cache_measured(10);
+        let cache = donor.device.as_ref().unwrap().cache.clone();
+        cache.lock().unwrap().advance_for_update_fixture(1, 2);
+        cache.lock().unwrap().set_soft_limit_for_fixture(10);
+        let mut ticket = receiver.cache_ticket(&2, false, None).expect("soft-cap source update admitted");
+        // SAFETY: source-only fixture records no work.
+        let source = unsafe { library.cuda_graph_capture_source(std::ptr::null_mut())? };
+        let (new, nodes, width, spans, _) = ticket.complete_source(&library, source, std::ptr::null_mut())?;
+        assert_ne!(new, raw);
+        // SAFETY: receiver owns the transferred generation.
+        let owner = unsafe { GraphOwner::new(&library, 0, new, ())? };
+        receiver.cache_commit(2, owner, ticket, nodes as u64, width, spans);
+        assert!(donor.cached_launch(&1).is_none());
+        assert!(donor.get(&1).is_none());
+        assert!(!donor.contains(&1));
+        assert!(receiver.cached_launch(&2).is_some());
+        drop(donor);
+        // SAFETY: new owner remains live after the old bank's generation retires.
+        unsafe { library.cuda_graph_launch(new, std::ptr::null_mut())?; }
+        let snapshot = super::super::device::snapshots().into_iter().find(|row| row.device == -164_405).unwrap();
+        assert_eq!(snapshot.charged, 10);
+        assert_eq!(snapshot.live_bytes, 10);
+        assert_eq!(snapshot.cycles[&Cycle::Decode].updates_soft, 1);
+        drop(receiver);
+        Ok(())
+    }
+
+    #[test]
+    fn failed_inspection_survives_source_completion_for_family_retention_policy() -> anyhow::Result<()> {
+        let fixture = cuteafd_ffi::native_library_lifetime_fixture::Fixture::build_for_tests()?;
+        let library = fixture.load()?;
+        fixture.configure_capture(&library, 11)?;
+        let mut bank: GraphBank<u32, ()> = GraphBank::new();
+        bank.attach_device_for_test(-164_406, 100, site())?;
+        let mut ticket = bank.cache_ticket(&1, false, None).unwrap();
+        // SAFETY: CPU fixture owns no CUDA work or operands.
+        let source = unsafe { library.cuda_graph_capture_source(std::ptr::null_mut())? };
+        assert_eq!(source.inspection_error.as_deref(), Some("injected CPU fixture failure"));
+        fixture.configure_capture(&library, 0)?;
+        let (raw, _, width, _, inspected) = ticket.complete_source(&library, source, std::ptr::null_mut())?;
+        assert_eq!(width, 0);
+        assert_eq!(inspected.as_deref(), Some("injected CPU fixture failure"));
+        // SAFETY: fresh fixture executable has never launched.
+        unsafe { library.cuda_graph_exec_destroy(raw)?; }
+        Ok(())
+    }
+
     #[test]
     fn failed_commit_measurement_retains_owner_and_charges_until_drained_teardown() -> anyhow::Result<()> {
         use std::{cell::Cell, rc::Rc};
@@ -603,6 +769,40 @@ mod device_tests {
             assert_eq!(bank.len(), 1, "rotating identities must not accumulate resident execs");
         }
         assert_eq!(super::super::device::snapshots().into_iter().find(|row| row.device == -318).unwrap().charged, 10);
+    }
+
+    #[test]
+    fn hit_lookup_does_not_acquire_the_device_mutex() {
+        let mut bank = GraphBank::new();
+        bank.attach_device_for_test(-39020, 1 << 20, site()).unwrap();
+        let ticket = bank.cache_ticket(&7, false, None).unwrap();
+        bank.cache_commit(7, 7, ticket, 8, 1, false);
+        let shared = bank.device.as_ref().unwrap().cache.clone();
+        let guard = shared.lock().unwrap();
+        assert_eq!(bank.get(&7), Some(&7));
+        assert!(bank.contains(&7));
+        assert_eq!(bank.cached_launch(&7), Some(&7));
+        drop(guard);
+    }
+
+    #[test]
+    fn unflushed_hit_protects_a_graph_from_cold_donation() {
+        let mut bank = GraphBank::new();
+        bank.attach_device_for_test(-39021, 1 << 20, site()).unwrap();
+        let ticket = bank.cache_ticket(&7, false, None).unwrap();
+        let id = ticket.id;
+        bank.cache_commit(7, 7, ticket, 8, 1, false);
+        let shared = bank.device.as_ref().unwrap().cache.clone();
+        {
+            let mut cache = shared.lock().unwrap();
+            cache.register_native(id, 123, vec![3, 1]);
+            cache.advance_for_update_fixture(0, 5);
+            cache.set_soft_limit_for_fixture(0);
+        }
+        assert_eq!(bank.cached_launch(&7), Some(&7));
+        // No cycle switch or counter fold occurred; the published use stamp is
+        // already enough to reject retirement under pressure.
+        assert!(shared.lock().unwrap().mark_victim(false).is_none());
     }
 
     #[test]
@@ -863,3 +1063,9 @@ impl<K: Hash + Eq + Clone + std::fmt::Debug, E> super::CacheAttached for GraphBa
         self.cache_drain(drain, measure)
     }
 }
+
+#[cfg(test)]
+mod perf_tests;
+
+#[cfg(test)]
+mod perf_mixed_tests;

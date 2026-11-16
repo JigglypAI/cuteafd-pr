@@ -146,7 +146,7 @@ impl<'a, P> Graphs<'a, P> {
                 unsafe { decode_graph::launch(self.stream.device.library, raw, self.stream.raw) }
             });
         }
-        let Some(ticket) = self.bank.cache_ticket(&key, false, estimate) else { return work() };
+        let Some(mut ticket) = self.bank.cache_ticket(&key, false, estimate) else { return work() };
         let device = self.stream.device;
         device.run(|| {
             let library = device.library;
@@ -159,7 +159,7 @@ impl<'a, P> Graphs<'a, P> {
             }
             let result = work();
             // SAFETY: end the matching stream capture even when work failed.
-            let captured = unsafe { library.cuda_graph_end_capture_topology(self.stream.raw) };
+            let captured = unsafe { crate::shared::decode_graph::end_capture(&library, self.stream.raw, &mut ticket) };
             if let Err(error) = result {
                 self.bank.cache_ticket_failed(ticket, captured.as_ref().err().unwrap_or(&error));
                 if let Ok((raw, ..)) = captured {
