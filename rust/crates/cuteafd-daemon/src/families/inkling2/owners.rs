@@ -14,6 +14,7 @@ pub(crate) trait UnitBuffers<'a> {
     fn layout(&self) -> &UnitLayout;
     fn buffer(&self, name: &str) -> Result<Buffer>;
     fn convolution_strides(&self) -> Option<(usize, usize, usize)> { None }
+    fn convolution_replay(&self, _field: &str) -> Result<Option<(Buffer, usize)>> { Ok(None) }
     fn packed(&self) -> Option<(&UnitOwner<'a>, &super::cache::CacheBank<'a>, usize, &[PackedMember])> { None }
     fn prepare_page_table(&self, _pages: &[i32]) -> Result<()> { anyhow::bail!("Inkling owner has no packed page-table uploader") }
 }
@@ -33,6 +34,13 @@ pub(crate) struct PackedLayerUnit<'u, 'a> {
     pub uploads: std::cell::RefCell<&'u mut crate::shared::token_table::RetainedUploads<'a>>,
 }
 impl<'a> UnitBuffers<'a> for PackedLayerUnit<'_, 'a> {
+    fn convolution_replay(&self, field: &str) -> Result<Option<(Buffer, usize)>> {
+        let Some((backing, width)) = self.unit.replay.get() else { return Ok(None) };
+        let offset = match field { "attn_conv_history" => 0, "mlp_conv_history" => 4608,
+            "k_conv_history" => 9216, "v_conv_history" => 10240, _ => anyhow::bail!("unknown convolution replay field") };
+        let offset = (self.layer*64*width+offset)*4;
+        Ok(Some((super::cache::view(backing, offset, backing.bytes-offset)?, width)))
+    }
     fn convolution_strides(&self) -> Option<(usize, usize, usize)> {
         Some((self.cache.layout.conv.slot_stride, self.cache.layout.conv.lag_stride, self.cache.layout.sequences))
     }
@@ -102,8 +110,16 @@ pub(crate) struct UnitOwner<'a> {
     pub stream: Rc<Stream<'a>>,
     pub layout: UnitLayout,
     buffers: BTreeMap<String, Allocation<'a>>,
+    replay: std::cell::Cell<Option<(Buffer, usize)>>,
 }
 impl<'a> UnitOwner<'a> {
+    /// The caller retains replay storage through every queued convolution and commit.
+    pub fn set_replay(&self, replay: Option<(Buffer, usize)>) -> Result<()> {
+        ensure!(replay.is_none_or(|(buffer,width)| width==11264 && buffer.device_id==self.stream.device.id
+            && buffer.bytes>=48*64*width*4), "convolution replay backing differs from admitted geometry");
+        self.replay.set(replay);
+        Ok(())
+    }
     pub fn bind<'u>(&'u self, cache: &'u super::cache::CacheBank<'a>, sequence: usize,
         layer: usize) -> Result<LayerUnit<'u, 'a>> {
         ensure!(sequence < cache.layout.sequences && layer < cache.layout.layers.len(),
@@ -209,7 +225,7 @@ impl<'a> UnitOwner<'a> {
         let buffers = layout.buffers.iter().map(|(name, bytes)| Ok((name.clone(),
             Allocation::new(stream.device, *bytes, Tag::workspace("inkling2/unit"))?)))
             .collect::<Result<BTreeMap<_, _>>>()?;
-        let owner = Self { stream, layout, buffers };
+        let owner = Self { stream, layout, buffers, replay: std::cell::Cell::new(None) };
         owner.zero()?;
         Ok(owner)
     }

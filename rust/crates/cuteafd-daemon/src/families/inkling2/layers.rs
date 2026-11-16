@@ -15,6 +15,7 @@ pub(crate) struct Kernels<'a> {
     kv_format: cuteafd_loader::families::inkling2::InklingKvCache,
     producers: BTreeMap<String, Producer<'a>>,
     strided: BTreeMap<(usize, bool), cuteafd_ffi::fir_strided::Convolution<'a>>,
+    replay: BTreeMap<(usize, bool), cuteafd_ffi::fir_replay::Convolution<'a>>,
     pub add: cuteafd_ffi::F32Add<'a>,
     pub narrow: cuteafd_ffi::F32Bf16Narrow<'a>,
     quant: cuteafd_ffi::programs::Program<'a>,
@@ -53,6 +54,9 @@ impl<'a> Kernels<'a> {
         let strided = [(4608, false), (1024, false), (1024, true)].into_iter().map(|geometry|
             Ok((geometry, cuteafd_ffi::fir_strided::Convolution::load(programs, geometry.0, geometry.1)?)))
             .collect::<Result<BTreeMap<_, _>>>()?;
+        let replay = [(4608, false), (1024, false), (1024, true)].into_iter().map(|geometry|
+            Ok((geometry, cuteafd_ffi::fir_replay::Convolution::load(programs, geometry.0, geometry.1)?)))
+            .collect::<Result<BTreeMap<_, _>>>()?;
         Ok(Self { projections: DraftProjections::load_with_output(programs, &[
             (4608, 6144), (4608, 768), (4608, 1024), (4608, 48), (4608, 32),
             (4608, 384), (6144, 4608), (64, 1024)], 4096, ProjectionOutput::F32)?,
@@ -62,7 +66,7 @@ impl<'a> Kernels<'a> {
             global_decode: Attention::load(programs, Kind::Global, Route::Decode, kv_format == cuteafd_loader::families::inkling2::InklingKvCache::Fp8)?, kv_format,
             add: programs.library().f32_add()?, narrow: programs.library().f32_bf16_narrow()?,
             quant,
-            sms: programs.library().sm_count()? as usize, producers, strided })
+            sms: programs.library().sm_count()? as usize, producers, strided, replay })
     }
     fn producer(&self, op: Op) -> Result<&Producer<'a>> {
         self.producers.get(&op.name()?).context("Inkling producer not bound at startup")
@@ -77,6 +81,13 @@ impl<'a> Kernels<'a> {
     pub fn convolution(&self, owner: &impl UnitBuffers<'a>, input: Buffer, weight: Buffer, dynamic: Buffer,
         output: Buffer, history: &str, width: usize, global: bool, rows: usize) -> Result<()> {
         if let Some((slot_stride, lag_stride, slots)) = owner.convolution_strides() {
+            if let Some((replay, replay_stride)) = owner.convolution_replay(history)? {
+                // SAFETY: input persistence is fused into the producer; the
+                // retained verify owner covers every packed replay row.
+                return unsafe { self.replay.get(&(width,global)).context("replay convolution not bound")?.launch(
+                    [input,weight,dynamic,owner.buffer(history)?,owner.buffer("first")?,owner.buffer("conv_slots")?,output,replay],
+                    rows,slots,slot_stride,lag_stride,replay_stride,owner.stream().raw) };
+            }
             // SAFETY: request-local metadata is validated by the unit, fields
             // are strided views of the one admitted contiguous FIR backing.
             return unsafe { self.strided.get(&(width, global)).context("strided convolution not bound")?.launch(
