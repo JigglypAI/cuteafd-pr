@@ -2,6 +2,7 @@
 //! n-gram table, the coordinator programs' layer chain, and the golden
 //! comparison command.
 mod media;
+mod graph_spanning;
 pub(crate) mod engine;
 mod admission;
 mod hybrid;
