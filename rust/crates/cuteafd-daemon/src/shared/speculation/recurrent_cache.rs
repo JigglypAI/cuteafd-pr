@@ -22,6 +22,10 @@ impl ContextState {
         if let Some(binding)=self.bindings[slot].take(){self.pool.release(binding)?;}
         self.bindings[slot]=Some(self.pool.bind(slot,origin)?);Ok(())
     }
+    pub fn install(&mut self,slot:usize,binding:DraftBinding)->Result<()> {
+        ensure!(slot<self.slots,"recurrent restored binding slot exceeds admission");
+        self.bindings[slot]=Some(binding);Ok(())
+    }
     pub fn binding(&self,slot:usize)->Result<DraftBinding>{
         self.bindings.get(slot).copied().flatten().context("unbound recurrent context slot")
     }

@@ -217,3 +217,9 @@ impl<'a> Rank<'a> {
                 rows*self.config.transformer.hidden*2,self.stream.raw)}
     }
 }
+
+impl Drop for Rank<'_> {
+    fn drop(&mut self) {
+        self.stream.drain_or_abort("recurrent rank retirement before weights/workspaces");
+    }
+}

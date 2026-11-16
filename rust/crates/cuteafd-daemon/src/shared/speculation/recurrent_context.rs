@@ -25,11 +25,21 @@ impl Rank<'_> {
             && destinations.iter().all(|rows_|rows_.len()==rows)
             && positions.iter().all(|&p|p>=0 && (p as usize)<c.max_position),"recurrent context metadata differs");
         ensure!(features.bytes>=rows*self.config.taps.len()*c.hidden*2,"recurrent target tap extent differs");
-        // SAFETY: metadata staging retains source bytes until the ordered event;
-        // destination is a permanent admitted plane on the retained stream.
-        unsafe{lib.copy_h2d_ordered(self.buffer("context.positions")?,bytes(positions),stream)?;}
+        let total_rows=rows;
         let kv=rank.kv_heads*c.head_dim;
         for index in 0..c.layers {
+            // Context projections are independent per position: rows that the
+            // same append overwrites in a local ring need not be computed.
+            let first=match self.config.context[index] {
+                cuteafd_loader::formats::block_dspark::recurrent::ContextPolicy::BlockAnchoredWindow(window)=>total_rows.saturating_sub(window),
+                cuteafd_loader::formats::block_dspark::recurrent::ContextPolicy::Full=>0,
+            };
+            let rows=total_rows-first;
+            let pitch=self.config.taps.len()*c.hidden*2;
+            let features=view(features,first*pitch,rows*pitch)?;
+            // SAFETY: ordered upload retains metadata until its copy completes;
+            // permanent destinations survive every queued context consumer.
+            unsafe{lib.copy_h2d_ordered(self.buffer("context.positions")?,bytes(&positions[first..]),stream)?;}
             let layer=&self.weights.tensors.layers[index];
             let alpha=self.weights.derived("derived.fuse_alpha")?.buffer;
             let alpha=view(alpha,index*self.config.taps.len()*2,self.config.taps.len()*2)?;
@@ -47,10 +57,13 @@ impl Rank<'_> {
                 self.buffer("step.query")?,self.buffer("context.key")?,self.buffer("context.value")?],
                 rows,c.rms_norm_eps as f32,0,stream)?;}
             let capacity=self.layout.cache.layer_bytes[index]/self.layout.cache.record_bytes;
-            ensure!(destinations[index].iter().all(|&slot|slot>=0 && (slot as usize)<capacity),"recurrent KV store destination outside admitted plane");
+            let active=&destinations[index][first..];
+            ensure!(active.iter().all(|&slot|slot>=0 && (slot as usize)<capacity)
+                && active.iter().copied().collect::<std::collections::BTreeSet<_>>().len()==rows,
+                "recurrent KV store destinations alias or lie outside admitted plane");
             // SAFETY: host plan checked every slot against the layer's physical
             // capacity; typed store checks row sources and stream retains cache.
-            unsafe{lib.copy_h2d_ordered(self.buffer("context.destinations")?,bytes(&destinations[index]),stream)?;
+            unsafe{lib.copy_h2d_ordered(self.buffer("context.destinations")?,bytes(active),stream)?;
                 self.programs.store.launch(&[self.buffer("context.key")?,self.buffer("context.value")?,
                     self.buffer("context.destinations")?,self.buffer(&format!("cache.layer.{index}.k"))?,
                     self.buffer(&format!("cache.layer.{index}.v"))?],rows,c.rms_norm_eps as f32,0,stream)?;}
