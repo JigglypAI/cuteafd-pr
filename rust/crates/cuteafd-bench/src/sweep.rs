@@ -253,8 +253,15 @@ fn draft_delta(before: Option<&Value>, after: Option<&Value>) -> Option<Value> {
     let delta = |key: &str| after?[key].as_u64()?.checked_sub(before?[key].as_u64()?);
     let rounds = delta("verification_rounds")?;
     let accepted = delta("accepted_drafts")?;
-    Some(serde_json::json!({"rounds": rounds, "accepted": accepted, "drafted": delta("drafted_tokens")?,
-        "accepted_per_step": (rounds > 0).then(|| accepted as f64 / rounds as f64)}))
+    let drafted = delta("drafted_tokens")?;
+    let mut counters = serde_json::json!({"rounds": rounds, "accepted": accepted, "drafted": drafted,
+        "accepted_per_step": (rounds > 0).then(|| accepted as f64 / rounds as f64)});
+    if let Some(passes) = delta("draft_verify_passes") {
+        counters["draft_verify_passes"] = serde_json::json!(passes);
+        counters["acceptance_rate"] = serde_json::json!((drafted > 0).then(|| accepted as f64 / drafted as f64));
+        counters["acceptance_length"] = serde_json::json!((passes > 0).then(|| 1.0 + accepted as f64 / passes as f64));
+    }
+    Some(counters)
 }
 
 /// Cold prefill at each length: fit tokens per reference token from two short
@@ -450,6 +457,19 @@ mod tests {
         assert_eq!(exported["seed"], 4244);
         assert_eq!(exported["prompt_sha256"], "hash");
         assert_eq!(exported["draft_counters"]["accepted_per_step"], 0.75);
+    }
+
+    #[test]
+    fn draft_length_uses_sequence_passes_and_bonus_not_batch_rounds() {
+        let before = serde_json::json!({"verification_rounds":10,"drafted_tokens":20,
+            "accepted_drafts":4,"draft_verify_passes":5});
+        let after = serde_json::json!({"verification_rounds":12,"drafted_tokens":40,
+            "accepted_drafts":16,"draft_verify_passes":9});
+        let delta = draft_delta(Some(&before), Some(&after)).unwrap();
+        assert_eq!(delta["acceptance_length"], 4.0);
+        assert_eq!(delta["acceptance_rate"], 0.6);
+        assert_eq!(delta["accepted_per_step"], 6.0);
+        assert!(draft_delta(Some(&before), Some(&before)).unwrap()["acceptance_length"].is_null());
     }
 
     #[test]

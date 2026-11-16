@@ -92,6 +92,55 @@ pub(crate) fn distinct_batch(client: &crate::client::Client, width: usize, token
     wave(client, bodies)
 }
 
+/// Decode-only settings; omitted fields preserve the historical greedy body.
+#[derive(Debug, Clone, Default, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct DecodeOptions {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub contents: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub top_p: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub seed: Option<i64>,
+}
+
+impl DecodeOptions {
+    pub fn parse(value: &Value) -> Result<Self> {
+        let options: Self = serde_json::from_value(value.clone())?;
+        if options.temperature.is_some_and(|v| !v.is_finite() || !(0.0..=2.0).contains(&v)) {
+            anyhow::bail!("temperature must be in 0..=2");
+        }
+        if options.top_p.is_some_and(|v| !v.is_finite() || v <= 0.0 || v > 1.0) {
+            anyhow::bail!("top_p must be in (0, 1]");
+        }
+        if let Some(contents) = &options.contents {
+            let mut seen = std::collections::HashSet::new();
+            if contents.is_empty() || contents.iter().any(|c|
+                !CONTENT.iter().any(|(name, _)| name == c) || !seen.insert(c)) {
+                anyhow::bail!("contents must be unique names from code,prose,json,math,chat,translation,summary,table");
+            }
+        }
+        Ok(options)
+    }
+
+    fn body(&self, client: &crate::client::Client, prompt: &str, tokens: u64) -> Value {
+        let mut body = plain(client, prompt, tokens);
+        if let Some(temperature) = self.temperature { body["temperature"] = json!(temperature); }
+        if let Some(top_p) = self.top_p { body["top_p"] = json!(top_p); }
+        if let Some(seed) = self.seed { body["seed"] = json!(seed); }
+        body
+    }
+
+    pub(crate) fn sampling(&self) -> Value {
+        let mut settings = json!({"temperature": self.temperature.unwrap_or(0.0)});
+        if let Some(top_p) = self.top_p { settings["top_p"] = json!(top_p); }
+        if let Some(seed) = self.seed { settings["seed"] = json!(seed); }
+        settings
+    }
+}
+
 pub struct DecodeContent;
 pub struct Concurrency;
 pub struct DraftMix;
@@ -115,24 +164,40 @@ impl Panel for DecodeContent {
         8.0 * rates.seconds(120.0, DECODE_TOKENS as f64)
     }
     fn run(&self, ctx: &Ctx<'_>) -> Result<Value> {
+        let options = ctx.panel_config.map(DecodeOptions::parse).transpose()?.unwrap_or_default();
+        let contents: Vec<_> = CONTENT.iter().filter(|(name, _)| options.contents.as_ref()
+            .is_none_or(|contents| contents.iter().any(|c| c == name))).collect();
         let mut rows = Vec::new();
-        for (i, (content, prompt)) in CONTENT.iter().enumerate() {
-            ctx.progress.step(i as f64 / CONTENT.len() as f64, *content);
+        for (i, (content, prompt)) in contents.iter().copied().enumerate() {
+            ctx.progress.step(i as f64 / contents.len() as f64, *content);
             let fabric_mark = ctx.client.fabric_mark();
             let table_before = common::mapped_counters(ctx.client);
             let before = common::draft_counters(ctx.client);
-            let chat = ctx.client.chat(plain(ctx.client, &format!("[{}] {prompt}", nonce()), DECODE_TOKENS), None)
+            let chat = ctx.client.chat(options.body(ctx.client, &format!("[{}] {prompt}", nonce()), DECODE_TOKENS), None)
                 .with_context(|| format!("{content} decode"))?;
-            let acceptance = common::acceptance(before, common::draft_counters(ctx.client));
+            let after = common::draft_counters(ctx.client);
+            let acceptance = common::acceptance(before, after);
             rows.push(json!({"content": content, "tok_s": chat.timing.decode_tok_s(),
                 "tokens": chat.timing.completion_tokens, "ttft_s": chat.timing.ttft_s, "acceptance": acceptance,
                 "mapped_tables": common::mapped_interval(&table_before, &common::mapped_counters(ctx.client)),
                 "fabric": ctx.client.fabric_since(fabric_mark, &format!("{}/{}", self.id(), i), true)}));
+            let row = rows.last_mut().expect("decode row");
+            if ctx.panel_config.is_some() { row["sampling"] = options.sampling(); }
+            if let Some(length) = common::acceptance_length(before, after) { row["acceptance_length"] = json!(length); }
             ctx.progress.partial(json!({"rows": rows}));
         }
-        let table_rows = rows.iter().map(|r| vec![r["content"].clone(), r["tok_s"].clone(), r["tokens"].clone(),
-            json!(r["ttft_s"].as_f64().unwrap_or(0.0) * 1e3), r["acceptance"].clone()]).collect();
-        Ok(json!({"rows": rows, "table": table(&["content", "tok/s", "tokens", "TTFT ms", "acceptance"], table_rows)}))
+        let has_length = rows.iter().any(|row| row.get("acceptance_length").is_some());
+        let mut columns = vec!["content", "tok/s", "tokens", "TTFT ms", "acceptance"];
+        if has_length { columns.push("acceptance length"); }
+        let table_rows = rows.iter().map(|r| {
+            let mut cells = vec![r["content"].clone(), r["tok_s"].clone(), r["tokens"].clone(),
+                json!(r["ttft_s"].as_f64().unwrap_or(0.0) * 1e3), r["acceptance"].clone()];
+            if has_length { cells.push(r["acceptance_length"].clone()); }
+            cells
+        }).collect();
+        let mut result = json!({"rows": rows, "table": table(&columns, table_rows)});
+        if ctx.panel_config.is_some() { result["sampling"] = options.sampling(); }
+        Ok(result)
     }
 }
 
@@ -480,6 +545,24 @@ impl Panel for SharedPrefix {
 mod tests {
     use super::*;
     use std::collections::HashSet;
+
+    #[test]
+    fn decode_sampling_preserves_default_bytes_and_sets_explicit_fields() {
+        let client = crate::client::Client::new("http://127.0.0.1:1", None, std::sync::Arc::default());
+        let original = plain(&client, "test", 256);
+        let default = DecodeOptions::default().body(&client, "test", 256);
+        assert_eq!(serde_json::to_vec(&default).unwrap(), serde_json::to_vec(&original).unwrap());
+        assert_eq!(original, json!({"messages":[{"role":"user","content":"test"}],
+            "max_tokens":256,"temperature":0,"thinking":{"type":"disabled"}}));
+        let options = DecodeOptions::parse(&json!({"contents":["code"],"temperature":1.0,"top_p":0.95,"seed":42})).unwrap();
+        let mut sampled = original;
+        sampled["temperature"] = json!(1.0);
+        sampled["top_p"] = json!(0.95);
+        sampled["seed"] = json!(42);
+        assert_eq!(options.body(&client, "test", 256), sampled);
+        assert_eq!(options.sampling(), json!({"temperature":1.0,"top_p":0.95,"seed":42}));
+        assert_eq!(options.contents.unwrap(), vec!["code"]);
+    }
 
     #[test]
     fn release_guard_covers_identical_and_retained_followup_cells() {

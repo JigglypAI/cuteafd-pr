@@ -134,9 +134,27 @@ fn counter_pair(stats: &Value, first: &str, second: &str) -> Option<(f64, f64)> 
     })
 }
 
-/// Draft counters the server publishes, for acceptance.
-pub fn draft_counters(client: &Client) -> Option<(f64, f64)> {
-    counter_pair(&client.stats().ok()?, "drafted_tokens", "accepted_drafts")
+#[derive(Clone, Copy, Debug)]
+pub struct DraftCounters {
+    pub drafted: f64,
+    pub accepted: f64,
+    pub passes: Option<f64>,
+}
+
+impl DraftCounters {
+    pub fn from_stats(stats: &Value) -> Option<Self> {
+        ["totals", "verify"].into_iter().find_map(|path| {
+            let counters = &stats[path];
+            Some(Self { drafted: counters["drafted_tokens"].as_f64()?,
+                accepted: counters["accepted_drafts"].as_f64()?,
+                passes: counters["draft_verify_passes"].as_f64() })
+        })
+    }
+}
+
+/// Draft counters from one scope/snapshot; old servers still supply the rate.
+pub fn draft_counters(client: &Client) -> Option<DraftCounters> {
+    DraftCounters::from_stats(&client.stats().ok()?)
 }
 
 /// Verification rounds and tokens emitted by those rounds (not prefill).
@@ -268,9 +286,18 @@ pub fn mapped_interval(before: &[Value], after: &[Value]) -> Vec<Value> {
     }).collect()
 }
 
-pub fn acceptance(before: Option<(f64, f64)>, after: Option<(f64, f64)>) -> Option<f64> {
-    let ((d0, a0), (d1, a1)) = (before?, after?);
-    (d1 > d0).then(|| (a1 - a0) / (d1 - d0))
+pub fn acceptance(before: Option<DraftCounters>, after: Option<DraftCounters>) -> Option<f64> {
+    let (before, after) = (before?, after?);
+    (after.drafted > before.drafted && after.accepted >= before.accepted)
+        .then(|| (after.accepted - before.accepted) / (after.drafted - before.drafted))
+}
+
+/// Vendor-style acceptance length includes one target/bonus token per draft pass.
+pub fn acceptance_length(before: Option<DraftCounters>, after: Option<DraftCounters>) -> Option<f64> {
+    let (before, after) = (before?, after?);
+    let (p0, p1) = (before.passes?, after.passes?);
+    (p1 > p0 && after.accepted >= before.accepted)
+        .then(|| 1.0 + (after.accepted - before.accepted) / (p1 - p0))
 }
 
 pub fn median(values: &mut [f64]) -> f64 {
@@ -300,6 +327,25 @@ pub fn doublings(from: u64, max: u64) -> Vec<u64> {
 #[cfg(test)]
 mod tests {
     use serde_json::{json, Value};
+    #[test]
+    fn acceptance_length_counts_bonus_and_only_draft_passes() {
+        use super::{DraftCounters, acceptance, acceptance_length};
+        let before = DraftCounters::from_stats(&json!({"totals": {
+            "drafted_tokens":20,"accepted_drafts":10,"draft_verify_passes":4}}));
+        let after = DraftCounters::from_stats(&json!({"totals": {
+            "drafted_tokens":40,"accepted_drafts":22,"draft_verify_passes":8}}));
+        assert_eq!(acceptance(before, after), Some(0.6));
+        assert_eq!(acceptance_length(before, after), Some(4.0));
+        assert_eq!(acceptance_length(before, before), None);
+        assert_eq!(acceptance_length(after, before), None);
+        let rejected = Some(DraftCounters { drafted:40., accepted:10., passes:Some(8.) });
+        assert_eq!(acceptance_length(before, rejected), Some(1.0));
+        let old = DraftCounters::from_stats(&json!({"totals": {"drafted_tokens":40,"accepted_drafts":22},
+            "verify": {"draft_verify_passes":8}}));
+        assert_eq!(acceptance(before, old), Some(0.6));
+        assert_eq!(acceptance_length(before, old), None, "never mix counter scopes");
+    }
+
     #[test]
     fn zero_tokens_omits_the_output_budget() {
         use serde_json::json;

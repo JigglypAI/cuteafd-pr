@@ -340,17 +340,25 @@ fn fidelity_path(doc: &mut Doc, t: &Theme, x: f64, y0: f64, w: f64, path: &str, 
 fn decode_content(doc: &mut Doc, t: &Theme, v: &Value, w: f64) -> f64 {
     let rows: Vec<(String, f64, &str, String)> = v["rows"].as_array().map(|rows| rows.iter().map(|r| {
         let content = r["content"].as_str().unwrap_or("?").to_string();
-        let note = match num(r, "acceptance") {
+        let mut note = match num(r, "acceptance") {
             Some(a) => format!("{:.0}% accepted", 100.0 * a),
             None => format!("{} tokens", r["tokens"].as_u64().unwrap_or(0)),
         };
+        if let Some(length) = num(r, "acceptance_length") { note.push_str(&format!(" · {length:.2} length")); }
         let color = content_color(t, &content);
         (content, num(r, "tok_s").unwrap_or(0.0), color, note)
     }).collect()).unwrap_or_default();
     if rows.is_empty() {
         return empty(doc, t, "no measurements yet");
     }
-    hbars(doc, t, 0.0, 0.0, w, &rows, "tps")
+    let y = if let Some(settings) = v.get("sampling") {
+        let mut label = format!("temperature {}", settings["temperature"]);
+        if let Some(top_p) = settings.get("top_p") { label.push_str(&format!(" · top_p {top_p}")); }
+        if let Some(seed) = settings.get("seed") { label.push_str(&format!(" · seed {seed}")); }
+        doc.text(0.0, 12.0, Font::new(10.0, t.muted), &super::svg::fit(&label, 10.0, w));
+        24.0
+    } else { 0.0 };
+    y + hbars(doc, t, 0.0, y, w, &rows, "tps")
 }
 
 /// Two groups of bars: the C16 mixed waves (aggregate, with the per-request
@@ -844,6 +852,21 @@ fn startup(doc: &mut Doc, t: &Theme, v: &Value, w: f64) -> f64 {
 
 #[cfg(test)]
 mod context_load_tests {
+    #[test]
+    fn sampled_decode_report_shows_settings_rate_and_bonus_length() {
+        let value = serde_json::json!({"sampling":{"temperature":1.0,"top_p":0.95,"seed":42},
+            "rows":[{"content":"code","tok_s":60,"tokens":256,"acceptance":0.75,"acceptance_length":4.0}]});
+        for width in [360.0, 700.0] {
+            let mut doc = super::Doc::new(width, 200.0);
+            super::decode_content(&mut doc, &super::super::theme::NORMAL, &value, width);
+            let svg = doc.finish();
+            for label in ["temperature 1.0", "top_p 0.95", "seed 42", "75% accepted", "4.00 length"] {
+                assert!(svg.contains(label), "{label}");
+            }
+            super::super::png::png(&svg, 1.0).unwrap();
+        }
+    }
+
     #[test]
     fn fidelity_panel_shows_recorded_precision_and_root_reason() {
         let mut value = serde_json::json!({"decode":{}});

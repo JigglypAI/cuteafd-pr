@@ -9,6 +9,39 @@ by `scripts/build/release-scope.py default-matrix`. `CUTEAFD_RELEASE_MATRIX`
 overrides that default; `--scope` selects families or cards for development builds,
 while publication requires `all` and complete image inventories.
 
+## Benchmark panel configuration
+
+`cuteafd bench --panels decode_content --panel-config
+'decode_content={"contents":["code"],"temperature":1.0,"top_p":0.95,"seed":42}'`
+runs sampled C1 code decode. `scripts/bench/wip-cards.py` accepts the same
+repeatable `--panel-config PANEL=JSON` option; smoke matrix entries/defaults use
+`"panel_config":{"decode_content":{"contents":["code"],"temperature":1.0,
+"top_p":0.95,"seed":42}}`. Entry settings replace defaults for the same panel.
+The in-server run API accepts this same `panel_config` map. Currently only
+`decode_content` accepts a configuration; unknown panels and fields fail before
+running. This does not change the baseline, concurrency sweep or goldens.
+
+`decode_content` fields are optional: `contents` selects unique names from
+`code,prose,json,math,chat,translation,summary,table` (all by default),
+`temperature` is 0..2 (default 0, greedy), `top_p` is (0,1] (omitted by default,
+using the server's default), and `seed` is a signed 64-bit request seed (omitted
+by default). Explicit settings are recorded per content row and displayed on
+the report. A seed repeats the sampling RNG; prompt nonces and dynamic scheduling
+still need matching conditions for fully reproducible comparisons. Unconfigured
+requests retain exactly their historical greedy body.
+
+Draft acceptance rate remains accepted draft tokens / proposed draft tokens.
+Acceptance length is **1 + accepted draft tokens / draft verify passes**: one
+bonus/target token per draft pass, including passes accepting no draft tokens.
+`/v1/stats` exposes `totals.draft_verify_passes`, a lifetime host-side counter
+incremented once per sequence per verification step that had a proposed or
+verified draft, not once per batch; anchor-only steps are excluded. No device
+synchronization is added. Content rows and cold-C1 sweep counters use interval
+deltas; length is absent/null when the server lacks this counter or no draft
+passes occurred. Never substitute `verification_rounds` (batch steps, including
+anchor-only decode) as its denominator. Existing rates remain available on old
+servers. Greedy and sampled figures must be compared separately.
+
 ## Optional performance levers
 
 Optional levers that are off by default and trade precision or host resources
