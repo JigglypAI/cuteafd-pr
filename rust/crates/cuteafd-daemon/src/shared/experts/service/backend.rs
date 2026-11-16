@@ -174,11 +174,8 @@ impl<'a> Weights<'a> {
             let supported = if endpoint.ingress == cuteafd_core::SparkIngress::Nvfp4 { nvfp4 }
             else if endpoint.ingress == cuteafd_core::SparkIngress::Native {
                 match self {
-                    Self::Fp8(experts) => !experts.is_empty() && experts.iter().all(|group| {
-                        use cuteafd_ffi::fp8_moe::Fp8MoeWeights;
-                        let bf16 = matches!(group.module.info().weights, Fp8MoeWeights::Bf16 | Fp8MoeWeights::Nvfp4);
-                        group.wire_input() != bf16
-                    }),
+                    Self::Fp8(experts) => !experts.is_empty()
+                        && experts.iter().all(|group| group.module.info().supports_native_ingress()),
                     _ => false,
                 }
             } else { supports_ingress(endpoint.ingress, fp8, bf16) };
@@ -747,6 +744,12 @@ pub(super) fn load_fp8<'a>(
         Ok((scratch, io, pinned))
     })?;
     let workspace = usize::try_from(workspace.total().context("native owner workspace overflow")?)?;
+    let regions = groups.iter().map(|group| cuteafd_loader::serving_capacity::fp8_expert_regions(
+        &group.tensors, &group.layers, config.world, config.rank, group.slicing))
+        .collect::<Result<Vec<_>>>()?.into_iter().flatten().collect::<Vec<_>>();
+    let device = crate::shared::memory::device::Device { library, id: library.cuda_get_device()? };
+    let layout = super::super::weight_layout::layout(device.id, "fp8", regions)?;
+    totals.resident = layout.bytes();
     let peak = spark_admission_budget(config, totals.resident, 0, totals.pinned, totals.host, workspace)?;
     ensure!(peak.load_peak <= config.device_budget && peak.serve_peak <= config.device_budget,
         "native expert groups exceed budget: load {} serve {} budget {}",
@@ -774,14 +777,6 @@ pub(super) fn load_fp8<'a>(
     } else {
         // Failed candidates have crossed the all-rank drain barrier. Reuse the
         // original modules; no second package preparation on fallback.
-        let regions = groups.iter().map(|group| cuteafd_loader::serving_capacity::fp8_expert_regions(
-            &group.tensors, &group.layers, config.world, config.rank, group.slicing))
-            .collect::<Result<Vec<_>>>()?.into_iter().flatten().collect::<Vec<_>>();
-        let device = crate::shared::memory::device::Device { library, id: library.cuda_get_device()? };
-        let layout = super::super::weight_layout::layout(device.id, "fp8", regions)?;
-        let peak = spark_admission_budget(config, layout.bytes(), 0, totals.pinned, totals.host, workspace)?;
-        ensure!(peak.load_peak <= config.device_budget && peak.serve_peak <= config.device_budget,
-            "physical expert arena startup peak exceeds configured device budget");
         admit_worker_peak(library, config.rank, peak.load_peak, peak.serve_peak)?;
         resident = layout.bytes();
         let arena = crate::shared::memory::weight_arena::DeviceWeightArena::new(device, layout, cuteafd_core::memory_layout::ArenaTag::experts("experts/spark-mount"))?;

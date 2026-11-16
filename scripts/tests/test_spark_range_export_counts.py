@@ -85,6 +85,21 @@ def test_inkling_native_and_two_tier_exl3_profiles_cover_tp3_tp6():
             first += width
 
 
+def test_native_layout_exact_worlds_preserve_other_source_and_storage_units():
+    packages = module('native_layout_policy', ROOT / 'python/tools/lib/spark_packages.py')
+    for kind, native, legacy in [('mxfp8', 32, 128), ('nvfp4', 16, 16)]:
+        policy = packages.native_layout('inkling2', kind)
+        assert policy['exact_worlds'] == [4]
+        assert packages.ownership_unit('inkling2', kind, 4) == native
+        assert all(packages.ownership_unit('inkling2', kind, world) == legacy
+                   for world in [1, 2, 3, 5, 6, 7, 8])
+        native_export = module('exact_world_native_export', ROOT / 'python/tools/aot/package_fp8_moe_aot.py')
+        assert native_export.exact_widths(2304, 4, native) == [576] * 4
+    for key, entry in json.loads(packages.RANGES_PATH.read_text())['entries'].items():
+        if not key.startswith('inkling2:'):
+            assert entry['native_layout']['exact_worlds'] == [], key
+
+
 def test_minimax_native_nvfp4_worlds_cover_the_padded_vendor_slices():
     packages = module('minimax_spark_package_coverage', ROOT / 'python/tools/lib/spark_packages.py')
     assert packages.geometry_worlds('minimax_nvfp4a4') == list(range(2, 9))

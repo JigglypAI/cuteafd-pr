@@ -22483,5 +22483,61 @@
     "tp4-compact-width640"
    ]
   }
+ },
+ {
+  "package": "fp8-inkling2-mxfp8/tp4-w576",
+  "family": "inkling2",
+  "format": "mxfp8",
+  "width": 576,
+  "hidden": 4608,
+  "topk": 8,
+  "bf16": false,
+  "scratch": [
+   782336,
+   11228160,
+   36188160,
+   50035712,
+   110468096,
+   191044608,
+   246440960,
+   352198656
+  ],
+  "source": {
+   "method": "static exporter fp8_moe_scratch_bytes across retained forms; native K64 exact width",
+   "compute": [
+    12,
+    1
+   ],
+   "sms": 48,
+   "fork": "e157ae62115a636644776f9e573415719f08b735"
+  }
+ },
+ {
+  "package": "fp8-inkling2-nvfp4/tp4-w576",
+  "family": "inkling2",
+  "format": "nvfp4",
+  "width": 576,
+  "hidden": 4608,
+  "topk": 8,
+  "bf16": true,
+  "scratch": [
+   4944896,
+   70871040,
+   216038400,
+   234970112,
+   317594624,
+   427760640,
+   503499776,
+   648093696
+  ],
+  "source": {
+   "method": "static exporter fp8_moe_scratch_bytes across retained forms; native K64 exact width",
+   "compute": [
+    12,
+    1
+   ],
+   "sms": 48,
+   "fork": "e157ae62115a636644776f9e573415719f08b735"
+  }
  }
 ]

@@ -160,14 +160,19 @@ pub(crate) fn catalog_owner_bytes(catalog: &crate::OfficialV41Catalog, family: &
     if !rows.iter().any(|row| row["family"] == family && row["format"] == "exl3" && row["width"].is_number()) {
         return exl3_owner_bytes(family, geometry, extent, None);
     }
-    let mut widths = Vec::new();
-    for &layer in &working.spark_layers {
-        let residency = catalog.exl3_spark_residency(crate::V41Exl3Layer::Backbone(layer), working.spark_ranks, rank)?;
-        let key = (u32::try_from(residency.intermediate)?, residency.unit_map.is_some());
-        if !widths.contains(&key) { widths.push(key); }
-    }
-    anyhow::ensure!(widths.len() == 1, "EXL3 worker requires one retained width/ABI, found {widths:?}");
-    recorded_exl3_owner_bytes(rows, family, geometry, widths[0].0, widths[0].1, extent)
+    anyhow::ensure!(!working.spark_layers.is_empty(), "EXL3 worker has no retained layers");
+    let package_family = match family {
+        "glm5" => "glm", "glm5_flash" => "glmf", "kimi_k3" | "kimi_k31" => "kimik3",
+        "muse_spark" => "muse", "mistral_large4" => "ml4", "deepseek_v4" => "dsv4p",
+        other => other,
+    };
+    let tiers = catalog.exl3().context("EXL3 worker needs its catalog")?.decoder_tiers()
+        .iter().map(usize::to_string).collect::<String>();
+    let recipe = super::super::experts::spark_recipe(&format!("{package_family}:exl3-k{tiers}"),
+        geometry.intermediate as usize, working.spark_ranks)?;
+    let width = *recipe.stored_widths.get(rank).context("EXL3 worker rank outside recipe")?;
+    let compact = recipe.rule == cuteafd_core::tp_units::UnitRule::Rotated;
+    recorded_exl3_owner_bytes(rows, family, geometry, width.try_into()?, compact, extent)
 }
 
 fn recorded_exl3_owner_bytes(rows: &[serde_json::Value], family: &str,
@@ -512,6 +517,9 @@ mod tests {
             let narrow = group_scratch("inkling2", format, 256, 4096)?;
             let wide = group_scratch("inkling2", format, 1152, 4096)?;
             assert!(narrow < wide, "narrow owner must not borrow widest scratch");
+            let exact = group_scratch("inkling2", format, 576, 4096)?;
+            assert_eq!(exact, if format == ExpertFormat::Mxfp8 { 352_198_656 } else { 648_093_696 });
+            assert!(narrow < exact && exact < wide);
             assert!(group_scratch("inkling2", format, 320, 4096).is_err(),
                 "an unrecorded width cannot borrow a neighbour or a margin");
         }

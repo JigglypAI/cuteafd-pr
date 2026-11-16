@@ -336,6 +336,54 @@
         "status": "current",
         "report": "benchmarks/minimax_m3/2026-11-16-smoke-minimax-m3-1-flash-2rtx-6spark-minimax-6spark-smoke-cand-r1"
       }
+    },
+    {
+      "family": "inkling2",
+      "checkpoint": "thinkingmachines/Inkling-2-Small",
+      "5090": {
+        "status": "pending",
+        "reason": "Not measured; four-Spark RTX PRO 6000 qualification first."
+      },
+      "1rtx": {
+        "status": "current",
+        "report": "benchmarks/inkling2/2026-11-16-smoke-inkling-2-small-1rtx-4spark-inkling2-nvfp4-min-cand-r1"
+      },
+      "2rtx": {
+        "status": "pending",
+        "reason": "Multi-RTX Inkling serving is not qualified (#1930)."
+      }
+    },
+    {
+      "family": "inkling2",
+      "checkpoint": "wrldsuksgo2mars/Inkling-2-Small-EXL3-K4-MC",
+      "5090": {
+        "status": "pending",
+        "reason": "Not measured; four-Spark RTX PRO 6000 qualification first."
+      },
+      "1rtx": {
+        "status": "current",
+        "report": "benchmarks/inkling2/2026-11-16-smoke-inkling-2-small-exl3-k4-mc-1rtx-4spark-inkling2-exl3-min-cand-r1"
+      },
+      "2rtx": {
+        "status": "pending",
+        "reason": "Multi-RTX Inkling serving is not qualified (#1930)."
+      }
+    },
+    {
+      "family": "inkling2",
+      "checkpoint": "thinkingmachines/Inkling-2-Small-MXFP8",
+      "5090": {
+        "status": "pending",
+        "reason": "Not measured."
+      },
+      "1rtx": {
+        "status": "current",
+        "report": "benchmarks/inkling2/2026-11-16-smoke-inkling-2-small-mxfp8-1rtx-6spark-inkling2-mxfp8-recard-cand-r1"
+      },
+      "2rtx": {
+        "status": "pending",
+        "reason": "Multi-RTX Inkling serving is not qualified (#1930)."
+      }
     }
   ],
   "retired": [

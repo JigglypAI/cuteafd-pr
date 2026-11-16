@@ -644,12 +644,13 @@ impl SparkAssignment {
                         .for_layer(layer)?;
                     // Exact-even mixed layers share source ranges, but seal each
                     // format's native units just as its independent worker group does.
-                    let slicing = match slicing {
-                        crate::formats::fp8_experts::Slicing::Blocks(block)
+                    let exact = tensors.exact_slicing(world);
+                    let slicing = match (slicing, exact) {
+                        (crate::formats::fp8_experts::Slicing::Blocks(block),
+                            crate::formats::fp8_experts::Slicing::Blocks(unit))
                             if world > 0 && geometry.intermediate as usize % (block * world) == 0
-                                && geometry.intermediate as usize % (tensors.block() * world) == 0 =>
-                            tensors.exact_slicing(world),
-                        other => other,
+                                && geometry.intermediate as usize % (unit * world) == 0 => exact,
+                        (other, _) => other,
                     };
                     let (first, width) = tensors.rank_range_with(world, rank, slicing)?;
                     slice.unit_map = Some(tensors.unit_map(world, rank, slicing)?.fingerprint());

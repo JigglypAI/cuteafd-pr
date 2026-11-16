@@ -67,7 +67,7 @@ pub(crate) fn validate_checkpoint_contract(info: &Fp8MoeInfo, tensors: &Fp8Exper
             view.format(), info.weights);
         ensure!(view.rank_width(tp, rank, slicing)? == info.slice,
             "expert layer {layer}: package slice {} differs from checkpoint TP{tp} rank {rank}", info.slice);
-        ensure!(!matches!(weights, Fp8MoeWeights::Bf16 | Fp8MoeWeights::Nvfp4 | Fp8MoeWeights::Nvfp4Dynamic) || !info.wire_input,
+        ensure!(!weights.requires_bf16_input() || !info.wire_input,
             "expert layer {layer}: native BF16/NVFP4 weights require BF16 input");
         if weights == Fp8MoeWeights::Nvfp4 {
             use cuteafd_ffi::fp8_moe::Fp8MoeScaleConvention;

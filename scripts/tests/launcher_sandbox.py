@@ -285,6 +285,10 @@ def seed_checkpoint_metadata(hf):
             "num_hidden_layers": 3, "moe_layer_freq": [0, 1, 1]}},
         "thinkingmachines/Inkling-2-Small-MXFP8": {"model_type": "inkling2", "text_config": {
             "num_hidden_layers": 48}, "quantization_config": {"quant_method": "mxfp8"}},
+        "thinkingmachines/Inkling-2-Small": {"model_type": "inkling2", "text_config": {
+            "num_hidden_layers": 48}, "quantization_config": {"quant_method": "nvfp4"}},
+        "wrldsuksgo2mars/Inkling-2-Small-EXL3-K4-MC": {"model_type": "inkling2", "text_config": {
+            "num_hidden_layers": 48}, "quantization_config": {"quant_method": "exl3"}},
     }
     checkpoints.update(copy.deepcopy(aliases))
     for name, config in checkpoints.items():

@@ -17,36 +17,91 @@
       "minimum": 5,
       "maximum": 8,
       "basis": "lower_bound",
-      "worlds": [2, 3, 4, 5, 6, 7, 8],
-      "checkpoints": [{
-        "model": "thinkingmachines/Inkling-2-Small-MXFP8",
-        "revision": "3febc62259ee92ea36e2fb6e8303371c4eb3922c",
-        "routed_expert_bytes": 605414227968
-      }]
+      "worlds": [
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8
+      ],
+      "checkpoints": [
+        {
+          "model": "thinkingmachines/Inkling-2-Small-MXFP8",
+          "revision": "3febc62259ee92ea36e2fb6e8303371c4eb3922c",
+          "routed_expert_bytes": 605414227968
+        }
+      ],
+      "native_layout": {
+        "unit_columns": 32,
+        "storage_alignment": 128,
+        "exact_worlds": [
+          4
+        ],
+        "coverage_unit_columns": 128,
+        "legacy_unit_columns": 128
+      }
     },
     "inkling2:nvfp4": {
       "intermediate": 2304,
       "minimum": 3,
       "maximum": 8,
       "basis": "lower_bound",
-      "worlds": [2, 3, 4, 5, 6, 7, 8],
-      "checkpoints": [{
-        "model": "thinkingmachines/Inkling-2-Small",
-        "revision": "aac974122acd33ddb0d3e1f54433a9c5dd2249ce",
-        "routed_expert_bytes": 376090779968
-      }]
+      "worlds": [
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8
+      ],
+      "checkpoints": [
+        {
+          "model": "thinkingmachines/Inkling-2-Small",
+          "revision": "aac974122acd33ddb0d3e1f54433a9c5dd2249ce",
+          "routed_expert_bytes": 376090779968
+        }
+      ],
+      "native_layout": {
+        "unit_columns": 16,
+        "storage_alignment": 128,
+        "exact_worlds": [
+          4
+        ],
+        "coverage_unit_columns": 16,
+        "legacy_unit_columns": 16
+      }
     },
     "inkling2:exl3": {
       "intermediate": 2304,
       "minimum": 2,
       "maximum": 8,
       "basis": "lower_bound",
-      "worlds": [2, 3, 4, 5, 6, 7, 8],
-      "checkpoints": [{
-        "model": "wrldsuksgo2mars/Inkling-2-Small-EXL3-K4-MC",
-        "revision": "6caa0ba08eb564ddc88b98df06ac73e853cc559e",
-        "routed_expert_bytes": 294298804224
-      }]
+      "worlds": [
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8
+      ],
+      "checkpoints": [
+        {
+          "model": "wrldsuksgo2mars/Inkling-2-Small-EXL3-K4-MC",
+          "revision": "6caa0ba08eb564ddc88b98df06ac73e853cc559e",
+          "routed_expert_bytes": 294298804224
+        }
+      ],
+      "native_layout": {
+        "unit_columns": 128,
+        "storage_alignment": 1,
+        "exact_worlds": [],
+        "coverage_unit_columns": 128,
+        "legacy_unit_columns": 128
+      }
     },
     "v41:mxfp4": {
       "intermediate": 2304,
@@ -68,7 +123,14 @@
           "revision": "1bae0e1088993b9b82de08f59de5be5a34e42170",
           "routed_expert_bytes": 288777830400
         }
-      ]
+      ],
+      "native_layout": {
+        "unit_columns": 32,
+        "storage_alignment": 1,
+        "exact_worlds": [],
+        "coverage_unit_columns": 32,
+        "legacy_unit_columns": 32
+      }
     },
     "dsv4f:mxfp4": {
       "intermediate": 2048,
@@ -90,7 +152,14 @@
           "revision": "9e165c30e2704aec5d9d593cce3eebd58bbef1cb",
           "routed_expert_bytes": 147169738752
         }
-      ]
+      ],
+      "native_layout": {
+        "unit_columns": 32,
+        "storage_alignment": 1,
+        "exact_worlds": [],
+        "coverage_unit_columns": 32,
+        "legacy_unit_columns": 32
+      }
     },
     "dsv4p:exl3": {
       "intermediate": 3072,
@@ -112,7 +181,14 @@
           "revision": "7a63f24905223aff19212d65226be708950823ac",
           "routed_expert_bytes": 388288498176
         }
-      ]
+      ],
+      "native_layout": {
+        "unit_columns": 128,
+        "storage_alignment": 1,
+        "exact_worlds": [],
+        "coverage_unit_columns": 128,
+        "legacy_unit_columns": 128
+      }
     },
     "glmf:exl3": {
       "intermediate": 2048,
@@ -139,7 +215,14 @@
           "revision": "558931fe149f59b49d19b2376a692bd7a12fb8b7",
           "routed_expert_bytes": 152648955648
         }
-      ]
+      ],
+      "native_layout": {
+        "unit_columns": 128,
+        "storage_alignment": 1,
+        "exact_worlds": [],
+        "coverage_unit_columns": 128,
+        "legacy_unit_columns": 128
+      }
     },
     "glmf:nvfp4": {
       "intermediate": 2048,
@@ -167,7 +250,14 @@
         4,
         5,
         6
-      ]
+      ],
+      "native_layout": {
+        "unit_columns": 16,
+        "storage_alignment": 128,
+        "exact_worlds": [],
+        "coverage_unit_columns": 128,
+        "legacy_unit_columns": 16
+      }
     },
     "mimof:fp8": {
       "intermediate": 2048,
@@ -189,7 +279,14 @@
           "revision": "2479e2d0029eca9a34cc7e7f55a121925f81908e",
           "routed_expert_bytes": 160859947008
         }
-      ]
+      ],
+      "native_layout": {
+        "unit_columns": 32,
+        "storage_alignment": 1,
+        "exact_worlds": [],
+        "coverage_unit_columns": 32,
+        "legacy_unit_columns": 32
+      }
     },
     "mimop:fp8": {
       "intermediate": 2048,
@@ -208,7 +305,14 @@
           "revision": "adea8e2c5373181e5a973fa1ecb343cb31af214b",
           "routed_expert_bytes": 531351207936
         }
-      ]
+      ],
+      "native_layout": {
+        "unit_columns": 32,
+        "storage_alignment": 1,
+        "exact_worlds": [],
+        "coverage_unit_columns": 32,
+        "legacy_unit_columns": 32
+      }
     },
     "qwen4:exl3": {
       "intermediate": 640,
@@ -227,7 +331,14 @@
           "revision": "888306bd3996d6317758c07df50622829259ad17",
           "routed_expert_bytes": 64645005312
         }
-      ]
+      ],
+      "native_layout": {
+        "unit_columns": 128,
+        "storage_alignment": 1,
+        "exact_worlds": [],
+        "coverage_unit_columns": 128,
+        "legacy_unit_columns": 128
+      }
     },
     "qwen4:nvfp4": {
       "intermediate": 640,
@@ -255,7 +366,14 @@
         3,
         4,
         6
-      ]
+      ],
+      "native_layout": {
+        "unit_columns": 16,
+        "storage_alignment": 128,
+        "exact_worlds": [],
+        "coverage_unit_columns": 128,
+        "legacy_unit_columns": 16
+      }
     },
     "glm:exl3": {
       "intermediate": 2048,
@@ -277,7 +395,14 @@
           "revision": "47af23347db743b4666d952e2eb48f2b01c3fede",
           "routed_expert_bytes": 363331814400
         }
-      ]
+      ],
+      "native_layout": {
+        "unit_columns": 128,
+        "storage_alignment": 1,
+        "exact_worlds": [],
+        "coverage_unit_columns": 128,
+        "legacy_unit_columns": 128
+      }
     },
     "glm:nvfp4": {
       "intermediate": 2048,
@@ -303,7 +428,14 @@
         3,
         4,
         6
-      ]
+      ],
+      "native_layout": {
+        "unit_columns": 16,
+        "storage_alignment": 128,
+        "exact_worlds": [],
+        "coverage_unit_columns": 128,
+        "legacy_unit_columns": 16
+      }
     },
     "kimik3:exl3": {
       "intermediate": 3072,
@@ -321,7 +453,14 @@
           "revision": "acba35b61a672561652b16a96fca1be85c1bd875",
           "routed_expert_bytes": 683978201088
         }
-      ]
+      ],
+      "native_layout": {
+        "unit_columns": 128,
+        "storage_alignment": 1,
+        "exact_worlds": [],
+        "coverage_unit_columns": 128,
+        "legacy_unit_columns": 128
+      }
     },
     "ml4:exl3": {
       "intermediate": 6144,
@@ -340,7 +479,14 @@
           "revision": "f12dabdc0c1e99e7f7924461a6f308859b05af4d",
           "routed_expert_bytes": 515260918272
         }
-      ]
+      ],
+      "native_layout": {
+        "unit_columns": 128,
+        "storage_alignment": 1,
+        "exact_worlds": [],
+        "coverage_unit_columns": 128,
+        "legacy_unit_columns": 128
+      }
     },
     "step5:bf16": {
       "intermediate": 1536,
@@ -358,7 +504,14 @@
           "revision": "364b3b03fed2477aa0953fe855a2c4c8c48ee3cc",
           "routed_expert_bytes": 604721627136
         }
-      ]
+      ],
+      "native_layout": {
+        "unit_columns": 128,
+        "storage_alignment": 1,
+        "exact_worlds": [],
+        "coverage_unit_columns": 128,
+        "legacy_unit_columns": 128
+      }
     },
     "mimo:fp8": {
       "intermediate": 2048,
@@ -380,7 +533,14 @@
           "revision": "2479e2d0029eca9a34cc7e7f55a121925f81908e",
           "routed_expert_bytes": 160859947008
         }
-      ]
+      ],
+      "native_layout": {
+        "unit_columns": 128,
+        "storage_alignment": 1,
+        "exact_worlds": [],
+        "coverage_unit_columns": 128,
+        "legacy_unit_columns": 128
+      }
     },
     "glm:fp8": {
       "intermediate": 2048,
@@ -402,7 +562,14 @@
           "revision": "47af23347db743b4666d952e2eb48f2b01c3fede",
           "routed_expert_bytes": 363331814400
         }
-      ]
+      ],
+      "native_layout": {
+        "unit_columns": 128,
+        "storage_alignment": 1,
+        "exact_worlds": [],
+        "coverage_unit_columns": 128,
+        "legacy_unit_columns": 128
+      }
     },
     "glmf:fp8": {
       "intermediate": 2048,
@@ -429,7 +596,14 @@
           "revision": "558931fe149f59b49d19b2376a692bd7a12fb8b7",
           "routed_expert_bytes": 152648955648
         }
-      ]
+      ],
+      "native_layout": {
+        "unit_columns": 128,
+        "storage_alignment": 1,
+        "exact_worlds": [],
+        "coverage_unit_columns": 128,
+        "legacy_unit_columns": 128
+      }
     },
     "qwen4:fp8": {
       "intermediate": 640,
@@ -448,7 +622,14 @@
           "revision": "888306bd3996d6317758c07df50622829259ad17",
           "routed_expert_bytes": 64645005312
         }
-      ]
+      ],
+      "native_layout": {
+        "unit_columns": 128,
+        "storage_alignment": 1,
+        "exact_worlds": [],
+        "coverage_unit_columns": 128,
+        "legacy_unit_columns": 128
+      }
     },
     "step5:fp8": {
       "intermediate": 1536,
@@ -466,7 +647,14 @@
           "revision": "364b3b03fed2477aa0953fe855a2c4c8c48ee3cc",
           "routed_expert_bytes": 604721627136
         }
-      ]
+      ],
+      "native_layout": {
+        "unit_columns": 128,
+        "storage_alignment": 1,
+        "exact_worlds": [],
+        "coverage_unit_columns": 128,
+        "legacy_unit_columns": 128
+      }
     },
     "step5:exl3": {
       "intermediate": 1536,
@@ -487,7 +675,14 @@
           "routed_expert_bytes": 298356157440
         }
       ],
-      "provenance_note": "Published safetensors headers at the pinned revision: 371712 routed tensors, 298356157440 bytes. Minimum 3 from the planner (2 Sparks need 138.9 GiB/rank), maximum 6 from the shared width cap (1536 / 256); real-header plans checked on #925."
+      "provenance_note": "Published safetensors headers at the pinned revision: 371712 routed tensors, 298356157440 bytes. Minimum 3 from the planner (2 Sparks need 138.9 GiB/rank), maximum 6 from the shared width cap (1536 / 256); real-header plans checked on #925.",
+      "native_layout": {
+        "unit_columns": 128,
+        "storage_alignment": 1,
+        "exact_worlds": [],
+        "coverage_unit_columns": 128,
+        "legacy_unit_columns": 128
+      }
     },
     "v41:nvfp4": {
       "intermediate": 2304,
@@ -508,7 +703,14 @@
         3,
         4,
         6
-      ]
+      ],
+      "native_layout": {
+        "unit_columns": 16,
+        "storage_alignment": 128,
+        "exact_worlds": [],
+        "coverage_unit_columns": 32,
+        "legacy_unit_columns": 16
+      }
     },
     "step5:nvfp4": {
       "intermediate": 1536,
@@ -529,7 +731,14 @@
       "deprecated": true,
       "admitted_worlds": [
         4
-      ]
+      ],
+      "native_layout": {
+        "unit_columns": 16,
+        "storage_alignment": 128,
+        "exact_worlds": [],
+        "coverage_unit_columns": 128,
+        "legacy_unit_columns": 16
+      }
     },
     "dsv4p:mxfp4": {
       "intermediate": 3072,
@@ -551,14 +760,29 @@
           "revision": "7a63f24905223aff19212d65226be708950823ac",
           "routed_expert_bytes": 388288498176
         }
-      ]
+      ],
+      "native_layout": {
+        "unit_columns": 32,
+        "storage_alignment": 1,
+        "exact_worlds": [],
+        "coverage_unit_columns": 32,
+        "legacy_unit_columns": 32
+      }
     },
     "minimax:nvfp4": {
       "intermediate": 3072,
       "minimum": 2,
       "maximum": 8,
       "basis": "lower_bound",
-      "worlds": [2, 3, 4, 5, 6, 7, 8],
+      "worlds": [
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8
+      ],
       "checkpoints": [
         {
           "model": "MiniMaxAI/MiniMax-M3.1-Flash",
@@ -566,7 +790,14 @@
           "routed_expert_bytes": 232381393920
         }
       ],
-      "provenance_note": "Export-only native W4A4 geometry: 57 routed layers x 128 experts x three 3072x6144 projections, packed FP4 plus E4M3 K16 scales and two FP32 globals each. No serving fit witness; family runtime remains gated."
+      "provenance_note": "Export-only native W4A4 geometry: 57 routed layers x 128 experts x three 3072x6144 projections, packed FP4 plus E4M3 K16 scales and two FP32 globals each. No serving fit witness; family runtime remains gated.",
+      "native_layout": {
+        "unit_columns": 16,
+        "storage_alignment": 128,
+        "exact_worlds": [],
+        "coverage_unit_columns": 128,
+        "legacy_unit_columns": 16
+      }
     },
     "muse:exl3": {
       "intermediate": 4096,
@@ -588,7 +819,14 @@
           "revision": "0fb02478",
           "routed_expert_bytes": null
         }
-      ]
+      ],
+      "native_layout": {
+        "unit_columns": 128,
+        "storage_alignment": 1,
+        "exact_worlds": [],
+        "coverage_unit_columns": 128,
+        "legacy_unit_columns": 128
+      }
     }
   },
   "provenance_notes": {

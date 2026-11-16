@@ -97,6 +97,28 @@ fn fixture_with_experts(kind: Fixture, experts: usize, topk: usize) -> (tempfile
 }
 
 #[test]
+fn layout_reuses_one_immutable_catalog_across_candidates() -> anyhow::Result<()> {
+    let (dir, _, _) = fixture_with_experts(Fixture::Exl3, 384, 8);
+    let input = plan::PlanInput::open(dir.path())?;
+    let catalog = input.expert_catalog()? as *const crate::OfficialV41Catalog;
+    for entry in std::fs::read_dir(dir.path())? {
+        let path = entry?.path();
+        if path.extension().is_some_and(|extension| extension == "safetensors") {
+            std::fs::remove_file(path)?;
+        }
+    }
+    for ranks in [3, 6, 3] {
+        let report = input.plan(&PlanOptions { placement: plan::ExpertPlacement::from_spark_ranks(ranks),
+            vision: plan::MediaMode::Off, audio: plan::MediaMode::Off,
+            layout: Some(plan::layout::LayoutOptions::default()), ..Default::default() })?;
+        assert!(report.memory_layout.as_ref().is_some_and(|layout| !layout.devices.is_empty()), "{:?}", report.hints);
+        assert!(!report.hints.iter().any(|hint| hint.what.contains("catalog refused")), "{:?}", report.hints);
+        assert_eq!(catalog, input.expert_catalog()? as *const crate::OfficialV41Catalog);
+    }
+    Ok(())
+}
+
+#[test]
 fn inkling_mxfp8_inventory_is_planned_not_executable() {
     let (dir, _, _) = fixture(Fixture::Mxfp8);
     let report = plan::plan(dir.path(), &PlanOptions::default()).unwrap();
@@ -115,6 +137,27 @@ fn inkling_mxfp8_inventory_is_planned_not_executable() {
     assert_eq!(experts.package, "inkling2:mxfp8");
     assert!(experts.spark_worlds.contains(&3) && experts.spark_worlds.contains(&6),
         "registered native width-class recipes cover TP3/TP6: {:?}", experts.spark_worlds);
+}
+
+#[test]
+fn mixed_four_rank_assignment_uses_each_layers_native_unit() -> anyhow::Result<()> {
+    use crate::placement::{SparkAssignment, SparkResidentLayout, SparkWorkingSet};
+    use crate::formats::fp8_experts::Slicing;
+    let (dir, _, _) = fixture_with_experts(Fixture::Mixed, 384, 8);
+    let catalog = crate::read_expert_catalog(dir.path())?;
+    let working = SparkWorkingSet { spark_layers: (0..4).collect(), spark_ranks: 4,
+        prefill_lanes: 1, ..Default::default() };
+    for unit in [16, 32, 64] {
+        for rank in 0..4 {
+            let assignment = SparkAssignment::resident_from_catalog(&catalog, &working, rank,
+                SparkResidentLayout::Fp8 { world: 4, rank, slicing: Slicing::Blocks(unit) })?;
+            assert_eq!(assignment.slices.len(), 4);
+            for slice in assignment.slices {
+                assert_eq!((slice.first, slice.width, slice.stored_width), ((rank * 576) as u32, 576, 576));
+            }
+        }
+    }
+    Ok(())
 }
 
 #[test]

@@ -190,11 +190,18 @@ these request values do not imply that a Planned checkpoint has a serving execut
 ### Inkling Serving
 
 Inkling exposes `cuteafd serve --family inkling2` and `./run.sh --wip SLOT`
-for initial text-only qualification on one RTX and 2-8 Spark expert endpoints.
-Use native MXFP8 or the MC original core; native mixed NVFP4, compact cores,
-bundled media and dSpark remain unqualified. Public dispatch is not a serving
-or fidelity qualification claim. A matching WIP build must include the Inkling
-padded-transpose load export and native expert packages.
+for text-only serving on one RTX and 2-8 Spark expert endpoints. Standard
+fidelity and Release smoke qualify the official mixed NVFP4/MXFP8 and EXL3 K4
+MC original checkpoints on 1 RTX + 4 Sparks, and native MXFP8 on 1 RTX + 6
+Sparks. Mixed TP4 owns and stores exactly 576 intermediate columns per rank;
+no checkpoint weight padding is required. Target core, RTX-onboarded experts
+and every Spark rank load in one required SparkNest push transaction.
+
+Planner reports mark the measured mixed and MC-original text checkpoints
+Serving on 1 RTX + 4 Sparks. Other configurations remain Planned while target
+TP2 (#2316), bundled dSpark (#2320), compact-core serving and bundled media
+qualification (#1930) are pending; their separate gates stay in place. A matching WIP build must include the Inkling padded-transpose
+load export and native expert packages.
 
 `ATTENTION_PLACEMENT=auto` and GPU embedding/device selection are required;
 explicit `heads`, `layers`, `context` and multi-RTX serving refuse. Set
