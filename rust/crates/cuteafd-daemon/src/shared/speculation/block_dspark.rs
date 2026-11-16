@@ -235,7 +235,7 @@ impl DsparkConfig {
         use cuteafd_loader::formats::block_dspark::{BlockDsparkConfig, DsparkRope};
         let cfg = BlockDsparkConfig::read(snapshot)?;
         ensure!(matches!(cfg.head_dim, 64 | 128), "dSpark kernels take 64/128-wide heads");
-        ensure!(cfg.rank == 256, "dSpark kernels take a vanilla rank-256 Markov head");
+        ensure!(matches!(cfg.rank, 256 | 512), "dSpark kernels take vanilla rank-256/512 Markov heads");
         let rope_theta = match cfg.rope {
             DsparkRope::Default { rope_theta } | DsparkRope::Yarn { rope_theta, .. } => rope_theta,
         };
@@ -1725,13 +1725,13 @@ mod tests {
         fixture.immediate_copies(&library)?;
         fixture.quiet_events(&library, true)?;
         let device = Device { library: &library, id: 1 };
-        for window in [Some(8), None] {
+        for (window, rank) in [(Some(8), 256), (None, 256), (Some(8), 512), (None, 512)] {
             let root = tempfile::tempdir_in(fixture.directory())?;
             let snapshot = root.path().join("draft");
             std::fs::create_dir_all(&snapshot)?;
             let config = serde_json::json!({"architectures":["DSparkDraftModel"], "speculators_model_type":"dspark",
                 "aux_hidden_state_layer_ids":[1], "block_size":2, "confidence_head_with_markov":true,
-                "draft_vocab_size":16, "enable_confidence_head":true, "markov_head_type":"vanilla", "markov_rank":256,
+                "draft_vocab_size":16, "enable_confidence_head":true, "markov_head_type":"vanilla", "markov_rank":rank,
                 "mask_token_id":0, "sample_from_anchor":true, "sliding_window_non_causal":false,
                 "transformer_layer_config":{"attention_bias":false, "head_dim":128, "hidden_act":"silu",
                     "hidden_size":256, "intermediate_size":256, "layer_types":[if window.is_some() { "sliding_attention" } else { "full_attention" }],

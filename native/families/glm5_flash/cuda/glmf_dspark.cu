@@ -186,56 +186,60 @@ __global__ void add_rmsnorm_kernel(const bf16* residual, const bf16* delta, cons
 // Block-local best per sequence (largest value, lowest index on ties).
 constexpr int kMarkovBlocks = 296;
 constexpr int kMarkovThreads = 256;
-constexpr int kMarkovRank = 256;
-constexpr int kMaxSequences = 32;
 constexpr int kSequenceCapacity = 64;
 
-// Lane's share of w2[v] . e (elements 8 * lane .. 8 * lane + 7), warp-summed.
+// Preserve rank-256's eight-element lane order; wider heads append tiles.
+template <int Rank>
 __device__ __forceinline__ float markov_dot(const bf16* w2, uint32_t v, const float* e, int lane) {
-  const uint4 raw = *reinterpret_cast<const uint4*>(w2 + uint64_t(v) * kMarkovRank + 8 * lane);
-  const __nv_bfloat162* pair = reinterpret_cast<const __nv_bfloat162*>(&raw);
   float dot = 0;
 #pragma unroll
-  for (int k = 0; k < 4; ++k) {
-    const float2 x = __bfloat1622float2(pair[k]);
-    dot = fmaf(x.x, e[8 * lane + 2 * k], dot);
-    dot = fmaf(x.y, e[8 * lane + 2 * k + 1], dot);
+  for (int tile = 0; tile < Rank; tile += 256) {
+    const uint4 raw = *reinterpret_cast<const uint4*>(w2 + uint64_t(v) * Rank + tile + 8 * lane);
+    const __nv_bfloat162* pair = reinterpret_cast<const __nv_bfloat162*>(&raw);
+#pragma unroll
+    for (int k = 0; k < 4; ++k) {
+      const float2 x = __bfloat1622float2(pair[k]);
+      dot = fmaf(x.x, e[tile + 8 * lane + 2 * k], dot);
+      dot = fmaf(x.y, e[tile + 8 * lane + 2 * k + 1], dot);
+    }
   }
   for (int o = 16; o; o >>= 1) dot += __shfl_xor_sync(0xffffffffu, dot, o);
   return dot;
 }
 
+template <int Rank>
 __global__ void markov_partial_kernel(const float* logits, const bf16* w1, const bf16* w2, const float* norms,
                                       const uint32_t* top, const uint32_t* anchors, const uint32_t* drafts,
                                       float* partial_value, uint32_t* partial_index, int sequences, int vocab,
                                       int block, int step) {
-  __shared__ float embed[kMaxSequences][kMarkovRank];
-  __shared__ float floor_value[kMaxSequences], reach[kMaxSequences];
-  for (int i = threadIdx.x; i < sequences * kMarkovRank; i += blockDim.x) {
-    const int s = i / kMarkovRank, c = i % kMarkovRank;
+  constexpr int kTileSequences = 8192 / Rank;
+  __shared__ float embed[kTileSequences][Rank];
+  __shared__ float floor_value[kTileSequences], reach[kTileSequences];
+  for (int i = threadIdx.x; i < sequences * Rank; i += blockDim.x) {
+    const int s = i / Rank, c = i % Rank;
     const uint32_t prev = step == 0 ? anchors[s] : drafts[s * block + step - 1];
-    embed[s][c] = f(w1[uint64_t(prev) * kMarkovRank + c]);
+    embed[s][c] = f(w1[uint64_t(prev) * Rank + c]);
   }
   __syncthreads();
   const int warp = threadIdx.x / 32, lane = threadIdx.x % 32, warps = blockDim.x / 32;
   // Per sequence: |e| and the value of the base argmax row (scored as below).
   for (int s = warp; s < sequences; s += warps) {
     float sum = 0;
-    for (int c = lane; c < kMarkovRank; c += 32) sum += embed[s][c] * embed[s][c];
+    for (int c = lane; c < Rank; c += 32) sum += embed[s][c] * embed[s][c];
     for (int o = 16; o; o >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, o);
     const uint64_t row = uint64_t(s) * block + step;
     const uint32_t t = top[row];
-    const float value = logits[row * vocab + t] + markov_dot(w2, t, embed[s], lane);
+    const float value = logits[row * vocab + t] + markov_dot<Rank>(w2, t, embed[s], lane);
     if (lane == 0) {
       floor_value[s] = value;
       reach[s] = sqrtf(sum) * 1.0001f + 1e-6f;
     }
   }
   __syncthreads();
-  float best[kMaxSequences];
-  uint32_t best_index[kMaxSequences];
+  float best[kTileSequences];
+  uint32_t best_index[kTileSequences];
 #pragma unroll
-  for (int s = 0; s < kMaxSequences; ++s) {
+  for (int s = 0; s < kTileSequences; ++s) {
     best[s] = -CUDART_INF_F;
     best_index[s] = UINT32_MAX;
   }
@@ -243,26 +247,26 @@ __global__ void markov_partial_kernel(const float* logits, const bf16* w1, const
     const float n = norms[v] * 1.0001f + 1e-6f;
     bool any = false;
 #pragma unroll
-    for (int s = 0; s < kMaxSequences; ++s) {
+    for (int s = 0; s < kTileSequences; ++s) {
       if (s >= sequences) break;
       any |= logits[(uint64_t(s) * block + step) * vocab + v] + n * reach[s] >= floor_value[s];
     }
     if (!any) continue;
 #pragma unroll
-    for (int s = 0; s < kMaxSequences; ++s) {
+    for (int s = 0; s < kTileSequences; ++s) {
       if (s >= sequences) break;
-      const float value = logits[(uint64_t(s) * block + step) * vocab + v] + markov_dot(w2, v, embed[s], lane);
+      const float value = logits[(uint64_t(s) * block + step) * vocab + v] + markov_dot<Rank>(w2, v, embed[s], lane);
       if (value > best[s] || (value == best[s] && uint32_t(v) < best_index[s])) {
         best[s] = value;
         best_index[s] = v;
       }
     }
   }
-  __shared__ float values[kMarkovThreads / 32][kMaxSequences];
-  __shared__ uint32_t indices[kMarkovThreads / 32][kMaxSequences];
+  __shared__ float values[kMarkovThreads / 32][kTileSequences];
+  __shared__ uint32_t indices[kMarkovThreads / 32][kTileSequences];
   if (lane == 0) {
 #pragma unroll
-    for (int s = 0; s < kMaxSequences; ++s) {
+    for (int s = 0; s < kTileSequences; ++s) {
       values[warp][s] = best[s];
       indices[warp][s] = best_index[s];
     }
@@ -319,13 +323,14 @@ __global__ void row_argmax_kernel(const float* logits, uint32_t* top, int vocab)
   }
 }
 
-// norms[v] = |w2[v]| (FP32) of the rank-256 rows.
+// norms[v] = |w2[v]| (FP32).
+template <int Rank>
 __global__ void row_norms_kernel(const bf16* w2, float* norms, int vocab) {
   const int warp = (blockIdx.x * blockDim.x + threadIdx.x) / 32, lane = threadIdx.x % 32;
   if (warp >= vocab) return;
   float sum = 0;
-  for (int c = lane; c < kMarkovRank; c += 32) {
-    const float x = f(w2[uint64_t(warp) * kMarkovRank + c]);
+  for (int c = lane; c < Rank; c += 32) {
+    const float x = f(w2[uint64_t(warp) * Rank + c]);
     sum += x * x;
   }
   for (int o = 16; o; o >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, o);
@@ -475,33 +480,38 @@ extern "C" uint64_t cuteafd_glmf_dspark_markov_workspace(int32_t sequences, int3
   return uint64_t(sequences) * kMarkovBlocks * 8 + uint64_t(sequences) * block * 4;
 }
 
-// norms [vocab] F32 = row norms of the Markov projection w2 (BF16 [vocab, 256]), once at load.
+// norms [vocab] F32 = row norms of the Markov projection w2 (BF16 [vocab, rank]), once at load.
 extern "C" int32_t cuteafd_glmf_dspark_markov_norms(const void* w2, void* norms, int32_t vocab, int32_t rank,
                                                     void* stream) {
-  if (vocab < 1 || rank != kMarkovRank) return cudaErrorInvalidValue;
-  row_norms_kernel<<<(vocab * 32 + 255) / 256, 256, 0, static_cast<cudaStream_t>(stream)>>>(
-      static_cast<const bf16*>(w2), static_cast<float*>(norms), vocab);
+  if (vocab < 1 || (rank != 256 && rank != 512)) return cudaErrorInvalidValue;
+  if (rank == 256)
+    row_norms_kernel<256><<<(vocab * 32 + 255) / 256, 256, 0, static_cast<cudaStream_t>(stream)>>>(
+        static_cast<const bf16*>(w2), static_cast<float*>(norms), vocab);
+  else
+    row_norms_kernel<512><<<(vocab * 32 + 255) / 256, 256, 0, static_cast<cudaStream_t>(stream)>>>(
+        static_cast<const bf16*>(w2), static_cast<float*>(norms), vocab);
   return cudaGetLastError();
 }
 
 // drafts [sequences, block] U32: for step k, argmax over the vocabulary of
-// logits[s, k] (FP32 [sequences * block, vocab]) + w2 @ w1[prev] (BF16 [vocab, 256])
+// logits[s, k] (FP32 [sequences * block, vocab]) + w2 @ w1[prev] (BF16 [vocab, rank])
 // with prev = anchors[s] at k = 0, else draft k - 1 (the vanilla Markov head, greedy);
 // `norms` from cuteafd_glmf_dspark_markov_norms.
-extern "C" int32_t cuteafd_glmf_dspark_markov(const void* logits, const void* w1, const void* w2, const void* norms,
+template <int Rank>
+int32_t markov_launch(const void* logits, const void* w1, const void* w2, const void* norms,
                                               const void* anchors, void* drafts, void* workspace, int32_t sequences,
-                                              int32_t block, int32_t vocab, int32_t rank, void* stream) {
-  if (sequences < 1 || sequences > kSequenceCapacity || block < 1 || rank != kMarkovRank) return cudaErrorInvalidValue;
+                                              int32_t block, int32_t vocab, void* stream) {
   auto s = static_cast<cudaStream_t>(stream);
   auto* values = static_cast<float*>(workspace);
   auto* indices = reinterpret_cast<uint32_t*>(values + uint64_t(sequences) * kMarkovBlocks);
   auto* top = indices + uint64_t(sequences) * kMarkovBlocks;
   row_argmax_kernel<<<sequences * block, 1024, 0, s>>>(static_cast<const float*>(logits), top, vocab);
   for (int step = 0; step < block; ++step) {
-    // Sequences are independent; preserve the 32-wide kernel's shared/register footprint.
-    for (int first = 0; first < sequences; first += kMaxSequences) {
-      const int count = sequences - first < kMaxSequences ? sequences - first : kMaxSequences;
-      markov_partial_kernel<<<kMarkovBlocks, kMarkovThreads, 0, s>>>(
+    // Bound static shared memory for both ranks without changing rank-256 tiling.
+    constexpr int kTileSequences = 8192 / Rank;
+    for (int first = 0; first < sequences; first += kTileSequences) {
+      const int count = sequences - first < kTileSequences ? sequences - first : kTileSequences;
+      markov_partial_kernel<Rank><<<kMarkovBlocks, kMarkovThreads, 0, s>>>(
           static_cast<const float*>(logits) + uint64_t(first) * block * vocab,
           static_cast<const bf16*>(w1), static_cast<const bf16*>(w2),
           static_cast<const float*>(norms), top + first * block, static_cast<const uint32_t*>(anchors) + first,
@@ -512,6 +522,16 @@ extern "C" int32_t cuteafd_glmf_dspark_markov(const void* logits, const void* w1
                                                  block, step);
   }
   return cudaGetLastError();
+}
+
+extern "C" int32_t cuteafd_glmf_dspark_markov(const void* logits, const void* w1, const void* w2, const void* norms,
+                                              const void* anchors, void* drafts, void* workspace, int32_t sequences,
+                                              int32_t block, int32_t vocab, int32_t rank, void* stream) {
+  if (sequences < 1 || sequences > kSequenceCapacity || block < 1 || vocab < 1)
+    return cudaErrorInvalidValue;
+  if (rank == 256) return markov_launch<256>(logits, w1, w2, norms, anchors, drafts, workspace, sequences, block, vocab, stream);
+  if (rank == 512) return markov_launch<512>(logits, w1, w2, norms, anchors, drafts, workspace, sequences, block, vocab, stream);
+  return cudaErrorInvalidValue;
 }
 
 // confidence [sequences * block] F32 from the final-norm rows `hidden` [rows, width],

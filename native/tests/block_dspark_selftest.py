@@ -200,13 +200,17 @@ def attention_check(lib):
     print("attention legacy64 bytes and 35-query/two-slice FP64 gate passed")
 
 
-def markov_check(lib, baseline=None):
+def markov_check(lib, baseline=None, rank=256):
     stream = torch.cuda.current_stream().cuda_stream
-    vocab, rank, block = 8192, 256, 3
+    vocab, block = 8192, 3
     w1 = torch.randn(vocab, rank, device="cuda").bfloat16()
     w2 = (torch.randn(vocab, rank, device="cuda") * 0.05).bfloat16()
     norms = torch.empty(vocab, device="cuda")
     assert lib.cuteafd_glmf_dspark_markov_norms(w2.data_ptr(), norms.data_ptr(), vocab, rank, stream) == 0
+    if baseline is not None:
+        old_norms = torch.empty_like(norms)
+        assert baseline.cuteafd_glmf_dspark_markov_norms(w2.data_ptr(), old_norms.data_ptr(), vocab, rank, stream) == 0
+        assert torch.equal(norms, old_norms), "rank256 Markov norm bytes changed"
     logits = torch.randn(64, block, vocab, device="cuda")
     anchors = torch.randint(vocab, (64,), device="cuda", dtype=torch.int32)
 
@@ -216,9 +220,10 @@ def markov_check(lib, baseline=None):
         scratch = torch.full((size + 256,), 173, device="cuda", dtype=torch.uint8)
         drafts = torch.empty(sequences, block, device="cuda", dtype=torch.int32)
         def launch():
+            active_stream = torch.cuda.current_stream().cuda_stream
             assert library.cuteafd_glmf_dspark_markov(scores.data_ptr(), w1.data_ptr(), w2.data_ptr(),
                 norms.data_ptr(), previous.data_ptr(), drafts.data_ptr(), scratch.data_ptr(),
-                sequences, block, vocab, rank, stream) == 0
+                sequences, block, vocab, rank, active_stream) == 0
         launch()
         torch.cuda.synchronize()
         assert torch.all(scratch[size:] == 173), "Markov workspace overrun"
@@ -226,6 +231,17 @@ def markov_check(lib, baseline=None):
 
     for sequences in (1, 8, 16, 32, 33, 64):
         actual, launch = run(lib, logits[:sequences], anchors[:sequences])
+        previous = anchors[:sequences].long()
+        for step in range(block):
+            scores = logits[:sequences, step] + w1[previous].float() @ w2.float().T
+            expected = scores.argmax(-1)
+            assert torch.equal(actual[:, step].long(), expected), f"rank{rank} C{sequences} step{step} reference mismatch"
+            previous = expected
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            launch()
+        graph.replay()
+        torch.cuda.synchronize()
         tiles = [run(baseline or lib, logits[first:min(first + 32, sequences)],
                      anchors[first:min(first + 32, sequences)])[0]
                  for first in range(0, sequences, 32)]
@@ -249,6 +265,10 @@ def markov_check(lib, baseline=None):
     invalid = lib.cuteafd_glmf_dspark_markov(None, None, None, None, None, None, None,
                                             65, block, vocab, rank, stream)
     assert invalid != 0, "C65 must be rejected before launching"
+    for invalid_rank in (0, 128, 257, 1024):
+        assert lib.cuteafd_glmf_dspark_markov(None, None, None, None, None, None, None,
+            1, block, vocab, invalid_rank, stream) != 0
+        assert lib.cuteafd_glmf_dspark_markov_norms(None, None, vocab, invalid_rank, stream) != 0
 
 
 def main():
@@ -261,6 +281,7 @@ def main():
     torch.manual_seed(276)
     lib = bind(args.library)
     markov_check(lib, bind(args.baseline) if args.baseline else None)
+    markov_check(lib, rank=512)
     if not args.markov_only:
         rotary_check(lib)
         attention_check(lib)
