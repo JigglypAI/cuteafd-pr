@@ -1406,7 +1406,7 @@ def capture_resolver_config_parity(snapshot: Path, example: Path, binary: Path,
         assert launched["resolved_settings"][key]["value"] == planned["resolved_settings"][key]["value"], (example.name, key, launched["resolved_settings"], planned["resolved_settings"])
     assert launched["report"]["fits"] == planned["report"]["fits"], example.name
     def onboard(value):
-        return value.get("estimated_placement", {}).get("onboard_layers", value["report"].get("onboard_layers"))
+        return (value.get("estimated_placement") or {}).get("onboard_layers", value["report"].get("onboard_layers"))
     assert onboard(launched) == onboard(planned), (example.name, onboard(launched), onboard(planned))
     assert launched["memory_layout"]["pool_tokens"] == planned["memory_layout"]["pool_tokens"], (example.name, launched["memory_layout"]["pool_tokens"], planned["memory_layout"]["pool_tokens"])
     if example.name == "glm53-flash-exlr8-k4-min.config":
