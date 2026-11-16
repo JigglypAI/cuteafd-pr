@@ -50,12 +50,14 @@ def test_persistent_layer_state_is_borrowed_and_metadata_uses_retained_uploads()
     assert '.drain(' not in embedding and 'copy_h2d(' not in embedding
     prefill = (FAMILY/'prefill.rs').read_text()
     assert 'for member in members(unit)' in prefill
-    assert 'owner.segment_metadata(' in prefill
+    assert 'owner.packed_metadata(' in prefill
+    assert 'layers::begin_layer(self.kernels, &state, self.target, self.cfg, layer, unit.rows.len())' in prefill
+    assert 'layers::join_experts(self.kernels, &state, self.target, self.cfg, layer, unit.rows.len())' in prefill
     assert 'unit.reply_origins()' in prefill
     assert 'layers::routed_ffn(self.kernels, owner,' in prefill
     assert 'impl<\'a> UnitIo<\'a> for TokenIo' in prefill
     assert 'self.head.embed_unit(' in prefill
-    assert 'probe::head_spans(member.rows.len(), 64)' in prefill
+    assert 'probe::head_spans(unit.rows.len(), 64)' in prefill
     assert '(self.on_logits)(member.sequence,' in prefill
 
 

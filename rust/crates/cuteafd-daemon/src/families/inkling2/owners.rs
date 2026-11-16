@@ -287,3 +287,48 @@ impl<'a> UnitBuffers<'a> for UnitOwner<'a> {
 impl Drop for UnitOwner<'_> {
     fn drop(&mut self) { self.stream.drain_or_abort("Inkling unit owners"); }
 }
+
+#[cfg(test)]
+mod packed_tests {
+    use super::*;
+    use cuteafd_ffi::native_library_lifetime_fixture::Fixture;
+    use cuteafd_loader::families::inkling2::{execution::{CacheLayout, UnitMetadata}, Inkling2Config};
+
+    #[test]
+    fn packed_metadata_keeps_sequence_frontiers_and_whole_row_offsets() -> Result<()> {
+        let fixture = Fixture::build_for_tests()?;
+        let library = fixture.load()?;
+        fixture.immediate_copies(&library)?;
+        fixture.configure_device_flags(&library, 0)?;
+        let device = crate::shared::memory::device::Device { library: &library, id: 0 };
+        let stream = Rc::new(Stream::new(device)?);
+        let mut cfg = Inkling2Config::from_hf(&serde_json::from_str(include_str!(
+            "../../../../cuteafd-loader/src/families/inkling2/fixtures/config.json"))?)?;
+        cfg.layers = 2;
+        cfg.local = vec![true, false];
+        let cache = super::super::cache::CacheBank::new(vec![stream.clone()], CacheLayout::new(&cfg, 2, 4)?, 0)?;
+        let unit = UnitOwner::new(stream.clone(), UnitLayout::serving(&cfg, 4, 128)?)?;
+        let mut uploads = unit.uploads(&cfg, 2)?;
+        let members = vec![
+            PackedMember { sequence: 1, rows: 0..1, metadata: UnitMetadata::new(&cfg, 63..64, &[2], 4)? },
+            PackedMember { sequence: 0, rows: 1..4, metadata: UnitMetadata::new(&cfg, 65..68, &[0, 3], 4)? },
+        ];
+        unit.packed_metadata(1, &cache, &members, &mut uploads)?;
+        stream.drain()?;
+        let values = |name: &str| -> Result<Vec<i64>> {
+            let buffer = unit.buffer(name)?;
+            let mut bytes = vec![0; buffer.bytes];
+            library.copy_d2h(&mut bytes, buffer)?;
+            Ok(bytes.chunks_exact(8).map(|b| i64::from_le_bytes(b.try_into().unwrap())).collect())
+        };
+        assert_eq!(values("positions")?, [63, 65, 66, 67]);
+        assert_eq!(values("cache_slots")?, [0, 0, 1, 2]);
+        assert_eq!(values("global_slots")?, [191, 193, 194, 195]);
+        assert_eq!(values("conv_slots")?, [0; 4]);
+        let packed = PackedLayerUnit { unit: &unit, cache: &cache, layer: 1, members: &members,
+            uploads: std::cell::RefCell::new(&mut uploads) };
+        assert_eq!(packed.buffer("partial")?.ptr, unit.buffer("partial")?.ptr);
+        assert_eq!(packed.buffer("cache_slots")?.ptr, unit.buffer("global_slots")?.ptr);
+        Ok(())
+    }
+}
