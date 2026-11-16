@@ -47,6 +47,8 @@ pub(crate) fn handshake(
             sm,
         ),
         max_patches: CAPACITY as u32,
+        max_output_rows:1024,
+        max_canvas_pixels:CAPACITY as u64*14*14,
         output_width: 5120,
         patch_size: 14,
         merge_size: 3,

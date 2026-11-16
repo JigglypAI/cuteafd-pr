@@ -1,10 +1,17 @@
 //! expertd tower startup: reserve the resident ledger before expert allocation.
-use super::{normalization_lut, remote::{EncoderHandshake, EncoderServer}, EncoderService, TowerSpec};
+use super::{
+    normalization_lut,
+    remote::{EncoderHandshake, EncoderServer},
+    EncoderService, TowerSpec,
+};
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::vision::NativeVision;
 use cuteafd_loader::media::ProcessorConfig;
-use cuteafd_loader::plan::checkpoint::{CoreView, CheckpointView};
-use std::{path::{Path, PathBuf}, time::Duration};
+use cuteafd_loader::plan::checkpoint::{CheckpointView, CoreView};
+use std::{
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 #[derive(Clone, Debug)]
 pub struct EncoderWorkerConfig {
@@ -14,18 +21,38 @@ pub struct EncoderWorkerConfig {
     pub max_tokens: usize,
 }
 pub fn parse_plan_hash(value: &str) -> Result<[u8; 32]> {
-    ensure!(value.len() == 64 && value.is_ascii(), "encoder plan hash must be 64 hexadecimal digits");
+    ensure!(
+        value.len() == 64 && value.is_ascii(),
+        "encoder plan hash must be 64 hexadecimal digits"
+    );
     let mut hash = [0; 32];
-    for (i, byte) in hash.iter_mut().enumerate() { *byte = u8::from_str_radix(&value[i*2..i*2+2], 16).context("encoder plan hash")?; }
+    for (i, byte) in hash.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&value[i * 2..i * 2 + 2], 16).context("encoder plan hash")?;
+    }
     Ok(hash)
 }
 /// The image handshake a tower serves (and a coordinator expects): its merged-row
 /// capacity in patches, output width, patch/merge geometry and marker rows.
-pub fn image_handshake(spec: &TowerSpec, processor: &ProcessorConfig, encoder_id: cuteafd_loader::media::EncoderId,
-    plan_hash: [u8; 32]) -> EncoderHandshake {
-    EncoderHandshake { encoder_id, max_patches: spec.native.max_tokens * processor.merge.pow(2),
-        output_width: spec.native.output_width, patch_size: processor.patch, merge_size: processor.merge,
-        row_markers: spec.row_markers(), plan_hash }
+pub fn image_handshake(
+    spec: &TowerSpec,
+    processor: &ProcessorConfig,
+    encoder_id: cuteafd_loader::media::EncoderId,
+    plan_hash: [u8; 32],
+) -> EncoderHandshake {
+    EncoderHandshake {
+        encoder_id,
+        max_patches: spec.native.max_tokens * processor.merge.pow(2),
+        max_output_rows: spec.native.max_tokens
+            + u32::from(spec.row_markers() > 0) * spec.native.max_tokens.isqrt(),
+        max_canvas_pixels: u64::from(spec.native.max_tokens)
+            * u64::from(processor.merge.pow(2))
+            * u64::from(processor.patch.pow(2)),
+        output_width: spec.native.output_width,
+        patch_size: processor.patch,
+        merge_size: processor.merge,
+        row_markers: spec.row_markers(),
+        plan_hash,
+    }
 }
 
 pub(crate) fn architecture(library: &Path) -> Result<u32> {
@@ -36,23 +63,43 @@ pub(crate) fn architecture(library: &Path) -> Result<u32> {
 }
 /// Returns a server only after the tower owner has reported ready. The caller
 /// subtracts this exact ledger before any expert weight/workspace admission.
-pub fn start(config: &EncoderWorkerConfig, snapshot: &Path, library: PathBuf, budget: u64) -> Result<(EncoderServer, u64)> {
+pub fn start(
+    config: &EncoderWorkerConfig,
+    snapshot: &Path,
+    library: PathBuf,
+    budget: u64,
+) -> Result<(EncoderServer, u64)> {
     let view = CheckpointView::select(snapshot, CoreView::Original)?;
     start_view(config, &view, library, budget)
 }
 
-fn start_view(config: &EncoderWorkerConfig, view: &CheckpointView, library: PathBuf, budget: u64) -> Result<(EncoderServer, u64)> {
+fn start_view(
+    config: &EncoderWorkerConfig,
+    view: &CheckpointView,
+    library: PathBuf,
+    budget: u64,
+) -> Result<(EncoderServer, u64)> {
     let snapshot = view.snapshot();
     let spec = TowerSpec::from_view(view, config.max_tokens)?;
     let sm = architecture(&library)?;
     let id = spec.encoder_id(&config.revision, sm);
     let ledger = NativeVision::required(&library, &spec.native)?;
-    ensure!(ledger.total_bytes() <= budget, "vision tower admission needs {} bytes, budget {budget}", ledger.total_bytes());
+    ensure!(
+        ledger.total_bytes() <= budget,
+        "vision tower admission needs {} bytes, budget {budget}",
+        ledger.total_bytes()
+    );
     let processor = ProcessorConfig::from_snapshot(snapshot, spec.image_family())?;
     let handshake = image_handshake(&spec, &processor, id, config.plan_hash);
     let service = EncoderService::start(spec, library, 0, ledger.total_bytes())?;
-    let server = EncoderServer::start(config.listen.parse().context("encoder listen address")?, handshake, service, normalization_lut(&processor), Duration::from_secs(60))
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let server = EncoderServer::start(
+        config.listen.parse().context("encoder listen address")?,
+        handshake,
+        service,
+        normalization_lut(&processor),
+        Duration::from_secs(60),
+    )
+    .map_err(|e| anyhow::anyhow!("{e}"))?;
     tracing::info!(address = %server.address, sm, admitted_bytes = ledger.total_bytes(), "vision encoder ready");
     Ok((server, ledger.total_bytes()))
 }
@@ -65,33 +112,59 @@ pub struct AudioWorkerConfig {
 }
 
 /// Admit both towers before either owner allocates; ports remain independent.
-pub fn start_encoders(vision: Option<&EncoderWorkerConfig>, audio: Option<&AudioWorkerConfig>,
-    view: &CheckpointView, library: PathBuf, budget: u64) -> Result<(Option<EncoderServer>, Option<EncoderServer>, u64)> {
-    if vision.is_none() && audio.is_none() { return Ok((None, None, 0)); }
+pub fn start_encoders(
+    vision: Option<&EncoderWorkerConfig>,
+    audio: Option<&AudioWorkerConfig>,
+    view: &CheckpointView,
+    library: PathBuf,
+    budget: u64,
+) -> Result<(Option<EncoderServer>, Option<EncoderServer>, u64)> {
+    if vision.is_none() && audio.is_none() {
+        return Ok((None, None, 0));
+    }
     let snapshot = view.snapshot();
     let config = view.config()?;
     if config["model_type"].as_str() == Some("deepseek_v41") {
         ensure!(audio.is_none(), "V4.1 audio encoder is unsupported");
         return match vision {
-            Some(config) => crate::families::deepseek_v41::v41_vision_encoder::start_worker(config, snapshot, library, budget)
-                .map(|(server, bytes)| (Some(server), None, bytes)),
+            Some(config) => crate::families::deepseek_v41::v41_vision_encoder::start_worker(
+                config, snapshot, library, budget,
+            )
+            .map(|(server, bytes)| (Some(server), None, bytes)),
             None => Ok((None, None, 0)),
         };
     }
     if let (Some(vision), Some(audio)) = (vision, audio) {
-        ensure!(vision.listen != audio.listen, "image/audio encoder listen addresses must differ");
+        ensure!(
+            vision.listen != audio.listen,
+            "image/audio encoder listen addresses must differ"
+        );
     }
-    let vision_bytes = vision.map(|config| -> Result<_> {
-        let spec = TowerSpec::from_view(view, config.max_tokens)?;
-        Ok(NativeVision::required(&library, &spec.native)?.total_bytes())
-    }).transpose()?.unwrap_or(0);
-    let audio_bytes = audio.map(|_| -> Result<_> {
-        let spec = super::audio::BundledAudioSpec::from_snapshot(snapshot, cuteafd_loader::media::audio::MAX_CLIP_SAMPLES)?;
-        let bytes = spec.required_bytes(&library)?;
-        bundled_audio_reservation(spec.geometry(), bytes, budget)
-    }).transpose()?.unwrap_or(0);
-    let reserved = vision_bytes.checked_add(audio_bytes).context("media reservation overflow")?;
-    ensure!(reserved <= budget, "media towers need {reserved} bytes including guard, budget {budget}");
+    let vision_bytes = vision
+        .map(|config| -> Result<_> {
+            let spec = TowerSpec::from_view(view, config.max_tokens)?;
+            Ok(NativeVision::required(&library, &spec.native)?.total_bytes())
+        })
+        .transpose()?
+        .unwrap_or(0);
+    let audio_bytes = audio
+        .map(|_| -> Result<_> {
+            let spec = super::audio::BundledAudioSpec::from_snapshot(
+                snapshot,
+                cuteafd_loader::media::audio::MAX_CLIP_SAMPLES,
+            )?;
+            let bytes = spec.required_bytes(&library)?;
+            bundled_audio_reservation(spec.geometry(), bytes, budget)
+        })
+        .transpose()?
+        .unwrap_or(0);
+    let reserved = vision_bytes
+        .checked_add(audio_bytes)
+        .context("media reservation overflow")?;
+    ensure!(
+        reserved <= budget,
+        "media towers need {reserved} bytes including guard, budget {budget}"
+    );
     if audio.is_some() {
         // SAFETY: this is the selected architecture-matching native library.
         let native = unsafe { cuteafd_ffi::NativeLibrary::load(&library) }?;
@@ -104,25 +177,60 @@ pub fn start_encoders(vision: Option<&EncoderWorkerConfig>, audio: Option<&Audio
         ensure!(sm == 121, "Spark audio worker requires SM121, got SM{sm}");
         let image_spec = TowerSpec::from_view(view, image_config.max_tokens)?;
         let processor = ProcessorConfig::from_snapshot(snapshot, image_spec.image_family())?;
-        let image_handshake = image_handshake(&image_spec, &processor,
-            image_spec.encoder_id(&image_config.revision, sm), image_config.plan_hash);
-        let audio_spec = super::audio::BundledAudioSpec::from_snapshot(snapshot, cuteafd_loader::media::audio::MAX_CLIP_SAMPLES)?;
+        let image_handshake = image_handshake(
+            &image_spec,
+            &processor,
+            image_spec.encoder_id(&image_config.revision, sm),
+            image_config.plan_hash,
+        );
+        let audio_spec = super::audio::BundledAudioSpec::from_snapshot(
+            snapshot,
+            cuteafd_loader::media::audio::MAX_CLIP_SAMPLES,
+        )?;
         let backend = audio_spec.backend(&library)?;
-        let audio_handshake = audio_spec.handshake(&audio_config.revision, sm, &backend, audio_config.plan_hash);
+        let audio_handshake =
+            audio_spec.handshake(&audio_config.revision, sm, &backend, audio_config.plan_hash);
         let admitted_audio = audio_spec.required_bytes(&library)?;
-        let service = std::sync::Arc::new(EncoderService::start_with_audio(image_spec, library, 0, vision_bytes,
-            Some(audio_spec.owner(admitted_audio)))?);
-        let image = EncoderServer::start_shared(image_config.listen.parse().context("encoder listen address")?,
-            image_handshake, service.clone(), normalization_lut(&processor), Duration::from_secs(60))
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
-        let audio = EncoderServer::start_audio_shared(audio_config.listen.parse().context("audio encoder listen address")?,
-            audio_handshake, service, Duration::from_secs(60)).map_err(|e| anyhow::anyhow!("{e}"))?;
+        let service = std::sync::Arc::new(EncoderService::start_with_audio(
+            image_spec,
+            library,
+            0,
+            vision_bytes,
+            Some(audio_spec.owner(admitted_audio)),
+        )?);
+        let image = EncoderServer::start_shared(
+            image_config
+                .listen
+                .parse()
+                .context("encoder listen address")?,
+            image_handshake,
+            service.clone(),
+            normalization_lut(&processor),
+            Duration::from_secs(60),
+        )
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let audio = EncoderServer::start_audio_shared(
+            audio_config
+                .listen
+                .parse()
+                .context("audio encoder listen address")?,
+            audio_handshake,
+            service,
+            Duration::from_secs(60),
+        )
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
         tracing::info!(address = %audio.address, sm, admitted_bytes = admitted_audio,
             reserved_bytes = reserved, backend = %backend, "audio encoder ready");
         return Ok((Some(image), Some(audio), reserved));
     }
-    let image = vision.map(|config| start_view(config, view, library.clone(), budget).map(|(server, _)| server)).transpose()?;
-    let audio = audio.map(|config| start_audio(config, snapshot, library.clone(), budget).map(|(server, _)| server)).transpose()?;
+    let image = vision
+        .map(|config| start_view(config, view, library.clone(), budget).map(|(server, _)| server))
+        .transpose()?;
+    let audio = audio
+        .map(|config| {
+            start_audio(config, snapshot, library.clone(), budget).map(|(server, _)| server)
+        })
+        .transpose()?;
     Ok((image, audio, reserved))
 }
 
@@ -143,35 +251,56 @@ pub(crate) fn drain_external_weights(library: &Path, device: i32) -> Result<()> 
 }
 
 pub(crate) fn require_allocatable(required: u64, free: u64) -> Result<()> {
-    ensure!(required <= free,
+    ensure!(
+        required <= free,
         "media tower allocation needs {required} bytes but only {free} allocatable bytes remain; \
         GB10 uses MemAvailable including reclaimable file cache, discrete RTX uses cudaMemGetInfo; \
-        free memory or choose another encoder owner");
+        free memory or choose another encoder owner"
+    );
     Ok(())
 }
 
 const AUDIO_GUARD_BYTES: u64 = 1 << 30;
 
 fn audio_reservation(admitted: u64, budget: u64) -> Result<u64> {
-    let reserved = admitted.checked_add(AUDIO_GUARD_BYTES).context("audio reservation overflow")?;
-    ensure!(reserved <= budget,
-        "audio tower needs {admitted} bytes plus 1 GiB guard, budget {budget}");
+    let reserved = admitted
+        .checked_add(AUDIO_GUARD_BYTES)
+        .context("audio reservation overflow")?;
+    ensure!(
+        reserved <= budget,
+        "audio tower needs {admitted} bytes plus 1 GiB guard, budget {budget}"
+    );
     Ok(reserved)
 }
 
-fn bundled_audio_reservation(geometry: cuteafd_core::media::AudioTokenGeometry, admitted: u64, budget: u64) -> Result<u64> {
+fn bundled_audio_reservation(
+    geometry: cuteafd_core::media::AudioTokenGeometry,
+    admitted: u64,
+    budget: u64,
+) -> Result<u64> {
     match geometry {
         cuteafd_core::media::AudioTokenGeometry::MimoRvq => audio_reservation(admitted, budget),
         cuteafd_core::media::AudioTokenGeometry::PcmPatches { .. } => {
-            ensure!(admitted <= budget, "PCM audio ledger needs {admitted} bytes, budget {budget}");
+            ensure!(
+                admitted <= budget,
+                "PCM audio ledger needs {admitted} bytes, budget {budget}"
+            );
             Ok(admitted)
         }
     }
 }
 
 /// Returns the native ledger plus any geometry-specific guard before experts load.
-pub fn start_audio(config: &AudioWorkerConfig, snapshot: &Path, library: PathBuf, budget: u64) -> Result<(EncoderServer, u64)> {
-    let spec = super::audio::BundledAudioSpec::from_snapshot(snapshot, cuteafd_loader::media::audio::MAX_CLIP_SAMPLES)?;
+pub fn start_audio(
+    config: &AudioWorkerConfig,
+    snapshot: &Path,
+    library: PathBuf,
+    budget: u64,
+) -> Result<(EncoderServer, u64)> {
+    let spec = super::audio::BundledAudioSpec::from_snapshot(
+        snapshot,
+        cuteafd_loader::media::audio::MAX_CLIP_SAMPLES,
+    )?;
     let sm = architecture(&library)?;
     ensure!(sm == 121, "Spark audio worker requires SM121, got SM{sm}");
     let admitted = spec.required_bytes(&library)?;
@@ -179,8 +308,16 @@ pub fn start_audio(config: &AudioWorkerConfig, snapshot: &Path, library: PathBuf
     let backend = spec.backend(&library)?;
     let handshake = spec.handshake(&config.revision, sm, &backend, config.plan_hash);
     let service = EncoderService::start_audio(library, 0, spec.owner(admitted))?;
-    let server = EncoderServer::start_audio(config.listen.parse().context("audio encoder listen address")?,
-        handshake, service, Duration::from_secs(60)).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let server = EncoderServer::start_audio(
+        config
+            .listen
+            .parse()
+            .context("audio encoder listen address")?,
+        handshake,
+        service,
+        Duration::from_secs(60),
+    )
+    .map_err(|e| anyhow::anyhow!("{e}"))?;
     tracing::info!(address = %server.address, sm, admitted_bytes = admitted, reserved_bytes = reserved,
         backend = %backend, "audio encoder ready");
     Ok((server, reserved))
@@ -191,24 +328,44 @@ mod tests {
     use super::*;
     #[test]
     fn audio_reservation_keeps_guard_outside_expert_budget() {
-        assert_eq!(audio_reservation(7, AUDIO_GUARD_BYTES + 7).unwrap(), AUDIO_GUARD_BYTES + 7);
+        assert_eq!(
+            audio_reservation(7, AUDIO_GUARD_BYTES + 7).unwrap(),
+            AUDIO_GUARD_BYTES + 7
+        );
         assert!(audio_reservation(7, AUDIO_GUARD_BYTES + 6).is_err());
         assert!(audio_reservation(u64::MAX, u64::MAX).is_err());
     }
     #[test]
     fn pcm_reservation_is_exact_and_refuses_short_budget() {
-        let geometry = cuteafd_core::media::AudioTokenGeometry::PcmPatches { samples_per_token: 1920 };
+        let geometry = cuteafd_core::media::AudioTokenGeometry::PcmPatches {
+            samples_per_token: 1920,
+        };
         assert_eq!(bundled_audio_reservation(geometry, 7, 7).unwrap(), 7);
         assert!(bundled_audio_reservation(geometry, 7, 6).is_err());
-        assert_eq!(bundled_audio_reservation(cuteafd_core::media::AudioTokenGeometry::MimoRvq,
-            7, AUDIO_GUARD_BYTES + 7).unwrap(), AUDIO_GUARD_BYTES + 7);
+        assert_eq!(
+            bundled_audio_reservation(
+                cuteafd_core::media::AudioTokenGeometry::MimoRvq,
+                7,
+                AUDIO_GUARD_BYTES + 7
+            )
+            .unwrap(),
+            AUDIO_GUARD_BYTES + 7
+        );
     }
     #[test]
     fn tower_preflight_requires_allocatable_memory() {
         assert!(require_allocatable(3 << 30, 3 << 30).is_ok());
         assert!(require_allocatable(0, 0).is_ok());
-        let error = require_allocatable(3 << 30, 2 << 30).unwrap_err().to_string();
-        for text in ["cudaMemGetInfo", "allocatable", "MemAvailable", "file cache", "another encoder owner"] {
+        let error = require_allocatable(3 << 30, 2 << 30)
+            .unwrap_err()
+            .to_string();
+        for text in [
+            "cudaMemGetInfo",
+            "allocatable",
+            "MemAvailable",
+            "file cache",
+            "another encoder owner",
+        ] {
             assert!(error.contains(text), "{error}");
         }
     }
@@ -219,16 +376,28 @@ mod tests {
     fn mistral_replica_and_coordinator_agree_on_the_span_handshake() {
         let dir = tempfile::tempdir().unwrap();
         cuteafd_loader::plan::testing::write_mistral_large4_snapshot(dir.path(), Some(&[1]), true);
-        let processor = ProcessorConfig::from_snapshot(dir.path(), cuteafd_loader::media::ImageFamily::Mistral).unwrap();
+        let processor =
+            ProcessorConfig::from_snapshot(dir.path(), cuteafd_loader::media::ImageFamily::Mistral)
+                .unwrap();
         let worker = TowerSpec::from_snapshot(dir.path(), processor.max_image_tokens).unwrap();
-        let coordinator = TowerSpec::mistral_large4(dir.path(),
-            super::super::mistral::merged_capacity(processor.max_image_tokens)).unwrap();
+        let coordinator = TowerSpec::mistral_large4(
+            dir.path(),
+            super::super::mistral::merged_capacity(processor.max_image_tokens),
+        )
+        .unwrap();
         let id = coordinator.encoder_id("rev", 121);
         assert_eq!(worker.encoder_id("rev", 121), id);
         let replica = image_handshake(&worker, &processor, id, [5; 32]);
         let expected = image_handshake(&coordinator, &processor, id, [5; 32]);
         assert_eq!(replica, expected);
-        assert_eq!((replica.row_markers, replica.max_patches, replica.output_width), (1, 55 * 55 * 4, 6144));
+        assert_eq!(
+            (
+                replica.row_markers,
+                replica.max_patches,
+                replica.output_width
+            ),
+            (1, 55 * 55 * 4, 6144)
+        );
     }
 
     /// Hardware (matching CUDA container): a Mistral Large 4 replica serves its Pixtral span over
@@ -240,38 +409,76 @@ mod tests {
         use cuteafd_engine::media::{EncodeJob, EncoderClient};
         let snapshot = std::path::PathBuf::from(std::env::var("VISION_SNAPSHOT").unwrap());
         let library = std::path::PathBuf::from(std::env::var("VISION_LIBRARY").unwrap());
-        let processor = ProcessorConfig::from_snapshot(&snapshot, cuteafd_loader::media::ImageFamily::Mistral).unwrap();
-        let config = EncoderWorkerConfig { listen: "127.0.0.1:0".into(), plan_hash: [9; 32], revision: "rev".into(),
-            max_tokens: processor.max_image_tokens };
+        let processor =
+            ProcessorConfig::from_snapshot(&snapshot, cuteafd_loader::media::ImageFamily::Mistral)
+                .unwrap();
+        let config = EncoderWorkerConfig {
+            listen: "127.0.0.1:0".into(),
+            plan_hash: [9; 32],
+            revision: "rev".into(),
+            max_tokens: processor.max_image_tokens,
+        };
         let (server, _) = start(&config, &snapshot, library.clone(), 64 << 30).unwrap();
-        let coordinator = TowerSpec::mistral_large4(&snapshot,
-            super::super::mistral::merged_capacity(processor.max_image_tokens)).unwrap();
-        let expected = image_handshake(&coordinator, &processor, coordinator.encoder_id("rev", architecture(&library).unwrap()),
-            [9; 32]);
-        let mut client = super::super::remote::RemoteEncoder::connect(vec![server.address], expected,
-            Duration::from_secs(60)).unwrap();
+        let coordinator = TowerSpec::mistral_large4(
+            &snapshot,
+            super::super::mistral::merged_capacity(processor.max_image_tokens),
+        )
+        .unwrap();
+        let expected = image_handshake(
+            &coordinator,
+            &processor,
+            coordinator.encoder_id("rev", architecture(&library).unwrap()),
+            [9; 32],
+        );
+        let mut client = super::super::remote::RemoteEncoder::connect(
+            vec![server.address],
+            expected,
+            Duration::from_secs(60),
+        )
+        .unwrap();
         let (gh, gw) = (16usize, 24usize);
-        let rgb: Vec<u8> = (0..gh * 14 * gw * 14 * 3).map(|i| (i * 7 % 251) as u8).collect();
+        let rgb: Vec<u8> = (0..gh * 14 * gw * 14 * 3)
+            .map(|i| (i * 7 % 251) as u8)
+            .collect();
         let rows = cuteafd_ffi::vision::output_rows([gh, gw], true);
-        let job = EncodeJob::image(cuteafd_core::ImageKey([4; 32]), [1, gh as u32, gw as u32], rgb.clone().into(), rows, 6144);
+        let job = EncodeJob::image(
+            cuteafd_core::ImageKey([4; 32]),
+            [1, gh as u32, gw as u32],
+            rgb.clone().into(),
+            rows,
+            6144,
+        );
         let ticket = client.submit(job).unwrap();
         let deadline = std::time::Instant::now() + Duration::from_secs(120);
         let remote = loop {
-            if let Some(result) = client.poll(ticket) { break result.unwrap().features; }
-            assert!(std::time::Instant::now() < deadline, "remote encode timed out");
+            if let Some(result) = client.poll(ticket) {
+                break result.unwrap().features;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "remote encode timed out"
+            );
             std::thread::sleep(Duration::from_millis(5));
         };
         drop((client, server));
         let mut local = super::super::VitRuntime::load(coordinator, &library, 0, 64 << 30).unwrap();
         let mut output = vec![0u16; rows * 6144];
-        local.encode_into(&rgb, [gh, gw], &normalization_lut(&processor), &mut output).unwrap();
+        local
+            .encode_into(&rgb, [gh, gw], &normalization_lut(&processor), &mut output)
+            .unwrap();
         let local: Vec<u8> = output.iter().flat_map(|v| v.to_le_bytes()).collect();
-        assert_eq!(&remote[..], &local[..], "remote and in-process Pixtral spans differ");
+        assert_eq!(
+            &remote[..],
+            &local[..],
+            "remote and in-process Pixtral spans differ"
+        );
     }
 
     #[test]
     fn hash_parser_fails_closed() {
         assert_eq!(parse_plan_hash(&"ab".repeat(32)).unwrap(), [0xab; 32]);
-        for bad in ["f".repeat(63), "z".repeat(64), "é".repeat(32)] { assert!(parse_plan_hash(&bad).is_err()); }
+        for bad in ["f".repeat(63), "z".repeat(64), "é".repeat(32)] {
+            assert!(parse_plan_hash(&bad).is_err());
+        }
     }
 }

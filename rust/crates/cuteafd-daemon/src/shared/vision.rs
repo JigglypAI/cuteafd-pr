@@ -508,6 +508,7 @@ impl VitRuntime {
 pub struct EncodeJob {
     pub rgb: Arc<[u8]>,
     pub grid: [usize; 2],
+    pub pixels: Option<cuteafd_core::media::ImagePixels>,
     pub lut: Arc<[f32; 768]>,
     pub output: Vec<u16>,
 }
@@ -723,9 +724,10 @@ impl EncoderService {
                     } else {
                         let encoded = match work.job {
                             EncoderJob::Vision(mut job) => match runtime.as_mut() {
-                                Some(runtime) => runtime.encode_into(
-                                    &job.rgb, job.grid, &job.lut, &mut job.output,
-                                ).map(|()| job.output),
+                                Some(runtime) => match job.pixels {
+                                    Some(pixels) => runtime.native.encode_pixels_into(&job.rgb,job.grid,pixels,&job.lut,&mut job.output).map_err(VisionError::from),
+                                    None => runtime.encode_into(&job.rgb,job.grid,&job.lut,&mut job.output),
+                                }.map(|()| job.output),
                                 None => Err(VisionError::Unsupported("vision encoder is not loaded".into())),
                             },
                             EncoderJob::Audio(job) => match audio_runtime.as_mut() {
@@ -953,7 +955,7 @@ mod tests {
                 } else { Ok(output) });
             }
         })));
-        let image = service.submit(EncodeJob { rgb: vec![0; 3072].into(), grid: [2,2],
+        let image = service.submit(EncodeJob { rgb: vec![0; 3072].into(), grid: [2,2], pixels: None,
             lut: Arc::new([0.0; 768]), output: vec![0; 4096] }).unwrap();
         let audio = service.submit_audio(audio_job()).unwrap();
         assert!(matches!(service.submit_audio(audio_job()), Err(VisionError::QueueFull)));
@@ -1160,6 +1162,7 @@ mod tests {
         let job = |grid: [usize; 2]| EncodeJob {
             rgb: vec![113; grid[0] * grid[1] * 768].into(),
             grid,
+            pixels: None,
             lut: lut.clone(),
             output: vec![0; grid[0] * grid[1] / 4 * width],
         };
@@ -1175,6 +1178,10 @@ mod tests {
         };
         let baseline = wait(&service.submit(job([4, 4])).unwrap());
         assert!(baseline.iter().any(|v| *v != 0));
+        let mut described=job([4,4]);
+        described.pixels=Some(cuteafd_core::media::ImagePixels::full(64,64));
+        assert_eq!(wait(&service.submit(described).unwrap()),baseline,
+            "explicit full-canvas descriptor preserves the legacy encode path");
         for _ in 0..3 {
             wait(&service.submit(job([8, 4])).unwrap());
             assert_eq!(wait(&service.submit(job([4, 4])).unwrap()), baseline);

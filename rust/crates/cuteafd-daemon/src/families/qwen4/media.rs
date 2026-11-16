@@ -78,7 +78,8 @@ impl ReadyVision {
             anyhow::ensure!(preparer.config().max_image_tokens <= max_tokens, "Qwen tower capacity is {max_tokens} tokens per image");
             warn_cache_capacity(cache_bytes, preparer.config().max_image_tokens, width)?;
             let expected = crate::shared::vision::remote::EncoderHandshake {
-                encoder_id: id, max_patches: max_tokens as u32 * processor.merge.pow(2), output_width: spec.native.output_width,
+                encoder_id: id, max_patches: max_tokens as u32 * processor.merge.pow(2), max_output_rows:max_tokens as u32, max_canvas_pixels:u64::from(spec.native.max_tokens)*u64::from(processor.merge.pow(2))*u64::from(processor.patch.pow(2)),
+        output_width: spec.native.output_width,
                 patch_size: processor.patch, merge_size: processor.merge, row_markers: 0, plan_hash: remote.plan_hash,
             };
             anyhow::ensure!(expected.output_width as usize == width, "Qwen tower/LM output width mismatch");
