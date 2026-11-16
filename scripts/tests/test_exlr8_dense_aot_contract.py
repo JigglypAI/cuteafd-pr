@@ -661,8 +661,11 @@ def test_inkling2_dispatch_package_codes_cmake_and_placement_scopes_agree(monkey
                  # this isolated dispatcher test needs no CUDA/compiler imports.
                  "inkling2_producer_programs": lambda rows: [],
                  "inkling2_load_programs": lambda: [],
+                 # Recurrent primitive and TP geometry inventories have their own tests.
+                 "inkling_draft_programs": lambda: [],
+                 "inkling_draft_projection_shapes": lambda ranks: set(),
                  "inkling2_input_quant_program": lambda: "native-wire",
-                 "compile_draft_bf16_projection": lambda k, n, output: (k, n, output)}
+                 "compile_draft_bf16_projection": lambda k, n, output="bf16": (k, n, output)}
     exec(compile(ast.Module(body=[helper, shapes, branch], type_ignores=[]), "dispatch", "exec"), namespace)
     assert namespace["manifest"]["families"] == {"inkling2": {"heads": 48, "kv_heads": 8}}
     stem = next(node for node in ast.walk(tree) if isinstance(node, ast.Assign)
@@ -680,7 +683,7 @@ def test_inkling2_dispatch_package_codes_cmake_and_placement_scopes_agree(monkey
         else:
             assert op == "bf16_projection" and family == "draft_bf16"
             assert thunk()[2] == "f32"
-    assert len(namespace["work"]) == 6 + 1 + 8
+    assert len(namespace["work"]) == 6 + 1 + 8 + 2
     assert names == [
         (f"inkling2_{kind}_attention_{route}_{fmt}_v2_m{rows}",
          dict(kind=kind, route=route, max_rows=rows, kv_format=fmt))
