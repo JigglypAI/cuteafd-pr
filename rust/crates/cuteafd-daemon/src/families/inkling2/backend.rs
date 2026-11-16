@@ -60,7 +60,7 @@ impl PolicyProbe{
     fn begin(&mut self,rows:usize){if let Some(routes)=&mut self.routes{
         routes.begin(rows);
         // Fit whole-round cost, including MoE exchange, without invented route timings.
-        for layer in 0..routes.layers(){routes.dense(layer).expect("admitted Inkling policy layer");}
+        for route_index in 0..routes.layers(){routes.dense(route_index).expect("admitted Inkling policy layer");}
     }}
     fn finish<T>(&self,observe:impl FnOnce(&RoundRoutes,&[Option<f64>])->T)->Option<T>{
         self.routes.as_ref().map(|routes|observe(routes,&[]))
