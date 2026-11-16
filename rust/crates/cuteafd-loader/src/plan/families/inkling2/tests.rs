@@ -356,6 +356,22 @@ fn installed_native_minimum_is_six_sparks_with_full_pool() -> anyhow::Result<()>
 }
 
 #[test]
+fn serving_header_inventory_preserves_remote_native_expert_scales() -> anyhow::Result<()> {
+    use crate::families::inkling2::experts::layer_experts;
+    let (directory, config, _) = fixture(Fixture::Mxfp8);
+    let view = crate::plan::checkpoint::CheckpointView::select(directory.path(),
+        crate::plan::checkpoint::CoreView::Original)?;
+    let cfg = Inkling2Config::from_hf(&config)?;
+    let coordinator = Checkpoint::coordinator_view(&view, false, false)?;
+    assert!(layer_experts(&coordinator, &cfg).is_err());
+    let inventory = Checkpoint::open_view(&view)?;
+    let experts = layer_experts(&inventory, &cfg)?;
+    assert_eq!(experts.len(), cfg.layers);
+    assert!(experts.iter().all(|layer| layer.source > 0 && layer.whole > 0));
+    Ok(())
+}
+
+#[test]
 fn structural_open_names_missing_tensors_and_accepts_reports_drift_per_tensor() {
     let (dir, small, tensors) = fixture(Fixture::Mxfp8);
     // A missing conv tensor is a typed open error naming it.

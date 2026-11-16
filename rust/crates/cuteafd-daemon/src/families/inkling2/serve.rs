@@ -66,7 +66,9 @@ pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
             let view = worker_args.attention.selected_view.clone().map(Ok)
                 .unwrap_or_else(|| worker_args.attention.select(&worker_args.snapshot))?;
             worker_args.attention.validate_view(&view)?;
-            let checkpoint = Checkpoint::coordinator_view(&view, false, false)?;
+            // Admission inventories remote expert scales as well as target tensors;
+            // opening headers does not load or allocate the remote weights.
+            let checkpoint = Checkpoint::open_view(&view)?;
             let cfg = Inkling2Config::from_hf(&checkpoint.config)?;
             cuteafd_core::set_expert_geometry(cuteafd_core::ExpertGeometry::INKLING2)
                 .map_err(|previous| anyhow::anyhow!("Inkling process geometry already fixed to {previous:?}"))?;
@@ -165,6 +167,8 @@ mod tests {
     fn shared_scheduler_owns_lanes_commit_and_last_fallible_readiness() {
         let source = include_str!("serve.rs").split("#[cfg(test)]").next().unwrap();
         assert!(source.contains("scheduler::schedule(&backend"));
+        assert!(source.contains("Checkpoint::open_view(&view)?"));
+        assert!(!source.contains("Checkpoint::coordinator_view("));
         assert!(source.contains("forward_initialization("));
         assert!(source.contains("finish_scheduler(&mut worker"));
         assert!(source.find("InklingEncoding::from_snapshot").unwrap() < source.find("NativeLibrary::load").unwrap());
