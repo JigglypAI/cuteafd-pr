@@ -1257,6 +1257,9 @@ def test_kimi_k31_dspark_exports_checkpoint_native_gqa_projections(exporter):
     assert {shape for shape, families in shapes.items() if "dspark-kimi-k31" in families} == expected
     old = {shape for shape, families in shapes.items() if "dspark-kimi" in families}
     assert expected - old == {(7168, 8192), (6144, 7168)}
+    split = {(35840, 7168), (7168, 4096), (7168, 1024),
+             (3072, 7168), (7168, 14336), (7168, 7168)}
+    assert {shape for shape, families in shapes.items() if "dspark-kimi-k31-tp2" in families} == split
 
 
 def test_glmf_tp2_drafter_exports_every_rank_local_projection(exporter):
