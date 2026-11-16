@@ -373,7 +373,7 @@ mod tests {
         let capacity = cuteafd_loader::families::glm5::draft_representation::flash_draft_capacity(&config, Some(8), 8)?;
         for representation in [GlmDraftRepresentation::Fp8Only, GlmDraftRepresentation::Bf16Only] {
             for ranks in 1..=if block { 1 } else { 2 } {
-                let mut process = ProcessOwners::new((512 << 30, 512 << 30), 8 << 30);
+                let mut process = ProcessOwners::new((512 << 30, 512 << 30), 8 << 30).with_spark_capacities(cuteafd_loader::serving_capacity::spark_memory::serving_bytes());
                 process.draft(snapshot, representation, ranks, ranks == 2)?;
                 let devices = [3, 1];
                 let mut runtime = if block { DsparkDrafter::arena_requests(snapshot, representation, devices[0])? }

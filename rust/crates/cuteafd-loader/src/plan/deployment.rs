@@ -219,7 +219,7 @@ mod tests {
         let report = plan_spark_count(dir.path(), &PlanOptions {
             placement: ExpertPlacement::from_spark_ranks(ranks),
             vision: crate::plan::MediaMode::Off, audio: crate::plan::MediaMode::Off,
-            layout: Some(LayoutOptions { spark_rank_bytes: crate::serving_capacity::spark_memory::serving_bytes().into_iter().chain(["kakapo", "cassowary"].map(|host| crate::serving_capacity::spark_memory::measured_bytes(host).unwrap())).collect(), host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram), rtx_bytes: vec![crate::placement::inventory::PRO_TOTAL_BYTES; gpus],
+            layout: Some(LayoutOptions { spark_rank_bytes: crate::serving_capacity::spark_memory::serving_bytes().into_iter().chain([crate::serving_capacity::spark_memory::measured_bytes("ostrich").unwrap(); 2]).collect(), host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram), rtx_bytes: vec![crate::placement::inventory::PRO_TOTAL_BYTES; gpus],
                 workspace_manifest: Some(manifest), pool_tokens: Some(0), tp2_dspark_experts,
                 prefill_rows: 256, context_tokens: 262_144, ..Default::default() }),
             ..Default::default()
@@ -537,6 +537,13 @@ mod tests {
         assert_eq!(worlds, [2, 3, 4, 5, 6, 7, 8]);
         let (_dir, below) = fixture(2, 2);
         assert!(below.executable(), "{}", crate::plan::render(&below));
+        let devices = below.memory_layout.as_ref().unwrap().devices.iter()
+            .filter(|device| device.kind == cuteafd_core::memory_layout::DeviceKind::Spark).collect::<Vec<_>>();
+        assert_eq!(devices.len(), 2);
+        for device in devices {
+            assert_eq!(device.capacity_bytes, crate::serving_capacity::spark_memory::serving_bytes()[device.index as usize]);
+            assert!(device.used_bytes() <= device.capacity_bytes, "{} full ledger exceeds capacity", device.name());
+        }
         for ranks in 3..=cuteafd_core::MAX_SPARK_WORLD {
             let (_dir, report) = fixture(2, ranks);
             assert!(report.executable(), "TP{ranks}: {}", crate::plan::render(&report));

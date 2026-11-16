@@ -205,7 +205,7 @@ fn exl3_publication_lays_out_on_the_glm_engine() {
             .collect::<Vec<_>>();
         assert_eq!(sparks.len(), ranks);
         for spark in sparks {
-            assert_eq!(spark.worker_budget_bytes, crate::serving_capacity::spark_memory::measured_bytes(["ostrich", "dodo", "emu", "kiwi", "rhea", "moa", "kakapo", "cassowary"][spark.index as usize]).unwrap(), "{ranks}+{gpus}");
+            assert_eq!(spark.worker_budget_bytes, crate::serving_capacity::spark_memory::measured_bytes(["ostrich", "dodo", "emu", "kiwi", "rhea", "moa", "ostrich", "ostrich"][spark.index as usize]).unwrap(), "{ranks}+{gpus}");
             assert!(spark.worker_budget_bytes <= spark.capacity_bytes, "{ranks}+{gpus}");
         }
         // The explicit whole-layer layout avoids replicated KV.
@@ -375,7 +375,6 @@ fn vision_on_two_rtx_is_charged_by_the_joint_solve() {
     let input = testing::BudgetedPlanInput::open(dir.path()).unwrap();
     let plan = |ranks: usize, vision: MediaMode| {
         let mut options = layout_options(ranks, 2);
-        options.layout.as_mut().unwrap().spark_bytes = 108 << 30;
         options.vision = vision;
         options.layout.as_mut().unwrap().workspace_manifest = Some(manifest.clone());
         input.plan(&options).unwrap()
@@ -394,7 +393,7 @@ fn vision_on_two_rtx_is_charged_by_the_joint_solve() {
             assert!(report.placement_supported, "n={ranks} {vision:?}: {:?}", report.hints);
             let encoder = report.encoder.as_ref().expect("an encoder placement");
             let on_rtx = matches!(encoder.kind, EncoderKind::Rtx { .. });
-            assert_eq!(on_rtx, vision != MediaMode::Auto || ranks == 5, "n={ranks} {vision:?}: {:?}", encoder.kind);
+            assert_eq!(on_rtx, vision != MediaMode::Auto, "n={ranks} {vision:?}: {:?}", encoder.kind);
             assert_eq!(encoder.weights + encoder.scratch, tower);
             // The span cap every replica and the coordinator build to, in the encoder plan hash.
             assert_eq!(report.max_image_tokens, Some(55 * 56));
@@ -572,7 +571,6 @@ fn auto_vision_can_disable_inside_joint_ml4_capacity_solve() {
     let dir = snapshot(true, None);
     let input = testing::BudgetedPlanInput::open(dir.path()).unwrap();
     let mut options = layout_options(5, 2);
-    options.layout.as_mut().unwrap().spark_bytes = 108 << 30;
     options.vision = MediaMode::Auto;
     let layout = options.layout.as_mut().unwrap();
     layout.rtx_bytes = vec![52 << 30; 2];
@@ -593,6 +591,10 @@ fn auto_vision_can_disable_inside_joint_ml4_capacity_solve() {
     let layout = options.layout.as_mut().unwrap();
     layout.pool_tokens = Some(off.memory_layout.as_ref().unwrap().pool_tokens);
     layout.rtx_bytes[1] = peak + budget.headroom + tower / 2;
+    let spark_used = off.memory_layout.as_ref().unwrap().devices.iter()
+        .filter(|device| device.kind == cuteafd_core::memory_layout::DeviceKind::Spark)
+        .map(|device| device.used_bytes()).max().unwrap();
+    options.layout.as_mut().unwrap().spark_allocation_budget_bytes = Some(spark_used);
     options.vision = MediaMode::Auto;
     let report = input.plan(&options).unwrap();
     assert!(report.placement_supported, "{:?}", report.hints);

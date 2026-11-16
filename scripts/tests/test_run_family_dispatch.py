@@ -5755,3 +5755,16 @@ def test_glmf_default_query_does_not_apply_unresolved_split_config(tmp_path):
     serve = next(shlex.split(line) for line in result.stderr.splitlines() if line.startswith("docker run -d") and "serve-glmf" in line)
     assert "--split-device" not in serve
     assert serve[serve.index("--replay-records") + 1] == "shared"
+
+
+def test_spark_probe_is_bounded_by_selected_count_and_restart_stops_first(tmp_path):
+    result = _family_launch_result(tmp_path, {"model_type": "glm_moe_dsa", "num_hidden_layers": 4,
+        "first_k_dense_replace": 3}, "test/measured",
+        "SPARK_COUNT=2\nRTX_GPUS=1\nSPECULATOR=off\nVISION=off\nAUDIO=off\n", restart=True)
+    assert result.returncode == 0, result.stderr
+    probes = [line for line in result.stderr.splitlines() if "python3 -I -" in line]
+    assert len(probes) == 2 and all('h2 ' not in line for line in probes)
+    for rank in range(2):
+        stop = result.stderr.index(f"cuteafd-spark-expert-h{rank}-")
+        probe_at = next(result.stderr.index(line) for line in probes if f"h{rank} " in line)
+        assert stop < probe_at

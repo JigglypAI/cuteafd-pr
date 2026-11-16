@@ -154,8 +154,11 @@ fn options(args: &PlanArgs) -> Result<PlanOptions, PlanError> {
                 cuteafd_loader::serving_capacity::spark_memory::sample_bytes(samples).map_err(invalid)?
             } else {
                 let cfg = launch_config(args.config.as_deref()).map_err(invalid)?;
-                let hosts = configured_spark_hosts(&cfg);
-                if hosts.iter().any(|host| host.starts_with("REPLACE-ME")) {
+                let hosts = configured_spark_hosts(&cfg).into_iter()
+                    .take(args.spark_ranks.unwrap_or(args.available_sparks)).collect::<Vec<_>>();
+                if args.spark_ranks == Some(0) {
+                    Vec::new()
+                } else if hosts.iter().any(|host| host.starts_with("REPLACE-ME")) {
                     cuteafd_loader::serving_capacity::spark_memory::serving_bytes()
                 } else if !hosts.is_empty() {
                     hosts.iter().map(|host| cuteafd_loader::serving_capacity::spark_memory::measured_bytes(host))
@@ -603,7 +606,7 @@ fn run_plan_with_host(mut args: PlanArgs) -> Result<()> {
         let report = cuteafd_loader::plan::exlr8::inspect(&snapshot,
             args.exlr8_manifest.as_deref().unwrap_or("bit325"),
             args.spark_ranks.unwrap_or(args.available_sparks), args.rtx,
-            options.spark_budget(), options.coordinator_budget_bytes)?;
+            &options.spark_capacities(args.spark_ranks.unwrap_or(args.available_sparks)), options.coordinator_budget_bytes)?;
         if args.json { println!("{}", serde_json::to_string_pretty(&report)?); }
         else { print!("{}", report.render()); }
         anyhow::ensure!(!args.require_ready, "EXLR8 is unsupported: add the kernels listed in the plan");
@@ -2567,6 +2570,9 @@ mod tests {
         assert_eq!(layout.spark_capacity(0), cuteafd_loader::serving_capacity::spark_memory::measured_bytes("rhea").unwrap());
         assert_eq!(layout.spark_capacity(1), cuteafd_loader::serving_capacity::spark_memory::measured_bytes("ostrich").unwrap());
         std::fs::write(&config, "SPARK_0_HOST=unknown\n").unwrap();
+        request.spark_ranks = Some(0);
+        assert!(options(&request).unwrap().layout.unwrap().spark_rank_bytes.is_empty());
+        request.spark_ranks = Some(2);
         let error = options(&request).unwrap_err().to_string();
         assert!(error.contains("unknown") && error.contains("spark_memory.json"));
         std::fs::write(&config, "SPARK_0_HOST=REPLACE-ME-spark-0\n").unwrap();
@@ -2606,7 +2612,7 @@ mod tests {
         request.memory.spark_memory_cap = None;
         let options = options(&request).unwrap();
         assert_eq!(options.spark_budget_bytes, None);
-        assert_eq!(options.spark_budget(), 100 << 30);
+        assert_eq!(options.maximum_spark_capacity(), cuteafd_loader::serving_capacity::spark_memory::serving_bytes().into_iter().max().unwrap());
         let layout = options.layout.unwrap();
         assert_eq!(layout.spark_allocation_budget_bytes, None);
         assert_eq!(layout.spark_capacities(6), cuteafd_loader::serving_capacity::spark_memory::serving_bytes());

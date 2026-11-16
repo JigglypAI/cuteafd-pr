@@ -55,3 +55,15 @@ def test_missing_memavailable_never_falls_back(tmp_path):
     (root / 'proc/meminfo').write_text('MemFree: 1000 kB\n')
     with pytest.raises(KeyError):
         probe.sample(root, cache, gpu_processes='')
+
+
+def test_selected_host_probe_deduplicates_without_changing_rank_order(tmp_path):
+    calls = tmp_path / 'calls'
+    common = Path(__file__).parents[1] / 'lib/release-common.sh'
+    result = probe.subprocess.run(['bash', '-c', r'''source "$1"
+release_ssh() { while [[ "$1" == -o ]]; do shift 2; done; printf '%s\n' "$1" >> "$CALLS"; printf '{"bytes":123,"boot_id":"boot","age_seconds":0}\n'; }
+release_spark_memory_samples rhea ostrich rhea
+''', '_', str(common)], env={**probe.os.environ, 'CALLS': str(calls)}, capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    assert calls.read_text().splitlines() == ['rhea', 'ostrich']
+    assert [row['host'] for row in json.loads(result.stdout)] == ['rhea', 'ostrich', 'rhea']

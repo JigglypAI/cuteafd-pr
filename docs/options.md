@@ -452,7 +452,10 @@ memory reclaims clean file cache; neither `MemFree` nor CUDA free is capacity).
 The launcher refreshes a host-local idle sample when no GPU compute process is
 resident. A busy host, including a server about to restart, uses only the last
 idle sample from its current boot ID; missing or reboot-stale samples fail
-closed with a stop-first hint. Plans retain sample timestamps, uptime and age.
+closed with a stop-first hint. On `--restart`, this coordinator and selected
+host/port workers stop before the idle probe, even if subsequent admission
+refuses. Dry runs skip teardown and live probing. Plans retain sample
+timestamps, uptime and age.
 Offline and simulated plans use the provenance-stamped per-host
 `serving_capacity/spark_memory.json` inventory in configured rank order; unknown
 hosts require an explicit cap or live measurement. Direct `plan --config` resolves
@@ -621,8 +624,10 @@ experts after accepted full-model fidelity and partial paired scoring proof
 (#1777/#2128: 77 exact windows, zero mismatches, explicitly accepted by TJ).
 The [max example](../examples/configs/kimi-k31-exl3-k2-mc-max.config) selects
 MC `CORE_VIEW=original`, 2 RTX + 6 Sparks and automatic pool/onboarding.
-The 1-RTX minimum stays blocked by #2082; no raised Spark cap or tiny-pool
-workaround is supplied. K8 compact remains `Planned` because fidelity is
+With measured idle Spark capacities (#2082), MC `k6-compact` plans on
+1 RTX + 6 Sparks with an automatic 2,081,152-token pool and no RTX expert
+onboarding; this is a CPU placement result, not a new serving benchmark.
+K8 compact remains `Planned` because fidelity is
 unmeasured; whole-core `fp8-compact` remains unsupported and unqualified.
 All accepted views retain native BF16 indexer weights. K3 DFlash2 hidden-state
 compatibility is independently unqualified: requesting a K3.1 drafter refuses.

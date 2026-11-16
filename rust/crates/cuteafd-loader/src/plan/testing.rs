@@ -101,11 +101,10 @@ impl BudgetedPlanInput {
                 && manifest.is_file() { options.inventory_workspace_manifest = Some(manifest); }
         }
         if let Some(layout) = &mut options.layout {
-            // Synthetic worlds 7/8 use the measured build-seed inventory explicitly;
+            // Synthetic worlds 7/8 repeat an explicitly measured serving-host capacity;
             // production's serving pool remains the six RoCE hosts.
             if options.placement.spark_ranks() > 6 && layout.spark_rank_bytes.len() == 6 {
-                layout.spark_rank_bytes.extend(["kakapo", "cassowary"].map(|host|
-                    crate::serving_capacity::spark_memory::measured_bytes(host).expect("measured test inventory")));
+                layout.spark_rank_bytes.extend([crate::serving_capacity::spark_memory::measured_bytes("ostrich").unwrap(); 2]);
             }
             layout.host_memory.get_or_insert(self.host.host_ram);
             let manifest = self.checkpoint().snapshot.join("share/PROGRAMS.json");

@@ -374,7 +374,6 @@ fn layout_with_native(report: &mut PlanReport, model: &dyn super::super::FamilyM
             if host_embedding { for rank in &mut alternate { rank.embedding = 0; } }
             process.alternate_resident = Some(alternate);
         }
-        process.spark_rank_caps = options.spark_capacities(spark_ranks);
         process.target(checkpoint, &inputs, exlr8)?;
         if let Some((_, metadata)) = exlr8 {
             if spark_ranks > 0 {
@@ -385,7 +384,6 @@ fn layout_with_native(report: &mut PlanReport, model: &dyn super::super::FamilyM
                     manifest.context("EXLR8 Spark owners require PROGRAMS.json")?, geometry, &executions,
                     spark_ranks, &(0..cfg.layers).filter(|&layer| !cfg.dense[layer]).collect::<Vec<_>>(),
                     options.exlr8_prefill_activations)?;
-                process.spark_cap = Some(options.spark_capacities(spark_ranks).into_iter().max().unwrap_or(0));
             }
         }
         let geometry = glmf::admission::host_geometry(&inputs)?;
@@ -410,6 +408,9 @@ fn layout_with_native(report: &mut PlanReport, model: &dyn super::super::FamilyM
                 idle: false, expert_bytes: 0, free_bytes: options.spark_capacity(rank) }).collect() };
         process.encoders = encoder::candidates(&EncoderRequest { mode: report.vision, weights, scratch,
             copies: options.vision_replicas }, &hardware);
+        process.physical_sparks = process.encoders.iter().flat_map(|encoder| encoder.spark_ranks())
+            .max().map_or(spark_ranks, |rank| spark_ranks.max(rank + 1));
+        process.spark_rank_caps = options.spark_capacities(process.physical_sparks);
         process.auto_vision = report.vision == crate::plan::MediaMode::Auto;
         if process.auto_vision && weights > 0 {
             process.encoders.push(EncoderPlacement { kind: EncoderKind::Off, weights: 0, scratch: 0,

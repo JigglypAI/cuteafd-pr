@@ -97,11 +97,6 @@ impl ServeArgs {
         Ok(plan)
     }
 
-    fn spark_budget_bytes(&self) -> u64 {
-        cuteafd_core::memory_policy::MemoryPolicy::current()
-            .spark_cap_bytes(cuteafd_loader::plan::DEFAULT_SPARK_BUDGET_BYTES)
-    }
-
     pub(super) fn validate(&self) -> Result<()> {
         cuteafd_core::concurrency::validate("muse_spark", u64::from(self.max_sequences))?;
         let devices = self.devices();
@@ -223,7 +218,7 @@ pub(super) fn with_backend<T>(args: &ServeArgs, run: impl FnOnce(&super::backend
             .slots(cuteafd_loader::placement::families::muse_spark::mark_bytes_with_format(&cfg, 1, args.kv_cache) as usize) as u64,
         max_context: args.max_context.filter(|&tokens| tokens > 0),
         pool_tokens: args.pool_tokens.filter(|&tokens| tokens > 0), onboard: args.rtx_expert_layers,
-        spark_budget_bytes: args.spark_budget_bytes(),
+
         spark_rank_bytes: cuteafd_loader::serving_capacity::spark_memory::runtime_bytes(&args.peers.iter().map(ToString::to_string).collect::<Vec<_>>())?,
         partial_bf16_max_rows: args.expert_partial_bf16_max_rows,
         partial_reply_formats: cuteafd_core::spark_reply::requested(),
@@ -786,7 +781,6 @@ mod tests {
         assert_eq!(defaults.vision, cuteafd_loader::plan::MediaMode::Auto);
         assert_eq!(defaults.audio, cuteafd_loader::plan::MediaMode::Auto);
         assert!(defaults.vision_peers.is_empty() && defaults.audio_peers.is_empty());
-        assert_eq!(defaults.spark_budget_bytes(), cuteafd_loader::plan::DEFAULT_SPARK_BUDGET_BYTES);
         assert_eq!(defaults.expert_partial_bf16_max_rows, 64);
         assert_eq!(cuteafd_core::SparkReplyFormat::resolve(None, true), cuteafd_core::SparkReplyFormat::Nvfp4);
         assert!(args(&["--peers", PEERS, "--spark-prefill-reply-format", "fp8"]).is_ok());

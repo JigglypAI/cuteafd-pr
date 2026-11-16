@@ -144,7 +144,7 @@ fn full_context_mtp_forecast_charges_private_predictors_before_allocation() -> a
     let arch = ArchContext::coordinator(capacity, None);
     for kv_format in [crate::families::qwen4::Qwen4KvCache::Bf16,
         crate::families::qwen4::Qwen4KvCache::Fp8] {
-        let inputs = RuntimeInputs { graph_layout: None, decode_graphs: false, bf16_target_head: crate::placement::planner::serving::BlasHead::TensorLt,
+        let inputs = RuntimeInputs { spark_bytes: crate::plan::testing::SimulatedHost::raptor().layout().spark_capacities(8), graph_layout: None, decode_graphs: false, bf16_target_head: crate::placement::planner::serving::BlasHead::TensorLt,
             host: Default::default(), resident_weight_limit: None, spark_reply_format: cuteafd_core::SparkReplyFormat::Bf16,
             kv_format,
             inventory: Inventory { gpus: vec![GpuBudget { capacity_bytes: capacity,

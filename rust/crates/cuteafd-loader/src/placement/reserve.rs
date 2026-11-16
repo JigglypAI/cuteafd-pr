@@ -126,13 +126,6 @@ pub fn gpu_component(bytes: u64) -> u64 {
     MemoryPolicy::current().component(DeviceKind::Gpu, bytes)
 }
 
-/// Configured ranks retain their individual measured capacities.
-pub fn spark_caps(ranks: usize) -> Vec<u64> {
-    if let Some(bytes) = MemoryPolicy::current().spark_cap { return vec![bytes; ranks]; }
-    crate::serving_capacity::spark_memory::live_bytes(ranks).unwrap_or_else(||
-        crate::serving_capacity::spark_memory::serving_bytes().into_iter().take(ranks).collect())
-}
-
 /// A built-in Spark reserve component's charged bytes (0 under `SPARK_RESERVE`).
 pub fn spark_component(bytes: u64) -> u64 {
     MemoryPolicy::current().component(DeviceKind::Spark, bytes)

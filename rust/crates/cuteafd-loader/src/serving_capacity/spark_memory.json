@@ -8,8 +8,6 @@
       "measured_at": "2026-11-16T08:31:00Z",
       "uptime": "about 5 minutes",
       "fresh_boot": true,
-      "boot_id": "7b201fd8-15cd-4e5e-ad07-9909b168039b",
-      "booted_at": "2026-11-16T08:26:15Z",
       "timestamp_approximate": true
     },
     "dodo": {
@@ -56,5 +54,6 @@
       "uptime": "not recorded",
       "fresh_boot": false
     }
-  }
+  },
+  "notes": "dodo and moa genuinely have equal MemAvailable readings in rolling-reboot-2026-11-16T0829Z.txt; boot identity belongs to live probe samples, not this offline census."
 }

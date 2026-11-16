@@ -691,6 +691,7 @@ namespace_mount_args=("${RELEASE_HUB_MOUNTS[@]}")
 [[ "$(jq -r '.quantization_config.quant_method == "exl3"' "$hf_home/$snapshot_rel/config.json")" != true ]] ||
   release_die "unsupported: EXL3 for DeepSeek V4/V4.1 Flash"
 coordinator="$RELEASE_COORDINATOR_CONTAINER_NAME"
+spark_prefix="$RELEASE_SPARK_CONTAINER_PREFIX"
 [[ "$TP2_DSPARK_EXPERTS" != on || "$SPECULATOR" == dspark ]] || release_die "TP2_DSPARK_EXPERTS requires dSpark"
 
 RELEASE_RECLAIM_ARGS=()
@@ -759,7 +760,7 @@ count_args=(--available-sparks "$RELEASE_AVAILABLE_SPARKS" --mapped-scale-preloa
 # Pass loader-resolved values: the planner's plain config parser does not parse
 # shell quoting/comments or supply the loader's default Spark inventory.
 count_config_text="$(printf '%s=%s\n' TP2_DSPARK_EXPERTS "$TP2_DSPARK_EXPERTS" SPECULATOR "$SPECULATOR" DRAFT_LENGTH "$draft_length" EXPERT_USAGE "$(get EXPERT_USAGE on)"
-  for ((rank = 0; rank < RELEASE_AVAILABLE_SPARKS; rank++)); do
+  for ((rank = 0; rank < SPARK_COUNT; rank++)); do
     host_key="SPARK_${rank}_HOST"
     printf '%s=%s\n' "$host_key" "${!host_key}"
   done)"
@@ -803,9 +804,15 @@ for ((rank = 0; rank < RELEASE_AVAILABLE_SPARKS; rank++)); do
 done
 ((${#deployment_peers[@]} == 0)) || count_args+=(--deployment-peers "$(IFS=,; echo "${deployment_peers[*]}")")
 spark_memory_samples=""
-if ((dry_run == 0 && RELEASE_AVAILABLE_SPARKS > 0)) && [[ -z "$(get SPARK_MEMORY_CAP)" ]]; then
+restart_stopped=""
+if ((restart && !dry_run)); then
+  release_stop_services "$coordinator" "$spark_prefix"
+  ((restart_all == 0)) || release_stop_all_worker_containers
+  restart_stopped=1
+fi
+if ((dry_run == 0 && SPARK_COUNT > 0)) && [[ -z "$(get SPARK_MEMORY_CAP)" ]]; then
   sample_hosts=()
-  for ((rank = 0; rank < RELEASE_AVAILABLE_SPARKS; rank++)); do
+  for ((rank = 0; rank < SPARK_COUNT; rank++)); do
     host_key="SPARK_${rank}_HOST"; sample_hosts+=("${!host_key}")
   done
   spark_memory_samples="$(release_spark_memory_samples "${sample_hosts[@]}")" || exit 1
@@ -821,7 +828,8 @@ count_plan="$(docker run --rm --network none "${count_mounts[@]}" "$COORDINATOR_
   "${plan_memory_args[@]}" --gpu-memory-cap "$profile_cap" \
   --pool-tokens "$count_pool" --prefill-rows "$count_prefill" --max-context-tokens "$MAX_CONTEXT_TOKENS" \
   --concurrency "$CONCURRENCY" --prefix-cache-entries "$PREFIX_CACHE_ENTRIES" --host-cache-bytes "$HOST_CACHE_BYTES")"
-release_validate_deployment "$count_plan" deepseek_v41
+release_validate_deployment "$count_plan" deepseek_v41 ||
+  { [[ -z "${restart_stopped:-}" ]] || echo "old workers were stopped; fix the reported admission constraint before restarting" >&2; exit 1; }
 v41_weight_budget_gib="$(jq -er '.resolved_settings.coordinator_weight_budget_gib.value' <<<"$count_plan")"
 release_deployment_spark_roles "$count_plan" "$SPARK_COUNT"
 release_admit_coordinator_gpus "$gpu_uuid_csv" "$count_plan" ${RELEASE_RECLAIM_ARGS[@]+"${RELEASE_RECLAIM_ARGS[@]}"}
@@ -1028,8 +1036,10 @@ if ((dry_run)); then
 fi
 shared_api_state "$COORDINATOR_DOCKER_INFERENCE" "${INSTANCE:-default}"
 if ((restart)); then
-  release_stop_services "$coordinator" "$spark_prefix"
-  ((restart_all == 0)) || release_stop_all_worker_containers
+  if [[ -z "${restart_stopped:-}" ]]; then
+    release_stop_services "$coordinator" "$spark_prefix"
+    ((restart_all == 0)) || release_stop_all_worker_containers
+  fi
 else
   docker inspect "$coordinator" >/dev/null 2>&1 && release_die "$coordinator already exists; use --restart"
   for i in "${spark_worker_ranks[@]}"; do
@@ -2503,9 +2513,18 @@ audio_encoder_hash=""
     deployment_peers+=("$(get "SPARK_${rank}_LANE_A"):$port")
   done
   ((${#deployment_peers[@]} == 0)) || deployment_args+=(--deployment-peers "$(IFS=,; printf '%s' "${deployment_peers[*]}")")
-  if ((dry_run == 0 && available_sparks > 0)) && [[ "$backend" != local && -z "$(get SPARK_MEMORY_CAP)" ]]; then
+  restart_stopped=""
+  if ((restart && !dry_run)); then
+    docker rm -f "$coordinator_name" >/dev/null 2>&1 || true
+    for ((rank = 0; rank < ranks; rank++)); do
+      host="$(get "SPARK_${rank}_HOST")"
+      release_stop_remote_containers "$host" "cuteafd-spark-expert-$host-$port" "cuteafd-phase0-tcp-expertd-$host-$port"
+    done
+    restart_stopped=1
+  fi
+  if ((dry_run == 0 && ranks > 0)) && [[ "$backend" != local && -z "$(get SPARK_MEMORY_CAP)" ]]; then
     sample_hosts=()
-    for ((rank = 0; rank < available_sparks; rank++)); do sample_hosts+=("$(get "SPARK_${rank}_HOST")"); done
+    for ((rank = 0; rank < ranks; rank++)); do sample_hosts+=("$(get "SPARK_${rank}_HOST")"); done
     spark_memory_samples="$(release_spark_memory_samples "${sample_hosts[@]}")" || exit 1
     deployment_args+=(--spark-memory-samples "$spark_memory_samples")
     family_args+=(--spark-memory-samples "$spark_memory_samples")
@@ -2562,7 +2581,8 @@ audio_encoder_hash=""
     "$coordinator_image" cuteafd plan "$snapshot" --fp8-prefill "$(get FP8_PREFILL auto)" --attention-placement "$attention_placement" --vision "$vision" --audio "$audio" --deployment "${readiness_args[@]}" \
     "${deployment_args[@]}" "${count_args[@]}" "${exlr8_plan_args[@]}" "${core_view_args[@]}" "${plan_memory_args[@]}" \
     --checkpoint-model-id "$model" --rtx "$plan_rtx" --gpu-memory-cap "$plan_cap" --pool-tokens "$plan_pool" --vision-replicas "$vision_replicas" "${plan_draft_args[@]}")"
-  release_validate_deployment "$plan_json" "$checkpoint_family"
+  release_validate_deployment "$plan_json" "$checkpoint_family" ||
+    { [[ -z "${restart_stopped:-}" ]] || echo "old workers were stopped; fix the reported admission constraint before restarting" >&2; exit 1; }
   RELEASE_RECLAIM_ARGS=()
   ((restart == 0)) || release_coordinator_reclaim_args "$coordinator_name"
   release_admit_coordinator_gpus "$(IFS=,; printf '%s' "${coordinator_uuids[*]}")" "$plan_json" \

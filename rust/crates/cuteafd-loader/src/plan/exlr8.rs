@@ -219,7 +219,7 @@ pub(super) fn native_plan_of(input: &super::PlanInput, selected: &str,
     let first_spark = first_moe_layer + placement.onboard_layers;
     let selected_world = if first_spark == layers { 0 } else { world };
     let residents = spark_resident_bytes_of(&metadata, &(first_spark..layers).collect::<Vec<_>>(), selected_world)?;
-    ensure!(residents.iter().all(|&bytes| bytes <= options.spark_budget()),
+    ensure!(residents.iter().enumerate().all(|(rank, &bytes)| bytes <= layout.spark_capacity(rank)),
         "EXLR8 selected Spark suffix exceeds Spark budget before live workspace admission");
     let mut local_routed = 0u64;
     for layer in first_moe_layer..first_spark {
@@ -1244,7 +1244,7 @@ pub fn inspect(
     selected: &str,
     sparks: usize,
     rtx: usize,
-    spark_budget: u64,
+    spark_budgets: &[u64],
     coordinator_budget: u64,
 ) -> Result<Exlr8Plan> {
     ensure!(
@@ -1319,7 +1319,7 @@ pub fn inspect(
                     coordinator_bytes,
                     coordinator_per_gpu_upper_bound: per_gpu,
                     weights_fit: per_gpu <= coordinator_budget
-                        && rank_bytes.iter().all(|b| *b <= spark_budget),
+                        && rank_bytes.iter().enumerate().all(|(rank, bytes)| spark_budgets.get(rank).is_some_and(|cap| *bytes <= *cap)),
                 });
             }
         }
@@ -1817,7 +1817,7 @@ mod mounted_tests {
         let snapshot = std::env::var_os("CUTEAFD_EXLR8_TEST_SNAPSHOT").expect("set CUTEAFD_EXLR8_TEST_SNAPSHOT for this installed test");
         let root = std::path::Path::new(&snapshot);
         assert!(super::recognizes(root).unwrap());
-        let report = super::inspect(root, "bit325", 6, 2, 100 << 30, 80 << 30).unwrap();
+        let report = super::inspect(root, "bit325", 6, 2, &[100 << 30; 6], 80 << 30).unwrap();
         assert!(!report.supported);
         assert!(report.selected_weights_fit);
         assert_eq!(report.fit.len(), report.manifests.len() * 18);

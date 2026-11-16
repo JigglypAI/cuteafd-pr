@@ -545,8 +545,10 @@ impl PlanOptions {
                 });
             }
         }
+        if self.spark_budget_bytes == Some(0) {
+            return Err(PlanError::InvalidOption { option: "Spark budget", reason: "must be positive".into() });
+        }
         for (option, bytes) in [
-            ("Spark budget", self.spark_budget_bytes.unwrap_or(DEFAULT_SPARK_BUDGET_BYTES)),
             ("coordinator weight budget", self.coordinator_budget_bytes),
             ("coordinator GPU budget", self.coordinator_gpu_budget_bytes),
         ] {
@@ -564,15 +566,15 @@ pub fn mapped_scale_preload_bytes(gib: f64) -> Result<u64, PlanError> {
 }
 
 
-/// The shared routed-expert weight budget per Spark rank, for families
-/// without their own (`FamilyModel::spark_budget_bytes`).
-pub const DEFAULT_SPARK_BUDGET_BYTES: u64 = 100 << 30;
-
 impl PlanOptions {
-    /// Routed-expert bytes per Spark rank: explicit, else the shared default
-    /// (`plan` resolves an unset budget to the family's before using it).
-    pub fn spark_budget(&self) -> u64 {
-        self.spark_budget_bytes.unwrap_or(DEFAULT_SPARK_BUDGET_BYTES)
+    pub fn spark_capacities(&self, ranks: usize) -> Vec<u64> {
+        if let Some(bytes) = self.spark_budget_bytes { return vec![bytes; ranks]; }
+        self.layout.as_ref().cloned().unwrap_or_default().spark_capacities(ranks)
+    }
+
+    /// Display/header upper bound only; the complete layout admits each rank.
+    pub fn maximum_spark_capacity(&self) -> u64 {
+        self.spark_capacities(self.placement.spark_ranks()).into_iter().max().unwrap_or(0)
     }
 }
 
@@ -1034,7 +1036,7 @@ pub(crate) fn empty_report(input: &PlanInput, options: &PlanOptions) -> anyhow::
         phase_ledger: None,
         admission_timing: None,
         attention_placement: options.attention_placement.unwrap_or_default(),
-        spark_budget_bytes: options.spark_budget(),
+        spark_budget_bytes: options.maximum_spark_capacity(),
         requested_attention: options.attention_placement,
         vision: options.vision,
         audio: resolve_audio_config(options.audio, &checkpoint.snapshot, &checkpoint.config)?,
@@ -1271,12 +1273,8 @@ fn plan_unrestricted(input: &PlanInput, options: &PlanOptions) -> Result<PlanRep
     let mut resolved = options.clone();
     if let Some(layout) = &mut resolved.layout { layout.decode_lanes = report.decode_lanes; }
     resolved.apply_spark_budget();
-    resolved.spark_budget_bytes = Some(options.spark_budget_bytes.unwrap_or_else(||
-        options.layout.as_ref().map(|layout| layout.spark_capacities(options.placement.spark_ranks())
-            .into_iter().max().unwrap_or_else(|| model.spark_budget_bytes()))
-            .unwrap_or_else(|| crate::serving_capacity::spark_memory::serving_bytes().into_iter().max().unwrap())));
     let options = &resolved;
-    report.spark_budget_bytes = options.spark_budget();
+    report.spark_budget_bytes = options.maximum_spark_capacity();
     let spec = model.spec();
     report.spec = Some(spec.clone());
     let ownership = options.draft_ownership.unwrap_or_else(|| {
@@ -1641,7 +1639,7 @@ fn place(report: &mut PlanReport, options: &PlanOptions, spec: &ModelSpec, model
                 recipe.stored_widths.iter().max().map(|&slice| slice as f64 / i as f64)
             }
         };
-        let fits_on = |ranks: usize| share(ranks).is_some_and(|s| routed as f64 * s <= options.spark_budget() as f64);
+        let fits_on = |ranks: usize| share(ranks).is_some_and(|s| routed as f64 * s <= options.maximum_spark_capacity() as f64);
         report.min_spark_ranks = contract.as_ref().and_then(|c| c.spark_worlds.iter().copied().find(|&r| fits_on(r)));
         let advice = match report.min_spark_ranks {
             Some(ranks) => format!("Use {ranks} Spark ranks (--spark-ranks {ranks})"),
@@ -1681,7 +1679,7 @@ fn place(report: &mut PlanReport, options: &PlanOptions, spec: &ModelSpec, model
                     report.hints.push(Hint {
                         what: format!("routed experts need {:.1} GiB on the widest of {ranks} Spark ranks, over the \
                             {:.0} GiB budget", gib(routed as f64 * report.spark_rank_share),
-                            gib(options.spark_budget() as f64)),
+                            gib(options.maximum_spark_capacity() as f64)),
                         how: format!("{advice}, keep bottom layers' experts resident on the RTX cards, or quantize \
                             the experts further (EXL3 K2-K3)."),
                     });

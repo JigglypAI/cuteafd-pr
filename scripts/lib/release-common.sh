@@ -390,10 +390,16 @@ release_ssh() {
 # One boot-keyed idle sample per configured rank. Dry-run is an offline plan.
 release_spark_memory_samples() {
   local host sample rows='[]'
+  local -A measured=()
   for host in "$@"; do
-    sample="$(release_ssh -o ConnectTimeout=10 "$host" python3 -I - \
-      < "$(dirname "${BASH_SOURCE[0]}")/../launch/spark-memory-probe.py")" ||
-      { release_die "cannot measure idle Spark memory on $host; stop workers first"; return 1; }
+    if [[ -n "${measured[$host]-}" ]]; then
+      sample="${measured[$host]}"
+    else
+      sample="$(release_ssh -o ConnectTimeout=10 -o ServerAliveInterval=5 -o ServerAliveCountMax=2 "$host" python3 -I - \
+        < "$(dirname "${BASH_SOURCE[0]}")/../launch/spark-memory-probe.py")" ||
+        { release_die "cannot measure idle Spark memory on $host; ${restart_stopped:+old workers were stopped; }stop workers first"; return 1; }
+      measured[$host]="$sample"
+    fi
     rows="$(jq -cer --arg host "$host" --argjson sample "$sample" \
       '. + [$sample + {host: $host}]' <<<"$rows")" || return 1
   done
