@@ -1383,7 +1383,7 @@ def capture_resolver_config_parity(snapshot: Path, example: Path, binary: Path,
     result = _family_launch_result(temporary, json.loads((snapshot / "config.json").read_text()),
         "test/resolver-parity", keys, physical_gpus=tuple(range(gpus)), root_launcher=True,
         cuda_total_bytes=101_973_491_712, gpu_free_mib=98304,
-        checkpoint_source=snapshot, extra_args=("--wip", "real-planner-test"), extra_env={
+        extra_args=("--wip", "real-planner-test"), extra_env={
             "STUB_REAL_PLANNER": str(binary), "STUB_REAL_SNAPSHOT": str(snapshot),
             "STUB_REAL_PROGRAMS": str(programs), "STUB_REAL_HF_HOME": str(hf_home),
             "STUB_REAL_PLAN_OUTPUT": str(output), "CUTEAFD_CDI_CHECK": "off"})
@@ -2702,8 +2702,8 @@ def test_glmf_invalid_fp8_options_fail_before_workers_launch(tmp_path, key, valu
               "layer_types": ["linear_attention", "deepseek_sparse_attention"]}
     result = _family_launch_result(tmp_path, config, "test/glmf",
                                   f"GLM5_FLASH_KDA_FP8=off\n{key}={value}\n")
-    assert result.returncode == 2 and message in result.stderr
-    assert not any(line.startswith(("docker ", "ssh ", "nest ")) and "--resolve-settings-only" not in line
+    assert result.returncode != 0 and message in result.stderr
+    assert not any(line.startswith(("docker ", "ssh ", "nest ")) and "cuteafd plan" not in line
                    for line in result.stderr.splitlines())
 
 
@@ -2870,9 +2870,9 @@ def test_glmf_draft_linear_is_forwarded_only_past_w8a16(tmp_path, keys, forwarde
 def test_glmf_draft_linear_rejects_unknown_values_before_launch(tmp_path):
     result = _family_launch_result(tmp_path, GLMF_TWO_LAYER, "test/glmf",
                                   "GLM5_FLASH_DRAFT_LINEAR=w4a16\n")
-    assert result.returncode == 2 and "GLM5_FLASH_DRAFT_LINEAR must be w8a16, wide or w8a8" in result.stderr, \
+    assert result.returncode != 0 and "GLM5_FLASH_DRAFT_LINEAR must be w8a16, wide or w8a8" in result.stderr, \
         result.stderr
-    assert not any(line.startswith(("docker ", "ssh ", "nest ")) and "--resolve-settings-only" not in line
+    assert not any(line.startswith(("docker ", "ssh ", "nest ")) and "cuteafd plan" not in line
                    for line in result.stderr.splitlines())
 
 
@@ -3297,8 +3297,8 @@ def test_glmf_replay_records_are_forwarded_only_when_shared(tmp_path, keys, shar
 def test_glmf_replay_records_reject_unsupported_layouts_before_launch(tmp_path, keys, message):
     result = _family_launch_result(tmp_path, SPLIT_CONFIGS["glm5_flash"], "test/glmf",
                                   keys)
-    assert result.returncode == 2 and message in result.stderr, result.stderr
-    assert not any(line.startswith(("docker ", "ssh ", "nest ")) and "--resolve-settings-only" not in line
+    assert result.returncode != 0 and message in result.stderr, result.stderr
+    assert not any(line.startswith(("docker ", "ssh ", "nest ")) and "cuteafd plan" not in line
                    for line in result.stderr.splitlines())
 
 
@@ -3361,7 +3361,7 @@ def test_probe_dump_root_is_mounted_for_remote_row_dumps(tmp_path, family):
                                   keys + f"PROBE_DUMP_ROOT={tmp_path}/absent\n", **options)
     assert result.returncode == 2 and "PROBE_DUMP_ROOT must be" in result.stderr
     blocked = ("docker run ", "ssh ", "nest ") if dense else ("docker ", "ssh ", "nest ")
-    assert not any(line.startswith(blocked) for line in result.stderr.splitlines())
+    assert not any(line.startswith(blocked) and "--resolve-settings-only" not in line for line in result.stderr.splitlines())
 
 
 def test_glmf_kda_rejects_invalid_conversion_before_launch(tmp_path):
@@ -3668,7 +3668,8 @@ def test_invalid_mimo_weight_policy_rejects_before_services(tmp_path, key):
     config = {"model_type": "mimo_v2", "num_hidden_layers": 2, "moe_layer_freq": [0, 1]}
     result = _family_launch_result(tmp_path, config, "test/mimo", f"{key}=bogus\n")
     assert result.returncode != 0
-    assert "must be" in result.stderr and "docker run" not in result.stderr
+    assert "must be" in result.stderr
+    assert not any("docker run" in line and "--resolve-settings-only" not in line for line in result.stderr.splitlines())
 
 
 def test_mimo_invalid_drafter_precision_rejects_before_launch(tmp_path):
@@ -5281,7 +5282,7 @@ def test_site_hub_launch_mounts_symlinked_main_draft_and_template(tmp_path, temp
     assert result.returncode == 0, result.stderr
     hub = hf / "hub"
     commands = [shlex.split(line) for line in result.stderr.splitlines()
-                if line.startswith("docker ") and ("cuteafd plan" in line or "cuteafd serve-glmf" in line or "cuteafd expertd-native" in line)]
+                if line.startswith("docker ") and "--resolve-settings-only" not in line and ("cuteafd plan" in line or "cuteafd serve-glmf" in line or "cuteafd expertd-native" in line)]
     assert len(commands) == 3, result.stderr
     for command in commands:
         assert f"{hub}:{hub}:ro" in command
@@ -5331,7 +5332,7 @@ def test_dry_run_total_capacity_ignores_foreign_gpu_memory_and_preserves_live_la
     assert "memory.free" not in opt_in_smi_log.read_text()
     plan_argv = shlex.split(next(line for line in opt_in.stderr.splitlines() if "cuteafd plan" in line))
     assert int(plan_argv[plan_argv.index("--gpu-memory-cap") + 1]) == int(expected_gib * 2**30)
-    deployment = json.loads(opt_in.stdout)
+    deployment = json.loads(next(line for line in opt_in.stdout.splitlines() if line.startswith("{")))
     assert deployment["resolved_settings"]["coordinator_weight_budget_gib"]["value"] == expected_gib
     assert "--coordinator-weight-budget-gib" not in plan_argv
 

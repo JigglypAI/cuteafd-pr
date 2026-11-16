@@ -79,5 +79,13 @@ mod tests {
         assert_eq!(glmf_speculator(None, Some("dflash2"), false).value, "dflash2");
         assert_eq!(coordinator_weight_budget(None, None, 32 << 30).value, 32.0);
         assert_eq!(coordinator_weight_budget(Some(20.0), None, 32 << 30).value, 20.0);
+        assert_eq!(glmf_replay_records(Some("auto"), Some("shared"), 2, true, true).value, "own");
+        assert_eq!(mimo_speculator(None, None, false).value, "off");
+        assert_eq!(mimo_speculator(None, None, true).value, "dflash2");
+        assert_eq!(mimo_speculator(Some("mtp"), Some("off"), true).value, "mtp");
+        assert_eq!(mimo_mtp_depth(None, None, true).value, 1);
+        assert_eq!(mimo_mtp_depth(Some(3), Some(2), true).value, 3);
+        assert!(kimi_draft_fp8(None, true).value);
+        assert!(!kimi_draft_fp8(Some(false), true).value);
     }
 }

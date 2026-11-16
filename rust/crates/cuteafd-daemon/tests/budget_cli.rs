@@ -30,6 +30,21 @@ fn plan_accepts_the_global_memory_policy_and_refuses_removed_budget_flags() {
 }
 
 #[test]
+fn settings_only_needs_config_not_checkpoint_inventory() {
+    let snapshot = tempfile::tempdir().unwrap();
+    std::fs::write(snapshot.path().join("config.json"), r#"{"model_type":"glm5_next"}"#).unwrap();
+    // A malformed MC manifest and absent tensor index prove this never selects a view.
+    std::fs::write(snapshot.path().join("cuteafd-mc.json"), "not json").unwrap();
+    let output = test_command(env!("CARGO_BIN_EXE_cuteafd"))
+        .args(["plan", snapshot.path().to_str().unwrap(), "--resolve-settings-only", "--speculator", "off"])
+        .output().unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let settings: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(settings["resolved_settings"]["index_cache"]["value"], "compact");
+    assert_eq!(settings["resolved_settings"]["draft_linear"]["value"], "w8a16");
+}
+
+#[test]
 fn budgeted_inventory_plans_carry_their_host_across_crate_boundaries() {
     use cuteafd_loader::plan::{self, testing::{self, BudgetedPlanInput, SimulatedHost}};
     let snapshot = tempfile::tempdir().unwrap();

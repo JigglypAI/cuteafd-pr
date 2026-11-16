@@ -1566,9 +1566,8 @@ fi
 # measured (2026-10-04: wrldsuksgo2mars EXL3 K3.25, nvidia NVFP4, brandonmusic
 # tr3 4bpw; agentic 1.3-1.5x dSpark); SPECULATOR=dspark selects the RedHat dSpark.
 # Qualification is for these official checkpoints, not a shape-compatible sibling.
-mimo_flash_mopd=0 mimo_bundled_dflash=0
+mimo_flash_mopd=0
 [[ "$family:$model" != mimo_v2:XiaomiMiMo/MiMo-V2.6-Flash-MOPD ]] || mimo_flash_mopd=1
-[[ $mimo_flash_mopd == 0 && "$family:$model" != mimo_v2:XiaomiMiMo/MiMo-V2.6-Pro-MOPD ]] || mimo_bundled_dflash=1
 # DeepSeek V4 checkpoints carry their dSpark drafter beside the target (mtp.0.*,
 # dspark_block_size in config.json); one without it serves without speculation.
 dsv4_dspark=0

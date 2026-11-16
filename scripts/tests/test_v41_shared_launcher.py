@@ -206,6 +206,10 @@ def test_shared_launcher_matches_the_private_v41_path(case: str, tmp_root) -> No
         expected[mount_index:mount_index] = ["-v", f"<root>/hosts/raptor/.cache/cuteafd/run-config/plan-{digest}.config:/run/cuteafd-plan.config:ro"]
         expected = [value.replace("/hf/hub/", "<root>/hf/hub/").replace("HF_HOME=/hf", "HF_HOME=/mnt/sparknest/hf-home") for value in expected]
         expected = ["/mnt/sparknest:/mnt/sparknest:ro" if value.endswith(":/hf/hub:ro") else value for value in expected]
+        # Weight ceiling now comes back from Rust, not a duplicate planner flag.
+        if "--coordinator-weight-budget-gib" in expected:
+            position = expected.index("--coordinator-weight-budget-gib")
+            del expected[position:position + 2]
         expected_plans.append(expected)
     assert current["plans"] == expected_plans, case
 

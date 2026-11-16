@@ -255,6 +255,18 @@ fn resolve_config(args: &mut PlanArgs, cfg: &std::collections::BTreeMap<String, 
     }
     configured!(attention_placement, "ATTENTION_PLACEMENT");
     configured!(prefill_rows, "PREFILL_ROWS");
+    configured!(concurrency, "CONCURRENCY");
+    configured!(prefill_waves, "PREFILL_WAVES");
+    configured!(prefill_span_rows, "PREFILL_SPAN_ROWS");
+    if !args.explicit_settings.contains("fp8_prefill") {
+        if let Some(value) = get("FP8_PREFILL") { args.fp8_prefill = value.parse().map_err(anyhow::Error::msg)?; }
+    }
+    if args.memory.spark_memory_cap.is_none() {
+        args.memory.spark_memory_cap = get("SPARK_MEMORY_CAP").map(|v| v.parse::<cuteafd_core::memory_policy::Size>().map(|v| v.0)).transpose()?;
+    }
+    if args.memory.gpu_memory_cap.is_none() {
+        args.memory.gpu_memory_cap = get("GPU_MEMORY_CAP").map(|v| v.parse::<cuteafd_core::memory_policy::Size>().map(|v| v.0)).transpose()?;
+    }
     if args.pool_tokens.is_none() { args.pool_tokens = get("POOL_TOKENS").filter(|v| *v != "auto").map(|v| v.parse().context("POOL_TOKENS")).transpose()?; }
     if args.exlr8_manifest.is_none() { args.exlr8_manifest = get("EXLR8_MANIFEST").cloned(); }
     if args.exlr8_prefill_activations.is_none() { args.exlr8_prefill_activations = get("EXLR8_PREFILL_ACTIVATIONS").map(|v| v.parse().context("EXLR8_PREFILL_ACTIVATIONS")).transpose()?; }
@@ -412,7 +424,7 @@ fn run_plan_with_host(mut args: PlanArgs) -> Result<()> {
             args.spark_ranks = count.or(hosts);
         }
     }
-    if args.files || args.fetch || args.role.is_some() {
+    {
         let cfg = launch_config(args.config.as_deref())?;
         if args.revision.is_none() && !PathBuf::from(&args.model).is_dir() {
             args.revision = cfg.get("MODEL_REVISION").filter(|v| !v.is_empty()).cloned();
@@ -442,9 +454,11 @@ fn run_plan_with_host(mut args: PlanArgs) -> Result<()> {
             .with_context(|| format!("no snapshot of {} under {}", args.model, hf_home.display()))?
     };
     // Settings-only performs one config read, never checkpoint selection or tensor I/O.
-    let family_config = if args.resolve_settings_only {
-        cuteafd_loader::read_json_file::<serde_json::Value>(&snapshot.join("config.json"))?
-    } else { args.attention.select(&snapshot)?.config()? };
+    let view = (!args.resolve_settings_only).then(|| args.attention.select(&snapshot)).transpose()?;
+    let family_config = match &view {
+        Some(view) => view.config()?,
+        None => cuteafd_loader::read_json_file::<serde_json::Value>(&snapshot.join("config.json"))?,
+    };
     let cfg = launch_config(args.config.as_deref())?;
     let family = if args.resolve_settings_only && family_config["model_type"] == "glm5_next" {
         "glm5_flash"
@@ -468,6 +482,11 @@ fn run_plan_with_host(mut args: PlanArgs) -> Result<()> {
             (requested_speculator != "auto" || args.explicit_settings.contains("speculator")).then_some(requested_speculator.as_str()), cfg.get("SPECULATOR").map(String::as_str),
             cuteafd_loader::model_cache_dir(&home, GLMF_DEFAULT_DRAFTER).is_dir())));
     }
+    if family == "mimo_v2" {
+        settings.insert("speculator".into(), setting(cuteafd_core::launch_settings::mimo_speculator(
+            (requested_speculator != "auto" || args.explicit_settings.contains("speculator")).then_some(requested_speculator.as_str()),
+            cfg.get("SPECULATOR").map(String::as_str), snapshot.join("dflash").is_dir())));
+    }
     if args.resolve_settings_only {
         let mut output = resolved_output(serde_json::json!({"family": family}), &args, settings, &cfg, replay_explicit);
         output["speculator"] = serde_json::json!(args.speculator);
@@ -478,7 +497,7 @@ fn run_plan_with_host(mut args: PlanArgs) -> Result<()> {
     if family == "kimi_k3" && args.speculator == "dflash2" && args.drafter_snapshot.is_none() {
         args.drafter_snapshot = file_args(args.clone(), &snapshot)?.drafter_snapshot;
     }
-    let view = args.attention.select(&snapshot)?;
+    let view = view.context("checkpoint view after settings-only dispatch")?;
     let mut options = options(&args)?;
     if view.mode() == cuteafd_loader::plan::checkpoint::CoreView::Original && cuteafd_loader::plan::exlr8::recognizes(&snapshot)? {
         if args.spark_range {
@@ -774,7 +793,9 @@ fn resolve_speculator(args: &mut PlanArgs, snapshot: &std::path::Path, family: &
         anyhow::ensure!(args.drafter_snapshot.is_none() && args.role.as_deref() != Some("drafter"), "--no-speculator conflicts with drafter inputs/role");
         args.speculator = "off".into();
     } else if (args.include_speculator || args.drafter_snapshot.is_some()) && args.speculator == "off" {
-        args.speculator = if matches!(family, "kimi_k3" | "muse_spark") && args.drafter_snapshot.is_some() { "dflash2".into() } else { default.into() };
+        args.speculator = if matches!(family, "kimi_k3" | "muse_spark") && args.drafter_snapshot.is_some() { "dflash2".into() }
+            else if family == "mimo_v2" && args.include_speculator { "mtp".into() }
+            else { default.into() };
         anyhow::ensure!(args.speculator != "off", "this family has no default speculator");
     }
     let enabled = match (family, args.speculator.as_str()) {
@@ -2165,8 +2186,8 @@ mod tests {
         for (family, key, value, expected) in [
             ("glm5_flash", "SPECULATOR", "dspark", DraftOwnership::None),
             ("glm5", "SPECULATOR", "off", DraftOwnership::None),
-            ("mimo_v2", "DFLASH", "on", DraftOwnership::None),
-            ("mimo_v2", "MTP", "2", DraftOwnership::NativeMtp),
+            ("mimo_v2", "SPECULATOR", "dflash2", DraftOwnership::None),
+            ("mimo_v2", "SPECULATOR", "mtp", DraftOwnership::NativeMtp),
             ("qwen4", "MTP", "0", DraftOwnership::None),
             ("deepseek_v4", "DSPARK", "off", DraftOwnership::None),
             ("deepseek_v41", "DSPARK", "on", DraftOwnership::BundledDspark),
