@@ -43,7 +43,7 @@ fn verify(execution:&mut Execution<'_>,placement:&mut Placement,tokens:&[u32])->
     let template=execution.head.logits.buffer;
     let mut target=super::verify_target::Target::new(execution,std::slice::from_mut(placement));
     let mark=target.checkpoint(&[0])?;
-    let result=(||{
+    let result:Result<Vec<u8>>=(||{
         let logits=target.verify(&mark,VerifyRequest{rows:&rows,tap_sites:&taps})?.logits;
         let bytes=tokens.len()*logits.vocab*4;let mut data=vec![0;bytes];
         library.copy_d2h(&mut data,Buffer{ptr:logits.ptr.cast_mut(),bytes,..template})?;Ok(data)
