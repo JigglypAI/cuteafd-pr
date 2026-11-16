@@ -8,6 +8,10 @@ use std::collections::BTreeMap;
 
 pub const REFERENCE_REVISION: &str = "a9bf8c76a0115f5e2672bfdfc61d70a2b7936744";
 pub const SOURCE_BYTES: u64 = 1_734_145_024;
+/// Supported SGLang M3.1 default image rectangle, not the older area policy.
+pub const MAX_IMAGE_EDGE: usize = 672;
+pub const MAX_IMAGE_PATCHES: usize = 48 * 48;
+pub const MAX_IMAGE_TOKENS: usize = MAX_IMAGE_PATCHES / 4;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct VisionContract {
@@ -270,6 +274,27 @@ impl VisionContract {
         Ok(packed)
     }
 
+    /// SGLang MiniMaxM31 _resize_shape: ceil to28, fit672 rectangle using
+    /// integer ratios, then ceil again. Even tiny images have one merge cell.
+    pub fn resize_shape(&self, height: u32, width: u32) -> Result<(u32, u32)> {
+        ensure!(
+            height > 0 && width > 0,
+            "MiniMax image dimensions must be positive"
+        );
+        let factor = 28u64;
+        let align = |n: u64| n.div_ceil(factor) * factor;
+        let mut h = align(u64::from(height));
+        let mut w = align(u64::from(width));
+        let max = MAX_IMAGE_EDGE as u64;
+        if h > max || w > max {
+            let nh = (h * max / h).min(h * max / w);
+            let nw = (w * max / h).min(w * max / w);
+            h = align(nh.max(factor));
+            w = align(nw.max(factor));
+        }
+        Ok((u32::try_from(h)?, u32::try_from(w)?))
+    }
+
     /// Vendor 3D rotary uses 26 dimensions per axis, leaving two head dimensions untouched.
     pub fn rotary_axis_dims(&self) -> [usize; 3] {
         let head = self.geometry.hidden / self.geometry.heads;
@@ -294,10 +319,11 @@ impl VisionContract {
     ) -> Result<Vec<[usize; 3]>> {
         let merge = self.geometry.spatial_merge;
         ensure!(
-            frames > 0
-                && frames <= self.geometry.max_segment_frames
+            frames == 1
                 && height > 0
                 && width > 0
+                && height <= MAX_IMAGE_EDGE / self.geometry.patch
+                && width <= MAX_IMAGE_EDGE / self.geometry.patch
                 && height % merge == 0
                 && width % merge == 0,
             "invalid MiniMax vision grid"
@@ -307,7 +333,7 @@ impl VisionContract {
             .and_then(|n| n.checked_mul(width))
             .context("MiniMax vision grid overflow")?;
         ensure!(
-            rows <= 65_536,
+            rows <= MAX_IMAGE_PATCHES,
             "MiniMax vision grid exceeds native capacity"
         );
         let mut coordinates = Vec::with_capacity(rows);
@@ -424,6 +450,23 @@ mod tests {
         assert!(contract.patch_coordinates(1, 3, 4).is_err());
         assert!(contract.patch_coordinates(0, 2, 4).is_err());
         assert!(contract.patch_coordinates(5, 2, 4).is_err());
+    }
+    #[test]
+    fn sglang_default_rectangle_is_not_smart_resize() {
+        let contract = VisionContract::from_config(&config()).unwrap();
+        for (input, expected) in [
+            ((900, 500), (672, 392)),
+            ((13, 17), (28, 28)),
+            ((432, 640), (448, 644)),
+            ((1009, 731), (672, 504)),
+            ((672, 672), (672, 672)),
+        ] {
+            assert_eq!(contract.resize_shape(input.0, input.1).unwrap(), expected);
+        }
+        assert_eq!(MAX_IMAGE_TOKENS, 576);
+        assert!(contract.patch_coordinates(1, 50, 48).is_err());
+        assert!(contract.patch_coordinates(2, 2, 2).is_err());
+        assert!(contract.resize_shape(0, 28).is_err());
     }
     #[test]
     fn incompatible_math_is_refused_before_allocating() {
