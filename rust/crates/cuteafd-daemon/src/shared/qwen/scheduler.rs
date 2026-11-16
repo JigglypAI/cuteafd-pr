@@ -187,7 +187,7 @@ pub(crate) trait Backend<'a> {
     fn draft(&self, sequences: &mut [DraftSeq<'_, Self::Placement, Self::Draft>], timing: &mut DraftTiming, selector: &mut crate::shared::token_io::TokenSelector<'_>)
         -> Result<Vec<Vec<u32>>>;
     /// Optional current-proposal evidence; omission preserves history-only policy exactly.
-    fn draft_evidence(&self, _draft: &Self::Draft) -> Option<&[f32]> { None }
+    fn draft_evidence<'d>(&self, _draft: &'d Self::Draft) -> Option<&'d [f32]> { None }
     fn accept(&self, verified: &mut [Verified<'_, Self::Placement, Self::Draft, Self::History>],
         speculative: bool) -> Result<()>;
     /// Drop any unaccepted replay owned by this request before its storage is released.
