@@ -23,7 +23,7 @@ mod tests {
     use super::*;
     use sha2::{Digest, Sha256};
     #[test]
-    fn supported_sglang_default_five_images_match_pillow_byte_hashes() {
+    fn supported_sglang_default_five_images_match_pillow_chw_byte_hashes() {
         let cfg = crate::families::minimax_m3::config::tests::release_config();
         let contract = VisionContract::from_config(&cfg).unwrap();
         for (h, w, expected) in [
@@ -65,8 +65,13 @@ mod tests {
                 &contract,
             )
             .unwrap();
+            // SGLang's resize_frames returns CHW uint8; the Rust payload is HWC.
+            // Hash an explicit CHW view on both sides, not differently laid-out bytes.
+            let chw = (0..3)
+                .flat_map(|channel| out.data.chunks_exact(3).map(move |pixel| pixel[channel]))
+                .collect::<Vec<_>>();
             assert_eq!(
-                format!("{:x}", Sha256::digest(out.data)),
+                format!("{:x}", Sha256::digest(chw)),
                 expected,
                 "source{h}x{w}"
             );
