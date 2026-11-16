@@ -199,7 +199,7 @@ impl<'a> DualAttentionWave<'a> {
             tail.restore_warmup()?;
             ticket.capture_result(crate::shared::decode_graph::begin_capture(&library, stream, &ticket))?;
             let queued=tail.enqueue(&attention,stream);
-            let captured=ticket.capture_result(library.cuda_graph_end_capture_topology(stream));
+            let captured={ let captured = crate::shared::decode_graph::end_capture(&library, stream, &mut ticket); ticket.capture_result(captured) };
             let (graph,nodes,width,_spans,inspection)=match (queued,captured) {
                 (Ok(()),Ok(graph))=>graph,
                 (Err(error),Ok((graph,_,_,_,_)))=> { library.cuda_graph_exec_destroy(graph)?;return Err(error); },

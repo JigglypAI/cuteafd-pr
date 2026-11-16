@@ -299,3 +299,41 @@ mod tests {
         assert_eq!(super::bank_id("../sparse"), None);
     }
 }
+
+#[cfg(test)]
+pub(crate) fn keyed_site_fixture<K: Clone + Eq + std::hash::Hash + std::fmt::Debug>(
+    name: &'static str, device: i32, key: K, test: &str,
+) -> anyhow::Result<()> {
+    const CHILD: &str = "CUTEAFD_KEYED_SITE_FIXTURE";
+    if std::env::var(CHILD).ok().as_deref() != Some(name) {
+        let result = std::process::Command::new(std::env::current_exe()?)
+            .args([test, "--exact", "--nocapture"])
+            .env(CHILD, name).env("CUTEAFD_GRAPH_CENSUS", "1").output()?;
+        anyhow::ensure!(result.status.success(), "site fixture failed: {}", String::from_utf8_lossy(&result.stderr));
+        let logs = format!("{}{}", String::from_utf8_lossy(&result.stdout), String::from_utf8_lossy(&result.stderr));
+        anyhow::ensure!(logs.matches("graph census capture key").count() == 1, "missing or duplicate keyed capture: {logs}");
+        anyhow::ensure!(logs.contains(name), "capture site identity absent");
+        return Ok(());
+    }
+    let _subscriber = tracing_subscriber::fmt().with_ansi(false).with_max_level(tracing::Level::INFO)
+        .with_writer(std::io::stderr).finish();
+    let _subscriber = tracing::subscriber::set_default(_subscriber);
+    use super::device::{Basis, Cycle, Preference, Site};
+    let mut bank = super::GraphBank::<K, usize>::with_family("deepseek_v41");
+    bank.attach_device_for_test(device, 64 << 20, Site { name, cycle: Cycle::Verify,
+        preference: Preference::Capture, bootstrap: 10, basis: Basis::Bytes, spans_devices: false })?;
+    let ticket = bank.cache_ticket(&key, false, None).expect("keyed site miss");
+    bank.census_capture_device_key(name, device, &key, 1usize as *mut std::ffi::c_void);
+    bank.cache_commit(key.clone(), 1, ticket, 3, 1, false);
+    bank.cache_measured(10);
+    assert_eq!(bank.cached_launch(&key), Some(&1));
+    bank.cache_tick();
+    let snapshot = super::device::snapshots().into_iter().find(|row| row.device == device).unwrap();
+    let counters = snapshot.cycles[&Cycle::Verify];
+    assert_eq!((counters.captures, counters.hits, counters.misses), (1, 1, 1));
+    assert_eq!(snapshot.top_hits.len(), 1);
+    let row = serde_json::to_value(&snapshot.top_hits[0])?;
+    assert_eq!(row["site"], name);
+    assert_eq!(row["shape"], format!("{key:?}"));
+    Ok(())
+}

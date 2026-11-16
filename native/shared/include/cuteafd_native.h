@@ -367,6 +367,15 @@ cuteafd_status_t cuteafd_cuda_graph_end_capture_for_test(void* cuda_stream, void
 // cuteafd_last_error. Only capture/instantiation/lifetime errors fail the call.
 cuteafd_status_t cuteafd_cuda_graph_end_capture_topology(void* cuda_stream,
     void** out_cuda_graph_exec, size_t* out_nodes, size_t* out_width, int* out_spans_devices);
+// Source-only capture: no executable allocation until the cache has tried update.
+cuteafd_status_t cuteafd_cuda_graph_capture_source(void* stream, void** source,
+    size_t* nodes, size_t* width, int* spans, const uint64_t** signature, size_t* words);
+cuteafd_status_t cuteafd_cuda_graph_source_instantiate(void* source, void* stream, void** exec);
+cuteafd_status_t cuteafd_cuda_graph_source_update(void* source, void* exec,
+    int* cuda_status, int* update_result);
+cuteafd_status_t cuteafd_cuda_graph_source_destroy(void* source);
+cuteafd_status_t cuteafd_cuda_graph_source_transfer(void* source, void* donor, void** out);
+cuteafd_status_t cuteafd_cuda_graph_exec_invalidate(void* donor);
 cuteafd_status_t cuteafd_cuda_graph_end_capture_retained(
     void* cuda_stream, cuteafd_cuda_graph_capture_info_t* out);
 cuteafd_status_t cuteafd_cuda_graph_launch(void* cuda_graph_exec, void* cuda_stream);

@@ -63,6 +63,16 @@ pub(crate) unsafe fn begin_capture(library: &cuteafd_ffi::NativeLibrary,
 }
 
 /// # Safety
+/// The caller owns capture and retains all recorded operands through replay.
+pub(crate) unsafe fn end_capture(library: &cuteafd_ffi::NativeLibrary,
+    stream: *mut std::ffi::c_void, ticket: &mut CaptureTicket)
+    -> anyhow::Result<(*mut std::ffi::c_void, usize, usize, bool, Option<String>)> {
+    // SAFETY: forwarded stream capture and operand lifetime contract.
+    let source = unsafe { library.cuda_graph_capture_source(stream) }?;
+    ticket.complete_source(library, source, stream)
+}
+
+/// # Safety
 /// The executable comes from an attached bank. Its captured allocations and
 /// stream remain live until every queued consumer has drained.
 pub(crate) unsafe fn launch(library: &cuteafd_ffi::NativeLibrary,

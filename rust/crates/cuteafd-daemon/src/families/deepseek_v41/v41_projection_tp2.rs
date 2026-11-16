@@ -164,7 +164,7 @@ impl<'w,'a> Rank<'w,'a> {
         device.run(||unsafe {
             ticket.capture_result(crate::shared::decode_graph::begin_capture(&device.library, self.storage.stream.raw, &ticket))?;
             let queued=self.enqueue(weights,rows);
-            let captured=ticket.capture_result(device.library.cuda_graph_end_capture_topology(self.storage.stream.raw));
+            let captured={ let captured = crate::shared::decode_graph::end_capture(&device.library, self.storage.stream.raw, &mut ticket); ticket.capture_result(captured) };
             match (queued,captured) {
                 (Ok(()),Ok((graph, nodes, width, _spans, _))) => {
                     if let Err(error)=self.graphs.cache_insert(layer,weights,rows,graph,ticket,nodes as u64,width,true) {
@@ -319,7 +319,7 @@ impl<'w,'a> Wave<'w,'a> {
         device.run(||unsafe {
             ticket.capture_result(crate::shared::decode_graph::begin_capture(&device.library, stream, &ticket))?;
             let queued=self.enqueue_gather(rows);
-            let captured=ticket.capture_result(device.library.cuda_graph_end_capture_topology(stream));
+            let captured={ let captured = crate::shared::decode_graph::end_capture(&device.library, stream, &mut ticket); ticket.capture_result(captured) };
             match (queued,captured) {
                 (Ok(()),Ok((graph, nodes, width, _spans, _))) => {
                     if let Err(error)=self.gather_graphs.cache_insert(0,weights,rows,graph,ticket,nodes as u64,width,true) {

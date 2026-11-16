@@ -4663,7 +4663,7 @@ impl<'a> GlmfEngine<'a> {
             return self.masked_segment(segment);
         }
         let pinned = self.graph_pinned(&key);
-        let Some(ticket) =
+        let Some(mut ticket) =
             graphs.borrow_mut().cache_ticket(&key, pinned, None) else {
             return self.masked_segment(segment);
         };
@@ -4679,7 +4679,7 @@ impl<'a> GlmfEngine<'a> {
         // rank 1's routed-layer shared FFN and its publication stay in `peer_segment`'s
         // host wrapper, so eager, captured and replayed steps queue the same pushes.
         let captured = self.masked_segment(&segment);
-        let exec = self.on(rank, || unsafe { self.library.cuda_graph_end_capture_topology(stream) });
+        let exec = self.on(rank, || unsafe { crate::shared::decode_graph::end_capture(&self.library, stream, &mut ticket) });
         if let Err(error) = captured {
             graphs.borrow_mut().cache_ticket_failed(ticket, exec.as_ref().err().unwrap_or(&error));
             if let Ok((raw, _, _, _, _)) = exec {

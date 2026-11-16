@@ -119,7 +119,7 @@ impl<'w, 'a> DistributedDsparkTerminal<'w, 'a> {
                 // sampling validation before any execution or graph replay.
                 let queued = if sampling { terminal.enqueue_sampling_geometry(requests, terminal.stream.raw) }
                     else { terminal.enqueue_normalize_geometry(requests, terminal.stream.raw) };
-                let captured = ticket.capture_result(device.library.cuda_graph_end_capture_topology(terminal.stream.raw));
+                let captured = { let captured = crate::shared::decode_graph::end_capture(&device.library, terminal.stream.raw, &mut ticket); ticket.capture_result(captured) };
                 match (queued, captured) {
                     (Ok(()), Ok(graph)) => Ok(Some(graph)),
                     (Err(error), Ok((graph, _, _, _, _))) => { device.library.cuda_graph_exec_destroy(graph)?; Err(error) }

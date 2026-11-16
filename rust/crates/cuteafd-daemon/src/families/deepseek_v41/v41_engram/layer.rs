@@ -395,7 +395,7 @@ impl<'weights, 'library> EngramGate<'weights, 'library> {
         }
         let launched = unsafe { self.enqueue(rows) };
         // End on both paths so a failed enqueue cannot leave the stream capturing.
-        let captured = unsafe { ticket.capture_result(self.weights.library.cuda_graph_end_capture_topology(self.storage.stream.raw)) };
+        let captured = unsafe { let captured = crate::shared::decode_graph::end_capture(&self.weights.library, self.storage.stream.raw, &mut ticket); ticket.capture_result(captured) };
         match (launched, captured) {
             (Ok(()), Ok((graph, nodes, width, spans, _))) => {
                 // SAFETY: this executable has not launched; the containing gate

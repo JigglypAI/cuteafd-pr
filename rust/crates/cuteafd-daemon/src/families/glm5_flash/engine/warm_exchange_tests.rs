@@ -143,7 +143,7 @@ fn captured_segments_keep_the_masked_boundary_on_spark_backed_tp2() {
     let source = include_str!("../engine.rs");
     let replay = body(source, "    fn replay_on(", "    fn masked_segment(");
     let begin = replay.find("decode_graph::begin_capture(&self.library, stream, &ticket)").unwrap();
-    let end = replay.find("cuda_graph_end_capture_topology(stream)").unwrap();
+    let end = replay.find("decode_graph::end_capture(&self.library, stream, &mut ticket)").unwrap();
     let captured = &replay[begin..end];
     // Inside the capture window the segment runs only under the mask.
     assert!(captured.contains("self.masked_segment(&segment)"), "capture must run the masked segment");

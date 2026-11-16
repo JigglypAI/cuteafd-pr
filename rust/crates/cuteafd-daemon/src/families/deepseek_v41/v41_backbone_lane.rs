@@ -183,7 +183,7 @@ impl<'w,'a> Tp2FfnGraphs<'w,'a> {
             block.restore_ffn_graph_warmup(binding,rows)?;
             ticket.capture_result(crate::shared::decode_graph::begin_capture(&self.device.library, stream, &ticket))?;
             let queued=block.enqueue_ffn(binding,rows,projected,stream);
-            let captured=ticket.capture_result(self.device.library.cuda_graph_end_capture_topology(stream));
+            let captured={ let captured = crate::shared::decode_graph::end_capture(&self.device.library, stream, &mut ticket); ticket.capture_result(captured) };
             match (queued,captured) {
                 (Ok(_),Ok((graph,nodes,width,spans,_)))=> {
                     if let Err(error)=self.bank.cache_insert(binding.layer(),weights,rows as u32,graph,ticket,nodes as u64,width,spans) {

@@ -74,10 +74,12 @@ pub(crate) struct CaptureTicket {
     id: u64,
     pinned: bool,
     committed: bool,
+    updated: bool,
 }
 
 fn capture_failed(cache: &super::device::SharedCache, id: u64, error: &anyhow::Error) -> bool {
     let mut cache = cache.lock().unwrap_or_else(|p| p.into_inner());
+    cache.source_capture_failed(id);
     if let Some(small) = error.downcast_ref::<cuteafd_ffi::SmallGraphCapture>() {
         cache.capture_too_small(id, small.nodes);
         false
@@ -94,6 +96,36 @@ impl CaptureTicket {
     pub(super) fn require_active(&self) -> anyhow::Result<()> {
         anyhow::ensure!(!self.committed, "graph capture ticket already settled");
         Ok(())
+    }
+
+    /// Finish an uninstantiated capture, preferring an atomic cold-donor update.
+    /// A rejected source returns the ordinary eager sentinel used by capture sites.
+    pub fn complete_source(&mut self, library: &cuteafd_ffi::NativeLibrary,
+        source: cuteafd_ffi::GraphSource<'_>, stream: *mut std::ffi::c_void)
+        -> anyhow::Result<(*mut std::ffi::c_void, usize, usize, bool, Option<String>)> {
+        let mut cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());
+        if cache.updating(self.id) {
+            cache.register_native(self.id, 0, source.signature.clone());
+            if let Some(exec) = cache.finish_update(self.id,
+                |exec| source.update(exec).map(|result| result.accepted()),
+                |exec| source.transfer(exec),
+                |exec| { if let Err(error) = library.cuda_graph_exec_invalidate(exec) {
+                    tracing::error!(%error, "invalidating rejected donor");
+                } }) {
+                self.updated = true;
+                return Ok((exec as *mut _, source.nodes, source.width, source.spans_devices, None));
+            }
+            match cache.fallback_update(self.id) {
+                super::device::Miss::Capture(id) => self.id = id,
+                super::device::Miss::Eager => {
+                    self.committed = true;
+                    return Err(cuteafd_ffi::GraphCacheEager.into());
+                }
+            }
+        }
+        let exec = source.instantiate(stream)?;
+        cache.register_native(self.id, exec as usize, source.signature.clone());
+        Ok((exec, source.nodes, source.width, source.spans_devices, None))
     }
 
     /// Keep native results and error precedence; settle failure before Drop can
@@ -114,7 +146,9 @@ impl CaptureTicket {
 impl Drop for CaptureTicket {
     fn drop(&mut self) {
         if !self.committed {
-            self.cache.lock().unwrap_or_else(|p| p.into_inner()).cancel_capture(self.id);
+            let mut cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());
+            if self.updated { cache.remove_drained(&[self.id]); }
+            else { cache.cancel_capture(self.id); }
         }
     }
 }
@@ -181,7 +215,9 @@ impl<K: Hash + Eq + Clone + std::fmt::Debug, E> GraphBank<K, E> {
                 binding.pinned_hits += 1;
                 binding.pinned_counts[entry.pinned_slot.expect("pinned cache slot")].1 += 1;
             } else {
-                binding.cache.lock().unwrap_or_else(|p| p.into_inner()).hit_cycle(id, binding.site.cycle);
+                let mut cache = binding.cache.lock().unwrap_or_else(|p| p.into_inner());
+                if !cache.owns(id, binding.bank) { return None }
+                cache.hit_cycle(id, binding.site.cycle);
             }
         }
         Some(&entry.exec)
@@ -197,7 +233,11 @@ impl<K: Hash + Eq + Clone + std::fmt::Debug, E> GraphBank<K, E> {
             self.cache_keys_dirty = true;
             identity
         };
-        binding.cache.lock().unwrap_or_else(|p| p.into_inner()).miss(identity, binding.site, node_estimate, pinned)
+        let mut cache = binding.cache.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(id) = cache.update_ticket(identity.clone(), binding.site, node_estimate.clone(), pinned) {
+            return super::device::Miss::Capture(id);
+        }
+        cache.miss(identity, binding.site, node_estimate, pinned)
     }
 
     fn cache_insert(&mut self, key: K, exec: E, id: u64, pinned: bool) {
@@ -217,7 +257,7 @@ impl<K: Hash + Eq + Clone + std::fmt::Debug, E> GraphBank<K, E> {
     /// failed path cancels the ticket, without synchronizing a peer segment.
     pub fn cache_ticket(&mut self, key: &K, pinned: bool, estimate: Option<super::device::Estimate>) -> Option<CaptureTicket> {
         let super::device::Miss::Capture(id) = self.cache_miss(key, pinned, estimate) else { return None };
-        Some(CaptureTicket { cache: self.device.as_ref()?.cache.clone(), id, pinned, committed: false })
+        Some(CaptureTicket { cache: self.device.as_ref()?.cache.clone(), id, pinned, committed: false, updated: false })
     }
 
     pub fn cache_commit(&mut self, key: K, exec: E, mut ticket: CaptureTicket,
@@ -225,10 +265,10 @@ impl<K: Hash + Eq + Clone + std::fmt::Debug, E> GraphBank<K, E> {
         let binding = self.device.as_ref().expect("graph capture requires an attached device cache");
         assert!(std::sync::Arc::ptr_eq(&binding.cache, &ticket.cache), "graph ticket belongs to a different device cache");
         assert!(!ticket.committed, "graph capture ticket already settled");
-        self.cache_topology(ticket.id, nodes, width, spans_devices);
+        if !ticket.updated { self.cache_topology(ticket.id, nodes, width, spans_devices); }
         self.cache_insert(key.clone(), exec, ticket.id, ticket.pinned);
         ticket.committed = true;
-        let retained = ticket.cache.lock().unwrap_or_else(|p| p.into_inner()).completed_capture(ticket.id);
+        let retained = ticket.updated || ticket.cache.lock().unwrap_or_else(|p| p.into_inner()).completed_capture(ticket.id);
         if !retained {
             // The caller may already hold the raw executable for its first
             // launch. Retain its owner until ordinary drained bank teardown.
@@ -291,6 +331,7 @@ impl<K: Hash + Eq + Clone + std::fmt::Debug, E> GraphBank<K, E> {
             let shared = binding.cache.clone();
             let mut cache = shared.lock().unwrap_or_else(|p| p.into_inner());
             binding.flush(&mut cache);
+            self.entries.retain(|_, entry| entry.cached.is_none_or(|(id, pinned)| pinned || cache.owns(id, binding.bank)));
             if self.cache_keys_dirty || self.cache_key_generation != cache.identity_generation() {
                 self.cache_keys.retain(|_, identity| cache.retains_identity(identity));
                 self.cache_keys_dirty = false;
@@ -384,9 +425,16 @@ impl<K: Hash + Eq + Clone + std::fmt::Debug, E> GraphBank<K, E> {
             device, None, key, exec);
     }
 
-    pub fn get(&self, key: &K) -> Option<&E> { self.entries.get(key).map(|entry| &entry.exec) }
+    fn valid_entry(&self, key: &K) -> bool {
+        let Some(entry) = self.entries.get(key) else { return false };
+        match (&self.device, entry.cached) {
+            (Some(binding), Some((id, false))) => binding.cache.lock().unwrap_or_else(|p| p.into_inner()).owns(id, binding.bank),
+            _ => true,
+        }
+    }
+    pub fn get(&self, key: &K) -> Option<&E> { self.valid_entry(key).then(|| &self.entries[key].exec) }
     pub fn len(&self) -> usize { self.entries.len() }
-    pub fn contains(&self, key: &K) -> bool { self.entries.contains_key(key) }
+    pub fn contains(&self, key: &K) -> bool { self.valid_entry(key) }
     pub fn keys(&self) -> Vec<K> { self.entries.keys().cloned().collect() }
     pub fn count(&self, matches: impl Fn(&K) -> bool) -> usize {
         self.entries.keys().filter(|key| matches(key)).count()

@@ -487,7 +487,7 @@ impl DsparkChain<'_, '_> {
             ticket.capture_result(crate::shared::decode_graph::begin_capture(&self.stream.library, self.stream.raw, &ticket))?;
         }
         let launched = unsafe { self.enqueue_geometry(reads, count) };
-        let captured = unsafe { ticket.capture_result(self.stream.library.cuda_graph_end_capture_topology(self.stream.raw)) };
+        let captured = unsafe { let captured = crate::shared::decode_graph::end_capture(&self.stream.library, self.stream.raw, &mut ticket); ticket.capture_result(captured) };
         self.invalidate();
         match (launched, captured) {
             (Ok(()), Ok((graph, nodes, width, spans, inspection))) => {
@@ -496,6 +496,7 @@ impl DsparkChain<'_, '_> {
                 let owner = unsafe { GraphOwner::new(self.stream.library, device, graph,
                     reads.each_ref().map(|r| r.owner))? };
                 warn_topology(inspection);
+                self.graphs.census_capture_device_key("dspark_chain", device, &key, graph);
                 self.graphs.cache_commit(key, owner, ticket, nodes as u64, width,
                     spans || self.spans_devices());
                 tracing::debug!(target: "cuteafd::graph_capture", count, width=self.width,
@@ -652,6 +653,17 @@ impl Drop for DsparkChain<'_, '_> {
 #[cfg(test)]
 mod failure_tests {
     use super::*;
+    #[test]
+    fn dspark_chain_has_keyed_capture_hit_and_census_identity() -> Result<()> {
+        let production = include_str!("chain.rs").split("#[cfg(test)]\nmod failure_tests").next().unwrap();
+        assert!(production.contains("census_capture_device_key(\"dspark_chain\", device, &key, graph)"));
+        assert!(production.contains("self.graphs.cache_ticket(&key"));
+        assert!(production.contains("self.graphs.cached_launch(&(count, self.width))"));
+        crate::shared::decode_graph::census::keyed_site_fixture("dspark_chain", -164_404,
+            (2usize, 5usize),
+            "families::deepseek_v41::v41_experts::dspark::chain::failure_tests::dspark_chain_has_keyed_capture_hit_and_census_identity")
+    }
+
     #[test]
     fn dspark_full_reserve_miss_runs_eager_without_refusal() -> Result<()> {
         use crate::shared::decode_graph::device::{Basis, Cycle, Preference, Site};

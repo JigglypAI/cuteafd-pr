@@ -133,7 +133,7 @@ impl DenseEngine<'_> {
         let pinned = qwen35_graphs::layout(&graphs.variant).is_some_and(|layout|
             layout.traced && layout.entries.iter().any(|entry|
                 entry.pin && entry.rows == key.rows && entry.table_stride == key.table_stride && entry.spec == key.spec));
-        let Some(ticket) = graphs.bank.borrow_mut().cache_ticket(&key, pinned, None) else {
+        let Some(mut ticket) = graphs.bank.borrow_mut().cache_ticket(&key, pinned, None) else {
             return segment();
         };
         // SAFETY: blocks only enqueue launches over persistent engine storage.
@@ -145,7 +145,7 @@ impl DenseEngine<'_> {
         }
         let captured = segment();
         // SAFETY: ends capture on the same stream even when enqueue failed.
-        let ended = unsafe { library.cuda_graph_end_capture_topology(stream.raw) };
+        let ended = unsafe { crate::shared::decode_graph::end_capture(&library, stream.raw, &mut ticket) };
         if let Err(error) = captured {
             graphs.bank.borrow_mut().cache_ticket_failed(ticket, ended.as_ref().err().unwrap_or(&error));
             if let Ok((raw, ..)) = ended {

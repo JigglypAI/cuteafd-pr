@@ -306,7 +306,7 @@ impl<'a,const HEADS:usize> LocalSparseAttentionWave<'a,HEADS> {
             Ok(())
         })();
         // End capture even if a tail failed, so the owner is not left capturing.
-        let captured = unsafe { ticket.capture_result(self.storage.stream.library.cuda_graph_end_capture_topology(self.storage.stream.raw)) };
+        let captured = unsafe { let captured = crate::shared::decode_graph::end_capture(&self.storage.stream.library, self.storage.stream.raw, &mut ticket); ticket.capture_result(captured) };
         match (queued, captured) {
             (Ok(()), Ok((graph, nodes, width, spans, inspection))) => {
                 if let Some(error) = inspection { tracing::warn!(%error, "sparse graph topology inspection failed"); }
@@ -329,6 +329,7 @@ impl<'a,const HEADS:usize> LocalSparseAttentionWave<'a,HEADS> {
         let device = self.storage.query.buffer.device_id;
         // SAFETY: the lane guard retains all captured cache/selection/tail storage.
         let owner = unsafe { GraphOwner::new(self.storage.stream.library, device, graph, ())? };
+        self.graphs.census_capture_device_key("sparse_attention", device, &key, graph);
         self.graphs.cache_commit(key, owner, ticket, nodes as u64, width, spans || self.spans_devices);
         Ok(())
     }
@@ -524,7 +525,7 @@ impl<'a,const HEADS:usize> LocalSparseAttentionWave<'a,HEADS> {
                 values: slice(self.storage.output.buffer, 0, plan.rows * (HEADS*1024)), layer: plan.layer, rows: plan.rows }, self.storage.stream.raw)?; }
             Ok(())
         })();
-        let captured = unsafe { plan.ticket.capture_result(self.storage.stream.library.cuda_graph_end_capture_topology(self.storage.stream.raw)) };
+        let captured = unsafe { let captured = crate::shared::decode_graph::end_capture(&self.storage.stream.library, self.storage.stream.raw, &mut plan.ticket); plan.ticket.capture_result(captured) };
         match (launched, captured) {
             (Ok(()), Ok((graph, nodes, width, spans, inspection))) => {
                 if let Some(error) = inspection { tracing::warn!(%error, "sparse graph topology inspection failed"); }

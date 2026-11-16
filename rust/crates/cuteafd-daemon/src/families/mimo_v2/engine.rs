@@ -2503,7 +2503,7 @@ impl<'a> MimoEngine<'a> {
         // pass, and then serving misses, are the only capture paths.
         if !self.graphs_warmed.get() && !self.graphs_warming.get() { return segment(); }
         let pinned = self.graph_pinned(key.rows);
-        let Some(ticket) =
+        let Some(mut ticket) =
             graphs.borrow_mut().cache_ticket(&key, pinned, None) else { return segment() };
         // No synchronization here: the other rank's segments may not be queued
         // yet. SAFETY: capture records launches on this rank's persistent stream.
@@ -2514,7 +2514,7 @@ impl<'a> MimoEngine<'a> {
             return segment();
         }
         let captured = segment();
-        let exec = self.on(rank, || unsafe { self.library.cuda_graph_end_capture_topology(stream) });
+        let exec = self.on(rank, || unsafe { crate::shared::decode_graph::end_capture(&self.library, stream, &mut ticket) });
         if let Err(error) = captured {
             graphs.borrow_mut().cache_ticket_failed(ticket, exec.as_ref().err().unwrap_or(&error));
             if let Ok((raw, _, _, _, _)) = exec { drop(GraphExec(raw, self.library)); }

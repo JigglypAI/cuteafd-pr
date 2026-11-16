@@ -137,6 +137,11 @@ def test_graph_capture_failure_clears_last_error_before_peer_eager_retry(tmp_pat
     entry_points = native.split('extern "C" cuteafd_status_t cuteafd_cuda_graph_begin_capture(', 1)[1]
     entry_points = 'extern "C" cuteafd_status_t cuteafd_cuda_graph_begin_capture(' + entry_points.split(
         'extern "C" cuteafd_status_t cuteafd_cuda_graph_launch(', 1)[0]
+    # These legacy-wrapper failure oracles stub only their original CUDA APIs;
+    # source-only capture/update has separate ownership tests.
+    begin = entry_points.index("#if CUTEAFD_NATIVE_ENABLE_CUDA\nnamespace {\nstruct GraphHandle")
+    end = entry_points.index('extern "C" cuteafd_status_t cuteafd_cuda_graph_end_capture_retained(', begin)
+    entry_points = entry_points[:begin] + entry_points[end:]
     diagnostics = (ROOT / "native/shared/include/cuteafd_graph_diagnostics.h").read_text()
     clear_error = diagnostics.split("inline cudaError_t diagnostic_cuda", 1)[1].split("using GraphEdgesQuery", 1)[0]
     source = tmp_path / "graph_capture_failure.cc"

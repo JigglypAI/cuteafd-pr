@@ -46,7 +46,7 @@ impl<'a> Graphs<'a> {
             return unsafe { crate::shared::decode_graph::launch(&self.device.library, raw, stream) };
         }
         if self.singleton.borrow().contains(&key) { return segment(); }
-        let Some(ticket) = self.bank.borrow_mut().cache_ticket(&key, self.pins.borrow().contains(&key.rows), None) else { return segment() };
+        let Some(mut ticket) = self.bank.borrow_mut().cache_ticket(&key, self.pins.borrow().contains(&key.rows), None) else { return segment() };
         // SAFETY: callers submit only device work on this stream, using persistent storage.
         if let Err(error) = unsafe { crate::shared::decode_graph::begin_capture(&self.device.library, stream, &ticket) } {
             if self.bank.borrow_mut().cache_ticket_failed(ticket, &error) {
@@ -57,7 +57,7 @@ impl<'a> Graphs<'a> {
         let captured = segment();
         // Always end capture, including a failed launch, before unwinding the ticket.
         // SAFETY: this is the stream whose capture began above.
-        let executable = unsafe { self.device.library.cuda_graph_end_capture_topology(stream) };
+        let executable = unsafe { crate::shared::decode_graph::end_capture(&self.device.library, stream, &mut ticket) };
         if let Err(error) = captured {
             self.bank.borrow_mut().cache_ticket_failed(ticket, executable.as_ref().err().unwrap_or(&error));
             if let Ok((raw, ..)) = executable {

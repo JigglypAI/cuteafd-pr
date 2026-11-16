@@ -3533,7 +3533,7 @@ impl<'a> Qwen4Engine<'a> {
         }
         let pinned = self.graph_pinned(&key);
         let ticket = self.graphs.borrow_mut()[owner].cache_ticket(&key, pinned, None);
-        let Some(ticket) = ticket else {
+        let Some(mut ticket) = ticket else {
             // The policy ran it eagerly (reserve/headroom or no headroom counted):
             // record the shape once so the next trace can add it.
             if !self.warming_graphs.get() { self.miss_graph(key); }
@@ -3551,7 +3551,7 @@ impl<'a> Qwen4Engine<'a> {
         }
         let captured = segment();
         // SAFETY: ends the capture begun above on the same stream.
-        let exec = unsafe { self.library.cuda_graph_end_capture_topology(self.execution_stream()) };
+        let exec = unsafe { crate::shared::decode_graph::end_capture(&self.library, self.execution_stream(), &mut ticket) };
         if let Err(error) = captured {
             self.graphs.borrow_mut()[owner].cache_ticket_failed(ticket, exec.as_ref().err().unwrap_or(&error));
             if let Ok((raw, _, _, _, _)) = exec {
