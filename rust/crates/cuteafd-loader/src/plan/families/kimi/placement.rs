@@ -172,9 +172,12 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
         let extra = (|| -> anyhow::Result<_> {
             use crate::families::kimi_k3::{allocation, core};
             // Speculative verify graphs replay at each exact width up to the drafter's block.
-            let verify = opts.kimi_drafter_snapshot.as_ref().map(|snapshot|
-                crate::formats::dflash::MlaDflashConfig::read(snapshot).map(|draft| draft.block))
-                .transpose()?.unwrap_or(0);
+            let verify = opts.kimi_drafter_snapshot.as_ref().map(|snapshot| -> anyhow::Result<usize> {
+                let raw: serde_json::Value = serde_json::from_slice(&std::fs::read(snapshot.join("config.json"))?)?;
+                if raw["speculators_model_type"] == "dspark" {
+                    Ok(crate::formats::block_dspark::BlockDsparkConfig::from_json(&raw)?.block + 1)
+                } else { Ok(crate::formats::dflash::MlaDflashConfig::from_json(&raw)?.block) }
+            }).transpose()?.unwrap_or(0);
             let attention_heads = if matches!(attention, AttentionPlacement::Heads | AttentionPlacement::Context)
                 && gpus == 2 { 48 } else { 96 };
             let mut demands = allocation::baseline_demands_for_ranks(cfg, manifest, rows, shape, context as usize,
@@ -278,17 +281,28 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
     let draft = opts.kimi_drafter_snapshot.as_ref().map(|snapshot| -> anyhow::Result<_> {
         use crate::{families::glm5::draft_representation::{GlmDraftCapacity, GlmDraftRepresentation},
             formats::dflash::MlaDflashConfig};
-        let draft = MlaDflashConfig::read(snapshot)?;
-        anyhow::ensure!(draft.mla.hidden == cfg.hidden && draft.vocab == cfg.vocab_size
-            && draft.taps.iter().all(|&layer| layer < cfg.layers), "Kimi drafter target geometry differs from checkpoint");
-        anyhow::ensure!(!opts.tp2_dflash || gpus == 2,
-            "Kimi TP2 DFlash requires two physical coordinator GPUs");
+        use crate::families::kimi_k3::draft::DraftLayout;
+        let raw: serde_json::Value = serde_json::from_slice(&std::fs::read(snapshot.join("config.json"))?)?;
         let slots = usize::try_from(slots)?;
-        let representation = if opts.kimi_draft_fp8 { GlmDraftRepresentation::Fp8Only }
-            else { GlmDraftRepresentation::Bf16Only };
-        let layout = draft.runtime_layout(representation, GlmDraftCapacity::new(slots, slots.min(8), draft.block)?,
-            usize::try_from(context)?, slots.checked_mul(usize::try_from(context)?).context("draft pool overflow")?, opts.physical_sms.unwrap_or(188) as usize, 0, opts.mla_kv)?.with_context_split(opts.tp2_dflash)?;
-        fixed.extend(crate::families::kimi_k3::draft_bridge_demands_for_ranks(&layout, rows, gpus)?);
+        let layout = if raw["speculators_model_type"] == "dspark" {
+            anyhow::ensure!(!opts.kimi_draft_fp8 && !opts.tp2_dflash,
+                "block dSpark keeps native BF16 weights on target head GPU");
+            DraftLayout::Block(crate::formats::block_dspark::BlockDsparkRuntimeLayout::new(snapshot,
+                slots,slots.min(8),opts.physical_sms.unwrap_or(188) as usize,&format!("kimi/draft/{head_rank}"))?)
+        } else {
+            let draft = MlaDflashConfig::from_json(&raw)?;
+            anyhow::ensure!(!opts.tp2_dflash || gpus == 2,
+                "Kimi TP2 DFlash requires two physical coordinator GPUs");
+            let representation = if opts.kimi_draft_fp8 { GlmDraftRepresentation::Fp8Only }
+                else { GlmDraftRepresentation::Bf16Only };
+            DraftLayout::Mla(draft.runtime_layout(representation, GlmDraftCapacity::new(slots, slots.min(8), draft.block)?,
+                usize::try_from(context)?,slots.checked_mul(usize::try_from(context)?).context("draft pool overflow")?,
+                opts.physical_sms.unwrap_or(188) as usize,0,opts.mla_kv)?.with_context_split(opts.tp2_dflash)?)
+        };
+        anyhow::ensure!(layout.target_hidden() == cfg.hidden && layout.target_vocab() == cfg.vocab_size
+            && layout.target_taps().iter().all(|&layer| layer < cfg.layers),
+            "Kimi drafter target geometry differs from checkpoint");
+        fixed.extend(crate::families::kimi_k3::draft::bridge_demands(&layout, rows, gpus)?);
         fixed.push(crate::families::kimi_k3::draft_probe_demand(cfg.layers, cfg.topk, 64)?);
         // A K6 vocabulary head has no BF16 operand to borrow: the drafter owns
         // a head-only K6 scratch on the head rank.
@@ -441,7 +455,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
         }
     };
     let draft = match &draft {
-        Some(layout) => match kimi::draft_facts(layout, page_rows, maximum_pages, head_rank as u8) {
+        Some(layout) => match kimi::draft_layout_facts(layout, page_rows, maximum_pages, head_rank as u8) {
             Ok(value) => Some(value),
             Err(error) => { report.refuse_placement(format!("Kimi native MLA draft inventory refused: {error:#}"),
                 "Provide a supported MLA DFlash2 checkpoint and matching native representation."); return memory; }

@@ -9,7 +9,7 @@ use super::super::{
     Placement, PoolLimits, ResidentWeights, Tp2Range,
 };
 use crate::families::kimi_k3::allocation;
-use crate::formats::dflash::MlaDraftRuntimeLayout;
+use crate::families::kimi_k3::draft::DraftLayout;
 use cuteafd_core::memory_layout::{Basis, Category};
 use cuteafd_core::spark_reply::SparkReplyFormats;
 
@@ -223,7 +223,12 @@ pub fn whole_arenas(counts: &[usize], workspace: u64, parts: &[Bytes2])
 /// Derive the drafter's pool-dependent owners from the admitted layout. The
 /// native recipe is linear in whole pages; a non-linear recipe is refused
 /// instead of sampled.
-pub fn draft_facts(layout: &MlaDraftRuntimeLayout, page_rows: u64, maximum_pages: u64, gpu: u8)
+pub fn draft_facts(layout: &crate::formats::dflash::MlaDraftRuntimeLayout,
+    page_rows: u64, maximum_pages: u64, gpu: u8) -> anyhow::Result<Draft> {
+    draft_layout_facts(&DraftLayout::Mla(layout.clone()),page_rows,maximum_pages,gpu)
+}
+
+pub fn draft_layout_facts(layout: &DraftLayout, page_rows: u64, maximum_pages: u64, gpu: u8)
     -> anyhow::Result<Draft> {
     use anyhow::Context;
     let multiple = if layout.context_split() && page_rows == 64 { 2 } else { 1 };
@@ -268,9 +273,11 @@ pub fn draft_facts(layout: &MlaDraftRuntimeLayout, page_rows: u64, maximum_pages
     }).collect::<anyhow::Result<Vec<_>>>()?;
     let staging_per_page = step(staging_one, staging_last)?;
     let arena = crate::serving_capacity::WeightArenaLayout::new(format!("kimi/draft/{gpu}"), layout.weight_arena_requests())?;
-    anyhow::ensure!(arena.payload_bytes() as u64 == layout.weights().resident_bytes()?,
-        "Kimi draft recipe differs from immutable payload");
-    let owners = owners.into_iter().filter(|owner| owner.group != "MLA DFlash owned weights").collect::<Vec<_>>();
+    if let DraftLayout::Mla(layout) = layout {
+        anyhow::ensure!(arena.payload_bytes() as u64 == layout.weights().resident_bytes()?,
+            "Kimi draft recipe differs from immutable payload");
+    }
+    let owners = owners.into_iter().filter(|owner| !matches!(owner.group.as_str(), "MLA DFlash owned weights" | "block dSpark owned weights")).collect::<Vec<_>>();
     anyhow::ensure!(owners.iter().all(|owner| owner.weights_at_first == 0 && owner.weights_per_page == 0),
         "Kimi draft immutable owner outside its arena");
     Ok(Draft { context_split: layout.context_split(), arena: Some((gpu, arena)), owners,

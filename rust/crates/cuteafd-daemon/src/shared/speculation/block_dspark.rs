@@ -475,6 +475,7 @@ enum HeadRef<'h> {
 enum DraftInput<'r, 'e> {
     Rows(&'r [u8]),
     Table(&'r TokenEmbedding<'e>),
+    Launch(&'r dyn Fn(&[u32], CuteafdDeviceBuffer, *mut c_void) -> Result<()>),
 }
 
 /// The tensors a dSpark draft reads (everything but the checkpoint's copies
@@ -1394,6 +1395,13 @@ impl<'a> DsparkDrafter<'a> {
         self.draft_from(sequences, DraftInput::Table(embedding), self.head_ref(&head)?, true)
     }
 
+    /// Device-driven input binding for a target whose embedding lives on a peer.
+    pub fn draft_device_with(&self, sequences: &[DraftSeq],
+        input: &dyn Fn(&[u32], CuteafdDeviceBuffer, *mut c_void) -> Result<()>, head: TargetHead<'_>)
+        -> Result<Vec<Draft>> {
+        self.draft_from(sequences, DraftInput::Launch(input), self.head_ref(&head)?, true)
+    }
+
     pub fn draft_device_diagnostic(&self, sequences: &[DraftSeq], embedding: &TokenEmbedding<'_>,
         head: TargetHead<'_>) -> Result<Vec<Draft>> {
         self.draft_from(sequences, DraftInput::Table(embedding), self.head_ref(&head)?, false)
@@ -1411,7 +1419,7 @@ impl<'a> DsparkDrafter<'a> {
         let (s_count, block, h) = (sequences.len(), c.block, c.hidden);
         let rows_ok = match input {
             DraftInput::Rows(r) => r.len() == s_count * h * 2,
-            DraftInput::Table(_) => true,
+            DraftInput::Table(_) | DraftInput::Launch(_) => true,
         };
         ensure!(s_count > 0 && s_count <= self.max_sequences && rows_ok, "draft step of {s_count} sequences");
         let rows = s_count * block;
@@ -1468,6 +1476,11 @@ impl<'a> DsparkDrafter<'a> {
                     .flat_map(|seq| std::iter::once(seq.anchor).chain(std::iter::repeat_n(c.mask_token, block - 1)))
                     .collect();
                 embedding.embed(&ids, w.ids.buffer, 1, w.h.buffer, self.stream)?;
+            }
+            DraftInput::Launch(launch) => {
+                let ids = sequences.iter().flat_map(|seq| std::iter::once(seq.anchor)
+                    .chain(std::iter::repeat_n(c.mask_token,block - 1))).collect::<Vec<_>>();
+                launch(&ids,w.h.buffer,self.stream)?;
             }
         }
         self.put(&w.positions, bytes_of(&positions))?;

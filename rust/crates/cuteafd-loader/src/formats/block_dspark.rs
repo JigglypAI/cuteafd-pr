@@ -82,6 +82,87 @@ impl NativeDsparkLayout {
     }
 }
 
+/// Physical owners of the shared Qwen3 block executor, excluding target taps/head.
+/// Window rings are fixed by checkpoint geometry, independent of the target pool.
+#[derive(Debug, Clone)]
+pub struct BlockDsparkRuntimeLayout {
+    pub config: BlockDsparkConfig,
+    pub weight_requests: Vec<(String, usize)>,
+    pub capacity: crate::families::glm5::draft_representation::GlmDraftCapacity,
+    pub weights: crate::serving_capacity::WeightArenaLayout,
+    pub buffers: Vec<(String, usize)>,
+    pub host_landing: usize,
+}
+
+impl BlockDsparkRuntimeLayout {
+    pub fn new(snapshot: &Path, slots: usize, sequences: usize, sms: usize, arena: &str)
+        -> anyhow::Result<Self> {
+        use anyhow::{ensure, Context};
+        use crate::families::glm5::draft_representation::{GlmDraftCapacity, GlmDraftRepresentation};
+        let config = BlockDsparkConfig::read(snapshot)?;
+        ensure!(config.dialect == DsparkDialect::Qwen3 && config.backbone.is_qwen3(config.head_dim)
+            && matches!(config.head_dim, 64 | 128) && matches!(config.rank, 256 | 512)
+            && supports_sequences(sequences) && sequences <= slots && sms > 0,
+            "unsupported shared Qwen3 block drafter arithmetic/capacity");
+        let capacity = GlmDraftCapacity::new(slots, sequences, config.block)?;
+        let window = config.window.context("block runtime layout requires checkpoint sliding window")?;
+        let cache = config.paged_cache_layout(slots, window, slots.checked_mul(window)
+            .context("block ring capacity overflow")?, crate::families::qwen4::Qwen4KvCache::Bf16)?;
+        let weight_requests = block_dspark_arena_requests(snapshot, GlmDraftRepresentation::Bf16Only)?;
+        let weights = crate::serving_capacity::WeightArenaLayout::new(arena, weight_requests.clone())?;
+        let mul = |values: &[usize]| values.iter().try_fold(1usize, |n, value| n.checked_mul(*value))
+            .context("block runtime owner extent overflow");
+        let add = |values: &[usize]| values.iter().try_fold(0usize, |n, value| n.checked_add(*value))
+            .context("block runtime width overflow");
+        let (h, inter, rows) = (config.hidden, config.intermediate, capacity.block_rows);
+        let q = mul(&[config.heads, config.head_dim])?;
+        let kv = mul(&[config.kv_heads, config.head_dim])?;
+        let qkv = add(&[q, mul(&[2,kv])?])?;
+        let mut buffers = Vec::new();
+        let mut push = |name: String, bytes: usize| buffers.push((name,bytes.max(256)));
+        for layer in 0..config.layers {
+            for plane in ["k_ring", "v_ring"] {
+                push(format!("layer.{layer}.{plane}"), cache.layer_bytes[layer] / 2);
+            }
+        }
+        for (name,width,bytes) in [("taps",mul(&[config.taps.len(),h])?,2), ("fused",h,2),
+            ("fused_norm",h,2), ("context_kv",mul(&[2,kv])?,2),
+            ("context_positions",1,8), ("context_slots",1,4)] {
+            push(name.into(),mul(&[2048,width,bytes])?);
+        }
+        for (name,width,bytes) in [("h",h,2),("n",h,2),("qkv",qkv,2),("q",q,2),
+            ("k",kv,2),("v",kv,2),("attn",q,2),("delta",h,2),
+            ("gate_up",mul(&[2,inter])?,2),("act",inter,2),("logits",config.vocab,4),
+            ("ids",1,4),("tokens",1,4),("confidence",1,4),("positions",1,8)] {
+            push(format!("workspace.{name}"),mul(&[rows,width,bytes])?);
+        }
+        push("workspace.anchors".into(),mul(&[sequences,4])?);
+        push("workspace.tables".into(),mul(&[sequences,12])?);
+        push("workspace.head".into(),cuteafd_ffi::programs::VOCABULARY_HEAD_WORKSPACE);
+        push("workspace.markov".into(),add(&[mul(&[sequences,296,8])?,mul(&[rows,4])?])?);
+        push("workspace.attention".into(),usize::try_from(crate::serving_capacity::draft_attention_workspace_bytes(
+            sequences as u64, config.kv_heads as u64,
+            mul(&[config.heads / config.kv_heads, config.block])?.div_ceil(32) as u64,
+            add(&[window, config.block])? as u64, config.head_dim as u64, sms as u64)?)?);
+        Ok(Self { config, weight_requests, capacity, weights, buffers, host_landing:mul(&[rows,8])? })
+    }
+
+    pub fn window_mark_bytes(&self) -> anyhow::Result<usize> {
+        use anyhow::Context;
+        let window = self.config.window.context("block runtime window missing")?;
+        [self.config.layers,2,window,self.config.kv_heads,self.config.head_dim,2]
+            .into_iter().try_fold(1usize, |n,v| n.checked_mul(v)).context("block snapshot extent overflow")?
+            .checked_add(16).and_then(|n| n.checked_add(255)).map(|n| n / 256 * 256)
+            .context("block snapshot alignment overflow")
+    }
+
+    pub fn demands(&self, gpu: u8) -> Vec<crate::placement::Demand> {
+        use cuteafd_core::memory_layout::{Basis, Category};
+        self.buffers.iter().map(|(name, bytes)| crate::placement::Demand::new(gpu,
+            Category::Drafter, format!("block dSpark {name}"), *bytes as u64, Basis::Exact)).collect()
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum DsparkConfigError {
     #[error(transparent)]
@@ -673,6 +754,35 @@ mod tests {
         let names = bf16.iter().map(|(name, _)| name).collect::<std::collections::BTreeSet<_>>();
         assert_eq!(names.len(), bf16.len(), "request names must be unique");
     }
+    #[test]
+    fn shared_window_runtime_has_exact_named_buffers_and_one_arena() -> anyhow::Result<()> {
+        use crate::plan::testing::{t, write_safetensors};
+        let root = tempfile::tempdir()?;
+        let mut raw = qwen();
+        raw["layer_types"] = json!(vec!["sliding_attention";5]);
+        raw["sliding_window"] = json!(2048);
+        raw["markov_rank"] = json!(512);
+        std::fs::write(root.path().join("config.json"),serde_json::to_vec(&raw)?)?;
+        let cfg = BlockDsparkConfig::read(root.path())?;
+        let shapes = std::cell::RefCell::new(Vec::new());
+        block_dspark_weight_recipe(&cfg, |name, shape| {
+            shapes.borrow_mut().push(t(name,"BF16",shape)); Ok::<_,anyhow::Error>(())
+        }, |parts, cols| { for (name, rows) in parts {
+            shapes.borrow_mut().push(t(*name,"BF16",&[*rows,cols])); } Ok(()) })?;
+        write_safetensors(&root.path().join("model.safetensors"),&shapes.into_inner());
+        let one = BlockDsparkRuntimeLayout::new(root.path(),1,1,188,"test/draft")?;
+        let two = BlockDsparkRuntimeLayout::new(root.path(),2,1,188,"test/draft")?;
+        assert_eq!(one.weights.views(),two.weights.views());
+        assert_eq!(one.buffers.len(),two.buffers.len());
+        let total = |layout: &BlockDsparkRuntimeLayout| layout.buffers.iter().map(|(_,n)| *n).sum::<usize>();
+        assert_eq!(total(&two)-total(&one),5*2*2048*8*128*2);
+        assert_eq!(one.window_mark_bytes()?,(16usize+5*2*2048*8*128*2).div_ceil(256)*256);
+        assert!(one.demands(1).iter().all(|d| d.gpu == 1 && d.resident_weights.0 == 0));
+        assert_eq!(one.buffers.iter().map(|(n,_)| n).collect::<std::collections::BTreeSet<_>>().len(),one.buffers.len());
+        assert!(BlockDsparkRuntimeLayout::new(root.path(),1,2,188,"test/draft").is_err());
+        Ok(())
+    }
+
     use serde_json::json;
 
     fn qwen() -> Value {
