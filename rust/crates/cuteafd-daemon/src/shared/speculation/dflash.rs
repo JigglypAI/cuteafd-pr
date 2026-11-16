@@ -1179,7 +1179,8 @@ impl<'a> DflashDrafter<'a> {
         let peer = device.own(|| Self::load_rank(library, programs, target_projection, snapshot, Some(file), exchange.stream(1 - head_rank), slots,
             max_sequences, mask_row, row_window, representation, scales, fp8_rows, kv_cache, 1, 2, &mut allocate).map(Box::new))?;
         let bytes = max_sequences * lead.cfg.block * lead.cfg.hidden * 2;
-        lead.head_split = Some(GqaHeadSplit::new(peer,exchange,head_rank,bytes)?);
+        lead.head_split = Some(GqaHeadSplit::new(peer,exchange,head_rank,bytes,
+            [Tag::drafter_workspace("shared/dflash-reduce"),Tag::transport("shared/dflash-reduce")])?);
         Ok(lead)
     }
 

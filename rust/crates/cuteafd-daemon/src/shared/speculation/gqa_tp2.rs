@@ -15,12 +15,13 @@ pub(crate) struct GqaHeadSplit<'a,D> {
 }
 
 impl<'a,D> GqaHeadSplit<'a,D> {
-    pub fn new(peer:DeviceOwner<'a,Box<D>>,exchange:Rc<PeerExchange<'a>>,lead:usize,bytes:usize)->Result<Self> {
+    pub fn new(peer:DeviceOwner<'a,Box<D>>,exchange:Rc<PeerExchange<'a>>,lead:usize,bytes:usize,
+        tags:[Tag;2])->Result<Self> {
         ensure!(lead<2 && bytes>0 && peer.device.id==exchange.device(1-lead),"invalid GQA TP2 physical owners");
         let library=peer.device.library;
         let lead_device=Device { library,id:exchange.device(lead) };
-        let reduced=lead_device.run(||DeviceAllocation::new(library,bytes,Tag::drafter_workspace("shared/dflash-reduce")))?;
-        let peer_reduced=peer.device.own(||DeviceAllocation::new(library,bytes,Tag::transport("shared/dflash-reduce")))?;
+        let reduced=lead_device.run(||DeviceAllocation::new(library,bytes,tags[0]))?;
+        let peer_reduced=peer.device.own(||DeviceAllocation::new(library,bytes,tags[1]))?;
         Ok(Self { peer,exchange,lead,reduced,peer_reduced })
     }
 
