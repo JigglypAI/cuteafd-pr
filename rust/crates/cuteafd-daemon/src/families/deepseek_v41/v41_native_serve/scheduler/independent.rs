@@ -160,7 +160,17 @@ async fn lane<'a, P: VerificationTarget<'a>, C: DraftChain<'a>>(lease: LaneLease
                     Boundary::Run(members) => members,
                 }
             };
-            ensure!(members.len() <= active.borrow().len().div_ceil(2), "independent lane exceeds request capacity");
+            // Guard at a drained boundary too: a stale or overfull lane must
+            // shed only its excess owners, never fail its peers or reset links.
+            let capacity = active.borrow().len().div_ceil(2).min(cuteafd_core::V41_MAX_LANE_MEMBERS);
+            if members.len() > capacity {
+                for &slot in &members[capacity..] {
+                    let id = active.borrow()[slot].as_ref().unwrap().id();
+                    let failure = crate::shared::serve::RequestFailure::check_lane(id, capacity, capacity).unwrap_err();
+                    round_failure::fail_request(&mut active.borrow_mut(), &failure);
+                }
+                continue;
+            }
             // A member whose next round would pass its reservation needs a top-up, which the
             // outer loop plans at a boundary where both lanes have drained.
             {
@@ -227,6 +237,7 @@ async fn lane<'a, P: VerificationTarget<'a>, C: DraftChain<'a>>(lease: LaneLease
             // The polled draft times itself from issue to completion.
             if !drafting.is_empty() { clock.drafted_us(draft_us); }
             let mut inputs = drafted;
+            validate_proposals(&active.borrow(), &members, &inputs)?;
             if let Some(draft) = draft.borrow_mut().as_deref_mut() {
                 extend_inputs(draft, &active.borrow(), &members, &mut inputs)?;
             }
@@ -239,7 +250,8 @@ async fn lane<'a, P: VerificationTarget<'a>, C: DraftChain<'a>>(lease: LaneLease
                 let mut draft = draft.borrow_mut();
                 for (&slot, input) in members.iter().zip(&mut inputs) {
                     let r = active[slot].as_ref().unwrap();
-                    if let Some(constraint) = &r.constraint { constraint.truncate_proposal(input)?; }
+                    if let Some(constraint) = &r.constraint { constraint.truncate_proposal(input).map_err(|error|
+                            crate::shared::serve::RequestFailure::new(r.id(), error))?; }
                     if crate::shared::probe::no_speculation(&r.job.probe) { input.truncate(1); }
                 }
                 // Lengths are chosen from this lane's proposals and routes only;
@@ -333,6 +345,8 @@ async fn lane<'a, P: VerificationTarget<'a>, C: DraftChain<'a>>(lease: LaneLease
                 if !decision.frontier_downloads.is_empty() {
                     let rows: Vec<_> = decision.frontier_downloads.iter().map(|&(_, row, _, _)| row).collect();
                     let bytes = pass.download_logits(batch.as_ref().unwrap(), &rows).await?;
+                    // One packed transfer has no per-member lengths: a short
+                    // buffer cannot identify its faulty owner. Keep it round-wide.
                     ensure!(bytes.len() == rows.len() * scores::ROW_BYTES, "retained frontier download extent differs");
                     for ((member, row, mask, retain), bytes) in decision.frontier_downloads.drain(..)
                         .zip(bytes.chunks_exact(scores::ROW_BYTES)) {
@@ -415,9 +429,11 @@ async fn lane<'a, P: VerificationTarget<'a>, C: DraftChain<'a>>(lease: LaneLease
                 // commit must drain/discard this lane before the outer reset.
                 pass.discard(batch)
             } else { Ok(()) };
-            operation?;
+            // A cleanup/device fault overrides a request-local validation
+            // failure: those links/owners are not safe to reuse without reset.
             stopped_capture?;
             discarded?;
+            operation?;
             // Commit/discard settled this lane; no bank traversal on hit-only rounds.
             graph_cycles.complete();
             // Give already-ready remote completions an opportunity to run before

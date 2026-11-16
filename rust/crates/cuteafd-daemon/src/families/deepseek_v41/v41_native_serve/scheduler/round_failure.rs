@@ -28,7 +28,7 @@ use crate::families::deepseek_v41::v41_backbone_cache::CacheLease;
 /// One member of a decode/verify round whose lifecycle the failure path owns.
 pub(super) trait RoundMember {
     /// Report `message` to the client (once) and mark the member terminal.
-    fn fail(&mut self, message: &str);
+    fn fail(&mut self, failure: cuteafd_api::openai::NativeFailure);
     /// The member is ready to leave the scheduler (finished or client gone).
     fn is_done(&self) -> bool;
     /// The request id, for logging a release error.
@@ -54,8 +54,28 @@ pub(super) struct RetireReport {
 pub(super) fn fail_round<M: RoundMember>(active: &mut [Option<M>], error: &anyhow::Error) {
     let message = format!("{error:#}");
     for member in active.iter_mut().flatten() {
-        if !member.is_done() { member.fail(&message); }
+        if !member.is_done() { member.fail(message.clone().into()); }
     }
+}
+
+/// Return true only for an explicitly attributed host-side failure. Unknown ids
+/// are internal faults, not permission to resume a possibly broken round.
+pub(super) fn fail_request<M: RoundMember>(active: &mut [Option<M>],
+    failure: &crate::shared::serve::RequestFailure) -> bool {
+    let Some(member) = active.iter_mut().flatten().find(|member| member.id() == failure.id) else { return false; };
+    if !member.is_done() { member.fail(failure.retry()); }
+    true
+}
+
+/// Reset only after a round-wide fault; callers invoke this after both lanes
+/// drain. The callback keeps the classification and reset decision inseparable.
+pub(super) fn handle<M: RoundMember>(active: &mut [Option<M>], error: &anyhow::Error,
+    reset: impl FnOnce() -> anyhow::Result<()>) -> anyhow::Result<()> {
+    if let Some(failure) = error.downcast_ref::<crate::shared::serve::RequestFailure>() {
+        if fail_request(active, failure) { return Ok(()); }
+    }
+    fail_round(active, error);
+    reset()
 }
 
 /// Take every done member out of the round and release it. A release error is
@@ -87,7 +107,7 @@ pub(super) fn retire_done<M: RoundMember, R: Releaser<M>>(active: &mut [Option<M
 pub(super) fn drain_on_exit<M: RoundMember, R: Releaser<M>>(active: &mut [Option<M>],
     releaser: &mut R, message: &str) -> RetireReport {
     for member in active.iter_mut().flatten() {
-        if !member.is_done() { member.fail(message); }
+        if !member.is_done() { member.fail(message.into()); }
     }
     retire_done(active, releaser)
 }
@@ -127,8 +147,8 @@ pub(super) fn release_admission<'w, 'a, C: DraftChain<'a>>(requests: &mut Reques
 }
 
 impl RoundMember for Active<'_> {
-    fn fail(&mut self, message: &str) {
-        let _ = self.job.events.send(Err(message.into()));
+    fn fail(&mut self, failure: cuteafd_api::openai::NativeFailure) {
+        let _ = self.job.events.send(Err(failure));
         self.finished = true;
         self.cacheable = false;
         self.failed = true;
@@ -176,10 +196,10 @@ pub(super) mod tests {
     }
 
     impl RoundMember for FakeMember {
-        fn fail(&mut self, message: &str) {
+        fn fail(&mut self, failure: cuteafd_api::openai::NativeFailure) {
             self.failed = true;
             self.done = true;
-            if !self.closed { self.errors.lock().unwrap().push((self.id, message.to_owned())); }
+            if !self.closed { self.errors.lock().unwrap().push((self.id, failure.to_string())); }
         }
         fn is_done(&self) -> bool { self.done }
         fn id(&self) -> u64 { self.id }
@@ -310,6 +330,91 @@ pub(super) mod tests {
         drop(first);
     }
 
+    #[test]
+    fn request_failure_preserves_peer_bytes_and_releases_only_its_owners_once() {
+        use super::super::InferenceChunk;
+        struct Owners { kv: HashSet<u64>, draft: HashSet<u64>, marks: HashSet<u64>, released: Vec<u64> }
+        impl Releaser<Active<'static>> for Owners {
+            fn release(&mut self, mut member: Active<'static>) -> anyhow::Result<()> {
+                let id = member.id();
+                assert!(self.kv.remove(&id));
+                assert!(self.draft.remove(&id));
+                assert!(self.marks.remove(&id));
+                self.released.push(id);
+                member.console_retire();
+                Ok(())
+            }
+        }
+        fn bytes(output: &mut tokio::sync::mpsc::UnboundedReceiver<Result<InferenceChunk,
+            cuteafd_api::openai::NativeFailure>>) -> Vec<u8> {
+            let mut result = Vec::new();
+            while let Ok(event) = output.try_recv() {
+                match event.unwrap() {
+                    InferenceChunk::Text { content, content_tokens } => {
+                        result.extend_from_slice(content.as_bytes()); result.extend(content_tokens.to_le_bytes());
+                    }
+                    InferenceChunk::Finish { .. } => result.extend_from_slice(b"finish"),
+                    _ => panic!("unexpected fixture event"),
+                }
+            }
+            result
+        }
+        let (a, mut ao, _) = active_fixture(10, 0);
+        let (bad, mut bo, _) = active_fixture(11, 0);
+        let (c, mut co, _) = active_fixture(12, 1);
+        let mut active = [Some(a), Some(bad), Some(c)];
+        let failure = anyhow::Error::new(crate::shared::serve::RequestFailure::new(11, "member shape differs"))
+            .context("decode validation");
+        for _ in 0..2 { handle(&mut active, &failure, || panic!("request fault must not reset links")).unwrap(); }
+        assert!(matches!(bo.try_recv(), Ok(Err(cuteafd_api::openai::NativeFailure::Retry(message)))
+            if message.contains("11") && message.contains("retry")));
+        assert!(bo.try_recv().is_err());
+        let mut owners = Owners { kv: HashSet::from([10, 11, 12]), draft: HashSet::from([10, 11, 12]),
+            marks: HashSet::from([10, 11, 12]), released: Vec::new() };
+        assert_eq!(retire_done(&mut active, &mut owners).retired, 1);
+        assert_eq!(retire_done(&mut active, &mut owners).retired, 0);
+        assert_eq!(owners.released, [11]);
+        assert!(active[1].is_none());
+        for (index, output) in [(0, &mut ao), (2, &mut co)] {
+            let member = active[index].as_mut().unwrap();
+            assert!(!member.failed && !member.finished);
+            let id = member.id();
+            let (mut baseline, mut reference, _) = active_fixture(id, member.lane() as u8);
+            member.emit(&[0, 1]).unwrap(); baseline.emit(&[0, 1]).unwrap();
+            assert_eq!(bytes(output), bytes(&mut reference), "peer output is byte-identical without failing member");
+            baseline.console_retire();
+        }
+        assert_eq!(retire_done(&mut active, &mut owners).retired, 2);
+        assert_eq!(retire_done(&mut active, &mut owners).retired, 0);
+        assert!(owners.kv.is_empty() && owners.draft.is_empty() && owners.marks.is_empty());
+    }
+
+    #[test]
+    fn round_wide_failure_fails_every_member_and_resets() {
+        let errors = ErrorLog::default();
+        let mut active = round(3, 0, &errors);
+        let mut resets = 0;
+        handle(&mut active, &fault("retained frontier download extent differs"), || { resets += 1; Ok(()) }).unwrap();
+        assert_eq!(resets, 1);
+        assert_eq!(errors.lock().unwrap().len(), 3);
+        let mut releaser = FakeReleaser { leases: leases(3), retired: 0, fail_on: None };
+        assert_eq!(retire_done(&mut active, &mut releaser).retired, 3);
+        assert!(releaser.leases.is_empty());
+    }
+
+    #[test]
+    fn lane_admission_refuses_before_ready_or_round() {
+        let source = include_str!("../scheduler.rs");
+        let ready = &source[source.find("let ready = (|| -> Result<_>").unwrap()..];
+        assert!(ready.find("RequestFailure::check_lane").unwrap() < ready.find("InferenceChunk::Ready").unwrap());
+        let failure = crate::shared::serve::RequestFailure::check_lane(17, 2, 2).unwrap_err();
+        let (job, mut output, _) = active_fixture(17, 0);
+        job.job.events.send(Err(failure.retry())).unwrap();
+        assert!(matches!(output.try_recv(), Ok(Err(cuteafd_api::openai::NativeFailure::Retry(_)))));
+        assert!(output.try_recv().is_err(), "no Ready or round output before refusal");
+        assert!(crate::shared::serve::RequestFailure::check_lane(18, 1, 2).is_ok());
+    }
+
     /// 48 members, one failed round: every member gets exactly one error event.
     #[test]
     fn failed_round_errors_every_member_once() {
@@ -400,7 +505,7 @@ pub(super) mod tests {
     fn fail_round_precedes_the_resets() {
         let source = include_str!("../scheduler.rs");
         let body = &source[source.find("\"native decode round failed\"").expect("failed-round branch")..];
-        let fail = body.find("round_failure::fail_round(").expect("fail_round in the branch");
+        let fail = body.find("round_failure::handle(").expect("failure handler in the branch");
         let reset = body.find("P::reset_connections(first_transport)?").expect("reset in the branch");
         assert!(fail < reset, "fail_round must run before the resets");
         assert_eq!(source.matches("round_failure::drain_on_exit(").count(), 1);
@@ -433,7 +538,7 @@ pub(super) mod tests {
     #[test]
     fn scheduler_wires_the_round_failure_helpers_once() {
         let source = include_str!("../scheduler.rs");
-        assert_eq!(source.matches("round_failure::fail_round(").count(), 1);
+        assert_eq!(source.matches("round_failure::handle(").count(), 1);
         assert_eq!(source.matches("round_failure::retire_done(").count(), 1);
     }
 }
