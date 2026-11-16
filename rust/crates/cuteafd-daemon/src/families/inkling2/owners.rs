@@ -334,7 +334,7 @@ mod packed_tests {
         cfg.layers = 2;
         cfg.local = vec![true, false];
         let cache = super::super::cache::CacheBank::new(vec![stream.clone()], CacheLayout::new(&cfg, 2, 4)?, 0)?;
-        let unit = UnitOwner::new(stream.clone(), UnitLayout::serving(&cfg, 4, 128)?)?;
+        let unit = UnitOwner::new(stream.clone(), UnitLayout::serving_format(&cfg, 4, 128, Default::default(), 2)?)?;
         let mut uploads = unit.uploads(&cfg, 2)?;
         let members = vec![
             PackedMember { sequence: 1, rows: 0..1, metadata: UnitMetadata::new(&cfg, 63..64, &[2], 4)? },
@@ -349,9 +349,21 @@ mod packed_tests {
             Ok(bytes.chunks_exact(8).map(|b| i64::from_le_bytes(b.try_into().unwrap())).collect())
         };
         assert_eq!(values("positions")?, [63, 65, 66, 67]);
-        assert_eq!(values("cache_slots")?, [0, 0, 1, 2]);
+        assert_eq!(values("cache_slots")?, [0, 1, 2, 3]);
         assert_eq!(values("global_slots")?, [191, 193, 194, 195]);
-        assert_eq!(values("conv_slots")?, [0; 4]);
+        assert_eq!(values("conv_slots")?, [1, 0, 0, 0]);
+        let i32_values = |name: &str| -> Result<Vec<i32>> {
+            let buffer = unit.buffer(name)?;
+            let mut bytes = vec![0; buffer.bytes];
+            library.copy_d2h(&mut bytes, buffer)?;
+            Ok(bytes.chunks_exact(4).map(|b| i32::from_le_bytes(b.try_into().unwrap())).collect())
+        };
+        assert_eq!(i32_values("first")?, [0, 1, 1, 1]);
+        assert_eq!(i32_values("table_indices")?, [0, 1, 1, 1]);
+        assert_eq!(&i32_values("tile_rows")?[..2], [0, 1]);
+        assert_eq!(i32_values("page_table")?, [2, 0, 0, 3]);
+        let stride = cache.layout.sequence_bytes/4096;
+        assert_eq!(values("ring_slots")?, [stride as i64+63, 65, 66, 67]);
         let packed = PackedLayerUnit { unit: &unit, cache: &cache, layer: 1, members: &members,
             uploads: std::cell::RefCell::new(&mut uploads) };
         assert_eq!(packed.buffer("partial")?.ptr, unit.buffer("partial")?.ptr);

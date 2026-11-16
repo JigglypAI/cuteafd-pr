@@ -74,9 +74,9 @@ impl UnitLayout {
         Ok(layout)
     }
 
-    /// Exact pinned source schedule for one unit's full layer walk. Each
-    /// segment uploads five i64 row tables and one i32 start table twice per
-    /// layer (attention and MLP lag join). Only global layers upload page IDs.
+    /// Exact bounded source schedule for one unit's full layer walk: five
+    /// packed i64 planes plus starts, table selectors and CTA starts. The
+    /// second allowance covers deferred MLP joins; global tables are one bank.
     pub fn upload_shape(&self, cfg: &Inkling2Config, members: usize) -> Result<crate::shared::token_table::UploadShape> {
         ensure!(members > 0 && members <= self.rows, "Inkling upload member count outside unit");
         let mut shape = crate::shared::token_table::UploadShape::default();
