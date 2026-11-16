@@ -152,18 +152,20 @@ fn options(args: &PlanArgs) -> Result<PlanOptions, PlanError> {
                 option: "Spark memory inventory", reason: error.to_string() };
             layout.spark_rank_bytes = if let Some(samples) = &args.spark_memory_samples {
                 cuteafd_loader::serving_capacity::spark_memory::sample_bytes(samples).map_err(invalid)?
-            } else if !args.deployment_peers.is_empty() {
-                args.deployment_peers.iter().take(args.spark_ranks.unwrap_or(args.available_sparks))
-                    .map(|peer| cuteafd_loader::serving_capacity::spark_memory::measured_bytes(peer))
-                    .collect::<anyhow::Result<Vec<_>>>().map_err(invalid)?
             } else {
                 let cfg = launch_config(args.config.as_deref()).map_err(invalid)?;
                 let hosts = configured_spark_hosts(&cfg);
-                if hosts.is_empty() || hosts.iter().any(|host| host.starts_with("REPLACE-ME")) {
+                if hosts.iter().any(|host| host.starts_with("REPLACE-ME")) {
                     cuteafd_loader::serving_capacity::spark_memory::serving_bytes()
-                } else {
+                } else if !hosts.is_empty() {
                     hosts.iter().map(|host| cuteafd_loader::serving_capacity::spark_memory::measured_bytes(host))
                         .collect::<anyhow::Result<Vec<_>>>().map_err(invalid)?
+                } else if !args.deployment_peers.is_empty() {
+                    args.deployment_peers.iter().take(args.spark_ranks.unwrap_or(args.available_sparks))
+                        .map(|peer| cuteafd_loader::serving_capacity::spark_memory::measured_bytes(peer))
+                        .collect::<anyhow::Result<Vec<_>>>().map_err(invalid)?
+                } else {
+                    cuteafd_loader::serving_capacity::spark_memory::serving_bytes()
                 }
             };
         }
@@ -2559,6 +2561,7 @@ mod tests {
         let mut request = args(std::path::Path::new("/not-read"), 2, false);
         request.memory.spark_memory_cap = None;
         request.config = Some(config.clone());
+        request.deployment_peers = vec!["192.0.2.1:19441".into(), "192.0.2.2:19441".into()];
         std::fs::write(&config, "SPARK_0_HOST=rhea\nSPARK_1_HOST=ostrich\n").unwrap();
         let layout = options(&request).unwrap().layout.unwrap();
         assert_eq!(layout.spark_capacity(0), cuteafd_loader::serving_capacity::spark_memory::measured_bytes("rhea").unwrap());

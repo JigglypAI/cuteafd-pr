@@ -62,6 +62,7 @@ RTX_EXPERT_LAYERS=auto
 HOST_CACHE_BYTES=auto
 KV_POOL_SIZE=
 memory_policy_args=()
+spark_memory_samples=
 v41_weight_budget_gib=95.5
 spark_memory_args=()
 SPECULATOR=dspark
