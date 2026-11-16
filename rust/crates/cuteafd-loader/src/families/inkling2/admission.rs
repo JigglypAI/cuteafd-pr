@@ -56,7 +56,7 @@ pub struct FactsRequest<'a> {
     pub catalog: &'a crate::OfficialV41Catalog,
     pub cfg: &'a Inkling2Config,
     pub kv_format: super::InklingKvCache,
-    pub drafter: Option<&'a super::draft::DraftLayout>,
+    pub drafter: Option<super::draft::Selection>,
     pub manifest_path: Option<&'a Path>,
     pub manifest: Option<Arc<serde_json::Value>>,
     pub coordinator: Coordinator,
@@ -263,11 +263,17 @@ pub fn gather(request: &FactsRequest<'_>) -> Result<InklingInputs, Refused> {
     let mark_bytes = (0..cfg.layers).map(|layer| shared::SequenceState::new(cfg, cfg.local[layer])
         .map(|state| state.ring_bytes + state.lag_bytes)).sum::<Result<u64, _>>()
         .map_err(|error| refused(format!("Inkling 2 sequence state refused: {error}"), "Check the window geometry."))?;
+    let draft_mark = request.drafter.map(|selection| {
+        let view=request.checkpoint.view.as_ref().context("bundled drafter needs selected checkpoint view")?;
+        let config=crate::formats::block_dspark::recurrent::RecurrentBlockConfig::from_hf(&view.config()?)?;
+        config.window_mark_bytes(selection.kv_cache,gpus-1,gpus,gpus-1)
+    }).transpose().map_err(|error|refused(format!("drafter mark inventory refused: {error:#}"),"Check bundled MTP config."))?.unwrap_or(0) as u64;
     let host_prefix = if request.host_cache_bytes == Some(0) || request.prefix_entries == 0 {
         serving::HostPrefixOwners { quota_bytes: 0, chunk_bytes: 0 }
     } else {
         let geometry = cuteafd_core::prefix::HostCacheGeometry { unit_rows: page_rows,
-            page_bytes: page_bytes * page_rows / shared::PAGE_ROWS, mark_bytes, draft_bytes: 0 };
+            page_bytes: page_bytes * page_rows / shared::PAGE_ROWS, mark_bytes:mark_bytes+draft_mark,
+                draft_bytes:request.drafter.map_or(0,|selection|64*2*selection.kv_cache.plane_record_bytes(cfg.kv_heads,cfg.head_dim) as u64) };
         let quota = geometry.resolve(request.host_cache_bytes, context, request.sequences, host_total,
             geometry.chunk_bytes()).unwrap_or(0);
         serving::HostPrefixOwners { quota_bytes: quota, chunk_bytes: geometry.chunk_bytes().min(quota.max(1)) }
@@ -292,12 +298,21 @@ pub fn gather(request: &FactsRequest<'_>) -> Result<InklingInputs, Refused> {
     let physical = (0..gpus).map(|gpu| request.coordinator.physical(gpu)).collect::<Vec<_>>();
     let maximum_pool_tokens = crate::placement::PoolPolicy::resolve(&physical, context, request.pool_tokens,
         page_rows).maximum_tokens();
+    let drafter=request.drafter.map(|selection| {
+        let view=request.checkpoint.view.as_ref().context("bundled drafter needs selected checkpoint view")?;
+        let marks=cuteafd_core::prefix::mark_slots_with_host(request.sequences,request.prefix_entries,
+            mark_bytes+draft_mark,request.prefix_mark_budget,host_prefix.quota_bytes>0) as usize;
+        super::draft::DraftLayout::new(view,gpus,usize::try_from(request.sequences)?,
+            usize::try_from(request.sequences)?.min(8),usize::try_from(context)?,usize::try_from(maximum_pool_tokens)?,
+            usize::try_from(shape.rows)?,usize::try_from(shape.waves)?,selection.sms,selection.kv_cache,marks)
+            .map(|layout|shared::Drafter{layout})
+    }).transpose().map_err(|error|refused(format!("bundled drafter inventory refused: {error:#}"),"Check MTP tensor headers and exports."))?;
     Ok(InklingInputs { cfg: cfg.clone(), kv_format: request.kv_format, gpus, spark_ranks: ranks,
         context: Context::resolve(context, (request.context_tokens > 0).then_some(request.context_tokens)),
         maximum_pool_tokens, prefill: shape, sequences: request.sequences, prefix_entries: request.prefix_entries,
         prefix_mark_budget: request.prefix_mark_budget, targets, placement, modes,
         routed: routed.clone(), experts, local, spark, links,
-        spark_reply_formats: request.replies, drafter: request.drafter.cloned().map(|layout| shared::Drafter { layout }), vision: None, budgets, code, graph_reserve,
+        spark_reply_formats: request.replies, drafter, vision: None, budgets, code, graph_reserve,
         head: request.head, host_prefix, device_sampling: true,
         expert_usage: request.expert_usage.then(|| cuteafd_core::expert_usage::Geometry { layers: cfg.layers,
             experts: cfg.experts, topk: cfg.topk, routed_layers: routed }),

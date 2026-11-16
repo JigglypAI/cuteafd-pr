@@ -4,6 +4,9 @@ use crate::{formats::block_dspark::recurrent::{loading::{RecurrentSource,Recurre
     plan::checkpoint::CheckpointView};
 use anyhow::{ensure,Context,Result};
 
+#[derive(Debug,Clone,Copy)]
+pub struct Selection {pub kv_cache:Qwen4KvCache,pub sms:usize}
+
 #[derive(Debug,Clone)]
 pub struct DraftLayout {
     pub config:RecurrentBlockConfig,
