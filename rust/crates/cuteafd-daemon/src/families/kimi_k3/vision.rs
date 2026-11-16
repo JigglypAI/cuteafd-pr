@@ -169,6 +169,46 @@ mod tests {
         assert_eq!(INV_FREQ_BITS[25], 0x3a44948d);
     }
     #[test]
+    fn header_fixture_builds_complete_one_arena_descriptor() -> Result<()> {
+        use std::io::Write;
+        let cfg = serde_json::json!({"model_type":"kimi_k3","text_config":{"hidden_size":7168},"vision_config":{
+            "vt_hidden_size":1024,"vt_num_hidden_layers":27,"vt_num_attention_heads":12,"qkv_hidden_size":1536,
+            "vt_intermediate_size":4096,"patch_size":14,"init_pos_emb_height":64,"init_pos_emb_width":64,
+            "init_pos_emb_time":4,"mm_hidden_size":1024,"text_hidden_size":7168,"activation_func":"gelu_pytorch_tanh",
+            "norm_type":"rmsnorm","mlp_type":"mlp2","pos_emb_type":"divided_fixed","pos_emb_interpolation_mode":"bilinear",
+            "merge_type":"sd2_tpool","mm_projector_type":"patchmergerv2","projector_hidden_act":"gelu",
+            "attn_bias":false,"linear_bias":false,"patch_embed_proj_bias":false,"merge_kernel_size":[2,2],"projector_ln_eps":1e-5}});
+        let g = VisionContract::from_config(&cfg)?;
+        let dir = tempfile::tempdir()?;
+        std::fs::write(dir.path().join("config.json"), serde_json::to_vec(&cfg)?)?;
+        let mut header = serde_json::Map::new();
+        let mut end = 0u64;
+        for (name, shape) in g.tensor_shapes() {
+            let bytes = shape.iter().product::<usize>() as u64 * 2;
+            header.insert(
+                name,
+                serde_json::json!({"dtype":"BF16","shape":shape,"data_offsets":[end,end+bytes]}),
+            );
+            end += bytes;
+        }
+        let header = serde_json::to_vec(&header)?;
+        let mut file = std::fs::File::create(dir.path().join("model.safetensors"))?;
+        file.write_all(&(header.len() as u64).to_le_bytes())?;
+        file.write_all(&header)?;
+        file.set_len(8 + header.len() as u64 + end)?;
+        let spec = tower(dir.path(), 16384)?;
+        assert_eq!(spec.native.weight_bytes, 894_718_080);
+        assert_eq!(spec.native.blocks.len(), 27);
+        let extension = spec.native.tower.as_ref().unwrap();
+        assert_eq!(extension.inv_freq[1], extension.inv_freq[2]);
+        assert_eq!(extension.attention_width, 1536);
+        assert_eq!(extension.final_norm.epsilon, TOWER_RMS_EPS);
+        assert_eq!(spec.constant_regions().len(), 1);
+        assert_eq!(spec.constant_regions()[0].bytes.len(), 128);
+        extension.validate(&spec.native)?;
+        Ok(())
+    }
+    #[test]
     fn capacity_is_bounded_before_touching_checkpoint() {
         for capacity in [0, 16385] {
             assert!(tower(Path::new("absent"), capacity).is_err());
