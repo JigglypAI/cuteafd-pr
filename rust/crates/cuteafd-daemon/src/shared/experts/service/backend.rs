@@ -210,12 +210,50 @@ impl<'a> Weights<'a> {
         modules: &mut super::modules::WarmModules<'a>,
         epilogue: Exl3Epilogue,
     ) -> Result<Execution<'_, 'a>> {
+        let staged = match self { Self::Full(weights) => weights.first().is_some_and(|weight| !weight.is_nvfp4()),
+            Self::Exlr8(_) => true, _ => false };
+        let remaining = if staged {
+            let geometry = cuteafd_core::expert_geometry();
+            let waves = match self {
+                Self::Full(weights) => {
+                    let info = weights.first().context("native weights empty")?.layer.select_info(library, compiled, false)?;
+                    cuteafd_loader::serving_capacity::spark_waves::staging_for_input(extent, geometry,
+                        info.input_row_bytes()?.try_into()?)?
+                }
+                _ => cuteafd_loader::serving_capacity::spark_waves::staging(extent, geometry)?,
+            };
+            // `remaining` is device_budget minus resident weight arena (and
+            // retained EXLR8 host descriptors), NOT minus admitted workspace.
+            // Reserve future wave allocations here; local.rs later subtracts
+            // their measured physical allocations exactly once from its FIFO budget.
+            let segments = match self {
+                Self::Full(weights) if extent.segment_rows().is_some() => {
+                    let path = config.library.parent().context("native library directory")?.join("../share/PROGRAMS.json");
+                    let manifest = serde_json::from_reader(std::fs::File::open(path)?)?;
+                    let widths = weights.iter().map(|weight| weight.layer.native_shard().map(|shard| shard.width))
+                        .collect::<Result<Vec<_>>>()?;
+                    cuteafd_loader::serving_capacity::spark_waves::native_scratch(&manifest, extent, geometry, widths)?
+                }
+                Self::Exlr8(weights) if extent.segment_rows().is_some() && extent.staging_rows > 64 => {
+                    let path = config.library.parent().context("EXLR8 library directory")?.join("../share/PROGRAMS.json");
+                    let manifest = serde_json::from_reader(std::fs::File::open(path)?)?;
+                    let units = weights.iter().map(|weight| weight.layout.compact_unit_limit()).max().context("EXLR8 weights empty")?;
+                    cuteafd_loader::serving_capacity::spark_waves::exlr8_scratch(&manifest, extent, geometry, units,
+                        config.exlr8_prefill_activations)?
+                }
+                _ => 0,
+            };
+            remaining.checked_sub(usize::try_from(waves.plane_bytes + waves.table_bytes + segments)?)
+                .context("staged input plane, tables and merged arena exceed device budget")?
+        } else { remaining };
         Ok(match self {
             Self::Exlr8(weights) => Execution::Exlr8(super::exlr8::Worker::new(library,
                 modules.exlr8()?, weights, config, remaining)?),
             Self::Full(weights) => {
                 let mut execution = ExpertWeights::execution_layers(weights, compiled, config.capacity, remaining)?;
                 execution.install_worker_timing(config.rank)?;
+                execution.prepare_segments(&config.library.parent().context("native library directory")?.join("../share/PROGRAMS.json"),
+                    extent, weights.iter().map(|weight| weight.layer.native_shard().map(|shard| shard.width)).collect::<Result<Vec<_>>>()?.into_iter())?;
                 Execution::Full(execution)
             }
             Self::Exl3(weights) => {
@@ -380,7 +418,9 @@ impl<'w, 'a> Execution<'w, 'a> {
     pub(super) fn prepare_waves(&mut self, extent: cuteafd_core::OwnerExtent) -> Result<()> {
         match self {
             Self::Exl3(execution) => execution.prepare_waves(extent),
-            Self::Fp8(_) | Self::Full(_) | Self::Exlr8(_) => Ok(()),
+            Self::Full(execution) => execution.prepare_waves(extent),
+            Self::Exlr8(execution) => execution.prepare_waves(extent),
+            Self::Fp8(_) => Ok(()),
         }
     }
 
@@ -392,14 +432,16 @@ impl<'w, 'a> Execution<'w, 'a> {
                 Ok(())
             }
             Self::Exl3(execution) => execution.flush_staged(),
-            Self::Full(_) | Self::Exlr8(_) => Ok(()),
+            Self::Full(execution) => execution.flush_staged(),
+            Self::Exlr8(execution) => execution.flush_staged(),
         }
     }
     pub(super) fn has_staged(&self) -> bool {
         match self {
             Self::Fp8(groups) => groups.workers.iter().any(|worker| worker.has_staged()),
             Self::Exl3(execution) => execution.has_staged(),
-            Self::Full(_) | Self::Exlr8(_) => false,
+            Self::Full(execution) => execution.has_staged(),
+            Self::Exlr8(execution) => execution.has_staged(),
         }
     }
     pub(super) fn cancel_staged(&mut self, input_address: usize) -> Result<bool> {
@@ -416,7 +458,8 @@ impl<'w, 'a> Execution<'w, 'a> {
                 Ok(false)
             }
             Self::Exl3(execution) => execution.cancel_staged(input_address),
-            Self::Full(_) | Self::Exlr8(_) => Ok(false),
+            Self::Full(execution) => execution.cancel_staged(input_address),
+            Self::Exlr8(execution) => execution.cancel_staged(input_address),
         }
     }
 

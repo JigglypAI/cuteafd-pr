@@ -7,6 +7,16 @@ use crate::placement::AttentionPlacement;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 
+fn plan_spark_count(snapshot: &std::path::Path, options: &PlanOptions, available: usize,
+    explicit: Option<usize>) -> Result<PlanReport, PlanError> {
+    let mut options = options.clone();
+    if let Some(layout) = &mut options.layout {
+        let manifest = snapshot.join("share/PROGRAMS.json");
+        if layout.workspace_manifest.is_none() && manifest.is_file() { layout.workspace_manifest = Some(manifest); }
+    }
+    super::plan_spark_count(snapshot, &options, available, explicit)
+}
+
 #[test]
 fn solved_phase_ledger_preserves_chronology_and_renders_each_physical_peak() {
     use crate::placement::planner::{self, Allocation, Allowance, Baseline, Budget, Contract,
@@ -719,7 +729,12 @@ fn check_concurrency_plan_cell(
     c: u64,
     options: &PlanOptions,
 ) -> PlanReport {
-    let (report, phases) = input.plan_with_timings(options);
+    let mut options = options.clone();
+    if let Some(layout) = &mut options.layout {
+        let manifest = input.checkpoint().snapshot.join("share/PROGRAMS.json");
+        if layout.workspace_manifest.is_none() && manifest.is_file() { layout.workspace_manifest = Some(manifest); }
+    }
+    let (report, phases) = input.plan_with_timings(&options);
     assert!(phases.total() < std::time::Duration::from_secs(10),
         "{label} C{c} GPUs={gpus} Sparks={ranks}: {phases:?}");
     let report = report.unwrap();
@@ -1027,7 +1042,8 @@ fn wave_plan_options(path: &Path, ranks: usize) -> PlanOptions {
         rtx_bytes: vec![crate::placement::inventory::PRO_TOTAL_BYTES], context_tokens: 32768, pool_tokens: Some(32768),
         prefix_slots: Some(0), host_cache_bytes: Some(0),
         host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram),
-        workspace_manifest: Some(path.join("absent.json")),
+        workspace_manifest: Some(if path.join("share/PROGRAMS.json").is_file() {
+            path.join("share/PROGRAMS.json") } else { path.join("absent.json") }),
         glm5_drafter_disabled: true, glmf_drafter_disabled: true,
         ..Default::default()
     }), attention_placement: Some(AttentionPlacement::Heads), ..sparks(ranks) }
@@ -6873,4 +6889,23 @@ fn unreadable_quantization_metadata_does_not_fit() {
     assert!(!report.fits);
     assert!(report.memory_layout.is_none());
     assert!(!report.executable());
+}
+
+
+#[test]
+fn missing_native_wave_program_is_a_named_unsupported_result() {
+    let dir = v4_snapshot();
+    let manifest = dir.path().join("missing-wave.json");
+    std::fs::write(&manifest, json!({"programs":[]}).to_string()).unwrap();
+    let options = PlanOptions { layout: Some(layout::LayoutOptions {
+        host_memory: Some(SimulatedHost::raptor().host_ram),
+        workspace_manifest: Some(manifest), rtx_bytes: vec![crate::placement::inventory::PRO_TOTAL_BYTES],
+        onboard: Some(crate::placement::OnboardSetting::Layers(0)),
+        context_tokens: 32768, pool_tokens: Some(32768), ..Default::default()
+    }), ..sparks(2) };
+    let report = plan_spark_count(dir.path(), &options, 2, Some(2)).unwrap();
+    assert!(!report.wip_launchable());
+    let reasons = report.hints.iter().map(|h| h.what.as_str()).collect::<Vec<_>>().join("; ");
+    assert!(reasons.contains("missing native_experts_dsv4f_w1024_segments in PROGRAMS.json; republish placement inputs"), "{reasons}");
+    assert!(!reasons.contains("checkpoint tensors or required package artifacts unavailable"), "{reasons}");
 }

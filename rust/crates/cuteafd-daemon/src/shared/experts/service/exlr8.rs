@@ -66,6 +66,14 @@ pub(super) struct Worker<'w, 'a> {
     /// The queued mapped request's identity, for its timing at completion.
     pending: super::super::execution::timing::PendingUnits<'a>,
     route_staging: super::routes::RouteStaging<'a>,
+    waves: Option<super::super::execution::waves::WaveStaging<'a>>,
+    staged_plane: Option<crate::shared::memory::DeviceAllocation<'a>>,
+    segments: Option<Exlr8Execution<'a>>,
+    programs: &'a Programs<'a>,
+    family: KernelFamily,
+    unit_limit: usize,
+    activations: crate::shared::experts::exlr8::Exlr8PrefillActivations,
+    timing_units: std::collections::VecDeque<bool>,
 }
 
 pub(super) fn load<'a>(library: &'a NativeLibrary, catalog: &OfficialV41Catalog,
@@ -90,10 +98,10 @@ pub(super) fn load<'a>(library: &'a NativeLibrary, catalog: &OfficialV41Catalog,
     let unit_limit = plans.iter().map(Residency::compact_unit_limit).max().context("EXLR8 has no resident plans")?;
     let info = library.cuda_device_info(library.cuda_get_device()?)?;
     let capability = (info.compute_capability_major, info.compute_capability_minor);
-    let owners = spark_execution_workspace(config, |capacity, _, staging_rows, _| {
-        Ok((execution_bytes(programs, family, capacity as usize, unit_limit, capability,
-            config.exlr8_prefill_activations)?, 0,
-            staging_rows as usize * catalog.routed_experts().geometry()?.topk as usize * 8))
+    let owners = spark_execution_workspace(config, |_, _, _, extent| {
+        let owner = cuteafd_loader::serving_capacity::spark_waves::exlr8_owner_from_specs(
+            |name| Ok(programs.spec(name)?.clone()), extent, geometry, unit_limit, config.exlr8_prefill_activations)?;
+        Ok((owner.scratch.try_into()?, owner.io.try_into()?, owner.pinned_staging.try_into()?))
     })?;
     let k1_workspace_bytes = usize::try_from(owners.total().context("EXLR8 owner workspace overflow")?)?;
     // Blocking fallback uploads share the native library's one pinned cache;
@@ -188,10 +196,83 @@ impl<'w, 'a> Worker<'w, 'a> {
             selected: 0, capacity: config.capacity as usize,
             executor_id: config.spark_world()?.topology().executor_id(config.rank)?, timing,
             deferred: false, pending: super::super::execution::timing::PendingUnits::new(library, 1)?,
-            route_staging: super::routes::RouteStaging::new(library, 1, capacity)? })
+            route_staging: super::routes::RouteStaging::new(library, 1, capacity)?,
+            waves: None, staged_plane: None, timing_units: Default::default(), segments: None,
+            programs, family, unit_limit, activations: config.exlr8_prefill_activations })
+    }
+    pub(super) fn prepare_waves(&mut self, extent: cuteafd_core::OwnerExtent) -> Result<()> {
+        let geometry = cuteafd_core::expert_geometry();
+        let row = geometry.hidden * 33 / 32;
+        let layout = cuteafd_loader::serving_capacity::spark_waves::staging_for_input(extent, geometry, row)?;
+        if layout.rows == 0 { return Ok(()); }
+        if let Some(rows) = extent.segment_rows().filter(|_| extent.staging_rows > K1_ROWS as u32) {
+            self.segments = Some(Exlr8Execution::new_segments(self.library, self.programs, self.family,
+                rows as usize, usize::MAX, self.unit_limit, self.activations)?);
+        }
+        let plane = crate::shared::memory::DeviceAllocation::new(self.library, layout.plane_bytes.try_into()?,
+            crate::shared::memory::Tag::workspace("experts/workspace/staged_units"))?;
+        self.waves = super::super::execution::waves::WaveStaging::with_max_units(self.library, extent,
+            plane.buffer, row as usize, 1, cuteafd_core::spark_executions::MAX_MERGED_UNITS)?;
+        self.staged_plane = Some(plane);
+        self.timing_units = std::collections::VecDeque::with_capacity(extent.buffered_units as usize);
+        Ok(())
+    }
+    pub(super) fn has_staged(&self) -> bool {
+        self.waves.as_ref().is_some_and(super::super::execution::waves::WaveStaging::has_staged)
+    }
+    pub(super) fn flush_staged(&mut self) -> Result<()> {
+        self.dispatch_waves(None)?;
+        Ok(())
+    }
+    pub(super) fn cancel_staged(&mut self, address: usize) -> Result<bool> {
+        match &mut self.waves { Some(waves) => waves.cancel(&mut self.pending, address), None => Ok(false) }
+    }
+    fn stage(&mut self, request: &BackboneRequest<'_>, input: CuteafdDeviceBuffer,
+        output: CuteafdDeviceBuffer, executor_id: u64) -> Result<bool> {
+        use super::super::execution::waves::{Arrival, Bypass};
+        if self.waves.is_none() { return Ok(false); }
+        let bypass = if request.partial_plan()?.is_some() { Some(Bypass::PartialReply) }
+            else if request.output_dtype() != ExpertV2Dtype::Bf16 { Some(Bypass::CompressedReply) } else { None };
+        if let Some(reason) = bypass {
+            self.flush_staged()?;
+            self.waves.as_mut().unwrap().bypass(request.rows(), reason);
+            return Ok(false);
+        }
+        self.dispatch_waves(Some(Arrival { request, input, output, layer: self.selected, executor_id }))
+    }
+    fn dispatch_waves(&mut self, arrival: Option<super::super::execution::waves::Arrival<'_, '_>>) -> Result<bool> {
+        let Some(waves) = &mut self.waves else { return Ok(false); };
+        let (library, weights, stream, timing, timing_units, segments) = (self.library, &self.weights[self.selected],
+            self.stream.raw, &self.timing, &mut self.timing_units, &self.segments);
+        let (prefill, grouped, decode, grouped_from) = (&self.prefill, &self.grouped_decode, &self.execution, self.grouped_from_row);
+        let mut launch = |wave: &super::super::execution::waves::Wave<'_>| -> Result<()> {
+            // SAFETY: staged views, arena, weights and registered replies outlive every member fence.
+            unsafe {
+                if let Some(timing) = timing { timing.record(0, stream)?; }
+                if wave.segmented {
+                    segments.as_ref().context("EXLR8 merged arena missing")?.run_segments(weights, wave, stream)?;
+                } else {
+                    let execution = if wave.rows > K1_ROWS { prefill.as_ref().context("missing EXLR8 prefill arena")? }
+                        else if wave.rows >= grouped_from { grouped.as_ref().context("missing EXLR8 grouped arena")? } else { decode };
+                    execution.run_staged(weights, wave.rows, [wave.input, wave.ids, wave.weights], stream)?;
+                    library_copy(library, wave.output, execution.output()?, wave.rows * cuteafd_core::expert_geometry().hidden as usize * 2, stream)?;
+                }
+                if let Some(timing) = timing { timing.record(1, stream)?; }
+            }
+            timing_units.extend((0..wave.members.len()).map(|index| index == 0));
+            Ok(())
+        };
+        if let Some(arrival) = arrival {
+            let merge = arrival.request.rows() as usize > K1_ROWS && segments.is_some();
+            waves.stage_with_merge(arrival, &mut self.pending, &mut self.route_staging, stream, &mut launch, merge)
+        } else {
+            waves.flush(&mut self.pending, &self.route_staging, stream, &mut launch)?;
+            Ok(false)
+        }
     }
     pub(super) fn bind_layer(&mut self, index: usize) -> Result<()> {
         ensure!(index < self.weights.len(), "EXLR8 requested layer is not resident");
+        if self.selected != index { self.flush_staged()?; }
         self.selected = index;
         Ok(())
     }
@@ -217,6 +298,11 @@ impl<'w, 'a> Worker<'w, 'a> {
         let output_stride = geometry.hidden as usize * 2;
         let topk = geometry.topk as usize;
         let rows = request.rows() as usize;
+        if self.deferred {
+            if let (Some(mapped), Some(output)) = (mapped, destination) {
+                if self.stage(request, mapped.hidden_payload, output, executor_id)? { return Ok(()); }
+            }
+        }
         let stage = self.pending.next_slot()?;
         let identity = (request.request_id(), request.layer(), rows as u32, executor_id);
         let compressed = request.output_dtype() != ExpertV2Dtype::Bf16;
@@ -286,6 +372,7 @@ impl<'w, 'a> Worker<'w, 'a> {
         }
         // SAFETY: every mapped copy and output write precedes this unit fence.
         unsafe { self.pending.record(identity, self.stream.raw)?; }
+        if self.waves.is_some() { self.timing_units.push_back(true); }
         if !self.deferred {
             // SAFETY: this worker exclusively owns the stream and every queued view.
             unsafe { self.library.cuda_stream_synchronize(self.stream.raw)?; }
@@ -375,7 +462,8 @@ impl<'w, 'a> Worker<'w, 'a> {
     /// The queued request finished (its stream drained): publish its timing.
     pub(super) fn complete(&mut self) -> Result<Option<super::super::execution::timing::UnitPace>> {
         let Some(((request_id, layer, rows, executor_id), pace)) = self.pending.pop()? else { return Ok(None) };
-        if let Some(timing) = &mut self.timing {
+        let publish = if self.waves.is_some() { self.timing_units.pop_front().context("missing EXLR8 wave timing identity")? } else { true };
+        if let Some(timing) = self.timing.as_mut().filter(|_| publish) {
             // SAFETY: the caller observed this stream drained after both records.
             unsafe { timing.publish(request_id, layer, rows, executor_id, "exlr8")?; }
         }
@@ -470,7 +558,7 @@ mod tests {
         let source = include_str!("exlr8.rs").split("#[cfg(test)]").next().unwrap();
         let sync = ["cuda_stream_", "synchronize("].concat();
         let execute = &source[source.find("fn execute(&mut self").unwrap()..source.find("fn execute_host(").unwrap()];
-        let chunk_loop = &execute[execute.find("for (first, rows) in chunks(").unwrap()..execute.find("Ok(())").unwrap()];
+        let chunk_loop = execute.split("for (first, rows) in chunks(").nth(1).unwrap().split("Ok(())").next().unwrap();
         assert!(!chunk_loop.contains(&sync), "no drain between mapped chunks");
         assert!(!chunk_loop.contains("copy_h2d(") && !chunk_loop.contains("copy_d2h("), "mapped chunks only queue stream copies");
         let after = &execute[execute.find("self.pending.record(identity,").unwrap()..];

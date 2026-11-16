@@ -189,7 +189,7 @@ fn load_weights<'a>(
     );
     // The workspace is planned from the same layer selection as the load, so a
     // TP2/TP3 topology cannot be budgeted with TP4 scratch.
-    let workspace = spark_execution_workspace(config, |live, compiled, staging_rows, _| {
+    let workspace = spark_execution_workspace(config, |live, compiled, staging_rows, extent| {
         let selections = layers.iter().map(|&layer| config.selection(layer)).collect::<Result<Vec<_>>>()?;
         let budget = ExpertWeights::plan_execution_layers(selections, library, compiled, live, nvfp4)?;
         let device = budget.total()?;
@@ -198,7 +198,21 @@ fn load_weights<'a>(
             .context("native Spark scratch overflow")?;
         let staging = (staging_rows as usize).checked_mul(cuteafd_core::expert_geometry().topk as usize * 8)
             .context("native Spark route staging overflow")?;
-        Ok((scratch, device - scratch, staging))
+        let geometry = cuteafd_core::expert_geometry();
+        let waves = if nvfp4 { Default::default() } else {
+            let info = config.selection(layers[0])?.select_info(library, compiled, false)?;
+            cuteafd_loader::serving_capacity::spark_waves::staging_for_input(extent, geometry,
+                info.input_row_bytes()?.try_into()?)?
+        };
+        let segments = if !nvfp4 && extent.segment_rows().is_some() {
+            let path = config.library.parent().context("native library directory")?.join("../share/PROGRAMS.json");
+            let manifest = serde_json::from_reader(std::fs::File::open(path)?)?;
+            let widths = layers.iter().map(|&layer| config.selection(layer)?.native_shard().map(|shard| shard.width))
+                .collect::<Result<Vec<_>>>()?;
+            cuteafd_loader::serving_capacity::spark_waves::native_scratch(&manifest, extent, geometry, widths)?
+        } else { 0 };
+        Ok((scratch + usize::try_from(segments)?, device - scratch + usize::try_from(waves.plane_bytes + waves.table_bytes)?,
+            staging + usize::try_from(waves.pinned_per_unit)?))
     })?;
     let workspace = usize::try_from(workspace.total().context("native Spark workspace overflow")?)?;
     ensure!(

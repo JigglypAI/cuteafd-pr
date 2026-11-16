@@ -18,7 +18,7 @@ use super::format::{
 pub mod residency;
 pub mod dense;
 pub mod native;
-mod workspace;
+pub(crate) mod workspace;
 pub use workspace::{execution_workspace_from_manifest, execution_workspace, routed_workspace, shared_execution_workspace, shared_workspace, ExecutionVariant, ExecutionWorkspace};
 
 /// Native selection is distinct from the ordinary GLM launch description.
@@ -124,6 +124,27 @@ fn native_options(selected: &str, options: &super::PlanOptions, speculator: &str
             "Flash EXLR8 {attention} attention requires two RTX GPUs");
     }
     Ok((world, gpu_count, attention, layout))
+}
+
+/// Candidate-local Spark costs consumed by both native solvers. Weights are
+/// suffix-dependent; execution arenas are charged only while a rank is used.
+pub(crate) fn spark_candidate_bytes(metadata: &residency::MetadataInput, programs: &Value,
+    geometry: cuteafd_core::ExpertGeometry, executions: &cuteafd_core::SparkExecutions,
+    world: usize, layers: &[usize], activations: PrefillActivations) -> Result<Vec<Vec<u64>>> {
+    (0..=layers.len()).map(|count| {
+        (0..world).map(|rank| {
+            if count == layers.len() { return Ok(0); }
+            let facts = layers[count..].iter().map(|&layer| metadata.admission_geometry(layer, world, rank,
+                residency::ExpertSet::Routed)).collect::<std::result::Result<Vec<_>, _>>()?;
+            let weights = facts.iter().try_fold(0u64, |sum, (bytes, _)| sum.checked_add(*bytes as u64))
+                .context("EXLR8 candidate weight sum overflow")?;
+            let units = facts.iter().map(|(_, units)| *units).max().context("EXLR8 candidate has no layers")?;
+            weights.checked_add(crate::serving_capacity::spark_waves::exlr8_worker_bytes(programs, executions,
+                geometry, units, activations)?).and_then(|bytes| bytes.checked_add(
+                    cuteafd_core::memory_layout::spark_runtime_reserve_bytes(weights)?))
+                .context("EXLR8 candidate total overflow")
+        }).collect()
+    }).collect()
 }
 
 pub(super) fn native_plan_of(input: &super::PlanInput, selected: &str,
@@ -245,7 +266,7 @@ pub(super) fn native_plan_of(input: &super::PlanInput, selected: &str,
         spark_worlds: (1..=8).collect(), local: Ok(format!("{package} coordinator native experts")) });
     if adapter_ready {
         report.hints.push(super::Hint { what: "EXLR8 native runtime is WIP admitted, not quality-qualified".into(),
-            how: "Spark resident bytes are exact; K1 workspace/host staging and rings are checked by worker live admission before loading weights.".into() });
+            how: "Spark weights and K1/grouped/merged execution owners are admitted by the planner; worker live admission checks the same arena inventory.".into() });
     } else if let Err(error) = execution { report.hints.push(error.hint()); }
     report.placement = if selected_world == 0 { ExpertPlacement::Local }
         else { ExpertPlacement::Sparks { ranks: selected_world } };
@@ -259,7 +280,31 @@ pub(super) fn native_plan_of(input: &super::PlanInput, selected: &str,
                 | cuteafd_core::memory_layout::Category::Embedding | cuteafd_core::memory_layout::Category::Experts)).map(|i| i.bytes).sum())]);
     let mut memory = memory;
     append_spark_devices(&mut memory, layout, &residents)?;
+    if selected_world > 0 {
+        let executions = super::layout::spark_executions(input, family.id(), layout)?;
+        let geometry = input.expert_catalog()?.routed_experts().geometry()?;
+        for device in memory.devices.iter_mut().filter(|device| device.kind == cuteafd_core::memory_layout::DeviceKind::Spark) {
+            let rank = device.index as usize;
+            let units = (first_spark..layers).map(|layer| metadata.admission_geometry(layer, selected_world, rank,
+                residency::ExpertSet::Routed).map(|(_, units)| units)).collect::<std::result::Result<Vec<_>, _>>()?
+                .into_iter().max().unwrap_or(1);
+            let bytes = crate::serving_capacity::spark_waves::exlr8_worker_bytes(&programs, &executions,
+                geometry, units, layout.exlr8_prefill_activations)?;
+            device.items.retain(|item| item.group != "EXLR8 execution owners");
+            device.items.push(cuteafd_core::memory_layout::Item::new(cuteafd_core::memory_layout::Category::Workspace,
+                "EXLR8 execution owners", "K1/grouped/merged arenas, staged inputs, tables, pinned routes and fallback",
+                bytes, cuteafd_core::memory_layout::Basis::Exact));
+        }
+    }
     append_spark_encoder(&mut memory, report.encoder.as_ref())?;
+    for device in memory.devices.iter().filter(|device| device.kind == cuteafd_core::memory_layout::DeviceKind::Spark) {
+        let cap = device.capacity_bytes.min(device.worker_budget_bytes);
+        let used = device.used_bytes();
+        if used > cap {
+            report.refuse_placement(format!("EXLR8 spark{} weights + execution owners need {used} bytes, cap {cap}, shortfall {} bytes",
+                device.index, used - cap), "Increase Spark memory or onboard more layers; execution arenas must fit at plan time.");
+        }
+    }
     let context = if layout.context_tokens > 0 { layout.context_tokens } else {
         report.cache_requirements.as_ref().and_then(|cache| cache.checkpoint_max_context_tokens).unwrap_or(0) };
     let physical = layout.rtx_bytes.iter().map(|&bytes| crate::placement::CoordinatorCard::planned(
@@ -300,7 +345,7 @@ fn append_spark_devices(memory: &mut cuteafd_core::memory_layout::MemoryLayout,
     for (rank, &bytes) in residents.iter().enumerate() {
         if !memory.devices.iter().any(|device| device.kind == DeviceKind::Spark && device.index as usize == rank) {
             memory.devices.push(DeviceLayout { kind: DeviceKind::Spark, index: rank as u32,
-                capacity_bytes: layout.spark_bytes, worker_budget_bytes: layout.spark_bytes,
+                capacity_bytes: layout.spark_bytes, worker_budget_bytes: layout.spark_allocation_budget_bytes.unwrap_or(layout.spark_bytes),
                 items: Vec::new(), kv_tokens: 0 });
         }
         let device = memory.devices.iter_mut().find(|device|

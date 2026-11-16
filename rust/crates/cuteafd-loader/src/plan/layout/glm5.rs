@@ -725,18 +725,40 @@ pub(crate) fn native_layout_with_metadata(checkpoint: &Checkpoint, options: &Lay
         cuteafd_core::SparkIngress::Fp8K32, rings, options.spark_reply_formats)?;
     let host = super::recipe_host_memory(options)?;
     let budgets = production_budgets(&options.rtx_bytes.iter().map(|&n| (n, n)).collect::<Vec<_>>(),
-        crate::placement::reserve::gpu("glm5"), host, (8 << 30).max(host.0 / 10), &vec![options.spark_bytes; spark_ranks])?;
+        crate::placement::reserve::gpu("glm5"), host, (8 << 30).max(host.0 / 10), &vec![options.spark_allocation_budget_bytes.unwrap_or(options.spark_bytes); spark_ranks])?;
     let operation = Operation::Serving;
     let request = production_request(crate::placement::planner::Context::resolve(context, (options.context_tokens > 0).then_some(options.context_tokens)), options.pool_tokens, onboard, prefill, operation,
         crate::placement::ResidentWeights(options.weight_budget_bytes), options.spark_reply_formats);
-    let admitted = ProductionInput { expert_usage: options.expert_usage, cfg: &cfg, layers: cfg.layers, context, maximum_pool_tokens,
+    let mut prepared = ProductionInput { expert_usage: options.expert_usage, cfg: &cfg, layers: cfg.layers, context, maximum_pool_tokens,
         attention, gpus: gpu_count, prefill, blas_head: serving::BlasHead::Native, blas: vec![], target, draft, scratch, context_scratch: context_programs,
         exchange_element_bytes: if glm::local_exchange_f32()? { 4 } else { 2 }, peer_diagnostics: false,
         prefix_host: crate::families::glm5::host_prefix_enabled(gpu_count, attention,
             options.host_cache_bytes != Some(0), options.mimo_prefix_entries),
         local: source.as_ref().map(|source| (source, physical)), spark_ranks, decode_link, prefill_link,
         skip_routed_experts: false, operation, sync_upload_bytes: 0, owners: additional, budgets,
-    }.prepare()?.admit(request)?;
+    }.prepare()?;
+    if spark_ranks > 0 {
+        let executions = crate::plan::spark_executions::admit_family("glm5",
+            &crate::plan::spark_executions::SparkBackend::Exlr8.exports(), None,
+            options.prefill_unit_rows.unwrap_or(rows), options.prefill_waves)?;
+        let costs = crate::plan::exlr8::spark_candidate_bytes(metadata, &manifest, geometry, &executions,
+            spark_ranks, &(cfg.first_moe_layer..cfg.layers).collect::<Vec<_>>(), options.exlr8_prefill_activations)?;
+        for (count, ranks) in costs.iter().enumerate() {
+            let mut components = Vec::new();
+            for (rank, &bytes) in ranks.iter().enumerate().filter(|(_, bytes)| **bytes > 0) {
+                let owner = Allocation::buffer(format!("exlr8.spark{rank}.owners.count{count}"),
+                    Location { device: Device::Spark(rank as u8), domain: Domain::Managed }, bytes,
+                    Lifetime::RESIDENT, Category::Workspace, "EXLR8 Spark weights + execution owners");
+                components.push(Component::allocation(owner, ByteCurve::fixed(bytes, maximum_pages), false, maximum_pages));
+            }
+            if prepared.recipe.experts.as_ref().is_some_and(|profile| profile.counts.contains(&count)) {
+                prepared.recipe.owners.push(Case { when: vec![When::Onboard { first: count, last: count }], value: components });
+            } else if count == 0 {
+                prepared.recipe.owners.push(Case { when: vec![], value: components });
+            }
+        }
+    }
+    let admitted = prepared.admit(request)?;
     if let Some(report) = report {
         report.phase_ledger = Some(crate::plan::SolvedPhaseLedger::from(&admitted.solved));
         report.host_budget_bytes = prefix_quota;
@@ -776,6 +798,22 @@ mod tests {
             onboard: Some(crate::placement::OnboardSetting::Layers(0)),
             glm5_drafter_disabled: true, host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram),
             host_cache_bytes: Some(0), ..Default::default() }
+    }
+
+    #[test]
+    fn native_spark_solver_refuses_weights_that_fit_without_execution_arenas() {
+        use crate::plan::exlr8::residency::{MetadataInput, ExpertSet};
+        let dir = tempfile::tempdir().unwrap();
+        crate::plan::testing::exlr8::glm_admission_snapshot(dir.path());
+        let checkpoint = Checkpoint::open(dir.path()).unwrap();
+        let metadata = MetadataInput::open(dir.path(), "k4").unwrap();
+        let weights = (0..4).map(|rank| metadata.admission_geometry(1, 4, rank, ExpertSet::Routed).unwrap().0)
+            .max().unwrap() as u64;
+        let mut options = native_fixture_options(1);
+        options.spark_bytes = weights + 1;
+        let error = native_layout_with_metadata(&checkpoint, &options, 4,
+            &crate::plan::testing::exlr8::glm_admission_programs(), "k4", Some(&metadata), None, None).unwrap_err();
+        assert!(format!("{error:#}").contains("spark"), "{error:#}");
     }
 
     #[test]

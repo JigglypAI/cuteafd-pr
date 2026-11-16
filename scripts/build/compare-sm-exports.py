@@ -242,6 +242,15 @@ def jobs(scope):
                        f"ffn_gate_up_i{width}_comp" for width in (3072, 6144, 16896, 33792))]))
     result.append(("kimi-routing", "export_b12x_dsv4_aot.py",
                    ["--geometry", "kimik3", "--only", "router_scores,expert_input_quant"]))
+    # Match the shipping Context decode table, including its wide GLM Flash shape.
+    for geometry in ("flash", "pro", "glm", "glmf", "ml4", "kimik31"):
+        for rows in ((64, 128) if geometry == "glmf" else (64,)):
+            names = [f"index_topk_decode_m{rows}"]
+            if rows == 64:
+                names.append(f"scored_index_topk_decode_m{rows}")
+            result.append((f"dsa-decode-{geometry}-m{rows}", "export_b12x_dsv4_aot.py",
+                           ["--geometry", geometry, "--decode-rows", str(rows),
+                            "--max-context", "1048576", "--context-split", "on", "--only", ",".join(names)]))
     # Isolate callers of the shared contiguous prefill scorer for targeted changes.
     for geometry in ("flash", "pro", "glm", "glmf", "ml4", "kimik31", "minimax"):
         names = ["index_prefill"] if geometry == "minimax" else ["index_topk_prefill_m4096"]
@@ -325,6 +334,8 @@ def jobs(scope):
     result.append(("muse-tp-combine", "export_b12x_muse_aot.py", ["--group", "tp-combine"]))
     result.append(("expert-partial", "export_b12x_expert_partial_aot.py", []))
     result.append(("expert-reply", "export_b12x_dsv4_aot.py", ["--geometry", "expert_reply"]))
+    # The exporter derives every segment width from native_spark_artifacts.
+    result.append(("native-experts", "export_b12x_dsv4_aot.py", ["--geometry", "native_experts"]))
     result.append(("muse-k6-dense", "export_b12x_dsv4_aot.py",
                    ["--geometry", "dense_trellis_k6", "--dense-trellis-families", "muse"]))
     for role in ("rtx_backbone", "rtx_tp2", "dspark_tp2"):
@@ -771,6 +782,31 @@ def export_exl3_routes(extra, output):
             export(output / stem, rows, experts, topk, block)
 
 
+def comparison_job_args(exporter, extra, role):
+    if exporter == "package_exl3_aot.py":
+        return [*extra, "--role", role]
+    if (exporter == "export_b12x_dsv4_aot.py" and "--geometry" in extra
+            and extra[extra.index("--geometry") + 1] == "exlr8"):
+        return [*extra, "--exlr8-role", role]
+    return extra
+
+
+def worker_capability(payload):
+    extra = payload["args"]
+    native_spark = (payload["exporter"] == "export_b12x_slices_aot.py"
+                    and any(role.startswith("spark") for role in extra))
+    exl3_spark = payload["exporter"] == "package_exl3_aot.py" and (
+        "--compact-companions" in extra or
+        ("--role" in extra and extra[extra.index("--role") + 1] == "spark"))
+    routed_spark = (payload["exporter"] == "package_fp8_moe_aot.py" and "--role" in extra
+                    and extra[extra.index("--role") + 1] == "spark")
+    segment_spark = (payload["exporter"] == "export_b12x_dsv4_aot.py" and "--geometry" in extra
+                     and extra[extra.index("--geometry") + 1] in ("native_experts", "exlr8")
+                     and (payload.get("role") == "spark" or
+                          ("--exlr8-role" in extra and extra[extra.index("--exlr8-role") + 1] == "spark")))
+    return (12, 1) if native_spark or exl3_spark or routed_spark or segment_spark else (12, 0)
+
+
 def worker(payload):
     global PROGRAM_RECORDER, PROGRAM_PLANS
     output = Path(payload["output"])
@@ -785,14 +821,7 @@ def worker(payload):
     sys.path[:0] = [str(ROOT / "python/tools/lib"), str(ROOT / "python/tools/aot")]
     import _pinned_sparkinfer
     from b12x._lib.compile_pool import _initialize_worker
-    native_spark = (payload["exporter"] == "export_b12x_slices_aot.py"
-                    and any(role.startswith("spark") for role in payload["args"]))
-    exl3_spark = payload["exporter"] == "package_exl3_aot.py" and (
-        "--compact-companions" in payload["args"] or
-        ("--role" in payload["args"] and payload["args"][payload["args"].index("--role") + 1] == "spark"))
-    routed_spark = (payload["exporter"] == "package_fp8_moe_aot.py" and "--role" in payload["args"]
-                    and payload["args"][payload["args"].index("--role") + 1] == "spark")
-    capability = (12, 1) if native_spark or exl3_spark or routed_spark else (12, 0)
+    capability = worker_capability(payload)
     _initialize_worker(0, capability, "sm-export-comparison", "sm-export-comparison",
                        payload["sms"], 101376, 102400, multiprocessing.Array("i", [0, 0]))
     import torch
@@ -1265,8 +1294,7 @@ def main():
         if unknown:
             parser.error(f"unknown groups: {sorted(unknown)}")
         selected_jobs = [job for job in selected_jobs if job[0] in selected]
-    selected_jobs = [(name, exporter, [*extra, "--role", args.role]
-                      if exporter == "package_exl3_aot.py" else extra)
+    selected_jobs = [(name, exporter, comparison_job_args(exporter, extra, args.role))
                      for name, exporter, extra in selected_jobs]
     output = args.output_dir.expanduser().resolve()
     load_file("cuteafd_build_filesystem", ROOT / "scripts/build/assert-build-filesystem.py").check_path(str(output))
@@ -1299,7 +1327,7 @@ def main():
                     index = context_args.index("--layouts")
                     del context_args[index:index + 2]
                 context_args.append("--source-package-layouts")
-            payload = dict(sms=sms, exporter=exporter, args=context_args, output=str(directory))
+            payload = dict(sms=sms, exporter=exporter, args=context_args, output=str(directory), role=args.role)
             print(f"export {name} SMs={sms}", flush=True)
             env = dict(os.environ, CUDA_VISIBLE_DEVICES="", CUTEAFD_SOURCE_ROOT=str(source),
                        CUTEAFD_SPARKINFER_SOURCE_DIR=str(source / "third_party/sparkinfer"),

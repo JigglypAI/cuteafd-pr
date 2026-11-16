@@ -104,12 +104,14 @@ pub(crate) struct WaveStaging<'a> {
     rows: usize,
     /// Members below this many rows launch alone (the package's recipe bound).
     minimum_rows: usize,
+    max_units: usize,
     topk: usize,
     /// Per slot: `unit_rows` input addresses, then `unit_rows` output addresses.
     descriptors: Vec<HostAllocation<'a>>,
     /// Input address table, route ids, route weights, output address table.
     device: [DeviceAllocation<'a>; 4],
     pub(crate) staged: Vec<StagedUnit>,
+    poisoned: bool,
     pub(crate) staged_units: u64,
     pub(crate) flushes: u64,
     /// Flushes that launched two or more members through row addresses.
@@ -158,11 +160,18 @@ impl<'a> WaveStaging<'a> {
     /// `plane` holds every buffered unit's slice of `row_bytes`-wide rows.
     pub(crate) fn new(library: &'a NativeLibrary, extent: cuteafd_core::OwnerExtent, plane: CuteafdDeviceBuffer,
         row_bytes: usize, minimum_rows: usize) -> Result<Option<Self>> {
-        let (Some(rows), Some(staged)) = (extent.segment_rows(), extent.staged_rows()) else { return Ok(None) };
-        let (rows, unit_rows) = (rows as usize, extent.staging_rows as usize);
+        Self::with_max_units(library, extent, plane, row_bytes, minimum_rows, MAX_MERGED_UNITS)
+    }
+
+    pub(crate) fn with_max_units(library: &'a NativeLibrary, extent: cuteafd_core::OwnerExtent,
+        plane: CuteafdDeviceBuffer, row_bytes: usize, minimum_rows: usize, max_units: u32) -> Result<Option<Self>> {
         let topk = cuteafd_core::expert_geometry().topk as usize;
+        let layout = cuteafd_core::spark_executions::wave_staging_layout(extent, row_bytes.try_into()?,
+            topk.try_into()?, max_units).context("invalid wave staging layout")?;
+        if layout.rows == 0 { return Ok(None); }
+        let (rows, unit_rows) = (layout.rows as usize, extent.staging_rows as usize);
         ensure!(row_bytes > 0 && row_bytes % 16 == 0, "staged rows must be a nonzero multiple of 16 bytes");
-        ensure!((staged as usize).checked_mul(row_bytes).is_some_and(|bytes| bytes <= plane.bytes),
+        ensure!(usize::try_from(layout.plane_bytes).is_ok_and(|bytes| bytes <= plane.bytes),
             "staged input plane is smaller than every buffered unit");
         let device = device::Device { library, id: library.cuda_get_device()? };
         let units = extent.buffered_units as usize;
@@ -174,9 +183,9 @@ impl<'a> WaveStaging<'a> {
             library,
             copy_stream: Rc::new(LoadStream { library, raw: library.cuda_stream_create()? }),
             copied: (0..units).map(|_| device::Event::new(device)).collect::<Result<_>>()?,
-            plane, row_bytes, unit_rows, rows, minimum_rows: minimum_rows.max(1), topk, descriptors,
+            plane, row_bytes, unit_rows, rows, minimum_rows: minimum_rows.max(1), max_units: max_units as usize, topk, descriptors,
             device: [table(rows * 8)?, table(rows * topk * 4)?, table(rows * topk * 4)?, table(rows * 8)?],
-            staged: Vec::with_capacity(units), staged_units: 0, flushes: 0, merged: 0, bypassed: 0,
+            staged: Vec::with_capacity(units), poisoned: false, staged_units: 0, flushes: 0, merged: 0, bypassed: 0,
         }))
     }
 
@@ -236,9 +245,13 @@ impl<'a> WaveStaging<'a> {
     /// its own completion fence. `launch` queues the expert math only.
     pub(crate) fn flush(&mut self, pending: &mut PendingUnits<'a>, routes: &dyn UnitRoutes<'a>, stream: *mut c_void,
         launch: &mut dyn FnMut(&Wave<'_>) -> Result<()>) -> Result<()> {
+        ensure!(!self.poisoned, "Spark wave staging poisoned after failed flush; retire the owner");
         if self.staged.is_empty() { return Ok(()) }
+        // Any failure, including a partial route upload or fence record, is
+        // terminal for this owner. Retain all storage but never resubmit it.
+        self.poisoned = true;
         let rows: usize = self.staged.iter().map(|unit| unit.identity.2 as usize).sum();
-        ensure!(rows <= self.rows && self.staged.len() <= MAX_MERGED_UNITS as usize,
+        ensure!(rows <= self.rows && self.staged.len() <= self.max_units,
             "staged wave exceeds admitted rows");
         self.flushes += 1;
         tracing::debug!(target: "cuteafd::spark_coalesce", staged_units = self.staged_units,
@@ -282,6 +295,7 @@ impl<'a> WaveStaging<'a> {
             unsafe { pending.record_reserved(unit.slot, unit.identity, stream)?; }
         }
         self.staged.clear();
+        self.poisoned = false;
         Ok(())
     }
 
@@ -290,6 +304,15 @@ impl<'a> WaveStaging<'a> {
     pub(crate) fn stage(&mut self, arrival: Arrival<'_, '_>, pending: &mut PendingUnits<'a>,
         routes: &mut dyn UnitRoutes<'a>, stream: *mut c_void, launch: &mut dyn FnMut(&Wave<'_>) -> Result<()>)
         -> Result<bool> {
+        self.stage_with_merge(arrival, pending, routes, stream, launch, true)
+    }
+
+    /// Recipe-ineligible units still stage, but flush on both sides so mixed
+    /// recipes can never share a row-addressed launch.
+    pub(crate) fn stage_with_merge(&mut self, arrival: Arrival<'_, '_>, pending: &mut PendingUnits<'a>,
+        routes: &mut dyn UnitRoutes<'a>, stream: *mut c_void, launch: &mut dyn FnMut(&Wave<'_>) -> Result<()>,
+        merge_eligible: bool) -> Result<bool> {
+        ensure!(!self.poisoned, "Spark wave staging poisoned after failed flush; retire the owner");
         let request = arrival.request;
         let rows = request.rows() as usize;
         let Some(stride) = self.stride(request) else {
@@ -297,7 +320,7 @@ impl<'a> WaveStaging<'a> {
             return Ok(false)
         };
         let (input_dtype, output_dtype) = (request.input_dtype(), request.output_dtype());
-        let singleton = rows < self.minimum_rows;
+        let singleton = singleton_boundary(rows, self.minimum_rows, merge_eligible);
         if singleton {
             tracing::debug!(target: "cuteafd::spark_coalesce", rows, reason = "singleton_recipe", "Spark staged boundary");
             self.flush(pending, routes, stream, launch)?;
@@ -343,10 +366,14 @@ impl<'a> WaveStaging<'a> {
         tracing::debug!(target: "cuteafd::spark_coalesce", staged_units = self.staged_units,
             staged = self.staged.len(), rows, slot, "Spark unit copied and staged");
         let staged_rows = staged_rows_after(&self.staged);
-        let full = self.staged.len() == self.copied.len().min(MAX_MERGED_UNITS as usize) || staged_rows >= self.rows;
+        let full = self.staged.len() == self.copied.len().min(self.max_units) || staged_rows >= self.rows;
         if singleton || full { self.flush(pending, routes, stream, launch)?; }
         Ok(true)
     }
+}
+
+fn singleton_boundary(rows: usize, minimum_rows: usize, merge_eligible: bool) -> bool {
+    !merge_eligible || rows < minimum_rows
 }
 
 fn staged_rows_after(staged: &[StagedUnit]) -> usize {
@@ -356,6 +383,34 @@ fn staged_rows_after(staged: &[StagedUnit]) -> usize {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn failed_flush_is_terminal_before_any_upload_or_launch_can_repeat() {
+        let source = include_str!("waves.rs");
+        let flush = source.split("    pub(crate) fn flush(").nth(1).unwrap().split("    pub(crate) fn stage(").next().unwrap();
+        let check = flush.find("ensure!(!self.poisoned").unwrap();
+        let poison = flush.find("self.poisoned = true").unwrap();
+        assert!(check < poison && poison < flush.find("routes.upload(").unwrap());
+        assert!(poison < flush.find("launch(&wave)?").unwrap());
+        assert!(flush.find("pending.record_reserved(").unwrap() < flush.find("self.poisoned = false").unwrap());
+        assert!(!flush.contains("unwrap_or") && !flush.contains("let _ ="));
+    }
+
+    #[test]
+    fn mixed_recipe_units_flush_before_and_after_the_singleton() {
+        use super::singleton_boundary;
+        // STREAM, slice fallback, STREAM, STREAM: only the last pair can merge.
+        let mut staged = 0;
+        let mut launches = Vec::new();
+        for eligible in [true, false, true, true] {
+            let singleton = singleton_boundary(2752, 1, eligible);
+            if singleton && staged > 0 { launches.push(staged); staged = 0; }
+            staged += 1;
+            if singleton || staged == 2 { launches.push(staged); staged = 0; }
+        }
+        assert_eq!(launches, [1, 1, 2]);
+        assert_eq!(staged, 0);
+    }
+
+    #[test]
     fn staging_boundaries_flush_without_waiting_for_stream_idle() {
         let source = include_str!("waves.rs");
         let stage = source.split("    pub(crate) fn stage(").nth(1).unwrap().split("\nfn staged_rows_after").next().unwrap();
@@ -363,7 +418,7 @@ mod tests {
         assert!(stage.contains("if singleton {\n            tracing::debug!"));
         assert!(stage.contains("unit.layer != arrival.layer"));
         assert!(stage.contains("if staged_rows + rows > self.rows { self.flush("));
-        assert!(stage.contains("self.staged.len() == self.copied.len().min(MAX_MERGED_UNITS as usize)"));
+        assert!(stage.contains("self.staged.len() == self.copied.len().min(self.max_units)"));
         assert!(stage.contains("staged_rows >= self.rows"));
         assert!(stage.contains("if singleton || full { self.flush("));
     }

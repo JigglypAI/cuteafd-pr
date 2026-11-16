@@ -75,6 +75,46 @@ def test_two_target_counts():
     assert compare_sm.parse_sms("188,170") == (188, 170)
 
 
+@pytest.mark.parametrize("role,capability", [("coordinator", (12, 0)), ("spark", (12, 1))])
+@pytest.mark.parametrize("group", ["native-experts", "exlr8", "exlr8-glmf"])
+def test_segment_groups_follow_comparison_role(group, role, capability):
+    _, exporter, extra = next(job for job in compare_sm.jobs("all") if job[0] == group)
+    args = compare_sm.comparison_job_args(exporter, extra, role)
+    assert exporter == "export_b12x_dsv4_aot.py"
+    if group == "native-experts":
+        assert args == ["--geometry", "native_experts"]
+    else:
+        assert args[-2:] == ["--exlr8-role", role]
+    assert compare_sm.worker_capability({"exporter": exporter, "args": args, "role": role}) == capability
+
+
+@pytest.mark.parametrize("exporter,args", [
+    ("export_b12x_slices_aot.py", ["--role", "spark_w384"]),
+    ("package_exl3_aot.py", ["--role", "spark"]),
+    ("package_exl3_aot.py", ["--compact-companions"]),
+    ("package_fp8_moe_aot.py", ["--role", "spark"]),
+])
+def test_existing_spark_workers_keep_sm121(exporter, args):
+    assert compare_sm.worker_capability({"exporter": exporter, "args": args}) == (12, 1)
+
+
+@pytest.mark.parametrize("geometry", ["flash", "pro", "glm", "glmf", "ml4", "kimik31"])
+def test_context_decode_groups_cover_shipping_capacity_selectors(geometry):
+    jobs = {name: args for name, _, args in compare_sm.jobs("all")}
+    args = jobs[f"dsa-decode-{geometry}-m64"]
+    assert args[args.index("--only") + 1] == "index_topk_decode_m64,scored_index_topk_decode_m64"
+    assert args[args.index("--max-context") + 1] == "1048576"
+    assert args[args.index("--context-split") + 1] == "on"
+    if geometry == "glmf":
+        assert jobs["dsa-decode-glmf-m128"][-1] == "index_topk_decode_m128"
+
+
+def test_comparison_role_does_not_retarget_reply_or_backbone():
+    for geometry in ("expert_reply", "flash", "inkling2"):
+        payload = {"exporter": "export_b12x_dsv4_aot.py", "args": ["--geometry", geometry], "role": "spark"}
+        assert compare_sm.worker_capability(payload) == (12, 0)
+
+
 @pytest.mark.parametrize("scope", ["all", "suspects"])
 @pytest.mark.parametrize("geometry,names", [
     ("flash", "index_topk_prefill_m4096"),
@@ -1587,7 +1627,7 @@ def test_combined_exl3_reply_exports_cover_supported_geometries_without_sm_sizin
     shapes = next(ast.literal_eval(node.value) for node in function.body
                   if isinstance(node, ast.Assign)
                   and any(isinstance(t, ast.Name) and t.id == "shapes" for t in node.targets))
-    assert set(shapes) == {(2560, 10), (3584, 16), (4096, 6), (4096, 8),
+    assert set(shapes) == {(2560, 10), (3584, 16), (4096, 6), (4096, 8), (4608, 8),
                            (5120, 6), (6144, 4), (6144, 8), (7168, 6)}
     assert len(shapes) == len(set(shapes))
     source = ast.get_source_segment(path.read_text(), function)
@@ -1613,7 +1653,7 @@ def test_combined_exl3_reply_export_operand_and_scalar_abi(monkeypatch):
     monkeypatch.setitem(sys.modules, "torch", SimpleNamespace(
         float16="fp16", uint8="u8", float32="fp32", int32="i32"))
     jobs = exporter.exl3_reply_programs(8256)
-    assert len(jobs) == 16
+    assert len(jobs) == 18
     for suffix, op, params, thunk in jobs:
         program = thunk()
         kernel, = program.args

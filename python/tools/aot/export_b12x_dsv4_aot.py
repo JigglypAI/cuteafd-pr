@@ -62,7 +62,7 @@ def exl3_reply_programs(max_rows):
     from b12x.moe._shared.kernels.w4a16.kernel import W4A16TopKSumKernel
     import torch
 
-    shapes = ((2560, 10), (3584, 16), (4096, 6), (4096, 8),
+    shapes = ((2560, 10), (3584, 16), (4096, 6), (4096, 8), (4608, 8),
               (5120, 6), (6144, 4), (6144, 8), (7168, 6))
 
     def compile_one(width, topk, format):
@@ -1675,6 +1675,8 @@ def main() -> None:
     parser.add_argument("--dense-trellis-families",
                         help="architecture tables for dense_trellis_k6 and exlr8_dense: kimik3,glm,glmf,step5,muse,ml4 "
                              "(defaults: K6 kimik3; EXLR8 --exlr8-family; no checkpoint reads)")
+    parser.add_argument("--native-expert-families", default="v41,dsv4f,dsv4p",
+                        help="native_experts segment packages: v41,dsv4f,dsv4p")
     parser.add_argument("--expert-partial-width", type=int, default=4096)
     parser.add_argument("--expert-partial-topk", type=int, default=8)
     parser.add_argument("--exlr8-role", choices=("all", "coordinator", "spark"), default="all",
@@ -1715,7 +1717,7 @@ def main() -> None:
     except ValueError as error:
         raise SystemExit(str(error)) from error
     if not geometries or any(name not in ("flash", "flash2", "pro", "pro2", "glm", "glm2", "mimo", "mimo2", "mimop",
-                                          "mimop2", "mimof", "mimof2", "glmf", "glmf2", "qwen4", "qwen35", "qwen38", "step5", "step52", "muse", "muse2", "ml4", "expert_partial", "expert_reply", "exlr8", "exlr8_dense", "minimax", "inkling2", "glm_stage", "glm2_stage", "glmf_stage", "glmf2_stage", "dense_trellis_k6", "kimi_split", "kimik3", "kimik31", "native_attention") for name in geometries):
+                                          "mimop2", "mimof", "mimof2", "glmf", "glmf2", "qwen4", "qwen35", "qwen38", "step5", "step52", "muse", "muse2", "ml4", "expert_partial", "expert_reply", "native_experts", "exlr8", "exlr8_dense", "minimax", "inkling2", "glm_stage", "glm2_stage", "glmf_stage", "glmf2_stage", "dense_trellis_k6", "kimi_split", "kimik3", "kimik31", "native_attention") for name in geometries):
         raise SystemExit("--geometry takes flash, flash2, pro, pro2, glm, glm2, mimo, mimo2, mimop, mimop2, mimof, mimof2, "
                          "glmf, glmf2, qwen4, qwen35, qwen38, step5, step52, muse, muse2, ml4, expert_partial, exlr8, exlr8_dense, minimax, inkling2, glm_stage, glm2_stage, glmf_stage, glmf2_stage, dense_trellis_k6, kimi_split, kimik3, kimik31 and/or native_attention")
     if args.context_split_only and any(name not in ("flash", "pro", "glm", "glmf", "kimik3") for name in geometries):
@@ -1725,7 +1727,7 @@ def main() -> None:
         from b12x.integration.cuteafd import KDAGeometry
         kimi_kda = KDAGeometry(hidden=7168, kda_heads=96).head_split(2)
     props = torch.cuda.get_device_properties(0)
-    if (props.major, props.minor) not in ((12, 0), (12, 1)) or (props.minor != 0 and not args.context_split_only and any(g not in ("exlr8", "expert_partial", "expert_reply") for g in geometries)):
+    if (props.major, props.minor) not in ((12, 0), (12, 1)) or (props.minor != 0 and not args.context_split_only and any(g not in ("exlr8", "expert_partial", "expert_reply", "native_experts") for g in geometries)):
         raise SystemExit("coordinator programs export on SM120 (K1 primitives also on SM121)")
     output = args.output_dir
     output.mkdir(parents=True, exist_ok=True)
@@ -1743,6 +1745,22 @@ def main() -> None:
     entries, includes = [], []
     work = []
     for name in geometries:
+        if name == "native_experts":
+            from spark_packages import native_spark_artifacts
+            from b12x.moe._shared.kernels.v4_stream_pipeline import compile_v4_stream_segments_aot
+            shapes = {"v41": (5120, 384), "dsv4f": (4096, 256), "dsv4p": (7168, 384)}
+            families = tuple(filter(None, args.native_expert_families.split(",")))
+            if not families or set(families) - shapes.keys():
+                raise ValueError("invalid native segment expert families")
+            manifest["families"][name] = {"max_rows": 8192, "row_addresses": True}
+            for family in families:
+                hidden, experts = shapes[family]
+                widths = sorted({a.logical for artifacts in native_spark_artifacts(family).values() for a in artifacts})
+                for width in widths:
+                    work.append((name, f"{family}_w{width}_segments", "native_experts", {"max_rows": 8192},
+                        lambda h=hidden, e=experts, w=width, f=family: compile_v4_stream_segments_aot(
+                            hidden=h, intermediate=w, experts=e, topk=6, scale_codes=f == "v41")))
+            continue
         if name == "native_attention":
             manifest["families"][name] = {"scale_block": 128, "decode_rows": 64}
             work += [(name, *item) for item in native_attention_programs()]
@@ -1779,7 +1797,7 @@ def main() -> None:
             if os.environ.get("CUTEAFD_BUILD_KIND", "development") == "release":
                 work += [(name, *item) for item in exl3_reply_programs(args.prefill_rows)]
                 from native_reply import compile_native_reply_aot
-                for width in (2048, 2560, 3072, 3584, 4096, 5120, 6144, 7168, 8192):
+                for width in (2048, 2560, 3072, 3584, 4096, 4608, 5120, 6144, 7168, 8192):
                     for format in (1, 2):
                         work.append((name, f"native_h{width}_{format}", "expert_reply",
                                      {"max_rows": args.prefill_rows},
@@ -1959,6 +1977,12 @@ def main() -> None:
             manifest["families"][family] = {**geometry, "role": args.exlr8_role,
                                            "programs": [f"{family}_{item[0]}" for item in exlr8_work]}
             work += [(family, *item) for item in exlr8_work]
+            from b12x.integration.cuteafd.exlr8_glue import exlr8_segment_programs
+            segments = exlr8_segment_programs(**({} if exlr8_family == "glm" else dict(
+                hidden=cfg.hidden, units=cfg.moe_inter // 128, top_k=cfg.top_k,
+                experts=cfg.routed_experts, swiglu_limit=cfg.swiglu_limit)))
+            work += [(family, *item) for item in segments]
+            manifest["families"][family]["programs"] += [f"{family}_{item[0]}" for item in segments]
     # Append shared drafter exports after all existing objects: table indices stay stable.
     if any(name in geometries for name in ("glm", "glm2", "glmf", "glmf2", "mimo", "mimo2", "mimop", "mimop2", "mimof", "mimof2", "qwen4", "qwen35", "qwen38", "kimik3", "kimik31", "ml4", "muse", "muse2", "step5", "step52")):
         work += [("draft_bf16", f"k{k}_n{n}", "bf16_projection",

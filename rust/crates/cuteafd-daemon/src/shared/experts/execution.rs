@@ -9,6 +9,7 @@ use cuteafd_ffi::{
 use std::ffi::c_void;
 pub(crate) mod timing;
 pub(crate) mod waves;
+mod native_waves;
 mod grouping;
 pub(crate) use grouping::{ExpertGroupingError, InstalledExpertGrouping};
 use timing::ExpertTiming;
@@ -144,7 +145,7 @@ pub(crate) struct ExpertExecution<'weights, 'library> {
     routing: DeviceAllocation<'library>,
     /// Pinned route ids then weights, uploaded asynchronously per request. The
     /// unit fence protects each staging slot until its own response is emitted.
-    route_staging: Vec<crate::shared::memory::HostAllocation<'library>>,
+    route_staging: super::service::routes::RouteStaging<'library>,
     compact_reducer: Option<V41CompactReducer<'library>>,
     compact_output: Option<DeviceAllocation<'library>>,
     native_reply: Option<super::reply::NativeReply<'library>>,
@@ -157,6 +158,11 @@ pub(crate) struct ExpertExecution<'weights, 'library> {
     pending: timing::PendingUnits<'library>,
     live_capacity: u32,
     budget: ExpertExecutionBudget,
+    waves: Option<waves::WaveStaging<'library>>,
+    segments: Option<native_waves::NativeSegments<'library>>,
+    staged_plane: Option<DeviceAllocation<'library>>,
+    timing_units: std::collections::VecDeque<bool>,
+    staged_recipe: Option<(u32, cuteafd_ffi::V41ExpertReduction)>,
 }
 impl<'library> ExpertWeights<'library> {
     pub fn execution_budget(&self, compiled: u32, live: u32) -> Result<ExpertExecutionBudget> {
@@ -350,8 +356,7 @@ impl<'library> ExpertWeights<'library> {
         let decode = prepare_small(1, budget.decode_scratch_bytes)?;
         let grouped = if budget.small_scratch_bytes > 0 { grouped_decode_rows(self.layer, library, compiled, self.is_nvfp4())? } else { compiled };
         let small = prepare_small(grouped, budget.small_scratch_bytes)?;
-        let route_staging = (0..1).map(|_| crate::shared::memory::HostAllocation::new(library,
-            budget.routing_bytes, crate::shared::memory::tag(crate::shared::memory::MemoryKind::Workspace, "experts/workspace/route_staging"))).collect::<Result<Vec<_>>>()?;
+        let route_staging = super::service::routes::RouteStaging::new(library, 1, live as usize)?;
         let native_reply = if compact_output_role(kernel.info().role) { Some(super::reply::NativeReply::load(library)?) } else { None };
         let stream = if own_stream { Some(stream) } else { drop(stream); None };
         Ok(ExpertExecution {
@@ -381,6 +386,7 @@ impl<'library> ExpertWeights<'library> {
             alternate_widths: Vec::new(),
             live_capacity: live,
             budget,
+            waves: None, segments: None, staged_plane: None, timing_units: Default::default(), staged_recipe: None,
         })
     }
 }
@@ -425,6 +431,7 @@ impl<'weights, 'library> ExpertExecution<'weights, 'library> {
     /// Rebind uncaptured launch arguments; the stream orders shared workspace use.
     /// Captured graphs retain weight addresses and cannot be rebound.
     pub fn bind_layer(&mut self, weights: &'weights ExpertWeights<'library>) -> Result<()> {
+        if self._weights.layer != weights.layer { self.flush_staged()?; }
         ensure!(
             std::ptr::eq(self.library, weights.buffers[0].library),
             "expert layer belongs to a different native library"
@@ -497,32 +504,39 @@ impl<'weights, 'library> ExpertExecution<'weights, 'library> {
         &DeviceAllocation<'library>,
     )> {
         validate_live_rows(rows as usize, self.live_capacity)?;
-        if let Some(plan) = &self.reduction_plan {
-            let capacities = [Some(self.kernel.info().capacity_rows),
-                self.decode.as_ref().map(|s| s.kernel.info().capacity_rows),
-                self.small.as_ref().map(|s| s.kernel.info().capacity_rows)];
+        Self::select_state(rows, &self.kernel, &self.slots, &self.scratch, &self.decode, &self.small, &self.reduction_plan)
+    }
+
+    fn select_state<'s>(rows: u32, kernel: &'s V41ExpertKernel<'library>, slots: &'s [*mut c_void; 44],
+        scratch: &'s DeviceAllocation<'library>, decode: &'s Option<DecodeExecution<'library>>,
+        small: &'s Option<DecodeExecution<'library>>, reduction_plan: &Option<super::ExpertReductionPlan>)
+        -> Result<(&'s V41ExpertKernel<'library>, &'s [*mut c_void; 44], &'s DeviceAllocation<'library>)> {
+        if let Some(plan) = reduction_plan {
+            let capacities = [Some(kernel.info().capacity_rows),
+                decode.as_ref().map(|s| s.kernel.info().capacity_rows),
+                small.as_ref().map(|s| s.kernel.info().capacity_rows)];
             let index = plan.execution_index(rows as usize, rows as usize,
                 capacities.into_iter().flatten().map(|c| c as usize))?;
             return match index {
-                0 => Ok((&self.kernel, &self.slots, &self.scratch)),
-                1 => self.decode.as_ref().map(|s| (&s.kernel, &s.slots, &s.scratch))
+                0 => Ok((kernel, slots, scratch)),
+                1 => decode.as_ref().map(|s| (&s.kernel, &s.slots, &s.scratch))
                     .context("admitted native expert decode state missing"),
-                2 => self.small.as_ref().map(|s| (&s.kernel, &s.slots, &s.scratch))
+                2 => small.as_ref().map(|s| (&s.kernel, &s.slots, &s.scratch))
                     .context("admitted native expert grouped state missing"),
                 _ => anyhow::bail!("invalid fixed native expert state index"),
             };
         }
         if rows == 1 {
-            if let Some(decode) = &self.decode {
+            if let Some(decode) = &decode {
                 return Ok((&decode.kernel, &decode.slots, &decode.scratch));
             }
         }
-        if let Some(small) = &self.small {
+        if let Some(small) = &small {
             if rows <= small.kernel.info().capacity_rows {
                 return Ok((&small.kernel, &small.slots, &small.scratch));
             }
         }
-        Ok((&self.kernel, &self.slots, &self.scratch))
+        Ok((kernel, slots, scratch))
     }
 
     /// Zero queries the main compiled tile; positive rows follow the launch selector.
@@ -568,18 +582,89 @@ impl<'weights, 'library> ExpertExecution<'weights, 'library> {
         Ok(report)
     }
 
+    pub(crate) fn prepare_segments(&mut self, path: &std::path::Path, extent: cuteafd_core::OwnerExtent,
+        widths: impl Iterator<Item = usize>) -> Result<()> {
+        if !self._weights.is_nvfp4() && extent.segment_rows().is_some() {
+            self.segments = Some(native_waves::NativeSegments::load(self.library, path, widths)?);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn prepare_waves(&mut self, extent: cuteafd_core::OwnerExtent) -> Result<()> {
+        if self._weights.is_nvfp4() { return Ok(()); }
+        let geometry = cuteafd_core::expert_geometry();
+        let row = self.kernel.info().input_row_bytes()?;
+        let layout = cuteafd_loader::serving_capacity::spark_waves::staging_for_input(extent, geometry, row.try_into()?)?;
+        if layout.rows == 0 { return Ok(()); }
+        let plane = DeviceAllocation::new(self.library, layout.plane_bytes.try_into()?,
+            crate::shared::memory::Tag::workspace("experts/workspace/staged_units"))?;
+        self.waves = waves::WaveStaging::with_max_units(self.library, extent, plane.buffer, row, 1, cuteafd_core::spark_executions::MAX_MERGED_UNITS)?;
+        self.staged_plane = Some(plane);
+        self.timing_units = std::collections::VecDeque::with_capacity(extent.buffered_units as usize);
+        Ok(())
+    }
+
+    pub(crate) fn has_staged(&self) -> bool { self.waves.as_ref().is_some_and(waves::WaveStaging::has_staged) }
+
+    pub(crate) fn cancel_staged(&mut self, address: usize) -> Result<bool> {
+        match &mut self.waves { Some(waves) => waves.cancel(&mut self.pending, address), None => Ok(false) }
+    }
+
+    pub(crate) fn flush_staged(&mut self) -> Result<()> {
+        self.dispatch_waves(None, false)?;
+        self.staged_recipe = None;
+        Ok(())
+    }
+
+    fn stage(&mut self, request: &cuteafd_transport::expert::BackboneRequest<'_>, input: CuteafdDeviceBuffer,
+        output: CuteafdDeviceBuffer, executor_id: u64) -> Result<bool> {
+        if self.waves.is_none() { return Ok(false); }
+        if request.partial_plan()?.is_some() {
+            self.flush_staged()?;
+            self.waves.as_mut().unwrap().bypass(request.rows(), waves::Bypass::PartialReply);
+            return Ok(false);
+        }
+        if request.output_dtype() != cuteafd_transport::ExpertV2Dtype::Bf16 {
+            self.flush_staged()?;
+            self.waves.as_mut().unwrap().bypass(request.rows(), waves::Bypass::CompressedReply);
+            return Ok(false);
+        }
+        let (kernel, _, _) = self.execution_state(request.rows())?;
+        let capacity = kernel.info().capacity_rows;
+        let recipe = self.reduction_plan.as_ref().and_then(|plan| plan.stream_recipe(capacity as usize));
+        let eligible = recipe.is_some() && self.segments.is_some();
+        let identity = recipe.map(|recipe| (capacity, recipe));
+        if self.has_staged() && !native_waves::same_recipe(self.staged_recipe, identity) { self.flush_staged()?; }
+        self.staged_recipe = identity;
+        self.dispatch_waves(Some(waves::Arrival { request, input, output,
+            layer: request.layer() as usize, executor_id }), eligible)
+    }
+
+    fn dispatch_waves(&mut self, arrival: Option<waves::Arrival<'_, '_>>, merge: bool) -> Result<bool> {
+        let stream = self.stream();
+        let Some(waves) = &mut self.waves else { return Ok(false); };
+        let mut launch = native_waves::NativeWaveLaunch {
+            kernel: &self.kernel, slots: &self.slots, scratch: &self.scratch, decode: &self.decode,
+            small: &self.small, reduction: &self.reduction_plan,
+            reducer: self.compact_reducer.as_ref().context("native staged worker needs compact output")?,
+            segments: &self.segments, timing: &self.worker_timing, timing_units: &mut self.timing_units,
+            stream, width: self.kernel.info().logical_intermediate as usize, weights: self._weights.buffers.each_ref().map(|w| w.buffer.ptr),
+        };
+        if let Some(arrival) = arrival {
+            waves.stage_with_merge(arrival, &mut self.pending, &mut self.route_staging, stream,
+                &mut |wave| launch.launch(wave), merge)
+        } else {
+            waves.flush(&mut self.pending, &self.route_staging, stream, &mut |wave| launch.launch(wave))?;
+            Ok(false)
+        }
+    }
+
     /// Leave mapped requests queued at return (see `deferred`).
     pub(crate) fn defer(&mut self, units: usize, staging_rows: usize, owner: cuteafd_core::ExecutionOwner) -> Result<()> {
         ensure!(self.pending.is_empty(), "cannot resize an active expert queue");
         ensure!(staging_rows > 0 && staging_rows <= self.live_capacity as usize, "native staging exceeds owner rows");
         self.pending = timing::PendingUnits::for_owner(self.library, units, owner)?;
-        let bytes = staging_rows.checked_mul(cuteafd_core::expert_geometry().topk as usize * 8)
-            .context("native route staging overflow")?;
-        self.route_staging.clear();
-        for _ in 0..units {
-            self.route_staging.push(crate::shared::memory::HostAllocation::new(self.library,
-                bytes, crate::shared::memory::tag(crate::shared::memory::MemoryKind::Workspace, "experts/workspace/route_staging"))?);
-        }
+        self.route_staging.resize(self.library, units, staging_rows)?;
         self.deferred = true;
         Ok(())
     }
@@ -588,7 +673,8 @@ impl<'weights, 'library> ExpertExecution<'weights, 'library> {
     /// Returns the completed unit's measured pace.
     pub(crate) fn complete(&mut self) -> Result<Option<timing::UnitPace>> {
         let Some(((request_id, layer, rows, executor_id), pace)) = self.pending.pop()? else { return Ok(None) };
-        if let Some(timing) = &mut self.worker_timing {
+        let publish = if self.waves.is_some() { self.timing_units.pop_front().context("missing native wave timing identity")? } else { true };
+        if let Some(timing) = self.worker_timing.as_mut().filter(|_| publish) {
             // SAFETY: the caller observed this stream drained after both records.
             unsafe { timing.publish(request_id, layer, rows, executor_id, "native")?; }
         }
@@ -826,6 +912,11 @@ impl ExpertExecution<'_, '_> {
         ensure!(executor_id != 0, "native response needs executor identity");
         validate_live_rows(request.rows() as usize, self.live_capacity)?;
         request.require_input_dtype(self.kernel.info().input_dtype)?;
+        if self.deferred {
+            if let (Some(input), Some(output)) = (hidden_view, destination) {
+                if self.stage(request, input, output, executor_id)? { return Ok(()); }
+            }
+        }
         let stage = self.pending.next_slot()?;
         let routes = request.rows() as usize * cuteafd_core::expert_geometry().topk as usize;
         let bytes = request.plane_bytes()?;
@@ -844,19 +935,8 @@ impl ExpertExecution<'_, '_> {
         // Mapped sources stay transport-owned; converted routes stay in this
         // unit's pinned staging until its own completion fence.
         let hidden_bytes = request.hidden().len();
-        ensure!(routes * 8 <= self.route_staging[stage].buffer.bytes && hidden_bytes <= self.hidden.buffer.bytes,
-            "native request staging is too small");
-        {
-            let staging = self.route_staging[stage].bytes_mut();
-            // SAFETY: both typed route arrays contain `routes` initialized values;
-            // their byte views do not overlap the exclusively borrowed staging.
-            unsafe {
-                staging[..routes * 4].copy_from_slice(
-                    std::slice::from_raw_parts(exchange.ids.as_ptr().cast::<u8>(), routes * 4));
-                staging[routes * 4..routes * 8].copy_from_slice(
-                    std::slice::from_raw_parts(exchange.routing.as_ptr().cast::<u8>(), routes * 4));
-            }
-        }
+        ensure!(hidden_bytes <= self.hidden.buffer.bytes, "native request staging is too small");
+        self.route_staging.pack(stage, request)?;
         let device = self.hidden.buffer.device_id;
         let mut in_frame = None;
         let uploaded = (|| -> Result<()> { unsafe {
@@ -874,12 +954,7 @@ impl ExpertExecution<'_, '_> {
                     CuteafdDeviceBuffer { bytes: hidden_bytes, ..view }, hidden_bytes, self.stream())?,
                 None => self.library.copy_h2d_async(self.hidden.buffer, request.hidden(), self.stream())?,
             }
-            let mut ids = self.route_staging[stage].buffer; ids.bytes = routes * 4;
-            let mut weights = self.route_staging[stage].buffer;
-            weights.ptr = weights.ptr.cast::<u8>().add(routes * 4).cast(); weights.bytes = routes * 4;
-            self.library.copy_host_buffers_h2d_batch_async(
-                &[self.ids.buffer, self.routing.buffer], &[ids, weights],
-                &[routes * 4, routes * 4], self.stream())?;
+            self.route_staging.upload(stage, 0, routes, self.ids.buffer, self.routing.buffer, self.stream())?;
             Ok(())
         } })();
         if let Err(error) = uploaded { self.synchronize()?; return Err(error); }
@@ -957,6 +1032,7 @@ impl ExpertExecution<'_, '_> {
         if self.deferred && destination.is_some() {
             // SAFETY: all copies, math and output writes precede this unit fence.
             unsafe { self.pending.record((request.request_id(), request.layer(), request.rows(), executor_id), self.stream())?; }
+            if self.waves.is_some() { self.timing_units.push_back(true); }
             return Ok(());
         }
         self.synchronize()?;
