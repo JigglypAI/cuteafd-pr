@@ -342,7 +342,7 @@ fn installed_native_minimum_is_six_sparks_with_full_pool() -> anyhow::Result<()>
     let input = testing::BudgetedPlanInput::open(&snapshot)?;
     let options = PlanOptions { placement: ExpertPlacement::from_spark_ranks(6),
         vision: MediaMode::Off, audio: MediaMode::Off,
-        layout: Some(LayoutOptions { workspace_manifest: Some(manifest), ..Default::default() }),
+        layout: Some(LayoutOptions { workspace_manifest: Some(manifest), inkling_kv: crate::families::inkling2::InklingKvCache::Bf16, ..Default::default() }),
         ..Default::default() };
     let report = input.plan(&options)?;
     assert_eq!(report.runtime, Some(RuntimeStatus::Planned));
@@ -496,7 +496,7 @@ fn shared_recipe_charges_every_owner_once_on_one_and_two_rtx() {
                     workspace: vec![("scratch".into(), (64 << 20) - 1024*4608*2), ("output".into(), 1024*4608*2)] }
             }).collect()
         }).collect() };
-        let inputs = InklingInputs { cfg: cfg.clone(), kv_format: Default::default(), gpus, spark_ranks: ranks, context: Context::automatic(1 << 20),
+        let inputs = InklingInputs { cfg: cfg.clone(), kv_format: crate::families::inkling2::InklingKvCache::Bf16, gpus, spark_ranks: ranks, context: Context::automatic(1 << 20),
             maximum_pool_tokens: 4 << 20, prefill, sequences: 16, prefix_entries: 8, prefix_mark_budget: 2 << 30, targets: targets.clone(), placement, modes: modes.clone(),
             routed: routed.clone(), experts,
             local,
