@@ -73,7 +73,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
     let spark_bytes = opts.spark_allocation_budget_bytes.unwrap_or(crate::plan::DEFAULT_SPARK_BUDGET_BYTES)
         .min(opts.spark_bytes);
     let sequences = opts.resolved_concurrency("inkling2");
-    let request = FactsRequest { checkpoint: input.checkpoint(), cfg, manifest_path: manifest_path.as_deref(),
+    let request = FactsRequest { checkpoint: input.checkpoint(), cfg, kv_format: opts.inkling_kv, manifest_path: manifest_path.as_deref(),
         manifest, coordinator: Coordinator::Planned { cards: cards.clone() }, attention, spark_ranks: ranks,
         spark_bytes, prefill: shape, context_tokens: opts.context_tokens, pool_tokens: opts.pool_tokens, sequences,
         host, host_cache_bytes: opts.host_cache_bytes, prefix_entries: opts.prefix_entries("inkling2"),

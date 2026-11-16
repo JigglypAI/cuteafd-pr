@@ -187,6 +187,7 @@ pub struct LayoutOptions {
     pub qwen_kv: crate::families::qwen4::Qwen4KvCache,
     pub step5_kv: crate::families::qwen4::Qwen4KvCache,
     pub muse_kv: crate::families::muse_spark::cache::MuseKvCache,
+    pub inkling_kv: crate::families::inkling2::InklingKvCache,
     /// Selected Qwen projection/head residency, matching serve-qwen4.
     pub qwen_representation: crate::families::qwen4::resident::Qwen4Representation,
     /// Qwen immutable attention scratch override.
@@ -338,6 +339,7 @@ impl Default for LayoutOptions {
             qwen_kv: Default::default(),
             step5_kv: crate::families::qwen4::Qwen4KvCache::Fp8,
             muse_kv: Default::default(),
+            inkling_kv: Default::default(),
             qwen_representation: crate::families::qwen4::resident::Qwen4Representation {
                 fp8_projections: false, fp8_head: false },
             qwen_attention_plan_rows: None,

@@ -54,6 +54,7 @@ impl Coordinator {
 pub struct FactsRequest<'a> {
     pub checkpoint: &'a crate::plan::Checkpoint,
     pub cfg: &'a Inkling2Config,
+    pub kv_format: super::InklingKvCache,
     pub manifest_path: Option<&'a Path>,
     pub manifest: Option<Arc<serde_json::Value>>,
     pub coordinator: Coordinator,
@@ -290,7 +291,7 @@ pub fn gather(request: &FactsRequest<'_>) -> Result<InklingInputs, Refused> {
     let physical = (0..gpus).map(|gpu| request.coordinator.physical(gpu)).collect::<Vec<_>>();
     let maximum_pool_tokens = crate::placement::PoolPolicy::resolve(&physical, context, request.pool_tokens,
         page_rows).maximum_tokens();
-    Ok(InklingInputs { cfg: cfg.clone(), gpus, spark_ranks: ranks,
+    Ok(InklingInputs { cfg: cfg.clone(), kv_format: request.kv_format, gpus, spark_ranks: ranks,
         context: Context::resolve(context, (request.context_tokens > 0).then_some(request.context_tokens)),
         maximum_pool_tokens, prefill: shape, sequences: request.sequences, prefix_entries: request.prefix_entries,
         prefix_mark_budget: request.prefix_mark_budget, targets, placement, modes,

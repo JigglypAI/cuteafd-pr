@@ -137,6 +137,7 @@ pub struct Vision {
 #[derive(Debug, Clone)]
 pub struct InklingInputs {
     pub cfg: Inkling2Config,
+    pub kv_format: crate::families::inkling2::InklingKvCache,
     pub gpus: usize,
     pub spark_ranks: usize,
     pub context: Context,
@@ -305,10 +306,10 @@ impl InklingInputs {
     /// slots per lane.
     fn context_buffers(&self) -> crate::placement::ContextBuffers {
         let cfg = &self.cfg;
-        let kv_row = (cfg.kv_heads * cfg.head_dim * 2) as u64;
+        let record_bytes = self.kv_format.record_bytes(cfg.kv_heads, cfg.head_dim) as u64;
         let heads = (cfg.heads / 2) as u64;
         crate::placement::ContextBuffers {
-            staging_unit_bytes: PAGE_ROWS * 2 * kv_row, staging_unit_rows: PAGE_ROWS,
+            staging_unit_bytes: PAGE_ROWS * record_bytes, staging_unit_rows: PAGE_ROWS,
             query_row_bytes: heads * cfg.head_dim as u64 * 2,
             partial_row_bytes: heads * (cfg.head_dim as u64 * 2 + 4),
             candidate_row_bytes: 0, compiled_extent: self.prefill.rows.max(u64::from(DECODE_ROWS)),
@@ -408,7 +409,7 @@ impl InklingInputs {
     fn unit_owners(&self, prefix: &str, gpu: usize, rows: u32, maximum: u64) -> Result<Vec<Component>, Refusal> {
         let location = Location::coordinator(gpu as u8);
         let context = usize::try_from(self.context.maximum).map_err(|_| Refusal::Overflow("Inkling context"))?;
-        let layout = crate::families::inkling2::execution::UnitLayout::serving(&self.cfg, rows as usize, context)
+        let layout = crate::families::inkling2::execution::UnitLayout::serving_format(&self.cfg, rows as usize, context, self.kv_format, self.sequences as usize)
             .map_err(refusal)?;
         let mut out = Vec::new();
         let uploads = layout.upload_shape(&self.cfg, usize::try_from(self.sequences).map_err(|_| Refusal::Overflow("Inkling upload members"))?
@@ -435,7 +436,7 @@ impl InklingInputs {
         out.extend(target.weight_components(maximum)?);
         // One interleaved K/V record backing per owned global layer. Local layers
         // keep no pool pages: their window lives in the per-sequence ring.
-        let kv_row = (cfg.kv_heads * cfg.head_dim * 2) as u64;
+        let record_bytes = self.kv_format.record_bytes(cfg.kv_heads, cfg.head_dim) as u64;
         let page_rows = self.page_rows();
         let mut marks = 0u64;
         for (layer, &mode) in self.modes.iter().enumerate() {
@@ -450,9 +451,9 @@ impl InklingInputs {
             if !cfg.local[layer] {
                 // One page of records on this rank: heads split the row; context
                 // parity interleaves whole pages (page_rows doubles, half land here).
-                let stride = page_rows * 2 * kv_row * num / den;
+                let stride = page_rows * record_bytes * num / den;
                 out.push(Component::allocation(Allocation::buffer(format!("inkling2.kv.{layer}.{gpu}.records"), location,
-                    stride, Lifetime::TARGET, Category::Kv, "global-layer interleaved BF16 KV records"),
+                    stride, Lifetime::TARGET, Category::Kv, "global-layer native KV records and scales"),
                     ByteCurve::linear_rounded(stride, stride, maximum, SM120_ALLOCATION_GRANULARITY_BYTES),
                     false, maximum));
             }

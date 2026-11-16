@@ -13,6 +13,7 @@ pub(crate) struct GoldenArgs {
     #[arg(long)] pub snapshot: PathBuf,
     #[arg(long, env="CUTEAFD_NATIVE_LIB")] native_lib: PathBuf,
     #[arg(long, default_value="/opt/cuteafd/share/PROGRAMS.json")] manifest: PathBuf,
+    #[arg(long="kv-cache", default_value="fp8")] kv_format: cuteafd_loader::families::inkling2::InklingKvCache,
     /// JSON array of token ids; no tokenizer or prompt preprocessing in golden.
     #[arg(long)] tokens: PathBuf,
     /// Prefix stops after this zero-based layer; no full-model claim if <47.
@@ -50,7 +51,7 @@ fn run(args: GoldenArgs) -> Result<()> {
         "Inkling golden needs2..4096 valid token ids");
     ensure!(args.tap_layers.iter().all(|&layer| layer<=args.last_layer), "Inkling tap layer exceeds run depth");
     let rows = tokens.len()-1;
-    let unit_layout = UnitLayout::new(&cfg, rows, tokens.len().max(64))?;
+    let unit_layout = UnitLayout::with_format(&cfg, rows, tokens.len().max(64), args.kv_format)?;
     let target_layout = CoordinatorWeights::golden(&checkpoint, &cfg, &(0..=args.last_layer).collect::<Vec<_>>())?;
     let package = args.native_lib.parent().context("Inkling native library directory")?
         .join("fp8/fp8-inkling2-mxfp8/tp1");
@@ -68,7 +69,7 @@ fn run(args: GoldenArgs) -> Result<()> {
     let library = unsafe { cuteafd_ffi::NativeLibrary::load(&args.native_lib) }?;
     let device = Device { library: &library, id: args.device };
     let programs = device.run(|| Ok(library.programs()?.with_manifest(&args.manifest)?))?;
-    let kernels = device.run(|| Kernels::bind(&programs))?;
+    let kernels = device.run(|| Kernels::bind(&programs, args.kv_format))?;
     // Load the expert code before the pre-weight CUDA sample, rather than
     // attributing its module residency to an unmeasured post-admission owner.
     // SAFETY: trusted generated package loaded on the retained device; this
@@ -88,6 +89,9 @@ fn run(args: GoldenArgs) -> Result<()> {
     let pages = (0..owner.layout.buffers["page_table"]/4).flat_map(|n| (n as i32).to_le_bytes()).collect::<Vec<_>>();
     stream.drain()?;
     device.run(|| {
+        let tile_rows = (0..rows).step_by(10)
+            .flat_map(|row| (row as i32).to_le_bytes()).collect::<Vec<_>>();
+        library.copy_h2d(owner.buffer("tile_rows")?, &tile_rows)?;
         library.copy_h2d(owner.buffer("positions")?, &positions)?;
         library.copy_h2d(owner.buffer("cache_slots")?, &positions)?;
         library.copy_h2d(owner.buffer("ring_slots")?, &rings)?;

@@ -67,6 +67,10 @@ fn options(args: &PlanArgs) -> Result<PlanOptions, PlanError> {
                     cuteafd_core::MlaCacheFormat::Bf16 => cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16,
                     cuteafd_core::MlaCacheFormat::Fp8 => cuteafd_loader::families::qwen4::Qwen4KvCache::Fp8,
                 }).unwrap_or_default(),
+                inkling_kv: args.kv_format.map(|format| match format {
+                    cuteafd_core::MlaCacheFormat::Bf16 => cuteafd_loader::families::inkling2::InklingKvCache::Bf16,
+                    cuteafd_core::MlaCacheFormat::Fp8 => cuteafd_loader::families::inkling2::InklingKvCache::Fp8,
+                }).unwrap_or_default(),
                 muse_kv: args.kv_format.map(|format| match format {
                     cuteafd_core::MlaCacheFormat::Bf16 => cuteafd_loader::families::muse_spark::cache::MuseKvCache::Bf16,
                     cuteafd_core::MlaCacheFormat::Fp8 => cuteafd_loader::families::muse_spark::cache::MuseKvCache::Fp8,
@@ -305,7 +309,7 @@ fn resolve_family_config(args: &mut PlanArgs, family: &str, cfg: &std::collectio
         if !args.explicit_settings.contains("mimo_kv_cache") {
             if let Some(value) = get("KV_CACHE") { args.mimo_kv_cache = crate::families::mimo_v2::KvCacheArg::from_str(value, false).map_err(anyhow::Error::msg)?; }
         }
-    } else if matches!(family, "qwen4" | "qwen3_5" | "kimi_k3" | "step5" | "muse_spark") && args.kv_format.is_none() {
+    } else if matches!(family, "qwen4" | "qwen3_5" | "kimi_k3" | "step5" | "muse_spark" | "inkling2") && args.kv_format.is_none() {
         args.kv_format = get("KV_CACHE").map(|v| v.parse().map_err(anyhow::Error::msg)).transpose()?;
     }
     if matches!(family, "qwen4" | "step5") && !args.explicit_settings.contains("native_mtp_layers") {
@@ -1483,6 +1487,19 @@ mod tests {
             args.kv_format = Some(selected);
             assert_eq!(options(&args).unwrap().layout.unwrap().muse_kv, format);
         }
+    }
+
+    #[test]
+    fn inkling_plan_and_config_preserve_selected_global_kv() {
+        use cuteafd_loader::families::inkling2::InklingKvCache;
+        let mut args = args(std::path::Path::new("/model"), 6, false);
+        assert_eq!(options(&args).unwrap().layout.unwrap().inkling_kv, InklingKvCache::Fp8);
+        let config = [("KV_CACHE".into(), "fp8".into())].into_iter().collect();
+        resolve_family_config(&mut args, "inkling2", &config).unwrap();
+        assert_eq!(options(&args).unwrap().layout.unwrap().inkling_kv, InklingKvCache::Fp8);
+        args.kv_format = Some(cuteafd_core::MlaCacheFormat::Bf16);
+        resolve_family_config(&mut args, "inkling2", &config).unwrap();
+        assert_eq!(options(&args).unwrap().layout.unwrap().inkling_kv, InklingKvCache::Bf16);
     }
 
     #[test]

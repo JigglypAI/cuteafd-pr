@@ -10,6 +10,9 @@ pub(crate) struct Kernels<'a> {
     pub projections: DraftProjections<'a>,
     pub local: Attention<'a>,
     pub global: Attention<'a>,
+    local_decode: Attention<'a>,
+    global_decode: Attention<'a>,
+    kv_format: cuteafd_loader::families::inkling2::InklingKvCache,
     producers: BTreeMap<String, Producer<'a>>,
     pub add: cuteafd_ffi::F32Add<'a>,
     pub narrow: cuteafd_ffi::F32Bf16Narrow<'a>,
@@ -17,7 +20,7 @@ pub(crate) struct Kernels<'a> {
     sms: usize,
 }
 impl<'a> Kernels<'a> {
-    pub fn bind(programs: &'a Programs<'a>) -> Result<Self> {
+    pub fn bind(programs: &'a Programs<'a>, kv_format: cuteafd_loader::families::inkling2::InklingKvCache) -> Result<Self> {
         let mut ops = Vec::new();
         for precision in [Precision::Bf16, Precision::F32] {
             for (width, dynamic) in [(4608, false), (1024, false), (1024, true)] {
@@ -29,7 +32,10 @@ impl<'a> Kernels<'a> {
             }
             for situ in [false, true] { ops.push(Op::Gate { situ, precision }); }
             for value in [false, true] { ops.push(Op::Norm { value, precision }); }
-            ops.push(Op::KvPack { precision });
+            ops.push(Op::KvPack { precision, fp8: false });
+            if kv_format == cuteafd_loader::families::inkling2::InklingKvCache::Fp8 {
+                ops.push(Op::KvPack { precision, fp8: true });
+            }
         }
         for queries in [1, 3] {
             for addend in [false, true] { ops.push(Op::Residual { queries, addend }); }
@@ -46,8 +52,10 @@ impl<'a> Kernels<'a> {
         Ok(Self { projections: DraftProjections::load_with_output(programs, &[
             (4608, 6144), (4608, 768), (4608, 1024), (4608, 48), (4608, 32),
             (4608, 384), (6144, 4608), (64, 1024)], 4096, ProjectionOutput::F32)?,
-            local: Attention::load(programs, Kind::Local, Route::Prefill)?,
-            global: Attention::load(programs, Kind::Global, Route::Prefill)?,
+            local: Attention::load(programs, Kind::Local, Route::Prefill, false)?,
+            global: Attention::load(programs, Kind::Global, Route::Prefill, kv_format == cuteafd_loader::families::inkling2::InklingKvCache::Fp8)?,
+            local_decode: Attention::load(programs, Kind::Local, Route::Decode, false)?,
+            global_decode: Attention::load(programs, Kind::Global, Route::Decode, kv_format == cuteafd_loader::families::inkling2::InklingKvCache::Fp8)?, kv_format,
             add: programs.library().f32_add()?, narrow: programs.library().f32_bf16_narrow()?,
             quant,
             sms: programs.library().sm_count()? as usize, producers })
@@ -64,21 +72,13 @@ impl<'a> Kernels<'a> {
     }
     pub fn convolution(&self, owner: &impl UnitBuffers<'a>, input: Buffer, weight: Buffer, dynamic: Buffer,
         output: Buffer, history: &str, width: usize, global: bool, rows: usize) -> Result<()> {
-        if let Some((unit, cache, layer, members)) = owner.packed() {
-            for member in members {
-                let segment = unit.segment(cache, member.sequence, layer, member.rows.clone())?;
-                let span = |buffer: Buffer, columns: usize| slice(buffer, member.rows.start*columns*4, member.rows.len()*columns*4);
-                self.convolution(&segment, span(input, width)?, weight,
-                    if global { span(dynamic, 32)? } else { dynamic }, span(output, width)?,
-                    history, width, global, member.rows.len())?;
-            }
-            return Ok(());
-        }
+        let history_geometry = owner.packed().map(|(_, cache, _, _)|
+            (cache.layout.sequence_bytes/4, cache.layout.sequences));
         // SAFETY: native F32 planes and BF16 taps are retained by unit/weights;
         // metadata addresses the unit's exclusive history and valid packed rows.
         unsafe { self.producer(Op::Convolution { width, dynamic: global, precision: Precision::F32 })?
             .launch(&[input, weight, dynamic, owner.buffer(history)?, owner.buffer("first")?,
-                owner.buffer("conv_slots")?, output], rows, None, owner.stream().raw) }
+                owner.buffer("conv_slots")?, output], rows, history_geometry, owner.stream().raw) }
     }
     pub fn residual(&self, owner: &impl UnitBuffers<'a>, query: Buffer, addend: Buffer, output: Buffer,
         rows: usize, queries: usize, candidates: usize, add: bool) -> Result<()> {
@@ -207,15 +207,7 @@ pub(crate) fn attention<'a>(k: &Kernels<'a>, owner: &impl UnitBuffers<'a>, targe
     }
     // SAFETY: retained F32 relative biases narrow into the whole-unit BF16 plane.
     unsafe { k.narrow.launch(b("relative_f32")?.ptr, b("relative")?.ptr, rows*48*1024, owner.stream().raw)?; }
-    if let Some((unit, cache, layer, members)) = owner.packed() {
-        for member in members {
-            if !local { owner.prepare_page_table(&member.metadata.page_table)?; }
-            let segment = unit.segment(cache, member.sequence, layer, member.rows.clone())?;
-            attention_cache(k, &segment, cfg, layer, member.rows.len())?;
-        }
-    } else {
-        attention_cache(k, owner, cfg, layer, rows)?;
-    }
+    attention_cache(k, owner, cfg, layer, rows)?;
     // F32 gate producer consumes F32 attended values. Widen BF16 through a
     // zeroed F32 destination before gating; no host data path.
     // SAFETY: q has6144 F32 values per row and is no longer read by attention;
@@ -239,15 +231,21 @@ fn attention_cache<'a>(k: &Kernels<'a>, owner: &impl UnitBuffers<'a>, cfg: &Inkl
     let b = |name: &str| owner.buffer(name);
     // SAFETY: the per-sequence view retains private cache slots and writes only
     // its own scratch rows before attention consumes them on the same stream.
-    unsafe { k.producer(Op::KvPack { precision: Precision::F32 })?.launch(&[b("k_clipped")?, b("v_norm")?,
+    unsafe { k.producer(Op::KvPack { precision: Precision::F32, fp8: !local && k.kv_format == cuteafd_loader::families::inkling2::InklingKvCache::Fp8 })?.launch(&[b("k_clipped")?, b("v_norm")?,
         b("cache_slots")?, if local { b("kv_step")? } else { b("global_cache")? }], rows, None, owner.stream().raw)?; }
-    let batch = Batch { rows, q: b("q_bf16")?, kv: if local { b("kv_step")? } else { b("global_cache")? },
+    let (tiles, tables, table_width, ring_stride_records) = if let Some((unit, cache, _, members)) = owner.packed() {
+        (members.iter().map(|member| member.rows.len().div_ceil(10)).sum(),
+            members.len(), unit.layout.buffers["page_table"]/(cache.layout.sequences*4),
+            cache.layout.sequence_bytes/4096)
+    } else { (rows.div_ceil(10), 1, owner.layout().buffers["page_table"]/4, 1088) };
+    let batch = Batch { rows, tiles, tile_rows: b("tile_rows")?, q: b("q_bf16")?, kv: if local { b("kv_step")? } else { b("global_cache")? },
         positions: b("positions")?, relative: b("relative")?, sinks: b("sinks")?, output: b("attended")?, scratch: b("attention_scratch")? };
     if local {
-        k.local.local(batch, Local { ring: b("ring")?, ring_count: 1, ring_slots: b("ring_slots")?, first: b("first")? }, owner.stream().raw)
+        k.local.local(batch, Local { ring: b("ring")?, ring_stride_records, ring_slots: b("ring_slots")?, first: b("first")? }, owner.stream().raw)
     } else {
-        k.global.global(batch, Global { pages: b("global_cache")?.bytes/(64*4096), page_table: b("page_table")?,
-            table_width: owner.layout().buffers["page_table"]/4, splits: 1 }, owner.stream().raw)
+        k.global.global(batch, Global {
+            pages: b("global_cache")?.bytes/(64*k.kv_format.record_bytes(cfg.kv_heads, cfg.head_dim)), page_table: b("page_table")?,
+            table_width, tables, table_indices: b("table_indices")?, first: b("first")?, splits: 1 }, owner.stream().raw)
     }
 }
 

@@ -425,10 +425,11 @@ def inkling2_attention_programs(decode_rows: int, prefill_rows: int):
 
     result = []
     for kind in ("local", "global"):
-        for route, rows in (("decode", decode_rows), ("prefill", prefill_rows)):
-            params = dict(kind=kind, route=route, max_rows=rows)
-            result.append((f"{kind}_attention_{route}_m{rows}", "attention", params,
-                           partial(compile_inkling2_attention_aot, **params)))
+        for kv_format in (("bf16", "fp8") if kind == "global" else ("bf16",)):
+            for route, rows in (("decode", decode_rows), ("prefill", prefill_rows)):
+                params = dict(kind=kind, route=route, max_rows=rows, kv_format=kv_format)
+                result.append((f"{kind}_attention_{route}_{kv_format}_v2_m{rows}", "attention", params,
+                               partial(compile_inkling2_attention_aot, **params)))
     return result
 
 
@@ -450,7 +451,7 @@ def inkling2_producer_programs(prefill_rows: int):
     for dtype, suffix in [(torch.bfloat16, "bf16"), (torch.float32, "f32")]:
         for width, dynamic in [(4608, False), (1024, False), (1024, True)]:
             kind = "dynamic" if dynamic else "static"
-            add(f"conv_{kind}_h{width}_{suffix}", "convolution", compile_inkling2_convolution_aot,
+            add(f"conv_{kind}_h{width}_{suffix}_v2", "convolution", compile_inkling2_convolution_aot,
                 width=width, heads=8 if dynamic else 1, dynamic=dynamic, dtype=dtype)
         for local in [True, False]:
             for name, heads, dim, threshold, scaled in [("q", 48, 128, 128**.5*2, True),
@@ -466,7 +467,9 @@ def inkling2_producer_programs(prefill_rows: int):
         add(f"norm_h4608_{suffix}", "rms_norm", compile_inkling2_norm_aot, output_dtype=dtype)
         add(f"norm_v_h8_d128_{suffix}", "rms_norm", compile_inkling2_norm_aot,
             width=128, heads=8, weighted=False, output_dtype=dtype)
-        add(f"kv_pack_{suffix}", "kv_pack", compile_inkling2_kv_pack_aot, input_dtype=dtype)
+        for kv_format in ("bf16", "fp8"):
+            add(f"kv_pack_{kv_format}_{suffix}_v2", "kv_pack", compile_inkling2_kv_pack_aot,
+                input_dtype=dtype, kv_format=kv_format)
     for queries in [1, 3]:
         for addend in [False, True]:
             add(f"residual_q{queries}_{'add' if addend else 'keep'}", "attn_res",
