@@ -761,3 +761,24 @@ def test_inkling2_dispatch_package_codes_cmake_and_placement_scopes_agree(monkey
     assert 'set(package "${CMAKE_CURRENT_BINARY_DIR}/fp8/fp8-inkling2-mxfp8")' in fp8
     for script in ("build-wip-artifacts.sh", "build-release-artifacts.sh"):
         assert "*:nvfp4|*:nvfp4a4|*:mxfp8)" in (ROOT / "scripts/build" / script).read_text()
+
+
+def test_native_segment_geometry_is_in_coordinator_and_spark_manifests(tmp_path):
+    import subprocess
+    cmake = ROOT / "native/cmake/shared/dsv4_programs.cmake"
+    for arch in (120, 121):
+        source = tmp_path / str(arch)
+        source.mkdir()
+        (source / "CMakeLists.txt").write_text("\n".join([
+            "cmake_minimum_required(VERSION 3.18)", "project(native_segments NONE)",
+            f"set(CUTEAFD_CUDA_ARCHITECTURES {arch})",
+            "set(CUTEAFD_CONTEXT_SPLIT_AOT OFF)", "set(CUTEAFD_ENABLE_V41_EXPERT_AOT ON)",
+            "add_custom_target(cuteafd_verify_sparkinfer_source)",
+            f'include("{cmake}")',
+            'file(WRITE "${CMAKE_BINARY_DIR}/scope.txt" "${CUTEAFD_PROGRAM_GEOMETRY}")',
+        ]))
+        build = source / "build"
+        result = subprocess.run(["cmake", "-S", str(source), "-B", str(build)],
+                                capture_output=True, text=True, timeout=30)
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert (build / "scope.txt").read_text().split(",").count("native_experts") == 1
