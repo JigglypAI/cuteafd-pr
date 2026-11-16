@@ -110,6 +110,7 @@ fn dump_max_group_plan_from_installed_headers() -> Result<()> {
         mark_slots: mark.slots(shared::mark_bytes(&cfg, 1) as usize) as u64, max_context: None,
         pool_tokens: None, onboard: Onboard::Auto,
         spark_budget_bytes: cuteafd_loader::plan::DEFAULT_SPARK_BUDGET_BYTES,
+        spark_rank_bytes: vec![cuteafd_loader::plan::DEFAULT_SPARK_BUDGET_BYTES; SPARKS],
         partial_bf16_max_rows: cuteafd_loader::families::muse_spark::replies::DEFAULT_BF16_MAX_ROWS,
         partial_reply_formats: Default::default(),
         local: shared::local_workspace(&catalog, Some(&manifest_path), GPUS, prefill.unit_rows)?,
