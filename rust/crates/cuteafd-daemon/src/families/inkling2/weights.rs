@@ -19,6 +19,7 @@ pub(crate) struct TargetWeights<'a> {
 /// validation barrier and whole-group committed receive before returning views.
 pub(crate) struct PendingTarget<'a> {
     target: TargetWeights<'a>,
+    draft: Option<crate::shared::speculation::recurrent_weights::Weights<'a>>,
     push: crate::shared::experts::rtx::push::CoordinatorPush,
     dense: (Vec<crate::shared::experts::rtx::push::DensePlan>, Vec<crate::shared::experts::rtx::dense::DenseArena<'a>>),
     device: Device<'a>,
@@ -54,21 +55,34 @@ impl<'a> PendingTarget<'a> {
                 ExpertLayer::BackboneFull { layer }).collect(),
         }] }).collect::<Vec<_>>();
         let experts = (!sets.is_empty()).then_some(CoordinatorExperts::Sets(sets));
-        let (target, records) = crate::shared::experts::rtx::dense::recording(||
-            TargetWeights::record_push(device, checkpoint, &inputs.targets[0]))?;
+        let ((target, draft), records) = crate::shared::experts::rtx::dense::recording(|| {
+            let target = TargetWeights::record_push(device, checkpoint, &inputs.targets[0])?;
+            let draft = inputs.drafter.as_ref().map(|draft| {
+                let layout = draft.layout.weights.first().context("admitted drafter rank absent")?;
+                let planned = admitted.solved.facts.allocations.iter().find(|owner|owner.id==layout.arena.id())
+                    .context("drafter weight arena absent from solved admission")?;
+                ensure!(planned.bytes==layout.arena.bytes() as u64
+                    && planned.location==cuteafd_loader::placement::planner::Location::coordinator(0),
+                    "drafter backing differs from pre-allocation admission");
+                let source = cuteafd_loader::formats::block_dspark::recurrent::loading::RecurrentSource::open(view)?;
+                crate::shared::speculation::recurrent_weights::Weights::load(device,&source,layout.clone(),std::ptr::null_mut())
+            }).transpose()?;
+            Ok((target,draft))
+        })?;
         let dense = crate::shared::experts::rtx::dense::plan_records(view.snapshot(), records, &[device], inputs.spark_ranks)?;
         let (push, streams, ranks) = CoordinatorPush::prepare_view_admitted(view, Some(catalog), 1, experts, envelope)?;
-        Ok((Self { target, push, dense, device, sparks: inputs.spark_ranks }, (streams, ranks)))
+        Ok((Self { target, draft, push, dense, device, sparks: inputs.spark_ranks }, (streams, ranks)))
     }
     pub fn finish(self, catalog: &cuteafd_loader::OfficialV41Catalog,
         pending: crate::shared::placement::PendingSparkAdmission)
-        -> Result<(TargetWeights<'a>, Vec<Vec<crate::shared::experts::rtx::push::PushedExperts<'a>>>)> {
-        let Self { target, push, dense, device, sparks } = self;
+        -> Result<(TargetWeights<'a>, Vec<Vec<crate::shared::experts::rtx::push::PushedExperts<'a>>>,
+            Option<crate::shared::speculation::recurrent_weights::Weights<'a>>)> {
+        let Self { target, draft, push, dense, device, sparks } = self;
         crate::shared::placement::load_while_admitting(Some(pending), || {
             let (received, ()) = push.receive_sets_with(vec![device], Some(catalog), sparks, Some(Ok(dense)), || ());
             let experts = crate::shared::experts::rtx::push::PushPolicy::Required.committed(received)?
                 .context("Inkling target push group did not commit")?;
-            Ok((target, experts))
+            Ok((target, experts, draft))
         })
     }
 }

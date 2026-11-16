@@ -134,7 +134,8 @@ pub(crate) fn prepare<'a>(library: &'a NativeLibrary, programs: &'a Programs<'a>
 pub(crate) fn deliver<'a>(library: &'a NativeLibrary,
     view: &cuteafd_loader::plan::checkpoint::CheckpointView, checkpoint: &Checkpoint,
     prepared: &Prepared<'a>, options: &Options<'_>)
-    -> Result<(super::weights::TargetWeights<'a>, Vec<Vec<crate::shared::experts::rtx::push::PushedExperts<'a>>>)> {
+    -> Result<(super::weights::TargetWeights<'a>, Vec<Vec<crate::shared::experts::rtx::push::PushedExperts<'a>>>,
+        Option<crate::shared::speculation::recurrent_weights::Weights<'a>>)> {
     use crate::shared::{memory::device::Device, placement::{spark_rings, SparkAdmission}};
     use cuteafd_core::{ExpertGeometry, SparkEndpoint};
     use cuteafd_loader::placement::SparkWorkingSet;
@@ -176,7 +177,8 @@ pub(crate) fn whole<'a>(library: &'a Arc<NativeLibrary>, programs: &'a Programs<
     phase.log("inkling2 code and admission");
     cuteafd_bench::context::phase("Inkling code and admission");
     let phase = crate::shared::memory::load_timing::Split::start();
-    let (target, pushed) = deliver(library, view, checkpoint, &prepared, &options)?;
+    let (target, pushed, draft_weights) = deliver(library, view, checkpoint, &prepared, &options)?;
+    ensure!(draft_weights.is_none(), "bundled drafter delivered before its serving executor binding");
     phase.log("inkling2 grouped weight delivery");
     cuteafd_bench::context::phase("Inkling grouped weight delivery");
     let phase = crate::shared::memory::load_timing::Split::start();
