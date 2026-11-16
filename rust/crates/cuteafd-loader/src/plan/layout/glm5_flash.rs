@@ -375,6 +375,18 @@ fn layout_with_native(report: &mut PlanReport, model: &dyn super::super::FamilyM
             process.alternate_resident = Some(alternate);
         }
         process.target(checkpoint, &inputs, exlr8)?;
+        if let Some((_, metadata)) = exlr8 {
+            if spark_ranks > 0 {
+                let executions = super::planned_spark_executions("glm5_flash", SparkBackend::Exlr8,
+                    Some(u32::try_from(decode_rows)?), options)?;
+                let geometry = catalog.routed_experts().geometry()?;
+                process.spark_candidates = crate::plan::exlr8::spark_candidate_bytes(metadata,
+                    manifest.context("EXLR8 Spark owners require PROGRAMS.json")?, geometry, &executions,
+                    spark_ranks, &(0..cfg.layers).filter(|&layer| !cfg.dense[layer]).collect::<Vec<_>>(),
+                    options.exlr8_prefill_activations)?;
+                process.spark_cap = Some(options.spark_allocation_budget_bytes.unwrap_or(options.spark_bytes));
+            }
+        }
         let geometry = glmf::admission::host_geometry(&inputs)?;
         let quota = if options.prefix_entries("glm5_flash") == 0 || options.host_cache_bytes == Some(0) { 0 }
             else { geometry.resolve(options.host_cache_bytes, context, sequences, host.0, geometry.chunk_bytes())

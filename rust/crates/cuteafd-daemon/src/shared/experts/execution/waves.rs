@@ -111,6 +111,7 @@ pub(crate) struct WaveStaging<'a> {
     /// Input address table, route ids, route weights, output address table.
     device: [DeviceAllocation<'a>; 4],
     pub(crate) staged: Vec<StagedUnit>,
+    poisoned: bool,
     pub(crate) staged_units: u64,
     pub(crate) flushes: u64,
     /// Flushes that launched two or more members through row addresses.
@@ -184,7 +185,7 @@ impl<'a> WaveStaging<'a> {
             copied: (0..units).map(|_| device::Event::new(device)).collect::<Result<_>>()?,
             plane, row_bytes, unit_rows, rows, minimum_rows: minimum_rows.max(1), max_units: max_units as usize, topk, descriptors,
             device: [table(rows * 8)?, table(rows * topk * 4)?, table(rows * topk * 4)?, table(rows * 8)?],
-            staged: Vec::with_capacity(units), staged_units: 0, flushes: 0, merged: 0, bypassed: 0,
+            staged: Vec::with_capacity(units), poisoned: false, staged_units: 0, flushes: 0, merged: 0, bypassed: 0,
         }))
     }
 
@@ -244,7 +245,11 @@ impl<'a> WaveStaging<'a> {
     /// its own completion fence. `launch` queues the expert math only.
     pub(crate) fn flush(&mut self, pending: &mut PendingUnits<'a>, routes: &dyn UnitRoutes<'a>, stream: *mut c_void,
         launch: &mut dyn FnMut(&Wave<'_>) -> Result<()>) -> Result<()> {
+        ensure!(!self.poisoned, "Spark wave staging poisoned after failed flush; retire the owner");
         if self.staged.is_empty() { return Ok(()) }
+        // Any failure, including a partial route upload or fence record, is
+        // terminal for this owner. Retain all storage but never resubmit it.
+        self.poisoned = true;
         let rows: usize = self.staged.iter().map(|unit| unit.identity.2 as usize).sum();
         ensure!(rows <= self.rows && self.staged.len() <= self.max_units,
             "staged wave exceeds admitted rows");
@@ -290,6 +295,7 @@ impl<'a> WaveStaging<'a> {
             unsafe { pending.record_reserved(unit.slot, unit.identity, stream)?; }
         }
         self.staged.clear();
+        self.poisoned = false;
         Ok(())
     }
 
@@ -306,6 +312,7 @@ impl<'a> WaveStaging<'a> {
     pub(crate) fn stage_with_merge(&mut self, arrival: Arrival<'_, '_>, pending: &mut PendingUnits<'a>,
         routes: &mut dyn UnitRoutes<'a>, stream: *mut c_void, launch: &mut dyn FnMut(&Wave<'_>) -> Result<()>,
         merge_eligible: bool) -> Result<bool> {
+        ensure!(!self.poisoned, "Spark wave staging poisoned after failed flush; retire the owner");
         let request = arrival.request;
         let rows = request.rows() as usize;
         let Some(stride) = self.stride(request) else {
@@ -375,6 +382,18 @@ fn staged_rows_after(staged: &[StagedUnit]) -> usize {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn failed_flush_is_terminal_before_any_upload_or_launch_can_repeat() {
+        let source = include_str!("waves.rs");
+        let flush = source.split("    pub(crate) fn flush(").nth(1).unwrap().split("    pub(crate) fn stage(").next().unwrap();
+        let check = flush.find("ensure!(!self.poisoned").unwrap();
+        let poison = flush.find("self.poisoned = true").unwrap();
+        assert!(check < poison && poison < flush.find("routes.upload(").unwrap());
+        assert!(poison < flush.find("launch(&wave)?").unwrap());
+        assert!(flush.find("pending.record_reserved(").unwrap() < flush.find("self.poisoned = false").unwrap());
+        assert!(!flush.contains("unwrap_or") && !flush.contains("let _ ="));
+    }
+
     #[test]
     fn mixed_recipe_units_flush_before_and_after_the_singleton() {
         use super::singleton_boundary;

@@ -126,6 +126,25 @@ fn native_options(selected: &str, options: &super::PlanOptions, speculator: &str
     Ok((world, gpu_count, attention, layout))
 }
 
+/// Candidate-local Spark costs consumed by both native solvers. Weights are
+/// suffix-dependent; execution arenas are charged only while a rank is used.
+pub(crate) fn spark_candidate_bytes(metadata: &residency::MetadataInput, programs: &Value,
+    geometry: cuteafd_core::ExpertGeometry, executions: &cuteafd_core::SparkExecutions,
+    world: usize, layers: &[usize], activations: PrefillActivations) -> Result<Vec<Vec<u64>>> {
+    (0..=layers.len()).map(|count| {
+        (0..world).map(|rank| {
+            if count == layers.len() { return Ok(0); }
+            let facts = layers[count..].iter().map(|&layer| metadata.admission_geometry(layer, world, rank,
+                residency::ExpertSet::Routed)).collect::<std::result::Result<Vec<_>, _>>()?;
+            let weights = facts.iter().try_fold(0u64, |sum, (bytes, _)| sum.checked_add(*bytes as u64))
+                .context("EXLR8 candidate weight sum overflow")?;
+            let units = facts.iter().map(|(_, units)| *units).max().context("EXLR8 candidate has no layers")?;
+            weights.checked_add(crate::serving_capacity::spark_waves::exlr8_worker_bytes(programs, executions,
+                geometry, units, activations)?).context("EXLR8 candidate total overflow")
+        }).collect()
+    }).collect()
+}
+
 pub(super) fn native_plan_of(input: &super::PlanInput, selected: &str,
     options: &super::PlanOptions, speculator: &str) -> Result<NativePlan> {
     use super::{ExpertPlacement, Status, RuntimeStatus, spec::Component};
@@ -245,7 +264,7 @@ pub(super) fn native_plan_of(input: &super::PlanInput, selected: &str,
         spark_worlds: (1..=8).collect(), local: Ok(format!("{package} coordinator native experts")) });
     if adapter_ready {
         report.hints.push(super::Hint { what: "EXLR8 native runtime is WIP admitted, not quality-qualified".into(),
-            how: "Spark resident bytes are exact; K1 workspace/host staging and rings are checked by worker live admission before loading weights.".into() });
+            how: "Spark weights and K1/grouped/merged execution owners are admitted by the planner; worker live admission checks the same arena inventory.".into() });
     } else if let Err(error) = execution { report.hints.push(error.hint()); }
     report.placement = if selected_world == 0 { ExpertPlacement::Local }
         else { ExpertPlacement::Sparks { ranks: selected_world } };
@@ -267,21 +286,23 @@ pub(super) fn native_plan_of(input: &super::PlanInput, selected: &str,
             let units = (first_spark..layers).map(|layer| metadata.admission_geometry(layer, selected_world, rank,
                 residency::ExpertSet::Routed).map(|(_, units)| units)).collect::<std::result::Result<Vec<_>, _>>()?
                 .into_iter().max().unwrap_or(1);
-            let waves = executions.workspace_bytes(|extent| -> Result<cuteafd_core::OwnerBytes> {
-                let staging = crate::serving_capacity::spark_waves::staging(extent, geometry)?;
-                Ok(cuteafd_core::OwnerBytes {
-                    scratch: crate::serving_capacity::spark_waves::exlr8_scratch(&programs, extent, geometry,
-                        units, layout.exlr8_prefill_activations)?,
-                    io: staging.plane_bytes + staging.table_bytes, pinned_staging: staging.pinned_per_unit,
-                })
-            })?.context("EXLR8 wave owner sum overflow")?;
-            device.items.retain(|item| item.group != "merged expert waves");
+            let bytes = crate::serving_capacity::spark_waves::exlr8_worker_bytes(&programs, &executions,
+                geometry, units, layout.exlr8_prefill_activations)?;
+            device.items.retain(|item| item.group != "EXLR8 execution owners");
             device.items.push(cuteafd_core::memory_layout::Item::new(cuteafd_core::memory_layout::Category::Workspace,
-                "merged expert waves", "manifest-sized arena, staged inputs, route/address tables and pinned descriptors",
-                waves.total().context("EXLR8 wave owner bytes overflow")?, cuteafd_core::memory_layout::Basis::Exact));
+                "EXLR8 execution owners", "K1/grouped/merged arenas, staged inputs, tables, pinned routes and fallback",
+                bytes, cuteafd_core::memory_layout::Basis::Exact));
         }
     }
     append_spark_encoder(&mut memory, report.encoder.as_ref())?;
+    for device in memory.devices.iter().filter(|device| device.kind == cuteafd_core::memory_layout::DeviceKind::Spark) {
+        let cap = device.capacity_bytes.min(options.spark_budget());
+        let used = device.used_bytes();
+        if used > cap {
+            report.refuse_placement(format!("EXLR8 spark{} weights + execution owners need {used} bytes, cap {cap}, shortfall {} bytes",
+                device.index, used - cap), "Increase Spark memory or onboard more layers; execution arenas must fit at plan time.");
+        }
+    }
     let context = if layout.context_tokens > 0 { layout.context_tokens } else {
         report.cache_requirements.as_ref().and_then(|cache| cache.checkpoint_max_context_tokens).unwrap_or(0) };
     let physical = layout.rtx_bytes.iter().map(|&bytes| crate::placement::CoordinatorCard::planned(

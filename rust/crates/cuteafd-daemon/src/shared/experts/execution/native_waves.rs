@@ -90,3 +90,27 @@ impl NativeWaveLaunch<'_, '_> {
         Ok(())
     }
 }
+
+
+pub(super) fn same_recipe(left: Option<(u32, cuteafd_ffi::V41ExpertReduction)>,
+    right: Option<(u32, cuteafd_ffi::V41ExpertReduction)>) -> bool {
+    left.is_some() && left == right
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn merged_members_require_equal_capacity_and_full_recipe() {
+        let recipe = cuteafd_ffi::V41ExpertReduction { implementation: 2, plane_fold: 3,
+            slice_width: 128, plane_count: 1, ..Default::default() };
+        assert!(same_recipe(Some((4096, recipe)), Some((4096, recipe))));
+        assert!(!same_recipe(Some((4096, recipe)), Some((1024, recipe))));
+        for other in [cuteafd_ffi::V41ExpertReduction { slice_width: 64, ..recipe },
+            cuteafd_ffi::V41ExpertReduction { plane_fold: 1, ..recipe },
+            cuteafd_ffi::V41ExpertReduction { plane_count: 2, ..recipe }] {
+            assert!(!same_recipe(Some((4096, recipe)), Some((4096, other))));
+        }
+        assert!(!same_recipe(None, None));
+    }
+}

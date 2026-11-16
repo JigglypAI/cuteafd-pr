@@ -168,6 +168,31 @@ pub fn glm_admission_programs() -> Value {
                 .into_iter().map(|(name,dtype,shape,role)| json!({"name":name,"dtype":dtype,"shape":shape,"role":role})).collect::<Vec<_>>()),
             "scalars":[{"type":"int32"},{"type":"int32"}],"scratch_bytes_at_capacity":{}}),
     ]);
+    // Every Spark owner uses the same manifest ABI as production; payloads
+    // remain absent because these fixtures run metadata-only admission.
+    let entries = manifest["programs"].as_array_mut().unwrap();
+    for (suffix, capacity, tile, groups) in [("a16_serving", 64u64, 16u64, 512u64),
+        ("a16_grouped64", 64, 16, 512), ("a16_grouped", 4096, 64, 768),
+        ("a8_grouped", 4096, 64, 768), ("a16_grouped_segments", 8192, 64, 1280),
+        ("a8_grouped_segments", 8192, 64, 1280)] {
+        let grouped = suffix != "a16_serving";
+        let segments = suffix.ends_with("_segments");
+        let mut names = pointers.to_vec();
+        if segments { names[11] = "output_rows"; }
+        if grouped { names.extend(["unit_count", "unit_map"]); }
+        let mut geometry = json!({"abi_version":3,"hidden":6144,"units":16,"top_k":8,
+            "max_groups":groups,"max_rows":capacity,"split_k_blocks":8,"fc1_splits":6,"ctas_per_sm":2});
+        if grouped { geometry["group_rows"] = tile.into(); }
+        else { geometry["serving_variant"] = "k1_k23_coalesced".into(); }
+        if suffix == "a16_grouped64" { geometry["fc2_partials"] = "f32".into(); }
+        if suffix.starts_with("a8_") { geometry["activations"] = "a8".into(); }
+        if segments { geometry["row_addresses"] = true.into(); }
+        entries.push(json!({"name":format!("exlr8_{suffix}"),"capacity_rows":capacity,"geometry":geometry,
+            "pointers":names.iter().map(|name|json!({"name":name})).collect::<Vec<_>>(),
+            "scalars":(0..if grouped {4} else {2}).map(|_|json!({"type":"int32"})).collect::<Vec<_>>(),
+            "scratch_bytes_at_capacity":{"fc1":groups*16*2*6*tile*128*4,
+                "intermediate":groups*16*tile*128*2,"fc2":groups*tile*6144*4}}));
+    }
     manifest
 }
 

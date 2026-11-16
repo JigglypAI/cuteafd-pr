@@ -330,7 +330,7 @@ mod load_order_tests {
 pub(crate) struct ExpertReductionPlan {
     decode: Vec<(usize, usize)>,
     decode_rows: usize,
-    stream_capacities: Vec<usize>,
+    stream_capacities: Vec<(usize, cuteafd_ffi::V41ExpertReduction)>,
 }
 
 impl ExpertReductionPlan {
@@ -399,12 +399,16 @@ impl ExpertReductionPlan {
             "native decode capacities must share one slice/fold recipe");
         let mut plan = Self::new(variants, decode_rows)?;
         plan.stream_capacities = variants.iter().filter_map(|(capacity, recipe)|
-            (recipe.implementation == 2).then_some(*capacity)).collect();
+            (recipe.implementation == 2).then_some((*capacity, *recipe))).collect();
         Ok(plan)
     }
 
     pub(crate) fn merges_stream_capacity(&self, capacity: usize) -> bool {
-        self.stream_capacities.contains(&capacity)
+        self.stream_recipe(capacity).is_some()
+    }
+
+    pub(crate) fn stream_recipe(&self, capacity: usize) -> Option<cuteafd_ffi::V41ExpertReduction> {
+        self.stream_capacities.iter().find(|(rows, _)| *rows == capacity).map(|(_, recipe)| *recipe)
     }
 
     pub(crate) fn execution_index(

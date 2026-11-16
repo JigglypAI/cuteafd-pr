@@ -98,15 +98,10 @@ pub(super) fn load<'a>(library: &'a NativeLibrary, catalog: &OfficialV41Catalog,
     let unit_limit = plans.iter().map(Residency::compact_unit_limit).max().context("EXLR8 has no resident plans")?;
     let info = library.cuda_device_info(library.cuda_get_device()?)?;
     let capability = (info.compute_capability_major, info.compute_capability_minor);
-    let owners = spark_execution_workspace(config, |capacity, _, staging_rows, extent| {
-        let waves = cuteafd_loader::serving_capacity::spark_waves::staging(extent, geometry)?;
-        let segments = if extent.segment_rows().is_some() && extent.staging_rows > K1_ROWS as u32 {
-            Exlr8Execution::segment_workspace_bytes(programs, family, extent.segment_rows().unwrap() as usize,
-                unit_limit, config.exlr8_prefill_activations)? as u64
-        } else { 0 };
-        Ok((execution_bytes(programs, family, capacity as usize, unit_limit, capability,
-            config.exlr8_prefill_activations)? + usize::try_from(segments)?, usize::try_from(waves.plane_bytes + waves.table_bytes)?,
-            staging_rows as usize * geometry.topk as usize * 8 + usize::try_from(waves.pinned_per_unit)?))
+    let owners = spark_execution_workspace(config, |_, _, _, extent| {
+        let owner = cuteafd_loader::serving_capacity::spark_waves::exlr8_owner_from_specs(
+            |name| Ok(programs.spec(name)?.clone()), extent, geometry, unit_limit, config.exlr8_prefill_activations)?;
+        Ok((owner.scratch.try_into()?, owner.io.try_into()?, owner.pinned_staging.try_into()?))
     })?;
     let k1_workspace_bytes = usize::try_from(owners.total().context("EXLR8 owner workspace overflow")?)?;
     // Blocking fallback uploads share the native library's one pinned cache;
@@ -208,9 +203,7 @@ impl<'w, 'a> Worker<'w, 'a> {
     pub(super) fn prepare_waves(&mut self, extent: cuteafd_core::OwnerExtent) -> Result<()> {
         let geometry = cuteafd_core::expert_geometry();
         let row = geometry.hidden * 33 / 32;
-        let max_units = if extent.buffered_units > 1 { cuteafd_core::spark_executions::MAX_MERGED_UNITS } else { 1 };
-        let layout = cuteafd_core::spark_executions::wave_staging_layout(extent, row, geometry.topk, max_units)
-            .context("EXLR8 staging layout overflow")?;
+        let layout = cuteafd_loader::serving_capacity::spark_waves::staging_for_input(extent, geometry, row)?;
         if layout.rows == 0 { return Ok(()); }
         if let Some(rows) = extent.segment_rows().filter(|_| extent.staging_rows > K1_ROWS as u32) {
             self.segments = Some(Exlr8Execution::new_segments(self.library, self.programs, self.family,
@@ -219,7 +212,7 @@ impl<'w, 'a> Worker<'w, 'a> {
         let plane = crate::shared::memory::DeviceAllocation::new(self.library, layout.plane_bytes.try_into()?,
             crate::shared::memory::Tag::workspace("experts/workspace/staged_units"))?;
         self.waves = super::super::execution::waves::WaveStaging::with_max_units(self.library, extent,
-            plane.buffer, row as usize, 1, max_units)?;
+            plane.buffer, row as usize, 1, cuteafd_core::spark_executions::MAX_MERGED_UNITS)?;
         self.staged_plane = Some(plane);
         self.timing_units = std::collections::VecDeque::with_capacity(extent.buffered_units as usize);
         Ok(())
@@ -310,7 +303,6 @@ impl<'w, 'a> Worker<'w, 'a> {
                 if self.stage(request, mapped.hidden_payload, output, executor_id)? { return Ok(()); }
             }
         }
-        if self.waves.is_some() && mapped.is_some() { self.timing_units.push_back(true); }
         let stage = self.pending.next_slot()?;
         let identity = (request.request_id(), request.layer(), rows as u32, executor_id);
         let compressed = request.output_dtype() != ExpertV2Dtype::Bf16;
@@ -380,6 +372,7 @@ impl<'w, 'a> Worker<'w, 'a> {
         }
         // SAFETY: every mapped copy and output write precedes this unit fence.
         unsafe { self.pending.record(identity, self.stream.raw)?; }
+        if self.waves.is_some() { self.timing_units.push_back(true); }
         if !self.deferred {
             // SAFETY: this worker exclusively owns the stream and every queued view.
             unsafe { self.library.cuda_stream_synchronize(self.stream.raw)?; }

@@ -20,9 +20,18 @@ pub fn native_segment_layout(spec: &ProgramSpec, geometry: ExpertGeometry, width
 /// Plane/table/descriptor bytes do not depend on backend; scratch is the
 /// maximum native width arena, or the one EXLR8 manifest-sized arena.
 pub fn staging(extent: OwnerExtent, geometry: ExpertGeometry) -> Result<cuteafd_core::spark_executions::WaveStagingLayout> {
-    let cap = if extent.buffered_units > 1 { cuteafd_core::spark_executions::MAX_MERGED_UNITS } else { 1 };
-    cuteafd_core::spark_executions::wave_staging_layout(extent, geometry.hidden * 33 / 32, geometry.topk, cap)
-        .context("Spark wave staging extent overflow")
+    staging_for_input(extent, geometry, geometry.hidden * 33 / 32)
+}
+
+/// Spark native/EXLR8 staging has one wire contract. Validate the actual
+/// installed input stride before allocating, rather than undercharging BF16.
+pub fn staging_for_input(extent: OwnerExtent, geometry: ExpertGeometry, row_bytes: u32)
+    -> Result<cuteafd_core::spark_executions::WaveStagingLayout> {
+    if extent.segment_rows().is_none() { return Ok(Default::default()); }
+    ensure!(row_bytes == geometry.hidden * 33 / 32,
+        "Spark wave staging requires FP8 K32 ingress, not {row_bytes}-byte rows");
+    cuteafd_core::spark_executions::wave_staging_layout(extent, row_bytes, geometry.topk,
+        cuteafd_core::spark_executions::MAX_MERGED_UNITS).context("Spark wave staging extent overflow")
 }
 
 pub fn native_scratch(programs: &serde_json::Value, extent: OwnerExtent, geometry: ExpertGeometry,
@@ -53,6 +62,17 @@ pub fn exlr8_scratch(programs: &serde_json::Value, extent: OwnerExtent, geometry
 mod tests {
     use super::*;
     #[test]
+    fn staging_skips_single_flight_and_rejects_noncanonical_native_ingress() {
+        let geometry = ExpertGeometry::DEEPSEEK_V41;
+        let mut extent = OwnerExtent { owner: cuteafd_core::ExecutionOwner::Prefill,
+            capacity: 2752, compiled: 4096, staging_rows: 2752, buffered_units: 3 };
+        assert_eq!(staging(extent, geometry).unwrap(), staging_for_input(extent, geometry, 5280).unwrap());
+        assert!(staging_for_input(extent, geometry, geometry.hidden * 2).unwrap_err().to_string().contains("FP8 K32 ingress"));
+        extent.buffered_units = 1;
+        assert_eq!(staging_for_input(extent, geometry, geometry.hidden * 2).unwrap(), Default::default());
+    }
+
+    #[test]
     fn missing_native_segments_name_the_export_and_republication() {
         let extent = OwnerExtent { owner: cuteafd_core::ExecutionOwner::Prefill, capacity: 2752,
             compiled: 4096, staging_rows: 2752, buffered_units: 3 };
@@ -74,4 +94,44 @@ mod tests {
             geometry, [448,512])?, 0);
         Ok(())
     }
+}
+
+/// All retained EXLR8 execution owners, including the old K1 arenas. Spark
+/// dispatch is SM121: compact decode plus grouped decode at its unit threshold.
+pub fn exlr8_owner_bytes(programs: &serde_json::Value, extent: OwnerExtent, geometry: ExpertGeometry,
+    units: usize, activations: crate::plan::exlr8::PrefillActivations) -> Result<cuteafd_core::OwnerBytes> {
+    exlr8_owner_from_specs(|name| crate::plan::exlr8::workspace::program_spec(programs, name),
+        extent, geometry, units, activations)
+}
+
+pub fn exlr8_owner_from_specs(mut spec: impl FnMut(&str) -> Result<ProgramSpec>, extent: OwnerExtent,
+    geometry: ExpertGeometry, units: usize, activations: crate::plan::exlr8::PrefillActivations)
+    -> Result<cuteafd_core::OwnerBytes> {
+    use crate::plan::exlr8::{execution_workspace, residency::ExpertSet, ExecutionVariant, PrefillActivations};
+    let family = cuteafd_ffi::exlr8::KernelFamily::from_geometry(geometry.hidden as usize,
+        geometry.intermediate as usize / 128, geometry.topk as usize, geometry.experts as usize)?;
+    let mut arena = |variant: ExecutionVariant, rows: usize, activations| -> Result<u64> {
+        Ok(execution_workspace(&spec(variant.program(family, activations))?, rows,
+            ExpertSet::Routed, variant, units, activations)?.bytes as u64)
+    };
+    let decode_rows = extent.capacity.min(64) as usize;
+    let mut scratch = arena(ExecutionVariant::DecodeCompact, decode_rows, PrefillActivations::A16)?;
+    if decode_rows >= if units <= 3 { 16 } else { 8 } {
+        scratch += arena(ExecutionVariant::DecodeGrouped, decode_rows, PrefillActivations::A16)?;
+    }
+    if extent.capacity > 64 { scratch += arena(ExecutionVariant::Prefill, extent.capacity as usize, activations)?; }
+    if let Some(rows) = extent.segment_rows().filter(|_| extent.staging_rows > 64) {
+        scratch += arena(ExecutionVariant::Segments, rows as usize, activations)?;
+    }
+    let stage = staging(extent, geometry)?;
+    Ok(cuteafd_core::OwnerBytes { scratch, io: stage.plane_bytes + stage.table_bytes,
+        pinned_staging: u64::from(extent.staging_rows) * u64::from(geometry.topk) * 8 + stage.pinned_per_unit })
+}
+
+pub fn exlr8_worker_bytes(programs: &serde_json::Value, executions: &cuteafd_core::SparkExecutions,
+    geometry: ExpertGeometry, units: usize, activations: crate::plan::exlr8::PrefillActivations) -> Result<u64> {
+    let owners = executions.workspace_bytes(|extent| exlr8_owner_bytes(programs, extent, geometry, units, activations))?
+        .context("EXLR8 worker owner overflow")?;
+    owners.total().and_then(|bytes| bytes.checked_add(u64::from(executions.capacity()) * u64::from(geometry.hidden) * 33 / 32))
+        .context("EXLR8 worker fallback staging overflow")
 }

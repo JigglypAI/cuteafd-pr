@@ -162,6 +162,7 @@ pub(crate) struct ExpertExecution<'weights, 'library> {
     segments: Option<native_waves::NativeSegments<'library>>,
     staged_plane: Option<DeviceAllocation<'library>>,
     timing_units: std::collections::VecDeque<bool>,
+    staged_recipe: Option<(u32, cuteafd_ffi::V41ExpertReduction)>,
 }
 impl<'library> ExpertWeights<'library> {
     pub fn execution_budget(&self, compiled: u32, live: u32) -> Result<ExpertExecutionBudget> {
@@ -385,7 +386,7 @@ impl<'library> ExpertWeights<'library> {
             alternate_widths: Vec::new(),
             live_capacity: live,
             budget,
-            waves: None, segments: None, staged_plane: None, timing_units: Default::default(),
+            waves: None, segments: None, staged_plane: None, timing_units: Default::default(), staged_recipe: None,
         })
     }
 }
@@ -593,13 +594,11 @@ impl<'weights, 'library> ExpertExecution<'weights, 'library> {
         if self._weights.is_nvfp4() { return Ok(()); }
         let geometry = cuteafd_core::expert_geometry();
         let row = self.kernel.info().input_row_bytes()?;
-        let max_units = if extent.buffered_units > 1 { cuteafd_core::spark_executions::MAX_MERGED_UNITS } else { 1 };
-        let layout = cuteafd_core::spark_executions::wave_staging_layout(extent, row.try_into()?, geometry.topk, max_units)
-            .context("native staging layout overflow")?;
+        let layout = cuteafd_loader::serving_capacity::spark_waves::staging_for_input(extent, geometry, row.try_into()?)?;
         if layout.rows == 0 { return Ok(()); }
         let plane = DeviceAllocation::new(self.library, layout.plane_bytes.try_into()?,
             crate::shared::memory::Tag::workspace("experts/workspace/staged_units"))?;
-        self.waves = waves::WaveStaging::with_max_units(self.library, extent, plane.buffer, row, 1, max_units)?;
+        self.waves = waves::WaveStaging::with_max_units(self.library, extent, plane.buffer, row, 1, cuteafd_core::spark_executions::MAX_MERGED_UNITS)?;
         self.staged_plane = Some(plane);
         self.timing_units = std::collections::VecDeque::with_capacity(extent.buffered_units as usize);
         Ok(())
@@ -613,6 +612,7 @@ impl<'weights, 'library> ExpertExecution<'weights, 'library> {
 
     pub(crate) fn flush_staged(&mut self) -> Result<()> {
         self.dispatch_waves(None, false)?;
+        self.staged_recipe = None;
         Ok(())
     }
 
@@ -630,8 +630,12 @@ impl<'weights, 'library> ExpertExecution<'weights, 'library> {
             return Ok(false);
         }
         let (kernel, _, _) = self.execution_state(request.rows())?;
-        let eligible = self.reduction_plan.as_ref().is_some_and(|plan|
-            plan.merges_stream_capacity(kernel.info().capacity_rows as usize)) && self.segments.is_some();
+        let capacity = kernel.info().capacity_rows;
+        let recipe = self.reduction_plan.as_ref().and_then(|plan| plan.stream_recipe(capacity as usize));
+        let eligible = recipe.is_some() && self.segments.is_some();
+        let identity = recipe.map(|recipe| (capacity, recipe));
+        if self.has_staged() && !native_waves::same_recipe(self.staged_recipe, identity) { self.flush_staged()?; }
+        self.staged_recipe = identity;
         self.dispatch_waves(Some(waves::Arrival { request, input, output,
             layer: request.layer() as usize, executor_id }), eligible)
     }
@@ -913,7 +917,6 @@ impl ExpertExecution<'_, '_> {
                 if self.stage(request, input, output, executor_id)? { return Ok(()); }
             }
         }
-        if self.waves.is_some() && self.deferred && destination.is_some() { self.timing_units.push_back(true); }
         let stage = self.pending.next_slot()?;
         let routes = request.rows() as usize * cuteafd_core::expert_geometry().topk as usize;
         let bytes = request.plane_bytes()?;
@@ -1029,6 +1032,7 @@ impl ExpertExecution<'_, '_> {
         if self.deferred && destination.is_some() {
             // SAFETY: all copies, math and output writes precede this unit fence.
             unsafe { self.pending.record((request.request_id(), request.layer(), request.rows(), executor_id), self.stream())?; }
+            if self.waves.is_some() { self.timing_units.push_back(true); }
             return Ok(());
         }
         self.synchronize()?;

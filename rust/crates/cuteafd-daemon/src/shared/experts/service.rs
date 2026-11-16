@@ -200,7 +200,9 @@ fn load_weights<'a>(
             .context("native Spark route staging overflow")?;
         let geometry = cuteafd_core::expert_geometry();
         let waves = if nvfp4 { Default::default() } else {
-            cuteafd_loader::serving_capacity::spark_waves::staging(extent, geometry)?
+            let info = config.selection(layers[0])?.select_info(library, compiled, false)?;
+            cuteafd_loader::serving_capacity::spark_waves::staging_for_input(extent, geometry,
+                info.input_row_bytes()?.try_into()?)?
         };
         let segments = if !nvfp4 && extent.segment_rows().is_some() {
             let path = config.library.parent().context("native library directory")?.join("../share/PROGRAMS.json");

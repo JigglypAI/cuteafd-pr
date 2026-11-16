@@ -214,7 +214,18 @@ impl<'a> Weights<'a> {
             Self::Exlr8(_) => true, _ => false };
         let remaining = if staged {
             let geometry = cuteafd_core::expert_geometry();
-            let waves = cuteafd_loader::serving_capacity::spark_waves::staging(extent, geometry)?;
+            let waves = match self {
+                Self::Full(weights) => {
+                    let info = weights.first().context("native weights empty")?.layer.select_info(library, compiled, false)?;
+                    cuteafd_loader::serving_capacity::spark_waves::staging_for_input(extent, geometry,
+                        info.input_row_bytes()?.try_into()?)?
+                }
+                _ => cuteafd_loader::serving_capacity::spark_waves::staging(extent, geometry)?,
+            };
+            // `remaining` is device_budget minus resident weight arena (and
+            // retained EXLR8 host descriptors), NOT minus admitted workspace.
+            // Reserve future wave allocations here; local.rs later subtracts
+            // their measured physical allocations exactly once from its FIFO budget.
             let segments = match self {
                 Self::Full(weights) if extent.segment_rows().is_some() => {
                     let path = config.library.parent().context("native library directory")?.join("../share/PROGRAMS.json");

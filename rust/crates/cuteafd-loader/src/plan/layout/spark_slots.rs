@@ -565,8 +565,7 @@ mod tests {
                             geometry.experts as usize, geometry.topk as usize, a.logical, a.role, rows, coded).unwrap())
                         .sum::<u64>()).sum::<u64>();
                     assert_eq!(total.scratch, expected);
-                    let waves = cuteafd_core::spark_executions::wave_staging_layout(shape, geometry.hidden * 33 / 32,
-                        geometry.topk, 1).unwrap();
+                    let waves = crate::serving_capacity::spark_waves::staging(shape, geometry).unwrap();
                     assert_eq!(total.io, u64::from(live) * (u64::from(geometry.hidden) * 97 / 32 + u64::from(geometry.topk) * 8)
                         + waves.plane_bytes + waves.table_bytes);
                     let buffered = mxfp4_owner_bytes(geometry, &artifacts, coded,
@@ -575,7 +574,7 @@ mod tests {
                     let extra = crate::serving_capacity::spark_waves::staging(
                         cuteafd_core::OwnerExtent { buffered_units: 3, ..shape }, geometry).unwrap();
                     assert_eq!(buffered.io, total.io + extra.plane_bytes + extra.table_bytes - waves.plane_bytes - waves.table_bytes);
-                    assert_eq!(buffered.pinned_staging, total.pinned_staging);
+                    assert_eq!(buffered.pinned_staging, total.pinned_staging + extra.pinned_per_unit - waves.pinned_per_unit);
                 }
             }
         }
