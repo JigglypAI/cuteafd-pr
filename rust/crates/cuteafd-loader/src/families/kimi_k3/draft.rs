@@ -36,7 +36,7 @@ impl DraftLayout {
         }
     }
     pub fn window_mark_bytes(&self) -> Result<usize> {
-        match self { Self::Mla(l) => l.window_mark_bytes(), Self::Block(l) => l.window_mark_bytes() }
+        match self { Self::Mla(l) => Ok(l.window_mark_bytes()?), Self::Block(l) => l.window_mark_bytes() }
     }
     pub fn weight_arena_requests(&self) -> Vec<(String, usize)> {
         match self { Self::Mla(l) => l.weight_arena_requests(), Self::Block(l) => l.weight_requests.clone() }
@@ -60,7 +60,7 @@ impl DraftLayout {
         use cuteafd_core::memory_layout::{Basis, Category};
         use crate::placement::{draft::DrafterDemand, Demand, ResidentWeights};
         match self {
-            Self::Mla(l) => l.demands(gpu),
+            Self::Mla(l) => Ok(l.demands(gpu)?),
             Self::Block(l) => {
                 let mut owned = l.demands(gpu);
                 owned.push(Demand::new(gpu,Category::Drafter,"block dSpark owned weights",l.weights.payload_bytes() as u64,
