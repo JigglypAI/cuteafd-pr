@@ -227,6 +227,7 @@ const N_HARD: u64 = 1;
 struct NativeGraph {
     exec: usize,
     signature: Vec<u64>,
+    indexed: Option<(usize, u64)>,
 }
 struct UpdateRequest {
     identity: Identity,
@@ -1163,8 +1164,6 @@ impl DeviceCache {
         let Some(bank) = self.records.get(&id).map(|record| record.identity.bank) else { return };
         let lane = self.bank_lane(bank);
         let epoch = hit_epoch(self.device, lane, self.lanes[lane].index);
-        let moved_stamp = self.records[&id].last_used != Some(epoch);
-        if moved_stamp { self.remove_donor_candidate(id); }
         let record = self.records.get_mut(&id).unwrap();
         if !record.pinned {
             if let Some(last) = record.last_used { self.reuse_ages.record(epoch.saturating_sub(last)); }
@@ -1176,7 +1175,6 @@ impl DeviceCache {
         if !pinned && !pending && matches!(record.list, Some(List::Recent | List::Frequent)) {
             self.push(id, List::Frequent);
         }
-        if moved_stamp { self.insert_donor_candidate(id); }
     }
 
     /// Pinned hits accumulate in the bank, without a lock or ARC mutation.
@@ -1312,6 +1310,7 @@ impl DeviceCache {
                 r.pinned || r.pending_capture || r.pending_destroy || r.permanently_eager || r.oom.is_some() ||
                     matches!(r.list, Some(List::Recent | List::Frequent))
             }) || (!hard && self.charged < self.soft.limit) { return None }
+        self.repair_donor_fronts();
         let any_cold = self.donor_candidates.values().any(|lanes| lanes.iter().any(|lane|
             lane.first().is_some_and(|&(_, id)| self.donor_age(id, hard).is_some())));
         if !any_cold {
@@ -1328,11 +1327,10 @@ impl DeviceCache {
     }
 
     fn remove_donor_candidate(&mut self, id: u64) {
-        let Some(native) = self.native_graphs.get(&id) else { return };
-        let Some(record) = self.records.get(&id) else { return };
-        let lane = self.bank_lane(record.identity.bank);
+        let Some(native) = self.native_graphs.get_mut(&id) else { return };
+        let Some((lane, stamp)) = native.indexed.take() else { return };
         if let Some(candidates) = self.donor_candidates.get_mut(&native.signature) {
-            if let Some(last) = record.last_used { candidates[lane].remove(&(last, id)); }
+            candidates[lane].remove(&(stamp, id));
             if candidates.iter().all(|lane| lane.is_empty()) { self.donor_candidates.remove(&native.signature); }
         }
     }
@@ -1349,12 +1347,13 @@ impl DeviceCache {
     }
 
     fn insert_donor_candidate(&mut self, id: u64) {
-        let Some(native) = self.native_graphs.get(&id) else { return };
+        let Some(native) = self.native_graphs.get_mut(&id) else { return };
         let Some(record) = self.records.get(&id) else { return };
         if native.signature.is_empty() || record.pinned || record.pending_destroy ||
             !matches!(record.list, Some(List::Recent | List::Frequent)) { return }
         let Some(last) = record.last_used else { return };
-        let lane = self.bank_lane(record.identity.bank);
+        let lane = self.bank_lanes.get(&record.identity.bank).copied().unwrap_or(0);
+        native.indexed = Some((lane, last));
         if let Some(candidates) = self.donor_candidates.get_mut(native.signature.as_slice()) {
             candidates[lane].insert((last, id));
         } else {
@@ -1364,9 +1363,41 @@ impl DeviceCache {
         }
     }
 
+    fn repair_fronts(records: &HashMap<u64, Record>, native: &mut HashMap<u64, NativeGraph>,
+        lanes: &mut [std::collections::BTreeSet<(u64, u64)>; 2]) -> usize {
+        let mut repairs = 0;
+        for (lane, candidates) in lanes.iter_mut().enumerate() {
+            loop {
+                let Some(&(stamp, id)) = candidates.first() else { break };
+                let actual = records.get(&id).and_then(|record| record.last_used);
+                if actual == Some(stamp) { break }
+                candidates.pop_first();
+                if let Some(actual) = actual {
+                    candidates.insert((actual, id));
+                    if let Some(native) = native.get_mut(&id) { native.indexed = Some((lane, actual)); }
+                }
+                repairs += 1;
+            }
+        }
+        repairs
+    }
+
+    fn repair_signature_fronts(&mut self, signature: &[u64]) -> usize {
+        self.donor_candidates.get_mut(signature).map_or(0, |lanes|
+            Self::repair_fronts(&self.records, &mut self.native_graphs, lanes))
+    }
+
+    fn repair_donor_fronts(&mut self) -> usize {
+        // Only misses repair timestamps. Replays stamp the fixed record/histogram
+        // without allocating; each stale entry moves forward at most once.
+        self.donor_candidates.values_mut().map(|lanes|
+            Self::repair_fronts(&self.records, &mut self.native_graphs, lanes)).sum()
+    }
+
     fn cold_donor(&mut self, signature: &[u64], hard: bool) -> Option<u64> {
         self.refresh_cycles();
         if signature.is_empty() { return None }
+        self.repair_signature_fronts(signature);
         self.donor_candidates.get(signature)?.iter().filter_map(|lane| {
             let &(_, id) = lane.first()?;
             self.donor_age(id, hard).map(|age| (id, age))
@@ -1374,7 +1405,7 @@ impl DeviceCache {
     }
 
     pub(super) fn register_native(&mut self, id: u64, exec: usize, signature: Vec<u64>) {
-        self.native_graphs.insert(id, NativeGraph { exec, signature });
+        self.native_graphs.insert(id, NativeGraph { exec, signature, indexed: None });
         self.insert_donor_candidate(id);
     }
 
@@ -1434,6 +1465,7 @@ impl DeviceCache {
         self.push(donor, List::RecentGhost);
         let mut native = self.native_graphs.remove(&donor).unwrap();
         native.exec = transferred;
+        native.indexed = None;
         record.identity = request.identity.clone();
         record.cycle = request.site.cycle;
         record.pinned = request.pinned;
@@ -2511,6 +2543,21 @@ mod tests {
         }
         println!("cold_donor_selection_with_cycle: {:.3} us/miss; 22000 records, 41 topologies, {iterations} misses; precheck+selection+one cycle/100 misses; no epoch rebuild",
             start.elapsed().as_secs_f64() * 1e6 / iterations as f64);
+        let hot: Vec<_> = cache.native_graphs.iter().filter(|(_, native)| native.signature == [3, 1])
+            .map(|(&id, _)| id).collect();
+        cache.begin_lane(0); cache.complete_lane(0);
+        for &id in &hot { cache.hit(id); }
+        let start = Instant::now();
+        let repairs = cache.repair_signature_fronts(&[3, 1]);
+        println!("cold_donor_worst_hot_repair: {:.3} us/miss; {repairs} repairs, {} matching candidates hit since last miss",
+            start.elapsed().as_secs_f64() * 1e6, hot.len());
+        cache.begin_lane(0); cache.complete_lane(0);
+        for &id in &hot { cache.hit(id); }
+        let start = Instant::now();
+        let mut repairs = 0;
+        for _ in 0..1000 { repairs += cache.repair_signature_fronts(&[3, 1]); }
+        println!("cold_donor_repair_mean_after_hot: {:.3} us/miss; {:.3} repairs/miss over1000 including one fully hot repair",
+            start.elapsed().as_secs_f64() * 1e3, repairs as f64 / 1000.0);
 
     }
 
