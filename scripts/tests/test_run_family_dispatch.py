@@ -5672,3 +5672,48 @@ def test_dense_qwen_sharded_modes_name_unbuilt_native_exports(tmp_path, attentio
     assert result.returncode != 0
     assert "unbuilt" in result.stderr and "exports" in result.stderr and "2133" in result.stderr
     assert "serve-qwen35 --snapshot" not in result.stderr
+
+
+@pytest.mark.parametrize("family", ["deepseek_v41", "deepseek_v4", "glm5", "glm5_flash", "mimo_v2",
+                                    "qwen4", "qwen3_5", "kimi_k3", "step5", "muse_spark", "minimax_m3"])
+def test_nondefault_config_handoff_matches_composed_serving_values(tmp_path, family):
+    from test_serve_launch_new_families import KIMI, STEP5, MUSE
+    configs = {"deepseek_v41": {"model_type": "deepseek_v41"}, "deepseek_v4": {"model_type": "deepseek_v4"},
+        "glm5": {"model_type": "glm_moe_dsa", "num_hidden_layers": 4, "first_k_dense_replace": 3},
+        "glm5_flash": SPLIT_CONFIGS["glm5_flash"], "mimo_v2": SPLIT_CONFIGS["mimo_flash"],
+        "qwen4": SPLIT_CONFIGS["qwen4"], "qwen3_5": DENSE_CONFIG, "kimi_k3": KIMI, "step5": STEP5,
+        "muse_spark": MUSE, "minimax_m3": {"model_type": "minimax_m3_vl", "text_config": {
+            "num_hidden_layers": 60, "moe_layer_freq": [0] * 3 + [1] * 57}}}
+    local = family == "qwen3_5"
+    keys = ("SPECULATOR=off\nVISION=off\nAUDIO=off\nRTX_GPUS=1\nPOOL_TOKENS=65536\n"
+            "MAX_CONTEXT_TOKENS=65536\nCONCURRENCY=4\nHOST_CACHE_BYTES=2GiB\n")
+    count = 0 if local else 4 if family == "deepseek_v41" else 6
+    keys += f"SPARK_COUNT={count}\n"
+    if local:
+        keys += "EXPERT_BACKEND=local\n"
+    else:
+        prefill = "PREFILL_BATCH_TOKENS" if family in ("deepseek_v41", "step5") else "PREFILL_ROWS"
+        keys += f"{prefill}=1024\nRTX_EXPERT_LAYERS=0\n"
+    has_kv = family in ("mimo_v2", "qwen4", "qwen3_5", "kimi_k3", "step5", "muse_spark")
+    if has_kv:
+        keys += "KV_CACHE=" + ("int8" if family == "mimo_v2" else "bf16") + "\n"
+    result = _family_launch_result(tmp_path, configs[family], "deepseek-ai/DeepSeek-V4.1-Flash" if family == "deepseek_v41" else "test/nondefaults",
+        keys, physical_gpus=(0,), root_launcher=True, extra_args=("--wip", "nondefaults"),
+        encoder_plan={"placement_supported": True, "fits": True, "encoder_plan_hash": "ab" * 32, "spark_ranks": count},
+        extra_env={"STUB_SPARK_ROLES": f"tp{count}"})
+    assert result.returncode == 0, result.stderr
+    plan = next(shlex.split(line) for line in result.stderr.splitlines() if " plan " in line and "--deployment" in line)
+    serve = next(shlex.split(line) for line in result.stderr.splitlines() if line.startswith("docker run -d") and " serve-" in line)
+    def value(argv, flag):
+        return argv[argv.index(flag) + 1] if flag in argv else None
+    for flag in ("--pool-tokens", "--max-context-tokens", "--host-cache-bytes"):
+        assert value(plan, flag) == value(serve, flag), (family, flag, plan, serve)
+    assert value(plan, "--concurrency") == value(serve, "--concurrency" if family == "deepseek_v41" else "--max-sequences") == "4"
+    if has_kv:
+        assert value(plan, "--mimo-kv-cache" if family == "mimo_v2" else "--kv-cache") == value(serve, "--kv-cache")
+    if family != "deepseek_v41":
+        # The planner's config side channel cannot re-ingest unrelated serving choices.
+        mount = next(item for item in plan if item.endswith(":/run/cuteafd-plan.config:ro"))
+        text = Path(mount.rsplit(":", 2)[0]).read_text()
+        for key in ("KV_CACHE", "PREFILL_ROWS", "RTX_EXPERT_LAYERS", "MAX_CONTEXT_TOKENS", "EXLR8_MANIFEST", "EXLR8_PREFILL_ACTIVATIONS"):
+            assert not any(line.startswith(key + "=") for line in text.splitlines()), (family, key, text)

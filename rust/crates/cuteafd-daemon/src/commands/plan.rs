@@ -289,8 +289,13 @@ fn resolve_family_config(args: &mut PlanArgs, family: &str, cfg: &std::collectio
     let get = |key: &str| cfg.get(key).filter(|v| !v.is_empty());
     if !args.explicit_settings.contains("prefill_rows") {
         if family == "qwen3_5" { args.prefill_rows = 4096; }
-        else if let Some(value) = get("PREFILL_ROWS").or_else(|| get("PREFILL_BATCH_TOKENS")) {
-            args.prefill_rows = value.parse().context("PREFILL_ROWS/PREFILL_BATCH_TOKENS")?;
+        else {
+            let value = match family {
+                "step5" | "deepseek_v41" => get("PREFILL_BATCH_TOKENS"),
+                "mimo_v2" | "kimi_k3" | "muse_spark" | "minimax_m3" => get("PREFILL_ROWS"),
+                _ => get("PREFILL_ROWS").or_else(|| get("PREFILL_BATCH_TOKENS")),
+            };
+            if let Some(value) = value { args.prefill_rows = value.parse().context("family prefill rows")?; }
         }
     }
     if family == "glm5" && !args.explicit_settings.contains("prefill_span_rows") {
@@ -2022,7 +2027,9 @@ mod tests {
         for name in ["config.json", "mask_embedding.pt", "model.safetensors.index.json", "dflash_draft_model.safetensors", "dflash.py"] {
             std::fs::write(draft.join(name), b"fixture").unwrap();
         }
-        let automatic = file_args(args(target.path(), 4, false), target.path()).unwrap();
+        let mut official = args(target.path(), 4, false);
+        official.checkpoint_model_id = Some("XiaomiMiMo/MiMo-V2.6-Flash-MOPD".into());
+        let automatic = file_args(official, target.path()).unwrap();
         let roles = [cuteafd_loader::plan::files::ReadRole::Coordinator { local_experts: false, speculator: false }];
         let mut manifest = cuteafd_loader::plan::files::manifest_roles(target.path(), &roles).unwrap();
         attach_snapshots(&mut manifest, &roles, &automatic).unwrap();
@@ -2230,7 +2237,8 @@ mod tests {
             ("EXPERT_USAGE", "off", "--expert-usage", "false")];
         for family in families {
             let mut cases = common.to_vec();
-            if family != "qwen3_5" { cases.push(("PREFILL_ROWS", "1024", "--prefill-rows", "1024")); }
+            if matches!(family, "step5" | "deepseek_v41") { cases.push(("PREFILL_BATCH_TOKENS", "1024", "--prefill-rows", "1024")); }
+            else if family != "qwen3_5" { cases.push(("PREFILL_ROWS", "1024", "--prefill-rows", "1024")); }
             if family == "glm5" { cases.push(("PREFILL_SPAN_ROWS", "4096", "--prefill-span-rows", "4096")); }
             if family == "mimo_v2" { for value in ["int8", "bf16"] { cases.push(("KV_CACHE", value, "--mimo-kv-cache", value)); } }
             else if matches!(family, "qwen4" | "qwen3_5" | "kimi_k3" | "step5" | "muse_spark") {
