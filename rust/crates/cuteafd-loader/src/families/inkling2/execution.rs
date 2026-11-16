@@ -253,15 +253,27 @@ mod tests {
         Inkling2Config::from_hf(&serde_json::from_str(include_str!("fixtures/config.json")).unwrap()).unwrap()
     }
     #[test]
+    fn fp8_records_charge_payload_and_head_scales_once() -> Result<()> {
+        let cfg = cfg();
+        assert_eq!(InklingKvCache::Fp8.record_bytes(8, 128), 2112);
+        assert_eq!(InklingKvCache::Bf16.record_bytes(8, 128), 4096);
+        let bf16 = CacheLayout::new(&cfg, 16, 32768)?;
+        let fp8 = CacheLayout::with_format(&cfg, 16, 32768, InklingKvCache::Fp8)?;
+        assert_eq!(fp8.page_bytes, 64*2112);
+        assert_eq!(bf16.sequence_bytes, fp8.sequence_bytes);
+        assert_eq!(bf16.layer_page_bytes()? - fp8.layer_page_bytes()?, 32768*64*(4096-2112));
+        assert_ne!(fp8.kv_format.record_format(), bf16.kv_format.record_format());
+        Ok(())
+    }
+    #[test]
     fn metadata_upload_shape_covers_every_segment_and_physical_source_once() -> Result<()> {
         let cfg = cfg();
         let layout = UnitLayout::serving(&cfg, 2752, 1 << 20)?;
         for members in [1usize, 2, 16] {
             let shape = layout.upload_shape(&cfg, members)?;
             let mut expected = crate::shared::token_table::UploadShape::default();
-            expected.append(&[2752*8, 2752*8, 2752*8, 2752*8, 2752*8, 2752*4], cfg.layers*2)?;
-            expected.fragment(6, cfg.layers*2*(members-1))?;
-            expected.append(&[65536], cfg.global_layers().len()*2*members)?;
+            expected.append(&[2752*8, 2752*8, 2752*8, 2752*8, 2752*8, 2752*4, 2752*4, 2752*4], cfg.layers*2)?;
+            expected.append(&[65536], cfg.global_layers().len()*2)?;
             expected.append(&[2752*4], 1)?;
             assert_eq!(shape, expected);
             assert!(shape.capacity_bytes()? >= shape.bytes);

@@ -153,7 +153,7 @@ impl<'a> UnitOwner<'a> {
             ensure!(member.rows.start == positions.len() && member.metadata.rows() == member.rows.len(),
                 "Inkling packed metadata members do not cover unit rows");
             positions.extend_from_slice(&member.metadata.positions);
-            local.extend_from_slice(&member.metadata.local_slots);
+            local.extend(member.metadata.local_slots.iter().map(|&slot| slot + member.rows.start as i64));
             global.extend_from_slice(&member.metadata.global_slots);
             ring.extend(member.metadata.ring_slots.iter().map(|&slot|
                 slot + (member.sequence * cache.layout.sequence_bytes / 4096) as i64));

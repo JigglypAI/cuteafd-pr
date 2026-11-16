@@ -1538,7 +1538,7 @@ fn selected_host_geometry(report: &mut PlanReport, options: &LayoutOptions, chec
         native_mtp_layers: if matches!(id, "deepseek_v4" | "qwen4") { shape.native_layers } else { 0 },
         mimo_kv: crate::families::mimo_v2::MimoKvFormats { full: options.mimo_full_kv, sliding: options.mimo_swa_kv },
         dense_qwen_kv: options.dense_qwen_kv, qwen_kv: options.qwen_kv, mla_kv: options.mla_kv,
-        step5_kv: options.step5_kv, muse_kv: options.muse_kv, inkling_kv: options.inkling_kv,
+        step5_kv: options.step5_kv, muse_kv: options.muse_kv,
         prefill_rows: report.prefill_unit_rows.unwrap_or(admitted_rows.unwrap_or(shape.prefill_rows)),
         prefill_span_rows: admitted_rows.unwrap_or(0),
         glmf_index: options.glmf_index, kda_state_bytes: options.glmf_kda_state.bytes(),
