@@ -17,8 +17,19 @@ typedef struct {
   int32_t window, column_order;
 } cuteafd_vision_block;
 
+/* Optional PE arithmetic/output extension. Offsets address the same admitted
+ * BF16 arena as the base spec; scale arrays contain exactly depth entries.
+ * Absolute positions and rotary are independent (both towers use both). */
 typedef struct {
-  uint32_t storage_abi; /* 3: host pointer/count storage, copied during registration. */
+  uint32_t activation; /* 0: exact GELU, 1: quick GELU. */
+  uint32_t position_grid, class_token, output_kind; /* 0: merge2, 1: conv3s2 twice. */
+  uint64_t ln_pre, ln_pre_bias, class_embedding, class_position;
+  uint64_t downsample1, downsample1_bias, downsample2, downsample2_bias;
+  const uint64_t *scale1, *scale2;
+} cuteafd_vision_perception;
+
+typedef struct {
+  uint32_t storage_abi; /* 4: optional copied PE extension, host layer storage. */
   uint32_t abi_version, max_tokens, output_width, reserved;
   uint64_t weight_bytes, patch, merger_norm, merger_fc1, merger_fc2, inv_freq;
   const cuteafd_vision_block* blocks;
@@ -30,6 +41,7 @@ typedef struct {
   uint64_t patch_bias, pos_embed, merger_norm_bias, merger_fc1_bias, merger_fc2_bias;
   uint64_t merger_extra[8];
   const uint64_t *norm1_bias, *norm2_bias, *q_norm, *k_norm;
+  const cuteafd_vision_perception* perception; /* null for other tower contracts. */
 } cuteafd_vision_spec;
 
 typedef struct {

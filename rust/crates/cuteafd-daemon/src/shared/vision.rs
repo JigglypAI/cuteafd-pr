@@ -3,6 +3,7 @@
 //! crates/mimo26-coordinator/src/vision.rs; weights are resident, never transient.
 mod glm_flash;
 mod muse;
+mod perception;
 pub mod mistral;
 mod qwen;
 pub mod local;
@@ -380,11 +381,14 @@ impl TowerSpec {
             }
         }
         let constants = self.frequency_bytes();
-        let at = self.native.inv_freq as usize;
-        weights[at..at + constants.len()].copy_from_slice(&constants);
+        if !constants.is_empty() {
+            let at = self.native.inv_freq as usize;
+            weights[at..at + constants.len()].copy_from_slice(&constants);
+        }
         Ok(weights)
     }
     fn frequency_bytes(&self) -> Vec<u8> {
+        if self.native.inv_freq == NO_VISION_OFFSET { return Vec::new(); }
         let values = if self.native.reserved == mistral::RESERVED {
             mistral::axial_inv_freq().into_iter().collect::<Vec<_>>()
         } else {
@@ -419,7 +423,8 @@ impl VitRuntime {
     }
     fn weight_arena(&self) -> Result<usize> {
         let address = self.native.weight_arena()?;
-        self.native.upload_range(self.spec.native.inv_freq, &self.spec.frequency_bytes())?;
+        let constants = self.spec.frequency_bytes();
+        if !constants.is_empty() { self.native.upload_range(self.spec.native.inv_freq, &constants)?; }
         Ok(address)
     }
     /// `admitted_bytes` comes from the placement memory ledger, not cudaMemGetInfo.

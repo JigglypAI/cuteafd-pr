@@ -55,11 +55,14 @@ impl Contribution {
         }
         let mut reserved = Vec::new();
         if let Some((spec, address)) = vision {
-            let start = usize::try_from(spec.native.inv_freq)?;
-            let end = start.checked_add(spec.frequency_bytes().len()).context("vision constants overflow")?;
-            ensure!(end <= spec.native.weight_bytes as usize, "vision constants outside admitted arena");
-            reserved.push((device, address.checked_add(start).context("vision constants address overflow")?,
-                address.checked_add(end).context("vision constants address overflow")?));
+            let constants = spec.frequency_bytes();
+            if !constants.is_empty() {
+                let start = usize::try_from(spec.native.inv_freq)?;
+                let end = start.checked_add(constants.len()).context("vision constants overflow")?;
+                ensure!(end <= spec.native.weight_bytes as usize, "vision constants outside admitted arena");
+                reserved.push((device, address.checked_add(start).context("vision constants address overflow")?,
+                    address.checked_add(end).context("vision constants address overflow")?));
+            }
             for read in &spec.reads {
                 append(&mut out.records, device, address, spec.native.weight_bytes as usize,
                     &read.path, &read.metadata, read.destination, read.vector)?;

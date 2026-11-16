@@ -75,6 +75,23 @@ pub fn rtx_encoder_gpu(mode: MediaMode, v41: bool, gpus: usize) -> usize {
     }
 }
 
+/// Rank only RTX choices; Auto's existing Spark-first policy is unchanged.
+/// Signed headroom preserves the closest shortfall if no RTX can fit. Historical
+/// device preference breaks exact ties, so balanced layouts keep stable owners.
+fn rtx_candidates(mode: MediaMode, hardware: &EncoderHardware, required: u64) -> Vec<usize> {
+    if let MediaMode::Rtx(Some(gpu)) = mode {
+        return hardware.gpus.get(gpu).map_or_else(Vec::new, |_| vec![gpu]);
+    }
+    let preferred = rtx_encoder_gpu(mode, hardware.v41, hardware.gpus.len());
+    let mut indices: Vec<_> = (0..hardware.gpus.len()).collect();
+    indices.sort_by_key(|&gpu| {
+        let budget = &hardware.gpus[gpu];
+        let headroom = i128::from(budget.free_bytes)-i128::from(budget.kv_target_bytes)-i128::from(required);
+        (std::cmp::Reverse(headroom),gpu != preferred,gpu)
+    });
+    indices
+}
+
 pub fn encoder_placement(mode: MediaMode, hardware: &EncoderHardware, weights: u64, scratch: u64, copies: usize) -> EncoderPlacement {
     let required = weights.saturating_add(scratch);
     let off = |reason: &str, shortfall| EncoderPlacement {
@@ -111,8 +128,8 @@ pub fn encoder_placement(mode: MediaMode, hardware: &EncoderHardware, weights: u
             return off("requested Spark encoder/replicas unavailable", spark_required.saturating_add(GIB).saturating_sub(room));
         }
     }
-    let preferred = rtx_encoder_gpu(mode, hardware.v41, hardware.gpus.len());
-    if let Some(gpu) = hardware.gpus.get(preferred) {
+    if let Some(preferred) = rtx_candidates(mode,hardware,required).first().copied() {
+        let gpu = &hardware.gpus[preferred];
         if gpu.free_bytes >= required.saturating_add(gpu.kv_target_bytes) {
             return make(EncoderKind::Rtx { gpu: preferred }, vec![], "RTX: KV target preserved after tower + scratch admission");
         }
@@ -162,11 +179,13 @@ pub(crate) fn candidates(request: &EncoderRequest, hardware: &EncoderHardware) -
         }
     }
     if matches!(request.mode, MediaMode::Auto | MediaMode::Rtx(_)) {
-        let gpu = rtx_encoder_gpu(request.mode, hardware.v41, hardware.gpus.len());
-        if hardware.gpus.get(gpu).is_some_and(|budget| request.mode != MediaMode::Auto
-            || budget.free_bytes >= request.weights.saturating_add(request.scratch).saturating_add(budget.kv_target_bytes)) {
-            result.push(make(EncoderKind::Rtx { gpu }, Vec::new(),
-                "RTX: KV target preserved after tower + scratch admission"));
+        let required = request.weights.saturating_add(request.scratch);
+        for gpu in rtx_candidates(request.mode,hardware,required) {
+            if request.mode != MediaMode::Auto
+                || hardware.gpus[gpu].free_bytes >= required.saturating_add(hardware.gpus[gpu].kv_target_bytes) {
+                result.push(make(EncoderKind::Rtx { gpu }, Vec::new(),
+                    "RTX: KV target preserved after tower + scratch admission"));
+            }
         }
     }
     result
@@ -231,8 +250,9 @@ pub fn admit_encoders<T>(requests: &[EncoderRequest], hardware: &EncoderHardware
             shortfalls.push(("requested Spark encoder/replicas unavailable", deficit.unwrap_or(spark_required)));
         }
         if matches!(request.mode, MediaMode::Auto | MediaMode::Rtx(_)) {
-            let gpu = rtx_encoder_gpu(request.mode, hardware.v41, hardware.gpus.len());
-            shortfalls.push(hardware.gpus.get(gpu).map_or(("requested RTX device absent", required), |gpu|
+            let gpu = rtx_candidates(request.mode,&hardware,required).first().copied()
+                .and_then(|index| hardware.gpus.get(index));
+            shortfalls.push(gpu.map_or(("requested RTX device absent", required), |gpu|
                 ("tower would reduce the requested KV target",
                     required.saturating_add(gpu.kv_target_bytes).saturating_sub(gpu.free_bytes))));
         }
@@ -284,10 +304,13 @@ mod tests {
         for s in &mut h.sparks { s.free_bytes = GIB; }
         assert_eq!(default_encoder_placement(&h, 2 * GIB, GIB).kind, EncoderKind::Rtx { gpu: 1 });
         h.gpus[1].free_bytes = 9 * GIB;
+        assert_eq!(default_encoder_placement(&h,2*GIB,GIB).kind,EncoderKind::Rtx {gpu:0});
+        h.gpus[0].free_bytes = 9 * GIB;
         let off = default_encoder_placement(&h, 2 * GIB, GIB);
         assert_eq!(off.kind, EncoderKind::Off);
         assert_eq!(off.shortfall, 2 * GIB);
         h.v41 = true;
+        h.gpus[0].free_bytes = 96*GIB;
         assert_eq!(default_encoder_placement(&h, 2 * GIB, GIB).kind, EncoderKind::Rtx { gpu: 0 });
         h.sparks[0].free_bytes = 20 * GIB;
         assert_eq!(default_encoder_placement(&h, 2 * GIB, GIB).kind, EncoderKind::Spark { rank: 0 });
@@ -320,6 +343,8 @@ mod tests {
         for spark in &mut h.sparks { spark.free_bytes = 6 * GIB - 1; }
         assert_eq!(encoder_placement(MediaMode::Auto, &h, 3 * GIB, 2 * GIB, 1).kind, EncoderKind::Rtx { gpu: 1 });
         h.gpus[1].free_bytes = 13 * GIB - 1;
+        assert_eq!(encoder_placement(MediaMode::Auto,&h,3*GIB,2*GIB,1).kind,EncoderKind::Rtx {gpu:0});
+        h.gpus[0].free_bytes = 13*GIB-1;
         assert_eq!(encoder_placement(MediaMode::Auto, &h, 3 * GIB, 2 * GIB, 1).shortfall, 1);
         assert_eq!(encoder_placement(MediaMode::Spark(None), &h, 3 * GIB, 2 * GIB, 1).shortfall, 1);
     }
@@ -334,6 +359,27 @@ mod tests {
         assert_eq!(encoder_placement(MediaMode::Off, &h, GIB, GIB, 1).admitted_bytes(), 0);
         assert_eq!(encoder_placement(MediaMode::Rtx(Some(5)), &h, GIB, GIB, 1).kind, EncoderKind::Off);
     }
+    #[test]
+    fn implicit_rtx_uses_post_reservation_headroom_without_changing_spark_auto() {
+        let mut h = hw(2,1,96);
+        h.gpus[0].free_bytes = 80*GIB;
+        h.gpus[1].free_bytes = 90*GIB;
+        h.gpus[1].kv_target_bytes = 30*GIB;
+        assert_eq!(encoder_placement(MediaMode::Rtx(None),&h,2*GIB,GIB,1).kind,EncoderKind::Rtx {gpu:0});
+        assert_eq!(encoder_placement(MediaMode::Rtx(Some(1)),&h,2*GIB,GIB,1).kind,EncoderKind::Rtx {gpu:1});
+        let request = EncoderRequest {mode:MediaMode::Auto,weights:2*GIB,scratch:GIB,copies:1};
+        let choices = candidates(&request,&h);
+        assert_eq!(choices.iter().map(|c| c.kind.clone()).collect::<Vec<_>>(),
+            vec![EncoderKind::Spark {rank:0},EncoderKind::Rtx {gpu:0},EncoderKind::Rtx {gpu:1}]);
+        assert!(choices.iter().all(|c| c.admitted_bytes()==3*GIB && c.replicas.is_empty()));
+        let explicit = EncoderRequest {mode:MediaMode::Rtx(Some(1)),..request.clone()};
+        assert_eq!(candidates(&explicit,&h).len(),1);
+        let (selected,()) = admit_encoders(&[request],&h,|selected| {
+            anyhow::ensure!(selected[0].kind==EncoderKind::Rtx {gpu:1},"retry preferred device");Ok(())
+        }).unwrap();
+        assert_eq!(selected[0].kind,EncoderKind::Rtx {gpu:1});
+    }
+
     #[test]
     fn native_trials_reuse_first_success_in_deterministic_order() {
         let hardware = hw(2, 2, 96);
