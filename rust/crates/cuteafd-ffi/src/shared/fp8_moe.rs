@@ -31,6 +31,26 @@ pub enum Fp8MoeWeights {
     Nvfp4Dynamic,
 }
 
+impl Fp8MoeWeights {
+    pub fn is_nvfp4_family(self) -> bool {
+        matches!(self, Self::Nvfp4 | Self::Nvfp4Dynamic)
+    }
+
+    pub fn requires_bf16_input(self) -> bool {
+        match self {
+            Self::Nvfp4 | Self::Nvfp4Dynamic | Self::Bf16 => true,
+            Self::Fp8 | Self::Mxfp4 | Self::Mxfp8 => false,
+        }
+    }
+
+    pub fn native_format_unit(self) -> usize {
+        cuteafd_core::tp_units::native_format_unit(match self {
+            Self::Fp8 => "fp8", Self::Mxfp4 => "mxfp4", Self::Mxfp8 => "mxfp8",
+            Self::Nvfp4 | Self::Nvfp4Dynamic => "nvfp4", Self::Bf16 => "bf16",
+        })
+    }
+}
+
 /// How the checkpoint's unchanged FP32 globals enter the NVFP4 arithmetic.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Fp8MoeScaleConvention {
@@ -139,11 +159,7 @@ impl Fp8MoeInfo {
             info.intermediate % unit == 0 && info.tp > 0 && blocks >= info.tp
                 && (info.slice == blocks / info.tp * unit || info.slice == blocks.div_ceil(info.tp) * unit)
         };
-        let native_unit = cuteafd_core::tp_units::native_format_unit(match info.weights {
-            Fp8MoeWeights::Mxfp4 => "mxfp4", Fp8MoeWeights::Mxfp8 => "mxfp8",
-            Fp8MoeWeights::Nvfp4 | Fp8MoeWeights::Nvfp4Dynamic => "nvfp4",
-            Fp8MoeWeights::Fp8 => "fp8", Fp8MoeWeights::Bf16 => "bf16",
-        });
+        let native_unit = info.weights.native_format_unit();
         let sliced = (info.slice % 128 == 0 && info.slice >= 128
             && (exact(128) || (info.slice * info.tp >= info.intermediate
                 && (info.slice - 128) * info.tp < info.intermediate)))
@@ -153,9 +169,9 @@ impl Fp8MoeInfo {
             && info.swiglu_limit.is_finite() && info.swiglu_limit >= 0.0
             && info.capacities[0] > 0 && info.capacities.iter().all(|&c| c <= i32::MAX as usize)
             && info.capacities.windows(2).all(|w| w[0] < w[1])
-            && (!matches!(info.weights, Fp8MoeWeights::Bf16 | Fp8MoeWeights::Nvfp4 | Fp8MoeWeights::Nvfp4Dynamic) || !info.wire_input)
+            && (!info.weights.requires_bf16_input() || !info.wire_input)
             && (info.weights != Fp8MoeWeights::Mxfp8 || info.wire_input)
-            && (!info.nvfp4_input || matches!(info.weights, Fp8MoeWeights::Nvfp4 | Fp8MoeWeights::Nvfp4Dynamic)),
+            && (!info.nvfp4_input || info.weights.is_nvfp4_family()),
             "inconsistent FP8 expert package info {info:?}");
         ensure!(info.swiglu_alpha.is_finite() && info.swiglu_beta.is_finite()
             && if info.activation == Fp8MoeActivation::SwigluOai {
@@ -198,6 +214,12 @@ impl Fp8MoeInfo {
     /// Wire row bytes: hidden E4M3 values then hidden/32 UE8M0 scales.
     pub fn wire_row_bytes(&self) -> usize {
         self.hidden + self.hidden / 32
+    }
+
+    /// A native mixed endpoint dispatches each layer to its own wire format.
+    /// Prequantized NVFP4 rows need the explicit NVFP4 endpoint instead.
+    pub fn supports_native_ingress(&self) -> bool {
+        !self.nvfp4_input && self.wire_input != self.weights.requires_bf16_input()
     }
 
     /// Bytes of one input row this package's programs read.
@@ -885,6 +907,26 @@ mod inkling_tests {
         [6 | format << 8 | 4 << 16 | 1 << 24, 4608, 2304, 384, 8, 2304, 1,
             if wire { 7 } else { 1 }, 0, 2, 16, 4096, 0, 0, 0, 0, 1f32.to_bits(), 0]
     }
+    #[test]
+    fn mixed_native_ingress_tracks_all_storage_input_contracts() {
+        let dynamic = Fp8MoeInfo::from_words(native(7, false)).unwrap();
+        let mxfp8 = Fp8MoeInfo::from_words(native(6, true)).unwrap();
+        assert!([&dynamic, &mxfp8].iter().all(|info| info.supports_native_ingress()));
+        for weights in [Fp8MoeWeights::Fp8, Fp8MoeWeights::Mxfp4, Fp8MoeWeights::Mxfp8,
+            Fp8MoeWeights::Bf16, Fp8MoeWeights::Nvfp4, Fp8MoeWeights::Nvfp4Dynamic] {
+            let mut info = dynamic.clone();
+            info.weights = weights;
+            info.wire_input = !weights.requires_bf16_input();
+            assert!(info.supports_native_ingress(), "{weights:?}");
+            info.wire_input = !info.wire_input;
+            assert!(!info.supports_native_ingress(), "{weights:?} wrong input");
+            info.nvfp4_input = true;
+            assert!(!info.supports_native_ingress(), "prequantized rows require explicit endpoint");
+        }
+        assert!(dynamic.weights.is_nvfp4_family());
+        assert!(!mxfp8.weights.is_nvfp4_family());
+    }
+
     #[test]
     fn exact_native_tp4_widths_follow_shared_format_blocks() {
         for (storage, wire) in [(6, true), (7, false), (4, false)] {

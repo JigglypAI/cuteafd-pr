@@ -174,11 +174,8 @@ impl<'a> Weights<'a> {
             let supported = if endpoint.ingress == cuteafd_core::SparkIngress::Nvfp4 { nvfp4 }
             else if endpoint.ingress == cuteafd_core::SparkIngress::Native {
                 match self {
-                    Self::Fp8(experts) => !experts.is_empty() && experts.iter().all(|group| {
-                        use cuteafd_ffi::fp8_moe::Fp8MoeWeights;
-                        let bf16 = matches!(group.module.info().weights, Fp8MoeWeights::Bf16 | Fp8MoeWeights::Nvfp4);
-                        group.wire_input() != bf16
-                    }),
+                    Self::Fp8(experts) => !experts.is_empty()
+                        && experts.iter().all(|group| group.module.info().supports_native_ingress()),
                     _ => false,
                 }
             } else { supports_ingress(endpoint.ingress, fp8, bf16) };
