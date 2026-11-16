@@ -746,10 +746,11 @@ mod tests {
                             expert_costs(&input, &cfg, &opts, ranks, 4, 4096).unwrap();
                         let probe = spark_intake_probe_bytes(true,
                             std::env::var("CUTEAFD_SPARK_INTAKE").ok().as_deref()).unwrap();
-                        let budgets = production::production_budgets(&vec![(95 * GIB, 95 * GIB); ranks],
+                        let mut budgets = production::production_budgets(&vec![(95 * GIB, 95 * GIB); ranks],
                             &(0..ranks).map(|_| production::device_headroom()).collect::<Vec<_>>(),
                             vec![Baseline::Forecast { occupied: 0, source: "empty fixture devices".into(), assumed: false }; ranks],
-                            opts.host_memory.unwrap(), opts.spark_bytes, 4).unwrap();
+                            opts.host_memory.unwrap(), opts.spark_capacity(0), 4).unwrap();
+                        opts.apply_spark_capacities(&mut budgets);
                         let runtime = production::ProductionInput {
                             startup_probe_bytes: probe,
                             blas_head: opts.bf16_target_head, draft_head: false,

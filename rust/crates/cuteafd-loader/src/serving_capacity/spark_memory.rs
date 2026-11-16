@@ -80,7 +80,7 @@ mod tests {
 
     #[test]
     fn exact_per_host_measurements_and_missing_fail_closed() {
-        assert_eq!(measured_bytes("dodo").unwrap(), 120_209_156 * 1024);
+        assert_eq!(measured_bytes("dodo").unwrap(), 121_171_588 * 1024);
         assert_eq!(measured_bytes("10.55.0.2:19441").unwrap(), measured_bytes("dodo").unwrap());
         assert_ne!(measured_bytes("ostrich").unwrap(), measured_bytes("rhea").unwrap());
         assert!(measured_bytes("unknown").is_err());

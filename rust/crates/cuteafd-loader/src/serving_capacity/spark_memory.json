@@ -1,15 +1,60 @@
 {
   "schema": 1,
-  "source": "issue #2082; main idle-host census 2026-11-16T08:23:41Z..2026-11-16T08:23:46Z",
+  "source": "issue #2082; rolling reboot idle census 2026-11-16; SparkNest 0.8.5",
   "method": "/proc/meminfo MemAvailable in kB multiplied by 1024; zero GPU compute processes on each host; no margin",
   "hosts": {
-    "ostrich": {"mem_available_kib": 118758096, "measured_at": "2026-11-16T08:23:41Z"},
-    "dodo": {"mem_available_kib": 120209156, "measured_at": "2026-11-16T08:23:42Z"},
-    "emu": {"mem_available_kib": 120244960, "measured_at": "2026-11-16T08:23:42Z"},
-    "kiwi": {"mem_available_kib": 120537644, "measured_at": "2026-11-16T08:23:43Z"},
-    "rhea": {"mem_available_kib": 120644804, "measured_at": "2026-11-16T08:23:44Z"},
-    "moa": {"mem_available_kib": 120540992, "measured_at": "2026-11-16T08:23:45Z"},
-    "kakapo": {"mem_available_kib": 120695860, "measured_at": "2026-11-16T08:23:45Z"},
-    "cassowary": {"mem_available_kib": 119820796, "measured_at": "2026-11-16T08:23:46Z"}
+    "ostrich": {
+      "mem_available_kib": 121300648,
+      "measured_at": "2026-11-16T08:31:00Z",
+      "uptime": "about 5 minutes",
+      "fresh_boot": true,
+      "boot_id": "7b201fd8-15cd-4e5e-ad07-9909b168039b",
+      "booted_at": "2026-11-16T08:26:15Z",
+      "timestamp_approximate": true
+    },
+    "dodo": {
+      "mem_available_kib": 121171588,
+      "measured_at": "2026-11-16T08:31:20Z",
+      "uptime": "up 0 minutes",
+      "fresh_boot": true
+    },
+    "emu": {
+      "mem_available_kib": 121082712,
+      "measured_at": "2026-11-16T08:32:03Z",
+      "uptime": "up 0 minutes",
+      "fresh_boot": true
+    },
+    "kiwi": {
+      "mem_available_kib": 121166344,
+      "measured_at": "2026-11-16T08:32:49Z",
+      "uptime": "up 0 minutes",
+      "fresh_boot": true
+    },
+    "rhea": {
+      "mem_available_kib": 121178876,
+      "measured_at": "2026-11-16T08:36:11Z",
+      "uptime": "up 0 minutes",
+      "fresh_boot": true
+    },
+    "moa": {
+      "mem_available_kib": 121171588,
+      "measured_at": "2026-11-16T08:39:36Z",
+      "uptime": "up 0 minutes",
+      "fresh_boot": true
+    },
+    "kakapo": {
+      "mem_available_kib": 120695860,
+      "measured_at": "2026-11-16T08:23:45Z",
+      "serving": false,
+      "uptime": "not recorded",
+      "fresh_boot": false
+    },
+    "cassowary": {
+      "mem_available_kib": 119820796,
+      "measured_at": "2026-11-16T08:23:46Z",
+      "serving": false,
+      "uptime": "not recorded",
+      "fresh_boot": false
+    }
   }
 }

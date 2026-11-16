@@ -527,14 +527,15 @@ fn preflight_shape(
         EmbeddingHome::Device(0)
     };
     let operation = Operation::Serving;
-    let budgets = contract::production_budgets(
+    let mut budgets = contract::production_budgets(
         &memory.iter().map(|sample| (sample.total_bytes, sample.total_bytes)).collect::<Vec<_>>(),
         &(0..memory.len()).map(|_| contract::device_headroom()).collect::<Vec<_>>(),
         memory.iter().map(|sample| Baseline::Sampled {
             free: sample.baseline_free_bytes, phase: Phase::Load,
             source: "measured post-module free memory".into() }).collect(),
         cuteafd_loader::formats::mapped_preload::host_memory_before_process()?,
-        cuteafd_loader::placement::reserve::spark_cap(), spark_ranks)?;
+        cuteafd_loader::placement::reserve::spark_caps(spark_ranks).into_iter().max().unwrap_or(0), spark_ranks)?;
+    cuteafd_loader::serving_capacity::spark_memory::apply_live_budgets(&mut budgets);
     let request = contract::production_request(
         serving_context, (args.pool_tokens > 0).then_some(args.pool_tokens as u64),
         args.onboard.resolve(routed_layers), prefill, operation,
