@@ -994,7 +994,7 @@ impl<'a> LocalLane<'a> {
         let stream = self.stream().clone();
         let staged = self.attention.take();
         let mut graphs = super::graphs::Graphs::new();
-        let result = graphs.attach(stream.device.library, stream.device.id, self.programs.ranks, rank, reserve)
+        let result = graphs.attach(stream.device.library, stream.device.id, self.programs.ranks, rank, reserve, self.context.is_some())
             .and_then(|()| {
                 if self.eager_context_dsa_diagnostic() { return Ok(0); }
                 graphs.prewarm(&stream, self.programs.graph_core(), self.programs.ranks, keys,
@@ -1018,16 +1018,13 @@ impl<'a> LocalLane<'a> {
         if let Some(graphs) = self.graphs.as_mut() { graphs.tick(); }
     }
 
-    pub(crate) fn graph_owner(&mut self) -> Option<&mut dyn crate::shared::decode_graph::CacheAttached> {
-        self.graphs.as_mut().map(super::graphs::Graphs::owner)
+    pub(crate) fn visit_graphs(&mut self, visit: &mut crate::shared::decode_graph::device::GraphVisitor<'_>) -> Result<()> {
+        if let Some(graphs) = self.graphs.as_mut() { graphs.visit(visit)?; }
+        Ok(())
     }
 
     pub(crate) fn graph_device(&self) -> Option<i32> {
         self.graphs.as_ref().filter(|graphs| graphs.attached()).map(super::graphs::Graphs::device)
-    }
-
-    pub(crate) fn graph_spans_devices(&self) -> bool {
-        self.graphs.as_ref().is_some_and(super::graphs::Graphs::spans_devices)
     }
 
     pub(crate) fn commit_kda(&self, tables: &[i32]) -> Result<()> {
