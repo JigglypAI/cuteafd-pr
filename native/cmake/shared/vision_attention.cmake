@@ -155,6 +155,7 @@ cuteafd_vision_owner_entry(d128 HEAD_DIM 128 POINTWISE_GROUP pixtral
   PROGRAMS vision_attention_d128_full ARGS --group attention --head-dim 128
   POINTWISE_PROGRAMS vision_axial_rotary_d128_bf16 vision_rms_bf16_gamma_h2048
   POINTWISE_ARGS --group pointwise --head-dim 128 --hidden 2048 --bf16-products --bf16-before-gamma)
+# Lender groups must precede their borrowers; the helper validates availability.
 foreach(kind inkling2 step5)
   if(kind STREQUAL "inkling2")
     set(dim 64)
