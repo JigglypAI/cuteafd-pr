@@ -1123,6 +1123,8 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
             let image_count = images.len();
             drop(images);
             let ready = (|| -> Result<_> {
+                crate::shared::serve::RequestFailure::check_lane(id, loads[lane],
+                    active.len().div_ceil(2).min(cuteafd_core::V41_MAX_LANE_MEMBERS))?;
                 let constraint = job.constraint.as_ref().map(|spec| compiler.matcher(spec)).transpose()
                     .map_err(cuteafd_api::openai::NativeFailure::from_admission_error)?;
                 ensure!(!job.events.is_closed(), "client disconnected");
@@ -1144,14 +1146,13 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
                         image_keys, cached, hit_scores, images: image_count > 0, ticket, constraint, decoder,
                         packed: None, reserve }) }) }
                 Err(error) => {
-                    let failure = error.downcast_ref::<cuteafd_api::openai::NativeFailure>()
-                        .cloned().unwrap_or_else(|| format!("{error:#}").into());
+                    let failure = error.downcast_ref::<crate::shared::serve::RequestFailure>()
+                        .map(crate::shared::serve::RequestFailure::retry)
+                        .unwrap_or_else(|| cuteafd_api::openai::NativeFailure::from_admission_error(error));
                     let _ = events.send(Err(failure));
                     if events.is_closed() { ticket.cancel() } else { ticket.fail(0) }
-                    tracing::warn!(%error, "native request admission failed");
+                    tracing::warn!(request_id=id, "native request admission failed");
                     round_failure::release_admission(&mut *requests, draft.as_deref_mut(), lease, id);
-                    P::reset_connections(first_transport)?; P::reset_connections(second_transport)?;
-                    for (_, transport) in prefill_slots.slots.iter_mut() { P::reset_connections(transport)?; }
                 }
             }
         }
@@ -1209,10 +1210,8 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
                 let slot = *members.iter().flatten().nth(pressure.work_index)
                     .context("pool pressure references an invalid append participant")?;
                 let request = active[slot].as_mut().unwrap();
-                let _ = request.job.events.send(Err(format!("{error:#}").into()));
-                request.finished = true;
-                request.cacheable = false;
-                request.failed = true;
+                let failure = crate::shared::serve::RequestFailure::new(request.id(), error);
+                round_failure::fail_request(&mut active, &failure);
                 // No layer stack started. The next completed-boundary cleanup
                 // releases only this owner's pages, then retries remaining work.
                 continue;
@@ -1244,9 +1243,11 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
             tracing::error!(error=%format!("{error:#}"), "native decode round failed");
             stall::mark(stall::Phase::Failed, active.iter().flatten().count());
             // RV3-4: answer and mark the members before a reset `?` can leave `serve`.
-            round_failure::fail_round(&mut active, &error);
-            P::reset_connections(first_transport)?; P::reset_connections(second_transport)?;
-                    for (_, transport) in prefill_slots.slots.iter_mut() { P::reset_connections(transport)?; }
+            round_failure::handle(&mut active, &error, || {
+                P::reset_connections(first_transport)?; P::reset_connections(second_transport)?;
+                for (_, transport) in prefill_slots.slots.iter_mut() { P::reset_connections(transport)?; }
+                Ok(())
+            })?;
         }
     }
     Ok(())
@@ -1797,9 +1798,15 @@ fn build_sampling_round<'a>(active: &[Option<Active<'a>>], members: &[usize],
     for (&slot, input) in members.iter().zip(inputs) {
         let request = active[slot].as_ref().unwrap();
         let row_masks = match request.constraint.as_ref() {
-            Some(constraint) => constraint.prepare_verification_masks(input)?,
+            Some(constraint) => constraint.prepare_verification_masks(input)
+                .map_err(|error| crate::shared::serve::RequestFailure::new(request.id(), error))?,
             None => vec![None; input.len()],
         };
+        // These extents still have an owning request, before any kernel reads
+        // the packed arena. Aggregate output extents below remain round faults.
+        if row_masks.len() != input.len() || row_masks.iter().flatten().any(|mask| mask.len() != VOCAB.div_ceil(32)) {
+            return Err(crate::shared::serve::RequestFailure::new(request.id(), "sampling member mask extent differs").into());
+        }
         resolved.push(SamplingMember {
             params: request.job.sampling,
             base_position: request.generated as u64,
@@ -2004,6 +2011,7 @@ async fn execute_logits<'a>(lib: &'a NativeLibrary, pass: &mut TargetPass<'_, 'a
 
 fn prepare_decode_lane<'a>(requests: &mut Requests<'a>, active: &[Option<Active<'a>>],
     members: &[usize], inputs: &[Vec<u32>], speculative: bool) -> Result<RequestBatch> {
+    validate_proposals(active, members, inputs)?;
     let work: Vec<_> = members.iter().zip(inputs).map(|(&slot, tokens)| RequestTokens {
         lease: active[slot].as_ref().unwrap().lease, tokens, image_mask: None,
         kind: if speculative { ExpertV2SourceKind::MtpVerify } else { ExpertV2SourceKind::Decode },
@@ -2032,6 +2040,19 @@ pub(super) fn prefetch_drafts(requests: &Requests<'_>, active: &[Option<Active<'
     let proposals: Vec<_> = members.iter().zip(inputs)
         .map(|(&slot, input)| (active[slot].as_ref().unwrap().lease, input.as_slice())).collect();
     requests.prefetch_drafts(&proposals);
+}
+
+fn validate_proposals(active: &[Option<Active<'_>>], members: &[usize], inputs: &[Vec<u32>]) -> Result<()> {
+    // Aggregate vector cardinality is a scheduler fault; an individual empty
+    // proposal is attributable before any target batch is prepared.
+    ensure!(members.len() == inputs.len(), "decode proposals differ from member count");
+    for (&slot, input) in members.iter().zip(inputs) {
+        if input.is_empty() {
+            return Err(crate::shared::serve::RequestFailure::new(active[slot].as_ref().unwrap().id(),
+                "decode proposal has no anchor row").into());
+        }
+    }
+    Ok(())
 }
 
 fn bound_inputs(inputs: &mut [Vec<u32>]) {
@@ -2090,13 +2111,15 @@ fn single_lane_round<'w, 'a>(lib: &'a NativeLibrary, runtime: &tokio::runtime::R
             Err(error) => { clock.drafted_us(0); draft.anchor_fallback(lane, &seeds, &error)? },
         }
     } else { seeds.iter().map(|r| vec![r.1]).collect() };
+    validate_proposals(active, members, &inputs)?;
     if let Some(draft) = draft.as_deref_mut() { extend_inputs(draft, active, members, &mut inputs)?; }
     prefetch_drafts(requests, active, members, &inputs);
     let copied = vec![false; members.len()];
     let proposal = console::Proposal::capture(&inputs, console::live());
     for (&slot, input) in members.iter().zip(&mut inputs) {
         let r = active[slot].as_ref().unwrap();
-        if let Some(constraint) = &r.constraint { constraint.truncate_proposal(input)?; }
+        if let Some(constraint) = &r.constraint { constraint.truncate_proposal(input).map_err(|error|
+            crate::shared::serve::RequestFailure::new(r.id(), error))?; }
         if crate::shared::probe::no_speculation(&r.job.probe) { input.truncate(1); }
     }
     // This path runs only while the other lane is empty.
@@ -2112,16 +2135,12 @@ fn single_lane_round<'w, 'a>(lib: &'a NativeLibrary, runtime: &tokio::runtime::R
     bound_inputs(&mut inputs);
     let draft_us = draft_start.elapsed().as_micros() as u64;
     let prepare_start = Instant::now();
-    let mut batch = Some(prepare_decode_lane(requests, active, members, &inputs, speculative)?);
-    let prepare_us = prepare_start.elapsed().as_micros() as u64;
-    let prepared_us = started.elapsed().as_micros() as u64;
     let compact = !tracing::enabled!(target: "cuteafd::logit_trace", tracing::Level::DEBUG)
         && !probe_rows_wanted(active, members)
         && members.iter().all(|&slot| {
             let request = active[slot].as_ref().unwrap();
             request.constraint.is_none() && request.job.sampling.is_greedy()
         });
-    let batch_id = batch.as_ref().unwrap().cache()?.identity();
     // Chunk-4a scope: a round is device-selected whenever the layout supports
     // the terminal and at least one row is device-servable. Each row's own
     // parameters then decide its kernels (K1, K1->K2 or K1->K3->K4->K5), and a
@@ -2133,9 +2152,14 @@ fn single_lane_round<'w, 'a>(lib: &'a NativeLibrary, runtime: &tokio::runtime::R
     //
     // A traced round still takes this path, but `SamplingRound::trace_rows` then
     // downloads every row for `top_two`.
-    if !compact && round_has_device_rows(active, members) {
-        let round = build_sampling_round(active, members, &inputs,
-            tracing::enabled!(target: "cuteafd::logit_trace", tracing::Level::DEBUG))?;
+    let sampling_round = (!compact && round_has_device_rows(active, members)).then(||
+        build_sampling_round(active, members, &inputs,
+            tracing::enabled!(target: "cuteafd::logit_trace", tracing::Level::DEBUG))).transpose()?;
+    let mut batch = Some(prepare_decode_lane(requests, active, members, &inputs, speculative)?);
+    let prepare_us = prepare_start.elapsed().as_micros() as u64;
+    let prepared_us = started.elapsed().as_micros() as u64;
+    let batch_id = batch.as_ref().unwrap().cache()?.identity();
+    if let Some(round) = sampling_round {
         pass.set_capture(capture);
         let next = runtime.block_on(execute_sampled_rows(pass, requests,
             batch.as_mut().unwrap(), transport, &round));

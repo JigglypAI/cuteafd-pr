@@ -269,15 +269,29 @@ pub use limits::{NativeLimits, DEFAULT_MAX_OUTPUT_TOKENS, MAX_CONTEXT_TOKENS};
 pub enum NativeFailure {
     BadRequest(String),
     Unavailable(String),
+    Retry(String),
     Worker(String),
 }
 impl std::fmt::Display for NativeFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self { Self::BadRequest(message) | Self::Unavailable(message) | Self::Worker(message) => f.write_str(message) }
+        match self { Self::BadRequest(message) | Self::Unavailable(message) | Self::Retry(message) | Self::Worker(message) => f.write_str(message) }
     }
 }
 impl std::error::Error for NativeFailure {}
 impl NativeFailure {
+    fn rejection(self) -> Rejection {
+        match self {
+            Self::BadRequest(message) => Rejection::bad(message),
+            Self::Unavailable(message) => Rejection::unavailable(message).retry(),
+            Self::Retry(message) => Rejection::new(StatusCode::TOO_MANY_REQUESTS, message).retry(),
+            Self::Worker(message) => Rejection::new(StatusCode::INTERNAL_SERVER_ERROR, message),
+        }
+    }
+    fn sse_error(self) -> String {
+        if matches!(self, Self::Retry(_)) {
+            format!("data: {}\n\n", retry_error_body(self))
+        } else { sse_error(self) }
+    }
     /// Preserve request faults while leaving tokenizer loading and internal span bugs as 500s.
     pub fn from_admission_error(error: anyhow::Error) -> Self {
         if let Some(failure) = error.downcast_ref::<Self>() { return failure.clone(); }
@@ -565,7 +579,15 @@ fn error_body(message: impl ToString) -> Value {
     json!({"error":{"message":message,"type":"native_v41_error"}})
 }
 fn error(status: StatusCode, message: impl ToString) -> Response {
-    (status, Json(error_body(message))).into_response()
+    let body = if status == StatusCode::TOO_MANY_REQUESTS { retry_error_body(message) } else { error_body(message) };
+    (status, Json(body)).into_response()
+}
+fn retry_error_body(message: impl ToString) -> Value {
+    let mut body = error_body(message);
+    body["error"]["type"] = json!("rate_limit_error");
+    body["error"]["code"] = json!("retry");
+    body["error"]["status"] = json!(429);
+    body
 }
 fn sse_error(message: impl ToString) -> String {
     // Keep the HTTP error envelope and bound, with JSON escaping so a worker
@@ -1243,7 +1265,7 @@ pub(crate) struct Submitter {
 pub(crate) struct Running {
     pub(crate) chunks: std::pin::Pin<Box<dyn futures::Stream<Item = anyhow::Result<ChatChunk>> + Send>>,
     /// Set when the engine failed or disconnected; checked before success frames.
-    pub(crate) failure: Arc<Mutex<Option<String>>>,
+    pub(crate) failure: Arc<Mutex<Option<NativeFailure>>>,
     pub(crate) image_tokens: usize,
     pub(crate) audio_tokens: usize,
     prefix_cache_source: PrefixCacheSource,
@@ -1330,13 +1352,11 @@ impl Submitter {
         // SSE, before a protocol processor can turn early EOF into a finish chunk.
         let first = match receive.recv().await {
             Some(Ok(chunk)) => chunk,
-            Some(Err(NativeFailure::BadRequest(message))) => return Err(Rejection::bad(message)),
-            Some(Err(NativeFailure::Unavailable(message))) => return Err(Rejection::new(StatusCode::SERVICE_UNAVAILABLE, message).retry()),
-            Some(Err(message)) => return Err(Rejection::new(StatusCode::INTERNAL_SERVER_ERROR, message)),
+            Some(Err(failure)) => return Err(failure.rejection()),
             None => return Err(Rejection::new(StatusCode::INTERNAL_SERVER_ERROR, "native worker ended without completion")),
         };
         // Never let a failed/disconnected backend be converted to a successful EOF.
-        let failure = Arc::new(Mutex::new(None::<String>));
+        let failure = Arc::new(Mutex::new(None::<NativeFailure>));
         let input_failure = failure.clone();
         let input_usage = usage.clone().filter(|_| chat_accounting);
         let input = async_stream::stream! {
@@ -1352,7 +1372,7 @@ impl Submitter {
                         yield chunk;
                         if finished { break; }
                     }
-                    Err(message) => { if let Some(scope) = &input_usage { scope.engine_error("worker"); } *input_failure.lock().unwrap() = Some(message.to_string()); break; }
+                    Err(message) => { if let Some(scope) = &input_usage { scope.engine_error("worker"); } *input_failure.lock().unwrap() = Some(message); break; }
                 }
             }
             if !finished {
@@ -1461,7 +1481,7 @@ async fn respond(running: Running) -> Response {
                 };
                 let failed = failure.lock().unwrap().clone();
                 if let Some(message) = failed {
-                    yield Ok(sse_error(message)); return;
+                    yield Ok(message.sse_error()); return;
                 }
                 match chunk {
                     Ok(chunk) => {
@@ -1487,7 +1507,7 @@ async fn respond(running: Running) -> Response {
                 }
             }
             let failed = failure.lock().unwrap().clone();
-            if let Some(message) = failed { yield Ok(sse_error(message)); return; }
+            if let Some(message) = failed { yield Ok(message.sse_error()); return; }
             if let Some(mut usage) = usage_chunk {
                 add_finish_detail(&mut usage, &finish_detail);
                 yield Ok(format!("data: {}\n\n", serde_json::to_string(&usage).unwrap()));
@@ -1514,13 +1534,13 @@ async fn respond(running: Running) -> Response {
         match chunk {
             Ok(chunk) => response.append(chunk),
             Err(e) => {
-                let message = failure.lock().unwrap().clone().unwrap_or_else(|| e.to_string());
-                return error(StatusCode::INTERNAL_SERVER_ERROR, message);
+                let message = failure.lock().unwrap().clone().unwrap_or_else(|| NativeFailure::Worker(e.to_string()));
+                return message.rejection().into_response();
             }
         }
     }
     if let Some(message) = failure.lock().unwrap().clone() {
-        return error(StatusCode::INTERNAL_SERVER_ERROR, message);
+        return message.rejection().into_response();
     }
     let mut value = serde_json::to_value(response).expect("chat response serializes");
     add_media_usage(&mut value, image_tokens, audio_tokens);
@@ -2417,6 +2437,9 @@ mod tests {
     }
 
     pub(super) fn terminal_sse_error(bytes: &[u8]) -> Value {
+        terminal_sse_error_type(bytes, "native_v41_error")
+    }
+    fn terminal_sse_error_type(bytes: &[u8], error_type: &str) -> Value {
         let text = std::str::from_utf8(bytes).unwrap();
         assert!(!text.split("\n\n").any(|frame| frame == "data: [DONE]"),
             "failed streams must not finish successfully: {text}");
@@ -2429,7 +2452,7 @@ mod tests {
             choices.iter().any(|choice| !choice["finish_reason"].is_null()))),
             "failed streams must not emit a success finish chunk: {text}");
         let last = frames.last().unwrap();
-        assert_eq!(last["error"]["type"], "native_v41_error");
+        assert_eq!(last["error"]["type"], error_type);
         last.clone()
     }
     fn strict_schema_body(thinking_disabled: bool, schema: Value) -> Body {
@@ -2958,6 +2981,30 @@ mod tests {
             }
         }
     }
+    #[tokio::test]
+    async fn request_retry_retains_429_before_and_after_ready_for_json_and_sse() {
+        for streaming in [false, true] {
+            for ready in [false, true] {
+                let (tx, mut rx) = mpsc::channel::<NativeRequest>(1);
+                let worker = tokio::spawn(async move {
+                    let job = rx.recv().await.unwrap();
+                    if ready { job.events.send(Ok(InferenceChunk::Ready { system_fingerprint: None,
+                        prompt_usage: PromptUsage { prompt_tokens: 1, prompt_cache_hit_tokens: 0 } })).unwrap(); }
+                    job.events.send(Err(NativeFailure::Retry("decode lane full; retry the request".into()))).unwrap();
+                });
+                let response = router(tx).oneshot(request(streaming)).await.unwrap();
+                assert_eq!(response.status(), if streaming && ready { StatusCode::OK } else { StatusCode::TOO_MANY_REQUESTS });
+                if !(streaming && ready) { assert_eq!(response.headers()["retry-after"], "1"); }
+                let body = axum::body::to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+                let value: Value = if streaming && ready { terminal_sse_error_type(&body, "rate_limit_error") } else { serde_json::from_slice(&body).unwrap() };
+                assert_eq!(value["error"]["code"], "retry");
+                assert_eq!(value["error"]["status"], 429);
+                assert_eq!(value["error"]["type"], "rate_limit_error");
+                worker.await.unwrap();
+            }
+        }
+    }
+
     #[tokio::test]
     async fn late_worker_failure_is_not_replaced_by_required_tool_validation() {
         for streaming in [false, true] {

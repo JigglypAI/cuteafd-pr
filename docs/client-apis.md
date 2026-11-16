@@ -30,6 +30,16 @@ them off with `--gateway off` (launchers: `GATEWAY=off`). Structured output
 passed; `json_object` works. `count_tokens` is exact (the checkpoint's
 tokenizer) for text turns.
 
+**Request capacity failures.** A request refused for decode-lane capacity or
+an attributable host-side decode validation failure is retryable: JSON returns
+HTTP 429 with `Retry-After: 1`. Chat errors carry `type: rate_limit_error`,
+`code: retry` and `status: 429`. Once SSE headers have been sent, HTTP stays 200
+and the terminal error event carries that same retry classification (no success
+finish or `[DONE]`). Gateway protocols preserve the rate-limit class in their
+own error envelopes. Only the failed request is retired; its peers keep running.
+Transport, GPU and unattributable packed-buffer extent faults still fail the
+round and reset its connections.
+
 **Browser sockets.** A Responses or Realtime WebSocket opened from a web
 page of another origin is refused unless it carries the key or the origin is
 listed with `--gateway-allow-origin URL`; CLIs and SDKs send no Origin and

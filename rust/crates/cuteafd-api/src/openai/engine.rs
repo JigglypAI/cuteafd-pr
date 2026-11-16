@@ -558,13 +558,13 @@ fn events(running: Running, names: ToolNames, stops: Vec<String>) -> TurnStream 
         while let Some(chunk) = chunks.next().await {
             let failed = failure.lock().unwrap().clone();
             if let Some(message) = failed {
-                yield Err(GatewayError::internal(message)); return;
+                yield Err(rejection(message.rejection())); return;
             }
             let chunk: ChatChunk = match chunk {
                 Ok(chunk) => chunk,
                 Err(e) => {
                     let failed = failure.lock().unwrap().clone();
-                    yield Err(GatewayError::internal(failed.unwrap_or_else(|| e.to_string()))); return;
+                    yield Err(rejection(failed.unwrap_or_else(|| super::NativeFailure::Worker(e.to_string())).rejection())); return;
                 }
             };
             if let Some(Some(u)) = &chunk.usage {
@@ -618,7 +618,7 @@ fn events(running: Running, names: ToolNames, stops: Vec<String>) -> TurnStream 
             return;
         }
         let failed = failure.lock().unwrap().clone();
-        yield Err(GatewayError::internal(failed.unwrap_or_else(|| "engine stream ended without a finish reason".into())));
+        yield Err(rejection(failed.unwrap_or_else(|| "engine stream ended without a finish reason".into()).rejection()));
     })
 }
 
