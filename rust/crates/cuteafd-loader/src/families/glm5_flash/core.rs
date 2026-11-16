@@ -877,7 +877,8 @@ mod tests {
             if let Some(expected) = &expert_headers { assert_eq!(expected, &actual); }
             else { expert_headers = Some(actual); }
             if mode == CoreView::Fp8Compact {
-                assert!(view.fp8_tensors().contains(mtp.keys().next().unwrap()));
+                // Restored native MTP stays BF16 in the derived FP8 view (78af72b02).
+                assert!(mtp.keys().all(|name| !view.fp8_tensors().contains(name)));
                 assert!(cp.converts_to_fp8("lm_head.weight"));
                 assert!(core.native.values().all(|weight| weight.fp8));
             }
