@@ -4,4 +4,5 @@ pub mod indexer;
 pub mod weight_layout;
 pub mod execution;
 pub mod admission;
+pub mod vision;
 pub use config::{MiniMaxM3Config, MiniMaxM3DsparkConfig, MiniMaxM3VisionConfig};
