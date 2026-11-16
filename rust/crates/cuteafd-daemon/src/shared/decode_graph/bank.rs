@@ -1002,3 +1002,6 @@ impl<K: Hash + Eq + Clone + std::fmt::Debug, E> super::CacheAttached for GraphBa
         self.cache_drain(drain, measure)
     }
 }
+
+#[cfg(test)]
+mod perf_tests;
