@@ -109,6 +109,10 @@ impl<'a> InklingBackend<'a> {
         let mut receipt = Vec::new();
         for (index, (placement, tokens)) in sequences.iter().enumerate() {
             self.check(placement, tokens, pool)?;
+            let cfg = &self.execution.borrow().cfg;
+            let ring = cuteafd_loader::families::inkling2::execution::SequenceLayout::new(cfg, true, 1)?.ring_rows;
+            debug_assert!(tokens.len() <= ring-cfg.window, "verify append exceeds ring dead horizon");
+            cuteafd_loader::families::inkling2::verify::verify_ring(cfg.window, ring, tokens.len())?;
             ensure!(slots.insert(placement.slot), "Inkling decode aliases a request state slot");
             members.push(UnitSegment { sequence: index, rows: spans[index].clone(),
                 tokens: placement.len..placement.len+tokens.len(),

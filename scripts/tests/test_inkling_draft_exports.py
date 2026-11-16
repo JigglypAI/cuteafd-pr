@@ -50,3 +50,22 @@ def test_recurrent_projection_shapes_include_native_head_and_tp2_columns(monkeyp
         assert expected in whole
     for expected in ((4608, 3072), (4608, 512), (3072, 4608), (4608, 9216), (9216, 4608)):
         assert expected in split
+def test_fir_exports_keep_wide_prefill_separate_from_bounded_replay(monkeypatch):
+    path = ROOT / "python/tools/aot/export_b12x_dsv4_aot.py"
+    tree = ast.parse(path.read_text())
+    node = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "inkling_fir_programs")
+    for module_name, compiler in (("fir_history", "compile_fir_history_commit_aot"),
+                                  ("inkling2_convolution_replay", "compile_inkling2_convolution_replay_aot"),
+                                  ("inkling2_convolution_strided", "compile_inkling2_convolution_strided_aot")):
+        module = types.ModuleType("b12x.integration.cuteafd."+module_name)
+        setattr(module, compiler, lambda _name=compiler, **kw: (_name, kw))
+        monkeypatch.setitem(sys.modules, module.__name__, module)
+    namespace = {}
+    exec(compile(ast.Module(body=[node], type_ignores=[]), str(path), "exec"), namespace)
+    exports = namespace["inkling_fir_programs"]()
+    assert len(exports) == 7
+    assert exports[0][0] == "fir_history_commit" and exports[0][2] == {"max_rows": 64}
+    for name, op, params, compile_ in exports[1:]:
+        assert params["max_rows"] == (64 if name.endswith("replay") else 4096)
+        assert compile_()[1]["width"] in (1024, 4608)
+        assert op in ("convolution_replay", "convolution_strided")

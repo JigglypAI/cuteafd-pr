@@ -626,6 +626,7 @@ fn shared_recipe_charges_every_owner_once_on_one_and_two_rtx() {
             let owner = |id: &str| contract.components.iter().find(|component| matches!(&component.kind,
                 ComponentKind::Allocation { template, .. } if template.id == id)).unwrap();
             assert_eq!(owner("inkling2.cache.0.active").bytes.at(1).unwrap(), cache.active_bytes().unwrap() as u64);
+            assert_eq!(owner("inkling2.cache.0.conv").bytes.at(1).unwrap(), cache.conv.bytes().unwrap() as u64);
             let slots = cuteafd_core::prefix::mark_slots_with_host(16, 8, cache.sequence_bytes as u64, 2 << 30, false);
             assert_eq!(owner("inkling2.cache.0.marks").bytes.at(1).unwrap(), cache.retained_bytes(slots as usize).unwrap() as u64);
             for &layer in &cache.global_layers {

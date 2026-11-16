@@ -47,6 +47,8 @@ fn validate(options: &Options<'_>, cfg: &Inkling2Config) -> Result<()> {
     ensure!(options.peers.iter().collect::<std::collections::BTreeSet<_>>().len() == options.peers.len(),
         "Inkling Spark endpoints must be distinct");
     cuteafd_core::concurrency::validate("inkling2", options.sequences)?;
+    let ring = cuteafd_loader::families::inkling2::execution::SequenceLayout::new(cfg, true, 1)?.ring_rows;
+    cuteafd_loader::families::inkling2::verify::verify_ring(cfg.window, ring, inkling2::DECODE_ROWS as usize)?;
     ensure!(options.context_tokens == 0 || options.context_tokens <= cfg.max_position as u64,
         "Inkling context exceeds checkpoint");
     ensure!(options.prefill.rows > 0 && options.prefill.rows <= 4096 && options.prefill.rows % 64 == 0

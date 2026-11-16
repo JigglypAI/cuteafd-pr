@@ -334,7 +334,10 @@ mod tests {
         let cache = CacheBank::new(vec![reader.clone()], CacheLayout::with_format(&cfg, 2, 3, format)?, 1)?;
         let state = cache.rings_for_sequence(0)?;
         let pattern = (0..state.bytes).map(|byte| (byte.wrapping_mul(17) % 251) as u8).collect::<Vec<_>>();
+        let conv = cache.conv_for_sequence(0)?;
+        let conv_pattern = (0..conv.bytes).map(|byte| (byte.wrapping_mul(31).wrapping_add(7)%251) as u8).collect::<Vec<_>>();
         library.copy_h2d(state, &pattern)?;
+        library.copy_h2d(conv, &conv_pattern)?;
         cache.capture(0, 0)?;
         cache.reset(0)?;
         cache.restore(0, 1)?;
@@ -344,6 +347,11 @@ mod tests {
         assert_eq!(restored, pattern);
         library.copy_d2h(&mut restored, cache.rings_for_sequence(0)?)?;
         assert!(restored.iter().all(|&byte| byte == 0));
+        let mut restored_conv = vec![0; conv_pattern.len()];
+        library.copy_d2h(&mut restored_conv, cache.conv_for_sequence(1)?)?;
+        assert_eq!(restored_conv, conv_pattern, "all contiguous FIR state bytes restore exactly");
+        library.copy_d2h(&mut restored_conv, cache.conv_for_sequence(0)?)?;
+        assert!(restored_conv.iter().all(|&byte|byte==0));
         let page = cache.page(1, 0)?;
         let page_pattern = vec![0x5a; page.bytes];
         library.copy_h2d(page, &page_pattern)?;

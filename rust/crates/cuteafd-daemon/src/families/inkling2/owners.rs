@@ -149,7 +149,7 @@ impl<'a> UnitOwner<'a> {
     }
     pub fn packed_metadata(&self, layer: usize, cache: &super::cache::CacheBank<'a>, members: &[PackedMember],
         uploads: &mut crate::shared::token_table::RetainedUploads<'a>) -> Result<()> {
-        ensure!(cache.layout.sequence_bytes % 4096 == 0,
+        ensure!(cache.layout.ring_sequence_bytes % 4096 == 0,
             "Inkling sequence bank must have an integral record stride");
         ensure!(members.len() <= cache.layout.sequences
             && members.iter().all(|member| member.sequence < cache.layout.sequences)
@@ -169,7 +169,7 @@ impl<'a> UnitOwner<'a> {
             local.extend(member.metadata.local_slots.iter().map(|&slot| slot + member.rows.start as i64));
             global.extend_from_slice(&member.metadata.global_slots);
             ring.extend(member.metadata.ring_slots.iter().map(|&slot|
-                slot + (member.sequence * cache.layout.sequence_bytes / 4096) as i64));
+                slot + (member.sequence * cache.layout.ring_sequence_bytes / 4096) as i64));
             conv.extend(std::iter::repeat_n(member.sequence as i64, member.rows.len()));
             first.extend(std::iter::repeat_n(member.rows.start as i32, member.rows.len()));
         }
@@ -370,7 +370,7 @@ mod packed_tests {
         assert_eq!(i32_values("table_indices")?, [0, 1, 1, 1]);
         assert_eq!(&i32_values("tile_rows")?[..2], [0, 1]);
         assert_eq!(i32_values("page_table")?, [2, 0, 0, 3]);
-        let stride = cache.layout.sequence_bytes/4096;
+        let stride = cache.layout.ring_sequence_bytes/4096;
         assert_eq!(values("ring_slots")?, [stride as i64+63, 65, 66, 67]);
         let packed = PackedLayerUnit { unit: &unit, cache: &cache, layer: 1, members: &members,
             uploads: std::cell::RefCell::new(&mut uploads) };
