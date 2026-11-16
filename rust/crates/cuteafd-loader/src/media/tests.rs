@@ -373,7 +373,7 @@ fn mistral_spans_match_mistral_common_layout_on_hf_grids() {
         } else {
             PreparedImage { key: cuteafd_core::ImageKey([0; 32]), encoder: EncoderId([0; 32]),
                 processor: PreprocessId([0; 32]), grid: ImageGrid { t: 1, h: rh / config.patch, w: rw / config.patch },
-                rgb8: std::sync::Arc::from([]), tokens: (expected.0 * (expected.1 + 1)) as usize }
+                rgb8: std::sync::Arc::from([]), pixels:cuteafd_core::media::ImagePixels::full(rw,rh), tokens: (expected.0 * (expected.1 + 1)) as usize }
         };
         let expanded = expander.expand(&[1, 10, 2], std::slice::from_ref(&image), 1 << 20).unwrap();
         let span = &expanded.tokens[1..expanded.tokens.len() - 1];

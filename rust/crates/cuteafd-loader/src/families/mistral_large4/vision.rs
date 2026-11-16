@@ -154,7 +154,7 @@ mod tests {
     fn square(cells: u32) -> crate::media::PreparedImage {
         crate::media::PreparedImage { key: crate::media::ImageKey([1; 32]), encoder: crate::media::EncoderId([0; 32]), processor: crate::media::PreprocessId([0; 32]),
             grid: crate::media::ImageGrid { t: 1, h: cells, w: cells },
-            rgb8: std::sync::Arc::from(Vec::new()), tokens: (cells * (cells + 1)) as usize }
+            rgb8: std::sync::Arc::from(Vec::new()), pixels:cuteafd_core::media::ImagePixels::full(cells*14,cells*14), tokens: (cells * (cells + 1)) as usize }
     }
 
     fn config() -> serde_json::Value {

@@ -551,7 +551,7 @@ mod tests {
         let rgb: Arc<[u8]> = Arc::from([37; 48]);
         let source = PreparedImage::key_for(EncoderId([120; 32]), processor, grid, &rgb);
         let image = Arc::new(PreparedImage { key: PreparedImage::key_for(EncoderId([121; 32]), processor, grid, &rgb),
-            encoder: EncoderId([121; 32]), processor, grid, rgb8: rgb, tokens: 1 });
+            encoder: EncoderId([121; 32]), processor, grid, rgb8: rgb, pixels:cuteafd_core::media::ImagePixels::full(28,28), tokens: 1 });
         let tokens = vec![1, 8, 7, 9, 2];
         let span = ProbeMedia { start: 2, len: 1, kind: "image".into(), key: key_hex(source.into()),
             grid: [1, 2, 2], identity: Some(ProbeImageIdentity { encoder: "78".repeat(32), processor: "02".repeat(32) }),

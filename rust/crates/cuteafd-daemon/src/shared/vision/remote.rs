@@ -96,6 +96,10 @@ impl EncoderHandshake {
     }
     fn validate_job(&self, job: &EncodeJob) -> Result<usize> {
         let ([t, h, w], rgb8) = job.image_input()?;
+        let pixels = job.pixels(self.patch_size)?;
+        if pixels.padded() || pixels.canvas != [w.saturating_mul(self.patch_size),h.saturating_mul(self.patch_size)] {
+            return Err(error("remote encoder does not carry padded source geometry"));
+        }
         let patches = u64::from(h) * u64::from(w);
         let rgb_bytes = self.input_bytes(patches);
         if t != 1
@@ -541,7 +545,7 @@ fn ping(s: &mut Wire) -> Result<()> {
 fn exchange(s: &mut Wire, job: &EncodeJob) -> Result<EncodeOutput> {
     s.frame();
     match &job.input {
-        cuteafd_engine::media::EncodeInput::Image { grid, rgb8 } => {
+        cuteafd_engine::media::EncodeInput::Image { grid, rgb8, .. } => {
             put_u32(s, 1)?;
             s.write_all(job.key.bytes()).map_err(error)?;
             for &n in grid {

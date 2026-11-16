@@ -600,7 +600,7 @@ mod tests {
     }
     fn image() -> Arc<PreparedImage> {
         Arc::new(PreparedImage { key: ImageKey([7; 32]), encoder: cuteafd_loader::media::EncoderId([0; 32]), processor: cuteafd_loader::media::PreprocessId([0; 32]), grid: ImageGrid { t: 1, h: 4, w: 4 },
-            rgb8: Arc::from(vec![0; 4 * 4 * 768]), tokens: 4 })
+            rgb8: Arc::from(vec![0; 4 * 4 * 768]), pixels:cuteafd_core::media::ImagePixels::full(64,64), tokens: 4 })
     }
     #[test]
     fn mixed_image_audio_jobs_and_span_identities_remain_in_prompt_order() {

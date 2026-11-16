@@ -68,6 +68,7 @@ pub struct PreparedImage {
     /// ViT patch grid, not the merged LM grid; t=1 for still images.
     pub grid: ImageGrid,
     pub rgb8: Arc<[u8]>,
+    pub pixels: cuteafd_core::media::ImagePixels,
     pub tokens: usize,
 }
 
@@ -504,6 +505,8 @@ impl ImageProcessor for ProcessorConfig {
             processor,
             grid,
             rgb8: rgb.data.into(),
+            pixels: cuteafd_core::media::ImagePixels { source:[image.width,image.height],
+                ..cuteafd_core::media::ImagePixels::full(width,height) },
             tokens,
         })
     }

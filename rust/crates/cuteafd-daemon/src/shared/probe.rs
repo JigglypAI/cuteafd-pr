@@ -202,7 +202,7 @@ mod image_span_tests {
         let rgb: Arc<[u8]> = Arc::from([37; 48]);
         let key = PreparedImage::key_for(EncoderId([120; 32]), processor, grid, &rgb);
         let mut remote = PreparedImage { key: PreparedImage::key_for(EncoderId([121; 32]), processor, grid, &rgb),
-            encoder: EncoderId([121; 32]), processor, grid, rgb8: rgb, tokens: 6 };
+            encoder: EncoderId([121; 32]), processor, grid, rgb8: rgb, pixels:cuteafd_core::media::ImagePixels::full(56,56), tokens: 6 };
         let tokens = vec![1, 5, 5, 4, 5, 5, 6, 2];
         let spec = ProbeSpec { prompt_ids: Some(tokens.clone()), media: vec![ProbeMedia {
             start: 1, len: 6, kind: "image".into(), key: key.0.iter().map(|b| format!("{b:02x}")).collect(),
@@ -223,7 +223,7 @@ mod image_span_tests {
         for (markers, tokens, start, len) in [(bounded, vec![1, 4, 5, 5, 5, 5, 6, 2], 2, 4),
             (rows, vec![1, 5, 5, 4, 5, 5, 6, 2], 1, 6)] {
             let image = PreparedImage { key: ImageKey([7; 32]), encoder: cuteafd_loader::media::EncoderId([0; 32]), processor: cuteafd_loader::media::PreprocessId([0; 32]), grid: ImageGrid { t: 1, h: 4, w: 4 },
-                rgb8: Arc::from([]), tokens: len };
+                rgb8: Arc::from([]), pixels:cuteafd_core::media::ImagePixels::full(56,56), tokens: len };
             let mut spec = ProbeSpec { prompt_ids: Some(tokens.clone()), media: vec![ProbeMedia { start, len,
                 kind: "image".into(), key: "07".repeat(32), grid: [1, 4, 4], identity: None, input_key: None, fixture: None,
                 image_url: Some(ProbeImageUrl { url: "fixture".into(), detail: None }) }], ..Default::default() };

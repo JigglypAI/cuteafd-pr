@@ -357,7 +357,7 @@ mod tests {
                         vec![PreparedImage {
                             key: ImageKey([0; 32]), encoder: cuteafd_loader::media::EncoderId([0; 32]), processor: cuteafd_loader::media::PreprocessId([0; 32]),
                             grid: ImageGrid { t: 1, h: 2, w: 2 },
-                            rgb8: Arc::from([0; 3]),
+                            rgb8: Arc::from([0; 3]), pixels:cuteafd_core::media::ImagePixels::full(32,32),
                             tokens: 4,
                         }]
                     } else {

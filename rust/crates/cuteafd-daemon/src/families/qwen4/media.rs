@@ -363,7 +363,7 @@ mod tests {
     }
     fn image() -> Arc<PreparedImage> {
         Arc::new(PreparedImage { key: ImageKey([7; 32]), encoder: cuteafd_loader::media::EncoderId([0; 32]), processor: cuteafd_loader::media::PreprocessId([0; 32]), grid: ImageGrid { t: 1, h: 4, w: 4 },
-            rgb8: Arc::from(vec![0; 4 * 4 * 768]), tokens: 4 })
+            rgb8: Arc::from(vec![0; 4 * 4 * 768]), pixels:cuteafd_core::media::ImagePixels::full(64,64), tokens: 4 })
     }
     fn feature_request() -> (Prompt, RequestMedia, serde_json::Value) {
         use cuteafd_api::openai::probe::{Probe, ProbeSpec, ProbeMedia, ProbeFixture, ProbeImageUrl};
