@@ -2009,7 +2009,14 @@ mod tests {
             assert!(split.exchange.require_cooperative_producer_event(1-lead,*producer,event.device.id,std::ptr::null_mut()).is_err());
             assert!(split.exchange.require_cooperative_producer_event(1-lead,*producer,1-event.device.id,event.raw).is_err());
             let invalid=ContextRow { tap_row:TAP_ROWS,slot:0,position:0 };
+            fixture.quiet_events(&library,false)?;
+            let before_invalid=fixture.events()?;
             let error=draft.update(&[invalid]).unwrap_err();
+            let after_invalid=fixture.events()?;
+            fixture.quiet_events(&library,true)?;
+            assert_eq!(after_invalid.bytes().filter(|&event|event==b'p').count(),
+                before_invalid.bytes().filter(|&event|event==b'p').count(),
+                "invalid update queued a peer push before validation");
             assert!(format!("{error:#}").contains("past"));
             assert_eq!(split.exchange.terminal_state(),crate::shared::peer_split::TerminalState::Aborting);
             // Same sequence as Engine::shutdown: abort again, ordered teardown,
