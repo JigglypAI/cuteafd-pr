@@ -35,8 +35,9 @@ pub struct Attention<'a> {
 /// One stream-ordered step. Metadata is device resident and validated by its
 /// owner: positions >=0, ring slots address their sequence's ring, first rows
 /// partition the packed step, and page-table entries address allocated pages.
-/// Prefill global attention accepts one sequence (table_stride=0); decode has
-/// a table per row. No producer may overwrite a retained history before use.
+/// Global rows select tables through table_indices; tile_rows names each CTA
+/// start and first prevents prefill tiles from crossing packed segments. No
+/// producer may overwrite a retained history before use.
 #[derive(Clone, Copy, Debug)]
 pub struct Batch {
     pub rows: usize,
@@ -86,7 +87,8 @@ impl<'a> Attention<'a> {
         ensure!(self.kind == Kind::Local, "Inkling local launch bound to global attention");
         let mut buffers = self.common(b)?;
         ensure!(local.ring_stride_records >= RING_ROWS, "Inkling ring stride is shorter than window");
-        let ring_bytes = RING_ROWS * RECORD_BYTES;
+        let ring_bytes = local.ring.bytes;
+        ensure!(ring_bytes >= RING_ROWS*RECORD_BYTES, "Inkling ring bank is shorter than window");
         buffers.extend([(b.kv, b.rows * RECORD_BYTES, 16), (local.ring, ring_bytes, 16),
             (local.ring_slots, b.rows * 8, 8), (local.first, b.rows * 4, 4)]);
         validate_buffers(&buffers, &[b.output, b.scratch, local.ring])?;

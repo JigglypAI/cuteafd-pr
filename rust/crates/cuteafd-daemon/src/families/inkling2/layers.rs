@@ -234,16 +234,16 @@ fn attention_cache<'a>(k: &Kernels<'a>, owner: &impl UnitBuffers<'a>, cfg: &Inkl
     unsafe { k.producer(Op::KvPack { precision: Precision::F32, fp8: !local && k.kv_format == cuteafd_loader::families::inkling2::InklingKvCache::Fp8 })?.launch(&[b("k_clipped")?, b("v_norm")?,
         b("cache_slots")?, if local { b("kv_step")? } else { b("global_cache")? }], rows, None, owner.stream().raw)?; }
     let (tiles, tables, table_width, ring_stride_records) = if let Some((unit, cache, _, members)) = owner.packed() {
-        (members.iter().map(|member| member.rows.len().div_ceil(if rows <= 64 { 1 } else { 10 })).sum(),
+        (members.iter().map(|member| member.rows.len().div_ceil(10)).sum(),
             members.len(), unit.layout.buffers["page_table"]/(cache.layout.sequences*4),
             cache.layout.sequence_bytes/4096)
-    } else { (rows.div_ceil(if rows <= 64 { 1 } else { 10 }), 1, owner.layout().buffers["page_table"]/4, 1088) };
+    } else { (rows.div_ceil(10), 1, owner.layout().buffers["page_table"]/4, 1088) };
     let batch = Batch { rows, tiles, tile_rows: b("tile_rows")?, q: b("q_bf16")?, kv: if local { b("kv_step")? } else { b("global_cache")? },
         positions: b("positions")?, relative: b("relative")?, sinks: b("sinks")?, output: b("attended")?, scratch: b("attention_scratch")? };
     if local {
-        (if rows <= 64 { &k.local_decode } else { &k.local }).local(batch, Local { ring: b("ring")?, ring_stride_records, ring_slots: b("ring_slots")?, first: b("first")? }, owner.stream().raw)
+        k.local.local(batch, Local { ring: b("ring")?, ring_stride_records, ring_slots: b("ring_slots")?, first: b("first")? }, owner.stream().raw)
     } else {
-        (if rows <= 64 { &k.global_decode } else { &k.global }).global(batch, Global {
+        k.global.global(batch, Global {
             pages: b("global_cache")?.bytes/(64*k.kv_format.record_bytes(cfg.kv_heads, cfg.head_dim)), page_table: b("page_table")?,
             table_width, tables, table_indices: b("table_indices")?, first: b("first")?, splits: 1 }, owner.stream().raw)
     }

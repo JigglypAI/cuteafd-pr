@@ -544,9 +544,10 @@ fn shared_recipe_charges_every_owner_once_on_one_and_two_rtx() {
         for gpu in 0..gpus {
             for (prefix, rows) in std::iter::once((format!("inkling2.decode.{gpu}"), 64usize))
                 .chain((0..prefill.waves).map(|slot| (format!("inkling2.unit.{gpu}.{slot}"), prefill.rows as usize))) {
-                let expected = crate::families::inkling2::execution::UnitLayout::serving(&cfg, rows, 1 << 20).unwrap();
+                let expected = crate::families::inkling2::execution::UnitLayout::serving_format(&cfg, rows, 1 << 20, inputs.kv_format, inputs.sequences as usize).unwrap();
                 let actual = contract.components.iter().filter_map(|component| match &component.kind {
                     ComponentKind::Allocation { template, .. } if template.location == Location::coordinator(gpu as u8) => template.id.strip_prefix(&format!("{prefix}."))
+                        .filter(|name| *name != "uploads")
                         .map(|name| (name.to_owned(), component.bytes.at(1).unwrap() as usize)),
                     _ => None,
                 }).collect::<std::collections::BTreeMap<_, _>>();

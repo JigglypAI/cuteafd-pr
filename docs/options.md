@@ -184,9 +184,11 @@ explicit `heads`, `layers`, `context` and multi-RTX serving refuse. Set
 `PREFIX_CACHE_ENTRIES`, `HOST_CACHE_BYTES`, KV reservation and loop-abort keys,
 plus `RTX_EXPERT_LAYERS=auto|all|N`, `PREFILL_ROWS` (a multiple of 64 up to
 4096), `PREFILL_WAVES` (1-3), `GPU_GRAPH_RESERVE`, its extra/cap keys and
-`GRAPH_TRACE`. `PREFILL_PACKING` and `KV_CACHE` are not selectable launch keys:
-KV uses native BF16 interleaved planes, convolution/residual state uses F32,
-and prefix restores preserve captured state exactly. Report the admitted KV
+`GRAPH_TRACE` and `KV_CACHE=bf16|fp8`. `PREFILL_PACKING` is not a selectable
+launch key. Global KV defaults to BF16 until paired FP8 fidelity qualifies;
+FP8 stores native E4M3 payloads with per-token/head FP32 K/V scales. Local
+rings stay BF16, convolution/residual state stays F32, and prefix restores
+preserve captured state exactly. Report the admitted KV
 pool rather than assuming the default target fits these owners.
 
 ### MiniMax Serving

@@ -142,6 +142,8 @@ impl<'a> UnitOwner<'a> {
     }
     pub fn packed_metadata(&self, layer: usize, cache: &super::cache::CacheBank<'a>, members: &[PackedMember],
         uploads: &mut crate::shared::token_table::RetainedUploads<'a>) -> Result<()> {
+        ensure!(cache.layout.sequence_bytes % 4096 == 0,
+            "Inkling sequence bank must have an integral record stride");
         let rows = members.last().context("Inkling packed metadata is empty")?.rows.end;
         let mut positions = Vec::with_capacity(rows);
         let mut local = Vec::with_capacity(rows);
@@ -171,7 +173,7 @@ impl<'a> UnitOwner<'a> {
         let bytes = first.iter().flat_map(|value| value.to_le_bytes()).collect::<Vec<_>>();
         // SAFETY: same whole-unit metadata source lifetime.
         unsafe { uploads.upload(self.buffer("first")?, &bytes, self.stream.raw)?; }
-        let step = if rows <= 64 { 1 } else { 10 };
+        let step = 10;
         let tiles = members.iter().flat_map(|member| member.rows.clone().step_by(step))
             .map(|row| row as i32).collect::<Vec<_>>();
         let indices = members.iter().enumerate().flat_map(|(table, member)|

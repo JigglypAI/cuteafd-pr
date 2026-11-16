@@ -89,7 +89,7 @@ fn run(args: GoldenArgs) -> Result<()> {
     let pages = (0..owner.layout.buffers["page_table"]/4).flat_map(|n| (n as i32).to_le_bytes()).collect::<Vec<_>>();
     stream.drain()?;
     device.run(|| {
-        let tile_rows = (0..rows).step_by(if rows <= 64 { 1 } else { 10 })
+        let tile_rows = (0..rows).step_by(10)
             .flat_map(|row| (row as i32).to_le_bytes()).collect::<Vec<_>>();
         library.copy_h2d(owner.buffer("tile_rows")?, &tile_rows)?;
         library.copy_h2d(owner.buffer("positions")?, &positions)?;
