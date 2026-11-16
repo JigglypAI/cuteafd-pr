@@ -188,6 +188,17 @@ fn resolve_settings(args: &mut PlanArgs, family: &str, cfg: &std::collections::B
             });
         }
     }
+    if family == "kimi_k3" {
+        let fp8 = defaults::kimi_draft_fp8(args.draft_fp8, args.speculator == "dflash2");
+        args.draft_fp8 = Some(fp8.value);
+        resolved.insert("draft_fp8".into(), setting(fp8));
+    }
+    if family == "mimo_v2" {
+        let depth = defaults::mimo_mtp_depth((args.explicit_settings.contains("native_mtp_layers")).then_some(args.native_mtp_layers),
+            cfg.get("SPECULATOR_DEPTH").filter(|v| !v.is_empty()).map(|v| v.parse().context("SPECULATOR_DEPTH")).transpose()?, args.speculator == "mtp");
+        args.native_mtp_layers = depth.value;
+        resolved.insert("native_mtp_layers".into(), setting(depth));
+    }
     Ok(resolved)
 }
 
@@ -458,6 +469,9 @@ fn run_plan_with_host(mut args: PlanArgs) -> Result<()> {
         println!("{}", serde_json::to_string(&output)?);
         return Ok(());
     }
+    if family == "kimi_k3" && args.speculator == "dflash2" && args.drafter_snapshot.is_none() {
+        args.drafter_snapshot = file_args(args.clone(), &snapshot)?.drafter_snapshot;
+    }
     let mut options = options(&args)?;
     if view.mode() == cuteafd_loader::plan::checkpoint::CoreView::Original && cuteafd_loader::plan::exlr8::recognizes(&snapshot)? {
         if args.spark_range {
@@ -721,7 +735,7 @@ fn resolve_speculator(args: &mut PlanArgs, snapshot: &std::path::Path, family: &
         "qwen3_5" if serde_json::from_slice::<serde_json::Value>(&std::fs::read(snapshot.join("config.json"))?)
             .is_ok_and(|config| config.get("text_config").unwrap_or(&config)["hidden_size"] == 5120) => "dspark",
         "mimo_v2" if snapshot.join("dflash").is_dir() => "dflash2",
-        "mimo_v2" | "qwen4" | "step5" if args.native_mtp_layers > 0 => "mtp",
+        "qwen4" | "step5" if args.native_mtp_layers > 0 => "mtp",
         "deepseek_v4" | "deepseek_v41" if args.native_mtp_layers > 0 => "dspark",
         _ => "off",
     };
@@ -730,6 +744,11 @@ fn resolve_speculator(args: &mut PlanArgs, snapshot: &std::path::Path, family: &
         let available = cuteafd_loader::model_cache_dir(&hf_home, GLMF_DEFAULT_DRAFTER).is_dir();
         args.speculator = cuteafd_core::launch_settings::glmf_speculator((args.speculator != "auto" || args.explicit_settings.contains("speculator")).then_some(args.speculator.as_str()),
             cfg.get("SPECULATOR").map(String::as_str), available).value;
+    }
+    if family == "mimo_v2" && !args.no_speculator {
+        args.speculator = cuteafd_core::launch_settings::mimo_speculator(
+            (args.speculator != "auto" || args.explicit_settings.contains("speculator")).then_some(args.speculator.as_str()),
+            cfg.get("SPECULATOR").map(String::as_str), snapshot.join("dflash").is_dir()).value;
     }
     if args.speculator == "auto" {
         args.speculator = cfg.get("SPECULATOR").cloned().unwrap_or_else(|| {

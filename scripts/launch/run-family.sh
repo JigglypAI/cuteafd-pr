@@ -1595,9 +1595,9 @@ if [[ -z "$speculator" ]]; then
     speculator="$(jq -er '.speculator' <<<"$glmf_defaults")"
     default_drafter="$(jq -er '.default_drafter' <<<"$glmf_defaults")"
   fi
-  if [[ $speculator == off && $mimo_bundled_dflash == 1 ]]; then
-    speculator=dflash2
-    echo "note: $model drafts with its bundled DFlash; SPECULATOR=off disables it" >&2
+  if [[ $speculator == off && $family == mimo_v2 ]]; then
+    mimo_defaults="$(docker run --rm --network none -e "HF_HOME=$container_hf_home"       "${generic_worker_mounts[@]}" "${wip_mount_args[@]}" -v "$config:/run/cuteafd-plan.config:ro"       "$coordinator_image" cuteafd plan "$snapshot" --config /run/cuteafd-plan.config --resolve-settings-only)"
+    speculator="$(jq -er '.speculator' <<<"$mimo_defaults")"
   fi
   if [[ $speculator == off && $dsv4_dspark == 1 ]]; then
     speculator=dspark
@@ -1773,7 +1773,6 @@ case "$speculator" in
       draft_snapshot="$(snapshot_of "$drafter" "$draft_revision")" ||
         { [[ -z "$default_drafter" ]] || echo "download it (hf download $drafter) or set SPECULATOR=off" >&2; exit 1; }
       draft_args=(--draft "$draft_snapshot")
-      [[ "$family" != kimi_k3 ]] || draft_args+=(--draft-fp8 true)
       if [[ "$family" == muse_spark ]]; then
         muse_draft_kv="$(get DRAFT_KV_CACHE fp8)"
         case "$muse_draft_kv" in bf16|fp8) ;; *) release_die "DRAFT_KV_CACHE must be bf16 or fp8" ;; esac
@@ -1785,7 +1784,7 @@ case "$speculator" in
       echo "SPECULATOR=$speculator needs SPECULATOR_MODEL_ID (a ${speculator/dflash2/DFlash2} checkpoint)" >&2; exit 2
     fi ;;
   mtp)
-    family_args+=(--mtp "$(get SPECULATOR_DEPTH "$mtp_depth")") ;;
+    [[ "$family" == mimo_v2 ]] || family_args+=(--mtp "$(get SPECULATOR_DEPTH "$mtp_depth")") ;;
 esac
 draft_model_args=${#draft_args[@]}
 # One fixed-length override for every family and speculator.
@@ -2337,7 +2336,7 @@ audio_encoder_hash=""
     plan_draft_args+=(--drafter-snapshot "$draft_snapshot")
   fi
   if [[ "$family:$speculator" == kimi_k3:dflash2 ]]; then
-    plan_draft_args+=(--drafter-snapshot "$draft_snapshot" --draft-fp8 true)
+    plan_draft_args+=(--drafter-snapshot "$draft_snapshot")
   fi
   if [[ "$family:$speculator" == muse_spark:dflash2 ]]; then
     plan_draft_args+=(--drafter-snapshot "$draft_snapshot")
@@ -2377,12 +2376,6 @@ audio_encoder_hash=""
     if [[ "$(get MIMO_PREFIX_DRAFT off)" == on ]]; then
       plan_draft_args+=(--mimo-prefix-draft)
     fi
-    # Plan the native MTP depth serve-mimo receives (its --mtp, default 0).
-    mimo_plan_mtp=0
-    for ((i=0; i<${#family_args[@]}; i++)); do
-      [[ "${family_args[i]}" != --mtp ]] || mimo_plan_mtp="${family_args[i+1]}"
-    done
-    plan_draft_args+=(--native-mtp-layers "$mimo_plan_mtp")
   fi
   # Rust resolves recurrent storage and prefix defaults from the same concurrency.
   if [[ "$family" == glm5_flash ]]; then
@@ -2557,6 +2550,12 @@ audio_encoder_hash=""
     echo "Qwen planner selected SPECULATOR=$speculator (admitted Spark expert world $spark_expert_world)"
   fi
   coordinator_weight_budget_gib="$(jq -er '.resolved_settings.coordinator_weight_budget_gib.value' <<<"$deployment_json")"
+  if [[ "$family:$speculator" == kimi_k3:dflash2 ]]; then
+    draft_args+=(--draft-fp8 "$(jq -er '.resolved_settings.draft_fp8.value | tostring' <<<"$deployment_json")")
+  fi
+  if [[ "$family:$speculator" == mimo_v2:mtp ]]; then
+    family_args+=(--mtp "$(jq -er '.resolved_settings.native_mtp_layers.value' <<<"$deployment_json")")
+  fi
   if [[ "$family" == glm5_flash ]]; then
     resolved_replay_records="$(jq -er '.replay_records | select(. == "own" or . == "shared")' <<<"$deployment_json")" ||
       release_die "GLM Flash deployment does not name resolved replay records"

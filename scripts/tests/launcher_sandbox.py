@@ -110,6 +110,10 @@ def fake_resolved_settings(args, family, sparks):
     shared = tp == 1 and int(value("--pool-tokens", "0") or 0) == 0 and int(sparks) > 0
     result = {"coordinator_weight_budget_gib": {
         "value": int(value("--gpu-memory-cap", str(96 << 30))) / 2**30, "provenance": "auto"}}
+    if family == "kimi_k3":
+        result["draft_fp8"] = {"value": True, "provenance": "auto"}
+    if family == "mimo_v2":
+        result["native_mtp_layers"] = {"value": int(config.get("SPECULATOR_DEPTH") or 1) if value("--speculator") == "mtp" else 0, "provenance": "auto"}
     if family == "glm5_flash":
         result.update(index_cache=resolved("--index-cache", "GLM5_FLASH_INDEX_CACHE", "compact" if tp == 1 else "keys"),
             draft_linear=resolved("--draft-linear", "GLM5_FLASH_DRAFT_LINEAR",

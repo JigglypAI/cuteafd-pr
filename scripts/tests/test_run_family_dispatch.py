@@ -1067,7 +1067,13 @@ args = sys.argv[1:]
 if "--resolve-settings-only" in args:
     from pathlib import Path
     hf = Path(os.environ["HF_HOME"])
-    selected = "dflash2" if (hf / "hub/models--incoai--GLM-5.3-Flash-DFlash2").is_dir() else "off"
+    checkpoint = json.loads(os.environ["STUB_CHECKPOINT"])
+    if checkpoint.get("model_type", "").startswith("mimo"):
+        selected = "dflash2" if (Path(os.environ["STUB_CONFIG_PATH"]).parent / "dflash").is_dir() else "off"
+        if os.environ.get("STUB_MODEL_ID") in ("XiaomiMiMo/MiMo-V2.6-Flash-MOPD", "XiaomiMiMo/MiMo-V2.6-Pro-MOPD"):
+            selected = "dflash2"
+    else:
+        selected = "dflash2" if (hf / "hub/models--incoai--GLM-5.3-Flash-DFlash2").is_dir() else "off"
     print(json.dumps(dict(speculator=selected, default_drafter="incoai/GLM-5.3-Flash-DFlash2")))
     sys.exit(0)
 if os.environ.get("STUB_REAL_PLANNER"):
@@ -1184,7 +1190,7 @@ print(json.dumps(deployment))
         f"SPARK_{rank}_HOST=h{rank}\nSPARK_{rank}_LANE_A=10.0.0.{rank + 1}\n" for rank in range(8)) + keys)
     env = {**os.environ, "HF_HOME": str(hf), "PATH": f"{bin_dir}:{os.environ['PATH']}",
            "STUB_PROGRAMS": str(tmp_path / "PROGRAMS.json"), "STUB_SPARK_COUNT": str(exact_count),
-           "STUB_DEPLOYMENT": str(deployment_stub), "STUB_CHECKPOINT": json.dumps(family_config),
+           "STUB_DEPLOYMENT": str(deployment_stub), "STUB_CHECKPOINT": json.dumps(family_config), "STUB_MODEL_ID": model,
            "STUB_CONFIG_PATH": str(hf / "hub" / f"models--{model.replace('/', '--')}" / "snapshots" / ("a" * 40 if native_v41 else "abc") / "config.json"),
            "STUB_FAMILY_READER": str(repo / "scripts/lib/checkpoint-family.py"),
            "STUB_PREFERRED_RANKS": str(preferred_ranks if preferred_ranks is not None else 1),

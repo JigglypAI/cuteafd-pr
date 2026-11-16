@@ -48,6 +48,20 @@ pub fn coordinator_weight_budget(explicit_gib: Option<f64>, configured_gib: Opti
         "device capacity after explicit cap and occupancy adjustment")
 }
 
+pub fn kimi_draft_fp8(explicit: Option<bool>, dflash: bool) -> Resolved<bool> {
+    selected(explicit, None, dflash, "FP8 for explicit Kimi DFlash2")
+}
+
+pub fn mimo_speculator(explicit: Option<&str>, configured: Option<&str>, bundled_dflash: bool) -> Resolved<String> {
+    selected(explicit.filter(|v| !v.is_empty() && *v != "auto").map(str::to_owned),
+        configured.filter(|_| explicit.is_none()).filter(|v| !v.is_empty() && *v != "auto").map(str::to_owned),
+        if bundled_dflash { "dflash2" } else { "off" }.into(), "bundled MiMo DFlash2 when present; off otherwise")
+}
+
+pub fn mimo_mtp_depth(explicit: Option<usize>, configured: Option<usize>, mtp: bool) -> Resolved<usize> {
+    selected(explicit, configured, if mtp { 1 } else { 0 }, "one stage for explicit MiMo MTP; zero otherwise")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

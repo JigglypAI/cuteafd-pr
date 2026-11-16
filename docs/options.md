@@ -1028,3 +1028,8 @@ explicit device capacity and estimated runtime owners. The plan
 `--coordinator-weight-budget-gib` default follows this capacity (including
 `--gpu-memory-cap`); the launcher passes Qwen occupancy as an explicit adjusted
 capacity. Explicit weight ceilings override that derivation.
+
+Kimi DFlash2 planning resolves the configured external drafter snapshot and
+defaults its weights to FP8, as the launcher does. MiMo without a bundled DFlash
+defaults speculation off; explicit MTP defaults to one stage. These settings
+are resolved in Rust for both config planning and launching.
