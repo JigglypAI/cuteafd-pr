@@ -1027,8 +1027,8 @@ pub fn stream_slab_owners(ranks: usize, maximum: u64) -> Result<Vec<Component>, 
 pub fn stream_slab_owners_with_block(ranks:usize,maximum:u64,block_tp2:bool)->Result<Vec<Component>,Refusal> {
     let base = crate::plan::families::kimi::startup_peak_live_streams();
     (0..ranks).map(|rank| {
-    // Dedicated exchange adds one abort publisher per GPU and a peer compute stream.
-    let peak=base+if block_tp2 { if rank+1==ranks { 1 } else { 2 } } else { 0 };
+    // Dedicated exchange: abort publisher per GPU, peer compute, local mark copy per GPU.
+    let peak=base+if block_tp2 { if rank+1==ranks { 2 } else { 3 } } else { 0 };
     let bytes=cuda_stream_slab_bytes(peak)?;
     Ok(Component {
         activation: Activation::always(), bytes: ByteCurve::fixed(bytes, maximum),

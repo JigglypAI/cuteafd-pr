@@ -1882,6 +1882,7 @@ mod tests {
         let library=fixture.load()?;
         for rank in 0..2 { fixture.configure_memory(&library,rank,1<<30)?; }
         fixture.immediate_copies(&library)?; fixture.quiet_events(&library,true)?;
+        fixture.peer_abort_initialization(&library)?;
         let root=tempfile::tempdir_in(fixture.directory())?;
         let config=serde_json::json!({"architectures":["DSparkDraftModel"],"speculators_model_type":"dspark",
             "aux_hidden_state_layer_ids":[1],"block_size":2,"confidence_head_with_markov":true,
