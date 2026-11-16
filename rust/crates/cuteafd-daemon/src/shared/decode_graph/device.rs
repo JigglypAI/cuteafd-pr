@@ -752,7 +752,6 @@ impl LaneCycles {
                 let mut cache = cache.lock().unwrap_or_else(|p| p.into_inner());
                 cache.concurrent_cycles = concurrent_cycles as u64;
                 cache.lane_max_cycles[lane] = concurrent_cycles as u64;
-                cache.donor_epoch = None;
                 HIT_EPOCHS.with(|epochs| { epochs.borrow_mut().insert(cache.device,
                     cache.clocks.as_ref().each_ref().map(|clock| clock.index.load(Ordering::Acquire))); });
                 cache.clocks.clone()
@@ -857,8 +856,7 @@ pub(crate) struct DeviceCache {
     age_soft_crossed: bool,
     update_sites: std::collections::BTreeMap<&'static str, HashMap<Cycle, Counters>>,
     native_graphs: HashMap<u64, NativeGraph>,
-    donor_epoch: Option<([u64; 2], bool)>,
-    donor_candidates: HashMap<Vec<u64>, HashSet<u64>>,
+    donor_candidates: HashMap<Vec<u64>, [std::collections::BTreeSet<(u64, u64)>; 2]>,
     update_requests: HashMap<u64, UpdateRequest>,
     observer: GrowthObserver,
     memory_query: Option<cuteafd_ffi::PhysicalMemoryQuery>,
@@ -912,7 +910,7 @@ impl DeviceCache {
             pending_growth: 0, pools: Pools::default(), basis: Basis::Bytes,
             chain_only: true, unmeasured: false, pending_destroy: 0,
             bank_lanes: HashMap::new(), lanes: std::array::from_fn(|_| LaneEpoch::default()), clocks: Arc::new(std::array::from_fn(|_| EpochClock::default())),
-            lagged: Vec::new(), epochs: EpochStats::default(), reuse_captures: HashSet::new(), selected_epochs: HashMap::new(), pending_lanes: [0; 2], concurrent_cycles: 1, lane_max_cycles: [1; 2], reuse_ages: ReuseAges::default(), age_log_cycles: 0, age_soft_crossed: false, update_sites: Default::default(), native_graphs: HashMap::new(), donor_epoch: None, donor_candidates: HashMap::new(), update_requests: HashMap::new(),
+            lagged: Vec::new(), epochs: EpochStats::default(), reuse_captures: HashSet::new(), selected_epochs: HashMap::new(), pending_lanes: [0; 2], concurrent_cycles: 1, lane_max_cycles: [1; 2], reuse_ages: ReuseAges::default(), age_log_cycles: 0, age_soft_crossed: false, update_sites: Default::default(), native_graphs: HashMap::new(), donor_candidates: HashMap::new(), update_requests: HashMap::new(),
             observer: GrowthObserver::default(), memory_query: None, captured_since_observation: false,
             counters: HashMap::new(), started: Instant::now(), clock_ms: 0, last_report: Instant::now(),
             interval_evictions: 0, trace: std::env::var_os("CUTEAFD_GRAPH_TRACE").and_then(|path| {
@@ -936,8 +934,11 @@ impl DeviceCache {
             debug_assert!(previous >= pending, "graph pending lane atomic mismatch");
             self.clocks[lane].pending.fetch_add(pending, Ordering::Release);
         }
+        let owners: Vec<_> = self.records.iter().filter(|(_, record)| record.identity.bank == bank)
+            .map(|(&id, _)| id).collect();
+        for &id in &owners { self.remove_donor_candidate(id); }
         self.bank_lanes.insert(bank, lane);
-        self.donor_epoch = None;
+        for id in owners { self.insert_donor_candidate(id); }
     }
 
     pub(super) fn bank_lane(&self, bank: u64) -> usize { self.bank_lanes.get(&bank).copied().unwrap_or(0) }
@@ -1163,6 +1164,7 @@ impl DeviceCache {
         let lane = self.bank_lane(bank);
         let epoch = hit_epoch(self.device, lane, self.lanes[lane].index);
         if self.records[&id].last_used != Some(epoch) { self.remove_donor_candidate(id); }
+        let moved_stamp = self.records[&id].last_used != Some(epoch);
         let record = self.records.get_mut(&id).unwrap();
         if !record.pinned {
             if let Some(last) = record.last_used { self.reuse_ages.record(epoch.saturating_sub(last)); }
@@ -1174,6 +1176,7 @@ impl DeviceCache {
         if !pinned && !pending && matches!(record.list, Some(List::Recent | List::Frequent)) {
             self.push(id, List::Frequent);
         }
+        if moved_stamp { self.insert_donor_candidate(id); }
     }
 
     /// Pinned hits accumulate in the bank, without a lock or ARC mutation.
@@ -1309,8 +1312,8 @@ impl DeviceCache {
                 r.pinned || r.pending_capture || r.pending_destroy || r.permanently_eager || r.oom.is_some() ||
                     matches!(r.list, Some(List::Recent | List::Frequent))
             }) || (!hard && self.charged < self.soft.limit) { return None }
-        self.refresh_donors(hard);
-        let any_cold = !self.donor_candidates.is_empty();
+        let any_cold = self.donor_candidates.values().any(|lanes| lanes.iter().any(|lane|
+            lane.first().is_some_and(|&(_, id)| self.donor_age(id, hard).is_some())));
         if !any_cold {
             let counters = self.counters.entry(site.cycle).or_default();
             if hard { counters.no_cold_donor_hard += 1 } else { counters.no_cold_donor_soft += 1 }
@@ -1326,9 +1329,11 @@ impl DeviceCache {
 
     fn remove_donor_candidate(&mut self, id: u64) {
         let Some(native) = self.native_graphs.get(&id) else { return };
+        let Some(record) = self.records.get(&id) else { return };
+        let lane = self.bank_lane(record.identity.bank);
         if let Some(candidates) = self.donor_candidates.get_mut(&native.signature) {
-            candidates.remove(&id);
-            if candidates.is_empty() { self.donor_candidates.remove(&native.signature); }
+            if let Some(last) = record.last_used { candidates[lane].remove(&(last, id)); }
+            if candidates.iter().all(|lane| lane.is_empty()) { self.donor_candidates.remove(&native.signature); }
         }
     }
 
@@ -1343,36 +1348,34 @@ impl DeviceCache {
         (age > threshold).then_some(age)
     }
 
-    fn refresh_donors(&mut self, hard: bool) {
-        let epoch = (self.lanes.each_ref().map(|lane| lane.index), hard);
-        if self.donor_epoch == Some(epoch) { return }
-        // Rebuild once for a changed owner clock, never once per layer miss.
-        // Hits/selection/transfers remove candidates immediately; newly captured
-        // records cannot become cold until an owner epoch advances.
-        self.donor_candidates.clear();
-        for (&id, native) in &self.native_graphs {
-            if !native.signature.is_empty() && self.donor_age(id, hard).is_some() {
-                if let Some(candidates) = self.donor_candidates.get_mut(native.signature.as_slice()) {
-                    candidates.insert(id);
-                } else {
-                    self.donor_candidates.insert(native.signature.clone(), HashSet::from([id]));
-                }
-            }
+    fn insert_donor_candidate(&mut self, id: u64) {
+        let Some(native) = self.native_graphs.get(&id) else { return };
+        let Some(record) = self.records.get(&id) else { return };
+        if native.signature.is_empty() || record.pinned || record.pending_destroy ||
+            !matches!(record.list, Some(List::Recent | List::Frequent)) { return }
+        let Some(last) = record.last_used else { return };
+        let lane = self.bank_lane(record.identity.bank);
+        if let Some(candidates) = self.donor_candidates.get_mut(native.signature.as_slice()) {
+            candidates[lane].insert((last, id));
+        } else {
+            let mut candidates: [std::collections::BTreeSet<(u64, u64)>; 2] = Default::default();
+            candidates[lane].insert((last, id));
+            self.donor_candidates.insert(native.signature.clone(), candidates);
         }
-        self.donor_epoch = Some(epoch);
     }
 
     fn cold_donor(&mut self, signature: &[u64], hard: bool) -> Option<u64> {
         self.refresh_cycles();
         if signature.is_empty() { return None }
-        self.refresh_donors(hard);
-        self.donor_candidates.get(signature)?.iter().filter_map(|&id|
-            self.donor_age(id, hard).map(|age| (id, age)))
-            .max_by_key(|&(id, age)| (age, std::cmp::Reverse(id))).map(|(id, _)| id)
+        self.donor_candidates.get(signature)?.iter().filter_map(|lane| {
+            let &(_, id) = lane.first()?;
+            self.donor_age(id, hard).map(|age| (id, age))
+        }).max_by_key(|&(id, age)| (age, std::cmp::Reverse(id))).map(|(id, _)| id)
     }
 
     pub(super) fn register_native(&mut self, id: u64, exec: usize, signature: Vec<u64>) {
         self.native_graphs.insert(id, NativeGraph { exec, signature });
+        self.insert_donor_candidate(id);
     }
 
     /// Re-keying and the driver update share the device lock. Every old bank
@@ -1451,6 +1454,7 @@ impl DeviceCache {
         self.records.insert(id, record);
         self.native_graphs.insert(id, native);
         if !request.pinned { self.push(id, List::Recent); }
+        self.insert_donor_candidate(id);
         self.sync_inventory(id);
         self.identity_generation += 1;
         self.trim_ghosts();
@@ -2437,12 +2441,11 @@ mod tests {
         for flag in 0..3 {
             { let record = cache.records.get_mut(&donor).unwrap();
                 record.pinned = flag == 0; record.pending_capture = flag == 1; record.pending_destroy = flag == 2; }
-            cache.donor_epoch = None;
             assert!(cache.cold_donor(&[3, 7, 11], false).is_none());
         }
         { let record = cache.records.get_mut(&donor).unwrap();
             record.pinned = false; record.pending_capture = false; record.pending_destroy = false; }
-        cache.donor_epoch = None;
+        cache.insert_donor_candidate(donor);
         assert_eq!(cache.cold_donor(&[3, 7, 11], false), Some(donor));
         assert!(cache.cold_donor(&[3, 7, 12], false).is_none());
         assert!(cache.cold_donor(&[], false).is_none());
@@ -2467,7 +2470,8 @@ mod tests {
         assert_eq!(cache.cold_donor(&[3, 7, 11], false), Some(younger));
         assert_eq!(cache.select_victim(None), Some(younger));
         assert!(cache.cold_donor(&[3, 7, 11], false).is_none());
-        assert!(cache.donor_candidates.is_empty());
+        assert!(cache.donor_candidates.values().all(|lanes| lanes.iter().all(|lane|
+            lane.first().is_none_or(|&(_, id)| cache.donor_age(id, false).is_none()))));
     }
 
     #[test]
@@ -2491,15 +2495,21 @@ mod tests {
         }
         for _ in 0..40 { cache.begin_lane(0); cache.complete_lane(0); }
         cache.soft.limit = cache.charged;
-        let iterations = 1000;
+        let iterations = 10_000;
+        let start = Instant::now();
+        for n in 0..iterations { black_box(cache.cold_donor(black_box(&[3, n % 41]), false)); }
+        println!("cold_donor_selection: {:.3} us/miss; 22000 records, 41 topologies, {iterations} misses",
+            start.elapsed().as_secs_f64() * 1e6 / iterations as f64);
         let start = Instant::now();
         for n in 0..iterations {
+            if n % 100 == 0 { cache.begin_lane(0); cache.complete_lane(0); }
             let ticket = cache.update_ticket(key(30_000 + n), site(Preference::Capture), None, false).unwrap();
             black_box(cache.cold_donor(black_box(&[3, n % 41]), false));
             cache.cancel_capture(ticket);
         }
-        println!("cold_donor_indexed: {:.3} us/miss; 22000 records, 41 topologies, {iterations} misses; includes precheck+indexed selection; one epoch rebuild amortized",
+        println!("cold_donor_selection_with_cycle: {:.3} us/miss; 22000 records, 41 topologies, {iterations} misses; precheck+selection+one cycle/100 misses; no epoch rebuild",
             start.elapsed().as_secs_f64() * 1e6 / iterations as f64);
+
     }
 
     #[test]
