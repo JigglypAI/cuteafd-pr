@@ -95,6 +95,7 @@ pub(crate) struct Counters {
     pub hot_guard_skips: u64,
     pub updates_soft: u64,
     pub updates_hard: u64,
+    pub donor_rekeys: u64,
     pub update_failures: u64,
     pub no_cold_donor_soft: u64,
     pub no_cold_donor_hard: u64,
@@ -863,6 +864,7 @@ pub(crate) struct DeviceCache {
     selected_epochs: HashMap<u64, [u64; 2]>,
     pending_lanes: [usize; 2],
     concurrent_cycles: u64,
+    donor_always: bool,
     lane_max_cycles: [u64; 2],
     site_lanes: HashMap<&'static str, u8>,
     update_sites: std::collections::BTreeMap<&'static str, HashMap<Cycle, Counters>>,
@@ -923,7 +925,7 @@ impl DeviceCache {
             pending_growth: 0, pools: Pools::default(), basis: Basis::Bytes,
             chain_only: true, unmeasured: false, pending_destroy: 0,
             bank_lanes: HashMap::new(), lanes: std::array::from_fn(|_| LaneEpoch::default()), clocks: Arc::new(std::array::from_fn(|_| EpochClock::default())),
-            lagged: Vec::new(), epochs: EpochStats::default(), reuse_captures: HashSet::new(), selected_epochs: HashMap::new(), pending_lanes: [0; 2], concurrent_cycles: 1, lane_max_cycles: [1; 2], site_lanes: HashMap::new(), update_sites: Default::default(), native_graphs: HashMap::new(), bank_native: HashMap::new(), donor_candidates: HashMap::new(), update_requests: HashMap::new(),
+            lagged: Vec::new(), epochs: EpochStats::default(), reuse_captures: HashSet::new(), selected_epochs: HashMap::new(), pending_lanes: [0; 2], concurrent_cycles: 1, donor_always: super::donor_always(), lane_max_cycles: [1; 2], site_lanes: HashMap::new(), update_sites: Default::default(), native_graphs: HashMap::new(), bank_native: HashMap::new(), donor_candidates: HashMap::new(), update_requests: HashMap::new(),
             observer: GrowthObserver::default(), memory_query: None, launch_query: None, captured_since_observation: false,
             counters: HashMap::new(), started: Instant::now(), clock_ms: 0, last_report: Instant::now(),
             interval_evictions: 0, trace: std::env::var_os("CUTEAFD_GRAPH_TRACE").and_then(|path| {
@@ -1430,7 +1432,7 @@ impl DeviceCache {
                 let r = &self.records[id];
                 r.pinned || r.pending_capture || r.pending_destroy || r.permanently_eager || r.oom.is_some() ||
                     matches!(r.list, Some(List::Recent | List::Frequent))
-            }) || (!hard && self.charged < self.soft.limit) { return None }
+            }) || (!self.donor_always && !hard && self.charged < self.soft.limit) { return None }
         self.donor_candidates.retain(|_, lanes| lanes.iter().any(|lane| lane.first.is_some()));
         let signature = self.identities.get(&identity).and_then(|id| self.records[id].signature.clone());
         // Unknown or non-kernel topologies never justify a hard-cap capture.
@@ -1630,8 +1632,10 @@ impl DeviceCache {
         self.trim_ghosts();
         let counters = self.counters.entry(request.site.cycle).or_default();
         counters.misses += 1;
+        counters.donor_rekeys += 1;
         if request.hard { counters.updates_hard += 1 } else { counters.updates_soft += 1 }
         let counters = self.update_sites.entry(request.site.name).or_default().entry(request.site.cycle).or_default();
+        counters.donor_rekeys += 1;
         if request.hard { counters.updates_hard += 1 } else { counters.updates_soft += 1 }
         Some(transferred)
     }
@@ -2546,6 +2550,30 @@ mod tests {
         cache.charged = if hard { 1000 } else { 10 };
         (cache, donor)
     }
+    #[test]
+    fn donor_always_reuses_below_soft_without_changing_default() {
+        let (mut cache, donor) = aged_update_fixture(5, false);
+        cache.soft.limit = 500;
+        assert!(cache.update_ticket(key(2), site(Preference::Capture), None, false).is_none());
+        cache.donor_always = true;
+        let ticket = cache.update_ticket(key(2), site(Preference::Capture), None, false).unwrap();
+        cache.register_native(ticket, 0, vec![3, 7, 11]);
+        assert_eq!(cache.finish_update(ticket, |_| Ok(true), |_| Ok(202), |_| panic!()), Some(202));
+        assert!(!cache.owns(donor, 1));
+        assert!(cache.owns(ticket, 1));
+        assert_eq!(cache.charged, 10);
+    }
+
+    #[test]
+    fn launch_cycle_switch_preserves_capture_cycle_and_other_banks() {
+        let (mut cache, id) = aged_update_fixture(5, false);
+        cache.bank_cycle(2, Cycle::Verify);
+        assert_eq!(cache.native_graphs[&id].launch_cycle, Cycle::Decode);
+        cache.bank_cycle(1, Cycle::Verify);
+        assert_eq!(cache.records[&id].cycle, Cycle::Decode);
+        assert_eq!(cache.native_graphs[&id].launch_cycle, Cycle::Verify);
+    }
+
     fn update_request(cache: &mut DeviceCache, key: Identity) -> u64 {
         cache.next_id += 1;
         let id = cache.next_id;

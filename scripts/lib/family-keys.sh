@@ -34,7 +34,7 @@ _spark_slot_keys() {
 _family_allowed_keys() {
   local checkpoint_family="${2:-$1}" registry_dir
   registry_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-  printf '%s\n' CORE_VIEW FP8_PREFILL ATTENTION_PREFILL_PRECISION
+  printf '%s\n' CORE_VIEW FP8_PREFILL ATTENTION_PREFILL_PRECISION GRAPH_PREWARM GRAPH_DONOR_ALWAYS
   cat <<'EOF'
 VISION
 AUDIO
@@ -459,6 +459,8 @@ release_spark_role_budget() {
 # DeepSeek V4.1 reads shell variables after release_load_config, not get().
 _v41_allowed_keys() {
   cat <<'EOF'
+GRAPH_PREWARM
+GRAPH_DONOR_ALWAYS
 EXPERT_USAGE
 ADDR
 API_KEY_FILE

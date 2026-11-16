@@ -1824,6 +1824,11 @@ impl<'a> GlmfEngine<'a> {
     pub fn warm_decode_graphs(&self, sequences: usize, speculation: bool) -> Result<bool> {
         if !self.use_graphs { return Ok(false); }
         check_decode_thresholds(&self.buckets, sequences, speculation)?;
+        if !crate::shared::decode_graph::prewarm_enabled() {
+            // Startup is skipped, not graphing: permit first-use runtime tickets.
+            self.graphs_warmed.set(true);
+            return Ok(false);
+        }
         tracing::info!(plain_rows = ?self.buckets.plain, spec_rows = ?self.buckets.spec, decode_rows = self.decode_rows,
             verify_rows = self.verify_rows, "GLM Flash decode buckets pass the projection thresholds");
         let layout = self.graph_layout();

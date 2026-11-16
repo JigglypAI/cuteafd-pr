@@ -468,6 +468,19 @@ spark_profile_wrapper_args=(${RELEASE_PROFILE_WRAPPER_DOCKER_ARGS[@]+"${RELEASE_
 }
 shared_graph_census_args() {
 graph_census_args=()
+graph_policy_args=()
+case "$(get GRAPH_PREWARM on)" in
+  on) ;;
+  off)
+    [[ "$family" == deepseek_v41 || "$family" == glm5_flash ]] || release_die 'GRAPH_PREWARM=off is supported only for deepseek_v41 (V4.1) and glm5_flash (GLM Flash)'
+    graph_policy_args+=(--graph-no-prewarm) ;;
+  *) release_die 'GRAPH_PREWARM must be on or off' ;;
+esac
+case "$(get GRAPH_DONOR_ALWAYS off)" in
+  on) graph_policy_args+=(--graph-donor-always) ;;
+  off) ;;
+  *) release_die 'GRAPH_DONOR_ALWAYS must be on or off' ;;
+esac
 if [[ "$family" == qwen3_5 ]]; then
   case "$(get DECODE_GRAPHS on)" in
     on) graph_census_args+=(-e CUTEAFD_QWEN35_GRAPHS=1) ;;
@@ -1180,7 +1193,7 @@ docker run -d "${RELEASE_SERVING_ARGS[@]}" --name "$coordinator" --restart no "$
   "${wip_mount_args[@]}" \
   "${api_mount_args[@]}" -e "CUTEAFD_IMAGE=$COORDINATOR_DOCKER_INFERENCE" -v "$bench_dir:/run/cuteafd/bench" -v "$fidelity_cache:/run/cuteafd/fidelity" -e CUTEAFD_FIDELITY_CACHE=/run/cuteafd/fidelity \
   ${profile_wrapper_args[@]+"${profile_wrapper_args[@]}"} \
-  "${namespace_mount_args[@]}" "$COORDINATOR_DOCKER_INFERENCE" ${profile_wrapper[@]+"${profile_wrapper[@]}"} cuteafd "${args[@]}" >/dev/null
+  "${namespace_mount_args[@]}" "$COORDINATOR_DOCKER_INFERENCE" ${profile_wrapper[@]+"${profile_wrapper[@]}"} cuteafd "${graph_policy_args[@]}" "${args[@]}" >/dev/null
 }
 deadline=$((SECONDS + ${CUTEAFD_RELEASE_READY_TIMEOUT_SECONDS:-900}))
 echo "== starting native Spark experts =="
@@ -2982,7 +2995,7 @@ docker run -d "${RELEASE_SERVING_ARGS[@]}" --name "$coordinator_name" --restart 
   "${bond_args[@]}" "${bench_nonce_env_args[@]}" "${tp2_env_args[@]}" "${graph_census_args[@]}" "${lane_env_args[@]}" "${thermal_args[@]}" \
   "${shared_env_args[@]:4}" ${coordinator_module_loading_args[@]+"${coordinator_module_loading_args[@]}"} -e "CUTEAFD_IMAGE=$coordinator_image" "${wip_mount_args[@]}" "${device_map_args[@]}" \
   "${generic_worker_mounts[@]}" -v "$bench_dir:/run/cuteafd/bench" -v "$fidelity_cache:/run/cuteafd/fidelity" -e CUTEAFD_FIDELITY_CACHE=/run/cuteafd/fidelity \
-  "${api_mount_args[@]}" "${chat_template_mounts[@]}" "${trace_args[@]}" "${probe_args[@]}" ${profile_args[@]+"${profile_args[@]}"} ${profile_wrapper_args[@]+"${profile_wrapper_args[@]}"} "$coordinator_image" ${profile_wrapper[@]+"${profile_wrapper[@]}"} cuteafd "${memory_policy_args[@]}" $serve --snapshot "$snapshot" --coordinator-weight-budget-gib "$coordinator_weight_budget_gib" \
+  "${api_mount_args[@]}" "${chat_template_mounts[@]}" "${trace_args[@]}" "${probe_args[@]}" ${profile_args[@]+"${profile_args[@]}"} ${profile_wrapper_args[@]+"${profile_wrapper_args[@]}"} "$coordinator_image" ${profile_wrapper[@]+"${profile_wrapper[@]}"} cuteafd "${graph_policy_args[@]}" "${memory_policy_args[@]}" $serve --snapshot "$snapshot" --coordinator-weight-budget-gib "$coordinator_weight_budget_gib" \
   --native-lib /opt/cuteafd/lib/libcuteafd_native.so "${peer_args[@]}" --listen "$addr" \
   --max-sequences "$effective_concurrency" "${context_args[@]}" \
   --max-output-tokens "$(get MAX_OUTPUT_TOKENS 131072)" "${kv_reserve_args[@]}" "${dspark_args[@]}" \

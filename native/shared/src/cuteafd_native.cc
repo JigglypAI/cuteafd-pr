@@ -22,6 +22,7 @@
 #include <mutex>
 #include <new>
 #include <string>
+#include <thread>
 #include <vector>
 #include <unordered_map>
 
@@ -1822,7 +1823,18 @@ extern "C" cuteafd_status_t cuteafd_cuda_graph_end_capture_topology(
 
 #if CUTEAFD_NATIVE_ENABLE_CUDA
 namespace {
-struct GraphHandle { cudaGraphExec_t exec; std::atomic<uint64_t> launches{0}; };
+struct GraphHandle {
+  cudaGraphExec_t exec = nullptr;
+  std::atomic<uint64_t> launches{0};
+  const std::thread::id executor = std::this_thread::get_id();
+};
+// GraphOwner pins the handle through every synchronous launch. All mutation of
+// one executable is on its owning executor (both V4.1 lanes are polled there).
+// Telemetry may run elsewhere, but only reads the atomic counter under the
+// registry mutex. The registry protects lookup/lifetime on rare paths, not replay.
+bool graph_executor(const GraphHandle& handle) {
+  return handle.executor == std::this_thread::get_id();
+}
 std::mutex graph_handles_mutex;
 std::unordered_map<void*, std::unique_ptr<GraphHandle>> graph_handles;
 void* own_graph_exec(cudaGraphExec_t exec) {
@@ -1946,6 +1958,8 @@ extern "C" cuteafd_status_t cuteafd_cuda_graph_source_update(void* source, void*
   const auto found = graph_handles.find(exec);
   if (found == graph_handles.end() || !found->second->exec)
     return fail(CUTEAFD_STATUS_INVALID_ARGUMENT, "invalid donor executable");
+  if (!graph_executor(*found->second))
+    return fail(CUTEAFD_STATUS_INVALID_ARGUMENT, "graph update must run on its owning executor thread");
   cudaGraphExecUpdateResultInfo result{};
   const auto status = cudaGraphExecUpdate(found->second->exec, static_cast<GraphSource*>(source)->graph, &result);
   *cuda_status = static_cast<int>(cuteafd::diagnostic_cuda(status));
@@ -1963,6 +1977,8 @@ extern "C" cuteafd_status_t cuteafd_cuda_graph_source_transfer(void* source, voi
   const auto found = graph_handles.find(donor);
   if (found == graph_handles.end() || !found->second->exec)
     return fail(CUTEAFD_STATUS_INVALID_ARGUMENT, "invalid transfer donor");
+  if (!graph_executor(*found->second))
+    return fail(CUTEAFD_STATUS_INVALID_ARGUMENT, "graph transfer must run on its owning executor thread");
   auto exec = found->second->exec;
   found->second->exec = nullptr;
   *out = own_graph_exec(exec);
@@ -1981,6 +1997,8 @@ extern "C" cuteafd_status_t cuteafd_cuda_graph_exec_invalidate(void* donor) {
     std::lock_guard<std::mutex> guard(graph_handles_mutex);
     const auto found = graph_handles.find(donor);
     if (found == graph_handles.end() || !found->second->exec) return ok();
+    if (!graph_executor(*found->second))
+      return fail(CUTEAFD_STATUS_INVALID_ARGUMENT, "graph invalidation must run on its owning executor thread");
     target = found->second->exec;
     found->second->exec = nullptr;
   }
@@ -2113,16 +2131,15 @@ extern "C" cuteafd_status_t cuteafd_cuda_graph_launch(void* cuda_graph_exec, voi
     return fail(CUTEAFD_STATUS_INVALID_ARGUMENT, "CUDA graph launch stream is null");
   }
 #if CUTEAFD_NATIVE_ENABLE_CUDA
-  // Source-path handles are tagged; legacy/test raw CUDA handles remain valid.
-  // Serialize the handle read AND submission against update/transfer/destroy.
-  // Cold-owner epoch checks additionally protect already submitted device work.
-  std::lock_guard<std::mutex> guard(graph_handles_mutex);
+  // The caller retains GraphOwner until submission returns. A transferred old
+  // owner retains its own tombstone, so stale generations fail without a map
+  // lookup and cannot name the receiver's new executable.
   GraphHandle* counted = nullptr;
   auto target = reinterpret_cast<cudaGraphExec_t>(cuda_graph_exec);
   if (reinterpret_cast<uintptr_t>(cuda_graph_exec) & uintptr_t(1)) {
-    const auto found = graph_handles.find(cuda_graph_exec);
-    if (found == graph_handles.end()) return fail(CUTEAFD_STATUS_INVALID_ARGUMENT, "unknown graph handle");
-    counted = found->second.get();
+    counted = reinterpret_cast<GraphHandle*>(reinterpret_cast<uintptr_t>(cuda_graph_exec) & ~uintptr_t(1));
+    if (!graph_executor(*counted))
+      return fail(CUTEAFD_STATUS_INVALID_ARGUMENT, "graph launch must run on its owning executor thread");
     target = counted->exec;
     if (!target) return fail(CUTEAFD_STATUS_INVALID_ARGUMENT, "stale transferred graph handle");
   }
@@ -2213,6 +2230,8 @@ extern "C" cuteafd_status_t cuteafd_cuda_graph_exec_destroy(void* cuda_graph_exe
     std::lock_guard<std::mutex> guard(graph_handles_mutex);
     const auto handle = graph_handles.find(cuda_graph_exec);
     if (handle != graph_handles.end()) {
+      if (!graph_executor(*handle->second))
+        return fail(CUTEAFD_STATUS_INVALID_ARGUMENT, "graph destruction must run on its owning executor thread");
       target = handle->second->exec;
       graph_handles.erase(handle);
       if (!target) return ok();

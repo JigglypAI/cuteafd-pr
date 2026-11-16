@@ -352,16 +352,16 @@ async fn run() -> Result<()> {
                     cuteafd_transport::wait_policy::WaitPolicy { wait: cli.host_wait,
                         idle_park: std::time::Duration::from_secs_f64(cli.idle_park_seconds) }, cuteafd_core::spark_reply::SparkReplyFormats {
                             prefill: cli.spark_prefill_reply_format, decode: cli.spark_decode_reply_format },
-                    cli.coordinator_weight_budget_gib, cli.graph_disable_low_mem)
+                    cli.coordinator_weight_budget_gib, cli.graph_disable_low_mem, (cli.graph_no_prewarm, cli.graph_donor_always))
             },
             Err(error) => error.exit(),
         }
     };
-    let (command, matches, initial_budget, initial_vision, initial_audio, initial_image_cap, initial_fetch, initial_wait, initial_reply, initial_weight_budget, initial_graph_floor) =
+    let (command, matches, initial_budget, initial_vision, initial_audio, initial_image_cap, initial_fetch, initial_wait, initial_reply, initial_weight_budget, initial_graph_floor, initial_graph_policy) =
         parse(Cli::command().get_matches());
     let mut selected_view = None;
     // `serve` and `golden` pick the family and stand for its own command.
-    let (mut command, matches, family_budget, family_vision, family_audio, family_image_cap, family_fetch, wait_policy, family_reply, family_weight_budget, family_graph_floor) = match command {
+    let (mut command, matches, family_budget, family_vision, family_audio, family_image_cap, family_fetch, wait_policy, family_reply, family_weight_budget, family_graph_floor, family_graph_policy) = match command {
         Commands::Serve(args) => match commands::family::resolve(commands::family::Kind::Serve, args)? {
             Some(resolved) => { selected_view = resolved.view; parse(Cli::command().get_matches_from(resolved.argv)) },
             None => return Ok(()),
@@ -371,8 +371,12 @@ async fn run() -> Result<()> {
             None => return Ok(()),
         },
         command => (command, matches, initial_budget, initial_vision, initial_audio, initial_image_cap, initial_fetch,
-            initial_wait, initial_reply, initial_weight_budget, initial_graph_floor.clone()),
+            initial_wait, initial_reply, initial_weight_budget, initial_graph_floor.clone(), initial_graph_policy),
     };
+    let no_prewarm = initial_graph_policy.0 || family_graph_policy.0;
+    anyhow::ensure!(!no_prewarm || matches!(&command, Commands::ServeNative(_) | Commands::ServeGlmf(_)),
+        "--graph-no-prewarm is supported only by V4.1 and GLM Flash serving");
+    shared::decode_graph::configure(no_prewarm, initial_graph_policy.1 || family_graph_policy.1);
     if let Some((role, directory)) = shared::memory_report::dump_location(&matches) {
         let host = std::env::var("CUTEAFD_PROFILE_HOST").unwrap_or_else(|_| {
             std::env::var("HOSTNAME").map(|name| format!("container {name}")).unwrap_or_else(|_| "unknown".into())
