@@ -984,6 +984,7 @@ impl LayerKernels for Bindings<'_, '_, '_> {
         if self.local[0].context_dsa_diagnostic() && self.packed.is_some() {
             let members = self.packed.take().context("Kimi packed context members absent")?;
             let total = self.rows;
+            let saved = self.local.iter().map(LocalLane::save_context_member).collect::<Vec<_>>();
             let result: Result<()> = (|| {
                 let mut first = 0;
                 for member in &members {
@@ -996,7 +997,7 @@ impl LayerKernels for Bindings<'_, '_, '_> {
                 Ok(())
             })();
             self.rows = total;
-            for local in self.local.iter_mut() { local.restore_context_member(total)?; }
+            for (local, saved) in self.local.iter_mut().zip(saved) { local.restore_context_member(saved); }
             self.packed = Some(members);
             result?;
         } else {

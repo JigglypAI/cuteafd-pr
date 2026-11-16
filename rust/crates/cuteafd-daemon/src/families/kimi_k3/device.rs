@@ -870,9 +870,7 @@ impl<'a> LocalLane<'a> {
     }
 
     pub(crate) fn attention_packed(&mut self, layer: usize, members: &[AttentionRows]) -> Result<()> {
-        let window = self.lane.window.clone();
-        let shape = self.attention;
-        let bank = self.lane.metadata_bank;
+        let saved = self.save_context_member();
         let result = (|| {
             let mut first = 0;
             for metadata in members {
@@ -888,9 +886,7 @@ impl<'a> LocalLane<'a> {
             }
             Ok(())
         })();
-        self.lane.window = window;
-        self.lane.metadata_bank = bank;
-        self.attention = shape;
+        self.restore_context_member(saved);
         result
     }
 
@@ -1271,11 +1267,13 @@ impl<'a> LocalLane<'a> {
         }, stream.raw)?))
     }
 
-    pub(crate) fn restore_context_member(&mut self, rows: usize) -> Result<()> {
-        self.lane.window = None;
-        self.lane.metadata_bank = 0;
-        self.attention = Some(AttentionShape { rows, sequences: 1 });
-        Ok(())
+    pub(crate) fn save_context_member(&self) -> ContextMemberView {
+        ContextMemberView { window: self.lane.window.clone(), bank: self.lane.metadata_bank,
+            attention: self.attention }
+    }
+
+    pub(crate) fn restore_context_member(&mut self, saved: ContextMemberView) {
+        saved.restore(&mut self.lane.window, &mut self.lane.metadata_bank, &mut self.attention);
     }
 
     pub(crate) fn context_gathered_dsa(&self) -> bool {
@@ -2108,10 +2106,26 @@ pub(crate) struct SequenceRows<'p> {
 
 use cuteafd_loader::families::kimi_k3::allocation::{ATTENTION_METADATA, DSA_METADATA, DSA_SCRATCH};
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct AttentionShape {
     rows: usize,
     sequences: usize,
+}
+
+pub(crate) struct ContextMemberView {
+    window: Option<std::ops::Range<usize>>,
+    bank: usize,
+    attention: Option<AttentionShape>,
+}
+
+impl ContextMemberView {
+    fn restore(self, window: &mut Option<std::ops::Range<usize>>, bank: &mut usize,
+        attention: &mut Option<AttentionShape>) {
+        // Residual arenas use the enclosing packed width, not admitted capacity.
+        *window = self.window;
+        *bank = self.bank;
+        *attention = self.attention;
+    }
 }
 
 /// Host metadata is rebuilt outside capture, then copied into fixed lane buffers.
@@ -3205,6 +3219,33 @@ mod tests {
         assert_ne!(pointers[0], pointers[1]);
         assert_eq!(fixture.events()?, staged, "reading retained graph views launches no work");
         Ok(())
+    }
+
+    #[test]
+    fn packed_context_member_restore_preserves_residual_stride_for_k3_and_k31() {
+        for sequences in [1usize, 4] {
+            for packed in [1usize, 2, 5, 7, 8, 32, 256] {
+                let original = Some(0..packed);
+                let shape = Some(AttentionShape { rows: packed, sequences: sequences.min(packed) });
+                let saved = ContextMemberView { window: original.clone(), bank: 2, attention: shape };
+                let (mut window, mut bank, mut attention) = (Some(0..1), 0, None);
+                // K3 and K3.1 both restore through the same helper.
+                saved.restore(&mut window, &mut bank, &mut attention);
+                assert_eq!(window, original);
+                assert_eq!(bank, 2);
+                assert_eq!(attention, shape);
+                let arena_rows = window.as_ref().map_or(256, |w| w.len());
+                assert_eq!(8 * arena_rows * 7168 * 2, 8 * packed * 7168 * 2);
+            }
+        }
+        let layers = include_str!("layers.rs");
+        assert!(layers.contains("map(LocalLane::save_context_member)"));
+        assert!(layers.contains("local.restore_context_member(saved)"));
+        let source = include_str!("device.rs").split("\n#[cfg(test)]\nmod ").next().unwrap();
+        let k3 = source.split("pub(crate) fn attention_packed").nth(1).unwrap()
+            .split("/// Stage immutable metadata").next().unwrap();
+        assert!(k3.contains("let saved = self.save_context_member()"));
+        assert!(k3.contains("self.restore_context_member(saved)"));
     }
 
     #[test]
