@@ -2303,12 +2303,14 @@ def test_fabric_health_caveat_only_gates_timed_phases():
     assert cards.fabric_rerun_reasons(phases) == []
 
 
-def test_coordinator_host_load_makes_the_ab_rerun(tmp_path):
-    # A quiet coordinator records low values and stays eligible; CPU pressure,
-    # memory pressure and reclaim each independently force a rerun.
+def test_coordinator_host_load_is_advisory_and_never_forces_a_rerun(tmp_path):
+    # A quiet coordinator records low values with no advisory. CPU pressure,
+    # memory pressure and reclaim are each reported as advisory caveats, but
+    # host load alone leaves the A/B eligible: calibration showed these bars do
+    # not predict real slowdowns, so only paired evidence earns a rerun.
     quiet = dict(name='decode', timed=True, ports=[],
                  host_load=dict(cpu_some_avg10=1.0, memory_some_avg10=0.5, pgscan_pages_per_s=0.0, seconds=10))
-    assert cards.fabric_rerun_reasons([quiet]) == []
+    assert cards.host_load_advisories([quiet]) == []
     assert cards.fabric_assessment([quiet]) == []
     contaminated = [
         dict(cpu_some_avg10=25.0, memory_some_avg10=0.5, pgscan_pages_per_s=0.0),
@@ -2316,16 +2318,18 @@ def test_coordinator_host_load_makes_the_ab_rerun(tmp_path):
         dict(cpu_some_avg10=1.0, memory_some_avg10=0.5, pgscan_pages_per_s=2000.0),
     ]
     phases = [dict(name='decode', timed=True, ports=[], host_load=load) for load in contaminated]
-    reasons = cards.fabric_rerun_reasons(phases)
-    assert any('host load' in r and 'CPU pressure' in r and '25.0%' in r for r in reasons), reasons
-    assert any('memory pressure' in r and '9.0%' in r for r in reasons), reasons
-    assert any('page reclaim' in r and '2000 pages/s' in r for r in reasons), reasons
-    assert cards.fabric_rerun_reasons([dict(phases[0], timed=False)]) == []
+    assert cards.fabric_rerun_reasons(phases) == []
+    advisories = cards.host_load_advisories(phases)
+    assert all('(advisory)' in a for a in advisories), advisories
+    assert any('CPU pressure' in a and '25.0%' in a for a in advisories), advisories
+    assert any('memory pressure' in a and '9.0%' in a for a in advisories), advisories
+    assert any('page reclaim' in a and '2000 pages/s' in a for a in advisories), advisories
+    assert cards.host_load_advisories([dict(phases[0], timed=False)]) == []
+    assert set(advisories) <= set(cards.fabric_assessment(phases))
     rows = [dict(card='c', arm='candidate', repeat=1, simulated=False, status='pass', C1=10, fabric=phases)]
     cards.write_summary(tmp_path, rows, {'candidate': {}})
-    assert json.loads((tmp_path / 'summary.json').read_text())['ab_verdict'] == 'rerun'
-    text = (tmp_path / 'summary.md').read_text()
-    assert 'A/B Verdict: Rerun' in text and 'host load' in text
+    assert json.loads((tmp_path / 'summary.json').read_text())['ab_verdict'] == 'eligible'
+    assert 'A/B Verdict: Rerun' not in (tmp_path / 'summary.md').read_text()
 
 
 def _checkout(path, run_sh=True):
@@ -3457,8 +3461,11 @@ def test_spark_memory_phase_timeout_diagnostics(monkeypatch, endpoint):
             raise TimeoutError('timed out')
         return {'g': {}}
     monkeypatch.setattr(cards, 'http', http)
-    ticks = iter([10., 10.5, 11., 11.5])
-    monkeypatch.setattr(cards.time, 'monotonic', lambda: next(ticks))
+    # Patch only wip-cards' view of the clock. Patching the shared time module
+    # let pytest/xdist's own monotonic reads drain a finite tick list and kill
+    # the worker (#2226). Each telemetry call reads the clock twice, 0.5 s apart.
+    ticks = iter(10. + .5 * n for n in range(1000))
+    monkeypatch.setattr(cards, 'time', SimpleNamespace(monotonic=lambda: next(ticks)))
     diagnostics = []
     assert cards.spark_memory_phase('http://localhost', diagnostics) == 'unavailable'
     assert calls[-1] == endpoint
