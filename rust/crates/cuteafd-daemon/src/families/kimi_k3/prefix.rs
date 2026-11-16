@@ -130,7 +130,7 @@ impl<'a> KimiPrefix<'a> {
     pub(crate) fn snapshot_owners(&self) -> Vec<Rc<Allocation<'a>>> {
         self.0.mla.iter().flat_map(|bank| bank.owners())
             .chain(self.0.kda.iter().filter_map(|bank| bank.mark_owner()))
-            .chain(self.0.draft.iter().filter_map(|draft| draft.mark_owner())).collect()
+            .chain(self.0.draft.iter().flat_map(|draft| draft.mark_owners())).collect()
     }
 
     fn validate(&self, placement: &Placement, len: usize) -> Result<()> {

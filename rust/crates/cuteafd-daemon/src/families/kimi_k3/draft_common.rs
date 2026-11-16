@@ -98,6 +98,10 @@ impl<'a> CommonDraft<'a> {
         let Self::Block { draft,.. }=self else { anyhow::bail!("expected block window planes") };
         draft.window_planes(slot)
     }
+    pub fn block_readers(&self)->Result<Vec<crate::shared::prefix::Reader>> {
+        let Self::Block { draft,.. }=self else { anyhow::bail!("expected block readers") };
+        Ok(draft.window_readers())
+    }
     pub fn mla_snapshot_buffers(&self)->Result<Vec<CuteafdDeviceBuffer>> {
         match self { Self::Mla(d)=>d.mla_snapshot_buffers(),Self::Block { draft:d,.. }=>
             (0..d.slots).map(|slot|d.window_planes(slot)).collect::<Result<Vec<_>>>().map(|v|v.into_iter().flatten().collect()) }

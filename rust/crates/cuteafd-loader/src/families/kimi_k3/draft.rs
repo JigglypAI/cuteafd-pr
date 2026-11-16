@@ -40,6 +40,16 @@ impl DraftLayout {
     pub fn window_mark_bytes(&self) -> Result<usize> {
         match self { Self::Mla(l) => Ok(l.window_mark_bytes()?), Self::Block(l) => l.window_mark_bytes(),Self::BlockTp2 { ranks,.. }=>ranks.iter().try_fold(0usize,|sum,r|sum.checked_add(r.window_mark_bytes()?).ok_or_else(||anyhow::anyhow!("TP2 window mark overflow"))) }
     }
+    pub fn window_mark_demands(&self,head:u8)->Result<Vec<crate::placement::Demand>> {
+        use cuteafd_core::memory_layout::{Basis,Category};
+        let extents=match self {
+            Self::BlockTp2 { ranks,.. }=>ranks.iter().enumerate().map(|(rank,l)|Ok((rank as u8,l.window_mark_bytes()?)))
+                .collect::<Result<Vec<_>>>()?,
+            _=>vec![(head,self.window_mark_bytes()?)],
+        };
+        Ok(extents.into_iter().filter(|(_,bytes)|*bytes>0).map(|(gpu,bytes)|crate::placement::Demand::new(gpu,
+            Category::Prefix,"Kimi exact draft windows",bytes as u64,Basis::Exact)).collect())
+    }
     pub fn weight_arena_requests(&self) -> Vec<(String, usize)> {
         match self { Self::Mla(l) => l.weight_arena_requests(), Self::Block(l) => l.weight_requests.clone(),Self::BlockTp2 { ranks,lead }=>ranks[*lead].weight_requests.clone() }
     }

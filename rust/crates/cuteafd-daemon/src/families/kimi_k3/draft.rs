@@ -130,6 +130,8 @@ impl<'a> Bridge<'a> {
 }
 
 pub(crate) struct NativeDraft<'a> {
+    // Copy fences must retire before either rank's draft stream/planes drop.
+    block_marks:Vec<crate::shared::speculation::block_dspark::WindowSnapshots<'a>>,
     owners: Owners<DeviceOwner<'a, CommonDraft<'a>>, Option<Vec<Rc<GlobalWeights<'a>>>>>,
     taps: Allocation<'a>,
     ids: Allocation<'a>,
@@ -216,8 +218,23 @@ impl<'a> NativeDraft<'a> {
         };
         let marks = usize::try_from(admission.mark_selection.slots)?;
         let window_bytes = layout.window_mark_bytes()?;
-        let window_marks = admission.allocate_draft_marks(streams[head].device)?;
-        Ok(Self { window_marks, window_bytes, programs, k6_head: None, cache_format: options.cache_format, marks, owners: Owners { draft, target: None }, taps: allocate("DFlash bridge taps")?,
+        let mut block_marks=Vec::new();
+        let window_marks=if draft.is_block() {
+            let devices=streams.iter().map(|s|s.device).collect::<Vec<_>>();
+            let backings=admission.allocate_block_marks(&devices)?;
+            if marks>0 {
+                let readers=draft.block_readers()?;
+                let planes=draft.block_window_planes(0)?;
+                for backing in backings {
+                    let reader=*readers.iter().find(|r|r.device==backing.device.id).context("block mark producer absent")?;
+                    let extents=planes.iter().filter(|p|p.device_id==reader.device).map(|p|p.bytes).collect();
+                    block_marks.push(crate::shared::speculation::block_dspark::WindowSnapshots::with_backing(
+                        reader,backing,extents,marks)?);
+                }
+            }
+            None
+        } else { admission.allocate_draft_marks(streams[head].device)? };
+        Ok(Self { block_marks,window_marks, window_bytes, programs, k6_head: None, cache_format: options.cache_format, marks, owners: Owners { draft, target: None }, taps: allocate("DFlash bridge taps")?,
             ids: allocate("DFlash bridge input ids")?, input: allocate("DFlash bridge gathered input")?,
             bridge, producer: RefCell::new(crate::shared::memory::device::Event::new(device)?),
             consumed: RefCell::new(crate::shared::memory::device::Event::new(streams[head].device)?),
@@ -397,10 +414,13 @@ impl<'a> NativeDraft<'a> {
     pub(crate) fn device(&self) -> crate::shared::memory::device::Device<'a> { self.owners.draft.device }
     pub(crate) fn common(&self) -> &CommonDraft<'a> { &self.owners.draft }
     pub(crate) fn frontier(&self, slot: usize) -> Result<(usize, usize)> { self.common().mla_frontier(slot) }
-    pub(crate) fn mark_owner(&self) -> Option<Rc<Allocation<'a>>> { self.window_marks.clone() }
+    pub(crate) fn mark_owners(&self) -> Vec<Rc<Allocation<'a>>> {
+        self.window_marks.iter().cloned().chain(self.block_marks.iter().map(|m|m.backing())).collect()
+    }
     pub(crate) fn mark_bytes(&self) -> usize { self.window_bytes }
     pub(crate) fn mark_segments(&self, mark: usize) -> Result<Vec<CuteafdDeviceBuffer>> {
         ensure!(mark < self.marks, "Kimi draft window mark outside admission");
+        if self.common().is_block() { return self.block_marks.iter().map(|m|m.mark(mark)).collect(); }
         let window_marks = self.window_marks.as_ref().context("Kimi draft prefix marks are disabled")?;
         let windows = self.common().mla_window_segments(0)?;
         let mut offset = mark * self.window_bytes;
@@ -416,39 +436,40 @@ impl<'a> NativeDraft<'a> {
         Ok(parts)
     }
     pub(crate) fn move_mark(&self, mark: usize, slot: usize, capture: bool) -> Result<()> {
-        let marks = self.mark_segments(mark)?;
-        self.drain()?;
-        self.owners.draft.device.run(|| {
-            if !self.common().is_block() { return self.common().copy_mla_windows(slot,&marks,capture); }
-            let live=self.common().block_window_planes(slot)?;
-            ensure!(marks.len()==live.len()+1,"block draft mark geometry differs");
-            let library=self.device().library;
-            let (origin,end)=self.frontier(slot)?;
-            let restored=if capture {
-                let bytes=[(origin as u64).to_le_bytes(),(end as u64).to_le_bytes()].concat();
-                library.copy_h2d(marks[0],&bytes)?;
-                None
-            } else {
-                let mut bytes=[0u8;16]; library.copy_d2h(&mut bytes,marks[0])?;
-                let origin=usize::try_from(u64::from_le_bytes(bytes[..8].try_into()?))?;
-                let end=usize::try_from(u64::from_le_bytes(bytes[8..].try_into()?))?;
-                ensure!(origin<=end,"block mark frontier invalid");
-                Some((origin,end))
+        if self.common().is_block() {
+            ensure!(mark<self.marks && !self.block_marks.is_empty(),"block marks disabled/outside admission");
+            let planes=self.common().block_window_planes(slot)?;
+            let frontier=if capture { self.frontier(slot)? } else {
+                let metadata=self.block_marks.iter().map(|m|m.metadata(mark)).collect::<Result<Vec<_>>>()?;
+                ensure!(metadata.windows(2).all(|p|p[0]==p[1]),"block rank mark frontiers disagree");
+                metadata[0]
             };
-            for (saved,live) in marks[1..].iter().zip(live) {
-                let (to,from)=if capture { (*saved,live) } else { (live,*saved) };
-                library.copy_d2d(to,from,to.bytes)?;
+            for snapshots in &self.block_marks {
+                let device=snapshots.backing().device.id;
+                let local=planes.iter().copied().filter(|p|p.device_id==device).collect::<Vec<_>>();
+                // SAFETY: same-device planes and admitted mark backing outlive the
+                // shared event fences, whose readers name this rank's producer.
+                unsafe {
+                    if capture { snapshots.capture(mark,&local,frontier.0,frontier.1)?; }
+                    else { ensure!(snapshots.restore(mark,&local,frontier.1)?==frontier,"block restore frontier changed"); }
+                }
             }
-            if let Some((origin,end))=restored { self.common().restore_frontier(slot,origin,end)?; }
-            Ok(())
-        })
+            if !capture { self.common().restore_frontier(slot,frontier.0,frontier.1)?; }
+            return Ok(());
+        }
+        let marks=self.mark_segments(mark)?;
+        self.drain()?;
+        self.owners.draft.device.run(||self.common().copy_mla_windows(slot,&marks,capture))
     }
 
     pub(crate) fn max_batch_sequences(&self) -> usize { self.owners.draft.max_batch_sequences() }
     pub(crate) fn drafts(&self) -> usize { self.owners.draft.drafts() }
     pub(crate) fn require_live(&self) -> Result<()> { self.bridge.require_live()?; self.common().require_live() }
     pub(crate) fn abort(&self) -> Result<()> { let a=self.bridge.abort(); let b=self.common().abort(); a.and(b) }
-    pub(crate) fn drain(&self) -> Result<()> { self.bridge.synchronize()?; self.common().drain_mla() }
+    pub(crate) fn drain(&self) -> Result<()> {
+        for marks in &self.block_marks { marks.drain()?; }
+        self.bridge.synchronize()?; self.common().drain_mla()
+    }
     pub(crate) fn finish_terminal(&self, drained: bool) { self.bridge.finish_terminal(drained); }
 
     pub(crate) fn propose(&self, sequences: &[DraftSeq]) -> Result<Vec<Draft>> {

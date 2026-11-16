@@ -45,9 +45,16 @@ impl<'a> WindowSnapshots<'a> {
         let (stride, bytes) = Self::bytes(&planes, marks)?;
         let arena = Rc::new(device::Allocation::new(stream.device, bytes,
             Tag::prefix("shared/draft-window-snapshots"))?);
-        let copies = crate::shared::prefix::PrefixCopies::new(stream.device.library,
-            vec![vec![crate::shared::prefix::Reader { device: stream.device.id, stream: stream.raw }]])?;
-        Ok(Self { copies, arena, planes, stride, marks })
+        Self::with_backing(crate::shared::prefix::Reader { device:stream.device.id,stream:stream.raw },arena,planes,marks)
+    }
+
+    pub fn with_backing(reader:crate::shared::prefix::Reader,arena:Rc<device::Allocation<'a>>,
+        planes:Vec<usize>,marks:usize)->Result<Self> {
+        let (stride,bytes)=Self::bytes(&planes,marks)?;
+        ensure!(arena.device.id==reader.device && arena.buffer.bytes==bytes,
+            "window mark backing differs from admitted physical owner");
+        let copies=crate::shared::prefix::PrefixCopies::new(arena.device.library,vec![vec![reader]])?;
+        Ok(Self { copies,arena,planes,stride,marks })
     }
 
     pub fn backing(&self) -> Rc<device::Allocation<'a>> { Rc::clone(&self.arena) }
@@ -117,19 +124,24 @@ impl<'a> WindowSnapshots<'a> {
     pub unsafe fn restore(&self, mark: usize, live: &[CuteafdDeviceBuffer], frontier: usize)
         -> Result<(usize, usize)> {
         let copies = self.parts(mark, live, false)?;
-        self.copies.drain()?;
-        let saved = self.mark(mark)?;
-        let mut metadata = [0u8; 16];
-        self.arena.device.run(|| self.arena.device.library.copy_d2h(&mut metadata,
-            CuteafdDeviceBuffer { bytes: 16, ..saved }))?;
-        let origin = usize::try_from(u64::from_le_bytes(metadata[..8].try_into()?))?;
-        let end = usize::try_from(u64::from_le_bytes(metadata[8..].try_into()?))?;
-        ensure!(origin <= end && end == frontier, "window snapshot metadata/frontier differs");
+        let (origin,end)=self.metadata(mark)?;
+        ensure!(end == frontier, "window snapshot metadata/frontier differs");
         // SAFETY: caller retains the initialized mark and destination planes.
         unsafe { self.copies.copy_d2d(&copies)?; }
         Ok((origin, end))
     }
 
+    pub fn metadata(&self,mark:usize)->Result<(usize,usize)> {
+        self.copies.drain()?;
+        let saved=self.mark(mark)?;
+        let mut bytes=[0u8;16];
+        self.arena.device.run(||self.arena.device.library.copy_d2h(&mut bytes,
+            CuteafdDeviceBuffer { bytes:16,..saved }))?;
+        let origin=usize::try_from(u64::from_le_bytes(bytes[..8].try_into()?))?;
+        let end=usize::try_from(u64::from_le_bytes(bytes[8..].try_into()?))?;
+        ensure!(origin<=end,"window snapshot metadata invalid");
+        Ok((origin,end))
+    }
     pub fn drain(&self) -> Result<()> { self.copies.drain() }
 }
 
@@ -1372,6 +1384,12 @@ impl<'a> DsparkDrafter<'a> {
         Ok(self.layers.iter().flat_map(|layer| [&layer.k_ring, &layer.v_ring])
             .map(|plane| cuteafd_hostcache::copy::DeviceRange {
                 addr: at(plane, page.index as usize * bytes) as u64, bytes }).collect())
+    }
+
+    pub(crate) fn window_readers(&self)->Vec<crate::shared::prefix::Reader> {
+        let mut readers=vec![crate::shared::prefix::Reader { device:self.hidden_norm.buffer.device_id,stream:self.stream }];
+        if let Some(split)=&self.head_split { readers.extend(split.peer.window_readers()); }
+        readers.sort_by_key(|r|r.device); readers
     }
 
     /// Slot-local physical planes, including inactive bytes, for exact window

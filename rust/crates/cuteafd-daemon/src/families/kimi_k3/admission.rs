@@ -362,6 +362,24 @@ impl<'a> Admission<'a> {
         (bytes > 0).then(|| crate::shared::memory::device::Allocation::new(device, bytes,
             crate::shared::memory::Tag::prefix("kimi/draft-marks")).map(Rc::new)).transpose()
     }
+    pub(crate) fn allocate_block_marks(&mut self,devices:&[Device<'a>])->Result<Vec<Rc<crate::shared::memory::device::Allocation<'a>>>> {
+        ensure!(!self.draft_marks_allocated && devices.len()==self.devices.len(),"block marks already allocated or rank inventory differs");
+        let layout=self.draft.as_ref().context("block marks have no admitted layout")?;
+        let demands=layout.window_mark_demands((devices.len()-1) as u8)?;
+        let marks=usize::try_from(self.mark_selection.slots)?;
+        for demand in &demands {
+            let rank=demand.gpu as usize;
+            let bytes=demand.bytes.checked_mul(marks as u64).context("block mark allocation overflow")?;
+            ensure!(devices[rank].id==self.devices[rank] && self.placement.items[rank].iter()
+                .filter(|i|i.group==DRAFT_MARKS).map(|i|i.bytes).collect::<Vec<_>>()
+                ==if bytes==0 { vec![] } else { vec![bytes] },"block mark backing differs from rank charge");
+        }
+        self.draft_marks_allocated=true;
+        if marks==0 { return Ok(Vec::new()); }
+        demands.iter().map(|d|crate::shared::memory::device::Allocation::new(devices[d.gpu as usize],
+            usize::try_from(d.bytes)?.checked_mul(marks).context("block mark extent overflow")?,
+            crate::shared::memory::Tag::prefix("kimi/draft-marks")).map(Rc::new)).collect()
+    }
     pub(crate) fn draft_layout(&self) -> Option<&DraftLayout> { self.draft.as_ref() }
 
     /// Hops, the peer exchange and Spark waves serve one prefill unit.
@@ -796,11 +814,12 @@ pub(crate) fn admit<'a, const RANKS: usize>(mut inputs: Inputs<'_, RANKS>) -> Re
     let expert_usage = inputs.expert_usage;
     let mut request = request(inputs)?;
     if let Some(layout) = &draft {
-        let demand = Demand::new((RANKS - 1) as u8, Category::Prefix, DRAFT_MARKS, layout.window_mark_bytes()? as u64, Basis::Exact);
-        if demand.bytes > 0 {
-            let mut total = demand.clone();
-            total.bytes = total.bytes.checked_mul(legacy_marks as u64).context("Kimi draft window marks overflow")?;
-            request.fixed.push(total);
+        for demand in layout.window_mark_demands((RANKS-1) as u8)? {
+            if legacy_marks>0 {
+                let mut total=demand;
+                total.bytes=total.bytes.checked_mul(legacy_marks as u64).context("Kimi draft window marks overflow")?;
+                request.fixed.push(total);
+            }
         }
     }
     if let Some(inventory) = &rtx {

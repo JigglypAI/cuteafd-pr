@@ -326,13 +326,12 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
                 fixed.push(demand);
             }
         }
-        let bytes = layout.window_mark_bytes()? as u64;
-        if bytes > 0 && legacy_marks > 0 {
-            let per_mark = Demand::new(head_rank as u8, Category::Prefix, "Kimi exact draft windows", bytes, Basis::Exact);
-            let mut total = per_mark.clone();
-            total.bytes = bytes.checked_mul(legacy_marks).context("Kimi draft mark overflow")?;
-            fixed.push(total);
-            mark_demands.push(per_mark);
+        for per_mark in layout.window_mark_demands(head_rank as u8)? {
+            if legacy_marks>0 {
+                let mut total=per_mark.clone();
+                total.bytes=total.bytes.checked_mul(legacy_marks).context("Kimi draft mark overflow")?;
+                fixed.push(total); mark_demands.push(per_mark);
+            }
         }
         Ok(layout)
     }).transpose();
