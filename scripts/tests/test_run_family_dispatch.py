@@ -1793,7 +1793,7 @@ def capture_native_exlr8_capability_deployment(deployment_path: Path) -> None:
     assert deployment["wip_launchable"] is True
     source = (ROOT / "scripts/lib/family-keys.sh").read_text()
     functions = []
-    for name in ("release_spark_worker_budget", "release_validate_deployment"):
+    for name in ("release_spark_worker_budget", "release_spark_role_budget", "release_validate_deployment"):
         match = re.search(rf"^{name}\(\) \{{\n.*?^\}}$", source, re.MULTILINE | re.DOTALL)
         assert match, f"missing actual launcher function {name}"
         functions.append(match.group())
@@ -1802,6 +1802,7 @@ release_die() { printf '%s\n' "$*" >&2; exit 1; }
 wip_slot=native-budget-test
 plan="$(cat "$1")"
 release_spark_worker_budget "$plan" "$2"
+for ((rank=0; rank<$2; rank++)); do release_spark_role_budget "$plan" "$rank"; done
 release_validate_deployment "$plan" glm5_flash
 '''
     result = subprocess.run(["bash", "-euc", script, "native-capability", str(deployment_path),
@@ -1810,8 +1811,10 @@ release_validate_deployment "$plan" glm5_flash
     devices = [device for device in deployment["memory_layout"]["devices"]
                if device["kind"] == "spark" and device["index"] in experts]
     assert len(devices) == deployment["spark_expert_world"]
-    assert {device["worker_budget_bytes"] for device in devices} == {int(result.stdout.strip())}
     assert result.returncode == 0, result.stderr
+    budgets = [int(value) for value in result.stdout.splitlines()]
+    assert budgets[0] == max(device["worker_budget_bytes"] for device in devices)
+    assert budgets[1:] == [device["worker_budget_bytes"] for device in sorted(devices, key=lambda device: device["index"])]
 
 
 def _coordinator_launches(stderr: str) -> list[list[str]]:
