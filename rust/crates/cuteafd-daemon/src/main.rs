@@ -413,7 +413,7 @@ async fn run() -> Result<()> {
         family_fetch.or(initial_fetch).unwrap_or(cuteafd_api::openai::media::ImageUrlFetch::Public))?;
     let weight_budget_gib = family_weight_budget.or(initial_weight_budget);
     if let Commands::Plan(args) = &mut command {
-        args.coordinator_weight_budget_gib = weight_budget_gib.unwrap_or(80.0);
+        args.coordinator_weight_budget_gib = weight_budget_gib;
     } else if let Some(gib) = weight_budget_gib {
         let bytes = cuteafd_loader::plan::budget_bytes("--coordinator-weight-budget-gib", gib)?;
         shared::memory::budget::set_resident_weight_limit(cuteafd_loader::placement::ResidentWeights(bytes))?;

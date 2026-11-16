@@ -408,13 +408,16 @@ pub(crate) struct PlanArgs {
     #[arg(long, conflicts_with_all = ["deployment", "files", "fetch", "role"])]
     pub(crate) spark_range: bool,
     /// Resolved global resident-weight ceiling, including drafter weights.
-    #[arg(skip = 80.0)]
-    pub(crate) coordinator_weight_budget_gib: f64,
+    #[arg(skip)]
+    pub(crate) coordinator_weight_budget_gib: Option<f64>,
     /// Resolved global memory policy (caps, reserves, KV target/min/max).
     #[arg(skip)]
     pub(crate) memory: MemoryArgs,
     #[arg(long, default_value_t = false)]
     pub(crate) json: bool,
+    /// Resolve deterministic launch settings without computing placement.
+    #[arg(long, hide = true)]
+    pub(crate) resolve_settings_only: bool,
     /// Emit typed launch decisions; live artifact verification stays with the launcher.
     #[arg(long, conflicts_with_all = ["files", "fetch", "role", "file_layout"])]
     pub(crate) deployment: bool,
@@ -477,8 +480,8 @@ pub(crate) struct PlanArgs {
     #[arg(long, action = clap::ArgAction::Set)]
     pub(crate) draft_fp8: Option<bool>,
     /// GLM Flash FP8 drafter GEMM row mode.
-    #[arg(long, default_value = "w8a16")]
-    pub(crate) draft_linear: crate::shared::fp8_linear::Fp8Rows,
+    #[arg(long)]
+    pub(crate) draft_linear: Option<crate::shared::fp8_linear::Fp8Rows>,
     /// Separately configured vision checkpoint to include in JSON inventory.
     #[arg(long)]
     pub(crate) vision_snapshot: Option<PathBuf>,
@@ -572,12 +575,12 @@ pub(crate) struct PlanArgs {
     #[arg(long, default_value_t = 64, value_parser = plan_decode_rows)]
     pub(crate) decode_rows: u64,
     /// GLM 5.3 Flash's DSA index storage for --layout (compact is single-GPU only).
-    #[arg(long, value_enum, default_value = "keys")]
-    pub(crate) index_cache: crate::families::glm5_flash::engine::IndexCache,
+    #[arg(long, value_enum)]
+    pub(crate) index_cache: Option<crate::families::glm5_flash::engine::IndexCache>,
     /// GLM 5.3 Flash's replay records for --layout (`shared`: in the prefill scratch, one GPU;
     /// `auto`: `shared` on one GPU with an automatic pool and admitted Spark experts, else `own`).
-    #[arg(long, value_enum, default_value = "own")]
-    pub(crate) replay_records: PlanReplayRecords,
+    #[arg(long, value_enum)]
+    pub(crate) replay_records: Option<PlanReplayRecords>,
     /// Concurrent sequences for --layout (0: family serving default; otherwise 8 at <=32 GiB, 16 above).
     #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(u64).range(0..=64))]
     pub(crate) concurrency: u64,
