@@ -1,5 +1,5 @@
 //! The officially bundled GLM 5.3 Flash tower; header-only until admission.
-use super::{Result, TensorRead, TowerSpec, VisionError};
+use super::{axial_frequency, ConstantRegion, Result, TensorRead, TowerSpec, VisionError};
 use cuteafd_core::DType;
 use cuteafd_ffi::vision::{VisionBlock, VisionSpec, NO_VISION_OFFSET};
 use std::{
@@ -172,7 +172,10 @@ impl TowerSpec {
         cursor = (cursor + 255) & !255;
         native.inv_freq = cursor as u64;
         native.weight_bytes = (cursor + 64) as u64;
-        Ok(Self { native, reads })
+        let constant=ConstantRegion::fp32("rotary.inv_freq",native.inv_freq,
+            (0..16).map(|i| axial_frequency(i,16)),
+            "f32 reciprocal pow(theta=10000,index/16)","GLM5.3Flash vision rotary inverse frequencies (theta=10000)");
+        Self::from_parts_with_constants(native,reads,vec![constant])
     }
 }
 
@@ -297,6 +300,7 @@ mod tests {
             spec.image_family(),
             cuteafd_loader::media::ImageFamily::GlmFlash
         );
+        super::super::constants::assert_original_table(&spec);
         super::super::tests::assert_ctypes_spec(dir.path(), "glm5_flash", &spec);
         super::super::push::tests::assert_vision_plan(dir.path(), &spec);
         assert_eq!(spec.reads.len(), 347);

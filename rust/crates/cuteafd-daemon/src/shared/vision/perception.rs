@@ -3,10 +3,6 @@ use super::*;
 use cuteafd_ffi::vision::PerceptionSpec;
 use cuteafd_loader::media::perception_vision::{PerceptionGeometry, PerceptionKind};
 
-pub(super) fn inv_freq(kind: u32) -> Vec<f32> {
-    match kind {6 => PerceptionKind::Inkling2.inv_freq(),7 => PerceptionKind::Step5.inv_freq(),
-        _ => Vec::new() }
-}
 
 impl TowerSpec {
     pub fn perception(snapshot: &Path, max_tokens: usize) -> Result<Self> {
@@ -102,7 +98,11 @@ impl TowerSpec {
             pe.scale2[layer] = field("ls_2.gamma");
         }
         native.perception = Some(pe);
-        Ok(Self {native,reads})
+        let constant=ConstantRegion::fp32("rotary.inv_freq",native.inv_freq,g.inv_freq(),
+            "PerceptionKind::inv_freq vendor-exact per-family recipe",
+            if inkling { "vllm@d664cd1e96052857aea2aa844eeba571c24758b4/vision.py sha256=a3ed563be68b63ee47c4103116bb4f77015eaaea31b040d9301b82af85349d16" }
+            else { "vllm@d664cd1e96052857aea2aa844eeba571c24758b4/step_vl.py sha256=348a7e4d5260d68232d91fe13a3b1a9a6badca4799457f1b7c8a1a8a112adcb2" });
+        Self::from_parts_with_constants(native,reads,vec![constant])
     }
 }
 
@@ -140,6 +140,7 @@ mod tests {
         for inkling in [true,false] {
             let directory = sparse_snapshot(inkling);
             let tower = TowerSpec::perception(directory.path(),169).unwrap();
+            super::super::constants::assert_original_table(&tower);
             let pe = tower.native.perception.as_ref().unwrap();
             assert_eq!(tower.reads.len(),if inkling {422} else {667});
             assert_eq!(tower.native.depth,if inkling {23} else {47});
@@ -149,13 +150,13 @@ mod tests {
             assert_eq!(pe.scale2.len(),tower.native.depth as usize);
             assert!(pe.scale1.iter().all(|offset| offset%256==0 && *offset<tower.native.weight_bytes));
             assert!(tower.reads.iter().all(|read| !read.vector && read.destination%256==0));
-            assert_eq!(tower.frequency_bytes().len(),if inkling {64} else {96});
-            assert_eq!(tower.native.inv_freq+tower.frequency_bytes().len() as u64,tower.native.weight_bytes);
+            assert_eq!(tower.constants[0].bytes.len(),if inkling {64} else {96});
+            assert_eq!(tower.native.inv_freq+tower.constants[0].bytes.len() as u64,tower.native.weight_bytes);
             let contribution = push::Contribution::prepare(0,Some((&tower,0x100000)),None,None,None).unwrap();
             let records = contribution.records();
             assert_eq!(records.operands.len(),tower.reads.len());
             assert!(records.steps.is_empty());
-            assert_eq!(records.operands.iter().map(|operand| operand.bytes as u64).sum::<u64>()+tower.frequency_bytes().len() as u64,tower.native.weight_bytes);
+            assert_eq!(records.operands.iter().map(|operand| operand.bytes as u64).sum::<u64>()+tower.constants[0].bytes.len() as u64,tower.native.weight_bytes);
             assert!(TowerSpec::perception(directory.path(),0).is_err());
             assert!(TowerSpec::perception(directory.path(),4097).is_err());
         }
