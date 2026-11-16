@@ -97,10 +97,7 @@ impl<'a> Head<'a> {
         ensure!(rows>0 && output_row.checked_add(rows).is_some_and(|end| end <= self.rows) && owner.stream().raw == self.stream.raw
             && owner.stream().device.id == self.stream.device.id,
             "Inkling head rows/producer stream differ from admitted owner");
-        k.residual(owner, target.operand("model.llm.attn_res.output_query")?.buffer,
-            owner.buffer("partial")?, owner.buffer("mixed")?, rows, 1, candidates, false)?;
-        k.norm(owner, owner.buffer("mixed")?, target.operand("model.llm.norm.weight")?.buffer,
-            self.normalized.buffer, false, Precision::Bf16, rows)?;
+        self.normalize(k,owner,target,rows,candidates)?;
         let logits = super::cache::view(self.logits.buffer, output_row*cfg.unpadded_vocab_size*4,
             rows*cfg.unpadded_vocab_size*4)?;
         // SAFETY: BF16 normalized rows and trimmed weight matrix stay live;
@@ -112,6 +109,19 @@ impl<'a> Head<'a> {
                 cfg.unpadded_vocab_size, cfg.unpadded_vocab_size, cfg.final_softcap as f32, self.stream.raw)?;
         }
         Ok(logits)
+    }
+    pub fn normalize(&self,k:&Kernels<'a>,owner:&impl UnitBuffers<'a>,target:&TargetWeights<'_>,
+        rows:usize,candidates:usize)->Result<Buffer> {
+        ensure!((1..=self.rows).contains(&rows),"Inkling normalized tap exceeds head owner");
+        k.residual(owner,target.operand("model.llm.attn_res.output_query")?.buffer,
+            owner.buffer("partial")?,owner.buffer("mixed")?,rows,1,candidates,false)?;
+        k.norm(owner,owner.buffer("mixed")?,target.operand("model.llm.norm.weight")?.buffer,
+            self.normalized.buffer,false,Precision::Bf16,rows)?;
+        self.normalized(rows)
+    }
+    pub fn normalized(&self,rows:usize)->Result<Buffer> {
+        ensure!((1..=self.rows).contains(&rows),"Inkling final norm tap rows outside head owner");
+        super::cache::view(self.normalized.buffer,0,rows*4608*2)
     }
     /// Vocabulary storage remains <=64 rows regardless of prompt length. The
     /// shared consumer finishes each tile before the next overwrites it.
