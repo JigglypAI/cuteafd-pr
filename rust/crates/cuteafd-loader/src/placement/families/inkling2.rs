@@ -114,14 +114,10 @@ pub struct SparkCharge {
     pub runtime: u64,
 }
 
-/// Bundled dSpark drafter: its own arena on the head GPU plus its scratch.
+/// Header-native per-rank drafter owners; pool-dependent caches stay curves.
 #[derive(Debug, Clone)]
 pub struct Drafter {
-    pub arena: WeightArenaLayout,
-    /// Exact scratch owners (name, bytes); state that follows the pool is
-    /// charged per page.
-    pub scratch: Vec<(String, u64)>,
-    pub state_per_page: u64,
+    pub layout: crate::families::inkling2::draft::DraftLayout,
 }
 
 /// Bundled PE-Lang ViT and merge projector: own arena plus scratch.
@@ -658,20 +654,37 @@ impl Recipe for InklingInputs {
                 }
             }
         }
-        // Optional bundled drafter: own arena on the head GPU (DraftHome domain).
         if let Some(draft) = &self.drafter {
             contract_variables.push(Variable::DraftHome(vec![head]));
-            let location = Location::coordinator(head);
             let lifetime = Lifetime { first: Phase::DraftLoad, last: Phase::Growth };
-            components.extend(weight_arena_components(&draft.arena, location, lifetime, maximum, MemoryKind::DrafterWeights)?);
-            for (name, bytes) in &draft.scratch {
-                components.extend(buffer(format!("inkling2.draft.{name}"), location, *bytes, lifetime,
-                    Category::Drafter, "bundled dSpark scratch", maximum));
+            if draft.layout.weights.len()!=self.gpus || draft.layout.runtime.len()!=self.gpus {
+                return Err(invalid("drafter rank inventory differs from target"));
             }
-            if draft.state_per_page > 0 {
-                components.push(Component::allocation(Allocation::buffer("inkling2.draft.state", location,
-                    draft.state_per_page, lifetime, Category::Drafter, "bundled dSpark per-page state"),
-                    ByteCurve::linear(draft.state_per_page, draft.state_per_page, maximum), false, maximum));
+            for (rank,(weights,work)) in draft.layout.weights.iter().zip(&draft.layout.runtime).enumerate() {
+                let location=Location::coordinator(rank as u8);
+                components.extend(weight_arena_components(&weights.arena,location,lifetime,maximum,MemoryKind::DrafterWeights)?);
+                for (name,bytes) in &work.buffers {
+                    let full=draft.layout.config.context.iter().enumerate().any(|(layer,policy)|
+                        matches!(policy,crate::formats::block_dspark::recurrent::ContextPolicy::Full)
+                            && name.starts_with(&format!("cache.layer.{layer}.")));
+                    let id=format!("inkling2.draft.{rank}.{name}");
+                    if full {
+                        let stride=PAGE_ROWS*work.cache.record_bytes as u64/2;
+                        components.push(Component::allocation(Allocation::buffer(id,location,stride,lifetime,
+                            Category::Drafter,"recurrent full-context KV plane"),ByteCurve::linear(stride,stride,maximum),false,maximum));
+                    } else {
+                        components.extend(buffer(id,location,*bytes as u64,lifetime,Category::Drafter,"recurrent fixed owner",maximum));
+                    }
+                }
+                if draft.layout.marks>0 {
+                    let bytes=work.window_mark_bytes.checked_mul(draft.layout.marks).ok_or(Refusal::Overflow("draft marks"))? as u64;
+                    components.extend(buffer(format!("inkling2.draft.{rank}.marks"),location,bytes,lifetime,Category::Drafter,
+                        "exact drafter window and last-feature marks",maximum));
+                }
+            }
+            for (name,bytes) in &draft.layout.target {
+                components.extend(buffer(format!("inkling2.draft.target.{name}"),Location::coordinator(0),*bytes as u64,lifetime,
+                    Category::Drafter,"target tap and accepted-prefix FIR owner",maximum));
             }
         }
         // Optional bundled vision tower: own arena; `Encoder` domain [on, off].
