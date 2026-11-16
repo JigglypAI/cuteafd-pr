@@ -10,9 +10,7 @@ use std::{collections::BTreeMap, ops::Range};
 use crate::{families::{glm5::draft_physical::ShardAxis,
     inkling2::{Inkling2Config, Inkling2MtpConfig}}, serving_capacity::WeightArenaLayout};
 
-/// Tap sites are arithmetic facts, not a conversion to ordinary post-layer taps.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TapSite { PartialAtLayerEntry(usize), FinalNorm }
+pub use cuteafd_core::TapSite;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ContextPolicy { BlockAnchoredWindow(usize), Full }
@@ -33,7 +31,7 @@ impl RecurrentBlockConfig {
         let transformer = Inkling2MtpConfig::from_hf(root, &target)?
             .context("checkpoint has no bundled recurrent block drafter")?;
         let taps = transformer.target_layers.iter().map(|&id| {
-            if id == target.layers { TapSite::FinalNorm } else { TapSite::PartialAtLayerEntry(id) }
+            if id == target.layers { TapSite::FinalNorm } else { TapSite::LayerEntry(id) }
         }).collect();
         let context = transformer.local.iter().map(|&local| {
             if local { ContextPolicy::BlockAnchoredWindow(transformer.window) } else { ContextPolicy::Full }
@@ -196,9 +194,9 @@ mod tests {
         assert_eq!(c.predictions(), 7);
         assert_eq!(c.recurrent_input_width()?, 9728);
         assert_eq!((c.padded_vocab, c.valid_vocab), (201024, 200058));
-        assert_eq!(c.taps, [TapSite::PartialAtLayerEntry(5), TapSite::PartialAtLayerEntry(11),
-            TapSite::PartialAtLayerEntry(17), TapSite::PartialAtLayerEntry(23), TapSite::PartialAtLayerEntry(29),
-            TapSite::PartialAtLayerEntry(35), TapSite::PartialAtLayerEntry(41), TapSite::FinalNorm]);
+        assert_eq!(c.taps, [TapSite::LayerEntry(5), TapSite::LayerEntry(11),
+            TapSite::LayerEntry(17), TapSite::LayerEntry(23), TapSite::LayerEntry(29),
+            TapSite::LayerEntry(35), TapSite::LayerEntry(41), TapSite::FinalNorm]);
         for layer in [0, 1, 3, 4] {
             assert_eq!(c.visible_context(layer, 100)?, 0..100);
             assert_eq!(c.visible_context(layer, 5000)?, 3976..5000);
