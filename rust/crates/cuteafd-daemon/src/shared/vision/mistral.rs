@@ -143,7 +143,7 @@ impl TowerSpec {
         native.weight_bytes = (cursor + (HEAD_DIM / 2) * 4) as u64;
         debug_assert_eq!(native.weight_bytes, resident_weight_bytes());
         let constant=ConstantRegion::fp32("rotary.inv_freq",native.inv_freq,axial_inv_freq(),
-            "919b230eb","Pixtral vendor axial FP32 frequency recipe",include_str!("mistral.rs"));
+            "Pixtral vendor axial FP32 frequency recipe","PixtralRotaryEmbedding axial interleave (theta=10000)");
         Self::from_parts_with_constants(native,reads,vec![constant])
     }
 }

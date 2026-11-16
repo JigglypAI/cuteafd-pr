@@ -84,8 +84,8 @@ impl TowerSpec {
             return Err(VisionError::Unsupported("Muse packed weights differ from planner contract".into()));
         }
         let constant=ConstantRegion::fp32("rotary.inv_freq",native.inv_freq,
-            (0..24).map(|i| axial_frequency(i,24)),"919b230eb",
-            "f32 reciprocal pow(theta=10000,index/24)",include_str!("muse.rs"));
+            (0..24).map(|i| axial_frequency(i,24)),
+            "f32 reciprocal pow(theta=10000,index/24)","Muse Spark vision rotary inverse frequencies (theta=10000)");
         Self::from_parts_with_constants(native,reads,vec![constant])
     }
 }

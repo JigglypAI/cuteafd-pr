@@ -387,8 +387,8 @@ impl TowerSpec {
         native.inv_freq = cursor as u64;
         native.weight_bytes = (cursor + 64) as u64;
         let constant = ConstantRegion::fp32("rotary.inv_freq",native.inv_freq,
-            (0..16).map(|i| axial_frequency(i,16)),"919b230eb",
-            "f32 reciprocal pow(theta=10000,index/16)",include_str!("vision.rs"));
+            (0..16).map(|i| axial_frequency(i,16)),
+            "f32 reciprocal pow(theta=10000,index/16)","MiMoVisionTransformer axial inverse frequencies (theta=10000)");
         Self::from_parts_with_constants(native,reads,vec![constant])
     }
     /// Canonical header extents, sorted by tensor name; no tower payload is read.
@@ -412,8 +412,7 @@ impl TowerSpec {
         for region in self.constant_regions() {
             headers.insert(format!("constant:{}",region.name),serde_json::json!({
                 "offset":region.offset,"alignment":region.alignment,"bytes":region.bytes.len(),
-                "source_revision":region.provenance.source_revision,"recipe":region.provenance.recipe,
-                "source_sha256":region.provenance.source_sha256,"content_sha256":region.provenance.content_sha256}));
+                "recipe":region.provenance.recipe,"content_sha256":region.provenance.content_sha256}));
         }
         cuteafd_loader::media::EncoderId::derive(family, revision, &headers, numerics, sm)
     }
@@ -1135,7 +1134,7 @@ mod tests {
                 destination: 0,
                 vector: true,
             }],
-            constants:vec![ConstantRegion::fp32("rotary.inv_freq",128,[1.0],"test","one float","fixture")],
+            constants:vec![ConstantRegion::fp32("rotary.inv_freq",128,[1.0],"one float","fixture")],
         };
         let arena = spec.load_weights().unwrap();
         assert_eq!(&arena[0..4], &1.0f32.to_le_bytes());

@@ -4,9 +4,8 @@ use std::{collections::BTreeSet, sync::Arc};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ConstantProvenance {
-    pub source_revision: String,
+    pub source: String,
     pub recipe: String,
-    pub source_sha256: [u8; 32],
     pub content_sha256: [u8; 32],
 }
 
@@ -25,9 +24,8 @@ impl ConstantRegion {
         offset: u64,
         alignment: u64,
         bytes: impl Into<Arc<[u8]>>,
-        source_revision: impl Into<String>,
+        source: impl Into<String>,
         recipe: impl Into<String>,
-        source_sha256: [u8; 32],
     ) -> Self {
         let bytes = bytes.into();
         let content_sha256 = Sha256::digest(&bytes).into();
@@ -37,9 +35,8 @@ impl ConstantRegion {
             alignment,
             bytes,
             provenance: ConstantProvenance {
-                source_revision: source_revision.into(),
+                source: source.into(),
                 recipe: recipe.into(),
-                source_sha256,
                 content_sha256,
             },
         }
@@ -49,7 +46,6 @@ impl ConstantRegion {
         name: &str,
         offset: u64,
         values: impl IntoIterator<Item = f32>,
-        revision: &str,
         recipe: &str,
         source: &str,
     ) -> Self {
@@ -57,15 +53,7 @@ impl ConstantRegion {
             .into_iter()
             .flat_map(f32::to_le_bytes)
             .collect::<Vec<_>>();
-        Self::new(
-            name,
-            offset,
-            4,
-            bytes,
-            revision,
-            recipe,
-            Sha256::digest(source.as_bytes()).into(),
-        )
+        Self::new(name, offset, 4, bytes, source, recipe)
     }
 
     pub(crate) fn validate(&self, arena_bytes: u64) -> Result<(), String> {
@@ -78,7 +66,7 @@ impl ConstantRegion {
                 .offset
                 .checked_add(self.bytes.len() as u64)
                 .is_none_or(|end| end > arena_bytes)
-            || self.provenance.source_revision.is_empty()
+            || self.provenance.source.is_empty()
             || self.provenance.recipe.is_empty()
             || <[u8; 32]>::from(Sha256::digest(&self.bytes)) != self.provenance.content_sha256
         {
@@ -133,7 +121,6 @@ mod tests {
             vec![1, 2, 3, 4],
             "vendor-sha",
             "FP32 arange/pow",
-            [7; 32],
         )
     }
     #[test]
@@ -158,7 +145,7 @@ mod tests {
                 3 => r.offset = u64::MAX,
                 4 => r.bytes = Arc::from([]),
                 5 => r.provenance.content_sha256[0] ^= 1,
-                6 => r.provenance.source_revision.clear(),
+                6 => r.provenance.source.clear(),
                 7 => r.provenance.recipe.clear(),
                 _ => r.alignment = 0,
             }

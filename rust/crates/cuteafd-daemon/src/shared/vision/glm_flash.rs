@@ -173,8 +173,8 @@ impl TowerSpec {
         native.inv_freq = cursor as u64;
         native.weight_bytes = (cursor + 64) as u64;
         let constant=ConstantRegion::fp32("rotary.inv_freq",native.inv_freq,
-            (0..16).map(|i| axial_frequency(i,16)),"919b230eb",
-            "f32 reciprocal pow(theta=10000,index/16)",include_str!("glm_flash.rs"));
+            (0..16).map(|i| axial_frequency(i,16)),
+            "f32 reciprocal pow(theta=10000,index/16)","GLM5.3Flash vision rotary inverse frequencies (theta=10000)");
         Self::from_parts_with_constants(native,reads,vec![constant])
     }
 }

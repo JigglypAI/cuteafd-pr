@@ -94,8 +94,8 @@ impl TowerSpec {
         native.inv_freq = cursor as u64;
         native.weight_bytes = (cursor + 18 * 4) as u64;
         let constant=ConstantRegion::fp32("rotary.inv_freq",native.inv_freq,
-            (0..18).map(|i| axial_frequency(i,18)),"919b230eb",
-            "f32 reciprocal pow(theta=10000,index/18)",include_str!("qwen.rs"));
+            (0..18).map(|i| axial_frequency(i,18)),
+            "f32 reciprocal pow(theta=10000,index/18)","Qwen3.8 vision rotary inverse frequencies (theta=10000)");
         Self::from_parts_with_constants(native,reads,vec![constant])
     }
 }
@@ -163,6 +163,16 @@ mod tests {
         assert_eq!(spec.native.merger_width, 4608);
         assert_eq!(spec.native.weight_bytes % 256, 72);
         assert_ne!(spec.encoder_id("revision", 120), spec.encoder_id("revision", 121));
+        let id=spec.encoder_id("revision",120);
+        let mut annotated=spec.clone();
+        annotated.constants[0].provenance.source="independent vendor source annotation".into();
+        assert_eq!(annotated.encoder_id("revision",120),id);
+        annotated.constants[0].provenance.recipe.push_str(" changed input recipe");
+        assert_ne!(annotated.encoder_id("revision",120),id);
+        let mut changed=spec.clone();
+        changed.constants[0].provenance.content_sha256[0]^=1;
+        assert_ne!(changed.encoder_id("revision",120),id);
+        assert!(changed.validate_constants().is_err());
         assert!(spec.reads.iter().all(|r| r.destination % 256 == 0));
         assert!(TowerSpec::qwen(dir.path(), 4097).is_err());
         let p = dir.path().join("config.json");

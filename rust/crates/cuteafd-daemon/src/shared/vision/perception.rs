@@ -99,8 +99,9 @@ impl TowerSpec {
         }
         native.perception = Some(pe);
         let constant=ConstantRegion::fp32("rotary.inv_freq",native.inv_freq,g.inv_freq(),
-            "919b230eb","PerceptionKind::inv_freq vendor-exact per-family recipe",
-            include_str!("../../../../cuteafd-loader/src/media/perception_vision.rs"));
+            "PerceptionKind::inv_freq vendor-exact per-family recipe",
+            if inkling { "vllm@d664cd1e96052857aea2aa844eeba571c24758b4/vision.py sha256=a3ed563be68b63ee47c4103116bb4f77015eaaea31b040d9301b82af85349d16" }
+            else { "vllm@d664cd1e96052857aea2aa844eeba571c24758b4/step_vl.py sha256=348a7e4d5260d68232d91fe13a3b1a9a6badca4799457f1b7c8a1a8a112adcb2" });
         Self::from_parts_with_constants(native,reads,vec![constant])
     }
 }
