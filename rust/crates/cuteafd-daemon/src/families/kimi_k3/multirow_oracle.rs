@@ -12,9 +12,9 @@ thread_local! {
     static SELECTED: RefCell<Option<Selections>> = const { RefCell::new(None) };
 }
 
-pub(super) fn recording() -> bool { SELECTED.with(|s| s.borrow().is_some()) }
+pub(in super::super) fn recording() -> bool { SELECTED.with(|s| s.borrow().is_some()) }
 
-pub(super) fn record(stream: &Stream<'_>, layer: usize, rows: usize,
+pub(in super::super) fn record(stream: &Stream<'_>, layer: usize, rows: usize,
     indices: CuteafdDeviceBuffer, scores: CuteafdDeviceBuffer) -> Result<()> {
     stream.drain()?;
     let mut values = Vec::new();
@@ -227,6 +227,12 @@ fn k31_context_multirow_verify_matches_sequential() -> Result<()> {
         let full = cuteafd_loader::families::kimi_k3::config::KimiK3Config::from_hf(&checkpoint.config)?;
         ensure!(full.dsa.is_some(), "K3.1 checkpoint required");
         let cfg = super::super::admission::prefix(&full, 4)?;
+        use cuteafd_loader::families::kimi_k3::config::KimiAttention;
+        // Attention geometry and DSA semantics are global checkpoint fields.
+        // Actual layers 0..3 span every attention class (three KDA, one DSA).
+        for kind in &full.attention { ensure!(cfg.attention.contains(kind), "uncovered attention class: {kind:?}"); }
+        ensure!(cfg.attention.contains(&KimiAttention::Kda)
+            && cfg.attention.contains(&KimiAttention::Mla), "oracle must include recurrent KDA and DSA");
         let label = format!("{:?}", view.mode());
         runtime.block_on(async {
             let loaded = super::super::startup::load(&library, &programs, &checkpoint, &full, &cfg,
@@ -236,7 +242,7 @@ fn k31_context_multirow_verify_matches_sequential() -> Result<()> {
                     devices: [0, 1], attention: Some(cuteafd_loader::placement::AttentionPlacement::Context),
                     native_lib: &native, manifest: &manifest, peers: vec![], rtx_expert_layers: cuteafd_loader::placement::OnboardSetting::Auto,
                     rows: 256, waves: 1, prefill_rows: Some(256), slots: 4, marks: 0, max_context: CONTEXT,
-                    context: cuteafd_loader::placement::planner::Context::pinned(CONTEXT), pool_tokens: Some(4 * CONTEXT),
+                    context: cuteafd_loader::placement::planner::Context::pinned(CONTEXT as u64), pool_tokens: Some(4 * CONTEXT as u64),
                     graphs: true, ffn_mode: Default::default(), hosted_layers: None, draft: None, verify_rows: 8, prefix: None,
                     prove_serve_admission: false,
                 })?;
