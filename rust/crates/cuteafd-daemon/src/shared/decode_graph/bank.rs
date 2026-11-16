@@ -449,6 +449,8 @@ mod device_tests {
         bank.cache_insert(1, Exec(drops.clone()), id, false);
         bank.cache_measured(10);
         let cache = bank.device.as_ref().unwrap().cache.clone();
+        cache.lock().unwrap().serial_boundary();
+        cache.lock().unwrap().serial_boundary();
         assert_eq!(cache.lock().unwrap().mark_victim(false), Some(id));
         assert!(bank.cache_drain(|| anyhow::bail!("not drained"), || unreachable!()).is_err());
         assert_eq!(drops.get(), 0);
@@ -481,7 +483,7 @@ mod device_tests {
         use super::super::device;
         let mut bank = GraphBank::<usize, usize>::new();
         bank.attach_device_for_test(-395, 64 << 20, site())?;
-        let mut cycles = device::LaneCycles::register(0,
+        let mut cycles = device::LaneCycles::register(0, 1,
             |visit| visit(-395, "bank-test", false, &mut bank))?;
         let cache = bank.device.as_ref().unwrap().cache.clone();
         // Keeping the controller locked makes a mutex on the boundary deadlock;
@@ -520,6 +522,8 @@ mod device_tests {
         bank.cache_commit(1, 1, ticket, 10, 1, false);
         bank.cache_measured(10);
         let cache = bank.device.as_ref().unwrap().cache.clone();
+        cache.lock().unwrap().serial_boundary();
+        cache.lock().unwrap().serial_boundary();
         cache.lock().unwrap().mark_victim(false).unwrap();
         // SAFETY: fixture integers own no captured allocations or native work.
         unsafe { device::observe_completed(&library,
@@ -587,6 +591,8 @@ mod device_tests {
         bank.cache_measured(10);
         for key in 2..20 {
             let cache = bank.device.as_ref().unwrap().cache.clone();
+            cache.lock().unwrap().serial_boundary();
+            cache.lock().unwrap().serial_boundary();
             assert!(cache.lock().unwrap().mark_victim(false).is_some());
             // SAFETY: fixture executables own no captured buffers or native work.
             unsafe { bank.cache_evict_persistent(); }

@@ -671,7 +671,7 @@ thread_local! {
 }
 
 fn hit_epoch(device: i32, lane: usize, fallback: u64) -> u64 {
-    HIT_EPOCHS.with(|epochs| epochs.borrow().get(&device).map_or(fallback, |epochs| epochs[lane]))
+    HIT_EPOCHS.with(|epochs| epochs.borrow().get(&device).map_or(fallback, |epochs| epochs[lane].max(fallback)))
 }
 
 pub(crate) struct LaneCycles {
@@ -681,15 +681,17 @@ pub(crate) struct LaneCycles {
 }
 
 impl LaneCycles {
-    pub fn register(lane: usize,
+    pub fn register(lane: usize, concurrent_cycles: usize,
         mut visit: impl FnMut(&mut GraphVisitor<'_>) -> anyhow::Result<()>) -> anyhow::Result<Self> {
+        anyhow::ensure!((1..=2).contains(&concurrent_cycles) && lane < concurrent_cycles,
+            "invalid graph lane/concurrent cycle count");
         let mut devices = std::collections::BTreeSet::new();
         visit(&mut |device, _, _, bank| { bank.lane_owner(lane); devices.insert(device); Ok(()) })?;
         let devices: Vec<_> = devices.into_iter().collect();
         let clocks = devices.iter().filter_map(|&device| existing_cache(device))
             .map(|cache| {
                 let mut cache = cache.lock().unwrap_or_else(|p| p.into_inner());
-                cache.concurrent_cycles = 2;
+                cache.concurrent_cycles = concurrent_cycles as u64;
                 HIT_EPOCHS.with(|epochs| { epochs.borrow_mut().insert(cache.device,
                     cache.clocks.as_ref().each_ref().map(|clock| clock.index.load(Ordering::Acquire))); });
                 cache.clocks.clone()
@@ -2032,6 +2034,28 @@ mod tests {
     }
 
     #[test]
+    fn hot_stamp_without_thread_mirror_uses_locked_owner_epoch() {
+        std::thread::spawn(|| {
+            let mut cache = epoch_fixture();
+            cache.concurrent_cycles = 2;
+            cache.begin_lane(0);
+            let id = *cache.records.keys().next().unwrap();
+            HIT_EPOCHS.with(|epochs| { epochs.borrow_mut().remove(&cache.device); });
+            cache.hit(id);
+            assert_eq!(cache.records[&id].last_used, Some(cache.lanes[0].index));
+            assert!(cache.hot(&cache.records[&id]));
+            // A stale mirror is equally unable to move the stamp backwards.
+            HIT_EPOCHS.with(|epochs| { epochs.borrow_mut().insert(cache.device, [0; 2]); });
+            cache.hit(id);
+            assert_eq!(cache.records[&id].last_used, Some(cache.lanes[0].index));
+            assert!(cache.hot(&cache.records[&id]));
+            cache.complete_lane(0);
+            cache.begin_lane(0);
+            assert!(cache.hot(&cache.records[&id]), "hot through the K2 lag window");
+        }).join().unwrap();
+    }
+
+    #[test]
     fn hot_entries_are_not_selected_inside_k1_or_k2_lag_window() {
         for k in [1, 2] {
             let mut cache = epoch_fixture();
@@ -2447,6 +2471,8 @@ mod tests {
             let Miss::Capture(id) = cache.miss(key(n), capture_site, None, false) else { panic!() };
             cache.captured_topology(id, 10, 1, false);
             cache.measured_capture(3 * GRAPH_CHUNK);
+            cache.serial_boundary();
+            cache.serial_boundary();
             owners.push(id);
         }
         assert!(cache.soft.measured_bytes.is_none());
@@ -2470,6 +2496,8 @@ mod tests {
             assert_eq!(cache.pending_destroy, 0, "fitting hot set must settle above soft");
             assert_eq!((cache.soft.margin, cache.soft.measured_bytes, cache.soft.measured_nodes), frozen);
         }
+        cache.serial_boundary();
+        cache.serial_boundary();
         assert!(matches!(cache.miss(key(6), capture_site, None, false), Miss::Eager));
         let victims: Vec<_> = cache.records.iter().filter(|(_, r)| r.pending_destroy).map(|(&id, _)| id).collect();
         assert_eq!(victims.len(), 1, "incoming node reservation makes room before capture");
@@ -3011,6 +3039,8 @@ mod tests {
         let a = capture(&mut cache, 1, false);
         cache.captured_topology(a, 0, 1, false);
         cache.hit_cycle(a, Cycle::Verify);
+        cache.serial_boundary();
+        cache.serial_boundary();
         assert_eq!(cache.mark_victim(false), Some(a));
         cache.destroyed(&[a], ReleaseMeasurement { released: 0 });
         assert!(matches!(cache.miss(key(1), site(Preference::Capture), None, false), Miss::Capture(id) if id == a));
@@ -3270,6 +3300,8 @@ mod tests {
             assert!(matches!(cache.miss(key(n), node_site, estimate(1), false), Miss::Capture(_)));
         }
         cache.measured_capture(4 << 20);
+        cache.serial_boundary();
+        cache.serial_boundary();
         let mut victims = Vec::new();
         while let Some(id) = cache.mark_victim(false) { victims.push(id); }
         cache.destroyed(&victims, ReleaseMeasurement { released: 0 });

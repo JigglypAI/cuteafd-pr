@@ -126,7 +126,7 @@ async fn lane<'a, P: VerificationTarget<'a>, C: DraftChain<'a>>(lease: LaneLease
     prefixes: &RefCell<&mut PrefixCache<'a>>, receive: &mpsc::Receiver<NativeRequest>, wake: admission::Wake<'_>,
 ) -> Result<()> {
     let lane = lease.index();
-    let mut graph_cycles = crate::shared::decode_graph::device::LaneCycles::register(lane, |visit| {
+    let mut graph_cycles = crate::shared::decode_graph::device::LaneCycles::register(lane, 2, |visit| {
         pass.visit_lane_graphs(visit)?;
         if let Some(draft) = draft.borrow_mut().as_deref_mut() { draft.visit_lane_graphs(lane, visit)?; }
         Ok(())
