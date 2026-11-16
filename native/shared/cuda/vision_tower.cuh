@@ -126,7 +126,7 @@ int generic_norm(Owner* owner,const cuteafd_vision_tower_norm& norm,uint16_t* x,
   if(!norm.kind)return int(cudaMemcpyAsync(output,x,size_t(rows)*width*2,cudaMemcpyDeviceToDevice,owner->stream));
   uint32_t epsilon;std::memcpy(&epsilon,&norm.epsilon,sizeof(epsilon));
   std::string name="vision_tower_"+std::string(norm.kind==1?"layer_norm":"rms_norm")+"_h"+std::to_string(width);
-  return generic_program(owner,name,{x,owner->weights+norm.weight,norm.bias==UINT64_MAX?output:owner->weights+norm.bias,
+  return generic_program(owner,name,{x,owner->weights+norm.weight,norm.bias==UINT64_MAX?static_cast<void*>(output):static_cast<void*>(owner->weights+norm.bias),
     output},{uint64_t(rows),epsilon});
 }
 int generic_projection(Owner* owner,uint16_t* x,uint64_t weight,uint64_t bias,uint16_t* output,int rows,int input,int width) {
