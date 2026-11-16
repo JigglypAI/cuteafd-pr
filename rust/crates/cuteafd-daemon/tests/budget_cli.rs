@@ -554,8 +554,8 @@ fn run_installed_glm_exlr8_worker_budget(hf_home: Option<std::ffi::OsString>,
             let devices = deployment["memory_layout"]["devices"].as_array().unwrap().iter()
                 .filter(|device| device["kind"] == "spark").collect::<Vec<_>>();
             assert_eq!(devices.len(), ranks as usize);
-            let expected = explicit.map_or(108u64, |_| 104) << 30;
             for (rank, device) in devices.iter().enumerate() {
+                let expected = explicit.map_or_else(|| cuteafd_loader::serving_capacity::spark_memory::serving_bytes()[rank], |_| 104u64 << 30);
                 assert_eq!(device["index"], rank);
                 assert_eq!(device["worker_budget_bytes"], expected);
                 assert_eq!(device["capacity_bytes"], expected);
@@ -611,8 +611,8 @@ fn installed_flash_exlr8_bounded_spark_plans_preserve_worker_budget_and_capabili
             let devices = deployment["memory_layout"]["devices"].as_array().unwrap().iter()
                 .filter(|device| device["kind"] == "spark").collect::<Vec<_>>();
             assert_eq!(devices.len(), ranks as usize);
-            let expected = explicit.map_or(108u64, |_| 104) << 30;
             for (rank, device) in devices.iter().enumerate() {
+                let expected = explicit.map_or_else(|| cuteafd_loader::serving_capacity::spark_memory::serving_bytes()[rank], |_| 104u64 << 30);
                 assert_eq!(device["index"], rank);
                 assert_eq!(device["worker_budget_bytes"], expected);
                 assert_eq!(device["capacity_bytes"], expected);

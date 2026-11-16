@@ -375,6 +375,7 @@ fn vision_on_two_rtx_is_charged_by_the_joint_solve() {
     let input = testing::BudgetedPlanInput::open(dir.path()).unwrap();
     let plan = |ranks: usize, vision: MediaMode| {
         let mut options = layout_options(ranks, 2);
+        options.layout.as_mut().unwrap().spark_bytes = 108 << 30;
         options.vision = vision;
         options.layout.as_mut().unwrap().workspace_manifest = Some(manifest.clone());
         input.plan(&options).unwrap()
@@ -571,6 +572,7 @@ fn auto_vision_can_disable_inside_joint_ml4_capacity_solve() {
     let dir = snapshot(true, None);
     let input = testing::BudgetedPlanInput::open(dir.path()).unwrap();
     let mut options = layout_options(5, 2);
+    options.layout.as_mut().unwrap().spark_bytes = 108 << 30;
     options.vision = MediaMode::Auto;
     let layout = options.layout.as_mut().unwrap();
     layout.rtx_bytes = vec![52 << 30; 2];
