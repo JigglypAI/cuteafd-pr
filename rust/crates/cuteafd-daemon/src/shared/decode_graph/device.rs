@@ -1422,6 +1422,8 @@ impl DeviceCache {
 
     /// A source-only capture defers eviction and hard-stop admission until its
     /// exact native topology is known. It reserves no driver arena bytes.
+    /// Spanning prewarm records must never donate: after readiness their missing
+    /// shapes cannot be recaptured safely, so startup reuse would destroy coverage.
     pub(super) fn update_ticket(&mut self, identity: Identity, site: Site,
         estimate: Option<Estimate>, pinned: bool) -> Option<u64> {
         self.refresh_cycles();
@@ -1432,7 +1434,7 @@ impl DeviceCache {
         let hard = self.charged >= self.reserve;
         if self.reserve == 0 || self.measurement_failed || self.soft.limit == 0 ||
             site.preference == Preference::Eager || site.basis != self.basis ||
-            (site.spans_devices && cross_device_capture_sealed()) ||
+            site.spans_devices ||
             self.identities.get(&identity).is_some_and(|id| {
                 let r = &self.records[id];
                 r.pinned || r.pending_capture || r.pending_destroy || r.permanently_eager || r.oom.is_some() ||
@@ -1478,7 +1480,7 @@ impl DeviceCache {
     fn donor_age(&self, id: u64) -> Option<u64> {
         let record = self.records.get(&id)?;
         if record.pinned || record.pending_capture || record.pending_destroy ||
-            (record.spans_devices && cross_device_capture_sealed()) ||
+            record.spans_devices ||
             !matches!(record.list, Some(List::Recent | List::Frequent)) ||
             !self.native_graphs.contains_key(&id) { return None }
         let lane = self.bank_lane(record.identity.bank);
@@ -1524,7 +1526,7 @@ impl DeviceCache {
             loop {
                 let Some(id) = self.donor_candidates.get(signature)?.get(lane)?.first else { break };
                 let record = &self.records[&id];
-                if record.spans_devices && cross_device_capture_sealed() {
+                if record.spans_devices {
                     self.remove_donor_candidate(id);
                     continue;
                 }
@@ -2562,6 +2564,27 @@ mod tests {
         cache.charged = if hard { 1000 } else { 10 };
         (cache, donor)
     }
+    #[test]
+    fn donor_always_preserves_spanning_prewarm_set_at_ready() {
+        let (mut cache, first) = aged_update_fixture(5, false);
+        cache.records.get_mut(&first).unwrap().spans_devices = true;
+        cache.donor_always = true;
+        cache.soft.limit = 900;
+        let mut spanning = site(Preference::Capture);
+        spanning.spans_devices = true;
+        seal_cross_device_capture_on_this_thread(false);
+        assert!(cache.update_ticket(key(2), spanning, None, false).is_none());
+        assert!(cache.update_ticket(key(3), site(Preference::Capture), None, false).is_none());
+        let Miss::Capture(second) = cache.miss(key(2), spanning, None, false) else { panic!("prewarm capture") };
+        cache.measured_capture(10);
+        cache.register_native(second, 202, vec![3, 7, 11]);
+        seal_cross_device_capture_on_this_thread(true);
+        let intact = cache.owns(first, 1) && cache.owns(second, 1);
+        seal_cross_device_capture_on_this_thread(false);
+        assert!(intact, "readiness retains both spanning geometries instead of re-keying the first");
+        assert_eq!(cache.counters[&Cycle::Decode].donor_rekeys, 0);
+    }
+
     #[test]
     fn sealed_spanning_donor_cannot_transfer_to_a_local_requester() {
         let (mut cache, donor) = aged_update_fixture(5, false);
