@@ -189,6 +189,9 @@ def value(flag, default=None):
     return args[args.index(flag) + 1] if flag in args else default
 report = json.loads(REPORT)
 family, first, last = FAMILY, FIRST, LAST
+if "--resolve-settings-only" in args:
+    print(json.dumps(dict(speculator="dflash2", default_drafter="incoai/GLM-5.3-Flash-DFlash2")))
+    sys.exit(0)
 if family == "glm5_flash":
     # Launch coverage uses a whole-drafter plan, not a synthetic memory-fit decision.
     report["tp2_dflash"] = value("--tp2-dflash", "false") == "true"

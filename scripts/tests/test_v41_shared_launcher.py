@@ -129,8 +129,8 @@ def test_shared_launcher_matches_the_private_v41_path(case: str, tmp_root) -> No
         # The serve command is the same set of flags and values (clap ignores order;
         # --usage now precedes nothing it depends on).
         assert after["command"][:3] == before["command"][:3], where
-        planned_budget = {plan[plan.index("--coordinator-weight-budget-gib") + 1]
-                          for plan in current["plans"] if "--coordinator-weight-budget-gib" in plan}
+        planned_budget = {str(int(plan[plan.index("--gpu-memory-cap") + 1]) / 2**30)
+                          for plan in current["plans"] if "--gpu-memory-cap" in plan}
         # The planner's prefill waves and reserve reach the shared executor.
         value = lambda flag: after["command"][after["command"].index(flag) + 1]
         expected_command = before["command"] + (["--mapped-scale-preload-gib", "0",
@@ -626,7 +626,7 @@ def test_v41_serve_admits_weights_against_the_planned_budget(tmp_root) -> None:
 
     result = capture_module.capture(ROOT, "deepseek-v41-mxfp4-max")
     command = parse_run(result["containers"][0]["argv"])["command"]
-    budgets = {plan[plan.index("--coordinator-weight-budget-gib") + 1]
-               for plan in result["plans"] if "--coordinator-weight-budget-gib" in plan}
+    budgets = {str(int(plan[plan.index("--gpu-memory-cap") + 1]) / 2**30)
+               for plan in result["plans"] if "--gpu-memory-cap" in plan}
     assert len(budgets) == 1
     assert command[command.index("--coordinator-weight-budget-gib") + 1] == budgets.pop()

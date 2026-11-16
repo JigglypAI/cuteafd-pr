@@ -250,7 +250,9 @@ fn resolve_config(args: &mut PlanArgs, cfg: &std::collections::BTreeMap<String, 
             }
         };
     }
-    configured!(rtx, "RTX_GPUS");
+    if !args.explicit_settings.contains("rtx") {
+        if let Some(value) = get("RTX_GPUS").filter(|v| *v != "auto") { args.rtx = value.parse().context("RTX_GPUS")?; }
+    }
     configured!(attention_placement, "ATTENTION_PLACEMENT");
     configured!(prefill_rows, "PREFILL_ROWS");
     if args.pool_tokens.is_none() { args.pool_tokens = get("POOL_TOKENS").filter(|v| *v != "auto").map(|v| v.parse().context("POOL_TOKENS")).transpose()?; }
@@ -439,16 +441,20 @@ fn run_plan_with_host(mut args: PlanArgs) -> Result<()> {
             .snapshot_path
             .with_context(|| format!("no snapshot of {} under {}", args.model, hf_home.display()))?
     };
-    let view = args.attention.select(&snapshot)?;
+    // Settings-only performs one config read, never checkpoint selection or tensor I/O.
+    let family_config = if args.resolve_settings_only {
+        cuteafd_loader::read_json_file::<serde_json::Value>(&snapshot.join("config.json"))?
+    } else { args.attention.select(&snapshot)?.config()? };
     let cfg = launch_config(args.config.as_deref())?;
-    let family_config = view.config()?;
     let family = if args.resolve_settings_only && family_config["model_type"] == "glm5_next" {
         "glm5_flash"
-    } else if cuteafd_loader::plan::exlr8::recognizes(&snapshot)? {
+    } else if args.resolve_settings_only && family_config["model_type"].as_str().is_some_and(|v| v.starts_with("mimo")) {
+        "mimo_v2"
+    } else if !args.resolve_settings_only && cuteafd_loader::plan::exlr8::recognizes(&snapshot)? {
         cuteafd_loader::plan::exlr8::architecture(&family_config)?
     } else {
         let checkpoint = cuteafd_loader::plan::Checkpoint { view: None, snapshot: snapshot.clone(),
-            config: family_config.clone(), quantize_config: None, weight_map: Default::default(),
+            config: family_config, quantize_config: None, weight_map: Default::default(),
             tensors: vec![], missing_shards: vec![], shard_bytes: 0 };
         cuteafd_loader::plan::family::detect(&checkpoint).map_or("", |family| family.id())
     };
@@ -472,6 +478,7 @@ fn run_plan_with_host(mut args: PlanArgs) -> Result<()> {
     if family == "kimi_k3" && args.speculator == "dflash2" && args.drafter_snapshot.is_none() {
         args.drafter_snapshot = file_args(args.clone(), &snapshot)?.drafter_snapshot;
     }
+    let view = args.attention.select(&snapshot)?;
     let mut options = options(&args)?;
     if view.mode() == cuteafd_loader::plan::checkpoint::CoreView::Original && cuteafd_loader::plan::exlr8::recognizes(&snapshot)? {
         if args.spark_range {

@@ -1594,6 +1594,11 @@ if [[ -z "$speculator" ]]; then
     glmf_defaults="$(docker run --rm --network none -e "HF_HOME=$container_hf_home"       "${generic_worker_mounts[@]}" "${wip_mount_args[@]}" -v "$config:/run/cuteafd-plan.config:ro"       "$coordinator_image" cuteafd plan "$snapshot" --config /run/cuteafd-plan.config --resolve-settings-only)"
     speculator="$(jq -er '.speculator' <<<"$glmf_defaults")"
     default_drafter="$(jq -er '.default_drafter' <<<"$glmf_defaults")"
+    if [[ "$speculator" == off ]]; then
+      echo "warning: default drafter is unavailable (hf download $default_drafter); serving without a drafter" >&2
+    else
+      echo "note: GLM Flash drafts with $speculator ($default_drafter)" >&2
+    fi
   fi
   if [[ $speculator == off && $family == mimo_v2 ]]; then
     mimo_defaults="$(docker run --rm --network none -e "HF_HOME=$container_hf_home"       "${generic_worker_mounts[@]}" "${wip_mount_args[@]}" -v "$config:/run/cuteafd-plan.config:ro"       "$coordinator_image" cuteafd plan "$snapshot" --config /run/cuteafd-plan.config --resolve-settings-only)"

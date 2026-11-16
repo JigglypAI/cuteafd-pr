@@ -264,8 +264,8 @@ def test_deployment_preserves_release_container_commands(
         if old["host"] == "coordinator" and "--coordinator-weight-budget-gib" not in before["command"]:
             # Serve admits resident weights against the planner's budget; historical
             # captures predate passing it and fell back to the 80 GiB default.
-            planned = {plan[plan.index("--coordinator-weight-budget-gib") + 1]
-                       for plan in current["plans"] if "--coordinator-weight-budget-gib" in plan}
+            planned = {str(int(plan[plan.index("--gpu-memory-cap") + 1]) / 2**30)
+                       for plan in current["plans"] if "--gpu-memory-cap" in plan}
             assert len(planned) == 1, (entry["name"], planned)
             budget = planned.pop()
             command = after["command"]
