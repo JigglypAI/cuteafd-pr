@@ -4116,7 +4116,7 @@ def test_matched_prompts_refuses_arm_scoped_image_probe(entry, tmp_path, monkeyp
     kit.mkdir()
     (kit / 'matrix-main.json').write_text(json.dumps(dict(entries=[entry])))
     monkeypatch.setattr(sys, 'argv', ['wip-cards', '--kit', str(kit), '--cards', 'v41-min',
-        '--interleave', '--matched-prompts', '--arm', 'candidate=test:s',
+        '--interleave', '--matched-prompts', '--arm', 'candidate=test:s', '--arm', 'base=base:s',
         '--probe', f'candidate:v41-min:{probe}', '--state', str(tmp_path / 'state'), '--dry-run'])
     with pytest.raises(ValueError, match='image probe'):
         cards.main()
