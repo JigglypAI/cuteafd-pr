@@ -134,7 +134,7 @@ impl<'a> GlmfContextSplit<'a> {
         let (r0, s0, p0) = rank(0)?;
         let (r1, s1, p1) = rank(1)?;
         Ok(Self { admitted_pages: cuteafd_core::coordinator_programs::scored_decode::admitted_pages(
-            extent as u64, 256 as u64).try_into()?, ranks: [r0, r1], exchange, staging_units, partial: [p0, p1], sink: [s0, s1] })
+            extent as u64, cfg.index_kpool as u64 * 64).try_into()?, ranks: [r0, r1], exchange, staging_units, partial: [p0, p1], sink: [s0, s1] })
     }
 
     /// Bytes this split allocated on each GPU beside the exchange (the solver's "context
@@ -285,7 +285,7 @@ impl<'a> GlmfEngine<'a> {
                 let own = &e.context.as_ref().context("context split")?.ranks[rank];
                 let admitted = e.context.as_ref().context("context split")?.admitted_pages;
                 ensure!(admitted as u64 == cuteafd_core::coordinator_programs::scored_decode::admitted_pages(
-                    e.max_context as u64, 256), "selector deployment capacity changed after admission");
+                    e.max_context as u64, e.cfg.index_kpool as u64 * 64), "selector deployment capacity changed after admission");
                 let k = e.cfg.index_topk / KPOOL;
                 let candidates = Candidates { scores: own.candidates.buffer.ptr,
                     indices: view(&own.candidates, DECODE_ROWS * k * 4, self.t * k * 4)?.ptr };

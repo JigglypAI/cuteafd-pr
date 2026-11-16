@@ -702,6 +702,7 @@ mod tests {
             })?;
         }
         let decode = KimiIndexTopK::load(&programs, 64, 16384, KimiIndexMode::Decode, true)?;
+        decode.bind_admitted_pages(8192)?;
         let prefill = KimiIndexTopK::load(&programs, 4096, 16384, KimiIndexMode::Prefill, true)?;
         let merge = KimiCandidateMerge::load(&programs)?;
         let rows = 131;

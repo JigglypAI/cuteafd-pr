@@ -149,7 +149,7 @@ pub fn context_workspace(cfg: &GlmNextConfig, extent: u64, rows: u64, lanes: u64
     let mut out = vec![("candidates", decode * k * 8), ("local pools", decode * (k + 1) * 4),
         ("own-head partial", partial), ("peer-head partial", partial),
         ("scored top-k scratch", context.selector_tile.map_or(context.topk_scratch, |tile|
-            tile.bytes(cuteafd_core::coordinator_programs::scored_decode::admitted_pages(extent, 256))
+            tile.bytes(cuteafd_core::coordinator_programs::scored_decode::admitted_pages(extent, cfg.index_kpool as u64 * 64))
                 .expect("validated deployment selector capacity"))), ("partial scratch", context.partial_scratch),
         ("gather tables", gather)];
     out.extend((0..lanes).map(|_| ("commit blocks", 3 * 3 * context_commit_units(rows) * 8)));
