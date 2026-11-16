@@ -59,7 +59,8 @@ def packed(monkeypatch, tmp_path):
 def test_mistral_pointer_count_abi_is_the_shared_base():
     gate = load_gate()
     assert gate.Spec is gate.common.Spec and gate.Ledger is gate.common.Ledger
-    assert ctypes.sizeof(gate.Spec) == 256
+    assert ctypes.sizeof(gate.Spec) == 264
+    assert gate.Spec.perception.offset == 256
 
 
 def test_mistral_packer_matches_the_rust_tower_arena(monkeypatch, tmp_path):

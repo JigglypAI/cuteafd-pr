@@ -16,17 +16,22 @@ int main() {
       std::vector<cuteafd_vision_block> blocks(depth);
       std::vector<uint64_t> n1(depth,11),n2(depth,22),q(depth,33),k(depth,44);
       blocks.back().norm1=1234;
+      std::vector<uint64_t> scale1(depth,55),scale2(depth,66);
+      cuteafd_vision_perception perception{};
+      perception.scale1=scale1.data();perception.scale2=scale2.data();
       cuteafd_vision_spec spec{};
-      spec.storage_abi=3;spec.depth=depth;spec.blocks=blocks.data();
+      spec.storage_abi=4;spec.depth=depth;spec.blocks=blocks.data();
       spec.norm1_bias=n1.data();spec.norm2_bias=n2.data();
-      spec.q_norm=q.data();spec.k_norm=k.data();
+      spec.q_norm=q.data();spec.k_norm=k.data();spec.perception=&perception;
       if(!copy_spec(owner,spec) || owner.spec.blocks==spec.blocks ||
-         owner.spec.q_norm==spec.q_norm)return 1;
-      blocks.back().norm1=0;q.back()=0;
+         owner.spec.q_norm==spec.q_norm || owner.spec.perception==spec.perception ||
+         owner.spec.perception->scale1==perception.scale1)return 1;
+      blocks.back().norm1=0;q.back()=0;scale1.back()=0;scale2.back()=0;
     }
     if(owner.spec.depth!=depth || owner.spec.blocks[depth-1].norm1!=1234 ||
        owner.spec.norm1_bias[depth-1]!=11 || owner.spec.norm2_bias[depth-1]!=22 ||
-       owner.spec.q_norm[depth-1]!=33 || owner.spec.k_norm[depth-1]!=44)return 1;
+       owner.spec.q_norm[depth-1]!=33 || owner.spec.k_norm[depth-1]!=44 ||
+       owner.spec.perception->scale1[depth-1]!=55 || owner.spec.perception->scale2[depth-1]!=66)return 1;
   }
   int devices=0;
   if(cudaGetDeviceCount(&devices)!=cudaSuccess || !devices)return 77;

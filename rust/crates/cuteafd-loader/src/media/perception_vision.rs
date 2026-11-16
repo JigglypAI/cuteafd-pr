@@ -184,7 +184,9 @@ mod tests {
             let g = geometry(kind);
             let tensors = headers(g);
             assert_eq!(tensors.len(),count);
-            assert_eq!(g.resident_weights(tensors.iter()).unwrap(), tensors.iter().map(|t| t.byte_length).sum::<u64>());
+            let checkpoint_bytes = match kind { PerceptionKind::Inkling2 => 655_386_624, PerceptionKind::Step5 => 3_962_029_568 };
+            assert_eq!(g.resident_weights(tensors.iter()).unwrap(),checkpoint_bytes);
+            assert_eq!(checkpoint_bytes, tensors.iter().map(|t| t.byte_length).sum::<u64>());
             assert!(g.resident_weights(tensors.iter().skip(1)).is_err());
             let mut wrong = tensors.clone(); wrong[0].dtype = DType::F32;
             assert!(g.resident_weights(wrong.iter()).is_err());

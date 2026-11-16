@@ -104,6 +104,56 @@ impl TowerSpec {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn sparse_snapshot(inkling: bool) -> tempfile::TempDir {
+        use std::io::Write;
+        let directory = tempfile::tempdir().unwrap();
+        let cfg = if inkling { serde_json::json!({"model_type":"inkling2","text_config":{"hidden_size":4608},"vision_config":{
+            "hidden_size":1024,"num_hidden_layers":23,"num_attention_heads":16,"native_patch_size":20,
+            "temporal_patch_size":2,"adapter_merge_size":2,"projection_hidden_dim":4096,"posemb_grid_size":32,
+            "mlp_ratio":4.0,"projector_bias":false,"layer_norm_eps":1e-5}}) }
+            else { serde_json::json!({"model_type":"step5_vl","text_config":{"hidden_size":4096},
+            "image_token_len":169,"image_token_id":128001,"vision_config":{"model_type":"perception_encoder",
+            "width":1536,"layers":47,"heads":16,"image_size":728,"patch_size":14,"pool_type":"none",
+            "use_cls_token":false,"use_ln_post":false,"hidden_act":"quick_gelu"}}) };
+        let geometry = PerceptionGeometry::from_config(&cfg).unwrap();
+        std::fs::write(directory.path().join("config.json"),serde_json::to_vec(&cfg).unwrap()).unwrap();
+        let mut header = serde_json::Map::new();
+        let mut end = 0u64;
+        for (name,shape) in geometry.tensor_shapes() {
+            let bytes = shape.iter().product::<usize>() as u64*2;
+            header.insert(name,serde_json::json!({"dtype":"BF16","shape":shape,"data_offsets":[end,end+bytes]}));
+            end += bytes;
+        }
+        let bytes = serde_json::to_vec(&header).unwrap();
+        let mut file = File::create(directory.path().join("model.safetensors")).unwrap();
+        file.write_all(&(bytes.len() as u64).to_le_bytes()).unwrap();file.write_all(&bytes).unwrap();
+        file.set_len(8+bytes.len() as u64+end).unwrap();
+        directory
+    }
+    #[test]
+    fn header_only_builders_pack_every_native_tensor_and_scale() {
+        for inkling in [true,false] {
+            let directory = sparse_snapshot(inkling);
+            let tower = TowerSpec::perception(directory.path(),169).unwrap();
+            let pe = tower.native.perception.as_ref().unwrap();
+            assert_eq!(tower.reads.len(),if inkling {422} else {667});
+            assert_eq!(tower.native.depth,if inkling {23} else {47});
+            assert_eq!(pe.class_token,u32::from(inkling));
+            assert_eq!(pe.activation,u32::from(!inkling));
+            assert_eq!(pe.scale1.len(),tower.native.depth as usize);
+            assert_eq!(pe.scale2.len(),tower.native.depth as usize);
+            assert!(pe.scale1.iter().all(|offset| offset%256==0 && *offset<tower.native.weight_bytes));
+            assert!(tower.reads.iter().all(|read| !read.vector && read.destination%256==0));
+            assert!(tower.frequency_bytes().is_empty());
+            let contribution = push::Contribution::prepare(0,Some((&tower,0x100000)),None,None,None).unwrap();
+            let records = contribution.records();
+            assert_eq!(records.operands.len(),tower.reads.len());
+            assert!(records.steps.is_empty());
+            assert_eq!(records.operands.iter().map(|operand| operand.bytes as u64).sum::<u64>(),tower.native.weight_bytes);
+            assert!(TowerSpec::perception(directory.path(),0).is_err());
+            assert!(TowerSpec::perception(directory.path(),4097).is_err());
+        }
+    }
     #[test]
     fn native_pe_execution_is_not_advertised_before_oracles() {
         let source = include_str!("../vision.rs");

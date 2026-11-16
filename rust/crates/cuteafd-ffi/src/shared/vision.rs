@@ -327,7 +327,7 @@ impl NativeVision {
             crate::memory_ledger::fault::install(&library);
             let required = library.get::<Required>(b"cuteafd_vision_required")?;
             let mut ledger = VisionLedger::default();
-            check(required(&spec.raw()?, &mut ledger))?;
+            check(required(&spec.raw()?.raw, &mut ledger))?;
             Ok(ledger)
         }
     }
@@ -383,7 +383,7 @@ impl NativeVision {
             let create = *library.get::<Create>(b"cuteafd_vision_create")?;
             let upload = *library.get::<Upload>(b"cuteafd_vision_upload")?;
             let mut ledger = VisionLedger::default();
-            check(required(&spec.raw()?, &mut ledger))?;
+            check(required(&spec.raw()?.raw, &mut ledger))?;
             if ledger.total_bytes() > admitted_bytes {
                 return Err(VisionError::InvalidInput(
                     "vision weight/scratch admission shortfall",
@@ -402,7 +402,7 @@ impl NativeVision {
                 _thread: PhantomData,
             };
             let native = super::media_backings::NativeTags::new(tags).map_err(VisionError::Native)?;
-            let status = create(&spec.raw()?, device, admitted_bytes, &native.raw(), &mut result.owner);
+            let status = create(&spec.raw()?.raw, device, admitted_bytes, &native.raw(), &mut result.owner);
             // Each backing native still holds is recorded, success or not; on
             // failure Drop destroys the owner and retires what native frees.
             match super::media_backings::MediaBackings::created(&result._library, "cuteafd_vision", status,
