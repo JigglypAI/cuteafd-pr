@@ -1508,7 +1508,7 @@ impl DeviceCache {
         Some(transferred)
     }
 
-    fn cold_donor_for_request(&mut self, id: u64, request: &UpdateRequest) -> Option<u64> {
+    fn cold_donor_for_request(&mut self, id: u64, _request: &UpdateRequest) -> Option<u64> {
         let signature = self.take_native(id)?.signature;
         self.cold_donor(&signature)
     }
@@ -1636,6 +1636,8 @@ impl DeviceCache {
         if allowed && !vampire {
             // No CUDA query or ticket for a planned physical-headroom miss.
             if !self.physical_room(estimate, headroom) {
+                let counters = self.site_counters(site.name, site.cycle, identity.bank);
+                counters.eager_runs += 1; counters.physical_floor_skips += 1;
                 return self.floor_skip(old, site.cycle);
             }
             if !self.captured_since_observation {
@@ -1656,6 +1658,8 @@ impl DeviceCache {
             // the boundary precheck. Honor that sample without another query.
             if !self.physical_room(estimate, headroom) {
                 if !self.unmeasured { self.captured_since_observation = false; }
+                let counters = self.site_counters(site.name, site.cycle, identity.bank);
+                counters.eager_runs += 1; counters.physical_floor_skips += 1;
                 return self.floor_skip(old, site.cycle);
             }
             let new_nodes = metadata.nodes.filter(|nodes| *nodes > 0)
@@ -2530,6 +2534,55 @@ mod tests {
         assert!(cache.cold_donor(&[3, 7, 11]).is_none());
         assert!(cache.donor_candidates.values().all(|lanes| lanes.iter().all(|lane|
             lane.first.is_none_or(|id| cache.donor_age(id).is_none()))));
+    }
+
+    #[test]
+    fn k_boundary_is_identical_at_soft_and_hard_caps() {
+        for hard in [false, true] {
+            for k in [1, 2] {
+                for age in 0..=k + 1 {
+                    let (mut cache, donor) = aged_update_fixture(age, hard);
+                    cache.lane_max_cycles[0] = k;
+                    assert_eq!(cache.cold_donor(&[3, 7, 11]), (age > k).then_some(donor));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn fifo_tracks_same_epoch_hits_reassignment_and_retirement() {
+        let (mut cache, old) = aged_update_fixture(5, false);
+        let young = capture(&mut cache, 2, false);
+        cache.register_native(young, 303, vec![3, 7, 11]);
+        cache.hit(old);
+        let queue = &cache.donor_candidates[&vec![3, 7, 11]][0];
+        assert_eq!((queue.first, queue.last), (Some(young), Some(old)));
+        cache.hit(young);
+        cache.hit(old);
+        // Equal stamps may appear in either order; both are hot.
+        assert!(cache.cold_donor(&[3, 7, 11]).is_none());
+        cache.assign_bank_lane(1, 1);
+        assert!(cache.donor_candidates[&vec![3, 7, 11]][0].first.is_none());
+        let ids = [old, young];
+        cache.remove_drained(&ids);
+        assert!(cache.cold_donor(&[3, 7, 11]).is_none());
+    }
+
+    #[test]
+    fn per_site_activity_uses_only_registered_owner_cycles() {
+        let mut cache = test_cache(-1033, 1000);
+        cache.assign_bank_lane(1, 1);
+        let id = capture(&mut cache, 1, false);
+        cache.hit(id);
+        cache.pinned_hits(id, Cycle::Decode, 3);
+        cache.begin_lane(0); cache.complete_lane(0);
+        let snapshot = cache.snapshot();
+        let counters = snapshot.update_sites["test"][&Cycle::Decode];
+        assert_eq!((counters.hits, counters.misses, counters.captures), (4, 1, 1));
+        let rates = &snapshot.per_cycle["test"][&Cycle::Decode];
+        assert_eq!(rates.owner_cycles, cache.clocks[1].completed.load(Ordering::Acquire));
+        assert_eq!(rates.hits, 4.0 / rates.owner_cycles as f64);
+        assert_eq!(rates.segments_launched, 0.0, "lookups and captures are not launches");
     }
 
     #[test]

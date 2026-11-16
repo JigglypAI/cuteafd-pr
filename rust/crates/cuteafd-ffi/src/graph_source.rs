@@ -157,16 +157,24 @@ mod tests {
         // SAFETY: CPU fixture has no CUDA work or operand pointers.
         let source = unsafe { library.cuda_graph_capture_source(std::ptr::null_mut())? };
         let donor = source.instantiate(std::ptr::null_mut())?;
+        let counts = library.graph_launch_query()?;
+        assert_eq!(counts.sample(donor as usize), 0);
+        // SAFETY: fixture submits no device work.
+        unsafe { library.cuda_graph_launch(donor, std::ptr::null_mut())?; }
+        assert_eq!(counts.sample(donor as usize), 1);
         let before = library.cuda_memory_info()?;
         assert!(source.update(donor as usize)?.accepted());
         let receiver = source.transfer(donor as usize)? as *mut c_void;
         assert_ne!(receiver, donor);
+        assert_eq!(counts.sample(donor as usize), 1);
+        assert_eq!(counts.sample(receiver as usize), 0);
         // SAFETY: fixture handles are valid; donor must reject, receiver survives.
         unsafe {
             assert!(library.cuda_graph_launch(donor, std::ptr::null_mut()).is_err());
             library.cuda_graph_exec_destroy(donor)?;
             library.cuda_graph_launch(receiver, std::ptr::null_mut())?;
         }
+        assert_eq!(counts.sample(receiver as usize), 1);
         assert_eq!(before, library.cuda_memory_info()?);
         // SAFETY: receiver exclusively owns the still-live executable.
         unsafe { library.cuda_graph_exec_destroy(receiver)?; }

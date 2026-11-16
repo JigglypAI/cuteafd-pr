@@ -1822,11 +1822,12 @@ extern "C" cuteafd_status_t cuteafd_cuda_graph_end_capture_topology(
 
 #if CUTEAFD_NATIVE_ENABLE_CUDA
 namespace {
-struct GraphHandle { cudaGraphExec_t exec; uint64_t launches = 0; };
+struct GraphHandle { cudaGraphExec_t exec; std::atomic<uint64_t> launches{0}; };
 std::mutex graph_handles_mutex;
 std::unordered_map<void*, std::unique_ptr<GraphHandle>> graph_handles;
 void* own_graph_exec(cudaGraphExec_t exec) {
-  auto handle = std::make_unique<GraphHandle>(GraphHandle{exec});
+  auto handle = std::make_unique<GraphHandle>();
+  handle->exec = exec;
   void* key = reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(handle.get()) | uintptr_t(1));
   graph_handles.emplace(key, std::move(handle));
   return key;
@@ -2120,7 +2121,7 @@ extern "C" cuteafd_status_t cuteafd_cuda_graph_launch(void* cuda_graph_exec, voi
   if (err != cudaSuccess) {
     return fail_cuda(CUTEAFD_STATUS_INTERNAL_ERROR, "cudaGraphLaunch failed", err);
   }
-  if (counted) ++counted->launches;
+  if (counted) counted->launches.fetch_add(1, std::memory_order_relaxed);
   return ok();
 #else
   return fail(CUTEAFD_STATUS_CUDA_UNAVAILABLE,
@@ -2136,7 +2137,7 @@ extern "C" cuteafd_status_t cuteafd_cuda_graph_launch_count(void* exec, uint64_t
   std::lock_guard<std::mutex> guard(graph_handles_mutex);
   const auto found = graph_handles.find(exec);
   if (found == graph_handles.end()) return fail(CUTEAFD_STATUS_INVALID_ARGUMENT, "unknown graph handle");
-  *out = found->second->launches;
+  *out = found->second->launches.load(std::memory_order_relaxed);
   return ok();
 #else
   return fail(CUTEAFD_STATUS_CUDA_UNAVAILABLE, "graph launch count unavailable");
