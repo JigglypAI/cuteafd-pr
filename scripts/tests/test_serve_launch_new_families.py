@@ -41,7 +41,7 @@ def _kimi(tmp_path: Path, keys: str = "", *, wip: bool = True, **kwargs):
 
 def _line(result, needle: str) -> str:
     assert result.returncode == 0, result.stderr
-    return next(line for line in result.stderr.splitlines() if needle in line)
+    return next(line for line in result.stderr.splitlines() if needle in line and "--resolve-settings-only" not in line)
 
 
 def _flag(line: str, flag: str) -> str | None:
@@ -232,6 +232,20 @@ def test_kimi_dflash2_uses_one_resolved_fp8_snapshot_for_plan_and_serve(tmp_path
     else:
         assert all(flag not in serve.split() for flag in ("--draft", "--draft-fp8", "--draft-length"))
         assert all(flag not in plan.split() for flag in ("--drafter-snapshot", "--draft-fp8"))
+
+
+@pytest.mark.parametrize("cache", ["bf16", "fp8"])
+def test_kimi_dspark_uses_resolved_native_weights_and_independent_draft_kv(tmp_path: Path, cache) -> None:
+    model, revision = "Inferact/Kimi-K3.1-Pro-DSpark", "e4e6e6261e9f8b6d5f249f9627eb6b109d762d5f"
+    _snapshot(tmp_path / "hf", model, {}, revision=revision)
+    result = _kimi(tmp_path, f"SPECULATOR=dspark\nDRAFT_KV_CACHE={cache}\n")
+    serve = _line(result,"serve-kimi --snapshot")
+    plan = next(line for line in result.stderr.splitlines() if "cuteafd plan" in line and "--deployment" in line)
+    assert _flag(serve,"--draft") == _flag(plan,"--drafter-snapshot")
+    assert _flag(serve,"--draft-fp8") == "false"
+    assert _flag(serve,"--draft-kv-cache") == _flag(plan,"--draft-kv-cache") == cache
+    assert _flag(plan,"--speculator") == "dspark"
+    assert _flag(serve,"--tp2-dflash") != "true"
 
 
 @pytest.mark.parametrize("selection,expected", [(None, "true"), ("off", "false"), ("on", "true")])

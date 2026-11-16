@@ -130,7 +130,7 @@ impl<'a> KimiPrefix<'a> {
     pub(crate) fn snapshot_owners(&self) -> Vec<Rc<Allocation<'a>>> {
         self.0.mla.iter().flat_map(|bank| bank.owners())
             .chain(self.0.kda.iter().filter_map(|bank| bank.mark_owner()))
-            .chain(self.0.draft.iter().filter_map(|draft| draft.mark_owner())).collect()
+            .chain(self.0.draft.iter().flat_map(|draft| draft.mark_owners())).collect()
     }
 
     fn validate(&self, placement: &Placement, len: usize) -> Result<()> {
@@ -281,7 +281,7 @@ impl PrefixFamily<SnapshotMeta> for KimiPrefix<'_> {
     fn capture_draft_pages(&self, placement: &Placement, len: usize)
         -> Result<Option<cuteafd_engine::prefix::DraftPageAttachment>, BoxError> {
         let Some(draft) = &self.0.draft else { return Ok(None) };
-        if draft.frontier(placement.slot)? != (0, len) { return Ok(None); }
+        if draft.common().is_block() || draft.frontier(placement.slot)? != (0, len) { return Ok(None); }
         let _scope = draft.device().enter()?;
         draft.common().capture_mla_pages(placement.slot, len, len).map(Some)
     }
@@ -300,6 +300,11 @@ impl PrefixFamily<SnapshotMeta> for KimiPrefix<'_> {
     fn restore_draft_pages(&self, attachment: Option<&cuteafd_engine::prefix::DraftPageAttachment>,
         placement: &mut Placement, frontier: usize) -> Result<(), BoxError> {
         let Some(draft) = &self.0.draft else { return Ok(()) };
+        if draft.common().is_block() {
+            if attachment.is_some() { return Err("window draft cannot restore page attachment".into()); }
+            if draft.frontier(placement.slot)?.1 != frontier { draft.reset(placement.slot,frontier)?; }
+            return Ok(());
+        }
         if let Some(attachment) = attachment {
             if attachment.origin != 0 || attachment.frontier != frontier { return Err("Kimi noncanonical draft snapshot".into()); }
             draft.drain()?;

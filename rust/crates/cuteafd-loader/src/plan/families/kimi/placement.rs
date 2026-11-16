@@ -6,6 +6,12 @@ use crate::placement::families::kimi::{self, ExpertProfile, FixedOwner, KimiReci
 use crate::{placement::*, plan::{Component, ExpertPlacement, PlanReport}};
 use cuteafd_core::memory_layout::{Basis, Category, DeviceKind, DeviceLayout, Item, MemoryLayout};
 
+fn raw_speculator_is_block(snapshot:Option<&std::path::Path>)->bool {
+    snapshot.and_then(|s|std::fs::read(s.join("config.json")).ok())
+        .and_then(|b|serde_json::from_slice::<serde_json::Value>(&b).ok())
+        .is_some_and(|v|v["speculators_model_type"]=="dspark")
+}
+
 const GIB: u64 = 1 << 30;
 const COMPILED_CAPACITY: u64 = crate::families::kimi_k3::COMPILED_CONTEXT as u64;
 const PAGE: u64 = 64;
@@ -172,9 +178,12 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
         let extra = (|| -> anyhow::Result<_> {
             use crate::families::kimi_k3::{allocation, core};
             // Speculative verify graphs replay at each exact width up to the drafter's block.
-            let verify = opts.kimi_drafter_snapshot.as_ref().map(|snapshot|
-                crate::formats::dflash::MlaDflashConfig::read(snapshot).map(|draft| draft.block))
-                .transpose()?.unwrap_or(0);
+            let verify = opts.kimi_drafter_snapshot.as_ref().map(|snapshot| -> anyhow::Result<usize> {
+                let raw: serde_json::Value = serde_json::from_slice(&std::fs::read(snapshot.join("config.json"))?)?;
+                if raw["speculators_model_type"] == "dspark" {
+                    Ok(crate::formats::block_dspark::BlockDsparkConfig::from_json(&raw)?.block + 1)
+                } else { Ok(crate::formats::dflash::MlaDflashConfig::from_json(&raw)?.block) }
+            }).transpose()?.unwrap_or(0);
             let attention_heads = if matches!(attention, AttentionPlacement::Heads | AttentionPlacement::Context)
                 && gpus == 2 { 48 } else { 96 };
             let mut demands = allocation::baseline_demands_for_ranks(cfg, manifest, rows, shape, context as usize,
@@ -278,17 +287,42 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
     let draft = opts.kimi_drafter_snapshot.as_ref().map(|snapshot| -> anyhow::Result<_> {
         use crate::{families::glm5::draft_representation::{GlmDraftCapacity, GlmDraftRepresentation},
             formats::dflash::MlaDflashConfig};
-        let draft = MlaDflashConfig::read(snapshot)?;
-        anyhow::ensure!(draft.mla.hidden == cfg.hidden && draft.vocab == cfg.vocab_size
-            && draft.taps.iter().all(|&layer| layer < cfg.layers), "Kimi drafter target geometry differs from checkpoint");
-        anyhow::ensure!(!opts.tp2_dflash || gpus == 2,
-            "Kimi TP2 DFlash requires two physical coordinator GPUs");
+        use crate::families::kimi_k3::draft::DraftLayout;
+        let raw: serde_json::Value = serde_json::from_slice(&std::fs::read(snapshot.join("config.json"))?)?;
         let slots = usize::try_from(slots)?;
-        let representation = if opts.kimi_draft_fp8 { GlmDraftRepresentation::Fp8Only }
-            else { GlmDraftRepresentation::Bf16Only };
-        let layout = draft.runtime_layout(representation, GlmDraftCapacity::new(slots, slots.min(8), draft.block)?,
-            usize::try_from(context)?, slots.checked_mul(usize::try_from(context)?).context("draft pool overflow")?, opts.physical_sms.unwrap_or(188) as usize, 0, opts.mla_kv)?.with_context_split(opts.tp2_dflash)?;
-        fixed.extend(crate::families::kimi_k3::draft_bridge_demands_for_ranks(&layout, rows, gpus)?);
+        let layout = if raw["speculators_model_type"] == "dspark" {
+            anyhow::ensure!(!opts.kimi_draft_fp8 && !opts.tp2_dflash,
+                "block dSpark uses native BF16 weights and physical GQA head splits, not TP2_DFLASH");
+            if gpus==2 {
+                let rank=|rank|crate::formats::block_dspark::BlockDsparkRuntimeLayout::for_rank(snapshot,
+                    slots,slots.min(8),opts.physical_sms.unwrap_or(188) as usize,&format!("kimi/draft/{rank}"),
+                    opts.draft_kv_cache,rank,2,head_rank);
+                DraftLayout::BlockTp2 { ranks:Box::new([rank(0)?,rank(1)?]),lead:head_rank }
+            } else {
+                DraftLayout::Block(crate::formats::block_dspark::BlockDsparkRuntimeLayout::with_kv(snapshot,
+                    slots,slots.min(8),opts.physical_sms.unwrap_or(188) as usize,&format!("kimi/draft/{head_rank}"),opts.draft_kv_cache)?)
+            }
+        } else {
+            let draft = MlaDflashConfig::from_json(&raw)?;
+            anyhow::ensure!(!opts.tp2_dflash || gpus == 2,
+                "Kimi TP2 DFlash requires two physical coordinator GPUs");
+            let representation = if opts.kimi_draft_fp8 { GlmDraftRepresentation::Fp8Only }
+                else { GlmDraftRepresentation::Bf16Only };
+            DraftLayout::Mla(draft.runtime_layout(representation, GlmDraftCapacity::new(slots, slots.min(8), draft.block)?,
+                usize::try_from(context)?,slots.checked_mul(usize::try_from(context)?).context("draft pool overflow")?,
+                opts.physical_sms.unwrap_or(188) as usize,0,opts.mla_kv)?.with_context_split(opts.tp2_dflash)?)
+        };
+        match &layout {
+            DraftLayout::Block(local)=>{ local.validate_projection_programs(manifest.as_ref().context("block dSpark requires installed projection inventory")?)?; }
+            DraftLayout::BlockTp2 { ranks,.. }=>{ for local in ranks.iter() {
+                local.validate_projection_programs(manifest.as_ref().context("block TP2 requires installed projection inventory")?)?;
+            } }
+            DraftLayout::Mla(_)=>{}
+        }
+        anyhow::ensure!(layout.target_hidden() == cfg.hidden && layout.target_vocab() == cfg.vocab_size
+            && layout.target_taps().iter().all(|&layer| layer < cfg.layers),
+            "Kimi drafter target geometry differs from checkpoint");
+        fixed.extend(crate::families::kimi_k3::draft::bridge_demands(&layout, rows, gpus)?);
         fixed.push(crate::families::kimi_k3::draft_probe_demand(cfg.layers, cfg.topk, 64)?);
         // A K6 vocabulary head has no BF16 operand to borrow: the drafter owns
         // a head-only K6 scratch on the head rank.
@@ -299,13 +333,12 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
                 fixed.push(demand);
             }
         }
-        let bytes = layout.window_mark_bytes()? as u64;
-        if bytes > 0 && legacy_marks > 0 {
-            let per_mark = Demand::new(head_rank as u8, Category::Prefix, "Kimi exact draft windows", bytes, Basis::Exact);
-            let mut total = per_mark.clone();
-            total.bytes = bytes.checked_mul(legacy_marks).context("Kimi draft mark overflow")?;
-            fixed.push(total);
-            mark_demands.push(per_mark);
+        for per_mark in layout.window_mark_demands(head_rank as u8)? {
+            if legacy_marks>0 {
+                let mut total=per_mark.clone();
+                total.bytes=total.bytes.checked_mul(legacy_marks).context("Kimi draft mark overflow")?;
+                fixed.push(total); mark_demands.push(per_mark);
+            }
         }
         Ok(layout)
     }).transpose();
@@ -441,7 +474,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
         }
     };
     let draft = match &draft {
-        Some(layout) => match kimi::draft_facts(layout, page_rows, maximum_pages, head_rank as u8) {
+        Some(layout) => match kimi::draft_layout_facts(layout, page_rows, maximum_pages, head_rank as u8) {
             Ok(value) => Some(value),
             Err(error) => { report.refuse_placement(format!("Kimi native MLA draft inventory refused: {error:#}"),
                 "Provide a supported MLA DFlash2 checkpoint and matching native representation."); return memory; }
@@ -531,7 +564,8 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
     };
     recipe.owners.push(kimi::host_scoring_owner(scoring_bytes, maximum_pages));
     recipe.owners.push(kimi::host_upload_owner(maximum_pages));
-    match kimi::stream_slab_owners(gpus, maximum_pages) {
+    match kimi::stream_slab_owners_with_block(gpus,maximum_pages,
+        raw_speculator_is_block(opts.kimi_drafter_snapshot.as_deref()) && gpus==2) {
         Ok(owners) => recipe.owners.extend(owners),
         Err(error) => { report.refuse_placement(format!("Kimi stream slab owners refused: {error}"),
             "Use supported coordinator stream counts."); return memory; }

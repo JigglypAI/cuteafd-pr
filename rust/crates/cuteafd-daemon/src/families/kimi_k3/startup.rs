@@ -161,13 +161,26 @@ pub(crate) fn load<'a, const RANKS: usize>(library: &'a Arc<cuteafd_ffi::NativeL
     ensure!(RANKS == 2 || !options.draft.as_ref().is_some_and(|draft| draft.tp2_dflash),
         "Kimi TP2 DFlash requires two physical coordinator GPUs");
     let draft_layout = options.draft.as_ref().map(|draft| devices[head].run(||
-        draft.layout(options.slots, options.max_context, library.sm_count()?))).transpose()?;
+        draft.layout(options.slots, options.max_context, library.sm_count()?,head))).transpose()?;
     // Resolve native modules before the measured baseline, while retaining their handles.
-    let _draft_modules = options.draft.as_ref().map(|_| devices[head].run(|| {
+    let _draft_modules = options.draft.as_ref().filter(|_| matches!(draft_layout,
+        Some(cuteafd_loader::families::kimi_k3::draft::DraftLayout::Mla(_)))).map(|_| devices[head].run(|| {
         use cuteafd_ffi::mla_draft::{MlaDraft, MlaDraftWindow};
         Ok([MlaDraft::load(programs, "kimik3", MlaDraftWindow::Full, options.cache_format)?,
             MlaDraft::load(programs, "kimik3", MlaDraftWindow::Sliding4096, options.cache_format)?])
     })).transpose()?;
+    let _block_projection_modules=if let Some(layout)=&draft_layout {
+        use cuteafd_loader::families::kimi_k3::draft::DraftLayout;
+        let locals=match layout {
+            DraftLayout::Block(local)=>vec![(head,local)],
+            DraftLayout::BlockTp2 { ranks,.. }=>ranks.iter().enumerate().collect(),
+            DraftLayout::Mla(_)=>Vec::new(),
+        };
+        locals.into_iter().map(|(rank,local)|devices[rank].run(|| {
+            let rows=2048usize.max(local.capacity.block_rows).max(programs.capacities().decode_rows.unwrap_or(0));
+            Ok(cuteafd_ffi::draft_projection::DraftProjections::load(programs,&local.projection_shapes(),rows)?)
+        })).collect::<Result<Vec<_>>>()?
+    } else { Vec::new() };
     memory.sample("modules-draft-mla")?;
     let _draft_context_modules = if draft_layout.as_ref().is_some_and(|layout| layout.context_split()) {
         use cuteafd_ffi::mla_draft::{MlaDraftPartial, MlaDraftCombine, MlaDraftWindow};
@@ -266,7 +279,7 @@ pub(crate) fn load<'a, const RANKS: usize>(library: &'a Arc<cuteafd_ffi::NativeL
         }
     }
     if let Some(layout) = &draft_layout {
-        fixed.extend(cuteafd_loader::families::kimi_k3::draft_bridge_demands_for_ranks(layout, rows, RANKS)?);
+        fixed.extend(cuteafd_loader::families::kimi_k3::draft::bridge_demands(layout, rows, RANKS)?);
         fixed.push(cuteafd_loader::families::kimi_k3::draft_probe_demand(cfg.layers, cfg.topk, rows.min(64))?);
         if core.projections.contains_key("language_model.lm_head") {
             if let Some(mut demand) = cuteafd_loader::families::kimi_k3::core::draft_head_demand(&core,

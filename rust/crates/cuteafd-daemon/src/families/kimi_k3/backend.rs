@@ -13,6 +13,7 @@ pub(crate) struct DraftState {
     anchor: Option<u32>,
     ready: bool,
     valid_from: usize,
+    confidence: Vec<f32>,
 }
 impl scheduler::DraftState for DraftState {
     fn pending_rows(&self) -> usize { usize::from(self.ready && self.anchor.is_some()) }
@@ -210,6 +211,7 @@ impl<'e, 'a> Backend<'a> for KimiBackend<'e, 'a> {
         let draft = self.engine.native_draft().ok_or_else(|| anyhow::anyhow!("Kimi drafter was not admitted"))?;
         let started = std::time::Instant::now();
         let mut output = vec![Vec::new(); sequences.len()];
+        for sequence in sequences.iter_mut() { sequence.seq.confidence.clear(); }
         let selected = sequences.iter().enumerate().filter(|(_, seq)| seq.depth > 0)
             .map(|(index, seq)| {
                 ensure!(seq.seq.ready && seq.depth <= draft.drafts(), "Kimi draft continuation is cold or too wide");
@@ -222,12 +224,16 @@ impl<'e, 'a> Backend<'a> for KimiBackend<'e, 'a> {
             let proposals = draft.propose(&rows)?;
             ensure!(proposals.len() == batch.len(), "Kimi draft output count differs from batch");
             for ((index, _), proposal) in batch.iter().zip(proposals) {
+                sequences[*index].seq.confidence = proposal.confidence;
                 output[*index] = proposal.tokens.into_iter().take(sequences[*index].depth).collect();
             }
             timing.steps += 1;
         }
         timing.seconds += started.elapsed().as_secs_f64();
         Ok(output)
+    }
+    fn draft_evidence<'d>(&self,draft:&'d DraftState)->Option<&'d [f32]> {
+        self.engine.native_draft().filter(|d|d.common().is_block()).map(|_|draft.confidence.as_slice())
     }
     fn accept(&self, verified: &mut [scheduler::Verified<'_, Placement, DraftState, ()>], speculative: bool)
         -> Result<()> {
@@ -670,7 +676,7 @@ mod tests {
                 pool_tokens: args.pool_tokens, graphs: true, ffn_mode: cuteafd_ffi::KimiFfnMode::default(),
                 hosted_layers: None, draft: Some(super::super::draft::Options {
                     snapshot: args.draft.clone().context("native packing gate requires --draft")?,
-                    fp8: args.draft_fp8, tp2_dflash: args.tp2_dflash, cache_format: args.kv_cache }), verify_rows: 0, prefix: Some(&args.prefix),
+                    fp8: args.draft_fp8, tp2_dflash: args.tp2_dflash, cache_format: args.kv_cache, draft_kv_cache: args.draft_kv_cache }), verify_rows: 0, prefix: Some(&args.prefix),
                 prove_serve_admission: false })?;
         let engine = &loaded.engine;
         let backend = KimiBackend::new(engine)?;

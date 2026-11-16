@@ -26,7 +26,18 @@ checkpoint are also qualified. MC revision `1455b31b` corrects compact-view
 metadata (unchanged weight shards); older `d6c4b6ce` compact views refuse (#2118).
 K8 remains Planned and whole-core FP8 refuses.
 K3 DFlash2 hidden-state compatibility remains independently unqualified.
-The minimum configuration remains blocked by #2082, without cap/pool workarounds.
+Inferact block dSpark integration is tracked in #2261: native BF16 weights,
+checkpoint-derived 2,048-token GQA window, rank-512 Markov confidence, shared
+policy/executor and target embedding/head. `SPECULATOR=dspark` is opt-in and
+still refuses until full-model served lossless speculation is qualified; the
+default stays off. TP1 runs on one RTX; TP2 splits 96 query/16 KV heads to
+48/8 per rank and splits FFN neurons, with private exchange flags and local
+per-rank prefix marks. FC/norms are replicated, Markov/confidence on the head.
+`DRAFT_KV_CACHE` selects FP8 (default) or BF16 independently of target KV.
+One-RTX K6 fit depends on pool/context and Spark capacity: the matched
+766,784-token pool at the measured post-reboot Spark capacity fits the
+Inferact drafter with two onboarded layers. The default 108 GiB Spark budget
+can refuse this configuration; #2082 tracks measured-cap admission.
 
 Full-model BF16/K6 fidelity is accepted. TJ accepted partial paired scoring
 coverage explicitly: Layers 26 decode windows and Context 51 windows

@@ -45,9 +45,16 @@ impl<'a> WindowSnapshots<'a> {
         let (stride, bytes) = Self::bytes(&planes, marks)?;
         let arena = Rc::new(device::Allocation::new(stream.device, bytes,
             Tag::prefix("shared/draft-window-snapshots"))?);
-        let copies = crate::shared::prefix::PrefixCopies::new(stream.device.library,
-            vec![vec![crate::shared::prefix::Reader { device: stream.device.id, stream: stream.raw }]])?;
-        Ok(Self { copies, arena, planes, stride, marks })
+        Self::with_backing(crate::shared::prefix::Reader { device:stream.device.id,stream:stream.raw },arena,planes,marks)
+    }
+
+    pub fn with_backing(reader:crate::shared::prefix::Reader,arena:Rc<device::Allocation<'a>>,
+        planes:Vec<usize>,marks:usize)->Result<Self> {
+        let (stride,bytes)=Self::bytes(&planes,marks)?;
+        ensure!(arena.device.id==reader.device && arena.buffer.bytes==bytes,
+            "window mark backing differs from admitted physical owner");
+        let copies=crate::shared::prefix::PrefixCopies::new(arena.device.library,vec![vec![reader]])?;
+        Ok(Self { copies,arena,planes,stride,marks })
     }
 
     pub fn backing(&self) -> Rc<device::Allocation<'a>> { Rc::clone(&self.arena) }
@@ -117,19 +124,24 @@ impl<'a> WindowSnapshots<'a> {
     pub unsafe fn restore(&self, mark: usize, live: &[CuteafdDeviceBuffer], frontier: usize)
         -> Result<(usize, usize)> {
         let copies = self.parts(mark, live, false)?;
-        self.copies.drain()?;
-        let saved = self.mark(mark)?;
-        let mut metadata = [0u8; 16];
-        self.arena.device.run(|| self.arena.device.library.copy_d2h(&mut metadata,
-            CuteafdDeviceBuffer { bytes: 16, ..saved }))?;
-        let origin = usize::try_from(u64::from_le_bytes(metadata[..8].try_into()?))?;
-        let end = usize::try_from(u64::from_le_bytes(metadata[8..].try_into()?))?;
-        ensure!(origin <= end && end == frontier, "window snapshot metadata/frontier differs");
+        let (origin,end)=self.metadata(mark)?;
+        ensure!(end == frontier, "window snapshot metadata/frontier differs");
         // SAFETY: caller retains the initialized mark and destination planes.
         unsafe { self.copies.copy_d2d(&copies)?; }
         Ok((origin, end))
     }
 
+    pub fn metadata(&self,mark:usize)->Result<(usize,usize)> {
+        self.copies.drain()?;
+        let saved=self.mark(mark)?;
+        let mut bytes=[0u8;16];
+        self.arena.device.run(||self.arena.device.library.copy_d2h(&mut bytes,
+            CuteafdDeviceBuffer { bytes:16,..saved }))?;
+        let origin=usize::try_from(u64::from_le_bytes(bytes[..8].try_into()?))?;
+        let end=usize::try_from(u64::from_le_bytes(bytes[8..].try_into()?))?;
+        ensure!(origin<=end,"window snapshot metadata invalid");
+        Ok((origin,end))
+    }
     pub fn drain(&self) -> Result<()> { self.copies.drain() }
 }
 
@@ -436,6 +448,15 @@ struct DraftLayer<'a> {
     v_ring: Dev<'a>,
 }
 
+struct MarkovHead<'a> {
+    w1:Dev<'a>, w2:Dev<'a>, norms:Dev<'a>, confidence_w:Dev<'a>, confidence_b:Dev<'a>,
+}
+struct HeadWorkspace<'a> {
+    logits:Dev<'a>,tokens:Dev<'a>,confidence:Dev<'a>,markov:Dev<'a>,
+    landing:crate::shared::memory::HostAllocation<'a>,
+    head:Option<VocabularyHead<'a>>, _head_workspace:Dev<'a>,
+}
+
 struct Workspace<'a> {
     sequences: usize,
     h: Dev<'a>,
@@ -448,20 +469,15 @@ struct Workspace<'a> {
     delta: Dev<'a>,
     gate_up: Dev<'a>,
     act: Dev<'a>,
-    logits: Dev<'a>,
+    output: Option<HeadWorkspace<'a>>,
     anchors: Dev<'a>,
     ids: Dev<'a>,
-    tokens: Dev<'a>,
-    confidence: Dev<'a>,
-    /// Pinned landing of `tokens` then `confidence`: both download behind the
-    /// round's one host wait.
-    landing: crate::shared::memory::HostAllocation<'a>,
     positions: Dev<'a>,
     tables: Dev<'a>,
     attention_workspace: Dev<'a>,
-    markov_workspace: Dev<'a>,
-    head: Option<VocabularyHead<'a>>,
-    _head_workspace: Dev<'a>,
+}
+impl<'a> Workspace<'a> {
+    fn output(&self)->Result<&HeadWorkspace<'a>> { self.output.as_ref().context("peer block drafter has no head workspace") }
 }
 
 /// The target head inside a draft step.
@@ -475,6 +491,7 @@ enum HeadRef<'h> {
 enum DraftInput<'r, 'e> {
     Rows(&'r [u8]),
     Table(&'r TokenEmbedding<'e>),
+    Launch(&'r dyn Fn(&[u32], CuteafdDeviceBuffer, *mut c_void) -> Result<()>),
 }
 
 /// The tensors a dSpark draft reads (everything but the checkpoint's copies
@@ -547,12 +564,13 @@ pub(crate) struct DsparkDrafter<'a> {
     fc: Matrix<'a>,
     hidden_norm: Dev<'a>,
     norm: Dev<'a>,
-    markov_w1: Dev<'a>,
-    markov_w2: Dev<'a>,
-    /// Row norms of `markov_w2` (FP32): the exact pruning bound of the Markov argmax.
-    markov_norms: Dev<'a>,
-    confidence_w: Dev<'a>,
-    confidence_b: Dev<'a>,
+    head: Option<MarkovHead<'a>>,
+    head_split: Option<super::gqa_tp2::GqaHeadSplit<'a,DsparkDrafter<'a>>>,
+    // Target producer streams outlive the family draft; events fence every private wait.
+    cooperative_producers:Vec<(crate::shared::peer_split::RankDevice,device::Event<'a>)>,
+    physical_rank:usize,
+    physical_ranks:usize,
+    lead:usize,
     layers: Vec<DraftLayer<'a>>,
     /// [TAP_ROWS, taps * hidden] BF16: the last step's tapped rows.
     pub taps: Dev<'a>,
@@ -572,6 +590,8 @@ pub(crate) struct DsparkDrafter<'a> {
     /// How the FP8 GEMMs run (--draft-linear), and the latest mode the FP8 scratch serves.
     fp8_rows: Cell<fp8_linear::Fp8Rows>,
     fp8_admitted: fp8_linear::Fp8Rows,
+    // Shared exchange drops before this peer stream, whose device body it borrows.
+    peer_stream:Option<device::Stream<'a>>,
 }
 
 fn at(dev: &Dev<'_>, bytes: usize) -> *mut c_void {
@@ -607,11 +627,45 @@ impl<'a> DsparkDrafter<'a> {
                 owner.inventory(inventory, &format!("{prefix}.layer.{index}.{name}"))?;
             }
         }
-        for (name, owner) in [("hidden_norm", &self.hidden_norm), ("norm", &self.norm), ("markov_w1", &self.markov_w1),
-            ("markov_w2", &self.markov_w2), ("markov_norms", &self.markov_norms), ("confidence_w", &self.confidence_w),
-            ("confidence_b", &self.confidence_b)] { owner.inventory(inventory, &format!("{prefix}.{name}"))?; }
+        for (name,owner) in [("hidden_norm",&self.hidden_norm),("norm",&self.norm)] { owner.inventory(inventory,&format!("{prefix}.{name}"))?; }
+        if let Some(head)=&self.head {
+            for (name,owner) in [("markov_w1",&head.w1),("markov_w2",&head.w2),("markov_norms",&head.norms),
+                ("confidence_w",&head.confidence_w),("confidence_b",&head.confidence_b)] { owner.inventory(inventory,&format!("{prefix}.{name}"))?; }
+        }
         if let Some(owner) = &self.inv_freq { owner.inventory(inventory, &format!("{prefix}.inv_freq"))?; }
         Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn load_tp2_with(library:&'a NativeLibrary,programs:&'a cuteafd_ffi::programs::Programs<'a>,
+        target_projection:super::dflash::TargetProjection,snapshot:&Path,slots:usize,sequences:usize,
+        kv:cuteafd_loader::families::qwen4::Qwen4KvCache,
+        devices:[i32;2],lead_stream:*mut c_void,lead:usize,
+        mut allocate:impl FnMut(i32,&str,usize)->Result<device::Allocation<'a>>)->Result<Self> {
+        ensure!(lead<2 && library.cuda_get_device()?==devices[lead] && !lead_stream.is_null(),"block TP2 current device differs from lead");
+        let peer_stream=device::Stream::new(device::Device { library,id:devices[1-lead] })?;
+        let rank_streams=std::array::from_fn(|rank|crate::shared::peer_split::RankDevice {
+            device:devices[rank],stream:if rank==lead { lead_stream } else { peer_stream.raw } });
+        let slot=cuteafd_loader::formats::block_dspark::BLOCK_TP2_EXCHANGE_BYTES;
+        let exchange=Rc::new(crate::shared::peer_split::PeerExchange::new_abortable(library,rank_streams,1,slot,slot)?);
+        exchange.trace_identity("block-dspark-tp2-private");
+        let cfg=DsparkConfig::read(snapshot)?;
+        let window=cfg.window.context("block TP2 requires sliding window")?;
+        let mut load=|rank,projection|Self::load_rank_with(library,programs,projection,snapshot,HashMap::new(),
+            exchange.stream(rank),slots,sequences,vec![0;cfg.hidden*2],GlmDraftRepresentation::Bf16Only,
+            fp8_linear::Fp8Scales::Amax,fp8_linear::Fp8Rows::W8a16,window,slots*window,kv,None,
+            rank,2,lead,&mut allocate);
+        let mut body=load(lead,target_projection)?;
+        let peer_device=device::Device { library,id:exchange.device(1-lead) };
+        let peer=peer_device.own(||load(1-lead,super::dflash::TargetProjection::Native).map(Box::new))?;
+        body.prepare_workspace()?;
+        peer.device.run(||peer.prepare_workspace())?;
+        let bytes=sequences.checked_mul(cfg.block).and_then(|n|n.checked_mul(cfg.hidden)).and_then(|n|n.checked_mul(2))
+            .context("block TP2 reduce extent overflow")?;
+        body.head_split=Some(super::gqa_tp2::GqaHeadSplit::new(peer,exchange,lead,bytes,
+            [Tag::drafter_workspace("shared/block-dspark-reduce"),Tag::transport("shared/block-dspark-reduce")])?);
+        body.peer_stream=Some(peer_stream);
+        Ok(body)
     }
 
     /// Uploads the drafter's tensors (see [`prefetch`]) and allocates `slots`
@@ -704,8 +758,28 @@ impl<'a> DsparkDrafter<'a> {
         scales: fp8_linear::Fp8Scales, fp8_rows: fp8_linear::Fp8Rows, context_capacity: usize, target_tokens: usize,
         kv_cache: cuteafd_loader::families::qwen4::Qwen4KvCache, native_rope: Option<(CuteafdDeviceBuffer,usize)>,
         allocate: &mut WeightAllocator<'a, '_>) -> Result<Self> {
+        Self::load_rank_with(library,programs,target_projection,snapshot,tensors,stream,slots,max_sequences,
+            mask_row,representation,scales,fp8_rows,context_capacity,target_tokens,kv_cache,native_rope,
+            0,1,0,allocate)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn load_rank_with(library:&'a NativeLibrary,programs:&'a cuteafd_ffi::programs::Programs<'a>,
+        target_projection:super::dflash::TargetProjection,snapshot:&Path,tensors:HashMap<String,Vec<u8>>,
+        stream:*mut c_void,slots:usize,max_sequences:usize,mask_row:Vec<u8>,representation:GlmDraftRepresentation,
+        scales:fp8_linear::Fp8Scales,fp8_rows:fp8_linear::Fp8Rows,context_capacity:usize,target_tokens:usize,
+        kv_cache:cuteafd_loader::families::qwen4::Qwen4KvCache,native_rope:Option<(CuteafdDeviceBuffer,usize)>,
+        physical_rank:usize,physical_ranks:usize,lead:usize,allocate:&mut WeightAllocator<'a,'_>)->Result<Self> {
         let _memory_scope = cuteafd_ffi::memory_ledger::scope("drafter");
-        let cfg = DsparkConfig::read(snapshot)?;
+        let mut cfg = DsparkConfig::read(snapshot)?;
+        ensure!(matches!(physical_ranks,1|2) && physical_rank<physical_ranks && lead<physical_ranks,
+            "invalid block physical rank inventory");
+        if physical_ranks==2 {
+            ensure!(native_rope.is_none() && representation==GlmDraftRepresentation::Bf16Only
+                && cfg.window.is_some() && cfg.heads%2==0 && cfg.kv_heads%2==0 && cfg.intermediate%2==0,
+                "block TP2 requires checkpoint-native BF16 GQA with divisible heads/neurons");
+            cfg.heads/=2; cfg.kv_heads/=2; cfg.intermediate/=2;
+        }
         ensure!(cfg.backbone.is_qwen3(cfg.head_dim) == native_rope.is_none(),
             "dSpark backbone needs its declared native arithmetic bindings");
         let h = cfg.hidden;
@@ -732,7 +806,7 @@ impl<'a> DsparkDrafter<'a> {
             context_capacity, target_tokens, kv_cache)?;
         tracing::info!(resident_bytes = residency.owned, scratch_bytes = residency.scratch, kv_cache = %kv_cache, "dSpark shared readiness inventory");
         ensure!((1..=MAX_SEQUENCES).contains(&max_sequences), "dSpark drafts take 1..={MAX_SEQUENCES} sequences");
-        let load = if native_rope.is_some() { Load::open(library, snapshot)? }
+        let load = if native_rope.is_some() || physical_ranks==2 { Load::open(library, snapshot)? }
             else { Load::with_tensors(library, snapshot, tensors)? }.with_allocator(allocate);
         let native_shapes = [(h, cfg.q_width()), (h,cfg.kv_width()), (cfg.q_width(),h),
             (h,cfg.intermediate), (cfg.intermediate,h)];
@@ -749,7 +823,17 @@ impl<'a> DsparkDrafter<'a> {
             Ok(allocation)
         };
         let (h, kv, inter) = (cfg.hidden, cfg.kv_width(), cfg.intermediate);
-        let weights = weight_recipe(snapshot, |name, shape| load.tensor(name, shape),
+        let weights=if physical_ranks==2 {
+            let source=cuteafd_loader::formats::block_dspark::BlockDsparkConfig::read(snapshot)?;
+            cuteafd_loader::formats::block_dspark::block_dspark_rank_recipe(&source,physical_rank,physical_ranks,lead,
+                |name,shape|load.tensor(name,shape),|parts,columns,axis| {
+                    match axis {
+                        Some(axis)=>load.matrix_shard(parts,columns,axis,physical_rank,physical_ranks,false,scales,stream),
+                        None=>load.matrix(parts,columns,false,scales,stream),
+                    }.map(Matrix::Legacy)
+                })?
+        } else {
+            let weights = weight_recipe(snapshot, |name, shape| load.tensor(name, shape),
             |parts, cols| {
                 if let Some(workspace) = &native_workspace {
                     if parts.len() == 1 && parts[0].0.ends_with("dspark.fc.weight") {
@@ -759,6 +843,10 @@ impl<'a> DsparkDrafter<'a> {
                 }
                 load.matrix(parts, cols, representation == GlmDraftRepresentation::Fp8Only, scales, stream).map(Matrix::Legacy)
             })?;
+            cuteafd_loader::formats::block_dspark::BlockDsparkRankWeights { layers:weights.layers,fc:weights.fc,
+                hidden_norm:weights.hidden_norm,norm:weights.norm,
+                head:Some((weights.markov_w1,weights.markov_w2,weights.confidence_w,weights.confidence_b)) }
+        };
         let layers = weights.layers.into_iter().map(|layer| -> Result<_> {
             Ok(DraftLayer { input_norm: layer.input_norm, post_norm: layer.post_norm, qkv: layer.qkv,
                 q_norm: layer.q_norm, k_norm: layer.k_norm, o: layer.o, gate_up: layer.gate_up, down: layer.down,
@@ -774,8 +862,11 @@ impl<'a> DsparkDrafter<'a> {
                 Some(fp8_linear::scratch_rows(library, TAP_ROWS.max(max_sequences * cfg.block), &shapes, fp8_rows)?)
             }
         };
-        let markov_norms = load.allocation("markov_norms", cfg.vocab * 4)?;
-        load.row_norms(weights.markov_w2.buffer, markov_norms.buffer, cfg.vocab, cfg.rank, stream)?;
+        let head=weights.head.map(|(w1,w2,confidence_w,confidence_b)|->Result<_> {
+            let norms=load.allocation("markov_norms",cfg.vocab*4)?;
+            load.row_norms(w2.buffer,norms.buffer,cfg.vocab,cfg.rank,stream)?;
+            Ok(MarkovHead { w1,w2,norms,confidence_w,confidence_b })
+        }).transpose()?;
         Ok(Self {
             kv_cache,
             library,
@@ -799,8 +890,7 @@ impl<'a> DsparkDrafter<'a> {
             inv_freq: if native_rope.is_some() { None } else {
                 cfg.rotary.as_ref().map(|plan| upload("inv_freq", bytes_of(&plan.inv_freq))).transpose()? },
             fc: weights.fc, hidden_norm: weights.hidden_norm, norm: weights.norm,
-            markov_w1: weights.markov_w1, markov_w2: weights.markov_w2, markov_norms,
-            confidence_w: weights.confidence_w, confidence_b: weights.confidence_b,
+            head,head_split:None,cooperative_producers:Vec::new(),physical_rank,physical_ranks,lead,
             layers,
             taps: zeroed(TAP_ROWS * taps * 2, Tag::drafter_workspace("shared/dspark-taps"))?,
             fused: zeroed(TAP_ROWS * h * 2, Tag::drafter_workspace("shared/dspark-context-update"))?,
@@ -816,6 +906,7 @@ impl<'a> DsparkDrafter<'a> {
             head_mode: Cell::new(DraftHead::Exact),
             fp8_rows: Cell::new(fp8_rows),
             fp8_admitted: fp8_rows,
+            peer_stream:None,
             cfg,
         })
     }
@@ -844,18 +935,33 @@ impl<'a> DsparkDrafter<'a> {
             for (name,owner) in [("h",&workspace.h),("n",&workspace.n),("qkv",&workspace.qkv),
                 ("q",&workspace.q),("k",&workspace.k),("v",&workspace.v),("attn",&workspace.attn),
                 ("delta",&workspace.delta),("gate_up",&workspace.gate_up),("act",&workspace.act),
-                ("logits",&workspace.logits),("anchors",&workspace.anchors),("ids",&workspace.ids),
-                ("tokens",&workspace.tokens),("confidence",&workspace.confidence),("positions",&workspace.positions),
-                ("tables",&workspace.tables),("head",&workspace._head_workspace),
-                ("attention",&workspace.attention_workspace),("markov",&workspace.markov_workspace)] {
+                ("anchors",&workspace.anchors),("ids",&workspace.ids),("positions",&workspace.positions),
+                ("tables",&workspace.tables),("attention",&workspace.attention_workspace)] {
                 owner.inventory(&mut inventory,&format!("workspace.{name}"))?;
             }
-            inventory.pinned("workspace.landing",workspace.landing.buffer)?;
+            if let Some(output)=&workspace.output {
+                for (name,owner) in [("logits",&output.logits),("tokens",&output.tokens),("confidence",&output.confidence),
+                    ("head",&output._head_workspace),("markov",&output.markov)] {
+                    owner.inventory(&mut inventory,&format!("workspace.{name}"))?;
+                }
+                inventory.pinned("workspace.landing",output.landing.buffer)?;
+            }
         }
         for receipt in &mut inventory.receipts {
             if receipt.allocation.id.starts_with(&format!("{prefix}..")) {
                 receipt.allocation.id = receipt.allocation.id.replacen("..",".",1);
             }
+        }
+        if let Some(split)=&self.head_split {
+            split.reduced.inventory(&mut inventory,"tp2.reduced")?;
+            split.peer.device.run(||split.peer_reduced.inventory(&mut inventory,"peer.tp2.reduced"))?;
+            let mut transport=receipts::Inventory::new(devices,prefix,
+                Lifetime { first:Phase::DraftLoad,last:Phase::Growth },Category::Transport,"block dSpark private exchange");
+            for (rank,name,buffer) in split.exchange.allocation_buffers() {
+                transport.device(&format!("tp2.exchange.{rank}.{name}"),buffer)?;
+            }
+            inventory.receipts.extend(transport.receipts);
+            inventory.receipts.extend(split.peer.device.run(||split.peer.runtime_receipts(devices,&format!("{prefix}.peer")))?);
         }
         Ok(inventory.receipts)
     }
@@ -891,10 +997,10 @@ impl<'a> DsparkDrafter<'a> {
                 out.push((format!("layer.{index}.{name}"), owner.buffer));
             }
         }
-        for (name, owner) in [("hidden_norm", &self.hidden_norm), ("norm", &self.norm), ("markov_w1", &self.markov_w1),
-            ("markov_w2", &self.markov_w2), ("markov_norms", &self.markov_norms), ("confidence_w", &self.confidence_w),
-            ("confidence_b", &self.confidence_b)] {
-            out.push((name.into(), owner.buffer));
+        for (name,owner) in [("hidden_norm",&self.hidden_norm),("norm",&self.norm)] { out.push((name.into(),owner.buffer)); }
+        if let Some(head)=&self.head {
+            for (name,owner) in [("markov_w1",&head.w1),("markov_w2",&head.w2),("markov_norms",&head.norms),
+                ("confidence_w",&head.confidence_w),("confidence_b",&head.confidence_b)] { out.push((name.into(),owner.buffer)); }
         }
         out
     }
@@ -1016,7 +1122,7 @@ impl<'a> DsparkDrafter<'a> {
 
     /// Writes the context K/V of committed tapped rows (in tap-row order).
     pub fn update(&self, rows: &[ContextRow]) -> Result<()> {
-        self.on_device(|| self.update_on_device(rows))
+        self.checked(||self.on_device(|| self.update_on_device(rows)))
     }
 
     fn update_on_device(&self, rows: &[ContextRow]) -> Result<()> {
@@ -1057,6 +1163,21 @@ impl<'a> DsparkDrafter<'a> {
             for row in rows {
                 slots[row.tap_row - first] = self.cfg.context_row(row.slot, row.position, self.slots,
                     self.context_capacity)?;
+            }
+        }
+        self.order_cooperative_producers()?;
+        if let Some(split)=&self.head_split {
+            if !rows.is_empty() {
+                let first=rows.iter().map(|r|r.tap_row).min().unwrap();
+                let last=rows.iter().map(|r|r.tap_row).max().unwrap();
+                let stride=self.cfg.taps.len()*self.cfg.hidden*2;
+                split.exchange.push_to(split.lead,crate::shared::peer_split::DIRECT,
+                    self.taps.buffer.ptr.wrapping_byte_add(first*stride),
+                    split.peer.taps.buffer.ptr.wrapping_byte_add(first*stride),(last-first+1)*stride)?;
+                split.exchange.wait(1-split.lead,crate::shared::peer_split::DIRECT)?;
+                split.peer.device.run(||split.peer.update_on_device(rows))?;
+                split.exchange.signal(1-split.lead,crate::shared::peer_split::DIRECT)?;
+                split.exchange.wait(split.lead,crate::shared::peer_split::DIRECT)?;
             }
         }
         self.put(&self.context_positions, bytes_of(&positions))?;
@@ -1119,6 +1240,7 @@ impl<'a> DsparkDrafter<'a> {
     }
 
     fn reset_context_on_device(&self, slot: usize, origin: usize) -> Result<()> {
+        if let Some(split)=&self.head_split { split.peer.device.run(||split.peer.reset_context_on_device(slot,origin))?; }
         ensure!(slot < self.slots && origin <= self.context_capacity, "block dSpark reset outside admission");
         if let Some(context) = &self.paged {
             // SAFETY: retire the previous request before releasing its page ownership.
@@ -1127,7 +1249,7 @@ impl<'a> DsparkDrafter<'a> {
             state.discard(slot)?;
             state.bindings[slot] = Some(state.pool.bind(slot, origin)?);
         } else if origin == 0 {
-            for plane in self.window_planes(slot)? {
+            for plane in self.window_planes(slot)?.into_iter().filter(|p|p.device_id==self.hidden_norm.buffer.device_id) {
                 // SAFETY: fresh slot admission precedes every new consumer;
                 // zero preserves deterministic inactive bytes for exact marks.
                 unsafe { self.library.cuda_zero_bytes_async(plane,plane.bytes,self.stream)?; }
@@ -1141,6 +1263,7 @@ impl<'a> DsparkDrafter<'a> {
     }
 
     fn discard_context_on_device(&self, slot: usize) -> Result<()> {
+        if let Some(split)=&self.head_split { split.peer.device.run(||split.peer.discard_context_on_device(slot))?; }
         ensure!(slot < self.slots, "block dSpark discard outside admission");
         if let Some(context) = &self.paged {
             // SAFETY: cancellation cannot recycle destinations still read by queued work.
@@ -1272,6 +1395,12 @@ impl<'a> DsparkDrafter<'a> {
                 addr: at(plane, page.index as usize * bytes) as u64, bytes }).collect())
     }
 
+    pub(crate) fn window_readers(&self)->Vec<crate::shared::prefix::Reader> {
+        let mut readers=vec![crate::shared::prefix::Reader { device:self.hidden_norm.buffer.device_id,stream:self.stream }];
+        if let Some(split)=&self.head_split { readers.extend(split.peer.window_readers()); }
+        readers.sort_by_key(|r|r.device); readers
+    }
+
     /// Slot-local physical planes, including inactive bytes, for exact window
     /// snapshots. No tap replay or weight-dependent reconstruction is involved.
     pub(crate) fn window_planes(&self, slot: usize) -> Result<Vec<CuteafdDeviceBuffer>> {
@@ -1280,11 +1409,13 @@ impl<'a> DsparkDrafter<'a> {
         let bytes = self.context_capacity.checked_mul(self.kv_cache.plane_record_bytes(
             self.cfg.kv_heads, self.cfg.head_dim)).context("block dSpark window extent overflow")?;
         let offset = slot.checked_mul(bytes).context("block dSpark window offset overflow")?;
-        self.layers.iter().flat_map(|layer| [&layer.k_ring, &layer.v_ring]).map(|plane| {
+        let mut planes=self.layers.iter().flat_map(|layer| [&layer.k_ring, &layer.v_ring]).map(|plane| {
             ensure!(offset.checked_add(bytes).is_some_and(|end| end <= plane.buffer.bytes),
                 "block dSpark window plane outside retained backing");
             Ok(CuteafdDeviceBuffer { ptr: at(plane, offset), bytes, ..plane.buffer })
-        }).collect()
+        }).collect::<Result<Vec<_>>>()?;
+        if let Some(split)=&self.head_split { planes.extend(split.peer.device.run(||split.peer.window_planes(slot))?); }
+        Ok(planes)
     }
 
     fn copy_pages(&self, copies: &[cuteafd_engine::prefix::TailCopy]) -> Result<()> {
@@ -1316,6 +1447,72 @@ impl<'a> DsparkDrafter<'a> {
         })
     }
 
+    pub(crate) fn bind_cooperative_producers(&mut self,producers:&[crate::shared::peer_split::RankDevice])->Result<()> {
+        if let Some(split)=&self.head_split {
+            ensure!(producers.len()==2 && self.cooperative_producers.is_empty(),"block cooperative producers already bound/missing");
+            for (rank,&producer) in producers.iter().enumerate() {
+                let event=device::Event::new(device::Device { library:self.library,id:producer.device })?;
+                split.exchange.require_cooperative_producer_event(rank,producer,event.device.id,event.raw)?;
+                self.cooperative_producers.push((producer,event));
+            }
+        }
+        Ok(())
+    }
+    fn order_cooperative_producers(&self)->Result<()> {
+        if let Some(split)=&self.head_split {
+            ensure!(self.cooperative_producers.len()==2,"block TP2 producer events must be bound before exchange waits");
+            for (rank,(producer,event)) in self.cooperative_producers.iter().enumerate() {
+                split.exchange.require_cooperative_producer_event(rank,*producer,event.device.id,event.raw)?;
+                event.device.run(|| {
+                    // SAFETY: the target retains this producer stream and this
+                    // event through draft retirement; waiter is its local private stream.
+                    unsafe {
+                        self.library.cuda_event_record(event.raw,producer.stream)?;
+                        self.library.cuda_stream_wait_event(split.exchange.stream(rank),event.raw)
+                    }
+                })?;
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn require_live(&self)->Result<()> {
+        self.head_split.as_ref().map_or(Ok(()),|s|s.exchange.require_live())
+    }
+    pub(crate) fn abort(&self)->Result<()> {
+        use crate::shared::peer_split::TerminalState;
+        self.head_split.as_ref().map_or(Ok(()),|s|match s.exchange.terminal_state() {
+            TerminalState::Aborting|TerminalState::Drained=>Ok(()),
+            _=>s.exchange.publish_abort(),
+        })
+    }
+    pub(crate) fn finish_terminal(&self,drained:bool) {
+        if let Some(split)=&self.head_split {
+            if split.exchange.terminal_state()==crate::shared::peer_split::TerminalState::Aborting {
+                split.exchange.finish_terminal(drained);
+            }
+        }
+    }
+    pub(crate) fn checked<T>(&self,work:impl FnOnce()->Result<T>)->Result<T> {
+        self.require_live()?;
+        match work() {
+            Ok(value)=>Ok(value),
+            Err(error)=>match self.abort() {
+                Ok(())=>Err(error),
+                Err(abort)=>Err(error.context(format!("block draft abort publication failed: {abort:#}"))),
+            }
+        }
+    }
+
+    pub(crate) fn drain(&self) -> Result<()> {
+        self.on_device(|| {
+            // SAFETY: this owner retains its stream and every draft operand through retirement.
+            unsafe { self.library.cuda_stream_synchronize(self.stream)?; }
+            if let Some(split)=&self.head_split { split.peer.device.run(||split.peer.drain())?; }
+            Ok(())
+        })
+    }
+
     /// Explicit serving startup admission; other callers retain lazy allocation.
     pub(crate) fn prepare_workspace(&self) -> Result<()> {
         if self.workspace.borrow().is_none() {
@@ -1334,7 +1531,19 @@ impl<'a> DsparkDrafter<'a> {
         let c = &self.cfg;
         let rows = sequences * c.block;
         let alloc = |bytes: usize| DeviceAllocation::new(self.library, bytes.max(256), Tag::drafter_workspace("shared/dspark"));
-        let head_workspace = alloc(VOCABULARY_HEAD_WORKSPACE)?;
+        let output=if self.head.is_some() {
+            let head_workspace=alloc(VOCABULARY_HEAD_WORKSPACE)?;
+            Some(HeadWorkspace {
+                logits:alloc(rows*c.vocab*4)?,tokens:alloc(rows*4)?,confidence:alloc(rows*4)?,
+                markov:alloc(self.library.glmf_dspark_markov_workspace(sequences,c.block)?)?,
+                landing:crate::shared::memory::HostAllocation::new(self.library,rows*8,Tag::staging("shared/dspark-landing"))?,
+                head:if self.target_projection==super::dflash::TargetProjection::Bf16 {
+                    // SAFETY: retained head workspace outlives the borrowed vocabulary handle.
+                    Some(unsafe { self.library.vocabulary_head_rows(head_workspace.buffer.ptr,c.hidden as u32,
+                        rows as u32,c.vocab as u32,cuteafd_ffi::programs::HeadMode::Gemm)? })
+                } else { None },_head_workspace:head_workspace,
+            })
+        } else { None };
         let attention_workspace = {
             let _scope = cuteafd_ffi::memory_ledger::scope("workspace/draft-attention");
             alloc(self.library.block_dspark_attention_workspace(sequences, c.heads, c.kv_heads, c.block,
@@ -1352,23 +1561,78 @@ impl<'a> DsparkDrafter<'a> {
             delta: alloc(rows * c.hidden * 2)?,
             gate_up: alloc(rows * 2 * c.intermediate * 2)?,
             act: alloc(rows * c.intermediate * 2)?,
-            logits: alloc(rows * c.vocab * 4)?,
+            output,
             anchors: alloc(sequences * 4)?,
             ids: alloc(rows * 4)?,
-            tokens: alloc(rows * 4)?,
-            confidence: alloc(rows * 4)?,
-            landing: crate::shared::memory::HostAllocation::new(self.library, rows * 8, Tag::staging("shared/dspark-landing"))?,
             positions: alloc(rows * 8)?,
             tables: alloc(3 * sequences * 4)?,
             attention_workspace,
-            markov_workspace: alloc(self.library.glmf_dspark_markov_workspace(sequences, c.block)?)?,
-            head: if self.target_projection == super::dflash::TargetProjection::Bf16 {
-                // SAFETY: the retained scratch drops after the borrowed native head.
-                Some(unsafe { self.library.vocabulary_head_rows(head_workspace.buffer.ptr, c.hidden as u32,
-                    rows as u32, c.vocab as u32, cuteafd_ffi::programs::HeadMode::Gemm)? })
-            } else { None },
-            _head_workspace: head_workspace,
         })
+    }
+
+    fn forward_tp2(&self,w:&Workspace<'a>,split:&super::gqa_tp2::GqaHeadSplit<'a,Self>,
+        positions:&[i64],tables:&[i32],sequences:usize,max_keys:usize)->Result<()> {
+        use crate::shared::peer_split::DIRECT;
+        self.order_cooperative_producers()?;
+        let rows=sequences*self.cfg.block; let h=self.cfg.hidden;
+        let peer_work=split.peer.workspace.borrow(); let pw=peer_work.as_ref().context("block TP2 peer scratch not prepared")?;
+        split.peer.device.run(|| { split.peer.put(&pw.positions,bytes_of(positions))?; split.peer.put(&pw.tables,bytes_of(tables)) })?;
+        split.exchange.push_to(split.lead,DIRECT,w.h.buffer.ptr,pw.h.buffer.ptr,rows*h*2)?;
+        split.exchange.wait(1-split.lead,DIRECT)?;
+        self.norm_first(w,rows)?;
+        split.peer.device.run(||split.peer.norm_first(pw,rows))?;
+        for index in 0..self.layers.len() {
+            self.attention_partial(w,index,sequences,max_keys)?;
+            split.peer.device.run(||split.peer.attention_partial(pw,index,sequences,max_keys))?;
+            split.reduce([w.delta.buffer,pw.delta.buffer],rows*h)?;
+            self.ffn_partial(w,index,rows,split.reduced.buffer)?;
+            split.peer.device.run(||split.peer.ffn_partial(pw,index,rows,split.peer_reduced.buffer))?;
+            split.reduce([w.delta.buffer,pw.delta.buffer],rows*h)?;
+            self.finish_layer(w,index,rows,split.reduced.buffer)?;
+            split.peer.device.run(||split.peer.finish_layer(pw,index,rows,split.peer_reduced.buffer))?;
+        }
+        split.exchange.signal(1-split.lead,DIRECT)?;
+        split.exchange.wait(split.lead,DIRECT)
+    }
+
+    fn norm_first(&self,w:&Workspace<'_>,rows:usize)->Result<()> {
+        // SAFETY: local residual/norm owners cover the admitted block on this retained stream.
+        unsafe { self.library.glm_dflash_rmsnorm(w.h.buffer.ptr,self.layers[0].input_norm.buffer.ptr,
+            w.n.buffer.ptr,rows,self.cfg.hidden,self.cfg.eps,self.stream) }
+    }
+    fn attention_partial(&self,w:&Workspace<'_>,index:usize,sequences:usize,max_keys:usize)->Result<()> {
+        let c=&self.cfg; let layer=&self.layers[index]; let rows=sequences*c.block;
+        // SAFETY: rank-local weights and KV use the checked local-head geometry and retained stream.
+        unsafe {
+            self.linear(w.n.buffer.ptr,&layer.qkv,0,w.qkv.buffer.ptr,rows,c.hidden,c.qkv_width())?;
+            self.library.block_dspark_qk_rope(w.qkv.buffer.ptr,layer.q_norm.buffer.ptr,layer.k_norm.buffer.ptr,
+                w.positions.buffer.ptr,std::ptr::null(),self.inv_freq.as_ref().map_or(std::ptr::null(),|v|v.buffer.ptr.cast_const()),
+                w.q.buffer.ptr,w.k.buffer.ptr,w.v.buffer.ptr,rows,c.heads,c.kv_heads,c.head_dim,c.theta,
+                c.rotary.as_ref().map_or(1.,|p|p.attention_factor),c.eps,false,self.stream)?;
+            self.library.block_dspark_attention(w.q.buffer.ptr,w.k.buffer.ptr,w.v.buffer.ptr,layer.k_ring.buffer.ptr,
+                layer.v_ring.buffer.ptr,w.tables.buffer.ptr,at(&w.tables,sequences*4),at(&w.tables,sequences*8),
+                w.attn.buffer.ptr,w.attention_workspace.buffer.ptr,sequences,c.block,c.heads,c.kv_heads,self.context_capacity,
+                max_keys,c.causal,c.head_dim,1./(c.head_dim as f32).sqrt(),
+                self.kv_cache==cuteafd_loader::families::qwen4::Qwen4KvCache::Fp8,self.stream)?;
+            self.linear(w.attn.buffer.ptr,&layer.o,0,w.delta.buffer.ptr,rows,c.q_width(),c.hidden)
+        }
+    }
+    fn ffn_partial(&self,w:&Workspace<'_>,index:usize,rows:usize,delta:CuteafdDeviceBuffer)->Result<()> {
+        let c=&self.cfg; let layer=&self.layers[index];
+        // SAFETY: reduced full-hidden attention updates replicated residual before local-neuron projections.
+        unsafe {
+            self.library.glmf_dspark_add_rmsnorm(w.h.buffer.ptr,delta.ptr,layer.post_norm.buffer.ptr,
+                w.h.buffer.ptr,w.n.buffer.ptr,rows,c.hidden,c.eps,self.stream)?;
+            self.linear(w.n.buffer.ptr,&layer.gate_up,0,w.gate_up.buffer.ptr,rows,c.hidden,2*c.intermediate)?;
+            self.library.glm_dflash_silu_mul(w.gate_up.buffer.ptr,w.act.buffer.ptr,rows,c.intermediate,self.stream)?;
+            self.linear(w.act.buffer.ptr,&layer.down,0,w.delta.buffer.ptr,rows,c.intermediate,c.hidden)
+        }
+    }
+    fn finish_layer(&self,w:&Workspace<'_>,index:usize,rows:usize,delta:CuteafdDeviceBuffer)->Result<()> {
+        let next=self.layers.get(index+1).map_or(self.norm.buffer,|layer|layer.input_norm.buffer);
+        // SAFETY: shared reduction and next norm are retained full-hidden operands on this rank's stream.
+        unsafe { self.library.glmf_dspark_add_rmsnorm(w.h.buffer.ptr,delta.ptr,next.ptr,w.h.buffer.ptr,w.n.buffer.ptr,
+            rows,self.cfg.hidden,self.cfg.eps,self.stream) }
     }
 
     fn head_ref<'h>(&self, head: &'h TargetHead<'h>) -> Result<HeadRef<'h>> {
@@ -1394,6 +1658,13 @@ impl<'a> DsparkDrafter<'a> {
         self.draft_from(sequences, DraftInput::Table(embedding), self.head_ref(&head)?, true)
     }
 
+    /// Device-driven input binding for a target whose embedding lives on a peer.
+    pub fn draft_device_with(&self, sequences: &[DraftSeq],
+        input: &dyn Fn(&[u32], CuteafdDeviceBuffer, *mut c_void) -> Result<()>, head: TargetHead<'_>)
+        -> Result<Vec<Draft>> {
+        self.draft_from(sequences, DraftInput::Launch(input), self.head_ref(&head)?, true)
+    }
+
     pub fn draft_device_diagnostic(&self, sequences: &[DraftSeq], embedding: &TokenEmbedding<'_>,
         head: TargetHead<'_>) -> Result<Vec<Draft>> {
         self.draft_from(sequences, DraftInput::Table(embedding), self.head_ref(&head)?, false)
@@ -1401,7 +1672,7 @@ impl<'a> DsparkDrafter<'a> {
 
     fn draft_from(&self, sequences: &[DraftSeq], input: DraftInput<'_, '_>, head: HeadRef<'_>, serving: bool)
         -> Result<Vec<Draft>> {
-        self.on_device(|| self.draft_on_device(sequences, input, head, serving))
+        self.checked(||self.on_device(|| self.draft_on_device(sequences, input, head, serving)))
     }
 
     fn draft_on_device(&self, sequences: &[DraftSeq], input: DraftInput<'_, '_>, head: HeadRef<'_>, serving: bool)
@@ -1411,7 +1682,7 @@ impl<'a> DsparkDrafter<'a> {
         let (s_count, block, h) = (sequences.len(), c.block, c.hidden);
         let rows_ok = match input {
             DraftInput::Rows(r) => r.len() == s_count * h * 2,
-            DraftInput::Table(_) => true,
+            DraftInput::Table(_) | DraftInput::Launch(_) => true,
         };
         ensure!(s_count > 0 && s_count <= self.max_sequences && rows_ok, "draft step of {s_count} sequences");
         let rows = s_count * block;
@@ -1469,6 +1740,11 @@ impl<'a> DsparkDrafter<'a> {
                     .collect();
                 embedding.embed(&ids, w.ids.buffer, 1, w.h.buffer, self.stream)?;
             }
+            DraftInput::Launch(launch) => {
+                let ids = sequences.iter().flat_map(|seq| std::iter::once(seq.anchor)
+                    .chain(std::iter::repeat_n(c.mask_token,block - 1))).collect::<Vec<_>>();
+                launch(&ids,w.h.buffer,self.stream)?;
+            }
         }
         self.put(&w.positions, bytes_of(&positions))?;
         self.put(&w.tables, bytes_of(&tables))?;
@@ -1479,6 +1755,9 @@ impl<'a> DsparkDrafter<'a> {
         // SAFETY: every workspace buffer holds `rows` rows of its width and the
         // weights their checkpoint shapes; the stream orders the chain.
         unsafe {
+            if let Some(split)=&self.head_split {
+                self.forward_tp2(w,split,&positions,&tables,s_count,max_keys)?;
+            } else {
             if let Some(native) = &self.native {
                 ensure!(positions.iter().all(|&p| p >= 0 && (p as usize) < native.positions),
                     "native draft block position exceeds admitted rotary table");
@@ -1537,32 +1816,34 @@ impl<'a> DsparkDrafter<'a> {
                         rows, h, eps, s)?;
                 }
             }
-            match head {
-                HeadRef::Bf16(weight) if serving => crate::shared::draft::launch_bf16_head(w.head.as_ref().context("BF16 dSpark head was not prepared before serving")?,
-                    w.n.buffer.ptr.cast(), weight.cast(), w.logits.buffer.ptr.cast(), rows, s)?,
-                HeadRef::Bf16(weight) => crate::shared::speculation::dflash::launch_draft_head(l, w.head.as_ref().context("BF16 dSpark head was not prepared before serving")?, w.n.buffer.ptr,
-                    weight, w.logits.buffer.ptr.cast(), rows, h, c.vocab, s, self.head_mode.get())?,
-                HeadRef::Launch(launch) => launch(w.n.buffer.ptr.cast_const(), w.logits.buffer.ptr.cast(), rows, s)?,
             }
-            l.glmf_dspark_markov(w.logits.buffer.ptr, self.markov_w1.buffer.ptr, self.markov_w2.buffer.ptr,
-                self.markov_norms.buffer.ptr, w.anchors.buffer.ptr, w.tokens.buffer.ptr, w.markov_workspace.buffer.ptr, s_count, block, c.vocab,
+            match head {
+                HeadRef::Bf16(weight) if serving => crate::shared::draft::launch_bf16_head(w.output()?.head.as_ref().context("BF16 dSpark head was not prepared before serving")?,
+                    w.n.buffer.ptr.cast(), weight.cast(), w.output()?.logits.buffer.ptr.cast(), rows, s)?,
+                HeadRef::Bf16(weight) => crate::shared::speculation::dflash::launch_draft_head(l, w.output()?.head.as_ref().context("BF16 dSpark head was not prepared before serving")?, w.n.buffer.ptr,
+                    weight, w.output()?.logits.buffer.ptr.cast(), rows, h, c.vocab, s, self.head_mode.get())?,
+                HeadRef::Launch(launch) => launch(w.n.buffer.ptr.cast_const(), w.output()?.logits.buffer.ptr.cast(), rows, s)?,
+            }
+            l.glmf_dspark_markov(w.output()?.logits.buffer.ptr, self.head.as_ref().context("block Markov head absent")?.w1.buffer.ptr, self.head.as_ref().context("block Markov head absent")?.w2.buffer.ptr,
+                self.head.as_ref().context("block Markov head absent")?.norms.buffer.ptr, w.anchors.buffer.ptr, w.output()?.tokens.buffer.ptr, w.output()?.markov.buffer.ptr, s_count, block, c.vocab,
                 c.rank, s)?;
-            l.glmf_dspark_confidence(w.n.buffer.ptr, self.markov_w1.buffer.ptr, self.confidence_w.buffer.ptr,
-                self.confidence_b.buffer.ptr, w.anchors.buffer.ptr, w.tokens.buffer.ptr, w.confidence.buffer.ptr,
+            l.glmf_dspark_confidence(w.n.buffer.ptr, self.head.as_ref().context("block Markov head absent")?.w1.buffer.ptr, self.head.as_ref().context("block confidence head absent")?.confidence_w.buffer.ptr,
+                self.head.as_ref().context("block confidence head absent")?.confidence_b.buffer.ptr, w.anchors.buffer.ptr, w.output()?.tokens.buffer.ptr, w.output()?.confidence.buffer.ptr,
                 s_count, block, h, c.rank, s)?;
             // The round's results download on its stream; one host wait then
             // covers the round and both copies (no second, synchronous drain).
             // SAFETY: the device buffers hold `rows` words; the landing is
             // pinned, owned by the workspace and read only after the wait.
+            let output=w.output()?;
             let landing = |offset: usize| cuteafd_ffi::CuteafdHostBuffer {
-                ptr: w.landing.buffer.ptr.cast::<u8>().add(offset).cast(), bytes: rows * 4, ..w.landing.buffer };
-            l.copy_d2h_host_buffer_async(landing(0), CuteafdDeviceBuffer { bytes: rows * 4, ..w.tokens.buffer },
+                ptr: output.landing.buffer.ptr.cast::<u8>().add(offset).cast(), bytes: rows * 4, ..output.landing.buffer };
+            l.copy_d2h_host_buffer_async(landing(0), CuteafdDeviceBuffer { bytes: rows * 4, ..w.output()?.tokens.buffer },
                 rows * 4, s)?;
-            l.copy_d2h_host_buffer_async(landing(rows * 4), CuteafdDeviceBuffer { bytes: rows * 4, ..w.confidence.buffer },
+            l.copy_d2h_host_buffer_async(landing(rows * 4), CuteafdDeviceBuffer { bytes: rows * 4, ..w.output()?.confidence.buffer },
                 rows * 4, s)?;
             self.round.borrow_mut().wait(s)?;
         }
-        let (tokens, confidence) = w.landing.bytes()[..rows * 8].split_at(rows * 4);
+        let (tokens, confidence) = w.output()?.landing.bytes()[..rows * 8].split_at(rows * 4);
         let word = |b: &[u8], i: usize| u32::from_le_bytes(b[i * 4..i * 4 + 4].try_into().unwrap());
         Ok((0..s_count).map(|i| Draft {
             tokens: (0..block).map(|j| word(&tokens, i * block + j)).collect(),
@@ -1587,9 +1868,9 @@ impl<'a> DsparkDrafter<'a> {
         let w = slot.as_ref().context("no draft step ran")?;
         let bytes = sequences.checked_mul(self.cfg.block).and_then(|n| n.checked_mul(self.cfg.vocab))
             .and_then(|n| n.checked_mul(4)).context("draft logit readback overflow")?;
-        ensure!(sequences > 0 && bytes <= w.logits.buffer.bytes, "draft logit readback exceeds arena");
+        ensure!(sequences > 0 && bytes <= w.output()?.logits.buffer.bytes, "draft logit readback exceeds arena");
         let mut host = vec![0; bytes];
-        self.library.copy_d2h(&mut host, CuteafdDeviceBuffer { bytes, ..w.logits.buffer })?;
+        self.library.copy_d2h(&mut host, CuteafdDeviceBuffer { bytes, ..w.output()?.logits.buffer })?;
         Ok(host.chunks_exact(4).map(|word| f32::from_le_bytes(word.try_into().unwrap())).collect())
     }
 
@@ -1646,6 +1927,167 @@ impl ReplayDrafter for DsparkDrafter<'_> {
 mod tests {
     use super::*;
     use crate::shared::memory::TEST;
+    #[test]
+    fn block_tp2_native_rank_arenas_match_physical_owner_receipts()->Result<()> {
+        use crate::shared::memory::{device::{Device,Stream},weight_arena::DeviceWeightArena};
+        use cuteafd_loader::{formats::block_dspark::{BlockDsparkConfig,BlockDsparkRuntimeLayout},
+            placement::planner::{CoordinatorDevices,Location}};
+        let fixture=cuteafd_ffi::native_library_lifetime_fixture::Fixture::build_for_tests()?;
+        let library=fixture.load()?;
+        for rank in 0..2 { fixture.configure_memory(&library,rank,1<<30)?; }
+        fixture.immediate_copies(&library)?; fixture.quiet_events(&library,true)?;
+        fixture.peer_ordering_model(&library)?;
+        let root=tempfile::tempdir_in(fixture.directory())?;
+        let config=serde_json::json!({"architectures":["DSparkDraftModel"],"speculators_model_type":"dspark",
+            "aux_hidden_state_layer_ids":[1],"block_size":2,"confidence_head_with_markov":true,
+            "draft_vocab_size":16,"enable_confidence_head":true,"markov_head_type":"vanilla","markov_rank":512,
+            "mask_token_id":0,"sample_from_anchor":true,"sliding_window_non_causal":false,
+            "transformer_layer_config":{"attention_bias":false,"head_dim":64,"hidden_act":"silu",
+                "hidden_size":256,"intermediate_size":256,"layer_types":["sliding_attention"],
+                "max_position_embeddings":8192,"model_type":"qwen3","num_attention_heads":4,"num_hidden_layers":1,
+                "num_key_value_heads":2,"rms_norm_eps":1e-5,"rope_parameters":{"rope_theta":10000.,"rope_type":"default"},
+                "sliding_window":8,"vocab_size":16}});
+        std::fs::write(root.path().join("config.json"),serde_json::to_vec(&config)?)?;
+        let cfg=BlockDsparkConfig::read(root.path())?;
+        let tensors=RefCell::new(Vec::new());
+        cuteafd_loader::formats::block_dspark::block_dspark_weight_recipe(&cfg,|name,shape| {
+            tensors.borrow_mut().push(cuteafd_loader::plan::testing::t(name,"BF16",shape)); Ok::<_,anyhow::Error>(())
+        },|parts,columns| { for (name,rows) in parts { tensors.borrow_mut().push(
+            cuteafd_loader::plan::testing::t(*name,"BF16",&[*rows,columns])); } Ok(()) })?;
+        cuteafd_loader::plan::testing::write_safetensors(&root.path().join("model.safetensors"),&tensors.into_inner());
+        let entries=[(256,256),(256,128),(128,256)].into_iter().map(|(k,n)|serde_json::json!({
+            "name":format!("draft_bf16_k{k}_n{n}"),"pointers":[{"name":"x"},{"name":"w"},{"name":"out"}],
+            "scalars":[{"type":"int32"}],"capacity_rows":TAP_ROWS,"scratch_bytes_at_capacity":{},
+            "geometry":{"width":k,"outputs":n,"output_dtype":"torch.bfloat16","reduction":"ordered_k16",
+                "tiles_by_rows":[[16,1,4,16,64,6]]}})).collect::<Vec<_>>();
+        fixture.register_programs(&library,&entries)?;
+        let manifest=root.path().join("PROGRAMS.json");
+        std::fs::write(&manifest,serde_json::to_vec(&serde_json::json!({"programs":entries}))?)?;
+        let programs=library.programs()?.with_manifest(&manifest)?;
+        let devices=[0,1].map(|id|Device { library:&library,id });
+        for lead in [0,1] { for kv in [cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16,
+            cuteafd_loader::families::qwen4::Qwen4KvCache::Fp8] {
+            let layouts=[0,1].map(|rank|BlockDsparkRuntimeLayout::for_rank(root.path(),2,2,188,
+                &format!("test/block/{rank}"),kv,rank,2,lead)).into_iter().collect::<Result<Vec<_>>>()?;
+            let arenas=layouts.iter().enumerate().map(|(rank,l)|DeviceWeightArena::new(devices[rank],l.weights.clone(),
+                crate::shared::memory::TEST_ARENA)).collect::<Result<Vec<_>>>()?;
+            let stream=Stream::new(devices[lead])?;
+            let mut draft=devices[lead].own(||DsparkDrafter::load_tp2_with(&library,&programs,
+                super::super::dflash::TargetProjection::Native,root.path(),2,2,kv,[0,1],stream.raw,lead,
+                |physical,name,bytes|arenas[physical as usize].view(name,bytes)))?;
+            let split=draft.head_split.as_ref().context("missing paired block owner")?;
+            assert!(draft.head.is_some() && split.peer.head.is_none());
+            assert!(draft.workspace.borrow().as_ref().unwrap().output.is_some());
+            assert!(split.peer.workspace.borrow().as_ref().unwrap().output.is_none());
+            assert_eq!((draft.cfg.heads,draft.cfg.kv_heads,draft.cfg.intermediate),(2,1,128));
+            let receipts=draft.runtime_receipts(CoordinatorDevices::new(&[0,1])?,"draft")?;
+            for rank in 0..2 {
+                let roots=receipts.iter().filter(|r|r.allocation.location==Location::coordinator(rank as u8)
+                    && r.allocation.view.is_none() && r.allocation.group=="weight arena").collect::<Vec<_>>();
+                assert_eq!(roots.len(),1,"rank {rank} has duplicate/missing arena");
+                assert_eq!(roots[0].allocation.bytes,layouts[rank].weights.bytes() as u64);
+                let reduction=receipts.iter().filter(|r|r.allocation.location==Location::coordinator(rank as u8)
+                    && r.allocation.view.is_none() && r.allocation.id.ends_with("tp2.reduced")).collect::<Vec<_>>();
+                assert_eq!(reduction.len(),1); assert_eq!(reduction[0].allocation.bytes,layouts[rank].reduction_bytes as u64);
+                let exchange=receipts.iter().filter(|r|r.allocation.location==Location::coordinator(rank as u8)
+                    && r.allocation.view.is_none() && r.allocation.id.contains("tp2.exchange.")).collect::<Vec<_>>();
+                assert_eq!(exchange.len(),layouts[rank].exchange_buffers.len());
+                assert!(exchange.iter().all(|r|r.allocation.category==cuteafd_core::memory_layout::Category::Transport));
+                assert_eq!(exchange.iter().map(|r|r.allocation.bytes).sum::<u64>(),
+                    layouts[rank].exchange_buffers.iter().map(|(_,n)|*n as u64).sum::<u64>());
+                let actual=receipts.iter().filter(|r|r.allocation.location==Location::coordinator(rank as u8)
+                    && r.allocation.view.is_none()).map(|r|r.allocation.bytes).sum::<u64>();
+                let planned=layouts[rank].weights.bytes() as u64+layouts[rank].demands(rank as u8).iter().map(|d|d.bytes).sum::<u64>();
+                assert_eq!(actual,planned,"rank {rank}, lead {lead}, KV {kv}: every physical backing must be charged once");
+            }
+            let producers=[Stream::new(devices[0])?,Stream::new(devices[1])?];
+            let ranks=[0,1].map(|rank|crate::shared::peer_split::RankDevice { device:rank as i32,stream:producers[rank].raw });
+            draft.bind_cooperative_producers(&ranks)?;
+            draft.order_cooperative_producers()?;
+            let split=draft.head_split.as_ref().unwrap();
+            let (producer,event)=&draft.cooperative_producers[1-lead];
+            assert!(split.exchange.require_cooperative_producer_event(1-lead,*producer,event.device.id,std::ptr::null_mut()).is_err());
+            assert!(split.exchange.require_cooperative_producer_event(1-lead,*producer,1-event.device.id,event.raw).is_err());
+            let invalid=ContextRow { tap_row:TAP_ROWS,slot:0,position:0 };
+            fixture.quiet_events(&library,false)?;
+            let before_invalid=fixture.events()?;
+            let error=draft.update(&[invalid]).unwrap_err();
+            let after_invalid=fixture.events()?;
+            fixture.quiet_events(&library,true)?;
+            assert_eq!(after_invalid.bytes().filter(|&event|event==b'p').count(),
+                before_invalid.bytes().filter(|&event|event==b'p').count(),
+                "invalid update queued a peer push before validation");
+            assert!(format!("{error:#}").contains("past"));
+            assert_eq!(split.exchange.terminal_state(),crate::shared::peer_split::TerminalState::Aborting);
+            // Same sequence as Engine::shutdown: abort again, ordered teardown,
+            // terminal completion, then repeated shutdown must remain harmless.
+            let steps=RefCell::new(Vec::new());
+            let shutdown=||->Result<()> {
+                draft.abort()?;
+                crate::shared::experts::rtx::pair::teardown(&mut crate::shared::experts::rtx::pair::Teardown {
+                    abort:||{ steps.borrow_mut().push("abort"); draft.abort() },
+                    ranks:||{ steps.borrow_mut().push("ranks"); draft.drain() },
+                    links:||{ steps.borrow_mut().push("links"); Ok(()) },
+                    copies:||{ steps.borrow_mut().push("copies"); draft.drain() },
+                    graphs:||{ steps.borrow_mut().push("graphs"); Ok(()) },
+                    finish:|drained|{ steps.borrow_mut().push("finish"); draft.finish_terminal(drained); },
+                })
+            };
+            shutdown()?;
+            assert_eq!(steps.borrow().as_slice(),["abort","ranks","links","copies","graphs","finish"]);
+            assert_eq!(split.exchange.terminal_state(),crate::shared::peer_split::TerminalState::Drained);
+            draft.abort()?;
+            shutdown()?;
+            draft.drain()?;
+        } }
+        Ok(())
+    }
+
+    #[test]
+    fn admitted_rank_local_windows_restore_all_bytes_without_cross_device_copies()->Result<()> {
+        use device::{Allocation,Device,Stream};
+        let fixture=cuteafd_ffi::native_library_lifetime_fixture::Fixture::build_for_tests()?;
+        let library=fixture.load()?;
+        for rank in 0..2 { fixture.configure_memory(&library,rank,1<<30)?; }
+        fixture.immediate_copies(&library)?; fixture.quiet_events(&library,true)?;
+        let devices=[0,1].map(|id|Device { library:&library,id });
+        let streams=[Stream::new(devices[0])?,Stream::new(devices[1])?];
+        let planes=[Allocation::new(devices[0],256,TEST)?,Allocation::new(devices[1],256,TEST)?];
+        let expected=[(0..256).map(|i|(i*17) as u8).collect::<Vec<_>>(),
+            (0..256).map(|i|(i*31+7) as u8).collect::<Vec<_>>()];
+        let mut snapshots=Vec::new();
+        for rank in 0..2 {
+            let (_,bytes)=WindowSnapshots::bytes(&[256],2)?;
+            let backing=Rc::new(Allocation::new(devices[rank],bytes,Tag::prefix("test/admitted-window"))?);
+            let before=fixture.events()?;
+            let owner=WindowSnapshots::with_backing(crate::shared::prefix::Reader {
+                device:rank as i32,stream:streams[rank].raw },backing.clone(),vec![256],2)?;
+            assert!(Rc::ptr_eq(&owner.backing(),&backing));
+            let added=fixture.events()?.strip_prefix(&before).unwrap().to_owned();
+            assert!(!added.contains("device-alloc"),"admitted backing allocated twice");
+            devices[rank].run(||library.copy_h2d(planes[rank].buffer,&expected[rank]))?;
+            // SAFETY: rank-local live planes and backing outlive event-ordered copies.
+            unsafe { owner.capture(0,&[planes[rank].buffer],0,4099)?; }
+            owner.drain()?;
+            devices[rank].run(||library.copy_h2d(planes[rank].buffer,&vec![199;256]))?;
+            snapshots.push(owner);
+        }
+        assert_eq!(snapshots[0].metadata(0)?,snapshots[1].metadata(0)?);
+        for rank in 0..2 {
+            assert!(unsafe { snapshots[rank].restore(0,&[planes[1-rank].buffer],4099) }.is_err());
+            // SAFETY: initialized mark and local owner satisfy retained event fence contract.
+            unsafe { snapshots[rank].restore(0,&[planes[rank].buffer],4099)?; }
+            snapshots[rank].drain()?;
+            let mut actual=vec![0;256];
+            devices[rank].run(||library.copy_d2h(&mut actual,planes[rank].buffer))?;
+            assert_eq!(actual,expected[rank],"rank bytes including inactive region changed");
+        }
+        let copies=include_str!("../prefix/copy_stream.rs");
+        assert!(copies.find("cuda_event_record(event, reader)").unwrap()<copies.find("cuda_stream_wait_event(state.stream, event)").unwrap());
+        assert!(copies.find("cuda_event_record(state.landed, state.stream)").unwrap()<copies.find("cuda_stream_wait_event(reader, state.landed)").unwrap());
+        Ok(())
+    }
+
     #[test]
     fn window_snapshot_restore_equals_cold_state_and_survives_slot_reuse() -> Result<()> {
         use device::{Allocation, Device, Stream};
@@ -1791,11 +2233,12 @@ mod tests {
                     {
                     let workspace = drafter.workspace.borrow();
                     let workspace = workspace.as_ref().context("prepared reversed-device workspace missing")?;
+                    let output=workspace.output()?;
                     for owner in [&workspace.h, &workspace.n, &workspace.qkv, &workspace.q,
                         &workspace.k, &workspace.v, &workspace.attn, &workspace.delta, &workspace.gate_up,
-                        &workspace.act, &workspace.logits, &workspace.anchors, &workspace.ids,
-                        &workspace.tokens, &workspace.confidence, &workspace.positions, &workspace.tables,
-                        &workspace.attention_workspace, &workspace.markov_workspace, &workspace._head_workspace] {
+                        &workspace.act, &output.logits, &workspace.anchors, &workspace.ids,
+                        &output.tokens, &output.confidence, &workspace.positions, &workspace.tables,
+                        &workspace.attention_workspace, &output.markov, &output._head_workspace] {
                         assert_eq!(owner.buffer.device_id, device.id, "workspace owner follows drafter, not caller");
                     }
                     }

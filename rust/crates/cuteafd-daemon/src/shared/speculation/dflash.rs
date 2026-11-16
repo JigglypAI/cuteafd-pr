@@ -29,6 +29,7 @@ use crate::shared::fp8_linear;
 use crate::shared::memory::DeviceAllocation;
 use crate::shared::memory::device::{Allocation, Device, DeviceOwner};
 use crate::shared::peer_split::{PeerExchange, DIRECT};
+use super::gqa_tp2::GqaHeadSplit;
 use std::rc::Rc;
 use crate::shared::token_io::TokenEmbedding;
 use anyhow::{ensure, Context, Result};
@@ -838,7 +839,7 @@ pub(crate) struct DflashDrafter<'a> {
     projections: cuteafd_ffi::draft_projection::DraftProjections<'a>,
     context_fc: Option<cuteafd_ffi::mla_draft::Ml4ContextProjection<'a>>,
     physical: Option<cuteafd_loader::families::glm5::draft_physical::GlmDflashPhysicalLayout>,
-    head_split: Option<GqaHeadSplit<'a>>,
+    head_split: Option<GqaHeadSplit<'a,DflashDrafter<'a>>>,
     hidden_norm: Dev<'a>,
     norm: Dev<'a>,
     head_ops: DraftHeadOps<'a>,
@@ -873,13 +874,6 @@ pub(crate) struct DflashDrafter<'a> {
     confidence_scales: fp8_linear::Fp8Scales,
 }
 
-struct GqaHeadSplit<'a> {
-    peer: DeviceOwner<'a, Box<DflashDrafter<'a>>>,
-    exchange: Rc<PeerExchange<'a>>,
-    lead: usize,
-    reduced: Dev<'a>,
-    peer_reduced: DeviceOwner<'a, Dev<'a>>,
-}
 
 fn at(dev: &Dev<'_>, bytes: usize) -> *mut c_void {
     // SAFETY: callers stay inside the allocation.
@@ -1185,9 +1179,8 @@ impl<'a> DflashDrafter<'a> {
         let peer = device.own(|| Self::load_rank(library, programs, target_projection, snapshot, Some(file), exchange.stream(1 - head_rank), slots,
             max_sequences, mask_row, row_window, representation, scales, fp8_rows, kv_cache, 1, 2, &mut allocate).map(Box::new))?;
         let bytes = max_sequences * lead.cfg.block * lead.cfg.hidden * 2;
-        let reduced = DeviceAllocation::new(library, bytes, Tag::drafter_workspace("shared/dflash-reduce"))?;
-        let peer_reduced = device.own(|| DeviceAllocation::new(library, bytes, Tag::transport("shared/dflash-reduce")))?;
-        lead.head_split = Some(GqaHeadSplit { peer, exchange, lead: head_rank, reduced, peer_reduced });
+        lead.head_split = Some(GqaHeadSplit::new(peer,exchange,head_rank,bytes,
+            [Tag::drafter_workspace("shared/dflash-reduce"),Tag::transport("shared/dflash-reduce")])?);
         Ok(lead)
     }
 
@@ -1687,7 +1680,7 @@ impl<'a> DflashDrafter<'a> {
         self.checked_head_split(|| self.update_tp2(rows, split))
     }
 
-    fn update_tp2(&self, rows: &[ContextRow], split: &GqaHeadSplit<'_>) -> Result<()> {
+    fn update_tp2(&self, rows: &[ContextRow], split: &GqaHeadSplit<'_,DflashDrafter<'_>>) -> Result<()> {
         let first = rows.iter().map(|row| row.tap_row).min().context("draft tap span")?;
         let last = rows.iter().map(|row| row.tap_row).max().context("draft tap span")?;
         ensure!(last < TAP_ROWS, "draft tap span exceeds admitted rows");
@@ -2223,7 +2216,7 @@ impl<'a> DflashDrafter<'a> {
         result
     }
 
-    fn forward_tp2(&self, w: &Workspace<'a>, split: &GqaHeadSplit<'a>, positions: &[i64],
+    fn forward_tp2(&self, w: &Workspace<'a>, split: &GqaHeadSplit<'a,DflashDrafter<'a>>, positions: &[i64],
         tables: &[i32], sequences: usize, max_keys: usize) -> Result<()> {
         let rows = sequences * self.cfg.block;
         let h = self.cfg.hidden;
@@ -2315,24 +2308,8 @@ impl<'a> DflashDrafter<'a> {
             w.h.buffer.ptr, next, w.h.buffer.ptr, w.n.buffer.ptr, rows, c.block, c.hidden, c.group, c.eps, self.stream) }
     }
 
-    fn reduce_gqa(split: &GqaHeadSplit<'_>, work: [&Workspace<'_>; 2], elements: usize) -> Result<()> {
-        let exchange = &split.exchange;
-        let window = exchange.slot_bytes() / 2;
-        ensure!(window > 0, "empty draft peer exchange");
-        for first in (0..elements).step_by(window) {
-            let count = window.min(elements - first);
-            for (rank, w) in work.iter().enumerate() {
-                exchange.push(rank ^ split.lead, 0, at(&w.delta, first * 2), count * 2)?;
-            }
-            for (rank, w) in work.iter().enumerate() {
-                let reduced = if rank == 0 { &split.reduced } else { &*split.peer_reduced };
-                exchange.wait(rank ^ split.lead, 0)?;
-                exchange.add(rank ^ split.lead, at(&w.delta, first * 2), exchange.recv(rank ^ split.lead, 0)?, at(reduced, first * 2), count)?;
-            }
-            for rank in 0..2 { exchange.signal(rank ^ split.lead, DIRECT)?; }
-            for rank in 0..2 { exchange.wait(rank ^ split.lead, DIRECT)?; }
-        }
-        Ok(())
+    fn reduce_gqa(split: &GqaHeadSplit<'_,DflashDrafter<'_>>, work: [&Workspace<'_>; 2], elements: usize) -> Result<()> {
+        split.reduce([work[0].delta.buffer,work[1].delta.buffer],elements)
     }
 
     /// Shared startup path for every serving DFlash family; diagnostics may
