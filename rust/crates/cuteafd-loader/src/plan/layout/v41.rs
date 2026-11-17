@@ -145,15 +145,13 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
         }
         Some(draft)
     } else { None };
-    let mut pool = PoolPolicy::resolve(&options.rtx_bytes, shape.context_tokens, options.pool_tokens, 512)
-        .with_context(crate::placement::planner::Context::resolve(shape.context_tokens, (options.context_tokens > 0).then_some(options.context_tokens)));
-    // CLI zero and an omitted pool are the same automatic admission.
-    let automatic = pool.requested.is_none();
-    if automatic {
-        pool.target = pool.target.min(options.target_pool_tokens.max(shape.context_tokens));
-    }
+    let mut facts = crate::placement::PoolFacts::new(&options.rtx_bytes,
+        crate::placement::planner::Context::resolve(shape.context_tokens,
+            (options.context_tokens > 0).then_some(options.context_tokens)), options.pool_tokens, 512);
+    facts.target = Some(options.target_pool_tokens.max(shape.context_tokens));
+    facts.encoding_limit = Some((131_072u64.saturating_sub(shape.concurrency + 2 * turns)) * 512);
+    let pool = crate::placement::prepare_pool(facts);
     pool.validate_explicit()?;
-    let maximum_pool_tokens = pool.maximum_tokens();
     let context = shape.context_tokens;
     let mut working = SparkWorkingSet { rtx_layers: Vec::new(),
         spark_layers: if spark_ranks > 0 { (0..40).collect() } else { Vec::new() },
@@ -237,7 +235,7 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
         config: &checkpoint.config,
         gpus: ranks,
         context,
-        maximum_pool_tokens,
+        pool,
         prefill: PrefillShape { rows, waves: slots as u64 },
         concurrency: shape.concurrency,
         retained_turns: turns,
@@ -408,7 +406,7 @@ mod tests {
             let input = ProductionInput {
             blas: Vec::new(),
             expert_usage: false,
-                config: &config, gpus: 2, context: 512, maximum_pool_tokens: 512 * 64,
+                config: &config, gpus: 2, context: 512, pool: crate::placement::prepare_pool(crate::placement::PoolFacts::new(&[96 << 30; 2], 512, Some(512 * 64), 512)),
                 prefill: PrefillShape { rows: 64, waves: 1 }, concurrency: 1, retained_turns: 0,
                 replicated: false, spark_ranks: 4, onboard_minimum: 0, onboard_counts: None,
                 experts: vec![expert; 40], workspace: 0,
@@ -450,7 +448,7 @@ mod tests {
         let input = ProductionInput {
             blas: Vec::new(),
             expert_usage: false,
-            config: &config, gpus: 2, context: 512, maximum_pool_tokens: 512 * 64,
+            config: &config, gpus: 2, context: 512, pool: crate::placement::prepare_pool(crate::placement::PoolFacts::new(&[96 << 30; 2], 512, Some(512 * 64), 512)),
             prefill: PrefillShape { rows: 64, waves: 1 }, concurrency: 1, retained_turns: 0,
             replicated: false, spark_ranks: 4, onboard_minimum: 0, onboard_counts: None,
             experts: vec![expert; 40], workspace: 0,

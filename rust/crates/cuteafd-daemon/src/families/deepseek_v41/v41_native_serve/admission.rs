@@ -579,24 +579,15 @@ pub(super) fn resolve_with_owners(
     let context = serving_context.maximum;
     let totals = memory.iter().map(|&(_, total)| total as u64).collect::<Vec<_>>();
     let tails = args.concurrency as u64 + 2 * args.resolved_prefix_entries() as u64;
-    let mut pool = PoolPolicy::resolve(
-        &totals,
-        context,
-        args.pool_tokens,
-        512);
-    if let Some(bytes) = args.kv_pool_size.filter(|_| args.pool_tokens.is_none()) {
+    let requested = if let Some(bytes) = args.kv_pool_size.filter(|_| args.pool_tokens.is_none()) {
         let groups = bytes.0 as u64 / (5 * 256 * 356);
-        ensure!(
-            groups > tails && groups <= 131072,
-            "explicit KV byte pool is outside physical/admission limits"
-        );
-        pool = PoolPolicy::resolve(
-            &totals,
-            context,
-            Some((groups - tails) * 512),
-            512);
-    }
-    pool = pool.with_context(serving_context);
+        ensure!(groups > tails && groups <= 131072,
+            "explicit KV byte pool is outside physical/admission limits");
+        Some((groups - tails) * 512)
+    } else { args.pool_tokens };
+    let mut facts = cuteafd_loader::placement::PoolFacts::new(&totals, serving_context, requested, 512);
+    facts.encoding_limit = Some(131_072u64.saturating_sub(tails) * 512);
+    let pool = cuteafd_loader::placement::prepare_pool(facts);
     // An explicit pool below the pinned context is the first typed refusal;
     // zero and an omitted pool both selected automatic admission above.
     pool.validate_explicit()?;
@@ -687,7 +678,7 @@ pub(super) fn resolve_with_owners(
         config: &config,
         gpus: ranks,
         context,
-        maximum_pool_tokens: pool.maximum_tokens(),
+        pool,
         prefill,
         concurrency: args.concurrency as u64,
         retained_turns: args.resolved_prefix_entries() as u64,

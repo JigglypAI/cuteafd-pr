@@ -125,7 +125,7 @@ mod tests {
             let demand = owners::arena_demand(gpu, layout);
             let prepared = admission::ProductionInput {
                 blas: Vec::new(),
-                expert_usage: false, config: &config, gpus: ranks, context: 512, maximum_pool_tokens: 512,
+                expert_usage: false, config: &config, gpus: ranks, context: 512, pool: cuteafd_loader::placement::prepare_pool(cuteafd_loader::placement::PoolFacts::new(&vec![96 << 30; ranks], 512, Some(512), 512)),
                 prefill: PrefillShape { rows: 128, waves: 1 }, concurrency: 1, retained_turns: 0,
                 replicated: false, spark_ranks: 4, onboard_minimum: 0, onboard_counts: None,
                 experts: vec![ExpertCost { whole: Bytes2 { resident: 0, staging: 0 },
