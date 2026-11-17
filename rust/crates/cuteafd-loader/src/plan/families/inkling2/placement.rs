@@ -30,11 +30,6 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
             "Use one coordinator GPU; the shared planner can describe TP2 owners, but serving cannot execute them yet.");
         return empty(notes);
     }
-    if opts.native_mtp_layers > 0 {
-        report.refuse_placement("Inkling bundled dSpark executor not implemented (#2320)".into(),
-            "Use SPECULATOR=off; the bundled drafter execution path is not implemented in this build.");
-        return empty(notes);
-    }
     if opts.host_embedding {
         report.refuse_placement("Inkling 2 does not support --embedding-placement host yet".into(),
             "Use --embedding-placement gpu; the shared host TokenEmbedding lands with the serving stage.");
@@ -90,8 +85,13 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
             return empty(notes);
         }
     };
+    let drafter = opts.inkling_dspark.then_some(crate::families::inkling2::draft::Selection {
+        kv_cache: opts.draft_kv_cache,
+        sms: opts.physical_sms.unwrap_or(crate::placement::ArchContext::for_device("sm_120",
+            cards.last().map_or(96 << 30, |card| card.physical_bytes)).sms) as usize,
+    });
     let request = FactsRequest { target_pool_tokens: opts.target_pool_tokens, vision: report.vision, vision_replicas: opts.vision_replicas,
-        media_cache_bytes: opts.media_cache_bytes, checkpoint: input.checkpoint(), catalog, cfg, kv_format: opts.inkling_kv, manifest_path: manifest_path.as_deref(),
+        media_cache_bytes: opts.media_cache_bytes, checkpoint: input.checkpoint(), catalog, cfg, kv_format: opts.inkling_kv, drafter, manifest_path: manifest_path.as_deref(),
         manifest, coordinator: Coordinator::Planned { cards: cards.clone() }, attention, spark_ranks: ranks,
         spark_bytes, prefill: shape, context_tokens: opts.context_tokens, pool_tokens: opts.pool_tokens, sequences,
         host, host_cache_bytes: opts.host_cache_bytes, prefix_entries: opts.prefix_entries("inkling2"),
@@ -106,6 +106,11 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
     if let LocalPackage::Missing(reason) = &inputs.local {
         notes.push(format!("Inkling 2 RTX onboarding unavailable: {reason}"));
     }
+    notes.push(if drafter.is_some() {
+        "Inkling bundled recurrent dSpark charges rank-local weight arenas, pool-coupled KV, workspaces and exact prefix marks"
+    } else {
+        "Inkling bundled recurrent dSpark is disabled; no drafter owners are charged"
+    }.into());
     notes.push("Inkling bundled PE uses the shared packed Spark-first encoder owner".into());
     let routed = inputs.routed.len();
     let onboard = opts.resolve_onboard(routed).unwrap_or(Onboard::Auto);

@@ -1605,7 +1605,7 @@ fi
 speculator="$(get SPECULATOR)"
 if [[ "$family" == kimi_k3 ]]; then kimi_requested_speculator="$speculator"; speculator=off; fi
 # MiniMax uses its bundled native drafter on whole, Layers and Heads placements.
-if [[ "$family" == minimax_m3 && ( -z "$speculator" || "$speculator" == auto ) ]]; then speculator=dspark; fi
+if [[ ( "$family" == minimax_m3 || "$family" == inkling2 ) && ( -z "$speculator" || "$speculator" == auto ) ]]; then speculator=dspark; fi
 # Qwen resolves auto only after expert admission, not from configured inventory.
 if [[ "$family" == qwen4 && ( -z "$speculator" || "$speculator" == auto ) ]]; then speculator=auto; fi
 default_drafter=""
@@ -1652,7 +1652,7 @@ if [[ -z "$speculator" ]]; then
 
 fi
 case "$family:$speculator" in
-  minimax_m3:dspark) ;;
+  minimax_m3:dspark|inkling2:dspark) ;;
   qwen4:mtp|qwen4:auto) ;;
   glm5:dspark) [[ "$checkpoint_family" == mistral_large4 ]] ||
     { echo "SPECULATOR=dspark does not apply to $family" >&2; exit 2; } ;; # The MTP layer's experts stay local even with Spark backbone experts.
@@ -1679,7 +1679,7 @@ if [[ "$split" != off ]]; then
 fi
 if [[ "$family" == inkling2 ]]; then
   [[ "$rtx_gpus" != 2 && "$split" != heads && "$explicit_coordinator_gpus" != *,* ]] ||
-    release_die "Inkling serving requires one coordinator GPU; multi-GPU execution is not implemented"
+    release_die "Inkling serving requires one coordinator GPU; multi-GPU target and bundled drafter execution are not implemented (#2316)"
   coordinator_gpu_count=1
 fi
 release_resolve_coordinator_gpus "$explicit_coordinator_gpus" "$coordinator_gpu_count"
@@ -1810,8 +1810,8 @@ case "$speculator" in
     drafter="$(get SPECULATOR_MODEL_ID)"
     [[ -n "$drafter" ]] || drafter="$default_drafter"
     [[ "$family:$speculator" != qwen3_5:dspark || -n "$drafter" ]] || drafter=RadixArk/Qwen3.8-27B-DSpark
-    if [[ "$family:$speculator" == minimax_m3:dspark ]]; then
-      : # Bundled native drafter; --dspark is supplied with MiniMax family args.
+    if [[ "$speculator" == dspark && ( "$family" == minimax_m3 || "$family" == inkling2 ) ]]; then
+      : # Bundled native drafter; --dspark is supplied with family args.
     elif [[ $speculator == dspark && ( $family == deepseek_v4 || $checkpoint_family == mistral_large4 ) ]]; then
       dspark_args=(--dspark)
     elif [[ -n "$drafter" ]]; then
@@ -2019,6 +2019,17 @@ if [[ $family == inkling2 ]]; then
   case "$inkling_kv" in bf16|fp8) ;; *) release_die "KV_CACHE must be bf16 or fp8" ;; esac
   family_args+=(--kv-cache "$inkling_kv")
   family_args+=(--rtx-expert-layers "$(get RTX_EXPERT_LAYERS auto)")
+  inkling_draft_kv="$(get DRAFT_KV_CACHE fp8)"
+  case "$inkling_draft_kv" in bf16|fp8) ;; *) release_die "DRAFT_KV_CACHE must be bf16 or fp8" ;; esac
+  case "$(get SPECULATOR_FP8 auto)" in
+    auto|off) ;;
+    *) release_die "Inkling SPECULATOR_FP8 must be auto or off (checkpoint-native drafter)" ;;
+  esac
+  if [[ "$speculator" == dspark ]]; then
+    family_args+=(--dspark --draft-kv-cache "$inkling_draft_kv")
+  else
+    family_args+=(--dspark=false)
+  fi
 fi
 if [[ $family == minimax_m3 ]]; then
   local_layers="$(get RTX_EXPERT_LAYERS auto)"
@@ -2474,7 +2485,10 @@ audio_encoder_hash=""
   fi
   [[ -z "$(get SPARK_PREFILL_REPLY_FORMAT)" ]] || plan_draft_args+=(--spark-prefill-reply-format "$(get SPARK_PREFILL_REPLY_FORMAT)")
   [[ -z "$(get SPARK_DECODE_REPLY_FORMAT)" ]] || plan_draft_args+=(--spark-decode-reply-format "$(get SPARK_DECODE_REPLY_FORMAT)")
-  if [[ "$family" == inkling2 ]]; then plan_draft_args+=(--kv-cache "$inkling_kv"); fi
+  if [[ "$family" == inkling2 ]]; then
+    plan_draft_args+=(--kv-cache "$inkling_kv")
+    if [[ "$speculator" == dspark ]]; then plan_draft_args+=(--draft-kv-cache "$inkling_draft_kv"); fi
+  fi
   if [[ "$family" == minimax_m3 || "$family" == inkling2 ]]; then
     plan_draft_args+=(--prefix-cache-entries "$effective_prefix_entries")
     [[ -z "$(get PREFIX_CACHE_MARK_MIB)" ]] || plan_draft_args+=(--prefix-cache-mark-mib "$(get PREFIX_CACHE_MARK_MIB)")

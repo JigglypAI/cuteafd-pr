@@ -7,6 +7,10 @@ VLLM = {
     "repository": "https://github.com/WoosukKwon/vllm",
     "revision": "d664cd1e96052857aea2aa844eeba571c24758b4",
     "files": {
+        "vllm/models/inkling2/dspark.py": "a67483a6ac6e791e64afb4a04ae33bdaf5f17c04d7b01fd365470ffd15eefdac",
+        "vllm/models/inkling2/speculator.py": "c2a536adfc6e349bcdbbe5622f26a8b88b7440fc243c2db5d3ea0f21b3ae86b5",
+        "vllm/models/inkling2/ops/dspark.py": "86dc4c32291479ab631f08a3abe7c8fc62a3863cd6f821f4b5ad8d0f5379c90b",
+        "tests/models/inkling2/test_dspark.py": "0f5c89ea5db33c4240f9faa2d70051393f36d88dc8b32ff8d73df50c074b80cc",
         "vllm/models/inkling2/configs.py": "a4ff9d082384d9ddc06888a7c54d3c97c0786b50f77409be032832fe649bd5be",
         "vllm/models/inkling2/model.py": "9c8afccd5920ba48d22c7186f746e6d663790ec7011c449074cf53f0dc5c2ff2",
         "vllm/models/inkling2/attention.py": "6726094a290f53729689b8e19e2b35a508a095f9e7a9e23cf1777a1308732123",
@@ -26,6 +30,7 @@ SGLANG = {
     "repository": "https://github.com/sgl-project/sglang",
     "revision": "ec5e7ff575beb33e54509fe01934d6a4483b5830",
     "files": {
+        "python/sglang/srt/models/inkling2_mtp.py": "43b4bd9b8d37850749a30fc909a6972591561a8796c4e740a62b036b80ce1b07",
         "python/sglang/srt/models/inkling_common/inkling2_attn.py": "77301875fef971b751403a033ac68052b288b0f391371da74e80591aabe6fce6",
         "python/sglang/srt/models/inkling_common/inkling2_attn_res.py": "133602b9a430d089122257930ce79eecb8e7a9304c778bbb3d669fda68c1bda8",
         "python/sglang/srt/models/inkling_common/inkling2_sconv.py": "3685766ef160241c0ddc1e377c827b2380f04f1f39a482ad5b14c0490b00bc65",

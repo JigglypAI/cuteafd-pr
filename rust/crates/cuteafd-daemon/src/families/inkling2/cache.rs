@@ -19,6 +19,7 @@ pub(crate) struct CacheBank<'a> {
     copies: PrefixCopies<'a>,
     readers: Vec<Rc<Stream<'a>>>,
     active: Allocation<'a>,
+    conv: Allocation<'a>,
     marks: Option<Allocation<'a>>,
     pages: BTreeMap<usize, Allocation<'a>>,
     pub layout: CacheLayout,
@@ -39,6 +40,7 @@ impl<'a> CacheBank<'a> {
         ensure!(readers.iter().all(|stream| stream.device.id == device.id
             && std::ptr::eq(stream.device.library, device.library)), "Inkling cache reader devices differ");
         let active = Allocation::new(device, layout.active_bytes()?, Tag::kv("inkling2/sequence-state"))?;
+        let conv = Allocation::new(device, layout.conv.bytes()?, Tag::kv("inkling2/convolution-state"))?;
         let marks = (mark_slots > 0).then(|| Allocation::new(device, layout.retained_bytes(mark_slots)?,
             Tag::new(cuteafd_core::memory_layout::MemoryKind::Prefix, "inkling2/prefix-marks"))).transpose()?;
         let pages = layout.global_layers.iter().map(|&layer| Ok((layer,
@@ -46,23 +48,33 @@ impl<'a> CacheBank<'a> {
             .collect::<Result<BTreeMap<_, _>>>()?;
         let copies = PrefixCopies::new(device.library, vec![readers.iter().map(|stream|
             Reader { device: stream.device.id, stream: stream.raw }).collect()])?;
-        let bank = Self { copies, readers, active, marks, pages, layout, mark_slots };
+        let bank = Self { copies, readers, active, conv, marks, pages, layout, mark_slots };
         bank.copies.ordered(0, |stream| {
             // SAFETY: all allocations succeeded before initialization; the bank
             // retains every destination and joins readers on both sides.
-            unsafe { device.library.cuda_zero_bytes_async(bank.active.buffer, bank.active.buffer.bytes, stream)?; }
+            unsafe {
+                device.library.cuda_zero_bytes_async(bank.active.buffer, bank.active.buffer.bytes, stream)?;
+                device.library.cuda_zero_bytes_async(bank.conv.buffer, bank.conv.buffer.bytes, stream)?;
+            }
             Ok(())
         })?;
         Ok(bank)
     }
     pub fn field(&self, sequence: usize, layer: usize, name: &str) -> Result<Buffer> {
-        let span = self.layout.field(sequence, layer, name)?;
-        view(self.active.buffer, span.start, span.len())
+        if name == "ring" {
+            let span = self.layout.ring_field(sequence, layer)?;
+            return view(self.active.buffer, span.start, span.len());
+        }
+        let (span, _) = self.layout.conv.field(sequence, layer, name)?;
+        view(self.conv.buffer, span.start, span.len())
     }
     pub fn field_bank(&self, layer: usize, name: &str) -> Result<Buffer> {
-        let span = self.layout.field(0, layer, name)?;
-        view(self.active.buffer, span.start,
-            (self.layout.sequences-1)*self.layout.sequence_bytes + span.len())
+        let first = self.field(0, layer, name)?;
+        let stride = if name == "ring" { self.layout.ring_sequence_bytes }
+            else { self.layout.conv.slot_stride*4 };
+        let backing = if name == "ring" { self.active.buffer } else { self.conv.buffer };
+        view(backing, first.ptr as usize-backing.ptr as usize,
+            (self.layout.sequences-1)*stride + first.bytes)
     }
     pub fn global(&self, layer: usize) -> Result<Buffer> {
         self.pages.get(&layer).map(|owner| owner.buffer).context("Inkling layer has no global KV pages")
@@ -71,9 +83,9 @@ impl<'a> CacheBank<'a> {
         ensure!(page < self.layout.pool_pages, "Inkling physical page outside pool");
         view(self.global(layer)?, page*self.layout.page_bytes, self.layout.page_bytes)
     }
-    fn sequence(&self, sequence: usize) -> Result<Buffer> {
+    fn rings_for_sequence(&self, sequence: usize) -> Result<Buffer> {
         ensure!(sequence < self.layout.sequences, "Inkling sequence outside cache");
-        view(self.active.buffer, sequence*self.layout.sequence_bytes, self.layout.sequence_bytes)
+        view(self.active.buffer, sequence*self.layout.ring_sequence_bytes, self.layout.ring_sequence_bytes)
     }
     pub fn mark(&self, slot: usize) -> Result<Buffer> {
         ensure!(slot < self.mark_slots, "Inkling mark outside arena");
@@ -81,18 +93,36 @@ impl<'a> CacheBank<'a> {
             slot*self.layout.sequence_bytes, self.layout.sequence_bytes)
     }
     pub fn reset(&self, sequence: usize) -> Result<()> {
-        let dst = self.sequence(sequence)?;
+        let rings = self.rings_for_sequence(sequence)?;
+        let conv = self.conv_for_sequence(sequence)?;
         self.copies.ordered(0, |stream| {
             // SAFETY: copy fences join every arithmetic reader before overwrite.
-            unsafe { self.readers[0].device.library.cuda_zero_bytes_async(dst, dst.bytes, stream) }
+            unsafe {
+                self.readers[0].device.library.cuda_zero_bytes_async(rings, rings.bytes, stream)?;
+                self.readers[0].device.library.cuda_zero_bytes_async(conv, conv.bytes, stream)
+            }
         })
     }
-    pub fn capture(&self, sequence: usize, slot: usize) -> Result<()> {
-        self.copy(self.mark(slot)?, self.sequence(sequence)?)
+    pub fn conv_for_sequence(&self, sequence: usize) -> Result<Buffer> {
+        ensure!(sequence < self.layout.sequences, "Inkling convolution sequence outside cache");
+        let bytes = self.layout.conv.slot_stride*4;
+        view(self.conv.buffer, sequence*bytes, bytes)
     }
-    pub fn restore(&self, slot: usize, sequence: usize) -> Result<()> {
-        self.copy(self.sequence(sequence)?, self.mark(slot)?)
+    pub fn conv_backing(&self) -> Buffer { self.conv.buffer }
+    fn state_copy(&self, sequence: usize, slot: usize, capture: bool) -> Result<()> {
+        let mark = self.mark(slot)?;
+        let rings = self.rings_for_sequence(sequence)?;
+        let conv = self.conv_for_sequence(sequence)?;
+        let saved_rings = view(mark, 0, rings.bytes)?;
+        let saved_conv = view(mark, rings.bytes, conv.bytes)?;
+        let copies = if capture { vec![(0, saved_rings, rings), (0, saved_conv, conv)] }
+            else { vec![(0, rings, saved_rings), (0, conv, saved_conv)] };
+        // SAFETY: exact disjoint ring/convolution views share registered readers;
+        // one prefix fence orders both backings before snapshot publication.
+        unsafe { self.copies.copy_d2d(&copies) }
     }
+    pub fn capture(&self, sequence: usize, slot: usize) -> Result<()> { self.state_copy(sequence, slot, true) }
+    pub fn restore(&self, slot: usize, sequence: usize) -> Result<()> { self.state_copy(sequence, slot, false) }
     fn copy(&self, dst: Buffer, src: Buffer) -> Result<()> {
         ensure!(dst.bytes == src.bytes && dst.ptr != src.ptr, "Inkling cache copy extent/alias");
         // SAFETY: checked disjoint sequence/mark regions survive all fenced
@@ -119,6 +149,7 @@ impl<'a> CacheBank<'a> {
         let cuteafd_loader::placement::planner::Device::Coordinator(gpu) = location.device
             else { anyhow::bail!("Inkling cache is not coordinator-owned"); };
         self.active.inventory(inventory, &format!("inkling2.cache.{gpu}.active"))?;
+        self.conv.inventory(inventory, &format!("inkling2.cache.{gpu}.conv"))?;
         if let Some(marks) = &self.marks { marks.inventory(inventory, &format!("inkling2.cache.{gpu}.marks"))?; }
         for (layer, owner) in &self.pages { owner.inventory(inventory, &format!("inkling2.kv.{layer}.{gpu}.records"))?; }
         self.copies.allocation_receipts(inventory, &format!("inkling2.cache.{gpu}.copies"))
@@ -143,12 +174,17 @@ impl crate::shared::qwen::scheduler::Placement for Placement {
 }
 
 #[derive(Clone)]
-pub(crate) struct InklingPrefix<'a>(Rc<CacheBank<'a>>);
+pub(crate) struct InklingPrefix<'a> { bank:Rc<CacheBank<'a>>, draft:Option<Rc<super::draft::Binding<'a>>> }
 impl<'a> InklingPrefix<'a> {
-    pub fn new(bank: Rc<CacheBank<'a>>) -> Self { Self(bank) }
+    pub fn new(bank: Rc<CacheBank<'a>>) -> Self { Self {bank,draft:None} }
+    pub fn with_draft(bank:Rc<CacheBank<'a>>,draft:Option<Rc<super::draft::Binding<'a>>>)->Self{Self{bank,draft}}
+    pub fn snapshot_owners(&self)->Vec<Rc<dyn crate::shared::prefix::cuda_copy::SnapshotOwner+'a>>{
+        let mut owners:Vec<Rc<dyn crate::shared::prefix::cuda_copy::SnapshotOwner+'a>>=vec![self.bank.clone()];
+        if let Some(draft)=&self.draft{owners.push(draft.clone());}owners
+    }
     fn validate(&self, placement: &Placement, len: usize) -> Result<()> {
-        ensure!(placement.slot < self.0.layout.sequences && len.div_ceil(64) <= placement.units.len()
-            && placement.units.iter().all(|&page| (page as usize) < self.0.layout.pool_pages),
+        ensure!(placement.slot < self.bank.layout.sequences && len.div_ceil(64) <= placement.units.len()
+            && placement.units.iter().all(|&page| (page as usize) < self.bank.layout.pool_pages),
             "Inkling prefix placement outside admitted state/pages");
         ensure!(placement.units.iter().copied().collect::<std::collections::BTreeSet<_>>().len()
             == placement.units.len(), "Inkling prefix placement aliases physical pages");
@@ -157,23 +193,52 @@ impl<'a> InklingPrefix<'a> {
 }
 impl cuteafd_engine::prefix::PrefixFamily for InklingPrefix<'_> {
     type Placement = Placement;
-    fn record_format(&self) -> &'static str { self.0.layout.kv_format.record_format() }
+    fn record_format(&self) -> &'static str { self.bank.layout.kv_format.record_format() }
     fn layout(&self) -> cuteafd_engine::prefix::FamilyLayout {
         use cuteafd_engine::prefix::{FamilyLayout, MarkStore, ReuseRule};
-        FamilyLayout { page_rows: 64, pages: self.0.layout.pool_pages,
-            page_bytes: self.0.layout.page_bytes * self.0.layout.global_layers.len(),
-            mark_bytes: self.0.layout.sequence_bytes, draft_bytes: 0,
+        FamilyLayout { page_rows: 64, pages: self.bank.layout.pool_pages,
+            page_bytes: self.bank.layout.page_bytes * self.bank.layout.global_layers.len(),
+            mark_bytes: self.bank.layout.sequence_bytes+self.draft.as_ref().and_then(|draft|draft.marks.as_ref()).map_or(0,|marks|marks.bytes()), draft_bytes: 0,
             rule: ReuseRule::EXACT, mark_store: MarkStore::Arena, page_owners: Default::default() }
     }
     fn pages<'p>(&self, placement: &'p Placement) -> &'p [u32] { &placement.units }
+    fn admit_draft_pages(&self,p:&mut Placement,capacity:usize)->Result<(),cuteafd_engine::prefix::BoxError>{
+        if let Some(draft)=&self.draft{draft.drafter.admit_pages(p.slot,capacity)?;}Ok(())
+    }
+    fn draft_pages_valid(&self,a:&cuteafd_engine::prefix::DraftPageAttachment)->bool{self.draft.as_ref().is_some_and(|d|d.drafter.pages_valid(a))}
+    fn draft_pages_revocable(&self,a:&cuteafd_engine::prefix::DraftPageAttachment)->bool{self.draft.as_ref().is_some_and(|d|d.drafter.pages_revocable(a))}
+    fn retain_draft_pages(&self,a:&cuteafd_engine::prefix::DraftPageAttachment)->Result<(),cuteafd_engine::prefix::BoxError>{
+        self.draft.as_ref().context("Inkling prefix has no drafter")?.drafter.retain_pages(a)?;Ok(())
+    }
+    fn capture_draft_pages(&self,p:&Placement,len:usize)->Result<Option<cuteafd_engine::prefix::DraftPageAttachment>,cuteafd_engine::prefix::BoxError>{
+        Ok(self.draft.as_ref().map(|draft|draft.drafter.capture_pages(p.slot,len)).transpose()?)
+    }
+    fn release_draft_pages(&self,a:&cuteafd_engine::prefix::DraftPageAttachment)->Result<(),cuteafd_engine::prefix::BoxError>{
+        self.draft.as_ref().context("Inkling prefix has no drafter")?.drafter.release_pages(a)?;Ok(())
+    }
+    fn restore_draft_pages(&self,a:Option<&cuteafd_engine::prefix::DraftPageAttachment>,p:&mut Placement,frontier:usize)->Result<(),cuteafd_engine::prefix::BoxError>{
+        if let Some(draft)=&self.draft{
+            if let Some(a)=a{draft.drafter.restore_pages(p.slot,a,frontier)?;}
+            else{if frontier!=0{return Err("Inkling draft restore needs exact full-context attachment".into());}draft.drafter.reset_context(p.slot,0)?;}
+        }Ok(())
+    }
+    fn promote_draft_pages(&self,a:&cuteafd_engine::prefix::DraftPageAttachment)->Result<cuteafd_engine::prefix::DraftPageAttachment,cuteafd_engine::prefix::BoxError>{
+        Ok(self.draft.as_ref().context("Inkling prefix has no drafter")?.drafter.promote_pages(a)?)
+    }
+    fn draft_page_segments(&self,page:cuteafd_engine::prefix::DraftPageId)->Vec<cuteafd_hostcache::copy::DeviceRange>{
+        self.draft.as_ref().map_or_else(Vec::new,|d|d.drafter.page_segments(page).expect("admitted draft page")
+            .into_iter().map(crate::shared::prefix::cuda_copy::range).collect())
+    }
     fn bind(&self, placement: &mut Placement) -> Result<(), cuteafd_engine::prefix::BoxError> {
         self.validate(placement, placement.len)?;
-        self.0.reset(placement.slot)?;
+        self.bank.reset(placement.slot)?;
+        if let Some(draft)=&self.draft{draft.drafter.reset_context(placement.slot,0)?;}
         placement.state_len = 0;
         Ok(())
     }
     fn discard(&self, placement: &mut Placement) -> Result<(), cuteafd_engine::prefix::BoxError> {
-        self.0.reset(placement.slot)?;
+        self.bank.reset(placement.slot)?;
+        if let Some(draft)=&self.draft{draft.drafter.reset_context(placement.slot,0)?;}
         placement.state_len = 0;
         Ok(())
     }
@@ -191,28 +256,44 @@ impl cuteafd_engine::prefix::PrefixFamily for InklingPrefix<'_> {
         if len != placement.len || len != placement.state_len {
             return Err("Inkling snapshot frontier does not match committed causal state".into());
         }
-        Ok(self.0.capture(placement.slot, slot.0 as usize)?)
+        self.bank.capture(placement.slot,slot.0 as usize)?;
+        if let Some(draft)=&self.draft{
+            let marks=draft.marks.as_ref().context("admitted draft marks absent")?;
+            let (origin,frontier)=draft.drafter.frontier(placement.slot)?;
+            if frontier!=len{return Err("draft snapshot frontier differs from target".into());}
+            marks.capture(&draft.drafter.lead,placement.slot,slot.0 as usize,origin,frontier)?;
+        }
+        Ok(())
     }
     fn restore(&self, mark: Option<cuteafd_engine::prefix::MarkSlot>, placement: &mut Placement, len: usize)
         -> Result<(), cuteafd_engine::prefix::BoxError> {
         self.validate(placement, len)?;
         let slot = mark.context("Inkling exact restore requires its SWA/convolution mark")?;
-        self.0.restore(slot.0 as usize, placement.slot)?;
+        self.bank.restore(slot.0 as usize, placement.slot)?;
+        if let Some(draft)=&self.draft{
+            draft.marks.as_ref().context("draft mark missing")?.restore(&draft.drafter.lead,placement.slot,slot.0 as usize,len)?;
+        }
         placement.len = len;
         placement.state_len = len;
         Ok(())
     }
     fn copy_rows(&self, copy: cuteafd_engine::prefix::TailCopy) -> Result<(), cuteafd_engine::prefix::BoxError> {
         if copy.owner.is_some() { return Err("Inkling whole-rank pages have no parity owner".into()); }
-        Ok(self.0.copy_page_rows(copy.from as usize, copy.to as usize, copy.rows)?)
+        Ok(self.bank.copy_page_rows(copy.from as usize, copy.to as usize, copy.rows)?)
     }
-    fn drain(&self) -> Result<(), cuteafd_engine::prefix::BoxError> { Ok(self.0.drain()?) }
+    fn drain(&self) -> Result<(), cuteafd_engine::prefix::BoxError> {
+        self.bank.drain()?;
+        if let Some(draft)=&self.draft{if let Some(marks)=&draft.marks{marks.drain()?;}draft.drafter.lead.stream.drain()?;}
+        Ok(())
+    }
     fn page_segments(&self, page: u32) -> Vec<cuteafd_hostcache::copy::DeviceRange> {
-        self.0.layout.global_layers.iter().filter_map(|&layer| self.0.page(layer, page as usize).ok())
+        self.bank.layout.global_layers.iter().filter_map(|&layer| self.bank.page(layer, page as usize).ok())
             .map(crate::shared::prefix::cuda_copy::range).collect()
     }
     fn mark_segments(&self, slot: cuteafd_engine::prefix::MarkSlot) -> Vec<cuteafd_hostcache::copy::DeviceRange> {
-        self.0.mark(slot.0 as usize).ok().into_iter().map(crate::shared::prefix::cuda_copy::range).collect()
+        let mut segments=self.bank.mark(slot.0 as usize).ok().into_iter().map(crate::shared::prefix::cuda_copy::range).collect::<Vec<_>>();
+        if let Some(draft)=&self.draft{if let Some(marks)=&draft.marks{if let Ok(mark)=marks.mark(slot.0 as usize){segments.push(crate::shared::prefix::cuda_copy::range(mark));}}}
+        segments
     }
 }
 
@@ -243,7 +324,7 @@ mod tests {
         let tokens = (0..65).collect::<Vec<u32>>();
         let mut source = cache.admit(&family, &tokens, 128, false,
             |units| Placement { media: None, units, slot: 0, len: 0, state_len: 0 })?.placement;
-        let state = bank.sequence(0)?;
+        let state = bank.rings_for_sequence(0)?;
         let prompt = vec![0x17; state.bytes];
         library.copy_h2d(state, &prompt)?;
         for &page in &source.units {
@@ -257,11 +338,11 @@ mod tests {
             |units| Placement { media: None, units, slot: 1, len: 0, state_len: 0 })?;
         assert_eq!(restored.resume, tokens.len());
         let mut observed = vec![0; state.bytes];
-        library.copy_d2h(&mut observed, bank.sequence(1)?)?;
+        library.copy_d2h(&mut observed, bank.rings_for_sequence(1)?)?;
         assert_eq!(observed, prompt);
         let mut continued = restored.placement;
         let turn = vec![0x6b; state.bytes];
-        library.copy_h2d(bank.sequence(1)?, &turn)?;
+        library.copy_h2d(bank.rings_for_sequence(1)?, &turn)?;
         let mut turn_tokens = tokens.clone(); turn_tokens.push(91);
         continued.len = turn_tokens.len(); continued.state_len = turn_tokens.len();
         assert!(cache.capture(&family, SnapshotKind::Turn, &turn_tokens, &continued, After::from_logits(&[0., 1.], true))?);
@@ -269,13 +350,13 @@ mod tests {
         let restored = cache.admit(&family, &turn_tokens, 128, false,
             |units| Placement { media: None, units, slot: 0, len: 0, state_len: 0 })?;
         assert_eq!(restored.resume, turn_tokens.len());
-        library.copy_d2h(&mut observed, bank.sequence(0)?)?;
+        library.copy_d2h(&mut observed, bank.rings_for_sequence(0)?)?;
         assert_eq!(observed, turn);
         cache.release(&family, &restored.placement.units)?;
         let restored = cache.admit(&family, &tokens, 128, false,
             |units| Placement { media: None, units, slot: 1, len: 0, state_len: 0 })?;
         assert_eq!(restored.resume, tokens.len());
-        library.copy_d2h(&mut observed, bank.sequence(1)?)?;
+        library.copy_d2h(&mut observed, bank.rings_for_sequence(1)?)?;
         assert_eq!(observed, prompt, "turn divergence must not mutate the prompt mark");
         cache.release(&family, &restored.placement.units)?;
         Ok(())
@@ -319,9 +400,11 @@ mod tests {
         })?;
         assert_eq!((fallback.resume, cache.stats().restore_failures, builds.get()), (0, 1, 2));
         assert_eq!((fallback.placement.len, fallback.placement.state_len), (0, 0));
-        let mut state = vec![0; bank.layout.sequence_bytes];
-        library.copy_d2h(&mut state, bank.sequence(1)?)?;
-        assert!(state.iter().all(|&byte| byte == 0), "cold bind must reset the abandoned slot");
+        for buffer in [bank.rings_for_sequence(1)?, bank.conv_for_sequence(1)?] {
+            let mut state = vec![0; buffer.bytes];
+            library.copy_d2h(&mut state, buffer)?;
+            assert!(state.iter().all(|&byte| byte == 0), "cold bind must reset the abandoned slot");
+        }
 
         let mut cold = cache.admit_cold(&family, tokens.len(), 128,
             |units| Placement { media: None, units, slot: 2, len: 0, state_len: 0 })?;
@@ -367,10 +450,49 @@ mod tests {
                     rows * row_bytes)?, &bytes)?;
             }
         }
-        library.copy_h2d(bank.sequence(placement.slot)?, &vec![seed.wrapping_add(0x9d);
-            bank.layout.sequence_bytes])?;
+        for buffer in [bank.rings_for_sequence(placement.slot)?, bank.conv_for_sequence(placement.slot)?] {
+            library.copy_h2d(buffer, &vec![seed.wrapping_add(0x9d); buffer.bytes])?;
+        }
         placement.len = tokens.len();
         placement.state_len = tokens.len();
+        Ok(())
+    }
+
+    #[test]
+    fn target_and_draft_banks_share_combined_budget_and_last_slot_bounds() -> Result<()> {
+        use crate::shared::speculation::block_dspark::WindowSnapshots;
+        use cuteafd_loader::families::inkling2::draft::prefix_mark_slots;
+        let fixture = Fixture::build_for_tests()?;
+        let library = fixture.load()?;
+        fixture.immediate_copies(&library)?;
+        let device = Device { library: &library, id: 0 };
+        let mut cfg = Inkling2Config::from_hf(&serde_json::from_str(include_str!(
+            "../../../../cuteafd-loader/src/families/inkling2/fixtures/config.json"))?)?;
+        cfg.layers = 2; cfg.local = vec![true, false];
+        let planes = vec![4096];
+        let (draft_bytes, _) = WindowSnapshots::bytes(&planes, 1)?;
+        for host in [false, true] {
+            let reader = Rc::new(Stream::new(device)?);
+            let layout = CacheLayout::new(&cfg, 2, 1)?;
+            let budget = 3 * (layout.sequence_bytes + draft_bytes) as u64;
+            let slots = prefix_mark_slots(2, 4, layout.sequence_bytes as u64, draft_bytes as u64, budget, host)?;
+            assert_eq!(slots, if host { 2 } else { 3 });
+            let target = CacheBank::new(vec![reader.clone()], layout, slots)?;
+            let draft = WindowSnapshots::new(&reader, planes.clone(), slots)?;
+            assert_eq!(target.mark_slots(), draft.backing().buffer.bytes / draft.mark_bytes());
+            let live = Allocation::new(device, planes[0], Tag::drafter_kv("test/inkling-draft-plane"))?;
+            library.copy_h2d(live.buffer, &vec![0x5a; planes[0]])?;
+            target.capture(0, slots - 1)?;
+            // SAFETY: fixture-backed, disjoint live/mark allocations remain alive
+            // through both registered copy fences and the final drain.
+            unsafe { draft.capture(slots - 1, &[live.buffer], 0, 64)?; }
+            target.drain()?; draft.drain()?;
+            assert!(target.mark(slots).is_err());
+            assert!(draft.mark(slots).is_err());
+            let mut saved = vec![0; draft.mark_bytes()];
+            library.copy_d2h(&mut saved, draft.mark(slots - 1)?)?;
+            assert!(saved[16..16 + planes[0]].iter().all(|&byte| byte == 0x5a));
+        }
         Ok(())
     }
 
@@ -395,18 +517,26 @@ mod tests {
         cfg.layers = 2;
         cfg.local = vec![true, false];
         let cache = CacheBank::new(vec![reader.clone()], CacheLayout::with_format(&cfg, 2, 3, format)?, 1)?;
-        let state = cache.sequence(0)?;
+        let state = cache.rings_for_sequence(0)?;
         let pattern = (0..state.bytes).map(|byte| (byte.wrapping_mul(17) % 251) as u8).collect::<Vec<_>>();
+        let conv = cache.conv_for_sequence(0)?;
+        let conv_pattern = (0..conv.bytes).map(|byte| (byte.wrapping_mul(31).wrapping_add(7)%251) as u8).collect::<Vec<_>>();
         library.copy_h2d(state, &pattern)?;
+        library.copy_h2d(conv, &conv_pattern)?;
         cache.capture(0, 0)?;
         cache.reset(0)?;
         cache.restore(0, 1)?;
         cache.drain()?;
         let mut restored = vec![0; pattern.len()];
-        library.copy_d2h(&mut restored, cache.sequence(1)?)?;
+        library.copy_d2h(&mut restored, cache.rings_for_sequence(1)?)?;
         assert_eq!(restored, pattern);
-        library.copy_d2h(&mut restored, cache.sequence(0)?)?;
+        library.copy_d2h(&mut restored, cache.rings_for_sequence(0)?)?;
         assert!(restored.iter().all(|&byte| byte == 0));
+        let mut restored_conv = vec![0; conv_pattern.len()];
+        library.copy_d2h(&mut restored_conv, cache.conv_for_sequence(1)?)?;
+        assert_eq!(restored_conv, conv_pattern, "all contiguous FIR state bytes restore exactly");
+        library.copy_d2h(&mut restored_conv, cache.conv_for_sequence(0)?)?;
+        assert!(restored_conv.iter().all(|&byte|byte==0));
         let page = cache.page(1, 0)?;
         let page_pattern = vec![0x5a; page.bytes];
         library.copy_h2d(page, &page_pattern)?;
@@ -444,7 +574,7 @@ mod tests {
         let cache = Rc::new(cache);
         let family = InklingPrefix::new(cache.clone());
         let mut source = Placement { media: None, units: vec![0, 1], slot: 0, len: 65, state_len: 65 };
-        library.copy_h2d(cache.sequence(0)?, &pattern)?;
+        library.copy_h2d(cache.rings_for_sequence(0)?, &pattern)?;
         family.capture(MarkSlot(0), &source, 65).map_err(|e| anyhow::anyhow!("{e}"))?;
         source.state_len = 64;
         assert!(family.capture(MarkSlot(0), &source, 65).is_err());
@@ -454,7 +584,7 @@ mod tests {
         family.restore(Some(MarkSlot(0)), &mut destination, 65).map_err(|e| anyhow::anyhow!("{e}"))?;
         family.drain().map_err(|e| anyhow::anyhow!("{e}"))?;
         assert_eq!((destination.len, destination.state_len), (65, 65));
-        library.copy_d2h(&mut restored, cache.sequence(1)?)?;
+        library.copy_d2h(&mut restored, cache.rings_for_sequence(1)?)?;
         assert_eq!(restored, pattern);
         let sentinel = vec![0x33; page.bytes];
         library.copy_h2d(cache.page(1, 2)?, &sentinel)?;
@@ -477,7 +607,7 @@ mod tests {
 
 impl crate::shared::prefix::cuda_copy::SnapshotOwner for CacheBank<'_> {
     fn snapshot_buffers(&self) -> Result<Vec<Buffer>> {
-        Ok(std::iter::once(self.active.buffer).chain(self.marks.iter().map(|owner| owner.buffer))
+        Ok([self.active.buffer,self.conv.buffer].into_iter().chain(self.marks.iter().map(|owner| owner.buffer))
             .chain(self.pages.values().map(|owner| owner.buffer)).collect())
     }
 }

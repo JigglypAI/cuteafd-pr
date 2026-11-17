@@ -134,10 +134,10 @@ fn layout_reuses_one_immutable_catalog_across_candidates() -> anyhow::Result<()>
 }
 
 #[test]
-fn serving_refuses_only_missing_multi_gpu_and_bundled_draft_executors() {
+fn serving_refuses_missing_multi_gpu_executor_with_or_without_drafter() {
     let (dir, _, _) = fixture(Fixture::Mxfp8);
     for (gpus, draft, expected) in [(2, false, "multi-GPU serving executor not implemented (#2316)"),
-        (1, true, "bundled dSpark executor not implemented (#2320)")] {
+        (2, true, "multi-GPU serving executor not implemented (#2316)")] {
         let report = plan::plan(dir.path(), &PlanOptions {
             placement: plan::ExpertPlacement::from_spark_ranks(4),
             draft_ownership: Some(if draft { crate::plan::spec::DraftOwnership::NativeMtp }
@@ -475,6 +475,31 @@ fn serving_header_inventory_preserves_remote_native_expert_scales() -> anyhow::R
 }
 
 #[test]
+fn bundled_recurrent_census_uses_shared_shapes_and_rejects_native_drift() -> anyhow::Result<()> {
+    use crate::formats::block_dspark::recurrent::{source_shapes, RecurrentBlockConfig};
+    use crate::plan::spec::DraftOwnership;
+    let (dir, config, mut tensors) = fixture(Fixture::Mxfp8);
+    for (name, shape) in source_shapes(&RecurrentBlockConfig::from_hf(&config)?)? {
+        tensors.push(testing::t(format!("mtp.{name}"), "BF16", &shape));
+    }
+    let options = PlanOptions { draft_ownership: Some(DraftOwnership::BundledDspark), ..Default::default() };
+    testing::write_snapshot(dir.path(), &config, &tensors, None);
+    let report = plan::plan(dir.path(), &options)?;
+    assert!(report.config_error.is_none(), "{:?}", report.config_error);
+    let draft = report.components.iter().find(|c| c.component == Component::Speculator).unwrap();
+    assert!(draft.tensors > 70 && draft.rejected == 0, "{draft:?}");
+    let norm = tensors.iter_mut().find(|t| t.0 == "mtp.norm.weight").unwrap();
+    norm.1 = "F32";
+    let drift = tempfile::tempdir()?;
+    testing::write_snapshot(drift.path(), &config, &tensors, None);
+    let report = plan::plan(drift.path(), &options)?;
+    let draft = report.components.iter().find(|c| c.component == Component::Speculator).unwrap();
+    assert_eq!(draft.rejected, 1, "{draft:?}");
+    assert!(draft.rejections[0].tensor.contains("mtp.norm"));
+    Ok(())
+}
+
+#[test]
 fn structural_open_names_missing_tensors_and_accepts_reports_drift_per_tensor() {
     let (dir, small, tensors) = fixture(Fixture::Mxfp8);
     // A missing conv tensor is a typed open error naming it.
@@ -593,7 +618,9 @@ fn shared_recipe_charges_every_owner_once_on_one_and_two_rtx() {
         }).collect() };
         let inputs = InklingInputs { cfg: cfg.clone(), kv_format: crate::families::inkling2::InklingKvCache::Bf16, gpus, spark_ranks: ranks, context: Context::automatic(1 << 20),
             pool: crate::placement::prepare_pool(pool_facts(&cfg, &modes, shared::PAGE_ROWS,
-            &vec![96 << 30; gpus], Context::automatic(1 << 20), None)).unwrap(), prefill, sequences: 16, prefix_entries: 8, prefix_mark_budget: 2 << 30, targets: targets.clone(), placement, modes: modes.clone(),
+            &vec![96 << 30; gpus], Context::automatic(1 << 20), None)).unwrap(), prefill, sequences: 16, prefix_entries: 8, prefix_mark_budget: 2 << 30, prefix_mark_slots: crate::families::inkling2::draft::prefix_mark_slots(16, 8,
+                (0..cfg.layers).map(|layer| shared::SequenceState::new(&cfg,cfg.local[layer]).unwrap())
+                    .map(|state|state.ring_bytes+state.lag_bytes).sum(), 0, 2 << 30, false).unwrap(), targets: targets.clone(), placement, modes: modes.clone(),
             routed: routed.clone(), experts,
             local,
             spark: (0..=routed.len()).map(charge).collect(),
@@ -666,6 +693,7 @@ fn shared_recipe_charges_every_owner_once_on_one_and_two_rtx() {
             let owner = |id: &str| contract.components.iter().find(|component| matches!(&component.kind,
                 ComponentKind::Allocation { template, .. } if template.id == id)).unwrap();
             assert_eq!(owner("inkling2.cache.0.active").bytes.at(1).unwrap(), cache.active_bytes().unwrap() as u64);
+            assert_eq!(owner("inkling2.cache.0.conv").bytes.at(1).unwrap(), cache.conv.bytes().unwrap() as u64);
             let slots = cuteafd_core::prefix::mark_slots_with_host(16, 8, cache.sequence_bytes as u64, 2 << 30, false);
             assert_eq!(owner("inkling2.cache.0.marks").bytes.at(1).unwrap(), cache.retained_bytes(slots as usize).unwrap() as u64);
             for &layer in &cache.global_layers {

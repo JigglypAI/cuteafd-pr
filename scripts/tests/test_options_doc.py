@@ -430,7 +430,7 @@ def test_optional_levers_are_default_off_and_documented():
 
 
 def test_minimax_bundled_dspark_is_a_family_default_not_an_optional_lever():
-    assert all("SPECULATOR" not in lever["keys"] for lever in LEVERS)
+    assert all("MiniMax" not in lever["families"] for lever in LEVERS if "SPECULATOR" in lever["keys"])
     assert "SPECULATOR" in family_keys("minimax_m3")
     text = DOC.read_text()
     assert "`SPECULATOR=dspark` is the default" in text

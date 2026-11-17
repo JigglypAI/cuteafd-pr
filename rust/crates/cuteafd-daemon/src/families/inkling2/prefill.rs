@@ -11,6 +11,8 @@ pub(crate) trait UnitIo<'a> {
     fn begin(&mut self, unit: &Unit, owner: &super::owners::UnitOwner<'a>,
         uploads: &mut crate::shared::token_table::RetainedUploads<'a>) -> Result<()>;
     fn end(&mut self, unit: &Unit, owner: &super::owners::UnitOwner<'a>) -> Result<()>;
+    fn tap(&mut self,_layer:usize,_unit:&Unit,_owner:&super::owners::UnitOwner<'a>)->Result<()> {Ok(())}
+    fn stage(&mut self,_layer:usize,_stage:&str,_unit:&Unit,_owner:&super::owners::UnitOwner<'a>)->Result<()> {Ok(())}
 }
 /// Token/head edge for ordinary prefill and bounded streamed scoring. The
 /// callback consumes scratch logits before another head tile overwrites them.
@@ -25,10 +27,22 @@ pub(crate) struct TokenIo<'s, 'a> {
     pub starts: &'s [usize],
     pub slots: &'s [usize],
     pub retained_rows: bool,
+    pub draft:Option<&'s super::draft::Binding<'a>>,
+    pub publish_draft:bool,
+    pub trace:Option<&'s std::cell::RefCell<super::width_invariance::Trace>>,
     pub media: &'s [Option<cuteafd_engine::media::RequestMedia>],
     pub on_logits: &'s mut dyn FnMut(usize, usize, crate::shared::token_io::DeviceLogits) -> Result<()>,
 }
 impl<'a> UnitIo<'a> for TokenIo<'_, 'a> {
+    fn stage(&mut self,layer:usize,stage:&str,unit:&Unit,owner:&super::owners::UnitOwner<'a>)->Result<()>{
+        if let Some(trace)=self.trace{trace.borrow_mut().capture(layer,stage,unit.rows.len(),owner)?;}Ok(())
+    }
+    fn tap(&mut self,layer:usize,unit:&Unit,owner:&super::owners::UnitOwner<'a>)->Result<()> {
+        if let Some(draft)=self.draft {
+            draft.taps(self.retained_rows,unit.slot)?.entry(layer,owner.buffer("partial")?,unit.rows.len())?;
+        }
+        Ok(())
+    }
     fn begin(&mut self, unit: &Unit, owner: &super::owners::UnitOwner<'a>,
         uploads: &mut crate::shared::token_table::RetainedUploads<'a>) -> Result<()> {
         let tokens = unit_tokens(unit, self.tokens, self.starts)?;
@@ -45,13 +59,20 @@ impl<'a> UnitIo<'a> for TokenIo<'_, 'a> {
     }
     fn end(&mut self, unit: &Unit, owner: &super::owners::UnitOwner<'a>) -> Result<()> {
         let members = members(unit);
-        if !members.iter().any(|member| member.head) { return Ok(()); }
+        let head=members.iter().any(|member|member.head);
+        if !head && self.draft.is_none() {return Ok(());}
         let sequence = *self.slots.get(members[0].sequence).context("Inkling head sequence slot absent")?;
         for span in crate::shared::probe::head_spans(unit.rows.len(), 64)? {
             let state = owner.segment(self.cache, sequence, self.cfg.layers-1, span.clone())?;
             let output_row = if self.retained_rows { span.start } else { 0 };
-            let logits = self.head.project_at(self.kernels, &state, self.target, self.cfg, span.len(),
-                self.cfg.residual_blocks()+1, output_row)?;
+            let logits = if head {Some(self.head.project_at(self.kernels,&state,self.target,self.cfg,span.len(),
+                self.cfg.residual_blocks()+1,output_row)?)} else {
+                self.head.normalize(self.kernels,&state,self.target,span.len(),self.cfg.residual_blocks()+1)?;None
+            };
+            if let Some(draft)=self.draft {
+                draft.taps(self.retained_rows,unit.slot)?.final_norm(self.head.normalized(span.len())?,span.start,span.len())?;
+            }
+            let Some(logits)=logits else {continue;};
             for member in members.iter().filter(|member| member.head) {
                 let first = span.start.max(member.rows.start);
                 let end = span.end.min(member.rows.end);
@@ -61,6 +82,15 @@ impl<'a> UnitIo<'a> for TokenIo<'_, 'a> {
                     crate::shared::token_io::DeviceLogits { ptr: logits.ptr.wrapping_byte_add(offset), rows: end-first,
                         vocab: self.cfg.unpadded_vocab_size, stride: self.cfg.unpadded_vocab_size,
                         stream: owner.stream.raw, greedy: None })?;
+            }
+        }
+        if self.publish_draft {
+            if let Some(draft)=self.draft {
+                let taps=draft.taps(self.retained_rows,unit.slot)?;
+                for member in &members {
+                    let slot=*self.slots.get(member.sequence).context("draft member slot missing")?;
+                    draft.update(taps,slot,member.tokens.start,member.rows.start,member.rows.len())?;
+                }
             }
         }
         Ok(())
@@ -112,7 +142,9 @@ impl Stateful<'_, '_> {
         let members = self.packed_members(unit)?;
         let state = super::owners::PackedLayerUnit { unit: owner, cache: self.cache, layer, members: &members,
             uploads: std::cell::RefCell::new(&mut self.uploads[unit.slot]) };
-        layers::join_experts(self.kernels, &state, self.target, self.cfg, layer, unit.rows.len())
+        self.io.stage(layer,"experts",unit,owner)?;
+        layers::join_experts(self.kernels, &state, self.target, self.cfg, layer, unit.rows.len())?;
+        self.io.stage(layer,"exit",unit,owner)
     }
 }
 
@@ -145,11 +177,14 @@ impl PrefillHooks for Stateful<'_, '_> {
     }
     fn attention(&mut self, layer: usize, unit: &Unit) -> Result<()> {
         let owner = &self.owners[unit.slot];
+        self.io.tap(layer,unit,owner)?;
+        self.io.stage(layer,"entry",unit,owner)?;
         let members = self.packed_members(unit)?;
         owner.packed_metadata(layer, self.cache, &members, &mut self.uploads[unit.slot])?;
         let state = super::owners::PackedLayerUnit { unit: owner, cache: self.cache, layer, members: &members,
             uploads: std::cell::RefCell::new(&mut self.uploads[unit.slot]) };
-        layers::begin_layer(self.kernels, &state, self.target, self.cfg, layer, unit.rows.len())
+        layers::begin_layer(self.kernels, &state, self.target, self.cfg, layer, unit.rows.len())?;
+        self.io.stage(layer,"attention",unit,owner)
     }
     fn local_ffn(&mut self, layer: usize, unit: &Unit) -> Result<()> {
         let owner = &self.owners[unit.slot];

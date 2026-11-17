@@ -63,6 +63,7 @@ pub(super) struct Model {
     /// Logical weights by stem.
     contracts: BTreeMap<String, Contract>,
     core: BTreeMap<String, crate::formats::trellis_core::CoreProjection>,
+    draft_shapes: BTreeMap<String, Vec<usize>>,
     /// Checkpoint bytes of every routed-expert tensor (headers only).
     pub(crate) routed_bytes: u64,
     /// Each routed layer's storage, from its own `w13` headers.
@@ -176,7 +177,7 @@ impl Model {
         let expected = contracts.iter().filter(|(_, contract)| contract.shape.len() == 2
             && matches!(contract.storage, Storage::Bf16)).map(|(stem, contract)|
                 (format!("{stem}.weight"), contract.shape.clone())).collect();
-        let core = crate::formats::trellis_core::read_projections(checkpoint, &expected,
+        let mut core = crate::formats::trellis_core::read_projections(checkpoint, &expected,
             |name| name.starts_with(TEXT) && !name.contains(".experts."),
             |stem| {
                 let selected = stem == "model.llm.unembed" || ["wq_du", "wr_du", "wk_dv", "wv_dv", "gate_attn", "wo_ud"]
@@ -185,8 +186,22 @@ impl Model {
                     split: crate::formats::trellis_core::CoreSplit::Whole,
                     padded_outputs: stem == "model.llm.unembed", view_varying: true })
             })?;
+        let draft_shapes = if mtp.is_some() {
+            use crate::formats::block_dspark::recurrent::{source_shapes, RecurrentBlockConfig};
+            source_shapes(&RecurrentBlockConfig::from_hf(&checkpoint.config)?)?.into_iter()
+                .map(|(name, shape)| (format!("mtp.{name}"), shape)).collect::<BTreeMap<_, _>>()
+        } else { BTreeMap::new() };
+        core.extend(crate::formats::trellis_core::read_projections(checkpoint, &draft_shapes,
+            |name| name.starts_with("mtp."), |stem| {
+                let weight = format!("{stem}.weight");
+                (draft_shapes.get(&weight).is_some_and(|shape| shape.len() == 2)
+                    && !draft_shapes.contains_key(&format!("{stem}.bias"))
+                    && stem != "mtp.markov_head.markov_w1").then_some(
+                        crate::formats::trellis_core::CoreContract { family: "Inkling recurrent drafter", widths: &[6,8],
+                            split: crate::formats::trellis_core::CoreSplit::Whole, padded_outputs: false, view_varying: true })
+            })?);
         let model = Self { spec: spec(&cfg, vision.is_some(), mtp.as_ref(), &expert_storage, checkpoint), cfg, contracts,
-            core, routed_bytes, expert_storage };
+            core, draft_shapes, routed_bytes, expert_storage };
         // Open is structural: every contract member must be present by name, so
         // a missing tensor is a typed open error that names it. Exact dtype and
         // shape agreement and unknown tensors are `accepts` verdicts, reported
@@ -381,12 +396,12 @@ impl Family for Inkling2 {
         Some(TensorRole::layer(component, layer))
     }
     fn component_hint(&self, component: Component) -> Option<Hint> {
+        if component == Component::Speculator { return None; }
         let how = match component {
             Component::Attention => "Export the biased-sink GQA tile (per-token per-head sinks, distance-indexed additive bias, window 1024), the short-conv (static and dynamic taps), L2-clip and output-gate kernels; see #1930 measure-first notes.",
             Component::ResidualMix => "Generalize the Kimi attn_res softmax mix to hidden 4608 (#1934 S2).",
             Component::RoutedExpert => "Export routed MXFP8 W8A8 and native NVFP4 W4A4 (per-token amax, fouroversix) experts with SiTU and route-weight-before-FC2 quantization, and register the EXL3 K4 geometry (4608, 2304, 384, 8, situ); see #1930 kernel notes.",
             Component::Vision => "Wire the bundled PE-Lang ViT (2-D rotary, layer scale) and 2x2 merge projector through shared media admission with their own arena.",
-            Component::Speculator => "Wire the bundled dSpark (block 8, rnn_hidden Markov head with f_rnn and head fold) through shared speculation; generalize DraftHeadOps::RnnMarkov (#1934 S4).",
             _ => "Add the Inkling 2 serving hooks over the shared scheduler, fixed-depth packed prefill and bounded graph cache; admit named owners and packed arenas through the shared recipe.",
         };
         Some(Hint { what: format!("Inkling 2 {} execution is not implemented in this build", component.label()), how: how.into() })
@@ -410,6 +425,15 @@ impl FamilyModel for Model {
                 && operand.logical == [projection.stored_outputs, projection.shape[1]],
                 || format!("{stem}: expected selected header-native K{} [{},{}]", projection.bits,
                     projection.stored_outputs, projection.shape[1]));
+        }
+        if role.component == Component::Speculator {
+            let name = if self.draft_shapes.contains_key(stem) { stem.to_owned() } else { format!("{stem}.weight") };
+            let shape = self.draft_shapes.get(&name)
+                .ok_or_else(|| format!("{stem}: outside the Inkling recurrent drafter tensor contract"))?;
+            let bias = self.draft_shapes.contains_key(&format!("{stem}.bias"));
+            return super::require(operand.logical == *shape && operand.is_plain(&[format::Encoding::Bf16])
+                && operand.input_scale.is_none() && operand.companions == if bias { vec!["bias"] } else { Vec::<&str>::new() },
+                || format!("{stem}: expected recurrent BF16 {shape:?}, found {}", super::describe(operand)));
         }
         // Per-expert EXL3 modules carry the expert id in their stem; the
         // contract is keyed by the fused per-layer stem.
