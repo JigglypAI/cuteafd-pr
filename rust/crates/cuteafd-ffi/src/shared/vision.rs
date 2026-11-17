@@ -169,6 +169,11 @@ impl std::ops::Deref for VisionSpecView {
 }
 
 impl VisionSpec {
+    /// Mirrors cuteafd_vision_encode_pixels dispatch: both PE and generic
+    /// tower paths consume source/content geometry, legacy paths do not.
+    pub fn supports_source_pixels(&self) -> bool {
+        self.perception.is_some() || self.tower.is_some()
+    }
     /// Layer storage is owned and follows the checkpoint depth, never an ABI cap.
     pub fn with_depth(mut self, depth: usize) -> Self {
         self.depth = u32::try_from(depth).expect("vision depth must fit u32");
@@ -511,7 +516,7 @@ impl NativeVision {
                     spec.patch_size as usize
                 },
                 span_markers: spec.abi_version == 2 && spec.reserved == MISTRAL_RESERVED,
-                source_pixels: spec.perception.is_some(),
+                source_pixels: spec.supports_source_pixels(),
                 merge: if spec
                     .perception
                     .as_ref()
@@ -876,6 +881,22 @@ fn validate_injection(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn generic_tower_owner_dispatch_accepts_padded_source_geometry() {
+        use cuteafd_core::media::ImagePixels;
+        let mut spec=VisionSpec::default();
+        let pixels=ImagePixels {source:[672,454],canvas:[672,476],content:[0,0,672,454]};
+        assert!(validate_pixel_geometry([34,48],pixels,14,spec.supports_source_pixels()).is_err());
+        spec.tower=Some(TowerExtension::default());
+        assert!(spec.supports_source_pixels());
+        assert!(validate_pixel_geometry([34,48],pixels,14,spec.supports_source_pixels()).is_ok());
+        let minimax=ImagePixels::full(672,476);
+        assert!(validate_pixel_geometry([34,48],minimax,14,spec.supports_source_pixels()).is_ok());
+        spec.tower=None;spec.perception=Some(PerceptionSpec::default());
+        assert!(spec.supports_source_pixels());
+        assert!(validate_pixel_geometry([34,48],pixels,14,spec.supports_source_pixels()).is_ok());
+    }
+
     #[test]
     fn legacy_towers_refuse_nontrivial_pixel_geometry_before_native_dispatch() {
         use cuteafd_core::media::ImagePixels;

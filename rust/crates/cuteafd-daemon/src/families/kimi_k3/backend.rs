@@ -21,6 +21,7 @@ impl scheduler::DraftState for DraftState {
 }
 
 pub(crate) struct KimiBackend<'e, 'a> {
+    media_enabled: bool,
     engine: &'e Engine<'a>,
     profile: RefCell<[f64; 2]>,
     geometry: scheduler::Geometry,
@@ -29,8 +30,9 @@ pub(crate) struct KimiBackend<'e, 'a> {
 }
 
 impl<'e, 'a> KimiBackend<'e, 'a> {
+    pub(crate) fn with_media_enabled(mut self,enabled:bool)->Self {self.media_enabled=enabled;self}
     pub(crate) fn new(engine: &'e Engine<'a>) -> Result<Self> {
-        Ok(Self { engine, profile: RefCell::new([0.0; 2]), geometry: engine.geometry()?,
+        Ok(Self { media_enabled:false,engine, profile: RefCell::new([0.0; 2]), geometry: engine.geometry()?,
             steady_census: Cell::new(false), origins: RefCell::new(vec![0; engine.geometry()?.slots]) })
     }
 }
@@ -70,25 +72,49 @@ impl<'e, 'a> Backend<'a> for KimiBackend<'e, 'a> {
         Ok((family, cache))
     }
     fn prepare(&self, job: NativeRequest, tokens: Vec<u32>) -> Result<(scheduler::Prompt, RequestMedia, Vec<EncodeJob>)> {
-        crate::shared::probe::still::prepare(job, tokens, u32::try_from(self.geometry.vocab_size)?,
-            7168, self.geometry.max_context, self.engine.target_view().snapshot(), cuteafd_loader::media::ImageFamily::Kimi)
+        let snapshot=self.engine.target_view().snapshot();
+        if job.media.is_empty() || job.probe.as_ref().is_some_and(|p|!p.spec.media.is_empty()) {
+            return crate::shared::probe::still::prepare(job,tokens,self.geometry.vocab_size as u32,7168,self.geometry.max_context,snapshot,cuteafd_loader::media::ImageFamily::Kimi);
+        }
+        ensure!(self.media_enabled,"vision is disabled");
+        let tokenizer=cuteafd_loader::cached_tokenizer(snapshot)?;
+        let ids=tokenizer.added_token_ids(&["<|media_pad|>","<|media_end|>"]);
+        ensure!(ids.len()==2,"Kimi image markers absent");
+        let mut job=job;let mut groups=std::mem::take(&mut job.image_groups);
+        ensure!(groups.len()==job.media.len(),"Kimi source groups absent");
+        for group in &mut groups {
+            let [w,h]=group.source;
+            let prefix=tokenizer.encode_ids(&format!("<|media_begin|>image {w}x{h}<|media_content|>"))?;
+            group.fragments=vec![cuteafd_loader::media::ImageFragment::Tokens(prefix),
+                cuteafd_loader::media::ImageFragment::Features {image:0,placeholder:ids[0]},
+                cuteafd_loader::media::ImageFragment::Tokens(vec![ids[1]])];
+        }
+        crate::shared::vision::still::Binding::prepare(job,tokens,self.geometry.vocab_size as u32,7168,
+            self.geometry.max_context,ids[0],groups)
     }
     fn probe_features(&self, prompt: &scheduler::Prompt, media: &mut RequestMedia,
         cache: &mut EmbeddingCache, snapshot: &Path) -> Result<()> {
-        crate::shared::probe::still::features(prompt, media, cache, snapshot, cuteafd_loader::media::ImageFamily::Kimi)
+        if prompt.job.probe.as_ref().is_some_and(|p|p.spec.feature_scoring()) {
+            crate::shared::probe::still::features(prompt, media, cache, snapshot, cuteafd_loader::media::ImageFamily::Kimi)?;
+        }
+        Ok(())
     }
     fn coordinates(&self, tokens: &[u32], job: &NativeRequest, media: &RequestMedia) -> Result<()> {
+        if self.media_enabled && job.probe.as_ref().is_none_or(|p|p.spec.media.is_empty()) {
+            ensure!(media.prompt_len()==tokens.len(),"Kimi image prompt extent");return Ok(());
+        }
         let spans = crate::shared::probe::still::spans(job, tokens, self.geometry.vocab_size as u32,
             self.geometry.max_context, self.engine.target_view().snapshot(), cuteafd_loader::media::ImageFamily::Kimi)?;
         ensure!(spans == media.spans(), "Kimi probe media coordinates differ");
         Ok(())
     }
     fn placement(&self, units: Vec<u32>, slot: i32) -> Placement {
-        Placement { units, slot: slot as usize, len: 0, state_len: 0 }
+        Placement { media_spans: Vec::new(), units, slot: slot as usize, len: 0, state_len: 0 }
     }
     fn bind_request(&self, placement: &mut Placement, _coordinates: (), media: RequestMedia,
         _tokens: &[u32], resume: usize) -> Result<()> {
         self.engine.probe_media.borrow_mut().remove(&placement.slot);
+        placement.media_spans=media.spans().to_vec();
         if !media.spans().is_empty() { self.engine.probe_media.borrow_mut().insert(placement.slot, media); }
         if let Some(draft) = self.engine.native_draft() {
             let (origin, end) = draft.frontier(placement.slot)?;
@@ -311,7 +337,7 @@ mod tests {
         let family = backend.engine.prefix_family()?;
         let starts = [0, 3, 7];
         let mut placements = prompts.iter().enumerate().map(|(slot, prompt)| {
-            let mut placement = Placement { units: pool.alloc((prompt.len() + 1).div_ceil(64))?,
+            let mut placement = Placement { media_spans: Vec::new(), units: pool.alloc((prompt.len() + 1).div_ceil(64))?,
                 slot, len: 0, state_len: 0 };
             family.bind(&mut placement).map_err(|error| anyhow::anyhow!(error.to_string()))?;
             family.admit_draft_pages(&mut placement, prompt.len() + 1)
@@ -373,7 +399,7 @@ mod tests {
         let layout = family.layout();
         let draft = backend.engine.native_draft().context("live prefix gate requires DFlash2")?;
         let tokens = (0..131).map(|i| source[i % source.len()]).collect::<Vec<_>>();
-        let build = |slot| move |units| Placement { units, slot, len: 0, state_len: 0 };
+        let build = |slot| move |units| Placement { media_spans: Vec::new(), units, slot, len: 0, state_len: 0 };
         let chunk = layout.mark_bytes.max(layout.page_bytes) as u64;
         let copy = CudaCopyEngine::registered_retained(backend.library(), family.snapshot_owners(), family.snapshot_retained())?;
         let mut cache = PrefixCache::new_with_draft_pages(layout, PrefixConfig {
@@ -483,7 +509,7 @@ mod tests {
         for packed in [false, true] {
             let mut placements = windows.iter().enumerate().map(|(slot, window)| {
                 let end = window.positions.last().context("Kimi packing golden empty")?.pos;
-                let mut placement = Placement { units: pool.alloc(end.div_ceil(64))?, slot, len: 0, state_len: 0 };
+                let mut placement = Placement { media_spans: Vec::new(), units: pool.alloc(end.div_ceil(64))?, slot, len: 0, state_len: 0 };
                 family.bind(&mut placement).map_err(|e| anyhow::anyhow!(e.to_string()))?;
                 family.admit_draft_pages(&mut placement, end).map_err(|e| anyhow::anyhow!(e.to_string()))?;
                 Ok(placement)
@@ -668,7 +694,7 @@ mod tests {
         let prefill = args.prefill()?;
         let peer = args.split_device.context("two-GPU packing gate requires --split-device")?;
         let loaded = super::super::startup::load(&library, &programs, &checkpoint, &cfg, &cfg,
-            super::super::startup::Options { role: super::super::startup::Role::Serve, expert_usage: false, expert_usage_reader: Default::default(), cache_format: args.kv_cache, devices: [args.device, peer],
+            super::super::startup::Options { media: None, role: super::super::startup::Role::Serve, expert_usage: false, expert_usage_reader: Default::default(), cache_format: args.kv_cache, devices: [args.device, peer],
                 attention: cuteafd_loader::placement::attention::parse(&args.attention_placement).map_err(anyhow::Error::msg)?,
                 native_lib: &args.native_lib, manifest: &args.manifest, peers: args.peers.clone(), rtx_expert_layers: args.rtx_expert_layers,
                 rows: usize::try_from(prefill.span_rows)?,

@@ -1256,6 +1256,7 @@ def kimi_kda_programs(g, decode_rows: int, prefill_rows: int, max_context: int):
     out.extend(kimi_context_programs(decode_rows, max_context))
     out.extend(kimi_shared_programs())
     out.extend(mla_draft_programs(decode_rows, max_context))
+    out.extend(mla_draft_fp8_weight_programs(64))
     return out
 
 
@@ -1323,6 +1324,7 @@ def kimi_k31_programs(g, decode_rows: int, prefill_rows: int, max_context: int):
                     lambda rb=record_bytes: context_split.compile_paged_staging_gather_aot(
                         row_bytes=rb, page_rows=PAGE_ROWS)))
     out.extend(causal_mla_draft_programs(64, max_context))
+    out.extend(mla_draft_fp8_weight_programs(64, causal=True))
     return out
 
 
@@ -1418,6 +1420,25 @@ def causal_mla_draft_programs(max_rows: int, max_context: int):
                     {"max_rows": max_rows, "max_context": max_context, "heads": 96,
                      "window_size": 1024, "is_causal": True, "kv_cache": cache},
                     lambda c=cache: build("attention", c)))
+    return out
+
+
+def mla_draft_fp8_weight_programs(max_rows: int, causal: bool = False):
+    """Additive #385 body-weight wrappers; attention and existing BF16 exports stay unchanged."""
+    from b12x.integration.cuteafd import kimi_mla
+
+    def build(op, cache="bf16"):
+        geometry = (kimi_mla.CausalMlaDraftGeometry if causal else kimi_mla.MlaDraftGeometry)(kv_cache=cache)
+        return getattr(kimi_mla, f"compile_mla_draft_{op}_fp8_weights_aot")(geometry, max_rows=max_rows)
+
+    tag = "_causal_h96" if causal else ""
+    out = [(f"mla_draft_output_fp8_weights{tag}_m{max_rows}", "mla_draft_output_fp8_weights",
+            {"max_rows": max_rows, "heads": 96 if causal else 64}, lambda: build("output"))]
+    for cache in ("bf16", "fp8"):
+        suffix = "" if cache == "bf16" else "_fp8"
+        out.append((f"mla_draft_producer_fp8_weights{tag}{suffix}_m{max_rows}", "mla_draft_producer_fp8_weights",
+                    {"max_rows": max_rows, "heads": 96 if causal else 64, "kv_cache": cache},
+                    lambda c=cache: build("producer", c)))
     return out
 
 

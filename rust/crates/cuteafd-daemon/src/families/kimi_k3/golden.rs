@@ -738,7 +738,7 @@ fn score_decode(args: &GoldenArgs, engine: &Engine<'_>, pool: &mut cuteafd_engin
     for window in windows {
         let count = window.tokens.len() - 1;
         let units = pool.alloc(window.tokens.len().div_ceil(cuteafd_ffi::MLA_PAGE_ROWS))?;
-        let mut placement = super::prefix::Placement { units: units.clone(), slot: 0, len: 0, state_len: 0 };
+        let mut placement = super::prefix::Placement { media_spans: Vec::new(), units: units.clone(), slot: 0, len: 0, state_len: 0 };
         family.bind(&mut placement).map_err(|error| anyhow::anyhow!("{error}"))?;
         let dump = root.join(&window.id);
         let probe = Probe::new(ProbeSpec { cold: true, no_speculation: true,
@@ -813,7 +813,7 @@ fn score_verify(args: &GoldenArgs, engine: &Engine<'_>, pool: &mut cuteafd_engin
         let count = window.tokens.len() - 1;
         let end = args.verify_limit.map_or(count, |limit| count.min(window.score_from - 1 + limit));
         let units = pool.alloc(window.tokens.len().div_ceil(cuteafd_ffi::MLA_PAGE_ROWS))?;
-        let mut placement = super::prefix::Placement { units: units.clone(), slot: 0, len: 0, state_len: 0 };
+        let mut placement = super::prefix::Placement { media_spans: Vec::new(), units: units.clone(), slot: 0, len: 0, state_len: 0 };
         family.bind(&mut placement).map_err(|error| anyhow::anyhow!("{error}"))?;
         let dump = root.join(&window.id);
         let probe = Probe::new(ProbeSpec { cold: true, no_speculation: true,
@@ -888,7 +888,7 @@ fn load_target<'a, const RANKS: usize>(args: &GoldenArgs, library: &'a Arc<cutea
     full: &KimiK3Config, cfg: &KimiK3Config, devices: [i32; RANKS],
     prefill: cuteafd_loader::serving_capacity::prefill_waves::PrefillPlan, graphs: bool, verify: usize)
     -> Result<super::startup::Loaded<'a>> {
-    super::startup::load(library, programs, checkpoint, full, cfg, super::startup::Options { role: args.role(), expert_usage: false, expert_usage_reader: Default::default(),
+    super::startup::load(library, programs, checkpoint, full, cfg, super::startup::Options { media: None, role: args.role(), expert_usage: false, expert_usage_reader: Default::default(),
         cache_format: args.kv_cache, devices,
         attention: cuteafd_loader::placement::attention::parse(&args.attention_placement).map_err(anyhow::Error::msg)?,
         native_lib: args.native_lib.as_deref().context("--native-lib required")?,
@@ -1623,7 +1623,7 @@ mod tests {
             crate::shared::placement::spark_rings(cuteafd_transport::TcpTransportConfig::default().max_frame_bytes)?,
             cuteafd_loader::serving_capacity::spark_memory::serving_bytes().into_iter().max().unwrap_or(0),
             cuteafd_loader::families::kimi_k3::spark::reserve_bytes(6, 2, rows as u64)?)?;
-        let admitted = admission::admit(admission::Inputs { skip_routed_experts: false, expert_usage: false, cfg: &cfg, core: Default::default(),
+        let admitted = admission::admit(admission::Inputs { vision: None, skip_routed_experts: false, expert_usage: false, cfg: &cfg, core: Default::default(),
             resident_weight_limit: cuteafd_loader::placement::ResidentWeights::DEFAULT_LIMIT, cache_format: cuteafd_core::MlaCacheFormat::Bf16, gpus: [GpuBudget {
             capacity_bytes: 96 << 30, reserve_bytes: 2 << 30,
             baseline: cuteafd_loader::placement::Baseline::Measured { free_bytes: (96 << 30) - reserve } }; 2],

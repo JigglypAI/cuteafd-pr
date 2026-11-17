@@ -54,6 +54,7 @@ pub(super) struct Model {
     snapshot: std::path::PathBuf,
     spec: ModelSpec,
     tensors: BTreeMap<String, Tensor>,
+    vision_shapes: BTreeMap<String, Vec<usize>>,
     /// Header byte counts by component.
     bytes: BTreeMap<Component, u64>,
     /// Every expected text tensor has a readable header.
@@ -92,6 +93,9 @@ fn text(name: &str) -> Option<&str> { name.strip_prefix(TEXT) }
 impl Model {
     fn open(checkpoint: &Checkpoint) -> Result<Self> {
         let cfg = KimiK3Config::from_hf(&checkpoint.config)?;
+        let vision_shapes=if checkpoint.config.get("vision_config").is_some() {
+            crate::families::kimi_k3::vision::VisionContract::from_config(&checkpoint.config)?.tensor_shapes().into_iter().collect::<BTreeMap<_,_>>()
+        }else{BTreeMap::new()};
         cfg.release_geometry()?;
         let (h, v, d) = (cfg.hidden, cfg.vocab_size, cfg.kda_heads * cfg.kda_head_dim);
         let mut tensors = BTreeMap::new();
@@ -161,7 +165,7 @@ impl Model {
         }
         let spec = spec(&cfg, checkpoint);
         let mla = vec![Residency::default(); cfg.layers];
-        let mut model = Self { cfg, snapshot: checkpoint.snapshot.clone(), spec, tensors, bytes: BTreeMap::new(), complete: true, expert_formats: Vec::new(),
+        let mut model = Self { vision_shapes, cfg, snapshot: checkpoint.snapshot.clone(), spec, tensors, bytes: BTreeMap::new(), complete: true, expert_formats: Vec::new(),
             coordinator: Residency::default(), frontends: [0; 2], mla,
             core: crate::families::kimi_k3::core::CoreInventory::default() };
         model.core = crate::families::kimi_k3::core::CoreInventory::from_checkpoint(&model.cfg, checkpoint,
@@ -318,10 +322,7 @@ impl Family for KimiK3 {
     }
     fn component_hint(&self, component: Component) -> Option<Hint> {
         match component {
-            Component::Vision => Some(Hint {
-                what: "Kimi K3 bundled vision is planned; production qualification remains pending (#1984)".into(),
-                how: "The joint planner admits MoonViT3d and patchmergerv2; normal serving remains text-only until qualification.".into(),
-            }),
+            Component::Vision => None,
             Component::Speculator | Component::SpeculatorExpert => Some(Hint {
                 what: "Kimi K3 draft execution is not implemented".into(),
                 how: "Serve text without speculation; a windowed external drafter needs a native integration".into(),
@@ -368,6 +369,13 @@ impl FamilyModel for Model {
         (layer < self.cfg.layers).then(|| self.cfg.activation())
     }
     fn accepts(&self, role: &TensorRole, stem: &str, operand: &mut QuantOperand) -> Result<(), String> {
+        if role.component==Component::Vision {
+            let expected=self.vision_shapes.get(&format!("{stem}.weight")).or_else(||self.vision_shapes.get(stem))
+                .ok_or_else(||format!("{stem}: outside Kimi native tower contract"))?;
+            return super::require(operand.logical==*expected&&operand.is_plain(&[format::Encoding::Bf16])
+                &&operand.input_scale.is_none()&&operand.companions.is_empty(),
+                ||format!("{stem}: Kimi tower requires BF16 {expected:?}"));
+        }
         if let Some(projection) = self.core.projections.get(stem) {
             return super::require(matches!(operand.encoding, format::Encoding::Exl3 { bits } if bits == projection.bits)
                 && operand.logical == [projection.stored_outputs, projection.shape[1]],

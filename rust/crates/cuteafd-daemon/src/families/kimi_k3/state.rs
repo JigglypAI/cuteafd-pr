@@ -425,8 +425,8 @@ mod tests {
 
     fn provisional_fixture() -> Result<(Provisional, Vec<super::super::prefix::Placement>, Vec<Vec<u32>>)> {
         let mut placements = vec![
-            super::super::prefix::Placement { units: vec![1, 2], slot: 1, len: 65, state_len: 65 },
-            super::super::prefix::Placement { units: vec![3], slot: 0, len: 9, state_len: 9 },
+            super::super::prefix::Placement { media_spans: Vec::new(), units: vec![1, 2], slot: 1, len: 65, state_len: 65 },
+            super::super::prefix::Placement { media_spans: Vec::new(), units: vec![3], slot: 0, len: 9, state_len: 9 },
         ];
         let rows = vec![vec![10, 11, 12, 13], vec![20, 21, 22]];
         let mut sequences = placements.iter_mut().zip(&rows).map(|(p, t)| (p, t.as_slice())).collect::<Vec<_>>();
