@@ -112,6 +112,16 @@ def rotary_check(lib, baseline=None):
             rows,heads,kvh,dim,10000.,factor,1e-6,stream)==0
         torch.cuda.synchronize()
         assert torch.equal(q,compact_q), "FP8 KV changed query bytes"
+        if baseline is not None and (not yarn or dim == 128):
+            old_q=torch.empty_like(q)
+            old_k=torch.full_like(compact_k,0xA5)
+            old_v=torch.full_like(compact_v,0xA5)
+            assert baseline.cuteafd_block_dspark_qk_rope_fp8(*pointers,
+                inv_freq.data_ptr() if inv_freq is not None else None,
+                old_q.data_ptr(),old_k.data_ptr(),old_v.data_ptr(),
+                rows,heads,kvh,dim,10000.,factor,1e-6,stream)==0
+            torch.cuda.synchronize()
+            assert all(torch.equal(a,b) for a,b in zip((compact_q,compact_k,compact_v),(old_q,old_k,old_v))), "baseline FP8 rotary bytes changed"
         expected_k,expected_v=pack(k),pack(v)
         for row,slot in enumerate(slots.tolist()):
             if slot>=0:

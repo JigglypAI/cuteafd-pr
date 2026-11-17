@@ -5920,4 +5920,4 @@ def test_other_family_refuses_unimplemented_context_window(tmp_path):
     result = _family_launch_result(tmp_path, {"model_type":"glm_moe_dsa", "num_hidden_layers":4,
         "first_k_dense_replace":3}, "test/glm", "DRAFT_CONTEXT_WINDOW=2048\n")
     assert result.returncode == 2
-    assert "unused configuration key: DRAFT_CONTEXT_WINDOW" in result.stderr
+    assert "DRAFT_CONTEXT_WINDOW currently requires Kimi block DSpark" in result.stderr

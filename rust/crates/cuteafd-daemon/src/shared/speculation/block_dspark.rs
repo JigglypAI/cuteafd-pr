@@ -2195,7 +2195,8 @@ mod tests {
         fixture.immediate_copies(&library)?;
         fixture.quiet_events(&library, true)?;
         let device = Device { library: &library, id: 1 };
-        for (window, rank) in [(Some(8), 256), (None, 256), (Some(8), 512), (None, 512)] {
+        for (window, rank, dim, yarn) in [(Some(8),256,128,false),(None,256,128,false),
+            (Some(8),512,128,false),(None,512,128,false),(Some(8),256,64,true),(None,256,64,true)] {
             let root = tempfile::tempdir_in(fixture.directory())?;
             let snapshot = root.path().join("draft");
             std::fs::create_dir_all(&snapshot)?;
@@ -2203,10 +2204,12 @@ mod tests {
                 "aux_hidden_state_layer_ids":[1], "block_size":2, "confidence_head_with_markov":true,
                 "draft_vocab_size":16, "enable_confidence_head":true, "markov_head_type":"vanilla", "markov_rank":rank,
                 "mask_token_id":0, "sample_from_anchor":true, "sliding_window_non_causal":false,
-                "transformer_layer_config":{"attention_bias":false, "head_dim":128, "hidden_act":"silu",
+                "transformer_layer_config":{"attention_bias":false, "head_dim":dim, "hidden_act":"silu",
                     "hidden_size":256, "intermediate_size":256, "layer_types":[if window.is_some() { "sliding_attention" } else { "full_attention" }],
                     "max_position_embeddings":64, "model_type":"qwen3", "num_attention_heads":2, "num_hidden_layers":1,
-                    "num_key_value_heads":2, "rms_norm_eps":1e-5, "rope_parameters":{"rope_theta":10000.0,"rope_type":"default"},
+                    "num_key_value_heads":2, "rms_norm_eps":1e-5, "rope_parameters":if yarn {
+                        serde_json::json!({"rope_theta":10000.,"rope_type":"yarn","factor":16.,"original_max_position_embeddings":65536})
+                    } else { serde_json::json!({"rope_theta":10000.0,"rope_type":"default"}) },
                     "sliding_window":window, "vocab_size":16}});
             std::fs::write(snapshot.join("config.json"), serde_json::to_vec(&config)?)?;
             let cfg = DsparkConfig::read(&snapshot)?;
@@ -2223,7 +2226,8 @@ mod tests {
                 }).collect::<Vec<_>>();
                 file.write_all_at(&bytes,tensor.byte_offset)?;
             }
-            let shapes = [(256,256),(256,768),(256,512)].into_iter().collect::<BTreeSet<_>>();
+            let shapes = [(256,256),(256,cfg.qkv_width()),(cfg.q_width(),256),(256,2*cfg.kv_width()),(256,512)]
+                .into_iter().collect::<BTreeSet<_>>();
             let entries = shapes.into_iter().map(|(k,n)| serde_json::json!({"name":format!("draft_bf16_k{k}_n{n}"),
                 "pointers":[{"name":"x"},{"name":"w"},{"name":"out"}], "scalars":[{"type":"int32"}],
                 "capacity_rows":TAP_ROWS, "scratch_bytes_at_capacity":{}, "geometry":{"width":k,"outputs":n,
@@ -2324,6 +2328,120 @@ mod tests {
                 }
             }
         }
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "installed Lithos parity fixture; requires sealed CUDA programs and reference outputs"]
+    fn installed_lithos_dspark_forward_parity_fixture() -> Result<()> {
+        use crate::shared::memory::{device::{Device,Stream},weight_arena::DeviceWeightArena};
+        use cuteafd_core::memory_layout::ArenaTag;
+        use cuteafd_loader::families::qwen4::Qwen4KvCache;
+        let Some(snapshot)=std::env::var_os("CUTEAFD_TEST_DRAFT_SNAPSHOT").map(std::path::PathBuf::from)
+            .filter(|p|p.join("config.json").is_file()) else {
+            eprintln!("SKIP installed Lithos parity fixture: checkpoint absent"); return Ok(());
+        };
+        let root=std::path::PathBuf::from(std::env::var("CUTEAFD_GOLDEN_FIXTURES")?);
+        let golden=root.join("taps");
+        let target=std::path::PathBuf::from(std::env::var("CUTEAFD_TEST_TARGET_SNAPSHOT")?);
+        let metadata:serde_json::Value=serde_json::from_slice(&std::fs::read(root.join("full-bf16/meta.json"))?)?;
+        let positions=metadata["positions"].as_array().context("fixture positions")?.iter()
+            .map(|n|n.as_u64().map(|n|n as usize).context("fixture position")).collect::<Result<Vec<_>>>()?;
+        let cfg=DsparkConfig::read(&snapshot)?;
+        ensure!((cfg.hidden,cfg.heads,cfg.kv_heads,cfg.head_dim,cfg.block,cfg.rank)==(7168,64,16,64,5,256)
+            && cfg.taps==[7,23,67,83,91] && cfg.mask_token==163824 && cfg.window.is_none(),"fixture is not native Lithos");
+        let tokens=std::fs::read(golden.join("tokens.bin"))?.chunks_exact(4)
+            .map(|b|u32::from_le_bytes(b.try_into().unwrap())).collect::<Vec<_>>();
+        let context=tokens.len();
+        let layers=cfg.taps.iter().map(|l|std::fs::read(golden.join(format!("layer{l:02}.bin"))))
+            .collect::<std::io::Result<Vec<_>>>()?;
+        // SAFETY: matching sealed library outlives every native owner in this isolated test.
+        let library=unsafe { NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
+        let manifest=std::path::PathBuf::from(std::env::var("CUTEAFD_PROGRAM_MANIFEST")?);
+        let programs=library.programs()?.with_manifest(&manifest)?;
+        let device=Device { library:&library,id:std::env::var("CUTEAFD_CACHE_TEST_DEVICE")?.parse()? };
+        let stream=Stream::new(device)?;
+        let source=super::super::weights::Source::open(&target)?;
+        let index:serde_json::Value=serde_json::from_slice(&std::fs::read(target.join("model.safetensors.index.json"))?)?;
+        let find=|suffix:&str|->Result<String> {
+            let names=index["weight_map"].as_object().context("target index")?.keys()
+                .filter(|name|name.ends_with(suffix)).cloned().collect::<Vec<_>>();
+            ensure!(names.len()==1,"target operand {suffix} is ambiguous");Ok(names[0].clone())
+        };
+        let embedding=source.rect(&find("embed_tokens.weight")?,&[cfg.vocab,cfg.hidden])?;
+        let head_name=find("lm_head.weight")?;
+        let head_requests=vec![(head_name.clone(),cfg.vocab*cfg.hidden*2)];
+        let head_arena=DeviceWeightArena::new(device,cuteafd_loader::serving_capacity::WeightArenaLayout::new(
+            "test/lithos-head",head_requests)?,ArenaTag::drafter_weights("test/lithos-head"))?;
+        let head=device.run(|| {
+            let mut allocate=|physical,name:&str,bytes| { ensure!(physical==device.id,"fixture head owner");head_arena.view(name,bytes) };
+            super::super::weights::Load::open(&library,&target)?.with_allocator(&mut allocate)
+                .tensor(&head_name,&[cfg.vocab,cfg.hidden])
+        })?;
+        for window in [0,2048] { for kv in [Qwen4KvCache::Bf16,Qwen4KvCache::Fp8] {
+            let name=format!("{}-{kv}",if window==0 { "full" } else { "window2048" });
+            let reference=root.join(&name);
+            let words=|file:&str|->Result<Vec<u32>> { Ok(std::fs::read(reference.join(file))?.chunks_exact(4)
+                .map(|b|u32::from_le_bytes(b.try_into().unwrap())).collect()) };
+            let expected=words("drafts.bin")?;
+            let confidence=words("confidence.bin")?;
+            let hidden=std::fs::read(reference.join("hidden.bin"))?;
+            let requests=DsparkDrafter::arena_requests(&snapshot,GlmDraftRepresentation::Bf16Only,device.id)?
+                .remove(&device.id).context("fixture arena requests")?;
+            let arena=DeviceWeightArena::new(device,cuteafd_loader::serving_capacity::WeightArenaLayout::new(
+                "test/lithos-draft",requests)?,ArenaTag::drafter_weights("test/lithos-draft"))?;
+            let tensors=prefetch(&snapshot).join().map_err(|_|anyhow::anyhow!("fixture prefetch panicked"))??;
+            let draft=device.run(||DsparkDrafter::load_window_paged_with(&library,&programs,
+                super::super::dflash::TargetProjection::Bf16,&snapshot,tensors,stream.raw,
+                1,1,vec![0;cfg.hidden*2],GlmDraftRepresentation::Bf16Only,fp8_linear::Fp8Scales::Amax,
+                fp8_linear::Fp8Rows::W8a16,if window==0 {context} else {window},context+128,kv,window,
+                |physical,name,bytes| { ensure!(physical==device.id,"fixture draft owner");arena.view(name,bytes) }))?;
+            let (mut done,mut max_abs,mut max_relative,mut max_confidence)=(0,0f32,0f32,0f32);
+            for (index,&position) in positions.iter().enumerate() {
+                while done<position {
+                    let n=(position-done).min(TAP_ROWS);
+                    let row=cfg.hidden*2;
+                    let mut taps=vec![0;n*cfg.taps.len()*row];
+                    for r in 0..n { for (tap,layer) in layers.iter().enumerate() {
+                        taps[(r*layers.len()+tap)*row..][..row].copy_from_slice(&layer[(done+r)*row..][..row]);
+                    } }
+                    device.run(|| { draft.put_taps(&taps)?;draft.update(&(0..n).map(|r|ContextRow {
+                        tap_row:r,slot:0,position:done+r }).collect::<Vec<_>>())?;draft.drain() })?;
+                    done+=n;
+                }
+                let input=|ids:&[u32],out:CuteafdDeviceBuffer,stream|->Result<()> {
+                    for (row,&id) in ids.iter().enumerate() {
+                        let mut rect=embedding.clone();rect.rows=id as usize..id as usize+1;
+                        let mut bytes=vec![0;cfg.hidden*2];rect.read(&mut bytes)?;
+                        let out=crate::shared::prefix::view(out,row*bytes.len(),bytes.len())?;
+                        // SAFETY: ordered staging and destination survive this retained stream.
+                        unsafe { library.copy_h2d_ordered(out,&bytes,stream)?; }
+                    }
+                    Ok(())
+                };
+                let actual=device.run(||draft.draft_device_with(&[DraftSeq {slot:0,anchor:tokens[position],position,valid_from:0}],
+                    &input,super::super::dflash::TargetHead::Bf16(&head)))?.remove(0);
+                ensure!(actual.tokens==expected[index*cfg.block..][..cfg.block],"{name} position {position} draft tokens differ");
+                let confidence_argmax=|values:&[f32]|values.iter().enumerate()
+                    .max_by(|(i,a),(j,b)|a.total_cmp(b).then_with(||j.cmp(i))).map(|(i,_)|i);
+                let expected_confidence=confidence[index*cfg.block..][..cfg.block].iter()
+                    .map(|&bits|f32::from_bits(bits)).collect::<Vec<_>>();
+                ensure!(confidence_argmax(&actual.confidence)==confidence_argmax(&expected_confidence),
+                    "{name} position {position} confidence argmax differs");
+                for (j,&value) in actual.confidence.iter().enumerate() {
+                    max_confidence=max_confidence.max((value-f32::from_bits(confidence[index*cfg.block+j])).abs());
+                }
+                let actual=device.run(||draft.last_hidden(1))?;
+                let expected=&hidden[index*cfg.block*cfg.hidden*2..][..actual.len()];
+                for (a,b) in actual.chunks_exact(2).zip(expected.chunks_exact(2)) {
+                    let a=f32::from_bits((u16::from_le_bytes(a.try_into().unwrap()) as u32)<<16);
+                    let b=f32::from_bits((u16::from_le_bytes(b.try_into().unwrap()) as u32)<<16);
+                    max_abs=max_abs.max((a-b).abs());max_relative=max_relative.max((a-b).abs()/b.abs().max(1e-3));
+                }
+            }
+            eprintln!("Lithos parity {name}: {} anchors, tokens exact, hidden max_abs={max_abs:.8} max_relative={max_relative:.8}, confidence max_abs={max_confidence:.8}",positions.len());
+            ensure!(max_abs.is_finite()&&max_relative.is_finite()&&max_confidence<0.05,"{name} nonfinite or excessive confidence delta");
+        } }
         Ok(())
     }
 

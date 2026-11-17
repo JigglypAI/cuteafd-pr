@@ -85,7 +85,7 @@ impl NativeDsparkLayout {
 }
 
 /// Physical owners of the shared Qwen3 block executor, excluding target taps/head.
-/// Window rings are fixed by checkpoint geometry, independent of the target pool.
+/// Window rings are slot-local; native full-context layers share the target token pool.
 #[derive(Debug, Clone, PartialEq)]
 pub struct BlockDsparkRuntimeLayout {
     pub representation: crate::families::glm5::draft_representation::GlmDraftRepresentation,
@@ -1038,6 +1038,7 @@ mod tests {
         assert_eq!(cfg.taps,[7,23,67,83,91]);
         assert_eq!(cfg.tap_sites(),cfg.taps.iter().copied().map(cuteafd_core::TapSite::LayerExit).collect::<Vec<_>>());
         assert_eq!(cfg.window,None);
+        assert!(crate::families::glm5::draft_representation::is_dspark(&lithos()));
         let rope=cfg.rope.plan(64)?;
         assert_eq!(rope.inv_freq.len(),32);
         assert!((rope.attention_factor-(1.0+0.1*16f32.ln())).abs()<1e-6);

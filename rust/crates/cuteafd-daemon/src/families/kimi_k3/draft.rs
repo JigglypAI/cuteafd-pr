@@ -712,6 +712,36 @@ mod tests {
     }
 
     #[test]
+    fn lithos_tp1_and_tp2_keep_one_whole_lead_local_body_and_native_taps() -> Result<()> {
+        use cuteafd_loader::{formats::block_dspark::{BlockDsparkConfig,block_dspark_weight_recipe},
+            plan::testing::{t,write_safetensors},families::qwen4::Qwen4KvCache};
+        let root=tempfile::tempdir()?;
+        let raw=include_str!("../../../../cuteafd-loader/src/families/kimi_k3/fixtures/lithos-dspark-config.json");
+        std::fs::write(root.path().join("config.json"),raw)?;
+        let config=BlockDsparkConfig::read(root.path())?;
+        let tensors=RefCell::new(Vec::new());
+        block_dspark_weight_recipe(&config,|name,shape| {
+            tensors.borrow_mut().push(t(name,"BF16",shape));Ok::<_,anyhow::Error>(())
+        },|parts,cols| { for (name,rows) in parts { tensors.borrow_mut().push(t(*name,"BF16",&[*rows,cols])); } Ok(()) })?;
+        write_safetensors(&root.path().join("model.safetensors"),&tensors.into_inner());
+        for head in [0,1] { for context_window in [0,2048] { for kv in [Qwen4KvCache::Bf16,Qwen4KvCache::Fp8] {
+            let options=Options { snapshot:root.path().to_owned(),fp8:false,tp2_dflash:false,
+                cache_format:Default::default(),draft_kv_cache:kv,context_window };
+            assert_eq!(options.kind()?,cuteafd_loader::families::kimi_k3::draft::DraftKind::BlockDspark);
+            let layout=options.layout(16,8192,188,head)?;
+            let DraftLayout::Block(local)=&layout else { anyhow::bail!("Lithos must not create body collectives") };
+            assert_eq!((local.config.heads,local.config.kv_heads,local.config.intermediate),(64,16,14336));
+            assert_eq!(layout.target_taps(),[7,23,67,83,91]);
+            assert_eq!(local.reduction_bytes,0);assert!(local.exchange_buffers.is_empty());
+            layout.validate_capacity(16,64,8192,Default::default())?;
+            let (owned,_)=layout.demands(head as u8)?;
+            assert!(owned.owned.iter().all(|d|d.gpu==head as u8));
+            assert!(Options {tp2_dflash:true,..options}.layout(16,8192,188,head).is_err());
+        } } }
+        Ok(())
+    }
+
+    #[test]
     fn precision_is_one_explicit_resident_representation() {
         let options = Options { snapshot: PathBuf::new(), fp8: false, cache_format: Default::default(), tp2_dflash: false, context_window: 0, draft_kv_cache: Default::default() };
         assert_eq!(options.representation(), GlmDraftRepresentation::Bf16Only);

@@ -408,17 +408,17 @@ extern "C" int32_t cuteafd_block_dspark_qk_rope(const void* qkv, const void* q_n
   const int64_t warps = int64_t(rows) * (int64_t(heads) + kv_heads);
   if (warps > INT32_MAX / 32) return cudaErrorInvalidValue;
   if (head_dim == 64) {
-  qk_rope_table_kernel<64, false><<<(warps * 32 + 255) / 256, 256, 0, static_cast<cudaStream_t>(stream)>>>(
-      static_cast<const bf16*>(qkv), static_cast<const bf16*>(q_norm), static_cast<const bf16*>(k_norm),
-      static_cast<const int64_t*>(positions), static_cast<const int32_t*>(slots), static_cast<const float*>(inv_freq),
-      static_cast<bf16*>(q_out), static_cast<bf16*>(k_out), static_cast<bf16*>(v_out), rows, heads, kv_heads,
-      attention_factor, eps);
+    qk_rope_table_kernel<64, false><<<(warps * 32 + 255) / 256, 256, 0, static_cast<cudaStream_t>(stream)>>>(
+        static_cast<const bf16*>(qkv), static_cast<const bf16*>(q_norm), static_cast<const bf16*>(k_norm),
+        static_cast<const int64_t*>(positions), static_cast<const int32_t*>(slots), static_cast<const float*>(inv_freq),
+        static_cast<bf16*>(q_out), static_cast<bf16*>(k_out), static_cast<bf16*>(v_out), rows, heads, kv_heads,
+        attention_factor, eps);
   } else {
-  qk_rope_table_kernel<128, false><<<(warps * 32 + 255) / 256, 256, 0, static_cast<cudaStream_t>(stream)>>>(
-      static_cast<const bf16*>(qkv), static_cast<const bf16*>(q_norm), static_cast<const bf16*>(k_norm),
-      static_cast<const int64_t*>(positions), static_cast<const int32_t*>(slots), static_cast<const float*>(inv_freq),
-      static_cast<bf16*>(q_out), static_cast<bf16*>(k_out), static_cast<bf16*>(v_out), rows, heads, kv_heads,
-      attention_factor, eps);
+    qk_rope_table_kernel<128, false><<<(warps * 32 + 255) / 256, 256, 0, static_cast<cudaStream_t>(stream)>>>(
+        static_cast<const bf16*>(qkv), static_cast<const bf16*>(q_norm), static_cast<const bf16*>(k_norm),
+        static_cast<const int64_t*>(positions), static_cast<const int32_t*>(slots), static_cast<const float*>(inv_freq),
+        static_cast<bf16*>(q_out), static_cast<bf16*>(k_out), static_cast<bf16*>(v_out), rows, heads, kv_heads,
+        attention_factor, eps);
   }
   return cudaGetLastError();
 }
@@ -585,17 +585,17 @@ extern "C" int32_t cuteafd_block_dspark_qk_rope_fp8(const void* qkv, const void*
   const int64_t warps = int64_t(rows) * (int64_t(heads) + kv_heads);
   if (warps > INT32_MAX / 32) return cudaErrorInvalidValue;
   if (head_dim == 64) {
-  qk_rope_table_kernel<64, true><<<(warps * 32 + 255) / 256, 256, 0, static_cast<cudaStream_t>(stream)>>>(
-      static_cast<const bf16*>(qkv), static_cast<const bf16*>(q_norm), static_cast<const bf16*>(k_norm),
-      static_cast<const int64_t*>(positions), static_cast<const int32_t*>(slots), static_cast<const float*>(inv_freq),
-      static_cast<bf16*>(q_out), static_cast<bf16*>(k_out), static_cast<bf16*>(v_out), rows, heads, kv_heads,
-      attention_factor, eps);
+    qk_rope_table_kernel<64, true><<<(warps * 32 + 255) / 256, 256, 0, static_cast<cudaStream_t>(stream)>>>(
+        static_cast<const bf16*>(qkv), static_cast<const bf16*>(q_norm), static_cast<const bf16*>(k_norm),
+        static_cast<const int64_t*>(positions), static_cast<const int32_t*>(slots), static_cast<const float*>(inv_freq),
+        static_cast<bf16*>(q_out), static_cast<bf16*>(k_out), static_cast<bf16*>(v_out), rows, heads, kv_heads,
+        attention_factor, eps);
   } else {
-  qk_rope_table_kernel<128, true><<<(warps * 32 + 255) / 256, 256, 0, static_cast<cudaStream_t>(stream)>>>(
-      static_cast<const bf16*>(qkv), static_cast<const bf16*>(q_norm), static_cast<const bf16*>(k_norm),
-      static_cast<const int64_t*>(positions), static_cast<const int32_t*>(slots), static_cast<const float*>(inv_freq),
-      static_cast<bf16*>(q_out), static_cast<bf16*>(k_out), static_cast<bf16*>(v_out), rows, heads, kv_heads,
-      attention_factor, eps);
+    qk_rope_table_kernel<128, true><<<(warps * 32 + 255) / 256, 256, 0, static_cast<cudaStream_t>(stream)>>>(
+        static_cast<const bf16*>(qkv), static_cast<const bf16*>(q_norm), static_cast<const bf16*>(k_norm),
+        static_cast<const int64_t*>(positions), static_cast<const int32_t*>(slots), static_cast<const float*>(inv_freq),
+        static_cast<bf16*>(q_out), static_cast<bf16*>(k_out), static_cast<bf16*>(v_out), rows, heads, kv_heads,
+        attention_factor, eps);
   }
   return cudaGetLastError();
 }
