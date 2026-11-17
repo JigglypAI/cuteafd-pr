@@ -292,16 +292,18 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
         let raw: serde_json::Value = serde_json::from_slice(&std::fs::read(snapshot.join("config.json"))?)?;
         let slots = usize::try_from(slots)?;
         let layout = if raw["speculators_model_type"] == "dspark" {
-            anyhow::ensure!(!opts.kimi_draft_fp8 && !opts.tp2_dflash,
-                "block dSpark uses native BF16 weights and physical GQA head splits, not TP2_DFLASH");
+            anyhow::ensure!(!opts.tp2_dflash,
+                "block dSpark uses physical GQA head splits, not TP2_DFLASH");
+            let representation=if opts.kimi_draft_fp8 { GlmDraftRepresentation::Fp8Only }
+                else { GlmDraftRepresentation::Bf16Only };
             if gpus==2 {
-                let rank=|rank|crate::formats::block_dspark::BlockDsparkRuntimeLayout::for_rank(snapshot,
+                let rank=|rank|crate::formats::block_dspark::BlockDsparkRuntimeLayout::for_rank_representation(snapshot,
                     slots,slots.min(8),opts.physical_sms.unwrap_or(188) as usize,&format!("kimi/draft/{rank}"),
-                    opts.draft_kv_cache,rank,2,head_rank);
+                    opts.draft_kv_cache,rank,2,head_rank,representation);
                 DraftLayout::BlockTp2 { ranks:Box::new([rank(0)?,rank(1)?]),lead:head_rank }
             } else {
-                DraftLayout::Block(crate::formats::block_dspark::BlockDsparkRuntimeLayout::with_kv(snapshot,
-                    slots,slots.min(8),opts.physical_sms.unwrap_or(188) as usize,&format!("kimi/draft/{head_rank}"),opts.draft_kv_cache)?)
+                DraftLayout::Block(crate::formats::block_dspark::BlockDsparkRuntimeLayout::with_representation(snapshot,
+                    slots,slots.min(8),opts.physical_sms.unwrap_or(188) as usize,&format!("kimi/draft/{head_rank}"),opts.draft_kv_cache,representation)?)
             }
         } else {
             let draft = MlaDflashConfig::from_json(&raw)?;

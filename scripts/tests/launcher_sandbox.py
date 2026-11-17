@@ -111,7 +111,10 @@ def fake_resolved_settings(args, family, sparks):
     result = {"coordinator_weight_budget_gib": {
         "value": int(value("--gpu-memory-cap", str(96 << 30))) / 2**30, "provenance": "auto"}}
     if family == "kimi_k3":
-        result["draft_fp8"] = {"value": value("--speculator") == "dflash2", "provenance": "auto"}
+        precision = resolved("--draft-fp8", "SPECULATOR_FP8", value("--speculator") == "dflash2")
+        raw = precision["value"]
+        precision["value"] = raw if isinstance(raw, bool) else raw in ("on", "true")
+        result["draft_fp8"] = precision
     if family == "mimo_v2":
         result["native_mtp_layers"] = {"value": int(config.get("SPECULATOR_DEPTH") or 1) if value("--speculator") == "mtp" else 0, "provenance": "auto"}
     if family == "glm5_flash":

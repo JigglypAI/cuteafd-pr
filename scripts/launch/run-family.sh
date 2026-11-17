@@ -2092,6 +2092,11 @@ if [[ $serve != serve-dsv4 ]]; then
         off) family_args+=(--draft-fp8 false) ;;
         *) echo "MiMo SPECULATOR_FP8 must be auto, on or off" >&2; exit 2 ;;
       esac
+    elif [[ $family == kimi_k3 ]]; then
+      case "$(get SPECULATOR_FP8 auto)" in
+        auto|on|off) ;; # Planner resolves this key and emits the sole serve flag below.
+        *) release_die "Kimi SPECULATOR_FP8 must be auto, on or off" ;;
+      esac
     elif [[ $family == glm5 || $family == glm5_flash ]]; then
       case "$(get SPECULATOR_FP8 auto)" in
         auto) ;; # The engine default: single-copy FP8 drafter weights.
@@ -2418,7 +2423,7 @@ audio_encoder_hash=""
   for ((i=0; i<${#family_args[@]}; i++)); do
     [[ "${family_args[i]}" != --host-cache-bytes ]] || plan_host_cache="${family_args[i+1]}"
     [[ "${family_args[i]}" != --media-cache-bytes ]] || plan_draft_args+=(--media-cache-bytes "${family_args[i+1]}")
-    if [[ "$family" == glm5_flash && ( "${family_args[i]}" == --draft-fp8 || "${family_args[i]}" == --draft-linear ) ]]; then
+    if [[ ( "$family" == glm5_flash || "$family" == kimi_k3 ) && ( "${family_args[i]}" == --draft-fp8 || "${family_args[i]}" == --draft-linear ) ]]; then
       plan_draft_args+=("${family_args[i]}" "${family_args[i+1]}")
     fi
   done

@@ -231,6 +231,12 @@ fn resolve_settings(args: &mut PlanArgs, family: &str, cfg: &std::collections::B
             "GLM5_FLASH_REPLAY_RECORDS=shared keeps the records in one GPU's prefill scratch; serve it without a head split");
     }
     if family == "kimi_k3" {
+        if args.draft_fp8.is_none() {
+            args.draft_fp8 = match cfg.get("SPECULATOR_FP8").map(String::as_str) {
+                Some("on") => Some(true), Some("off") => Some(false), None | Some("") | Some("auto") => None,
+                _ => anyhow::bail!("SPECULATOR_FP8 must be auto, on or off"),
+            };
+        }
         let fp8 = defaults::kimi_draft_fp8(args.draft_fp8, args.speculator == "dflash2");
         args.draft_fp8 = Some(fp8.value);
         resolved.insert("draft_fp8".into(), setting(fp8));
