@@ -1,5 +1,11 @@
 # GLM 5.3 Flash
 
+Automatic KV sizing uses the shared 2M-token target on every card, including
+32 GB / RTX 5090. Placement and expert onboarding are fixed at that target;
+the pool then grows into remaining admitted memory, within native encoding
+limits. `KV_MAX_TOKENS` is unset by default and can explicitly cap growth.
+See [memory policy](../options.md#memory-and-pools).
+
 A hybrid-attention sibling of GLM 5.3: most layers run linear Kimi Delta
 Attention (KDA), a minority run MLA + DSA. Alongside the existing checkpoints,
 [`wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K4-MC`](https://huggingface.co/wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K4-MC)

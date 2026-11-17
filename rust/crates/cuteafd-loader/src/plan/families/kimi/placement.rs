@@ -456,9 +456,14 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
         context_buffers.query_row_bytes.saturating_add(context_buffers.partial_row_bytes)
     } else { 0 };
     let page_rows = if modes.iter().any(|mode| *mode == LayerMode::ContextSplit) { PAGE * 2 } else { PAGE };
-    let mut facts = crate::placement::PoolFacts::new(&opts.rtx_bytes[..gpus],
-        crate::placement::planner::Context::resolve(context, (opts.context_tokens > 0).then_some(opts.context_tokens)),
+    let mut facts = crate::placement::PoolFacts::new(crate::placement::planner::Context::resolve(context, (opts.context_tokens > 0).then_some(opts.context_tokens)),
         requested_pool, PAGE);
+    // Whole-layer placements may give all MLA to either owner. Sum memory
+    // against the checkpoint's total record slope to bound every legal cut.
+    facts.memory = vec![crate::placement::PoolMemory {
+        available_bytes: opts.rtx_bytes[..gpus].iter().sum(),
+        bytes_per_unit: cfg.mla_layers() as u64 * PAGE * opts.mla_kv.record_bytes() as u64,
+    }];
     facts.target = opts.target_pool_tokens;
     let pool = match crate::placement::prepare_pool(facts) {
         Ok(pool) => pool,

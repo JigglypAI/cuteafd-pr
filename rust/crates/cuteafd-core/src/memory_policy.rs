@@ -19,9 +19,6 @@ use std::sync::OnceLock;
 
 use crate::serving_capacity::DEFAULT_GPU_KV_TOKENS;
 
-/// Cards at or below this size take the 1M default KV target.
-pub const SMALL_CARD_BYTES: u64 = 32 << 30;
-pub const SMALL_CARD_KV_TARGET_TOKENS: u64 = 1 << 20;
 /// Agentic context floor: the default KV min when the model allows it.
 pub const AGENTIC_FLOOR_TOKENS: u64 = 262_144;
 /// Explicit release allowance for unassigned memory, lowered each release as
@@ -241,18 +238,17 @@ impl MemoryPolicy {
         self.component(DeviceKind::Gpu, self.memory_padding.unwrap_or(DEFAULT_MEMORY_PADDING))
     }
 
-    /// KV target, min and max for the smallest physical coordinator card.
+    /// Uniform KV target, minimum and optional growth cap.
     /// The default minimum is the smaller of the model context and the
     /// agentic floor, bounded by the target, independent of Spark placement.
-    pub fn kv(&self, smallest_card: u64, context: u64) -> Result<KvBounds, PolicyError> {
-        let default_target = if smallest_card <= SMALL_CARD_BYTES { SMALL_CARD_KV_TARGET_TOKENS }
-            else { DEFAULT_GPU_KV_TOKENS };
+    pub fn kv(&self, context: u64) -> Result<KvBounds, PolicyError> {
+        let default_target = DEFAULT_GPU_KV_TOKENS;
         // An explicit target can be below the model maximum for automatic context.
         let target = self.kv_target.unwrap_or(default_target.max(context));
         let min = self.kv_min.unwrap_or(context.min(AGENTIC_FLOOR_TOKENS).min(target));
-        let max = self.kv_max.unwrap_or(target).max(if self.kv_max.is_some() { 0 } else { target });
-        if target == 0 || min > target || target > max {
-            return Err(PolicyError::KvOrder { min, target, max });
+        let max = self.kv_max;
+        if target == 0 || min > target || max.is_some_and(|max| target > max) {
+            return Err(PolicyError::KvOrder { min, target, max: max.unwrap_or(target) });
         }
         Ok(KvBounds { target, min, max })
     }
@@ -266,7 +262,7 @@ impl MemoryPolicy {
                 if reserve >= cap { return Err(PolicyError::ReserveFillsCap { device: name, reserve, cap }); }
             }
         }
-        self.kv(u64::MAX, 0).map(|_| ())
+        self.kv(0).map(|_| ())
     }
 }
 
@@ -274,11 +270,14 @@ impl MemoryPolicy {
 pub struct KvBounds {
     pub target: u64,
     pub min: u64,
-    pub max: u64,
+    /// None grows into all memory left after the target-sized layout.
+    pub max: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum PolicyError {
+    #[error("KV pool needs finite memory geometry for its planner domain")]
+    PoolGeometry,
     #[error("KV pool request {requested} overflows allocation quantum {unit_rows}")]
     PoolAlignment { requested: u64, unit_rows: u64 },
     #[error("KV bounds must satisfy 0 < KV_MIN_TOKENS <= KV_TARGET_TOKENS <= KV_MAX_TOKENS (min {min}, target {target}, max {max})")]
@@ -337,7 +336,7 @@ pub fn render_line(device: &DeviceBreakdown, pool: &PoolBreakdown) -> String {
     format!("{}: cap {}; weights {}; workspaces {}; reserve {}{} [{}]; other {}; KV target {} min {} max {}, pool {} tokens / {}",
         device.device, mib(device.cap_bytes), mib(device.weights_bytes), mib(device.workspace_bytes),
         mib(device.reserve_bytes()), if device.reserve_overridden { " (overridden)" } else { "" },
-        components, mib(device.other_bytes), pool.kv.target, pool.kv.min, pool.kv.max, pool.pool_tokens,
+        components, mib(device.other_bytes), pool.kv.target, pool.kv.min, pool.kv.max.map_or_else(|| "unbounded".into(), |max| max.to_string()), pool.pool_tokens,
         mib(device.kv_bytes))
 }
 
@@ -414,18 +413,14 @@ mod tests {
     }
 
     #[test]
-    fn kv_defaults_follow_card_and_context() {
+    fn kv_defaults_are_unbounded_with_one_target_on_every_card() {
         let policy = MemoryPolicy::default();
-        assert_eq!(policy.kv(96 * GIB, 1 << 20).unwrap(), KvBounds { target: 2 << 20, min: AGENTIC_FLOOR_TOKENS, max: 2 << 20 });
-        assert_eq!(policy.kv(96 * GIB, 65_536).unwrap(), KvBounds { target: 2 << 20, min: 65_536, max: 2 << 20 });
-        assert_eq!(policy.kv(32 * GIB, 65_536).unwrap(), KvBounds { target: 1 << 20, min: 65_536, max: 1 << 20 });
-        let short_target = MemoryPolicy { kv_target: Some(131_072), ..policy };
-        assert_eq!(short_target.kv(96 * GIB, 1 << 20).unwrap(),
-            KvBounds { target: 131_072, min: 131_072, max: 131_072 });
-        let grow = MemoryPolicy { kv_max: Some(4 << 20), ..policy };
-        assert_eq!(grow.kv(96 * GIB, 1 << 20).unwrap().max, 4 << 20);
-        assert!(MemoryPolicy { kv_max: Some(1 << 20), ..policy }.kv(96 * GIB, 0).is_err());
-        assert!(MemoryPolicy { kv_min: Some(3 << 20), ..policy }.kv(96 * GIB, 0).is_err());
+        assert_eq!(policy.kv(65_536).unwrap(),
+            KvBounds { target: 2 << 20, min: 65_536, max: None });
+        let pinned = MemoryPolicy { kv_max: Some(4 << 20), ..policy };
+        assert_eq!(pinned.kv(1 << 20).unwrap().max, Some(4 << 20));
+        assert!(MemoryPolicy { kv_max: Some(1 << 20), ..policy }.kv(0).is_err());
+        assert!(MemoryPolicy { kv_min: Some(3 << 20), ..policy }.kv(0).is_err());
     }
 
     #[test]
@@ -456,7 +451,7 @@ mod tests {
                 ReserveComponent { name: "graphs".into(), bytes: GIB },
                 ReserveComponent { name: "family".into(), bytes: 0 }],
             reserve_overridden: false, kv_bytes: 30 * GIB, other_bytes: GIB };
-        let pool = PoolBreakdown { kv: KvBounds { target: 2 << 20, min: 262_144, max: 2 << 20 }, pool_tokens: 2 << 20 };
+        let pool = PoolBreakdown { kv: KvBounds { target: 2 << 20, min: 262_144, max: Some(2 << 20) }, pool_tokens: 2 << 20 };
         let line = render_line(&device, &pool);
         for part in ["rtx0: cap 98304MiB", "weights 40960MiB", "workspaces 8192MiB", "reserve 1584MiB [cuda context 560MiB, graphs 1024MiB, family 0MiB]",
             "KV target 2097152 min 262144 max 2097152, pool 2097152 tokens / 30720MiB"] {

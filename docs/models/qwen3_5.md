@@ -1,5 +1,11 @@
 # Dense Qwen 3.5 / 3.8
 
+Automatic KV sizing uses the shared 2M-token target on every card, including
+32 GB / RTX 5090. Placement and expert onboarding are fixed at that target;
+the pool then grows into remaining admitted memory, within native encoding
+limits. `KV_MAX_TOKENS` is unset by default and can explicitly cap growth.
+See [memory policy](../options.md#memory-and-pools).
+
 Dense Qwen checkpoints serve on one RTX PRO 6000 from their own Hugging Face
 headers: `Qwen/Qwen3.5-9B` (BF16), and `Qwen/Qwen3.8-27B` in BF16 and FP8.
 With no routed experts there is nothing to place on Sparks, so these layouts use

@@ -470,8 +470,8 @@ mod default_tests {
         input.requested_pool = None;
         input.attention = Some(AttentionPlacement::Heads);
         let default = prepare(&input).unwrap().admit(production_request(&input)).unwrap();
-        assert_eq!(default.solved.pool_tokens, 2 << 20);
-        MemoryPolicy { kv_max: Some(100_000_000), ..Default::default() }.scoped(|| {
+        assert!(default.solved.pool_tokens > 2 << 20, "an unbounded max grows into the admitted memory");
+        MemoryPolicy { kv_max: Some(2 << 20), ..Default::default() }.scoped(|| {
             let prepared = prepare(&input).unwrap();
             let grown = MemoryPolicy::default().scoped(|| prepared.admit(production_request(&input))).unwrap();
             let mut live = input.clone();
@@ -480,10 +480,10 @@ mod default_tests {
             }
             let served = prepare(&live).unwrap().admit(production_request(&live)).unwrap();
             assert_eq!(grown.solved.pool_policy, served.solved.pool_policy);
-            assert_eq!(grown.solved.pool_policy.unwrap().ceiling(), POOL_CEILING_TOKENS);
+            assert_eq!(grown.solved.pool_policy.unwrap().ceiling(), 2 << 20);
             assert_eq!(grown.solved.pool_tokens, served.solved.pool_tokens);
             assert_eq!(grown.solved.decisions, served.solved.decisions);
-            assert!(grown.solved.pool_tokens > default.solved.pool_tokens);
+            assert_eq!(grown.solved.pool_tokens, 2 << 20);
             assert_eq!(grown.solved.decisions.onboard_layers, default.solved.decisions.onboard_layers);
             input.requested_pool = Some(262_144);
             let strict = prepare(&input).unwrap().admit(production_request(&input)).unwrap();
@@ -498,11 +498,11 @@ mod default_tests {
         input.gpus = vec![(32 << 30, Baseline::Planned { context_bytes: 0, loaded_bytes: 0 }); 2];
         input.attention = Some(AttentionPlacement::Heads);
         let default = prepare(&input).unwrap().admit(production_request(&input)).unwrap();
-        assert_eq!(default.solved.pool_policy.unwrap().target(), 1 << 20);
+        assert_eq!(default.solved.pool_policy.unwrap().target(), 2 << 20);
         input.target_pool = Some(524_288);
         let selected = prepare(&input).unwrap().admit(production_request(&input)).unwrap();
         assert_eq!(selected.solved.pool_policy.unwrap().target(), 524_288);
-        assert_eq!(selected.solved.pool_tokens, 524_288);
+        assert!(selected.solved.pool_tokens >= 524_288, "the target sizes the layout; the pool still grows");
     }
 
     /// The graph arena is exactly one canonical `graph reserve` owner per

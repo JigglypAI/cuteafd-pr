@@ -1,6 +1,17 @@
 use super::*;
 use crate::plan::{self, testing, PlanOptions};
 
+/// Pool facts from the family's real per-rank page geometry.
+fn pool_facts(cfg: &crate::families::inkling2::Inkling2Config,
+    modes: &[crate::placement::LayerMode], page_rows: u64, cards: &[u64],
+    context: impl Into<crate::placement::planner::Context>, requested: Option<u64>)
+    -> crate::placement::PoolFacts {
+    let units = crate::families::inkling2::admission::pool_memory(cfg,
+        crate::families::inkling2::InklingKvCache::Bf16, modes, page_rows, cards)
+        .iter().map(|memory| memory.bytes_per_unit).collect::<Vec<_>>();
+    crate::plan::testing::pool_facts(cards, context, requested, page_rows, &units)
+}
+
 /// Which routed-expert storage the fixture writes.
 #[derive(Clone, Copy, PartialEq)]
 enum Fixture { Mxfp8, Mixed, Exl3 }
@@ -415,15 +426,19 @@ fn installed_native_measured_five_sparks_fit_with_exact_ledgers() -> anyhow::Res
     assert_eq!(report.runtime, Some(RuntimeStatus::Serving));
     assert!(report.fits && report.placement_supported && report.native_serving_admitted, "{:?}", report.hints);
     assert!(report.wip_launchable() && report.executable());
-    assert_eq!(report.memory_layout.as_ref().unwrap().pool_tokens, 2_097_152);
+    // The default KV max is unbounded: the pool grows past the 2M target
+    // into the memory the admitted layout leaves.
+    let pool = report.memory_layout.as_ref().unwrap().pool_tokens;
+    assert!(pool >= 2_097_152, "pool {pool} grew into the memory bound");
     let mut fp8_options = options.clone();
     fp8_options.layout.as_mut().unwrap().inkling_kv = Default::default();
     assert_eq!(fp8_options.layout.as_ref().unwrap().inkling_kv,
         crate::families::inkling2::InklingKvCache::Fp8);
     let fp8 = input.plan(&fp8_options)?;
     assert!(fp8.fits && fp8.placement_supported && fp8.native_serving_admitted, "{:?}", fp8.hints);
-    assert_eq!(fp8.memory_layout.as_ref().unwrap().pool_tokens, 2_097_152);
-    println!("Inkling native 1RTX+6S pool2097152: BF16->FP8 onboard {:?}->{:?}, global KV 64GiB->33GiB",
+    let fp8_pool = fp8.memory_layout.as_ref().unwrap().pool_tokens;
+    assert!(fp8_pool >= 2_097_152, "fp8 pool {fp8_pool} grew into the memory bound");
+    println!("Inkling native 1RTX+6S pool {pool}->{fp8_pool}: BF16->FP8 onboard {:?}->{:?}, global KV 64GiB->33GiB",
         report.onboard_layers, fp8.onboard_layers);
     assert!(fp8.onboard_layers > report.onboard_layers, "freed global KV must admit more native expert layers");
     let five = input.plan(&PlanOptions { placement: ExpertPlacement::from_spark_ranks(5), ..fp8_options.clone() })?;
@@ -577,8 +592,8 @@ fn shared_recipe_charges_every_owner_once_on_one_and_two_rtx() {
             }).collect()
         }).collect() };
         let inputs = InklingInputs { cfg: cfg.clone(), kv_format: crate::families::inkling2::InklingKvCache::Bf16, gpus, spark_ranks: ranks, context: Context::automatic(1 << 20),
-            pool: crate::placement::prepare_pool(crate::placement::PoolFacts::new(
-            &vec![96 << 30; gpus], Context::automatic(1 << 20), None, shared::PAGE_ROWS)).unwrap(), prefill, sequences: 16, prefix_entries: 8, prefix_mark_budget: 2 << 30, targets: targets.clone(), placement, modes: modes.clone(),
+            pool: crate::placement::prepare_pool(pool_facts(&cfg, &modes, shared::PAGE_ROWS,
+            &vec![96 << 30; gpus], Context::automatic(1 << 20), None)).unwrap(), prefill, sequences: 16, prefix_entries: 8, prefix_mark_budget: 2 << 30, targets: targets.clone(), placement, modes: modes.clone(),
             routed: routed.clone(), experts,
             local,
             spark: (0..=routed.len()).map(charge).collect(),
@@ -693,9 +708,9 @@ fn shared_recipe_charges_every_owner_once_on_one_and_two_rtx() {
             assert!(contract.components.iter().any(|c| matches!(&c.kind, ComponentKind::Allocation { template, .. }
                 if template.id == format!("inkling2.cache.{gpu}.active"))), "rtx{gpu} marks");
         }
-        let small = crate::placement::prepare_pool(crate::placement::PoolFacts::new(
-            &vec![32 << 30; gpus], inputs.context, None, inputs.page_rows())).unwrap();
-        assert_eq!(small.target(), 1 << 20);
+        let small = crate::placement::prepare_pool(pool_facts(&inputs.cfg, &inputs.modes,
+            inputs.page_rows(), &vec![32 << 30; gpus], inputs.context, None)).unwrap();
+        assert_eq!(small.target(), 2 << 20);
         let admitted = inputs.admit(request.clone()).unwrap();
         assert_eq!(admitted.solved.pool_policy, Some(inputs.pool));
         let mut sampled = inputs.clone();
@@ -709,17 +724,20 @@ fn shared_recipe_charges_every_owner_once_on_one_and_two_rtx() {
         let grow = MemoryPolicy { kv_max: Some(100_000_000), ..Default::default() };
         let grown = grow.scoped(|| {
             let mut growing = inputs.clone();
-            growing.pool = crate::placement::prepare_pool(crate::placement::PoolFacts::new(
-                &vec![96 << 30; gpus], inputs.context, None, inputs.page_rows())).unwrap();
+            growing.pool = crate::placement::prepare_pool(pool_facts(&inputs.cfg, &inputs.modes,
+                inputs.page_rows(), &vec![96 << 30; gpus], inputs.context, None)).unwrap();
             growing.admit(request.clone()).unwrap()
         });
         assert_eq!(grown.onboard, admitted.onboard, "growth must preserve Inkling onboarding");
-        assert!(grown.solved.pool_tokens > admitted.solved.pool_tokens,
+        // The unbounded default already grows into the declared memory bound;
+        // an explicit max can only cap that growth lower.
+        assert!(admitted.solved.pool_tokens > inputs.pool.target(),
+            "{placement:?} on {gpus} GPUs: {} grew into the memory bound", admitted.solved.pool_tokens);
+        assert!(grown.solved.pool_tokens <= admitted.solved.pool_tokens,
             "{placement:?} on {gpus} GPUs: {} -> {}", admitted.solved.pool_tokens, grown.solved.pool_tokens);
         let explicit = grow.scoped(|| {
             let mut pinned = inputs.clone();
-            pinned.pool = crate::placement::prepare_pool(crate::placement::PoolFacts::new(
-                &vec![96 << 30; gpus], inputs.context, Some(admitted.solved.pool_tokens), inputs.page_rows())).unwrap();
+            pinned.pool = crate::placement::prepare_pool(crate::placement::PoolFacts::new(inputs.context, Some(admitted.solved.pool_tokens), inputs.page_rows())).unwrap();
             let mut exact = request.clone();
             exact.pool = crate::placement::planner::Pin::Exact(admitted.solved.pool_tokens);
             pinned.admit(exact).unwrap()
