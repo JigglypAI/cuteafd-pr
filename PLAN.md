@@ -207,8 +207,9 @@ Extend (new families; kernels largely exist in b12x already):
 | Qwen/Qwen3.8-Flash-Next (+ EXL3 K4.25 PLE variants) | qwen4 | GDN linear attention, n-gram memory tables, PLE, MTP; `../qflashrt` has a single-device port |
 
 Speculation: one best speculator per family (native MTP/nextn, dSpark,
-DFlash2). Adaptive width with calibrated confidence and cost model, as in
-ds41rt `dspark_policy` and glmrt `dflash2_confidence`.
+DFlash2). The shared `history` policy chooses verified width from per-position
+acceptance windows, with one explore past the stop. A calibrated trained
+head may skip that explore below 0.3; there is no cost or selector model.
 Qwen's launcher defaults to MTP3 for qualified local EXL3 and NVFP4
 (admitted Spark expert world 0, independent of inventory); explicit overrides
 win. Spark-backed expert layouts leave the
