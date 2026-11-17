@@ -477,7 +477,7 @@ mod tests {
     }
 
     #[test]
-    fn canonical_deployment_retains_only_qualified_package_worlds() {
+    fn canonical_deployment_retains_only_exported_package_worlds() {
         let (_dir, mut report) = fixture(1, 4);
         let options = DeploymentOptions { rtx_gpus: 1, ..Default::default() };
         for (family, package, intermediate, ranks) in [
@@ -503,7 +503,7 @@ mod tests {
                 } else {
                     assert!(result.is_err());
                     if package.ends_with(":nvfp4") {
-                        assert!(format!("{:#}", result.unwrap_err()).contains("NVFP4 is deprecated"));
+                        assert!(format!("{:#}", result.unwrap_err()).contains("missing Spark package recipe"));
                     }
                 }
             }

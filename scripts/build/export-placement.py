@@ -20,6 +20,7 @@ import time
 from pathlib import Path
 
 NO_TURN = 75
+YIELD_SERVING = 76
 CONTEXT_MIB = 640  # one exporter's CUDA context (~550 MiB measured) plus slack
 SIZING_MIB = 2048  # the largest per-process EXL3 sizing pass measured
 MAX_CAP_MIB = 12288  # the measured 8.7 GiB full-scope peak plus margin
@@ -212,9 +213,26 @@ def run_held(command, env, handle=None):
             signal.signal(signum, handler)
 
 
-def hold(gpus: list[str], command: list[str], lock_dir: Path, wait: float = 14400) -> int:
+def queue_module(lock_dir):
+    spec = importlib.util.spec_from_file_location('export_hwlock', Path(__file__).parents[1] / 'hw/hwlock.py')
+    hwlock = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(hwlock)
+    hwlock.LOCK_DIR = lock_dir
+    return hwlock
+
+
+def waiting_serving(lock_dir):
+    hwlock = queue_module(lock_dir)
+    return hwlock.older_conflicts(lock_dir / 'hwq', ['gpu0', 'gpu1'], None)
+
+
+def hold(gpus: list[str], command: list[str], lock_dir: Path, wait: float = 14400,
+         yield_serving: bool = False) -> int:
     if not gpus or any(gpu not in ('0', '1') for gpu in gpus):
         raise ValueError('export GPUs must be a nonempty list of 0 or 1')
+    if yield_serving and waiting_serving(lock_dir):
+        print('export-placement: live raptor GPU ticket; redirecting export to maxq', file=sys.stderr)
+        return YIELD_SERVING
     held = held_by_caller()
     for gpu in gpus:
         if f'gpu{gpu}' in held:
@@ -223,11 +241,25 @@ def hold(gpus: list[str], command: list[str], lock_dir: Path, wait: float = 1440
     # A seed/serving lock held by an outer caller cannot be released here.
     if held:
         raise ValueError('release other hardware locks before queueing an export')
-    spec = importlib.util.spec_from_file_location('export_hwlock', Path(__file__).parents[1] / 'hw/hwlock.py')
-    hwlock = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(hwlock)
-    hwlock.LOCK_DIR = lock_dir
+    hwlock = queue_module(lock_dir)
     lock_dir.mkdir(parents=True, exist_ok=True)
+    if yield_serving:
+        # Auto exports never join a raptor queue. Recheck after acquiring to
+        # catch a serving ticket published between selection and this probe.
+        for gpu in gpus:
+            handles = hwlock._try_flocks([f'gpu{gpu}'])
+            if handles is None:
+                continue
+            try:
+                if waiting_serving(lock_dir):
+                    return YIELD_SERVING
+                env = {**os.environ, 'CUTEAFD_EXPORT_GPU': gpu, 'CUTEAFD_HW_LOCKS_HELD': f'gpu{gpu}'}
+                return run_held(command, env, handles[0])
+            finally:
+                for handle in handles:
+                    handle.close()
+        return YIELD_SERVING
+
     gpu = gpus[0]
     try:
         with hwlock.hold([f'gpu{gpu}'], wait, 'coordinator export',
@@ -243,6 +275,7 @@ def hold(gpus: list[str], command: list[str], lock_dir: Path, wait: float = 1440
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest='action', required=True)
+    sub.add_parser('waiting-serving', help='exit 0 when a live hwq ticket wants either raptor GPU')
     a = sub.add_parser('admit')
     a.add_argument('--smi', default='nvidia-smi')
     a.add_argument('--gpu', required=True)
@@ -261,6 +294,7 @@ def main(argv=None) -> int:
     d.add_argument('--reservation', required=True)
     h = sub.add_parser('hold')
     h.add_argument('--gpus', default='1,0')
+    h.add_argument('--yield-serving', action='store_true', help='redirect to maxq rather than wait on raptor')
     h.add_argument('--wait', type=float, default=14400)
     h.add_argument('command', nargs=argparse.REMAINDER)
     w = sub.add_parser('watch')
@@ -275,6 +309,8 @@ def main(argv=None) -> int:
     w.add_argument('--interval', type=float, default=1.0)
     w.add_argument('command', nargs=argparse.REMAINDER)
     args = parser.parse_args(argv)
+    if args.action == 'waiting-serving':
+        return 0 if waiting_serving(Path(os.environ.get('CUTEAFD_LOCK_DIR', Path.home() / '.cache/cuteafd'))) else 1
     if args.action == 'release':
         release_reservation(args.ledger, args.reservation)
         return 0
@@ -303,7 +339,7 @@ def main(argv=None) -> int:
         lock_dir = Path(os.environ.get('CUTEAFD_LOCK_DIR', Path.home() / '.cache/cuteafd'))
         if not 0 <= args.wait < float('inf'):
             parser.error('--wait must be finite and nonnegative')
-        return hold([g for g in args.gpus.split(',') if g], args.command, lock_dir, args.wait)
+        return hold([g for g in args.gpus.split(',') if g], args.command, lock_dir, args.wait, args.yield_serving)
     return watch(args)
 
 

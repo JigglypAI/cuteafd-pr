@@ -1602,9 +1602,6 @@ fi
 # 2 Sparks and 2 RTX + 4 Sparks) for each checkpoint. DFlash2 led on every one
 # measured (2026-10-04: wrldsuksgo2mars EXL3 K3.25, nvidia NVFP4, brandonmusic
 # tr3 4bpw; agentic 1.3-1.5x dSpark); SPECULATOR=dspark selects the RedHat dSpark.
-# Qualification is for these official checkpoints, not a shape-compatible sibling.
-mimo_flash_mopd=0
-[[ "$family:$model" != mimo_v2:XiaomiMiMo/MiMo-V2.6-Flash-MOPD ]] || mimo_flash_mopd=1
 # DeepSeek V4 checkpoints carry their dSpark drafter beside the target (mtp.0.*,
 # dspark_block_size in config.json); one without it serves without speculation.
 dsv4_dspark=0
@@ -1787,7 +1784,7 @@ if [[ -n "$chat_template_from" && "$vision" != off ]]; then
 fi
 # Still towers use the shared media options and the admitted encoder owner.
 family_args+=(--vision "$vision" --audio "$audio")
-if [[ "$family" == inkling2 || "$family" == step5 ]]; then
+if [[ "$family" == inkling2 || "$family" == step5 || "$family" == kimi_k3 ]]; then
   family_args+=(--vision-replicas "$vision_replicas")
 fi
 
@@ -1881,7 +1878,7 @@ case $family in
     family_args+=(--prefix-cache-entries "$effective_prefix_entries")
     [[ "$(get HOST_CACHE_BYTES auto)" == 0 ]] || family_args+=(--host-cache-bytes "$(get HOST_CACHE_BYTES auto)") ;;
 esac
-if [[ ( $family == mimo_v2 || $family == qwen4 || $family == glm5_flash || $family == inkling2 || $family == step5 ) && $vision != off ]]; then
+if [[ ( $family == mimo_v2 || $family == qwen4 || $family == glm5_flash || $family == inkling2 || $family == step5 || $family == kimi_k3 ) && $vision != off ]]; then
   # Text-only frozen daemons can predate the optional media-cache flag.
   [[ -z "$(get MEDIA_CACHE_BYTES)" ]] || family_args+=(--media-cache-bytes "$(get MEDIA_CACHE_BYTES)")
 fi
@@ -2088,15 +2085,8 @@ if [[ $serve != serve-dsv4 ]]; then
     if [[ $family == mimo_v2 ]]; then
       [[ -z "$(get DRAFT_CONTEXT_SLOTS)" ]] || family_args+=(--draft-context-slots "$(get DRAFT_CONTEXT_SLOTS)")
       [[ -z "$(get DRAFT_SEQUENCES)" ]] || family_args+=(--draft-sequences "$(get DRAFT_SEQUENCES)")
-      mimo_draft_default=""
-      if [[ $mimo_flash_mopd == 1 && $speculator == dflash2 && -z "$drafter" ]]; then
-        mimo_draft_default=on
-      fi
-      case "$(get SPECULATOR_FP8 "$mimo_draft_default")" in
-        "") ;;
-        auto) family_args+=(--draft-representation checkpoint) ;;
-        on) family_args+=(--draft-fp8 true) ;;
-        off) family_args+=(--draft-fp8 false) ;;
+      case "$(get SPECULATOR_FP8)" in
+        ""|auto|on|off) ;; # Rust emits the one precision choice after admission.
         *) echo "MiMo SPECULATOR_FP8 must be auto, on or off" >&2; exit 2 ;;
       esac
     elif [[ $family == kimi_k3 ]]; then
@@ -2659,6 +2649,9 @@ audio_encoder_hash=""
   fi
   coordinator_weight_budget_gib="$(jq -er '.resolved_settings.coordinator_weight_budget_gib.value' <<<"$deployment_json")"
   if [[ "$family" == kimi_k3 && ( "$speculator" == dflash2 || "$speculator" == dspark ) ]]; then
+    draft_args+=(--draft-fp8 "$(jq -er '.resolved_settings.draft_fp8.value | tostring' <<<"$deployment_json")")
+  fi
+  if [[ "$family:$speculator" == mimo_v2:dflash2 ]]; then
     draft_args+=(--draft-fp8 "$(jq -er '.resolved_settings.draft_fp8.value | tostring' <<<"$deployment_json")")
   fi
   if [[ "$family:$speculator" == mimo_v2:mtp ]]; then

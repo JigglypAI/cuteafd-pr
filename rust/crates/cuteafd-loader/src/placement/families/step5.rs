@@ -107,6 +107,16 @@ fn physical(fixed: &mut Vec<Demand>, backings: &mut Vec<GranularityBacking>, ran
     Ok(())
 }
 
+/// FP8 plane alignment can make head splits larger than whole-layer records.
+/// The domain must cover either layout, before the owner cut is selected.
+fn pool_unit_lower_bound(cfg: &Config, ranks: usize, context: u64, depth: usize,
+    rows: u64, step: u64, format: crate::families::qwen4::Qwen4KvCache) -> Result<u64> {
+    (1..=ranks).map(|count| {
+        let cache = Step5CacheLayout::new(cfg, count, context, depth, rows, step, format)?;
+        checked_sum(cache.geometry.ranks.iter().map(|rank| rank.persistent_unit_bytes))
+    }).collect::<Result<Vec<_>>>()?.into_iter().min().context("Step-5 pool owner geometry")
+}
+
 fn pool_physical_bytes(unit: u64, pages: u64) -> Result<u64, Refusal> {
     unit.checked_mul(pages).ok_or(Refusal::Overflow("Step-5 pool backing"))
         .and_then(sm120_request_backing)
@@ -123,6 +133,62 @@ fn pool_curve(unit: u64, maximum: u64) -> Result<ByteCurve, Refusal> {
 #[cfg(test)]
 mod physical_pool_tests {
     use super::*;
+
+    #[test]
+    fn native_pool_domain_covers_whole_layer_and_head_split_records() -> Result<()> {
+        struct NativeRecords { units: Vec<u64>, maximum: u64 }
+        impl Recipe for NativeRecords {
+            fn prepare(&self, _: &Request) -> Result<Contract, Refusal> {
+                let facts = Facts { phase_order: PhaseOrder::TARGET_THEN_DRAFT,
+                    allocations: vec![], deferred: vec![], sequential: vec![], reservations: vec![],
+                    allowances: vec![], resident_weights: vec![], driver_page_tables: vec![], allocation_granularity: vec![] };
+                let mut contract = Contract::fixed(PAGE_ROWS, self.maximum, self.units.len(), facts);
+                contract.variables = vec![Variable::Attention { layer: 0, values: vec![LayerMode::HeadSplit] },
+                    Variable::Prefill(vec![PrefillShape { rows: 64, waves: 1 }]), Variable::Lanes(vec![1])];
+                for (rank, &unit) in self.units.iter().enumerate() {
+                    let owner = Allocation::buffer(format!("native.records.{rank}"), Location::coordinator(rank as u8),
+                        unit, Lifetime::TARGET, Category::Kv, "native records");
+                    let curve = pool_curve(unit, self.maximum)?;
+                    let mut component = Component::allocation(owner, curve.clone(), false, self.maximum);
+                    component.byte_extent(curve)?;
+                    contract.components.push(component);
+                }
+                Ok(contract)
+            }
+        }
+        let dir = crate::plan::families::step5::tests::exl3_snapshot();
+        let cfg = Config::parse(&crate::plan::Checkpoint::open(dir.path())?)?;
+        let modes = Step5Recipe::modes(&cfg, 2, cfg.layers / 2);
+        let ownership = ExecutionOwnership::for_modes(&cfg, 2, &modes, HopSpec {
+            storage: HopStorage::ReceiveSlots, row_bytes: 4096 * 4, rows: 64, lanes: 1,
+            entry_gpu: 0, head_gpu: 0, terminal: TerminalHome::AttentionOwner })?;
+        for format in [crate::families::qwen4::Qwen4KvCache::Bf16, crate::families::qwen4::Qwen4KvCache::Fp8] {
+            let minimum = pool_unit_lower_bound(&cfg, 2, 262_144, 0, 64, 64, format)?;
+            let whole = Step5CacheLayout::for_execution(&cfg, &ownership, 262_144, 0, 64, 64, format)?;
+            let split = Step5CacheLayout::new(&cfg, 2, 262_144, 0, 64, 64, format)?;
+            for bytes in [32u64 << 30, 96 << 30, 192 << 30] {
+                let cards = [bytes * 2];
+                let pool = crate::placement::prepare_pool(crate::plan::testing::pool_facts(
+                    &cards, crate::placement::planner::Context::automatic(262_144), None, PAGE_ROWS, &[minimum]))?;
+                for cache in [&whole, &split] {
+                    let recipe = NativeRecords { units: cache.geometry.ranks.iter()
+                        .map(|rank| rank.persistent_unit_bytes).collect(),
+                        maximum: pool.maximum_tokens() / PAGE_ROWS * 2 };
+                    let budgets = (0..2).map(|rank| Budget { id: format!("rtx{rank}"),
+                        locations: vec![Location::coordinator(rank)], physical_bytes: bytes, logical_bytes: bytes,
+                        baseline: Baseline::Forecast { occupied: 0, source: "simulated native records".into(), assumed: false },
+                        headroom: 0 }).collect();
+                    let request = Request { context: crate::placement::planner::Context::automatic(262_144), pool: Pin::Auto, onboard: Pin::Auto,
+                        prefill: Pin::Auto, spark_reply_formats: Default::default(), operation: Operation::Serving,
+                        resident_weight_limit: None };
+                    let solved = solve(request, budgets, &recipe)?;
+                    assert!(pool.maximum_tokens() >= solved.admitted_extent(),
+                        "{format:?}: domain {} < admitted {}", pool.maximum_tokens(), solved.admitted_extent());
+                }
+            }
+        }
+        Ok(())
+    }
 
     #[test]
     fn pool_curve_prices_exact_physical_backing_without_aligning_pages() -> Result<()> {
@@ -209,13 +275,17 @@ impl<'a> Step5Recipe<'a> {
             .iter()
             .map(|gpu| gpu.capacity_bytes)
             .collect::<Vec<_>>();
-        let mut facts = crate::placement::PoolFacts::new(
-            &capacities, inputs.serving_context, inputs.requested_pool, PAGE_ROWS);
+        let mut facts = crate::placement::PoolFacts::new(inputs.serving_context, inputs.requested_pool, PAGE_ROWS);
+        facts.memory = vec![crate::placement::PoolMemory {
+            available_bytes: checked_sum(capacities.iter().copied())?,
+            bytes_per_unit: pool_unit_lower_bound(cfg, gpus, inputs.context, depth,
+                inputs.unit_rows() as u64, inputs.rows as u64, inputs.kv_format)?,
+        }];
         facts.target = inputs.target_pool;
         let pool = crate::placement::prepare_pool(facts)?;
         pool.validate_explicit()?;
         let maximum_pages = pool.maximum_tokens().div_ceil(PAGE_ROWS);
-        let layout_pages = pool.requested().unwrap_or(pool.target()).div_ceil(PAGE_ROWS);
+        let layout_pages = pool.requested().unwrap_or(pool.target()).div_ceil(PAGE_ROWS).min(maximum_pages);
         ensure!(maximum_pages > 0, "Step-5 empty pool ceiling");
         let prefill = PrefillShape {
             rows: inputs.unit_rows() as u64,
@@ -775,6 +845,28 @@ impl Recipe for Step5Recipe<'_> {
             }
         }
         self.expert_components(&mut contract, onboard)?;
+        for (count, ranks) in self.inputs.spark_owners.iter().enumerate() {
+            if ranks.len() != self.inputs.inventory.spark_ranks {
+                return Err(Refusal::InvalidFact("Step-5 remote owner rank count".into()));
+            }
+            let activation = onboard.map_or_else(Activation::always, |variable| Activation::choice(variable, count));
+            for (rank, items) in ranks.iter().enumerate() {
+                let location = Location { device: Device::Spark(rank as u8), domain: Domain::Managed };
+                for (index, item) in items.iter().enumerate() {
+                    let owner = Allocation::buffer(format!("step5.spark.{count}.{rank}.{index}"), location,
+                        item.bytes, Lifetime::RESIDENT, item.category, &item.group);
+                    if item.category == Category::Experts {
+                        contract.components.push(Component { activation: activation.clone(),
+                            bytes: ByteCurve::fixed(item.bytes, self.maximum_pages),
+                            kind: ComponentKind::DriverPageTables { model: DriverPageTableModel::Sm121Arena,
+                                location, lifetime: owner.lifetime, backing: owner.id.clone() } });
+                    }
+                    contract.components.push(Component { activation: activation.clone(),
+                        ..Component::allocation(owner, ByteCurve::fixed(item.bytes, self.maximum_pages),
+                            false, self.maximum_pages) });
+                }
+            }
+        }
         if let Some(vision) = &self.inputs.vision {
             vision.extend(&mut contract.variables, &mut contract.components, self.maximum_pages)?;
             vision.require_spark_worker(&contract.variables, &mut contract.requires);

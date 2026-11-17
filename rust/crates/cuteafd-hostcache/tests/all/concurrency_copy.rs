@@ -3,7 +3,7 @@
 //! seeded order that mixes issues, records, waits and advances. A shadow model checks the
 //! engine's observable state after every step, and the schedule is logged so a failure
 //! reproduces from its seed.
-mod common;
+use super::common;
 
 use common::Rng;
 use cuteafd_hostcache::copy::testing::Shadow;

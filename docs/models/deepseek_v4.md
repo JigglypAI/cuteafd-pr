@@ -1,5 +1,11 @@
 # DeepSeek V4 (Flash / Pro)
 
+Automatic KV sizing uses the shared 2M-token target on every card, including
+32 GB / RTX 5090. Placement and expert onboarding are fixed at that target;
+the pool then grows into remaining admitted memory, within native encoding
+limits. `KV_MAX_TOKENS` is unset by default and can explicitly cap growth.
+See [memory policy](../options.md#memory-and-pools).
+
 Re-hosted on CuteAFD's generic per-layer engine rather than the legacy
 `real_full` path. Release cards measure each checkpoint against CuteAFD's
 own history, not an external-engine parity campaign.

@@ -129,7 +129,7 @@ fn blas_heads_share_one_pool_only_for_genuine_bf16_drafts() {
 fn auto_pool_matches_the_declared_owners_and_never_shrinks_context() {
     let (cfg, weights, buffers, arena) = fixture();
     let plan = admit(request(), budgets(), facts(&cfg, &weights, &buffers, &arena)).unwrap();
-    assert_eq!(plan.pool_tokens, 2 << 20);
+    assert!(plan.pool_tokens > 2 << 20, "an unbounded max grows into the admitted memory");
     assert_eq!(plan.pool_tokens % PAGE_ROWS, 0);
     assert_eq!(plan.decisions.embedding, Some(planner::EmbeddingHome::Device(0)));
     assert!(plan.decisions.onboard_layers.iter().all(Vec::is_empty));
@@ -292,7 +292,7 @@ fn exact_pools_report_typed_refusals_instead_of_shrinking_the_context() {
     for (pool, expected) in [
         (Pin::Exact(PAGE_ROWS), "below context"),
         (Pin::Exact(3 * PAGE_ROWS + 1), "misaligned"),
-        (Pin::Exact((32 << 20) * PAGE_ROWS), "beyond memory"),
+        (Pin::Exact((32 << 20) * PAGE_ROWS), "beyond the compiled extent"),
     ] {
         let mut ask = request();
         ask.pool = pool;
@@ -300,8 +300,7 @@ fn exact_pools_report_typed_refusals_instead_of_shrinking_the_context() {
         match expected {
             "below context" => assert!(matches!(&refusal, Refusal::PoolBelowContext { .. }), "{refusal}"),
             "misaligned" => assert!(matches!(&refusal, Refusal::MisalignedPool { .. }), "{refusal}"),
-            _ => assert!(matches!(&refusal, Refusal::Capacity { budget, .. } if budget == "rtx0"),
-                "{refusal}"),
+            _ => assert!(matches!(&refusal, Refusal::InvalidPin(_)), "{refusal}"),
         }
     }
     // The compiled extent is a real ceiling, refused before any arithmetic.
@@ -512,17 +511,17 @@ fn prepared_pool_matches_plan_and_runtime_and_preserves_strict_requests() {
     use cuteafd_core::memory_policy::MemoryPolicy;
     let (cfg, weights, buffers, arena) = fixture();
     let default = admit(request(), budgets(), facts(&cfg, &weights, &buffers, &arena)).unwrap();
-    assert_eq!(default.pool_tokens, 2 << 20);
-    MemoryPolicy { kv_max: Some(100_000_000), ..Default::default() }.scoped(|| {
+    assert!(default.pool_tokens > 2 << 20, "an unbounded max grows into the admitted memory");
+    MemoryPolicy { kv_max: Some(2 << 20), ..Default::default() }.scoped(|| {
         let planned = admit(request(), budgets(), facts(&cfg, &weights, &buffers, &arena)).unwrap();
         let live = sampled_budgets(96 << 30, 96 << 30, None,
             crate::plan::testing::SimulatedHost::raptor().host_ram).unwrap();
         let served = admit(request(), live, facts(&cfg, &weights, &buffers, &arena)).unwrap();
         assert_eq!(planned.pool_policy, served.pool_policy);
         let pool = planned.pool_policy.unwrap();
-        assert_eq!(pool.ceiling(), u32::MAX as u64);
-        assert_eq!(pool.maximum_tokens(), 100_000_000);
-        assert!(planned.pool_tokens > default.pool_tokens);
+        assert_eq!(pool.ceiling(), 2 << 20);
+        assert_eq!(pool.maximum_tokens(), 2 << 20);
+        assert_eq!(planned.pool_tokens, 2 << 20);
         assert_eq!(planned.decisions.onboard_layers, default.decisions.onboard_layers);
         let mut strict = request();
         strict.pool = Pin::Exact(262_144);

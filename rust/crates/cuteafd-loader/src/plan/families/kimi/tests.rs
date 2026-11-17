@@ -370,9 +370,13 @@ fn release_headers_classify_native_text_without_installed_artifacts() {
     assert!(report.hints.iter().any(|hint| hint.what.contains("Kimi header inventory refused: missing projection")),
         "{:?}", report.hints);
     assert_eq!(model.vision_mode(MediaMode::Auto), MediaMode::Auto);
+    let vision=report.components.iter().find(|c|c.component==Component::Vision).unwrap();
+    assert_eq!(vision.status,Status::Ready,"Auto vision is structural, never qualification-Planned");
+    assert_eq!(vision.rejected,0);
+    assert!(!report.hints.iter().any(|h|h.what.contains("vision")&&h.what.contains("qualification")));
     let vision_report = testing::plan(dir.path(), &PlanOptions { vision: MediaMode::Rtx(None), ..Default::default() }).unwrap();
     assert!(!vision_report.wip_launchable());
-    assert!(vision_report.hints.iter().any(|h| h.what.contains("production qualification remains pending")));
+    assert!(!vision_report.hints.iter().any(|h| h.what.contains("production qualification remains pending")));
 }
 
 #[test]
@@ -748,6 +752,7 @@ fn header_native_k4_k6_k8_core_is_admitted_by_default() -> Result<()> {
     let mut model=Model::open(&checkpoint)?;
     model.configure().map_err(anyhow::Error::msg)?;
     assert!(model.native_serving_admission());
+    assert_eq!(KIMI_K3.runtime(), crate::plan::RuntimeStatus::Serving);
     assert!(model.core.projections.values().all(|p| p.bits == bits));
     for (stem,projection) in &model.core.projections {
         let members=checkpoint.tensors.iter().filter(|t|format::split_stem(&t.meta.name).0==stem)

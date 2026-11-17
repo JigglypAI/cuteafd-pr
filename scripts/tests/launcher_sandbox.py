@@ -119,6 +119,10 @@ def fake_resolved_settings(args, family, sparks):
         precision["value"] = raw if isinstance(raw, bool) else raw in ("on", "true")
         result["draft_fp8"] = precision
     if family == "mimo_v2":
+        precision = resolved("--draft-fp8", "SPECULATOR_FP8", True)
+        raw = precision["value"]
+        precision["value"] = raw if isinstance(raw, bool) else raw in ("on", "true")
+        result["draft_fp8"] = precision
         result["native_mtp_layers"] = {"value": int(config.get("SPECULATOR_DEPTH") or 1) if value("--speculator") == "mtp" else 0, "provenance": "auto"}
     if family == "glm5_flash":
         result.update(index_cache=resolved("--index-cache", "GLM5_FLASH_INDEX_CACHE", "compact" if tp == 1 else "keys"),

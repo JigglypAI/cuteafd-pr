@@ -178,6 +178,8 @@ const EXECUTOR: ExecutorModes = crate::placement::families::STEP5;
 pub struct RuntimeInputs {
     pub vision: Option<crate::placement::still_encoder::StillEncoder>,
     pub spark_bytes: Vec<u64>,
+    /// Catalog-exact remote owners, indexed by onboarding count and Spark rank.
+    pub spark_owners: Vec<Vec<Vec<cuteafd_core::memory_layout::Item>>>,
     pub graph_layout: Option<crate::serving_capacity::step5_graphs::Step5GraphLayout>,
     pub decode_graphs: bool,
     pub host: HostInputs,
@@ -295,22 +297,12 @@ pub fn tp2_exchange_requests(unit_rows: usize, lanes: usize, exchange: Tp2Exchan
     Ok(requests)
 }
 
-/// Why NVFP4 Step plans onboard nothing (and refuse an explicit layer count).
-pub const NVFP4_ONBOARDING_DEPRECATED: &str = "Step-5 NVFP4 is deprecated (its cards retire this release): \
-    RTX expert onboarding is not built for it; its routed experts stay on the Sparks";
-/// FP8 Step is qualified only on two RTX (2 RTX + 6 Sparks); there its
-/// onboarded layers split TP2. No whole-layer fp8moe executor exists.
-pub const FP8_ONBOARDING_TWO_RTX: &str = "Step-5 FP8 onboards TP2 on two RTX only (its qualified card): \
-    its routed experts stay on the Sparks";
+/// Native fp8moe experts have a TP2 owner; the single-GPU whole owner is EXL3-only.
+pub const NATIVE_ONBOARDING_TWO_RTX: &str = "Step-5 native FP8/NVFP4 whole-layer RTX expert executor is not implemented;     use two coordinator GPUs for native TP2 onboarding or leave routed experts on Sparks";
 
-/// The named reason a routed format does not onboard here, or None.
+/// The named structural reason a routed format cannot onboard, or None.
 pub fn onboarding_unavailable(catalog: &crate::OfficialV41Catalog, gpus: usize) -> Option<&'static str> {
-    use crate::formats::fp8_experts::ExpertFormat;
-    match catalog.fp8().map(|fp8| fp8.format()) {
-        Some(ExpertFormat::Nvfp4) => Some(NVFP4_ONBOARDING_DEPRECATED),
-        Some(_) if gpus != 2 => Some(FP8_ONBOARDING_TWO_RTX),
-        _ => None,
-    }
+    (catalog.fp8().is_some() && gpus != 2).then_some(NATIVE_ONBOARDING_TWO_RTX)
 }
 
 /// Header-exact costs of the routed layers in order (whole, and TP2 halves on
@@ -347,6 +339,78 @@ impl OnboardInputs {
         Ok(Some(Self { costs: expert_costs(catalog, gpus == 2)?, workspace, tp2_workspace,
             workspace_requests: vec![requests; gpus], mode }))
     }
+}
+
+/// The same packed resident assignment and typed execution census the Spark
+/// startup path uses. Every onboarding candidate prices only its remote suffix.
+pub fn spark_owners(catalog: &crate::OfficialV41Catalog, inputs: &RuntimeInputs)
+    -> Result<Vec<Vec<Vec<cuteafd_core::memory_layout::Item>>>> {
+    use cuteafd_core::memory_layout::Item;
+    let ranks = inputs.inventory.spark_ranks;
+    if ranks == 0 { return Ok(Vec::new()); }
+    let shape = catalog.routed_experts();
+    let routed = (shape.first_layer..shape.layers).collect::<Vec<_>>();
+    let backend = crate::plan::spark_executions::SparkBackend::for_catalog(catalog)?;
+    let executions = crate::plan::spark_executions::admit_family("step5", &backend.exports(), None,
+        inputs.unit_rows() as u64, inputs.waves as u64)?;
+    let endpoint = cuteafd_core::SparkEndpoint { ring_depth: None, capacity: inputs.unit_rows().try_into()?,
+        ingress: if catalog.exl3().is_some() { cuteafd_core::SparkIngress::Fp8K32 }
+        else if catalog.fp8().is_some_and(|tensors| tensors.format().bf16_input()) {
+            cuteafd_core::SparkIngress::Bf16
+        } else { cuteafd_core::SparkIngress::Native }, partial_reply_bytes: None };
+    let rings = cuteafd_core::SparkRings { max_frame_bytes: 64 << 20, depth: 8,
+        slot_bytes: 8 << 20, alignment: 4096 };
+    let layouts = (0..ranks).map(|rank| -> Result<_> {
+        if catalog.exl3().is_some() { return Ok(SparkResidentLayout::Exl3 { world: ranks, rank }); }
+        let format = catalog.fp8().context("Step-5 native expert headers")?.format();
+        let name = match format {
+            crate::formats::fp8_experts::ExpertFormat::Nvfp4 => "nvfp4",
+            crate::formats::fp8_experts::ExpertFormat::Bf16 => "bf16",
+            _ => "fp8",
+        };
+        let recipe = crate::plan::experts::spark_recipe(&format!("step5:{name}"), shape.intermediate, ranks)?;
+        Ok(SparkResidentLayout::Fp8 { world: ranks, rank, slicing: recipe.slicing })
+    }).collect::<Result<Vec<_>>>()?;
+    // Validate each layer/rank once, not again for every onboarding suffix.
+    let resident = (0..ranks).map(|rank| routed.iter().map(|&layer| {
+        if catalog.exl3().is_some() {
+            return usize::try_from(catalog.exl3_spark_arena_bytes(layer, ranks)?[rank]).map_err(Into::into);
+        }
+        let working = SparkWorkingSet { spark_layers: vec![layer], spark_ranks: ranks,
+            prefill_lanes: 1, ..Default::default() };
+        Ok(usize::try_from(SparkAssignment::resident_from_catalog(catalog, &working, rank,
+            layouts[rank])?.resident_bytes)?)
+    }).collect::<Result<Vec<_>>>()).collect::<Result<Vec<_>>>()?;
+    let count_max = if inputs.onboard.is_some() { routed.len() } else { 0 };
+    (0..=count_max).map(|count| {
+        let working = SparkWorkingSet { rtx_layers: routed[..count].to_vec(), spark_layers: routed[count..].to_vec(),
+            spark_ranks: ranks, prefill_lanes: 1 };
+        (0..ranks).map(|rank| {
+            if working.spark_layers.is_empty() { return Ok(Vec::new()); }
+            let resident_bytes = crate::serving_capacity::PackedWeightRegions::new(
+                resident[rank][count..].iter().copied())?.bytes as u64;
+            let workspace = executions.workspace_bytes(|extent|
+                crate::plan::layout::spark_slots::catalog_owner_bytes(catalog, "step5", &working, rank, extent))?
+                .context("Step-5 Spark execution owner overflow")?;
+            let io = working.rank_endpoints_io(rank, cuteafd_core::ExpertGeometry::STEP5, &[endpoint], rings)?;
+            let mut items = vec![Item::new(Category::Experts, "routed expert arena", "",
+                resident_bytes, Basis::Exact)];
+            for (category, group, bytes) in [
+                (Category::Transport, "expert intake", io.intake),
+                (Category::Transport, "host expert exchange", io.host_exchange),
+                (Category::Transport, "expert row indices", io.row_indices),
+                (Category::Transport, "endpoint response prefixes", io.endpoint_staging),
+                (Category::Transport, "rdma rings", io.mapped_rings),
+                (Category::Workspace, "execution owners", workspace.device_bytes),
+                (Category::Workspace, "execution staging", workspace.pinned_bytes),
+                (Category::Runtime, cuteafd_core::memory_layout::spark_runtime_reserve_group(),
+                    cuteafd_core::memory_layout::spark_runtime_reserve_bytes(0).context("Spark runtime reserve")?),
+            ] {
+                if bytes > 0 { items.push(Item::new(category, group, "", bytes, Basis::Exact)); }
+            }
+            Ok(items)
+        }).collect()
+    }).collect()
 }
 
 pub use crate::placement::families::step5::Admission;
@@ -462,6 +526,13 @@ pub fn admit(checkpoint: &Checkpoint, inputs: &RuntimeInputs) -> Result<Admissio
     let contract = super::coordinator::CoordinatorContract::from_checkpoint(checkpoint)?;
     let mut selected_inputs = inputs.clone();
     selected_inputs.host.attention_mount_load = contract.attention_mount_load(inputs.inventory.gpus.len())?;
+    if inputs.inventory.spark_ranks > 0 && selected_inputs.spark_owners.is_empty() {
+        let catalog = match &checkpoint.view {
+            Some(view) => crate::read_expert_catalog_view(view)?,
+            None => crate::read_expert_catalog(&checkpoint.snapshot)?,
+        };
+        selected_inputs.spark_owners = spark_owners(&catalog, &selected_inputs)?;
+    }
     let inputs = &selected_inputs;
     admit_with(&cfg, inputs, |ownership| {
         (0..ownership.ranks())
@@ -490,6 +561,13 @@ pub fn admit_mtp_with_contract(checkpoint: &Checkpoint, inputs: &RuntimeInputs, 
     let cfg = Config::parse(checkpoint)?;
     let mut selected_inputs = inputs.clone();
     selected_inputs.host.attention_mount_load = contract.attention_mount_load(inputs.inventory.gpus.len())?;
+    if inputs.inventory.spark_ranks > 0 && selected_inputs.spark_owners.is_empty() {
+        let catalog = match &checkpoint.view {
+            Some(view) => crate::read_expert_catalog_view(view)?,
+            None => crate::read_expert_catalog(&checkpoint.snapshot)?,
+        };
+        selected_inputs.spark_owners = spark_owners(&catalog, &selected_inputs)?;
+    }
     let inputs = &selected_inputs;
     if depth == 0 {
         return admit_with(&cfg, inputs, |ownership| (0..ownership.ranks()).map(|rank|
@@ -592,7 +670,7 @@ mod tests {
         }
     }
     fn inputs(ranks: usize) -> RuntimeInputs {
-        RuntimeInputs { vision: None, spark_bytes: crate::plan::testing::SimulatedHost::raptor().layout().spark_capacities(8), graph_layout: None, decode_graphs: false, bf16_target_head: crate::placement::planner::serving::BlasHead::TensorLt,
+        RuntimeInputs { vision: None, spark_owners: Vec::new(), spark_bytes: crate::plan::testing::SimulatedHost::raptor().layout().spark_capacities(8), graph_layout: None, decode_graphs: false, bf16_target_head: crate::placement::planner::serving::BlasHead::TensorLt,
             host: Default::default(), resident_weight_limit: None, spark_reply_format: cuteafd_core::SparkReplyFormat::Bf16,
                 kv_format: crate::families::qwen4::Qwen4KvCache::Bf16,
             waves: 1, unit: 0,
@@ -1293,6 +1371,8 @@ mod tests {
             for ranks in [1, 2] {
                 for mode in [BlasHead::TensorLt, BlasHead::Gemm] {
                     let mut input = inputs(ranks);
+                    // This isolates head/handle ownership, not the unsupported BF16 card fit.
+                    input.spark_bytes = vec![512 << 30; input.inventory.spark_ranks];
                     input.bf16_target_head = mode;
                     for depth in [0, 1, 3] {
                         let admitted = admit_mtp_with_contract(&checkpoint, &input, depth, &contract)?;

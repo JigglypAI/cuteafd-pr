@@ -18,6 +18,7 @@ pub(super) fn diagnostic_pool(layout: FamilyLayout) -> cuteafd_engine::prefix::R
 
 #[derive(Clone)]
 pub(crate) struct Placement {
+    pub media_spans: Vec<cuteafd_core::MediaSpan>,
     pub units: Vec<u32>,
     pub slot: usize,
     pub len: usize,
@@ -29,7 +30,7 @@ impl crate::shared::qwen::scheduler::Placement for Placement {
     fn set_len(&mut self, len: usize) { self.len = len; }
     fn units(&self) -> &[u32] { &self.units }
     fn slot(&self) -> i32 { self.slot as i32 }
-    fn spans(&self) -> &[cuteafd_core::MediaSpan] { &[] }
+    fn spans(&self) -> &[cuteafd_core::MediaSpan] { &self.media_spans }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -615,7 +616,7 @@ mod tests {
                 cache.tick();
                 Ok(())
             };
-            let build = |slot| move |units| Placement { units, slot, len: 0, state_len: 0 };
+            let build = |slot| move |units| Placement { media_spans: Vec::new(), units, slot, len: 0, state_len: 0 };
             let mut cache = make_cache()?;
             let tokens = (100..230).collect::<Vec<u32>>();
             let mut original = cache.admit(&family, &tokens[..65], 131, false, build(0))?.placement;
@@ -785,7 +786,7 @@ mod tests {
                 Ok(bytes)
             };
             let boxed = |error: BoxError| anyhow::anyhow!("Kimi prefix fixture: {error}");
-            let mut original = Placement { units: vec![0, 1], slot: 0, len: 0, state_len: 0 };
+            let mut original = Placement { media_spans: Vec::new(), units: vec![0, 1], slot: 0, len: 0, state_len: 0 };
             family.bind(&mut original).map_err(boxed)?;
             family.check_append(&original, 65)?;
             assert!(family.check_append(&original, 0).is_err());
@@ -846,7 +847,7 @@ mod tests {
                     }
                 }
             }
-            let mut restored = Placement { units: vec![2, 3], slot: 1, len: 0, state_len: 0 };
+            let mut restored = Placement { media_spans: Vec::new(), units: vec![2, 3], slot: 1, len: 0, state_len: 0 };
             family.bind(&mut restored).map_err(boxed)?;
             assert!(family.restore(None, &mut restored, 65).is_err());
             family.restore(Some(MarkSlot(0)), &mut restored, 65).map_err(boxed)?;
@@ -954,7 +955,7 @@ mod tests {
             PrefixConfig { entries: 8, mark_slots: family.slots(), keep_logits: true, min_tokens: 1 },
             None)?;
         let tokens = (100..165).collect::<Vec<u32>>();
-        let build = |slot: usize| move |units| Placement { units, slot, len: 0, state_len: 0 };
+        let build = |slot: usize| move |units| Placement { media_spans: Vec::new(), units, slot, len: 0, state_len: 0 };
         let mut source = cache.admit(&family, &tokens, 192, false, build(0))?.placement;
         prefill(&library, &family, &mut source, &tokens, 0x37)?;
         assert!(cache.capture(&family, SnapshotKind::Prompt, &tokens, &source,
@@ -966,7 +967,7 @@ mod tests {
         let builds = std::cell::Cell::new(0);
         let mut fallback = cache.admit(&family, &tokens, 192, false, |mut units| {
             if builds.replace(builds.get() + 1) == 0 { units.truncate(1); }
-            Placement { units, slot: 1, len: 0, state_len: 0 }
+            Placement { media_spans: Vec::new(), units, slot: 1, len: 0, state_len: 0 }
         })?;
         assert_eq!((fallback.resume, cache.stats().restore_failures, builds.get()), (0, 1, 2));
         assert_eq!((fallback.placement.len, fallback.placement.state_len), (0, 0));
