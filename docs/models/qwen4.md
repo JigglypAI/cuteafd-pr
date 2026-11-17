@@ -26,8 +26,8 @@ placeholder Spark hosts and addresses): EXL3 K4.25 [min](../../examples/configs/
   layer; EXL3 K4/K5, FP8 128x128 blocks, or ModelOpt NVFP4 group-16; a local
   (RTX-resident, TP1) expert path is supported.
 - Speculator: native MTP (full attention, 512 experts, and a hyper-connection
-  feedback path). The launcher defaults to MTP3 with resident local EXL3 or
-  NVFP4 experts; `SPECULATOR=off` disables it and `SPECULATOR_DEPTH` overrides the
+  feedback path). The launcher defaults to MTP3 when the checkpoint declares
+  its one native MTP layer, across supported expert formats and local/Spark layouts; `SPECULATOR=off` disables it and `SPECULATOR_DEPTH` overrides the
   depth. The policy adapts the number of drafts to concurrency and acceptance.
 - KV precision: `KV_CACHE=bf16|fp8` (default `fp8`), forwarded as `--kv-cache`
   on plan and serve.

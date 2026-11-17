@@ -726,7 +726,7 @@ Each key is also a global `cuteafd` flag (`--gpu-memory-cap`, `--kv-max-tokens`,
 | `SPECULATOR` | family default | `auto` (Qwen4/Kimi), `off`, `dflash2`, `dspark`, `mtp` | An eligible Kimi/GLM Flash automatic external drafter must be installed, including its config; a missing checkpoint fails with a `nest hf download` command rather than silently serving without speculation. Explicit `off` and unsupported automatic targets remain off. K3.1 pairing reads verifier model/architecture declarations and target hidden/vocabulary/tap/mask dimensions from checkpoint metadata, including MC source identity; no checkpoint revision or core-view allowlist is used. Pairing mismatches name the field and refuse launch. |
 | `SPECULATOR_MODEL_ID` | family default | HF repo id | External drafter checkpoint. |
 | `SPECULATOR_MODEL_REVISION` | empty | 40–64 lowercase hex | Drafter revision. |
-| `SPECULATOR_DEPTH` | 3 for local Qwen/Step-5, else 1 | positive int | Native MTP draft depth. |
+| `SPECULATOR_DEPTH` | 3 for Qwen/Step-5, else 1 | positive int | Native MTP draft depth. |
 | `DRAFT_LENGTH` | unset (adaptive) | positive int | Fixed verified draft tokens per step: min(value, native head width), further capped by the existing row budget at high concurrency. Overrides `DRAFT_POLICY`; statistics still recorded. Every family and speculator (DFlash2, dSpark, MTP, Markov). V4.1 adaptive maximum remains 5 when unset; fixed supports up to 7. Without a speculator it is ignored with one startup log; reports and cards say `no speculation`. |
 | `SPECULATOR_FP8` | `auto` | `auto`, `on`, `off` | GLM/Qwen/MiMo/Kimi drafter precision: unset, `auto` and `on` select single-copy FP8 projection weights; `off` keeps BF16. Rust resolves the same MiMo precision for planning and serving, independent of checkpoint alias or core view. Kimi block DSpark supports TP1 and physical TP2 with native BF16 norms/Markov tensors; FP8 applies to content-paired K3.1 DSpark in every core view and layout. Independent of `DRAFT_KV_CACHE`. |
 | `DRAFT_POLICY` | unset | `shared`, `simple`, `simple-rc`, `simple-derived` | Drafter block policy: unset selects `simple` for every family; the others are explicit opt-ins. Shared prices draft/skip actions per concurrency bucket and collects per-layer timing. |
@@ -1018,12 +1018,14 @@ Speculator (`SPECULATOR`):
 | `dspark` | ✓ (default) | ✓ (default) | ✓ (Mistral Large 4 only) | ✓ | ✗ | ✗ | ✓ (default unless hidden is 5120) | ✓ (content-paired K3.1 default in every view/layout; otherwise opt-in) | ✗ | ✗ | ✗ |
 | `mtp` | ✗ | ✗ | ✗ | ✗ | ✓ | ✓ (default) | ✓ (local EXL3/NVFP4 default, depth 3) | ✗ | ✓ (default) | ✗ | ✗ |
 
-Qwen4 unset/`auto` selects native MTP (depth 3) only for qualified local
-EXL3 or ModelOpt NVFP4 with one MTP stage and an admitted Spark expert
-world of zero. Configured Spark inventory and admitted vision-only ranks do
-not disable this default. Media-only Spark layouts still require an available
-worker and complete encoder admission. Other formats and Spark expert layouts
-default off. Explicit values win.
+Qwen4 unset/`auto` selects native MTP whenever the checkpoint declares its MTP
+layer, independent of expert quantization, core view, repository revision or
+admitted Spark expert world. The one native layer recursively drafts three
+tokens by default; `SPECULATOR_DEPTH` overrides that depth and explicit
+`SPECULATOR=off` disables drafting. Multiple checkpoint MTP layers require an
+unimplemented executor and refuse precisely; unsupported tensors or native
+exports still refuse through the ordinary structural contract. Media-only
+Spark layouts still require an available worker and complete encoder admission.
 Qwen4 keeps the exact pre-allocation-admitted expert set resident, with no runtime paging.
 `RTX_EXPERT_LAYERS=auto` is pool-first on one or two RTX devices, including
 Spark-backed layouts: whole routed layers on one RTX, TP2 halves on two, and
