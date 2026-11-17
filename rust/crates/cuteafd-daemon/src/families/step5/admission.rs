@@ -446,6 +446,7 @@ mod tests {
 
     #[test]
     fn joint_spark_owners_match_startup_assignments_for_fp8_mc_and_nvfp4() -> Result<()> {
+        use anyhow::Context;
         use cuteafd_core::memory_layout::{Category, DeviceKind};
         use crate::shared::placement::SparkAdmission;
         for kind in ["fp8", "mc", "nvfp4"] {

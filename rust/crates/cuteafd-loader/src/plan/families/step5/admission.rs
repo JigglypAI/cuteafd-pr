@@ -404,8 +404,6 @@ pub fn spark_owners(catalog: &crate::OfficialV41Catalog, inputs: &RuntimeInputs)
                 (Category::Workspace, "execution staging", workspace.pinned_bytes),
                 (Category::Runtime, cuteafd_core::memory_layout::spark_runtime_reserve_group(),
                     cuteafd_core::memory_layout::spark_runtime_reserve_bytes(0).context("Spark runtime reserve")?),
-                (Category::Runtime, "expert arena driver page tables",
-                    cuteafd_core::memory_layout::spark_arena_driver_overhead_bytes(assignment.resident_bytes)),
             ] {
                 if bytes > 0 { items.push(Item::new(category, group, "", bytes, Basis::Exact)); }
             }

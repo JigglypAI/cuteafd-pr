@@ -785,6 +785,12 @@ impl Recipe for Step5Recipe<'_> {
                 for (index, item) in items.iter().enumerate() {
                     let owner = Allocation::buffer(format!("step5.spark.{count}.{rank}.{index}"), location,
                         item.bytes, Lifetime::RESIDENT, item.category, &item.group);
+                    if item.category == Category::Experts {
+                        contract.components.push(Component { activation: activation.clone(),
+                            bytes: ByteCurve::fixed(item.bytes, self.maximum_pages),
+                            kind: ComponentKind::DriverPageTables { model: DriverPageTableModel::Sm121Arena,
+                                location, lifetime: owner.lifetime, backing: owner.id.clone() } });
+                    }
                     contract.components.push(Component { activation: activation.clone(),
                         ..Component::allocation(owner, ByteCurve::fixed(item.bytes, self.maximum_pages),
                             false, self.maximum_pages) });
