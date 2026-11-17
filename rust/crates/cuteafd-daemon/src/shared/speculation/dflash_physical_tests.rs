@@ -450,7 +450,13 @@ fn installed_kimi_mla_projection_recipe_matches_native_manifest() -> Result<()> 
 
 /// Full production MLA geometry, sparse checkpoint and allocation-only DSO.
 /// Exercises the real loader, not a second test-only traversal or numerical oracle.
-pub(crate) fn with_mla_arena_fixture(mut verify: impl FnMut(&DflashDrafter<'_>,
+pub(crate) fn with_mla_arena_fixture(verify: impl FnMut(&DflashDrafter<'_>,
+    &cuteafd_loader::formats::dflash::MlaDraftRuntimeLayout,
+    &cuteafd_loader::serving_capacity::WeightArenaLayout) -> Result<()>) -> Result<()> {
+    with_mla_arena_fixture_precision(false, verify)
+}
+
+fn with_mla_arena_fixture_precision(complete: bool, mut verify: impl FnMut(&DflashDrafter<'_>,
     &cuteafd_loader::formats::dflash::MlaDraftRuntimeLayout,
     &cuteafd_loader::serving_capacity::WeightArenaLayout) -> Result<()>) -> Result<()> {
     use cuteafd_loader::{formats::dflash::MlaDflashConfig,
@@ -486,8 +492,11 @@ pub(crate) fn with_mla_arena_fixture(mut verify: impl FnMut(&DflashDrafter<'_>,
         .map(|(name, shape)| t(name, "BF16", shape)).collect::<Vec<_>>());
     for cache in [cuteafd_core::MlaCacheFormat::Bf16, cuteafd_core::MlaCacheFormat::Fp8] {
         for representation in [GlmDraftRepresentation::Bf16Only, GlmDraftRepresentation::Fp8Only] {
-            let layout = cfg.runtime_layout(representation, GlmDraftCapacity::new(2, 1, 8)?,
-                8192, 16384, library.sm_count()?, fp8_linear::Fp8Rows::W8a16.code() as u8, cache)?;
+            if complete && representation != GlmDraftRepresentation::Fp8Only { continue; }
+            let layout = if complete {
+                cfg.complete_fp8_runtime_layout(GlmDraftCapacity::new(2,1,8)?,8192,16384,library.sm_count()?,0,cache)?
+            } else { cfg.runtime_layout(representation, GlmDraftCapacity::new(2, 1, 8)?,
+                8192, 16384, library.sm_count()?, fp8_linear::Fp8Rows::W8a16.code() as u8, cache)? };
             let p = layout.program();
             let shapes = [(7168, 256), (128, 7168), (14336, 7168), (7168, 1792), (7168, 256)]
                 .into_iter().collect::<std::collections::BTreeSet<_>>();
@@ -517,6 +526,15 @@ pub(crate) fn with_mla_arena_fixture(mut verify: impl FnMut(&DflashDrafter<'_>,
                     }
                     _ => geometry["output_gate"] = false.into(),
                 }
+                let (suffix, pointers) = if complete && index != 1 {
+                    geometry["weight_dtype"] = "fp8".into();
+                    geometry["projection_scale_k"] = 128.into();
+                    geometry["batched_scale_k"] = 64.into();
+                    if index == 0 {
+                        ("producer_fp8_weights", vec!["x","kv_slots","positions","inv_freq","w_qkv_a","s_qkv_a",
+                            "q_a_norm","kv_a_norm","w_q_b","s_q_b","w_uk","s_uk","kv_cache","query","q_resid","scratch"])
+                    } else { ("output_fp8_weights", vec!["attn","w_uv","s_uv","w_o","s_o","out","scratch"]) }
+                } else { (suffix, pointers) };
                 let cache_suffix = if index == 2 { "" } else { cache.program_suffix() };
                 entries.push(serde_json::json!({"name":format!("kimik3_mla_draft_{suffix}{cache_suffix}_m64"),
                     "pointers":pointers.iter().map(|name| serde_json::json!({"name":name})).collect::<Vec<_>>(),
@@ -528,10 +546,12 @@ pub(crate) fn with_mla_arena_fixture(mut verify: impl FnMut(&DflashDrafter<'_>,
             let manifest = snapshot.join("programs.json");
             std::fs::write(&manifest, serde_json::to_vec(&serde_json::json!({"programs":entries}))?)?;
             let programs = library.programs()?.with_manifest(&manifest)?;
-            let requests = DflashDrafter::mla_arena_requests(snapshot, representation, 1)?;
+            let requests = if complete {
+                std::collections::BTreeMap::from([(1, cuteafd_loader::families::glm5::draft_physical::mla_complete_fp8_arena_requests(&cfg)?)])
+            } else { DflashDrafter::mla_arena_requests(snapshot, representation, 1)? };
             assert_eq!(layout.weight_arena_requests(), requests[&1]);
-            assert_eq!(cuteafd_loader::families::glm5::draft_physical::mla_arena_requests(
-                &cfg, representation)?, requests[&1]);
+            if !complete { assert_eq!(cuteafd_loader::families::glm5::draft_physical::mla_arena_requests(
+                &cfg, representation)?, requests[&1]); }
             let planned = WeightArenaLayout::new("kimi/draft/1", requests[&1].clone())?;
             assert_eq!(planned.payload_bytes() as u64, layout.weights().resident_bytes()?);
             assert_eq!(planned.padding_bytes(), 0);
@@ -549,7 +569,18 @@ pub(crate) fn with_mla_arena_fixture(mut verify: impl FnMut(&DflashDrafter<'_>,
                         Ok(view)
                     })))?;
             assert!(!records.operands.is_empty());
-            assert_arena_bindings(&planned, &requests[&1], &bound);
+            if complete {
+                let mut names = std::collections::BTreeSet::new();
+                assert_eq!(bound.len(), planned.views().len());
+                for (name, offset, bytes) in &bound {
+                    assert!(names.insert(name));
+                    let view = planned.view(name).context("complete MLA binder requested an unplanned owner")?;
+                    assert_eq!((*offset,*bytes),(view.offset(),view.bytes()));
+                }
+                assert!(records.steps.iter().any(|step| step.jobs.iter().any(|job|
+                    matches!(job,crate::shared::experts::rtx::dense::Job::AbsorbQuant { .. }))));
+                assert!(records.steps.iter().all(|step|step.bytes()<=crate::shared::experts::rtx::dense::STEP_BYTES));
+            } else { assert_arena_bindings(&planned, &requests[&1], &bound); }
             drop(arena);
             device.run(|| verify(&drafter, &layout, &planned))?;
             stream.drain()?;
@@ -566,6 +597,19 @@ pub(crate) fn with_mla_arena_fixture(mut verify: impl FnMut(&DflashDrafter<'_>,
         .map(|(name, shape)| t(name, "F32", shape)).collect::<Vec<_>>());
     assert!(DflashDrafter::mla_arena_requests(snapshot, GlmDraftRepresentation::Bf16Only, 1).is_err());
     Ok(())
+}
+
+#[test]
+fn complete_mla_fp8_arena_covers_actual_loader_scale_views_and_bounded_steps() -> Result<()> {
+    with_mla_arena_fixture_precision(true, |drafter, layout, planned| {
+        assert!(layout.complete_fp8_body());
+        assert_eq!(layout.weights().bf16_values,0);
+        assert_eq!(layout.weights().max_load_staging,crate::shared::experts::rtx::dense::STEP_BYTES as u64);
+        assert!(drafter.layers.iter().all(|layer|matches!(&layer.attention,
+            DraftAttention::Mla(attention) if attention.fp8_scales.is_some())));
+        assert_eq!(planned.payload_bytes() as u64,layout.weights().resident_bytes()?);
+        Ok(())
+    })
 }
 
 #[test]
