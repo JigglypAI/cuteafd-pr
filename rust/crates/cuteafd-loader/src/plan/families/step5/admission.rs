@@ -644,6 +644,24 @@ fn admit_depth_with(
                 error
             }
         })?;
+    if inputs.requested_pool.is_none_or(|tokens| tokens == 0)
+        && inputs.onboard.as_ref().is_some_and(|onboard| onboard.mode == Onboard::Auto)
+        && solved.pool_tokens < recipe.pool.target()
+    {
+        if let Some((rank, needed, available)) = inputs.spark_owners.first().into_iter()
+            .flat_map(|ranks| ranks.iter().enumerate()).find_map(|(rank, items)| {
+                let mut needed = items.iter().try_fold(0u64, |sum, item| sum.checked_add(item.bytes))?;
+                for item in items.iter().filter(|item| item.category == Category::Experts) {
+                    needed = needed.checked_add(cuteafd_core::memory_layout::spark_arena_driver_overhead_bytes(item.bytes))?;
+                }
+                let available = *inputs.spark_bytes.get(rank)?;
+                (needed > available).then_some((rank, needed, available))
+            }) {
+            return Err(anyhow::Error::from(Refusal::InvalidFact(format!(
+                "Step-5 pool-first Spark rank {rank} needs {needed} bytes without onboarding, has {available}; fitting it by onboarding would reduce KV to {} below target {} tokens",
+                solved.pool_tokens, recipe.pool.target()))));
+        }
+    }
     recipe.execution(&solved)
 }
 
