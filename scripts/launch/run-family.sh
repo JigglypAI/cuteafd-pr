@@ -1705,9 +1705,6 @@ if [[ "$family" == kimi_k3 ]]; then
   kimi_rtx="${#RELEASE_COORDINATOR_GPU_INDICES[@]}"
   [[ "$split" != off ]] || kimi_rtx=1
   kimi_draft_kv_default=fp8
-  if [[ "$model" == wrldsuksgo2mars/Kimi-K3.1-Pro-EXL3-K2-MC && "$core_view" == original && "$kimi_rtx" == 2 ]]; then
-    kimi_draft_kv_default=bf16
-  fi
   kimi_draft_kv="$(get DRAFT_KV_CACHE "$kimi_draft_kv_default")"
   kimi_defaults="$(docker run --rm --network none -e "HF_HOME=$container_hf_home" \
     "${generic_worker_mounts[@]}" "${wip_mount_args[@]}" "$coordinator_image" cuteafd plan "$snapshot" \

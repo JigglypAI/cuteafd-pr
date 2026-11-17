@@ -1098,8 +1098,8 @@ if "--resolve-settings-only" in args:
         if selected == "auto":
             def option(flag, default): return args[args.index(flag) + 1] if flag in args else default
             qualified = (option("--checkpoint-model-id", "") == "wrldsuksgo2mars/Kimi-K3.1-Pro-EXL3-K2-MC"
-                and option("--rtx", "1") == "2" and option("--core-view", "original") == "original"
-                and option("--kv-cache", "fp8") == "fp8" and option("--draft-kv-cache", "fp8") == "bf16")
+                and option("--rtx", "1") in ("1", "2") and option("--core-view", "original") in ("original", "k6-compact")
+                and option("--kv-cache", "fp8") == "fp8" and option("--draft-kv-cache", "fp8") in ("fp8", "bf16"))
             selected = "dspark" if qualified else "off"
         if selected not in ("off", "dflash2", "dspark"):
             print(f"SPECULATOR={selected} does not apply to kimi_k3", file=sys.stderr)
@@ -5872,10 +5872,10 @@ def test_kimi_shared_speculation_trace_reaches_coordinator(tmp_path):
     assert f"CUTEAFD_SPECULATION_TRACE={trace}" in serve
 
 
-@pytest.mark.parametrize("layout,enabled", [("RTX_GPUS=2\n", True), ("RTX_GPUS=1\n", False),
-    ("RTX_GPUS=2\nCORE_VIEW=k6-compact\n", False), ("RTX_GPUS=2\nSPECULATOR=off\n", False),
-    ("RTX_GPUS=2\nDRAFT_KV_CACHE=fp8\n", False), ("RTX_GPUS=2\nKV_CACHE=bf16\n", False),
-    ("RTX_GPUS=2\nCOORDINATOR_SPLIT=off\n", False)])
+@pytest.mark.parametrize("layout,enabled", [("RTX_GPUS=2\n", True), ("RTX_GPUS=1\n", True),
+    ("RTX_GPUS=2\nCORE_VIEW=k6-compact\n", True), ("RTX_GPUS=2\nSPECULATOR=off\n", False),
+    ("RTX_GPUS=2\nDRAFT_KV_CACHE=fp8\n", True), ("RTX_GPUS=2\nKV_CACHE=bf16\n", False),
+    ("RTX_GPUS=2\nCOORDINATOR_SPLIT=off\n", True)])
 def test_k31_qualified_default_tracks_physical_tp_and_kv(tmp_path, layout, enabled):
     config = {"model_type": "kimi_k31", "text_config": {"model_type": "kimi_linear", "num_hidden_layers": 93,
         "first_k_dense_replace": 1, "moe_layer_freq": 1}}
@@ -5885,4 +5885,5 @@ def test_k31_qualified_default_tracks_physical_tp_and_kv(tmp_path, layout, enabl
     launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-kimi" in line)
     assert ("--draft " in launch) == enabled, launch
     if enabled:
-        assert "--draft-kv-cache bf16" in launch
+        assert "--draft-kv-cache fp8" in launch
+        assert "--draft-fp8 true" in launch

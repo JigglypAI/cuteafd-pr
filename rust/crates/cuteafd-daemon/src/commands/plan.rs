@@ -237,7 +237,10 @@ fn resolve_settings(args: &mut PlanArgs, family: &str, cfg: &std::collections::B
                 _ => anyhow::bail!("SPECULATOR_FP8 must be auto, on or off"),
             };
         }
-        let fp8 = defaults::kimi_draft_fp8(args.draft_fp8, args.speculator == "dflash2");
+        let native_default = args.speculator == "dspark" && kimi_qualification(args, cfg).qualified();
+        let fp8 = defaults::selected(args.draft_fp8, None,
+            args.speculator == "dflash2" || native_default,
+            "FP8 for qualified K3.1 block DSpark and explicit Kimi DFlash2");
         args.draft_fp8 = Some(fp8.value);
         resolved.insert("draft_fp8".into(), setting(fp8));
     }
@@ -854,7 +857,7 @@ fn kimi_qualification<'a>(args: &'a PlanArgs, cfg: &'a std::collections::BTreeMa
     use cuteafd_loader::{plan::checkpoint::CoreView, families::qwen4::Qwen4KvCache};
     cuteafd_core::launch_settings::KimiDraftQualification {
         model: checkpoint_model_id(args, cfg),
-        core_view: if args.attention.core_view == CoreView::Original { "original" } else { "compact" },
+        core_view: match args.attention.core_view { CoreView::Original => "original", CoreView::K6Compact => "k6-compact", _ => "unqualified" },
         rtx: args.rtx,
         target_kv: if args.kv_format.unwrap_or_default() == cuteafd_core::MlaCacheFormat::Fp8 { "fp8" } else { "bf16" },
         draft_kv: if args.draft_kv_cache == Qwen4KvCache::Bf16 { "bf16" } else { "fp8" },
@@ -868,9 +871,6 @@ fn resolve_speculator(args: &mut PlanArgs, snapshot: &std::path::Path, family: &
         if !args.explicit_settings.contains("draft_kv_cache") {
             args.draft_kv_cache = match cfg.get("DRAFT_KV_CACHE") {
                 Some(value) => value.parse()?,
-                None if checkpoint_model_id(args, cfg) == cuteafd_core::launch_settings::KIMI_K31_MC
-                    && args.rtx == 2 && args.attention.core_view == cuteafd_loader::plan::checkpoint::CoreView::Original
-                    => cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16,
                 None => args.draft_kv_cache,
             };
         }
@@ -1514,7 +1514,7 @@ mod tests {
     }
 
     #[test]
-    fn kimi_tp2_original_defaults_to_qualified_bf16_drafter_without_revision_or_spark_gate() {
+    fn kimi_mc_defaults_to_fp8_drafter_on_qualified_views_and_tp_sizes() {
         use clap::Parser;
         for sparks in [1, 4, 6, 8] {
             let crate::cli::Commands::Plan(mut request) = crate::cli::Cli::try_parse_from([
@@ -1522,10 +1522,18 @@ mod tests {
                 "--spark-ranks", &sparks.to_string()]).unwrap().command else { panic!("plan") };
             resolve_speculator(&mut request, std::path::Path::new("/unused"), "kimi_k3", &Default::default()).unwrap();
             assert_eq!(request.speculator, "dspark");
-            assert_eq!(request.draft_kv_cache, cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16);
+            assert_eq!(request.draft_kv_cache, cuteafd_loader::families::qwen4::Qwen4KvCache::Fp8);
         }
-        for flags in [vec!["--rtx", "1"], vec!["--rtx", "2", "--core-view", "k6-compact"],
-            vec!["--rtx", "2", "--draft-kv-cache", "fp8"], vec!["--rtx", "2", "--kv-cache", "bf16"],
+        for tp in ["1", "2"] { for view in ["original", "k6-compact"] {
+            let crate::cli::Commands::Plan(mut request) = crate::cli::Cli::try_parse_from([
+                "cuteafd", "plan", cuteafd_core::launch_settings::KIMI_K31_MC, "--rtx", tp, "--core-view", view
+            ]).unwrap().command else { panic!("plan") };
+            resolve_speculator(&mut request, std::path::Path::new("/unused"), "kimi_k3", &Default::default()).unwrap();
+            resolve_settings(&mut request, "kimi_k3", &Default::default()).unwrap();
+            assert_eq!(request.speculator, "dspark");
+            assert_eq!(request.draft_fp8, Some(true));
+        } }
+        for flags in [vec!["--rtx", "2", "--core-view", "k8-compact"], vec!["--rtx", "2", "--kv-cache", "bf16"],
             vec!["--rtx", "2", "--speculator", "off"]] {
             let draft_explicit = flags.contains(&"--draft-kv-cache");
             let crate::cli::Commands::Plan(mut request) = crate::cli::Cli::try_parse_from(

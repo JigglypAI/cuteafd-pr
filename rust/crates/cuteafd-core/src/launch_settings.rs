@@ -68,8 +68,9 @@ pub struct KimiDraftQualification<'a> {
 
 impl KimiDraftQualification<'_> {
     pub fn qualified(self) -> bool {
-        self.model == KIMI_K31_MC && self.core_view == "original" && self.rtx == 2
-            && self.target_kv == "fp8" && self.draft_kv == "bf16"
+        self.model == KIMI_K31_MC && matches!(self.core_view, "original" | "k6-compact")
+            && matches!(self.rtx, 1 | 2) && self.target_kv == "fp8"
+            && matches!(self.draft_kv, "bf16" | "fp8")
     }
 }
 
@@ -78,7 +79,7 @@ pub fn kimi_speculator(explicit:Option<&str>,configured:Option<&str>, qualificat
     let resolved=selected(explicit.filter(|v|!v.is_empty() && *v!="auto").map(str::to_owned),
         configured.filter(|_|explicit.is_none()).filter(|v|!v.is_empty() && *v!="auto").map(str::to_owned),
         if qualification.qualified() { "dspark" } else { "off" }.into(),
-        "DSpark for qualified K3.1 MC original TP2 with target FP8 and draft BF16 KV; off otherwise");
+        "DSpark for qualified K3.1 MC original/K6 on one or two coordinators; off otherwise");
     if !matches!(resolved.value.as_str(),"off"|"dflash2"|"dspark") {
         return Err(KimiSpeculatorError(resolved.value));
     }
@@ -110,11 +111,14 @@ mod tests {
         assert_eq!(kimi_speculator(Some("auto"), Some("off"), qualified).unwrap().value, "dspark");
         assert_eq!(kimi_speculator(Some("off"), None, qualified).unwrap().value, "off");
         assert_eq!(kimi_speculator(None, Some("off"), qualified).unwrap().value, "off");
+        for view in ["original", "k6-compact"] { for rtx in [1, 2] { for kv in ["bf16", "fp8"] {
+            assert_eq!(kimi_speculator(None, None, KimiDraftQualification {
+                core_view: view, rtx, draft_kv: kv, ..qualified }).unwrap().value, "dspark");
+        } } }
         for other in [KimiDraftQualification { model: "other/model", ..qualified },
-            KimiDraftQualification { core_view: "k6-compact", ..qualified },
-            KimiDraftQualification { rtx: 1, ..qualified },
-            KimiDraftQualification { target_kv: "bf16", ..qualified },
-            KimiDraftQualification { draft_kv: "fp8", ..qualified }] {
+            KimiDraftQualification { core_view: "k8-compact", ..qualified },
+            KimiDraftQualification { rtx: 3, ..qualified },
+            KimiDraftQualification { target_kv: "bf16", ..qualified }] {
             assert_eq!(kimi_speculator(None, None, other).unwrap().value, "off");
             assert_eq!(kimi_speculator(Some("dspark"), None, other).unwrap().value, "dspark");
         }
