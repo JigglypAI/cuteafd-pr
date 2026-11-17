@@ -132,6 +132,10 @@ pub struct MlaDraftProgramLayout {
 pub enum MlaDraftKind { Dflash2, CausalDflash2, Ml4Dspark }
 
 impl MlaDraftKind {
+    /// RadixArk's trained block is 5; causal path sampling extends verification
+    /// to the current token plus seven drafts without changing checkpoint math.
+    pub const CAUSAL_VERIFY_ROWS: usize = 8;
+
     pub fn hidden(self) -> usize { match self { Self::Dflash2 | Self::CausalDflash2 => 7168, Self::Ml4Dspark => 6144 } }
     pub fn heads(self) -> usize { if self == Self::CausalDflash2 { 96 } else { 64 } }
     pub fn is_dflash(self) -> bool { self != Self::Ml4Dspark }
