@@ -187,7 +187,7 @@ pub(crate) fn load<'a>(library: &'a Arc<cuteafd_ffi::NativeLibrary>, programs: &
     };
     let gathered_checkpoint = if options.media.vision != cuteafd_loader::plan::MediaMode::Off {
         Some(Checkpoint::open_view_for_role(view, "MiniMax target and still tower", |name|
-            checkpoint.contains_tensor(name) || cuteafd_loader::families::minimax_m3::vision::VisionContract::is_tensor(name))?)
+            checkpoint.has_header(name) || cuteafd_loader::families::minimax_m3::vision::VisionContract::is_tensor(name))?)
     }else{None};
     let replies = cuteafd_core::spark_reply::requested();
     fp8::validate_reply_formats(catalog.fp8().context("MiniMax expert catalog")?.format(), replies)?;
