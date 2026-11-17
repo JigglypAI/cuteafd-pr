@@ -249,9 +249,10 @@ these request values do not imply that a Planned checkpoint has a serving execut
 ### PE Vision Qualification
 
 Inkling and Step-5 use the shared bundled PE tower runtime and image admission.
-`VISION=off` remains the qualified text-only configuration while normal image
-answers are being qualified (#1930, #1994). Explicit `VISION=spark[:rank]` or
-`VISION=rtx[:gpu]` selects the jointly admitted packed tower owner in WIP builds;
+Step-5 defaults to `VISION=auto`: joint admission selects a Spark-first packed
+owner with RTX fallback. `VISION=off` explicitly selects text-only operation.
+Inkling remains text-only by default while normal image answers are qualified (#1930).
+Explicit `VISION=spark[:rank]` or `VISION=rtx[:gpu]` selects the jointly admitted packed owner;
 `VISION_REPLICAS=1..8` and `MEDIA_CACHE_BYTES` use the shared media options.
 Each tower has one weight arena and one scratch backing per replica; tensor
 views do not add another charge. Step-5 images retain ordered local crops and

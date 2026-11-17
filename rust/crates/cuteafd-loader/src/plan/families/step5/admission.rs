@@ -300,10 +300,9 @@ pub fn tp2_exchange_requests(unit_rows: usize, lanes: usize, exchange: Tp2Exchan
 /// Why NVFP4 Step plans onboard nothing (and refuse an explicit layer count).
 pub const NVFP4_ONBOARDING_DEPRECATED: &str = "Step-5 NVFP4 is deprecated (its cards retire this release): \
     RTX expert onboarding is not built for it; its routed experts stay on the Sparks";
-/// FP8 Step is qualified only on two RTX (2 RTX + 6 Sparks); there its
-/// onboarded layers split TP2. No whole-layer fp8moe executor exists.
-pub const FP8_ONBOARDING_TWO_RTX: &str = "Step-5 FP8 onboards TP2 on two RTX only (its qualified card): \
-    its routed experts stay on the Sparks";
+/// Native whole-layer onboarding is not implemented; TP2 uses fp8moe halves.
+pub const FP8_ONBOARDING_TWO_RTX: &str = "Step-5 native whole-layer RTX expert onboarding on one GPU is unimplemented (#2429); \
+    routed experts stay on the Sparks; use two GPUs for native TP2 onboarding";
 
 /// The named reason a routed format does not onboard here, or None.
 pub fn onboarding_unavailable(catalog: &crate::OfficialV41Catalog, gpus: usize) -> Option<&'static str> {

@@ -196,9 +196,14 @@ preserve target KV/CSA, predictor histories and cursors exactly.
 
 Start with `examples/configs/step5-fp8-max.config` or
 `examples/configs/step5-nvfp4-min.config`. Replace the sample fabric endpoints
-and select a sealed WIP slot containing `serve-step5`. Keep media disabled;
-Step-5's bundled vision execution is not yet qualified. Pool sizing remains
-automatic, and admission refuses configurations below the 256K context floor.
+and select a sealed WIP slot containing `serve-step5`. Bundled PE vision defaults
+to automatic joint admission (Spark-first with RTX fallback); `VISION=off`
+explicitly selects text-only operation. Pool sizing remains automatic, and
+admission refuses configurations below the 256K context floor. One or two
+coordinator GPUs are planned from actual owner bytes. Native whole-layer RTX
+expert onboarding on one GPU remains unimplemented (#2429); native experts stay
+on the Sparks there, while EXL3 supports whole-layer onboarding and two GPUs
+support native TP2 onboarding.
 
 ## Changelog
 

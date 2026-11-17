@@ -11,7 +11,7 @@ use anyhow::{ensure, Context, Result};
 use cuteafd_core::memory_layout::{Basis, Category, DeviceKind, DeviceLayout, Item, MemoryLayout};
 
 #[derive(Debug, thiserror::Error)]
-#[error("Step-5 layout is unqualified: {0}; use one or two RTX PRO 6000 for EXL3, two for FP8 or one for NVFP4, with a covered Spark width and enough memory")]
+#[error("Step-5 layout is unqualified: {0}; use one or two coordinator GPUs with a covered Spark width and enough memory")]
 struct Unqualified(&'static str);
 
 pub(super) fn layout(
@@ -27,11 +27,7 @@ pub(super) fn layout(
     );
     let nvfp4 = model.formats.iter().any(|f| f == "nvfp4-g16-w4a4");
     let exl3 = model.is_exl3();
-    // Coordinator GPUs are a placement qualification: EXL3 runs on one or two
-    // RTX; the official releases keep their qualified GPU counts. Spark worlds
-    // come from the shared width-class package ranges for every format, and a
-    // frozen format admits only the worlds it shipped on.
-    let coordinators = if exl3 { opts.rtx_bytes.len() } else if nvfp4 { 1 } else { 2 };
+    let coordinators = opts.rtx_bytes.len();
     let spark_ranks = requested.spark_ranks();
     let format = if exl3 { "exl3" } else if nvfp4 { "nvfp4" } else { "fp8" };
     let package = if exl3 { format!("step5:{}", model.exl3_package().context("Step-5 EXL3 expert tiers")?) }
@@ -51,7 +47,7 @@ pub(super) fn layout(
         Unqualified("BF16 target format")
     );
     ensure!(
-        matches!(coordinators, 1 | 2) && opts.rtx_bytes.len() == coordinators
+        matches!(coordinators, 1 | 2)
             && (spark_ranks == 0 || worlds.contains(&spark_ranks))
             && opts.rtx_bytes.iter().all(|&bytes| bytes > 32 << 30),
         Unqualified("coordinator/Spark count or 5090")

@@ -408,7 +408,7 @@ impl Model {
                 "CSA compresses index keys only: one E4M3 proxy256 summary per eight tokens, original GQA K/V retained; provider-group top-512 regions".into(),
                 "FP32 residual and zero-centered norms; post-SiLU clamp + FP32 product, one BF16 round, for routed/shared/dense FFNs".into(),
                 "ssmax_s [64] FP32 is retained and validated, unused by released kernels; ordinary attention scale 1/sqrt(192)".into(),
-                "Eager native admission on qualified WIP cards; native MTP defaults to depth 3, with exact predictor header contracts; no release or media qualification".into(),
+                "Native MTP defaults to depth 3, with exact predictor header contracts; bundled PE vision is jointly admitted".into(),
             ] };
         let mut spec = spec;
         if complete {
@@ -498,13 +498,6 @@ impl Family for Step5 {
             else { return None; };
         Some(TensorRole::layer(component, layer))
     }
-    fn component_hint(&self, component: Component) -> Option<Hint> {
-        match component {
-            Component::Vision => Some(Hint { what: "Step-5 bundled vision is not qualified".into(),
-                how: "Use text-only serving; qualify the official bundled encoder before enabling media.".into() }),
-            _ => None,
-        }
-    }
     fn optional(&self, component: Component) -> bool {
         matches!(component, Component::Vision | Component::Speculator)
     }
@@ -516,9 +509,6 @@ impl FamilyModel for Model {
     fn spec(&self) -> &ModelSpec { &self.spec }
     fn native_serving_admission(&self) -> bool { true }
     fn contract_admission(&self) -> bool { true }
-    fn vision_mode(&self, mode: crate::plan::MediaMode) -> crate::plan::MediaMode {
-        if mode == crate::plan::MediaMode::Auto { crate::plan::MediaMode::Off } else { mode }
-    }
     fn cache_geometry(&self, options: crate::serving_capacity::CacheOptions)
         -> Result<Option<crate::serving_capacity::FamilyCacheGeometry>, crate::serving_capacity::CacheGeometryError> {
         let unit = options.prefill_rows.max(64);
