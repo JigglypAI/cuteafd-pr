@@ -275,11 +275,14 @@ impl<'a> MlaDraftStorage<'a> {
         ensure!(expected("head_workspace")? == VOCABULARY_HEAD_WORKSPACE,
             "MLA draft vocabulary workspace disagrees with admission");
         let selector_bytes = layout.selector_workspace_bytes()?;
-        if layout.kind() == cuteafd_core::coordinator_programs::MlaDraftKind::Dflash2 {
+        if layout.kind().is_dflash() {
             ensure!(selector_bytes == expected("topk_workspace")?,
                 "MLA draft top-k workspace disagrees with admission");
             let drafted = layout.capacity().block_rows - layout.capacity().max_batch_sequences;
-            ensure!(library.glm_dflash_topk_workspace(drafted)?.max(256) == selector_bytes,
+            let native_bytes = if layout.kind() == cuteafd_core::coordinator_programs::MlaDraftKind::CausalDflash2 {
+                library.dflash_topk_workspace_width(drafted, layout.kind().selector_top_k())?
+            } else { library.glm_dflash_topk_workspace(drafted)? };
+            ensure!(native_bytes.max(256) == selector_bytes,
                 "MLA draft native top-k workspace disagrees with admission");
         }
         if let Some(scratch) = layout.fp8_scratch() {
@@ -1314,8 +1317,10 @@ impl<'a> DflashDrafter<'a> {
         let load = super::weights::Load::with_prefetched(library, snapshot, file)?.with_allocator(&mut allocate);
         load.validate(native.tensor_shapes())?;
         let programs = native.windows.iter().map(|window| -> Result<_> {
-            let program = MlaDraft::load(programs, program_namespace, if window.is_some() { MlaDraftWindow::Sliding4096 }
-                else { MlaDraftWindow::Full }, layout.cache_format())?;
+            let window = match window { Some(1024) => MlaDraftWindow::CausalSliding1024,
+                Some(4096) => MlaDraftWindow::Sliding4096, None => MlaDraftWindow::Full,
+                _ => anyhow::bail!("unsupported checkpoint MLA draft window") };
+            let program = MlaDraft::load(programs, program_namespace, window, layout.cache_format())?;
             ensure!(program.max_context() >= layout.program().context
                 && program.splits() == layout.program().splits
                 && program.scratch_bytes() == layout.program().scratch,
@@ -2788,15 +2793,16 @@ impl<'a> DflashDrafter<'a> {
             match &self.head_ops {
                 DraftHeadOps::Peer => anyhow::bail!("peer drafter cannot launch selection"),
                 DraftHeadOps::Selector { projection, predecessor, successor } => {
-                    l.glm_dflash_topk(w.head()?.logits.buffer.ptr, w.head()?.unary.as_ref().context("selector workspace missing")?.buffer.ptr, w.head()?.candidates.as_ref().context("selector workspace missing")?.buffer.ptr,
-                        w.head()?.topk_workspace.as_ref().context("selector workspace missing")?.buffer.ptr, s_count, block, c.drafts(), c.vocab, s)?;
+                    let top_k = match &self.context { DraftContext::Mla(context) => context.cfg.selector_top_k, _ => 16 };
+                    l.dflash_topk_width(w.head()?.logits.buffer.ptr, w.head()?.unary.as_ref().context("selector workspace missing")?.buffer.ptr, w.head()?.candidates.as_ref().context("selector workspace missing")?.buffer.ptr,
+                        w.head()?.topk_workspace.as_ref().context("selector workspace missing")?.buffer.ptr, s_count, block, c.drafts(), c.vocab, top_k, s)?;
                     self.timing.end(head_span, s)?;
                     let select_span = self.timing.begin("selector_confidence", None, rows, s)?;
                     self.linear(w.n.buffer.ptr, projection, 0,
                         w.head()?.projected.as_ref().context("selector workspace missing")?.buffer.ptr, rows, h, c.rank)?;
-                    l.glm_dflash_select(predecessor.buffer.ptr, successor.buffer.ptr, w.head()?.projected.as_ref().context("selector workspace missing")?.buffer.ptr,
+                    l.dflash_select_width(predecessor.buffer.ptr, successor.buffer.ptr, w.head()?.projected.as_ref().context("selector workspace missing")?.buffer.ptr,
                         w.head()?.candidates.as_ref().context("selector workspace missing")?.buffer.ptr, w.head()?.unary.as_ref().context("selector workspace missing")?.buffer.ptr, w.head()?.anchors.buffer.ptr, w.head()?.tokens.buffer.ptr,
-                        w.head()?.features.as_ref().context("selector workspace missing")?.buffer.ptr, s_count, block, c.drafts(), c.rank, s)?;
+                        w.head()?.features.as_ref().context("selector workspace missing")?.buffer.ptr, s_count, block, c.drafts(), c.rank, top_k, s)?;
                     self.timing.end(select_span, s)?;
                 }
                 DraftHeadOps::RnnMarkov { softcap, embedding, joint_w, joint_b, output, norms, rank } => {
