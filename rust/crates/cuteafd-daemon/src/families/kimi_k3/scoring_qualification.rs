@@ -177,7 +177,7 @@ fn k31_raw_and_streamed_scoring_match_ordinary_c16() -> Result<()> {
             let mut records = Vec::new();
             for arm in ["raw", "streamed"] {
                 engine.reset_cold_state()?;
-                let mut placement = Placement { units: pages.clone(), slot: 0, len: 0, state_len: 0 };
+                let mut placement = Placement { media_spans: Vec::new(), units: pages.clone(), slot: 0, len: 0, state_len: 0 };
                 family.bind(&mut placement).map_err(|e| anyhow::anyhow!(e.to_string()))?;
                 let probe = Probe::new(ProbeSpec { cold: true, no_speculation: true,
                     prompt_ids: Some(window.tokens.clone()), score_from: Some(window.score_from),

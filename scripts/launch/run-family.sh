@@ -1787,7 +1787,7 @@ if [[ -n "$chat_template_from" && "$vision" != off ]]; then
 fi
 # Still towers use the shared media options and the admitted encoder owner.
 family_args+=(--vision "$vision" --audio "$audio")
-if [[ "$family" == inkling2 || "$family" == step5 ]]; then
+if [[ "$family" == inkling2 || "$family" == step5 || "$family" == kimi_k3 ]]; then
   family_args+=(--vision-replicas "$vision_replicas")
 fi
 
@@ -1875,7 +1875,7 @@ case $family in
     family_args+=(--prefix-cache-entries "$effective_prefix_entries")
     [[ "$(get HOST_CACHE_BYTES auto)" == 0 ]] || family_args+=(--host-cache-bytes "$(get HOST_CACHE_BYTES auto)") ;;
 esac
-if [[ ( $family == mimo_v2 || $family == qwen4 || $family == glm5_flash || $family == inkling2 || $family == step5 ) && $vision != off ]]; then
+if [[ ( $family == mimo_v2 || $family == qwen4 || $family == glm5_flash || $family == inkling2 || $family == step5 || $family == kimi_k3 ) && $vision != off ]]; then
   # Text-only frozen daemons can predate the optional media-cache flag.
   [[ -z "$(get MEDIA_CACHE_BYTES)" ]] || family_args+=(--media-cache-bytes "$(get MEDIA_CACHE_BYTES)")
 fi

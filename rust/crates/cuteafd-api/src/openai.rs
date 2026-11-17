@@ -2759,6 +2759,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn encoder_failure_503_retains_precise_source_geometry_reason() {
+        let (tx,mut rx)=mpsc::channel::<NativeRequest>(1);
+        let reason="vision encoder unavailable: tower does not support source/content geometry";
+        let worker=tokio::spawn(async move {
+            let job=rx.recv().await.unwrap();
+            job.events.send(Err(NativeFailure::Unavailable(reason.into()))).unwrap();
+        });
+        let body=json!({"model":MODEL,"messages":[{"role":"user","content":"check"}],"max_tokens":1});
+        let response=router(tx).oneshot(axum::http::Request::post("/v1/chat/completions")
+            .header("content-type","application/json").body(Body::from(body.to_string())).unwrap()).await.unwrap();
+        assert_eq!(response.status(),StatusCode::SERVICE_UNAVAILABLE);
+        let bytes=axum::body::to_bytes(response.into_body(),4096).await.unwrap();
+        assert_eq!(serde_json::from_slice::<Value>(&bytes).unwrap()["error"]["message"],reason);
+        worker.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn expanded_audio_probe_binds_ordinary_sources_without_chat_rendering() {
         use base64::Engine;
         use cuteafd_loader::media::EncoderId;
@@ -2982,6 +2999,52 @@ mod tests {
             panic!("replayed media rejected: {status}: {}", String::from_utf8_lossy(&bytes));
         }
         worker.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn native_still_image_chat_uses_grouped_preparation_and_off_rejects() {
+        use base64::Engine;
+        use cuteafd_loader::media::{EncoderId, ImageFamily, ProcessorConfig};
+        let preparer=Arc::new(media::MediaPreparer::new(ProcessorConfig::for_family(ImageFamily::MiniMax),
+            EncoderId([1;32]),media::ImageUrlFetch::Off,1).unwrap());
+        let root=tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("tokenizer_config.json"),json!({"added_tokens_decoder":{
+            "163587":{"content":kimi::OPEN},"163588":{"content":kimi::CLOSE},
+            "163589":{"content":kimi::SEP},"163586":{"content":kimi::END}}}).to_string()).unwrap();
+        std::fs::write(root.path().join("generation_config.json"),"{\"eos_token_id\":163586}").unwrap();
+        let encodings=[ModelEncoding::Kimi(Arc::new(kimi::KimiEncoding::from_snapshot(root.path()).unwrap())),
+            ModelEncoding::MiniMax(Arc::new(minimax::fixtures::encoding()))];
+        let url=format!("data:image/png;base64,{}",base64::engine::general_purpose::STANDARD.encode(include_bytes!("openai/fixtures/black.png")));
+        for encoding in encodings {
+            for enabled in [false,true] {
+                for image in [false,true] {
+                    let (tx,mut rx)=mpsc::channel::<NativeRequest>(1);
+                    let mut profile=ModelProfile::new(MODEL,encoding.clone());
+                    if enabled {profile=profile.with_grouped_vision(preparer.clone());}
+                    let app=router_for_model(tx,NativeLimits::default(),Arc::new(Mutex::new(Value::Null)),
+                        std::time::Duration::from_secs(1),ConsoleHub::disabled(),profile);
+                    let worker_encoding=encoding.clone();
+                    let worker=if enabled||!image {Some(tokio::spawn(async move {
+                        let job=rx.recv().await.unwrap();
+                        if image {
+                            assert_eq!(job.image_groups.len(),1);assert_eq!(job.media.len(),1);
+                            assert_eq!(job.image_groups[0].images[0].key,job.media[0].key);
+                            assert!(job.prompt.contains(if matches!(worker_encoding,ModelEncoding::Kimi(_)){"<|media_pad|>"}else{"]<]image[>["}));
+                        }else{assert!(job.media.is_empty()&&job.image_groups.is_empty());}
+                        job.events.send(Ok(InferenceChunk::Ready {system_fingerprint:None,prompt_usage:PromptUsage {
+                            prompt_tokens:1,prompt_cache_hit_tokens:0}})).unwrap();
+                        job.events.send(Ok(InferenceChunk::Finish {finish_reason:InferenceFinishReason::Length})).unwrap();
+                    }))}else{None};
+                    let content=if image {json!([{"type":"image_url","image_url":{"url":url}},
+                        {"type":"text","text":"What is in the image?"}])}else{json!("What is in the image?")};
+                    let body=json!({"model":MODEL,"messages":[{"role":"user","content":content}],"max_tokens":1});
+                    let response=app.oneshot(axum::http::Request::post("/v1/chat/completions")
+                        .header("content-type","application/json").body(Body::from(body.to_string())).unwrap()).await.unwrap();
+                    assert_eq!(response.status(),if enabled||!image {StatusCode::OK}else{StatusCode::BAD_REQUEST});
+                    if let Some(worker)=worker {worker.await.unwrap();}
+                }
+            }
+        }
     }
 
     #[tokio::test]

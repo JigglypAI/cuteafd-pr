@@ -370,9 +370,13 @@ fn release_headers_classify_native_text_without_installed_artifacts() {
     assert!(report.hints.iter().any(|hint| hint.what.contains("Kimi header inventory refused: missing projection")),
         "{:?}", report.hints);
     assert_eq!(model.vision_mode(MediaMode::Auto), MediaMode::Auto);
+    let vision=report.components.iter().find(|c|c.component==Component::Vision).unwrap();
+    assert_eq!(vision.status,Status::Ready,"Auto vision is structural, never qualification-Planned");
+    assert_eq!(vision.rejected,0);
+    assert!(!report.hints.iter().any(|h|h.what.contains("vision")&&h.what.contains("qualification")));
     let vision_report = testing::plan(dir.path(), &PlanOptions { vision: MediaMode::Rtx(None), ..Default::default() }).unwrap();
     assert!(!vision_report.wip_launchable());
-    assert!(vision_report.hints.iter().any(|h| h.what.contains("production qualification remains pending")));
+    assert!(!vision_report.hints.iter().any(|h| h.what.contains("production qualification remains pending")));
 }
 
 #[test]

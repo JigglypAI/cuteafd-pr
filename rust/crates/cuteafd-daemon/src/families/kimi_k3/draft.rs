@@ -751,7 +751,7 @@ mod tests {
         let programs = library.programs()?.with_manifest(&manifest)?;
         let cache_format = cuteafd_core::MlaCacheFormat::Fp8;
         let spark_cap = cuteafd_core::memory_policy::MemoryPolicy { spark_cap: Some(110 << 30), ..Default::default() };
-        let loaded = spark_cap.scoped(|| startup::load(&library, &programs, &checkpoint, &cfg, &cfg, startup::Options { role: startup::Role::Golden { skip_routed_experts: false }, expert_usage: false, expert_usage_reader: Default::default(),
+        let loaded = spark_cap.scoped(|| startup::load(&library, &programs, &checkpoint, &cfg, &cfg, startup::Options { media: None, role: startup::Role::Golden { skip_routed_experts: false }, expert_usage: false, expert_usage_reader: Default::default(),
             cache_format, attention: None, devices: [0], native_lib: &native, manifest: &manifest, peers,
             rtx_expert_layers: cuteafd_loader::placement::OnboardSetting::Layers(local_layers),
             rows: 2048, waves: 2, prefill_rows: Some(1024),
@@ -775,7 +775,7 @@ mod tests {
             let mut states = Vec::new();
             for (slot, prompt) in prompts.iter().enumerate() {
                 let capacity = (prompt.len() + 16).div_ceil(layout.page_rows) * layout.page_rows;
-                let mut placement = Placement { units: pool.alloc(capacity / layout.page_rows)?, slot, len: 0, state_len: 0 };
+                let mut placement = Placement { media_spans: Vec::new(), units: pool.alloc(capacity / layout.page_rows)?, slot, len: 0, state_len: 0 };
                 family.bind(&mut placement).map_err(prefix_error)?;
                 family.admit_draft_pages(&mut placement, capacity).map_err(prefix_error)?;
                 backend.bind_request(&mut placement, (), RequestMedia::new(Vec::new(), cfg.hidden, prompt.len())?, prompt, 0)?;
@@ -840,7 +840,7 @@ mod tests {
         // SAFETY: golden-run supplies the sealed library; all borrowers drop before it.
         let library = Arc::new(unsafe { cuteafd_ffi::NativeLibrary::load(&native)? });
         let programs = library.programs()?.with_manifest(&manifest)?;
-        let loaded = startup::load(&library, &programs, &checkpoint, &cfg, &cfg, startup::Options { role: startup::Role::Golden { skip_routed_experts: false }, expert_usage: false, expert_usage_reader: Default::default(),
+        let loaded = startup::load(&library, &programs, &checkpoint, &cfg, &cfg, startup::Options { media: None, role: startup::Role::Golden { skip_routed_experts: false }, expert_usage: false, expert_usage_reader: Default::default(),
             cache_format,
             attention: None, devices: [0, 1], native_lib: &native, manifest: &manifest, peers,
             rtx_expert_layers: cuteafd_loader::placement::OnboardSetting::Layers(local_layers),
@@ -862,7 +862,7 @@ mod tests {
         let suffix = [2201, 2202, 2203];
         let extent = (tokens.len() + suffix.len() + 16).div_ceil(layout.page_rows);
         let allocate = |pool: &mut RefPagePool| -> Result<Placement> {
-            Ok(Placement { units: pool.alloc(extent)?, slot: 0, len: 0, state_len: 0 })
+            Ok(Placement { media_spans: Vec::new(), units: pool.alloc(extent)?, slot: 0, len: 0, state_len: 0 })
         };
         let bind = |placement: &mut Placement, resume| -> Result<()> {
             backend.bind_request(placement, (), RequestMedia::new(Vec::new(), cfg.hidden, tokens.len())?,
