@@ -488,7 +488,7 @@ def main() -> None:
                 values = values.float()
                 scale = values.abs().amax(-1,keepdim=True)/448.0
                 scale = torch.where(scale>0,scale,1.0)
-                return ((values/scale).to(torch.float8_e4m3fn).float()*scale).bfloat16()
+                return ((values*(1.0/scale)).to(torch.float8_e4m3fn).float()*scale).bfloat16()
             ctx = [(qdq(k),qdq(v)) for k,v in ctx]
 
         def draft(p: int) -> tuple[list[int], list[float], torch.Tensor]:

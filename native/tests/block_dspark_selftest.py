@@ -137,7 +137,7 @@ def rotary_check(lib, baseline=None):
 
 def attention_check(lib):
     stream = torch.cuda.current_stream().cuda_stream
-    for dim, heads, kvh, block in ((64, 64, 64, 8), (128, 40, 8, 7)):
+    for dim, heads, kvh, block in ((64, 64, 64, 8), (128, 40, 8, 7), (64,64,16,5)):
         for sequences in (1, 8):
             for context in (0, 33, 1024):
                 for causal in (False, True):
