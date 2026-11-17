@@ -1495,6 +1495,12 @@ fn installed_pe_min_max_plans_charge_one_native_tower_arena() {
                     .arg(&programs).env("HF_HOME", &hf_home).output().unwrap();
                 assert!(output.status.success(), "{model}/{gpus}RTX/{vision}: {}", String::from_utf8_lossy(&output.stderr));
                 let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+                if model.starts_with("Inkling") && gpus == "2" {
+                    assert_eq!(report["placement_supported"], false);
+                    assert!(report["hints"].to_string().contains(
+                        "Inkling multi-GPU serving executor not implemented (#2316)"));
+                    continue;
+                }
                 assert_eq!(report["placement_supported"], true, "{model}/{gpus}RTX/{vision}: {}", report["hints"]);
                 let items = report["memory_layout"]["devices"].as_array().unwrap().iter()
                     .flat_map(|device| device["items"].as_array().unwrap()).collect::<Vec<_>>();
