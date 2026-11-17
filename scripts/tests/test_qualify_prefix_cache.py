@@ -166,8 +166,8 @@ def test_every_pooled_draft_family_overrides_live_binding_quarantine():
     owners = set()
     daemon = root / "rust/crates/cuteafd-daemon/src"
     for source in daemon.rglob("*.rs"):
-        text = re.split(r"(?m)^#\[cfg\(test\)\]\nmod ", source.read_text(), maxsplit=1)[0]
-        if "DraftPagePool" in text:
+        text = source.read_text()
+        if re.search(r"(?m)^\s+pool: (?:cuteafd_engine::prefix::)?DraftPagePool,", text):
             owners.add(source.relative_to(daemon).as_posix())
     assert owners == {"shared/speculation/dflash.rs", "shared/speculation/block_dspark.rs",
                       "families/qwen3_5/mtp.rs"}
