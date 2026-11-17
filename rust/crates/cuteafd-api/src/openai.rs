@@ -2688,6 +2688,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn encoder_failure_503_retains_precise_source_geometry_reason() {
+        let (tx,mut rx)=mpsc::channel::<NativeRequest>(1);
+        let reason="vision encoder unavailable: tower does not support source/content geometry";
+        let worker=tokio::spawn(async move {
+            let job=rx.recv().await.unwrap();
+            job.events.send(Err(NativeFailure::Unavailable(reason.into()))).unwrap();
+        });
+        let body=json!({"model":MODEL,"messages":[{"role":"user","content":"check"}],"max_tokens":1});
+        let response=router(tx).oneshot(axum::http::Request::post("/v1/chat/completions")
+            .header("content-type","application/json").body(Body::from(body.to_string())).unwrap()).await.unwrap();
+        assert_eq!(response.status(),StatusCode::SERVICE_UNAVAILABLE);
+        let bytes=axum::body::to_bytes(response.into_body(),4096).await.unwrap();
+        assert_eq!(serde_json::from_slice::<Value>(&bytes).unwrap()["error"]["message"],reason);
+        worker.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn expanded_audio_probe_binds_ordinary_sources_without_chat_rendering() {
         use base64::Engine;
         use cuteafd_loader::media::EncoderId;
