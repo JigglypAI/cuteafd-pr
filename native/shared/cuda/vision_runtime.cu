@@ -212,9 +212,11 @@ bool valid_tower(const cuteafd_vision_spec& s) {
 #else
   if(s.perception)return false;
 #endif
-  // The independent arithmetic contract has no qualified kernels in this step.
-  // Reject before allocations and never reinterpret it as an existing tower.
+#ifdef CUTEAFD_HAVE_VISION_ATTENTION_AOT
+  if(s.tower)return valid_generic_tower(s);
+#else
   if(s.tower)return false;
+#endif
   if(s.abi_version==1)return valid_spec(s);
 #ifdef CUTEAFD_HAVE_VISION_ATTENTION_AOT
   if(s.reserved==2)return valid_qwen(s);

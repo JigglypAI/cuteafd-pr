@@ -125,13 +125,7 @@ pub struct Drafter {
 }
 
 /// Bundled PE-Lang ViT and merge projector: own arena plus scratch.
-#[derive(Debug, Clone)]
-pub struct Vision {
-    pub arena: WeightArenaLayout,
-    pub scratch: u64,
-    /// Host embedding cache quota for prepared images.
-    pub media_cache: u64,
-}
+pub type Vision = crate::placement::still_encoder::StillEncoder;
 
 /// Everything both edges know before one solve.
 #[derive(Debug, Clone)]
@@ -669,19 +663,9 @@ impl Recipe for InklingInputs {
                     ByteCurve::linear(draft.state_per_page, draft.state_per_page, maximum), false, maximum));
             }
         }
-        // Optional bundled vision tower: own arena; `Encoder` domain [on, off].
         if let Some(vision) = &self.vision {
-            let variable = contract_variables.len();
-            contract_variables.push(Variable::Encoder(vec![0, 1]));
-            let on = Activation::choice(variable, 0);
-            let location = Location::coordinator(0);
-            components.extend(with(weight_arena_components(&vision.arena, location, Lifetime::RESIDENT, maximum,
-                MemoryKind::Weights)?, &on));
-            components.extend(buffer("inkling2.vision.scratch", location, vision.scratch, Lifetime::TARGET,
-                Category::Workspace, "vision tower scratch", maximum).map(|mut c| { c.activation = on.clone(); c }));
-            components.extend(buffer("inkling2.host.media", Location::HOST, vision.media_cache,
-                Lifetime { first: Phase::Warmup, last: Phase::Growth }, Category::Embedding, "media/embedding-cache",
-                maximum).map(|mut c| { c.activation = on.clone(); c }));
+            vision.extend(&mut contract_variables, &mut components, maximum)?;
+            vision.require_spark_worker(&contract_variables, &mut requires);
         }
         // BLAS: the BF16 vocabulary head borrows one serving-thread pool.
         if self.head.bf16() {

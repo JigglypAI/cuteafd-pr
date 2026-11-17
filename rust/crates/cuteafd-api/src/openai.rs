@@ -131,6 +131,7 @@ pub struct ModelProfile {
     pub media_preparer: Option<Arc<media::MediaPreparer>>,
     /// Fidelity feature overrides only; never advertises a loaded vision encoder.
     pub probe_media_preparer: Option<Arc<media::MediaPreparer>>,
+    pub grouped_images: bool,
     pub audio_preparer: Option<Arc<media::audio::AudioPreparer>>,
     pub audio_health: Option<Arc<std::sync::atomic::AtomicBool>>,
     /// Loaded encoder capabilities, not checkpoint metadata or requested placement.
@@ -172,7 +173,7 @@ impl ModelProfile {
     pub fn new(id: impl Into<String>, encoding: ModelEncoding) -> Self {
         let eos_token_ids = encoding.eos_token_ids();
         let capabilities = MediaCapabilities { vision: matches!(encoding, ModelEncoding::DeepseekV41), audio: false };
-        Self { stats_diagnostics: None, expert_usage: Default::default(), id: id.into(), encoding, eos_token_ids, capabilities, engine_health: None, media_preparer: None, probe_media_preparer: None, vision_health: None,
+        Self { stats_diagnostics: None, expert_usage: Default::default(), id: id.into(), encoding, eos_token_ids, capabilities, engine_health: None, media_preparer: None, probe_media_preparer: None, grouped_images: false, vision_health: None,
             audio_preparer: None, audio_health: None, gateway: None, v41_turns: V41Turns::default(),
             literal_tokens: Arc::new(cuteafd_loader::LiteralTokens::new([
                 "<｜deepseek_image｜>", "<｜begin▁of▁sentence｜>", "<｜end▁of▁sentence｜>",
@@ -201,6 +202,10 @@ impl ModelProfile {
         self.media_preparer = Some(preparer);
         self.capabilities.vision = true;
         self
+    }
+
+    pub fn with_grouped_vision(mut self, preparer: Arc<media::MediaPreparer>) -> Self {
+        self.grouped_images=true; self.with_loaded_vision(preparer)
     }
 
     pub fn with_probe_media(mut self, preparer: Arc<media::MediaPreparer>) -> Self {
@@ -357,6 +362,7 @@ pub struct NativeRequest {
     pub constraint: Option<NativeConstraint>,
     pub images: Vec<cuteafd_loader::V41Image>,
     /// Generic-family media, in template order. V4.1 only uses `images`.
+    pub image_groups: Vec<cuteafd_loader::media::PreparedImageGroup>,
     pub media: Vec<Arc<cuteafd_loader::media::PreparedImage>>,
     pub audio: Vec<Arc<cuteafd_loader::media::audio::PreparedAudio>>,
     pub max_tokens: usize,
@@ -1207,6 +1213,7 @@ pub(crate) fn build(profile: &ModelProfile, limits: NativeLimits, headers: &axum
 
 /// Prepared media for one request (decoded on blocking threads).
 struct Prepared {
+    image_groups: Vec<cuteafd_loader::media::PreparedImageGroup>,
     images: Vec<cuteafd_loader::V41Image>,
     media: Vec<Arc<cuteafd_loader::media::PreparedImage>>,
     audio: Vec<Arc<cuteafd_loader::media::audio::PreparedAudio>>,
@@ -1236,7 +1243,8 @@ async fn prepare_media(profile: &ModelProfile, decoder: &images::ImageDecoder, w
             Err(e) => return Err(Rejection::new(StatusCode::INTERNAL_SERVER_ERROR, e)),
         }
     };
-    let media = if media_sources.is_empty() { Vec::new() } else {
+    let grouped=profile.grouped_images && probe.is_none_or(|p|p.spec.media.is_empty());
+    let (media,image_groups) = if media_sources.is_empty() { (Vec::new(),Vec::new()) } else {
         let preparer = profile.media_preparer.as_ref().or_else(|| probe.filter(|p| p.spec.feature_scoring())
             .and(profile.probe_media_preparer.as_ref())).expect("validated media preparer").clone();
         let slot = preparer.slots.clone().acquire_owned().await
@@ -1245,9 +1253,13 @@ async fn prepare_media(profile: &ModelProfile, decoder: &images::ImageDecoder, w
             .map(|span| span.fixture.as_ref().map(|f| f.sha256.clone())).collect::<Vec<_>>()).unwrap_or_default();
         match tokio::task::spawn_blocking(move || {
             let _slot = slot;
-            preparer.prepare_verified(&media_sources, &hashes)
+            if grouped {
+                let groups=preparer.prepare_groups(&media_sources)?;
+                let images=groups.iter().flat_map(|g|g.images.iter().cloned()).collect();
+                Ok::<_,anyhow::Error>((images,groups))
+            }else {Ok((preparer.prepare_verified(&media_sources, &hashes)?.images,Vec::new()))}
         }).await {
-            Ok(Ok(prepared)) => prepared.images,
+            Ok(Ok(prepared)) => prepared,
             Ok(Err(message)) => return Err(Rejection::bad(message)),
             Err(message) => return Err(Rejection::new(StatusCode::INTERNAL_SERVER_ERROR, message)),
         }
@@ -1266,7 +1278,7 @@ async fn prepare_media(profile: &ModelProfile, decoder: &images::ImageDecoder, w
             Err(message) => return Err(Rejection::new(StatusCode::INTERNAL_SERVER_ERROR, message)),
         }
     };
-    Ok(Prepared { images, media, audio })
+    Ok(Prepared { image_groups, images, media, audio })
 }
 
 /// Shared engine-facing state the chat route and the gateway backend submit through.
@@ -1352,6 +1364,7 @@ impl Submitter {
             prefix_cache_source: prefix_cache_source.clone(),
             finish_detail: finish_detail.clone(),
             audio: prepared.audio,
+            image_groups: prepared.image_groups,
             media: prepared.media,
             prompt,
             literal_spans,

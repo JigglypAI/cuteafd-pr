@@ -160,7 +160,7 @@ mod tests {
                 key:"07".repeat(32),grid:[1,132,506],identity:None,input_key:None,
                 fixture:Some(ProbeFixture {path:"image.png".into(),sha256:"ab".repeat(32)}),
                 image_url:Some(ProbeImageUrl {url:"fixture".into(),detail:None}) }], ..Default::default() });
-        let mut job = NativeRequest { prefix_cache_source:Default::default(),finish_detail:Default::default(),
+        let mut job = NativeRequest { image_groups: Vec::new(), prefix_cache_source:Default::default(),finish_detail:Default::default(),
             literal_spans:vec![],prompt:String::new(),constraint:None,images:vec![],media:vec![image],audio:vec![],
             max_tokens:64,sampling:Default::default(),stop_token_ids:vec![],
             events:tokio::sync::mpsc::unbounded_channel().0,usage:None,probe:None };

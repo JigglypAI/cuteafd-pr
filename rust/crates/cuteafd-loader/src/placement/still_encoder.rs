@@ -18,6 +18,7 @@ impl StillEncoder {
         let rows = match checkpoint.model_type() {
             Some("kimi_k3" | "kimi_k31") => crate::families::kimi_k3::vision::MAX_IMAGE_TOKENS as usize,
             Some("minimax_m3_vl") => crate::families::minimax_m3::vision::MAX_IMAGE_TOKENS,
+            Some("inkling2" | "step5_vl") => 4096,
             _ => anyhow::bail!("unsupported independent still tower"),
         };
         let inventory = StillTowerInventory::from_checkpoint(checkpoint, rows)?;
@@ -137,7 +138,7 @@ mod tests {
     #[test]
     fn both_families_use_shared_spark_first_and_rtx_fallback_with_one_arena() {
         use crate::plan::encoder::{EncoderGpuBudget,EncoderSparkBudget};
-        for kind in [StillTowerKind::Kimi,StillTowerKind::MiniMax] {
+        for kind in [StillTowerKind::Kimi,StillTowerKind::MiniMax,StillTowerKind::Inkling2,StillTowerKind::Step5] {
             for spark_free in [u64::MAX,0] {
                 let hardware=EncoderHardware {v41:false,gpus:vec![EncoderGpuBudget {free_bytes:u64::MAX,kv_target_bytes:0}],
                     sparks:vec![EncoderSparkBudget {rank:0,host:"fixture".into(),idle:false,expert_bytes:0,free_bytes:spark_free}]};
@@ -159,7 +160,7 @@ mod tests {
         impl Recipe for Prepared {
             fn prepare(&self, _: &Request) -> Result<Contract, Refusal> { Ok(self.0.clone()) }
         }
-        for kind in [StillTowerKind::Kimi, StillTowerKind::MiniMax] {
+        for kind in [StillTowerKind::Kimi, StillTowerKind::MiniMax, StillTowerKind::Inkling2, StillTowerKind::Step5] {
             let hardware = EncoderHardware { v41: false,
                 gpus: vec![EncoderGpuBudget { free_bytes: 64 << 20, kv_target_bytes: 0 }],
                 sparks: vec![EncoderSparkBudget { rank: 0, host: "fixture".into(), idle: false,

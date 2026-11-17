@@ -12,6 +12,7 @@ pub(crate) use read_transform::ReadTransform;
 pub mod mistral;
 mod qwen;
 pub mod local;
+pub(crate) mod still;
 pub mod remote;
 pub mod worker;
 pub mod audio;

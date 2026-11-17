@@ -52,6 +52,9 @@ impl Coordinator {
 
 /// Every operator input admission reads, resolved once by the caller.
 pub struct FactsRequest<'a> {
+    pub vision: crate::plan::MediaMode,
+    pub vision_replicas: usize,
+    pub media_cache_bytes: Option<u64>,
     pub checkpoint: &'a crate::plan::Checkpoint,
     pub catalog: &'a crate::OfficialV41Catalog,
     pub cfg: &'a Inkling2Config,
@@ -291,12 +294,15 @@ pub fn gather(request: &FactsRequest<'_>) -> Result<InklingInputs, Refused> {
     let physical = (0..gpus).map(|gpu| request.coordinator.physical(gpu)).collect::<Vec<_>>();
     let maximum_pool_tokens = crate::placement::PoolPolicy::resolve(&physical, context, request.pool_tokens,
         page_rows).maximum_tokens();
+    let vision = crate::placement::still_encoder::StillEncoder::planned(request.checkpoint,
+        request.vision, request.vision_replicas, &budgets, request.media_cache_bytes.unwrap_or(256 << 20))
+        .map_err(|error| refused(format!("Inkling vision inventory refused: {error:#}"), "Provide the bundled PE tensors."))?;
     Ok(InklingInputs { cfg: cfg.clone(), kv_format: request.kv_format, gpus, spark_ranks: ranks,
         context: Context::resolve(context, (request.context_tokens > 0).then_some(request.context_tokens)),
         maximum_pool_tokens, prefill: shape, sequences: request.sequences, prefix_entries: request.prefix_entries,
         prefix_mark_budget: request.prefix_mark_budget, targets, placement, modes,
         routed: routed.clone(), experts, local, spark, links,
-        spark_reply_formats: request.replies, drafter: None, vision: None, budgets, code, graph_reserve,
+        spark_reply_formats: request.replies, drafter: None, vision, budgets, code, graph_reserve,
         head: request.head, host_prefix, device_sampling: true,
         expert_usage: request.expert_usage.then(|| cuteafd_core::expert_usage::Geometry { layers: cfg.layers,
             experts: cfg.experts, topk: cfg.topk, routed_layers: routed }),
