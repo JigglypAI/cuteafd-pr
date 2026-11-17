@@ -12,7 +12,10 @@ impl Trace{
     pub fn capture(&mut self,layer:usize,stage:&str,rows:usize,owner:&UnitOwner<'_>)->Result<()>{
         let fields:&[(&str,usize)]=match stage{
             "entry"=>&[("partial",4608*4)],
-            "attention"=>&[("attention",4608*4),("projection_input",4608*2)],
+            "attention"=>&[("q_bf16",6144*2),("k",1024*4),("v",1024*4),
+                ("conv_k",1024*4),("conv_v",1024*4),("k_clipped",1024*4),("v_norm",1024*4),
+                ("relative",48*1024*2),("sinks",48*4),("attended",6144*2),
+                ("gated",6144*2),("attention",4608*4),("projection_input",4608*2)],
             "experts"=>&[("projection_input",4608*2),("expert_wire",4752),("route_logits",384*4),("route_ids",8*4),("route_weights",8*4),("expert_output",4608*2)],
             "exit"=>&[("partial",4608*4)],_=>anyhow::bail!("unknown Inkling width trace stage {stage}")};
         owner.stream.drain()?;
@@ -117,6 +120,8 @@ fn compare(candidate:&Trace,reference:&[Trace],logits:&[u8],base_logits:&[Vec<u8
             ensure!(sample.layer==other.layer && sample.stage==other.stage && other.rows==1,"width trace order differs");
             let order:Vec<&str>=if sample.stage=="experts"{
                 vec!["projection_input","expert_wire","route_logits","route_ids","route_weights","expert_output"]
+            }else if sample.stage=="attention" && sample.buffers.contains_key("q_bf16"){
+                vec!["q_bf16","k","v","conv_k","conv_v","k_clipped","v_norm","relative","sinks","attended","gated","attention","projection_input"]
             }else{sample.buffers.keys().map(String::as_str).collect()};
             let mut equality=BTreeMap::new();
             let mut operand=None;
