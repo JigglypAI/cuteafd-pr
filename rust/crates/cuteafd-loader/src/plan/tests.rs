@@ -4011,7 +4011,7 @@ fn glm5_flash_selected_working_set_drives_plan_request_and_runtime_buffers() {
         let report = plan(dir.path(), &options).unwrap();
         assert!(report.placement_supported, "{}", render(&report));
         let opts = options.layout.as_ref().unwrap();
-        let input = glmf::GlmfInputs {
+        let input = glmf::GlmfInputs { target_pool_tokens: None,
             blas_head: crate::placement::planner::serving::BlasHead::TensorLt,
         resident_weight_limit: None, spark_reply_format: cuteafd_core::SparkReplyFormat::Bf16, context: crate::placement::planner::Context::pinned(opts.context_tokens), attention: Default::default(), cfg: &cfg, layers: cfg.layers, local_tp2_exl3: false,
             gpus: opts.rtx_bytes.iter().map(|&total| (total, Baseline::Planned {
@@ -4039,6 +4039,7 @@ fn glm5_flash_selected_working_set_drives_plan_request_and_runtime_buffers() {
         process.serving(&input, 0, 0, 0, 0).unwrap();
         process.spark_link(&input, checkpoint.spark_input_is_bf16()).unwrap();
         let selected = glmf::admission::prepare(&input, 188, true, process).unwrap().admit().unwrap();
+        assert_eq!(report.phase_ledger.as_ref().unwrap().pool_policy, selected.solved.pool_policy);
         let (placed, working) = (&selected.placement, &selected.working);
         assert_eq!(working.rtx_layers.len(), expected_rtx);
         assert_eq!(placed.onboard_layers, expected_rtx);

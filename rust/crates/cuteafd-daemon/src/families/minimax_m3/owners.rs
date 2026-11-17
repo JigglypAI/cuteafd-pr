@@ -765,7 +765,8 @@ pub(super) mod tests {
         Ok(MiniMaxInputs { cfg: cfg.clone(), gpus, split_wire: Some(cuteafd_loader::families::minimax_m3::execution::WirePrecision::Bf16),
             attention: canonical::MINIMAX_M3.check_attention(None, gpus, gpus == 2)?,
             spark_ranks: 2, context: ModelContext::pinned(257),
-            maximum_pool_tokens: 256 * 64, prefill, sequences: concurrency, manifest: std::sync::Arc::new(manifest(&targets)?),
+            pool: cuteafd_loader::placement::prepare_pool(cuteafd_loader::placement::PoolFacts::new(
+                &vec![96 << 30; gpus], ModelContext::pinned(257), Some(129 * 64), 64)), prefill, sequences: concurrency, manifest: std::sync::Arc::new(manifest(&targets)?),
             routed: routed.clone(), expert_backings, owners, budgets,
             local: LocalPackage::Installed { scratch: 64 << 20, output: prefill.rows * 6144 * 2 },
             spark: (0..=routed.len()).map(|count| vec![if count == routed.len() {
