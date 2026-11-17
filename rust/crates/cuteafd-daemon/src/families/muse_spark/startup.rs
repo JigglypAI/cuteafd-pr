@@ -398,7 +398,7 @@ mod tests {
             }
             let layout = report.memory_layout.as_ref().context("vision layout")?;
             let native: u64 = layout.devices.iter().flat_map(|device| &device.items)
-                .filter(|item| item.group == "vision tower" || item.group == "vision scratch")
+                .filter(|item| item.group == cuteafd_loader::media::still_tower::vision_weight_arena_label() || item.group == "vision scratch")
                 .map(|item| item.bytes).sum();
             assert_eq!(native, encoder.admitted_bytes());
             assert!(live.pool_tokens > 0);
@@ -537,7 +537,7 @@ mod tests {
             ("audio", audio, &admitted.audio, 246_586_368, 1),
         ] {
             let native = layout.devices.iter().flat_map(|device| &device.items)
-                .filter(|item| item.group == format!("{name} tower") || item.group == format!("{name} scratch"))
+                .filter(|item| item.group == if name == "vision" { cuteafd_loader::media::still_tower::vision_weight_arena_label() } else { "audio tower" } || item.group == format!("{name} scratch"))
                 .map(|item| item.bytes).sum::<u64>();
             if mode == MediaMode::Off { assert_eq!(native, 0); continue; }
             assert_eq!(encoder.admitted_bytes(), bytes);
@@ -547,8 +547,8 @@ mod tests {
         for device in layout.devices.iter().filter(|device| device.kind == DeviceKind::Spark) {
             let expected = &admitted.spark_items[device.index as usize];
             for item in expected { assert!(device.items.contains(item)); }
-            let native = device.items.iter().filter(|item| matches!(item.group.as_str(),
-                "vision tower" | "vision scratch" | "audio tower" | "audio scratch"))
+            let native = device.items.iter().filter(|item| item.group == cuteafd_loader::media::still_tower::vision_weight_arena_label()
+                || matches!(item.group.as_str(), "vision scratch" | "audio tower" | "audio scratch"))
                 .map(|item| item.bytes).sum::<u64>();
             assert_eq!(native, expected.iter().map(|item| item.bytes).sum::<u64>());
             assert!(!device.items.iter().any(|item| item.group == "media admission guard"));
