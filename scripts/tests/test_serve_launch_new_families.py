@@ -550,7 +550,7 @@ def test_step5_cache_format_matches_plan_and_serve(tmp_path: Path, model, gpus, 
 
 @pytest.mark.parametrize("keys,diagnostic", [
     ("SPECULATOR=dflash2\n", "SPECULATOR=dflash2 does not apply to step5"),
-    ("ATTENTION_PLACEMENT=heads\n", "step5 supports only ATTENTION_PLACEMENT=auto"),
+    ("ATTENTION_PLACEMENT=context\n", "Step-5 has no context/layers attention executor"),
     ("EMBEDDING=host\n", "step5 serves GPU token embeddings only"),
     ("SPECULATOR_MODEL_ID=x/y\n", "unused configuration key: SPECULATOR_MODEL_ID"),
     ("SPECULATOR_MODEL_REVISION=abc\n", "unused configuration key: SPECULATOR_MODEL_REVISION"),
@@ -866,7 +866,7 @@ def test_muse_forwards_supported_packing_modes(tmp_path: Path, mode: str) -> Non
 
 
 @pytest.mark.parametrize("keys,diagnostic", [
-    ("ATTENTION_PLACEMENT=layers\n", "supports only ATTENTION_PLACEMENT=auto"),
+    ("ATTENTION_PLACEMENT=layers\n", "Muse has no context/layers attention executor"),
     ("SPECULATOR=mtp\n", "SPECULATOR=mtp does not apply to muse_spark"),
     ("SPECULATOR=dflash2\nSPECULATOR_MODEL_ID=RadixArk/Muse-Spark-Open-DFlash2\nDRAFT_KV_CACHE=fp16\n",
      "DRAFT_KV_CACHE must be bf16 or fp8"),

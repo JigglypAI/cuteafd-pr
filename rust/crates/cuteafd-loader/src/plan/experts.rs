@@ -228,6 +228,11 @@ pub fn spark_recipe(package: &str, intermediate: usize, world: usize) -> Result<
     let coverage = cuteafd_core::tp_units::spark_package_entry(&coverage_key);
     let worlds = coverage["worlds"].as_array().map(|values| values.iter()
         .filter_map(|value| value.as_u64().map(|value| value as usize)).collect::<Vec<_>>()).unwrap_or_default();
+    // Retired packages cannot acquire new aliases without a rebuild. Their
+    // exported worlds, not historical fidelity/card admission, remain usable.
+    if coverage["deprecated"].as_bool() == Some(true) && !worlds.contains(&world) {
+        return Err(SparkRecipeRefusal::MissingPackage { package: key.into(), world });
+    }
     let packaged_intermediate = coverage["intermediate"].as_u64().unwrap_or(0) as usize;
     let required = package_width_keys(intermediate, block, world, exl3, native, nvfp4 && !policy.exact_storage(world));
     let available = worlds.iter().flat_map(|&count|

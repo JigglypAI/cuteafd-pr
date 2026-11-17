@@ -138,7 +138,7 @@ FULL_TESTS = (
     'fidelity_dataset::tests::cached_published_qualifications_and_manifests_load',
     'families::kimi_k3::admission::tests::planner_equals_runtime_context_extent_at_256k_512k_and_1m',
     'families::step5::admission::tests::public_max_card_planner_equals_measured_daemon_before_allocation',
-    'plan::families::step5::tests::native_prefill_refuses_every_unqualified_spark_count',
+    'plan::families::step5::tests::native_prefill_refuses_missing_spark_packages',
     'plan::layout::draft_prefix_tests::kimi_host_snapshots_use_serve_context_and_selected_draft_record',
     'plan::families::step5::tests::nvfp4_min_card_admits_native_w4a4_and_bf16_root_stays_reference_only',
     'families::kimi_k3::serve::tests::shared_prefill_policy_matches_planner_and_runtime_admission',

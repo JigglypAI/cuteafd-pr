@@ -245,6 +245,15 @@ fn resolve_settings(args: &mut PlanArgs, family: &str, cfg: &std::collections::B
         resolved.insert("draft_fp8".into(), setting(fp8));
     }
     if family == "mimo_v2" {
+        let configured = match cfg.get("SPECULATOR_FP8").map(String::as_str) {
+            Some("on") => Some(true), Some("off" | "auto") => Some(false), None | Some("") => None,
+            _ => anyhow::bail!("SPECULATOR_FP8 must be auto, on or off"),
+        };
+        let fp8 = defaults::selected(args.draft_fp8.or(args.mimo_draft_bf16.then_some(false)),
+            configured, true, "FP8 MiMo DFlash body; explicit auto preserves checkpoint BF16");
+        args.draft_fp8 = Some(fp8.value);
+        args.mimo_draft_bf16 = !fp8.value;
+        resolved.insert("draft_fp8".into(), setting(fp8));
         let depth = defaults::mimo_mtp_depth((args.explicit_settings.contains("native_mtp_layers")).then_some(args.native_mtp_layers),
             cfg.get("SPECULATOR_DEPTH").filter(|v| !v.is_empty()).map(|v| v.parse().context("SPECULATOR_DEPTH")).transpose()?, args.speculator == "mtp");
         args.native_mtp_layers = depth.value;
@@ -2613,6 +2622,26 @@ mod tests {
         request.native_mtp_layers = 0;
         resolve_speculator(&mut request, dir.path(), "deepseek_v4", &Default::default()).unwrap();
         assert_eq!(request.speculator, "off");
+    }
+
+    #[test]
+    fn mimo_draft_precision_and_plan_accounting_share_one_resolution() {
+        let dir = tempfile::tempdir().unwrap();
+        for alias in ["XiaomiMiMo/MiMo-V2.6-Flash-MOPD", "community/MiMo-MC", "renamed/local"] {
+            for (mode, expected) in [(None, true), (Some("on"), true), (Some("auto"), false), (Some("off"), false)] {
+                let mut request = args(dir.path(), 4, false);
+                request.checkpoint_model_id = Some(alias.into());
+                request.speculator = "dflash2".into();
+                let cfg = mode.map(|mode| [("SPECULATOR_FP8".into(), mode.into())].into()).unwrap_or_default();
+                let resolved = resolve_settings(&mut request, "mimo_v2", &cfg).unwrap();
+                assert_eq!(resolved["draft_fp8"].value, serde_json::json!(expected));
+                assert_eq!(request.draft_fp8, Some(expected));
+                assert_eq!(options(&request).unwrap().layout.unwrap().mimo_draft_bf16, !expected);
+                request.draft_fp8 = Some(!expected);
+                resolve_settings(&mut request, "mimo_v2", &cfg).unwrap();
+                assert_eq!(options(&request).unwrap().layout.unwrap().mimo_draft_bf16, expected);
+            }
+        }
     }
 
     #[test]

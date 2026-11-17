@@ -972,6 +972,9 @@ def _family_launch_result(tmp_path: Path, family_config: dict, model: str, keys:
         (repo / "scripts" / "build" / "verify-sparkinfer-source.py").write_text("print('test-pin')\n")
     hf = tmp_path / "hf"
     _snapshot(hf, model, family_config, "a" * 40 if native_v41 else "abc")
+    if family_config.get("model_type") == "mimo_v2":
+        (hf / "hub" / f"models--{model.replace('/', '--')}" / "snapshots/abc/dflash").mkdir(exist_ok=True)
+
     if "CORE_VIEW=k6-compact" in keys:
         selected = hf / "hub" / f"models--{model.replace('/', '--')}" / "snapshots" / ("a" * 40 if native_v41 else "abc")
         (selected / "config.k6.json").write_text(json.dumps(family_config))
@@ -1110,7 +1113,7 @@ if "--resolve-settings-only" in args:
         sys.exit(0)
     if checkpoint.get("model_type", "").startswith("mimo"):
         selected = "off"
-        if (args[args.index("--checkpoint-model-id") + 1] if "--checkpoint-model-id" in args else None) in ("XiaomiMiMo/MiMo-V2.6-Flash-MOPD", "XiaomiMiMo/MiMo-V2.6-Pro-MOPD"):
+        if (Path(os.environ["STUB_CONFIG_PATH"]).parent / "dflash").is_dir():
             selected = "dflash2"
     else:
         selected = "dflash2" if (hf / "hub/models--incoai--GLM-5.3-Flash-DFlash2").is_dir() else "off"
@@ -4144,14 +4147,14 @@ def test_memory_keys_are_accepted_for_cleanup_and_native_launchers(tmp_path):
 
 @pytest.mark.parametrize("keys,expected", [
     ("", "fp8"), ("SPECULATOR=dflash2\n", "fp8"),
-    ("SPECULATOR_FP8=auto\n", "checkpoint"), ("SPECULATOR_FP8=off\n", "bf16"),
+    ("SPECULATOR_FP8=auto\n", "bf16"), ("SPECULATOR_FP8=off\n", "bf16"),
     ("SPECULATOR=off\n", "off"), ("SPECULATOR=mtp\n", "mtp"),
 ])
 @pytest.mark.parametrize("draft_kv", ["bf16", "fp8"])
-def test_flash_mopd_defaults_to_its_qualified_bundled_drafter(tmp_path: Path, keys: str, expected: str, draft_kv: str) -> None:
+@pytest.mark.parametrize("model", ["XiaomiMiMo/MiMo-V2.6-Flash-MOPD", "community/MiMo-MC", "renamed/copy"])
+def test_flash_mopd_defaults_to_its_bundled_drafter(tmp_path: Path, keys: str, expected: str, draft_kv: str, model: str) -> None:
     config = {"model_type": "mimo_v2", "hidden_size": 4096, "num_hidden_layers": 2,
               "moe_layer_freq": [0, 1], "quantization_config": {"store_dtype": "mxfp4"}}
-    model = "XiaomiMiMo/MiMo-V2.6-Flash-MOPD"
     result = _family_launch_result(tmp_path, config, model, keys + f"DRAFT_KV_CACHE={draft_kv}\n")
     assert result.returncode == 0, result.stderr
     launch = next(line for line in result.stderr.splitlines() if "serve-mimo --snapshot" in line)
@@ -4163,7 +4166,7 @@ def test_flash_mopd_defaults_to_its_qualified_bundled_drafter(tmp_path: Path, ke
         assert "--draft" not in command
         assert ("--mtp 1" in launch) == (expected == "mtp")
     else:
-        assert f"--draft {tmp_path}/hf/hub/models--XiaomiMiMo--MiMo-V2.6-Flash-MOPD/snapshots/abc" in launch
+        assert f"--draft {tmp_path}/hf/hub/models--{model.replace('/', '--')}/snapshots/abc" in launch
         if expected == "checkpoint":
             assert "--draft-representation checkpoint" in launch and "--draft-fp8" not in launch
         else:
@@ -4178,7 +4181,7 @@ def test_flash_mopd_external_drafter_does_not_inherit_bundled_precision(tmp_path
     assert result.returncode == 0, result.stderr
     launch = next(line for line in result.stderr.splitlines() if "serve-mimo --snapshot" in line)
     assert "models--test--external-draft/snapshots/abc" in launch
-    assert "--draft-fp8" not in launch
+    assert "--draft-fp8 true" in launch
 
 
 def test_family_config_reads_share_the_stop_key_grammar() -> None:

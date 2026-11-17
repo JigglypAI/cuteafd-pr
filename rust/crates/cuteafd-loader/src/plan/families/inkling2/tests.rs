@@ -121,6 +121,25 @@ fn layout_reuses_one_immutable_catalog_across_candidates() -> anyhow::Result<()>
 }
 
 #[test]
+fn serving_refuses_only_missing_multi_gpu_and_bundled_draft_executors() {
+    let (dir, _, _) = fixture(Fixture::Mxfp8);
+    for (gpus, draft, expected) in [(2, false, "multi-GPU serving executor not implemented (#2316)"),
+        (1, true, "bundled dSpark executor not implemented (#2320)")] {
+        let report = plan::plan(dir.path(), &PlanOptions {
+            placement: plan::ExpertPlacement::from_spark_ranks(4),
+            draft_ownership: Some(if draft { crate::plan::spec::DraftOwnership::NativeMtp }
+                else { crate::plan::spec::DraftOwnership::None }),
+            vision: plan::MediaMode::Off, audio: plan::MediaMode::Off,
+            layout: Some(plan::layout::LayoutOptions { rtx_bytes: vec![96 << 30; gpus],
+                native_mtp_layers: usize::from(draft), ..Default::default() }), ..Default::default()
+        }).unwrap();
+        assert_eq!(report.runtime, Some(RuntimeStatus::Serving));
+        assert!(!report.executable());
+        assert!(report.hints.iter().any(|hint| hint.what.contains(expected)), "{:?}", report.hints);
+    }
+}
+
+#[test]
 fn inkling_mxfp8_inventory_is_serving_without_checkpoint_allowlist() {
     let (dir, _, _) = fixture(Fixture::Mxfp8);
     let report = plan::plan(dir.path(), &PlanOptions::default()).unwrap();

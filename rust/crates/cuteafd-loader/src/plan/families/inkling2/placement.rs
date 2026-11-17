@@ -25,6 +25,16 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
     let mut notes = vec![
         "Inkling 2 shared contract: one solve over named physical owners".to_string(),
     ];
+    if gpus != 1 {
+        report.refuse_placement("Inkling multi-GPU serving executor not implemented (#2316)".into(),
+            "Use one coordinator GPU; the shared planner can describe TP2 owners, but serving cannot execute them yet.");
+        return empty(notes);
+    }
+    if opts.native_mtp_layers > 0 {
+        report.refuse_placement("Inkling bundled dSpark executor not implemented (#2320)".into(),
+            "Use SPECULATOR=off; the bundled drafter execution path is not implemented in this build.");
+        return empty(notes);
+    }
     if opts.host_embedding {
         report.refuse_placement("Inkling 2 does not support --embedding-placement host yet".into(),
             "Use --embedding-placement gpu; the shared host TokenEmbedding lands with the serving stage.");

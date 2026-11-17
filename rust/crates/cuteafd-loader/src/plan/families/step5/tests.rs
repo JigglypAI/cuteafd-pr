@@ -710,7 +710,7 @@ fn official_nested_inventory_separates_target_tail_mtp_vision() {
 
 #[test]
 fn native_formats_use_executor_counts_and_memory_not_card_or_fidelity_allowlists() {
-    for (kind, gpus, ranks) in [("fp8", 1, 6), ("nvfp4", 2, 4)] {
+    for (kind, gpus, ranks) in [("fp8", 1, 6), ("nvfp4", 2, 4), ("nvfp4", 1, 6)] {
         let dir = snapshot(kind);
         let admitted = report(dir.path(), gpus, 96, ranks, None);
         assert!(admitted.native_serving_admitted && admitted.executable(), "{kind}: {:?}", admitted.hints);
@@ -811,7 +811,7 @@ fn nvfp4_min_card_admits_native_w4a4_and_bf16_root_stays_reference_only() {
             assert_eq!(mapped.bytes, lane_rings as u64, "one main transport endpoint");
         }
     }
-    for (gpus, gib, ranks) in [(1, 32, 4), (1, 96, 6), (1, 96, 0)] {
+    for (gpus, gib, ranks) in [(1, 32, 4), (1, 96, 0)] {
         let result = report(dir.path(), gpus, gib, ranks, None);
         assert!(!result.wip_launchable() && !result.native_serving_admitted);
         if ranks == 0 {
