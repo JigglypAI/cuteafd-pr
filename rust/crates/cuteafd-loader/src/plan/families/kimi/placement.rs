@@ -465,8 +465,10 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
         context_buffers.query_row_bytes.saturating_add(context_buffers.partial_row_bytes)
     } else { 0 };
     let page_rows = if modes.iter().any(|mode| *mode == LayerMode::ContextSplit) { PAGE * 2 } else { PAGE };
-    let ceiling = crate::placement::PoolPolicy::resolve(&opts.rtx_bytes[..gpus], context,
-        requested_pool, page_rows).maximum_tokens();
+    let mut pool = crate::placement::PoolPolicy::resolve(&opts.rtx_bytes[..gpus], context,
+        requested_pool, page_rows);
+    pool.target = opts.target_pool_tokens.max(context);
+    let ceiling = pool.maximum_tokens();
     let maximum_pages = ceiling.div_ceil(page_rows);
     let draft_window_bytes = match draft.as_ref().map(|layout| layout.window_mark_bytes()).transpose() {
         Ok(bytes) => bytes.unwrap_or(0) as u64,
