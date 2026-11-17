@@ -238,13 +238,17 @@ size_t scratch_tower(Owner* o) {
 }
 }
 
-extern "C" int32_t cuteafd_vision_required(const cuteafd_vision_spec* s, cuteafd_vision_ledger* out) {
-  if(!s || !out || !valid_tower(*s))return cudaErrorInvalidValue;
+static int32_t vision_required_impl(const cuteafd_vision_spec* s, cuteafd_vision_ledger* out,
+    bool (*validate)(const cuteafd_vision_spec&)) {
+  if(!s || !out || !validate(*s))return cudaErrorInvalidValue;
   Owner o;
   if(!copy_spec(o,*s))return cudaErrorMemoryAllocation;
   size_t bytes=scratch_tower(&o);
   size_t blas_bytes=(s->perception || s->tower || (s->abi_version==2 && s->reserved==5)) ? 0 : BLAS_BYTES;
   *out={s->weight_bytes,bytes-blas_bytes,blas_bytes,0,0}; return 0;
+}
+extern "C" int32_t cuteafd_vision_required(const cuteafd_vision_spec* s, cuteafd_vision_ledger* out) {
+  return vision_required_impl(s,out,valid_tower);
 }
 extern "C" int32_t cuteafd_vision_get_backings(void* owner, cuteafd_media_backings* out) {
   if(!owner || !out)return cudaErrorInvalidValue;
@@ -284,10 +288,10 @@ extern "C" int32_t cuteafd_vision_destroy_backings(void* owner, uint32_t* releas
   if(!o->weights && !o->arena) delete o;
   return first;
 }
-extern "C" int32_t cuteafd_vision_create(const cuteafd_vision_spec* s, int32_t device, uint64_t admitted,
-    const cuteafd_media_tags* tags, void** out) {
+static int32_t vision_create_impl(const cuteafd_vision_spec* s, int32_t device, uint64_t admitted,
+    const cuteafd_media_tags* tags, void** out, bool (*validate)(const cuteafd_vision_spec&)) {
   if(!out || !tags)return cudaErrorInvalidValue; *out=nullptr;
-  cuteafd_vision_ledger ledger{}; int e=cuteafd_vision_required(s,&ledger);
+  cuteafd_vision_ledger ledger{}; int e=vision_required_impl(s,&ledger,validate);
   if(e)return e;
   if(admitted < ledger.weights+ledger.scratch+ledger.blas_workspace)return cudaErrorMemoryAllocation;
   e=cudaSetDevice(device);if(e)return e;
@@ -305,7 +309,10 @@ extern "C" int32_t cuteafd_vision_create(const cuteafd_vision_spec* s, int32_t d
   e=cuteafd_media_allocate(reinterpret_cast<void**>(&o->arena),ledger.scratch+ledger.blas_workspace,tags->workspace_kind,tags->workspace_owner);if(e)return fail(e);++o->ledger.device_allocations;
   scratch_tower(o);
 #ifdef CUTEAFD_HAVE_VISION_ATTENTION_AOT
-  if(s->abi_version==2 || s->perception) {
+  if(s->tower) {
+    const char* group=s->tower->temporal_patch==1 ? "tower_kimi" : "tower_minimax";
+    e=cuteafd_vision_attention_create_entry(s->head_dim,0,group,&o->attention);if(e)return fail(e);
+  } else if(s->abi_version==2 || s->perception) {
     const char* group=s->perception ? (s->reserved==6?"pe_inkling2":"pe_step5") :
       (s->reserved==5 ? "muse" : (s->reserved==4 ? "pixtral" : ""));
     e=cuteafd_vision_attention_create_entry(s->head_dim,0,group,&o->attention);if(e)return fail(e);
@@ -329,6 +336,10 @@ extern "C" int32_t cuteafd_vision_create(const cuteafd_vision_spec* s, int32_t d
   }
   if(s->abi_version==1) { e=cudaFuncSetAttribute(vit_attn_kernel,cudaFuncAttributeMaxDynamicSharedMemorySize,sizeof(AttnSmem));if(e)return fail(e); }
   *out=o;return 0;
+}
+extern "C" int32_t cuteafd_vision_create(const cuteafd_vision_spec* s, int32_t device, uint64_t admitted,
+    const cuteafd_media_tags* tags, void** out) {
+  return vision_create_impl(s,device,admitted,tags,out,valid_tower);
 }
 extern "C" int32_t cuteafd_vision_upload(void* owner, uint64_t offset, const void* data, uint64_t bytes) {
   if(!owner || !data)return cudaErrorInvalidValue;auto* o=static_cast<Owner*>(owner);
@@ -359,6 +370,8 @@ extern "C" int32_t cuteafd_vision_encode(void* owner, const uint8_t* rgb, uint64
   int32_t gh, int32_t gw, uint16_t* output, uint64_t output_bytes, cuteafd_vision_observer cb, void* ctx) {
   if(!owner || !rgb || !lut || !output)return cudaErrorInvalidValue;
   auto* o=static_cast<Owner*>(owner); const auto& s=o->spec;
+  if(s.tower)return encode_generic_tower(o,rgb,rgb_bytes,lut,gh,gw,gh*s.patch_size,gw*s.patch_size,
+      0,0,gw*s.patch_size,gh*s.patch_size,output,output_bytes,cb,ctx);
   if(s.perception)return encode_perception(o,rgb,rgb_bytes,lut,gh,gw,gh*s.patch_size,gw*s.patch_size,
       0,0,gw*s.patch_size,gh*s.patch_size,output,output_bytes,cb,ctx);
   if(s.abi_version==2 && s.reserved==2)return encode_qwen(o,rgb,rgb_bytes,lut,gh,gw,output,output_bytes,cb,ctx);
@@ -440,6 +453,8 @@ extern "C" int32_t cuteafd_vision_encode_pixels(void* owner,const uint8_t* rgb,u
     uint16_t* output,uint64_t output_bytes,cuteafd_vision_observer cb,void* ctx) {
   if(!owner)return cudaErrorInvalidValue;
   auto* o=static_cast<Owner*>(owner);
+  if(o->spec.tower)return encode_generic_tower(o,rgb,rgb_bytes,parameters,gh,gw,sh,sw,cx,cy,cw,ch,
+      output,output_bytes,cb,ctx);
   if(!o->spec.perception)return cudaErrorNotSupported;
   return encode_perception(o,rgb,rgb_bytes,parameters,gh,gw,sh,sw,cx,cy,cw,ch,output,output_bytes,cb,ctx);
 }

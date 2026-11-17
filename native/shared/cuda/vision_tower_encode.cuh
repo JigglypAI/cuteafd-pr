@@ -63,7 +63,7 @@ int encode_generic_tower(Owner* o,const uint8_t* rgb,uint64_t rgb_bytes,const fl
     GENERIC_RUN(generic_projection(o,b.qkv_norm,block.qkv,block.qkv_bias,b.qkv,n,h,3*a));
     GENERIC_RUN(generic_program(o,"vision_rotary_"+suffix,
       {b.qkv,b.cosines,b.sines,b.q,b.k,b.v},{uint64_t(n)}));
-    GENERIC_RUN(generic_program(o,"vision_dynamic_attention",
+    GENERIC_RUN(generic_program(o,"vision_dynamic_attention_h"+std::to_string(s.heads)+"_d"+std::to_string(s.head_dim),
       {b.q,b.k,b.v,b.attention,b.lse,b.lengths},{uint64_t(n),scale_bits,uint64_t(l2)}));
     GENERIC_RUN(generic_projection(o,b.attention,block.proj,block.proj_bias,b.next,n,a,h));
     GENERIC_RUN(generic_residual(o,b.x,b.next,n));

@@ -261,3 +261,13 @@ def test_inactive_generic_tower_inventory_is_unique_and_has_dynamic_attention_fi
         assert not any("65536" in name or "66792" in name for name in names)
     native=(ROOT / "native/shared/cuda/vision_runtime.cu").read_text()
     assert "if(s.tower)return false" in native
+    assert "return vision_required_impl(s,out,valid_tower);" in native
+    assert "return vision_create_impl(s,device,admitted,tags,out,valid_tower);" in native
+    bridge = (ROOT / "native/tests/vision_tower_oracle_bridge.cuh").read_text()
+    assert "vision_required_impl(spec,ledger,valid_generic_tower)" in bridge
+    assert "vision_create_impl(spec,device,admitted,tags,owner,valid_generic_tower)" in bridge
+    assert "scratch_generic_tower" not in bridge and "encode_generic_tower" not in bridge
+    shim = (ROOT / "native/tests/vision_tower_oracle.cu").read_text()
+    assert '#include "../shared/cuda/vision_runtime.cu"' in shim
+    cmake = (ROOT / "native/CMakeLists.txt").read_text()
+    assert "add_library(cuteafd_vision_tower_oracle SHARED EXCLUDE_FROM_ALL" in cmake

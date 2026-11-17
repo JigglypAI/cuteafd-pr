@@ -806,6 +806,19 @@ if(CUTEAFD_ENABLE_CUDA)
   target_link_libraries(cuteafd_vision_pointwise_selftest PRIVATE cuteafd_memory_callbacks CUDA::cudart CUDA::cublas)
   add_test(NAME cuteafd_vision_pointwise_selftest COMMAND cuteafd_vision_pointwise_selftest)
   set_tests_properties(cuteafd_vision_pointwise_selftest PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77)
+  if(CUTEAFD_ENABLE_VISION_ATTENTION_AOT)
+    # Test-only gate bridge; includes the exact production owner/encode TU.
+    add_library(cuteafd_vision_tower_oracle SHARED EXCLUDE_FROM_ALL tests/vision_tower_oracle.cu
+      shared/src/vision_attention_aot.cc ${owner_objects})
+    set_target_properties(cuteafd_vision_tower_oracle PROPERTIES
+      CUDA_ARCHITECTURES "${CUTEAFD_CUDA_ARCHITECTURES}")
+    target_compile_definitions(cuteafd_vision_tower_oracle PRIVATE CUTEAFD_HAVE_VISION_ATTENTION_AOT=1)
+    target_include_directories(cuteafd_vision_tower_oracle PRIVATE ${CUTEAFD_NATIVE_INCLUDE_DIRS}
+      "${CUTEAFD_VISION_ATTENTION_DIR}" "${CUTEAFD_VISION_ATTENTION_DIR}/media")
+    target_link_libraries(cuteafd_vision_tower_oracle PRIVATE cuteafd_memory_callbacks
+      CUDA::cudart CUDA::cublas CUDA::cuda_driver)
+    add_dependencies(cuteafd_vision_tower_oracle cuteafd_vision_attention_export)
+  endif()
   # Chunk-1 GPU target-sampler (K1) device tests. They link the shipped native
   # library and therefore also pin the exported C ABI of sampling_gpu.h.
   # `.cu` because the subnormal/FTZ canary defines a probe kernel compiled with
