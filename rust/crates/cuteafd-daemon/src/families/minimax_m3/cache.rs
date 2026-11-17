@@ -934,7 +934,7 @@ mod tests {
                 Some(pool_tokens), cuteafd_loader::placement::Onboard::Layers(0), shape,
                 Operation::Serving, None, Default::default()),
             decisions: Decisions { attention: modes.clone(), onboard_layers: vec![vec![]; ranks],
-                expert_homes: Default::default(), embedding: None, draft_home: None, head_home: None,
+                expert_homes: Default::default(), embedding: None, draft_home: None, draft_traffic_bytes_per_cycle: 0, head_home: None,
                 intake_home: None, encoder: None, prefill: shape, lanes: 1, spark_reply_formats: None },
             pool_tokens, pool_page_rows: PAGE_ROWS as u64, budgets: vec![], phases: vec![],
             facts: Facts { phase_order: PhaseOrder::TARGET_THEN_DRAFT, resident_weights: vec![], allocations,
@@ -946,7 +946,7 @@ mod tests {
                 peer_row_bytes: 0, onboard_layers: 0, max_pool_tokens_no_onboard: None,
                 layers: modes.into_iter().map(|mode| LayerAssignment { mode, experts: ExpertHome::Dense }).collect(),
                 movables: vec![], expert_ranges: vec![], residual: vec![], hops: vec![], tp2: None, items: vec![] },
-            solved, onboard: 0, expert_backings: vec![], push_host_envelope: None, draft_home: None, encoder: None })
+            solved, onboard: 0, expert_backings: vec![], push_host_envelope: None, draft_home: None, draft_traffic_bytes_per_cycle: 0, encoder: None })
     }
 
     fn request_streams<'a>(library: &'a cuteafd_ffi::NativeLibrary, ids: &[i32]) -> Result<Vec<RequestStreams<'a>>> {

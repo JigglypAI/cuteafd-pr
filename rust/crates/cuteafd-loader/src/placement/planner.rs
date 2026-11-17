@@ -448,6 +448,8 @@ pub struct Decisions {
     pub expert_homes: BTreeMap<usize, ExpertDestination>,
     pub embedding: Option<EmbeddingHome>,
     pub draft_home: Option<u8>,
+    #[serde(default)]
+    pub draft_traffic_bytes_per_cycle: u64,
     pub head_home: Option<u8>,
     pub intake_home: Option<u8>,
     pub encoder: Option<usize>,
@@ -588,7 +590,7 @@ pub mod native_attention;
 pub mod serving;
 pub use contract::{
     Activation, ByteCurve, BytePiece, Choice, Component, ComponentKind, Contract, Requires,
-    Variable,
+    Variable, DraftHomeAlternative,
 };
 pub use search::solve;
 

@@ -77,7 +77,7 @@ pub(crate) fn admit(checkpoint: &Checkpoint, cfg: &Inkling2Config, target: &Coor
             prefill: Pin::Exact(shape), operation: Operation::Scoring, resident_weight_limit: None,
             spark_reply_formats: Default::default() },
         decisions: Decisions { attention: vec![], onboard_layers: vec![], expert_homes: Default::default(),
-            embedding: None, draft_home: None, head_home: Some(0), intake_home: None, encoder: None,
+            embedding: None, draft_home: None, draft_traffic_bytes_per_cycle: 0, head_home: Some(0), intake_home: None, encoder: None,
             prefill: shape, lanes: 1, spark_reply_formats: None },
         pool_tokens: 64, pool_page_rows: 64, budgets, facts, phases })
 }
@@ -188,7 +188,7 @@ mod tests {
         ResolvedPlan { encoder_diagnostics: vec![], request: Request { context: Context::pinned(64), pool: Pin::Exact(64),
             onboard: Pin::Exact(0), prefill: Pin::Exact(shape), operation: Operation::Scoring, resident_weight_limit: None,
             spark_reply_formats: Default::default() }, decisions: Decisions { attention: vec![], onboard_layers: vec![],
-            expert_homes: Default::default(), embedding: None, draft_home: None, head_home: Some(0), intake_home: None,
+            expert_homes: Default::default(), embedding: None, draft_home: None, draft_traffic_bytes_per_cycle: 0, head_home: Some(0), intake_home: None,
             encoder: None, prefill: shape, lanes: 1, spark_reply_formats: None }, pool_tokens: 64, pool_page_rows: 64,
             phases: evaluate(&facts, &budgets).unwrap(), facts, budgets }
     }
