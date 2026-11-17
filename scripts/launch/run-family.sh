@@ -620,6 +620,7 @@ case "$SPECULATOR" in dspark|off) ;; *) release_die "SPECULATOR must be dspark o
 draft_length="$DRAFT_LENGTH"
 [[ -z "$draft_length" || "$draft_length" =~ ^[1-9][0-9]*$ ]] ||
   release_die "DRAFT_LENGTH must be a positive integer"
+shared_draft_policy_args
 release_validate_verbs_device_map
 # V41_FP8_HEAD: unset/auto is resolved once by the shared loader parser to
 # packed (exact BF16 target weights, coarse dSpark plane), on one or two RTX.
@@ -1179,7 +1180,6 @@ if [[ -n "${POOL_TOKENS:-}" ]]; then
 fi
 [[ "$SPECULATOR" != dspark ]] || args+=(--dspark)
 [[ -z "$draft_length" ]] || args+=(--draft-length "$draft_length")
-shared_draft_policy_args
 args+=("${draft_policy_args[@]}")
 [[ "$TP2_ATTENTION" != on ]] || args+=(--tp2-attention)
 [[ "$TP2_QUERY_PROJECTION" != on ]] || args+=(--tp2-query-projection)

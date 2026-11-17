@@ -87,9 +87,7 @@ impl Policy {
     pub fn observe(&mut self, outcomes: &[DraftOutcome]) {
         let record = self.history.observe(outcomes, self.trace.is_some());
         if let (Some(trace), Some(record)) = (self.trace, record) {
-            let round = self.rounds;
-            if let Err(error) = trace.write(crate::shared::speculation_trace::record! {
-                r#type: "draft_round", round: round, draft: record }) {
+            if let Err(error) = trace.write(RoundRecord { r#type: "draft_round", round: self.rounds, draft: record }) {
                 tracing::warn!(%error, "draft round trace failed");
             }
         }
@@ -102,6 +100,19 @@ impl Policy {
     fn publish(&self) {
         if let Ok(mut slot) = SNAPSHOT.lock() { *slot = Some(Arc::new(self.history.snapshot())); }
     }
+}
+
+/// One `SPECULATION_TRACE` line per observed round: the policy, the running
+/// short-round share and explore counts, and per request every planned position
+/// with the probability used, its history counts, whether it was an explore,
+/// the head score where the drafter has one, and a skipped explore's
+/// calibrated probability (`explore_skipped`).
+#[derive(serde::Serialize)]
+struct RoundRecord {
+    r#type: &'static str,
+    round: u64,
+    #[serde(flatten)]
+    draft: cuteafd_core::RoundTrace,
 }
 
 /// The stats view may lag the policy by this many rounds.
@@ -194,6 +205,29 @@ mod tests {
         let mut off = Policy::new(DraftLength { draft_policy: super::super::length::DraftPolicyChoice::Off,
             ..Default::default() }, 7, HeadScore::None, true);
         assert_eq!((off.plan(&[(1, 40)], 64), off.max_positions()), (vec![0], 0));
+    }
+
+    #[test]
+    fn the_round_record_is_flat_and_carries_positions_and_the_short_share() {
+        let mut core = DraftHistory::new(DrafterSpec { block: 3, head: HeadScore::Probability, copy: 0 },
+            cuteafd_core::DraftControl::History);
+        core.plan(&[(7, 3)], 64);
+        core.refine(7, 3, Some(&[0.9, 0.8, 0.1]));
+        let draft = core.observe(&[outcome(7, 4, 2, false)], true).unwrap();
+        let value = serde_json::to_value(RoundRecord { r#type: "draft_round", round: 0, draft }).unwrap();
+        assert_eq!((value["type"].as_str(), value["policy"].as_str(), value["block"].as_u64()),
+            (Some("draft_round"), Some("history"), Some(3)));
+        assert_eq!((value["rounds"].as_u64(), value["short_rounds"].as_u64(), value["short_share"].as_f64()),
+            (Some(1), Some(0), Some(0.)));
+        let request = &value["requests"][0];
+        assert_eq!((request["id"].as_u64(), request["proposed"].as_u64(), request["accepted_drafts"].as_u64()),
+            (Some(7), Some(3), Some(1)));
+        assert!(request["explore_skipped"].is_null());
+        let position = &request["positions"][1];
+        for field in ["p", "accepted", "reached", "server", "server_reached", "explore", "head", "calibrated", "outcome"] {
+            assert!(position.get(field).is_some(), "{field}");
+        }
+        assert_eq!((position["head"].as_f64().map(|x| (x * 10.).round()), position["outcome"].as_bool()), (Some(8.), Some(false)));
     }
 
     #[test]
