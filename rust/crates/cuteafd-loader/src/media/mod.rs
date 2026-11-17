@@ -206,6 +206,25 @@ const CLIP_STD: [f64; 3] = [0.26862954, 0.26130258, 0.27577711];
 pub use resize::Resample;
 
 impl ProcessorConfig {
+    /// Native feature/span ceiling. Families without a qualified fixed ceiling
+    /// keep their existing policy-derived capacity rather than inventing one.
+    pub fn architectural_span_ceiling(&self) -> Option<usize> {
+        match self.family {
+            ImageFamily::Qwen=>Some(QWEN_MAX_IMAGE_TOKENS),
+            ImageFamily::Mistral=>Some(self.max_image_tokens.min(MISTRAL_MAX_IMAGE_TOKENS)),
+            ImageFamily::MiniMax=>Some(crate::families::minimax_m3::vision::MAX_IMAGE_TOKENS),
+            ImageFamily::Kimi=>Some(crate::families::kimi_k3::vision::MAX_IMAGE_TOKENS as usize),
+            _=>None,
+        }
+    }
+    pub fn default_span(&self) -> usize {
+        if self.family==ImageFamily::Kimi {crate::families::kimi_k3::vision::MAX_IMAGE_TOKENS as usize} else {4096}
+    }
+    pub fn resolved_span_cap(&self, policy: Option<usize>) -> Result<usize> {
+        let requested=policy.unwrap_or_else(|| self.default_span());
+        if requested==0 {return Err(invalid("image span policy must be positive"));}
+        Ok(self.architectural_span_ceiling().map_or(requested,|ceiling| requested.min(ceiling)))
+    }
     pub fn token_geometry(&self) -> cuteafd_core::media::ImageTokenGeometry {
         cuteafd_core::media::ImageTokenGeometry { merge: self.merge,
             row_markers: u32::from(self.family == ImageFamily::Mistral) }
