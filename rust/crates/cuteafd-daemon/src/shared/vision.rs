@@ -147,8 +147,13 @@ pub struct TowerSpec {
     pub native: VisionSpec,
     reads: Vec<TensorRead>,
     constants: Vec<ConstantRegion>,
+    family: Option<cuteafd_loader::media::ImageFamily>,
 }
 impl TowerSpec {
+    pub(crate) fn with_family(mut self, family: cuteafd_loader::media::ImageFamily) -> Self {
+        self.family=Some(family);
+        self
+    }
     /// Family-owned builders provide header plans; shared runtime retains ownership.
     /// Does not advertise executable dispatch or read any tensor payload.
     #[allow(dead_code)] // Consumed by family builders in the next additive step.
@@ -175,7 +180,7 @@ impl TowerSpec {
         constants::validate_regions(&constants, native.weight_bytes,
             ranges.iter().map(|&(start,end)| (start as u64,(end-start) as u64)))
             .map_err(VisionError::Unsupported)?;
-        Ok(Self { native, reads, constants })
+        Ok(Self { native, reads, constants, family: None })
     }
     pub(crate) fn constant_regions(&self) -> &[ConstantRegion] { &self.constants }
     fn validate_constants(&self) -> Result<()> {
@@ -279,12 +284,7 @@ impl TowerSpec {
     pub fn row_markers(&self) -> u32 { u32::from(self.native.reserved == mistral::RESERVED) }
     pub fn image_family(&self) -> cuteafd_loader::media::ImageFamily {
         use cuteafd_loader::media::ImageFamily;
-        if self.native.tower.as_ref().is_some_and(|tower| tower.temporal_patch==1) {
-            return ImageFamily::Kimi;
-        }
-        if self.native.tower.as_ref().is_some_and(|tower| tower.temporal_patch == 2) {
-            return ImageFamily::MiniMax;
-        }
+        if let Some(family)=self.family {return family;}
         match self.native.reserved {
             2 => ImageFamily::Qwen,
             3 => ImageFamily::GlmFlash,
@@ -1149,6 +1149,7 @@ mod tests {
                 transform: ReadTransform::Bf16ToF32,
             }],
             constants:vec![ConstantRegion::fp32("rotary.inv_freq",128,[1.0],"one float","fixture")],
+            family: None,
         };
         let arena = spec.load_weights().unwrap();
         assert_eq!(&arena[0..4], &1.0f32.to_le_bytes());
