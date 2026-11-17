@@ -1192,8 +1192,15 @@ impl Opened {
         } else { cuteafd_loader::serving_capacity::glm_cache_geometry(&self.cfg, layers, devices.len())? };
         let mut pool_facts = cuteafd_loader::placement::PoolFacts::new(&card_bytes, *serving_context,
             requested_pool, page_tokens);
-        pool_facts.memory = cache.ranks.iter().zip(&card_bytes).map(|(rank, &available_bytes)|
-            cuteafd_loader::placement::PoolMemory { available_bytes, bytes_per_unit: rank.persistent_unit_bytes }).collect();
+        // Whole-layer attention splits the replicated record slope between the
+        // cards; heads and context keep the whole latent pool on each.
+        pool_facts.memory = if attention == cuteafd_loader::placement::AttentionPlacement::Layers {
+            vec![cuteafd_loader::placement::PoolMemory { available_bytes: card_bytes.iter().sum(),
+                bytes_per_unit: cache.ranks[0].persistent_unit_bytes }]
+        } else {
+            cache.ranks.iter().zip(&card_bytes).map(|(rank, &available_bytes)|
+                cuteafd_loader::placement::PoolMemory { available_bytes, bytes_per_unit: rank.persistent_unit_bytes }).collect()
+        };
         let pool = cuteafd_loader::placement::prepare_pool(pool_facts)?;
         let maximum_pages = pool.maximum_tokens().div_ceil(page_tokens);
         let prefill = PrefillShape { rows: args.prefill_rows as u64, waves: prefill_lanes as u64 };

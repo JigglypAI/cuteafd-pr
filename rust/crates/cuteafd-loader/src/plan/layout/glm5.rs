@@ -524,8 +524,15 @@ fn placement(report: &PlanReport, input: &crate::plan::PlanInput, options: &Layo
         Some(ml4) => crate::serving_capacity::mistral_large4_cache_geometry(ml4, gpus)?,
         None => crate::serving_capacity::glm_cache_geometry(&cfg, cfg.layers, gpus)?,
     };
-    pool_facts.memory = cache.ranks.iter().zip(card_bytes).map(|(rank, &available_bytes)|
-        crate::placement::PoolMemory { available_bytes, bytes_per_unit: rank.persistent_unit_bytes }).collect();
+    // Whole-layer attention splits the replicated record slope between the
+    // cards; heads and context keep the whole latent pool on each.
+    pool_facts.memory = if attention == crate::placement::AttentionPlacement::Layers {
+        vec![crate::placement::PoolMemory { available_bytes: card_bytes.iter().sum(),
+            bytes_per_unit: cache.ranks[0].persistent_unit_bytes }]
+    } else {
+        cache.ranks.iter().zip(card_bytes).map(|(rank, &available_bytes)|
+            crate::placement::PoolMemory { available_bytes, bytes_per_unit: rank.persistent_unit_bytes }).collect()
+    };
     pool_facts.target = options.target_pool_tokens;
     let pool = crate::placement::prepare_pool(pool_facts)?;
     let maximum_pages = pool.maximum_tokens().div_ceil(page_tokens);
@@ -720,8 +727,15 @@ pub(crate) fn native_layout_with_metadata(checkpoint: &Checkpoint, options: &Lay
         Some(ml4) => crate::serving_capacity::mistral_large4_cache_geometry(ml4, gpu_count)?,
         None => crate::serving_capacity::glm_cache_geometry(&cfg, cfg.layers, gpu_count)?,
     };
-    pool_facts.memory = cache.ranks.iter().zip(card_bytes).map(|(rank, &available_bytes)|
-        crate::placement::PoolMemory { available_bytes, bytes_per_unit: rank.persistent_unit_bytes }).collect();
+    // Whole-layer attention splits the replicated record slope between the
+    // cards; heads and context keep the whole latent pool on each.
+    pool_facts.memory = if attention == crate::placement::AttentionPlacement::Layers {
+        vec![crate::placement::PoolMemory { available_bytes: card_bytes.iter().sum(),
+            bytes_per_unit: cache.ranks[0].persistent_unit_bytes }]
+    } else {
+        cache.ranks.iter().zip(card_bytes).map(|(rank, &available_bytes)|
+            crate::placement::PoolMemory { available_bytes, bytes_per_unit: rank.persistent_unit_bytes }).collect()
+    };
     pool_facts.target = options.target_pool_tokens;
     let pool = crate::placement::prepare_pool(pool_facts)?;
     let maximum_pages = pool.maximum_tokens().div_ceil(page_tokens);
