@@ -11,6 +11,21 @@ while publication requires `all` and complete image inventories.
 
 ## Benchmark panel configuration
 
+Before any timed profile or sweep, the server runs one untimed, authenticated
+warm prelude per serving instance: code, prose, JSON, then code, prose, JSON,
+at the sweep output-token count (192 for a direct profile). The fixed prompts
+and nonces are identical across arms. Existing per-point warm waves remain.
+The prelude receipt is cached by the server; subsequent calls do no inference.
+Missing receipts or a different server-instance identity refuse timing. The
+receipt is embedded in `report.json` and `sweep.json`, including each request's
+cycles, selected mean width and final policy telemetry when exposed. Profiling
+windows open afterward. This is deterministic conditioning, not convergence:
+K3.1 traces show initial width drift over 64-128 cycles, and about 316 cycles
+for one 256-token triple; two triples provide roughly 630 cycles of conditioning.
+Timed request records retain a 120-character opening without classifying it;
+unknown per-request cycle counts are explicitly unavailable, not overlapping
+global-counter estimates.
+
 `cuteafd bench --panels decode_content --panel-config
 'decode_content={"contents":["code"],"temperature":1.0,"top_p":0.95,"seed":42}'`
 runs sampled C1 code decode. `scripts/bench/wip-cards.py` accepts the same

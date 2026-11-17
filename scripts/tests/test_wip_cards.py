@@ -1471,6 +1471,16 @@ def test_binary_without_sweep_fields_is_refused(entry, tmp_path, monkeypatch):
     cards.binary_supports('/new/cuteafd', ROOT, job, ['levels', 'post_load_c1'])
 
 
+def test_old_runner_without_server_prelude_is_refused_before_hardware(entry, tmp_path, monkeypatch):
+    job = make(entry, tmp_path)
+    for marker in ['', 'warm_prelude=client-local']:
+        monkeypatch.setattr(cards.subprocess, 'run', lambda *a, **k: SimpleNamespace(returncode=0, stderr=marker, stdout=''))
+        with pytest.raises(ValueError, match='/old/cuteafd lacks the server-owned warm prelude'):
+            cards.binary_supports('/old/cuteafd', ROOT, job, ['warm_prelude'])
+    monkeypatch.setattr(cards.subprocess, 'run', lambda *a, **k: SimpleNamespace(returncode=0, stderr='warm_prelude=server-v1', stdout=''))
+    cards.binary_supports('/new/cuteafd', ROOT, job, ['warm_prelude'])
+
+
 def test_toolchain_hash_matches_canonical_head_identity():
     canonical = subprocess.run([sys.executable, str(ROOT / 'scripts/build/dev-toolchain.py')],
                                capture_output=True, text=True, check=True).stdout.strip()
@@ -2523,7 +2533,7 @@ def test_every_required_smoke_field_is_advertised_by_the_dry_run():
     # binary_supports looks for FIELD= in the smoke dry-run line; a field wip-cards can
     # require but smoke.rs never prints would refuse every binary, however new.
     source = (ROOT / 'scripts/bench/wip-cards.py').read_text()
-    block = source[source.index("    fields = ['fabric']"):source.index('    for job in {j[\'launcher\'][\'repo\']')]
+    block = source[source.index("    fields = ['fabric', 'warm_prelude']"):source.index('    for job in {j[\'launcher\'][\'repo\']')]
     required = {name for name in re.findall(r"\['([a-z_0-9]+)'\]", block) if name not in ('entry', 'launcher', 'repo')}
     dry_run = (ROOT / 'rust/crates/cuteafd-bench/src/smoke.rs').read_text()
     line = next(text for text in dry_run.splitlines() if 'api_key_file={}' in text)

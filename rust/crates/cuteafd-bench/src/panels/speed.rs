@@ -179,6 +179,7 @@ impl Panel for DecodeContent {
             let acceptance = common::acceptance(before, after);
             rows.push(json!({"content": content, "tok_s": chat.timing.decode_tok_s(),
                 "tokens": chat.timing.completion_tokens, "ttft_s": chat.timing.ttft_s, "acceptance": acceptance,
+                "request": chat.timing,
                 "mapped_tables": common::mapped_interval(&table_before, &common::mapped_counters(ctx.client)),
                 "fabric": ctx.client.fabric_since(fabric_mark, &format!("{}/{}", self.id(), i), true)}));
             let row = rows.last_mut().expect("decode row");

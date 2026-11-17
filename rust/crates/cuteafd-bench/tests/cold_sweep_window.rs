@@ -55,9 +55,9 @@ async fn prefill_purge_precedes_each_warm_up_and_timed_request() {
         let opened = opened_at.lock().unwrap().clone();
         (purged, opened, sweep)
     }).await.unwrap();
-    // Two calibration requests, then per length: purge, warm-up, purge, timed.
-    assert_eq!(purged_at, vec![2, 3, 4, 5]);
-    assert_eq!(opened_at, vec![3]);
+    // Six prelude requests, two sizing requests, then purge/warm/purge/timed.
+    assert_eq!(purged_at, vec![8, 9, 10, 11]);
+    assert_eq!(opened_at, vec![9]);
     assert_eq!(sweep.prefill.len(), 2);
     assert!(sweep.prefill.iter().all(|point| point.idle_seconds == 0.03));
 }

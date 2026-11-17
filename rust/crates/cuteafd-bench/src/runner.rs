@@ -159,6 +159,8 @@ pub struct Bench {
     active: Mutex<Option<ActiveRun>>,
     live: Mutex<HashMap<String, Arc<Mutex<Report>>>>,
     baselines: Mutex<HashMap<String, Baseline>>,
+    prelude: crate::prelude::Prelude,
+    instance: String,
     info: Mutex<Option<ServerInfo>>,
     events: broadcast::Sender<Arc<str>>,
     /// The live console of the in-process server, attached at mount. A run
@@ -189,6 +191,8 @@ impl Bench {
             active: Mutex::new(None),
             live: Mutex::new(HashMap::new()),
             baselines: Mutex::new(HashMap::new()),
+            prelude: crate::prelude::Prelude::default(),
+            instance: uuid::Uuid::new_v4().simple().to_string(),
             info: Mutex::new(None),
             events,
             console: OnceLock::new(),
@@ -428,6 +432,7 @@ impl Bench {
         json!({
             "active": active.as_ref().map(|a| json!({"id": a.id, "panel": a.panel, "fraction": a.fraction,
                 "eta_s": a.eta_s, "elapsed_s": a.started.elapsed().as_secs_f64()})),
+            "server_instance": self.instance,
             "readiness_s": crate::context::readiness_s(),
             "prefill_scoring": if crate::fidelity_dataset::prefill_admitted(&crate::context::get().settings) { Some("streamed") } else { None },
             "draft": crate::context::get().draft_mode(),
@@ -517,6 +522,30 @@ impl Bench {
         Ok(value)
     }
 
+    /// The endpoint owns the same exclusion slot as ordinary benchmark runs.
+    pub(crate) fn warm_prelude(self: &Arc<Self>, tokens: u64) -> anyhow::Result<Value> {
+        if let Some(reason) = self.stopping.get() { return Err(StartError::Stopping(reason.clone()).into()); }
+        let base = crate::context::loopback().ok_or(StartError::NotReady)?;
+        let active = ActiveRun { id: uuid::Uuid::new_v4().simple().to_string(),
+            token: uuid::Uuid::new_v4().simple().to_string(), cancel: Arc::new(AtomicBool::new(false)),
+            started: Instant::now(), eta_s: 900., panel: "warm prelude".into(), fraction: 0. };
+        {
+            let mut slot = self.active.lock().map_err(|_| anyhow::anyhow!("active lock poisoned"))?;
+            if let Some(current) = slot.as_ref() { return Err(StartError::Busy(current.id.clone()).into()); }
+            *slot = Some(active.clone());
+        }
+        struct Release(Arc<Bench>);
+        impl Drop for Release { fn drop(&mut self) { if let Ok(mut slot) = self.0.active.lock() { *slot = None; } } }
+        let _release = Release(self.clone());
+        let mut client = Client::new(&base, Some(active.token), active.cancel).with_local_probes().with_api_key(self.api_key.get().cloned());
+        client.discover()?;
+        self.ensure_prelude(&client, tokens)
+    }
+
+    fn ensure_prelude(&self, client: &Client, tokens: u64) -> anyhow::Result<Value> {
+        self.prelude.ensure(&self.instance, tokens, || crate::prelude::run(client, tokens))
+    }
+
     /// Starts a run; returns its id.
     pub fn start(self: &Arc<Self>, request: RunRequest) -> Result<String, StartError> {
         if let Some(reason) = self.stopping.get() { return Err(StartError::Stopping(reason.clone())); }
@@ -575,6 +604,7 @@ impl Bench {
                 title: panels::find(&p.id).map_or(p.id.clone(), |panel| panel.title().to_string()),
                 ..PanelResult::default() }).collect(),
             fabric: Vec::new(),
+            prelude: None,
             error: (!dropped.is_empty()).then(|| format!("panels not in this build: {}", dropped.join(", "))),
         }));
         // Publish the starting run before its id can reach a polling client.
@@ -668,9 +698,12 @@ impl Bench {
         let max_output = record["max_output_tokens"].as_u64().unwrap_or(4096);
         let info = self.server_info(&client.model);
         let fingerprint = crate::server::fingerprint(&info);
+        let prelude = self.ensure_prelude(&client, crate::sweep::TOKENS)?;
+        crate::prelude::validate(&prelude)?;
         let run_mark = client.thermal_mark();
         {
             let mut r = report.lock().expect("report lock");
+            r.prelude = Some(prelude);
             r.server = info.clone();
             r.fingerprint = fingerprint.clone();
         }

@@ -180,6 +180,18 @@ async fn start(State(bench): State<Arc<Bench>>, connect: Option<ConnectInfo<Sock
 }
 
 #[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PreludeRequest { tokens: u64 }
+
+async fn prelude(State(bench): State<Arc<Bench>>, Json(request): Json<PreludeRequest>) -> Response {
+    match tokio::task::spawn_blocking(move || bench.warm_prelude(request.tokens)).await {
+        Ok(Ok(receipt)) => Json(receipt).into_response(),
+        Ok(Err(error)) => (StatusCode::BAD_REQUEST, format!("{error:#}")).into_response(),
+        Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
+    }
+}
+
+#[derive(serde::Deserialize)]
 struct ProbeRequest {
     body: serde_json::Value,
     #[serde(default)]
@@ -442,6 +454,7 @@ pub fn routes(bench: Arc<Bench>) -> Router {
         .route("/bench/fabric.js", get(fabric_script))
         .route("/v1/bench/status", get(status))
         .route("/v1/bench/probe", post(probe_request))
+        .route("/v1/bench/prelude", post(prelude))
         .route("/v1/bench/panels", get(panels))
         .route("/v1/bench/profiles", get(profiles))
         .route("/v1/bench/profiles/:name", put(save_profile).delete(delete_profile))
@@ -495,7 +508,7 @@ mod tests {
             let chat = call(Method::POST, "/v1/chat/completions", None).await;
             assert_eq!(chat == StatusCode::OK, key.is_none(), "keyless inference is open; a configured key guards it");
             assert_eq!(call(Method::GET, "/v1/bench/status", None).await, StatusCode::OK);
-            for (method, path) in [(Method::GET, "/v1/bench/runs"), (Method::POST, "/v1/bench/probe"), (Method::PUT, "/v1/bench/usage")] {
+            for (method, path) in [(Method::GET, "/v1/bench/runs"), (Method::POST, "/v1/bench/probe"), (Method::POST, "/v1/bench/prelude"), (Method::PUT, "/v1/bench/usage")] {
                 assert_eq!(call(method.clone(), path, None).await, StatusCode::FORBIDDEN, "{path} without credentials");
                 assert_ne!(call(method.clone(), path, Some(("cookie", cookie.clone()))).await, StatusCode::FORBIDDEN, "{path} with the cookie");
                 let bearer = call(method.clone(), path, Some(("authorization", "Bearer op-key".into()))).await;
@@ -700,7 +713,7 @@ mod tests {
 
     #[test]
     fn missing_saved_fidelity_pair_is_explicit_and_updates_partial_only() {
-        let mut report = Report { schema: crate::report::SCHEMA.into(), prompt_content: Some(crate::text::PROMPT_CONTENT.into()), id: "current".into(),
+        let mut report = Report { schema: crate::report::SCHEMA.into(), prelude: None, prompt_content: Some(crate::text::PROMPT_CONTENT.into()), id: "current".into(),
             created: String::new(), finished: None, status: crate::report::RunStatus::Running,
             profile: "fidelity".into(), plan: vec![], server: Default::default(), fingerprint: String::new(),
             baseline: None, panels: vec![crate::report::PanelResult {
