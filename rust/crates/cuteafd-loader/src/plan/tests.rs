@@ -3744,7 +3744,7 @@ fn qwen_spark_encoder_candidate_enforces_its_physical_budget() {
         vision: MediaMode::Spark(Some(0)),
         layout: Some(layout::LayoutOptions {
             host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram), host_cache_bytes: Some(0),
-            rtx_bytes: vec![crate::placement::inventory::PRO_TOTAL_BYTES], pool_tokens: Some(32768), target_pool_tokens: 32768,
+            rtx_bytes: vec![crate::placement::inventory::PRO_TOTAL_BYTES], pool_tokens: Some(32768), target_pool_tokens: Some(32768),
             onboard: Some(crate::placement::OnboardSetting::Layers(1)), ..Default::default()
         }), ..sparks(1)
     };
@@ -5667,7 +5667,7 @@ fn encoder_plan_g9_charges_before_pool_and_hashes_off() {
     let mut tensors = mimo_flash_tensors();
     tensors.push(t("visual.patch_embed.proj.weight", "BF16", &[1280,3,2,16,16]));
     let dir = snapshot_tp(cfg, &tensors, Some(1));
-    let options = PlanOptions { layout: Some(layout::LayoutOptions { host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram), rtx_bytes: vec![crate::placement::inventory::PRO_TOTAL_BYTES], target_pool_tokens: 32_768, ..Default::default() }), ..Default::default() };
+    let options = PlanOptions { layout: Some(layout::LayoutOptions { host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram), rtx_bytes: vec![crate::placement::inventory::PRO_TOTAL_BYTES], target_pool_tokens: Some(32_768), ..Default::default() }), ..Default::default() };
     let spark = plan(dir.path(), &options).unwrap();
     assert!(matches!(spark.encoder.as_ref().unwrap().kind, EncoderKind::Spark { .. }));
     let local = plan(dir.path(), &PlanOptions { vision: MediaMode::Rtx(Some(0)), ..options.clone() }).unwrap();
@@ -6065,7 +6065,7 @@ fn qwen_image_cap_is_visible_and_auto_preserves_zero_spark_kv() {
     let dir = snapshot(cfg.clone(), &tensors);
     write_quantize_config(dir.path(), &manifest);
     let options = PlanOptions { placement: ExpertPlacement::Local, layout: Some(layout::LayoutOptions { host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram),
-        rtx_bytes: vec![crate::placement::inventory::PRO_TOTAL_BYTES], pool_tokens: Some(32768), target_pool_tokens: 32768,
+        rtx_bytes: vec![crate::placement::inventory::PRO_TOTAL_BYTES], pool_tokens: Some(32768), target_pool_tokens: Some(32768),
         ..Default::default()
     }), ..Default::default() };
     let auto = plan(dir.path(), &options).unwrap();
@@ -6895,7 +6895,7 @@ fn mimo_and_qwen_all_onboarded_preserve_media_only_spark_and_refuse_unavailable_
             host_cache_bytes: Some(0),
             rtx_bytes: vec![crate::placement::inventory::PRO_TOTAL_BYTES],
             pool_tokens: Some(32768),
-            target_pool_tokens: 32768,
+            target_pool_tokens: Some(32768),
             onboard: Some(crate::placement::OnboardSetting::Layers(1)),
             ..Default::default()
         }),

@@ -974,9 +974,10 @@ mod tests {
             let reserve = crate::placement::families::mimo_v2::admission::device_headroom();
             assert_eq!(reserve, cuteafd_core::memory_policy::MemoryPolicy::current().release_padding());
             profile.steady.devices[0].reserve_bytes = reserve;
-            let policy = CapacityPolicy { concurrency: 4,
-                target_pool_tokens: None,
-                max_context_tokens: Some(1 << 20), ..Default::default() };
+            let pool = crate::placement::prepare_pool(crate::placement::PoolFacts::new(
+                &[total], 1 << 20, None, profile.steady.pool_unit_rows));
+            let mut policy = pool.capacity_policy(4);
+            policy.pool_tokens = None;
             let admitted = resolve_capacity_with_startup_peaks(policy, &profile.steady,
                 &[DeviceMemory { device: 0, total_bytes: total, baseline_free_bytes: total - baseline }],
                 &[]).unwrap();

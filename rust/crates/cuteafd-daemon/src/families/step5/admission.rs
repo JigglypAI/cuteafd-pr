@@ -333,6 +333,10 @@ mod tests {
                     Some(&path), unit, ranks, waves, cuteafd_loader::placement::Onboard::Auto)?,
             };
             let live = checkpoint_admission(&checkpoint, &inputs);
+            if let (Some(ledger), Ok(admitted)) = (&report.phase_ledger, &live) {
+                assert_eq!(ledger.pool_policy, admitted.solved.pool_policy,
+                    "Step-5 public plan and serve must carry identical resolved policy");
+            }
             if !report.wip_launchable() {
                 let error = live.err().expect("both edges must refuse the unsupported allocation");
                 let refusal = error.to_string();
