@@ -358,7 +358,8 @@ pub fn spark_owners(catalog: &crate::OfficialV41Catalog, inputs: &RuntimeInputs)
     use cuteafd_core::memory_layout::Item;
     let ranks = inputs.inventory.spark_ranks;
     if ranks == 0 { return Ok(Vec::new()); }
-    let routed = catalog.routed_experts().routed_layers();
+    let shape = catalog.routed_experts();
+    let routed = (shape.first_layer..shape.layers).collect::<Vec<_>>();
     let backend = crate::plan::spark_executions::SparkBackend::for_catalog(catalog)?;
     let executions = crate::plan::spark_executions::admit_family("step5", &backend.exports(), None,
         inputs.unit_rows() as u64, inputs.waves as u64)?;

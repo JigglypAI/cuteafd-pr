@@ -445,6 +445,79 @@ mod tests {
     }
 
     #[test]
+    fn joint_spark_owners_match_startup_assignments_for_fp8_mc_and_nvfp4() -> Result<()> {
+        use cuteafd_core::memory_layout::{Category, DeviceKind};
+        use crate::shared::placement::SparkAdmission;
+        for kind in ["fp8", "mc", "nvfp4"] {
+            let dir = tempfile::tempdir()?;
+            if kind == "mc" {
+                testing::write_step5_exl3_snapshot(dir.path());
+            } else {
+                let (config, tensors) = testing::step5_fixture(kind);
+                testing::write_snapshot(dir.path(), &config, &tensors, None);
+            }
+            let manifest = testing::step5_native_manifest(dir.path());
+            let (gpus, sparks) = if kind == "nvfp4" { (1, 4) } else { (2, 6) };
+            let view = plan::checkpoint::CheckpointView::select(dir.path(), plan::checkpoint::CoreView::Original)?;
+            let input = plan::PlanInput::open_view(&view)?;
+            let report = input.plan(&PlanOptions {
+                placement: ExpertPlacement::Sparks { ranks: sparks },
+                draft_ownership: Some(plan::spec::DraftOwnership::None),
+                layout: Some(LayoutOptions {
+                    host_memory: Some(testing::SimulatedHost::raptor().host_ram),
+                    rtx_bytes: vec![inventory::PRO_TOTAL_BYTES; gpus], pool_tokens: Some(262_144),
+                    context_tokens: 262_144, workspace_manifest: Some(manifest),
+                    ..Default::default()
+                }), ..Default::default()
+            })?;
+            ensure!(report.wip_launchable(), "{kind}: {:?}", report.hints);
+            let catalog = input.expert_catalog()?;
+            let placement = report.solver_placement.as_ref().context("joint placement")?;
+            let routed = catalog.routed_experts();
+            let working = SparkWorkingSet {
+                rtx_layers: (routed.first_layer..routed.layers).filter(|&layer|
+                    !matches!(placement.layers[layer].experts, ExpertHome::Spark)).collect(),
+                spark_layers: (routed.first_layer..routed.layers).filter(|&layer|
+                    matches!(placement.layers[layer].experts, ExpertHome::Spark)).collect(),
+                spark_ranks: sparks, prefill_lanes: 1,
+            };
+            let rows = report.prefill_unit_rows.context("prefill unit")?;
+            let waves = report.prefill_waves.context("prefill waves")?;
+            let backend = plan::spark_executions::SparkBackend::for_catalog(catalog)?;
+            let endpoint = cuteafd_core::SparkEndpoint { ring_depth: None, capacity: rows.try_into()?,
+                ingress: if kind == "nvfp4" { cuteafd_core::SparkIngress::Bf16 }
+                    else { cuteafd_core::SparkIngress::Native }, partial_reply_bytes: None };
+            let model = super::super::serve::spark_model(&backend.exports(), endpoint, waves, 1, 64 << 20)?;
+            let startup = SparkAdmission::plan_view(&view, cuteafd_core::ExpertGeometry::STEP5,
+                Some(catalog), &working, sparks, model, None)?;
+            let (_, assignments) = startup.admitted();
+            for device in report.memory_layout.as_ref().context("joint memory")?.devices.iter()
+                .filter(|device| device.kind == DeviceKind::Spark) {
+                let assignment = &assignments[device.index as usize];
+                let experts: u64 = device.items.iter().filter(|item| item.category == Category::Experts)
+                    .map(|item| item.bytes).sum();
+                assert!(experts > 0, "{kind}: {}", device.name());
+                assert_eq!(experts, assignment.resident_bytes, "{kind}: {} weights", device.name());
+                for (group, expected) in [
+                    ("expert intake", assignment.io.intake),
+                    ("host expert exchange", assignment.io.host_exchange),
+                    ("expert row indices", assignment.io.row_indices),
+                    ("endpoint response prefixes", assignment.io.endpoint_staging),
+                    ("rdma rings", assignment.io.mapped_rings),
+                ] {
+                    let bytes: u64 = device.items.iter().filter(|item|
+                        item.category == Category::Transport && item.group == group).map(|item| item.bytes).sum();
+                    assert_eq!(bytes, expected, "{kind}: {} {group}", device.name());
+                }
+                assert!(device.items.iter().any(|item| item.group == "execution owners" && item.bytes > 0));
+                eprintln!("Step-5 {kind} {}: experts={experts} rings={} total={}",
+                    device.name(), assignment.io.mapped_rings, device.used_bytes());
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
     fn shared_native_allocation_constants_match_ffi_owners() -> Result<()> {
         assert_eq!(
             std::mem::size_of::<cuteafd_ffi::peer_exchange::PeerProgress>(),
