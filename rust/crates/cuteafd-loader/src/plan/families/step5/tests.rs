@@ -704,9 +704,10 @@ fn official_nested_inventory_separates_target_tail_mtp_vision() {
     let result = report(dir.path(),1,96,6,Some(262_144));
     assert!(result.config_error.is_none(),"{:?}",result.config_error);
     assert!(result.unclassified.is_empty(),"{:?}",result.unclassified);
-    assert!(!result.executable() && !result.wip_launchable() && !result.native_serving_admitted);
-    assert!(result.components.iter().any(|c| c.status != Status::Ready));
-    assert!(result.hints.iter().any(|hint|hint.what.contains("unqualified")));
+    assert!(result.executable() && result.wip_launchable() && result.native_serving_admitted);
+    assert_eq!(result.onboard_layers, Some(0));
+    assert!(result.memory_layout.as_ref().unwrap().notes.iter()
+        .any(|note| note.contains("unimplemented (#2429)")));
     assert_eq!(result.min_spark_ranks,Some(6));
 }
 

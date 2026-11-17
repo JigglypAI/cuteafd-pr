@@ -110,13 +110,23 @@ impl StillEncoder {
     pub fn require_spark_worker(&self, variables: &[Variable], requires: &mut Vec<Requires>) {
         let Some(encoder) = variables.iter().position(|v| matches!(v, Variable::Encoder(_))) else { return; };
         for (option, placement) in self.candidates.iter().enumerate() {
-            for _rank in placement.spark_ranks() {
+            for rank in placement.spark_ranks() {
                 let mut retained = Vec::new();
                 // Families here have one ordered onboarding prefix shared by every Spark.
                 for (variable, domain) in variables.iter().enumerate() {
                     if let Variable::Onboard { layers, counts, .. } = domain {
                         retained.extend(counts.iter().enumerate().filter(|(_, count)| **count < layers.len())
                             .map(|(option, _)| Choice { variable, option }));
+                    }
+                }
+                if !variables.iter().any(|domain| matches!(domain, Variable::Onboard { .. })) {
+                    for (variable, domain) in variables.iter().enumerate() {
+                        if let Variable::ExpertHome { layers, rank_sets } = domain {
+                            if !layers.is_empty() {
+                                retained.extend(rank_sets.iter().enumerate().filter(|(_, ranks)| ranks.contains(&(rank as u8)))
+                                    .map(|(option, _)| Choice { variable, option }));
+                            }
+                        }
                     }
                 }
                 requires.push(Requires { when: Choice { variable: encoder, option }, any_of: retained });
@@ -175,7 +185,9 @@ mod tests {
                     resident_weights: vec![], allocation_granularity: vec![], driver_page_tables: vec![] });
                 contract.variables.extend([Variable::Prefill(vec![PrefillShape { rows: 64, waves: 1 }]),
                     Variable::Lanes(vec![1])]);
+                contract.variables.push(Variable::ExpertHome { layers: vec![0], rank_sets: vec![vec![0]] });
                 encoder.extend(&mut contract.variables, &mut contract.components, 1).unwrap();
+                encoder.require_spark_worker(&contract.variables, &mut contract.requires);
                 let budgets = [Location::coordinator(0), location].into_iter().enumerate().map(|(i, location)|
                     Budget { id: format!("device{i}"), locations: vec![location], physical_bytes: 64 << 20,
                         logical_bytes: 64 << 20, headroom: 0,
