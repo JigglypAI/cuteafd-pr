@@ -23,6 +23,11 @@ pub fn template_context(body: &Value, options: &MiniMaxPromptOptions) -> Result<
     for (index, message) in messages.iter_mut().enumerate() {
         if !message.is_object() { return Err(format!("messages[{index}] must be an object")); }
         if message["content"].is_null() { message["content"] = Value::Null; }
+        if let Some(parts) = message.get_mut("content").and_then(Value::as_array_mut) {
+            for part in parts {
+                if part["type"]=="image_url" { *part=json!({"type":"image"}); }
+            }
+        }
         if let Some(calls) = message.get_mut("tool_calls").filter(|v| !v.is_null()) {
             for call in calls.as_array_mut().ok_or("tool_calls must be an array")? {
                 let args = &mut call["function"]["arguments"];

@@ -1312,8 +1312,10 @@ def _assert_real_deployment_ledger(deployment: dict) -> None:
             placement = role.get(field)
             if placement is None:
                 continue
-            weights = [item for item in device["items"]
-                       if item["group"] in (f"{prefix} weights", f"{prefix} tower")]
+            if prefix == "vision":
+                assert not any(item["group"] in ("vision weights", "vision tower") for item in device["items"]), (role, device)
+            weight_groups = ("vision packed weight arena",) if prefix == "vision" else ("audio weights", "audio tower")
+            weights = [item for item in device["items"] if item["group"] in weight_groups]
             scratch = [item for item in device["items"] if item["group"] == f"{prefix} scratch"]
             overhead = [item for item in device["items"] if item["group"] == f"{prefix} CUDA overhead"]
             assert len(weights) == 1 and weights[0]["bytes"] == placement["weights"], (role, device)
@@ -1338,13 +1340,13 @@ def _shared_tower_expert_deployment() -> dict:
             "memory_layout": {"devices": [{"kind": "spark", "index": 2,
                 "worker_budget_bytes": 100, "items": [
                     {"group": "routed_expert", "bytes": 30},
-                    {"group": "vision weights", "bytes": 20},
+                    {"group": "vision packed weight arena", "bytes": 20},
                     {"group": "vision scratch", "bytes": 6},
                     {"group": "vision CUDA overhead", "bytes": 2}]}]}}
 
 
 @pytest.mark.parametrize("defect", ["duplicate_device", "missing_device", "missing_ceiling",
-                                  "duplicate_weights", "duplicate_scratch", "wrong_scratch"])
+                                  "duplicate_weights", "duplicate_scratch", "wrong_scratch", "legacy_weights", "legacy_tower", "wrong_weights"])
 def test_real_deployment_ledger_rejects_inconsistent_physical_owners(defect):
     deployment = _shared_tower_expert_deployment()
     devices = deployment["memory_layout"]["devices"]
@@ -1359,6 +1361,10 @@ def test_real_deployment_ledger_rejects_inconsistent_physical_owners(defect):
         device["items"].append(device["items"][1].copy())
     elif defect == "duplicate_scratch":
         device["items"].append(device["items"][2].copy())
+    elif defect in ("legacy_weights", "legacy_tower"):
+        device["items"][1]["group"] = "vision weights" if defect == "legacy_weights" else "vision tower"
+    elif defect == "wrong_weights":
+        device["items"][1]["bytes"] += 1
     else:
         device["items"][2]["bytes"] += 1
     with pytest.raises(AssertionError):

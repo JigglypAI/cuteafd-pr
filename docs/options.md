@@ -11,6 +11,21 @@ while publication requires `all` and complete image inventories.
 
 ## Benchmark panel configuration
 
+Before any timed profile or sweep, the server runs one untimed, authenticated
+warm prelude per serving instance: code, prose, JSON, then code, prose, JSON,
+at the sweep output-token count (192 for a direct profile). The fixed prompts
+and nonces are identical across arms. Existing per-point warm waves remain.
+The prelude receipt is cached by the server; subsequent calls do no inference.
+Missing receipts or a different server-instance identity refuse timing. The
+receipt is embedded in `report.json` and `sweep.json`, including each request's
+cycles, selected mean width and final policy telemetry when exposed. Profiling
+windows open afterward. This is deterministic conditioning, not convergence:
+K3.1 traces show initial width drift over 64-128 cycles, and about 316 cycles
+for one 256-token triple; two triples provide roughly 630 cycles of conditioning.
+Timed request records retain a 120-character opening without classifying it;
+unknown per-request cycle counts are explicitly unavailable, not overlapping
+global-counter estimates.
+
 `cuteafd bench --panels decode_content --panel-config
 'decode_content={"contents":["code"],"temperature":1.0,"top_p":0.95,"seed":42}'`
 runs sampled C1 code decode. `scripts/bench/wip-cards.py` accepts the same
@@ -514,6 +529,12 @@ for its entire invocation, including container creation, native cache keys and
 sealed metadata, so a concurrent default-tag move cannot change its build inputs.
 Versioned `tc-*` image tags remain available for older checkouts.
 
+`./wip.sh --from-slot NAME` reuses that slot's seed within the selected
+`WIP_INSTANCE`/`WIP_ROOT`, rather than choosing the least-loaded seed. New
+builds record `slots/NAME/seed-host`; older slots are located with bounded
+instance-container probes. An explicit `--seed HOST` that conflicts with the
+source seed fails with the host and source path before cloning.
+
 The host-only environment overrides `CUTEAFD_SPARKNEST_RUN_DIR` and
 `CUTEAFD_FUSE_SYSFS_ROOT` select the source directories for the optional
 read-only SparkNest control and FUSE connection mounts (defaults
@@ -695,12 +716,12 @@ Each key is also a global `cuteafd` flag (`--gpu-memory-cap`, `--kv-max-tokens`,
 
 | Key | Default | Values | Notes |
 | --- | --- | --- | --- |
-| `SPECULATOR` | family default | `auto` (Qwen4/Kimi), `off`, `dflash2`, `dspark`, `mtp` | Which fail is in the table below. |
+| `SPECULATOR` | family default | `auto` (Qwen4/Kimi), `off`, `dflash2`, `dspark`, `mtp` | An eligible Kimi/GLM Flash automatic external drafter must be installed, including its config; a missing checkpoint fails with a `nest hf download` command rather than silently serving without speculation. Explicit `off` and unsupported automatic targets remain off. K3.1 pairing reads verifier model/architecture declarations and target hidden/vocabulary/tap/mask dimensions from checkpoint metadata, including MC source identity; no checkpoint revision or core-view allowlist is used. Pairing mismatches name the field and refuse launch. |
 | `SPECULATOR_MODEL_ID` | family default | HF repo id | External drafter checkpoint. |
 | `SPECULATOR_MODEL_REVISION` | empty | 40–64 lowercase hex | Drafter revision. |
 | `SPECULATOR_DEPTH` | 3 for local Qwen/Step-5, else 1 | positive int | Native MTP draft depth. |
 | `DRAFT_LENGTH` | unset (adaptive) | positive int | Fixed verified draft tokens per step: min(value, native head width), further capped by the existing row budget at high concurrency. Overrides `DRAFT_POLICY`; statistics still recorded. Every family and speculator (DFlash2, dSpark, MTP, Markov). V4.1 adaptive maximum remains 5 when unset; fixed supports up to 7. Without a speculator it is ignored with one startup log; reports and cards say `no speculation`. |
-| `SPECULATOR_FP8` | `auto` | `auto`, `on`, `off` | GLM/Qwen/MiMo/Kimi drafter precision: `on` converts projection matrices to single-copy FP8. Kimi block DSpark supports TP1 and physical TP2 with native BF16 norms/Markov tensors; `auto` selects FP8 for qualified K3.1 MC original/K6 on TP1/TP2; explicit `off` keeps BF16. Independent of `DRAFT_KV_CACHE`. |
+| `SPECULATOR_FP8` | `auto` | `auto`, `on`, `off` | GLM/Qwen/MiMo/Kimi drafter precision: `on` converts projection matrices to single-copy FP8. Kimi block DSpark supports TP1 and physical TP2 with native BF16 norms/Markov tensors; `auto` selects FP8 for content-paired K3.1 DSpark in every core view and layout; explicit `off` keeps BF16. Independent of `DRAFT_KV_CACHE`. |
 | `DRAFT_POLICY` | unset | `shared`, `simple`, `simple-rc`, `simple-derived` | Drafter block policy: unset selects `simple` for every family; the others are explicit opt-ins. Shared prices draft/skip actions per concurrency bucket and collects per-layer timing. |
 | `DRAFT_ROW_COST` | unset | `linear`, `power`, `log` | Drafter row cost model diagnostic. |
 | `DRAFT_SURVIVAL_LENGTHS` | `off` | `on`, `off` | Record draft survival lengths. |
@@ -788,7 +809,9 @@ uneven-completion drain penalty; sustained C8/C16 measurements in #2261 select
 the throughput arm. Sampled acceptance is not directly comparable to Inferact's
 reported 4.16 because its draft sampling/rejection method differs (#2312). `TP2_DFLASH` does not select this GQA split.
 
-Kimi K3, MiniMax and Step-5 production serving remain text-only; dense Qwen
+MiniMax defaults to its bundled still-image tower (`VISION=auto`), placed
+Spark-first with RTX fallback by joint admission. `VISION=off` keeps text-only
+serving and rejects image chat. Kimi K3 and Step-5 production serving remain text-only; dense Qwen
 has media off. Kimi and MiniMax `plan --layout` now reserve their bundled
 still-image tower as an independent packed arena plus phase-peak scratch,
 Spark-first with RTX fallback in the joint admission solve. Planning does not
@@ -983,7 +1006,7 @@ Speculator (`SPECULATOR`):
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | `off` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ (default) |
 | `dflash2` | ✗ | ✗ | ✓ (default) | ✓ (default) | ✓ | ✗ | ✗ | ✓ (default) | ✗ | ✓ (default) | ✗ |
-| `dspark` | ✓ (default) | ✓ (default) | ✓ (Mistral Large 4 only) | ✓ | ✗ | ✗ | ✓ (default unless hidden is 5120) | ✓ (K3.1 MC original/K6 TP1/TP2 default; otherwise opt-in) | ✗ | ✗ | ✗ |
+| `dspark` | ✓ (default) | ✓ (default) | ✓ (Mistral Large 4 only) | ✓ | ✗ | ✗ | ✓ (default unless hidden is 5120) | ✓ (content-paired K3.1 default in every view/layout; otherwise opt-in) | ✗ | ✗ | ✗ |
 | `mtp` | ✗ | ✗ | ✗ | ✗ | ✓ | ✓ (default) | ✓ (local EXL3/NVFP4 default, depth 3) | ✗ | ✓ (default) | ✗ | ✗ |
 
 Qwen4 unset/`auto` selects native MTP (depth 3) only for qualified local

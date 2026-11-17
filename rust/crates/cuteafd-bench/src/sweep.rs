@@ -28,6 +28,8 @@ pub const OMIT_TOKENS: u64 = 0;
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct Point {
     pub c: usize,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub requests: Vec<crate::report::StreamTiming>,
     /// `levels`, `post_load` (C1 after the widest level) or `post_load_repeat` (that C1 re-sending the levels C1's prompts).
     pub phase: String,
     pub aggregate_tok_s: f64,
@@ -136,6 +138,8 @@ impl PrefillOptions<'_> {
 pub struct Sweep {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt_content: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prelude: Option<Value>,
     pub points: Vec<Point>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub prefill: Vec<PrefillPoint>,
@@ -236,7 +240,7 @@ fn measure(client: &Client, c: usize, phase: &str, repeat: Option<&Prompts>, tok
     }
     let mut per: Vec<f64> = ok.iter().map(|r| r.chat.timing.decode_tok_s()).collect();
     let mut ttft: Vec<f64> = ok.iter().map(|r| r.chat.timing.ttft_s).collect();
-    let point = Point { c, phase: phase.into(), aggregate_tok_s: aggregate(&ok), per_request_tok_s: median(&mut per),
+    let point = Point { c, requests: ok.iter().map(|r| r.chat.timing.clone()).collect(), phase: phase.into(), aggregate_tok_s: aggregate(&ok), per_request_tok_s: median(&mut per),
         ttft_s: median(&mut ttft), errors, thermal, fabric, mapped_tables, expert_usage,
         context: c1.map(|x| x.0), seed: c1.map(|x| x.1),
         prompt_sha256: c1.map(|_| format!("{:x}", Sha256::digest(prompts.timed[0].as_bytes()))),
@@ -401,7 +405,8 @@ fn run_configured(url: &str, api_key: Option<&str>, levels: &[usize], post_load_
     let mut client = Client::new(url, None, Arc::new(AtomicBool::new(false))).with_api_key(key).with_fabric(fabric);
     let _subscription = client.fabric_subscription();
     let record = client.discover().context("sweep: /v1/models")?;
-    let mut sweep = Sweep { prompt_content: Some(crate::text::PROMPT_CONTENT.into()), ..Sweep::default() };
+    let prelude = client.warm_prelude(if tokens == 0 { TOKENS } else { tokens })?;
+    let mut sweep = Sweep { prompt_content: Some(crate::text::PROMPT_CONTENT.into()), prelude: Some(prelude), ..Sweep::default() };
     if !prefill_lengths.is_empty() {
         let max_context = record["max_context_tokens"].as_u64().unwrap_or(8192);
         let mark = client.thermal_mark();

@@ -1405,7 +1405,7 @@ pub fn resolve_encoder(report: &mut PlanReport, towers: &Towers, rtx: &mut [Devi
         placement.shortfall = 0;
     }
     let add = |d: &mut DeviceLayout| {
-        d.items.push(Item::new(Category::Weights, "vision tower", "BF16 + FP32 vectors", placement.weights, Basis::Formula));
+        d.items.push(Item::new(Category::Weights, crate::media::still_tower::vision_weight_arena_label(), "BF16 + FP32 vectors", placement.weights, Basis::Formula));
         let spark_overhead = if hardware.v41 && d.kind == DeviceKind::Spark {
             super::encoder::V41_SPARK_CUDA_OVERHEAD_BYTES
         } else { 0 };

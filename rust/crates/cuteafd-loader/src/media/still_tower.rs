@@ -3,6 +3,9 @@
 use crate::{plan::Checkpoint, serving_capacity::WeightArenaLayout};
 use anyhow::{ensure, Context, Result};
 
+/// Ledger identity for a packed tower backing, independent of its family or owner.
+pub const fn vision_weight_arena_label() -> &'static str { "vision packed weight arena" }
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StillTowerKind { Kimi, MiniMax, Inkling2, Step5 }
 

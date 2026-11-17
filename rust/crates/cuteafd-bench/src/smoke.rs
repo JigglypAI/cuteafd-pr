@@ -20,7 +20,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::os::unix::process::CommandExt;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -1108,7 +1108,7 @@ pub fn run(args: SmokeArgs) -> Result<()> {
     check_nested_holds(&pending)?;
     if args.dry_run {
         for e in &pending {
-            eprintln!("  {} api_key_file={} family={} gpus={:?} sparks={:?} locks={:?} levels={:?} post_load_c1={} post_load_repeat={} prefill_lengths={:?} prefill_repeat={} prefill_idle_seconds={} prefill_purge={} sweep_tokens={} baseline={} window={} lossless_set={} lossless_dump={:?} lossless_concurrency={} context_lengths={:?} context_levels={:?} context_suffix={} panel_config={} fabric={} worker_stop={} set={:?}",
+            eprintln!("  {} api_key_file={} family={} gpus={:?} sparks={:?} locks={:?} levels={:?} post_load_c1={} post_load_repeat={} prefill_lengths={:?} prefill_repeat={} prefill_idle_seconds={} prefill_purge={} sweep_tokens={} baseline={} window={} lossless_set={} lossless_dump={:?} lossless_concurrency={} context_lengths={:?} context_levels={:?} context_suffix={} panel_config={} fabric={} worker_stop={} warm_prelude=server-v1 set={:?}",
                 e.name, e.set.get("API_KEY_FILE").map_or("-", String::as_str), e.family.as_deref().unwrap_or("?"), e.gpus, e.sparks, locks_for(e), e.levels,
                 e.post_load_c1.unwrap_or(false), e.post_load_repeat.unwrap_or(false), e.prefill_lengths,
                 e.prefill_repeat.unwrap_or(false), e.prefill_idle_seconds.unwrap_or(0.0), e.prefill_purge.is_some(),
@@ -1637,6 +1637,12 @@ fn run_entry(entry: &Entry, repo: &Path, out_root: &Path, configs: &Path, logs: 
         let api_key = std::env::var("CUTEAFD_API_KEY").ok().or_else(|| config.get("API_KEY_FILE")
             .and_then(|file| std::fs::read_to_string(file).ok()).map(|key| key.trim().to_string()).filter(|k| !k.is_empty()));
         let sweeping = entry.levels.is_some() || entry.prefill_lengths.is_some();
+        let prelude = {
+            let key = api_key.as_deref().map(cuteafd_api::openai::auth::ApiKey::new).transpose().map_err(anyhow::Error::msg)?;
+            let client = crate::client::Client::new(&url, None, Arc::new(AtomicBool::new(false))).with_api_key(key);
+            let tokens = entry.sweep_tokens.unwrap_or(crate::sweep::TOKENS);
+            client.warm_prelude(if tokens == 0 { crate::sweep::TOKENS } else { tokens })?
+        };
         let run_sweep = || -> Result<crate::sweep::Sweep> {
             let open: crate::sweep::OnTimed = entry.window.as_ref().map(|window| -> Box<dyn FnOnce() -> Result<()> + '_> {
                 Box::new(|| {
@@ -1684,6 +1690,7 @@ fn run_entry(entry: &Entry, repo: &Path, out_root: &Path, configs: &Path, logs: 
             lossless_set: entry.lossless_set.as_ref().map(|p| crate::panels::lossless::CaseSet::load(&repo.join(p)))
                 .transpose()?, lossless_dump: entry.lossless_dump.clone(), lossless_concurrency: entry.lossless_concurrency, context_lengths: entry.context_lengths.clone(), context_levels: entry.context_levels.clone(), context_suffix: entry.context_suffix, panel_config: entry.panel_config.clone() };
         let (mut report, dir) = crate::cli::run(&options)?;
+        anyhow::ensure!(report.prelude.as_ref() == Some(&prelude), "server changed warm prelude receipt before timing");
         // Publication markers are runner metadata, not serving defaults. This
         // also works against images built before these markers existed.
         for (key, name) in [("BENCH_SIMULATED", "simulated"), ("BENCH_HARDWARE_CLASS", "hardware.class")] {

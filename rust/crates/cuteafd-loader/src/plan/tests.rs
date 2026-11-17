@@ -5575,7 +5575,7 @@ fn encoder_plan_g9_charges_before_pool_and_hashes_off() {
     let local = plan(dir.path(), &PlanOptions { vision: MediaMode::Rtx(Some(0)), ..options.clone() }).unwrap();
     assert_eq!(local.encoder.as_ref().unwrap().kind, EncoderKind::Rtx { gpu:0 });
     let memory = local.memory_layout.as_ref().unwrap();
-    let tower = memory.devices[0].items.iter().position(|i| i.group == "vision tower").unwrap();
+    let tower = memory.devices[0].items.iter().position(|i| i.group == crate::media::still_tower::vision_weight_arena_label()).unwrap();
     let pool = memory.devices[0].items.iter().position(|i| i.group == "records").unwrap();
     assert!(tower < pool, "{:?}", memory.devices[0].items);
     let off = plan(dir.path(), &PlanOptions { vision: MediaMode::Off, ..options }).unwrap();
@@ -5793,7 +5793,7 @@ fn mimo_spark_tower_sees_rank_io_under_a_tight_spark_budget() {
     let host = memory.devices.iter().find(|d| d.kind == DeviceKind::Spark && d.index as usize == rank).unwrap();
     let sum = |groups: &[&str]| host.items.iter().filter(|i| groups.contains(&i.group.as_str())).map(|i| i.bytes).sum::<u64>();
     let io = sum(&["expert waves", "expert intake", "host expert exchange", "expert row indices", "rdma rings"]);
-    let tower = sum(&["vision tower", "vision scratch"]);
+    let tower = sum(&[crate::media::still_tower::vision_weight_arena_label(), "vision scratch"]);
     assert!(io > 0 && tower > 0, "{}", memory.render());
     let allocated: u64 = host.items.iter().filter(|i| i.category != Category::Reserved).map(|i| i.bytes).sum();
     // Room for the tower and its 1 GiB guard only if the rank I/O were invisible.
@@ -5985,7 +5985,7 @@ fn qwen_image_cap_is_visible_and_auto_preserves_zero_spark_kv() {
     // The tower is the solve's choice: its owners are admitted device items.
     let rtx = &auto.memory_layout.as_ref().unwrap().devices[0];
     let tower = |group: &str| rtx.items.iter().filter(|i| i.group == group).map(|i| i.bytes).sum::<u64>();
-    assert_eq!((tower("vision tower"), tower("vision scratch")), (898_680_904, 447_778_048));
+    assert_eq!((tower(crate::media::still_tower::vision_weight_arena_label()), tower("vision scratch")), (898_680_904, 447_778_048));
     let ledger = auto.phase_ledger.as_ref().expect("recipe phase ledger");
     assert!(ledger.budgets.iter().any(|b| b.id == "host"));
     // Pool first: where the tower and the pinned pool cannot both fit, Auto
@@ -5999,7 +5999,7 @@ fn qwen_image_cap_is_visible_and_auto_preserves_zero_spark_kv() {
     assert_eq!(declined.kind, EncoderKind::Off, "{}", render(&crowded));
     assert!(declined.reason.contains("pool-first"), "{}", declined.reason);
     assert_eq!(crowded.memory_layout.as_ref().unwrap().pool_tokens, 32768);
-    assert!(!crowded.memory_layout.as_ref().unwrap().devices[0].items.iter().any(|i| i.group == "vision tower"));
+    assert!(!crowded.memory_layout.as_ref().unwrap().devices[0].items.iter().any(|i| i.group == crate::media::still_tower::vision_weight_arena_label()));
     let off = plan(dir.path(), &PlanOptions { vision: MediaMode::Off, ..options.clone() }).unwrap();
     assert_eq!(off.max_image_tokens, Some(1024));
     assert_eq!(off.encoder.as_ref().unwrap().kind, EncoderKind::Off);
