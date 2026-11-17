@@ -271,3 +271,14 @@ def test_inactive_generic_tower_inventory_is_unique_and_has_dynamic_attention_fi
     assert "cuteafd_internal_vision_tower_oracle" not in header
     cmake = (ROOT / "native/CMakeLists.txt").read_text()
     assert "add_library(cuteafd_vision_tower_oracle" not in cmake
+    assert "cuteafd_internal_vision_tower_teacher" not in header
+    assert "using TowerTeacherInput = const uint16_t* (*)(void*, int32_t, int32_t, int32_t);" in native
+    teacher = native.split('extern "C" int32_t cuteafd_internal_vision_tower_teacher', 1)[1].split('extern "C"', 1)[0]
+    assert "if(!o->spec.tower)return cudaErrorInvalidValue;" in teacher
+    assert "rc=drain(o,0);if(rc)return rc;" in teacher
+    encode = (ROOT / "native/shared/cuda/vision_tower_encode.cuh").read_text()
+    assert "if(!o->teacher_input)return 0;" in encode
+    assert "cudaMemcpyHostToDevice,o->stream" in encode
+    assert "return drain(o,rc);" in encode
+    assert "generic_teacher_boundary(o,0,b.x,n,h)" in encode
+    assert "if(layer+1<s.depth)GENERIC_RUN(generic_teacher_boundary(o,int(layer)+1,b.x,n,h));" in encode

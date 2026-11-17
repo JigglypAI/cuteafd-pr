@@ -30,6 +30,8 @@ static_assert(sizeof(cuteafd_vision_tower_projector) == 56, "generic tower proje
 static_assert(sizeof(cuteafd_vision_tower) == 304, "generic tower extension ABI");
 static_assert(sizeof(cuteafd_vision_spec) == 272, "vision pointer/count ABI");
 
+// Private teacher callback returns host BF16 input, never a mutable device view.
+using TowerTeacherInput = const uint16_t* (*)(void*, int32_t, int32_t, int32_t);
 namespace {
 constexpr size_t BLAS_BYTES = 4 * 1024 * 1024;
 constexpr int HIDDEN = 1280, INTER = 4608, MERGED = 5120, PATCH = 1536, CHUNK = 4096;
@@ -41,6 +43,8 @@ struct Owner {
   cuteafd_vision_perception perception{};
   cuteafd_vision_tower generic_tower{};
   GenericTowerStorage generic_storage{};
+  TowerTeacherInput teacher_input = nullptr;
+  void* teacher_context = nullptr;
   std::vector<uint64_t> scale1, scale2;
   cuteafd_vision_ledger ledger{};
   int device = 0;
@@ -349,6 +353,18 @@ extern "C" int32_t cuteafd_internal_vision_tower_oracle(const cuteafd_vision_spe
   int rc=vision_required_impl(spec,ledger,valid_generic_tower);
   if(rc || !owner)return rc;
   return vision_create_impl(spec,device,admitted,tags,owner,valid_generic_tower);
+}
+// Separate test-only callback type supplies host inputs. Public observers retain
+// their const device view; no serving API can install teacher forcing.
+extern "C" int32_t cuteafd_internal_vision_tower_teacher(void* owner,
+    TowerTeacherInput callback,void* context) {
+  if(!owner)return cudaErrorInvalidValue;
+  auto* o=static_cast<Owner*>(owner);
+  if(!o->spec.tower)return cudaErrorInvalidValue;
+  int rc=device_ok(o);if(rc)return rc;
+  rc=drain(o,0);if(rc)return rc;
+  o->teacher_input=callback;o->teacher_context=context;
+  return 0;
 }
 extern "C" int32_t cuteafd_vision_upload(void* owner, uint64_t offset, const void* data, uint64_t bytes) {
   if(!owner || !data)return cudaErrorInvalidValue;auto* o=static_cast<Owner*>(owner);

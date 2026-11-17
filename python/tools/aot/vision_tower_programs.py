@@ -30,6 +30,11 @@ def names(kind):
 
 
 def builders(kind):
+    # Inventory queries stay CPU-only; actual builders verify the pinned source.
+    import sys
+    from pathlib import Path
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
+    import _pinned_sparkinfer  # noqa: F401
     import torch
     import cutlass.cute as cute
     import cuda.bindings.driver as cuda

@@ -1,6 +1,17 @@
 // Generic still encoder sequence. All storage is admitted before registration;
 // every arithmetic launch resolves to a fork AOT program owned by attention.
 #ifdef CUTEAFD_HAVE_VISION_ATTENTION_AOT
+int generic_teacher_boundary(Owner* o,int next_layer,uint16_t* x,int rows,int width) {
+  if(!o->teacher_input)return 0;
+  // Observe/drain completes every preceding use of x. The callback returns a
+  // separate host tensor; synchronizing this encode-stream copy before return
+  // keeps its lifetime and the next layer ordered without writable observers.
+  int rc=drain(o,0);if(rc)return rc;
+  const uint16_t* input=o->teacher_input(o->teacher_context,next_layer,rows,width);
+  if(!input)return cudaErrorInvalidValue;
+  rc=cudaMemcpyAsync(x,input,size_t(rows)*width*2,cudaMemcpyHostToDevice,o->stream);
+  return drain(o,rc);
+}
 int generic_activation(Owner* o,uint16_t* x,int rows,int width,uint32_t activation) {
   const std::string name="vision_"+std::string(activation==1?"gelu":"tanh_gelu")+"_h"+std::to_string(width);
   return generic_program(o,name,{x,x},{uint64_t(rows)});
@@ -46,6 +57,8 @@ int encode_generic_tower(Owner* o,const uint8_t* rgb,uint64_t rgb_bytes,const fl
   }
   GENERIC_RUN(generic_norm(o,t.pre_norm,b.x,b.next,n,h));
   std::swap(b.x,b.next);
+  GENERIC_RUN(observe(o,cb,ctx,-2,b.x,n,h,false));
+  GENERIC_RUN(generic_teacher_boundary(o,0,b.x,n,h));
   const auto frequency=[&](int axis)->void* {
     return t.inv_freq[axis]==UINT64_MAX?static_cast<void*>(b.cosines):o->weights+t.inv_freq[axis];
   };
@@ -73,6 +86,9 @@ int encode_generic_tower(Owner* o,const uint8_t* rgb,uint64_t rgb_bytes,const fl
     GENERIC_RUN(generic_projection(o,b.mlp,block.down,block.down_bias,b.next,n,s.intermediate,h));
     GENERIC_RUN(generic_residual(o,b.x,b.next,n));
     GENERIC_RUN(observe(o,cb,ctx,int(layer)+1,b.x,n,h,false));
+    // Only x carries state to the next block. QKV/norm/MLP/next storage is
+    // overwritten before reuse; the residual reads this same x, not a cache.
+    if(layer+1<s.depth)GENERIC_RUN(generic_teacher_boundary(o,int(layer)+1,b.x,n,h));
   }
   GENERIC_RUN(generic_norm(o,t.final_norm,b.x,b.next,n,h));
   if(t.projection_order==2) {
