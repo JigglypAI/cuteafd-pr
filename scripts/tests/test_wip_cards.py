@@ -32,6 +32,7 @@ def no_stop_handlers(monkeypatch, tmp_path):
     cards.bench_panels.cache_clear()
     monkeypatch.setattr(cards, 'observer_gpu_uuids', lambda devices: ','.join(f'GPU-host-{device}' for device in devices))
     monkeypatch.setattr(cards, 'preflight_deployment', lambda job, arm: {
+        'speculator': job['entry']['set'].get('SPECULATOR', 'dspark').replace('auto', 'dspark'),
         'spark_roles': [dict(rank=i, experts=True, audio_encoder=bool((job.get('needs') or {}).get('audio')))
                         for i in range(len(job['entry'].get('sparks', [])))],
         'artifact_requirements': {'spark_packages': {}, 'spark_tp_role': (job.get('needs') or {}).get('tp_role')}})
@@ -3313,6 +3314,39 @@ def test_observer_slow_cleanup_exits_within_hook_wait_and_preserves_failures(ent
         cards.observe(job)
 
 
+def test_trace_rejects_nonempty_off_only_cycles(entry, tmp_path):
+    job = cards.generate(entry, 'a', dict(instance='t', slot='s'), tmp_path, tmp_path / 'key', {}, set(), None, 1, trace=True)
+    job['entry'].update(profile='panels:', baseline=False)
+    trace = Path(job['state']) / 'speculation-trace.jsonl'
+    trace.write_text(('{}\n'.format(json.dumps({'cycle_ms': 10, 'depths': [0]}))) * 10)
+    row = cards.summarize_job(job, 0)
+    assert row['failure_kind'] == 'measurement'
+    assert 'zero proposed tokens' in row['error']
+    trace.write_text(('{}\n'.format(json.dumps({'cycle_ms': 10, 'depths': [3]}))) * 10)
+    assert cards.summarize_job(job, 0)['status'] == 'pass'
+    logs = Path(job['state']) / 'smoke' / 'logs'
+    logs.mkdir(parents=True)
+    (logs / 'test.coordinator.log').write_text('DRAFT_LENGTH=5 ignored: no speculator\n')
+    assert 'no speculator' in cards.summarize_job(job, 0)['error']
+
+
+def test_planned_speculator_identity_is_stable_and_explicit(entry, tmp_path):
+    job = make(entry, tmp_path)
+    cards.planned_speculator(job, {'speculator': 'dspark'})
+    assert job['planned_speculator'] == 'dspark'
+    with pytest.raises(ValueError, match='changed since enqueue'):
+        cards.planned_speculator(job, {'speculator': 'off'})
+    job.pop('planned_speculator')
+    job['entry']['set']['SPECULATOR'] = 'off'
+    cards.planned_speculator(job, {'speculator': 'off'})
+    with pytest.raises(ValueError, match='differs from requested'):
+        cards.planned_speculator(job, {'speculator': 'dspark'})
+    job.pop('planned_speculator')
+    job['entry']['set'].update(SPECULATOR='auto', DRAFT_LENGTH='5')
+    with pytest.raises(ValueError, match='no speculator'):
+        cards.planned_speculator(job, {'speculator': 'off'})
+
+
 @pytest.mark.parametrize('profile,policy,expected', [('', 'simple', 'off'),
     ('', 'shared', 'on (perturbing)'), ('draft-timing', 'simple', 'on (perturbing)'),
     ('transport-timing', 'simple', 'on (perturbing)'), ('census', 'simple', 'off')])
@@ -3336,9 +3370,9 @@ def test_deployment_preflight_uses_the_same_launcher_admission(entry, tmp_path, 
     calls = []
     def launch(cmd, **kwargs):
         calls.append((cmd, kwargs))
-        return SimpleNamespace(stdout='launcher summary\n{"spark_roles": []}\n')
+        return SimpleNamespace(stdout='launcher summary\n{"spark_roles": [], "speculator": "dspark"}\n')
     monkeypatch.setattr(original, "run", launch)
-    assert original.preflight_deployment(job, arm) == {"spark_roles": []}
+    assert original.preflight_deployment(job, arm) == {"spark_roles": [], "speculator": "dspark"}
     cmd, kwargs = calls[0]
     assert cmd[:3] == [str(ROOT / "run.sh"), "--config", job["entry"]["config"]]
     assert "--dry-run" in cmd and "--total-capacity" in cmd
