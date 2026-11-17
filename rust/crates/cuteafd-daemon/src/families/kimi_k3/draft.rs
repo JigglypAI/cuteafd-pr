@@ -43,7 +43,7 @@ impl Options {
                 &self.snapshot,slots,slots.min(8),sms,&format!("kimi/draft/{head_rank}"),self.draft_kv_cache,self.representation())?));
         }
         let cfg=MlaDflashConfig::read(&self.snapshot)?;
-        Ok(cfg.runtime_layout(self.representation(),GlmDraftCapacity::new(slots,slots.min(8),cfg.block)?,
+        Ok(cfg.serving_runtime_layout(self.representation(),GlmDraftCapacity::new(slots,slots.min(8),cfg.block)?,
             context,slots.checked_mul(context).context("draft pool overflow")?,sms,Fp8Rows::W8a16.code() as u8,
             cfg.cache_format(self.draft_kv_cache))?.with_context_split(self.tp2_dflash)?.into())
     }
@@ -329,7 +329,11 @@ impl<'a> NativeDraft<'a> {
         let cfg = self.owners.draft.geometry();
         if let Some(replica) = &self.head_replica {
             self.target_streams[head].drain()?;
-            replica.copy(&target[head], self.bridge.stream())?;
+            let copied = replica.copy(&target[head], self.bridge.stream());
+            if copied.is_err() {
+                crate::shared::decode_graph::fatal_drain(self.bridge.stream().drain(), "Kimi draft head replica startup failure");
+            }
+            copied?;
         }
         let execution_device = self.bridge.stream().device;
         ensure!(target[0].buffer("embedding")?.bytes == cfg.vocab * cfg.hidden * 2,

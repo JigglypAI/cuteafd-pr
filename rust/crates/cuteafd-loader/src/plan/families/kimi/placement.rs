@@ -320,7 +320,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
                 "Kimi TP2 DFlash requires two physical coordinator GPUs");
             let representation = if opts.kimi_draft_fp8 { GlmDraftRepresentation::Fp8Only }
                 else { GlmDraftRepresentation::Bf16Only };
-            DraftLayout::Mla(draft.runtime_layout(representation, GlmDraftCapacity::new(slots, slots.min(8), draft.block)?,
+            DraftLayout::Mla(draft.serving_runtime_layout(representation, GlmDraftCapacity::new(slots, slots.min(8), draft.block)?,
                 usize::try_from(context)?,slots.checked_mul(usize::try_from(context)?).context("draft pool overflow")?,
                 opts.physical_sms.unwrap_or(188) as usize,0,draft.cache_format(opts.draft_kv_cache))?.with_context_split(opts.tp2_dflash)?)
         };

@@ -241,9 +241,12 @@ impl<'a> Admission<'a> {
                 Some(crate::shared::speculation::dflash::context_split::ContextOwner::allocate(
                     programs, &layout, streams, peer, stream)?)
             } else { None };
-            let requests = DflashDrafter::mla_arena_requests(snapshot, representation, device.id)?;
+            let requests = if layout.complete_fp8_body() {
+                cuteafd_loader::families::glm5::draft_physical::mla_complete_fp8_arena_requests(
+                    &cuteafd_loader::formats::dflash::MlaDflashConfig::read(snapshot)?)?
+            } else { DflashDrafter::mla_arena_requests(snapshot, representation, device.id)?[&device.id].clone() };
             let arena_layout = cuteafd_loader::serving_capacity::WeightArenaLayout::new(
-                format!("kimi/draft/{}", device.id), requests[&device.id].clone())?;
+                format!("kimi/draft/{rank}"), requests)?;
             let admitted = cuteafd_loader::serving_capacity::WeightArenaLayout::new(
                 format!("kimi/draft/{rank}"), layout.weight_arena_requests())?;
             ensure!(arena_layout.bytes() == admitted.bytes() && arena_layout.views() == admitted.views(),
@@ -1068,7 +1071,7 @@ pub(crate) fn admit<'a, const RANKS: usize>(mut inputs: Inputs<'_, RANKS>) -> Re
         admission.check_global(rank, devices[rank])?;
         for lane in 0..lanes as usize { admission.check_io(rank, lane, devices[rank])?; }
     }
-    if admission.draft.is_some() { admission.check_draft(devices[RANKS - 1])?; }
+    if let Some(home) = draft::home(&admission.placement) { admission.check_draft(devices[usize::from(home)])?; }
     Ok(admission)
 }
 
@@ -1820,6 +1823,21 @@ pub(super) mod tests {
         Ok(())
     }
 
+    #[test]
+    fn whole_mla_homes_price_transfers_and_retain_only_the_selected_native_head() -> Result<()> {
+        let cfg = cfg();
+        let layout = draft_layout(2, 2, 8192);
+        let mut i = inputs(&cfg);
+        i.draft = Some(layout.clone());
+        let admitted = admit(i)?;
+        let home = draft::home(&admitted.placement).context("MLA home")?;
+        assert!(admitted.check_draft(i32::from(home)).is_ok());
+        assert!(admitted.check_draft(i32::from(1-home)).is_err());
+        assert!(admitted.receipt.decisions.draft_traffic_bytes_per_cycle == 0 || home == 1);
+        assert_eq!(admitted.receipt.facts.allocations.iter().filter(|owner|owner.id=="kimi/draft-head/0").count(), usize::from(home==0));
+        Ok(())
+    }
+
     fn draft_layout(slots: usize, sequences: usize, context: usize) -> DraftLayout {
         draft_layout_with_cache(slots, sequences, context, cuteafd_core::MlaCacheFormat::Bf16)
     }
@@ -1926,23 +1944,25 @@ pub(super) mod tests {
                 super::super::device::NativeScratch { kda: 1024, mla: [512, 0, 1024] }).unwrap()); i.lanes];
             i.draft = Some(layout.clone());
             let mut admitted = admit(i)?;
-            assert!(admitted.check_draft(0).is_err());
+            let home = i32::from(draft::home(&admitted.placement).context("selected draft home")?);
+            assert!(admitted.check_draft(1-home).is_err());
             let layout = layout.with_pool_tokens(usize::try_from(admitted.placement.pool_tokens)?)?;
-            assert_eq!(admitted.check_draft(1)?, &layout);
-            let allocated = admitted.allocate_draft_with(1, |owned| {
+            assert_eq!(admitted.check_draft(home)?, &layout);
+            let allocated = admitted.allocate_draft_with(home, |owned| {
                 assert_eq!(owned, layout);
                 let DraftLayout::Mla(owned)=owned else { anyhow::bail!("fixture requires MLA draft") };
                 owned.allocate_with(|buffer| Ok((buffer.name.clone(), buffer.bytes)))
             })?;
             let DraftLayout::Mla(layout)=layout else { anyhow::bail!("fixture requires MLA draft") };
             assert_eq!(allocated.iter().map(|(_, bytes)| *bytes as u64).sum::<u64>(), layout.buffer_bytes()?);
-            assert!(admitted.check_draft(1).is_err());
+            assert!(admitted.check_draft(home).is_err());
         }
         let mut i = inputs(&cfg);
         i.draft = Some(draft_layout(i.state_slots, i.state_slots, 1048576));
         let mut admitted = admit(i)?;
-        assert!(admitted.allocate_draft_with::<()>(1, |_| anyhow::bail!("injected partial allocation")).is_err());
-        assert!(admitted.check_draft(1).is_err());
+        let home = i32::from(draft::home(&admitted.placement).context("selected draft home")?);
+        assert!(admitted.allocate_draft_with::<()>(home, |_| anyhow::bail!("injected partial allocation")).is_err());
+        assert!(admitted.check_draft(home).is_err());
         Ok(())
     }
 
@@ -1993,7 +2013,8 @@ pub(super) mod tests {
             assert_eq!(charges.len(), 1, "one configured graph arena per device");
             assert_eq!(charges[0].bytes, reserve[rank].bytes);
         }
-        let marks = admitted.placement.items[1].iter().find(|item| item.group == DRAFT_MARKS).unwrap();
+        let home = usize::from(draft::home(&admitted.placement).context("selected draft home")?);
+        let marks = admitted.placement.items[home].iter().find(|item| item.group == DRAFT_MARKS).unwrap();
         assert_eq!(marks.bytes, layout.window_mark_bytes()? as u64 * admitted.mark_selection.slots);
         let owners = admitted.placement.layers.iter().filter_map(|layer| match layer.mode {
             LayerMode::Whole { gpu, .. } => Some(gpu), _ => None,
@@ -2012,7 +2033,7 @@ pub(super) mod tests {
         let mut mixed = inputs(&cfg);
         mixed.cache_format = cuteafd_core::MlaCacheFormat::Fp8;
         mixed.draft = Some(draft_layout(2, 2, 1048576));
-        assert!(request(mixed).is_err(), "target/draft record mismatch must fail before admission");
+        assert!(request(mixed).is_ok(), "draft cache records are independent of target records");
         let mut i = inputs(&cfg);
         i.draft = Some(draft_layout(2, 2, 1048576));
         i.fixed.push(i.draft.as_ref().unwrap().demands(1)?.0.owned[0].clone());
@@ -2025,15 +2046,16 @@ pub(super) mod tests {
         assert!(request(i).is_err());
         let mut i = inputs(&cfg); i.draft = Some(draft_layout(2, 2, 1048576));
         let mut admitted = admit(i)?;
+        let home = i32::from(draft::home(&admitted.placement).context("selected draft home")?);
         admitted.global_uploaded[0] = true;
-        assert!(admitted.check_draft(1).is_err());
+        assert!(admitted.check_draft(home).is_err());
         admitted.global_uploaded[0] = false;
-        admitted.placement.movables[0].1 = 0;
-        assert!(admitted.check_draft(1).is_err());
-        admitted.placement.movables[0].1 = 1;
-        let charge = admitted.receipt.facts.allocations.iter_mut().find(|owner| owner.id == "kimi/draft/1").unwrap();
+        admitted.placement.movables[0].1 = (1-home) as u8;
+        assert!(admitted.check_draft(home).is_err());
+        admitted.placement.movables[0].1 = home as u8;
+        let charge = admitted.receipt.facts.allocations.iter_mut().find(|owner| owner.id == format!("kimi/draft/{home}")).unwrap();
         charge.bytes -= 1;
-        assert!(admitted.check_draft(1).is_err());
+        assert!(admitted.check_draft(home).is_err());
         assert!(admit(inputs(&cfg))?.check_draft(1).is_err());
         Ok(())
     }

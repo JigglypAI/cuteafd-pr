@@ -1275,8 +1275,20 @@ impl MlaDflashConfig {
         Ok(layout)
     }
 
-    /// Qualification callers select this immutable complete-body recipe; serving
-    /// switches uniformly only after the lightseek lossless/performance gate.
+    /// Production Kimi body representation: every body linear uses FP8 while
+    /// norms, codebooks, embeddings and prediction heads retain checkpoint math.
+    #[allow(clippy::too_many_arguments)]
+    pub fn serving_runtime_layout(&self,
+        mode: crate::families::glm5::draft_representation::GlmDraftRepresentation,
+        capacity: crate::families::glm5::draft_representation::GlmDraftCapacity,
+        compiled_context: usize, target_pool_tokens: usize, sm_count: usize, fp8_mode: u8,
+        cache_format: MlaCacheFormat) -> Result<MlaDraftRuntimeLayout> {
+        if self.kind.is_dflash() && mode == crate::families::glm5::draft_representation::GlmDraftRepresentation::Fp8Only {
+            self.complete_fp8_runtime_layout(capacity, compiled_context, target_pool_tokens, sm_count, fp8_mode, cache_format)
+        } else { self.runtime_layout(mode, capacity, compiled_context, target_pool_tokens, sm_count, fp8_mode, cache_format) }
+    }
+
+    /// Complete-body native FP8 recipe shared by planning and the real loader.
     pub fn complete_fp8_runtime_layout(&self,
         capacity: crate::families::glm5::draft_representation::GlmDraftCapacity,
         compiled_context: usize, target_pool_tokens: usize, sm_count: usize, fp8_mode: u8,
@@ -1609,6 +1621,30 @@ mod tests {
         assert!(broken.context_shards(None, 5).is_err());
         assert!(batch.context_shards(Some(0), 5).is_err());
         assert!(batch.context_shards(None, 0).is_err());
+    }
+
+    #[test]
+    fn kimi_serving_fp8_covers_all_body_linears_and_preserves_native_auxiliaries() {
+        use crate::families::glm5::draft_representation::{GlmDraftCapacity, GlmDraftRepresentation};
+        for raw in [config(), causal_config()] {
+            let cfg = MlaDflashConfig::from_json(&raw).unwrap();
+            for cache in [MlaCacheFormat::Bf16, MlaCacheFormat::Fp8] {
+                let capacity = GlmDraftCapacity::new(2, 2, cfg.block).unwrap();
+                let make = |mode| cfg.serving_runtime_layout(mode, capacity, 8192, 16384, 188, 0, cache).unwrap();
+                let fp8 = make(GlmDraftRepresentation::Fp8Only);
+                assert!(fp8.complete_fp8_body());
+                assert_eq!(fp8.weights(), &cfg.complete_fp8_weight_layout().unwrap());
+                for name in ["self_attn.q_b_proj.weight", "self_attn.o_proj.weight", "kv_b_proj.weight.uk", "kv_b_proj.weight.uv"] {
+                    assert!(fp8.weight_arena_requests().iter().any(|(n,_)|n.ends_with(&format!("{name}.payload"))), "{name}");
+                    assert!(fp8.weight_arena_requests().iter().any(|(n,_)|n.ends_with(&format!("{name}.scales"))), "{name}");
+                }
+                assert!(fp8.weight_arena_requests().iter().any(|(name,_)|name.ends_with("q_a_proj.weight+layers.0.self_attn.kv_a_proj_with_mqa.weight.payload")));
+                assert!(!fp8.weight_arena_requests().iter().any(|(name,_)|name.contains("codebook.payload")));
+                assert!(!make(GlmDraftRepresentation::Bf16Only).complete_fp8_body());
+                assert!(fp8.with_pool_tokens(32768).unwrap().complete_fp8_body());
+                assert_eq!(fp8.weights().max_load_staging, crate::shared::dense_read::STEP_BYTES as u64);
+            }
+        }
     }
 
     fn config() -> serde_json::Value {

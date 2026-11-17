@@ -170,10 +170,12 @@ pub(crate) fn load<'a, const RANKS: usize>(library: &'a Arc<cuteafd_ffi::NativeL
         use cuteafd_ffi::mla_draft::{MlaDraft, MlaDraftWindow};
         let cfg=cuteafd_loader::formats::dflash::MlaDflashConfig::read(&draft.snapshot)?;
         let cache=cfg.cache_format(draft.draft_kv_cache);
+        let load = |namespace, window| if draft.fp8 { MlaDraft::load_fp8_weights(programs, namespace, window, cache) }
+            else { MlaDraft::load(programs, namespace, window, cache) };
         if cfg.kind == cuteafd_core::coordinator_programs::MlaDraftKind::CausalDflash2 {
-            Ok(vec![MlaDraft::load(programs,"kimik31",MlaDraftWindow::CausalSliding1024,cache)?])
-        } else { Ok(vec![MlaDraft::load(programs, "kimik3", MlaDraftWindow::Full, cache)?,
-            MlaDraft::load(programs, "kimik3", MlaDraftWindow::Sliding4096, cache)?]) }
+            Ok(vec![load("kimik31",MlaDraftWindow::CausalSliding1024)?])
+        } else { Ok(vec![load("kimik3", MlaDraftWindow::Full)?,
+            load("kimik3", MlaDraftWindow::Sliding4096)?]) }
     })).transpose()?;
     let _block_projection_modules=if let Some(layout)=&draft_layout {
         use cuteafd_loader::families::kimi_k3::draft::DraftLayout;
