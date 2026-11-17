@@ -111,7 +111,10 @@ def fake_resolved_settings(args, family, sparks):
     result = {"coordinator_weight_budget_gib": {
         "value": int(value("--gpu-memory-cap", str(96 << 30))) / 2**30, "provenance": "auto"}}
     if family == "kimi_k3":
-        precision = resolved("--draft-fp8", "SPECULATOR_FP8", value("--speculator") == "dflash2")
+        qualified = (config.get("MODEL_ID") == "wrldsuksgo2mars/Kimi-K3.1-Pro-EXL3-K2-MC"
+            and value("--core-view", "original") in ("original", "k6-compact") and tp in (1, 2)
+            and value("--kv-cache", "fp8") == "fp8")
+        precision = resolved("--draft-fp8", "SPECULATOR_FP8", value("--speculator") == "dflash2" or qualified)
         raw = precision["value"]
         precision["value"] = raw if isinstance(raw, bool) else raw in ("on", "true")
         result["draft_fp8"] = precision

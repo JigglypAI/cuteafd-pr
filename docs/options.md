@@ -108,7 +108,6 @@ default-off performance lever adds its row here in the same PR (AGENTS.md).
 | `L2_PREFETCH` | V4.1, MiMo, Qwen4 | `L2_PREFETCH=auto` or a MiB count (unset = off; GLM 5.3 and GLM Flash already default it to `auto`) | Pulls the next layer's weights into L2 while a one-lane decode step waits on its Spark exchange. V4.1 1× RTX 5090 + 4 Sparks: every C1 cell +1.7–3.9%, C4/C8 and 8K prefill unchanged (#623); GLM 5.3 weighted +4.4%, GLM Flash C1 +6–15% (2026-09-30). | None in values (outputs byte-identical); only extra L2 traffic. |
 | `QWEN_FP8_DECODE` | Qwen4 | `QWEN_FP8_DECODE=on` (unset = checkpoint BF16) | Holds the GDN/attention projections as one resident E4M3 copy; with `QWEN_FP8_HEAD=on`, 1× RTX code C1 222→247 tok/s, C4 441→489, 8K prefill 6100→6177 (2026-10-03). | Converts target projections to FP8 at load: golden KL 0.036→0.046, top-1 88.5%→86.7%; fails the KL gate, so opt-in only. |
 | `CORE_VIEW` | GLM 5.3 / ML4, GLM Flash, Kimi K3, Step-5, Muse | `CORE_VIEW=k8-compact`, `k6-compact` or `fp8-compact` (unset = original) | Stored MC core or generic load-time block FP8 of exactly the original variant's `core_tensors`; BF16 index only. GLM Flash K4 MC, 2 RTX PRO 6000 / 0 Sparks, DFlash2, fixed 425/425 W (2026-11-12): FP8 vs original C1/C16/8K prefill 171.12/741.93/7837.57 to 196.74/772.56/7741.92 tok/s (+15.0%/+4.1%/-1.2%); pool 1628160 to 2097152. K6 is non-inferior on both measured Standard-v2 paths, with +22.8% C1 and -12.5% 8K prefill vs original. Muse K4 MC `fp8-compact` is measured below (+15.2% C1, C16 flat, -5.1% 8K prefill; larger pool). GLM/Step whole-core FP8, 2 RTX PRO 6000 + 6 Sparks, 425 W/card (2026-11-16): GLM C1/C16/8K 49.04/180.68/3392 to 53.52/191.81/3122 tok/s (+9.1%/+6.2%/-8.0%), onboarded layers 5 to 8; Step 59.87/216.73/2740 to 68.98/266.95/2562 (+15.2%/+23.2%/-6.5%), onboarded layers 13 to 19. Both keep the 2,097,152-token pool; one warmed launch per arm, strict lossless 10/10. Step FP8 replay matches all 106 saved original prompt hashes. No thermal slowdown; prefill power-cap windows differ. Requires v52e exports. Other checkpoints unmeasured. | K8/K6 and FP8 quantize target weights. FP8 uses E4M3 + FP32 128x128 block scales. GLM generated Standard decode/prefill KL 0.03686/0.03100 to 0.04530/0.03880, top-1 94.544%/95.177% to 94.091%/94.775%; Step KL 0.01337/0.01164 to 0.01597/0.01429, top-1 96.069%/96.008% to 95.166%/95.811%. Absolute family bars pass; no paired non-inferiority claim. Original stays default. Matched Standard-v2 generated positions: FP8-minus-original KL to official BF16 ancestry +0.00289 decode/+0.00325 prefill, top-1 -0.013/-0.526 percentage points; absolute ancestry gates pass, paired decode non-inferiority passes but prefill fails (0.005 margin). Those figures ran W8A8 prefill over every group; W8A16 prefill (`FP8_PREFILL=off`) also fails prefill non-inferiority (top-1 loss 0.00263, upper95 0.00614). FP8 stays opt-in. Unsupported executor roles refuse by tensor name, never skip. Plain checkpoints refuse every compact selector, including the former plain Flash FP8 path. |
-| `SPECULATOR_FP8` | Kimi K3 | `SPECULATOR_FP8=on` (default `auto`, BF16) | Unmeasured; TP1/TP2 FP8 projection weights, exact per-rank packed arenas and shared push conversion. Independent of `DRAFT_KV_CACHE`; target weights stay unchanged. | Drafter E4M3 projection rounding can affect proposal acceptance and delivered speed; target verification retains strict output semantics. |
 | `KV_CACHE` | Muse | `KV_CACHE=fp8` (default `bf16`) | Muse K4 MC original, dev `5e28a1d30`, RTX PRO 6000 (2026-11-16): 1 RTX + 4 Sparks, speculation off, pool 510,272 to 1,056,768 tokens (2.071x), served context 510,272 to 1,048,576. Separate quiet 2 RTX + 6 Sparks pair with default NVIDIA DFlash2: C1 70.81 to 65.08 emitted tok/s (0.919x), C16 253.03 to 257.81 (1.019x), pool 2,009,216 to 2,097,152 and onboarded layers 0 to 9. One warmed launch per arm; no power-cap or thermal slowdown in timed windows. | Lossy native E4M3 target KV with per-token/head FP32 scales. Standard max generated decode: KL 0.00968 to 0.01689 (+0.00721), top-1 97.149% to 96.594% (-0.555 pp); prefill KL +0.00625, top-1 -0.716 pp. Absolute family bars pass, but paired quality and C1 default bars fail: remains opt-in. BF16 stays default; drafter storage is independent. |
 | `QWEN_FP8_HEAD` | Qwen4 | `QWEN_FP8_HEAD=on` (unset = BF16) | Converts the shared target/MTP head to one E4M3 backing. Historical combined measurement is in the decode row; standalone effect unmeasured. | Changes target logits; the draft reads the same head, not a separate draft-only FP8 copy. |
 | `MIMO_FP8_HEAD`, `MIMO_FP8_O_PROJ` | MiMo | Set either to `on` (unset/auto = checkpoint) | Explicitly converts a BF16 target head or O projection; native FP8 stays FP8. Unmeasured. | Target-weight quantization, independent of drafter precision. |
@@ -670,12 +669,12 @@ Each key is also a global `cuteafd` flag (`--gpu-memory-cap`, `--kv-max-tokens`,
 
 | Key | Default | Values | Notes |
 | --- | --- | --- | --- |
-| `SPECULATOR` | family default | `auto` (Qwen4), `off`, `dflash2`, `dspark`, `mtp` | Which fail is in the table below. |
+| `SPECULATOR` | family default | `auto` (Qwen4/Kimi), `off`, `dflash2`, `dspark`, `mtp` | Which fail is in the table below. |
 | `SPECULATOR_MODEL_ID` | family default | HF repo id | External drafter checkpoint. |
 | `SPECULATOR_MODEL_REVISION` | empty | 40–64 lowercase hex | Drafter revision. |
 | `SPECULATOR_DEPTH` | 3 for local Qwen/Step-5, else 1 | positive int | Native MTP draft depth. |
 | `DRAFT_LENGTH` | unset (adaptive) | positive int | Fixed verified draft tokens per step: min(value, native head width), further capped by the existing row budget at high concurrency. Overrides `DRAFT_POLICY`; statistics still recorded. Every family and speculator (DFlash2, dSpark, MTP, Markov). V4.1 adaptive maximum remains 5 when unset; fixed supports up to 7. Without a speculator it is ignored with one startup log; reports and cards say `no speculation`. |
-| `SPECULATOR_FP8` | `auto` | `auto`, `on`, `off` | GLM/Qwen/MiMo/Kimi drafter precision: `on` converts projection matrices to single-copy FP8. Kimi block DSpark supports TP1 and physical TP2 with native BF16 norms/Markov tensors; `auto` keeps BF16 until qualification. Independent of `DRAFT_KV_CACHE`. |
+| `SPECULATOR_FP8` | `auto` | `auto`, `on`, `off` | GLM/Qwen/MiMo/Kimi drafter precision: `on` converts projection matrices to single-copy FP8. Kimi block DSpark supports TP1 and physical TP2 with native BF16 norms/Markov tensors; `auto` selects FP8 for qualified K3.1 MC original/K6 on TP1/TP2; explicit `off` keeps BF16. Independent of `DRAFT_KV_CACHE`. |
 | `DRAFT_POLICY` | unset | `shared`, `simple`, `simple-rc`, `simple-derived` | Drafter block policy: unset selects shared for MiniMax, simple elsewhere. Shared prices draft/skip actions per concurrency bucket and collects per-layer timing. Explicit values override the family default. |
 | `DRAFT_ROW_COST` | unset | `linear`, `power`, `log` | Drafter row cost model diagnostic. |
 | `DRAFT_SURVIVAL_LENGTHS` | `off` | `on`, `off` | Record draft survival lengths. |
@@ -745,9 +744,23 @@ two coordinators split query/KV heads and FFN neurons across both devices,
 with per-rank packed arenas, local rings and exact local prefix marks. FC and
 norms are replicated; only the head GPU owns Markov/confidence and borrows the
 target vocabulary head. The shared GQA TP2 reduction uses drafter-private
-exchange flags, never target exchange slots. `SPECULATOR=off` remains the
-default. Full-model served lossless qualification is still pending (#2261);
-this is not a performance claim. `TP2_DFLASH` does not select this GQA split.
+exchange flags, never target exchange slots. Unset/`auto` `SPECULATOR` selects DSpark
+for `wrldsuksgo2mars/Kimi-K3.1-Pro-EXL3-K2-MC`, `CORE_VIEW=original|k6-compact`,
+on one or two coordinators with target FP8 KV. The independent defaults are
+`SPECULATOR_FP8=auto` (FP8 projection weights) and `DRAFT_KV_CACHE=fp8`;
+explicit `SPECULATOR=off`, weight precision or draft KV overrides win.
+The max example uses this automatic selection, not an off pin. Qualification
+uses the measured config and MC-manifest SHA-256 digests plus selected view and physical TP,
+never a repository/path string or Spark count; identical local/renamed copies qualify.
+The Inferact drafter config digest is checked independently;
+normal memory admission still decides fit. K8/whole-core FP8 target views,
+other checkpoints and target BF16 KV remain default-off.
+Cold and full-prompt warm strict sets passed 10/10 on the qualified TP2 views;
+TP1 K6 is separately gated. FP8 weights save 1.227 GB net per coordinator versus
+BF16 after scratch, independently of draft KV. Closed-batch C16 has a substantial
+uneven-completion drain penalty; sustained C8/C16 measurements in #2261 select
+the throughput arm. Sampled acceptance is not directly comparable to Inferact's
+reported 4.16 because its draft sampling/rejection method differs (#2312). `TP2_DFLASH` does not select this GQA split.
 
 Kimi K3 and Step-5 are text-only; dense Qwen has media off. GLM 5.3 / ML4,
 GLM Flash, MiMo, Qwen4 and Muse carry their own towers. Native GLM Flash EXLR8
@@ -940,7 +953,7 @@ Speculator (`SPECULATOR`):
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | `off` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ (default) |
 | `dflash2` | ✗ | ✗ | ✓ (default) | ✓ (default) | ✓ | ✗ | ✗ | ✓ (default) | ✗ | ✓ (default) | ✗ |
-| `dspark` | ✓ (default) | ✓ (default) | ✓ (Mistral Large 4 only) | ✓ | ✗ | ✗ | ✓ (default unless hidden is 5120) | ✓ (K3.1 opt-in; qualification gate) | ✗ | ✗ | ✗ |
+| `dspark` | ✓ (default) | ✓ (default) | ✓ (Mistral Large 4 only) | ✓ | ✗ | ✗ | ✓ (default unless hidden is 5120) | ✓ (K3.1 MC original/K6 TP1/TP2 default; otherwise opt-in) | ✗ | ✗ | ✗ |
 | `mtp` | ✗ | ✗ | ✗ | ✗ | ✓ | ✓ (default) | ✓ (local EXL3/NVFP4 default, depth 3) | ✗ | ✓ (default) | ✗ | ✗ |
 
 Qwen4 unset/`auto` selects native MTP (depth 3) only for qualified local

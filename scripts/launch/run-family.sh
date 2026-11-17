@@ -1621,19 +1621,14 @@ if [[ $family == deepseek_v4 ]]; then
   dsv4_dspark="$(python3 -c 'import json,sys; print(int(int(json.load(open(sys.argv[1])).get("dspark_block_size") or 0) > 0))' "$root/snapshots/$revision/$selected_config")"
 fi
 speculator="$(get SPECULATOR)"
+if [[ "$family" == kimi_k3 ]]; then kimi_requested_speculator="$speculator"; speculator=off; fi
 # MiniMax uses its bundled native drafter on whole, Layers and Heads placements.
 if [[ "$family" == minimax_m3 && ( -z "$speculator" || "$speculator" == auto ) ]]; then speculator=dspark; fi
 # Qwen resolves auto only after expert admission, not from configured inventory.
 if [[ "$family" == qwen4 && ( -z "$speculator" || "$speculator" == auto ) ]]; then speculator=auto; fi
 default_drafter=""
 [[ "$family" != muse_spark ]] || default_drafter=nvidia/Muse-Spark-Open-816B-A42B-DFlash2
-if [[ "$family" == kimi_k3 ]]; then
-  kimi_defaults="$(docker run --rm --network none -e "HF_HOME=$container_hf_home" \
-    "${generic_worker_mounts[@]}" "${wip_mount_args[@]}" "$coordinator_image" cuteafd plan "$snapshot" \
-    --checkpoint-model-id "$model" --speculator "${speculator:-auto}" --resolve-settings-only)" || exit 2
-  speculator="$(jq -er '.speculator' <<<"$kimi_defaults")"
-  if [[ "$speculator" == dspark ]]; then default_drafter="$(jq -er '.default_drafter' <<<"$kimi_defaults")"; fi
-fi
+
 if [[ -z "$speculator" ]]; then
   speculator=off
   if [[ $speculator == off && $family == glm5 && -z ${cfg[SPECULATOR]+set} ]]; then
@@ -1706,6 +1701,17 @@ if [[ "$family" == inkling2 ]]; then
   coordinator_gpu_count=1
 fi
 release_resolve_coordinator_gpus "$explicit_coordinator_gpus" "$coordinator_gpu_count"
+if [[ "$family" == kimi_k3 ]]; then
+  kimi_rtx="${#RELEASE_COORDINATOR_GPU_INDICES[@]}"
+  [[ "$split" != off ]] || kimi_rtx=1
+  kimi_draft_kv_default=fp8
+  kimi_draft_kv="$(get DRAFT_KV_CACHE "$kimi_draft_kv_default")"
+  kimi_defaults="$(docker run --rm --network none -e "HF_HOME=$container_hf_home" \
+    "${generic_worker_mounts[@]}" "${wip_mount_args[@]}" "$coordinator_image" cuteafd plan "$snapshot" \
+    --checkpoint-model-id "$model" --rtx "$kimi_rtx" --core-view "$core_view" --kv-cache "$(get KV_CACHE fp8)" --draft-kv-cache "$kimi_draft_kv" --speculator "${kimi_requested_speculator:-auto}" --resolve-settings-only)" || exit 2
+  speculator="$(jq -er '.speculator' <<<"$kimi_defaults")"
+  if [[ "$speculator" == dspark ]]; then default_drafter="$(jq -er '.default_drafter' <<<"$kimi_defaults")"; fi
+fi
 profile_bytes="$(release_cuda_total_bytes "$RELEASE_COORDINATOR_GPU_UUID")" || release_die "cannot query coordinator CUDA capacity"
 profile="$(release_coordinator_profile "$profile_bytes" "$coordinator_budget")" || release_die "cannot resolve coordinator capacity profile"
 read -r profile_cap default_concurrency <<<"$profile"
@@ -1840,6 +1846,7 @@ case "$speculator" in
       draft_args=(--draft "$draft_snapshot")
       if [[ "$family" == muse_spark || "$family:$speculator" == kimi_k3:dspark ]]; then
         muse_draft_kv="$(get DRAFT_KV_CACHE fp8)"
+        [[ "$family" != kimi_k3 ]] || muse_draft_kv="$kimi_draft_kv"
         case "$muse_draft_kv" in bf16|fp8) ;; *) release_die "DRAFT_KV_CACHE must be bf16 or fp8" ;; esac
         draft_args+=(--draft-kv-cache "$muse_draft_kv")
       fi
@@ -2413,7 +2420,7 @@ audio_encoder_hash=""
   fi
   if [[ "$family" == kimi_k3 && ( "$speculator" == dflash2 || "$speculator" == dspark ) ]]; then
     plan_draft_args+=(--drafter-snapshot "$draft_snapshot")
-    if [[ "$speculator" == dspark ]]; then plan_draft_args+=(--draft-kv-cache "$(get DRAFT_KV_CACHE fp8)"); fi
+    if [[ "$speculator" == dspark ]]; then plan_draft_args+=(--draft-kv-cache "$(get DRAFT_KV_CACHE "${kimi_draft_kv_default:-fp8}")"); fi
   fi
   if [[ "$family:$speculator" == muse_spark:dflash2 ]]; then
     plan_draft_args+=(--drafter-snapshot "$draft_snapshot")

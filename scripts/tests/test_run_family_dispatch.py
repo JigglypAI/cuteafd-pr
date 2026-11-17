@@ -977,6 +977,10 @@ def _family_launch_result(tmp_path: Path, family_config: dict, model: str, keys:
         (selected / "config.k6.json").write_text(json.dumps(family_config))
     if "SPECULATOR_MODEL_ID=test/draft" in keys:
         _snapshot(hf, "test/draft", {"speculators_model_type":"dspark"})
+    if model == "wrldsuksgo2mars/Kimi-K3.1-Pro-EXL3-K2-MC" and not (
+            hf / "hub/models--Inferact--Kimi-K3.1-Pro-DSpark").exists():
+        _snapshot(hf, "Inferact/Kimi-K3.1-Pro-DSpark", {"speculators_model_type": "dspark"},
+                  "e4e6e6261e9f8b6d5f249f9627eb6b109d762d5f")
     if checkpoint_source is not None:
         staged = hf / "hub" / f"models--{model.replace('/', '--')}" / "snapshots" / ("a" * 40 if native_v41 else "abc")
         # Header fixtures have huge sparse tensor payloads; never materialize them.
@@ -1092,7 +1096,12 @@ if "--resolve-settings-only" in args:
     checkpoint = json.loads(os.environ["STUB_CHECKPOINT"])
     if checkpoint.get("model_type", "") in ("kimi_k3", "kimi_k31"):
         selected = args[args.index("--speculator") + 1] if "--speculator" in args else "off"
-        if selected == "auto": selected = "off"
+        if selected == "auto":
+            def option(flag, default): return args[args.index(flag) + 1] if flag in args else default
+            qualified = (option("--checkpoint-model-id", "") == "wrldsuksgo2mars/Kimi-K3.1-Pro-EXL3-K2-MC"
+                and option("--rtx", "1") in ("1", "2") and option("--core-view", "original") in ("original", "k6-compact")
+                and option("--kv-cache", "fp8") == "fp8" and option("--draft-kv-cache", "fp8") in ("fp8", "bf16"))
+            selected = "dspark" if qualified else "off"
         if selected not in ("off", "dflash2", "dspark"):
             print(f"SPECULATOR={selected} does not apply to kimi_k3", file=sys.stderr)
             sys.exit(2)
@@ -1405,7 +1414,8 @@ def capture_resolver_config_parity(snapshot: Path, example: Path, binary: Path,
     hub = temporary / "hf/hub"
     hub.mkdir(parents=True)
     for model in (config.get("SPECULATOR_MODEL_ID"), "incoai/GLM-5.3-Flash-DFlash2",
-                  "incoai/GLM-5.3-DFlash2", "nvidia/Muse-Spark-Open-816B-A42B-DFlash2"):
+                  "incoai/GLM-5.3-DFlash2", "nvidia/Muse-Spark-Open-816B-A42B-DFlash2",
+                  "Inferact/Kimi-K3.1-Pro-DSpark"):
         if model:
             cache = "models--" + model.replace("/", "--")
             source = hf_home / "hub" / cache
@@ -1414,15 +1424,16 @@ def capture_resolver_config_parity(snapshot: Path, example: Path, binary: Path,
     keys = "\n".join(line for line in raw.splitlines()
                      if not line.startswith(("MODEL_ID=", "MODEL_REVISION="))) + "\nMODEL_REVISION=\n"
     output = temporary / "resolver-deployment.json"
+    identity = config.get("MODEL_ID", "test/resolver-parity")
     result = _family_launch_result(temporary, json.loads((snapshot / "config.json").read_text()),
-        "test/resolver-parity", keys, physical_gpus=tuple(range(gpus)), root_launcher=True,
+        identity, keys, physical_gpus=tuple(range(gpus)), root_launcher=True,
         cuda_total_bytes=101_973_491_712, gpu_free_mib=98304,
         extra_args=("--wip", "real-planner-test"), extra_env={
             "STUB_REAL_PLANNER": str(binary), "STUB_REAL_SNAPSHOT": str(snapshot),
             "STUB_REAL_PROGRAMS": str(programs), "STUB_REAL_HF_HOME": str(hf_home),
             "STUB_REAL_PLAN_OUTPUT": str(output), "CUTEAFD_CDI_CHECK": "off",
             "STUB_SPARK_ROLES": f"tp{config['SPARK_COUNT']}",
-            "STUB_SERVED_MODEL_ID": "test/resolver-parity"})
+            "STUB_SERVED_MODEL_ID": identity})
     assert result.returncode == 0, result.stderr
     launched = _read_real_deployment(output)
     plans = [shlex.split(line) for line in result.stderr.splitlines()
@@ -5862,3 +5873,20 @@ def test_kimi_shared_speculation_trace_reaches_coordinator(tmp_path):
     assert result.returncode == 0, result.stderr
     serve = next(line for line in result.stderr.splitlines() if "cuteafd serve-kimi" in line)
     assert f"CUTEAFD_SPECULATION_TRACE={trace}" in serve
+
+
+@pytest.mark.parametrize("layout,enabled", [("RTX_GPUS=2\n", True), ("RTX_GPUS=1\n", True),
+    ("RTX_GPUS=2\nCORE_VIEW=k6-compact\n", True), ("RTX_GPUS=2\nSPECULATOR=off\n", False),
+    ("RTX_GPUS=2\nDRAFT_KV_CACHE=fp8\n", True), ("RTX_GPUS=2\nKV_CACHE=bf16\n", False),
+    ("RTX_GPUS=2\nCOORDINATOR_SPLIT=off\n", True)])
+def test_k31_qualified_default_tracks_physical_tp_and_kv(tmp_path, layout, enabled):
+    config = {"model_type": "kimi_k31", "text_config": {"model_type": "kimi_linear", "num_hidden_layers": 93,
+        "first_k_dense_replace": 1, "moe_layer_freq": 1}}
+    result = _family_launch_result(tmp_path, config, "wrldsuksgo2mars/Kimi-K3.1-Pro-EXL3-K2-MC",
+        layout + "VISION=off\nAUDIO=off\n", physical_gpus=(0, 1))
+    assert result.returncode == 0, result.stderr
+    launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-kimi" in line)
+    assert ("--draft " in launch) == enabled, launch
+    if enabled:
+        assert "--draft-kv-cache fp8" in launch
+        assert "--draft-fp8 true" in launch
