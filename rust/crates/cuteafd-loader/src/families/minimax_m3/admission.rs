@@ -52,6 +52,9 @@ impl Coordinator {
 
 /// Every operator input admission reads, resolved once by the caller.
 pub struct FactsRequest<'a> {
+    pub vision: crate::plan::MediaMode,
+    pub vision_replicas: usize,
+    pub media_cache_bytes: Option<u64>,
     pub checkpoint: &'a crate::plan::Checkpoint,
     pub cfg: &'a MiniMaxM3Config,
     pub catalog: &'a crate::OfficialV41Catalog,
@@ -411,7 +414,12 @@ pub fn gather(request: &FactsRequest<'_>) -> Result<MiniMaxInputs, Refused> {
         spark_ingress: ingress,
         spark_reply_formats: request.replies, drafter: request.drafter.as_ref().map(|native| shared::Drafter {
             arena:native.weights.clone(),native:native.clone(),scratch:Vec::new(),state_per_page:0 }),
-        vision: None, budgets, code, measured_context, graph_reserve,
+        vision: crate::placement::still_encoder::StillEncoder::planned(request.checkpoint,
+            request.vision, request.vision_replicas, &budgets,
+            request.media_cache_bytes.unwrap_or((8 << 30).min(host_total / 20)))
+            .map_err(|error| refused(format!("MiniMax bundled vision inventory refused: {error:#}"),
+                "Supply the bundled CLIP tower tensors or use --vision off."))?,
+        budgets, code, measured_context, graph_reserve,
         head: request.head, host_prefix, device_sampling: true,
         expert_usage: request.expert_usage.then(|| cuteafd_core::expert_usage::Geometry { layers: cfg.layers,
             experts: cfg.experts, topk: cfg.topk, routed_layers: routed }),

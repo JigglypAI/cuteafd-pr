@@ -135,4 +135,49 @@ mod tests {
             }
         }
     }
+    #[test]
+    fn joint_solve_retries_rtx_when_spark_experts_leave_no_tower_room() {
+        use crate::plan::encoder::{EncoderGpuBudget, EncoderSparkBudget};
+        struct Prepared(Contract);
+        impl Recipe for Prepared {
+            fn prepare(&self, _: &Request) -> Result<Contract, Refusal> { Ok(self.0.clone()) }
+        }
+        for kind in [StillTowerKind::Kimi, StillTowerKind::MiniMax] {
+            let hardware = EncoderHardware { v41: false,
+                gpus: vec![EncoderGpuBudget { free_bytes: 64 << 20, kv_target_bytes: 0 }],
+                sparks: vec![EncoderSparkBudget { rank: 0, host: "fixture".into(), idle: false,
+                    expert_bytes: 0, free_bytes: 64 << 20 }] };
+            let encoder = StillEncoder::new(inventory(kind), MediaMode::Auto, 1, &hardware, 0).unwrap();
+            for expert_bytes in [1 << 20, 60 << 20] {
+                let location = Location { device: Device::Spark(0), domain: Domain::Managed };
+                let mut contract = Contract::fixed(64, 1, 1, Facts { phase_order: PhaseOrder::TARGET_THEN_DRAFT,
+                    allocations: vec![Allocation::buffer("experts", location, expert_bytes,
+                        Lifetime::RESIDENT, Category::Experts, "routed experts")],
+                    deferred: vec![], sequential: vec![], reservations: vec![], allowances: vec![],
+                    resident_weights: vec![], allocation_granularity: vec![], driver_page_tables: vec![] });
+                encoder.extend(&mut contract.variables, &mut contract.components, 1).unwrap();
+                let budgets = [Location::coordinator(0), location].into_iter().enumerate().map(|(i, location)|
+                    Budget { id: format!("device{i}"), locations: vec![location], physical_bytes: 64 << 20,
+                        logical_bytes: 64 << 20, headroom: 0,
+                        baseline: Baseline::Forecast { occupied: 0, source: "test".into(), assumed: false } }).collect();
+                let solved = solve(Request { context: 64.into(), pool: Pin::Exact(64), onboard: Pin::Auto,
+                    prefill: Pin::Auto, operation: Operation::Serving, resident_weight_limit: None,
+                    spark_reply_formats: Default::default() }, budgets, &Prepared(contract)).unwrap();
+                let expected = if expert_bytes == 1 << 20 { EncoderKind::Spark { rank: 0 } }
+                    else { EncoderKind::Rtx { gpu: 0 } };
+                assert_eq!(encoder.admitted(&solved).unwrap().kind, expected);
+                let roots = solved.facts.allocations.iter().filter(|a| a.group == "vision packed weight arena")
+                    .collect::<Vec<_>>();
+                assert_eq!(roots.len(), 1);
+                assert_eq!(roots[0].bytes, encoder.inventory.arena.bytes() as u64);
+                let aliases = solved.facts.allocations.iter().filter(|a| a.view.as_ref()
+                    .is_some_and(|v| v.backing == roots[0].id)).count();
+                assert_eq!(aliases, encoder.inventory.arena.views().len());
+                let tails = solved.facts.allocation_granularity.iter().filter(|tail| tail.backings.iter()
+                    .any(|b| b.backing == roots[0].id)).count();
+                assert_eq!(tails, usize::from(matches!(expected, EncoderKind::Rtx { .. })));
+            }
+        }
+    }
+
 }

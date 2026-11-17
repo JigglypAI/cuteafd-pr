@@ -749,7 +749,11 @@ exchange flags, never target exchange slots. `SPECULATOR=off` remains the
 default. Full-model served lossless qualification is still pending (#2261);
 this is not a performance claim. `TP2_DFLASH` does not select this GQA split.
 
-Kimi K3 and Step-5 are text-only; dense Qwen has media off. GLM 5.3 / ML4,
+Kimi K3, MiniMax and Step-5 production serving remain text-only; dense Qwen
+has media off. Kimi and MiniMax `plan --layout` now reserve their bundled
+still-image tower as an independent packed arena plus phase-peak scratch,
+Spark-first with RTX fallback in the joint admission solve. Planning does not
+qualify native production execution (#1984, #1779). GLM 5.3 / ML4,
 GLM Flash, MiMo, Qwen4 and Muse carry their own towers. Native GLM Flash EXLR8
 K4 min/max examples use automatic bundled vision; the planner admits its resident
 weights and scratch alongside the KV pool and routed experts.

@@ -91,7 +91,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
                 "Supply the bundled dspark/config.json and native safetensors headers.");return empty(notes); }
         }
     } else { None };
-    let request = FactsRequest { spark_rank_bytes: Vec::new(), checkpoint: input.checkpoint(), cfg, catalog, manifest_path: &manifest_path,
+    let request = FactsRequest { vision: report.vision, vision_replicas: opts.vision_replicas, media_cache_bytes: opts.media_cache_bytes, spark_rank_bytes: Vec::new(), checkpoint: input.checkpoint(), cfg, catalog, manifest_path: &manifest_path,
         manifest: manifest.clone(), attention: Some(attention), split_wire: opts.minimax_split_wire, physical_devices: &physical_devices, coordinator: Coordinator::Planned { cards: cards.clone() }, spark_ranks: ranks,
         spark_bytes, prefill: shape, context_tokens: opts.context_tokens, pool_tokens: opts.pool_tokens, sequences,
         host, host_cache_bytes: opts.host_cache_bytes, prefix_entries: opts.prefix_entries("minimax_m3"), drafter,
@@ -102,13 +102,6 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
         Err(refused) => { report.refuse_placement(refused.what, refused.how); return empty(notes); }
     };
     opts.apply_spark_capacities(&mut inputs.budgets);
-    inputs.vision = match crate::placement::still_encoder::StillEncoder::planned(input.checkpoint(),
-        report.vision, opts.vision_replicas, &inputs.budgets,
-        opts.media_cache_bytes.unwrap_or((8 << 30).min(host.0 / 20))) {
-        Ok(vision) => vision,
-        Err(error) => { report.refuse_placement(format!("MiniMax bundled vision inventory refused: {error:#}"),
-            "Supply the bundled CLIP tower tensors or use --vision off."); return empty(notes); }
-    };
     if let LocalPackage::Missing(reason) = &inputs.local {
         notes.push(format!("MiniMax RTX onboarding unavailable: {reason}"));
     }
