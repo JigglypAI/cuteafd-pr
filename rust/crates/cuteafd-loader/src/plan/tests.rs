@@ -3868,8 +3868,10 @@ fn glm5_flash_layout_charges_the_engine_step_workspaces_and_headroom() {
     let f32 = planned(GlmfKdaState::F32, false, &s16_path);
     let bf16 = planned(GlmfKdaState::Bf16, false, &s16_path);
     let tile = planned(GlmfKdaState::Bf16Tile, false, &s16_path);
+    // State, not the grown KV pool: the pool absorbs whatever memory the
+    // precision leaves, so it must not mask the state comparison.
     let state_bytes = |memory: &cuteafd_core::memory_layout::MemoryLayout| memory.devices[0].items.iter()
-        .filter(|i| i.category == Category::Kv && i.group != "MLA pools").map(|i| i.bytes).sum::<u64>();
+        .filter(|i| i.category == Category::Kv && i.group != "KV pool").map(|i| i.bytes).sum::<u64>();
     assert!(state_bytes(&f32) > state_bytes(&bf16));
     assert_eq!(state_bytes(&bf16), state_bytes(&tile));
     let w8_s16 = planned(GlmfKdaState::Bf16, true, &s16_path);
@@ -4645,7 +4647,9 @@ fn glm5_flash_layout_uses_physical_candidate_scratch_without_double_counting_ove
             .filter(|i| i.group == "weight arena").map(|i| i.bytes).sum::<u64>();
         assert!(weight_bytes(&explicit) >= options.drafter_bytes);
         assert_eq!(bytes(&explicit,0,Category::Workspace), 0);
-        assert_eq!(explicit.pool_tokens, simulated.pool_tokens);
+        assert!(explicit.pool_tokens > simulated.pool_tokens,
+            "the weight-only override returns the inferred drafter's runtime to the grown pool: {} vs {}",
+            explicit.pool_tokens, simulated.pool_tokens);
         options.glmf_drafter_disabled = true;
         let disabled = run(&options);
         assert_eq!(bytes(&disabled,0,Category::Drafter), 0);
@@ -6245,7 +6249,9 @@ fn glm_flash_pool_marks_charge_their_reserved_unit_beside_the_pool() {
     let arena = layout(false, None);
     assert_eq!(item(&arena, "marks"), 14 * rank.retained_mark_bytes);
     assert!(pool.pool_tokens >= arena.pool_tokens, "{} {}", pool.pool_tokens, arena.pool_tokens);
-    let more = (pool.pool_tokens - arena.pool_tokens) as i64 * unit as i64 / 256;
+    // The pool's charged bytes, not a token linearization, explain the free
+    // delta once the unbounded default grows into every byte the arena returns.
+    let more = item(&pool, "KV pool") as i64 - item(&arena, "KV pool") as i64;
     assert_eq!(pool.devices[0].free_bytes() - arena.devices[0].free_bytes(),
         (14 * rank.retained_mark_bytes - GLMF_POOL_MARK_RESERVED_UNITS * unit) as i64 - more);
 }
