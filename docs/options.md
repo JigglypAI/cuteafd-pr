@@ -502,6 +502,12 @@ for its entire invocation, including container creation, native cache keys and
 sealed metadata, so a concurrent default-tag move cannot change its build inputs.
 Versioned `tc-*` image tags remain available for older checkouts.
 
+`./wip.sh --from-slot NAME` reuses that slot's seed within the selected
+`WIP_INSTANCE`/`WIP_ROOT`, rather than choosing the least-loaded seed. New
+builds record `slots/NAME/seed-host`; older slots are located with bounded
+instance-container probes. An explicit `--seed HOST` that conflicts with the
+source seed fails with the host and source path before cloning.
+
 The host-only environment overrides `CUTEAFD_SPARKNEST_RUN_DIR` and
 `CUTEAFD_FUSE_SYSFS_ROOT` select the source directories for the optional
 read-only SparkNest control and FUSE connection mounts (defaults
