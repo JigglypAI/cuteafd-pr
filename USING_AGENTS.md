@@ -291,7 +291,7 @@ orchestrator's to use; TJ isn't using these subscriptions.
 | `grok` (X Premium+) | `grok-4.7` (default), `grok-4.7-build-fast` | `--always-approve`, `--prompt-file`, `--reasoning-effort` | mechanical work; a fallback when Codex is down or out of quota |
 | `agy` (Google Antigravity) | `gemini-4-carbon-high` (default, TJ 2026-11-11), `gemini-4-carbon-medium`/`-low`, `gemini-4-argon-*`, `gemini-3.8-flash-*` | `--dangerously-skip-permissions`, `-p`, `--effort`, `--add-dir` | second opinions on hard kernel and technical problems, vision, deep research and search |
 
-`ext-agent.py start --tool agy` always passes `--model`: an explicit model wins, `--effort low|medium|high` pins `gemini-4-carbon-{effort}`, and neither pins `gemini-4-carbon-high`.
+`ext-agent.py start --tool agy` and `ext-launch.sh agy` always pass `--model`: an explicit model wins, `--effort low|medium|high` pins `gemini-4-carbon-{effort}`, and neither pins `gemini-4-carbon-high`.
 
 Use the interactive stdlib driver for a worker that needs steering or answers:
 
