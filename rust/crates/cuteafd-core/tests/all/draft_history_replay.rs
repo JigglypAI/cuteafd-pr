@@ -78,6 +78,73 @@ fn replay(head: HeadScore, control: DraftControl) -> ([Tally; 2], u64) {
     (tallies, policy.stats().head_skips)
 }
 
+/// Independent headless mirror keeps the old prior-eight counterfactual
+/// available without exposing a runtime policy knob or changing fixture data.
+fn code_first_reference(prior: f64) -> Tally {
+    use std::collections::{HashMap, VecDeque};
+    let mut rounds = rounds();
+    rounds.sort_by_key(|round| !round.code); // Stable: preserve every request's round order.
+    let mut server: [VecDeque<bool>; BLOCK] = std::array::from_fn(|_| VecDeque::new());
+    let mut requests: HashMap<u64, VecDeque<(usize, usize)>> = HashMap::new();
+    let mut tally = Tally::default();
+    for round in rounds {
+        let request = requests.entry(round.id).or_default();
+        let mut length = 0;
+        for position in 0..BLOCK {
+            let reached = request.iter().filter(|(reached, _)| position < *reached).count();
+            let accepted = request.iter().filter(|(reached, accepted)| position < *reached && position < *accepted).count();
+            let global = if server[position].is_empty() { 1. } else {
+                server[position].iter().filter(|&&hit| hit).count() as f64 / server[position].len() as f64 };
+            length += 1;
+            if (accepted as f64 + prior * global) / (reached as f64 + prior) <= 0.5 { break; }
+        }
+        let accepted = round.accepted.min(length);
+        let reached = length.min(accepted + 1);
+        if request.len() == 8 { request.pop_front(); }
+        request.push_back((reached, accepted));
+        for position in 0..reached {
+            if server[position].len() == 256 { server[position].pop_front(); }
+            server[position].push_back(position < accepted);
+        }
+        if !round.code {
+            tally.rounds += 1;
+            tally.drafts += length;
+            tally.tokens += accepted + 1;
+            tally.short += usize::from(length <= 1);
+        }
+    }
+    tally
+}
+
+#[test]
+fn code_first_requests_adapt_with_fewer_rows_without_losing_prose_tokens() {
+    let mut rounds = rounds();
+    rounds.sort_by_key(|round| !round.code);
+    let mut policy = DraftHistory::new(DrafterSpec { block: BLOCK, head: HeadScore::None, copy: 0 }, DraftControl::History);
+    let mut prose = Tally::default();
+    for round in rounds {
+        let length = policy.plan(&[(round.id, BLOCK)], 64)[0];
+        let accepted = round.accepted.min(length);
+        policy.observe(&[DraftOutcome { id: round.id, proposed: length, accepted, censored: false }], false);
+        if !round.code {
+            prose.rounds += 1;
+            prose.drafts += length;
+            prose.tokens += accepted + 1;
+            prose.short += usize::from(length <= 1);
+        }
+    }
+    assert_eq!(prose, code_first_reference(2.), "reference mirror must match the production policy");
+    let old = code_first_reference(8.);
+    // Unchanged checked-in sample, stable code-first order: rows/round
+    // prior2 4.332 versus prior8 5.112. No cohort selection or reseeding.
+    let rows = |tally: Tally| (tally.drafts + tally.rounds) as f64 / tally.rounds as f64;
+    let tokens = |tally: Tally| tally.tokens as f64 / tally.rounds as f64;
+    eprintln!("code-first prior2: {prose:?}, rows {:.6}, tokens {:.6}; prior8: {old:?}, rows {:.6}, tokens {:.6}",
+        rows(prose), tokens(prose), rows(old), tokens(old));
+    assert!(rows(prose) <= 0.9 * rows(old), "prose verify rows did not improve sufficiently");
+    assert!(tokens(prose) >= 0.9 * tokens(old), "prose tokens per round fell too far");
+}
+
 #[test]
 fn history_drafts_long_on_code_and_short_on_prose() {
     let ([fixed_prose, fixed_code], _) = replay(HeadScore::None, DraftControl::Fixed(BLOCK));
