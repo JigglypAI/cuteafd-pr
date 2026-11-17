@@ -587,7 +587,7 @@ pub(super) fn resolve_with_owners(
     } else { args.pool_tokens };
     let mut facts = cuteafd_loader::placement::PoolFacts::new(&totals, serving_context, requested, 512);
     facts.encoding_limit = Some(131_072u64.saturating_sub(tails) * 512);
-    let pool = cuteafd_loader::placement::prepare_pool(facts).unwrap();
+    let pool = cuteafd_loader::placement::prepare_pool(facts)?;
     // An explicit pool below the pinned context is the first typed refusal;
     // zero and an omitted pool both selected automatic admission above.
     pool.validate_explicit()?;

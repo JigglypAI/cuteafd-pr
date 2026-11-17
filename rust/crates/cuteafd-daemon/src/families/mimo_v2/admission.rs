@@ -502,7 +502,7 @@ fn preflight_shape(
     use cuteafd_loader::placement::planner::{Baseline, EmbeddingHome, Operation, Phase, PrefillShape};
     let pool = cuteafd_loader::placement::prepare_pool(cuteafd_loader::placement::PoolFacts::new(
         &memory.iter().map(|sample| sample.total_bytes).collect::<Vec<_>>(),
-        serving_context, Some(args.pool_tokens as u64), spark_profiles.steady.pool_unit_rows)).unwrap();
+        serving_context, Some(args.pool_tokens as u64), spark_profiles.steady.pool_unit_rows))?;
     let policy = pool.capacity_policy(u32::try_from(concurrency)?);
     let report = reservation_report(&spark_profiles.steady, &memory, policy)?;
     let intake_probe_bytes = cuteafd_loader::families::mimo_v2::admission::spark_intake_probe_bytes(
