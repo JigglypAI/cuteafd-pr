@@ -64,7 +64,7 @@ mod spark_tests {
 
     #[test]
     fn provenance_names_the_admitted_layout_and_graph_arena() {
-        let sample = cuteafd_loader::placement::RuntimeSample { device: 0, total_bytes: 96 << 30,
+        let sample = cuteafd_loader::placement::RuntimeSample { device: 0, physical_bytes: Some(96 << 30), total_bytes: 96 << 30,
             free_bytes: 80 << 30, context_bytes: 0, module_bytes: 0, sms: 188,
             arch: "sm_120".into(), driver: "test".into() };
         let provenance = super::Provenance { layout: "snapshot/x; context/1048576".into(),

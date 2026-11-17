@@ -1354,7 +1354,7 @@ mod tests {
         let report = ModelAdmissionResponse { rank: 2, resident_bytes: assignment.resident_bytes,
             slices: assignment.slices.clone(), mapped_ring_bytes: 800, host_exchange_bytes: 200,
             row_indices_bytes: 400, runtime: SparkRuntimeInventory { detail: Default::default(),
-                sample: RuntimeSample { device: 0, total_bytes: 121 << 30, free_bytes: 100 << 30,
+                sample: RuntimeSample { device: 0, physical_bytes: Some(121 << 30), total_bytes: 121 << 30, free_bytes: 100 << 30,
                     context_bytes: 1 << 30, module_bytes: 1 << 20, sms: 48,
                     arch: "sm_121".into(), driver: "test".into() },
                 workspace_bytes: 100, pinned_workspace_bytes: 0 } };

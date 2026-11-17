@@ -1607,7 +1607,7 @@ mod reconciliation_tests {
     use anyhow::Context as _;
 
     fn sample(device: i32) -> cuteafd_loader::placement::RuntimeSample {
-        cuteafd_loader::placement::RuntimeSample { device, total_bytes: 96 << 30, free_bytes: 90 << 30,
+        cuteafd_loader::placement::RuntimeSample { device, physical_bytes: Some(96 << 30), total_bytes: 96 << 30, free_bytes: 90 << 30,
             context_bytes: 577 << 20, module_bytes: 12 << 20, sms: 188, arch: "sm_120".into(), driver: "test".into() }
     }
 

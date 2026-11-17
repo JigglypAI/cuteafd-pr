@@ -518,7 +518,7 @@ mod tests {
     #[test]
     fn reconciliation_registers_the_identity_the_shared_capture_reads() -> anyhow::Result<()> {
         let sample = |device: i32| cuteafd_loader::placement::RuntimeSample { device,
-            total_bytes: 96 << 30, free_bytes: 80 << 30, context_bytes: 1 << 20, module_bytes: 0,
+            physical_bytes: Some(96 << 30), total_bytes: 96 << 30, free_bytes: 80 << 30, context_bytes: 1 << 20, module_bytes: 0,
             sms: 188, arch: "sm_120".into(), driver: "580.65".into() };
         let provenance = super::reconciliation_provenance("commit", "false", "toolchain", "native",
             "programs", "layout", &[sample(0), sample(1)], 2, &[vec![0], vec![1]],

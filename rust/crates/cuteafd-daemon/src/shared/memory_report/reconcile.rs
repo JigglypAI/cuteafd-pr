@@ -228,7 +228,7 @@ mod tests {
 
     #[test]
     fn muse_ready_and_first_request_resolve_physical_device_samples() {
-        let device = cuteafd_core::RuntimeSample { device: 3, total_bytes: 1000,
+        let device = cuteafd_core::RuntimeSample { device: 3, physical_bytes: Some(1000), total_bytes: 1000,
             free_bytes: 250, context_bytes: 100, module_bytes: 0, sms: 96,
             arch: "sm_120".into(), driver: "test".into() };
         let owners = cuteafd_core::memory_policy::DeviceBreakdown { device: "rtx0".into(),
@@ -352,7 +352,7 @@ mod tests {
             tensor: None, format: None, bytes, allocations: 1, method: "fixture".into() };
         let report = ModelAdmissionResponse { rank: 2, resident_bytes: 100, slices: vec![],
             runtime: SparkRuntimeInventory { sample: RuntimeSample { device: 0,
-                total_bytes: 1000, free_bytes: 500, context_bytes: 123, module_bytes: 0,
+                physical_bytes: Some(1000), total_bytes: 1000, free_bytes: 500, context_bytes: 123, module_bytes: 0,
                 sms: 48, arch: "sm_121".into(), driver: "test".into() },
                 workspace_bytes: 20, pinned_workspace_bytes: 3,
                 detail: SparkRuntimeDetail { allocations: vec![term("device", 120), term("pinned", 3),
