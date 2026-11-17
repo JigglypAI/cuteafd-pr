@@ -288,6 +288,16 @@ def test_kimi_unset_spark_budget_leaves_serve_on_the_family_default(tmp_path: Pa
     assert "--spark-memory-cap" not in _line(_kimi(tmp_path, ""), "serve-kimi --snapshot")
 
 
+def test_kimi_auto_places_bundled_tower_on_admitted_spark(tmp_path):
+    plan={**PLANNED,"encoder":{"kind":{"kind":"spark","rank":1},"replicas":[],
+        "weights":894718080,"scratch":1538887936},"max_image_tokens":16698}
+    result=_kimi(tmp_path,encoder_plan=plan)
+    serve=_line(result,"serve-kimi --snapshot")
+    assert _flag(serve,"--vision")=="spark:1"
+    assert _flag(serve,"--vision-peers")=="10.0.0.2:19442"
+    assert "--encoder-max-tokens 16698" in result.stderr
+
+
 @pytest.mark.parametrize("keys,diagnostic", [
     ("SPECULATOR=dflash2\n", "SPECULATOR=dflash2 needs SPECULATOR_MODEL_ID"),
     ("SPECULATOR=mtp\n", "SPECULATOR=mtp does not apply to kimi_k3"),
