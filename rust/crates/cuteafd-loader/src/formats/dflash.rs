@@ -1633,7 +1633,7 @@ mod tests {
                 let make = |mode| cfg.serving_runtime_layout(mode, capacity, 8192, 16384, 188, 0, cache).unwrap();
                 let fp8 = make(GlmDraftRepresentation::Fp8Only);
                 assert!(fp8.complete_fp8_body());
-                assert_eq!(fp8.weights(), &cfg.complete_fp8_weight_layout().unwrap());
+                assert_eq!(fp8.weights(), cfg.complete_fp8_weight_layout().unwrap());
                 for name in ["self_attn.q_b_proj.weight", "self_attn.o_proj.weight", "kv_b_proj.weight.uk", "kv_b_proj.weight.uv"] {
                     assert!(fp8.weight_arena_requests().iter().any(|(n,_)|n.ends_with(&format!("{name}.payload"))), "{name}");
                     assert!(fp8.weight_arena_requests().iter().any(|(n,_)|n.ends_with(&format!("{name}.scales"))), "{name}");

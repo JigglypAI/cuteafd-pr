@@ -132,6 +132,13 @@ pub(crate) struct GlobalWeights<'a> {
     pub(crate) core_head: Option<CoreWeights<'a>>,
 }
 
+#[cfg(test)]
+impl<'a> GlobalWeights<'a> {
+    pub(super) fn draft_head_fixture(head: Option<Allocation<'a>>, core_head: Option<CoreWeights<'a>>) -> Self {
+        Self { operands: head.into_iter().map(|owner| ("head", owner)).collect(), core_head }
+    }
+}
+
 impl GlobalWeights<'_> {
     pub(super) fn check_device(&self, device: Device<'_>) -> Result<()> {
         ensure!(self.operands.values().chain(self.core_head.iter().flat_map(|weights|

@@ -1067,6 +1067,62 @@ mod tests {
     }
 
     #[test]
+    fn native_head_replica_peer_copy_is_byte_exact_and_one_backing_for_bf16_k4_k6_k8() -> Result<()> {
+        use crate::shared::memory::{device::Device, receipts::Inventory};
+        use cuteafd_loader::{formats::{exl3_storage::Exl3Codebook, dense_trellis::TrellisSide,
+            trellis_core::{CoreProjection, CoreSplit}}, families::kimi_k3::core::CoreInventory,
+            placement::planner::{CoordinatorDevices, Lifetime}, serving_capacity::WeightArenaLayout};
+        let fixture = cuteafd_ffi::native_library_lifetime_fixture::Fixture::build_for_tests()?;
+        let library = fixture.load()?;
+        fixture.peer_ordering_model(&library)?;
+        fixture.immediate_copies(&library)?;
+        let devices = [Device { library: &library, id: 0 }, Device { library: &library, id: 1 }];
+        let stream = Stream::new(devices[0])?;
+        for bits in [0, 4, 6, 8] {
+            let mut core = CoreInventory::default();
+            if bits != 0 { core.projections.insert("language_model.lm_head".into(), CoreProjection {
+                stem: "language_model.lm_head".into(), bits, codebook: Exl3Codebook::Mcg,
+                shape: [128, 128], stored_outputs: 128, split: CoreSplit::Whole, source_bytes: 0 }); }
+            let layout = cuteafd_loader::placement::families::kimi::draft_head_replica(&core, 128, 128)?;
+            let replica = HeadReplica::allocate(devices[0], layout.clone(), &core)?;
+            let source_arena = crate::shared::memory::weight_arena::DeviceWeightArena::new(devices[1],
+                WeightArenaLayout::new("source", layout.views().iter().map(|(name,view)| (name.clone(),view.bytes())))?,
+                cuteafd_core::memory_layout::ArenaTag::weights("test-head"))?;
+            let upload = |name, bytes| -> Result<Allocation<'_>> {
+                let owner = source_arena.view(name, bytes)?;
+                let data = (0..bytes).map(|i| ((i*17+bits*3)%251) as u8).collect::<Vec<_>>();
+                devices[1].run(|| library.copy_h2d(owner.buffer, &data))?;
+                Ok(owner)
+            };
+            let source = if let Some(weight) = &replica.core {
+                GlobalWeights::draft_head_fixture(None, Some(crate::shared::dense_trellis::CoreWeights {
+                    payload: upload("head.trellis",weight.payload.buffer.bytes)?,
+                    suh: upload("head.suh",weight.suh.buffer.bytes)?, svh: upload("head.svh",weight.svh.buffer.bytes)?,
+                    shape: weight.shape, side: TrellisSide::Output, bits, codebook: weight.codebook }))
+            } else { GlobalWeights::draft_head_fixture(Some(upload("head",128*128*2)?), None) };
+            replica.copy(&source, &stream)?;
+            let mut inventory = Inventory::new(CoordinatorDevices::new(&[0,1])?, "replica", Lifetime::RESIDENT,
+                cuteafd_core::memory_layout::Category::Drafter, "replica");
+            let planes = match &replica.core {
+                Some(weight) => vec![&weight.payload,&weight.suh,&weight.svh],
+                None => vec![replica.bf16.as_ref().unwrap()],
+            };
+            for (index, owner) in planes.into_iter().enumerate() {
+                let mut data = vec![0;owner.buffer.bytes];
+                devices[0].run(||library.copy_d2h(&mut data,owner.buffer))?;
+                assert_eq!(data,(0..data.len()).map(|i| ((i*17+bits*3)%251) as u8).collect::<Vec<_>>());
+                owner.inventory(&mut inventory,&format!("plane.{index}"))?;
+            }
+            let mut census = crate::shared::memory::receipts::Census::default();
+            census.owners(inventory.receipts);
+            census.normalize(cuteafd_loader::placement::planner::PhaseOrder::DRAFT_THEN_TARGET)?;
+            assert_eq!(census.receipts.iter().filter(|r|r.allocation.view.is_none()).count(),1);
+            assert_eq!(census.receipts.iter().find(|r|r.allocation.view.is_none()).unwrap().allocation.bytes,layout.bytes() as u64);
+        }
+        Ok(())
+    }
+
+    #[test]
     fn common_drafter_drops_before_borrowed_target_owner() {
         struct Owner(&'static str, Rc<RefCell<Vec<&'static str>>>);
         impl Drop for Owner { fn drop(&mut self) { self.1.borrow_mut().push(self.0); } }
@@ -1076,10 +1132,9 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires CUTEAFD_NATIVE_LIFETIME_FIXTURE_DIR; CPU-only fake DSO"]
     fn local_bridge_drains_without_peer_waits_and_closes_after_failure() -> Result<()> {
         use cuteafd_ffi::native_library_lifetime_fixture::Fixture;
-        let fixture = Fixture::build()?;
+        let fixture = Fixture::build_for_tests()?;
         let library = fixture.load()?;
         let device = crate::shared::memory::device::Device { library: &library, id: 0 };
         fixture.immediate_copies(&library)?;
