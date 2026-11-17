@@ -501,6 +501,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
             "Supply supported Spark endpoint geometry."); return memory; }
     };
     let mut recipe = KimiRecipe {
+        vision: None,
         expert_usage: kimi::usage_geometry(cfg, opts.expert_usage),
         context, gpus, placement: attention, attention: modes,
         prefill, lanes: LANES, spark_links: ranks > 0,
@@ -598,6 +599,13 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
             "Check the requested card capacities."); return memory; }
     };
     budgets.push(kimi::host_budget(host_total, host_available));
+    recipe.vision = match crate::placement::still_encoder::StillEncoder::planned(input.checkpoint(),
+        report.vision, opts.vision_replicas, &budgets,
+        opts.media_cache_bytes.unwrap_or((8 << 30).min(host_total / 20))) {
+        Ok(vision) => vision,
+        Err(error) => { report.refuse_placement(format!("Kimi bundled vision inventory refused: {error:#}"),
+            "Supply the bundled MoonViT3d tensors or use --vision off."); return memory; }
+    };
     report.host_budget_bytes = host_quota;
     let mut host_items = vec![cuteafd_core::memory_layout::host_table_item("Kimi host scoring logits", scoring_bytes),
         cuteafd_core::memory_layout::host_table_item("Kimi reusable H2D staging (estimated)", kimi::HOST_UPLOAD_BYTES)];
@@ -612,8 +620,17 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
         (8 << 30).max(host_total / 10), host_quota, host_items);
     let resolved = recipe.admit(kimi::request(crate::placement::planner::Context::resolve(context, (opts.context_tokens > 0).then_some(opts.context_tokens)), requested_pool, onboard, prefill,
         crate::placement::planner::Operation::Serving, ResidentWeights(opts.weight_budget_bytes), opts.spark_reply_formats), budgets);
+    let mut vision_items = vec![Vec::new(); ranks];
     let onboarded = match resolved {
         Ok(selection) => {
+            report.encoder = recipe.vision.as_ref().and_then(|vision| vision.admitted(&selection.solved));
+            report.phase_ledger = Some(crate::plan::SolvedPhaseLedger::from(&selection.solved));
+            for (rank, items) in vision_items.iter_mut().enumerate() {
+                *items = selection.solved.items(crate::placement::planner::Location {
+                    device: crate::placement::planner::Device::Spark(rank as u8),
+                    domain: crate::placement::planner::Domain::Managed }).unwrap_or_default().into_iter()
+                    .filter(|item| item.group.starts_with("vision ")).collect();
+            }
             let served = selection.solved.request.context.served(selection.solved.pool_tokens);
             memory.notes.retain(|note| !note.starts_with("Kimi API max context:"));
             memory.notes.push(format!("Kimi API max context: {served} tokens; compiled max context: {COMPILED_CAPACITY} tokens"));
@@ -674,6 +691,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
         if let Err(error) = kimi_owners(&mut device, &working, admitted.unit_rows, admitted.waves) {
             report.refuse_placement(format!("Kimi Spark execution owners: {error:#}"), "Use a supported wave count.");
         }
+        device.items.extend(vision_items[rank].clone());
         memory.devices.push(device);
     }
     memory.notes.push(format!("Spark budget {} B/rank includes rank-specific header arenas, endpoint I/O, runtime residual and typed execution owners (one prefill scratch, {} x {}-row units)",

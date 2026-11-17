@@ -17,6 +17,7 @@ pub mod perception_vision;
 mod resize;
 mod spans;
 pub mod step5;
+pub mod still_tower;
 
 /// Bundled audio execution selected by the checkpoint's declaration, not its LM family.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
