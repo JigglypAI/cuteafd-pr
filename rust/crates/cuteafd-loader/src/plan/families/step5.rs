@@ -498,6 +498,7 @@ impl Family for Step5 {
             else { return None; };
         Some(TensorRole::layer(component, layer))
     }
+    fn component_hint(&self, _: Component) -> Option<Hint> { None }
     fn optional(&self, component: Component) -> bool {
         matches!(component, Component::Vision | Component::Speculator)
     }
