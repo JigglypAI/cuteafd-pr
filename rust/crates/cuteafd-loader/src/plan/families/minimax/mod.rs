@@ -268,10 +268,7 @@ impl Family for MiniMaxM3 {
         Some(TensorRole::layer(component, layer))
     }
     fn component_hint(&self, component: Component) -> Option<Hint> {
-        if component == Component::Vision {
-            return Some(Hint { what: "MiniMax M3 bundled vision is planned; production qualification remains pending (#1779)".into(),
-                how: "The joint planner admits the CLIP tower, patch merge and projector arena; normal serving remains text-only until qualification.".into() });
-        }
+        if component == Component::Vision { return None; }
         let how = match component {
             Component::Attention | Component::Indexer | Component::DenseFfn | Component::SharedExpert
                 | Component::Router | Component::Norm | Component::RoutedExpert | Component::Embedding

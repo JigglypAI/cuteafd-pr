@@ -15,6 +15,7 @@ pub(crate) struct Prepared<'a, T> {
     devices: Vec<Device<'a>>,
     sparks: usize,
     dense: (Vec<DensePlan>, Vec<dense::DenseArena<'a>>),
+    media: crate::shared::vision::push::Contribution,
 }
 
 /// The caller has solved the complete host/device recipe before invoking this.
@@ -42,17 +43,18 @@ pub(crate) fn prepare<'a, T>(view: &CheckpointView, catalog: &OfficialV41Catalog
             devices.len(), experts, envelope)?;
         (push, Some((streams, ranks)))
     };
-    Ok((Prepared { push, owners, devices: devices.to_vec(), sparks, dense }, membership))
+    Ok((Prepared { push, owners, devices: devices.to_vec(), sparks, dense, media: Default::default() }, membership))
 }
 
 impl<'a, T> Prepared<'a, T> {
     /// Call while awaiting the Spark admission transaction. No initialized owner
     /// escapes a declined, failed, or partially committed group.
     pub(crate) fn receive(self, catalog: &OfficialV41Catalog) -> Result<(T, Vec<Vec<PushedExperts<'a>>>)> {
-        let Self { push, owners, devices, sparks, dense } = self;
+        let Self { push, owners, devices, sparks, dense, media } = self;
         let (received, ()) = push.receive_sets_with(devices, Some(catalog), sparks, Some(Ok(dense)), || ());
         let experts = PushPolicy::Required.committed(received)?
             .context("MiniMax group did not publish coordinator ranks")?;
+        media.commit()?;
         Ok((owners, experts))
     }
 }
@@ -171,6 +173,12 @@ fn serving_expert_plan(backings: &[cuteafd_loader::placement::families::minimax_
 }
 
 impl<'a> PendingServing<'a> {
+    pub(crate) fn with_media(mut self, snapshot: &std::path::Path, media: crate::shared::vision::push::Contribution) -> Result<Self> {
+        let (plans, arenas)=dense::plan_records(snapshot,media.records(),&self.prepared.devices,self.prepared.sparks)?;
+        self.prepared.dense.0.extend(plans);self.prepared.dense.1.extend(arenas);
+        self.prepared.media=media;Ok(self)
+    }
+
     pub(crate) fn finish(self, catalog: &OfficialV41Catalog,
         pending: Option<crate::shared::placement::PendingSparkAdmission>) -> Result<ServingWeights<'a>> {
         let Self { prepared, expected } = self;

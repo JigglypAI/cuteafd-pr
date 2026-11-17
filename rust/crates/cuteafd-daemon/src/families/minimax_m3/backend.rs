@@ -127,6 +127,7 @@ impl PolicyProbe {
 /// No allocations or placement choices here: startup passes its admitted context
 /// and host-prefix config, and the Owners borrow pins every native backing.
 pub(crate) struct MiniMaxBackend<'e, 'a> {
+    media_enabled: bool,
     snapshot: std::path::PathBuf,
     owners: &'e Owners<'a>,
     cfg: &'e MiniMaxM3Config,
@@ -145,6 +146,7 @@ pub(crate) struct MiniMaxBackend<'e, 'a> {
 }
 
 impl<'e, 'a> MiniMaxBackend<'e, 'a> {
+    pub(crate) fn with_media_enabled(mut self, enabled: bool) -> Self { self.media_enabled=enabled; self }
     pub(crate) fn with_probe_snapshot(mut self, snapshot: &Path) -> Self {
         self.snapshot = snapshot.to_owned(); self
     }
@@ -173,7 +175,7 @@ impl<'e, 'a> MiniMaxBackend<'e, 'a> {
         }
         let schedule = Requests::new(state.capacity, served_context, cfg.layers, rank.prefill.len())?;
         drop(state);
-        Ok(Self { snapshot: Default::default(), owners, cfg, execution: RefCell::new(execution), schedule, context: served_context,
+        Ok(Self { media_enabled: false, snapshot: Default::default(), owners, cfg, execution: RefCell::new(execution), schedule, context: served_context,
             host, profile: RefCell::new([0.0; 2]), policy_probe:RefCell::new(PolicyProbe::default()), identities: RefCell::new(BTreeMap::new()),
             next_identity: Cell::new(1), pending: RefCell::new(None), terminal: Cell::new(false),
             selector_receipts: RefCell::new(None), packing })
@@ -356,14 +358,40 @@ impl<'e, 'a> Backend<'a> for MiniMaxBackend<'e, 'a> {
     }
     fn prepare(&self, job: NativeRequest, tokens: Vec<u32>) -> Result<(scheduler::Prompt, RequestMedia, Vec<EncodeJob>)> {
         self.owners.storage.embedding.check(&tokens)?;
-        crate::shared::probe::still::prepare(job, tokens, u32::try_from(self.cfg.vocab_size)?, self.cfg.hidden,
-            self.context, &self.snapshot, cuteafd_loader::media::ImageFamily::MiniMax)
+        if job.probe.as_ref().is_some_and(|p|!p.spec.media.is_empty()) {
+            return crate::shared::probe::still::prepare(job,tokens,self.cfg.vocab_size as u32,self.cfg.hidden,
+                self.context,&self.snapshot,cuteafd_loader::media::ImageFamily::MiniMax);
+        }
+        ensure!(self.media_enabled || job.media.is_empty(),"vision is disabled");
+        if job.media.is_empty() {
+            return crate::shared::probe::still::prepare(job,tokens,self.cfg.vocab_size as u32,self.cfg.hidden,
+                self.context,&self.snapshot,cuteafd_loader::media::ImageFamily::MiniMax);
+        }
+        let tokenizer=cuteafd_loader::cached_tokenizer(&self.snapshot)?;
+        let ids=tokenizer.added_token_ids(&["]<]image[>[","]<]start of image[>[","]<]end of image[>["]);
+        ensure!(ids.len()==3,"MiniMax image markers absent");
+        let mut job=job;
+        let mut groups=std::mem::take(&mut job.image_groups);
+        ensure!(groups.len()==job.media.len(),"MiniMax source groups absent");
+        for group in &mut groups {
+            group.fragments=vec![cuteafd_loader::media::ImageFragment::Tokens(vec![ids[1]]),
+                cuteafd_loader::media::ImageFragment::Features {image:0,placeholder:ids[0]},
+                cuteafd_loader::media::ImageFragment::Tokens(vec![ids[2]])];
+        }
+        crate::shared::vision::still::Binding::prepare(job,tokens,self.cfg.vocab_size as u32,self.cfg.hidden,
+            self.context,ids[0],groups)
     }
     fn probe_features(&self, prompt: &scheduler::Prompt, media: &mut RequestMedia,
         cache: &mut EmbeddingCache, snapshot: &Path) -> Result<()> {
-        crate::shared::probe::still::features(prompt, media, cache, snapshot, cuteafd_loader::media::ImageFamily::MiniMax)
+        if prompt.job.probe.as_ref().is_some_and(|p|p.spec.feature_scoring()) {
+            crate::shared::probe::still::features(prompt, media, cache, snapshot, cuteafd_loader::media::ImageFamily::MiniMax)?;
+        }
+        Ok(())
     }
     fn coordinates(&self, tokens: &[u32], job: &NativeRequest, media: &RequestMedia) -> Result<()> {
+        if self.media_enabled && job.probe.as_ref().is_none_or(|p|p.spec.media.is_empty()) {
+            ensure!(media.prompt_len()==tokens.len(),"MiniMax media prompt extent");return Ok(());
+        }
         let spans = crate::shared::probe::still::spans(job, tokens, self.cfg.vocab_size as u32,
             self.context, &self.snapshot, cuteafd_loader::media::ImageFamily::MiniMax)?;
         ensure!(spans == media.spans(), "MiniMax probe media coordinates differ");
@@ -635,7 +663,7 @@ mod tests {
         let library = Arc::new(unsafe { NativeLibrary::load(&args.native_lib)? });
         let programs = library.programs()?.with_manifest(&args.manifest)?;
         let loaded = super::super::startup::load(&library, &programs, &view, &checkpoint, &cfg,
-            super::super::startup::Options {
+            super::super::startup::Options { media: &crate::shared::vision::still::Options {vision:cuteafd_loader::plan::MediaMode::Off,..Default::default()},
                 device: args.device, split_device: args.split_device, peers: &args.peers,
                 native_lib: &args.native_lib, manifest_path: &args.manifest,
                 split_wire: super::super::dense::PartialPrecision::DEFAULT,
