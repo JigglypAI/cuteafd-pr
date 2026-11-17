@@ -1826,7 +1826,7 @@ pub(super) mod tests {
     #[test]
     fn whole_mla_homes_price_transfers_and_retain_only_the_selected_native_head() -> Result<()> {
         let cfg = cfg();
-        let layout = draft_layout(2, 2, 8192);
+        let layout = draft_layout(2, 2, 1048576);
         let mut i = inputs(&cfg);
         i.draft = Some(layout.clone());
         let admitted = admit(i)?;
