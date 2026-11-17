@@ -30,7 +30,7 @@ KIMI = {"model_type": "kimi_k3", "text_config": {"model_type": "kimi_linear", "n
 KIMI_ID = "wrldsuksgo2mars/Kimi-K3-EXL3-K2"
 SIX = "".join(f"SPARK_{i}_HOST=h{i}\nSPARK_{i}_LANE_A=10.0.0.{i + 1}\n" for i in range(6))
 KIMI_KEYS = "SPARK_COUNT=6\nRTX_GPUS=2\nSPECULATOR=off\n" + SIX
-PLANNED = {"placement_supported": True, "fits": True, "spark_budget_bytes": 108 << 30}
+PLANNED = {"placement_supported": True, "fits": True, "spark_budget_bytes": 108 << 30, "encoder": None, "encoder_plan_hash": "ab" * 32}
 
 
 def _kimi(tmp_path: Path, keys: str = "", *, wip: bool = True, **kwargs):
@@ -157,7 +157,8 @@ def test_kimi_dispatches_to_serve_kimi_with_its_own_defaults(tmp_path: Path) -> 
     # The planner picks onboarded layers; no speculator or media options are passed.
     assert _flag(serve, "--rtx-expert-layers") == "auto"
     assert _flag(serve, "--max-context-tokens") == "auto"
-    for absent in ("--pool-tokens", "--vision", "--audio",
+    assert _flag(serve,"--vision")=="off"  # Fixture admits no tower; Auto falls back explicitly.
+    for absent in ("--pool-tokens",
                    "--draft", "--draft-fp8", "--mtp", "--dspark", "--local-experts"):
         assert absent not in serve.split(), absent
     workers = [line for line in result.stderr.splitlines() if "cuteafd expertd-native" in line]
@@ -166,7 +167,7 @@ def test_kimi_dispatches_to_serve_kimi_with_its_own_defaults(tmp_path: Path) -> 
     plan = _line(result, "cuteafd plan")
     assert "--spark-memory-cap" not in plan.split()
     assert all(f"--device-budget-bytes {108 << 30} " in worker for worker in workers)
-    assert "--world 6" in workers[0] and "--vision off --audio off" in plan
+    assert "--world 6" in workers[0] and "--vision auto --audio off" in plan
     assert _flag(plan, "--spark-ranks") == "6" and _flag(plan, "--rtx") == "2"
     assert _flag(plan, "--speculator") == "off" and "--require-ready" not in plan.split()
     assert "--drafter-snapshot" not in plan.split() and "--draft-fp8" not in plan.split()
@@ -291,8 +292,8 @@ def test_kimi_unset_spark_budget_leaves_serve_on_the_family_default(tmp_path: Pa
     ("SPECULATOR=dflash2\n", "SPECULATOR=dflash2 needs SPECULATOR_MODEL_ID"),
     ("SPECULATOR=mtp\n", "SPECULATOR=mtp does not apply to kimi_k3"),
     ("ATTENTION_PLACEMENT=invalid\n", "ATTENTION_PLACEMENT must be auto, context, layers or heads"),
-    ("VISION=rtx\n", "kimi_k3 bundled media execution is not qualified"),
-    ("AUDIO=spark\n", "kimi_k3 bundled media execution is not qualified"),
+    
+    ("AUDIO=spark\n", "explicit media placement requires a supported bundled vision/audio checkpoint"),
     ("EMBEDDING=host\n", "GPU token embeddings only"),
     ("RTX_EXPERT_LAYERS=max\n", "RTX_EXPERT_LAYERS must be auto, all or N"),
     ("RTX_EXPERT_LAYERS=50%\n", "RTX_EXPERT_LAYERS must be auto, all or N"),
