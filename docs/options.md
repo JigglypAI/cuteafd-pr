@@ -741,7 +741,9 @@ on one or two coordinators with target FP8 KV. The independent defaults are
 `SPECULATOR_FP8=auto` (FP8 projection weights) and `DRAFT_KV_CACHE=fp8`;
 explicit `SPECULATOR=off`, weight precision or draft KV overrides win.
 The max example uses this automatic selection, not an off pin. Qualification
-uses checkpoint identity/view and physical TP, never revision metadata or Spark count;
+uses the measured config and MC-manifest SHA-256 digests plus selected view and physical TP,
+never a repository/path string or Spark count; identical local/renamed copies qualify.
+The Inferact drafter config digest is checked independently;
 normal memory admission still decides fit. K8/whole-core FP8 target views,
 other checkpoints and target BF16 KV remain default-off.
 Cold and full-prompt warm strict sets passed 10/10 on the qualified TP2 views;

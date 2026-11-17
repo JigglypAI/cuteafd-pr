@@ -34,7 +34,8 @@ memory admission. `SPECULATOR_FP8=auto` selects FP8 projection weights and
 `DRAFT_KV_CACHE=fp8` stores the independent drafter rings. Explicit
 `SPECULATOR=off` wins; weight and ring precision overrides remain independent.
 K8/whole-core FP8 targets, other checkpoints and target BF16 KV stay default-off.
-Qualification is identity/view based, not revision or Spark-count based. Cold and
+Qualification checks config/MC-manifest/drafter-config SHA-256 digests and view, not
+repository names, local paths or Spark count; identical renamed copies qualify. Cold and
 full-prompt warm strict sets passed 10/10 on both TP2 core views; TP1 K6 has its
 own gate. FP8 weights save 1.227 GB net per GPU after scratch. Sustained C8/C16
 results, not closed-batch drain tails, select the default arm (#2261).

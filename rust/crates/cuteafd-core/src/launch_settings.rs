@@ -59,7 +59,7 @@ pub const KIMI_K31_MC: &str = "wrldsuksgo2mars/Kimi-K3.1-Pro-EXL3-K2-MC";
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct KimiDraftQualification<'a> {
-    pub model: &'a str,
+    pub content_qualified: bool,
     pub core_view: &'a str,
     pub rtx: usize,
     pub target_kv: &'a str,
@@ -68,7 +68,7 @@ pub struct KimiDraftQualification<'a> {
 
 impl KimiDraftQualification<'_> {
     pub fn qualified(self) -> bool {
-        self.model == KIMI_K31_MC && matches!(self.core_view, "original" | "k6-compact")
+        self.content_qualified && matches!(self.core_view, "original" | "k6-compact")
             && matches!(self.rtx, 1 | 2) && self.target_kv == "fp8"
             && matches!(self.draft_kv, "bf16" | "fp8")
     }
@@ -105,7 +105,7 @@ mod tests {
     use super::*;
     #[test]
     fn kimi_defaults_only_cover_qualified_identity_view_layout_and_kv() {
-        let qualified = KimiDraftQualification { model: KIMI_K31_MC, core_view: "original", rtx: 2,
+        let qualified = KimiDraftQualification { content_qualified: true, core_view: "original", rtx: 2,
             target_kv: "fp8", draft_kv: "bf16" };
         assert_eq!(kimi_speculator(None, None, qualified).unwrap().value, "dspark");
         assert_eq!(kimi_speculator(Some("auto"), Some("off"), qualified).unwrap().value, "dspark");
@@ -115,7 +115,7 @@ mod tests {
             assert_eq!(kimi_speculator(None, None, KimiDraftQualification {
                 core_view: view, rtx, draft_kv: kv, ..qualified }).unwrap().value, "dspark");
         } } }
-        for other in [KimiDraftQualification { model: "other/model", ..qualified },
+        for other in [KimiDraftQualification { content_qualified: false, ..qualified },
             KimiDraftQualification { core_view: "k8-compact", ..qualified },
             KimiDraftQualification { rtx: 3, ..qualified },
             KimiDraftQualification { target_kv: "bf16", ..qualified }] {
