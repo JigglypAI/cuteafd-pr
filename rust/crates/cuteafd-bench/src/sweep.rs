@@ -446,6 +446,12 @@ fn run_configured(url: &str, api_key: Option<&str>, levels: &[usize], post_load_
                 sustained: Some(window), ..Point::default() });
         }
     }
+    // A configured sustained sweep that measured no sustained point must fail
+    // loudly, not pass on its closed points alone.
+    if concurrency.sustained && !sweep.points.iter().any(|point| point.phase == "sustained") {
+        bail!("sustained concurrency was requested but the external sweep produced no sustained point \
+            (sustained needs a non-empty `levels` list and no sweep_c1)");
+    }
     if !levels.is_empty() || post_load_c1 {
         if let Some(window) = client.thermal_since(mark) { sweep.thermal.insert("decode".into(), window); }
     }
