@@ -786,13 +786,13 @@ uneven-completion drain penalty; sustained C8/C16 measurements in #2261 select
 the throughput arm. Sampled acceptance is not directly comparable to Inferact's
 reported 4.16 because its draft sampling/rejection method differs (#2312). `TP2_DFLASH` does not select this GQA split.
 
-MiniMax defaults to its bundled still-image tower (`VISION=auto`), placed
+MiniMax and Kimi default to their bundled still-image towers (`VISION=auto`), placed
 Spark-first with RTX fallback by joint admission. `VISION=off` keeps text-only
-serving and rejects image chat. Kimi K3 and Step-5 production serving remain text-only; dense Qwen
+serving and rejects image chat. Step-5 production serving remains text-only; dense Qwen
 has media off. Kimi and MiniMax `plan --layout` now reserve their bundled
 still-image tower as an independent packed arena plus phase-peak scratch,
-Spark-first with RTX fallback in the joint admission solve. Planning does not
-qualify native production execution (#1984, #1779). GLM 5.3 / ML4,
+Spark-first with RTX fallback in the joint admission solve. Native still-image serving uses the admitted owner through the shared vision
+runtime; the numerical drift diagnostics remain on #1984 and #1779. GLM 5.3 / ML4,
 GLM Flash, MiMo, Qwen4 and Muse carry their own towers. Native GLM Flash EXLR8
 K4 min/max examples use automatic bundled vision; the planner admits its resident
 weights and scratch alongside the KV pool and routed experts.
