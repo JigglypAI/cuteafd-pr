@@ -31,6 +31,7 @@ def _fake(monkeypatch, outputs):
         calls.append(cmd)
         Path(log_path).write_text(text)
         return code, 1.0
+    monkeypatch.setattr(gate, 'compiler_cache_env', lambda source, root, env: dict(env))
     monkeypatch.setattr(gate, 'nextest_for', lambda env: None)
     monkeypatch.setattr(gate, 'python_for', lambda source: Path('/gate-venv/bin/python'))
     monkeypatch.setattr(gate, 'run_logged', run_logged)
@@ -302,6 +303,7 @@ def test_installed_deployment_inventory_is_enabled_for_both_tiers(tmp_path, monk
         Path(path).write_text(BUILD_OK if len(calls) == 1 else
                               'test result: ok. 1 passed; 0 failed; 0 ignored\n')
         return 0, 1.
+    monkeypatch.setattr(gate, 'compiler_cache_env', lambda source, root, env: dict(env))
     monkeypatch.setattr(gate, 'nextest_for', lambda env: None)
     monkeypatch.setattr(gate, 'python_for', lambda source: Path('/gate-venv/bin/python'))
     monkeypatch.setattr(gate, 'run_logged', run_logged)
@@ -590,6 +592,7 @@ def test_scratch_is_removed_on_every_exit_unless_kept(tmp_path, monkeypatch, kee
     _scratch_tree(root)
     monkeypatch.setattr(gate, 'BUILDS', tmp_path / 'builds')
     monkeypatch.setattr(gate.signal, 'signal', lambda *a: None)
+    monkeypatch.setattr(gate, 'gate_lease', lambda: gate.nullcontext(None))
 
     def run_gate(args, root):
         if outcome == 'raise':
@@ -598,8 +601,8 @@ def test_scratch_is_removed_on_every_exit_unless_kept(tmp_path, monkeypatch, kee
     monkeypatch.setattr(gate, 'run_gate', run_gate)
     monkeypatch.setattr(sys, 'argv', ['cpu-gate', '--task', 'task'] + (['--keep'] if keep else []))
     if outcome == 'raise':
-        with pytest.raises(KeyboardInterrupt):
-            gate.main()
+        assert gate.main() in (130, 143)
+        assert json.loads((root / 'cpu-gate.json').read_text())['verdict'] == 'terminated'
     else:
         assert gate.main() == 0
     for side in ('head', 'base'):
@@ -631,7 +634,7 @@ def test_interrupt_stops_running_suites(tmp_path):
         gate.STOPPING.clear()
 
 
-def test_gate_scrubs_inherited_compiler_cache_env_and_records_names(tmp_path, monkeypatch):
+def test_gate_keeps_cargo_cache_and_scrubs_only_script_fixtures(tmp_path, monkeypatch):
     (tmp_path / 'logs').mkdir()
     inherited = {
         'CMAKE_C_COMPILER_LAUNCHER': '/tmp/kache',
@@ -662,6 +665,7 @@ def test_gate_scrubs_inherited_compiler_cache_env_and_records_names(tmp_path, mo
 
     monkeypatch.setattr(gate, 'prepare', lambda source, root, owned=False: None)
     monkeypatch.setattr(gate, 'checked', lambda cmd, **k: 'deadbeef' if 'rev-parse' in cmd else '')
+    monkeypatch.setattr(gate, 'compiler_cache_env', lambda source, root, env: dict(env))
     monkeypatch.setattr(gate, 'nextest_for', lambda env: None)
     monkeypatch.setattr(gate, 'python_for', lambda source: Path('/usr/bin/python3'))
     monkeypatch.setattr(gate, 'run_logged', run_logged)
@@ -670,14 +674,17 @@ def test_gate_scrubs_inherited_compiler_cache_env_and_records_names(tmp_path, mo
     record = gate.gate(ROOT, tmp_path, args)
     assert record['status'] == 'pass'
     expected_scrubbed = sorted(inherited)
-    assert record['scrubbed_env'] == expected_scrubbed
-    for suite in record['suites']:
-        assert suite['scrubbed_env'] == expected_scrubbed
+    assert record['scrubbed_env'] == []
+    assert record['suites'][0]['scrubbed_env'] == []
+    assert record['suites'][1]['scrubbed_env'] == expected_scrubbed
     assert len(seen_envs) == 3
     for env in seen_envs:
         assert env.get('KEEP_PLAIN_VAR') == 'kept'
         for key in expected_scrubbed:
-            assert key not in env
+            if 'CARGO_TARGET_DIR' in env:
+                assert env[key] == inherited[key]
+            else:
+                assert key not in env
 
 
 def test_v4_live_planners_are_explicit_full_tier_requirements():
@@ -790,3 +797,201 @@ def test_missing_installed_programs_manifest_surfaces_in_receipt_error(tmp_path,
 def test_help_warns_against_systemd_supplementary_groups():
     assert '216/GROUP' in gate.__doc__
     assert 'gate-requirements.txt' in gate.__doc__
+
+
+def test_gate_lease_counts_waiters_and_releases(tmp_path):
+    with gate.gate_lease(tmp_path, slots=2, timeout=0) as first:
+        with gate.gate_lease(tmp_path, slots=2, timeout=0) as second:
+            assert (first['slot'], second['slot']) == (0, 1)
+            with pytest.raises(TimeoutError, match='no gate lease free'):
+                with gate.gate_lease(tmp_path, slots=2, timeout=0):
+                    pytest.fail('a third gate acquired a lease')
+        with gate.gate_lease(tmp_path, slots=2, timeout=0) as reused:
+            assert reused['slot'] == 1
+
+
+def test_compiler_cache_setup_retains_cache_configuration(tmp_path):
+    wrapper = tmp_path / 'kache'
+    wrapper.write_text('#!/bin/sh\n[ "$1" = --version ] && exit 0\nexit 1\n')
+    wrapper.chmod(0o755)
+    env, _ = gate.scrub_compiler_cache_env(os.environ)
+    env.update(HOME=str(tmp_path), CUTEAFD_KACHE=str(wrapper),
+               CUTEAFD_KACHE_CACHE_DIR=str(tmp_path / 'cache'), KEEP_VAR='kept')
+    configured = gate.compiler_cache_env(ROOT, tmp_path / 'build', env)
+    assert configured['CUTEAFD_KACHE_ACTIVE'] == str(wrapper)
+    assert configured['RUSTC_WRAPPER'] == str(ROOT / 'scripts/build/compiler-cache.sh')
+    assert configured['KACHE_CACHE_DIR'] == str(tmp_path / 'cache' / gate.platform.machine())
+    assert configured['KEEP_VAR'] == 'kept'
+    assert configured['CARGO_INCREMENTAL'] == '0'
+    assert gate.compiler_cache_receipt(configured, tmp_path / 'target')['mode'] == 'kache'
+    warning = Path(configured['CUTEAFD_KACHE_WARNING_DIR']) / 'first-failure'
+    warning.parent.mkdir()
+    warning.write_text('exit 124: timed out')
+    assert gate.compiler_cache_receipt(configured, tmp_path / 'target')['mode'] == 'fallback'
+
+
+def test_missing_compiler_cache_is_fail_soft(tmp_path, capsys):
+    env, _ = gate.scrub_compiler_cache_env(os.environ)
+    env['CUTEAFD_KACHE'] = '/nonexistent/kache'
+    configured = gate.compiler_cache_env(ROOT, tmp_path, env)
+    assert not configured.get('RUSTC_WRAPPER')
+    assert 'using plain compilers' in capsys.readouterr().err
+
+
+def test_build_slot_termination_while_waiting_is_not_success(tmp_path):
+    import fcntl
+    lock = (tmp_path / 'build.lock').open('a')
+    fcntl.flock(lock, fcntl.LOCK_EX)
+    process = subprocess.Popen(['bash', str(ROOT / 'scripts/build/build-slot.sh'), 'true'],
+                               env={**os.environ, 'CUTEAFD_LOCK_DIR': str(tmp_path), 'CUTEAFD_BUILD_SLOTS': '1'},
+                               stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True)
+    try:
+        # SIGTERM the whole waiting group, just as systemd does on stop.
+        time.sleep(0.2)
+        os.killpg(process.pid, 15)
+        _, error = process.communicate(timeout=5)
+        assert process.returncode == 143
+        assert 'terminated' in error
+    finally:
+        if process.poll() is None:
+            os.killpg(process.pid, 9)
+            process.wait()
+        lock.close()
+
+
+def test_build_leg_notification_records_termination(tmp_path):
+    helper = ROOT / 'scripts/lib/build-supervision.sh'
+    process = subprocess.Popen(['bash', '-c', f'source "{helper}"; exec 8>"$1"; work() {{ sleep 60; }}; build_run_leg fixture work',
+                                'test', str(tmp_path / 'completion')],
+                               stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True)
+    try:
+        time.sleep(0.2)
+        os.killpg(process.pid, 15)
+        _, error = process.communicate(timeout=5)
+        assert (tmp_path / 'completion').read_text() == 'fixture 143\n'
+        assert 'terminated' in error
+    finally:
+        if process.poll() is None:
+            os.killpg(process.pid, 9)
+            process.wait()
+
+
+def test_build_slot_does_not_detach_compilers_from_gate_process_group(tmp_path):
+    process = subprocess.Popen(['bash', str(ROOT / 'scripts/build/build-slot.sh'), 'python3', '-c',
+                                'import os; print(os.getpgrp(), flush=True)'],
+                               env={**os.environ, 'CUTEAFD_LOCK_DIR': str(tmp_path)},
+                               stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True)
+    output, error = process.communicate(timeout=5)
+    assert process.returncode == 0, error
+    assert int(output.strip()) == process.pid
+
+
+def test_cpu_gate_terminated_in_lease_queue_writes_nonzero_receipt(tmp_path):
+    locks = tmp_path / '.cache/cuteafd'
+    locks.mkdir(parents=True)
+    with gate.gate_lease(locks, slots=2, timeout=0):
+        with gate.gate_lease(locks, slots=2, timeout=0):
+            process = subprocess.Popen([sys.executable, str(ROOT / 'scripts/dev/cpu-gate'), '--task', 'terminated-lease'],
+                                       env={**os.environ, 'HOME': str(tmp_path)}, stdout=subprocess.PIPE,
+                                       stderr=subprocess.PIPE, text=True, start_new_session=True)
+            try:
+                import selectors
+                selector = selectors.DefaultSelector()
+                selector.register(process.stderr, selectors.EVENT_READ)
+                assert selector.select(timeout=10)
+                line = process.stderr.readline()
+                if 'resolved child tools' in line:
+                    line = process.stderr.readline()
+                assert 'waiting for gate lease' in line
+                process.terminate()
+                process.communicate(timeout=10)
+                assert process.returncode == 143
+                record = json.loads((locks / 'builds/terminated-lease/cpu-gate.json').read_text())
+                assert record['verdict'] == 'terminated' and record['exit'] == 143
+                selector.close()
+            finally:
+                if process.poll() is None:
+                    os.killpg(process.pid, 9)
+                    process.wait()
+
+
+def test_term_ignoring_suite_has_bounded_unwind_and_terminated_receipt(tmp_path, monkeypatch):
+    import threading
+    (tmp_path / 'logs').mkdir()
+    ready = tmp_path / 'ready'
+    root = tmp_path / 'builds/term-ignoring'
+    root.mkdir(parents=True)
+    suite_log = tmp_path / 'logs/suite.log'
+    command = [sys.executable, '-c',
+               'import signal,time,pathlib; signal.signal(signal.SIGTERM, signal.SIG_IGN); '
+               f'pathlib.Path({str(ready)!r}).touch(); time.sleep(120)']
+    monkeypatch.setattr(gate, 'BUILDS', tmp_path / 'builds')
+    monkeypatch.setattr(gate, 'gate_lease', lambda: gate.nullcontext(None))
+    monkeypatch.setattr(gate, 'checked', lambda *a, **k: 'deadbeef')
+    monkeypatch.setattr(gate.signal, 'signal', lambda *a: None)
+    monkeypatch.setattr(sys, 'argv', ['cpu-gate', '--task', 'term-ignoring'])
+    gate.STOPPING.clear()
+    gate.TERMINATED_SIGNAL = None
+
+    def run_gate(args, root):
+        with gate.ThreadPoolExecutor(max_workers=1) as pool:
+            result = pool.submit(gate.run_logged, command, suite_log, dict(os.environ), tmp_path, 180)
+            deadline = time.monotonic() + 10
+            while not ready.exists():
+                assert time.monotonic() < deadline
+                threading.Event().wait(0.01)
+            gate.interrupt(15, None)
+            result.result()
+
+    monkeypatch.setattr(gate, 'run_gate', run_gate)
+    try:
+        started = time.monotonic()
+        assert gate.main() == 143
+        assert time.monotonic() - started < 13
+        record = json.loads((root / 'cpu-gate.json').read_text())
+        assert record['verdict'] == 'terminated' and record['exit'] == 143
+        assert not gate.CHILDREN
+    finally:
+        gate.STOPPING.clear()
+        gate.TERMINATED_SIGNAL = None
+
+
+def test_child_path_resolves_rustup_before_fixture_changes_home(tmp_path, monkeypatch):
+    home = tmp_path / 'home'
+    toolchain = home / '.rustup/toolchains/stable/bin'
+    toolchain.mkdir(parents=True)
+    for name in ('cargo', 'rustc'):
+        binary = toolchain / name
+        binary.write_text('#!/bin/sh\nprintf "resolved-toolchain\\n"\n')
+        binary.chmod(0o755)
+    rustup = home / '.cargo/bin/rustup'
+    rustup.parent.mkdir(parents=True)
+    rustup.write_text(f'#!/bin/sh\nprintf "%s\\n" "{toolchain / "cargo"}"\n')
+    rustup.chmod(0o755)
+    brew = tmp_path / 'brew/bin'
+    brew.mkdir(parents=True)
+    (brew / 'nasm').write_text('#!/bin/sh\nexit 0\n')
+    (brew / 'nasm').chmod(0o755)
+    monkeypatch.setattr(gate, 'HOMEBREW_BIN', brew)
+    monkeypatch.setattr(gate, 'RUSTUP_HOME', tmp_path / 'absent')
+    path, receipt = gate.resolved_child_tools({'HOME': str(home), 'PATH': str(rustup.parent)})
+    result = subprocess.run(['rustc', '-V'], env={'HOME': str(tmp_path / 'fixture-home'), 'PATH': path},
+                            text=True, capture_output=True, check=True)
+    assert result.stdout == 'resolved-toolchain\n'
+    assert receipt['tools']['rustc'] == str(toolchain / 'rustc')
+    assert receipt['tools']['nasm'] == str(brew / 'nasm')
+
+
+def test_cache_stats_uses_configured_build_event_root(tmp_path, monkeypatch):
+    root = tmp_path / 'head'
+    stats = {'summary': {'local_hits': 12, 'remote_hits': 2, 'misses': 3}}
+    calls = []
+    def run(command, **kwargs):
+        calls.append(command)
+        return SimpleNamespace(returncode=0, stdout=json.dumps(stats))
+    monkeypatch.setattr(gate.subprocess, 'run', run)
+    receipt = gate.compiler_cache_receipt({'CUTEAFD_KACHE_ACTIVE': '/kache',
+                                          'KACHE_CONFIG': str(root / 'compiler-cache/config.toml')}, root / 'target')
+    assert receipt['event_root'] == str(root)
+    assert receipt['hits'] == 14 and receipt['misses'] == 3
+    assert calls[-1] == ['/kache', '--json', 'stats', '--root', str(root), '--full']

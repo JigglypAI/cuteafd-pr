@@ -4280,3 +4280,25 @@ def test_sustained_levels_panel_config_reaches_matrix(entry, tmp_path, monkeypat
     e = json.loads(next(state.glob('*/matrix.json')).read_text())['entries'][0]
     assert e['levels'] == [8, 16]
     assert e['panel_config'] == {'concurrency': {'sustained': True, 'multiplier': 4}}
+
+
+def test_detached_termination_cannot_publish_child_success(tmp_path):
+    import signal
+    smoke = [sys.executable, '-c', 'import pathlib,signal,sys,time\n'
+             f'd=pathlib.Path({str(tmp_path)!r})\n'
+             'signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))\n'
+             '(d/"ready").touch()\nwhile True: time.sleep(0.01)\n']
+    process = cards.detached(smoke, tmp_path / 'driver.log', tmp_path / 'exit', dict(os.environ))
+    try:
+        deadline = time.monotonic() + 10
+        while not (tmp_path / 'ready').exists():
+            assert time.monotonic() < deadline and process.poll() is None
+            time.sleep(0.01)
+        cards.forward_stop(signal.SIGTERM)
+        assert cards.wait_detached(process, grace=5) == 143
+        assert (tmp_path / 'exit').read_text().strip() == '143'
+        assert 'terminated' in (tmp_path / 'driver.log').read_text()
+    finally:
+        if process.poll() is None:
+            os.killpg(process.pid, signal.SIGKILL)
+            process.wait(timeout=5)

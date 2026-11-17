@@ -250,7 +250,9 @@ def test_relocated_cargo_target_is_where_the_daemon_is_installed(scratch):
         """,
     )
 
-    env = dict(os.environ)
+    env = {key: value for key, value in os.environ.items()
+           if not key.startswith(('CUTEAFD_KACHE', 'KACHE_', 'CUTEAFD_SCCACHE', 'SCCACHE_', 'CMAKE_'))
+           and key not in ('RUSTC_WRAPPER', 'RUSTC_WORKSPACE_WRAPPER', 'CC', 'CXX')}
     env["CUTEAFD_EXPORT_IMAGE_ID"] = ""
     env["CUTEAFD_EXPORT_CACHE"] = "off"
     env["PATH"] = f"{shims}:{env['PATH']}"

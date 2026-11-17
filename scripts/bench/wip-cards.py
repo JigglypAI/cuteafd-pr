@@ -993,12 +993,15 @@ def stopped_code():
 
 def detached(cmd, log, exit_file, env):
     # Shell remains in the detached group and writes a numeric status even if the
-    # CLI disappears. It ignores stop signals itself (smoke handles them), so it
-    # waits for smoke's teardown and still records smoke's exit status. The
+    # CLI disappears. It records stop signals but waits for smoke's teardown;
+    # even a child that exits zero after termination cannot publish success. The
     # parent's serving turn outlives this process and its container teardown.
     # setsid may fork when its caller is a process-group leader; --wait must
     # propagate the child status rather than report the successful fork.
-    script = 'trap : TERM INT HUP; "$@"; rc=$?; printf "%s\\n" "$rc" > "$CARD_EXIT"; exit "$rc"'
+    script = ('terminated=0; trap \'terminated=143\' TERM; trap \'terminated=130\' INT; '
+              'trap \'terminated=129\' HUP; "$@"; rc=$?; '
+              'if ((terminated)); then rc=$terminated; echo "terminated (exit $rc)" >&2; fi; '
+              'printf "%s\\n" "$rc" > "$CARD_EXIT"; exit "$rc"')
     with Path(log).open('w') as output:
         process = subprocess.Popen(['setsid', '--wait', 'bash', '-c', script, 'wip-card', *cmd], stdin=subprocess.DEVNULL, stdout=output, stderr=subprocess.STDOUT, env={**env, 'CARD_EXIT': str(exit_file)}, start_new_session=False)
     with _LIVE_LOCK:

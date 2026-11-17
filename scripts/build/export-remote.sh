@@ -105,7 +105,7 @@ cleanup_export() {
   rm -rf "$root"
 }
 trap cleanup_export EXIT
-trap 'exit 143' TERM HUP INT QUIT
+trap 'echo "export terminated (TERM)" >&2; exit 143' TERM HUP INT QUIT
 mkdir -p "$HOME/.cache/cuteafd/export-workers"
 mkdir -p "$root/src" "$root/build" "$root/output" "$root/home"
 zstd -d -q <"$area/source.tar.zst" | tar -C "$root/src" -xf -
