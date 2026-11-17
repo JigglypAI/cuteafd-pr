@@ -444,12 +444,12 @@ pub(crate) mod tests {
             shape: vec![bytes / 2], byte_offset: 0, byte_length: bytes as u64,
         };
         let mut records = Records::default();
-        append(&mut records, 0, 4096, bytes * 2, &path, &metadata, 0, true).unwrap();
+        append(&mut records, 0, 4096, bytes * 2, &path, &metadata, 0, ReadTransform::Bf16ToF32).unwrap();
         assert_eq!(records.steps.len(), 3);
         assert_records(root.path(), records, bytes as u64, bytes * 2);
         metadata.byte_length = 3;
-        assert!(append(&mut Records::default(), 0, 4096, 6, &path, &metadata, 0, true).is_err());
-        assert!(append(&mut Records::default(), 0, usize::MAX, 6, &path, &metadata, 0, false).is_err());
+        assert!(append(&mut Records::default(), 0, 4096, 6, &path, &metadata, 0, ReadTransform::Bf16ToF32).is_err());
+        assert!(append(&mut Records::default(), 0, usize::MAX, 6, &path, &metadata, 0, ReadTransform::Direct).is_err());
     }
     #[test]
     fn abandoned_contribution_cancels_owner_without_publishing() {
