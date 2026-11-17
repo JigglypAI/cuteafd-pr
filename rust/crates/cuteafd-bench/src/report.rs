@@ -855,6 +855,8 @@ pub struct StreamTiming {
     #[serde(default)]
     pub tokens_per_cycle: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub speculation: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cycles_unavailable: Option<String>,
     pub prompt_tokens: u64,
     pub completion_tokens: u64,

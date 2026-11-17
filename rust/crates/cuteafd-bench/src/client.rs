@@ -390,10 +390,12 @@ impl Client {
         let total = started.elapsed().as_secs_f64();
         let usage = &chat.usage;
         let number = |v: &Value| v.as_u64().unwrap_or(0);
+        let cycles = usage["speculation"]["cycles"].as_u64().filter(|&n| n > 0);
         chat.timing = StreamTiming {
             opening: if chat.reasoning.is_empty() { &chat.content } else { &chat.reasoning }.chars().take(120).collect(),
-            tokens_per_cycle: None,
-            cycles_unavailable: Some("response has no exact per-request cycle counter; global deltas may overlap".into()),
+            tokens_per_cycle: cycles.map(|n| number(&usage["completion_tokens"]).saturating_sub(1) as f64 / n as f64),
+            speculation: usage.get("speculation").filter(|v| v.is_object()).cloned(),
+            cycles_unavailable: cycles.is_none().then(|| "speculation did not run or server omitted request-local counters".into()),
             prompt_tokens: number(&usage["prompt_tokens"]),
             completion_tokens: number(&usage["completion_tokens"]),
             cached_tokens: usage.get("prompt_cache_hit_tokens").map(number)
@@ -583,7 +585,7 @@ mod tests {
                         ttft_s: 0.25, total_s: 0.25, ..Default::default()
                     }, content: "cold".into(), probe: Some(pending.record()), ..Default::default() }).unwrap()
                 } else {
-                    "data: {\"choices\":[{\"delta\":{\"content\":\"warm\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":256,\"completion_tokens\":1,\"prompt_tokens_details\":{\"cached_tokens\":192}}}\n\ndata: [DONE]\n\n".into()
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"warm\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":256,\"completion_tokens\":1,\"speculation\":{\"request_id\":\"warm-request\",\"proposed\":3,\"accepted\":0,\"cycles\":2},\"prompt_tokens_details\":{\"cached_tokens\":192}}}\n\ndata: [DONE]\n\n".into()
                 };
                 write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                     if cold { "application/json" } else { "text/event-stream" }, reply.len(), reply).unwrap();
@@ -593,6 +595,10 @@ mod tests {
         let body = json!({"messages":[{"role":"user","content":"shared template prefix: request"}]});
         let warm = client.chat(body.clone(), None).unwrap();
         assert_eq!(warm.timing.cached_tokens, 192);
+        assert_eq!(warm.timing.opening,"warm");
+        assert_eq!(warm.timing.speculation.as_ref().unwrap()["request_id"],"warm-request");
+        assert_eq!(warm.timing.tokens_per_cycle,Some(0.));
+        assert_eq!(warm.timing.cycles_unavailable,None);
         let cold = client.chat(body, Some(ProbeSpec { cold: true, ..Default::default() })).unwrap();
         assert_eq!(cold.timing.cached_tokens, 0);
         assert_eq!(cold.timing.ttft_s, 0.25);

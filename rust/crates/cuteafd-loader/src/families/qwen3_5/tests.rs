@@ -639,3 +639,45 @@ fn native_single_rtx_context_hint_never_claims_an_executable_context_layout() {
     assert!(automatic.executable());
     assert_eq!(automatic.attention_placement, crate::placement::AttentionPlacement::Heads);
 }
+
+#[test]
+fn public_plan_and_runtime_share_resolved_pool_with_optional_target_and_growth() {
+    use crate::placement::{families::qwen3_5::{self, DenseFacts, NativeWeights}, planner::*};
+    use cuteafd_core::memory_policy::MemoryPolicy;
+    let (dir, mut options, buffers, _) = native_planner_fixture();
+    let checkpoint = crate::plan::Checkpoint::open(dir.path()).unwrap();
+    let cfg = Qwen35Config::from_hf(&checkpoint.config).unwrap();
+    let weights = NativeWeights::native(&checkpoint, &cfg, cuteafd_core::DType::F32).unwrap();
+    let arena = weight_layout::target_arena(&checkpoint, &cfg, cuteafd_core::DType::F32,
+        weight_layout::DenseFormat::Bf16).unwrap();
+    for capacity in [32 << 30, 96 << 30] {
+        for target in [None, Some(524_288)] {
+            for maximum in [None, Some(100_000_000)] {
+                MemoryPolicy { kv_max: maximum, ..Default::default() }.scoped(|| {
+                    let layout = options.layout.as_mut().unwrap();
+                    layout.rtx_bytes = vec![capacity];
+                    layout.pool_tokens = None;
+                    layout.target_pool_tokens = target;
+                    let report = plan::plan(dir.path(), &options).unwrap();
+                    assert!(report.executable(), "{:?}", report.hints);
+                    let physical_bytes = crate::placement::inventory::PRO_TOTAL_BYTES;
+                    let budgets = qwen3_5::sampled_budgets(physical_bytes, physical_bytes, Some(capacity),
+                        crate::plan::testing::SimulatedHost::raptor().host_ram).unwrap();
+                    let runtime = qwen3_5::admit(Request { context: Context::resolve(cfg.max_context as u64, None),
+                        pool: Pin::Auto, onboard: Pin::Auto, prefill: Pin::Auto, operation: Operation::Serving,
+                        resident_weight_limit: None, spark_reply_formats: Default::default() }, budgets,
+                        DenseFacts { target_pool: target, graph_variant: "fixture".into(), graphs_enabled: true,
+                            cfg: &cfg, weights: &weights, target_arena: &arena, buffers: &buffers, slots: 4,
+                            record_bytes: 4096, drafter: None, blas_head: serving::BlasHead::Native,
+                            serving: None, host_prefix: serving::HostPrefixOwners { quota_bytes: 0, chunk_bytes: 0 },
+                            verify_check: false }).unwrap();
+                    let policy = report.phase_ledger.unwrap().pool_policy.unwrap();
+                    assert_eq!(Some(policy), runtime.pool_policy);
+                    let expected = target.unwrap_or(if capacity <= 32 << 30 { 1 << 20 } else { 2 << 20 });
+                    assert_eq!(policy.target(), expected);
+                    if maximum.is_some() { assert!(runtime.pool_tokens > expected); }
+                });
+            }
+        }
+    }
+}

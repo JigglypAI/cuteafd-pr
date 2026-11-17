@@ -49,16 +49,6 @@ fn invalid(detail: impl std::fmt::Display) -> Refusal {
     Refusal::InvalidFact(format!("MiMo component contract: {detail}"))
 }
 
-/// The largest pool tokens this build may index: the automatic target or the
-/// explicit request, rounded up to the profile's pool quantum.
-pub fn maximum_pool_tokens(cards: &[u64], context: u64, requested: Option<u64>, page_rows: u64) -> u64 {
-    let page = page_rows.max(1);
-    crate::placement::PoolPolicy::resolve(cards, context, requested, page)
-        .maximum_tokens()
-        .div_ceil(page)
-        .saturating_mul(page)
-}
-
 /// Physical budgets for the coordinator GPUs plus one inert per-Spark budget,
 /// so every declared expert home has a physical owner.
 pub fn production_budgets(cards: &[(u64, u64)], headrooms: &[u64], baselines: Vec<Baseline>,
@@ -204,7 +194,7 @@ pub struct ProductionInput<'a> {
     pub blas_head: crate::placement::planner::serving::BlasHead,
     pub draft_head: bool,
     pub context: u64,
-    pub maximum_pool_tokens: u64,
+    pub pool: crate::placement::PoolPolicy,
     pub prefill: PrefillShape,
     pub lanes: u64,
     pub embedding: EmbeddingHome,
@@ -228,6 +218,7 @@ pub struct ProductionInput<'a> {
 
 /// Prepared facts retained until the one shared solve selects them.
 pub struct PreparedMimo<'a> {
+    pub pool: crate::placement::PoolPolicy,
     pub recipe: MimoRecipe<'a>,
     pub budgets: Vec<Budget>,
 }
@@ -350,7 +341,7 @@ impl<'a> ProductionInput<'a> {
         } else {
             LayerMode::Whole { gpu: 0, ffn: FfnMode::Owner }
         }).collect();
-        let maximum_pages = self.maximum_pool_tokens.div_ceil(page_rows);
+        let maximum_pages = self.pool.maximum_tokens().div_ceil(page_rows);
         let mut context_owners = Vec::new();
         let mut budgets = self.budgets;
         for budget in &mut budgets {
@@ -376,6 +367,7 @@ impl<'a> ProductionInput<'a> {
                 source: "physical capacity; context and selected modules charged once in recipe".into() };
         }
         Ok(PreparedMimo {
+            pool: self.pool,
             recipe: MimoRecipe {
                 pushed_experts: false,
                 startup_probe_bytes: self.startup_probe_bytes, context_owners,
@@ -412,17 +404,8 @@ impl PreparedMimo<'_> {
 
     /// One typed admission over the prepared facts. The shared planner picks
     /// the pool and the onboarding prefix; nothing here re-solves.
-    pub fn admit(&self, mut request: Request) -> Result<AdmittedMimo, Refusal> {
-        // The operator's explicit pool keeps the old quantum rounding; an
-        // unaligned request is not a reason to plan a different pool.
-        if let Pin::Exact(tokens) = request.pool {
-            let page = self.recipe.page_rows;
-            if tokens % page != 0 {
-                request.pool = Pin::Exact(tokens.div_ceil(page).checked_mul(page)
-                    .ok_or(Refusal::Overflow("MiMo pool quantum"))?);
-            }
-        }
-        let solved = crate::placement::planner::solve(request, self.budgets.clone(), &self.recipe)?;
+    pub fn admit(&self, request: Request) -> Result<AdmittedMimo, Refusal> {
+        let solved = crate::placement::planner::solve_prepared(request, self.budgets.clone(), &self.recipe, &self.pool)?;
         let (placement, spark) = self.recipe.execution(&solved)?;
         let count = spark.rtx_layers.len();
         let profile = self.recipe.profile(count).clone();

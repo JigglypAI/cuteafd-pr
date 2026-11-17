@@ -94,6 +94,7 @@ fn sum(bytes: impl IntoIterator<Item = u64>) -> Result<u64, Refusal> {
 /// request must match, and the expert count profile.
 #[derive(Debug)]
 pub struct PreparedV4<'a> {
+    pool: crate::placement::PoolPolicy,
     inputs: &'a V4Inputs,
     expert_usage: Option<cuteafd_core::expert_usage::Geometry>,
     budgets: Vec<Budget>,
@@ -263,17 +264,6 @@ fn budgets(inputs: &V4Inputs, reserves: &[u64]) -> Result<Vec<Budget>, Refusal> 
     Ok(budgets)
 }
 
-/// The shared pool policy for this request: an automatic checkpoint may be
-/// served at an explicit smaller pool (serving clamps its context to it); a
-/// fixed context is a hard floor, and Spark-free layouts keep the agentic floor.
-fn pool_policy(inputs: &V4Inputs) -> crate::placement::PoolPolicy {
-    // The card size plan sees (the logical ceiling), so a simulated small card
-    // targets the same pool offline and live.
-    let cards = inputs.gpus.iter().map(|&(bytes, _)| bytes).collect::<Vec<_>>();
-    crate::placement::PoolPolicy::resolve(&cards, inputs.max_context, inputs.requested_pool,
-        V4_PAGE_ROWS).with_context(inputs.serving_context)
-}
-
 /// The smallest pool the request admits.
 fn context_floor(inputs: &V4Inputs) -> u64 {
     inputs.max_context
@@ -332,10 +322,13 @@ pub fn prepare(inputs: &V4Inputs) -> Result<PreparedV4<'_>, Refusal> {
     } else {
         V4_PAGE_ROWS
     };
-    let maximum_tokens = pool_policy(inputs)
-        .maximum_tokens()
-        .max(context)
-        .min(super::POOL_CEILING_TOKENS);
+    let cards = inputs.gpus.iter().map(|&(bytes, _)| bytes).collect::<Vec<_>>();
+    let mut facts = crate::placement::PoolFacts::new(&cards, inputs.serving_context,
+        inputs.requested_pool, page_rows);
+    facts.encoding_limit = Some(super::POOL_CEILING_TOKENS);
+    facts.target = inputs.target_pool;
+    let pool = crate::placement::prepare_pool(facts).map_err(|error| Refusal::InvalidFact(error.to_string()))?;
+    let maximum_tokens = pool.maximum_tokens().max(context);
     let maximum_pages = maximum_tokens.div_ceil(page_rows).max(1);
     let prefix = match &inputs.host {
         Some(host) => super::host::prefix_owners(inputs, host, attention == AttentionPlacement::Context)?,
@@ -352,6 +345,7 @@ pub fn prepare(inputs: &V4Inputs) -> Result<PreparedV4<'_>, Refusal> {
         return Err(invalid("invalid V4 expert usage geometry"));
     }
     Ok(PreparedV4 {
+        pool,
         inputs,
         expert_usage,
         budgets,
@@ -826,7 +820,7 @@ impl<'a> PreparedV4<'a> {
                 )));
             }
         }
-        let solved = solve(request, self.budgets.clone(), &self)?;
+        let solved = solve_prepared(request, self.budgets.clone(), &self, &self.pool)?;
         let placement = self.execution(&solved)?;
         let reserves = self.reserves.clone();
         let graph_reserves = self.graph_reserves.clone();

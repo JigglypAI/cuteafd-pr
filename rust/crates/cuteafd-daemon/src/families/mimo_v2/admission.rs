@@ -245,7 +245,7 @@ fn preflight_shape(
     prefix_draft: bool,
     serving_context: cuteafd_loader::placement::planner::Context,
 ) -> Result<Preflight> {
-    use cuteafd_core::serving_capacity::{CapacityPolicy, DeviceMemory};
+    use cuteafd_core::serving_capacity::DeviceMemory;
     use cuteafd_ffi::programs::VOCABULARY_HEAD_WORKSPACE;
     use cuteafd_loader::families::mimo_v2::capacity::{
         mimo_capacity_profiles, MimoCapacityOptions, MimoRankRuntime,
@@ -500,17 +500,10 @@ fn preflight_shape(
         &devices, args.planner_media_weights, crate::shared::memory::budget::resident_weight_limit())?;
     use cuteafd_loader::placement::families::mimo_v2::admission::{self as contract, ProductionInput};
     use cuteafd_loader::placement::planner::{Baseline, EmbeddingHome, Operation, Phase, PrefillShape};
-    let maximum_pool_tokens = contract::maximum_pool_tokens(
+    let pool = cuteafd_loader::placement::prepare_pool(cuteafd_loader::placement::PoolFacts::new(
         &memory.iter().map(|sample| sample.total_bytes).collect::<Vec<_>>(),
-        args.max_context as u64, (args.pool_tokens > 0).then_some(args.pool_tokens as u64),
-        spark_profiles.steady.pool_unit_rows);
-    let policy = CapacityPolicy {
-        concurrency: u32::try_from(concurrency)?,
-        target_pool_tokens: maximum_pool_tokens,
-        max_context_tokens: Some(args.max_context as u64),
-        pool_tokens: Some(maximum_pool_tokens),
-        ..CapacityPolicy::default()
-    };
+        serving_context, Some(args.pool_tokens as u64), spark_profiles.steady.pool_unit_rows))?;
+    let policy = pool.capacity_policy(u32::try_from(concurrency)?);
     let report = reservation_report(&spark_profiles.steady, &memory, policy)?;
     let intake_probe_bytes = cuteafd_loader::families::mimo_v2::admission::spark_intake_probe_bytes(
         spark_ranks > 0, std::env::var("CUTEAFD_SPARK_INTAKE").ok().as_deref())?;
@@ -551,7 +544,7 @@ fn preflight_shape(
             opened.weight_formats.head == cuteafd_loader::families::mimo_v2::projection::MimoProjectionRepresentation::Bf16),
         draft_head: args.draft.is_some(),
         cfg, layers, kv, mtp_stages: args.mtp, context: args.max_context as u64,
-        maximum_pool_tokens, prefill, lanes: transport_lanes as u64, embedding, gpus: ranks,
+        pool, prefill, lanes: transport_lanes as u64, embedding, gpus: ranks,
         spark_ranks, experts: expert_costs, expert_workspace, tp2_workspace,
         spark: spark_profiles.clone(), no_spark: no_spark_profiles.clone(),
         post_kv_additional: post_kv_loading_additional, draft_packing,
@@ -986,6 +979,57 @@ mod tests {
 
     use super::*;
     use cuteafd_loader::families::mimo_v2::admission::workspace_shapes;
+
+    #[test]
+    fn kv_max_widens_extent_without_inflating_reservation_floor_or_displacing_onboarding() -> Result<()> {
+        use cuteafd_core::memory_policy::MemoryPolicy;
+        use cuteafd_core::serving_capacity::*;
+        
+        let dir = tempfile::tempdir()?;
+        cuteafd_loader::plan::testing::write_snapshot(dir.path(),
+            &cuteafd_loader::plan::testing::mimo_flash_config(),
+            &cuteafd_loader::plan::testing::mimo_flash_tensors(), None);
+        let input = cuteafd_loader::plan::testing::BudgetedPlanInput::open(dir.path())?;
+        let options = cuteafd_loader::plan::PlanOptions {
+            placement: cuteafd_loader::plan::ExpertPlacement::Sparks { ranks: 4 },
+            layout: Some(cuteafd_loader::plan::layout::LayoutOptions {
+                rtx_bytes: vec![96 << 30], context_tokens: 65_536,
+                host_cache_bytes: Some(0), glm5_drafter_disabled: true,
+                host_memory: Some(cuteafd_loader::plan::testing::SimulatedHost::raptor().host_ram),
+                ..Default::default()
+            }), ..Default::default()
+        };
+        let baseline = MemoryPolicy::default().scoped(|| input.plan(&options))?;
+        let grow = MemoryPolicy { kv_max: Some(100_000_000), ..Default::default() };
+        grow.scoped(|| -> Result<()> {
+            let pool = cuteafd_loader::placement::prepare_pool(cuteafd_loader::placement::PoolFacts::new(
+                &[96 << 30], 65_536, Some(0), 64)).unwrap();
+            assert_eq!(pool.maximum_tokens(), 100_000_000);
+            let policy = pool.capacity_policy(16);
+            assert_eq!(policy.target_pool_tokens, 2 << 20);
+            assert_eq!(policy.pool_tokens, Some(2 << 20));
+            let profile = CapacityProfile {
+                context: ContextLimits { checkpoint_max_tokens: 1 << 20, compiled_index_max_tokens: None },
+                pool_unit_rows: 64, host_prefix_bytes: 0,
+                devices: vec![DeviceCosts { device: 0, pool_unit_bytes: 64 * 1024,
+                    reservations: vec![], reserve_bytes: 0 }],
+            };
+            let memory = [DeviceMemory { device: 0, total_bytes: 96 << 30, baseline_free_bytes: 96 << 30 }];
+            let capacity = resolve_capacity(policy, &profile, &memory)?;
+            assert_eq!(capacity.requested_kv_floor_tokens, pool.target());
+            let report: serde_json::Value = serde_json::from_str(&reservation_report(&profile, &memory, policy)?)?;
+            assert_eq!(report["requested_pool_tokens"], pool.target());
+            assert_eq!(report["devices"][0]["requested_pool_bytes"], pool.target() * 1024);
+            let grown = input.plan(&options)?;
+            assert!(baseline.fits && grown.fits, "{:?}", grown.hints);
+            assert_eq!(grown.onboard_layers, baseline.onboard_layers);
+            assert!(grown.memory_layout.unwrap().pool_tokens > baseline.memory_layout.unwrap().pool_tokens);
+            let explicit = cuteafd_loader::placement::prepare_pool(cuteafd_loader::placement::PoolFacts::new(
+                &[96 << 30], 65_536, Some(1 << 20), 64)).unwrap();
+            assert_eq!(explicit.capacity_policy(16).pool_tokens, Some(1 << 20));
+            Ok(())
+        })
+    }
 
     #[test]
     fn automatic_context_clamp_updates_aligned_full_sequence_capacity() {

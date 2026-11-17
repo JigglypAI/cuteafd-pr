@@ -27,7 +27,7 @@ fn request() -> Request {
 
 fn facts<'a>(cfg: &'a Qwen35Config, weights: &'a NativeWeights, buffers: &'a NativeBuffers,
     target_arena: &'a crate::serving_capacity::WeightArenaLayout) -> DenseFacts<'a> {
-    DenseFacts { graph_variant: "fixture".into(), graphs_enabled: true, cfg, weights, target_arena, buffers, slots: 4, record_bytes: 4096, drafter: None, blas_head: serving::BlasHead::TensorLt, serving: None,
+    DenseFacts { target_pool: None, graph_variant: "fixture".into(), graphs_enabled: true, cfg, weights, target_arena, buffers, slots: 4, record_bytes: 4096, drafter: None, blas_head: serving::BlasHead::TensorLt, serving: None,
         host_prefix: serving::HostPrefixOwners { quota_bytes: 0, chunk_bytes: 0 }, verify_check: false }
 }
 
@@ -40,8 +40,8 @@ fn sampled_preweight_occupancy_is_one_capacity_neutral_named_owner() {
             let input = facts(&cfg, &weights, &buffers, &arena);
             let live = sampled_budgets((96 << 30) - sampled, 96 << 30, Some(logical),
                 crate::plan::testing::SimulatedHost::raptor().host_ram).unwrap();
-            let previous = solve(request(), live.clone(), &input).unwrap();
-            let plan = admit(request(), live, input).unwrap();
+            let plan = admit(request(), live.clone(), input.clone()).unwrap();
+            let previous = solve_prepared(request(), live, &input, &plan.pool_policy.unwrap()).unwrap();
             assert_eq!(plan.pool_tokens, previous.pool_tokens);
             assert_eq!(plan.decisions, previous.decisions);
             assert_eq!(plan.budgets[0].logical_bytes, logical);
@@ -82,8 +82,9 @@ fn sampled_preweight_owner_survives_gpu_reserve_override_without_changing_capaci
         MemoryPolicy { gpu_reserve: Some(reserve), ..Default::default() }.scoped(|| {
             let live = sampled_budgets((96 << 30) - occupied, 96 << 30, Some(80 << 30),
                 crate::plan::testing::SimulatedHost::raptor().host_ram).unwrap();
-            let previous = solve(request(), live.clone(), &facts(&cfg, &weights, &buffers, &arena)).unwrap();
-            let plan = admit(request(), live, facts(&cfg, &weights, &buffers, &arena)).unwrap();
+            let plan = admit(request(), live.clone(), facts(&cfg, &weights, &buffers, &arena)).unwrap();
+            let previous = solve_prepared(request(), live, &facts(&cfg, &weights, &buffers, &arena),
+                &plan.pool_policy.unwrap()).unwrap();
             assert_eq!(plan.pool_tokens, previous.pool_tokens);
             assert_eq!(plan.decisions, previous.decisions);
             assert_eq!(plan.budgets[0].headroom, reserve);
@@ -504,4 +505,28 @@ fn graph_reserve_is_one_canonical_owner_before_pool_sizing() {
     assert!(!off.facts.allowances.iter().any(|allowance|
         crate::placement::graph_reserve::is_source(&allowance.source)));
     assert!(off.pool_tokens >= plan.pool_tokens);
+}
+
+#[test]
+fn prepared_pool_matches_plan_and_runtime_and_preserves_strict_requests() {
+    use cuteafd_core::memory_policy::MemoryPolicy;
+    let (cfg, weights, buffers, arena) = fixture();
+    let default = admit(request(), budgets(), facts(&cfg, &weights, &buffers, &arena)).unwrap();
+    assert_eq!(default.pool_tokens, 2 << 20);
+    MemoryPolicy { kv_max: Some(100_000_000), ..Default::default() }.scoped(|| {
+        let planned = admit(request(), budgets(), facts(&cfg, &weights, &buffers, &arena)).unwrap();
+        let live = sampled_budgets(96 << 30, 96 << 30, None,
+            crate::plan::testing::SimulatedHost::raptor().host_ram).unwrap();
+        let served = admit(request(), live, facts(&cfg, &weights, &buffers, &arena)).unwrap();
+        assert_eq!(planned.pool_policy, served.pool_policy);
+        let pool = planned.pool_policy.unwrap();
+        assert_eq!(pool.ceiling(), u32::MAX as u64);
+        assert_eq!(pool.maximum_tokens(), 100_000_000);
+        assert!(planned.pool_tokens > default.pool_tokens);
+        assert_eq!(planned.decisions.onboard_layers, default.decisions.onboard_layers);
+        let mut strict = request();
+        strict.pool = Pin::Exact(262_144);
+        let pinned = admit(strict, budgets(), facts(&cfg, &weights, &buffers, &arena)).unwrap();
+        assert_eq!(pinned.pool_tokens, 262_144);
+    });
 }

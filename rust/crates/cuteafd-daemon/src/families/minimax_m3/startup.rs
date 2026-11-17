@@ -191,7 +191,11 @@ pub(crate) fn load<'a>(library: &'a Arc<cuteafd_ffi::NativeLibrary>, programs: &
     }else{None};
     let replies = cuteafd_core::spark_reply::requested();
     fp8::validate_reply_formats(catalog.fp8().context("MiniMax expert catalog")?.format(), replies)?;
-    let (inputs, admitted) = serve_admission::prepare(FactsRequest { vision: options.media.vision, vision_replicas: options.media.vision_replicas, media_cache_bytes: options.media.media_cache_bytes.map(|bytes|bytes.0 as u64), spark_rank_bytes: cuteafd_loader::serving_capacity::spark_memory::runtime_bytes(&options.peers.iter().map(ToString::to_string).collect::<Vec<_>>())?, checkpoint: gathered_checkpoint.as_ref().unwrap_or(checkpoint), cfg,
+    let (inputs, admitted) = serve_admission::prepare(FactsRequest { target_pool_tokens: None,
+        vision: options.media.vision, vision_replicas: options.media.vision_replicas,
+        media_cache_bytes: options.media.media_cache_bytes.map(|bytes|bytes.0 as u64),
+        spark_rank_bytes: cuteafd_loader::serving_capacity::spark_memory::runtime_bytes(&options.peers.iter().map(ToString::to_string).collect::<Vec<_>>())?,
+        checkpoint: gathered_checkpoint.as_ref().unwrap_or(checkpoint), cfg,
         catalog: &catalog, manifest_path: options.manifest_path, manifest: Arc::clone(&manifest),
         coordinator: Coordinator::Measured { samples: vec![], loaded_code: vec![] },
         attention: Some(options.attention_placement), split_wire: Some(options.split_wire), physical_devices: &physical,

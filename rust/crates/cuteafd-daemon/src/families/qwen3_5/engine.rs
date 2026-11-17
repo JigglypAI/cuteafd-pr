@@ -217,7 +217,7 @@ impl<'a> DenseEngine<'a> {
             cfg.max_context, concurrency)).transpose()?.flatten();
         let solve_started = std::time::Instant::now();
         let graph_variant = cuteafd_loader::serving_capacity::qwen35_graphs::variant(&cfg, format.fp8(), kv_format);
-        let facts = DenseFacts { cfg: &cfg,
+        let facts = DenseFacts { target_pool: None, cfg: &cfg,
             graph_variant: graph_variant.clone(), graphs_enabled: cuteafd_loader::serving_capacity::qwen35_graphs::enabled(), weights: &weight_bytes, target_arena: &target_arena, buffers: &buffers, slots,
             record_bytes: kv_format.record_bytes(cfg.kv_heads, cfg.head_dim) as u64, drafter,
             blas_head: crate::shared::target_head::TargetHead::configured().blas_head(true),
