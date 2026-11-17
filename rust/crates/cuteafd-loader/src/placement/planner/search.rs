@@ -847,7 +847,7 @@ pub fn solve(
 ) -> Result<ResolvedPlan, Refusal> {
     let cards = budgets.iter().filter(|budget| budget.locations.iter()
         .any(|location| matches!(location.device, Device::Coordinator(_))))
-        .map(|budget| budget.physical_bytes).collect::<Vec<_>>();
+        .map(|budget| budget.logical_bytes).collect::<Vec<_>>();
     let requested = match request.pool { Pin::Auto => None, Pin::Exact(tokens) => Some(tokens) };
     let pool = crate::placement::prepare_pool(crate::placement::PoolFacts::new(
         &cards, request.context, requested, 1));
@@ -917,8 +917,8 @@ pub fn solve_prepared(
     }
     // KV target, min and max (`cuteafd_core::memory_policy`). The layout is
     // searched at the target; an automatic pool then grows to the max.
-    // The card class picks the default target (a capped PRO keeps the PRO
-    // target, as `PoolPolicy` and the live sample do).
+    // The logical cap picks the card class, including 5090 simulations on PRO.
+    // The prepared policy is the only source of target/min/max semantics.
     if pool.context() != request.context || pool.requested() != match request.pool {
         Pin::Auto => None, Pin::Exact(tokens) => Some(tokens),
     } {

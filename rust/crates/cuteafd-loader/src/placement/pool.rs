@@ -27,14 +27,15 @@ impl CoordinatorCard {
     }
 
     pub fn maximum_pool(cards: &[Self], context: u64, requested: Option<u64>, page_rows: u64) -> u64 {
-        let physical = cards.iter().map(|card| card.physical_bytes).collect::<Vec<_>>();
-        PoolPolicy::resolve(&physical, context, requested, page_rows).maximum_tokens()
+        let logical = cards.iter().map(|card| card.logical_bytes).collect::<Vec<_>>();
+        prepare_pool(PoolFacts::new(&logical, context, requested, page_rows)).maximum_tokens()
     }
 }
 
 /// Geometry and operator inputs, before the shared placement preparation resolves policy.
 #[derive(Debug, Clone, Copy)]
 pub struct PoolFacts<'a> {
+    /// Logical per-card ceilings; a capped PRO intentionally simulates a small card.
     pub card_bytes: &'a [u64],
     pub context: super::planner::Context,
     pub requested: Option<u64>,
@@ -238,12 +239,12 @@ mod tests {
     }
 
     #[test]
-    fn capped_pro_has_the_same_planned_and_sampled_pool_extent() {
+    fn capped_pro_uses_the_same_small_card_pool_as_a_logical_simulation() {
         let planned = CoordinatorCard::planned(32 << 30, Some(188));
         let sampled = CoordinatorCard { physical_bytes: super::super::inventory::PRO_TOTAL_BYTES,
             logical_bytes: 32 << 30 };
         assert_eq!(planned, sampled);
-        assert_eq!(CoordinatorCard::maximum_pool(&[planned], 262_144, None, 64), 2 << 20);
+        assert_eq!(CoordinatorCard::maximum_pool(&[planned], 262_144, None, 64), 1 << 20);
         assert_eq!(CoordinatorCard::maximum_pool(&[planned], 262_144, Some(0), 64),
             CoordinatorCard::maximum_pool(&[sampled], 262_144, None, 64));
         assert_eq!(CoordinatorCard::planned(32 << 30, None), planned);
