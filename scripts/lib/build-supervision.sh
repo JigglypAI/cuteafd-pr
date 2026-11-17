@@ -5,6 +5,9 @@ build_run_leg() (
   set +m
   # Keep completion separate from the worker's private EXIT/cleanup traps.
   trap 'status=$?; printf "%s %s\n" "$leg" "$status" >&8' EXIT
+  trap 'echo "$leg terminated (TERM)" >&2; exit 143' TERM
+  trap 'echo "$leg terminated (INT)" >&2; exit 130' INT
+  trap 'echo "$leg terminated (HUP)" >&2; exit 129' HUP
   "$command"
 )
 

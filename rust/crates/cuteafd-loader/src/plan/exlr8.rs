@@ -380,7 +380,7 @@ fn append_spark_encoder(memory: &mut cuteafd_core::memory_layout::MemoryLayout,
             // Flash's joint admission already publishes its tower ledger; GLM's
             // native adapter leaves these charges to this shared finalization.
             for (category, group, bytes, basis) in [
-                (Category::Weights, "vision weights", encoder.weights, Basis::Exact),
+                (Category::Weights, crate::media::still_tower::vision_weight_arena_label(), encoder.weights, Basis::Exact),
                 (Category::Workspace, "vision scratch", encoder.scratch, Basis::Formula),
             ] {
                 let existing = device.items.iter().filter(|item| item.category == category && item.group == group)
@@ -1467,7 +1467,7 @@ mod tests {
             kind: DeviceKind::Spark, index: 0, capacity_bytes: layout.spark_capacity(0),
             worker_budget_bytes: layout.spark_capacity(0), kv_tokens: 0,
             items: vec![Item::new(Category::Runtime, "context+modules", "tower only", runtime, Basis::Calibrated),
-                Item::new(Category::Weights, "vision weights", "bundled encoder", encoder.weights, Basis::Exact),
+                Item::new(Category::Weights, crate::media::still_tower::vision_weight_arena_label(), "bundled encoder", encoder.weights, Basis::Exact),
                 Item::new(Category::Workspace, "vision scratch", "bundled encoder", encoder.scratch, Basis::Formula)],
         }], pool_tokens: 2097152, waste: Vec::new(), notes: Vec::new() };
         append_spark_devices(&mut memory, &layout, &[experts]).unwrap();

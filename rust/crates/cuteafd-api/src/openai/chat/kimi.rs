@@ -388,16 +388,16 @@ fn render_literals(body: &Value, thinking: bool, literal: &mut dyn FnMut(&str) -
         if role == "assistant" {
             calls = message["tool_calls"].as_array().cloned().unwrap_or_default();
             tool_index = 0;
+            out.push_str(&open("think", &[]));
             if thinking {
-                out.push_str(&open("think", &[]));
                 let reasoning = message
                     .get("reasoning_content")
                     .filter(|value| value.as_str().is_some_and(|s| !s.is_empty()))
                     .or_else(|| message.get("reasoning"))
                     .unwrap_or(&Value::Null);
                 out.push_str(&literal(&content(reasoning)?));
-                out.push_str(&close("think"));
             }
+            out.push_str(&close("think"));
             out.push_str(&open("response", &[]));
             out.push_str(&literal(&content(&message["content"])?));
             out.push_str(&close("response"));
@@ -449,7 +449,13 @@ fn render_literals(body: &Value, thinking: bool, literal: &mut dyn FnMut(&str) -
         _ => {}
     }
     out.push_str(&open("message", &[("role", "assistant".into())]));
-    out.push_str(&open(if thinking { "think" } else { "response" }, &[]));
+    out.push_str(&open("think", &[]));
+    if !thinking {
+        // Like GLM's empty-think form, keep the trained channel structure while
+        // prefilling reasoning as empty instead of dropping the channel.
+        out.push_str(&close("think"));
+        out.push_str(&open("response", &[]));
+    }
     Ok(out)
 }
 

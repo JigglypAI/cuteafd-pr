@@ -28,6 +28,8 @@ impl Options {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Request {
+    #[serde(default)]
+    pub timing: crate::report::StreamTiming,
     pub index: usize,
     pub sent_s: f64,
     pub first_token_s: f64,
@@ -123,7 +125,7 @@ pub fn run(client: &Client, c: usize, options: &Options, tokens: u64) -> Result<
                     let chat = client.chat(bodies[index].clone(), None)
                         .with_context(|| format!("sustained C{c} request {index}"))?;
                     let completed_s = start.elapsed().as_secs_f64();
-                    requests.lock().unwrap().push(Request { index, sent_s,
+                    requests.lock().unwrap().push(Request { timing: chat.timing.clone(), index, sent_s,
                         first_token_s: sent_s + chat.timing.ttft_s,
                         last_token_s: sent_s + chat.timing.ttft_s + chat.timing.decode_s,
                         completed_s, completion_tokens: chat.timing.completion_tokens, credited_tokens: 0.0 });
@@ -155,7 +157,7 @@ mod tests {
 
     #[test]
     fn window_credits_only_overlap_not_warmup_or_drain() {
-        let request = |first, last| Request { index: 0, sent_s: 0.0, first_token_s: first,
+        let request = |first, last| Request { timing: Default::default(), index: 0, sent_s: 0.0, first_token_s: first,
             last_token_s: last, completed_s: last, completion_tokens: 100, credited_tokens: 0.0 };
         assert_eq!(credit(&request(0.0, 2.0), 2.0, 6.0), 0.0);
         assert_eq!(credit(&request(6.0, 8.0), 2.0, 6.0), 0.0);

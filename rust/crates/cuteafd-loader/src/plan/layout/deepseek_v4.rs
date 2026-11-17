@@ -189,7 +189,7 @@ fn layout_for_experts(report: &mut PlanReport, model: &dyn super::super::FamilyM
                 anyhow::ensure!(gpu < ranks, "V4 encoder owner is not an admitted coordinator GPU");
                 let mut with_tower = inputs.clone();
                 with_tower.extra.push(crate::placement::Demand::new(gpu as u8, Category::Weights,
-                    "vision tower", encoder.weights, Basis::Formula)
+                    crate::media::still_tower::vision_weight_arena_label(), encoder.weights, Basis::Formula)
                     .with_resident_weights(crate::placement::ResidentWeights(encoder.weights)));
                 with_tower.extra.push(crate::placement::Demand::new(gpu as u8, Category::Workspace,
                     "vision scratch", encoder.scratch, Basis::Formula));

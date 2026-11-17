@@ -322,7 +322,7 @@ fn only_optional_bundled_components_keep_missing_execution_hints() {
         Component::Indexer, Component::Router, Component::SharedExpert, Component::RoutedExpert,
         Component::DenseFfn, Component::Vision, Component::Speculator].into_iter()
         .filter(|&component| MINIMAX_M3.component_hint(component).is_some()).collect::<Vec<_>>();
-    assert_eq!(missing, [Component::Vision, Component::Speculator]);
+    assert_eq!(missing, [Component::Speculator]);
 }
 
 #[test]

@@ -86,6 +86,24 @@ impl<'a> Head<'a> {
         unsafe { Self::embed_device_ids(cfg, capacity_rows, embedding, tokens.len(), stream,
             ids, gathered, residual) }
     }
+    pub fn embed_media(cfg: &MiniMaxM3Config, capacity_rows: usize,
+        embedding: &crate::shared::token_io::TokenEmbedding<'_>, tokens: &[u32],
+        media: &cuteafd_engine::media::MediaChunk, stream: &Stream<'_>,
+        ids: Buffer, gathered: Buffer, residual: Buffer) -> Result<()> {
+        if media.indices.is_empty() { return Self::embed_tokens(cfg,capacity_rows,embedding,tokens,stream,ids,gathered,residual); }
+        check_embedding(cfg,capacity_rows,embedding,tokens.len(),stream,ids,gathered,residual)?;
+        // Residual and IDs are dead until the cast; reuse their admitted storage.
+        crate::shared::vision::still::embed_inject(stream,
+            ||embedding.embed(tokens,ids,1,gathered,stream.raw),media,residual,ids,gathered,tokens.len(),cfg.hidden)?;
+        stream.device.run(|| {
+            // SAFETY: gather/injection are ordered before this cast on the retained stream;
+            // both admitted planes remain live until the unit drains.
+            unsafe {
+                stream.device.library.cuda_zero_bytes_async(residual,tokens.len()*cfg.hidden*4,stream.raw)?;
+                stream.device.library.cuda_accumulate_bf16_to_f32_async(gathered,residual,tokens.len()*cfg.hidden,stream.raw)
+            }
+        })
+    }
     /// Decode/verify consumes device token ids directly, without a host hop.
     ///
     /// # Safety

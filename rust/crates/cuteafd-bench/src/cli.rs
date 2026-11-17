@@ -192,6 +192,9 @@ pub fn run(options: &RunOptions) -> Result<(Report, PathBuf)> {
     crate::panel_config::validate(&options.panel_config)?;
     let base = options.url.trim_end_matches('/').to_string();
     let agent = agent();
+    let key = options.api_key.as_deref().map(cuteafd_api::openai::auth::ApiKey::new).transpose().map_err(anyhow::Error::msg)?;
+    let client = crate::client::Client::new(&base, None, Default::default()).with_api_key(key);
+    let prelude = client.warm_prelude(crate::sweep::TOKENS)?;
     let mut body = json!({});
     if let Some(profile) = &options.profile {
         body["profile"] = json!(profile);
@@ -253,6 +256,7 @@ pub fn run(options: &RunOptions) -> Result<(Report, PathBuf)> {
     // run's own gate check and a run recovered from the local store after the
     // server went away cannot carry a verdict the data no longer earns.
     let mut report = crate::quality::under_current_rule(&report);
+    anyhow::ensure!(report.prelude.as_ref() == Some(&prelude), "timed report omitted or changed this server's warm prelude receipt");
     check_context_suffix(&mut report, options.context_suffix.unwrap_or(0));
     check_panel_config(&mut report, &options.panel_config);
     let written = write_exports(&report, &dir, &options.export)?;

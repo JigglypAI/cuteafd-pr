@@ -116,6 +116,7 @@ pub(crate) const PAGE_PLANES: [(&str, usize); 3] =
 /// Request state contains references and a logical frontier, never device storage.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Placement {
+    pub media_spans: Vec<cuteafd_core::MediaSpan>,
     pub units: Vec<u32>,
     pub slot: usize,
     pub len: usize,
@@ -126,7 +127,7 @@ impl crate::shared::qwen::scheduler::Placement for Placement {
     fn set_len(&mut self, len: usize) { self.len = len; }
     fn units(&self) -> &[u32] { &self.units }
     fn slot(&self) -> i32 { self.slot as i32 }
-    fn spans(&self) -> &[cuteafd_core::MediaSpan] { &[] }
+    fn spans(&self) -> &[cuteafd_core::MediaSpan] { &self.media_spans }
 }
 
 /// Streams are provided by startup and retained by every metadata/cache reader.
@@ -762,9 +763,9 @@ mod tests {
         let bank = PageBank::new(vec![Rc::clone(&stream)], &cfg, capacity,
             MsaCache::new(2, 16, 4, 257)?, MsaRope::new(&cfg, 257)?, 0..2)?;
         bank.reserve_tables(stream.raw)?;
-        let placements = [Placement { units: vec![7, 2, 9], slot: 3, len: 63 },
-            Placement { units: vec![4, 11, 1], slot: 0, len: 128 },
-            Placement { units: vec![8, 6, 13], slot: 2, len: 1 }];
+        let placements = [Placement { media_spans: Vec::new(), units: vec![7, 2, 9], slot: 3, len: 63 },
+            Placement { media_spans: Vec::new(), units: vec![4, 11, 1], slot: 0, len: 128 },
+            Placement { media_spans: Vec::new(), units: vec![8, 6, 13], slot: 2, len: 1 }];
         for placement in &placements { bank.install(placement, stream.raw)?; }
         stream.drain()?;
         let canonical = device.run(|| read(&library, bank.plane("page_table")?, bank.plane("page_table")?.bytes))?;
@@ -846,7 +847,7 @@ mod tests {
         }
         assert_eq!(placements, original);
         assert!(bank.prepare_decode(&mut metadata, &[&placements[0], &placements[0]]).is_err());
-        let alias = Placement { slot: 1, ..placements[0].clone() };
+        let alias = Placement { media_spans: Vec::new(), slot: 1, ..placements[0].clone() };
         assert!(bank.prepare_decode(&mut metadata, &[&placements[0], &alias]).is_err());
         assert!(bank.prepare_segments(&mut metadata,
             &[Append { first_row: 1, placement: &placements[0], rows: 1 }]).is_err());
@@ -1028,7 +1029,7 @@ mod tests {
                         assert_eq!(metadata.layout, capacity.prefill);
                         assert!(Rc::ptr_eq(&metadata.stream, &rank.bank.readers()[slot + 1]));
                     }
-                    let placement = Placement { units: vec![0], slot: 0, len: 0 };
+                    let placement = Placement { media_spans: Vec::new(), units: vec![0], slot: 0, len: 0 };
                     rank.bank.prepare_decode(&mut rank.decode, &[&placement])?;
                     assert_eq!(rank.bank.decode_request(&rank.decode, rank.bank.layers.start)?.batch, 1);
                     for metadata in &mut rank.prefill {

@@ -575,7 +575,7 @@ fn layout_with_native(report: &mut PlanReport, model: &dyn super::super::FamilyM
             ensure_tower_spark(&mut devices, rank, options);
             if let Some(device) = devices.iter_mut().find(|device|
                 device.kind == DeviceKind::Spark && device.index as usize == rank) {
-                device.items.push(Item::new(Category::Weights, "vision weights", "bundled encoder", encoder.weights, Basis::Exact));
+                device.items.push(Item::new(Category::Weights, crate::media::still_tower::vision_weight_arena_label(), "bundled encoder", encoder.weights, Basis::Exact));
                 device.items.push(Item::new(Category::Workspace, "vision scratch", "bundled encoder", encoder.scratch, Basis::Formula));
             }
         }

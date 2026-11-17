@@ -1756,7 +1756,7 @@ impl Recipe for V41Recipe<'_> {
                             Lifetime::RESIDENT,
                             category,
                             match part {
-                                "weights" => "vision tower".to_string(),
+                                "weights" => crate::media::still_tower::vision_weight_arena_label().to_string(),
                                 _ => "vision scratch".to_string(),
                             },
                         );

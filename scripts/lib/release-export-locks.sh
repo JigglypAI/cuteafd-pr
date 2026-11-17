@@ -35,7 +35,7 @@ release_with_export_locks() (
     return 1
   }
   trap 'rc=$?; cleanup_export || { echo "failed to remove export container $container" >&2; rc=1; }; exit "$rc"' EXIT
-  trap 'exit 130' INT
-  trap 'exit 143' TERM
+  trap 'echo "export terminated (INT)" >&2; exit 130' INT
+  trap 'echo "export terminated (TERM)" >&2; exit 143' TERM
   "$@"
 )
