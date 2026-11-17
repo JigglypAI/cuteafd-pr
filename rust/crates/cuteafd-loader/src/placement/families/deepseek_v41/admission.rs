@@ -1997,7 +1997,7 @@ mod measured_adoption_tests {
             baseline: Baseline::Forecast { occupied: 0, source: "test".into(), assumed: false },
             headroom: 0,
         }];
-        let plan = ResolvedPlan {
+        let plan = ResolvedPlan { pool_policy: None,
             encoder_diagnostics: Vec::new(),
             request: production_request(1024u64, None, crate::placement::Onboard::Auto,
                 PrefillShape { rows: 1, waves: 1 }, Operation::Serving, 0,

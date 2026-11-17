@@ -64,7 +64,7 @@ pub fn prepare_pool(facts: PoolFacts<'_>) -> PoolPolicy {
     pool
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PoolPolicy {
     pub context: super::planner::Context,
     /// Immutable workspace extent, independent of the pool fit floor.
@@ -84,6 +84,15 @@ pub struct PoolPolicy {
 }
 
 impl PoolPolicy {
+    pub fn context(&self) -> super::planner::Context { self.context }
+    pub fn compiled_context(&self) -> u64 { self.compiled_context }
+    pub fn requested(&self) -> Option<u64> { self.requested }
+    pub fn target(&self) -> u64 { self.target }
+    pub fn floor(&self) -> u64 { self.floor }
+    pub fn ceiling(&self) -> u64 { self.ceiling }
+    pub fn max(&self) -> u64 { self.max }
+    pub fn unit_rows(&self) -> u64 { self.unit_rows }
+
     /// Both CLI zero and an omitted pool request select automatic admission.
     pub fn normalize_request(requested: Option<u64>) -> Option<u64> {
         requested.filter(|&tokens| tokens > 0)
@@ -93,7 +102,7 @@ impl PoolPolicy {
     /// Layout selection still uses `target`; only the selected pool's owners
     /// are charged when it grows into the memory left after onboarding.
     pub fn maximum_tokens(&self) -> u64 {
-        self.requested.unwrap_or(self.max.max(self.target))
+        self.requested.unwrap_or(self.max.max(self.target)).min(self.ceiling)
     }
 
     /// Diagnostic capacity reports use the layout target or strict request,

@@ -845,6 +845,23 @@ pub fn solve(
     budgets: Vec<Budget>,
     recipe: &impl Recipe,
 ) -> Result<ResolvedPlan, Refusal> {
+    let cards = budgets.iter().filter(|budget| budget.locations.iter()
+        .any(|location| matches!(location.device, Device::Coordinator(_))))
+        .map(|budget| budget.physical_bytes).collect::<Vec<_>>();
+    let requested = match request.pool { Pin::Auto => None, Pin::Exact(tokens) => Some(tokens) };
+    let pool = crate::placement::prepare_pool(crate::placement::PoolFacts::new(
+        &cards, request.context, requested, 1));
+    solve_prepared(request, budgets, recipe, &pool)
+}
+
+/// Admit a recipe using the same immutable policy that prepared its domain.
+/// No policy is re-read after preparation, including through a scoped plan.
+pub fn solve_prepared(
+    request: Request,
+    budgets: Vec<Budget>,
+    recipe: &impl Recipe,
+    pool: &crate::placement::PoolPolicy,
+) -> Result<ResolvedPlan, Refusal> {
     let started = std::time::Instant::now();
     let mut contract = recipe.prepare(&request)?;
     contract.add_driver_page_tables();
@@ -902,18 +919,18 @@ pub fn solve(
     // searched at the target; an automatic pool then grows to the max.
     // The card class picks the default target (a capped PRO keeps the PRO
     // target, as `PoolPolicy` and the live sample do).
-    let smallest = budgets.iter().filter(|b| b.locations.iter()
-        .any(|l| matches!(l.device, Device::Coordinator(_))))
-        .map(|b| b.physical_bytes).min().unwrap_or(u64::MAX);
-    let kv = cuteafd_core::memory_policy::MemoryPolicy::current().kv(smallest, request.context.maximum)
-        .map_err(|error| Refusal::InvalidFact(error.to_string()))?;
+    if pool.context() != request.context || pool.requested() != match request.pool {
+        Pin::Auto => None, Pin::Exact(tokens) => Some(tokens),
+    } {
+        return Err(Refusal::InvalidFact("prepared pool differs from placement request".into()));
+    }
     let aligned = |tokens: u64| tokens.div_ceil(page).div_ceil(multiple).checked_mul(multiple)
         .ok_or(Refusal::Overflow("target pool pages"));
-    let floor = request.context.required().max(if matches!(request.pool, Pin::Auto) { kv.min } else { 0 });
+    let floor = request.context.required().max(if matches!(request.pool, Pin::Auto) { pool.floor() } else { 0 });
     let minimum = aligned(floor)?;
     let compiled = contract.maximum_pages / multiple * multiple;
-    let target = aligned(kv.target.max(request.context.required()))?;
-    let ceiling = aligned(kv.max.max(kv.target).max(request.context.required()))?.min(compiled);
+    let target = aligned(pool.target().max(request.context.required()))?;
+    let ceiling = aligned(pool.max().max(pool.target()).max(request.context.required()))?.min(compiled);
     let wanted = match request.pool {
         Pin::Auto => target.min(compiled),
         Pin::Exact(n) => n / page,
@@ -1065,7 +1082,7 @@ pub fn solve(
             }
         }
     }
-    Ok(ResolvedPlan {
+    Ok(ResolvedPlan { pool_policy: Some(*pool),
         pool_page_rows: page,
         encoder_diagnostics,
         request,

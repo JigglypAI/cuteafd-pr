@@ -475,7 +475,7 @@ fn startup_graph_capture_replaces_opaque_estimate_without_reselection() {
     let mut physical = facts(vec![allocation("kv", 100)]);
     physical.allowances.push(owner);
     let budgets = vec![budget(1000)];
-    let mut plan = ResolvedPlan { pool_page_rows: 64, encoder_diagnostics: vec![], request: request(), decisions: decisions(1),
+    let mut plan = ResolvedPlan { pool_policy: None, pool_page_rows: 64, encoder_diagnostics: vec![], request: request(), decisions: decisions(1),
         pool_tokens: 64, phases: evaluate(&physical, &budgets).unwrap(), facts: physical, budgets };
     let original = plan.clone();
     let graphs = GraphSet { ranks: vec![rank], shapes: 1, lifetime: GraphLifetime::Startup };
@@ -562,7 +562,7 @@ fn shared_draft_arena_reconciliation_maps_roots_views_and_derived_references() -
             if physical.len() == 2 { let mut peer = budget(16 << 20);
                 peer.id = "peer".into(); peer.locations = vec![Location::coordinator(1)]; budgets.push(peer); }
             let facts = contract.facts(&vec![0; contract.variables.len()], 1)?;
-            let plan = ResolvedPlan { pool_page_rows: 64, encoder_diagnostics: vec![], request: request(), decisions: decisions(0),
+            let plan = ResolvedPlan { pool_policy: None, pool_page_rows: 64, encoder_diagnostics: vec![], request: request(), decisions: decisions(0),
                 pool_tokens: 64, phases: evaluate(&facts, &budgets)?, budgets, facts };
             let original = plan.clone();
             let mapped = devices.remap_plan_weight_arenas(&plan)?;
@@ -661,7 +661,7 @@ fn shared_arena_reconciliation_maps_physical_ids_without_changing_the_plan() -> 
         let mut facts = facts(planned.clone());
         facts.resident_weights = facts.allocations.iter().filter(|a| a.view.is_none())
             .map(|a| ResidentWeight::from_allocation(a, ResidentWeights(a.bytes))).collect();
-        let plan = ResolvedPlan { pool_page_rows: 64, encoder_diagnostics: vec![], request: request(), decisions: decisions(0),
+        let plan = ResolvedPlan { pool_policy: None, pool_page_rows: 64, encoder_diagnostics: vec![], request: request(), decisions: decisions(0),
             pool_tokens: 64, phases: evaluate(&facts, &budgets)?, budgets, facts };
         let original = plan.clone();
         let mapped = devices.remap_plan_weight_arenas(&plan)?;
@@ -775,7 +775,7 @@ fn shared_arena_remap_preserves_derived_backings_and_all_owner_scopes() -> anyho
             host.id = "host".into();
             host.locations = vec![Location::PINNED];
             budgets.push(host);
-            let plan = ResolvedPlan { pool_page_rows: 64, encoder_diagnostics: vec![], request: request(), decisions: decisions(0),
+            let plan = ResolvedPlan { pool_policy: None, pool_page_rows: 64, encoder_diagnostics: vec![], request: request(), decisions: decisions(0),
                 pool_tokens: 64, phases: evaluate(&planned, &budgets)?, budgets, facts: planned };
             let original = plan.clone();
             let mut expected_plan = plan.clone();
@@ -925,7 +925,7 @@ fn plan(allocations: Vec<Allocation>) -> ResolvedPlan {
     let budgets = vec![budget(4096)];
     let facts = facts(allocations);
     let phases = evaluate(&facts, &budgets).unwrap();
-    ResolvedPlan {
+    ResolvedPlan { pool_policy: None,
         pool_page_rows: 64,
         encoder_diagnostics: vec![],
         request: request(),
