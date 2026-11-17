@@ -459,6 +459,12 @@ pub(crate) fn with_mla_arena_fixture(verify: impl FnMut(&DflashDrafter<'_>,
 fn with_mla_arena_fixture_precision(complete: bool, mut verify: impl FnMut(&DflashDrafter<'_>,
     &cuteafd_loader::formats::dflash::MlaDraftRuntimeLayout,
     &cuteafd_loader::serving_capacity::WeightArenaLayout) -> Result<()>) -> Result<()> {
+    with_mla_arena_fixture_config(complete, false, verify)
+}
+
+fn with_mla_arena_fixture_config(complete: bool, windows_only: bool, mut verify: impl FnMut(&DflashDrafter<'_>,
+    &cuteafd_loader::formats::dflash::MlaDraftRuntimeLayout,
+    &cuteafd_loader::serving_capacity::WeightArenaLayout) -> Result<()>) -> Result<()> {
     use cuteafd_loader::{formats::dflash::MlaDflashConfig,
         plan::testing::{t, write_safetensors}, serving_capacity::WeightArenaLayout};
     use crate::shared::memory::{device::Stream, weight_arena::DeviceWeightArena};
@@ -477,7 +483,7 @@ fn with_mla_arena_fixture_precision(complete: bool, mut verify: impl FnMut(&Dfla
         "qk_nope_head_dim":128, "qk_rope_head_dim":64, "v_head_dim":128,
         "rms_norm_eps":1e-5, "vocab_size":256, "draft_vocab_size":256,
         "max_position_embeddings":65536, "num_target_layers":93,
-        "layer_types":["sliding_attention","full_attention"], "sliding_window":4096,
+        "layer_types":if windows_only { vec!["sliding_attention"; 2] } else { vec!["sliding_attention","full_attention"] }, "sliding_window":4096,
         "use_sliding_window":true, "is_causal":false, "mla_use_output_gate":false,
         "attention_bias":false, "hidden_act":"silu", "fc_norm":false,
         "rope_parameters":{"rope_type":"yarn", "rope_theta":50000., "factor":32.,
@@ -597,6 +603,65 @@ fn with_mla_arena_fixture_precision(complete: bool, mut verify: impl FnMut(&Dfla
         .map(|(name, shape)| t(name, "F32", shape)).collect::<Vec<_>>());
     assert!(DflashDrafter::mla_arena_requests(snapshot, GlmDraftRepresentation::Bf16Only, 1).is_err());
     Ok(())
+}
+
+#[test]
+fn prompt_window_snapshot_restores_exact_ring_bytes_and_committed_frontier() -> Result<()> {
+    use crate::shared::memory::{device::Allocation, TEST};
+    // The sparse CPU DSO's device extents are host-mapped bytes. Its synchronous
+    // copy primitive writes those bytes even though numerical kernels are disabled.
+    with_mla_arena_fixture_config(true, true, |draft, layout, _| {
+        assert!(draft.mla_windows_only());
+        assert_eq!(draft.mla_draft_page_bytes(), 0);
+        draft.reset_context(0, 0)?;
+        let DraftContext::Mla(context) = &draft.context else { unreachable!() };
+        let end = 1034;
+        let expected_rings = {
+            let mut state = context.state.borrow_mut();
+            for first in (0..end).step_by(64) {
+                let rows = (first..(first+64).min(end)).enumerate()
+                    .map(|(tap_row,position)| ContextRow { tap_row,slot:0,position }).collect::<Vec<_>>();
+                let (plan,reservations) = MlaContextUpdate::checked_paged(&mut state, layout, &rows)?;
+                assert!(reservations.is_empty());
+                state.rings = plan.next;
+            }
+            assert_eq!(state.rings.frontier(0)?, (0,end));
+            assert_eq!(state.pool.frontier(state.bindings[0].unwrap())?, (0,0));
+            state.rings.clone()
+        };
+        let device = crate::shared::memory::device::Device { library:draft.library,id:1 };
+        let windows = draft.mla_window_buffers(0)?;
+        let marks = windows.iter().map(|window| Allocation::new(device,window.bytes,TEST)).collect::<Result<Vec<_>>>()?;
+        let buffers = marks.iter().map(|mark|mark.buffer).collect::<Vec<_>>();
+        let bytes = windows.iter().enumerate().map(|(layer,window)|
+            (0..window.bytes).map(|i|((i*17+layer*31)%251) as u8).collect::<Vec<_>>()).collect::<Vec<_>>();
+        let write = |destination: CuteafdDeviceBuffer,data:&[u8]| draft.library.copy_d2d(destination,
+            CuteafdDeviceBuffer { ptr:data.as_ptr().cast_mut().cast(),bytes:data.len(),device_id:1,flags:0 },data.len());
+        for (&window,data) in windows.iter().zip(&bytes) { write(window,data)?; }
+        draft.copy_mla_windows(0,&buffers,true)?;
+        draft.drain_mla()?;
+        // Simulate recycling the request slot after prompt-end snapshot capture.
+        draft.reset_context(0, 7000)?;
+        for &window in &windows { write(window,&vec![0xa5;window.bytes])?; }
+        draft.copy_mla_windows(0,&buffers,false)?;
+        draft.restore_mla_windows(0,end)?;
+        for (&window,expected) in windows.iter().zip(&bytes) {
+            let mut actual=vec![0;window.bytes];draft.library.copy_d2h(&mut actual,window)?;
+            assert_eq!(&actual,expected,"restored FP8/BF16 ring bytes differ");
+        }
+        let state=context.state.borrow();
+        assert_eq!(state.rings.frontier(0)?,expected_rings.frontier(0)?);
+        assert_eq!(state.rings,expected_rings);
+        assert_eq!(state.pool.frontier(state.bindings[0].unwrap())?,(end,end));
+        Ok(())
+    })?;
+    // Mixed/full MLA still owns page attachments; it must not enter window restore.
+    with_mla_arena_fixture(|draft,_,_| {
+        assert!(!draft.mla_windows_only());
+        assert!(draft.mla_draft_page_bytes()>0);
+        assert!(draft.restore_mla_windows(0,1034).is_err());
+        Ok(())
+    })
 }
 
 #[test]

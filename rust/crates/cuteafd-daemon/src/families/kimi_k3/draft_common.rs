@@ -137,6 +137,11 @@ impl<'a> CommonDraft<'a> {
     pub fn last_logits(&self,seqs:usize)->Result<Vec<f32>> {
         match self { Self::Mla(d)=>d.last_logits(seqs),Self::Block { draft:d,.. }=>d.last_logits(seqs) }
     }
+    pub fn mla_windows_only(&self) -> bool { matches!(self, Self::Mla(d) if d.mla_windows_only()) }
+    pub fn restore_mla_windows(&self, slot: usize, frontier: usize) -> Result<()> {
+        match self { Self::Mla(d) => d.restore_mla_windows(slot, frontier),
+            Self::Block { .. } => anyhow::bail!("block draft restores its own frontier metadata") }
+    }
     pub fn mla_draft_page_bytes(&self)->usize { match self { Self::Mla(d)=>d.mla_draft_page_bytes(),Self::Block { .. }=>0 } }
     pub fn mla_reservation(&self,slot:usize)->Option<cuteafd_engine::reserve::DraftDemand> {
         match self { Self::Mla(d)=>d.mla_reservation(slot),Self::Block { .. }=>None }
