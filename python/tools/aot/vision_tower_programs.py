@@ -14,7 +14,7 @@ def geometry(kind):
 def names(kind):
     g=geometry(kind);h,a,i,o=g["hidden"],g["attention"],g["intermediate"],g["output"]
     suffix="raster_t1" if kind=="kimi" else "group_t2"
-    result=["dynamic_attention",f"patches_{suffix}",f"tables_{suffix}",f"rotary_{suffix}",
+    result=[f"dynamic_attention_h{g['heads']}_d{g['dim']}",f"patches_{suffix}",f"tables_{suffix}",f"rotary_{suffix}",
             f"residual_h{h}"]
     if kind=="kimi":
         result += ["tower_rms_norm_h1024","tower_rms_norm_h7168","position_h1024","group_h1024"]
@@ -72,7 +72,7 @@ def builders(kind):
     g=geometry(kind);h,a,i,o=g["hidden"],g["attention"],g["intermediate"],g["output"]
     suffix="raster_t1" if kind=="kimi" else "group_t2"
     axes=(0,64,64) if kind=="kimi" else (26,26,26)
-    result={"dynamic_attention":lambda:compile_dynamic_vision_attention_aot(heads=g["heads"],dim=g["dim"]),
+    result={f"dynamic_attention_h{g['heads']}_d{g['dim']}":lambda:compile_dynamic_vision_attention_aot(heads=g["heads"],dim=g["dim"]),
         f"patches_{suffix}":lambda:compile_still_patches_aot(temporal=g["temporal"],group_major=g["group_major"]),
         f"tables_{suffix}":lambda:compile_vision_rotary_tables_aot(axes=axes,adjacent=kind=="kimi",group_major=g["group_major"]),
         f"rotary_{suffix}":lambda:compile_vision_qkv_rotary_aot(heads=g["heads"],dim=g["dim"],rotated=sum(axes),adjacent=kind=="kimi"),

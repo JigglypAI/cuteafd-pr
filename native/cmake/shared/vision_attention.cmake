@@ -180,6 +180,41 @@ foreach(kind inkling2 step5)
     BORROW_POINTWISE_GROUP muse BORROW_POINTWISE_PROGRAMS ${borrowed_programs}
     POINTWISE_PROGRAMS ${pe_programs} POINTWISE_ARGS --group perception --perception ${kind})
 endforeach()
+# Generic still towers own dynamic-row attention and an independent program group.
+# Registration alone does not qualify runtime dispatch, which stays oracle-gated.
+set(tower_inventory "${CMAKE_CURRENT_LIST_DIR}/../../../python/tools/aot/vision_tower_programs.py")
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${tower_inventory}")
+foreach(kind kimi minimax)
+  if(kind STREQUAL "kimi")
+    set(dim 128)
+  else()
+    set(dim 80)
+  endif()
+  execute_process(COMMAND "${Python3_EXECUTABLE}" "${muse_exporter}" --list-tower-programs --tower ${kind}
+    RESULT_VARIABLE tower_status OUTPUT_VARIABLE tower_programs OUTPUT_STRIP_TRAILING_WHITESPACE)
+  if(NOT tower_status EQUAL 0 OR NOT tower_programs)
+    message(FATAL_ERROR "Cannot read ${kind} generic tower export inventory")
+  endif()
+  list(GET tower_programs 0 first_program)
+  if(NOT first_program MATCHES "^vision_dynamic_attention_h[0-9]+_d${dim}$")
+    message(FATAL_ERROR "Generic tower inventory must start with geometry-keyed dynamic attention")
+  endif()
+  list(REMOVE_AT tower_programs 0)
+  set(borrowed_programs)
+  if(kind STREQUAL "kimi")
+    # These use the same media/pointwise builders and keys as Muse.
+    set(borrowed_programs vision_projection_h4096_o4096 vision_gelu_h4096)
+  endif()
+  set(attention_args --group tower --tower ${kind})
+  foreach(stem IN LISTS tower_programs)
+    list(APPEND attention_args --omit-program ${stem})
+  endforeach()
+  cuteafd_vision_owner_entry(tower_${kind} HEAD_DIM ${dim}
+    PROGRAMS ${first_program} ARGS ${attention_args}
+    POINTWISE_GROUP tower_${kind} POINTWISE_PROGRAMS ${tower_programs}
+    BORROW_POINTWISE_GROUP muse BORROW_POINTWISE_PROGRAMS ${borrowed_programs}
+    POINTWISE_ARGS --group tower --tower ${kind} --omit-program ${first_program})
+endforeach()
 get_property(owner_outputs GLOBAL PROPERTY CUTEAFD_VISION_OWNER_OUTPUTS)
 list(APPEND CUTEAFD_VISION_ATTENTION_OUTPUTS ${owner_outputs})
 list(REMOVE_DUPLICATES CUTEAFD_VISION_ATTENTION_OUTPUTS)
