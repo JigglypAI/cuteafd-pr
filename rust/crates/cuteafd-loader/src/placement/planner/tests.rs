@@ -2445,19 +2445,19 @@ fn full_context_refusal_prices_best_feasible_assignment_not_pruned_alternative()
 }
 
 #[test]
-fn automatic_target_uses_logical_cap_for_small_card_simulation() {
+fn automatic_target_is_uniform_for_small_card_simulation() {
     let recipe = Linear::new();
     let mut card = budget(96 << 30);
     card.logical_bytes = 24 << 30;
     assert_eq!(
         solve(request(), vec![card], &recipe).unwrap().pool_tokens,
-        1 << 20
+        2 << 20
     );
     assert_eq!(
         solve(request(), vec![budget(32 << 30)], &recipe)
             .unwrap()
             .pool_tokens,
-        1 << 20
+        2 << 20
     );
     let context = 3 << 20;
     let recipe = Linear {
@@ -2481,7 +2481,7 @@ fn automatic_target_uses_logical_cap_for_small_card_simulation() {
 
 #[test]
 fn pool_first_then_onboarding_and_exact_constraints() {
-    let target = 1 << 20;
+    let target = 2 << 20;
     let recipe = Linear {
         onboard: 2,
         ..Linear::new()
@@ -3750,4 +3750,37 @@ fn dashboard_reservations_include_deferred_host_prefix_and_match_assess() {
     }
     // Existing readiness/admission projection semantics are intentionally unchanged.
     assert!(p.items_at(Location::PINNED, Phase::Growth).unwrap().is_empty());
+}
+
+
+#[test]
+fn memory_domain_bounds_exact_growth_without_changing_target_onboarding() {
+    use cuteafd_core::memory_policy::MemoryPolicy;
+    let req = Request { context: Context::automatic(131_072), ..request() };
+    for bytes in [32u64 << 30, 96 << 30, 192 << 30] {
+        let cards = [bytes];
+        let solve_with = |policy: MemoryPolicy| policy.scoped(|| {
+            let pool = crate::placement::prepare_pool(crate::plan::testing::pool_facts(
+                &cards, req.context, None, 64, &[64 * 1024])).unwrap();
+            let mut contract = Linear { maximum: pool.maximum_tokens(), onboard: 2,
+                ..Linear::new() }.prepare(&req).unwrap();
+            contract.set_byte_extent("kv", ByteCurve::linear(64 * 1024, 64 * 1024,
+                contract.maximum_pages)).unwrap();
+            contract.validate().unwrap();
+            let solved = search::solve_prepared(req.clone(), vec![budget(bytes)],
+                &Prepared(contract), &pool).unwrap();
+            assert!(pool.maximum_tokens() >= solved.admitted_extent());
+            (pool, solved)
+        });
+        let (_, baseline) = solve_with(MemoryPolicy { kv_max: Some(2 << 20), ..Default::default() });
+        let (pool, grown) = solve_with(MemoryPolicy::default());
+        assert_eq!(pool.maximum_tokens(), bytes / (64 * 1024) * 64);
+        assert_eq!(grown.decisions.onboard(), 2);
+        assert_eq!(grown.decisions.onboard(), baseline.decisions.onboard());
+        assert_eq!(grown.admitted_extent(), (bytes - 2 * 64) / (64 * 1024) * 64);
+        let (capped_pool, capped) = solve_with(MemoryPolicy { kv_max: Some(4 << 20), ..Default::default() });
+        assert_eq!(capped_pool.maximum_tokens(), (4 << 20).min(pool.maximum_tokens()));
+        assert_eq!(capped.admitted_extent(), (4 << 20).min(grown.admitted_extent()));
+        assert_eq!(capped.decisions.onboard(), baseline.decisions.onboard());
+    }
 }

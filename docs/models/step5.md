@@ -1,5 +1,11 @@
 # Step-5
 
+Automatic KV sizing uses the shared 2M-token target on every card, including
+32 GB / RTX 5090. Placement and expert onboarding are fixed at that target;
+the pool then grows into remaining admitted memory, within native encoding
+limits. `KV_MAX_TOKENS` is unset by default and can explicitly cap growth.
+See [memory policy](../options.md#memory-and-pools).
+
 Step-5-Preview serves text from its standard Hugging Face checkpoint headers.
 The MC release cards target one RTX PRO 6000 plus three Sparks and two RTX
 plus six Sparks. Official FP8 and NVFP4 remain supported; NVFP4 experts

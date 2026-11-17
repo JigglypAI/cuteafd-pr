@@ -1,5 +1,11 @@
 # MiniMax M3.1 Flash
 
+Automatic KV sizing uses the shared 2M-token target on every card, including
+32 GB / RTX 5090. Placement and expert onboarding are fixed at that target;
+the pool then grows into remaining admitted memory, within native encoding
+limits. `KV_MAX_TOKENS` is unset by default and can explicitly cap growth.
+See [memory policy](../options.md#memory-and-pools).
+
 Native MiniMax M3.1 Flash serves through the shared scheduler, continuous
 prefill executor, Spark exchange, exact prefix cache and device token selector.
 Qualified layouts are one RTX PRO 6000 with three Sparks or two RTX PRO 6000

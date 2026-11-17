@@ -183,9 +183,8 @@ impl PoolPolicy {
 
 #[cfg(test)]
 fn legacy_fixture_pool(cards: &[u64], context: u64, requested: Option<u64>, unit_rows: u64) -> PoolPolicy {
-    let mut facts = PoolFacts::new(cards, context, requested, unit_rows);
-    facts.encoding_limit = Some(requested.unwrap_or(2 << 20));
-    prepare_pool(facts).unwrap()
+    prepare_pool(crate::plan::testing::pool_facts(cards, context, requested, unit_rows,
+        &vec![unit_rows * 1024; cards.len()])).unwrap()
 }
 
 #[cfg(test)]
@@ -239,7 +238,7 @@ mod tests {
     }
 
     #[test]
-    fn targets_follow_the_smallest_card_and_the_context() {
+    fn targets_are_uniform_and_preserve_context_requirements() {
         let gib = 1u64 << 30;
         assert_eq!(legacy_fixture_pool(&[96 * gib], 131_072, None, 256).target, 2 << 20);
         assert_eq!(legacy_fixture_pool(&[96 * gib, 32 * gib], 131_072, None, 256).target, 2 << 20);
