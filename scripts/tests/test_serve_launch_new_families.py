@@ -846,6 +846,14 @@ def test_muse_prefill_scoring_uses_ordinary_launch(tmp_path: Path) -> None:
     assert "--full-prefill-logits" not in plan
 
 
+def test_step5_forwards_shared_speculation_trace(tmp_path: Path) -> None:
+    trace = tmp_path / "trace" / "step5.jsonl"
+    result = _step5(tmp_path, f"SPARK_COUNT=4\nRTX_GPUS=2\nSPECULATION_TRACE={trace}\n" + _hosts(4))
+    serve = _line(result, "serve-step5 --snapshot")
+    assert f"CUTEAFD_SPECULATION_TRACE={trace}" in serve
+    assert f"{trace.parent}:{trace.parent}" in serve
+
+
 def test_muse_forwards_speculation_trace(tmp_path: Path) -> None:
     trace = tmp_path / "trace" / "speculation-trace.jsonl"
     result = _muse(tmp_path, f"SPECULATION_TRACE={trace}\n")
