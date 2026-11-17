@@ -66,8 +66,7 @@ int encode_generic_tower(Owner* o,const uint8_t* rgb,uint64_t rgb_bytes,const fl
     {frequency(0),frequency(1),frequency(2),b.cosines,b.sines},{uint64_t(gh),uint64_t(gw)}));
   int32_t lengths[2]={0,n};
   GENERIC_RUN(cudaMemcpyAsync(b.lengths,lengths,sizeof(lengths),cudaMemcpyHostToDevice,stream));
-  int l2=0;GENERIC_RUN(cudaDeviceGetAttribute(&l2,cudaDevAttrL2CacheSize,o->device));
-  const float scale=1.f/sqrtf(float(s.head_dim));uint32_t scale_bits;std::memcpy(&scale_bits,&scale,4);
+  const float scale=1.f/sqrtf(float(s.head_dim));
   for(uint32_t layer=0;layer<s.depth;++layer) {
     const auto& block=s.blocks[layer];
     cuteafd_vision_tower_norm norm1{t.block_norm_kind,t.block_norm_epsilon,block.norm1,s.norm1_bias[layer]};
@@ -76,8 +75,8 @@ int encode_generic_tower(Owner* o,const uint8_t* rgb,uint64_t rgb_bytes,const fl
     GENERIC_RUN(generic_projection(o,b.qkv_norm,block.qkv,block.qkv_bias,b.qkv,n,h,3*a));
     GENERIC_RUN(generic_program(o,"vision_rotary_"+suffix,
       {b.qkv,b.cosines,b.sines,b.q,b.k,b.v},{uint64_t(n)}));
-    GENERIC_RUN(generic_program(o,"vision_dynamic_attention_h"+std::to_string(s.heads)+"_d"+std::to_string(s.head_dim),
-      {b.q,b.k,b.v,b.attention,b.lse,b.lengths},{uint64_t(n),scale_bits,uint64_t(l2)}));
+    GENERIC_RUN(cuteafd_vision_dynamic_attention_launch(o->attention,b.q,b.k,b.v,
+      b.attention,b.lse,b.lengths,n,scale,stream));
     GENERIC_RUN(generic_projection(o,b.attention,block.proj,block.proj_bias,b.next,n,a,h));
     GENERIC_RUN(generic_residual(o,b.x,b.next,n));
     GENERIC_RUN(generic_norm(o,norm2,b.x,b.norm,n,h));

@@ -184,7 +184,19 @@ inline int cudaLibraryUnload(void*) {++unloads;return fail_unload;}
     header(tmp_path / "vision_axial_rotary.h", "vision_axial_rotary", pointers=6, scalars=("int32_t",))
     modern = entry(tmp_path, 96, programs=["vision_attention_d96_full", "vision_axial_rotary"])
     modern["pointwise_group"] = "d96_f32"
-    (tmp_path / "vision_owner_entries.h").write_text(registry.registry([entry(tmp_path), entry(tmp_path, 72), modern]))
+    exporter = ROOT / "python/tools/aot/export_b12x_vision_aot.py"
+    generic_entries = []
+    generic_names = []
+    for kind, dim in (("kimi", 128), ("minimax", 80)):
+        names = subprocess.check_output(["python3", str(exporter), "--list-tower-programs", "--tower", kind], text=True).strip().split(";")
+        generic_names.append(names)
+        for index, name in enumerate(names):
+            header(tmp_path / (name + ".h"), name, pointers=6 if index == 0 else 4,
+                   scalars=("int32_t", "float", "int32_t") if index == 0 else ("int32_t",))
+        item = entry(tmp_path, dim, programs=names)
+        item["pointwise_group"] = "tower_" + kind
+        generic_entries.append(item)
+    (tmp_path / "vision_owner_entries.h").write_text(registry.registry([entry(tmp_path), entry(tmp_path, 72), modern, *generic_entries]))
     fixture = """
 #include <cassert>
 #include <cstring>
@@ -210,7 +222,9 @@ extern "C" void _mlir_cuteafd_vision_axial_rotary_cuda_init(void** a){initialize
 extern "C" void _mlir_cuteafd_vision_axial_rotary_cuda_load_to_device(void** a){load(a,0);}
 extern "C" void _mlir_cuteafd_vision_axial_rotary_entry(void** a,int n){
  assert(n==9);assert(*static_cast<int32_t*>(a[6])==17);*static_cast<int*>(a[8])=0;}
+GENERIC_PROGRAMS
 int main(){
+ GENERIC_CHECKS
  void *a=nullptr,*b=nullptr,*c=nullptr;
  assert(cuteafd_vision_attention_create_entry(64,0,"",&a)==0);
  assert(cuteafd_vision_attention_create_entry(64,0,"",&b)==0);
@@ -241,6 +255,30 @@ int main(){
  assert(cuteafd_vision_attention_destroy(nullptr)==0);
 }
 """
+    definitions, checks, seen = [], [], set()
+    for kind, dim, names in zip(("kimi", "minimax"), (128, 80), generic_names, strict=True):
+        for index, name in enumerate(names):
+            if name in seen:
+                continue
+            seen.add(name)
+            validation = ('assert(n==11);assert(*static_cast<int32_t*>(a[6])==16);'
+                          'assert(*static_cast<float*>(a[7])==.5f);'
+                          'assert(*static_cast<int32_t*>(a[8])==50331648);*static_cast<int*>(a[10])=0;' if index == 0 else
+                          'assert(n==7);*static_cast<int*>(a[6])=0;')
+            definitions.append(f'''extern "C" void _mlir_cuteafd_{name}_cuda_init(void** a){{initialize(a,0);}}
+extern "C" void _mlir_cuteafd_{name}_cuda_load_to_device(void** a){{load(a,0);}}
+extern "C" void _mlir_cuteafd_{name}_entry(void** a,int n){{{validation}}}''')
+        launch_checks = '\n'.join(f'assert(cuteafd_vision_pointwise_launch(g,"{name}",ptrs,&scalar,nullptr)==0);' for name in names[1:])
+        checks.append(f'''{{void* g=nullptr;assert(cuteafd_vision_attention_create_entry({dim},0,"tower_{kind}",&g)==0);
+void* ptrs[6]{{}};uint64_t scalar=16;
+assert(cuteafd_vision_pointwise_launch(g,"{names[0]}",ptrs,&scalar,nullptr)==cudaErrorInvalidValue);
+assert(cuteafd_vision_dynamic_attention_launch(g,nullptr,nullptr,nullptr,nullptr,nullptr,nullptr,16,.5f,nullptr)==0);
+assert(cuteafd_vision_dynamic_attention_launch(g,nullptr,nullptr,nullptr,nullptr,nullptr,nullptr,0,.5f,nullptr)==cudaErrorInvalidValue);
+assert(cuteafd_vision_attention_launch(g,nullptr,nullptr,nullptr,nullptr,nullptr,nullptr,.5f,nullptr)==cudaErrorInvalidValue);
+{launch_checks}
+assert(cuteafd_vision_attention_destroy(g)==0);}}
+unloads=0;init[0]=0;loads[0]=0;''')
+    fixture = fixture.replace("GENERIC_PROGRAMS", '\n'.join(definitions)).replace("GENERIC_CHECKS", '\n'.join(checks))
     (tmp_path / "fixture.cc").write_text(fixture)
     executable = tmp_path / "test-owner"
     result = subprocess.run([compiler, "-std=c++17", "-pthread", "-I", str(tmp_path), "-I",
@@ -280,5 +318,7 @@ def test_inactive_generic_tower_inventory_is_unique_and_has_dynamic_attention_fi
     assert "if(!o->teacher_input)return 0;" in encode
     assert "cudaMemcpyHostToDevice,o->stream" in encode
     assert "return drain(o,rc);" in encode
+    assert "cuteafd_vision_dynamic_attention_launch(o->attention" in encode
+    assert 'generic_program(o,"vision_dynamic_attention' not in encode
     assert "generic_teacher_boundary(o,0,b.x,n,h)" in encode
     assert "if(layer+1<s.depth)GENERIC_RUN(generic_teacher_boundary(o,int(layer)+1,b.x,n,h));" in encode
