@@ -16,7 +16,7 @@ fn request(gpus: usize, free: u64, layers: usize, sparks: usize, onboard: Onboar
             gpus: vec![GpuBudget { capacity_bytes: 96 * GIB, reserve_bytes: 0,
                 baseline: Baseline::Measured { free_bytes: free } }; gpus],
             spark_ranks: sparks, peer_access: gpus == 2 },
-        pool: PoolPolicy::resolve(&vec![96 * GIB; gpus], 131_072, None, 256),
+        pool: prepare_pool(PoolFacts::new(&vec![96 * GIB; gpus], 131_072, None, 256)).unwrap(),
         layers: (0..layers).map(|_| LayerDemand { kind: AttentionClass::Csa, weights: ModeBytes::default(),
             kv_unit: ModeBytes::default().into(), colocate: None,
             fixed_bytes: ModeBytes::default(), extra: Vec::new(), context_indexer: false,
@@ -240,20 +240,19 @@ fn explicit_pool_requires_compiled_context_in_live_and_frozen_solves() {
     }
     req.pool.requested = Some(131072);
     assert_eq!(solve(&req).unwrap().pool_tokens, 131072);
-    req.pool = PoolPolicy::resolve(&[96 * GIB; 2], 32768, Some(32768), 256);
+    req.pool = prepare_pool(PoolFacts::new(&[96 * GIB; 2], 32768, Some(32768), 256)).unwrap();
     assert_eq!(solve(&req).unwrap().pool_tokens, 32768);
 }
 
 #[test]
 fn explicit_diagnostic_pool_clamps_only_automatic_context() {
     let mut req = request(1, GIB, 2, 4, Onboard::Auto);
-    req.pool = PoolPolicy::resolve(&[96 * GIB], 131072, Some(32768), 256)
-        .with_context(crate::placement::planner::Context::automatic(131072));
+    req.pool = prepare_pool(PoolFacts::new(&[96 * GIB], crate::placement::planner::Context::automatic(131072), Some(32768), 256)).unwrap();
     let placed = solve(&req).unwrap();
     assert_eq!(placed.pool_tokens, 32768);
     assert_eq!(crate::serving_capacity::pool_context(crate::placement::planner::Context::automatic(131072),
         placed.pool_tokens as usize).unwrap(), 32768);
-    req.pool = PoolPolicy::resolve(&[96 * GIB], 131072, Some(32768), 256);
+    req.pool = prepare_pool(PoolFacts::new(&[96 * GIB], 131072, Some(32768), 256)).unwrap();
     assert_eq!(solve(&req), Err(PlacementError::RequestedBelowContext {
         requested: 32768, floor: 131072,
     }));
@@ -1747,7 +1746,7 @@ fn compulsory_prefix_reserves_exact_costs_before_an_automatic_pool() {
 #[test]
 fn spark_budget_feeds_existing_tp2_pool_first_and_mark_selection() {
     let mut req = request(2, 8 * GIB, 4, 6, Onboard::Auto);
-    req.pool = PoolPolicy::resolve(&[96 * GIB; 2], 1 << 20, Some(1 << 20), 64);
+    req.pool = prepare_pool(PoolFacts::new(&[96 * GIB; 2], 1 << 20, Some(1 << 20), 64)).unwrap();
     req.pool_overhead = vec![128 * 1024; 2]; // 2 GiB per GPU at the fixed 1M extent.
     for layer in &mut req.layers {
         let cost = layer.experts.as_mut().unwrap();
