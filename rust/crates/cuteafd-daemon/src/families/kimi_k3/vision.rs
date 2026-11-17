@@ -1,5 +1,5 @@
 //! Header-native MoonViT3d builder. Execution remains gated until encoder oracles.
-use crate::shared::vision::{ConstantRegion, TensorRead, TowerSpec};
+use crate::shared::vision::{ConstantRegion, ReadTransform, TensorRead, TowerSpec};
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::vision::{
     TowerExtension, TowerNorm, TowerProjector, VisionBlock, VisionSpec, NO_VISION_OFFSET as NONE,
@@ -37,7 +37,7 @@ pub(crate) fn tower(snapshot: &Path, max_output_rows: usize) -> Result<TowerSpec
             path: path.clone(),
             metadata: metadata.clone(),
             destination: usize::try_from(tensor.destination)?,
-            vector: false,
+            transform: ReadTransform::Direct,
         });
     }
     let at = |name: &str| {

@@ -44,7 +44,7 @@ impl TowerSpec {
             cursor = (cursor + 255) & !255;
             let destination = cursor;
             cursor += metadata.byte_length as usize * if vector { 2 } else { 1 };
-            reads.push(TensorRead { path: path.clone(), metadata: metadata.clone(), destination, vector });
+            reads.push(TensorRead { path: path.clone(), metadata: metadata.clone(), destination, transform: if vector {ReadTransform::Bf16ToF32}else{ReadTransform::Direct} });
             Ok(destination as u64)
         };
         let mut native = VisionSpec {

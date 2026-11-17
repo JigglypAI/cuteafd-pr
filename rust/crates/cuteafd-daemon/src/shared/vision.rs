@@ -6,6 +6,8 @@ mod muse;
 mod perception;
 mod constants;
 pub(crate) use constants::ConstantRegion;
+mod read_transform;
+pub(crate) use read_transform::ReadTransform;
 pub mod mistral;
 mod qwen;
 pub mod local;
@@ -136,7 +138,7 @@ pub(crate) struct TensorRead {
     pub(crate) path: PathBuf,
     pub(crate) metadata: SafetensorsTensorMetadata,
     pub(crate) destination: usize,
-    pub(crate) vector: bool,
+    pub(crate) transform: ReadTransform,
 }
 /// Header-only plan. It touches no tensor data until weight/scratch admission.
 #[derive(Clone, Debug)]
@@ -155,13 +157,7 @@ impl TowerSpec {
     pub(crate) fn from_parts_with_constants(native: VisionSpec, reads: Vec<TensorRead>, constants: Vec<ConstantRegion>) -> Result<Self> {
         let mut ranges = Vec::new();
         for read in &reads {
-            let source = usize::try_from(read.metadata.byte_length)
-                .map_err(|_| VisionError::Unsupported("tower source extent overflow".into()))?;
-            if read.vector && read.metadata.dtype != DType::Bf16 {
-                return Err(VisionError::Unsupported("tower vector widening requires BF16".into()));
-            }
-            let bytes = source.checked_mul(if read.vector { 2 } else { 1 })
-                .ok_or_else(|| VisionError::Unsupported("tower resident extent overflow".into()))?;
+            let bytes = read.transform.resident_bytes(&read.metadata)?;
             let end = read.destination.checked_add(bytes)
                 .ok_or_else(|| VisionError::Unsupported("tower destination overflow".into()))?;
             if bytes == 0 || end as u64 > native.weight_bytes
@@ -182,9 +178,9 @@ impl TowerSpec {
     }
     pub(crate) fn constant_regions(&self) -> &[ConstantRegion] { &self.constants }
     fn validate_constants(&self) -> Result<()> {
-        constants::validate_regions(&self.constants,self.native.weight_bytes,
-            self.reads.iter().map(|read| (read.destination as u64,
-                read.metadata.byte_length.saturating_mul(if read.vector {2} else {1}))))
+        let ranges=self.reads.iter().map(|read| Ok((read.destination as u64,
+            read.transform.resident_bytes(&read.metadata)? as u64))).collect::<Result<Vec<_>>>()?;
+        constants::validate_regions(&self.constants,self.native.weight_bytes,ranges)
             .map_err(VisionError::Unsupported)
     }
     #[allow(dead_code)] // Family modules outside this parent use the same catalog.
@@ -194,8 +190,8 @@ impl TowerSpec {
     /// Header-only staged source windows of this tower's pushed contribution:
     /// BF16 vectors widen in the same windows `push::Contribution` records.
     pub(crate) fn staged_rects(&self) -> Vec<crate::shared::experts::rtx::dense::Rect> {
-        self.reads.iter().filter(|read| read.vector)
-            .flat_map(|read| push::widen_windows(&read.path, &read.metadata)).collect()
+        self.reads.iter().filter(|read| read.transform!=ReadTransform::Direct)
+            .flat_map(|read| push::transform_windows(&read.path, &read.metadata,read.transform)).collect()
     }
 }
 fn tower_catalog(snapshot: &Path, prefix: &str) -> Result<BTreeMap<String, (PathBuf, SafetensorsTensorMetadata)>> {
@@ -323,7 +319,7 @@ impl TowerSpec {
                 path: path.clone(),
                 metadata: metadata.clone(),
                 destination,
-                vector,
+                transform: if vector {ReadTransform::Bf16ToF32}else{ReadTransform::Direct},
             });
             Ok(destination as u64)
         };
@@ -425,16 +421,13 @@ impl TowerSpec {
             let mut file = File::open(&read.path)?;
             file.seek(SeekFrom::Start(m.byte_offset))?;
             let start = read.destination;
-            if read.vector {
-                let mut raw = vec![0u8; m.byte_length as usize];
-                file.read_exact(&mut raw)?;
-                for (i, bytes) in raw.chunks_exact(2).enumerate() {
-                    let value =
-                        f32::from_bits((u16::from_le_bytes([bytes[0], bytes[1]]) as u32) << 16);
-                    weights[start + i * 4..start + i * 4 + 4].copy_from_slice(&value.to_le_bytes());
-                }
+            let resident=read.transform.resident_bytes(m)?;
+            if read.transform==ReadTransform::Direct {
+                file.read_exact(&mut weights[start..start+resident])?;
             } else {
-                file.read_exact(&mut weights[start..start + m.byte_length as usize])?;
+                let mut raw=vec![0u8;m.byte_length as usize];
+                file.read_exact(&mut raw)?;
+                read.transform.convert(&raw,&mut weights[start..start+resident])?;
             }
         }
         for region in self.constant_regions() {
@@ -862,7 +855,7 @@ mod tests {
             let prefix = if family == "mimo_v2" { "visual." } else { "model.visual." };
             let placements: BTreeMap<_, _> = tower.reads.iter().map(|read| (
                 read.metadata.name.strip_prefix(prefix).unwrap(),
-                (read.destination, read.metadata.byte_length * if read.vector { 2 } else { 1 })
+                (read.destination, read.transform.resident_bytes(&read.metadata).unwrap() as u64)
             )).collect();
             let output = std::process::Command::new(python)
                 .args(["-c", "import importlib.util,json,sys; p=sys.argv[1]; s=importlib.util.spec_from_file_location('parity',p); m=importlib.util.module_from_spec(s); s.loader.exec_module(m); print(json.dumps(m.packed_spec_fields(sys.argv[2],sys.argv[3],json.loads(sys.argv[4]))))"])
@@ -1134,7 +1127,7 @@ mod tests {
                     byte_length: 4,
                 },
                 destination: 0,
-                vector: true,
+                transform: ReadTransform::Bf16ToF32,
             }],
             constants:vec![ConstantRegion::fp32("rotary.inv_freq",128,[1.0],"one float","fixture")],
         };
@@ -1213,7 +1206,7 @@ mod tests {
 mod family_builder_hook_tests {
     use super::*;
     fn read(destination: usize) -> TensorRead {
-        TensorRead { path: "unread.safetensors".into(), destination, vector: false,
+        TensorRead { path: "unread.safetensors".into(), destination, transform: ReadTransform::Direct,
             metadata: SafetensorsTensorMetadata { name: "tower.weight".into(), dtype: DType::Bf16,
                 shape: vec![8], byte_offset: 0, byte_length: 16 } }
     }
@@ -1225,7 +1218,7 @@ mod family_builder_hook_tests {
         assert!(TowerSpec::from_parts(native.clone(), vec![read(24)]).is_err());
         let mut bad = read(0); bad.metadata.byte_offset = u64::MAX;
         assert!(TowerSpec::from_parts(native.clone(), vec![bad]).is_err());
-        let mut bad = read(0); bad.metadata.dtype = DType::F32; bad.vector = true;
+        let mut bad = read(0); bad.metadata.dtype = DType::F32; bad.transform = ReadTransform::Bf16ToF32;
         assert!(TowerSpec::from_parts(native.clone(), vec![bad]).is_err());
         let mut bad = read(0); bad.metadata.byte_length = 0;
         assert!(TowerSpec::from_parts(native, vec![bad]).is_err());
