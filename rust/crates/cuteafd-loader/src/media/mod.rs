@@ -161,6 +161,7 @@ pub enum ImageFamily {
     Mistral,
     Inkling2,
     Step5,
+    MiniMax,
 }
 /// Reference processor parameters; all identity-affecting choices live here.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -206,6 +207,7 @@ impl ProcessorConfig {
             ImageFamily::Mistral => (14, 1, MISTRAL_LONGEST_EDGE, CLIP_MEAN, CLIP_STD),
             ImageFamily::Inkling2 => (20, 1, 64 << 20, CLIP_MEAN, CLIP_STD),
             ImageFamily::Step5 => (14, 1, 3024 * 3024, CLIP_MEAN, CLIP_STD),
+            ImageFamily::MiniMax => (14, 28 * 28, 672 * 672, CLIP_MEAN, CLIP_STD),
         };
         Self {
             resample: match family {ImageFamily::Muse=>Resample::Lanczos,ImageFamily::Step5=>Resample::Bilinear,_=>Resample::Bicubic},
@@ -220,6 +222,7 @@ impl ProcessorConfig {
             max_image_tokens: match family {
                 ImageFamily::Qwen => QWEN_MAX_IMAGE_TOKENS,
                 ImageFamily::Mistral => MISTRAL_MAX_IMAGE_TOKENS,
+                ImageFamily::MiniMax => crate::families::minimax_m3::vision::MAX_IMAGE_TOKENS,
                 _ => 4096,
             },
             decode: DecodePolicy::default(),
@@ -228,6 +231,9 @@ impl ProcessorConfig {
     /// HF AutoProcessor reads preprocessor_config.json. It takes precedence
     /// over MiMo config.json's conflicting embedded processor_config (D3).
     pub fn from_snapshot(snapshot: &Path, family: ImageFamily) -> Result<Self> {
+        if family == ImageFamily::MiniMax {
+            return minimax::processor_config(snapshot);
+        }
         if matches!(family,ImageFamily::Inkling2|ImageFamily::Step5) {
             let cfg:serde_json::Value=crate::read_json_file(&snapshot.join("config.json"))
                 .map_err(|e| MediaError::Config(e.to_string()))?;
@@ -400,6 +406,16 @@ impl ProcessorConfig {
             }
             return Ok(());
         }
+        if self.family == ImageFamily::MiniMax {
+            let expected = Self::for_family(ImageFamily::MiniMax);
+            if self.patch != expected.patch || self.merge != expected.merge || self.temporal != expected.temporal
+                || self.mean != expected.mean || self.std != expected.std || self.resample != expected.resample
+                || self.min_pixels != expected.min_pixels || self.max_pixels != expected.max_pixels
+                || self.max_image_tokens > expected.max_image_tokens {
+                return Err(MediaError::Config("MiniMax processor differs from supported SGLang defaults".into()));
+            }
+            return Ok(());
+        }
         if self.family == ImageFamily::Mistral {
             return Ok(());
         }
@@ -457,6 +473,7 @@ impl ProcessorConfig {
         match self.family {
             ImageFamily::Inkling2=>Some("Inkling bundled vision.py sha256=34525c3b6afb44851de1f0341f60f6006760256c5e507b18cf5167a17497117c:processor-CLIP-bf16/encoder-CLIP-remap"),
             ImageFamily::Step5=>Some("Step bundled step3_processor.py sha256=ce0265261a6bffaf40b98911ef5b9babe30d20443af83a4c8ecf251ce6a861fa:Step3VisionProcessor/Step3VLImageProcessor:CLIP-bilinear-antialias728/504"),
+            ImageFamily::MiniMax=>Some("sglang@a9bf8c76 MiniMaxM31ImageProcessor:RGB-before-Pillow-bicubic:ceil28-fit672:CLIP-f32:duplicate-still"),
             _=>None,
         }
     }
@@ -485,7 +502,9 @@ impl ProcessorConfig {
             ));
         }
         let factor = self.patch * self.merge;
-        if self.family == ImageFamily::Muse {
+        if self.family == ImageFamily::MiniMax {
+            minimax::resize_shape(height, width)
+        } else if self.family == ImageFamily::Muse {
             muse::resize_shape(height, width, factor, self.effective_max() as u32)
                 .ok_or_else(|| invalid("Muse resize dimensions overflow"))
         } else if self.family == ImageFamily::Mistral {

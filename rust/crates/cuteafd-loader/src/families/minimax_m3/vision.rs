@@ -277,22 +277,7 @@ impl VisionContract {
     /// SGLang MiniMaxM31 _resize_shape: ceil to28, fit672 rectangle using
     /// integer ratios, then ceil again. Even tiny images have one merge cell.
     pub fn resize_shape(&self, height: u32, width: u32) -> Result<(u32, u32)> {
-        ensure!(
-            height > 0 && width > 0,
-            "MiniMax image dimensions must be positive"
-        );
-        let factor = 28u64;
-        let align = |n: u64| n.div_ceil(factor) * factor;
-        let mut h = align(u64::from(height));
-        let mut w = align(u64::from(width));
-        let max = MAX_IMAGE_EDGE as u64;
-        if h > max || w > max {
-            let nh = (h * max / h).min(h * max / w);
-            let nw = (w * max / h).min(w * max / w);
-            h = align(nh.max(factor));
-            w = align(nw.max(factor));
-        }
-        Ok((u32::try_from(h)?, u32::try_from(w)?))
+        resize_shape(height, width)
     }
 
     /// Vendor 3D rotary uses 26 dimensions per axis, leaving two head dimensions untouched.
@@ -350,6 +335,23 @@ impl VisionContract {
         }
         Ok(coordinates)
     }
+}
+
+/// Supported vendor still-image geometry, shared by the tensor contract and processor.
+pub fn resize_shape(height: u32, width: u32) -> Result<(u32, u32)> {
+    ensure!(height > 0 && width > 0, "MiniMax image dimensions must be positive");
+    let factor = 28u64;
+    let align = |n: u64| n.div_ceil(factor) * factor;
+    let mut h = align(u64::from(height));
+    let mut w = align(u64::from(width));
+    let max = MAX_IMAGE_EDGE as u64;
+    if h > max || w > max {
+        let nh = (h * max / h).min(h * max / w);
+        let nw = (w * max / h).min(w * max / w);
+        h = align(nh.max(factor));
+        w = align(nw.max(factor));
+    }
+    Ok((u32::try_from(h)?, u32::try_from(w)?))
 }
 
 #[cfg(test)]
