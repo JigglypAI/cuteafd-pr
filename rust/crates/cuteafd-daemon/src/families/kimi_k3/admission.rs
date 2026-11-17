@@ -1208,7 +1208,7 @@ fn request<const RANKS: usize>(mut i: Inputs<'_, RANKS>) -> Result<PlacementRequ
             modes: if RANKS == 1 { vec![WHOLE] } else if mla { MODES.to_vec() } else { vec![LayerMode::HeadSplit] } });
     }
     let pool = cuteafd_loader::placement::prepare_pool(cuteafd_loader::placement::PoolFacts::new(
-        &i.gpus.map(|gpu| gpu.capacity_bytes), i.serving_context, i.requested_pool, MLA_PAGE_ROWS as u64));
+        &i.gpus.map(|gpu| gpu.capacity_bytes), i.serving_context, i.requested_pool, MLA_PAGE_ROWS as u64))?;
     Ok(PlacementRequest {
         resident_weight_limit: Some(i.resident_weight_limit), inventory: Inventory { gpus: i.gpus.to_vec(), spark_ranks: i.spark_ranks, peer_access: i.peer_access },
         attention_placement: i.attention, context_buffers: i.context.as_ref().map_or_else(ContextBuffers::default, |layout| layout.buffers()), layers_first_gpu: 0,
@@ -1458,7 +1458,7 @@ pub(super) mod tests {
                         let tokens = units * 64;
                         let mut trial = candidate.clone();
                         trial.pool = cuteafd_loader::placement::prepare_pool(cuteafd_loader::placement::PoolFacts::new(
-                            &[96 << 30; 2], 0, Some(tokens), 64));
+                            &[96 << 30; 2], 0, Some(tokens), 64)).unwrap();
                         if enabled {
                             let layout = draft.with_pool_tokens(pool_cap.map_or(tokens as usize, |cap| cap.min(tokens as usize)))?;
                             let (mut demand, peak) = layout.demands(1)?;
@@ -2501,7 +2501,7 @@ pub(super) mod tests {
                 assert_eq!(under.pool.compiled_context(), context);
                 assert_eq!(under.pool.floor(), context);
                 under.pool = cuteafd_loader::placement::prepare_pool(cuteafd_loader::placement::PoolFacts::new(
-                    &[96 << 30; 2], under.pool.context(), Some(context - 64), 64));
+                    &[96 << 30; 2], under.pool.context(), Some(context - 64), 64)).unwrap();
                 assert_eq!(solve(&under), Err(PlacementError::RequestedBelowContext {
                     requested: context - 64, floor: context,
                 }));

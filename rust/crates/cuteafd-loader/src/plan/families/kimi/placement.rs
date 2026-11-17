@@ -469,7 +469,11 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
         crate::placement::planner::Context::resolve(context, (opts.context_tokens > 0).then_some(opts.context_tokens)),
         requested_pool, page_rows);
     facts.target = opts.target_pool_tokens;
-    let pool = crate::placement::prepare_pool(facts);
+    let pool = match crate::placement::prepare_pool(facts) {
+        Ok(pool) => pool,
+        Err(error) => { report.refuse_placement(format!("Kimi pool policy: {error}"),
+            "Supply consistent KV target, min and max bounds."); return memory; }
+    };
     let ceiling = pool.maximum_tokens();
     let maximum_pages = ceiling.div_ceil(page_rows);
     let draft_window_bytes = match draft.as_ref().map(|layout| layout.window_mark_bytes()).transpose() {

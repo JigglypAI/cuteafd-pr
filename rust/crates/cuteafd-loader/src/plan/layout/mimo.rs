@@ -552,7 +552,7 @@ fn apply_selected(input: &super::super::PlanInput, options: &LayoutOptions,
             (options.context_tokens > 0).then_some(options.context_tokens)),
         options.pool_tokens, profiles.steady.pool_unit_rows);
     facts.target = options.target_pool_tokens;
-    let pool = crate::placement::prepare_pool(facts);
+    let pool = crate::placement::prepare_pool(facts)?;
     let prefill = PrefillShape { rows, waves: lanes as u64 };
     let operation = Operation::Serving;
     let embedding = if use_host_embedding(checkpoint, options) { EmbeddingHome::HostPinned }
@@ -761,7 +761,7 @@ mod tests {
                             expert_usage: opts.expert_usage, cfg: &cfg, layers: cfg.layers, kv,
                             mtp_stages: 0, context: 32768, pool: crate::placement::prepare_pool(crate::placement::PoolFacts::new(
                                 &opts.rtx_bytes, crate::placement::planner::Context::automatic(32768), opts.pool_tokens,
-                                admitted.steady.pool_unit_rows)), prefill,
+                                admitted.steady.pool_unit_rows)).unwrap(), prefill,
                             lanes: lanes as u64, embedding: EmbeddingHome::Device(0), gpus: ranks, spark_ranks: 4,
                             experts, expert_workspace, tp2_workspace, spark: admitted.clone(),
                             no_spark: profile(checkpoint, &opts, ranks, 0, 4096, 4, 32768, None).unwrap(),
@@ -975,7 +975,7 @@ mod tests {
             assert_eq!(reserve, cuteafd_core::memory_policy::MemoryPolicy::current().release_padding());
             profile.steady.devices[0].reserve_bytes = reserve;
             let pool = crate::placement::prepare_pool(crate::placement::PoolFacts::new(
-                &[total], 1 << 20, None, profile.steady.pool_unit_rows));
+                &[total], 1 << 20, None, profile.steady.pool_unit_rows)).unwrap();
             let mut policy = pool.capacity_policy(4);
             policy.pool_tokens = None;
             let admitted = resolve_capacity_with_startup_peaks(policy, &profile.steady,

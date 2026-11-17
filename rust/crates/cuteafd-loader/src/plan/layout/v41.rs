@@ -150,7 +150,7 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
             (options.context_tokens > 0).then_some(options.context_tokens)), options.pool_tokens, 512);
     facts.target = options.target_pool_tokens;
     facts.encoding_limit = Some((131_072u64.saturating_sub(shape.concurrency + 2 * turns)) * 512);
-    let pool = crate::placement::prepare_pool(facts);
+    let pool = crate::placement::prepare_pool(facts)?;
     pool.validate_explicit()?;
     let context = shape.context_tokens;
     let mut working = SparkWorkingSet { rtx_layers: Vec::new(),
@@ -406,7 +406,7 @@ mod tests {
             let input = ProductionInput {
             blas: Vec::new(),
             expert_usage: false,
-                config: &config, gpus: 2, context: 512, pool: crate::placement::prepare_pool(crate::placement::PoolFacts::new(&[96 << 30; 2], 512, Some(512 * 64), 512)),
+                config: &config, gpus: 2, context: 512, pool: crate::placement::prepare_pool(crate::placement::PoolFacts::new(&[96 << 30; 2], 512, Some(512 * 64), 512)).unwrap(),
                 prefill: PrefillShape { rows: 64, waves: 1 }, concurrency: 1, retained_turns: 0,
                 replicated: false, spark_ranks: 4, onboard_minimum: 0, onboard_counts: None,
                 experts: vec![expert; 40], workspace: 0,
@@ -448,7 +448,7 @@ mod tests {
         let input = ProductionInput {
             blas: Vec::new(),
             expert_usage: false,
-            config: &config, gpus: 2, context: 512, pool: crate::placement::prepare_pool(crate::placement::PoolFacts::new(&[96 << 30; 2], 512, Some(512 * 64), 512)),
+            config: &config, gpus: 2, context: 512, pool: crate::placement::prepare_pool(crate::placement::PoolFacts::new(&[96 << 30; 2], 512, Some(512 * 64), 512)).unwrap(),
             prefill: PrefillShape { rows: 64, waves: 1 }, concurrency: 1, retained_turns: 0,
             replicated: false, spark_ranks: 4, onboard_minimum: 0, onboard_counts: None,
             experts: vec![expert; 40], workspace: 0,

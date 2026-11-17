@@ -28,7 +28,7 @@ impl CoordinatorCard {
 
     pub fn maximum_pool(cards: &[Self], context: u64, requested: Option<u64>, page_rows: u64) -> u64 {
         let logical = cards.iter().map(|card| card.logical_bytes).collect::<Vec<_>>();
-        prepare_pool(PoolFacts::new(&logical, context, requested, page_rows)).maximum_tokens()
+        prepare_pool(PoolFacts::new(&logical, context, requested, page_rows)).expect("legacy pool helper requires validated policy").maximum_tokens()
     }
 }
 
@@ -189,21 +189,21 @@ mod tests {
     fn preparation_uses_one_shared_target_precedence_and_small_card_default() {
         MemoryPolicy { kv_target: Some(3 << 20), kv_max: Some(100_000_000), ..Default::default() }.scoped(|| {
             let mut facts = PoolFacts::new(&[32 << 30], super::super::planner::Context::automatic(262_144), None, 64);
-            assert_eq!(prepare_pool(facts).target(), 3 << 20);
+            assert_eq!(prepare_pool(facts).unwrap().target(), 3 << 20);
             facts.target = Some(4 << 20);
-            let pool = prepare_pool(facts);
+            let pool = prepare_pool(facts).unwrap();
             assert_eq!(pool.target(), 4 << 20);
             assert_eq!(pool.maximum_tokens(), 100_000_000);
             facts.requested = Some(524_288);
-            let explicit = prepare_pool(facts);
+            let explicit = prepare_pool(facts).unwrap();
             assert_eq!(explicit.maximum_tokens(), 524_288);
             assert_eq!(explicit.capacity_policy(16).pool_tokens, Some(524_288));
         });
         MemoryPolicy::default().scoped(|| {
             for cards in [&[32 << 30][..], &[96 << 30, 32 << 30][..]] {
-                assert_eq!(prepare_pool(PoolFacts::new(cards, 262_144, None, 64)).target(), 1 << 20);
+                assert_eq!(prepare_pool(PoolFacts::new(cards, 262_144, None, 64)).unwrap().target(), 1 << 20);
             }
-            assert_eq!(prepare_pool(PoolFacts::new(&[96 << 30], 262_144, None, 64)).target(), 2 << 20);
+            assert_eq!(prepare_pool(PoolFacts::new(&[96 << 30], 262_144, None, 64)).unwrap().target(), 2 << 20);
         });
     }
 

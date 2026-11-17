@@ -502,7 +502,7 @@ fn preflight_shape(
     use cuteafd_loader::placement::planner::{Baseline, EmbeddingHome, Operation, Phase, PrefillShape};
     let pool = cuteafd_loader::placement::prepare_pool(cuteafd_loader::placement::PoolFacts::new(
         &memory.iter().map(|sample| sample.total_bytes).collect::<Vec<_>>(),
-        serving_context, Some(args.pool_tokens as u64), spark_profiles.steady.pool_unit_rows));
+        serving_context, Some(args.pool_tokens as u64), spark_profiles.steady.pool_unit_rows)).unwrap();
     let policy = pool.capacity_policy(u32::try_from(concurrency)?);
     let report = reservation_report(&spark_profiles.steady, &memory, policy)?;
     let intake_probe_bytes = cuteafd_loader::families::mimo_v2::admission::spark_intake_probe_bytes(
@@ -1003,7 +1003,7 @@ mod tests {
         let grow = MemoryPolicy { kv_max: Some(100_000_000), ..Default::default() };
         grow.scoped(|| -> Result<()> {
             let pool = cuteafd_loader::placement::prepare_pool(cuteafd_loader::placement::PoolFacts::new(
-                &[96 << 30], 65_536, Some(0), 64));
+                &[96 << 30], 65_536, Some(0), 64)).unwrap();
             assert_eq!(pool.maximum_tokens(), 100_000_000);
             let policy = pool.capacity_policy(16);
             assert_eq!(policy.target_pool_tokens, 2 << 20);
@@ -1025,7 +1025,7 @@ mod tests {
             assert_eq!(grown.onboard_layers, baseline.onboard_layers);
             assert!(grown.memory_layout.unwrap().pool_tokens > baseline.memory_layout.unwrap().pool_tokens);
             let explicit = cuteafd_loader::placement::prepare_pool(cuteafd_loader::placement::PoolFacts::new(
-                &[96 << 30], 65_536, Some(1 << 20), 64));
+                &[96 << 30], 65_536, Some(1 << 20), 64)).unwrap();
             assert_eq!(explicit.capacity_policy(16).pool_tokens, Some(1 << 20));
             Ok(())
         })
