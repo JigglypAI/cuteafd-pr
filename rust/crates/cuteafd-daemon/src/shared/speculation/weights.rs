@@ -108,6 +108,13 @@ impl Weight<'_> {
     }
 }
 
+/// Row-major E4M3 operands for native MLA wrappers, distinct from the legacy
+/// MMA-fragment-packed FP8 linear weights. Scales live in the same weight arena.
+pub(crate) struct MlaFp8Matrix<'a> {
+    pub values: DeviceAllocation<'a>,
+    pub scales: DeviceAllocation<'a>,
+}
+
 /// One projection dispatch shared by block backbones; storage stays with its owner.
 pub(crate) trait Projection {
     /// # Safety
@@ -400,6 +407,57 @@ impl<'a, 'b> Load<'a, 'b> {
         let uk = self.allocation(&format!("{name}.uk"), heads * uk_head)?;
         let uv = self.allocation(&format!("{name}.uv"), heads * uv_head)?;
         absorb_into(&self.dense, source, heads, nope, value, latent, uk.buffer, uv.buffer, stream)?;
+        Ok((uk, uv))
+    }
+
+    /// Bounded native RowQuant jobs write final row-major values/scales. This
+    /// is shared by MLA attention projections; no full BF16 device copy remains.
+    pub fn mla_fp8_matrix(&self, parts: &[(&str, usize)], cols: usize, rule: Fp8Scales,
+        stream: *mut c_void) -> Result<MlaFp8Matrix<'a>> {
+        let rects = self.parts(parts, cols)?;
+        let name = parts.iter().map(|(name, _)| *name).collect::<Vec<_>>().join("+");
+        let rows = parts.iter().try_fold(0usize, |n, (_, rows)| n.checked_add(*rows)).context("MLA FP8 rows overflow")?;
+        ensure!(rows > 0 && cols % 128 == 0, "MLA FP8 row quant requires complete K128 units");
+        let values = self.allocation(&format!("{name}.payload"), rows.checked_mul(cols).context("MLA FP8 values overflow")?)?;
+        let scales = self.allocation(&format!("{name}.scales"), rows * (cols / 128) * 4)?;
+        let window = (STEP_BYTES / (cols * 2)).max(1);
+        let mut first = 0usize;
+        for rect in rects {
+            for start in (0..rect.rows.len()).step_by(window) {
+                let count = window.min(rect.rows.len() - start);
+                self.dense.step(Step { device: values.buffer.device_id, rects: vec![rect.sub(start..start + count)],
+                    jobs: vec![Job::RowQuant { rows: count, cols, rule,
+                        q: view(values.buffer, first * cols, count * cols)?,
+                        scale: view(scales.buffer, first * (cols / 128) * 4, count * (cols / 128) * 4)?,
+                        block: false, scale_repeat: Default::default() }] }, stream)?;
+                first += count;
+            }
+        }
+        ensure!(first == rows, "MLA FP8 row source differs from allocation");
+        Ok(MlaFp8Matrix { values, scales })
+    }
+
+    pub fn mla_fp8_absorb(&self, name: &str, heads: usize, nope: usize, value: usize, latent: usize,
+        rule: Fp8Scales, stream: *mut c_void) -> Result<(MlaFp8Matrix<'a>, MlaFp8Matrix<'a>)> {
+        let (head_rows, source_bytes, uk_bytes, uv_bytes) = absorb_geometry(heads, nope, value, latent)?;
+        let matrix = |part: &str, values| -> Result<MlaFp8Matrix<'a>> {
+            Ok(MlaFp8Matrix { values: self.allocation(&format!("{name}.{part}.payload"), values)?,
+                scales: self.allocation(&format!("{name}.{part}.scales"), values / 64 * 4)? })
+        };
+        let uk = matrix("uk", heads * uk_bytes / 2)?;
+        let uv = matrix("uv", heads * uv_bytes / 2)?;
+        let source = self.source.rect(name, &[heads * head_rows, latent])?;
+        let chunk = (STEP_BYTES / source_bytes).max(1).min(heads);
+        for first in (0..heads).step_by(chunk) {
+            let count = chunk.min(heads - first);
+            self.dense.step(Step { device: uk.values.buffer.device_id,
+                rects: vec![source.sub(first * head_rows..(first + count) * head_rows)],
+                jobs: vec![Job::AbsorbQuant { heads: count, nope, v: value, lat: latent, rule,
+                    uk: view(uk.values.buffer, first * uk_bytes / 2, count * uk_bytes / 2)?,
+                    uk_scale: view(uk.scales.buffer, first * uk_bytes / 2 / 64 * 4, count * uk_bytes / 2 / 64 * 4)?,
+                    uv: view(uv.values.buffer, first * uv_bytes / 2, count * uv_bytes / 2)?,
+                    uv_scale: view(uv.scales.buffer, first * uv_bytes / 2 / 64 * 4, count * uv_bytes / 2 / 64 * 4)? }] }, stream)?;
+        }
         Ok((uk, uv))
     }
 

@@ -16,6 +16,9 @@ const PRODUCER: &[&str] = &["x", "kv_slots", "positions", "inv_freq", "w_qkv_a",
 const ATTENTION: &[&str] = &["query", "kv_cache", "page_table", "cache_seqlens", "cu_seqlens_q",
     "attn", "lse", "scratch"];
 const OUTPUT: &[&str] = &["attn", "w_uv", "w_o", "out", "scratch"];
+const PRODUCER_FP8: &[&str] = &["x", "kv_slots", "positions", "inv_freq", "w_qkv_a", "s_qkv_a",
+    "q_a_norm", "kv_a_norm", "w_q_b", "s_q_b", "w_uk", "s_uk", "kv_cache", "query", "q_resid", "scratch"];
+const OUTPUT_FP8: &[&str] = &["attn", "w_uv", "s_uv", "w_o", "s_o", "out", "scratch"];
 const PARTIAL: &[&str] = &["query", "kv_cache", "page_table", "visible_intervals", "cu_seqlens_q",
     "attn", "lse", "scratch"];
 /// Mistral Large 4's mtp_dspark producer (no q-LoRA; RoPE through a unit query scale).
@@ -157,6 +160,12 @@ fn validate_combine_batch(batch: MlaDraftCombineBatch) -> Result<()> {
 pub struct MlaDraftWeights {
     pub qkv_a: Buffer, pub q_a_norm: Buffer, pub kv_a_norm: Buffer,
     pub q_b: Buffer, pub uk: Buffer, pub uv: Buffer, pub output: Buffer,
+    pub fp8_scales: Option<MlaDraftScales>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct MlaDraftScales {
+    pub qkv_a: Buffer, pub q_b: Buffer, pub uk: Buffer, pub uv: Buffer, pub output: Buffer,
 }
 
 /// Absolute I64 positions drive RoPE; I64 slots independently address physical
@@ -278,6 +287,7 @@ pub struct MlaDraft<'a> {
     layout: Layout,
     cache_format: MlaCacheFormat,
     kind: MlaDraftKind,
+    fp8_weights: bool,
 }
 
 impl<'a> MlaDraft<'a> {
@@ -290,7 +300,21 @@ impl<'a> MlaDraft<'a> {
         let output = programs.program(&format!("{program_namespace}_mla_draft_output{geometry}_m64"), OUTPUT)?;
         let layout = validate_manifest([producer.spec(), attention.spec(), output.spec()], window, cache_format)?;
         Ok(Self { producer, attention, output, layout, cache_format,
-            kind: if causal { MlaDraftKind::CausalDflash2 } else { MlaDraftKind::Dflash2 } })
+            kind: if causal { MlaDraftKind::CausalDflash2 } else { MlaDraftKind::Dflash2 }, fp8_weights: false })
+    }
+
+    /// Complete single-copy FP8 body. Cache precision is independently selected.
+    pub fn load_fp8_weights(programs: &'a Programs<'a>, namespace: &str, window: MlaDraftWindow,
+        cache_format: MlaCacheFormat) -> Result<Self> {
+        let causal = window == MlaDraftWindow::CausalSliding1024;
+        let geometry = if causal { "_causal_h96" } else { "" };
+        let cache = cache_format.program_suffix();
+        let producer = programs.program(&format!("{namespace}_mla_draft_producer_fp8_weights{geometry}{cache}_m64"), PRODUCER_FP8)?;
+        let attention = programs.program(&format!("{namespace}_mla_draft_attention_{}{cache}_m64", window.suffix()), ATTENTION)?;
+        let output = programs.program(&format!("{namespace}_mla_draft_output_fp8_weights{geometry}_m64"), OUTPUT_FP8)?;
+        let layout = validate_fp8_manifest([producer.spec(), attention.spec(), output.spec()], window, cache_format)?;
+        Ok(Self { producer, attention, output, layout, cache_format,
+            kind: if causal { MlaDraftKind::CausalDflash2 } else { MlaDraftKind::Dflash2 }, fp8_weights: true })
     }
 
     /// Mistral Large 4's bundled mtp_dspark (`ml4_draft_*`): FP8 656-byte records,
@@ -300,7 +324,7 @@ impl<'a> MlaDraft<'a> {
         let attention = programs.program("ml4_draft_attention_m64", ATTENTION)?;
         let output = programs.program("ml4_draft_output_m64", OUTPUT)?;
         let layout = validate_ml4_manifest([producer.spec(), attention.spec(), output.spec()])?;
-        Ok(Self { producer, attention, output, layout, cache_format: MlaCacheFormat::Fp8, kind: MlaDraftKind::Ml4Dspark })
+        Ok(Self { producer, attention, output, layout, cache_format: MlaCacheFormat::Fp8, kind: MlaDraftKind::Ml4Dspark, fp8_weights: false })
     }
 
     pub fn kind(&self) -> MlaDraftKind { self.kind }
@@ -313,17 +337,36 @@ impl<'a> MlaDraft<'a> {
 
     /// Preflight an entire multi-layer/chunk operation before its first cache write.
     pub fn check_produce(&self, w: MlaDraftWeights, b: MlaDraftBatch) -> Result<()> {
+        self.check_weight_precision(w)?;
         validate_producer_kind(self.kind, w, b, self.layout, self.cache_format)
     }
 
+    fn check_weight_precision(&self, w: MlaDraftWeights) -> Result<()> {
+        if self.fp8_weights != w.fp8_scales.is_some() {
+            return Err(MlaDraftError::Invalid("MLA weight precision differs from loaded ABI"));
+        }
+        Ok(())
+    }
+
     pub fn check_launch(&self, w: MlaDraftWeights, b: MlaDraftBatch) -> Result<()> {
+        self.check_weight_precision(w)?;
         validate_batch_kind(self.kind, w, b, self.layout, self.cache_format)
     }
 
     /// Context-only projection uses the same producer, without attention or
     /// output. The owner chunks taps to at most 64 rows and joins their producer.
     pub fn produce(&self, w: MlaDraftWeights, b: MlaDraftBatch, stream: *mut c_void) -> Result<()> {
-        validate_producer_kind(self.kind, w, b, self.layout, self.cache_format)?;
+        self.check_produce(w, b)?;
+        if let Some(scales) = w.fp8_scales {
+            // SAFETY: the full FP8 geometry, scale extents and device ownership
+            // are checked before launch; all operands survive the caller's stream.
+            unsafe { self.producer.launch(&[b.x.ptr, b.slots.ptr, b.positions.ptr, b.inv_freq.ptr,
+                w.qkv_a.ptr, scales.qkv_a.ptr, w.q_a_norm.ptr, w.kv_a_norm.ptr,
+                w.q_b.ptr, scales.q_b.ptr, w.uk.ptr, scales.uk.ptr, b.cache.ptr,
+                b.query.ptr, b.q_resid.ptr, b.producer_scratch.ptr],
+                &[Scalar::F32(b.rotary_factor), Scalar::I32(b.rows as i32)], stream)?; }
+            return Ok(());
+        }
         match self.kind {
             // SAFETY: host extents/devices/scalars are validated. The owner retains
             // storage and stream, and stages checked positions and physical slots.
@@ -348,12 +391,19 @@ impl<'a> MlaDraft<'a> {
 
     /// Validate the final projection before a Context producer mutates cache.
     pub fn check_output(&self, w: MlaDraftWeights, b: MlaDraftBatch) -> Result<()> {
+        self.check_weight_precision(w)?;
         let hidden = self.kind.hidden();
         let heads = self.kind.heads();
         if !(1..=ROWS).contains(&b.rows) { return Err(MlaDraftError::Invalid("output rows")); }
-        validate_buffers(&[(b.attention, b.rows * heads * 512 * 2),
-            (w.uv, heads * 128 * 512 * 2), (w.output, hidden * heads * 128 * 2),
-            (b.output, b.rows * hidden * 2), (b.output_scratch, self.layout.scratch[2])], b.output.device_id)
+        let scalar_bytes = if w.fp8_scales.is_some() { 1 } else { 2 };
+        let mut requirements = vec![(b.attention, b.rows * heads * 512 * 2),
+            (w.uv, heads * 128 * 512 * scalar_bytes), (w.output, hidden * heads * 128 * scalar_bytes),
+            (b.output, b.rows * hidden * 2), (b.output_scratch, self.layout.scratch[2])];
+        if let Some(scales) = w.fp8_scales {
+            requirements.extend([(scales.uv, heads * 128 * 512 / 64 * 4),
+                (scales.output, hidden * heads * 128 / 128 * 4)]);
+        }
+        validate_buffers(&requirements, b.output.device_id)
     }
 
     /// Apply the output projection after Context partials have been LSE-combined.
@@ -362,8 +412,13 @@ impl<'a> MlaDraft<'a> {
         // SAFETY: checked rank-local live extents; caller orders the combined
         // attention producer before this projection and retains every owner.
         unsafe {
-            self.output.launch(&[b.attention.ptr, w.uv.ptr, w.output.ptr, b.output.ptr,
-                b.output_scratch.ptr], &[Scalar::I32(b.rows as i32)], stream)?;
+            if let Some(scales) = w.fp8_scales {
+                self.output.launch(&[b.attention.ptr, w.uv.ptr, scales.uv.ptr, w.output.ptr, scales.output.ptr,
+                    b.output.ptr, b.output_scratch.ptr], &[Scalar::I32(b.rows as i32)], stream)?;
+            } else {
+                self.output.launch(&[b.attention.ptr, w.uv.ptr, w.output.ptr, b.output.ptr,
+                    b.output_scratch.ptr], &[Scalar::I32(b.rows as i32)], stream)?;
+            }
         }
         Ok(())
     }
@@ -371,7 +426,7 @@ impl<'a> MlaDraft<'a> {
     /// Validate the entire operation before the producer can mutate cache.
     /// Scratch may overlap across these strictly ordered phases, not live data.
     pub fn launch(&self, w: MlaDraftWeights, b: MlaDraftBatch, stream: *mut c_void) -> Result<()> {
-        validate_batch_kind(self.kind, w, b, self.layout, self.cache_format)?;
+        self.check_launch(w, b)?;
         self.produce(w, b, stream)?;
         // SAFETY: the full batch was validated before any launch. Metadata,
         // buffers and stream remain owned and ordered through completion.
@@ -381,9 +436,8 @@ impl<'a> MlaDraft<'a> {
                 &[Scalar::I32(b.rows as i32), Scalar::I32(b.requests as i32),
                   Scalar::I64(b.page_table_width as i64), Scalar::I32(b.active_splits as i32),
                   Scalar::F32(b.attention_scale)], stream)?;
-            self.output.launch(&[b.attention.ptr, w.uv.ptr, w.output.ptr, b.output.ptr,
-                b.output_scratch.ptr], &[Scalar::I32(b.rows as i32)], stream)?;
         }
+        self.output(w, b, stream)?;
         Ok(())
     }
 }
@@ -427,6 +481,23 @@ fn validate_manifest(specs: [&ProgramSpec; 3], window: MlaDraftWindow, cache_for
         return Err(MlaDraftError::Invalid("manifest traversal/scratch"));
     }
     Ok(layout)
+}
+
+fn validate_fp8_manifest(specs: [&ProgramSpec; 3], window: MlaDraftWindow,
+    cache: MlaCacheFormat) -> Result<Layout> {
+    for (index, spec) in specs.iter().enumerate().filter(|(index, _)| *index != 1) {
+        let pointers = if index == 0 { PRODUCER_FP8 } else { OUTPUT_FP8 };
+        if !spec.pointers.iter().map(String::as_str).eq(pointers.iter().copied())
+            || spec.geometry["weight_dtype"].as_str() != Some("fp8")
+            || spec.geometry["projection_scale_k"].as_u64() != Some(128)
+            || spec.geometry["batched_scale_k"].as_u64() != Some(64) {
+            return Err(MlaDraftError::Invalid("FP8 MLA projection scales/ABI"));
+        }
+    }
+    let mut normalized = specs.map(Clone::clone);
+    normalized[0].pointers = PRODUCER.iter().map(|name| (*name).to_owned()).collect();
+    normalized[2].pointers = OUTPUT.iter().map(|name| (*name).to_owned()).collect();
+    validate_manifest(normalized.each_ref(), window, cache)
 }
 
 /// The ml4_draft_* manifest: Mistral Large 4's draft geometry (hidden 6144, no
@@ -522,11 +593,17 @@ fn producer_requirements(w: MlaDraftWeights, b: MlaDraftBatch, l: Layout, cache_
     }
     let cache = b.cache_pages.checked_mul(PAGE * cache_format.record_bytes())
         .ok_or(MlaDraftError::Invalid("cache extent overflow"))?;
-    Ok(vec![(b.x, b.rows * 7168 * 2), (b.slots, b.rows * 8), (b.positions, b.rows * 8),
-        (b.inv_freq, 32 * 4), (w.qkv_a, 2112 * 7168 * 2), (w.q_a_norm, 1536 * 2),
-        (w.kv_a_norm, 512 * 2), (w.q_b, heads * 192 * 1536 * 2), (w.uk, heads * 512 * 128 * 2),
-        (b.cache, cache), (b.query, b.rows * heads * 576 * 2), (b.q_resid, b.rows * 1536 * 2),
-        (b.producer_scratch, l.scratch[0])])
+    let scalar_bytes = if w.fp8_scales.is_some() { 1 } else { 2 };
+    let mut requirements = vec![(b.x, b.rows * 7168 * 2), (b.slots, b.rows * 8), (b.positions, b.rows * 8),
+        (b.inv_freq, 32 * 4), (w.qkv_a, 2112 * 7168 * scalar_bytes), (w.q_a_norm, 1536 * 2),
+        (w.kv_a_norm, 512 * 2), (w.q_b, heads * 192 * 1536 * scalar_bytes), (w.uk, heads * 512 * 128 * scalar_bytes),
+        (b.cache, cache), (b.query, b.rows * heads * 576 * 2), (b.q_resid, b.rows * 1536 * 2)];
+    if let Some(scales) = w.fp8_scales {
+        requirements.extend([(scales.qkv_a, 2112 * 7168 / 128 * 4),
+            (scales.q_b, heads * 192 * 1536 / 128 * 4), (scales.uk, heads * 512 * 128 / 64 * 4)]);
+    }
+    requirements.push((b.producer_scratch, l.scratch[0]));
+    Ok(requirements)
 }
 
 fn validate_producer(w: MlaDraftWeights, b: MlaDraftBatch, l: Layout, cache_format: MlaCacheFormat) -> Result<()> {
@@ -550,8 +627,12 @@ fn validate_dflash_batch(w: MlaDraftWeights, b: MlaDraftBatch, l: Layout, cache_
     requirements.extend([(b.page_table, b.requests * b.page_table_width * 4),
         (b.lengths, b.requests * 4), (b.query_offsets, (b.requests + 1) * 4),
         (b.attention, b.rows * heads * 512 * 2), (b.lse, b.rows * heads * 4),
-        (b.output, b.rows * 7168 * 2), (w.uv, heads * 128 * 512 * 2),
-        (w.output, 7168 * heads * 128 * 2)]);
+        (b.output, b.rows * 7168 * 2), (w.uv, heads * 128 * 512 * if w.fp8_scales.is_some() { 1 } else { 2 }),
+        (w.output, 7168 * heads * 128 * if w.fp8_scales.is_some() { 1 } else { 2 })]);
+    if let Some(scales) = w.fp8_scales {
+        requirements.extend([(scales.uv, heads * 128 * 512 / 64 * 4),
+            (scales.output, 7168 * heads * 128 / 128 * 4)]);
+    }
     validate_buffers(&requirements, b.x.device_id)?;
     for plane in [scratch, (b.attention_scratch, l.scratch[1]), (b.output_scratch, l.scratch[2])] {
         let mut phase = requirements.clone();
@@ -886,7 +967,7 @@ mod tests {
         let mut next = 0x100000usize;
         let mut alloc = || { next += 0x10000000; Buffer { ptr: next as *mut c_void, bytes: 0x10000000, device_id: 1, flags: 0 } };
         let w = MlaDraftWeights { qkv_a: alloc(), q_a_norm: alloc(), kv_a_norm: alloc(), q_b: alloc(),
-            uk: alloc(), uv: alloc(), output: alloc() };
+            uk: alloc(), uv: alloc(), output: alloc(), fp8_scales: None };
         let b = MlaDraftBatch { rows: 64, requests: 8, page_table_width: 66, cache_pages: 520,
             active_splits: l.splits, rotary_factor: 1.0, attention_scale: 0.2,
             x: alloc(), slots: alloc(), positions: alloc(), inv_freq: alloc(), cache: alloc(),

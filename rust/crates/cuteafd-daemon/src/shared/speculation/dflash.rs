@@ -242,7 +242,7 @@ impl MlaAttention<'_> {
     fn weights(&self) -> cuteafd_ffi::mla_draft::MlaDraftWeights {
         cuteafd_ffi::mla_draft::MlaDraftWeights { qkv_a: self.qkv_a.buffer,
             q_a_norm: self.q_norm.buffer, kv_a_norm: self.kv_norm.buffer,
-            q_b: self.q_b.buffer, uk: self.uk.buffer, uv: self.uv.buffer, output: self.output.buffer }
+            q_b: self.q_b.buffer, uk: self.uk.buffer, uv: self.uv.buffer, output: self.output.buffer, fp8_scales: None }
     }
 }
 
