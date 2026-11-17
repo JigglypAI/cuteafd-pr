@@ -336,7 +336,7 @@ mod tests {
                 "", 2 << 20, Basis::Formula)] }], pool_tokens: 1 << 20, waste: vec![], notes: vec![] };
         let lines = MemoryPolicy { gpu_reserve: Some(0), ..Default::default() }
             .scoped(|| layout_lines(&layout, "glm5", &[96 << 30], &super::super::prepare_pool(
-                super::super::PoolFacts::new(&[96 << 30], 1 << 20, None, 1)).unwrap()));
+                super::super::PoolFacts::new(&[96 << 30], super::super::planner::Context::automatic(1 << 20), None, 1)).unwrap()));
         assert_eq!(lines.len(), 1);
         assert!(lines[0].contains("GRAPH_NODE_PADDING=1670 bytes (2.50%)"), "{}", lines[0]);
         assert!(lines[0].contains("padding included, not a reserve"), "{}", lines[0]);
@@ -355,7 +355,7 @@ mod tests {
         let layout = MemoryLayout { devices: vec![gpu, spark], pool_tokens: 1 << 20, waste: vec![], notes: vec![] };
         let lines = MemoryPolicy { family_reserve: Some(1 << 30), ..Default::default() }
             .scoped(|| layout_lines(&layout, "glm5", &[96 << 30], &super::super::prepare_pool(
-                super::super::PoolFacts::new(&[96 << 30], 1 << 20, None, 1)).unwrap()));
+                super::super::PoolFacts::new(&[96 << 30], super::super::planner::Context::automatic(1 << 20), None, 1)).unwrap()));
         assert_eq!(lines.len(), 2, "{lines:?}");
         // The GPU cap is the plan's cap, not the layout capacity already less the reserve.
         assert!(lines[0].starts_with("rtx0: cap 98304MiB; weights 40960MiB"), "{}", lines[0]);
@@ -368,7 +368,7 @@ mod tests {
         assert!(lines[1].contains("reserve 1523MiB [Spark worker process resident 1523MiB]"), "{}", lines[1]);
         let overridden = MemoryPolicy { spark_reserve: Some(3 << 30), ..Default::default() }
             .scoped(|| layout_lines(&layout, "glm5", &[96 << 30], &super::super::prepare_pool(
-                super::super::PoolFacts::new(&[96 << 30], 1 << 20, None, 1)).unwrap()));
+                super::super::PoolFacts::new(&[96 << 30], super::super::planner::Context::automatic(1 << 20), None, 1)).unwrap()));
         assert!(overridden[1].contains("(overridden)") && overridden[1].contains("SPARK_RESERVE 3072MiB"), "{}", overridden[1]);
     }
 }

@@ -1835,8 +1835,8 @@ fn below_target_onboards_on_nonbinding_device_without_spending_one_page() {
 
 #[test]
 fn exact_onboarding_reaches_target_before_maximizing_physical_capacity() {
-    const TARGET: u64 = 2 << 20;
-    let maximum = TARGET * 2 / 64;
+    const TARGET: u64 = 1 << 20;
+    let maximum = TARGET * 4 / 64;
     let mut contract = profile_contract(maximum);
     contract.variables[0] = Variable::Attention {
         layer: 0,
@@ -2445,13 +2445,13 @@ fn full_context_refusal_prices_best_feasible_assignment_not_pruned_alternative()
 }
 
 #[test]
-fn automatic_target_uses_physical_card_not_logical_cap() {
+fn automatic_target_uses_logical_cap_for_small_card_simulation() {
     let recipe = Linear::new();
     let mut card = budget(96 << 30);
     card.logical_bytes = 24 << 30;
     assert_eq!(
         solve(request(), vec![card], &recipe).unwrap().pool_tokens,
-        2 << 20
+        1 << 20
     );
     assert_eq!(
         solve(request(), vec![budget(32 << 30)], &recipe)
@@ -3571,7 +3571,7 @@ fn automatic_context_uses_shared_floor_and_exact_admitted_extent() {
         let mut available = budget(pool);
         available.physical_bytes = 96 << 30;
         let solved = solve(automatic.clone(), vec![available], &recipe).unwrap();
-        assert_eq!(solved.pool_tokens, pool);
+        assert_eq!(solved.pool_tokens, pool.min(1 << 20));
         assert_eq!(solved.served_context(), maximum.min(pool));
         assert_eq!(solved.request.context.maximum, maximum);
     }
