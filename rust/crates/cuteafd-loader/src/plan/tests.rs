@@ -4975,46 +4975,48 @@ fn all_family_concurrency_defaults_match_explicit_logical_capacity() {
 
 #[test]
 fn mimo_draft_prefix_ledger_is_opt_in_and_checked() {
-    for (draft_kv_cache, plane_bytes) in [
-        (crate::families::qwen4::Qwen4KvCache::Bf16, 2048),
-        (crate::families::qwen4::Qwen4KvCache::Fp8, 1056),
-    ] {
-        let dir = tempfile::tempdir().unwrap();
-        write_snapshot(dir.path(), &mimo_pro_config(), &mimo_pro_tensors(), Some(8));
-        let mut options = PlanOptions { layout: Some(layout::LayoutOptions { host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram),
-            concurrency: 16, draft_kv_cache, ..Default::default()
-        }), ..sparks(4) };
-        let base = plan(dir.path(), &options).unwrap().memory_layout.unwrap();
-        assert!(!base.devices[0].items.iter().any(|i| i.group == "DFlash context marks"));
-        let draft = dir.path().join("dflash");
-        std::fs::create_dir(&draft).unwrap();
-        std::fs::write(draft.join("config.json"), json!({"num_hidden_layers": 5,
-            "num_key_value_heads": 8, "head_dim": 128}).to_string()).unwrap();
-        let disabled = plan(dir.path(), &options).unwrap().memory_layout.unwrap();
-        assert!(!disabled.devices[0].items.iter().any(|i| i.group == "DFlash context marks"));
-        // A present DFlash borrows the BF16 head through GEMM, independently of prefix marks.
-        let handles = |memory: &cuteafd_core::memory_layout::MemoryLayout| memory.devices[0].items.iter()
-            .filter(|item| item.group.starts_with("cuBLAS handles: mimo/blas/serve"))
-            .map(|item| item.bytes).sum::<u64>();
-        assert_eq!(handles(&base), 0);
-        assert_eq!(handles(&disabled), 64 << 20);
-        assert_eq!(disabled.devices[0].used_bytes() - base.devices[0].used_bytes(), handles(&disabled));
-        options.layout.as_mut().unwrap().mimo_prefix_draft = true;
-        let marked = plan(dir.path(), &options).unwrap().memory_layout.unwrap();
-        let bytes = marked.devices[0].items.iter().find(|i| i.group == "DFlash context marks").unwrap().bytes;
-        let mark_bytes = 5 * 1024 * 2 * plane_bytes + 8;
-        assert_eq!(bytes, mark_bytes * cuteafd_core::prefix::mark_slots_with_host(16, 20, 1, u64::MAX, true));
-        assert_eq!(marked.devices[0].items.iter().find(|i| i.group == "DFlash valid-floor transfer").unwrap().bytes, 16 * 8);
-        options.layout.as_mut().unwrap().draft_context_slots = Some(25);
-        let overridden = plan(dir.path(), &options).unwrap().memory_layout.unwrap();
-        assert_eq!(overridden.devices[0].items.iter().find(|i| i.group == "DFlash valid-floor transfer").unwrap().bytes, 16 * 8);
-        assert!(overridden.notes.iter().any(|note| note.contains("context slots 25")));
-        std::fs::write(draft.join("config.json"), "{}").unwrap();
-        let malformed = plan(dir.path(), &options).unwrap();
-        assert!(!malformed.placement_supported);
-        assert!(!malformed.executable());
+        cuteafd_core::memory_policy::MemoryPolicy { kv_max: Some(2 << 20), ..Default::default() }.scoped(|| {
+        for (draft_kv_cache, plane_bytes) in [
+            (crate::families::qwen4::Qwen4KvCache::Bf16, 2048),
+            (crate::families::qwen4::Qwen4KvCache::Fp8, 1056),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            write_snapshot(dir.path(), &mimo_pro_config(), &mimo_pro_tensors(), Some(8));
+            let mut options = PlanOptions { layout: Some(layout::LayoutOptions { host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram),
+                concurrency: 16, draft_kv_cache, ..Default::default()
+            }), ..sparks(4) };
+            let base = plan(dir.path(), &options).unwrap().memory_layout.unwrap();
+            assert!(!base.devices[0].items.iter().any(|i| i.group == "DFlash context marks"));
+            let draft = dir.path().join("dflash");
+            std::fs::create_dir(&draft).unwrap();
+            std::fs::write(draft.join("config.json"), json!({"num_hidden_layers": 5,
+                "num_key_value_heads": 8, "head_dim": 128}).to_string()).unwrap();
+            let disabled = plan(dir.path(), &options).unwrap().memory_layout.unwrap();
+            assert!(!disabled.devices[0].items.iter().any(|i| i.group == "DFlash context marks"));
+            // A present DFlash borrows the BF16 head through GEMM, independently of prefix marks.
+            let handles = |memory: &cuteafd_core::memory_layout::MemoryLayout| memory.devices[0].items.iter()
+                .filter(|item| item.group.starts_with("cuBLAS handles: mimo/blas/serve"))
+                .map(|item| item.bytes).sum::<u64>();
+            assert_eq!(handles(&base), 0);
+            assert_eq!(handles(&disabled), 64 << 20);
+            assert_eq!(disabled.devices[0].used_bytes() - base.devices[0].used_bytes(), handles(&disabled));
+            options.layout.as_mut().unwrap().mimo_prefix_draft = true;
+            let marked = plan(dir.path(), &options).unwrap().memory_layout.unwrap();
+            let bytes = marked.devices[0].items.iter().find(|i| i.group == "DFlash context marks").unwrap().bytes;
+            let mark_bytes = 5 * 1024 * 2 * plane_bytes + 8;
+            assert_eq!(bytes, mark_bytes * cuteafd_core::prefix::mark_slots_with_host(16, 20, 1, u64::MAX, true));
+            assert_eq!(marked.devices[0].items.iter().find(|i| i.group == "DFlash valid-floor transfer").unwrap().bytes, 16 * 8);
+            options.layout.as_mut().unwrap().draft_context_slots = Some(25);
+            let overridden = plan(dir.path(), &options).unwrap().memory_layout.unwrap();
+            assert_eq!(overridden.devices[0].items.iter().find(|i| i.group == "DFlash valid-floor transfer").unwrap().bytes, 16 * 8);
+            assert!(overridden.notes.iter().any(|note| note.contains("context slots 25")));
+            std::fs::write(draft.join("config.json"), "{}").unwrap();
+            let malformed = plan(dir.path(), &options).unwrap();
+            assert!(!malformed.placement_supported);
+            assert!(!malformed.executable());
+        }
+        })
     }
-}
 
 #[test]
 fn qwen_default_attention_follows_spark_free_coordinator_layout() {
@@ -5372,7 +5374,8 @@ fn v41_prefill_reserve_is_the_largest_that_fits_never_shrunk_for_kv() {
     assert!(capped.executable(), "{}", render(&capped));
     assert_eq!((capped.prefill_reserve_rows, capped.prefill_unit_rows, capped.prefill_waves),
         (Some(8192), Some(2752), Some(3)));
-    assert_eq!(capped.memory_layout.as_ref().unwrap().pool_tokens, 1 << 20);
+    assert_eq!(capped.phase_ledger.as_ref().unwrap().pool_policy.unwrap().target(), 2 << 20);
+    assert!(capped.memory_layout.as_ref().unwrap().pool_tokens >= 1 << 20);
     // The BLAS/code split retires the mixed 2 GiB row, not the independent
     // graph reserve. This synthetic 31 GiB card now fits as well.
     let compact = PlanOptions { layout: Some(layout::LayoutOptions {
@@ -5692,7 +5695,7 @@ fn encoder_plan_g9_charges_before_pool_and_hashes_off() {
     let mut tensors = mimo_flash_tensors();
     tensors.push(t("visual.patch_embed.proj.weight", "BF16", &[1280,3,2,16,16]));
     let dir = snapshot_tp(cfg, &tensors, Some(1));
-    let options = PlanOptions { layout: Some(layout::LayoutOptions { host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram), rtx_bytes: vec![crate::placement::inventory::PRO_TOTAL_BYTES], target_pool_tokens: Some(32_768), ..Default::default() }), ..Default::default() };
+    let options = PlanOptions { layout: Some(layout::LayoutOptions { host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram), rtx_bytes: vec![crate::placement::inventory::PRO_TOTAL_BYTES], target_pool_tokens: Some(32_768), pool_tokens: Some(32_768), ..Default::default() }), ..Default::default() };
     let spark = plan(dir.path(), &options).unwrap();
     assert!(matches!(spark.encoder.as_ref().unwrap().kind, EncoderKind::Spark { .. }));
     let local = plan(dir.path(), &PlanOptions { vision: MediaMode::Rtx(Some(0)), ..options.clone() }).unwrap();

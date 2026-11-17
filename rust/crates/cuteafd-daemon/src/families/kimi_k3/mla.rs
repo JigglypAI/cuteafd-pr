@@ -350,59 +350,63 @@ mod tests {
 
     #[test]
     fn context_pages_have_one_physical_owner_and_compact_offsets() -> Result<()> {
-        let cfg = KimiK3Config::from_hf(&cuteafd_loader::plan::testing::kimi_k3_config())?;
-        let mut placement = super::super::admission::admit(super::super::admission::tests::inputs(&cfg))?.placement;
-        for (kind, layer) in cfg.attention.iter().zip(&mut placement.layers) {
-            if *kind == KimiAttention::Mla { layer.mode = LayerMode::ContextSplit; }
-        }
-        for format in [MlaCacheFormat::Bf16, MlaCacheFormat::Fp8] {
-            let shards = [CacheLayout::new(&cfg, &placement, 0, format)?,
-                CacheLayout::new(&cfg, &placement, 1, format)?];
-            assert!(shards.iter().all(|shard| shard.parity));
-            assert_eq!(shards.iter().map(CacheLayout::bytes).sum::<usize>(),
-                placement.pool_tokens as usize * format.record_bytes() * cfg.mla_layers());
-            let layer = cfg.attention.iter().position(|kind| *kind == KimiAttention::Mla).unwrap();
-            for page in [0, 1, 2, 3, shards[0].pages - 2, shards[0].pages - 1] {
-                let owner = page % 2;
-                let (offset, bytes) = shards[owner].page_range(layer, page, 17)?;
-                assert_eq!(offset, (page >> 1) * MLA_PAGE_ROWS * format.record_bytes());
-                assert_eq!(bytes, 17 * format.record_bytes());
-                assert!(offset + bytes <= shards[owner].layer_bytes);
-                assert!(shards[1 - owner].page_range(layer, page, 17).is_err());
+        cuteafd_core::memory_policy::MemoryPolicy { kv_max: Some(2 << 20), ..Default::default() }.scoped(|| {
+            let cfg = KimiK3Config::from_hf(&cuteafd_loader::plan::testing::kimi_k3_config())?;
+            let mut placement = super::super::admission::admit(super::super::admission::tests::inputs(&cfg))?.placement;
+            for (kind, layer) in cfg.attention.iter().zip(&mut placement.layers) {
+                if *kind == KimiAttention::Mla { layer.mode = LayerMode::ContextSplit; }
             }
-            let mut mixed = placement.clone();
-            mixed.layers[layer].mode = LayerMode::HeadSplit;
-            assert!(CacheLayout::new(&cfg, &mixed, 0, format).is_err());
-            let mut odd = placement.clone();
-            odd.pool_tokens = 3 * MLA_PAGE_ROWS as u64;
-            assert!(CacheLayout::new(&cfg, &odd, 0, format).is_err());
-        }
-        Ok(())
+            for format in [MlaCacheFormat::Bf16, MlaCacheFormat::Fp8] {
+                let shards = [CacheLayout::new(&cfg, &placement, 0, format)?,
+                    CacheLayout::new(&cfg, &placement, 1, format)?];
+                assert!(shards.iter().all(|shard| shard.parity));
+                assert_eq!(shards.iter().map(CacheLayout::bytes).sum::<usize>(),
+                    placement.pool_tokens as usize * format.record_bytes() * cfg.mla_layers());
+                let layer = cfg.attention.iter().position(|kind| *kind == KimiAttention::Mla).unwrap();
+                for page in [0, 1, 2, 3, shards[0].pages - 2, shards[0].pages - 1] {
+                    let owner = page % 2;
+                    let (offset, bytes) = shards[owner].page_range(layer, page, 17)?;
+                    assert_eq!(offset, (page >> 1) * MLA_PAGE_ROWS * format.record_bytes());
+                    assert_eq!(bytes, 17 * format.record_bytes());
+                    assert!(offset + bytes <= shards[owner].layer_bytes);
+                    assert!(shards[1 - owner].page_range(layer, page, 17).is_err());
+                }
+                let mut mixed = placement.clone();
+                mixed.layers[layer].mode = LayerMode::HeadSplit;
+                assert!(CacheLayout::new(&cfg, &mixed, 0, format).is_err());
+                let mut odd = placement.clone();
+                odd.pool_tokens = 3 * MLA_PAGE_ROWS as u64;
+                assert!(CacheLayout::new(&cfg, &odd, 0, format).is_err());
+            }
+            Ok(())
+                })
     }
 
     #[test]
     fn k31_context_index_cache_follows_page_parity() -> Result<()> {
-        use cuteafd_loader::families::kimi_k3::config::KimiDsaConfig;
-        let mut cfg = KimiK3Config::from_hf(&cuteafd_loader::plan::testing::kimi_k3_config())?;
-        let mut placement = super::super::admission::admit(super::super::admission::tests::inputs(&cfg))?.placement;
-        cfg.dsa = Some(KimiDsaConfig { heads: 32, head_dim: 128, topk: 2048 });
-        for (kind, layer) in cfg.attention.iter().zip(&mut placement.layers) {
-            if *kind == KimiAttention::Mla { layer.mode = LayerMode::ContextSplit; }
-        }
-        for format in [MlaCacheFormat::Bf16, MlaCacheFormat::Fp8] {
-            for rank in 0..2 {
-                let layout = CacheLayout::new(&cfg, &placement, rank, format)?;
-                // Index records follow the same logical-page parity as the
-                // latent cache: each rank owns and is charged for half.
-                assert_eq!(layout.index_layer_bytes, placement.pool_tokens as usize / 2 / 64 * 8448);
-                assert_eq!(layout.layer_bytes, placement.pool_tokens as usize / 2 * format.record_bytes());
-                assert_eq!(layout.bytes(), (layout.layer_bytes + layout.index_layer_bytes) * cfg.mla_layers());
-                assert_eq!(layout.index_reserved_bytes(),
-                    CacheLayout::backing_bytes(layout.index_layer_bytes) * cfg.mla_layers() as u64);
-                assert!(layout.reserved_bytes() >= layout.bytes() as u64);
+        cuteafd_core::memory_policy::MemoryPolicy { kv_max: Some(2 << 20), ..Default::default() }.scoped(|| {
+            use cuteafd_loader::families::kimi_k3::config::KimiDsaConfig;
+            let mut cfg = KimiK3Config::from_hf(&cuteafd_loader::plan::testing::kimi_k3_config())?;
+            let mut placement = super::super::admission::admit(super::super::admission::tests::inputs(&cfg))?.placement;
+            cfg.dsa = Some(KimiDsaConfig { heads: 32, head_dim: 128, topk: 2048 });
+            for (kind, layer) in cfg.attention.iter().zip(&mut placement.layers) {
+                if *kind == KimiAttention::Mla { layer.mode = LayerMode::ContextSplit; }
             }
-        }
-        Ok(())
+            for format in [MlaCacheFormat::Bf16, MlaCacheFormat::Fp8] {
+                for rank in 0..2 {
+                    let layout = CacheLayout::new(&cfg, &placement, rank, format)?;
+                    // Index records follow the same logical-page parity as the
+                    // latent cache: each rank owns and is charged for half.
+                    assert_eq!(layout.index_layer_bytes, placement.pool_tokens as usize / 2 / 64 * 8448);
+                    assert_eq!(layout.layer_bytes, placement.pool_tokens as usize / 2 * format.record_bytes());
+                    assert_eq!(layout.bytes(), (layout.layer_bytes + layout.index_layer_bytes) * cfg.mla_layers());
+                    assert_eq!(layout.index_reserved_bytes(),
+                        CacheLayout::backing_bytes(layout.index_layer_bytes) * cfg.mla_layers() as u64);
+                    assert!(layout.reserved_bytes() >= layout.bytes() as u64);
+                }
+            }
+            Ok(())
+                })
     }
 
     #[test]

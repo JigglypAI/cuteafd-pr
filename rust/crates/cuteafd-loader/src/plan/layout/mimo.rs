@@ -959,38 +959,40 @@ mod tests {
 
     #[test]
     fn recorded_inventory_pool_matches_runtime_admission() {
-        use cuteafd_core::serving_capacity::{CapacityPolicy, DeviceMemory, resolve_capacity_with_startup_peaks};
-        let dir = tempfile::tempdir().unwrap();
-        write_snapshot(dir.path(), &mimo_flash_mopd_config(), &mimo_flash_mopd_tensors(), Some(4));
-        let checkpoint = Checkpoint::open(dir.path()).unwrap();
-        let input = PlanInput::from_checkpoint(checkpoint);
-        let checkpoint = input.checkpoint();
-        for (total, baseline) in [(101_973_491_712u64, 586_416_128u64),
-            (101_970_345_984, 586_416_128), (34_144_990_003, 596_901_888)] {
-            let baseline = baseline + 35_651_584;
-            let opts = LayoutOptions { native_mtp_layers: 0, host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram), rtx_bytes: vec![total], concurrency: 4, ..Default::default() };
-            let mut profile = profile(&checkpoint, &opts, 1, 2, 4096, 4, 1 << 20, None).unwrap();
-            let cublas = crate::placement::inventory::ArchContext::for_device("sm_120", total).cublas_bytes;
-            profile.steady.devices[0].reservations.push(cuteafd_core::serving_capacity::MemoryReservation {
-                name: "runtime.cublas_first_gemm".into(), bytes: cublas,
-            });
-            // A drained startup probe does not remain in the serving headroom.
-            let reserve = crate::placement::families::mimo_v2::admission::device_headroom();
-            assert_eq!(reserve, cuteafd_core::memory_policy::MemoryPolicy::current().release_padding());
-            profile.steady.devices[0].reserve_bytes = reserve;
-            let pool = crate::placement::prepare_pool(crate::plan::testing::pool_facts(
-                &[total], 1 << 20, None, profile.steady.pool_unit_rows, &[profile.steady.devices[0].pool_unit_bytes])).unwrap();
-            let mut policy = pool.capacity_policy(4);
-            policy.pool_tokens = None;
-            let admitted = resolve_capacity_with_startup_peaks(policy, &profile.steady,
-                &[DeviceMemory { device: 0, total_bytes: total, baseline_free_bytes: total - baseline }],
-                &[]).unwrap();
-            let mut devices = vec![DeviceLayout { kind: DeviceKind::Rtx, index: 0, capacity_bytes: total, worker_budget_bytes: 0,
-                items: vec![Item::new(Category::Runtime, "context+modules", "", baseline + cublas, Basis::Exact)], kv_tokens: 0 }];
-            let pool = apply(&input, &opts, &mut devices, 2, 4096, 4, 1 << 20, None).unwrap().pool_tokens;
-            assert_eq!(pool, admitted.allocated_gpu_kv_tokens, "recorded total {total}");
-            assert_eq!(devices[0].capacity_bytes, total - reserve);
-        }
+        cuteafd_core::memory_policy::MemoryPolicy { kv_max: Some(2 << 20), ..Default::default() }.scoped(|| {
+            use cuteafd_core::serving_capacity::{CapacityPolicy, DeviceMemory, resolve_capacity_with_startup_peaks};
+            let dir = tempfile::tempdir().unwrap();
+            write_snapshot(dir.path(), &mimo_flash_mopd_config(), &mimo_flash_mopd_tensors(), Some(4));
+            let checkpoint = Checkpoint::open(dir.path()).unwrap();
+            let input = PlanInput::from_checkpoint(checkpoint);
+            let checkpoint = input.checkpoint();
+            for (total, baseline) in [(101_973_491_712u64, 586_416_128u64),
+                (101_970_345_984, 586_416_128), (34_144_990_003, 596_901_888)] {
+                let baseline = baseline + 35_651_584;
+                let opts = LayoutOptions { native_mtp_layers: 0, host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram), rtx_bytes: vec![total], concurrency: 4, ..Default::default() };
+                let mut profile = profile(&checkpoint, &opts, 1, 2, 4096, 4, 1 << 20, None).unwrap();
+                let cublas = crate::placement::inventory::ArchContext::for_device("sm_120", total).cublas_bytes;
+                profile.steady.devices[0].reservations.push(cuteafd_core::serving_capacity::MemoryReservation {
+                    name: "runtime.cublas_first_gemm".into(), bytes: cublas,
+                });
+                // A drained startup probe does not remain in the serving headroom.
+                let reserve = crate::placement::families::mimo_v2::admission::device_headroom();
+                assert_eq!(reserve, cuteafd_core::memory_policy::MemoryPolicy::current().release_padding());
+                profile.steady.devices[0].reserve_bytes = reserve;
+                let pool = crate::placement::prepare_pool(crate::plan::testing::pool_facts(
+                    &[total], 1 << 20, None, profile.steady.pool_unit_rows, &[profile.steady.devices[0].pool_unit_bytes])).unwrap();
+                let mut policy = pool.capacity_policy(4);
+                policy.pool_tokens = None;
+                let admitted = resolve_capacity_with_startup_peaks(policy, &profile.steady,
+                    &[DeviceMemory { device: 0, total_bytes: total, baseline_free_bytes: total - baseline }],
+                    &[]).unwrap();
+                let mut devices = vec![DeviceLayout { kind: DeviceKind::Rtx, index: 0, capacity_bytes: total, worker_budget_bytes: 0,
+                    items: vec![Item::new(Category::Runtime, "context+modules", "", baseline + cublas, Basis::Exact)], kv_tokens: 0 }];
+                let pool = apply(&input, &opts, &mut devices, 2, 4096, 4, 1 << 20, None).unwrap().pool_tokens;
+                assert_eq!(pool, admitted.allocated_gpu_kv_tokens, "recorded total {total}");
+                assert_eq!(devices[0].capacity_bytes, total - reserve);
+            }
+                });
     }
 
     #[test]

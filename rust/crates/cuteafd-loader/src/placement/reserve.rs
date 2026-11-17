@@ -196,9 +196,7 @@ pub fn report_layout_lines(layout: &cuteafd_core::memory_layout::MemoryLayout, f
     if let Some(pool) = retained {
         return Ok(layout_lines(layout, family, gpu_caps, &pool));
     }
-    let mut policy = MemoryPolicy::current();
-    policy.kv_target = target.or(policy.kv_target);
-    let mut bounds = policy.kv(context.maximum)?;
+    let mut bounds = super::pool::resolve_bounds(context.maximum, target)?;
     bounds.target = bounds.target.max(context.required());
     bounds.min = super::PoolPolicy::normalize_request(requested).unwrap_or(bounds.min).max(context.required());
     bounds.max = super::PoolPolicy::normalize_request(requested).or(bounds.max);

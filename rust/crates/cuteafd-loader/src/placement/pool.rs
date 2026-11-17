@@ -56,11 +56,16 @@ impl PoolFacts {
     }
 }
 
+pub(super) fn resolve_bounds(context: u64, target: Option<u64>)
+    -> Result<cuteafd_core::memory_policy::KvBounds, cuteafd_core::memory_policy::PolicyError> {
+    let mut policy = MemoryPolicy::current();
+    policy.kv_target = target.or(policy.kv_target);
+    policy.kv(context)
+}
+
 /// The only policy resolution entry point for plan and runtime preparation.
 pub fn prepare_pool(facts: PoolFacts) -> Result<PoolPolicy, cuteafd_core::memory_policy::PolicyError> {
-    let mut policy = MemoryPolicy::current();
-    policy.kv_target = facts.target.or(policy.kv_target);
-    let bounds = policy.kv(facts.context.maximum)?;
+    let bounds = resolve_bounds(facts.context.maximum, facts.target)?;
     let raw_requested = PoolPolicy::normalize_request(facts.requested);
     let requested = raw_requested.map(|tokens| {
         // A raw pin below context must retain its typed refusal, not round into validity.

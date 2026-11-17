@@ -2614,7 +2614,9 @@ pub(super) mod tests {
         for layers in [1, 2, 4, 5, 12, 92, 93] {
             let selected = prefix(&full, layers)?;
             check_prefix(&full, &selected)?;
-            let admitted = admit(inputs(&selected))?;
+            let mut input = inputs(&selected);
+            input.requested_pool = Some(2 << 20);
+            let admitted = admit(input)?;
             assert_eq!(admitted.execution_plan()?.modes().len(), layers);
             assert_eq!(admitted.layouts.len(), layers);
             assert_eq!(admitted.cfg, selected);
@@ -2723,23 +2725,25 @@ pub(super) mod tests {
 
     #[test]
     fn explicit_heads_preserves_ffns_and_replicates_mla_cache() -> Result<()> {
-        let cfg = cfg();
-        let owned = admit(inputs(&cfg))?;
-        let mut i = inputs(&cfg);
-        i.attention = Some(AttentionPlacement::Heads);
-        let heads = admit(i)?;
-        assert!(heads.placement.layers.iter().all(|layer| layer.mode == LayerMode::HeadSplit));
-        let records = |admitted: &Admission| admitted.placement.items.iter().flatten()
-            .filter(|item| item.group == "records").map(|item| item.bytes).sum::<u64>();
-        assert_eq!(records(&heads), 2 * records(&owned));
-        for rank in 0..2 {
-            for category in [Category::Kv, Category::Workspace, Category::Prefix] {
-                let state = |a: &Admission| a.placement.items[rank].iter().filter(|item|
-                    item.category == category && item.group.starts_with("Kimi")).map(|item| item.bytes).sum::<u64>();
-                assert_eq!(state(&heads), state(&owned));
+        cuteafd_core::memory_policy::MemoryPolicy { kv_max: Some(2 << 20), ..Default::default() }.scoped(|| {
+            let cfg = cfg();
+            let owned = admit(inputs(&cfg))?;
+            let mut i = inputs(&cfg);
+            i.attention = Some(AttentionPlacement::Heads);
+            let heads = admit(i)?;
+            assert!(heads.placement.layers.iter().all(|layer| layer.mode == LayerMode::HeadSplit));
+            let records = |admitted: &Admission| admitted.placement.items.iter().flatten()
+                .filter(|item| item.group == "records").map(|item| item.bytes).sum::<u64>();
+            assert_eq!(records(&heads), 2 * records(&owned));
+            for rank in 0..2 {
+                for category in [Category::Kv, Category::Workspace, Category::Prefix] {
+                    let state = |a: &Admission| a.placement.items[rank].iter().filter(|item|
+                        item.category == category && item.group.starts_with("Kimi")).map(|item| item.bytes).sum::<u64>();
+                    assert_eq!(state(&heads), state(&owned));
+                }
             }
-        }
-        Ok(())
+            Ok(())
+                })
     }
 
     #[test]
@@ -2769,51 +2773,53 @@ pub(super) mod tests {
 
     #[test]
     fn mla_cache_residency_and_pages_follow_accepted_core_views() -> Result<()> {
-        let cfg = cfg();
-        let owned = admit(inputs(&cfg))?;
-        let mut i = inputs(&cfg);
-        i.attention = Some(AttentionPlacement::Heads);
-        let heads = admit(i)?;
-        let tokens = owned.placement.pool_tokens as usize;
-        let pages = tokens / MLA_PAGE_ROWS;
-        let layer_bytes = tokens * MLA_RECORD_BYTES;
-        for rank in 0..2 {
-            let layout = owned.check_mla(rank, rank as i32)?;
-            assert_eq!(layout.bytes(), layer_bytes);
-            assert_eq!(heads.check_mla(rank, rank as i32)?.bytes(), 2 * layer_bytes);
-            for layer in 0..cfg.layers {
-                let resident = layer == 1 + 2 * rank;
-                assert_eq!(layout.page_range(layer, 0, 64).is_ok(), resident);
-                assert_eq!(heads.mla_layouts[rank].page_range(layer, 0, 64).is_ok(),
-                    cfg.attention[layer] == KimiAttention::Mla);
-                if !resident { continue; }
-                let mut next = 0;
-                for page in 0..pages {
-                    let (offset, bytes) = layout.page_range(layer, page, 64)?;
-                    assert_eq!(offset, next);
-                    next += bytes;
+        cuteafd_core::memory_policy::MemoryPolicy { kv_max: Some(2 << 20), ..Default::default() }.scoped(|| {
+            let cfg = cfg();
+            let owned = admit(inputs(&cfg))?;
+            let mut i = inputs(&cfg);
+            i.attention = Some(AttentionPlacement::Heads);
+            let heads = admit(i)?;
+            let tokens = owned.placement.pool_tokens as usize;
+            let pages = tokens / MLA_PAGE_ROWS;
+            let layer_bytes = tokens * MLA_RECORD_BYTES;
+            for rank in 0..2 {
+                let layout = owned.check_mla(rank, rank as i32)?;
+                assert_eq!(layout.bytes(), layer_bytes);
+                assert_eq!(heads.check_mla(rank, rank as i32)?.bytes(), 2 * layer_bytes);
+                for layer in 0..cfg.layers {
+                    let resident = layer == 1 + 2 * rank;
+                    assert_eq!(layout.page_range(layer, 0, 64).is_ok(), resident);
+                    assert_eq!(heads.mla_layouts[rank].page_range(layer, 0, 64).is_ok(),
+                        cfg.attention[layer] == KimiAttention::Mla);
+                    if !resident { continue; }
+                    let mut next = 0;
+                    for page in 0..pages {
+                        let (offset, bytes) = layout.page_range(layer, page, 64)?;
+                        assert_eq!(offset, next);
+                        next += bytes;
+                    }
+                    assert_eq!(next, layer_bytes);
+                    assert_eq!(layout.page_range(layer, pages - 1, 1)?,
+                        (layer_bytes - MLA_PAGE_ROWS * MLA_RECORD_BYTES, MLA_RECORD_BYTES));
+                    for (page, rows) in [(pages, 1), (0, 0), (0, 65)] {
+                        assert!(layout.page_range(layer, page, rows).is_err());
+                    }
                 }
-                assert_eq!(next, layer_bytes);
-                assert_eq!(layout.page_range(layer, pages - 1, 1)?,
-                    (layer_bytes - MLA_PAGE_ROWS * MLA_RECORD_BYTES, MLA_RECORD_BYTES));
-                for (page, rows) in [(pages, 1), (0, 0), (0, 65)] {
-                    assert!(layout.page_range(layer, page, rows).is_err());
-                }
+                assert!(layout.page_range(cfg.layers, 0, 1).is_err());
             }
-            assert!(layout.page_range(cfg.layers, 0, 1).is_err());
-        }
-        let mut placement = owned.placement.clone();
-        for invalid in [LayerMode::ContextSplit, LayerMode::Whole { gpu: 2, ffn: FfnMode::Split }] {
-            placement.layers[1].mode = invalid;
-            assert!(CacheLayout::new(&cfg, &placement, 0, cuteafd_core::MlaCacheFormat::Bf16).is_err());
-        }
-        placement = owned.placement.clone();
-        for pool in [0, 65, u64::MAX] {
-            placement.pool_tokens = pool;
-            assert!(CacheLayout::new(&cfg, &placement, 0, cuteafd_core::MlaCacheFormat::Bf16).is_err());
-        }
-        assert!(CacheLayout::new(&cfg, &owned.placement, 2, cuteafd_core::MlaCacheFormat::Bf16).is_err());
-        Ok(())
+            let mut placement = owned.placement.clone();
+            for invalid in [LayerMode::ContextSplit, LayerMode::Whole { gpu: 2, ffn: FfnMode::Split }] {
+                placement.layers[1].mode = invalid;
+                assert!(CacheLayout::new(&cfg, &placement, 0, cuteafd_core::MlaCacheFormat::Bf16).is_err());
+            }
+            placement = owned.placement.clone();
+            for pool in [0, 65, u64::MAX] {
+                placement.pool_tokens = pool;
+                assert!(CacheLayout::new(&cfg, &placement, 0, cuteafd_core::MlaCacheFormat::Bf16).is_err());
+            }
+            assert!(CacheLayout::new(&cfg, &owned.placement, 2, cuteafd_core::MlaCacheFormat::Bf16).is_err());
+            Ok(())
+                })
     }
 
     #[test]

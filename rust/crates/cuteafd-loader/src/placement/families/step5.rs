@@ -285,7 +285,7 @@ impl<'a> Step5Recipe<'a> {
         let pool = crate::placement::prepare_pool(facts)?;
         pool.validate_explicit()?;
         let maximum_pages = pool.maximum_tokens().div_ceil(PAGE_ROWS);
-        let layout_pages = pool.requested().unwrap_or(pool.target()).div_ceil(PAGE_ROWS);
+        let layout_pages = pool.requested().unwrap_or(pool.target()).div_ceil(PAGE_ROWS).min(maximum_pages);
         ensure!(maximum_pages > 0, "Step-5 empty pool ceiling");
         let prefill = PrefillShape {
             rows: inputs.unit_rows() as u64,
