@@ -161,7 +161,8 @@ impl ProbeMedia {
         let key = if let Some(identity) = &self.identity {
             let processor = PreprocessId(digest(&identity.processor)?);
             anyhow::ensure!(processor == image.processor, "probe image processor differs");
-            PreparedImage::key_for(EncoderId(digest(&identity.encoder)?), processor, image.grid, &image.rgb8)
+            PreparedImage::key_for_pixels(EncoderId(digest(&identity.encoder)?), processor,
+                image.grid, &image.rgb8, image.pixels)?
         } else { image.key };
         anyhow::ensure!(self.len == image.tokens && self.grid == [image.grid.t, image.grid.h, image.grid.w]
             && self.key == hex(&key.0), "probe prepared image identity differs");
