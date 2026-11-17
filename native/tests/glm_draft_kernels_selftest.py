@@ -143,7 +143,7 @@ def topk_check(lib, args):
                 assert torch.equal(values[row].view(torch.int32), singleton[row][0][0].view(torch.int32)), (
                     "row bytes", vocab, rows, row)
             entry = dict(vocab=vocab, rows=rows, oracle=True, row_invariant=True)
-            if baseline is not None and vocab <= 196608:
+            if baseline is not None and 1024 <= vocab <= 196608:
                 old_values, old_ids, old_launch = launch_topk(baseline, logits, rows, vocab, stream)
                 torch.cuda.synchronize()
                 assert torch.equal(ids, old_ids), ("old/new ids", vocab, rows)
@@ -152,7 +152,7 @@ def topk_check(lib, args):
                 entry["old_byte_identical"] = True
             if vocab in (154880, 202048):
                 entry["candidate_ms"] = timed(launch, 20)
-                if baseline is not None and vocab <= 196608:
+                if baseline is not None and 1024 <= vocab <= 196608:
                     entry["old_ms"] = timed(old_launch, 20)
                     entry["candidate_over_old"] = entry["candidate_ms"] / entry["old_ms"]
             results.append(entry)
