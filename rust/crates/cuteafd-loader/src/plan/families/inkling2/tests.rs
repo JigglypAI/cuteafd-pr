@@ -701,7 +701,11 @@ fn shared_recipe_charges_every_owner_once_on_one_and_two_rtx() {
             growing.admit(request.clone()).unwrap()
         });
         assert_eq!(grown.onboard, admitted.onboard, "growth must preserve Inkling onboarding");
-        assert!(grown.solved.pool_tokens > admitted.solved.pool_tokens,
+        // The unbounded default already grows into the declared memory bound;
+        // an explicit max can only cap that growth lower.
+        assert!(admitted.solved.pool_tokens > inputs.pool.target(),
+            "{placement:?} on {gpus} GPUs: {} grew into the memory bound", admitted.solved.pool_tokens);
+        assert!(grown.solved.pool_tokens <= admitted.solved.pool_tokens,
             "{placement:?} on {gpus} GPUs: {} -> {}", admitted.solved.pool_tokens, grown.solved.pool_tokens);
         let explicit = grow.scoped(|| {
             let mut pinned = inputs.clone();

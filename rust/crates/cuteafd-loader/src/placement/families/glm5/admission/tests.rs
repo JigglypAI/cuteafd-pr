@@ -2458,7 +2458,10 @@ fn prepared_pool_survives_policy_scope_and_matches_sampled_admission() {
             let grown = prepared.admit(req.clone()).unwrap();
             assert_eq!(grown.solved.pool_policy, Some(pool));
             assert_eq!(grown.placement.onboard_layers, default.placement.onboard_layers);
-            assert!(grown.solved.pool_tokens > default.solved.pool_tokens);
+            // An unbounded default already grows into the declared memory
+            // bound; an explicit max above that bound changes nothing.
+            assert_eq!(grown.solved.pool_tokens, default.solved.pool_tokens);
+            assert!(grown.solved.pool_tokens > pool.target(), "automatic growth fills the memory bound");
             let mut sampled = MemoryPolicy { kv_max: Some(100_000_000), ..Default::default() }.scoped(make);
             for budget in sampled.budgets.iter_mut().take(gpus) {
                 let Baseline::Forecast { occupied, .. } = budget.baseline else { panic!("forecast baseline") };

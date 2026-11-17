@@ -699,7 +699,10 @@ pub(crate) mod tests {
             let grown = prepared.admit().unwrap();
             assert_eq!(grown.solved.pool_policy, Some(pool));
             assert_eq!(grown.placement.onboard_layers, default.placement.onboard_layers);
-            assert!(grown.solved.pool_tokens > default.solved.pool_tokens);
+            // An unbounded default already grows into the declared memory
+            // bound; an explicit max above that bound changes nothing.
+            assert_eq!(grown.solved.pool_tokens, default.solved.pool_tokens);
+            assert!(grown.solved.pool_tokens > pool.target(), "automatic growth fills the memory bound");
             let runtime = MemoryPolicy { kv_max: Some(100_000_000), ..Default::default() }
                 .scoped(|| contract(&sampled(&input))).unwrap();
             assert_eq!(grown.solved.pool_policy, runtime.solved.pool_policy);
@@ -1191,7 +1194,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn zero_peer_auto_pool_stops_at_target_for_planned_and_sampled_baselines() {
+    fn zero_peer_auto_pool_grows_to_memory_for_planned_and_sampled_baselines() {
         let cfg = GlmNextConfig::from_hf(&crate::plan::testing::glm5_flash_config(4)).unwrap();
         let mut input = inputs(&cfg, 2, inventory::PRO_TOTAL_BYTES);
         input.spark_ranks = 0;
@@ -1200,7 +1203,11 @@ pub(crate) mod tests {
         for pool in [None, Some(2 << 20)] {
             input.requested_pool = pool;
             let (placed, graphs, working) = admitted_case(&input, false, 188, true, None).unwrap();
-            assert_eq!(placed.pool_tokens, 2 << 20);
+            match pool {
+                Some(tokens) => assert_eq!(placed.pool_tokens, tokens),
+                None => assert!(placed.pool_tokens > 2 << 20,
+                    "an unbounded max grows into the declared memory bound"),
+            }
             assert_eq!(placed.onboard_layers, input.experts.len());
             assert!(placed.layers.iter().enumerate().filter(|(layer, _)| !cfg.dense[*layer])
                 .all(|(_, layer)| layer.experts == ExpertHome::RtxTp2));

@@ -2389,7 +2389,11 @@ fn prepared_pool_growth_retains_onboarding_and_policy_after_scope_exit() {
         let grown = growing.admit(request.clone()).unwrap();
         assert_eq!(grown.solved.pool_policy, Some(growing.pool));
         assert_eq!(grown.onboard, default.onboard);
-        assert!(grown.solved.pool_tokens > default.solved.pool_tokens);
+        // The unbounded default already grows into the declared memory bound;
+        // an explicit max can only cap that growth lower.
+        assert!(default.solved.pool_tokens > inputs.pool.target(),
+            "the unbounded default grows into the memory bound");
+        assert!(grown.solved.pool_tokens <= default.solved.pool_tokens);
         let mut explicit = inputs.clone();
         explicit.pool = crate::placement::prepare_pool(crate::placement::PoolFacts::new(
             &vec![96 << 30; gpus], inputs.context, Some(default.solved.pool_tokens), shared::PAGE_ROWS)).unwrap();
