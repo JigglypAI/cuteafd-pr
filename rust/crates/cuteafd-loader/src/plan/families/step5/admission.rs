@@ -197,6 +197,7 @@ pub struct RuntimeInputs {
     pub context: u64,
     pub serving_context: crate::placement::planner::Context,
     pub requested_pool: Option<u64>,
+    pub target_pool: Option<u64>,
     pub marks: MarkRule,
     pub peer_diagnostics: bool,
     pub pending_code: Vec<u64>,
@@ -612,7 +613,7 @@ mod tests {
             rows: 64,
             sequences: 16,
             context: FLOOR, serving_context: crate::placement::planner::Context::pinned(FLOOR),
-            requested_pool: Some(FLOOR),
+            requested_pool: Some(FLOOR), target_pool: None,
             marks: MarkRule {
                 lanes: 16,
                 entries: 16,

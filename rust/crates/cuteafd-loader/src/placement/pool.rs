@@ -188,6 +188,28 @@ mod tests {
     use super::*;
 
     #[test]
+    fn preparation_uses_one_shared_target_precedence_and_small_card_default() {
+        MemoryPolicy { kv_target: Some(3 << 20), kv_max: Some(100_000_000), ..Default::default() }.scoped(|| {
+            let mut facts = PoolFacts::new(&[32 << 30], super::super::planner::Context::automatic(262_144), None, 64);
+            assert_eq!(prepare_pool(facts).target(), 3 << 20);
+            facts.target = Some(4 << 20);
+            let pool = prepare_pool(facts);
+            assert_eq!(pool.target(), 4 << 20);
+            assert_eq!(pool.maximum_tokens(), 100_000_000);
+            facts.requested = Some(524_288);
+            let explicit = prepare_pool(facts);
+            assert_eq!(explicit.maximum_tokens(), 524_288);
+            assert_eq!(explicit.capacity_policy(16).pool_tokens, Some(524_288));
+        });
+        MemoryPolicy::default().scoped(|| {
+            for cards in [&[32 << 30][..], &[96 << 30, 32 << 30][..]] {
+                assert_eq!(prepare_pool(PoolFacts::new(cards, 262_144, None, 64)).target(), 1 << 20);
+            }
+            assert_eq!(prepare_pool(PoolFacts::new(&[96 << 30], 262_144, None, 64)).target(), 2 << 20);
+        });
+    }
+
+    #[test]
     fn maximum_extent_includes_growth_without_changing_the_layout_target() {
         let defaults = PoolPolicy::resolve(&[96 << 30], 262_144, None, 256);
         assert_eq!(defaults.maximum_tokens(), defaults.target);

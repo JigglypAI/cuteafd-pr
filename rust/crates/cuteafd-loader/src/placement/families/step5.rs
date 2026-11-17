@@ -209,8 +209,10 @@ impl<'a> Step5Recipe<'a> {
             .iter()
             .map(|gpu| gpu.capacity_bytes)
             .collect::<Vec<_>>();
-        let pool = crate::placement::prepare_pool(crate::placement::PoolFacts::new(
-            &capacities, inputs.serving_context, inputs.requested_pool, PAGE_ROWS));
+        let mut facts = crate::placement::PoolFacts::new(
+            &capacities, inputs.serving_context, inputs.requested_pool, PAGE_ROWS);
+        facts.target = inputs.target_pool;
+        let pool = crate::placement::prepare_pool(facts);
         pool.validate_explicit()?;
         let maximum_pages = pool.maximum_tokens().div_ceil(PAGE_ROWS);
         let layout_pages = pool.requested().unwrap_or(pool.target()).div_ceil(PAGE_ROWS);

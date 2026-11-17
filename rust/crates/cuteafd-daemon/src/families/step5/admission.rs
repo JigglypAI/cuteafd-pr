@@ -320,7 +320,7 @@ mod tests {
                 unit,
                 sequences: 16,
                 context, serving_context: cuteafd_loader::placement::planner::Context::pinned(context),
-                requested_pool: pool,
+                requested_pool: pool, target_pool: None,
                 marks: prefix_marks(&<PrefixCli as clap::Parser>::parse_from([
                     "step5", "--host-cache-bytes", &host.map_or_else(|| "auto".into(), |n| n.to_string()),
                     "--prefix-cache-entries", &entries.to_string(),
