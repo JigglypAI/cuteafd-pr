@@ -1042,7 +1042,8 @@ mod tests {
                 host: super::host_owners_with_memory(&args, &cfg, 4, mtp, 2, 0, false, None,
                     host_embedding, Vec::new(), cuteafd_loader::plan::testing::SimulatedHost::raptor().host_ram)?, encoders: Default::default() })?;
             assert_eq!(solved.pool_policy, report.phase_ledger.as_ref().unwrap().pool_policy);
-            assert_eq!(runtime.pool_tokens, if capacities.iter().any(|&bytes| bytes <= 32 << 30) { 1 << 20 } else { 2 << 20 });
+            // The layout target is uniform; an automatic pool then grows into memory.
+            assert_eq!(solved.pool_policy.as_ref().unwrap().target(), 2 << 20);
             assert_eq!(runtime.pool_tokens, layout.pool_tokens);
             assert_eq!(runtime.tp2.unwrap().layers, 4);
             assert!(layout.notes.contains(&format!("placement: {}", runtime.summary())));

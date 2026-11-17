@@ -325,6 +325,26 @@ pub fn prepare(inputs: &V4Inputs) -> Result<PreparedV4<'_>, Refusal> {
     let cards = inputs.gpus.iter().map(|&(bytes, _)| bytes).collect::<Vec<_>>();
     let mut facts = crate::placement::PoolFacts::new(&cards, inputs.serving_context,
         inputs.requested_pool, page_rows);
+    // Records one pool unit costs: a context split hands a rank half of every
+    // C4 page while C128 pages replicate, as V4KvLayout prices. A whole-layer
+    // placement may give every cached layer to either owner, so its summed
+    // slope bounds every legal cut.
+    let context_split = attention == AttentionPlacement::Context;
+    let pages_per_unit = page_rows / V4_PAGE_ROWS;
+    let mut unit_bytes = 0u64;
+    for &ratio in &inputs.cfg.compress_ratios {
+        let bytes = crate::serving_capacity::deepseek_v4_layer_unit_bytes(ratio)
+            .checked_mul(pages_per_unit).ok_or(Refusal::Overflow("V4 pool unit"))?;
+        let owned = if context_split && ratio == 4 { bytes / 2 } else { bytes };
+        unit_bytes = unit_bytes.checked_add(owned).ok_or(Refusal::Overflow("V4 pool unit"))?;
+    }
+    facts.memory = if attention == AttentionPlacement::Layers {
+        vec![crate::placement::PoolMemory {
+            available_bytes: cards.iter().sum(), bytes_per_unit: unit_bytes }]
+    } else {
+        cards.iter().map(|&available_bytes| crate::placement::PoolMemory {
+            available_bytes, bytes_per_unit: unit_bytes }).collect()
+    };
     facts.encoding_limit = Some(super::POOL_CEILING_TOKENS);
     facts.target = inputs.target_pool;
     let pool = crate::placement::prepare_pool(facts).map_err(|error| Refusal::InvalidFact(error.to_string()))?;

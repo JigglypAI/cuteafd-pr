@@ -27,6 +27,12 @@ pub fn admit_dual(request: Request, budgets: Vec<Budget>, facts: DenseFacts<'_>)
         .map(|budget| budget.logical_bytes).collect::<Vec<_>>();
     let requested = match request.pool { Pin::Auto => None, Pin::Exact(tokens) => Some(tokens) };
     let mut pool_facts = crate::placement::PoolFacts::new(&cards, request.context, requested, PAGE_ROWS);
+    // A whole-layer cut gives either rank a contiguous run of full-attention
+    // layers. Sum memory against the checkpoint's total record slope to bound
+    // every legal cut, exactly as the single-owner page geometry prices it.
+    let page_bytes = host_prefix_geometry(facts.cfg, facts.record_bytes, 0).page_bytes;
+    pool_facts.memory = vec![crate::placement::PoolMemory {
+        available_bytes: cards.iter().sum(), bytes_per_unit: page_bytes }];
     pool_facts.encoding_limit = Some(if facts.drafter.is_some() { i32::MAX as u64 } else { u32::MAX as u64 });
     pool_facts.target = facts.target_pool;
     let pool = crate::placement::prepare_pool(pool_facts).map_err(|error| Refusal::InvalidFact(error.to_string()))?;

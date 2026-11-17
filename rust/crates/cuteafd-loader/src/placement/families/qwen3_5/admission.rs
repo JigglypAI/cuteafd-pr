@@ -113,6 +113,11 @@ pub fn admit(request: Request, mut budgets: Vec<Budget>, facts: DenseFacts<'_>)
         .map(|budget| budget.logical_bytes).collect::<Vec<_>>();
     let requested = match request.pool { Pin::Auto => None, Pin::Exact(tokens) => Some(tokens) };
     let mut pool_facts = crate::placement::PoolFacts::new(&cards, request.context, requested, PAGE_ROWS);
+    // One rank holds every full-attention layer's records: the same page
+    // geometry the runtime prefix cache and the KV owners are priced from.
+    let page_bytes = super::host_prefix_geometry(facts.cfg, facts.record_bytes, 0).page_bytes;
+    pool_facts.memory = cards.iter().map(|&available_bytes|
+        crate::placement::PoolMemory { available_bytes, bytes_per_unit: page_bytes }).collect();
     pool_facts.encoding_limit = Some(if facts.drafter.is_some() { i32::MAX as u64 } else { u32::MAX as u64 });
     pool_facts.target = facts.target_pool;
     let pool = crate::placement::prepare_pool(pool_facts).map_err(|error| Refusal::InvalidFact(error.to_string()))?;

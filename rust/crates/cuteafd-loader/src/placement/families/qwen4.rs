@@ -231,6 +231,11 @@ impl<'a> QwenSingle<'a> {
         let requested = inputs.requested_pool;
         let cards = [inputs.capacity_bytes];
         let mut facts = PoolFacts::new(&cards, inputs.context, requested, page);
+        let a = &inputs.admission;
+        let geometry = crate::serving_capacity::qwen_cache_geometry(a.cfg, a.layers, a.mtp, a.kv_format)
+            .map_err(|error| Refusal::InvalidFact(format!("Qwen cache geometry: {error}")))?;
+        facts.memory = cards.iter().map(|&available_bytes| PoolMemory { available_bytes,
+            bytes_per_unit: geometry.ranks[0].persistent_unit_bytes }).collect();
         facts.target = inputs.target_pool;
         let pool = prepare_pool(facts).map_err(|error| Refusal::InvalidFact(error.to_string()))?;
         let context = pool.compiled_context();
@@ -908,6 +913,28 @@ impl<'a> QwenDual<'a> {
         let requested = inputs.requested_pool;
         let cards = inputs.gpus.map(|gpu| gpu.capacity_bytes);
         let mut facts = PoolFacts::new(&cards, inputs.context, requested, page);
+        let compute = |layers, mtp| crate::serving_capacity::qwen_cache_geometry(
+            a.cfg, layers, mtp, a.kv_format)
+            .map_err(|error| Refusal::InvalidFact(format!("Qwen cache geometry: {error}")));
+        // Records are owned by the layer's rank; the probe accumulates each
+        // owner's full-attention layers exactly as the contract prices them.
+        let mut records = [0u64; 2];
+        let mut previous = 0u64;
+        for (layer, &gpu) in owners.iter().enumerate() {
+            let current = compute(layer + 1, false)?.ranks[0].persistent_unit_bytes;
+            records[gpu] = records[gpu].checked_add(current.checked_sub(previous)
+                .ok_or_else(|| Refusal::InvalidFact("Qwen per-layer records shrink".into()))?)
+                .ok_or(Refusal::Overflow("Qwen per-rank records"))?;
+            previous = current;
+        }
+        if a.mtp {
+            let complete = compute(a.layers, true)?.ranks[0].persistent_unit_bytes;
+            records[0] = records[0].checked_add(complete.checked_sub(previous)
+                .ok_or_else(|| Refusal::InvalidFact("Qwen MTP records shrink".into()))?)
+                .ok_or(Refusal::Overflow("Qwen per-rank records"))?;
+        }
+        facts.memory = cards.iter().zip(records).map(|(&available_bytes, bytes_per_unit)|
+            PoolMemory { available_bytes, bytes_per_unit }).collect();
         facts.target = inputs.target_pool;
         let policy = prepare_pool(facts).map_err(|error| Refusal::InvalidFact(error.to_string()))?;
         let maximum_pages = policy.maximum_tokens().max(policy.floor()).div_ceil(page);
@@ -1783,74 +1810,78 @@ mod tests {
     #[test]
     fn planner_equals_runtime_qwen4() {
         let cfg = Qwen4Config::from_hf(&crate::plan::testing::qwen4_config(4)).unwrap();
-        let planned = placement(&single_inputs(&cfg, Baseline::Planned { context_bytes: 0, loaded_bytes: 0 },
-            0, None, ResidentWeights(1024), None)).unwrap();
-        let runtime = placement(&single_inputs(&cfg, Baseline::Measured { free_bytes: 96 << 30 },
-            0, None, ResidentWeights(1024), None)).unwrap();
-        assert_eq!(planned, runtime);
-        assert!(!planned.items.iter().flatten().any(|item| item.group == "residual hop control"));
-        assert_eq!(planned.pool_tokens, 2 << 20);
-        // Both baselines and CLI zero select the same automatic admission.
-        let zero = placement(&single_inputs(&cfg, Baseline::Measured { free_bytes: 96 << 30 },
-            0, Some(0), ResidentWeights(1024), None)).unwrap();
-        assert_eq!(zero, runtime);
-        let admission = qwen_admission(&single_inputs(&cfg, Baseline::Measured { free_bytes: 96 << 30 },
-            0, None, ResidentWeights(1024), None).admission).unwrap();
-        // One arena per pooled record set: the engine allocates the layer's
-        // records, token keys and pool keys as one block, so each set is
-        // charged as its single physical cudaMalloc, rounding once at the
-        // SM120 granule. Everything else in the pool total (page tables and
-        // their per-token rounding) stays linear.
-        let granule = SM120_ALLOCATION_GRANULARITY_BYTES;
-        let pool_pages = (2u64 << 20) / QWEN_UNIT_ROWS as u64;
-        let geometry = |layers, mtp| crate::serving_capacity::qwen_cache_geometry(&cfg, layers, mtp,
-            Qwen4KvCache::Bf16).unwrap().ranks[0].persistent_unit_bytes;
-        let (mut previous, mut expected) = (0u64, 0u64);
-        for layer in 0..cfg.layers {
-            let current = geometry(layer + 1, false);
-            expected += ((current - previous) * pool_pages).div_ceil(granule) * granule;
-            previous = current;
-        }
-        expected += (admission.per_token * QWEN_UNIT_ROWS as u64 - geometry(cfg.layers, false)) * pool_pages;
-        assert_eq!(planned.items[0].iter().filter(|item| item.group == "records")
-            .map(|item| item.bytes).sum::<u64>(), expected);
-        let (base, extra) = qwen_reserve(QwenGraphShapeKey::Single0Spark, 0).unwrap();
-        let reserve = crate::placement::graph_reserve::current(0, false, base, extra).unwrap();
-        assert_eq!(planned.items[0].iter().filter(|item| item.group == "graph reserve: qwen4.graphs.0")
-            .map(|item| item.bytes).collect::<Vec<_>>(), vec![reserve.bytes]);
+        use cuteafd_core::memory_policy::MemoryPolicy;
+        // A finite KV max pins this fixture's record arithmetic; the prepared-pool test covers unbounded growth.
+        MemoryPolicy { kv_max: Some(2 << 20), ..Default::default() }.scoped(|| {
+            let planned = placement(&single_inputs(&cfg, Baseline::Planned { context_bytes: 0, loaded_bytes: 0 },
+                0, None, ResidentWeights(1024), None)).unwrap();
+            let runtime = placement(&single_inputs(&cfg, Baseline::Measured { free_bytes: 96 << 30 },
+                0, None, ResidentWeights(1024), None)).unwrap();
+            assert_eq!(planned, runtime);
+            assert!(!planned.items.iter().flatten().any(|item| item.group == "residual hop control"));
+            assert_eq!(planned.pool_tokens, 2 << 20);
+            // Both baselines and CLI zero select the same automatic admission.
+            let zero = placement(&single_inputs(&cfg, Baseline::Measured { free_bytes: 96 << 30 },
+                0, Some(0), ResidentWeights(1024), None)).unwrap();
+            assert_eq!(zero, runtime);
+            let admission = qwen_admission(&single_inputs(&cfg, Baseline::Measured { free_bytes: 96 << 30 },
+                0, None, ResidentWeights(1024), None).admission).unwrap();
+            // One arena per pooled record set: the engine allocates the layer's
+            // records, token keys and pool keys as one block, so each set is
+            // charged as its single physical cudaMalloc, rounding once at the
+            // SM120 granule. Everything else in the pool total (page tables and
+            // their per-token rounding) stays linear.
+            let granule = SM120_ALLOCATION_GRANULARITY_BYTES;
+            let pool_pages = (2u64 << 20) / QWEN_UNIT_ROWS as u64;
+            let geometry = |layers, mtp| crate::serving_capacity::qwen_cache_geometry(&cfg, layers, mtp,
+                Qwen4KvCache::Bf16).unwrap().ranks[0].persistent_unit_bytes;
+            let (mut previous, mut expected) = (0u64, 0u64);
+            for layer in 0..cfg.layers {
+                let current = geometry(layer + 1, false);
+                expected += ((current - previous) * pool_pages).div_ceil(granule) * granule;
+                previous = current;
+            }
+            expected += (admission.per_token * QWEN_UNIT_ROWS as u64 - geometry(cfg.layers, false)) * pool_pages;
+            assert_eq!(planned.items[0].iter().filter(|item| item.group == "records")
+                .map(|item| item.bytes).sum::<u64>(), expected);
+            let (base, extra) = qwen_reserve(QwenGraphShapeKey::Single0Spark, 0).unwrap();
+            let reserve = crate::placement::graph_reserve::current(0, false, base, extra).unwrap();
+            assert_eq!(planned.items[0].iter().filter(|item| item.group == "graph reserve: qwen4.graphs.0")
+                .map(|item| item.bytes).collect::<Vec<_>>(), vec![reserve.bytes]);
 
-        // MTP records are their own record arena on owner zero, so they round
-        // once as a physical cudaMalloc instead of sharing the pool table
-        // rounding; everything left in the per-token total is page tables.
-        let mut mtp_json = crate::plan::testing::qwen4_config(4);
-        mtp_json["text_config"]["mtp_num_hidden_layers"] = serde_json::json!(1);
-        let mtp_cfg = Qwen4Config::from_hf(&mtp_json).unwrap();
-        let mut mtp_inputs = single_inputs(&mtp_cfg, Baseline::Measured { free_bytes: 96 << 30 },
-            0, None, ResidentWeights(1024), None);
-        mtp_inputs.admission.mtp = true;
-        let mtp_admission = qwen_admission(&mtp_inputs.admission).unwrap();
-        let mtp_planned = placement(&mtp_inputs).unwrap();
-        assert_eq!(mtp_planned.pool_tokens, 2 << 20);
-        let geometry_mtp = |layers, mtp| crate::serving_capacity::qwen_cache_geometry(&mtp_cfg, layers, mtp,
-            Qwen4KvCache::Bf16).unwrap().ranks[0].persistent_unit_bytes;
-        let mtp_records = geometry_mtp(mtp_cfg.layers, true) - geometry_mtp(mtp_cfg.layers, false);
-        let (mut previous, mut mtp_expected) = (0u64, 0u64);
-        for layer in 0..mtp_cfg.layers {
-            let current = geometry_mtp(layer + 1, false);
-            mtp_expected += ((current - previous) * pool_pages).div_ceil(granule) * granule;
-            previous = current;
-        }
-        mtp_expected += (mtp_records * pool_pages).div_ceil(granule) * granule;
-        mtp_expected += (mtp_admission.per_token * QWEN_UNIT_ROWS as u64
-            - geometry_mtp(mtp_cfg.layers, true)) * pool_pages;
-        assert_eq!(mtp_planned.items[0].iter().filter(|item| item.group == "records")
-            .map(|item| item.bytes).sum::<u64>(), mtp_expected);
-        // The first typed refusal is preserved, not clamped or re-solved.
-        let limited = single_inputs(&cfg, Baseline::Measured { free_bytes: 96 << 30 }, 0,
-            None, ResidentWeights(2048), Some(ResidentWeights(1)));
-        let refused = QwenSingle::new(&limited).unwrap();
-        assert_eq!(refused.admit().unwrap_err(),
-            Refusal::ResidentWeightLimit { gpu: 0, required: 2048, limit: 1 });
+            // MTP records are their own record arena on owner zero, so they round
+            // once as a physical cudaMalloc instead of sharing the pool table
+            // rounding; everything left in the per-token total is page tables.
+            let mut mtp_json = crate::plan::testing::qwen4_config(4);
+            mtp_json["text_config"]["mtp_num_hidden_layers"] = serde_json::json!(1);
+            let mtp_cfg = Qwen4Config::from_hf(&mtp_json).unwrap();
+            let mut mtp_inputs = single_inputs(&mtp_cfg, Baseline::Measured { free_bytes: 96 << 30 },
+                0, None, ResidentWeights(1024), None);
+            mtp_inputs.admission.mtp = true;
+            let mtp_admission = qwen_admission(&mtp_inputs.admission).unwrap();
+            let mtp_planned = placement(&mtp_inputs).unwrap();
+            assert_eq!(mtp_planned.pool_tokens, 2 << 20);
+            let geometry_mtp = |layers, mtp| crate::serving_capacity::qwen_cache_geometry(&mtp_cfg, layers, mtp,
+                Qwen4KvCache::Bf16).unwrap().ranks[0].persistent_unit_bytes;
+            let mtp_records = geometry_mtp(mtp_cfg.layers, true) - geometry_mtp(mtp_cfg.layers, false);
+            let (mut previous, mut mtp_expected) = (0u64, 0u64);
+            for layer in 0..mtp_cfg.layers {
+                let current = geometry_mtp(layer + 1, false);
+                mtp_expected += ((current - previous) * pool_pages).div_ceil(granule) * granule;
+                previous = current;
+            }
+            mtp_expected += (mtp_records * pool_pages).div_ceil(granule) * granule;
+            mtp_expected += (mtp_admission.per_token * QWEN_UNIT_ROWS as u64
+                - geometry_mtp(mtp_cfg.layers, true)) * pool_pages;
+            assert_eq!(mtp_planned.items[0].iter().filter(|item| item.group == "records")
+                .map(|item| item.bytes).sum::<u64>(), mtp_expected);
+            // The first typed refusal is preserved, not clamped or re-solved.
+            let limited = single_inputs(&cfg, Baseline::Measured { free_bytes: 96 << 30 }, 0,
+                None, ResidentWeights(2048), Some(ResidentWeights(1)));
+            let refused = QwenSingle::new(&limited).unwrap();
+            assert_eq!(refused.admit().unwrap_err(),
+                Refusal::ResidentWeightLimit { gpu: 0, required: 2048, limit: 1 });
+        });
     }
 
     #[test]
@@ -1863,7 +1894,7 @@ mod tests {
             let serve = single_inputs(&cfg, Baseline::Measured { free_bytes: 96 << 30 },
                 0, requested, ResidentWeights(0), None);
             let default = QwenSingle::new(&plan).unwrap().admit().unwrap();
-            MemoryPolicy { kv_max: Some(100_000_000), ..Default::default() }.scoped(|| {
+            MemoryPolicy { kv_max: Some(2 << 20), ..Default::default() }.scoped(|| {
                 let prepared = QwenSingle::new(&plan).unwrap();
                 let live = QwenSingle::new(&serve).unwrap();
                 // A resolved preparation stays authoritative after the ambient policy changes.
@@ -1877,8 +1908,8 @@ mod tests {
                 if requested.is_some() {
                     assert_eq!(solved.pool_tokens, 262_400);
                 } else {
-                    assert_eq!(default.pool_tokens, 2 << 20);
-                    assert!(solved.pool_tokens > default.pool_tokens);
+                    assert!(default.pool_tokens > 2 << 20, "an unbounded max grows into the admitted memory");
+                    assert_eq!(solved.pool_tokens, 2 << 20);
                 }
             });
         }
@@ -1890,11 +1921,11 @@ mod tests {
         let mut inputs = single_inputs(&cfg, Baseline::Measured { free_bytes: 32 << 30 },
             0, None, ResidentWeights(0), None);
         inputs.capacity_bytes = 32 << 30;
-        assert_eq!(QwenSingle::new(&inputs).unwrap().admit().unwrap().pool_policy.unwrap().target(), 1 << 20);
+        assert_eq!(QwenSingle::new(&inputs).unwrap().admit().unwrap().pool_policy.unwrap().target(), 2 << 20);
         inputs.target_pool = Some(524_288);
         let solved = QwenSingle::new(&inputs).unwrap().admit().unwrap();
         assert_eq!(solved.pool_policy.unwrap().target(), 524_288);
-        assert_eq!(solved.pool_tokens, 524_288);
+        assert!(solved.pool_tokens >= 524_288, "the target sizes the layout; the pool still grows");
     }
 
     /// The header-only planner reserves Spark return planes beside a planned
@@ -1908,7 +1939,9 @@ mod tests {
                 ResidentWeights(0), None);
             (placement(&inputs).unwrap(), inputs)
         };
-        let (planned, inputs) = intake(Baseline::Planned { context_bytes: 0, loaded_bytes: 0 });
+        use cuteafd_core::memory_policy::MemoryPolicy;
+        let pinned = || MemoryPolicy { kv_max: Some(2 << 20), ..Default::default() };
+        let (planned, inputs) = pinned().scoped(|| intake(Baseline::Planned { context_bytes: 0, loaded_bytes: 0 }));
         let planes = planned.items[0].iter().filter(|item| item.group == "Spark intake planes")
             .map(|item| item.bytes).collect::<Vec<_>>();
         assert_eq!(planes.len(), 1);
@@ -1916,7 +1949,7 @@ mod tests {
             4, cfg.hidden as u64, cuteafd_core::SparkReplyFormat::Bf16).unwrap());
         assert_eq!(planned.pool_tokens, 2 << 20);
         drop(inputs);
-        let (runtime, _) = intake(Baseline::Measured { free_bytes: 96 << 30 });
+        let (runtime, _) = pinned().scoped(|| intake(Baseline::Measured { free_bytes: 96 << 30 }));
         assert!(!runtime.items[0].iter().any(|item| item.group == "Spark intake planes"));
         assert_eq!(runtime.pool_tokens, planned.pool_tokens);
     }
