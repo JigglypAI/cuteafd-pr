@@ -50,7 +50,9 @@ source-level profiling (SASS-level profiling needs neither).
 touching Docker, SSH or any container.
 
 --from-slot NAME first clones an existing slot, then rebuilds the selected
-role. This is useful for coordinator-only or expert-only A/B candidates.
+role. The source slot's recorded seed is reused (bounded seed probes find older
+slots); a conflicting explicit --seed fails instead of cloning on another host.
+This is useful for coordinator-only or expert-only A/B candidates.
 For a coordinator-only clone, wip.sh stops only the coordinator process and
 keeps resident Spark experts available for fingerprint-checked reuse.
 WIP_INSTANCE (environment or config key) isolates containers and caches; unset
@@ -233,6 +235,48 @@ if ((dry_run)); then
   echo "  Spark cache plan (host HOME template; states/admission and uid rechecked on each Spark, no SSH):"
   cuteafd_build_cache_docker_args "${WIP_ROOT:-$HOME/.cache/cuteafd/builds/wip${WIP_INSTANCE:+-$WIP_INSTANCE}}" /wip/home "$wip_toolchain_hash" dry aarch64 >/dev/null
   exit 0
+fi
+
+# wip-from-slot-seed:start
+wip_resolve_from_slot_seed() {
+  local record_root="${WIP_ROOT:-$HOME/.cache/cuteafd/builds/wip${WIP_INSTANCE:+-$WIP_INSTANCE}}"
+  local record="$record_root/slots/$from_slot/seed-host" recorded="" host resolved=""
+  local container path="/wip/slots/$from_slot/spark-expert"
+  container="$(release_wip_container spark-expert)"
+  [[ ! -f "$record" ]] || recorded="$(<"$record")"
+  [[ -z "$recorded" || "$recorded" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]] ||
+    release_die "invalid source seed host in $record: $recorded"
+  local -a candidates=("$recorded" "${release_lan_seed_hosts[@]}" "$seed_host" rhea moa "${wip_hosts[@]}")
+  local -A seen=()
+  for host in "${candidates[@]}"; do
+    [[ -n "$host" && -z "${seen[$host]:-}" ]] || continue
+    seen[$host]=1
+    if timeout --kill-after=1 8 ssh -o BatchMode=yes -o ConnectTimeout=3 "$host" \
+      docker exec "$container" test -d "$path" 2>/dev/null; then
+      resolved="$host"
+      break
+    fi
+  done
+  [[ -n "$resolved" ]] || release_die "source WIP slot missing: $path in $container on hosts ${!seen[*]} (instance ${WIP_INSTANCE:-default})"
+  if ((seed_explicit)) && [[ "$seed_host" != "$resolved" ]]; then
+    release_die "--seed $seed_host conflicts with --from-slot $from_slot: source $path is on $resolved ($container)"
+  fi
+  [[ "$seed_host" == "$resolved" ]] || unset WIP_SEED_ADDR
+  seed_host="$resolved"
+  # Cloning must stay on the source seed, including when the build lease queues.
+  seed_explicit=1
+  wip_target_hosts=()
+  wip_seed_serves=0
+  for host in "${wip_hosts[@]}"; do
+    if [[ "$host" == "$seed_host" ]]; then wip_seed_serves=1; else wip_target_hosts+=("$host"); fi
+  done
+  wip_container_hosts=("${wip_hosts[@]}")
+  ((wip_seed_serves)) || wip_container_hosts=("$seed_host" "${wip_hosts[@]}")
+  echo "WIP source slot $from_slot: seed $seed_host ($path in $container)"
+}
+# wip-from-slot-seed:end
+if [[ -n "$from_slot" ]] && ((wip_spark_leg)); then
+  wip_resolve_from_slot_seed
 fi
 
 # A coordinator-only retry repairs distribution of a Spark slot sealed by a
@@ -1005,23 +1049,23 @@ fi
 
 if [[ -n "$from_slot" ]]; then
   echo "== cloning WIP slot $from_slot -> $slot =="
-  docker exec -i "$coordinator_container" bash -s -- "$from_slot" "$slot" <<'CONTAINER'
+  docker exec -i "$coordinator_container" bash -s -- "$from_slot" "$slot" "$(hostname -s)" <<'CONTAINER'
 set -euo pipefail
 from="$1"
 to="$2"
-test -d "/wip/slots/$from/coordinator"
-test ! -e "/wip/slots/$to"
+test -d "/wip/slots/$from/coordinator" || { echo "${3:-coordinator}: missing source directory /wip/slots/$from/coordinator" >&2; exit 1; }
+test ! -e "/wip/slots/$to" || { echo "$3: destination already exists: /wip/slots/$to" >&2; exit 1; }
 CONTAINER
   if ((wip_spark_leg)); then
-  ssh -o BatchMode=yes "$seed_host" docker exec -i "$spark_container" bash -s -- "$from_slot" "$slot" <<'CONTAINER'
+  ssh -o BatchMode=yes "$seed_host" docker exec -i "$spark_container" bash -s -- "$from_slot" "$slot" "$seed_host" <<'CONTAINER'
 set -euo pipefail
 from="$1"
 to="$2"
-test -d "/wip/slots/$from/spark-expert"
-test ! -e "/wip/slots/$to"
+test -d "/wip/slots/$from/spark-expert" || { echo "${3:-seed}: missing source directory /wip/slots/$from/spark-expert" >&2; exit 1; }
+test ! -e "/wip/slots/$to" || { echo "$3: destination already exists: /wip/slots/$to" >&2; exit 1; }
 CONTAINER
   fi
-  docker exec -i "$coordinator_container" bash -s -- "$from_slot" "$slot" <<'CONTAINER'
+  docker exec -i "$coordinator_container" bash -s -- "$from_slot" "$slot" "$(hostname -s)" <<'CONTAINER'
 set -euo pipefail
 from="$1"
 to="$2"
@@ -1043,11 +1087,11 @@ body = json.dumps(meta, indent=2, sort_keys=True).encode() + b"\n"
 RESEAL
 CONTAINER
   if ((wip_spark_leg)); then
-  ssh -o BatchMode=yes "$seed_host" docker exec -i "$spark_container" bash -s -- "$from_slot" "$slot" <<'CONTAINER'
+  ssh -o BatchMode=yes "$seed_host" docker exec -i "$spark_container" bash -s -- "$from_slot" "$slot" "$seed_host" <<'CONTAINER'
 set -euo pipefail
 from="$1"
 to="$2"
-test -d "/wip/slots/$from/spark-expert"
+test -d "/wip/slots/$from/spark-expert" || { echo "${3:-seed}: missing source directory /wip/slots/$from/spark-expert" >&2; exit 1; }
 mkdir -p "/wip/slots/$to"
 cp -a "/wip/slots/$from/spark-expert" "/wip/slots/$to/spark-expert"
 python3 - "/wip/slots/$to/spark-expert" "$to" <<'RESEAL'
@@ -1590,12 +1634,12 @@ wip_retain_counterpart() {
 # role-specific rebuild must retain the cloned counterpart even if its build
 # helper stages or replaces only the selected role.
 if [[ -n "$from_slot" && "$role" == expert ]]; then
-  docker exec -i "$coordinator_container" bash -s -- "$from_slot" "$slot" <<'CONTAINER'
+  docker exec -i "$coordinator_container" bash -s -- "$from_slot" "$slot" "$(hostname -s)" <<'CONTAINER'
 set -euo pipefail
 from="$1"
 to="$2"
 if [ ! -d "/wip/slots/$to/coordinator" ]; then
-  test -d "/wip/slots/$from/coordinator"
+  test -d "/wip/slots/$from/coordinator" || { echo "${3:-coordinator}: missing source directory /wip/slots/$from/coordinator" >&2; exit 1; }
   mkdir -p "/wip/slots/$to"
   cp -a "/wip/slots/$from/coordinator" "/wip/slots/$to/coordinator"
 python3 - "/wip/slots/$to/coordinator" "$to" <<'RESEAL'
@@ -1615,12 +1659,12 @@ RESEAL
 fi
 CONTAINER
 elif [[ -n "$from_slot" && "$role" == coordinator ]] && ((wip_spark_leg)); then
-  ssh -o BatchMode=yes "$seed_host" docker exec -i "$spark_container" bash -s -- "$from_slot" "$slot" <<'CONTAINER'
+  ssh -o BatchMode=yes "$seed_host" docker exec -i "$spark_container" bash -s -- "$from_slot" "$slot" "$seed_host" <<'CONTAINER'
 set -euo pipefail
 from="$1"
 to="$2"
 if [ ! -d "/wip/slots/$to/spark-expert" ]; then
-  test -d "/wip/slots/$from/spark-expert"
+  test -d "/wip/slots/$from/spark-expert" || { echo "${3:-seed}: missing source directory /wip/slots/$from/spark-expert" >&2; exit 1; }
   mkdir -p "/wip/slots/$to"
   cp -a "/wip/slots/$from/spark-expert" "/wip/slots/$to/spark-expert"
 python3 - "/wip/slots/$to/spark-expert" "$to" <<'RESEAL'
@@ -1782,11 +1826,11 @@ distribute_expert_slot() {
 
 wip_check_expert_readiness() {
 if ((wip_spark_leg)) && [[ "$role" != coordinator || -n "$from_slot" ]]; then
-ssh -o BatchMode=yes "$seed_host" docker exec -i "$spark_container" bash -s -- "$slot" <<'CONTAINER'
+ssh -o BatchMode=yes "$seed_host" docker exec -i "$spark_container" bash -s -- "$slot" "$seed_host" <<'CONTAINER'
 set -euo pipefail
 slot="$1"
-test -s "/wip/slots/$slot/spark-expert/FINGERPRINT"
-test -s "/wip/slots/$slot/spark-expert/workspace/cuteafd.config"
+test -s "/wip/slots/$slot/spark-expert/FINGERPRINT" || { echo "$2: missing or empty /wip/slots/$slot/spark-expert/FINGERPRINT" >&2; exit 1; }
+test -s "/wip/slots/$slot/spark-expert/workspace/cuteafd.config" || { echo "$2: missing or empty /wip/slots/$slot/spark-expert/workspace/cuteafd.config" >&2; exit 1; }
 CONTAINER
 fi
 }
@@ -1863,15 +1907,20 @@ wip_build_selected_roles
 # A fresh role-only build succeeds with its own artifacts. Clones still require
 # the retained counterpart, and a both-role build must prove the complete pair.
 if [[ "$role" != expert || -n "$from_slot" ]]; then
-docker exec -i "$coordinator_container" bash -s -- "$slot" <<'CONTAINER'
+docker exec -i "$coordinator_container" bash -s -- "$slot" "$(hostname -s)" <<'CONTAINER'
 set -euo pipefail
 slot="$1"
-test -s "/wip/slots/$slot/coordinator/FINGERPRINT"
-test -s "/wip/slots/$slot/coordinator/workspace/cuteafd.config"
+test -s "/wip/slots/$slot/coordinator/FINGERPRINT" || { echo "$2: missing or empty /wip/slots/$slot/coordinator/FINGERPRINT" >&2; exit 1; }
+test -s "/wip/slots/$slot/coordinator/workspace/cuteafd.config" || { echo "$2: missing or empty /wip/slots/$slot/coordinator/workspace/cuteafd.config" >&2; exit 1; }
 CONTAINER
 fi
 # wip-slot-readiness:end
 
+if ((wip_spark_leg)); then
+  mkdir -p "$state_dir/slots/$slot"
+  printf '%s\n' "$seed_host" >"$state_dir/slots/$slot/seed-host.tmp"
+  mv "$state_dir/slots/$slot/seed-host.tmp" "$state_dir/slots/$slot/seed-host"
+fi
 release_record_wip_slot "$slot"
 if [[ "$role" == both || -n "$from_slot" ]]; then
   echo "WIP slot '$slot' is ready. Launch it with: ./run.sh --wip '$slot' --restart"

@@ -11,11 +11,15 @@ ROOT = Path(__file__).resolve().parents[2]
 HELPER = ROOT / "scripts/build/compiler-cache.sh"
 
 
-def run_setup(tmp_path, extra=None, expression='env | sort'):
-    env = {key: value for key, value in os.environ.items()
+def clean_env():
+    return {key: value for key, value in os.environ.items()
            if not key.startswith(("CUTEAFD_KACHE", "KACHE_", "CUTEAFD_SCCACHE", "SCCACHE_")) and key not in
            ("RUSTC_WRAPPER", "RUSTC_WORKSPACE_WRAPPER", "CC", "CXX",
             "CMAKE_C_COMPILER_LAUNCHER", "CMAKE_CXX_COMPILER_LAUNCHER", "CMAKE_CUDA_COMPILER_LAUNCHER")}
+
+
+def run_setup(tmp_path, extra=None, expression='env | sort'):
+    env = clean_env()
     env.update(extra or {})
     return subprocess.run(["bash", "-c", f'set -eu; source "{HELPER}"; '
                            'cuteafd_compiler_cache_setup "$1"; ' + expression,
@@ -247,7 +251,7 @@ def test_cmake_opt_out_clears_persisted_cache_launcher(tmp_path):
     (native / "CMakeCache.txt").write_text(f'CMAKE_C_COMPILER_LAUNCHER:STRING={HELPER}\n')
     result = subprocess.run(["bash", "-c", f'source "{HELPER}"; unset CUTEAFD_KACHE_MODE; '
                              'cuteafd_compiler_cache_cmake_args "$1"', "test", str(native)],
-                            text=True, capture_output=True, check=True)
+                            env=clean_env(), text=True, capture_output=True, check=True)
     assert result.stdout.splitlines() == ["-DCMAKE_C_COMPILER_LAUNCHER="]
 
 

@@ -111,6 +111,18 @@ impl Client {
         Ok(response.into_json()?)
     }
 
+    /// Ask this serving instance for its once-per-launch conditioning receipt.
+    pub(crate) fn warm_prelude(&self, tokens: u64) -> Result<Value> {
+        let response = self.authorize(self.agent.post(&format!("{}/v1/bench/prelude", self.base)))
+            .timeout(Duration::from_secs(900)).send_json(json!({"tokens":tokens}))
+            .context("timed benchmark requires this server's warm prelude endpoint")?;
+        let receipt: Value = response.into_json()?;
+        crate::prelude::validate(&receipt)?;
+        let status = self.get("/v1/bench/status")?;
+        anyhow::ensure!(status["server_instance"] == receipt["server_instance"], "warm prelude belongs to a different server instance");
+        Ok(receipt)
+    }
+
     /// The served model id and its `/v1/models` record; sets `self.model`.
     pub fn discover(&mut self) -> Result<Value> {
         let models = self.get("/v1/models")?;
@@ -379,6 +391,9 @@ impl Client {
         let usage = &chat.usage;
         let number = |v: &Value| v.as_u64().unwrap_or(0);
         chat.timing = StreamTiming {
+            opening: if chat.reasoning.is_empty() { &chat.content } else { &chat.reasoning }.chars().take(120).collect(),
+            tokens_per_cycle: None,
+            cycles_unavailable: Some("response has no exact per-request cycle counter; global deltas may overlap".into()),
             prompt_tokens: number(&usage["prompt_tokens"]),
             completion_tokens: number(&usage["completion_tokens"]),
             cached_tokens: usage.get("prompt_cache_hit_tokens").map(number)

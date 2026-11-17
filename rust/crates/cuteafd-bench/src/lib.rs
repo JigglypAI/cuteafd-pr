@@ -22,6 +22,7 @@ pub mod panels;
 pub mod panel_config;
 pub mod profiles;
 pub mod prefill;
+pub mod prelude;
 pub mod publish;
 pub mod quality;
 pub mod reference;

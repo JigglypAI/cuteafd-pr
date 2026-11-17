@@ -721,6 +721,8 @@ def binary_supports(binary, repo, job, needs):
                             capture_output=True, text=True, timeout=120)
     if result.returncode:
         raise ValueError(f"{binary} bench smoke --dry-run failed: {(result.stderr or result.stdout).strip().splitlines()[-1:]}")
+    if 'warm_prelude' in needs and 'warm_prelude=server-v1' not in result.stderr:
+        raise ValueError(f'{binary} lacks the server-owned warm prelude; build a current cuteafd and pass --binary before using hardware')
     missing = [field for field in needs if field + '=' not in result.stderr]
     if missing:
         raise ValueError(f"{binary} predates smoke fields {', '.join(missing)}; build cuteafd from this checkout and pass --binary")
@@ -993,12 +995,15 @@ def stopped_code():
 
 def detached(cmd, log, exit_file, env):
     # Shell remains in the detached group and writes a numeric status even if the
-    # CLI disappears. It ignores stop signals itself (smoke handles them), so it
-    # waits for smoke's teardown and still records smoke's exit status. The
+    # CLI disappears. It records stop signals but waits for smoke's teardown;
+    # even a child that exits zero after termination cannot publish success. The
     # parent's serving turn outlives this process and its container teardown.
     # setsid may fork when its caller is a process-group leader; --wait must
     # propagate the child status rather than report the successful fork.
-    script = 'trap : TERM INT HUP; "$@"; rc=$?; printf "%s\\n" "$rc" > "$CARD_EXIT"; exit "$rc"'
+    script = ('terminated=0; trap \'terminated=143\' TERM; trap \'terminated=130\' INT; '
+              'trap \'terminated=129\' HUP; "$@"; rc=$?; '
+              'if ((terminated)); then rc=$terminated; echo "terminated (exit $rc)" >&2; fi; '
+              'printf "%s\\n" "$rc" > "$CARD_EXIT"; exit "$rc"')
     with Path(log).open('w') as output:
         process = subprocess.Popen(['setsid', '--wait', 'bash', '-c', script, 'wip-card', *cmd], stdin=subprocess.DEVNULL, stdout=output, stderr=subprocess.STDOUT, env={**env, 'CARD_EXIT': str(exit_file)}, start_new_session=False)
     with _LIVE_LOCK:
@@ -3531,7 +3536,7 @@ def main():
                         save(Path(job['entry']['set']['PROFILE_DIR']) / 'observer-context.json', {'pending': True})
         if kept:
             print(f'wip-cards: resume keeps {len(kept)} passed job(s), reruns {len(jobs) - len(kept)}', file=sys.stderr)
-    fields = ['fabric'] + (['levels', 'post_load_c1'] + (['post_load_repeat'] if args.post_load_repeat else []) if args.levels else []) + (['prefill_lengths'] if prefill_lengths else []) + \
+    fields = ['fabric', 'warm_prelude'] + (['levels', 'post_load_c1'] + (['post_load_repeat'] if args.post_load_repeat else []) if args.levels else []) + (['prefill_lengths'] if prefill_lengths else []) + \
         (['prefill_repeat'] if args.prefill_repeat else []) + \
         (['prefill_idle_seconds'] if args.prefill_idle_seconds is not None else []) + \
         (['prefill_purge'] if any(job['entry'].get('prefill_purge') for job in jobs) else []) + \
