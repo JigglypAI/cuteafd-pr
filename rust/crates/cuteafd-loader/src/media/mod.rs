@@ -121,7 +121,7 @@ pub struct PreparedImage {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct EncoderId(pub [u8; 32]);
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct PreprocessId(pub [u8; 32]);
 fn field(hash: &mut Sha256, bytes: &[u8]) {
     hash.update((bytes.len() as u64).to_le_bytes());
@@ -161,6 +161,18 @@ pub enum ImageFamily {
     Mistral,
     Inkling2,
     Step5,
+    Kimi,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FamilyProcessor {
+    #[default]
+    None,
+    Kimi(kimi::KimiProcessor),
+}
+impl FamilyProcessor {
+    fn is_none(&self) -> bool { matches!(self,Self::None) }
 }
 /// Reference processor parameters; all identity-affecting choices live here.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -178,6 +190,8 @@ pub struct ProcessorConfig {
     pub max_pixels: u64,
     pub max_image_tokens: usize,
     pub decode: DecodePolicy,
+    #[serde(default, skip_serializing_if = "FamilyProcessor::is_none")]
+    pub family_processor: FamilyProcessor,
 }
 /// Largest Qwen merged image admitted by the calibrated BF16 tower.
 pub const QWEN_MAX_IMAGE_TOKENS: usize = 1024;
@@ -206,13 +220,14 @@ impl ProcessorConfig {
             ImageFamily::Mistral => (14, 1, MISTRAL_LONGEST_EDGE, CLIP_MEAN, CLIP_STD),
             ImageFamily::Inkling2 => (20, 1, 64 << 20, CLIP_MEAN, CLIP_STD),
             ImageFamily::Step5 => (14, 1, 3024 * 3024, CLIP_MEAN, CLIP_STD),
+            ImageFamily::Kimi => (14, 1, crate::families::kimi_k3::vision::MAX_IMAGE_CANVAS_PIXELS, [0.5;3], [0.5;3]),
         };
         Self {
             resample: match family {ImageFamily::Muse=>Resample::Lanczos,ImageFamily::Step5=>Resample::Bilinear,_=>Resample::Bicubic},
             family,
             patch,
             merge: if family==ImageFamily::Step5 {4} else {2},
-            temporal: 2,
+            temporal: if family==ImageFamily::Kimi {1} else {2},
             mean,
             std,
             min_pixels,
@@ -220,14 +235,24 @@ impl ProcessorConfig {
             max_image_tokens: match family {
                 ImageFamily::Qwen => QWEN_MAX_IMAGE_TOKENS,
                 ImageFamily::Mistral => MISTRAL_MAX_IMAGE_TOKENS,
+                ImageFamily::Kimi => crate::families::kimi_k3::vision::MAX_IMAGE_TOKENS as usize,
                 _ => 4096,
             },
             decode: DecodePolicy::default(),
+            family_processor: FamilyProcessor::None,
         }
     }
     /// HF AutoProcessor reads preprocessor_config.json. It takes precedence
     /// over MiMo config.json's conflicting embedded processor_config (D3).
     pub fn from_snapshot(snapshot: &Path, family: ImageFamily) -> Result<Self> {
+        if family==ImageFamily::Kimi {
+            let cfg=crate::read_json_file(&snapshot.join("config.json")).map_err(|e| MediaError::Config(e.to_string()))?;
+            crate::families::kimi_k3::vision::VisionContract::from_config(&cfg).map_err(|e| MediaError::Config(e.to_string()))?;
+            let mut config=Self::for_family(family);
+            config.family_processor=FamilyProcessor::Kimi(kimi::KimiProcessor::from_snapshot(snapshot)?);
+            config.validate()?;
+            return Ok(config);
+        }
         if matches!(family,ImageFamily::Inkling2|ImageFamily::Step5) {
             let cfg:serde_json::Value=crate::read_json_file(&snapshot.join("config.json"))
                 .map_err(|e| MediaError::Config(e.to_string()))?;
@@ -376,11 +401,16 @@ impl ProcessorConfig {
         config
     }
     pub fn validate(&self) -> Result<()> {
+        match (&self.family_processor,self.family) {
+            (FamilyProcessor::Kimi(processor),ImageFamily::Kimi)=>processor.validate()?,
+            (FamilyProcessor::None,family) if family!=ImageFamily::Kimi=>{},
+            _=>return Err(MediaError::Config("family processor variant differs from image family".into())),
+        }
         if self.patch == 0
             || self.merge == 0
-            || self.temporal != 2
+            || self.temporal != if self.family==ImageFamily::Kimi {1} else {2}
             || self.max_image_tokens == 0
-            || self.max_image_tokens > 16_384
+            || self.max_image_tokens > if self.family==ImageFamily::Kimi {crate::families::kimi_k3::vision::MAX_IMAGE_TOKENS as usize} else {16_384}
             || self.patch > 64
             || self.merge > 8
             || self.min_pixels == 0
@@ -397,6 +427,14 @@ impl ProcessorConfig {
             if self.patch!=expected.patch || self.merge!=expected.merge || self.temporal!=expected.temporal
                 || self.mean!=expected.mean || self.std!=expected.std || self.resample!=expected.resample {
                 return Err(MediaError::Config("PE processor numerics differ from pinned bundled class".into()));
+            }
+            return Ok(());
+        }
+        if self.family==ImageFamily::Kimi {
+            let expected=Self::for_family(ImageFamily::Kimi);
+            if self.patch!=expected.patch || self.merge!=expected.merge || self.mean!=expected.mean
+                || self.std!=expected.std || self.resample!=expected.resample {
+                return Err(MediaError::Config("Kimi processor numerics differ from bundled class".into()));
             }
             return Ok(());
         }
@@ -472,6 +510,7 @@ impl ProcessorConfig {
     /// itself instead, before calling the checked group expansion.
     pub fn assemble_group_prompt(&self,group:&mut PreparedImageGroup,layout:&ImagePromptLayout) -> Result<()> {
         if self.family==ImageFamily::Step5 {return step5::assemble_group_prompt(group,layout);}
+        if self.family==ImageFamily::Kimi {return Err(invalid("Kimi source dimensions require family-assembled prompt fragments"));}
         let ImagePromptLayout::Single {placeholder}=layout else {return Err(invalid("single-view processor needs a single prompt layout"));};
         if group.images.len()!=1 {return Err(invalid("single-view prompt needs exactly one prepared job"));}
         group.fragments=vec![ImageFragment::Features {image:0,placeholder:*placeholder}];
@@ -485,7 +524,11 @@ impl ProcessorConfig {
             ));
         }
         let factor = self.patch * self.merge;
-        if self.family == ImageFamily::Muse {
+        if self.family==ImageFamily::Kimi {
+            let FamilyProcessor::Kimi(processor)=&self.family_processor else {unreachable!("validated Kimi variant")};
+            let (_,canvas)=processor.geometry(width,height)?;
+            Ok((canvas[1],canvas[0]))
+        } else if self.family == ImageFamily::Muse {
             muse::resize_shape(height, width, factor, self.effective_max() as u32)
                 .ok_or_else(|| invalid("Muse resize dimensions overflow"))
         } else if self.family == ImageFamily::Mistral {
@@ -581,6 +624,14 @@ impl ImageProcessor for ProcessorConfig {
         self
     }
     fn prepare_pixels(&self,image:DecodedPixels,encoder:EncoderId) -> Result<PreparedImage> {
+        if self.family==ImageFamily::Kimi {
+            self.validate()?;
+            let FamilyProcessor::Kimi(processor)=&self.family_processor else {unreachable!("validated Kimi variant")};
+            let mut prepared=processor.prepare(image,encoder,self.max_image_tokens)?;
+            prepared.processor=self.id();
+            prepared.key=PreparedImage::key_for_pixels(encoder,prepared.processor,prepared.grid,&prepared.rgb8,prepared.pixels)?;
+            return Ok(prepared);
+        }
         if self.family==ImageFamily::Inkling2 {
             self.validate()?;
             let mut prepared=inkling::prepare(image,encoder,self.max_image_tokens)?;
@@ -592,7 +643,7 @@ impl ImageProcessor for ProcessorConfig {
         self.prepare_rgb(image.into_rgb(self.decode.alpha),encoder)
     }
     fn prepare_rgb(&self, image: RgbImage, encoder: EncoderId) -> Result<PreparedImage> {
-        if self.family==ImageFamily::Inkling2 {return self.prepare_pixels(DecodedPixels::Rgb(image),encoder);}
+        if matches!(self.family,ImageFamily::Inkling2|ImageFamily::Kimi) {return self.prepare_pixels(DecodedPixels::Rgb(image),encoder);}
         if self.family==ImageFamily::Step5 {return Err(invalid("Step images need grouped local/global preparation"));}
         let (height, width) = self.resize_shape(image.height, image.width)?;
         if image.data.len() != image.width as usize * image.height as usize * 3 {

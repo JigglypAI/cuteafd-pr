@@ -7,7 +7,7 @@ use super::{
 use sha2::{Digest, Sha256};
 use std::path::Path;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct KimiProcessor {
     patch: u32,
     merge: u32,
@@ -59,6 +59,13 @@ impl KimiProcessor {
             checkerboard,
             identity,
         })
+    }
+
+    pub(super) fn validate(&self) -> Result<()> {
+        if (self.patch,self.merge,self.patch_limit,self.side_limit)!=(14,2,65536,512) {
+            return Err(MediaError::Config("unsupported typed Kimi processor geometry".into()));
+        }
+        self.checkerboard.validate_rounding(BlendRounding::Float32Truncate)
     }
 
     /// Width,height returned separately for valid content and padded canvas.
@@ -310,6 +317,32 @@ mod tests {
         let data=vec![37;7069*1833*3];
         assert!(p.prepare(DecodedPixels::Rgb(RgbImage {width:7069,height:1833,data}),
             EncoderId([1;32]),MAX_IMAGE_TOKENS as usize-1).is_err());
+    }
+    #[test]
+    fn typed_registration_preserves_checkpoint_checkerboard_and_group_split() {
+        use crate::media::{FamilyProcessor,ImageFamily,ImagePromptLayout,ProcessorConfig,PreparedImageGroup,ImageFragment};
+        let processor=KimiProcessor::from_config(&config()).unwrap();
+        let mut registered=ProcessorConfig::for_family(ImageFamily::Kimi);
+        assert!(registered.validate().is_err());
+        registered.family_processor=FamilyProcessor::Kimi(processor.clone());
+        registered.validate().unwrap();
+        let encoded=serde_json::to_vec(&registered).unwrap();
+        let restored:ProcessorConfig=serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(restored,registered);
+        let encoder=EncoderId([7;32]);
+        let pixels=DecodedPixels::Rgba {width:17,height:13,data:vec![127;17*13*4]};
+        let direct=processor.prepare(pixels.clone(),encoder,16698).unwrap();
+        let mut group=registered.prepare_group(pixels,encoder).unwrap();
+        assert_eq!(&*group.images[0].rgb8,&*direct.rgb8);
+        assert_eq!(group.source,[17,13]);assert!(group.fragments.is_empty());
+        assert!(registered.assemble_group_prompt(&mut group,&ImagePromptLayout::Single {placeholder:163605}).is_err());
+        group.fragments=vec![ImageFragment::Tokens(vec![1,2]),ImageFragment::Features {image:0,placeholder:163605}];
+        let expanded=PreparedImageGroup::expand_prompt(&[3,163605,4],163605,&[group],164000,100).unwrap();
+        assert_eq!(expanded.media.len(),1);
+        let mut different=config();different["media_proc_cfg"]["transparent_bg_config"]["chessboard_gray_value"]=179.into();
+        let mut other=registered.clone();other.family_processor=FamilyProcessor::Kimi(KimiProcessor::from_config(&different).unwrap());
+        assert_ne!(other.id(),registered.id());
+        let mut mismatch=registered.clone();mismatch.family=ImageFamily::Mimo;assert!(mismatch.validate().is_err());
     }
     #[test]
     fn config_numerics_and_identity_are_explicit() {

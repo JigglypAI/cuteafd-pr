@@ -266,6 +266,8 @@ impl TowerSpec {
             Some("glm5_next") => Self::glm_flash(snapshot, max_tokens),
             Some("muse_spark") => Self::muse(snapshot, max_tokens),
             Some("inkling2"|"step5_vl") => Self::perception(snapshot,max_tokens),
+            Some("kimi_k3"|"kimi_k31") => crate::families::kimi_k3::vision::tower(snapshot,max_tokens)
+                .map_err(|error| VisionError::Unsupported(error.to_string())),
             // `max_tokens` counts the LM span; the tower's capacity is its merged [IMG] rows.
             Some("mistral_large4") => Self::mistral_large4(snapshot, mistral::merged_capacity(max_tokens)),
             kind => Err(VisionError::Unsupported(format!("tower model_type {kind:?}; add a tower exporter/kernel"))),
@@ -275,6 +277,9 @@ impl TowerSpec {
     pub fn row_markers(&self) -> u32 { u32::from(self.native.reserved == mistral::RESERVED) }
     pub fn image_family(&self) -> cuteafd_loader::media::ImageFamily {
         use cuteafd_loader::media::ImageFamily;
+        if self.native.tower.as_ref().is_some_and(|tower| tower.temporal_patch==1) {
+            return ImageFamily::Kimi;
+        }
         match self.native.reserved {
             2 => ImageFamily::Qwen,
             3 => ImageFamily::GlmFlash,
@@ -406,6 +411,7 @@ impl TowerSpec {
             cuteafd_loader::media::ImageFamily::Mistral => "mistral_large4",
             cuteafd_loader::media::ImageFamily::Inkling2 => "inkling2",
             cuteafd_loader::media::ImageFamily::Step5 => "step5",
+            cuteafd_loader::media::ImageFamily::Kimi => "kimi_k3",
         };
         let numerics = if self.image_family() == cuteafd_loader::media::ImageFamily::Muse {
             headers.insert("feature_norm_eps".into(), serde_json::json!(self.native.norm_eps.to_bits()));
