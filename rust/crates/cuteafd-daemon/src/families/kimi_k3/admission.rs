@@ -815,6 +815,7 @@ pub(crate) fn admit<'a, const RANKS: usize>(mut inputs: Inputs<'_, RANKS>) -> Re
     let context = inputs.context.clone();
     let prefix_args = inputs.prefix;
     let expert_usage = inputs.expert_usage;
+    let vision=inputs.vision.take();
     let mut request = request(inputs)?;
     if let Some(layout) = &draft {
         for demand in layout.window_mark_demands((RANKS-1) as u8)? {
@@ -985,7 +986,7 @@ pub(crate) fn admit<'a, const RANKS: usize>(mut inputs: Inputs<'_, RANKS>) -> Re
     let mut host_budget = kimi::host_budget(host_total, host_available);
     host_budget.headroom = host_budget.headroom.max(prefix_args.map_or(0, |args| args.host_cache_headroom_bytes));
     budgets.push(host_budget);
-    if let Some((inventory,mode,copies,cache))=&inputs.vision {
+    if let Some((inventory,mode,copies,cache))=&vision {
         let hardware=cuteafd_loader::plan::encoder::EncoderHardware {v41:false,
             gpus:cards.iter().map(|(_,bytes)|cuteafd_loader::plan::encoder::EncoderGpuBudget {free_bytes:*bytes,kv_target_bytes:0}).collect(),
             sparks:sparks.iter().enumerate().map(|(rank,&bytes)|cuteafd_loader::plan::encoder::EncoderSparkBudget {
