@@ -939,7 +939,7 @@ pub fn solve_prepared(
     }
     // KV target, min and max (`cuteafd_core::memory_policy`). The layout is
     // searched at the target; an automatic pool then grows to the max.
-    // The logical cap picks the card class, including 5090 simulations on PRO.
+    // The target is uniform, including 5090 simulations on PRO.
     // The prepared policy is the only source of target/min/max semantics.
     let aligned = |tokens: u64| tokens.div_ceil(page).div_ceil(multiple).checked_mul(multiple)
         .ok_or(Refusal::Overflow("target pool pages"));

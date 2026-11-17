@@ -348,6 +348,21 @@ mod tests {
     }
 
     #[test]
+    fn unadmitted_layout_renders_requested_bounds_without_pool_geometry() {
+        use cuteafd_core::memory_layout::{DeviceKind, DeviceLayout, MemoryLayout};
+        let layout = MemoryLayout { devices: vec![DeviceLayout { kind: DeviceKind::Rtx,
+            index: 0, capacity_bytes: 32 << 30, worker_budget_bytes: 0, kv_tokens: 0,
+            items: vec![] }], pool_tokens: 0, waste: vec![], notes: vec!["original refusal".into()] };
+        let lines = MemoryPolicy::default().scoped(|| report_layout_lines(&layout, "fixture", &[32 << 30],
+            None, super::super::planner::Context::automatic(262_144), None, None)).unwrap();
+        assert!(lines[0].contains("KV target 2097152 min 262144 max unbounded, pool 0 tokens"));
+        let pinned = MemoryPolicy::default().scoped(|| report_layout_lines(&layout, "fixture", &[32 << 30],
+            None, super::super::planner::Context::automatic(262_144), Some(65_537), Some(3 << 20))).unwrap();
+        assert!(pinned[0].contains("KV target 3145728 min 65537 max 65537, pool 0 tokens"));
+        assert_eq!(layout.notes, ["original refusal"]);
+    }
+
+    #[test]
     fn layout_lines_show_computed_graph_padding_inside_each_owner() {
         use cuteafd_core::memory_layout::{Basis, Category, DeviceKind as Kind, DeviceLayout, Item, MemoryLayout};
         let layout = MemoryLayout { devices: vec![DeviceLayout { kind: Kind::Rtx, index: 0,

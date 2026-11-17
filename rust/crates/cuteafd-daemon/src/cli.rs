@@ -68,13 +68,13 @@ pub(crate) struct MemoryArgs {
     /// Graph node/executable padding: percentage (default 2.5%), bytes per coefficient, or rtx=VALUE,spark=VALUE; independent of GPU_RESERVE.
     #[arg(long, global = true)]
     pub(crate) graph_node_padding: Option<cuteafd_core::memory_policy::GraphNodePadding>,
-    /// KV tokens the layout is sized for (default 2M; 1M on cards of 32 GiB or less).
+    /// KV tokens the layout is sized for (default 2M on every card).
     #[arg(long, global = true)]
     pub(crate) kv_target_tokens: Option<u64>,
     /// Refuse the launch below this many KV tokens (default: min(256K, model context)).
     #[arg(long, global = true)]
     pub(crate) kv_min_tokens: Option<u64>,
-    /// Grow the pool into memory left after the layout is fixed, up to this (default: the target).
+    /// Cap pool growth after the layout is fixed (default: all remaining memory).
     #[arg(long, global = true)]
     pub(crate) kv_max_tokens: Option<u64>,
 }

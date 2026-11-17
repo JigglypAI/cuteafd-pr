@@ -4432,7 +4432,9 @@ fn glm5_flash_layout_moves_shared_replay_records_into_the_prefill_scratch() {
         assert_eq!(item(&path, false, fixed, Category::Kv, "state") - item(&path, true, fixed, Category::Kv, "state"), records);
         assert_eq!(item(&path, false, fixed, Category::Workspace, "steps"), item(&path, true, fixed, Category::Workspace, "steps"));
     }
-    assert_eq!(report(&path, true, None).memory_layout.unwrap().pool_tokens, 1_048_576);
+    let automatic = report(&path, true, None);
+    assert_eq!(automatic.phase_ledger.as_ref().unwrap().pool_policy.unwrap().target(), 2 << 20);
+    assert!(automatic.memory_layout.unwrap().pool_tokens >= 2 << 20);
     assert_eq!(report(&path, true, None).replay_records, Some("shared"));
     assert_eq!(report(&path, false, None).replay_records, Some("own"));
     let auto_report = |placement: ExpertPlacement, pool: Option<u64>, onboard: Option<crate::placement::OnboardSetting>| {

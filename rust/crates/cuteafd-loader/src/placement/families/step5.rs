@@ -169,7 +169,7 @@ mod physical_pool_tests {
             for bytes in [32u64 << 30, 96 << 30, 192 << 30] {
                 let cards = [bytes * 2];
                 let pool = crate::placement::prepare_pool(crate::plan::testing::pool_facts(
-                    &cards, Context::automatic(262_144), None, PAGE_ROWS, &[minimum]))?;
+                    &cards, crate::placement::planner::Context::automatic(262_144), None, PAGE_ROWS, &[minimum]))?;
                 for cache in [&whole, &split] {
                     let recipe = NativeRecords { units: cache.geometry.ranks.iter()
                         .map(|rank| rank.persistent_unit_bytes).collect(),
@@ -178,7 +178,7 @@ mod physical_pool_tests {
                         locations: vec![Location::coordinator(rank)], physical_bytes: bytes, logical_bytes: bytes,
                         baseline: Baseline::Forecast { occupied: 0, source: "simulated native records".into(), assumed: false },
                         headroom: 0 }).collect();
-                    let request = Request { context: Context::automatic(262_144), pool: Pin::Auto, onboard: Pin::Auto,
+                    let request = Request { context: crate::placement::planner::Context::automatic(262_144), pool: Pin::Auto, onboard: Pin::Auto,
                         prefill: Pin::Auto, spark_reply_formats: Default::default(), operation: Operation::Serving,
                         resident_weight_limit: None };
                     let solved = solve(request, budgets, &recipe)?;

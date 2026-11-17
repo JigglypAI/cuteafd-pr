@@ -652,13 +652,13 @@ fn installed_flash_exlr8_automatic_tp2_plan(ranks: &str) -> serde_json::Value {
 
 #[test]
 #[ignore = "requires CUTEAFD_EXLR8_FLASH_SNAPSHOT and current CUTEAFD_DEPLOYMENT_TEST_PROGRAMS"]
-fn installed_flash_exlr8_automatic_zero_spark_pool_stops_at_2m() {
+fn installed_flash_exlr8_automatic_zero_spark_pool_grows_past_target() {
     let deployment = installed_flash_exlr8_automatic_tp2_plan("0");
     let devices = deployment["memory_layout"]["devices"].as_array().unwrap();
     assert_eq!(devices.len(), 2);
     for device in devices {
-        assert_eq!(device["kv_tokens"], 2_097_152,
-            "automatic zero-Spark pool must stop at its 2M target when capacity permits");
+        assert!(device["kv_tokens"].as_u64().unwrap() >= 2_097_152,
+            "automatic zero-Spark pool grows into admitted remaining memory");
     }
 }
 
@@ -688,7 +688,7 @@ fn installed_flash_exlr8_automatic_tp2_max_is_zero_spark_and_launchable() {
         for (rank, device) in devices.iter().enumerate() {
             assert_eq!(device["kind"], "rtx");
             assert_eq!(device["index"], rank);
-            assert_eq!(device["kv_tokens"], 2_097_152);
+            assert!(device["kv_tokens"].as_u64().unwrap() >= 2_097_152);
             let items = device["items"].as_array().unwrap();
             let routed = items.iter().find(|item| item["group"] == "RTX expert arena")
                 .expect("the selected routed expert backing must be charged on each RTX");
