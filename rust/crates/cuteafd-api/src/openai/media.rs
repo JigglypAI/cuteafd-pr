@@ -132,11 +132,11 @@ pub struct PreparedMedia {
     pub decode_misses: usize,
     pub image_tokens: usize,
 }
-static PREPARATION_POLICY: std::sync::OnceLock<(usize, ImageUrlFetch)> = std::sync::OnceLock::new();
+static PREPARATION_POLICY: std::sync::OnceLock<(Option<usize>, ImageUrlFetch)> = std::sync::OnceLock::new();
 /// Startup-only generic-family policy; V4.1 keeps its established limits.
-pub fn set_preparation_policy(max_image_tokens: usize, fetch: ImageUrlFetch) -> Result<()> {
+pub fn set_preparation_policy(max_image_tokens: Option<usize>, fetch: ImageUrlFetch) -> Result<()> {
     ensure!(
-        (1..=16_384).contains(&max_image_tokens),
+        max_image_tokens.is_none_or(|cap| (1..=16_384).contains(&cap)),
         "max image tokens must be 1 through 16384"
     );
     PREPARATION_POLICY
@@ -165,7 +165,7 @@ impl MediaPreparer {
     ) -> Result<Self> {
         let policy = PREPARATION_POLICY.get().copied();
         let fetch = policy.map_or(ImageUrlFetch::Public, |(_,fetch)| fetch);
-        config.max_image_tokens = config.resolved_span_cap(policy.map(|(cap,_)| cap))?;
+        config.max_image_tokens = config.resolved_span_cap(policy.and_then(|(cap,_)| cap))?;
         Self::new(config, encoder, fetch, slots)
     }
     pub fn new(
