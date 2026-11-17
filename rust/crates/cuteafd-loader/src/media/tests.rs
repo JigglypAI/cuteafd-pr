@@ -440,6 +440,23 @@ fn mistral_expansion_refuses_bare_markers_and_mismatched_spans() {
 }
 
 #[test]
+fn every_family_resolves_default_and_explicit_span_without_raising_ceiling() {
+    for (family,default,ceiling) in [
+        (ImageFamily::Mimo,4096,None),(ImageFamily::Qwen,1024,Some(1024)),
+        (ImageFamily::GlmFlash,4096,None),(ImageFamily::Muse,4096,None),
+        (ImageFamily::Mistral,3080,Some(3080)),(ImageFamily::Inkling2,4096,None),
+        (ImageFamily::Step5,4096,None),(ImageFamily::MiniMax,576,Some(576)),
+        (ImageFamily::Kimi,16698,Some(16698))] {
+        let config=ProcessorConfig::for_family(family);
+        assert_eq!(config.resolved_span_cap(None).unwrap(),default);
+        assert_eq!(config.architectural_span_ceiling(),ceiling);
+        assert_eq!(config.resolved_span_cap(Some(64)).unwrap(),64);
+        assert_eq!(config.resolved_span_cap(Some(20000)).unwrap(),ceiling.unwrap_or(20000));
+        assert!(config.resolved_span_cap(Some(0)).is_err());
+    }
+}
+
+#[test]
 fn pe_normalization_identity_keys_both_inkling_round_boundaries() {
     let inkling=ProcessorConfig::for_family(ImageFamily::Inkling2);
     let parameters=inkling.normalization_parameters();

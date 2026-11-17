@@ -132,11 +132,11 @@ pub struct PreparedMedia {
     pub decode_misses: usize,
     pub image_tokens: usize,
 }
-static PREPARATION_POLICY: std::sync::OnceLock<(usize, ImageUrlFetch)> = std::sync::OnceLock::new();
+static PREPARATION_POLICY: std::sync::OnceLock<(Option<usize>, ImageUrlFetch)> = std::sync::OnceLock::new();
 /// Startup-only generic-family policy; V4.1 keeps its established limits.
-pub fn set_preparation_policy(max_image_tokens: usize, fetch: ImageUrlFetch) -> Result<()> {
+pub fn set_preparation_policy(max_image_tokens: Option<usize>, fetch: ImageUrlFetch) -> Result<()> {
     ensure!(
-        (1..=16_384).contains(&max_image_tokens),
+        max_image_tokens.is_none_or(|cap| (1..=16_384).contains(&cap)),
         "max image tokens must be 1 through 16384"
     );
     PREPARATION_POLICY
@@ -163,16 +163,9 @@ impl MediaPreparer {
         encoder: EncoderId,
         slots: usize,
     ) -> Result<Self> {
-        let (cap, fetch) = PREPARATION_POLICY
-            .get()
-            .copied()
-            .unwrap_or((4096, ImageUrlFetch::Public));
-        config.max_image_tokens = match config.family {
-            cuteafd_loader::media::ImageFamily::Qwen => cap.min(cuteafd_loader::media::QWEN_MAX_IMAGE_TOKENS),
-            // Mistral's span cap follows the checkpoint's longest edge; the policy only lowers it.
-            cuteafd_loader::media::ImageFamily::Mistral => cap.min(config.max_image_tokens),
-            _ => cap,
-        };
+        let policy = PREPARATION_POLICY.get().copied();
+        let fetch = policy.map_or(ImageUrlFetch::Public, |(_,fetch)| fetch);
+        config.max_image_tokens = config.resolved_span_cap(policy.and_then(|(cap,_)| cap))?;
         Self::new(config, encoder, fetch, slots)
     }
     pub fn new(
