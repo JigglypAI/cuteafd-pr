@@ -400,9 +400,11 @@ mod tests {
         })?;
         assert_eq!((fallback.resume, cache.stats().restore_failures, builds.get()), (0, 1, 2));
         assert_eq!((fallback.placement.len, fallback.placement.state_len), (0, 0));
-        let mut state = vec![0; bank.layout.sequence_bytes];
-        library.copy_d2h(&mut state, bank.rings_for_sequence(1)?)?;
-        assert!(state.iter().all(|&byte| byte == 0), "cold bind must reset the abandoned slot");
+        for buffer in [bank.rings_for_sequence(1)?, bank.conv_for_sequence(1)?] {
+            let mut state = vec![0; buffer.bytes];
+            library.copy_d2h(&mut state, buffer)?;
+            assert!(state.iter().all(|&byte| byte == 0), "cold bind must reset the abandoned slot");
+        }
 
         let mut cold = cache.admit_cold(&family, tokens.len(), 128,
             |units| Placement { media: None, units, slot: 2, len: 0, state_len: 0 })?;
@@ -448,8 +450,9 @@ mod tests {
                     rows * row_bytes)?, &bytes)?;
             }
         }
-        library.copy_h2d(bank.rings_for_sequence(placement.slot)?, &vec![seed.wrapping_add(0x9d);
-            bank.layout.sequence_bytes])?;
+        for buffer in [bank.rings_for_sequence(placement.slot)?, bank.conv_for_sequence(placement.slot)?] {
+            library.copy_h2d(buffer, &vec![seed.wrapping_add(0x9d); buffer.bytes])?;
+        }
         placement.len = tokens.len();
         placement.state_len = tokens.len();
         Ok(())

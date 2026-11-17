@@ -195,16 +195,17 @@ pub(crate) fn run(args:&mut GoldenArgs)->Result<()>{
     let library=Arc::new(unsafe{cuteafd_ffi::NativeLibrary::load(&args.native_lib)?});
     library.cuda_set_device(args.device)?;
     let programs=library.programs()?.with_manifest(&args.manifest)?;
-    let (mut execution,inputs,admitted,_)=super::startup::whole(&library,&programs,&view,&checkpoint,&cfg,super::startup::Options{
+    let vision=crate::shared::vision::still::Options { vision:cuteafd_loader::plan::MediaMode::Off,..Default::default() };
+    let (mut execution,inputs,admitted,_,_media)=super::startup::whole(&library,&programs,&view,&checkpoint,&cfg,super::startup::Options{
         device:args.device,peers:&args.peers,manifest:&args.manifest,native_lib:&args.native_lib,
         prefill:PrefillShape{rows:args.prefill_rows as u64,waves:args.prefill_waves},sequences:args.max_sequences as u64,
         context_tokens:0,pool_tokens:args.pool_tokens,kv_format:args.kv_format,drafter:Some(args.draft_kv_cache),
         onboard:args.rtx_expert_layers.resolve(cfg.layers),prefix:&args.prefix,
-        resident_weights:crate::shared::memory::budget::resident_weight_limit(),expert_usage:false})?;
+        resident_weights:crate::shared::memory::budget::resident_weight_limit(),expert_usage:false,vision:&vision})?;
     ensure!(inputs.prefix_mark_slots>0,"width oracle has no admitted target mark");
     let bank=execution.requests.cache.clone();bank.reset(0)?;
     execution.draft.as_ref().unwrap().drafter.reset_context(0,0)?;
-    let mut placement=Placement{units:(0..(args.prefill+maximum+usize::from(args.commit_invariance)).div_ceil(64)).map(|page|page as u32).collect(),slot:0,len:0,state_len:0};
+    let mut placement=Placement{media:None,units:(0..(args.prefill+maximum+usize::from(args.commit_invariance)).div_ceil(64)).map(|page|page as u32).collect(),slot:0,len:0,state_len:0};
     ensure!(placement.units.len()<=bank.layout.pool_pages,"width oracle prefix exceeds admitted target pages");
     execution.draft.as_ref().unwrap().drafter.admit_pages(0,args.prefill+maximum)?;
     let mut units=crate::shared::prefill_pipeline::sequence_units(args.prefill,args.prefill_rows,args.prefill_waves as usize,cfg.layers)?;

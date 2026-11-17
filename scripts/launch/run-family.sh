@@ -1685,7 +1685,7 @@ if [[ "$split" != off ]]; then
 fi
 if [[ "$family" == inkling2 ]]; then
   [[ "$rtx_gpus" != 2 && "$split" != heads && "$explicit_coordinator_gpus" != *,* ]] ||
-    release_die "Inkling serving requires one coordinator GPU; multi-GPU execution is not implemented"
+    release_die "Inkling serving requires one coordinator GPU; multi-GPU target and bundled drafter execution are not implemented (#2316)"
   coordinator_gpu_count=1
 fi
 release_resolve_coordinator_gpus "$explicit_coordinator_gpus" "$coordinator_gpu_count"
