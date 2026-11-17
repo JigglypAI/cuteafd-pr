@@ -992,6 +992,8 @@ fn assert_pool_max_growth(input: &PlanInput, options: &PlanOptions) {
     let pool = |report: &PlanReport| report.memory_layout.as_ref().unwrap().pool_tokens;
     assert!(pool(&grown) > pool(&capped), "{}: {} -> {}", default.family.as_deref().unwrap(), pool(&capped), pool(&grown));
     assert!(pool(&grown) <= 100_000_000);
+    println!("{}: KV {} -> {}, onboarding {:?} -> {:?}", default.family.as_deref().unwrap(),
+        pool(&capped), pool(&grown), capped.onboard_layers, grown.onboard_layers);
     let mut exact = options.clone();
     exact.layout.as_mut().unwrap().pool_tokens = Some(pool(&capped));
     let pinned = MemoryPolicy { kv_max: Some(100_000_000), ..Default::default() }
@@ -1026,6 +1028,8 @@ fn pool_max_grows_after_onboarding_in_every_family_planner() {
     testing::install_step5_exl3_rtx_package(&manifest);
     let mut options = wave_plan_options(dir.path(), 3);
     options.draft_ownership = Some(spec::DraftOwnership::None);
+    options.layout.as_mut().unwrap().rtx_bytes = vec![crate::placement::inventory::PRO_TOTAL_BYTES; 2];
+    options.layout.as_mut().unwrap().prefix_slots = None;
     options.layout.as_mut().unwrap().pool_tokens = None;
     options.layout.as_mut().unwrap().workspace_manifest = Some(manifest);
     assert_pool_max_growth(&PlanInput::open(dir.path()).unwrap(), &options);
