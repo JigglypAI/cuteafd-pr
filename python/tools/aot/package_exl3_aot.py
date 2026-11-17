@@ -974,10 +974,13 @@ def tile_overrides(values: list[str], capacities: list[int], role: str,
     return result
 
 
-def init_variant_worker():
+def init_variant_worker(reservations=None):
     """Once per long-lived worker: its own session (so a failure can kill the
     compilers it started) and the reservation its one CUDA context takes."""
     os.setsid()
+    if reservations is not None:
+        from _export_jobs import claim_context_reservation
+        claim_context_reservation(reservations.get(timeout=30))
     os.environ['CUTEAFD_EXPORT_WORKER_RAM_MIB'] = '4096'
     os.environ['CUTEAFD_EXPORT_WORKER_GPU_MIB'] = '2688'
 
@@ -1025,12 +1028,26 @@ def compile_variant(payload):
 
 def compile_variants(payloads, jobs):
     """Observe failures in completion order, assemble successes in input order."""
+    from _export_jobs import reserve_context_pool
+    context = multiprocessing.get_context('spawn')
+    with reserve_context_pool(min(jobs, len(payloads))) as paths:
+        reservations = context.Queue()
+        try:
+            for path in paths:
+                reservations.put(path)
+            return _compile_variants(payloads, len(paths), context, reservations)
+        finally:
+            reservations.close()
+            reservations.join_thread()
+
+
+def _compile_variants(payloads, jobs, context, reservations):
     # Workers live for the whole package and reuse one CUDA context across
     # variants: a context per variant meant 24-30 create/destroy cycles per
     # package, and GB10 context creation fails (NV_ERR_NO_MEMORY) under the
     # build's own load. Each variant still frees its tensors and cache.
-    pool = ProcessPoolExecutor(max_workers=jobs, mp_context=multiprocessing.get_context('spawn'),
-                               initializer=init_variant_worker)
+    pool = ProcessPoolExecutor(max_workers=jobs, mp_context=context,
+                               initializer=init_variant_worker, initargs=(reservations,))
     try:
         futures = {pool.submit(compile_variant, payload): index for index, payload in enumerate(payloads)}
         results = [None] * len(payloads)
