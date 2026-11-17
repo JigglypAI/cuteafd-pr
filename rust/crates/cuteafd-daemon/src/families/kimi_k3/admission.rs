@@ -2096,6 +2096,7 @@ pub(super) mod tests {
         let rows = unit * waves;
         let spark_bytes = 110 << 30;
         let options = PlanOptions {
+            vision: cuteafd_loader::plan::MediaMode::Off,
             placement: ExpertPlacement::Sparks { ranks: 6 }, coordinator_budget_bytes: capacity,
             layout: Some(LayoutOptions { host_memory: Some(cuteafd_loader::plan::testing::SimulatedHost::raptor().host_ram),
                 rtx_bytes: vec![capacity], head_split: false, concurrency: slots as u64,
@@ -2217,6 +2218,8 @@ pub(super) mod tests {
             ])?;
             let crate::cli::Commands::Plan(mut args) = cli.command else { panic!("plan command") };
             args.coordinator_weight_budget_gib = Some(cli.coordinator_weight_budget_gib.context("global cap")?);
+            args.vision = cli.vision.unwrap_or(args.vision);
+            args.audio = cli.audio.unwrap_or(args.audio);
             args.memory = cli.memory;
             let planned = crate::commands::plan::run_plan(args);
             let mut i = inputs(&cfg);
