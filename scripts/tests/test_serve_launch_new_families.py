@@ -292,7 +292,7 @@ def test_kimi_unset_spark_budget_leaves_serve_on_the_family_default(tmp_path: Pa
     ("SPECULATOR=dflash2\n", "SPECULATOR=dflash2 needs SPECULATOR_MODEL_ID"),
     ("SPECULATOR=mtp\n", "SPECULATOR=mtp does not apply to kimi_k3"),
     ("ATTENTION_PLACEMENT=invalid\n", "ATTENTION_PLACEMENT must be auto, context, layers or heads"),
-    
+
     ("AUDIO=spark\n", "kimi_k3 has no bundled audio execution owner"),
     ("EMBEDDING=host\n", "GPU token embeddings only"),
     ("RTX_EXPERT_LAYERS=max\n", "RTX_EXPERT_LAYERS must be auto, all or N"),

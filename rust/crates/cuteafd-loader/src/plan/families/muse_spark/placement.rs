@@ -160,7 +160,18 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
         card.physical_bytes, card.logical_bytes, crate::placement::reserve::gpu("muse_spark"),
         ArchContext::for_device("sm_120", card.physical_bytes).context_bytes)).collect::<Vec<_>>();
     budgets.extend((0..ranks).map(|rank| shared::spark_budget(rank as u8, opts.spark_capacity(rank))));
-    let maximum_pool_tokens = crate::placement::CoordinatorCard::maximum_pool(&cards, context, opts.pool_tokens, shared::PAGE_ROWS);
+    let card_bytes = cards.iter().map(|card| card.logical_bytes).collect::<Vec<_>>();
+    let mut pool_facts = crate::placement::PoolFacts::new(&card_bytes,
+        crate::placement::planner::Context::resolve(context, (opts.context_tokens > 0).then_some(opts.context_tokens)),
+        opts.pool_tokens, shared::PAGE_ROWS);
+    pool_facts.target = opts.target_pool_tokens;
+    let pool = match crate::placement::prepare_pool(pool_facts) {
+        Ok(pool) => pool,
+        Err(error) => {
+            report.refuse_placement(format!("invalid KV pool policy: {error}"), "Set KV min <= target <= max.");
+            return memory;
+        }
+    };
     let (total, available) = match crate::plan::layout::planner_host_memory(opts.host_memory, crate::plan::layout::HostMemorySample::Raw) {
         Ok(memory) => memory,
         Err(error) => { report.refuse_placement(format!("Muse host inventory refused: {error:#}"), "Provide a host memory sample."); return memory; }
@@ -177,7 +188,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
         if component == Component::Vision { report.encoder = Some(encoder); } else { report.audio_encoder = Some(encoder); }
     }
     let facts = shared::ProductionInput { kv_cache: opts.muse_kv, cfg, core: &model.core, projections, catalog, budgets, host, prefill,
-         bf16_target_head: opts.bf16_target_head, slots, mark_slots, context, maximum_pool_tokens,
+         bf16_target_head: opts.bf16_target_head, slots, mark_slots, context, pool,
         partial_bf16_max_rows: opts.muse_partial_bf16_max_rows, partial_reply_formats: opts.spark_reply_formats,
         local, drafter, fixed, media };
     let prepared = match facts.prepare() {

@@ -254,7 +254,7 @@ mod tests {
         let catalog = cuteafd_loader::read_expert_catalog(dir.path())?;
         let manifest_path = dir.path().join("PROGRAMS.json");
         let manifest = std::sync::Arc::new(serde_json::json!({"programs":[]}));
-        let request = |rows| FactsRequest { vision: cuteafd_loader::plan::MediaMode::Off, vision_replicas: 1, media_cache_bytes: None, spark_rank_bytes: Vec::new(), checkpoint: &checkpoint, cfg: &cfg, catalog: &catalog,
+        let request = |rows| FactsRequest { target_pool_tokens: None, vision: cuteafd_loader::plan::MediaMode::Off, vision_replicas: 1, media_cache_bytes: None, spark_rank_bytes: Vec::new(), checkpoint: &checkpoint, cfg: &cfg, catalog: &catalog,
             manifest_path: &manifest_path, manifest: manifest.clone(),
             coordinator: Coordinator::Planned { cards: vec![CoordinatorCard {
                 physical_bytes: 96 << 30, logical_bytes: 96 << 30 }; 2] },

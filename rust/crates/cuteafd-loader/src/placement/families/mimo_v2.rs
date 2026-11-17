@@ -242,8 +242,8 @@ mod tests {
             expert_usage: false,
             blas_head: crate::placement::planner::serving::BlasHead::Native, draft_head: false,
             cfg, layers: 4, kv: MimoKvFormats::default(), mtp_stages: 0, context,
-            maximum_pool_tokens: admission::maximum_pool_tokens(&[96 << 30; 2][..ranks], context,
-                None, spark.pool_unit_rows),
+            pool: crate::placement::prepare_pool(crate::placement::PoolFacts::new(
+                &[96 << 30; 2][..ranks], context, Some(context), spark.pool_unit_rows)).unwrap(),
             prefill: crate::placement::planner::PrefillShape { rows: 4096, waves: 3 },
             lanes: 3, embedding: crate::placement::planner::EmbeddingHome::Device(0),
             gpus: ranks, spark_ranks: 6,
@@ -587,10 +587,44 @@ mod tests {
     }
 
     #[test]
+    fn explicit_unaligned_pool_keeps_shared_round_up() {
+        let (cfg, spark, no_spark) = fixture(1, 4096);
+        let mut facts = input(&cfg, &spark, &no_spark, 1, 4096);
+        let page = spark.pool_unit_rows;
+        facts.pool = crate::placement::prepare_pool(crate::placement::PoolFacts::new(
+            &[96 << 30], 4096, Some(4097), page)).unwrap();
+        let prepared = facts.prepare().unwrap();
+        let request = admission::production_request(4096, Some(4097), Onboard::Auto,
+            prepared.recipe.prefill, crate::placement::planner::Operation::Serving,
+            ResidentWeights(u64::MAX), Default::default());
+        let admitted = prepared.admit(request).unwrap();
+        assert_eq!(admitted.solved.pool_tokens, 4097u64.div_ceil(page) * page);
+        assert_eq!(admitted.solved.pool_policy.unwrap().requested(), Some(admitted.solved.pool_tokens));
+        let dir = tempfile::tempdir().unwrap();
+        crate::plan::testing::write_snapshot(dir.path(), &crate::plan::testing::mimo_flash_config(),
+            &crate::plan::testing::mimo_flash_tensors(), None);
+        let options = crate::plan::PlanOptions {
+            placement: crate::plan::ExpertPlacement::Sparks { ranks: 4 },
+            layout: Some(crate::plan::layout::LayoutOptions { rtx_bytes: vec![96 << 30],
+                context_tokens: 4096, pool_tokens: Some(4097), host_cache_bytes: Some(0),
+                host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram), ..Default::default() }),
+            ..Default::default()
+        };
+        let planned = crate::plan::testing::plan(dir.path(), &options).unwrap();
+        assert!(planned.fits, "{:?}", planned.hints);
+        let planned_pool = planned.phase_ledger.unwrap().pool_policy.unwrap();
+        assert_eq!(planned_pool.requested(), Some(4097u64.div_ceil(planned_pool.unit_rows()) * planned_pool.unit_rows()));
+        assert_eq!(planned.memory_layout.unwrap().pool_tokens, planned_pool.requested().unwrap());
+    }
+
+    #[test]
     fn zero_and_unset_pool_admit_identically() {
         let (cfg, spark, no_spark) = fixture(1, 256 << 10);
         let context = 256 << 10;
-        let prepared = input(&cfg, &spark, &no_spark, 1, context).prepare().unwrap();
+        let mut facts = input(&cfg, &spark, &no_spark, 1, context);
+        facts.pool = crate::placement::prepare_pool(crate::placement::PoolFacts::new(
+            &[96 << 30], context, None, spark.pool_unit_rows)).unwrap();
+        let prepared = facts.prepare().unwrap();
         let request = |pool| admission::production_request(context, pool, Onboard::Auto,
             prepared.recipe.prefill, crate::placement::planner::Operation::Serving,
             ResidentWeights(u64::MAX), Default::default());
@@ -611,7 +645,8 @@ mod tests {
         let prepared = facts.prepare().unwrap();
         let recipe = &prepared.recipe;
         let components = recipe.host.components(recipe, 1).unwrap();
-        for pages in [1, 2, 63, 64, 65, 66, 1024, recipe.maximum_pages] {
+        for pages in [1, 2, 63, 64, 65, 66, 1024, recipe.maximum_pages].into_iter()
+            .filter(|&pages| pages <= recipe.maximum_pages) {
             for (component, (name, bytes)) in components.iter().zip(recipe.host.demands(recipe, pages, 1).unwrap()) {
                 assert_eq!(component.bytes.at(pages).unwrap(), bytes, "{name} pages={pages}");
             }
@@ -648,6 +683,8 @@ mod tests {
         let (cfg, spark, no_spark) = fixture(1, 256 << 10);
         let context = 256 << 10;
         let mut prepared = input(&cfg, &spark, &no_spark, 1, context);
+        prepared.pool = crate::placement::prepare_pool(crate::placement::PoolFacts::new(
+            &[1 << 30], context, None, spark.pool_unit_rows)).unwrap();
         prepared.budgets = admission::production_budgets(&[(1 << 30, 1 << 30)], &[0],
             vec![crate::placement::planner::Baseline::Forecast { occupied: 0,
                 source: "unit test".into(), assumed: false }], crate::plan::testing::SimulatedHost::raptor().host_ram,

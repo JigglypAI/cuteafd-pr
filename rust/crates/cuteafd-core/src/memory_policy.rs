@@ -279,6 +279,8 @@ pub struct KvBounds {
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum PolicyError {
+    #[error("KV pool request {requested} overflows allocation quantum {unit_rows}")]
+    PoolAlignment { requested: u64, unit_rows: u64 },
     #[error("KV bounds must satisfy 0 < KV_MIN_TOKENS <= KV_TARGET_TOKENS <= KV_MAX_TOKENS (min {min}, target {target}, max {max})")]
     KvOrder { min: u64, target: u64, max: u64 },
     #[error("{0}_MEMORY_CAP must be positive")]

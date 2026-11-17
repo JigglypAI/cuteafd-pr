@@ -168,7 +168,11 @@ fn layout_for_experts(report: &mut PlanReport, model: &dyn super::super::FamilyM
                 encoder_request.onboard = Pin::Exact(0);
                 encoder_request.pool = Pin::Exact(placement.pool_tokens);
             }
-            let encoder_admitted = prepare()?.admit(encoder_request)?;
+            let mut encoder_inputs = inputs.clone();
+            encoder_inputs.requested_pool = match encoder_request.pool { Pin::Auto => None, Pin::Exact(tokens) => Some(tokens) };
+            let prepared = v4::prepare(&encoder_inputs)?;
+            let prepared = if require_remote { prepared.require_remote_experts()? } else { prepared };
+            let encoder_admitted = prepared.admit(encoder_request)?;
             solve_us = solve_us.saturating_add(encoder_admitted.solve_us);
             admissions += 1;
             let encoder_budget = encoder_admitted.placement;
@@ -185,13 +189,14 @@ fn layout_for_experts(report: &mut PlanReport, model: &dyn super::super::FamilyM
                 anyhow::ensure!(gpu < ranks, "V4 encoder owner is not an admitted coordinator GPU");
                 let mut with_tower = inputs.clone();
                 with_tower.extra.push(crate::placement::Demand::new(gpu as u8, Category::Weights,
-                    "vision tower", encoder.weights, Basis::Formula)
+                    crate::media::still_tower::vision_weight_arena_label(), encoder.weights, Basis::Formula)
                     .with_resident_weights(crate::placement::ResidentWeights(encoder.weights)));
                 with_tower.extra.push(crate::placement::Demand::new(gpu as u8, Category::Workspace,
                     "vision scratch", encoder.scratch, Basis::Formula));
                 // Mandatory media displaces optional experts, never the admitted pool.
                 let mut tower_request = request.clone();
                 tower_request.pool = Pin::Exact(placement.pool_tokens);
+                with_tower.requested_pool = Some(placement.pool_tokens);
                 let prepared = v4::prepare(&with_tower)?;
                 let prepared = if require_remote { prepared.require_remote_experts()? } else { prepared };
                 let admitted = prepared.admit(tower_request)?;
@@ -354,7 +359,7 @@ fn v4_inputs(report: &PlanReport, input: &super::super::PlanInput, options: &Lay
         extra.push(crate::placement::Demand::new(0, Category::Weights, "loaded drafter weights", 0, Basis::Exact)
             .with_resident_weights(crate::placement::ResidentWeights(options.drafter_bytes)));
     }
-    let inputs = v4::V4Inputs {
+    let inputs = v4::V4Inputs { target_pool: options.target_pool_tokens,
         expert_usage: options.expert_usage,
         resident_weight_limit: Some(crate::placement::ResidentWeights(options.weight_budget_bytes)), spark_reply_format: options.resolved_spark_reply_format(false), serving_context: crate::placement::planner::Context::resolve(shape.context_tokens, (options.context_tokens > 0).then_some(options.context_tokens)), cfg: cfg.clone(),
         weights,

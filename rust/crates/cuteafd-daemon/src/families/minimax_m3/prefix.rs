@@ -335,7 +335,7 @@ mod tests {
         let scratch = Rc::new(Allocation::new(banks[0].stream.device, 256, Tag::workspace("minimax/unit"))?);
         MiniMaxPrefix::new(banks, scratch)
     }
-    fn build(units: Vec<u32>, slot: usize) -> Placement { Placement { units, slot, len: 0 } }
+    fn build(units: Vec<u32>, slot: usize) -> Placement { Placement { media_spans: Vec::new(), units, slot, len: 0 } }
     fn read_page(family: &MiniMaxPrefix<'_>, page: u32) -> Result<Vec<Vec<u8>>> {
         family.0.copies.drain()?;
         let mut out = Vec::new();
@@ -461,7 +461,7 @@ mod tests {
                         let staging = library.ordered_h2d_staging_buffer(destination, stream)?.unwrap();
                         assert_eq!(staging.bytes, destination.bytes);
                         for len in [0, 1, 64, 65, 128] {
-                            bank.install(&Placement { units: vec![0, 1], slot, len }, stream)?;
+                            bank.install(&Placement { media_spans: Vec::new(), units: vec![0, 1], slot, len }, stream)?;
                         }
                         assert_eq!(library.ordered_h2d_staging_buffer(destination, stream)?.unwrap().ptr,
                             staging.ptr);
@@ -470,11 +470,11 @@ mod tests {
                 Ok(())
             })?;
         }
-        for placement in [Placement { units: vec![0, 0], slot: 0, len: 65 },
-            Placement { units: vec![12], slot: 0, len: 1 },
-            Placement { units: vec![0], slot: 4, len: 1 },
-            Placement { units: vec![0], slot: 0, len: 65 },
-            Placement { units: vec![], slot: 0, len: 0 }] {
+        for placement in [Placement { media_spans: Vec::new(), units: vec![0, 0], slot: 0, len: 65 },
+            Placement { media_spans: Vec::new(), units: vec![12], slot: 0, len: 1 },
+            Placement { media_spans: Vec::new(), units: vec![0], slot: 4, len: 1 },
+            Placement { media_spans: Vec::new(), units: vec![0], slot: 0, len: 65 },
+            Placement { media_spans: Vec::new(), units: vec![], slot: 0, len: 0 }] {
             assert!(family.install(&placement).is_err());
         }
         family.0.copies.drain()?;
