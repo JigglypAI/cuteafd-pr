@@ -143,7 +143,7 @@ def topk_check(lib, args):
                 assert torch.equal(values[row].view(torch.int32), singleton[row][0][0].view(torch.int32)), (
                     "row bytes", vocab, rows, row)
             entry = dict(vocab=vocab, rows=rows, oracle=True, row_invariant=True)
-            if baseline is not None and vocab <= 196608:
+            if baseline is not None and 1024 <= vocab <= 196608:
                 old_values, old_ids, old_launch = launch_topk(baseline, logits, rows, vocab, stream)
                 torch.cuda.synchronize()
                 assert torch.equal(ids, old_ids), ("old/new ids", vocab, rows)
@@ -152,11 +152,12 @@ def topk_check(lib, args):
                 entry["old_byte_identical"] = True
             if vocab in (154880, 202048):
                 entry["candidate_ms"] = timed(launch, 20)
-                if baseline is not None and vocab <= 196608:
+                if baseline is not None and 1024 <= vocab <= 196608:
                     entry["old_ms"] = timed(old_launch, 20)
                     entry["candidate_over_old"] = entry["candidate_ms"] / entry["old_ms"]
             results.append(entry)
             print("topk:", json.dumps(entry, sort_keys=True), flush=True)
+    topk_width_check(lib, stream)
     print("topk-summary:", json.dumps(results, sort_keys=True), flush=True)
 
 
@@ -171,6 +172,67 @@ def launch_topk(lib, logits, rows, vocab, stream):
 
     launch()
     return values, ids, launch
+
+def topk_width_check(lib, stream):
+    """Both widths, exact scratch, native block5 tails and greedy path oracle."""
+    workspace_fn = lib.cuteafd_dflash_topk_workspace_width
+    workspace_fn.argtypes, workspace_fn.restype = [C.c_int32, C.c_int32], C.c_uint64
+    topk_fn = lib.cuteafd_dflash_topk_width
+    topk_fn.argtypes, topk_fn.restype = [P, P, P, P] + [C.c_int32] * 5 + [P], C.c_int32
+    select_fn = lib.cuteafd_dflash_select_width
+    select_fn.argtypes, select_fn.restype = [P] * 8 + [C.c_int32] * 5 + [P], C.c_int32
+    legacy_select = lib.cuteafd_glm_dflash_select
+    legacy_select.argtypes, legacy_select.restype = [P] * 8 + [C.c_int32] * 4 + [P], C.c_int32
+    assert workspace_fn(0, 32) == workspace_fn(1, 17) == 0
+    torch.manual_seed(326)
+    for top_k in (16, 32):
+        for vocab in ((16, 17, 32, 33, 154880, 163840, 202048, 1000000) if top_k == 16
+                      else (32, 33, 154880, 163840, 202048, 1000000)):
+            sequences, block, drafts = 2, 5, 4
+            logits = torch.randint(-128, 129, (sequences, block, vocab), device="cuda").float() / 16
+            logits[..., -1] = 32
+            logits[..., torch.arange(33, device="cuda") * 256 % vocab] = 40
+            wanted = torch.argsort(logits[:, 1:].bfloat16().float(), dim=-1, descending=True, stable=True)[..., :top_k]
+            values = torch.empty(sequences, drafts, top_k, device="cuda")
+            ids = torch.empty_like(values, dtype=torch.int32)
+            bytes_ = workspace_fn(sequences * drafts, top_k)
+            assert bytes_ == sequences * drafts * 64 * top_k * 8
+            storage = torch.full((bytes_ + 256,), 173, device="cuda", dtype=torch.uint8)
+            assert topk_fn(logits.data_ptr(), values.data_ptr(), ids.data_ptr(), storage.data_ptr(),
+                           sequences, block, drafts, vocab, top_k, stream) == 0
+            assert torch.equal(ids.long(), wanted), (top_k, vocab)
+            assert torch.equal(values, logits[:, 1:].gather(-1, ids.long()).bfloat16().float())
+            assert (storage[bytes_:] == 173).all()
+            if top_k == 16:
+                old_values, old_ids = torch.empty_like(values), torch.empty_like(ids)
+                assert lib.cuteafd_glm_dflash_topk(logits.data_ptr(), old_values.data_ptr(), old_ids.data_ptr(),
+                    storage.data_ptr(), sequences, block, drafts, vocab, stream) == 0
+                assert torch.equal(ids, old_ids) and torch.equal(values.view(torch.int32), old_values.view(torch.int32))
+        # Integer-valued BF16 operands make the expanded selector oracle exact.
+        pred = torch.randint(-1, 2, (vocab, 256), device="cuda").bfloat16()
+        succ = torch.randint(-1, 2, (vocab, 256), device="cuda").bfloat16()
+        projected = torch.randint(-1, 2, (sequences, block, 256), device="cuda").bfloat16()
+        anchors = torch.tensor([0, 3], device="cuda", dtype=torch.uint32)
+        tokens = torch.empty(sequences, drafts, device="cuda", dtype=torch.uint32)
+        features = torch.empty(sequences, drafts, 4, device="cuda")
+        assert select_fn(pred.data_ptr(), succ.data_ptr(), projected.data_ptr(), ids.data_ptr(), values.data_ptr(),
+            anchors.data_ptr(), tokens.data_ptr(), features.data_ptr(), sequences, block, drafts, 256, top_k, stream) == 0
+        previous = anchors.long()
+        wanted_tokens = []
+        for position in range(drafts):
+            conditioned = (pred[previous] * projected[:, position + 1]).bfloat16()
+            edge = torch.einsum("sr,skr->sk", conditioned.float(), succ[ids[:, position].long()].float()).bfloat16()
+            scores = (values[:, position] + edge.float()).bfloat16()
+            previous = ids[:, position].gather(-1, scores.float().argmax(-1, keepdim=True)).squeeze(-1).long()
+            wanted_tokens.append(previous)
+        assert torch.equal(tokens.long(), torch.stack(wanted_tokens, dim=1))
+        if top_k == 16:
+            old_tokens, old_features = torch.empty_like(tokens), torch.empty_like(features)
+            assert legacy_select(pred.data_ptr(), succ.data_ptr(), projected.data_ptr(), ids.data_ptr(), values.data_ptr(),
+                anchors.data_ptr(), old_tokens.data_ptr(), old_features.data_ptr(), sequences, block, drafts, 256, stream) == 0
+            assert torch.equal(tokens, old_tokens) and torch.equal(features.view(torch.int32), old_features.view(torch.int32))
+        print(f"topk-width: width={top_k} exact topk/path/legacy oracle and scratch guards PASS", flush=True)
+
 
 def head_bf16_interval(value, epsilon):
     """Possible selector values at a BF16 midpoint within the FP64 error bound."""

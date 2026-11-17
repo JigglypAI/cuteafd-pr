@@ -189,7 +189,6 @@ __global__ void silu_mul_kernel(const bf16* gate_up, bf16* out, uint64_t rows, i
 
 // Top-16 of each drafted row's BF16-rounded logits (largest first, lower
 // index on ties): 64 chunk-local top-16s, then a merge.
-constexpr int kTopK = 16;
 constexpr int kTopChunks = 64;
 constexpr int kTopThreads = 256;
 
@@ -223,6 +222,7 @@ __device__ void block_argmax(float& v, int& i) {
 
 // The original 12-register specialization wins at supported small vocabularies.
 // Drafted row n is block row 1 + n % drafts of sequence n / drafts.
+template <int kTopK>
 __global__ void topk_partial_small_kernel(const float* logits, float* values, int* indices, int vocab, int block_rows,
                                     int drafts) {
   const int chunk = blockIdx.x, n = blockIdx.y;
@@ -251,11 +251,13 @@ __global__ void topk_partial_small_kernel(const float* logits, float* values, in
       indices[(uint64_t(n) * kTopChunks + chunk) * kTopK + k] = bi;
     }
     const int owner = bi - first;
-    if (owner >= 0 && owner % kTopThreads == int(threadIdx.x)) local[owner / kTopThreads] = -CUDART_INF_F;
+    if (bi != INT32_MAX && owner >= 0 && owner % kTopThreads == int(threadIdx.x))
+      local[owner / kTopThreads] = -CUDART_INF_F;
   }
 }
 
 // Drafted row n is block row 1 + n % drafts of sequence n / drafts.
+template <int kTopK>
 __global__ void topk_partial_kernel(const float* logits, float* values, int* indices, int vocab, int block_rows,
                                     int drafts) {
   const int chunk = blockIdx.x, n = blockIdx.y;
@@ -310,6 +312,7 @@ __global__ void topk_partial_kernel(const float* logits, float* values, int* ind
   }
 }
 
+template <int kTopK>
 __global__ void topk_merge_kernel(const float* values, const int* indices, float* unary, int* candidates) {
   const int n = blockIdx.x;
   constexpr int kLocal = kTopChunks * kTopK / kTopThreads;
@@ -344,6 +347,7 @@ __global__ void topk_merge_kernel(const float* values, const int* indices, float
 // best probability, entropy and rank over the 16 scores per row.
 constexpr int kRank = 256;
 
+template <int kTopK>
 __global__ void select_kernel(const bf16* pred_cb, const bf16* succ_cb, const bf16* projected, const int* candidates,
                               const float* unary, const uint32_t* anchors, uint32_t* tokens, float* features,
                               int block_rows, int drafts) {
@@ -499,7 +503,7 @@ extern "C" int32_t cuteafd_glm_dflash_silu_mul(const void* gate_up, void* out, i
 
 // Workspace bytes cuteafd_glm_dflash_topk needs for `rows` drafted rows.
 extern "C" uint64_t cuteafd_glm_dflash_topk_workspace(int32_t rows) {
-  return uint64_t(rows) * kTopChunks * kTopK * 8;
+  return uint64_t(rows) * kTopChunks * 16 * 8;
 }
 
 // unary/candidates [sequences * drafts, 16] from logits [sequences * block_rows, vocab]
@@ -507,21 +511,52 @@ extern "C" uint64_t cuteafd_glm_dflash_topk_workspace(int32_t rows) {
 extern "C" int32_t cuteafd_glm_dflash_topk(const void* logits, void* unary, void* candidates, void* workspace,
                                            int32_t sequences, int32_t block_rows, int32_t drafts, int32_t vocab,
                                            void* stream) {
-  if (sequences < 1 || drafts < 1 || drafts >= block_rows || vocab < kTopK
+  if (sequences < 1 || drafts < 1 || drafts >= block_rows || vocab < 16
       || int64_t(sequences) * drafts > 65535)
     return cudaErrorInvalidValue;
   const int rows = sequences * drafts;
   auto* values = static_cast<float*>(workspace);
-  auto* indices = reinterpret_cast<int*>(values + uint64_t(rows) * kTopChunks * kTopK);
+  auto* indices = reinterpret_cast<int*>(values + uint64_t(rows) * kTopChunks * 16);
   auto s = static_cast<cudaStream_t>(stream);
   if (vocab <= 12 * kTopThreads * kTopChunks) {
-    topk_partial_small_kernel<<<dim3(kTopChunks, rows), kTopThreads, 0, s>>>(
+    topk_partial_small_kernel<16><<<dim3(kTopChunks, rows), kTopThreads, 0, s>>>(
         static_cast<const float*>(logits), values, indices, vocab, block_rows, drafts);
   } else {
-    topk_partial_kernel<<<dim3(kTopChunks, rows), kTopThreads, 0, s>>>(
+    topk_partial_kernel<16><<<dim3(kTopChunks, rows), kTopThreads, 0, s>>>(
         static_cast<const float*>(logits), values, indices, vocab, block_rows, drafts);
   }
-  topk_merge_kernel<<<rows, kTopThreads, 0, s>>>(values, indices, static_cast<float*>(unary),
+  topk_merge_kernel<16><<<rows, kTopThreads, 0, s>>>(values, indices, static_cast<float*>(unary),
+                                                 static_cast<int*>(candidates));
+  return cudaGetLastError();
+}
+
+// Width is checkpoint geometry, not a live token count. The legacy top-16
+// entry points retain exactly the same specializations and arithmetic.
+extern "C" uint64_t cuteafd_dflash_topk_workspace_width(int32_t rows, int32_t top_k) {
+  if (rows < 1 || (top_k != 16 && top_k != 32)) return 0;
+  return uint64_t(rows) * kTopChunks * top_k * 8;
+}
+
+extern "C" int32_t cuteafd_dflash_topk_width(const void* logits, void* unary, void* candidates, void* workspace,
+                                             int32_t sequences, int32_t block_rows, int32_t drafts, int32_t vocab,
+                                             int32_t top_k, void* stream) {
+  if (top_k == 16)
+    return cuteafd_glm_dflash_topk(logits, unary, candidates, workspace, sequences, block_rows, drafts, vocab, stream);
+  if (top_k != 32 || sequences < 1 || drafts < 1 || drafts >= block_rows || vocab < 32
+      || int64_t(sequences) * drafts > 65535)
+    return cudaErrorInvalidValue;
+  const int rows = sequences * drafts;
+  auto* values = static_cast<float*>(workspace);
+  auto* indices = reinterpret_cast<int*>(values + uint64_t(rows) * kTopChunks * 32);
+  auto s = static_cast<cudaStream_t>(stream);
+  if (vocab <= 12 * kTopThreads * kTopChunks) {
+    topk_partial_small_kernel<32><<<dim3(kTopChunks, rows), kTopThreads, 0, s>>>(
+        static_cast<const float*>(logits), values, indices, vocab, block_rows, drafts);
+  } else {
+    topk_partial_kernel<32><<<dim3(kTopChunks, rows), kTopThreads, 0, s>>>(
+        static_cast<const float*>(logits), values, indices, vocab, block_rows, drafts);
+  }
+  topk_merge_kernel<32><<<rows, kTopThreads, 0, s>>>(values, indices, static_cast<float*>(unary),
                                                  static_cast<int*>(candidates));
   return cudaGetLastError();
 }
@@ -534,7 +569,23 @@ extern "C" int32_t cuteafd_glm_dflash_select(const void* pred_cb, const void* su
                                              void* tokens, void* features, int32_t sequences, int32_t block_rows,
                                              int32_t drafts, int32_t rank, void* stream) {
   if (sequences < 1 || rank != kRank || drafts < 1 || drafts >= block_rows) return cudaErrorInvalidValue;
-  select_kernel<<<sequences, kRank, 0, static_cast<cudaStream_t>(stream)>>>(
+  select_kernel<16><<<sequences, kRank, 0, static_cast<cudaStream_t>(stream)>>>(
+      static_cast<const bf16*>(pred_cb), static_cast<const bf16*>(succ_cb), static_cast<const bf16*>(projected),
+      static_cast<const int*>(candidates), static_cast<const float*>(unary), static_cast<const uint32_t*>(anchors),
+      static_cast<uint32_t*>(tokens), static_cast<float*>(features), block_rows, drafts);
+  return cudaGetLastError();
+}
+
+extern "C" int32_t cuteafd_dflash_select_width(const void* pred_cb, const void* succ_cb, const void* projected,
+                                               const void* candidates, const void* unary, const void* anchors,
+                                               void* tokens, void* features, int32_t sequences, int32_t block_rows,
+                                               int32_t drafts, int32_t rank, int32_t top_k, void* stream) {
+  if (top_k == 16)
+    return cuteafd_glm_dflash_select(pred_cb, succ_cb, projected, candidates, unary, anchors,
+                                   tokens, features, sequences, block_rows, drafts, rank, stream);
+  if (top_k != 32 || sequences < 1 || rank != kRank || drafts < 1 || drafts >= block_rows)
+    return cudaErrorInvalidValue;
+  select_kernel<32><<<sequences, kRank, 0, static_cast<cudaStream_t>(stream)>>>(
       static_cast<const bf16*>(pred_cb), static_cast<const bf16*>(succ_cb), static_cast<const bf16*>(projected),
       static_cast<const int*>(candidates), static_cast<const float*>(unary), static_cast<const uint32_t*>(anchors),
       static_cast<uint32_t*>(tokens), static_cast<float*>(features), block_rows, drafts);
