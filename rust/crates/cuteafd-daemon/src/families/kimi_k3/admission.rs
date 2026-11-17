@@ -2164,7 +2164,7 @@ pub(super) mod tests {
         i.rtx = Some(rtx); i.spark_budget = Some(spark);
         let admitted = admit(i)?;
         assert_eq!(report.phase_ledger.as_ref().context("Kimi planned policy")?.pool_policy,
-            admitted.solved.pool_policy, "Kimi plan and runtime policy must be identical");
+            admitted.receipt.pool_policy, "Kimi plan and runtime policy must be identical");
         let memory = report.memory_layout.context("single-owner installed ledger")?;
         assert_eq!(memory.pool_tokens, admitted.placement.pool_tokens);
         assert_eq!(admitted.devices, [0]);

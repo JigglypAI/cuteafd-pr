@@ -1158,7 +1158,7 @@ mod tests {
 
     pub(super) fn recipe() -> KimiRecipe {
         let mut recipe = KimiRecipe {
-            pool: crate::placement::prepare_pool(crate::placement::PoolFacts::new(&[96 << 30], 256, Some(256), 64)),
+            pool: crate::placement::prepare_pool(crate::placement::PoolFacts::new(&[96 << 30], 256, None, 64)),
             vision: None,
             expert_usage: None,
             shaped: Vec::new(),
@@ -1577,7 +1577,9 @@ mod tests {
         }
         let request = |pool| Request { context: (128).into(), ..request_with(Some(pool)) };
         recipe.context = 128;
+        recipe.pool = crate::placement::prepare_pool(crate::placement::PoolFacts::new(&[1 << 30; 2], 128, Some(192), 64));
         assert!(recipe.admit(request(192), budget.clone()).is_err());
+        recipe.pool = crate::placement::prepare_pool(crate::placement::PoolFacts::new(&[1 << 30; 2], 128, Some(128), 64));
         assert_eq!(recipe.admit(request(128), budget).unwrap().solved.pool_tokens, 128);
     }
 
