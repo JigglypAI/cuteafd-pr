@@ -854,7 +854,7 @@ fn decisions(onboard: u64) -> Decisions {
         expert_homes: (0..onboard as usize).map(|layer|
             (layer, ExpertDestination::Coordinator { gpus: vec![0] })).collect(),
         embedding: None,
-        draft_home: None,
+        draft_home: None, draft_traffic_bytes_per_cycle: 0,
         head_home: None,
         intake_home: None,
         prefill: PrefillShape {
@@ -1586,6 +1586,41 @@ fn single_copy_homes_are_selected_jointly_with_pool_and_per_gpu_headroom() {
         assert!(matches!(solve(request(), budgets, &Prepared(duplicate)), Err(Refusal::InvalidFact(_))));
         assert!(matches!(solve(request(), vec![budget(1000)], &Prepared(contract)), Err(Refusal::InvalidFact(_))));
     }
+}
+
+#[test]
+fn drafter_traffic_prefers_local_home_without_trading_away_onboarding() {
+    let mut contract=profile_contract(8);
+    let variable=contract.variables.len();
+    contract.variables.push(Variable::DraftHomeTraffic(vec![
+        DraftHomeAlternative { gpu:0,traffic_bytes_per_cycle:0 },
+        DraftHomeAlternative { gpu:1,traffic_bytes_per_cycle:4096 }]));
+    for (option,gpu,bytes) in [(0,0,60),(1,1,10)] {
+        let mut owner=allocation(&format!("draft.{gpu}"),bytes);
+        owner.location=Location::coordinator(gpu);
+        let mut component=Component::allocation(owner,ByteCurve::fixed(bytes,8),false,8);
+        component.activation=Activation::choice(variable,option);
+        contract.components.push(component);
+    }
+    let local=solve(request(),two_gpus(100,100),&Prepared(contract.clone())).unwrap();
+    assert_eq!(local.decisions.draft_home,Some(0));
+    assert_eq!(local.decisions.draft_traffic_bytes_per_cycle,0);
+    assert!(serde_json::to_value(&local.decisions).unwrap().get("draft_traffic_bytes_per_cycle").is_some());
+    add_profile(&mut contract,vec![0,1,2],vec![0],vec![0,1],&[0,60]);
+    let onboard=solve(request(),two_gpus(100,100),&Prepared(contract)).unwrap();
+    assert_eq!(onboard.decisions.onboard_layers[0].len(),1);
+    assert_eq!(onboard.decisions.draft_home,Some(1));
+    assert_eq!(onboard.decisions.draft_traffic_bytes_per_cycle,4096);
+}
+
+#[test]
+fn drafter_split_execution_cannot_select_unadmitted_whole_home() {
+    let mut contract=profile_contract(8);
+    contract.variables.push(Variable::DraftHomeTraffic(vec![DraftHomeAlternative {
+        gpu:1,traffic_bytes_per_cycle:512 }]));
+    let solved=solve(request(),two_gpus(100,100),&Prepared(contract)).unwrap();
+    assert_eq!(solved.decisions.draft_home,Some(1));
+    assert_eq!(solved.decisions.draft_traffic_bytes_per_cycle,512);
 }
 
 #[test]

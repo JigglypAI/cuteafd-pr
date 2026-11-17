@@ -67,6 +67,11 @@ impl DflashDrafter<'_> {
                     }
                 }
                 DraftAttention::Mla(attention) => {
+                    if let Some(scales) = &attention.fp8_scales {
+                        for (name, owner) in ["qkv_a", "q_b", "uk", "uv", "output"].iter().zip(scales) {
+                            owner.inventory(&mut inventory, &format!("{prefix}.{name}.scales"))?;
+                        }
+                    }
                     for (name, owner) in [("qkv_a", &attention.qkv_a), ("q_norm", &attention.q_norm),
                         ("kv_norm", &attention.kv_norm), ("q_b", &attention.q_b), ("uk", &attention.uk),
                         ("uv", &attention.uv), ("output", &attention.output), ("cache", &attention.cache),

@@ -19,6 +19,13 @@ pub(crate) enum MixSite {
     Output,
 }
 
+/// The bank stream handed to a drafter uses its next consumer's score weights.
+/// Both K3 and K3.1 checkpoints have attention-residual banks.
+pub(crate) fn draft_mix_site(cfg: &KimiK3Config, layer: usize) -> Result<MixSite> {
+    ensure!(layer < cfg.layers, "Kimi draft tap layer {layer} outside target");
+    Ok(if layer + 1 == cfg.layers { MixSite::Output } else { MixSite::Attention(layer + 1) })
+}
+
 /// One routed selection per row: expert ids and their renormalized weights.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Routes {
@@ -139,6 +146,24 @@ mod tests {
 
     fn cfg() -> KimiK3Config {
         KimiK3Config::from_hf(&cuteafd_loader::plan::testing::kimi_k3_config()).unwrap()
+    }
+
+    #[test]
+    fn draft_bank_stream_uses_next_consumer_including_boundary_and_output() {
+        let cfg = cfg();
+        for layer in 0..cfg.layers {
+            let expected = if layer + 1 == cfg.layers { MixSite::Output } else { MixSite::Attention(layer + 1) };
+            assert_eq!(draft_mix_site(&cfg, layer).unwrap(), expected);
+        }
+        // At the boundary the next attention sees only the existing blocks;
+        // its new append is not a candidate for its own mixture.
+        let boundary = cfg.residual_block - 1;
+        let site = super::super::device::residual_site(&cfg, draft_mix_site(&cfg, boundary).unwrap()).unwrap();
+        assert_eq!(site.candidates, 2);
+        assert!(site.append);
+        let last = super::super::device::residual_site(&cfg, draft_mix_site(&cfg, cfg.layers - 1).unwrap()).unwrap();
+        assert_eq!(last.candidates, cfg.max_residual_blocks() + 1);
+        assert!(draft_mix_site(&cfg, cfg.layers).is_err());
     }
 
     #[test]

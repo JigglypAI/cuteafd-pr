@@ -214,6 +214,69 @@ def test_residual_official_fp64(candidates, mode, append, mix, rows, case):
     assert torch.equal(out, first), "graph replay is not byte-exact"
 
 
+@pytest.mark.parametrize("candidates", [2, 3, 8, 9])
+@pytest.mark.parametrize("rows", [1, 16, 4096])
+@torch.no_grad()
+def test_draft_stream_bank_fixture_bytes_and_replay(candidates, rows):
+    from b12x.integration.cuteafd.kimi_residual import compile_kimi_attn_res_stream_aot
+    # Zero score projection gives an exact uniform mix. Dyadic rows scaled
+    # by C make the expected average exact even for non-power-of-two C.
+    arena = torch.zeros(9, rows + 3, 7168, dtype=torch.bfloat16, device="cuda")
+    for slot in range(9):
+        arena[slot].fill_((slot + 1) * candidates / 32)
+    delta = torch.full((rows, 7168), candidates / 32, dtype=torch.bfloat16, device="cuda")
+    score = torch.zeros(7168, dtype=torch.float32, device="cuda")
+    # NaN following-norm weights prove the pre-norm path does not read them.
+    following = torch.full((7168,), float("nan"), dtype=torch.bfloat16, device="cuda")
+    original, original_delta = arena.clone(), delta.clone()
+    current = arena[8, :rows] + delta
+    blocks = arena[:candidates - 1, :rows].transpose(0, 1)
+    expected = torch.cat((blocks, current[:, None]), 1).float().mean(1).bfloat16()
+    program = compile_kimi_attn_res_stream_aot(candidates=candidates)
+    out = torch.empty_like(current)
+    program.launch(arena, delta, score, following, out, scalars=(rows, rows + 3, 1e-5))
+    torch.cuda.synchronize()
+    assert torch.equal(out, expected), "tap differs from pre-norm reference bytes"
+    assert torch.equal(arena, original), "capture advanced the live residual bank"
+    assert torch.equal(delta, original_delta), "capture clobbered the FFN delta"
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        program.launch(arena, delta, score, following, out, scalars=(rows, rows + 3, 1e-5))
+    out.zero_()
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(out, expected)
+    assert torch.equal(arena, original) and torch.equal(delta, original_delta)
+
+
+@pytest.mark.parametrize("candidates", [2, 3, 8, 9])
+@pytest.mark.parametrize("case", ["normal", "cancel", "saturated"])
+@torch.no_grad()
+def test_draft_stream_nonzero_scores_official_fp64(candidates, case):
+    from b12x.integration.cuteafd.kimi_residual import compile_kimi_attn_res_stream_aot
+    arena, delta, norm, proj, following = inputs(16, candidates, case)
+    original = arena.clone()
+    current = arena[8, :16] + delta
+    blocks = arena[:candidates - 1, :16].transpose(0, 1).contiguous()
+    definitions = official()
+    res_norm = definitions["KimiRMSNorm"](7168, eps=1e-5).cuda().bfloat16()
+    projection = nn.Linear(7168, 1, bias=False).cuda().bfloat16()
+    res_norm.weight.copy_(norm)
+    projection.weight.copy_(proj[None])
+    baseline = definitions["_apply_attn_res"](current, blocks, projection, res_norm)
+    values = torch.cat((blocks, current[:, None]), 1).cpu().double()
+    score = ((values / (values.square().mean(-1, keepdim=True) + 1e-5).sqrt()) *
+             (norm.cpu().double() * proj.cpu().double())).sum(-1)
+    oracle = (values * score.softmax(-1)[..., None]).sum(1)
+    out = torch.empty_like(current)
+    program = compile_kimi_attn_res_stream_aot(candidates=candidates)
+    program.launch(arena, delta, norm.float() * proj.float(), following, out,
+                   scalars=(16, arena.shape[1], 1e-5))
+    torch.cuda.synchronize()
+    assert_accuracy(out, baseline, oracle)
+    assert torch.equal(arena, original)
+
+
 @pytest.mark.parametrize("candidates", [2, 9])
 @torch.no_grad()
 def test_residual_prefill_official_fp64(candidates):

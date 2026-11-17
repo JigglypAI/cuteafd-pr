@@ -1162,7 +1162,7 @@ report.update(spark_ranks=ranks)
 if family == "mimo_v2":
     report["prefill_lanes"] = 3
 gpus = int(value("--rtx", "1"))
-if family == "glm5_flash":
+if family in {"glm5_flash", "kimi_k3"}:
     report.setdefault("tp2_dflash", gpus == 2 and value("--speculator") == "dflash2"
         and value("--tp2-dflash", "true") == "true")
 def size_bytes(text):
@@ -4546,6 +4546,21 @@ def test_glmf_tp2_dflash_auto_passes_planner_choice_to_server(tmp_path, selected
     assert f"--tp2-dflash {str(selected).lower()}" in server
 
 
+@pytest.mark.parametrize("selected", [False, True])
+def test_kimi_tp2_dflash_omission_forwards_structural_planner_choice(tmp_path, selected):
+    config = {"model_type": "kimi_k3", "text_config": {"model_type": "kimi_linear",
+              "num_hidden_layers": 93, "first_k_dense_replace": 1, "moe_layer_freq": 1}}
+    result = _family_launch_result(tmp_path, config, "test/structural-draft",
+        "RTX_GPUS=2\nSPECULATOR=dflash2\nSPECULATOR_MODEL_ID=test/structural-draft\nVISION=off\nAUDIO=off\n",
+        encoder_plan={"tp2_dflash": selected})
+    assert result.returncode == 0, result.stderr
+    lines = result.stderr.splitlines()
+    plans = [shlex.split(line) for line in lines if "cuteafd plan " in line and "--deployment" in line]
+    assert plans and all("--tp2-dflash" not in plan for plan in plans)
+    server = next(line for line in lines if "cuteafd serve-kimi" in line)
+    assert f"--tp2-dflash {str(selected).lower()}" in server
+
+
 @pytest.mark.parametrize("precision,mode", [("off", "w8a16"), ("on", "wide"), ("auto", "w8a8")])
 def test_glmf_plan_uses_served_drafter_precision_and_rows(tmp_path, precision, mode):
     plan = {"placement_supported": True, "fits": True, "spark_ranks": 1, "tp2_dflash": True}
@@ -5484,7 +5499,7 @@ def test_tp2_dflash_explicit_boolean_reaches_plan_and_serve(tmp_path, family, co
         keys += "SPECULATOR_MODEL_ID=test/tp2-dflash\n"
     if value is not None:
         keys += f"TP2_DFLASH={value}\n"
-    automatic = family == "glm5_flash" and value is None
+    automatic = family in {"glm5_flash", "kimi_k3"} and value is None
     result = _family_launch_result(tmp_path, config, "test/tp2-dflash", keys,
         encoder_plan={"tp2_dflash": True} if automatic else None)
     assert result.returncode == 0, result.stderr

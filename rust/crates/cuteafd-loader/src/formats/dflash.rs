@@ -19,6 +19,7 @@ pub fn validate_topk_vocab(vocab: u64) -> std::result::Result<(), DflashTopkVoca
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct MlaDflashConfig {
+    pub hidden_stream: crate::families::kimi_k3::draft::DraftHiddenStream,
     pub mla: MlaGeometry,
     pub intermediate: usize,
     pub eps: f64,
@@ -187,6 +188,8 @@ impl MlaDraftWeight {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MlaDraftRuntimeLayout {
     kind: cuteafd_core::coordinator_programs::MlaDraftKind,
+    hidden_stream: crate::families::kimi_k3::draft::DraftHiddenStream,
+    complete_fp8_body: bool,
     cache_format: MlaCacheFormat,
     target_hidden: usize,
     target_vocab: usize,
@@ -228,7 +231,7 @@ pub fn draft_selector_workspace_bytes(kind: cuteafd_core::coordinator_programs::
     drafted: usize) -> Result<usize> {
     use cuteafd_core::coordinator_programs::MlaDraftKind;
     match kind {
-        MlaDraftKind::Dflash2 => drafted.checked_mul(64 * 16 * 8)
+        MlaDraftKind::Dflash2 | MlaDraftKind::CausalDflash2 => drafted.checked_mul(64 * kind.selector_top_k() * 8)
             .map(|bytes| bytes.max(256)).ok_or_else(|| unsupported("draft selector workspace overflow")),
         MlaDraftKind::Ml4Dspark => Ok(0),
     }
@@ -241,6 +244,8 @@ impl MlaDraftRuntimeLayout {
     pub fn selector_workspace_bytes(&self) -> Result<usize> {
         draft_selector_workspace_bytes(self.kind, self.capacity.block_rows - self.capacity.max_batch_sequences)
     }
+    pub fn complete_fp8_body(&self) -> bool { self.complete_fp8_body }
+    pub fn hidden_stream(&self) -> crate::families::kimi_k3::draft::DraftHiddenStream { self.hidden_stream }
     pub fn cache_format(&self) -> MlaCacheFormat { self.cache_format }
     pub fn target_hidden(&self) -> usize { self.target_hidden }
     pub fn target_vocab(&self) -> usize { self.target_vocab }
@@ -260,7 +265,7 @@ impl MlaDraftRuntimeLayout {
     }
     /// All immutable destinations, including DFlash2's separately loaded MLA weights.
     pub fn weight_arena_requests(&self) -> Vec<(String, usize)> {
-        if self.kind == cuteafd_core::coordinator_programs::MlaDraftKind::Dflash2 {
+        if self.kind.is_dflash() {
             self.weight_arena_requests.clone()
         } else {
             self.immutable_arena_requests()
@@ -893,10 +898,14 @@ struct Raw {
     sliding_window: Option<usize>,
     use_sliding_window: bool,
     is_causal: bool,
-    mla_use_output_gate: bool,
+    mla_use_output_gate: Option<bool>,
+    #[serde(default)]
+    mla_use_nope: Option<bool>,
+    #[serde(default)]
+    rope_interleave: Option<bool>,
     attention_bias: bool,
     hidden_act: String,
-    fc_norm: bool,
+    fc_norm: Option<bool>,
     rope_parameters: DsparkRope,
     dflash_config: Draft,
 }
@@ -904,6 +913,8 @@ struct Raw {
 #[derive(Deserialize)]
 struct Draft {
     attention_mode: String,
+    #[serde(default)]
+    aux_hidden_stream: Option<String>,
     block_size: usize,
     conv_kernel_size: usize,
     conv_group_size: usize,
@@ -924,17 +935,30 @@ impl MlaDflashConfig {
 
     pub fn from_json(value: &serde_json::Value) -> Result<Self> {
         let raw: Raw = serde_json::from_value(value.clone())?;
+        let hidden_stream = crate::families::kimi_k3::draft::DraftHiddenStream::from_config(value)
+            .map_err(|error| unsupported(&error.to_string()))?;
         validate_topk_vocab(raw.vocab_size as u64)?;
         let d = raw.dflash_config;
+        let causal = raw.is_causal;
+        // The causal checkpoint declares its missing gate/norm behavior through
+        // its MLA, interleaved-RoPE and attention-residual stream contract.
+        let optional_flags_valid = if causal {
+            raw.mla_use_output_gate != Some(true) && raw.fc_norm != Some(true)
+                && raw.mla_use_nope == Some(false) && raw.rope_interleave == Some(true)
+                && d.aux_hidden_stream.as_deref() == Some("attn_res")
+        } else {
+            raw.mla_use_output_gate == Some(false) && raw.fc_norm == Some(false)
+                && raw.rope_interleave != Some(false)
+        };
         if !raw.architectures.iter().any(|a| a == "DFlash2DraftModel")
-            || d.attention_mode != "mla" || raw.is_causal || raw.mla_use_output_gate
-            || raw.attention_bias || raw.hidden_act != "silu" || raw.fc_norm {
-            return Err(unsupported("MLA DFlash2 requires noncausal, ungated, bias-free SiLU and fc_norm=false"));
+            || d.attention_mode != "mla" || !optional_flags_valid
+            || raw.attention_bias || raw.hidden_act != "silu" {
+            return Err(unsupported("MLA DFlash2 requires declared ungated, bias-free SiLU, interleaved RoPE and fc_norm=false"));
         }
         let mla = MlaGeometry { hidden: raw.hidden_size, heads: raw.num_attention_heads,
             q_rank: raw.q_lora_rank, kv_rank: raw.kv_lora_rank, nope: raw.qk_nope_head_dim,
             rope: raw.qk_rope_head_dim, value: raw.v_head_dim };
-        if mla != (MlaGeometry { hidden: 7168, heads: 64, q_rank: 1536,
+        if mla != (MlaGeometry { hidden: 7168, heads: if causal { 96 } else { 64 }, q_rank: 1536,
             kv_rank: 512, nope: 128, rope: 64, value: 128 })
             || raw.num_key_value_heads != mla.heads || raw.rms_norm_eps != 1e-5 {
             return Err(unsupported("MLA draft exports require H7168, 64 heads, Q1536/KV512, NoPE128/RoPE64/V128, eps=1e-5"));
@@ -950,24 +974,27 @@ impl MlaDflashConfig {
             || d.target_layer_ids.windows(2).any(|pair| pair[0] >= pair[1]) {
             return Err(unsupported("invalid MLA draft dimensions, context, vocabulary or ordered post-layer taps"));
         }
-        if d.block_size != 8 || d.conv_kernel_size != 2 || d.conv_group_size != 16
-            || d.selector_rank != 256 || d.selector_top_k != 16 {
-            return Err(unsupported("DFlash2 requires block8, two-tap group16 convolutions, rank256/top16 selector"));
+        if d.block_size != if causal { 5 } else { 8 }
+            || d.conv_kernel_size != 2 || d.conv_group_size != 16
+            || d.selector_rank != 256 || d.selector_top_k != if causal { 32 } else { 16 } {
+            return Err(unsupported("DFlash2 requires noncausal block8/top16 or causal block5/top32, kernel2/group16, rank256"));
         }
         if raw.layer_types.len() != raw.num_hidden_layers {
             return Err(unsupported("MLA draft layer_types count differs from num_hidden_layers"));
         }
+        let window = if causal { 1024 } else { 4096 };
         let windows = raw.layer_types.iter().map(|kind| match kind.as_str() {
-            "full_attention" => Ok(None),
-            "sliding_attention" if raw.use_sliding_window && raw.sliding_window == Some(4096) => Ok(Some(4096)),
-            _ => Err(unsupported("MLA draft exports support full attention or a native 4096-token window")),
+            "full_attention" if !causal => Ok(None),
+            "sliding_attention" if raw.use_sliding_window && raw.sliding_window == Some(window) => Ok(Some(window)),
+            _ => Err(unsupported("MLA draft exports require native full/4096 noncausal or all-1024 causal windows")),
         }).collect::<Result<Vec<_>>>()?;
         let rotary = raw.rope_parameters.plan(mla.rope)?;
-        Ok(Self { mla, intermediate: raw.intermediate_size, eps: raw.rms_norm_eps,
+        Ok(Self { hidden_stream, mla, intermediate: raw.intermediate_size, eps: raw.rms_norm_eps,
             block: d.block_size, group: d.conv_group_size, selector_rank: d.selector_rank,
             selector_top_k: d.selector_top_k, taps: d.target_layer_ids, vocab: raw.vocab_size,
             mask_token: d.mask_token_id, max_context: raw.max_position_embeddings, windows, rotary,
-            kind: cuteafd_core::coordinator_programs::MlaDraftKind::Dflash2, markov_rank: 0 })
+            kind: if causal { cuteafd_core::coordinator_programs::MlaDraftKind::CausalDflash2 }
+                else { cuteafd_core::coordinator_programs::MlaDraftKind::Dflash2 }, markov_rank: 0 })
     }
 
     /// Mistral Large 4's bundled mtp_dspark, from the checkpoint's own params.json
@@ -984,7 +1011,7 @@ impl MlaDflashConfig {
         }
         let inv_freq = target.inv_freq(&vec![0.0; rope / 2])
             .map_err(|e| unsupported(&format!("mtp_dspark rotary: {e}")))?;
-        Ok(Self { mla: MlaGeometry { hidden: target.hidden, heads: target.heads, q_rank: 0,
+        Ok(Self { hidden_stream: Default::default(), mla: MlaGeometry { hidden: target.hidden, heads: target.heads, q_rank: 0,
                 kv_rank: target.kv_lora_rank, nope: target.qk_nope_head_dim, rope, value: target.v_head_dim },
             intermediate: target.dense_intermediate, eps: target.rms_norm_eps, block: dspark.depth, group: 0,
             selector_rank: 0, selector_top_k: 0, taps: dspark.taps.clone(), vocab: target.vocab_size,
@@ -995,6 +1022,12 @@ impl MlaDflashConfig {
     }
 
     fn is_ml4(&self) -> bool { self.kind == cuteafd_core::coordinator_programs::MlaDraftKind::Ml4Dspark }
+
+    /// Every MLA drafter owns records independently of target KV storage.
+    pub fn cache_format(&self, draft: crate::families::qwen4::Qwen4KvCache) -> MlaCacheFormat {
+        match draft { crate::families::qwen4::Qwen4KvCache::Bf16 => MlaCacheFormat::Bf16,
+            crate::families::qwen4::Qwen4KvCache::Fp8 => MlaCacheFormat::Fp8 }
+    }
 
     /// Drafted tokens per proposal: DFlash2's block holds the anchor (block - 1);
     /// mtp_dspark predicts from the anchor too (block).
@@ -1112,6 +1145,32 @@ impl MlaDflashConfig {
         Ok(layout)
     }
 
+    /// Additive inventory for fully FP8 body projections, before runtime
+    /// enablement. The actual conversion backing is one bounded load owner.
+    pub fn complete_fp8_weight_layout(&self)
+        -> Result<crate::families::glm5::draft_representation::GlmDraftWeightLayout> {
+        use crate::families::glm5::draft_representation::{draft_weight_role, DraftWeightRole, GlmDraftWeightLayout};
+        if !self.kind.is_dflash() { return Err(unsupported("complete MLA FP8 body requires DFlash2")); }
+        let overflow = || unsupported("complete MLA FP8 body inventory overflow");
+        let mut layout = GlmDraftWeightLayout { bf16_values: 0, fp8_values: 0, fp8_scales: 0,
+            bf16_auxiliary: 0, bf16_codebooks: 0, max_load_staging: crate::shared::dense_read::STEP_BYTES as u64 };
+        for (name, shape) in self.tensor_shapes() {
+            let values = shape.iter().try_fold(1u64, |n, &d| n.checked_mul(d as u64)).ok_or_else(overflow)?;
+            let role = draft_weight_role(&name).ok_or_else(|| unsupported("MLA tensor has no shared precision role"))?;
+            if role == DraftWeightRole::BodyLinear {
+                layout.fp8_values = layout.fp8_values.checked_add(values).ok_or_else(overflow)?;
+                let unit = if name.ends_with(".self_attn.kv_b_proj.weight") { 64 } else { 128 };
+                layout.fp8_scales = layout.fp8_scales.checked_add(values / unit * 4).ok_or_else(overflow)?;
+            } else if name.ends_with("_codebook") {
+                layout.bf16_codebooks = layout.bf16_codebooks.checked_add(values * 2).ok_or_else(overflow)?;
+            } else {
+                layout.bf16_auxiliary = layout.bf16_auxiliary.checked_add(values * 2).ok_or_else(overflow)?;
+            }
+        }
+        layout.loading_peak_bytes().map_err(|_| overflow())?;
+        Ok(layout)
+    }
+
     /// One checked inventory for the shared executor's common buffers and the
     /// native MLA branch. Native work is chunked, not replicated per layer or
     /// scheduler sequence. Only bounded rings and page tables scale with slots;
@@ -1130,14 +1189,15 @@ impl MlaDflashConfig {
         }
         if capacity != GlmDraftCapacity::new(capacity.context_slots, capacity.max_batch_sequences, self.block)
             .map_err(|_| invalid())? || capacity.max_batch_sequences > 32
-            || !(1..=4096).contains(&sm_count) || fp8_mode > 2 || self.block != 8
-            || self.group != 16 || self.selector_rank != 256 || self.selector_top_k != 16
-            || self.mla != (MlaGeometry { hidden: 7168, heads: 64, q_rank: 1536,
+            || !(1..=4096).contains(&sm_count) || fp8_mode > 2
+            || self.block != if self.kind == cuteafd_core::coordinator_programs::MlaDraftKind::CausalDflash2 { 5 } else { 8 }
+            || self.group != 16 || self.selector_rank != 256 || self.selector_top_k != self.kind.selector_top_k()
+            || self.mla != (MlaGeometry { hidden: 7168, heads: self.kind.heads(), q_rank: 1536,
                 kv_rank: 512, nope: 128, rope: 64, value: 128 })
             || self.intermediate == 0 || self.intermediate > 1_000_000
             || self.vocab == 0 || self.vocab > 1_000_000 || self.taps.is_empty() || self.taps.len() > 1024
             || self.windows.is_empty() || self.windows.len() > 1024
-            || self.windows.iter().any(|w| !matches!(w, None | Some(4096))) {
+            || self.windows.iter().any(|w| if self.kind == cuteafd_core::coordinator_programs::MlaDraftKind::CausalDflash2 { *w != Some(1024) } else { !matches!(w, None | Some(4096)) }) {
             return Err(invalid());
         }
         let program = self.program_layout(compiled_context)?;
@@ -1167,10 +1227,10 @@ impl MlaDflashConfig {
             ("fused", vec![tap_rows, h, 2]), ("fused_norm", vec![tap_rows, h, 2]),
             ("context_positions", vec![tap_rows, 8]), ("context_slots", vec![tap_rows, 8]),
             ("inverse_frequencies", vec![self.mla.rope / 2, 4]),
-            ("query", vec![native_rows, 64, 576, 2]),
+            ("query", vec![native_rows, self.mla.heads, 576, 2]),
             ("q_residual", vec![native_rows, 1536, 2]),
-            ("attention", vec![native_rows, 64, 512, 2]),
-            ("lse", vec![native_rows, 64, 4]),
+            ("attention", vec![native_rows, self.mla.heads, 512, 2]),
+            ("lse", vec![native_rows, self.mla.heads, 4]),
             ("native_scratch", vec![program.scratch_bytes()]),
             ("lengths", vec![seq, 4]), ("query_offsets", vec![seq + 1, 4]),
             ("native_slots", vec![native_rows, 8]), ("native_positions", vec![native_rows, 8]),
@@ -1179,7 +1239,7 @@ impl MlaDflashConfig {
             ("conv", vec![rows, h, 2]), ("dynamic", vec![rows, 4 * h / self.group, 2]),
             ("delta", vec![rows, h, 2]), ("gate_up", vec![rows, 2 * inter, 2]),
             ("act", vec![rows, inter, 2]), ("logits", vec![rows, self.vocab, 4]),
-            ("unary", vec![drafted, 16, 4]), ("candidates", vec![drafted, 16, 4]),
+            ("unary", vec![drafted, self.selector_top_k, 4]), ("candidates", vec![drafted, self.selector_top_k, 4]),
             ("projected", vec![rows, self.selector_rank, 2]), ("anchors", vec![seq, 4]),
             ("ids", vec![rows, 4]), ("tokens", vec![drafted, 4]),
             ("features", vec![drafted, 16]), ("positions", vec![rows, 8]),
@@ -1207,10 +1267,38 @@ impl MlaDflashConfig {
         } else { None };
         let weight_arena_requests = crate::families::glm5::draft_physical::mla_arena_requests(self, mode)
             .map_err(|error| unsupported(&error.to_string()))?;
-        let layout = MlaDraftRuntimeLayout { kind: self.kind, cache_format, target_hidden: h, target_vocab: self.vocab,
+        let layout = MlaDraftRuntimeLayout { kind: self.kind, hidden_stream: self.hidden_stream, complete_fp8_body: false, cache_format, target_hidden: h, target_vocab: self.vocab,
             target_taps: self.taps.clone(), capacity, weights, cache, paged_cache, program,
             fp8_scratch, sm_count, fp8_mode, buffers, owners: Vec::new(), weight_destinations: Vec::new(),
             weight_arena_requests, context_split: false };
+        layout.resident_bytes()?;
+        Ok(layout)
+    }
+
+    /// Production Kimi body representation: every body linear uses FP8 while
+    /// norms, codebooks, embeddings and prediction heads retain checkpoint math.
+    #[allow(clippy::too_many_arguments)]
+    pub fn serving_runtime_layout(&self,
+        mode: crate::families::glm5::draft_representation::GlmDraftRepresentation,
+        capacity: crate::families::glm5::draft_representation::GlmDraftCapacity,
+        compiled_context: usize, target_pool_tokens: usize, sm_count: usize, fp8_mode: u8,
+        cache_format: MlaCacheFormat) -> Result<MlaDraftRuntimeLayout> {
+        if self.kind.is_dflash() && mode == crate::families::glm5::draft_representation::GlmDraftRepresentation::Fp8Only {
+            self.complete_fp8_runtime_layout(capacity, compiled_context, target_pool_tokens, sm_count, fp8_mode, cache_format)
+        } else { self.runtime_layout(mode, capacity, compiled_context, target_pool_tokens, sm_count, fp8_mode, cache_format) }
+    }
+
+    /// Complete-body native FP8 recipe shared by planning and the real loader.
+    pub fn complete_fp8_runtime_layout(&self,
+        capacity: crate::families::glm5::draft_representation::GlmDraftCapacity,
+        compiled_context: usize, target_pool_tokens: usize, sm_count: usize, fp8_mode: u8,
+        cache_format: MlaCacheFormat) -> Result<MlaDraftRuntimeLayout> {
+        let mut layout = self.runtime_layout(crate::families::glm5::draft_representation::GlmDraftRepresentation::Fp8Only,
+            capacity, compiled_context, target_pool_tokens, sm_count, fp8_mode, cache_format)?;
+        layout.complete_fp8_body = true;
+        layout.weights = self.complete_fp8_weight_layout()?;
+        layout.weight_arena_requests = crate::families::glm5::draft_physical::mla_complete_fp8_arena_requests(self)
+            .map_err(|error| unsupported(&error.to_string()))?;
         layout.resident_bytes()?;
         Ok(layout)
     }
@@ -1321,7 +1409,7 @@ impl MlaDflashConfig {
         weights.bf16_auxiliary = weights.bf16_auxiliary.checked_add(destination_bytes.checked_sub(source_bytes)
             .ok_or_else(|| unsupported("mtp_dspark packing lost source bytes"))?)
             .ok_or_else(|| unsupported("mtp_dspark generated weight overflow"))?;
-        let layout = MlaDraftRuntimeLayout { kind: self.kind, cache_format, target_hidden: h, target_vocab: self.vocab,
+        let layout = MlaDraftRuntimeLayout { kind: self.kind, hidden_stream: self.hidden_stream, complete_fp8_body: false, cache_format, target_hidden: h, target_vocab: self.vocab,
             target_taps: self.taps.clone(), capacity, weights, cache, paged_cache, program,
             fp8_scratch: None, sm_count, fp8_mode: 0, buffers, owners, weight_destinations,
             weight_arena_requests: Vec::new(), context_split: false };
@@ -1535,6 +1623,46 @@ mod tests {
         assert!(batch.context_shards(None, 0).is_err());
     }
 
+    #[test]
+    fn kimi_serving_fp8_covers_all_body_linears_and_preserves_native_auxiliaries() {
+        use crate::families::glm5::draft_representation::{GlmDraftCapacity, GlmDraftRepresentation};
+        for raw in [config(), causal_config()] {
+            let cfg = MlaDflashConfig::from_json(&raw).unwrap();
+            for cache in [MlaCacheFormat::Bf16, MlaCacheFormat::Fp8] {
+                let capacity = GlmDraftCapacity::new(2, 2, cfg.block).unwrap();
+                let make = |mode| cfg.serving_runtime_layout(mode, capacity, 8192, 16384, 188, 0, cache).unwrap();
+                let fp8 = make(GlmDraftRepresentation::Fp8Only);
+                assert!(fp8.complete_fp8_body());
+                assert_eq!(fp8.weights(), cfg.complete_fp8_weight_layout().unwrap());
+                for name in ["self_attn.q_b_proj.weight", "self_attn.o_proj.weight", "kv_b_proj.weight.uk", "kv_b_proj.weight.uv"] {
+                    assert!(fp8.weight_arena_requests().iter().any(|(n,_)|n.ends_with(&format!("{name}.payload"))), "{name}");
+                    assert!(fp8.weight_arena_requests().iter().any(|(n,_)|n.ends_with(&format!("{name}.scales"))), "{name}");
+                }
+                assert!(fp8.weight_arena_requests().iter().any(|(name,_)|name.ends_with("q_a_proj.weight+layers.0.self_attn.kv_a_proj_with_mqa.weight.payload")));
+                assert!(!fp8.weight_arena_requests().iter().any(|(name,_)|name.contains("codebook.payload")));
+                assert!(!make(GlmDraftRepresentation::Bf16Only).complete_fp8_body());
+                assert!(fp8.with_pool_tokens(32768).unwrap().complete_fp8_body());
+                assert_eq!(fp8.weights().max_load_staging, crate::shared::dense_read::STEP_BYTES as u64);
+            }
+        }
+    }
+
+    #[test]
+    fn structural_context_split_auto_preserves_h64_and_avoids_missing_h96_kernel() {
+        use crate::families::kimi_k3::draft::resolve_context_split;
+        let root = tempfile::tempdir().unwrap();
+        for (raw, supported) in [(config(), true), (causal_config(), false)] {
+            std::fs::write(root.path().join("config.json"), serde_json::to_vec(&raw).unwrap()).unwrap();
+            assert_eq!(resolve_context_split(root.path(), None, true).unwrap(), supported);
+            assert!(!resolve_context_split(root.path(), None, false).unwrap());
+            assert!(!resolve_context_split(root.path(), Some(false), true).unwrap());
+            assert!(resolve_context_split(root.path(), Some(true), false).is_err());
+            let explicit = resolve_context_split(root.path(), Some(true), true);
+            if supported { assert!(explicit.unwrap()); }
+            else { assert!(explicit.unwrap_err().to_string().contains("kimik31_mla_draft_partial_causal_w1024_h96_m64")); }
+        }
+    }
+
     fn config() -> serde_json::Value {
         json!({"architectures":["DFlash2DraftModel"], "hidden_size":7168,
             "intermediate_size":14336, "num_hidden_layers":5, "num_attention_heads":64,
@@ -1554,6 +1682,71 @@ mod tests {
                 "selector_top_k":16, "target_layer_ids":[19,37,66,78,90], "mask_token_id":163592}})
     }
 
+    fn causal_config() -> serde_json::Value {
+        let mut raw = config();
+        raw["num_attention_heads"] = 96.into();
+        raw["num_key_value_heads"] = 96.into();
+        raw["is_causal"] = true.into();
+        raw["mla_use_nope"] = false.into();
+        raw["rope_interleave"] = true.into();
+        raw["sliding_window"] = 1024.into();
+        raw["layer_types"] = json!(vec!["sliding_attention"; 5]);
+        raw["dflash_config"]["block_size"] = 5.into();
+        raw["dflash_config"]["selector_top_k"] = 32.into();
+        raw["dflash_config"]["mask_token_id"] = 163824.into();
+        raw["dflash_config"]["aux_hidden_stream"] = "attn_res".into();
+        raw["dflash_config"]["target_layer_ids"] = json!([7,23,51,67,83,91]);
+        raw.as_object_mut().unwrap().remove("fc_norm");
+        raw.as_object_mut().unwrap().remove("mla_use_output_gate");
+        raw
+    }
+
+    #[test]
+    fn all_mla_draft_kv_is_independent_of_target_storage() -> anyhow::Result<()> {
+        use crate::families::qwen4::Qwen4KvCache;
+        let causal=MlaDflashConfig::from_json(&causal_config())?;
+        let legacy=MlaDflashConfig::from_json(&config())?;
+        for _target in [MlaCacheFormat::Bf16,MlaCacheFormat::Fp8] {
+            for (draft,expected) in [(Qwen4KvCache::Bf16,MlaCacheFormat::Bf16),(Qwen4KvCache::Fp8,MlaCacheFormat::Fp8)] {
+                assert_eq!(causal.cache_format(draft),expected);
+                assert_eq!(legacy.cache_format(draft),expected);
+                let cache=causal.cache_layout(2,8192,expected)?;
+                assert_eq!(cache.cache_bytes,5*2*1088*expected.record_bytes() as u64);
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn causal_checkpoint_declares_missing_flags_and_exact_header_geometry() -> anyhow::Result<()> {
+        let raw = causal_config();
+        let cfg = MlaDflashConfig::from_json(&raw)?;
+        assert_eq!(cfg.kind, cuteafd_core::coordinator_programs::MlaDraftKind::CausalDflash2);
+        assert_eq!((cfg.mla.heads, cfg.block, cfg.drafts(), cfg.selector_top_k), (96,5,4,32));
+        assert_eq!(cfg.taps, [7,23,51,67,83,91]);
+        assert_eq!(cfg.windows, vec![Some(1024);5]);
+        let shapes: std::collections::BTreeMap<_,_> = cfg.tensor_shapes().into_iter().collect();
+        assert_eq!(shapes.len(),86);
+        assert_eq!(shapes["fc.weight"], [7168,43008]);
+        assert_eq!(shapes["layers.0.self_attn.q_b_proj.weight"], [18432,1536]);
+        assert_eq!(shapes["layers.0.self_attn.kv_b_proj.weight"], [24576,512]);
+        assert_eq!(shapes["layers.0.self_attn.o_proj.weight"], [7168,12288]);
+        assert_eq!(cfg.bf16_weight_bytes()?, 5_569_622_016);
+        for key in ["rope_interleave", "mla_use_nope"] {
+            let mut missing = raw.clone(); missing.as_object_mut().unwrap().remove(key);
+            assert!(MlaDflashConfig::from_json(&missing).is_err());
+        }
+        for key in ["fc_norm", "mla_use_output_gate"] {
+            let mut changed = raw.clone(); changed[key] = true.into();
+            assert!(MlaDflashConfig::from_json(&changed).is_err());
+            let mut legacy = config(); legacy.as_object_mut().unwrap().remove(key);
+            assert!(MlaDflashConfig::from_json(&legacy).is_err());
+        }
+        let mut wrong = raw.clone(); wrong["dflash_config"]["aux_hidden_stream"] = "terminal".into();
+        assert!(MlaDflashConfig::from_json(&wrong).is_err());
+        Ok(())
+    }
+
     /// Every buffer each real layout emits is classified by rule: only the
     /// retained paged cache is KV, per-batch tables and context-update planes
     /// are scratch, the RoPE table is a constant and only peer landings are Transport.
@@ -1562,7 +1755,7 @@ mod tests {
         use crate::families::glm5::draft_representation::{GlmDraftCapacity, GlmDraftRepresentation::*};
         use cuteafd_core::memory_layout::MemoryKind::*;
         let cfg = MlaDflashConfig::from_json(&config()).unwrap();
-        let ml4 = MlaDflashConfig { mla: MlaGeometry { hidden: 6144, heads: 64, q_rank: 0,
+        let ml4 = MlaDflashConfig { hidden_stream: Default::default(), mla: MlaGeometry { hidden: 6144, heads: 64, q_rank: 0,
             kv_rank: 512, nope: 64, rope: 64, value: 128 }, intermediate: 24576, eps: 1e-5,
             block: 3, group: 0, selector_rank: 512, selector_top_k: 0, taps: vec![1,18,36,54,71],
             vocab: 204800, mask_token: 0, max_context: 1 << 20, windows: vec![Some(2048); 3],
@@ -1728,7 +1921,7 @@ mod tests {
     fn ml4_owner_and_view_receipts_match_tp1_and_five_spark_min() -> anyhow::Result<()> {
         use std::collections::{BTreeMap, BTreeSet};
         use crate::families::glm5::draft_representation::{GlmDraftCapacity, GlmDraftRepresentation::Bf16Only};
-        let cfg = MlaDflashConfig { mla: MlaGeometry { hidden: 6144, heads: 64, q_rank: 0,
+        let cfg = MlaDflashConfig { hidden_stream: Default::default(), mla: MlaGeometry { hidden: 6144, heads: 64, q_rank: 0,
             kv_rank: 512, nope: 64, rope: 64, value: 128 }, intermediate: 24576, eps: 1e-5,
             block: 3, group: 0, selector_rank: 512, selector_top_k: 0, taps: vec![1,18,36,54,71],
             vocab: 204800, mask_token: 0, max_context: 1 << 20, windows: vec![Some(2048); 3],
@@ -2005,6 +2198,45 @@ mod tests {
         assert!(layout.fp8_scratch.as_ref().unwrap().shapes.iter().any(|s| s.n == 65536 && s.k == 7168));
         cfg.mla.hidden = usize::MAX;
         assert!(cfg.runtime_layout(Bf16Only, capacity, 262144, 262144, 188, 0, MlaCacheFormat::Bf16).is_err());
+    }
+
+    #[test]
+    fn complete_mla_fp8_inventory_covers_every_body_projection_once() -> anyhow::Result<()> {
+        use crate::families::glm5::{draft_physical::mla_complete_fp8_arena_requests,
+            draft_representation::{draft_weight_role, DraftWeightRole}};
+        for raw in [config(), causal_config()] {
+            let cfg = MlaDflashConfig::from_json(&raw)?;
+            let requests = mla_complete_fp8_arena_requests(&cfg)?;
+            let arena = crate::serving_capacity::WeightArenaLayout::new("test/complete-draft", requests.clone())?;
+            let count = cfg.complete_fp8_weight_layout()?;
+            assert_eq!(arena.payload_bytes() as u64, count.resident_bytes()?);
+            assert_eq!(count.bf16_values, 0);
+            assert_eq!(count.max_load_staging, crate::shared::dense_read::STEP_BYTES as u64);
+            for (name, _) in cfg.tensor_shapes() {
+                match draft_weight_role(&name).unwrap() {
+                    DraftWeightRole::BodyLinear if name.ends_with(".self_attn.kv_b_proj.weight") => {
+                        assert!(!requests.iter().any(|(id, _)| id == &name));
+                        for part in ["uk", "uv"] {
+                            assert!(arena.view(&format!("{name}.{part}.payload")).is_some());
+                            assert!(arena.view(&format!("{name}.{part}.scales")).is_some());
+                        }
+                    }
+                    DraftWeightRole::BodyLinear => {
+                        assert!(!requests.iter().any(|(id, _)| id == &name));
+                        assert!(requests.iter().any(|(id, _)| id.ends_with(".payload") && id.contains(&name)));
+                    }
+                    _ => {
+                        assert!(arena.view(&name).is_some());
+                        assert!(arena.view(&format!("{name}.payload")).is_none());
+                    }
+                }
+            }
+            if cfg.mla.heads == 96 {
+                assert_eq!((count.fp8_values, count.fp8_scales, count.resident_bytes()?),
+                    (2_700_541_952, 86_358_016, 2_955_438_080));
+            }
+        }
+        Ok(())
     }
 
     #[test]

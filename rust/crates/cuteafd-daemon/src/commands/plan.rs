@@ -447,7 +447,13 @@ fn tp2_dflash(args: &PlanArgs, family: &str,
         Some("on") => true,
         Some(_) => anyhow::bail!("TP2_DFLASH must be on or off"),
     };
-    let enabled = args.tp2_dflash.unwrap_or(configured);
+    let enabled = if family == "kimi_k3" && args.speculator == "dflash2" {
+        let requested = args.tp2_dflash.or_else(|| cfg.get("TP2_DFLASH").filter(|v| !v.is_empty()).map(|v| v == "on"));
+        match &args.drafter_snapshot {
+            Some(snapshot) => cuteafd_loader::families::kimi_k3::draft::resolve_context_split(snapshot, requested, default_on)?,
+            None => args.tp2_dflash.unwrap_or(configured),
+        }
+    } else { args.tp2_dflash.unwrap_or(configured) };
     anyhow::ensure!(!enabled || (args.layout && args.rtx == 2 && args.speculator == "dflash2"
         && matches!(family, "mimo_v2" | "kimi_k3" | "glm5_flash" | "muse_spark")),
         "TP2_DFLASH requires MiMo/Kimi/GLM Flash/Muse, --layout, --rtx 2 and DFlash2");
@@ -1860,9 +1866,53 @@ mod tests {
     }
 
     #[test]
+    fn kimi_structural_draft_default_matches_direct_serve_and_explicit_refusal() -> Result<()> {
+        use clap::{CommandFactory, FromArgMatches, Parser};
+        let root = tempfile::tempdir()?;
+        for (heads, causal, expected) in [(64, false, true), (96, true, false)] {
+            let block = if causal { 5 } else { 8 };
+            let mut raw = serde_json::json!({"architectures":["DFlash2DraftModel"],"hidden_size":7168,
+                "intermediate_size":14336,"num_hidden_layers":5,"num_attention_heads":heads,
+                "num_key_value_heads":heads,"q_lora_rank":1536,"kv_lora_rank":512,
+                "qk_nope_head_dim":128,"qk_rope_head_dim":64,"v_head_dim":128,"rms_norm_eps":1e-5,
+                "vocab_size":163840,"draft_vocab_size":163840,"max_position_embeddings":1048576,
+                "num_target_layers":93,"layer_types":vec!["sliding_attention";5],
+                "sliding_window":if causal {1024}else{4096},"use_sliding_window":true,
+                "is_causal":causal,"mla_use_output_gate":false,"fc_norm":false,"attention_bias":false,"hidden_act":"silu",
+                "rope_parameters":{"rope_type":"yarn","rope_theta":50000.,"factor":32.,
+                    "original_max_position_embeddings":32768,"beta_fast":32,"beta_slow":1,"mscale":1.,"mscale_all_dim":1.},
+                "dflash_config":{"attention_mode":"mla","block_size":block,"conv_kernel_size":2,"conv_group_size":16,
+                    "selector_rank":256,"selector_top_k":if causal{32}else{16},"target_layer_ids":[7,23,51,67,83,91],"mask_token_id":163824}});
+            if causal { raw["mla_use_nope"]=false.into();raw["rope_interleave"]=true.into();raw["dflash_config"]["aux_hidden_stream"]="attn_res".into(); }
+            std::fs::write(root.path().join("config.json"), serde_json::to_vec(&raw)?)?;
+            for explicit in [None,Some(false),Some(true)] {
+                let mut plan = args(std::path::Path::new("/model"),6,false);
+                plan.layout=true;plan.rtx=2;plan.speculator="dflash2".into();plan.drafter_snapshot=Some(root.path().into());plan.tp2_dflash=explicit;
+                let mut argv=vec!["cuteafd","serve-kimi","--snapshot","/model","--native-lib","/native.so","--split-device","1","--draft",root.path().to_str().unwrap()];
+                if let Some(value)=explicit {argv.extend(["--tp2-dflash",if value{"true"}else{"false"}]);}
+                let matches=crate::cli::Cli::command().try_get_matches_from(argv)?;
+                let mut cli=crate::cli::Cli::from_arg_matches(&matches)?;
+                let direct=crate::cli::resolve_tp2_dflash(&mut cli.command,&matches);
+                let planned=tp2_dflash(&plan,"kimi_k3",&Default::default());
+                if causal && explicit==Some(true) {
+                    for error in [direct.unwrap_err(),planned.unwrap_err()] {
+                        assert!(error.to_string().contains("kimik31_mla_draft_partial_causal_w1024_h96_m64"));
+                    }
+                } else {
+                    direct?;
+                    let crate::cli::Commands::ServeKimi(served)=cli.command else {panic!("serve-kimi")};
+                    assert_eq!(planned?,explicit.unwrap_or(expected));
+                    assert_eq!(served.tp2_dflash,explicit.unwrap_or(expected));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
     fn tp2_dflash_plan_and_direct_serve_defaults_agree() {
         use clap::{CommandFactory, FromArgMatches, Parser};
-        for (family, command) in [("mimo_v2", "serve-mimo"), ("kimi_k3", "serve-kimi"), ("muse_spark", "serve-muse")] {
+        for (family, command) in [("mimo_v2", "serve-mimo"), ("muse_spark", "serve-muse")] {
             for split in [false, true] {
                 for draft in [false, true] {
                     for explicit in [None, Some(false), Some(true)] {
@@ -1880,7 +1930,7 @@ mod tests {
                             else { panic!("expected plan") };
                         let matches = crate::cli::Cli::command().try_get_matches_from(serve).unwrap();
                         let mut parsed = crate::cli::Cli::from_arg_matches(&matches).unwrap();
-                        crate::cli::resolve_tp2_dflash(&mut parsed.command, &matches);
+                        crate::cli::resolve_tp2_dflash(&mut parsed.command, &matches).unwrap();
                         let served = match parsed.command {
                             crate::cli::Commands::ServeMimo(args) => args.engine.tp2_dflash,
                             crate::cli::Commands::ServeKimi(args) => args.tp2_dflash,

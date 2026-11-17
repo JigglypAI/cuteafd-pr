@@ -344,7 +344,7 @@ impl<'a> Qwen4Loader<'a> {
                 ptr: unsafe { scale.buffer.ptr.cast::<u8>().add(window.start / 128 * kb * 4) }.cast(),
                 bytes: n.div_ceil(128) * kb * 4, ..scale.buffer };
             self.step(parts, vec![crate::shared::experts::rtx::dense::Job::RowQuant { rows: n, cols,
-                rule: self.fp8_scales, q: qw, scale: sw, block: true }])?;
+                rule: self.fp8_scales, q: qw, scale: sw, block: true, scale_repeat: Default::default() }])?;
         }
         Ok((q, scale))
     }

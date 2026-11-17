@@ -2000,7 +2000,7 @@ mod measured_adoption_tests {
                 SparkReplyFormats::default()),
             decisions: Decisions {
                 attention: Vec::new(), onboard_layers: vec![Vec::new()],
-                expert_homes: BTreeMap::new(), embedding: None, draft_home: None,
+                expert_homes: BTreeMap::new(), embedding: None, draft_home: None, draft_traffic_bytes_per_cycle: 0,
                 head_home: None, intake_home: None, encoder: None,
                 prefill: PrefillShape { rows: 1, waves: 1 }, lanes: 1,
                 spark_reply_formats: None,
