@@ -43,12 +43,9 @@
 //! starts at [`COPY_COLD_RATE`], so a cold copy verifies one explored position
 //! and grows as copies are accepted.
 //!
-//! `m = 8` equals the request window: a request whose whole window disagrees
-//! with the server moves a position's probability exactly half way from the
-//! server rate to its own, so eight straight misses at a position the server
-//! accepts 95% of the time give 0.475 (stop, keep exploring) and a single miss
-//! gives 0.84 (keep). Smaller `m` lets one or two misses cut a good position;
-//! larger `m` cannot suppress a position a request really keeps missing.
+//! The request prior has strength two: after eight reached observations the
+//! request owns 80% of the estimate. A code-conditioned server must not keep
+//! a subsequent low-acceptance prose request at full width indefinitely.
 use serde::Serialize;
 use std::collections::{HashMap, VecDeque};
 
@@ -57,7 +54,14 @@ pub const REQUEST_WINDOW: usize = 8;
 /// Rounds that reached a position, server wide.
 pub const SERVER_WINDOW: usize = 256;
 /// Weight `m` of the server rate against the request's own counts, in rounds.
-pub const PRIOR_STRENGTH: f64 = 8.;
+/// V4.1 fixed7 card-order replay (code first, then prose; 20 prose requests):
+/// m | prose rows/round | tokens/round | tokens/row | code-after tokens/round
+/// 8 | 6.77             | 1.97         | 0.29       | 4.96
+/// 4 | 5.54             | 1.93         | 0.35       | --
+/// 2 | 4.12             | 1.83         | 0.45       | 4.89
+/// 1 | 3.05             | 1.81         | 0.59       | --
+/// Two cuts prose rows 39% for 7% fewer tokens/round; code changes -1.4%.
+pub const PRIOR_STRENGTH: f64 = 2.;
 /// A position is kept while its probability is above this.
 pub const KEEP_CUT: f64 = 0.5;
 /// A head-calibrated explore position below this is skipped for the round.
@@ -726,6 +730,26 @@ mod tests {
         assert_eq!(positions.iter().map(|p| p.outcome).collect::<Vec<_>>(), [Some(true), Some(true), Some(false)]);
         // Position 2 was explored from the second round on: one miss already puts it under the cut.
         assert_eq!((policy.stats().explored, policy.stats().explore_accepted), (8, 0));
+    }
+
+    #[test]
+    fn prose_request_overcomes_code_conditioned_server_within_its_window() {
+        let mut policy = policy(7);
+        for _ in 0..40 {
+            policy.plan(&[(9, 7)], 64);
+            policy.observe(&[outcome(9, 7, 7)], false);
+        }
+        // First position always agrees; each subsequent position agrees with
+        // probability .3. This deterministic ten-round cycle reaches P2 on
+        // every round and accepts it exactly three times.
+        let accepted = [1, 1, 2, 1, 1, 2, 1, 1, 2, 1];
+        let mut shortened = None;
+        for round in 0..REQUEST_WINDOW {
+            let depth = policy.plan(&[(1, 7)], 64)[0];
+            policy.observe(&[outcome(1, depth, accepted[round].min(depth))], false);
+            if policy.plan(&[(1, 7)], 64)[0] <= 3 { shortened = Some(round + 1); break; }
+        }
+        assert!(shortened.is_some(), "code-conditioned prior prevents request adaptation");
     }
 
     #[test]
