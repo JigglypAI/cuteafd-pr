@@ -1361,7 +1361,7 @@ impl Submitter {
         let prefix_cache_source = PrefixCacheSource::default();
         if let Some(scope) = &usage { scope.finish_detail(finish_detail.clone()); }
         let job = NativeRequest {
-            image_groups: Vec::new(), prefix_cache_source: prefix_cache_source.clone(),
+            prefix_cache_source: prefix_cache_source.clone(),
             finish_detail: finish_detail.clone(),
             audio: prepared.audio,
             image_groups: prepared.image_groups,
