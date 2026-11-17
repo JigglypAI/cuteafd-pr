@@ -20,7 +20,7 @@ fn report(dir: &std::path::Path, gpus: usize, gib: u64, ranks: usize, pool: Opti
 fn report_context(dir: &std::path::Path, gpus: usize, gib: u64, ranks: usize, pool: Option<u64>, context: u64) -> PlanReport {
     let manifest = native_manifest(dir);
     plan::plan(dir, &PlanOptions { placement: ExpertPlacement::from_spark_ranks(ranks),
-        draft_ownership: Some(spec::DraftOwnership::None),
+        draft_ownership: Some(spec::DraftOwnership::None), vision: MediaMode::Off,
         layout: Some(layout::LayoutOptions { host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram), rtx_bytes: vec![gib<<30;gpus], pool_tokens: pool, context_tokens: context,
             workspace_manifest: Some(manifest), ..Default::default() }),
         ..Default::default() }).unwrap()
@@ -704,7 +704,10 @@ fn official_nested_inventory_separates_target_tail_mtp_vision() {
     let result = report(dir.path(),1,96,6,Some(262_144));
     assert!(result.config_error.is_none(),"{:?}",result.config_error);
     assert!(result.unclassified.is_empty(),"{:?}",result.unclassified);
-    assert!(result.executable() && result.wip_launchable() && result.native_serving_admitted, "{:?}", result.hints);
+    assert!(result.executable() && result.wip_launchable() && result.native_serving_admitted);
+    assert_eq!(result.onboard_layers, Some(0));
+    assert!(result.memory_layout.as_ref().unwrap().notes.iter()
+        .any(|note| note.contains("unimplemented (#2429)")));
     assert_eq!(result.min_spark_ranks,Some(6));
 }
 
@@ -1673,7 +1676,7 @@ fn nvfp4_whole_onboarding_is_refused_with_its_missing_executor() {
     assert!(auto.memory_layout.as_ref().unwrap().notes.iter()
         .any(|n| n == super::admission::NATIVE_ONBOARDING_TWO_RTX));
     let explicit = plan_with(Some(crate::placement::OnboardSetting::Layers(2)));
-    assert!(explicit.hints.iter().any(|h| h.what.contains("whole-layer RTX expert executor is not implemented")), "{:#?}", explicit.hints);
+    assert!(explicit.hints.iter().any(|h| h.what.contains(super::admission::NATIVE_ONBOARDING_TWO_RTX)), "{:#?}", explicit.hints);
 }
 
 #[test]
@@ -2211,5 +2214,86 @@ fn mc_whole_fp8_core_selects_target_and_mtp_without_expert_conversion() -> anyho
     assert_eq!(requests,vec![256;12]);
     assert!(checkpoint.tensors.iter().filter(|tensor|tensor.meta.name.contains(".moe.experts.")).all(|tensor|
         !checkpoint.converts_to_fp8(&tensor.meta.name)));
+    Ok(())
+}
+
+#[test]
+fn default_vision_and_native_fp8_single_gpu_use_joint_admission() -> anyhow::Result<()> {
+    use crate::plan::checkpoint::{CheckpointView, CoreView};
+    let emit = |name: &str, input: &testing::BudgetedPlanInput, manifest: &std::path::Path,
+        gpus: usize, sparks: usize| -> anyhow::Result<()> {
+        let report = input.plan(&PlanOptions {
+            placement: ExpertPlacement::from_spark_ranks(sparks),
+            draft_ownership: Some(spec::DraftOwnership::NativeMtp),
+            vision: MediaMode::Auto,
+            layout: Some(layout::LayoutOptions {
+                host_memory: Some(testing::SimulatedHost::raptor().host_ram),
+                rtx_bytes: vec![crate::placement::inventory::PRO_TOTAL_BYTES; gpus],
+                workspace_manifest: Some(manifest.to_path_buf()),
+                native_mtp_layers: 3,
+                step5_kv: crate::families::qwen4::Qwen4KvCache::Fp8,
+                ..Default::default()
+            }), ..Default::default()
+        })?;
+        let mut value = serde_json::json!({"card": name, "gpus": gpus, "sparks": sparks,
+            "launchable": report.wip_launchable(), "onboard": report.onboard_layers,
+            "hints": report.hints.iter().map(|hint| &hint.what).collect::<Vec<_>>()});
+        if let Some(memory) = &report.memory_layout {
+            value["pool"] = serde_json::json!(memory.pool_tokens);
+            value["devices"] = serde_json::json!(memory.devices.iter().map(|device| {
+                serde_json::json!({"device":device.name(), "bytes": device.used_bytes(),
+                    "capacity":device.capacity_bytes,
+                    "experts":device.items.iter().filter(|item| item.category == cuteafd_core::memory_layout::Category::Experts)
+                        .map(|item|item.bytes).sum::<u64>()})
+            }).collect::<Vec<_>>());
+        }
+        if let Some(ledger) = &report.phase_ledger {
+            value["binding"] = serde_json::json!(ledger.phases.iter().filter(|phase|
+                phase.budget.starts_with("rtx") || phase.budget.starts_with("spark"))
+                .min_by_key(|phase| phase.available.saturating_sub(phase.owned + phase.opaque))
+                .map(|phase| serde_json::json!({"device":phase.budget,"phase":phase.phase,
+                    "needed":phase.owned+phase.opaque,"available":phase.available})));
+        }
+        eprintln!("CARD_TRUTH {value}");
+        assert!(report.wip_launchable(), "{name} {gpus}+{sparks}: {:?}", report.hints);
+        let encoder = report.encoder.as_ref().expect("default bundled PE encoder");
+        assert!(!matches!(encoder.kind, crate::plan::encoder::EncoderKind::Off));
+        assert!(encoder.weights > 0 && encoder.scratch > 0);
+        assert!(report.memory_layout.as_ref().unwrap().devices.iter()
+            .all(|device| device.used_bytes() <= device.capacity_bytes));
+        if name == "fp8" && gpus == 1 {
+            assert_eq!(report.onboard_layers, Some(0));
+            assert!(report.memory_layout.as_ref().unwrap().notes.iter()
+                .any(|note| note.contains("unimplemented (#2429)")));
+        }
+        Ok(())
+    };
+    for (kind, gpus, sparks) in [("fp8",1,6),("fp8",2,6),("nvfp4",1,4)] {
+        let dir = snapshot(kind);
+        let manifest = native_manifest(dir.path());
+        let input = testing::BudgetedPlanInput::open(dir.path())?;
+        emit(kind, &input, &manifest, gpus, sparks)?;
+    }
+    let source = exl3_snapshot();
+    let cp = Checkpoint::open(source.path())?;
+    let cfg = Config::parse(&cp)?;
+    let tensors = cp.tensors.iter().map(|tensor| testing::t(&tensor.meta.name,
+        match &tensor.meta.dtype { DType::Bf16=>"BF16",DType::F16=>"F16",DType::F32=>"F32",DType::I16=>"I16",
+            DType::I32=>"I32",DType::U8=>"U8",other=>panic!("{other:?}") }, &tensor.meta.shape)).collect::<Vec<_>>();
+    let (mtp,target) = exl3::expected(&cfg).into_iter().partition(|(name,_)|
+        name.strip_prefix("model.layers.").and_then(|rest|rest.split('.').next())
+            .and_then(|layer|layer.parse::<usize>().ok()).is_some_and(|layer|layer>=cfg.layers));
+    let mc = tempfile::tempdir()?;
+    let mut config=cp.config.clone();
+    for key in ["core_bits","head_bits"] { config["quantization_config"].as_object_mut().unwrap().remove(key); }
+    testing::write_mc_snapshot_with_mtp(mc.path(),&config,&tensors,&target,&mtp);
+    let manifest = native_manifest(mc.path());
+    for view in [CoreView::Original,CoreView::K6Compact,CoreView::K8Compact] {
+        let selected=CheckpointView::select(mc.path(),view)?;
+        let input=testing::BudgetedPlanInput::from_checkpoint(Checkpoint::open_view(&selected)?);
+        for (gpus,sparks) in [(1,3),(2,6)] {
+            emit(&format!("mc-{view:?}"),&input,&manifest,gpus,sparks)?;
+        }
+    }
     Ok(())
 }

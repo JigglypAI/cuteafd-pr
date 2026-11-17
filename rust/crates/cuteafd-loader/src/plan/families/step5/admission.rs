@@ -298,7 +298,8 @@ pub fn tp2_exchange_requests(unit_rows: usize, lanes: usize, exchange: Tp2Exchan
 }
 
 /// Native fp8moe experts have a TP2 owner; the single-GPU whole owner is EXL3-only.
-pub const NATIVE_ONBOARDING_TWO_RTX: &str = "Step-5 native FP8/NVFP4 whole-layer RTX expert executor is not implemented;     use two coordinator GPUs for native TP2 onboarding or leave routed experts on Sparks";
+pub const NATIVE_ONBOARDING_TWO_RTX: &str = "Step-5 native FP8/NVFP4 whole-layer RTX expert executor is unimplemented (#2429); \
+    use two coordinator GPUs for native TP2 onboarding or leave routed experts on Sparks";
 
 /// The named structural reason a routed format cannot onboard, or None.
 pub fn onboarding_unavailable(catalog: &crate::OfficialV41Catalog, gpus: usize) -> Option<&'static str> {

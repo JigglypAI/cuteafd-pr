@@ -630,7 +630,7 @@ def test_step5_example_configs(tmp_path: Path, name, model, revision, gpus, spar
     values = _keys(path)
     assert (values["MODEL_ID"], values["MODEL_REVISION"], values["RTX_GPUS"]) == (model, revision, gpus)
     assert values["SPARK_COUNT"] == str(sparks)
-    assert (values["SPECULATOR"], values["VISION"], values["AUDIO"], values["POOL_TOKENS"]) == ("mtp", "off", "off", "auto")
+    assert (values["SPECULATOR"], values.get("VISION", "auto"), values["AUDIO"], values["POOL_TOKENS"]) == ("mtp", "auto", "off", "auto")
     for rank in range(sparks):
         assert values[f"SPARK_{rank}_HOST"] == f"REPLACE-ME-spark-{rank}"
         assert values[f"SPARK_{rank}_LANE_A"] == f"192.0.2.{rank + 1}"
