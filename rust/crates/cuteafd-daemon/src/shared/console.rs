@@ -660,6 +660,38 @@ mod tests {
     }
 
     #[test]
+    fn isolated_c1_response_counters_equal_actual_global_deltas() {
+        if std::env::var_os("CUTEAFD_TEST_ISOLATED_USAGE").is_none() {
+            let result = std::process::Command::new("timeout").arg("60")
+                .arg(std::env::current_exe().unwrap()).args(["--exact",
+                    "shared::console::tests::isolated_c1_response_counters_equal_actual_global_deltas", "--nocapture"])
+                .env("CUTEAFD_TEST_ISOLATED_USAGE","1").output().unwrap();
+            assert!(result.status.success(),"{}{}",String::from_utf8_lossy(&result.stdout),String::from_utf8_lossy(&result.stderr));
+            return;
+        }
+        use cuteafd_api::usage::{Counters, Record, UsageHandle, UsageSink};
+        struct Sink(Counters);
+        impl UsageSink for Sink {
+            fn record(&self, _: Record) {}
+            fn counters(&self) -> &Counters { &self.0 }
+        }
+        let usage = UsageHandle::new(Record { rid:"isolated-c1".into(), ..Default::default() },
+            Arc::new(Sink(Counters::default())));
+        let ticket = admit(5,0,16,false,0,Instant::now(),Some(usage.clone()));
+        let before = totals::snapshot();
+        for (proposal,emitted) in [(&[1,2,3][..], &[4,5][..]), (&[1,2][..], &[4,5,6][..])] {
+            let mut step = Step::begin(0);
+            step.member(&ticket,proposal,proposal.len(),emitted,false,false);
+            step.end(Vec::new);
+        }
+        let after = totals::snapshot();
+        let request = usage.speculation().unwrap();
+        for (field,total) in [("proposed","drafted_tokens"),("accepted","accepted_drafts"),("cycles","verification_rounds")] {
+            assert_eq!(request[field].as_u64().unwrap(),after[total].as_u64().unwrap()-before[total].as_u64().unwrap());
+        }
+    }
+
+    #[test]
     fn totals_snapshot_has_loop_aborts() {
         // Other threaded tests may bump the same global, so assert monotonicity
         // rather than an exact delta (the review's snapshot race).
