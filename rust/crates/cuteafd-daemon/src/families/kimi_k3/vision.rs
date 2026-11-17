@@ -148,7 +148,8 @@ pub(crate) fn tower(snapshot: &Path, max_output_rows: usize) -> Result<TowerSpec
         native.q_norm[layer] = NONE;
         native.k_norm[layer] = NONE;
     }
-    TowerSpec::from_parts_with_constants(native, reads, vec![constant]).map_err(Into::into)
+    TowerSpec::from_parts_with_constants(native, reads, vec![constant])
+        .map(|spec| spec.with_family(cuteafd_loader::media::ImageFamily::Kimi)).map_err(Into::into)
 }
 
 #[cfg(test)]
@@ -199,6 +200,10 @@ mod tests {
         let spec = tower(dir.path(), MAX_IMAGE_TOKENS as usize)?;
         assert_eq!(spec.native.weight_bytes, 894_718_080);
         assert_eq!(spec.native.blocks.len(), 27);
+        assert_eq!(spec.image_family(),cuteafd_loader::media::ImageFamily::Kimi);
+        let mut changed_geometry=spec.clone();
+        changed_geometry.native.tower.as_mut().unwrap().temporal_patch=2;
+        assert_eq!(changed_geometry.image_family(),cuteafd_loader::media::ImageFamily::Kimi);
         let extension = spec.native.tower.as_ref().unwrap();
         assert_eq!(extension.inv_freq[1], extension.inv_freq[2]);
         assert_eq!(extension.attention_width, 1536);
