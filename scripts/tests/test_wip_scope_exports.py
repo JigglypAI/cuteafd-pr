@@ -114,9 +114,10 @@ def flags_for(family, model, count, role='coordinator'):
     return cmake_flags(role, env)
 
 
-def test_kimi_coordinator_flags_turn_v41_and_vision_off():
+def test_kimi_coordinator_flags_turn_v41_off_and_shared_vision_on():
     flags = flags_for('kimi_k3', 'Kimi-K3-EXL3-K2', 6)
-    for flag in V41_COORDINATOR + ('V41_EXPERT', 'V41_NVFP4', 'VISION_ATTENTION'):
+    assert flags['CUTEAFD_ENABLE_VISION_ATTENTION_AOT'] == 'ON'
+    for flag in V41_COORDINATOR + ('V41_EXPERT', 'V41_NVFP4'):
         assert flags[f'CUTEAFD_ENABLE_{flag}_AOT'] == 'OFF', flag
     assert flags['CUTEAFD_ENABLE_KIMIK3_AOT'] == 'ON'
     assert flags['CUTEAFD_EXPERT_FAMILIES'] == 'kimik3:exl3-k23'
