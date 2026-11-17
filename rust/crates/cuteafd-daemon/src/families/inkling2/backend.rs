@@ -313,7 +313,8 @@ impl<'a> Backend<'a> for InklingBackend<'a> {
         crate::shared::speculation_trace::Deferred::new(move || serde_json::json!({"kind":"inkling2", "rows":rows, "attention":"eager"}))
     }
     fn draft_head_kind(&self) -> cuteafd_core::HeadScore { cuteafd_core::HeadScore::None }
-    fn draft_copies(&self) -> bool { true }
+    // Exact FIR verification owns one anchor plus the native seven drafts.
+    fn draft_copies(&self) -> bool { false }
     fn prefill_draft(&self,p:&Placement,_:usize,_:&[u32],next:Option<u32>,state:&mut Draft)->Result<()>{
         if let Some(draft)=&self.execution.borrow().draft{ensure!(draft.drafter.frontier(p.slot)?.1==p.len,"Inkling draft prefill frontier differs");}
         state.anchor=next;Ok(())
@@ -385,7 +386,7 @@ mod tests {
             &serde_json::from_str(include_str!("../../../../cuteafd-loader/src/families/inkling2/fixtures/config.json"))?)?;
         let width = config.predictions();
         assert_eq!(width, 7);
-        let mut policy = DraftHistory::new(DrafterSpec { block: width, head: HeadScore::None, copy: 32 }, DraftControl::History);
+        let mut policy = DraftHistory::new(DrafterSpec { block: width, head: HeadScore::None, copy: 0 }, DraftControl::History);
         assert_eq!(policy.plan(&[(1, width)], 64), [7]);
         for _ in 0..256 {
             let depth = policy.plan(&[(1, width)], 64)[0];
@@ -411,7 +412,9 @@ mod tests {
         let history = [1,2,3,4,5,6,7,8,20,21,22,23,24,25,26,27,28,29,50,1,2,3,4,5,6,7,8];
         let draft = [20,21,22,23,24,25,26];
         let tail = crate::shared::draft::copy::continuation(&history, &draft, true).unwrap();
-        let rows = std::iter::once(9).chain(draft).chain(tail.iter().copied()).collect::<Vec<_>>();
+        assert!(!tail.is_empty());
+        let rows = std::iter::once(9).chain(draft).collect::<Vec<_>>();
+        assert_eq!(rows.len(), 8, "Inkling FIR verifier remains at its admitted native block");
         let prior = [100,99,98];
         for keep in 0..=rows.len() {
             let committed = accepted_history(3, rows.len(), keep)?.into_iter().map(|source| match source {
