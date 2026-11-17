@@ -40,6 +40,8 @@ impl Policy {
     pub fn new(length: DraftLength, block: usize, head: HeadScore, copies: bool) -> Self {
         let spec = DrafterSpec { block, head, copy: if copies { copy::COPY_EXTENSION } else { 0 } };
         let history = DraftHistory::new(spec, length.control());
+        SPECULATION_ENABLED.store(block > 0 && history.control() != DraftControl::Off,
+            std::sync::atomic::Ordering::Relaxed);
         cuteafd_bench::context::set_resolved("draft-mode", &length.label(block));
         tracing::info!(policy = %history.control().label(), block, head = ?head, copy_positions = spec.copy,
             requested_length = ?length.draft_length, "draft policy");
@@ -101,6 +103,12 @@ impl Policy {
     fn publish(&self) {
         if let Ok(mut slot) = SNAPSHOT.lock() { *slot = Some(Arc::new(self.history.snapshot())); }
     }
+}
+
+static SPECULATION_ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn speculation_enabled() -> bool {
+    SPECULATION_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 // Numeric tickets stay engine-local; HTTP ids join response usage to this trace.

@@ -734,6 +734,11 @@ Each key is also a global `cuteafd` flag (`--gpu-memory-cap`, `--kv-max-tokens`,
 | `SPECULATION_TRACE` | unset | absolute path | JSONL speculation trace. Shared `draft_round` records include each request's numeric engine ticket and HTTP `request_id` (the identity in `usage.speculation`), per-position history probabilities/counts, exploration and calibrated head skips. |
 | `GLM5_FLASH_DRAFT_LINEAR` | auto by drafter | `w8a16`, `wide`, `w8a8` | GLM Flash drafter GEMM; Rust resolves `w8a8` with an external FP8 drafter, `w8a16` otherwise. |
 
+With a drafter and an enabled draft policy, responses include request-local
+`usage.speculation` counters (`request_id`, `proposed`, `accepted`, `cycles`),
+including zero counters when the request proposed nothing. The field is absent
+when the server has no drafter or its effective draft policy is `off`.
+
 ## Prefill
 
 | Key | Default | Values | Notes |
