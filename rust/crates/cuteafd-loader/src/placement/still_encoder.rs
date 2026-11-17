@@ -75,7 +75,7 @@ impl StillEncoder {
             for (copy,location) in locations.into_iter().enumerate() {
                 let backing=format!("{}.candidate{option}.copy{copy}",self.inventory.arena.id());
                 let bytes=self.inventory.arena.bytes() as u64;
-                let root=Allocation::buffer(&backing,location,bytes,Lifetime::RESIDENT,Category::Weights,"vision packed weight arena");
+                let root=Allocation::buffer(&backing,location,bytes,Lifetime::RESIDENT,Category::Weights,crate::media::still_tower::vision_weight_arena_label());
                 owners.push(Component::allocation(root.clone(),ByteCurve::fixed(bytes,maximum),false,maximum));
                 for (name, view) in self.inventory.arena.views() {
                     let mut alias = Allocation::buffer(format!("{backing}.{name}"), location,
@@ -186,7 +186,7 @@ mod tests {
                 let expected = if expert_bytes == 1 << 20 { EncoderKind::Spark { rank: 0 } }
                     else { EncoderKind::Rtx { gpu: 0 } };
                 assert_eq!(encoder.admitted(&solved).unwrap().kind, expected);
-                let roots = solved.facts.allocations.iter().filter(|a| a.group == "vision packed weight arena")
+                let roots = solved.facts.allocations.iter().filter(|a| a.group == crate::media::still_tower::vision_weight_arena_label())
                     .collect::<Vec<_>>();
                 assert_eq!(roots.len(), 1);
                 assert_eq!(roots[0].bytes, encoder.inventory.arena.bytes() as u64);

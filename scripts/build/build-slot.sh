@@ -19,6 +19,21 @@ dir="${CUTEAFD_LOCK_DIR:-$HOME/.cache/cuteafd}"
   echo "build-slot: lock directory $dir is missing or not writable; run on the host or mount it (cuteafd-dev.sh does)" >&2
   exit 2
 }
+child=
+terminated() {
+  local code="$1"
+  trap '' TERM INT HUP QUIT
+  echo "build-slot: terminated (exit $code)" >&2
+  if [[ -n "$child" ]]; then
+    kill -TERM "$child" 2>/dev/null || true
+    wait "$child" 2>/dev/null || true
+  fi
+  exit "$code"
+}
+trap 'terminated 143' TERM
+trap 'terminated 130' INT
+trap 'terminated 129' HUP
+trap 'terminated 131' QUIT
 fd=
 deadline=$((SECONDS + wait_s))
 while :; do
@@ -28,8 +43,11 @@ while :; do
     exec {fd}>>"$lock"
     if flock -n "$fd"; then
       echo "build slot $i: $*" >&2
-      CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-16}" nice -n 19 "$@"
-      exit $?
+      CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-16}" nice -n 19 "$@" &
+      child=$!
+      status=0
+      wait "$child" || status=$?
+      exit "$status"
     fi
     exec {fd}>&-
   done
