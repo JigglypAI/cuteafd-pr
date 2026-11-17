@@ -402,15 +402,19 @@ fn installed_native_measured_five_sparks_fit_with_exact_ledgers() -> anyhow::Res
     assert_eq!(report.runtime, Some(RuntimeStatus::Planned));
     assert!(report.fits && report.placement_supported && report.native_serving_admitted, "{:?}", report.hints);
     assert!(report.wip_launchable() && !report.executable());
-    assert_eq!(report.memory_layout.as_ref().unwrap().pool_tokens, 2_097_152);
+    // The default KV max is unbounded: the pool grows past the 2M target
+    // into the memory the admitted layout leaves.
+    let pool = report.memory_layout.as_ref().unwrap().pool_tokens;
+    assert!(pool >= 2_097_152, "pool {pool} grew into the memory bound");
     let mut fp8_options = options.clone();
     fp8_options.layout.as_mut().unwrap().inkling_kv = Default::default();
     assert_eq!(fp8_options.layout.as_ref().unwrap().inkling_kv,
         crate::families::inkling2::InklingKvCache::Fp8);
     let fp8 = input.plan(&fp8_options)?;
     assert!(fp8.fits && fp8.placement_supported && fp8.native_serving_admitted, "{:?}", fp8.hints);
-    assert_eq!(fp8.memory_layout.as_ref().unwrap().pool_tokens, 2_097_152);
-    println!("Inkling native 1RTX+6S pool2097152: BF16->FP8 onboard {:?}->{:?}, global KV 64GiB->33GiB",
+    let fp8_pool = fp8.memory_layout.as_ref().unwrap().pool_tokens;
+    assert!(fp8_pool >= 2_097_152, "fp8 pool {fp8_pool} grew into the memory bound");
+    println!("Inkling native 1RTX+6S pool {pool}->{fp8_pool}: BF16->FP8 onboard {:?}->{:?}, global KV 64GiB->33GiB",
         report.onboard_layers, fp8.onboard_layers);
     assert!(fp8.onboard_layers > report.onboard_layers, "freed global KV must admit more native expert layers");
     let five = input.plan(&PlanOptions { placement: ExpertPlacement::from_spark_ranks(5), ..fp8_options.clone() })?;
