@@ -46,6 +46,10 @@ def test_registry_validates_and_binds_both_export_abis(tmp_path):
     assert '_mlir_cuteafd_vision_attention_d64_entry, 8, "fi"' in text
     assert '_mlir_cuteafd_vision_attention_d96_full_entry, 6, "fi"' in text
     assert '_mlir_cuteafd_vision_axial_rotary_entry, 6, "i"' in text
+    header(tmp_path / "vision_dynamic_attention.h", "vision_dynamic_attention", pointers=6,
+           scalars=("int32_t","float","int32_t"))
+    dynamic=registry.registry([entry(tmp_path,128,programs=["vision_dynamic_attention"])])
+    assert '_mlir_cuteafd_vision_dynamic_attention_entry, 6, "ifi"' in dynamic
     with pytest.raises(ValueError, match="duplicate"):
         registry.registry(entries + entries[:1])
     with pytest.raises(ValueError, match="varlen attention"):
@@ -233,3 +237,16 @@ int main(){
         str(tmp_path / "fixture.cc"), "-o", str(executable)], capture_output=True, text=True, timeout=30)
     assert result.returncode == 0, result.stderr
     subprocess.run([str(executable)], check=True, timeout=10)
+
+
+def test_inactive_generic_tower_inventory_is_unique_and_has_dynamic_attention_first():
+    path=ROOT / "python/tools/aot/vision_tower_programs.py"
+    spec=importlib.util.spec_from_file_location("generic_tower_inventory",path)
+    module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
+    for kind,count in [("kimi",18),("minimax",16)]:
+        names=module.names(kind)
+        assert len(names)==count and len(set(names))==count
+        assert names[0]=="vision_dynamic_attention"
+        assert not any("65536" in name or "66792" in name for name in names)
+    native=(ROOT / "native/shared/cuda/vision_runtime.cu").read_text()
+    assert "if(s.tower)return false" in native

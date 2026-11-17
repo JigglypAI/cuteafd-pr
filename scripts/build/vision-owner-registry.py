@@ -50,9 +50,10 @@ def registry(entries):
         if not names or len(set(names)) != len(names):
             raise ValueError("vision owner needs unique programs, attention first")
         programs = [program(path, name) for path, name in specs]
-        # Attention has the legacy 8-pointer or shared 6-pointer varlen ABI,
-        # both taking (softmax scale, device L2 bytes).
-        if not (programs[0].endswith(', 8, "fi"}') or programs[0].endswith(', 6, "fi"}')):
+        # Existing entries retain their exact ABI. New generic entries add a
+        # runtime row extent before (scale,L2); no capacity compile key.
+        if not (programs[0].endswith(', 8, "fi"}') or programs[0].endswith(', 6, "fi"}')
+                or programs[0].endswith(', 6, "ifi"}')):
             raise ValueError("vision entry's first program must be varlen attention")
         includes.extend('#include "%s/%s.h"' % (path.as_posix(), name) for path, name in specs)
         rows.append('{%d, %s, %s, {%s}}' % (dim, str(windowed).lower(), json.dumps(pointwise), ", ".join(programs)))
