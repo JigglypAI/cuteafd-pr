@@ -1,7 +1,7 @@
 //! Processor-owned checkerboard colors and explicit alpha rounding.
 use super::{DecodedPixels, MediaError, Result, RgbImage};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum BlendRounding {
     /// Historical integer alpha compositing, nearest with half rounded up.
     Nearest,
@@ -9,7 +9,7 @@ pub enum BlendRounding {
     Float32Truncate,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Checkerboard {
     square: u32,
     white: u8,
@@ -66,6 +66,13 @@ impl Checkerboard {
             top,
             rounding,
         )
+    }
+
+    pub(super) fn validate_rounding(&self, expected: BlendRounding) -> Result<()> {
+        if self.square == 0 || self.rounding != expected {
+            return Err(MediaError::Config("invalid checkerboard size or rounding".into()));
+        }
+        Ok(())
     }
 
     pub fn composite(self, pixels: DecodedPixels) -> Result<RgbImage> {

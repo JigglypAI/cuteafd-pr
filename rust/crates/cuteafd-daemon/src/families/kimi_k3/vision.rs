@@ -1,10 +1,10 @@
 //! Header-native MoonViT3d builder. Execution remains gated until encoder oracles.
-use crate::shared::vision::{ConstantRegion, TensorRead, TowerSpec};
+use crate::shared::vision::{ConstantRegion, ReadTransform, TensorRead, TowerSpec};
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::vision::{
     TowerExtension, TowerNorm, TowerProjector, VisionBlock, VisionSpec, NO_VISION_OFFSET as NONE,
 };
-use cuteafd_loader::families::kimi_k3::vision::{VisionContract, PROJECTOR_RMS_EPS, TOWER_RMS_EPS};
+use cuteafd_loader::families::kimi_k3::vision::{VisionContract, MAX_IMAGE_TOKENS, PROJECTOR_RMS_EPS, TOWER_RMS_EPS};
 use std::{collections::BTreeMap, path::Path};
 
 /// Official GPU arange/pow bytes, identical on SM120 and SM121 in the pinned
@@ -18,8 +18,8 @@ const INV_FREQ_BITS: [u32; 32] = [
 
 pub(crate) fn tower(snapshot: &Path, max_output_rows: usize) -> Result<TowerSpec> {
     ensure!(
-        (1..=16384).contains(&max_output_rows),
-        "Kimi vision output capacity must be1..=16384"
+        (1..=MAX_IMAGE_TOKENS as usize).contains(&max_output_rows),
+        "Kimi vision output capacity must be1..={MAX_IMAGE_TOKENS}"
     );
     let cfg: serde_json::Value = cuteafd_loader::read_json_file(&snapshot.join("config.json"))?;
     let geometry = VisionContract::from_config(&cfg)?;
@@ -37,7 +37,7 @@ pub(crate) fn tower(snapshot: &Path, max_output_rows: usize) -> Result<TowerSpec
             path: path.clone(),
             metadata: metadata.clone(),
             destination: usize::try_from(tensor.destination)?,
-            vector: false,
+            transform: ReadTransform::Direct,
         });
     }
     let at = |name: &str| {
@@ -148,7 +148,8 @@ pub(crate) fn tower(snapshot: &Path, max_output_rows: usize) -> Result<TowerSpec
         native.q_norm[layer] = NONE;
         native.k_norm[layer] = NONE;
     }
-    TowerSpec::from_parts_with_constants(native, reads, vec![constant]).map_err(Into::into)
+    TowerSpec::from_parts_with_constants(native, reads, vec![constant])
+        .map(|spec| spec.with_family(cuteafd_loader::media::ImageFamily::Kimi)).map_err(Into::into)
 }
 
 #[cfg(test)]
@@ -196,21 +197,37 @@ mod tests {
         file.write_all(&(header.len() as u64).to_le_bytes())?;
         file.write_all(&header)?;
         file.set_len(8 + header.len() as u64 + end)?;
-        let spec = tower(dir.path(), 16384)?;
+        let spec = tower(dir.path(), MAX_IMAGE_TOKENS as usize)?;
         assert_eq!(spec.native.weight_bytes, 894_718_080);
         assert_eq!(spec.native.blocks.len(), 27);
+        assert_eq!(spec.image_family(),cuteafd_loader::media::ImageFamily::Kimi);
+        let mut changed_geometry=spec.clone();
+        changed_geometry.native.tower.as_mut().unwrap().temporal_patch=2;
+        assert_eq!(changed_geometry.image_family(),cuteafd_loader::media::ImageFamily::Kimi);
         let extension = spec.native.tower.as_ref().unwrap();
         assert_eq!(extension.inv_freq[1], extension.inv_freq[2]);
         assert_eq!(extension.attention_width, 1536);
         assert_eq!(extension.final_norm.epsilon, TOWER_RMS_EPS);
         assert_eq!(spec.constant_regions().len(), 1);
+        assert_eq!(spec.constant_regions()[0].name, "rotary.spatial.inv_freq");
         assert_eq!(spec.constant_regions()[0].bytes.len(), 128);
         extension.validate(&spec.native)?;
+        crate::shared::vision::push::tests::assert_vision_plan(dir.path(), &spec);
+        assert!(spec.staged_rects().is_empty());
+        assert_eq!(spec.constant_regions()[0].offset + 128, spec.native.weight_bytes);
+        let mut k31 = cfg.clone();
+        k31["model_type"] = "kimi_k31".into();
+        std::fs::write(dir.path().join("config.json"), serde_json::to_vec(&k31)?)?;
+        let sibling = tower(dir.path(), MAX_IMAGE_TOKENS as usize)?;
+        assert_eq!(sibling.native.weight_bytes, spec.native.weight_bytes);
+        assert_eq!(sibling.native.blocks, spec.native.blocks);
+        assert_eq!(sibling.native.tower, spec.native.tower);
+        assert_eq!(sibling.constant_regions(), spec.constant_regions());
         Ok(())
     }
     #[test]
     fn capacity_is_bounded_before_touching_checkpoint() {
-        for capacity in [0, 16385] {
+        for capacity in [0, MAX_IMAGE_TOKENS as usize + 1] {
             assert!(tower(Path::new("absent"), capacity).is_err());
         }
     }

@@ -426,7 +426,18 @@ impl<'library> VocabularyHead<'library> {
 }
 
 #[cfg(test)]
-impl NativeRtxTensors<'_> {
+impl<'a> NativeRtxTensors<'a> {
+    pub(crate) fn hc_fixture(library: &'a NativeLibrary) -> Result<Self> {
+        let specs = [("projection", 24 * 20480 * 4), ("scale", 12), ("base", 96), ("norm", 10240)];
+        let layout = cuteafd_loader::serving_capacity::WeightArenaLayout::new("v41-hc-fixture",
+            specs.iter().map(|&(name, bytes)| (name.to_owned(), bytes)))?;
+        let arena = DeviceWeightArena::new(Device { library, id: library.cuda_get_device()? }, layout,
+            ArenaTag::weights("v41/hc-fixture"))?;
+        let tensors = specs.into_iter().map(|(name, bytes)|
+            Ok((name.to_owned(), DeviceAllocation::from_allocation(arena.view(name, bytes)?))))
+            .collect::<Result<_>>()?;
+        Ok(Self { tensors, resident_bytes: arena.layout().bytes(), mapped_embedding: None })
+    }
     /// Every resident tensor (golden digests).
     pub(crate) fn visit(&self, prefix: &str, f: &mut dyn FnMut(String, cuteafd_ffi::CuteafdDeviceBuffer)) {
         for (name, allocation) in &self.tensors { f(format!("{prefix}{name}"), allocation.buffer); }

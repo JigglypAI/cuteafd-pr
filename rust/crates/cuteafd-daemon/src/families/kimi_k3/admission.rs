@@ -271,7 +271,7 @@ impl<'a> Admission<'a> {
                     .map_err(|_|anyhow::anyhow!("block draft reader panicked"))?? };
             let draft=DsparkDrafter::load_with(device.library,programs,target_projection,snapshot,tensors,stream,
                 layout.capacity.context_slots,layout.capacity.max_batch_sequences,vec![0;layout.config.hidden*2],
-                GlmDraftRepresentation::Bf16Only,Fp8Scales::Amax,Fp8Rows::W8a16,layout.kv_cache,
+                layout.representation,Fp8Scales::Amax,Fp8Rows::W8a16,layout.kv_cache,
                 |physical,name,bytes| { ensure!(physical==device.id,"block draft physical arena changed"); arena.view(name,bytes) })?;
             draft.prepare_workspace()?;
             Ok(super::draft_common::CommonDraft::Block { draft,
@@ -295,7 +295,7 @@ impl<'a> Admission<'a> {
             }).collect::<Result<std::collections::BTreeMap<_,_>>>()?;
             let capacity=ranks[lead].capacity;
             let draft=DsparkDrafter::load_tp2_with(device.library,programs,projection,snapshot,
-                capacity.context_slots,capacity.max_batch_sequences,ranks[lead].kv_cache,
+                capacity.context_slots,capacity.max_batch_sequences,ranks[lead].kv_cache,ranks[lead].representation,
                 [physical[0],physical[1]],stream,lead,
                 |physical,name,bytes|arenas.get(&physical).context("paired block arena owner absent")?.view(name,bytes))?;
             Ok(super::draft_common::CommonDraft::Block { draft,

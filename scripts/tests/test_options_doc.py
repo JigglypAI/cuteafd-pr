@@ -409,6 +409,13 @@ def test_optional_levers_are_default_off_and_documented():
                 assert lever["families"] == ["Muse"]
                 assert default == "family default"
                 assert 'muse_kv_cache="$(get KV_CACHE bf16)"' in (ROOT / "scripts/launch/run-family.sh").read_text()
+            elif key == "SPECULATOR_FP8":
+                assert lever["families"] == ["Kimi K3"]
+                assert default == "auto"
+                source = (ROOT / "rust/crates/cuteafd-core/src/launch_settings.rs").read_text()
+                assert 'selected(explicit, None, dflash,' in source
+                assert 'kimi_draft_fp8(args.draft_fp8, args.speculator == "dflash2")' in (
+                    ROOT / "rust/crates/cuteafd-daemon/src/commands/plan.rs").read_text()
             else:
                 assert default.startswith(("off", "unset")), \
                     f"lever {key} default is {default!r}, not off/unset"
@@ -512,3 +519,10 @@ def test_mc_fp8_lever_reports_measured_glm_and_step_quality_costs():
     assert "59.87/216.73/2740 to 68.98/266.95/2562" in text
     assert "0.04530/0.03880" in text and "0.01597/0.01429" in text
     assert "no paired non-inferiority claim" in text
+
+
+def test_kimi_accepts_existing_shared_draft_policy_key():
+    assert "DRAFT_POLICY" in family_keys("kimi_k3")
+    assert MATRIX["DRAFT_POLICY"]["Kimi K3"]
+    launcher = (ROOT / "scripts/launch/run-family.sh").read_text()
+    assert 'CUTEAFD_DRAFT_POLICY=$(get DRAFT_POLICY)' in launcher

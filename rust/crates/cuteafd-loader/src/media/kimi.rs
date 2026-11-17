@@ -7,7 +7,7 @@ use super::{
 use sha2::{Digest, Sha256};
 use std::path::Path;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct KimiProcessor {
     patch: u32,
     merge: u32,
@@ -61,6 +61,13 @@ impl KimiProcessor {
         })
     }
 
+    pub(super) fn validate(&self) -> Result<()> {
+        if (self.patch,self.merge,self.patch_limit,self.side_limit)!=(14,2,65536,512) {
+            return Err(MediaError::Config("unsupported typed Kimi processor geometry".into()));
+        }
+        self.checkerboard.validate_rounding(BlendRounding::Float32Truncate)
+    }
+
     /// Width,height returned separately for valid content and padded canvas.
     pub fn geometry(&self, width: u32, height: u32) -> Result<([u32; 2], [u32; 2])> {
         if width == 0 || height == 0 {
@@ -99,7 +106,7 @@ impl KimiProcessor {
         let patches = u64::from(canvas[0] / self.patch) * u64::from(canvas[1] / self.patch);
         let tokens = usize::try_from(patches / u64::from(self.merge * self.merge))
             .map_err(|_| invalid("Kimi token count overflow"))?;
-        if patches > self.patch_limit || tokens > max_tokens || max_tokens == 0 {
+        if patches > u64::from(crate::families::kimi_k3::vision::MAX_IMAGE_PATCHES) || tokens > max_tokens || max_tokens == 0 {
             return Err(invalid(
                 "Kimi padded image exceeds admitted encoder capacity",
             ));
@@ -282,8 +289,60 @@ mod tests {
             p.geometry(7069, 1833).unwrap(),
             ([7069, 1833], [7084, 1848])
         );
-        // Shared ceilings remain nominal until the full boundary encoder runs.
         assert_eq!(7084u64 / 14 * (1848 / 14), 66792);
+    }
+    #[test]
+    fn declared_maximum_is_derived_from_floor_patch_then_merge_padding() {
+        use crate::families::kimi_k3::vision::{MAX_IMAGE_PATCHES,MAX_IMAGE_TOKENS};
+        let p=KimiProcessor::from_config(&config()).unwrap();
+        let mut largest=0u64;
+        // Before resize, all unscaled floor-patch pairs have product<=65536.
+        // Within each pair the largest image is14*floor+13 pixels (side cap
+        //7168). Padding each such source to28 bounds that pair's whole cell.
+        for h in 1..=512u32 {for w in 1..=512u32 {
+            if u64::from(h)*u64::from(w)>65536 {continue;}
+            let height=(h*14+13).min(7168);let width=(w*14+13).min(7168);
+            let (_,canvas)=p.geometry(width,height).unwrap();
+            largest=largest.max(u64::from(canvas[0]/14)*u64::from(canvas[1]/14));
+        }}
+        assert_eq!(largest,u64::from(MAX_IMAGE_PATCHES));
+        assert_eq!(MAX_IMAGE_TOKENS,16698);
+        let data=[37u8,91,173].into_iter().cycle().take(7069*1833*3).collect();
+        let prepared=p.prepare(DecodedPixels::Rgb(RgbImage {width:7069,height:1833,data}),
+            EncoderId([1;32]),MAX_IMAGE_TOKENS as usize).unwrap();
+        assert_eq!(prepared.tokens,16698);
+        assert_eq!(prepared.grid,ImageGrid {t:1,h:132,w:506});
+        assert_eq!(format!("{:x}",Sha256::digest(prepared.rgb8)),
+            "9556acb8c702f537f348e707683ec2a92362e593b7021293b94b9757ec06c363");
+        let data=vec![37;7069*1833*3];
+        assert!(p.prepare(DecodedPixels::Rgb(RgbImage {width:7069,height:1833,data}),
+            EncoderId([1;32]),MAX_IMAGE_TOKENS as usize-1).is_err());
+    }
+    #[test]
+    fn typed_registration_preserves_checkpoint_checkerboard_and_group_split() {
+        use crate::media::{FamilyProcessor,ImageFamily,ImagePromptLayout,ProcessorConfig,PreparedImageGroup,ImageFragment};
+        let processor=KimiProcessor::from_config(&config()).unwrap();
+        let mut registered=ProcessorConfig::for_family(ImageFamily::Kimi);
+        assert!(registered.validate().is_err());
+        registered.family_processor=FamilyProcessor::Kimi(processor.clone());
+        registered.validate().unwrap();
+        let encoded=serde_json::to_vec(&registered).unwrap();
+        let restored:ProcessorConfig=serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(restored,registered);
+        let encoder=EncoderId([7;32]);
+        let pixels=DecodedPixels::Rgba {width:17,height:13,data:vec![127;17*13*4]};
+        let direct=processor.prepare(pixels.clone(),encoder,16698).unwrap();
+        let mut group=registered.prepare_group(pixels,encoder).unwrap();
+        assert_eq!(&*group.images[0].rgb8,&*direct.rgb8);
+        assert_eq!(group.source,[17,13]);assert!(group.fragments.is_empty());
+        assert!(registered.assemble_group_prompt(&mut group,&ImagePromptLayout::Single {placeholder:163605}).is_err());
+        group.fragments=vec![ImageFragment::Tokens(vec![1,2]),ImageFragment::Features {image:0,placeholder:163605}];
+        let expanded=PreparedImageGroup::expand_prompt(&[3,163605,4],163605,&[group],164000,100).unwrap();
+        assert_eq!(expanded.media.len(),1);
+        let mut different=config();different["media_proc_cfg"]["transparent_bg_config"]["chessboard_gray_value"]=179.into();
+        let mut other=registered.clone();other.family_processor=FamilyProcessor::Kimi(KimiProcessor::from_config(&different).unwrap());
+        assert_ne!(other.id(),registered.id());
+        let mut mismatch=registered.clone();mismatch.family=ImageFamily::Mimo;assert!(mismatch.validate().is_err());
     }
     #[test]
     fn config_numerics_and_identity_are_explicit() {

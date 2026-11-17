@@ -34,7 +34,7 @@ impl TowerSpec {
                 path: path.clone(),
                 metadata: metadata.clone(),
                 destination: cursor,
-                vector: false,
+                transform: ReadTransform::Direct,
             });
             cursor += metadata.byte_length as usize;
         }
@@ -232,7 +232,7 @@ mod tests {
             assert!(tower
                 .reads
                 .iter()
-                .all(|read| !read.vector && read.destination % 256 == 0));
+                .all(|read| read.transform==ReadTransform::Direct && read.destination % 256 == 0));
             assert_eq!(
                 tower.constants[0].bytes.len(),
                 if inkling { 64 } else { 96 }
@@ -287,16 +287,13 @@ mod tests {
         }
     }
     #[test]
-    fn native_pe_execution_is_not_advertised_before_oracles() {
-        let source = include_str!("../vision.rs");
-        let dispatch = source
-            .split("pub fn from_snapshot")
-            .nth(1)
-            .unwrap()
-            .split("pub fn row_markers")
-            .next()
-            .unwrap();
-        assert!(!dispatch.contains("inkling2"));
-        assert!(!dispatch.contains("step5_vl"));
+    fn qualified_pe_towers_have_explicit_shared_dispatch() {
+        let source=include_str!("../vision.rs");
+        assert!(source.contains("Some(\"inkling2\"|\"step5_vl\") => Self::perception"));
+        for (inkling,family) in [(true,cuteafd_loader::media::ImageFamily::Inkling2),(false,cuteafd_loader::media::ImageFamily::Step5)] {
+            let directory=sparse_snapshot(inkling);
+            let tower=TowerSpec::from_snapshot(directory.path(),169).unwrap();
+            assert_eq!(tower.image_family(),family);
+        }
     }
 }

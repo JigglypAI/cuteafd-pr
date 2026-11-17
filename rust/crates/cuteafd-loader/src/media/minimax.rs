@@ -1,5 +1,28 @@
 //! Supported SGLang M3.1 default: Pillow RGB8 bicubic, ceil28/max672 rectangle.
-use super::{DecodedPixels, Resample, Result, RgbImage};
+use super::{DecodedPixels, ImageFamily, MediaError, ProcessorConfig, Resample, Result, RgbImage};
+use std::path::Path;
+
+pub(super) fn processor_config(snapshot: &Path) -> Result<ProcessorConfig> {
+    let config = crate::read_json_file(&snapshot.join("config.json")).map_err(|e| MediaError::Config(e.to_string()))?;
+    VisionContract::from_config(&config).map_err(|e| MediaError::Config(e.to_string()))?;
+    let raw: serde_json::Value = crate::read_json_file(&snapshot.join("preprocessor_config.json"))
+        .map_err(|e| MediaError::Config(e.to_string()))?;
+    let expected = ProcessorConfig::for_family(ImageFamily::MiniMax);
+    if raw["patch_size"] != 14 || raw["size"] != serde_json::json!([672,672])
+        || raw["image_mean"] != serde_json::json!(expected.mean)
+        || raw["image_std"] != serde_json::json!(expected.std)
+        || raw["img_token_compression_config"]["spatial_merge_size"] != 2
+        || raw["img_token_compression_config"]["temporal_patch_size"] != 2 {
+        return Err(MediaError::Config("unsupported MiniMax SGLang processor geometry/numerics".into()));
+    }
+    expected.validate()?;
+    Ok(expected)
+}
+
+pub(super) fn resize_shape(height: u32, width: u32) -> Result<(u32,u32)> {
+    crate::families::minimax_m3::vision::resize_shape(height,width)
+        .map_err(|e| MediaError::Config(e.to_string()))
+}
 use crate::families::minimax_m3::vision::VisionContract;
 
 /// No request-specific max_pixels policy: the API rejects that override before
@@ -22,6 +45,31 @@ pub fn resize_default(pixels: DecodedPixels, contract: &VisionContract) -> Resul
 mod tests {
     use super::*;
     use sha2::{Digest, Sha256};
+    #[test]
+    fn registered_groups_keep_supported_geometry_and_checked_feature_spans() {
+        use super::super::{EncoderId,ImageProcessor,ImagePromptLayout,PreparedImageGroup};
+        let config=ProcessorConfig::for_family(ImageFamily::MiniMax);
+        let encoder=EncoderId([9;32]);
+        for (height,width) in [(13,17),(432,640),(640,432),(672,672),(1009,731)] {
+            let data=(0..height*width*3).map(|i| ((i*37+11)%256) as u8).collect();
+            let mut group=config.prepare_group(DecodedPixels::Rgb(RgbImage {width,height,data}),encoder).unwrap();
+            assert!(group.fragments.is_empty());
+            assert_eq!(group.source,[width,height]);
+            let expected=resize_shape(height,width).unwrap();
+            let image=&group.images[0];
+            assert_eq!([image.grid.h*14,image.grid.w*14],[expected.0,expected.1]);
+            assert!(image.tokens<=576);
+            assert_eq!(image.processor,config.id());
+            config.assemble_group_prompt(&mut group,&ImagePromptLayout::Single {placeholder:200025}).unwrap();
+            let rows=group.feature_rows().unwrap();
+            let expanded=PreparedImageGroup::expand_prompt(&[1,200025,2],200025,&[group],200064,600).unwrap();
+            assert_eq!(expanded.tokens.len(),rows+2);
+            assert_eq!(expanded.media.len(),1);
+        }
+        let mut bounded=config.clone(); bounded.max_image_tokens=1;
+        assert!(bounded.prepare_rgb(RgbImage {width:56,height:56,data:vec![0;56*56*3]},encoder).is_err());
+        let mut wrong=config;wrong.std[0]=0.5;assert!(wrong.validate().is_err());
+    }
     #[test]
     fn supported_sglang_default_five_images_match_pillow_chw_byte_hashes() {
         let cfg = crate::families::minimax_m3::config::tests::release_config();

@@ -40,14 +40,14 @@ impl Options {
 
     pub(crate) fn layout(&self,slots:usize,context:usize,sms:usize,head_rank:usize)->Result<DraftLayout> {
         if crate::shared::speculation::block_dspark::is_dspark(&self.snapshot)? {
-            ensure!(!self.fp8 && !self.tp2_dflash,"block dSpark uses native BF16 on head GPU");
+            ensure!(!self.tp2_dflash,"block dSpark uses physical GQA head splits, not TP2_DFLASH");
             if head_rank==1 {
-                let rank=|rank|cuteafd_loader::formats::block_dspark::BlockDsparkRuntimeLayout::for_rank(
-                    &self.snapshot,slots,slots.min(8),sms,&format!("kimi/draft/{rank}"),self.draft_kv_cache,rank,2,head_rank);
+                let rank=|rank|cuteafd_loader::formats::block_dspark::BlockDsparkRuntimeLayout::for_rank_representation(
+                    &self.snapshot,slots,slots.min(8),sms,&format!("kimi/draft/{rank}"),self.draft_kv_cache,rank,2,head_rank,self.representation());
                 return Ok(DraftLayout::BlockTp2 { ranks:Box::new([rank(0)?,rank(1)?]),lead:head_rank });
             }
-            return Ok(DraftLayout::Block(cuteafd_loader::formats::block_dspark::BlockDsparkRuntimeLayout::with_kv(
-                &self.snapshot,slots,slots.min(8),sms,&format!("kimi/draft/{head_rank}"),self.draft_kv_cache)?));
+            return Ok(DraftLayout::Block(cuteafd_loader::formats::block_dspark::BlockDsparkRuntimeLayout::with_representation(
+                &self.snapshot,slots,slots.min(8),sms,&format!("kimi/draft/{head_rank}"),self.draft_kv_cache,self.representation())?));
         }
         let cfg=MlaDflashConfig::read(&self.snapshot)?;
         Ok(cfg.runtime_layout(self.representation(),GlmDraftCapacity::new(slots,slots.min(8),cfg.block)?,

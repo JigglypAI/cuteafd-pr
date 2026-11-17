@@ -17,9 +17,41 @@ runs sampled C1 code decode. `scripts/bench/wip-cards.py` accepts the same
 repeatable `--panel-config PANEL=JSON` option; smoke matrix entries/defaults use
 `"panel_config":{"decode_content":{"contents":["code"],"temperature":1.0,
 "top_p":0.95,"seed":42}}`. Entry settings replace defaults for the same panel.
-The in-server run API accepts this same `panel_config` map. The `decode_content` and
+The in-server run API accepts this same `panel_config` map. The `decode_content`, `concurrency` and
 `spec_lossless_set` panels accept configuration; unknown panels and fields fail before
-running. This does not change the baseline, concurrency sweep or goldens.
+running. This does not change the baseline or goldens.
+
+`concurrency={"sustained":true,"multiplier":4}` adds continuous-refill rows after
+the existing closed-batch concurrency rows (which retain their schema and workload).
+`sustained` defaults to false; `multiplier` is an integer in 2..64, default 4.
+The in-server concurrency panel uses its usual levels. For an external sweep use
+`wip-cards.py --levels 8,16 --panel-config 'concurrency={"sustained":true}'`
+(with the usual kit/arms), or set that same `panel_config` in the smoke matrix.
+`--sweep-tokens` still controls the external sweep's per-request output budget.
+
+At level C, C workers immediately refill from a pool of N = multiplier * C
+requests. The steady window starts at the first completion and ends when the
+last refill is dispatched, excluding initial warm-up and final drain. Requests
+are indexed before dispatch, so scheduling cannot change the prompt/nonces across
+arms. The pool uses `CUTEAFD_BENCH_NONCE_SEED` (or `sustained-v1`) and records
+`pool_sha256`; use a fresh shared seed for independent pairs to avoid cache reuse.
+The prior untimed width warm-ups and all closed-batch points run first.
+
+Sustained `aggregate_tok_s` is an **estimate**: exact final usage token totals are
+credited pro rata by each request's first-to-last-content-token overlap with the
+window, assuming uniform per-request emission (SSE text chunks are not tokens).
+Only output/decode tokens enter the numerator; refill prompt/prefill work consumes
+time inside the window but contributes no prompt tokens to throughput. This is
+the intended under-load decode rate, not prefill throughput.
+This includes boundary-crossing requests without crediting their warm-up/drain
+output. `sustained` records relative window bounds, duration, initial/total/refill/
+completed and overlapping request counts, fractional token credits, the explicit
+accounting assumption, and every request's send/completion times, token span and
+exact usage total. Errors invalidate the sustained run instead of silently
+reducing concurrency. Thermal/fabric/counter observations cover the full refill
+run including its warm-up and drain, not just the steady window. External sweep
+rows use `phase: "sustained"`; wip-cards reports `sustained C8`, `sustained C16`,
+etc., separately from `sweep C8`/`sweep C16`.
 
 `decode_content` fields are optional: `contents` selects unique names from
 `code,prose,json,math,chat,translation,summary,table` (all by default),
@@ -72,10 +104,11 @@ default-off performance lever adds its row here in the same PR (AGENTS.md).
 | --- | --- | --- | --- | --- |
 | `GRAPH_PREWARM` | V4.1, GLM Flash | `GRAPH_PREWARM=off` (default `on`) | Skip startup graph prewarm and allow lazy request-time capture on single-GPU layouts. With donor-always, V4.1 min measured graph high-water 3.114 GB to 0.902 GB; GLM Flash min 52.4 MB to 35.7 MB (2026-11-16, RTX PRO 6000, one warmed launch/arm). Other families and cross-device layouts reject `off` (#1878). | First-use capture latency; no intended precision change. Admission reserve is unchanged: lower physical high-water alone does not expand KV; a separately qualified lower explicit reserve is needed. |
 | `GRAPH_DONOR_ALWAYS` | V4.1, V4, GLM 5.3 / ML4, GLM Flash, MiMo, Qwen4, Qwen dense, Kimi K3, Step-5, Muse, Inkling | `GRAPH_DONOR_ALWAYS=on` (default `off`) | Prefer a same-topology cold donor below the soft cap as well as above it. With prewarm off, V4.1 min C1/C16/post-C1 126.02/541.62/123.42 to 125.49/501.17/121.26 tok/s; 165,824 request-time updates/re-keys. GLM Flash min 109.41/393.98/87.17 to 109.02/397.93/87.10 tok/s; 1,270 updates/re-keys. One warmed matched launch/arm, RTX PRO 6000, no thermal slowdown, unchanged KL/top-1. | May replace a reusable cached shape and require a later update; no intended precision change. |
-| `GRAPH_DONOR_COLD_LAG` | V4.1, V4, GLM 5.3 / ML4, GLM Flash, MiMo, Qwen4, Qwen dense, Kimi K3, Step-5, Muse, Inkling | `GRAPH_DONOR_ALWAYS=on GRAPH_DONOR_COLD_LAG=16` (default `0`) | unmeasured; retain recently used graph shapes below the soft cap by requiring age > K + N. Pressure keeps age > K. | May retain more physical graph memory in exchange for fewer updates; no intended precision change. |
+| `GRAPH_DONOR_COLD_LAG` | V4.1, V4, GLM 5.3 / ML4, GLM Flash, MiMo, Qwen4, Qwen dense, Kimi K3, Step-5, Muse, Inkling | `GRAPH_DONOR_ALWAYS=on GRAPH_DONOR_COLD_LAG=16` (default `0`) | Require age > K + N below the soft cap; pressure keeps age > K. V4.1 min, 1 RTX PRO 6000 + 3 Sparks, DSpark, dev `0edd9b6c4` (2026-11-17), one warmed matched launch/arm: defaults / donor-always lag 0 / lag 16 C1 132.73/125.88/132.99, C16 556.17/499.76/527.38, post-C1 124.24/117.20/123.11 tok/s. Donor arms disable prewarm. Lag 16 cuts request-time updates/re-keys 164,366 to 47,057; physical graph charge 3.043/0.935/1.669 GB (admission reserve unchanged). Its C16/default ratio 0.948 meets the experiment's stop bar, not the 0.98 recovery goal; no further tuning. No thermal slowdown; C16 power-cap seconds 1.004/0/0, max temperatures 60/57/58 C, min T.Limit headroom 38/38/37 C; donor busy clocks unavailable (default 2805 MHz). Other families unmeasured. | Lag 16 retains more graph memory than lag 0; quality unchanged (baseline KL 0.01328, top-1 96.956%). Remains opt-in; no intended precision change. |
 | `L2_PREFETCH` | V4.1, MiMo, Qwen4 | `L2_PREFETCH=auto` or a MiB count (unset = off; GLM 5.3 and GLM Flash already default it to `auto`) | Pulls the next layer's weights into L2 while a one-lane decode step waits on its Spark exchange. V4.1 1× RTX 5090 + 4 Sparks: every C1 cell +1.7–3.9%, C4/C8 and 8K prefill unchanged (#623); GLM 5.3 weighted +4.4%, GLM Flash C1 +6–15% (2026-09-30). | None in values (outputs byte-identical); only extra L2 traffic. |
 | `QWEN_FP8_DECODE` | Qwen4 | `QWEN_FP8_DECODE=on` (unset = checkpoint BF16) | Holds the GDN/attention projections as one resident E4M3 copy; with `QWEN_FP8_HEAD=on`, 1× RTX code C1 222→247 tok/s, C4 441→489, 8K prefill 6100→6177 (2026-10-03). | Converts target projections to FP8 at load: golden KL 0.036→0.046, top-1 88.5%→86.7%; fails the KL gate, so opt-in only. |
 | `CORE_VIEW` | GLM 5.3 / ML4, GLM Flash, Kimi K3, Step-5, Muse | `CORE_VIEW=k8-compact`, `k6-compact` or `fp8-compact` (unset = original) | Stored MC core or generic load-time block FP8 of exactly the original variant's `core_tensors`; BF16 index only. GLM Flash K4 MC, 2 RTX PRO 6000 / 0 Sparks, DFlash2, fixed 425/425 W (2026-11-12): FP8 vs original C1/C16/8K prefill 171.12/741.93/7837.57 to 196.74/772.56/7741.92 tok/s (+15.0%/+4.1%/-1.2%); pool 1628160 to 2097152. K6 is non-inferior on both measured Standard-v2 paths, with +22.8% C1 and -12.5% 8K prefill vs original. Muse K4 MC `fp8-compact` is measured below (+15.2% C1, C16 flat, -5.1% 8K prefill; larger pool). GLM/Step whole-core FP8, 2 RTX PRO 6000 + 6 Sparks, 425 W/card (2026-11-16): GLM C1/C16/8K 49.04/180.68/3392 to 53.52/191.81/3122 tok/s (+9.1%/+6.2%/-8.0%), onboarded layers 5 to 8; Step 59.87/216.73/2740 to 68.98/266.95/2562 (+15.2%/+23.2%/-6.5%), onboarded layers 13 to 19. Both keep the 2,097,152-token pool; one warmed launch per arm, strict lossless 10/10. Step FP8 replay matches all 106 saved original prompt hashes. No thermal slowdown; prefill power-cap windows differ. Requires v52e exports. Other checkpoints unmeasured. | K8/K6 and FP8 quantize target weights. FP8 uses E4M3 + FP32 128x128 block scales. GLM generated Standard decode/prefill KL 0.03686/0.03100 to 0.04530/0.03880, top-1 94.544%/95.177% to 94.091%/94.775%; Step KL 0.01337/0.01164 to 0.01597/0.01429, top-1 96.069%/96.008% to 95.166%/95.811%. Absolute family bars pass; no paired non-inferiority claim. Original stays default. Matched Standard-v2 generated positions: FP8-minus-original KL to official BF16 ancestry +0.00289 decode/+0.00325 prefill, top-1 -0.013/-0.526 percentage points; absolute ancestry gates pass, paired decode non-inferiority passes but prefill fails (0.005 margin). Those figures ran W8A8 prefill over every group; W8A16 prefill (`FP8_PREFILL=off`) also fails prefill non-inferiority (top-1 loss 0.00263, upper95 0.00614). FP8 stays opt-in. Unsupported executor roles refuse by tensor name, never skip. Plain checkpoints refuse every compact selector, including the former plain Flash FP8 path. |
+| `SPECULATOR_FP8` | Kimi K3 | `SPECULATOR_FP8=on` (default `auto`, BF16) | Unmeasured; TP1/TP2 FP8 projection weights, exact per-rank packed arenas and shared push conversion. Independent of `DRAFT_KV_CACHE`; target weights stay unchanged. | Drafter E4M3 projection rounding can affect proposal acceptance and delivered speed; target verification retains strict output semantics. |
 | `KV_CACHE` | Muse | `KV_CACHE=fp8` (default `bf16`) | Muse K4 MC original, dev `5e28a1d30`, RTX PRO 6000 (2026-11-16): 1 RTX + 4 Sparks, speculation off, pool 510,272 to 1,056,768 tokens (2.071x), served context 510,272 to 1,048,576. Separate quiet 2 RTX + 6 Sparks pair with default NVIDIA DFlash2: C1 70.81 to 65.08 emitted tok/s (0.919x), C16 253.03 to 257.81 (1.019x), pool 2,009,216 to 2,097,152 and onboarded layers 0 to 9. One warmed launch per arm; no power-cap or thermal slowdown in timed windows. | Lossy native E4M3 target KV with per-token/head FP32 scales. Standard max generated decode: KL 0.00968 to 0.01689 (+0.00721), top-1 97.149% to 96.594% (-0.555 pp); prefill KL +0.00625, top-1 -0.716 pp. Absolute family bars pass, but paired quality and C1 default bars fail: remains opt-in. BF16 stays default; drafter storage is independent. |
 | `QWEN_FP8_HEAD` | Qwen4 | `QWEN_FP8_HEAD=on` (unset = BF16) | Converts the shared target/MTP head to one E4M3 backing. Historical combined measurement is in the decode row; standalone effect unmeasured. | Changes target logits; the draft reads the same head, not a separate draft-only FP8 copy. |
 | `MIMO_FP8_HEAD`, `MIMO_FP8_O_PROJ` | MiMo | Set either to `on` (unset/auto = checkpoint) | Explicitly converts a BF16 target head or O projection; native FP8 stays FP8. Unmeasured. | Target-weight quantization, independent of drafter precision. |
@@ -642,7 +675,7 @@ Each key is also a global `cuteafd` flag (`--gpu-memory-cap`, `--kv-max-tokens`,
 | `SPECULATOR_MODEL_REVISION` | empty | 40–64 lowercase hex | Drafter revision. |
 | `SPECULATOR_DEPTH` | 3 for local Qwen/Step-5, else 1 | positive int | Native MTP draft depth. |
 | `DRAFT_LENGTH` | unset (adaptive) | positive int | Fixed verified draft tokens per step: min(value, native head width), further capped by the existing row budget at high concurrency. Overrides `DRAFT_POLICY`; statistics still recorded. Every family and speculator (DFlash2, dSpark, MTP, Markov). V4.1 adaptive maximum remains 5 when unset; fixed supports up to 7. Without a speculator it is ignored with one startup log; reports and cards say `no speculation`. |
-| `SPECULATOR_FP8` | `auto` | `auto`, `on`, `off` | GLM/Qwen/MiMo drafter precision: `on` converts to single-copy FP8. |
+| `SPECULATOR_FP8` | `auto` | `auto`, `on`, `off` | GLM/Qwen/MiMo/Kimi drafter precision: `on` converts projection matrices to single-copy FP8. Kimi block DSpark supports TP1 and physical TP2 with native BF16 norms/Markov tensors; `auto` keeps BF16 until qualification. Independent of `DRAFT_KV_CACHE`. |
 | `DRAFT_POLICY` | unset | `shared`, `simple`, `simple-rc`, `simple-derived` | Drafter block policy: unset selects shared for MiniMax, simple elsewhere. Shared prices draft/skip actions per concurrency bucket and collects per-layer timing. Explicit values override the family default. |
 | `DRAFT_ROW_COST` | unset | `linear`, `power`, `log` | Drafter row cost model diagnostic. |
 | `DRAFT_SURVIVAL_LENGTHS` | `off` | `on`, `off` | Record draft survival lengths. |
@@ -683,6 +716,15 @@ Each key is also a global `cuteafd` flag (`--gpu-memory-cap`, `--kv-max-tokens`,
 | `MEDIA_FEATURES_DIR`, `AUDIO_FEATURES_DIR` | unset | absolute dir | Encoder feature caches. |
 | `CHAT_TEMPLATE_FROM` | checkpoint | snapshot dir | GLM Flash template source when the checkpoint's template cannot mark images. |
 
+The direct daemon's `--max-image-tokens` accepts an explicit 1-16384 per-image
+LM span cap. Omission uses the processor's default span, limited by its
+architectural ceiling: existing families default to 4096 (Qwen capped at 1024,
+Mistral at its checkpoint span), MiniMax to 576, and Kimi to 16698. An explicit
+cap can only lower a declared ceiling; it never changes vendor resize geometry
+or silently truncates feature rows. Kimi's full default is intentionally above
+the CLI's largest explicit value. These registration limits do not qualify an
+otherwise inactive tower for serving. `detail=low` remains capped at 256.
+
 Kimi K3.1 (`kimi_k31`) uses the shared Kimi engine. MC `original` (BF16),
 MC `k6-compact` and standalone native Core-K6 are launchable with real Spark
 experts after accepted full-model fidelity and partial paired scoring proof
@@ -697,7 +739,7 @@ unmeasured; whole-core `fp8-compact` remains unsupported and unqualified.
 All accepted views retain native BF16 indexer weights. K3 DFlash2 hidden-state
 compatibility is independently unqualified. `SPECULATOR=dspark` selects the
 checkpoint-native Inferact K3.1 block drafter (override with `SPECULATOR_MODEL_ID`
-and `SPECULATOR_MODEL_REVISION`), with native BF16 weights and independent
+and `SPECULATOR_MODEL_REVISION`), with BF16 or opt-in FP8 projection weights (`SPECULATOR_FP8=on`) and independent
 `DRAFT_KV_CACHE=fp8|bf16` window rings (default FP8). One coordinator runs TP1;
 two coordinators split query/KV heads and FFN neurons across both devices,
 with per-rank packed arenas, local rings and exact local prefix marks. FC and
@@ -1054,13 +1096,13 @@ original core is already FP8, not an MC publication.
 | `SPECULATOR_MODEL_REVISION` | ✗ | ✓ | ✓ | ✓ | ✓ | ✗ | ✓ | ✓ | ✗ | ✓ | ✗ |
 | `SPECULATOR_DEPTH` | ✗ | ✗ | ✗ | ✗ | ✓ | ✓ | ✓ | ✗ | ✓ | ✗ | ✗ |
 | `DRAFT_LENGTH` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| `SPECULATOR_FP8` | ✗ | ✗ | ✓ | ✓ | ✓ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ |
-| `DRAFT_POLICY` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ |
+| `SPECULATOR_FP8` | ✗ | ✗ | ✓ | ✓ | ✓ | ✓ | ✗ | ✓ | ✗ | ✗ | ✗ |
+| `DRAFT_POLICY` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✓ | ✗ | ✗ | ✗ |
 | `DRAFT_ROW_COST` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ |
 | `DRAFT_SURVIVAL_LENGTHS` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ |
 | `DRAFT_CONTEXT_SLOTS` | ✗ | ✗ | ✓ | ✓ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
 | `DRAFT_SEQUENCES` | ✗ | ✗ | ✓ | ✓ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
-| `SPECULATION_TRACE` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✗ | ✓ | ✗ |
+| `SPECULATION_TRACE` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✓ | ✗ |
 | `GLM5_FLASH_DRAFT_LINEAR` | ✗ | ✗ | ✗ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
 | **Prefill** | | | | | | | | | | |  |
 | `PREFILL_PACKING` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ |

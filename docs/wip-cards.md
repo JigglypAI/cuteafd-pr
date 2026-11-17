@@ -89,7 +89,12 @@ and arms for cleanup. Source worktrees are retained for inspection.
   level); `--post-load-c1` measures C1 again after the widest level. The sweep
   runs in the smoke binary, so arms with different server builds measure the
   same workload; pass `--binary` built from a checkout that has it (wip-cards
-  checks).
+  checks). Add `--panel-config 'concurrency={"sustained":true,"multiplier":4}'`
+  for separate continuous-refill rows at those levels (or in the server's
+  `concurrency` panel). The steady window excludes initial warm-up and final
+  drain; output-only tok/s includes the time spent on refill prefills. See
+  [benchmark panel configuration](options.md#benchmark-panel-configuration)
+  for window metadata and the explicit uniform-emission overlap estimate.
 - `--panels baseline,spec_lossless_set` adds the lossless merge gate: every
   case of `scripts/bench/fixtures/spec-lossless-set-v1.json` (or
   `--lossless-set FILE`, `[{id, prompt, nonce}]` with the full nonce string)

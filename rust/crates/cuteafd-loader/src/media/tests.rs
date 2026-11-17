@@ -438,3 +438,46 @@ fn mistral_expansion_refuses_bare_markers_and_mismatched_spans() {
     wrong.tokens += 1;
     assert!(expander.expand(&[10], &[wrong], 64).is_err());
 }
+
+#[test]
+fn every_family_resolves_default_and_explicit_span_without_raising_ceiling() {
+    for (family,default,ceiling) in [
+        (ImageFamily::Mimo,4096,None),(ImageFamily::Qwen,1024,Some(1024)),
+        (ImageFamily::GlmFlash,4096,None),(ImageFamily::Muse,4096,None),
+        (ImageFamily::Mistral,3080,Some(3080)),(ImageFamily::Inkling2,4096,None),
+        (ImageFamily::Step5,4096,None),(ImageFamily::MiniMax,576,Some(576)),
+        (ImageFamily::Kimi,16698,Some(16698))] {
+        let config=ProcessorConfig::for_family(family);
+        assert_eq!(config.resolved_span_cap(None).unwrap(),default);
+        assert_eq!(config.architectural_span_ceiling(),ceiling);
+        assert_eq!(config.resolved_span_cap(Some(64)).unwrap(),64);
+        assert_eq!(config.resolved_span_cap(Some(20000)).unwrap(),ceiling.unwrap_or(20000));
+        assert!(config.resolved_span_cap(Some(0)).is_err());
+    }
+}
+
+#[test]
+fn pe_normalization_identity_keys_both_inkling_round_boundaries() {
+    let inkling=ProcessorConfig::for_family(ImageFamily::Inkling2);
+    let parameters=inkling.normalization_parameters();
+    assert_eq!(parameters[..3].iter().map(|v|v.to_bits()).collect::<Vec<_>>(),
+        [0x3ef6813a,0x3eea685e,0x3ed100ff]);
+    assert_eq!(parameters[3..6].iter().map(|v|v.to_bits()).collect::<Vec<_>>(),
+        [0x3e8989d0,0x3e85c974,0x3e8d32a8]);
+    assert_eq!(parameters[6..9].iter().map(|v|v.to_bits()).collect::<Vec<_>>(),
+        [0x3e8989d0,0x3e85c974,0x3e8d32a8]);
+    // Both decimal std blocks round to identical f32 values. Keep both: the
+    // native owner normalizes, rounds to BF16, then applies the encoder remap.
+    assert_eq!(&parameters[3..6],&parameters[6..9]);
+    assert!(parameters[9..].iter().all(|v|v.to_bits()==0));
+    assert!(inkling.normalization_source().unwrap().contains("sha256="));
+    let step=ProcessorConfig::for_family(ImageFamily::Step5);
+    assert_eq!(step.merge,4);assert_eq!(step.resample,Resample::Bilinear);
+    assert_eq!(&step.normalization_parameters()[..3],&parameters[..3]);
+    assert_ne!(inkling.id(),step.id());
+    for family in [ImageFamily::Mimo,ImageFamily::Qwen,ImageFamily::GlmFlash,ImageFamily::Muse,ImageFamily::Mistral] {
+        let config=ProcessorConfig::for_family(family);let table=config.normalization_parameters();
+        for i in 0..768 {let c=i/256;let value=((i%256) as f64*(1.0/255.0)) as f32;
+            assert_eq!(table[i].to_bits(),((value-config.mean[c] as f32)/config.std[c] as f32).to_bits());}
+    }
+}

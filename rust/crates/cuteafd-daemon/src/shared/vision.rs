@@ -4,8 +4,11 @@
 mod glm_flash;
 mod muse;
 mod perception;
+mod minimax;
 mod constants;
 pub(crate) use constants::ConstantRegion;
+mod read_transform;
+pub(crate) use read_transform::ReadTransform;
 pub mod mistral;
 mod qwen;
 pub mod local;
@@ -136,7 +139,7 @@ pub(crate) struct TensorRead {
     pub(crate) path: PathBuf,
     pub(crate) metadata: SafetensorsTensorMetadata,
     pub(crate) destination: usize,
-    pub(crate) vector: bool,
+    pub(crate) transform: ReadTransform,
 }
 /// Header-only plan. It touches no tensor data until weight/scratch admission.
 #[derive(Clone, Debug)]
@@ -144,8 +147,13 @@ pub struct TowerSpec {
     pub native: VisionSpec,
     reads: Vec<TensorRead>,
     constants: Vec<ConstantRegion>,
+    family: Option<cuteafd_loader::media::ImageFamily>,
 }
 impl TowerSpec {
+    pub(crate) fn with_family(mut self, family: cuteafd_loader::media::ImageFamily) -> Self {
+        self.family=Some(family);
+        self
+    }
     /// Family-owned builders provide header plans; shared runtime retains ownership.
     /// Does not advertise executable dispatch or read any tensor payload.
     #[allow(dead_code)] // Consumed by family builders in the next additive step.
@@ -155,13 +163,7 @@ impl TowerSpec {
     pub(crate) fn from_parts_with_constants(native: VisionSpec, reads: Vec<TensorRead>, constants: Vec<ConstantRegion>) -> Result<Self> {
         let mut ranges = Vec::new();
         for read in &reads {
-            let source = usize::try_from(read.metadata.byte_length)
-                .map_err(|_| VisionError::Unsupported("tower source extent overflow".into()))?;
-            if read.vector && read.metadata.dtype != DType::Bf16 {
-                return Err(VisionError::Unsupported("tower vector widening requires BF16".into()));
-            }
-            let bytes = source.checked_mul(if read.vector { 2 } else { 1 })
-                .ok_or_else(|| VisionError::Unsupported("tower resident extent overflow".into()))?;
+            let bytes = read.transform.resident_bytes(&read.metadata)?;
             let end = read.destination.checked_add(bytes)
                 .ok_or_else(|| VisionError::Unsupported("tower destination overflow".into()))?;
             if bytes == 0 || end as u64 > native.weight_bytes
@@ -178,13 +180,13 @@ impl TowerSpec {
         constants::validate_regions(&constants, native.weight_bytes,
             ranges.iter().map(|&(start,end)| (start as u64,(end-start) as u64)))
             .map_err(VisionError::Unsupported)?;
-        Ok(Self { native, reads, constants })
+        Ok(Self { native, reads, constants, family: None })
     }
     pub(crate) fn constant_regions(&self) -> &[ConstantRegion] { &self.constants }
     fn validate_constants(&self) -> Result<()> {
-        constants::validate_regions(&self.constants,self.native.weight_bytes,
-            self.reads.iter().map(|read| (read.destination as u64,
-                read.metadata.byte_length.saturating_mul(if read.vector {2} else {1}))))
+        let ranges=self.reads.iter().map(|read| Ok((read.destination as u64,
+            read.transform.resident_bytes(&read.metadata)? as u64))).collect::<Result<Vec<_>>>()?;
+        constants::validate_regions(&self.constants,self.native.weight_bytes,ranges)
             .map_err(VisionError::Unsupported)
     }
     #[allow(dead_code)] // Family modules outside this parent use the same catalog.
@@ -194,8 +196,8 @@ impl TowerSpec {
     /// Header-only staged source windows of this tower's pushed contribution:
     /// BF16 vectors widen in the same windows `push::Contribution` records.
     pub(crate) fn staged_rects(&self) -> Vec<crate::shared::experts::rtx::dense::Rect> {
-        self.reads.iter().filter(|read| read.vector)
-            .flat_map(|read| push::widen_windows(&read.path, &read.metadata)).collect()
+        self.reads.iter().filter(|read| read.transform!=ReadTransform::Direct)
+            .flat_map(|read| push::transform_windows(&read.path, &read.metadata,read.transform)).collect()
     }
 }
 fn tower_catalog(snapshot: &Path, prefix: &str) -> Result<BTreeMap<String, (PathBuf, SafetensorsTensorMetadata)>> {
@@ -268,6 +270,11 @@ impl TowerSpec {
             Some("qwen4_exp") => Self::qwen(snapshot, max_tokens.min(cuteafd_loader::media::QWEN_MAX_IMAGE_TOKENS)),
             Some("glm5_next") => Self::glm_flash(snapshot, max_tokens),
             Some("muse_spark") => Self::muse(snapshot, max_tokens),
+            Some("inkling2"|"step5_vl") => Self::perception(snapshot,max_tokens),
+            Some("kimi_k3"|"kimi_k31") => crate::families::kimi_k3::vision::tower(snapshot,max_tokens)
+                .map_err(|error| VisionError::Unsupported(error.to_string())),
+            Some("minimax_m3_vl") => Self::minimax(snapshot,max_tokens)
+                .map_err(|error| VisionError::Unsupported(error.to_string())),
             // `max_tokens` counts the LM span; the tower's capacity is its merged [IMG] rows.
             Some("mistral_large4") => Self::mistral_large4(snapshot, mistral::merged_capacity(max_tokens)),
             kind => Err(VisionError::Unsupported(format!("tower model_type {kind:?}; add a tower exporter/kernel"))),
@@ -277,10 +284,13 @@ impl TowerSpec {
     pub fn row_markers(&self) -> u32 { u32::from(self.native.reserved == mistral::RESERVED) }
     pub fn image_family(&self) -> cuteafd_loader::media::ImageFamily {
         use cuteafd_loader::media::ImageFamily;
+        if let Some(family)=self.family {return family;}
         match self.native.reserved {
             2 => ImageFamily::Qwen,
             3 => ImageFamily::GlmFlash,
             5 => ImageFamily::Muse,
+            6 => ImageFamily::Inkling2,
+            7 => ImageFamily::Step5,
             mistral::RESERVED => ImageFamily::Mistral,
             _ => ImageFamily::Mimo,
         }
@@ -323,7 +333,7 @@ impl TowerSpec {
                 path: path.clone(),
                 metadata: metadata.clone(),
                 destination,
-                vector,
+                transform: if vector {ReadTransform::Bf16ToF32}else{ReadTransform::Direct},
             });
             Ok(destination as u64)
         };
@@ -404,6 +414,10 @@ impl TowerSpec {
             cuteafd_loader::media::ImageFamily::GlmFlash => "glm5_flash",
             cuteafd_loader::media::ImageFamily::Muse => "muse_spark",
             cuteafd_loader::media::ImageFamily::Mistral => "mistral_large4",
+            cuteafd_loader::media::ImageFamily::Inkling2 => "inkling2",
+            cuteafd_loader::media::ImageFamily::Step5 => "step5",
+            cuteafd_loader::media::ImageFamily::Kimi => "kimi_k3",
+            cuteafd_loader::media::ImageFamily::MiniMax => "minimax_m3",
         };
         let numerics = if self.image_family() == cuteafd_loader::media::ImageFamily::Muse {
             headers.insert("feature_norm_eps".into(), serde_json::json!(self.native.norm_eps.to_bits()));
@@ -425,16 +439,13 @@ impl TowerSpec {
             let mut file = File::open(&read.path)?;
             file.seek(SeekFrom::Start(m.byte_offset))?;
             let start = read.destination;
-            if read.vector {
-                let mut raw = vec![0u8; m.byte_length as usize];
-                file.read_exact(&mut raw)?;
-                for (i, bytes) in raw.chunks_exact(2).enumerate() {
-                    let value =
-                        f32::from_bits((u16::from_le_bytes([bytes[0], bytes[1]]) as u32) << 16);
-                    weights[start + i * 4..start + i * 4 + 4].copy_from_slice(&value.to_le_bytes());
-                }
+            let resident=read.transform.resident_bytes(m)?;
+            if read.transform==ReadTransform::Direct {
+                file.read_exact(&mut weights[start..start+resident])?;
             } else {
-                file.read_exact(&mut weights[start..start + m.byte_length as usize])?;
+                let mut raw=vec![0u8;m.byte_length as usize];
+                file.read_exact(&mut raw)?;
+                read.transform.convert(&raw,&mut weights[start..start+resident])?;
             }
         }
         for region in self.constant_regions() {
@@ -450,12 +461,13 @@ fn axial_frequency(index: usize, frequencies: usize) -> f32 {
 }
 
 /// Matches the CPU reference's f64 rescale followed by f32 normalize, without FMA.
-pub fn normalization_lut(config: &cuteafd_loader::media::ProcessorConfig) -> Arc<[f32; 768]> {
-    Arc::new(std::array::from_fn(|i| {
-        let c = i / 256;
-        let pixel = ((i % 256) as f64 * (1.0 / 255.0)) as f32;
-        (pixel - config.mean[c] as f32) / config.std[c] as f32
-    }))
+pub fn normalization_parameters(config:&cuteafd_loader::media::ProcessorConfig) -> Arc<[f32;768]> {
+    Arc::new(config.normalization_parameters())
+}
+/// Legacy callers keep their name and byte-identical LUT. PE uses the same
+/// bounded parameter storage, with its declared per-family interpretation.
+pub fn normalization_lut(config:&cuteafd_loader::media::ProcessorConfig) -> Arc<[f32;768]> {
+    normalization_parameters(config)
 }
 
 pub struct VitRuntime {
@@ -862,7 +874,7 @@ mod tests {
             let prefix = if family == "mimo_v2" { "visual." } else { "model.visual." };
             let placements: BTreeMap<_, _> = tower.reads.iter().map(|read| (
                 read.metadata.name.strip_prefix(prefix).unwrap(),
-                (read.destination, read.metadata.byte_length * if read.vector { 2 } else { 1 })
+                (read.destination, read.transform.resident_bytes(&read.metadata).unwrap() as u64)
             )).collect();
             let output = std::process::Command::new(python)
                 .args(["-c", "import importlib.util,json,sys; p=sys.argv[1]; s=importlib.util.spec_from_file_location('parity',p); m=importlib.util.module_from_spec(s); s.loader.exec_module(m); print(json.dumps(m.packed_spec_fields(sys.argv[2],sys.argv[3],json.loads(sys.argv[4]))))"])
@@ -1134,9 +1146,10 @@ mod tests {
                     byte_length: 4,
                 },
                 destination: 0,
-                vector: true,
+                transform: ReadTransform::Bf16ToF32,
             }],
             constants:vec![ConstantRegion::fp32("rotary.inv_freq",128,[1.0],"one float","fixture")],
+            family: None,
         };
         let arena = spec.load_weights().unwrap();
         assert_eq!(&arena[0..4], &1.0f32.to_le_bytes());
@@ -1213,7 +1226,7 @@ mod tests {
 mod family_builder_hook_tests {
     use super::*;
     fn read(destination: usize) -> TensorRead {
-        TensorRead { path: "unread.safetensors".into(), destination, vector: false,
+        TensorRead { path: "unread.safetensors".into(), destination, transform: ReadTransform::Direct,
             metadata: SafetensorsTensorMetadata { name: "tower.weight".into(), dtype: DType::Bf16,
                 shape: vec![8], byte_offset: 0, byte_length: 16 } }
     }
@@ -1225,7 +1238,7 @@ mod family_builder_hook_tests {
         assert!(TowerSpec::from_parts(native.clone(), vec![read(24)]).is_err());
         let mut bad = read(0); bad.metadata.byte_offset = u64::MAX;
         assert!(TowerSpec::from_parts(native.clone(), vec![bad]).is_err());
-        let mut bad = read(0); bad.metadata.dtype = DType::F32; bad.vector = true;
+        let mut bad = read(0); bad.metadata.dtype = DType::F32; bad.transform = ReadTransform::Bf16ToF32;
         assert!(TowerSpec::from_parts(native.clone(), vec![bad]).is_err());
         let mut bad = read(0); bad.metadata.byte_length = 0;
         assert!(TowerSpec::from_parts(native, vec![bad]).is_err());

@@ -8,7 +8,7 @@ use cuteafd_ffi::{CuteafdDeviceBuffer, NativeLibrary};
 mod encoder_suffix;
 mod transfer;
 pub(crate) use encoder_suffix::EncoderSuffix;
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Phase {
     Idle,
     StartupAttention(usize),
@@ -63,7 +63,21 @@ pub(crate) struct BackboneBlockWave<'w, 'a> {
     tokens: Vec<u64>,
     phase: Phase,
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct FfnGraphState {
+    phase: Phase,
+    attention: super::v41_hc::HcGraphState,
+    ffn: super::v41_hc::HcGraphState,
+}
 impl<'w, 'a> BackboneBlockWave<'w, 'a> {
+    pub(crate) fn ffn_graph_state(&self) -> FfnGraphState {
+        FfnGraphState { phase: self.phase, attention: self.attention.graph_state(), ffn: self.ffn.graph_state() }
+    }
+    pub(crate) fn restore_ffn_graph_state(&mut self, state: FfnGraphState) {
+        self.phase = state.phase;
+        self.attention.restore_graph_state(state.attention);
+        self.ffn.restore_graph_state(state.ffn);
+    }
     #[cfg(test)]
     pub fn trace_stream(&self) -> *mut std::ffi::c_void { self.ffn.stream_raw() }
     /// The stream carrying each layer's FFN finish (mHC post, next inputs).
@@ -733,6 +747,116 @@ impl<'a> BlockOutput<'a> {
     pub(crate) unsafe fn from_test_buffers(layer: usize, tokens: &'a [u64],
         residual: CuteafdDeviceBuffer, pre: CuteafdDeviceBuffer) -> Result<Self> {
         Ok(Self { binding: QueryBinding::new(layer)?, layer, tokens, residual, pre })
+    }
+}
+
+#[cfg(test)]
+mod capture_rejection_tests {
+    use super::*;
+    use crate::shared::decode_graph::{self, GraphBank};
+    use crate::shared::decode_graph::device::{Basis, Cycle, Preference, Site};
+    use super::super::v41_tensors::NativeRtxTensors;
+
+    fn check(warmup: bool, device_id: i32) -> Result<()> {
+        let fixture = cuteafd_ffi::native_library_lifetime_fixture::Fixture::build_for_tests()?;
+        let library = fixture.load()?;
+        fixture.configure_memory(&library, 0, 1 << 30)?;
+        fixture.immediate_copies(&library)?;
+        let weights = NativeRtxTensors::hc_fixture(&library)?;
+        let names = || ["projection", "scale", "base", "norm"].map(str::to_owned);
+        let make = || -> Result<_> { Ok(BackboneBlockWave::new(&library, 0,
+            HcSublayer::new(&library, &weights, names(), 1, usize::MAX)?,
+            HcSublayer::new(&library, &weights, names(), 1, usize::MAX)?, 1)) };
+        let binding = QueryBinding::new(0)?;
+        let projected = crate::shared::memory::DeviceAllocation::new(&library, 10240,
+            crate::shared::memory::TEST)?;
+        library.copy_h2d(projected.buffer, &vec![3; 10240])?;
+        let prepare = |block: &mut BackboneBlockWave<'_, '_>| -> Result<()> {
+            library.copy_h2d(block.inputs()[0], &vec![7; 40960])?;
+            library.copy_h2d(block.inputs()[1], &[0; 16])?;
+            block.tokens = vec![9];
+            block.phase = Phase::Attention(binding, 1);
+            // SAFETY: fixture operands are initialized; this establishes the
+            // same unpublished attention state as the query producer.
+            unsafe { block.attention.graph_begin_state(1) }
+        };
+        let output = |block: &BackboneBlockWave<'_, '_>| -> Result<Vec<Vec<u8>>> {
+            [block.graph_normalized_storage(1), block.ffn.inputs()[0], block.ffn.inputs()[1]]
+                .into_iter().map(|buffer| {
+                    let mut bytes = vec![0; buffer.bytes];
+                    library.copy_d2h(&mut bytes, buffer)?; Ok(bytes)
+                }).collect()
+        };
+        let mut reference = make()?;
+        prepare(&mut reference)?;
+        // SAFETY: CPU stand-ins retain all operands, use deterministic dependency
+        // markers and execute only outside native capture, never CUDA numerics.
+        unsafe { reference.enqueue_ffn(binding, 1, projected.buffer, reference.finish_stream())?; }
+        let expected = output(&reference)?;
+        assert!(expected[0].iter().any(|&byte| byte != 0));
+
+        for failure in [0, 1, 2, 3] {
+            let mut block = make()?;
+            prepare(&mut block)?;
+            let stream = block.finish_stream();
+            if warmup {
+                // SAFETY: warmup is complete before restoring its host state.
+                unsafe {
+                    block.enqueue_ffn(binding, 1, projected.buffer, stream)?;
+                    library.cuda_stream_synchronize(stream)?;
+                    block.restore_ffn_graph_warmup(binding, 1)?;
+                }
+            }
+            let before = block.ffn_graph_state();
+            let bytes_before = output(&block)?;
+            let mut bank: GraphBank<u32, ()> = GraphBank::new();
+            bank.attach_device_for_test(device_id - failure, 100, Site {
+                name: "capture-rejection", cycle: Cycle::Decode, preference: Preference::Capture,
+                bootstrap: 10, basis: Basis::Bytes, spans_devices: false,
+            })?;
+            let mut ticket = bank.cache_ticket(&1, false, None).unwrap();
+            fixture.configure_capture(&library, match failure { 0 => 10, 3 => 12, _ => 0 })?;
+            if failure == 2 { fixture.configure_pack(&library, 98, 0)?; }
+            let result = decode_graph::capture_transaction(&mut block, before, |block| {
+                // SAFETY: end the capture even when enqueue fails halfway.
+                unsafe {
+                    ticket.capture_result(decode_graph::begin_capture(&library, stream, &ticket))?;
+                    let queued = block.enqueue_ffn(binding, 1, projected.buffer, stream);
+                    let captured = decode_graph::end_capture(&library, stream, &mut ticket);
+                    let captured = ticket.capture_result(captured);
+                    if let Ok((raw, ..)) = &captured { library.cuda_graph_exec_destroy(*raw)?; }
+                    queued?;
+                    captured?;
+                }
+                // Force the shared-cache eager sentinel after a completed record.
+                Err::<(), _>(cuteafd_ffi::GraphCacheEager.into())
+            }, |block, checkpoint| block.restore_ffn_graph_state(checkpoint));
+            assert!(result.is_err());
+            if failure < 2 { assert!(cuteafd_ffi::is_small_graph(&result.unwrap_err())); }
+            assert_eq!(block.ffn_graph_state(), before, "every recorded host flag rolls back");
+            assert_eq!(output(&block)?, bytes_before, "recording never executes device work");
+            fixture.configure_capture(&library, 0)?;
+            fixture.configure_pack(&library, 0, 0)?;
+            // SAFETY: failed record is ended; the exact input checkpoint was restored.
+            unsafe { block.enqueue_ffn(binding, 1, projected.buffer, stream)?; }
+            assert_eq!(output(&block)?, expected, "fallback equals never-captured execution");
+            assert_eq!(block.ffn_graph_state(), reference.ffn_graph_state());
+        }
+        // Negative control: the old fallback fails after recording changed phase.
+        let mut block = make()?;
+        prepare(&mut block)?;
+        let stream = block.finish_stream();
+        // SAFETY: same initialized CPU fixture storage as the successful reference.
+        unsafe { block.enqueue_ffn(binding, 1, projected.buffer, stream)?; }
+        // SAFETY: the second enqueue must fail its phase check before native work.
+        assert!(unsafe { block.enqueue_ffn(binding, 1, projected.buffer, stream) }
+            .unwrap_err().to_string().contains("block attention is not pending for queued FFN"));
+        Ok(())
+    }
+    #[test]
+    fn sparse_tail_rejection_restores_complete_state_and_eager_output() -> Result<()> {
+        check(false, -237_310)?;
+        check(true, -237_320)
     }
 }
 

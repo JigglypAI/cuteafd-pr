@@ -2649,7 +2649,7 @@ def test_one_serving_turn_covers_all_arms_repeats_and_teardown(entry, tmp_path, 
     monkeypatch.setattr(cards.hwlock, 'hold', hold)
     original_preflight = cards.preflight_at_grant
     def at_grant(job, arm):
-        assert held == ['sparks', 'gpu0', 'gpu1']
+        assert held == ['sparks', 'gpu0']
         events.append('prelaunch-' + job['arm'])
         return original_preflight(job, arm)
     monkeypatch.setattr(cards, 'preflight_at_grant', at_grant)
@@ -2668,9 +2668,9 @@ def test_one_serving_turn_covers_all_arms_repeats_and_teardown(entry, tmp_path, 
     expected = ['base'] if stop else ['base', 'cand', 'cand', 'base']
     assert launched == ['v41-min/' + arm for arm in expected]
     assert events == ['grant', *[event for arm in expected for event in ('prelaunch-' + arm, 'teardown-' + arm)], 'release']
-    assert all(env['CUTEAFD_HW_LOCKS_HELD'] == 'sparks,gpu0,gpu1' for env in smoke_envs)
+    assert all(env['CUTEAFD_HW_LOCKS_HELD'] == 'sparks,gpu0' for env in smoke_envs)
     assert not held
-    locks = cards.hwlock._try_flocks(['sparks', 'gpu0', 'gpu1'])
+    locks = cards.hwlock._try_flocks(['sparks', 'gpu0'])
     assert locks is not None
     for handle in locks:
         handle.close()
@@ -2705,7 +2705,7 @@ def test_all_build_paths_finish_before_shared_serving_turn(entry, tmp_path, monk
     assert events == ['build-base', 'build-cand', 'grant', 'release']
 
 
-def test_serving_lock_union_matches_smoke_rules():
+def test_serving_lock_union_follows_the_resolved_layout():
     import itertools
     for gpus, hosts, exclusive, family in itertools.product(
             ([0], [1], [0, 1]), ([], ['ostrich'], ['rhea'], ['moa'], ['rhea', 'moa']),
@@ -2713,13 +2713,47 @@ def test_serving_lock_union_matches_smoke_rules():
         entry = dict(gpus=gpus, sparks=hosts, family=family)
         if exclusive is not None:
             entry['exclusive'] = exclusive
-        expected_exclusive = exclusive if exclusive is not None else family == 'deepseek_v41'
-        expected = []
-        if 0 in gpus or 'ostrich' in hosts or expected_exclusive:
-            expected.append('sparks')
-        expected += [f'gpu{gpu}' for gpu in (0, 1) if gpu in gpus or expected_exclusive]
+        expected = (['sparks'] if set(hosts) & set(cards.HOSTS[:4]) else []) + [f'gpu{gpu}' for gpu in (0, 1) if gpu in gpus]
         expected += [host for host in ('rhea', 'moa') if host in hosts]
         assert cards.serving_locks([dict(entry=entry)]) == expected
+
+
+def test_serving_lock_cases_match_the_shared_parity_fixture():
+    # Rust smoke.rs locks_for reads the same table (lock_cases_match_the_shared_parity_fixture).
+    fixture = json.loads((ROOT / 'rust/crates/cuteafd-bench/tests/fixtures/serving-locks.json').read_text())
+    for case in fixture['cases']:
+        entry = dict(gpus=case['gpus'], sparks=case['sparks'], family=case.get('family'))
+        if 'exclusive' in case:
+            entry['exclusive'] = case['exclusive']
+        expected = [lock.removesuffix('.lock') for lock in case['locks']]
+        assert cards.serving_locks([dict(entry=entry)]) == expected, case['name']
+
+
+def test_card_layout_is_the_lock_source():
+    # V4.1 min card: one coordinator GPU and three pool Sparks.
+    card = dict(config='unused.config', gpus=[0], sparks=['ostrich', 'dodo', 'emu'],
+                resolved_values={'COORDINATOR_GPUS': '0', 'SPARK_COUNT': '3'})
+    assert cards.card_layout(card) == ([0], ['ostrich', 'dodo', 'emu'])
+    assert cards.layout_locks([cards.card_layout(card)]) == ['sparks', 'gpu0']
+    # A 0-Spark card keeps its GPUs and takes no sparks lock, even on GPU0.
+    card['resolved_values'] = {'COORDINATOR_GPUS': '0,1', 'SPARK_COUNT': '0'}
+    assert cards.serving_locks([dict(entry=dict(gpus=[0, 1], sparks=[]))]) == ['gpu0', 'gpu1']
+    # The 2-RTX + 6-Spark layout: pool Sparks plus rhea and moa.
+    card['resolved_values'] = {'COORDINATOR_GPUS': '0,1', 'SPARK_COUNT': '6',
+                               'SPARK_4_HOST': 'rhea', 'SPARK_5_HOST': 'moa'}
+    assert cards.layout_locks([cards.card_layout(card)]) == ['sparks', 'gpu0', 'gpu1', 'rhea', 'moa']
+
+
+def test_print_locks_never_builds_or_serves(entry, tmp_path, monkeypatch, capsys):
+    def forbidden(*args, **kwargs):
+        pytest.fail('--print-locks must not build, preflight or take a lock')
+    monkeypatch.setattr(cards, 'build_arms', forbidden)
+    monkeypatch.setattr(cards, 'resolve_launchers', forbidden)
+    monkeypatch.setattr(cards.hwlock, 'hold', forbidden)
+    monkeypatch.setattr(sys, 'argv', ['wip-cards', '--kit', str(_kit(tmp_path, entry)), '--cards', entry['name'],
+                        '--matrix', '--arm', 'base=b:s', '--state', str(tmp_path / 'state'), '--print-locks'])
+    assert cards.main() == 0
+    assert capsys.readouterr().out.strip() == 'sparks,gpu0'
 
 
 def test_dry_run_prints_one_turn_after_builds(entry, tmp_path, monkeypatch, capsys):
@@ -2729,7 +2763,7 @@ def test_dry_run_prints_one_turn_after_builds(entry, tmp_path, monkeypatch, caps
     assert cards.main() == 0
     output = capsys.readouterr().out
     assert output.count('single serving turn') == 1
-    assert 'hwlock --locks sparks,gpu0,gpu1 --wait 21600' in output
+    assert 'hwlock --locks sparks,gpu0 --wait 21600' in output
     assert output.count('setsid ') == 4
     assert not cards.hwlock.LOCK_DIR.exists()
 
@@ -2761,7 +2795,7 @@ def test_real_stopped_smoke_tears_down_before_parent_unlocks(entry, tmp_path, mo
              '(d/"ready").write_text(os.environ["CUTEAFD_HW_LOCKS_HELD"])\n'
              'while True: time.sleep(0.01)\n']
     with cards.serving_turn([job], dict(os.environ), 5):
-        env = {**os.environ, 'CUTEAFD_HW_LOCKS_HELD': 'sparks,gpu0,gpu1'}
+        env = {**os.environ, 'CUTEAFD_HW_LOCKS_HELD': 'sparks,gpu0'}
         process = cards.detached(smoke, tmp_path / 'driver.log', tmp_path / 'exit', env)
         try:
             deadline = time.monotonic() + 10
@@ -2826,18 +2860,31 @@ def test_failed_build_never_takes_serving_turn(entry, tmp_path, monkeypatch):
                    '--matrix', '--arm', 'base=b:s', '--build', 'base=HEAD', '--state', str(tmp_path / 'state')])
 
 
-def test_serving_turn_preserves_inherited_locks(entry, tmp_path, monkeypatch):
-    import contextlib
-    requested = []
-    @contextlib.contextmanager
-    def hold(names, *args, **kwargs):
-        requested.append(names)
-        yield
-    monkeypatch.setattr(cards.hwlock, 'hold', hold)
+def test_serving_turn_takes_no_ticket_when_the_hold_covers_it(entry, tmp_path, monkeypatch):
+    # An enclosing hold that covers the whole set needs no inner ticket, and the
+    # child smokes inherit the canonical union.
+    def forbidden(*args, **kwargs):
+        pytest.fail('a covering hold needs no inner ticket')
+    monkeypatch.setattr(cards.hwlock, 'hold', forbidden)
     env = {'CUTEAFD_HW_LOCKS_HELD': 'sparks.lock,gpu0.lock'}
     with cards.serving_turn([make(entry, tmp_path)], env, 5):
-        assert env['CUTEAFD_HW_LOCKS_HELD'] == 'sparks,gpu0,gpu1'
-    assert requested == [['gpu1']]
+        assert env['CUTEAFD_HW_LOCKS_HELD'] == 'sparks,gpu0'
+
+
+def test_nested_hold_must_cover_the_whole_serving_set(entry, tmp_path, monkeypatch):
+    def forbidden(*args, **kwargs):
+        pytest.fail('a lock the outer hold does not cover must never be queued')
+    monkeypatch.setattr(cards.hwlock, 'hold', forbidden)
+    # #2364: the outer hwlock held sparks,gpu0 while the V4.1 card resolved both GPUs.
+    job = make({**entry, 'gpus': [0, 1]}, tmp_path)
+    with pytest.raises(ValueError, match=r'gpu1.*cannot be granted'):
+        with cards.serving_turn([job], {'CUTEAFD_HW_LOCKS_HELD': 'sparks,gpu0'}, 5):
+            pytest.fail('nothing may run')
+    # A hold that covers none of them fails the same way.
+    job = make(entry, tmp_path)
+    with pytest.raises(ValueError, match=r'sparks,gpu0'):
+        with cards.serving_turn([job], {'CUTEAFD_HW_LOCKS_HELD': 'rhea'}, 5):
+            pytest.fail('nothing may run')
 
 
 def test_resume_with_every_job_kept_never_queues(entry, tmp_path, monkeypatch):
@@ -2854,7 +2901,7 @@ def test_resume_with_every_job_kept_never_queues(entry, tmp_path, monkeypatch):
 def test_serving_turn_wait_is_bounded(entry, tmp_path, monkeypatch):
     monkeypatch.setattr(cards.hwlock, 'POLL_S', 0.005)
     job = make(entry, tmp_path)
-    with cards.hwlock.hold(['gpu1'], 1):
+    with cards.hwlock.hold(['gpu0'], 1):
         with pytest.raises(TimeoutError, match='no turn'):
             with cards.serving_turn([job], {}, 0.02):
                 pytest.fail('a conflicting turn cannot be granted')
@@ -2888,9 +2935,11 @@ def test_grouped_smoke_inherits_union_turn(entry, tmp_path, monkeypatch):
     assert seen == ['launch', ('absent', 'one'), ('absent', 'two')]
 
 
-def test_null_exclusive_uses_smokes_family_default():
-    assert cards.serving_locks([{'entry': dict(family='deepseek_v41', exclusive=None, gpus=[1])}]) == [
-        'sparks', 'gpu0', 'gpu1']
+def test_null_exclusive_does_not_widen_v41_locks():
+    # V4.1's exclusive default is a scheduling rule; the card resolved GPU1 only.
+    assert cards.serving_locks([{'entry': dict(family='deepseek_v41', exclusive=None, gpus=[1])}]) == ['gpu1']
+    assert cards.serving_locks([{'entry': dict(family='deepseek_v41', exclusive=True, gpus=[0],
+                                              sparks=['ostrich', 'dodo', 'emu'])}]) == ['sparks', 'gpu0']
 
 
 def test_cancelled_smoke_skips_remote_profile_collection(entry, tmp_path, monkeypatch):
@@ -4185,3 +4234,15 @@ def test_next_turn_fidelity_checks_capture_and_self_determinism(failure):
         with pytest.raises(ValueError): cards.image_next_turn_fidelity(reference, warm, repeat)
     else:
         cards.image_next_turn_fidelity(reference, warm, repeat)
+
+
+def test_sustained_levels_panel_config_reaches_matrix(entry, tmp_path, monkeypatch):
+    kit = _kit(tmp_path, entry)
+    state = tmp_path / 'sustained-state'
+    monkeypatch.setattr(sys, 'argv', ['wip-cards', '--kit', str(kit), '--cards', 'v41-min', '--matrix',
+        '--arm', 'a=b:s', '--state', str(state), '--panels', 'none', '--levels', '8,16',
+        '--panel-config', 'concurrency={"sustained":true,"multiplier":4}', '--dry-run'])
+    assert cards.main() == 0
+    e = json.loads(next(state.glob('*/matrix.json')).read_text())['entries'][0]
+    assert e['levels'] == [8, 16]
+    assert e['panel_config'] == {'concurrency': {'sustained': True, 'multiplier': 4}}
