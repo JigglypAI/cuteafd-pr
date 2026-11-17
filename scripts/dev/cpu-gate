@@ -557,6 +557,12 @@ def compiler_cache_receipt(env, target):
                   rustflags=env.get('RUSTFLAGS', ''), cargo_encoded_rustflags=env.get('CARGO_ENCODED_RUSTFLAGS', ''))
     if warning.is_file():
         record['fallback'] = warning.read_text(errors='replace').strip()
+    for name, command in (('rustc', ['rustc', '-vV']), ('cargo', ['cargo', '-V'])):
+        try:
+            version = subprocess.run(command, env=env, capture_output=True, text=True, timeout=5)
+            record[name] = version.stdout.strip() if version.returncode == 0 else None
+        except (OSError, subprocess.SubprocessError):
+            record[name] = None
     if active:
         try:
             result = subprocess.run([active, '--json', 'stats', '--root', str(target), '--last-build'],

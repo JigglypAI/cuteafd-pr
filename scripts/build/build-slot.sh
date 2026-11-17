@@ -25,7 +25,7 @@ terminated() {
   trap '' TERM INT HUP QUIT
   echo "build-slot: terminated (exit $code)" >&2
   if [[ -n "$child" ]]; then
-    kill -TERM -- "-$child" 2>/dev/null || true
+    kill -TERM "$child" 2>/dev/null || true
     wait "$child" 2>/dev/null || true
   fi
   exit "$code"
@@ -43,7 +43,7 @@ while :; do
     exec {fd}>>"$lock"
     if flock -n "$fd"; then
       echo "build slot $i: $*" >&2
-      CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-16}" setsid --wait nice -n 19 "$@" &
+      CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-16}" nice -n 19 "$@" &
       child=$!
       status=0
       wait "$child" || status=$?

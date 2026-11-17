@@ -874,3 +874,39 @@ def test_build_leg_notification_records_termination(tmp_path):
         if process.poll() is None:
             os.killpg(process.pid, 9)
             process.wait()
+
+
+def test_build_slot_does_not_detach_compilers_from_gate_process_group(tmp_path):
+    process = subprocess.Popen(['bash', str(ROOT / 'scripts/build/build-slot.sh'), 'python3', '-c',
+                                'import os; print(os.getpgrp(), flush=True)'],
+                               env={**os.environ, 'CUTEAFD_LOCK_DIR': str(tmp_path)},
+                               stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True)
+    output, error = process.communicate(timeout=5)
+    assert process.returncode == 0, error
+    assert int(output.strip()) == process.pid
+
+
+def test_cpu_gate_terminated_in_lease_queue_writes_nonzero_receipt(tmp_path):
+    locks = tmp_path / '.cache/cuteafd'
+    locks.mkdir(parents=True)
+    with gate.gate_lease(locks, slots=2, timeout=0):
+        with gate.gate_lease(locks, slots=2, timeout=0):
+            process = subprocess.Popen([sys.executable, str(ROOT / 'scripts/dev/cpu-gate'), '--task', 'terminated-lease'],
+                                       env={**os.environ, 'HOME': str(tmp_path)}, stdout=subprocess.PIPE,
+                                       stderr=subprocess.PIPE, text=True, start_new_session=True)
+            try:
+                import selectors
+                selector = selectors.DefaultSelector()
+                selector.register(process.stderr, selectors.EVENT_READ)
+                assert selector.select(timeout=10)
+                assert 'waiting for gate lease' in process.stderr.readline()
+                process.terminate()
+                process.communicate(timeout=10)
+                assert process.returncode == 143
+                record = json.loads((locks / 'builds/terminated-lease/cpu-gate.json').read_text())
+                assert record['verdict'] == 'terminated' and record['exit'] == 143
+                selector.close()
+            finally:
+                if process.poll() is None:
+                    os.killpg(process.pid, 9)
+                    process.wait()
