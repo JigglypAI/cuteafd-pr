@@ -2287,6 +2287,7 @@ pub(super) mod tests {
         let spark_bytes = 115_964_116_992;
         use cuteafd_core::MlaCacheFormat;
         let automatic = plan_input.plan_spark_count(&PlanOptions {
+            vision: plan::MediaMode::Off,
             attention_placement: Some(AttentionPlacement::Layers),
             placement: ExpertPlacement::Sparks { ranks: 6 },
             layout: Some(LayoutOptions { host_memory: Some(cuteafd_loader::plan::testing::SimulatedHost::raptor().host_ram),
@@ -2339,7 +2340,7 @@ pub(super) mod tests {
             let mark_bytes = cfg.kda_layers() as u64 * (cfg.kda_state_bytes() + cfg.kda_conv_bytes());
             let marks = prefix_slots.unwrap_or_else(|| rule.slots(usize::try_from(mark_bytes).unwrap()) as u64);
             assert_eq!(marks, if entries == 0 { 0 } else if rule.host { 2 } else { 1 });
-            let options = PlanOptions { attention_placement: Some(AttentionPlacement::Layers), placement: ExpertPlacement::Sparks { ranks: 6 },
+            let options = PlanOptions { vision: plan::MediaMode::Off, attention_placement: Some(AttentionPlacement::Layers), placement: ExpertPlacement::Sparks { ranks: 6 },
                 layout: Some(LayoutOptions { host_memory: Some(cuteafd_loader::plan::testing::SimulatedHost::raptor().host_ram), rtx_bytes: vec![capacity; 2], prefill_rows: unit as u64, prefill_lanes: waves as u64,
                     concurrency: slots, state_slots: Some(slots), prefix_slots,
                     mimo_prefix_entries: entries as u64, mimo_prefix_mark_bytes: rule.budget_bytes,
