@@ -846,6 +846,20 @@ def test_muse_prefill_scoring_uses_ordinary_launch(tmp_path: Path) -> None:
     assert "--full-prefill-logits" not in plan
 
 
+def test_step5_forwards_shared_speculation_trace(tmp_path: Path) -> None:
+    trace = tmp_path / "trace" / "step5.jsonl"
+    result = _step5(tmp_path, f"SPARK_COUNT=4\nRTX_GPUS=2\nSPECULATION_TRACE={trace}\n" + _hosts(4))
+    serve = _line(result, "serve-step5 --snapshot")
+    assert f"CUTEAFD_SPECULATION_TRACE={trace}" in serve
+    assert f"{trace.parent}:{trace.parent}" in serve
+    daemon = Path(__file__).resolve().parents[2] / "rust/crates/cuteafd-daemon/src"
+    assert "scheduler::schedule(backend," in (daemon / "families/step5/serve.rs").read_text()
+    scheduler = (daemon / "shared/qwen/scheduler.rs").read_text()
+    assert "let trace = Trace::open()?;" in scheduler
+    assert "crate::shared::speculation_trace::Trace::open()?" in scheduler
+    assert "self.history.observe(outcomes, self.trace.is_some())" in (daemon / "shared/draft/history.rs").read_text()
+
+
 def test_muse_forwards_speculation_trace(tmp_path: Path) -> None:
     trace = tmp_path / "trace" / "speculation-trace.jsonl"
     result = _muse(tmp_path, f"SPECULATION_TRACE={trace}\n")
