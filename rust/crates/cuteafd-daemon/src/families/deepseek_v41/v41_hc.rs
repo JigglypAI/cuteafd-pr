@@ -91,7 +91,21 @@ pub(crate) struct HcSublayer<'weights, 'library> {
     ready: Option<usize>,
     pending: Option<usize>,
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct HcGraphState {
+    begun: Option<usize>,
+    ready: Option<usize>,
+    pending: Option<usize>,
+}
 impl<'weights, 'library> HcSublayer<'weights, 'library> {
+    pub(crate) fn graph_state(&self) -> HcGraphState {
+        HcGraphState { begun: self.begun, ready: self.ready, pending: self.pending }
+    }
+    pub(crate) fn restore_graph_state(&mut self, state: HcGraphState) {
+        self.begun = state.begun;
+        self.ready = state.ready;
+        self.pending = state.pending;
+    }
     pub fn new(
         library: &'library NativeLibrary,
         weights: &'weights NativeRtxTensors<'library>,

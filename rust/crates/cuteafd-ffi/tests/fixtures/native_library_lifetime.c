@@ -536,11 +536,18 @@ int cuteafd_alloc_managed_device_buffer(size_t bytes, struct device_buffer *out,
     return 0;
 }
 
+/* Opt-in through HC initialization. Only the HC regression models capture:
+ * recorded HC operations/copies do not execute, including rejected records. */
+static int hc_fixture, hc_recording;
+static void *hc_capture_stream;
+static int hc_is_recording(void *stream) {
+    return hc_fixture && hc_recording && hc_capture_stream == stream;
+}
 static int capture_status;
 void fixture_configure_capture(int status) { capture_status = status; }
 struct graph_exec { int device; size_t bytes; int invalid; uint64_t launches; };
 int cuteafd_cuda_graph_end_capture(void *stream, void **out) {
-    (void)stream;
+    if (hc_is_recording(stream)) hc_recording = 0;
     if (capture_status) return capture_status;
     struct graph_exec *graph = malloc(sizeof(*graph));
     if (!graph) return 1;
@@ -570,7 +577,7 @@ int cuteafd_cuda_graph_end_capture_topology(void *stream, void **out,
 struct fixture_graph_source { int device; };
 int cuteafd_cuda_graph_capture_source(void *stream, void **out, size_t *nodes,
     size_t *width, int *spans, const uint64_t **signature, size_t *words) {
-    (void)stream;
+    if (hc_is_recording(stream)) hc_recording = 0;
     *out = NULL; *nodes = *width = *words = 0; *spans = 0; *signature = NULL;
     if (capture_status == 10) { *nodes = 2; return capture_status; }
     if (capture_status && capture_status != 11) return capture_status;
@@ -819,6 +826,7 @@ int cuteafd_copy_h2d_async(struct device_buffer dst, const void *source,
 int cuteafd_copy_d2d_async(struct device_buffer dst, struct device_buffer src,
                            size_t bytes, void *stream) {
     if (bytes > dst.bytes || bytes > src.bytes) return 1;
+    if (hc_is_recording(stream)) return pack_status;
     if (peer_model && dst.device_id != src.device_id) {
         if (src.device_id != current_device) return 1;
         event('c');
@@ -1331,7 +1339,52 @@ int cuteafd_v41_dspark_cache_write_fp8(const uint16_t *src, const void *writes,
     (void)src; (void)writes; (void)ring; (void)rows; (void)slots; (void)stream;
     return 0;
 }
-int cuteafd_cuda_graph_begin_capture(void *stream) { (void)stream; return 0; }
+int cuteafd_cuda_graph_begin_capture(void *stream) {
+    if (hc_fixture && capture_status == 12) return 1;
+    if (hc_fixture) { hc_recording = 1; hc_capture_stream = stream; }
+    return 0;
+}
+/* Deterministic dependency markers, not BF16/CUDA numerical emulation. */
+int cuteafd_v41_hc_project_initialize(void) { hc_fixture = 1; return 0; }
+int cuteafd_v41_hc_begin(void *residual, void *projection, void *scale, void *base,
+    void *incoming, void *norm, void *predicted, void *post, void *comb,
+    void *normalized, void *scratch, uint64_t bytes, int rows, void *stream) {
+    (void)projection; (void)scale; (void)base; (void)norm; (void)post;
+    (void)comb; (void)scratch; (void)bytes;
+    if (hc_is_recording(stream)) return 0;
+    for (int row = 0; row < rows; ++row) {
+        for (int col = 0; col < 5120; ++col)
+            ((uint16_t *)normalized)[row * 5120 + col] =
+                ((uint16_t *)residual)[row * 20480 + col] + (uint16_t)((float *)incoming)[row * 4];
+        for (int col = 0; col < 4; ++col)
+            ((float *)predicted)[row * 4 + col] = ((float *)incoming)[row * 4 + col] + 1;
+    }
+    return 0;
+}
+int cuteafd_v41_hc_post(const uint16_t *result, const uint16_t *residual,
+    const float *post, const float *comb, uint16_t *out, int rows, void *stream) {
+    (void)post; (void)comb;
+    if (hc_is_recording(stream)) return 0;
+    for (int row = 0; row < rows; ++row) for (int col = 0; col < 20480; ++col)
+        out[row * 20480 + col] = residual[row * 20480 + col] + result[row * 5120 + col % 5120];
+    return 0;
+}
+int cuteafd_v41_hc_pre(const uint16_t *residual, const float *pre, uint16_t *out,
+    int rows, void *stream) {
+    (void)residual; (void)pre; (void)out; (void)rows; (void)stream; return 98;
+}
+int cuteafd_v41_hc_mixes(const uint16_t *residual, const float *projection,
+    const float *scale, const float *base, float *pre, float *post, float *comb,
+    int rows, void *stream) {
+    (void)residual; (void)projection; (void)scale; (void)base; (void)pre;
+    (void)post; (void)comb; (void)rows; (void)stream; return 98;
+}
+int cuteafd_v41_hc_mixes_workspace(const uint16_t *residual, const float *projection,
+    const float *scale, const float *base, float *pre, float *post, float *comb,
+    void *scratch, uint64_t bytes, int rows, void *stream) {
+    (void)scratch; (void)bytes;
+    return cuteafd_v41_hc_mixes(residual, projection, scale, base, pre, post, comb, rows, stream);
+}
 int cuteafd_fp8_w8a16_linear(const void *x, const void *w, const void *s, void *out,
         int f32, int rows, int k, int n, void *scratch, size_t bytes, void *stream) {
     (void)x; (void)w; (void)s; (void)out; (void)f32; (void)rows;

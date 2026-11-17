@@ -71,6 +71,20 @@ pub(crate) use native::{LayerGraphs, RowGraphs};
 pub(crate) use bank::{missing_variants, note_eager, CaptureTicket, GraphBank};
 pub(crate) use owner::GraphOwner;
 
+/// Recording runs host code without executing device work. Restore the complete
+/// host checkpoint on failure before an eager retry. The recorder must end
+/// capture and destroy unaccepted executables on errors; rollback changes no
+/// device storage or cache policy.
+pub(crate) fn capture_transaction<S: ?Sized, C, T>(
+    state: &mut S, checkpoint: C,
+    record: impl FnOnce(&mut S) -> anyhow::Result<T>,
+    rollback: impl FnOnce(&mut S, C),
+) -> anyhow::Result<T> {
+    let result = record(state);
+    if result.is_err() { rollback(state, checkpoint); }
+    result
+}
+
 /// # Safety
 /// The ticket admits this capture; the caller owns the stream and pins every
 /// recorded operand through the joined drain of all consuming launches.
@@ -169,6 +183,21 @@ pub(crate) fn real_row_moe(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn capture_transaction_commits_success_and_restores_partial_errors() {
+        let mut flags = [1, 2, 3];
+        let checkpoint = flags;
+        let value = super::capture_transaction(&mut flags, checkpoint,
+            |state| { state[0] = 9; Ok(42) }, |state, saved| *state = saved).unwrap();
+        assert_eq!((value, flags), (42, [9, 2, 3]));
+        let checkpoint = flags;
+        let error = super::capture_transaction(&mut flags, checkpoint,
+            |state| -> anyhow::Result<()> { state[1] = 8; anyhow::bail!("partial recording failed") },
+            |state, saved| *state = saved).unwrap_err();
+        assert_eq!(error.to_string(), "partial recording failed");
+        assert_eq!(flags, checkpoint);
+    }
+
     #[test]
     fn donor_cold_lag_requires_donor_always() {
         use super::Options;
