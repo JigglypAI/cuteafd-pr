@@ -31,3 +31,20 @@ fn fixture_input_is_exact_across_encoder_architectures_for_mistral_qwen_and_mimo
         assert!(legacy.verify_image(&remote).is_err());
     }
 }
+
+#[test]
+fn padded_kimi_identity_rebinds_encoder_without_losing_content_geometry() {
+    use cuteafd_loader::media::{ImageGrid, PreparedImage, PreprocessId};
+    let pixels = cuteafd_core::media::ImagePixels { source:[17,13], canvas:[28,28], content:[0,0,17,13] };
+    let mut image = PreparedImage { key:cuteafd_loader::media::ImageKey([0;32]), encoder:EncoderId([120;32]),
+        processor:PreprocessId([1;32]), grid:ImageGrid {t:1,h:2,w:2}, rgb8:vec![0;28*28*3].into(), pixels,tokens:1 };
+    image.key=PreparedImage::key_for_pixels(image.encoder,image.processor,image.grid,&image.rgb8,pixels).unwrap();
+    let span=ProbeMedia {start:1,len:1,kind:"image".into(),key:hex(&image.key.0),grid:[1,2,2],
+        identity:Some(ProbeImageIdentity::prepared(&image)),input_key:None,fixture:None,image_url:None};
+    span.verify_image(&image).unwrap();
+    image.encoder=EncoderId([121;32]);
+    image.key=PreparedImage::key_for_pixels(image.encoder,image.processor,image.grid,&image.rgb8,pixels).unwrap();
+    span.verify_image(&image).unwrap();
+    image.pixels.content[2]-=1;
+    assert!(span.verify_image(&image).is_err());
+}
