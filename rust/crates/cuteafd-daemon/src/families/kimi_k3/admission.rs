@@ -2636,7 +2636,8 @@ pub(super) mod tests {
     #[test]
     fn owned_mla_charges_nonowner_ffn_and_exact_native_weights() -> Result<()> {
         let cfg = cfg();
-        let admitted = admit(inputs(&cfg))?;
+        let admitted = cuteafd_core::memory_policy::MemoryPolicy { kv_max: Some(2 << 20),
+            ..Default::default() }.scoped(|| admit(inputs(&cfg)))?;
         assert_eq!(admitted.placement.pool_tokens, 2 << 20);
         for (layer, owner) in [(1, 0), (3, 1)] {
             assert_eq!(admitted.placement.layers[layer].mode, LayerMode::Whole { gpu: owner, ffn: FfnMode::Split });

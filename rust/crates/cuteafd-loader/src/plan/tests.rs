@@ -982,13 +982,10 @@ fn assert_pool_max_growth(input: &BudgetedPlanInput, options: &PlanOptions) {
     let target = default.phase_ledger.as_ref().unwrap().pool_policy.unwrap().target();
     let capped = MemoryPolicy { kv_max: Some(target), ..Default::default() }
         .scoped(|| input.plan(options)).unwrap();
-    let physical = |report: &PlanReport| {
-        let mut memory = report.memory_layout.clone().unwrap();
-        // Muse reports elapsed solve time in notes; it is not an owner or placement.
-        memory.notes.retain(|note| !note.starts_with("Muse shared solve "));
-        memory
-    };
-    assert_eq!(physical(&default), physical(&capped), "default max must be byte-identical");
+    assert_eq!(default.onboard_layers, capped.onboard_layers,
+        "unbounded default must preserve target-sized onboarding");
+    assert_eq!(default.prefill_unit_rows, capped.prefill_unit_rows);
+    assert_eq!(default.prefill_waves, capped.prefill_waves);
     let grown = MemoryPolicy { kv_max: Some(100_000_000), ..Default::default() }
         .scoped(|| input.plan(options)).unwrap();
     assert!(grown.fits && grown.placement_supported, "{}", render(&grown));
@@ -997,7 +994,9 @@ fn assert_pool_max_growth(input: &BudgetedPlanInput, options: &PlanOptions) {
     assert_eq!(grown.prefill_waves, capped.prefill_waves);
     let pool = |report: &PlanReport| report.memory_layout.as_ref().unwrap().pool_tokens;
     assert!(pool(&grown) > pool(&capped), "{}: {} -> {}", default.family.as_deref().unwrap(), pool(&capped), pool(&grown));
-    assert!(pool(&grown) <= 100_000_000);
+    assert_eq!(pool(&grown), pool(&default).min(100_000_000));
+    let witness = default.phase_ledger.as_ref().unwrap();
+    assert!(witness.pool_policy.unwrap().maximum_tokens() >= pool(&default));
     println!("{}: KV {} -> {}, onboarding {:?} -> {:?}", default.family.as_deref().unwrap(),
         pool(&capped), pool(&grown), capped.onboard_layers, grown.onboard_layers);
     let mut exact = options.clone();
@@ -1026,7 +1025,7 @@ fn pool_max_grows_after_onboarding_in_every_family_planner() {
             let mut small = options.clone();
             small.layout.as_mut().unwrap().rtx_bytes = vec![32 << 30];
             let report = input.plan(&small).unwrap();
-            assert_eq!(report.phase_ledger.as_ref().unwrap().pool_policy.unwrap().target(), 1 << 20);
+            assert_eq!(report.phase_ledger.as_ref().unwrap().pool_policy.unwrap().target(), 2 << 20);
             assert_pool_max_growth(&input, &small);
         }
     }
@@ -3497,9 +3496,11 @@ fn v4_pool_first_defaults_and_explicit_layer_failure() {
         ..sparks(2)
     }).unwrap();
     let large = solve(96 << 30, None, None);
-    assert_eq!(large.memory_layout.unwrap().pool_tokens, 2 << 20);
+    assert_eq!(large.phase_ledger.as_ref().unwrap().pool_policy.unwrap().target(), 2 << 20);
+    assert!(large.memory_layout.unwrap().pool_tokens >= 2 << 20);
     let small = solve(24 << 30, None, None);
-    assert_eq!(small.memory_layout.unwrap().pool_tokens, 1 << 20);
+    assert_eq!(small.phase_ledger.as_ref().unwrap().pool_policy.unwrap().target(), 2 << 20);
+    assert!(small.memory_layout.unwrap().pool_tokens > 0);
     let explicit = solve(24 << 30, Some(262144), Some(2));
     assert!(explicit.placement_supported);
     assert_eq!(explicit.memory_layout.unwrap().pool_tokens, 262144);
@@ -3517,12 +3518,12 @@ fn v4_pool_first_defaults_and_explicit_layer_failure() {
     assert!(beyond.memory_layout.as_ref().unwrap().notes.iter().any(|n|
         n.contains(&format!("--rtx-expert-layers {} exceeds the {routed} routed layers", routed + 1))),
         "{:?}", beyond.memory_layout.as_ref().unwrap().notes);
-    // A fixed onboard leaves the automatic pool at the card's target (1M below
-    // the small-card threshold); the memory beyond it stays free by contract.
+    // Fixed onboarding leaves the automatic pool free to consume the remainder.
     let fixed = plan(dir.path(), &PlanOptions { layout: Some(layout::LayoutOptions { host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram), rtx_bytes: vec![24 << 30],
         onboard: Some(crate::placement::OnboardSetting::Layers(1)), ..Default::default() }), ..sparks(2) }).unwrap();
     assert!(fixed.placement_supported);
-    assert_eq!(fixed.memory_layout.unwrap().pool_tokens, 1 << 20);
+    assert_eq!(fixed.phase_ledger.as_ref().unwrap().pool_policy.unwrap().target(), 2 << 20);
+    assert!(fixed.memory_layout.unwrap().pool_tokens > 1 << 20);
 }
 
 #[test]
@@ -4808,8 +4809,9 @@ fn layout_places_every_device_and_names_compact_spark_slices() {
     // Head split: both GPUs hold attention weights; only the lead holds the embedding.
     assert!(layout.devices[1].by_category().get(&Category::Weights).copied().unwrap_or(0) > 0);
     assert_eq!(layout.devices[1].by_category().get(&Category::Embedding), None);
-    // The pool fills what the tighter GPU has left, within the target, in whole pages.
-    assert!(layout.pool_tokens > 0 && layout.pool_tokens <= cuteafd_core::serving_capacity::DEFAULT_GPU_KV_TOKENS);
+    // The pool fills the tighter GPU's remainder in whole pages.
+    assert!(layout.pool_tokens > 0);
+    assert!(report.phase_ledger.as_ref().unwrap().pool_policy.unwrap().maximum_tokens() >= layout.pool_tokens);
     assert_eq!(layout.pool_tokens % 64, 0);
     assert!(layout.devices.iter().filter(|d| d.kind == DeviceKind::Rtx).all(|d| d.free_bytes() >= 0));
     // Logical K32 ranges rotate; Pro stores each owner at its exact width.
