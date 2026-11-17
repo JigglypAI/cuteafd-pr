@@ -1104,6 +1104,9 @@ mod tests {
                     placement: ExpertPlacement::Local,
                     layout: Some(LayoutOptions { host_memory: Some(cuteafd_loader::plan::testing::SimulatedHost::raptor().host_ram), rtx_bytes: vec![capacity], context_tokens: context,
                         pool_tokens: pool, qwen_kv: kv_format, concurrency, state_slots: Some(concurrency), prefix_slots: Some(0),
+                        // A device-only parity fixture: no host prefix tier, so the
+                        // runtime's no-prefix engine args declare the same owners.
+                        host_cache_bytes: Some(0),
                         ..Default::default() }), ..Default::default()
                 })?;
                 assert!(report.placement_supported, "{}", cuteafd_loader::plan::render(&report));
@@ -1136,11 +1139,18 @@ mod tests {
                     context: cuteafd_loader::placement::planner::Context::pinned(context), admission: inputs,
                     capacity_bytes: capacity, baseline: Baseline::Measured { free_bytes: capacity - baseline },
                     pending_code_bytes: 0, max_context: context, requested_pool: pool, spark_ranks: 0,
-                    // The production host builder: the planner's pinned upload
-                    // owners (and their mapped-buffer page tables) must match.
-                    host: super::host_owners_with_memory(&args, &cfg, cfg.layers, false, 1, 0, false,
-                        None, 0, Vec::new(),
-                        cuteafd_loader::plan::testing::SimulatedHost::raptor().host_ram)?,
+                    // The production host builder plus the planner's mapped-table
+                    // placement, so both contracts charge the same pinned upload
+                    // owners and their mapped-buffer page tables.
+                    host: {
+                        let mut host = super::host_owners_with_memory(&args, &cfg, cfg.layers, false, 1, 0,
+                            false, None, 0, Vec::new(),
+                            cuteafd_loader::plan::testing::SimulatedHost::raptor().host_ram)?;
+                        host.table_reactor = cuteafd_loader::formats::mapped_table::table_reactor_workspace_bytes(
+                            report.mapped_placement.mapped) as u64;
+                        host.preloaded_tables = report.mapped_placement.preloaded_bytes;
+                        host
+                    },
                     encoders: Default::default() };
                 // The graph reserve is one owner at the resolved capture shape,
                 // charged once before KV sizing.
