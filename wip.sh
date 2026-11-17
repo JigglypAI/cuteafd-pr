@@ -1293,7 +1293,16 @@ wip_seed_lock() {
 }
 # Try a configured remote exporter first, then queue one capped local turn.
 # Dispatch runs only after the Spark lease and Cargo build slot are released.
+wip_serving_export_priority() {
+  [[ "${CUTEAFD_WIP_COORDINATOR_EXPORT:-auto}" == auto ]] &&
+    python3 "$repo_root/scripts/build/export-placement.py" waiting-serving
+}
+
 wip_coordinator_export_modes() {
+  if wip_serving_export_priority; then
+    printf 'maxq wait-maxq\n'
+    return
+  fi
   case "${CUTEAFD_WIP_COORDINATOR_EXPORT:-auto}" in
     auto) [[ -z "${CUTEAFD_EXPORT_HOST:-}" ]] || printf 'remote ' ; printf 'capped\n' ;;
     capped) [[ -z "${CUTEAFD_EXPORT_HOST:-}" ]] || printf 'remote ' ; printf 'capped\n' ;;
@@ -1325,7 +1334,8 @@ wip_cached_exports() {
 # wip_remote_export: the native key's entry from CUTEAFD_EXPORT_HOST, through
 # sparknest, then restored here with REQUIRE_HIT (no GPU turn on raptor).
 wip_remote_export() {
-  local host="${CUTEAFD_EXPORT_HOST:-}" key env_file started=$SECONDS
+  local host="${CUTEAFD_EXPORT_HOST:-maxq}" key env_file started=$SECONDS
+  if wip_serving_export_priority; then host=maxq; fi
   [[ -n "$host" ]] || return 75
   read -r _ key <"$state_dir/output/coordinator/.native-cache-key" || return 75
   env_file="$(mktemp "${TMPDIR:-/tmp}/wip-export-env.XXXXXXXX")"
@@ -1355,10 +1365,21 @@ wip_remote_export() {
 # host's nvidia-smi and stopped by the watchdog if it outgrows its cap.
 wip_capped_export() {
   local status=0
+  local -a priority=()
+  [[ "${CUTEAFD_WIP_COORDINATOR_EXPORT:-auto}" != auto ]] || priority=(--yield-serving)
   CUTEAFD_CAPPED_BUILD="$(printf '%q ' "$@")" \
-    python3 "$repo_root/scripts/build/export-placement.py" hold --gpus "${CUTEAFD_WIP_EXPORT_GPUS:-1,0}" --wait "${CUTEAFD_WIP_EXPORT_WAIT_S:-14400}" -- \
-    bash -c "$(declare -f wip_capped_export_on release_gpu_device_args cuteafd_cdi_require cuteafd_cdi_gpu_args); $(declare -p repo_root coordinator_container COORDINATOR_DOCKER_DEV); wip_capped_export_on" ||
+    python3 "$repo_root/scripts/build/export-placement.py" hold --gpus "${CUTEAFD_WIP_EXPORT_GPUS:-1,0}" "${priority[@]}" --wait "${CUTEAFD_WIP_EXPORT_WAIT_S:-14400}" -- \
+    bash -c "$(declare -f wip_capped_export_on release_gpu_device_args); $(declare -p repo_root coordinator_container COORDINATOR_DOCKER_DEV); source \"\$repo_root/scripts/lib/cdi-gpus.sh\"; wip_capped_export_on" ||
     status=$?
+  if ((status == 76)); then
+    echo "WIP coordinator export: yielding raptor to serving; remote on maxq"
+    local remote_deadline=$((SECONDS + ${CUTEAFD_WIP_EXPORT_WAIT_S:-14400}))
+    while ((SECONDS < remote_deadline)); do
+      if CUTEAFD_EXPORT_HOST=maxq wip_remote_export; then return 0; fi
+      sleep 60
+    done
+    return 75
+  fi
   ((status == 0)) || { echo "WIP coordinator export: capped export exited $status; next mode" >&2; return 75; }
 }
 
@@ -1518,12 +1539,15 @@ build_coordinator() {
     for mode in $(wip_coordinator_export_modes); do
       case "$mode" in
         remote) wip_remote_export && exported=1 ;;
+        maxq) CUTEAFD_EXPORT_HOST=maxq wip_remote_export && exported=1 ;;
         capped) wip_capped_export "${coordinator_build[@]}" && exported=1 ;;
-        wait-remote)
+        wait-remote|wait-maxq)
           local remote_deadline=$((SECONDS + ${CUTEAFD_WIP_EXPORT_WAIT_S:-14400}))
           while ((SECONDS < remote_deadline)); do
             sleep 60
-            if wip_remote_export; then exported=1; break; fi
+            if [[ "$mode" == wait-maxq ]]; then
+              if CUTEAFD_EXPORT_HOST=maxq wip_remote_export; then exported=1; break; fi
+            elif wip_remote_export; then exported=1; break; fi
           done
           ;;
 
