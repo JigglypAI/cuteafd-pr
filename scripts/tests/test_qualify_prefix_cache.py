@@ -1,6 +1,7 @@
 import hashlib
 import importlib.util
 import json
+import re
 import threading
 from pathlib import Path
 
@@ -155,7 +156,7 @@ def test_every_pooled_draft_family_overrides_live_binding_quarantine():
         if "fn draft_page_bytes(&self)" not in text or "PrefixFamily" not in text:
             continue
         # Ignore test-only fixtures: inspect the production adapter before its first test module.
-        text = text.split("#[cfg(test)]", 1)[0]
+        text = re.split(r"(?m)^#\[cfg\(test\)\]\nmod ", text, maxsplit=1)[0]
         if "fn draft_page_bytes(&self)" not in text:
             continue
         pooled.add(source.relative_to(families).as_posix())
@@ -165,7 +166,7 @@ def test_every_pooled_draft_family_overrides_live_binding_quarantine():
     owners = set()
     daemon = root / "rust/crates/cuteafd-daemon/src"
     for source in daemon.rglob("*.rs"):
-        text = source.read_text().split("#[cfg(test)]", 1)[0]
+        text = re.split(r"(?m)^#\[cfg\(test\)\]\nmod ", source.read_text(), maxsplit=1)[0]
         if "DraftPagePool" in text:
             owners.add(source.relative_to(daemon).as_posix())
     assert owners == {"shared/speculation/dflash.rs", "shared/speculation/block_dspark.rs",
