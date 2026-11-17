@@ -182,7 +182,7 @@ pub(super) fn layout(
         spark_ranks,
         peer_access: coordinators == 2,
     };
-    let mut inputs = RuntimeInputs { vision: None, spark_bytes: opts.spark_capacities(spark_ranks), graph_layout: crate::serving_capacity::step5_graphs::Step5GraphLayout::resolve(
+    let mut inputs = RuntimeInputs { vision: None, spark_owners: Vec::new(), spark_bytes: opts.spark_capacities(spark_ranks), graph_layout: crate::serving_capacity::step5_graphs::Step5GraphLayout::resolve(
             &catalog, &contract, coordinators, spark_ranks), decode_graphs: opts.step5_decode_graphs, host: super::admission::HostInputs::from_contract(&contract, &model.cfg, coordinators,
             crate::plan::layout::recipe_host_memory(opts)?, opts.host_cache_bytes, 8 << 30)?, resident_weight_limit: Some(ResidentWeights(opts.weight_budget_bytes)), spark_reply_format: opts.resolved_spark_reply_format(false),
                 kv_format: opts.step5_kv, bf16_target_head: opts.bf16_target_head,
@@ -204,6 +204,7 @@ pub(super) fn layout(
         onboard: super::admission::OnboardInputs::new(input.expert_catalog()?, opts.workspace_manifest.as_deref(),
             checked_rows, coordinators, waves, opts.resolve_onboard(catalog.routed_experts().routed_layers()).unwrap_or(Onboard::Auto))?,
     };
+    inputs.spark_owners = admission::spark_owners(catalog, &inputs)?;
     inputs.vision = crate::placement::still_encoder::StillEncoder::planned(input.checkpoint(),
         report.vision, opts.vision_replicas, &crate::placement::families::step5::budgets(&inputs)?,
         opts.media_cache_bytes.unwrap_or(256 << 20))?;

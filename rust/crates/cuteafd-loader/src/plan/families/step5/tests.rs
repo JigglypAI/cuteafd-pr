@@ -144,7 +144,7 @@ fn full_context_mtp_forecast_charges_private_predictors_before_allocation() -> a
     let arch = ArchContext::coordinator(capacity, None);
     for kv_format in [crate::families::qwen4::Qwen4KvCache::Bf16,
         crate::families::qwen4::Qwen4KvCache::Fp8] {
-        let inputs = RuntimeInputs { vision: None, spark_bytes: crate::plan::testing::SimulatedHost::raptor().layout().spark_capacities(8), graph_layout: None, decode_graphs: false, bf16_target_head: crate::placement::planner::serving::BlasHead::TensorLt,
+        let inputs = RuntimeInputs { vision: None, spark_owners: Vec::new(), spark_bytes: crate::plan::testing::SimulatedHost::raptor().layout().spark_capacities(8), graph_layout: None, decode_graphs: false, bf16_target_head: crate::placement::planner::serving::BlasHead::TensorLt,
             host: Default::default(), resident_weight_limit: None, spark_reply_format: cuteafd_core::SparkReplyFormat::Bf16,
             kv_format,
             inventory: Inventory { gpus: vec![GpuBudget { capacity_bytes: capacity,
@@ -769,6 +769,10 @@ fn nvfp4_min_card_admits_native_w4a4_and_bf16_root_stays_reference_only() {
         assert!(result.wip_launchable() && result.native_serving_admitted, "{:?}", result.hints);
         assert!(result.executable());
         assert_eq!(result.min_spark_ranks, Some(4));
+        let rendered = plan::render(&result);
+        let routed = rendered.lines().find(|line| line.starts_with("routed_expert")).unwrap();
+        assert!(routed.contains("nvfp4-g16") && routed.contains("bf16"), "{routed}");
+        assert!(result.experts.as_ref().unwrap().package.contains("step5:nvfp4"));
         let memory = result.memory_layout.unwrap();
         assert_eq!(memory.devices.len(), 5);
         if let Some(tokens) = pool {
@@ -794,7 +798,11 @@ fn nvfp4_min_card_admits_native_w4a4_and_bf16_root_stays_reference_only() {
             depth: 8, slot_bytes: 8 << 20, alignment: 4096 };
         let lane_rings = endpoint.ring_bytes(cuteafd_core::ExpertGeometry::STEP5, rings).unwrap();
         for device in &memory.devices[1..] {
-            assert!(device.items.iter().any(|item| item.format == "W4A4"));
+            assert_eq!(device.kind, cuteafd_core::memory_layout::DeviceKind::Spark);
+            let experts: u64 = device.items.iter().filter(|item|
+                item.category == cuteafd_core::memory_layout::Category::Experts).map(|item| item.bytes).sum();
+            assert!(experts > 0, "{} has no admitted expert weights", device.name());
+            eprintln!("Step-5 NVFP4 {}: expert_bytes={experts} total_bytes={}", device.name(), device.used_bytes());
             let mapped = device.items.iter().find(|item| item.group == "rdma rings").unwrap();
             assert_eq!(mapped.bytes, lane_rings as u64, "one main transport endpoint");
         }
