@@ -73,6 +73,7 @@ pub(crate) struct Inputs<'a, const RANKS: usize = 2> {
     pub cache_format: cuteafd_core::MlaCacheFormat,
     pub core: cuteafd_loader::families::kimi_k3::core::CoreInventory,
     pub gpus: [GpuBudget; RANKS],
+    pub physical_bytes: [u64; RANKS],
     pub devices: [i32; RANKS],
     pub peer_access: bool,
     pub spark_ranks: usize,
@@ -1208,7 +1209,7 @@ fn request<const RANKS: usize>(mut i: Inputs<'_, RANKS>) -> Result<PlacementRequ
             modes: if RANKS == 1 { vec![WHOLE] } else if mla { MODES.to_vec() } else { vec![LayerMode::HeadSplit] } });
     }
     let pool = cuteafd_loader::placement::prepare_pool(cuteafd_loader::placement::PoolFacts::new(
-        &i.gpus.map(|gpu| gpu.capacity_bytes), i.serving_context, i.requested_pool, MLA_PAGE_ROWS as u64));
+        &i.physical_bytes, i.serving_context, i.requested_pool, MLA_PAGE_ROWS as u64));
     Ok(PlacementRequest {
         resident_weight_limit: Some(i.resident_weight_limit), inventory: Inventory { gpus: i.gpus.to_vec(), spark_ranks: i.spark_ranks, peer_access: i.peer_access },
         attention_placement: i.attention, context_buffers: i.context.as_ref().map_or_else(ContextBuffers::default, |layout| layout.buffers()), layers_first_gpu: 0,
@@ -1494,7 +1495,7 @@ pub(super) mod tests {
     }
 
     fn inputs_for_ranks<const RANKS: usize>(cfg: &KimiK3Config) -> Inputs<'_, RANKS> {
-        Inputs { skip_routed_experts: false, expert_usage: false, cfg, resident_weight_limit: ResidentWeights::DEFAULT_LIMIT, core: Default::default(), cache_format: cuteafd_core::MlaCacheFormat::Bf16, gpus: [GpuBudget { capacity_bytes: 96 << 30, reserve_bytes: 2 << 30,
+        Inputs { skip_routed_experts: false, expert_usage: false, cfg, resident_weight_limit: ResidentWeights::DEFAULT_LIMIT, core: Default::default(), cache_format: cuteafd_core::MlaCacheFormat::Bf16, physical_bytes: [96 << 30; RANKS], gpus: [GpuBudget { capacity_bytes: 96 << 30, reserve_bytes: 2 << 30,
             baseline: Baseline::Measured { free_bytes: 96 << 30 } }; RANKS], devices: std::array::from_fn(|rank| rank as i32), peer_access: RANKS == 2, spark_ranks: 6,
             attention: (RANKS == 2).then_some(AttentionPlacement::Layers), context: None, serving_context: cuteafd_loader::placement::planner::Context::pinned(1 << 20), requested_pool: None, state_slots: 2, prefix_marks: 2, rows: 4096, lanes: 2, waves: 2, unit_rows: None,
             lane_layouts: vec![std::array::from_fn(|_| LaneLayout::for_ranks(

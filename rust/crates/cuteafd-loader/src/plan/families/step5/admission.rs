@@ -176,6 +176,7 @@ const EXECUTOR: ExecutorModes = crate::placement::families::STEP5;
 /// absolute additional peaks above that same sample, not steady-state deltas.
 #[derive(Clone)]
 pub struct RuntimeInputs {
+    pub physical_bytes: Vec<u64>,
     pub vision: Option<crate::placement::still_encoder::StillEncoder>,
     pub spark_bytes: Vec<u64>,
     pub graph_layout: Option<crate::serving_capacity::step5_graphs::Step5GraphLayout>,
@@ -592,7 +593,7 @@ mod tests {
         }
     }
     fn inputs(ranks: usize) -> RuntimeInputs {
-        RuntimeInputs { vision: None, spark_bytes: crate::plan::testing::SimulatedHost::raptor().layout().spark_capacities(8), graph_layout: None, decode_graphs: false, bf16_target_head: crate::placement::planner::serving::BlasHead::TensorLt,
+        RuntimeInputs { physical_bytes: vec![96 << 30; ranks], vision: None, spark_bytes: crate::plan::testing::SimulatedHost::raptor().layout().spark_capacities(8), graph_layout: None, decode_graphs: false, bf16_target_head: crate::placement::planner::serving::BlasHead::TensorLt,
             host: Default::default(), resident_weight_limit: None, spark_reply_format: cuteafd_core::SparkReplyFormat::Bf16,
                 kv_format: crate::families::qwen4::Qwen4KvCache::Bf16,
             waves: 1, unit: 0,

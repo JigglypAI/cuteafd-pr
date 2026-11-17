@@ -60,7 +60,9 @@ pub(super) fn worker(mut args: crate::cli::NativeServeArgs, mut receive: mpsc::R
     })?;
     memory_checkpoint("after native preload")?;
     let preweight_context = inventory.gpus.iter().map(|gpu| gpu.context_bytes).collect::<Vec<_>>();
-    let mut pool = admission::admit_startup(&lib, &catalog, &args, &preweight_context)?;
+    let mut pool = admission::admit_startup(&lib, &catalog, &args, &preweight_context,
+        &inventory.gpus.iter().map(|sample| sample.physical_bytes.context("fresh V4.1 physical card sample"))
+            .collect::<Result<Vec<_>>>()?)?;
     args.max_context_tokens = pool.served_context;
     cuteafd_bench::context::set_resolved("max-context-tokens", &args.max_context_tokens.to_string());
     cuteafd_bench::context::ResolvedSettings::placement(&pool.placement).publish();

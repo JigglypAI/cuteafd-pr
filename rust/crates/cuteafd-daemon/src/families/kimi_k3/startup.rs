@@ -314,7 +314,9 @@ pub(crate) fn load<'a, const RANKS: usize>(library: &'a Arc<cuteafd_ffi::NativeL
     let peer_receive = [core.attention_receive_bytes(unit, RANKS)?,
         core.attention_receive_bytes(unit.min(64), RANKS)?];
     let inputs = admission::Inputs { skip_routed_experts, expert_usage: options.expert_usage_reader.configure(options.expert_usage, false).map_err(anyhow::Error::msg)?, cfg, core,
-        resident_weight_limit: crate::shared::memory::budget::resident_weight_limit(), cache_format: options.cache_format, gpus, devices: options.devices,
+        resident_weight_limit: crate::shared::memory::budget::resident_weight_limit(), cache_format: options.cache_format, gpus,
+        physical_bytes: inventory.gpus.iter().map(|sample| sample.physical_bytes.context("fresh Kimi physical card sample"))
+            .collect::<Result<Vec<_>>>()?.try_into().map_err(|_| anyhow::anyhow!("Kimi physical card count"))?, devices: options.devices,
         peer_access: RANKS == 2, spark_ranks, attention: options.attention, context: context_layout, serving_context: options.context, requested_pool: options.pool_tokens,
         state_slots: options.slots, prefix_marks: options.marks, rows, lanes: 1, waves: options.waves,
         unit_rows: options.prefill_rows, lane_layouts, fixed,
