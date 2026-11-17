@@ -600,6 +600,21 @@ mod tests {
         let admitted = prepared.admit(request).unwrap();
         assert_eq!(admitted.solved.pool_tokens, 4097u64.div_ceil(page) * page);
         assert_eq!(admitted.solved.pool_policy.unwrap().requested(), Some(admitted.solved.pool_tokens));
+        let dir = tempfile::tempdir().unwrap();
+        crate::plan::testing::write_snapshot(dir.path(), &crate::plan::testing::mimo_flash_config(),
+            &crate::plan::testing::mimo_flash_tensors(), None);
+        let options = crate::plan::PlanOptions {
+            placement: crate::plan::ExpertPlacement::Sparks { ranks: 4 },
+            layout: Some(crate::plan::layout::LayoutOptions { rtx_bytes: vec![96 << 30],
+                context_tokens: 4096, pool_tokens: Some(4097), host_cache_bytes: Some(0),
+                host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram), ..Default::default() }),
+            ..Default::default()
+        };
+        let planned = crate::plan::testing::plan(dir.path(), &options).unwrap();
+        assert!(planned.fits, "{:?}", planned.hints);
+        let planned_pool = planned.phase_ledger.unwrap().pool_policy.unwrap();
+        assert_eq!(planned_pool.requested(), Some(4097u64.div_ceil(planned_pool.unit_rows()) * planned_pool.unit_rows()));
+        assert_eq!(planned.memory_layout.unwrap().pool_tokens, planned_pool.requested().unwrap());
     }
 
     #[test]

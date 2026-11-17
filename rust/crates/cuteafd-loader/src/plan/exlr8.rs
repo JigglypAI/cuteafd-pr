@@ -316,10 +316,13 @@ pub(super) fn native_plan_of(input: &super::PlanInput, selected: &str,
                 device.index, used - cap), "Increase Spark memory or onboard more layers; execution arenas must fit at plan time.");
         }
     }
-    if let Some(pool) = report.phase_ledger.as_ref().and_then(|ledger| ledger.pool_policy) {
-        report.memory_policy_lines = crate::placement::reserve::layout_lines(&memory,
-            family.id(), &layout.rtx_bytes, &pool);
-    }
+    let maximum = report.cache_requirements.as_ref().and_then(|cache|
+        cache.checkpoint_max_context_tokens).unwrap_or(layout.context_tokens);
+    report.memory_policy_lines = crate::placement::reserve::report_layout_lines(&memory,
+        family.id(), &layout.rtx_bytes, report.phase_ledger.as_ref().and_then(|ledger| ledger.pool_policy),
+        crate::placement::planner::Context::resolve(maximum,
+            (layout.context_tokens > 0).then_some(layout.context_tokens)),
+        layout.pool_tokens, layout.target_pool_tokens)?;
     report.memory_layout = Some(memory);
     report.solver_placement = Some(placement);
     if !model.contract_admission() {

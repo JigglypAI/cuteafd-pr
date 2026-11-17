@@ -2423,6 +2423,8 @@ pub(super) mod tests {
                     continue;
                 }
             };
+            assert_eq!(report.phase_ledger.as_ref().context("TP2 Kimi planned policy")?.pool_policy,
+                admitted.receipt.pool_policy, "TP2 Kimi plan and serve policy must match");
             let memory = report.memory_layout.context("installed Kimi planner ledger")?;
             assert_eq!(memory.pool_tokens, admitted.placement.pool_tokens);
             assert_eq!(admitted.mark_selection.slots, marks);

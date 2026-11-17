@@ -979,7 +979,7 @@ fn assert_pool_max_growth(input: &BudgetedPlanInput, options: &PlanOptions) {
     use cuteafd_core::memory_policy::MemoryPolicy;
     let default = MemoryPolicy::default().scoped(|| input.plan(options)).unwrap();
     assert!(default.fits && default.placement_supported, "{}", render(&default));
-    let target = 2 << 20;
+    let target = default.phase_ledger.as_ref().unwrap().pool_policy.unwrap().target();
     let capped = MemoryPolicy { kv_max: Some(target), ..Default::default() }
         .scoped(|| input.plan(options)).unwrap();
     let physical = |report: &PlanReport| {
@@ -1022,6 +1022,13 @@ fn pool_max_grows_after_onboarding_in_every_family_planner() {
         }
         let input = BudgetedPlanInput::open(dir.path()).unwrap();
         assert_pool_max_growth(&input, &options);
+        if family == "mimo_v2" {
+            let mut small = options.clone();
+            small.layout.as_mut().unwrap().rtx_bytes = vec![32 << 30];
+            let report = input.plan(&small).unwrap();
+            assert_eq!(report.phase_ledger.as_ref().unwrap().pool_policy.unwrap().target(), 1 << 20);
+            assert_pool_max_growth(&input, &small);
+        }
     }
     let (dir, manifest) = qwen4_matrix_snapshot();
     let mut options = wave_plan_options(dir.path(), 4);
@@ -1063,9 +1070,18 @@ fn pool_max_grows_after_onboarding_in_every_family_planner() {
     options.attention_placement = None;
     let layout = options.layout.as_mut().unwrap();
     layout.pool_tokens = None;
-    layout.onboard = Some(crate::placement::OnboardSetting::Layers(0));
+    layout.onboard = Some(crate::placement::OnboardSetting::Auto);
     layout.workspace_manifest = Some(manifest);
-    assert_pool_max_growth(&BudgetedPlanInput::open(dir.path()).unwrap(), &options);
+    let package = dir.path().join("fp8/fp8-minimax-mxfp8");
+    std::fs::create_dir_all(&package).unwrap();
+    let native = json!({"abi_version":6,"projection":"bf16","activation":"silu_bf16_product",
+        "swiglu_limit":0.0,"swiglu_alpha":1.0,"swiglu_beta":0.0,"weights":"mxfp8",
+        "capacities":[{"capacity":4096,"scratch_bytes":4096}]});
+    std::fs::write(package.join("manifest.json"), json!({"layouts":{"tp1":native,"tp2":native}}).to_string()).unwrap();
+    let input = BudgetedPlanInput::open(dir.path()).unwrap();
+    let baseline = input.plan(&options).unwrap();
+    assert!(baseline.onboard_layers.is_some_and(|layers| layers > 0), "{:?}", baseline.hints);
+    assert_pool_max_growth(&input, &options);
 
     // Dense Qwen already indexes the type's full extent, not maximum_tokens.
     let (dir, mut options, _, _) = crate::families::qwen3_5::tests::native_planner_fixture();

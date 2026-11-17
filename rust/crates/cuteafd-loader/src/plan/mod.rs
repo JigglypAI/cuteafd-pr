@@ -1430,10 +1430,14 @@ fn plan_unrestricted(input: &PlanInput, options: &PlanOptions) -> Result<PlanRep
         }
         let refused = !report.placement_supported && memory.devices.is_empty();
         if !memory.devices.is_empty() {
-            if let Some(pool) = report.phase_ledger.as_ref().and_then(|ledger| ledger.pool_policy) {
-                report.memory_policy_lines = crate::placement::reserve::layout_lines(&memory,
-                    report.family.as_deref().unwrap_or(""), &layout_options.rtx_bytes, &pool);
-            }
+            let maximum = report.cache_requirements.as_ref().and_then(|cache|
+                cache.checkpoint_max_context_tokens).unwrap_or(layout_options.context_tokens);
+            let context = crate::placement::planner::Context::resolve(maximum,
+                (layout_options.context_tokens > 0).then_some(layout_options.context_tokens));
+            report.memory_policy_lines = crate::placement::reserve::report_layout_lines(&memory,
+                report.family.as_deref().unwrap_or(""), &layout_options.rtx_bytes,
+                report.phase_ledger.as_ref().and_then(|ledger| ledger.pool_policy), context,
+                layout_options.pool_tokens, layout_options.target_pool_tokens).unwrap_or_default();
         }
         report.memory_layout = Some(memory);
         if !refused && !model.contract_admission() {

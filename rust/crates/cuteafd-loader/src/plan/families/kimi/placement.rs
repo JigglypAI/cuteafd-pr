@@ -467,7 +467,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
     let page_rows = if modes.iter().any(|mode| *mode == LayerMode::ContextSplit) { PAGE * 2 } else { PAGE };
     let mut facts = crate::placement::PoolFacts::new(&opts.rtx_bytes[..gpus],
         crate::placement::planner::Context::resolve(context, (opts.context_tokens > 0).then_some(opts.context_tokens)),
-        requested_pool, page_rows);
+        requested_pool, PAGE);
     facts.target = opts.target_pool_tokens;
     let pool = match crate::placement::prepare_pool(facts) {
         Ok(pool) => pool,

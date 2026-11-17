@@ -1102,7 +1102,12 @@ mod tests {
                 let mut report = crate::plan::empty_report(&input, &crate::plan::PlanOptions::default()).unwrap();
                 let (layout, _) = native_layout_with_metadata(&checkpoint, options, 4, &manifest, "k4",
                     None, None, Some(&mut report)).unwrap();
-                (layout.pool_tokens, report.phase_ledger.unwrap())
+                let ledger = report.phase_ledger.unwrap();
+                assert!(ledger.pool_policy.is_some(), "native EXLR8 keeps its logging policy witness");
+                let lines = crate::placement::reserve::report_layout_lines(&layout, "glm5", &options.rtx_bytes,
+                    ledger.pool_policy, crate::placement::planner::Context::automatic(1), None, None).unwrap();
+                assert_eq!(lines.len(), layout.devices.len());
+                (layout.pool_tokens, ledger)
             };
             let (pool16, a16) = plan(&options);
             let (pool8, a8) = plan(&LayoutOptions {

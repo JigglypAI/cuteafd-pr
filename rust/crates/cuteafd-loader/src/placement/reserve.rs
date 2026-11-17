@@ -188,6 +188,22 @@ pub fn log_layout(layout: &cuteafd_core::memory_layout::MemoryLayout, family: &s
     }
 }
 
+/// Refused inventory-only reports have no admitted witness. Resolve diagnostic
+/// bounds only in that case; successful plans always render their retained policy.
+pub fn report_layout_lines(layout: &cuteafd_core::memory_layout::MemoryLayout, family: &str,
+    gpu_caps: &[u64], retained: Option<super::PoolPolicy>, context: super::planner::Context,
+    requested: Option<u64>, target: Option<u64>) -> Result<Vec<String>, cuteafd_core::memory_policy::PolicyError> {
+    let pool = match retained {
+        Some(pool) => pool,
+        None => {
+            let mut facts = super::PoolFacts::new(gpu_caps, context, requested, 1);
+            facts.target = target;
+            super::prepare_pool(facts)?
+        }
+    };
+    Ok(layout_lines(layout, family, gpu_caps, &pool))
+}
+
 /// Render the admitted policy witness, without resolving target/min/max again.
 pub fn layout_lines(layout: &cuteafd_core::memory_layout::MemoryLayout, family: &str,
     gpu_caps: &[u64], resolved: &super::PoolPolicy) -> Vec<String> {
