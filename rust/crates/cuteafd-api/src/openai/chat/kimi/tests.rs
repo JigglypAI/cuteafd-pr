@@ -19,6 +19,57 @@ fn prompts_match_official_cpu_encoder() {
     }
 }
 
+#[test]
+fn thinking_disabled_bench_prompt_has_exact_response_prefix_and_greedy_sampling() {
+    use crate::openai::{build, ModelEncoding, ModelProfile, NativeLimits};
+    let profile = ModelProfile::new("kimi-fixture", ModelEncoding::Kimi(std::sync::Arc::new(
+        KimiEncoding { eos: vec![163586] },
+    )));
+    let content = "[f8f52a874c42425f-0000000008] Write a complete Python module that implements a thread-safe LRU cache with per-entry TTL expiry, a background janitor thread, hit/miss statistics and a full pytest test suite. Output only the code.";
+    let body = json!({"model":"kimi-fixture", "messages":[{"role":"user", "content":content}],
+        "thinking":{"type":"disabled"}, "temperature":0, "max_tokens":192});
+    let built = build(&profile, NativeLimits::default(), &Default::default(), body)
+        .unwrap_or_else(|error| panic!("{}", error.message));
+    assert_eq!(built.prompt(), format!(
+        "<|open|>message role=\"user\"<|sep|>{content}<|close|>message<|sep|><|end_of_msg|><|open|>message role=\"assistant\"<|sep|><|open|>response<|sep|>"));
+    assert_eq!(built.sampling.temperature(), 0.0);
+    assert_eq!(built.sampling.top_p(), 1.0);
+    assert_eq!(built.sampling.top_k(), None);
+    assert_eq!(built.sampling.min_p(), 0.0);
+    assert_eq!(built.stop_token_ids, [163586]);
+    assert!(built.constraint.is_none());
+}
+
+/// Reuses the loader's installed TikToken oracle contract; each case also carries
+/// the original request body so the API and tokenizer are checked together.
+#[test]
+#[ignore = "requires explicit installed-checkpoint input"]
+fn thinking_disabled_bench_matches_official_segment_tokens_when_present() {
+    use crate::openai::{build, ModelEncoding, ModelProfile, NativeLimits};
+    let spec = std::env::var("CUTEAFD_KIMI_TOKENIZER_ORACLE")
+        .expect("set CUTEAFD_KIMI_TOKENIZER_ORACLE for this installed test");
+    let (snapshot, oracle) = spec.rsplit_once(':').expect("<snapshot>:<oracle.json>");
+    let snapshot = Path::new(snapshot);
+    let profile = ModelProfile::new("kimi-fixture", ModelEncoding::Kimi(std::sync::Arc::new(
+        KimiEncoding::from_snapshot(snapshot).unwrap(),
+    )));
+    let cases: Vec<Value> = serde_json::from_slice(&std::fs::read(oracle).unwrap()).unwrap();
+    assert!(cases.len() >= 8);
+    for case in cases {
+        let mut body = case["body"].clone();
+        body["model"] = json!("kimi-fixture");
+        let built = build(&profile, NativeLimits::default(), &Default::default(), body)
+            .unwrap_or_else(|error| panic!("{}", error.message));
+        assert_eq!(built.prompt(), case["text"].as_str().unwrap());
+        let ids = cuteafd_loader::encode_tokenizer_text(snapshot, built.prompt(), false).unwrap().token_ids;
+        let expected: Vec<u32> = serde_json::from_value(case["ids"].clone()).unwrap();
+        assert_eq!(ids, expected);
+        assert_eq!(ids.last(), Some(&163589));
+        assert!(built.prompt().ends_with("<|open|>response<|sep|>"));
+        assert_eq!(built.stop_token_ids, [163586]);
+    }
+}
+
 #[derive(Default, Debug, PartialEq)]
 struct Parsed {
     reasoning: String,
@@ -70,6 +121,21 @@ fn official_outputs_are_chunk_invariant() {
             .collect::<Vec<_>>();
         assert_eq!(parse(&chars, case["thinking"].as_bool().unwrap()).0, expected);
     }
+}
+
+#[test]
+fn thinking_disabled_telegraphic_text_is_response_content_not_a_hidden_channel() {
+    let text = "I need craft response only code complete Python module";
+    let wire = format!("{text}<|close|>response<|sep|><|close|>message<|sep|><|end_of_msg|>");
+    for split in wire.char_indices().map(|(at, _)| at).chain([wire.len()]) {
+        let (parsed, calls) = parse(&[&wire[..split], &wire[split..]], false);
+        assert_eq!(parsed.content, text);
+        assert!(parsed.reasoning.is_empty());
+        assert_eq!(calls, 0);
+    }
+    let (parsed, _) = parse(&["<|open|>think<|sep|>Plan<|close|>think<|sep|>"], false);
+    // An unexpected think opener is not silently swallowed into plain content.
+    assert!(parsed.content.contains("<|open|>think<|sep|>"));
 }
 
 #[test]
