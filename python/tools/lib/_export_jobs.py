@@ -147,6 +147,8 @@ def export_slot():
 
 _context_lease = None
 _context_admitted_at = None
+_context_prepaid = None
+_context_footprint = None
 _gpu_lease = None
 
 
@@ -199,6 +201,20 @@ def gpu_admission():
             f'reserved={reserved} MiB, budget={budget} MiB', 'GPU')
 
 
+def context_worker_ram(minimum=1):
+    """Use the same conservative charge for pool sizing and CUDA admission."""
+    per_worker = max(minimum, int(os.environ.get('CUTEAFD_EXPORT_WORKER_RAM_MIB') or '1536'))
+    if _gb10_host():
+        root = Path(os.environ.get('CUTEAFD_EXPORT_HOST_SLOT_DIR') or
+                    str(Path.home() / '.cache/cuteafd/export-workers'))
+        try:
+            measured = int((root / 'context-footprint-mib').read_text())
+        except (FileNotFoundError, ValueError):
+            measured = 0
+        per_worker = max(per_worker, 4096, measured)
+    return per_worker
+
+
 def context_admission():
     """Reserve RAM before CUDA creates a context; hold until process exit.
 
@@ -212,15 +228,7 @@ def context_admission():
         return
     root = Path(os.environ['CUTEAFD_EXPORT_HOST_SLOT_DIR'])
     root.mkdir(parents=True, exist_ok=True)
-    per_worker = int(os.environ.get('CUTEAFD_EXPORT_WORKER_RAM_MIB') or '1536')
-    if _gb10_host():
-        # Cold builds start conservatively; subsequent admissions use the
-        # measured process + allocator high-water footprint on this host.
-        try:
-            measured = int((root / 'context-footprint-mib').read_text())
-        except (FileNotFoundError, ValueError):
-            measured = 0
-        per_worker = max(per_worker, 4096, measured)
+    per_worker = context_worker_ram()
     count = host_context_cap()
     spacing = float(os.environ.get('CUTEAFD_EXPORT_CONTEXT_SPACING_S',
                                    CONTEXT_SPACING_S if _gb10_host() else 0))
@@ -247,23 +255,23 @@ def context_admission():
         next_warn = _wait_for_admission(started, next_warn, status, 'context')
 
 
-def _admit_locked(root, per_worker, count, spacing, details):
-    """One admission attempt under context-admission.lock; a log line or None."""
-    global _context_lease
+def _context_budget(root, per_worker):
+    """Read live charges under the admission guard, reaping retired pools."""
     reserved = 0
     leased = parked = 0
     for path in root.glob("context.*.lock"):
         with path.open('a+') as existing:
             try:
                 fcntl.flock(existing, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                if path.name.startswith('context.parked-'):
+                if path.name.startswith(('context.parked-', 'context.pool-')):
                     path.unlink()  # its process exited
             except BlockingIOError:
                 existing.seek(0)
-                reserved += int(existing.read() or per_worker)
+                charge = int(existing.read() or per_worker)
+                reserved += charge
                 if path.name.startswith('context.parked-'):
                     parked += 1
-                else:
+                elif charge:
                     leased += 1
     # GB10 can reclaim file cache. Burst protection comes from the seed export
     # turn, host context cap, spaced creation and PSI brake, not MemFree.
@@ -275,11 +283,33 @@ def _admit_locked(root, per_worker, count, spacing, details):
     # Existing live contexts already reduce available RAM: subtract
     # reservations from the common baseline, not twice from the sample.
     budget = min(available, baseline - reserved)
+    return available, budget, leased, parked, reserved
+
+
+def _admit_locked(root, per_worker, count, spacing, details):
+    """One admission attempt under context-admission.lock; a log line or None."""
+    global _context_lease, _context_prepaid
+    prepaid = _context_prepaid
+    if prepaid is not None:
+        with prepaid.open() as token:
+            try:
+                fcntl.flock(token, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                per_worker = int(token.read())
+            else:
+                raise RuntimeError('EXL3 context reservation owner exited before worker admission')
+    available, budget, leased, parked, reserved = _context_budget(root, per_worker)
+    needed = per_worker + 1024
+    if prepaid is not None:
+        # The pool already reserved this worker. Requiring its entire charge
+        # again strands its task behind idle siblings' RSS until pool shutdown.
+        budget, needed = available, 1024
     pressure = memory_pressure()
-    details['status'] = (f'available={available} MiB, budget={budget} MiB, needed={per_worker + 1024} MiB, '
+    details['status'] = (f'available={available} MiB, budget={budget} MiB, needed={needed} MiB, '
                          f'leases={leased}/{count}, parked={parked}, reserved={reserved} MiB; '
                          f'memory pressure some avg10={pressure:.2f} (limit {MEMORY_PSI_LIMIT:g})')
-    if pressure > MEMORY_PSI_LIMIT or budget < per_worker + 1024:
+    if (pressure > MEMORY_PSI_LIMIT or budget < needed
+            or (prepaid is None and leased >= count)):
         return None
     for index in range(count):
         handle = (root / f'context.{index}.lock').open('a+')
@@ -308,6 +338,10 @@ def _admit_locked(root, per_worker, count, spacing, details):
         handle.truncate()
         handle.write(str(per_worker))
         handle.flush()
+        if prepaid is not None:
+            # Transfer the prepaid charge to the live context exactly once.
+            prepaid.write_text('0')
+            _context_prepaid = None
         _context_lease = handle
         atexit.register(handle.close)
         return (f'AOT context admitted: lease {index}/{count}, {per_worker} MiB reservation, '
@@ -317,8 +351,64 @@ def _admit_locked(root, per_worker, count, spacing, details):
     return None
 
 
+@contextmanager
+def reserve_context_pool(jobs):
+    """Reserve a whole persistent pool before any worker can take a variant.
+
+    A blocked pool worker owns a task its admitted siblings cannot finish.
+    Reserve only what fits, atomically with competing packages, then transfer
+    each prepaid charge to its worker at the normal spaced CUDA admission.
+    """
+    root = os.environ.get('CUTEAFD_EXPORT_HOST_SLOT_DIR')
+    if not root:
+        yield [None] * jobs
+        return
+    root = Path(root)
+    root.mkdir(parents=True, exist_ok=True)
+    if jobs < 1:
+        raise ValueError('context pool needs at least one worker')
+    handles = []
+    started = next_warn = time.monotonic()
+    try:
+        while not handles:
+            status = 'waiting for admission lock'
+            with (root / 'context-admission.lock').open('a') as guard:
+                try:
+                    fcntl.flock(guard, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    pass
+                else:
+                    charge = context_worker_ram(4096)
+                    available, budget, leased, _, _ = _context_budget(root, charge)
+                    count = min(jobs, host_context_cap() - leased, max(0, (budget - 1024) // charge))
+                    pressure = memory_pressure()
+                    status = (f'available={available} MiB, budget={budget} MiB, needed={charge + 1024} MiB, '
+                              f'leases={leased}/{host_context_cap()}, memory pressure={pressure:.2f}')
+                    if pressure <= MEMORY_PSI_LIMIT:
+                        for _ in range(count):
+                            handle = (root / f'context.pool-{uuid.uuid4().hex}.lock').open('x+')
+                            handles.append(handle)
+                            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                            handle.write(str(charge))
+                            handle.flush()
+            if not handles:
+                next_warn = _wait_for_admission(started, next_warn, status, 'pool')
+        print(f'AOT context pool reserved: {len(handles)}/{jobs} workers, {charge} MiB each, '
+              f'{budget} MiB budget', flush=True)
+        yield [str(handle.name) for handle in handles]
+    finally:
+        for handle in handles:
+            handle.close()
+
+
+def claim_context_reservation(path):
+    """Called once by a spawned worker; its parent keeps the prepaid lock live."""
+    global _context_prepaid
+    _context_prepaid = Path(path) if path is not None else None
+
+
 def park_context_lease():
-    """Free this process's counted lease while keeping its RAM reservation.
+    """Free this process's counted lease, charging its measured idle footprint.
 
     A planner whose own context idles while its pool workers run must not
     hold one of the host's context leases: concurrent planners would starve
@@ -332,7 +422,7 @@ def park_context_lease():
     with (root / 'context-admission.lock').open('a') as guard:
         fcntl.flock(guard, fcntl.LOCK_EX)
         _context_lease.seek(0)
-        reservation = _context_lease.read()
+        reservation = str(_context_footprint) if _context_footprint is not None else _context_lease.read()
         parked = (root / f'context.parked-{uuid.uuid4().hex}.lock').open('x+')
         fcntl.flock(parked, fcntl.LOCK_EX | fcntl.LOCK_NB)
         parked.write(reservation)
@@ -350,6 +440,7 @@ def _record_footprint(torch, root, initial_available):
     This intentionally overestimates shared library pages instead of trusting
     nvidia-smi's context-only figure as the entire export footprint.
     """
+    global _context_footprint
     peak_rss = (resource.getrusage(resource.RUSAGE_SELF).ru_maxrss + 1023) // 1024
     allocated = torch.cuda.max_memory_allocated() // 1024**2
     cached = torch.cuda.max_memory_reserved() // 1024**2
@@ -357,6 +448,7 @@ def _record_footprint(torch, root, initial_available):
     available = host_allocatable_memory() // 1024**2
     with (root / 'context-admission.lock').open('a') as guard:
         fcntl.flock(guard, fcntl.LOCK_EX)
+        _context_footprint = footprint
         path = root / 'context-footprint-mib'
         try:
             previous = int(path.read_text())
@@ -405,6 +497,10 @@ def install_context_admission():
                 return original(*args, **kwargs)
             root = Path(os.environ['CUTEAFD_EXPORT_HOST_SLOT_DIR'])
             root.mkdir(parents=True, exist_ok=True)
+            # Never hold the init guard while waiting for reservations owned
+            # by another pool: those workers need this guard to make progress.
+            context_admission()
+            gpu_admission()
             started = time.monotonic()
             next_warn = started
             with (root / 'context-init.lock').open('a') as guard:
@@ -415,8 +511,18 @@ def install_context_admission():
                     except BlockingIOError:
                         next_warn = _wait_for_admission(started, next_warn,
                             'waiting for actual CUDA context initialization', 'initialization')
-                context_admission()
-                gpu_admission()
+                # Admission order and init-lock order may differ. Space the
+                # actual driver calls too, not just their reservations.
+                spacing = float(os.environ.get('CUTEAFD_EXPORT_CONTEXT_SPACING_S', CONTEXT_SPACING_S))
+                last_path = root / 'context-last-init'
+                try:
+                    last = float(last_path.read_text())
+                except (FileNotFoundError, ValueError):
+                    last = None
+                now = time.monotonic()
+                if last is not None and 0 <= now - last < spacing:
+                    time.sleep(spacing - (now - last))
+                last_path.write_text(repr(time.monotonic()))
                 available = host_allocatable_memory() // 1024**2
                 initializing.active = True
                 try:

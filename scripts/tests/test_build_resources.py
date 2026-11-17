@@ -32,6 +32,8 @@ def quiet_host(tmp_path_factory, monkeypatch):
     # In-process admissions never read the gate host's live PSI or nvidia-smi.
     monkeypatch.setattr(export, 'PRESSURE_PATH', tmp_path_factory.mktemp('psi') / 'absent')
     monkeypatch.setattr(export, 'live_cuda_processes', lambda: 'stubbed')
+    monkeypatch.setattr(export, '_context_footprint', None)
+    monkeypatch.setattr(export, '_context_prepaid', None)
     yield
 
 
@@ -668,6 +670,170 @@ def test_exl3_variant_workers_persist_across_variants(tmp_path):
     assert 'initializer=init_variant_worker' in text
 
 
+@pytest.mark.parametrize('baseline,expected,shrinking', [(14704, 2, False), (10000, 1, False),
+                                                       (14704, 2, True)])
+def test_exl3_pool_completes_with_inkling_budget(tmp_path, baseline, expected, shrinking):
+    shim = tmp_path / 'shim.py'
+    shim.write_text('import os, time\nfrom pathlib import Path\n'
+                    'def variant(payload):\n'
+                    '    import _export_jobs as export\n'
+                    '    marker = Path(os.environ["CUTEAFD_EXPORT_HOST_SLOT_DIR"]) / "sibling-admitted"\n'
+                    '    shrinking = payload\n'
+                    '    if shrinking and export._context_prepaid is not None and export._context_prepaid.name == sorted(p.name for p in marker.parent.glob("context.pool-*.lock"))[1]:\n'
+                    '        deadline = time.monotonic() + 10\n'
+                    '        while not marker.exists():\n'
+                    '            assert time.monotonic() < deadline\n'
+                    '            time.sleep(0.01)\n'
+                    '    export.host_allocatable_memory = lambda: (2048 if shrinking and marker.exists() else 13763) * 1024**2\n'
+                    '    export.memory_pressure = lambda: 0\n'
+                    '    export.live_cuda_processes = lambda: "stubbed"\n'
+                    '    export.context_admission()\n'
+                    '    marker.touch()\n'
+                    '    time.sleep(0.05)\n'
+                    '    return os.getpid()\n')
+    child = '''
+import os, sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+import package_exl3_aot as package
+import _export_jobs as export
+import shim
+root = Path(os.environ['CUTEAFD_EXPORT_HOST_SLOT_DIR'])
+root.mkdir()
+(root / 'context-footprint-mib').write_text('5620')
+export.host_allocatable_memory = lambda: int(sys.argv[2]) * 1024**2
+export.memory_pressure = lambda: 0
+export.live_cuda_processes = lambda: 'stubbed'
+export.context_admission()
+assert export._context_lease.readable()
+export._context_footprint = 717
+export.park_context_lease()
+assert export._context_lease.name.endswith('.lock')
+assert Path(export._context_lease.name).read_text() == '717'
+package.compile_variant = shim.variant
+results = package.compile_variants([sys.argv[3] == '1'] * 16, 2)
+assert len(results) == 16
+print('COMPLETED')
+'''
+    env = {**os.environ, 'PYTHONPATH': str(tmp_path),
+           'CUTEAFD_EXPORT_HOST_SLOT_DIR': str(tmp_path / 'slots'),
+           'CUTEAFD_EXPORT_HOST_CLASS': 'remote', 'CUTEAFD_EXPORT_HOST_CONTEXTS': '8',
+           'CUTEAFD_EXPORT_CONTEXT_SPACING_S': '0', 'CUTEAFD_EXPORT_WORKER_RAM_MIB': '4096'}
+    result = subprocess.run([sys.executable, '-c', child, str(ROOT / 'python/tools/aot'), str(baseline), str(int(shrinking))],
+                            env=env, capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert f'pool reserved: {expected}/2 workers, 5620 MiB each' in result.stdout
+    assert result.stdout.count('AOT context admitted:') == expected + 1
+    assert 'COMPLETED' in result.stdout
+    assert 'timed out' not in result.stdout
+    # The old parent + first worker consumed 11240 MiB, leaving only 3464,
+    # below the second worker's 5620 + 1024 = 6644 MiB admission requirement.
+    assert 14704 - 2 * 5620 == 3464 < 6644 == 5620 + 1024
+    for path in (tmp_path / 'slots').glob('context.*.lock'):
+        handle = resource.try_lock(path)
+        assert handle is not None
+        handle.close()
+
+
+def test_pool_reservation_competes_atomically_with_contexts(tmp_path, monkeypatch):
+    monkeypatch.setattr(export, '_context_lease', None)
+    monkeypatch.setenv('CUTEAFD_EXPORT_HOST_SLOT_DIR', str(tmp_path))
+    monkeypatch.setenv('CUTEAFD_EXPORT_HOST_CONTEXTS', '2')
+    monkeypatch.setattr(export, '_gb10_host', lambda: True)
+    monkeypatch.setattr(export, 'host_allocatable_memory', lambda: 14704 * 1024**2)
+    (tmp_path / 'context-footprint-mib').write_text('5620')
+    with export.reserve_context_pool(4) as paths:
+        assert len(paths) == 2
+        details = {}
+        assert export._admit_locked(tmp_path, 5620, 2, 0, details) is None
+        assert 'budget=3464 MiB' in details['status']
+        assert 'leases=2/2' in details['status']
+    # Closed pool reservations are reaped rather than charged to the next pool.
+    with export.reserve_context_pool(4) as paths:
+        assert len(paths) == 2
+
+
+@pytest.mark.parametrize('crash', [False, True])
+def test_failed_variant_pool_releases_tokens_and_owned_sessions(tmp_path, crash):
+    shim = tmp_path / 'shim.py'
+    shim.write_text('import os, time\n'
+                    'def variant(payload):\n'
+                    '    if payload:\n'
+                    '        os._exit(17)\n'
+                    '    raise RuntimeError("variant failed")\n')
+    child = '''
+import os, sys
+sys.path.insert(0, sys.argv[1])
+import package_exl3_aot as package
+import _export_jobs as export
+import shim
+export.host_allocatable_memory = lambda: 14704 * 1024**2
+export.memory_pressure = lambda: 0
+package.compile_variant = shim.variant
+kills = []
+original = package.os.killpg
+def killpg(pid, sig):
+    kills.append((pid, sig))
+    return original(pid, sig)
+package.os.killpg = killpg
+try:
+    package.compile_variants([sys.argv[2] == '1'] * 8, 2)
+except Exception:
+    pass
+else:
+    raise AssertionError('pool should fail')
+assert kills, 'owned worker sessions were not killed'
+with export.reserve_context_pool(2) as paths:
+    assert len(paths) == 2, paths
+print('RELEASED')
+'''
+    env = {**os.environ, 'PYTHONPATH': str(tmp_path),
+           'CUTEAFD_EXPORT_HOST_SLOT_DIR': str(tmp_path / 'slots'),
+           'CUTEAFD_EXPORT_HOST_CONTEXTS': '2', 'CUTEAFD_EXPORT_HOST_CLASS': 'remote'}
+    result = subprocess.run([sys.executable, '-c', child, str(ROOT / 'python/tools/aot'), str(int(crash))],
+                            env=env, capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert 'RELEASED' in result.stdout
+    for path in (tmp_path / 'slots').glob('context.pool-*.lock'):
+        handle = resource.try_lock(path)
+        assert handle is not None
+        handle.close()
+
+
+def test_prepaid_worker_rejects_retired_parent(tmp_path, monkeypatch):
+    monkeypatch.setenv('CUTEAFD_EXPORT_HOST_SLOT_DIR', str(tmp_path))
+    monkeypatch.setattr(export, '_context_lease', None)
+    token = tmp_path / 'context.pool-dead.lock'
+    token.write_text('5620')
+    export.claim_context_reservation(str(token))
+    with pytest.raises(RuntimeError, match='reservation owner exited'):
+        export.context_admission()
+    assert export._context_lease is None
+
+
+def test_exl3_admits_cuda_before_taking_export_slot(monkeypatch, tmp_path):
+    import types
+    from contextlib import contextmanager
+    package = load('package_admission_order', ROOT / 'python/tools/aot/package_exl3_aot.py')
+    events = []
+    class Stop(Exception):
+        pass
+    @contextmanager
+    def slot():
+        assert events == ['cuda']
+        events.append('slot')
+        raise Stop()
+        yield
+    monkeypatch.setitem(sys.modules, '_pinned_sparkinfer', types.SimpleNamespace())
+    monkeypatch.setitem(sys.modules, 'export_b12x_exl3_aot', types.SimpleNamespace(export=None))
+    monkeypatch.setitem(sys.modules, '_export_jobs', types.SimpleNamespace(export_slot=slot))
+    monkeypatch.setitem(sys.modules, 'torch', types.SimpleNamespace(cuda=types.SimpleNamespace(
+        current_device=lambda: events.append('cuda'))))
+    with pytest.raises(Stop):
+        package.compile_variant((None, (12, 0), tmp_path, 1, 1, 1, 1, 'bf16', {}))
+    assert events == ['cuda', 'slot']
+
+
 def test_spark_native_builds_brake_ninja_on_load():
     host_isa = ROOT / 'scripts/build/host-isa.sh'
     for machine, expected in (('aarch64', ['-l', '10']), ('x86_64', [])):
@@ -1056,7 +1222,12 @@ def test_context_hook_initializes_stream_under_host_guard(tmp_path, monkeypatch)
         return types.SimpleNamespace(synchronize=lambda: events.append('sync'))
     cuda.current_stream = stream
     monkeypatch.setitem(sys.modules, 'torch', types.SimpleNamespace(cuda=cuda))
-    monkeypatch.setattr(export, 'context_admission', lambda: events.append('admit'))
+    def admit():
+        handle = resource.try_lock(tmp_path / 'context-init.lock')
+        assert handle is not None
+        handle.close()
+        events.append('admit')
+    monkeypatch.setattr(export, 'context_admission', admit)
     monkeypatch.setattr(export, 'gpu_admission', lambda: events.append('gpu'))
     monkeypatch.setattr(export, '_record_footprint', lambda *args: 'measured')
     callbacks = []
