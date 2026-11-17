@@ -444,14 +444,15 @@ fn pe_normalization_identity_keys_both_inkling_round_boundaries() {
     let inkling=ProcessorConfig::for_family(ImageFamily::Inkling2);
     let parameters=inkling.normalization_parameters();
     assert_eq!(parameters[..3].iter().map(|v|v.to_bits()).collect::<Vec<_>>(),
-        [0.48145466f32,0.4578275,0.40821073].map(f32::to_bits));
+        [0x3ef6813a,0x3eea685e,0x3ed100ff]);
     assert_eq!(parameters[3..6].iter().map(|v|v.to_bits()).collect::<Vec<_>>(),
-        [0.26862954f32,0.2613026,0.2757771].map(f32::to_bits));
+        [0x3e8989d0,0x3e85c974,0x3e8d32a8]);
     assert_eq!(parameters[6..9].iter().map(|v|v.to_bits()).collect::<Vec<_>>(),
-        [0.26862954f32,0.26130258,0.27577711].map(f32::to_bits));
-    // Green's different decimal spellings round to the same f32. Blue's do not.
-    assert_eq!(parameters[4].to_bits(),parameters[7].to_bits());
-    assert_ne!(parameters[5].to_bits(),parameters[8].to_bits());
+        [0x3e8989d0,0x3e85c974,0x3e8d32a8]);
+    // Both decimal std blocks round to identical f32 values. Keep both: the
+    // native owner normalizes, rounds to BF16, then applies the encoder remap.
+    assert_eq!(&parameters[3..6],&parameters[6..9]);
+    assert!(parameters[9..].iter().all(|v|v.to_bits()==0));
     assert!(inkling.normalization_source().unwrap().contains("sha256="));
     let step=ProcessorConfig::for_family(ImageFamily::Step5);
     assert_eq!(step.merge,4);assert_eq!(step.resample,Resample::Bilinear);
