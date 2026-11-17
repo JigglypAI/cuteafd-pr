@@ -129,6 +129,8 @@ pub struct ModelProfile {
     /// Live readiness for remote vision; absent on existing local serving paths.
     pub vision_health: Option<Arc<std::sync::atomic::AtomicBool>>,
     pub media_preparer: Option<Arc<media::MediaPreparer>>,
+    /// Fidelity feature overrides only; never advertises a loaded vision encoder.
+    pub probe_media_preparer: Option<Arc<media::MediaPreparer>>,
     pub audio_preparer: Option<Arc<media::audio::AudioPreparer>>,
     pub audio_health: Option<Arc<std::sync::atomic::AtomicBool>>,
     /// Loaded encoder capabilities, not checkpoint metadata or requested placement.
@@ -170,7 +172,7 @@ impl ModelProfile {
     pub fn new(id: impl Into<String>, encoding: ModelEncoding) -> Self {
         let eos_token_ids = encoding.eos_token_ids();
         let capabilities = MediaCapabilities { vision: matches!(encoding, ModelEncoding::DeepseekV41), audio: false };
-        Self { stats_diagnostics: None, expert_usage: Default::default(), id: id.into(), encoding, eos_token_ids, capabilities, engine_health: None, media_preparer: None, vision_health: None,
+        Self { stats_diagnostics: None, expert_usage: Default::default(), id: id.into(), encoding, eos_token_ids, capabilities, engine_health: None, media_preparer: None, probe_media_preparer: None, vision_health: None,
             audio_preparer: None, audio_health: None, gateway: None, v41_turns: V41Turns::default(),
             literal_tokens: Arc::new(cuteafd_loader::LiteralTokens::new([
                 "<｜deepseek_image｜>", "<｜begin▁of▁sentence｜>", "<｜end▁of▁sentence｜>",
@@ -198,6 +200,11 @@ impl ModelProfile {
     pub fn with_loaded_vision(mut self, preparer: Arc<media::MediaPreparer>) -> Self {
         self.media_preparer = Some(preparer);
         self.capabilities.vision = true;
+        self
+    }
+
+    pub fn with_probe_media(mut self, preparer: Arc<media::MediaPreparer>) -> Self {
+        self.probe_media_preparer = Some(preparer);
         self
     }
 
@@ -441,7 +448,7 @@ pub fn router_for_model(queue: mpsc::Sender<NativeRequest>, limits: NativeLimits
         .route("/assets/cuteafd-logo.svg", get(console::logo))
         .route("/assets/cuteafd-mark.svg", get(console::mark))
         .with_state(console);
-    let body_limit = axum::extract::DefaultBodyLimit::max(if profile.media_preparer.is_some() || profile.audio_preparer.is_some() { 256 << 20 } else { images::BODY_BYTES });
+    let body_limit = axum::extract::DefaultBodyLimit::max(if profile.media_preparer.is_some() || profile.probe_media_preparer.is_some() || profile.audio_preparer.is_some() { 256 << 20 } else { images::BODY_BYTES });
     let mount = profile.gateway.clone();
     let state = NativeState { queue, limits, images, stats, tables, admission, profile: Arc::new(profile) };
     let mut routes = Router::new()
@@ -816,8 +823,10 @@ pub(crate) fn build(profile: &ModelProfile, limits: NativeLimits, headers: &axum
     }
     images::guard_content(&body, profile.capabilities).map_err(Rejection::bad)?;
     let probe = headers.get(probe::HEADER).and_then(|v| v.to_str().ok()).and_then(|id| probe::registry().claim(id));
+    let probe_preparer = probe.as_ref().filter(|p| p.spec.feature_scoring())
+        .and(profile.probe_media_preparer.as_ref());
     if let Some(p) = &probe {
-        let geometry = profile.media_preparer.as_ref().map(|p| p.config().token_geometry())
+        let geometry = profile.media_preparer.as_ref().or(probe_preparer).map(|p| p.config().token_geometry())
             .unwrap_or(cuteafd_core::media::ImageTokenGeometry::MERGED);
         let audio = profile.audio_preparer.as_ref().map(|p| p.geometry())
             .unwrap_or(cuteafd_core::media::AudioTokenGeometry::MimoRvq);
@@ -825,8 +834,8 @@ pub(crate) fn build(profile: &ModelProfile, limits: NativeLimits, headers: &axum
             p.fail(format!("{message:#}"));
             return Err(Rejection::bad(message));
         }
-        if !p.spec.media.is_empty() && (!profile.capabilities.vision || profile.media_preparer.is_none()
-            || matches!(profile.encoding, ModelEncoding::DeepseekV41)) {
+        if !p.spec.media.is_empty() && ((!profile.capabilities.vision || profile.media_preparer.is_none())
+            && probe_preparer.is_none() || matches!(profile.encoding, ModelEncoding::DeepseekV41)) {
             p.fail("probe media requires a loaded encoder");
             return Err(Rejection::bad("probe media requires a loaded encoder"));
         }
@@ -1228,7 +1237,8 @@ async fn prepare_media(profile: &ModelProfile, decoder: &images::ImageDecoder, w
         }
     };
     let media = if media_sources.is_empty() { Vec::new() } else {
-        let preparer = profile.media_preparer.as_ref().expect("sources require preparer").clone();
+        let preparer = profile.media_preparer.as_ref().or_else(|| probe.filter(|p| p.spec.feature_scoring())
+            .and(profile.probe_media_preparer.as_ref())).expect("validated media preparer").clone();
         let slot = preparer.slots.clone().acquire_owned().await
             .map_err(|_| Rejection::unavailable("image preparation is closed"))?;
         let hashes = probe.map(|p| p.spec.media.iter()

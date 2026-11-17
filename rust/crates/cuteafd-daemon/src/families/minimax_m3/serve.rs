@@ -99,6 +99,7 @@ pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
         .context("MiniMax serving requires --model-id for a snapshot without HF identity")?;
     let mut profile = ModelProfile::new(model, encoding);
     profile.expert_usage = args.expert_usage_reader.clone();
+    profile = crate::shared::probe::still::install(profile, &args.snapshot, cuteafd_loader::media::ImageFamily::MiniMax)?;
     let (queue, mut receive) = tokio::sync::mpsc::channel::<NativeRequest>(
         cuteafd_core::concurrency::queue_depth(u64::from(args.max_sequences)) as usize);
     let stats = Arc::new(Mutex::new(serde_json::Value::Null));
@@ -140,14 +141,14 @@ pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
                 resident_weights: crate::shared::memory::budget::resident_weight_limit(),draft:worker_args.dspark })?;
             let served_context = usize::try_from(loaded.admitted.solved.served_context())?;
             let backend = super::backend::MiniMaxBackend::new(&loaded.owners, &cfg,
-                loaded.execution, served_context, loaded.host_prefix, worker_args.prefill_packing)?;
+                loaded.execution, served_context, loaded.host_prefix, worker_args.prefill_packing)?.with_probe_snapshot(&worker_args.snapshot);
             library.cuda_set_device(worker_args.split_device.unwrap_or(worker_args.device))?;
             let physical = std::iter::once(worker_args.device).chain(worker_args.split_device).collect::<Vec<_>>();
             scheduler::schedule(&backend, &worker_args.snapshot, &mut receive, &worker_stats,
                 concurrency, if worker_args.dspark { scheduler::Drafts::Neural { depth:7 } } else { scheduler::Drafts::None },
                 worker_args.draft_length, eos, worker_args.decode_share,
                 &worker_args.prefix, worker_args.loop_abort.config(), worker_args.token_io.token_select,
-                &mut super::super::qwen3_5::serve::text_media(), None, || {
+                &mut crate::shared::probe::still::admission(), None, || {
                     backend.require_live()?;
                     RuntimeInventory::measure(&library, &physical, InventoryPhase::PostLoad,
                         |_| Ok(()))?.record("minimax_m3-serving-loaded", &loaded.admission_free);

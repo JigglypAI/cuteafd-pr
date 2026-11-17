@@ -882,7 +882,8 @@ pub(crate) fn schedule<'a, B: Backend<'a>>(engine: &B, snapshot: &std::path::Pat
                             let _ = job.events.send(Err(NativeFailure::BadRequest(format!("scoring: {error:#}"))));
                             continue;
                         }
-                        if !job.media.is_empty() && !media.encoder().available() {
+                        if !job.media.is_empty() && !media.encoder().available()
+                            && !job.probe.as_ref().is_some_and(|p| p.spec.feature_scoring()) {
                             let _ = job.events.send(Err(NativeFailure::Unavailable("vision encoder unavailable".into())));
                             continue;
                         }
@@ -917,7 +918,8 @@ pub(crate) fn schedule<'a, B: Backend<'a>>(engine: &B, snapshot: &std::path::Pat
                     }
                 },
             };
-            if !ready.job().job.media.is_empty() && !media.encoder().available() {
+            if !ready.job().job.media.is_empty() && !media.encoder().available()
+                && !ready.job().job.probe.as_ref().is_some_and(|p| p.spec.feature_scoring()) {
                 let _ = ready.job().job.events.send(Err(NativeFailure::Unavailable("vision encoder unavailable".into())));
                 continue;
             }

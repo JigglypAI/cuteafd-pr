@@ -35,6 +35,7 @@ pub(crate) struct Rank<'a> {
 /// Graphs retain this entire bundle, not just the buffers in one captured site.
 /// Mutable request/slot borrows are synchronous and never cross an await.
 pub(crate) struct Storage<'a> {
+    pub(crate) probe_media: RefCell<BTreeMap<usize, cuteafd_engine::media::RequestMedia>>,
     pub ranks: Vec<Rank<'a>>,
     pub requests: RefCell<RequestState<'a>>,
     pub prefix: MiniMaxPrefix<'a>,
@@ -262,7 +263,7 @@ impl<'a> Owners<'a> {
             else { None };
         let heads = if inputs.heads() { Some(super::heads::Heads::new(&ranks, capacity.decode.rows, capacity.prefill.rows)?) }
             else { None };
-        let storage = Rc::new(Storage { ranks, requests: RefCell::new(requests), prefix, head,
+        let storage = Rc::new(Storage { probe_media: RefCell::new(BTreeMap::new()), ranks, requests: RefCell::new(requests), prefix, head,
             embedding, usage, split, heads, draft_prefix, verify_logits, verify_taps, devices });
         let census = storage.inventory()?;
         reconcile(&census, &admitted.solved.facts, &contract.components, pages, retained_owner)?;

@@ -2497,6 +2497,13 @@ impl TokenIo<'_> {
         })
     }
 
+    pub(crate) fn inject_probe(&self, media: &cuteafd_engine::media::RequestMedia,
+        start: usize, rows: usize, offset: usize, output: CuteafdDeviceBuffer) -> Result<()> {
+        let output = view(output, offset * self.layout.hidden * 2, rows * self.layout.hidden * 2)?;
+        self.stream.device.run(|| crate::shared::probe::still::inject(&self.stream, output,
+            media, start, rows, self.layout.hidden, false))
+    }
+
     /// Wide scoring retains all admitted outputs, but reuses the ordinary
     /// 64-row head/scratch on the same stream for each output span.
     pub(crate) fn project(&self, input: CuteafdDeviceBuffer, rows: usize, local:&LocalLane<'_>) -> Result<CuteafdDeviceBuffer> {

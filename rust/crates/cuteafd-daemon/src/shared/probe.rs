@@ -10,6 +10,7 @@ use cuteafd_ffi::NativeLibrary;
 use std::sync::Arc;
 
 pub(crate) mod features;
+pub(crate) mod still;
 
 pub(crate) type ProbeRef = Option<Arc<Probe>>;
 

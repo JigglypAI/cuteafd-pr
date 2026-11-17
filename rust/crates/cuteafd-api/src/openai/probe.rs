@@ -185,6 +185,13 @@ pub fn sha256_hex(value: &str) -> bool {
 }
 
 impl ProbeSpec {
+    /// Only registered teacher-forced fidelity requests may supply feature rows.
+    pub fn feature_scoring(&self) -> bool {
+        self.cold && self.no_speculation && self.score_from.is_some()
+            && self.prompt_ids.is_some() && !self.media.is_empty() && self.audio.is_empty()
+            && self.media.iter().all(|span| span.fixture.is_some())
+    }
+
     pub fn validate_cold_steps(&self, len: usize, prefill_rows: usize, decode_rows: usize) -> anyhow::Result<()> {
         if self.cold_steps.is_empty() { return Ok(()); }
         anyhow::ensure!(self.cold && self.no_speculation && self.score_from.is_none(),
