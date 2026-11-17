@@ -721,6 +721,8 @@ def binary_supports(binary, repo, job, needs):
                             capture_output=True, text=True, timeout=120)
     if result.returncode:
         raise ValueError(f"{binary} bench smoke --dry-run failed: {(result.stderr or result.stdout).strip().splitlines()[-1:]}")
+    if 'warm_prelude' in needs and 'warm_prelude=server-v1' not in result.stderr:
+        raise ValueError(f'{binary} lacks the server-owned warm prelude; build a current cuteafd and pass --binary before using hardware')
     missing = [field for field in needs if field + '=' not in result.stderr]
     if missing:
         raise ValueError(f"{binary} predates smoke fields {', '.join(missing)}; build cuteafd from this checkout and pass --binary")
@@ -3531,7 +3533,7 @@ def main():
                         save(Path(job['entry']['set']['PROFILE_DIR']) / 'observer-context.json', {'pending': True})
         if kept:
             print(f'wip-cards: resume keeps {len(kept)} passed job(s), reruns {len(jobs) - len(kept)}', file=sys.stderr)
-    fields = ['fabric'] + (['levels', 'post_load_c1'] + (['post_load_repeat'] if args.post_load_repeat else []) if args.levels else []) + (['prefill_lengths'] if prefill_lengths else []) + \
+    fields = ['fabric', 'warm_prelude'] + (['levels', 'post_load_c1'] + (['post_load_repeat'] if args.post_load_repeat else []) if args.levels else []) + (['prefill_lengths'] if prefill_lengths else []) + \
         (['prefill_repeat'] if args.prefill_repeat else []) + \
         (['prefill_idle_seconds'] if args.prefill_idle_seconds is not None else []) + \
         (['prefill_purge'] if any(job['entry'].get('prefill_purge') for job in jobs) else []) + \
