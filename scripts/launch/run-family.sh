@@ -1420,22 +1420,9 @@ case "$family" in
   muse_spark) serve=serve-muse ;;
   *) echo "run-family.sh serves DeepSeek V4, GLM 5.x, GLM 5.3 Flash, MiMo V2, Qwen 3.8, Kimi K3, Step-5 and Muse Spark checkpoints, not $family (./run.sh serves DeepSeek V4.1)" >&2; exit 2 ;;
 esac
-# Kimi K3 and Step-5 serve through their own commands: automatic attention
-# placement, text only (their bundled vision towers are not in scope) and GPU
-# token embeddings. Kimi ships no MTP head; Step-5 defaults to native MTP
-# depth 3 (SPECULATOR=off disables it).
-text_family=0
-: # Every supported still-tower family now owns media through the shared runtime.
 # These commands own automatic context, pool and Spark budgets independently of media.
-standalone_family=$text_family
-[[ "$family" != minimax_m3 && "$family" != kimi_k3 && "$family" != inkling2 && "$family" != step5 ]] || standalone_family=1
-[[ "$family" != muse_spark ]] || standalone_family=1
-if ((text_family)); then
-  case "$vision:$audio" in
-    auto:auto|auto:off|off:auto|off:off) vision=off; audio=off ;;
-    *) release_die "$family bundled media execution is not qualified; set VISION=off and AUDIO=off" ;;
-  esac
-fi
+standalone_family=0
+[[ "$family" != minimax_m3 && "$family" != kimi_k3 && "$family" != inkling2 && "$family" != step5 && "$family" != muse_spark ]] || standalone_family=1
 if [[ "$family" == qwen3_5 ]]; then
   case "$vision:$audio" in
     auto:auto|auto:off|off:auto|off:off) vision=off; audio=off ;;
@@ -1796,7 +1783,7 @@ if [[ -n "$chat_template_from" && "$vision" != off ]]; then
   family_args+=(--chat-template-from "$chat_template_from")
 fi
 # Still towers use the shared media options and the admitted encoder owner.
-((text_family)) || family_args+=(--vision "$vision" --audio "$audio")
+family_args+=(--vision "$vision" --audio "$audio")
 
 dspark_args=()
 if [[ $family == mimo_v2 ]]; then

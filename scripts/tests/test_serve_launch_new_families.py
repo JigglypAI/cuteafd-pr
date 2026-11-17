@@ -64,7 +64,7 @@ def test_inkling_native_launcher_composes_shared_argv_and_rejects_pair(tmp_path:
     assert _flag(serve, "--core-view") == "original"
     assert (_flag(serve, "--prefill-rows"), _flag(serve, "--prefill-waves")) == ("2752", "3")
     assert _flag(serve, "--rtx-expert-layers") == "auto"
-    for flag in ("--split-device", "--attention-placement", "--vision", "--audio", "--dspark", "--prefill-packing"):
+    for flag in ("--split-device", "--attention-placement", "--dspark", "--prefill-packing"):
         assert flag not in shlex.split(serve)
     pair = _family_launch_result(tmp_path / "pair", config, "thinkingmachines/Inkling-2-Small-MXFP8",
         keys.replace("RTX_GPUS=1", "RTX_GPUS=2"), extra_args=("--wip", "inkling"), encoder_plan=PLANNED)
@@ -550,7 +550,6 @@ def test_step5_cache_format_matches_plan_and_serve(tmp_path: Path, model, gpus, 
 @pytest.mark.parametrize("keys,diagnostic", [
     ("SPECULATOR=dflash2\n", "SPECULATOR=dflash2 does not apply to step5"),
     ("ATTENTION_PLACEMENT=heads\n", "step5 supports only ATTENTION_PLACEMENT=auto"),
-    ("VISION=rtx\n", "step5 bundled media execution is not qualified"),
     ("EMBEDDING=host\n", "step5 serves GPU token embeddings only"),
     ("SPECULATOR_MODEL_ID=x/y\n", "unused configuration key: SPECULATOR_MODEL_ID"),
     ("SPECULATOR_MODEL_REVISION=abc\n", "unused configuration key: SPECULATOR_MODEL_REVISION"),
@@ -959,3 +958,23 @@ def test_family_table_and_planner_fixtures_name_muse() -> None:
     fixtures = json.loads((ROOT / "rust/crates/cuteafd-loader/tests/fixtures/launch-families.json").read_text())
     assert "muse_spark muse_spark 0 61" in {case["line"] for case in fixtures}
     assert '"muse_spark" =>' in (ROOT / "rust/crates/cuteafd-loader/src/plan/launch.rs").read_text()
+
+@pytest.mark.parametrize("family,model,ranks", [("inkling2", "thinkingmachines/Inkling-2-Small", 4),
+    ("step5", "wrldsuksgo2mars/Step-5-Preview-EXL3-K4-MC", 3)])
+@pytest.mark.parametrize("vision", ["spark", "rtx", "off"])
+def test_pe_shared_encoder_plan_handoff(tmp_path, family, model, ranks, vision):
+    config = {"model_type": "inkling2" if family == "inkling2" else "step5_vl", "vision_config": {"depth": 2},
+        "text_config": {"num_hidden_layers": 48 if family == "inkling2" else 92, "moe_layer_list": list(range(3, 91))}}
+    owner = None if vision == "off" else {"kind": {"kind": vision, "rank" if vision == "spark" else "gpu": 0}, "replicas": []}
+    plan = {**PLANNED, "encoder_plan_hash": "ab" * 32, "encoder": owner}
+    keys = f"SPARK_COUNT={ranks}\nRTX_GPUS=1\nSPECULATOR=off\nVISION={vision}\nAUDIO=off\n" + _hosts(ranks)
+    result = _family_launch_result(tmp_path, config, model, keys, physical_gpus=(0,),
+        extra_args=("--wip", "pe"), encoder_plan=plan)
+    serve = _line(result, f"serve-{'inkling2' if family == 'inkling2' else 'step5'} --snapshot")
+    assert _flag(serve, "--vision") == ("off" if vision == "off" else f"{vision}:0")
+    if vision == "spark":
+        assert _flag(serve, "--vision-peers") == "10.0.0.1:19442"
+        assert _flag(serve, "--encoder-plan-hash") == "ab" * 32
+        assert _flag(serve, "--encoder-revision") == "abc"
+    workers = [line for line in result.stderr.splitlines() if "cuteafd expertd-native" in line]
+    assert sum("--encoder " in worker for worker in workers) == (vision == "spark")
