@@ -481,6 +481,23 @@ def rustup_toolchain_bin(root=RUSTUP_HOME, env=None):
     return resolved.parent if resolved is not None and resolved.is_file() else None
 
 
+def resolved_child_tools(env):
+    """Resolve rustup before fixtures replace HOME, and find host build tools."""
+    env = dict(env)
+    roots = [Path(env['RUSTUP_HOME'])] if env.get('RUSTUP_HOME') else []
+    roots += [Path(env.get('HOME') or Path.home()) / '.rustup', RUSTUP_HOME]
+    toolchain = next((found for root in roots
+                      if (found := rustup_toolchain_bin(root=root, env=env)) is not None), None)
+    directories = ([str(toolchain)] if toolchain else [])
+    directories += [env.get('PATH', '')]
+    if HOMEBREW_BIN.is_dir():
+        directories.append(str(HOMEBREW_BIN))
+    path = os.pathsep.join(directories)
+    tools = {name: shutil.which(name, path=path) for name in
+             ('cargo', 'rustc', 'nasm', 'cmake', 'cc', 'c++', 'make', 'ninja', 'pkg-config')}
+    return path, dict(toolchain_bin=str(toolchain) if toolchain else None, tools=tools)
+
+
 def cargo_build_succeeded(path):
     """Require Cargo's completion event even if an enclosing shell masks its exit."""
     finished = []
@@ -552,7 +569,8 @@ def compiler_cache_env(source, root, env):
 def compiler_cache_receipt(env, target):
     active = env.get('CUTEAFD_KACHE_ACTIVE')
     warning = Path(env.get('CUTEAFD_KACHE_WARNING_DIR', '/nonexistent')) / 'first-failure'
-    record = dict(mode='fallback' if warning.is_file() else 'kache' if active else 'plain',
+    event_root = str(Path(env['KACHE_CONFIG']).parent.parent) if env.get('KACHE_CONFIG') else str(target.parent)
+    record = dict(event_root=event_root, mode='fallback' if warning.is_file() else 'kache' if active else 'plain',
                   target=str(target), wrapper=env.get('RUSTC_WRAPPER', ''),
                   cache_dir=env.get('KACHE_CACHE_DIR'), hits=None, misses=None,
                   rustflags=env.get('RUSTFLAGS', ''), cargo_encoded_rustflags=env.get('CARGO_ENCODED_RUSTFLAGS', ''))
@@ -566,9 +584,10 @@ def compiler_cache_receipt(env, target):
             record[name] = None
     if active:
         try:
-            result = subprocess.run([active, '--json', 'stats', '--root', str(target), '--last-build'],
+            result = subprocess.run([active, '--json', 'stats', '--root', event_root, '--full'],
                                     env=env, capture_output=True, text=True, timeout=15)
-            stats = json.loads(result.stdout)['report']['summary']
+            payload = json.loads(result.stdout)
+            stats = payload.get('report', payload)['summary']
             record.update(hits=sum(stats.get(k, 0) for k in ('local_hits', 'remote_hits', 'prefetch_hits')),
                           misses=stats['misses'], stats=stats)
         except (OSError, subprocess.SubprocessError, ValueError, KeyError) as error:
@@ -942,6 +961,8 @@ def main():
     if missing and (args.cargo or args.benches or args.scripts):
         parser.error(f'{", ".join(missing)} not on PATH; pass PATH including ~/.cargo/bin '
                      '(systemd-run --setenv=PATH=...)')
+    os.environ['PATH'], args.resolved_tools = resolved_child_tools(os.environ)
+    log(f"resolved child tools: {json.dumps(args.resolved_tools, sort_keys=True)}")
     concurrent =args.scripts and (args.cargo or args.benches)
     args.cargo_jobs = max(1, args.jobs // 2) if concurrent else args.jobs
     args.pytest_jobs = max(1, args.jobs - args.cargo_jobs) if concurrent else args.jobs
@@ -978,6 +999,7 @@ def main():
 def run_gate(args, root):
     record = {'task': args.task, 'started': time.strftime('%Y-%m-%dT%H:%M:%S%z'),
               'gate_lease': getattr(args, 'gate_lease', None),
+              'resolved_tools': getattr(args, 'resolved_tools', None),
               'full': getattr(args, 'full', False),
               'skip_live_planners': args.skip_live_planners, **gate(args.source.resolve(), root / 'head', args)}
     if args.base:

@@ -899,7 +899,10 @@ def test_cpu_gate_terminated_in_lease_queue_writes_nonzero_receipt(tmp_path):
                 selector = selectors.DefaultSelector()
                 selector.register(process.stderr, selectors.EVENT_READ)
                 assert selector.select(timeout=10)
-                assert 'waiting for gate lease' in process.stderr.readline()
+                line = process.stderr.readline()
+                if 'resolved child tools' in line:
+                    line = process.stderr.readline()
+                assert 'waiting for gate lease' in line
                 process.terminate()
                 process.communicate(timeout=10)
                 assert process.returncode == 143
@@ -951,3 +954,44 @@ def test_term_ignoring_suite_has_bounded_unwind_and_terminated_receipt(tmp_path,
     finally:
         gate.STOPPING.clear()
         gate.TERMINATED_SIGNAL = None
+
+
+def test_child_path_resolves_rustup_before_fixture_changes_home(tmp_path, monkeypatch):
+    home = tmp_path / 'home'
+    toolchain = home / '.rustup/toolchains/stable/bin'
+    toolchain.mkdir(parents=True)
+    for name in ('cargo', 'rustc'):
+        binary = toolchain / name
+        binary.write_text('#!/bin/sh\nprintf "resolved-toolchain\\n"\n')
+        binary.chmod(0o755)
+    rustup = home / '.cargo/bin/rustup'
+    rustup.parent.mkdir(parents=True)
+    rustup.write_text(f'#!/bin/sh\nprintf "%s\\n" "{toolchain / "cargo"}"\n')
+    rustup.chmod(0o755)
+    brew = tmp_path / 'brew/bin'
+    brew.mkdir(parents=True)
+    (brew / 'nasm').write_text('#!/bin/sh\nexit 0\n')
+    (brew / 'nasm').chmod(0o755)
+    monkeypatch.setattr(gate, 'HOMEBREW_BIN', brew)
+    monkeypatch.setattr(gate, 'RUSTUP_HOME', tmp_path / 'absent')
+    path, receipt = gate.resolved_child_tools({'HOME': str(home), 'PATH': str(rustup.parent)})
+    result = subprocess.run(['rustc', '-V'], env={'HOME': str(tmp_path / 'fixture-home'), 'PATH': path},
+                            text=True, capture_output=True, check=True)
+    assert result.stdout == 'resolved-toolchain\n'
+    assert receipt['tools']['rustc'] == str(toolchain / 'rustc')
+    assert receipt['tools']['nasm'] == str(brew / 'nasm')
+
+
+def test_cache_stats_uses_configured_build_event_root(tmp_path, monkeypatch):
+    root = tmp_path / 'head'
+    stats = {'summary': {'local_hits': 12, 'remote_hits': 2, 'misses': 3}}
+    calls = []
+    def run(command, **kwargs):
+        calls.append(command)
+        return SimpleNamespace(returncode=0, stdout=json.dumps(stats))
+    monkeypatch.setattr(gate.subprocess, 'run', run)
+    receipt = gate.compiler_cache_receipt({'CUTEAFD_KACHE_ACTIVE': '/kache',
+                                          'KACHE_CONFIG': str(root / 'compiler-cache/config.toml')}, root / 'target')
+    assert receipt['event_root'] == str(root)
+    assert receipt['hits'] == 14 and receipt['misses'] == 3
+    assert calls[-1] == ['/kache', '--json', 'stats', '--root', str(root), '--full']
