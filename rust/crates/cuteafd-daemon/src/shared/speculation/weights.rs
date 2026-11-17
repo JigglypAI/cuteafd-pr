@@ -115,6 +115,13 @@ pub(crate) struct MlaFp8Matrix<'a> {
     pub scales: DeviceAllocation<'a>,
 }
 
+pub(crate) enum MlaMatrix<'a> { Bf16(DeviceAllocation<'a>), Fp8(MlaFp8Matrix<'a>) }
+impl<'a> MlaMatrix<'a> {
+    pub fn into_parts(self) -> (DeviceAllocation<'a>, Option<DeviceAllocation<'a>>) {
+        match self { Self::Bf16(values) => (values, None), Self::Fp8(matrix) => (matrix.values, Some(matrix.scales)) }
+    }
+}
+
 /// One projection dispatch shared by block backbones; storage stays with its owner.
 pub(crate) trait Projection {
     /// # Safety

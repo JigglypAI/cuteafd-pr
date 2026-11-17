@@ -189,6 +189,7 @@ impl MlaDraftWeight {
 pub struct MlaDraftRuntimeLayout {
     kind: cuteafd_core::coordinator_programs::MlaDraftKind,
     hidden_stream: crate::families::kimi_k3::draft::DraftHiddenStream,
+    complete_fp8_body: bool,
     cache_format: MlaCacheFormat,
     target_hidden: usize,
     target_vocab: usize,
@@ -243,6 +244,7 @@ impl MlaDraftRuntimeLayout {
     pub fn selector_workspace_bytes(&self) -> Result<usize> {
         draft_selector_workspace_bytes(self.kind, self.capacity.block_rows - self.capacity.max_batch_sequences)
     }
+    pub fn complete_fp8_body(&self) -> bool { self.complete_fp8_body }
     pub fn hidden_stream(&self) -> crate::families::kimi_k3::draft::DraftHiddenStream { self.hidden_stream }
     pub fn cache_format(&self) -> MlaCacheFormat { self.cache_format }
     pub fn target_hidden(&self) -> usize { self.target_hidden }
@@ -1259,10 +1261,26 @@ impl MlaDflashConfig {
         } else { None };
         let weight_arena_requests = crate::families::glm5::draft_physical::mla_arena_requests(self, mode)
             .map_err(|error| unsupported(&error.to_string()))?;
-        let layout = MlaDraftRuntimeLayout { kind: self.kind, hidden_stream: self.hidden_stream, cache_format, target_hidden: h, target_vocab: self.vocab,
+        let layout = MlaDraftRuntimeLayout { kind: self.kind, hidden_stream: self.hidden_stream, complete_fp8_body: false, cache_format, target_hidden: h, target_vocab: self.vocab,
             target_taps: self.taps.clone(), capacity, weights, cache, paged_cache, program,
             fp8_scratch, sm_count, fp8_mode, buffers, owners: Vec::new(), weight_destinations: Vec::new(),
             weight_arena_requests, context_split: false };
+        layout.resident_bytes()?;
+        Ok(layout)
+    }
+
+    /// Qualification callers select this immutable complete-body recipe; serving
+    /// switches uniformly only after the lightseek lossless/performance gate.
+    pub fn complete_fp8_runtime_layout(&self,
+        capacity: crate::families::glm5::draft_representation::GlmDraftCapacity,
+        compiled_context: usize, target_pool_tokens: usize, sm_count: usize, fp8_mode: u8,
+        cache_format: MlaCacheFormat) -> Result<MlaDraftRuntimeLayout> {
+        let mut layout = self.runtime_layout(crate::families::glm5::draft_representation::GlmDraftRepresentation::Fp8Only,
+            capacity, compiled_context, target_pool_tokens, sm_count, fp8_mode, cache_format)?;
+        layout.complete_fp8_body = true;
+        layout.weights = self.complete_fp8_weight_layout()?;
+        layout.weight_arena_requests = crate::families::glm5::draft_physical::mla_complete_fp8_arena_requests(self)
+            .map_err(|error| unsupported(&error.to_string()))?;
         layout.resident_bytes()?;
         Ok(layout)
     }
@@ -1373,7 +1391,7 @@ impl MlaDflashConfig {
         weights.bf16_auxiliary = weights.bf16_auxiliary.checked_add(destination_bytes.checked_sub(source_bytes)
             .ok_or_else(|| unsupported("mtp_dspark packing lost source bytes"))?)
             .ok_or_else(|| unsupported("mtp_dspark generated weight overflow"))?;
-        let layout = MlaDraftRuntimeLayout { kind: self.kind, hidden_stream: self.hidden_stream, cache_format, target_hidden: h, target_vocab: self.vocab,
+        let layout = MlaDraftRuntimeLayout { kind: self.kind, hidden_stream: self.hidden_stream, complete_fp8_body: false, cache_format, target_hidden: h, target_vocab: self.vocab,
             target_taps: self.taps.clone(), capacity, weights, cache, paged_cache, program,
             fp8_scratch: None, sm_count, fp8_mode: 0, buffers, owners, weight_destinations,
             weight_arena_requests: Vec::new(), context_split: false };

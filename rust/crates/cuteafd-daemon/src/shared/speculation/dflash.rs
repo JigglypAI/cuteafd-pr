@@ -235,6 +235,7 @@ struct MlaAttention<'a> {
     program: cuteafd_ffi::mla_draft::MlaDraft<'a>,
     qkv_a: Dev<'a>, q_norm: Dev<'a>, kv_norm: Dev<'a>,
     q_b: Dev<'a>, uk: Dev<'a>, uv: Dev<'a>, output: Dev<'a>,
+    fp8_scales: Option<[Dev<'a>; 5]>,
     cache: Dev<'a>, page_table: Dev<'a>,
 }
 
@@ -242,7 +243,10 @@ impl MlaAttention<'_> {
     fn weights(&self) -> cuteafd_ffi::mla_draft::MlaDraftWeights {
         cuteafd_ffi::mla_draft::MlaDraftWeights { qkv_a: self.qkv_a.buffer,
             q_a_norm: self.q_norm.buffer, kv_a_norm: self.kv_norm.buffer,
-            q_b: self.q_b.buffer, uk: self.uk.buffer, uv: self.uv.buffer, output: self.output.buffer, fp8_scales: None }
+            q_b: self.q_b.buffer, uk: self.uk.buffer, uv: self.uv.buffer, output: self.output.buffer,
+            fp8_scales: self.fp8_scales.as_ref().map(|scales| cuteafd_ffi::mla_draft::MlaDraftScales {
+                qkv_a: scales[0].buffer, q_b: scales[1].buffer, uk: scales[2].buffer,
+                uv: scales[3].buffer, output: scales[4].buffer }) }
     }
 }
 
@@ -1308,9 +1312,15 @@ impl<'a> DflashDrafter<'a> {
         use cuteafd_loader::formats::dflash::MlaDflashConfig;
         let _scope = cuteafd_ffi::memory_ledger::scope("drafter");
         let native = MlaDflashConfig::read(snapshot)?;
-        ensure!(native.runtime_layout(representation, layout.capacity(), layout.program().context,
-            layout.paged_cache().target_tokens, library.sm_count()?, fp8_rows.code() as u8, layout.cache_format())?
-                .with_context_split(layout.context_split())? == layout && layout.context_split() == split.is_some(),
+        let admitted_source = if layout.complete_fp8_body() {
+            ensure!(representation == GlmDraftRepresentation::Fp8Only, "complete MLA body requires FP8 representation");
+            native.complete_fp8_runtime_layout(layout.capacity(), layout.program().context,
+                layout.paged_cache().target_tokens, library.sm_count()?, fp8_rows.code() as u8, layout.cache_format())?
+        } else {
+            native.runtime_layout(representation, layout.capacity(), layout.program().context,
+                layout.paged_cache().target_tokens, library.sm_count()?, fp8_rows.code() as u8, layout.cache_format())?
+        };
+        ensure!(admitted_source.with_context_split(layout.context_split())? == layout && layout.context_split() == split.is_some(),
             "MLA draft checkpoint/runtime differs from admitted immutable layout");
         let cfg = DflashConfig::mla(&native);
         let projections = Self::load_projections(programs, &cfg, representation, true, false, layout.capacity().max_batch_sequences)?;
@@ -1320,7 +1330,9 @@ impl<'a> DflashDrafter<'a> {
             let window = match window { Some(1024) => MlaDraftWindow::CausalSliding1024,
                 Some(4096) => MlaDraftWindow::Sliding4096, None => MlaDraftWindow::Full,
                 _ => anyhow::bail!("unsupported checkpoint MLA draft window") };
-            let program = MlaDraft::load(programs, program_namespace, window, layout.cache_format())?;
+            let program = if layout.complete_fp8_body() {
+                MlaDraft::load_fp8_weights(programs, program_namespace, window, layout.cache_format())?
+            } else { MlaDraft::load(programs, program_namespace, window, layout.cache_format())? };
             ensure!(program.max_context() >= layout.program().context
                 && program.splits() == layout.program().splits
                 && program.scratch_bytes() == layout.program().scratch,
@@ -1328,19 +1340,40 @@ impl<'a> DflashDrafter<'a> {
             Ok(program)
         }).collect::<Result<Vec<_>>>()?;
         let mut owners = MlaDraftStorage::allocate(library, layout.clone())?.into_owners()?;
-        let weights = super::weights::mla_weight_recipe(&native,
+        use super::weights::MlaMatrix;
+        let weights = cuteafd_loader::families::glm5::draft_physical::mla_weight_recipe_with_attention(&native,
             |parts| load.tensor_parts(parts),
             |parts, cols| load.matrix(parts, cols, representation == GlmDraftRepresentation::Fp8Only, scales, stream),
-            |name| load.absorb(name, native.mla.heads, native.mla.nope, native.mla.value, native.mla.kv_rank, stream))?;
+            |parts, cols| if layout.complete_fp8_body() {
+                load.mla_fp8_matrix(parts, cols, scales, stream).map(MlaMatrix::Fp8)
+            } else { load.concat(parts, cols).map(MlaMatrix::Bf16) },
+            |name| if layout.complete_fp8_body() {
+                let (uk, uv) = load.mla_fp8_absorb(name, native.mla.heads, native.mla.nope,
+                    native.mla.value, native.mla.kv_rank, scales, stream)?;
+                Ok((MlaMatrix::Fp8(uk), MlaMatrix::Fp8(uv)))
+            } else {
+                let (uk, uv) = load.absorb(name, native.mla.heads, native.mla.nope,
+                    native.mla.value, native.mla.kv_rank, stream)?;
+                Ok((MlaMatrix::Bf16(uk), MlaMatrix::Bf16(uv)))
+            })?;
         let mut layers = Vec::with_capacity(cfg.layers);
         for (index, (program, weight)) in programs.into_iter().zip(weights.layers).enumerate() {
+            let (qkv_a, sqkv) = weight.qkv_a.into_parts();
+            let (q_b, sqb) = weight.q_b.into_parts();
+            let (uk, suk) = weight.uk.into_parts();
+            let (uv, suv) = weight.uv.into_parts();
+            let (output, so) = weight.output.into_parts();
+            let fp8_scales = if layout.complete_fp8_body() {
+                Some([sqkv.context("MLA qkv scale missing")?, sqb.context("MLA query scale missing")?,
+                    suk.context("MLA UK scale missing")?, suv.context("MLA UV scale missing")?, so.context("MLA output scale missing")?])
+            } else { None };
             layers.push(DraftLayer {
                 input_norm: weight.input_norm, post_norm: weight.post_norm,
                 body: LayerBody::Dflash { attn_conv: weight.attn_conv, attn_base: weight.attn_base,
                     mlp_conv: weight.mlp_conv, mlp_base: weight.mlp_base },
-                attention: DraftAttention::Mla(MlaAttention { program, qkv_a: weight.qkv_a,
-                    q_norm: weight.q_norm, kv_norm: weight.kv_norm, q_b: weight.q_b,
-                    uk: weight.uk, uv: weight.uv, output: weight.output,
+                attention: DraftAttention::Mla(MlaAttention { program, qkv_a,
+                    q_norm: weight.q_norm, kv_norm: weight.kv_norm, q_b,
+                    uk, uv, output, fp8_scales,
                     cache: owners.take(&format!("layer.{index}.cache"))?,
                     page_table: owners.take(&format!("layer.{index}.page_table"))?,
                 }),
@@ -1446,6 +1479,7 @@ impl<'a> DflashDrafter<'a> {
                     uk: owners.take(&format!("weight.{a}.wkv_b.weight.uk"))?,
                     uv: owners.take(&format!("weight.{a}.wkv_b.weight.uv"))?,
                     output: tensor(&mut owners, &format!("{a}.wo.weight"), &[h, heads * v])?,
+                    fp8_scales: None,
                     cache: owners.take(&format!("layer.{index}.cache"))?,
                     page_table: owners.take(&format!("layer.{index}.page_table"))?,
                 }),

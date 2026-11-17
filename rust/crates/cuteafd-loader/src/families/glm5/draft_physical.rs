@@ -320,15 +320,15 @@ fn validate_bf16_headers(snapshot: &Path, shapes: Vec<(String, Vec<usize>)>) -> 
     Ok(())
 }
 
-pub struct MlaLayerWeights<T, M> {
+pub struct MlaLayerWeights<T, M, A = T> {
     pub input_norm: T, pub post_norm: T,
     pub attn_conv: M, pub attn_base: T, pub mlp_conv: M, pub mlp_base: T,
-    pub qkv_a: T, pub q_norm: T, pub kv_norm: T, pub q_b: T,
-    pub uk: T, pub uv: T, pub output: T, pub gate_up: M, pub down: M,
+    pub qkv_a: A, pub q_norm: T, pub kv_norm: T, pub q_b: A,
+    pub uk: A, pub uv: A, pub output: A, pub gate_up: M, pub down: M,
 }
 
-pub struct MlaWeights<T, M> {
-    pub layers: Vec<MlaLayerWeights<T, M>>,
+pub struct MlaWeights<T, M, A = T> {
+    pub layers: Vec<MlaLayerWeights<T, M, A>>,
     pub fc: M, pub hidden_norm: T, pub norm: T, pub selector: (M, T, T),
 }
 
@@ -340,6 +340,20 @@ pub fn mla_weight_recipe<T, M>(
     matrix: impl Fn(&[(&str, usize)], usize) -> Result<M>,
     absorb: impl Fn(&str) -> Result<(T, T)>,
 ) -> Result<MlaWeights<T, M>> {
+    ensure!(cfg.kind.is_dflash(), "MLA DFlash arena recipe requires DFlash2");
+    mla_weight_recipe_with_attention(cfg, &tensor, matrix,
+        |parts, columns| tensor(&parts.iter().map(|(name, rows)| (*name, vec![*rows, columns]))
+            .collect::<Vec<_>>()), absorb)
+}
+
+/// Same immutable traversal for BF16 and row-major FP8 attention operands.
+pub fn mla_weight_recipe_with_attention<T, M, A>(
+    cfg: &crate::formats::dflash::MlaDflashConfig,
+    tensor: impl Fn(&[(&str, Vec<usize>)]) -> Result<T>,
+    matrix: impl Fn(&[(&str, usize)], usize) -> Result<M>,
+    attention: impl Fn(&[(&str, usize)], usize) -> Result<A>,
+    absorb: impl Fn(&str) -> Result<(A, A)>,
+) -> Result<MlaWeights<T, M, A>> {
     ensure!(cfg.kind.is_dflash(), "MLA DFlash arena recipe requires DFlash2");
     let m = &cfg.mla;
     let h = m.hidden;
@@ -356,12 +370,12 @@ pub fn mla_weight_recipe<T, M>(
             attn_base: one(&format!("{p}.attention_conv.base_kernel"), &[2, 2, h])?,
             mlp_conv: matrix(&[(&format!("{p}.mlp_conv.kernel_projection.weight"), 4 * h / cfg.group)], h)?,
             mlp_base: one(&format!("{p}.mlp_conv.base_kernel"), &[2, 2, h])?,
-            qkv_a: tensor(&[(&format!("{a}.q_a_proj.weight"), vec![m.q_rank, h]),
-                (&format!("{a}.kv_a_proj_with_mqa.weight"), vec![m.kv_rank + m.rope, h])])?,
+            qkv_a: attention(&[(&format!("{a}.q_a_proj.weight"), m.q_rank),
+                (&format!("{a}.kv_a_proj_with_mqa.weight"), m.kv_rank + m.rope)], h)?,
             q_norm: one(&format!("{a}.q_a_layernorm.weight"), &[m.q_rank])?,
             kv_norm: one(&format!("{a}.kv_a_layernorm.weight"), &[m.kv_rank])?,
-            q_b: one(&format!("{a}.q_b_proj.weight"), &[m.heads * (m.nope + m.rope), m.q_rank])?,
-            uk, uv, output: one(&format!("{a}.o_proj.weight"), &[h, m.heads * m.value])?,
+            q_b: attention(&[(&format!("{a}.q_b_proj.weight"), m.heads * (m.nope + m.rope))], m.q_rank)?,
+            uk, uv, output: attention(&[(&format!("{a}.o_proj.weight"), h)], m.heads * m.value)?,
             gate_up: matrix(&[(&format!("{p}.mlp.gate_proj.weight"), cfg.intermediate),
                 (&format!("{p}.mlp.up_proj.weight"), cfg.intermediate)], h)?,
             down: matrix(&[(&format!("{p}.mlp.down_proj.weight"), h)], cfg.intermediate)?,
@@ -430,6 +444,15 @@ pub fn mla_complete_fp8_arena_requests(cfg: &crate::formats::dflash::MlaDflashCo
             .context("MLA complete FP8 extent overflow")?;
         if name.ends_with(".self_attn.q_a_proj.weight") || name.ends_with(".self_attn.kv_a_proj_with_mqa.weight") {
             qkv.push((name, values));
+            continue;
+        }
+        if name.ends_with(".mlp.gate_proj.weight") || name.ends_with(".mlp.up_proj.weight") {
+            if name.ends_with(".mlp.gate_proj.weight") {
+                let up = name.replace(".gate_proj.weight", ".up_proj.weight");
+                let joined = format!("{name}+{up}");
+                requests.extend([(format!("{joined}.payload"), values * 2),
+                    (format!("{joined}.scales"), values * 2 / 128 * 4)]);
+            }
             continue;
         }
         if name.ends_with(".self_attn.kv_b_proj.weight") {
