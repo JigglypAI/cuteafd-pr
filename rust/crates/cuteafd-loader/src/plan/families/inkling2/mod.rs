@@ -396,10 +396,7 @@ impl Family for Inkling2 {
         Some(TensorRole::layer(component, layer))
     }
     fn component_hint(&self, component: Component) -> Option<Hint> {
-        if component == Component::Speculator {
-            return Some(Hint { what:"Inkling bundled dSpark served qualification is pending".into(),
-                how:"Select SPECULATOR=dspark in a matching WIP build; cold/warm target-lossless and emitted-speed gates remain pending (#2320).".into() });
-        }
+        if component == Component::Speculator { return None; }
         let how = match component {
             Component::Attention => "Export the biased-sink GQA tile (per-token per-head sinks, distance-indexed additive bias, window 1024), the short-conv (static and dynamic taps), L2-clip and output-gate kernels; see #1930 measure-first notes.",
             Component::ResidualMix => "Generalize the Kimi attn_res softmax mix to hidden 4608 (#1934 S2).",
