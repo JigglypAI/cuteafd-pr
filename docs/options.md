@@ -70,7 +70,6 @@ default-off performance lever adds its row here in the same PR (AGENTS.md).
 
 | Lever | Families | Enable | Effect | Cost |
 | --- | --- | --- | --- | --- |
-| `SPECULATOR` (bundled recurrent dSpark) | Inkling | `SPECULATOR=dspark` (default `off`) | Unmeasured; served cold/warm lossless and emitted-speed qualification pending (#2320). | Drafter arena, KV and workspace consume admitted memory; native checkpoint math, exact-match target verification. FP8 draft KV may change proposals, not accepted target tokens. |
 | `GRAPH_PREWARM` | V4.1, GLM Flash | `GRAPH_PREWARM=off` (default `on`) | Skip startup graph prewarm and allow lazy request-time capture on single-GPU layouts. With donor-always, V4.1 min measured graph high-water 3.114 GB to 0.902 GB; GLM Flash min 52.4 MB to 35.7 MB (2026-11-16, RTX PRO 6000, one warmed launch/arm). Other families and cross-device layouts reject `off` (#1878). | First-use capture latency; no intended precision change. Admission reserve is unchanged: lower physical high-water alone does not expand KV; a separately qualified lower explicit reserve is needed. |
 | `GRAPH_DONOR_ALWAYS` | V4.1, V4, GLM 5.3 / ML4, GLM Flash, MiMo, Qwen4, Qwen dense, Kimi K3, Step-5, Muse, Inkling | `GRAPH_DONOR_ALWAYS=on` (default `off`) | Prefer a same-topology cold donor below the soft cap as well as above it. With prewarm off, V4.1 min C1/C16/post-C1 126.02/541.62/123.42 to 125.49/501.17/121.26 tok/s; 165,824 request-time updates/re-keys. GLM Flash min 109.41/393.98/87.17 to 109.02/397.93/87.10 tok/s; 1,270 updates/re-keys. One warmed matched launch/arm, RTX PRO 6000, no thermal slowdown, unchanged KL/top-1. | May replace a reusable cached shape and require a later update; no intended precision change. |
 | `L2_PREFETCH` | V4.1, MiMo, Qwen4 | `L2_PREFETCH=auto` or a MiB count (unset = off; GLM 5.3 and GLM Flash already default it to `auto`) | Pulls the next layer's weights into L2 while a one-lane decode step waits on its Spark exchange. V4.1 1× RTX 5090 + 4 Sparks: every C1 cell +1.7–3.9%, C4/C8 and 8K prefill unchanged (#623); GLM 5.3 weighted +4.4%, GLM Flash C1 +6–15% (2026-09-30). | None in values (outputs byte-identical); only extra L2 traffic. |
@@ -206,13 +205,17 @@ load export and native expert packages.
 
 `ATTENTION_PLACEMENT=auto` and GPU embedding/device selection are required;
 explicit `heads`, `layers`, `context` and multi-RTX serving refuse. Set
-`VISION=off` and `AUDIO=off`. `SPECULATOR=off|dspark` defaults to `off`;
+`VISION=off` and `AUDIO=off`. `SPECULATOR=off|dspark` defaults to `dspark`
+(unset/`auto` selects the bundled drafter); explicit `off` wins and passes
+`--dspark=false`. Direct serving also defaults on;
 `dspark` selects the bundled recurrent-hidden block drafter (seven proposals
 per eight-token block), with `DRAFT_KV_CACHE=fp8|bf16` (default `fp8`).
 `SPECULATOR_FP8=auto|off` preserves checkpoint-native weights; `on` refuses.
 Drafter weights join the target's required push transaction in their own
-admitted arena. Served lossless and emitted-speed qualification remain pending
-(#2320); this is not a performance or default-on claim. Inkling accepts the shared
+admitted arena. MC original EXL3 K4 on 1 RTX + 4 Sparks passes strict cold and
+warm lossless with FP8 draft KV (10/10 each, exact ids, row hashes and emitted
+bytes, complete prompt-end restores). BF16 draft-KV and emitted-speed
+measurement remain pending (#2320); no speed figure is claimed here. Inkling accepts the shared
 `CONCURRENCY`, `POOL_TOKENS=auto|N`, `MAX_CONTEXT_TOKENS`,
 `PREFIX_CACHE_ENTRIES`, `HOST_CACHE_BYTES`, KV reservation and loop-abort keys,
 plus `RTX_EXPERT_LAYERS=auto|all|N`, `PREFILL_ROWS` (a multiple of 64 up to

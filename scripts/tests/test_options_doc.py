@@ -400,10 +400,6 @@ def test_optional_levers_are_default_off_and_documented():
                 assert default == "on"
                 assert "`GRAPH_PREWARM=off`" in DOC.read_text()
                 assert 'case "$(get GRAPH_PREWARM on)"' in (ROOT / "scripts/launch/run-family.sh").read_text()
-            elif key == "SPECULATOR":
-                assert lever["families"] == ["Inkling"]
-                assert default == "family default"
-                assert "`SPECULATOR=off|dspark` defaults to `off`" in DOC.read_text()
             elif key == "KV_CACHE":
                 assert lever["families"] == ["Muse"]
                 assert default == "family default"

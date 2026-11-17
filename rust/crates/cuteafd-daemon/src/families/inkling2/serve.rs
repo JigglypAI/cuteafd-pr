@@ -14,7 +14,7 @@ pub(crate) struct ServeArgs {
     #[arg(long, value_delimiter=',')] pub peers: Vec<SocketAddr>,
     #[arg(long)] pub pool_tokens: Option<u64>,
     #[arg(long="kv-cache", default_value="fp8")] pub kv_format: cuteafd_loader::families::inkling2::InklingKvCache,
-    #[arg(long)] pub dspark:bool,
+    #[arg(long,default_value_t=true,action=clap::ArgAction::Set,num_args=0..=1,default_missing_value="true")] pub dspark:bool,
     #[arg(long,default_value="fp8")] pub draft_kv_cache:cuteafd_loader::families::qwen4::Qwen4KvCache,
     #[arg(long="max-context-tokens", value_parser=crate::shared::context::parse_tokens::<usize>)]
     pub max_context: Option<usize>,

@@ -64,11 +64,27 @@ def test_inkling_native_launcher_composes_shared_argv_and_rejects_pair(tmp_path:
     assert _flag(serve, "--core-view") == "original"
     assert (_flag(serve, "--prefill-rows"), _flag(serve, "--prefill-waves")) == ("2752", "3")
     assert _flag(serve, "--rtx-expert-layers") == "auto"
+    assert "--dspark=false" in shlex.split(serve)
     for flag in ("--split-device", "--attention-placement", "--vision", "--audio", "--dspark", "--prefill-packing"):
         assert flag not in shlex.split(serve)
     pair = _family_launch_result(tmp_path / "pair", config, "thinkingmachines/Inkling-2-Small-MXFP8",
         keys.replace("RTX_GPUS=1", "RTX_GPUS=2"), extra_args=("--wip", "inkling"), encoder_plan=PLANNED)
     assert pair.returncode == 2 and "one coordinator GPU" in pair.stderr
+
+
+@pytest.mark.parametrize("setting, enabled", [("", True), ("auto", True), ("off", False), ("dspark", True)])
+def test_inkling_bundled_drafter_defaults_on_and_honors_off(tmp_path: Path, setting: str, enabled: bool) -> None:
+    config = {"model_type": "inkling2", "text_config": {"num_hidden_layers": 48}}
+    keys = "SPARK_COUNT=6\nRTX_GPUS=1\nVISION=off\nAUDIO=off\n" + SIX
+    if setting:
+        keys += f"SPECULATOR={setting}\n"
+    result = _family_launch_result(tmp_path, config, "thinkingmachines/Inkling-2-Small-MXFP8", keys,
+        physical_gpus=(0,), extra_args=("--wip", "inkling"), encoder_plan=PLANNED)
+    serve = _line(result, "serve-inkling2 --snapshot")
+    plan = _line(result, "cuteafd plan")
+    assert ("--dspark" in shlex.split(serve)) == enabled
+    assert ("--dspark=false" in shlex.split(serve)) == (not enabled)
+    assert _flag(plan, "--speculator") == ("dspark" if enabled else "off")
 
 
 @pytest.mark.parametrize("cache", ["fp8", "bf16"])

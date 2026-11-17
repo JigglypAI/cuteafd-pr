@@ -859,7 +859,7 @@ fn resolve_speculator(args: &mut PlanArgs, snapshot: &std::path::Path, family: &
             (args.speculator != "auto").then_some(args.speculator.as_str()),cfg.get("SPECULATOR").map(String::as_str))?.value;
     }
     let default = match family {
-        "minimax_m3" => "dspark",
+        "minimax_m3" | "inkling2" => "dspark",
         "glm5" | "glm5_flash" | "muse_spark" => "dflash2",
         "qwen3_5" if serde_json::from_slice::<serde_json::Value>(&std::fs::read(snapshot.join("config.json"))?)
             .is_ok_and(|config| config.get("text_config").unwrap_or(&config)["hidden_size"] == 5120) => "dspark",
@@ -1558,7 +1558,10 @@ mod tests {
         let mut args = args(std::path::Path::new("/model"), 4, false);
         args.speculator = "auto".into();
         resolve_speculator(&mut args, std::path::Path::new("/model"), "inkling2", &Default::default()).unwrap();
-        assert_eq!(args.speculator, "off");
+        assert_eq!(args.speculator, "dspark");
+        assert_eq!(DraftOwnership::selected("inkling2", &args.speculator), DraftOwnership::BundledDspark);
+        args.speculator = "off".into();
+        resolve_speculator(&mut args, std::path::Path::new("/model"), "inkling2", &Default::default()).unwrap();
         assert_eq!(DraftOwnership::selected("inkling2", &args.speculator), DraftOwnership::None);
         args.speculator = "dspark".into();
         resolve_speculator(&mut args, std::path::Path::new("/model"), "inkling2", &Default::default()).unwrap();

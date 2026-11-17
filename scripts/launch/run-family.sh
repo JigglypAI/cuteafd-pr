@@ -1615,7 +1615,7 @@ if [[ $family == deepseek_v4 ]]; then
 fi
 speculator="$(get SPECULATOR)"
 # MiniMax uses its bundled native drafter on whole, Layers and Heads placements.
-if [[ "$family" == minimax_m3 && ( -z "$speculator" || "$speculator" == auto ) ]]; then speculator=dspark; fi
+if [[ ( "$family" == minimax_m3 || "$family" == inkling2 ) && ( -z "$speculator" || "$speculator" == auto ) ]]; then speculator=dspark; fi
 # Qwen resolves auto only after expert admission, not from configured inventory.
 if [[ "$family" == qwen4 && ( -z "$speculator" || "$speculator" == auto ) ]]; then speculator=auto; fi
 default_drafter=""
@@ -2023,6 +2023,8 @@ if [[ $family == inkling2 ]]; then
   esac
   if [[ "$speculator" == dspark ]]; then
     family_args+=(--dspark --draft-kv-cache "$inkling_draft_kv")
+  else
+    family_args+=(--dspark=false)
   fi
 fi
 if [[ $family == minimax_m3 ]]; then
