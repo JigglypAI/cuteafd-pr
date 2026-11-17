@@ -180,7 +180,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
             // Speculative verify graphs replay at each exact width up to the drafter's block.
             let verify = opts.kimi_drafter_snapshot.as_ref().map(|snapshot| -> anyhow::Result<usize> {
                 let raw: serde_json::Value = serde_json::from_slice(&std::fs::read(snapshot.join("config.json"))?)?;
-                if raw["speculators_model_type"] == "dspark" {
+                if crate::families::glm5::draft_representation::is_dspark(&raw) {
                     Ok(crate::formats::block_dspark::BlockDsparkConfig::from_json(&raw)?.block + 1)
                 } else { Ok(crate::formats::dflash::MlaDflashConfig::from_json(&raw)?.block) }
             }).transpose()?.unwrap_or(0);
@@ -296,16 +296,18 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
                 "block dSpark uses physical GQA head splits, not TP2_DFLASH");
             let representation=if opts.kimi_draft_fp8 { GlmDraftRepresentation::Fp8Only }
                 else { GlmDraftRepresentation::Bf16Only };
-            if gpus==2 {
+            if gpus==2 && opts.draft_context_window==0 && crate::formats::block_dspark::BlockDsparkConfig::from_json(&raw)?.window.is_some() {
                 let rank=|rank|crate::formats::block_dspark::BlockDsparkRuntimeLayout::for_rank_representation(snapshot,
                     slots,slots.min(8),opts.physical_sms.unwrap_or(188) as usize,&format!("kimi/draft/{rank}"),
                     opts.draft_kv_cache,rank,2,head_rank,representation);
                 DraftLayout::BlockTp2 { ranks:Box::new([rank(0)?,rank(1)?]),lead:head_rank }
             } else {
-                DraftLayout::Block(crate::formats::block_dspark::BlockDsparkRuntimeLayout::with_representation(snapshot,
-                    slots,slots.min(8),opts.physical_sms.unwrap_or(188) as usize,&format!("kimi/draft/{head_rank}"),opts.draft_kv_cache,representation)?)
+                DraftLayout::Block(crate::formats::block_dspark::BlockDsparkRuntimeLayout::with_context(snapshot,
+                    slots,slots.min(8),opts.physical_sms.unwrap_or(188) as usize,&format!("kimi/draft/{head_rank}"),opts.draft_kv_cache,representation,
+                    usize::try_from(context)?,slots.checked_mul(usize::try_from(context)?).context("block draft pool overflow")?,opts.draft_context_window)?)
             }
         } else {
+            anyhow::ensure!(opts.draft_context_window==0,"DRAFT_CONTEXT_WINDOW requires a Kimi block DSpark drafter");
             let draft = MlaDflashConfig::from_json(&raw)?;
             anyhow::ensure!(!opts.tp2_dflash || gpus == 2,
                 "Kimi TP2 DFlash requires two physical coordinator GPUs");

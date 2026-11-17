@@ -94,7 +94,8 @@ class Drafter:
                  target: Path | None = None):
         self.cfg = json.loads((draft / "config.json").read_text())
         speculators = self.cfg.get("speculators_model_type") == "dspark"
-        if not speculators and "DSparkDraftModel" not in self.cfg.get("architectures", []):
+        if not speculators and not any(a in ("DSparkDraftModel", "Qwen3DSparkModel")
+                                       for a in self.cfg.get("architectures", [])):
             raise ValueError("not a dSpark checkpoint")
         t = self.cfg["transformer_layer_config"] if speculators else self.cfg
         d = self.cfg if speculators else self.cfg["dflash_config"]

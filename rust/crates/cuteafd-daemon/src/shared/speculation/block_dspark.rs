@@ -213,7 +213,7 @@ pub(crate) fn is_dspark(snapshot: &Path) -> Result<bool> {
         .with_context(|| format!("reading drafter {}", path.display()))?)
         .with_context(|| format!("parsing drafter {}", path.display()))?;
     Ok(config["speculators_model_type"] == "dspark" || config["architectures"].as_array()
-        .is_some_and(|a| a.iter().any(|v| v == "DSparkDraftModel")))
+        .is_some_and(|a| a.iter().any(|v| v == "DSparkDraftModel" || v == "Qwen3DSparkModel")))
 }
 
 /// The drafter geometry the kernels are written for, read from `config.json`.
@@ -251,8 +251,7 @@ impl DsparkConfig {
         let rope_theta = match cfg.rope {
             DsparkRope::Default { rope_theta } | DsparkRope::Yarn { rope_theta, .. } => rope_theta,
         };
-        let rotary = if cfg.head_dim == 64 {
-            ensure!(matches!(cfg.rope, DsparkRope::Default { .. }), "64-wide dSpark requires default RoPE");
+        let rotary = if cfg.head_dim == 64 && matches!(cfg.rope, DsparkRope::Default { .. }) {
             None
         } else { Some(cfg.rope.plan(cfg.backbone.rotary_dim)?) };
         Ok(Self { backbone: cfg.backbone, dialect: cfg.dialect, hidden: cfg.hidden, intermediate: cfg.intermediate, layers: cfg.layers,
@@ -654,7 +653,7 @@ impl<'a> DsparkDrafter<'a> {
         let mut load=|rank,projection|Self::load_rank_with(library,programs,projection,snapshot,HashMap::new(),
             exchange.stream(rank),slots,sequences,vec![0;cfg.hidden*2],representation,
             fp8_linear::Fp8Scales::Amax,fp8_linear::Fp8Rows::W8a16,window,slots*window,kv,None,
-            rank,2,lead,&mut allocate);
+            rank,2,lead,0,&mut allocate);
         let mut body=load(lead,target_projection)?;
         let peer_device=device::Device { library,id:exchange.device(1-lead) };
         let peer=peer_device.own(||load(1-lead,super::dflash::TargetProjection::Native).map(Box::new))?;
@@ -734,9 +733,20 @@ impl<'a> DsparkDrafter<'a> {
         fp8_rows: fp8_linear::Fp8Rows, context_capacity: usize, target_tokens: usize,
         kv_cache: cuteafd_loader::families::qwen4::Qwen4KvCache,
         mut allocate: impl FnMut(i32, &str, usize) -> Result<crate::shared::memory::device::Allocation<'a>>) -> Result<Self> {
-        Self::load_backbone_with(library, programs, target_projection, snapshot, tensors, stream,
-            slots, max_sequences, mask_row, representation, scales, fp8_rows, context_capacity,
-            target_tokens, kv_cache, None, &mut allocate)
+        Self::load_window_paged_with(library,programs,target_projection,snapshot,tensors,stream,slots,
+            max_sequences,mask_row,representation,scales,fp8_rows,context_capacity,target_tokens,kv_cache,0,&mut allocate)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn load_window_paged_with(library: &'a NativeLibrary, programs: &'a cuteafd_ffi::programs::Programs<'a>,
+        target_projection: super::dflash::TargetProjection, snapshot: &Path, tensors: HashMap<String, Vec<u8>>,
+        stream: *mut c_void, slots: usize, max_sequences: usize, mask_row: Vec<u8>,
+        representation: GlmDraftRepresentation, scales: fp8_linear::Fp8Scales, fp8_rows: fp8_linear::Fp8Rows,
+        context_capacity: usize, target_tokens: usize, kv_cache: cuteafd_loader::families::qwen4::Qwen4KvCache,
+        context_window: usize, mut allocate: impl FnMut(i32,&str,usize)->Result<device::Allocation<'a>>) -> Result<Self> {
+        Self::load_rank_with(library,programs,target_projection,snapshot,tensors,stream,slots,max_sequences,
+            mask_row,representation,scales,fp8_rows,context_capacity,target_tokens,kv_cache,None,
+            0,1,0,context_window,&mut allocate)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -760,7 +770,7 @@ impl<'a> DsparkDrafter<'a> {
         allocate: &mut WeightAllocator<'a, '_>) -> Result<Self> {
         Self::load_rank_with(library,programs,target_projection,snapshot,tensors,stream,slots,max_sequences,
             mask_row,representation,scales,fp8_rows,context_capacity,target_tokens,kv_cache,native_rope,
-            0,1,0,allocate)
+            0,1,0,0,allocate)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -769,9 +779,10 @@ impl<'a> DsparkDrafter<'a> {
         stream:*mut c_void,slots:usize,max_sequences:usize,mask_row:Vec<u8>,representation:GlmDraftRepresentation,
         scales:fp8_linear::Fp8Scales,fp8_rows:fp8_linear::Fp8Rows,context_capacity:usize,target_tokens:usize,
         kv_cache:cuteafd_loader::families::qwen4::Qwen4KvCache,native_rope:Option<(CuteafdDeviceBuffer,usize)>,
-        physical_rank:usize,physical_ranks:usize,lead:usize,allocate:&mut WeightAllocator<'a,'_>)->Result<Self> {
+        physical_rank:usize,physical_ranks:usize,lead:usize,context_window:usize,allocate:&mut WeightAllocator<'a,'_>)->Result<Self> {
         let _memory_scope = cuteafd_ffi::memory_ledger::scope("drafter");
         let mut cfg = DsparkConfig::read(snapshot)?;
+        if context_window > 0 { cfg.window=Some(context_window); }
         ensure!(matches!(physical_ranks,1|2) && physical_rank<physical_ranks && lead<physical_ranks,
             "invalid block physical rank inventory");
         if physical_ranks==2 {
@@ -797,7 +808,12 @@ impl<'a> DsparkDrafter<'a> {
         ensure!(slots.checked_mul(context_capacity).is_some_and(|rows| rows <= i32::MAX as usize),
             "dSpark context capacity exceeds signed32 native slots");
         ensure!(cfg.hidden.checked_mul(2) == Some(mask_row.len()), "dSpark mask row shape");
-        let config = serde_json::from_slice(&std::fs::read(snapshot.join("config.json"))?)?;
+        let mut config:serde_json::Value = serde_json::from_slice(&std::fs::read(snapshot.join("config.json"))?)?;
+        if context_window > 0 {
+            let c = if config["speculators_model_type"] == "dspark" { &mut config["transformer_layer_config"] } else { &mut config };
+            c["sliding_window"]=serde_json::json!(context_window);
+            c["layer_types"]=serde_json::json!(vec!["sliding_attention";cfg.layers]);
+        }
         let cache_layout = cuteafd_loader::formats::block_dspark::BlockDsparkConfig::from_json(&config)?
             .paged_cache_layout(slots, context_capacity, target_tokens, kv_cache)?;
         let cache_rows = cache_layout.layer_bytes[0] / cache_layout.record_bytes;
@@ -931,6 +947,7 @@ impl<'a> DsparkDrafter<'a> {
             ("context_kv",&self.context_kv),("context_positions",&self.context_positions),("context_slots",&self.context_slots)] {
             owner.inventory(&mut inventory,name)?;
         }
+        if let Some(context) = &self.paged { context.tables.inventory(&mut inventory,"context.page-table")?; }
         if let Some(owner) = &self.fp8_workspace { owner.inventory(&mut inventory,"workspace.fp8-linear")?; }
         if let Some(workspace) = self.workspace.borrow().as_ref() {
             for (name,owner) in [("h",&workspace.h),("n",&workspace.n),("qkv",&workspace.qkv),

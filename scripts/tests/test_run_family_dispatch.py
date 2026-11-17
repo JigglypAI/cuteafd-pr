@@ -5890,3 +5890,34 @@ def test_k31_qualified_default_tracks_physical_tp_and_kv(tmp_path, layout, enabl
     if enabled:
         assert "--draft-kv-cache fp8" in launch
         assert "--draft-fp8 true" in launch
+
+
+@pytest.mark.parametrize("window", ["0", "2048"])
+def test_kimi_shared_context_window_reaches_serving_and_planning(tmp_path, window):
+    config = {"model_type":"kimi_k31","text_config":{"model_type":"kimi_linear", "num_hidden_layers":93,
+        "first_k_dense_replace":1,"moe_layer_freq":1}}
+    result = _family_launch_result(tmp_path, config, "test/kimi",
+        f"SPECULATOR=dspark\nSPECULATOR_MODEL_ID=test/draft\nDRAFT_CONTEXT_WINDOW={window}\nVISION=off\nAUDIO=off\n")
+    assert result.returncode == 0, result.stderr
+    serve = next(line for line in result.stderr.splitlines() if "cuteafd serve-kimi" in line)
+    assert ("--draft-context-window" in serve) == (window != "0")
+    if window != "0":
+        assert f"--draft-context-window {window}" in serve
+    assert "CUTEAFD_DRAFT_CONTEXT_WINDOW" not in serve
+
+
+@pytest.mark.parametrize("window", ["-1", "1.5", "native"])
+def test_kimi_context_window_refuses_invalid_tokens(tmp_path, window):
+    config = {"model_type":"kimi_k31","text_config":{"model_type":"kimi_linear", "num_hidden_layers":93,
+        "first_k_dense_replace":1,"moe_layer_freq":1}}
+    result = _family_launch_result(tmp_path, config, "test/kimi",
+        f"SPECULATOR=dspark\nSPECULATOR_MODEL_ID=test/draft\nDRAFT_CONTEXT_WINDOW={window}\nVISION=off\nAUDIO=off\n")
+    assert result.returncode == 2
+    assert "DRAFT_CONTEXT_WINDOW must be a nonnegative integer" in result.stderr
+
+
+def test_other_family_refuses_unimplemented_context_window(tmp_path):
+    result = _family_launch_result(tmp_path, {"model_type":"glm_moe_dsa", "num_hidden_layers":4,
+        "first_k_dense_replace":3}, "test/glm", "DRAFT_CONTEXT_WINDOW=2048\n")
+    assert result.returncode == 2
+    assert "unused configuration key: DRAFT_CONTEXT_WINDOW" in result.stderr

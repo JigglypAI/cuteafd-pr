@@ -90,6 +90,8 @@ impl NativeDsparkLayout {
 pub struct BlockDsparkRuntimeLayout {
     pub representation: crate::families::glm5::draft_representation::GlmDraftRepresentation,
     pub config: BlockDsparkConfig,
+    pub context_capacity: usize,
+    pub target_tokens: usize,
     pub kv_cache: crate::families::qwen4::Qwen4KvCache,
     pub weight_requests: Vec<(String, usize)>,
     pub capacity: crate::families::glm5::draft_representation::GlmDraftCapacity,
@@ -116,17 +118,26 @@ impl BlockDsparkRuntimeLayout {
     pub fn with_representation(snapshot: &Path, slots: usize, sequences: usize, sms: usize, arena: &str,
         kv_cache: crate::families::qwen4::Qwen4KvCache,
         representation: crate::families::glm5::draft_representation::GlmDraftRepresentation) -> anyhow::Result<Self> {
+        let context = BlockDsparkConfig::read(snapshot)?.window
+            .ok_or_else(|| anyhow::anyhow!("full-context block draft requires explicit admission"))?;
+        Self::with_context(snapshot,slots,sequences,sms,arena,kv_cache,representation,context,
+            slots.checked_mul(context).ok_or_else(||anyhow::anyhow!("block capacity overflow"))?,0)
+    }
+
+    pub fn with_context(snapshot: &Path, slots: usize, sequences: usize, sms: usize, arena: &str,
+        kv_cache: crate::families::qwen4::Qwen4KvCache,
+        representation: crate::families::glm5::draft_representation::GlmDraftRepresentation,
+        context: usize, target_tokens: usize, context_window: usize) -> anyhow::Result<Self> {
         use anyhow::{ensure, Context};
         use crate::families::glm5::draft_representation::GlmDraftCapacity;
-        let config = BlockDsparkConfig::read(snapshot)?;
+        let config = BlockDsparkConfig::read(snapshot)?.with_context_window(context_window)?;
         ensure!(config.dialect == DsparkDialect::Qwen3 && config.backbone.is_qwen3(config.head_dim)
             && matches!(config.head_dim, 64 | 128) && matches!(config.rank, 256 | 512)
             && supports_sequences(sequences) && sequences <= slots && sms > 0,
             "unsupported shared Qwen3 block drafter arithmetic/capacity");
         let capacity = GlmDraftCapacity::new(slots, sequences, config.block)?;
-        let window = config.window.context("block runtime layout requires checkpoint sliding window")?;
-        let cache = config.paged_cache_layout(slots, window, slots.checked_mul(window)
-            .context("block ring capacity overflow")?, kv_cache)?;
+        let window = config.window.unwrap_or(context);
+        let cache = config.paged_cache_layout(slots, window, target_tokens, kv_cache)?;
         let weight_requests = block_dspark_arena_requests(snapshot, representation)?;
         let weights = crate::serving_capacity::WeightArenaLayout::new(arena, weight_requests.clone())?;
         let mul = |values: &[usize]| values.iter().try_fold(1usize, |n, value| n.checked_mul(*value))
@@ -143,6 +154,9 @@ impl BlockDsparkRuntimeLayout {
             for plane in ["k_ring", "v_ring"] {
                 push(format!("layer.{layer}.{plane}"), cache.layer_bytes[layer] / 2);
             }
+        }
+        if config.window.is_none() {
+            push("context.page-table".into(),usize::try_from(cache.page_table_bytes)?);
         }
         for (name,width,bytes) in [("taps",mul(&[config.taps.len(),h])?,2), ("fused",h,2),
             ("fused_norm",h,2), ("context_kv",mul(&[2,kv])?,2),
@@ -163,9 +177,25 @@ impl BlockDsparkRuntimeLayout {
             sequences as u64, config.kv_heads as u64,
             mul(&[config.heads / config.kv_heads, config.block])?.div_ceil(32) as u64,
             add(&[window, config.block])? as u64, config.head_dim as u64, sms as u64)?)?);
-        let mut layout = Self { representation, config, kv_cache, weight_requests, capacity, weights, buffers,
+        let mut layout = Self { representation, config, context_capacity:window, target_tokens, kv_cache, weight_requests, capacity, weights, buffers,
             host_landing:mul(&[rows,8])?, reduction_bytes:0,reduction_peer:false,exchange_buffers:Vec::new() };
         layout.set_fp8_scratch(sms)?;
+        Ok(layout)
+    }
+
+    pub fn with_pool_tokens(&self, tokens: usize) -> anyhow::Result<Self> {
+        use anyhow::Context;
+        let mut layout = self.clone();
+        if self.config.window.is_some() { return Ok(layout); }
+        let cache = self.config.paged_cache_layout(self.capacity.context_slots,self.context_capacity,tokens,self.kv_cache)?;
+        for (name,bytes) in &mut layout.buffers {
+            if name.ends_with(".k_ring") || name.ends_with(".v_ring") {
+                let layer:usize = name.strip_prefix("layer.").and_then(|n| n.split('.').next())
+                    .context("invalid block layer owner")?.parse()?;
+                *bytes = crate::serving_capacity::WeightArenaLayout::allocation_bytes(cache.layer_bytes[layer]/2);
+            }
+        }
+        layout.target_tokens=tokens;
         Ok(layout)
     }
 
@@ -257,7 +287,7 @@ impl BlockDsparkRuntimeLayout {
 
     pub fn window_mark_bytes(&self) -> anyhow::Result<usize> {
         use anyhow::Context;
-        let window = self.config.window.context("block runtime window missing")?;
+        let Some(window) = self.config.window else { return Ok(0); };
         [self.config.layers,2,window,self.kv_cache.plane_record_bytes(self.config.kv_heads,self.config.head_dim)]
             .into_iter().try_fold(1usize, |n,v| n.checked_mul(v)).context("block snapshot extent overflow")?
             .checked_add(16).and_then(|n| n.checked_add(255)).map(|n| n / 256 * 256)
@@ -548,6 +578,18 @@ struct Layers {
 }
 
 impl BlockDsparkConfig {
+    /// Zero preserves native attention; positive values explicitly bound draft
+    /// context without mutating the checkpoint or changing target tap sites.
+    pub fn with_context_window(mut self, window: usize) -> Result<Self, DsparkConfigError> {
+        if window > 0 {
+            if window.checked_add(self.block).is_none_or(|n| n > i32::MAX as usize) {
+                return Err(DsparkConfigError::Unsupported("draft context window exceeds native indexing".into()));
+            }
+            self.window=Some(window);
+        }
+        Ok(self)
+    }
+
     pub fn tap_sites(&self) -> Vec<cuteafd_core::TapSite> {
         self.taps.iter().copied().map(cuteafd_core::TapSite::LayerExit).collect()
     }
@@ -623,7 +665,7 @@ impl BlockDsparkConfig {
         let specforge = !speculators
             && raw["architectures"]
                 .as_array()
-                .is_some_and(|a| a.iter().any(|v| v == "DSparkDraftModel"));
+                .is_some_and(|a| a.iter().any(|v| v == "DSparkDraftModel" || v == "Qwen3DSparkModel"));
         if !speculators && !specforge {
             return Err(Unsupported(
                 "expected DSparkDraftModel or speculators_model_type=dspark".into(),
@@ -982,6 +1024,70 @@ mod tests {
     }
 
     use serde_json::json;
+
+    fn lithos() -> Value {
+        serde_json::from_str(include_str!("../families/kimi_k3/fixtures/lithos-dspark-config.json")).unwrap()
+    }
+
+    #[test]
+    fn lithos_native_config_taps_and_yarn64_are_checkpoint_driven() -> anyhow::Result<()> {
+        let cfg=BlockDsparkConfig::from_json(&lithos())?;
+        assert_eq!((cfg.hidden,cfg.intermediate,cfg.layers,cfg.heads,cfg.kv_heads,cfg.head_dim),
+            (7168,14336,5,64,16,64));
+        assert_eq!((cfg.block,cfg.rank,cfg.mask_token,cfg.vocab),(5,256,163824,163840));
+        assert_eq!(cfg.taps,[7,23,67,83,91]);
+        assert_eq!(cfg.tap_sites(),cfg.taps.iter().copied().map(cuteafd_core::TapSite::LayerExit).collect::<Vec<_>>());
+        assert_eq!(cfg.window,None);
+        let rope=cfg.rope.plan(64)?;
+        assert_eq!(rope.inv_freq.len(),32);
+        assert!((rope.attention_factor-(1.0+0.1*16f32.ln())).abs()<1e-6);
+        assert_eq!(cfg.clone().with_context_window(0)?,cfg);
+        assert_eq!(cfg.clone().with_context_window(2048)?.window,Some(2048));
+        assert!(cfg.with_context_window(usize::MAX).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn lithos_full_pool_and_window_owners_charge_once_in_both_formats() -> anyhow::Result<()> {
+        use crate::families::{glm5::draft_representation::GlmDraftRepresentation,qwen4::Qwen4KvCache};
+        use crate::plan::testing::{t,write_safetensors};
+        let root=tempfile::tempdir()?;
+        let raw=lithos();
+        std::fs::write(root.path().join("config.json"),serde_json::to_vec(&raw)?)?;
+        let cfg=BlockDsparkConfig::from_json(&raw)?;
+        let tensors=std::cell::RefCell::new(Vec::new());
+        block_dspark_weight_recipe(&cfg,|name,shape| {
+            tensors.borrow_mut().push(t(name,"BF16",shape));Ok::<_,anyhow::Error>(())
+        },|parts,cols| { for (name,rows) in parts { tensors.borrow_mut().push(t(*name,"BF16",&[*rows,cols])); } Ok(()) })?;
+        write_safetensors(&root.path().join("model.safetensors"),&tensors.into_inner());
+        for representation in [GlmDraftRepresentation::Bf16Only,GlmDraftRepresentation::Fp8Only] {
+            for (kv,per_token) in [(Qwen4KvCache::Bf16,20480),(Qwen4KvCache::Fp8,10880)] {
+                let full=BlockDsparkRuntimeLayout::with_context(root.path(),16,8,188,"kimi/draft/1",
+                    kv,representation,8192,1<<21,0)?;
+                assert_eq!(full.window_mark_bytes()?,0);
+                assert!(full.weight_requests.iter().any(|(name,_)|name=="inv_freq"));
+                let rings=|l:&BlockDsparkRuntimeLayout|l.buffers.iter().filter(|(name,_)|
+                    name.ends_with(".k_ring")||name.ends_with(".v_ring")).map(|(_,n)|n).sum::<usize>();
+                assert_eq!(rings(&full),per_token*(1<<21));
+                let small=full.with_pool_tokens(64)?;
+                assert_eq!(rings(&small),per_token*64);
+                assert_eq!(small.weights,full.weights);
+                assert_eq!(small.capacity,full.capacity);
+                let facts=crate::placement::families::kimi::draft_layout_facts(
+                    &crate::families::kimi_k3::draft::DraftLayout::Block(full.clone()),64,(1<<21)/64,1)?;
+                assert_eq!(facts.arenas.len(),1);
+                assert_eq!(facts.owners.iter().map(|o|o.bytes_per_page).sum::<u64>(),(per_token*64) as u64);
+                assert!(facts.owners.iter().all(|o|o.weights_at_first==0&&o.weights_per_page==0));
+                let window=BlockDsparkRuntimeLayout::with_context(root.path(),16,8,188,"kimi/draft/1",
+                    kv,representation,8192,1<<21,2048)?;
+                assert_eq!(rings(&window),16*2048*per_token);
+                assert_eq!(window.with_pool_tokens(64)?,window);
+                assert!(window.window_mark_bytes()?>2048*per_token);
+                assert!(!window.buffers.iter().any(|(name,_)|name=="context.page-table"));
+            }
+        }
+        Ok(())
+    }
 
     fn qwen() -> Value {
         json!({"architectures":["DSparkDraftModel"], "hidden_size":5120, "intermediate_size":10240,
@@ -1424,7 +1530,7 @@ pub fn block_dspark_rank_arena_requests_with_representation(snapshot:&Path,rank:
         Ok(())
     })?;
     if rank==lead { requests.borrow_mut().push(("markov_norms".into(),cfg.vocab*4)); }
-    if cfg.head_dim!=64 { requests.borrow_mut().push(("inv_freq".into(),crate::serving_capacity::WeightArenaLayout::allocation_bytes(std::mem::size_of_val(cfg.rope.plan(cfg.head_dim)?.inv_freq.as_slice())))); }
+    if cfg.head_dim!=64 || !matches!(cfg.rope,DsparkRope::Default { .. }) { requests.borrow_mut().push(("inv_freq".into(),crate::serving_capacity::WeightArenaLayout::allocation_bytes(std::mem::size_of_val(cfg.rope.plan(cfg.head_dim)?.inv_freq.as_slice())))); }
     Ok(requests.into_inner())
 }
 
@@ -1523,7 +1629,7 @@ pub fn block_dspark_arena_requests(snapshot: &Path,
     })?;
     let mut requests = requests.into_inner();
     requests.push(("markov_norms".into(), cfg.vocab.checked_mul(4).context("block dSpark norms extent overflow")?));
-    if cfg.head_dim != 64 {
+    if cfg.head_dim != 64 || !matches!(cfg.rope,DsparkRope::Default { .. }) {
         let plan = cfg.rope.plan(cfg.head_dim)?;
         requests.push(("inv_freq".into(), std::mem::size_of_val(plan.inv_freq.as_slice()).max(256)));
     }

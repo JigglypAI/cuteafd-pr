@@ -120,6 +120,7 @@ fn options(args: &PlanArgs) -> Result<PlanOptions, PlanError> {
                 mimo_expert_input: args.expert_input.into(),
                 draft_sequences: args.draft_sequences,
                 draft_kv_cache: args.draft_kv_cache,
+                draft_context_window: args.draft_context_window,
                 draft_context_slots: args.draft_context_slots,
                 mimo_decode_graphs: args.mimo_decode_graphs == "on",
                 step5_decode_graphs: args.step5_decode_graphs == "on",
@@ -312,6 +313,7 @@ fn resolve_config(args: &mut PlanArgs, cfg: &std::collections::BTreeMap<String, 
     }
     configured!(attention_placement, "ATTENTION_PLACEMENT");
     configured!(concurrency, "CONCURRENCY");
+    configured!(draft_context_window, "DRAFT_CONTEXT_WINDOW");
     configured!(prefill_waves, "PREFILL_WAVES");
     if !args.explicit_settings.contains("fp8_prefill") {
         if let Some(value) = get("FP8_PREFILL") { args.fp8_prefill = value.parse().map_err(anyhow::Error::msg)?; }
@@ -1795,6 +1797,7 @@ mod tests {
             fp8_prefill: Default::default(),
             attention: Default::default(),
             draft_kv_cache: cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16,
+            draft_context_window: 0,
             expert_partial_bf16_max_rows: cuteafd_loader::families::muse_spark::replies::DEFAULT_BF16_MAX_ROWS,
             exlr8_manifest: None,
             exlr8_prefill_activations: None,

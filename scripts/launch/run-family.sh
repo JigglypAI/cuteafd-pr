@@ -1853,6 +1853,12 @@ case "$speculator" in
     [[ "$family" == mimo_v2 ]] || family_args+=(--mtp "$(get SPECULATOR_DEPTH "$mtp_depth")") ;;
 esac
 draft_model_args=${#draft_args[@]}
+draft_context_window="$(get DRAFT_CONTEXT_WINDOW 0)"
+[[ "$draft_context_window" =~ ^[0-9]+$ ]] || release_die "DRAFT_CONTEXT_WINDOW must be a nonnegative integer"
+if ((draft_context_window > 0)); then
+  [[ "$family:$speculator" == kimi_k3:dspark ]] || release_die "DRAFT_CONTEXT_WINDOW currently requires Kimi block DSpark"
+  draft_args+=(--draft-context-window "$draft_context_window")
+fi
 # One fixed-length override for every family and speculator.
 draft_length="$(get DRAFT_LENGTH)"
 if [[ -n "$draft_length" ]]; then
@@ -2403,7 +2409,7 @@ audio_encoder_hash=""
     # Subtract that explicit used-memory term from the CUDA/logical capacity.
     plan_cap="$(python3 -c 'import sys;f,t,b=map(int,sys.argv[1:]);print(max(1,b-(t-f)*2**20))' "$free_mib" "$total_mib" "$profile_cap")"
   fi
-  plan_draft_args=(--concurrency "$effective_concurrency" --mapped-scale-preload-gib "$(get MAPPED_SCALE_PRELOAD_GIB 0)")
+  plan_draft_args=(--draft-context-window "$draft_context_window" --concurrency "$effective_concurrency" --mapped-scale-preload-gib "$(get MAPPED_SCALE_PRELOAD_GIB 0)")
   if [[ ( "$family" == mimo_v2 || "$family" == kimi_k3 || "$family" == glm5_flash || "$family" == muse_spark ) && "$tp2_dflash" != auto ]]; then
     plan_draft_args+=(--tp2-dflash "$tp2_dflash_bool")
   fi
