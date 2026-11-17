@@ -1540,11 +1540,10 @@ async fn respond(running: Running) -> Response {
             }
             let failed = failure.lock().unwrap().clone();
             if let Some(message) = failed { yield Ok(message.sse_error()); return; }
-            if let Some(scope) = &request_usage {
-                if let Err(error) = scope.wait_retired().await { yield Ok(sse_error(anyhow::anyhow!(error))); return; }
-            }
             if let Some(mut usage) = usage_chunk {
-                add_speculation_usage(&mut usage, request_usage.as_ref());
+                if final_speculation_ready(request_usage.as_ref()).await {
+                    add_speculation_usage(&mut usage, request_usage.as_ref());
+                }
                 add_finish_detail(&mut usage, &finish_detail);
                 yield Ok(format!("data: {}\n\n", serde_json::to_string(&usage).unwrap()));
             }
@@ -1578,17 +1577,23 @@ async fn respond(running: Running) -> Response {
     if let Some(message) = failure.lock().unwrap().clone() {
         return message.rejection().into_response();
     }
-    if let Some(scope) = &request_usage {
-        if let Err(error) = scope.wait_retired().await {
-            return Rejection::new(StatusCode::INTERNAL_SERVER_ERROR, error).into_response();
-        }
-    }
+    let speculation_ready = final_speculation_ready(request_usage.as_ref()).await;
     let mut value = serde_json::to_value(response).expect("chat response serializes");
     add_media_usage(&mut value, image_tokens, audio_tokens);
     add_prefix_source(&mut value, &prefix_cache_source);
     add_finish_detail(&mut value, &finish_detail);
-    add_speculation_usage(&mut value, request_usage.as_ref());
+    if speculation_ready { add_speculation_usage(&mut value, request_usage.as_ref()); }
     Json(value).into_response()
+}
+
+async fn final_speculation_ready(usage: Option<&crate::usage::UsageHandle>) -> bool {
+    if let Some(scope) = usage {
+        if let Err(error) = scope.wait_retired().await {
+            tracing::warn!(request_id=scope.rid(), %error, "omitting incomplete speculation usage");
+            return false;
+        }
+    }
+    true
 }
 
 fn add_speculation_usage(response: &mut Value, usage: Option<&crate::usage::UsageHandle>) {
