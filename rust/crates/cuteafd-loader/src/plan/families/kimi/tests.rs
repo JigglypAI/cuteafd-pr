@@ -372,7 +372,7 @@ fn release_headers_classify_native_text_without_installed_artifacts() {
     assert_eq!(model.vision_mode(MediaMode::Auto), MediaMode::Auto);
     let vision_report = testing::plan(dir.path(), &PlanOptions { vision: MediaMode::Rtx(None), ..Default::default() }).unwrap();
     assert!(!vision_report.wip_launchable());
-    assert!(vision_report.hints.iter().any(|h| h.what.contains("production qualification remains pending")));
+    assert!(!vision_report.hints.iter().any(|h| h.what.contains("production qualification remains pending")));
 }
 
 #[test]

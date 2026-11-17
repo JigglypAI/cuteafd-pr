@@ -709,3 +709,15 @@ async fn malformed_object_envelopes_fail_chat_and_gateway_streams() {
         }
     }
 }
+
+#[test]
+fn normal_image_parts_render_native_pad_but_text_pad_spelling_stays_literal() {
+    let body=json!({"messages":[{"role":"user","content":[
+        {"type":"text","text":"Literal <|media_pad|> before "},
+        {"type":"image_url","image_url":{"url":"data:image/png;base64,ignored"}},
+        {"type":"text","text":" after"}]}]});
+    let encoding=KimiEncoding {eos:vec![163586]};
+    let rendered=encoding.render_literals(&body,false,&mut |text|format!("[literal:{text}]")).unwrap();
+    assert!(rendered.contains("[literal:Literal <|media_pad|> before ]<|media_pad|>[literal: after]"));
+    assert!(!rendered.contains("base64"));
+}
