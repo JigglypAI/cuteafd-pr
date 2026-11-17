@@ -150,3 +150,16 @@ impl<'a> Head<'a> {
 impl Drop for Head<'_> {
     fn drop(&mut self) { self.stream.drain_or_abort("Inkling head handle/workspace retirement"); }
 }
+
+
+#[cfg(test)]
+mod media_tests {
+    #[test]
+    fn vendor_image_rows_replace_normalized_text_without_a_second_norm() {
+        let source = include_str!("head.rs").split("#[cfg(test)]").next().unwrap();
+        let unit = source.split("pub fn embed_unit(").nth(1).unwrap().split("pub fn project(").next().unwrap();
+        assert!(unit.find("k.norm(").unwrap() < unit.find("still::inject_f32(").unwrap());
+        assert_eq!(unit.matches("k.norm(").count(),1);
+        assert!(unit.contains("owner.buffer(\"partial\")?"));
+    }
+}

@@ -279,3 +279,20 @@ fn markerless_output_stays_empty_and_warns_instead_of_silently_disappearing() {
     let log = String::from_utf8(bytes.lock().unwrap().clone()).unwrap();
     assert!(log.contains("Inkling completion contained no recognized content channels"), "{log}");
 }
+
+
+#[test]
+fn ordinary_openai_image_parts_keep_the_native_inkling_placeholder() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("tokenizer_config.json"), include_str!("fixtures/tokenizer_config.json")).unwrap();
+    std::fs::write(root.path().join("chat_template.jinja"), include_str!("fixtures/inkling2.jinja")).unwrap();
+    let encoding = super::InklingEncoding::from_snapshot(root.path()).unwrap();
+    for kind in ["image", "image_url", "input_image"] {
+        let body = serde_json::json!({"messages":[{"role":"user","content":[
+            {"type":kind,"image_url":{"url":"data:image/png;base64,AA=="}},
+            {"type":"text","text":"describe"}]}]});
+        let prompt = encoding.render(&body, &super::InklingPromptOptions::default()).unwrap();
+        assert_eq!(prompt.matches("<|unused_200054|>").count(),1,"{kind}: {prompt}");
+        assert!(prompt.contains("<|content_image|>"));
+    }
+}
