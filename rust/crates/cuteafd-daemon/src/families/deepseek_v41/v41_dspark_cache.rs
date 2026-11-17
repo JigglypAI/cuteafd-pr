@@ -188,7 +188,7 @@ impl<'a> DsparkWindow<'a> {
         Ok(value)
     }
     pub fn synchronize(&self) -> Result<()> {
-        ensure!(!self.poisoned.get(), "dSpark window requires restart after unproved drain");
+        // Poison blocks reuse, never the attempt to prove cleanup completed.
         // SAFETY: this window owns the stream and retains every queued source/destination.
         let result = unsafe { self.stream.library.cuda_stream_synchronize(self.stream.raw) };
         if let Err(error) = &result {
@@ -416,7 +416,13 @@ impl<'a> DsparkWindow<'a> {
 }
 impl Drop for DsparkWindow<'_> {
     fn drop(&mut self) {
-        crate::shared::decode_graph::fatal_drain(self.synchronize(), "dSpark window");
+        if self.stream.library.is_quarantined_after_failed_drain() { return; }
+        if let Err(error) = self.synchronize() {
+            // Health already requires restart. Retain buffers, pinned staging, streams and
+            // module instead of aborting or freeing pointers an unproved copy may still use.
+            tracing::error!(%error, "dSpark window cleanup did not drain; retaining its storage");
+            self.stream.library.quarantine_module_after_failed_drain();
+        }
     }
 }
 

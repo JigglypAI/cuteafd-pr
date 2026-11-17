@@ -104,6 +104,51 @@ impl<'a> DsparkWindow<'a> {
 mod tests {
     use super::*;
     #[test]
+    fn poisoned_restore_cleanup_drains_or_retains_without_abort() -> Result<()> {
+        const CHILD: &str = "CUTEAFD_DSPARK_DROP_CHILD";
+        let Some(mode) = std::env::var_os(CHILD) else {
+            for mode in ["recovered", "persistent"] {
+                let status = std::process::Command::new(std::env::current_exe()?)
+                    .args(["--exact", "families::deepseek_v41::v41_dspark_cache::prefix::tests::poisoned_restore_cleanup_drains_or_retains_without_abort", "--nocapture"])
+                    .env(CHILD, mode).status()?;
+                ensure!(status.success(), "{mode} poisoned-window cleanup failed or aborted");
+            }
+            return Ok(());
+        };
+        let persistent = mode == "persistent";
+        let fixture = cuteafd_ffi::native_library_lifetime_fixture::Fixture::build_for_tests()?;
+        let lib = fixture.load()?;
+        fixture.immediate_copies(&lib)?;
+        fixture.configure_memory(&lib, 0, 1 << 30)?;
+        let (free_before, _) = lib.cuda_memory_info()?;
+        let mut window = DsparkWindow::new(&lib, 1, 8, usize::MAX)?;
+        let lease = window.begin_request(0, 1)?;
+        let saved = DeviceAllocation::new(&lib, V41DsparkCache::SLOT_BYTES, crate::shared::memory::TEST)?;
+        fixture.configure_pack(&lib, 0, 1)?;
+        assert!(window.restore_ring(lease, 63, saved.buffer).is_err());
+        if !persistent {
+            fixture.configure_pack(&lib, 0, 0)?;
+            window.synchronize()?;
+            assert!(window.begin_request(0, 2).is_err(), "later drain never clears poison");
+        }
+        let (free_live, _) = lib.cuda_memory_info()?;
+        drop(window);
+        let (free_dropped, _) = lib.cuda_memory_info()?;
+        if persistent {
+            assert_eq!(free_dropped, free_live, "unproved ring copies retain all buffers");
+            assert!(lib.is_quarantined_after_failed_drain());
+        } else {
+            assert!(free_dropped > free_live, "proved later drain permits buffer cleanup");
+            assert!(!lib.is_quarantined_after_failed_drain());
+        }
+        drop(saved);
+        if !persistent { assert_eq!(lib.cuda_memory_info()?.0, free_before); }
+        drop(lib);
+        assert_eq!(fixture.resident()?, persistent, "only unproved copies retain the module");
+        Ok(())
+    }
+
+    #[test]
     fn retained_ring_rows_match_cold_prefill_across_wraps_and_slot_reuse() {
         for end in [1usize, 63, 64, 65, 127, 128, 129, 255, 256, 257, 4097] {
             let row = V41DsparkCache::ROW_BYTES;
