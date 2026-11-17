@@ -1781,7 +1781,6 @@ mod tests {
     }
 
     #[test]
-    fn planner_equals_runtime_qwen4()    #[test]
     fn planner_equals_runtime_qwen4() {
         let cfg = Qwen4Config::from_hf(&crate::plan::testing::qwen4_config(4)).unwrap();
         let planned = placement(&single_inputs(&cfg, Baseline::Planned { context_bytes: 0, loaded_bytes: 0 },

@@ -238,7 +238,6 @@ mod tests {
     }
 
     #[test]
-    fn capped_pro_uses    #[test]
     fn capped_pro_uses_the_same_small_card_pool_as_a_logical_simulation() {
         let planned = CoordinatorCard::planned(32 << 30, Some(188));
         let sampled = CoordinatorCard { physical_bytes: super::super::inventory::PRO_TOTAL_BYTES,

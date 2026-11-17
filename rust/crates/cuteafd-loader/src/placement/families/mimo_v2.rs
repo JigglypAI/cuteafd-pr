@@ -603,7 +603,6 @@ mod tests {
     }
 
     #[test]
-    fn zero_and_unset_pool_admit_identically()    #[test]
     fn zero_and_unset_pool_admit_identically() {
         let (cfg, spark, no_spark) = fixture(1, 256 << 10);
         let context = 256 << 10;
