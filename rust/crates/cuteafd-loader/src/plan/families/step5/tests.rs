@@ -728,7 +728,21 @@ fn card_memory_conclusions_and_request_vs_pool_extent() {
     let pinned = report_context(dir.path(), 2, 96, 6, Some(262_144), 1_048_576);
     assert!(!pinned.wip_launchable());
     assert!(pinned.hints.iter().any(|h| h.what.contains("explicit KV pool of 262144 tokens is below the compiled/max-context floor of 1048576 tokens")), "{:?}", pinned.hints);
-    for (gpus, gib, ranks) in [(1,96,6), (1,32,6), (2,96,4), (2,96,0)] {
+    // The joint solver can fit TP4 by moving 19 routed layers to the RTX pair.
+    // The KV target is not a floor: 501376 tokens still covers a 256K request.
+    let tp4 = report(dir.path(), 2, 96, 4, None);
+    assert!(tp4.wip_launchable() && tp4.native_serving_admitted, "{:?}", tp4.hints);
+    assert_eq!(tp4.onboard_layers, Some(19));
+    let memory = tp4.memory_layout.as_ref().unwrap();
+    assert_eq!(memory.pool_tokens, 501_376);
+    let sparks = memory.devices.iter().filter(|device|
+        device.kind == cuteafd_core::memory_layout::DeviceKind::Spark).collect::<Vec<_>>();
+    assert_eq!(sparks.len(), 4);
+    for device in sparks {
+        assert_eq!(device.used_bytes(), 123_761_553_312);
+        assert!(device.used_bytes() <= device.capacity_bytes);
+    }
+    for (gpus, gib, ranks) in [(1,96,6), (1,32,6), (2,96,0)] {
         let r = report(dir.path(), gpus, gib, ranks, None);
         assert!(!r.wip_launchable() && !r.native_serving_admitted, "{gpus} RTX x{gib}GiB +{ranks}: {:?}", r.hints);
         if ranks == 0 {
