@@ -172,6 +172,8 @@ mod tests {
                         Lifetime::RESIDENT, Category::Experts, "routed experts")],
                     deferred: vec![], sequential: vec![], reservations: vec![], allowances: vec![],
                     resident_weights: vec![], allocation_granularity: vec![], driver_page_tables: vec![] });
+                contract.variables.extend([Variable::Prefill(vec![PrefillShape { rows: 64, waves: 1 }]),
+                    Variable::Lanes(vec![1])]);
                 encoder.extend(&mut contract.variables, &mut contract.components, 1).unwrap();
                 let budgets = [Location::coordinator(0), location].into_iter().enumerate().map(|(i, location)|
                     Budget { id: format!("device{i}"), locations: vec![location], physical_bytes: 64 << 20,

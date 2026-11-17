@@ -1,6 +1,7 @@
 import hashlib
 import importlib.util
 import json
+import re
 import threading
 from pathlib import Path
 
@@ -144,3 +145,32 @@ def test_a_prefill_cancel_hangs_up_while_the_server_is_silent():
         assert not server_gave_up.is_set()
         assert gone.wait(2), "the server saw the hang-up"
         server.shutdown()
+
+
+def test_every_pooled_draft_family_overrides_live_binding_quarantine():
+    root = Path(__file__).resolve().parents[2]
+    families = root / "rust/crates/cuteafd-daemon/src/families"
+    pooled = set()
+    for source in families.rglob("*.rs"):
+        text = source.read_text()
+        if "fn draft_page_bytes(&self)" not in text or "PrefixFamily" not in text:
+            continue
+        # Ignore test-only fixtures: inspect the production adapter before its first test module.
+        text = re.split(r"(?m)^#\[cfg\(test\)\]\nmod ", text, maxsplit=1)[0]
+        if "fn draft_page_bytes(&self)" not in text:
+            continue
+        pooled.add(source.relative_to(families).as_posix())
+        assert "fn quarantine_draft_pages(&self" in text, source
+    assert pooled == {"glm5/prefix.rs", "kimi_k3/prefix.rs", "qwen3_5/prefix.rs"}
+    # Fixed draft rings/arrays are not DraftPagePool owners. A new owner must extend this audit.
+    owners = set()
+    daemon = root / "rust/crates/cuteafd-daemon/src"
+    for source in daemon.rglob("*.rs"):
+        text = source.read_text()
+        if re.search(r"(?m)^\s+pool: (?:cuteafd_engine::prefix::)?DraftPagePool,", text):
+            owners.add(source.relative_to(daemon).as_posix())
+    assert owners == {"shared/speculation/dflash.rs", "shared/speculation/block_dspark.rs",
+                      "families/qwen3_5/mtp.rs"}
+    trait = (root / "rust/crates/cuteafd-engine/src/prefix/family.rs").read_text()
+    default = trait.split("fn quarantine_draft_pages", 1)[1].split("\n    }", 1)[0]
+    assert "debug_assert_eq!(self.draft_page_bytes(), 0" in default

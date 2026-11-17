@@ -101,6 +101,7 @@ pub struct DraftPagePool {
     pool: RefPagePool,
     slots: Vec<Option<Sequence>>,
     generations: Vec<u64>,
+    quarantined: Vec<bool>,
     snapshots: BTreeMap<DraftSnapshot, Snapshot>,
     serial: u64,
     context: usize,
@@ -115,7 +116,7 @@ impl DraftPagePool {
         }
         let id = pool_id()?;
         Ok(Self { id, pool: RefPagePool::new(pages, DRAFT_PAGE_ROWS),
-            slots: (0..slots).map(|_| None).collect(), generations: vec![0; slots],
+            slots: (0..slots).map(|_| None).collect(), generations: vec![0; slots], quarantined: vec![false; slots],
             snapshots: BTreeMap::new(), serial: 0, context, layout })
     }
 
@@ -128,6 +129,7 @@ impl DraftPagePool {
     }
 
     fn sequence(&self, binding: DraftBinding) -> Result<&Sequence> {
+        if self.quarantined.get(binding.slot).copied().unwrap_or(false) { return Err(DraftPageError::Stale); }
         self.slots.get(binding.slot).and_then(Option::as_ref)
             .filter(|s| s.binding == binding).ok_or(DraftPageError::Stale)
     }
@@ -398,8 +400,24 @@ impl DraftPagePool {
         Ok(())
     }
 
+    /// Irreversibly retain live and provisional pages without device work or tail copies.
+    /// The occupied slot and page references survive normal cleanup until pool destruction.
+    pub fn quarantine(&mut self, binding: DraftBinding) -> Result<()> {
+        let s = self.slots.get(binding.slot).and_then(Option::as_ref).ok_or(DraftPageError::Stale)?;
+        if s.binding != binding { return Err(DraftPageError::Stale); }
+        let pages = s.pages.len();
+        self.quarantined[binding.slot] = true;
+        // Unmaterialized credit has no queued destination; retain physical references only.
+        self.slots[binding.slot].as_mut().unwrap().credit = pages;
+        Ok(())
+    }
+
     /// Cancellation, including a pending proposal. The owner must drain first.
     pub fn release(&mut self, binding: DraftBinding) -> Result<()> {
+        if self.quarantined.get(binding.slot).copied().unwrap_or(false) {
+            return if self.slots[binding.slot].as_ref().is_some_and(|s| s.binding == binding) { Ok(()) }
+                else { Err(DraftPageError::Stale) };
+        }
         self.sequence(binding)?;
         let s = self.slots[binding.slot].take().expect("validated binding");
         self.pool.release(&s.pages);
@@ -410,6 +428,23 @@ impl DraftPagePool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn quarantine_retains_pending_pages_without_copying_or_releasing() {
+        let mut pool = DraftPagePool::new(8 * 64, 2, 1024, 3).unwrap();
+        let binding = pool.bind(0, 0).unwrap();
+        let pending = pool.reserve(binding, 0, 3 * 64).unwrap();
+        let held = pool.destinations(pending).unwrap();
+        pool.quarantine(binding).unwrap();
+        pool.release(binding).unwrap();
+        assert_eq!(pool.free(), 5);
+        assert!(pool.bind(0, 0).is_err());
+        assert!(pool.commit(pending, 0).is_err());
+        let next = pool.bind(1, 0).unwrap();
+        let pending = pool.reserve(next, 0, 5 * 64).unwrap();
+        assert!(pool.destinations(pending).unwrap().iter().all(|row| !held.contains(row)));
+        assert_eq!(pool.free(), 0);
+    }
 
     #[test]
     fn reservable_counts_only_snapshot_pages_whose_release_frees_them() {

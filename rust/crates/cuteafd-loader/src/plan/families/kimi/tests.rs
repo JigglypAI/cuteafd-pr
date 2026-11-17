@@ -1050,6 +1050,7 @@ fn k31_qualified_cores_charge_index_records_once_and_unlock_serve() -> Result<()
     std::fs::write(&programs_path, manifest.to_string())?;
     options.layout.as_mut().unwrap().workspace_manifest = Some(programs_path);
     options.attention_placement = Some(crate::placement::AttentionPlacement::Layers);
+    options.vision = MediaMode::Off;
     let k6_report = testing::BudgetedPlanInput::open(k6_dir.path())?.plan(&options)?;
     assert!(k6_report.placement_supported, "{:?}", k6_report.hints);
     assert!(k6_report.memory_layout.as_ref().is_some_and(|memory| memory.pool_tokens > 0));

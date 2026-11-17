@@ -236,7 +236,7 @@ mod tests {
         assert_eq!(spec.reads.len(), 523);
         assert_eq!(spec.native.depth, 32);
         assert_eq!(spec.native.weight_bytes, 1_731_134_516);
-        let checkpoint = cuteafd_loader::plan::Checkpoint::inventory(directory.path()).unwrap();
+        let checkpoint = cuteafd_loader::plan::Checkpoint::open(directory.path()).unwrap();
         let inventory = cuteafd_loader::media::still_tower::StillTowerInventory::from_checkpoint(
             &checkpoint, MAX_IMAGE_TOKENS as usize).unwrap();
         assert_eq!(inventory.arena.bytes() as u64, spec.native.weight_bytes);

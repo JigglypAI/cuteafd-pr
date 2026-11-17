@@ -146,6 +146,28 @@ fn check_panel_config(report: &mut Report, configs: &crate::panel_config::PanelC
             }
             continue;
         }
+        if panel == "concurrency" {
+            let sustained = crate::sustained::Options::parse(config).map(|o| o.sustained).unwrap_or(false);
+            // Without the in-server panel the config is for the external sweep,
+            // which validates its own output (it fails when no sustained point ran).
+            let Some(evidence) = report.panels.iter().find(|p| &p.id == panel) else { continue };
+            let points: Vec<&Value> = evidence.passes.iter()
+                .filter_map(|pass| pass["points"].as_array()).flatten().collect();
+            let supported = if sustained {
+                // Every level the panel measured needs its sustained point and window.
+                let levels: std::collections::BTreeSet<u64> = points.iter()
+                    .filter(|p| p["phase"] != "sustained").filter_map(|p| p["c"].as_u64()).collect();
+                !levels.is_empty() && levels.iter().all(|level| points.iter().any(|p|
+                    p["phase"] == "sustained" && p["c"].as_u64() == Some(*level) && p["sustained"].is_object()))
+            } else {
+                !points.iter().any(|p| p["phase"] == "sustained")
+            };
+            if !supported {
+                report.status = RunStatus::Failed;
+                report.error = Some("server did not record requested concurrency panel-config settings".into());
+            }
+            continue;
+        }
         let options = match panel.as_str() {
             "decode_content" => crate::panels::speed::DecodeOptions::parse(config).ok(),
             _ => None,
@@ -396,6 +418,36 @@ mod tests {
         report.status = crate::report::RunStatus::Done;
         report.panels.last_mut().unwrap().passes[0]["sampling"] =
             serde_json::json!({"temperature":1.0,"top_p":0.95,"seed":42});
+        super::check_panel_config(&mut report, &configs);
+        assert_eq!(report.status, crate::report::RunStatus::Done);
+    }
+
+    #[test]
+    fn sustained_concurrency_requires_server_evidence_not_ignored_configuration() {
+        let configs = std::collections::BTreeMap::from([("concurrency".into(),
+            serde_json::json!({"sustained":true,"multiplier":4}))]);
+        let mut report = crate::sample::report(false);
+        report.panels.retain(|p| p.id != "concurrency");
+        report.panels.push(crate::report::PanelResult { id:"concurrency".into(),
+            passes:vec![serde_json::json!({"points":[{"c":1},{"c":4}]})], ..Default::default() });
+        super::check_panel_config(&mut report, &configs);
+        assert_eq!(report.status, crate::report::RunStatus::Failed);
+        report.status = crate::report::RunStatus::Done;
+        report.error = None;
+        report.panels.last_mut().unwrap().passes[0]["points"] = serde_json::json!([
+            {"c":1},{"c":4},
+            {"c":1,"phase":"sustained","sustained":{"credited_tokens":10.0,"elapsed_s":1.0}},
+            {"c":4,"phase":"sustained","sustained":{"credited_tokens":10.0,"elapsed_s":1.0}}]);
+        super::check_panel_config(&mut report, &configs);
+        assert_eq!(report.status, crate::report::RunStatus::Done);
+    }
+
+    #[test]
+    fn external_only_concurrency_config_skips_the_server_check() {
+        let configs = std::collections::BTreeMap::from([("concurrency".into(),
+            serde_json::json!({"sustained":true,"multiplier":4}))]);
+        let mut report = crate::sample::report(false);
+        report.panels.retain(|p| p.id != "concurrency");
         super::check_panel_config(&mut report, &configs);
         assert_eq!(report.status, crate::report::RunStatus::Done);
     }

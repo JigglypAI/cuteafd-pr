@@ -1418,3 +1418,41 @@ mod tests {
         assert_eq!(allocator.admit(8 * 256).unwrap().units.len(), 8);
     }
 }
+
+/// #2342: GLM Flash keeps no family discard; its restore validates the point
+/// before it maps or copies any mark, and the cold admission builds a fresh
+/// placement at len 0. KDA/MLA state is GPU-only, so this is a source contract.
+#[cfg(test)]
+mod rollback_tests {
+    fn production() -> &'static str {
+        include_str!("prefix.rs").split("\n#[cfg(test)]").next().unwrap()
+    }
+    fn body<'a>(source: &'a str, needle: &str) -> &'a str {
+        let rest = &source[source.find(needle).unwrap_or_else(|| panic!("{needle}"))..];
+        let end = rest.find("\n    }\n").map_or(rest.len(), |e| e + 6);
+        &rest[..end]
+    }
+
+    #[test]
+    fn a_failed_restore_cannot_leave_a_bound_partial_placement() {
+        let source = production();
+        for (name, need) in [("fn restore(&self, mark: Option<MarkSlot>", true),
+            ("fn restore_pages(&self, pages: &[u32]", false)] {
+            let restore = body(source, name);
+            let missing = if need {
+                restore.find("GLM 5.3 Flash restores exact snapshots with their KDA state")
+                    .expect("exact restore requires its mark")
+            } else {
+                restore.find("restore_point(placement, len)?").expect("restore_pages validates the point")
+            };
+            let map = restore.find("self.engine.map_pools(placement)?")
+                .expect("restore maps the placement's pools");
+            let write = restore.find("self.move_mark").expect("restore installs the mark");
+            assert!(missing < map && map < write, "{name}: validation must precede every write");
+        }
+        assert!(!source.contains("fn discard("), "GLM Flash relies on the fresh cold placement");
+        let engine = include_str!("engine.rs");
+        assert!(body(engine, "pub fn new(units: Vec<u32>, slot: i32)")
+            .contains("len: 0, kda_len: 0"), "the cold build starts every request at zero rows");
+    }
+}

@@ -110,6 +110,8 @@ struct Fake {
     queue: RefCell<Vec<Op>>,
     writable_lag: usize,
     fail_restore: Cell<bool>,
+    fail_discard: Cell<bool>,
+    fail_draft_admission: Cell<bool>,
     fail_copy: Cell<bool>,
     fail_drain: Cell<bool>,
     record_format: Cell<&'static str>,
@@ -134,7 +136,7 @@ impl Fake {
     fn new(pages: usize, rings: usize, slots: usize) -> Self {
         let bytes = (pages * ROWS + rings * RING + slots * WINDOW) * ROW;
         let mem = Rc::new(RefCell::new(StubCopyEngine::new(CopyModel::default(), bytes, 1 << 26)));
-        Self { mem, pages, rings, slots, writable_lag: 0, queue: RefCell::new(Vec::new()), fail_restore: Cell::new(false), fail_copy: Cell::new(false), fail_drain: Cell::new(false), record_format: Cell::new("opaque_v1"), drains: Cell::new(0),
+        Self { mem, pages, rings, slots, writable_lag: 0, queue: RefCell::new(Vec::new()), fail_restore: Cell::new(false), fail_discard: Cell::new(false), fail_draft_admission: Cell::new(false), fail_copy: Cell::new(false), fail_drain: Cell::new(false), record_format: Cell::new("opaque_v1"), drains: Cell::new(0),
             rule: ReuseRule::EXACT, markless: false, pooled: false, reserved: 0, draft: RefCell::new(None) }
     }
     /// Marks in pool pages: no arena slot exists (any use of one panics). `pages` pages hand
@@ -237,10 +239,16 @@ impl PrefixFamily for Fake {
         Fake::layout(self)
     }
     fn discard(&self, placement: &mut Placement) -> Result<(), BoxError> {
+        if self.fail_discard.get() { return Err("injected discard failure".into()); }
         if let Some(draft) = self.draft.borrow_mut().as_mut() {
             if let Some(binding) = draft.bindings[placement.ring].take() { draft.pool.release(binding)?; }
         }
         Ok(())
+    }
+    fn quarantine_draft_pages(&self, placement: &Placement) {
+        if let Some(draft) = self.draft.borrow_mut().as_mut() {
+            if let Some(binding) = draft.bindings[placement.ring] { draft.pool.quarantine(binding).unwrap(); }
+        }
     }
     fn draft_page_bytes(&self) -> usize {
         if self.draft.borrow().is_some() { DRAFT_PAGE_ROWS * ROW } else { 0 }
@@ -257,6 +265,11 @@ impl PrefixFamily for Fake {
             }
         };
         draft.pool.admit(binding, capacity, 8)?;
+        if self.fail_draft_admission.get() {
+            let (_, end) = draft.pool.frontier(binding)?;
+            draft.pool.reserve(binding, end, 64)?;
+            return Err("injected failure after provisional draft allocation".into());
+        }
         Ok(())
     }
     fn draft_pages_valid(&self, attachment: &DraftPageAttachment) -> bool {
@@ -804,6 +817,122 @@ fn a_failed_restore_is_a_miss_and_holds_nothing() {
     cache.release(&fake, &admitted.placement.pages).unwrap();
     cache.clear(&fake).unwrap();
     assert_eq!(cache.pool().free(), 32);
+}
+
+#[test]
+fn failed_restore_fallback_is_byte_identical_to_cold() {
+    for pooled in [false, true] {
+        let fake = if pooled { Fake::pooled(64, 4) } else { Fake::new(64, 4, 4) };
+        let mut cache = cache(&fake, 4, 0);
+        let prompt = seq(100, 21);
+        let (_, _, original) = serve(&mut cache, &fake, 0, &prompt[..20], &[], 24);
+        cache.release(&fake, &original.pages).unwrap();
+        fake.fail_restore.set(true);
+        let mut fallback = cache.admit(&fake, &prompt, 24, false, |pages| Placement {
+            pages, ring: 1, len: 0, ring_from: 0 }).unwrap();
+        fake.fail_restore.set(false);
+        assert_eq!((fallback.resume, cache.stats().restore_failures), (0, 1));
+        let mut cold = cache.admit_cold(&fake, prompt.len(), 24, |pages| Placement {
+            pages, ring: 2, len: 0, ring_from: 0 }).unwrap();
+        let a = fake.forward(&mut fallback.placement, &prompt).unwrap();
+        let b = fake.forward(&mut cold.placement, &prompt).unwrap();
+        assert_eq!(a.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+            b.iter().map(|x| x.to_bits()).collect::<Vec<_>>());
+        for row in 0..prompt.len() {
+            assert_eq!(fake.mem.borrow().read_device(fake.page_row(fallback.placement.pages[row / ROWS], row % ROWS)),
+                fake.mem.borrow().read_device(fake.page_row(cold.placement.pages[row / ROWS], row % ROWS)));
+        }
+        cache.release(&fake, &fallback.placement.pages).unwrap();
+        cache.release(&fake, &cold.placement.pages).unwrap();
+        cache.clear(&fake).unwrap();
+        assert_eq!(cache.pool().free(), fake.pages - fake.reserved);
+    }
+}
+
+#[test]
+fn a_failed_discard_stops_admission_and_quarantines_its_pages() {
+    let fake = Fake::new(32, 4, 4);
+    let mut cache = cache(&fake, 4, 0);
+    let (_, _, original) = serve(&mut cache, &fake, 0, &seq(100, 20), &[], 24);
+    cache.release(&fake, &original.pages).unwrap();
+    fake.fail_restore.set(true);
+    fake.fail_discard.set(true);
+    let builds = Cell::new(0);
+    let result = cache.admit(&fake, &seq(100, 21), 24, false, |pages| {
+        builds.set(builds.get() + 1);
+        Placement { pages, ring: 1, len: 0, ring_from: 0 }
+    });
+    assert!(matches!(result, Err(super::cache::PrefixError::Rollback { .. })));
+    assert_eq!(builds.get(), 1, "no cold bind over a failed rollback");
+    assert_eq!(cache.stats().quarantined, 1);
+}
+
+#[test]
+fn failed_restore_drain_stops_admission_and_keeps_pages_quarantined() {
+    let fake = Fake::new(32, 4, 4);
+    let mut cache = cache(&fake, 4, 0);
+    let (_, _, original) = serve(&mut cache, &fake, 0, &seq(100, 20), &[], 24);
+    cache.release(&fake, &original.pages).unwrap();
+    let free = cache.pool().free();
+    fake.fail_restore.set(true);
+    fake.fail_drain.set(true);
+    let builds = Cell::new(0);
+    let forked = RefCell::new(Vec::new());
+    let result = cache.admit(&fake, &seq(100, 21), 24, false, |pages| {
+        builds.set(builds.get() + 1);
+        *forked.borrow_mut() = pages.clone();
+        Placement { pages, ring: 1, len: 0, ring_from: 0 }
+    });
+    assert!(matches!(result, Err(super::cache::PrefixError::Rollback { .. })));
+    assert_eq!(builds.get(), 1);
+    assert_eq!(cache.stats().quarantined, 1);
+    assert!(cache.pool().free() < free);
+    // A later successful drain does not silently recycle an unknown binding. Restart
+    // destroys the cache; until then gauges continue to expose the lost capacity.
+    let quarantined = forked.into_inner();
+    fake.fail_drain.set(false);
+    cache.clear(&fake).unwrap();
+    assert!(cache.pool().free() < cache.pool().capacity());
+    assert_eq!(cache.stats().quarantined, 1);
+    let mut later = Vec::new();
+    while cache.pool().free() > 0 {
+        let admitted = cache.admit_cold(&fake, ROWS, ROWS, |pages| Placement {
+            pages, ring: 2, len: 0, ring_from: 0 }).unwrap();
+        assert!(admitted.placement.pages.iter().all(|page| !quarantined.contains(page)));
+        later.extend(admitted.placement.pages);
+    }
+    assert!(cache.admit_cold(&fake, ROWS, ROWS, |pages| Placement {
+        pages, ring: 2, len: 0, ring_from: 0 }).is_err());
+    cache.release(&fake, &later).unwrap();
+}
+
+#[test]
+fn fatal_rollback_holds_provisional_draft_pages_after_normal_cleanup() {
+    let fake = Fake::new(64, 3, 8);
+    *fake.draft.borrow_mut() = Some(DraftFixture {
+        pool: DraftPagePool::new(8 * 64, 3, 4096, 23).unwrap(), bindings: vec![None; 3],
+    });
+    let mut cache: PrefixCache<Shared> = PrefixCache::new_with_draft_pages(fake.layout(),
+        config(8, 8), None, fake.draft_page_bytes()).unwrap();
+    fake.fail_draft_admission.set(true);
+    fake.fail_drain.set(true);
+    assert!(matches!(cache.admit_cold(&fake, 64, 64, |pages| Placement {
+        pages, ring: 0, len: 0, ring_from: 0 }), Err(PrefixError::Rollback { .. })));
+    let held = fake.draft.borrow().as_ref().unwrap().bindings[0].unwrap();
+    fake.fail_draft_admission.set(false);
+    fake.fail_drain.set(false);
+    let mut failed = Placement { pages: Vec::new(), ring: 0, len: 0, ring_from: 0 };
+    fake.discard(&mut failed).unwrap();
+    let mut draft = fake.draft.borrow_mut();
+    let draft = draft.as_mut().unwrap();
+    assert_eq!(draft.pool.free(), 7, "normal cleanup cannot free provisional quarantined pages");
+    assert!(draft.pool.bind(0, 0).is_err(), "quarantined slot remains occupied");
+    assert!(draft.pool.frontier(held).is_err());
+    let next = draft.pool.bind(1, 0).unwrap();
+    let reservation = draft.pool.reserve(next, 0, 7 * 64).unwrap();
+    let later = draft.pool.destinations(reservation).unwrap();
+    assert!(later.iter().all(|&row| row >= 64), "first physical page never recycles");
+    assert!(draft.pool.bind(2, 0).and_then(|b| draft.pool.reserve(b, 0, 64)).is_err());
 }
 
 #[test]

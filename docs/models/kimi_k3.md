@@ -21,19 +21,29 @@ addresses): [max](../../examples/configs/kimi-k3-exl3-k6-max.config).
 
 [Max starting config](../../examples/configs/kimi-k31-exl3-k2-mc-max.config):
 MC original BF16 core, 2 RTX + 6 Sparks, automatic pool/context/onboarding,
-speculation off. `CORE_VIEW=k6-compact` and the standalone native Core-K6
+automatic native DSpark. `CORE_VIEW=k6-compact` and the standalone native Core-K6
 checkpoint are also qualified. MC revision `1455b31b` corrects compact-view
 metadata (unchanged weight shards); older `d6c4b6ce` compact views refuse (#2118).
 K8 remains Planned and whole-core FP8 refuses.
 K3 DFlash2 hidden-state compatibility remains independently unqualified.
 Inferact block dSpark integration is tracked in #2261: native BF16 weights,
 checkpoint-derived 2,048-token GQA window, rank-512 Markov confidence, shared
-policy/executor and target embedding/head. `SPECULATOR=dspark` is opt-in and
-full-model served lossless qualification is pending (#2261); the default
-stays off. TP1 runs on one RTX; TP2 splits 96 query/16 KV heads to
+policy/executor and target embedding/head. Unset/`auto` `SPECULATOR` selects DSpark
+for MC original and K6 compact on TP1 or TP2 with target FP8 KV, subject to normal
+memory admission. `SPECULATOR_FP8=auto` selects FP8 projection weights and
+`DRAFT_KV_CACHE=fp8` stores the independent drafter rings. Explicit
+`SPECULATOR=off` wins; weight and ring precision overrides remain independent.
+K8/whole-core FP8 targets, other checkpoints and target BF16 KV stay default-off.
+Qualification checks config/MC-manifest/drafter-config SHA-256 digests and view, not
+repository names, local paths or Spark count; identical renamed copies qualify. Cold and
+full-prompt warm strict sets passed 10/10 on both TP2 core views; TP1 K6 has its
+own gate. FP8 weights save 1.227 GB net per GPU after scratch. Sustained C8/C16
+results, not closed-batch drain tails, select the default arm (#2261).
+The sampled Inferact 4.16 reference uses a different draft-sampling/rejection
+method and is not directly comparable (#2312). TP1 runs on one RTX; TP2 splits 96 query/16 KV heads to
 48/8 per rank and splits FFN neurons, with private exchange flags and local
 per-rank prefix marks. FC/norms are replicated, Markov/confidence on the head.
-`DRAFT_KV_CACHE` selects FP8 (default) or BF16 independently of target KV.
+`DRAFT_KV_CACHE` selects FP8 (default) or BF16 independently of target KV and drafter weights.
 One-RTX K6 fit depends on pool/context and Spark capacity: the matched
 766,784-token pool at the measured post-reboot Spark capacity fits the
 Inferact drafter with two onboarded layers. The default 108 GiB Spark budget

@@ -363,7 +363,7 @@ def probe_selection(items, cards, arms):
         if card not in probes:
             raise ValueError('probe card must be selected')
         values = set(filter(None, values.split(',')))
-        if not values <= {'image', 'memory', 'console', 'fabric'}:
+        if not values <= {'image', 'image-prefix', 'memory', 'console', 'fabric'}:
             raise ValueError('unknown probe')
         if arm is None:
             probes[card] = values
@@ -514,8 +514,8 @@ def generate(entry, arm_name, arm, state, key_file, overrides, probes, expected_
                                  finish_timeout_s=OBSERVER_FINISH_TIMEOUT_S, required=True)
         if 'memory' in probes:
             entry['observer']['cleanup'] = sampler_cleanup(job)
-    if expected_pool is not None or 'image' in probes or ('memory' in probes and hosts):
-        entry['precheck'] = dict(argv=hook + ['--precheck', str(dest / 'job.json')], timeout_s=180, required=True)
+    if expected_pool is not None or probes & {'image', 'image-prefix'} or ('memory' in probes and hosts):
+        entry['precheck'] = dict(argv=hook + ['--precheck', str(dest / 'job.json')], timeout_s=1800 if 'image-prefix' in probes else 180, required=True)
     if 'memory' in probes and hosts and (entry.get('levels') or entry.get('prefill_lengths')):
         sample = dict(argv=hook + ['--spark-memory-boundary', str(dest / 'job.json')], timeout_s=20, required=True)
         window = entry.setdefault('window', dict(open=dict(argv=['true'], timeout_s=10, required=True)))
@@ -1075,6 +1075,159 @@ def red_square():
     return 'data:image/png;base64,' + base64.b64encode(png).decode()
 
 
+def image_prefix_probe(url, dest):
+    """Keep every attempt and its assertion, including a smoke hook's teardown retry."""
+    dest = Path(dest)
+    dest.mkdir(parents=True, exist_ok=True)
+    for number in itertools.count(1):
+        attempt = dest / f'image-prefix-attempt-{number}'
+        try:
+            attempt.mkdir()
+            break
+        except FileExistsError:
+            continue
+    try:
+        result = image_prefix_attempt(url, attempt)
+    except Exception as error:
+        save(attempt / 'verdict.json', dict(status='failed', error=str(error)))
+        raise
+    save(attempt / 'verdict.json', dict(status='pass', requests=result))
+    return result
+
+
+def image_prefix_attempt(url, dest):
+    """Divergence after the same image must restore exactly or prefill cold (#2340)."""
+    model = http(url, '/v1/models')['data'][0]['id']
+    def chunk(tag, data):
+        return struct.pack('>I', len(data)) + tag + data + struct.pack('>I', zlib.crc32(tag + data))
+    raw = (b'\x00' + b'\xff\x00\x00' * 160 + b'\x00\x00\xff' * 160) * 200
+    png = (b'\x89PNG\r\n\x1a\n' + chunk(b'IHDR', struct.pack('>2I5B', 320, 200, 8, 2, 0, 0, 0))
+           + chunk(b'IDAT', zlib.compress(raw)) + chunk(b'IEND', b''))
+    image = 'data:image/png;base64,' + base64.b64encode(png).decode()
+    nonce = str(time.time_ns())
+    results = []
+    for variant, entries, padding in [('even', 120, ''), ('odd', 120, ' x'), ('long', 4096, '')]:
+        prefix = f'Run {nonce} {variant}. Reference notes. ' + ' '.join(
+            f'Entry {i} is code {i * 7}.' for i in range(entries)) + padding
+        # Count the same image/question template, without generation, to exercise actual
+        # odd/even prompt frontiers rather than guessing from a character's tokenization.
+        desired = 1 if variant == 'odd' else 0
+        for pad in range(16):
+            candidate = prefix + ' x' * pad
+            counted = http(url, '/v1/responses/input_tokens', dict(model=model,
+                input=[dict(role='user', content=[dict(type='input_text', text=candidate),
+                    dict(type='input_image', image_url=image),
+                    dict(type='input_text', text='Is there red in the image? yes/no.')])],
+                reasoning=dict(effort='none')), timeout=120)
+            if counted.get('exact_token_count') is not True:
+                raise ValueError('image-prefix boundary probe requires exact token counts')
+            if counted['input_tokens'] % 2 == desired:
+                prefix, prompt_tokens = candidate, counted['input_tokens']
+                break
+        else:
+            raise ValueError(f'{variant}: could not select an exact prompt frontier parity')
+        save(dest / f'image-prefix-{variant}-boundary.json',
+             dict(input_tokens=prompt_tokens, parity=desired, padding=pad))
+        requests = [
+            ('text-a', False, 'What is the code of entry 3? Number only.', r'\b21\b'),
+            ('text-b', False, 'What is the code of entry 5? Number only.', r'\b35\b'),
+            ('image-a', True, 'Which colours are in the image? Brief.', r'(?is)(?=.*\bred\b)(?=.*\bblue\b)'),
+            ('image-b', True, 'Is there red in the image? yes/no.', r'\byes\b'),
+        ]
+        previous_content = previous_answer = None
+        exact_bodies = []
+        for label, with_image, question, expected in requests + [('next-turn', True, 'Is there red in the image? yes/no.', r'\byes\b')]:
+            content = [dict(type='text', text=prefix)]
+            if with_image:
+                content.append(dict(type='image_url', image_url=dict(url=image)))
+            content.append(dict(type='text', text=question))
+            messages = [dict(role='user', content=content)]
+            if label == 'next-turn':
+                messages = [dict(role='user', content=previous_content),
+                            dict(role='assistant', content=previous_answer),
+                            dict(role='user', content=question)]
+            receipt = dest / f'image-prefix-{variant}-{label}.json'
+            try:
+                response = http(url, '/v1/chat/completions', dict(model=model,
+                    messages=messages, max_tokens=32,
+                    reasoning_effort='none', temperature=0, stream=False), timeout=600)
+            except Exception as error:
+                save(receipt, dict(error=str(error)))
+                raise
+            save(receipt, response)
+            answer = response['choices'][0]['message'].get('content') or ''
+            if not re.search(expected, answer, re.I):
+                raise ValueError(f'{variant}/{label}: incorrect answer {answer!r}')
+            usage = response['usage']
+            cached = usage.get('prompt_cache_hit_tokens', 0)
+            source = usage.get('prefix_cache_source')
+            if label == 'image-b' and usage['prompt_tokens'] != prompt_tokens:
+                raise ValueError(f'{variant}: count and serving frontiers differ: {usage} != {prompt_tokens}')
+            # Exact-only families deliberately miss on divergence, while page/replay
+            # families may reuse the common prefix. Both are valid if provenance agrees.
+            if label == 'text-a' and (cached != 0 or source != 'miss'):
+                raise ValueError(f'{variant}/{label}: unique prefix was not a miss: {usage}')
+            if label != 'text-a' and (source not in {'miss', 'device', 'host'}
+                    or (cached > 0) != (source != 'miss')):
+                raise ValueError(f'{variant}/{label}: inconsistent prefix provenance: {usage}')
+            if label == 'next-turn' and not (cached >= prompt_tokens and source in {'device', 'host'}):
+                raise ValueError(f'{variant}/{label}: exact image ancestor did not hit: {usage}')
+            if label == 'image-b':
+                previous_content, previous_answer = content, answer
+            results.append(dict(variant=variant, request=label, answer=answer, cached=cached, source=source))
+            if label in {'image-b', 'next-turn'}:
+                exact_bodies.append((label, dict(model=model, messages=messages, max_tokens=32,
+                    reasoning_effort='none', temperature=0, stream=False)))
+        for label, body in exact_bodies:
+            # A next-turn prompt inherits decode-produced KV from its turn ancestor. Cold
+            # prefill may round differently; compare restore to its own captured state.
+            reference = None
+            if label == 'next-turn':
+                reference = http(url, '/v1/bench/probe', dict(body=body,
+                    spec=dict(no_speculation=True, pair_exempt=True, record_state=True,
+                              record_rows=1, top_k=5)), timeout=600)
+                save(dest / f'image-prefix-{variant}-{label}-reference.json', reference)
+            probes = []
+            for name, cold in [('cold', True), ('warm', False)] + ([('warm-repeat', False)] if reference else []):
+                reply = http(url, '/v1/bench/probe', dict(body=body,
+                    spec=dict(cold=cold, no_speculation=True, pair_exempt=True,
+                              record_state=reference is not None, record_rows=1, top_k=5)), timeout=600)
+                save(dest / f'image-prefix-{variant}-{label}-{name}.json', reply)
+                record = reply.get('probe') or {}
+                if record.get('cold') is not cold or record.get('no_speculation') is not True:
+                    raise ValueError(f'{variant}/{label}: engine did not honor exact probe switches')
+                if not record.get('generated'):
+                    raise ValueError(f'{variant}/{label}: exact probe omitted generated token IDs')
+                probes.append(record)
+            if reference is None:
+                if probes[0]['generated'] != probes[1]['generated']:
+                    raise ValueError(f'{variant}/{label}: cold/warm image output token IDs differ')
+            else:
+                image_next_turn_fidelity(reference['probe'], probes[1], probes[2])
+            if probes[1].get('cached_tokens', 0) < len(probes[0].get('prompt_ids') or []):
+                raise ValueError(f'{variant}/{label}: exact image prompt was not fully restored')
+    return results
+
+
+def image_next_turn_fidelity(reference, warm, repeat):
+    """Restore identity is relative to the capture, not a differently rounded cold prefill."""
+    def state(record, kind):
+        rows = [s for s in record.get('states', []) if s['kind'] == kind]
+        if len(rows) != 1:
+            raise ValueError(f'next-turn probe requires one {kind} state')
+        return {k: rows[0][k] for k in ('end', 'sha256', 'bytes')}
+    captured = state(reference, 'prompt')
+    for record in (warm, repeat):
+        if state(record, 'restore') != captured or state(record, 'prompt') != captured:
+            raise ValueError('next-turn restored state differs from captured state')
+        if record.get('prompt_ids') != reference.get('prompt_ids'):
+            raise ValueError('next-turn probe prompt IDs differ')
+    if any(warm.get(k) != repeat.get(k) for k in ('generated', 'rows', 'states')):
+        raise ValueError('next-turn warm repeat is not byte-identical')
+    if warm.get('generated') != reference.get('generated') or warm.get('rows') != reference.get('rows'):
+        raise ValueError('next-turn warm output differs from fixed reference')
+
+
 def ready_log(job):
     name = 'cuteafd-coordinator-' + job['entry']['set']['INSTANCE']
     result = run(['docker', 'logs', name])
@@ -1099,7 +1252,7 @@ def precheck(job):
     try:
         if 'memory' in job['probes'] and job['entry'].get('sparks'):
             spark_memory_boundary(job, 'ready')
-        text = ready_log(job) if job['expected_pool'] is not None or 'image' in job['probes'] else ''
+        text = ready_log(job) if job['expected_pool'] is not None or set(job['probes']) & {'image', 'image-prefix'} else ''
         if job['expected_pool'] is not None:
             result['pool'] = admitted_pool(text)
             if result['pool'] != job['expected_pool']:
@@ -1113,6 +1266,8 @@ def precheck(job):
             result['image'] = {'model': model, 'answer': answer}
             if not re.search(r'\bred\b', answer, re.I):
                 raise ValueError('image answer does not identify red')
+        if 'image-prefix' in job['probes']:
+            result['image-prefix'] = [image_prefix_probe(os.environ['CUTEAFD_SMOKE_URL'], dest) for _ in range(3)]
         result['status'] = 'pass'
     except Exception as error:
         result.update(status='failed', error=str(error))
@@ -2942,7 +3097,7 @@ def main():
     parser.add_argument('--arm-env', action='append', default=[], metavar='ARM:CUTEAFD_DIAG_NAME=VALUE',
                         help='arm-specific private diagnostic in the launch environment (CUTEAFD_DIAG_* only; '
                         'the launcher forwards those to the coordinator unchanged)')
-    parser.add_argument('--probe', action='append', default=[], metavar='[ARM:]CARD:image,memory,console,fabric')
+    parser.add_argument('--probe', action='append', default=[], metavar='[ARM:]CARD:image,image-prefix,memory,console,fabric')
     parser.add_argument('--spark-memory-guard', action='store_true',
                         help='with --probe memory: stop only a verified card WIP worker if host MemAvailable falls below 512 MiB')
     parser.add_argument('--panels', metavar='LIST', help='run these server panels on every card instead of its profile '
@@ -3205,7 +3360,9 @@ def main():
         raise ValueError('override/probe names must be selected cards')
     for card in cards:
         if args.matched_prompts or args.nonce_seed is not None:
-            if args.matched_prompts and 'image' in probes[card['name']]:
+            if args.matched_prompts and any(
+                    (probes[card['name']] | arm_probes.get(arm, {}).get(card['name'], set()))
+                    & {'image', 'image-prefix'} for arm in arms):
                 raise ValueError('--matched-prompts cannot precede its first benchmark request with an image probe')
         requested_panels(card.get('profile', 'smoke'), binary=panel_binary(args.binary, arms))
         card['set'].update(overrides.get(card['name'], {}))

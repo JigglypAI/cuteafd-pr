@@ -372,6 +372,8 @@ pub(crate) fn core_view_settings(view: &cuteafd_loader::plan::checkpoint::Checkp
 #[derive(Debug, Clone, Args)]
 pub(crate) struct PlanArgs {
     #[arg(skip)]
+    pub(crate) kimi_content_qualified: bool,
+    #[arg(skip)]
     pub(crate) explicit_settings: std::collections::BTreeSet<String>,
     #[cfg(test)]
     #[arg(skip)]

@@ -157,8 +157,8 @@ impl<'a> BackboneCache<'a> {
     }
 
     /// Restore a snapshot into a fresh request whose source pages hold its rows through
-    /// `saved.end`. Any partially applied failure revokes the whole request after draining; no
-    /// mixed-layer frontier is observable.
+    /// `saved.end`. On error the caller must reset or release the drained request; a partially
+    /// applied restore must never execute.
     pub fn restore_mark(&mut self, lease: CacheLease, saved: &BackboneMark, mark: CuteafdDeviceBuffer) -> Result<()> {
         self.restore_retained_phase(lease, saved, mark, CachePhase::Full)
     }
@@ -204,13 +204,8 @@ impl<'a> BackboneCache<'a> {
             }
             Ok(())
         })();
-        let drained = unsafe { self.prefix_stream.library.cuda_stream_synchronize(self.prefix_stream.raw) };
-        if let Err(error) = result.and(drained) {
-            if let Err(cleanup) = self.release(&[lease]) {
-                tracing::error!(%cleanup, "releasing failed prefix restore");
-            }
-            return Err(error);
-        }
+        let drained = self.prefix_drain();
+        result.and(drained)?;
         let request = self.requests[lease.slot]
             .as_mut()
             .expect("validated prefix admission");
@@ -218,6 +213,45 @@ impl<'a> BackboneCache<'a> {
         request.phase = phase;
         request.version = 1;
         self.committed_end(lease)?;
+        Ok(())
+    }
+
+    /// Reset failed prefix state without changing the outer lease. Component leases are
+    /// replaced so neither partial positional restores nor source page bindings survive.
+    pub fn reset_prefix(&mut self, lease: CacheLease) -> Result<()> {
+        self.prefix_drain()?;
+        let request = self.request(lease)?;
+        let (id, windows, sources) = (request.id, request.windows, request.sources);
+        let reset = (|| -> Result<_> {
+            let mut new_windows = Vec::with_capacity(windows.len());
+            let mut new_sources = Vec::with_capacity(sources.len());
+            for (state, old) in self.windows.iter_mut().zip(windows) {
+                let device = state.device;
+                new_windows.push(device.run(|| {
+                    state.release(old)?;
+                    state.begin_request(lease.slot, id)
+                })?);
+            }
+            for (state, old) in self.sources.iter_mut().zip(sources) {
+                let device = state.device;
+                new_sources.push(device.run(|| {
+                    state.release(old)?;
+                    state.begin_request(lease.slot, id)
+                })?);
+            }
+            Ok((new_windows, new_sources))
+        })();
+        let (windows, sources) = match reset {
+            Ok(reset) => reset,
+            Err(error) => { self.poison(&error); return Err(error); }
+        };
+        let request = self.requests[lease.slot].as_mut().expect("validated prefix request");
+        request.windows = windows.try_into().ok().expect("40 windows");
+        request.sources = sources.try_into().ok().expect("four sources");
+        request.end = 0;
+        request.version = 0;
+        request.phase = CachePhase::Full;
+        request.publication.clear();
         Ok(())
     }
 
@@ -235,7 +269,14 @@ impl<'a> BackboneCache<'a> {
     /// Wait for every snapshot copy and restore queued on the prefix stream (never a compute
     /// stream: prefix copies run on their own stream).
     pub fn prefix_drain(&self) -> Result<()> {
-        unsafe { self.prefix_stream.library.cuda_stream_synchronize(self.prefix_stream.raw) }
+        // SAFETY: this stream belongs to the backbone and every queued owner remains live.
+        let result = unsafe { self.prefix_stream.library.cuda_stream_synchronize(self.prefix_stream.raw) };
+        if let Err(error) = &result {
+            // Ring/carry writes may still be in flight: page quarantine alone cannot make
+            // the request slot safe to reuse. Require process restart, not a cold retry.
+            self.poison(&anyhow::anyhow!("V4.1 prefix copy drain failed; restart required: {error:#}"));
+        }
+        result
     }
 
     /// Physical pages of prefix-engine `units` (512 tokens each) in every source, row order: a
@@ -412,6 +453,98 @@ impl<'a> BackboneCache<'a> {
             "encoder continuation must cover the final decoder window");
         self.test_fork(lease, saved)?;
         self.restore_encoder_continuation(lease, &saved.meta, saved.mark.buffer, prompt_end)
+    }
+}
+
+#[cfg(test)]
+mod rollback_tests {
+    use super::*;
+    use cuteafd_ffi::native_library_lifetime_fixture::Fixture;
+
+    #[test]
+    fn poisoned_backbone_marks_idle_health_unavailable_without_an_admission() -> Result<()> {
+        const CHILD: &str = "CUTEAFD_V41_POISON_HEALTH_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe()?)
+                .args(["--exact", "families::deepseek_v41::v41_backbone_cache::prefix::rollback_tests::poisoned_backbone_marks_idle_health_unavailable_without_an_admission", "--nocapture"])
+                .env(CHILD, "1").status()?;
+            ensure!(status.success(), "isolated poison/health regression failed");
+            return Ok(());
+        }
+        let fixture = Fixture::build_for_tests()?;
+        let lib = fixture.load()?;
+        fixture.immediate_copies(&lib)?;
+        let mut bank = BackboneCache::new(&lib, 1, [4, 4, 4, 8], usize::MAX)?;
+        tokio::runtime::Runtime::new()?.block_on(async {
+            use axum::{body::Body, http::{Request, StatusCode}};
+            use tower::ServiceExt;
+            let (queue, mut receive) = tokio::sync::mpsc::channel(1);
+            let mut profile = cuteafd_api::openai::ModelProfile::default();
+            profile.engine_health = Some(cuteafd_api::openai::health::HealthWitness(
+                std::sync::Arc::new(cuteafd_transport::health::failure_reason)));
+            let app = cuteafd_api::openai::router_for_model(queue, Default::default(),
+                std::sync::Arc::new(std::sync::Mutex::new(serde_json::Value::Null)),
+                std::time::Duration::from_secs(1), cuteafd_api::openai::ConsoleHub::disabled(), profile);
+            let get = || Request::get("/health").body(Body::empty()).unwrap();
+            assert_eq!(app.clone().oneshot(get()).await?.status(), StatusCode::OK);
+            fixture.configure_pack(&lib, 0, 1)?;
+            let lease = bank.begin_request(0, 7)?;
+            assert!(bank.prefix_drain().is_err());
+            assert!(bank.poisoned.get());
+            assert!(bank.bind_sources(lease, [&[], &[], &[], &[]], [0; 4]).is_err());
+            assert!(bank.begin_request(0, 8).is_err(), "queued second request cannot reuse the slot");
+            let response = app.oneshot(get()).await?;
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            let body = axum::body::to_bytes(response.into_body(), 4096).await?;
+            assert!(String::from_utf8_lossy(&body).contains("prefix copy drain failed"));
+            fixture.configure_pack(&lib, 0, 0)?;
+            assert!(receive.try_recv().is_err(), "health must not require another admission");
+            anyhow::Ok(())
+        })?;
+        Ok(())
+    }
+
+    #[test]
+    fn failed_restore_keeps_lease_and_cold_rebinds_after_partial_layers() -> Result<()> {
+        let fixture = Fixture::build_for_tests()?;
+        let lib = fixture.load()?;
+        fixture.immediate_copies(&lib)?;
+        let mut bank = BackboneCache::new(&lib, 2, [4, 4, 4, 8], usize::MAX)?;
+        bank.use_engine_pages()?;
+        let lease = bank.begin_request(0, 7)?;
+        let fresh = bank.begin_request(1, 8)?;
+        let mark = crate::shared::memory::DeviceAllocation::new(&lib, BackboneMark::BYTES,
+            crate::shared::memory::TEST)?;
+        let mut metadata = BackboneMark { end: 1173, windows: vec![(1045, 1173); 40] };
+        // Fail only after twenty windows have already been installed.
+        metadata.windows[20] = (1174, 1173);
+        let pages = bank.unit_pages(&[0, 1, 2]);
+        let refs = [&pages[0][..], &pages[1][..], &pages[2][..], &pages[3][..]];
+        bank.bind_sources(lease, refs, bank.source_rows(1173))?;
+        assert!(bank.restore_mark(lease, &metadata, mark.buffer).is_err());
+        assert_eq!(bank.request_id(lease)?, 7, "restore errors cannot release the outer lease");
+        bank.reset_prefix(lease)?;
+        // Different pages, fewer initialized rows: the stale binding used to reject this.
+        let pages = bank.unit_pages(&[3]);
+        let refs = [&pages[0][..], &pages[1][..], &pages[2][..], &pages[3][..]];
+        bank.bind_sources(lease, refs, [0; 4])?;
+        let a = bank.request(lease)?;
+        let b = bank.request(fresh)?;
+        assert_eq!((a.end, a.phase), (b.end, b.phase));
+        for ((state, &x), &y) in bank.windows.iter().zip(&a.windows).zip(&b.windows) {
+            assert_eq!(state.span(x)?, state.span(y)?);
+            let mut x_end = [0; 8]; let mut y_end = [0; 8];
+            lib.copy_d2h(&mut x_end, state.view(x)?.device_end)?;
+            lib.copy_d2h(&mut y_end, state.view(y)?.device_end)?;
+            assert_eq!(x_end, y_end);
+        }
+        for (state, &lease) in bank.sources.iter().zip(&a.sources) {
+            assert_eq!(state.committed_end(lease)?, 0);
+            assert_eq!(state.binding(lease)?.1, 0);
+        }
+        bank.begin_encoder(lease, 1173)?;
+        bank.release(&[lease, fresh])?;
+        Ok(())
     }
 }
 

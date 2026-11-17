@@ -749,3 +749,41 @@ mod frontier_tests {
         }
     }
 }
+
+/// #2342: Qwen4 keeps no family discard: the cache releases the failed fork and
+/// the cold admission builds a fresh placement at len 0, which the prefill then
+/// overwrites row by row. The state is GPU-only, so this is a source contract.
+#[cfg(test)]
+mod rollback_tests {
+    fn production() -> &'static str {
+        include_str!("prefix.rs").split("\n#[cfg(test)]").next().unwrap()
+    }
+    fn body<'a>(source: &'a str, needle: &str) -> &'a str {
+        let rest = &source[source.find(needle).unwrap_or_else(|| panic!("{needle}"))..];
+        let end = rest.find("\n    }\n").map_or(rest.len(), |e| e + 6);
+        &rest[..end]
+    }
+
+    #[test]
+    fn a_failed_restore_cannot_leave_a_bound_partial_placement() {
+        let source = production();
+        let restore = body(source, "fn restore(&self, mark: Option<MarkSlot>");
+        let missing = restore.find("Qwen 3.8 Flash Next restores exact snapshots with their GDN state")
+            .expect("restore requires the exact mark");
+        let units = restore.find("len.div_ceil(UNIT_ROWS) > placement.units.len()")
+            .expect("restore validates the destination extent");
+        let write = restore.find("self.move_mark(slot, placement.slot, false)?")
+            .expect("restore installs the mark");
+        assert!(missing < write && units < write, "restore must validate before writing state");
+        let restore_with = body(source, "fn restore_with(");
+        let metadata = restore_with.find("saved.target != plan.resume()")
+            .expect("restore_with validates the saved frontier");
+        let delegate = restore_with.find("self.restore(Some(*slot), placement, plan.resume())?")
+            .expect("restore_with delegates after validation");
+        assert!(metadata < delegate);
+        assert!(!source.contains("fn discard("), "Qwen4 relies on the fresh cold placement, not a discard");
+        let engine = include_str!("engine.rs");
+        assert!(body(engine, "pub fn new(units: Vec<u32>, slot: i32, history: NgramHistory)")
+            .contains("len: 0, state_len: 0"), "the cold build starts every request at zero rows");
+    }
+}
