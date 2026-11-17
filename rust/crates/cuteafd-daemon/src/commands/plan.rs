@@ -865,7 +865,51 @@ fn kimi_content_matches(snapshot: &std::path::Path, draft: &std::path::Path) -> 
     Ok(true)
 }
 
+enum DraftPairDialect<'a> {
+    Speculators,
+    Native { config: &'a serde_json::Value, draft: &'a serde_json::Value },
+}
+
+impl<'a> DraftPairDialect<'a> {
+    fn read(draft: &'a serde_json::Value) -> Result<Self> {
+        if draft.get("speculators_config").is_some() || draft["speculators_model_type"] == "dspark" {
+            return Ok(Self::Speculators);
+        }
+        anyhow::ensure!(draft["architectures"].as_array().is_some_and(|a| a.iter().any(|v|
+            matches!(v.as_str(),Some("Qwen3DSparkModel"|"DSparkDraftModel"|"DFlash2DraftModel")))),
+            "drafter pairing: unsupported native draft architecture");
+        let config=draft.get("dflash_config").context("drafter pairing: native dflash_config missing")?;
+        Ok(Self::Native {config,draft})
+    }
+}
+
 fn kimi_pair_metadata(target: &serde_json::Value, draft: &serde_json::Value, snapshot: &std::path::Path) -> Result<()> {
+    if let DraftPairDialect::Native {config,draft}=DraftPairDialect::read(draft)? {
+        let text=target.get("text_config").unwrap_or(target);
+        anyhow::ensure!(target["architectures"].as_array().is_some_and(|a|
+            a.iter().any(|v|v=="KimiK31ForConditionalGeneration")),
+            "drafter pairing mismatch: native draft requires K3.1 target architectures");
+        for (field,target_field) in [("num_target_layers","num_hidden_layers"),("hidden_size","hidden_size"),
+            ("vocab_size","vocab_size"),("draft_vocab_size","vocab_size")] {
+            anyhow::ensure!(draft[field].as_u64().is_some()&&draft[field]==text[target_field],
+                "drafter pairing mismatch: {field}: drafter={}, target={}",draft[field],text[target_field]);
+        }
+        let layers=text["num_hidden_layers"].as_u64().context("drafter pairing: target layer count missing")?;
+        let taps=config["target_layer_ids"].as_array().context("drafter pairing: native target_layer_ids missing")?;
+        let mut unique=std::collections::BTreeSet::new();
+        anyhow::ensure!(!taps.is_empty()&&taps.iter().all(|v|v.as_u64().is_some_and(|n|n<layers&&unique.insert(n))),
+            "drafter pairing mismatch: target_layer_ids outside target layer count or duplicated");
+        for field in ["bos_token_id","eos_token_id","pad_token_id"] {
+            let expected=text.get(field).or_else(||target.get(field));
+            anyhow::ensure!(draft.get(field).is_some_and(|v|!v.is_null()&&Some(v)==expected),
+                "drafter pairing mismatch: {field} differs from target");
+        }
+        let vocab=text["vocab_size"].as_u64().unwrap_or(0);
+        // Native block masking uses a dedicated vocabulary token, not PAD.
+        anyhow::ensure!(config["mask_token_id"].as_u64().is_some_and(|n|n<vocab),
+            "drafter pairing mismatch: native mask_token_id outside target vocabulary");
+        return Ok(());
+    }
     let verifier = &draft["speculators_config"]["verifier"];
     let architectures = verifier["architectures"].as_array().context("drafter pairing: verifier.architectures missing")?;
     anyhow::ensure!(architectures.iter().any(|v| target["architectures"].as_array().is_some_and(|a| a.contains(v))),
@@ -1641,6 +1685,34 @@ mod tests {
             }
             assert!(kimi_pair_metadata(&config,&changed,&target).unwrap_err().to_string().contains(field));
         }
+        Ok(())
+    }
+
+    #[test]
+    fn native_draft_pairing_checks_checkpoint_geometry_taps_and_token_ids() -> Result<()> {
+        let target=serde_json::json!({"architectures":["KimiK31ForConditionalGeneration"],
+            "text_config":{"hidden_size":7168,"vocab_size":163840,"num_hidden_layers":93,
+                "bos_token_id":163584,"eos_token_id":163586,"pad_token_id":163839}});
+        let draft=serde_json::json!({"architectures":["Qwen3DSparkModel"],"num_target_layers":93,
+            "hidden_size":7168,"vocab_size":163840,"draft_vocab_size":163840,
+            "bos_token_id":163584,"eos_token_id":163586,"pad_token_id":163839,
+            "dflash_config":{"mask_token_id":163824,"target_layer_ids":[7,23,67,83,91]}});
+        let nonexistent=std::path::Path::new("/native-pairing-needs-no-side-files");
+        for architecture in ["Qwen3DSparkModel","DSparkDraftModel","DFlash2DraftModel"] {
+            let mut selected=draft.clone();selected["architectures"]=serde_json::json!([architecture]);
+            kimi_pair_metadata(&target,&selected,nonexistent)?;
+        }
+        for field in ["hidden_size","vocab_size","draft_vocab_size","num_target_layers",
+            "bos_token_id","eos_token_id","pad_token_id"] {
+            let mut changed=draft.clone();changed[field]=serde_json::json!(123);
+            assert!(kimi_pair_metadata(&target,&changed,nonexistent).unwrap_err().to_string().contains(field));
+        }
+        for taps in [serde_json::json!([93]),serde_json::json!([7,7]),serde_json::json!([])] {
+            let mut changed=draft.clone();changed["dflash_config"]["target_layer_ids"]=taps;
+            assert!(kimi_pair_metadata(&target,&changed,nonexistent).unwrap_err().to_string().contains("target_layer_ids"));
+        }
+        let mut changed=draft.clone();changed["dflash_config"]["mask_token_id"]=serde_json::json!(163840);
+        assert!(kimi_pair_metadata(&target,&changed,nonexistent).unwrap_err().to_string().contains("mask_token_id"));
         Ok(())
     }
 
