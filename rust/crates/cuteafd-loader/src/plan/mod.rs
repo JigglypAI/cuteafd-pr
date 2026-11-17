@@ -1430,13 +1430,10 @@ fn plan_unrestricted(input: &PlanInput, options: &PlanOptions) -> Result<PlanRep
         }
         let refused = !report.placement_supported && memory.devices.is_empty();
         if !memory.devices.is_empty() {
-            // The serving context: explicit, else the checkpoint's maximum.
-            let context = if layout_options.context_tokens > 0 { layout_options.context_tokens } else {
-                report.cache_requirements.as_ref().and_then(|cache| cache.checkpoint_max_context_tokens).unwrap_or(0) };
-            let physical = layout_options.rtx_bytes.iter().map(|&bytes| crate::placement::CoordinatorCard::planned(
-                bytes, layout_options.physical_sms).physical_bytes).min().unwrap_or(u64::MAX);
-            report.memory_policy_lines = crate::placement::reserve::layout_lines(&memory,
-                report.family.as_deref().unwrap_or(""), context, &layout_options.rtx_bytes, physical);
+            if let Some(pool) = report.phase_ledger.as_ref().and_then(|ledger| ledger.pool_policy) {
+                report.memory_policy_lines = crate::placement::reserve::layout_lines(&memory,
+                    report.family.as_deref().unwrap_or(""), &layout_options.rtx_bytes, &pool);
+            }
         }
         report.memory_layout = Some(memory);
         if !refused && !model.contract_admission() {

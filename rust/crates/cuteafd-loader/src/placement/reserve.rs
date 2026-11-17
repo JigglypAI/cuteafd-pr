@@ -181,22 +181,17 @@ pub fn breakdown(device: impl Into<String>, kind: DeviceKind, cap_bytes: u64, na
 /// Log one line per device (each coordinator GPU and each Spark): the cap,
 /// weights, workspaces, the named reserve components, KV target/min/max and
 /// the final pool. `cuteafd plan` prints the same lines.
-pub fn log_layout(layout: &cuteafd_core::memory_layout::MemoryLayout, family: &str, context: u64, gpu_caps: &[u64],
-    physical_card: u64) {
-    for line in layout_lines(layout, family, context, gpu_caps, physical_card) {
+pub fn log_layout(layout: &cuteafd_core::memory_layout::MemoryLayout, family: &str,
+    gpu_caps: &[u64], resolved: &super::PoolPolicy) {
+    for line in layout_lines(layout, family, gpu_caps, resolved) {
         tracing::info!(target: "cuteafd::memory_policy", "{line}");
     }
 }
 
-/// `gpu_caps` are the coordinator GPUs' caps by index (a layout's own RTX
-/// capacity may already exclude the named reserve); `physical_card` the
-/// smallest physical card, which picks the default KV target.
-pub fn layout_lines(layout: &cuteafd_core::memory_layout::MemoryLayout, family: &str, context: u64,
-    gpu_caps: &[u64], physical_card: u64) -> Vec<String> {
+/// Render the admitted policy witness, without resolving target/min/max again.
+pub fn layout_lines(layout: &cuteafd_core::memory_layout::MemoryLayout, family: &str,
+    gpu_caps: &[u64], resolved: &super::PoolPolicy) -> Vec<String> {
     use cuteafd_core::memory_layout::DeviceKind as Layout;
-    let _ = physical_card;
-    let Ok(resolved) = super::prepare_pool(super::PoolFacts::new(gpu_caps, context, None, 1))
-        else { return Vec::new() };
     let kv = resolved.bounds();
     let pool = cuteafd_core::memory_policy::PoolBreakdown { kv, pool_tokens: layout.pool_tokens };
     layout.devices.iter().map(|device| {
@@ -340,7 +335,8 @@ mod tests {
                 "startup graphs: fixture rank 0; nodes=10; measured-rate bytes=66800; GRAPH_NODE_PADDING=1670 bytes (2.50%); packed=2097152 bytes",
                 "", 2 << 20, Basis::Formula)] }], pool_tokens: 1 << 20, waste: vec![], notes: vec![] };
         let lines = MemoryPolicy { gpu_reserve: Some(0), ..Default::default() }
-            .scoped(|| layout_lines(&layout, "glm5", 1 << 20, &[96 << 30], 96 << 30));
+            .scoped(|| layout_lines(&layout, "glm5", &[96 << 30], &super::super::prepare_pool(
+                super::super::PoolFacts::new(&[96 << 30], 1 << 20, None, 1)).unwrap()));
         assert_eq!(lines.len(), 1);
         assert!(lines[0].contains("GRAPH_NODE_PADDING=1670 bytes (2.50%)"), "{}", lines[0]);
         assert!(lines[0].contains("padding included, not a reserve"), "{}", lines[0]);
@@ -358,7 +354,8 @@ mod tests {
                 cuteafd_core::memory_layout::spark_worker_process_resident_item()] };
         let layout = MemoryLayout { devices: vec![gpu, spark], pool_tokens: 1 << 20, waste: vec![], notes: vec![] };
         let lines = MemoryPolicy { family_reserve: Some(1 << 30), ..Default::default() }
-            .scoped(|| layout_lines(&layout, "glm5", 1 << 20, &[96 << 30], 96 << 30));
+            .scoped(|| layout_lines(&layout, "glm5", &[96 << 30], &super::super::prepare_pool(
+                super::super::PoolFacts::new(&[96 << 30], 1 << 20, None, 1)).unwrap()));
         assert_eq!(lines.len(), 2, "{lines:?}");
         // The GPU cap is the plan's cap, not the layout capacity already less the reserve.
         assert!(lines[0].starts_with("rtx0: cap 98304MiB; weights 40960MiB"), "{}", lines[0]);
@@ -370,7 +367,8 @@ mod tests {
         // Sparks carry no family reserve; the residual is their named component.
         assert!(lines[1].contains("reserve 1523MiB [Spark worker process resident 1523MiB]"), "{}", lines[1]);
         let overridden = MemoryPolicy { spark_reserve: Some(3 << 30), ..Default::default() }
-            .scoped(|| layout_lines(&layout, "glm5", 1 << 20, &[96 << 30], 96 << 30));
+            .scoped(|| layout_lines(&layout, "glm5", &[96 << 30], &super::super::prepare_pool(
+                super::super::PoolFacts::new(&[96 << 30], 1 << 20, None, 1)).unwrap()));
         assert!(overridden[1].contains("(overridden)") && overridden[1].contains("SPARK_RESERVE 3072MiB"), "{}", overridden[1]);
     }
 }
