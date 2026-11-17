@@ -190,7 +190,7 @@ pub struct Step5Recipe<'a> {
 
 impl<'a> Step5Recipe<'a> {
     /// Binds the native owners for every candidate CSA boundary, then keeps
-    /// the boundary whose max per-rank total at the pool ceiling is smallest.
+    /// the boundary whose max per-rank total at the layout target is smallest.
     /// The native bytes come from the same callback execution uses; this is
     /// one family fact, not a second admission.
     pub fn new(
@@ -208,13 +208,13 @@ impl<'a> Step5Recipe<'a> {
             .iter()
             .map(|gpu| gpu.capacity_bytes)
             .collect::<Vec<_>>();
-        let maximum_pages = PoolPolicy::resolve(
+        let pool = PoolPolicy::resolve(
             &capacities,
             inputs.context,
             inputs.requested_pool,
-            PAGE_ROWS)
-        .maximum_tokens()
-        .div_ceil(PAGE_ROWS);
+            PAGE_ROWS);
+        let maximum_pages = pool.maximum_tokens().div_ceil(PAGE_ROWS);
+        let layout_pages = pool.requested.unwrap_or(pool.target).div_ceil(PAGE_ROWS);
         ensure!(maximum_pages > 0, "Step-5 empty pool ceiling");
         let prefill = PrefillShape {
             rows: inputs.unit_rows() as u64,
@@ -228,7 +228,7 @@ impl<'a> Step5Recipe<'a> {
             let admitted = native(&ownership)?;
             let figures = Self::figures(cfg, inputs, depth, &ownership, &admitted, maximum_pages)?;
             let score = (0..gpus as u8)
-                .map(|rank| figures.total(rank, maximum_pages))
+                .map(|rank| figures.total(rank, layout_pages))
                 .collect::<Result<Vec<_>>>()?
                 .into_iter()
                 .max()

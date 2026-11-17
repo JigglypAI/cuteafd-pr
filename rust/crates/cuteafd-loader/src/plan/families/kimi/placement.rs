@@ -91,7 +91,6 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
     let head_rank = gpus - 1;
     let modes = if gpus == 1 { &[WHOLE][..] } else { MODES };
     let requested_pool = opts.pool_tokens.filter(|n| *n > 0);
-    let target_pool = opts.target_pool_tokens.max(context);
     let edge = |c| *model.bytes.get(&c).unwrap_or(&0);
     let (embedding, head) = (edge(Component::Embedding), model.core.projections.get("language_model.lm_head")
         .map_or(edge(Component::LmHead), |p| p.resident_bytes(1).expect("validated core dimensions")));
@@ -466,7 +465,8 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
         context_buffers.query_row_bytes.saturating_add(context_buffers.partial_row_bytes)
     } else { 0 };
     let page_rows = if modes.iter().any(|mode| *mode == LayerMode::ContextSplit) { PAGE * 2 } else { PAGE };
-    let ceiling = target_pool.max(requested_pool.unwrap_or(0));
+    let ceiling = crate::placement::PoolPolicy::resolve(&opts.rtx_bytes[..gpus], context,
+        requested_pool, page_rows).maximum_tokens();
     let maximum_pages = ceiling.div_ceil(page_rows);
     let draft_window_bytes = match draft.as_ref().map(|layout| layout.window_mark_bytes()).transpose() {
         Ok(bytes) => bytes.unwrap_or(0) as u64,

@@ -57,8 +57,11 @@ impl PoolPolicy {
         requested.filter(|&tokens| tokens > 0)
     }
 
+    /// Finite index/curve domain, not an allocation or a layout reservation.
+    /// Layout selection still uses `target`; only the selected pool's owners
+    /// are charged when it grows into the memory left after onboarding.
     pub fn maximum_tokens(&self) -> u64 {
-        self.requested.unwrap_or(self.target)
+        self.requested.unwrap_or(self.max.max(self.target))
     }
 
     /// `card_bytes` are the coordinator GPUs' totals; `context` the compiled
@@ -125,6 +128,34 @@ impl PoolPolicy {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn maximum_extent_includes_growth_without_changing_the_layout_target() {
+        let defaults = PoolPolicy::resolve(&[96 << 30], 262_144, None, 256);
+        assert_eq!(defaults.maximum_tokens(), defaults.target);
+        let growing = MemoryPolicy { kv_max: Some(100_000_000), ..Default::default() }.scoped(||
+            PoolPolicy::resolve(&[96 << 30], 262_144, None, 256));
+        assert_eq!(growing.maximum_tokens(), 100_000_000);
+        assert_eq!((growing.target, growing.floor, growing.compiled_context),
+            (defaults.target, defaults.floor, defaults.compiled_context));
+        assert_eq!(growing.wanted_units(), defaults.wanted_units());
+        assert_eq!(growing.max_units(), 100_000_000 / 256);
+    }
+
+    #[test]
+    fn explicit_pool_extent_is_strict_and_zero_is_automatic() {
+        MemoryPolicy { kv_target: Some(1 << 20), kv_max: Some(100_000_000),
+            ..Default::default() }.scoped(|| {
+            for requested in [Some(524_288), Some(4 << 20)] {
+                let pool = PoolPolicy::resolve(&[96 << 30], 262_144, requested, 256);
+                assert_eq!(pool.maximum_tokens(), requested.unwrap());
+                assert_eq!(pool.max, requested.unwrap());
+                assert_eq!(pool.wanted_units(), requested.unwrap() / 256);
+            }
+            assert_eq!(PoolPolicy::resolve(&[96 << 30], 262_144, Some(0), 256),
+                PoolPolicy::resolve(&[96 << 30], 262_144, None, 256));
+        });
+    }
 
     #[test]
     fn capped_pro_has_the_same_planned_and_sampled_pool_extent() {

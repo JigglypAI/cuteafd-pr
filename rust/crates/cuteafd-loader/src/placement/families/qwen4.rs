@@ -90,8 +90,8 @@ pub fn single_policy(inputs: &QwenInputs<'_>) -> PoolPolicy {
 
 /// Serving context and the finite compiled pool extent, both derived from the
 /// same policy. The legacy ceiling was unbounded; a contract curve needs a
-/// finite domain, so the extent is the larger of the automatic target and the
-/// explicit request. Every pool the policy accepts is inside it.
+/// finite domain, so the extent includes automatic growth up to KV max, or the
+/// strict explicit request. Every pool the policy accepts is inside it.
 fn single_extent(policy: &PoolPolicy) -> Result<(u64, u64), Refusal> {
     let page = QWEN_UNIT_ROWS as u64;
     let tokens = policy.maximum_tokens().max(policy.floor);

@@ -49,7 +49,7 @@ fn invalid(detail: impl std::fmt::Display) -> Refusal {
     Refusal::InvalidFact(format!("MiMo component contract: {detail}"))
 }
 
-/// The largest pool tokens this build may index: the automatic target or the
+/// The largest pool tokens this build may index: the automatic maximum or the
 /// explicit request, rounded up to the profile's pool quantum.
 pub fn maximum_pool_tokens(cards: &[u64], context: u64, requested: Option<u64>, page_rows: u64) -> u64 {
     let page = page_rows.max(1);
