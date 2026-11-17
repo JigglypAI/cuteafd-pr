@@ -1029,6 +1029,7 @@ fn pool_max_grows_after_onboarding_in_every_family_planner() {
     let mut options = wave_plan_options(dir.path(), 3);
     options.draft_ownership = Some(spec::DraftOwnership::None);
     options.layout.as_mut().unwrap().rtx_bytes = vec![crate::placement::inventory::PRO_TOTAL_BYTES; 2];
+    options.layout.as_mut().unwrap().context_tokens = 262_144;
     options.layout.as_mut().unwrap().prefix_slots = None;
     options.layout.as_mut().unwrap().pool_tokens = None;
     options.layout.as_mut().unwrap().workspace_manifest = Some(manifest);
