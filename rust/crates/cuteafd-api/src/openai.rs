@@ -2478,7 +2478,7 @@ mod tests {
             });
             let app = router(tx).layer(axum::middleware::from_fn_with_state(
                 crate::usage::Middleware::new(sink.clone()), crate::usage::track));
-            let body = json!({"messages":[{"role":"user","content":"Hi"}],"max_tokens":16,
+            let body = json!({"model":MODEL,"messages":[{"role":"user","content":"Hi"}],"max_tokens":16,
                 "thinking":{"type":"disabled"},"stream":streaming,"stream_options":{"include_usage":true}});
             let response = app.oneshot(axum::http::Request::post("/v1/chat/completions")
                 .header("content-type","application/json").body(Body::from(body.to_string())).unwrap()).await.unwrap();
