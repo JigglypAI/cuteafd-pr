@@ -56,9 +56,16 @@ pub fn prepare_pool(facts: PoolFacts<'_>) -> Result<PoolPolicy, cuteafd_core::me
     policy.kv_target = facts.target.or(policy.kv_target);
     let smallest = facts.card_bytes.iter().copied().min().unwrap_or(u64::MAX);
     let bounds = policy.kv(smallest, facts.context.maximum)?;
-    let requested = PoolPolicy::normalize_request(facts.requested);
+    let raw_requested = PoolPolicy::normalize_request(facts.requested);
+    let requested = raw_requested.map(|tokens| {
+        // A raw pin below context must retain its typed refusal, not round into validity.
+        if tokens < facts.context.required() { return Ok(tokens); }
+        let rows = facts.unit_rows.max(1);
+        tokens.div_ceil(rows).checked_mul(rows).ok_or(
+            cuteafd_core::memory_policy::PolicyError::PoolAlignment { requested: tokens, unit_rows: rows })
+    }).transpose()?;
     Ok(PoolPolicy {
-        context: facts.context, compiled_context: facts.context.maximum, requested,
+        context: facts.context, compiled_context: facts.context.maximum, raw_requested, requested,
         target: bounds.target.max(facts.context.required()),
         floor: requested.unwrap_or(bounds.min).max(facts.context.required()),
         ceiling: facts.encoding_limit.unwrap_or(u64::MAX),
@@ -73,6 +80,7 @@ pub struct PoolPolicy {
     pub(super) compiled_context: u64,
     /// An explicit pool is strict: admission fails rather than shrink it.
     pub(super) requested: Option<u64>,
+    pub(super) raw_requested: Option<u64>,
     /// The layout (onboarding, buffers) is sized for this pool.
     pub(super) target: u64,
     /// Admission refuses below this (`KV_MIN_TOKENS` and any pinned context).
@@ -89,6 +97,7 @@ impl PoolPolicy {
     pub fn context(&self) -> super::planner::Context { self.context }
     pub fn compiled_context(&self) -> u64 { self.compiled_context }
     pub fn requested(&self) -> Option<u64> { self.requested }
+    pub(crate) fn raw_requested(&self) -> Option<u64> { self.raw_requested }
     pub fn target(&self) -> u64 { self.target }
     pub fn floor(&self) -> u64 { self.floor }
     pub fn ceiling(&self) -> u64 { self.ceiling }
@@ -215,6 +224,21 @@ mod tests {
     }
 
     #[test]
+    fn explicit_pool_rounds_once_and_preserves_raw_context_refusals() {
+        let pool = prepare_pool(PoolFacts::new(&[96 << 30], 4096, Some(4097), 256)).unwrap();
+        assert_eq!(pool.requested(), Some(4352));
+        assert_eq!(pool.raw_requested(), Some(4097));
+        assert_eq!(pool.maximum_tokens(), 4352);
+        assert_eq!(pool.capacity_policy(16).pool_tokens, Some(4352));
+        let short = prepare_pool(PoolFacts::new(&[96 << 30], 4096, Some(4095), 256)).unwrap();
+        assert_eq!(short.requested(), Some(4095));
+        assert!(short.validate_explicit().is_err());
+        assert!(matches!(prepare_pool(PoolFacts::new(&[96 << 30], 4096, Some(u64::MAX), 256)),
+            Err(cuteafd_core::memory_policy::PolicyError::PoolAlignment { .. })));
+    }
+
+    #[test]
+    fn capped_pro_uses    #[test]
     fn capped_pro_uses_the_same_small_card_pool_as_a_logical_simulation() {
         let planned = CoordinatorCard::planned(32 << 30, Some(188));
         let sampled = CoordinatorCard { physical_bytes: super::super::inventory::PRO_TOTAL_BYTES,

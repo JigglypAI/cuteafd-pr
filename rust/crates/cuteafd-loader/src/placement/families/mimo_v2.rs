@@ -587,6 +587,23 @@ mod tests {
     }
 
     #[test]
+    fn explicit_unaligned_pool_keeps_shared_round_up() {
+        let (cfg, spark, no_spark) = fixture(1, 4096);
+        let mut facts = input(&cfg, &spark, &no_spark, 1, 4096);
+        let page = spark.pool_unit_rows;
+        facts.pool = crate::placement::prepare_pool(crate::placement::PoolFacts::new(
+            &[96 << 30], 4096, Some(4097), page)).unwrap();
+        let prepared = facts.prepare().unwrap();
+        let request = admission::production_request(4096, Some(4097), Onboard::Auto,
+            prepared.recipe.prefill, crate::placement::planner::Operation::Serving,
+            ResidentWeights(u64::MAX), Default::default());
+        let admitted = prepared.admit(request).unwrap();
+        assert_eq!(admitted.solved.pool_tokens, 4097u64.div_ceil(page) * page);
+        assert_eq!(admitted.solved.pool_policy.unwrap().requested(), Some(admitted.solved.pool_tokens));
+    }
+
+    #[test]
+    fn zero_and_unset_pool_admit_identically()    #[test]
     fn zero_and_unset_pool_admit_identically() {
         let (cfg, spark, no_spark) = fixture(1, 256 << 10);
         let context = 256 << 10;

@@ -404,16 +404,7 @@ impl PreparedMimo<'_> {
 
     /// One typed admission over the prepared facts. The shared planner picks
     /// the pool and the onboarding prefix; nothing here re-solves.
-    pub fn admit(&self, mut request: Request) -> Result<AdmittedMimo, Refusal> {
-        // The operator's explicit pool keeps the old quantum rounding; an
-        // unaligned request is not a reason to plan a different pool.
-        if let Pin::Exact(tokens) = request.pool {
-            let page = self.recipe.page_rows;
-            if tokens % page != 0 {
-                request.pool = Pin::Exact(tokens.div_ceil(page).checked_mul(page)
-                    .ok_or(Refusal::Overflow("MiMo pool quantum"))?);
-            }
-        }
+    pub fn admit(&self, request: Request) -> Result<AdmittedMimo, Refusal> {
         let solved = crate::placement::planner::solve_prepared(request, self.budgets.clone(), &self.recipe, &self.pool)?;
         let (placement, spark) = self.recipe.execution(&solved)?;
         let count = spark.rtx_layers.len();

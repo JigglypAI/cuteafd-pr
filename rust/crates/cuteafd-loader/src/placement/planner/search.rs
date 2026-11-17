@@ -857,11 +857,16 @@ pub fn solve(
 /// Admit a recipe using the same immutable policy that prepared its domain.
 /// No policy is re-read after preparation, including through a scoped plan.
 pub fn solve_prepared(
-    request: Request,
+    mut request: Request,
     budgets: Vec<Budget>,
     recipe: &impl Recipe,
     pool: &crate::placement::PoolPolicy,
 ) -> Result<ResolvedPlan, Refusal> {
+    let requested = match request.pool { Pin::Auto => None, Pin::Exact(tokens) => Some(tokens) };
+    if pool.context() != request.context || requested != pool.raw_requested() && requested != pool.requested() {
+        return Err(Refusal::InvalidFact("prepared pool differs from placement request".into()));
+    }
+    request.pool = pool.requested().map_or(Pin::Auto, Pin::Exact);
     let started = std::time::Instant::now();
     let mut contract = recipe.prepare(&request)?;
     contract.add_driver_page_tables();
@@ -919,11 +924,6 @@ pub fn solve_prepared(
     // searched at the target; an automatic pool then grows to the max.
     // The logical cap picks the card class, including 5090 simulations on PRO.
     // The prepared policy is the only source of target/min/max semantics.
-    if pool.context() != request.context || pool.requested() != match request.pool {
-        Pin::Auto => None, Pin::Exact(tokens) => Some(tokens),
-    } {
-        return Err(Refusal::InvalidFact("prepared pool differs from placement request".into()));
-    }
     let aligned = |tokens: u64| tokens.div_ceil(page).div_ceil(multiple).checked_mul(multiple)
         .ok_or(Refusal::Overflow("target pool pages"));
     let floor = request.context.required().max(if matches!(request.pool, Pin::Auto) { pool.floor() } else { 0 });

@@ -228,8 +228,7 @@ impl<'a> QwenSingle<'a> {
         if let Some(tokens) = inputs.requested_pool.filter(|&tokens| tokens > 0 && tokens < inputs.context.required()) {
             return Err(Refusal::PoolBelowContext { tokens, context: inputs.context.required() });
         }
-        let requested = inputs.requested_pool.filter(|&tokens| tokens > 0).map(|tokens|
-            tokens.div_ceil(page).checked_mul(page).ok_or(Refusal::Overflow("Qwen pool request"))).transpose()?;
+        let requested = inputs.requested_pool;
         let cards = [inputs.capacity_bytes];
         let mut facts = PoolFacts::new(&cards, inputs.context, requested, page);
         facts.target = inputs.target_pool;
@@ -906,8 +905,7 @@ impl<'a> QwenDual<'a> {
         if let Some(tokens) = inputs.requested_pool.filter(|&tokens| tokens > 0 && tokens < inputs.context.required()) {
             return Err(Refusal::PoolBelowContext { tokens, context: inputs.context.required() });
         }
-        let requested = inputs.requested_pool.filter(|&tokens| tokens > 0).map(|tokens|
-            tokens.div_ceil(page).checked_mul(page).ok_or(Refusal::Overflow("Qwen pool request"))).transpose()?;
+        let requested = inputs.requested_pool;
         let cards = inputs.gpus.map(|gpu| gpu.capacity_bytes);
         let mut facts = PoolFacts::new(&cards, inputs.context, requested, page);
         facts.target = inputs.target_pool;
@@ -1773,6 +1771,17 @@ mod tests {
     /// Plan-time and serve-time baselines describe the same owners; the recipe
     /// declares every allocation after them, so both must admit one placement.
     #[test]
+    fn explicit_unaligned_pool_keeps_shared_round_up() {
+        let cfg = Qwen4Config::from_hf(&crate::plan::testing::qwen4_config(4)).unwrap();
+        let inputs = single_inputs(&cfg, Baseline::Measured { free_bytes: 96 << 30 },
+            0, Some(131_073), ResidentWeights(0), None);
+        let admitted = QwenSingle::new(&inputs).unwrap().admit().unwrap();
+        assert_eq!(admitted.pool_tokens, 131_328);
+        assert_eq!(admitted.pool_policy.unwrap().requested(), Some(131_328));
+    }
+
+    #[test]
+    fn planner_equals_runtime_qwen4()    #[test]
     fn planner_equals_runtime_qwen4() {
         let cfg = Qwen4Config::from_hf(&crate::plan::testing::qwen4_config(4)).unwrap();
         let planned = placement(&single_inputs(&cfg, Baseline::Planned { context_bytes: 0, loaded_bytes: 0 },
