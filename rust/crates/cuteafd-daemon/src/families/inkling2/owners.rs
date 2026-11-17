@@ -13,6 +13,7 @@ pub(crate) trait UnitBuffers<'a> {
     fn stream(&self) -> &Stream<'a>;
     fn layout(&self) -> &UnitLayout;
     fn buffer(&self, name: &str) -> Result<Buffer>;
+    fn decode_attention(&self)->bool {false}
     fn convolution_strides(&self) -> Option<(usize, usize, usize)> { None }
     fn convolution_replay(&self, _field: &str) -> Result<Option<(Buffer, usize)>> { Ok(None) }
     fn packed(&self) -> Option<(&UnitOwner<'a>, &super::cache::CacheBank<'a>, usize, &[PackedMember])> { None }
@@ -34,6 +35,7 @@ pub(crate) struct PackedLayerUnit<'u, 'a> {
     pub uploads: std::cell::RefCell<&'u mut crate::shared::token_table::RetainedUploads<'a>>,
 }
 impl<'a> UnitBuffers<'a> for PackedLayerUnit<'_, 'a> {
+    fn decode_attention(&self)->bool {self.unit.decode_attention}
     fn convolution_replay(&self, field: &str) -> Result<Option<(Buffer, usize)>> {
         let Some((backing, width)) = self.unit.replay.get() else { return Ok(None) };
         let offset = match field { "attn_conv_history" => 0, "mlp_conv_history" => 4608,
@@ -111,6 +113,7 @@ pub(crate) struct UnitOwner<'a> {
     pub layout: UnitLayout,
     buffers: BTreeMap<String, Allocation<'a>>,
     replay: std::cell::Cell<Option<(Buffer, usize)>>,
+    decode_attention:bool,
 }
 impl<'a> UnitOwner<'a> {
     /// The caller retains replay storage through every queued convolution and commit.
@@ -200,7 +203,7 @@ impl<'a> UnitOwner<'a> {
         let bytes = first.iter().flat_map(|value| value.to_le_bytes()).collect::<Vec<_>>();
         // SAFETY: same whole-unit metadata source lifetime.
         unsafe { uploads.upload(self.buffer("first")?, &bytes, self.stream.raw)?; }
-        let step = 10;
+        let step = if self.decode_attention {1}else{10};
         let tiles = members.iter().flat_map(|member| member.rows.clone().step_by(step))
             .map(|row| row as i32).collect::<Vec<_>>();
         let indices = members.iter().enumerate().flat_map(|(table, member)|
@@ -225,7 +228,7 @@ impl<'a> UnitOwner<'a> {
         let buffers = layout.buffers.iter().map(|(name, bytes)| Ok((name.clone(),
             Allocation::new(stream.device, *bytes, Tag::workspace("inkling2/unit"))?)))
             .collect::<Result<BTreeMap<_, _>>>()?;
-        let owner = Self { stream, layout, buffers, replay: std::cell::Cell::new(None) };
+        let owner = Self { stream, layout, buffers, replay: std::cell::Cell::new(None), decode_attention:false };
         owner.zero()?;
         Ok(owner)
     }
@@ -319,7 +322,8 @@ impl<'a> RequestOwners<'a> {
         }
         // Every extent was checked before the first allocation.
         let cache = Rc::new(super::cache::CacheBank::new(vec![stream.clone()], cache_layout, mark_slots)?);
-        let decode = UnitOwner::new(stream.clone(), decode_layout)?;
+        let mut decode = UnitOwner::new(stream.clone(), decode_layout)?;
+        decode.decode_attention=true;
         let prefill = (0..inputs.prefill.waves).map(|_| UnitOwner::new(stream.clone(), prefill_layout.clone()))
             .collect::<Result<Vec<_>>>()?;
         let decode_uploads = decode.uploads(cfg, sequences.min(decode.layout.rows))?;
@@ -357,7 +361,7 @@ mod packed_tests {
         cfg.layers = 2;
         cfg.local = vec![true, false];
         let cache = super::super::cache::CacheBank::new(vec![stream.clone()], CacheLayout::new(&cfg, 2, 4)?, 0)?;
-        let unit = UnitOwner::new(stream.clone(), UnitLayout::serving_format(&cfg, 4, 128, Default::default(), 2)?)?;
+        let mut unit = UnitOwner::new(stream.clone(), UnitLayout::serving_format(&cfg, 4, 128, Default::default(), 2)?)?;
         let mut uploads = unit.uploads(&cfg, 2)?;
         let members = vec![
             PackedMember { sequence: 1, rows: 0..1, metadata: UnitMetadata::new(&cfg, 63..64, &[2], 4)? },
@@ -391,6 +395,13 @@ mod packed_tests {
             uploads: std::cell::RefCell::new(&mut uploads) };
         assert_eq!(packed.buffer("partial")?.ptr, unit.buffer("partial")?.ptr);
         assert_eq!(packed.buffer("cache_slots")?.ptr, unit.buffer("global_slots")?.ptr);
+        drop(packed);
+        unit.decode_attention=true;
+        unit.packed_metadata(1,&cache,&members,&mut uploads)?;stream.drain()?;
+        let mut tiles=vec![0;16];library.copy_d2h(&mut tiles,unit.buffer("tile_rows")?)?;
+        assert_eq!(tiles.chunks_exact(4).map(|bytes|i32::from_le_bytes(bytes.try_into().unwrap())).collect::<Vec<_>>(),[0,1,2,3]);
+        let packed=PackedLayerUnit{unit:&unit,cache:&cache,layer:1,members:&members,uploads:std::cell::RefCell::new(&mut uploads)};
+        assert!(packed.decode_attention());
         Ok(())
     }
 }
