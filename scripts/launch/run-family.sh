@@ -1787,6 +1787,9 @@ if [[ -n "$chat_template_from" && "$vision" != off ]]; then
 fi
 # Still towers use the shared media options and the admitted encoder owner.
 family_args+=(--vision "$vision" --audio "$audio")
+if [[ "$family" == inkling2 || "$family" == step5 ]]; then
+  family_args+=(--vision-replicas "$vision_replicas")
+fi
 
 dspark_args=()
 if [[ $family == mimo_v2 ]]; then

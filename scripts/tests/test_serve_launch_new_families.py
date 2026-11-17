@@ -979,3 +979,19 @@ def test_pe_shared_encoder_plan_handoff(tmp_path, family, model, ranks, vision):
         assert _flag(serve, "--encoder-revision") == "abc"
     workers = [line for line in result.stderr.splitlines() if "cuteafd expertd-native" in line]
     assert sum("--encoder " in worker for worker in workers) == (vision == "spark")
+
+
+@pytest.mark.parametrize("family,model,ranks", [("inkling2", "thinkingmachines/Inkling-2-Small", 4),
+    ("step5", "wrldsuksgo2mars/Step-5-Preview-EXL3-K4-MC", 3)])
+def test_pe_encoder_replicas_match_plan_and_runtime(tmp_path, family, model, ranks):
+    config = {"model_type": "inkling2" if family == "inkling2" else "step5_vl", "vision_config": {"depth": 2},
+        "text_config": {"model_type": "step5", "num_hidden_layers": 48 if family == "inkling2" else 92,
+            "moe_layer_list": list(range(3,91))}}
+    plan = {**PLANNED, "encoder": {"kind":{"kind":"spark","rank":0},"replicas":[1]},"encoder_plan_hash":"ab"*32}
+    keys = f"SPARK_COUNT={ranks}\nRTX_GPUS=1\nSPECULATOR=off\nVISION=spark\nVISION_REPLICAS=2\nAUDIO=off\n"+_hosts(ranks)
+    result = _family_launch_result(tmp_path, config, model, keys, physical_gpus=(0,),
+        extra_args=("--wip","pe"), encoder_plan=plan)
+    serve = _line(result,f"serve-{family} --snapshot")
+    assert _flag(serve,"--vision-replicas")=="2"
+    assert _flag(_line(result,"cuteafd plan"),"--vision-replicas")=="2"
+    assert _flag(serve,"--vision-peers")=="10.0.0.1:19442,10.0.0.2:19442"
