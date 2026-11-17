@@ -228,7 +228,7 @@ pub fn draft_selector_workspace_bytes(kind: cuteafd_core::coordinator_programs::
     drafted: usize) -> Result<usize> {
     use cuteafd_core::coordinator_programs::MlaDraftKind;
     match kind {
-        MlaDraftKind::Dflash2 => drafted.checked_mul(64 * 16 * 8)
+        MlaDraftKind::Dflash2 | MlaDraftKind::CausalDflash2 => drafted.checked_mul(64 * kind.selector_top_k() * 8)
             .map(|bytes| bytes.max(256)).ok_or_else(|| unsupported("draft selector workspace overflow")),
         MlaDraftKind::Ml4Dspark => Ok(0),
     }
@@ -260,7 +260,7 @@ impl MlaDraftRuntimeLayout {
     }
     /// All immutable destinations, including DFlash2's separately loaded MLA weights.
     pub fn weight_arena_requests(&self) -> Vec<(String, usize)> {
-        if self.kind == cuteafd_core::coordinator_programs::MlaDraftKind::Dflash2 {
+        if self.kind.is_dflash() {
             self.weight_arena_requests.clone()
         } else {
             self.immutable_arena_requests()
@@ -893,10 +893,14 @@ struct Raw {
     sliding_window: Option<usize>,
     use_sliding_window: bool,
     is_causal: bool,
-    mla_use_output_gate: bool,
+    mla_use_output_gate: Option<bool>,
+    #[serde(default)]
+    mla_use_nope: Option<bool>,
+    #[serde(default)]
+    rope_interleave: Option<bool>,
     attention_bias: bool,
     hidden_act: String,
-    fc_norm: bool,
+    fc_norm: Option<bool>,
     rope_parameters: DsparkRope,
     dflash_config: Draft,
 }
@@ -904,6 +908,8 @@ struct Raw {
 #[derive(Deserialize)]
 struct Draft {
     attention_mode: String,
+    #[serde(default)]
+    aux_hidden_stream: Option<String>,
     block_size: usize,
     conv_kernel_size: usize,
     conv_group_size: usize,
@@ -926,15 +932,26 @@ impl MlaDflashConfig {
         let raw: Raw = serde_json::from_value(value.clone())?;
         validate_topk_vocab(raw.vocab_size as u64)?;
         let d = raw.dflash_config;
+        let causal = raw.is_causal;
+        // The causal checkpoint declares its missing gate/norm behavior through
+        // its MLA, interleaved-RoPE and attention-residual stream contract.
+        let optional_flags_valid = if causal {
+            raw.mla_use_output_gate != Some(true) && raw.fc_norm != Some(true)
+                && raw.mla_use_nope == Some(false) && raw.rope_interleave == Some(true)
+                && d.aux_hidden_stream.as_deref() == Some("attn_res")
+        } else {
+            raw.mla_use_output_gate == Some(false) && raw.fc_norm == Some(false)
+                && raw.rope_interleave != Some(false)
+        };
         if !raw.architectures.iter().any(|a| a == "DFlash2DraftModel")
-            || d.attention_mode != "mla" || raw.is_causal || raw.mla_use_output_gate
-            || raw.attention_bias || raw.hidden_act != "silu" || raw.fc_norm {
-            return Err(unsupported("MLA DFlash2 requires noncausal, ungated, bias-free SiLU and fc_norm=false"));
+            || d.attention_mode != "mla" || !optional_flags_valid
+            || raw.attention_bias || raw.hidden_act != "silu" {
+            return Err(unsupported("MLA DFlash2 requires declared ungated, bias-free SiLU, interleaved RoPE and fc_norm=false"));
         }
         let mla = MlaGeometry { hidden: raw.hidden_size, heads: raw.num_attention_heads,
             q_rank: raw.q_lora_rank, kv_rank: raw.kv_lora_rank, nope: raw.qk_nope_head_dim,
             rope: raw.qk_rope_head_dim, value: raw.v_head_dim };
-        if mla != (MlaGeometry { hidden: 7168, heads: 64, q_rank: 1536,
+        if mla != (MlaGeometry { hidden: 7168, heads: if causal { 96 } else { 64 }, q_rank: 1536,
             kv_rank: 512, nope: 128, rope: 64, value: 128 })
             || raw.num_key_value_heads != mla.heads || raw.rms_norm_eps != 1e-5 {
             return Err(unsupported("MLA draft exports require H7168, 64 heads, Q1536/KV512, NoPE128/RoPE64/V128, eps=1e-5"));
@@ -950,24 +967,27 @@ impl MlaDflashConfig {
             || d.target_layer_ids.windows(2).any(|pair| pair[0] >= pair[1]) {
             return Err(unsupported("invalid MLA draft dimensions, context, vocabulary or ordered post-layer taps"));
         }
-        if d.block_size != 8 || d.conv_kernel_size != 2 || d.conv_group_size != 16
-            || d.selector_rank != 256 || d.selector_top_k != 16 {
-            return Err(unsupported("DFlash2 requires block8, two-tap group16 convolutions, rank256/top16 selector"));
+        if d.block_size != if causal { 5 } else { 8 }
+            || d.conv_kernel_size != 2 || d.conv_group_size != 16
+            || d.selector_rank != 256 || d.selector_top_k != if causal { 32 } else { 16 } {
+            return Err(unsupported("DFlash2 requires noncausal block8/top16 or causal block5/top32, kernel2/group16, rank256"));
         }
         if raw.layer_types.len() != raw.num_hidden_layers {
             return Err(unsupported("MLA draft layer_types count differs from num_hidden_layers"));
         }
+        let window = if causal { 1024 } else { 4096 };
         let windows = raw.layer_types.iter().map(|kind| match kind.as_str() {
-            "full_attention" => Ok(None),
-            "sliding_attention" if raw.use_sliding_window && raw.sliding_window == Some(4096) => Ok(Some(4096)),
-            _ => Err(unsupported("MLA draft exports support full attention or a native 4096-token window")),
+            "full_attention" if !causal => Ok(None),
+            "sliding_attention" if raw.use_sliding_window && raw.sliding_window == Some(window) => Ok(Some(window)),
+            _ => Err(unsupported("MLA draft exports require native full/4096 noncausal or all-1024 causal windows")),
         }).collect::<Result<Vec<_>>>()?;
         let rotary = raw.rope_parameters.plan(mla.rope)?;
         Ok(Self { mla, intermediate: raw.intermediate_size, eps: raw.rms_norm_eps,
             block: d.block_size, group: d.conv_group_size, selector_rank: d.selector_rank,
             selector_top_k: d.selector_top_k, taps: d.target_layer_ids, vocab: raw.vocab_size,
             mask_token: d.mask_token_id, max_context: raw.max_position_embeddings, windows, rotary,
-            kind: cuteafd_core::coordinator_programs::MlaDraftKind::Dflash2, markov_rank: 0 })
+            kind: if causal { cuteafd_core::coordinator_programs::MlaDraftKind::CausalDflash2 }
+                else { cuteafd_core::coordinator_programs::MlaDraftKind::Dflash2 }, markov_rank: 0 })
     }
 
     /// Mistral Large 4's bundled mtp_dspark, from the checkpoint's own params.json
@@ -1130,14 +1150,15 @@ impl MlaDflashConfig {
         }
         if capacity != GlmDraftCapacity::new(capacity.context_slots, capacity.max_batch_sequences, self.block)
             .map_err(|_| invalid())? || capacity.max_batch_sequences > 32
-            || !(1..=4096).contains(&sm_count) || fp8_mode > 2 || self.block != 8
-            || self.group != 16 || self.selector_rank != 256 || self.selector_top_k != 16
-            || self.mla != (MlaGeometry { hidden: 7168, heads: 64, q_rank: 1536,
+            || !(1..=4096).contains(&sm_count) || fp8_mode > 2
+            || self.block != if self.kind == cuteafd_core::coordinator_programs::MlaDraftKind::CausalDflash2 { 5 } else { 8 }
+            || self.group != 16 || self.selector_rank != 256 || self.selector_top_k != self.kind.selector_top_k()
+            || self.mla != (MlaGeometry { hidden: 7168, heads: self.kind.heads(), q_rank: 1536,
                 kv_rank: 512, nope: 128, rope: 64, value: 128 })
             || self.intermediate == 0 || self.intermediate > 1_000_000
             || self.vocab == 0 || self.vocab > 1_000_000 || self.taps.is_empty() || self.taps.len() > 1024
             || self.windows.is_empty() || self.windows.len() > 1024
-            || self.windows.iter().any(|w| !matches!(w, None | Some(4096))) {
+            || self.windows.iter().any(|w| if self.kind == cuteafd_core::coordinator_programs::MlaDraftKind::CausalDflash2 { *w != Some(1024) } else { !matches!(w, None | Some(4096)) }) {
             return Err(invalid());
         }
         let program = self.program_layout(compiled_context)?;
@@ -1167,10 +1188,10 @@ impl MlaDflashConfig {
             ("fused", vec![tap_rows, h, 2]), ("fused_norm", vec![tap_rows, h, 2]),
             ("context_positions", vec![tap_rows, 8]), ("context_slots", vec![tap_rows, 8]),
             ("inverse_frequencies", vec![self.mla.rope / 2, 4]),
-            ("query", vec![native_rows, 64, 576, 2]),
+            ("query", vec![native_rows, self.mla.heads, 576, 2]),
             ("q_residual", vec![native_rows, 1536, 2]),
-            ("attention", vec![native_rows, 64, 512, 2]),
-            ("lse", vec![native_rows, 64, 4]),
+            ("attention", vec![native_rows, self.mla.heads, 512, 2]),
+            ("lse", vec![native_rows, self.mla.heads, 4]),
             ("native_scratch", vec![program.scratch_bytes()]),
             ("lengths", vec![seq, 4]), ("query_offsets", vec![seq + 1, 4]),
             ("native_slots", vec![native_rows, 8]), ("native_positions", vec![native_rows, 8]),
@@ -1179,7 +1200,7 @@ impl MlaDflashConfig {
             ("conv", vec![rows, h, 2]), ("dynamic", vec![rows, 4 * h / self.group, 2]),
             ("delta", vec![rows, h, 2]), ("gate_up", vec![rows, 2 * inter, 2]),
             ("act", vec![rows, inter, 2]), ("logits", vec![rows, self.vocab, 4]),
-            ("unary", vec![drafted, 16, 4]), ("candidates", vec![drafted, 16, 4]),
+            ("unary", vec![drafted, self.selector_top_k, 4]), ("candidates", vec![drafted, self.selector_top_k, 4]),
             ("projected", vec![rows, self.selector_rank, 2]), ("anchors", vec![seq, 4]),
             ("ids", vec![rows, 4]), ("tokens", vec![drafted, 4]),
             ("features", vec![drafted, 16]), ("positions", vec![rows, 8]),
@@ -1552,6 +1573,55 @@ mod tests {
             "dflash_config":{"attention_mode":"mla", "block_size":8,
                 "conv_kernel_size":2, "conv_group_size":16, "selector_rank":256,
                 "selector_top_k":16, "target_layer_ids":[19,37,66,78,90], "mask_token_id":163592}})
+    }
+
+    fn causal_config() -> serde_json::Value {
+        let mut raw = config();
+        raw["num_attention_heads"] = 96.into();
+        raw["num_key_value_heads"] = 96.into();
+        raw["is_causal"] = true.into();
+        raw["mla_use_nope"] = false.into();
+        raw["rope_interleave"] = true.into();
+        raw["sliding_window"] = 1024.into();
+        raw["layer_types"] = json!(vec!["sliding_attention"; 5]);
+        raw["dflash_config"]["block_size"] = 5.into();
+        raw["dflash_config"]["selector_top_k"] = 32.into();
+        raw["dflash_config"]["mask_token_id"] = 163824.into();
+        raw["dflash_config"]["aux_hidden_stream"] = "attn_res".into();
+        raw["dflash_config"]["target_layer_ids"] = json!([7,23,51,67,83,91]);
+        raw.as_object_mut().unwrap().remove("fc_norm");
+        raw.as_object_mut().unwrap().remove("mla_use_output_gate");
+        raw
+    }
+
+    #[test]
+    fn causal_checkpoint_declares_missing_flags_and_exact_header_geometry() -> anyhow::Result<()> {
+        let raw = causal_config();
+        let cfg = MlaDflashConfig::from_json(&raw)?;
+        assert_eq!(cfg.kind, cuteafd_core::coordinator_programs::MlaDraftKind::CausalDflash2);
+        assert_eq!((cfg.mla.heads, cfg.block, cfg.drafts(), cfg.selector_top_k), (96,5,4,32));
+        assert_eq!(cfg.taps, [7,23,51,67,83,91]);
+        assert_eq!(cfg.windows, vec![Some(1024);5]);
+        let shapes: std::collections::BTreeMap<_,_> = cfg.tensor_shapes().into_iter().collect();
+        assert_eq!(shapes.len(),86);
+        assert_eq!(shapes["fc.weight"], [7168,43008]);
+        assert_eq!(shapes["layers.0.self_attn.q_b_proj.weight"], [18432,1536]);
+        assert_eq!(shapes["layers.0.self_attn.kv_b_proj.weight"], [24576,512]);
+        assert_eq!(shapes["layers.0.self_attn.o_proj.weight"], [7168,12288]);
+        assert_eq!(cfg.bf16_weight_bytes()?, 5_569_622_016);
+        for key in ["rope_interleave", "mla_use_nope"] {
+            let mut missing = raw.clone(); missing.as_object_mut().unwrap().remove(key);
+            assert!(MlaDflashConfig::from_json(&missing).is_err());
+        }
+        for key in ["fc_norm", "mla_use_output_gate"] {
+            let mut changed = raw.clone(); changed[key] = true.into();
+            assert!(MlaDflashConfig::from_json(&changed).is_err());
+            let mut legacy = config(); legacy.as_object_mut().unwrap().remove(key);
+            assert!(MlaDflashConfig::from_json(&legacy).is_err());
+        }
+        let mut wrong = raw.clone(); wrong["dflash_config"]["aux_hidden_stream"] = "terminal".into();
+        assert!(MlaDflashConfig::from_json(&wrong).is_err());
+        Ok(())
     }
 
     /// Every buffer each real layout emits is classified by rule: only the

@@ -340,8 +340,7 @@ pub fn mla_weight_recipe<T, M>(
     matrix: impl Fn(&[(&str, usize)], usize) -> Result<M>,
     absorb: impl Fn(&str) -> Result<(T, T)>,
 ) -> Result<MlaWeights<T, M>> {
-    use cuteafd_core::coordinator_programs::MlaDraftKind;
-    ensure!(cfg.kind == MlaDraftKind::Dflash2, "MLA DFlash arena recipe requires DFlash2");
+    ensure!(cfg.kind.is_dflash(), "MLA DFlash arena recipe requires DFlash2");
     let m = &cfg.mla;
     let h = m.hidden;
     let one = |name: &str, shape: &[usize]| tensor(&[(name, shape.to_vec())]);

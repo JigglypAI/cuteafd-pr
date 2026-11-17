@@ -324,7 +324,7 @@ impl<'a> MlaDraft<'a> {
         match self.kind {
             // SAFETY: host extents/devices/scalars are validated. The owner retains
             // storage and stream, and stages checked positions and physical slots.
-            MlaDraftKind::Dflash2 => unsafe {
+            MlaDraftKind::Dflash2 | MlaDraftKind::CausalDflash2 => unsafe {
                 self.producer.launch(&[b.x.ptr, b.slots.ptr, b.positions.ptr, b.inv_freq.ptr,
                     w.qkv_a.ptr, w.q_a_norm.ptr, w.kv_a_norm.ptr, w.q_b.ptr, w.uk.ptr,
                     b.cache.ptr, b.query.ptr, b.q_resid.ptr, b.producer_scratch.ptr],
@@ -478,14 +478,14 @@ fn ml4_producer_requirements(w: MlaDraftWeights, b: MlaDraftBatch, l: Layout) ->
 fn validate_producer_kind(kind: MlaDraftKind, w: MlaDraftWeights, b: MlaDraftBatch, l: Layout,
     cache_format: MlaCacheFormat) -> Result<()> {
     match kind {
-        MlaDraftKind::Dflash2 => validate_producer(w, b, l, cache_format),
+        MlaDraftKind::Dflash2 | MlaDraftKind::CausalDflash2 => validate_producer(w, b, l, cache_format),
         MlaDraftKind::Ml4Dspark => validate_buffers(&ml4_producer_requirements(w, b, l)?, b.x.device_id),
     }
 }
 
 fn validate_batch_kind(kind: MlaDraftKind, w: MlaDraftWeights, b: MlaDraftBatch, l: Layout,
     cache_format: MlaCacheFormat) -> Result<()> {
-    if kind == MlaDraftKind::Dflash2 { return validate_batch(w, b, l, cache_format); }
+    if kind.is_dflash() { return validate_batch(w, b, l, cache_format); }
     if b.requests == 0 || b.requests > b.rows || b.page_table_width == 0
         || b.page_table_width > l.context.div_ceil(PAGE) + 1
         || b.active_splits != l.splits || !b.attention_scale.is_finite() || b.attention_scale <= 0.0 {
