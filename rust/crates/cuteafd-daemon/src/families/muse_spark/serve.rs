@@ -396,9 +396,6 @@ pub(super) fn with_backend<T>(args: &ServeArgs, run: impl FnOnce(&super::backend
     let served_context = usize::try_from(context.min(placement.pool_tokens))?;
     let pages = usize::try_from(placement.pool_tokens)? / super::step::PAGE_ROWS;
     let streams = engine.streams.iter().map(|stream| stream.raw).collect::<Vec<_>>();
-    let pricing = draft.as_ref().map(|_| super::backend::DraftPricing::new(&cfg,
-        catalog.exl3().context("Muse draft pricing needs EXL3 headers")?, &onboarded, gpus, engine.link.world_size()?,
-        engine.link.installed_grouping()?)).transpose()?;
     tracing::info!(drafter = ?args.draft, onboarded = onboarded.len(), "Muse Spark drafter");
     let draft_receipts = if crate::shared::inventory::startup_probe_enabled() {
         draft.as_ref().map(|draft| draft.drafter.allocation_receipts(
@@ -407,7 +404,7 @@ pub(super) fn with_backend<T>(args: &ServeArgs, run: impl FnOnce(&super::backend
     } else { Vec::new() };
     let mut backend = super::backend::MuseBackend::new(&cfg, &ranks, streams, &embedding, &mut engine.link,
         engine.peer.as_ref(), usize::try_from(prefill.unit_rows)?, usize::try_from(prefill.waves)?, sequences,
-        served_context, pages, local, draft, pricing, super::media::Binding::from_view(&view, cfg.vocab_size)?, args.prefill_packing, built.host.prefix_bytes)?;
+        served_context, pages, local, draft, super::media::Binding::from_view(&view, cfg.vocab_size)?, args.prefill_packing, built.host.prefix_bytes)?;
     backend.configure_graphs(args.decode_graphs, placement.onboard_layers)?;
     let weight_census = if crate::shared::inventory::startup_probe_enabled() {
         use cuteafd_loader::placement::planner::{CoordinatorDevices, Lifetime, PhaseOrder};

@@ -66,7 +66,7 @@ pub(crate) enum BackendError {
 }
 
 #[derive(Default)]
-pub(crate) struct DraftState { anchor:Option<u32> }
+pub(crate) struct DraftState { anchor:Option<u32>, confidence:Vec<f32> }
 impl scheduler::DraftState for DraftState {
     fn pending_rows(&self) -> usize { usize::from(self.anchor.is_some()) }
     fn close(&mut self, token: u32) { self.anchor=Some(token); }
@@ -515,13 +515,6 @@ impl<'e, 'a> Backend<'a> for MiniMaxBackend<'e, 'a> {
         crate::shared::speculation_trace::Deferred::new(move || serde_json::json!({
             "kind":"minimax_msa", "rows":rows, "contexts":contexts, "attention":"eager", "arithmetic":"eager" }))
     }
-    fn draft_geometry(&self, _: &Path, width: usize) -> Result<cuteafd_core::PolicyGeometry> {
-        ensure!(self.owners.storage.draft_prefix.is_some(),"MiniMax drafter not admitted");
-        Ok(cuteafd_core::PolicyGeometry { layers:vec![cuteafd_core::LayerResource {
-            class:None,slice_bytes:0.,group_rows:1,timed:false };self.cfg.layers],
-            group_rows_by_rows:vec![],experts:0,topk:0,max_requests:self.geometry().slots,
-            max_positions:self.geometry().decode_rows,widths:vec![width],classes:vec![cuteafd_core::ResourceClass::rtx()],regimes:1 })
-    }
     fn arm_draft_probe(&self) -> Result<()> { self.policy_probe.borrow_mut().arm(self.cfg.layers);Ok(()) }
     fn prefill_draft(&self, placement:&Placement, _:usize, _: &[u32], next:Option<u32>, state:&mut DraftState) -> Result<()> {
         let draft=self.owners.storage.draft_prefix.as_ref().context("MiniMax drafter not admitted")?;
@@ -534,9 +527,12 @@ impl<'e, 'a> Backend<'a> for MiniMaxBackend<'e, 'a> {
         use crate::shared::speculation::dflash::{DraftSeq,TargetHead};
         let draft=self.owners.storage.draft_prefix.as_ref().context("MiniMax drafter not admitted")?;
         let mut output=vec![Vec::new();sequences.len()];
-        let selected=sequences.iter().enumerate().filter(|(_,sequence)| sequence.depth > 0).collect::<Vec<_>>();
+        for sequence in sequences.iter_mut() { sequence.seq.confidence.clear(); }
+        let selected=sequences.iter().enumerate().filter(|(_,sequence)| sequence.depth > 0)
+            .map(|(index,sequence)| (index,sequence.depth)).collect::<Vec<_>>();
         if selected.is_empty() { return Ok(output); }
-        let rows=selected.iter().map(|(_,sequence)| {
+        let rows=selected.iter().map(|&(index,_)| {
+            let sequence=&sequences[index];
             ensure!(draft.frontier(sequence.placement.slot)? == sequence.placement.len,"MiniMax draft target frontier differs");
             Ok(DraftSeq { slot:sequence.placement.slot,anchor:sequence.seq.anchor.context("MiniMax draft anchor missing")?,
                 position:sequence.placement.len,valid_from:0 })
@@ -546,11 +542,16 @@ impl<'e, 'a> Backend<'a> for MiniMaxBackend<'e, 'a> {
         let started=std::time::Instant::now();
         let proposed=draft.drafter.draft_device(&rows,&self.owners.storage.embedding,TargetHead::Bf16Buffer(&head))?;
         timing.steps+=1;timing.seconds+=started.elapsed().as_secs_f64();
-        for ((index,sequence),draft) in selected.into_iter().zip(proposed) {
-            output[index]=draft.tokens.into_iter().take(sequence.depth).collect();
+        for ((index,depth),draft) in selected.into_iter().zip(proposed) {
+            output[index]=draft.tokens.into_iter().take(depth).collect();
+            sequences[index].seq.confidence=draft.confidence;
         }
         Ok(output)
     }
+    // The bundled dSpark's trained confidence head, one sigmoid per drafted position.
+    fn draft_head_kind(&self) -> cuteafd_core::HeadScore { cuteafd_core::HeadScore::Probability }
+    fn draft_head<'d>(&self,draft:&'d DraftState) -> Option<&'d [f32]> { Some(&draft.confidence) }
+    fn draft_copies(&self) -> bool { true }
     fn accept(&self, verified: &mut [scheduler::Verified<'_, Placement, DraftState, u64>], speculative: bool) -> Result<()> {
         self.live()?;
         if let Some(draft)=&self.owners.storage.draft_prefix {
@@ -977,41 +978,6 @@ mod tests {
             std::fs::write(Path::new(&output).join("native-zero-proposal.json"),serde_json::to_vec_pretty(&report)?)?;
         }
         Ok(())
-    }
-
-    #[test]
-    fn policy_probe_observes_each_round_and_updates_only_live_concurrency_bucket() {
-        use crate::shared::draft::{resource,clock::RoundTimes,evidence::DraftSource};
-        let geometry=cuteafd_core::PolicyGeometry { layers:vec![cuteafd_core::LayerResource {
-            class:None,slice_bytes:0.,group_rows:1,timed:false };60],group_rows_by_rows:vec![],
-            experts:0,topk:0,max_requests:16,max_positions:128,widths:vec![7],
-            classes:vec![cuteafd_core::ResourceClass::rtx()],regimes:1 };
-        let mut policy=cuteafd_core::DraftPolicy::seeded(geometry,cuteafd_core::PolicySeed::weak(7)).unwrap();
-        let mut probe=PolicyProbe::default();
-        assert!(probe.finish(|_,_| ()).is_none());
-        probe.arm(60);
-        let mut observed=0;
-        for concurrency in [1,4,16] {
-            let other=[1,4,16].into_iter().filter(|&n| n!=concurrency)
-                .map(|n| (n,policy.cost_snapshot(false,n))).collect::<Vec<_>>();
-            for _ in 0..3 {
-                let before=policy.cost_snapshot(false,concurrency);
-                probe.begin(concurrency * 3);
-                let requests=(0..concurrency).map(|id| resource::Verified { id:id as u64,rows:3,accepted:2,
-                    source:DraftSource::Neural,prior:Some(&[0.8,0.8]),features:None,censor:None }).collect::<Vec<_>>();
-                probe.finish(|routes,times| {
-                    routes.complete().unwrap();
-                    resource::observe_drafted(&mut policy,&requests,routes,times,
-                        RoundTimes { total_us:2000 * concurrency as u64,draft_us:Some(300) },7,None,Some(concurrency)).unwrap();
-                    observed+=1;
-                }).unwrap();
-                let after=policy.cost_snapshot(false,concurrency);
-                assert_ne!(after.round,before.round);
-                assert_ne!(after.draft,before.draft);
-            }
-            for (n,before) in other { assert_eq!(policy.cost_snapshot(false,n),before); }
-        }
-        assert_eq!(observed,9);
     }
 
     #[test]

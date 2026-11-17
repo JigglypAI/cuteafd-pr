@@ -82,8 +82,7 @@ impl<'a> RoundProbe<'a> {
         // Initialize padding once: the single contiguous download includes unused row slots.
         library.cuda_zero_bytes(device_ring.buffer, bytes)?;
         let last_owned = dense.iter().rposition(|&dense| !dense);
-        Ok(Self { collect_routes: super::binding::configured_needs_routes(),
-            collect_timing: super::binding::configured_needs_timing(),
+        Ok(Self { collect_routes: false, collect_timing: super::timing_profile(),
             clock: LayerClock::new(library, layers)?, routes: RoundRoutes::new(layers, topk), ring,
             device_ring, last_owned, downloaded: false, capacity,
             topk, ringed: vec![false; layers], staged: vec![false; layers], dense,

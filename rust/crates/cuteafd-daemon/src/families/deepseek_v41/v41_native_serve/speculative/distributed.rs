@@ -36,10 +36,9 @@ impl<'w, 'a> DraftRuntime<'w, 'a, DistributedDsparkChain<'w, 'a>> {
                 mains, chains, windows: [window()?, window()?, window()?],
                 pending_commit_ids: vec![Vec::new(); lane_count], pending_prefix_ids: [None, None],
                 requests: Default::default(), pending: vec![None; lane_count],
-                request_limit: requests as usize, draft_limit: 5, draft_width: weights.draft_width(),
+                request_limit: requests as usize, draft_limit: weights.draft_width(), draft_width: weights.draft_width(),
                 confidence_trace: Default::default(), neural_lengths: Default::default(), length: Default::default(), policy: None,
-                published: None,
-                lanes: (0..lane_count).map(|_| LaneRound::new(policy::LAYERS, policy::TOPK)).collect(),
+                lanes: vec![LaneDraft::default(); lane_count],
             })
         })
     }
@@ -87,8 +86,7 @@ mod tests {
         assert!(actual.requests.is_empty());
         assert!(actual.pending.iter().all(Option::is_none));
         devices[1].run(|| {
-            let geometry = policy::remote_geometry(5);
-            actual.bind_policy(geometry.clone())?; reference.bind_policy(geometry)?;
+            actual.bind_policy(0); reference.bind_policy(0);
             for id in 1000..1016 { actual.admit(id)?; reference.admit(id)?; }
             Ok(())
         })?;

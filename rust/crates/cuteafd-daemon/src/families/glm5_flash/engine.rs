@@ -2429,69 +2429,6 @@ impl<'a> GlmfEngine<'a> {
             == Some(ExpertRoute::Backend(cuteafd_loader::placement::ExpertHome::RtxTp2))
     }
 
-    /// Bind the actual admitted TP1/TP2/Spark homes, not catalog availability.
-    pub(crate) fn draft_geometry(&self, catalog: Option<&cuteafd_loader::OfficialV41Catalog>, width: usize,
-        extension: usize) -> Result<cuteafd_core::PolicyGeometry> {
-        use crate::shared::draft::resource::{self, LayerHome};
-        let remote = match &self.experts {
-            Some(Experts::Spark { transport, .. }) => transport.borrow().installed_grouping()?,
-            _ => Vec::new(),
-        };
-        let homes = self.weights.layers.iter().enumerate().map(|(layer, weights)| {
-            if weights.dense { return Ok(LayerHome::Dense); }
-            let tp = if self.tp2_layer(layer) { 2 } else {
-                match self.routed_experts(layer) {
-                    Some(Experts::Local(_) | Experts::LocalExl3(_) | Experts::LocalNative(_)) => 1,
-                    Some(Experts::Spark { .. }) => remote.len(),
-                    _ => anyhow::bail!("GLM Flash layer {layer} has no installed expert home"),
-                }
-            };
-            ensure!(tp > 0, "GLM Flash layer {layer} has no installed expert ranks");
-            let catalog = catalog.context("GLM Flash routed expert catalog missing")?;
-            let slice_bytes = resource::layer_slice_bytes(catalog.exl3(), layer, tp, || {
-                if let Some(tp2) = self.tp2.as_ref().filter(|tp2| tp2.layers.contains(&layer)) {
-                    let left = tp2.ranks[0].borrow();
-                    let right = tp2.ranks[1].borrow();
-                    tp2_weight_read_bytes([left.as_ref(), right.as_ref()])
-                } else if catalog.format() == cuteafd_loader::plan::checkpoint::CheckpointFormat::Exlr8 {
-                    match self.routed_experts(layer) {
-                        Some(Experts::LocalNative(local)) => local.borrow().weight_read_bytes(),
-                        Some(Experts::Spark { .. }) => resource::worker_weight_read_bytes(&remote, layer),
-                        _ => anyhow::bail!("GLM Flash layer {layer} has no installed native byte descriptor"),
-                    }
-                } else {
-                    anyhow::ensure!(catalog.fp8().is_some(), "GLM Flash routed expert format cannot be priced");
-                    match self.routed_experts(layer) {
-                        Some(Experts::Local(local)) => Ok(local.experts.borrow().weight_read_bytes()),
-                        Some(Experts::Spark { .. }) => resource::worker_weight_read_bytes(&remote, layer),
-                        _ => anyhow::bail!("GLM Flash layer {layer} has no installed FP8-family byte descriptor"),
-                    }
-                }
-            })?;
-            Ok(if matches!(self.routed_experts(layer), Some(Experts::Spark { .. })) && !self.tp2_layer(layer) {
-                LayerHome::Remote { slice_bytes }
-            } else { LayerHome::Local { slice_bytes } })
-        }).collect::<Result<Vec<_>>>()?;
-        resource::geometry_with_grouping(&homes, self.cfg.experts, self.cfg.topk, self.verify_rows, width,
-            extension, |layer, rows| {
-                if let Some(tp2) = self.tp2.as_ref().filter(|tp2| tp2.layers.contains(&layer)) {
-                    let group = tp2.ranks[0].borrow().group_rows(rows)?;
-                    ensure!(tp2.ranks[1].borrow().group_rows(rows)? == group,
-                        "GLM Flash installed TP2 ranks disagree on layer {layer} grouping");
-                    return Ok(group);
-                }
-                match self.routed_experts(layer) {
-                    Some(Experts::LocalNative(local)) => local.borrow().group_rows(rows),
-                    Some(Experts::Local(local)) => Ok(local.experts.borrow().weight_read_group(rows, true)?.0),
-                    Some(Experts::LocalExl3(local)) => crate::families::deepseek_v4::local::installed_window_group_rows(
-                        &local.resident, || local.ensure(layer, self.stream), rows,
-                        |experts, rows| experts.group_rows(rows)),
-                    Some(Experts::Spark { .. }) => resource::worker_group_rows_for_input(&remote, layer, rows, self.spark_bf16),
-                    _ => anyhow::bail!("GLM Flash layer {layer} has no installed expert grouping"),
-                }
-            })
-    }
-
     fn record_exchange(&self, rank: usize, name: &'static str, slot: usize, push: bool) {
         let Some(tp2) = &self.tp2 else { return };
         let mut recorded = tp2.schedule.borrow_mut();
@@ -5625,26 +5562,6 @@ mod tp2_tests {
         let mut wrong = valid(); wrong.fp8 = false;
         assert!(native_local_layers(&wrong, 4).is_err());
         assert!(native_local_layers(&valid(), 0).is_err());
-    }
-    #[test]
-    fn draft_geometry_prices_installed_tp2_owners_and_propagates_errors() {
-        struct Rank(Option<usize>);
-        impl RtxExpertLayer for Rank {
-            fn shard(&self) -> crate::shared::experts::rtx::RtxShard { unreachable!() }
-            fn partial(&self) -> PartialDtype { PartialDtype::Bf16 }
-            fn uses_fp8_input(&self) -> bool { true }
-            fn layers(&self) -> &[usize] { &[3] }
-            fn device(&self) -> i32 { 0 }
-            fn workspace_bytes(&self) -> usize { 0 }
-            fn output(&self) -> *mut c_void { std::ptr::null_mut() }
-            fn weight_read_bytes(&self) -> Result<usize> { self.0.context("installed descriptor missing") }
-            unsafe fn enqueue(&mut self, _: usize, _: usize, _: ExpertInput, _: Routes,
-                _: *mut c_void, _: &mut dyn FnMut()) -> Result<()> { unreachable!() }
-        }
-        assert_eq!(tp2_weight_read_bytes([&Rank(Some(123)), &Rank(Some(456))]).unwrap(), 456);
-        assert_eq!(tp2_weight_read_bytes([&Rank(Some(456)), &Rank(Some(123))]).unwrap(), 456);
-        assert!(tp2_weight_read_bytes([&Rank(None), &Rank(Some(456))]).is_err());
-        assert!(tp2_weight_read_bytes([&Rank(Some(456)), &Rank(None)]).is_err());
     }
 
     #[test]

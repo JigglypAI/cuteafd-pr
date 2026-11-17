@@ -1,86 +1,26 @@
-//! Engine plumbing for the resource-priced draft policy
-//! (`cuteafd_core::draft_policy`), shared by every family's serve loop.
+//! Speculative drafting shared by every family's serve loop.
 //!
-//! A round gives the policy three signals, each taken where the engine already
-//! has the data:
-//! - [`clock::LayerClock`]: per-layer device time from CUDA timing events
-//!   recorded between graph launches, read once after the round's own sync;
-//! - [`routes::RoundRoutes`]: the round's routed expert ids per layer and
-//!   verifier row, copied from host staging (Spark layers) or a device ring
-//!   (local layers);
-//! - [`clock::RoundClock`]: host round and draft-call boundaries.
-//!
-//! [`evidence`] names where each request's drafts came from and what the
-//! drafter said about them, with the censor reasons that keep unverified
-//! positions out of the acceptance evidence. [`binding`] turns one completed
-//! round into the policy's observation and owns the per-lane state a serve loop
-//! carries between selection and observation.
-pub(crate) mod binding;
+//! [`history`] is the one draft policy: per-position acceptance history with
+//! exploration (`cuteafd_core::DraftHistory`), its launch configuration
+//! ([`length`]), trace records and stats. A drafter declares its native block
+//! and, where it has a trained confidence head, a raw score per position;
+//! nothing else. [`copy`] finds the history copies the policy may verify past
+//! an agreeing neural draft. [`clock`] and [`timing`] are profiling only.
 pub(crate) mod clock;
 pub(crate) mod copy;
-pub(crate) mod evidence;
+pub(crate) mod history;
 pub(crate) mod length;
 pub(crate) mod probe;
 pub(crate) mod remote;
 pub(crate) mod remote_dflash;
-pub(crate) mod resource;
 pub(crate) mod routes;
-pub(crate) mod runtime;
 pub(crate) mod timing;
 
-/// Apply the opt-in length rules: `CUTEAFD_DRAFT_SURVIVAL_LENGTHS` (launcher
-/// key `DRAFT_SURVIVAL_LENGTHS`) verifies drafts while their calibrated
-/// survival is at least one half, with width, skip and copy actions still
-/// resource priced; `CUTEAFD_DRAFT_POLICY` (launcher key `DRAFT_POLICY`)
-/// selects the length rule (`cuteafd_core::DraftMode`): `simple` by default,
-/// `simple-rc` or `simple-derived`, or `shared` for the resource-priced policy.
-pub(crate) fn apply_length_rule(policy: &mut cuteafd_core::DraftPolicy) {
-    let survival = super::draft_policy::enabled("CUTEAFD_DRAFT_SURVIVAL_LENGTHS");
-    if survival { tracing::info!("draft lengths follow calibrated survival >= 0.5"); }
-    policy.set_survival_lengths(survival);
-    policy.set_draft_mode(draft_mode());
-    policy.set_row_cost(row_cost());
-    cuteafd_bench::context::set_resolved("per-layer-timing",
-        if binding::needs_timing(policy) { "on (perturbing)" } else { "off" });
-}
-
-/// How the simple rules price rows (`CUTEAFD_DRAFT_ROW_COST`, launcher key
-/// `DRAFT_ROW_COST`: linear by default, power or log).
-pub(crate) fn row_cost() -> cuteafd_core::RowCost {
-    static COST: std::sync::OnceLock<cuteafd_core::RowCost> = std::sync::OnceLock::new();
-    *COST.get_or_init(|| {
-        let value = std::env::var("CUTEAFD_DRAFT_ROW_COST").unwrap_or_default();
-        cuteafd_core::RowCost::parse(&value).unwrap_or_else(|| {
-            tracing::warn!(value, "unknown CUTEAFD_DRAFT_ROW_COST; using linear");
-            cuteafd_core::RowCost::Linear
-        })
-    })
-}
-
-/// Explicit device timing profiles, independent of observers and replay traces.
+/// Explicit device timing profiles.
 pub(crate) fn timing_profile() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| ["CUTEAFD_DRAFT_TIMING", "CUTEAFD_PROTOCOL_V2_TCP_TIMING"]
-        .iter().any(|name| super::draft_policy::enabled(name)))
-}
-
-/// The configured draft mode; unset and unknown values keep the simple policy.
-pub(crate) fn draft_mode() -> cuteafd_core::DraftMode {
-    static MODE: std::sync::OnceLock<cuteafd_core::DraftMode> = std::sync::OnceLock::new();
-    *MODE.get_or_init(|| {
-        let value = std::env::var("CUTEAFD_DRAFT_POLICY").unwrap_or_default();
-        let mode = resolve_draft_mode(&value);
-        tracing::info!(mode = mode.label(), "draft length policy selected");
-        mode
-    })
-}
-
-fn resolve_draft_mode(value: &str) -> cuteafd_core::DraftMode {
-    if value.is_empty() { return cuteafd_core::DraftMode::Simple; }
-    cuteafd_core::DraftMode::parse(value).unwrap_or_else(|| {
-        tracing::warn!(value, "unknown CUTEAFD_DRAFT_POLICY; using simple");
-        cuteafd_core::DraftMode::Simple
-    })
+    *ENABLED.get_or_init(|| ["CUTEAFD_DRAFT_TIMING", "CUTEAFD_PROTOCOL_V2_TCP_TIMING"].iter()
+        .any(|name| std::env::var(name).is_ok_and(|v| matches!(v.as_str(), "1" | "on" | "true"))))
 }
 
 /// BF16 drafter proposals use tensor cores at every row count, borrowing the
@@ -97,19 +37,4 @@ pub(crate) unsafe fn launch_bf16_head(head: &cuteafd_ffi::programs::VocabularyHe
     let rows = u32::try_from(rows).map_err(|_| anyhow::anyhow!("drafter head row count exceeds u32"))?;
     // SAFETY: the caller retains the checked geometry, buffers and workspace.
     unsafe { head.launch_tensor_op(input, weight, logits, rows, stream) }
-}
-
-#[cfg(test)]
-mod mode_tests {
-    use super::*;
-    use cuteafd_core::DraftMode;
-
-    #[test]
-    fn unset_policy_selects_simple_and_explicit_values_win() {
-        assert_eq!(resolve_draft_mode(""), DraftMode::Simple);
-        for mode in [DraftMode::Simple, DraftMode::Shared, DraftMode::SimpleRc, DraftMode::SimpleDerived] {
-            assert_eq!(resolve_draft_mode(mode.label()), mode);
-        }
-        assert_eq!(resolve_draft_mode("unknown"), DraftMode::Simple);
-    }
 }

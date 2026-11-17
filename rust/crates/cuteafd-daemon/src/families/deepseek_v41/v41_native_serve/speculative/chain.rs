@@ -19,8 +19,6 @@ pub(crate) trait DraftChain<'a> {
     fn note_failure(&mut self, error: &anyhow::Error);
     /// Draft width of the next (or pending) proposal.
     fn width(&self) -> usize;
-    /// Select the width (5 or 7, within the loaded maximum) before staging.
-    fn set_width(&mut self, width: usize) -> Result<()>;
     /// A terminal draft (dead expert wire or a sticky CUDA/replay failure) is
     /// not a reusable target-only fallback: the lane must fail the round
     /// instead of verifying anchors forever. Mirrors GLM Flash's `require_live`
@@ -91,9 +89,6 @@ macro_rules! chain {
             fn cancel_replay(&mut self) { self.cancel_replay() }
             fn note_failure(&mut self, error: &anyhow::Error) { self.note_failure(error) }
             fn width(&self) -> usize { self.width() }
-            fn set_width(&mut self, width: usize) -> Result<()> {
-                self.set_width(width)
-            }
             fn require_live(&self) -> Result<()> { ($live)(self) }
         }
     };

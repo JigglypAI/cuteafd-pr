@@ -24,15 +24,6 @@ const H: usize = 4096;
 
 fn decode_peer_bytes(capacity: usize) -> usize { capacity.min(64) * H * 4 }
 
-fn draft_homes(ownership: &ExecutionOwnership, catalog: &cuteafd_loader::OfficialV41Catalog,
-    reports: &[cuteafd_transport::worker_selection::InstalledExpertGrouping],
-    read_bytes: impl Fn(usize) -> Result<usize>) -> Result<Vec<crate::shared::draft::resource::LayerHome>> {
-    crate::shared::draft::resource::layer_homes(ownership.execution().modes().iter().enumerate().map(|(layer, _)| {
-        let local = ownership.onboarded(layer);
-        (layer < 3 || layer == 91, local, if local { ownership.ranks() } else { reports.len() })
-    }), catalog.exl3(), read_bytes)
-}
-
 /// Immutable headers are shared across every native plan and allocation in a launch.
 pub(super) struct NativePlan {
     pub(super) contract: Rc<CoordinatorContract>,
@@ -1133,31 +1124,6 @@ impl<'e, 'a> Execution<'e, 'a> {
         })?;
         Ok(packed_route_cap(rows, &reports, &inputs))
     }
-    pub(super) fn draft_geometry(&self, width: usize, rows: usize)
-        -> Result<cuteafd_core::PolicyGeometry> {
-        use crate::shared::{draft::resource, experts::rtx::RtxExpertLayer};
-        let catalog = cuteafd_loader::read_expert_catalog_view(self.main.checkpoint.view.as_ref()
-            .context("Step-5 draft geometry requires its selected checkpoint view")?)?;
-        let transport = self.main.transport.borrow();
-        let reports = transport.as_ref().context("Step-5 main transport missing")?.installed_grouping()?;
-        let homes = draft_homes(&self.main.ownership, &catalog, &reports, |layer| {
-            if self.main.ownership.onboarded(layer) {
-                self.main.tp2.as_ref().context("Step-5 installed native TP2 experts missing")?.pair.weight_read_bytes()
-            } else { resource::worker_weight_read_bytes(&reports, layer) }
-        })?;
-        resource::geometry_with_grouping(&homes, 352, 8, rows, width, 0, |layer, rows| {
-            if self.main.ownership.onboarded(layer) {
-                if let Some(tp2) = &self.main.tp2 { return tp2.pair.group_rows(rows); }
-                return self.main.native.onboarded.as_ref().context("Step-5 installed local EXL3 experts missing")?
-                    .borrow().group_rows(rows);
-            }
-            let owner = owner_of(&self.main, layer)?.unwrap_or(0);
-            let Ffn::Routed(ffn) = &self.main.layer(owner, layer)?.ffn else {
-                anyhow::bail!("Step-5 routed layer missing from draft admission");
-            };
-            resource::worker_group_rows_for_input(&reports, layer, rows, ffn.wire_dtype() == ExpertV2Dtype::Bf16)
-        })
-    }
     pub(super) fn poison_scratch_between_layers(&self) { self.main.poison_scratch.set(true); }
     pub(super) fn retain_diagnostic_outputs(&self, layers: &[usize]) -> Result<()> {
         ensure!(layers.iter().all(|&layer| layer < self.main.inventory.len()), "Step-5 diagnostic layer outside loaded target");
@@ -2224,18 +2190,6 @@ mod tests {
                 assert_eq!(packed_route_cap(64, &reports, &invalid), 0,
                     "an onboarded layer has no Spark report; filter it before computing the cap");
             }
-            let homes = draft_homes(&ownership, &catalog, &reports,
-                |_| panic!("EXL3 must price checkpoint headers, not FP8 descriptors"))?;
-            for (layer, home) in homes.iter().enumerate() {
-                if !(3..91).contains(&layer) { assert_eq!(*home, LayerHome::Dense); continue; }
-                let local = ownership.onboarded(layer);
-                let bytes = resource::exl3_slice_bytes(catalog.exl3().unwrap(), layer,
-                    if local { gpus } else { sparks })?;
-                assert_eq!(*home, if local { LayerHome::Local { slice_bytes: bytes } }
-                    else { LayerHome::Remote { slice_bytes: bytes } });
-                if !local { assert_eq!(resource::worker_group_rows_for_input(&reports, layer, 64, false)?, 16); }
-            }
-            assert_eq!(homes.iter().filter(|home| matches!(home, LayerHome::Local { .. })).count(), onboarded.len());
             eprintln!("Step draft {gpus} RTX + {sparks} Sparks: {} Local, {} Remote; all ranks covered", onboarded.len(), remote.len());
         }
         Ok(())

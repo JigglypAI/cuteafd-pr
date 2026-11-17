@@ -168,8 +168,6 @@ pub(crate) struct MimoDrafter<'a> {
     bf16_head: bool,
     fp8_workspace: Option<Dev<'a>>,
 
-    confidence_directory: std::path::PathBuf,
-    confidence_scales: fp8_linear::Fp8Scales,
     rank: usize,
     ranks: usize,
     peer: Option<DeviceOwner<'a, Box<MimoDrafter<'a>>>>,
@@ -559,18 +557,6 @@ mod mask_tests {
 }
 
 impl<'a> MimoDrafter<'a> {
-    pub fn confidence_prior(&self, head: &str) -> Result<crate::shared::draft_confidence::SelectorFit> {
-        let (storage, rows) = match self.representation {
-            MimoDraftRepresentation::Bf16Only => ("bf16", "bf16-linear"),
-            MimoDraftRepresentation::Fp8Only => ("fp8", "w8a16-chunk64"),
-        };
-        let kv = if self.kv_cache == cuteafd_loader::families::qwen4::Qwen4KvCache::Fp8 { "-kv-fp8" } else { "" };
-        let numerics = format!("{storage}-{rows}-{head}-{:?}{kv}-r1", self.confidence_scales).to_ascii_lowercase();
-        let key = format!("mimo_v2/dflash/{numerics}");
-        let mut fit = crate::shared::draft_confidence::SelectorFit::load(&self.confidence_directory, &key)?;
-        fit.key = key;
-        Ok(fit)
-    }
 
     /// Loads the drafter's weights from `file` (its safetensors bytes, see
     /// [`prefetch`]) and allocates `slots` ring contexts; draft steps take up
@@ -695,8 +681,6 @@ impl<'a> MimoDrafter<'a> {
             workspace: RefCell::new(None),
             representation,
             bf16_head,
-            confidence_directory: dir.into(),
-            confidence_scales: scales,
             fp8_workspace,
             timing: crate::shared::draft::timing::DraftTiming::from_env(library, "mimo-dflash")?,
             cfg,

@@ -420,16 +420,19 @@ mod tests {
     #[test]
     fn mtp_source_charge_uses_scheduler_verify_budget() -> anyhow::Result<()> {
         use super::{DECODE_ROWS, MTP_DEFERRED_STEPS};
-        use crate::shared::draft::resource::trim_budget;
+        use cuteafd_core::{DraftControl, DraftHistory, DrafterSpec, HeadScore};
         assert_eq!(DECODE_ROWS, cuteafd_loader::families::qwen4::VERIFY_ROWS);
-        for requests in 1..=DECODE_ROWS {
-            let mut depths = vec![MTP_DEFERRED_STEPS; requests];
-            trim_budget(&mut depths, DECODE_ROWS);
-            assert!(depths.iter().map(|depth| depth + 1).sum::<usize>() <= DECODE_ROWS);
+        let spec = DrafterSpec { block: MTP_DEFERRED_STEPS, head: HeadScore::None, copy: 0 };
+        for control in [DraftControl::History, DraftControl::Fixed(MTP_DEFERRED_STEPS)] {
+            for requests in 1..=DECODE_ROWS {
+                let plan: Vec<_> = (0..requests as u64).map(|id| (id, MTP_DEFERRED_STEPS)).collect();
+                let depths = DraftHistory::new(spec, control).plan(&plan, DECODE_ROWS);
+                assert!(depths.iter().map(|depth| depth + 1).sum::<usize>() <= DECODE_ROWS);
+                assert!(depths.iter().all(|&depth| depth <= MTP_DEFERRED_STEPS));
+            }
         }
-        let mut negative = vec![MTP_DEFERRED_STEPS; DECODE_ROWS];
-        assert!(negative.iter().map(|depth| depth + 1).sum::<usize>() > DECODE_ROWS);
-        assert!(trim_budget(&mut negative, DECODE_ROWS));
+        // Unbudgeted, a full lane of full chains would not fit.
+        assert!(DECODE_ROWS * (MTP_DEFERRED_STEPS + 1) > DECODE_ROWS);
         Ok(())
     }
 
@@ -1712,36 +1715,6 @@ impl<'a> Qwen4Engine<'a> {
         })).collect::<Result<Vec<_>>>()?;
         *self.draft_probes.borrow_mut() = probes;
         Ok(())
-    }
-
-    pub(crate) fn draft_homes(&self, snapshot: &std::path::Path) -> Result<Vec<crate::shared::draft::resource::LayerHome>> {
-        use crate::shared::draft::resource;
-        let catalog = cuteafd_loader::read_expert_catalog(snapshot)?;
-        let Some(Experts::Hybrid(experts)) = &self.experts else { anyhow::bail!("Qwen expert homes missing") };
-        let remote = self.spark_link(0).map(|link| link.borrow().installed_grouping()).transpose()?.unwrap_or_default();
-        let world = self.spark_link(0).map_or(0, |link| link.borrow().world_size());
-        let local_tp = if matches!(experts.local, Some(LocalRouted::Tp2(_))) { 2 } else { 1 };
-        resource::layer_homes((0..self.cfg.layers).map(|layer| {
-            let local = experts.local_layer(layer);
-            (false, local, if local { local_tp } else { world })
-        }), catalog.exl3(), |layer| {
-            if experts.local_layer(layer) { experts.local.as_ref().context("Qwen local owner")?.weight_read_bytes() }
-            else { resource::worker_weight_read_bytes(&remote, layer) }
-        })
-    }
-
-    pub(crate) fn draft_geometry(&self, snapshot: &std::path::Path, width: usize)
-        -> Result<cuteafd_core::PolicyGeometry> {
-        use crate::shared::draft::resource;
-        let remote = self.spark_link(0).map(|link| link.borrow().installed_grouping()).transpose()?.unwrap_or_default();
-        resource::geometry_with_grouping(&self.draft_homes(snapshot)?, self.cfg.experts, self.cfg.topk,
-            DECODE_ROWS, width, resource::COPY_EXTENSION, |layer, rows| {
-                match &self.experts {
-                    Some(Experts::Hybrid(experts)) if experts.local_layer(layer) =>
-                        experts.local.as_ref().context("Qwen local owner")?.group_rows(rows),
-                    _ => resource::worker_group_rows_for_input(&remote, layer, rows, self.spark_bf16),
-                }
-            })
     }
 
     pub(crate) fn probe_begin(&self, rows: usize) {

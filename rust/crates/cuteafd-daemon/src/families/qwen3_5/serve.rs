@@ -13,14 +13,6 @@ use crate::shared::speculation::{
     block_dspark::{self, DsparkDrafter}, dflash::{ContextRow, DraftSeq, TargetHead, TAP_ROWS}};
 use cuteafd_ffi::CuteafdDeviceBuffer;
 
-fn draft_geometry(layers: usize, slots: usize, rows: usize, width: usize) -> cuteafd_core::PolicyGeometry {
-    cuteafd_core::PolicyGeometry {
-        layers: vec![cuteafd_core::LayerResource { class: None, slice_bytes: 0., group_rows: 1, timed: false }; layers],
-        group_rows_by_rows: vec![vec![1; layers]; rows + 1], experts: 0, topk: 0, max_requests: slots,
-        max_positions: rows, widths: vec![width], classes: vec![cuteafd_core::ResourceClass::rtx()], regimes: 1,
-    }
-}
-
 #[derive(Default)]
 struct DenseProbe { routes: Option<RoundRoutes> }
 impl DenseProbe {
@@ -39,7 +31,7 @@ impl DenseProbe {
 }
 
 #[derive(Default)]
-pub(crate) struct DraftState { anchor: Option<u32> }
+pub(crate) struct DraftState { anchor: Option<u32>, confidence: Vec<f32> }
 impl scheduler::DraftState for DraftState {
     fn pending_rows(&self) -> usize { usize::from(self.anchor.is_some()) }
     fn close(&mut self, token: u32) { self.anchor = Some(token); }
@@ -432,17 +424,6 @@ impl<'e, 'a> Backend<'a> for DenseBackend<'e, 'a> {
         let contexts = contexts.to_vec();
         crate::shared::speculation_trace::Deferred::new(move || serde_json::json!({"kind":"causal_gqa", "rows":rows, "contexts":contexts}))
     }
-    fn draft_geometry(&self, _snapshot: &Path, width: usize) -> Result<cuteafd_core::PolicyGeometry> {
-        if self.mtp.is_some() {
-            ensure!((1..=3).contains(&width), "dense native MTP chain depth outside 1..=3");
-            let engine = self.engine.borrow();
-            return Ok(draft_geometry(engine.cfg.attention.len(), engine.slot_count(), engine.decode_rows(), width));
-        }
-        let draft = self.drafter.as_ref().context("dense serving has no drafter")?;
-        ensure!(width <= draft.cfg.drafts(), "dense draft width exceeds checkpoint");
-        let engine = self.engine.borrow();
-        Ok(draft_geometry(engine.cfg.attention.len(), draft.max_sequences, engine.decode_rows(), width))
-    }
     fn arm_draft_probe(&self) -> Result<()> {
         self.probe.borrow_mut().arm(self.engine.borrow().cfg.attention.len());
         Ok(())
@@ -474,12 +455,14 @@ impl<'e, 'a> Backend<'a> for DenseBackend<'e, 'a> {
         }
         let draft = self.drafter.as_ref().context("dense serving has no drafter")?;
         let mut proposed = vec![Vec::new(); sequences.len()];
-        let selected = sequences.iter().enumerate().filter(|(_, sequence)| sequence.depth > 0).collect::<Vec<_>>();
+        for sequence in sequences.iter_mut() { sequence.seq.confidence.clear(); }
+        let selected = sequences.iter().enumerate().filter(|(_, sequence)| sequence.depth > 0)
+            .map(|(index, sequence)| (index, sequence.depth)).collect::<Vec<_>>();
         if selected.is_empty() { return Ok(proposed); }
-        let rows = selected.iter().map(|(_, sequence)| Ok(DraftSeq {
+        let rows = selected.iter().map(|&(index, _)| { let sequence = &sequences[index]; Ok(DraftSeq {
             slot: sequence.placement.slot, anchor: sequence.seq.anchor.context("dense draft has no anchor")?,
             position: sequence.placement.len, valid_from: 0,
-        })).collect::<Result<Vec<_>>>()?;
+        }) }).collect::<Result<Vec<_>>>()?;
         let engine = self.engine.borrow();
         let start = std::time::Instant::now();
         let device_id = engine.target_stream().device.id;
@@ -500,11 +483,20 @@ impl<'e, 'a> Backend<'a> for DenseBackend<'e, 'a> {
         let output = draft.draft_device(&rows, engine.token_embedding(), head)?;
         timing.steps += 1;
         timing.seconds += start.elapsed().as_secs_f64();
-        for ((index, sequence), output) in selected.into_iter().zip(output) {
-            proposed[index] = output.tokens.into_iter().take(sequence.depth).collect();
+        for ((index, depth), output) in selected.into_iter().zip(output) {
+            proposed[index] = output.tokens.into_iter().take(depth).collect();
+            sequences[index].seq.confidence = output.confidence;
         }
         Ok(proposed)
     }
+    // dSpark has a trained confidence head (one sigmoid per position); the MTP chain has none.
+    fn draft_head_kind(&self) -> cuteafd_core::HeadScore {
+        if self.drafter.is_some() { cuteafd_core::HeadScore::Probability } else { cuteafd_core::HeadScore::None }
+    }
+    fn draft_head<'d>(&self, draft: &'d DraftState) -> Option<&'d [f32]> {
+        self.drafter.as_ref().map(|_| draft.confidence.as_slice())
+    }
+    fn draft_copies(&self) -> bool { true }
     fn accept(&self, verified: &mut [scheduler::Verified<'_, Placement, DraftState, ()>], speculative: bool) -> Result<()> {
         if let Some(mtp) = &self.mtp {
             let mut engine = self.engine.borrow_mut();
@@ -1017,43 +1009,6 @@ mod tests {
         }
         assert!(Cli::try_parse_from(base.into_iter().chain(["--mtp", "4"])).is_err());
         assert!(Cli::try_parse_from(base.into_iter().chain(["--mtp", "1", "--draft", "external"])).is_err());
-    }
-
-    #[test]
-    fn dense_probe_observes_acceptance_and_costs_only_in_its_concurrency_bucket() {
-        use crate::shared::draft::{clock::RoundTimes, evidence::DraftSource, resource};
-        let mut policy = cuteafd_core::DraftPolicy::seeded(draft_geometry(64, 16, 64, 7),
-            cuteafd_core::PolicySeed::weak(7)).unwrap();
-        let mut probe = DenseProbe::default();
-        assert!(probe.finish(|_, _| ()).is_none());
-        probe.arm(64);
-        for concurrency in [1, 4, 16] {
-            let other = [1, 4, 16].into_iter().filter(|&n| n != concurrency)
-                .map(|n| (n, policy.cost_snapshot(false, n), policy.calibration(n))).collect::<Vec<_>>();
-            let before = policy.cost_snapshot(false, concurrency);
-            let calibration = policy.calibration(concurrency);
-            probe.begin(concurrency * 3);
-            let requests = (0..concurrency).map(|id| resource::Verified { id: id as u64, rows: 3,
-                accepted: 2, source: DraftSource::Neural, prior: Some(&[0.8, 0.8]), features: None,
-                censor: None }).collect::<Vec<_>>();
-            probe.finish(|routes, times| {
-                assert!(routes.flat().is_empty());
-                routes.complete().unwrap();
-                resource::observe_drafted(&mut policy, &requests, routes, times,
-                    RoundTimes { total_us: 2000 * concurrency as u64, draft_us: Some(300) },
-                    7, None, Some(concurrency)).unwrap();
-            }).unwrap();
-            assert_ne!(policy.cost_snapshot(false, concurrency).round, before.round);
-            assert_ne!(policy.cost_snapshot(false, concurrency).draft, before.draft);
-            assert_ne!(policy.calibration(concurrency), calibration);
-            for (n, costs, calibration) in other {
-                assert_eq!(policy.cost_snapshot(false, n), costs);
-                assert_eq!(policy.calibration(n), calibration);
-            }
-        }
-        assert_eq!(policy.stats().rounds, 3);
-        assert_eq!(policy.stats().verified_drafts, 42);
-        assert_eq!(policy.stats().accepted_drafts, 21);
     }
 
     #[test]

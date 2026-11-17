@@ -1110,33 +1110,28 @@ fn boot_concurrency_full_plan_matrix_muse_spark() {
 }
 
 #[test]
-fn v41_full_concurrency_launcher_admission_and_configured_draft_width() {
+fn v41_full_concurrency_launcher_admission_at_the_native_draft_block() {
     use cuteafd_core::memory_layout::Category;
     let dir = strict_v41_snapshot(false);
     let input = PlanInput::open(dir.path()).unwrap();
     for (gpus, ranks) in [(1, 3), (2, 6)] {
         for concurrency in [17, 32, 33, 64] {
-            let mut draft_bytes = Vec::new();
-            for limit in [5, 7] {
-                let mut options = wave_plan_options(dir.path(), ranks);
-                let layout = options.layout.as_mut().unwrap();
-                layout.rtx_bytes = vec![96 << 30; gpus];
-                layout.concurrency = concurrency;
-                layout.context_tokens = 262_144;
-                layout.pool_tokens = Some(0);
-                layout.workspace_manifest = v41_workspace(dir.path());
-                layout.native_mtp_layers = 3;
-                layout.v41_draft_width = limit;
-                let start = std::time::Instant::now();
-                let report = input.plan_spark_count(&options, 6, Some(ranks)).unwrap();
-                assert!(start.elapsed() < std::time::Duration::from_secs(10));
-                assert!(report.fits && report.placement_supported && report.executable(),
-                    "C{concurrency} GPUs={gpus} width={limit}: {}", render(&report));
-                let memory = report.memory_layout.as_ref().unwrap();
-                draft_bytes.push(memory.devices.iter().flat_map(|d| &d.items)
-                    .filter(|i| i.category == Category::Drafter).map(|i| i.bytes).sum::<u64>());
-            }
-            assert!(draft_bytes[1] > draft_bytes[0], "configured width must charge larger terminal/head owners");
+            let mut options = wave_plan_options(dir.path(), ranks);
+            let layout = options.layout.as_mut().unwrap();
+            layout.rtx_bytes = vec![96 << 30; gpus];
+            layout.concurrency = concurrency;
+            layout.context_tokens = 262_144;
+            layout.pool_tokens = Some(0);
+            layout.workspace_manifest = v41_workspace(dir.path());
+            layout.native_mtp_layers = 3;
+            let start = std::time::Instant::now();
+            let report = input.plan_spark_count(&options, 6, Some(ranks)).unwrap();
+            assert!(start.elapsed() < std::time::Duration::from_secs(10));
+            assert!(report.fits && report.placement_supported && report.executable(),
+                "C{concurrency} GPUs={gpus}: {}", render(&report));
+            let memory = report.memory_layout.as_ref().unwrap();
+            assert!(memory.devices.iter().flat_map(|d| &d.items)
+                .filter(|i| i.category == Category::Drafter).map(|i| i.bytes).sum::<u64>() > 0);
         }
     }
 }

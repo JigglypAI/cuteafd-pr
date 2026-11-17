@@ -120,7 +120,7 @@ pub(crate) fn layout(args: &crate::cli::NativeServeArgs) -> Layout {
     layout.eos = vec![1];
     layout.speculator = args.dspark.then(|| Speculator {
         name: "dSpark".into(),
-        positions: if args.draft_length.draft_length.unwrap_or(5) > 5 { 7 } else { 5 },
+        positions: cuteafd_core::MAX_DSPARK_PROPOSALS,
         policy: args.draft_length.label(7),
     });
     layout.steps = vec![
@@ -164,22 +164,13 @@ fn layer_classes(local: usize) -> Vec<u8> {
 
 /// The dSpark policy's facts and the RTX/Spark layer split it runs on.
 fn dynamic(policy: &Value, dspark: bool) -> Value {
-    let mode = policy.get("mode").and_then(Value::as_str).unwrap_or(if dspark { "…" } else { "off" });
-    let warm = |key: &str| policy.get(key).and_then(|fit| fit.get("warm")).and_then(Value::as_bool);
-    let fit = match (warm("solo"), warm("shared")) {
-        (Some(solo), shared) => format!("fit: solo {} · shared {}", if solo { "warm" } else { "cold" },
-            if shared == Some(true) { "warm" } else { "cold" }),
-        _ => "fit: –".into(),
+    let mode = policy.get("policy").and_then(Value::as_str).unwrap_or(if dspark { "…" } else { "off" });
+    let count = |key: &str| policy.get(key).and_then(Value::as_u64).unwrap_or(0);
+    let accepted = match count("verified_drafts") {
+        0 => "–".into(),
+        verified => format!("{:.0}% of verified drafts accepted", 100.0 * count("accepted_drafts") as f64 / verified as f64),
     };
-    // Simple and fixed modes price no rounds: no fit, no cost model to report.
-    let priced = !matches!(mode, "simple" | "fixed" | "off");
-    let mut facts = vec![json!(["Policy", mode, if priced { fit } else { "no cost model".into() }])];
-    if priced {
-        let error = policy.get("prediction").and_then(|p| p.get("mean_abs_relative_error")).and_then(Value::as_f64)
-            .map_or_else(|| "–".into(), |e| format!("{:.1}%", 100.0 * e));
-        facts.push(json!(["Cost model error", error, "mean abs, per round"]));
-    }
-    let mut value = json!({"facts": facts});
+    let mut value = json!({"facts": [["Policy", mode, accepted]]});
     if let Some(local) = policy.get("local_layers").and_then(Value::as_u64) {
         value["layer_class"] = json!(layer_classes(local as usize));
     }
@@ -191,11 +182,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn unpriced_draft_modes_show_no_cost_model() {
-        let simple = dynamic(&json!({"mode": "simple", "prediction": {"mean_abs_relative_error": 1.0}}), true);
-        assert_eq!(simple["facts"], json!([["Policy", "simple", "no cost model"]]));
-        let priced = dynamic(&json!({"mode": "bandwidth", "prediction": {"mean_abs_relative_error": 0.04}}), true);
-        assert_eq!(priced["facts"][1], json!(["Cost model error", "4.0%", "mean abs, per round"]));
+    fn policy_fact_shows_the_mode_and_acceptance() {
+        let history = dynamic(&json!({"policy": "history", "verified_drafts": 200, "accepted_drafts": 150, "local_layers": 20}), true);
+        assert_eq!(history["facts"], json!([["Policy", "history", "75% of verified drafts accepted"]]));
+        assert_eq!(history["layer_class"].as_array().unwrap().len(), LAYERS);
+        assert_eq!(dynamic(&Value::Null, false)["facts"], json!([["Policy", "off", "–"]]));
     }
 
     #[test]

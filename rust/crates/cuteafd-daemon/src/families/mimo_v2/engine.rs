@@ -1006,49 +1006,6 @@ impl<'a> MimoEngine<'a> {
         Some(observe(routes, &times))
     }
 
-    pub(crate) fn draft_geometry(&self, width: usize) -> Result<cuteafd_core::PolicyGeometry> {
-        use crate::shared::draft::resource::{self, LayerHome};
-        let reports = match &self.experts {
-            Some(Experts::Spark { decode: transport, .. }) => transport.borrow().installed_grouping()?,
-            _ => Vec::new(),
-        };
-        let homes = self.weights.layers.iter().enumerate().map(|(index, layer)| {
-            if layer.dense { return Ok(LayerHome::Dense); }
-            let bytes = if self.tp2_layer(index) {
-                self.tp2.as_ref().context("MiMo TP2")?.ranks.iter()
-                    .map(|rank| rank.borrow().weight_read_bytes()).max().context("MiMo TP2 ranks")?
-            } else if let Some(local) = self.rtx_local.as_ref().filter(|local| local.index_of(index).is_ok()) {
-                local.weight_read_bytes()
-            } else { match &self.experts {
-                Some(Experts::Local(local)) => {
-                    local.index_of(index)?;
-                    local.weight_read_bytes()
-                }
-                Some(Experts::Streamed { experts, .. }) => experts.borrow().weight_read_bytes(),
-                Some(Experts::Spark { .. }) => {
-                    let bytes = reports.iter().filter(|report| report.layers().iter()
-                        .any(|range| (range.first as usize..range.end as usize).contains(&index)))
-                        .map(|report| report.weight_read_bytes()).collect::<Result<Vec<_>>>()?;
-                    return Ok(LayerHome::Remote { slice_bytes: *bytes.iter().max()
-                        .with_context(|| format!("installed MiMo worker missing layer {index}"))? as f64 });
-                }
-                Some(Experts::Skip) | None => anyhow::bail!("MiMo routed layer {index} has no installed expert owner"),
-            }};
-            Ok(LayerHome::Local { slice_bytes: bytes as f64 })
-        }).collect::<Result<Vec<_>>>()?;
-        let geometry = resource::geometry_with_grouping(&homes, self.cfg.experts, self.cfg.topk,
-            DECODE_ROWS, width, crate::shared::draft::copy::COPY_EXTENSION,
-            |layer, rows| Ok(self.draft_group(layer, rows, &reports)?.0))?;
-        let mut geometry = geometry;
-        geometry.classes = vec![cuteafd_core::ResourceClass::rtx(), cuteafd_core::ResourceClass::spark()];
-        for (layer, home) in homes.iter().enumerate().filter(|(_, home)| **home != LayerHome::Dense) {
-            let (group_rows, contract) = self.draft_group(layer, 0, &reports)?;
-            tracing::info!(layer, ?home, group_rows, traffic_contract = contract.label(),
-                "MiMo installed draft-policy expert traffic");
-        }
-        Ok(geometry)
-    }
-
     fn draft_group(&self, layer: usize, rows: usize,
         reports: &[cuteafd_transport::worker_selection::InstalledExpertGrouping])
         -> Result<(usize, cuteafd_transport::worker_selection::ExpertTrafficContract)> {

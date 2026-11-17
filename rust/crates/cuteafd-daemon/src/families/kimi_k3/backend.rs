@@ -215,10 +215,6 @@ impl<'e, 'a> Backend<'a> for KimiBackend<'e, 'a> {
         let contexts = contexts.to_vec();
         crate::shared::speculation_trace::Deferred::new(move || serde_json::json!({"kind":"kimi_owned_mla_tp2_kda", "rows":rows, "contexts":contexts}))
     }
-    fn draft_geometry(&self, snapshot: &Path, width: usize) -> Result<cuteafd_core::PolicyGeometry> {
-        ensure!(self.engine.native_draft().is_some(), "Kimi drafter was not admitted");
-        self.engine.draft_geometry(snapshot, width)
-    }
     fn arm_draft_probe(&self) -> Result<()> { self.engine.arm_draft_probe() }
     fn prefill_draft(&self, placement: &Placement, start: usize, chunk: &[u32], next: Option<u32>,
         seq: &mut DraftState) -> Result<()> {
@@ -259,8 +255,13 @@ impl<'e, 'a> Backend<'a> for KimiBackend<'e, 'a> {
         timing.seconds += started.elapsed().as_secs_f64();
         Ok(output)
     }
-    fn draft_evidence<'d>(&self,draft:&'d DraftState)->Option<&'d [f32]> {
-        self.engine.native_draft().filter(|d|d.common().is_block()).map(|_|draft.confidence.as_slice())
+    // Block dSpark has a trained confidence head; DFlash2 proposes tokens only.
+    fn draft_head_kind(&self) -> cuteafd_core::HeadScore {
+        if self.engine.native_draft().is_some_and(|d| d.common().is_block()) { cuteafd_core::HeadScore::Probability }
+        else { cuteafd_core::HeadScore::None }
+    }
+    fn draft_head<'d>(&self, draft: &'d DraftState) -> Option<&'d [f32]> {
+        self.engine.native_draft().filter(|d| d.common().is_block()).map(|_| draft.confidence.as_slice())
     }
     fn accept(&self, verified: &mut [scheduler::Verified<'_, Placement, DraftState, ()>], speculative: bool)
         -> Result<()> {
@@ -760,43 +761,6 @@ mod tests {
         live_golden_packed(&backend, &mut pool)?;
         drop(pool);
         live_prefix_restores(&backend, &source)
-    }
-
-    #[test]
-    fn kimi_verify_cycle_observes_simple_wall_time_and_shared_routes() -> Result<()> {
-        use crate::shared::draft::{resource::{self, LayerHome}, clock::RoundTimes, evidence::DraftSource};
-        use cuteafd_core::{DraftMode, DraftPolicy, PolicySeed};
-        // Same scheduler resource handoff as production; simple deliberately has no routes.
-        let homes = [LayerHome::Dense, LayerHome::Local { slice_bytes: 1024.0 },
-            LayerHome::Remote { slice_bytes: 1024.0 }];
-        let geometry = resource::geometry(&homes, 896, 16, 64, 7, 0)?;
-        for mode in [DraftMode::Simple, DraftMode::Shared] {
-            let mut policy = DraftPolicy::new(geometry.clone(), PolicySeed::weak(7), false)?;
-            policy.set_draft_mode(mode);
-            let mut routes = RoundRoutes::new(3, 16);
-            let layer_us = if policy.needs_routes() {
-                routes.begin(4);
-                routes.dense(0)?;
-                let ids = (0..64).map(|id| id as u32).collect::<Vec<_>>();
-                routes.push(1, &ids, u32::MAX)?;
-                let staged = ids.iter().flat_map(|id| id.to_le_bytes()).collect::<Vec<_>>();
-                routes.push_bytes(2, &staged, u32::MAX)?;
-                routes.complete()?;
-                assert_eq!(routes.flat().len(), 3 * 4 * 16);
-                vec![None, Some(20.0), Some(80.0)]
-            } else {
-                assert!(routes.flat().is_empty());
-                Vec::new()
-            };
-            let prior = [0.9; 3];
-            let requests = [resource::Verified { id: 1, rows: 4, accepted: 3,
-                source: DraftSource::Neural, prior: Some(&prior), features: None, censor: None }];
-            resource::observe_drafted(&mut policy, &requests, &routes, &layer_us,
-                RoundTimes { total_us: 200, draft_us: Some(40) }, 7, None, Some(1))?;
-            assert_eq!(policy.stats().rounds, 1);
-            if mode == DraftMode::Simple { assert!(policy.simple_round().is_some()); }
-        }
-        Ok(())
     }
 
     #[test]

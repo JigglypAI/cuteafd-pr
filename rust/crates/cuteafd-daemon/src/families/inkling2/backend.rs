@@ -284,7 +284,6 @@ impl<'a> Backend<'a> for InklingBackend<'a> {
     fn verify_attention_trace(&self, _: &[Vec<usize>], rows: usize) -> crate::shared::speculation_trace::Deferred {
         crate::shared::speculation_trace::Deferred::new(move || serde_json::json!({"kind":"inkling2", "rows":rows, "attention":"eager"}))
     }
-    fn draft_geometry(&self, _: &Path, _: usize) -> Result<cuteafd_core::PolicyGeometry> { anyhow::bail!("Inkling bundled drafter is not yet qualified") }
     fn arm_draft_probe(&self) -> Result<()> { Ok(()) }
     fn prefill_draft(&self, _: &Placement, _: usize, _: &[u32], _: Option<u32>, _: &mut Draft) -> Result<()> { Ok(()) }
     fn draft(&self, sequences: &mut [scheduler::DraftSeq<'_, Placement, Draft>], _: &mut scheduler::DraftTiming,

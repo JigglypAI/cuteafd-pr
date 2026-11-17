@@ -16,7 +16,6 @@ use crate::families::deepseek_v41::v41_requests::RequestBatch;
 use crate::families::deepseek_v41::v41_backbone_lane::Capture;
 use super::prefix::{draft_id, keyed, ImageKeys, V41Cache as PrefixCache, SnapshotKind};
 use super::console;
-use crate::shared::draft::clock::RoundClock;
 use crate::shared::loop_abort::LoopAbort;
 
 #[cfg(test)]
@@ -2060,29 +2059,17 @@ fn validate_proposals(active: &[Option<Active<'_>>], members: &[usize], inputs: 
     Ok(())
 }
 
-fn bound_inputs(inputs: &mut [Vec<u32>]) {
-    let mut lengths: Vec<_> = inputs.iter().map(|input| input.len() - 1).collect();
-    crate::shared::draft::resource::trim_budget(&mut lengths, cuteafd_core::V41_VERIFY_ROWS);
-    for (input, length) in inputs.iter_mut().zip(lengths) { input.truncate(length + 1); }
-}
-
-/// Preserve the confident neural prefix before grammar and resource-priced truncation.
-fn extend_inputs<'a, C: DraftChain<'a>>(draft: &mut DraftRuntime<'_, 'a, C>, active: &[Option<Active<'_>>],
-    members: &[usize], inputs: &mut [Vec<u32>]) -> Result<()> {
-    for (&slot, input) in members.iter().zip(inputs) {
+/// Fit the lane's proposals to the shared draft policy's plan: the confidence
+/// head may skip an explore, an agreeing history copy extends a draft, and the
+/// verifier row budget caps the round. Grammar truncation follows.
+fn shape_inputs<'a, C: DraftChain<'a>>(draft: &mut DraftRuntime<'_, 'a, C>, active: &[Option<Active<'_>>],
+    members: &[usize], inputs: &mut [Vec<u32>]) {
+    let lane: Vec<_> = members.iter().map(|&slot| {
         let request = active[slot].as_ref().unwrap();
-        let room = (request.job.max_tokens - request.generated).saturating_sub(1)
-            .min(input.len() - 1 + crate::shared::draft::copy::COPY_EXTENSION);
-        if input.len() <= 1 { continue; }
-        let Some(calibrated) = draft.calibrated_confidence(members.len(), request.id(), input.len() - 1)? else { continue; };
-        if let Some(copy) = crate::shared::draft::copy::continuation(&request.tokens, &input[1..], &calibrated,
-            room, request.job.sampling.is_greedy() && !crate::shared::probe::no_speculation(&request.job.probe)) {
-            draft.extend_confidence(request.id(), copy.neural, copy.tokens.len() - copy.neural)?;
-            input.truncate(1);
-            input.extend(copy.tokens);
-        }
-    }
-    Ok(())
+        (request.id(), request.tokens.as_slice(),
+            request.job.sampling.is_greedy() && !crate::shared::probe::no_speculation(&request.job.probe))
+    }).collect();
+    draft.shape(&lane, inputs);
 }
 
 fn single_lane_round<'w, 'a>(lib: &'a NativeLibrary, runtime: &tokio::runtime::Runtime,
@@ -2101,25 +2088,20 @@ fn single_lane_round<'w, 'a>(lib: &'a NativeLibrary, runtime: &tokio::runtime::R
         let r = active[slot].as_ref().unwrap();
         Ok((r.id(), r.anchor, requests.cache().committed_end(r.lease)?, r.job.max_tokens-r.generated))
     }).collect::<Result<Vec<_>>>()?;
-    // The policy's clock brackets the draft call alone; `draft_us` below (the
-    // console's draft stage) still spans copy lookup and length selection.
-    let mut clock = RoundClock::at(started);
     let draft_start = Instant::now();
     // The anchors' rows are known since the last commit: fetch them across the draft phase.
     prefetch_drafts(requests, active, members, &seeds.iter().map(|seed| vec![seed.1]).collect::<Vec<_>>());
     let mut inputs = if let Some(draft) = draft.as_deref_mut() {
-        match clock.draft(|| draft.propose(lane, &seeds)) {
+        match draft.propose(lane, &seeds) {
             Ok(inputs) => inputs,
             // W64-1: a failed proposal verifies the anchors only while the draft
-            // is still live; a terminal draft fails the round. The round did no
-            // draft work, so report 0 like the independent path does.
-            Err(error) => { clock.drafted_us(0); draft.anchor_fallback(lane, &seeds, &error)? },
+            // is still live; a terminal draft fails the round.
+            Err(error) => draft.anchor_fallback(lane, &seeds, &error)?,
         }
     } else { seeds.iter().map(|r| vec![r.1]).collect() };
     validate_proposals(active, members, &inputs)?;
-    if let Some(draft) = draft.as_deref_mut() { extend_inputs(draft, active, members, &mut inputs)?; }
+    if let Some(draft) = draft.as_deref_mut() { shape_inputs(draft, active, members, &mut inputs); }
     prefetch_drafts(requests, active, members, &inputs);
-    let copied = vec![false; members.len()];
     let proposal = console::Proposal::capture(&inputs, console::live());
     for (&slot, input) in members.iter().zip(&mut inputs) {
         let r = active[slot].as_ref().unwrap();
@@ -2127,17 +2109,6 @@ fn single_lane_round<'w, 'a>(lib: &'a NativeLibrary, runtime: &tokio::runtime::R
             crate::shared::serve::RequestFailure::new(r.id(), error))?; }
         if crate::shared::probe::no_speculation(&r.job.probe) { input.truncate(1); }
     }
-    // This path runs only while the other lane is empty.
-    if let Some(draft) = draft.as_deref_mut() {
-        let candidates: Vec<_> = members.iter().zip(&inputs).zip(&copied)
-            .map(|((&slot, input), &copied)| (active[slot].as_ref().unwrap().id(), if copied { 0 } else { input.len()-1 })).collect();
-        if let Some(lengths) = draft.select_lengths(lane, &candidates, false)? {
-            for ((input, &copied), length) in inputs.iter_mut().zip(&copied).zip(lengths) {
-                if !copied { input.truncate(length+1); }
-            }
-        }
-    }
-    bound_inputs(&mut inputs);
     let draft_us = draft_start.elapsed().as_micros() as u64;
     let prepare_start = Instant::now();
     let compact = !tracing::enabled!(target: "cuteafd::logit_trace", tracing::Level::DEBUG)
@@ -2201,8 +2172,7 @@ fn single_lane_round<'w, 'a>(lib: &'a NativeLibrary, runtime: &tokio::runtime::R
         let tally = console::Tally::new(proposal, &inputs, &accepted_inputs, &emissions, live);
         tally.usage(members.iter().map(|&slot| active[slot].as_ref().and_then(|r| r.job.usage.as_ref())));
         let layer_us = pass.captured_layer_us();
-        observe_lane_round(draft.as_deref_mut(), lane, false, pass.captured_routes(),
-            &layer_us, active, members, &inputs, &accepted_inputs, &copied, &clock);
+        observe_lane_round(draft.as_deref_mut(), active, members, &inputs, &accepted_inputs, &emissions);
         if let Some(live) = live {
             live.push(console_round(tally, lane, false, started, draft_us, prepare_us, verified_us,
                 &layer_us, pass.captured_ffn_split(), active, members, &inputs, Some(&round)));
@@ -2250,8 +2220,7 @@ fn single_lane_round<'w, 'a>(lib: &'a NativeLibrary, runtime: &tokio::runtime::R
         let tally = console::Tally::new(proposal, &inputs, &accepted_inputs, &emissions, live);
         tally.usage(members.iter().map(|&slot| active[slot].as_ref().and_then(|r| r.job.usage.as_ref())));
         let layer_us = pass.captured_layer_us();
-        observe_lane_round(draft.as_deref_mut(), lane, false, pass.captured_routes(),
-            &layer_us, active, members, &inputs, &accepted_inputs, &copied, &clock);
+        observe_lane_round(draft.as_deref_mut(), active, members, &inputs, &accepted_inputs, &emissions);
         if let Some(live) = live {
             live.push(console_round(tally, lane, false, started, draft_us, prepare_us, executed_us - prepared_us,
                 &layer_us, pass.captured_ffn_split(), active, members, &inputs, None));
@@ -2716,18 +2685,20 @@ pub(super) fn console_gauges(active: &[Option<Active<'_>>], requests: &Requests<
     console::Event::Gauges(gauges)
 }
 
+/// Feed a completed lane round's acceptance to the draft policy. A request
+/// that finished on a token its next draft also proposed (or on its last
+/// verified row) was not judged there: its round is censored, not a miss.
 fn observe_lane_round<'a, C: DraftChain<'a>>(draft: Option<&mut DraftRuntime<'_, 'a, C>>,
-    lane: usize, shared: bool, routes: &[Vec<[u32; 6]>], layer_us: &[Option<f64>],
-    active: &[Option<Active<'a>>], members: &[usize], inputs: &[Vec<u32>], accepted: &[u32], copied: &[bool],
-    clock: &RoundClock,
+    active: &[Option<Active<'a>>], members: &[usize], inputs: &[Vec<u32>], accepted: &[u32], emissions: &[Vec<u32>],
 ) {
     let Some(draft) = draft else { return };
-    let requests: Vec<_> = members.iter().zip(inputs).zip(accepted).zip(copied)
-        .filter_map(|(((&slot, input), &count), &copied)|
+    let requests: Vec<_> = members.iter().zip(inputs).zip(accepted).zip(emissions)
+        .filter_map(|(((&slot, input), &count), emitted)|
             active[slot].as_ref().map(|r| super::speculative::LaneRequest { id: r.id(), rows: input.len(),
-                accepted: count, copied })).collect();
+                accepted: count, censored: crate::shared::draft::history::finish_censored(r.finished, count as usize,
+                    input, emitted.last().copied()) })).collect();
     if requests.len() != members.len() { return; }
-    draft.observe_round(lane, shared, routes, layer_us, &requests, clock.observe());
+    draft.observe_round(&requests);
 }
 /// Resolve one finishing row's retained frontier from its downloaded bytes.
 ///
@@ -2967,17 +2938,6 @@ mod sampling_tests {
         manifest["projections"].as_array_mut().unwrap().remove(0);
         assert!(native_coordinator_exact_cap(&manifest).is_err());
         Ok(())
-    }
-
-    #[test]
-    fn verifier_budget_preserves_anchors_and_admits_copy_tails() {
-        let mut inputs = vec![vec![10; 38]; 16];
-        bound_inputs(&mut inputs);
-        assert_eq!(inputs.iter().map(Vec::len).sum::<usize>(), cuteafd_core::V41_VERIFY_ROWS);
-        assert!(inputs.iter().all(|input| !input.is_empty()));
-        let mut solo = vec![vec![10; 38]];
-        bound_inputs(&mut solo);
-        assert_eq!(solo[0].len(), 38);
     }
 
     /// Position-sensitive logits so different absolute indices and rows differ.

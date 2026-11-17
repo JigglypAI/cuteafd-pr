@@ -100,26 +100,6 @@ impl<'a> GlmEngine<'a> {
             .or_else(|| self.whole.as_ref().map(|owner| owner.layers.as_slice()))
     }
 
-    pub(crate) fn draft_group_rows(&self, layer: usize, rows: usize,
-        remote: &[cuteafd_transport::worker_selection::InstalledExpertGrouping]) -> Result<usize> {
-        if let Some(whole) = self.whole.as_ref().filter(|owner| owner.layers.contains(&layer)) {
-            return whole.group_rows(rows);
-        }
-        match self.tp2.as_ref().filter(|pair| pair.layers.contains(&layer)) {
-            Some(pair) => pair.group_rows(rows),
-            None => crate::shared::draft::resource::worker_group_rows_for_input(remote, layer, rows, self.spark_bf16),
-        }
-    }
-    pub(crate) fn draft_weight_read_bytes(&self, layer: usize,
-        remote: &[cuteafd_transport::worker_selection::InstalledExpertGrouping]) -> Result<usize> {
-        if let Some(whole) = self.whole.as_ref().filter(|owner| owner.layers.contains(&layer)) {
-            return whole.weight_read_bytes();
-        }
-        match self.tp2.as_ref().filter(|pair| pair.layers.contains(&layer)) {
-            Some(pair) => pair.weight_read_bytes(),
-            None => crate::shared::draft::resource::worker_weight_read_bytes(remote, layer),
-        }
-    }
     pub(super) fn tp2_layer(&self, layer: usize) -> bool {
         self.tp2
             .as_ref()

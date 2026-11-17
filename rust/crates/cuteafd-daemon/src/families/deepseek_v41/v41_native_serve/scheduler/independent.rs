@@ -219,8 +219,6 @@ async fn lane<'a, P: VerificationTarget<'a>, C: DraftChain<'a>>(lease: LaneLease
             // The anchors' rows are known since the last commit: fetch them across the draft phase.
             super::prefetch_drafts(&requests.borrow(), &active.borrow(), &members,
                 &drafting.iter().map(|seed| vec![seed.1]).collect::<Vec<_>>());
-            let copied = vec![false; members.len()];
-            let mut clock = RoundClock::at(started);
             let (drafted, draft_us) = if drafting.is_empty() { (Vec::new(), 0) } else { loop {
                 let proposed = {
                     let mut draft = draft.borrow_mut();
@@ -237,12 +235,10 @@ async fn lane<'a, P: VerificationTarget<'a>, C: DraftChain<'a>>(lease: LaneLease
                 // draft and transaction before retirement can recycle its slots.
                 tokio::task::yield_now().await;
             } };
-            // The polled draft times itself from issue to completion.
-            if !drafting.is_empty() { clock.drafted_us(draft_us); }
             let mut inputs = drafted;
             validate_proposals(&active.borrow(), &members, &inputs)?;
             if let Some(draft) = draft.borrow_mut().as_deref_mut() {
-                extend_inputs(draft, &active.borrow(), &members, &mut inputs)?;
+                shape_inputs(draft, &active.borrow(), &members, &mut inputs);
             }
             super::prefetch_drafts(&requests.borrow(), &active.borrow(), &members, &inputs);
             let proposal = console::Proposal::capture(&inputs, console::live());
@@ -257,18 +253,6 @@ async fn lane<'a, P: VerificationTarget<'a>, C: DraftChain<'a>>(lease: LaneLease
                             crate::shared::serve::RequestFailure::new(r.id(), error))?; }
                     if crate::shared::probe::no_speculation(&r.job.probe) { input.truncate(1); }
                 }
-                // Lengths are chosen from this lane's proposals and routes only;
-                // the peer lane's activity selects the shared-regime fit.
-                if let Some(draft) = draft.as_deref_mut() {
-                    let candidates: Vec<_> = members.iter().zip(&inputs).zip(&copied)
-                        .map(|((&slot, input), &copied)| (active[slot].as_ref().unwrap().id(), if copied { 0 } else { input.len()-1 })).collect();
-                    if let Some(lengths) = draft.select_lengths(lane, &candidates, shared)? {
-                        for ((input, &copied), length) in inputs.iter_mut().zip(&copied).zip(lengths) {
-                            if !copied { input.truncate(length+1); }
-                        }
-                    }
-                }
-                bound_inputs(&mut inputs);
                 let batch = prepare_decode_lane(&mut requests, &active, &members, &inputs, draft.is_some())?;
                 (inputs, Some(batch), draft.as_deref().map(DraftRuntime::capture).unwrap_or_default())
             };
@@ -408,9 +392,8 @@ async fn lane<'a, P: VerificationTarget<'a>, C: DraftChain<'a>>(lease: LaneLease
                 { let active = active.borrow();
                     tally.usage(members.iter().map(|&slot| active[slot].as_ref().and_then(|r| r.job.usage.as_ref()))); }
                 let layer_us = pass.captured_layer_us();
-                observe_lane_round(draft.borrow_mut().as_deref_mut(), lane, shared,
-                    pass.captured_routes(), &layer_us, &active.borrow(), &members, &inputs,
-                    &accepted_inputs, &copied, &clock);
+                observe_lane_round(draft.borrow_mut().as_deref_mut(), &active.borrow(), &members, &inputs,
+                    &accepted_inputs, &emissions);
                 if let Some(live) = live {
                     let active = active.borrow();
                     live.push(console_round(tally, lane, shared, started, draft_us,

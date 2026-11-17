@@ -501,35 +501,6 @@ impl<'a> Engine<'a> {
 
     pub(crate) fn native_draft(&self) -> Option<&super::draft::NativeDraft<'a>> { self.draft.as_deref() }
 
-    pub(crate) fn draft_geometry(&self, snapshot: &std::path::Path, width: usize)
-        -> Result<cuteafd_core::PolicyGeometry> {
-        use crate::shared::{draft::resource::{self, LayerHome}, experts::rtx::RtxExpertLayer};
-        ensure!(snapshot == self.target_view.snapshot(), "Kimi draft target snapshot differs from selected view");
-        let catalog = cuteafd_loader::read_expert_catalog_view(&self.target_view)?;
-        let manifest = catalog.exl3().ok_or_else(|| anyhow::anyhow!("Kimi draft needs EXL3 headers"))?;
-        let lanes = self.lanes.try_borrow()?;
-        let cfg = lanes.local[0][0].config();
-        let reports = lanes.routed[0].installed_grouping()?;
-        let local = &lanes.experts[0];
-        let homes = cfg.dense.iter().enumerate().map(|(layer, dense)| {
-            if *dense { return Ok(LayerHome::Dense); }
-            let resident = local[0].as_ref().is_some_and(|rank| rank.layers().contains(&layer));
-            ensure!(local.iter().all(|rank| resident == rank.as_ref().is_some_and(|rank| rank.layers().contains(&layer))),
-                "Kimi TP2 draft policy layer homes disagree");
-            let bytes = resource::exl3_slice_bytes(manifest, layer, if resident { local.len() } else { lanes.routed[0].world_size()? })?;
-            Ok(if resident { LayerHome::Local { slice_bytes: bytes } }
-                else { LayerHome::Remote { slice_bytes: bytes } })
-        }).collect::<Result<Vec<_>>>()?;
-        resource::geometry_with_grouping(&homes, cfg.experts, cfg.topk, 64, width, 0, |layer, rows| {
-            if matches!(homes[layer], LayerHome::Local { .. }) {
-                let group = local[0].as_ref().unwrap().group_rows(rows)?;
-                ensure!(local.iter().map(|rank| rank.as_ref().unwrap().group_rows(rows)).collect::<Result<Vec<_>>>()?.iter().all(|&rows| rows == group),
-                    "Kimi TP2 draft policy grouping disagrees");
-                Ok(group)
-            } else { resource::worker_group_rows_for_input(&reports, layer, rows, false) }
-        })
-    }
-
     pub(crate) fn library(&self) -> &'a cuteafd_ffi::NativeLibrary {
         self.exchange_streams[0].device.library
     }

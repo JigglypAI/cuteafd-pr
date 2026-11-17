@@ -649,10 +649,6 @@ impl<'e, 'a> Backend<'a> for Step5Backend<'e, 'a> {
         crate::shared::speculation_trace::Deferred::new(move || serde_json::json!({"kind":"step5_swa512_csa64", "rows":rows, "contexts":contexts,
             "attention":"eager_per_sequence", "arithmetic":"eager"}))
     }
-    fn draft_geometry(&self, _snapshot: &Path, width: usize) -> Result<cuteafd_core::PolicyGeometry> {
-        ensure!(self.mtp.is_some(), "Step-5 MTP runtime is not admitted");
-        self.execution.draft_geometry(width, self.geometry().decode_rows)
-    }
     fn arm_draft_probe(&self) -> Result<()> {
         ensure!(self.mtp.is_some(), "Step-5 MTP runtime is not admitted");
         self.execution.arm_draft_probe()
