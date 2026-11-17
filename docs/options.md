@@ -274,14 +274,22 @@ and every Spark rank load in one required SparkNest push transaction.
 Planner reports mark admitted configurations Serving, independent of checkpoint
 repository, revision, MC view or fidelity measurement. Missing formats or native
 programs still refuse with their structural cause. The current serving executor
-owns one RTX and 2-8 Spark endpoints; target TP2 and bundled dSpark are separate
-implementation work, not fidelity gates. A matching WIP build must include the
+owns one RTX and 2-8 Spark endpoints; target TP2 is separate implementation work (#2316), not a fidelity gate. A matching WIP build must include the
 Inkling padded-transpose load export and native expert packages.
 
 `ATTENTION_PLACEMENT=auto|heads` and GPU embedding/device selection are supported;
-explicit `layers`, `context` and multi-RTX serving need a multi-GPU executor.
-Set `SPECULATOR=off` and `AUDIO=off`; bundled vision follows `VISION=auto` and
-normal encoder admission. Inkling accepts the shared
+explicit `layers`, `context` and multi-RTX serving need a multi-GPU executor (#2316).
+Set `AUDIO=off`; bundled vision follows `VISION=auto` and normal encoder admission. `SPECULATOR=off|dspark` defaults to `dspark`
+(unset/`auto` selects the bundled drafter); explicit `off` wins and passes
+`--dspark=false`. Direct serving also defaults on;
+`dspark` selects the bundled recurrent-hidden block drafter (seven proposals
+per eight-token block), with `DRAFT_KV_CACHE=fp8|bf16` (default `fp8`).
+`SPECULATOR_FP8=auto|off` preserves checkpoint-native weights; `on` refuses.
+Drafter weights join the target's required push transaction in their own
+admitted arena. MC original EXL3 K4 on 1 RTX + 4 Sparks passes strict cold and
+warm lossless with FP8 draft KV (10/10 each, exact ids, row hashes and emitted
+bytes, complete prompt-end restores). BF16 draft KV also passes strict cold and warm 10/10; emitted-speed
+measurement remains pending (#2320); no speed figure is claimed here. Inkling accepts the shared
 `CONCURRENCY`, `POOL_TOKENS=auto|N`, `MAX_CONTEXT_TOKENS`,
 `PREFIX_CACHE_ENTRIES`, `HOST_CACHE_BYTES`, KV reservation and loop-abort keys,
 plus `RTX_EXPERT_LAYERS=auto|all|N`, `PREFILL_ROWS` (a multiple of 64 up to
@@ -487,6 +495,26 @@ role; the flag is unavailable to serve and does not restrict ordinary serving.
 `cuteafd glm-golden --nll --save-logits DIR` writes `tokens.bin` and all
 prefill rows as F32 `logits.bin` for same-engine build or core-view comparisons.
 The option is listed in CLI help so the sealed golden runner can validate it.
+
+`cuteafd golden --family inkling2 --width-invariance 1,8 --tokens TOKENS.json
+--prefill N --peers HOST:PORT,... --save-logits DIR` compares teacher-forced
+serial decode with actual block verification after an identical admitted prefix.
+This path loads the selected MC original target through serving startup and its
+required push transaction with real Spark experts. `--rtx-expert-layers`,
+`--pool-tokens`, `--max-sequences`, `--prefill-rows`, `--prefill-waves`, target
+`--kv-cache`, `--draft-kv-cache` and shared prefix args select the served shape.
+Widths are 1..8 total verify rows (anchor included), independently of the
+64-row packed physical capacity. Exact prompt-end SWA/FIR marks are restored
+before each width; width 1 repeats after the wide pass. The JSON receipt names
+the first differing layer, stage and operand per row, including route ids,
+weights and expert outputs; no tolerance or automatic numerical fix applies.
+Add `--commit-invariance` to compare every accepted prefix (0..width) against
+serial decode: live global KV rows, sliding-window KV, contiguous FIR bytes and
+logical bookkeeping, followed by one more cycle's logits. Dead rejected KV
+outside the committed horizon is excluded. The receipt names the first owner
+and differing byte; this remains a diagnostic, not a tolerance.
+Run through `scripts/bench/golden-run.py --family inkling2 --spark-hosts ...`.
+Without `--width-invariance`, Inkling retains its cold native-MXFP8 golden path.
 
 `cuteafd step5-golden --golden TOKENS_DIR --nll --last-layer 91` accepts a
 `tokens.bin`-only directory for same-engine core-view comparisons (2..4096 U32
@@ -702,7 +730,7 @@ Each key is also a global `cuteafd` flag (`--gpu-memory-cap`, `--kv-max-tokens`,
 | `KV_CACHE` | family default | `bf16`, `fp8`; MiMo also `int8` | See the precision table below. |
 | `SWA_KV_CACHE` | `int8` | `bf16`, `int8`, `fp8` | MiMo sliding/MTP rings. |
 | `DRAFT_CONTEXT_WINDOW` | `0` | Nonnegative token count | Kimi K3.1 DSpark context override (other launcher families reject this key). Unset/0 preserves native attention (full context for Lithos K3.1 DSpark, trained window for Inferact); a positive value selects a window, e.g. 2048. It never changes target KV or target taps. |
-| `DRAFT_KV_CACHE` | `fp8` | `bf16`, `fp8` | Drafter ring storage (GLM 5.3, GLM Flash, MiMo, Muse, Kimi GQA block dSpark and MLA DFlash2). Every drafter selects BF16/FP8 independently of target KV and body weights; default FP8. |
+| `DRAFT_KV_CACHE` | `fp8` | `bf16`, `fp8` | Drafter ring storage (GLM 5.3, GLM Flash, MiMo, Muse, Kimi GQA block dSpark and MLA DFlash2, Inkling). Every drafter selects BF16/FP8 independently of target KV and body weights; default FP8. |
 | `PREFIX_CACHE_ENTRIES` | `auto` | `auto`, non-negative | Snapshot entries; auto derives from context × concurrency. |
 | `PREFIX_CACHE_MARK_MIB` | unset | MiB | Recurrent/ring state retained per mark. |
 | `PREFIX_PARTIAL` | `off` | `on`, `off` | MiMo approximate partial reuse; off keeps exact restores only. Every other family, V4.1 included, restores exact snapshot frontiers only and refuses `on`. |
@@ -725,7 +753,7 @@ Each key is also a global `cuteafd` flag (`--gpu-memory-cap`, `--kv-max-tokens`,
 | `SPECULATOR` | family default | `auto` (Qwen4/Kimi), `off`, `dflash2`, `dspark`, `mtp` | An eligible Kimi/GLM Flash automatic external drafter must be installed, including its config; a missing checkpoint fails with a `nest hf download` command rather than silently serving without speculation. Explicit `off` and unsupported automatic targets remain off. K3.1 pairing reads verifier model/architecture declarations and target hidden/vocabulary/tap/mask dimensions from checkpoint metadata, including MC source identity; no checkpoint revision or core-view allowlist is used. Pairing mismatches name the field and refuse launch. |
 | `SPECULATOR_MODEL_ID` | family default | HF repo id | External drafter checkpoint. |
 | `SPECULATOR_MODEL_REVISION` | empty | 40–64 lowercase hex | Drafter revision. |
-| `SPECULATOR_DEPTH` | 3 for local Qwen/Step-5, else 1 | positive int | Native MTP draft depth. |
+PECULATOR_DEPTH` | 3 for local Qwen/Step-5, else 1 | positive int | Native MTP draft depth. |
 | `DRAFT_LENGTH` | unset (follows `DRAFT_POLICY`) | positive int | Measurement override: verify a fixed number of draft tokens per step, min(value, the drafter's native block), further capped by the row budget at high concurrency. Overrides `DRAFT_POLICY`; acceptance history is still recorded. Every family and speculator (DFlash2, dSpark, MTP, Markov). Without a speculator it is ignored with one startup log; reports and cards say `no speculation`. |
 | `SPECULATOR_FP8` | `auto` | `auto`, `on`, `off` | GLM/Qwen/MiMo/Kimi drafter precision: unset, `auto` and `on` select single-copy FP8 body linear projection weights; `off` keeps BF16. Rust resolves the same MiMo precision for planning and serving, independent of checkpoint alias or core view. Kimi block DSpark supports TP1 and physical TP2 with native BF16 norms/Markov tensors; FP8 applies to content-paired K3.1 DSpark in every core view and layout. Kimi MLA includes QKV-A, Q-B, absorbed UK/UV and output; embeddings, norms, codebooks and prediction heads remain native. Independent of `DRAFT_KV_CACHE`. |
 | `DRAFT_POLICY` | `history` | `history`, `off` | How many drafted positions each request verifies; one policy for every family and drafter. `history` keeps a position while its acceptance probability is above 0.5, where the probability is the request's accepted/reached counts at that position over its last 8 verify rounds, shrunk toward the server-wide rate over the last 256 rounds that reached it (prior strength 8). One position past the stop is always verified so an estimate cannot lock low; a drafter with a trained confidence head (dSpark) skips that explore when the head's calibrated probability is below 0.3, and the skip counts as a miss at that position. The drafter's full native block is available (V4.1: 7). When a round exceeds the 64 verify rows, positions are granted across requests by the same probabilities, highest first. History copies past an agreeing draft use the same rule on their own counts. `off` verifies no drafts. |
@@ -1153,7 +1181,7 @@ original core is already FP8, not an MC publication.
 | `MAX_OUTPUT_TOKENS` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | `KV_CACHE` | ✗ | ✗ | ✗ | ✗ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | `SWA_KV_CACHE` | ✗ | ✗ | ✗ | ✗ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
-| `DRAFT_KV_CACHE` | ✗ | ✗ | ✓ | ✓ | ✓ | ✗ | ✗ | ✓ | ✗ | ✓ | ✗ |
+| `DRAFT_KV_CACHE` | ✗ | ✗ | ✓ | ✓ | ✓ | ✗ | ✗ | ✓ | ✗ | ✓ | ✓ |
 | `PREFIX_CACHE_ENTRIES` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | `PREFIX_CACHE_MARK_MIB` | ✗ | ✗ | ✗ | ✓ | ✓ | ✗ | ✓ | ✗ | ✗ | ✗ | ✗ |
 | `PREFIX_PARTIAL` | ✗ | ✗ | ✗ | ✗ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
@@ -1175,11 +1203,11 @@ original core is already FP8, not an MC publication.
 | `SPECULATOR_DEPTH` | ✗ | ✗ | ✗ | ✗ | ✓ | ✓ | ✓ | ✗ | ✓ | ✗ | ✗ |
 | `DRAFT_LENGTH` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | `DRAFT_CONTEXT_WINDOW` | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✓ | ✗ | ✗ | ✗ |
-| `SPECULATOR_FP8` | ✗ | ✗ | ✓ | ✓ | ✓ | ✓ | ✗ | ✓ | ✗ | ✗ | ✗ |
+PECULATOR_FP8` | ✗ | ✗ | ✓ | ✓ | ✓ | ✓ | ✗ | ✓ | ✗ | ✗ | ✗ |
 | `DRAFT_POLICY` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | `DRAFT_CONTEXT_SLOTS` | ✗ | ✗ | ✓ | ✓ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
 | `DRAFT_SEQUENCES` | ✗ | ✗ | ✓ | ✓ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
-| `SPECULATION_TRACE` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✓ | ✗ |
+| `SPECULATION_TRACE` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✓ | ✓ |
 | `GLM5_FLASH_DRAFT_LINEAR` | ✗ | ✗ | ✗ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
 | **Prefill** | | | | | | | | | | |  |
 | `PREFILL_PACKING` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ |

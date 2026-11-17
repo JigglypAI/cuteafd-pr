@@ -13,6 +13,9 @@ pub(crate) trait UnitBuffers<'a> {
     fn stream(&self) -> &Stream<'a>;
     fn layout(&self) -> &UnitLayout;
     fn buffer(&self, name: &str) -> Result<Buffer>;
+    fn decode_attention(&self)->bool {false}
+    fn convolution_strides(&self) -> Option<(usize, usize, usize)> { None }
+    fn convolution_replay(&self, _field: &str) -> Result<Option<(Buffer, usize)>> { Ok(None) }
     fn packed(&self) -> Option<(&UnitOwner<'a>, &super::cache::CacheBank<'a>, usize, &[PackedMember])> { None }
     fn prepare_page_table(&self, _pages: &[i32]) -> Result<()> { anyhow::bail!("Inkling owner has no packed page-table uploader") }
 }
@@ -32,6 +35,17 @@ pub(crate) struct PackedLayerUnit<'u, 'a> {
     pub uploads: std::cell::RefCell<&'u mut crate::shared::token_table::RetainedUploads<'a>>,
 }
 impl<'a> UnitBuffers<'a> for PackedLayerUnit<'_, 'a> {
+    fn decode_attention(&self)->bool {self.unit.decode_attention}
+    fn convolution_replay(&self, field: &str) -> Result<Option<(Buffer, usize)>> {
+        let Some((backing, width)) = self.unit.replay.get() else { return Ok(None) };
+        let offset = match field { "attn_conv_history" => 0, "mlp_conv_history" => 4608,
+            "k_conv_history" => 9216, "v_conv_history" => 10240, _ => anyhow::bail!("unknown convolution replay field") };
+        let offset = (self.layer*64*width+offset)*4;
+        Ok(Some((super::cache::view(backing, offset, backing.bytes-offset)?, width)))
+    }
+    fn convolution_strides(&self) -> Option<(usize, usize, usize)> {
+        Some((self.cache.layout.conv.slot_stride, self.cache.layout.conv.lag_stride, self.cache.layout.sequences))
+    }
     fn stream(&self) -> &Stream<'a> { &self.unit.stream }
     fn layout(&self) -> &UnitLayout { &self.unit.layout }
     fn buffer(&self, name: &str) -> Result<Buffer> {
@@ -62,6 +76,9 @@ pub(crate) struct LayerUnit<'u, 'a> {
     rows: std::ops::Range<usize>,
 }
 impl<'a> UnitBuffers<'a> for LayerUnit<'_, 'a> {
+    fn convolution_strides(&self) -> Option<(usize, usize, usize)> {
+        Some((self.cache.layout.conv.slot_stride, self.cache.layout.conv.lag_stride, 1))
+    }
     fn stream(&self) -> &Stream<'a> { &self.unit.stream }
     fn layout(&self) -> &UnitLayout { &self.unit.layout }
     fn buffer(&self, name: &str) -> Result<Buffer> {
@@ -95,8 +112,17 @@ pub(crate) struct UnitOwner<'a> {
     pub stream: Rc<Stream<'a>>,
     pub layout: UnitLayout,
     buffers: BTreeMap<String, Allocation<'a>>,
+    replay: std::cell::Cell<Option<(Buffer, usize)>>,
+    decode_attention:bool,
 }
 impl<'a> UnitOwner<'a> {
+    /// The caller retains replay storage through every queued convolution and commit.
+    pub fn set_replay(&self, replay: Option<(Buffer, usize)>) -> Result<()> {
+        ensure!(replay.is_none_or(|(buffer,width)| width==11264 && buffer.device_id==self.stream.device.id
+            && buffer.bytes>=48*64*width*4), "convolution replay backing differs from admitted geometry");
+        self.replay.set(replay);
+        Ok(())
+    }
     pub fn bind<'u>(&'u self, cache: &'u super::cache::CacheBank<'a>, sequence: usize,
         layer: usize) -> Result<LayerUnit<'u, 'a>> {
         ensure!(sequence < cache.layout.sequences && layer < cache.layout.layers.len(),
@@ -142,7 +168,7 @@ impl<'a> UnitOwner<'a> {
     }
     pub fn packed_metadata(&self, layer: usize, cache: &super::cache::CacheBank<'a>, members: &[PackedMember],
         uploads: &mut crate::shared::token_table::RetainedUploads<'a>) -> Result<()> {
-        ensure!(cache.layout.sequence_bytes % 4096 == 0,
+        ensure!(cache.layout.ring_sequence_bytes % 4096 == 0,
             "Inkling sequence bank must have an integral record stride");
         ensure!(members.len() <= cache.layout.sequences
             && members.iter().all(|member| member.sequence < cache.layout.sequences)
@@ -162,7 +188,7 @@ impl<'a> UnitOwner<'a> {
             local.extend(member.metadata.local_slots.iter().map(|&slot| slot + member.rows.start as i64));
             global.extend_from_slice(&member.metadata.global_slots);
             ring.extend(member.metadata.ring_slots.iter().map(|&slot|
-                slot + (member.sequence * cache.layout.sequence_bytes / 4096) as i64));
+                slot + (member.sequence * cache.layout.ring_sequence_bytes / 4096) as i64));
             conv.extend(std::iter::repeat_n(member.sequence as i64, member.rows.len()));
             first.extend(std::iter::repeat_n(member.rows.start as i32, member.rows.len()));
         }
@@ -177,7 +203,7 @@ impl<'a> UnitOwner<'a> {
         let bytes = first.iter().flat_map(|value| value.to_le_bytes()).collect::<Vec<_>>();
         // SAFETY: same whole-unit metadata source lifetime.
         unsafe { uploads.upload(self.buffer("first")?, &bytes, self.stream.raw)?; }
-        let step = 10;
+        let step = if self.decode_attention {1}else{10};
         let tiles = members.iter().flat_map(|member| member.rows.clone().step_by(step))
             .map(|row| row as i32).collect::<Vec<_>>();
         let indices = members.iter().enumerate().flat_map(|(table, member)|
@@ -202,7 +228,7 @@ impl<'a> UnitOwner<'a> {
         let buffers = layout.buffers.iter().map(|(name, bytes)| Ok((name.clone(),
             Allocation::new(stream.device, *bytes, Tag::workspace("inkling2/unit"))?)))
             .collect::<Result<BTreeMap<_, _>>>()?;
-        let owner = Self { stream, layout, buffers };
+        let owner = Self { stream, layout, buffers, replay: std::cell::Cell::new(None), decode_attention:false };
         owner.zero()?;
         Ok(owner)
     }
@@ -270,8 +296,7 @@ impl<'a> RequestOwners<'a> {
         let context = usize::try_from(inputs.context.maximum)?;
         let pages = usize::try_from(admitted.solved.pool_tokens.div_ceil(64))?;
         let cache_layout = cuteafd_loader::families::inkling2::execution::CacheLayout::with_format(cfg, sequences, pages, inputs.kv_format)?;
-        let mark_slots = usize::try_from(cuteafd_core::prefix::mark_slots_with_host(inputs.sequences, inputs.prefix_entries,
-            cache_layout.sequence_bytes as u64, inputs.prefix_mark_budget, inputs.host_prefix.quota_bytes > 0))?;
+        let mark_slots = inputs.prefix_mark_slots;
         let decode_layout = UnitLayout::serving_format(cfg, 64, context, inputs.kv_format, sequences)?;
         let prefill_layout = UnitLayout::serving_format(cfg, usize::try_from(inputs.prefill.rows)?, context, inputs.kv_format, sequences)?;
         let owner = |id: &str, bytes: usize, location| -> Result<()> {
@@ -283,6 +308,7 @@ impl<'a> RequestOwners<'a> {
         };
         let device = Location::coordinator(0);
         owner("inkling2.cache.0.active", cache_layout.active_bytes()?, device)?;
+        owner("inkling2.cache.0.conv", cache_layout.conv.bytes()?, device)?;
         if mark_slots > 0 { owner("inkling2.cache.0.marks", cache_layout.retained_bytes(mark_slots)?, device)?; }
         for &layer in &cache_layout.global_layers {
             let bytes = usize::try_from(cuteafd_loader::placement::planner::sm120_request_backing(cache_layout.layer_page_bytes()? as u64)?)?;
@@ -296,7 +322,8 @@ impl<'a> RequestOwners<'a> {
         }
         // Every extent was checked before the first allocation.
         let cache = Rc::new(super::cache::CacheBank::new(vec![stream.clone()], cache_layout, mark_slots)?);
-        let decode = UnitOwner::new(stream.clone(), decode_layout)?;
+        let mut decode = UnitOwner::new(stream.clone(), decode_layout)?;
+        decode.decode_attention=true;
         let prefill = (0..inputs.prefill.waves).map(|_| UnitOwner::new(stream.clone(), prefill_layout.clone()))
             .collect::<Result<Vec<_>>>()?;
         let decode_uploads = decode.uploads(cfg, sequences.min(decode.layout.rows))?;
@@ -334,7 +361,7 @@ mod packed_tests {
         cfg.layers = 2;
         cfg.local = vec![true, false];
         let cache = super::super::cache::CacheBank::new(vec![stream.clone()], CacheLayout::new(&cfg, 2, 4)?, 0)?;
-        let unit = UnitOwner::new(stream.clone(), UnitLayout::serving_format(&cfg, 4, 128, Default::default(), 2)?)?;
+        let mut unit = UnitOwner::new(stream.clone(), UnitLayout::serving_format(&cfg, 4, 128, Default::default(), 2)?)?;
         let mut uploads = unit.uploads(&cfg, 2)?;
         let members = vec![
             PackedMember { sequence: 1, rows: 0..1, metadata: UnitMetadata::new(&cfg, 63..64, &[2], 4)? },
@@ -362,12 +389,19 @@ mod packed_tests {
         assert_eq!(i32_values("table_indices")?, [0, 1, 1, 1]);
         assert_eq!(&i32_values("tile_rows")?[..2], [0, 1]);
         assert_eq!(i32_values("page_table")?, [2, 0, 0, 3]);
-        let stride = cache.layout.sequence_bytes/4096;
+        let stride = cache.layout.ring_sequence_bytes/4096;
         assert_eq!(values("ring_slots")?, [stride as i64+63, 65, 66, 67]);
         let packed = PackedLayerUnit { unit: &unit, cache: &cache, layer: 1, members: &members,
             uploads: std::cell::RefCell::new(&mut uploads) };
         assert_eq!(packed.buffer("partial")?.ptr, unit.buffer("partial")?.ptr);
         assert_eq!(packed.buffer("cache_slots")?.ptr, unit.buffer("global_slots")?.ptr);
+        drop(packed);
+        unit.decode_attention=true;
+        unit.packed_metadata(1,&cache,&members,&mut uploads)?;stream.drain()?;
+        let mut tiles=vec![0;16];library.copy_d2h(&mut tiles,unit.buffer("tile_rows")?)?;
+        assert_eq!(tiles.chunks_exact(4).map(|bytes|i32::from_le_bytes(bytes.try_into().unwrap())).collect::<Vec<_>>(),[0,1,2,3]);
+        let packed=PackedLayerUnit{unit:&unit,cache:&cache,layer:1,members:&members,uploads:std::cell::RefCell::new(&mut uploads)};
+        assert!(packed.decode_attention());
         Ok(())
     }
 }

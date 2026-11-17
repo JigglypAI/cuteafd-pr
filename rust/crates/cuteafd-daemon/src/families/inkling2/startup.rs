@@ -21,6 +21,7 @@ pub(crate) struct Options<'a> {
     pub context_tokens: u64,
     pub pool_tokens: Option<u64>,
     pub kv_format: cuteafd_loader::families::inkling2::InklingKvCache,
+    pub drafter:Option<cuteafd_loader::families::qwen4::Qwen4KvCache>,
     pub onboard: Onboard,
     pub prefix: &'a PrefixArgs,
     pub resident_weights: ResidentWeights,
@@ -48,6 +49,8 @@ fn validate(options: &Options<'_>, cfg: &Inkling2Config) -> Result<()> {
     ensure!(options.peers.iter().collect::<std::collections::BTreeSet<_>>().len() == options.peers.len(),
         "Inkling Spark endpoints must be distinct");
     cuteafd_core::concurrency::validate("inkling2", options.sequences)?;
+    let ring = cuteafd_loader::families::inkling2::execution::SequenceLayout::new(cfg, true, 1)?.ring_rows;
+    cuteafd_loader::families::inkling2::verify::verify_ring(cfg.window, ring, inkling2::DECODE_ROWS as usize)?;
     ensure!(options.context_tokens == 0 || options.context_tokens <= cfg.max_position as u64,
         "Inkling context exceeds checkpoint");
     ensure!(options.prefill.rows > 0 && options.prefill.rows <= 4096 && options.prefill.rows % 64 == 0
@@ -79,6 +82,9 @@ pub(crate) fn prepare<'a>(library: &'a NativeLibrary, programs: &'a Programs<'a>
         // Missing pin/export is a named startup error, never a host fallback.
         programs.program("inkling2_padded_transpose_bf16_r16_c1024_p64", &["source", "output"])?;
         kernels = Some(Kernels::bind(programs, options.kv_format)?);
+        if options.drafter.is_some(){
+            programs.load_matching(|name|name.starts_with("inkling_draft_")||name.starts_with("draft_bf16_")||name=="fir_history_commit")?;
+        }
         if let Some(tensors) = catalog.fp8() {
             let layers = (0..cfg.layers).collect::<Vec<_>>();
             for (view, _) in tensors.homogeneous_layers(&layers)? {
@@ -93,7 +99,7 @@ pub(crate) fn prepare<'a>(library: &'a NativeLibrary, programs: &'a Programs<'a>
             exl3_modules = crate::shared::experts::rtx::exl3::Exl3Tp2::preload_whole_modules(
                 crate::shared::memory::device::Device { library, id: options.device }, &directory,
                 usize::try_from(options.prefill.rows.max(64))?, cuteafd_core::ExpertGeometry::INKLING2,
-                crate::shared::experts::rtx::RtxSelectionPolicy::FirstCapacity)?;
+                crate::shared::experts::rtx::RtxSelectionPolicy::CanonicalDecode)?;
         }
         Ok(())
     })?;
@@ -107,7 +113,8 @@ pub(crate) fn prepare<'a>(library: &'a NativeLibrary, programs: &'a Programs<'a>
     let manifest = Arc::new(serde_json::from_slice(&std::fs::read(options.manifest)?)?);
     let request = FactsRequest { target_pool_tokens: None, vision: options.vision.vision,
         vision_replicas: options.vision.vision_replicas,
-        media_cache_bytes: options.vision.media_cache_bytes.map(|bytes| bytes.0 as u64), kv_format: options.kv_format, checkpoint, catalog: &catalog, cfg, manifest_path: Some(options.manifest), manifest: Some(manifest),
+        media_cache_bytes: options.vision.media_cache_bytes.map(|bytes| bytes.0 as u64), kv_format: options.kv_format, drafter: options.drafter.map(|kv_cache|cuteafd_loader::families::inkling2::draft::Selection{
+        kv_cache,sms:library.sm_count().unwrap_or(1) as usize}), checkpoint, catalog: &catalog, cfg, manifest_path: Some(options.manifest), manifest: Some(manifest),
         coordinator: Coordinator::Measured { samples, loaded_code: vec![0] }, attention: AttentionPlacement::Heads,
         spark_ranks: options.peers.len(), spark_bytes: cuteafd_loader::serving_capacity::spark_memory::runtime_bytes(&options.peers.iter().map(ToString::to_string).collect::<Vec<_>>())?.into_iter().max().unwrap_or(0),
         prefill: options.prefill, context_tokens: options.context_tokens, pool_tokens: options.pool_tokens,
@@ -135,7 +142,8 @@ pub(crate) fn prepare<'a>(library: &'a NativeLibrary, programs: &'a Programs<'a>
 pub(crate) fn deliver<'a>(library: &'a NativeLibrary,
     view: &cuteafd_loader::plan::checkpoint::CheckpointView, checkpoint: &Checkpoint,
     prepared: &Prepared<'a>, options: &Options<'_>, media: crate::shared::vision::push::Contribution)
-    -> Result<(super::weights::TargetWeights<'a>, Vec<Vec<crate::shared::experts::rtx::push::PushedExperts<'a>>>)> {
+    -> Result<(super::weights::TargetWeights<'a>, Vec<Vec<crate::shared::experts::rtx::push::PushedExperts<'a>>>,
+        Option<crate::shared::speculation::recurrent_weights::Weights<'a>>)> {
     use crate::shared::{memory::device::Device, placement::{spark_rings, SparkAdmission}};
     use cuteafd_core::{ExpertGeometry, SparkEndpoint};
     use cuteafd_loader::placement::SparkWorkingSet;
@@ -181,7 +189,7 @@ pub(crate) fn whole<'a>(library: &'a Arc<NativeLibrary>, programs: &'a Programs<
         options.native_lib, library, &[options.device], prepared.inputs.vision.as_ref()
             .and_then(|vision| vision.admitted(&prepared.admitted.solved)),
         cuteafd_loader::media::ImageFamily::Inkling2, prepared.inputs.vision.as_ref().map_or(0, |vision| vision.media_cache))?;
-    let (target, pushed) = deliver(library, view, checkpoint, &prepared, &options, std::mem::take(&mut media.push))?;
+    let (target, pushed, draft_weights) = deliver(library, view, checkpoint, &prepared, &options, std::mem::take(&mut media.push))?;
     phase.log("inkling2 grouped weight delivery");
     cuteafd_bench::context::phase("Inkling grouped weight delivery");
     let phase = crate::shared::memory::load_timing::Split::start();
@@ -216,8 +224,21 @@ pub(crate) fn whole<'a>(library: &'a Arc<NativeLibrary>, programs: &'a Programs<
         } else { ExpertV2Dtype::Bf16 })?;
     session.flags |= EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16;
     device.run(|| link.bootstrap(&session))?;
-    let execution = super::engine::Execution::new(link, requests, head, target, kernels, local, cfg.clone(), inputs.graph_reserve[0],
+    let mut execution = super::engine::Execution::new(link, requests, head, target, kernels, local, cfg.clone(), inputs.graph_reserve[0],
         inputs.experts.iter().map(|layer| inkling2::ingress(layer.storage)).collect())?;
+    if let Some(weights)=draft_weights{
+        let facts=inputs.drafter.as_ref().context("delivered drafter has no admission facts")?;
+        let mut layout=facts.layout.clone();
+        for rank in &mut layout.runtime{
+            *rank=cuteafd_loader::formats::block_dspark::recurrent::runtime::RecurrentRuntimeLayout::new(&layout.config,
+                rank.slots,rank.sequences,rank.context_rows,usize::try_from(inputs.context.maximum)?,
+                usize::try_from(admitted.solved.pool_tokens)?,library.sm_count()? as usize,rank.kv_cache,
+                rank.rank.rank,rank.rank.ranks,rank.rank.lead)?;
+        }
+        execution.draft=Some(std::rc::Rc::new(super::draft::Binding::new(programs,stream.clone(),weights,layout,
+            &admitted.solved,execution.target.operand("model.llm.unembed.weight")?.buffer,
+            usize::try_from(inputs.prefill.rows)?,usize::try_from(inputs.prefill.waves)?,inputs.prefix_mark_slots)?));
+    }
     let physical = [options.device];
     let devices = cuteafd_loader::placement::planner::CoordinatorDevices::new(&physical)?;
     let mut inventory = crate::shared::memory::receipts::Inventory::new(devices, "retained",
@@ -240,6 +261,11 @@ mod tests {
         assert!(source.contains("InklingEncoding::from_snapshot(&checkpoint.snapshot)"));
         assert!(source.contains("eos == [200006]"));
         assert!(source.contains("InventoryPhase::PreWeight"));
+        assert!(source.contains("RtxSelectionPolicy::CanonicalDecode"));
+        assert!(!source.contains("RtxSelectionPolicy::FirstCapacity"));
+        let resident=include_str!("experts.rs").split("#[cfg(test)]").next().unwrap();
+        assert!(resident.contains("RtxSelectionPolicy::CanonicalDecode"));
+        assert!(!resident.contains("RtxSelectionPolicy::FirstCapacity"));
         assert!(source.contains("Coordinator::Measured"));
         assert!(source.contains("gather(&request)"));
         assert!(source.contains("inputs.admit(inkling2::request("));

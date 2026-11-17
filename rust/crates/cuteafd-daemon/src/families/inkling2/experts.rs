@@ -57,7 +57,7 @@ impl<'a> Resident<'a> {
                 let package = native_lib.parent().context("Inkling native lib directory absent")?
                     .join("exl3/exl3-inkling2-k45/rtx-tp1");
                 Box::new(Exl3Tp2::pushed_whole_weights(device, catalog, &package, backing.layers.clone(), rows,
-                    budget, RtxSelectionPolicy::FirstCapacity, layers)?.execution()?)
+                    budget, RtxSelectionPolicy::CanonicalDecode, layers)?.execution()?)
             }
             _ => anyhow::bail!("Inkling pushed backend storage differs from its selected native/MC catalog"),
         };

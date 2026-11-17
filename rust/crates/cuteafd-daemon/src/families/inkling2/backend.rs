@@ -34,10 +34,15 @@ fn decode_spans(widths: impl IntoIterator<Item = usize>, capacity: usize) -> Res
 }
 
 #[derive(Default)]
-pub(crate) struct Draft;
+pub(crate) struct Draft {anchor:Option<u32>}
 impl scheduler::DraftState for Draft {
-    fn pending_rows(&self) -> usize { 0 }
-    fn close(&mut self, _: u32) {}
+    fn pending_rows(&self) -> usize { usize::from(self.anchor.is_some()) }
+    fn close(&mut self, token: u32) {self.anchor=Some(token);}
+}
+
+enum Pending<'a>{
+    Plain(Vec<(usize,usize,Vec<u32>)>),
+    Spec{mark:super::verify::TargetMark<'a>,tokens:Vec<Vec<u32>>},
 }
 
 pub(crate) struct InklingBackend<'a> {
@@ -51,7 +56,7 @@ pub(crate) struct InklingBackend<'a> {
     vocab: usize,
     host: Option<cuteafd_hostcache::config::Config>,
     profile: RefCell<[f64; 2]>,
-    pending: RefCell<Option<Vec<(usize, usize, Vec<u32>)>>>,
+    pending: RefCell<Option<Pending<'a>>>,
     selector: Vec<cuteafd_loader::placement::planner::Allocation>,
     selector_ready: std::cell::Cell<bool>,
     vision: Option<crate::shared::vision::perception::Binding>,
@@ -69,7 +74,8 @@ impl<'a> InklingBackend<'a> {
         let vocab = execution.cfg.unpadded_vocab_size;
         let selector = plan.facts.allocations.iter().filter(|owner| owner.id.starts_with("selector.")).cloned().collect::<Vec<_>>();
         ensure!(!selector.is_empty(), "Inkling selector was not admitted before startup");
-        Ok(Self { execution: RefCell::new(execution), family: InklingPrefix::new(cache), library,
+        let family=InklingPrefix::with_draft(cache,execution.draft.clone());
+        Ok(Self { execution: RefCell::new(execution), family, library,
             context, concurrency, unit_rows, waves, vocab, host, profile: RefCell::new([0.; 2]),
             pending: RefCell::new(None), selector, vision: None, selector_ready: std::cell::Cell::new(false) })
     }
@@ -101,8 +107,8 @@ impl<'a> InklingBackend<'a> {
     }
     fn decode(&self, sequences: &mut [(&mut Placement, &[u32])], speculative: bool,
         pool: &RefPagePool) -> Result<Option<DeviceLogits>> {
-        ensure!(!speculative && !sequences.is_empty() && sequences.len() <= self.concurrency,
-            "Inkling target decode requires non-speculative admitted requests");
+        ensure!(!sequences.is_empty() && sequences.len() <= self.concurrency && self.pending.borrow().is_none(),
+            "Inkling target decode requires admitted requests and prior commit");
         let spans = decode_spans(sequences.iter().map(|(_, tokens)| tokens.len()),
             self.execution.borrow().requests.decode.layout.rows)?;
         let rows = spans.last().context("Inkling decode has no rows")?.end;
@@ -113,6 +119,10 @@ impl<'a> InklingBackend<'a> {
         let mut receipt = Vec::new();
         for (index, (placement, tokens)) in sequences.iter().enumerate() {
             self.check(placement, tokens, pool)?;
+            let cfg = &self.execution.borrow().cfg;
+            let ring = cuteafd_loader::families::inkling2::execution::SequenceLayout::new(cfg, true, 1)?.ring_rows;
+            debug_assert!(tokens.len() <= ring-cfg.window, "verify append exceeds ring dead horizon");
+            cuteafd_loader::families::inkling2::verify::verify_ring(cfg.window, ring, tokens.len())?;
             ensure!(slots.insert(placement.slot), "Inkling decode aliases a request state slot");
             members.push(UnitSegment { sequence: index, rows: spans[index].clone(),
                 tokens: placement.len..placement.len+tokens.len(),
@@ -123,9 +133,22 @@ impl<'a> InklingBackend<'a> {
         let layers = self.execution.borrow().cfg.layers;
         let unit = Unit { index: 0, sequence: 0, segments: members, rows: 0..rows,
             layers: 0..layers, slot: 0, barrier: false };
-        let logits = self.execution.borrow_mut().decode(&mut placements, &sources, &unit, 1)?;
+        let (logits,pending)=if speculative{
+            use crate::shared::speculation::target::{BlockVerifyTarget,VerifyRequest,VerifyRow};
+            let mut execution=self.execution.borrow_mut();
+            let taps=execution.draft.as_ref().context("speculative verify without admitted drafter")?.layout.config.taps.clone();
+            let ids=placements.iter().map(|p|p.slot).collect::<Vec<_>>();
+            let rows=receipt.iter().flat_map(|(slot,start,tokens)|tokens.iter().enumerate().map(move |(offset,&token)|
+                VerifyRow{slot:*slot,position:start+offset,token:Some(token)})).collect::<Vec<_>>();
+            let mut target=super::verify_target::Target::new(&mut execution,&mut placements);
+            let mark=target.checkpoint(&ids)?;
+            let logits=target.verify(&mark,VerifyRequest{rows:&rows,tap_sites:&taps})?.logits;
+            (logits,Pending::Spec{mark,tokens:receipt.iter().map(|(_,_,tokens)|tokens.clone()).collect()})
+        }else{
+            (self.execution.borrow_mut().decode(&mut placements,&sources,&unit,1)?,Pending::Plain(receipt))
+        };
         for ((placement, _), next) in sequences.iter_mut().zip(placements) { **placement = next; }
-        *self.pending.borrow_mut() = Some(receipt);
+        *self.pending.borrow_mut() = Some(pending);
         Ok(Some(logits))
     }
 }
@@ -180,8 +203,7 @@ impl<'a> Backend<'a> for InklingBackend<'a> {
             "Inkling prefix geometry requires exact admitted frontiers");
         let bank = self.execution.borrow().requests.cache.clone();
         let host = self.host.clone().map(|config| {
-            let retained: std::rc::Rc<dyn crate::shared::prefix::cuda_copy::SnapshotOwner + 'a> = bank.clone();
-            CudaCopyEngine::registered_retained(self.library, vec![], vec![retained]).map(|engine| (config, engine))
+            CudaCopyEngine::registered_retained(self.library, vec![], self.family.snapshot_owners()).map(|engine| (config, engine))
         }).transpose()?;
         let host_bytes = host.as_ref().map_or(0, |(config, _)| config.bytes);
         let layout = self.family.layout();
@@ -250,7 +272,8 @@ impl<'a> Backend<'a> for InklingBackend<'a> {
         ensure!(sequences.iter().map(|sequence| sequence.placement.slot).collect::<BTreeSet<_>>().len() == sequences.len(),
             "Inkling packed members alias a request state slot");
         let chunks = sequences.iter().map(|sequence| {
-            ensure!(!sequence.neural && sequence.start == sequence.placement.len, "Inkling packed start/drafter differs");
+            ensure!(sequence.start == sequence.placement.len, "Inkling packed start differs");
+            ensure!(!sequence.neural || self.execution.borrow().draft.is_some(), "Inkling packed neural prefill needs admitted drafter");
             self.check(sequence.placement, sequence.tokens, pool)?;
             Ok((sequence.start, sequence.tokens.len()))
         }).collect::<Result<Vec<_>>>()?;
@@ -272,7 +295,12 @@ impl<'a> Backend<'a> for InklingBackend<'a> {
             }
             Ok(())
         })?;
-        for (sequence, placement) in sequences.iter_mut().zip(placements) { *sequence.placement = placement; }
+        for (sequence, placement) in sequences.iter_mut().zip(placements) {
+            *sequence.placement = placement;
+            if sequence.neural {
+                self.prefill_draft(sequence.placement, sequence.start, sequence.tokens, sequence.next, sequence.draft)?;
+            }
+        }
         last.into_iter().map(|outcome| outcome.context("Inkling packed member last-row callback missing")).collect()
     }
     fn verify_device(&self, sequences: &mut [(&mut Placement, &[u32])], speculative: bool, pool: &RefPagePool) -> Result<Option<DeviceLogits>> {
@@ -284,26 +312,126 @@ impl<'a> Backend<'a> for InklingBackend<'a> {
     fn verify_attention_trace(&self, _: &[Vec<usize>], rows: usize) -> crate::shared::speculation_trace::Deferred {
         crate::shared::speculation_trace::Deferred::new(move || serde_json::json!({"kind":"inkling2", "rows":rows, "attention":"eager"}))
     }
-    fn prefill_draft(&self, _: &Placement, _: usize, _: &[u32], _: Option<u32>, _: &mut Draft) -> Result<()> { Ok(()) }
-    fn draft(&self, sequences: &mut [scheduler::DraftSeq<'_, Placement, Draft>], _: &mut scheduler::DraftTiming,
-        _: &mut TokenSelector<'_>) -> Result<Vec<Vec<u32>>> { Ok(vec![vec![]; sequences.len()]) }
+    fn draft_head_kind(&self) -> cuteafd_core::HeadScore { cuteafd_core::HeadScore::None }
+    fn draft_copies(&self) -> bool { true }
+    fn prefill_draft(&self,p:&Placement,_:usize,_:&[u32],next:Option<u32>,state:&mut Draft)->Result<()>{
+        if let Some(draft)=&self.execution.borrow().draft{ensure!(draft.drafter.frontier(p.slot)?.1==p.len,"Inkling draft prefill frontier differs");}
+        state.anchor=next;Ok(())
+    }
+    fn draft(&self,sequences:&mut [scheduler::DraftSeq<'_,Placement,Draft>],timing:&mut scheduler::DraftTiming,
+        _:&mut TokenSelector<'_>)->Result<Vec<Vec<u32>>>{
+        let execution=self.execution.borrow();let Some(draft)=&execution.draft else{return Ok(vec![vec![];sequences.len()]);};
+        let start=std::time::Instant::now();let mut output=vec![vec![];sequences.len()];
+        for first in (0..sequences.len()).step_by(draft.layout.runtime[0].sequences){
+            let end=(first+draft.layout.runtime[0].sequences).min(sequences.len());
+            let selected=sequences[first..end].iter().enumerate().filter(|(_,s)|s.depth>0).filter_map(|(index,s)|s.seq.anchor.map(|anchor|(index,anchor,s))).collect::<Vec<_>>();
+            if selected.is_empty(){continue;}
+            let rows=selected.iter().map(|(_,anchor,s)|crate::shared::speculation::dflash::DraftSeq{
+                slot:s.placement.slot,anchor:*anchor,position:s.placement.len,valid_from:0}).collect::<Vec<_>>();
+            let proposed=draft.drafter.draft(&rows,execution.target.operand("model.llm.embed.weight")?.buffer,
+                execution.target.operand("model.llm.embed_norm.weight")?.buffer,execution.target.operand("model.llm.unembed.weight")?.buffer)?;
+            for ((index,_,s),tokens) in selected.into_iter().zip(proposed){output[first+index]=tokens.tokens.into_iter().take(s.depth).collect();}
+        }
+        timing.steps+=1;timing.seconds+=start.elapsed().as_secs_f64();Ok(output)
+    }
     fn accept(&self, verified: &mut [scheduler::Verified<'_, Placement, Draft, usize>], speculative: bool) -> Result<()> {
-        ensure!(!speculative, "Inkling bundled drafter is not yet qualified");
-        let pending = self.pending.borrow_mut().take().context("Inkling decode acceptance has no submitted receipt")?;
-        ensure!(pending.len() == verified.len(), "Inkling accepted request count differs");
-        for ((slot, start, tokens), request) in pending.iter().zip(verified) {
-            ensure!(*slot == request.history && *slot == request.placement.slot && *start == request.start
-                && tokens == request.rows && request.placement.len == start+tokens.len()
-                && request.placement.state_len == request.placement.len, "Inkling accepted causal receipt differs");
+        let pending=self.pending.borrow_mut().take().context("Inkling accept lacks submitted receipt")?;
+        let mut execution=self.execution.borrow_mut();let draft=execution.draft.clone();
+        match pending{
+            Pending::Plain(sent)=>{
+                ensure!(!speculative && sent.len()==verified.len(),"Inkling plain accept inventory differs");
+                for ((slot,start,tokens),request) in sent.iter().zip(verified.iter()){
+                    ensure!(*slot==request.history && *slot==request.placement.slot && *start==request.start
+                        && tokens==request.rows,"Inkling plain accept receipt differs");
+                }
+            }
+            Pending::Spec{mark,tokens}=>{
+                use crate::shared::speculation::target::{AcceptedPrefix,BlockVerifyTarget};
+                ensure!(speculative && tokens.len()==verified.len() && tokens.iter().zip(verified.iter()).all(|(tokens,s)|tokens==s.rows),
+                    "Inkling speculative accept receipt differs");
+                let accepted=verified.iter().map(|s|AcceptedPrefix{slot:s.placement.slot,rows:s.kept.map_or(0,|(rows,_)|rows)}).collect::<Vec<_>>();
+                let mut placements=verified.iter().map(|s|s.placement.clone()).collect::<Vec<_>>();
+                super::verify_target::Target::new(&mut execution,&mut placements).commit(&mark,&accepted)?;
+                for (s,p) in verified.iter_mut().zip(placements){*s.placement=p;}
+            }
+        }
+        if let Some(draft)=draft{
+            for s in verified.iter_mut(){
+                let keep=if speculative{s.kept.map_or(0,|(rows,_)|rows)}else{s.rows.len()};
+                if keep>0{draft.update(&draft.decode,s.placement.slot,s.start,s.first_row,keep)?;}
+                if let Some((_,anchor))=s.kept{s.seq.anchor=Some(anchor);}
+            }
         }
         Ok(())
     }
-    fn cancel(&self, _: &Placement) -> Result<()> { self.execution.borrow().requests.cache.drain()?; self.pending.borrow_mut().take(); Ok(()) }
+    fn cancel(&self,_:&Placement)->Result<()>{
+        let execution=self.execution.borrow();
+        if let Some(Pending::Spec{mark,..})=self.pending.borrow_mut().take(){
+            execution.draft.as_ref().context("cancelled draft missing")?.verify.restore(&mark.conv,execution.requests.cache.conv_backing())?;
+        }
+        execution.requests.cache.drain()?;Ok(())
+    }
+
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recurrent_native_seven_history_always_explores_and_never_head_skips() -> Result<()> {
+        use cuteafd_core::{DraftControl, DraftHistory, DraftOutcome, DrafterSpec, HeadScore};
+        let config = cuteafd_loader::formats::block_dspark::recurrent::RecurrentBlockConfig::from_hf(
+            &serde_json::from_str(include_str!("../../../../cuteafd-loader/src/families/inkling2/fixtures/config.json"))?)?;
+        let width = config.predictions();
+        assert_eq!(width, 7);
+        let mut policy = DraftHistory::new(DrafterSpec { block: width, head: HeadScore::None, copy: 32 }, DraftControl::History);
+        assert_eq!(policy.plan(&[(1, width)], 64), [7]);
+        for _ in 0..256 {
+            let depth = policy.plan(&[(1, width)], 64)[0];
+            let kept = policy.refine(1, depth, None);
+            assert!(kept >= 1, "headless drafter must explore suppressed first position");
+            policy.observe(&[DraftOutcome { id: 1, proposed: kept, accepted: 0, censored: false }], false);
+        }
+        assert_eq!(policy.plan(&[(1, width)], 64), [1]);
+        assert_eq!(policy.stats().head_skips, 0);
+        assert!(policy.stats().explored > 0);
+        for _ in 0..32 {
+            let depth = policy.plan(&[(1, width)], 64)[0];
+            policy.observe(&[DraftOutcome { id: 1, proposed: depth, accepted: depth, censored: false }], false);
+        }
+        assert_eq!(policy.plan(&[(1, width)], 64), [7]);
+        assert_eq!(policy.stats().head_skips, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn agreeing_history_copies_preserve_exact_fir_prefixes() -> Result<()> {
+        use cuteafd_loader::families::inkling2::verify::{accepted_history, Source};
+        let history = [1,2,3,4,5,6,7,8,20,21,22,23,24,25,26,27,28,29,50,1,2,3,4,5,6,7,8];
+        let draft = [20,21,22,23,24,25,26];
+        let tail = crate::shared::draft::copy::continuation(&history, &draft, true).unwrap();
+        let rows = std::iter::once(9).chain(draft).chain(tail.iter().copied()).collect::<Vec<_>>();
+        let prior = [100,99,98];
+        for keep in 0..=rows.len() {
+            let committed = accepted_history(3, rows.len(), keep)?.into_iter().map(|source| match source {
+                Source::Input(i) => rows[i], Source::Prior(i) => prior[i] }).collect::<Vec<_>>();
+            let mut serial = prior.to_vec();
+            for &token in &rows[..keep] { serial.insert(0, token); serial.truncate(3); }
+            assert_eq!(committed, serial);
+        }
+        assert_eq!(decode_spans([8;8],64)?.last().unwrap().end,64);
+        Ok(())
+    }
+
+    #[test]
+    fn packed_neural_prefill_updates_context_and_anchor_before_returning() {
+        let source = include_str!("backend.rs").split("#[cfg(test)]").next().unwrap();
+        let packed = source.split("fn prefill_packed(").nth(1).unwrap().split("fn verify_device(").next().unwrap();
+        assert!(!packed.contains("!sequence.neural &&"));
+        assert!(packed.contains("self.prefill_draft(sequence.placement, sequence.start, sequence.tokens, sequence.next, sequence.draft)?"));
+        assert!(packed.find("*sequence.placement = placement;").unwrap() < packed.find("self.prefill_draft(").unwrap());
+    }
 
     #[test]
     fn decode_members_share_admitted_rows_without_overlapping_logits() -> Result<()> {

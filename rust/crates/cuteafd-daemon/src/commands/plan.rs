@@ -361,6 +361,14 @@ fn resolve_config(args: &mut PlanArgs, cfg: &std::collections::BTreeMap<String, 
 fn resolve_family_config(args: &mut PlanArgs, family: &str, cfg: &std::collections::BTreeMap<String, String>) -> Result<()> {
     use clap::ValueEnum;
     let get = |key: &str| cfg.get(key).filter(|v| !v.is_empty());
+    if family == "inkling2" {
+        if !args.explicit_settings.contains("draft_kv_cache") {
+            if let Some(value) = get("DRAFT_KV_CACHE") { args.draft_kv_cache = value.parse()?; }
+        }
+        anyhow::ensure!(!args.draft_fp8.unwrap_or(false)
+            && matches!(get("SPECULATOR_FP8").map(String::as_str), None | Some("auto" | "off")),
+            "Inkling SPECULATOR_FP8 must be auto or off (checkpoint-native drafter)");
+    }
     if !args.explicit_settings.contains("prefill_rows") {
         if family == "qwen3_5" { args.prefill_rows = 4096; }
         else {
@@ -677,6 +685,7 @@ fn run_plan_with_host(mut args: PlanArgs) -> Result<()> {
         layout.glmf_drafter_disabled = args.speculator == "off";
         layout.glm5_drafter_disabled = args.speculator == "off";
         layout.minimax_dspark = family == "minimax_m3" && args.speculator == "dspark";
+        layout.inkling_dspark = family == "inkling2" && args.speculator == "dspark";
         resolve_mimo_drafter(layout, &args.speculator);
         if family == "qwen3_5" { layout.dense_qwen_mtp = args.speculator == "mtp"; }
         if family == "qwen3_5" && args.speculator == "dspark" {
@@ -1029,7 +1038,7 @@ fn resolve_speculator(args: &mut PlanArgs, snapshot: &std::path::Path, family: &
             (args.speculator != "auto").then_some(args.speculator.as_str()),cfg.get("SPECULATOR").map(String::as_str), kimi_qualification(&args, &cfg))?.value;
     }
     let default = match family {
-        "minimax_m3" => "dspark",
+        "minimax_m3" | "inkling2" => "dspark",
         "glm5" | "glm5_flash" | "muse_spark" => "dflash2",
         "qwen3_5" if serde_json::from_slice::<serde_json::Value>(&std::fs::read(snapshot.join("config.json"))?)
             .is_ok_and(|config| config.get("text_config").unwrap_or(&config)["hidden_size"] == 5120) => "dspark",
@@ -1074,7 +1083,7 @@ fn resolve_speculator(args: &mut PlanArgs, snapshot: &std::path::Path, family: &
     let enabled = match (family, args.speculator.as_str()) {
         (_, "off") | ("qwen3_5", "dspark" | "mtp") | ("kimi_k3", "dflash2"|"dspark") | ("muse_spark", "dflash2") | ("glm5", "dflash2") | ("glm5_flash", "dflash2" | "dspark")
         | ("mimo_v2", "dflash2" | "mtp") | ("qwen4", "auto") | ("qwen4" | "step5", "mtp")
-        | ("deepseek_v4" | "deepseek_v41" | "mistral_large4" | "minimax_m3", "dspark") => true,
+        | ("deepseek_v4" | "deepseek_v41" | "mistral_large4" | "minimax_m3" | "inkling2", "dspark") => true,
         _ => false,
     };
     anyhow::ensure!(enabled, "SPECULATOR={} does not apply to {family}", args.speculator);
@@ -1839,6 +1848,27 @@ mod tests {
         args.kv_format = Some(cuteafd_core::MlaCacheFormat::Bf16);
         resolve_family_config(&mut args, "inkling2", &config).unwrap();
         assert_eq!(options(&args).unwrap().layout.unwrap().inkling_kv, InklingKvCache::Bf16);
+    }
+
+    #[test]
+    fn inkling_bundled_speculator_is_explicit_and_preserves_draft_storage() {
+        use cuteafd_loader::{families::qwen4::Qwen4KvCache, plan::spec::DraftOwnership};
+        let mut args = args(std::path::Path::new("/model"), 4, false);
+        args.speculator = "auto".into();
+        resolve_speculator(&mut args, std::path::Path::new("/model"), "inkling2", &Default::default()).unwrap();
+        assert_eq!(args.speculator, "dspark");
+        assert_eq!(DraftOwnership::selected("inkling2", &args.speculator), DraftOwnership::BundledDspark);
+        args.speculator = "off".into();
+        resolve_speculator(&mut args, std::path::Path::new("/model"), "inkling2", &Default::default()).unwrap();
+        assert_eq!(DraftOwnership::selected("inkling2", &args.speculator), DraftOwnership::None);
+        args.speculator = "dspark".into();
+        resolve_speculator(&mut args, std::path::Path::new("/model"), "inkling2", &Default::default()).unwrap();
+        assert_eq!(DraftOwnership::selected("inkling2", &args.speculator), DraftOwnership::BundledDspark);
+        let config = [("DRAFT_KV_CACHE".into(), "bf16".into()), ("SPECULATOR_FP8".into(), "off".into())].into_iter().collect();
+        resolve_family_config(&mut args, "inkling2", &config).unwrap();
+        assert_eq!(options(&args).unwrap().layout.unwrap().draft_kv_cache, Qwen4KvCache::Bf16);
+        args.draft_fp8 = Some(true);
+        assert!(resolve_family_config(&mut args, "inkling2", &config).is_err());
     }
 
     #[test]

@@ -114,14 +114,10 @@ pub struct SparkCharge {
     pub runtime: u64,
 }
 
-/// Bundled dSpark drafter: its own arena on the head GPU plus its scratch.
+/// Header-native per-rank drafter owners; pool-dependent caches stay curves.
 #[derive(Debug, Clone)]
 pub struct Drafter {
-    pub arena: WeightArenaLayout,
-    /// Exact scratch owners (name, bytes); state that follows the pool is
-    /// charged per page.
-    pub scratch: Vec<(String, u64)>,
-    pub state_per_page: u64,
+    pub layout: crate::families::inkling2::draft::DraftLayout,
 }
 
 /// Bundled PE-Lang ViT and merge projector: own arena plus scratch.
@@ -142,6 +138,8 @@ pub struct InklingInputs {
     pub sequences: u64,
     pub prefix_entries: u64,
     pub prefix_mark_budget: u64,
+    /// One combined-budget count, consumed by target and optional draft banks.
+    pub prefix_mark_slots: usize,
     /// Per-rank target arenas (one per coordinator GPU).
     pub targets: Vec<CoordinatorWeights>,
     /// The resolved attention placement and every layer's mode under it.
@@ -432,7 +430,8 @@ impl InklingInputs {
         // keep no pool pages: their window lives in the per-sequence ring.
         let record_bytes = self.kv_format.record_bytes(cfg.kv_heads, cfg.head_dim) as u64;
         let page_rows = self.page_rows();
-        let mut marks = 0u64;
+        let mut rings = 0u64;
+        let mut conv = 0u64;
         for (layer, &mode) in self.modes.iter().enumerate() {
             // This rank's share of the layer's KV heads: all of a whole layer it
             // owns, half of a split layer, none of a layer another GPU owns.
@@ -456,8 +455,10 @@ impl InklingInputs {
             // under a split (the residual is replicated), the K/V lags split.
             let ring = state.ring_bytes * num / den;
             let lags = if den == 1 { state.lag_bytes } else { state.kv_lag_bytes / 2 + (state.lag_bytes - state.kv_lag_bytes) };
-            marks = marks.checked_add((ring + lags).checked_mul(sequences)
-                .ok_or(Refusal::Overflow("Inkling 2 sequence state"))?).ok_or(Refusal::Overflow("Inkling 2 sequence state"))?;
+            rings = rings.checked_add(ring.checked_mul(sequences)
+                .ok_or(Refusal::Overflow("Inkling ring state"))?).ok_or(Refusal::Overflow("Inkling ring state"))?;
+            conv = conv.checked_add(lags.checked_mul(sequences)
+                .ok_or(Refusal::Overflow("Inkling convolution state"))?).ok_or(Refusal::Overflow("Inkling convolution state"))?;
         }
         if self.modes.iter().any(|mode| *mode == LayerMode::ContextSplit) {
             for demand in self.context_buffers().demands().map_err(|error| invalid(error))?
@@ -469,11 +470,12 @@ impl InklingInputs {
         // Sliding-window rings and short-conv lag rows for every admitted
         // sequence: the prefix-mark arena a snapshot copies (byte-identical
         // restores), sized by concurrency, not context.
-        out.extend(buffer(format!("inkling2.cache.{gpu}.active"), location, marks, Lifetime::TARGET, Category::Kv,
-            "active SWA rings and FP32 convolution lags", maximum));
-        let per_sequence = marks / sequences;
-        let slots = cuteafd_core::prefix::mark_slots_with_host(self.sequences, self.prefix_entries,
-            self.mark_bytes()?, self.prefix_mark_budget, self.host_prefix.quota_bytes > 0);
+        out.extend(buffer(format!("inkling2.cache.{gpu}.active"), location, rings, Lifetime::TARGET, Category::Kv,
+            "active SWA rings", maximum));
+        out.extend(buffer(format!("inkling2.cache.{gpu}.conv"), location, conv, Lifetime::TARGET, Category::Kv,
+            "contiguous FP32 convolution lag backing", maximum));
+        let per_sequence = rings.checked_add(conv).ok_or(Refusal::Overflow("Inkling complete sequence state"))? / sequences;
+        let slots = self.prefix_mark_slots as u64;
         let retained = per_sequence.checked_mul(slots).ok_or(Refusal::Overflow("Inkling prefix marks"))?;
         out.extend(buffer(format!("inkling2.cache.{gpu}.marks"), location, retained, Lifetime::TARGET, Category::Prefix,
             "exact retained SWA and FP32 convolution marks", maximum));
@@ -647,20 +649,37 @@ impl Recipe for InklingInputs {
                 }
             }
         }
-        // Optional bundled drafter: own arena on the head GPU (DraftHome domain).
         if let Some(draft) = &self.drafter {
             contract_variables.push(Variable::DraftHome(vec![head]));
-            let location = Location::coordinator(head);
             let lifetime = Lifetime { first: Phase::DraftLoad, last: Phase::Growth };
-            components.extend(weight_arena_components(&draft.arena, location, lifetime, maximum, MemoryKind::DrafterWeights)?);
-            for (name, bytes) in &draft.scratch {
-                components.extend(buffer(format!("inkling2.draft.{name}"), location, *bytes, lifetime,
-                    Category::Drafter, "bundled dSpark scratch", maximum));
+            if draft.layout.weights.len()!=self.gpus || draft.layout.runtime.len()!=self.gpus {
+                return Err(invalid("drafter rank inventory differs from target"));
             }
-            if draft.state_per_page > 0 {
-                components.push(Component::allocation(Allocation::buffer("inkling2.draft.state", location,
-                    draft.state_per_page, lifetime, Category::Drafter, "bundled dSpark per-page state"),
-                    ByteCurve::linear(draft.state_per_page, draft.state_per_page, maximum), false, maximum));
+            for (rank,(weights,work)) in draft.layout.weights.iter().zip(&draft.layout.runtime).enumerate() {
+                let location=Location::coordinator(rank as u8);
+                components.extend(weight_arena_components(&weights.arena,location,lifetime,maximum,MemoryKind::DrafterWeights)?);
+                for (name,bytes) in &work.buffers {
+                    let full=draft.layout.config.context.iter().enumerate().any(|(layer,policy)|
+                        matches!(policy,crate::formats::block_dspark::recurrent::ContextPolicy::Full)
+                            && name.starts_with(&format!("cache.layer.{layer}.")));
+                    let id=format!("inkling2.draft.{rank}.{name}");
+                    if full {
+                        let stride=PAGE_ROWS*work.cache.record_bytes as u64/2;
+                        components.push(Component::allocation(Allocation::buffer(id,location,stride,lifetime,
+                            Category::Drafter,"recurrent full-context KV plane"),ByteCurve::linear(stride,stride,maximum),false,maximum));
+                    } else {
+                        components.extend(buffer(id,location,*bytes as u64,lifetime,Category::Drafter,"recurrent fixed owner",maximum));
+                    }
+                }
+                if self.prefix_mark_slots>0 {
+                    let bytes=work.window_mark_bytes.checked_mul(self.prefix_mark_slots).ok_or(Refusal::Overflow("draft marks"))? as u64;
+                    components.extend(buffer(format!("inkling2.draft.{rank}.marks"),location,bytes,lifetime,Category::Drafter,
+                        "exact drafter window and last-feature marks",maximum));
+                }
+            }
+            for (name,bytes) in &draft.layout.target {
+                components.extend(buffer(format!("inkling2.draft.target.{name}"),Location::coordinator(0),*bytes as u64,lifetime,
+                    Category::Drafter,"target tap and accepted-prefix FIR owner",maximum));
             }
         }
         if let Some(vision) = &self.vision {

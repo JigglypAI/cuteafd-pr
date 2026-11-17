@@ -15,6 +15,8 @@ pub(crate) struct ServeArgs {
     #[arg(long, value_delimiter=',')] pub peers: Vec<SocketAddr>,
     #[arg(long)] pub pool_tokens: Option<u64>,
     #[arg(long="kv-cache", default_value="fp8")] pub kv_format: cuteafd_loader::families::inkling2::InklingKvCache,
+    #[arg(long,default_value_t=true,action=clap::ArgAction::Set,num_args=0..=1,default_missing_value="true")] pub dspark:bool,
+    #[arg(long,default_value="fp8")] pub draft_kv_cache:cuteafd_loader::families::qwen4::Qwen4KvCache,
     #[arg(long="max-context-tokens", value_parser=crate::shared::context::parse_tokens::<usize>)]
     pub max_context: Option<usize>,
     #[arg(long, default_value="auto")] pub rtx_expert_layers: cuteafd_loader::placement::OnboardSetting,
@@ -85,15 +87,17 @@ pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
                     native_lib: &worker_args.native_lib, manifest: &worker_args.manifest,
                     prefill: PrefillShape { rows: prefill.unit_rows, waves: prefill.waves },
                     sequences: worker_args.max_sequences as u64, context_tokens: worker_args.max_context.unwrap_or(0) as u64,
-                    pool_tokens: worker_args.pool_tokens, kv_format: worker_args.kv_format, onboard: worker_args.rtx_expert_layers.resolve(cfg.layers),
+                    pool_tokens: worker_args.pool_tokens, kv_format: worker_args.kv_format, drafter:worker_args.dspark.then_some(worker_args.draft_kv_cache), onboard: worker_args.rtx_expert_layers.resolve(cfg.layers),
                     prefix: &worker_args.prefix, resident_weights: crate::shared::memory::budget::resident_weight_limit(),
                     expert_usage: false, vision: &worker_args.vision })?;
             let context = usize::try_from(admitted.solved.served_context())?;
-            let family = super::cache::InklingPrefix::new(execution.requests.cache.clone());
+            let family = super::cache::InklingPrefix::with_draft(execution.requests.cache.clone(),execution.draft.clone());
             let host = (inputs.host_prefix.quota_bytes > 0).then(|| {
                 use cuteafd_engine::prefix::PrefixFamily;
                 worker_args.prefix.host_config_for(family.layout(), context, inputs.host_prefix.quota_bytes)
             }).transpose()?;
+            let drafts = execution.draft.as_ref().map_or(scheduler::Drafts::None, |draft|
+                scheduler::Drafts::Neural { depth: draft.layout.config.transformer.block - 1 });
             let binding = crate::shared::vision::perception::Binding::new(&worker_args.snapshot,
                 cuteafd_loader::media::ImageFamily::Inkling2, media.preparer.is_some(), cfg.unpadded_vocab_size as u32)?;
             let backend = super::backend::InklingBackend::new(execution, context, host, &admitted.solved)?.with_vision(binding);
@@ -101,7 +105,7 @@ pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
                 cuteafd_engine::media::EmbeddingCache::new(media.cache_bytes), media.encoder, worker_args.max_sequences);
             library.cuda_set_device(worker_args.device)?;
             scheduler::schedule(&backend, &worker_args.snapshot, &mut receive, &worker_stats,
-                worker_args.max_sequences, scheduler::Drafts::None, worker_args.draft_length, eos,
+                worker_args.max_sequences, drafts, worker_args.draft_length, eos,
                 worker_args.decode_share, &worker_args.prefix, worker_args.loop_abort.config(),
                 worker_args.token_io.token_select, &mut media_admission, None, || {
                     backend.require_live()?;
