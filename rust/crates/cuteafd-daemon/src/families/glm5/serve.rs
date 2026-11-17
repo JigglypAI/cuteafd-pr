@@ -1373,7 +1373,7 @@ mod lane_tests {
     fn publish_keeps_reconciliation_but_leaves_graph_inventory_to_http() {
         let source = include_str!("serve.rs");
         let publish = source.split_once("\nfn publish(").unwrap().1
-            .split_once("\n/// Weak GLM").unwrap().0;
+            .split_once("\nfn schedule(").unwrap().0;
         assert!(publish.contains("capture(\"first_request\")"));
         assert!(!publish.contains("graph_capture_stats"));
         assert!(include_str!("../../shared/api.rs").contains("profile.stats_diagnostics = Some(crate::shared::probe::graph_capture_stats)"));

@@ -5414,6 +5414,10 @@ of their own (decode rows 128 stays opt-in until D2's C1-after-C16 card).
 
 ## First after rc3: per-key draft confidence calibration (TJ, 2026-10-09)
 
+> Superseded 2026-11-18: `history` deletes selector confidence fits and cost
+> models. Only trained dSpark heads calibrate online to decide whether to skip
+> an explore. This section records historical measurements, not pending work.
+
 Items 1-2 are the prior stage of the v3 draft policy's calibration chain
 (section 3 above) and are built on work/draft-policy-v2 (`SelectorFit`,
 `ConfidencePolicy`); item 4's buckets are superseded by that design's `D2`.

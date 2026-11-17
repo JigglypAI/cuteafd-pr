@@ -157,6 +157,8 @@ pub struct PositionTrace {
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct RequestTrace {
     pub id: u64,
+    /// HTTP identity attached by the serving adapter, absent in offline replays.
+    pub request_id: Option<String>,
     pub room: usize,
     /// Leading neural positions above the cut.
     pub keep: usize,
@@ -603,7 +605,7 @@ impl DraftHistory {
                                 .then_some(position < kept[track]) });
                     }
                 }
-                requests.push(RequestTrace { id: outcome.id, room: pending.room, keep: pending.keep,
+                requests.push(RequestTrace { id: outcome.id, request_id: None, room: pending.room, keep: pending.keep,
                     explore_skipped: pending.skipped, neural: pending.granted[NEURAL], copy: pending.granted[COPY],
                     proposed, accepted_drafts: accepted, censored: outcome.censored, positions });
             }

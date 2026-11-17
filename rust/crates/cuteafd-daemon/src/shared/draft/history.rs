@@ -86,7 +86,8 @@ impl Policy {
     /// Learn from one verified round and record it.
     pub fn observe(&mut self, outcomes: &[DraftOutcome]) {
         let record = self.history.observe(outcomes, self.trace.is_some());
-        if let (Some(trace), Some(record)) = (self.trace, record) {
+        if let (Some(trace), Some(mut record)) = (self.trace, record) {
+            attach_request_ids(&mut record);
             if let Err(error) = trace.write(RoundRecord { r#type: "draft_round", round: self.rounds, draft: record }) {
                 tracing::warn!(%error, "draft round trace failed");
             }
@@ -99,6 +100,31 @@ impl Policy {
 
     fn publish(&self) {
         if let Ok(mut slot) = SNAPSHOT.lock() { *slot = Some(Arc::new(self.history.snapshot())); }
+    }
+}
+
+// Numeric tickets stay engine-local; HTTP ids join response usage to this trace.
+static REQUEST_IDS: Mutex<Option<std::collections::HashMap<u64, String>>> = Mutex::new(None);
+
+pub(crate) fn register_request(id: u64, request_id: &str) {
+    if replay_trace().is_some() {
+        if let Ok(mut ids) = REQUEST_IDS.lock() {
+            ids.get_or_insert_with(Default::default).insert(id, request_id.to_owned());
+        }
+    }
+}
+
+pub(crate) fn unregister_request(id: u64) {
+    if let Ok(mut ids) = REQUEST_IDS.lock() {
+        if let Some(ids) = ids.as_mut() { ids.remove(&id); }
+    }
+}
+
+fn attach_request_ids(record: &mut cuteafd_core::RoundTrace) {
+    if let Ok(ids) = REQUEST_IDS.lock() {
+        if let Some(ids) = ids.as_ref() {
+            for request in &mut record.requests { request.request_id = ids.get(&request.id).cloned(); }
+        }
     }
 }
 
@@ -228,6 +254,25 @@ mod tests {
             assert!(position.get(field).is_some(), "{field}");
         }
         assert_eq!((position["head"].as_f64().map(|x| (x * 10.).round()), position["outcome"].as_bool()), (Some(8.), Some(false)));
+    }
+
+    #[test]
+    fn round_requests_join_response_usage_by_http_id_and_retirement_removes_it() {
+        let id = u64::MAX - 2443;
+        REQUEST_IDS.lock().unwrap().get_or_insert_with(Default::default)
+            .insert(id, "http-history-request".to_owned());
+        let mut core = DraftHistory::new(DrafterSpec { block: 3, head: HeadScore::None, copy: 0 },
+            DraftControl::History);
+        core.plan(&[(id, 3)], 64);
+        let mut record = core.observe(&[outcome(id, 4, 2, false)], true).unwrap();
+        attach_request_ids(&mut record);
+        let value = serde_json::to_value(RoundRecord { r#type: "draft_round", round: 0,
+            draft: record.clone() }).unwrap();
+        assert_eq!(value["requests"][0]["id"], id);
+        assert_eq!(value["requests"][0]["request_id"], "http-history-request");
+        unregister_request(id);
+        attach_request_ids(&mut record);
+        assert!(record.requests[0].request_id.is_none());
     }
 
     #[test]

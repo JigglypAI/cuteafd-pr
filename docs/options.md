@@ -731,7 +731,7 @@ Each key is also a global `cuteafd` flag (`--gpu-memory-cap`, `--kv-max-tokens`,
 | `DRAFT_POLICY` | `history` | `history`, `off` | How many drafted positions each request verifies; one policy for every family and drafter. `history` keeps a position while its acceptance probability is above 0.5, where the probability is the request's accepted/reached counts at that position over its last 8 verify rounds, shrunk toward the server-wide rate over the last 256 rounds that reached it (prior strength 8). One position past the stop is always verified so an estimate cannot lock low; a drafter with a trained confidence head (dSpark) skips that explore when the head's calibrated probability is below 0.3, and the skip counts as a miss at that position. The drafter's full native block is available (V4.1: 7). When a round exceeds the 64 verify rows, positions are granted across requests by the same probabilities, highest first. History copies past an agreeing draft use the same rule on their own counts. `off` verifies no drafts. |
 | `DRAFT_CONTEXT_SLOTS` | `max(20, drafts)` | positive int | GLM/MiMo drafter context slots. |
 | `DRAFT_SEQUENCES` | engine default | positive int | Maximum drafts in one batch. |
-| `SPECULATION_TRACE` | unset | absolute path | JSONL speculation trace. |
+| `SPECULATION_TRACE` | unset | absolute path | JSONL speculation trace. Shared `draft_round` records include each request's numeric engine ticket and HTTP `request_id` (the identity in `usage.speculation`), per-position history probabilities/counts, exploration and calibrated head skips. |
 | `GLM5_FLASH_DRAFT_LINEAR` | auto by drafter | `w8a16`, `wide`, `w8a8` | GLM Flash drafter GEMM; Rust resolves `w8a8` with an external FP8 drafter, `w8a16` otherwise. |
 
 ## Prefill
