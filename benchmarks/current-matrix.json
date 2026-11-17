@@ -94,7 +94,7 @@
       },
       "2rtx": {
         "status": "current",
-        "report": "benchmarks/kimi_k31/2026-11-16-smoke-kimi-k3-1-pro-exl3-k2-mc-2rtx-6spark-kimi-k31-mc-original-max"
+        "report": "benchmarks/kimi_k3/2026-11-17-smoke-kimi-k3-1-pro-exl3-k2-mc-2rtx-6spark-kimi-k31-mc-original-max-default-on"
       }
     },
     {
