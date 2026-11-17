@@ -1322,6 +1322,7 @@ def kimi_k31_programs(g, decode_rows: int, prefill_rows: int, max_context: int):
                     {"row_bytes": record_bytes, "page_rows": PAGE_ROWS},
                     lambda rb=record_bytes: context_split.compile_paged_staging_gather_aot(
                         row_bytes=rb, page_rows=PAGE_ROWS)))
+    out.extend(causal_mla_draft_programs(decode_rows, max_context))
     return out
 
 
@@ -1392,6 +1393,31 @@ def mla_draft_programs(max_rows: int, max_context: int):
                         lambda w=window, c=cache: build("partial", w, c)))
     out.append(("mla_draft_lse_combine2", "lse_combine2", {"heads": 64, "has_sink": False},
                 lambda: context_split.compile_lse_combine2_aot(heads=64, has_sink=False)))
+    return out
+
+
+def causal_mla_draft_programs(max_rows: int, max_context: int):
+    """Checkpoint-native h96 row-causal drafter; no changes to h64 exports."""
+    from b12x.integration.cuteafd import kimi_mla
+
+    def build(op, cache="bf16"):
+        geometry = kimi_mla.CausalMlaDraftGeometry(kv_cache=cache)
+        kwargs = {"max_rows": max_rows}
+        if op == "attention":
+            kwargs["max_context"] = max_context
+        return getattr(kimi_mla, f"compile_mla_draft_{op}_aot")(geometry, **kwargs)
+
+    out = [(f"mla_draft_output_causal_h96_m{max_rows}", "mla_draft_output",
+            {"max_rows": max_rows, "heads": 96}, lambda: build("output"))]
+    for cache in ("bf16", "fp8"):
+        suffix = "" if cache == "bf16" else "_fp8"
+        out.append((f"mla_draft_producer_causal_h96{suffix}_m{max_rows}", "mla_draft_producer",
+                    {"max_rows": max_rows, "heads": 96, "kv_cache": cache},
+                    lambda c=cache: build("producer", c)))
+        out.append((f"mla_draft_attention_causal_w1024{suffix}_m{max_rows}", "mla_draft_attention",
+                    {"max_rows": max_rows, "max_context": max_context, "heads": 96,
+                     "window_size": 1024, "is_causal": True, "kv_cache": cache},
+                    lambda c=cache: build("attention", c)))
     return out
 
 

@@ -54,6 +54,7 @@ def exporter(monkeypatch):
         index_topk=2048, index_norm_eps=1e-5, hidden=7168, q_lora_rank=1536, page_rows=64,
         sparse_mla_row_chunk_size=64)
     package.kimi_mla.KimiMlaGeometry = lambda **kw: KimiGeometry(**kw)
+    package.kimi_mla.CausalMlaDraftGeometry = lambda **kw: KimiGeometry(heads=96, window_size=1024, **kw)
     package.kimi_mla.kimi_context_heads_per_tile = lambda *, rows: 8 if rows < 4 else 16
     @dataclasses.dataclass(frozen=True)
     class PartialProgram:
@@ -758,6 +759,25 @@ def test_kimi_context_exports_native_partial_ranges_and_shared_primitives(export
     assert {stem for stem, *_ in programs} <= catalog
 
 
+def test_causal_mla_drafter_export_keeps_native_geometry_and_separate_names(exporter):
+    programs = exporter.causal_mla_draft_programs(64, 1048576)
+    assert len(programs) == 5
+    for stem, op, params, build in programs:
+        module, function, args, kwargs = build()
+        assert module == "kimi_mla" and function == f"compile_{op}_aot"
+        assert args[0].heads == 96 and args[0].window_size == 1024
+        assert kwargs["max_rows"] == 64
+        if op == "mla_draft_attention":
+            assert params["is_causal"] and params["window_size"] == 1024
+            assert kwargs["max_context"] == 1048576
+        assert stem.startswith("mla_draft_") and "causal" in stem
+    target = types.SimpleNamespace(index_heads=32)
+    catalog = {stem for stem, *_ in exporter.kimi_k31_programs(target,64,4096,1048576)}
+    assert {stem for stem, *_ in programs} <= catalog
+    legacy = {stem for stem, *_ in exporter.mla_draft_programs(64,1048576)}
+    assert not legacy.intersection(stem for stem, *_ in programs)
+
+
 @pytest.mark.parametrize("namespace", ["kimik3"])
 def test_shared_mla_drafter_requested_names_exist_in_family_catalog(exporter, namespace):
     ffi = (ROOT / "rust/crates/cuteafd-ffi/src/shared/mla_draft.rs").read_text()
@@ -768,7 +788,7 @@ def test_shared_mla_drafter_requested_names_exist_in_family_catalog(exporter, na
     catalog = {f"{namespace}_{stem}" for stem, *_ in
                exporter.kimi_kda_programs(GEOMETRY, 64, 4096, 1048576)}
     for window in ("full", "w4096"):
-        names = {name.replace("{program_namespace}", namespace).replace("{}", window).replace("{cache}", "_fp8")
+        names = {name.replace("{program_namespace}", namespace).replace("{geometry}", "").replace("{}", window).replace("{cache}", "_fp8")
                  for name in requested}
         assert names <= catalog, sorted(names - catalog)
         assert all(name.startswith(namespace + "_") for name in names)
