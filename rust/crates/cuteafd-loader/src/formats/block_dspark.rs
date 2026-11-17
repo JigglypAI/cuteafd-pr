@@ -1061,6 +1061,42 @@ mod tests {
             tensors.borrow_mut().push(t(name,"BF16",shape));Ok::<_,anyhow::Error>(())
         },|parts,cols| { for (name,rows) in parts { tensors.borrow_mut().push(t(*name,"BF16",&[*rows,cols])); } Ok(()) })?;
         write_safetensors(&root.path().join("model.safetensors"),&tensors.into_inner());
+        let body=std::cell::RefCell::new(Vec::new());
+        let native=std::cell::RefCell::new(Vec::new());
+        block_dspark_weight_recipe(&cfg,|name,shape| {
+            native.borrow_mut().push((name.to_owned(),shape.iter().product::<usize>()*2));
+            Ok::<_,anyhow::Error>(())
+        },|parts,cols| {
+            body.borrow_mut().push((parts.iter().map(|(name,_)|*name).collect::<Vec<_>>().join("+"),
+                parts.iter().map(|(_,rows)|rows*cols).sum::<usize>()));
+            Ok(())
+        })?;
+        let bf16=block_dspark_arena_requests(root.path(),GlmDraftRepresentation::Bf16Only)?
+            .into_iter().collect::<std::collections::BTreeMap<_,_>>();
+        let fp8=block_dspark_arena_requests(root.path(),GlmDraftRepresentation::Fp8Only)?
+            .into_iter().collect::<std::collections::BTreeMap<_,_>>();
+        // The real recipe identifies body matrices; prediction heads never pass
+        // through the matrix callback, regardless of their two-dimensional shape.
+        assert_eq!(body.borrow().len(),1+cfg.layers*4);
+        assert_eq!(body.borrow().iter().map(|(_,n)|n*2).sum::<usize>(),4_330_618_880);
+        for (name,elements) in body.borrow().iter() {
+            assert_eq!(bf16.get(name),Some(&(elements*2)));
+            assert!(!fp8.contains_key(name),"retained BF16 body {name}");
+            assert_eq!(fp8.get(&format!("{name}.payload")),Some(elements));
+            assert_eq!(fp8.get(&format!("{name}.scales")),Some(&(elements/128*4)));
+        }
+        for (name,bytes) in native.borrow().iter() {
+            assert_eq!(bf16.get(name),Some(&(*bytes).max(256)));
+            assert_eq!(fp8.get(name),bf16.get(name),"native auxiliary changed {name}");
+            assert!(!fp8.contains_key(&format!("{name}.payload")));
+            assert!(!fp8.contains_key(&format!("{name}.scales")));
+        }
+        for name in ["markov_head.markov_w1.weight","markov_head.markov_w2.weight",
+            "confidence_head.proj.weight","confidence_head.proj.bias","markov_norms","inv_freq"] {
+            assert!(fp8.contains_key(name),"missing native prediction/derived owner {name}");
+            assert_eq!(fp8.get(name),bf16.get(name));
+        }
+        assert_eq!(fp8.len(),bf16.len()+body.borrow().len());
         for representation in [GlmDraftRepresentation::Bf16Only,GlmDraftRepresentation::Fp8Only] {
             for (kv,per_token) in [(Qwen4KvCache::Bf16,20480),(Qwen4KvCache::Fp8,10880)] {
                 let full=BlockDsparkRuntimeLayout::with_context(root.path(),16,8,188,"kimi/draft/1",
