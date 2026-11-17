@@ -335,7 +335,7 @@ def test_kimi_switch_is_forwarded_to_coordinator_and_native_dispatch():
     wip = (ROOT / 'wip.sh').read_text()
     assert '-e "CUTEAFD_WIP_KIMIK3_AOT=${CUTEAFD_WIP_KIMIK3_AOT:-OFF}"' in wip
     build = (ROOT / 'scripts/build/build-wip-artifacts.sh').read_text()
-    dispatch = next(line for line in build.splitlines() if line.startswith('elif [[ ( "$role" == coordinator'))
+    dispatch = next(line for line in build.splitlines() if line.startswith('elif [[') and '"$role" == coordinator' in line)
     assert '${CUTEAFD_WIP_KIMIK3_AOT:-OFF}' in dispatch
     cmake = (ROOT / 'native/cmake/shared/dsv4_programs.cmake').read_text()
     block = cmake.split('if(CUTEAFD_ENABLE_KIMIK3_AOT)', 1)[1].split('if(CUTEAFD_ENABLE_EXLR8_AOT)', 1)[0]
@@ -352,7 +352,7 @@ def test_ml4_switch_is_keyed_only_when_on_and_forwarded():
     wip = (ROOT / 'wip.sh').read_text()
     assert '-e "CUTEAFD_WIP_ML4_AOT=${CUTEAFD_WIP_ML4_AOT:-OFF}"' in wip
     build = (ROOT / 'scripts/build/build-wip-artifacts.sh').read_text()
-    dispatch = next(line for line in build.splitlines() if line.startswith('elif [[ ( "$role" == coordinator'))
+    dispatch = next(line for line in build.splitlines() if line.startswith('elif [[') and '"$role" == coordinator' in line)
     assert '${CUTEAFD_WIP_ML4_AOT:-OFF}' in dispatch
     block = build[build.index('    env | grep -E'):build.index('    printf', build.index('    env | grep -E'))]
     keyed = lambda extra: subprocess.check_output(['bash', '-c', block], env={**base, **extra}, text=True)
