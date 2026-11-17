@@ -774,8 +774,11 @@ mod fair {
 /// The set follows the entry's resolved layout only: every coordinator GPU it
 /// names, `sparks` when it attaches a pool host (ostrich/dodo/emu/kiwi), and
 /// rhea/moa when those out-of-pool hosts are used. `exclusive` never widens it
-/// (#2364). `wip_cards.serving_locks` in scripts/bench/wip-cards.py mirrors
-/// this; tests/fixtures/serving-locks.json is the shared parity table.
+/// (#2364). GPU0 no longer implies `sparks`: that dated from the launcher
+/// defaulting an unset SPARK_COUNT to every available Spark, and matrix entries
+/// and example configs now resolve the Spark count explicitly (a 0-Spark entry
+/// sets SPARK_COUNT=0). `wip_cards.serving_locks` in scripts/bench/wip-cards.py
+/// mirrors this; tests/fixtures/serving-locks.json is the shared parity table.
 fn locks_for(entry: &Entry) -> Vec<&'static str> {
     let gpus = entry.gpus.clone().unwrap_or_else(|| vec![0]);
     let hosts = entry.sparks.clone().unwrap_or_default();

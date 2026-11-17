@@ -595,7 +595,9 @@ def layout_locks(layouts):
     `sparks` only when a pool host (ostrich/dodo/emu/kiwi) is attached, and
     rhea/moa only when those out-of-pool hosts are used (they have their own
     locks). `exclusive` is a scheduling rule inside one smoke run (V4.1 runs
-    alone), not a claim on both GPUs: it never widens this set (#2364).
+    alone), not a claim on both GPUs: it never widens this set (#2364). GPU0
+    no longer implies `sparks`; card_layout resolves SPARK_COUNT and the hosts
+    explicitly, so a zero-Spark layout takes no pool lock.
     """
     names = set()
     for gpus, hosts in layouts:
