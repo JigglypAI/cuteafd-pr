@@ -53,7 +53,7 @@ impl Options {
         let cfg=MlaDflashConfig::read(&self.snapshot)?;
         Ok(cfg.runtime_layout(self.representation(),GlmDraftCapacity::new(slots,slots.min(8),cfg.block)?,
             context,slots.checked_mul(context).context("draft pool overflow")?,sms,Fp8Rows::W8a16.code() as u8,
-            self.cache_format)?.with_context_split(self.tp2_dflash)?.into())
+            cfg.cache_format(self.cache_format,self.draft_kv_cache))?.with_context_split(self.tp2_dflash)?.into())
     }
 
 }
@@ -189,7 +189,9 @@ impl<'a> NativeDraft<'a> {
         let hidden_stream = cuteafd_loader::families::kimi_k3::draft::DraftHiddenStream::read(&options.snapshot)?;
         ensure!(hidden_stream == layout.hidden_stream(), "Kimi draft hidden stream differs from admitted checkpoint fact");
         if let DraftLayout::Mla(layout) = layout {
-            ensure!(options.cache_format == layout.cache_format(), "Kimi draft options/admission cache records differ");
+            let config=MlaDflashConfig::read(&options.snapshot)?;
+            ensure!(config.cache_format(options.cache_format,options.draft_kv_cache) == layout.cache_format(),
+                "Kimi draft options/admission cache records differ");
         }
         ensure!(matches!(streams.len(), 1 | 2)
             && (streams.len() == 1 || streams[0].device.id != streams[1].device.id),
@@ -246,8 +248,9 @@ impl<'a> NativeDraft<'a> {
             }
             None
         } else { admission.allocate_draft_marks(streams[head].device)? };
+        let cache_format=match layout { DraftLayout::Mla(layout)=>layout.cache_format(),_=>options.cache_format };
         Ok(Self { hidden_stream,
-            block_marks,window_marks, window_bytes, programs, k6_head: None, cache_format: options.cache_format, marks, owners: Owners { draft, target: None }, taps: allocate("DFlash bridge taps")?,
+            block_marks,window_marks, window_bytes, programs, k6_head: None, cache_format, marks, owners: Owners { draft, target: None }, taps: allocate("DFlash bridge taps")?,
             ids: allocate("DFlash bridge input ids")?, input: allocate("DFlash bridge gathered input")?,
             bridge, producer: RefCell::new(crate::shared::memory::device::Event::new(device)?),
             consumed: RefCell::new(crate::shared::memory::device::Event::new(streams[head].device)?),

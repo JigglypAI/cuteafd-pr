@@ -114,7 +114,8 @@ impl<'a> KimiPrefix<'a> {
     pub(crate) fn with_draft(mut self, draft: Option<Rc<super::draft::NativeDraft<'a>>>) -> Result<Self> {
         let inner = Rc::get_mut(&mut self.0).context("Kimi prefix drafter must bind before publication")?;
         if let Some(draft) = &draft {
-            ensure!(draft.cache_format() == inner.mla[0].format(), "Kimi target/draft cache records differ");
+            // Draft marks inventory their own physical records independently
+            // of the target cache dtype.
             let bytes = draft.mark_bytes();
             inner.layout.mark_bytes = inner.layout.mark_bytes.checked_add(bytes).context("Kimi complete mark overflow")?;
         }

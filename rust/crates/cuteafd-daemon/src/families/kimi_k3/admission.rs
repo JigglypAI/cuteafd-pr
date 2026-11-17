@@ -246,8 +246,9 @@ impl<'a> Admission<'a> {
             ensure!(arena_layout.bytes() == admitted.bytes() && arena_layout.views() == admitted.views(),
                 "Kimi draft binder differs from admitted immutable arena");
             let arena = crate::shared::memory::weight_arena::DeviceWeightArena::new(device, arena_layout, ArenaTag::drafter_weights("kimi/draft"))?;
+            let namespace=if layout.kind()==cuteafd_core::coordinator_programs::MlaDraftKind::CausalDflash2 { "kimik31" } else { "kimik3" };
             DflashDrafter::load_mla_with(device.library, programs,
-                target_projection, "kimik3", snapshot, file, stream, layout,
+                target_projection, namespace, snapshot, file, stream, layout,
                 representation, scales, rows, split, |physical, name, bytes| {
                     ensure!(physical == device.id, "Kimi draft arena physical owner changed");
                     arena.view(name, bytes)

@@ -1838,7 +1838,7 @@ case "$speculator" in
       draft_snapshot="$(snapshot_of "$drafter" "$draft_revision")" ||
         { [[ -z "$default_drafter" ]] || echo "download it (hf download $drafter) or set SPECULATOR=off" >&2; exit 1; }
       draft_args=(--draft "$draft_snapshot")
-      if [[ "$family" == muse_spark || "$family:$speculator" == kimi_k3:dspark ]]; then
+      if [[ "$family" == muse_spark || "$family" == kimi_k3 ]]; then
         muse_draft_kv="$(get DRAFT_KV_CACHE fp8)"
         [[ "$family" != kimi_k3 ]] || muse_draft_kv="$kimi_draft_kv"
         case "$muse_draft_kv" in bf16|fp8) ;; *) release_die "DRAFT_KV_CACHE must be bf16 or fp8" ;; esac
@@ -2414,7 +2414,7 @@ audio_encoder_hash=""
   fi
   if [[ "$family" == kimi_k3 && ( "$speculator" == dflash2 || "$speculator" == dspark ) ]]; then
     plan_draft_args+=(--drafter-snapshot "$draft_snapshot")
-    if [[ "$speculator" == dspark ]]; then plan_draft_args+=(--draft-kv-cache "$(get DRAFT_KV_CACHE "${kimi_draft_kv_default:-fp8}")"); fi
+    plan_draft_args+=(--draft-kv-cache "$(get DRAFT_KV_CACHE "${kimi_draft_kv_default:-fp8}")")
   fi
   if [[ "$family:$speculator" == muse_spark:dflash2 ]]; then
     plan_draft_args+=(--drafter-snapshot "$draft_snapshot")

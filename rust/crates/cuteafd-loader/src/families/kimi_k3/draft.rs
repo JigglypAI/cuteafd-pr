@@ -87,7 +87,7 @@ impl DraftLayout {
         ensure!(self.capacity().context_slots == slots && self.capacity().max_batch_sequences <= rows.min(64),
             "Kimi drafter capacity differs from target slots/rows");
         match self {
-            Self::Mla(l) => ensure!(l.cache_format() == cache && l.program().context == context
+            Self::Mla(l) => ensure!((l.kind() == cuteafd_core::coordinator_programs::MlaDraftKind::CausalDflash2 || l.cache_format() == cache) && l.program().context == context
                 && l.cache().layers.iter().all(|layer| layer.slots() == slots),
                 "Kimi MLA drafter cache differs from target capacity"),
             Self::Block(l) => ensure!(l.config.window.is_some(), "block drafter requires window-bounded KV"),

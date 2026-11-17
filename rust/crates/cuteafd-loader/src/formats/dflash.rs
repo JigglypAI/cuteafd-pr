@@ -1023,6 +1023,15 @@ impl MlaDflashConfig {
 
     fn is_ml4(&self) -> bool { self.kind == cuteafd_core::coordinator_programs::MlaDraftKind::Ml4Dspark }
 
+    /// Preserve the historical h64 cache contract; the native causal stack's
+    /// independently owned rings use the existing drafter storage selection.
+    pub fn cache_format(&self, target: MlaCacheFormat,
+        draft: crate::families::qwen4::Qwen4KvCache) -> MlaCacheFormat {
+        if self.kind != cuteafd_core::coordinator_programs::MlaDraftKind::CausalDflash2 { return target; }
+        match draft { crate::families::qwen4::Qwen4KvCache::Bf16 => MlaCacheFormat::Bf16,
+            crate::families::qwen4::Qwen4KvCache::Fp8 => MlaCacheFormat::Fp8 }
+    }
+
     /// Drafted tokens per proposal: DFlash2's block holds the anchor (block - 1);
     /// mtp_dspark predicts from the anchor too (block).
     pub fn drafts(&self) -> usize { if self.is_ml4() { self.block } else { self.block - 1 } }
@@ -1641,6 +1650,22 @@ mod tests {
         raw.as_object_mut().unwrap().remove("fc_norm");
         raw.as_object_mut().unwrap().remove("mla_use_output_gate");
         raw
+    }
+
+    #[test]
+    fn causal_mla_draft_kv_is_independent_and_lightseek_storage_is_unchanged() -> anyhow::Result<()> {
+        use crate::families::qwen4::Qwen4KvCache;
+        let causal=MlaDflashConfig::from_json(&causal_config())?;
+        let legacy=MlaDflashConfig::from_json(&config())?;
+        for target in [MlaCacheFormat::Bf16,MlaCacheFormat::Fp8] {
+            for (draft,expected) in [(Qwen4KvCache::Bf16,MlaCacheFormat::Bf16),(Qwen4KvCache::Fp8,MlaCacheFormat::Fp8)] {
+                assert_eq!(causal.cache_format(target,draft),expected);
+                assert_eq!(legacy.cache_format(target,draft),target);
+                let cache=causal.cache_layout(2,8192,expected)?;
+                assert_eq!(cache.cache_bytes,5*2*1088*expected.record_bytes() as u64);
+            }
+        }
+        Ok(())
     }
 
     #[test]

@@ -133,7 +133,7 @@ pub(crate) fn load<'a, const RANKS: usize>(library: &'a Arc<cuteafd_ffi::NativeL
     if RANKS == 2 { options.attention = Some(cuteafd_loader::families::kimi_k3::resolve_attention(options.attention, RANKS)); }
     check_attention(options.attention, RANKS, options.graphs)?;
     ensure!(options.draft.as_ref().is_none_or(|draft| draft.cache_format == options.cache_format),
-        "Kimi target/draft cache records differ");
+        "Kimi draft options must retain the target cache selection");
     let spark_ranks = options.peers.len();
     ensure!(spark_ranks <= cuteafd_core::MAX_SPARK_WORLD, "Kimi Spark peer inventory exceeds eight");
     let core = cuteafd_loader::plan::families::kimi::core_inventory(checkpoint)?;
@@ -164,10 +164,14 @@ pub(crate) fn load<'a, const RANKS: usize>(library: &'a Arc<cuteafd_ffi::NativeL
         draft.layout(options.slots, options.max_context, library.sm_count()?,head))).transpose()?;
     // Resolve native modules before the measured baseline, while retaining their handles.
     let _draft_modules = options.draft.as_ref().filter(|_| matches!(draft_layout,
-        Some(cuteafd_loader::families::kimi_k3::draft::DraftLayout::Mla(_)))).map(|_| devices[head].run(|| {
+        Some(cuteafd_loader::families::kimi_k3::draft::DraftLayout::Mla(_)))).map(|draft| devices[head].run(|| {
         use cuteafd_ffi::mla_draft::{MlaDraft, MlaDraftWindow};
-        Ok([MlaDraft::load(programs, "kimik3", MlaDraftWindow::Full, options.cache_format)?,
-            MlaDraft::load(programs, "kimik3", MlaDraftWindow::Sliding4096, options.cache_format)?])
+        let cfg=cuteafd_loader::formats::dflash::MlaDflashConfig::read(&draft.snapshot)?;
+        let cache=cfg.cache_format(options.cache_format,draft.draft_kv_cache);
+        if cfg.kind == cuteafd_core::coordinator_programs::MlaDraftKind::CausalDflash2 {
+            Ok(vec![MlaDraft::load(programs,"kimik31",MlaDraftWindow::CausalSliding1024,cache)?])
+        } else { Ok(vec![MlaDraft::load(programs, "kimik3", MlaDraftWindow::Full, options.cache_format)?,
+            MlaDraft::load(programs, "kimik3", MlaDraftWindow::Sliding4096, options.cache_format)?]) }
     })).transpose()?;
     let _block_projection_modules=if let Some(layout)=&draft_layout {
         use cuteafd_loader::families::kimi_k3::draft::DraftLayout;
