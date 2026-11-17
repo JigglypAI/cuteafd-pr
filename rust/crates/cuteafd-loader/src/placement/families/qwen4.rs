@@ -225,6 +225,9 @@ impl<'a> QwenSingle<'a> {
         let admission = qwen_admission(&inputs.admission)
             .map_err(|error| Refusal::InvalidFact(format!("Qwen admission: {error}")))?;
         let page = QWEN_UNIT_ROWS as u64;
+        if let Some(tokens) = inputs.requested_pool.filter(|&tokens| tokens > 0 && tokens < inputs.context.required()) {
+            return Err(Refusal::PoolBelowContext { tokens, context: inputs.context.required() });
+        }
         let requested = inputs.requested_pool.filter(|&tokens| tokens > 0).map(|tokens|
             tokens.div_ceil(page).checked_mul(page).ok_or(Refusal::Overflow("Qwen pool request"))).transpose()?;
         let cards = [inputs.capacity_bytes];
@@ -900,6 +903,9 @@ impl<'a> QwenDual<'a> {
             .ok_or(Refusal::Overflow("Qwen residual hop buffers"))?
             .try_into().map_err(|_| Refusal::InvalidFact("Qwen hop owner count".into()))?;
         let (arena, resident) = tp2_arena(inputs)?;
+        if let Some(tokens) = inputs.requested_pool.filter(|&tokens| tokens > 0 && tokens < inputs.context.required()) {
+            return Err(Refusal::PoolBelowContext { tokens, context: inputs.context.required() });
+        }
         let requested = inputs.requested_pool.filter(|&tokens| tokens > 0).map(|tokens|
             tokens.div_ceil(page).checked_mul(page).ok_or(Refusal::Overflow("Qwen pool request"))).transpose()?;
         let cards = inputs.gpus.map(|gpu| gpu.capacity_bytes);
@@ -2103,9 +2109,12 @@ mod tests {
         // An explicit pool below the context is the first typed refusal.
         let short = single_inputs(&cfg, Baseline::Measured { free_bytes: 96 << 30 }, 0,
             Some(65536), ResidentWeights(0), None);
-        let below = QwenSingle::new(&short).unwrap();
-        assert_eq!(below.admit().unwrap_err(),
-            Refusal::PoolBelowContext { tokens: 65536, context: 131072 });
+        assert!(matches!(QwenSingle::new(&short), Err(Refusal::PoolBelowContext {
+            tokens: 65536, context: 131072 })));
+        let almost = single_inputs(&cfg, Baseline::Measured { free_bytes: 96 << 30 }, 0,
+            Some(131_071), ResidentWeights(0), None);
+        assert!(matches!(QwenSingle::new(&almost), Err(Refusal::PoolBelowContext {
+            tokens: 131_071, context: 131_072 })));
     }
 
     /// The dual route states its cut, arenas and receive-slot hops once; the
