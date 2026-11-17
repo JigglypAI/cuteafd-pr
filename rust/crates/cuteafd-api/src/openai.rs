@@ -1299,6 +1299,7 @@ pub(crate) struct Running {
     pub(crate) audio_tokens: usize,
     prefix_cache_source: PrefixCacheSource,
     finish_detail: FinishDetail,
+    usage: Option<crate::usage::UsageHandle>,
     /// The prompt usage and matched client stop string, observed as the
     /// generator sees them.
     pub(crate) tap: Arc<Mutex<Tap>>,
@@ -1411,6 +1412,7 @@ impl Submitter {
             }
         };
         let chunks = processor.process(input);
+        let response_usage = usage.clone();
         let output_usage = usage.filter(|_| chat_accounting);
         let chunks = async_stream::stream! {
             futures::pin_mut!(chunks);
@@ -1432,7 +1434,7 @@ impl Submitter {
                 }
             }
         };
-        Ok(Running { prefix_cache_source, finish_detail, chunks: Box::pin(chunks), failure, image_tokens, audio_tokens, tap, streaming, include_usage, id, model })
+        Ok(Running { prefix_cache_source, finish_detail, usage: response_usage, chunks: Box::pin(chunks), failure, image_tokens, audio_tokens, tap, streaming, include_usage, id, model })
     }
 }
 
@@ -1495,7 +1497,7 @@ async fn chat(State(state): State<NativeState>, headers: axum::http::HeaderMap,
 
 /// Render an accepted request as Chat Completions SSE or JSON.
 async fn respond(running: Running) -> Response {
-    let Running { chunks, failure, image_tokens, audio_tokens, prefix_cache_source, finish_detail, streaming, include_usage, id, model, .. } = running;
+    let Running { chunks, failure, image_tokens, audio_tokens, prefix_cache_source, finish_detail, usage: request_usage, streaming, include_usage, id, model, .. } = running;
     if streaming {
         let stream = async_stream::stream! {
             let mut chunks = chunks;
@@ -1538,7 +1540,11 @@ async fn respond(running: Running) -> Response {
             }
             let failed = failure.lock().unwrap().clone();
             if let Some(message) = failed { yield Ok(message.sse_error()); return; }
+            if let Some(scope) = &request_usage {
+                if let Err(error) = scope.wait_retired().await { yield Ok(sse_error(anyhow::anyhow!(error))); return; }
+            }
             if let Some(mut usage) = usage_chunk {
+                add_speculation_usage(&mut usage, request_usage.as_ref());
                 add_finish_detail(&mut usage, &finish_detail);
                 yield Ok(format!("data: {}\n\n", serde_json::to_string(&usage).unwrap()));
             }
@@ -1572,11 +1578,25 @@ async fn respond(running: Running) -> Response {
     if let Some(message) = failure.lock().unwrap().clone() {
         return message.rejection().into_response();
     }
+    if let Some(scope) = &request_usage {
+        if let Err(error) = scope.wait_retired().await {
+            return Rejection::new(StatusCode::INTERNAL_SERVER_ERROR, error).into_response();
+        }
+    }
     let mut value = serde_json::to_value(response).expect("chat response serializes");
     add_media_usage(&mut value, image_tokens, audio_tokens);
     add_prefix_source(&mut value, &prefix_cache_source);
     add_finish_detail(&mut value, &finish_detail);
+    add_speculation_usage(&mut value, request_usage.as_ref());
     Json(value).into_response()
+}
+
+fn add_speculation_usage(response: &mut Value, usage: Option<&crate::usage::UsageHandle>) {
+    if let Some(counters) = usage.and_then(crate::usage::UsageHandle::speculation) {
+        if let Some(usage) = response.get_mut("usage").and_then(Value::as_object_mut) {
+            usage.insert("speculation".into(), counters);
+        }
+    }
 }
 
 fn count_parts(items: &Value, kind: &str) -> u64 {
@@ -2431,6 +2451,50 @@ mod tests {
             let error = String::from_utf8_lossy(&bytes);
             assert!(error.contains("does not support disabling thinking"), "{error}");
         }
+    }
+
+    #[tokio::test]
+    async fn request_local_speculation_usage_matches_records_for_json_and_sse() {
+        for streaming in [false, true] { for speculative in [false, true] {
+            let sink = Arc::new(crate::usage::tests::Sink::default());
+            let (tx, mut rx) = mpsc::channel::<NativeRequest>(1);
+            let worker = tokio::spawn(async move {
+                let job = rx.recv().await.unwrap();
+                if let Some(usage) = &job.usage {
+                    usage.round(if speculative { 5 } else { 0 }, if speculative { 3 } else { 0 });
+                    usage.round(if speculative { 3 } else { 0 }, if speculative { 2 } else { 0 });
+                }
+                for event in [InferenceChunk::Ready { system_fingerprint: None,
+                    prompt_usage: PromptUsage { prompt_tokens: 18, prompt_cache_hit_tokens: 0 } },
+                    InferenceChunk::Text { content: "answer".into(), content_tokens: 8 },
+                    InferenceChunk::Finish { finish_reason: InferenceFinishReason::Stop }] {
+                    job.events.send(Ok(event)).unwrap();
+                }
+            });
+            let app = router(tx).layer(axum::middleware::from_fn_with_state(
+                crate::usage::Middleware::new(sink.clone()), crate::usage::track));
+            let body = json!({"messages":[{"role":"user","content":"Hi"}],"max_tokens":16,
+                "thinking":{"type":"disabled"},"stream":streaming,"stream_options":{"include_usage":true}});
+            let response = app.oneshot(axum::http::Request::post("/v1/chat/completions")
+                .header("content-type","application/json").body(Body::from(body.to_string())).unwrap()).await.unwrap();
+            assert_eq!(response.status(),StatusCode::OK);
+            let bytes = axum::body::to_bytes(response.into_body(),1<<20).await.unwrap();
+            worker.await.unwrap();
+            let value: Value = if streaming {
+                std::str::from_utf8(&bytes).unwrap().split("data: ")
+                    .filter_map(|s| s.trim().parse::<Value>().ok()).find(|v| v["choices"] == json!([])).unwrap()
+            } else { serde_json::from_slice(&bytes).unwrap() };
+            let rows = sink.0.lock().unwrap();
+            assert_eq!(rows.len(),1);
+            if speculative {
+                let s = &value["usage"]["speculation"];
+                assert_eq!(s["request_id"],rows[0].rid);
+                assert_eq!(s["proposed"],8); assert_eq!(s["accepted"],5); assert_eq!(s["cycles"],2);
+                assert_eq!(s["proposed"].as_u64(),rows[0].draft_proposed);
+                assert_eq!(s["accepted"].as_u64(),rows[0].draft_accepted);
+                assert_eq!(s["cycles"].as_u64(),rows[0].rounds);
+            } else { assert!(value["usage"].get("speculation").is_none()); }
+        } }
     }
 
     #[tokio::test]
