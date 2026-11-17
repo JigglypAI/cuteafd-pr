@@ -28,7 +28,11 @@
 //! **Head skip.** A drafter with a trained head keeps one online Platt fit per
 //! position from raw head score to acceptance, trained on reached positions.
 //! The explore position is skipped for a round when its calibrated probability
-//! is below [`SKIP_CUT`]. Drafters without a head always explore.
+//! is below [`SKIP_CUT`], and the skip is booked as a miss at that position in
+//! the request's and the server's history (when the kept prefix before it was
+//! accepted, exactly as a rejected explore would be): otherwise the position's
+//! history stands still and later rounds draft deeper. Drafters without a head
+//! always explore.
 //!
 //! **Budget.** When the round's rows exceed the verify-row budget, positions
 //! are granted across requests by the same probabilities, highest first, each
@@ -58,7 +62,7 @@ pub const PRIOR_STRENGTH: f64 = 8.;
 pub const KEEP_CUT: f64 = 0.5;
 /// A head-calibrated explore position below this is skipped for the round.
 /// The one place this threshold lives: retune it here from card data.
-pub const SKIP_CUT: f64 = 0.2;
+pub const SKIP_CUT: f64 = 0.3;
 /// Server rate of a neural position nobody has reached yet.
 pub const NEURAL_COLD_RATE: f64 = 1.;
 /// Server rate of a copy position nobody has reached yet.
@@ -156,8 +160,8 @@ pub struct RequestTrace {
     pub room: usize,
     /// Leading neural positions above the cut.
     pub keep: usize,
-    /// The head skipped this round's explore.
-    pub skipped: bool,
+    /// The head skipped this round's explore: its calibrated probability.
+    pub explore_skipped: Option<f64>,
     /// Neural and copy positions granted under the row budget.
     pub neural: usize,
     pub copy: usize,
@@ -172,6 +176,16 @@ pub struct RequestTrace {
 pub struct RoundTrace {
     pub policy: String,
     pub block: usize,
+    /// Request rounds observed so far, and how many of them verified at most one
+    /// draft although they had room for more: the share a card reads to tell a
+    /// short-drafting workload from a locked estimate.
+    pub rounds: u64,
+    pub short_rounds: u64,
+    pub short_share: f64,
+    /// Explores verified, accepted and skipped by the head so far.
+    pub explored: u64,
+    pub explore_accepted: u64,
+    pub head_skips: u64,
     pub requests: Vec<RequestTrace>,
 }
 
@@ -187,8 +201,9 @@ pub struct DraftHistoryStats {
     /// Explore positions verified, and how many the target accepted.
     pub explored: u64,
     pub explore_accepted: u64,
-    /// Explore positions the head skipped.
+    /// Explore positions the head skipped, and how many were booked as a miss.
     pub head_skips: u64,
+    pub skip_misses: u64,
     /// Positions the row budget removed from plans.
     pub budget_cut: u64,
     /// Request rounds by verified draft count.
@@ -197,6 +212,13 @@ pub struct DraftHistoryStats {
     pub position_accepted: Vec<u64>,
     pub copy_reached: Vec<u64>,
     pub copy_accepted: Vec<u64>,
+}
+
+impl DraftHistoryStats {
+    /// Share of request rounds that verified at most one draft with room for more.
+    pub fn short_share(&self) -> f64 {
+        if self.rounds == 0 { 0. } else { self.short_rounds as f64 / self.rounds as f64 }
+    }
 }
 
 /// The last `SERVER_WINDOW` outcomes of one position.
@@ -298,7 +320,8 @@ struct Planned {
 struct Pending {
     room: usize,
     keep: usize,
-    skipped: bool,
+    /// The skipped explore's calibrated probability.
+    skipped: Option<f64>,
     /// Planned positions per track, and how many of them the budget granted.
     planned: [Vec<Planned>; 2],
     granted: [usize; 2],
@@ -416,7 +439,7 @@ impl DraftHistory {
                 }
             };
             let granted = planned.len();
-            let pending = Pending { room, keep, skipped: false, planned: [planned, Vec::new()],
+            let pending = Pending { room, keep, skipped: None, planned: [planned, Vec::new()],
                 granted: [granted, 0], head: Vec::new() };
             self.requests.insert(id, Request { pending: Some(pending), ..request });
         }
@@ -436,10 +459,11 @@ impl DraftHistory {
         let explore = pending.keep;
         if self.control == DraftControl::History && pending.granted[NEURAL] > explore {
             if let Some(&score) = pending.head.get(explore) {
-                if score.is_finite() && self.platt[explore].apply(logit(self.spec.head, score)) < SKIP_CUT {
+                let calibrated = self.platt[explore].apply(logit(self.spec.head, score));
+                if score.is_finite() && calibrated < SKIP_CUT {
                     pending.granted[NEURAL] = explore;
                     pending.planned[NEURAL].truncate(explore);
-                    pending.skipped = true;
+                    pending.skipped = Some(calibrated);
                     self.stats.head_skips += 1;
                 }
             }
@@ -514,8 +538,12 @@ impl DraftHistory {
             // The position after the accepted prefix was judged unless the round was censored.
             let judged = (accepted + usize::from(!outcome.censored)).min(proposed);
             let neural = proposed.min(pending.granted[NEURAL]);
-            let reached = [judged.min(neural), judged.saturating_sub(neural)];
+            let mut reached = [judged.min(neural), judged.saturating_sub(neural)];
             let kept = [accepted.min(neural), accepted.saturating_sub(neural)];
+            // A skipped explore whose kept prefix was verified and accepted is a miss at
+            // its position, as a rejected explore would have been. It trains no calibration.
+            let skip_miss = pending.skipped.is_some() && !outcome.censored
+                && neural == pending.keep && kept[NEURAL] == pending.keep;
             for track in [NEURAL, COPY] {
                 for position in 0..reached[track] {
                     let hit = position < kept[track];
@@ -532,8 +560,13 @@ impl DraftHistory {
                     }
                 }
             }
+            if skip_miss {
+                self.server[NEURAL][pending.keep].push(false);
+                reached[NEURAL] = pending.keep + 1;
+                self.stats.skip_misses += 1;
+            }
             let explores = self.control == DraftControl::History;
-            if explores && reached[NEURAL] > pending.keep {
+            if explores && !skip_miss && reached[NEURAL] > pending.keep {
                 self.stats.explored += 1;
                 self.stats.explore_accepted += u64::from(kept[NEURAL] > pending.keep);
             }
@@ -560,12 +593,15 @@ impl DraftHistory {
                     }
                 }
                 requests.push(RequestTrace { id: outcome.id, room: pending.room, keep: pending.keep,
-                    skipped: pending.skipped, neural: pending.granted[NEURAL], copy: pending.granted[COPY],
+                    explore_skipped: pending.skipped, neural: pending.granted[NEURAL], copy: pending.granted[COPY],
                     proposed, accepted_drafts: accepted, censored: outcome.censored, positions });
             }
             self.requests.insert(outcome.id, request);
         }
-        trace.then(|| RoundTrace { policy: self.control.label(), block: self.spec.block, requests })
+        trace.then(|| RoundTrace { policy: self.control.label(), block: self.spec.block,
+            rounds: self.stats.rounds, short_rounds: self.stats.short_rounds, short_share: self.stats.short_share(),
+            explored: self.stats.explored, explore_accepted: self.stats.explore_accepted,
+            head_skips: self.stats.head_skips, requests })
     }
 
     /// Forget a finished request.
@@ -587,8 +623,9 @@ impl DraftHistory {
             "prior_strength": PRIOR_STRENGTH, "active_requests": self.requests.len(),
             "rounds": self.stats.rounds, "verified_drafts": self.stats.verified_drafts,
             "accepted_drafts": self.stats.accepted_drafts, "short_rounds": self.stats.short_rounds,
+            "short_share": self.stats.short_share(),
             "explored": self.stats.explored, "explore_accepted": self.stats.explore_accepted,
-            "head_skips": self.stats.head_skips, "budget_cut": self.stats.budget_cut,
+            "head_skips": self.stats.head_skips, "skip_misses": self.stats.skip_misses, "budget_cut": self.stats.budget_cut,
             "length_histogram": self.stats.length_histogram,
             "positions": track(NEURAL, &self.stats.position_reached, &self.stats.position_accepted),
             "copy": track(COPY, &self.stats.copy_reached, &self.stats.copy_accepted),
@@ -793,18 +830,29 @@ mod tests {
         assert_eq!(policy.stats().position_reached, [3, 2, 1, 0, 0]);
     }
 
-    #[test]
-    fn the_head_skips_only_explores_calibrated_below_the_cut() {
+    /// A head drafter whose position 1 has been explored and missed eight times. The
+    /// rounds report no scores, so the calibration is still the identity.
+    fn suppressed_head_policy() -> DraftHistory {
         let spec = DrafterSpec { block: 4, head: HeadScore::Probability, copy: 0 };
         let mut policy = DraftHistory::new(spec, DraftControl::History);
         for _ in 0..REQUEST_WINDOW {
             policy.plan(&[(1, 4)], 64);
-            policy.refine(1, 4, Some(&[0.9, 0.5, 0.5, 0.5]));
+            policy.refine(1, 4, None);
             policy.observe(&[outcome(1, 4, 1)], false);
         }
-        // Position 1 is the explore; its fit has learned that a 0.5 there misses.
+        assert_eq!(policy.stats().head_skips, 0);
+        policy
+    }
+
+    #[test]
+    fn the_head_skips_only_explores_calibrated_below_the_cut() {
+        let mut policy = suppressed_head_policy();
+        // Position 1 is the explore. The fit starts at the identity and learns from each
+        // verified explore, so the cut is checked against the calibrated value in force.
+        assert!(policy.platt[1].apply(logit(HeadScore::Probability, 0.29)) < SKIP_CUT);
+        assert!(policy.platt[1].apply(logit(HeadScore::Probability, 0.31)) >= SKIP_CUT);
         let mut skipped = 0;
-        for score in [0.02, 0.19, 0.35, 0.6, 0.9, 0.99] {
+        for score in [0.02, 0.29, 0.31, 0.6, 0.9, 0.99] {
             assert_eq!(policy.plan(&[(1, 4)], 64), [2]);
             let calibrated = policy.platt[1].apply(logit(HeadScore::Probability, score));
             let kept = calibrated >= SKIP_CUT;
@@ -812,12 +860,13 @@ mod tests {
             assert_eq!(policy.refine(1, 2, Some(&[0.9, score])), length, "score {score} calibrated {calibrated}");
             assert_eq!(policy.settle(&[1], 64), [length]);
             let trace = policy.observe(&[outcome(1, length, 1)], true).unwrap();
-            assert_eq!(trace.requests[0].skipped, !kept);
+            assert_eq!(trace.requests[0].explore_skipped, (!kept).then_some(calibrated));
             skipped += u64::from(!kept);
         }
         assert!((1..6).contains(&skipped), "{skipped} of 6 skipped");
         assert_eq!(policy.stats().head_skips, skipped);
         // A kept position is never skipped, whatever the head says.
+        let spec = DrafterSpec { block: 4, head: HeadScore::Probability, copy: 0 };
         let mut policy = DraftHistory::new(spec, DraftControl::History);
         assert_eq!(policy.plan(&[(1, 4)], 64), [4]);
         assert_eq!(policy.refine(1, 4, Some(&[0.01; 4])), 4);
@@ -829,6 +878,39 @@ mod tests {
         }
         assert_eq!(policy.plan(&[(1, 4)], 64), [2]);
         assert_eq!(policy.refine(1, 2, Some(&[0.9, 0.01])), 2);
+    }
+
+    #[test]
+    fn a_skipped_explore_is_booked_as_a_miss_at_its_position() {
+        let mut policy = suppressed_head_policy();
+        let skip = |policy: &mut DraftHistory, outcome: DraftOutcome| {
+            assert_eq!(policy.plan(&[(1, 4)], 64), [2]);
+            assert_eq!(policy.refine(1, 2, Some(&[0.9, 0.02])), 1);
+            policy.observe(&[outcome], false);
+        };
+        let server = |policy: &DraftHistory| (policy.server[NEURAL][1].ones, policy.server[NEURAL][1].len);
+        let (calibration, verified) = (policy.platt[1].theta, policy.stats().position_reached[1]);
+        assert_eq!((policy.requests[&1].counts(NEURAL, 1), server(&policy)), ((0, 8), (0, 8)));
+        // The kept position was accepted: the skipped explore counts as proposed 2, accepted 1.
+        skip(&mut policy, outcome(1, 1, 1));
+        assert_eq!((policy.requests[&1].counts(NEURAL, 1), server(&policy)), ((0, 8), (0, 9)));
+        assert_eq!(policy.requests[&1].rounds.back().unwrap().reached[NEURAL], 2);
+        assert_eq!((policy.stats().head_skips, policy.stats().skip_misses), (1, 1));
+        // It is not a verified row and teaches the calibration nothing.
+        assert_eq!((policy.platt[1].theta, policy.stats().position_reached[1]), (calibration, verified));
+        assert_eq!(policy.stats().explored, 7);
+        // The kept position itself missed: position 1 was never reached, skip or not.
+        skip(&mut policy, outcome(1, 1, 0));
+        assert_eq!(server(&policy), (0, 9));
+        assert_eq!(policy.requests[&1].rounds.back().unwrap().reached[NEURAL], 1);
+        // A censored round (stop token on the kept draft) books nothing either.
+        skip(&mut policy, DraftOutcome { id: 1, proposed: 1, accepted: 1, censored: true });
+        assert_eq!((server(&policy), policy.stats().skip_misses), ((0, 9), 1));
+        // Without the booking the request's window would have aged the misses out and
+        // drafted deeper: after eight skipped rounds position 1 is still suppressed.
+        for _ in 0..REQUEST_WINDOW { skip(&mut policy, outcome(1, 1, 1)); }
+        assert_eq!(policy.requests[&1].counts(NEURAL, 1), (0, 8));
+        assert!(policy.probability(1, 1) <= KEEP_CUT);
     }
 
     #[test]
@@ -977,5 +1059,9 @@ mod tests {
         let snapshot = policy.snapshot();
         assert_eq!(snapshot["positions"][0]["reached"], 5);
         assert_eq!(snapshot["explored"], 4);
+        // One of five rounds drafted a single position with room for three.
+        assert_eq!((value["rounds"].as_u64(), value["short_rounds"].as_u64()), (Some(5), Some(0)));
+        assert_eq!(value["short_share"], 0.);
+        assert_eq!(snapshot["short_share"], 0.);
     }
 }

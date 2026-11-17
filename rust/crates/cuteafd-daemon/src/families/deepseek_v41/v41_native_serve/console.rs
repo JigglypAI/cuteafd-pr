@@ -265,10 +265,9 @@ mod tests {
 
     #[test]
     fn policy_facts_and_layer_split() {
-        let value = dynamic(&json!({"mode": "bandwidth", "local_layers": 20, "solo": {"warm": true},
-            "prediction": {"mean_abs_relative_error": 0.14}}), true);
-        assert_eq!(value["facts"][0], json!(["Policy", "bandwidth", "fit: solo warm · shared cold"]));
-        assert_eq!(value["facts"][1][1], "14.0%");
+        let value = dynamic(&json!({"policy": "history", "local_layers": 20, "verified_drafts": 50,
+            "accepted_drafts": 43}), true);
+        assert_eq!(value["facts"][0], json!(["Policy", "history", "86% of verified drafts accepted"]));
         assert_eq!(value["layer_class"][19], 0);
         assert_eq!(value["layer_class"][20], 1);
         assert_eq!(dynamic(&Value::Null, false)["facts"][0][1], "off");

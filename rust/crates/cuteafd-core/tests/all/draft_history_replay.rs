@@ -19,11 +19,16 @@
 //! - this fixture's trace by content (37k rounds): code 99.4% at 6.87 of 7
 //!   drafts, none short; prose 91.2% at 2.19 of 7 drafts (rejected rows per
 //!   round 1.42, against about 6 at fixed width), 26% of rounds short.
-//! - the dSpark explore skip (calibrated head probability below 0.2) on that
-//!   trace: 6,445 skips in 28,478 prose rounds, tokens 91.2% -> 91.0%, drafts
-//!   2.19 -> 2.18. In this replay a skipped explore also withholds the miss
-//!   that keeps the position suppressed, so the position returns sooner; the
-//!   threshold is `SKIP_CUT`, to be retuned from card data.
+//! - the dSpark explore skip (calibrated head probability below `SKIP_CUT`,
+//!   0.3), booked as a miss at the skipped position, replayed on that trace:
+//!   18.5% fewer verify rows for 3.2% fewer tokens; tokens per verified row
+//!   0.706 -> 0.839; of the explores skipped, 9,572 would have failed and
+//!   1,478 passed. Prose rounds at one draft or fewer rise from 26% to 59%:
+//!   the head keeps saying those explores would miss, it is not a lock (the
+//!   explore returns as soon as the head scores it at 0.3 or above). At 0.2:
+//!   8.5% fewer rows (13.8% on prose) for 1.1% fewer tokens. Without the
+//!   booking the skip left the position's history unchanged, later rounds
+//!   drafted deeper and rows rose 0.8%.
 use cuteafd_core::{DraftControl, DraftHistory, DraftOutcome, DrafterSpec, HeadScore};
 
 const BLOCK: usize = 7;
@@ -88,17 +93,25 @@ fn history_drafts_long_on_code_and_short_on_prose() {
     assert!(code.drafts * prose.rounds > 3 * prose.drafts * code.rounds);
 }
 
-/// The dSpark head skip: bounds, not exact counts (the fit is floating point).
-/// On this sample 266 prose explores are skipped and none on code; tokens move
-/// by under 1% and prose drafts do not fall (2,232 -> about 2,340).
+/// The dSpark head skip, booked as a miss: bounds, not exact counts (the fit
+/// is floating point). It fires on prose, not on code, and spends fewer verify
+/// rows on prose for nearly the same tokens. On this sample: 454 skips; prose
+/// drafts 2,232 -> 1,490 (-33%) for tokens 1,946 -> 1,855 (-4.7%), rounds at
+/// one draft or fewer 389 -> 738 of 1,112; code 4,383 -> 4,365 drafts and
+/// 3,131 -> 3,133 tokens.
 #[test]
-fn the_head_skip_fires_on_prose_only_and_changes_little() {
+fn the_head_skip_saves_prose_rows_and_leaves_code_alone() {
     let ([prose, code], _) = replay(HeadScore::None, DraftControl::History);
     let ([skip_prose, skip_code], skips) = replay(HeadScore::Probability, DraftControl::History);
     eprintln!("head skip: {skips} skips; prose {prose:?} -> {skip_prose:?}; code {code:?} -> {skip_code:?}");
-    assert!((100..=500).contains(&skips), "{skips} skips");
+    assert!(skips >= 50, "{skips} skips");
     assert!(skip_code.tokens.abs_diff(code.tokens) * 100 <= code.tokens);
     assert!(skip_code.drafts.abs_diff(code.drafts) * 50 <= code.drafts);
-    assert!(skip_prose.tokens.abs_diff(prose.tokens) * 50 <= prose.tokens);
-    assert!(skip_prose.drafts.abs_diff(prose.drafts) * 10 <= prose.drafts);
+    assert!(skip_prose.drafts < prose.drafts, "prose drafts {} -> {}", prose.drafts, skip_prose.drafts);
+    assert!(skip_prose.tokens * 100 >= prose.tokens * 90, "prose tokens {} -> {}", prose.tokens, skip_prose.tokens);
+    // More prose rounds stop at one draft, and the explore still comes back: not a lock.
+    assert!(skip_prose.short > prose.short && skip_prose.short < skip_prose.rounds);
+    // Tokens per verified row (anchors included) do not fall.
+    let efficiency = |tally: Tally| tally.tokens as f64 / (tally.drafts + tally.rounds) as f64;
+    assert!(efficiency(skip_prose) >= efficiency(prose));
 }
