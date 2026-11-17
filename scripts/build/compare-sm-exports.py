@@ -467,6 +467,9 @@ def jobs(scope):
         # Covers Muse transformer programs using the exporter's shared geometry.
         ("vision-transformer", "export_b12x_vision_aot.py", ["--capability", "120", "--group", "transformer"]),
         ("vision-d128-attention", "export_b12x_vision_aot.py", ["--capability", "120", "--group", "attention", "--head-dim", "128"]),
+        ("vision-tower-kimi", "export_b12x_vision_aot.py", ["--capability", "120", "--group", "tower", "--tower", "kimi",
+            "--omit-program", "vision_projection_h4096_o4096", "--omit-program", "vision_gelu_h4096"]),
+        ("vision-tower-minimax", "export_b12x_vision_aot.py", ["--capability", "120", "--group", "tower", "--tower", "minimax"]),
         ("audio-pcm", "export_b12x_audio_aot.py", ["--capability", "120", "--group", "pcm"]),
     ])
     for name, _, args in result:
