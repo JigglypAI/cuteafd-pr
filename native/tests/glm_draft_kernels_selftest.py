@@ -234,6 +234,41 @@ def topk_width_check(lib, stream):
         print(f"topk-width: width={top_k} exact topk/path/legacy oracle and scratch guards PASS", flush=True)
 
 
+def row_quant_repeat_check(lib, snapshot, baseline_path=None):
+    """Real absorbed UK/UV, unchanged row128 quantization and repeated row64 scales."""
+    from safetensors import safe_open
+    with safe_open(str(Path(snapshot) / "model.safetensors"), framework="pt", device="cpu") as source:
+        kv = source.get_tensor("layers.0.self_attn.kv_b_proj.weight")[:256].cuda()
+    matrices = {"uk": kv[:128].T.contiguous(), "uv": kv[128:].contiguous()}
+    repeat = lib.cuteafd_fp8_row_quant_repeat
+    repeat.argtypes, repeat.restype = [P, P, P] + [C.c_int32] * 4 + [P], C.c_int32
+    legacy = lib.cuteafd_fp8_row_quant_rule
+    legacy.argtypes, legacy.restype = [P, P, P] + [C.c_int32] * 3 + [P], C.c_int32
+    baseline = C.CDLL(baseline_path) if baseline_path else None
+    old = baseline.cuteafd_fp8_row_quant_rule if baseline else legacy
+    old.argtypes, old.restype = legacy.argtypes, legacy.restype
+    stream = torch.cuda.current_stream().cuda_stream
+    for name, weight in matrices.items():
+        rows, cols = weight.shape
+        for rule in range(3):
+            q = torch.empty_like(weight, dtype=torch.uint8)
+            q_once, q_legacy = torch.empty_like(q), torch.empty_like(q)
+            compact = torch.empty(rows, cols // 128, device="cuda")
+            once = torch.empty_like(compact)
+            expanded = torch.empty(rows, cols // 64, device="cuda")
+            assert old(weight.data_ptr(), q_legacy.data_ptr(), compact.data_ptr(), rows, cols, rule, stream) == 0
+            assert repeat(weight.data_ptr(), q_once.data_ptr(), once.data_ptr(), rows, cols, rule, 1, stream) == 0
+            assert repeat(weight.data_ptr(), q.data_ptr(), expanded.data_ptr(), rows, cols, rule, 2, stream) == 0
+            assert torch.equal(q_once, q_legacy) and torch.equal(once.view(torch.int32), compact.view(torch.int32))
+            assert torch.equal(q, q_legacy)
+            assert torch.equal(expanded.view(torch.int32), compact.repeat_interleave(2, -1).view(torch.int32))
+            values = q.view(torch.float8_e4m3fn).float()
+            d128 = (values.unflatten(-1, (-1, 128)) * compact[..., None]).flatten(-2).bfloat16()
+            d64 = (values.unflatten(-1, (-1, 64)) * expanded[..., None]).flatten(-2).bfloat16()
+            assert torch.equal(d128.view(torch.int16), d64.view(torch.int16))
+        print(f"row-quant-repeat: real {name} {rows}x{cols} once/legacy and row128/row64 dequant bytes exact", flush=True)
+
+
 def head_bf16_interval(value, epsilon):
     """Possible selector values at a BF16 midpoint within the FP64 error bound."""
     def rounded(x):
@@ -1044,6 +1079,7 @@ def main():
                         help="one NVTX-labelled head/top-k shot inside cudaProfilerStart/Stop after checks")
     parser.add_argument("--fp8-shapes", help="comma-separated KxN shapes; overrides --quick's shape subset")
     parser.add_argument("--fp8-baseline", help="sealed baseline library for exact FP8 output comparison")
+    parser.add_argument("--row-quant-snapshot", help="MLA drafter snapshot for exact real UK/UV repeated-scale oracle")
     parser.add_argument("--fp8-rows", default="8,16,32,64,128", help="comma-separated profiling row counts")
     parser.add_argument("--profile-fp8", action="store_true",
                         help="one NVTX-labelled projection shot after checks; use with --skip-head")
@@ -1102,7 +1138,9 @@ def main():
         parser.error("--mimo-forward has its own profile range and cannot run separate head/FP8 checks")
     lib = bind(args.library)
     print(torch.cuda.get_device_name(), torch.cuda.get_device_properties(0).multi_processor_count, "SMs")
-    if args.topk_only:
+    if args.row_quant_snapshot:
+        row_quant_repeat_check(lib, args.row_quant_snapshot, args.fp8_baseline)
+    elif args.topk_only:
         topk_check(lib, args)
     elif args.attention_only:
         attention_check(lib, args)

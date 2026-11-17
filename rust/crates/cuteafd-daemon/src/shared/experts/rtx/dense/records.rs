@@ -127,6 +127,13 @@ pub(crate) fn host_operand(operand: HostOperand, policy: super::super::push::Pus
     }
 }
 
+/// The quantization unit stays K128; only final scale storage is repeated.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum ScaleRepeat { #[default] Once, Twice }
+impl ScaleRepeat {
+    pub fn count(self) -> usize { match self { Self::Once => 1, Self::Twice => 2 } }
+}
+
 /// One GPU transform of a step's staged bytes (byte offsets are into the staging).
 #[derive(Clone)]
 pub(crate) enum Job {
@@ -179,7 +186,7 @@ pub(crate) enum Job {
     /// FP32 scales by the row kernel (`cuteafd_fp8_row_quant_rule`, `rule`)
     /// into `q` [rows, cols] and `scale` [rows, cols / 128].
     RowQuant { rows: usize, cols: usize, rule: crate::shared::fp8_linear::Fp8Scales, q: CuteafdDeviceBuffer,
-        scale: CuteafdDeviceBuffer, block: bool },
+        scale: CuteafdDeviceBuffer, block: bool, scale_repeat: ScaleRepeat },
     /// Staged BF16 `norm` (`at..at + bytes`) and `proj` (`with..with + bytes`)
     /// promoted to F32 and multiplied once per element into `dst` (the Kimi
     /// residual score weight).
@@ -590,17 +597,22 @@ impl Step {
                         library.cuda_stream_synchronize(stream)
                     })?;
                 }
-                Job::RowQuant { rows, cols, rule, q, scale, block } => {
+                Job::RowQuant { rows, cols, rule, q, scale, block, scale_repeat } => {
                     // Per-row x 128-K scales [rows, cols/128], or with `block` 128x128
                     // block scales [ceil(rows/128), ceil(cols/128)] (`cuteafd_fp8_block_quant_rule`).
-                    let scale_bytes = if block { rows.div_ceil(128) * cols.div_ceil(128) * 4 } else { rows * cols / 128 * 4 };
-                    ensure!(rows * cols * 2 <= self.bytes() && (block || cols % 128 == 0) && q.bytes >= rows * cols
+                    let repeat = scale_repeat.count();
+                    let scale_bytes = if block { rows.div_ceil(128) * cols.div_ceil(128) * 4 } else { rows * cols / 128 * 4 * repeat };
+                    ensure!((!block || repeat == 1) && rows * cols * 2 <= self.bytes() && (block || cols % 128 == 0) && q.bytes >= rows * cols
                         && scale.bytes >= scale_bytes, "row quantization outside its step or operands");
                     let source = device_copy(scratch)?;
                     // SAFETY: the staged rows are in the live device scratch; both outputs
                     // are live operands; the stream drains before return.
                     load_timing::quantize(rows * cols * 2, || unsafe {
-                        library.fp8_quant_rule(source.cast(), q.ptr, scale.ptr, rows, cols, !block, rule.code(), stream)?;
+                        if repeat == 1 {
+                            library.fp8_quant_rule(source.cast(), q.ptr, scale.ptr, rows, cols, !block, rule.code(), stream)?;
+                        } else {
+                            library.fp8_row_quant_repeat(source.cast(), q.ptr, scale.ptr, rows, cols, rule.code(), repeat, stream)?;
+                        }
                         library.cuda_stream_synchronize(stream)
                     })?;
                 }
