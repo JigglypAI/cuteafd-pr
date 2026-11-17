@@ -848,13 +848,27 @@ pub fn solve(
     budgets: Vec<Budget>,
     recipe: &impl Recipe,
 ) -> Result<ResolvedPlan, Refusal> {
-    let cards = budgets.iter().filter(|budget| budget.locations.iter()
-        .any(|location| matches!(location.device, Device::Coordinator(_))))
-        .map(|budget| budget.logical_bytes).collect::<Vec<_>>();
     let requested = match request.pool { Pin::Auto => None, Pin::Exact(tokens) => Some(tokens) };
-    let pool = crate::placement::prepare_pool(crate::placement::PoolFacts::new(
-        &cards, request.context, requested, 1)).map_err(|error| Refusal::InvalidFact(error.to_string()))?;
-    solve_prepared(request, budgets, recipe, &pool)
+    // Generic solver fixtures declare their exact finite curve domain. Shipping
+    // family paths prepare their memory-bounded policy before building curves.
+    let contract = recipe.prepare(&request)?;
+    if contract.page_rows == 0 {
+        return Err(Refusal::InvalidFact("zero contract page rows".into()));
+    }
+    if let Some(tokens) = requested {
+        if tokens % contract.page_rows != 0 {
+            return Err(Refusal::MisalignedPool { tokens, page_rows: contract.page_rows });
+        }
+    }
+    let mut facts = crate::placement::PoolFacts::new(request.context, requested, contract.page_rows);
+    facts.encoding_limit = contract.maximum_pages.checked_mul(contract.page_rows);
+    let pool = crate::placement::prepare_pool(facts)
+        .map_err(|error| Refusal::InvalidFact(error.to_string()))?;
+    struct Prepared(Contract);
+    impl Recipe for Prepared {
+        fn prepare(&self, _: &Request) -> Result<Contract, Refusal> { Ok(self.0.clone()) }
+    }
+    solve_prepared(request, budgets, &Prepared(contract), &pool)
 }
 
 /// Admit a recipe using the same immutable policy that prepared its domain.
@@ -928,7 +942,7 @@ pub fn solve_prepared(
     }
     // KV target, min and max (`cuteafd_core::memory_policy`). The layout is
     // searched at the target; an automatic pool then grows to the max.
-    // The logical cap picks the card class, including 5090 simulations on PRO.
+    // The target is uniform, including 5090 simulations on PRO.
     // The prepared policy is the only source of target/min/max semantics.
     let aligned = |tokens: u64| tokens.div_ceil(page).div_ceil(multiple).checked_mul(multiple)
         .ok_or(Refusal::Overflow("target pool pages"));
@@ -936,13 +950,24 @@ pub fn solve_prepared(
     let minimum = aligned(floor)?;
     let compiled = contract.maximum_pages.min(pool.ceiling() / page) / multiple * multiple;
     let target = aligned(pool.target().max(request.context.required()))?;
-    let ceiling = aligned(pool.max().max(pool.target()).max(request.context.required()))?.min(compiled);
+    let ceiling = aligned(pool.max().unwrap_or(compiled.saturating_mul(page)).max(pool.target()).max(request.context.required()))?.min(compiled);
     let wanted = match request.pool {
         Pin::Auto => target.min(compiled),
         Pin::Exact(n) => n / page,
     };
-    if wanted < minimum || wanted > compiled {
-        return Err(Refusal::InvalidPin("pool exceeds compiled extent"));
+    if wanted < minimum && matches!(request.pool, Pin::Auto) {
+        return Err(Refusal::FullContextShortfall { context: floor,
+            tokens: compiled.checked_mul(page).ok_or(Refusal::Overflow("pool domain tokens"))?,
+            limiting: Box::new(Refusal::InvalidFact("memory-derived pool domain is below the required floor".into())) });
+    }
+    if wanted > compiled {
+        return Err(Refusal::PoolExceedsMemoryBound {
+            requested: pool.requested().expect("only exact pools can exceed the domain"),
+            bound: compiled.checked_mul(page).ok_or(Refusal::Overflow("pool domain tokens"))?,
+        });
+    }
+    if wanted < minimum {
+        return Err(Refusal::PoolBelowContext { tokens: wanted * page, context: floor });
     }
     let exact = match request.onboard {
         Pin::Auto => None,

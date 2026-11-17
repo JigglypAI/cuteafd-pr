@@ -6,7 +6,7 @@
 use anyhow::Result;
 use serde_json::Value;
 
-use crate::plan::checkpoint::{opt_usize_field, usize_field, Checkpoint};
+use crate::plan::checkpoint::Checkpoint;
 use crate::plan::family::{ConfigError, Described, Family, FamilyModel, Hint, RuntimeStatus};
 use crate::plan::spec::*;
 
@@ -22,7 +22,7 @@ impl Family for Dspark {
     }
     fn detect(&self, checkpoint: &Checkpoint) -> bool {
         checkpoint.config.get("speculators_model_type").and_then(Value::as_str) == Some("dspark")
-            || checkpoint.architectures().iter().any(|arch| arch == "DSparkDraftModel")
+            || checkpoint.architectures().iter().any(|arch| arch == "DSparkDraftModel" || arch == "Qwen3DSparkModel")
     }
 
     fn open(&self, checkpoint: &Checkpoint) -> Result<Box<dyn FamilyModel>, ConfigError> {
@@ -49,41 +49,19 @@ impl Family for Dspark {
 
 impl Dspark {
     fn spec(&self, checkpoint: &Checkpoint) -> Result<ModelSpec> {
-        let c = &checkpoint.config;
-        let t = c.get("transformer_layer_config").cloned().unwrap_or(Value::Null);
-        let layer = LayerSpec {
-            rope: None,
-            attention: AttentionKind::SlidingGqa {
-                heads: usize_field(&t, "num_attention_heads")?,
-                kv_heads: opt_usize_field(&t, "num_key_value_heads").unwrap_or(0),
-                head_dim: opt_usize_field(&t, "head_dim").unwrap_or(0),
-                window: opt_usize_field(&t, "sliding_window").unwrap_or(0),
-                sinks: false,
-            },
-            ffn: FfnKind::Dense { intermediate: opt_usize_field(&t, "intermediate_size").unwrap_or(0) },
-        };
-        let aux: Vec<u64> = c.get("aux_hidden_state_layer_ids").and_then(Value::as_array)
-            .map(|v| v.iter().filter_map(Value::as_u64).collect()).unwrap_or_default();
-        let verifier = c.pointer("/speculators_config/verifier/architectures/0").and_then(Value::as_str).unwrap_or("?");
-        let notes = vec![
-            format!("block drafter for {verifier}: block {} (every row drafts: sample_from_anchor {}), aux taps \
-                     {aux:?} (target layer outputs {:?}), mask token {}",
-                opt_usize_field(c, "block_size").unwrap_or(0),
-                c.get("sample_from_anchor").and_then(Value::as_bool).unwrap_or(false),
-                aux.iter().map(|l| l.saturating_sub(1)).collect::<Vec<_>>(),
-                opt_usize_field(c, "mask_token_id").unwrap_or(0)),
-            format!("{} Markov head rank {}, confidence head {} (with Markov features {})",
-                c.get("markov_head_type").and_then(Value::as_str).unwrap_or("?"),
-                opt_usize_field(c, "markov_rank").unwrap_or(0),
-                c.get("enable_confidence_head").and_then(Value::as_bool).unwrap_or(false),
-                c.get("confidence_head_with_markov").and_then(Value::as_bool).unwrap_or(false)),
-        ];
+        let c = crate::formats::block_dspark::BlockDsparkConfig::from_json(&checkpoint.config)?;
+        let layer = LayerSpec { rope: None,
+            attention: match c.window {
+                Some(window)=>AttentionKind::SlidingGqa { heads:c.heads,kv_heads:c.kv_heads,head_dim:c.head_dim,window,sinks:false },
+                None=>AttentionKind::Gqa { heads:c.heads,kv_heads:c.kv_heads,head_dim:c.head_dim },
+            }, ffn:FfnKind::Dense { intermediate:c.intermediate } };
+        let notes=vec![format!("block {} Markov rank {} target taps {:?}; native window {:?}",c.block,c.rank,c.taps,c.window)];
         Ok(ModelSpec {
             family: "dspark",
-            architecture: "DSparkDraftModel".into(),
-            hidden: usize_field(&t, "hidden_size")?,
-            vocab: usize_field(&t, "vocab_size")?,
-            layers: vec![layer; usize_field(&t, "num_hidden_layers")?],
+            architecture: checkpoint.architectures().first().cloned().unwrap_or_else(||"DSparkDraftModel".into()),
+            hidden: c.hidden,
+            vocab: c.vocab,
+            layers: vec![layer; c.layers],
             moe: None,
             speculator: None,
             tables: Vec::new(),

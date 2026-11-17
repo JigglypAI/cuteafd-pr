@@ -585,7 +585,10 @@ pub(super) fn resolve_with_owners(
             "explicit KV byte pool is outside physical/admission limits");
         Some((groups - tails) * 512)
     } else { args.pool_tokens };
-    let mut facts = cuteafd_loader::placement::PoolFacts::new(&totals, serving_context, requested, 512);
+    let mut facts = cuteafd_loader::placement::PoolFacts::new(serving_context, requested, 512);
+    let geometry = cuteafd_loader::serving_capacity::deepseek_v41_cache_geometry(&config, ranks)?;
+    facts.memory = geometry.ranks.iter().zip(&totals).map(|(rank, &available_bytes)|
+        cuteafd_loader::placement::PoolMemory { available_bytes, bytes_per_unit: rank.persistent_unit_bytes }).collect();
     facts.encoding_limit = Some(131_072u64.saturating_sub(tails) * 512);
     let pool = cuteafd_loader::placement::prepare_pool(facts)?;
     // An explicit pool below the pinned context is the first typed refusal;
@@ -1381,46 +1384,48 @@ mod admission_tests {
 
     #[test]
     fn logical_pool_excludes_snapshot_tails_and_charges_each_cache_owner() -> Result<()> {
-        let dir = tempfile::tempdir()?;
-        std::fs::write(
-            dir.path().join("config.json"),
-            include_str!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../cuteafd-loader/src/families/deepseek_v41/official-v41-config.json"
-            )),
-        )?;
-        for (ranks, replicas) in [(1, false), (2, false), (2, true)] {
-            let mut args = args(dir.path());
-            args.rtx_gpus = ranks as u32;
-            args.tp2_attention = replicas;
-            args.rtx_expert_layers = LocalLayers::Count(0);
-            let memory = vec![(80usize << 30, 96usize << 30); ranks];
-            let admitted = resolve(&args, &memory, no_experts(), 0, &vec![0; ranks], 0, None)?;
-            assert_eq!(admitted.placement.pool_tokens, 2 << 20);
-            assert_eq!(admitted.pages, [4152, 4152, 4152, 8304]);
-            args.kv_pool_size = Some(crate::shared::memory::budget::ByteSize(
-                (4152 * 5 * 256 * 356) + 1,
-            ));
-            let exact = resolve(&args, &memory, no_experts(), 0, &vec![0; ranks], 0, None)?;
-            assert_eq!(exact.pages, admitted.pages);
-            assert_eq!(exact.cache_bytes, admitted.cache_bytes);
-            args.kv_pool_size = None;
-            args.pool_tokens = Some(67_108_864);
-            assert!(resolve(&args, &memory, no_experts(), 0, &vec![0; ranks], 0, None).is_err());
-            args.pool_tokens = Some(2 << 20);
-            assert!(
-                resolve(
-                    &args,
-                    &vec![(1usize << 30, 96usize << 30); ranks],
-                    vec![],
-                    0,
-                    &vec![0; ranks],
-                    0, None
-                )
-                .is_err()
-            );
-        }
-        Ok(())
+        cuteafd_core::memory_policy::MemoryPolicy { kv_max: Some(2 << 20), ..Default::default() }.scoped(|| {
+            let dir = tempfile::tempdir()?;
+            std::fs::write(
+                dir.path().join("config.json"),
+                include_str!(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/../cuteafd-loader/src/families/deepseek_v41/official-v41-config.json"
+                )),
+            )?;
+            for (ranks, replicas) in [(1, false), (2, false), (2, true)] {
+                let mut args = args(dir.path());
+                args.rtx_gpus = ranks as u32;
+                args.tp2_attention = replicas;
+                args.rtx_expert_layers = LocalLayers::Count(0);
+                let memory = vec![(80usize << 30, 96usize << 30); ranks];
+                let admitted = resolve(&args, &memory, no_experts(), 0, &vec![0; ranks], 0, None)?;
+                assert_eq!(admitted.placement.pool_tokens, 2 << 20);
+                assert_eq!(admitted.pages, [4152, 4152, 4152, 8304]);
+                args.kv_pool_size = Some(crate::shared::memory::budget::ByteSize(
+                    (4152 * 5 * 256 * 356) + 1,
+                ));
+                let exact = resolve(&args, &memory, no_experts(), 0, &vec![0; ranks], 0, None)?;
+                assert_eq!(exact.pages, admitted.pages);
+                assert_eq!(exact.cache_bytes, admitted.cache_bytes);
+                args.kv_pool_size = None;
+                args.pool_tokens = Some(67_108_864);
+                assert!(resolve(&args, &memory, no_experts(), 0, &vec![0; ranks], 0, None).is_err());
+                args.pool_tokens = Some(2 << 20);
+                assert!(
+                    resolve(
+                        &args,
+                        &vec![(1usize << 30, 96usize << 30); ranks],
+                        vec![],
+                        0,
+                        &vec![0; ranks],
+                        0, None
+                    )
+                    .is_err()
+                );
+            }
+            Ok(())
+                })
     }
 
     #[test]
@@ -1604,7 +1609,7 @@ mod admission_tests {
     }
 
     #[test]
-    fn graph_reserves_and_small_card_logical_target_remain_distinct() -> Result<()> {
+    fn graph_reserves_and_uniform_layout_target_remain_distinct() -> Result<()> {
         // Each physical rank owns its measured inventory and the shared
         // extra; card size and logical KV target do not change that owner.
         for ranks in [1, 2] {
@@ -1627,8 +1632,9 @@ mod admission_tests {
         args.rtx_expert_layers = LocalLayers::Count(0);
         args.max_context_tokens = 262_144;
         let admitted = resolve(&args, &[(30usize << 30, 32usize << 30)], no_experts(), 0, &[0], 0, None)?;
-        assert_eq!(admitted.placement.pool_tokens, 1 << 20);
-        assert_eq!(admitted.pages[0], 2048 + 56);
+        assert_eq!(admitted.solved.pool_policy.unwrap().target(), 2 << 20);
+        assert!(admitted.placement.pool_tokens > 2 << 20);
+        assert_eq!(admitted.pages[0] as u64, admitted.placement.pool_tokens / 512 + 56);
         assert_eq!(admitted.reservation_bytes, vec![32usize << 30]);
         // A GPU_RESERVE that leaves no room for the pool refuses admission.
         let reserved = cuteafd_core::memory_policy::MemoryPolicy { gpu_reserve: Some(31 << 30), ..Default::default() }

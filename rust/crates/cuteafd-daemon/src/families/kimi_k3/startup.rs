@@ -140,8 +140,6 @@ pub(crate) fn load<'a, const RANKS: usize>(library: &'a Arc<cuteafd_ffi::NativeL
     ensure!(spark_ranks <= cuteafd_core::MAX_SPARK_WORLD, "Kimi Spark peer inventory exceeds eight");
     let core = cuteafd_loader::plan::families::kimi::core_inventory(checkpoint)?;
     core.validate_runtime_groups(full)?;
-    ensure!(options.role != Role::Serve || core.serving_qualified(full),
-        "Kimi K3.1 serving is qualified for BF16 original and native K6 cores only; K8/FP8 remain Planned (#1777)");
     let graph_core = cuteafd_loader::serving_capacity::kimi_prewarm::KimiCoreFormat::from_inventory(&core);
     if RANKS == 2 {
         ensure!(crate::shared::peer_split::probed_device(library, options.devices[0], Some(options.devices[1]))?

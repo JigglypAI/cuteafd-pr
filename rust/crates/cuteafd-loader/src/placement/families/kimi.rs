@@ -1238,7 +1238,7 @@ mod tests {
 
     pub(super) fn recipe() -> KimiRecipe {
         let mut recipe = KimiRecipe {
-            pool: crate::placement::prepare_pool(crate::placement::PoolFacts::new(&[96 << 30], 256, None, 64)).unwrap(),
+            pool: crate::placement::prepare_pool(crate::plan::testing::pool_facts(&[96 << 30], 256, None, 64, &[128])).unwrap(),
             vision: None,
             expert_usage: None,
             shaped: Vec::new(),
@@ -1657,9 +1657,9 @@ mod tests {
         }
         let request = |pool| Request { context: (128).into(), ..request_with(Some(pool)) };
         recipe.context = 128;
-        recipe.pool = crate::placement::prepare_pool(crate::placement::PoolFacts::new(&[1 << 30; 2], 128, Some(192), 64)).unwrap();
+        recipe.pool = crate::placement::prepare_pool(crate::placement::PoolFacts::new(128, Some(192), 64)).unwrap();
         assert!(recipe.admit(request(192), budget.clone()).is_err());
-        recipe.pool = crate::placement::prepare_pool(crate::placement::PoolFacts::new(&[1 << 30; 2], 128, Some(128), 64)).unwrap();
+        recipe.pool = crate::placement::prepare_pool(crate::placement::PoolFacts::new(128, Some(128), 64)).unwrap();
         assert_eq!(recipe.admit(request(128), budget).unwrap().solved.pool_tokens, 128);
     }
 
@@ -1762,8 +1762,7 @@ mod tests {
             FixedOwner { rank: rank as u8, category: Category::Runtime, group: "replayed max owners".into(),
                 bytes: bytes - 12 * per_layer, weights: 0, lifetime: Lifetime::RESIDENT, basis: Basis::Exact }).collect();
         toy_weight_owners(&mut recipe);
-        recipe.pool = crate::placement::prepare_pool(crate::placement::PoolFacts::new(
-            &[102 << 30; 2], recipe.context, Some(recipe.context), PAGE_ROWS)).unwrap();
+        recipe.pool = crate::placement::prepare_pool(crate::placement::PoolFacts::new(recipe.context, Some(recipe.context), PAGE_ROWS)).unwrap();
         let request = request(recipe.context, Some(recipe.context), crate::placement::Onboard::Auto,
             recipe.prefill, Operation::Serving, ResidentWeights(u64::MAX), SparkReplyFormats::default());
         let started = std::time::Instant::now();

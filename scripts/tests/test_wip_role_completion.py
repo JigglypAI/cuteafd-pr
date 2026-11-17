@@ -58,7 +58,7 @@ def test_wip_audio_opt_in_is_validated_before_operations_and_forwarded(value):
                'docker() { printf "docker %s\\n" "$*"; }\n'
                'ssh() { printf "ssh %s\\n" "$*"; }\n'
                'timeout() { shift 2; "$@"; }\n' + helpers + 'native_store_has() { return 1; }\n' + coordinator + '\n' + expert + '\n'
-               'build_coordinator\nbuild_expert\n')
+               'build_coordinator all /frozen/source\nbuild_expert\n')
     result = subprocess.run(['bash', '-c', command], env=env, capture_output=True, text=True, timeout=10)
     if value not in (None, 'ON', 'OFF'):
         assert result.returncode == 2
@@ -507,6 +507,7 @@ def test_distribution_precedes_export_even_on_failure_or_coordinator_retry(tmp_p
     flow = text.split('wip_build_selected_roles() {', 1)[1].split('\n}\n', 1)[0]
     trace = tmp_path / 'trace'
     script = f"""set -euo pipefail
+staging_dir=/frozen/source
 role={role}; wip_reused_coordinator=0; wip_reused_expert=0
 build_coordinator() {{ echo coordinator-$1 >> '{trace}'; [[ $1 != native ]] || return {export_status}; }}
 wip_build_resource_acquire() {{ echo lease >> '{trace}'; }}

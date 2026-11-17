@@ -288,7 +288,7 @@ impl PrefixFamily<SnapshotMeta> for KimiPrefix<'_> {
         let Some(draft) = &self.0.draft else { return Ok(None) };
         // Window-only MLA state lives entirely in the positional mark, not in
         // pooled pages whose committed frontier intentionally does not advance.
-        if draft.common().is_block() || draft.common().mla_windows_only()
+        if draft.common().is_windowed_block() || draft.common().mla_windows_only()
             || draft.frontier(placement.slot)? != (0, len) { return Ok(None); }
         let _scope = draft.device().enter()?;
         draft.common().capture_mla_pages(placement.slot, len, len).map(Some)
@@ -308,7 +308,7 @@ impl PrefixFamily<SnapshotMeta> for KimiPrefix<'_> {
     fn restore_draft_pages(&self, attachment: Option<&cuteafd_engine::prefix::DraftPageAttachment>,
         placement: &mut Placement, frontier: usize) -> Result<(), BoxError> {
         let Some(draft) = &self.0.draft else { return Ok(()) };
-        if draft.common().is_block() {
+        if draft.common().is_windowed_block() {
             if attachment.is_some() { return Err("window draft cannot restore page attachment".into()); }
             if draft.frontier(placement.slot)?.1 != frontier { draft.reset(placement.slot,frontier)?; }
             return Ok(());

@@ -704,10 +704,22 @@ fn official_nested_inventory_separates_target_tail_mtp_vision() {
     let result = report(dir.path(),1,96,6,Some(262_144));
     assert!(result.config_error.is_none(),"{:?}",result.config_error);
     assert!(result.unclassified.is_empty(),"{:?}",result.unclassified);
-    assert!(!result.executable() && !result.wip_launchable() && !result.native_serving_admitted);
-    assert!(result.components.iter().any(|c| c.status != Status::Ready));
-    assert!(result.hints.iter().any(|hint|hint.what.contains("unqualified")));
+    assert!(result.executable() && result.wip_launchable() && result.native_serving_admitted, "{:?}", result.hints);
     assert_eq!(result.min_spark_ranks,Some(6));
+}
+
+#[test]
+fn native_formats_use_executor_counts_and_memory_not_card_or_fidelity_allowlists() {
+    for (kind, gpus, ranks) in [("fp8", 1, 6), ("nvfp4", 2, 4), ("nvfp4", 1, 6)] {
+        let dir = snapshot(kind);
+        let admitted = report(dir.path(), gpus, 96, ranks, None);
+        assert!(admitted.native_serving_admitted && admitted.executable(), "{kind}: {:?}", admitted.hints);
+        let capped = report(dir.path(), gpus, 32, ranks, None);
+        assert!(!capped.hints.iter().any(|hint| hint.what.contains("5090")
+            || hint.what.contains("unqualified") || hint.what.contains("coordinator/Spark count")), "{:?}", capped.hints);
+        assert!(capped.native_serving_admitted || capped.hints.iter().any(|hint|
+            hint.what.contains("memory budget") || hint.what.contains("rtx")), "{:?}", capped.hints);
+    }
 }
 
 #[test]
@@ -742,14 +754,14 @@ fn card_memory_conclusions_and_request_vs_pool_extent() {
         assert_eq!(device.used_bytes(), 123_761_553_312);
         assert!(device.used_bytes() <= device.capacity_bytes);
     }
-    for (gpus, gib, ranks) in [(1,96,6), (1,32,6), (2,96,0)] {
+    for (gpus, gib, ranks) in [(1,32,6), (2,96,0)] {
         let r = report(dir.path(), gpus, gib, ranks, None);
         assert!(!r.wip_launchable() && !r.native_serving_admitted, "{gpus} RTX x{gib}GiB +{ranks}: {:?}", r.hints);
         if ranks == 0 {
             assert!(r.hints.iter().any(|h| h.what.contains("no local expert package for step5")), "{:?}", r.hints);
             assert!(r.hints.iter().any(|h| h.what.contains("memory budget 'rtx0'")), "{:?}", r.hints);
         } else {
-            assert!(r.hints.iter().any(|h| h.what.contains("unqualified") || h.what.contains("Spark") || h.what.contains("routed experts")), "{:?}", r.hints);
+            assert!(r.hints.iter().any(|h| h.what.contains("memory budget") || h.what.contains("Spark") || h.what.contains("rtx") || h.what.contains("routed experts")), "{:?}", r.hints);
         }
     }
     let r = report(dir.path(), 2, 96, 6, Some(32_768));
@@ -792,12 +804,11 @@ fn nvfp4_min_card_admits_native_w4a4_and_bf16_root_stays_reference_only() {
         if let Some(tokens) = pool {
             assert_eq!(memory.pool_tokens, tokens);
         } else {
-            let target = crate::placement::prepare_pool(crate::placement::PoolFacts::new(&[96 << 30], context, None, 64)).unwrap().target();
-            assert!((context..=target).contains(&memory.pool_tokens));
-            // More free capacity must grow the same default-format pool to its cap.
+            assert!(memory.pool_tokens >= context);
+            // More free capacity grows the same default-format pool without a policy cap.
             let roomy = report_context(dir.path(), 1, 160, 4, None, context);
             assert!(roomy.wip_launchable(), "{:?}", roomy.hints);
-            assert_eq!(roomy.memory_layout.unwrap().pool_tokens, target);
+            assert!(roomy.memory_layout.unwrap().pool_tokens > memory.pool_tokens);
         }
         assert!(memory.devices.iter().all(|d| d.used_bytes() <= d.capacity_bytes));
         // The endpoint's frames hold one unit; the intake holds the three
@@ -821,7 +832,7 @@ fn nvfp4_min_card_admits_native_w4a4_and_bf16_root_stays_reference_only() {
             assert_eq!(mapped.bytes, lane_rings as u64, "one main transport endpoint");
         }
     }
-    for (gpus, gib, ranks) in [(2, 96, 4), (1, 32, 4), (1, 96, 6), (1, 96, 0)] {
+    for (gpus, gib, ranks) in [(1, 32, 4), (1, 96, 0)] {
         let result = report(dir.path(), gpus, gib, ranks, None);
         assert!(!result.wip_launchable() && !result.native_serving_admitted);
         if ranks == 0 {
@@ -829,13 +840,13 @@ fn nvfp4_min_card_admits_native_w4a4_and_bf16_root_stays_reference_only() {
                 "no local expert package for step5: missing RTX expert export step5:bf16")),
                 "{:?}", result.hints);
         } else {
-            assert!(result.hints.iter().any(|h| h.what.contains("unqualified") || h.what.contains("Spark")), "{:?}", result.hints);
+            assert!(result.hints.iter().any(|h| h.what.contains("memory budget") || h.what.contains("Spark") || h.what.contains("rtx")), "{:?}", result.hints);
         }
     }
     let dir = snapshot("bf16");
     let r = report(dir.path(),2,96,6,None);
     assert!(r.config_error.is_none(),"{:?}",r.config_error);
-    assert!(r.hints.iter().any(|h| h.what.contains("BF16 target format")));
+    assert!(r.hints.iter().any(|h| h.what.contains("BF16 routed experts: no native BF16 expert execution kernel")));
 }
 
 #[test]
@@ -999,7 +1010,7 @@ fn planner_rejects_all_whole_swa_before_serving_admission() {
         }).unwrap();
         assert!(!result.wip_launchable() && !result.native_serving_admitted);
         assert!(result.hints.iter().any(|hint| hint.what.contains(
-            "two-GPU execution requires head-split SWA with whole-owned CSA")),
+            "attention placement other than heads: SWA uses split heads and CSA uses whole owners")),
             "{:?}", result.hints);
     }
 }
@@ -1180,7 +1191,7 @@ fn native_rope_plan_honors_checkpoint_layer_policy_and_factor_one() -> Result<()
 }
 
 #[test]
-fn spark_admission_is_scoped_to_qualified_native_layers() {
+fn spark_admission_is_scoped_to_validated_native_layers() {
     use crate::plan::experts::{checkpoint_spark_recipe, spark_recipe};
     for kind in ["fp8", "nvfp4", "bf16"] {
         let dir = snapshot(kind);
@@ -1195,7 +1206,7 @@ fn spark_admission_is_scoped_to_qualified_native_layers() {
             }
             if kind == "nvfp4" {
                 let error = checkpoint_spark_recipe(&cp, 5, &[3]).unwrap_err();
-                assert!(format!("{error:#}").contains("NVFP4 is deprecated"));
+                assert!(format!("{error:#}").contains("missing Spark package recipe"));
             } else {
                 assert!(checkpoint_spark_recipe(&cp, 5, &[3]).is_ok());
             }
@@ -1220,8 +1231,11 @@ fn spark_admission_is_scoped_to_qualified_native_layers() {
         }
         let r = report(dir.path(), 2, 96, 6, None);
         assert_eq!(r.executable(), r.wip_launchable());
-        assert_eq!(r.wip_launchable(), kind == "fp8", "{:?}", r.hints);
-        assert_eq!(r.native_serving_admitted, kind == "fp8");
+        assert_eq!(r.wip_launchable(), kind != "bf16", "{:?}", r.hints);
+        assert_eq!(r.native_serving_admitted, kind != "bf16");
+        if kind == "bf16" {
+            assert!(r.hints.iter().any(|hint| hint.what.contains("BF16 routed experts: no native BF16 expert execution kernel")), "{:?}", r.hints);
+        }
     }
 }
 
@@ -1364,7 +1378,7 @@ fn assert_native_prefill_refusal(kind: &str, gpus: usize, ranks: usize) {
 }
 
 #[test]
-fn native_prefill_refuses_every_unqualified_spark_count() {
+fn native_prefill_refuses_missing_spark_packages() {
     for (kind, gpus) in [("nvfp4", 1), ("fp8", 2)] {
         for ranks in [0, 1, 3, 8] {
             assert_native_prefill_refusal(kind, gpus, ranks);
@@ -1643,10 +1657,10 @@ fn exl3_zero_spark_refuses_partial_ownership_in_the_joint_planner() {
     assert!(report.hints.iter().any(|hint| hint.what.contains("native placement refused")), "{:?}", report.hints);
 }
 
-/// NVFP4 Step is deprecated: auto onboards nothing (with the named reason),
+/// Single-GPU native expert execution is unimplemented: auto onboards nothing,
 /// an explicit layer count is refused.
 #[test]
-fn nvfp4_onboarding_is_refused_with_its_deprecation() {
+fn nvfp4_whole_onboarding_is_refused_with_its_missing_executor() {
     let dir = snapshot("nvfp4");
     let manifest = native_manifest(dir.path());
     let plan_with = |onboard: Option<crate::placement::OnboardSetting>| plan::plan(dir.path(), &PlanOptions {
@@ -1657,9 +1671,27 @@ fn nvfp4_onboarding_is_refused_with_its_deprecation() {
     let auto = plan_with(None);
     assert_eq!(auto.onboard_layers, Some(0), "{:#?}", auto.hints);
     assert!(auto.memory_layout.as_ref().unwrap().notes.iter()
-        .any(|n| n == super::admission::NVFP4_ONBOARDING_DEPRECATED));
+        .any(|n| n == super::admission::NATIVE_ONBOARDING_TWO_RTX));
     let explicit = plan_with(Some(crate::placement::OnboardSetting::Layers(2)));
-    assert!(explicit.hints.iter().any(|h| h.what.contains("Step-5 NVFP4 is deprecated")), "{:#?}", explicit.hints);
+    assert!(explicit.hints.iter().any(|h| h.what.contains("whole-layer RTX expert executor is not implemented")), "{:#?}", explicit.hints);
+}
+
+#[test]
+fn nvfp4_two_rtx_onboards_exported_native_tp2_without_a_retirement_gate() {
+    use crate::placement::{ExpertHome, OnboardSetting};
+    let dir = snapshot("nvfp4");
+    let manifest = native_manifest(dir.path());
+    let report = plan::plan(dir.path(), &PlanOptions {
+        placement: ExpertPlacement::from_spark_ranks(6), draft_ownership: Some(spec::DraftOwnership::None),
+        layout: Some(layout::LayoutOptions { host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram),
+            rtx_bytes: vec![crate::placement::inventory::PRO_TOTAL_BYTES; 2], workspace_manifest: Some(manifest),
+            onboard: Some(OnboardSetting::Layers(2)), ..Default::default() }), ..Default::default()
+    }).unwrap();
+    assert!(report.executable(), "{:?}", report.hints);
+    assert_eq!(report.onboard_layers, Some(2));
+    assert_eq!(report.solver_placement.as_ref().unwrap().layers.iter()
+        .filter(|layer| layer.experts == ExpertHome::RtxTp2).count(), 2);
+    assert!(!report.hints.iter().any(|hint| hint.what.contains("deprecated")));
 }
 
 #[test]
@@ -1854,7 +1886,7 @@ fn tp2_onboarded_layers_skip_replication_and_validate_their_exchange() {
 #[test]
 fn fp8_two_rtx_onboards_tp2_halves_with_the_bf16_exchange() {
     use crate::placement::ExpertHome;
-    use super::admission::{tp2_exchange_bytes, Tp2Exchange, FP8_ONBOARDING_TWO_RTX};
+    use super::admission::{tp2_exchange_bytes, Tp2Exchange, NATIVE_ONBOARDING_TWO_RTX};
     let dir = snapshot("fp8");
     let report = report(dir.path(), 2, 96, 6, None);
     assert!(report.wip_launchable(), "{:#?}", report.hints);
@@ -1867,7 +1899,7 @@ fn fp8_two_rtx_onboards_tp2_halves_with_the_bf16_exchange() {
     eprintln!("Step-5 FP8 2 RTX + 6 Sparks: onboard {onboarded} layers TP2, pool {}", solved.pool_tokens);
     let one = Checkpoint::open(dir.path()).unwrap();
     let catalog = crate::read_expert_catalog(&one.snapshot).unwrap();
-    assert_eq!(super::admission::onboarding_unavailable(&catalog, 1), Some(FP8_ONBOARDING_TWO_RTX));
+    assert_eq!(super::admission::onboarding_unavailable(&catalog, 1), Some(NATIVE_ONBOARDING_TWO_RTX));
     assert_eq!(super::admission::onboarding_unavailable(&catalog, 2), None);
 }
 
@@ -1893,7 +1925,7 @@ fn fp8_tp5_uses_width_recipe_but_still_requires_memory() {
     assert!(!small.fits, "{:?}", small.hints);
     assert!(small.hints.iter().any(|hint| hint.what.contains("budget") || hint.what.contains("memory")), "{:?}", small.hints);
     assert!(matches!(crate::plan::experts::spark_recipe("step5:nvfp4",1536,5),
-        Err(crate::plan::experts::SparkRecipeRefusal::Deprecated { .. })));
+        Err(crate::plan::experts::SparkRecipeRefusal::MissingPackage { .. })));
 }
 
 fn native_outputs_snapshot() -> tempfile::TempDir {

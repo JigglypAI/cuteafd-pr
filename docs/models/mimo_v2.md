@@ -1,5 +1,11 @@
 # MiMo V2 (V2.6 Flash / Pro)
 
+Automatic KV sizing uses the shared 2M-token target on every card, including
+32 GB / RTX 5090. Placement and expert onboarding are fixed at that target;
+the pool then grows into remaining admitted memory, within native encoding
+limits. `KV_MAX_TOKENS` is unset by default and can explicitly cap growth.
+See [memory policy](../options.md#memory-and-pools).
+
 Hybrid full / sliding-window GQA attention with learned sinks, sigmoid top-8
 experts without a shared expert.
 
@@ -37,7 +43,9 @@ placeholder Spark hosts and addresses): V2.6 Flash MOPD [min](../../examples/con
   fusion) or a DFlash external drafter — DFlash is the measured-best
   speculator for V2.6 Flash MOPD and Pro. Both default to the checkpoint's
   own `dflash/` (Flash with FP8 drafter weights); `SPECULATOR=off` disables it,
-  `SPECULATOR_FP8=auto` preserves source BF16, and `off` explicitly selects BF16.
+  unset, `SPECULATOR_FP8=auto` and `on` select FP8 projection weights;
+  `off` explicitly selects BF16. This applies to MC views and renamed copies
+  as well as official checkpoints; plan and serve share one precision resolution.
 - Flash MOPD's constants have separate `mimof`/`mimof2` programs: norm
   epsilon 1e-6, full/SWA RoPE theta 1e7/1e4, target value scale 0.707,
   QK/V widths 192/128 and partial NeoX RoPE width 64. Shape-compatible

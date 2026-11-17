@@ -89,7 +89,7 @@ impl DraftLayout {
         match self { Self::Mla(l) => l.weight_arena_requests(), Self::Block(l) => l.weight_requests.clone(),Self::BlockTp2 { ranks,lead }=>ranks[*lead].weight_requests.clone() }
     }
     pub fn with_pool_tokens(&self, tokens: usize) -> Result<Self> {
-        Ok(match self { Self::Mla(l) => Self::Mla(l.with_pool_tokens(tokens)?), Self::Block(l) => Self::Block(l.clone()),Self::BlockTp2 { ranks,lead }=>Self::BlockTp2 { ranks:ranks.clone(),lead:*lead } })
+        Ok(match self { Self::Mla(l) => Self::Mla(l.with_pool_tokens(tokens)?), Self::Block(l) => Self::Block(l.with_pool_tokens(tokens)?),Self::BlockTp2 { ranks,lead }=>Self::BlockTp2 { ranks:ranks.clone(),lead:*lead } })
     }
     pub fn validate_capacity(&self, slots: usize, rows: usize, context: usize,
         _target_cache: cuteafd_core::MlaCacheFormat) -> Result<()> {
@@ -99,7 +99,7 @@ impl DraftLayout {
             Self::Mla(l) => ensure!(l.program().context == context
                 && l.cache().layers.iter().all(|layer| layer.slots() == slots),
                 "Kimi MLA drafter cache differs from target capacity"),
-            Self::Block(l) => ensure!(l.config.window.is_some(), "block drafter requires window-bounded KV"),
+            Self::Block(l) => ensure!(l.config.window.is_some() || l.context_capacity == context, "block drafter context differs from admission"),
             Self::BlockTp2 { ranks,lead }=>ensure!(*lead<2 && ranks.iter().all(|r|r.config.window.is_some() && r.capacity.context_slots==slots),"invalid TP2 block capacity"),
         }
         Ok(())

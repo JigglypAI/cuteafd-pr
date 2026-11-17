@@ -1,5 +1,11 @@
 # Step-5
 
+Automatic KV sizing uses the shared 2M-token target on every card, including
+32 GB / RTX 5090. Placement and expert onboarding are fixed at that target;
+the pool then grows into remaining admitted memory, within native encoding
+limits. `KV_MAX_TOKENS` is unset by default and can explicitly cap growth.
+See [memory policy](../options.md#memory-and-pools).
+
 Step-5-Preview serves text from its standard Hugging Face checkpoint headers.
 The MC release cards target one RTX PRO 6000 plus three Sparks and two RTX
 plus six Sparks. Official FP8 and NVFP4 remain supported; NVFP4 experts
@@ -28,9 +34,10 @@ Everything is read from `config.json` and the safetensors headers;
 `quantize_config.json` is only cross-checked. `cuteafd plan` finds the
 fit for each selected view. The card layouts are 1 RTX PRO 6000 + 3 Sparks
 and 2 RTX PRO 6000 + 6 Sparks. Routed layers are onboarded to the RTX by default
-(`RTX_EXPERT_LAYERS` unset is pool-first auto). Once the 2M KV pool fits,
+(`RTX_EXPERT_LAYERS` unset is pool-first auto). After admission sizes the layout for the 2M KV target,
 one RTX runs whole layers from `rtx-tp1`; two RTX split each onboarded layer
-TP2 through the shared pair and `rtx-tp2`, with F32 partial exchange. The
+TP2 through the shared pair and `rtx-tp2`, with F32 partial exchange.
+The automatic pool then grows into remaining memory; `KV_MAX_TOKENS` can cap it. The
 prior K6 96 GiB header-fixture maximum onboards 24 layers; its minimum prioritizes
 its roughly 1.81M-token pool and onboards none. These are planner results,
 not hardware qualification. Start from
@@ -196,7 +203,11 @@ preserve target KV/CSA, predictor histories and cursors exactly.
 
 Start with `examples/configs/step5-fp8-max.config` or
 `examples/configs/step5-nvfp4-min.config`. Replace the sample fabric endpoints
-and select a sealed WIP slot containing `serve-step5`. Keep media disabled;
+and select a sealed WIP slot containing `serve-step5`. One or two coordinator
+GPUs execute every supported expert format; memory admission, not card name or
+a 32 GiB policy floor, determines fit. Deprecated NVFP4 still runs wherever its
+native packages are exported (including TP6), without a fidelity allowlist.
+Keep media disabled;
 Step-5's bundled vision execution is not yet qualified. Pool sizing remains
 automatic, and admission refuses configurations below the 256K context floor.
 

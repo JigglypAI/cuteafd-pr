@@ -454,15 +454,6 @@ impl CoreInventory {
         Ok(inventory)
     }
 
-    /// Accepted K3.1 fidelity covers BF16 original and native K6 only (#1777).
-    /// Sparse scoring uses the same selector/head tiling for both core formats.
-    pub fn serving_qualified(&self, cfg: &KimiK3Config) -> bool {
-        use crate::plan::checkpoint::CoreView;
-        cfg.dsa.is_none() || (matches!(self.selected_core_view, None | Some(CoreView::Original | CoreView::K6Compact))
-            && self.projections.values().all(|projection| projection.bits == 6)
-            && self.native.values().all(|projection| !projection.fp8))
-    }
-
     /// Attention dispatches each validated projection independently. Shared
     /// FFNs and latent projections retain their existing whole-group contract.
     pub fn validate_runtime_groups(&self,cfg:&KimiK3Config)->Result<()> {
@@ -503,26 +494,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn k31_serving_qualification_accepts_only_bf16_and_k6_without_qualifying_drafts() -> Result<()> {
+    fn k31_runtime_groups_do_not_gate_selected_view_or_head_width() -> Result<()> {
         use crate::plan::checkpoint::CoreView;
         let cfg = KimiK3Config::from_hf(&super::super::config::tests::k31_config())?;
         let mut core = CoreInventory::default();
-        assert!(core.serving_qualified(&cfg));
-        for view in [CoreView::Original, CoreView::K6Compact] {
+        for view in [CoreView::Original, CoreView::K6Compact, CoreView::K8Compact, CoreView::Fp8Compact] {
             core.selected_core_view = Some(view);
-            assert!(core.serving_qualified(&cfg));
+            for bits in [6, 8] {
+                core.projections.insert("head".into(), CoreProjection { stem: "head".into(), bits,
+                    codebook: crate::formats::exl3_storage::Exl3Codebook::Mcg,
+                    shape: [128, 128], stored_outputs: 128, split: CoreSplit::Whole, source_bytes: 0 });
+                core.validate_runtime_groups(&cfg)?;
+            }
         }
-        for view in [CoreView::K8Compact, CoreView::Fp8Compact] {
-            core.selected_core_view = Some(view);
-            assert!(!core.serving_qualified(&cfg));
-        }
-        core.selected_core_view = None;
-        core.projections.insert("head".into(), CoreProjection { stem: "head".into(), bits: 6,
-            codebook: crate::formats::exl3_storage::Exl3Codebook::Mcg, shape: [128, 128], stored_outputs: 128,
-            split: CoreSplit::Whole, source_bytes: 0 });
-        assert!(core.serving_qualified(&cfg));
-        core.projections.get_mut("head").unwrap().bits = 8;
-        assert!(!core.serving_qualified(&cfg));
         Ok(())
     }
 

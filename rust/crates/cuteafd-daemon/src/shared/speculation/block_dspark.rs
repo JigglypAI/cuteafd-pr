@@ -213,7 +213,7 @@ pub(crate) fn is_dspark(snapshot: &Path) -> Result<bool> {
         .with_context(|| format!("reading drafter {}", path.display()))?)
         .with_context(|| format!("parsing drafter {}", path.display()))?;
     Ok(config["speculators_model_type"] == "dspark" || config["architectures"].as_array()
-        .is_some_and(|a| a.iter().any(|v| v == "DSparkDraftModel")))
+        .is_some_and(|a| a.iter().any(|v| v == "DSparkDraftModel" || v == "Qwen3DSparkModel")))
 }
 
 /// The drafter geometry the kernels are written for, read from `config.json`.
@@ -251,8 +251,7 @@ impl DsparkConfig {
         let rope_theta = match cfg.rope {
             DsparkRope::Default { rope_theta } | DsparkRope::Yarn { rope_theta, .. } => rope_theta,
         };
-        let rotary = if cfg.head_dim == 64 {
-            ensure!(matches!(cfg.rope, DsparkRope::Default { .. }), "64-wide dSpark requires default RoPE");
+        let rotary = if cfg.head_dim == 64 && matches!(cfg.rope, DsparkRope::Default { .. }) {
             None
         } else { Some(cfg.rope.plan(cfg.backbone.rotary_dim)?) };
         Ok(Self { backbone: cfg.backbone, dialect: cfg.dialect, hidden: cfg.hidden, intermediate: cfg.intermediate, layers: cfg.layers,
@@ -654,7 +653,7 @@ impl<'a> DsparkDrafter<'a> {
         let mut load=|rank,projection|Self::load_rank_with(library,programs,projection,snapshot,HashMap::new(),
             exchange.stream(rank),slots,sequences,vec![0;cfg.hidden*2],representation,
             fp8_linear::Fp8Scales::Amax,fp8_linear::Fp8Rows::W8a16,window,slots*window,kv,None,
-            rank,2,lead,&mut allocate);
+            rank,2,lead,0,&mut allocate);
         let mut body=load(lead,target_projection)?;
         let peer_device=device::Device { library,id:exchange.device(1-lead) };
         let peer=peer_device.own(||load(1-lead,super::dflash::TargetProjection::Native).map(Box::new))?;
@@ -734,9 +733,20 @@ impl<'a> DsparkDrafter<'a> {
         fp8_rows: fp8_linear::Fp8Rows, context_capacity: usize, target_tokens: usize,
         kv_cache: cuteafd_loader::families::qwen4::Qwen4KvCache,
         mut allocate: impl FnMut(i32, &str, usize) -> Result<crate::shared::memory::device::Allocation<'a>>) -> Result<Self> {
-        Self::load_backbone_with(library, programs, target_projection, snapshot, tensors, stream,
-            slots, max_sequences, mask_row, representation, scales, fp8_rows, context_capacity,
-            target_tokens, kv_cache, None, &mut allocate)
+        Self::load_window_paged_with(library,programs,target_projection,snapshot,tensors,stream,slots,
+            max_sequences,mask_row,representation,scales,fp8_rows,context_capacity,target_tokens,kv_cache,0,&mut allocate)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn load_window_paged_with(library: &'a NativeLibrary, programs: &'a cuteafd_ffi::programs::Programs<'a>,
+        target_projection: super::dflash::TargetProjection, snapshot: &Path, tensors: HashMap<String, Vec<u8>>,
+        stream: *mut c_void, slots: usize, max_sequences: usize, mask_row: Vec<u8>,
+        representation: GlmDraftRepresentation, scales: fp8_linear::Fp8Scales, fp8_rows: fp8_linear::Fp8Rows,
+        context_capacity: usize, target_tokens: usize, kv_cache: cuteafd_loader::families::qwen4::Qwen4KvCache,
+        context_window: usize, mut allocate: impl FnMut(i32,&str,usize)->Result<device::Allocation<'a>>) -> Result<Self> {
+        Self::load_rank_with(library,programs,target_projection,snapshot,tensors,stream,slots,max_sequences,
+            mask_row,representation,scales,fp8_rows,context_capacity,target_tokens,kv_cache,None,
+            0,1,0,context_window,&mut allocate)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -760,7 +770,7 @@ impl<'a> DsparkDrafter<'a> {
         allocate: &mut WeightAllocator<'a, '_>) -> Result<Self> {
         Self::load_rank_with(library,programs,target_projection,snapshot,tensors,stream,slots,max_sequences,
             mask_row,representation,scales,fp8_rows,context_capacity,target_tokens,kv_cache,native_rope,
-            0,1,0,allocate)
+            0,1,0,0,allocate)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -769,9 +779,10 @@ impl<'a> DsparkDrafter<'a> {
         stream:*mut c_void,slots:usize,max_sequences:usize,mask_row:Vec<u8>,representation:GlmDraftRepresentation,
         scales:fp8_linear::Fp8Scales,fp8_rows:fp8_linear::Fp8Rows,context_capacity:usize,target_tokens:usize,
         kv_cache:cuteafd_loader::families::qwen4::Qwen4KvCache,native_rope:Option<(CuteafdDeviceBuffer,usize)>,
-        physical_rank:usize,physical_ranks:usize,lead:usize,allocate:&mut WeightAllocator<'a,'_>)->Result<Self> {
+        physical_rank:usize,physical_ranks:usize,lead:usize,context_window:usize,allocate:&mut WeightAllocator<'a,'_>)->Result<Self> {
         let _memory_scope = cuteafd_ffi::memory_ledger::scope("drafter");
         let mut cfg = DsparkConfig::read(snapshot)?;
+        if context_window > 0 { cfg.window=Some(context_window); }
         ensure!(matches!(physical_ranks,1|2) && physical_rank<physical_ranks && lead<physical_ranks,
             "invalid block physical rank inventory");
         if physical_ranks==2 {
@@ -797,7 +808,12 @@ impl<'a> DsparkDrafter<'a> {
         ensure!(slots.checked_mul(context_capacity).is_some_and(|rows| rows <= i32::MAX as usize),
             "dSpark context capacity exceeds signed32 native slots");
         ensure!(cfg.hidden.checked_mul(2) == Some(mask_row.len()), "dSpark mask row shape");
-        let config = serde_json::from_slice(&std::fs::read(snapshot.join("config.json"))?)?;
+        let mut config:serde_json::Value = serde_json::from_slice(&std::fs::read(snapshot.join("config.json"))?)?;
+        if context_window > 0 {
+            let c = if config["speculators_model_type"] == "dspark" { &mut config["transformer_layer_config"] } else { &mut config };
+            c["sliding_window"]=serde_json::json!(context_window);
+            c["layer_types"]=serde_json::json!(vec!["sliding_attention";cfg.layers]);
+        }
         let cache_layout = cuteafd_loader::formats::block_dspark::BlockDsparkConfig::from_json(&config)?
             .paged_cache_layout(slots, context_capacity, target_tokens, kv_cache)?;
         let cache_rows = cache_layout.layer_bytes[0] / cache_layout.record_bytes;
@@ -931,6 +947,7 @@ impl<'a> DsparkDrafter<'a> {
             ("context_kv",&self.context_kv),("context_positions",&self.context_positions),("context_slots",&self.context_slots)] {
             owner.inventory(&mut inventory,name)?;
         }
+        if let Some(context) = &self.paged { context.tables.inventory(&mut inventory,"context.page-table")?; }
         if let Some(owner) = &self.fp8_workspace { owner.inventory(&mut inventory,"workspace.fp8-linear")?; }
         if let Some(workspace) = self.workspace.borrow().as_ref() {
             for (name,owner) in [("h",&workspace.h),("n",&workspace.n),("qkv",&workspace.qkv),
@@ -2178,7 +2195,8 @@ mod tests {
         fixture.immediate_copies(&library)?;
         fixture.quiet_events(&library, true)?;
         let device = Device { library: &library, id: 1 };
-        for (window, rank) in [(Some(8), 256), (None, 256), (Some(8), 512), (None, 512)] {
+        for (window, rank, dim, yarn) in [(Some(8),256,128,false),(None,256,128,false),
+            (Some(8),512,128,false),(None,512,128,false),(Some(8),256,64,true),(None,256,64,true)] {
             let root = tempfile::tempdir_in(fixture.directory())?;
             let snapshot = root.path().join("draft");
             std::fs::create_dir_all(&snapshot)?;
@@ -2186,10 +2204,12 @@ mod tests {
                 "aux_hidden_state_layer_ids":[1], "block_size":2, "confidence_head_with_markov":true,
                 "draft_vocab_size":16, "enable_confidence_head":true, "markov_head_type":"vanilla", "markov_rank":rank,
                 "mask_token_id":0, "sample_from_anchor":true, "sliding_window_non_causal":false,
-                "transformer_layer_config":{"attention_bias":false, "head_dim":128, "hidden_act":"silu",
+                "transformer_layer_config":{"attention_bias":false, "head_dim":dim, "hidden_act":"silu",
                     "hidden_size":256, "intermediate_size":256, "layer_types":[if window.is_some() { "sliding_attention" } else { "full_attention" }],
                     "max_position_embeddings":64, "model_type":"qwen3", "num_attention_heads":2, "num_hidden_layers":1,
-                    "num_key_value_heads":2, "rms_norm_eps":1e-5, "rope_parameters":{"rope_theta":10000.0,"rope_type":"default"},
+                    "num_key_value_heads":2, "rms_norm_eps":1e-5, "rope_parameters":if yarn {
+                        serde_json::json!({"rope_theta":10000.,"rope_type":"yarn","factor":16.,"original_max_position_embeddings":65536})
+                    } else { serde_json::json!({"rope_theta":10000.0,"rope_type":"default"}) },
                     "sliding_window":window, "vocab_size":16}});
             std::fs::write(snapshot.join("config.json"), serde_json::to_vec(&config)?)?;
             let cfg = DsparkConfig::read(&snapshot)?;
@@ -2206,7 +2226,8 @@ mod tests {
                 }).collect::<Vec<_>>();
                 file.write_all_at(&bytes,tensor.byte_offset)?;
             }
-            let shapes = [(256,256),(256,768),(256,512)].into_iter().collect::<BTreeSet<_>>();
+            let shapes = [(256,256),(256,cfg.qkv_width()),(cfg.q_width(),256),(256,2*cfg.kv_width()),(256,512)]
+                .into_iter().collect::<BTreeSet<_>>();
             let entries = shapes.into_iter().map(|(k,n)| serde_json::json!({"name":format!("draft_bf16_k{k}_n{n}"),
                 "pointers":[{"name":"x"},{"name":"w"},{"name":"out"}], "scalars":[{"type":"int32"}],
                 "capacity_rows":TAP_ROWS, "scratch_bytes_at_capacity":{}, "geometry":{"width":k,"outputs":n,
@@ -2307,6 +2328,120 @@ mod tests {
                 }
             }
         }
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "installed Lithos parity fixture; requires sealed CUDA programs and reference outputs"]
+    fn installed_lithos_dspark_forward_parity_fixture() -> Result<()> {
+        use crate::shared::memory::{device::{Device,Stream},weight_arena::DeviceWeightArena};
+        use cuteafd_core::memory_layout::ArenaTag;
+        use cuteafd_loader::families::qwen4::Qwen4KvCache;
+        let Some(snapshot)=std::env::var_os("CUTEAFD_TEST_DRAFT_SNAPSHOT").map(std::path::PathBuf::from)
+            .filter(|p|p.join("config.json").is_file()) else {
+            eprintln!("SKIP installed Lithos parity fixture: checkpoint absent"); return Ok(());
+        };
+        let root=std::path::PathBuf::from(std::env::var("CUTEAFD_GOLDEN_FIXTURES")?);
+        let golden=root.join("taps");
+        let target=std::path::PathBuf::from(std::env::var("CUTEAFD_TEST_TARGET_SNAPSHOT")?);
+        let metadata:serde_json::Value=serde_json::from_slice(&std::fs::read(root.join("full-bf16/meta.json"))?)?;
+        let positions=metadata["positions"].as_array().context("fixture positions")?.iter()
+            .map(|n|n.as_u64().map(|n|n as usize).context("fixture position")).collect::<Result<Vec<_>>>()?;
+        let cfg=DsparkConfig::read(&snapshot)?;
+        ensure!((cfg.hidden,cfg.heads,cfg.kv_heads,cfg.head_dim,cfg.block,cfg.rank)==(7168,64,16,64,5,256)
+            && cfg.taps==[7,23,67,83,91] && cfg.mask_token==163824 && cfg.window.is_none(),"fixture is not native Lithos");
+        let tokens=std::fs::read(golden.join("tokens.bin"))?.chunks_exact(4)
+            .map(|b|u32::from_le_bytes(b.try_into().unwrap())).collect::<Vec<_>>();
+        let context=tokens.len();
+        let layers=cfg.taps.iter().map(|l|std::fs::read(golden.join(format!("layer{l:02}.bin"))))
+            .collect::<std::io::Result<Vec<_>>>()?;
+        // SAFETY: matching sealed library outlives every native owner in this isolated test.
+        let library=unsafe { NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
+        let manifest=std::path::PathBuf::from(std::env::var("CUTEAFD_PROGRAM_MANIFEST")?);
+        let programs=library.programs()?.with_manifest(&manifest)?;
+        let device=Device { library:&library,id:std::env::var("CUTEAFD_CACHE_TEST_DEVICE")?.parse()? };
+        let stream=Stream::new(device)?;
+        let source=super::super::weights::Source::open(&target)?;
+        let index:serde_json::Value=serde_json::from_slice(&std::fs::read(target.join("model.safetensors.index.json"))?)?;
+        let find=|suffix:&str|->Result<String> {
+            let names=index["weight_map"].as_object().context("target index")?.keys()
+                .filter(|name|name.ends_with(suffix)).cloned().collect::<Vec<_>>();
+            ensure!(names.len()==1,"target operand {suffix} is ambiguous");Ok(names[0].clone())
+        };
+        let embedding=source.rect(&find("embed_tokens.weight")?,&[cfg.vocab,cfg.hidden])?;
+        let head_name=find("lm_head.weight")?;
+        let head_requests=vec![(head_name.clone(),cfg.vocab*cfg.hidden*2)];
+        let head_arena=DeviceWeightArena::new(device,cuteafd_loader::serving_capacity::WeightArenaLayout::new(
+            "test/lithos-head",head_requests)?,ArenaTag::drafter_weights("test/lithos-head"))?;
+        let head=device.run(|| {
+            let mut allocate=|physical,name:&str,bytes| { ensure!(physical==device.id,"fixture head owner");head_arena.view(name,bytes) };
+            super::super::weights::Load::open(&library,&target)?.with_allocator(&mut allocate)
+                .tensor(&head_name,&[cfg.vocab,cfg.hidden])
+        })?;
+        for window in [0,2048] { for kv in [Qwen4KvCache::Bf16,Qwen4KvCache::Fp8] {
+            let name=format!("{}-{kv}",if window==0 { "full" } else { "window2048" });
+            let reference=root.join(&name);
+            let words=|file:&str|->Result<Vec<u32>> { Ok(std::fs::read(reference.join(file))?.chunks_exact(4)
+                .map(|b|u32::from_le_bytes(b.try_into().unwrap())).collect()) };
+            let expected=words("drafts.bin")?;
+            let confidence=words("confidence.bin")?;
+            let hidden=std::fs::read(reference.join("hidden.bin"))?;
+            let requests=DsparkDrafter::arena_requests(&snapshot,GlmDraftRepresentation::Bf16Only,device.id)?
+                .remove(&device.id).context("fixture arena requests")?;
+            let arena=DeviceWeightArena::new(device,cuteafd_loader::serving_capacity::WeightArenaLayout::new(
+                "test/lithos-draft",requests)?,ArenaTag::drafter_weights("test/lithos-draft"))?;
+            let tensors=prefetch(&snapshot).join().map_err(|_|anyhow::anyhow!("fixture prefetch panicked"))??;
+            let draft=device.run(||DsparkDrafter::load_window_paged_with(&library,&programs,
+                super::super::dflash::TargetProjection::Bf16,&snapshot,tensors,stream.raw,
+                1,1,vec![0;cfg.hidden*2],GlmDraftRepresentation::Bf16Only,fp8_linear::Fp8Scales::Amax,
+                fp8_linear::Fp8Rows::W8a16,if window==0 {context} else {window},context+128,kv,window,
+                |physical,name,bytes| { ensure!(physical==device.id,"fixture draft owner");arena.view(name,bytes) }))?;
+            let (mut done,mut max_abs,mut max_relative,mut max_confidence)=(0,0f32,0f32,0f32);
+            for (index,&position) in positions.iter().enumerate() {
+                while done<position {
+                    let n=(position-done).min(TAP_ROWS);
+                    let row=cfg.hidden*2;
+                    let mut taps=vec![0;n*cfg.taps.len()*row];
+                    for r in 0..n { for (tap,layer) in layers.iter().enumerate() {
+                        taps[(r*layers.len()+tap)*row..][..row].copy_from_slice(&layer[(done+r)*row..][..row]);
+                    } }
+                    device.run(|| { draft.put_taps(&taps)?;draft.update(&(0..n).map(|r|ContextRow {
+                        tap_row:r,slot:0,position:done+r }).collect::<Vec<_>>())?;draft.drain() })?;
+                    done+=n;
+                }
+                let input=|ids:&[u32],out:CuteafdDeviceBuffer,stream|->Result<()> {
+                    for (row,&id) in ids.iter().enumerate() {
+                        let mut rect=embedding.clone();rect.rows=id as usize..id as usize+1;
+                        let mut bytes=vec![0;cfg.hidden*2];rect.read(&mut bytes)?;
+                        let out=crate::shared::prefix::view(out,row*bytes.len(),bytes.len())?;
+                        // SAFETY: ordered staging and destination survive this retained stream.
+                        unsafe { library.copy_h2d_ordered(out,&bytes,stream)?; }
+                    }
+                    Ok(())
+                };
+                let actual=device.run(||draft.draft_device_with(&[DraftSeq {slot:0,anchor:tokens[position],position,valid_from:0}],
+                    &input,super::super::dflash::TargetHead::Bf16(&head)))?.remove(0);
+                ensure!(actual.tokens==expected[index*cfg.block..][..cfg.block],"{name} position {position} draft tokens differ");
+                let confidence_argmax=|values:&[f32]|values.iter().enumerate()
+                    .max_by(|(i,a),(j,b)|a.total_cmp(b).then_with(||j.cmp(i))).map(|(i,_)|i);
+                let expected_confidence=confidence[index*cfg.block..][..cfg.block].iter()
+                    .map(|&bits|f32::from_bits(bits)).collect::<Vec<_>>();
+                ensure!(confidence_argmax(&actual.confidence)==confidence_argmax(&expected_confidence),
+                    "{name} position {position} confidence argmax differs");
+                for (j,&value) in actual.confidence.iter().enumerate() {
+                    max_confidence=max_confidence.max((value-f32::from_bits(confidence[index*cfg.block+j])).abs());
+                }
+                let actual=device.run(||draft.last_hidden(1))?;
+                let expected=&hidden[index*cfg.block*cfg.hidden*2..][..actual.len()];
+                for (a,b) in actual.chunks_exact(2).zip(expected.chunks_exact(2)) {
+                    let a=f32::from_bits((u16::from_le_bytes(a.try_into().unwrap()) as u32)<<16);
+                    let b=f32::from_bits((u16::from_le_bytes(b.try_into().unwrap()) as u32)<<16);
+                    max_abs=max_abs.max((a-b).abs());max_relative=max_relative.max((a-b).abs()/b.abs().max(1e-3));
+                }
+            }
+            eprintln!("Lithos parity {name}: {} anchors, tokens exact, hidden max_abs={max_abs:.8} max_relative={max_relative:.8}, confidence max_abs={max_confidence:.8}",positions.len());
+            ensure!(max_abs.is_finite()&&max_relative.is_finite()&&max_confidence<0.05,"{name} nonfinite or excessive confidence delta");
+        } }
         Ok(())
     }
 

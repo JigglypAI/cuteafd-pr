@@ -1,10 +1,17 @@
 # Inkling 2 Small
 
+Automatic KV sizing uses the shared 2M-token target on every card, including
+32 GB / RTX 5090. Placement and expert onboarding are fixed at that target;
+the pool then grows into remaining admitted memory, within native encoding
+limits. `KV_MAX_TOKENS` is unset by default and can explicitly cap growth.
+See [memory policy](../options.md#memory-and-pools).
+
 Inkling 2 Small is being qualified as a first-class family on the shared engine
 ([#1930](https://github.com/tpurtell/cuteafd/issues/1930), v5.2). The initial
 text-only public path is `cuteafd serve --family inkling2` or `./run.sh --wip
-SLOT`, with one RTX and 2-8 Sparks. Startup, native cold-prefill/cache exactness,
-fidelity and served smoke are pending; dispatch alone does not qualify them.
+SLOT`, with one RTX and 2-8 Sparks. Admitted checkpoints and layouts report Serving without a repository, revision,
+core-view or fidelity allowlist. Unsupported executor components and missing
+native programs still refuse with their structural cause.
 This page records checkpoint facts read from each checkpoint's own `config.json`
 and safetensors headers. See [Inkling options](../options.md#inkling-serving)
 for the accepted launch keys and current execution limits.

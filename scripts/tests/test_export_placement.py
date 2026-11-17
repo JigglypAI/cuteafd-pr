@@ -313,6 +313,7 @@ def test_queued_export_releases_seed_and_build_locks_for_serving_ticket(tmp_path
             time.sleep(0.01)
         assert ready.exists()
         script = f"""set -euo pipefail
+staging_dir=/frozen/source
 role=both; wip_reused_coordinator=0; wip_reused_expert=0
 wip_retain_counterpart() {{ :; }}
 wip_build_resource_acquire() {{ exec {{seed_fd}}>'{locks}/kakapo.lock'; flock "$seed_fd"; }}
@@ -361,3 +362,26 @@ def test_queue_waits_when_both_gpus_are_busy_then_exports(tmp_path):
         if holder.poll() is None:
             holder.kill()
             holder.wait()
+
+
+@pytest.mark.parametrize('wanted,live,expected', [(['gpu0'], True, True), (['gpu1'], True, True),
+                                                (['sparks'], True, False), (['gpu1'], False, False)])
+def test_serving_priority_reads_only_live_gpu_tickets(tmp_path, wanted, live, expected):
+    import fcntl
+    import json
+    queue = tmp_path / 'hwq'
+    queue.mkdir()
+    path = queue / '000000000001.123.ticket'
+    with path.open('w') as handle:
+        handle.write(json.dumps({'locks': wanted}))
+        handle.flush()
+        if live:
+            fcntl.flock(handle, fcntl.LOCK_EX)
+        assert bool(placement.waiting_serving(tmp_path)) == expected
+
+
+def test_auto_hold_yields_without_acquiring_raptor_gpu(tmp_path, monkeypatch):
+    monkeypatch.setattr(placement, 'waiting_serving', lambda root: ['live.ticket'])
+    monkeypatch.setattr(placement, 'run_held', lambda *a, **k: pytest.fail('must not launch local export'))
+    assert placement.hold(['1', '0'], ['true'], tmp_path, 0, yield_serving=True) == 76
+    assert not (tmp_path / 'gpu1.lock').exists()

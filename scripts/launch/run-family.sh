@@ -1602,9 +1602,6 @@ fi
 # 2 Sparks and 2 RTX + 4 Sparks) for each checkpoint. DFlash2 led on every one
 # measured (2026-10-04: wrldsuksgo2mars EXL3 K3.25, nvidia NVFP4, brandonmusic
 # tr3 4bpw; agentic 1.3-1.5x dSpark); SPECULATOR=dspark selects the RedHat dSpark.
-# Qualification is for these official checkpoints, not a shape-compatible sibling.
-mimo_flash_mopd=0
-[[ "$family:$model" != mimo_v2:XiaomiMiMo/MiMo-V2.6-Flash-MOPD ]] || mimo_flash_mopd=1
 # DeepSeek V4 checkpoints carry their dSpark drafter beside the target (mtp.0.*,
 # dspark_block_size in config.json); one without it serves without speculation.
 dsv4_dspark=0
@@ -1853,6 +1850,12 @@ case "$speculator" in
     [[ "$family" == mimo_v2 ]] || family_args+=(--mtp "$(get SPECULATOR_DEPTH "$mtp_depth")") ;;
 esac
 draft_model_args=${#draft_args[@]}
+draft_context_window="$(get DRAFT_CONTEXT_WINDOW 0)"
+[[ "$draft_context_window" =~ ^[0-9]+$ ]] || release_die "DRAFT_CONTEXT_WINDOW must be a nonnegative integer"
+if ((draft_context_window > 0)); then
+  [[ "$family:$speculator" == kimi_k3:dspark ]] || release_die "DRAFT_CONTEXT_WINDOW currently requires Kimi block DSpark"
+  draft_args+=(--draft-context-window "$draft_context_window")
+fi
 # One fixed-length override for every family and speculator.
 draft_length="$(get DRAFT_LENGTH)"
 if [[ -n "$draft_length" ]]; then
@@ -2082,15 +2085,8 @@ if [[ $serve != serve-dsv4 ]]; then
     if [[ $family == mimo_v2 ]]; then
       [[ -z "$(get DRAFT_CONTEXT_SLOTS)" ]] || family_args+=(--draft-context-slots "$(get DRAFT_CONTEXT_SLOTS)")
       [[ -z "$(get DRAFT_SEQUENCES)" ]] || family_args+=(--draft-sequences "$(get DRAFT_SEQUENCES)")
-      mimo_draft_default=""
-      if [[ $mimo_flash_mopd == 1 && $speculator == dflash2 && -z "$drafter" ]]; then
-        mimo_draft_default=on
-      fi
-      case "$(get SPECULATOR_FP8 "$mimo_draft_default")" in
-        "") ;;
-        auto) family_args+=(--draft-representation checkpoint) ;;
-        on) family_args+=(--draft-fp8 true) ;;
-        off) family_args+=(--draft-fp8 false) ;;
+      case "$(get SPECULATOR_FP8)" in
+        ""|auto|on|off) ;; # Rust emits the one precision choice after admission.
         *) echo "MiMo SPECULATOR_FP8 must be auto, on or off" >&2; exit 2 ;;
       esac
     elif [[ $family == kimi_k3 ]]; then
@@ -2403,7 +2399,7 @@ audio_encoder_hash=""
     # Subtract that explicit used-memory term from the CUDA/logical capacity.
     plan_cap="$(python3 -c 'import sys;f,t,b=map(int,sys.argv[1:]);print(max(1,b-(t-f)*2**20))' "$free_mib" "$total_mib" "$profile_cap")"
   fi
-  plan_draft_args=(--concurrency "$effective_concurrency" --mapped-scale-preload-gib "$(get MAPPED_SCALE_PRELOAD_GIB 0)")
+  plan_draft_args=(--draft-context-window "$draft_context_window" --concurrency "$effective_concurrency" --mapped-scale-preload-gib "$(get MAPPED_SCALE_PRELOAD_GIB 0)")
   if [[ ( "$family" == mimo_v2 || "$family" == kimi_k3 || "$family" == glm5_flash || "$family" == muse_spark ) && "$tp2_dflash" != auto ]]; then
     plan_draft_args+=(--tp2-dflash "$tp2_dflash_bool")
   fi
@@ -2653,6 +2649,9 @@ audio_encoder_hash=""
   fi
   coordinator_weight_budget_gib="$(jq -er '.resolved_settings.coordinator_weight_budget_gib.value' <<<"$deployment_json")"
   if [[ "$family" == kimi_k3 && ( "$speculator" == dflash2 || "$speculator" == dspark ) ]]; then
+    draft_args+=(--draft-fp8 "$(jq -er '.resolved_settings.draft_fp8.value | tostring' <<<"$deployment_json")")
+  fi
+  if [[ "$family:$speculator" == mimo_v2:dflash2 ]]; then
     draft_args+=(--draft-fp8 "$(jq -er '.resolved_settings.draft_fp8.value | tostring' <<<"$deployment_json")")
   fi
   if [[ "$family:$speculator" == mimo_v2:mtp ]]; then

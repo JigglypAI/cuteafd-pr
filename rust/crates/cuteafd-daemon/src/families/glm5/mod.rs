@@ -1186,9 +1186,23 @@ impl Opened {
         } else { cuteafd_loader::placement::AttentionPlacement::Heads });
         let page_tokens = if attention == cuteafd_loader::placement::AttentionPlacement::Context { 128 } else { 64 };
         let requested_pool = cuteafd_loader::placement::PoolPolicy::normalize_request(Some(args.pool_tokens as u64));
-        let pool = cuteafd_loader::placement::prepare_pool(cuteafd_loader::placement::PoolFacts::new(
-            &cards.iter().map(|&(_, logical)| logical).collect::<Vec<_>>(), *serving_context,
-            requested_pool, page_tokens))?;
+        let card_bytes = cards.iter().map(|&(_, logical)| logical).collect::<Vec<_>>();
+        let cache = if let Some(ml4) = self.cfg.variant.ml4() {
+            cuteafd_loader::serving_capacity::mistral_large4_cache_geometry(ml4, 1)?
+        } else { cuteafd_loader::serving_capacity::glm_cache_geometry(&self.cfg, layers, 1)? };
+        let unit = cache.ranks[0].persistent_unit_bytes;
+        let mut pool_facts = cuteafd_loader::placement::PoolFacts::new(*serving_context,
+            requested_pool, page_tokens);
+        // Whole-layer attention splits the replicated record slope between the
+        // cards; heads and context keep the whole latent pool on each.
+        pool_facts.memory = if attention == cuteafd_loader::placement::AttentionPlacement::Layers {
+            vec![cuteafd_loader::placement::PoolMemory { available_bytes: card_bytes.iter().sum(),
+                bytes_per_unit: unit }]
+        } else {
+            card_bytes.iter().map(|&available_bytes|
+                cuteafd_loader::placement::PoolMemory { available_bytes, bytes_per_unit: unit }).collect()
+        };
+        let pool = cuteafd_loader::placement::prepare_pool(pool_facts)?;
         let maximum_pages = pool.maximum_tokens().div_ceil(page_tokens);
         let prefill = PrefillShape { rows: args.prefill_rows as u64, waves: prefill_lanes as u64 };
         let operation = Operation::Serving;
@@ -1220,9 +1234,6 @@ impl Opened {
         let source = local.as_ref().map(|local| LocalPhysicalSource::read(&self.cfg, &self.catalog, local,
             &physical, metadata.as_ref())).transpose()?;
         let host = cuteafd_loader::formats::mapped_preload::host_memory_before_process()?;
-        let cache = if let Some(ml4) = self.cfg.variant.ml4() {
-            cuteafd_loader::serving_capacity::mistral_large4_cache_geometry(ml4, 1)?
-        } else { cuteafd_loader::serving_capacity::glm_cache_geometry(&self.cfg, layers, 1)? };
         let mark_bytes = ml4_draft.as_ref().map(glm::draft_window_mark_bytes).transpose()?.unwrap_or(0);
         let host_config = if devices.len() == 2 && attention == cuteafd_loader::placement::AttentionPlacement::Heads { None }
             else { serving.map(|(prefix, concurrency)| prefix.resolve_host_config(cuteafd_engine::prefix::FamilyLayout {

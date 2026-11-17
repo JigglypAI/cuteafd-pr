@@ -269,7 +269,7 @@ pub fn draft_workspace_bytes(g: GlmDraftGeometry, capacity: GlmDraftCapacity, bl
 
 pub fn is_dspark(config: &serde_json::Value) -> bool {
     config["speculators_model_type"] == "dspark" || config["architectures"].as_array()
-        .is_some_and(|a| a.iter().any(|v| v == "DSparkDraftModel"))
+        .is_some_and(|a| a.iter().any(|v| v == "DSparkDraftModel" || v == "Qwen3DSparkModel"))
 }
 
 /// Serving owns one draft ring per scheduler slot unless explicitly overridden.

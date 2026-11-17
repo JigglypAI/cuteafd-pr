@@ -14,6 +14,17 @@ fn cfg() -> GlmDsaConfig {
     GlmDsaConfig::from_hf(&crate::plan::testing::glm5_config()).unwrap()
 }
 
+/// Pool facts from the family's real per-rank page geometry.
+fn pool_facts(cfg: &GlmDsaConfig, cards: &[u64], context: impl Into<planner::Context>,
+    requested: Option<u64>, unit_rows: u64) -> crate::placement::PoolFacts {
+    let cache = match cfg.variant.ml4() {
+        Some(ml4) => crate::serving_capacity::mistral_large4_cache_geometry(ml4, cards.len()).unwrap(),
+        None => crate::serving_capacity::glm_cache_geometry(cfg, cfg.layers, cards.len()).unwrap(),
+    };
+    let units = cache.ranks.iter().map(|rank| rank.persistent_unit_bytes).collect::<Vec<_>>();
+    crate::plan::testing::pool_facts(cards, context, requested, unit_rows, &units)
+}
+
 fn production_link(cfg: &GlmDsaConfig, ranks: usize, shape: PrefillShape, prefill: bool)
     -> crate::placement::PreparedSparkLink {
     use crate::placement::{PreparedSparkLink, SparkEndpointOwners, SparkIntakeCandidates};
@@ -40,8 +51,8 @@ fn production_input(cfg: &GlmDsaConfig, gpus: usize, ranks: usize, prefill: Pref
             baseline: Baseline::Forecast { occupied: 0, source: "test physical witness".into(), assumed: false },
             headroom: 0 });
     }
-    ProductionInput { expert_usage: false, cfg, layers: cfg.layers, context: 4096, pool: crate::placement::prepare_pool(crate::placement::PoolFacts::new(
-        &vec![96 << 30; gpus], 4096, Some(4096), if gpus == 2 { 128 } else { 64 })).unwrap(),
+    ProductionInput { expert_usage: false, cfg, layers: cfg.layers, context: 4096, pool: crate::placement::prepare_pool(pool_facts(
+        cfg, &vec![96 << 30; gpus], 4096, Some(4096), if gpus == 2 { 128 } else { 64 })).unwrap(),
         attention: if gpus == 2 { AttentionPlacement::Context } else { AttentionPlacement::Heads },
         gpus, prefill, blas_head: serving::BlasHead::TensorLt, blas: vec![],
         target: TargetFacts {
@@ -2344,8 +2355,8 @@ fn sampled_preweight_replaces_census_context_once_and_preserves_capacity() {
             MemoryPolicy { gpu_reserve: reserve, ..Default::default() }.scoped(|| {
                 let make = || {
                     let mut input = production_input(&cfg, gpus, 4, PrefillShape { rows: 128, waves: 3 });
-                    input.pool = crate::placement::prepare_pool(crate::placement::PoolFacts::new(
-                        &vec![96 << 30; gpus], request().context, None, if gpus == 2 { 128 } else { 64 })).unwrap();
+                    input.pool = crate::placement::prepare_pool(pool_facts(
+                        &cfg, &vec![96 << 30; gpus], request().context, None, if gpus == 2 { 128 } else { 64 })).unwrap();
                     input
                 };
                 let mut live = make();
@@ -2365,8 +2376,8 @@ fn sampled_preweight_replaces_census_context_once_and_preserves_capacity() {
                         phase: Phase::Load, source: "preweight fixture".into() };
                 }
                 let mut req = request(); req.pool = Pin::Auto;
-                let pool = crate::placement::prepare_pool(crate::placement::PoolFacts::new(
-                    &vec![96 << 30; gpus], req.context, None, if gpus == 2 { 128 } else { 64 })).unwrap();
+                let pool = crate::placement::prepare_pool(pool_facts(
+                    &cfg, &vec![96 << 30; gpus], req.context, None, if gpus == 2 { 128 } else { 64 })).unwrap();
                 live.pool = pool;
                 reference.pool = pool;
                 let before = reference.admit(req.clone()).unwrap().solved;
@@ -2437,8 +2448,8 @@ fn prepared_pool_survives_policy_scope_and_matches_sampled_admission() {
             req.pool = Pin::Auto;
             let make = || {
                 let mut input = production_input(&cfg, gpus, 4, PrefillShape { rows: 128, waves: 3 });
-                input.pool = crate::placement::prepare_pool(crate::placement::PoolFacts::new(
-                    &vec![96 << 30; gpus], req.context, None, if gpus == 2 { 128 } else { 64 })).unwrap();
+                input.pool = crate::placement::prepare_pool(pool_facts(
+                    &cfg, &vec![96 << 30; gpus], req.context, None, if gpus == 2 { 128 } else { 64 })).unwrap();
                 input.prepare().unwrap()
             };
             let default = MemoryPolicy::default().scoped(make).admit(req.clone()).unwrap();
@@ -2447,7 +2458,11 @@ fn prepared_pool_survives_policy_scope_and_matches_sampled_admission() {
             let grown = prepared.admit(req.clone()).unwrap();
             assert_eq!(grown.solved.pool_policy, Some(pool));
             assert_eq!(grown.placement.onboard_layers, default.placement.onboard_layers);
-            assert!(grown.solved.pool_tokens > default.solved.pool_tokens);
+            // The unbounded default grows into the declared memory bound;
+            // an explicit max below that bound caps it.
+            assert!(default.solved.pool_tokens > pool.target(), "automatic growth fills the memory bound");
+            assert_eq!(grown.solved.pool_tokens, 100_000_000u64.min(default.solved.pool_tokens),
+                "KV_MAX caps automatic growth");
             let mut sampled = MemoryPolicy { kv_max: Some(100_000_000), ..Default::default() }.scoped(make);
             for budget in sampled.budgets.iter_mut().take(gpus) {
                 let Baseline::Forecast { occupied, .. } = budget.baseline else { panic!("forecast baseline") };
@@ -2459,19 +2474,19 @@ fn prepared_pool_survives_policy_scope_and_matches_sampled_admission() {
             let mut exact = req.clone();
             exact.pool = Pin::Exact(default.solved.pool_tokens);
             let mut pinned = production_input(&cfg, gpus, 4, PrefillShape { rows: 128, waves: 3 });
-            pinned.pool = crate::placement::prepare_pool(crate::placement::PoolFacts::new(
-                &vec![96 << 30; gpus], exact.context, Some(default.solved.pool_tokens), if gpus == 2 { 128 } else { 64 })).unwrap();
+            pinned.pool = crate::placement::prepare_pool(crate::placement::PoolFacts::new(exact.context, Some(default.solved.pool_tokens), if gpus == 2 { 128 } else { 64 })).unwrap();
             assert_eq!(pinned.prepare().unwrap().admit(exact).unwrap().solved.pool_tokens, default.solved.pool_tokens);
         }
     }
 }
 
 #[test]
-fn small_card_policy_facts_preserve_shared_default_and_explicit_target() {
+fn pool_facts_preserve_shared_default_and_explicit_target() {
+    let cfg = cfg();
     for unit in [64, 128] {
-        let mut facts = crate::placement::PoolFacts::new(&[32 << 30],
+        let mut facts = pool_facts(&cfg, &[32 << 30],
             crate::placement::planner::Context::automatic(262_144), None, unit);
-        assert_eq!(crate::placement::prepare_pool(facts).unwrap().target(), 1 << 20);
+        assert_eq!(crate::placement::prepare_pool(facts.clone()).unwrap().target(), 2 << 20);
         facts.target = Some(3 << 20);
         assert_eq!(crate::placement::prepare_pool(facts).unwrap().target(), 3 << 20);
     }

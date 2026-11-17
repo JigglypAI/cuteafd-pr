@@ -1669,15 +1669,7 @@ fn place(report: &mut PlanReport, options: &PlanOptions, spec: &ModelSpec, model
                     report.experts = Some(contract.clone());
                     return;
                 }
-                if let Some(worlds) = experts::frozen_refusal(&contract.package, ranks) {
-                    // Frozen formats admit only the worlds they shipped on, for every family.
-                    report.placement_supported = false;
-                    report.fits = false;
-                    report.hints.push(Hint {
-                        what: worlds.to_string(),
-                        how: format!("{advice}; choose a supported quantization for other Spark counts."),
-                    });
-                } else if share(ranks).is_none() {
+                if share(ranks).is_none() {
                     report.placement_supported = false;
                     report.fits = false;
                     report.hints.push(Hint {
@@ -1702,11 +1694,7 @@ fn place(report: &mut PlanReport, options: &PlanOptions, spec: &ModelSpec, model
                         what: refusal.as_ref().map(ToString::to_string).unwrap_or_else(||
                             format!("no {} layout for {ranks} Spark ranks (this build packages {:?})",
                                 contract.package, contract.spark_worlds)),
-                        how: if matches!(refusal, Some(experts::SparkRecipeRefusal::Deprecated { .. })) {
-                            format!("{advice}; choose a supported quantization for other Spark counts.")
-                        } else {
-                            format!("{advice}; add the native geometry or width-class export named by the refusal.")
-                        },
+                        how: format!("{advice}; add the native geometry or width-class export named by the refusal."),
                     });
                 }
             }

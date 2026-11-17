@@ -481,7 +481,7 @@ the coordinator to fit an endpoint
   - Startup and `cuteafd plan` print one line per device: cap, weights,
     workspaces, every reserve component, and the KV target, min, max and pool.
 - **Pool first.** `PoolPolicy` ([loader/placement/pool.rs:11](../../rust/crates/cuteafd-loader/src/placement/pool.rs#L11))
-  takes the KV target (2M tokens on cards above 32 GiB, 1M at 32 GiB or less),
+  takes the KV target (2M tokens on every card),
   min and max from the policy. The solver's order (`mod.rs:7-10`) is:
   1. fixed demands (graphs, workspaces) and mandatory movables;
   2. the pool target;

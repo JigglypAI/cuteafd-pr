@@ -1,5 +1,8 @@
-//! Separate binary: benchmark readiness and its loopback address are process-wide.
-mod common;
+//! Separate binary: `mark_ready` seals the process-wide `context` readiness and
+//! loopback address (`src/context.rs` `listen: OnceLock<SocketAddr>`), after which
+//! another suite's `set_resolved` (the fake engine here) is a debug assertion
+//! failure (`publish_resolved`).
+#[path = "all/common/mod.rs"] mod common;
 use common::fake_engine;
 use cuteafd_api::openai::{router_with_console, ConsoleHub, NativeLimits, NativeRequest};
 use serde_json::Value;
