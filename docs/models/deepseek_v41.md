@@ -46,8 +46,9 @@ There is no separate scale-only preload. `ENGRAM_WARM` warms the whole mapped ta
   (MXFP4, EXL3 K2–K4, or ModelOpt NVFP4); mHC hyper-connections mix the
   coordinator residual stream.
 - Speculator: three-stage dSpark drafter (`markov_head`, `confidence_head`,
-  `main_proj`) with adaptive width from a calibrated confidence and cost
-  model.
+  `main_proj`) with the full native seven-position block. The shared `history`
+  policy chooses verified lengths from per-position acceptance history; the
+  calibrated head only skips an explore below 0.3. No draft cost model.
 - KV format: compressed MLA latent in FP8 32x32 blocks. Prefix cache: the
   shared engine cache with exact frontiers only (`ReuseRule::EXACT`); shared
   FP4 source pages, a mark holding the window rings, odd compressor carry,

@@ -1282,7 +1282,9 @@ Work, in priority order:
    split choices. This widens paired precision noise for V4 Flash and
    blocks byte-exact speculation there.
    **Separate task: GLM Flash speculative decode is not launch-deterministic
-   (2026-10-07, WP-9):** greedy, temperature 0 / seed 0, identical prompt and
+   (2026-10-07, WP-9; historical):** The timing-based policy hypothesis and
+   repeat-run prescription below are superseded by `history` (2026-11-18)
+   and the current tiered gates in AGENTS.md. Greedy, temperature 0 / seed 0, identical prompt and
    tokenizer diverge at token 6 between launches on the unchanged lazy path
    (retokenized SSE text, not a raw generated-ID trace). Lazy/startup also
    diverge; the lazy/lazy control rules out attributing this to bucket padding
