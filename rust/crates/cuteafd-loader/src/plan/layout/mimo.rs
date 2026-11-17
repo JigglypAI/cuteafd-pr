@@ -775,7 +775,7 @@ mod tests {
                             prefill, Operation::Serving, crate::placement::ResidentWeights(opts.weight_budget_bytes),
                             opts.spark_reply_formats)).unwrap();
                         let (_, _, planned_ledger, _) = apply_selected(&input, &opts, &mut devices.clone(),
-                            &vec![ResidentWeights(0); ranks], 0, 4, 4096, 4, 32768, None).unwrap();
+                            &vec![crate::placement::ResidentWeights(0); ranks], 0, 4, 4096, 4, 32768, None).unwrap();
                         assert_eq!(planned_ledger.pool_policy, runtime.solved.pool_policy,
                             "MiMo public plan facts and runtime facts must resolve the same policy");
                         assert_eq!(runtime.placement.pool_tokens, placement.pool_tokens);
