@@ -320,15 +320,15 @@ fn validate_bf16_headers(snapshot: &Path, shapes: Vec<(String, Vec<usize>)>) -> 
     Ok(())
 }
 
-pub struct MlaLayerWeights<T, M> {
+pub struct MlaLayerWeights<T, M, A = T> {
     pub input_norm: T, pub post_norm: T,
     pub attn_conv: M, pub attn_base: T, pub mlp_conv: M, pub mlp_base: T,
-    pub qkv_a: T, pub q_norm: T, pub kv_norm: T, pub q_b: T,
-    pub uk: T, pub uv: T, pub output: T, pub gate_up: M, pub down: M,
+    pub qkv_a: A, pub q_norm: T, pub kv_norm: T, pub q_b: A,
+    pub uk: A, pub uv: A, pub output: A, pub gate_up: M, pub down: M,
 }
 
-pub struct MlaWeights<T, M> {
-    pub layers: Vec<MlaLayerWeights<T, M>>,
+pub struct MlaWeights<T, M, A = T> {
+    pub layers: Vec<MlaLayerWeights<T, M, A>>,
     pub fc: M, pub hidden_norm: T, pub norm: T, pub selector: (M, T, T),
 }
 
@@ -340,8 +340,21 @@ pub fn mla_weight_recipe<T, M>(
     matrix: impl Fn(&[(&str, usize)], usize) -> Result<M>,
     absorb: impl Fn(&str) -> Result<(T, T)>,
 ) -> Result<MlaWeights<T, M>> {
-    use cuteafd_core::coordinator_programs::MlaDraftKind;
-    ensure!(cfg.kind == MlaDraftKind::Dflash2, "MLA DFlash arena recipe requires DFlash2");
+    ensure!(cfg.kind.is_dflash(), "MLA DFlash arena recipe requires DFlash2");
+    mla_weight_recipe_with_attention(cfg, &tensor, matrix,
+        |parts, columns| tensor(&parts.iter().map(|(name, rows)| (*name, vec![*rows, columns]))
+            .collect::<Vec<_>>()), absorb)
+}
+
+/// Same immutable traversal for BF16 and row-major FP8 attention operands.
+pub fn mla_weight_recipe_with_attention<T, M, A>(
+    cfg: &crate::formats::dflash::MlaDflashConfig,
+    tensor: impl Fn(&[(&str, Vec<usize>)]) -> Result<T>,
+    matrix: impl Fn(&[(&str, usize)], usize) -> Result<M>,
+    attention: impl Fn(&[(&str, usize)], usize) -> Result<A>,
+    absorb: impl Fn(&str) -> Result<(A, A)>,
+) -> Result<MlaWeights<T, M, A>> {
+    ensure!(cfg.kind.is_dflash(), "MLA DFlash arena recipe requires DFlash2");
     let m = &cfg.mla;
     let h = m.hidden;
     let one = |name: &str, shape: &[usize]| tensor(&[(name, shape.to_vec())]);
@@ -357,12 +370,12 @@ pub fn mla_weight_recipe<T, M>(
             attn_base: one(&format!("{p}.attention_conv.base_kernel"), &[2, 2, h])?,
             mlp_conv: matrix(&[(&format!("{p}.mlp_conv.kernel_projection.weight"), 4 * h / cfg.group)], h)?,
             mlp_base: one(&format!("{p}.mlp_conv.base_kernel"), &[2, 2, h])?,
-            qkv_a: tensor(&[(&format!("{a}.q_a_proj.weight"), vec![m.q_rank, h]),
-                (&format!("{a}.kv_a_proj_with_mqa.weight"), vec![m.kv_rank + m.rope, h])])?,
+            qkv_a: attention(&[(&format!("{a}.q_a_proj.weight"), m.q_rank),
+                (&format!("{a}.kv_a_proj_with_mqa.weight"), m.kv_rank + m.rope)], h)?,
             q_norm: one(&format!("{a}.q_a_layernorm.weight"), &[m.q_rank])?,
             kv_norm: one(&format!("{a}.kv_a_layernorm.weight"), &[m.kv_rank])?,
-            q_b: one(&format!("{a}.q_b_proj.weight"), &[m.heads * (m.nope + m.rope), m.q_rank])?,
-            uk, uv, output: one(&format!("{a}.o_proj.weight"), &[h, m.heads * m.value])?,
+            q_b: attention(&[(&format!("{a}.q_b_proj.weight"), m.heads * (m.nope + m.rope))], m.q_rank)?,
+            uk, uv, output: attention(&[(&format!("{a}.o_proj.weight"), h)], m.heads * m.value)?,
             gate_up: matrix(&[(&format!("{p}.mlp.gate_proj.weight"), cfg.intermediate),
                 (&format!("{p}.mlp.up_proj.weight"), cfg.intermediate)], h)?,
             down: matrix(&[(&format!("{p}.mlp.down_proj.weight"), h)], cfg.intermediate)?,
@@ -417,6 +430,58 @@ pub fn mla_arena_requests(cfg: &crate::formats::dflash::MlaDflashConfig,
     Ok(requests.into_inner())
 }
 
+/// Complete MLA body FP8 destinations. This is additive to the historical
+/// representation until its lossless/performance qualification enables it.
+/// Native auxiliary/prediction tensors retain their exact BF16 storage.
+pub fn mla_complete_fp8_arena_requests(cfg: &crate::formats::dflash::MlaDflashConfig)
+    -> Result<Vec<(String, usize)>> {
+    use super::draft_representation::{draft_weight_role, DraftWeightRole};
+    ensure!(cfg.kind.is_dflash(), "complete MLA FP8 body requires DFlash2");
+    let mut requests = Vec::new();
+    let mut qkv = Vec::new();
+    for (name, shape) in cfg.tensor_shapes() {
+        let values = shape.iter().try_fold(1usize, |n, &d| n.checked_mul(d))
+            .context("MLA complete FP8 extent overflow")?;
+        if name.ends_with(".self_attn.q_a_proj.weight") || name.ends_with(".self_attn.kv_a_proj_with_mqa.weight") {
+            qkv.push((name, values));
+            continue;
+        }
+        if name.ends_with(".mlp.gate_proj.weight") || name.ends_with(".mlp.up_proj.weight") {
+            if name.ends_with(".mlp.gate_proj.weight") {
+                let up = name.replace(".gate_proj.weight", ".up_proj.weight");
+                let joined = format!("{name}+{up}");
+                requests.extend([(format!("{joined}.payload"), values * 2),
+                    (format!("{joined}.scales"), values * 2 / 128 * 4)]);
+            }
+            continue;
+        }
+        if name.ends_with(".self_attn.kv_b_proj.weight") {
+            let root = &name;
+            let m = &cfg.mla;
+            for (part, count) in [("uk", m.heads * m.kv_rank * m.nope), ("uv", m.heads * m.value * m.kv_rank)] {
+                requests.extend([(format!("{root}.{part}.payload"), count),
+                    (format!("{root}.{part}.scales"), count / 64 * 4)]);
+            }
+            continue;
+        }
+        match draft_weight_role(&name).with_context(|| format!("MLA tensor {name} has no precision role"))? {
+            DraftWeightRole::BodyLinear => {
+                ensure!(shape.len() == 2 && shape[0] % 16 == 0 && shape[1] % 128 == 0,
+                    "MLA complete FP8 matrix alignment: {name}");
+                requests.extend([(format!("{name}.payload"), values), (format!("{name}.scales"), values / 128 * 4)]);
+            }
+            _ => requests.push((name, (values * 2).max(256))),
+        }
+    }
+    for pair in qkv.chunks_exact(2) {
+        let name = format!("{}+{}", pair[0].0, pair[1].0);
+        let values = pair[0].1.checked_add(pair[1].1).context("MLA joined QKV overflow")?;
+        requests.extend([(format!("{name}.payload"), values), (format!("{name}.scales"), values / 128 * 4)]);
+    }
+    ensure!(qkv.len() == cfg.windows.len() * 2, "MLA joined QKV inventory incomplete");
+    Ok(requests)
+}
+
 /// The same MLA requests, checked against native BF16 checkpoint headers.
 pub fn mla_checkpoint_arena_requests(snapshot: &Path, representation: GlmDraftRepresentation)
     -> Result<Vec<(String, usize)>> {
@@ -444,6 +509,33 @@ pub use super::draft_physical_layout::{draft_device_requests, GlmDflashPhysicalL
 #[cfg(test)]
 mod arena_tests {
     use super::*;
+
+    #[test]
+    fn glm_body_fp8_recipe_and_shared_roles_agree_for_every_operand() -> Result<()> {
+        use crate::families::glm5::draft_representation::{draft_weight_role, DraftWeightRole};
+        let cfg = GlmDflashConfig { hidden:256,intermediate:256,layers:2,heads:2,kv_heads:1,head_dim:128,
+            eps:1e-6,theta:10000.,block:8,group:16,mask_token:0,rank:256,taps:vec![0,1],vocab:32,
+            window:2048,row_window:true,sample_from_anchor:false };
+        let native = gqa_arena_requests(&cfg,GlmDraftRepresentation::Bf16Only,0,1)?
+            .into_iter().collect::<std::collections::BTreeMap<_,_>>();
+        let fp8 = gqa_arena_requests(&cfg,GlmDraftRepresentation::Fp8Only,0,1)?
+            .into_iter().collect::<std::collections::BTreeMap<_,_>>();
+        gqa_weight_recipe(&cfg,0,1,|name,_| {
+            assert_ne!(draft_weight_role(name),Some(DraftWeightRole::BodyLinear),"{name}");
+            assert_eq!(fp8[name],native[name]);
+            assert!(!fp8.contains_key(&format!("{name}.payload")));
+            Ok(())
+        },|parts,cols,_| {
+            for (name,_) in parts { assert_eq!(draft_weight_role(name),Some(DraftWeightRole::BodyLinear),"{name}"); }
+            let name=parts.iter().map(|(name,_)|*name).collect::<Vec<_>>().join("+");
+            let values=parts.iter().map(|(_,rows)|rows*cols).sum::<usize>();
+            assert_eq!(fp8[&format!("{name}.payload")],values);
+            assert_eq!(fp8[&format!("{name}.scales")],values/128*4);
+            assert!(!fp8.contains_key(&name));
+            Ok(())
+        })?;
+        Ok(())
+    }
 
     #[test]
     fn gqa_checkpoint_and_config_requests_agree_and_reject_invalid_headers() -> Result<()> {

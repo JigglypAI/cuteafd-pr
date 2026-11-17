@@ -9,7 +9,7 @@ pub(crate) fn tp2_dflash_default(family: &str, split: bool, draft: bool) -> bool
 }
 
 /// Resolve the topology-dependent bool once, without losing an explicit false.
-pub(crate) fn resolve_tp2_dflash(command: &mut Commands, matches: &clap::ArgMatches) {
+pub(crate) fn resolve_tp2_dflash(command: &mut Commands, matches: &clap::ArgMatches) -> anyhow::Result<()> {
     let explicit = matches.subcommand().is_some_and(|(_, sub)|
         sub.try_contains_id("tp2_dflash").is_ok_and(|present| present)
             && sub.value_source("tp2_dflash") == Some(clap::parser::ValueSource::CommandLine));
@@ -22,19 +22,29 @@ pub(crate) fn resolve_tp2_dflash(command: &mut Commands, matches: &clap::ArgMatc
         engine.tp2_dflash_auto = !explicit && engine.split_device.is_some()
             && engine.draft.as_ref().is_some_and(|path|
                 crate::families::glm5_flash::dspark::is_dspark(path).is_ok_and(|plain| !plain));
-        return;
+        return Ok(());
+    }
+    if let Commands::ServeKimi(args) = command {
+        if let Some(snapshot) = &args.draft {
+            if !crate::shared::speculation::block_dspark::is_dspark(snapshot)? {
+                args.tp2_dflash = cuteafd_loader::families::kimi_k3::draft::resolve_context_split(snapshot,
+                    explicit.then_some(args.tp2_dflash), args.split_device.is_some())?;
+                return Ok(());
+            }
+        }
     }
     let (enabled, family, split, draft) = match command {
         Commands::ServeMimo(args) => (&mut args.engine.tp2_dflash, "mimo_v2", args.engine.split_device.is_some(), args.engine.draft.is_some()),
         Commands::MimoGolden(args) => (&mut args.engine.tp2_dflash, "mimo_v2", args.engine.split_device.is_some(), args.engine.draft.is_some()),
         Commands::ServeKimi(args) => (&mut args.tp2_dflash, "kimi_k3", args.split_device.is_some(), args.draft.is_some()),
         Commands::ServeMuse(args) => (&mut args.tp2_dflash, "muse_spark", args.split_device.is_some(), args.draft.is_some()),
-        _ => return,
+        _ => return Ok(()),
     };
-    let Some((_, sub)) = matches.subcommand() else { return };
+    let Some((_, sub)) = matches.subcommand() else { return Ok(()) };
     if sub.value_source("tp2_dflash") != Some(clap::parser::ValueSource::CommandLine) {
         *enabled = tp2_dflash_default(family, split, draft);
     }
+    Ok(())
 }
 
 fn parse_size(text: &str) -> std::result::Result<u64, String> {
@@ -969,7 +979,7 @@ mod tests {
                     if let Some(value) = explicit { argv.extend(["--tp2-dflash", value]); }
                     let matches = super::Cli::command().try_get_matches_from(argv).unwrap();
                     let mut cli = super::Cli::from_arg_matches(&matches).unwrap();
-                    super::resolve_tp2_dflash(&mut cli.command, &matches);
+                    super::resolve_tp2_dflash(&mut cli.command, &matches).unwrap();
                     let super::Commands::ServeGlmf(args) = cli.command else { panic!("expected GLM Flash"); };
                     assert_eq!(args.engine.tp2_dflash, explicit.is_some_and(|v| v == "true"));
                     assert_eq!(args.engine.tp2_dflash_auto, explicit.is_none() && split && compatible);

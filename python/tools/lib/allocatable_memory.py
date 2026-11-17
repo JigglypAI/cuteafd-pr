@@ -53,6 +53,15 @@ def cgroup_allocatable_bytes(available: int, membership: str,
                 continue
             limit = _unsigned(limit)
             current = _unsigned((path / current_name).read_text())
+            if not controllers:
+                # v2 current includes reclaimable compile-output page cache.
+                # Charge the working set, bounded separately by MemAvailable.
+                try:
+                    stats = dict(line.split() for line in (path / 'memory.stat').read_text().splitlines())
+                except FileNotFoundError:
+                    stats = {}
+                inactive = _unsigned(stats.get('inactive_file', '0'))
+                current = max(0, current - inactive)
             available = min(available, max(0, limit - current))
     return available
 

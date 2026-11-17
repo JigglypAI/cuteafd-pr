@@ -426,7 +426,7 @@ mod draft_cli_tests {
     fn bench_verify_mla_tail_binds_and_populates_every_requested_slot() -> Result<()> {
         use cuteafd_loader::formats::{dflash::{MlaDflashConfig, MlaDraftCacheState,
             MlaDraftCacheRequest}, mla::MlaGeometry, block_dspark::DsparkRotaryPlan};
-        let cfg = MlaDflashConfig { mla: MlaGeometry { hidden: 128, heads: 2, q_rank: 0,
+        let cfg = MlaDflashConfig { hidden_stream: Default::default(), mla: MlaGeometry { hidden: 128, heads: 2, q_rank: 0,
             kv_rank: 128, nope: 64, rope: 64, value: 128 }, intermediate: 128, eps: 1e-5,
             block: 3, group: 0, selector_rank: 512, selector_top_k: 0, taps: vec![0, 1],
             vocab: 16, mask_token: 0, max_context: 32768, windows: vec![Some(2048); 2],

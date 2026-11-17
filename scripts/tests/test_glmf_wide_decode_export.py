@@ -674,13 +674,15 @@ def test_kimi_nope_mla_exports_both_head_layouts_and_all_modes(exporter, decode_
 
 
 @pytest.mark.parametrize("decode_rows,prefill_rows", [(64, 4096), (128, 2048)])
-def test_kimi_k31_exports_native_dsa_without_changing_k3_or_enabling_a_drafter(exporter, decode_rows, prefill_rows):
+def test_kimi_k31_exports_native_dsa_and_causal_draft_without_changing_k3(exporter, decode_rows, prefill_rows):
     programs = exporter.kimi_k31_programs(GEOMETRY, decode_rows, prefill_rows, 1048576)
     catalog = {stem: (op, params, build) for stem, op, params, build in programs}
     assert len(catalog) == len(programs)
     assert not any("dense_mla" in stem for stem in catalog)
-    assert {stem for stem in catalog if "draft" in stem} == {
-        stem for stem, *_ in exporter.mla_draft_fp8_weight_programs(64, causal=True)}
+    draft_stems = {stem for stem in catalog if "draft" in stem}
+    assert draft_stems == ({stem for stem, *_ in exporter.causal_mla_draft_programs(64, 1048576)} |
+        {stem for stem, *_ in exporter.mla_draft_fp8_weight_programs(64, causal=True)})
+    assert all("causal" in stem and stem.endswith("_m64") for stem in draft_stems)
     assert {"kda_commit", "lse_combine2", "dsa_candidate_merge"} <= catalog.keys()
     for suffix, row_bytes in [("", 1152), ("_fp8", 656)]:
         module, function, args, kwargs = catalog[f"paged_staging_gather{suffix}"][2]()
@@ -762,6 +764,25 @@ def test_kimi_context_exports_native_partial_ranges_and_shared_primitives(export
     assert {stem for stem, *_ in programs} <= catalog
 
 
+def test_causal_mla_drafter_export_keeps_native_geometry_and_separate_names(exporter):
+    programs = exporter.causal_mla_draft_programs(64, 1048576)
+    assert len(programs) == 5
+    for stem, op, params, build in programs:
+        module, function, args, kwargs = build()
+        assert module == "kimi_mla" and function == f"compile_{op}_aot"
+        assert args[0].heads == 96 and args[0].window_size == 1024
+        assert kwargs["max_rows"] == 64
+        if op == "mla_draft_attention":
+            assert params["is_causal"] and params["window_size"] == 1024
+            assert kwargs["max_context"] == 1048576
+        assert stem.startswith("mla_draft_") and "causal" in stem
+    target = types.SimpleNamespace(index_heads=32)
+    catalog = {stem for stem, *_ in exporter.kimi_k31_programs(target,64,4096,1048576)}
+    assert {stem for stem, *_ in programs} <= catalog
+    legacy = {stem for stem, *_ in exporter.mla_draft_programs(64,1048576)}
+    assert not legacy.intersection(stem for stem, *_ in programs)
+
+
 @pytest.mark.parametrize("causal", [False, True])
 def test_mla_fp8_weight_exports_are_additive_and_cache_independent(exporter, causal):
     wrappers = exporter.mla_draft_fp8_weight_programs(64, causal=causal)
@@ -783,13 +804,13 @@ def test_mla_fp8_weight_exports_are_additive_and_cache_independent(exporter, cau
 def test_shared_mla_drafter_requested_names_exist_in_family_catalog(exporter, namespace):
     ffi = (ROOT / "rust/crates/cuteafd-ffi/src/shared/mla_draft.rs").read_text()
     implementation = ffi.split("impl<'a> MlaDraft<'a> {", 1)[1]
-    load = implementation.split("pub fn load(", 1)[1].split("pub fn load_ml4(", 1)[0]
+    load = implementation.split("pub fn load(", 1)[1].split("pub fn load_fp8_weights(", 1)[0]
     requested = re.findall(r'programs\.program\(&format!\("([^"]+)"', load)
     assert len(requested) == 3
     catalog = {f"{namespace}_{stem}" for stem, *_ in
                exporter.kimi_kda_programs(GEOMETRY, 64, 4096, 1048576)}
     for window in ("full", "w4096"):
-        names = {name.replace("{program_namespace}", namespace).replace("{}", window).replace("{cache}", "_fp8")
+        names = {name.replace("{program_namespace}", namespace).replace("{geometry}", "").replace("{}", window).replace("{cache}", "_fp8")
                  for name in requested}
         assert names <= catalog, sorted(names - catalog)
         assert all(name.startswith(namespace + "_") for name in names)
@@ -797,10 +818,12 @@ def test_shared_mla_drafter_requested_names_exist_in_family_catalog(exporter, na
     startup = (daemon / "families/kimi_k3/startup.rs").read_text()
     admission = (daemon / "families/kimi_k3/admission.rs").read_text()
     shared = (daemon / "shared/speculation/dflash.rs").read_text()
-    assert f'MlaDraft::load(programs, "{namespace}", MlaDraftWindow::Full, options.cache_format)' in startup
-    assert f'MlaDraft::load(programs, "{namespace}", MlaDraftWindow::Sliding4096, options.cache_format)' in startup
+    assert "MlaDraft::load_fp8_weights(programs, namespace, window, cache)" in startup
+    assert "MlaDraft::load(programs, namespace, window, cache)" in startup
+    assert f'load("{namespace}", MlaDraftWindow::Full)' in startup
+    assert f'load("{namespace}", MlaDraftWindow::Sliding4096)' in startup
     assert re.search(r'DflashDrafter::load_mla_with\(device\.library, programs,\s*'
-                     rf'target_projection, "{namespace}",', admission)
+                     r'target_projection, namespace,', admission)
     assert "MlaDraft::load(programs, program_namespace," in shared
 
 

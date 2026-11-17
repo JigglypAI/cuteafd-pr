@@ -50,6 +50,11 @@ impl Activation {
     }
 }
 
+/// One executable physical drafter placement, priced from its actual producers
+/// and consumers. Traffic excludes startup-only immutable weight replication.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DraftHomeAlternative { pub gpu: u8, pub traffic_bytes_per_cycle: u64 }
+
 #[derive(Debug, Clone)]
 pub enum Variable {
     /// A small family-declared list of correlated attention assignments.
@@ -67,6 +72,8 @@ pub enum Variable {
     Embedding(Vec<EmbeddingHome>),
     /// Ordered coordinator homes for one drafter; lower index is preferred.
     DraftHome(Vec<u8>),
+    /// Executable homes with explicit hot-path traffic (same facts in plan/serve).
+    DraftHomeTraffic(Vec<DraftHomeAlternative>),
     /// Ordered coordinator homes for the single vocabulary head.
     HeadHome(Vec<u8>),
     /// Ordered coordinator homes for the single Spark intake owner.
@@ -98,6 +105,7 @@ impl Variable {
             Self::Lanes(values) => values.len(),
             Self::Embedding(values) => values.len(),
             Self::DraftHome(values) | Self::HeadHome(values) | Self::IntakeHome(values) => values.len(),
+            Self::DraftHomeTraffic(values) => values.len(),
             Self::Encoder(values) => values.len(),
             Self::ExpertHome { rank_sets, .. } => rank_sets.len(),
             Self::Onboard { counts, .. } => counts.len(),
@@ -108,6 +116,9 @@ impl Variable {
             Self::Onboard { counts, .. } => counts[option] as u64,
             _ => 0,
         }
+    }
+    pub(super) fn draft_traffic(&self, option: usize) -> u64 {
+        match self { Self::DraftHomeTraffic(values) => values[option].traffic_bytes_per_cycle, _ => 0 }
     }
     pub(super) fn onboard_layers(&self, option: usize) -> &[usize] {
         match self {
@@ -621,6 +632,11 @@ impl Contract {
                         return Err(Refusal::InvalidFact("duplicate draft home domain".into()));
                     }
                 }
+                Variable::DraftHomeTraffic(values) => {
+                    if draft_home.replace(values[option].gpu).is_some() {
+                        return Err(Refusal::InvalidFact("duplicate draft home domain".into()));
+                    }
+                }
                 Variable::HeadHome(values) => {
                     if head_home.replace(values[option]).is_some() {
                         return Err(Refusal::InvalidFact("duplicate head home domain".into()));
@@ -678,6 +694,8 @@ impl Contract {
             expert_homes,
             embedding,
             draft_home,
+            draft_traffic_bytes_per_cycle: self.variables.iter().zip(selected).try_fold(0u64, |sum,(variable,&option)|
+                sum.checked_add(variable.draft_traffic(option)).ok_or(Refusal::Overflow("drafter traffic per cycle")))?,
             head_home,
             intake_home,
             encoder,
@@ -705,6 +723,11 @@ impl Contract {
                 Variable::DraftHome(values) | Variable::HeadHome(values) | Variable::IntakeHome(values) => {
                     if values.iter().any(|&gpu| !covered(Location::coordinator(gpu))) {
                         return Err(Refusal::InvalidFact("owner home has no physical budget".into()));
+                    }
+                }
+                Variable::DraftHomeTraffic(values) => {
+                    if values.iter().any(|home| !covered(Location::coordinator(home.gpu))) {
+                        return Err(Refusal::InvalidFact("drafter home has no physical budget".into()));
                     }
                 }
                 Variable::ExpertHome { rank_sets, .. } => {
@@ -803,6 +826,13 @@ impl Contract {
                         return Err(Refusal::InvalidFact("invalid owner home domain".into()));
                     }
                     *seen = true;
+                }
+                Variable::DraftHomeTraffic(values) => {
+                    if draft_home || values.iter().enumerate().any(|(index,home)|
+                        usize::from(home.gpu)>=self.gpus || values[..index].iter().any(|old|old.gpu==home.gpu)) {
+                        return Err(Refusal::InvalidFact("invalid drafter traffic home domain".into()));
+                    }
+                    draft_home=true;
                 }
                 Variable::Encoder(values) => {
                     if encoder || values.iter().copied().ne(0..values.len()) {

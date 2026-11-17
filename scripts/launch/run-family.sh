@@ -1527,15 +1527,9 @@ if ((standalone_family)) && [[ -n "$wip_slot" ]]; then
     release_die "WIP slot $wip_slot has no '$serve' command; build the slot from a commit that serves $family"
 fi
 
-qwen_exl3=0
-qwen_nvfp4=0
-qwen_mtp=0
 if [[ "$family" == qwen4 ]]; then
   kv_cache="$(get KV_CACHE fp8)"
   case "$kv_cache" in bf16|fp8) ;; *) release_die "KV_CACHE must be bf16 or fp8" ;; esac
-  # NVFP4: a ModelOpt publication with 4-bit weight groups (nvidia/Qwen3.8-Flash-Next-NVFP4).
-  qwen_features="$(python3 -c 'import json,sys; c=json.load(open(sys.argv[1])); q=c.get("quantization_config", {}); m=q.get("quant_method", q.get("method")); g=q.get("config_groups", {}).values(); print(int(m == "exl3"), int(m == "modelopt" and any(x.get("weights", {}).get("num_bits") == 4 for x in g)), c.get("text_config", c).get("mtp_num_hidden_layers", 0))' "$root/snapshots/$revision/$selected_config")"
-  read -r qwen_exl3 qwen_nvfp4 qwen_mtp <<<"$qwen_features"
 fi
 # Docker options only the Spark expert workers take (their environment and mounts).
 spark_worker_env=""
@@ -1584,13 +1578,13 @@ fi
 # release card ran (examples/configs/*.config; scripts/tests/test_example_configs.py
 # keeps the two in step): GLM 5.3 DFlash2; GLM 5.3 Flash its measured best;
 # MiMo V2.6 Flash/Pro MOPD the bundled DFlash; DeepSeek V4 dSpark when the
-# checkpoint carries it; Qwen local EXL3/NVFP4 MTP3; otherwise off.
+# checkpoint carries it; Qwen checkpoint-native MTP3; otherwise off.
 #   dflash2  GLM 5.x / GLM 5.3 Flash: the DFlash2 checkpoint SPECULATOR_MODEL_ID
 #            (e.g. incoai/GLM-5.3-DFlash2, incoai/GLM-5.3-Flash-DFlash2);
 #            MiMo V2.6 Flash/Pro: the snapshot's own dflash/ drafter unless
 #            SPECULATOR_MODEL_ID names one (Pro needs SPARK_COUNT=6)
 #   mtp      MiMo V2 Flash, Qwen 3.8, Step-5 (opt-in): the checkpoint's native MTP layers,
-#            SPECULATOR_DEPTH drafts (qualified local Qwen default 3; otherwise 1)
+#            SPECULATOR_DEPTH drafts (Qwen default 3; otherwise 1)
 #   dspark   DeepSeek V4 (its own drafter); GLM 5.3 Flash: the dSpark
 #            checkpoint SPECULATOR_MODEL_ID (RedHatAI/GLM-5.3-Flash-speculator.dspark-preview)
 # Official Flash MOPD's bundled drafter defaults to single-copy FP8 (measured
@@ -1739,10 +1733,10 @@ fi
 tp2_dflash_default=off
 if [[ ( "$family" == mimo_v2 || "$family" == kimi_k3 || "$family" == glm5_flash || "$family" == muse_spark ) && ${#RELEASE_COORDINATOR_GPU_INDICES[@]} == 2 && "$split" != off && "$speculator" == dflash2 ]]; then
   tp2_dflash_default=on
-  [[ "$family" != glm5_flash ]] || tp2_dflash_default=auto
+  [[ "$family" != glm5_flash && "$family" != kimi_k3 ]] || tp2_dflash_default=auto
 fi
 tp2_dflash="$(get TP2_DFLASH "$tp2_dflash_default")"
-case "$tp2_dflash" in on|off) ;; auto) [[ "$family" == glm5_flash && -z "$(get TP2_DFLASH)" ]] || release_die "TP2_DFLASH must be on or off" ;; *) release_die "TP2_DFLASH must be on or off" ;; esac
+case "$tp2_dflash" in on|off) ;; auto) [[ ( "$family" == glm5_flash || "$family" == kimi_k3 ) && -z "$(get TP2_DFLASH)" ]] || release_die "TP2_DFLASH must be on or off" ;; *) release_die "TP2_DFLASH must be on or off" ;; esac
 [[ "$tp2_dflash" != on || ( ( "$family" == mimo_v2 || "$family" == kimi_k3 || "$family" == glm5_flash || "$family" == muse_spark ) && ${#RELEASE_COORDINATOR_GPU_INDICES[@]} == 2 && "$speculator" == dflash2 ) ]] ||
   release_die "TP2_DFLASH requires MiMo/Kimi/GLM Flash/Muse, two selected RTX GPUs and DFlash2"
 if [[ ( "$family" == mimo_v2 || "$family" == kimi_k3 || "$family" == glm5_flash || "$family" == muse_spark ) && "$tp2_dflash" != auto ]]; then
@@ -1809,7 +1803,6 @@ if [[ $family == mimo_v2 ]]; then
 fi
 mtp_depth=1
 [[ "$family" != step5 ]] || mtp_depth=3
-[[ ( $qwen_exl3 != 1 && $qwen_nvfp4 != 1 ) || $qwen_mtp != 1 ]] || mtp_depth=3
 case "$speculator" in
   off)
     [[ "$family" != step5 ]] || family_args+=(--mtp 0) ;;
@@ -1835,7 +1828,7 @@ case "$speculator" in
       draft_snapshot="$(snapshot_of "$drafter" "$draft_revision")" ||
         { [[ -z "$default_drafter" ]] || echo "download it (hf download $drafter) or set SPECULATOR=off" >&2; exit 1; }
       draft_args=(--draft "$draft_snapshot")
-      if [[ "$family" == muse_spark || "$family:$speculator" == kimi_k3:dspark ]]; then
+      if [[ "$family" == muse_spark || "$family" == kimi_k3 ]]; then
         muse_draft_kv="$(get DRAFT_KV_CACHE fp8)"
         [[ "$family" != kimi_k3 ]] || muse_draft_kv="$kimi_draft_kv"
         case "$muse_draft_kv" in bf16|fp8) ;; *) release_die "DRAFT_KV_CACHE must be bf16 or fp8" ;; esac
@@ -1847,7 +1840,7 @@ case "$speculator" in
       echo "SPECULATOR=$speculator needs SPECULATOR_MODEL_ID (a ${speculator/dflash2/DFlash2} checkpoint)" >&2; exit 2
     fi ;;
   mtp)
-    [[ "$family" == mimo_v2 ]] || family_args+=(--mtp "$(get SPECULATOR_DEPTH "$mtp_depth")") ;;
+    [[ "$family" == mimo_v2 || "$family" == qwen4 ]] || family_args+=(--mtp "$(get SPECULATOR_DEPTH "$mtp_depth")") ;;
 esac
 draft_model_args=${#draft_args[@]}
 draft_context_window="$(get DRAFT_CONTEXT_WINDOW 0)"
@@ -2421,7 +2414,7 @@ audio_encoder_hash=""
   fi
   if [[ "$family" == kimi_k3 && ( "$speculator" == dflash2 || "$speculator" == dspark ) ]]; then
     plan_draft_args+=(--drafter-snapshot "$draft_snapshot")
-    if [[ "$speculator" == dspark ]]; then plan_draft_args+=(--draft-kv-cache "$(get DRAFT_KV_CACHE "${kimi_draft_kv_default:-fp8}")"); fi
+    plan_draft_args+=(--draft-kv-cache "$(get DRAFT_KV_CACHE "${kimi_draft_kv_default:-fp8}")")
   fi
   if [[ "$family:$speculator" == muse_spark:dflash2 ]]; then
     plan_draft_args+=(--drafter-snapshot "$draft_snapshot")
@@ -2440,8 +2433,8 @@ audio_encoder_hash=""
     on) plan_draft_args+=(--expert-usage) ;;
     off) plan_draft_args+=(--expert-usage=false) ;;
   esac
-  if [[ "$family" == qwen4 ]]; then
-    plan_draft_args+=(--native-mtp-layers "$(get SPECULATOR_DEPTH "$mtp_depth")")
+  if [[ "$family" == qwen4 && -n "$(get SPECULATOR_DEPTH)" ]]; then
+    plan_draft_args+=(--native-mtp-layers "$(get SPECULATOR_DEPTH)")
   fi
   if [[ "$family" == qwen3_5 ]]; then
     plan_draft_args+=(--kv-cache "$dense_qwen_kv_cache" --prefill-rows 4096
@@ -2658,8 +2651,10 @@ audio_encoder_hash=""
   if [[ "$family:$speculator" == qwen4:auto ]]; then
     speculator="$(jq -er '.speculator | select(. == "mtp" or . == "off")' <<<"$deployment_json")" ||
       release_die "Qwen deployment does not name a resolved speculator"
-    [[ "$speculator" != mtp ]] || family_args+=(--mtp "$(get SPECULATOR_DEPTH "$mtp_depth")")
     echo "Qwen planner selected SPECULATOR=$speculator (admitted Spark expert world $spark_expert_world)"
+  fi
+  if [[ "$family:$speculator" == qwen4:mtp ]]; then
+    family_args+=(--mtp "$(jq -er '.resolved_settings.native_mtp_layers.value' <<<"$deployment_json")")
   fi
   coordinator_weight_budget_gib="$(jq -er '.resolved_settings.coordinator_weight_budget_gib.value' <<<"$deployment_json")"
   if [[ "$family" == kimi_k3 && ( "$speculator" == dflash2 || "$speculator" == dspark ) ]]; then
@@ -2687,10 +2682,10 @@ audio_encoder_hash=""
     esac
   fi
   plan_json="$(jq -c '.report' <<<"$deployment_json")"
-  if [[ "$family" == glm5_flash && "$tp2_dflash" == auto ]]; then
+  if [[ ( "$family" == glm5_flash || "$family" == kimi_k3 ) && "$tp2_dflash" == auto ]]; then
     tp2_dflash_bool="$(jq -er '.tp2_dflash | if . == true then "true" elif . == false then "false" else error("missing drafter choice") end' <<<"$plan_json")"
     family_args+=(--tp2-dflash "$tp2_dflash_bool")
-    echo "GLM Flash planner selected TP2_DFLASH=$tp2_dflash_bool"
+    echo "$family planner selected TP2_DFLASH=$tp2_dflash_bool"
   fi
   release_prefill_shape "$deployment_json" "$family"
   resolved_decode_lanes="$(jq -er '.decode_lanes | select(. == 1 or . == 2)' <<<"$deployment_json")" ||

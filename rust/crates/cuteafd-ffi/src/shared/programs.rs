@@ -1236,6 +1236,23 @@ impl NativeLibrary {
         Ok(())
     }
 
+    /// Row128 FP8 quantization with one or two identical stores per scale unit.
+    ///
+    /// # Safety
+    /// As [`Self::fp8_row_quant`], with scales [rows, cols / 128 * scale_repeat].
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn fp8_row_quant_repeat(&self, w: *const c_void, q: *mut c_void, scale: *mut c_void,
+        rows: usize, cols: usize, rule: i32, scale_repeat: usize, stream: *mut c_void) -> Result<()> {
+        anyhow::ensure!(matches!(scale_repeat, 1 | 2), "FP8 scale repetition must be one or two");
+        type Quant = unsafe extern "C" fn(*const c_void, *mut c_void, *mut c_void, i32, i32, i32, i32, *mut c_void) -> i32;
+        // SAFETY: the native symbol has this signature and the caller owns all spans.
+        let f = *unsafe { self.lib.get::<Quant>(b"cuteafd_fp8_row_quant_repeat") }?;
+        let status = unsafe { f(w, q, scale, i32::try_from(rows)?, i32::try_from(cols)?, rule,
+            i32::try_from(scale_repeat)?, stream) };
+        if status != 0 { return Err(crate::memory_ledger::capture_failure(anyhow::anyhow!("FP8 row quantization repeat failed with {status}"))); }
+        Ok(())
+    }
+
     /// Mean over the four mHC copies of `rows` stream rows [rows, 4, hidden]
     /// into columns `offset..offset + hidden` of `out` [rows, stride], BF16.
     ///

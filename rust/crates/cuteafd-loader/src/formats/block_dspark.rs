@@ -916,6 +916,23 @@ mod tests {
         assert_eq!(fp8.len(), bf16.len() + 5);
         let names = bf16.iter().map(|(name, _)| name).collect::<std::collections::BTreeSet<_>>();
         assert_eq!(names.len(), bf16.len(), "request names must be unique");
+        use crate::families::glm5::draft_representation::{draft_weight_role,DraftWeightRole};
+        let native=bf16.into_iter().collect::<std::collections::BTreeMap<_,_>>();
+        let packed=fp8.into_iter().collect::<std::collections::BTreeMap<_,_>>();
+        block_dspark_weight_recipe(&cfg,|name,_| {
+            assert_ne!(draft_weight_role(name),Some(DraftWeightRole::BodyLinear),"{name}");
+            assert_eq!(packed[name],native[name]);
+            assert!(!packed.contains_key(&format!("{name}.payload")));
+            Ok::<_,anyhow::Error>(())
+        },|parts,cols| {
+            for (name,_) in parts { assert_eq!(draft_weight_role(name),Some(DraftWeightRole::BodyLinear),"{name}"); }
+            let name=parts.iter().map(|(name,_)|*name).collect::<Vec<_>>().join("+");
+            let values=parts.iter().map(|(_,rows)|rows*cols).sum::<usize>();
+            assert_eq!(packed[&format!("{name}.payload")],values);
+            assert_eq!(packed[&format!("{name}.scales")],values/128*4);
+            assert!(!packed.contains_key(&name));
+            Ok(())
+        }).unwrap();
     }
     #[test]
     fn shared_window_runtime_has_exact_named_buffers_and_one_arena() -> anyhow::Result<()> {

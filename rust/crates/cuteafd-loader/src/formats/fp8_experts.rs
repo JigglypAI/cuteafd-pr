@@ -126,7 +126,8 @@ impl ExpertFormat {
         matches!(self, Self::Mxfp4 | Self::Nvfp4)
     }
 
-    /// Values per scale along K: 128 (FP8 blocks), 32 (MXFP4), 16 (NVFP4).
+    /// Header-validated native unit: 128 (FP8 blocks/BF16 storage),
+    /// 32 (MXFP4/MXFP8 scales), 16 (NVFP4 scales).
     pub fn group(self) -> usize {
         cuteafd_core::tp_units::native_format_unit(match self {
             Self::Fp8Block128 => "fp8", Self::Mxfp4 => "mxfp4", Self::Mxfp8 => "mxfp8",
@@ -170,6 +171,8 @@ pub struct Fp8ExpertTensors {
     compressed_nvfp4: bool,
     dynamic_nvfp4: bool,
     format: ExpertFormat,
+    /// Config-declared package identity, used only for exported storage policy.
+    package_family: Option<&'static str>,
     tensors: Arc<HashMap<String, Located>>,
     /// Physical row pitch of fused/interleaved checkpoint views; ordinary
     /// projection members are contiguous and absent from this map.
@@ -526,7 +529,8 @@ impl Fp8ExpertTensors {
             _ => Vec::new(),
         };
         let mut catalog = Self { reader: Default::default(), snapshot: snapshot.to_path_buf(), shape, prefix: prefix.to_string(), mtp_layers, compressed_nvfp4, dynamic_nvfp4: false,
-            format: ExpertFormat::Fp8Block128, tensors: Arc::new(tensors), source_pitches: Arc::new(source_pitches), activations,
+            format: ExpertFormat::Fp8Block128, package_family: crate::plan::family::detect(&checkpoint).map(|family| family.id()),
+            tensors: Arc::new(tensors), source_pitches: Arc::new(source_pitches), activations,
             slice_layer: first_selected_layer(shape, layers), coordinator: false };
         let first_layer = layers.and_then(|selected| selected.first().copied()).unwrap_or(shape.first_layer);
         let first = catalog.name(first_layer, 0, Fp8Projection::Gate);
@@ -620,8 +624,9 @@ impl Fp8ExpertTensors {
 
     fn exact_storage_policy(&self, tp: usize) -> Option<cuteafd_core::tp_units::NativeLayout> {
         if self.coordinator { return None; }
-        let geometry = self.shape.geometry().ok()?;
-        let family = geometry.family()?;
+        // No package tree is available while opening checkpoint headers. This
+        // registry selects shipped exact-storage worlds, never source units.
+        let family = self.package_family?;
         let format = match self.format {
             ExpertFormat::Bf16 => "bf16", ExpertFormat::Fp8Block128 => "fp8",
             ExpertFormat::Mxfp4 => "mxfp4", ExpertFormat::Mxfp8 => "mxfp8", ExpertFormat::Nvfp4 => "nvfp4",
@@ -632,9 +637,11 @@ impl Fp8ExpertTensors {
     }
 
     pub fn exact_slicing(&self, tp: usize) -> Slicing {
-        Slicing::Blocks(if self.coordinator { 128 } else {
-            self.exact_storage_policy(tp).map_or(self.block(), |policy| policy.ownership_unit(self.shape.intermediate, tp))
-        })
+        Slicing::Blocks(if self.coordinator { 128 } else if self.exact_storage_policy(tp).is_some() {
+            if self.format == ExpertFormat::Nvfp4 {
+                cuteafd_core::tp_units::nvfp4_ownership_unit(self.shape.intermediate, tp)
+            } else { self.format.group() }
+        } else { self.block() })
     }
 
     fn needs_nvfp4_padding(&self, tp: usize) -> bool {
@@ -824,8 +831,11 @@ impl Fp8ExpertTensors {
         let Slicing::Blocks(g) = slicing else { return self.rank_range(tp, rank) };
         ensure!(rank < tp, "rank {rank} of TP{tp}");
         let i = self.shape.intermediate;
-        let source_unit = self.exact_storage_policy(tp).map_or(self.block(), |policy| policy.unit_columns);
-        ensure!(g > 0 && g % source_unit == 0 && i % g == 0 && i / g >= tp,
+        let source_unit = self.format.group();
+        ensure!(g > 0 && g % source_unit == 0,
+            "{}: unsupported ownership unit {g} for {:?}: checkpoint source_unit={source_unit}; ownership must combine whole native scale/storage units (TP{tp} rank={rank} layer={})",
+            self.name(self.slice_layer, 0, Fp8Projection::Gate), self.format, self.slice_layer);
+        ensure!(i % g == 0 && i / g >= tp,
             "{}: intermediate {i} does not split into whole {g}-row blocks over {tp} ranks: source_unit={source_unit} rank={rank} layer={} format={:?}",
             self.name(self.slice_layer, 0, Fp8Projection::Gate), self.slice_layer, self.format);
         let rule = self.slice_rule(i / g, tp);
@@ -1414,11 +1424,126 @@ mod tests {
     }
 
     #[test]
+    fn unrecognized_mxfp8_native32_slices_cover_checkpoint_weights_and_scales() -> Result<()> {
+        use crate::plan::testing::{mxfp8, write_snapshot};
+        let root = tempfile::tempdir()?;
+        let shape = RoutedExpertShape { layers: 1, first_layer: 0, experts: 2, topk: 1,
+            hidden: 128, intermediate: 640, draft_stages: 0, draft_experts: 0 };
+        assert!(shape.geometry()?.family().is_none());
+        let mut headers = Vec::new();
+        for expert in 0..shape.experts {
+            for (projection, n, k) in [("gate", 640, 128), ("up", 640, 128), ("down", 128, 640)] {
+                headers.extend(mxfp8(&format!("model.layers.0.mlp.experts.{expert}.{projection}_proj"), n, k));
+            }
+        }
+        write_snapshot(root.path(), &serde_json::json!({"model_type":"unknown_mxfp8"}), &headers, None);
+        let mut tensors = Fp8ExpertTensors::read(root.path(), shape)?;
+        assert_eq!(tensors.format(), ExpertFormat::Mxfp8);
+        assert_eq!(tensors.package_family, None);
+        for located in tensors.tensors.values() {
+            let bytes = (0..located.bytes as usize).map(|i| ((i * 17 + i / 13 + 7) % 251) as u8).collect::<Vec<_>>();
+            std::fs::OpenOptions::new().write(true).open(root.path().join(&located.shard))?
+                .write_all_at(&bytes, located.offset)?;
+        }
+        let slicing = Slicing::Blocks(32);
+        for tp in [3, 4] {
+            for layer in [0, 1, 5] {
+                tensors.slice_layer = layer;
+                let mut coverage = vec![0; shape.intermediate];
+                for rank in 0..tp {
+                    let (first, width) = tensors.rank_range_with(tp, rank, slicing)?;
+                    assert_eq!(first % 32, 0);
+                    assert_eq!(width % 32, 0);
+                    for count in &mut coverage[first..first + width] { *count += 1; }
+                    let scale = tensors.projection_slices(Fp8Projection::Down, tp, rank, slicing)?[1];
+                    assert_eq!((scale.source_offset, scale.source_pitch, scale.width, scale.rows),
+                        (first / 32, shape.intermediate / 32, width / 32, shape.hidden));
+                    assert_eq!(scale.destination_pitch, (width / 32).div_ceil(4) * 4);
+                }
+                assert!(coverage.into_iter().all(|count| count == 1));
+                for expert in 0..shape.experts {
+                    for projection in Fp8Projection::ALL {
+                        let (w, s) = tensors.projection_bytes(projection);
+                        let mut source = [vec![0; w], vec![0; s]];
+                        let [weight, scale] = &mut source;
+                        tensors.read_projection_once(0, expert, projection, weight, scale)?;
+                        let mut reconstructed = [vec![0; w], vec![0; s]];
+                        for rank in 0..tp {
+                            let (w, s) = tensors.slice_bytes_with(projection, tp, rank, slicing)?;
+                            let mut actual = [vec![255; w], vec![255; s]];
+                            let [weight, scale] = &mut actual;
+                            tensors.read_slice_with(0, expert, projection, tp, rank, slicing,
+                                weight, scale, &mut Vec::new())?;
+                            for (index, window) in tensors.projection_slices(projection, tp, rank, slicing)?.into_iter().enumerate() {
+                                assert_eq!(actual[index].len(), window.destination_bytes);
+                                let mut expected = vec![0; window.destination_bytes];
+                                for row in 0..window.rows {
+                                    let src = window.source_offset + row * window.source_pitch;
+                                    let dst = row * window.destination_pitch;
+                                    expected[dst..dst + window.width].copy_from_slice(&source[index][src..src + window.width]);
+                                    reconstructed[index][src..src + window.width].copy_from_slice(&actual[index][dst..dst + window.width]);
+                                }
+                                assert_eq!(actual[index], expected);
+                            }
+                        }
+                        assert_eq!(reconstructed, source, "TP{tp} layer={layer} expert={expert} {projection:?}");
+                    }
+                }
+            }
+        }
+        // Data slicing does not claim a matching executable has been exported.
+        let error = crate::plan::experts::spark_recipe("inkling2:mxfp8", shape.intermediate, 4)
+            .unwrap_err().to_string();
+        assert!(error.contains("missing Spark package recipe: inkling2:mxfp8 TP4"), "{error}");
+        assert!(error.contains("package_fp8_moe_aot.py"), "{error}");
+        Ok(())
+    }
+
+    #[test]
+    fn exported_storage_policy_uses_checkpoint_config_not_geometry() -> Result<()> {
+        use crate::plan::testing::{mxfp8, write_snapshot};
+        let root = tempfile::tempdir()?;
+        let shape = RoutedExpertShape { layers: 1, first_layer: 0, experts: 2, topk: 1,
+            hidden: 128, intermediate: 640, draft_stages: 0, draft_experts: 0 };
+        let mut headers = Vec::new();
+        for (projection, n, k) in [("gate", 640, 128), ("up", 640, 128), ("down", 128, 640)] {
+            headers.extend(mxfp8(&format!("model.layers.0.mlp.experts.0.{projection}_proj"), n, k));
+        }
+        write_snapshot(root.path(), &crate::families::inkling2::config::tests::release_config(), &headers, None);
+        let tensors = Fp8ExpertTensors::read(root.path(), shape)?;
+        assert!(shape.geometry()?.family().is_none());
+        assert_eq!(tensors.package_family, Some("inkling2"));
+        assert_eq!(tensors.exact_slicing(4), Slicing::Blocks(32));
+        assert_eq!(tensors.exact_slicing(3), Slicing::Blocks(128));
+        // A recognized process geometry cannot manufacture an export identity.
+        let mut unknown = catalog(ExpertFormat::Mxfp8, 2304);
+        unknown.shape.hidden = 4608;
+        unknown.shape.experts = 384;
+        assert_eq!(unknown.shape.geometry()?.family(), Some("inkling2"));
+        assert!(unknown.exact_storage_policy(4).is_none());
+        assert_eq!(unknown.rank_range_with(4, 0, Slicing::Blocks(32))?, (0, 576));
+        Ok(())
+    }
+
+    #[test]
+    fn unsupported_ownership_unit_names_checkpoint_native_alignment() {
+        for (format, unit) in [(ExpertFormat::Mxfp8, 32), (ExpertFormat::Fp8Block128, 128)] {
+            let tensors = catalog(format, 640);
+            let error = tensors.rank_range_with(4, 0, Slicing::Blocks(16)).unwrap_err().to_string();
+            assert!(error.contains("unsupported ownership unit 16"), "{error}");
+            assert!(error.contains(&format!("checkpoint source_unit={unit}")), "{error}");
+            assert!(error.contains("TP4 rank=0 layer=0"), "{error}");
+            assert!(error.contains("model.layers.0.mlp.experts.0.gate_proj.weight"), "{error}");
+        }
+    }
+
+    #[test]
     fn exact_world_native_packages_store_four_unpadded_checkpoint_slices() -> Result<()> {
         for format in [ExpertFormat::Mxfp8, ExpertFormat::Nvfp4] {
             let mut tensors = catalog(format, 2304);
             tensors.shape.hidden = 4608;
             tensors.shape.experts = 384;
+            tensors.package_family = Some("inkling2");
             let unit = if format == ExpertFormat::Mxfp8 { 32 } else { 64 };
             assert_eq!(tensors.exact_slicing(4), Slicing::Blocks(unit));
             assert!(!tensors.needs_nvfp4_padding(4));
@@ -1537,7 +1662,7 @@ mod tests {
     fn catalog(format: ExpertFormat, intermediate: usize) -> Fp8ExpertTensors {
         let shape = RoutedExpertShape { layers: 78, first_layer: 3, experts: 256, topk: 8, hidden: 6144, intermediate,
             draft_stages: 0, draft_experts: 0 };
-        Fp8ExpertTensors { reader: Default::default(), snapshot: PathBuf::new(), shape, prefix: "model.".into(), mtp_layers: false, compressed_nvfp4: false, dynamic_nvfp4: false, format,
+        Fp8ExpertTensors { reader: Default::default(), snapshot: PathBuf::new(), shape, prefix: "model.".into(), mtp_layers: false, compressed_nvfp4: false, dynamic_nvfp4: false, format, package_family: None,
             tensors: Arc::new(HashMap::new()), source_pitches: Default::default(), activations: Vec::new(), slice_layer: 0, coordinator: false }
     }
 

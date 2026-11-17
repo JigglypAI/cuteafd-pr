@@ -670,7 +670,11 @@ fn planner_equals_runtime_deepseek_v4() {
                                 if placement.onboard_layers > 0 {
                                     assert_eq!(placement.expert_ranges[0].peak_bytes, 0);
                                     if onboard.is_none() || onboard == Some(OnboardSetting::Auto) {
-                                        assert_eq!(placement.pool_tokens, 2 << 20);
+                                        // An unbounded KV max grows the pool past the target
+                                        // into the memory the layout leaves; `assert_equal`
+                                        // already pins the exact plan/runtime extent.
+                                        assert!(placement.pool_tokens >= 2 << 20,
+                                            "automatic pool {} below the 2M target", placement.pool_tokens);
                                     }
                                 }
                             } else { assert!(placement.tp2.is_none()); }
@@ -871,7 +875,10 @@ fn planner_equals_runtime_deepseek_v4_measured() {
             }
             // The runtime's admission over the measured sample.
             let runtime = runtime_measured(&shared, &case, &fixture).unwrap_or_else(|e| panic!("{label}: runtime: {e:#}"));
-            assert_eq!(runtime.pool_tokens, fixture.pool_tokens, "{label}: fixture pool vs this build's runtime");
+            // The recorded sample predates unbounded growth (its pool is the old
+            // target); the memory-derived plan/runtime comparison below bounds it.
+            assert!(runtime.pool_tokens >= fixture.pool_tokens,
+                "{label}: runtime pool {} below the recorded {}", runtime.pool_tokens, fixture.pool_tokens);
             assert_eq!(runtime.onboard_layers, fixture.onboard_layers, "{label}: fixture layers vs this build's runtime");
             // The planner resolves the same layers and a pool within the baseline difference.
             let notes = runtime.expert_ranges.iter().enumerate().map(|(gpu, r)|
@@ -906,7 +913,8 @@ fn planner_equals_runtime_deepseek_v4_measured() {
                         "{label} {onboard:?}: pool {} planned vs {} measured",
                         layout.pool_tokens, runtime.pool_tokens);
                     if runtime.onboard_layers > 0 && (onboard.is_none() || onboard == Some(OnboardSetting::Auto)) {
-                        assert_eq!(runtime.pool_tokens, 2 << 20);
+                        assert!(runtime.pool_tokens >= 2 << 20,
+                            "automatic pool {} below the 2M target", runtime.pool_tokens);
                     }
                     if let Some(OnboardSetting::Layers(n)) = onboard {
                         assert_eq!(runtime.onboard_layers, n);

@@ -63,6 +63,16 @@ impl GlobalLayout {
         Ok(vec![entry])
     }
 
+    /// Ported from the final-tap packed-owner contract in #2398; replicate
+    /// score/norm only when the checkpoint requests a last-layer attn_res tap.
+    pub fn with_final_attn_res(mut self, cfg: &KimiK3Config, needed: bool) -> Result<Self> {
+        if needed && self.rank == 0 {
+            self.operands.insert("output.score", extent(&[cfg.hidden, 4])?);
+            self.operands.insert("output.norm", extent(&[cfg.hidden, 2])?);
+        }
+        Ok(self)
+    }
+
     pub fn pair(cfg: &KimiK3Config) -> Result<[Self; 2]> {
         ensure!(!cfg.tie_embeddings, "Kimi global weights require the checkpoint's untied head");
         let matrix = extent(&[cfg.vocab_size, cfg.hidden, 2])?;
@@ -338,6 +348,27 @@ fn extent(dimensions: &[usize]) -> Result<usize> {
 mod tests {
     use super::*;
     use crate::placement::FfnMode;
+
+    #[test]
+    fn final_layer_declared_attn_res_charges_rank_zero_score_norm_once() -> Result<()> {
+        let cfg = KimiK3Config::from_hf(&crate::plan::testing::kimi_k3_config())?;
+        for ranks in [1, 2] {
+            let globals = GlobalLayout::ranks_with_core(&cfg, &CoreInventory::default(), ranks)?;
+            let plain = globals[0].clone();
+            assert_eq!(plain.clone().with_final_attn_res(&cfg, false)?, plain);
+            let entry = plain.clone().with_final_attn_res(&cfg, true)?;
+            assert_eq!(entry.operands["output.score"], cfg.hidden * 4);
+            assert_eq!(entry.operands["output.norm"], cfg.hidden * 2);
+            assert_eq!(entry.clone().with_final_attn_res(&cfg, true)?, entry);
+            assert_eq!(entry.bytes()? - plain.bytes()?, if ranks == 1 { 0 } else { cfg.hidden * 6 });
+            let arena = coordinator_arena(0, &entry, &[])?;
+            assert_eq!(arena.view("global.output.score").unwrap().bytes(), cfg.hidden * 4);
+            assert_eq!(arena.view("global.output.norm").unwrap().bytes(), cfg.hidden * 2);
+            assert_eq!(arena.payload_bytes(), entry.bytes()?);
+            assert_eq!(entry.demand()?.bytes, entry.bytes()? as u64);
+        }
+        Ok(())
+    }
 
     #[test]
     fn physical_weight_requests_partition_exact_payloads_for_bf16_k6_and_native_attention() -> Result<()> {

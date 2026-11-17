@@ -35,6 +35,36 @@ def group(root, relative, limit, current, *, v1=False):
     (path / ('memory.usage_in_bytes' if v1 else 'memory.current')).write_text(str(current))
 
 
+@pytest.mark.parametrize('relative', ['', 'parent', 'parent/child'])
+def test_cgroup_v2_reclaims_inactive_file_at_each_ancestor(host_paths, relative):
+    mib = 1024**2
+    host_paths['meminfo'].write_text(f'MemAvailable: {16000 * 1024} kB\n')
+    host_paths['membership'].write_text('0::/parent/child\n')
+    root = host_paths['cgroup_root']
+    group(root, relative, 16384 * mib, 16000 * mib)
+    (root / relative / 'memory.stat').write_text(
+        f'anon {8000 * mib}\nfile {8000 * mib}\ninactive_file {6000 * mib}\n')
+    # Only 384 MiB appears unused, but 6000 MiB of inactive compile cache is
+    # reclaimable; a prepaid worker must not sit below its 1024 MiB floor.
+    assert memory.host_allocatable_memory(**host_paths) == 6384 * mib
+    host_paths['meminfo'].write_text('MemAvailable: 2048 kB\n')
+    assert memory.host_allocatable_memory(**host_paths) == 2 * mib
+
+
+@pytest.mark.parametrize('inactive,expected', [('10000', 1000), ('200', 900)])
+def test_cgroup_reclaim_clamps_working_set(host_paths, inactive, expected):
+    group(host_paths['cgroup_root'], '', 1000, 300)
+    (host_paths['cgroup_root'] / 'memory.stat').write_text(f'inactive_file {inactive}\n')
+    assert memory.host_allocatable_memory(**host_paths) == expected
+
+
+def test_malformed_reclaim_stat_fails_closed(host_paths):
+    group(host_paths['cgroup_root'], '', 1000, 300)
+    (host_paths['cgroup_root'] / 'memory.stat').write_text('inactive_file -1\n')
+    with pytest.raises(ValueError, match='cgroup'):
+        memory.host_allocatable_memory(**host_paths)
+
+
 def test_integrated_reclaims_cache_without_double_counting(host_paths):
     assert memory.cuda_allocatable_memory_info(device(True), **host_paths) == (
         8 * 1024**2, 16 * 1024**2, 'MemAvailable')

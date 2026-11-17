@@ -171,6 +171,9 @@ fn validate_v4_placement_inputs(root: &std::path::Path) -> anyhow::Result<()> {
             for rtx in [1, 2] {
                 let manifest = format!("{model}-{rtx}-{context}/PROGRAMS.json");
                 anyhow::ensure!(files.contains_key(&manifest), "missing required V4 manifest {manifest}");
+                let document: Value = serde_json::from_slice(&fs::read(root.join(&manifest))
+                    .with_context(|| format!("missing V4 manifest {manifest}"))?)?;
+                validate_v4_native_experts(&manifest, &document)?;
                 if model == "pro" {
                     for tp in [1, 2] {
                         for rows in cuteafd_core::EXL3_CAPACITIES {
@@ -188,6 +191,21 @@ fn validate_v4_placement_inputs(root: &std::path::Path) -> anyhow::Result<()> {
         let actual = format!("{:x}", Sha256::digest(fs::read(root.join(path))
             .with_context(|| format!("missing V4 placement input {path}"))?));
         anyhow::ensure!(expected.as_str() == Some(&actual), "V4 placement input checksum mismatch: {path}");
+    }
+    Ok(())
+}
+
+/// Spark worlds charge the native expert-wave segment programs from the case
+/// manifest, so a V4 publication whose export geometry omits `native_experts`
+/// leaves every live Spark plan refusing at admission.
+fn validate_v4_native_experts(manifest: &str, document: &Value) -> anyhow::Result<()> {
+    let programs = document["programs"].as_array()
+        .ok_or_else(|| anyhow::anyhow!("V4 manifest {manifest} has no program list"))?;
+    for family in ["dsv4f", "dsv4p"] {
+        let prefix = format!("native_experts_{family}_");
+        anyhow::ensure!(programs.iter().any(|program| program["name"].as_str()
+            .is_some_and(|name| name.starts_with(&prefix))),
+            "V4 manifest {manifest} is missing {prefix}* native expert programs; republish with the native_experts geometry");
     }
     Ok(())
 }
@@ -347,6 +365,24 @@ mod tests {
             fs::write(&metadata, invalid.to_string()).unwrap();
             assert!(format!("{:#}", validate_placement_inputs(&manifest).unwrap_err()).contains("invalid placement input path"));
         }
+    }
+
+    #[test]
+    fn live_v4_manifests_require_native_expert_segment_programs() {
+        let complete = json!({"programs": [
+            {"name": "native_experts_dsv4f_w512_segments"},
+            {"name": "native_experts_dsv4p_w1024_segments"},
+            {"name": "dsv4f_mhc_pre"}]});
+        validate_v4_native_experts("flash-1-131072/PROGRAMS.json", &complete).unwrap();
+        for missing in ["native_experts_dsv4f_w512_segments", "native_experts_dsv4p_w1024_segments"] {
+            let mut programs = complete["programs"].as_array().unwrap().clone();
+            programs.retain(|program| program["name"] != missing);
+            let document = json!({"programs": programs});
+            let error = validate_v4_native_experts("flash-1-131072/PROGRAMS.json", &document)
+                .unwrap_err().to_string();
+            assert!(error.contains("is missing native_experts_") && error.contains("republish"), "{error}");
+        }
+        assert!(validate_v4_native_experts("flash-1-131072/PROGRAMS.json", &json!({})).is_err());
     }
 
     #[test]
