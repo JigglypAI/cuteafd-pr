@@ -32,6 +32,38 @@ impl CoordinatorCard {
     }
 }
 
+/// Geometry and operator inputs, before the shared placement preparation resolves policy.
+#[derive(Debug, Clone, Copy)]
+pub struct PoolFacts<'a> {
+    pub card_bytes: &'a [u64],
+    pub context: super::planner::Context,
+    pub requested: Option<u64>,
+    pub target: Option<u64>,
+    pub unit_rows: u64,
+    /// Exclusive of private tails; an encoding limit, never a memory reservation.
+    pub encoding_limit: Option<u64>,
+}
+
+impl<'a> PoolFacts<'a> {
+    pub fn new(card_bytes: &'a [u64], context: impl Into<super::planner::Context>,
+        requested: Option<u64>, unit_rows: u64) -> Self {
+        Self { card_bytes, context: context.into(), requested, target: None,
+            unit_rows, encoding_limit: None }
+    }
+}
+
+/// The only policy resolution entry point for plan and runtime preparation.
+pub fn prepare_pool(facts: PoolFacts<'_>) -> PoolPolicy {
+    let mut pool = PoolPolicy::resolve(facts.card_bytes, facts.context.maximum,
+        facts.requested, facts.unit_rows).with_context(facts.context);
+    if let Some(target) = facts.target {
+        pool.target = target.max(facts.context.required());
+        pool.max = pool.requested.unwrap_or_else(|| MemoryPolicy::current().kv_max.unwrap_or(pool.target).max(pool.target));
+    }
+    pool.ceiling = facts.encoding_limit.unwrap_or(u64::MAX);
+    pool
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PoolPolicy {
     pub context: super::planner::Context,
@@ -62,6 +94,16 @@ impl PoolPolicy {
     /// are charged when it grows into the memory left after onboarding.
     pub fn maximum_tokens(&self) -> u64 {
         self.requested.unwrap_or(self.max.max(self.target))
+    }
+
+    /// Diagnostic capacity reports use the layout target or strict request,
+    /// never the planner's potentially much larger index domain.
+    pub fn capacity_policy(&self, concurrency: u32) -> cuteafd_core::serving_capacity::CapacityPolicy {
+        cuteafd_core::serving_capacity::CapacityPolicy {
+            concurrency, target_pool_tokens: self.target,
+            max_context_tokens: Some(self.compiled_context),
+            pool_tokens: Some(self.requested.unwrap_or(self.target)), ..Default::default()
+        }
     }
 
     /// `card_bytes` are the coordinator GPUs' totals; `context` the compiled
