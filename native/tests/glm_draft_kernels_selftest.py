@@ -186,7 +186,8 @@ def topk_width_check(lib, stream):
     assert workspace_fn(0, 32) == workspace_fn(1, 17) == 0
     torch.manual_seed(326)
     for top_k in (16, 32):
-        for vocab in (32, 33, 163840, 202048, 1000000):
+        for vocab in ((16, 17, 32, 33, 154880, 163840, 202048, 1000000) if top_k == 16
+                      else (32, 33, 154880, 163840, 202048, 1000000)):
             sequences, block, drafts = 2, 5, 4
             logits = torch.randint(-128, 129, (sequences, block, vocab), device="cuda").float() / 16
             logits[..., -1] = 32

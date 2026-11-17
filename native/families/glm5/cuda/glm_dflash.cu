@@ -251,7 +251,8 @@ __global__ void topk_partial_small_kernel(const float* logits, float* values, in
       indices[(uint64_t(n) * kTopChunks + chunk) * kTopK + k] = bi;
     }
     const int owner = bi - first;
-    if (owner >= 0 && owner % kTopThreads == int(threadIdx.x)) local[owner / kTopThreads] = -CUDART_INF_F;
+    if (bi != INT32_MAX && owner >= 0 && owner % kTopThreads == int(threadIdx.x))
+      local[owner / kTopThreads] = -CUDART_INF_F;
   }
 }
 
