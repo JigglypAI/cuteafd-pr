@@ -1156,21 +1156,6 @@ fn installed_example_deployments_publish_executable_prefill_shapes() {
 }
 
 #[test]
-fn inkling_family_baseline_diagnostic() {
-    use cuteafd_loader::plan::{family, Checkpoint};
-    let hf_home=std::path::PathBuf::from(std::env::var_os("CUTEAFD_DEPLOYMENT_TEST_HF_HOME").expect("explicit HF home"));
-    for (model,revision) in [
-        ("thinkingmachines/Inkling-2-Small","aac974122acd33ddb0d3e1f54433a9c5dd2249ce"),
-        ("thinkingmachines/Inkling-2-Small-MXFP8","3febc62259ee92ea36e2fb6e8303371c4eb3922c"),
-        ("wrldsuksgo2mars/Inkling-2-Small-EXL3-K4-MC","6caa0ba08eb564ddc88b98df06ac73e853cc559e")] {
-        let snapshot=installed_example_snapshot(model,Some(revision),&hf_home).expect("Inkling snapshot");
-        let checkpoint=Checkpoint { view:None,config:serde_json::from_slice(&std::fs::read(snapshot.join("config.json")).unwrap()).unwrap(),snapshot,
-            quantize_config:None,weight_map:Default::default(),tensors:vec![],missing_shards:vec![],shard_bytes:0 };
-        eprintln!("verified Inkling baseline {model}@{revision}: {}",family::detect(&checkpoint).unwrap().id());
-    }
-}
-
-#[test]
 fn installed_release_and_example_families_match_dev_d6aecfcb7() {
     use cuteafd_loader::plan::{family, Checkpoint};
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
@@ -1181,7 +1166,8 @@ fn installed_release_and_example_families_match_dev_d6aecfcb7() {
         &std::fs::read(root.join("benchmarks/current-matrix.json")).unwrap()).unwrap();
     let retired = retired_configs(&matrix);
     // Original detector baseline, extended with verified published MC configurations
-    // and deliberate pinned qualifications. Keep old MC revisions until their
+    // and deliberate pinned qualifications, including all three live Inkling
+    // formats verified from installed configs. Keep old MC revisions until their
     // historical live matrix cards are replaced by repaired #2207 revisions.
     let baseline: serde_json::Value = serde_json::from_str(include_str!(
         "fixtures/family-detection-devd6aecfcb7.json")).unwrap();
@@ -1241,8 +1227,8 @@ fn installed_release_and_example_families_match_dev_d6aecfcb7() {
         (expected_absent.0.to_owned(), expected_absent.1.to_owned())]));
     assert_eq!(installed.iter().map(|(model, revision)| (model.as_str(), revision.as_str()))
         .collect::<std::collections::BTreeSet<_>>(), expected_installed);
-    assert_eq!(tested, 35, "installed checkpoint revision set changed (including three repaired MC revisions)");
-    eprintln!("family detection baseline d6aecfcb7 plus deliberate MiniMax (#2081), Muse MC, Kimi K3.1 MC and repaired MC entries: {tested} installed checkpoint revisions verified");
+    assert_eq!(tested, 38, "installed checkpoint revision set changed (including repaired MC and three live Inkling revisions)");
+    eprintln!("family detection baseline d6aecfcb7 plus deliberate MiniMax (#2081), Muse MC, Kimi K3.1 MC, repaired MC and three live Inkling entries: {tested} installed checkpoint revisions verified");
 }
 
 fn retired_configs(matrix: &serde_json::Value) -> std::collections::BTreeSet<String> {

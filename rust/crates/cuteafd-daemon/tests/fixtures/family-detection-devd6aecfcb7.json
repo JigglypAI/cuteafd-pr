@@ -72,6 +72,16 @@
       "family": "step5"
     },
     {
+      "model": "thinkingmachines/Inkling-2-Small",
+      "revision": "aac974122acd33ddb0d3e1f54433a9c5dd2249ce",
+      "family": "inkling2"
+    },
+    {
+      "model": "thinkingmachines/Inkling-2-Small-MXFP8",
+      "revision": "3febc62259ee92ea36e2fb6e8303371c4eb3922c",
+      "family": "inkling2"
+    },
+    {
       "model": "wrldsuksgo2mars/DeepSeek-V4-Pro-0813-EXL3-K2-calibrated-v1",
       "revision": "7a63f24905223aff19212d65226be708950823ac",
       "family": "deepseek_v4"
@@ -84,6 +94,11 @@
     {
       "model": "wrldsuksgo2mars/GLM-5.3-EXL3-K4-Core-K6",
       "revision": "5a4e83a09a11f3145332ed632d28a9894ea88225",
+      "family": "glm5"
+    },
+    {
+      "model": "wrldsuksgo2mars/GLM-5.3-EXL3-K4-MC",
+      "revision": "2e42b53e61f0f59f664c915fe2424ce9c9fa5f8e",
       "family": "glm5"
     },
     {
@@ -108,8 +123,18 @@
     },
     {
       "model": "wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K4-MC",
+      "revision": "558931fe149f59b49d19b2376a692bd7a12fb8b7",
+      "family": "glm5_flash"
+    },
+    {
+      "model": "wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K4-MC",
       "revision": "91a8dbc9c12e790c65aa1a38c6aede6a3e23a77d",
       "family": "glm5_flash"
+    },
+    {
+      "model": "wrldsuksgo2mars/Inkling-2-Small-EXL3-K4-MC",
+      "revision": "6caa0ba08eb564ddc88b98df06ac73e853cc559e",
+      "family": "inkling2"
     },
     {
       "model": "wrldsuksgo2mars/Kimi-K3-EXL3-K2",
@@ -157,24 +182,14 @@
       "family": "step5"
     },
     {
-      "model": "zai-org/GLM-5.3-Flash",
-      "revision": "eb9eb208eb0d988989d07a6a12d0fdeb5f52574a",
-      "family": "glm5_flash"
-    },
-    {
-      "model": "wrldsuksgo2mars/GLM-5.3-EXL3-K4-MC",
-      "revision": "2e42b53e61f0f59f664c915fe2424ce9c9fa5f8e",
-      "family": "glm5"
-    },
-    {
-      "model": "wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K4-MC",
-      "revision": "558931fe149f59b49d19b2376a692bd7a12fb8b7",
-      "family": "glm5_flash"
-    },
-    {
       "model": "wrldsuksgo2mars/Step-5-Preview-EXL3-K4-MC",
       "revision": "aedda90d25bd02bb6520bcaf88e06e6c9bc932c4",
       "family": "step5"
+    },
+    {
+      "model": "zai-org/GLM-5.3-Flash",
+      "revision": "eb9eb208eb0d988989d07a6a12d0fdeb5f52574a",
+      "family": "glm5_flash"
     }
   ],
   "not_installed": [
