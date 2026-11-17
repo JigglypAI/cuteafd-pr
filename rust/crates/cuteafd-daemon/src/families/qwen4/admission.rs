@@ -1032,7 +1032,7 @@ mod tests {
         experts: Some(qwen4::QwenExperts::read(&catalog, &lib, 4, 2, args.prefill_rows.max(64) as u64)?), blas_head: crate::shared::target_head::TargetHead::configured().blas_head(!args.mtp_fp8_head),
         resident_weight_limit: None, context: cuteafd_loader::placement::planner::Context::pinned(131_072), owner_manifests: manifests.each_ref().map(Some), admission,
                 gpus: [0, 1].map(|rank| GpuBudget { capacity_bytes: capacities[rank],
-                    reserve_bytes: 3 << 30, baseline: Baseline::Measured { free_bytes: capacities[rank]
+                    reserve_bytes: cuteafd_loader::placement::reserve::gpu("qwen4"), baseline: Baseline::Measured { free_bytes: capacities[rank]
                         - layout.devices[rank].items.iter().filter(|item| item.group == "context+modules")
                             .map(|item| item.bytes).sum::<u64>() } }),
                 arenas: &weights.arenas, layer_experts: &experts.costs,
@@ -1112,9 +1112,14 @@ mod tests {
                 assert!(device.items.iter().any(|i| i.group == "weight arena" && i.bytes > 0));
                 let baseline = device.items.iter().filter(|item| item.group == "context+modules")
                     .map(|item| item.bytes).sum::<u64>();
+                // The fixture has no manifest, so the planner's prefill rows are
+                // its default; hand the runtime exactly the plan's shape so both
+                // price the same workspaces.
+                let prefill_rows = report.prefill_span_rows.unwrap_or(4096).to_string();
                 let mut args = Cli::try_parse_from(["serve", "--snapshot", snapshot.path().to_str().unwrap(),
                     "--native-lib", "/nonexistent/lib.so", "--max-context-tokens", &context.to_string(),
-                    "--slots", &concurrency.to_string(),
+                    "--slots", &concurrency.to_string(), "--prefill-rows", &prefill_rows,
+                    "--prefill-waves", "1",
                     "--pool-tokens", &pool.unwrap_or(0).to_string(), "--kv-cache", &kv_format.to_string()])?.engine;
                 args.planner_prefix_bytes = Some(0);
                 let inputs = super::inputs(&args, &cfg, cfg.layers, false, None, None, 0)?;
@@ -1131,7 +1136,12 @@ mod tests {
                     context: cuteafd_loader::placement::planner::Context::pinned(context), admission: inputs,
                     capacity_bytes: capacity, baseline: Baseline::Measured { free_bytes: capacity - baseline },
                     pending_code_bytes: 0, max_context: context, requested_pool: pool, spark_ranks: 0,
-                    host: qwen4::QwenHost::ample(&cfg, 1, 4096)?, encoders: Default::default() };
+                    // The production host builder: the planner's pinned upload
+                    // owners (and their mapped-buffer page tables) must match.
+                    host: super::host_owners_with_memory(&args, &cfg, cfg.layers, false, 1, 0, false,
+                        None, 0, Vec::new(),
+                        cuteafd_loader::plan::testing::SimulatedHost::raptor().host_ram)?,
+                    encoders: Default::default() };
                 // The graph reserve is one owner at the resolved capture shape,
                 // charged once before KV sizing.
                 let (placement, solved) = qwen4::admitted(&planned)?;

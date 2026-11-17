@@ -359,46 +359,49 @@ fn planner_equals_runtime_prefix_marks_with_host_and_replicated_heads() {
 /// buffers are charged on both GPUs while the C4 records halve.
 #[test]
 fn planner_equals_runtime_deepseek_v4_fixture_context() {
-    use cuteafd_loader::placement::{AttentionPlacement, LayerMode};
-    let dir = tempfile::tempdir().unwrap();
-    let manifest = synthetic_context(dir.path());
-    let shared = Shared::open(dir.path()).unwrap();
-    let case = |attention| Case { snapshot: dir.path(), manifest: &manifest, rtx: 2, sparks: 2, context: 1_048_576,
-        budget: 24 << 30, onboard: None, dspark: false, tp2_draft: false, exchange_f32: false, peer_budget: None, physical_sms: None, attention };
-    let heads = assert_equal(&shared, &case(Some(AttentionPlacement::Heads)), "context fixture heads");
-    let auto = assert_equal(&shared, &case(None), "context fixture auto");
-    let context = assert_equal(&shared, &case(Some(AttentionPlacement::Context)), "context fixture context");
-    assert_eq!(auto, context, "auto is context where the build carries the programs");
-    assert_ne!(auto, heads);
-    assert_eq!(context.attention_placement, AttentionPlacement::Context);
-    let cfg = cuteafd_loader::families::deepseek_v4::DeepseekV4Config::read(dir.path(), 1).unwrap();
-    for (layer, (a, &ratio)) in context.layers.iter().zip(&cfg.compress_ratios).enumerate() {
-        assert_eq!(a.mode, if ratio == 4 { LayerMode::ContextSplit } else { LayerMode::HeadSplit }, "layer {layer}");
-    }
-    assert!(super::check_modes(&context, true, &cfg).unwrap());
-    assert!(!super::check_modes(&heads, true, &cfg).unwrap());
-    let bytes = |p: &Placement, gpu: usize, group: &str| p.items[gpu].iter().filter(|i| i.group == group)
-        .map(|i| i.bytes).sum::<u64>();
-    for gpu in 0..2 {
-        for group in ["context staging", "context exchange", "context workspace"] {
-            assert!(bytes(&context, gpu, group) > 0 && bytes(&heads, gpu, group) == 0, "rtx{gpu} {group}");
+    // The C4 split halves only the records; keep a common pool to price it.
+    let _guard = cuteafd_core::memory_policy::MemoryPolicy { kv_max: Some(2 << 20), ..Default::default() }.scoped(|| {
+        use cuteafd_loader::placement::{AttentionPlacement, LayerMode};
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = synthetic_context(dir.path());
+        let shared = Shared::open(dir.path()).unwrap();
+        let case = |attention| Case { snapshot: dir.path(), manifest: &manifest, rtx: 2, sparks: 2, context: 1_048_576,
+            budget: 24 << 30, onboard: None, dspark: false, tp2_draft: false, exchange_f32: false, peer_budget: None, physical_sms: None, attention };
+        let heads = assert_equal(&shared, &case(Some(AttentionPlacement::Heads)), "context fixture heads");
+        let auto = assert_equal(&shared, &case(None), "context fixture auto");
+        let context = assert_equal(&shared, &case(Some(AttentionPlacement::Context)), "context fixture context");
+        assert_eq!(auto, context, "auto is context where the build carries the programs");
+        assert_ne!(auto, heads);
+        assert_eq!(context.attention_placement, AttentionPlacement::Context);
+        let cfg = cuteafd_loader::families::deepseek_v4::DeepseekV4Config::read(dir.path(), 1).unwrap();
+        for (layer, (a, &ratio)) in context.layers.iter().zip(&cfg.compress_ratios).enumerate() {
+            assert_eq!(a.mode, if ratio == 4 { LayerMode::ContextSplit } else { LayerMode::HeadSplit }, "layer {layer}");
         }
-        // C4 records and indices halve, retaining one scratch unit per layer;
-        // all other views stay whole. The single arena rounds only once per GPU.
-        assert_eq!(heads.pool_tokens, context.pool_tokens, "rtx{gpu}: attention placement keeps the pool");
-        let units = heads.pool_tokens / 256;
-        let delta = bytes(&heads, gpu, "KV arena").abs_diff(bytes(&context, gpu, "KV arena"));
-        let exact = 45_888 * units - 2 * 45_888;
-        let rounding = cuteafd_loader::placement::planner::SM120_ALLOCATION_GRANULARITY_BYTES;
-        assert!(delta.abs_diff(exact) < rounding,
-            "rtx{gpu} C4 records halve: {delta} vs {exact} ± {rounding}");
-    }
-    // A build without the programs refuses both auto and explicit context.
-    let plain = synthetic(&dir.path().join("plain").tap_dir());
-    let mut refused = case(Some(AttentionPlacement::Context));
-    refused.manifest = &plain;
-    let (layout, _, _) = planned(&shared, &refused);
-    assert!(runtime(&shared, &refused, &layout).is_err(), "explicit context without its programs");
+        assert!(super::check_modes(&context, true, &cfg).unwrap());
+        assert!(!super::check_modes(&heads, true, &cfg).unwrap());
+        let bytes = |p: &Placement, gpu: usize, group: &str| p.items[gpu].iter().filter(|i| i.group == group)
+            .map(|i| i.bytes).sum::<u64>();
+        for gpu in 0..2 {
+            for group in ["context staging", "context exchange", "context workspace"] {
+                assert!(bytes(&context, gpu, group) > 0 && bytes(&heads, gpu, group) == 0, "rtx{gpu} {group}");
+            }
+            // C4 records and indices halve, retaining one scratch unit per layer;
+            // all other views stay whole. The single arena rounds only once per GPU.
+            assert_eq!(heads.pool_tokens, context.pool_tokens, "rtx{gpu}: attention placement keeps the pool");
+            let units = heads.pool_tokens / 256;
+            let delta = bytes(&heads, gpu, "KV arena").abs_diff(bytes(&context, gpu, "KV arena"));
+            let exact = 45_888 * units - 2 * 45_888;
+            let rounding = cuteafd_loader::placement::planner::SM120_ALLOCATION_GRANULARITY_BYTES;
+            assert!(delta.abs_diff(exact) < rounding,
+                "rtx{gpu} C4 records halve: {delta} vs {exact} ± {rounding}");
+        }
+        // A build without the programs refuses both auto and explicit context.
+        let plain = synthetic(&dir.path().join("plain").tap_dir());
+        let mut refused = case(Some(AttentionPlacement::Context));
+        refused.manifest = &plain;
+        let (layout, _, _) = planned(&shared, &refused);
+        assert!(runtime(&shared, &refused, &layout).is_err(), "explicit context without its programs");
+    });
 }
 
 #[test]
@@ -434,33 +437,35 @@ impl TapDir for PathBuf {
 /// GPUs, both extents, automatic and fixed onboard.
 #[test]
 fn planner_equals_runtime_deepseek_v4_fixture() {
-    let dir = tempfile::tempdir().unwrap();
-    let manifest = synthetic_context(dir.path());
-    let shared = Shared::open(dir.path()).unwrap();
-    for (rtx, budget) in [(1, 24u64 << 30), (2, 24 << 30)] {
-        for context in [131_072, 1_048_576] {
-            for onboard in [None, Some(OnboardSetting::Auto), Some(OnboardSetting::Layers(2)),
-                Some(OnboardSetting::Layers(0)), Some(OnboardSetting::All)] {
-                let case = Case { snapshot: dir.path(), manifest: &manifest, rtx, sparks: 2, context, budget,
-                    onboard, dspark: false, tp2_draft: false, exchange_f32: false, peer_budget: None, physical_sms: None, attention: None };
-                let placement = assert_equal(&shared, &case, &format!("fixture rtx{rtx} {context} {onboard:?}"));
-                // The default: pool first for Flash on one or two RTX (`default_onboard`).
-                let routed = shared.catalog(false).unwrap().routed_experts().routed_layers();
-                let effective = onboard.map(|setting| setting.resolve(routed))
-                    .unwrap_or_else(cuteafd_loader::placement::families::deepseek_v4::default_onboard);
-                match effective {
-                    Onboard::Auto => assert_eq!(placement.pool_tokens, 1 << 20, "24 GiB cards target 1M"),
-                    Onboard::Layers(n) => {
-                        assert_eq!(placement.onboard_layers, n);
-                        assert!(placement.pool_tokens >= 1 << 20, "a fixed onboard fills the pool past the target");
+    let _guard = cuteafd_core::memory_policy::MemoryPolicy { kv_max: Some(2 << 20), ..Default::default() }.scoped(|| {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = synthetic_context(dir.path());
+        let shared = Shared::open(dir.path()).unwrap();
+        for (rtx, budget) in [(1, 24u64 << 30), (2, 24 << 30)] {
+            for context in [131_072, 1_048_576] {
+                for onboard in [None, Some(OnboardSetting::Auto), Some(OnboardSetting::Layers(2)),
+                    Some(OnboardSetting::Layers(0)), Some(OnboardSetting::All)] {
+                    let case = Case { snapshot: dir.path(), manifest: &manifest, rtx, sparks: 2, context, budget,
+                        onboard, dspark: false, tp2_draft: false, exchange_f32: false, peer_budget: None, physical_sms: None, attention: None };
+                    let placement = assert_equal(&shared, &case, &format!("fixture rtx{rtx} {context} {onboard:?}"));
+                    // The default: pool first for Flash on one or two RTX (`default_onboard`).
+                    let routed = shared.catalog(false).unwrap().routed_experts().routed_layers();
+                    let effective = onboard.map(|setting| setting.resolve(routed))
+                        .unwrap_or_else(cuteafd_loader::placement::families::deepseek_v4::default_onboard);
+                    match effective {
+                        Onboard::Auto => assert_eq!(placement.pool_tokens, 2 << 20, "the uniform 2M target fits these cards"),
+                        Onboard::Layers(n) => {
+                            assert_eq!(placement.onboard_layers, n);
+                            assert!(placement.pool_tokens >= 2 << 20, "a fixed onboard fills the pool past the target");
+                        }
                     }
-                }
-                if onboard == Some(OnboardSetting::All) {
-                    assert_eq!(placement.onboard_layers, routed, "all pins every routed layer");
+                    if onboard == Some(OnboardSetting::All) {
+                        assert_eq!(placement.onboard_layers, routed, "all pins every routed layer");
+                    }
                 }
             }
         }
-    }
+    });
 }
 
 #[test]

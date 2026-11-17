@@ -231,11 +231,14 @@ impl<'a> QwenSingle<'a> {
         let requested = inputs.requested_pool;
         let cards = [inputs.capacity_bytes];
         let mut facts = PoolFacts::new(inputs.context, requested, page);
-        let a = &inputs.admission;
-        let geometry = crate::serving_capacity::qwen_cache_geometry(a.cfg, a.layers, a.mtp, a.kv_format)
-            .map_err(|error| Refusal::InvalidFact(format!("Qwen cache geometry: {error}")))?;
+        // The pool unit's real admitted cost: records plus the page map and
+        // metadata, exactly the per-token charge the contract prices. A model
+        // with no full-attention records still pays its page tables, so this
+        // slope is never zero and always yields a finite pool domain.
+        let unit_bytes = admission.per_token.checked_mul(page)
+            .ok_or(Refusal::Overflow("Qwen pool unit"))?;
         facts.memory = cards.iter().map(|&available_bytes| PoolMemory { available_bytes,
-            bytes_per_unit: geometry.ranks[0].persistent_unit_bytes }).collect();
+            bytes_per_unit: unit_bytes }).collect();
         facts.target = inputs.target_pool;
         let pool = prepare_pool(facts).map_err(|error| Refusal::InvalidFact(error.to_string()))?;
         let context = pool.compiled_context();
@@ -933,7 +936,21 @@ impl<'a> QwenDual<'a> {
                 .ok_or_else(|| Refusal::InvalidFact("Qwen MTP records shrink".into()))?)
                 .ok_or(Refusal::Overflow("Qwen per-rank records"))?;
         }
-        facts.memory = cards.iter().zip(records).map(|(&available_bytes, bytes_per_unit)|
+        // Each rank also owns its pool page map and metadata for the whole
+        // pool, so a model with no full-attention records still pays a
+        // nonzero slope and keeps a finite domain. Mirrors `prepare`.
+        let complete = compute(a.layers, a.mtp)?.ranks[0];
+        let tables = (1 + QWEN_DECODE_ROWS as u64) * 5 * 4;
+        let mut slopes = [0u64; 2];
+        for (gpu, slope) in slopes.iter_mut().enumerate() {
+            let overhead = tables.checked_add(if gpu == 0 { complete.pool_metadata_unit_bytes } else { 0 })
+                .ok_or(Refusal::Overflow("Qwen pool metadata"))?;
+            let overhead = overhead.div_ceil(page).checked_mul(page)
+                .ok_or(Refusal::Overflow("Qwen pool page map"))?;
+            *slope = records[gpu].checked_add(overhead)
+                .ok_or(Refusal::Overflow("Qwen per-rank pool unit"))?;
+        }
+        facts.memory = cards.iter().zip(slopes).map(|(&available_bytes, bytes_per_unit)|
             PoolMemory { available_bytes, bytes_per_unit }).collect();
         facts.target = inputs.target_pool;
         let policy = prepare_pool(facts).map_err(|error| Refusal::InvalidFact(error.to_string()))?;
