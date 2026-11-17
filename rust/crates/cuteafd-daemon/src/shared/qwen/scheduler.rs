@@ -1645,7 +1645,7 @@ async fn decode_round<'a, B: Backend<'a>>(lease: LaneLease<'_>, engine: &B, geom
 
 fn media_failure(error: cuteafd_engine::media::MediaError) -> cuteafd_api::openai::NativeFailure {
     match error {
-        cuteafd_engine::media::MediaError::Encoder(_) => cuteafd_api::openai::NativeFailure::Unavailable("vision encoder unavailable".into()),
+        cuteafd_engine::media::MediaError::Encoder(reason) => cuteafd_api::openai::NativeFailure::Unavailable(format!("vision encoder unavailable: {reason}")),
         error @ (cuteafd_engine::media::MediaError::CacheFull { .. } | cuteafd_engine::media::MediaError::QueueFull) =>
             cuteafd_api::openai::NativeFailure::Unavailable(error.to_string()),
         error => cuteafd_api::openai::NativeFailure::BadRequest(error.to_string()),
@@ -1909,9 +1909,9 @@ mod media_failure_tests {
         assert!(matches!(super::media_failure(MediaError::QueueFull), cuteafd_api::openai::NativeFailure::Unavailable(_)));
     }
     #[test]
-    fn encoder_failure_does_not_expose_internal_error() {
+    fn encoder_failure_retains_the_precise_reason() {
         assert!(matches!(super::media_failure(cuteafd_engine::media::MediaError::Encoder("socket died".into())),
-            cuteafd_api::openai::NativeFailure::Unavailable(message) if message == "vision encoder unavailable"));
+            cuteafd_api::openai::NativeFailure::Unavailable(message) if message == "vision encoder unavailable: socket died"));
     }
 }
 
