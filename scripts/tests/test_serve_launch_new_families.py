@@ -293,7 +293,7 @@ def test_kimi_unset_spark_budget_leaves_serve_on_the_family_default(tmp_path: Pa
     ("SPECULATOR=mtp\n", "SPECULATOR=mtp does not apply to kimi_k3"),
     ("ATTENTION_PLACEMENT=invalid\n", "ATTENTION_PLACEMENT must be auto, context, layers or heads"),
     
-    ("AUDIO=spark\n", "explicit media placement requires a supported bundled vision/audio checkpoint"),
+    ("AUDIO=spark\n", "kimi_k3 has no bundled audio execution owner"),
     ("EMBEDDING=host\n", "GPU token embeddings only"),
     ("RTX_EXPERT_LAYERS=max\n", "RTX_EXPERT_LAYERS must be auto, all or N"),
     ("RTX_EXPERT_LAYERS=50%\n", "RTX_EXPERT_LAYERS must be auto, all or N"),
@@ -489,7 +489,7 @@ STEP5 = {"model_type": "step5_vl", "vision_config": {"depth": 2},
          "text_config": {"model_type": "step5", "num_hidden_layers": 92, "moe_layer_list": list(range(3, 91))}}
 STEP5_FP8 = "stepfun-ai/Step-5-Preview"
 STEP5_NVFP4 = "stepfun-ai/Step-5-Preview-NVFP4"
-STEP5_PLANNED = {"placement_supported": True, "fits": True, "spark_budget_bytes": 100 << 30}
+STEP5_PLANNED = {"placement_supported": True, "fits": True, "spark_budget_bytes": 100 << 30, "encoder": None, "encoder_plan_hash": "ab" * 32}
 
 
 def _hosts(count: int) -> str:
@@ -513,7 +513,7 @@ def test_step5_dispatches_to_serve_step5(tmp_path: Path, model: str, gpus: int, 
     assert _flag(serve, "--prefix-cache-entries") == "20"
     assert ((_flag(serve, "--device"), _flag(serve, "--split-device")) == ("0", "1")) == (gpus == 2)
     assert _flag(serve, "--max-context-tokens") == "auto"
-    for absent in ("--pool-tokens", "--rtx-expert-layers", "--vision", "--audio",
+    for absent in ("--pool-tokens", "--rtx-expert-layers",
                    "--draft", "--draft-fp8", "--dspark", "--local-experts"):
         assert absent not in serve.split(), absent
     workers = [line for line in result.stderr.splitlines() if "cuteafd expertd-native" in line]
@@ -522,7 +522,7 @@ def test_step5_dispatches_to_serve_step5(tmp_path: Path, model: str, gpus: int, 
     assert "--spark-memory-cap" not in plan.split()
     assert all(f"--device-budget-bytes {100 << 30} " in worker for worker in workers)
     assert _flag(plan, "--spark-ranks") == str(sparks) and _flag(plan, "--rtx") == str(gpus)
-    assert "--vision off --audio off" in plan and "--require-ready" not in plan.split()
+    assert "--vision auto --audio off" in plan and "--require-ready" not in plan.split()
     lines = result.stderr.splitlines()
     probe = next(i for i, line in enumerate(lines) if "dst=/opt/cuteafd-serve-probe" in line)
     assert lines[probe].endswith("serve-step5 --help ") and probe < lines.index(plan)

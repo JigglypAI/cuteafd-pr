@@ -1423,6 +1423,9 @@ esac
 # These commands own automatic context, pool and Spark budgets independently of media.
 standalone_family=0
 [[ "$family" != minimax_m3 && "$family" != kimi_k3 && "$family" != inkling2 && "$family" != step5 && "$family" != muse_spark ]] || standalone_family=1
+if [[ "$family" == kimi_k3 || "$family" == minimax_m3 || "$family" == inkling2 || "$family" == step5 ]]; then
+  case "$audio" in auto|off) audio=off ;; *) release_die "$family has no bundled audio execution owner" ;; esac
+fi
 if [[ "$family" == qwen3_5 ]]; then
   case "$vision:$audio" in
     auto:auto|auto:off|off:auto|off:off) vision=off; audio=off ;;
