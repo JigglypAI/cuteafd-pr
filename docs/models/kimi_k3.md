@@ -22,20 +22,22 @@ addresses): [max](../../examples/configs/kimi-k3-exl3-k6-max.config).
 [Max starting config](../../examples/configs/kimi-k31-exl3-k2-mc-max.config):
 MC original BF16 core, 2 RTX + 6 Sparks, automatic pool/context/onboarding,
 automatic native DSpark. `CORE_VIEW=k6-compact` and the standalone native Core-K6
-checkpoint are also qualified. MC revision `1455b31b` corrects compact-view
+checkpoint are also supported. MC revision `1455b31b` corrects compact-view
 metadata (unchanged weight shards); older `d6c4b6ce` compact views refuse (#2118).
-K8 remains Planned and whole-core FP8 refuses.
+K8 compact uses the same runtime admission; fidelity does not gate serving.
+Whole-core FP8 refuses only unsupported tensor roles with the missing route.
 K3 DFlash2 hidden-state compatibility remains independently unqualified.
 Inferact block dSpark integration is tracked in #2261: native BF16 weights,
 checkpoint-derived 2,048-token GQA window, rank-512 Markov confidence, shared
 policy/executor and target embedding/head. Unset/`auto` `SPECULATOR` selects DSpark
-for MC original and K6 compact on TP1 or TP2 with target FP8 KV, subject to normal
-memory admission. `SPECULATOR_FP8=auto` selects FP8 projection weights and
+for K3.1 targets with a content-paired native drafter, across supported MC views,
+KV formats and layouts, subject to structural and memory admission. `SPECULATOR_FP8=auto` selects FP8 projection weights and
 `DRAFT_KV_CACHE=fp8` stores the independent drafter rings. Explicit
 `SPECULATOR=off` wins; weight and ring precision overrides remain independent.
-K8/whole-core FP8 targets, other checkpoints and target BF16 KV stay default-off.
-Qualification checks config/MC-manifest/drafter-config SHA-256 digests and view, not
-repository names, local paths or Spark count; identical renamed copies qualify. Cold and
+Drafter pairing checks its declared verifier architecture and geometry against
+the target metadata, not frozen measured snapshot SHA-256 digests, repository
+names, paths, view names or Spark counts. Unsupported whole-core FP8 target roles
+still refuse before loading with the missing kernel/tensor contract. Cold and
 full-prompt warm strict sets passed 10/10 on both TP2 core views; TP1 K6 has its
 own gate. FP8 weights save 1.227 GB net per GPU after scratch. Sustained C8/C16
 results, not closed-batch drain tails, select the default arm (#2261).

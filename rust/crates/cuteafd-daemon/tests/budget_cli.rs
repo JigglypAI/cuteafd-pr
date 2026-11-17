@@ -59,13 +59,13 @@ fn settings_query_rejects_shared_replay_before_placement() {
 }
 
 #[test]
-fn mimo_automatic_drafter_uses_official_identity_not_directory() {
+fn mimo_automatic_drafter_uses_contents_not_repository_identity() {
     let snapshot = tempfile::tempdir().unwrap();
     std::fs::write(snapshot.path().join("config.json"), r#"{"model_type":"mimo_v2"}"#).unwrap();
     for present in [false, true] {
         if present { std::fs::create_dir(snapshot.path().join("dflash")).unwrap(); }
-        for (id, expected) in [("XiaomiMiMo/MiMo-V2.6-Flash-MOPD", "dflash2"),
-            ("XiaomiMiMo/MiMo-V2.6-Pro-MOPD", "dflash2"), ("community/lookalike", "off")] {
+        for id in ["XiaomiMiMo/MiMo-V2.6-Flash-MOPD", "XiaomiMiMo/MiMo-V2.6-Pro-MOPD", "community/lookalike"] {
+            let expected = if present { "dflash2" } else { "off" };
             let output = test_command(env!("CARGO_BIN_EXE_cuteafd"))
                 .args(["plan", snapshot.path().to_str().unwrap(), "--resolve-settings-only", "--checkpoint-model-id", id])
                 .output().unwrap();
@@ -1316,6 +1316,7 @@ fn installed_mc_views_cover_executable_projection_manifests() {
         ("GLM-5.3-EXL3-K4-MC", "2e42b53e61f0f59f664c915fe2424ce9c9fa5f8e"),
         ("GLM-5.3-Flash-EXL3-K4-MC", "558931fe149f59b49d19b2376a692bd7a12fb8b7"),
         ("Step-5-Preview-EXL3-K4-MC", "aedda90d25bd02bb6520bcaf88e06e6c9bc932c4"),
+        ("Kimi-K3.1-Pro-EXL3-K2-MC", "1455b31b0acc53f36df916864fb541d9f536b3f8"),
     ] {
         let snapshot = require_installed_snapshot("MC projection coverage",
             &format!("wrldsuksgo2mars/{model}"), Some(revision), &hf_home);
@@ -1329,6 +1330,7 @@ fn installed_mc_views_cover_executable_projection_manifests() {
             assert!(output.status.success(), "{model}/{view}: {}", String::from_utf8_lossy(&output.stderr));
             let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
             assert_eq!(report["placement_supported"], true, "{model}/{view}: {}", report["hints"]);
+            assert_eq!(report["runtime"], "serving", "{model}/{view}: {}", report["hints"]);
             assert!(report["memory_layout"]["devices"].as_array().is_some_and(|owners| !owners.is_empty()),
                 "{model}/{view}: no executable projection owners");
             assert!(!report["hints"].to_string().contains("MissingExport"), "{model}/{view}: {}", report["hints"]);
@@ -1494,6 +1496,12 @@ fn installed_pe_min_max_plans_charge_one_native_tower_arena() {
                     .arg(&programs).env("HF_HOME", &hf_home).output().unwrap();
                 assert!(output.status.success(), "{model}/{gpus}RTX/{vision}: {}", String::from_utf8_lossy(&output.stderr));
                 let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+                if model.starts_with("Inkling") && gpus == "2" {
+                    assert_eq!(report["placement_supported"], false);
+                    assert!(report["hints"].to_string().contains(
+                        "Inkling multi-GPU serving executor not implemented (#2316)"));
+                    continue;
+                }
                 assert_eq!(report["placement_supported"], true, "{model}/{gpus}RTX/{vision}: {}", report["hints"]);
                 let items = report["memory_layout"]["devices"].as_array().unwrap().iter()
                     .flat_map(|device| device["items"].as_array().unwrap()).collect::<Vec<_>>();

@@ -22,13 +22,15 @@ release_check_attention_placement() {
   # executor exists.
   case "$attention_placement:$family" in
     auto:kimi_k3|heads:kimi_k3|context:kimi_k3|layers:kimi_k3) ;;
-    # Step-5 and Muse Spark run only their recorded automatic placement.
+    # These executors have one concrete attention ownership mode.
     heads:qwen3_5|context:qwen3_5)
       release_die "dense Qwen $attention_placement attention is unbuilt: native half-head GDN/GQA and dense FFN exports, shared reductions, and context KV/softmax merge are needed (#2133); use layers" ;;
     auto:minimax_m3|heads:minimax_m3|layers:minimax_m3) ;;
     *:minimax_m3) release_die "MiniMax supports auto or heads on one RTX and auto, layers or heads on two RTX" ;;
-    auto:step5|auto:muse_spark|auto:inkling2) ;;
-    *:step5|*:muse_spark|*:inkling2) release_die "$family supports only ATTENTION_PLACEMENT=auto" ;;
+    auto:step5|heads:step5|auto:muse_spark|heads:muse_spark|auto:inkling2|heads:inkling2) ;;
+    *:step5) release_die "Step-5 has no context/layers attention executor: SWA splits heads and CSA uses whole owners" ;;
+    *:muse_spark) release_die "Muse has no context/layers attention executor: native attention splits heads" ;;
+    *:inkling2) release_die "inkling2 serving has one whole-layer attention coordinator executor; context/layers require a multi-GPU executor" ;;
     auto:*|heads:*|context:glm5|context:glm5_flash|context:deepseek_v4|layers:qwen4|layers:qwen3_5) ;;
     # K4/P7 qualified explicit layers; context remains the recorded auto default.
     # The planner still requires the selected image's executor and native programs.

@@ -88,6 +88,8 @@ fn fixture_with_experts(kind: Fixture, experts: usize, topk: usize) -> (tempfile
     if kind == Fixture::Exl3 {
         small["quantization_config"] = testing::exl3_compact(4);
     }
+    let vision = crate::media::perception_vision::PerceptionGeometry::from_config(&small).unwrap();
+    tensors.extend(vision.tensor_shapes().into_iter().map(|(name, shape)| testing::t(name, "BF16", &shape)));
     testing::write_snapshot(dir.path(), &small, &tensors, None);
     // The fixtures carry the checkpoint's quantization metadata beside the
     // headers, as the release does; the loader cross-checks and never requires it.
@@ -107,27 +109,49 @@ fn layout_reuses_one_immutable_catalog_across_candidates() -> anyhow::Result<()>
             std::fs::remove_file(path)?;
         }
     }
-    for ranks in [3, 6, 3] {
+    for ranks in [3, 4, 3] {
         let report = input.plan(&PlanOptions { placement: plan::ExpertPlacement::from_spark_ranks(ranks),
             vision: plan::MediaMode::Off, audio: plan::MediaMode::Off,
             layout: Some(plan::layout::LayoutOptions::default()), ..Default::default() })?;
         assert!(report.memory_layout.as_ref().is_some_and(|layout| !layout.devices.is_empty()), "{:?}", report.hints);
         assert!(!report.hints.iter().any(|hint| hint.what.contains("catalog refused")), "{:?}", report.hints);
         assert_eq!(catalog, input.expert_catalog()? as *const crate::OfficialV41Catalog);
+        assert_eq!(report.runtime, Some(RuntimeStatus::Serving));
+        assert!(report.executable(), "{:?}", report.hints);
     }
     Ok(())
 }
 
 #[test]
-fn inkling_mxfp8_inventory_is_planned_not_executable() {
+fn serving_refuses_only_missing_multi_gpu_and_bundled_draft_executors() {
     let (dir, _, _) = fixture(Fixture::Mxfp8);
-    let report = plan::plan(dir.path(), &PlanOptions::default()).unwrap();
+    for (gpus, draft, expected) in [(2, false, "multi-GPU serving executor not implemented (#2316)"),
+        (1, true, "bundled dSpark executor not implemented (#2320)")] {
+        let report = plan::plan(dir.path(), &PlanOptions {
+            placement: plan::ExpertPlacement::from_spark_ranks(4),
+            draft_ownership: Some(if draft { crate::plan::spec::DraftOwnership::NativeMtp }
+                else { crate::plan::spec::DraftOwnership::None }),
+            vision: plan::MediaMode::Off, audio: plan::MediaMode::Off,
+            layout: Some(plan::layout::LayoutOptions { rtx_bytes: vec![96 << 30; gpus],
+                native_mtp_layers: usize::from(draft), ..Default::default() }), ..Default::default()
+        }).unwrap();
+        assert_eq!(report.runtime, Some(RuntimeStatus::Serving));
+        assert!(!report.executable());
+        assert!(report.hints.iter().any(|hint| hint.what.contains(expected)), "{:?}", report.hints);
+    }
+}
+
+#[test]
+fn inkling_mxfp8_inventory_is_serving_without_checkpoint_allowlist() {
+    let (dir, _, _) = fixture(Fixture::Mxfp8);
+    let report = plan::plan(dir.path(), &PlanOptions {
+        placement: plan::ExpertPlacement::from_spark_ranks(3), ..Default::default() }).unwrap();
     assert!(report.config_error.is_none(), "{:?}", report.config_error);
     assert_eq!(report.family.as_deref(), Some("inkling2"));
-    assert_eq!(report.runtime, Some(RuntimeStatus::Planned));
+    assert_eq!(report.runtime, Some(RuntimeStatus::Serving));
     assert!(report.unclassified.is_empty(), "{:?}", report.unclassified);
     assert!(report.components.iter().all(|c| c.rejected == 0), "{:?}", report.components);
-    assert!(!report.executable());
+    assert!(report.executable(), "{:?}", report.hints);
     let spec = report.spec.unwrap();
     assert_eq!(spec.moe_layers(), 4);
     assert!(matches!(spec.layers[0].attention, AttentionKind::SlidingGqa { window: 1024, sinks: true, .. }));
@@ -388,9 +412,9 @@ fn installed_native_measured_five_sparks_fit_with_exact_ledgers() -> anyhow::Res
         layout: Some(LayoutOptions { workspace_manifest: Some(manifest), inkling_kv: crate::families::inkling2::InklingKvCache::Bf16, ..Default::default() }),
         ..Default::default() };
     let report = input.plan(&options)?;
-    assert_eq!(report.runtime, Some(RuntimeStatus::Planned));
+    assert_eq!(report.runtime, Some(RuntimeStatus::Serving));
     assert!(report.fits && report.placement_supported && report.native_serving_admitted, "{:?}", report.hints);
-    assert!(report.wip_launchable() && !report.executable());
+    assert!(report.wip_launchable() && report.executable());
     assert_eq!(report.memory_layout.as_ref().unwrap().pool_tokens, 2_097_152);
     let mut fp8_options = options.clone();
     fp8_options.layout.as_mut().unwrap().inkling_kv = Default::default();
