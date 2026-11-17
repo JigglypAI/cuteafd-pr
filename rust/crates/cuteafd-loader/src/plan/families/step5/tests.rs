@@ -1170,7 +1170,7 @@ fn native_rope_plan_honors_checkpoint_layer_policy_and_factor_one() -> Result<()
 }
 
 #[test]
-fn spark_admission_is_scoped_to_qualified_native_layers() {
+fn spark_admission_is_scoped_to_validated_native_layers() {
     use crate::plan::experts::{checkpoint_spark_recipe, spark_recipe};
     for kind in ["fp8", "nvfp4", "bf16"] {
         let dir = snapshot(kind);
@@ -1210,8 +1210,11 @@ fn spark_admission_is_scoped_to_qualified_native_layers() {
         }
         let r = report(dir.path(), 2, 96, 6, None);
         assert_eq!(r.executable(), r.wip_launchable());
-        assert_eq!(r.wip_launchable(), kind == "fp8", "{:?}", r.hints);
-        assert_eq!(r.native_serving_admitted, kind == "fp8");
+        assert_eq!(r.wip_launchable(), kind != "bf16", "{:?}", r.hints);
+        assert_eq!(r.native_serving_admitted, kind != "bf16");
+        if kind == "bf16" {
+            assert!(r.hints.iter().any(|hint| hint.what.contains("BF16 routed experts: no native BF16 expert execution kernel")), "{:?}", r.hints);
+        }
     }
 }
 

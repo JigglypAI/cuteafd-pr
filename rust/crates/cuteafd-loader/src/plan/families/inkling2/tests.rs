@@ -145,7 +145,7 @@ fn serving_refuses_only_missing_multi_gpu_and_bundled_draft_executors() {
 fn inkling_mxfp8_inventory_is_serving_without_checkpoint_allowlist() {
     let (dir, _, _) = fixture(Fixture::Mxfp8);
     let report = plan::plan(dir.path(), &PlanOptions {
-        placement: plan::ExpertPlacement::from_spark_ranks(4), ..Default::default() }).unwrap();
+        placement: plan::ExpertPlacement::from_spark_ranks(3), ..Default::default() }).unwrap();
     assert!(report.config_error.is_none(), "{:?}", report.config_error);
     assert_eq!(report.family.as_deref(), Some("inkling2"));
     assert_eq!(report.runtime, Some(RuntimeStatus::Serving));
