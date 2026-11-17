@@ -2,7 +2,8 @@
 # Run one task on an external CLI agent (Grok, or Gemini via Antigravity) in a
 # detached tmux session, so the orchestrator can watch, steer and stop it.
 #   scripts/agents/ext-launch.sh grok|agy <name> [model] [effort]
-# agy models carry their effort in the name (gemini-4-carbon-high); effort applies only without a model.
+# agy always pins a model: [model] wins, otherwise [effort] maps to
+# gemini-4-carbon-{effort} and anything else gets gemini-4-carbon-high.
 # The prompt is scripts/agents/codex-preamble.md + $AGENT_RUNS/<name>.md.
 # Output: <name>.report.md (the transcript tail), <name>.log (full transcript).
 # The script waits until the agent exits, so start it as a background command;
@@ -15,6 +16,15 @@ tool="${1:?grok or agy}"
 name="${2:?task name}"
 model="${3:-}"
 effort="${4:-high}"
+# Carbon carries its effort in the model name and Antigravity's own default
+# drifts (it reset to Argon), so never leave the model to the CLI. Same rule
+# as ext-agent.py: explicit model, else the effort's Carbon model, else the
+# roster default.
+case "$effort" in
+  high|medium|low) agy_model="gemini-4-carbon-$effort" ;;
+  *) agy_model="gemini-4-carbon-high" ;;
+esac
+agy_model="${model:-$agy_model}"
 [[ -f "$runs/$name.md" ]] || { echo "missing $runs/$name.md" >&2; exit 2; }
 [[ "$tool" == grok || "$tool" == agy ]] || { echo "unknown tool: $tool, expected grok or agy" >&2; exit 2; }
 session="ext-$name"
@@ -36,7 +46,7 @@ runner="$runs/$name.run.sh"
     agy)
       # Antigravity's eligibility check returns transient 503s; retry those.
       echo "for attempt in 1 2 3 4 5; do"
-      echo "  agy --dangerously-skip-permissions --add-dir $(printf %q "$repo") $(if [[ -n "$model" ]]; then printf -- '--model %q' "$model"; else printf -- '--effort %q' "$effort"; fi) -p \"\$(cat $(printf %q "$prompt"))\" 2>&1 | tee /tmp/agy-\$\$.out"
+      echo "  agy --dangerously-skip-permissions --add-dir $(printf %q "$repo") --model $(printf %q "$agy_model") -p \"\$(cat $(printf %q "$prompt"))\" 2>&1 | tee /tmp/agy-\$\$.out"
       echo '  rc=${PIPESTATUS[0]}'
       echo "  grep -q 'Eligibility check failed: UNAVAILABLE' /tmp/agy-\$\$.out || break"
       echo '  echo "agy 503, retry $attempt in 60 s"; sleep 60'

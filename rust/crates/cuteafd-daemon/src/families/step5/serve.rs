@@ -273,7 +273,16 @@ fn with_backend<T>(args: &ServeArgs,
         .unwrap_or_else(|| args.attention.select(&args.snapshot))?;
     args.attention.validate_view(&view)?;
     crate::cli::publish_core_view(&view);
-    let checkpoint = Checkpoint::open_view(&view)?;
+    let mut checkpoint = Checkpoint::coordinator_view(&view, false, args.mtp > 0)?;
+    if args.vision.vision != cuteafd_loader::plan::MediaMode::Off {
+        let vision = cuteafd_loader::plan::files::open_role_view(&view,
+            cuteafd_loader::plan::files::ReadRole::Vision)?;
+        checkpoint.tensors.extend(vision.tensors);
+        checkpoint.tensors.sort_by(|a, b| a.meta.name.cmp(&b.meta.name));
+        checkpoint.missing_shards.extend(vision.missing_shards);
+        checkpoint.missing_shards.sort();
+        checkpoint.missing_shards.dedup();
+    }
     let cfg = Config::parse(&checkpoint)?;
     cuteafd_bench::context::set_family(cfg.family_id());
     let mut catalog = cuteafd_loader::read_expert_catalog_view(&view)?;
