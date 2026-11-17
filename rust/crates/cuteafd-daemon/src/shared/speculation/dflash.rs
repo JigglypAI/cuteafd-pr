@@ -235,6 +235,7 @@ struct MlaAttention<'a> {
     program: cuteafd_ffi::mla_draft::MlaDraft<'a>,
     qkv_a: Dev<'a>, q_norm: Dev<'a>, kv_norm: Dev<'a>,
     q_b: Dev<'a>, uk: Dev<'a>, uv: Dev<'a>, output: Dev<'a>,
+    fp8_scales: Option<[Dev<'a>; 5]>,
     cache: Dev<'a>, page_table: Dev<'a>,
 }
 
@@ -242,7 +243,10 @@ impl MlaAttention<'_> {
     fn weights(&self) -> cuteafd_ffi::mla_draft::MlaDraftWeights {
         cuteafd_ffi::mla_draft::MlaDraftWeights { qkv_a: self.qkv_a.buffer,
             q_a_norm: self.q_norm.buffer, kv_a_norm: self.kv_norm.buffer,
-            q_b: self.q_b.buffer, uk: self.uk.buffer, uv: self.uv.buffer, output: self.output.buffer }
+            q_b: self.q_b.buffer, uk: self.uk.buffer, uv: self.uv.buffer, output: self.output.buffer,
+            fp8_scales: self.fp8_scales.as_ref().map(|scales| cuteafd_ffi::mla_draft::MlaDraftScales {
+                qkv_a: scales[0].buffer, q_b: scales[1].buffer, uk: scales[2].buffer,
+                uv: scales[3].buffer, output: scales[4].buffer }) }
     }
 }
 
@@ -275,11 +279,14 @@ impl<'a> MlaDraftStorage<'a> {
         ensure!(expected("head_workspace")? == VOCABULARY_HEAD_WORKSPACE,
             "MLA draft vocabulary workspace disagrees with admission");
         let selector_bytes = layout.selector_workspace_bytes()?;
-        if layout.kind() == cuteafd_core::coordinator_programs::MlaDraftKind::Dflash2 {
+        if layout.kind().is_dflash() {
             ensure!(selector_bytes == expected("topk_workspace")?,
                 "MLA draft top-k workspace disagrees with admission");
             let drafted = layout.capacity().block_rows - layout.capacity().max_batch_sequences;
-            ensure!(library.glm_dflash_topk_workspace(drafted)?.max(256) == selector_bytes,
+            let native_bytes = if layout.kind() == cuteafd_core::coordinator_programs::MlaDraftKind::CausalDflash2 {
+                library.dflash_topk_workspace_width(drafted, layout.kind().selector_top_k())?
+            } else { library.glm_dflash_topk_workspace(drafted)? };
+            ensure!(native_bytes.max(256) == selector_bytes,
                 "MLA draft native top-k workspace disagrees with admission");
         }
         if let Some(scratch) = layout.fp8_scratch() {
@@ -1288,17 +1295,27 @@ impl<'a> DflashDrafter<'a> {
         use cuteafd_loader::formats::dflash::MlaDflashConfig;
         let _scope = cuteafd_ffi::memory_ledger::scope("drafter");
         let native = MlaDflashConfig::read(snapshot)?;
-        ensure!(native.runtime_layout(representation, layout.capacity(), layout.program().context,
-            layout.paged_cache().target_tokens, library.sm_count()?, fp8_rows.code() as u8, layout.cache_format())?
-                .with_context_split(layout.context_split())? == layout && layout.context_split() == split.is_some(),
+        let admitted_source = if layout.complete_fp8_body() {
+            ensure!(representation == GlmDraftRepresentation::Fp8Only, "complete MLA body requires FP8 representation");
+            native.complete_fp8_runtime_layout(layout.capacity(), layout.program().context,
+                layout.paged_cache().target_tokens, library.sm_count()?, fp8_rows.code() as u8, layout.cache_format())?
+        } else {
+            native.runtime_layout(representation, layout.capacity(), layout.program().context,
+                layout.paged_cache().target_tokens, library.sm_count()?, fp8_rows.code() as u8, layout.cache_format())?
+        };
+        ensure!(admitted_source.with_context_split(layout.context_split())? == layout && layout.context_split() == split.is_some(),
             "MLA draft checkpoint/runtime differs from admitted immutable layout");
         let cfg = DflashConfig::mla(&native);
         let projections = Self::load_projections(programs, &cfg, representation, true, false, layout.capacity().max_batch_sequences)?;
         let load = super::weights::Load::with_prefetched(library, snapshot, file)?.with_allocator(&mut allocate);
         load.validate(native.tensor_shapes())?;
         let programs = native.windows.iter().map(|window| -> Result<_> {
-            let program = MlaDraft::load(programs, program_namespace, if window.is_some() { MlaDraftWindow::Sliding4096 }
-                else { MlaDraftWindow::Full }, layout.cache_format())?;
+            let window = match window { Some(1024) => MlaDraftWindow::CausalSliding1024,
+                Some(4096) => MlaDraftWindow::Sliding4096, None => MlaDraftWindow::Full,
+                _ => anyhow::bail!("unsupported checkpoint MLA draft window") };
+            let program = if layout.complete_fp8_body() {
+                MlaDraft::load_fp8_weights(programs, program_namespace, window, layout.cache_format())?
+            } else { MlaDraft::load(programs, program_namespace, window, layout.cache_format())? };
             ensure!(program.max_context() >= layout.program().context
                 && program.splits() == layout.program().splits
                 && program.scratch_bytes() == layout.program().scratch,
@@ -1306,19 +1323,40 @@ impl<'a> DflashDrafter<'a> {
             Ok(program)
         }).collect::<Result<Vec<_>>>()?;
         let mut owners = MlaDraftStorage::allocate(library, layout.clone())?.into_owners()?;
-        let weights = super::weights::mla_weight_recipe(&native,
+        use super::weights::MlaMatrix;
+        let weights = cuteafd_loader::families::glm5::draft_physical::mla_weight_recipe_with_attention(&native,
             |parts| load.tensor_parts(parts),
             |parts, cols| load.matrix(parts, cols, representation == GlmDraftRepresentation::Fp8Only, scales, stream),
-            |name| load.absorb(name, native.mla.heads, native.mla.nope, native.mla.value, native.mla.kv_rank, stream))?;
+            |parts, cols| if layout.complete_fp8_body() {
+                load.mla_fp8_matrix(parts, cols, scales, stream).map(MlaMatrix::Fp8)
+            } else { load.concat(parts, cols).map(MlaMatrix::Bf16) },
+            |name| if layout.complete_fp8_body() {
+                let (uk, uv) = load.mla_fp8_absorb(name, native.mla.heads, native.mla.nope,
+                    native.mla.value, native.mla.kv_rank, scales, stream)?;
+                Ok((MlaMatrix::Fp8(uk), MlaMatrix::Fp8(uv)))
+            } else {
+                let (uk, uv) = load.absorb(name, native.mla.heads, native.mla.nope,
+                    native.mla.value, native.mla.kv_rank, stream)?;
+                Ok((MlaMatrix::Bf16(uk), MlaMatrix::Bf16(uv)))
+            })?;
         let mut layers = Vec::with_capacity(cfg.layers);
         for (index, (program, weight)) in programs.into_iter().zip(weights.layers).enumerate() {
+            let (qkv_a, sqkv) = weight.qkv_a.into_parts();
+            let (q_b, sqb) = weight.q_b.into_parts();
+            let (uk, suk) = weight.uk.into_parts();
+            let (uv, suv) = weight.uv.into_parts();
+            let (output, so) = weight.output.into_parts();
+            let fp8_scales = if layout.complete_fp8_body() {
+                Some([sqkv.context("MLA qkv scale missing")?, sqb.context("MLA query scale missing")?,
+                    suk.context("MLA UK scale missing")?, suv.context("MLA UV scale missing")?, so.context("MLA output scale missing")?])
+            } else { None };
             layers.push(DraftLayer {
                 input_norm: weight.input_norm, post_norm: weight.post_norm,
                 body: LayerBody::Dflash { attn_conv: weight.attn_conv, attn_base: weight.attn_base,
                     mlp_conv: weight.mlp_conv, mlp_base: weight.mlp_base },
-                attention: DraftAttention::Mla(MlaAttention { program, qkv_a: weight.qkv_a,
-                    q_norm: weight.q_norm, kv_norm: weight.kv_norm, q_b: weight.q_b,
-                    uk: weight.uk, uv: weight.uv, output: weight.output,
+                attention: DraftAttention::Mla(MlaAttention { program, qkv_a,
+                    q_norm: weight.q_norm, kv_norm: weight.kv_norm, q_b,
+                    uk, uv, output, fp8_scales,
                     cache: owners.take(&format!("layer.{index}.cache"))?,
                     page_table: owners.take(&format!("layer.{index}.page_table"))?,
                 }),
@@ -1423,6 +1461,7 @@ impl<'a> DflashDrafter<'a> {
                     uk: owners.take(&format!("weight.{a}.wkv_b.weight.uk"))?,
                     uv: owners.take(&format!("weight.{a}.wkv_b.weight.uv"))?,
                     output: tensor(&mut owners, &format!("{a}.wo.weight"), &[h, heads * v])?,
+                    fp8_scales: None,
                     cache: owners.take(&format!("layer.{index}.cache"))?,
                     page_table: owners.take(&format!("layer.{index}.page_table"))?,
                 }),
@@ -2769,15 +2808,16 @@ impl<'a> DflashDrafter<'a> {
             match &self.head_ops {
                 DraftHeadOps::Peer => anyhow::bail!("peer drafter cannot launch selection"),
                 DraftHeadOps::Selector { projection, predecessor, successor } => {
-                    l.glm_dflash_topk(w.head()?.logits.buffer.ptr, w.head()?.unary.as_ref().context("selector workspace missing")?.buffer.ptr, w.head()?.candidates.as_ref().context("selector workspace missing")?.buffer.ptr,
-                        w.head()?.topk_workspace.as_ref().context("selector workspace missing")?.buffer.ptr, s_count, block, c.drafts(), c.vocab, s)?;
+                    let top_k = match &self.context { DraftContext::Mla(context) => context.cfg.selector_top_k, _ => 16 };
+                    l.dflash_topk_width(w.head()?.logits.buffer.ptr, w.head()?.unary.as_ref().context("selector workspace missing")?.buffer.ptr, w.head()?.candidates.as_ref().context("selector workspace missing")?.buffer.ptr,
+                        w.head()?.topk_workspace.as_ref().context("selector workspace missing")?.buffer.ptr, s_count, block, c.drafts(), c.vocab, top_k, s)?;
                     self.timing.end(head_span, s)?;
                     let select_span = self.timing.begin("selector_confidence", None, rows, s)?;
                     self.linear(w.n.buffer.ptr, projection, 0,
                         w.head()?.projected.as_ref().context("selector workspace missing")?.buffer.ptr, rows, h, c.rank)?;
-                    l.glm_dflash_select(predecessor.buffer.ptr, successor.buffer.ptr, w.head()?.projected.as_ref().context("selector workspace missing")?.buffer.ptr,
+                    l.dflash_select_width(predecessor.buffer.ptr, successor.buffer.ptr, w.head()?.projected.as_ref().context("selector workspace missing")?.buffer.ptr,
                         w.head()?.candidates.as_ref().context("selector workspace missing")?.buffer.ptr, w.head()?.unary.as_ref().context("selector workspace missing")?.buffer.ptr, w.head()?.anchors.buffer.ptr, w.head()?.tokens.buffer.ptr,
-                        w.head()?.features.as_ref().context("selector workspace missing")?.buffer.ptr, s_count, block, c.drafts(), c.rank, s)?;
+                        w.head()?.features.as_ref().context("selector workspace missing")?.buffer.ptr, s_count, block, c.drafts(), c.rank, top_k, s)?;
                     self.timing.end(select_span, s)?;
                 }
                 DraftHeadOps::RnnMarkov { softcap, embedding, joint_w, joint_b, output, norms, rank } => {
@@ -3414,7 +3454,7 @@ mod checkpoint_header_tests {
     fn mla_config() -> cuteafd_loader::formats::dflash::MlaDflashConfig {
         use cuteafd_loader::formats::{dflash::MlaDflashConfig,
             mla::MlaGeometry, block_dspark::DsparkRotaryPlan};
-        let cfg = MlaDflashConfig { mla: MlaGeometry { hidden: 7168, heads: 64,
+        let cfg = MlaDflashConfig { hidden_stream: Default::default(), mla: MlaGeometry { hidden: 7168, heads: 64,
             q_rank: 1536, kv_rank: 512, nope: 128, rope: 64, value: 128 },
             intermediate: 14336, eps: 1e-5, block: 8, group: 16, selector_rank: 256,
             selector_top_k: 16, taps: vec![19, 37, 66, 78, 90], vocab: 163840,

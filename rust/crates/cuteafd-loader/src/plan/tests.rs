@@ -6739,7 +6739,7 @@ fn qwen_auto_mtp_matches_explicit_memory_and_deployment() {
             layout: Some(layout::LayoutOptions { host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram),
                 host_cache_bytes: Some(0), ..Default::default() }), ..sparks(ranks) };
         let auto = plan(dir.path(), &options).unwrap();
-        let selected = if ranks == 0 { "mtp" } else { "off" };
+        let selected = "mtp";
         assert_eq!(auto.speculator, Some(selected));
         let explicit = plan(dir.path(), &PlanOptions { qwen_auto_mtp: false,
             draft_ownership: Some(DraftOwnership::selected("qwen4", selected)), ..options }).unwrap();
@@ -6754,13 +6754,15 @@ fn qwen_auto_mtp_matches_explicit_memory_and_deployment() {
     }
     for (quant, stages, qualified) in [
         (json!({"quant_method":"exl3"}), 1, true),
-        (json!({"quant_method":"exl3"}), 2, false),
-        (json!({"quant_method":"fp8"}), 1, false),
-        (json!({"quant_method":"nvfp4"}), 1, false),
+        (json!({"quant_method":"exl3"}), 2, true),
+        (json!({"quant_method":"fp8"}), 1, true),
+        (json!({"quant_method":"nvfp4"}), 1, true),
+        (json!({}), 0, false),
+        (json!({}), 1, true),
         (json!({"quant_method":"modelopt", "config_groups":{"g":{"weights":{"num_bits":4}}}}), 1, true),
     ] {
         let cfg = json!({"quantization_config":quant, "text_config":{"mtp_num_hidden_layers":stages}});
-        assert_eq!(qualified_qwen_mtp(&cfg), qualified);
+        assert_eq!(qwen_mtp_layers(&cfg) > 0, qualified);
     }
 }
 
@@ -6787,13 +6789,13 @@ fn qwen_auto_mtp_real_inventory_selects_local_without_losing_mtp() {
             prefix_slots: Some(0), ..Default::default() }), ..sparks(2) };
     let input = PlanInput::open(dir.path()).unwrap();
     // Keep this arm genuinely remote: Auto may onboard the complete small
-    // fixture now, in which case zero expert world correctly enables MTP.
+    // fixture now; native MTP stays enabled in either admitted expert world.
     let mut remote = options.clone();
     remote.layout.as_mut().unwrap().onboard = Some(crate::placement::OnboardSetting::Layers(0));
     let spark = input.plan(&remote).unwrap();
     assert!(spark.solver_placement.is_some(), "{}", render(&spark));
     assert_eq!(spark.spark_expert_world(), 2);
-    assert_eq!(spark.speculator, Some("off"));
+    assert_eq!(spark.speculator, Some("mtp"));
     // Inventory is nonzero; the selected expert count is independently local.
     let auto = input.plan_spark_count(&options, 2, Some(0)).unwrap();
     assert!(auto.solver_placement.is_some(), "{}", render(&auto));
@@ -6813,7 +6815,7 @@ fn qwen_auto_mtp_real_inventory_selects_local_without_losing_mtp() {
     assert_eq!(deployment::DeploymentSpec::from_report(&auto, &deployment).unwrap().speculator, "mtp");
 
     // The candidate still requests Sparks, but its actual solve puts all experts
-    // on RTX. Auto must re-plan the same candidate with native draft ownership.
+    // on RTX. Native draft ownership is identical regardless of that solve.
     let mut onboarded_options = options;
     onboarded_options.layout.as_mut().unwrap().onboard =
         Some(crate::placement::OnboardSetting::Layers(4));

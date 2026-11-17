@@ -115,7 +115,8 @@ impl<'a> KimiPrefix<'a> {
     pub(crate) fn with_draft(mut self, draft: Option<Rc<super::draft::NativeDraft<'a>>>) -> Result<Self> {
         let inner = Rc::get_mut(&mut self.0).context("Kimi prefix drafter must bind before publication")?;
         if let Some(draft) = &draft {
-            ensure!(draft.cache_format() == inner.mla[0].format(), "Kimi target/draft cache records differ");
+            // Draft marks inventory their own physical records independently
+            // of the target cache dtype.
             let bytes = draft.mark_bytes();
             inner.layout.mark_bytes = inner.layout.mark_bytes.checked_add(bytes).context("Kimi complete mark overflow")?;
         }
@@ -285,7 +286,10 @@ impl PrefixFamily<SnapshotMeta> for KimiPrefix<'_> {
     fn capture_draft_pages(&self, placement: &Placement, len: usize)
         -> Result<Option<cuteafd_engine::prefix::DraftPageAttachment>, BoxError> {
         let Some(draft) = &self.0.draft else { return Ok(None) };
-        if draft.common().is_windowed_block() || draft.frontier(placement.slot)? != (0, len) { return Ok(None); }
+        // Window-only MLA state lives entirely in the positional mark, not in
+        // pooled pages whose committed frontier intentionally does not advance.
+        if draft.common().is_windowed_block() || draft.common().mla_windows_only()
+            || draft.frontier(placement.slot)? != (0, len) { return Ok(None); }
         let _scope = draft.device().enter()?;
         draft.common().capture_mla_pages(placement.slot, len, len).map(Some)
     }
@@ -308,6 +312,14 @@ impl PrefixFamily<SnapshotMeta> for KimiPrefix<'_> {
             if attachment.is_some() { return Err("window draft cannot restore page attachment".into()); }
             if draft.frontier(placement.slot)?.1 != frontier { draft.reset(placement.slot,frontier)?; }
             return Ok(());
+        }
+        if draft.common().mla_windows_only() {
+            if attachment.is_some() { return Err("window-only MLA cannot restore pooled page attachment".into()); }
+            // restore() already copied the exact saved ring bytes on the mark stream.
+            // Retire that copy before rebinding producers to the saved frontier.
+            draft.drain()?;
+            let _scope = draft.device().enter()?;
+            return Ok(draft.common().restore_mla_windows(placement.slot, frontier)?);
         }
         if let Some(attachment) = attachment {
             if attachment.origin != 0 || attachment.frontier != frontier { return Err("Kimi noncanonical draft snapshot".into()); }

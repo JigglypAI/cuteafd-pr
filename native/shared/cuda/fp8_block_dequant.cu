@@ -102,6 +102,7 @@ __global__ void fp8_block_quant_kernel(const __nv_bfloat16* w, __nv_fp8_e4m3* q,
 // One warp per (row, 128-wide K block): scale = amax / 448 (1 for an
 // all-zero block), E4M3 = rn_satfinite(w / scale). The per-row x 128-K layout
 // (`[rows, cols / 128]` scales) of the MmaFp8Gemv row_scales programs.
+template <int ScaleRepeat = 1>
 __global__ void fp8_row_quant_kernel(const __nv_bfloat16* w, __nv_fp8_e4m3* q, float* scale, int rows, int cols,
                                      int rule) {
   const int blocks = cols / 128;
@@ -126,7 +127,10 @@ __global__ void fp8_row_quant_kernel(const __nv_bfloat16* w, __nv_fp8_e4m3* q, f
     }
     s = warp_sum(ep) < warp_sum(ea) ? sp : sa;
   }
-  if (lane == 0) scale[unit] = s;
+  if (lane == 0) {
+    #pragma unroll
+    for (int repeat = 0; repeat < ScaleRepeat; ++repeat) scale[unit * ScaleRepeat + repeat] = s;
+  }
   for (int j = 0; j < 4; ++j) q[base + j] = __nv_fp8_e4m3(x[j] / s);
 }
 }  // namespace
@@ -136,7 +140,20 @@ extern "C" int32_t cuteafd_fp8_row_quant_rule(const void* w, void* q, void* scal
                                               int32_t rule, void* stream) {
   if (rows < 1 || cols < 128 || cols % 128 || rule < 0 || rule > 2) return cudaErrorInvalidValue;
   const uint64_t units = uint64_t(rows) * (cols / 128);
-  fp8_row_quant_kernel<<<unsigned((units + 7) / 8), 256, 0, static_cast<cudaStream_t>(stream)>>>(
+  fp8_row_quant_kernel<1><<<unsigned((units + 7) / 8), 256, 0, static_cast<cudaStream_t>(stream)>>>(
+      static_cast<const __nv_bfloat16*>(w), static_cast<__nv_fp8_e4m3*>(q), static_cast<float*>(scale), rows, cols,
+      rule);
+  return cudaGetLastError();
+}
+
+// Same row128 quantization; duplicate each final scale for row64 consumers.
+extern "C" int32_t cuteafd_fp8_row_quant_repeat(const void* w, void* q, void* scale, int32_t rows, int32_t cols,
+                                                int32_t rule, int32_t scale_repeat, void* stream) {
+  if (scale_repeat == 1) return cuteafd_fp8_row_quant_rule(w, q, scale, rows, cols, rule, stream);
+  if (scale_repeat != 2 || rows < 1 || cols < 128 || cols % 128 || rule < 0 || rule > 2)
+    return cudaErrorInvalidValue;
+  const uint64_t units = uint64_t(rows) * (cols / 128);
+  fp8_row_quant_kernel<2><<<unsigned((units + 7) / 8), 256, 0, static_cast<cudaStream_t>(stream)>>>(
       static_cast<const __nv_bfloat16*>(w), static_cast<__nv_fp8_e4m3*>(q), static_cast<float*>(scale), rows, cols,
       rule);
   return cudaGetLastError();

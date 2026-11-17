@@ -450,7 +450,19 @@ fn installed_kimi_mla_projection_recipe_matches_native_manifest() -> Result<()> 
 
 /// Full production MLA geometry, sparse checkpoint and allocation-only DSO.
 /// Exercises the real loader, not a second test-only traversal or numerical oracle.
-pub(crate) fn with_mla_arena_fixture(mut verify: impl FnMut(&DflashDrafter<'_>,
+pub(crate) fn with_mla_arena_fixture(verify: impl FnMut(&DflashDrafter<'_>,
+    &cuteafd_loader::formats::dflash::MlaDraftRuntimeLayout,
+    &cuteafd_loader::serving_capacity::WeightArenaLayout) -> Result<()>) -> Result<()> {
+    with_mla_arena_fixture_precision(false, verify)
+}
+
+fn with_mla_arena_fixture_precision(complete: bool, mut verify: impl FnMut(&DflashDrafter<'_>,
+    &cuteafd_loader::formats::dflash::MlaDraftRuntimeLayout,
+    &cuteafd_loader::serving_capacity::WeightArenaLayout) -> Result<()>) -> Result<()> {
+    with_mla_arena_fixture_config(complete, false, verify)
+}
+
+fn with_mla_arena_fixture_config(complete: bool, windows_only: bool, mut verify: impl FnMut(&DflashDrafter<'_>,
     &cuteafd_loader::formats::dflash::MlaDraftRuntimeLayout,
     &cuteafd_loader::serving_capacity::WeightArenaLayout) -> Result<()>) -> Result<()> {
     use cuteafd_loader::{formats::dflash::MlaDflashConfig,
@@ -471,7 +483,7 @@ pub(crate) fn with_mla_arena_fixture(mut verify: impl FnMut(&DflashDrafter<'_>,
         "qk_nope_head_dim":128, "qk_rope_head_dim":64, "v_head_dim":128,
         "rms_norm_eps":1e-5, "vocab_size":256, "draft_vocab_size":256,
         "max_position_embeddings":65536, "num_target_layers":93,
-        "layer_types":["sliding_attention","full_attention"], "sliding_window":4096,
+        "layer_types":if windows_only { vec!["sliding_attention"; 2] } else { vec!["sliding_attention","full_attention"] }, "sliding_window":4096,
         "use_sliding_window":true, "is_causal":false, "mla_use_output_gate":false,
         "attention_bias":false, "hidden_act":"silu", "fc_norm":false,
         "rope_parameters":{"rope_type":"yarn", "rope_theta":50000., "factor":32.,
@@ -486,8 +498,11 @@ pub(crate) fn with_mla_arena_fixture(mut verify: impl FnMut(&DflashDrafter<'_>,
         .map(|(name, shape)| t(name, "BF16", shape)).collect::<Vec<_>>());
     for cache in [cuteafd_core::MlaCacheFormat::Bf16, cuteafd_core::MlaCacheFormat::Fp8] {
         for representation in [GlmDraftRepresentation::Bf16Only, GlmDraftRepresentation::Fp8Only] {
-            let layout = cfg.runtime_layout(representation, GlmDraftCapacity::new(2, 1, 8)?,
-                8192, 16384, library.sm_count()?, fp8_linear::Fp8Rows::W8a16.code() as u8, cache)?;
+            if complete && representation != GlmDraftRepresentation::Fp8Only { continue; }
+            let layout = if complete {
+                cfg.complete_fp8_runtime_layout(GlmDraftCapacity::new(2,1,8)?,8192,16384,library.sm_count()?,0,cache)?
+            } else { cfg.runtime_layout(representation, GlmDraftCapacity::new(2, 1, 8)?,
+                8192, 16384, library.sm_count()?, fp8_linear::Fp8Rows::W8a16.code() as u8, cache)? };
             let p = layout.program();
             let shapes = [(7168, 256), (128, 7168), (14336, 7168), (7168, 1792), (7168, 256)]
                 .into_iter().collect::<std::collections::BTreeSet<_>>();
@@ -517,6 +532,15 @@ pub(crate) fn with_mla_arena_fixture(mut verify: impl FnMut(&DflashDrafter<'_>,
                     }
                     _ => geometry["output_gate"] = false.into(),
                 }
+                let (suffix, pointers) = if complete && index != 1 {
+                    geometry["weight_dtype"] = "fp8".into();
+                    geometry["projection_scale_k"] = 128.into();
+                    geometry["batched_scale_k"] = 64.into();
+                    if index == 0 {
+                        ("producer_fp8_weights", vec!["x","kv_slots","positions","inv_freq","w_qkv_a","s_qkv_a",
+                            "q_a_norm","kv_a_norm","w_q_b","s_q_b","w_uk","s_uk","kv_cache","query","q_resid","scratch"])
+                    } else { ("output_fp8_weights", vec!["attn","w_uv","s_uv","w_o","s_o","out","scratch"]) }
+                } else { (suffix, pointers) };
                 let cache_suffix = if index == 2 { "" } else { cache.program_suffix() };
                 entries.push(serde_json::json!({"name":format!("kimik3_mla_draft_{suffix}{cache_suffix}_m64"),
                     "pointers":pointers.iter().map(|name| serde_json::json!({"name":name})).collect::<Vec<_>>(),
@@ -528,10 +552,12 @@ pub(crate) fn with_mla_arena_fixture(mut verify: impl FnMut(&DflashDrafter<'_>,
             let manifest = snapshot.join("programs.json");
             std::fs::write(&manifest, serde_json::to_vec(&serde_json::json!({"programs":entries}))?)?;
             let programs = library.programs()?.with_manifest(&manifest)?;
-            let requests = DflashDrafter::mla_arena_requests(snapshot, representation, 1)?;
+            let requests = if complete {
+                std::collections::BTreeMap::from([(1, cuteafd_loader::families::glm5::draft_physical::mla_complete_fp8_arena_requests(&cfg)?)])
+            } else { DflashDrafter::mla_arena_requests(snapshot, representation, 1)? };
             assert_eq!(layout.weight_arena_requests(), requests[&1]);
-            assert_eq!(cuteafd_loader::families::glm5::draft_physical::mla_arena_requests(
-                &cfg, representation)?, requests[&1]);
+            if !complete { assert_eq!(cuteafd_loader::families::glm5::draft_physical::mla_arena_requests(
+                &cfg, representation)?, requests[&1]); }
             let planned = WeightArenaLayout::new("kimi/draft/1", requests[&1].clone())?;
             assert_eq!(planned.payload_bytes() as u64, layout.weights().resident_bytes()?);
             assert_eq!(planned.padding_bytes(), 0);
@@ -549,7 +575,18 @@ pub(crate) fn with_mla_arena_fixture(mut verify: impl FnMut(&DflashDrafter<'_>,
                         Ok(view)
                     })))?;
             assert!(!records.operands.is_empty());
-            assert_arena_bindings(&planned, &requests[&1], &bound);
+            if complete {
+                let mut names = std::collections::BTreeSet::new();
+                assert_eq!(bound.len(), planned.views().len());
+                for (name, offset, bytes) in &bound {
+                    assert!(names.insert(name));
+                    let view = planned.view(name).context("complete MLA binder requested an unplanned owner")?;
+                    assert_eq!((*offset,*bytes),(view.offset(),view.bytes()));
+                }
+                assert!(records.steps.iter().any(|step| step.jobs.iter().any(|job|
+                    matches!(job,crate::shared::experts::rtx::dense::Job::AbsorbQuant { .. }))));
+                assert!(records.steps.iter().all(|step|step.bytes()<=crate::shared::experts::rtx::dense::STEP_BYTES));
+            } else { assert_arena_bindings(&planned, &requests[&1], &bound); }
             drop(arena);
             device.run(|| verify(&drafter, &layout, &planned))?;
             stream.drain()?;
@@ -566,6 +603,78 @@ pub(crate) fn with_mla_arena_fixture(mut verify: impl FnMut(&DflashDrafter<'_>,
         .map(|(name, shape)| t(name, "F32", shape)).collect::<Vec<_>>());
     assert!(DflashDrafter::mla_arena_requests(snapshot, GlmDraftRepresentation::Bf16Only, 1).is_err());
     Ok(())
+}
+
+#[test]
+fn prompt_window_snapshot_restores_exact_ring_bytes_and_committed_frontier() -> Result<()> {
+    use crate::shared::memory::{device::Allocation, TEST};
+    // The sparse CPU DSO's device extents are host-mapped bytes. Its synchronous
+    // copy primitive writes those bytes even though numerical kernels are disabled.
+    with_mla_arena_fixture_config(true, true, |draft, layout, _| {
+        assert!(draft.mla_windows_only());
+        assert_eq!(draft.mla_draft_page_bytes(), 0);
+        draft.reset_context(0, 0)?;
+        let DraftContext::Mla(context) = &draft.context else { unreachable!() };
+        let end = 1034;
+        let expected_rings = {
+            let mut state = context.state.borrow_mut();
+            for first in (0..end).step_by(64) {
+                let rows = (first..(first+64).min(end)).enumerate()
+                    .map(|(tap_row,position)| ContextRow { tap_row,slot:0,position }).collect::<Vec<_>>();
+                let (plan,reservations) = MlaContextUpdate::checked_paged(&mut state, layout, &rows)?;
+                assert!(reservations.is_empty());
+                state.rings = plan.next;
+            }
+            assert_eq!(state.rings.frontier(0)?, (0,end));
+            assert_eq!(state.pool.frontier(state.bindings[0].unwrap())?, (0,0));
+            state.rings.clone()
+        };
+        let device = crate::shared::memory::device::Device { library:draft.library,id:1 };
+        let windows = draft.mla_window_buffers(0)?;
+        let marks = windows.iter().map(|window| Allocation::new(device,window.bytes,TEST)).collect::<Result<Vec<_>>>()?;
+        let buffers = marks.iter().map(|mark|mark.buffer).collect::<Vec<_>>();
+        let bytes = windows.iter().enumerate().map(|(layer,window)|
+            (0..window.bytes).map(|i|((i*17+layer*31)%251) as u8).collect::<Vec<_>>()).collect::<Vec<_>>();
+        let write = |destination: CuteafdDeviceBuffer,data:&[u8]| draft.library.copy_d2d(destination,
+            CuteafdDeviceBuffer { ptr:data.as_ptr().cast_mut().cast(),bytes:data.len(),device_id:1,flags:0 },data.len());
+        for (&window,data) in windows.iter().zip(&bytes) { write(window,data)?; }
+        draft.copy_mla_windows(0,&buffers,true)?;
+        draft.drain_mla()?;
+        // Simulate recycling the request slot after prompt-end snapshot capture.
+        draft.reset_context(0, 7000)?;
+        for &window in &windows { write(window,&vec![0xa5;window.bytes])?; }
+        draft.copy_mla_windows(0,&buffers,false)?;
+        draft.restore_mla_windows(0,end)?;
+        for (&window,expected) in windows.iter().zip(&bytes) {
+            let mut actual=vec![0;window.bytes];draft.library.copy_d2h(&mut actual,window)?;
+            assert_eq!(&actual,expected,"restored FP8/BF16 ring bytes differ");
+        }
+        let state=context.state.borrow();
+        assert_eq!(state.rings.frontier(0)?,expected_rings.frontier(0)?);
+        assert_eq!(state.rings,expected_rings);
+        assert_eq!(state.pool.frontier(state.bindings[0].unwrap())?,(end,end));
+        Ok(())
+    })?;
+    // Mixed/full MLA still owns page attachments; it must not enter window restore.
+    with_mla_arena_fixture(|draft,_,_| {
+        assert!(!draft.mla_windows_only());
+        assert!(draft.mla_draft_page_bytes()>0);
+        assert!(draft.restore_mla_windows(0,1034).is_err());
+        Ok(())
+    })
+}
+
+#[test]
+fn complete_mla_fp8_arena_covers_actual_loader_scale_views_and_bounded_steps() -> Result<()> {
+    with_mla_arena_fixture_precision(true, |drafter, layout, planned| {
+        assert!(layout.complete_fp8_body());
+        assert_eq!(layout.weights().bf16_values,0);
+        assert_eq!(layout.weights().max_load_staging,crate::shared::experts::rtx::dense::STEP_BYTES as u64);
+        assert!(drafter.layers.iter().all(|layer|matches!(&layer.attention,
+            DraftAttention::Mla(attention) if attention.fp8_scales.is_some())));
+        assert_eq!(planned.payload_bytes() as u64,layout.weights().resident_bytes()?);
+        Ok(())
+    })
 }
 
 #[test]

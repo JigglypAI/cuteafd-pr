@@ -299,7 +299,7 @@ fn draft_home_is_one_solve_choice_that_balances_and_charges_its_bridge() {
 fn ml4_draft_facts_preserve_native_owners_and_share_the_library_upload_bank() {
     use crate::formats::{block_dspark::DsparkRotaryPlan, dflash::MlaDflashConfig, mla::MlaGeometry};
     use crate::families::glm5::draft_representation::{GlmDraftCapacity, GlmDraftRepresentation::Bf16Only};
-    let cfg = MlaDflashConfig { mla: MlaGeometry { hidden: 6144, heads: 64, q_rank: 0,
+    let cfg = MlaDflashConfig { hidden_stream: Default::default(), mla: MlaGeometry { hidden: 6144, heads: 64, q_rank: 0,
         kv_rank: 512, nope: 64, rope: 64, value: 128 }, intermediate: 24576, eps: 1e-5,
         block: 3, group: 0, selector_rank: 512, selector_top_k: 0, taps: vec![1, 18, 36, 54, 71],
         vocab: 204800, mask_token: 0, max_context: 1 << 20, windows: vec![Some(2048); 3],

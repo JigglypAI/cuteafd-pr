@@ -250,9 +250,10 @@ these request values do not imply that a Planned checkpoint has a serving execut
 ### PE Vision Qualification
 
 Inkling and Step-5 use the shared bundled PE tower runtime and image admission.
-`VISION=off` remains the qualified text-only configuration while normal image
-answers are being qualified (#1930, #1994). Explicit `VISION=spark[:rank]` or
-`VISION=rtx[:gpu]` selects the jointly admitted packed tower owner in WIP builds;
+Step-5 defaults to `VISION=auto`: joint admission selects a Spark-first packed
+owner with RTX fallback. `VISION=off` explicitly selects text-only operation.
+Inkling remains text-only by default while normal image answers are qualified (#1930).
+Explicit `VISION=spark[:rank]` or `VISION=rtx[:gpu]` selects the jointly admitted packed owner;
 `VISION_REPLICAS=1..8` and `MEDIA_CACHE_BYTES` use the shared media options.
 Each tower has one weight arena and one scratch backing per replica; tensor
 views do not add another charge. Step-5 images retain ordered local crops and
@@ -701,7 +702,7 @@ Each key is also a global `cuteafd` flag (`--gpu-memory-cap`, `--kv-max-tokens`,
 | `KV_CACHE` | family default | `bf16`, `fp8`; MiMo also `int8` | See the precision table below. |
 | `SWA_KV_CACHE` | `int8` | `bf16`, `int8`, `fp8` | MiMo sliding/MTP rings. |
 | `DRAFT_CONTEXT_WINDOW` | `0` | Nonnegative token count | Kimi K3.1 DSpark context override (other launcher families reject this key). Unset/0 preserves native attention (full context for Lithos K3.1 DSpark, trained window for Inferact); a positive value selects a window, e.g. 2048. It never changes target KV or target taps. |
-| `DRAFT_KV_CACHE` | `fp8` | `bf16`, `fp8` | Drafter ring storage (GLM 5.3, GLM Flash, MiMo, Muse, Kimi GQA block dSpark; Kimi MLA DFlash2 follows target KV). |
+| `DRAFT_KV_CACHE` | `fp8` | `bf16`, `fp8` | Drafter ring storage (GLM 5.3, GLM Flash, MiMo, Muse, Kimi GQA block dSpark and MLA DFlash2). Every drafter selects BF16/FP8 independently of target KV and body weights; default FP8. |
 | `PREFIX_CACHE_ENTRIES` | `auto` | `auto`, non-negative | Snapshot entries; auto derives from context × concurrency. |
 | `PREFIX_CACHE_MARK_MIB` | unset | MiB | Recurrent/ring state retained per mark. |
 | `PREFIX_PARTIAL` | `off` | `on`, `off` | MiMo approximate partial reuse; off keeps exact restores only. Every other family, V4.1 included, restores exact snapshot frontiers only and refuses `on`. |
@@ -726,7 +727,7 @@ Each key is also a global `cuteafd` flag (`--gpu-memory-cap`, `--kv-max-tokens`,
 | `SPECULATOR_MODEL_REVISION` | empty | 40–64 lowercase hex | Drafter revision. |
 | `SPECULATOR_DEPTH` | 3 for local Qwen/Step-5, else 1 | positive int | Native MTP draft depth. |
 | `DRAFT_LENGTH` | unset (follows `DRAFT_POLICY`) | positive int | Measurement override: verify a fixed number of draft tokens per step, min(value, the drafter's native block), further capped by the row budget at high concurrency. Overrides `DRAFT_POLICY`; acceptance history is still recorded. Every family and speculator (DFlash2, dSpark, MTP, Markov). Without a speculator it is ignored with one startup log; reports and cards say `no speculation`. |
-| `SPECULATOR_FP8` | `auto` | `auto`, `on`, `off` | GLM/Qwen/MiMo/Kimi drafter precision: unset, `auto` and `on` select single-copy FP8 projection weights; `off` keeps BF16. Rust resolves the same MiMo precision for planning and serving, independent of checkpoint alias or core view. Kimi block DSpark supports TP1 and physical TP2 with native BF16 norms/Markov tensors; FP8 applies to content-paired K3.1 DSpark in every core view and layout. Independent of `DRAFT_KV_CACHE`. |
+| `SPECULATOR_FP8` | `auto` | `auto`, `on`, `off` | GLM/Qwen/MiMo/Kimi drafter precision: unset, `auto` and `on` select single-copy FP8 body linear projection weights; `off` keeps BF16. Rust resolves the same MiMo precision for planning and serving, independent of checkpoint alias or core view. Kimi block DSpark supports TP1 and physical TP2 with native BF16 norms/Markov tensors; FP8 applies to content-paired K3.1 DSpark in every core view and layout. Kimi MLA includes QKV-A, Q-B, absorbed UK/UV and output; embeddings, norms, codebooks and prediction heads remain native. Independent of `DRAFT_KV_CACHE`. |
 | `DRAFT_POLICY` | `history` | `history`, `off` | How many drafted positions each request verifies; one policy for every family and drafter. `history` keeps a position while its acceptance probability is above 0.5, where the probability is the request's accepted/reached counts at that position over its last 8 verify rounds, shrunk toward the server-wide rate over the last 256 rounds that reached it (prior strength 8). One position past the stop is always verified so an estimate cannot lock low; a drafter with a trained confidence head (dSpark) skips that explore when the head's calibrated probability is below 0.3, and the skip counts as a miss at that position. The drafter's full native block is available (V4.1: 7). When a round exceeds the 64 verify rows, positions are granted across requests by the same probabilities, highest first. History copies past an agreeing draft use the same rule on their own counts. `off` verifies no drafts. |
 | `DRAFT_CONTEXT_SLOTS` | `max(20, drafts)` | positive int | GLM/MiMo drafter context slots. |
 | `DRAFT_SEQUENCES` | engine default | positive int | Maximum drafts in one batch. |
@@ -853,7 +854,7 @@ Keys here that are optional and off by default are also listed under
 | `GLM5_FLASH_TARGET_HEAD` | `auto` | `auto`, `tensor`, `exact` | GLM Flash's `TARGET_HEAD` spelling. |
 | `TP2_ATTENTION`, `TP2_QUERY_PROJECTION`, `TP2_OUTPUT_PROJECTION` | `off` | `on`, `off` | V4.1 TP2 projections on the RTX pair. |
 | `TP2_DSPARK_EXPERTS` | `on` with dual RTX + dSpark, otherwise `off` | `on`, `off` | V4/V4.1 TP2 draft experts; requires two RTX GPUs and dSpark. Explicit `off` retains GPU0-only draft experts. |
-| `TP2_DFLASH` | MiMo/Kimi/Muse dual-RTX DFlash2: `on`; GLM Flash: planner choice; otherwise: `off` | `on`, `off` | DFlash tensor parallelism on an active two-RTX split with DFlash2. Muse defaults to `on` with dual-RTX DFlash2 (`off` remains available): rank-local query/KV heads and MLP neurons use the existing target peer exchange; selector and vocabulary head stay on GPU1. GLM Flash compares the whole GPU0 drafter with a head split: larger admitted pool wins, ties split for balance. Omit the key for this automatic choice; explicit `on` or `off` wins. Auto requires two GPUs and checkpoint-derived drafter owners (`--drafter-gib` keeps whole placement). GLM Flash selector weights and head-only workspace stay on GPU0. Plan accepts `--draft-fp8 true|false` (omission defaults to FP8 for GLM Flash) and `--draft-linear w8a16|wide|w8a8` and charges the same representation and scratch as serve. MiMo and GLM Flash split query/KV heads and MLP neurons, retaining replicated residual/convolution owners. Kimi splits cache and attention by Context; producer weights and FFN stay on GPU1. CLI false overrides config on. |
+| `TP2_DFLASH` | MiMo/Muse dual-RTX DFlash2: `on`; Kimi/GLM Flash: planner choice; otherwise: `off` | `on`, `off` | DFlash tensor parallelism on an active two-RTX split with DFlash2. Muse defaults to `on` with dual-RTX DFlash2 (`off` remains available): rank-local query/KV heads and MLP neurons use the existing target peer exchange; selector and vocabulary head stay on GPU1. GLM Flash compares the whole GPU0 drafter with a head split: larger admitted pool wins, ties split for balance. Omit the key for this automatic choice; explicit `on` or `off` wins. Auto requires two GPUs and checkpoint-derived drafter owners (`--drafter-gib` keeps whole placement). GLM Flash selector weights and head-only workspace stay on GPU0. Plan accepts `--draft-fp8 true|false` (omission defaults to FP8 for GLM Flash) and `--draft-linear w8a16|wide|w8a8` and charges the same representation and scratch as serve. MiMo and GLM Flash split query/KV heads and MLP neurons, retaining replicated residual/convolution owners. Kimi derives Context support from checkpoint geometry: noncausal h64 defaults to split cache/attention with producer weights and FFN on GPU1; causal h96 defaults to the admitted whole-drafter home because its Context partial kernel is absent. Explicit `on` for h96 names the missing kernel and refuses before allocation. CLI false overrides config on. |
 
 ## Concurrency and serving
 
@@ -1013,12 +1014,14 @@ Speculator (`SPECULATOR`):
 | `dspark` | ✓ (default) | ✓ (default) | ✓ (Mistral Large 4 only) | ✓ | ✗ | ✗ | ✓ (default unless hidden is 5120) | ✓ (content-paired K3.1 default in every view/layout; otherwise opt-in) | ✗ | ✗ | ✗ |
 | `mtp` | ✗ | ✗ | ✗ | ✗ | ✓ | ✓ (default) | ✓ (local EXL3/NVFP4 default, depth 3) | ✗ | ✓ (default) | ✗ | ✗ |
 
-Qwen4 unset/`auto` selects native MTP (depth 3) only for qualified local
-EXL3 or ModelOpt NVFP4 with one MTP stage and an admitted Spark expert
-world of zero. Configured Spark inventory and admitted vision-only ranks do
-not disable this default. Media-only Spark layouts still require an available
-worker and complete encoder admission. Other formats and Spark expert layouts
-default off. Explicit values win.
+Qwen4 unset/`auto` selects native MTP whenever the checkpoint declares its MTP
+layer, independent of expert quantization, core view, repository revision or
+admitted Spark expert world. The one native layer recursively drafts three
+tokens by default; `SPECULATOR_DEPTH` overrides that depth and explicit
+`SPECULATOR=off` disables drafting. Multiple checkpoint MTP layers require an
+unimplemented executor and refuse precisely; unsupported tensors or native
+exports still refuse through the ordinary structural contract. Media-only
+Spark layouts still require an available worker and complete encoder admission.
 Qwen4 keeps the exact pre-allocation-admitted expert set resident, with no runtime paging.
 `RTX_EXPERT_LAYERS=auto` is pool-first on one or two RTX devices, including
 Spark-backed layouts: whole routed layers on one RTX, TP2 halves on two, and

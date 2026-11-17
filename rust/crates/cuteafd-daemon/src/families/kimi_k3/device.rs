@@ -68,6 +68,7 @@ pub(crate) fn residual_site(cfg: &KimiK3Config, site: MixSite) -> Result<KimiRes
 /// W9 supplies admitted allocations and TP2 projection slices to these calls.
 pub(crate) struct W8<'a> {
     residuals: Vec<(KimiResidualSite, KimiResidual<'a>)>,
+    streams: Vec<KimiResidual<'a>>,
     dense: KimiFfn<'a>,
     shared: KimiFfn<'a>,
     cfg: KimiK3Config,
@@ -91,7 +92,9 @@ impl<'a> W8<'a> {
                 residuals.push((key, KimiResidual::load(programs, key)?));
             }
         }
-        Ok(Self { residuals, dense: KimiFfn::load(programs, cfg.dense_intermediate / ranks, mode)?,
+        let streams = (2..=cfg.max_residual_blocks() + 1)
+            .map(|candidates| KimiResidual::load_stream(programs, candidates)).collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(Self { residuals, streams, dense: KimiFfn::load(programs, cfg.dense_intermediate / ranks, mode)?,
             shared: KimiFfn::load(programs, cfg.moe_intermediate * cfg.shared_experts / ranks, mode)?, cfg: cfg.clone() })
     }
 
@@ -177,6 +180,11 @@ fn packing_inventory(core: Option<&serde_json::Value>, native: &[String])
     for cache in ["", "_fp8"] {
         add(format!("kimik31_paged_staging_gather{cache}"), SequenceLocal)?;
     }
+    add("kimik31_mla_draft_output_causal_h96_m64".into(), SequenceLocal)?;
+    for cache in ["", "_fp8"] {
+        add(format!("kimik31_mla_draft_producer_causal_h96{cache}_m64"), SequenceLocal)?;
+        add(format!("kimik31_mla_draft_attention_causal_w1024{cache}_m64"), SequenceLocal)?;
+    }
     add("kimik3_lse_combine2".into(), SequenceLocal)?;
     for cache in ["", "_fp8"] {
         add(format!("kimik3_paged_staging_gather{cache}"), SequenceLocal)?;
@@ -202,6 +210,7 @@ fn packing_inventory(core: Option<&serde_json::Value>, native: &[String])
         }
     }
     add("kimik3_attn_res_c1_keep_append".into(), PackedRows)?;
+    for candidates in 2..=9 { add(format!("kimik3_attn_res_stream_c{candidates}"), PackedRows)?; }
     for candidates in 2..=9 {
         add(format!("kimik3_attn_res_stream_c{candidates}"), PackedRows)?;
         for prefix in ["add", "replace", "keep"] {
@@ -1968,6 +1977,26 @@ impl<'a> LocalLane<'a> {
             // SAFETY: the exact persistent lane owns all three disjoint planes.
             unsafe { self.programs.add.launch(prefix, delta, output, rows * 7168, self.lane.stream.raw) }
         })?;
+        Ok(output)
+    }
+
+    /// Vendor DSpark/DFlash captures the next consumer's bank aggregate,
+    /// not the unmixed decoder output and not its input RMSNorm result.
+    pub(crate) fn draft_stream(&mut self, layer: usize, rows: usize) -> Result<CuteafdDeviceBuffer> {
+        let site = super::block::draft_mix_site(&self.cfg, layer)?;
+        let (score_weight, norm_weight) = match site {
+            MixSite::Attention(next) => (self.layer(next)?.buffer("attention.score")?, self.layer(next)?.buffer("attention.norm")?),
+            MixSite::Output => (self.global.buffer("output.score")?, self.global.buffer("output.norm")?),
+            MixSite::Ffn(_) => unreachable!("a draft stream never consumes FFN weights"),
+        };
+        let candidates = residual_site(&self.cfg, site)?.candidates;
+        let program = self.programs.w8.streams.get(candidates - 2).context("unresolved Kimi draft stream")?;
+        let output = self.plane("normalized", rows, 7168)?;
+        let batch = KimiResidualBatch { rows, arena_rows: self.lane.rows(), arena: self.lane.buffer("residual arena")?,
+            delta: self.plane("delta", rows, 7168)?, score_weight, norm_weight, output };
+        // This specialization neither advances prefix/bank state nor normalizes
+        // the mixture. The following target consumer still runs exactly once.
+        self.lane.stream.device.run(|| Ok(program.launch(batch, self.lane.stream.raw)?))?;
         Ok(output)
     }
 

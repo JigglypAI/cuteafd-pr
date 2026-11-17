@@ -40,6 +40,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
     let rows = prefill.span_rows as usize;
     let unit = prefill.unit_rows as usize;
     let cfg = model.cfg();
+    report.tp2_dflash = Some(opts.tp2_dflash);
     let ranks = requested.spark_ranks();
     let gpus = opts.rtx_bytes.len();
     let mut memory = MemoryLayout { devices: Vec::new(), pool_tokens: 0, waste: Vec::new(), notes: vec![
@@ -146,7 +147,17 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
     }
     // Weight upload extents come from checkpoint geometry, not executable
     // workspace metadata. Header-only forecasts retain the same physical owners.
-    let globals = match crate::families::kimi_k3::weight_layout::GlobalLayout::ranks_with_core(cfg, &model.core, gpus) {
+    let final_tap = (|| -> anyhow::Result<bool> {
+        let Some(snapshot) = &opts.kimi_drafter_snapshot else { return Ok(false) };
+        let raw: serde_json::Value = serde_json::from_slice(&std::fs::read(snapshot.join("config.json"))?)?;
+        let stream = crate::families::kimi_k3::draft::DraftHiddenStream::from_config(&raw)?;
+        Ok(stream == crate::families::kimi_k3::draft::DraftHiddenStream::AttnRes
+            && raw["dflash_config"]["target_layer_ids"].as_array().is_some_and(|taps|
+                taps.iter().any(|tap| tap.as_u64() == cfg.layers.checked_sub(1).map(|last| last as u64))))
+    })();
+    let globals = match final_tap.and_then(|final_tap|
+        crate::families::kimi_k3::weight_layout::GlobalLayout::ranks_with_core(cfg, &model.core, gpus)?
+            .into_iter().map(|layout| layout.with_final_attn_res(cfg, final_tap)).collect::<anyhow::Result<Vec<_>>>()) {
         Ok(value) => value, Err(error) => {
             report.refuse_placement(format!("Kimi packed global inventory refused: {error:#}"), "Check checkpoint global geometry."); return memory;
         }
@@ -297,9 +308,9 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
                 "Kimi TP2 DFlash requires two physical coordinator GPUs");
             let representation = if opts.kimi_draft_fp8 { GlmDraftRepresentation::Fp8Only }
                 else { GlmDraftRepresentation::Bf16Only };
-            DraftLayout::Mla(draft.runtime_layout(representation, GlmDraftCapacity::new(slots, slots.min(8), draft.block)?,
+            DraftLayout::Mla(draft.serving_runtime_layout(representation, GlmDraftCapacity::new(slots, slots.min(8), draft.block)?,
                 usize::try_from(context)?,slots.checked_mul(usize::try_from(context)?).context("draft pool overflow")?,
-                opts.physical_sms.unwrap_or(188) as usize,0,opts.mla_kv)?.with_context_split(opts.tp2_dflash)?)
+                opts.physical_sms.unwrap_or(188) as usize,0,draft.cache_format(opts.draft_kv_cache))?.with_context_split(opts.tp2_dflash)?)
         };
         match &layout {
             DraftLayout::Block(local)=>{ local.validate_projection_programs(manifest.as_ref().context("block dSpark requires installed projection inventory")?)?; }
@@ -475,6 +486,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
             return memory;
         }
     };
+    let draft_layout = draft.clone();
     let block_tp2 = matches!(draft,Some(crate::families::kimi_k3::draft::DraftLayout::BlockTp2 { .. }));
     let draft = match &draft {
         Some(layout) => match kimi::draft_layout_facts(layout, page_rows, maximum_pages, head_rank as u8) {
@@ -525,6 +537,12 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
         report.refuse_placement(format!("Kimi packed arena inventory refused: {error:#}"),
             "Provide complete selected native weight extents.");
         return memory;
+    }
+    if let Some(layout) = &draft_layout {
+        if let Err(error) = recipe.draft_homes(layout, &model.core) {
+            report.refuse_placement(format!("Kimi draft homes refused: {error:#}"), "Supply native full-head geometry.");
+            return memory;
+        }
     }
     if let Err(error) = recipe.blas_owners(if model.core.get_weight("language_model.lm_head").is_some() {
         crate::placement::planner::serving::BlasHead::Native } else { opts.bf16_target_head }) {

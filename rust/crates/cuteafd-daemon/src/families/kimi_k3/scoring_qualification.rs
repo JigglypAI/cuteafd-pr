@@ -83,7 +83,6 @@ fn k31_raw_and_streamed_scoring_match_ordinary_c16() -> Result<()> {
     let cfg = KimiK3Config::from_hf(&checkpoint.config)?;
     ensure!(cfg.dsa.is_some(), "paired K3.1 proof requires Gated DSA");
     cfg.release_geometry()?;
-    cfg.validate_speculation(None)?;
     let prefill = args.prefill()?;
     ensure!((prefill.unit_rows, prefill.waves, prefill.span_rows) == (2752, 3, 8256),
         "paired proof must retain ordinary prefill reserve");

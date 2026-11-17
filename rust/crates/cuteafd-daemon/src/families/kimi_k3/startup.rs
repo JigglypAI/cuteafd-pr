@@ -127,7 +127,7 @@ pub(crate) fn load<'a, const RANKS: usize>(library: &'a Arc<cuteafd_ffi::NativeL
     checkpoint: &cuteafd_loader::plan::Checkpoint, full: &KimiK3Config,
     cfg: &KimiK3Config, mut options: Options<'_, RANKS>) -> Result<Loaded<'a>> {
     ensure!(matches!(RANKS, 1 | 2), "Kimi startup requires one or two physical devices");
-    full.validate_speculation(options.draft.as_ref().map(super::draft::Options::kind).transpose()?)?;
+
     options.role.validate(full, options.peers.len(), options.draft.is_some())?;
     let skip_routed_experts = options.role.skip_routed_experts();
     let mut memory = memory_phases(library, &options.devices)?;
@@ -135,7 +135,7 @@ pub(crate) fn load<'a, const RANKS: usize>(library: &'a Arc<cuteafd_ffi::NativeL
     if RANKS == 2 { options.attention = Some(cuteafd_loader::families::kimi_k3::resolve_attention(options.attention, RANKS)); }
     check_attention(options.attention, RANKS, options.graphs)?;
     ensure!(options.draft.as_ref().is_none_or(|draft| draft.cache_format == options.cache_format),
-        "Kimi target/draft cache records differ");
+        "Kimi draft options must retain the target cache selection");
     let spark_ranks = options.peers.len();
     ensure!(spark_ranks <= cuteafd_core::MAX_SPARK_WORLD, "Kimi Spark peer inventory exceeds eight");
     let core = cuteafd_loader::plan::families::kimi::core_inventory(checkpoint)?;
@@ -164,10 +164,16 @@ pub(crate) fn load<'a, const RANKS: usize>(library: &'a Arc<cuteafd_ffi::NativeL
         draft.layout(options.slots, options.max_context, library.sm_count()?,head))).transpose()?;
     // Resolve native modules before the measured baseline, while retaining their handles.
     let _draft_modules = options.draft.as_ref().filter(|_| matches!(draft_layout,
-        Some(cuteafd_loader::families::kimi_k3::draft::DraftLayout::Mla(_)))).map(|_| devices[head].run(|| {
+        Some(cuteafd_loader::families::kimi_k3::draft::DraftLayout::Mla(_)))).map(|draft| devices[head].run(|| {
         use cuteafd_ffi::mla_draft::{MlaDraft, MlaDraftWindow};
-        Ok([MlaDraft::load(programs, "kimik3", MlaDraftWindow::Full, options.cache_format)?,
-            MlaDraft::load(programs, "kimik3", MlaDraftWindow::Sliding4096, options.cache_format)?])
+        let cfg=cuteafd_loader::formats::dflash::MlaDflashConfig::read(&draft.snapshot)?;
+        let cache=cfg.cache_format(draft.draft_kv_cache);
+        let load = |namespace, window| if draft.fp8 { MlaDraft::load_fp8_weights(programs, namespace, window, cache) }
+            else { MlaDraft::load(programs, namespace, window, cache) };
+        if cfg.kind == cuteafd_core::coordinator_programs::MlaDraftKind::CausalDflash2 {
+            Ok(vec![load("kimik31",MlaDraftWindow::CausalSliding1024)?])
+        } else { Ok(vec![load("kimik3", MlaDraftWindow::Full)?,
+            load("kimik3", MlaDraftWindow::Sliding4096)?]) }
     })).transpose()?;
     let _block_projection_modules=if let Some(layout)=&draft_layout {
         use cuteafd_loader::families::kimi_k3::draft::DraftLayout;
@@ -186,9 +192,10 @@ pub(crate) fn load<'a, const RANKS: usize>(library: &'a Arc<cuteafd_ffi::NativeL
     memory.sample("modules-draft-mla")?;
     let _draft_context_modules = if draft_layout.as_ref().is_some_and(|layout| layout.context_split()) {
         use cuteafd_ffi::mla_draft::{MlaDraftPartial, MlaDraftCombine, MlaDraftWindow};
+        let cache = match draft_layout.as_ref() { Some(cuteafd_loader::families::kimi_k3::draft::DraftLayout::Mla(layout))=>layout.cache_format(), _=>unreachable!() };
         let partials = devices.iter().map(|device| device.run(|| Ok([
-            MlaDraftPartial::load(programs, "kimik3", MlaDraftWindow::Full, options.cache_format)?,
-            MlaDraftPartial::load(programs, "kimik3", MlaDraftWindow::Sliding4096, options.cache_format)?])))
+            MlaDraftPartial::load(programs, "kimik3", MlaDraftWindow::Full, cache)?,
+            MlaDraftPartial::load(programs, "kimik3", MlaDraftWindow::Sliding4096, cache)?])))
             .collect::<Result<Vec<_>>>()?;
         Some((partials, devices[head].run(|| Ok(MlaDraftCombine::load(programs, "kimik3")?))?))
     } else { None };

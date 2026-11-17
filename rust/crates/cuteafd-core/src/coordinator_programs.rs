@@ -129,17 +129,20 @@ pub struct MlaDraftProgramLayout {
 /// Both share the attention geometry (64 heads, 576/512 latent) and the
 /// ungated UV/o output; they differ in the producer and its scratch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum MlaDraftKind { Dflash2, Ml4Dspark }
+pub enum MlaDraftKind { Dflash2, CausalDflash2, Ml4Dspark }
 
 impl MlaDraftKind {
-    pub fn hidden(self) -> usize { match self { Self::Dflash2 => 7168, Self::Ml4Dspark => 6144 } }
+    pub fn hidden(self) -> usize { match self { Self::Dflash2 | Self::CausalDflash2 => 7168, Self::Ml4Dspark => 6144 } }
+    pub fn heads(self) -> usize { if self == Self::CausalDflash2 { 96 } else { 64 } }
+    pub fn is_dflash(self) -> bool { self != Self::Ml4Dspark }
+    pub fn selector_top_k(self) -> usize { match self { Self::Dflash2 => 16, Self::CausalDflash2 => 32, Self::Ml4Dspark => 0 } }
 
     /// Producer scratch at `rows`: DFlash2 [rows, 2112] q|kv_a then [rows, 64, 192] q;
     /// mtp_dspark [rows, 64, 128] q then [rows, 576] kv_a.
     fn producer_scratch(self, rows: usize) -> usize {
         let align = |n: usize| n.div_ceil(1024) * 1024;
         match self {
-            Self::Dflash2 => align(rows * 2112 * 2) + align(rows * MlaDraftProgramLayout::HEADS * 192 * 2),
+            Self::Dflash2 | Self::CausalDflash2 => align(rows * 2112 * 2) + align(rows * self.heads() * 192 * 2),
             Self::Ml4Dspark => align(rows * MlaDraftProgramLayout::HEADS * 128 * 2) + align(rows * 576 * 2),
         }
     }
@@ -156,15 +159,16 @@ impl MlaDraftProgramLayout {
 
     pub fn for_kind(kind: MlaDraftKind, context: usize) -> Result<Self, MlaDraftLayoutError> {
         if !(1..=1_048_576).contains(&context) { return Err(MlaDraftLayoutError); }
+        let heads = kind.heads();
         let pages = context.div_ceil(Self::PAGE);
         let splits = pages.min(16);
         let align = |n: usize| n.div_ceil(1024) * 1024;
-        let partial_output_bytes = if splits > 1 { align(Self::ROWS * Self::HEADS * splits * 512 * 2) } else { 0 };
-        let partial_lse_bytes = if splits > 1 { align(Self::ROWS * Self::HEADS * splits * 4) } else { 0 };
+        let partial_output_bytes = if splits > 1 { align(Self::ROWS * heads * splits * 512 * 2) } else { 0 };
+        let partial_lse_bytes = if splits > 1 { align(Self::ROWS * heads * splits * 4) } else { 0 };
         Ok(Self { context, splits, chunks_per_split: pages.div_ceil(splits),
             partial_output_bytes, partial_lse_bytes,
             scratch: [kind.producer_scratch(Self::ROWS),
-                partial_output_bytes + partial_lse_bytes, align(Self::ROWS * Self::HEADS * 128 * 2)] })
+                partial_output_bytes + partial_lse_bytes, align(Self::ROWS * heads * 128 * 2)] })
     }
 
     /// One arena can cover all three phase-disjoint native scratch planes.
