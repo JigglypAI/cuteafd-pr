@@ -12,6 +12,12 @@ pub const ORACLE_TORCH_COMMIT: &str = "cf30153c4c131c8164ee7798e5022d810682e2cb"
 pub const TOWER_RMS_EPS: f32 = 1.1920928955078125e-7;
 pub const PROJECTOR_RMS_EPS: f32 = 1e-5;
 pub const SOURCE_BYTES: u64 = 894_717_952;
+/// Processor limits floor-to14 before its final28px padding. The executed
+/// 7069x1833 boundary reaches132x506 patches; full official encoder+projector
+/// and dynamic attention passed this shape on SM120 and SM121.
+pub const MAX_IMAGE_PATCHES: u32 = 66_792;
+pub const MAX_IMAGE_TOKENS: u32 = MAX_IMAGE_PATCHES / 4;
+pub const MAX_IMAGE_CANVAS_PIXELS: u64 = MAX_IMAGE_PATCHES as u64 * 14 * 14;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct VisionContract {
@@ -231,7 +237,7 @@ impl VisionContract {
             .checked_mul(width)
             .context("Kimi vision grid overflow")?;
         ensure!(
-            frames.checked_mul(rows).is_some_and(|n| n <= 65536),
+            frames.checked_mul(rows).is_some_and(|n| n <= MAX_IMAGE_PATCHES as usize),
             "Kimi vision grid exceeds native capacity"
         );
         Ok(rows / (self.merge * self.merge))

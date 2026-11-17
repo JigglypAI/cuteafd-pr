@@ -4,7 +4,7 @@ use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::vision::{
     TowerExtension, TowerNorm, TowerProjector, VisionBlock, VisionSpec, NO_VISION_OFFSET as NONE,
 };
-use cuteafd_loader::families::kimi_k3::vision::{VisionContract, PROJECTOR_RMS_EPS, TOWER_RMS_EPS};
+use cuteafd_loader::families::kimi_k3::vision::{VisionContract, MAX_IMAGE_TOKENS, PROJECTOR_RMS_EPS, TOWER_RMS_EPS};
 use std::{collections::BTreeMap, path::Path};
 
 /// Official GPU arange/pow bytes, identical on SM120 and SM121 in the pinned
@@ -18,8 +18,8 @@ const INV_FREQ_BITS: [u32; 32] = [
 
 pub(crate) fn tower(snapshot: &Path, max_output_rows: usize) -> Result<TowerSpec> {
     ensure!(
-        (1..=16384).contains(&max_output_rows),
-        "Kimi vision output capacity must be1..=16384"
+        (1..=MAX_IMAGE_TOKENS as usize).contains(&max_output_rows),
+        "Kimi vision output capacity must be1..={MAX_IMAGE_TOKENS}"
     );
     let cfg: serde_json::Value = cuteafd_loader::read_json_file(&snapshot.join("config.json"))?;
     let geometry = VisionContract::from_config(&cfg)?;
@@ -196,7 +196,7 @@ mod tests {
         file.write_all(&(header.len() as u64).to_le_bytes())?;
         file.write_all(&header)?;
         file.set_len(8 + header.len() as u64 + end)?;
-        let spec = tower(dir.path(), 16384)?;
+        let spec = tower(dir.path(), MAX_IMAGE_TOKENS as usize)?;
         assert_eq!(spec.native.weight_bytes, 894_718_080);
         assert_eq!(spec.native.blocks.len(), 27);
         let extension = spec.native.tower.as_ref().unwrap();
@@ -210,7 +210,7 @@ mod tests {
     }
     #[test]
     fn capacity_is_bounded_before_touching_checkpoint() {
-        for capacity in [0, 16385] {
+        for capacity in [0, MAX_IMAGE_TOKENS as usize + 1] {
             assert!(tower(Path::new("absent"), capacity).is_err());
         }
     }
