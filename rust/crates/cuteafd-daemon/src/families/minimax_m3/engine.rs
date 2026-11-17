@@ -1594,9 +1594,9 @@ mod tests {
         let bank = PageBank::new(vec![stream.clone()], &cfg, capacity, MsaCache::new(2, 16, 4, 320)?,
             MsaRope::new(&cfg, 320)?, 0..2)?;
         bank.reserve_tables(stream.raw)?;
-        let mut placements = [Placement { units: vec![7, 2, 9, 14, 15], slot: 3, len: 63 },
-            Placement { units: vec![4, 11, 1], slot: 0, len: 128 },
-            Placement { units: vec![8, 6], slot: 2, len: 1 }];
+        let mut placements = [Placement { media_spans: Vec::new(), units: vec![7, 2, 9, 14, 15], slot: 3, len: 63 },
+            Placement { media_spans: Vec::new(), units: vec![4, 11, 1], slot: 0, len: 128 },
+            Placement { media_spans: Vec::new(), units: vec![8, 6], slot: 2, len: 1 }];
         for placement in &placements { bank.install(placement, stream.raw)?; }
         let tokens = [vec![37; 270], vec![71; 133], vec![113; 2]];
         let starts = placements.iter().map(|placement| placement.len).collect::<Vec<_>>();
@@ -1653,7 +1653,7 @@ mod tests {
     #[test]
     fn heads_flattened_queries_share_identity_validation_and_verify_cycle() -> Result<()> {
         let schedule = Requests::new(RequestCapacity::with_queries(4, 64, 32)?, 4096, 60, 3)?;
-        let mut placements = (0..4).map(|row| Placement { units: vec![3, 7], slot: 2, len: 63 + row })
+        let mut placements = (0..4).map(|row| Placement { media_spans: Vec::new(), units: vec![3, 7], slot: 2, len: 63 + row })
             .collect::<Vec<_>>();
         let token = [17];
         let mut requests = placements.iter_mut().map(|placement| ServingRequest {
@@ -1868,7 +1868,7 @@ mod tests {
             Tag::workspace("minimax/test/fault-abort"))?, stream: Rc::new(Stream::new(device)?) };
         device.run(|| library.cuda_zero_bytes(arithmetic.abort.buffer, 256))?;
         fixture.peer_stream_fault(&library, stream.raw)?;
-        let mut placement = Placement { units: vec![0], slot: 0, len: 0 };
+        let mut placement = Placement { media_spans: Vec::new(), units: vec![0], slot: 0, len: 0 };
         let mut requests = [ServingRequest { identity: 1, kind: ExpertV2SourceKind::Prefill,
             placement: &mut placement, start: 0, tokens: &[7], heads: 0..1 }];
         let unit = Unit { index: 0, sequence: 0, segments: vec![UnitSegment { sequence: 0,

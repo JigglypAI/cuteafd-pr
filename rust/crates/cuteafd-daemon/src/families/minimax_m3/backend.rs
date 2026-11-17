@@ -397,11 +397,12 @@ impl<'e, 'a> Backend<'a> for MiniMaxBackend<'e, 'a> {
         ensure!(spans == media.spans(), "MiniMax probe media coordinates differ");
         Ok(())
     }
-    fn placement(&self, units: Vec<u32>, slot: i32) -> Placement { Placement { units, slot: slot as usize, len: 0 } }
+    fn placement(&self, units: Vec<u32>, slot: i32) -> Placement { Placement { media_spans: Vec::new(), units, slot: slot as usize, len: 0 } }
     fn bind_request(&self, placement: &mut Placement, _: (), media: RequestMedia,
         tokens: &[u32], resume: usize) -> Result<()> {
         self.idle()?;
         self.owners.storage.probe_media.borrow_mut().remove(&placement.slot);
+        placement.media_spans=media.spans().to_vec();
         if !media.spans().is_empty() { self.owners.storage.probe_media.borrow_mut().insert(placement.slot, media); }
         ensure!(placement.len == resume && resume <= tokens.len(), "MiniMax restored request frontier differs");
         self.owners.storage.requests.borrow().ranks[0].bank.validate(placement, resume)?;
@@ -775,7 +776,7 @@ mod tests {
                         }
                     }
                     let mut placements=members.iter().map(|&slot| -> Result<_> {
-                        let mut placement=Placement { units:pages[slot].clone(),slot,len:0 };
+                        let mut placement=Placement { media_spans: Vec::new(), units:pages[slot].clone(),slot,len:0 };
                         family.bind(&mut placement).map_err(|e| anyhow::anyhow!(e.to_string()))?;
                         backend.identities.borrow_mut().insert(slot,(slot+1) as u64);
                         backend.prefill_device(&mut placement,&tokens[slot..slot+prompt],0,&pool)?;
@@ -854,7 +855,7 @@ mod tests {
                     }
                 }
                 let mut placements = pages.iter().enumerate().map(|(slot,pages)| -> Result<_> {
-                    let mut placement = Placement { units:pages.clone(),slot,len:0 };
+                    let mut placement = Placement { media_spans: Vec::new(), units:pages.clone(),slot,len:0 };
                     family.bind(&mut placement).map_err(|e| anyhow::anyhow!(e.to_string()))?;
                     backend.identities.borrow_mut().insert(slot,(slot+1) as u64);
                     Ok(placement)
@@ -1195,7 +1196,7 @@ mod tests {
         let library = fixture.load()?;
         fixture.immediate_copies(&library)?;
         let (bank, family) = family(&library)?;
-        let mut placement = Placement { units: vec![7, 3, 11], slot: 2, len: 0 };
+        let mut placement = Placement { media_spans: Vec::new(), units: vec![7, 3, 11], slot: 2, len: 0 };
         let tokens = (0..65).map(|i| (i * 37 % 251) as u32).collect::<Vec<_>>();
         append(&family, &bank, &mut placement, &tokens[..64])?;
         append(&family, &bank, &mut placement, &tokens[64..])?;
@@ -1248,7 +1249,7 @@ mod tests {
             entries: 8, mark_slots: 0, keep_logits: true, min_tokens: 1 }, None)?;
         let tokens = (0..end).map(|i| (i * 73 + i / 7) as u32 % 251).collect::<Vec<_>>();
         let mut original = cache.admit(&family, &tokens[..65], 256, false,
-            |units| Placement { units, slot: 0, len: 0 })?.placement;
+            |units| Placement { media_spans: Vec::new(), units, slot: 0, len: 0 })?.placement;
         append(&family, &bank, &mut original, &tokens[..65])?;
         assert!(cache.capture(&family, SnapshotKind::Prompt, &tokens[..65], &original,
             After::from_logits(&[0.0, 1.0], true))?);
@@ -1262,14 +1263,14 @@ mod tests {
         append(&family, &bank, &mut original, &[239; 41])?;
         cache.release(&family, &original.units)?;
         let hit = cache.admit(&family, &tokens, 256, false,
-            |units| Placement { units, slot: 1, len: 0 })?;
+            |units| Placement { media_spans: Vec::new(), units, slot: 1, len: 0 })?;
         assert_eq!(hit.resume, resume);
         assert_eq!(hit.source.as_ref().unwrap().kind, kind);
         assert!(hit.source.as_ref().unwrap().plan.exact());
         let mut restored = hit.placement;
         binding(&bank, &restored)?;
         let mut cold = cache.admit_cold(&family, tokens.len(), 256,
-            |units| Placement { units, slot: 2, len: 0 })?.placement;
+            |units| Placement { media_spans: Vec::new(), units, slot: 2, len: 0 })?.placement;
         append(&family, &bank, &mut cold, &tokens[..resume])?;
         assert_live_rows_equal(&bank, &restored, &cold, 0..resume)?;
         assert_eq!(model_logits(&bank, &restored)?, model_logits(&bank, &cold)?);
@@ -1315,7 +1316,7 @@ mod tests {
 
     #[test]
     fn accept_checks_original_identity_pages_start_and_tokens_not_mutated_length() -> Result<()> {
-        let sent = Submitted { identity: 91, placement: Placement { units: vec![3, 7], slot: 2, len: 63 }, tokens: vec![101] };
+        let sent = Submitted { identity: 91, placement: Placement { media_spans: Vec::new(), units: vec![3, 7], slot: 2, len: 63 }, tokens: vec![101] };
         let mut actual = sent.placement.clone();
         actual.len = 64;
         sent.validate(91, &actual, 63, &[101])?;

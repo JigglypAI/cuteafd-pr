@@ -467,7 +467,7 @@ fn run_split(args: GoldenArgs, view: CheckpointView, checkpoint: Checkpoint,
         probe.admitted("minimax_m3", &window.tokens, 0);
         probe.selected_score_path(if args.decode { "decode" } else { "prefill" });
         probe.provenance(provenance.clone());
-        let mut placement = Placement { units: (0..count.div_ceil(64)).map(|page| page as u32).collect(), slot: 0, len: 0 };
+        let mut placement = Placement { media_spans: Vec::new(), units: (0..count.div_ceil(64)).map(|page| page as u32).collect(), slot: 0, len: 0 };
         for rank in &owners.storage.requests.borrow().ranks {
             let stream = &rank.bank.readers()[0];
             rank.bank.install(&placement, stream.raw)?;

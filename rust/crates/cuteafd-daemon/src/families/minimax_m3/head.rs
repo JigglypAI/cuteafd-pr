@@ -94,8 +94,7 @@ impl<'a> Head<'a> {
         check_embedding(cfg,capacity_rows,embedding,tokens.len(),stream,ids,gathered,residual)?;
         embedding.embed(tokens,ids,1,gathered,stream.raw)?;
         // Residual and IDs are dead until the cast; reuse their admitted storage.
-        stream.device.run(|| Ok(stream.device.library.embedding_injection()?.inject_host(
-            &media.features,&media.indices,residual,ids,gathered,tokens.len(),cfg.hidden,1,stream.raw)?))?;
+        crate::shared::vision::still::inject(stream,media,residual,ids,gathered,tokens.len(),cfg.hidden)?;
         stream.device.run(|| {
             // SAFETY: gather/injection are ordered before this cast on the retained stream;
             // both admitted planes remain live until the unit drains.
