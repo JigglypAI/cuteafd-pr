@@ -933,7 +933,7 @@ pub fn solve_prepared(
     let minimum = aligned(floor)?;
     let compiled = contract.maximum_pages.min(pool.ceiling() / page) / multiple * multiple;
     let target = aligned(pool.target().max(request.context.required()))?;
-    let ceiling = aligned(pool.max().max(pool.target()).max(request.context.required()))?.min(compiled);
+    let ceiling = aligned(pool.max().unwrap_or(compiled.saturating_mul(page)).max(pool.target()).max(request.context.required()))?.min(compiled);
     let wanted = match request.pool {
         Pin::Auto => target.min(compiled),
         Pin::Exact(n) => n / page,

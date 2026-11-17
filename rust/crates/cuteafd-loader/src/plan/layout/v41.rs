@@ -148,6 +148,9 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
     let mut facts = crate::placement::PoolFacts::new(&options.rtx_bytes,
         crate::placement::planner::Context::resolve(shape.context_tokens,
             (options.context_tokens > 0).then_some(options.context_tokens)), options.pool_tokens, 512);
+    let geometry = crate::serving_capacity::deepseek_v41_cache_geometry(&checkpoint.config, ranks)?;
+    facts.memory = geometry.ranks.iter().zip(&options.rtx_bytes).map(|(rank, &available_bytes)|
+        crate::placement::PoolMemory { available_bytes, bytes_per_unit: rank.persistent_unit_bytes }).collect();
     facts.target = options.target_pool_tokens;
     facts.encoding_limit = Some((131_072u64.saturating_sub(shape.concurrency + 2 * turns)) * 512);
     let pool = crate::placement::prepare_pool(facts)?;

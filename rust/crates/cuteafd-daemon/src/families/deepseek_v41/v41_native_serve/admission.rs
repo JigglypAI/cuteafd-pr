@@ -586,6 +586,9 @@ pub(super) fn resolve_with_owners(
         Some((groups - tails) * 512)
     } else { args.pool_tokens };
     let mut facts = cuteafd_loader::placement::PoolFacts::new(&totals, serving_context, requested, 512);
+    let geometry = cuteafd_loader::serving_capacity::deepseek_v41_cache_geometry(&config, ranks)?;
+    facts.memory = geometry.ranks.iter().zip(&totals).map(|(rank, &available_bytes)|
+        cuteafd_loader::placement::PoolMemory { available_bytes, bytes_per_unit: rank.persistent_unit_bytes }).collect();
     facts.encoding_limit = Some(131_072u64.saturating_sub(tails) * 512);
     let pool = cuteafd_loader::placement::prepare_pool(facts)?;
     // An explicit pool below the pinned context is the first typed refusal;

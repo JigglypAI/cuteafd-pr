@@ -19,9 +19,6 @@ use std::sync::OnceLock;
 
 use crate::serving_capacity::DEFAULT_GPU_KV_TOKENS;
 
-/// Cards at or below this size take the 1M default KV target.
-pub const SMALL_CARD_BYTES: u64 = 32 << 30;
-pub const SMALL_CARD_KV_TARGET_TOKENS: u64 = 1 << 20;
 /// Agentic context floor: the default KV min when the model allows it.
 pub const AGENTIC_FLOOR_TOKENS: u64 = 262_144;
 /// Explicit release allowance for unassigned memory, lowered each release as
@@ -244,15 +241,14 @@ impl MemoryPolicy {
     /// KV target, min and max for the smallest physical coordinator card.
     /// The default minimum is the smaller of the model context and the
     /// agentic floor, bounded by the target, independent of Spark placement.
-    pub fn kv(&self, smallest_card: u64, context: u64) -> Result<KvBounds, PolicyError> {
-        let default_target = if smallest_card <= SMALL_CARD_BYTES { SMALL_CARD_KV_TARGET_TOKENS }
-            else { DEFAULT_GPU_KV_TOKENS };
+    pub fn kv(&self, _smallest_card: u64, context: u64) -> Result<KvBounds, PolicyError> {
+        let default_target = DEFAULT_GPU_KV_TOKENS;
         // An explicit target can be below the model maximum for automatic context.
         let target = self.kv_target.unwrap_or(default_target.max(context));
         let min = self.kv_min.unwrap_or(context.min(AGENTIC_FLOOR_TOKENS).min(target));
-        let max = self.kv_max.unwrap_or(target).max(if self.kv_max.is_some() { 0 } else { target });
-        if target == 0 || min > target || target > max {
-            return Err(PolicyError::KvOrder { min, target, max });
+        let max = self.kv_max;
+        if target == 0 || min > target || max.is_some_and(|max| target > max) {
+            return Err(PolicyError::KvOrder { min, target, max: max.unwrap_or(target) });
         }
         Ok(KvBounds { target, min, max })
     }
@@ -274,11 +270,14 @@ impl MemoryPolicy {
 pub struct KvBounds {
     pub target: u64,
     pub min: u64,
-    pub max: u64,
+    /// None grows into all memory left after the target-sized layout.
+    pub max: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum PolicyError {
+    #[error("KV pool needs finite memory geometry for its planner domain")]
+    PoolGeometry,
     #[error("KV pool request {requested} overflows allocation quantum {unit_rows}")]
     PoolAlignment { requested: u64, unit_rows: u64 },
     #[error("KV bounds must satisfy 0 < KV_MIN_TOKENS <= KV_TARGET_TOKENS <= KV_MAX_TOKENS (min {min}, target {target}, max {max})")]
@@ -337,7 +336,7 @@ pub fn render_line(device: &DeviceBreakdown, pool: &PoolBreakdown) -> String {
     format!("{}: cap {}; weights {}; workspaces {}; reserve {}{} [{}]; other {}; KV target {} min {} max {}, pool {} tokens / {}",
         device.device, mib(device.cap_bytes), mib(device.weights_bytes), mib(device.workspace_bytes),
         mib(device.reserve_bytes()), if device.reserve_overridden { " (overridden)" } else { "" },
-        components, mib(device.other_bytes), pool.kv.target, pool.kv.min, pool.kv.max, pool.pool_tokens,
+        components, mib(device.other_bytes), pool.kv.target, pool.kv.min, pool.kv.max.map_or_else(|| "unbounded".into(), |max| max.to_string()), pool.pool_tokens,
         mib(device.kv_bytes))
 }
 

@@ -3,7 +3,7 @@
 //! or less by default); the pool then grows into what
 //! the fixed layout leaves, up to `KV_MAX_TOKENS`; below `KV_MIN_TOKENS` the
 //! launch is refused.
-use cuteafd_core::memory_policy::{MemoryPolicy, SMALL_CARD_BYTES};
+use cuteafd_core::memory_policy::MemoryPolicy;
 
 /// Agentic context floor: the default KV min.
 pub use cuteafd_core::memory_policy::AGENTIC_FLOOR_TOKENS;
@@ -22,7 +22,7 @@ impl CoordinatorCard {
         let class = physical_sms.and_then(|sms| super::inventory::ARCH_CONTEXTS.iter()
             .find(|class| class.arch == "sm_120" && class.sms == sms));
         let physical_bytes = class.map_or(super::inventory::PRO_TOTAL_BYTES, |class|
-            if class.total_bytes == 0 { SMALL_CARD_BYTES } else { class.total_bytes });
+            if class.total_bytes == 0 { 32 << 30 } else { class.total_bytes });
         Self { physical_bytes, logical_bytes }
     }
 
@@ -30,7 +30,7 @@ impl CoordinatorCard {
 }
 
 /// Geometry and operator inputs, before the shared placement preparation resolves policy.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct PoolFacts<'a> {
     /// Logical per-card ceilings; a capped PRO intentionally simulates a small card.
     pub card_bytes: &'a [u64],
@@ -40,13 +40,21 @@ pub struct PoolFacts<'a> {
     pub unit_rows: u64,
     /// Exclusive of private tails; an encoding limit, never a memory reservation.
     pub encoding_limit: Option<u64>,
+    /// Stage-one physical upper bound per owning device. No allocation is made.
+    pub memory: Vec<PoolMemory>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct PoolMemory {
+    pub available_bytes: u64,
+    pub bytes_per_unit: u64,
 }
 
 impl<'a> PoolFacts<'a> {
     pub fn new(card_bytes: &'a [u64], context: impl Into<super::planner::Context>,
         requested: Option<u64>, unit_rows: u64) -> Self {
         Self { card_bytes, context: context.into(), requested, target: None,
-            unit_rows, encoding_limit: None }
+            unit_rows, encoding_limit: None, memory: Vec::new() }
     }
 }
 
@@ -64,12 +72,21 @@ pub fn prepare_pool(facts: PoolFacts<'_>) -> Result<PoolPolicy, cuteafd_core::me
         tokens.div_ceil(rows).checked_mul(rows).ok_or(
             cuteafd_core::memory_policy::PolicyError::PoolAlignment { requested: tokens, unit_rows: rows })
     }).transpose()?;
+    let units = facts.memory.iter().filter(|rank| rank.bytes_per_unit > 0)
+        .map(|rank| rank.available_bytes / rank.bytes_per_unit).min();
+    let memory_extent = units.and_then(|units| units.checked_mul(facts.unit_rows.max(1)));
+    let extent = match (memory_extent, facts.encoding_limit, requested.or(bounds.max)) {
+        (Some(memory), encoding, cap) => memory.min(encoding.unwrap_or(memory)).min(cap.unwrap_or(memory)),
+        (None, Some(encoding), cap) => encoding.min(cap.unwrap_or(encoding)),
+        (None, None, Some(cap)) => cap,
+        _ => return Err(cuteafd_core::memory_policy::PolicyError::PoolGeometry),
+    };
     Ok(PoolPolicy {
         context: facts.context, compiled_context: facts.context.maximum, raw_requested, requested,
         target: bounds.target.max(facts.context.required()),
         floor: requested.unwrap_or(bounds.min).max(facts.context.required()),
-        ceiling: facts.encoding_limit.unwrap_or(u64::MAX),
-        max: requested.unwrap_or(bounds.max), unit_rows: facts.unit_rows,
+        ceiling: extent,
+        max: requested.or(bounds.max), unit_rows: facts.unit_rows,
     })
 }
 
@@ -89,7 +106,7 @@ pub struct PoolPolicy {
     pub(super) ceiling: u64,
     /// After an automatic layout is fixed for the target, the pool grows into
     /// what is left up to this (`KV_MAX_TOKENS`, default the target).
-    pub(super) max: u64,
+    pub(super) max: Option<u64>,
     pub(super) unit_rows: u64,
 }
 
@@ -101,7 +118,7 @@ impl PoolPolicy {
     pub fn target(&self) -> u64 { self.target }
     pub fn floor(&self) -> u64 { self.floor }
     pub fn ceiling(&self) -> u64 { self.ceiling }
-    pub fn max(&self) -> u64 { self.max }
+    pub fn max(&self) -> Option<u64> { self.max }
     pub fn unit_rows(&self) -> u64 { self.unit_rows }
 
     /// Both CLI zero and an omitted pool request select automatic admission.
@@ -113,7 +130,7 @@ impl PoolPolicy {
     /// Layout selection still uses `target`; only the selected pool's owners
     /// are charged when it grows into the memory left after onboarding.
     pub fn maximum_tokens(&self) -> u64 {
-        self.requested.unwrap_or(self.max.max(self.target)).min(self.ceiling)
+        self.requested.or(self.max).unwrap_or(self.ceiling).min(self.ceiling)
     }
 
     /// Diagnostic capacity reports use the layout target or strict request,
@@ -138,7 +155,7 @@ impl PoolPolicy {
         self.target = tokens;
         self.floor = tokens;
         self.ceiling = tokens;
-        self.max = tokens;
+        self.max = Some(tokens);
     }
 
     pub fn validate_explicit(&self) -> Result<(), super::PlacementError> {
@@ -160,7 +177,7 @@ impl PoolPolicy {
 
     /// Automatic growth bound: KV max within the index limit.
     pub(crate) fn max_units(&self) -> u64 {
-        self.max.min(self.ceiling) / self.unit_rows.max(1)
+        self.max.unwrap_or(self.ceiling).min(self.ceiling) / self.unit_rows.max(1)
     }
 }
 
