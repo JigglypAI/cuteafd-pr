@@ -60,11 +60,12 @@ Qwen 3.8 Flash Next EXL3 K4.25, 1 RTX, MTP 3. FP8 projections fail the KL gate (
 ## Default speculation and placement
 
 `EXPERT_BACKEND=auto` prefers resident local EXL3 experts when the planner
-admits the weights, MTP, serving reservations and requested KV pool. After
-local admission, an unset `SPECULATOR` selects native MTP at depth 3 (EXL3, and
-NVFP4 with its FP8 MTP package). Explicit
-`EXPERT_BACKEND=local` uses the same speculation default. `MTP=0` retains the
-legacy opt-out; explicit depth settings retain their meaning.
+admits the weights, MTP, serving reservations and requested KV pool. An unset
+or `auto` `SPECULATOR` selects native MTP whenever the checkpoint declares its
+one physical MTP layer, regardless of expert quantization or admitted Spark
+world. Rust resolves three recursive drafts by default; explicit
+`SPECULATOR_DEPTH` overrides that depth and `SPECULATOR=off` disables drafting.
+Missing kernel/tensor routes and multiple physical MTP layers refuse precisely.
 
 | Attention configuration | Default | Contract |
 | --- | --- | --- |
@@ -128,16 +129,16 @@ readiness field measures only the coordinator process.
 - FP8 experts have no Spark TP layout yet: 640 is not evenly divisible the
   way the FP8 MoE kernel currently tiles larger TP degrees. Spark supports
   EXL3 and NVFP4; the official FP8 checkpoint is outside the v1 smoke matrix.
-- Spark workers serve backbone expert layers only. Explicit `SPECULATOR=mtp`
+- Spark workers serve backbone expert layers only. Native MTP
   keeps `mtp.layers.0.mlp.experts` resident on the coordinator; it does not
   copy backbone experts there. Spark MTP3 is qualified for EXL3 TP1. An unset
-  Spark speculator remains off; use the explicit minimum settings above.
+  Spark speculator follows checkpoint-native presence, just like local placement.
 - The historical local EXL3 C1 difference includes the change from v0
   decode-only FP8 projections with dual residency to BF16 projections.
   Matched BF16 ABAB passes parity. Single-copy FP8 projections remain
   opt-in because their golden NLL/KL misses the precision gate.
-- The automatic MTP default is qualified for local EXL3 and NVFP4. Other expert
-  formats retain explicit speculation settings.
+- The automatic MTP default is independent of expert format; unsupported native
+  tensor/kernel routes still refuse through the runtime contract.
 - Local NVFP4 supports explicit `SPECULATOR=mtp`, `SPECULATOR_DEPTH=3`.
   Routed layers use the NVFP4 TP1 package; the MTP layer uses the FP8 TP1
   package. Both stay resident, with one copy per layer and separately
