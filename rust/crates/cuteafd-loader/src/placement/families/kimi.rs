@@ -1158,7 +1158,7 @@ mod tests {
 
     pub(super) fn recipe() -> KimiRecipe {
         let mut recipe = KimiRecipe {
-            pool: crate::placement::prepare_pool(crate::placement::PoolFacts::new(&[96 << 30], 256, None, 64)).unwrap(),
+            pool: crate::placement::prepare_pool(crate::plan::testing::pool_facts(&[96 << 30], 256, None, 64, &[128])).unwrap(),
             vision: None,
             expert_usage: None,
             shaped: Vec::new(),

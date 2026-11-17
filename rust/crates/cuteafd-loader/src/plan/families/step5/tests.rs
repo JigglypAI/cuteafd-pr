@@ -774,12 +774,11 @@ fn nvfp4_min_card_admits_native_w4a4_and_bf16_root_stays_reference_only() {
         if let Some(tokens) = pool {
             assert_eq!(memory.pool_tokens, tokens);
         } else {
-            let target = crate::placement::prepare_pool(crate::placement::PoolFacts::new(&[96 << 30], context, None, 64)).unwrap().target();
-            assert!((context..=target).contains(&memory.pool_tokens));
-            // More free capacity must grow the same default-format pool to its cap.
+            assert!(memory.pool_tokens >= context);
+            // More free capacity grows the same default-format pool without a policy cap.
             let roomy = report_context(dir.path(), 1, 160, 4, None, context);
             assert!(roomy.wip_launchable(), "{:?}", roomy.hints);
-            assert_eq!(roomy.memory_layout.unwrap().pool_tokens, target);
+            assert!(roomy.memory_layout.unwrap().pool_tokens > memory.pool_tokens);
         }
         assert!(memory.devices.iter().all(|d| d.used_bytes() <= d.capacity_bytes));
         // The endpoint's frames hold one unit; the intake holds the three

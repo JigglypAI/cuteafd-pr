@@ -16,7 +16,7 @@ fn request(gpus: usize, free: u64, layers: usize, sparks: usize, onboard: Onboar
             gpus: vec![GpuBudget { capacity_bytes: 96 * GIB, reserve_bytes: 0,
                 baseline: Baseline::Measured { free_bytes: free } }; gpus],
             spark_ranks: sparks, peer_access: gpus == 2 },
-        pool: prepare_pool(PoolFacts::new(&vec![96 * GIB; gpus], 131_072, None, 256)).unwrap(),
+        pool: prepare_pool(crate::plan::testing::pool_facts(&vec![96 * GIB; gpus], 131_072, None, 256, &vec![UNIT; gpus])).unwrap(),
         layers: (0..layers).map(|_| LayerDemand { kind: AttentionClass::Csa, weights: ModeBytes::default(),
             kv_unit: ModeBytes::default().into(), colocate: None,
             fixed_bytes: ModeBytes::default(), extra: Vec::new(), context_indexer: false,
@@ -2175,10 +2175,12 @@ fn owner_search_matches_exhaustive_frozen_pool_with_bounded_draft_storage() {
 fn kv_max_grows_the_automatic_pool_after_the_onboarded_layout_is_fixed() {
     use cuteafd_core::memory_policy::MemoryPolicy;
     // 40 GiB: the 2M target (32 GiB) first, then both 1 GiB layers in what is left.
-    let target = solve(&request(1, 40 * GIB, 2, 4, Onboard::Auto)).unwrap();
-    assert_eq!((target.pool_tokens, target.onboard_layers), (2 << 20, 2));
-    let grown = MemoryPolicy { kv_max: Some(4 << 20), ..Default::default() }
+    let target = MemoryPolicy { kv_max: Some(2 << 20), ..Default::default() }
         .scoped(|| solve(&request(1, 40 * GIB, 2, 4, Onboard::Auto))).unwrap();
+    assert_eq!((target.pool_tokens, target.onboard_layers), (2 << 20, 2));
+    let grown_request = request(1, 40 * GIB, 2, 4, Onboard::Auto);
+    let grown = solve(&grown_request).unwrap();
+    assert!(grown_request.pool.maximum_tokens() >= grown.pool_tokens);
     // Same layout (onboarding fixed at the target), larger pool from the remainder.
     assert_eq!(grown.onboard_layers, target.onboard_layers);
     assert!(grown.pool_tokens > target.pool_tokens && grown.pool_tokens < 4 << 20, "{}", grown.pool_tokens);

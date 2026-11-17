@@ -3549,8 +3549,8 @@ fn kv_min_refuses_and_kv_max_grows_an_automatic_pool_past_the_target() {
     let contract = Linear { maximum: 64 * 1000, ..Linear::new() }.prepare(&request()).unwrap();
     let solve_with = |policy: MemoryPolicy, bytes: u64| policy.scoped(||
         solve(request(), vec![budget(bytes)], &Prepared(contract.clone())));
-    // Target 64 pages: the layout is sized for it; without a max the pool stops there.
-    let target = MemoryPolicy { kv_target: Some(64 * 64), kv_min: Some(64), ..Default::default() };
+    // Target 64 pages: a user cap retains the old target-only baseline.
+    let target = MemoryPolicy { kv_target: Some(64 * 64), kv_min: Some(64), kv_max: Some(64 * 64), ..Default::default() };
     assert_eq!(solve_with(target, 64 * 500).unwrap().pool_tokens, 64 * 64);
     // KV max 640 pages: the pool grows into what is left, up to the max.
     let grow = MemoryPolicy { kv_max: Some(64 * 640), ..target };
@@ -3571,7 +3571,7 @@ fn automatic_context_uses_shared_floor_and_exact_admitted_extent() {
         let mut available = budget(pool);
         available.physical_bytes = 96 << 30;
         let solved = solve(automatic.clone(), vec![available], &recipe).unwrap();
-        assert_eq!(solved.pool_tokens, pool.min(1 << 20));
+        assert_eq!(solved.admitted_extent(), pool);
         assert_eq!(solved.served_context(), maximum.min(pool));
         assert_eq!(solved.request.context.maximum, maximum);
     }
@@ -3602,7 +3602,7 @@ fn automatic_floor_is_bounded_by_an_explicit_target() {
         .scoped(|| {
             let solved = solve(Request { context: Context::automatic(1 << 20), ..request() },
                 vec![budget(2 << 20)], &Linear::new()).unwrap();
-            assert_eq!((solved.pool_tokens, solved.served_context()), (131_072, 131_072));
+            assert_eq!((solved.pool_tokens, solved.served_context()), (2 << 20, 1 << 20));
         });
 }
 

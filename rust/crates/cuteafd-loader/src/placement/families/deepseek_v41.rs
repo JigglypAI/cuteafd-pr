@@ -464,11 +464,13 @@ mod tests {
         free: u64,
     ) -> Result<AdmittedV41, Refusal> {
         let total = 96 << 30;
+        let geometry = crate::serving_capacity::deepseek_v41_cache_geometry(config, ranks)?;
+        let slopes = geometry.ranks.iter().map(|rank| rank.persistent_unit_bytes).collect::<Vec<_>>();
         let budgets = admission::live_budgets(&vec![(total, total, free); ranks], &vec![64 << 30; 4])?;
         let input = ProductionInput {
             blas: Vec::new(),
             expert_usage: false,
-            config, gpus: ranks, context, pool: crate::placement::prepare_pool(crate::placement::PoolFacts::new(&vec![total; ranks], context, pool, 512)).unwrap(),
+            config, gpus: ranks, context, pool: crate::placement::prepare_pool(crate::plan::testing::pool_facts(&vec![total; ranks], context, pool, 512, &slopes)).unwrap(),
             prefill: PrefillShape { rows: 128, waves: 1 }, concurrency, retained_turns: turns,
             replicated, spark_ranks: 4, onboard_minimum: 0, onboard_counts: None,
             experts, workspace: 0, owners, weight_arenas: Vec::new(), startup: Vec::new(), allowances: Vec::new(),
@@ -757,7 +759,9 @@ mod tests {
         let input = ProductionInput {
             blas: Vec::new(),
             expert_usage: false,
-            config: &config, gpus: 2, context: 262_144, pool: crate::placement::prepare_pool(crate::placement::PoolFacts::new(&[96 << 30; 2], 262_144, None, 512)).unwrap(),
+            config: &config, gpus: 2, context: 262_144, pool: crate::placement::prepare_pool(crate::plan::testing::pool_facts(&[96 << 30; 2], 262_144, None, 512,
+                &crate::serving_capacity::deepseek_v41_cache_geometry(&config, 2)?.ranks.iter()
+                    .map(|rank| rank.persistent_unit_bytes).collect::<Vec<_>>())).unwrap(),
             prefill: PrefillShape { rows: 128, waves: 1 }, concurrency: 1, retained_turns: 0,
             replicated: false, spark_ranks: 4, onboard_minimum: 0, onboard_counts: None,
             experts: vec![cost(2); 40], workspace: 0, owners: Vec::new(), weight_arenas: Vec::new(), startup: Vec::new(),

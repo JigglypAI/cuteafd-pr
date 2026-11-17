@@ -188,27 +188,32 @@ pub fn log_layout(layout: &cuteafd_core::memory_layout::MemoryLayout, family: &s
     }
 }
 
-/// Refused inventory-only reports have no admitted witness. Resolve diagnostic
-/// bounds only in that case; successful plans always render their retained policy.
+/// Refused inventory-only reports show requested bounds without preparing a
+/// curve domain; successful plans always render their retained policy.
 pub fn report_layout_lines(layout: &cuteafd_core::memory_layout::MemoryLayout, family: &str,
     gpu_caps: &[u64], retained: Option<super::PoolPolicy>, context: super::planner::Context,
     requested: Option<u64>, target: Option<u64>) -> Result<Vec<String>, cuteafd_core::memory_policy::PolicyError> {
-    let pool = match retained {
-        Some(pool) => pool,
-        None => {
-            let mut facts = super::PoolFacts::new(gpu_caps, context, requested, 1);
-            facts.target = target;
-            super::prepare_pool(facts)?
-        }
-    };
-    Ok(layout_lines(layout, family, gpu_caps, &pool))
+    if let Some(pool) = retained {
+        return Ok(layout_lines(layout, family, gpu_caps, &pool));
+    }
+    let mut policy = MemoryPolicy::current();
+    policy.kv_target = target.or(policy.kv_target);
+    let mut bounds = policy.kv(gpu_caps.iter().copied().min().unwrap_or(0), context.maximum)?;
+    bounds.target = bounds.target.max(context.required());
+    bounds.min = super::PoolPolicy::normalize_request(requested).unwrap_or(bounds.min).max(context.required());
+    bounds.max = super::PoolPolicy::normalize_request(requested).or(bounds.max);
+    Ok(layout_bound_lines(layout, family, gpu_caps, bounds))
 }
 
 /// Render the admitted policy witness, without resolving target/min/max again.
 pub fn layout_lines(layout: &cuteafd_core::memory_layout::MemoryLayout, family: &str,
     gpu_caps: &[u64], resolved: &super::PoolPolicy) -> Vec<String> {
+    layout_bound_lines(layout, family, gpu_caps, resolved.bounds())
+}
+
+fn layout_bound_lines(layout: &cuteafd_core::memory_layout::MemoryLayout, family: &str,
+    gpu_caps: &[u64], kv: cuteafd_core::memory_policy::KvBounds) -> Vec<String> {
     use cuteafd_core::memory_layout::DeviceKind as Layout;
-    let kv = resolved.bounds();
     let pool = cuteafd_core::memory_policy::PoolBreakdown { kv, pool_tokens: layout.pool_tokens };
     layout.devices.iter().map(|device| {
         let (kind, named) = match device.kind {
@@ -352,7 +357,7 @@ mod tests {
                 "", 2 << 20, Basis::Formula)] }], pool_tokens: 1 << 20, waste: vec![], notes: vec![] };
         let lines = MemoryPolicy { gpu_reserve: Some(0), ..Default::default() }
             .scoped(|| layout_lines(&layout, "glm5", &[96 << 30], &super::super::prepare_pool(
-                super::super::PoolFacts::new(&[96 << 30], super::super::planner::Context::automatic(1 << 20), None, 1)).unwrap()));
+                crate::plan::testing::pool_facts(&[96 << 30], super::super::planner::Context::automatic(1 << 20), None, 1, &[20 * 1024])).unwrap()));
         assert_eq!(lines.len(), 1);
         assert!(lines[0].contains("GRAPH_NODE_PADDING=1670 bytes (2.50%)"), "{}", lines[0]);
         assert!(lines[0].contains("padding included, not a reserve"), "{}", lines[0]);
@@ -371,20 +376,20 @@ mod tests {
         let layout = MemoryLayout { devices: vec![gpu, spark], pool_tokens: 1 << 20, waste: vec![], notes: vec![] };
         let lines = MemoryPolicy { family_reserve: Some(1 << 30), ..Default::default() }
             .scoped(|| layout_lines(&layout, "glm5", &[96 << 30], &super::super::prepare_pool(
-                super::super::PoolFacts::new(&[96 << 30], super::super::planner::Context::automatic(1 << 20), None, 1)).unwrap()));
+                crate::plan::testing::pool_facts(&[96 << 30], super::super::planner::Context::automatic(1 << 20), None, 1, &[20 * 1024])).unwrap()));
         assert_eq!(lines.len(), 2, "{lines:?}");
         // The GPU cap is the plan's cap, not the layout capacity already less the reserve.
         assert!(lines[0].starts_with("rtx0: cap 98304MiB; weights 40960MiB"), "{}", lines[0]);
         assert!(lines[0].contains("reserve 1724MiB [context+modules 600MiB, family reserve 1024MiB, release padding 100MiB]"), "{}", lines[0]);
         // The same shared default minimum applies with Sparks.
-        assert!(lines[0].contains("KV target 2097152 min 262144 max 2097152, pool 1048576 tokens / 20480MiB"), "{}", lines[0]);
+        assert!(lines[0].contains("KV target 2097152 min 262144 max unbounded, pool 1048576 tokens / 20480MiB"), "{}", lines[0]);
         // A Spark's cap is its worker ceiling; its residual is a named component.
         assert!(lines[1].starts_with("spark0: cap 110592MiB; weights 92160MiB"), "{}", lines[1]);
         // Sparks carry no family reserve; the residual is their named component.
         assert!(lines[1].contains("reserve 1523MiB [Spark worker process resident 1523MiB]"), "{}", lines[1]);
         let overridden = MemoryPolicy { spark_reserve: Some(3 << 30), ..Default::default() }
             .scoped(|| layout_lines(&layout, "glm5", &[96 << 30], &super::super::prepare_pool(
-                super::super::PoolFacts::new(&[96 << 30], super::super::planner::Context::automatic(1 << 20), None, 1)).unwrap()));
+                crate::plan::testing::pool_facts(&[96 << 30], super::super::planner::Context::automatic(1 << 20), None, 1, &[20 * 1024])).unwrap()));
         assert!(overridden[1].contains("(overridden)") && overridden[1].contains("SPARK_RESERVE 3072MiB"), "{}", overridden[1]);
     }
 }
