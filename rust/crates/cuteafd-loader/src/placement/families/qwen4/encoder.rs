@@ -50,7 +50,7 @@ impl QwenEncoders {
                         ("scratch", encoder.scratch, Category::Workspace)] {
                         if bytes == 0 { continue; }
                         let owner = Allocation::buffer(format!("qwen.encoder.{option}.{part}"), location, bytes,
-                            Lifetime::RESIDENT, category, format!("vision {}", if part == "weights" { "tower" } else { "scratch" }));
+                            Lifetime::RESIDENT, category, if part == "weights" { crate::media::still_tower::vision_weight_arena_label() } else { "vision scratch" });
                         if part == "weights" {
                             owners.push(Component::resident_weight(ResidentWeight::from_allocation(&owner,
                                 crate::placement::ResidentWeights(bytes)), ByteCurve::fixed(bytes, maximum_pages)));
@@ -71,7 +71,7 @@ impl QwenEncoders {
                         for (part, bytes, category) in [("tower", encoder.weights, Category::Weights),
                             ("scratch", encoder.scratch, Category::Workspace)] {
                             let owner = Allocation::buffer(format!("qwen.encoder.{option}.spark{rank}.{part}"),
-                                location, bytes, Lifetime::RESIDENT, category, format!("vision {part}"));
+                                location, bytes, Lifetime::RESIDENT, category, if part == "tower" { crate::media::still_tower::vision_weight_arena_label() } else { "vision scratch" });
                             owners.push(Component::allocation(owner, ByteCurve::fixed(bytes, maximum_pages), false, maximum_pages));
                         }
                     }
@@ -128,6 +128,15 @@ mod tests {
                     media_cache: 0, ..Default::default() };
                 let mut components = Vec::new();
                 encoders.extend(&mut vec![], &mut components, 2, head, 16).unwrap();
+                let packed = components.iter().filter_map(|component| match &component.kind {
+                    ComponentKind::Allocation { template, .. } if template.category == Category::Weights => Some(template),
+                    _ => None,
+                }).collect::<Vec<_>>();
+                assert_eq!(packed.len(), usize::from(encoder != EncoderKind::Off));
+                for owner in packed {
+                    assert_eq!(owner.group, crate::media::still_tower::vision_weight_arena_label());
+                    assert_eq!(owner.bytes, 1024);
+                }
                 let handles = |location| components.iter().filter_map(|component| match &component.kind {
                     ComponentKind::Allowance(owner) if owner.location == location
                         && owner.source.starts_with("cuBLAS handles:")

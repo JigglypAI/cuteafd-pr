@@ -197,6 +197,7 @@ pub struct RuntimeInputs {
     pub context: u64,
     pub serving_context: crate::placement::planner::Context,
     pub requested_pool: Option<u64>,
+    pub target_pool: Option<u64>,
     pub marks: MarkRule,
     pub peer_diagnostics: bool,
     pub pending_code: Vec<u64>,
@@ -405,13 +406,6 @@ impl RuntimeInputs {
                 .is_none_or(|n| n >= FLOOR && n % 64 == 0),
             "Step-5 explicit pool must be page-aligned and at least 256K tokens"
         );
-        // An explicit pool below the request context is refused, never clamped.
-        PoolPolicy::resolve(
-            &self.inventory.gpus.iter().map(|g| g.capacity_bytes).collect::<Vec<_>>(),
-            self.context,
-            self.requested_pool,
-            64).with_context(self.serving_context)
-        .validate_explicit()?;
         ensure!(
             self.pending_code.len() == ranks && self.marks.lanes == self.sequences,
             "Step-5 code or prefix sequence inventory differs"
@@ -551,7 +545,7 @@ fn admit_depth_with(
     inputs.validate(cfg)?;
     let recipe = family::Step5Recipe::new(cfg, inputs, depth, native)?;
     let budgets = family::budgets(inputs).map_err(anyhow::Error::from)?;
-    let solved = solve(recipe.request(), budgets, &recipe)
+    let solved = crate::placement::planner::solve_prepared(recipe.request(), budgets, &recipe, &recipe.pool)
         .map_err(|error| {
             let clamped = matches!(error, Refusal::Capacity { .. }
                 | Refusal::FullContextShortfall { .. });
@@ -619,7 +613,7 @@ mod tests {
             rows: 64,
             sequences: 16,
             context: FLOOR, serving_context: crate::placement::planner::Context::pinned(FLOOR),
-            requested_pool: Some(FLOOR),
+            requested_pool: Some(FLOOR), target_pool: None,
             marks: MarkRule {
                 lanes: 16,
                 entries: 16,

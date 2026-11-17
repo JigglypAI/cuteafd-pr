@@ -88,7 +88,7 @@ mod tests {
                     variables: vec![Variable::Prefill(vec![recipe.prefill]), Variable::Lanes(vec![1])], requires: vec![] };
                 let selected = [0, 0];
                 let facts = contract.facts(&selected, pages)?;
-                let mut solved = ResolvedPlan { request: request.clone(), pool_tokens: pages * recipe.page_rows(),
+                let mut solved = ResolvedPlan { pool_policy: None, request: request.clone(), pool_tokens: pages * recipe.page_rows(),
                     pool_page_rows: recipe.page_rows(), facts,
                     budgets: (0..2).map(|rank| Budget { id: format!("gpu{rank}"),
                         locations: vec![Location::coordinator(rank)], physical_bytes: 96 << 30,

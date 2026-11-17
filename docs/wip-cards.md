@@ -1,5 +1,12 @@
 # WIP hardware cards
 
+Every launch conditions the shared draft policy before timing with the server's
+cached warm-prelude receipt: two fixed code/prose/JSON triples at the sweep
+output length, identical nonces across arms. Both report and sweep retain the
+receipt; an older server without this endpoint is refused. Per-point warm waves
+remain, and Nsight windows exclude the prelude. This normalizes preceding
+benchmark traffic rather than claiming widths have converged.
+
 Use `scripts/bench/wip-cards.py` instead of copying an RC kit driver. It reads
 `cfg/*.config` and `matrix-*.json` from the kit (default: release-v2-rc2), writes
 private one-card matrices and a 0600 API key, and runs `cuteafd bench smoke`

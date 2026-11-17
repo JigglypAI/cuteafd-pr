@@ -95,7 +95,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
             return empty(notes);
         }
     };
-    let request = FactsRequest { vision: report.vision, vision_replicas: opts.vision_replicas,
+    let request = FactsRequest { target_pool_tokens: opts.target_pool_tokens, vision: report.vision, vision_replicas: opts.vision_replicas,
         media_cache_bytes: opts.media_cache_bytes, checkpoint: input.checkpoint(), catalog, cfg, kv_format: opts.inkling_kv, manifest_path: manifest_path.as_deref(),
         manifest, coordinator: Coordinator::Planned { cards: cards.clone() }, attention, spark_ranks: ranks,
         spark_bytes, prefill: shape, context_tokens: opts.context_tokens, pool_tokens: opts.pool_tokens, sequences,

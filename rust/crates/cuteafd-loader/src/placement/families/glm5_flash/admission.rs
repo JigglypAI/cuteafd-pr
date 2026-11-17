@@ -397,6 +397,7 @@ impl p::Recipe for GlmfRecipe {
 }
 
 pub struct PreparedGlmf<'a> {
+    pub pool: PoolPolicy,
     started: std::time::Instant,
     input: &'a GlmfInputs<'a>,
     pub recipe: GlmfRecipe,
@@ -683,8 +684,11 @@ fn prepare_fixed<'a>(i: &'a GlmfInputs<'a>, sms: usize, rtx_experts: bool, proce
             return Err(invalid("GLM Flash step inventory"));
         }
     }
-    let pool = PoolPolicy::resolve(&i.gpus.iter().map(|g| g.0).collect::<Vec<_>>(),
-        i.max_context, PoolPolicy::normalize_request(i.requested_pool), 256);
+    let capacities = i.gpus.iter().map(|gpu| gpu.0).collect::<Vec<_>>();
+    let mut pool_facts = crate::placement::PoolFacts::new(&capacities, i.context, i.requested_pool, 256);
+    pool_facts.target = i.target_pool_tokens;
+    let pool = crate::placement::prepare_pool(pool_facts)
+        .map_err(|error| p::Refusal::InvalidFact(error.to_string()))?;
     let maximum = pool.maximum_tokens().div_ceil(256);
     let attention = modes(i);
     let routed: Vec<_> = (0..i.layers).filter(|&layer| !i.cfg.dense[layer]).collect();
@@ -1150,7 +1154,7 @@ fn prepare_fixed<'a>(i: &'a GlmfInputs<'a>, sms: usize, rtx_experts: bool, proce
         prefill: p::Pin::Exact(prefill), operation: p::Operation::Serving,
         resident_weight_limit: i.resident_weight_limit,
         spark_reply_formats: contract.spark_reply_formats.unwrap_or_default() };
-    Ok(PreparedGlmf { started: std::time::Instant::now(), input: i, recipe: GlmfRecipe { contract }, budgets, request, counts, arena, sms,
+    Ok(PreparedGlmf { pool, started: std::time::Instant::now(), input: i, recipe: GlmfRecipe { contract }, budgets, request, counts, arena, sms,
         native_load: process.native_load, mount_load: process.mount_load, push_host: process.push_host, encoders: process.encoders })
 }
 
@@ -1162,7 +1166,7 @@ fn hop_spec(i: &GlmfInputs<'_>) -> HopSpec {
 
 impl PreparedGlmf<'_> {
     pub fn admit(self) -> Result<AdmittedGlmf, p::Refusal> {
-        let mut solved = p::solve(self.request, self.budgets, &self.recipe)?;
+        let mut solved = p::solve_prepared(self.request, self.budgets, &self.recipe, &self.pool)?;
         let i = self.input;
         let count = solved.decisions.onboard_layers.iter().flatten().copied()
             .collect::<std::collections::BTreeSet<_>>().len();

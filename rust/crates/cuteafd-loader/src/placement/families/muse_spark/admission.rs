@@ -62,12 +62,6 @@ fn dense_push_staging(core: &CoreInventory, gpus: usize) -> Result<(u64, String)
     Ok((bytes, "Muse native dense push staging: shared windowed receive and transform envelope from selected source headers".into()))
 }
 
-/// The largest coordinator KV pool this deployment admits, from the one shared
-/// pool policy. Both edges call this before either solves.
-pub fn maximum_pool_tokens(capacities: &[u64], context: u64, requested: Option<u64>) -> u64 {
-    PoolPolicy::resolve(capacities, context, requested, PAGE_ROWS).maximum_tokens()
-}
-
 /// One coordinator GPU's planned budget: the CUDA context is the forecast
 /// charge; everything else the family states as an owner.
 pub fn planned_budget(gpu: u8, physical_bytes: u64, capacity_bytes: u64, headroom_bytes: u64, context_bytes: u64) -> Budget {
@@ -191,9 +185,9 @@ pub struct ProductionInput<'a> {
     pub slots: u64,
     /// Device mark slots from the shared prefix rule (the host tier holds retention).
     pub mark_slots: u64,
-    /// The compiled context floor; `maximum_pool_tokens` is the extent.
+    /// The compiled context floor; `pool` carries the resolved extent.
     pub context: u64,
-    pub maximum_pool_tokens: u64,
+    pub pool: PoolPolicy,
     pub partial_bf16_max_rows: usize,
     pub partial_reply_formats: cuteafd_core::spark_reply::SparkReplyFormats,
     /// The coordinator EXL3 package for onboarded layers.
@@ -209,6 +203,7 @@ pub struct ProductionInput<'a> {
 
 /// The prepared recipe plus everything the caller reports from it.
 pub struct PreparedMuse<'a> {
+    pub pool: PoolPolicy,
     kv_cache: crate::families::muse_spark::cache::MuseKvCache,
     pub recipe: MuseRecipe<'a>,
     budgets: Vec<Budget>,
@@ -350,7 +345,7 @@ fn scale_alias(id: String, backing: String, location: Location, lifetime: Lifeti
 impl<'a> ProductionInput<'a> {
     pub fn prepare(self) -> Result<PreparedMuse<'a>, Refusal> {
         let ProductionInput { kv_cache, cfg, core, projections, catalog, mut budgets, host, prefill, bf16_target_head, slots, mark_slots,
-            context, maximum_pool_tokens, partial_bf16_max_rows, partial_reply_formats, local, drafter, fixed,
+            context, pool, partial_bf16_max_rows, partial_reply_formats, local, drafter, fixed,
             media } = self;
         let coordinator = budgets.iter().filter(|budget| budget.locations.iter()
             .any(|location| matches!(location.device, Device::Coordinator(_)))).count();
@@ -359,6 +354,7 @@ impl<'a> ProductionInput<'a> {
         if !(1..=2).contains(&coordinator) || spark_ranks > 8 {
             return Err(invalid("Muse Spark runs on one or two RTX with at most eight Spark ranks"));
         }
+        let maximum_pool_tokens = pool.maximum_tokens();
         if maximum_pool_tokens < context {
             return Err(Refusal::PoolBelowContext { tokens: maximum_pool_tokens, context });
         }
@@ -710,7 +706,7 @@ impl<'a> ProductionInput<'a> {
             prefill: PrefillShape { rows: prefill.unit_rows, waves: prefill.waves }, attention,
             spark_ranks, encoders, modes: (media.vision, media.audio), cases, peaks, local: local.clone(),
             drafter: drafter.clone(), head_backend: if global.head.is_none() && global.head_native.is_none() { bf16_target_head } else { serving::BlasHead::Native } };
-        Ok(PreparedMuse { kv_cache, recipe, budgets, local, drafter, layouts, global, projections,
+        Ok(PreparedMuse { pool, kv_cache, recipe, budgets, local, drafter, layouts, global, projections,
             spark_budget, host: host_quotas, push })
     }
 }
@@ -1026,7 +1022,7 @@ pub const LOCAL_ONLY_REFUSAL: Refusal = Refusal::MissingExecutor {
     family: "Muse Spark", executor: "coordinator-only routed experts", issue: 1395,
 };
 
-fn solve_sampled(request: Request, mut budgets: Vec<Budget>, recipe: &MuseRecipe<'_>)
+fn solve_sampled(request: Request, mut budgets: Vec<Budget>, recipe: &MuseRecipe<'_>, pool: &PoolPolicy)
     -> Result<ResolvedPlan, Refusal> {
     let mut contract = recipe.prepare(&request)?;
     for budget in &mut budgets {
@@ -1054,16 +1050,16 @@ fn solve_sampled(request: Request, mut budgets: Vec<Budget>, recipe: &MuseRecipe
     impl Recipe for Prepared {
         fn prepare(&self, _: &Request) -> Result<Contract, Refusal> { Ok(self.0.clone()) }
     }
-    solve(request, budgets, &Prepared(contract))
+    solve_prepared(request, budgets, &Prepared(contract), pool)
 }
 
 impl PreparedMuse<'_> {
     /// The single admission solve. Planner and serving call this one verb.
     pub fn admit(self, request: Request) -> Result<AdmittedMuse, Refusal> {
-        let PreparedMuse { kv_cache, recipe, budgets, local, drafter, layouts, global, projections,
+        let PreparedMuse { pool, kv_cache, recipe, budgets, local, drafter, layouts, global, projections,
             spark_budget, mut host, push } = self;
         let started = std::time::Instant::now();
-        let solved = solve_sampled(request, budgets, &recipe)?;
+        let solved = solve_sampled(request, budgets, &recipe, &pool)?;
         let solve_us = started.elapsed().as_micros().try_into().unwrap_or(u64::MAX);
         let (placement, spark) = recipe.execution(&solved)?;
         if spark.spark_layers.is_empty() { return Err(LOCAL_ONLY_REFUSAL); }
@@ -1276,6 +1272,7 @@ mod contract_tests {
             local: LocalPackage::Unknown, drafter: None, head_backend: serving::BlasHead::Native };
         let request = || production_request(64, None, Onboard::Layers(0), prefill,
             Operation::Serving, None, SparkReplyFormats::default());
+        let pool = crate::placement::prepare_pool(crate::placement::PoolFacts::new(&[96 << 30; 2], 64, None, PAGE_ROWS)).unwrap();
         for logical in [96 << 30, 80 << 30] {
             for sampled in [0, 674_496_512] {
                 let budgets = vec![measured_budget(0, 96 << 30, logical, 100 << 20,
@@ -1286,7 +1283,7 @@ mod contract_tests {
                         baseline: Baseline::Sampled { free: 120 << 30, phase: Phase::Load,
                             source: "host sample".into() } }];
                 let previous = solve(request(), budgets.clone(), &recipe).unwrap();
-                let plan = solve_sampled(request(), budgets, &recipe).unwrap();
+                let plan = solve_sampled(request(), budgets, &recipe, &pool).unwrap();
                 assert_eq!(plan.pool_tokens, previous.pool_tokens);
                 assert_eq!(plan.decisions, previous.decisions);
                 assert_eq!(plan.budgets[2], previous.budgets[2], "host baseline stays sampled");
@@ -1316,11 +1313,19 @@ mod contract_tests {
         }
         let forecast = solve_sampled(request(), vec![
             planned_budget(0, 96 << 30, 96 << 30, 0, 674_496_512),
-            planned_budget(1, 96 << 30, 96 << 30, 0, 674_496_512)], &recipe).unwrap();
+            planned_budget(1, 96 << 30, 96 << 30, 0, 674_496_512)], &recipe, &pool).unwrap();
         assert!(!forecast.facts.allowances.iter().any(|owner|
             crate::placement::sampled_baseline::is_source(&owner.source)));
         assert!(solve_sampled(request(), vec![
-            measured_budget(0, 96 << 30, 96 << 30, 0, (96 << 30) + 1)], &recipe).is_err());
+            measured_budget(0, 96 << 30, 96 << 30, 0, (96 << 30) + 1)], &recipe, &pool).is_err());
+    }
+
+    #[test]
+    fn small_card_pool_facts_do_not_inject_a_family_target() {
+        let mut facts = crate::placement::PoolFacts::new(&[32 << 30], Context::automatic(1 << 20), None, PAGE_ROWS);
+        assert_eq!(crate::placement::prepare_pool(facts).unwrap().target(), 1 << 20);
+        facts.target = Some(3 << 20);
+        assert_eq!(crate::placement::prepare_pool(facts).unwrap().target(), 3 << 20);
     }
 
     #[test]

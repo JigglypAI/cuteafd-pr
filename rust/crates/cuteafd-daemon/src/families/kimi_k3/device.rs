@@ -196,6 +196,7 @@ fn packing_inventory(core: Option<&serde_json::Value>, native: &[String])
     }
     add("kimik3_attn_res_c1_keep_append".into(), PackedRows)?;
     for candidates in 2..=9 {
+        add(format!("kimik3_attn_res_stream_c{candidates}"), PackedRows)?;
         for prefix in ["add", "replace", "keep"] {
             add(format!("kimik3_attn_res_c{candidates}_{prefix}"), PackedRows)?;
         }
@@ -2601,6 +2602,39 @@ impl Ops for Pending {
 mod packing_inventory_tests {
     use super::*;
     use crate::shared::prefill_packing::ProgramRows::{PackedRows, SequenceLocal};
+
+    #[test]
+    fn installed_kimi_programs_equal_runtime_required_packing_inventory() -> Result<()> {
+        let path = std::env::var_os("CUTEAFD_DEPLOYMENT_TEST_PROGRAMS")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::PathBuf::from(std::env::var_os("HOME").expect("HOME"))
+                .join(".cache/cuteafd/builds/placement-inputs/current/share/PROGRAMS.json"));
+        let manifest: serde_json::Value = serde_json::from_slice(&std::fs::read(&path)
+            .with_context(|| format!("required installed PROGRAMS.json: {}", path.display()))?)?;
+        let programs = manifest["programs"].as_array().context("installed program inventory")?;
+        for core in [false, true] {
+            let metadata = core.then_some(&manifest["families"]["dense_trellis_k6"]);
+            let catalogue = packing_inventory(metadata, &[])?;
+            let required = programs.iter().map(|program| program["name"].as_str()
+                .context("installed program name")).collect::<Result<Vec<_>>>()?
+                .into_iter().filter(|name| packing_program(name, core))
+                .collect::<std::collections::BTreeSet<_>>();
+            ensure!(!required.is_empty(), "installed Kimi program group is empty");
+            let classified = classify_packing_inventory(required.iter().copied(), &catalogue)?;
+            assert_eq!(required, classified.iter().map(|(name, _)| *name).collect(),
+                "installed Kimi required/classified program sets differ (core={core})");
+            let roles = classified.into_iter().collect::<BTreeMap<_, _>>();
+            for candidates in 2..=9 {
+                let name = format!("kimik3_attn_res_stream_c{candidates}");
+                assert_eq!(roles.get(name.as_str()), Some(&PackedRows), "{name}");
+                let missing = catalogue.iter().filter(|(entry, _)| entry != &name)
+                    .cloned().collect::<Vec<_>>();
+                assert!(classify_packing_inventory(required.iter().copied(), &missing).is_err(),
+                    "an unclassified export must fail the gate: {name}");
+            }
+        }
+        Ok(())
+    }
 
     #[test]
     fn context_draft_exports_are_sequence_local_in_both_target_inventories() -> Result<()> {
