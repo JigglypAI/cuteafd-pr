@@ -2728,7 +2728,14 @@ mod tests {
                 grid: [image.grid.t, image.grid.h, image.grid.w], identity: None, input_key: None,
                 fixture: Some(probe::ProbeFixture { path: "image.png".into(), sha256: format!("{:x}", Sha256::digest(bytes)) }),
                 image_url: Some(probe::ProbeImageUrl { url: url.clone(), detail: None }) }], ..Default::default() };
-        let profile = ModelProfile::new(MODEL, ModelEncoding::DeepseekV4).with_probe_media(preparer);
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("tokenizer_config.json"), json!({"added_tokens_decoder":{
+            "163587":{"content":kimi::OPEN},"163588":{"content":kimi::CLOSE},
+            "163589":{"content":kimi::SEP},"163586":{"content":kimi::END}}}).to_string()).unwrap();
+        std::fs::write(root.path().join("generation_config.json"), "{\"eos_token_id\":163586}").unwrap();
+        for encoding in [ModelEncoding::Kimi(Arc::new(kimi::KimiEncoding::from_snapshot(root.path()).unwrap())),
+            ModelEncoding::MiniMax(Arc::new(minimax::fixtures::encoding()))] {
+        let profile = ModelProfile::new(MODEL, encoding).with_probe_media(preparer.clone());
         assert!(!profile.capabilities.vision && profile.media_preparer.is_none());
         let (tx, mut rx) = mpsc::channel::<NativeRequest>(1);
         let app = router_for_model(tx, NativeLimits::default(), Arc::new(Mutex::new(Value::Null)),
@@ -2754,6 +2761,7 @@ mod tests {
             assert_eq!(response.status(), StatusCode::BAD_REQUEST);
             assert!(rx.try_recv().is_err());
         }
+        let image = image.clone();
         let worker = tokio::spawn(async move {
             let job = rx.recv().await.unwrap();
             assert!(job.probe.as_ref().unwrap().spec.feature_scoring());
@@ -2762,12 +2770,13 @@ mod tests {
                 prompt_usage: PromptUsage { prompt_tokens: 1, prompt_cache_hit_tokens: 0 } })).unwrap();
             job.events.send(Ok(InferenceChunk::Finish { finish_reason: InferenceFinishReason::Length })).unwrap();
         });
-        let (id, _) = probe::registry().register(spec);
+        let (id, _) = probe::registry().register(spec.clone());
         let response = app.oneshot(axum::http::Request::post("/v1/chat/completions")
             .header(probe::HEADER,id).header("content-type","application/json")
             .body(Body::from(body.to_string())).unwrap()).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         worker.await.unwrap();
+        }
     }
 
     #[tokio::test]
