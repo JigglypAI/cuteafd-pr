@@ -171,7 +171,8 @@ impl TowerSpec {
             native.q_norm[layer] = NO_VISION_OFFSET;
             native.k_norm[layer] = NO_VISION_OFFSET;
         }
-        Self::from_parts_with_constants(native, reads, vec![constant]).map_err(Into::into)
+        Self::from_parts_with_constants(native, reads, vec![constant])
+            .map(|spec| spec.with_family(cuteafd_loader::media::ImageFamily::MiniMax)).map_err(Into::into)
     }
 }
 
@@ -306,6 +307,9 @@ mod tests {
         let registered = TowerSpec::from_snapshot(directory.path(), MAX_IMAGE_TOKENS).unwrap();
         assert_eq!(registered.native.weight_bytes, spec.native.weight_bytes);
         assert_eq!(registered.image_family(), cuteafd_loader::media::ImageFamily::MiniMax);
+        let mut changed_geometry=registered.clone();
+        changed_geometry.native.tower.as_mut().unwrap().temporal_patch=1;
+        assert_eq!(changed_geometry.image_family(),cuteafd_loader::media::ImageFamily::MiniMax);
     }
 
     #[test]
