@@ -98,7 +98,7 @@ pub(crate) fn prepare<'a>(library: &'a NativeLibrary, programs: &'a Programs<'a>
             exl3_modules = crate::shared::experts::rtx::exl3::Exl3Tp2::preload_whole_modules(
                 crate::shared::memory::device::Device { library, id: options.device }, &directory,
                 usize::try_from(options.prefill.rows.max(64))?, cuteafd_core::ExpertGeometry::INKLING2,
-                crate::shared::experts::rtx::RtxSelectionPolicy::FirstCapacity)?;
+                crate::shared::experts::rtx::RtxSelectionPolicy::CanonicalDecode)?;
         }
         Ok(())
     })?;
@@ -254,6 +254,11 @@ mod tests {
         assert!(source.contains("InklingEncoding::from_snapshot(&checkpoint.snapshot)"));
         assert!(source.contains("eos == [200006]"));
         assert!(source.contains("InventoryPhase::PreWeight"));
+        assert!(source.contains("RtxSelectionPolicy::CanonicalDecode"));
+        assert!(!source.contains("RtxSelectionPolicy::FirstCapacity"));
+        let resident=include_str!("experts.rs").split("#[cfg(test)]").next().unwrap();
+        assert!(resident.contains("RtxSelectionPolicy::CanonicalDecode"));
+        assert!(!resident.contains("RtxSelectionPolicy::FirstCapacity"));
         assert!(source.contains("Coordinator::Measured"));
         assert!(source.contains("gather(&request)"));
         assert!(source.contains("inputs.admit(inkling2::request("));
