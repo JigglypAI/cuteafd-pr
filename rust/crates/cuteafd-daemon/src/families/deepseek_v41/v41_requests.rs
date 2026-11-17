@@ -92,6 +92,65 @@ impl Drop for RequestBatch {
         if let Some(engram) = &mut self.engram { engram.cancel(); }
     }
 }
+/// Host-only references owned by live requests and the scheduler's drained retirement queue.
+#[derive(Default)]
+pub(crate) struct RequestUnits {
+    live: Vec<Vec<u32>>,
+    released: Vec<Vec<u32>>,
+}
+impl RequestUnits {
+    pub fn new(slots: usize) -> Self { Self { live: vec![Vec::new(); slots], released: Vec::new() } }
+    pub fn detach(&mut self, slot: usize) { self.live[slot].clear(); }
+    fn take(&mut self, slot: usize) -> Vec<u32> { std::mem::take(&mut self.live[slot]) }
+    fn retire(&mut self, units: Vec<u32>) { if !units.is_empty() { self.released.push(units); } }
+    pub fn take_released(&mut self) -> Vec<Vec<u32>> { std::mem::take(&mut self.released) }
+}
+
+#[cfg(test)]
+mod unit_retirement_tests {
+    use super::*;
+    use cuteafd_engine::prefix::RefPagePool;
+    use cuteafd_ffi::native_library_lifetime_fixture::Fixture;
+
+    #[test]
+    fn quarantined_units_survive_normal_retirement_and_pool_exhaustion() -> Result<()> {
+        let fixture = Fixture::build_for_tests()?;
+        let lib = fixture.load()?;
+        fixture.immediate_copies(&lib)?;
+        let mut bank = BackboneCache::new(&lib, 1, [8, 8, 8, 16], usize::MAX)?;
+        bank.use_engine_pages()?;
+        let mut pool = RefPagePool::new(8, 512);
+        let mut units = RequestUnits::new(1);
+        let quarantined = pool.alloc(3)?;
+        let lease = bank.begin_request(0, 91)?;
+        let pages = bank.unit_pages(&quarantined);
+        bank.bind_sources(lease, [&pages[0], &pages[1], &pages[2], &pages[3]], [0; 4])?;
+        units.live[0] = quarantined.clone();
+        // The fatal rollback hook detaches only host ownership. Once the outstanding work
+        // finally drains, normal request release must not enqueue the quarantined refs.
+        units.detach(0);
+        let retired = units.take(0);
+        bank.release(&[lease])?;
+        units.retire(retired);
+        for refs in units.take_released() { pool.release(&refs); }
+        assert_eq!(pool.free(), 5);
+        let mut later = Vec::new();
+        for id in 100..105 {
+            let refs = pool.alloc(1)?;
+            assert!(refs.iter().all(|page| !quarantined.contains(page)));
+            let lease = bank.begin_request(0, id)?;
+            let pages = bank.unit_pages(&refs);
+            bank.bind_sources(lease, [&pages[0], &pages[1], &pages[2], &pages[3]], [0; 4])?;
+            bank.release(&[lease])?;
+            later.extend(refs);
+        }
+        assert!(pool.alloc(1).is_err(), "quarantine is not admission capacity");
+        pool.release(&later);
+        assert_eq!(pool.free(), 5);
+        Ok(())
+    }
+}
+
 pub(crate) struct Requests<'a> {
     cache: BackboneCache<'a>,
     /// Per capture lane: the lease whose snapshot is queued.
@@ -99,9 +158,7 @@ pub(crate) struct Requests<'a> {
     pipeline: EngramPipeline,
     slots: Vec<Option<Request>>,
     /// Per slot: prefix-engine units (512 tokens) the slot's sources are bound to.
-    units: Vec<Vec<u32>>,
-    /// Units of released slots, for the prefix engine to unreference once their consumers drained.
-    released_units: Vec<Vec<u32>>,
+    units: RequestUnits,
     image_requests: usize,
     /// The next encoder unit's Engram I/O, started ahead of its reservation (#815).
     prefetched: prefetch::PrefetchSlot<CacheLease, EngramWave>,
@@ -154,8 +211,7 @@ impl<'a> Requests<'a> {
             prefix_leases: [None, None],
             pipeline,
             slots: (0..slots).map(|_| None).collect(),
-            units: vec![Vec::new(); slots],
-            released_units: Vec::new(),
+            units: RequestUnits::new(slots),
             image_requests: 0,
             prefetched: Default::default(),
             releases: 0,
@@ -175,8 +231,7 @@ impl<'a> Requests<'a> {
             prefix_leases: [None, None],
             pipeline,
             slots: (0..slots).map(|_| None).collect(),
-            units: vec![Vec::new(); slots],
-            released_units: Vec::new(),
+            units: RequestUnits::new(slots),
             image_requests: 0,
             prefetched: Default::default(),
             releases: 0,
@@ -189,8 +244,8 @@ impl<'a> Requests<'a> {
     pub fn new_replicated(library:&'a NativeLibrary,pipeline:EngramPipeline,slots:usize,
         pages:[usize;4],map:crate::families::deepseek_v41::v41_backbone_cache::CachePlacement,budgets:[usize;2])->Result<Self> {
         Ok(Self { cache:BackboneCache::new_replicated(library,map,slots,pages,budgets)?,
-            prefix_leases:[None,None],pipeline,slots:(0..slots).map(|_|None).collect(),units:vec![Vec::new();slots],
-            released_units:Vec::new(),image_requests:0, prefetched: Default::default(),releases:0, reconciliation: Default::default() })
+            prefix_leases:[None,None],pipeline,slots:(0..slots).map(|_|None).collect(),units:RequestUnits::new(slots),
+            image_requests:0, prefetched: Default::default(),releases:0, reconciliation: Default::default() })
     }
     fn request_identity(&self, lease: CacheLease) -> Result<&Request> {
         self.slots.iter().flatten().find(|r| r.lease == lease).context("request history missing")
@@ -295,7 +350,7 @@ impl<'a> Requests<'a> {
         if !self.slots[slot].as_ref().unwrap().images.is_empty() { self.image_requests -= 1; }
         self.slots[slot] = None;
         self.releases += 1;
-        let units = std::mem::take(&mut self.units[slot]);
+        let units = self.units.take(slot);
         // Cache failure invalidation may already have revoked its root lease.
         if self.cache.request_id(lease).is_ok() {
             if let Err(error) = self.cache.release(&[lease]) {
@@ -306,7 +361,7 @@ impl<'a> Requests<'a> {
                 return Err(error);
             }
         }
-        if !units.is_empty() { self.released_units.push(units); }
+        self.units.retire(units);
         Ok(())
     }
     /// Moves whenever a request is released.
@@ -324,10 +379,10 @@ impl<'a> Requests<'a> {
     /// request owns these unit references until it is released.
     pub fn bind_units(&mut self, lease: CacheLease, units: Vec<u32>, pages: [&[u32]; 4], rows: [usize; 4]) -> Result<()> {
         self.request(lease)?;
-        ensure!(units.starts_with(&self.units[lease_slot(&self.slots, lease)?]), "unit binding rewrites a request's units");
+        ensure!(units.starts_with(&self.units.live[lease_slot(&self.slots, lease)?]), "unit binding rewrites a request's units");
         self.cache.bind_sources(lease, pages, rows)?;
         let slot = lease_slot(&self.slots, lease)?;
-        self.units[slot] = units;
+        self.units.live[slot] = units;
         Ok(())
     }
     /// A request's committed Engram position and compressed lookback (chronological).
@@ -342,22 +397,18 @@ impl<'a> Requests<'a> {
     /// Units a request's sources are bound to.
     pub fn units(&self, lease: CacheLease) -> Result<&[u32]> {
         self.request(lease)?;
-        Ok(&self.units[lease_slot(&self.slots, lease)?])
+        Ok(&self.units.live[lease_slot(&self.slots, lease)?])
     }
-    /// Forget a live request's units without releasing them: the prefix engine already owns
-    /// their references (it abandons a placement whose restore failed).
-    pub fn take_units(&mut self, lease: CacheLease) -> Vec<u32> {
-        lease_slot(&self.slots, lease).map(|slot| std::mem::take(&mut self.units[slot])).unwrap_or_default()
+    /// Host-only detachment: quarantined engine references must never enter released_units.
+    pub fn detach_prefix_units(&mut self, lease: CacheLease) {
+        if let Ok(slot) = lease_slot(&self.slots, lease) { self.units.detach(slot); }
     }
-    /// Drop a released request's queued units (the prefix engine releases them itself).
-    pub fn forget_released_units(&mut self, units: &[u32]) {
-        if let Some(i) = self.released_units.iter().rposition(|queued| queued == units) {
-            self.released_units.swap_remove(i);
-        }
+    pub fn slot_index(&self, lease: CacheLease) -> Result<usize> {
+        lease_slot(&self.slots, lease)
     }
     /// Units of released requests, for the prefix engine to unreference (after it drains).
     pub fn take_released_units(&mut self) -> Vec<Vec<u32>> {
-        std::mem::take(&mut self.released_units)
+        self.units.take_released()
     }
     fn mark_of(&self, request: &Request, backbone: crate::families::deepseek_v41::v41_backbone_cache::BackboneMark)
         -> RequestMark {
@@ -427,14 +478,22 @@ impl<'a> Requests<'a> {
             Some(end) => self.cache.restore_encoder_continuation(lease, &saved.backbone, mark, end),
             None => self.cache.restore_mark(lease, &saved.backbone, mark),
         };
-        if let Err(error) = restored {
-            if let Err(cleanup) = self.release(lease) {
-                tracing::error!(%cleanup, "releasing failed request prefix restore");
-            }
-            return Err(error);
-        }
+        restored?;
         self.slots.iter_mut().flatten().find(|r| r.lease == lease)
             .expect("validated restored request").history = history;
+        Ok(())
+    }
+    /// Roll back a drained prefix admission without revoking its identity or images. The
+    /// prefix engine owns the detached units and releases them after this call succeeds.
+    pub fn discard_prefix(&mut self, lease: CacheLease) -> Result<()> {
+        let slot = lease_slot(&self.slots, lease)?;
+        self.prefetched.cancel_owner(&lease);
+        self.cache.reset_prefix(lease)?;
+        self.units.detach(slot);
+        let request = self.slots[slot].as_mut().expect("validated prefix request");
+        request.history = self.pipeline.new_history()?;
+        request.prefill = None;
+        request.lookahead = None;
         Ok(())
     }
     pub fn validate(&self, batch: &RequestBatch) -> Result<()> {

@@ -208,15 +208,22 @@ impl<'a, C: DraftChain<'a>> PrefixFamily<V41Meta> for V41Prefix<'_, 'a, '_, C> {
     fn bind(&self, placement: &mut V41Placement) -> Result<(), BoxError> {
         self.bind_units(placement, 0).map_err(boxed)
     }
+    fn quarantine(&self, placement: &mut V41Placement) {
+        self.requests.borrow_mut().detach_prefix_units(placement.lease);
+    }
+    fn placement_slot(&self, placement: &V41Placement) -> Option<usize> {
+        self.requests.borrow().slot_index(placement.lease).ok()
+    }
     fn discard(&self, placement: &mut V41Placement) -> Result<(), BoxError> {
-        // The engine releases the placement's units itself: take them off the request so its
-        // release (here or by the scheduler) does not unreference them a second time. A
-        // failed restore may already have released the lease; then they were queued for
-        // reclaim instead, and are taken back from there.
-        let mut requests = self.requests.borrow_mut();
-        if requests.take_units(placement.lease).is_empty() {
-            requests.forget_released_units(&placement.units);
+        // Also prove draft ring writes drained before resetting either request owner.
+        self.drain_rollback()?;
+        self.requests.borrow_mut().discard_prefix(placement.lease).map_err(boxed)?;
+        if let (Some(id), Some(draft)) = (placement.draft, self.draft.borrow_mut().as_deref_mut()) {
+            draft.release(id).map_err(boxed)?;
+            draft.admit(id).map_err(boxed)?;
         }
+        placement.len = 0;
+        placement.plan = None;
         Ok(())
     }
     fn restore_with(&self, mark: Option<&Mark>, saved: Option<&V41Meta>, placement: &mut V41Placement,
@@ -331,6 +338,12 @@ impl<'a, C: DraftChain<'a>> PrefixFamily<V41Meta> for V41Prefix<'_, 'a, '_, C> {
     }
     fn drain(&self) -> Result<(), BoxError> {
         self.requests.borrow().cache().prefix_drain().map_err(boxed)
+    }
+    fn drain_rollback(&self) -> Result<(), BoxError> {
+        let target = self.requests.borrow().cache().prefix_drain();
+        let draft = self.draft.borrow().as_deref().map_or(Ok(()), |draft| draft.drain_prefix());
+        if let Err(error) = &draft { self.requests.borrow().cache().poison(error); }
+        target.and(draft).map_err(boxed)
     }
     fn page_segments(&self, page: u32) -> Vec<DeviceRange> {
         self.requests.borrow().cache().unit_segments(page).into_iter().map(range).collect()
@@ -580,6 +593,18 @@ mod tests {
     }
 
     #[test]
+    fn ordinary_prefix_drain_does_not_synchronize_draft_streams() {
+        let source = include_str!("prefix.rs");
+        let body = source.split_once("    fn drain(&self) -> Result<(), BoxError> {").unwrap().1
+            .split_once("\n    }").unwrap().0;
+        assert!(body.contains("prefix_drain()"));
+        assert!(!body.contains("draft"));
+        let rollback = source.split_once("    fn drain_rollback(&self) -> Result<(), BoxError> {").unwrap().1
+            .split_once("\n    }").unwrap().0;
+        assert!(rollback.contains("draft.drain_prefix()"));
+    }
+
+    #[test]
     fn layout_reuses_exact_frontiers_only() {
         for draft in [false, true] {
             let layout = layout(4, draft);
@@ -615,6 +640,27 @@ mod tests {
         // A branch inside the only retained frontier is a miss, not an approximate replay.
         assert!(selected(&[&tokens[..1500]], &branch).is_none());
         assert!(selected(&[&tokens[..1500]], &tokens[..1499]).is_none());
+    }
+
+    #[test]
+    fn image_straddling_divergence_declines_instead_of_planning_inexact_replay() {
+        // #2340: the old even-aligned common frontier's 128-token replay began inside
+        // this image and rounded to 972, while the encoder restarted at 1044.
+        for common in [1172, 1173, 290_001] {
+            let tokens: Vec<u32> = (0..common + 12).collect();
+            let mut branch = tokens.clone();
+            branch[common as usize] = u32::MAX;
+            assert!(selected(&[&tokens], &branch).is_none());
+            let end = common as usize;
+            let span = MediaSpan { start: end - 200, len: 192,
+                key: cuteafd_core::ImageKey([7; 32]).into() };
+            let hit = RestoreCandidate { common: end, snapshot_end: end,
+                target_end: branch.len(), resume: end, media: std::slice::from_ref(&span),
+                saved_media: std::slice::from_ref(&span) };
+            let plan = RestorePlan::under(ReuseRule::EXACT, hit);
+            assert!(plan.exact());
+            assert_eq!((plan.resume(), hit.media_safe(plan.resume())), (end, end));
+        }
     }
 
     #[test]
@@ -654,7 +700,7 @@ mod tests {
             ("queue_mark", &["self.copy_mark(lease", "cuda_stream_wait_event(stream, self.prefix_queued.0)"]),
             ("copy_mark", &["request.phase == CachePhase::Full && request.publication.is_empty()"]),
             // Restores: only a fresh admission, drained before it is observable.
-            ("restore_retained_phase", &["request.end == 0", "request.version == 0", "cuda_stream_synchronize(self.prefix_stream.raw)"]),
+            ("restore_retained_phase", &["request.end == 0", "request.version == 0", "self.prefix_drain()"]),
             ("prefix_drain", &["cuda_stream_synchronize(self.prefix_stream.raw)"]),
             // Tail copies: into a fresh fork's private page, drained before release.
             ("copy_unit_rows", &["`to` belongs to the caller's fresh fork and no reader"]),

@@ -305,7 +305,9 @@ mod tests {
         // device rather than draining it.
         let v41 = include_str!("../../families/deepseek_v41/v41_backbone_cache/prefix.rs");
         let start = v41.find("pub fn prefix_drain(&self)").expect("V4.1 prefix drain");
-        assert!(v41[start..start + 200].contains("self.prefix_stream.raw"));
+        let tail = &v41[start..];
+        let end = tail.find("\n    }\n").expect("complete prefix_drain body") + "\n    }".len();
+        assert!(tail[..end].contains("self.prefix_stream.raw"));
         let serve = include_str!("../../families/deepseek_v41/v41_native_serve/prefix.rs");
         let queued = &serve[serve.find("fn queue_capture(").expect("V4.1 queue_capture")..];
         let queued = &queued[..queued.find("\n    fn ").unwrap_or(queued.len())];

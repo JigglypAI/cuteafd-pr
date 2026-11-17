@@ -1259,6 +1259,16 @@ impl<'a> DsparkDrafter<'a> {
         Ok(())
     }
 
+    pub(crate) fn quarantine_pages(&self, slot: usize) {
+        if let Some(split) = &self.head_split { split.peer.quarantine_pages(slot); }
+        if let Some(context) = &self.paged {
+            let mut state = context.state.borrow_mut();
+            if let Some(binding) = state.bindings.get(slot).copied().flatten() {
+                state.pool.quarantine(binding).expect("live block binding belongs to its pool");
+            }
+        }
+    }
+
     pub(crate) fn discard_context(&self, slot: usize) -> Result<()> {
         self.on_device(|| self.discard_context_on_device(slot))
     }

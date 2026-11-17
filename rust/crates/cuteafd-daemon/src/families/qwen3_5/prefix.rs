@@ -316,6 +316,10 @@ impl PrefixFamily for DensePrefix<'_, '_> {
             (None, None) => None,
         }
     }
+    fn quarantine_draft_pages(&self, placement: &Placement) {
+        if let Some(mtp) = &self.mtp { mtp.quarantine_pages(placement.slot); }
+        if let Some(draft) = &self.drafter { draft.quarantine_pages(placement.slot); }
+    }
     fn admit_draft_pages(&self, placement: &mut Placement, capacity: usize) -> Result<(), BoxError> {
         if let Some(mtp) = &self.mtp { mtp.admit_pages(placement.slot, capacity)?; }
         if let Some(draft) = &self.drafter { draft.admit_pages(placement.slot, capacity)?; }
@@ -467,5 +471,38 @@ impl PrefixFamily for DensePrefix<'_, '_> {
     fn mark_segments(&self, slot: MarkSlot) -> Vec<DeviceRange> {
         self.mark_buffers(slot).unwrap_or_default().into_iter()
             .map(|buffer| DeviceRange { addr: buffer.ptr as u64, bytes: buffer.bytes }).collect()
+    }
+}
+
+/// #2342: Qwen3.5's engine state is GPU-only, so the rollback contract is
+/// checked on the source: a restore validates before it writes, and the
+/// engine's abandon path resets the bound slot before the cold bind.
+#[cfg(test)]
+mod rollback_tests {
+    fn production() -> &'static str {
+        include_str!("prefix.rs").split("\n#[cfg(test)]").next().unwrap()
+    }
+    fn body<'a>(source: &'a str, needle: &str) -> &'a str {
+        let rest = &source[source.find(needle).unwrap_or_else(|| panic!("{needle}"))..];
+        let end = rest.find("\n    }\n").map_or(rest.len(), |e| e + 6);
+        &rest[..end]
+    }
+
+    #[test]
+    fn a_failed_restore_is_reset_by_discard_before_the_cold_bind() {
+        let source = production();
+        let restore = body(source, "fn restore(&self, mark: Option<MarkSlot>");
+        let validate = restore.find("self.mark_buffers(mark)?")
+            .expect("Qwen3.5 restore must validate the mark before it writes state");
+        let write = restore.find("self.move_mark(mark, placement.slot, false)?")
+            .expect("restore installs the mark");
+        assert!(validate < write, "a rejected mark must not leave partial state");
+        let discard = body(source, "fn discard(&self, placement: &mut Placement)");
+        assert!(discard.contains("reset_slot(placement.slot)"),
+            "discard resets the engine slot a partial restore touched");
+        assert!(discard.contains("placement.len = 0") && discard.contains("placement.state_len = 0"));
+        let bind = body(source, "fn bind(&self, placement: &mut Placement)");
+        assert!(bind.contains("reset_slot(placement.slot)"));
+        assert!(bind.contains("bind_slot(placement.slot, &placement.units)"));
     }
 }

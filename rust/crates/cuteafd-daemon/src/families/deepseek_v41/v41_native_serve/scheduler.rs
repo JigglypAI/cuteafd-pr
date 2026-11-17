@@ -917,6 +917,11 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
         let mut held_slots = std::collections::BTreeSet::new();
         stall::mark(stall::Phase::Admission, active.iter().flatten().count() + media.len() + media_ready.len());
         loop {
+            // A terminal target/drafter drain can fail during admission itself. Do not
+            // reuse any fixed slot before the outer serving loop observes the failure.
+            if let Some(reason) = cuteafd_transport::health::failure_reason() {
+                anyhow::bail!("admission unavailable until restart: {reason}");
+            }
             let busy_slots = active.iter().flatten().count() + media.len() + media_ready.len() + held_slots.len()
                 + prefills.len();
             let backlog = !media.full() && !media.backlog.is_empty();
