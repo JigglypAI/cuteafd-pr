@@ -899,6 +899,7 @@ fn boot_concurrency_full_plan_matrix() {
                             let mut options = case.base_options.clone()
                                 .unwrap_or_else(|| wave_plan_options(case.dir.path(), ranks));
                             options.placement = ExpertPlacement::from_spark_ranks(ranks);
+                            if family == "kimi_k3" { options.vision = MediaMode::Off; }
                             if matches!(family, "qwen4" | "minimax_m3") && gpus == 2 {
                                 // MiniMax's reduced four-layer fixture exercises explicit split-wire
                                 // costs; release-geometry auto Heads has its own runtime parity oracle.
