@@ -1435,6 +1435,10 @@ def kimi_w8_programs():
         from b12x.integration.cuteafd import kimi_residual
         return kimi_residual.compile_kimi_attn_res_rmsnorm_aot(**params)
 
+    def build_stream(params):
+        from b12x.integration.cuteafd import kimi_residual
+        return kimi_residual.compile_kimi_attn_res_stream_aot(**params)
+
     def build_situ(width):
         from b12x.integration.cuteafd import kimi_residual
         return kimi_residual.compile_kimi_situ_aot(intermediate=width)
@@ -1454,6 +1458,10 @@ def kimi_w8_programs():
         name = f"attn_res_c{candidates}_{mode}" + ("_append" if append else "")
         out.append((name, "attn_res_rmsnorm", params,
                     lambda kw=params: build_residual(kw)))
+    for candidates in range(2, 10):
+        params = dict(hidden=7168, candidates=candidates)
+        out.append((f"attn_res_stream_c{candidates}", "attn_res_stream", params,
+                    lambda kw=params: build_stream(kw)))
     for width in (3072, 6144, 16896, 33792):
         out.append((f"situ_i{width}", "situ", {"intermediate": width},
                     lambda w=width: build_situ(w)))

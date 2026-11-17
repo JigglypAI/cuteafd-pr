@@ -21,6 +21,7 @@ use cuteafd_transport::{expert::{SparkWorld, EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT
 use std::{collections::BTreeSet, net::SocketAddr, path::Path, rc::Rc, sync::Arc};
 
 pub(crate) struct Options<'a> {
+    pub media: &'a crate::shared::vision::still::Options,
     pub device: i32,
     pub split_device: Option<i32>,
     pub peers: &'a [SocketAddr],
@@ -44,6 +45,7 @@ pub(crate) struct Options<'a> {
 /// Readiness remains the shared scheduler's responsibility, after its selector
 /// and prefix cache have been constructed and reconciled.
 pub(crate) struct Loaded<'a> {
+    pub media: crate::shared::vision::still::Ready,
     pub execution: ServingPrefill<'a>,
     pub owners: Owners<'a>,
     pub inputs: MiniMaxInputs,
@@ -183,9 +185,13 @@ pub(crate) fn load<'a>(library: &'a Arc<cuteafd_ffi::NativeLibrary>, programs: &
     let host_cache_bytes = match options.prefix.host_cache_bytes {
         HostBudget::Auto => None, HostBudget::Bytes(bytes) => Some(bytes),
     };
+    let gathered_checkpoint = if options.media.vision != cuteafd_loader::plan::MediaMode::Off {
+        Some(Checkpoint::open_view_for_role(view, "MiniMax target and still tower", |name|
+            checkpoint.has_header(name) || cuteafd_loader::families::minimax_m3::vision::VisionContract::is_tensor(name))?)
+    }else{None};
     let replies = cuteafd_core::spark_reply::requested();
     fp8::validate_reply_formats(catalog.fp8().context("MiniMax expert catalog")?.format(), replies)?;
-    let (inputs, admitted) = serve_admission::prepare(FactsRequest { vision: cuteafd_loader::plan::MediaMode::Off, vision_replicas: 1, media_cache_bytes: None, spark_rank_bytes: cuteafd_loader::serving_capacity::spark_memory::runtime_bytes(&options.peers.iter().map(ToString::to_string).collect::<Vec<_>>())?, checkpoint, cfg,
+    let (inputs, admitted) = serve_admission::prepare(FactsRequest { vision: options.media.vision, vision_replicas: options.media.vision_replicas, media_cache_bytes: options.media.media_cache_bytes.map(|bytes|bytes.0 as u64), spark_rank_bytes: cuteafd_loader::serving_capacity::spark_memory::runtime_bytes(&options.peers.iter().map(ToString::to_string).collect::<Vec<_>>())?, checkpoint: gathered_checkpoint.as_ref().unwrap_or(checkpoint), cfg,
         catalog: &catalog, manifest_path: options.manifest_path, manifest: Arc::clone(&manifest),
         coordinator: Coordinator::Measured { samples: vec![], loaded_code: vec![] },
         attention: Some(options.attention_placement), split_wire: Some(options.split_wire), physical_devices: &physical,
@@ -219,7 +225,12 @@ pub(crate) fn load<'a>(library: &'a Arc<cuteafd_ffi::NativeLibrary>, programs: &
         Some(SparkAdmission::plan_view(view, ExpertGeometry::MINIMAX_M3, Some(&catalog),
             &working, options.peers.len(), model, None)?)
     };
+    let placement = inputs.vision.as_ref().and_then(|vision|vision.admitted(&admitted.solved));
+    let cache_bytes = inputs.vision.as_ref().map_or(0,|vision|vision.media_cache);
+    let mut media = crate::shared::vision::still::Ready::load(options.media, &checkpoint.snapshot,
+        options.native_lib, library, &physical, placement, cuteafd_loader::media::ImageFamily::MiniMax, cache_bytes)?;
     let (pending, membership) = push::prepare_serving(view, &catalog, checkpoint, &devices, &inputs, &admitted)?;
+    let pending=pending.with_media(view.snapshot(),std::mem::take(&mut media.push))?;
     let spark = spark.map(|spark| spark.start_with(options.peers, membership)).transpose()?;
     let push::ServingWeights { targets, embedding, mut expert_sets } = pending.finish(&catalog, spark)?;
     let loaded = targets.into_iter().zip(&devices).map(|(weights, &device)| {
@@ -303,7 +314,7 @@ pub(crate) fn load<'a>(library: &'a Arc<cuteafd_ffi::NativeLibrary>, programs: &
     crate::shared::memory_report::release_load_staging(library)?;
     publish_provenance(options.native_lib, options.manifest_path, &runtime, &admitted,
         options.peers.len(), options.sequences)?;
-    Ok(Loaded { execution, owners, inputs, admitted,
+    Ok(Loaded { media, execution, owners, inputs, admitted,
         admission_free: samples.iter().map(|sample| sample.free).collect(), host_prefix })
 }
 

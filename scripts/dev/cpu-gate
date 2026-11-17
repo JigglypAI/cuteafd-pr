@@ -30,7 +30,7 @@ the release host-cost bounds (BENCHES: the draft policy's select median at the
 V4.1 C16 geometry under CUTEAFD_POLICY_BENCH_MAX_US) as their own suite,
 recording each bench's medians. Everything lives under
 ~/.cache/cuteafd/builds/NAME (asserted build filesystem): the Cargo target
-(target-cpu-gate, plain rustc, kept apart from kache targets), TMPDIR and
+(fresh target-cpu-gate-kache/plain directories), TMPDIR and
 pytest's basetemp. Submodules are initialized at their pinned commits first.
 Compiling (cargo test --no-run) holds a build slot (scripts/build/build-slot.sh,
 slot 0 is build.lock); running the tests holds none. Each suite has its own
@@ -56,6 +56,8 @@ stay.
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager, nullcontext
+import fcntl
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 import json
@@ -71,6 +73,7 @@ import threading
 import xml.etree.ElementTree as ET
 import sys
 import time
+import uuid
 
 REPO = Path(__file__).resolve().parents[2]
 BUILDS = Path.home() / '.cache/cuteafd/builds'
@@ -172,6 +175,8 @@ RUN_SUFFIX = re.compile(r'(?:[-_.](?:\d+|[0-9a-f]{8,}))+\Z')
 CHILDREN = set()
 CHILDREN_LOCK = threading.Lock()
 STOPPING = threading.Event()
+TERMINATED_SIGNAL = None
+GATE_LEASE_WAIT = 7200
 
 
 def log(message):
@@ -280,7 +285,7 @@ def run_logged(cmd, log_path, env, cwd, timeout):
     started = time.monotonic()
     with open(log_path, 'w') as output:
         if STOPPING.is_set():
-            output.write('cpu-gate: interrupted before start\n')
+            output.write('cpu-gate: terminated before start\n')
             return 130, 0.0
         # Own session: an interrupt or timeout stops the whole tree (rustc, test binaries, xdist workers).
         process = subprocess.Popen(cmd, cwd=cwd, env=env, stdout=output, stderr=subprocess.STDOUT, start_new_session=True)
@@ -301,6 +306,15 @@ def run_logged(cmd, log_path, env, cwd, timeout):
 
 def stop_tree(process):
     try:
+        os.killpg(process.pid, signal.SIGTERM)
+    except (ProcessLookupError, PermissionError):
+        pass
+    try:
+        process.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        pass
+    # Kill the group even if its leader exited: descendants may ignore TERM.
+    try:
         os.killpg(process.pid, signal.SIGKILL)
     except (ProcessLookupError, PermissionError):
         pass
@@ -308,16 +322,17 @@ def stop_tree(process):
 
 
 def interrupt(signum, frame):
+    global TERMINATED_SIGNAL
     if STOPPING.is_set():
         return  # already unwinding toward cleanup
     STOPPING.set()
+    TERMINATED_SIGNAL = signum
     with CHILDREN_LOCK:
         running = list(CHILDREN)
-    for process in running:
-        try:
-            os.killpg(process.pid, signal.SIGKILL)
-        except (ProcessLookupError, PermissionError):
-            pass
+    # Stop children before the executor joins; a TERM-ignoring compile must
+    # not leave the signal handler waiting for the multi-hour suite timeout.
+    with ThreadPoolExecutor(max_workers=max(1, len(running))) as stopper:
+        list(stopper.map(stop_tree, running))
     raise KeyboardInterrupt(f'signal {signum}')
 
 
@@ -378,7 +393,7 @@ def remove_tree(path):
 def clean_scratch(root):
     removed = []
     for side in ('head', 'base'):
-        for name in SCRATCH:
+        for name in (*SCRATCH, *(p.name for p in (root / side).glob('target-cpu-gate-*'))):
             path = root / side / name
             if path.exists() or path.is_symlink():
                 remove_tree(path)
@@ -466,6 +481,23 @@ def rustup_toolchain_bin(root=RUSTUP_HOME, env=None):
     return resolved.parent if resolved is not None and resolved.is_file() else None
 
 
+def resolved_child_tools(env):
+    """Resolve rustup before fixtures replace HOME, and find host build tools."""
+    env = dict(env)
+    roots = [Path(env['RUSTUP_HOME'])] if env.get('RUSTUP_HOME') else []
+    roots += [Path(env.get('HOME') or Path.home()) / '.rustup', RUSTUP_HOME]
+    toolchain = next((found for root in roots
+                      if (found := rustup_toolchain_bin(root=root, env=env)) is not None), None)
+    directories = ([str(toolchain)] if toolchain else [])
+    directories += [env.get('PATH', '')]
+    if HOMEBREW_BIN.is_dir():
+        directories.append(str(HOMEBREW_BIN))
+    path = os.pathsep.join(directories)
+    tools = {name: shutil.which(name, path=path) for name in
+             ('cargo', 'rustc', 'nasm', 'cmake', 'cc', 'c++', 'make', 'ninja', 'pkg-config')}
+    return path, dict(toolchain_bin=str(toolchain) if toolchain else None, tools=tools)
+
+
 def cargo_build_succeeded(path):
     """Require Cargo's completion event even if an enclosing shell masks its exit."""
     finished = []
@@ -485,8 +517,8 @@ def cargo_build_succeeded(path):
 
 
 def scrub_compiler_cache_env(env):
-    """Remove inherited compiler-launcher and cache variables so Cargo and script suites
-    never share read-only kache outputs or inherit ambient launcher overrides."""
+    """Isolate script fixtures, not Cargo. Never bypass compiler caches unless TJ
+    asks, release requires it, or disk is short (global BUILD_CACHES=off)."""
     cleaned = dict(env)
     scrubbed = sorted(key for key in list(cleaned)
                       if key in SCRUBBED_ENV_NAMES or key.startswith(SCRUBBED_ENV_PREFIXES)
@@ -494,6 +526,101 @@ def scrub_compiler_cache_env(env):
     for key in scrubbed:
         cleaned.pop(key, None)
     return cleaned, scrubbed
+
+
+def compiler_cache_env(source, root, env):
+    """Use the shipping fail-soft wrapper, with per-run config and local arch stores."""
+    env = dict(env)
+    home = Path(env.get('HOME') or Path.home())
+    env.setdefault('CARGO_HOME', str(persistent_cargo_home(env)))
+    if env.get('CUTEAFD_BUILD_CACHES') == 'off':
+        env, _ = scrub_compiler_cache_env(env)
+        return env
+    native = home / '.cache/cuteafd/tools' / platform.machine() / 'kache'
+    env['CUTEAFD_KACHE'] = env.get('CUTEAFD_KACHE') or (str(native) if native.is_file() else '1')
+    env.setdefault('CUTEAFD_KACHE_CACHE_DIR', str(home / '.cache/cuteafd/kache'))
+    # Reinitialize managed launchers: the inherited config/shims belong to the
+    # caller's build. Preserve cache paths and unmanaged compiler wrappers.
+    if env.get('CUTEAFD_KACHE_ACTIVE') and env.get('RUSTC_WRAPPER', '').endswith('/compiler-cache.sh'):
+        for key in ('RUSTC_WRAPPER', 'CMAKE_C_COMPILER_LAUNCHER', 'CMAKE_CXX_COMPILER_LAUNCHER'):
+            env.pop(key, None)
+        for key in ('CC', 'CXX'):
+            if env.get(key, '').startswith(env.get('CUTEAFD_KACHE_SHIM_DIR', '/nonexistent') + '/'):
+                env.pop(key, None)
+    for key in ('CUTEAFD_KACHE_ACTIVE', 'CUTEAFD_KACHE_MODE', 'CUTEAFD_KACHE_WARNING_DIR'):
+        env.pop(key, None)
+    helper = str(source / 'scripts/build/compiler-cache.sh')
+    command = "source \"$1\"; cuteafd_compiler_cache_setup \"$2\"; exec python3 -c 'import os,json; print(json.dumps(dict(os.environ)))'"
+    try:
+        result = subprocess.run(['bash', '-c', command, 'cpu-gate', helper, str(root)],
+                                env=env, text=True, capture_output=True, timeout=30)
+        if result.stderr:
+            log(result.stderr.strip())
+        if result.returncode == 0:
+            return json.loads(result.stdout)
+    except (OSError, subprocess.SubprocessError, ValueError) as error:
+        log(f'warning: compiler cache setup unavailable: {error}; using plain compilers')
+    else:
+        log('warning: compiler cache setup failed; using plain compilers')
+    env, _ = scrub_compiler_cache_env(env)
+    return env
+
+
+def compiler_cache_receipt(env, target):
+    active = env.get('CUTEAFD_KACHE_ACTIVE')
+    warning = Path(env.get('CUTEAFD_KACHE_WARNING_DIR', '/nonexistent')) / 'first-failure'
+    event_root = str(Path(env['KACHE_CONFIG']).parent.parent) if env.get('KACHE_CONFIG') else str(target.parent)
+    record = dict(event_root=event_root, mode='fallback' if warning.is_file() else 'kache' if active else 'plain',
+                  target=str(target), wrapper=env.get('RUSTC_WRAPPER', ''),
+                  cache_dir=env.get('KACHE_CACHE_DIR'), hits=None, misses=None,
+                  rustflags=env.get('RUSTFLAGS', ''), cargo_encoded_rustflags=env.get('CARGO_ENCODED_RUSTFLAGS', ''))
+    if warning.is_file():
+        record['fallback'] = warning.read_text(errors='replace').strip()
+    for name, command in (('rustc', ['rustc', '-vV']), ('cargo', ['cargo', '-V'])):
+        try:
+            version = subprocess.run(command, env=env, capture_output=True, text=True, timeout=5)
+            record[name] = version.stdout.strip() if version.returncode == 0 else None
+        except (OSError, subprocess.SubprocessError):
+            record[name] = None
+    if active:
+        try:
+            result = subprocess.run([active, '--json', 'stats', '--root', event_root, '--full'],
+                                    env=env, capture_output=True, text=True, timeout=15)
+            payload = json.loads(result.stdout)
+            stats = payload.get('report', payload)['summary']
+            record.update(hits=sum(stats.get(k, 0) for k in ('local_hits', 'remote_hits', 'prefetch_hits')),
+                          misses=stats['misses'], stats=stats)
+        except (OSError, subprocess.SubprocessError, ValueError, KeyError) as error:
+            record['stats_error'] = str(error)
+    return record
+
+
+@contextmanager
+def gate_lease(directory=None, slots=None, timeout=GATE_LEASE_WAIT):
+    """Count whole gates, including pytest and base comparisons, on this host."""
+    directory = directory or Path.home() / '.cache/cuteafd'
+    slots = slots if slots is not None else (1 if platform.node().split('.')[0] == 'maxq' else 2)
+    directory.mkdir(parents=True, exist_ok=True)
+    started = time.monotonic()
+    log(f'waiting for gate lease ({slots} slots, timeout {timeout}s)')
+    while True:
+        for slot in range(slots):
+            lock = (directory / f'cpu-gate.{slot}.lock').open('a')
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                lock.close()
+                continue
+            try:
+                log(f'gate lease {slot}/{slots} acquired after {time.monotonic() - started:.1f}s')
+                yield dict(slot=slot, slots=slots, wait_s=round(time.monotonic() - started, 3))
+            finally:
+                lock.close()
+            return
+        if time.monotonic() - started >= timeout:
+            raise TimeoutError(f'no gate lease free after {timeout}s')
+        if STOPPING.wait(min(1, max(0, timeout - (time.monotonic() - started)))):
+            raise KeyboardInterrupt('terminated while waiting for gate lease')
 
 
 def validate_full_test_ids(source, root, args, env):
@@ -516,9 +643,11 @@ def validate_full_test_ids(source, root, args, env):
 
 
 def cargo(source, root, args, env):
-    target = root / 'target-cpu-gate'
+    run_id = uuid.uuid4().hex[:12]
+    env = compiler_cache_env(source, root / 'compiler-cache-runs' / run_id, env)
+    mode = 'kache' if env.get('CUTEAFD_KACHE_ACTIVE') else 'plain'
+    target = root / f'target-cpu-gate-{mode}-{run_id}'
     checked([sys.executable, str(source / 'scripts/build/assert-build-filesystem.py'), str(target)])
-    env, scrubbed_env = scrub_compiler_cache_env(env)
     env = {**env, 'CARGO_TARGET_DIR': str(target), 'CARGO_BUILD_JOBS': str(getattr(args, 'cargo_jobs', 16)),
            'RUST_TEST_THREADS': str(getattr(args, 'cargo_jobs', 16))}
     env.setdefault('CUTEAFD_DEPLOYMENT_TEST_PROGRAMS',
@@ -529,15 +658,18 @@ def cargo(source, root, args, env):
                                 '--no-run', '--message-format=json-render-diagnostics'], build_log, env, source / 'rust', args.cargo_build_timeout)
     complete = cargo_build_succeeded(build_log)
     result = dict(suite='cargo', build_exit=code, build_complete=complete, build_s=round(build_s), build_log=str(build_log),
-                  scrubbed_env=scrubbed_env, deployment_test_programs=env['CUTEAFD_DEPLOYMENT_TEST_PROGRAMS'])
+                  compiler_cache=compiler_cache_receipt(env, target),
+                  scrubbed_env=[], deployment_test_programs=env['CUTEAFD_DEPLOYMENT_TEST_PROGRAMS'])
     if code or not complete:
         tail = [line for line in build_log.read_text(errors='replace').splitlines() if line.startswith('error')][:5]
         return {**result, 'status': 'failed', 'error': 'compile failed: ' + ('; '.join(tail) or
                 f'exit {code}; missing or unsuccessful build-finished event')}
-    result.update(validate_full_test_ids(source, root, args, env))
+    if not getattr(args, 'cargo_filter', None):
+        result.update(validate_full_test_ids(source, root, args, env))
     if 'error' in result:
         return {**result, 'status': 'failed'}
     full = getattr(args, 'full', False)
+    test_filter = getattr(args, 'cargo_filter', None)
     if not args.skip_live_planners:
         # Installed launcher checks import the same pytest helpers as the script suite.
         env['CUTEAFD_TEST_PYTHON'] = str(python_for(source))
@@ -549,7 +681,9 @@ def cargo(source, root, args, env):
     skipped = list(dict.fromkeys(skipped_full + skipped_live))
     skips = [flag for name in skipped for flag in ('--skip', name)]
     test_args = ['nice', '-n', '19', 'cargo', 'test', '--workspace', '--locked', '--no-fail-fast', '--', *skips]
-    if skips:
+    if test_filter:
+        test_args.insert(test_args.index('--'), test_filter)
+    if skips and not test_filter:
         test_args.append('--exact')
     nextest = nextest_for(env)
     # nextest's store is workspace-relative, independent of CARGO_TARGET_DIR.
@@ -568,8 +702,11 @@ def cargo(source, root, args, env):
         test_args = ['nice', '-n', '19', nextest, 'nextest', 'run', '--workspace', '--locked',
                      '--config-file', str(config), '--profile', profile_name, '--no-fail-fast', '--test-threads',
                      env['RUST_TEST_THREADS']]
-        if skipped:
-            test_args += ['-E', ' & '.join(f'not test(={name})' for name in skipped)]
+        expressions = [f'not test(={name})' for name in skipped]
+        if test_filter:
+            expressions.append(f'test({test_filter})')
+        if expressions:
+            test_args += ['-E', ' & '.join(expressions)]
     if nextest:
         report.unlink(missing_ok=True)
     log(f"cargo: running tests ({'nextest' if nextest else 'cargo test'}, {env['RUST_TEST_THREADS']} workers, no build slot)")
@@ -583,7 +720,7 @@ def cargo(source, root, args, env):
             code = code or 1  # Passing doctests cannot mask an empty/missing nextest run.
     passed, failed, ignored = (sum(t[i] for t in totals) for i in range(3))
     ids = nextest_ids if nextest else sorted(set(CARGO_FAIL.findall(text)))
-    if nextest and code != 124:
+    if nextest and code != 124 and not test_filter:
         doc_log = root / 'logs/cargo-doc.log'
         doc_code, doc_s = run_logged(['nice', '-n', '19', 'cargo', 'test', '--workspace', '--locked', '--doc'],
                                     doc_log, env, source / 'rust', args.cargo_timeout)
@@ -647,11 +784,13 @@ def parse_nextest(report):
 
 def benches(source, root, args, env):
     """Release-mode bound checks: each bench passes only when its test ran and passed."""
-    target = root / 'target-cpu-gate-release'
+    run_id = uuid.uuid4().hex[:12]
+    env = compiler_cache_env(source, root / 'compiler-cache-runs' / run_id, env)
+    mode = 'kache' if env.get('CUTEAFD_KACHE_ACTIVE') else 'plain'
+    target = root / f'target-cpu-gate-release-{mode}-{run_id}'
     checked([sys.executable, str(source / 'scripts/build/assert-build-filesystem.py'), str(target)])
-    env, scrubbed_env = scrub_compiler_cache_env(env)
     env = {**env, 'CARGO_TARGET_DIR': str(target), 'CARGO_BUILD_JOBS': str(getattr(args, 'cargo_jobs', 16))}
-    result = dict(suite='benches', passed=0, failed=0, failing=[], medians={}, logs=[], scrubbed_env=scrubbed_env)
+    result = dict(suite='benches', passed=0, failed=0, failing=[], medians={}, logs=[], scrubbed_env=[])
     build_s = test_s = 0.
     for crate, test, bounds in BENCHES:
         log(f'benches: compiling {crate}/{test} (release, build slot held while compiling)')
@@ -684,7 +823,8 @@ def benches(source, root, args, env):
             result['failing'].append(test)
             result.setdefault('errors', []).append(f'{test}: ' + ('timed out' if code == 124 else 'did not run' if not ran
                                                                  else f'bound exceeded or failed (exit {code})'))
-    result.update(build_s=round(build_s), test_s=round(test_s), bounds={t: b for _, t, b in BENCHES},
+    result.update(compiler_cache=compiler_cache_receipt(env, target),
+                  build_s=round(build_s), test_s=round(test_s), bounds={t: b for _, t, b in BENCHES},
                   status='pass' if result['passed'] == len(BENCHES) else 'failed')
     if result['status'] == 'failed':
         result['error'] = '; '.join(result.get('errors', []))
@@ -698,7 +838,7 @@ def scripts(source, root, args, env):
     log(f"scripts: pytest ({python}, {getattr(args, 'pytest_jobs', 16)} workers)")
     cmd = ['nice', '-n', '19', str(python), '-m', 'pytest', '-q', '-p', 'no:cacheprovider', '--basetemp',
            str(root / 'tmp/pytest'), '-n', str(getattr(args, 'pytest_jobs', 16)),
-           '-p', 'no:randomly', 'scripts/tests']
+           '-p', 'no:randomly', getattr(args, 'pytest_target', 'scripts/tests')]
     code, seconds = run_logged(cmd, test_log, env, source, args.scripts_timeout)
     text = test_log.read_text(errors='replace')
     summary = PYTEST_SUMMARY.findall(text)
@@ -726,7 +866,10 @@ def gate(source, root, args, owned=False):
     # Record the gated commit before running: a checkout that moves during the
     # gate would otherwise be credited with tests that ran against older source.
     head = checked(['git', '-C', str(source), 'rev-parse', 'HEAD']).strip()
-    env, scrubbed_env = scrub_compiler_cache_env({**os.environ, 'TMPDIR': str(root / 'tmp'), 'PYTHONDONTWRITEBYTECODE': '1'})
+    # Never bypass Cargo caches unless TJ asks, release requires it, or disk is short.
+    # Only script fixtures scrub ambient launchers; BUILD_CACHES=off is global.
+    env = {**os.environ, 'TMPDIR': str(root / 'tmp'), 'PYTHONDONTWRITEBYTECODE': '1'}
+    scrubbed_env = []
     requested = [fn for enabled, fn in ((args.cargo, cargo), (args.scripts, scripts),
                                          (args.benches, benches)) if enabled]
     # Cargo and its release benches share compiler resources; only pytest overlaps them.
@@ -757,6 +900,9 @@ def render(record):
              '| Suite | Status | Passed | Failed | Seconds | Note |', '| --- | --- | ---: | ---: | ---: | --- |']
     for suite in record['suites']:
         note = suite.get('error', '')
+        if suite.get('compiler_cache'):
+            cache = suite['compiler_cache']
+            note += f" cache={cache['mode']} hits={cache['hits']} misses={cache['misses']}"
         if suite.get('skipped_live_planners'):
             note = (note + '; ' if note else '') + 'live planner tests skipped (--skip-live-planners)'
         if suite.get('skipped_full_tests'):
@@ -786,8 +932,8 @@ def main():
     parser.add_argument('--full', action='store_true', help='include full-plan/cache and installed-checkpoint tests (required for releases)')
     parser.add_argument('--slow', action='store_true', help='also run explicit ignored CPU soaks (required at release cuts; never enables GPU tests)')
     parser.add_argument('--task', required=True, help='build directory name under ~/.cache/cuteafd/builds')
-    parser.add_argument('--cargo', action='store_true')
-    parser.add_argument('--scripts', action='store_true')
+    parser.add_argument('--cargo', nargs='?', const='', metavar='FILTER', help='Cargo suite, optionally a focused test filter (no gate lease)')
+    parser.add_argument('--scripts', nargs='?', const='scripts/tests', metavar='TARGET', help='script suite, optionally a focused pytest path/node (no gate lease)')
     parser.add_argument('--benches', action='store_true', help='release host-cost bounds (BENCHES), recorded as their own suite')
     parser.add_argument('--skip-live-planners', action='store_true', help='skip live V4 and installed-checkpoint planners (explicitly recorded)')
     parser.add_argument('--base', metavar='REV', help='also gate REV in a detached worktree; fail only on new failing ids')
@@ -799,6 +945,9 @@ def main():
     args = parser.parse_args()
     if not NAME.fullmatch(args.task):
         parser.error('--task must be a plain name')
+    args.cargo_filter = args.cargo or None
+    args.pytest_target = args.scripts or 'scripts/tests'
+    args.cargo, args.scripts = args.cargo is not None, args.scripts is not None
     if not (args.cargo or args.scripts or args.benches):
         args.cargo = args.scripts = True
     if args.jobs < 1:
@@ -814,6 +963,8 @@ def main():
     if missing and (args.cargo or args.benches or args.scripts):
         parser.error(f'{", ".join(missing)} not on PATH; pass PATH including ~/.cargo/bin '
                      '(systemd-run --setenv=PATH=...)')
+    os.environ['PATH'], args.resolved_tools = resolved_child_tools(os.environ)
+    log(f"resolved child tools: {json.dumps(args.resolved_tools, sort_keys=True)}")
     concurrent =args.scripts and (args.cargo or args.benches)
     args.cargo_jobs = max(1, args.jobs // 2) if concurrent else args.jobs
     args.pytest_jobs = max(1, args.jobs - args.cargo_jobs) if concurrent else args.jobs
@@ -823,7 +974,20 @@ def main():
     signal.signal(signal.SIGHUP, interrupt)
     signal.signal(signal.SIGINT, interrupt)
     try:
-        return run_gate(args, root)
+        whole_gate = (args.cargo and not args.cargo_filter) or (args.scripts and args.pytest_target == 'scripts/tests') or args.benches
+        with gate_lease() if whole_gate else nullcontext(None) as lease:
+            args.gate_lease = lease
+            return run_gate(args, root)
+    except (KeyboardInterrupt, TimeoutError) as error:
+        code = 128 + TERMINATED_SIGNAL if TERMINATED_SIGNAL else 130 if isinstance(error, KeyboardInterrupt) else 75
+        record = dict(task=args.task, verdict='terminated' if code != 75 else 'failed',
+                      status='terminated' if code != 75 else 'failed', exit=code, error=str(error),
+                      head=checked(['git', '-C', str(args.source), 'rev-parse', 'HEAD']).strip(),
+                      dirty=False, suites=[])
+        (root / 'cpu-gate.json').write_text(json.dumps(record, indent=2) + '\n')
+        (root / 'cpu-gate.md').write_text(render(record))
+        log(f"{record['verdict']}: {error} (exit {code})")
+        return code
     finally:
         if args.keep:
             log(f'--keep: scratch and Cargo targets left under {root}')
@@ -836,6 +1000,8 @@ def main():
 
 def run_gate(args, root):
     record = {'task': args.task, 'started': time.strftime('%Y-%m-%dT%H:%M:%S%z'),
+              'gate_lease': getattr(args, 'gate_lease', None),
+              'resolved_tools': getattr(args, 'resolved_tools', None),
               'full': getattr(args, 'full', False),
               'skip_live_planners': args.skip_live_planners, **gate(args.source.resolve(), root / 'head', args)}
     if args.base:

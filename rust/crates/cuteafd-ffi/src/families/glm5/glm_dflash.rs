@@ -171,6 +171,44 @@ impl NativeLibrary {
         }, "top-k")
     }
 
+    /// Exact native selector scratch for the checkpoint's 16- or 32-candidate width.
+    pub fn dflash_topk_workspace_width(&self, rows: usize, top_k: usize) -> Result<usize> {
+        anyhow::ensure!(rows > 0 && matches!(top_k, 16 | 32), "invalid DFlash selector extent");
+        type F = unsafe extern "C" fn(i32, i32) -> u64;
+        // SAFETY: symbol signature matches the native width-selecting workspace ABI.
+        let f = *unsafe { self.lib.get::<F>(b"cuteafd_dflash_topk_workspace_width") }?;
+        Ok(usize::try_from(unsafe { f(i(rows)?, i(top_k)?) })?)
+    }
+
+    /// Top-k of BF16-rounded logits, with checkpoint-selected output width.
+    ///
+    /// # Safety
+    /// As [`Self::linear_bf16`]; output and workspace extents include `top_k`.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn dflash_topk_width(&self, logits: P, unary: M, candidates: M, workspace: M,
+        sequences: usize, block_rows: usize, drafts: usize, vocab: usize, top_k: usize, stream: M) -> Result<()> {
+        anyhow::ensure!(matches!(top_k, 16 | 32), "unsupported DFlash selector width");
+        type F = unsafe extern "C" fn(P, M, M, M, i32, i32, i32, i32, i32, M) -> i32;
+        let f = *unsafe { self.lib.get::<F>(b"cuteafd_dflash_topk_width") }?;
+        check(unsafe { f(logits, unary, candidates, workspace, i(sequences)?, i(block_rows)?,
+            i(drafts)?, i(vocab)?, i(top_k)?, stream) }, "width top-k")
+    }
+
+    /// Width-selecting greedy candidate-selector walk.
+    ///
+    /// # Safety
+    /// As [`Self::linear_bf16`]; candidate and unary rows each contain `top_k` entries.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn dflash_select_width(&self, pred_cb: P, succ_cb: P, projected: P, candidates: P,
+        unary: P, anchors: P, tokens: M, features: M, sequences: usize, block_rows: usize,
+        drafts: usize, rank: usize, top_k: usize, stream: M) -> Result<()> {
+        anyhow::ensure!(matches!(top_k, 16 | 32), "unsupported DFlash selector width");
+        type F = unsafe extern "C" fn(P, P, P, P, P, P, M, M, i32, i32, i32, i32, i32, M) -> i32;
+        let f = *unsafe { self.lib.get::<F>(b"cuteafd_dflash_select_width") }?;
+        check(unsafe { f(pred_cb, succ_cb, projected, candidates, unary, anchors, tokens, features,
+            i(sequences)?, i(block_rows)?, i(drafts)?, i(rank)?, i(top_k)?, stream) }, "width select")
+    }
+
     /// Greedy candidate-selector walk: tokens [sequences, drafts] U32 and
     /// features [sequences, drafts, 4] F32.
     ///

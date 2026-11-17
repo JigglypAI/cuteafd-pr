@@ -505,3 +505,58 @@ def test_seal_records_the_store_independent_dev_image_identity(tmp_path):
     meta = json.loads((incoming / 'META.json').read_text())
     assert meta['base_image_id'] == 'sha256:seed'
     assert meta['base_image_layers'] == ['sha256:l1', 'sha256:l2']
+
+
+@pytest.mark.parametrize('record,explicit,expected', [
+    ('', False, 'cassowary'), ('cassowary', False, 'cassowary'),
+    ('cassowary', True, 'conflicts'), ('kakapo', False, 'cassowary'),
+])
+def test_from_slot_resolves_source_seed_before_balancing(tmp_path, record, explicit, expected):
+    record_dir = tmp_path / 'state/slots/source'
+    record_dir.mkdir(parents=True)
+    if record:
+        (record_dir / 'seed-host').write_text(record + '\n')
+    helper = WIP.split('# wip-from-slot-seed:start\n', 1)[1].split('# wip-from-slot-seed:end', 1)[0]
+    command = f'''set -euo pipefail
+release_die() {{ echo "$*" >&2; exit 1; }}
+release_wip_container() {{ echo cuteafd-wip-spark-expert-fixture; }}
+ssh() {{
+  [[ "$*" == *"cuteafd-wip-spark-expert-fixture test -d /wip/slots/source/spark-expert" ]] || exit 91
+  [[ "$*" == *" cassowary docker "* ]]
+}}
+# timeout invokes an executable; keep the fake SSH function in this shell.
+timeout() {{ shift 2; "$@"; }}
+WIP_ROOT={str(tmp_path / 'state')!r}
+WIP_INSTANCE=fixture
+from_slot=source
+seed_host=kakapo
+seed_explicit={int(explicit)}
+release_lan_seed_hosts=(kakapo cassowary)
+wip_hosts=(ostrich dodo)
+{helper}
+wip_resolve_from_slot_seed
+[[ "$seed_host" == cassowary && "$seed_explicit" == 1 ]]
+[[ "${{wip_container_hosts[*]}}" == "cassowary ostrich dodo" ]]
+'''
+    result = subprocess.run(['bash', '-c', command], text=True, capture_output=True, timeout=5)
+    if expected == 'conflicts':
+        assert result.returncode == 1 and '--seed kakapo conflicts' in result.stderr
+        assert 'cassowary' in result.stderr and '/wip/slots/source/spark-expert' in result.stderr
+    else:
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert 'seed cassowary' in result.stdout
+
+
+def test_from_slot_missing_source_names_hosts_path_and_instance(tmp_path):
+    helper = WIP.split('# wip-from-slot-seed:start\n', 1)[1].split('# wip-from-slot-seed:end', 1)[0]
+    result = subprocess.run(['bash', '-c', f'''set -euo pipefail
+release_die() {{ echo "$*" >&2; exit 1; }}
+release_wip_container() {{ echo fixture-container; }}
+timeout() {{ return 1; }}
+WIP_ROOT={str(tmp_path)!r}; WIP_INSTANCE=fixture; from_slot=source; seed_host=kakapo; seed_explicit=0
+release_lan_seed_hosts=(kakapo cassowary); wip_hosts=(ostrich)
+{helper}
+wip_resolve_from_slot_seed
+'''], text=True, capture_output=True, timeout=5)
+    assert result.returncode == 1
+    assert all(s in result.stderr for s in ('source WIP slot missing', '/wip/slots/source/spark-expert', 'kakapo', 'cassowary', 'instance fixture'))
