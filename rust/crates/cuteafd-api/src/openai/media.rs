@@ -317,15 +317,12 @@ impl MediaPreparer {
         );
         Ok(result)
     }
-    /// Additive any-resolution path: preserve per-crop keys and expand only
-    /// after all source, marker, vocabulary and context bounds are validated.
-    pub fn prepare_and_expand(&self,sources:&[MediaSource],prompt:&[u32],
-        layout:&cuteafd_loader::media::ImagePromptLayout,vocabulary:u32,context:usize)
-        -> Result<(Vec<cuteafd_loader::media::PreparedImageGroup>,cuteafd_loader::media::ExpandedMediaPrompt)> {
-        use cuteafd_loader::media::PreparedImageGroup;
+    /// Prepare independent encoder jobs first. The family then builds fragments
+    /// from source dimensions/grids and calls `PreparedImageGroup::expand_prompt`
+    /// to check source counts, markers, vocabulary and the final context bound.
+    pub fn prepare_groups(&self,sources:&[MediaSource])
+        -> Result<Vec<cuteafd_loader::media::PreparedImageGroup>> {
         ensure!(sources.len()<=self.limits.images,"too many source images");
-        ensure!(prompt.iter().filter(|&&id| id==layout.placeholder()).count()==sources.len(),
-            "source image placeholder count differs from images");
         let deadline=Instant::now()+Duration::from_secs(60);
         let mut decoded_bytes=0usize;let mut groups=Vec::with_capacity(sources.len());
         for source in sources {
@@ -336,11 +333,10 @@ impl MediaPreparer {
             let pixels=decode_pixels_bounded(&bytes,config.decode,self.limits.decoded_bytes.saturating_sub(decoded_bytes))?;
             decoded_bytes=decoded_bytes.checked_add(pixels.bytes()).context("decoded image bytes overflow")?;
             ensure!(decoded_bytes<=self.limits.decoded_bytes,"decoded images exceed request budget");
-            groups.push(config.prepare_group(pixels,self.encoder,layout)?);
+            groups.push(config.prepare_group(pixels,self.encoder)?);
         }
-        let expanded=PreparedImageGroup::expand_prompt(prompt,layout.placeholder(),&groups,vocabulary,context)?;
         ensure!(Instant::now()<deadline,"image preparation deadline exceeded");
-        Ok((groups,expanded))
+        Ok(groups)
     }
     fn source_bytes(&self, source: &str, deadline: Instant) -> Result<Vec<u8>> {
         if source.starts_with("data:") {

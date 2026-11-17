@@ -183,21 +183,9 @@ pub fn prepare_group(
     config: &super::ProcessorConfig,
     pixels: super::DecodedPixels,
     encoder: super::EncoderId,
-    layout: &super::ImagePromptLayout,
 ) -> Result<super::PreparedImageGroup> {
-    use super::{ImageFragment, ImageGrid, PreparedImage, PreparedImageGroup};
+    use super::{ImageGrid, PreparedImage, PreparedImageGroup};
     use std::sync::Arc;
-    let super::ImagePromptLayout::LocalGlobal {
-        placeholder,
-        local_start,
-        local_end,
-        newline,
-        global_start,
-        global_end,
-    } = *layout
-    else {
-        return Err(invalid("Step processor needs local/global prompt markers"));
-    };
     let source = pixels.dimensions();
     let plan = StepImagePlan::new(source[0], source[1])?;
     let rows = plan
@@ -236,12 +224,34 @@ pub fn prepare_group(
             pixels,
             tokens: if local { 81 } else { 169 },
         }));
-        group.fragments.push(ImageFragment::Tokens(vec![if local {
+    }
+    Ok(group)
+}
+
+/// Attach native local/global markers after all crop jobs are prepared.
+pub fn assemble_group_prompt(
+    group: &mut super::PreparedImageGroup,
+    layout: &super::ImagePromptLayout,
+) -> Result<()> {
+    use super::ImageFragment;
+    let super::ImagePromptLayout::LocalGlobal {
+        placeholder, local_start, local_end, newline, global_start, global_end,
+    } = *layout else {
+        return Err(invalid("Step processor needs local/global prompt markers"));
+    };
+    let plan = StepImagePlan::new(group.source[0], group.source[1])?;
+    if group.images.len() != plan.windows.len() + 1 {
+        return Err(invalid("Step prompt crop count differs from prepared jobs"));
+    }
+    let mut fragments = Vec::new();
+    for index in 0..group.images.len() {
+        let local = index < plan.windows.len();
+        fragments.push(ImageFragment::Tokens(vec![if local {
             local_start
         } else {
             global_start
         }]));
-        group.fragments.push(ImageFragment::Features {
+        fragments.push(ImageFragment::Features {
             image: index,
             placeholder,
         });
@@ -249,9 +259,10 @@ pub fn prepare_group(
         if local && plan.newline_after[index] {
             end.push(newline);
         }
-        group.fragments.push(ImageFragment::Tokens(end));
+        fragments.push(ImageFragment::Tokens(end));
     }
-    Ok(group)
+    group.fragments = fragments;
+    Ok(())
 }
 
 #[cfg(test)]

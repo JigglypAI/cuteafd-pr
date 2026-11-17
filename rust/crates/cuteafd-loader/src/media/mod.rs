@@ -460,11 +460,22 @@ impl ProcessorConfig {
             _=>None,
         }
     }
-    pub fn prepare_group(&self,pixels:DecodedPixels,encoder:EncoderId,layout:&ImagePromptLayout) -> Result<PreparedImageGroup> {
+    /// Prepare encoder jobs without template tokens: families may need source
+    /// dimensions and prepared grids before they can assemble their prompt.
+    pub fn prepare_group(&self,pixels:DecodedPixels,encoder:EncoderId) -> Result<PreparedImageGroup> {
         self.validate()?;
-        if self.family==ImageFamily::Step5 {return step5::prepare_group(self,pixels,encoder,layout);}
+        if self.family==ImageFamily::Step5 {return step5::prepare_group(self,pixels,encoder);}
+        let image=Arc::new(self.prepare_pixels(pixels,encoder)?);
+        Ok(PreparedImageGroup {source:image.pixels.source,images:vec![image],fragments:Vec::new()})
+    }
+    /// A family with dimension-dependent tokens may assign `group.fragments`
+    /// itself instead, before calling the checked group expansion.
+    pub fn assemble_group_prompt(&self,group:&mut PreparedImageGroup,layout:&ImagePromptLayout) -> Result<()> {
+        if self.family==ImageFamily::Step5 {return step5::assemble_group_prompt(group,layout);}
         let ImagePromptLayout::Single {placeholder}=layout else {return Err(invalid("single-view processor needs a single prompt layout"));};
-        Ok(PreparedImageGroup::single(Arc::new(self.prepare_pixels(pixels,encoder)?),*placeholder))
+        if group.images.len()!=1 {return Err(invalid("single-view prompt needs exactly one prepared job"));}
+        group.fragments=vec![ImageFragment::Features {image:0,placeholder:*placeholder}];
+        Ok(())
     }
     pub fn resize_shape(&self, height: u32, width: u32) -> Result<(u32, u32)> {
         self.validate()?;
