@@ -105,6 +105,23 @@ impl StillEncoder {
         }
         Ok(())
     }
+
+    pub fn require_spark_worker(&self, variables: &[Variable], requires: &mut Vec<Requires>) {
+        let Some(encoder) = variables.iter().position(|v| matches!(v, Variable::Encoder(_))) else { return; };
+        for (option, placement) in self.candidates.iter().enumerate() {
+            for _rank in placement.spark_ranks() {
+                let mut retained = Vec::new();
+                // Families here have one ordered onboarding prefix shared by every Spark.
+                for (variable, domain) in variables.iter().enumerate() {
+                    if let Variable::Onboard { layers, counts, .. } = domain {
+                        retained.extend(counts.iter().enumerate().filter(|(_, count)| **count < layers.len())
+                            .map(|(option, _)| Choice { variable, option }));
+                    }
+                }
+                requires.push(Requires { when: Choice { variable: encoder, option }, any_of: retained });
+            }
+        }
+    }
     pub fn admitted(&self,solved:&ResolvedPlan)->Option<EncoderPlacement> {
         solved.decisions.encoder.and_then(|index|self.candidates.get(index).cloned())
     }

@@ -960,6 +960,7 @@ impl Recipe for KimiRecipe {
         // physical baselines, not single driver requests.
         if let Some(vision) = &self.vision {
             vision.extend(&mut contract.variables, &mut contract.components, self.maximum_pages)?;
+            vision.require_spark_worker(&contract.variables, &mut contract.requires);
         }
         crate::placement::planner::fixed_request_tails(&mut contract.components, self.maximum_pages,
             &[allocation::GRAPH_RESERVE, allocation::CODE_OWNER,

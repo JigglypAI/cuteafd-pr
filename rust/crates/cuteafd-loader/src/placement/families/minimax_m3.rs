@@ -1018,6 +1018,7 @@ impl Recipe for MiniMaxInputs {
         // Independent bundled tower shares the target/KV/expert joint solve.
         if let Some(vision) = &self.vision {
             vision.extend(&mut contract_variables, &mut components, maximum)?;
+            vision.require_spark_worker(&contract_variables, &mut requires);
         }
         // Target and drafter borrow the same native thread-local BLAS pool.
         // The shared borrower union charges its GEMM handle exactly once.
