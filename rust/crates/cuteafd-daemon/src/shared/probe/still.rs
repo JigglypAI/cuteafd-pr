@@ -184,3 +184,44 @@ mod tests {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod injection_tests {
+    use super::*;
+    use crate::shared::memory::device::{Allocation, Device, Stream};
+    use cuteafd_core::memory_layout::Tag;
+    use cuteafd_loader::media::ImageKey;
+
+    #[test]
+    fn feature_injection_preserves_text_rows_and_converts_bf16_to_f32_exactly() -> Result<()> {
+        let fixture = cuteafd_ffi::native_library_lifetime_fixture::Fixture::build_for_tests()?;
+        let library = fixture.load()?;
+        fixture.immediate_copies(&library)?;
+        let device = Device { library: &library, id: 0 };
+        let stream = Stream::new(device)?;
+        let source = [0x3f80u16,0xc000,0x3f00,0x4000];
+        let payload = source.into_iter().flat_map(u16::to_le_bytes).collect::<Vec<_>>();
+        let mut cache = EmbeddingCache::new(payload.len());
+        let key = ImageKey([1;32]); let pin = cache.reserve(key,payload.len())?;
+        let lease = cache.complete(key,payload.into())?;
+        let mut media = RequestMedia::new(vec![MediaSpan {start:2,len:2,key:key.into()}],2,6)?;
+        media.attach(lease)?;drop(pin);
+        for fp32 in [false,true] {
+            let row_bytes = if fp32 {8} else {4};
+            let output = Allocation::new(device,6*row_bytes,Tag::workspace("probe-test"))?;
+            let original=vec![0x55;6*row_bytes];
+            device.run(|| {
+                library.copy_h2d(output.buffer,&original)?;
+                inject(&stream,output.buffer,&media,0,6,2,fp32)
+            })?;
+            let mut actual=vec![0;original.len()];
+            device.run(||library.copy_d2h(&mut actual,output.buffer))?;
+            assert_eq!(&actual[..2*row_bytes],&original[..2*row_bytes]);
+            assert_eq!(&actual[4*row_bytes..],&original[4*row_bytes..]);
+            let expected=if fp32 { source.into_iter().flat_map(|v|(u32::from(v)<<16).to_le_bytes()).collect::<Vec<_>>() }
+                else {source.into_iter().flat_map(u16::to_le_bytes).collect::<Vec<_>>()};
+            assert_eq!(&actual[2*row_bytes..4*row_bytes],expected);
+        }
+        Ok(())
+    }
+}
