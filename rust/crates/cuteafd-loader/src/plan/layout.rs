@@ -104,7 +104,7 @@ pub struct LayoutOptions {
     /// Explicit pool tokens; `None` or `Some(0)` sizes the pool from what is left.
     pub pool_tokens: Option<u64>,
     /// Upper bound for an automatically sized pool.
-    pub target_pool_tokens: u64,
+    pub target_pool_tokens: Option<u64>,
     /// Explicit checkpoint-resident drafter weights; no inferred runtime storage.
     pub drafter_bytes: u64,
     pub dense_qwen_drafter_snapshot: Option<std::path::PathBuf>,
@@ -313,7 +313,7 @@ impl Default for LayoutOptions {
             glmf_auto_replay: false,
             spark_capacity_rows: 4096,
             pool_tokens: None,
-            target_pool_tokens: cuteafd_core::serving_capacity::DEFAULT_GPU_KV_TOKENS,
+            target_pool_tokens: None,
             drafter_bytes: 0,
             dense_qwen_drafter_snapshot: None,
             dense_qwen_mtp: false,

@@ -80,7 +80,7 @@ pub fn report(failed: bool) -> Report {
         quality, seconds: 151.0, thermal: None, fabric: vec![],
     };
     Report {
-        schema: SCHEMA.into(), prompt_content: Some(crate::text::PROMPT_CONTENT.into()), id: "7c1e2d3f4a5b6c7d8e9f".into(), created: "2026-10-02T10:12:00Z".into(),
+        schema: SCHEMA.into(), prelude: None, prompt_content: Some(crate::text::PROMPT_CONTENT.into()), id: "7c1e2d3f4a5b6c7d8e9f".into(), created: "2026-10-02T10:12:00Z".into(),
         finished: Some("2026-10-02T10:14:31Z".into()), status: RunStatus::Done, profile: "smoke".into(),
         plan: vec![PlannedPanel { id: "hardware".into(), passes: 1 }, PlannedPanel { id: "configuration".into(), passes: 1 }],
         server: ServerInfo { model: "deepseek-ai/DeepSeek-V4.1-Flash".into(), executor: Some("serve-native".into()), family: Some("deepseek_v41".into()),

@@ -72,7 +72,7 @@ pub(crate) fn admit(checkpoint: &Checkpoint, cfg: &Inkling2Config, target: &Coor
     tracing::info!(record = %serde_json::json!({"facts":facts,"budgets":budgets,"phases":phases}),
         "Inkling cold native forward admission");
     let shape = PrefillShape { rows: unit.rows.next_multiple_of(64) as u64, waves: 1 };
-    Ok(ResolvedPlan { encoder_diagnostics: vec![],
+    Ok(ResolvedPlan { pool_policy: None, encoder_diagnostics: vec![],
         request: Request { context: Context::pinned(64), pool: Pin::Exact(64), onboard: Pin::Exact(0),
             prefill: Pin::Exact(shape), operation: Operation::Scoring, resident_weight_limit: None,
             spark_reply_formats: Default::default() },
@@ -185,7 +185,7 @@ mod tests {
             physical_bytes: 1<<30, logical_bytes: 1<<30, headroom: 0,
             baseline: Baseline::Sampled { free: 1<<30, phase: Phase::Load, source: "CPU fixture".into() } }];
         let shape = PrefillShape { rows: 64, waves: 1 };
-        ResolvedPlan { encoder_diagnostics: vec![], request: Request { context: Context::pinned(64), pool: Pin::Exact(64),
+        ResolvedPlan { pool_policy: None, encoder_diagnostics: vec![], request: Request { context: Context::pinned(64), pool: Pin::Exact(64),
             onboard: Pin::Exact(0), prefill: Pin::Exact(shape), operation: Operation::Scoring, resident_weight_limit: None,
             spark_reply_formats: Default::default() }, decisions: Decisions { attention: vec![], onboard_layers: vec![],
             expert_homes: Default::default(), embedding: None, draft_home: None, head_home: Some(0), intake_home: None,

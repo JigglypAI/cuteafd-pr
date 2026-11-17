@@ -200,6 +200,8 @@ pub struct RoleReadiness {
 /// The admitted phase totals, separate from Ready-resident layout items.
 #[derive(Debug, Clone, Serialize)]
 pub struct SolvedPhaseLedger {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pool_policy: Option<crate::placement::PoolPolicy>,
     pub served_context_tokens: u64,
     pub budgets: Vec<crate::placement::planner::Budget>,
     pub phases: Vec<crate::placement::planner::PhaseBudget>,
@@ -207,7 +209,7 @@ pub struct SolvedPhaseLedger {
 
 impl From<&crate::placement::planner::ResolvedPlan> for SolvedPhaseLedger {
     fn from(plan: &crate::placement::planner::ResolvedPlan) -> Self {
-        Self { served_context_tokens: plan.served_context(), budgets: plan.budgets.clone(), phases: plan.phases.clone() }
+        Self { pool_policy: plan.pool_policy, served_context_tokens: plan.served_context(), budgets: plan.budgets.clone(), phases: plan.phases.clone() }
     }
 }
 
@@ -1428,13 +1430,14 @@ fn plan_unrestricted(input: &PlanInput, options: &PlanOptions) -> Result<PlanRep
         }
         let refused = !report.placement_supported && memory.devices.is_empty();
         if !memory.devices.is_empty() {
-            // The serving context: explicit, else the checkpoint's maximum.
-            let context = if layout_options.context_tokens > 0 { layout_options.context_tokens } else {
-                report.cache_requirements.as_ref().and_then(|cache| cache.checkpoint_max_context_tokens).unwrap_or(0) };
-            let physical = layout_options.rtx_bytes.iter().map(|&bytes| crate::placement::CoordinatorCard::planned(
-                bytes, layout_options.physical_sms).physical_bytes).min().unwrap_or(u64::MAX);
-            report.memory_policy_lines = crate::placement::reserve::layout_lines(&memory,
-                report.family.as_deref().unwrap_or(""), context, &layout_options.rtx_bytes, physical);
+            let maximum = report.cache_requirements.as_ref().and_then(|cache|
+                cache.checkpoint_max_context_tokens).unwrap_or(layout_options.context_tokens);
+            let context = crate::placement::planner::Context::resolve(maximum,
+                (layout_options.context_tokens > 0).then_some(layout_options.context_tokens));
+            report.memory_policy_lines = crate::placement::reserve::report_layout_lines(&memory,
+                report.family.as_deref().unwrap_or(""), &layout_options.rtx_bytes,
+                report.phase_ledger.as_ref().and_then(|ledger| ledger.pool_policy), context,
+                layout_options.pool_tokens, layout_options.target_pool_tokens).unwrap_or_default();
         }
         report.memory_layout = Some(memory);
         if !refused && !model.contract_admission() {
