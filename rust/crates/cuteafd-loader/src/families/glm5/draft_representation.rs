@@ -31,6 +31,31 @@ impl GlmDraftRepresentation {
     }
 }
 
+/// Shared precision boundary, independent of the drafter's attention dialect.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DraftWeightRole { BodyLinear, NativeAuxiliary, PredictionHead }
+
+/// Embeddings, norms, learned convolution bases and codebooks are not body
+/// linear layers. Vocabulary, Markov and confidence heads retain native math.
+/// Unknown names fail closed rather than silently inheriting a representation.
+pub fn draft_weight_role(name: &str) -> Option<DraftWeightRole> {
+    use DraftWeightRole::*;
+    if name == "lm_head.weight" || name.starts_with("markov_head.") || name.starts_with("confidence_head.") {
+        return Some(PredictionHead);
+    }
+    if name == "embed_tokens.weight" || name.ends_with("_codebook") || name.ends_with(".base_kernel")
+        || name.ends_with("norm.weight") || name == "norm.weight" {
+        return Some(NativeAuxiliary);
+    }
+    if name == "fc.weight" || name == "candidate_selector.hidden_projection.weight"
+        || name.ends_with(".kernel_projection.weight") || name.contains(".mlp.") && name.ends_with("_proj.weight")
+        || name.contains(".self_attn.") && name.ends_with("_proj.weight")
+        || name.ends_with(".self_attn.kv_a_proj_with_mqa.weight") {
+        return Some(BodyLinear);
+    }
+    None
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GlmDraftCapacity {
     pub context_slots: usize,
@@ -399,6 +424,33 @@ pub fn block_dspark_paged_resident_bytes(config: &serde_json::Value, slots: usiz
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_drafter_precision_role_keeps_prediction_heads_native() {
+        use DraftWeightRole::*;
+        for family in ["Inferact DSpark", "Lithos DSpark", "GLM DFlash", "lightseek MLA", "RadixArk MLA"] {
+            for name in ["fc.weight", "layers.0.self_attn.q_proj.weight", "layers.0.self_attn.k_proj.weight",
+                "layers.0.self_attn.v_proj.weight", "layers.0.self_attn.o_proj.weight",
+                "layers.0.self_attn.q_a_proj.weight", "layers.0.self_attn.q_b_proj.weight",
+                "layers.0.self_attn.kv_a_proj_with_mqa.weight", "layers.0.self_attn.kv_b_proj.weight",
+                "layers.0.mlp.gate_proj.weight", "layers.0.mlp.up_proj.weight", "layers.0.mlp.down_proj.weight",
+                "layers.0.attention_conv.kernel_projection.weight", "layers.0.mlp_conv.kernel_projection.weight",
+                "candidate_selector.hidden_projection.weight"] {
+                assert_eq!(draft_weight_role(name), Some(BodyLinear), "{family}: {name}");
+            }
+            for name in ["lm_head.weight", "markov_head.markov_w1.weight", "markov_head.markov_w2.weight",
+                "confidence_head.proj.weight", "confidence_head.proj.bias"] {
+                assert_eq!(draft_weight_role(name), Some(PredictionHead), "{family}: {name}");
+            }
+            for name in ["embed_tokens.weight", "norm.weight", "hidden_norm.weight", "layers.0.input_layernorm.weight",
+                "layers.0.self_attn.q_a_layernorm.weight", "layers.0.self_attn.kv_a_layernorm.weight",
+                "layers.0.attention_conv.base_kernel", "candidate_selector.predecessor_codebook",
+                "candidate_selector.successor_codebook"] {
+                assert_eq!(draft_weight_role(name), Some(NativeAuxiliary), "{family}: {name}");
+            }
+        }
+        assert_eq!(draft_weight_role("unknown.weight"), None);
+    }
 
     fn geometry(flash: bool) -> GlmDraftGeometry {
         GlmDraftGeometry {
