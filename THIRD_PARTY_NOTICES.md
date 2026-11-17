@@ -647,7 +647,7 @@ available at <https://www.apache.org/licenses/LICENSE-2.0>.
 
 ## Test-Case Provenance
 
-The upstream-derived test suites under `rust/**/tests/upstream_*.rs`,
+The upstream-derived test suites under `rust/**/tests/**/upstream_*.rs`,
 `rust/crates/cuteafd-api/src/tests/upstream_*.rs`, and
 `python/tests/test_upstream_*.py` were rewritten from published test
 *behavior* (invariants, test vectors, golden cases) from:

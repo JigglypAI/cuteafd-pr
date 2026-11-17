@@ -1,6 +1,7 @@
 //! Serving lifecycle around a benchmark: discovery after ready, and a shutdown
-//! during a run (its own binary: the loopback address is process-wide).
-mod common;
+//! during a run (its own binary: `ready()` seals the process-wide
+//! `context::loopback()` that `Bench::discover` and the runner read).
+#[path = "all/common/mod.rs"] mod common;
 use common::fake_engine;
 use cuteafd_api::openai::{auth::ApiKey, router_with_console, ConsoleHub, NativeLimits, NativeRequest};
 use cuteafd_bench::report::RunStatus;

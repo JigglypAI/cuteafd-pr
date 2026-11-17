@@ -1,6 +1,6 @@
 //! The sweep's measurement window opens exactly once, after the first warm-up
 //! wave and before the first timed request (smoke's `window.open` hook).
-mod common;
+use super::common;
 use common::fake_engine;
 use cuteafd_api::openai::{router_with_console, ConsoleHub, NativeLimits, NativeRequest};
 use serde_json::Value;

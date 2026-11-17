@@ -28,7 +28,7 @@ def _dispatch():
     ('capped', 'other', 'remote capped'),
 ])
 def test_mode_order(setting, host, expected):
-    script = 'release_die() { echo "DIE $*"; exit 9; }\n' + _function('wip_coordinator_export_modes') + \
+    script = 'release_die() { echo "DIE $*"; exit 9; }\nrepo_root=/nonexistent\n' + (_function('wip_serving_export_priority') + _function('wip_coordinator_export_modes')) + \
         f'CUTEAFD_WIP_COORDINATOR_EXPORT={setting} CUTEAFD_EXPORT_HOST={host} wip_coordinator_export_modes\n'
     result = subprocess.run(['bash', '-c', script], capture_output=True, text=True, timeout=30)
     assert result.returncode == 0, result.stdout + result.stderr
@@ -36,7 +36,7 @@ def test_mode_order(setting, host, expected):
 
 
 def test_unknown_mode_is_refused():
-    script = 'release_die() { echo "DIE $*"; exit 9; }\n' + _function('wip_coordinator_export_modes') + \
+    script = 'release_die() { echo "DIE $*"; exit 9; }\nrepo_root=/nonexistent\n' + (_function('wip_serving_export_priority') + _function('wip_coordinator_export_modes')) + \
         'CUTEAFD_WIP_COORDINATOR_EXPORT=bogus wip_coordinator_export_modes\n'
     result = subprocess.run(['bash', '-c', script], capture_output=True, text=True, timeout=30)
     assert result.returncode == 9 and 'must be auto, remote or capped' in result.stdout
@@ -51,7 +51,8 @@ def test_dispatch_queues_only_after_remote_unavailable(tmp_path, setting, capped
     trace = tmp_path / 'trace'
     script = f'''
 release_die() {{ echo "DIE $*"; exit 9; }}
-{_function('wip_coordinator_export_modes')}
+repo_root=/nonexistent
+{(_function('wip_serving_export_priority') + _function('wip_coordinator_export_modes'))}
 CUTEAFD_WIP_COORDINATOR_EXPORT={setting} CUTEAFD_EXPORT_HOST=other
 wip_remote_export() {{ echo remote >> {trace}; return {remote}; }}
 wip_capped_export() {{ echo capped >> {trace}; return {capped}; }}
@@ -172,3 +173,28 @@ bf16_families= audio_aot=OFF wip_export_locks=on
     assert 'native cache hit, no GPU turn' in result.stdout
     assert 'CUTEAFD_WIP_NATIVE_REQUIRE_HIT=1' in result.stdout
     assert 'unexpected-queue' not in result.stdout
+
+
+@pytest.mark.parametrize('setting,waiting,expected', [('auto', True, 'maxq wait-maxq'),
+                                                     ('auto', False, 'remote capped'),
+                                                     ('capped', True, 'remote capped')])
+def test_auto_export_never_falls_back_to_raptor_with_live_serving_ticket(setting, waiting, expected):
+    script = 'release_die() { exit 9; }\n' + _function('wip_coordinator_export_modes') + \
+        f'wip_serving_export_priority() {{ [[ {setting} == auto ]] && return {0 if waiting else 1}; }}\n' + \
+        f'CUTEAFD_WIP_COORDINATOR_EXPORT={setting} CUTEAFD_EXPORT_HOST=other wip_coordinator_export_modes\n'
+    result = subprocess.run(['bash', '-c', script], capture_output=True, text=True, timeout=5)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.split() == expected.split()
+
+
+def test_capped_child_sources_entire_cdi_helper():
+    function = _function('wip_capped_export')
+    assert 'source \\"\\$repo_root/scripts/lib/cdi-gpus.sh\\"' in function
+    assert 'declare -f wip_capped_export_on release_gpu_device_args)' in function
+
+
+def test_remote_maxq_owns_no_raptor_mutex_and_protects_both_host_views():
+    remote = (ROOT / 'scripts/build/export-remote.sh').read_text()
+    assert '--locks maxq' in remote and 'maxq-gpu.lock' in remote
+    assert '--locks gpu0' not in remote and '--locks gpu1' not in remote
+    assert 'flock -w 7200 7' in remote

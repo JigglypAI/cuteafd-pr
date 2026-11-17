@@ -1182,8 +1182,7 @@ fn shared_prefill_public_plan_family_by_spark_matrix() {
                 let cfg = crate::families::glm5_flash::GlmNextConfig::from_hf(
                     &Checkpoint::open(dir.path()).unwrap().config).unwrap();
                 let remote = ranks > 0 && report.experts.as_ref().is_some_and(|contract|
-                    experts::frozen_refusal(&contract.package, ranks).is_none()
-                        && experts::spark_recipe(&contract.package, cfg.moe_intermediate, ranks).is_ok());
+                    experts::spark_recipe(&contract.package, cfg.moe_intermediate, ranks).is_ok());
                 if !remote {
                     assert!(!report.executable() && !report.native_serving_admitted,
                         "the incomplete header fixture has no local expert package: {}", render(&report));
@@ -2790,10 +2789,9 @@ fn glm5_flash_modelopt_nvfp4_experts_are_ready() {
     assert!(report_tp5.executable(), "{}", render(&report_tp5));
     assert_eq!(component(&report_tp5, Component::RoutedExpert).status, Status::Ready, "{}", render(&report_tp5));
     assert!((report_tp5.spark_rank_share - 512.0 / 2048.0).abs() < 1e-9);
-    // A geometry-valid but frozen remote world must not bypass its policy
-    // merely because Flash defers remote-package admission to the joint solve.
+    // A geometry-valid remote world still requires its native width exports
+    // when Flash defers remote-package admission to the joint solve.
     assert!(super::experts::spark_recipe("glmf:nvfp4", 2048, 7).is_err());
-    assert!(super::experts::frozen_refusal("glmf:nvfp4", 7).is_some());
     let mut frozen = quant_options(7);
     frozen.layout.as_mut().unwrap().onboard = Some(crate::placement::OnboardSetting::Layers(0));
     let refused = plan(dir.path(), &frozen).unwrap();

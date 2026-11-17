@@ -1,7 +1,7 @@
 //! Functional suite for packet HC-2: host snapshots, exact page sharing, the reuse radix and
 //! eviction. Every public operation on its happy path, every documented error path, and
 //! proptest properties over random store/lookup/evict/free sequences against a model.
-mod common;
+use super::common;
 
 use common::{apply, Model, Op};
 use cuteafd_hostcache::pool::testing::CHUNK;

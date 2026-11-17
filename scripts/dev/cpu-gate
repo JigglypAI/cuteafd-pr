@@ -138,7 +138,7 @@ FULL_TESTS = (
     'fidelity_dataset::tests::cached_published_qualifications_and_manifests_load',
     'families::kimi_k3::admission::tests::planner_equals_runtime_context_extent_at_256k_512k_and_1m',
     'families::step5::admission::tests::public_max_card_planner_equals_measured_daemon_before_allocation',
-    'plan::families::step5::tests::native_prefill_refuses_every_unqualified_spark_count',
+    'plan::families::step5::tests::native_prefill_refuses_missing_spark_packages',
     'plan::layout::draft_prefix_tests::kimi_host_snapshots_use_serve_context_and_selected_draft_record',
     'plan::families::step5::tests::nvfp4_min_card_admits_native_w4a4_and_bf16_root_stays_reference_only',
     'families::kimi_k3::serve::tests::shared_prefill_policy_matches_planner_and_runtime_admission',
@@ -146,8 +146,8 @@ FULL_TESTS = (
     'plan::tests::v41_32gib_counts_share_pool_and_local_layer_admission',
     *INSTALLED_PLANNERS,
 )
-SLOW_TESTS = (('cuteafd-hostcache', 'soak_has_no_leak_and_balances_the_counters'),
-              ('cuteafd-hostcache', 'soak_in_bank_order_has_no_leak_and_balances_the_counters'),
+SLOW_TESTS = (('cuteafd-hostcache', 'stability_hc_5::soak_has_no_leak_and_balances_the_counters'),
+              ('cuteafd-hostcache', 'stability_hc_5::soak_in_bank_order_has_no_leak_and_balances_the_counters'),
               ('cuteafd-loader', 'mounted_mimo_audio_inventory_is_independently_admitted'))
 NAME = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.-]*\Z')
 TOOLCHAIN = ('cargo', 'rustc')
@@ -158,8 +158,9 @@ CARGO_FAIL = re.compile(r'^test (\S+) \.\.\. FAILED$', re.M)
 CARGO_PANIC_ID = re.compile(r"^---- (\S+) stdout ----$", re.M)
 PYTEST_SUMMARY = re.compile(r'^=*\s*(.*?\b(?:passed|failed|error|errors|no tests ran)\b.*?) in [\d.]+s', re.M)
 PYTEST_FAIL = re.compile(r'^(?:FAILED|ERROR) (\S+)', re.M)
-# Release benches with a bound: (crate, test target, environment).
-BENCHES = (('cuteafd-core', 'draft_policy_bench', {'CUTEAFD_POLICY_BENCH_MAX_US': '1200'}),)
+# Release benches with a bound: (crate, label, test target, test-name filter, environment).
+BENCHES = (('cuteafd-core', 'draft_policy_bench', 'all', 'draft_policy_host_cost_per_round',
+            {'CUTEAFD_POLICY_BENCH_MAX_US': '1200'}),)
 BENCH_MEDIANS = re.compile(r'medians: (.*?)(?:, total|$)', re.M)
 BENCH_VALUE = re.compile(r'(\w+) ([\d.]+) us')
 CMAKE_LAUNCHER_ENV = re.compile(r'CMAKE_.*_COMPILER_LAUNCHER\Z')
@@ -792,11 +793,11 @@ def benches(source, root, args, env):
     env = {**env, 'CARGO_TARGET_DIR': str(target), 'CARGO_BUILD_JOBS': str(getattr(args, 'cargo_jobs', 16))}
     result = dict(suite='benches', passed=0, failed=0, failing=[], medians={}, logs=[], scrubbed_env=[])
     build_s = test_s = 0.
-    for crate, test, bounds in BENCHES:
+    for crate, test, test_target, test_name, bounds in BENCHES:
         log(f'benches: compiling {crate}/{test} (release, build slot held while compiling)')
         build_log = root / f'logs/bench-{test}-build.log'
         code, seconds = run_logged([str(source / 'scripts/build/build-slot.sh'), 'cargo', 'test', '--release', '--locked',
-                                    '-p', crate, '--test', test, '--no-run', '--message-format=json-render-diagnostics'], build_log, env, source / 'rust',
+                                    '-p', crate, '--test', test_target, '--no-run', '--message-format=json-render-diagnostics'], build_log, env, source / 'rust',
                                    args.cargo_build_timeout)
         build_s += seconds
         if code or not cargo_build_succeeded(build_log):
@@ -805,7 +806,7 @@ def benches(source, root, args, env):
             result.setdefault('errors', []).append(f'{test}: compile exit {code}')
             continue
         test_log = root / f'logs/bench-{test}.log'
-        code, seconds = run_logged(['cargo', 'test', '--release', '--locked', '-p', crate, '--test', test, '--',
+        code, seconds = run_logged(['cargo', 'test', '--release', '--locked', '-p', crate, '--test', test_target, test_name, '--',
                                     '--ignored', '--nocapture', '--test-threads', '1'], test_log, {**env, **bounds},
                                    source / 'rust', args.cargo_timeout)
         test_s += seconds
@@ -824,7 +825,7 @@ def benches(source, root, args, env):
             result.setdefault('errors', []).append(f'{test}: ' + ('timed out' if code == 124 else 'did not run' if not ran
                                                                  else f'bound exceeded or failed (exit {code})'))
     result.update(compiler_cache=compiler_cache_receipt(env, target),
-                  build_s=round(build_s), test_s=round(test_s), bounds={t: b for _, t, b in BENCHES},
+                  build_s=round(build_s), test_s=round(test_s), bounds={t: b for _, t, _, _, b in BENCHES},
                   status='pass' if result['passed'] == len(BENCHES) else 'failed')
     if result['status'] == 'failed':
         result['error'] = '; '.join(result.get('errors', []))

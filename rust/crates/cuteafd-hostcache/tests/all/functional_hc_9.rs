@@ -8,7 +8,7 @@
 //! regardless — never failing the request, never blocking longer than the pace, and never
 //! double-counting the completing store's own latency. Proptest properties cover the named
 //! invariants over random pending-store ages, paces and stream health.
-mod common_hc_5;
+use super::common_hc_5;
 
 use common_hc_5::{
     cache as build_cache, config as base_config, modelled_store_ns, snapshot, tokens,

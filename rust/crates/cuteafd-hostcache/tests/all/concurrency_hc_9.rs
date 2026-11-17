@@ -8,7 +8,7 @@
 //! hold metric ever moves. Every run is a pure function of its seed, so a failure reproduces
 //! from the seed alone; the run's log is kept for humans. Also carries the performance
 //! floor test (debug build) so a broken fast path fails `cargo test`, not a human.
-mod common_hc_5;
+use super::common_hc_5;
 
 use common_hc_5::{cache as build_cache, config as base_config, snapshot, tokens, write_snapshot};
 use common_hc_5::{Device, Payload, DEVICE_BYTES};
