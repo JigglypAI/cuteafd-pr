@@ -26,8 +26,6 @@ pub(crate) struct Engine<'a> {
     pub host_prefix: Option<cuteafd_hostcache::config::Config>,
     target_view: cuteafd_loader::plan::checkpoint::CheckpointView,
     draft: Option<Rc<super::draft::NativeDraft<'a>>>,
-    draft_probe: RefCell<Option<crate::shared::memory::device::DeviceOwner<'a,
-        crate::shared::draft::probe::RoundProbe<'a>>>>,
     execution: Execution<'a>,
     lanes: RefCell<Lanes<'a>>,
     prefix: RefCell<Option<super::prefix::KimiPrefix<'a>>>,
@@ -279,14 +277,10 @@ impl<'a> Engine<'a> {
             check_expert_owners(&admission.placement.layers,
                 std::array::from_fn::<_, RANKS, _>(|rank| owners[rank].as_ref().map_or(&[][..], |e| e.layers())))?;
         }
-        // Admission charged this arena before allocation; retain its exact device owner.
-        let draft_probe = draft.as_ref().map(|_| devices[0].own(||
-            crate::shared::draft::probe::RoundProbe::new(devices[0].library,
-                local[0][0].config().dense.clone(), local[0][0].config().topk, 64))).transpose()?;
         // Weak admission registries must not outlive these strong startup owners
         // until every persistent local binding has acquired the same operands.
         if let Some(draft) = draft.as_mut() { draft.bind_target_ranks(weights.global.clone(), programs[RANKS - 1].clone())?; }
-        memory.sample("draft-probe-and-target-bind")?;
+        memory.sample("draft-target-bind")?;
         drop((weights, kda, mla));
         if let Some(pending) = pending { pending.wait()?; }
         memory.sample("workers-loaded")?;
@@ -309,7 +303,6 @@ impl<'a> Engine<'a> {
         engine.max_pool_tokens_no_onboard = admission.placement.max_pool_tokens_no_onboard;
         engine.host_prefix = admission.host_prefix.take();
         engine.draft = draft.map(Rc::new);
-        *engine.draft_probe.borrow_mut() = draft_probe;
         Ok(engine)
     }
 
@@ -341,7 +334,7 @@ impl<'a> Engine<'a> {
         let execution = Execution::new(plan, peer.as_deref(), hops.as_ref(), exchange_streams.clone(), streams)?;
         let depth = crate::shared::prefill_depth::PrefillDepth::new(prefill.waves, prefill.unit_rows)?;
         let served_context = local[0][0].max_context();
-        Ok(Self { probe_media: RefCell::new(Default::default()), host_prefix: None, max_pool_tokens_no_onboard: None, target_view, depth, draft: None, draft_probe: RefCell::new(None), execution, lanes: RefCell::new(Lanes { local, routed, io, experts }),
+        Ok(Self { probe_media: RefCell::new(Default::default()), host_prefix: None, max_pool_tokens_no_onboard: None, target_view, depth, draft: None, execution, lanes: RefCell::new(Lanes { local, routed, io, experts }),
             prefix: RefCell::new(None), provisional: RefCell::new(None),
             hops, peer, terminal: Cell::new(TerminalState::Active), exchange_streams, prefill, packed_row_cap: Cell::new(None), coordinator_packing_cap, served_context })
     }
@@ -477,26 +470,6 @@ impl<'a> Engine<'a> {
                 Ok(Ok(()))
             })
         })
-    }
-
-    pub(crate) fn arm_draft_probe(&self) -> Result<()> {
-        self.require_live()?;
-        ensure!(self.draft_probe.borrow().is_some(), "Kimi draft policy probe was not admitted");
-        Ok(())
-    }
-    pub(crate) fn probe_begin(&self, rows: usize) {
-        if let Some(probe) = self.draft_probe.borrow_mut().as_mut() { probe.begin(rows); }
-    }
-    pub(crate) fn probe_end(&self) {
-        if let Some(probe) = self.draft_probe.borrow_mut().as_mut() { probe.end(); }
-    }
-    pub(crate) fn probe_finish<T>(&self, observe: impl FnOnce(&crate::shared::draft::routes::RoundRoutes,
-        &[Option<f64>]) -> T) -> Option<T> {
-        let mut probe = self.draft_probe.borrow_mut();
-        let probe = probe.as_mut()?;
-        let device = probe.device;
-        device.run(|| Ok(probe.finish().map(|(routes, times)| observe(routes, &times))))
-            .unwrap_or_else(|error| { tracing::debug!(%error, "Kimi draft probe read failed"); None })
     }
 
     pub(crate) fn native_draft(&self) -> Option<&super::draft::NativeDraft<'a>> { self.draft.as_deref() }
@@ -742,7 +715,7 @@ impl<'a> Engine<'a> {
                 ensure!(rows <= self.prefill.unit_rows, "Kimi {rows}-row multi-sequence step exceeds one prefill unit");
                 self.execution.run(scope, self.peer.as_deref(), self.hops.as_ref(),
                     &mut local[..1], &mut routed[..1], &mut experts[..1], &[rows], speculative,
-                    super::layers::Output::Normalized, self.draft.as_deref(), Some(&self.draft_probe))
+                    super::layers::Output::Normalized, self.draft.as_deref())
             };
             for binding in &mut local[0] { binding.enable_replay(true); }
             let normalized = result?[0];
@@ -900,7 +873,7 @@ impl<'a> Engine<'a> {
             let Lanes { local, routed, experts, .. } = &mut *lanes;
             let outputs = self.execution.run(scope, self.peer.as_deref(), self.hops.as_ref(),
                 &mut local[..1], &mut routed[..1], &mut experts[..1], &[tokens.len()], false,
-                super::layers::Output::Residual, None, None)?;
+                super::layers::Output::Residual, None)?;
             let stream = local[0][self.head()].stream();
             stream.device.run(|| {
                 // SAFETY: this uncaptured diagnostic retains every operand until
@@ -969,7 +942,7 @@ impl<'a> Engine<'a> {
                     "Kimi multi-sequence diagnostic step exceeds one prefill unit");
                 self.execution.run(scope, self.peer.as_deref(), self.hops.as_ref(),
                     &mut local[..tokens.len()], &mut routed[..tokens.len()], &mut experts[..tokens.len()], &rows, false,
-                    super::layers::Output::Normalized, None, None)?
+                    super::layers::Output::Normalized, None)?
             };
             for (lane, normalized) in normalized.into_iter().enumerate() {
                 let stream = local[lane][self.head()].stream();

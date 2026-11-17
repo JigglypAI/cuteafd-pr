@@ -650,7 +650,6 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
     let mut free_slots: Vec<usize> = drafter.map_or(Vec::new(), |d| (0..d.slots).rev().collect());
     // mtp_dspark and DFlash2 propose tokens only: neither has a trained confidence head.
     let mut shared = drafter.map(|d| {
-        engine.arm_draft_probe()?;
         anyhow::Ok(DraftPolicy::new(policy.length, d.cfg.drafts(), cuteafd_core::HeadScore::None, true))
     }).transpose()?;
     let mut active: Vec<Active<'_>> = Vec::new();
@@ -1229,11 +1228,9 @@ async fn decode_round(lease: LaneLease<'_>, engine: &GlmEngine<'_>, opened: &Ope
     let mut rows: Vec<(&mut GlmPlacement, usize)> = active.iter_mut().zip(&sequences)
         .map(|(a, s)| (&mut a.placement, s.len())).collect();
     let timer = Instant::now();
-    engine.probe_begin(tokens.len());
     let step = engine.verify_device(&mut rows, &tokens, transport.as_deref_mut().map(|t| (t, runtime)))
         .and_then(|logits| logits.context("decode needs every layer"))
         .and_then(|logits| Ok((selector.select(&logits, &batch)?, logits)));
-    engine.probe_end();
     let (selected, logits) = match step {
         Ok(step) => step,
         Err(error) => {
@@ -1322,7 +1319,6 @@ async fn decode_round(lease: LaneLease<'_>, engine: &GlmEngine<'_>, opened: &Ope
     let timer = Instant::now();
     lanes::commit(&mut DraftContext { drafter, context }).await?;
     phases[5] += timer.elapsed().as_secs_f64();
-    engine.probe_finish(|_, _| ());
     if let Some(policy) = shared.as_mut() {
         let outcomes: Vec<_> = active.iter().zip(&verified).map(|(a, &(rows, accepted, censored))|
             history::outcome(a.ticket.id(), rows, accepted, censored)).collect();

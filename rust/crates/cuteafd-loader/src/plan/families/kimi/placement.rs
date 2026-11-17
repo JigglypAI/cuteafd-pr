@@ -312,7 +312,6 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
             && layout.target_taps().iter().all(|&layer| layer < cfg.layers),
             "Kimi drafter target geometry differs from checkpoint");
         fixed.extend(crate::families::kimi_k3::draft::bridge_demands(&layout, rows, gpus)?);
-        fixed.push(crate::families::kimi_k3::draft_probe_demand(cfg.layers, cfg.topk, 64)?);
         // A K6 vocabulary head has no BF16 operand to borrow: the drafter owns
         // a head-only K6 scratch on the head rank.
         if let Some(manifest) = &manifest {

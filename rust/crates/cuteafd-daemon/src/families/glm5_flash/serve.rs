@@ -856,7 +856,6 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
     // The history draft policy chooses each request's verify length under the verify-row budget.
     let mut shared = match drafter {
         Some(drafter) => {
-            engine.arm_draft_probe(engine.decode_rows)?;
             Some(DraftPolicy::new(policy.length, drafter.drafts(), drafter.head_kind(), true))
         }
         _ => None,
@@ -1408,7 +1407,6 @@ async fn decode_round(lease: LaneLease<'_>, engine: &GlmfEngine<'_>, opened: &Op
         .map(|(a, s)| (&mut a.placement, s.len())).collect();
     lane.steps += 1;
     let timer = Instant::now();
-    engine.probe_begin(tokens.len());
     let step = engine.verify_device(&mut rows, &tokens, spec).and_then(|logits| logits.context("decode needs every layer"))
         .and_then(|logits| {
             // Each row draws at the position after it, masked along its sequence's drafts.
@@ -1419,8 +1417,6 @@ async fn decode_round(lease: LaneLease<'_>, engine: &GlmfEngine<'_>, opened: &Op
             }
             Ok((selector.select(&logits, &batch)?, logits))
         });
-    // Selection drained the stream; the probe stops recording either way.
-    engine.probe_end(step.is_ok());
     let step_ms = timer.elapsed().as_secs_f64() * 1e3;
     lane.stats.record(tokens.len(), engine.serving_decode_rows(tokens.len(), spec), spec, step_ms);
     lane.verify_s += step_ms / 1e3;
@@ -1499,7 +1495,6 @@ async fn decode_round(lease: LaneLease<'_>, engine: &GlmfEngine<'_>, opened: &Op
     lanes::commit(&mut Commit { engine, drafter, spec, commits: &commits, context: &context, kept: &kept,
         active: &mut *active }).await?;
     lane.verify_s += timer.elapsed().as_secs_f64();
-    engine.probe_finish(|_, _| ());
     if let Some(policy) = shared.as_mut() {
         let outcomes: Vec<_> = active.iter().zip(&verified).map(|(a, &(rows, accepted, censored))|
             history::outcome(a.ticket.id(), rows, accepted.max(1), censored)).collect();

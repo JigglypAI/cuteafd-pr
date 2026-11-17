@@ -349,7 +349,7 @@ impl GlmEngine<'_> {
         let mut census = crate::shared::memory::receipts::Census::default();
         for receipts in [self.target_buffer_receipts()?, self.target_hook_receipts()?,
             self.weight_receipts()?, self.expert_receipts()?, self.exchange_receipts()?,
-            self.serving_probe_receipts()?, prefix.allocation_receipts(devices)?] {
+            prefix.allocation_receipts(devices)?] {
             census.owners(receipts);
         }
         self.embedding.allocation_aliases(&mut census, devices, "glm.embedding")?;
@@ -431,17 +431,6 @@ impl GlmEngine<'_> {
             }
         }
         inventory.receipts.extend(self.embedding.allocation_receipts(devices, "glm.embedding")?);
-        Ok(inventory.receipts)
-    }
-
-    pub(crate) fn serving_probe_receipts(&self) -> Result<Vec<Receipt>> {
-        let physical = self.census_physical_devices()?;
-        let mut inventory = crate::shared::memory::receipts::Inventory::new(
-            CoordinatorDevices::new(&physical)?, "glm.serving",
-            Lifetime { first: Phase::Warmup, last: Phase::Growth }, Category::Workspace, "serving probe");
-        if let Some(probe) = self.draft_probe.try_borrow()?.as_ref() {
-            probe.allocation_receipts(&mut inventory, "draft_probe")?;
-        }
         Ok(inventory.receipts)
     }
 

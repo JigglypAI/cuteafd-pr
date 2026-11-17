@@ -194,7 +194,6 @@ fn serve_loop(
     let mut ready = Some(ready);
     // The mark arena is allocated before local experts fill the device.
     let arena = |engine: &super::engine::Engine<'_>| -> Result<usize> {
-        if args.dspark && !engine.skip_routed && engine.weights.dspark.is_some() { engine.arm_draft_probe()?; }
         let mark = Dsv4Prefix::mark_bytes_of(engine)?;
         Ok(mark_slots(engine, &prefix, mark) * mark)
     };
@@ -490,20 +489,18 @@ fn speculative_step(
         ensure!(!rows.is_empty(), "grammar removed V4 verifier anchor");
         Ok(rows)
     }).collect::<Result<_>>()?;
-    let total_rows = sequences.iter().map(Vec::len).sum();
+    let total_rows: usize = sequences.iter().map(Vec::len).sum();
     ensure!(total_rows <= engine.decode_rows, "shared V4 verifier budget exceeded");
     let lengths: Vec<_> = sequences.iter().map(|rows| rows.len() - 1).collect();
     let starts: Vec<usize> = active.iter().map(|a| a.placement.len).collect();
     let mut rows: Vec<(&mut Placement, &[u32])> = active.iter_mut().zip(&sequences)
         .map(|(a, tokens)| (&mut a.placement, tokens.as_slice())).collect();
     let timer = Instant::now();
-    engine.probe_begin(total_rows);
     let verified = engine.verify_device(&mut rows, transports, runtime).and_then(|logits| {
         let (selected, poisoned) = select_rows(selector, &logits, active, &sequences, &starts)?;
         crate::shared::spark_waves::healthy()?;
         Ok((logits, selected, poisoned))
     });
-    engine.probe_end(verified.is_ok());
     let (logits, selected, mut poisoned) = verified?;
     shape.verify_us = console::us(timer);
     shape.verified = lengths;
@@ -531,7 +528,6 @@ fn speculative_step(
         offset += rows.len();
         done
     }).collect();
-    engine.probe_finish(|_, _| ());
     let outcomes: Vec<_> = active.iter().zip(&sequences).zip(&outcomes).map(|((request, rows), &(accepted, censored))|
         history::outcome(request.ticket.id(), rows.len(), accepted, censored)).collect();
     shared.observe(&outcomes);

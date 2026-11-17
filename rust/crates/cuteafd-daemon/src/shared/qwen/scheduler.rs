@@ -3,8 +3,7 @@ use anyhow::Result;
 use cuteafd_api::openai::NativeRequest;
 use cuteafd_engine::media::{EncodeJob, EncoderClient, MediaKeys, RequestMedia};
 use cuteafd_ffi::NativeLibrary;
-use crate::shared::{draft::routes::RoundRoutes,
-    prefix::{CudaCopyEngine, PrefixArgs}, token_io::DeviceLogits};
+use crate::shared::{prefix::{CudaCopyEngine, PrefixArgs}, token_io::DeviceLogits};
 use std::{cell::RefCell, path::Path};
 
 #[derive(Debug, Clone, Copy)]
@@ -180,7 +179,6 @@ pub(crate) trait Backend<'a> {
         -> Result<Option<DeviceLogits>>;
     fn verify_bucket_rows(&self, rows: usize, speculative: bool, diagnostic: bool) -> usize;
     fn verify_attention_trace(&self, contexts: &[Vec<usize>], rows: usize) -> crate::shared::speculation_trace::Deferred;
-    fn arm_draft_probe(&self) -> Result<()>;
     fn prefill_draft(&self, placement: &Self::Placement, start: usize, chunk: &[u32], next: Option<u32>,
         draft: &mut Self::Draft) -> Result<()>;
     fn draft(&self, sequences: &mut [DraftSeq<'_, Self::Placement, Self::Draft>], timing: &mut DraftTiming, selector: &mut crate::shared::token_io::TokenSelector<'_>)
@@ -195,9 +193,6 @@ pub(crate) trait Backend<'a> {
         speculative: bool) -> Result<()>;
     /// Drop any unaccepted replay owned by this request before its storage is released.
     fn cancel(&self, _placement: &Self::Placement) -> Result<()> { Ok(()) }
-    fn probe_begin(&self, rows: usize);
-    fn probe_end(&self);
-    fn probe_finish<T>(&self, observe: impl FnOnce(&RoundRoutes, &[Option<f64>]) -> T) -> Option<T>;
 }
 
 
@@ -823,7 +818,6 @@ pub(crate) fn schedule<'a, B: Backend<'a>>(engine: &B, snapshot: &std::path::Pat
         let mut selector = TokenSelector::new(engine.library(), select, geometry.vocab_size, geometry.decode_rows)?;
         engine.selector_ready(&mut selector)?;
         let shared = if width > 0 {
-            engine.arm_draft_probe()?;
             Some(Policy::new(length, width, engine.draft_head_kind(), engine.draft_copies()))
         } else { None };
         let trace = Trace::open()?;
@@ -1416,7 +1410,6 @@ async fn decode_round<'a, B: Backend<'a>>(lease: LaneLease<'_>, engine: &B, geom
         .map(|(a, s)| (&mut a.placement, s.as_slice())).collect();
     lane.steps += 1;
     let timer = Instant::now();
-    engine.probe_begin(tokens.len());
     let step = if diagnostic {
         engine.verify_device_ungraphed(&mut rows, spec, UngraphedKind::Decode, cache.pool())
     } else {
@@ -1431,7 +1424,6 @@ async fn decode_round<'a, B: Backend<'a>>(lease: LaneLease<'_>, engine: &B, geom
             }
             Ok((selector.select(&logits, &batch)?, logits))
         });
-    engine.probe_end();
     let elapsed = timer.elapsed().as_secs_f64();
     lane.stats.record(tokens.len(), engine.verify_bucket_rows(tokens.len(), spec, diagnostic), spec, 1e3 * elapsed);
     lane.verify_s += elapsed;
@@ -1529,7 +1521,6 @@ async fn decode_round<'a, B: Backend<'a>>(lease: LaneLease<'_>, engine: &B, geom
     }
     lanes::commit(&mut Accept { engine, verified, spec }).await?;
     let commit_us = console::us(commit_timer);
-    engine.probe_finish(|_, _| ());
     if let Some(policy) = shared.as_mut() { policy.observe(&outcomes); }
     for (i, request) in active.iter().enumerate() {
         tally.member(&request.ticket, &proposals[i], sequences[i].len() - 1, &request.history[before[i]..],

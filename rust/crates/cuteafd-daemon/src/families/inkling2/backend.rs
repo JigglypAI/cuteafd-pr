@@ -1,6 +1,6 @@
 //! Inkling adapter for the shared request scheduler; no family scheduling loop.
 use super::{cache::{InklingPrefix, Placement}, engine::Execution};
-use crate::shared::{draft::routes::RoundRoutes, prefix::{CudaCopyEngine, PrefixArgs}, probe,
+use crate::shared::{prefix::{CudaCopyEngine, PrefixArgs}, probe,
     prefill_packing::{Limits, MemberOutcome}, prefill_pipeline::{sequence_units, Unit, UnitSegment},
     qwen::scheduler::{self, Backend}, token_io::{DeviceLogits, TokenSelector}};
 use anyhow::{ensure, Context, Result};
@@ -284,7 +284,6 @@ impl<'a> Backend<'a> for InklingBackend<'a> {
     fn verify_attention_trace(&self, _: &[Vec<usize>], rows: usize) -> crate::shared::speculation_trace::Deferred {
         crate::shared::speculation_trace::Deferred::new(move || serde_json::json!({"kind":"inkling2", "rows":rows, "attention":"eager"}))
     }
-    fn arm_draft_probe(&self) -> Result<()> { Ok(()) }
     fn prefill_draft(&self, _: &Placement, _: usize, _: &[u32], _: Option<u32>, _: &mut Draft) -> Result<()> { Ok(()) }
     fn draft(&self, sequences: &mut [scheduler::DraftSeq<'_, Placement, Draft>], _: &mut scheduler::DraftTiming,
         _: &mut TokenSelector<'_>) -> Result<Vec<Vec<u32>>> { Ok(vec![vec![]; sequences.len()]) }
@@ -300,9 +299,6 @@ impl<'a> Backend<'a> for InklingBackend<'a> {
         Ok(())
     }
     fn cancel(&self, _: &Placement) -> Result<()> { self.execution.borrow().requests.cache.drain()?; self.pending.borrow_mut().take(); Ok(()) }
-    fn probe_begin(&self, _: usize) {}
-    fn probe_end(&self) {}
-    fn probe_finish<T>(&self, _: impl FnOnce(&RoundRoutes, &[Option<f64>]) -> T) -> Option<T> { None }
 }
 
 #[cfg(test)]

@@ -1,7 +1,7 @@
 //! Text-only MiniMax adapter; admission, lanes and selection stay in the shared scheduler.
 use super::{cache::{Placement, PAGE_ROWS}, engine::{Requests, ServingPrefill, ServingRequest},
     prefix::MiniMaxPrefix, owners::Owners};
-use crate::shared::{draft::routes::RoundRoutes, prefix::{CudaCopyEngine, PrefixArgs, Toggle},
+use crate::shared::{prefix::{CudaCopyEngine, PrefixArgs, Toggle},
     prefill_packing::{Limits, MemberOutcome}, probe,
     qwen::scheduler::{self, Backend}, token_io::{DeviceLogits, TokenSelector}};
 use anyhow::{ensure, Context, Result};
@@ -107,23 +107,6 @@ fn publish<F: PrefixFamily<Placement = Placement>>(family: &F,
     Ok(())
 }
 
-#[derive(Default)]
-struct PolicyProbe { routes:Option<RoundRoutes> }
-impl PolicyProbe {
-    fn arm(&mut self,layers:usize) { self.routes=Some(RoundRoutes::new(layers,0)); }
-    fn begin(&mut self,rows:usize) {
-        if let Some(routes)=&mut self.routes {
-            routes.begin(rows);
-            // The shared policy learns whole-round cost, without claiming
-            // per-expert or per-layer timings that this adapter does not collect.
-            for layer in 0..routes.layers() { routes.dense(layer).expect("admitted policy layer"); }
-        }
-    }
-    fn finish<T>(&self,observe:impl FnOnce(&RoundRoutes,&[Option<f64>])->T) -> Option<T> {
-        self.routes.as_ref().map(|routes| observe(routes,&[]))
-    }
-}
-
 /// No allocations or placement choices here: startup passes its admitted context
 /// and host-prefix config, and the Owners borrow pins every native backing.
 pub(crate) struct MiniMaxBackend<'e, 'a> {
@@ -136,7 +119,6 @@ pub(crate) struct MiniMaxBackend<'e, 'a> {
     context: usize,
     host: Option<cuteafd_hostcache::config::Config>,
     profile: RefCell<[f64; 2]>,
-    policy_probe: RefCell<PolicyProbe>,
     identities: RefCell<BTreeMap<usize, u64>>,
     next_identity: Cell<u64>,
     pending: RefCell<Option<Vec<Submitted>>>,
@@ -176,7 +158,7 @@ impl<'e, 'a> MiniMaxBackend<'e, 'a> {
         let schedule = Requests::new(state.capacity, served_context, cfg.layers, rank.prefill.len())?;
         drop(state);
         Ok(Self { media_enabled: false, snapshot: Default::default(), owners, cfg, execution: RefCell::new(execution), schedule, context: served_context,
-            host, profile: RefCell::new([0.0; 2]), policy_probe:RefCell::new(PolicyProbe::default()), identities: RefCell::new(BTreeMap::new()),
+            host, profile: RefCell::new([0.0; 2]), identities: RefCell::new(BTreeMap::new()),
             next_identity: Cell::new(1), pending: RefCell::new(None), terminal: Cell::new(false),
             selector_receipts: RefCell::new(None), packing })
     }
@@ -515,7 +497,6 @@ impl<'e, 'a> Backend<'a> for MiniMaxBackend<'e, 'a> {
         crate::shared::speculation_trace::Deferred::new(move || serde_json::json!({
             "kind":"minimax_msa", "rows":rows, "contexts":contexts, "attention":"eager", "arithmetic":"eager" }))
     }
-    fn arm_draft_probe(&self) -> Result<()> { self.policy_probe.borrow_mut().arm(self.cfg.layers);Ok(()) }
     fn prefill_draft(&self, placement:&Placement, _:usize, _: &[u32], next:Option<u32>, state:&mut DraftState) -> Result<()> {
         let draft=self.owners.storage.draft_prefix.as_ref().context("MiniMax drafter not admitted")?;
         ensure!(draft.frontier(placement.slot)? == placement.len,"MiniMax draft prefill frontier differs");
@@ -614,11 +595,6 @@ impl<'e, 'a> Backend<'a> for MiniMaxBackend<'e, 'a> {
         self.identities.borrow_mut().remove(&placement.slot);
         self.owners.storage.probe_media.borrow_mut().remove(&placement.slot);
         Ok(())
-    }
-    fn probe_begin(&self, rows: usize) { self.policy_probe.borrow_mut().begin(rows); }
-    fn probe_end(&self) {}
-    fn probe_finish<T>(&self, observe: impl FnOnce(&RoundRoutes, &[Option<f64>]) -> T) -> Option<T> {
-        self.policy_probe.borrow().finish(observe)
     }
 }
 

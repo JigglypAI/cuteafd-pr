@@ -533,7 +533,6 @@ fn schedule_inner(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path
     let width = drafter.map_or_else(|| engine.mtp.as_ref().map_or(0, |m| m.stages.len()), |d| d.cfg.drafts());
     // DFlash and the native MTP chain propose tokens only: neither has a trained confidence head.
     let mut shared = if width > 0 {
-        engine.arm_draft_probe()?;
         Some(DraftPolicy::new(policy.length, width, cuteafd_core::HeadScore::None, true))
     } else { None };
 
@@ -1184,7 +1183,6 @@ async fn decode_round(lease: LaneLease<'_>, engine: &MimoEngine<'_>, prefix_draf
     // error inside `submit` would end the engine.
     let mut poisoned: Vec<Option<String>> = vec![None; active.len()];
     cuteafd_transport::route_log::step(|| active.iter().zip(&sequences).map(|(a, s)| (a.ticket.id(), s.len() as u32)).collect());
-    engine.probe_begin(tokens.len());
     let step = engine.submit(|| {
         let mut rows: Vec<(&mut MimoPlacement, usize)> = active.iter_mut().zip(&sequences)
             .map(|(a, s)| (&mut a.placement, s.len())).collect();
@@ -1197,7 +1195,6 @@ async fn decode_round(lease: LaneLease<'_>, engine: &MimoEngine<'_>, prefix_draf
         }
         Ok((selector.select(&logits, &batch)?, logits))
     });
-    engine.probe_end();
     let step_s = timer.elapsed().as_secs_f64();
     lane.verify_s += step_s;
     let timer = Instant::now();
@@ -1280,7 +1277,6 @@ async fn decode_round(lease: LaneLease<'_>, engine: &MimoEngine<'_>, prefix_draf
     }
     lanes::commit(&mut DraftContext { engine, drafter, context }).await?;
     lane.emit_s += timer.elapsed().as_secs_f64();
-    engine.probe_finish(|_, _| ());
     if let Some(policy) = shared.as_mut() {
         let outcomes: Vec<_> = active.iter().zip(&verified).map(|(a, &(rows, accepted, censored))|
             history::outcome(a.ticket.id(), rows, accepted, censored)).collect();

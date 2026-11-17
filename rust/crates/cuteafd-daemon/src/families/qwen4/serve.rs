@@ -395,7 +395,6 @@ impl<'e, 'a> Backend<'a> for Qwen4Backend<'e, 'a> {
     fn verify_attention_trace(&self, contexts: &[Vec<usize>], rows: usize) -> crate::shared::speculation_trace::Deferred {
         self.engine.verify_attention_trace(contexts, rows)
     }
-    fn arm_draft_probe(&self) -> Result<()> { self.engine.arm_draft_probe() }
     fn draft_copies(&self) -> bool { true }
     fn prefill_draft(&self, placement: &Self::Placement, start: usize, chunk: &[u32], next: Option<u32>, draft: &mut Self::Draft)
         -> Result<()> {
@@ -408,10 +407,5 @@ impl<'e, 'a> Backend<'a> for Qwen4Backend<'e, 'a> {
     fn accept(&self, verified: &mut [scheduler::Verified<'_, Self::Placement, Self::Draft, Self::History>],
         speculative: bool) -> Result<()> {
         super::speculate::accept(self.engine, verified, speculative)
-    }
-    fn probe_begin(&self, rows: usize) { self.engine.probe_begin(rows); }
-    fn probe_end(&self) { self.engine.probe_end(); }
-    fn probe_finish<T>(&self, observe: impl FnOnce(&crate::shared::draft::routes::RoundRoutes, &[Option<f64>]) -> T) -> Option<T> {
-        self.engine.probe_finish(observe)
     }
 }

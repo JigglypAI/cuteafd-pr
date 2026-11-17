@@ -3171,10 +3171,9 @@ def test_glmf_shared_packing_option_needs_no_batch_gate(tmp_path, mode):
 
 @pytest.mark.parametrize("keys,expected,absent", [
     ("", (), ("CUTEAFD_GLMF_ROUTE_RING_CHECK", "CUTEAFD_GLMF_DRAFT_POLICY")),
-    ("GLM5_FLASH_ROUTE_RING_CHECK=on\n", ("CUTEAFD_GLMF_ROUTE_RING_CHECK=1",), ("CUTEAFD_GLMF_DRAFT_POLICY",)),
 ])
 def test_glmf_draft_policy_keys_reach_the_coordinator(tmp_path, keys, expected, absent):
-    """The shared draft policy has no switch; the route ring check is diagnostic."""
+    """The shared draft policy has no family switch and no route ring."""
     result = _family_launch_result(tmp_path, GLMF_CONFIG, "test/glmf", keys)
     assert result.returncode == 0, result.stderr
     launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-glmf" in line)
@@ -3187,7 +3186,7 @@ def test_glmf_draft_policy_keys_reach_the_coordinator(tmp_path, keys, expected, 
 @pytest.mark.parametrize("keys,message", [
     ("GLM5_FLASH_DRAFT_POLICY=shared\n", "unknown configuration key: GLM5_FLASH_DRAFT_POLICY"),
     ("GLM5_FLASH_DRAFT_POLICY=cycle\n", "unknown configuration key: GLM5_FLASH_DRAFT_POLICY"),
-    ("GLM5_FLASH_ROUTE_RING_CHECK=yes\n", "GLM5_FLASH_ROUTE_RING_CHECK must be"),
+    ("GLM5_FLASH_ROUTE_RING_CHECK=on\n", "unknown configuration key: GLM5_FLASH_ROUTE_RING_CHECK"),
     ("GLM5_FLASH_DRAFT_TRACE=yes\n", "unknown configuration key: GLM5_FLASH_DRAFT_TRACE"),
 ])
 def test_glmf_draft_policy_keys_reject_bad_values_before_launch(tmp_path, keys, message):

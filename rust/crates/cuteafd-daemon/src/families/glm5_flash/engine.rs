@@ -1479,9 +1479,6 @@ pub(crate) struct GlmfEngine<'a> {
     graphs_warmed: std::cell::Cell<bool>,
     /// Opt-in matched-token/route evidence; never adds a device readback.
     split_audit: bool,
-    /// The shared draft policy's per-step signals (layer events, routes), armed by
-    /// `serve-glmf` under the shared policy and active only around its verify steps.
-    draft_probe: RefCell<Option<super::draft_probe::RoundProbe<'a>>>,
     /// A decode segment is being captured: host-side probe work stays out of the graph.
     capturing: std::cell::Cell<bool>,
     ops: Option<RefCell<OpTimes>>,
@@ -1785,7 +1782,7 @@ impl<'a> GlmfEngine<'a> {
             warming_graphs: std::cell::Cell::new(false),
             prewarming_graphs: std::cell::Cell::new(false), graphs_warmed: std::cell::Cell::new(false),
             split_audit: std::env::var("CUTEAFD_GLMF_SPLIT_AUDIT").is_ok_and(|v| v == "1"),
-            spark_bf16: false, draft_probe: RefCell::new(None), capturing: std::cell::Cell::new(false),
+            spark_bf16: false, capturing: std::cell::Cell::new(false),
             ops: std::env::var("CUTEAFD_GLMF_PROFILE_OPS").is_ok_and(|v| v == "1").then(RefCell::default),
             fp8_prefill: Fp8Prefill::default(), kda_fp32_partials: false,
             kda_output_shard: false, mark_slots: 0,
@@ -4327,7 +4324,6 @@ impl<'a> GlmfEngine<'a> {
                 on_layer(index, &self.download(&w.streams[cur], t * HC * row)?)?;
             }
             crate::shared::console::layer_mark(index);
-            self.probe_mark(index)?;
         }
         if let Some(w1) = w1 { self.replicate_terminal(w, w1, cur, t)?; }
         self.finish_route_checks()?;
@@ -4491,7 +4487,6 @@ impl<'a> GlmfEngine<'a> {
             }
             if index < layers.len() {
                 crate::shared::console::layer_mark(index);
-                self.probe_mark(index)?;
             }
         }
         if layers.len() < self.cfg.layers {
@@ -5178,7 +5173,6 @@ impl<'a> GlmfEngine<'a> {
                     self.cfg.routed_scale as f32, true, self.stream)
             }
         })?;
-        self.probe_ring(index, w, t)?;
         if !matches!(experts, Some(Experts::Local(_))) && !self.spark_bf16 {
             let grid = self.quantize_grid.blocks(t, h);
             self.run("expert_input_quant", &[("source_ptr", w.x.buffer.ptr), ("values_ptr", w.wire.buffer.ptr),
@@ -5329,64 +5323,6 @@ impl<'a> GlmfEngine<'a> {
             }
         }
         self.run("add", &[("a", w.routed_ptr()?), ("b", w.shared.buffer.ptr), ("out", w.delta.buffer.ptr)], &[rows])
-    }
-
-    /// The draft probe's layer mark: the end of `index` on the engine stream.
-    fn probe_mark(&self, index: usize) -> Result<()> {
-        if let Some(probe) = self.draft_probe.borrow_mut().as_mut() {
-            // SAFETY: the engine's own stream, live for the engine's lifetime.
-            unsafe { probe.mark(index, self.stream)? };
-        }
-        Ok(())
-    }
-
-    /// Queue layer `index`'s router ids into the draft probe's ring right
-    /// behind the router. Spark layers ring too: their routes reach the host
-    /// only on the exchange worker, after the post.
-    fn probe_ring(&self, index: usize, w: &Workspace<'_>, t: usize) -> Result<()> {
-        if self.capturing.get() { return Ok(()); }
-        let mut probe = self.draft_probe.borrow_mut();
-        let Some(probe) = probe.as_mut().filter(|p| p.wants_ring(false)) else { return Ok(()) };
-        // SAFETY: the router just wrote `t` rows of ids into `route_ids` on this stream; the ring
-        // is read after the step's sync.
-        unsafe { probe.ring(self.library, index, w.route_ids.buffer, t, self.stream) }
-    }
-
-    /// Arm the shared draft policy's per-step signals for verify steps of up
-    /// to `rows` rows (`serve-glmf` under the shared policy only).
-    pub(crate) fn arm_draft_probe(&self, rows: usize) -> Result<()> {
-        let dense = self.weights.layers.iter().map(|layer| layer.dense).collect();
-        *self.draft_probe.borrow_mut() = Some(super::draft_probe::RoundProbe::new(self.library, dense,
-            self.cfg.topk, rows)?);
-        Ok(())
-    }
-
-    /// Start recording a verify step of `rows` rows (with the draft probe armed).
-    pub(crate) fn probe_begin(&self, rows: usize) {
-        if let Some(probe) = self.draft_probe.borrow_mut().as_mut() { probe.begin(rows); }
-    }
-
-    /// Stop recording after the step and its token selection (which drains the
-    /// engine stream); a failed step's signals are dropped.
-    pub(crate) fn probe_end(&self, ok: bool) {
-        if let Some(probe) = self.draft_probe.borrow_mut().as_mut() {
-            probe.end();
-            if !ok { let _ = probe.finish(); }
-        }
-    }
-
-    /// The probed step's routes and layer µs, once its stream drained, handed
-    /// to `observe` (nothing when the step's signals are incomplete).
-    pub(crate) fn probe_finish<T>(&self, observe: impl FnOnce(&crate::shared::draft::routes::RoundRoutes,
-        &[Option<f64>]) -> T) -> Option<T> {
-        let mut probe = self.draft_probe.borrow_mut();
-        let (routes, layer_us) = probe.as_mut()?.finish()?;
-        Some(observe(routes, &layer_us))
-    }
-
-    /// Ring and staged-id agreement under `CUTEAFD_GLMF_ROUTE_RING_CHECK`.
-    pub(crate) fn probe_ring_check(&self) -> Option<super::draft_probe::RingCheck> {
-        self.draft_probe.borrow().as_ref().map(|probe| probe.ring_check)
     }
 
     /// Layer `index`'s wave on the link's exchange: routes and wire rows copy

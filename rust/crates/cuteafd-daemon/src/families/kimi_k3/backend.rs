@@ -1,6 +1,6 @@
 //! Text-only target and opt-in native MLA adapter to the shared scheduler.
 use super::{engine::Engine, prefix::{KimiPrefix, Placement}};
-use crate::shared::{draft::routes::RoundRoutes, prefix::{CudaCopyEngine, PrefixArgs, Toggle},
+use crate::shared::{prefix::{CudaCopyEngine, PrefixArgs, Toggle},
     qwen::scheduler::{self, Backend}, token_io::DeviceLogits};
 use anyhow::{ensure, Result};
 use cuteafd_api::openai::NativeRequest;
@@ -215,7 +215,6 @@ impl<'e, 'a> Backend<'a> for KimiBackend<'e, 'a> {
         let contexts = contexts.to_vec();
         crate::shared::speculation_trace::Deferred::new(move || serde_json::json!({"kind":"kimi_owned_mla_tp2_kda", "rows":rows, "contexts":contexts}))
     }
-    fn arm_draft_probe(&self) -> Result<()> { self.engine.arm_draft_probe() }
     fn prefill_draft(&self, placement: &Placement, start: usize, chunk: &[u32], next: Option<u32>,
         seq: &mut DraftState) -> Result<()> {
         let draft = self.engine.native_draft().ok_or_else(|| anyhow::anyhow!("Kimi drafter was not admitted"))?;
@@ -312,11 +311,6 @@ impl<'e, 'a> Backend<'a> for KimiBackend<'e, 'a> {
         self.engine.probe_media.borrow_mut().remove(&placement.slot);
         if let Some(draft) = self.engine.native_draft() { draft.discard(placement.slot)?; }
         Ok(())
-    }
-    fn probe_begin(&self, rows: usize) { self.engine.probe_begin(rows); }
-    fn probe_end(&self) { self.engine.probe_end(); }
-    fn probe_finish<T>(&self, observe: impl FnOnce(&RoundRoutes, &[Option<f64>]) -> T) -> Option<T> {
-        self.engine.probe_finish(observe)
     }
 }
 

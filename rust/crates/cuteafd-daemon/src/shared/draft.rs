@@ -5,15 +5,14 @@
 //! ([`length`]), trace records and stats. A drafter declares its native block
 //! and, where it has a trained confidence head, a raw score per position;
 //! nothing else. [`copy`] finds the history copies the policy may verify past
-//! an agreeing neural draft. [`clock`] and [`timing`] are profiling only.
+//! an agreeing neural draft. [`clock`] and [`timing`] are profiling only; the
+//! policy reads no device signal.
 pub(crate) mod clock;
 pub(crate) mod copy;
 pub(crate) mod history;
 pub(crate) mod length;
-pub(crate) mod probe;
 pub(crate) mod remote;
 pub(crate) mod remote_dflash;
-pub(crate) mod routes;
 pub(crate) mod timing;
 
 /// Explicit device timing profiles.

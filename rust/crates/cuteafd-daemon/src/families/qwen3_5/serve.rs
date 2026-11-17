@@ -1,6 +1,6 @@
 //! Dense target adapter for the shared Qwen request lifecycle.
 use super::engine::{DenseEngine, DenseMark, prefix::{DensePrefix, Placement}};
-use crate::shared::{draft::routes::RoundRoutes, prefix::{CudaCopyEngine, PrefixArgs, Toggle},
+use crate::shared::{prefix::{CudaCopyEngine, PrefixArgs, Toggle},
     qwen::scheduler::{self, Backend}, speculation::target::{AcceptedPrefix, BlockVerifyTarget, VerifyRequest, VerifyRow},
     token_io::DeviceLogits};
 use anyhow::{ensure, Context, Result};
@@ -12,23 +12,6 @@ use std::{cell::RefCell, path::Path, rc::Rc};
 use crate::shared::speculation::{
     block_dspark::{self, DsparkDrafter}, dflash::{ContextRow, DraftSeq, TargetHead, TAP_ROWS}};
 use cuteafd_ffi::CuteafdDeviceBuffer;
-
-#[derive(Default)]
-struct DenseProbe { routes: Option<RoundRoutes> }
-impl DenseProbe {
-    fn arm(&mut self, layers: usize) { self.routes = Some(RoundRoutes::new(layers, 0)); }
-    fn begin(&mut self, rows: usize) {
-        if let Some(routes) = &mut self.routes {
-            routes.begin(rows);
-            for layer in 0..routes.layers() { routes.dense(layer).expect("admitted dense layer"); }
-        }
-    }
-    fn finish<T>(&self, observe: impl FnOnce(&RoundRoutes, &[Option<f64>]) -> T) -> Option<T> {
-        // Dense layers have no expert timings: the complete measured round
-        // teaches the shared policy's bucket-local verifier residual instead.
-        self.routes.as_ref().map(|routes| observe(routes, &[]))
-    }
-}
 
 #[derive(Default)]
 pub(crate) struct DraftState { anchor: Option<u32>, confidence: Vec<f32> }
@@ -44,7 +27,6 @@ pub(crate) struct DenseBackend<'e, 'a> {
     mtp: Option<Rc<super::engine::mtp::MtpCache<'a>>>,
     profile: RefCell<[f64; 2]>,
     pending: RefCell<Option<DenseMark<'a>>>,
-    probe: RefCell<DenseProbe>,
     packing: crate::shared::prefill_packing::PackingMode,
 }
 
@@ -142,7 +124,7 @@ impl<'e, 'a> DenseBackend<'e, 'a> {
     pub fn new(engine: &'e RefCell<DenseEngine<'a>>, library: &'a NativeLibrary) -> Self {
         Self { engine, library, drafter: None, mtp: None,
             profile: RefCell::new([0.0; 2]), pending: RefCell::new(None),
-            probe: RefCell::new(DenseProbe::default()), packing: Default::default() }
+            packing: Default::default() }
     }
 }
 
@@ -424,10 +406,6 @@ impl<'e, 'a> Backend<'a> for DenseBackend<'e, 'a> {
         let contexts = contexts.to_vec();
         crate::shared::speculation_trace::Deferred::new(move || serde_json::json!({"kind":"causal_gqa", "rows":rows, "contexts":contexts}))
     }
-    fn arm_draft_probe(&self) -> Result<()> {
-        self.probe.borrow_mut().arm(self.engine.borrow().cfg.attention.len());
-        Ok(())
-    }
     fn prefill_draft(&self, _placement: &Placement, _start: usize, _chunk: &[u32], next: Option<u32>, draft: &mut DraftState) -> Result<()> {
         draft.anchor = next;
         Ok(())
@@ -552,11 +530,6 @@ impl<'e, 'a> Backend<'a> for DenseBackend<'e, 'a> {
         if let Some(mtp) = &self.mtp { mtp.discard_context(placement.slot)?; }
         if let Some(draft) = &self.drafter { draft.discard_context(placement.slot)?; }
         Ok(())
-    }
-    fn probe_begin(&self, rows: usize) { self.probe.borrow_mut().begin(rows); }
-    fn probe_end(&self) {}
-    fn probe_finish<T>(&self, observe: impl FnOnce(&RoundRoutes, &[Option<f64>]) -> T) -> Option<T> {
-        self.probe.borrow().finish(observe)
     }
 }
 
