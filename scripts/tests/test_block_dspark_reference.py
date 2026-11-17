@@ -175,3 +175,15 @@ def test_gqa_block_and_yarn_match_bundled_attention():
     cos, sin = rotary(x[None, :, 0], positions[None])
     expected = x * cos[0, :, None] + torch.cat([-x[..., 2:], x[..., :2]], -1) * sin[0, :, None]
     assert torch.equal(drafter.rotary(x, positions), expected)
+
+
+def test_lithos_parity_fixture_uses_native_config_and_explicit_context_only_window():
+    source = ORACLE.read_text()
+    tree = ast.parse(source)
+    assert '"Qwen3DSparkModel"' in source
+    assert '"--context-window"' in source and '"--kv-cache"' in source
+    assert '"--fixture-rows"' in source
+    assert 'drafter.window = args.context_window' in source
+    assert 'drafter.causal =' not in source
+    body = next(node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef) and node.name == "body")
+    assert 'self.causal' in ast.unparse(body)

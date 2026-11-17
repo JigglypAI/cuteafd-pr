@@ -1,5 +1,11 @@
 # Mistral Large 4
 
+Automatic KV sizing uses the shared 2M-token target on every card, including
+32 GB / RTX 5090. Placement and expert onboarding are fixed at that target;
+the pool then grows into remaining admitted memory, within native encoding
+limits. `KV_MAX_TOKENS` is unset by default and can explicitly cap growth.
+See [memory policy](../options.md#memory-and-pools).
+
 [`wrldsuksgo2mars/Mistral-Large-4-EXL3-K4`](https://huggingface.co/wrldsuksgo2mars/Mistral-Large-4-EXL3-K4)
 serves `mistralai/Mistral-Large-4-1T-A52B` with EXL3 K4 routed experts and
 the original mixed FP8/BF16 vendor core. Revision

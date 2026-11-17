@@ -20,9 +20,15 @@ fn i(value: usize) -> Result<i32> {
     Ok(i32::try_from(value)?)
 }
 
+fn supports_block_rope(head_dim: usize, has_table: bool, factor: f32) -> bool {
+    factor.is_finite() && factor > 0.0 &&
+        ((head_dim == 64 && !has_table && factor == 1.0)
+            || (matches!(head_dim,64|128) && has_table))
+}
+
 impl NativeLibrary {
-    /// Shared block dSpark per-head norm and checkpoint RoPE. For 128-wide
-    /// heads, `inv_freq` is immutable FP32 [64] on device and `factor` scales
+    /// Shared block dSpark per-head norm and checkpoint RoPE. For table-driven
+    /// heads, `inv_freq` is immutable FP32 [head_dim / 2] and `factor` scales
     /// cos/sin before BF16 rounding. The 64-wide default route is unchanged.
     ///
     /// # Safety
@@ -33,8 +39,7 @@ impl NativeLibrary {
         inv_freq: P, q_out: M, k_out: M, v_out: M, rows: usize, heads: usize, kv_heads: usize,
         head_dim: usize, theta: f32, factor: f32, eps: f32, fp8_kv: bool, stream: M) -> Result<()> {
         ensure!(rows > 0 && kv_heads > 0, "invalid block dSpark qk geometry");
-        ensure!((head_dim == 64 && inv_freq.is_null() && factor == 1.0)
-            || (head_dim == 128 && !inv_freq.is_null()), "unsupported block dSpark RoPE");
+        ensure!(supports_block_rope(head_dim,!inv_freq.is_null(),factor), "unsupported block dSpark RoPE");
         type F = unsafe extern "C" fn(P, P, P, P, P, P, M, M, M, i32, i32, i32, i32, f32, f32, f32, M) -> i32;
         // SAFETY: the symbol has the native signature above.
         let symbol: &[u8] = if fp8_kv { b"cuteafd_block_dspark_qk_rope_fp8" } else { b"cuteafd_block_dspark_qk_rope" };
@@ -211,5 +216,27 @@ impl NativeLibrary {
         check(unsafe {
             f(hidden, w1, weight, bias, anchors, drafts, out, i(sequences)?, i(block)?, i(width)?, i(rank)?, stream)
         }, "confidence")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::supports_block_rope;
+
+    #[test]
+    fn shared_block_rope_accepts_lithos_yarn_without_changing_legacy_dispatch() {
+        assert!(supports_block_rope(64,false,1.0));
+        for dim in [64,128] {
+            for factor in [1.0,1.0+0.1*16f32.ln(),1.0+0.1*32f32.ln()] {
+                assert!(supports_block_rope(dim,true,factor));
+            }
+        }
+        assert!(!supports_block_rope(128,false,1.0));
+        assert!(!supports_block_rope(64,false,1.25));
+        for dim in [0,32,96,256] { assert!(!supports_block_rope(dim,true,1.0)); }
+        for factor in [0.0,-1.0,f32::NAN,f32::INFINITY] {
+            assert!(!supports_block_rope(64,true,factor));
+            assert!(!supports_block_rope(128,true,factor));
+        }
     }
 }

@@ -1160,7 +1160,24 @@ def v4_placement_sources():
     return {str(path.relative_to(ROOT)): sha(path.read_bytes()) for path in sorted(paths)}
 
 
-def v4_placement_inputs(destination, staging, timeout, workers, previous=None, backend_cache=None, verify_skips=False):
+def v4_export_jobs():
+    """V4 case exports. Spark worlds charge native expert-wave segment programs
+    from the case manifest, so the exported program set carries the dsv4f/dsv4p
+    segments rather than only the Flash/Pro model programs."""
+    exports = [(str(context), "export_b12x_dsv4_aot.py",
+                ["--geometry", "flash,pro,flash2,pro2,native_experts",
+                 "--native-expert-families", "dsv4f,dsv4p",
+                 "--max-context", str(context),
+                 "--decode-rows", "64", "--prefill-rows", "4096", "--context-split", "on"])
+               for context in (131072, 1048576)]
+    exports.append(("exl3", "package_exl3_aot.py",
+                    ["--geometry", "dsv4p", "--capacities", EXL3_CAPACITIES,
+                     "--bits", "2,3", "--role", "coordinator"]))
+    return exports
+
+
+def v4_placement_inputs(destination, staging, timeout, workers, previous=None, backend_cache=None,
+                        verify_skips=False, expect=None):
     """Publish compiler-produced planner metadata, never inferred scratch sizes."""
     filesystem = load_file("cuteafd_build_filesystem", ROOT / "scripts/build/assert-build-filesystem.py")
     for path in (destination, staging):
@@ -1171,13 +1188,7 @@ def v4_placement_inputs(destination, staging, timeout, workers, previous=None, b
     engine = subprocess.check_output(["git", "-C", str(ROOT), "rev-parse", "HEAD"], text=True).strip()
     lock = json.loads((ROOT / "third_party/sparkinfer.lock.json").read_text())
     sources = v4_placement_sources()
-    exports = [(str(context), "export_b12x_dsv4_aot.py",
-                ["--geometry", "flash,pro,flash2,pro2", "--max-context", str(context),
-                 "--decode-rows", "64", "--prefill-rows", "4096", "--context-split", "on"])
-               for context in (131072, 1048576)]
-    exports.append(("exl3", "package_exl3_aot.py",
-                    ["--geometry", "dsv4p", "--capacities", EXL3_CAPACITIES,
-                     "--bits", "2,3", "--role", "coordinator"]))
+    exports = v4_export_jobs()
 
     publisher = load_file("v4_publication_records", ROOT / "scripts/build/export-placement-inputs.py")
     if backend_cache:
@@ -1234,7 +1245,16 @@ def v4_placement_inputs(destination, staging, timeout, workers, previous=None, b
     if previous:
         records_module = load_file("v4_change_records", ROOT / "scripts/build/kernel-records.py")
         old = json.loads((previous / "INPUTS.json").read_text())["program_records"]
-        records_module.write_report(destination, records_module.change_report(old, records))
+        expected = json.loads(expect.read_text()) if expect else None
+        if isinstance(expected, dict):
+            expected = expected["groups"]
+        if expected is not None and (not isinstance(expected, list)
+                                     or not all(isinstance(group, str) for group in expected)):
+            raise ValueError("--expect must contain a JSON list of export groups, or {groups: [...]}")
+        report = records_module.change_report(old, records, expected)
+        records_module.write_report(destination, report)
+        if report["leaks"]:
+            raise ValueError(f"UNEXPECTED V4 KERNEL CHANGES outside --expect: {report['leaks']}")
     print(f"Published V4 placement inputs: {destination}", flush=True)
 
 
@@ -1258,6 +1278,8 @@ def main():
     parser.add_argument("--v4-placement-inputs", type=Path,
                         help="CPU-only Flash/Pro 1/2-RTX x 128K/1M planner metadata; --output-dir is staging")
     parser.add_argument("--previous", type=Path, help="prior V4 publication for incremental job replay")
+    parser.add_argument("--expect", type=Path,
+                        help="JSON list of export job groups expected to change; requires --previous")
     parser.add_argument("--backend-cache", type=Path, help="content-addressed lowered-MLIR cache")
     parser.add_argument("--verify-skips", action="store_true", help="run skipped frontends and reject IR drift")
     parser.add_argument("--_worker", help=argparse.SUPPRESS)
@@ -1275,11 +1297,14 @@ def main():
     if args.v4_placement_inputs:
         if args.workers < 1 or args.timeout < 1:
             parser.error("--workers and --timeout must be positive")
+        if args.expect and not args.previous:
+            parser.error("--expect requires --previous")
         v4_placement_inputs(args.v4_placement_inputs.expanduser().resolve(),
                             args.output_dir.expanduser().resolve(), args.timeout, args.workers,
                             args.previous.expanduser().resolve() if args.previous else None,
                             args.backend_cache.expanduser().resolve() if args.backend_cache else None,
-                            args.verify_skips)
+                            args.verify_skips,
+                            args.expect.expanduser().resolve() if args.expect else None)
         return 0
     if args.expected_removals and not args.baseline_source:
         parser.error("--expected-removals requires --baseline-source")

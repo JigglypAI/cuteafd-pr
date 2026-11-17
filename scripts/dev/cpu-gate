@@ -575,6 +575,10 @@ def compiler_cache_receipt(env, target):
                   target=str(target), wrapper=env.get('RUSTC_WRAPPER', ''),
                   cache_dir=env.get('KACHE_CACHE_DIR'), hits=None, misses=None,
                   rustflags=env.get('RUSTFLAGS', ''), cargo_encoded_rustflags=env.get('CARGO_ENCODED_RUSTFLAGS', ''))
+    timeouts = sorted(warning.parent.glob('timeouts/*'))
+    record['invocation_timeouts'] = [path.read_text(errors='replace').strip() for path in timeouts if path.is_file()]
+    if timeouts and not warning.is_file():
+        record['mode'] = 'kache-with-timeouts'
     if warning.is_file():
         record['fallback'] = warning.read_text(errors='replace').strip()
     for name, command in (('rustc', ['rustc', '-vV']), ('cargo', ['cargo', '-V'])):

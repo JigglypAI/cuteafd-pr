@@ -1331,9 +1331,10 @@ wip_cached_exports() {
   return 1
 }
 
-# wip_remote_export: the native key's entry from CUTEAFD_EXPORT_HOST, through
+# wip_remote_export SOURCE: the native key's entry from CUTEAFD_EXPORT_HOST, through
 # sparknest, then restored here with REQUIRE_HIT (no GPU turn on raptor).
 wip_remote_export() {
+  local export_source="${1:?wip_remote_export requires frozen source directory}"
   local host="${CUTEAFD_EXPORT_HOST:-maxq}" key env_file started=$SECONDS
   if wip_serving_export_priority; then host=maxq; fi
   [[ -n "$host" ]] || return 75
@@ -1344,7 +1345,7 @@ wip_remote_export() {
   echo "WIP coordinator export: remote on $host"
   local layers status=0
   layers="$(docker image inspect -f '{{json .RootFS.Layers}}' "$COORDINATOR_DOCKER_DEV" | sha256sum | awk '{print $1}')"
-  "$repo_root/scripts/build/export-remote.sh" "$host" "$staging_dir" "$key" "$env_file" \
+  "$repo_root/scripts/build/export-remote.sh" "$host" "$export_source" "$key" "$env_file" \
     "$COORDINATOR_DOCKER_DEV" "$layers" || status=$?
   if ((status != 0)); then
     rm -f "$env_file"
@@ -1358,12 +1359,14 @@ wip_remote_export() {
   echo "WIP phase coordinator export-remote: $((SECONDS - started))s ($host)"
 }
 
-# wip_capped_export BUILD...: the native phase on a raptor GPU we hold: one
+# wip_capped_export SOURCE BUILD...: the native phase on a raptor GPU we hold: one
 # whose lock the caller already holds, else a fair-queued GPU turn (the first
 # configured GPU, held only for the export). A one-off container on
 # that GPU (the WIP container is bound to the primary COORDINATOR_GPUS), admitted by the
 # host's nvidia-smi and stopped by the watchdog if it outgrows its cap.
 wip_capped_export() {
+  local export_source="${1:?wip_capped_export requires frozen source directory}"
+  shift
   local status=0
   local -a priority=()
   [[ "${CUTEAFD_WIP_COORDINATOR_EXPORT:-auto}" != auto ]] || priority=(--yield-serving)
@@ -1375,7 +1378,7 @@ wip_capped_export() {
     echo "WIP coordinator export: yielding raptor to serving; remote on maxq"
     local remote_deadline=$((SECONDS + ${CUTEAFD_WIP_EXPORT_WAIT_S:-14400}))
     while ((SECONDS < remote_deadline)); do
-      if CUTEAFD_EXPORT_HOST=maxq wip_remote_export; then return 0; fi
+      if CUTEAFD_EXPORT_HOST=maxq wip_remote_export "$export_source"; then return 0; fi
       sleep 60
     done
     return 75
@@ -1444,6 +1447,7 @@ wip_capped_export_on() (
 build_coordinator() {
   echo "== incrementally building coordinator slot $slot =="
   local phase="${1:-all}"
+  local export_source="${2:?build_coordinator requires frozen source directory}"
   [[ "$phase" == native ]] || sync_local_source
   local image_id image_layers
   image_id="$(docker image inspect -f '{{.Id}}' "$COORDINATOR_DOCKER_DEV")"
@@ -1538,16 +1542,16 @@ build_coordinator() {
     local mode exported=0
     for mode in $(wip_coordinator_export_modes); do
       case "$mode" in
-        remote) wip_remote_export && exported=1 ;;
-        maxq) CUTEAFD_EXPORT_HOST=maxq wip_remote_export && exported=1 ;;
-        capped) wip_capped_export "${coordinator_build[@]}" && exported=1 ;;
+        remote) wip_remote_export "$export_source" && exported=1 ;;
+        maxq) CUTEAFD_EXPORT_HOST=maxq wip_remote_export "$export_source" && exported=1 ;;
+        capped) wip_capped_export "$export_source" "${coordinator_build[@]}" && exported=1 ;;
         wait-remote|wait-maxq)
           local remote_deadline=$((SECONDS + ${CUTEAFD_WIP_EXPORT_WAIT_S:-14400}))
           while ((SECONDS < remote_deadline)); do
             sleep 60
             if [[ "$mode" == wait-maxq ]]; then
-              if CUTEAFD_EXPORT_HOST=maxq wip_remote_export; then exported=1; break; fi
-            elif wip_remote_export; then exported=1; break; fi
+              if CUTEAFD_EXPORT_HOST=maxq wip_remote_export "$export_source"; then exported=1; break; fi
+            elif wip_remote_export "$export_source"; then exported=1; break; fi
           done
           ;;
 
@@ -1912,7 +1916,7 @@ wip_build_selected_roles() {
   [[ "$role" == expert || "$wip_reused_coordinator" == 1 ]] || wip_build_coordinator=1
   [[ "$role" == coordinator || "$wip_reused_expert" == 1 ]] || wip_build_expert=1
   # No hardware or seed lease during Cargo; its build-slot helper exits here.
-  ((wip_build_coordinator == 0)) || build_coordinator rust
+  ((wip_build_coordinator == 0)) || build_coordinator rust "$staging_dir"
   if ((wip_build_expert)); then
     wip_build_resource_acquire
     build_expert
@@ -1922,7 +1926,7 @@ wip_build_selected_roles() {
   wip_build_resource_release
   echo "WIP build resources released before Spark distribution and coordinator export"
   wip_distribute_sealed_expert
-  ((wip_build_coordinator == 0)) || build_coordinator native
+  ((wip_build_coordinator == 0)) || build_coordinator native "$staging_dir"
 }
 
 wip_build_selected_roles

@@ -148,7 +148,7 @@ def _wip_coordinator(tmp_path, hit, exports_cached=False, incomplete=False):
     cached = 'true' if exports_cached else 'false'
     for name, body in {'docker': 'printf "docker %s\\n" "$*" >> "$TRACE"\nprintf "image-id\\n"\n'
                                  'case "$*" in *CUTEAFD_EXPORT_CACHE_REQUIRE_HIT=1*) ' + cached + ' || exit 3;; esac',
-                       'python3': 'printf "turn %s\\n" "$*" >> "$TRACE"'}.items():
+                       'python3': 'printf "turn %s\\n" "$*" >> "$TRACE"\ncase "$*" in *waiting-serving*) exit 1;; esac'}.items():
         (tools / name).write_text('#!/bin/sh\n' + body + '\n')
         (tools / name).chmod(0o755)
     state = tmp_path / 'state'
@@ -174,7 +174,7 @@ slot=test coordinator_container=owned COORDINATOR_DOCKER_DEV=image bf16_families
 CUTEAFD_WIP_EXPORT_LOCKS=on wip_export_locks=on
 CUTEAFD_WIP_COORDINATOR_EXPORT=auto
 '''
-    result = subprocess.run(['bash', '-c', setup + helpers + '\nwip_capped_export() { printf \"capped\\n\" >> \"$TRACE\"; \"$@\" native; }\nbuild_coordinator'], capture_output=True, text=True,
+    result = subprocess.run(['bash', '-c', setup + helpers + '\nwip_capped_export() { shift; printf \"capped\\n\" >> \"$TRACE\"; \"$@\" native; }\nbuild_coordinator all "$state_dir/source-staging"'], capture_output=True, text=True,
                             env={**os.environ, 'HOME': str(tmp_path / 'home'), 'PATH': f'{tools}:{os.environ["PATH"]}',
                                  'TRACE': str(trace)})
     assert result.returncode == 0, result.stderr

@@ -72,7 +72,7 @@ pub fn default_prefill_unit_rows() -> u64 {
     prefill_unit_rows_in(PREFILL_DEPTH, PREFILL_RESERVE_ROWS)
 }
 
-/// Common logical GPU pool across model families; larger pools are explicit.
+/// Common layout-sizing target; the admitted pool can grow into remaining memory.
 pub const DEFAULT_GPU_KV_TOKENS: u64 = 2 << 20;
 
 /// Literal registry shared with the launcher's logical GPU profile resolver.

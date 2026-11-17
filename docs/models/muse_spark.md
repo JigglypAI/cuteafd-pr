@@ -1,5 +1,11 @@
 # Muse Spark
 
+Automatic KV sizing uses the shared 2M-token target on every card, including
+32 GB / RTX 5090. Placement and expert onboarding are fixed at that target;
+the pool then grows into remaining admitted memory, within native encoding
+limits. `KV_MAX_TOKENS` is unset by default and can explicitly cap growth.
+See [memory policy](../options.md#memory-and-pools).
+
 Target KV storage accepts `KV_CACHE=bf16` (the current default) or experimental
 `KV_CACHE=fp8`. FP8 stores native E4M3 K/V plus independent FP32 amax/448
 scales for every token and KV head, for full and sliding attention. One aligned

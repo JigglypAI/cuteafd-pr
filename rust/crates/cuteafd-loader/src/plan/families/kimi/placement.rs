@@ -6,12 +6,6 @@ use crate::placement::families::kimi::{self, ExpertProfile, FixedOwner, KimiReci
 use crate::{placement::*, plan::{Component, ExpertPlacement, PlanReport}};
 use cuteafd_core::memory_layout::{Basis, Category, DeviceKind, DeviceLayout, Item, MemoryLayout};
 
-fn raw_speculator_is_block(snapshot:Option<&std::path::Path>)->bool {
-    snapshot.and_then(|s|std::fs::read(s.join("config.json")).ok())
-        .and_then(|b|serde_json::from_slice::<serde_json::Value>(&b).ok())
-        .is_some_and(|v|v["speculators_model_type"]=="dspark")
-}
-
 const GIB: u64 = 1 << 30;
 const COMPILED_CAPACITY: u64 = crate::families::kimi_k3::COMPILED_CONTEXT as u64;
 const PAGE: u64 = 64;
@@ -170,7 +164,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
             // Speculative verify graphs replay at each exact width up to the drafter's block.
             let verify = opts.kimi_drafter_snapshot.as_ref().map(|snapshot| -> anyhow::Result<usize> {
                 let raw: serde_json::Value = serde_json::from_slice(&std::fs::read(snapshot.join("config.json"))?)?;
-                if raw["speculators_model_type"] == "dspark" {
+                if crate::families::glm5::draft_representation::is_dspark(&raw) {
                     Ok(crate::formats::block_dspark::BlockDsparkConfig::from_json(&raw)?.block + 1)
                 } else { Ok(crate::formats::dflash::MlaDflashConfig::from_json(&raw)?.block) }
             }).transpose()?.unwrap_or(0);
@@ -281,21 +275,23 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
         use crate::families::kimi_k3::draft::DraftLayout;
         let raw: serde_json::Value = serde_json::from_slice(&std::fs::read(snapshot.join("config.json"))?)?;
         let slots = usize::try_from(slots)?;
-        let layout = if raw["speculators_model_type"] == "dspark" {
+        let layout = if crate::families::glm5::draft_representation::is_dspark(&raw) {
             anyhow::ensure!(!opts.tp2_dflash,
                 "block dSpark uses physical GQA head splits, not TP2_DFLASH");
             let representation=if opts.kimi_draft_fp8 { GlmDraftRepresentation::Fp8Only }
                 else { GlmDraftRepresentation::Bf16Only };
-            if gpus==2 {
+            if gpus==2 && opts.draft_context_window==0 && crate::formats::block_dspark::BlockDsparkConfig::from_json(&raw)?.window.is_some() {
                 let rank=|rank|crate::formats::block_dspark::BlockDsparkRuntimeLayout::for_rank_representation(snapshot,
                     slots,slots.min(8),opts.physical_sms.unwrap_or(188) as usize,&format!("kimi/draft/{rank}"),
                     opts.draft_kv_cache,rank,2,head_rank,representation);
                 DraftLayout::BlockTp2 { ranks:Box::new([rank(0)?,rank(1)?]),lead:head_rank }
             } else {
-                DraftLayout::Block(crate::formats::block_dspark::BlockDsparkRuntimeLayout::with_representation(snapshot,
-                    slots,slots.min(8),opts.physical_sms.unwrap_or(188) as usize,&format!("kimi/draft/{head_rank}"),opts.draft_kv_cache,representation)?)
+                DraftLayout::Block(crate::formats::block_dspark::BlockDsparkRuntimeLayout::with_context(snapshot,
+                    slots,slots.min(8),opts.physical_sms.unwrap_or(188) as usize,&format!("kimi/draft/{head_rank}"),opts.draft_kv_cache,representation,
+                    usize::try_from(context)?,slots.checked_mul(usize::try_from(context)?).context("block draft pool overflow")?,opts.draft_context_window)?)
             }
         } else {
+            anyhow::ensure!(opts.draft_context_window==0,"DRAFT_CONTEXT_WINDOW requires a Kimi block DSpark drafter");
             let draft = MlaDflashConfig::from_json(&raw)?;
             anyhow::ensure!(!opts.tp2_dflash || gpus == 2,
                 "Kimi TP2 DFlash requires two physical coordinator GPUs");
@@ -456,9 +452,14 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
         context_buffers.query_row_bytes.saturating_add(context_buffers.partial_row_bytes)
     } else { 0 };
     let page_rows = if modes.iter().any(|mode| *mode == LayerMode::ContextSplit) { PAGE * 2 } else { PAGE };
-    let mut facts = crate::placement::PoolFacts::new(&opts.rtx_bytes[..gpus],
-        crate::placement::planner::Context::resolve(context, (opts.context_tokens > 0).then_some(opts.context_tokens)),
+    let mut facts = crate::placement::PoolFacts::new(crate::placement::planner::Context::resolve(context, (opts.context_tokens > 0).then_some(opts.context_tokens)),
         requested_pool, PAGE);
+    // Whole-layer placements may give all MLA to either owner. Sum memory
+    // against the checkpoint's total record slope to bound every legal cut.
+    facts.memory = vec![crate::placement::PoolMemory {
+        available_bytes: opts.rtx_bytes[..gpus].iter().sum(),
+        bytes_per_unit: cfg.mla_layers() as u64 * PAGE * opts.mla_kv.record_bytes() as u64,
+    }];
     facts.target = opts.target_pool_tokens;
     let pool = match crate::placement::prepare_pool(facts) {
         Ok(pool) => pool,
@@ -475,6 +476,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
             return memory;
         }
     };
+    let block_tp2 = matches!(draft,Some(crate::families::kimi_k3::draft::DraftLayout::BlockTp2 { .. }));
     let draft = match &draft {
         Some(layout) => match kimi::draft_layout_facts(layout, page_rows, maximum_pages, head_rank as u8) {
             Ok(value) => Some(value),
@@ -569,7 +571,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
     recipe.owners.push(kimi::host_scoring_owner(scoring_bytes, maximum_pages));
     recipe.owners.push(kimi::host_upload_owner(maximum_pages));
     match kimi::stream_slab_owners_with_block(gpus,maximum_pages,
-        raw_speculator_is_block(opts.kimi_drafter_snapshot.as_deref()) && gpus==2) {
+        block_tp2) {
         Ok(owners) => recipe.owners.extend(owners),
         Err(error) => { report.refuse_placement(format!("Kimi stream slab owners refused: {error}"),
             "Use supported coordinator stream counts."); return memory; }

@@ -1207,10 +1207,7 @@ deployment = dict(encoder=report.get("encoder"), audio_encoder=report.get("audio
     encoder_plan_hash=report.get("encoder_plan_hash", "ab" * 32), spark_expert_world=expert_world,
     replay_records=report.get("replay_records"), spark_roles=roles, version=1, family=family, executable=family != "qwen3_5" and placement_ready, wip_launchable=placement_ready, rtx_gpus=gpus, spark_ranks=ranks,
     topology=dict(tp=expert_world), peers=peers,
-    speculator=("mtp" if expert_world == 0 and config.get("text_config", config).get("mtp_num_hidden_layers") == 1
-        and (config.get("quantization_config", {}).get("quant_method") == "exl3"
-             or config.get("quantization_config", {}).get("quant_method") == "modelopt"
-             and any(group.get("weights", {}).get("num_bits") == 4 for group in config["quantization_config"].get("config_groups", {}).values()))
+    speculator=("mtp" if config.get("text_config", config).get("mtp_num_hidden_layers", 0) > 0
         else "off") if family == "qwen4" and value("--speculator") == "auto" else value("--speculator", "off"), prefill_unit_rows=unit, prefill_waves=waves, prefill_span_rows=span, prefill_reserve_rows=8192, decode_lanes=decode_lanes,
     admission=dict(kv_pool_size=value("--kv-pool-size"), memory_policy={}),
     spark_admission="coordinator_authoritative",
@@ -1466,7 +1463,7 @@ def capture_resolver_config_parity(snapshot: Path, example: Path, binary: Path,
     assert launched["memory_layout"]["pool_tokens"] == planned["memory_layout"]["pool_tokens"], (example.name, launched["memory_layout"]["pool_tokens"], planned["memory_layout"]["pool_tokens"])
     if example.name == "glm53-flash-exlr8-k4-min.config":
         assert onboard(planned) == 18, planned
-        assert planned["memory_layout"]["pool_tokens"] == 2_097_152, planned
+        assert planned["memory_layout"]["pool_tokens"] >= 2_097_152, planned
         assert planned["resolved_settings"]["index_cache"]["value"] == "compact"
 
 
@@ -4255,7 +4252,7 @@ def test_qwen_local_mtp_default_preserves_overrides(tmp_path: Path, keys: str, d
 @pytest.mark.parametrize("method", ["exl3", "modelopt"])
 @pytest.mark.parametrize("inventory,world,tower", [(0, 0, False), (3, 0, False), (3, 0, True), (2, 2, False)])
 @pytest.mark.parametrize("override", [None, "auto", "mtp", "off"])
-def test_qwen_auto_mtp_follows_admitted_world(tmp_path, method, inventory, world, tower, override):
+def test_qwen_auto_mtp_is_independent_of_admitted_world(tmp_path, method, inventory, world, tower, override):
     quant = {"quant_method": method}
     if method == "modelopt":
         quant["config_groups"] = {"experts": {"weights": {"num_bits": 4}}}
@@ -4278,7 +4275,7 @@ def test_qwen_auto_mtp_follows_admitted_world(tmp_path, method, inventory, world
     assert plan[plan.index("--speculator") + 1] == (override or "auto")
     assert result.returncode == 0, result.stderr
     serve = next(shlex.split(line) for line in result.stderr.splitlines() if "cuteafd serve-qwen4 --snapshot" in line)
-    expected = override == "mtp" or override in (None, "auto") and world == 0
+    expected = override != "off"
     assert ("--mtp" in serve) == expected, serve
     if expected:
         assert serve[serve.index("--mtp") + 1] == "3"
@@ -4311,22 +4308,23 @@ def test_qwen_spark_mtp_keeps_the_draft_layer_on_coordinator(tmp_path: Path) -> 
 
 
 @pytest.mark.parametrize("method,mtp_layers", [("exl3", 0), ("exl3", 2), ("fp8", 1), ("nvfp4", 1)])
-def test_qwen_local_unqualified_mtp_keeps_the_existing_default(tmp_path: Path, method: str, mtp_layers: int) -> None:
+def test_qwen_native_mtp_default_follows_checkpoint_presence(tmp_path: Path, method: str, mtp_layers: int) -> None:
     config = {**SPLIT_CONFIGS["qwen4"], "quantization_config": {"quant_method": method},
               "text_config": {**SPLIT_CONFIGS["qwen4"]["text_config"], "mtp_num_hidden_layers": mtp_layers}}
     result = _family_launch_result(tmp_path, config, "test/model", "EXPERT_BACKEND=local\n")
     assert result.returncode == 0, result.stderr
     launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-qwen4" in line)
-    assert "--local-experts" in launch and "--mtp " not in launch
+    assert "--local-experts" in launch
+    assert ("--mtp 3" in launch) == (mtp_layers > 0)
 
 
 @pytest.mark.parametrize("method", ["fp8", "nvfp4"])
-def test_qwen_unqualified_explicit_mtp_keeps_the_existing_depth(tmp_path: Path, method: str) -> None:
+def test_qwen_explicit_mtp_uses_uniform_default_depth(tmp_path: Path, method: str) -> None:
     config = {**SPLIT_CONFIGS["qwen4"], "quantization_config": {"quant_method": method}}
     result = _family_launch_result(tmp_path, config, "test/model", "EXPERT_BACKEND=local\nSPECULATOR=mtp\n")
     assert result.returncode == 0, result.stderr
     launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-qwen4" in line)
-    assert "--local-experts" in launch and "--mtp 1" in launch
+    assert "--local-experts" in launch and "--mtp 3" in launch
 
 
 @pytest.mark.parametrize("restart,admitted_mib", [(False, 12000), (True, 96000)])
@@ -5899,3 +5897,34 @@ def test_k31_qualified_default_tracks_physical_tp_and_kv(tmp_path, layout, enabl
     if enabled:
         assert "--draft-kv-cache fp8" in launch
         assert "--draft-fp8 true" in launch
+
+
+@pytest.mark.parametrize("window", ["0", "2048"])
+def test_kimi_shared_context_window_reaches_serving_and_planning(tmp_path, window):
+    config = {"model_type":"kimi_k31","text_config":{"model_type":"kimi_linear", "num_hidden_layers":93,
+        "first_k_dense_replace":1,"moe_layer_freq":1}}
+    result = _family_launch_result(tmp_path, config, "test/kimi",
+        f"SPECULATOR=dspark\nSPECULATOR_MODEL_ID=test/draft\nDRAFT_CONTEXT_WINDOW={window}\nVISION=off\nAUDIO=off\n")
+    assert result.returncode == 0, result.stderr
+    serve = next(line for line in result.stderr.splitlines() if "cuteafd serve-kimi" in line)
+    assert ("--draft-context-window" in serve) == (window != "0")
+    if window != "0":
+        assert f"--draft-context-window {window}" in serve
+    assert "CUTEAFD_DRAFT_CONTEXT_WINDOW" not in serve
+
+
+@pytest.mark.parametrize("window", ["-1", "1.5", "native"])
+def test_kimi_context_window_refuses_invalid_tokens(tmp_path, window):
+    config = {"model_type":"kimi_k31","text_config":{"model_type":"kimi_linear", "num_hidden_layers":93,
+        "first_k_dense_replace":1,"moe_layer_freq":1}}
+    result = _family_launch_result(tmp_path, config, "test/kimi",
+        f"SPECULATOR=dspark\nSPECULATOR_MODEL_ID=test/draft\nDRAFT_CONTEXT_WINDOW={window}\nVISION=off\nAUDIO=off\n")
+    assert result.returncode == 2
+    assert "DRAFT_CONTEXT_WINDOW must be a nonnegative integer" in result.stderr
+
+
+def test_other_family_refuses_unimplemented_context_window(tmp_path):
+    result = _family_launch_result(tmp_path, {"model_type":"glm_moe_dsa", "num_hidden_layers":4,
+        "first_k_dense_replace":3}, "test/glm", "DRAFT_CONTEXT_WINDOW=2048\n")
+    assert result.returncode == 2
+    assert "DRAFT_CONTEXT_WINDOW currently requires Kimi block DSpark" in result.stderr

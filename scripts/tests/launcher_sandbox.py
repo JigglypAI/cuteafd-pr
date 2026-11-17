@@ -118,6 +118,8 @@ def fake_resolved_settings(args, family, sparks):
         raw = precision["value"]
         precision["value"] = raw if isinstance(raw, bool) else raw in ("on", "true")
         result["draft_fp8"] = precision
+    if family == "qwen4":
+        result["native_mtp_layers"] = {"value": int(value("--native-mtp-layers", config.get("SPECULATOR_DEPTH") or "3")), "provenance": "auto"}
     if family == "mimo_v2":
         precision = resolved("--draft-fp8", "SPECULATOR_FP8", True)
         raw = precision["value"]
