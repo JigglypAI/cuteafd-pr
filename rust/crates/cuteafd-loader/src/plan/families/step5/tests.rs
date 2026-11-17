@@ -774,7 +774,7 @@ fn nvfp4_min_card_admits_native_w4a4_and_bf16_root_stays_reference_only() {
         if let Some(tokens) = pool {
             assert_eq!(memory.pool_tokens, tokens);
         } else {
-            let target = crate::placement::PoolPolicy::resolve(&[96 << 30], context, None, 64).target;
+            let target = crate::placement::prepare_pool(crate::placement::PoolFacts::new(&[96 << 30], context, None, 64)).target();
             assert!((context..=target).contains(&memory.pool_tokens));
             // More free capacity must grow the same default-format pool to its cap.
             let roomy = report_context(dir.path(), 1, 160, 4, None, context);

@@ -297,6 +297,7 @@ pub fn draft_layout_facts(layout: &DraftLayout, page_rows: u64, maximum_pages: u
 /// attention modes, retention, expert inventory and the transient load peaks.
 #[derive(Debug, Clone)]
 pub struct KimiRecipe {
+    pub pool: crate::placement::PoolPolicy,
     pub vision: Option<crate::placement::still_encoder::StillEncoder>,
     pub expert_usage: Option<cuteafd_core::expert_usage::Geometry>,
     pub context: u64,
@@ -373,7 +374,7 @@ impl KimiRecipe {
             request.onboard == Pin::Exact(profile.layers.len() as u64)) {
             return Err(LOCAL_ONLY_REFUSAL);
         }
-        let mut solved = solve(request, budgets, self)?;
+        let mut solved = crate::placement::planner::solve_prepared(request, budgets, self, &self.pool)?;
         self.refine_shaped(&mut solved)?;
         let placement = self.execution(&solved)?;
         if self.spark_links && self.experts.is_some()
@@ -1157,6 +1158,7 @@ mod tests {
 
     pub(super) fn recipe() -> KimiRecipe {
         let mut recipe = KimiRecipe {
+            pool: crate::placement::prepare_pool(crate::placement::PoolFacts::new(&[96 << 30], 256, Some(256), 64)),
             vision: None,
             expert_usage: None,
             shaped: Vec::new(),

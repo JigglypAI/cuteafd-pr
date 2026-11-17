@@ -911,7 +911,7 @@ pub(crate) fn admit<'a, const RANKS: usize>(mut inputs: Inputs<'_, RANKS>) -> Re
             bytes: request.inventory.gpus[rank].capacity_bytes.saturating_sub(free_bytes), weights: 0,
             lifetime: contract::Lifetime::RESIDENT, basis: Basis::Exact });
     }
-    let mut recipe = KimiRecipe { vision: None, expert_usage: kimi::usage_geometry(cfg, expert_usage), context: request.pool.compiled_context, gpus: RANKS,
+    let mut recipe = KimiRecipe { pool: request.pool, vision: None, expert_usage: kimi::usage_geometry(cfg, expert_usage), context: request.pool.compiled_context, gpus: RANKS,
         placement: placement_mode, attention,
         prefill: contract::PrefillShape { rows: unit_rows as u64, waves: inputs_waves as u64 },
         lanes, spark_links: spark_ranks > 0, hop_spec: request.hops.clone(),
@@ -1207,9 +1207,8 @@ fn request<const RANKS: usize>(mut i: Inputs<'_, RANKS>) -> Result<PlacementRequ
                 half: [Bytes2::default(); 2], tp2: false, whole_supported: true, spark_ok: true }),
             modes: if RANKS == 1 { vec![WHOLE] } else if mla { MODES.to_vec() } else { vec![LayerMode::HeadSplit] } });
     }
-    let mut pool = PoolPolicy::resolve(&i.gpus.map(|gpu| gpu.capacity_bytes), context as u64,
-        i.requested_pool, MLA_PAGE_ROWS as u64).with_context(i.serving_context);
-    pool.ceiling = pool.maximum_tokens();
+    let pool = cuteafd_loader::placement::prepare_pool(cuteafd_loader::placement::PoolFacts::new(
+        &i.gpus.map(|gpu| gpu.capacity_bytes), i.serving_context, i.requested_pool, MLA_PAGE_ROWS as u64));
     Ok(PlacementRequest {
         resident_weight_limit: Some(i.resident_weight_limit), inventory: Inventory { gpus: i.gpus.to_vec(), spark_ranks: i.spark_ranks, peer_access: i.peer_access },
         attention_placement: i.attention, context_buffers: i.context.as_ref().map_or_else(ContextBuffers::default, |layout| layout.buffers()), layers_first_gpu: 0,
@@ -1458,9 +1457,8 @@ pub(super) mod tests {
                         let units = (low + high + 1) / 2;
                         let tokens = units * 64;
                         let mut trial = candidate.clone();
-                        trial.pool.compiled_context = 0;
-                        trial.pool.requested = Some(tokens); trial.pool.floor = tokens;
-                        trial.pool.target = tokens; trial.pool.ceiling = tokens; trial.pool.max = tokens;
+                        trial.pool = cuteafd_loader::placement::prepare_pool(cuteafd_loader::placement::PoolFacts::new(
+                            &[96 << 30; 2], 0, Some(tokens), 64));
                         if enabled {
                             let layout = draft.with_pool_tokens(pool_cap.map_or(tokens as usize, |cap| cap.min(tokens as usize)))?;
                             let (mut demand, peak) = layout.demands(1)?;
@@ -2500,7 +2498,8 @@ pub(super) mod tests {
                 let mut under = request(i)?;
                 assert_eq!(under.pool.compiled_context, context);
                 assert_eq!(under.pool.floor, context);
-                under.pool.requested = Some(context - 64);
+                under.pool = cuteafd_loader::placement::prepare_pool(cuteafd_loader::placement::PoolFacts::new(
+                    &[96 << 30; 2], under.pool.context(), Some(context - 64), 64));
                 assert_eq!(solve(&under), Err(PlacementError::RequestedBelowContext {
                     requested: context - 64, floor: context,
                 }));

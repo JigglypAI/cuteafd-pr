@@ -928,7 +928,7 @@ pub fn solve_prepared(
         .ok_or(Refusal::Overflow("target pool pages"));
     let floor = request.context.required().max(if matches!(request.pool, Pin::Auto) { pool.floor() } else { 0 });
     let minimum = aligned(floor)?;
-    let compiled = contract.maximum_pages / multiple * multiple;
+    let compiled = contract.maximum_pages.min(pool.ceiling() / page) / multiple * multiple;
     let target = aligned(pool.target().max(request.context.required()))?;
     let ceiling = aligned(pool.max().max(pool.target()).max(request.context.required()))?.min(compiled);
     let wanted = match request.pool {

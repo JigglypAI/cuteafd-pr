@@ -160,6 +160,7 @@ fn scaled(bytes: u64, count: usize) -> Result<u64> {
 
 /// One prepared candidate: the facts the shared planner prices.
 pub struct Step5Recipe<'a> {
+    pub pool: crate::placement::PoolPolicy,
     pub cfg: &'a Config,
     pub inputs: &'a RuntimeInputs,
     pub depth: usize,
@@ -208,13 +209,11 @@ impl<'a> Step5Recipe<'a> {
             .iter()
             .map(|gpu| gpu.capacity_bytes)
             .collect::<Vec<_>>();
-        let pool = PoolPolicy::resolve(
-            &capacities,
-            inputs.context,
-            inputs.requested_pool,
-            PAGE_ROWS);
+        let pool = crate::placement::prepare_pool(crate::placement::PoolFacts::new(
+            &capacities, inputs.serving_context, inputs.requested_pool, PAGE_ROWS));
+        pool.validate_explicit()?;
         let maximum_pages = pool.maximum_tokens().div_ceil(PAGE_ROWS);
-        let layout_pages = pool.requested.unwrap_or(pool.target).div_ceil(PAGE_ROWS);
+        let layout_pages = pool.requested().unwrap_or(pool.target()).div_ceil(PAGE_ROWS);
         ensure!(maximum_pages > 0, "Step-5 empty pool ceiling");
         let prefill = PrefillShape {
             rows: inputs.unit_rows() as u64,
@@ -271,6 +270,7 @@ impl<'a> Step5Recipe<'a> {
                 inputs.host.memory.0, host_geometry.chunk_bytes()).context("Step-5 host prefix geometry")?
         };
         Ok(Self {
+            pool,
             host_geometry, host_cache_bytes,
             cfg,
             inputs,

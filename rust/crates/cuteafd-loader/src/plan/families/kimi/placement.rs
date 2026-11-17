@@ -465,9 +465,11 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
         context_buffers.query_row_bytes.saturating_add(context_buffers.partial_row_bytes)
     } else { 0 };
     let page_rows = if modes.iter().any(|mode| *mode == LayerMode::ContextSplit) { PAGE * 2 } else { PAGE };
-    let mut pool = crate::placement::PoolPolicy::resolve(&opts.rtx_bytes[..gpus], context,
+    let mut facts = crate::placement::PoolFacts::new(&opts.rtx_bytes[..gpus],
+        crate::placement::planner::Context::resolve(context, (opts.context_tokens > 0).then_some(opts.context_tokens)),
         requested_pool, page_rows);
-    pool.target = opts.target_pool_tokens.max(context);
+    facts.target = Some(opts.target_pool_tokens.max(context));
+    let pool = crate::placement::prepare_pool(facts);
     let ceiling = pool.maximum_tokens();
     let maximum_pages = ceiling.div_ceil(page_rows);
     let draft_window_bytes = match draft.as_ref().map(|layout| layout.window_mark_bytes()).transpose() {
@@ -503,6 +505,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
             "Supply supported Spark endpoint geometry."); return memory; }
     };
     let mut recipe = KimiRecipe {
+        pool,
         vision: None,
         expert_usage: kimi::usage_geometry(cfg, opts.expert_usage),
         context, gpus, placement: attention, attention: modes,
