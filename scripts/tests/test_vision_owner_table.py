@@ -297,6 +297,9 @@ def test_inactive_generic_tower_inventory_is_unique_and_has_dynamic_attention_fi
         assert len(names)==count and len(set(names))==count
         assert names[0] == ("vision_dynamic_attention_h12_d128" if kind == "kimi" else "vision_dynamic_attention_h16_d80")
         assert not any("65536" in name or "66792" in name for name in names)
+        assert ("vision_vendor_rotary_raster_t1" in names) == (kind=="kimi")
+        assert "vision_rotary_raster_t1" not in names
+        assert not any("cu130" in name for name in names)
     native=(ROOT / "native/shared/cuda/vision_runtime.cu").read_text()
     assert "if(s.tower)return false" in native
     assert "return vision_required_impl(s,out,valid_tower);" in native

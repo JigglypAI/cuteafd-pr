@@ -73,7 +73,7 @@ int encode_generic_tower(Owner* o,const uint8_t* rgb,uint64_t rgb_bytes,const fl
     cuteafd_vision_tower_norm norm2{t.block_norm_kind,t.block_norm_epsilon,block.norm2,s.norm2_bias[layer]};
     GENERIC_RUN(generic_norm(o,norm1,b.x,b.qkv_norm,n,h));
     GENERIC_RUN(generic_projection(o,b.qkv_norm,block.qkv,block.qkv_bias,b.qkv,n,h,3*a));
-    GENERIC_RUN(generic_program(o,"vision_rotary_"+suffix,
+    GENERIC_RUN(generic_program(o,t.rotary_kind==2 ? "vision_vendor_rotary_raster_t1" : "vision_rotary_"+suffix,
       {b.qkv,b.cosines,b.sines,b.q,b.k,b.v},{uint64_t(n)}));
     GENERIC_RUN(cuteafd_vision_dynamic_attention_launch(o->attention,b.q,b.k,b.v,
       b.attention,b.lse,b.lengths,n,scale,stream));
