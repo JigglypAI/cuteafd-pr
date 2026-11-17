@@ -1436,8 +1436,7 @@ mod tests {
                 headers.extend(mxfp8(&format!("model.layers.0.mlp.experts.{expert}.{projection}_proj"), n, k));
             }
         }
-        write_snapshot(root.path(), &serde_json::json!({"model_type":"unknown_mxfp8",
-            "quantization_config":{"quant_method":"mxfp8", "weight_block_size":[1,32]}}), &headers, None);
+        write_snapshot(root.path(), &serde_json::json!({"model_type":"unknown_mxfp8"}), &headers, None);
         let mut tensors = Fp8ExpertTensors::read(root.path(), shape)?;
         assert_eq!(tensors.format(), ExpertFormat::Mxfp8);
         assert_eq!(tensors.package_family, None);
