@@ -1344,6 +1344,42 @@ mod admission_tests {
     }
 
     #[test]
+    fn public_plan_and_runtime_share_resolved_policy_before_and_after_growth() -> Result<()> {
+        use cuteafd_core::memory_policy::MemoryPolicy;
+        use cuteafd_loader::plan::{self, layout::LayoutOptions, testing, ExpertPlacement, MediaMode, PlanOptions};
+        let dir = tempfile::tempdir()?;
+        testing::write_v41_snapshot(dir.path());
+        let manifest = testing::write_v41_workspaces(dir.path());
+        let input = testing::BudgetedPlanInput::open(dir.path())?;
+        let mut args = args(dir.path());
+        args.max_context_tokens = 262_144;
+        args.rtx_expert_layers = LocalLayers::Count(0);
+        args.pool_tokens = None;
+        args.concurrency = 16;
+        args.prefix.prefix_cache_entries = 0;
+        let options = PlanOptions { placement: ExpertPlacement::Sparks { ranks: 4 },
+            vision: MediaMode::Off, audio: MediaMode::Off,
+            layout: Some(LayoutOptions { rtx_bytes: vec![96 << 30], context_tokens: 262_144,
+                onboard: Some(OnboardSetting::Layers(0)), host_cache_bytes: Some(0), prefix_slots: Some(0),
+                mimo_prefix_entries: 0, workspace_manifest: Some(manifest),
+                host_memory: Some(testing::SimulatedHost::raptor().host_ram), ..Default::default() }),
+            ..Default::default() };
+        let run = |max| MemoryPolicy { kv_max: Some(max), ..Default::default() }.scoped(|| -> Result<_> {
+            let report = input.plan(&options)?;
+            ensure!(report.fits, "{}", plan::render(&report));
+            let runtime = resolve(&args, &[(80usize << 30, 96usize << 30)], no_experts(), 0, &[0], 0, None)?;
+            assert_eq!(report.phase_ledger.as_ref().context("V4.1 planned policy")?.pool_policy,
+                runtime.solved.pool_policy);
+            Ok(runtime)
+        });
+        let before = run(2 << 20)?;
+        let after = run(100_000_000)?;
+        assert!(after.placement.pool_tokens > before.placement.pool_tokens);
+        assert_eq!(after.placement.onboard_layers, before.placement.onboard_layers);
+        Ok(())
+    }
+
+    #[test]
     fn logical_pool_excludes_snapshot_tails_and_charges_each_cache_owner() -> Result<()> {
         let dir = tempfile::tempdir()?;
         std::fs::write(
