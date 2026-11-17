@@ -791,6 +791,9 @@ def generate_v41(traces, coverage, pin_frequency, prefill_rows, pin_report, layo
         prefill.add(prefill_rows)
     allowed = set(range(1, V41_DECODE_ROWS + 1)) | prefill
     latest = {}
+    identities = {}
+    drafts = set()
+    exercised_prefill = set()
     for trace in traces:
         if trace.get("schema_version") not in (1, 2):
             raise ValueError("expected GRAPH_TRACE schema_version=1 or 2")
@@ -800,29 +803,48 @@ def generate_v41(traces, coverage, pin_frequency, prefill_rows, pin_report, layo
         sampled = trace["cache"].get("sampled_at_ms", 0)
         if device not in latest or sampled >= latest[device][0]:
             latest[device] = (sampled, trace)
-    if set(latest) != set(range(layout)):
-        raise ValueError("need a complete trace inventory for every layout rank")
-    identities = {}
-    drafts = set()
-    exercised_prefill = set()
-    for device, (_, trace) in latest.items():
-        for graph in trace["graphs"]:
+        occurrences = {}
+        snapshot = {(graph["site"], graph.get("bank", 0), graph.get("key_id", graph["shape"])): graph
+                    for graph in trace["graphs"]}
+        for graph in sorted(snapshot.values(), key=lambda graph: (graph["site"], graph.get("bank", 0), graph.get("key_id", 0), graph["shape"])):
             if not graph["site"].startswith("deepseek_v41."):
                 continue
             cost = graph.get("capture_bytes")
-            if type(cost) is not int or cost < 0:
+            if cost is not None and (type(cost) is not int or cost < 0):
                 raise ValueError("capture_bytes must be a nonnegative integer for every identity")
             hits = graph.get("hits")
             if type(hits) is not int or hits < 0:
                 raise ValueError("hits must be a nonnegative integer (capture counts are not replays)")
             geometry = v41_geometry(graph["shape"], allowed, graph["site"])
-            identity = (device, graph["site"], graph.get("bank", 0), graph.get("key_id", graph["shape"]))
-            identities[identity] = (geometry, graph)
+            # key_id and pointer fingerprints change across launches. Pair each
+            # bank/geometry one-to-one in key order; duplicates remain distinct.
+            shape_identity = (device, graph["site"], graph.get("bank", 0), geometry)
+            ordinal = occurrences.get(shape_identity, 0)
+            occurrences[shape_identity] = ordinal + 1
+            identity = (*shape_identity, ordinal)
+            previous = identities.get(identity)
+            if previous is None:
+                merged = {**graph, "cycles": dict(graph.get("cycles", {}))}
+            else:
+                old = previous[1]
+                merged = {**(graph if sampled >= old["_sampled_at_ms"] else old)}
+                merged["hits"] = old["hits"] + hits
+                merged["cycles"] = {key: old.get("cycles", {}).get(key, 0) + graph.get("cycles", {}).get(key, 0)
+                                    for key in old.get("cycles", {}).keys() | graph.get("cycles", {}).keys()}
+                measured = [value for value in (old.get("capture_bytes"), cost) if value is not None]
+                merged["capture_bytes"] = max(measured) if measured else None
+            merged["_sampled_at_ms"] = max(sampled, previous[1]["_sampled_at_ms"] if previous else sampled)
+            identities[identity] = (geometry, merged)
             if geometry and geometry[0] == "draft":
                 drafts.add(geometry)
             if geometry and geometry[0] == "row" and geometry[1] in prefill:
                 if graph.get("cycles", {}).get("prefill", 0) > 0:
                     exercised_prefill.add(geometry[1])
+    if set(latest) != set(range(layout)):
+        raise ValueError("need a complete trace inventory for every layout rank")
+    for identity, (_, graph) in identities.items():
+        if graph.get("capture_bytes") is None:
+            raise ValueError(f"capture_bytes missing for identity {identity!r} in every trace")
     if not identities:
         raise ValueError("trace contains no matching graph identities")
 

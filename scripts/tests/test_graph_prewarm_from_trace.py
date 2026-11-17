@@ -1277,13 +1277,43 @@ def test_v41_replays_select_whole_geometry_but_not_capture_only_geometry():
     assert report[0]["zero_replay_sibling_identities"] == 1
 
 
-def test_v41_latest_inventory_and_exact_ids_win_independently_per_rank():
+def test_v41_snapshots_aggregate_cost_max_and_exact_siblings_per_rank():
     old = v41_trace(graphs=[v41_graph(cost=99999999)], sampled=1)
     new = v41_trace(graphs=[v41_graph(cost=0), v41_graph(cost=2345, key_id=2)], sampled=2)
     second = v41_trace(device=1, graphs=[v41_graph(cost=5 << 20)])
     for inputs in [[old, new, second], [second, new, old]]:
         result = MODULE.generate(inputs, "deepseek_v41", layout=2)
-        assert [rank["reserve_base_bytes"] for rank in result["ranks"]] == [2 << 20, 6 << 20]
+        assert [rank["reserve_base_bytes"] for rank in result["ranks"]] == [48 * (2 << 20), 6 << 20]
+
+
+def test_v41_aslr_geometry_and_costs_match_without_double_charging():
+    first = v41_graph(cost=3 << 20)
+    second = dict(first, shape="(99999999, 1)", key_id=99)
+    one = MODULE.generate([v41_trace(graphs=[first])], "deepseek_v41", layout=1)
+    both = MODULE.generate([v41_trace(graphs=[first]), v41_trace(graphs=[second])], "deepseek_v41", layout=1)
+    assert both["ranks"][0]["reserve_base_bytes"] == one["ranks"][0]["reserve_base_bytes"] == 4 << 20
+
+
+def test_v41_shifted_same_geometry_identities_pair_one_to_one():
+    first = [v41_graph(cost=1 << 20, key_id=1), v41_graph(cost=3 << 20, key_id=2)]
+    second = [dict(v41_graph(cost=2 << 20, key_id=21), shape="(900, 1)"),
+              dict(v41_graph(cost=1 << 20, key_id=22), shape="(901, 1)")]
+    for traces in [[v41_trace(graphs=first), v41_trace(graphs=second)],
+                   [v41_trace(graphs=second), v41_trace(graphs=first)]]:
+        result = MODULE.generate(traces, "deepseek_v41", layout=1)
+        assert result["ranks"][0]["reserve_base_bytes"] == 6 << 20
+
+
+def test_v41_replay_in_one_snapshot_can_use_measured_bytes_from_another():
+    replay = v41_graph(cost=None, hits=4)
+    measured = dict(v41_graph(cost=3 << 20, hits=0, key_id=99), shape="(9999, 1)")
+    result = MODULE.generate([v41_trace(graphs=[replay]), v41_trace(graphs=[measured])],
+                             "deepseek_v41", layout=1)
+    assert result["ranks"][0]["reserve_base_bytes"] == 4 << 20
+    measured["capture_bytes"] = None
+    with pytest.raises(ValueError, match="capture_bytes.*every trace"):
+        MODULE.generate([v41_trace(graphs=[replay]), v41_trace(graphs=[measured])],
+                        "deepseek_v41", layout=1)
 
 
 @pytest.mark.parametrize("value", [None, True, False, -1, 1.5, "1"])

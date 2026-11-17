@@ -7,12 +7,12 @@
       "ranks": [
         {
           "rank": 0,
-          "reserve_base_bytes": 3630170112,
+          "reserve_base_bytes": 2371878912,
           "reserve_extra_bytes": 2097152,
           "entries": [
             {
               "rows": 1,
-              "pin": false
+              "pin": true
             },
             {
               "rows": 2,
@@ -20,11 +20,11 @@
             },
             {
               "rows": 3,
-              "pin": false
+              "pin": true
             },
             {
               "rows": 4,
-              "pin": false
+              "pin": true
             },
             {
               "rows": 5,
@@ -36,7 +36,7 @@
             },
             {
               "rows": 7,
-              "pin": false
+              "pin": true
             },
             {
               "rows": 8,
@@ -47,15 +47,7 @@
               "pin": false
             },
             {
-              "rows": 10,
-              "pin": false
-            },
-            {
               "rows": 11,
-              "pin": false
-            },
-            {
-              "rows": 12,
               "pin": false
             },
             {
@@ -79,19 +71,11 @@
               "pin": false
             },
             {
-              "rows": 18,
-              "pin": false
-            },
-            {
               "rows": 19,
               "pin": false
             },
             {
               "rows": 20,
-              "pin": false
-            },
-            {
-              "rows": 21,
               "pin": false
             },
             {
@@ -119,10 +103,6 @@
               "pin": false
             },
             {
-              "rows": 28,
-              "pin": false
-            },
-            {
               "rows": 29,
               "pin": false
             },
@@ -139,23 +119,7 @@
               "pin": false
             },
             {
-              "rows": 33,
-              "pin": false
-            },
-            {
-              "rows": 34,
-              "pin": false
-            },
-            {
-              "rows": 35,
-              "pin": false
-            },
-            {
               "rows": 36,
-              "pin": false
-            },
-            {
-              "rows": 37,
               "pin": false
             },
             {
@@ -163,35 +127,11 @@
               "pin": false
             },
             {
-              "rows": 39,
-              "pin": false
-            },
-            {
-              "rows": 40,
-              "pin": false
-            },
-            {
-              "rows": 41,
-              "pin": false
-            },
-            {
-              "rows": 42,
-              "pin": false
-            },
-            {
               "rows": 43,
               "pin": false
             },
             {
-              "rows": 44,
-              "pin": false
-            },
-            {
               "rows": 45,
-              "pin": false
-            },
-            {
-              "rows": 46,
               "pin": false
             },
             {
@@ -200,10 +140,6 @@
             },
             {
               "rows": 48,
-              "pin": false
-            },
-            {
-              "rows": 49,
               "pin": false
             },
             {
@@ -221,6 +157,30 @@
             {
               "rows": 55,
               "pin": false
+            },
+            {
+              "rows": 56,
+              "pin": false
+            },
+            {
+              "rows": 57,
+              "pin": false
+            },
+            {
+              "rows": 61,
+              "pin": false
+            },
+            {
+              "rows": 62,
+              "pin": false
+            },
+            {
+              "rows": 63,
+              "pin": false
+            },
+            {
+              "rows": 64,
+              "pin": false
             }
           ],
           "prefill_entries": [
@@ -232,22 +192,42 @@
           "draft_entries": [
             {
               "requests": 1,
-              "width": 5,
+              "width": 7,
               "pin": true
             },
             {
               "requests": 2,
-              "width": 5,
+              "width": 7,
+              "pin": false
+            },
+            {
+              "requests": 3,
+              "width": 7,
               "pin": false
             },
             {
               "requests": 4,
-              "width": 5,
+              "width": 7,
+              "pin": false
+            },
+            {
+              "requests": 5,
+              "width": 7,
+              "pin": false
+            },
+            {
+              "requests": 6,
+              "width": 7,
+              "pin": false
+            },
+            {
+              "requests": 7,
+              "width": 7,
               "pin": false
             },
             {
               "requests": 8,
-              "width": 5,
+              "width": 7,
               "pin": false
             }
           ]
@@ -259,12 +239,12 @@
       "ranks": [
         {
           "rank": 0,
-          "reserve_base_bytes": 1625292800,
+          "reserve_base_bytes": 1470103552,
           "reserve_extra_bytes": 2097152,
           "entries": [
             {
               "rows": 1,
-              "pin": false
+              "pin": true
             },
             {
               "rows": 2,
@@ -280,7 +260,7 @@
             },
             {
               "rows": 5,
-              "pin": true
+              "pin": false
             },
             {
               "rows": 6,
@@ -324,10 +304,6 @@
             },
             {
               "rows": 16,
-              "pin": false
-            },
-            {
-              "rows": 17,
               "pin": false
             },
             {
@@ -395,19 +371,7 @@
               "pin": false
             },
             {
-              "rows": 34,
-              "pin": false
-            },
-            {
               "rows": 35,
-              "pin": false
-            },
-            {
-              "rows": 36,
-              "pin": false
-            },
-            {
-              "rows": 37,
               "pin": false
             },
             {
@@ -435,10 +399,6 @@
               "pin": false
             },
             {
-              "rows": 44,
-              "pin": false
-            },
-            {
               "rows": 45,
               "pin": false
             },
@@ -452,10 +412,6 @@
             },
             {
               "rows": 48,
-              "pin": false
-            },
-            {
-              "rows": 49,
               "pin": false
             },
             {
@@ -481,6 +437,26 @@
             {
               "rows": 57,
               "pin": false
+            },
+            {
+              "rows": 60,
+              "pin": false
+            },
+            {
+              "rows": 61,
+              "pin": false
+            },
+            {
+              "rows": 62,
+              "pin": false
+            },
+            {
+              "rows": 63,
+              "pin": false
+            },
+            {
+              "rows": 64,
+              "pin": false
             }
           ],
           "prefill_entries": [
@@ -489,52 +465,16 @@
               "pin": true
             }
           ],
-          "draft_entries": [
-            {
-              "requests": 1,
-              "width": 5,
-              "pin": true
-            },
-            {
-              "requests": 2,
-              "width": 5,
-              "pin": false
-            },
-            {
-              "requests": 3,
-              "width": 5,
-              "pin": false
-            },
-            {
-              "requests": 4,
-              "width": 5,
-              "pin": false
-            },
-            {
-              "requests": 5,
-              "width": 5,
-              "pin": false
-            },
-            {
-              "requests": 7,
-              "width": 5,
-              "pin": false
-            },
-            {
-              "requests": 8,
-              "width": 5,
-              "pin": false
-            }
-          ]
+          "draft_entries": []
         },
         {
           "rank": 1,
-          "reserve_base_bytes": 1279262720,
+          "reserve_base_bytes": 1497366528,
           "reserve_extra_bytes": 2097152,
           "entries": [
             {
               "rows": 1,
-              "pin": false
+              "pin": true
             },
             {
               "rows": 2,
@@ -550,7 +490,7 @@
             },
             {
               "rows": 5,
-              "pin": true
+              "pin": false
             },
             {
               "rows": 6,
@@ -594,10 +534,6 @@
             },
             {
               "rows": 16,
-              "pin": false
-            },
-            {
-              "rows": 17,
               "pin": false
             },
             {
@@ -665,19 +601,7 @@
               "pin": false
             },
             {
-              "rows": 34,
-              "pin": false
-            },
-            {
               "rows": 35,
-              "pin": false
-            },
-            {
-              "rows": 36,
-              "pin": false
-            },
-            {
-              "rows": 37,
               "pin": false
             },
             {
@@ -705,10 +629,6 @@
               "pin": false
             },
             {
-              "rows": 44,
-              "pin": false
-            },
-            {
               "rows": 45,
               "pin": false
             },
@@ -722,10 +642,6 @@
             },
             {
               "rows": 48,
-              "pin": false
-            },
-            {
-              "rows": 49,
               "pin": false
             },
             {
@@ -751,6 +667,26 @@
             {
               "rows": 57,
               "pin": false
+            },
+            {
+              "rows": 60,
+              "pin": false
+            },
+            {
+              "rows": 61,
+              "pin": false
+            },
+            {
+              "rows": 62,
+              "pin": false
+            },
+            {
+              "rows": 63,
+              "pin": false
+            },
+            {
+              "rows": 64,
+              "pin": false
             }
           ],
           "prefill_entries": [
@@ -762,37 +698,42 @@
           "draft_entries": [
             {
               "requests": 1,
-              "width": 5,
+              "width": 7,
               "pin": true
             },
             {
               "requests": 2,
-              "width": 5,
+              "width": 7,
               "pin": false
             },
             {
               "requests": 3,
-              "width": 5,
+              "width": 7,
               "pin": false
             },
             {
               "requests": 4,
-              "width": 5,
+              "width": 7,
               "pin": false
             },
             {
               "requests": 5,
-              "width": 5,
+              "width": 7,
+              "pin": false
+            },
+            {
+              "requests": 6,
+              "width": 7,
               "pin": false
             },
             {
               "requests": 7,
-              "width": 5,
+              "width": 7,
               "pin": false
             },
             {
               "requests": 8,
-              "width": 5,
+              "width": 7,
               "pin": false
             }
           ]
