@@ -94,7 +94,7 @@ impl Model {
     fn open(checkpoint: &Checkpoint) -> Result<Self> {
         let cfg = KimiK3Config::from_hf(&checkpoint.config)?;
         let vision_shapes=if checkpoint.config.get("vision_config").is_some() {
-            crate::families::kimi_k3::vision::VisionContract::from_config(&checkpoint.config)?.tensor_shapes()
+            crate::families::kimi_k3::vision::VisionContract::from_config(&checkpoint.config)?.tensor_shapes().into_iter().collect::<BTreeMap<_,_>>()
         }else{BTreeMap::new()};
         cfg.release_geometry()?;
         let (h, v, d) = (cfg.hidden, cfg.vocab_size, cfg.kda_heads * cfg.kda_head_dim);
