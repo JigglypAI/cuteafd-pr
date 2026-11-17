@@ -457,7 +457,7 @@ mod tests {
                 let cp = Checkpoint::open(source.path())?;
                 let cfg = plan::families::step5::Config::parse(&cp)?;
                 let tensors = cp.tensors.iter().map(|tensor| testing::t(&tensor.meta.name,
-                    match tensor.meta.dtype {
+                    match &tensor.meta.dtype {
                         cuteafd_core::DType::Bf16 => "BF16", cuteafd_core::DType::F32 => "F32",
                         cuteafd_core::DType::I16 => "I16", cuteafd_core::DType::I32 => "I32",
                         cuteafd_core::DType::U8 => "U8", other => panic!("{other:?}"),
