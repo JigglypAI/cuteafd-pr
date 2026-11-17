@@ -464,7 +464,7 @@ mod tests {
         free: u64,
     ) -> Result<AdmittedV41, Refusal> {
         let total = 96 << 30;
-        let geometry = crate::serving_capacity::deepseek_v41_cache_geometry(config, ranks)?;
+        let geometry = crate::serving_capacity::deepseek_v41_cache_geometry(config, ranks).unwrap();
         let slopes = geometry.ranks.iter().map(|rank| rank.persistent_unit_bytes).collect::<Vec<_>>();
         let budgets = admission::live_budgets(&vec![(total, total, free); ranks], &vec![64 << 30; 4])?;
         let input = ProductionInput {
