@@ -201,13 +201,17 @@ pub struct RoleReadiness {
 #[derive(Debug, Clone, Serialize)]
 pub struct SolvedPhaseLedger {
     pub served_context_tokens: u64,
+    pub draft_home: Option<u8>,
+    pub draft_traffic_bytes_per_cycle: u64,
     pub budgets: Vec<crate::placement::planner::Budget>,
     pub phases: Vec<crate::placement::planner::PhaseBudget>,
 }
 
 impl From<&crate::placement::planner::ResolvedPlan> for SolvedPhaseLedger {
     fn from(plan: &crate::placement::planner::ResolvedPlan) -> Self {
-        Self { served_context_tokens: plan.served_context(), budgets: plan.budgets.clone(), phases: plan.phases.clone() }
+        Self { served_context_tokens: plan.served_context(), draft_home: plan.decisions.draft_home,
+            draft_traffic_bytes_per_cycle: plan.decisions.draft_traffic_bytes_per_cycle,
+            budgets: plan.budgets.clone(), phases: plan.phases.clone() }
     }
 }
 
@@ -216,6 +220,10 @@ impl SolvedPhaseLedger {
         use crate::placement::planner::{Baseline, Device, Domain};
         use std::fmt::Write;
         let _ = writeln!(out, "served context: {} tokens", self.served_context_tokens);
+        if let Some(home) = self.draft_home {
+            let _ = writeln!(out,"drafter home: coordinator GPU {home}; cross-GPU traffic: {} bytes/cycle",
+                self.draft_traffic_bytes_per_cycle);
+        }
         for budget in &self.budgets {
             let Some(peak) = self.phases.iter().filter(|row| row.budget == budget.id)
                 .reduce(|peak, row| if u128::from(row.owned) + u128::from(row.opaque)
