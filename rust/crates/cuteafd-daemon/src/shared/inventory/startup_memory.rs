@@ -357,7 +357,7 @@ mod tests {
         let snapshot = root.path().join("snapshot");
         cuteafd_loader::plan::testing::write_step5_exl3_snapshot(&snapshot);
         let checkpoint = Checkpoint::open(&snapshot)?;
-        let inputs = RuntimeInputs { vision: None, spark_bytes: cuteafd_loader::plan::testing::SimulatedHost::raptor().layout().spark_capacities(8), graph_layout: None, decode_graphs: false,
+        let inputs = RuntimeInputs { vision: None, spark_owners: Vec::new(), spark_bytes: cuteafd_loader::plan::testing::SimulatedHost::raptor().layout().spark_capacities(8), graph_layout: None, decode_graphs: false,
             bf16_target_head: cuteafd_loader::placement::planner::serving::BlasHead::TensorLt,
             host: HostInputs::default(), resident_weight_limit: None,
             spark_reply_format: cuteafd_core::SparkReplyFormat::Bf16,
@@ -366,7 +366,7 @@ mod tests {
                 reserve_bytes: 0, baseline: Baseline::Measured { free_bytes: 96 << 30 } }; 2],
                 spark_ranks: 6, peer_access: true },
             rows: 64, waves: 1, unit: 64, sequences: 16,
-            context: 262144, serving_context: ServingContext::pinned(262144), requested_pool: Some(262144),
+            context: 262144, serving_context: ServingContext::pinned(262144), requested_pool: Some(262144), target_pool: None,
             marks: MarkRule { lanes: 16, entries: 0, budget_bytes: 0, host: true },
             peer_diagnostics: false, pending_code: vec![0; 2], onboard: None,
         };

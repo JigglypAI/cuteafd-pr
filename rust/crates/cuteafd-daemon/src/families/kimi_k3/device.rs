@@ -186,6 +186,13 @@ fn packing_inventory(core: Option<&serde_json::Value>, native: &[String])
     }
     // The drafter consumes each member's private context after packed target work.
     add("kimik3_mla_draft_output_m64".into(), SequenceLocal)?;
+    for name in ["kimik3_mla_draft_output_fp8_weights_m64",
+        "kimik3_mla_draft_producer_fp8_weights_m64", "kimik3_mla_draft_producer_fp8_weights_fp8_m64",
+        "kimik31_mla_draft_output_fp8_weights_causal_h96_m64",
+        "kimik31_mla_draft_producer_fp8_weights_causal_h96_m64",
+        "kimik31_mla_draft_producer_fp8_weights_causal_h96_fp8_m64"] {
+        add(name.into(), SequenceLocal)?;
+    }
     add("kimik3_mla_draft_lse_combine2".into(), SequenceLocal)?;
     for cache in ["", "_fp8"] {
         add(format!("kimik3_mla_draft_producer{cache}_m64"), SequenceLocal)?;
@@ -196,6 +203,7 @@ fn packing_inventory(core: Option<&serde_json::Value>, native: &[String])
     }
     add("kimik3_attn_res_c1_keep_append".into(), PackedRows)?;
     for candidates in 2..=9 {
+        add(format!("kimik3_attn_res_stream_c{candidates}"), PackedRows)?;
         for prefix in ["add", "replace", "keep"] {
             add(format!("kimik3_attn_res_c{candidates}_{prefix}"), PackedRows)?;
         }
@@ -2497,11 +2505,14 @@ impl TokenIo<'_> {
         })
     }
 
-    pub(crate) fn inject_probe(&self, media: &cuteafd_engine::media::RequestMedia,
-        start: usize, rows: usize, offset: usize, output: CuteafdDeviceBuffer) -> Result<()> {
-        let output = view(output, offset * self.layout.hidden * 2, rows * self.layout.hidden * 2)?;
-        self.stream.device.run(|| crate::shared::probe::still::inject(&self.stream, output,
-            media, start, rows, self.layout.hidden, false))
+    pub(crate) fn inject_media(&self,media:&cuteafd_engine::media::RequestMedia,start:usize,rows:usize,
+        offset:usize,output:CuteafdDeviceBuffer,scratch:CuteafdDeviceBuffer)->Result<()> {
+        let end=start.checked_add(rows).context("Kimi media span extent")?;
+        if media.needed(start,end).next().is_none(){return Ok(());}
+        let mut chunk=cuteafd_engine::media::MediaChunk::default();media.write_chunk(start,end,&mut chunk)?;
+        let output=view(output,offset*self.layout.hidden*2,rows*self.layout.hidden*2)?;
+        let ids=self.ids.as_ref().context("Kimi image injection IDs absent")?.buffer;
+        crate::shared::vision::still::inject(&self.stream,&chunk,scratch,ids,output,rows,self.layout.hidden)
     }
 
     /// Wide scoring retains all admitted outputs, but reuses the ordinary
@@ -2601,6 +2612,39 @@ impl Ops for Pending {
 mod packing_inventory_tests {
     use super::*;
     use crate::shared::prefill_packing::ProgramRows::{PackedRows, SequenceLocal};
+
+    #[test]
+    fn installed_kimi_programs_equal_runtime_required_packing_inventory() -> Result<()> {
+        let path = std::env::var_os("CUTEAFD_DEPLOYMENT_TEST_PROGRAMS")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::PathBuf::from(std::env::var_os("HOME").expect("HOME"))
+                .join(".cache/cuteafd/builds/placement-inputs/current/share/PROGRAMS.json"));
+        let manifest: serde_json::Value = serde_json::from_slice(&std::fs::read(&path)
+            .with_context(|| format!("required installed PROGRAMS.json: {}", path.display()))?)?;
+        let programs = manifest["programs"].as_array().context("installed program inventory")?;
+        for core in [false, true] {
+            let metadata = core.then_some(&manifest["families"]["dense_trellis_k6"]);
+            let catalogue = packing_inventory(metadata, &[])?;
+            let required = programs.iter().map(|program| program["name"].as_str()
+                .context("installed program name")).collect::<Result<Vec<_>>>()?
+                .into_iter().filter(|name| packing_program(name, core))
+                .collect::<std::collections::BTreeSet<_>>();
+            ensure!(!required.is_empty(), "installed Kimi program group is empty");
+            let classified = classify_packing_inventory(required.iter().copied(), &catalogue)?;
+            assert_eq!(required, classified.iter().map(|(name, _)| *name).collect(),
+                "installed Kimi required/classified program sets differ (core={core})");
+            let roles = classified.into_iter().collect::<BTreeMap<_, _>>();
+            for candidates in 2..=9 {
+                let name = format!("kimik3_attn_res_stream_c{candidates}");
+                assert_eq!(roles.get(name.as_str()), Some(&PackedRows), "{name}");
+                let missing = catalogue.iter().filter(|(entry, _)| entry != &name)
+                    .cloned().collect::<Vec<_>>();
+                assert!(classify_packing_inventory(required.iter().copied(), &missing).is_err(),
+                    "an unclassified export must fail the gate: {name}");
+            }
+        }
+        Ok(())
+    }
 
     #[test]
     fn context_draft_exports_are_sequence_local_in_both_target_inventories() -> Result<()> {

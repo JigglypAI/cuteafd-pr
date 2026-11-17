@@ -975,6 +975,121 @@ fn boot_concurrency_full_plan_matrix() {
     }
 }
 
+fn assert_pool_max_growth(input: &BudgetedPlanInput, options: &PlanOptions) {
+    use cuteafd_core::memory_policy::MemoryPolicy;
+    let default = MemoryPolicy::default().scoped(|| input.plan(options)).unwrap();
+    assert!(default.fits && default.placement_supported, "{}", render(&default));
+    let target = default.phase_ledger.as_ref().unwrap().pool_policy.unwrap().target();
+    let capped = MemoryPolicy { kv_max: Some(target), ..Default::default() }
+        .scoped(|| input.plan(options)).unwrap();
+    let physical = |report: &PlanReport| {
+        let mut memory = report.memory_layout.clone().unwrap();
+        // Muse reports elapsed solve time in notes; it is not an owner or placement.
+        memory.notes.retain(|note| !note.starts_with("Muse shared solve "));
+        memory
+    };
+    assert_eq!(physical(&default), physical(&capped), "default max must be byte-identical");
+    let grown = MemoryPolicy { kv_max: Some(100_000_000), ..Default::default() }
+        .scoped(|| input.plan(options)).unwrap();
+    assert!(grown.fits && grown.placement_supported, "{}", render(&grown));
+    assert_eq!(grown.onboard_layers, capped.onboard_layers, "KV growth must not displace onboarding");
+    assert_eq!(grown.prefill_unit_rows, capped.prefill_unit_rows);
+    assert_eq!(grown.prefill_waves, capped.prefill_waves);
+    let pool = |report: &PlanReport| report.memory_layout.as_ref().unwrap().pool_tokens;
+    assert!(pool(&grown) > pool(&capped), "{}: {} -> {}", default.family.as_deref().unwrap(), pool(&capped), pool(&grown));
+    assert!(pool(&grown) <= 100_000_000);
+    println!("{}: KV {} -> {}, onboarding {:?} -> {:?}", default.family.as_deref().unwrap(),
+        pool(&capped), pool(&grown), capped.onboard_layers, grown.onboard_layers);
+    let mut exact = options.clone();
+    exact.layout.as_mut().unwrap().pool_tokens = Some(pool(&capped));
+    let pinned = MemoryPolicy { kv_max: Some(100_000_000), ..Default::default() }
+        .scoped(|| input.plan(&exact)).unwrap();
+    assert!(pinned.fits && pinned.placement_supported, "{}", render(&pinned));
+    assert_eq!(pool(&pinned), pool(&capped), "explicit pools must not grow");
+}
+
+#[test]
+fn pool_max_grows_after_onboarding_in_every_family_planner() {
+    let mut cases = shared_wave_snapshots();
+    cases.retain(|(family, _)| *family != "qwen4");
+    cases.push(("deepseek_v41", strict_v41_snapshot(false)));
+    cases.push(("mimo_v2", snapshot(mimo_flash_config(), &mimo_flash_tensors())));
+    for (family, dir) in cases {
+        let mut options = wave_plan_options(dir.path(), 4);
+        options.layout.as_mut().unwrap().pool_tokens = None;
+        if family == "deepseek_v41" {
+            options.layout.as_mut().unwrap().workspace_manifest = v41_workspace(dir.path());
+        }
+        let input = BudgetedPlanInput::open(dir.path()).unwrap();
+        assert_pool_max_growth(&input, &options);
+        if family == "mimo_v2" {
+            let mut small = options.clone();
+            small.layout.as_mut().unwrap().rtx_bytes = vec![32 << 30];
+            let report = input.plan(&small).unwrap();
+            assert_eq!(report.phase_ledger.as_ref().unwrap().pool_policy.unwrap().target(), 1 << 20);
+            assert_pool_max_growth(&input, &small);
+        }
+    }
+    let (dir, manifest) = qwen4_matrix_snapshot();
+    let mut options = wave_plan_options(dir.path(), 4);
+    options.layout.as_mut().unwrap().pool_tokens = None;
+    options.layout.as_mut().unwrap().workspace_manifest = Some(manifest);
+    assert_pool_max_growth(&BudgetedPlanInput::open(dir.path()).unwrap(), &options);
+
+    let dir = families::step5::tests::exl3_snapshot();
+    let manifest = testing::step5_native_manifest(dir.path());
+    testing::install_step5_exl3_rtx_package(&manifest);
+    let mut options = wave_plan_options(dir.path(), 3);
+    options.draft_ownership = Some(spec::DraftOwnership::None);
+    options.layout.as_mut().unwrap().rtx_bytes = vec![crate::placement::inventory::PRO_TOTAL_BYTES; 2];
+    options.layout.as_mut().unwrap().context_tokens = 262_144;
+    options.layout.as_mut().unwrap().prefix_slots = None;
+    options.layout.as_mut().unwrap().pool_tokens = None;
+    options.layout.as_mut().unwrap().workspace_manifest = Some(manifest);
+    assert_pool_max_growth(&BudgetedPlanInput::open(dir.path()).unwrap(), &options);
+
+    for family in ["kimi_k3", "muse_spark"] {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = if family == "kimi_k3" {
+            write_kimi_snapshot(dir.path(), true);
+            write_kimi_installed_inventory(dir.path(), false)
+        } else {
+            write_muse_spark_snapshot(dir.path(), &(0..62).collect::<Vec<_>>());
+            write_muse_exl3_capacities(dir.path())
+        };
+        let mut options = wave_plan_options(dir.path(), if family == "kimi_k3" { 6 } else { 4 });
+        options.vision = MediaMode::Off;
+        let layout = options.layout.as_mut().unwrap();
+        layout.pool_tokens = None;
+        layout.rtx_bytes = vec![crate::placement::inventory::PRO_TOTAL_BYTES; 2];
+        layout.workspace_manifest = Some(manifest);
+        assert_pool_max_growth(&BudgetedPlanInput::open(dir.path()).unwrap(), &options);
+    }
+    let (dir, manifest) = families::minimax::tests::onboarding_matrix_snapshot();
+    let mut options = wave_plan_options(dir.path(), 4);
+    options.attention_placement = None;
+    let layout = options.layout.as_mut().unwrap();
+    layout.pool_tokens = None;
+    layout.onboard = Some(crate::placement::OnboardSetting::Auto);
+    layout.workspace_manifest = Some(manifest);
+    let package = dir.path().join("fp8/fp8-minimax-nvfp4a4");
+    std::fs::create_dir_all(package.join("tp1")).unwrap();
+    std::fs::create_dir_all(package.join("tp2")).unwrap();
+    let native = json!({"abi_version":6,"projection":"bf16","activation":"swigluoai",
+        "swiglu_limit":7.0,"swiglu_alpha":1.702,"swiglu_beta":1.0,"weights":"nvfp4a4",
+        "capacities":[{"capacity":4096,"scratch_bytes":4096}]});
+    std::fs::write(package.join("manifest.json"), json!({"layouts":{"tp1":native,"tp2":native}}).to_string()).unwrap();
+    let input = BudgetedPlanInput::open(dir.path()).unwrap();
+    let baseline = input.plan(&options).unwrap();
+    assert!(baseline.onboard_layers.is_some_and(|layers| layers > 0), "{:?}", baseline.hints);
+    assert_pool_max_growth(&input, &options);
+
+    // Dense Qwen already indexes the type's full extent, not maximum_tokens.
+    let (dir, mut options, _, _) = crate::families::qwen3_5::tests::native_planner_fixture();
+    options.layout.as_mut().unwrap().pool_tokens = None;
+    assert_pool_max_growth(&BudgetedPlanInput::open(dir.path()).unwrap(), &options);
+}
+
 #[test]
 fn boot_concurrency_full_plan_matrix_muse_spark() {
     let dir = tempfile::tempdir().unwrap();
@@ -3646,7 +3761,7 @@ fn qwen_spark_encoder_candidate_enforces_its_physical_budget() {
         vision: MediaMode::Spark(Some(0)),
         layout: Some(layout::LayoutOptions {
             host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram), host_cache_bytes: Some(0),
-            rtx_bytes: vec![crate::placement::inventory::PRO_TOTAL_BYTES], pool_tokens: Some(32768), target_pool_tokens: 32768,
+            rtx_bytes: vec![crate::placement::inventory::PRO_TOTAL_BYTES], pool_tokens: Some(32768), target_pool_tokens: Some(32768),
             onboard: Some(crate::placement::OnboardSetting::Layers(1)), ..Default::default()
         }), ..sparks(1)
     };
@@ -3913,7 +4028,7 @@ fn glm5_flash_selected_working_set_drives_plan_request_and_runtime_buffers() {
         let report = plan(dir.path(), &options).unwrap();
         assert!(report.placement_supported, "{}", render(&report));
         let opts = options.layout.as_ref().unwrap();
-        let input = glmf::GlmfInputs {
+        let input = glmf::GlmfInputs { target_pool_tokens: None,
             blas_head: crate::placement::planner::serving::BlasHead::TensorLt,
         resident_weight_limit: None, spark_reply_format: cuteafd_core::SparkReplyFormat::Bf16, context: crate::placement::planner::Context::pinned(opts.context_tokens), attention: Default::default(), cfg: &cfg, layers: cfg.layers, local_tp2_exl3: false,
             gpus: opts.rtx_bytes.iter().map(|&total| (total, Baseline::Planned {
@@ -3941,6 +4056,7 @@ fn glm5_flash_selected_working_set_drives_plan_request_and_runtime_buffers() {
         process.serving(&input, 0, 0, 0, 0).unwrap();
         process.spark_link(&input, checkpoint.spark_input_is_bf16()).unwrap();
         let selected = glmf::admission::prepare(&input, 188, true, process).unwrap().admit().unwrap();
+        assert_eq!(report.phase_ledger.as_ref().unwrap().pool_policy, selected.solved.pool_policy);
         let (placed, working) = (&selected.placement, &selected.working);
         assert_eq!(working.rtx_layers.len(), expected_rtx);
         assert_eq!(placed.onboard_layers, expected_rtx);
@@ -4212,8 +4328,8 @@ fn glm5_flash_index_layout_pool_matches_runtime_geometry() {
                         let geometry = glm_flash_rank_cache_geometry_rows(&cfg, cfg.layers, gpus,
                             served_index, 4, rows).unwrap();
                         let unit = geometry.logical_unit_rows;
-                        let mut served_pool = crate::placement::PoolPolicy::resolve(&vec![24 << 30; gpus],
-                            131_072, None, 256).target;
+                        let mut served_pool = crate::placement::prepare_pool(crate::placement::PoolFacts::new(&vec![24 << 30; gpus],
+                            131_072, None, 256)).unwrap().target();
                         let pieces = crate::serving_capacity::glm_flash_mla_unit_pieces(served_index,
                             AttentionPlacement::Heads);
                         for (device, rank) in memory.devices.iter().filter(|d| d.kind == cuteafd_core::memory_layout::DeviceKind::Rtx)
@@ -5569,7 +5685,7 @@ fn encoder_plan_g9_charges_before_pool_and_hashes_off() {
     let mut tensors = mimo_flash_tensors();
     tensors.push(t("visual.patch_embed.proj.weight", "BF16", &[1280,3,2,16,16]));
     let dir = snapshot_tp(cfg, &tensors, Some(1));
-    let options = PlanOptions { layout: Some(layout::LayoutOptions { host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram), rtx_bytes: vec![crate::placement::inventory::PRO_TOTAL_BYTES], target_pool_tokens: 32_768, ..Default::default() }), ..Default::default() };
+    let options = PlanOptions { layout: Some(layout::LayoutOptions { host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram), rtx_bytes: vec![crate::placement::inventory::PRO_TOTAL_BYTES], target_pool_tokens: Some(32_768), ..Default::default() }), ..Default::default() };
     let spark = plan(dir.path(), &options).unwrap();
     assert!(matches!(spark.encoder.as_ref().unwrap().kind, EncoderKind::Spark { .. }));
     let local = plan(dir.path(), &PlanOptions { vision: MediaMode::Rtx(Some(0)), ..options.clone() }).unwrap();
@@ -5967,7 +6083,7 @@ fn qwen_image_cap_is_visible_and_auto_preserves_zero_spark_kv() {
     let dir = snapshot(cfg.clone(), &tensors);
     write_quantize_config(dir.path(), &manifest);
     let options = PlanOptions { placement: ExpertPlacement::Local, layout: Some(layout::LayoutOptions { host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram),
-        rtx_bytes: vec![crate::placement::inventory::PRO_TOTAL_BYTES], pool_tokens: Some(32768), target_pool_tokens: 32768,
+        rtx_bytes: vec![crate::placement::inventory::PRO_TOTAL_BYTES], pool_tokens: Some(32768), target_pool_tokens: Some(32768),
         ..Default::default()
     }), ..Default::default() };
     let auto = plan(dir.path(), &options).unwrap();
@@ -6797,7 +6913,7 @@ fn mimo_and_qwen_all_onboarded_preserve_media_only_spark_and_refuse_unavailable_
             host_cache_bytes: Some(0),
             rtx_bytes: vec![crate::placement::inventory::PRO_TOTAL_BYTES],
             pool_tokens: Some(32768),
-            target_pool_tokens: 32768,
+            target_pool_tokens: Some(32768),
             onboard: Some(crate::placement::OnboardSetting::Layers(1)),
             ..Default::default()
         }),

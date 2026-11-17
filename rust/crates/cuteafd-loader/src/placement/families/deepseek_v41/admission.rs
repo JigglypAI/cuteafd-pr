@@ -564,9 +564,7 @@ pub fn adopt_measured(
     let tails = slots
         .checked_add(retained_turns.checked_mul(2).ok_or(Refusal::Overflow("V4.1 retained turns"))?)
         .ok_or(Refusal::Overflow("V4.1 private tails"))?;
-    let maximum = maximum_pool_tokens
-        .div_ceil(plan.pool_page_rows)
-        .min(131_072u64.saturating_sub(tails));
+    let maximum = maximum_pool_tokens.div_ceil(plan.pool_page_rows);
     // Zero is a measurement too: an owner with no bytes is not a charge.
     for occupant in measured {
         let location = Location::coordinator(occupant.gpu);
@@ -1153,8 +1151,8 @@ pub struct ProductionInput<'a> {
     pub gpus: usize,
     /// Smallest pool the layout admits, in page tokens.
     pub context: u64,
-    /// Largest indexable pool request, in page tokens.
-    pub maximum_pool_tokens: u64,
+    /// One shared policy prepared before describing owners.
+    pub pool: crate::placement::PoolPolicy,
     pub prefill: PrefillShape,
     /// Concurrent sequences whose private source tables and tails are charged.
     pub concurrency: u64,
@@ -1190,6 +1188,7 @@ pub struct ProductionInput<'a> {
 }
 
 pub struct PreparedV41<'a> {
+    pub pool: crate::placement::PoolPolicy,
     pub recipe: V41Recipe<'a>,
     budgets: Vec<Budget>,
     /// Compulsory local routed layers; a smaller solved prefix is refused.
@@ -1239,7 +1238,7 @@ impl<'a> ProductionInput<'a> {
         if !(1..=2).contains(&self.gpus)
             || routed != 40
             || self.context == 0
-            || self.maximum_pool_tokens < self.context
+            || self.pool.maximum_tokens() < self.context
             || self.spark_ranks > 8
             || !(1..=cuteafd_core::V41_MAX_REQUESTS as u64).contains(&self.concurrency)
             || self.retained_turns > 128
@@ -1266,13 +1265,10 @@ impl<'a> ProductionInput<'a> {
                     .ok_or(Refusal::Overflow("V4.1 retained turns"))?,
             )
             .ok_or(Refusal::Overflow("V4.1 private tails"))?;
-        let maximum_pages = self
-            .maximum_pool_tokens
-            .div_ceil(512)
-            .min(131_072u64.saturating_sub(tails));
+        let maximum_pages = self.pool.maximum_tokens().div_ceil(512);
         if maximum_pages == 0 || self.context.div_ceil(512) > maximum_pages {
             return Err(Refusal::PoolBelowContext {
-                tokens: self.maximum_pool_tokens,
+                tokens: self.pool.maximum_tokens(),
                 context: self.context,
             });
         }
@@ -1407,7 +1403,7 @@ impl<'a> ProductionInput<'a> {
             });
         }
         let minimum = self.onboard_minimum;
-        Ok(PreparedV41 { recipe, budgets: self.budgets, minimum })
+        Ok(PreparedV41 { pool: self.pool, recipe, budgets: self.budgets, minimum })
     }
 }
 
@@ -1446,7 +1442,7 @@ pub fn draft_owners(draft: &DraftInventory, gpus: usize) -> Result<Vec<Owner>, R
 
 impl PreparedV41<'_> {
     pub fn admit(self, request: Request) -> Result<AdmittedV41, Refusal> {
-        let solved = crate::placement::planner::solve(request, self.budgets, &self.recipe)?;
+        let solved = crate::placement::planner::solve_prepared(request, self.budgets, &self.recipe, &self.pool)?;
         let count = solved
             .decisions
             .onboard_layers
@@ -1997,7 +1993,7 @@ mod measured_adoption_tests {
             baseline: Baseline::Forecast { occupied: 0, source: "test".into(), assumed: false },
             headroom: 0,
         }];
-        let plan = ResolvedPlan {
+        let plan = ResolvedPlan { pool_policy: None,
             encoder_diagnostics: Vec::new(),
             request: production_request(1024u64, None, crate::placement::Onboard::Auto,
                 PrefillShape { rows: 1, waves: 1 }, Operation::Serving, 0,

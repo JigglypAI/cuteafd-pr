@@ -74,6 +74,7 @@ pub struct FactsRequest<'a> {
     /// Explicit context, or 0 for the checkpoint's maximum.
     pub context_tokens: u64,
     pub pool_tokens: Option<u64>,
+    pub target_pool_tokens: Option<u64>,
     pub sequences: u64,
     pub host: (u64, u64),
     pub host_cache_bytes: Option<u64>,
@@ -404,12 +405,15 @@ pub fn gather(request: &FactsRequest<'_>) -> Result<MiniMaxInputs, Refused> {
             geometry.chunk_bytes()).unwrap_or(0);
         serving::HostPrefixOwners { quota_bytes: quota, chunk_bytes: geometry.chunk_bytes().min(quota.max(1)) }
     };
-    let physical = (0..gpus).map(|gpu| request.coordinator.physical(gpu)).collect::<Vec<_>>();
-    let maximum_pool_tokens = crate::placement::PoolPolicy::resolve(&physical, context, request.pool_tokens,
-        shared::PAGE_ROWS).maximum_tokens();
+    let capacities = (0..gpus).map(|gpu| request.coordinator.budget(gpu).logical_bytes).collect::<Vec<_>>();
+    let mut pool_facts = crate::placement::PoolFacts::new(&capacities,
+        Context::resolve(context, (request.context_tokens > 0).then_some(request.context_tokens)), request.pool_tokens, shared::PAGE_ROWS);
+    pool_facts.target = request.target_pool_tokens;
+    let pool = crate::placement::prepare_pool(pool_facts).map_err(|error|
+        refused(format!("invalid KV pool policy: {error}"), "Set KV min <= target <= max."))?;
     Ok(MiniMaxInputs { cfg: cfg.clone(), gpus, attention, split_wire: request.split_wire, spark_ranks: ranks,
         context: Context::resolve(context, (request.context_tokens > 0).then_some(request.context_tokens)),
-        maximum_pool_tokens, prefill: shape, sequences: request.sequences, targets, owners,
+        pool, prefill: shape, sequences: request.sequences, targets, owners,
         manifest: request.manifest.clone(), routed: routed.clone(), expert_backings, local, spark, links,
         spark_ingress: ingress,
         spark_reply_formats: request.replies, drafter: request.drafter.as_ref().map(|native| shared::Drafter {

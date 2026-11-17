@@ -144,6 +144,7 @@ struct Inner {
     error: OnceLock<String>,
     terminal: AtomicU64,
     retired: OnceLock<f64>,
+    retirement: tokio::sync::Notify,
 }
 /// Opaque, cloneable handle usable by gateway and engine admission tickets.
 #[derive(Clone)]
@@ -189,6 +190,7 @@ impl UsageHandle {
             error: OnceLock::new(),
             terminal: AtomicU64::new(0),
             retired: OnceLock::new(),
+            retirement: tokio::sync::Notify::new(),
         }))
     }
     pub fn rid(&self) -> &str {
@@ -260,6 +262,22 @@ impl UsageHandle {
         let _ = self.0.retired.set(self.0.start.elapsed().as_secs_f64() * 1000.);
         if reason == "cancelled" { self.stop(reason); }
         if reason == "failed" { self.engine_error("worker"); }
+        self.0.retirement.notify_waiters();
+    }
+    /// Finish can reach the response parser before the engine tallies its last round.
+    pub async fn wait_retired(&self) -> Result<(), String> {
+        if self.0.admit.get().is_none() { return Ok(()); }
+        let wait = async {
+            loop {
+                let notified = self.0.retirement.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                if self.0.retired.get().is_some() { return; }
+                notified.await;
+            }
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(30), wait).await
+            .map_err(|_| "engine did not retire request before final usage".to_owned())
     }
     /// A websocket turn owns a distinct row and never retains the connection scope.
     pub fn child(&self, protocol: &str) -> Self {
@@ -301,6 +319,12 @@ impl UsageHandle {
         self.0.proposed.fetch_add(proposed, Relaxed);
         self.0.accepted.fetch_add(accepted, Relaxed);
         self.0.rounds.fetch_add(1, Relaxed);
+    }
+    /// Request-local engine counters; never subtract concurrent global totals.
+    pub fn speculation(&self) -> Option<serde_json::Value> {
+        let proposed = self.0.proposed.load(Relaxed);
+        (proposed > 0).then(|| serde_json::json!({"request_id":self.rid(), "proposed":proposed,
+            "accepted":self.0.accepted.load(Relaxed), "cycles":self.0.rounds.load(Relaxed)}))
     }
     pub fn finished(&self, status: u16) {
         self.0.status.store(status.into(), Relaxed);
@@ -896,6 +920,38 @@ pub(crate) mod tests {
         assert_eq!(session_hash("private-user").len(), 16);
         assert_ne!(session_hash("private-user"), "private-user");
     }
+    #[tokio::test]
+    async fn final_speculation_waits_for_engine_retirement_without_lost_wakeup() {
+        let scope = UsageHandle::new(Record::default(), Arc::new(Sink::default()));
+        scope.admitted(1);
+        let waiter = scope.clone();
+        let task = tokio::spawn(async move { waiter.wait_retired().await.unwrap(); waiter.speculation() });
+        tokio::task::yield_now().await;
+        assert!(!task.is_finished());
+        scope.round(5,3);
+        scope.retired(5,"finished");
+        assert_eq!(task.await.unwrap().unwrap()["accepted"],3);
+        scope.wait_retired().await.unwrap();
+    }
+
+    #[test]
+    fn request_speculation_is_exact_for_an_isolated_c1_interval() {
+        let sink = Arc::new(Sink::default());
+        let scope = UsageHandle::new(Record { rid:"c1".into(), ..Default::default() }, sink);
+        assert!(scope.speculation().is_none());
+        let mut global = (0u64,0u64,0u64);
+        let before = global;
+        for (proposed,accepted) in [(5,3),(4,2),(0,0)] {
+            scope.round(proposed,accepted);
+            global.0 += proposed; global.1 += accepted; global.2 += 1;
+        }
+        let request = scope.speculation().unwrap();
+        assert_eq!(request["request_id"],"c1");
+        assert_eq!(request["proposed"],global.0-before.0);
+        assert_eq!(request["accepted"],global.1-before.1);
+        assert_eq!(request["cycles"],global.2-before.2);
+    }
+
     #[test]
     fn engine_retirement_rounds_and_child_lifetimes() {
         let sink = Arc::new(Sink::default());

@@ -579,24 +579,15 @@ pub(super) fn resolve_with_owners(
     let context = serving_context.maximum;
     let totals = memory.iter().map(|&(_, total)| total as u64).collect::<Vec<_>>();
     let tails = args.concurrency as u64 + 2 * args.resolved_prefix_entries() as u64;
-    let mut pool = PoolPolicy::resolve(
-        &totals,
-        context,
-        args.pool_tokens,
-        512);
-    if let Some(bytes) = args.kv_pool_size.filter(|_| args.pool_tokens.is_none()) {
+    let requested = if let Some(bytes) = args.kv_pool_size.filter(|_| args.pool_tokens.is_none()) {
         let groups = bytes.0 as u64 / (5 * 256 * 356);
-        ensure!(
-            groups > tails && groups <= 131072,
-            "explicit KV byte pool is outside physical/admission limits"
-        );
-        pool = PoolPolicy::resolve(
-            &totals,
-            context,
-            Some((groups - tails) * 512),
-            512);
-    }
-    pool = pool.with_context(serving_context);
+        ensure!(groups > tails && groups <= 131072,
+            "explicit KV byte pool is outside physical/admission limits");
+        Some((groups - tails) * 512)
+    } else { args.pool_tokens };
+    let mut facts = cuteafd_loader::placement::PoolFacts::new(&totals, serving_context, requested, 512);
+    facts.encoding_limit = Some(131_072u64.saturating_sub(tails) * 512);
+    let pool = cuteafd_loader::placement::prepare_pool(facts)?;
     // An explicit pool below the pinned context is the first typed refusal;
     // zero and an omitted pool both selected automatic admission above.
     pool.validate_explicit()?;
@@ -687,7 +678,7 @@ pub(super) fn resolve_with_owners(
         config: &config,
         gpus: ranks,
         context,
-        maximum_pool_tokens: pool.maximum_tokens(),
+        pool,
         prefill,
         concurrency: args.concurrency as u64,
         retained_turns: args.resolved_prefix_entries() as u64,
@@ -711,7 +702,7 @@ pub(super) fn resolve_with_owners(
     };
     let request = production_request(
         serving_context,
-        pool.requested,
+        pool.requested(),
         onboard,
         prefill,
         Operation::Serving,
@@ -1349,6 +1340,42 @@ mod admission_tests {
                 assert_eq!(result?.placement.pool_tokens, tokens as u64);
             }
         }
+        Ok(())
+    }
+
+    #[test]
+    fn public_plan_and_runtime_share_resolved_policy_before_and_after_growth() -> Result<()> {
+        use cuteafd_core::memory_policy::MemoryPolicy;
+        use cuteafd_loader::plan::{self, layout::LayoutOptions, testing, ExpertPlacement, MediaMode, PlanOptions};
+        let dir = tempfile::tempdir()?;
+        testing::write_v41_snapshot(dir.path());
+        let manifest = testing::write_v41_workspaces(dir.path());
+        let input = testing::BudgetedPlanInput::open(dir.path())?;
+        let mut args = args(dir.path());
+        args.max_context_tokens = 262_144;
+        args.rtx_expert_layers = LocalLayers::Count(0);
+        args.pool_tokens = None;
+        args.concurrency = 16;
+        args.prefix.prefix_cache_entries = 0;
+        let options = PlanOptions { placement: ExpertPlacement::Sparks { ranks: 4 },
+            vision: MediaMode::Off, audio: MediaMode::Off,
+            layout: Some(LayoutOptions { rtx_bytes: vec![96 << 30], context_tokens: 262_144,
+                onboard: Some(OnboardSetting::Layers(0)), host_cache_bytes: Some(0), prefix_slots: Some(0),
+                mimo_prefix_entries: 0, workspace_manifest: Some(manifest),
+                host_memory: Some(testing::SimulatedHost::raptor().host_ram), ..Default::default() }),
+            ..Default::default() };
+        let run = |max| MemoryPolicy { kv_max: Some(max), ..Default::default() }.scoped(|| -> Result<_> {
+            let report = input.plan(&options)?;
+            ensure!(report.fits, "{}", plan::render(&report));
+            let runtime = resolve(&args, &[(80usize << 30, 96usize << 30)], no_experts(), 0, &[0], 0, None)?;
+            assert_eq!(report.phase_ledger.as_ref().context("V4.1 planned policy")?.pool_policy,
+                runtime.solved.pool_policy);
+            Ok(runtime)
+        });
+        let before = run(2 << 20)?;
+        let after = run(100_000_000)?;
+        assert!(after.placement.pool_tokens > before.placement.pool_tokens);
+        assert_eq!(after.placement.onboard_layers, before.placement.onboard_layers);
         Ok(())
     }
 

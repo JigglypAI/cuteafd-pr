@@ -330,13 +330,13 @@ fn with_backend<T>(args: &ServeArgs,
     let reserve = cuteafd_loader::placement::reserve::gpu("step5");
     let graph_layout = cuteafd_loader::serving_capacity::step5_graphs::Step5GraphLayout::resolve(
         &catalog, &contract, ids.len(), args.peers.len());
-    let mut inputs = RuntimeInputs { vision: None, spark_bytes: cuteafd_loader::serving_capacity::spark_memory::runtime_bytes(&args.peers.iter().map(ToString::to_string).collect::<Vec<_>>())?, graph_layout, decode_graphs: args.decode_graphs, bf16_target_head: crate::shared::target_head::TargetHead::configured().blas_head(true),
+    let mut inputs = RuntimeInputs { vision: None, spark_owners: Vec::new(), spark_bytes: cuteafd_loader::serving_capacity::spark_memory::runtime_bytes(&args.peers.iter().map(ToString::to_string).collect::<Vec<_>>())?, graph_layout, decode_graphs: args.decode_graphs, bf16_target_head: crate::shared::target_head::TargetHead::configured().blas_head(true),
         host: Default::default(), resident_weight_limit: Some(crate::shared::memory::budget::resident_weight_limit()), spark_reply_format: cuteafd_core::SparkReplyFormat::resolve(cuteafd_core::spark_reply::requested().prefill, false), kv_format: args.kv_cache, inventory: Inventory { gpus: measured.baselines(&[]).into_iter()
         .map(|(capacity_bytes, baseline)| GpuBudget { capacity_bytes, baseline, reserve_bytes: reserve }).collect(),
         spark_ranks: args.peers.len(), peer_access: ids.len() == 2 }, rows: usize::try_from(shape.span_rows)?,
         waves: usize::from(args.prefill_waves), unit: args.prefill_rows as usize,
         sequences: usize::from(args.max_sequences), context: args.max_context, serving_context,
-        requested_pool: args.pool_tokens,
+        requested_pool: args.pool_tokens, target_pool: None,
         marks: admission::prefix_marks(&args.prefix, usize::from(args.max_sequences)),
         peer_diagnostics: cuteafd_loader::serving_capacity::peer_wait_diagnostics(), pending_code,
         onboard: cuteafd_loader::plan::families::step5::admission::OnboardInputs::new(&catalog,
@@ -348,6 +348,7 @@ fn with_backend<T>(args: &ServeArgs,
             crate::shared::prefix::budget::HostBudget::Auto => None,
             crate::shared::prefix::budget::HostBudget::Bytes(bytes) => Some(bytes),
         }, args.prefix.host_cache_headroom_bytes)?;
+    inputs.spark_owners = cuteafd_loader::plan::families::step5::admission::spark_owners(&catalog, &inputs)?;
     inputs.vision = cuteafd_loader::placement::still_encoder::StillEncoder::planned(&checkpoint,
         args.vision.vision, args.vision.vision_replicas, &cuteafd_loader::placement::families::step5::budgets(&inputs)?,
         args.vision.media_cache_bytes.map_or(256 << 20, |bytes| bytes.0 as u64))?;
@@ -907,10 +908,10 @@ mod tests {
         args.validate()?;
         assert_eq!(args.max_context, 262_144);
         assert_eq!(args.pool_tokens, Some(args.max_context));
-        let policy = cuteafd_loader::placement::PoolPolicy::resolve(
-            &[96 << 30; 2], args.max_context, args.pool_tokens, 64);
+        let policy = cuteafd_loader::placement::prepare_pool(cuteafd_loader::placement::PoolFacts::new(
+            &[96 << 30; 2], args.max_context, args.pool_tokens, 64)).unwrap();
         policy.validate_explicit()?;
-        assert_eq!(policy.compiled_context, args.max_context);
+        assert_eq!(policy.compiled_context(), args.max_context);
         assert!(args.max_context >= 640 + u64::from(args.mtp));
         Ok(())
     }
@@ -950,13 +951,13 @@ mod tests {
         let capacity = placement::inventory::PRO_TOTAL_BYTES;
         let arch = placement::inventory::ArchContext::coordinator(capacity, None);
         let selected = ProgramSet::from_names(&["step5", "step52"], programs.names());
-        let mut inputs = RuntimeInputs { vision: None, spark_bytes: cuteafd_loader::plan::testing::SimulatedHost::raptor().layout().spark_capacities(8), graph_layout: None, decode_graphs: false, bf16_target_head: crate::shared::target_head::TargetHead::configured().blas_head(true),
+        let mut inputs = RuntimeInputs { vision: None, spark_owners: Vec::new(), spark_bytes: cuteafd_loader::plan::testing::SimulatedHost::raptor().layout().spark_capacities(8), graph_layout: None, decode_graphs: false, bf16_target_head: crate::shared::target_head::TargetHead::configured().blas_head(true),
             host: Default::default(), resident_weight_limit: None, spark_reply_format: cuteafd_core::SparkReplyFormat::Bf16,
                 kv_format: args.kv_cache,
             inventory: Inventory { gpus: vec![GpuBudget { capacity_bytes: capacity,
                 baseline: Baseline::Measured { free_bytes: capacity - arch.context_bytes },
                 reserve_bytes: 0 }; 2], spark_ranks: 6, peer_access: true },
-            rows: 256, waves: 1, unit: 0, sequences: 16, context: args.max_context, serving_context: cuteafd_loader::placement::planner::Context::pinned(args.max_context), requested_pool: None,
+            rows: 256, waves: 1, unit: 0, sequences: 16, context: args.max_context, serving_context: cuteafd_loader::placement::planner::Context::pinned(args.max_context), requested_pool: None, target_pool: None,
             marks: admission::prefix_marks(&args.prefix, 16), peer_diagnostics: false,
             pending_code: (0..2).map(|rank| placement::inventory::loaded_code_allowance(
                 "step5", &format.package_name(), true, rank, &arch, Some(&selected)).bytes).collect(),

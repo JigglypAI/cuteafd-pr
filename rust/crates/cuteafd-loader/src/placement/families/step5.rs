@@ -160,6 +160,7 @@ fn scaled(bytes: u64, count: usize) -> Result<u64> {
 
 /// One prepared candidate: the facts the shared planner prices.
 pub struct Step5Recipe<'a> {
+    pub pool: crate::placement::PoolPolicy,
     pub cfg: &'a Config,
     pub inputs: &'a RuntimeInputs,
     pub depth: usize,
@@ -190,7 +191,7 @@ pub struct Step5Recipe<'a> {
 
 impl<'a> Step5Recipe<'a> {
     /// Binds the native owners for every candidate CSA boundary, then keeps
-    /// the boundary whose max per-rank total at the pool ceiling is smallest.
+    /// the boundary whose max per-rank total at the layout target is smallest.
     /// The native bytes come from the same callback execution uses; this is
     /// one family fact, not a second admission.
     pub fn new(
@@ -208,13 +209,13 @@ impl<'a> Step5Recipe<'a> {
             .iter()
             .map(|gpu| gpu.capacity_bytes)
             .collect::<Vec<_>>();
-        let maximum_pages = PoolPolicy::resolve(
-            &capacities,
-            inputs.context,
-            inputs.requested_pool,
-            PAGE_ROWS)
-        .maximum_tokens()
-        .div_ceil(PAGE_ROWS);
+        let mut facts = crate::placement::PoolFacts::new(
+            &capacities, inputs.serving_context, inputs.requested_pool, PAGE_ROWS);
+        facts.target = inputs.target_pool;
+        let pool = crate::placement::prepare_pool(facts)?;
+        pool.validate_explicit()?;
+        let maximum_pages = pool.maximum_tokens().div_ceil(PAGE_ROWS);
+        let layout_pages = pool.requested().unwrap_or(pool.target()).div_ceil(PAGE_ROWS);
         ensure!(maximum_pages > 0, "Step-5 empty pool ceiling");
         let prefill = PrefillShape {
             rows: inputs.unit_rows() as u64,
@@ -228,7 +229,7 @@ impl<'a> Step5Recipe<'a> {
             let admitted = native(&ownership)?;
             let figures = Self::figures(cfg, inputs, depth, &ownership, &admitted, maximum_pages)?;
             let score = (0..gpus as u8)
-                .map(|rank| figures.total(rank, maximum_pages))
+                .map(|rank| figures.total(rank, layout_pages))
                 .collect::<Result<Vec<_>>>()?
                 .into_iter()
                 .max()
@@ -271,6 +272,7 @@ impl<'a> Step5Recipe<'a> {
                 inputs.host.memory.0, host_geometry.chunk_bytes()).context("Step-5 host prefix geometry")?
         };
         Ok(Self {
+            pool,
             host_geometry, host_cache_bytes,
             cfg,
             inputs,
@@ -773,6 +775,28 @@ impl Recipe for Step5Recipe<'_> {
             }
         }
         self.expert_components(&mut contract, onboard)?;
+        for (count, ranks) in self.inputs.spark_owners.iter().enumerate() {
+            if ranks.len() != self.inputs.inventory.spark_ranks {
+                return Err(Refusal::InvalidFact("Step-5 remote owner rank count".into()));
+            }
+            let activation = onboard.map_or_else(Activation::always, |variable| Activation::choice(variable, count));
+            for (rank, items) in ranks.iter().enumerate() {
+                let location = Location { device: Device::Spark(rank as u8), domain: Domain::Managed };
+                for (index, item) in items.iter().enumerate() {
+                    let owner = Allocation::buffer(format!("step5.spark.{count}.{rank}.{index}"), location,
+                        item.bytes, Lifetime::RESIDENT, item.category, &item.group);
+                    if item.category == Category::Experts {
+                        contract.components.push(Component { activation: activation.clone(),
+                            bytes: ByteCurve::fixed(item.bytes, self.maximum_pages),
+                            kind: ComponentKind::DriverPageTables { model: DriverPageTableModel::Sm121Arena,
+                                location, lifetime: owner.lifetime, backing: owner.id.clone() } });
+                    }
+                    contract.components.push(Component { activation: activation.clone(),
+                        ..Component::allocation(owner, ByteCurve::fixed(item.bytes, self.maximum_pages),
+                            false, self.maximum_pages) });
+                }
+            }
+        }
         if let Some(vision) = &self.inputs.vision {
             vision.extend(&mut contract.variables, &mut contract.components, self.maximum_pages)?;
             vision.require_spark_worker(&contract.variables, &mut contract.requires);

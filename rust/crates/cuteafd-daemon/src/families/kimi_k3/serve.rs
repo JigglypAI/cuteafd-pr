@@ -8,6 +8,7 @@ use cuteafd_loader::families::kimi_k3::COMPILED_CONTEXT;
 
 #[derive(Debug, Clone, clap::Args)]
 pub(crate) struct ServeArgs {
+    #[command(flatten)] pub media: crate::shared::vision::still::Options,
     #[command(flatten)]
     pub(crate) attention: crate::cli::CoreViewArgs,
     /// Target and drafter share the exact selected MLA record.
@@ -117,7 +118,7 @@ pub(super) fn startup_options<'a, const RANKS: usize>(args: &'a ServeArgs,
     -> Result<startup::Options<'a, RANKS>> {
     let draft = args.draft.as_ref().map(|snapshot| super::draft::Options {
         snapshot: snapshot.clone(), fp8: args.draft_fp8, tp2_dflash: args.tp2_dflash, cache_format: args.kv_cache, draft_kv_cache: args.draft_kv_cache });
-    Ok(startup::Options { role: startup::Role::Serve,
+    Ok(startup::Options { media: Some(&args.media), role: startup::Role::Serve,
         expert_usage: args.expert_usage, expert_usage_reader: args.expert_usage_reader.clone(),
         cache_format: args.kv_cache, devices, native_lib: &args.native_lib, manifest: &args.manifest,
         attention: cuteafd_loader::placement::attention::parse(&args.attention_placement).map_err(anyhow::Error::msg)?,
@@ -147,11 +148,11 @@ pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
     })).context("Kimi serving requires --model-id for a snapshot without HF identity")?;
     let mut profile = ModelProfile::new(model, ModelEncoding::Kimi(encoding));
     profile.expert_usage = args.expert_usage_reader.clone();
-    profile = crate::shared::probe::still::install(profile, &args.snapshot, cuteafd_loader::media::ImageFamily::Kimi)?;
+
     let (queue, mut receive) = tokio::sync::mpsc::channel::<NativeRequest>(cuteafd_core::concurrency::queue_depth(args.max_sequences as u64) as usize);
     let stats = Arc::new(Mutex::new(serde_json::Value::Null));
     let worker_stats = stats.clone();
-    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<Result<usize>>();
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<Result<(usize,Option<Arc<cuteafd_api::openai::media::MediaPreparer>>,Option<Arc<std::sync::atomic::AtomicBool>>)>>();
     let worker_args = args.clone();
     let worker = tokio::task::spawn_blocking(move || -> Result<()> {
         let mut ready = Some(ready_tx);
@@ -188,7 +189,9 @@ pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
             let physical_devices = std::iter::once(worker_args.device).chain(worker_args.split_device).collect::<Vec<_>>();
             crate::shared::memory_report::release_load_staging(&library)?;
             loaded.engine.configure_packing(worker_args.prefill_packing)?;
-            let backend = KimiBackend::new(&loaded.engine)?;
+            let backend = KimiBackend::new(&loaded.engine)?.with_media_enabled(loaded.media.preparer.is_some());
+            let image=loaded.media.preparer.clone();let health=loaded.media.encoder.health_handle();
+            let mut media=cuteafd_engine::media::MediaAdmission::new(cuteafd_engine::media::EmbeddingCache::new(loaded.media.cache_bytes),loaded.media.encoder,16);
             {
                 cuteafd_bench::context::set_resolved("prefill-scoring", "streamed");
             }
@@ -202,14 +205,14 @@ pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
                     None => scheduler::Drafts::None,
                 }, worker_args.draft_length, eos, worker_args.decode_share, &worker_args.prefix,
                 worker_args.loop_abort.config(), worker_args.token_io.token_select,
-                &mut crate::shared::probe::still::admission(), None, || {
+                &mut media, None, || {
                     loaded.engine.require_live()?;
                     crate::shared::inventory::RuntimeInventory::measure(&library,
                         &physical_devices,
                         crate::shared::inventory::InventoryPhase::PostLoad, |_| Ok(()))?
                         .record("kimi_k3-serving-loaded", &loaded.admission_free);
                     if let Some(ready) = ready.take() {
-                        let _ = ready.send(Ok(backend.geometry().max_context));
+                        let _ = ready.send(Ok((backend.geometry().max_context,image,health)));
                     }
                     Ok(())
                 })
@@ -218,7 +221,8 @@ pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
             ready.take().expect("pending readiness").send(Err(error)).map_err(|result| match result { Err(error) => error, Ok(_) => unreachable!("sent an error") })
         })
     });
-    let compiled_context = ready_rx.await.context("Kimi worker exited before readiness")??;
+    let (compiled_context,image,health) = ready_rx.await.context("Kimi worker exited before readiness")??;
+    if let Some(image)=image {profile=profile.with_grouped_vision(image);profile.vision_health=health;}
     let limits = args.api_limits(compiled_context)?;
     tracing::info!(api_max_context = limits.context(), compiled_max_context = compiled_context,
         "Kimi API and compiled context limits");

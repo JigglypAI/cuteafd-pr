@@ -376,6 +376,20 @@ mod serving_tests {
         Ok(())
     }
 
+    #[test]
+    fn local_tower_replans_combined_raw_records_without_appending_rank_sets() -> Result<()> {
+        let buffer=cuteafd_ffi::CuteafdDeviceBuffer {ptr:std::ptr::dangling_mut::<u8>().cast(),bytes:2,device_id:0,flags:0};
+        let finish=dense::Finish::RowNorms {source:buffer,norms:buffer,rows:1,cols:1};
+        let base=dense::Records {finishes:vec![finish.clone()],..Default::default()};
+        let media=dense::Records {finishes:vec![finish],..Default::default()};
+        let actual=compose_media_plans((vec![10,20],vec![30,40]),base,media,|records| {
+            assert_eq!(records.finishes.len(),2,"target and local tower raw records must share one rank planner");
+            Ok((vec![11,21],vec![31,41]))
+        })?;
+        assert_eq!(actual,(vec![11,21],vec![31,41]));
+        Ok(())
+    }
+
     fn facts(targets: &[CoordinatorWeights], experts: &[ExpertBacking]) -> Result<Facts> {
         let mut facts = Facts { phase_order: PhaseOrder::TARGET_THEN_DRAFT,
             resident_weights: vec![], allocations: vec![], deferred: vec![], sequential: vec![],

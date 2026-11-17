@@ -58,6 +58,8 @@ fn serve_media(command: &mut Commands) -> Option<ServeMedia<'_>> {
             vision: &mut args.vision.vision, audio: None }),
         Commands::ServeMimo(args) => Some(ServeMedia { snapshot: &args.engine.snapshot,
             vision: &mut args.vision, audio: Some(&mut args.audio) }),
+        Commands::ServeKimi(args) => Some(ServeMedia { snapshot: &args.snapshot,
+            vision: &mut args.media.vision, audio: None }),
         Commands::ServeMinimax(args) => Some(ServeMedia { snapshot: &args.snapshot,
             vision: &mut args.media.vision, audio: None }),
         Commands::ServeMuse(args) => Some(ServeMedia { snapshot: &args.snapshot,

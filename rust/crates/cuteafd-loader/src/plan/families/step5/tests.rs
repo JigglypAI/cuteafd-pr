@@ -144,14 +144,14 @@ fn full_context_mtp_forecast_charges_private_predictors_before_allocation() -> a
     let arch = ArchContext::coordinator(capacity, None);
     for kv_format in [crate::families::qwen4::Qwen4KvCache::Bf16,
         crate::families::qwen4::Qwen4KvCache::Fp8] {
-        let inputs = RuntimeInputs { vision: None, spark_bytes: crate::plan::testing::SimulatedHost::raptor().layout().spark_capacities(8), graph_layout: None, decode_graphs: false, bf16_target_head: crate::placement::planner::serving::BlasHead::TensorLt,
+        let inputs = RuntimeInputs { vision: None, spark_owners: Vec::new(), spark_bytes: crate::plan::testing::SimulatedHost::raptor().layout().spark_capacities(8), graph_layout: None, decode_graphs: false, bf16_target_head: crate::placement::planner::serving::BlasHead::TensorLt,
             host: Default::default(), resident_weight_limit: None, spark_reply_format: cuteafd_core::SparkReplyFormat::Bf16,
             kv_format,
             inventory: Inventory { gpus: vec![GpuBudget { capacity_bytes: capacity,
                 baseline: Baseline::Planned { context_bytes: arch.context_bytes, loaded_bytes: 0 },
                 reserve_bytes: 1 << 30 }; 2], spark_ranks: 6, peer_access: true },
             rows: 256, waves: 1, unit: 0, sequences: 16, context: 1_048_576, serving_context: crate::placement::planner::Context::pinned(1_048_576),
-            requested_pool: Some(1_048_576),
+            requested_pool: Some(1_048_576), target_pool: None,
             marks: MarkRule { lanes: 16, entries: 20, budget_bytes: 2 << 30, host: true },
             pending_code: (0..2).map(|rank| inventory::loaded_code_allowance(
                 "step5", "step5:fp8", true, rank, &arch, Some(&programs)).bytes).collect(),
@@ -728,9 +728,23 @@ fn card_memory_conclusions_and_request_vs_pool_extent() {
     let pinned = report_context(dir.path(), 2, 96, 6, Some(262_144), 1_048_576);
     assert!(!pinned.wip_launchable());
     assert!(pinned.hints.iter().any(|h| h.what.contains("explicit KV pool of 262144 tokens is below the compiled/max-context floor of 1048576 tokens")), "{:?}", pinned.hints);
-    for (gpus, gib, ranks) in [(1,96,6), (1,32,6), (2,96,4), (2,96,0)] {
+    // The joint solver can fit TP4 by moving 19 routed layers to the RTX pair.
+    // The KV target is not a floor: 501376 tokens still covers a 256K request.
+    let tp4 = report(dir.path(), 2, 96, 4, None);
+    assert!(tp4.wip_launchable() && tp4.native_serving_admitted, "{:?}", tp4.hints);
+    assert_eq!(tp4.onboard_layers, Some(19));
+    let memory = tp4.memory_layout.as_ref().unwrap();
+    assert_eq!(memory.pool_tokens, 501_376);
+    let sparks = memory.devices.iter().filter(|device|
+        device.kind == cuteafd_core::memory_layout::DeviceKind::Spark).collect::<Vec<_>>();
+    assert_eq!(sparks.len(), 4);
+    for device in sparks {
+        assert_eq!(device.used_bytes(), 123_761_553_312);
+        assert!(device.used_bytes() <= device.capacity_bytes);
+    }
+    for (gpus, gib, ranks) in [(1,96,6), (1,32,6), (2,96,0)] {
         let r = report(dir.path(), gpus, gib, ranks, None);
-        assert!(!r.wip_launchable() && !r.native_serving_admitted);
+        assert!(!r.wip_launchable() && !r.native_serving_admitted, "{gpus} RTX x{gib}GiB +{ranks}: {:?}", r.hints);
         if ranks == 0 {
             assert!(r.hints.iter().any(|h| h.what.contains("no local expert package for step5")), "{:?}", r.hints);
             assert!(r.hints.iter().any(|h| h.what.contains("memory budget 'rtx0'")), "{:?}", r.hints);
@@ -769,12 +783,16 @@ fn nvfp4_min_card_admits_native_w4a4_and_bf16_root_stays_reference_only() {
         assert!(result.wip_launchable() && result.native_serving_admitted, "{:?}", result.hints);
         assert!(result.executable());
         assert_eq!(result.min_spark_ranks, Some(4));
+        let rendered = plan::render(&result);
+        let routed = rendered.lines().find(|line| line.starts_with("routed_expert")).unwrap();
+        assert!(routed.contains("nvfp4-g16") && routed.contains("bf16"), "{routed}");
+        assert!(result.experts.as_ref().unwrap().package.contains("step5:nvfp4"));
         let memory = result.memory_layout.unwrap();
         assert_eq!(memory.devices.len(), 5);
         if let Some(tokens) = pool {
             assert_eq!(memory.pool_tokens, tokens);
         } else {
-            let target = crate::placement::PoolPolicy::resolve(&[96 << 30], context, None, 64).target;
+            let target = crate::placement::prepare_pool(crate::placement::PoolFacts::new(&[96 << 30], context, None, 64)).unwrap().target();
             assert!((context..=target).contains(&memory.pool_tokens));
             // More free capacity must grow the same default-format pool to its cap.
             let roomy = report_context(dir.path(), 1, 160, 4, None, context);
@@ -794,7 +812,11 @@ fn nvfp4_min_card_admits_native_w4a4_and_bf16_root_stays_reference_only() {
             depth: 8, slot_bytes: 8 << 20, alignment: 4096 };
         let lane_rings = endpoint.ring_bytes(cuteafd_core::ExpertGeometry::STEP5, rings).unwrap();
         for device in &memory.devices[1..] {
-            assert!(device.items.iter().any(|item| item.format == "W4A4"));
+            assert_eq!(device.kind, cuteafd_core::memory_layout::DeviceKind::Spark);
+            let experts: u64 = device.items.iter().filter(|item|
+                item.category == cuteafd_core::memory_layout::Category::Experts).map(|item| item.bytes).sum();
+            assert!(experts > 0, "{} has no admitted expert weights", device.name());
+            eprintln!("Step-5 NVFP4 {}: expert_bytes={experts} total_bytes={}", device.name(), device.used_bytes());
             let mapped = device.items.iter().find(|item| item.group == "rdma rings").unwrap();
             assert_eq!(mapped.bytes, lane_rings as u64, "one main transport endpoint");
         }
