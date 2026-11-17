@@ -1132,22 +1132,53 @@ def image_prefix_attempt(url, dest):
                 exact_bodies.append((label, dict(model=model, messages=messages, max_tokens=32,
                     reasoning_effort='none', temperature=0, stream=False)))
         for label, body in exact_bodies:
+            # A next-turn prompt inherits decode-produced KV from its turn ancestor. Cold
+            # prefill may round differently; compare restore to its own captured state.
+            reference = None
+            if label == 'next-turn':
+                reference = http(url, '/v1/bench/probe', dict(body=body,
+                    spec=dict(no_speculation=True, pair_exempt=True, record_state=True,
+                              record_rows=1, top_k=5)), timeout=600)
+                save(dest / f'image-prefix-{variant}-{label}-reference.json', reference)
             probes = []
-            for cold in [True, False]:
+            for name, cold in [('cold', True), ('warm', False)] + ([('warm-repeat', False)] if reference else []):
                 reply = http(url, '/v1/bench/probe', dict(body=body,
-                    spec=dict(cold=cold, no_speculation=True, pair_exempt=True)), timeout=600)
-                save(dest / f'image-prefix-{variant}-{label}-{"cold" if cold else "warm"}.json', reply)
+                    spec=dict(cold=cold, no_speculation=True, pair_exempt=True,
+                              record_state=reference is not None, record_rows=1, top_k=5)), timeout=600)
+                save(dest / f'image-prefix-{variant}-{label}-{name}.json', reply)
                 record = reply.get('probe') or {}
                 if record.get('cold') is not cold or record.get('no_speculation') is not True:
                     raise ValueError(f'{variant}/{label}: engine did not honor exact probe switches')
                 if not record.get('generated'):
                     raise ValueError(f'{variant}/{label}: exact probe omitted generated token IDs')
                 probes.append(record)
-            if probes[0]['generated'] != probes[1]['generated']:
-                raise ValueError(f'{variant}/{label}: cold/warm image output token IDs differ')
+            if reference is None:
+                if probes[0]['generated'] != probes[1]['generated']:
+                    raise ValueError(f'{variant}/{label}: cold/warm image output token IDs differ')
+            else:
+                image_next_turn_fidelity(reference['probe'], probes[1], probes[2])
             if probes[1].get('cached_tokens', 0) < len(probes[0].get('prompt_ids') or []):
                 raise ValueError(f'{variant}/{label}: exact image prompt was not fully restored')
     return results
+
+
+def image_next_turn_fidelity(reference, warm, repeat):
+    """Restore identity is relative to the capture, not a differently rounded cold prefill."""
+    def state(record, kind):
+        rows = [s for s in record.get('states', []) if s['kind'] == kind]
+        if len(rows) != 1:
+            raise ValueError(f'next-turn probe requires one {kind} state')
+        return {k: rows[0][k] for k in ('end', 'sha256', 'bytes')}
+    captured = state(reference, 'prompt')
+    for record in (warm, repeat):
+        if state(record, 'restore') != captured or state(record, 'prompt') != captured:
+            raise ValueError('next-turn restored state differs from captured state')
+        if record.get('prompt_ids') != reference.get('prompt_ids'):
+            raise ValueError('next-turn probe prompt IDs differ')
+    if any(warm.get(k) != repeat.get(k) for k in ('generated', 'rows', 'states')):
+        raise ValueError('next-turn warm repeat is not byte-identical')
+    if warm.get('generated') != reference.get('generated') or warm.get('rows') != reference.get('rows'):
+        raise ValueError('next-turn warm output differs from fixed reference')
 
 
 def ready_log(job):

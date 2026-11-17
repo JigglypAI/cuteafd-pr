@@ -4071,11 +4071,14 @@ def test_image_prefix_probe_receipts_and_http_failure(tmp_path, monkeypatch, fai
                 self.wfile.write(json.dumps(dict(exact_token_count=True, input_tokens=count)).encode())
                 return
             if self.path == '/v1/bench/probe':
-                cold = body['spec']['cold']
+                cold = body['spec'].get('cold', False)
                 self.send_response(200)
                 self.end_headers()
+                state = dict(end=3, sha256='capture', bytes=12)
                 self.wfile.write(json.dumps(dict(probe=dict(cold=cold, no_speculation=True,
-                    generated=[7, 8, 9], prompt_ids=[1, 2, 3], cached_tokens=0 if cold else 3))).encode())
+                    generated=[7, 8, 9], prompt_ids=[1, 2, 3], rows=[],
+                    states=[dict(kind='prompt', **state)] + ([] if cold else [dict(kind='restore', **state)]),
+                    cached_tokens=0 if cold else 3))).encode())
                 return
             calls.append(body)
             index = (len(calls) - 1) % 5
@@ -4107,7 +4110,7 @@ def test_image_prefix_probe_receipts_and_http_failure(tmp_path, monkeypatch, fai
                 cards.image_prefix_probe(url, tmp_path)
         else:
             assert len(cards.image_prefix_probe(url, tmp_path)) == 15
-            assert len(list((tmp_path / 'image-prefix-attempt-1').glob('image-prefix-*.json'))) == 30
+            assert len(list((tmp_path / 'image-prefix-attempt-1').glob('image-prefix-*.json'))) == 36
             assert calls[0]['messages'][0]['content'][0] == calls[3]['messages'][0]['content'][0]
             assert len(calls[10]['messages'][0]['content'][0]['text']) > 100_000
             assert len(calls[4]['messages']) == 3
@@ -4137,7 +4140,7 @@ def test_image_prefix_probe_rejects_cold_warm_token_drift(tmp_path, monkeypatch)
         if path == '/v1/responses/input_tokens':
             return dict(exact_token_count=True, input_tokens=1200)
         if path == '/v1/bench/probe':
-            cold = body['spec']['cold']
+            cold = body['spec'].get('cold', False)
             return dict(probe=dict(cold=cold, no_speculation=True, generated=[1 if cold else 2],
                                   prompt_ids=[1], cached_tokens=0 if cold else 1))
         messages = body['messages']
@@ -4165,3 +4168,20 @@ def test_image_prefix_attempts_preserve_failed_verdict_and_receipts(tmp_path, mo
         assert json.loads((path / 'response.json').read_text()) == {'cached_tokens': 7}
         assert json.loads((path / 'verdict.json').read_text()) == {
             'status': 'failed', 'error': 'next-turn exactness injected'}
+
+
+@pytest.mark.parametrize('failure', [None, 'state', 'repeat', 'reference'])
+def test_next_turn_fidelity_checks_capture_and_self_determinism(failure):
+    import copy
+    state = dict(end=40061, sha256='captured', bytes=38370299)
+    reference = dict(prompt_ids=[1, 2], generated=[10240, 1], rows=[{'hash': 'fixed'}],
+                     states=[dict(kind='prompt', **state)])
+    warm = dict(reference, states=[dict(kind='restore', **state), dict(kind='prompt', **state)])
+    repeat = copy.deepcopy(warm)
+    if failure == 'state': warm['states'][0]['sha256'] = 'corrupted'
+    if failure == 'repeat': repeat['generated'] = [16520, 1]
+    if failure == 'reference': reference['generated'] = [16520, 1]
+    if failure:
+        with pytest.raises(ValueError): cards.image_next_turn_fidelity(reference, warm, repeat)
+    else:
+        cards.image_next_turn_fidelity(reference, warm, repeat)
