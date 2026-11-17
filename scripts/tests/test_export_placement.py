@@ -313,6 +313,7 @@ def test_queued_export_releases_seed_and_build_locks_for_serving_ticket(tmp_path
             time.sleep(0.01)
         assert ready.exists()
         script = f"""set -euo pipefail
+staging_dir=/frozen/source
 role=both; wip_reused_coordinator=0; wip_reused_expert=0
 wip_retain_counterpart() {{ :; }}
 wip_build_resource_acquire() {{ exec {{seed_fd}}>'{locks}/kakapo.lock'; flock "$seed_fd"; }}
