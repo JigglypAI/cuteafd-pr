@@ -673,11 +673,14 @@ def test_kimi_nope_mla_exports_both_head_layouts_and_all_modes(exporter, decode_
 
 
 @pytest.mark.parametrize("decode_rows,prefill_rows", [(64, 4096), (128, 2048)])
-def test_kimi_k31_exports_native_dsa_without_changing_k3_or_enabling_a_drafter(exporter, decode_rows, prefill_rows):
+def test_kimi_k31_exports_native_dsa_and_causal_draft_without_changing_k3(exporter, decode_rows, prefill_rows):
     programs = exporter.kimi_k31_programs(GEOMETRY, decode_rows, prefill_rows, 1048576)
     catalog = {stem: (op, params, build) for stem, op, params, build in programs}
     assert len(catalog) == len(programs)
-    assert not any("draft" in stem or "dense_mla" in stem for stem in catalog)
+    assert not any("dense_mla" in stem for stem in catalog)
+    draft_stems = {stem for stem in catalog if "draft" in stem}
+    assert draft_stems == {stem for stem, *_ in exporter.causal_mla_draft_programs(64, 1048576)}
+    assert all("causal" in stem and stem.endswith("_m64") for stem in draft_stems)
     assert {"kda_commit", "lse_combine2", "dsa_candidate_merge"} <= catalog.keys()
     for suffix, row_bytes in [("", 1152), ("_fp8", 656)]:
         module, function, args, kwargs = catalog[f"paged_staging_gather{suffix}"][2]()

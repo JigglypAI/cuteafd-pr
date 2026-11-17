@@ -1264,7 +1264,7 @@ def kimi_k31_programs(g, decode_rows: int, prefill_rows: int, max_context: int):
 
     Keep this inventory separate from K3's dense attention exports: K3's rank
     normalization remains 1e-6, while K3.1 requires 1e-5 in every core view.
-    No K3 drafter is exported here until hidden-state compatibility is qualified.
+    Causal K3.1 drafter exports are separate from the noncausal K3 program set.
     """
     from b12x.integration.cuteafd import context_split, glmf, kimi_dsa, kimi_mla
 
@@ -1322,7 +1322,7 @@ def kimi_k31_programs(g, decode_rows: int, prefill_rows: int, max_context: int):
                     {"row_bytes": record_bytes, "page_rows": PAGE_ROWS},
                     lambda rb=record_bytes: context_split.compile_paged_staging_gather_aot(
                         row_bytes=rb, page_rows=PAGE_ROWS)))
-    out.extend(causal_mla_draft_programs(decode_rows, max_context))
+    out.extend(causal_mla_draft_programs(64, max_context))
     return out
 
 
