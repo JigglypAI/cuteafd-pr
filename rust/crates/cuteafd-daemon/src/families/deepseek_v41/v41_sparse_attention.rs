@@ -50,6 +50,10 @@ pub(crate) struct QueuedSparseAttention {
 /// until sparse graphs are destroyed. No callback may suspend during capture.
 pub(crate) trait AttentionGraphTail {
     fn identity(&self) -> Vec<usize>;
+    // Projection enqueues are host-stateless. Checkpoint the block and both mHC
+    // boundaries, the only host state a tail record can mutate, even partially.
+    fn checkpoint(&self) -> Option<super::v41_block::FfnGraphState>;
+    fn rollback(&mut self, checkpoint: Option<super::v41_block::FfnGraphState>);
     unsafe fn prepare(&mut self, stream: *mut c_void) -> Result<()>;
     unsafe fn enqueue(&mut self, attention: &QueuedSparseAttention, stream: *mut c_void) -> Result<()>;
     unsafe fn restore_warmup(&mut self) -> Result<()>;
@@ -517,6 +521,13 @@ impl<'a,const HEADS:usize> LocalSparseAttentionWave<'a,HEADS> {
             layer: plan.layer, rows: plan.rows })
     }
     unsafe fn capture_plan(&self, plan: &mut ColdSparse, tail: &mut Option<&mut dyn AttentionGraphTail>) -> Result<(*mut c_void, usize, usize, bool)> {
+        let checkpoint = tail.as_ref().and_then(|tail| tail.checkpoint());
+        crate::shared::decode_graph::capture_transaction(tail, checkpoint,
+            // SAFETY: forwarded cold-plan and tail storage contract.
+            |tail| unsafe { self.record_plan(plan, tail) },
+            |tail, checkpoint| { if let Some(tail) = tail { tail.rollback(checkpoint); } })
+    }
+    unsafe fn record_plan(&self, plan: &mut ColdSparse, tail: &mut Option<&mut dyn AttentionGraphTail>) -> Result<(*mut c_void, usize, usize, bool)> {
         unsafe { plan.ticket.capture_result(crate::shared::decode_graph::begin_capture(&self.storage.stream.library, self.storage.stream.raw, &plan.ticket))?; }
         let launched = (|| unsafe {
             self.enqueue(plan.sink, &plan.launches, plan.selected, plan.batch.as_ref())?;

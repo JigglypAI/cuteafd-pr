@@ -220,6 +220,10 @@ struct StartupAttentionTail<'s, 'w, 'a> {
 }
 impl crate::families::deepseek_v41::v41_sparse_attention::AttentionGraphTail for StartupAttentionTail<'_, '_, '_> {
     fn identity(&self) -> Vec<usize> { attention_tail_identity(self.projection, self.block, false) }
+    fn checkpoint(&self) -> Option<super::v41_block::FfnGraphState> { Some(self.block.ffn_graph_state()) }
+    fn rollback(&mut self, checkpoint: Option<super::v41_block::FfnGraphState>) {
+        self.block.restore_ffn_graph_state(checkpoint.expect("startup block checkpoint"));
+    }
     unsafe fn prepare(&mut self, _: *mut std::ffi::c_void) -> Result<()> {
         anyhow::bail!("startup tail must not prepare live request metadata")
     }
@@ -248,6 +252,12 @@ struct AttentionTail<'s, 'w, 'a> {
 impl crate::families::deepseek_v41::v41_sparse_attention::AttentionGraphTail for AttentionTail<'_, '_, '_> {
     fn identity(&self) -> Vec<usize> {
         attention_tail_identity(self.projection, self.block, self.split_output)
+    }
+    fn checkpoint(&self) -> Option<super::v41_block::FfnGraphState> {
+        (!self.split_output).then(|| self.block.ffn_graph_state())
+    }
+    fn rollback(&mut self, checkpoint: Option<super::v41_block::FfnGraphState>) {
+        if let Some(state) = checkpoint { self.block.restore_ffn_graph_state(state); }
     }
     unsafe fn prepare(&mut self, stream: *mut std::ffi::c_void) -> Result<()> {
         unsafe { self.projection.prepare_chain_graph(self.tokens, stream) }
