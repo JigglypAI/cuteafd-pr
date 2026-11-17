@@ -520,6 +520,21 @@ def test_approval_bypass_is_explicit_and_interrupts_are_adapter_specific():
     assert driver.Agy().interrupt_key == 'Escape'
 
 
+def test_agy_always_pins_a_model_and_never_emits_bare_effort():
+    meta = {'executable': 'agy', 'cwd': '/workspace', 'model': None, 'effort': None}
+    # Neither given: the Carbon default, so the CLI cannot pick its own model.
+    assert driver.Agy().command(meta)[-2:] == ['--model', 'gemini-4-carbon-high']
+    # Effort only: mapped onto the matching Carbon model, no bare --effort.
+    for effort in ('high', 'medium', 'low'):
+        cmd = driver.Agy().command(meta | {'effort': effort})
+        assert cmd[-2:] == ['--model', f'gemini-4-carbon-{effort}']
+        assert '--effort' not in cmd
+    # An explicit model still wins unchanged.
+    cmd = driver.Agy().command(meta | {'model': 'gemini-4-argon-low', 'effort': 'high'})
+    assert cmd[-2:] == ['--model', 'gemini-4-argon-low']
+    assert '--effort' not in cmd
+
+
 def test_preamble_and_brief_have_no_project_default(monkeypatch):
     args = driver.parser().parse_args(['start', 'task', '--tool', 'grok'])
     assert args.preamble is None and args.brief is None and not args.auto_approve
@@ -534,10 +549,3 @@ def test_wait_wake_flags_are_wired():
     assert "result['woke'] = 'progress'" in source
     assert "result['woke'] = 'context'" in source
     assert "result['woke'] = 'quiet'" in source
-
-
-def test_agy_pins_carbon_high_unless_model_or_effort_given():
-    meta = {'executable': 'agy', 'cwd': '/w'}
-    assert driver.Agy().command(meta)[-2:] == ['--model', 'gemini-4-carbon-high']
-    assert driver.Agy().command({**meta, 'model': 'gemini-4-argon-high'})[-2:] == ['--model', 'gemini-4-argon-high']
-    assert driver.Agy().command({**meta, 'effort': 'low'})[-2:] == ['--effort', 'low']
