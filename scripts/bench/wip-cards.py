@@ -1029,6 +1029,26 @@ def red_square():
 
 
 def image_prefix_probe(url, dest):
+    """Keep every attempt and its assertion, including a smoke hook's teardown retry."""
+    dest = Path(dest)
+    dest.mkdir(parents=True, exist_ok=True)
+    for number in itertools.count(1):
+        attempt = dest / f'image-prefix-attempt-{number}'
+        try:
+            attempt.mkdir()
+            break
+        except FileExistsError:
+            continue
+    try:
+        result = image_prefix_attempt(url, attempt)
+    except Exception as error:
+        save(attempt / 'verdict.json', dict(status='failed', error=str(error)))
+        raise
+    save(attempt / 'verdict.json', dict(status='pass', requests=result))
+    return result
+
+
+def image_prefix_attempt(url, dest):
     """Divergence after the same image must restore exactly or prefill cold (#2340)."""
     model = http(url, '/v1/models')['data'][0]['id']
     def chunk(tag, data):
@@ -1169,7 +1189,7 @@ def precheck(job):
             if not re.search(r'\bred\b', answer, re.I):
                 raise ValueError('image answer does not identify red')
         if 'image-prefix' in job['probes']:
-            result['image-prefix'] = image_prefix_probe(os.environ['CUTEAFD_SMOKE_URL'], dest)
+            result['image-prefix'] = [image_prefix_probe(os.environ['CUTEAFD_SMOKE_URL'], dest) for _ in range(3)]
         result['status'] = 'pass'
     except Exception as error:
         result.update(status='failed', error=str(error))

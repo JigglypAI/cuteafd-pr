@@ -4100,14 +4100,14 @@ def test_image_prefix_probe_receipts_and_http_failure(tmp_path, monkeypatch, fai
         if fail_fourth:
             with pytest.raises(RuntimeError, match='HTTP 500'):
                 cards.image_prefix_probe(url, tmp_path)
-            assert 'HTTP 500' in json.loads((tmp_path / 'image-prefix-even-image-b.json').read_text())['error']
+            assert 'HTTP 500' in json.loads((tmp_path / 'image-prefix-attempt-1/image-prefix-even-image-b.json').read_text())['error']
             assert len(calls) == 4
         elif short_hit:
             with pytest.raises(ValueError, match='exact image ancestor did not hit'):
                 cards.image_prefix_probe(url, tmp_path)
         else:
             assert len(cards.image_prefix_probe(url, tmp_path)) == 15
-            assert len(list(tmp_path.glob('image-prefix-*.json'))) == 30
+            assert len(list((tmp_path / 'image-prefix-attempt-1').glob('image-prefix-*.json'))) == 30
             assert calls[0]['messages'][0]['content'][0] == calls[3]['messages'][0]['content'][0]
             assert len(calls[10]['messages'][0]['content'][0]['text']) > 100_000
             assert len(calls[4]['messages']) == 3
@@ -4150,3 +4150,18 @@ def test_image_prefix_probe_rejects_cold_warm_token_drift(tmp_path, monkeypatch)
     monkeypatch.setattr(cards, 'http', http)
     with pytest.raises(ValueError, match='cold/warm image output token IDs differ'):
         cards.image_prefix_probe('fixture', tmp_path)
+
+
+def test_image_prefix_attempts_preserve_failed_verdict_and_receipts(tmp_path, monkeypatch):
+    def attempt(url, dest):
+        cards.save(dest / 'response.json', {'cached_tokens': 7})
+        raise ValueError('next-turn exactness injected')
+    monkeypatch.setattr(cards, 'image_prefix_attempt', attempt)
+    for _ in range(2):
+        with pytest.raises(ValueError, match='next-turn exactness injected'):
+            cards.image_prefix_probe('fixture', tmp_path)
+    for number in [1, 2]:
+        path = tmp_path / f'image-prefix-attempt-{number}'
+        assert json.loads((path / 'response.json').read_text()) == {'cached_tokens': 7}
+        assert json.loads((path / 'verdict.json').read_text()) == {
+            'status': 'failed', 'error': 'next-turn exactness injected'}
