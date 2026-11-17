@@ -1648,6 +1648,7 @@ mod tests {
         let root = tempfile::tempdir()?;
         let target = root.path().join("target");
         std::fs::create_dir_all(&target)?;
+        std::fs::write(target.join("config.json"), "{}")?;
         for family in ["glm5_flash", "kimi_k3"] {
             let crate::cli::Commands::Plan(mut request) = crate::cli::Cli::try_parse_from([
                 "cuteafd", "plan", target.to_str().unwrap(), "--rtx", "2"
