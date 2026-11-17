@@ -2,9 +2,9 @@
 use anyhow::{ensure, Context, Result};
 use cuteafd_api::openai::media::MediaPreparer;
 use cuteafd_engine::media::{EncodeJob, MediaKeys, RequestMedia};
-use cuteafd_loader::{media::{ImageFamily, ImageFragment, PreparedImageGroup, ProcessorConfig},
+use cuteafd_loader::{media::{ImageFamily, PreparedImageGroup, ProcessorConfig},
     plan::{encoder::{EncoderKind, EncoderPlacement}, MediaMode}};
-use std::{net::SocketAddr, path::{Path, PathBuf}, sync::Arc};
+use std::{net::SocketAddr, path::Path, sync::Arc};
 
 #[derive(Clone, Debug, clap::Args)]
 pub(crate) struct Options {
@@ -68,42 +68,18 @@ impl Ready {
     }
 }
 
-pub(crate) struct Binding { snapshot:PathBuf, family:ImageFamily, enabled:bool }
+/// Families assemble native fragments (including grouped local/global crops)
+/// before this single checked expansion and scheduler binding boundary.
+pub(crate) struct Binding;
 impl Binding {
-    pub fn new(snapshot:&Path,family:ImageFamily,enabled:bool)->Self {Self {snapshot:snapshot.into(),family,enabled}}
-    fn marker(&self,name:&str,vocabulary:u32)->Result<u32> {
-        let config:serde_json::Value=cuteafd_loader::read_json_file(&self.snapshot.join("tokenizer_config.json"))?;
-        let mut ids=config["added_tokens_decoder"].as_object().context("still tokenizer added tokens")?.iter()
-            .filter(|(_,v)|v["content"].as_str()==Some(name));
-        let id:u32=ids.next().with_context(||format!("missing image marker {name}"))?.0.parse()?;
-        ensure!(ids.next().is_none()&&id<vocabulary,"invalid still image marker");Ok(id)
-    }
-    pub fn prepare(&self,job:cuteafd_api::openai::NativeRequest,tokens:Vec<u32>,vocabulary:u32,hidden:usize,context:usize)
+    pub fn prepare(mut job:cuteafd_api::openai::NativeRequest,tokens:Vec<u32>,vocabulary:u32,hidden:usize,
+        context:usize,source_placeholder:u32,groups:Vec<PreparedImageGroup>)
         ->Result<(crate::shared::qwen::scheduler::Prompt,RequestMedia,Vec<EncodeJob>)> {
         ensure!(job.audio.is_empty(),"still tower has no audio owner");
-        if job.probe.as_ref().is_some_and(|p|!p.spec.media.is_empty()) {
-            return crate::shared::probe::still::prepare(job,tokens,vocabulary,hidden,context,&self.snapshot,self.family);
-        }
-        ensure!(self.enabled||job.media.is_empty(),"vision is disabled");
-        if job.media.is_empty() {
-            let keys=MediaKeys::new(&tokens,vocabulary,&[])?;
-            let media=RequestMedia::new(vec![],hidden,tokens.len())?;
-            return Ok((crate::shared::qwen::scheduler::Prompt {job,tokens,keys},media,vec![]));
-        }
-        let placeholder=self.marker(if self.family==ImageFamily::Kimi {"<|kimi_image_placeholder|>"}else{"]<]image[>["},vocabulary)?;
-        let pad=self.marker(if self.family==ImageFamily::Kimi {"<|media_pad|>"}else{"]<]image[>["},vocabulary)?;
-        let tokenizer=cuteafd_loader::cached_tokenizer(&self.snapshot)?;
-        let mut groups=Vec::new();
-        for image in &job.media {
-            let mut group=PreparedImageGroup::single(image.clone(),pad);
-            let (prefix,suffix)=if self.family==ImageFamily::Kimi {
-                let [w,h]=image.pixels.source;
-                (tokenizer.encode_ids(&format!("<|media_begin|>image {w}x{h}<|media_content|>"))?,self.marker("<|media_end|>",vocabulary)?)
-            }else{(vec![self.marker("]<]start of image[>[",vocabulary)?],self.marker("]<]end of image[>[",vocabulary)?)};
-            group.fragments.insert(0,ImageFragment::Tokens(prefix));
-            group.fragments.push(ImageFragment::Tokens(vec![suffix]));groups.push(group);
-        }
-        let expanded=PreparedImageGroup::expand_prompt(&tokens,placeholder,&groups,vocabulary,context)?;
+        let expanded=PreparedImageGroup::expand_prompt(&tokens,source_placeholder,&groups,vocabulary,context)?;
+        // The expanded fragment order, not source-image count, owns encoder jobs.
+        job.media=groups.iter().flat_map(|group|group.keys_in_prompt_order().map(|key|
+            group.images.iter().find(|image|image.key==key).expect("validated group key").clone())).collect();
         let keys=MediaKeys::new(&expanded.tokens,vocabulary,&expanded.media)?;
         let media=RequestMedia::new(expanded.media.clone(),hidden,expanded.tokens.len())?;
         let jobs=job.media.iter().map(|i|EncodeJob::image_with_pixels(i.key,[i.grid.t,i.grid.h,i.grid.w],i.rgb8.clone(),i.pixels,i.tokens,hidden)).collect();
