@@ -2478,12 +2478,14 @@ mod tests {
             });
             let app = router(tx).layer(axum::middleware::from_fn_with_state(
                 crate::usage::Middleware::new(sink.clone()), crate::usage::track));
-            let body = json!({"model":MODEL,"messages":[{"role":"user","content":"Hi"}],"max_tokens":16,
-                "thinking":{"type":"disabled"},"stream":streaming,"stream_options":{"include_usage":true}});
+            let mut body = json!({"model":MODEL,"messages":[{"role":"user","content":"Hi"}],"max_tokens":16,
+                "thinking":{"type":"disabled"},"stream":streaming});
+            if streaming { body["stream_options"] = json!({"include_usage":true}); }
             let response = app.oneshot(axum::http::Request::post("/v1/chat/completions")
                 .header("content-type","application/json").body(Body::from(body.to_string())).unwrap()).await.unwrap();
-            assert_eq!(response.status(),StatusCode::OK);
+            let status = response.status();
             let bytes = axum::body::to_bytes(response.into_body(),1<<20).await.unwrap();
+            assert_eq!(status,StatusCode::OK,"{}",String::from_utf8_lossy(&bytes));
             worker.await.unwrap();
             let value: Value = if streaming {
                 std::str::from_utf8(&bytes).unwrap().split("data: ")
