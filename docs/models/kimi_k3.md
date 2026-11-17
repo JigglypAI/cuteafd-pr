@@ -1,5 +1,11 @@
 # Kimi K3
 
+Automatic KV sizing uses the shared 2M-token target on every card, including
+32 GB / RTX 5090. Placement and expert onboarding are fixed at that target;
+the pool then grows into remaining admitted memory, within native encoding
+limits. `KV_MAX_TOKENS` is unset by default and can explicitly cap growth.
+See [memory policy](../options.md#memory-and-pools).
+
 `wrldsuksgo2mars/Kimi-K3-EXL3-K2-Core-K6` serves on two RTX PRO 6000 GPUs plus
 six Sparks: EXL3 K2 routed experts on the Sparks (with RTX onboarding), and a
 native K6 dense core (attention, dense and shared FFN, vocabulary head) on the

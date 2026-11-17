@@ -1,5 +1,11 @@
 # GLM 5.3
 
+Automatic KV sizing uses the shared 2M-token target on every card, including
+32 GB / RTX 5090. Placement and expert onboarding are fixed at that target;
+the pool then grows into remaining admitted memory, within native encoding
+limits. `KV_MAX_TOKENS` is unset by default and can explicitly cap growth.
+See [memory policy](../options.md#memory-and-pools).
+
 Ported from `../glmrt`: MLA with a DeepSeek Sparse Attention (DSA) indexer,
 a top-8 sigmoid router, and a DFlash2 draft speculator.
 

@@ -57,6 +57,7 @@ CUTEAFD_WIP_COORDINATOR_EXPORT={setting} CUTEAFD_EXPORT_HOST=other
 wip_remote_export() {{ echo remote >> {trace}; return {remote}; }}
 wip_capped_export() {{ echo capped >> {trace}; return {capped}; }}
 wip_hwlock() {{ echo turn >> {trace}; }}
+export_source=/frozen/source
 coordinator_build=(docker exec c)
 run() {{
 {_dispatch()}
@@ -116,7 +117,7 @@ esac
     cdi = (ROOT / 'scripts/lib/cdi-gpus.sh').read_text()
     script = 'CUTEAFD_CDI_CHECK=off\n' + cdi + helper + _function('wip_capped_export') + _function('wip_capped_export_on') + f'''
 repo_root={str(ROOT)!r} coordinator_container=wipc COORDINATOR_DOCKER_DEV=img
-wip_capped_export docker exec -e CUTEAFD_WIP_DSV4_AOT=ON -e 'CUTEAFD_WIP_EXPERT_FAMILIES=a;b' wipc /x coordinator
+wip_capped_export /frozen/source docker exec -e CUTEAFD_WIP_DSV4_AOT=ON -e 'CUTEAFD_WIP_EXPERT_FAMILIES=a;b' wipc /x coordinator
 '''
     result = subprocess.run(['bash', '-c', 'set -euo pipefail\n' + script], capture_output=True, text=True, timeout=60,
                             env={**os.environ, 'PATH': f'{bindir}:{os.environ["PATH"]}', 'CUTEAFD_LOCK_DIR': str(locks),
@@ -167,7 +168,7 @@ release_die() { exit 9; }
 wip_capped_export() { echo unexpected-queue; exit 99; }
 slot=test coordinator_container=fixture COORDINATOR_DOCKER_DEV=fixture
 bf16_families= audio_aot=OFF wip_export_locks=on
-""" + function + '\nbuild_coordinator native\n'
+""" + function + '\nbuild_coordinator native /frozen/source\n'
     result = subprocess.run(['bash', '-c', script], capture_output=True, text=True, timeout=10)
     assert result.returncode == 0, result.stderr
     assert 'native cache hit, no GPU turn' in result.stdout
@@ -198,3 +199,48 @@ def test_remote_maxq_owns_no_raptor_mutex_and_protects_both_host_views():
     assert '--locks maxq' in remote and 'maxq-gpu.lock' in remote
     assert '--locks gpu0' not in remote and '--locks gpu1' not in remote
     assert 'flock -w 7200 7' in remote
+
+
+def test_remote_export_receives_source_argument_without_staging_global(tmp_path):
+    state = tmp_path / 'state'
+    (state / 'output/coordinator').mkdir(parents=True)
+    (state / 'output/coordinator/.native-cache-key').write_text('coordinator-120 ' + 'a' * 64 + '\n')
+    repo = tmp_path / 'repo'
+    (repo / 'scripts/build').mkdir(parents=True)
+    trace = tmp_path / 'trace'
+    exporter = repo / 'scripts/build/export-remote.sh'
+    exporter.write_text(f'#!/bin/sh\nprintf "%s\\n" "$2" > "{trace}"\n')
+    exporter.chmod(0o755)
+    script = f'''set -euo pipefail
+unset staging_dir
+repo_root={str(repo)!r}
+state_dir={str(state)!r}
+COORDINATOR_DOCKER_DEV=image
+CUTEAFD_EXPORT_HOST=maxq
+coordinator_build=(docker exec -e CUTEAFD_SCOPE=ON container)
+wip_serving_export_priority() {{ return 1; }}
+docker() {{ echo image; }}
+native_store_nest() {{ :; }}
+native_store_sync() {{ :; }}
+{_function('wip_remote_export')}
+wip_remote_export '/explicit/frozen source'
+'''
+    result = subprocess.run(['bash', '-c', script], capture_output=True, text=True, timeout=10)
+    assert result.returncode == 0, result.stderr
+    assert trace.read_text() == '/explicit/frozen source\n'
+
+
+def test_capped_redirect_passes_explicit_source_to_remote(tmp_path):
+    script = f'''set -euo pipefail
+unset staging_dir
+repo_root=/fixture
+coordinator_container=fixture
+COORDINATOR_DOCKER_DEV=image
+python3() {{ return 76; }}
+wip_remote_export() {{ [[ "$1" == '/explicit/frozen source' ]]; }}
+{_function('wip_capped_export')}
+wip_capped_export '/explicit/frozen source' docker exec fixture native
+'''
+    result = subprocess.run(['bash', '-c', script], capture_output=True, text=True, timeout=10)
+    assert result.returncode == 0, result.stderr
+    assert 'yielding raptor to serving' in result.stdout

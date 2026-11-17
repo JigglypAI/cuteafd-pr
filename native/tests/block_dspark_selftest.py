@@ -21,6 +21,7 @@ def bind(path):
         "cuteafd_glmf_dspark_markov": ([P] * 7 + [I] * 4 + [P], I),
         "cuteafd_glmf_dspark_qk_rope": ([P] * 8 + [I] * 3 + [F] * 2 + [P], I),
         "cuteafd_block_dspark_qk_rope": ([P] * 9 + [I] * 4 + [F] * 3 + [P], I),
+        "cuteafd_block_dspark_qk_rope_fp8": ([P] * 9 + [I] * 4 + [F] * 3 + [P], I),
         "cuteafd_block_dspark_attention_workspace": ([I] * 6, C.c_uint64),
         "cuteafd_block_dspark_attention": ([P] * 10 + [I] * 8 + [F, P], I),
         "cuteafd_block_dspark_attention_paged": ([P] * 11 + [I] * 9 + [F, P], I),
@@ -35,14 +36,15 @@ def bind(path):
     return lib
 
 
-def rotary_check(lib):
+def rotary_check(lib, baseline=None):
     from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
     from transformers.models.qwen3.modeling_qwen3 import Qwen3RotaryEmbedding
 
     stream = torch.cuda.current_stream().cuda_stream
     positions = torch.tensor([0, 8191, 8192, 262143], device="cuda", dtype=torch.int64)
     slots = torch.tensor([2, -1, 0, 3], device="cuda", dtype=torch.int32)
-    for dim, heads, kvh in ((64, 64, 64), (128, 40, 8), (128, 0, 8)):
+    for dim, heads, kvh, yarn in ((64,64,64,False),(128,40,8,True),(128,0,8,True),
+                                  (64,64,16,True),(64,0,16,True)):
         rows = positions.numel()
         source = torch.randn(rows, heads + 2 * kvh, dim, device="cuda").bfloat16()
         qnorm = (torch.randn(dim, device="cuda") * 0.1 + 1).bfloat16()
@@ -50,11 +52,12 @@ def rotary_check(lib):
         q = torch.empty(rows, heads, dim, device="cuda", dtype=torch.bfloat16)
         k = torch.full((rows, kvh, dim), -123, device="cuda", dtype=torch.bfloat16)
         v = torch.full_like(k, -123)
-        if dim == 128:
+        if yarn:
             config = Qwen3Config(hidden_size=5120, num_attention_heads=40, num_key_value_heads=8,
-                head_dim=128, max_position_embeddings=262144,
-                rope_parameters=dict(rope_type="yarn", rope_theta=10000000., factor=32.,
-                    original_max_position_embeddings=8192, beta_fast=32., beta_slow=1.))
+                head_dim=dim, max_position_embeddings=1048576,
+                rope_parameters=dict(rope_type="yarn", rope_theta=10000000. if dim==128 else 10000.,
+                    factor=32. if dim==128 else 16.,
+                    original_max_position_embeddings=8192 if dim==128 else 65536, beta_fast=32., beta_slow=1.))
             rotary = Qwen3RotaryEmbedding(config, device="cuda")
             inv_freq = rotary.inv_freq.contiguous()
             factor = rotary.attention_scaling
@@ -65,7 +68,14 @@ def rotary_check(lib):
         assert lib.cuteafd_block_dspark_qk_rope(*pointers,
             inv_freq.data_ptr() if inv_freq is not None else None, *outputs,
             rows, heads, kvh, dim, 10000., factor, 1e-6, stream) == 0
-        if dim == 64:
+        if baseline is not None and (not yarn or dim == 128):
+            previous = [torch.empty_like(q), torch.full_like(k, -123), torch.full_like(v, -123)]
+            assert baseline.cuteafd_block_dspark_qk_rope(*pointers,
+                inv_freq.data_ptr() if inv_freq is not None else None, *[x.data_ptr() for x in previous],
+                rows, heads, kvh, dim, 10000., factor, 1e-6, stream) == 0
+            torch.cuda.synchronize()
+            assert all(torch.equal(a,b) for a,b in zip((q,k,v),previous)), "baseline rotary bytes changed"
+        if not yarn:
             legacy = [torch.empty_like(q), torch.full_like(k, -123), torch.full_like(v, -123)]
             assert lib.cuteafd_glmf_dspark_qk_rope(*pointers, *[x.data_ptr() for x in legacy],
                 rows, heads, kvh, 10000., 1e-6, stream) == 0
@@ -92,16 +102,42 @@ def rotary_check(lib):
                     torch.testing.assert_close(k[slot], expected_k[row], rtol=0.016, atol=0.016)
             print(f"rotary dim={dim} heads={heads}/{kvh} max_q_error="
                   f"{(q.float() - expected_q.float()).abs().max().item() if heads else 0:.6g}")
+        from draft_kv_selftest import pack, plane_bytes
+        compact_q = torch.empty_like(q)
+        compact_k = torch.full((rows,plane_bytes(kvh,dim)),0xA5,device="cuda",dtype=torch.uint8)
+        compact_v = torch.full_like(compact_k,0xA5)
+        assert lib.cuteafd_block_dspark_qk_rope_fp8(*pointers,
+            inv_freq.data_ptr() if inv_freq is not None else None,
+            compact_q.data_ptr(),compact_k.data_ptr(),compact_v.data_ptr(),
+            rows,heads,kvh,dim,10000.,factor,1e-6,stream)==0
+        torch.cuda.synchronize()
+        assert torch.equal(q,compact_q), "FP8 KV changed query bytes"
+        if baseline is not None and (not yarn or dim == 128):
+            old_q=torch.empty_like(q)
+            old_k=torch.full_like(compact_k,0xA5)
+            old_v=torch.full_like(compact_v,0xA5)
+            assert baseline.cuteafd_block_dspark_qk_rope_fp8(*pointers,
+                inv_freq.data_ptr() if inv_freq is not None else None,
+                old_q.data_ptr(),old_k.data_ptr(),old_v.data_ptr(),
+                rows,heads,kvh,dim,10000.,factor,1e-6,stream)==0
+            torch.cuda.synchronize()
+            assert all(torch.equal(a,b) for a,b in zip((compact_q,compact_k,compact_v),(old_q,old_k,old_v))), "baseline FP8 rotary bytes changed"
+        expected_k,expected_v=pack(k),pack(v)
+        for row,slot in enumerate(slots.tolist()):
+            if slot>=0:
+                assert torch.equal(compact_k[slot],expected_k[slot]), "FP8 YaRN K writer bytes differ"
+                assert torch.equal(compact_v[slot],expected_v[slot]), "FP8 V writer bytes differ"
+        assert torch.all(compact_k[1]==0xA5) and torch.all(compact_v[1]==0xA5)
         for row, slot in enumerate(slots.tolist()):
             if slot >= 0:
                 assert torch.equal(v[slot], source[row, heads + kvh:]), "V changed"
         assert torch.all(k[1] == -123) and torch.all(v[1] == -123), "negative slot wrote cache"
-    print("rotary legacy64 dispatch is byte-identical; YaRN128 boundary positions passed")
+    print("rotary legacy64 dispatch is byte-identical; YaRN64/128 boundary positions passed")
 
 
 def attention_check(lib):
     stream = torch.cuda.current_stream().cuda_stream
-    for dim, heads, kvh, block in ((64, 64, 64, 8), (128, 40, 8, 7)):
+    for dim, heads, kvh, block in ((64, 64, 64, 8), (128, 40, 8, 7), (64,64,16,5)):
         for sequences in (1, 8):
             for context in (0, 33, 1024):
                 for causal in (False, True):
@@ -283,7 +319,7 @@ def main():
     markov_check(lib, bind(args.baseline) if args.baseline else None)
     markov_check(lib, rank=512)
     if not args.markov_only:
-        rotary_check(lib)
+        rotary_check(lib, bind(args.baseline) if args.baseline else None)
         attention_check(lib)
     print("block dSpark kernels: all checks passed")
 

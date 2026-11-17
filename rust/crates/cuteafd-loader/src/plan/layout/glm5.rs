@@ -517,9 +517,21 @@ fn placement(report: &PlanReport, input: &crate::plan::PlanInput, options: &Layo
     }
     let page_tokens = if attention == crate::placement::AttentionPlacement::Context { 128 } else { 64 };
     let card_bytes = &options.rtx_bytes[..gpus];
-    let mut pool_facts = crate::placement::PoolFacts::new(card_bytes,
-        crate::placement::planner::Context::resolve(context, (options.context_tokens > 0).then_some(options.context_tokens)),
+    let mut pool_facts = crate::placement::PoolFacts::new(crate::placement::planner::Context::resolve(context, (options.context_tokens > 0).then_some(options.context_tokens)),
         options.pool_tokens, page_tokens);
+    let cache = match cfg.variant.ml4() {
+        Some(ml4) => crate::serving_capacity::mistral_large4_cache_geometry(ml4, gpus)?,
+        None => crate::serving_capacity::glm_cache_geometry(&cfg, cfg.layers, gpus)?,
+    };
+    // Whole-layer attention splits the replicated record slope between the
+    // cards; heads and context keep the whole latent pool on each.
+    pool_facts.memory = if attention == crate::placement::AttentionPlacement::Layers {
+        vec![crate::placement::PoolMemory { available_bytes: card_bytes.iter().sum(),
+            bytes_per_unit: cache.ranks[0].persistent_unit_bytes }]
+    } else {
+        cache.ranks.iter().zip(card_bytes).map(|(rank, &available_bytes)|
+            crate::placement::PoolMemory { available_bytes, bytes_per_unit: rank.persistent_unit_bytes }).collect()
+    };
     pool_facts.target = options.target_pool_tokens;
     let pool = crate::placement::prepare_pool(pool_facts)?;
     let maximum_pages = pool.maximum_tokens().div_ceil(page_tokens);
@@ -707,9 +719,21 @@ pub(crate) fn native_layout_with_metadata(checkpoint: &Checkpoint, options: &Lay
     }).transpose()?;
     let page_tokens = if attention == crate::placement::AttentionPlacement::Context { 2 * glm::PAGE_ROWS } else { glm::PAGE_ROWS };
     let card_bytes = &options.rtx_bytes;
-    let mut pool_facts = crate::placement::PoolFacts::new(card_bytes,
-        crate::placement::planner::Context::resolve(context, (options.context_tokens > 0).then_some(options.context_tokens)),
+    let mut pool_facts = crate::placement::PoolFacts::new(crate::placement::planner::Context::resolve(context, (options.context_tokens > 0).then_some(options.context_tokens)),
         options.pool_tokens, page_tokens);
+    let cache = match cfg.variant.ml4() {
+        Some(ml4) => crate::serving_capacity::mistral_large4_cache_geometry(ml4, gpu_count)?,
+        None => crate::serving_capacity::glm_cache_geometry(&cfg, cfg.layers, gpu_count)?,
+    };
+    // Whole-layer attention splits the replicated record slope between the
+    // cards; heads and context keep the whole latent pool on each.
+    pool_facts.memory = if attention == crate::placement::AttentionPlacement::Layers {
+        vec![crate::placement::PoolMemory { available_bytes: card_bytes.iter().sum(),
+            bytes_per_unit: cache.ranks[0].persistent_unit_bytes }]
+    } else {
+        cache.ranks.iter().zip(card_bytes).map(|(rank, &available_bytes)|
+            crate::placement::PoolMemory { available_bytes, bytes_per_unit: rank.persistent_unit_bytes }).collect()
+    };
     pool_facts.target = options.target_pool_tokens;
     let pool = crate::placement::prepare_pool(pool_facts)?;
     let maximum_pages = pool.maximum_tokens().div_ceil(page_tokens);

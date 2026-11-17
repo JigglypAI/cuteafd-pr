@@ -810,7 +810,7 @@ def _trace_tools(tmp_path, extra=None):
         'docker': '#!/bin/sh\nprintf "docker %s\\n" "$*" >> "$TRACE"\n' + cold + 'printf "image-id\\n"\n',
         'flock': '#!/bin/sh\nprintf "flock %s\\n" "$*" >> "$TRACE"\n',
         # hwlock stand-in: record the turn, then run the command it guards.
-        'python3': '#!/bin/sh\nprintf "turn %s\\n" "$*" >> "$TRACE"\nwhile [ "$1" != -- ]; do shift; done; shift\nprintf "begin\\n" >> "$TRACE"\n"$@"\nrc=$?\nprintf "end\\n" >> "$TRACE"\nexit $rc\n',
+        'python3': '#!/bin/sh\nprintf "turn %s\\n" "$*" >> "$TRACE"\ncase "$*" in *waiting-serving*) exit 1;; esac\nwhile [ "$1" != -- ]; do shift; done; shift\nprintf "begin\\n" >> "$TRACE"\n"$@"\nrc=$?\nprintf "end\\n" >> "$TRACE"\nexit $rc\n',
         'timeout': '#!/bin/sh\nwhile [ "${1#-}" != "$1" ]; do shift; done; shift\nexec "$@"\n',
         **(extra or {})}
     for name, script in scripts.items():
@@ -867,8 +867,8 @@ slot=test coordinator_container=owned COORDINATOR_DOCKER_DEV=image bf16_families
 CUTEAFD_WIP_EXPORT_LOCKS=on wip_export_locks=on
 CUTEAFD_WIP_COORDINATOR_EXPORT=auto
 '''
-    modes = _wip_function('wip_coordinator_export_modes() {', '\n# wip_remote_export:')
-    subprocess.run(['bash', '-c', setup + modes + function + '\nwip_capped_export() { printf \"capped\\n\" >> \"$TRACE\"; \"$@\" native; }\nbuild_coordinator'], check=True,
+    modes = _wip_function('wip_coordinator_export_modes() {', '\n# wip_remote_export SOURCE:')
+    subprocess.run(['bash', '-c', setup + modes + function + '\nwip_capped_export() { shift; printf \"capped\\n\" >> \"$TRACE\"; \"$@\" native; }\nbuild_coordinator all /frozen/source'], check=True,
                    env={**os.environ, 'PATH': str(tools) + ':' + os.environ['PATH'], 'TRACE': str(trace)})
     lines = trace.read_text().splitlines()
     rust = next(i for i, line in enumerate(lines) if line.endswith('/wip/output/coordinator rust'))

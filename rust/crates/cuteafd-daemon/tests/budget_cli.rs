@@ -652,13 +652,13 @@ fn installed_flash_exlr8_automatic_tp2_plan(ranks: &str) -> serde_json::Value {
 
 #[test]
 #[ignore = "requires CUTEAFD_EXLR8_FLASH_SNAPSHOT and current CUTEAFD_DEPLOYMENT_TEST_PROGRAMS"]
-fn installed_flash_exlr8_automatic_zero_spark_pool_stops_at_2m() {
+fn installed_flash_exlr8_automatic_zero_spark_pool_grows_past_target() {
     let deployment = installed_flash_exlr8_automatic_tp2_plan("0");
     let devices = deployment["memory_layout"]["devices"].as_array().unwrap();
     assert_eq!(devices.len(), 2);
     for device in devices {
-        assert_eq!(device["kv_tokens"], 2_097_152,
-            "automatic zero-Spark pool must stop at its 2M target when capacity permits");
+        assert!(device["kv_tokens"].as_u64().unwrap() >= 2_097_152,
+            "automatic zero-Spark pool grows into admitted remaining memory");
     }
 }
 
@@ -688,7 +688,7 @@ fn installed_flash_exlr8_automatic_tp2_max_is_zero_spark_and_launchable() {
         for (rank, device) in devices.iter().enumerate() {
             assert_eq!(device["kind"], "rtx");
             assert_eq!(device["index"], rank);
-            assert_eq!(device["kv_tokens"], 2_097_152);
+            assert!(device["kv_tokens"].as_u64().unwrap() >= 2_097_152);
             let items = device["items"].as_array().unwrap();
             let routed = items.iter().find(|item| item["group"] == "RTX expert arena")
                 .expect("the selected routed expert backing must be charged on each RTX");
@@ -789,7 +789,7 @@ fn installed_mimo_min_onboarding_matches_smoke(root: &std::path::Path,
     // 15 layers under the retired 97% ceiling; the one-cap policy (#1440) admits a 16th
     // with the measured 575 MiB baseline and the named Ready owners charged.
     assert_eq!(deployment["report"]["onboard_layers"], 16, "measured min-card local prefix must not drift");
-    assert_eq!(deployment["memory_layout"]["pool_tokens"], 2_097_152);
+    assert!(deployment["memory_layout"]["pool_tokens"].as_u64().unwrap() >= 2_097_152);
     assert_eq!(deployment["prefill_unit_rows"], 2752);
     assert_eq!(deployment["prefill_waves"], 3);
     let lead = deployment["memory_layout"]["devices"].as_array().unwrap().iter()
@@ -919,12 +919,15 @@ fn assert_v41_sim5090_head_pools(root: &std::path::Path, snapshot: &std::path::P
         let report: serde_json::Value = serde_json::from_slice(&output.stdout)
             .unwrap_or_else(|error| panic!("sim5090 {head}: {error}; {stderr}"));
         assert!(output.status.success(), "sim5090 {head}: {stderr}; {:?}", report["hints"]);
-        assert_eq!(report["memory_layout"]["pool_tokens"], 1_048_576, "sim5090 {head}: {report}");
+        let pool = report["memory_layout"]["pool_tokens"].as_u64().unwrap();
+        let policy = &report["phase_ledger"]["pool_policy"];
+        assert_eq!(policy["target"], 2_097_152, "sim5090 {head}: {report}");
+        assert!(pool >= context.parse::<u64>().unwrap(), "sim5090 {head}: {report}");
     }
 }
 
 #[test]
-fn v41_sim5090_overlay_preserves_1m_pool_for_all_and_packed() {
+fn v41_sim5090_overlay_uses_uniform_target_and_memory_pool_for_all_and_packed() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
     let snapshot = tempfile::tempdir().unwrap();
     cuteafd_loader::plan::testing::write_v41_snapshot(snapshot.path());

@@ -1835,206 +1835,212 @@ fn below_target_onboards_on_nonbinding_device_without_spending_one_page() {
 
 #[test]
 fn exact_onboarding_reaches_target_before_maximizing_physical_capacity() {
-    const TARGET: u64 = 1 << 20;
-    let maximum = TARGET * 4 / 64;
-    let mut contract = profile_contract(maximum);
-    contract.variables[0] = Variable::Attention {
-        layer: 0,
-        values: vec![
-            LayerMode::Whole { gpu: 0, ffn: FfnMode::Owner },
-            LayerMode::Whole { gpu: 1, ffn: FfnMode::Owner },
-        ],
-    };
-    for (option, slopes) in [[64, 192], [64, 64]].into_iter().enumerate() {
-        for (gpu, slope) in slopes.into_iter().enumerate() {
-            let mut owner = allocation(&format!("kv.{option}.{gpu}"), slope);
-            owner.location = Location::coordinator(gpu as u8);
-            let curve = ByteCurve::linear(slope, slope, maximum);
-            let mut component = Component::allocation(owner, curve.clone(), false, maximum);
-            component.byte_extent(curve).unwrap();
-            component.activation = Activation::choice(0, option);
-            contract.components.push(component);
+    cuteafd_core::memory_policy::MemoryPolicy { kv_max: Some(1 << 20), kv_target: Some(1 << 20), ..Default::default() }.scoped(|| {
+        const TARGET: u64 = 1 << 20;
+        let maximum = TARGET * 4 / 64;
+        let mut contract = profile_contract(maximum);
+        contract.variables[0] = Variable::Attention {
+            layer: 0,
+            values: vec![
+                LayerMode::Whole { gpu: 0, ffn: FfnMode::Owner },
+                LayerMode::Whole { gpu: 1, ffn: FfnMode::Owner },
+            ],
+        };
+        for (option, slopes) in [[64, 192], [64, 64]].into_iter().enumerate() {
+            for (gpu, slope) in slopes.into_iter().enumerate() {
+                let mut owner = allocation(&format!("kv.{option}.{gpu}"), slope);
+                owner.location = Location::coordinator(gpu as u8);
+                let curve = ByteCurve::linear(slope, slope, maximum);
+                let mut component = Component::allocation(owner, curve.clone(), false, maximum);
+                component.byte_extent(curve).unwrap();
+                component.activation = Activation::choice(0, option);
+                contract.components.push(component);
+            }
         }
-    }
-    add_profile(&mut contract, vec![0, 1], vec![0, 1], vec![0, 1, 2],
-        &[0, 1 << 20, 2 << 20]);
-    let mut budgets = two_gpus(5 << 20, 5 << 20);
-    for budget in &mut budgets {
-        budget.physical_bytes = 96 << 30;
-    }
-    let recipe = Prepared(contract);
-    let pinned = Request { onboard: Pin::Exact(1), ..request() };
-    let automatic = solve(pinned.clone(), budgets.clone(), &recipe).unwrap();
-    let explicit = solve(Request { pool: Pin::Exact(TARGET), ..pinned.clone() },
-        budgets.clone(), &recipe).unwrap();
-    assert_eq!(automatic.pool_tokens, TARGET);
-    assert_eq!(automatic.decisions.onboard(), 1);
-    assert_eq!(automatic.decisions, explicit.decisions);
-    assert_eq!(automatic.decisions.attention,
-        vec![LayerMode::Whole { gpu: 1, ffn: FfnMode::Owner }]);
-    assert_eq!(solve(request(), budgets.clone(), &recipe).unwrap().pool_tokens, TARGET);
-    // The target-fitting owner also fits above the target. That is spare
-    // capacity, not a reason to overfill or discard its automatic-pool plan.
-    assert_eq!(solve(Request { pool: Pin::Exact(3 << 20), ..pinned }, budgets, &recipe)
-        .unwrap().pool_tokens, 3 << 20);
+        add_profile(&mut contract, vec![0, 1], vec![0, 1], vec![0, 1, 2],
+            &[0, 1 << 20, 2 << 20]);
+        let mut budgets = two_gpus(5 << 20, 5 << 20);
+        for budget in &mut budgets {
+            budget.physical_bytes = 96 << 30;
+        }
+        let recipe = Prepared(contract);
+        let pinned = Request { onboard: Pin::Exact(1), ..request() };
+        let automatic = solve(pinned.clone(), budgets.clone(), &recipe).unwrap();
+        let explicit = solve(Request { pool: Pin::Exact(TARGET), ..pinned.clone() },
+            budgets.clone(), &recipe).unwrap();
+        assert_eq!(automatic.pool_tokens, TARGET);
+        assert_eq!(automatic.decisions.onboard(), 1);
+        assert_eq!(automatic.decisions, explicit.decisions);
+        assert_eq!(automatic.decisions.attention,
+            vec![LayerMode::Whole { gpu: 1, ffn: FfnMode::Owner }]);
+        assert_eq!(solve(request(), budgets.clone(), &recipe).unwrap().pool_tokens, TARGET);
+        // The target-fitting owner also fits above the target. That is spare
+        // capacity, not a reason to overfill or discard its automatic-pool plan.
+        assert_eq!(solve(Request { pool: Pin::Exact(3 << 20), ..pinned }, budgets, &recipe)
+            .unwrap().pool_tokens, 3 << 20);
+    });
 }
 
 #[test]
 fn step_exact_fifteen_inventory_replay_preserves_feasible_two_million_target() {
-    // Frozen CPU plans from #776 comment 6587874033, source 140e7f802,
-    // Step EXL3 K4+Core-K6 revision 83d47a384eabc07ea6fcfaac4779b0e5f013ce89:
-    // 2 PRO + 6 Sparks, C16, MTP3, 1M context, prefill 2752x3. This replays
-    // three observed inventories, not a complete Step recipe or live receipts.
-    const TARGET: u64 = 2 << 20;
-    const PINNED_EXPERTS: u64 = 26_371_720_568;
-    const AUTO_EXPERTS: u64 = 31_417_468_280;
-    let witnesses = [
-        (7, 1_996_608, 15, [81_448_123_784, 99_238_178_520], [702_464, 1_605_632]),
-        (9, TARGET, 18, [95_671_429_768, 98_732_386_776], [903_168, 1_404_928]),
-        (10, TARGET, 15, [94_662_675_720, 89_649_645_400], [1_003_520, 1_304_576]),
-    ];
-    let maximum = TARGET * 2 / 64;
-    let mut contract = Contract::fixed(64, maximum, 2, facts(vec![]));
-    for layer in 0..23 {
-        let whole = |gpu| LayerMode::Whole { gpu, ffn: FfnMode::Owner };
-        contract.variables.push(Variable::Attention {
-            layer,
-            values: if layer < 7 { vec![whole(0)] }
-                else if layer < 10 { vec![whole(0), whole(1)] }
-                else { vec![whole(1)] },
-        });
-    }
-    // Keep precisely the observed contiguous cuts 7, 9 and 10, while leaving
-    // ownership independent of the onboarding pin and the pool request.
-    for (when, required) in [(7, 8), (8, 7), (9, 8)] {
-        contract.requires.push(Requires {
-            when: Choice { variable: when, option: 0 },
-            any_of: vec![Choice { variable: required, option: 0 }],
-        });
-    }
-    contract.variables.push(Variable::Prefill(vec![PrefillShape { rows: 2752, waves: 3 }]));
-    contract.variables.push(Variable::Lanes(vec![1]));
-    add_profile(&mut contract, (3..91).collect(), vec![0, 1], vec![15, 18],
-        &[PINNED_EXPERTS, AUTO_EXPERTS]);
-    for &(cut, tokens, onboard, totals, slopes) in &witnesses {
-        let activation = match cut {
-            7 => Activation::choice(7, 1),
-            9 => Activation { clauses: vec![vec![
-                Choice { variable: 7, option: 0 }, Choice { variable: 9, option: 1 },
-            ]] },
-            10 => Activation::choice(9, 0),
-            _ => unreachable!(),
-        };
-        for gpu in 0..2 {
-            let expert = if onboard == 15 { PINNED_EXPERTS } else { AUTO_EXPERTS };
-            let fixed = totals[gpu] - tokens / 64 * slopes[gpu] - expert;
-            let curve = ByteCurve::linear(fixed + slopes[gpu], slopes[gpu], maximum);
-            let mut owner = allocation(&format!("step.frozen.{cut}.{gpu}"), fixed + slopes[gpu]);
-            owner.location = Location::coordinator(gpu as u8);
-            let mut component = Component::allocation(owner, curve.clone(), false, maximum);
-            component.byte_extent(curve).unwrap();
-            component.activation = activation.clone();
-            contract.components.push(component);
+    cuteafd_core::memory_policy::MemoryPolicy { kv_max: Some(2 << 20), ..Default::default() }.scoped(|| {
+        // Frozen CPU plans from #776 comment 6587874033, source 140e7f802,
+        // Step EXL3 K4+Core-K6 revision 83d47a384eabc07ea6fcfaac4779b0e5f013ce89:
+        // 2 PRO + 6 Sparks, C16, MTP3, 1M context, prefill 2752x3. This replays
+        // three observed inventories, not a complete Step recipe or live receipts.
+        const TARGET: u64 = 2 << 20;
+        const PINNED_EXPERTS: u64 = 26_371_720_568;
+        const AUTO_EXPERTS: u64 = 31_417_468_280;
+        let witnesses = [
+            (7, 1_996_608, 15, [81_448_123_784, 99_238_178_520], [702_464, 1_605_632]),
+            (9, TARGET, 18, [95_671_429_768, 98_732_386_776], [903_168, 1_404_928]),
+            (10, TARGET, 15, [94_662_675_720, 89_649_645_400], [1_003_520, 1_304_576]),
+        ];
+        let maximum = TARGET * 2 / 64;
+        let mut contract = Contract::fixed(64, maximum, 2, facts(vec![]));
+        for layer in 0..23 {
+            let whole = |gpu| LayerMode::Whole { gpu, ffn: FfnMode::Owner };
+            contract.variables.push(Variable::Attention {
+                layer,
+                values: if layer < 7 { vec![whole(0)] }
+                    else if layer < 10 { vec![whole(0), whole(1)] }
+                    else { vec![whole(1)] },
+            });
         }
-    }
-    let mut budgets = two_gpus(101_973_491_712, 101_973_491_712);
-    for budget in &mut budgets {
-        budget.baseline = Baseline::Forecast {
-            occupied: 586_416_128,
-            source: "frozen Step CPU plan pre-weight baseline".into(),
-            assumed: false,
-        };
-        budget.headroom = 2 << 30;
-    }
-    for &(cut, tokens, onboard, totals, _) in &witnesses {
-        let mut selected = (0..23).map(|layer|
-            usize::from((7..10).contains(&layer) && layer >= cut)).collect::<Vec<_>>();
-        selected.extend([0, 0, usize::from(onboard == 18)]);
-        let phases = evaluate(&contract.facts(&selected, tokens / 64).unwrap(), &budgets).unwrap();
-        let owned = phases.iter().filter(|p| p.phase == Phase::Ready)
-            .map(|p| p.owned).collect::<Vec<_>>();
-        assert_eq!(owned, totals, "CSA cut {cut} preserves the real plan's rank totals");
-        if cut == 7 {
-            assert!(matches!(evaluate(&contract.facts(&selected, tokens / 64 + 1).unwrap(), &budgets),
-                Err(Refusal::Capacity { .. })));
-        } else {
-            evaluate(&contract.facts(&selected, TARGET / 64 + 1).unwrap(), &budgets).unwrap();
+        // Keep precisely the observed contiguous cuts 7, 9 and 10, while leaving
+        // ownership independent of the onboarding pin and the pool request.
+        for (when, required) in [(7, 8), (8, 7), (9, 8)] {
+            contract.requires.push(Requires {
+                when: Choice { variable: when, option: 0 },
+                any_of: vec![Choice { variable: required, option: 0 }],
+            });
         }
-    }
-    let recipe = Prepared(contract);
-    let req = Request { context: (1 << 20).into(), onboard: Pin::Exact(15), ..request() };
-    let pinned = solve(req.clone(), budgets.clone(), &recipe).unwrap();
-    let explicit = solve(Request { pool: Pin::Exact(TARGET), ..req.clone() },
-        budgets.clone(), &recipe).unwrap();
-    let automatic = solve(Request { onboard: Pin::Auto, ..req }, budgets, &recipe).unwrap();
-    assert_eq!((pinned.pool_tokens, pinned.decisions.onboard()), (TARGET, 15));
-    assert_eq!((automatic.pool_tokens, automatic.decisions.onboard()), (TARGET, 18));
-    assert_eq!(pinned.decisions, explicit.decisions);
-    // Active-phase balance may improve upon the old explicit-2M witness's cut
-    // 10. The required invariant is the feasible target, not its old owner cut.
-    assert_eq!(pinned.decisions.attention.iter()
-        .filter(|mode| matches!(mode, LayerMode::Whole { gpu: 0, .. })).count(), 9);
-    assert_eq!(pinned.pool_tokens, automatic.pool_tokens);
+        contract.variables.push(Variable::Prefill(vec![PrefillShape { rows: 2752, waves: 3 }]));
+        contract.variables.push(Variable::Lanes(vec![1]));
+        add_profile(&mut contract, (3..91).collect(), vec![0, 1], vec![15, 18],
+            &[PINNED_EXPERTS, AUTO_EXPERTS]);
+        for &(cut, tokens, onboard, totals, slopes) in &witnesses {
+            let activation = match cut {
+                7 => Activation::choice(7, 1),
+                9 => Activation { clauses: vec![vec![
+                    Choice { variable: 7, option: 0 }, Choice { variable: 9, option: 1 },
+                ]] },
+                10 => Activation::choice(9, 0),
+                _ => unreachable!(),
+            };
+            for gpu in 0..2 {
+                let expert = if onboard == 15 { PINNED_EXPERTS } else { AUTO_EXPERTS };
+                let fixed = totals[gpu] - tokens / 64 * slopes[gpu] - expert;
+                let curve = ByteCurve::linear(fixed + slopes[gpu], slopes[gpu], maximum);
+                let mut owner = allocation(&format!("step.frozen.{cut}.{gpu}"), fixed + slopes[gpu]);
+                owner.location = Location::coordinator(gpu as u8);
+                let mut component = Component::allocation(owner, curve.clone(), false, maximum);
+                component.byte_extent(curve).unwrap();
+                component.activation = activation.clone();
+                contract.components.push(component);
+            }
+        }
+        let mut budgets = two_gpus(101_973_491_712, 101_973_491_712);
+        for budget in &mut budgets {
+            budget.baseline = Baseline::Forecast {
+                occupied: 586_416_128,
+                source: "frozen Step CPU plan pre-weight baseline".into(),
+                assumed: false,
+            };
+            budget.headroom = 2 << 30;
+        }
+        for &(cut, tokens, onboard, totals, _) in &witnesses {
+            let mut selected = (0..23).map(|layer|
+                usize::from((7..10).contains(&layer) && layer >= cut)).collect::<Vec<_>>();
+            selected.extend([0, 0, usize::from(onboard == 18)]);
+            let phases = evaluate(&contract.facts(&selected, tokens / 64).unwrap(), &budgets).unwrap();
+            let owned = phases.iter().filter(|p| p.phase == Phase::Ready)
+                .map(|p| p.owned).collect::<Vec<_>>();
+            assert_eq!(owned, totals, "CSA cut {cut} preserves the real plan's rank totals");
+            if cut == 7 {
+                assert!(matches!(evaluate(&contract.facts(&selected, tokens / 64 + 1).unwrap(), &budgets),
+                    Err(Refusal::Capacity { .. })));
+            } else {
+                evaluate(&contract.facts(&selected, TARGET / 64 + 1).unwrap(), &budgets).unwrap();
+            }
+        }
+        let recipe = Prepared(contract);
+        let req = Request { context: (1 << 20).into(), onboard: Pin::Exact(15), ..request() };
+        let pinned = solve(req.clone(), budgets.clone(), &recipe).unwrap();
+        let explicit = solve(Request { pool: Pin::Exact(TARGET), ..req.clone() },
+            budgets.clone(), &recipe).unwrap();
+        let automatic = solve(Request { onboard: Pin::Auto, ..req }, budgets, &recipe).unwrap();
+        assert_eq!((pinned.pool_tokens, pinned.decisions.onboard()), (TARGET, 15));
+        assert_eq!((automatic.pool_tokens, automatic.decisions.onboard()), (TARGET, 18));
+        assert_eq!(pinned.decisions, explicit.decisions);
+        // Active-phase balance may improve upon the old explicit-2M witness's cut
+        // 10. The required invariant is the feasible target, not its old owner cut.
+        assert_eq!(pinned.decisions.attention.iter()
+            .filter(|mode| matches!(mode, LayerMode::Whole { gpu: 0, .. })).count(), 9);
+        assert_eq!(pinned.pool_tokens, automatic.pool_tokens);
+    });
 }
 
 #[test]
 fn flash_spark_free_auto_all_inventory_replay_stops_at_target_and_retains_slack() {
-    // Real requested-zero-Spark plan from #776 comment 6589996421, a2a6de7d0:
-    // Flash EXLR8 k4 revision 867580abd28d142bb4c56218bb81a752b7dea988,
-    // two PROs, spec/media off, context 1M, prefill 4096x1. Preserve this
-    // inventory, not the legacy policy that fills past the automatic target.
-    const TARGET: u64 = 2 << 20;
-    const LEGACY_POOL: u64 = 2_761_216;
-    const SLOPE: u64 = 789_892;
-    const EXPERTS: u64 = 79_800_852_992;
-    const CAPACITY: u64 = 99_826_008_064;
-    const TOTALS: [u64; 2] = [99_825_322_576, 99_489_193_600];
-    let maximum = (4 << 20) / 256;
-    let mut contract = Contract::fixed(256, maximum, 2, facts(vec![]));
-    for layer in 0..45 {
-        contract.variables.push(Variable::Attention { layer, values: vec![
-            if layer >= 3 && (layer - 3) % 4 == 0 { LayerMode::ContextSplit }
-            else { LayerMode::HeadSplit },
-        ] });
-    }
-    contract.variables.push(Variable::Prefill(vec![PrefillShape { rows: 4096, waves: 1 }]));
-    contract.variables.push(Variable::Lanes(vec![1]));
-    // Spark-free removes the remote home from the domain; Auto is still the
-    // same pool-first objective, with the only legal profile owning all 42.
-    add_profile(&mut contract, (3..45).collect(), vec![0, 1], vec![42], &[EXPERTS]);
-    for (gpu, total) in TOTALS.into_iter().enumerate() {
-        let fixed = total - LEGACY_POOL / 256 * SLOPE - EXPERTS;
-        let curve = ByteCurve::linear(fixed + SLOPE, SLOPE, maximum);
-        let mut owner = allocation(&format!("flash.frozen.{gpu}"), fixed + SLOPE);
-        owner.location = Location::coordinator(gpu as u8);
-        let mut component = Component::allocation(owner, curve.clone(), false, maximum);
-        component.byte_extent(curve).unwrap();
-        contract.components.push(component);
-    }
-    let mut budgets = two_gpus(CAPACITY, CAPACITY);
-    for budget in &mut budgets { budget.physical_bytes = 96 << 30; }
-    let selected = vec![0; contract.variables.len()];
-    let legacy = evaluate(&contract.facts(&selected, LEGACY_POOL / 256).unwrap(), &budgets).unwrap();
-    assert_eq!(legacy.iter().filter(|p| p.phase == Phase::Ready).map(|p| p.owned)
-        .collect::<Vec<_>>(), TOTALS);
-    assert!(matches!(evaluate(&contract.facts(&selected, LEGACY_POOL / 256 + 1).unwrap(), &budgets),
-        Err(Refusal::Capacity { .. })));
-    let recipe = Prepared(contract);
-    let req = Request { context: (1 << 20).into(), ..request() };
-    let automatic = solve(req.clone(), budgets.clone(), &recipe).unwrap();
-    let pinned = solve(Request { onboard: Pin::Exact(42), ..req.clone() }, budgets.clone(), &recipe).unwrap();
-    let explicit = solve(Request { pool: Pin::Exact(TARGET), ..req.clone() }, budgets.clone(), &recipe).unwrap();
-    assert_eq!(automatic.pool_tokens, TARGET);
-    assert_eq!(automatic.decisions.onboard(), 42);
-    assert_eq!(automatic.decisions.onboard_layers, vec![(3..45).collect::<Vec<_>>(); 2]);
-    assert_eq!(automatic.decisions, pinned.decisions);
-    assert_eq!(automatic.decisions, explicit.decisions);
-    assert_eq!(pinned.pool_tokens, TARGET);
-    for (gpu, slack) in [2_049_665_336, 2_385_794_312].into_iter().enumerate() {
-        assert_eq!(automatic.remaining(&budgets[gpu].id, Phase::Ready), Some(slack));
-    }
-    assert_eq!(solve(Request { pool: Pin::Exact(LEGACY_POOL), ..req }, budgets, &recipe)
-        .unwrap().pool_tokens, LEGACY_POOL);
+    cuteafd_core::memory_policy::MemoryPolicy { kv_max: Some(2 << 20), ..Default::default() }.scoped(|| {
+        // Real requested-zero-Spark plan from #776 comment 6589996421, a2a6de7d0:
+        // Flash EXLR8 k4 revision 867580abd28d142bb4c56218bb81a752b7dea988,
+        // two PROs, spec/media off, context 1M, prefill 4096x1. Preserve this
+        // inventory, not the legacy policy that fills past the automatic target.
+        const TARGET: u64 = 2 << 20;
+        const LEGACY_POOL: u64 = 2_761_216;
+        const SLOPE: u64 = 789_892;
+        const EXPERTS: u64 = 79_800_852_992;
+        const CAPACITY: u64 = 99_826_008_064;
+        const TOTALS: [u64; 2] = [99_825_322_576, 99_489_193_600];
+        let maximum = (4 << 20) / 256;
+        let mut contract = Contract::fixed(256, maximum, 2, facts(vec![]));
+        for layer in 0..45 {
+            contract.variables.push(Variable::Attention { layer, values: vec![
+                if layer >= 3 && (layer - 3) % 4 == 0 { LayerMode::ContextSplit }
+                else { LayerMode::HeadSplit },
+            ] });
+        }
+        contract.variables.push(Variable::Prefill(vec![PrefillShape { rows: 4096, waves: 1 }]));
+        contract.variables.push(Variable::Lanes(vec![1]));
+        // Spark-free removes the remote home from the domain; Auto is still the
+        // same pool-first objective, with the only legal profile owning all 42.
+        add_profile(&mut contract, (3..45).collect(), vec![0, 1], vec![42], &[EXPERTS]);
+        for (gpu, total) in TOTALS.into_iter().enumerate() {
+            let fixed = total - LEGACY_POOL / 256 * SLOPE - EXPERTS;
+            let curve = ByteCurve::linear(fixed + SLOPE, SLOPE, maximum);
+            let mut owner = allocation(&format!("flash.frozen.{gpu}"), fixed + SLOPE);
+            owner.location = Location::coordinator(gpu as u8);
+            let mut component = Component::allocation(owner, curve.clone(), false, maximum);
+            component.byte_extent(curve).unwrap();
+            contract.components.push(component);
+        }
+        let mut budgets = two_gpus(CAPACITY, CAPACITY);
+        for budget in &mut budgets { budget.physical_bytes = 96 << 30; }
+        let selected = vec![0; contract.variables.len()];
+        let legacy = evaluate(&contract.facts(&selected, LEGACY_POOL / 256).unwrap(), &budgets).unwrap();
+        assert_eq!(legacy.iter().filter(|p| p.phase == Phase::Ready).map(|p| p.owned)
+            .collect::<Vec<_>>(), TOTALS);
+        assert!(matches!(evaluate(&contract.facts(&selected, LEGACY_POOL / 256 + 1).unwrap(), &budgets),
+            Err(Refusal::Capacity { .. })));
+        let recipe = Prepared(contract);
+        let req = Request { context: (1 << 20).into(), ..request() };
+        let automatic = solve(req.clone(), budgets.clone(), &recipe).unwrap();
+        let pinned = solve(Request { onboard: Pin::Exact(42), ..req.clone() }, budgets.clone(), &recipe).unwrap();
+        let explicit = solve(Request { pool: Pin::Exact(TARGET), ..req.clone() }, budgets.clone(), &recipe).unwrap();
+        assert_eq!(automatic.pool_tokens, TARGET);
+        assert_eq!(automatic.decisions.onboard(), 42);
+        assert_eq!(automatic.decisions.onboard_layers, vec![(3..45).collect::<Vec<_>>(); 2]);
+        assert_eq!(automatic.decisions, pinned.decisions);
+        assert_eq!(automatic.decisions, explicit.decisions);
+        assert_eq!(pinned.pool_tokens, TARGET);
+        for (gpu, slack) in [2_049_665_336, 2_385_794_312].into_iter().enumerate() {
+            assert_eq!(automatic.remaining(&budgets[gpu].id, Phase::Ready), Some(slack));
+        }
+        assert_eq!(solve(Request { pool: Pin::Exact(LEGACY_POOL), ..req }, budgets, &recipe)
+            .unwrap().pool_tokens, LEGACY_POOL);
+    });
 }
 
 #[test]
@@ -2445,19 +2451,19 @@ fn full_context_refusal_prices_best_feasible_assignment_not_pruned_alternative()
 }
 
 #[test]
-fn automatic_target_uses_logical_cap_for_small_card_simulation() {
+fn automatic_target_is_uniform_for_small_card_simulation() {
     let recipe = Linear::new();
     let mut card = budget(96 << 30);
     card.logical_bytes = 24 << 30;
     assert_eq!(
         solve(request(), vec![card], &recipe).unwrap().pool_tokens,
-        1 << 20
+        2 << 20
     );
     assert_eq!(
         solve(request(), vec![budget(32 << 30)], &recipe)
             .unwrap()
             .pool_tokens,
-        1 << 20
+        2 << 20
     );
     let context = 3 << 20;
     let recipe = Linear {
@@ -2481,7 +2487,7 @@ fn automatic_target_uses_logical_cap_for_small_card_simulation() {
 
 #[test]
 fn pool_first_then_onboarding_and_exact_constraints() {
-    let target = 1 << 20;
+    let target = 2 << 20;
     let recipe = Linear {
         onboard: 2,
         ..Linear::new()
@@ -3549,8 +3555,8 @@ fn kv_min_refuses_and_kv_max_grows_an_automatic_pool_past_the_target() {
     let contract = Linear { maximum: 64 * 1000, ..Linear::new() }.prepare(&request()).unwrap();
     let solve_with = |policy: MemoryPolicy, bytes: u64| policy.scoped(||
         solve(request(), vec![budget(bytes)], &Prepared(contract.clone())));
-    // Target 64 pages: the layout is sized for it; without a max the pool stops there.
-    let target = MemoryPolicy { kv_target: Some(64 * 64), kv_min: Some(64), ..Default::default() };
+    // Target 64 pages: a user cap retains the old target-only baseline.
+    let target = MemoryPolicy { kv_target: Some(64 * 64), kv_min: Some(64), kv_max: Some(64 * 64), ..Default::default() };
     assert_eq!(solve_with(target, 64 * 500).unwrap().pool_tokens, 64 * 64);
     // KV max 640 pages: the pool grows into what is left, up to the max.
     let grow = MemoryPolicy { kv_max: Some(64 * 640), ..target };
@@ -3571,7 +3577,7 @@ fn automatic_context_uses_shared_floor_and_exact_admitted_extent() {
         let mut available = budget(pool);
         available.physical_bytes = 96 << 30;
         let solved = solve(automatic.clone(), vec![available], &recipe).unwrap();
-        assert_eq!(solved.pool_tokens, pool.min(1 << 20));
+        assert_eq!(solved.admitted_extent(), pool);
         assert_eq!(solved.served_context(), maximum.min(pool));
         assert_eq!(solved.request.context.maximum, maximum);
     }
@@ -3602,7 +3608,7 @@ fn automatic_floor_is_bounded_by_an_explicit_target() {
         .scoped(|| {
             let solved = solve(Request { context: Context::automatic(1 << 20), ..request() },
                 vec![budget(2 << 20)], &Linear::new()).unwrap();
-            assert_eq!((solved.pool_tokens, solved.served_context()), (131_072, 131_072));
+            assert_eq!((solved.pool_tokens, solved.served_context()), (2 << 20, 1 << 20));
         });
 }
 
@@ -3750,4 +3756,37 @@ fn dashboard_reservations_include_deferred_host_prefix_and_match_assess() {
     }
     // Existing readiness/admission projection semantics are intentionally unchanged.
     assert!(p.items_at(Location::PINNED, Phase::Growth).unwrap().is_empty());
+}
+
+
+#[test]
+fn memory_domain_bounds_exact_growth_without_changing_target_onboarding() {
+    use cuteafd_core::memory_policy::MemoryPolicy;
+    let req = Request { context: Context::automatic(131_072), ..request() };
+    for bytes in [32u64 << 30, 96 << 30, 192 << 30] {
+        let cards = [bytes];
+        let solve_with = |policy: MemoryPolicy| policy.scoped(|| {
+            let pool = crate::placement::prepare_pool(crate::plan::testing::pool_facts(
+                &cards, req.context, None, 64, &[64 * 1024])).unwrap();
+            let mut contract = Linear { maximum: pool.maximum_tokens(), onboard: 2,
+                ..Linear::new() }.prepare(&req).unwrap();
+            contract.set_byte_extent("kv", ByteCurve::linear(64 * 1024, 64 * 1024,
+                contract.maximum_pages)).unwrap();
+            contract.validate().unwrap();
+            let solved = search::solve_prepared(req.clone(), vec![budget(bytes)],
+                &Prepared(contract), &pool).unwrap();
+            assert!(pool.maximum_tokens() >= solved.admitted_extent());
+            (pool, solved)
+        });
+        let (_, baseline) = solve_with(MemoryPolicy { kv_max: Some(2 << 20), ..Default::default() });
+        let (pool, grown) = solve_with(MemoryPolicy::default());
+        assert_eq!(pool.maximum_tokens(), bytes / (64 * 1024) * 64);
+        assert_eq!(grown.decisions.onboard(), 2);
+        assert_eq!(grown.decisions.onboard(), baseline.decisions.onboard());
+        assert_eq!(grown.admitted_extent(), (bytes - 2 * 64) / (64 * 1024) * 64);
+        let (capped_pool, capped) = solve_with(MemoryPolicy { kv_max: Some(4 << 20), ..Default::default() });
+        assert_eq!(capped_pool.maximum_tokens(), (4 << 20).min(pool.maximum_tokens()));
+        assert_eq!(capped.admitted_extent(), (4 << 20).min(grown.admitted_extent()));
+        assert_eq!(capped.decisions.onboard(), baseline.decisions.onboard());
+    }
 }

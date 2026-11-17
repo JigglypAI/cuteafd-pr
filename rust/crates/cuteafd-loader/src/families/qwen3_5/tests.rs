@@ -673,7 +673,7 @@ fn public_plan_and_runtime_share_resolved_pool_with_optional_target_and_growth()
                             verify_check: false }).unwrap();
                     let policy = report.phase_ledger.unwrap().pool_policy.unwrap();
                     assert_eq!(Some(policy), runtime.pool_policy);
-                    let expected = target.unwrap_or(if capacity <= 32 << 30 { 1 << 20 } else { 2 << 20 });
+                    let expected = target.unwrap_or(2 << 20);
                     assert_eq!(policy.target(), expected);
                     if maximum.is_some() { assert!(runtime.pool_tokens > expected); }
                 });

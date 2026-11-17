@@ -68,13 +68,13 @@ pub(crate) struct MemoryArgs {
     /// Graph node/executable padding: percentage (default 2.5%), bytes per coefficient, or rtx=VALUE,spark=VALUE; independent of GPU_RESERVE.
     #[arg(long, global = true)]
     pub(crate) graph_node_padding: Option<cuteafd_core::memory_policy::GraphNodePadding>,
-    /// KV tokens the layout is sized for (default 2M; 1M on cards of 32 GiB or less).
+    /// KV tokens the layout is sized for (default 2M on every card).
     #[arg(long, global = true)]
     pub(crate) kv_target_tokens: Option<u64>,
     /// Refuse the launch below this many KV tokens (default: min(256K, model context)).
     #[arg(long, global = true)]
     pub(crate) kv_min_tokens: Option<u64>,
-    /// Grow the pool into memory left after the layout is fixed, up to this (default: the target).
+    /// Cap pool growth after the layout is fixed (default: all remaining memory).
     #[arg(long, global = true)]
     pub(crate) kv_max_tokens: Option<u64>,
 }
@@ -660,6 +660,9 @@ pub(crate) struct PlanArgs {
     /// Shared GQA drafter-ring format for layout admission.
     #[arg(long, default_value = "fp8")]
     pub(crate) draft_kv_cache: cuteafd_loader::families::qwen4::Qwen4KvCache,
+    /// Zero preserves the native drafter context; positive values bound it.
+    #[arg(long, default_value_t = 0)]
+    pub(crate) draft_context_window: usize,
     /// Muse Spark partial replies (serve-muse's flags): the per-request BF16 row cutoff.
     #[arg(long, default_value_t = cuteafd_loader::families::muse_spark::replies::DEFAULT_BF16_MAX_ROWS)]
     pub(crate) expert_partial_bf16_max_rows: usize,

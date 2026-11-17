@@ -30,6 +30,7 @@ impl<'a> CommonDraft<'a> {
         }
     }
     pub fn is_block(&self) -> bool { matches!(self,Self::Block { .. }) }
+    pub fn is_windowed_block(&self) -> bool { matches!(self,Self::Block { draft,.. } if draft.cfg.window.is_some()) }
     pub fn tap_index(&self, layer: usize) -> Option<usize> { self.geometry().taps.iter().position(|&l| l == layer) }
     pub fn taps(&self) -> CuteafdDeviceBuffer {
         match self { Self::Mla(d) => d.taps.buffer, Self::Block { draft:d,.. } => d.taps.buffer }
@@ -68,7 +69,7 @@ impl<'a> CommonDraft<'a> {
     }
     pub fn reset_context(&self,slot:usize,origin:usize)->Result<()> {
         match self { Self::Mla(d)=>d.reset_context(slot,origin), Self::Block { draft:d,frontiers }=> {
-            d.reset_context(slot,0)?;
+            d.reset_context(slot,if d.cfg.window.is_some() { 0 } else { origin })?;
             *frontiers.borrow_mut().get_mut(slot).context("block draft reset slot outside admission")?=(origin,origin);
             Ok(())
         } }
@@ -103,7 +104,7 @@ impl<'a> CommonDraft<'a> {
         Ok(draft.window_readers())
     }
     pub fn mla_snapshot_buffers(&self)->Result<Vec<CuteafdDeviceBuffer>> {
-        match self { Self::Mla(d)=>d.mla_snapshot_buffers(),Self::Block { draft:d,.. }=>
+        match self { Self::Mla(d)=>d.mla_snapshot_buffers(),Self::Block { draft:d,.. } if d.cfg.window.is_none()=>Ok(Vec::new()),Self::Block { draft:d,.. }=>
             (0..d.slots).map(|slot|d.window_planes(slot)).collect::<Result<Vec<_>>>().map(|v|v.into_iter().flatten().collect()) }
     }
     pub fn bind_cooperative_producers(&mut self,producers:&[crate::shared::peer_split::RankDevice])->Result<()> {
@@ -137,36 +138,40 @@ impl<'a> CommonDraft<'a> {
     pub fn last_logits(&self,seqs:usize)->Result<Vec<f32>> {
         match self { Self::Mla(d)=>d.last_logits(seqs),Self::Block { draft:d,.. }=>d.last_logits(seqs) }
     }
-    pub fn mla_draft_page_bytes(&self)->usize { match self { Self::Mla(d)=>d.mla_draft_page_bytes(),Self::Block { .. }=>0 } }
+    pub fn mla_draft_page_bytes(&self)->usize { match self { Self::Mla(d)=>d.mla_draft_page_bytes(),Self::Block { draft,.. }=>draft.page_bytes() } }
     pub fn mla_reservation(&self,slot:usize)->Option<cuteafd_engine::reserve::DraftDemand> {
-        match self { Self::Mla(d)=>d.mla_reservation(slot),Self::Block { .. }=>None }
+        match self { Self::Mla(d)=>d.mla_reservation(slot),Self::Block { draft,.. }=>draft.reservation(slot) }
     }
-    pub fn mla_reservable(&self)->Option<usize> { match self { Self::Mla(d)=>d.mla_reservable(),Self::Block { .. }=>None } }
-    pub fn mla_lifetime_rows(&self)->Option<usize> { match self { Self::Mla(d)=>d.mla_lifetime_rows(),Self::Block { .. }=>None } }
+    pub fn mla_reservable(&self)->Option<usize> { match self { Self::Mla(d)=>d.mla_reservable(),Self::Block { draft,.. }=>draft.reservable() } }
+    pub fn mla_lifetime_rows(&self)->Option<usize> { match self { Self::Mla(d)=>d.mla_lifetime_rows(),Self::Block { draft,.. }=>draft.lifetime_rows() } }
     pub fn mla_admission(&self,origin:usize)->Option<cuteafd_engine::reserve::DraftDemand> {
-        match self { Self::Mla(d)=>d.mla_admission(origin),Self::Block { .. }=>None }
+        match self { Self::Mla(d)=>d.mla_admission(origin),Self::Block { draft,.. }=>draft.admission(origin) }
     }
     pub fn quarantine_mla_pages(&self, slot: usize) {
         match self { Self::Mla(d) => d.quarantine_mla_pages(slot), Self::Block { draft, .. } => draft.quarantine_pages(slot) }
     }
     pub fn admit_mla_pages(&self,slot:usize,capacity:usize)->std::result::Result<(),BoxError> {
-        match self { Self::Mla(d)=>d.admit_mla_pages(slot,capacity),Self::Block { .. }=>Ok(()) }
+        match self { Self::Mla(d)=>d.admit_mla_pages(slot,capacity),Self::Block { draft,.. }=>draft.admit_pages(slot,capacity).map_err(Into::into) }
     }
-    pub fn mla_pages_valid(&self,a:&Attachment)->bool { match self { Self::Mla(d)=>d.mla_pages_valid(a),Self::Block { .. }=>false } }
-    pub fn mla_pages_revocable(&self,a:&Attachment)->bool { match self { Self::Mla(d)=>d.mla_pages_revocable(a),Self::Block { .. }=>false } }
-    pub fn retain_mla_pages(&self,a:&Attachment)->Result<()> { match self { Self::Mla(d)=>d.retain_mla_pages(a),Self::Block { .. }=>anyhow::bail!("window draft has no page attachments") } }
-    pub fn release_mla_pages(&self,a:&Attachment)->Result<()> { match self { Self::Mla(d)=>d.release_mla_pages(a),Self::Block { .. }=>anyhow::bail!("window draft has no page attachments") } }
+    pub fn mla_pages_valid(&self,a:&Attachment)->bool { match self { Self::Mla(d)=>d.mla_pages_valid(a),Self::Block { draft,.. }=>draft.pages_valid(a) } }
+    pub fn mla_pages_revocable(&self,a:&Attachment)->bool { match self { Self::Mla(d)=>d.mla_pages_revocable(a),Self::Block { draft,.. }=>draft.pages_revocable(a) } }
+    pub fn retain_mla_pages(&self,a:&Attachment)->Result<()> { match self { Self::Mla(d)=>d.retain_mla_pages(a),Self::Block { draft,.. }=>draft.retain_pages(a) } }
+    pub fn release_mla_pages(&self,a:&Attachment)->Result<()> { match self { Self::Mla(d)=>d.release_mla_pages(a),Self::Block { draft,.. }=>draft.release_pages(a) } }
     pub fn capture_mla_pages(&self,slot:usize,frontier:usize,write:usize)->std::result::Result<Attachment,BoxError> {
-        match self { Self::Mla(d)=>d.capture_mla_pages(slot,frontier,write),Self::Block { .. }=>Err("window draft has no page attachments".into()) }
+        match self { Self::Mla(d)=>d.capture_mla_pages(slot,frontier,write),Self::Block { draft,.. }=>draft.capture_pages(slot,frontier,write).map_err(Into::into) }
     }
     pub fn promote_mla_pages(&self,a:&Attachment)->std::result::Result<Attachment,BoxError> {
-        match self { Self::Mla(d)=>d.promote_mla_pages(a),Self::Block { .. }=>Err("window draft has no page attachments".into()) }
+        match self { Self::Mla(d)=>d.promote_mla_pages(a),Self::Block { draft,.. }=>draft.promote_pages(a).map_err(Into::into) }
     }
     pub fn mla_page_segments(&self,p:cuteafd_engine::prefix::DraftPageId)->Result<Vec<cuteafd_hostcache::copy::DeviceRange>> {
-        match self { Self::Mla(d)=>d.mla_page_segments(p),Self::Block { .. }=>anyhow::bail!("window draft has no page attachments") }
+        match self { Self::Mla(d)=>d.mla_page_segments(p),Self::Block { draft,.. }=>draft.page_segments(p) }
     }
     pub fn restore_mla_pages(&self,slot:usize,a:&Attachment,end:usize)->std::result::Result<(),BoxError> {
-        match self { Self::Mla(d)=>d.restore_mla_pages(slot,a,end),Self::Block { .. }=>Err("window draft has no page attachments".into()) }
+        match self { Self::Mla(d)=>d.restore_mla_pages(slot,a,end),Self::Block { draft,frontiers }=> {
+            draft.restore_pages(slot,a,end)?;
+            *frontiers.borrow_mut().get_mut(slot).ok_or("block restore slot outside admission")?=(a.origin,a.frontier);
+            Ok(())
+        } }
     }
 }
 

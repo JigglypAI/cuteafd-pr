@@ -117,6 +117,7 @@ default-off performance lever adds its row here in the same PR (AGENTS.md).
 
 | Lever | Families | Enable | Effect | Cost |
 | --- | --- | --- | --- | --- |
+| `DRAFT_CONTEXT_WINDOW` | Kimi K3 | `DRAFT_CONTEXT_WINDOW=2048` (default `0`, native) | Bound full-context draft KV; unmeasured. Lithos K3.1 uses 40 MiB BF16 or 21.25 MiB FP8 per sequence at window 2048, instead of 20,480 or 10,880 bytes per token in the full-context pool. | Changes draft attention/acceptance, not verified target output. Native full context is retained at 0. |
 | `GRAPH_PREWARM` | V4.1, GLM Flash | `GRAPH_PREWARM=off` (default `on`) | Skip startup graph prewarm and allow lazy request-time capture on single-GPU layouts. With donor-always, V4.1 min measured graph high-water 3.114 GB to 0.902 GB; GLM Flash min 52.4 MB to 35.7 MB (2026-11-16, RTX PRO 6000, one warmed launch/arm). Other families and cross-device layouts reject `off` (#1878). | First-use capture latency; no intended precision change. Admission reserve is unchanged: lower physical high-water alone does not expand KV; a separately qualified lower explicit reserve is needed. |
 | `GRAPH_DONOR_ALWAYS` | V4.1, V4, GLM 5.3 / ML4, GLM Flash, MiMo, Qwen4, Qwen dense, Kimi K3, Step-5, Muse, Inkling | `GRAPH_DONOR_ALWAYS=on` (default `off`) | Prefer a same-topology cold donor below the soft cap as well as above it. With prewarm off, V4.1 min C1/C16/post-C1 126.02/541.62/123.42 to 125.49/501.17/121.26 tok/s; 165,824 request-time updates/re-keys. GLM Flash min 109.41/393.98/87.17 to 109.02/397.93/87.10 tok/s; 1,270 updates/re-keys. One warmed matched launch/arm, RTX PRO 6000, no thermal slowdown, unchanged KL/top-1. | May replace a reusable cached shape and require a later update; no intended precision change. |
 | `GRAPH_DONOR_COLD_LAG` | V4.1, V4, GLM 5.3 / ML4, GLM Flash, MiMo, Qwen4, Qwen dense, Kimi K3, Step-5, Muse, Inkling | `GRAPH_DONOR_ALWAYS=on GRAPH_DONOR_COLD_LAG=16` (default `0`) | Require age > K + N below the soft cap; pressure keeps age > K. V4.1 min, 1 RTX PRO 6000 + 3 Sparks, DSpark, dev `0edd9b6c4` (2026-11-17), one warmed matched launch/arm: defaults / donor-always lag 0 / lag 16 C1 132.73/125.88/132.99, C16 556.17/499.76/527.38, post-C1 124.24/117.20/123.11 tok/s. Donor arms disable prewarm. Lag 16 cuts request-time updates/re-keys 164,366 to 47,057; physical graph charge 3.043/0.935/1.669 GB (admission reserve unchanged). Its C16/default ratio 0.948 meets the experiment's stop bar, not the 0.98 recovery goal; no further tuning. No thermal slowdown; C16 power-cap seconds 1.004/0/0, max temperatures 60/57/58 C, min T.Limit headroom 38/38/37 C; donor busy clocks unavailable (default 2805 MHz). Other families unmeasured. | Lag 16 retains more graph memory than lag 0; quality unchanged (baseline KL 0.01328, top-1 96.956%). Remains opt-in; no intended precision change. |
@@ -667,9 +668,9 @@ Each key is also a global `cuteafd` flag (`--gpu-memory-cap`, `--kv-max-tokens`,
 
 | Key | Default | Values | Notes |
 | --- | --- | --- | --- |
-| `KV_TARGET_TOKENS` | 2M; 1M on cards of 32 GB or less | positive count | KV the layout is sized for: layer placement, onboarding, buffers. |
+| `KV_TARGET_TOKENS` | 2M on every card | positive count | KV the layout is sized for: layer placement, onboarding, buffers. |
 | `KV_MIN_TOKENS` | min(256K, model max context, KV target), on every layout | positive count | Refuse automatic pools below this; missing the target is fine down to it. Automatic context serves min(model max context, admitted pool); an explicit context still requires the pool to cover it. |
-| `KV_MAX_TOKENS` | the target | positive count, at least the target | After an automatic layout is fixed, the pool grows into free memory up to this. A pinned `RTX_EXPERT_LAYERS` already makes the pool the output (it fills what is left). |
+| `KV_MAX_TOKENS` | unbounded (all remaining memory) | positive count, at least the target | After the target-sized layout and expert onboarding are fixed, the pool takes the remaining admitted memory, bounded by native encoding limits. An explicit value caps this growth. A pinned `RTX_EXPERT_LAYERS` already makes the pool the output (it fills what is left). |
 | `GPU_MEMORY_CAP` | full device | size | Total per-GPU ceiling for plan, serve and golden; leaves SM count and L2 unchanged. |
 | `SPARK_MEMORY_CAP` | each host's measured idle `MemAvailable` | size | Explicit total per-Spark engine ceiling overrides measured capacities, including worker process residency and routed weights. No extra margin. |
 | `GPU_RESERVE` | auto | size | Sets the total GPU reserve; built-in reserve components (including release padding) become 0, but physical driver page tables, named sampled pre-weight occupancy and the bounded graph-cache reserve stay charged. Still inside the cap. |
@@ -688,7 +689,7 @@ Each key is also a global `cuteafd` flag (`--gpu-memory-cap`, `--kv-max-tokens`,
 | `FAMILY_RESERVE` | per-family constant (0 in every family) | size | A named per-GPU reserve added to the measured components; `GPU_RESERVE` overrides it. One key for coordinator GPUs only: no family keeps a per-family Spark margin (Sparks use `SPARK_RESERVE`). |
 | `KV_POOL_TOKENS` | unset | multiple of 64 | V4.1 only: fixed KV pool. Conflicts with `POOL_TOKENS`. |
 | `KV_POOL_SIZE` | unset | `B/MB/GB/MiB/GiB` | V4.1 only: fixed KV pool size. |
-| `POOL_TOKENS` | `auto` where offered | `auto` or count | Planner-sized pool up to 2M tokens; a number pins it. |
+| `POOL_TOKENS` | `auto` where offered | `auto` or count | Automatic pool uses memory left after target-sized placement and onboarding; a number pins it. |
 | `HOST_CACHE_BYTES` | `auto` | `auto`, `0`, byte size | Prefix-cache host tier; `0` disables it. |
 
 ## Attention and KV
@@ -703,6 +704,7 @@ Each key is also a global `cuteafd` flag (`--gpu-memory-cap`, `--kv-max-tokens`,
 | `MAX_OUTPUT_TOKENS` | `131072` | integer | Generation cap. |
 | `KV_CACHE` | family default | `bf16`, `fp8`; MiMo also `int8` | See the precision table below. |
 | `SWA_KV_CACHE` | `int8` | `bf16`, `int8`, `fp8` | MiMo sliding/MTP rings. |
+| `DRAFT_CONTEXT_WINDOW` | `0` | Nonnegative token count | Kimi K3.1 DSpark context override (other launcher families reject this key). Unset/0 preserves native attention (full context for Lithos K3.1 DSpark, trained window for Inferact); a positive value selects a window, e.g. 2048. It never changes target KV or target taps. |
 | `DRAFT_KV_CACHE` | `fp8` | `bf16`, `fp8` | Drafter ring storage (GLM 5.3, GLM Flash, MiMo, Muse, Kimi GQA block dSpark; Kimi MLA DFlash2 follows target KV). |
 | `PREFIX_CACHE_ENTRIES` | `auto` | `auto`, non-negative | Snapshot entries; auto derives from context × concurrency. |
 | `PREFIX_CACHE_MARK_MIB` | unset | MiB | Recurrent/ring state retained per mark. |
@@ -1173,6 +1175,7 @@ original core is already FP8, not an MC publication.
 | `SPECULATOR_MODEL_REVISION` | ✗ | ✓ | ✓ | ✓ | ✓ | ✗ | ✓ | ✓ | ✗ | ✓ | ✗ |
 | `SPECULATOR_DEPTH` | ✗ | ✗ | ✗ | ✗ | ✓ | ✓ | ✓ | ✗ | ✓ | ✗ | ✗ |
 | `DRAFT_LENGTH` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `DRAFT_CONTEXT_WINDOW` | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✓ | ✗ | ✗ | ✗ |
 | `SPECULATOR_FP8` | ✗ | ✗ | ✓ | ✓ | ✓ | ✓ | ✗ | ✓ | ✗ | ✗ | ✗ |
 | `DRAFT_POLICY` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✓ | ✗ | ✗ | ✗ |
 | `DRAFT_ROW_COST` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ |
