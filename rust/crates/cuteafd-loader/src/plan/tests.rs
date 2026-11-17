@@ -975,7 +975,7 @@ fn boot_concurrency_full_plan_matrix() {
     }
 }
 
-fn assert_pool_max_growth(input: &PlanInput, options: &PlanOptions) {
+fn assert_pool_max_growth(input: &BudgetedPlanInput, options: &PlanOptions) {
     use cuteafd_core::memory_policy::MemoryPolicy;
     let default = MemoryPolicy::default().scoped(|| input.plan(options)).unwrap();
     assert!(default.fits && default.placement_supported, "{}", render(&default));
@@ -1014,14 +1014,14 @@ fn pool_max_grows_after_onboarding_in_every_family_planner() {
         if family == "deepseek_v41" {
             options.layout.as_mut().unwrap().workspace_manifest = v41_workspace(dir.path());
         }
-        let input = PlanInput::open(dir.path()).unwrap();
+        let input = BudgetedPlanInput::open(dir.path()).unwrap();
         assert_pool_max_growth(&input, &options);
     }
     let (dir, manifest) = qwen4_matrix_snapshot();
     let mut options = wave_plan_options(dir.path(), 4);
     options.layout.as_mut().unwrap().pool_tokens = None;
     options.layout.as_mut().unwrap().workspace_manifest = Some(manifest);
-    assert_pool_max_growth(&PlanInput::open(dir.path()).unwrap(), &options);
+    assert_pool_max_growth(&BudgetedPlanInput::open(dir.path()).unwrap(), &options);
 
     let dir = families::step5::tests::exl3_snapshot();
     let manifest = testing::step5_native_manifest(dir.path());
@@ -1033,7 +1033,7 @@ fn pool_max_grows_after_onboarding_in_every_family_planner() {
     options.layout.as_mut().unwrap().prefix_slots = None;
     options.layout.as_mut().unwrap().pool_tokens = None;
     options.layout.as_mut().unwrap().workspace_manifest = Some(manifest);
-    assert_pool_max_growth(&PlanInput::open(dir.path()).unwrap(), &options);
+    assert_pool_max_growth(&BudgetedPlanInput::open(dir.path()).unwrap(), &options);
 
     for family in ["kimi_k3", "muse_spark"] {
         let dir = tempfile::tempdir().unwrap();
@@ -1044,12 +1044,13 @@ fn pool_max_grows_after_onboarding_in_every_family_planner() {
             write_muse_spark_snapshot(dir.path(), &(0..62).collect::<Vec<_>>());
             write_muse_exl3_capacities(dir.path())
         };
-        let mut options = wave_plan_options(dir.path(), 4);
+        let mut options = wave_plan_options(dir.path(), if family == "kimi_k3" { 6 } else { 4 });
         options.vision = MediaMode::Off;
         let layout = options.layout.as_mut().unwrap();
         layout.pool_tokens = None;
+        if family == "kimi_k3" { layout.rtx_bytes = vec![crate::placement::inventory::PRO_TOTAL_BYTES; 2]; }
         layout.workspace_manifest = Some(manifest);
-        assert_pool_max_growth(&PlanInput::open(dir.path()).unwrap(), &options);
+        assert_pool_max_growth(&BudgetedPlanInput::open(dir.path()).unwrap(), &options);
     }
     let (dir, manifest) = families::minimax::tests::concurrency_matrix_snapshot();
     let mut options = wave_plan_options(dir.path(), 4);
@@ -1058,12 +1059,12 @@ fn pool_max_grows_after_onboarding_in_every_family_planner() {
     layout.pool_tokens = None;
     layout.onboard = Some(crate::placement::OnboardSetting::Layers(0));
     layout.workspace_manifest = Some(manifest);
-    assert_pool_max_growth(&PlanInput::open(dir.path()).unwrap(), &options);
+    assert_pool_max_growth(&BudgetedPlanInput::open(dir.path()).unwrap(), &options);
 
     // Dense Qwen already indexes the type's full extent, not maximum_tokens.
     let (dir, mut options, _, _) = crate::families::qwen3_5::tests::native_planner_fixture();
     options.layout.as_mut().unwrap().pool_tokens = None;
-    assert_pool_max_growth(&PlanInput::open(dir.path()).unwrap(), &options);
+    assert_pool_max_growth(&BudgetedPlanInput::open(dir.path()).unwrap(), &options);
 }
 
 #[test]

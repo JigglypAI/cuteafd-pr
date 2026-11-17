@@ -2054,6 +2054,24 @@ pub(super) mod tests {
     }
 
     #[test]
+    fn automatic_pool_ceiling_includes_max_but_explicit_requests_stay_strict() -> Result<()> {
+        use cuteafd_core::memory_policy::MemoryPolicy;
+        let cfg = cfg();
+        MemoryPolicy { kv_max: Some(100_000_000), ..Default::default() }.scoped(|| -> Result<()> {
+            let automatic = request(inputs(&cfg))?;
+            assert_eq!(automatic.pool.ceiling, 100_000_000);
+            assert_eq!(automatic.pool.target, 2 << 20);
+            assert_eq!(automatic.pool.compiled_context, 1 << 20);
+            let mut pinned = inputs(&cfg);
+            pinned.requested_pool = Some(2 << 20);
+            let pinned = request(pinned)?;
+            assert_eq!(pinned.pool.ceiling, 2 << 20);
+            assert_eq!(pinned.pool.requested, Some(2 << 20));
+            Ok(())
+        })
+    }
+
+    #[test]
     fn automatic_and_explicit_pools_preserve_compiled_context() -> Result<()> {
         let cfg = cfg();
         for requested in [None, Some(0), Some(262_144), Some(2 << 20)] {
