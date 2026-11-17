@@ -4,11 +4,11 @@ use anyhow::{ensure, Context};
 use cuteafd_ffi::vision::{TowerExtension, TowerNorm, TowerProjector};
 use cuteafd_loader::families::minimax_m3::vision::{VisionContract, MAX_IMAGE_TOKENS};
 
-// Provisional CPU capture only: vendor construction uses a CUDA default device.
-// Replace from both-architecture real-module buffers before enabling dispatch.
+// Actual pinned vendor constructor under CUDA/BF16 defaults, identical on both
+// architectures. CPU pow differs at indices 3, 6 and 12; do not regenerate it.
 const INV_FREQ_BITS: [u32; 13] = [
-    0x3f800000, 0x3efc1a50, 0x3e7843d0, 0x3df47c46, 0x3d70c376, 0x3ced1928, 0x3c697d22, 0x3be5ef2c,
-    0x3b626f12, 0x3adefc9d, 0x3a5b9797, 0x39d83fcc, 0x3954f507,
+    0x3f800000, 0x3efc1a50, 0x3e7843d0, 0x3df47c44, 0x3d70c376, 0x3ced1928, 0x3c697d1f, 0x3be5ef2c,
+    0x3b626f12, 0x3adefc9d, 0x3a5b9797, 0x39d83fcc, 0x3954f4ff,
 ];
 
 impl TowerSpec {
@@ -66,8 +66,8 @@ impl TowerSpec {
         let frequency_offset = packed.arena_bytes;
         let constant = ConstantRegion::fp32("rotary.thw.inv_freq", frequency_offset,
             INV_FREQ_BITS.into_iter().map(f32::from_bits),
-            "CPU FP32 arange(0,26,2)/26; reciprocal(10000**exponent); shared T/H/W; torch2.14.1+cpu",
-            "sglang@a9bf8c76a0115f5e2672bfdfc61d70a2b7936744 minimax_vl_common.py sha256=89ceb45627033fa95530d60939d060d4747abe99b3b85a022cbef31a8259e18f");
+            "CUDA FP32 arange(0,26,2)/26; reciprocal(10000**exponent); shared T/H/W; constructor under default BF16 + CUDA device",
+            "sglang@a9bf8c76a0115f5e2672bfdfc61d70a2b7936744 minimax_vl_common.py sha256=89ceb45627033fa95530d60939d060d4747abe99b3b85a022cbef31a8259e18f; torch2.14.1+cu130 CUDA13.0; SM120 probe driver595.91.07; SM121 probe driver580.178.04; both buffer sha256=2c2850b12068116c8477db11b9768cb65519b2d2ac3c8660c24ab66f1b5ac047");
         let projector = |prefix: &str, input_width| -> anyhow::Result<TowerProjector> {
             Ok(TowerProjector {
                 kind: 1,
@@ -315,7 +315,7 @@ mod tests {
             .collect();
         assert_eq!(
             format!("{:x}", Sha256::digest(bytes)),
-            "12f61d6b811cf2908575af2029d2271c3f6ab08c3a2c9810ebafa2d175f7ccdf"
+            "2c2850b12068116c8477db11b9768cb65519b2d2ac3c8660c24ab66f1b5ac047"
         );
         for capacity in [0, MAX_IMAGE_TOKENS + 1] {
             assert!(TowerSpec::minimax(Path::new("absent"), capacity).is_err());
