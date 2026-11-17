@@ -265,6 +265,7 @@ impl TowerSpec {
             Some("qwen4_exp") => Self::qwen(snapshot, max_tokens.min(cuteafd_loader::media::QWEN_MAX_IMAGE_TOKENS)),
             Some("glm5_next") => Self::glm_flash(snapshot, max_tokens),
             Some("muse_spark") => Self::muse(snapshot, max_tokens),
+            Some("inkling2"|"step5_vl") => Self::perception(snapshot,max_tokens),
             // `max_tokens` counts the LM span; the tower's capacity is its merged [IMG] rows.
             Some("mistral_large4") => Self::mistral_large4(snapshot, mistral::merged_capacity(max_tokens)),
             kind => Err(VisionError::Unsupported(format!("tower model_type {kind:?}; add a tower exporter/kernel"))),
@@ -278,6 +279,8 @@ impl TowerSpec {
             2 => ImageFamily::Qwen,
             3 => ImageFamily::GlmFlash,
             5 => ImageFamily::Muse,
+            6 => ImageFamily::Inkling2,
+            7 => ImageFamily::Step5,
             mistral::RESERVED => ImageFamily::Mistral,
             _ => ImageFamily::Mimo,
         }
@@ -401,6 +404,8 @@ impl TowerSpec {
             cuteafd_loader::media::ImageFamily::GlmFlash => "glm5_flash",
             cuteafd_loader::media::ImageFamily::Muse => "muse_spark",
             cuteafd_loader::media::ImageFamily::Mistral => "mistral_large4",
+            cuteafd_loader::media::ImageFamily::Inkling2 => "inkling2",
+            cuteafd_loader::media::ImageFamily::Step5 => "step5",
         };
         let numerics = if self.image_family() == cuteafd_loader::media::ImageFamily::Muse {
             headers.insert("feature_norm_eps".into(), serde_json::json!(self.native.norm_eps.to_bits()));
@@ -444,12 +449,13 @@ fn axial_frequency(index: usize, frequencies: usize) -> f32 {
 }
 
 /// Matches the CPU reference's f64 rescale followed by f32 normalize, without FMA.
-pub fn normalization_lut(config: &cuteafd_loader::media::ProcessorConfig) -> Arc<[f32; 768]> {
-    Arc::new(std::array::from_fn(|i| {
-        let c = i / 256;
-        let pixel = ((i % 256) as f64 * (1.0 / 255.0)) as f32;
-        (pixel - config.mean[c] as f32) / config.std[c] as f32
-    }))
+pub fn normalization_parameters(config:&cuteafd_loader::media::ProcessorConfig) -> Arc<[f32;768]> {
+    Arc::new(config.normalization_parameters())
+}
+/// Legacy callers keep their name and byte-identical LUT. PE uses the same
+/// bounded parameter storage, with its declared per-family interpretation.
+pub fn normalization_lut(config:&cuteafd_loader::media::ProcessorConfig) -> Arc<[f32;768]> {
+    normalization_parameters(config)
 }
 
 pub struct VitRuntime {
