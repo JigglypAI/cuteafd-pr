@@ -1647,6 +1647,22 @@ mod tests {
         }
     }
 
+    #[test]
+    fn structural_context_split_auto_preserves_h64_and_avoids_missing_h96_kernel() {
+        use crate::families::kimi_k3::draft::resolve_context_split;
+        let root = tempfile::tempdir().unwrap();
+        for (raw, supported) in [(config(), true), (causal_config(), false)] {
+            std::fs::write(root.path().join("config.json"), serde_json::to_vec(&raw).unwrap()).unwrap();
+            assert_eq!(resolve_context_split(root.path(), None, true).unwrap(), supported);
+            assert!(!resolve_context_split(root.path(), None, false).unwrap());
+            assert!(!resolve_context_split(root.path(), Some(false), true).unwrap());
+            assert!(resolve_context_split(root.path(), Some(true), false).is_err());
+            let explicit = resolve_context_split(root.path(), Some(true), true);
+            if supported { assert!(explicit.unwrap()); }
+            else { assert!(explicit.unwrap_err().to_string().contains("kimik31_mla_draft_partial_causal_w1024_h96_m64")); }
+        }
+    }
+
     fn config() -> serde_json::Value {
         json!({"architectures":["DFlash2DraftModel"], "hidden_size":7168,
             "intermediate_size":14336, "num_hidden_layers":5, "num_attention_heads":64,

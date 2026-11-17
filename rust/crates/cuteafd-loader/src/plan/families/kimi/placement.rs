@@ -46,6 +46,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
     let rows = prefill.span_rows as usize;
     let unit = prefill.unit_rows as usize;
     let cfg = model.cfg();
+    report.tp2_dflash = Some(opts.tp2_dflash);
     if !model.core.serving_qualified(cfg) {
         report.runtime = Some(crate::plan::RuntimeStatus::Planned);
         if !report.hints.iter().any(|h| h.what.contains("Kimi K3.1 serving remains gated")) {

@@ -1742,10 +1742,10 @@ fi
 tp2_dflash_default=off
 if [[ ( "$family" == mimo_v2 || "$family" == kimi_k3 || "$family" == glm5_flash || "$family" == muse_spark ) && ${#RELEASE_COORDINATOR_GPU_INDICES[@]} == 2 && "$split" != off && "$speculator" == dflash2 ]]; then
   tp2_dflash_default=on
-  [[ "$family" != glm5_flash ]] || tp2_dflash_default=auto
+  [[ "$family" != glm5_flash && "$family" != kimi_k3 ]] || tp2_dflash_default=auto
 fi
 tp2_dflash="$(get TP2_DFLASH "$tp2_dflash_default")"
-case "$tp2_dflash" in on|off) ;; auto) [[ "$family" == glm5_flash && -z "$(get TP2_DFLASH)" ]] || release_die "TP2_DFLASH must be on or off" ;; *) release_die "TP2_DFLASH must be on or off" ;; esac
+case "$tp2_dflash" in on|off) ;; auto) [[ ( "$family" == glm5_flash || "$family" == kimi_k3 ) && -z "$(get TP2_DFLASH)" ]] || release_die "TP2_DFLASH must be on or off" ;; *) release_die "TP2_DFLASH must be on or off" ;; esac
 [[ "$tp2_dflash" != on || ( ( "$family" == mimo_v2 || "$family" == kimi_k3 || "$family" == glm5_flash || "$family" == muse_spark ) && ${#RELEASE_COORDINATOR_GPU_INDICES[@]} == 2 && "$speculator" == dflash2 ) ]] ||
   release_die "TP2_DFLASH requires MiMo/Kimi/GLM Flash/Muse, two selected RTX GPUs and DFlash2"
 if [[ ( "$family" == mimo_v2 || "$family" == kimi_k3 || "$family" == glm5_flash || "$family" == muse_spark ) && "$tp2_dflash" != auto ]]; then
@@ -2674,10 +2674,10 @@ audio_encoder_hash=""
     esac
   fi
   plan_json="$(jq -c '.report' <<<"$deployment_json")"
-  if [[ "$family" == glm5_flash && "$tp2_dflash" == auto ]]; then
+  if [[ ( "$family" == glm5_flash || "$family" == kimi_k3 ) && "$tp2_dflash" == auto ]]; then
     tp2_dflash_bool="$(jq -er '.tp2_dflash | if . == true then "true" elif . == false then "false" else error("missing drafter choice") end' <<<"$plan_json")"
     family_args+=(--tp2-dflash "$tp2_dflash_bool")
-    echo "GLM Flash planner selected TP2_DFLASH=$tp2_dflash_bool"
+    echo "$family planner selected TP2_DFLASH=$tp2_dflash_bool"
   fi
   release_prefill_shape "$deployment_json" "$family"
   resolved_decode_lanes="$(jq -er '.decode_lanes | select(. == 1 or . == 2)' <<<"$deployment_json")" ||

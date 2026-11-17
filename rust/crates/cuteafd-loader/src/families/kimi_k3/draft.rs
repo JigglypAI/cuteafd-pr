@@ -3,6 +3,18 @@ use crate::formats::{block_dspark::BlockDsparkRuntimeLayout, dflash::MlaDraftRun
 use crate::families::glm5::draft_representation::GlmDraftCapacity;
 use anyhow::{ensure, Result};
 
+/// Automatic placement follows native kernel geometry, never checkpoint identity.
+pub fn resolve_context_split(snapshot: &std::path::Path, requested: Option<bool>, eligible: bool) -> Result<bool> {
+    ensure!(requested != Some(true) || eligible, "TP2_DFLASH requires two physical GPUs and DFlash2");
+    if requested == Some(false) || !eligible && requested != Some(true) { return Ok(false) }
+    let cfg = crate::formats::dflash::MlaDflashConfig::read(snapshot)?;
+    let supported = cfg.kind == cuteafd_core::coordinator_programs::MlaDraftKind::Dflash2
+        && cfg.mla.hidden == 7168 && cfg.mla.heads == 64;
+    ensure!(requested != Some(true) || supported,
+        "TP2_DFLASH requires missing context-split kernel kimik31_mla_draft_partial_causal_w1024_h96_m64 for causal MLA h96; use whole-drafter placement (omit TP2_DFLASH)");
+    Ok(eligible && requested.unwrap_or(supported))
+}
+
 /// A checkpoint-declared target feature, not a user-selectable execution mode.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub enum DraftHiddenStream { #[default] PlainResidual, AttnRes }

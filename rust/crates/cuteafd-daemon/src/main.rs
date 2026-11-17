@@ -363,7 +363,9 @@ async fn run() -> Result<()> {
                             format!("invalid --spark-memory-samples: {error}")).exit();
                     }
                 }
-                cli::resolve_tp2_dflash(&mut cli.command, &matches);
+                if let Err(error) = cli::resolve_tp2_dflash(&mut cli.command, &matches) {
+                    clap::Error::raw(clap::error::ErrorKind::ValueValidation, error.to_string()).exit();
+                }
                 if let Commands::Plan(args) = &mut cli.command {
                     args.spark_memory_samples = cli.spark_memory_samples.clone();
                     if let Some((_, options)) = matches.subcommand() {
