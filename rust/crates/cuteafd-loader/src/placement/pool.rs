@@ -183,7 +183,9 @@ impl PoolPolicy {
 
 #[cfg(test)]
 fn legacy_fixture_pool(cards: &[u64], context: u64, requested: Option<u64>, unit_rows: u64) -> PoolPolicy {
-    prepare_pool(PoolFacts::new(cards, context, requested, unit_rows)).unwrap()
+    let mut facts = PoolFacts::new(cards, context, requested, unit_rows);
+    facts.encoding_limit = Some(requested.unwrap_or(2 << 20));
+    prepare_pool(facts).unwrap()
 }
 
 #[cfg(test)]

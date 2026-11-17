@@ -500,9 +500,12 @@ fn preflight_shape(
         &devices, args.planner_media_weights, crate::shared::memory::budget::resident_weight_limit())?;
     use cuteafd_loader::placement::families::mimo_v2::admission::{self as contract, ProductionInput};
     use cuteafd_loader::placement::planner::{Baseline, EmbeddingHome, Operation, Phase, PrefillShape};
-    let pool = cuteafd_loader::placement::prepare_pool(cuteafd_loader::placement::PoolFacts::new(
-        &memory.iter().map(|sample| sample.total_bytes).collect::<Vec<_>>(),
-        serving_context, Some(args.pool_tokens as u64), spark_profiles.steady.pool_unit_rows))?;
+    let cards = memory.iter().map(|sample| sample.total_bytes).collect::<Vec<_>>();
+    let mut facts = cuteafd_loader::placement::PoolFacts::new(&cards,
+        serving_context, Some(args.pool_tokens as u64), spark_profiles.steady.pool_unit_rows);
+    facts.memory = spark_profiles.steady.devices.iter().zip(&cards).map(|(rank, &available_bytes)|
+        cuteafd_loader::placement::PoolMemory { available_bytes, bytes_per_unit: rank.pool_unit_bytes }).collect();
+    let pool = cuteafd_loader::placement::prepare_pool(facts)?;
     let policy = pool.capacity_policy(u32::try_from(concurrency)?);
     let report = reservation_report(&spark_profiles.steady, &memory, policy)?;
     let intake_probe_bytes = cuteafd_loader::families::mimo_v2::admission::spark_intake_probe_bytes(

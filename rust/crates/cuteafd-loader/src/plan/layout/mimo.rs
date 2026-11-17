@@ -551,6 +551,8 @@ fn apply_selected(input: &super::super::PlanInput, options: &LayoutOptions,
         &options.rtx_bytes[..ranks], crate::placement::planner::Context::resolve(context,
             (options.context_tokens > 0).then_some(options.context_tokens)),
         options.pool_tokens, profiles.steady.pool_unit_rows);
+    facts.memory = profiles.steady.devices.iter().zip(&options.rtx_bytes).map(|(rank, &available_bytes)|
+        crate::placement::PoolMemory { available_bytes, bytes_per_unit: rank.pool_unit_bytes }).collect();
     facts.target = options.target_pool_tokens;
     let pool = crate::placement::prepare_pool(facts)?;
     let prefill = PrefillShape { rows, waves: lanes as u64 };

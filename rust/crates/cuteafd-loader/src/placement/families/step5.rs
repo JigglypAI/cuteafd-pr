@@ -211,6 +211,12 @@ impl<'a> Step5Recipe<'a> {
             .collect::<Vec<_>>();
         let mut facts = crate::placement::PoolFacts::new(
             &capacities, inputs.serving_context, inputs.requested_pool, PAGE_ROWS);
+        let geometry = Step5CacheLayout::new(cfg, gpus, inputs.context, depth,
+            inputs.unit_rows() as u64, inputs.rows as u64, inputs.kv_format)?.geometry;
+        facts.memory = vec![crate::placement::PoolMemory {
+            available_bytes: capacities.iter().sum(),
+            bytes_per_unit: geometry.ranks.iter().map(|rank| rank.persistent_unit_bytes).sum(),
+        }];
         facts.target = inputs.target_pool;
         let pool = crate::placement::prepare_pool(facts)?;
         pool.validate_explicit()?;

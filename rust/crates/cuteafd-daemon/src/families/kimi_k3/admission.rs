@@ -1207,8 +1207,14 @@ fn request<const RANKS: usize>(mut i: Inputs<'_, RANKS>) -> Result<PlacementRequ
                 half: [Bytes2::default(); 2], tp2: false, whole_supported: true, spark_ok: true }),
             modes: if RANKS == 1 { vec![WHOLE] } else if mla { MODES.to_vec() } else { vec![LayerMode::HeadSplit] } });
     }
-    let pool = cuteafd_loader::placement::prepare_pool(cuteafd_loader::placement::PoolFacts::new(
-        &i.gpus.map(|gpu| gpu.capacity_bytes), i.serving_context, i.requested_pool, MLA_PAGE_ROWS as u64))?;
+    let cards = i.gpus.map(|gpu| gpu.capacity_bytes);
+    let mut facts = cuteafd_loader::placement::PoolFacts::new(
+        &cards, i.serving_context, i.requested_pool, MLA_PAGE_ROWS as u64);
+    facts.memory = vec![cuteafd_loader::placement::PoolMemory {
+        available_bytes: cards.iter().sum(),
+        bytes_per_unit: cfg.mla_layers() as u64 * MLA_PAGE_ROWS as u64 * i.cache_format.record_bytes() as u64,
+    }];
+    let pool = cuteafd_loader::placement::prepare_pool(facts)?;
     Ok(PlacementRequest {
         resident_weight_limit: Some(i.resident_weight_limit), inventory: Inventory { gpus: i.gpus.to_vec(), spark_ranks: i.spark_ranks, peer_access: i.peer_access },
         attention_placement: i.attention, context_buffers: i.context.as_ref().map_or_else(ContextBuffers::default, |layout| layout.buffers()), layers_first_gpu: 0,
