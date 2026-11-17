@@ -4,8 +4,8 @@
 //! equivalent (unconditional→conditional rate conversion, per-request
 //! acceptance metrics accumulator, async-scheduling backup-token indexing) is
 //! reimplemented here as clearly-marked upstream ports; every group also
-//! anchors the invariant against product code (`draft_expected_tokens`,
-//! `verify_dspark_greedy`).
+//! anchors the invariant against product code where one exists
+//! (`verify_dspark_greedy`).
 //!
 //! Upstream sources:
 //! - test_synthetic_rejection_sampler_utils.py (5 tests, pure math)
@@ -20,9 +20,7 @@
 // parity tests (docs/test-coverage/DEFERRED.md) and are counted separately
 // from product regression coverage (review MAJOR 4/6, 2026-09-15).
 
-use cuteafd_core::{
-    draft_expected_tokens, verify_dspark_greedy,
-};
+use cuteafd_core::verify_dspark_greedy;
 
 // ---------------------------------------------------------------------------
 // Upstream reference math (ports; no cuteafd product equivalent exists).
@@ -65,11 +63,15 @@ fn upstream_acceptance_length_to_rates(length: f64, n: usize) -> Vec<f64> {
 // (vLLM test_synthetic_rejection_sampler_utils.py)
 // ---------------------------------------------------------------------------
 
-/// Product anchor: cuteafd's `draft_expected_tokens` (the policy objective) computes
-/// expected_tokens = 1 + sum(cumulative products of the conditional rates),
-/// i.e. exactly 1 + sum(unconditional rates). This is the semantic contract
-/// tying cuteafd's "conditional draft confidence" input to vLLM's
-/// unconditional acceptance-rate convention.
+/// Expected emitted tokens of a draft with these conditional acceptance
+/// rates: 1 + the sum of their cumulative products, i.e. 1 + the sum of the
+/// unconditional rates. The `history` policy has no such objective (it keeps
+/// positions by their own rate), so this is reference math like the ports above.
+fn draft_expected_tokens(confidence: &[f64]) -> f64 {
+    let mut survival = 1.;
+    1. + confidence.iter().map(|&p| { survival *= p; survival }).sum::<f64>()
+}
+
 fn expected_tokens_for_conditional(confidence: &[f64]) -> f64 {
     draft_expected_tokens(confidence)
 }

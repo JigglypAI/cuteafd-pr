@@ -165,16 +165,17 @@ def test_minimax_dspark_default_and_explicit_off_match_plan_and_serve(tmp_path, 
         assert _flag(serve, "--split-device") == "1"
 
 
-@pytest.mark.parametrize("mode", ["simple", "shared", "simple-rc", "simple-derived"])
-def test_minimax_preserves_explicit_draft_policy(tmp_path, mode):
+@pytest.mark.parametrize("mode", [None, "history", "off"])
+def test_minimax_passes_the_shared_draft_policy(tmp_path, mode):
     config = {"model_type": "minimax_m3_vl", "text_config": {
         "num_hidden_layers": 60, "moe_layer_freq": [0] * 3 + [1] * 57}}
     hosts = "".join(f"SPARK_{i}_HOST=h{i}\nSPARK_{i}_LANE_A=10.0.0.{i + 1}\n" for i in range(3))
     result = _family_launch_result(tmp_path, config, "MiniMaxAI/MiniMax-M3.1-Flash",
-        f"SPARK_COUNT=3\nRTX_GPUS=1\nDRAFT_POLICY={mode}\nVISION=off\nAUDIO=off\n" + hosts,
+        "SPARK_COUNT=3\nRTX_GPUS=1\nVISION=off\nAUDIO=off\n" + (f"DRAFT_POLICY={mode}\n" if mode else "") + hosts,
         encoder_plan=PLANNED)
     serve = _line(result, "serve-minimax --snapshot")
-    assert f"CUTEAFD_DRAFT_POLICY={mode}" in serve
+    assert ("--draft-policy off" in serve) == (mode == "off")
+    assert "CUTEAFD_DRAFT_POLICY" not in serve
 
 
 @pytest.mark.parametrize("filter", ["", "info,cuteafd::shared::mapped_table=debug"])

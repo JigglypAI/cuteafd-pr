@@ -828,7 +828,7 @@ fn drafter_is_charged_on_the_head_gpu_and_must_match_the_target_head() {
     let tails = |placement: &crate::placement::Placement, gpu: usize|
         placement.items[gpu].iter().filter(|item| item.group == "allocation granularity").map(|item| item.bytes).sum::<u64>();
     assert_eq!(tails(placed, 1) - tails(plain_placed, 1), tail);
-    assert_eq!(expected.runtime, (16 * 8 * 4 + 62 * 64 * 8 * 4) as u64, "draft ids + probe ring");
+    assert_eq!(expected.runtime, (16 * 8 * 4) as u64, "draft ids");
     assert_eq!(expected.head_scratch, (16 * 8 * (202_112 + 202_048) * 4) as u64);
     assert!(placed.pool_tokens <= plain.solver_placement.as_ref().unwrap().pool_tokens);
     // One RTX cannot reach the pool cap: the exact drafter charge must displace KV pages.

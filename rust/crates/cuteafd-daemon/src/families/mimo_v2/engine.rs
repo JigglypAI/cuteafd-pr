@@ -844,7 +844,6 @@ pub(crate) struct MimoEngine<'a> {
     pub expert_input: ExpertInput,
     /// Host time per phase: GPU wait before the expert request, the Spark exchange.
     pub profile: RefCell<[f64; 2]>,
-    draft_probe: RefCell<Option<crate::shared::draft::probe::RoundProbe<'a>>>,
     /// The DFlash drafter (V2.6 Pro's dflash/): every step taps its target layers.
     pub drafter: Option<super::dflash::MimoDrafter<'a>>,
     /// L2 prefetch of the next layer's weights during decode exchanges.
@@ -956,7 +955,7 @@ impl<'a> MimoEngine<'a> {
             split_family, peer: None, exchange: None, kv, rope, workspace: RefCell::new(None), decode_workspace: RefCell::new(None),
             prefill_kv_wide: RefCell::new(None), experts: None, expert_usage: None, packed_row_cap: Cell::new(None), packed_programs: Default::default(), tp2: None, rtx_local: None,
             expert_input: ExpertInput::Fp8,
-            profile: RefCell::new([0.0; 2]), draft_probe: RefCell::new(None),
+            profile: RefCell::new([0.0; 2]),
             drafter: None, mtp: None, l2: None, embedding,
             mtp_staging: RefCell::new((HostAllocation::new(library, 1 << 20, Tag::staging("mimo/mtp-staging"))?, 0)), prefill_w8a8: true,
             output_fp8_decode: true, kv_cache,
@@ -980,124 +979,6 @@ impl<'a> MimoEngine<'a> {
         };
         let attention = layers[layer].attention;
         (attention, kv[layer].buffer, self.record_bytes(&layers[layer]))
-    }
-
-    /// Arm after graph warmup; only explicit verify rounds record signals.
-    pub(crate) fn arm_draft_probe(&self) -> Result<()> {
-        let dense = self.weights.layers.iter().map(|layer| layer.dense).collect();
-        *self.draft_probe.borrow_mut() = Some(crate::shared::draft::probe::RoundProbe::new(
-            self.library, dense, self.cfg.topk, DECODE_ROWS)?);
-        Ok(())
-    }
-
-    pub(crate) fn probe_begin(&self, rows: usize) {
-        if let Some(probe) = self.draft_probe.borrow_mut().as_mut() { probe.begin(rows); }
-    }
-
-    pub(crate) fn probe_end(&self) {
-        if let Some(probe) = self.draft_probe.borrow_mut().as_mut() { probe.end(); }
-    }
-
-    /// Read only after the verifier's normal stream synchronization.
-    pub(crate) fn probe_finish<T>(&self, observe: impl FnOnce(&crate::shared::draft::routes::RoundRoutes,
-        &[Option<f64>]) -> T) -> Option<T> {
-        let mut probe = self.draft_probe.borrow_mut();
-        let (routes, times) = probe.as_mut()?.finish()?;
-        Some(observe(routes, &times))
-    }
-
-    pub(crate) fn draft_geometry(&self, width: usize) -> Result<cuteafd_core::PolicyGeometry> {
-        use crate::shared::draft::resource::{self, LayerHome};
-        let reports = match &self.experts {
-            Some(Experts::Spark { decode: transport, .. }) => transport.borrow().installed_grouping()?,
-            _ => Vec::new(),
-        };
-        let homes = self.weights.layers.iter().enumerate().map(|(index, layer)| {
-            if layer.dense { return Ok(LayerHome::Dense); }
-            let bytes = if self.tp2_layer(index) {
-                self.tp2.as_ref().context("MiMo TP2")?.ranks.iter()
-                    .map(|rank| rank.borrow().weight_read_bytes()).max().context("MiMo TP2 ranks")?
-            } else if let Some(local) = self.rtx_local.as_ref().filter(|local| local.index_of(index).is_ok()) {
-                local.weight_read_bytes()
-            } else { match &self.experts {
-                Some(Experts::Local(local)) => {
-                    local.index_of(index)?;
-                    local.weight_read_bytes()
-                }
-                Some(Experts::Streamed { experts, .. }) => experts.borrow().weight_read_bytes(),
-                Some(Experts::Spark { .. }) => {
-                    let bytes = reports.iter().filter(|report| report.layers().iter()
-                        .any(|range| (range.first as usize..range.end as usize).contains(&index)))
-                        .map(|report| report.weight_read_bytes()).collect::<Result<Vec<_>>>()?;
-                    return Ok(LayerHome::Remote { slice_bytes: *bytes.iter().max()
-                        .with_context(|| format!("installed MiMo worker missing layer {index}"))? as f64 });
-                }
-                Some(Experts::Skip) | None => anyhow::bail!("MiMo routed layer {index} has no installed expert owner"),
-            }};
-            Ok(LayerHome::Local { slice_bytes: bytes as f64 })
-        }).collect::<Result<Vec<_>>>()?;
-        let geometry = resource::geometry_with_grouping(&homes, self.cfg.experts, self.cfg.topk,
-            DECODE_ROWS, width, crate::shared::draft::copy::COPY_EXTENSION,
-            |layer, rows| Ok(self.draft_group(layer, rows, &reports)?.0))?;
-        let mut geometry = geometry;
-        geometry.classes = vec![cuteafd_core::ResourceClass::rtx(), cuteafd_core::ResourceClass::spark()];
-        for (layer, home) in homes.iter().enumerate().filter(|(_, home)| **home != LayerHome::Dense) {
-            let (group_rows, contract) = self.draft_group(layer, 0, &reports)?;
-            tracing::info!(layer, ?home, group_rows, traffic_contract = contract.label(),
-                "MiMo installed draft-policy expert traffic");
-        }
-        Ok(geometry)
-    }
-
-    fn draft_group(&self, layer: usize, rows: usize,
-        reports: &[cuteafd_transport::worker_selection::InstalledExpertGrouping])
-        -> Result<(usize, cuteafd_transport::worker_selection::ExpertTrafficContract)> {
-        if self.tp2_layer(layer) {
-            let tp2 = self.tp2.as_ref().context("MiMo TP2")?;
-            let group = tp2.ranks[0].borrow().weight_read_group(rows)?;
-            ensure!(tp2.ranks[1].borrow().weight_read_group(rows)? == group,
-                "MiMo TP2 ranks disagree on installed expert grouping");
-            return Ok(group);
-        }
-        if let Some(local) = self.rtx_local.as_ref().filter(|local| local.index_of(layer).is_ok()) {
-            return local.weight_read_group(rows, true);
-        }
-        match &self.experts {
-            Some(Experts::Local(local)) => local.weight_read_group(rows, !local.wire_input()),
-            Some(Experts::Streamed { experts, .. }) => {
-                let local = experts.borrow();
-                local.weight_read_group(rows, !local.wire_input())
-            }
-            Some(Experts::Spark { .. }) => {
-                let group = crate::shared::draft::resource::worker_group_rows_for_input(
-                    reports, layer, rows, self.expert_bf16_input(true))?;
-                let mut contracts = reports.iter().filter(|report| report.layers().iter()
-                    .any(|range| (range.first as usize..range.end as usize).contains(&layer)))
-                    .map(|report| report.traffic_contract());
-                let contract = contracts.next().with_context(|| format!("installed MiMo worker missing layer {layer}"))?;
-                ensure!(contracts.all(|other| other == contract), "MiMo workers disagree on installed traffic contract");
-                Ok((group, contract))
-            }
-            Some(Experts::Skip) | None => anyhow::bail!("MiMo routed layer {layer} has no installed expert owner"),
-        }
-    }
-
-    fn probe_mark(&self, index: usize) -> Result<()> {
-        if self.graphs_warming.get() { return Ok(()); }
-        if let Some(probe) = self.draft_probe.borrow_mut().as_mut() {
-            // SAFETY: the clock and stream belong to rank zero and outlive this round.
-            unsafe { probe.mark(index, self.stream)? };
-        }
-        Ok(())
-    }
-
-    fn probe_ring(&self, w: &Workspace<'_>, index: usize, rows: usize) -> Result<()> {
-        if self.graphs_warming.get() { return Ok(()); }
-        if let Some(probe) = self.draft_probe.borrow_mut().as_mut().filter(|p| p.wants_ring(false)) {
-            // SAFETY: called outside graph capture after the router; normal round sync precedes reading.
-            unsafe { probe.ring(self.library, index, w.route_ids.buffer, rows, self.stream)?; }
-        }
-        Ok(())
     }
 
     /// Strong allocation ownership for host snapshot DMA, independent of this
@@ -2053,7 +1934,6 @@ impl<'a> MimoEngine<'a> {
                 }
             }
             crate::shared::console::layer_mark(index);
-            self.probe_mark(index)?;
         }
         if layers.len() < self.cfg.layers {
             // SAFETY: the engine owns this stream.
@@ -2216,27 +2096,22 @@ impl<'a> MimoEngine<'a> {
                 unsafe { record_mimo_routes(self.expert_usage.as_ref(), self.device, 0, index,
                     w.route_ids.buffer.ptr, t, true, self.stream)?; }
             }
-            if layers[index].dense { self.probe_mark(index)?; continue; }
-            if self.tp2_layer(index) { self.probe_ring(w, index, t)?; }
+            if layers[index].dense { continue; }
             if self.tp2_layer(index) {
                 self.tp2_experts(0, index, 0, w, t)?;
                 let peer = w1.context("MiMo TP2 decode workspace")?;
                 self.tp2_experts(1, index, 0, peer, t)?;
                 if index + 1 == layers.len() { self.tp2_post(1, index, 0, peer, t)?; }
-                self.probe_mark(index)?;
                 continue;
             }
             if self.rtx_local_layer(index) {
                 self.moe_run(w, index, t, true)?;
-                self.probe_mark(index)?;
                 continue;
             }
             match (self.experts.as_ref(), link.as_mut()) {
                 (Some(Experts::Spark { .. }), Some(link)) => {
-                    // The router's ids into the probe ring, then the wave: its
-                    // copies, the L2 prefetch behind them, and the post on the
-                    // exchange worker; the next segment's land orders the reduce.
-                    self.probe_ring(w, index, t)?;
+                    // The wave: its copies, the L2 prefetch behind them, and the post on
+                    // the exchange worker; the next segment's land orders the reduce.
                     pending = Some(self.wave_send(w, index, t, ExpertV2SourceKind::Decode, bf16_input,
                         link.exchange()?, None)?);
                     if let Some(l2) = &self.l2 { l2.issue(self.library, index, self.stream)?; }
@@ -2245,7 +2120,6 @@ impl<'a> MimoEngine<'a> {
                 (None, _) => anyhow::bail!("layer {index} is an MoE layer; pass Spark peers for its routed experts"),
             }
             if !self.graphs_warming.get() { crate::shared::console::layer_mark(index); }
-            self.probe_mark(index)?;
         }
         Ok(())
     }
@@ -3194,7 +3068,6 @@ impl<'a> MimoEngine<'a> {
         let bytes = t * self.cfg.hidden * 2;
         if self.tp2_layer(index) {
             self.moe_front(w, index, layer, t, decode, true)?;
-            self.probe_ring(w, index, t)?;
             return self.tp2_experts(0, index, 0, w, t);
         }
         if self.rtx_local_layer(index) {
@@ -3268,8 +3141,6 @@ impl<'a> MimoEngine<'a> {
             Experts::Spark { decode: decode_link, prefill } => {
                 let transport = if decode { decode_link } else { prefill };
                 let kind = if decode { ExpertV2SourceKind::Decode } else { ExpertV2SourceKind::Prefill };
-                // Verify steps' draft probe reads the routes from its device ring.
-                self.probe_ring(w, index, t)?;
                 let mut link = transport.borrow_mut();
                 let exchange = link.exchange()?;
                 let wave = self.wave_send(w, index, t, kind, bf16_input, exchange, None)?;
@@ -3284,7 +3155,6 @@ impl<'a> MimoEngine<'a> {
     /// their sum into `delta`.
     fn moe_run(&self, w: &Workspace<'_>, index: usize, t: usize, decode: bool) -> Result<()> {
         let h = self.cfg.hidden;
-        self.probe_ring(w, index, t)?;
         if let Some(local) = self.rtx_local.as_ref().filter(|local| local.index_of(index).is_ok()) {
             // SAFETY: admitted BF16 input, routes and output are live on the
             // rank stream; local package output is copied directly into delta.

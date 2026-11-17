@@ -877,8 +877,6 @@ pub(crate) struct DflashDrafter<'a> {
     /// scratch was admitted for.
     fp8_rows: Cell<fp8_linear::Fp8Rows>,
     fp8_admitted: fp8_linear::Fp8Rows,
-    confidence_directory: std::path::PathBuf,
-    confidence_scales: fp8_linear::Fp8Scales,
 }
 
 
@@ -1072,19 +1070,6 @@ impl<'a> DflashDrafter<'a> {
     /// draft policy uses the pooled request-history prior.
     pub fn token_only(&self) -> bool { matches!(self.head_ops, DraftHeadOps::RnnMarkov { .. }) }
 
-    pub fn selector_fit(&self, family: &str, fp8_head: bool) -> Result<crate::shared::draft_confidence::SelectorFit> {
-        crate::shared::draft_confidence::SelectorFit::load(&self.confidence_directory,
-            &self.confidence_key(family, fp8_head))
-    }
-
-    fn confidence_key(&self, family: &str, fp8_head: bool) -> String {
-        let head = if fp8_head { "head-fp8-row".into() } else { format!("head-bf16-{:?}", self.head_mode.get()) };
-        let kv = if self.kv_cache == cuteafd_loader::families::qwen4::Qwen4KvCache::Fp8 { "-kv-fp8" } else { "" };
-        let numerics = format!("{}-{:?}-{head}-{:?}{kv}-r1", self.representation.name(), self.fp8_rows.get(),
-            self.confidence_scales).to_ascii_lowercase();
-        format!("{family}/dflash2/{numerics}")
-    }
-
     pub fn max_batch_sequences(&self) -> usize { self.max_sequences }
     /// Loads the drafter's weights from `file` (its safetensors bytes, see
     /// [`prefetch`]) and allocates `slots` ring contexts; draft steps take up
@@ -1274,8 +1259,6 @@ impl<'a> DflashDrafter<'a> {
             target_projection, workspace: RefCell::new(None),
             startup_primed: Cell::new(false),
             representation,
-            confidence_directory: snapshot.into(),
-            confidence_scales: scales,
             fp8_workspace,
             timing: crate::shared::draft::timing::DraftTiming::from_env(library, "glm-dflash")?,
             round: std::cell::RefCell::new(crate::shared::memory::BlockingWait::new(library)),
@@ -1397,7 +1380,6 @@ impl<'a> DflashDrafter<'a> {
             mask_row: Vec::new(), mask_rows: None, markov_workspace: None, target_projection, workspace: RefCell::new(Some(workspace)), startup_primed: Cell::new(false), representation,
             fp8_workspace: if representation == GlmDraftRepresentation::Fp8Only { Some(owners.take("fp8_scratch")?) } else { None },
             head_mode: Cell::new(DraftHead::Exact), fp8_rows: Cell::new(fp8_rows), fp8_admitted: fp8_rows,
-            confidence_directory: snapshot.into(), confidence_scales: scales,
             timing: crate::shared::draft::timing::DraftTiming::from_env(library, "mla-dflash")?, cfg,
             round: std::cell::RefCell::new(crate::shared::memory::BlockingWait::new(library)),
         };
@@ -1520,8 +1502,7 @@ impl<'a> DflashDrafter<'a> {
             target_projection, workspace: RefCell::new(Some(workspace)), startup_primed: Cell::new(false),
             representation: GlmDraftRepresentation::Bf16Only, fp8_workspace: None,
             head_mode: Cell::new(DraftHead::Exact), fp8_rows: Cell::new(fp8_linear::Fp8Rows::default()),
-            fp8_admitted: fp8_linear::Fp8Rows::default(), confidence_directory: std::path::PathBuf::new(),
-            confidence_scales: fp8_linear::Fp8Scales::Amax,
+            fp8_admitted: fp8_linear::Fp8Rows::default(),
             timing: crate::shared::draft::timing::DraftTiming::from_env(library, "ml4-dspark")?, cfg,
             round: std::cell::RefCell::new(crate::shared::memory::BlockingWait::new(library)),
         };
@@ -2870,7 +2851,8 @@ impl<'a> DflashDrafter<'a> {
                 } else { draft_view(w.head()?.tokens.buffer, 0, drafted * 4)? }
             } else { draft_view(w.head()?.tokens.buffer, 0, drafted * 4)? };
             l.copy_d2h_host_buffer_async(landing(0, drafted * 4), token_buffer, drafted * 4, s)?;
-            if matches!(self.head_ops, DraftHeadOps::Selector { .. }) {
+            // Only the explicit golden selector oracle consumes these features.
+            if !serving && matches!(self.head_ops, DraftHeadOps::Selector { .. }) {
                 l.copy_d2h_host_buffer_async(landing(drafted * 4, drafted * 16),
                     CuteafdDeviceBuffer { bytes: drafted * 16, ..w.head()?.features.as_ref().context("selector workspace missing")?.buffer }, drafted * 16, s)?;
             }
@@ -2888,7 +2870,7 @@ impl<'a> DflashDrafter<'a> {
         self.timing.publish_completed()?;
         self.timing.dump_head_input(w.n.buffer, rows, h)?;
         let drafted = s_count * c.drafts();
-        let selector = matches!(self.head_ops, DraftHeadOps::Selector { .. });
+        let selector = !serving && matches!(self.head_ops, DraftHeadOps::Selector { .. });
         let landing_bytes = drafted * if selector { 20 } else { 4 };
         let (tokens, features) = w.head()?.landing.bytes()[..landing_bytes].split_at(drafted * 4);
         let word = |b: &[u8], i: usize| u32::from_le_bytes(b[i * 4..i * 4 + 4].try_into().unwrap());

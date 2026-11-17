@@ -1,30 +1,73 @@
-"""Acceptance denominators must not mix grammar targets or censored endings."""
+"""Shared history summaries separate content and count only reached positions."""
 import runpy
 from pathlib import Path
 
 summarize = runpy.run_path(str(Path(__file__).parents[1] /
-                             'qualify/deepseek_v41/collect-content-acceptance.py'))['summarize_acceptance']
+                             'qualify/deepseek_v41/collect-content-acceptance.py'))['summarize_history']
 
 
-def test_separates_grammar_and_terminal_cycles():
-    base = dict(request_id=1, rows=4, matched=2, terminal=False, constrained=False)
-    result = summarize([base, dict(base, matched=0),
-                        dict(base, matched=0, terminal=True),
-                        dict(base, request_id=2, matched=3, constrained=True)])
-    plain = result['unconstrained']
-    assert plain['verified_drafts'] == 6
-    assert plain['accepted_drafts'] == 2
-    assert plain['acceptance'] == 1 / 3
-    assert plain['mean_emitted_tokens'] == 2
-    assert plain['excluded_terminal_observations'] == 1
-    assert plain['zero_acceptance_cycles'] == 1
-    assert result['grammar_constrained']['acceptance'] == 1
+def request(identity=1, **changes):
+    value = dict(id=identity, room=7, proposed=3, accepted_drafts=2,
+                 explore_skipped=None, positions=[
+                     dict(track='neural', position=0, outcome=True, explore=False),
+                     dict(track='neural', position=1, outcome=True, explore=False),
+                     dict(track='neural', position=2, outcome=False, explore=True),
+                     dict(track='copy', position=0, outcome=None, explore=True)])
+    value.update(changes)
+    return value
 
 
-def test_adaptive_zero_draft_round_is_not_a_failed_draft():
-    row = dict(request_id=1, rows=1, matched=0, terminal=False, constrained=False)
-    plain = summarize([row])['unconstrained']
-    assert plain['acceptance'] is None
-    assert plain['mean_emitted_tokens'] == 1
-    assert plain['verified_width_counts'] == {'0': 1}
-    assert summarize([])['grammar_constrained']['mean_emitted_tokens'] is None
+def test_content_counts_and_censored_copy_positions():
+    records = [dict(type='cycle'), dict(type='draft_round', policy='history', requests=[
+        request(), request(2, proposed=1, accepted_drafts=0, explore_skipped=0.1),
+        request(3, room=0, proposed=0, accepted_drafts=0, positions=[])])]
+    result = summarize(records, {'1': 'code', '2': 'prose', '3': 'code'})
+    assert result['all']['proposed'] == 4
+    assert result['all']['accepted'] == 2
+    assert result['all']['acceptance'] == 0.5
+    assert result['all']['short_share'] == 1 / 3
+    assert result['all']['explore_skipped'] == 1
+    assert result['code']['requests'] == 2
+    assert result['code']['copy_reached'] == 0
+    assert result['code']['copy_acceptance'] is None
+    assert result['prose']['short_share'] == 1
+
+
+def test_copy_acceptance_and_empty_trace():
+    r = request(positions=[dict(track='copy', position=0, outcome=True, explore=True),
+                           dict(track='copy', position=1, outcome=False, explore=True)])
+    result = summarize([dict(type='draft_round', policy='history', requests=[r])])
+    assert result['all']['copy_reached'] == 2
+    assert result['all']['copy_acceptance'] == 0.5
+    assert summarize([]) == {}
+
+
+def test_fixed_width_is_not_reported_as_history():
+    import pytest
+    with pytest.raises(ValueError, match='expected history'):
+        summarize([dict(type='draft_round', policy='fixed 7', requests=[request()])])
+
+
+def test_report_joins_exact_http_ids_and_keeps_c1_content_label():
+    load = runpy.run_path(str(Path(__file__).parents[1] /
+                            'qualify/deepseek_v41/collect-content-acceptance.py'))['report_content']
+    timing = dict(speculation=dict(request_id='http-code', proposed=7, accepted=5, cycles=2))
+    report = dict(baseline=dict(card=dict(
+        decode=[dict(content='code', runs=[timing]), dict(content='prose', runs=[
+            dict(speculation=dict(request_id='http-prose'))])],
+        concurrency=[dict(width=1, runs=[dict(timing=timing)]), dict(width=16, runs=[
+            dict(timing=dict(speculation=dict(request_id='http-wide')))])])))
+    content = load(report)
+    assert content == {'http-code': 'code', 'http-prose': 'prose', 'http-wide': 'concurrency/16'}
+    r = request(request_id='http-code')
+    result = summarize([dict(type='draft_round', policy='history', requests=[r])], content)
+    assert 'code' in result and 'unclassified' not in result
+
+
+def test_skipped_explore_is_not_a_verified_conditional_label():
+    r = request(proposed=1, accepted_drafts=1, explore_skipped=0.1,
+                positions=[dict(track='neural', position=0, outcome=True, explore=False),
+                           dict(track='neural', position=1, outcome=None, explore=True)])
+    result = summarize([dict(type='draft_round', policy='history', requests=[r])])['all']
+    assert result['positions'][1]['reached'] == 0
+    assert result['positions'][1]['explore_skipped'] == 1

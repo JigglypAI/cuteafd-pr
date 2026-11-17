@@ -1043,7 +1043,6 @@ mod tests {
             .collect::<Result<Vec<_>>>()?;
         ensure!(tokens.len() > 577, "live exactness needs at least 578 real tokens");
         with_backend(&args, |backend, _, _| {
-            backend.draft_geometry(&args.snapshot, 3)?;
             let (family, mut pool) = backend.prefix_cache(&args.prefix, 3)?;
             let prefill = |placement: &mut Placement, state: &mut super::super::mtp::DraftState,
                 start: usize, end: usize, pool: &cuteafd_engine::prefix::RefPagePool| -> Result<()> {

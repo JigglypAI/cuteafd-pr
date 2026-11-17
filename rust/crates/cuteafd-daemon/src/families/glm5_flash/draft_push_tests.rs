@@ -165,11 +165,15 @@ fn installed_flash_drafters_push_byte_identical_to_mount_within_admitted_staging
 }
 
 #[test]
-fn draft_policy_calls_shared_resource_directly() {
-    for source in [include_str!("mod.rs"), include_str!("serve.rs"), include_str!("dspark.rs")] {
-        assert!(!source.contains("draft_binding"));
-    }
+fn serve_loop_holds_no_draft_policy_of_its_own() {
+    // Lengths come from the shared history policy's plan, shape and observe alone.
     let serve = include_str!("serve.rs");
-    assert!(serve.contains("resource::observe_drafted("));
-    assert!(serve.contains("resource::select_drafted("));
+    for call in ["policy.plan(&requests, verify_rows)", "policy.shape(&mut shaped, verify_rows)", "policy.observe(&outcomes)"] {
+        assert_eq!(serve.matches(call).count(), 1, "{call}");
+    }
+    for source in [include_str!("mod.rs"), serve, include_str!("dspark.rs")] {
+        for removed in ["draft_binding", "resource::", "SelectorFit", "choose_block", "DraftEvidence"] {
+            assert!(!source.contains(removed), "{removed}");
+        }
+    }
 }

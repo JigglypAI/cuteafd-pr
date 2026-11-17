@@ -2072,8 +2072,7 @@ def table_backend_findings(phases):
 def timing_instrumentation(job):
     values = {**config(job['entry']['config']), **job['entry'].get('set', {})} if job['entry'].get('config') else job['entry'].get('set', {})
     profiles = set(filter(None, values.get('PROFILE', '').split(',')))
-    priced = values.get('DRAFT_POLICY', 'simple') == 'shared' and not values.get('DRAFT_LENGTH')
-    layer = bool(profiles & {'draft-timing', 'transport-timing'}) or priced
+    layer = bool(profiles & {'draft-timing', 'transport-timing'})
     return {'per_layer_timing': 'on (perturbing)' if layer else 'off',
             'profiling': bool(profiles), 'source': 'launch configuration'}
 
@@ -2194,7 +2193,7 @@ def summarize_job(job, exit_code):
                     cycles += 1
                     proposed += sum(max(0, n) for n in observation['depths'])
                 elif observation.get('type') == 'draft_round':
-                    proposed += sum(max(0, r.get('verified_rows', 1) - 1) for r in observation.get('requests', []))
+                    proposed += sum(r.get('proposed', 0) for r in observation.get('requests', []))
         expected = speculating(job['entry']['set']) or job.get('planned_speculator', 'off') != 'off'
         row['trace'] = {'path': trace_path, 'bytes': path.stat().st_size if path.is_file() else 0, 'records': records,
                         'expected': expected, 'proposal_evidence_rows': proposed, 'cycles': cycles}

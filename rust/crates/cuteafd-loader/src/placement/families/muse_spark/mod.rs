@@ -200,8 +200,7 @@ pub struct MuseDrafter {
     pub weights: ResidentWeights,
     pub scratch: u64,
     pub head_scratch: u64,
-    /// The draft batch's input ids and the policy probe's device route ring
-    /// (`layers x HEAD_ROWS x topk` ids) on the head GPU.
+    /// The draft batch's input ids on the head GPU.
     pub runtime: u64,
     pub context_slots: usize,
     pub sequences: usize,
@@ -265,8 +264,7 @@ pub fn drafter_inventory(cfg: &MuseSparkConfig, config: &serde_json::Value, slot
     ensure!(stored >= cfg.vocab_size, "Muse head stored width below the vocabulary");
     let rows = capacity.max_batch_sequences * block;
     let head_scratch = u64::try_from(rows * (stored + cfg.vocab_size) * 4)?;
-    let probe = (cfg.layers * crate::families::muse_spark::lane::HEAD_ROWS * cfg.topk * 4) as u64;
-    let runtime = u64::try_from(rows * 4)? + probe;
+    let runtime = u64::try_from(rows * 4)?;
     Ok(MuseDrafter { representation, arena_requests, owned: residency.owned, weights: residency.weights, scratch: residency.scratch,
         head_scratch, runtime, context_slots: capacity.context_slots,
         sequences: capacity.max_batch_sequences, block, head_dim: geometry.head_dim as usize, tp2: Vec::new() })

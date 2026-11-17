@@ -1,39 +1,23 @@
-//! History copies replace only the neural draft's unconfident continuation.
+//! History copies continue a neural draft the request's own history agrees with.
+//!
+//! The copy window is the continuation of the latest earlier occurrence of the
+//! request's last 4-8 tokens. It extends a draft only when every drafted
+//! position the policy kept matches it; the copied positions are then verified
+//! on their own acceptance history (`cuteafd_core::DraftHistory`'s copy track).
 
-/// Most copy positions beyond the loaded neural window.
+/// Most copy positions beyond the neural draft.
 pub(crate) const COPY_EXTENSION: usize = 32;
 pub(crate) const MIN_DRAFT_AGREEMENT: usize = 3;
 pub(crate) const MIN_ANCHORED_MATCH: usize = 7;
-/// Protect moderately likely leading tokens; trace calibration motivates 0.6.
-pub(crate) const CONFIDENCE_CUT: f64 = 0.6;
 
-pub(crate) fn tail_prior(position: usize) -> f64 {
-    [0.95, 0.9, 0.65, 0.3].get(position).copied().unwrap_or(0.2)
-}
-
-pub(crate) struct Continuation {
-    /// Complete proposal after the anchor, including the agreeing neural prefix.
-    pub tokens: Vec<u32>,
-    /// Positions still backed by neural evidence; later positions are copy evidence.
-    pub neural: usize,
-}
-
-impl Continuation {
-    /// Whether the verified proposal reaches the history-backed tail.
-    pub(crate) fn uses_copy(&self, verified_drafts: usize) -> bool {
-        verified_drafts.min(self.tokens.len()) > self.neural
-    }
-}
-
-pub(crate) fn continuation(history: &[u32], drafted: &[u32], calibrated: &[f64], room: usize,
-    greedy: bool) -> Option<Continuation> {
-    if !greedy || drafted.len() < MIN_DRAFT_AGREEMENT || calibrated.len() != drafted.len() { return None; }
-    let confident = calibrated.iter().take_while(|&&p| p.is_finite() && p >= CONFIDENCE_CUT).count();
-    let neural = confident.max(MIN_DRAFT_AGREEMENT);
-    let (_, suffix, copy) = window(history, room.min(drafted.len() + COPY_EXTENSION));
-    if suffix + neural < MIN_ANCHORED_MATCH || copy.len() <= neural
-        || drafted[..neural] != copy[..neural] { return None; }
-    Some(Continuation { tokens: copy.to_vec(), neural })
+/// The copy tokens that follow `drafted`, when the window agrees with all of
+/// it: at least three drafts and seven anchored tokens (suffix plus drafts).
+pub(crate) fn continuation<'h>(history: &'h [u32], drafted: &[u32], greedy: bool) -> Option<&'h [u32]> {
+    if !greedy || drafted.len() < MIN_DRAFT_AGREEMENT { return None; }
+    let (_, suffix, copy) = window(history, drafted.len() + COPY_EXTENSION);
+    if suffix + drafted.len() < MIN_ANCHORED_MATCH || copy.len() <= drafted.len()
+        || drafted != &copy[..drafted.len()] { return None; }
+    Some(&copy[drafted.len()..])
 }
 
 /// Trace-only agreement with the same selected history copy, independent of room.
@@ -65,89 +49,37 @@ fn window(history: &[u32], limit: usize) -> (Option<usize>, usize, &[u32]) {
 mod tests {
     use super::*;
 
-    #[test]
-    fn verified_neural_prefix_does_not_count_as_a_copy_round() {
-        let copy = Continuation { tokens: vec![20, 21, 22, 50, 51], neural: 3 };
-        for verified in 0..=3 {
-            assert!(!copy.uses_copy(verified));
-        }
-        for verified in [4, 5, 64] {
-            assert!(copy.uses_copy(verified));
-        }
-        let neural_only = Continuation { tokens: vec![20, 21, 22], neural: 3 };
-        assert!(!neural_only.uses_copy(64));
-    }
-
+    /// `copy` after an eight-token stretch that the history then repeats `suffix` tokens of.
     fn history(copy: &[u32], suffix: usize) -> Vec<u32> {
-        let tail: Vec<_> = (1..=suffix as u32).collect();
-        let mut history = tail.clone();
-        history.extend(copy);
-        history.extend(100..164);
-        history.extend(tail);
+        let mut history: Vec<u32> = (1..=8).collect();
+        history.extend_from_slice(copy);
+        history.extend(900..910);
+        history.extend((9 - suffix) as u32..=8);
         history
     }
 
     #[test]
-    fn trace_window_matches_runtime_copy_without_changing_selection() {
-        let history = [1, 2, 3, 4, 10, 11, 12, 13, 1, 2, 3, 4];
-        assert_eq!(trace_window(&history, 3), (Some(0), 4, vec![10, 11, 12]));
-        assert_eq!(trace_window(&history, 20).2, window(&history, 20).2);
-        assert_eq!(trace_window(&[], 3), (None, 0, Vec::new()));
-    }
-
-    #[test]
-    fn uniform_agreement_replaces_low_confidence_for_every_width() {
-        for width in [3, 5, 7] {
-            let neural: Vec<_> = (20..20 + width as u32).collect();
-            let mut copied: Vec<_> = (50..50 + width as u32 + 40).collect();
-            copied[..3].copy_from_slice(&neural[..3]);
-            let mut confidence = vec![0.1; width];
-            confidence[..3].fill(0.9);
-            let history = history(&copied, 4);
-            let result = continuation(&history, &neural, &confidence, 100, true).unwrap();
-            assert_eq!(result.neural, 3);
-            assert_eq!(result.tokens, copied[..width + COPY_EXTENSION]);
-            assert_eq!(agreement(&history, &neural), 3);
-            assert_eq!(continuation(&history, &neural, &confidence, 5, true).unwrap().tokens.len(), 5);
-            assert!(continuation(&history, &neural, &confidence, 3, true).is_none());
-            assert!(continuation(&history, &neural, &confidence, 100, false).is_none());
+    fn an_agreeing_draft_is_continued_by_the_rest_of_the_window() {
+        let copy: Vec<u32> = (100..150).collect();
+        let history = history(&copy, 8);
+        for width in [3, 5, 7, 16] {
+            let tail = continuation(&history, &copy[..width], true).unwrap();
+            assert_eq!(tail, &copy[width..width + COPY_EXTENSION]);
         }
+        assert_eq!(trace_window(&history, 4), (Some(0), 8, copy[..4].to_vec()));
+        assert_eq!(agreement(&history, &[100, 101, 7, 103]), 2);
     }
 
     #[test]
-    fn protects_every_confident_leading_position_and_at_least_three() {
-        let neural = [20, 21, 22, 23, 24, 25, 26];
-        for protected in 3..=7 {
-            let mut copy: Vec<_> = (50..100).collect();
-            copy[..protected].copy_from_slice(&neural[..protected]);
-            let mut confidence = vec![0.1; 7];
-            confidence[..protected].fill(CONFIDENCE_CUT);
-            let h = history(&copy, 4);
-            assert_eq!(continuation(&h, &neural, &confidence, 39, true).unwrap().neural, protected);
-            for mismatch in 0..protected {
-                let mut bad = copy.clone();
-                bad[mismatch] = 99;
-                assert!(continuation(&history(&bad, 4), &neural, &confidence, 39, true).is_none());
-            }
-        }
-        assert!(continuation(&history(&[20, 21, 50, 51], 8), &neural, &[0.1; 7], 39, true).is_none());
-        assert!(continuation(&history(&[20, 21, 22, 50], 4), &neural[..2], &[0.9; 2], 39, true).is_none());
-    }
-
-    #[test]
-    fn trace_identifies_the_copy_and_decay_has_no_flat_tail() {
-        let h = history(&[20, 21, 22, 50, 51], 4);
-        assert_eq!(trace_window(&h, 5), (Some(0), 4, vec![20, 21, 22, 50, 51]));
-        assert_eq!((0..6).map(tail_prior).collect::<Vec<_>>(), [0.95, 0.9, 0.65, 0.3, 0.2, 0.2]);
-    }
-
-    #[test]
-    fn no_match_short_copy_or_missing_confidence_cannot_qualify() {
-        let neural = [20, 21, 22];
-        assert!(continuation(&[], &neural, &[0.9; 3], 35, true).is_none());
-        assert!(continuation(&history(&neural, 4)[..7], &neural, &[0.9; 3], 35, true).is_none());
-        assert!(continuation(&history(&[20, 21, 22, 50], 4), &neural, &[], 35, true).is_none());
-        assert_eq!(agreement(&history(&[20, 21, 99, 50], 4), &neural), 2);
-        assert_eq!(agreement(&[], &neural), 0);
+    fn disagreement_short_drafts_weak_anchors_and_sampling_do_not_copy() {
+        let copy: Vec<u32> = (100..150).collect();
+        let anchored = history(&copy, 8);
+        assert!(continuation(&anchored, &[100, 101, 7], true).is_none());
+        assert!(continuation(&anchored, &copy[..2], true).is_none());
+        assert!(continuation(&anchored, &copy[..5], false).is_none());
+        // Four matched tokens need three drafts to reach seven anchored.
+        let weak = history(&copy, 4);
+        assert!(continuation(&weak, &copy[..3], true).is_some());
+        assert!(continuation(&(0..40).collect::<Vec<u32>>(), &[1, 2, 3], true).is_none());
     }
 }

@@ -490,10 +490,6 @@ fn tp2_input(experts: &dyn RtxExpertLayer, wire: *mut c_void, hidden: *mut c_voi
     if experts.uses_fp8_input() { ExpertInput::Fp8K32(wire) } else { ExpertInput::Bf16(hidden) }
 }
 
-fn tp2_weight_read_bytes(ranks: [&dyn RtxExpertLayer; 2]) -> Result<usize> {
-    ranks.into_iter().try_fold(0, |largest, rank| Ok(largest.max(rank.weight_read_bytes()?)))
-}
-
 /// Per-program GPU times (CUTEAFD_GLMF_PROFILE_OPS=1): timing events around
 /// every launch, read back by [`GlmfEngine::op_profile`].
 #[derive(Default)]
@@ -1483,9 +1479,6 @@ pub(crate) struct GlmfEngine<'a> {
     graphs_warmed: std::cell::Cell<bool>,
     /// Opt-in matched-token/route evidence; never adds a device readback.
     split_audit: bool,
-    /// The shared draft policy's per-step signals (layer events, routes), armed by
-    /// `serve-glmf` under the shared policy and active only around its verify steps.
-    draft_probe: RefCell<Option<super::draft_probe::RoundProbe<'a>>>,
     /// A decode segment is being captured: host-side probe work stays out of the graph.
     capturing: std::cell::Cell<bool>,
     ops: Option<RefCell<OpTimes>>,
@@ -1789,7 +1782,7 @@ impl<'a> GlmfEngine<'a> {
             warming_graphs: std::cell::Cell::new(false),
             prewarming_graphs: std::cell::Cell::new(false), graphs_warmed: std::cell::Cell::new(false),
             split_audit: std::env::var("CUTEAFD_GLMF_SPLIT_AUDIT").is_ok_and(|v| v == "1"),
-            spark_bf16: false, draft_probe: RefCell::new(None), capturing: std::cell::Cell::new(false),
+            spark_bf16: false, capturing: std::cell::Cell::new(false),
             ops: std::env::var("CUTEAFD_GLMF_PROFILE_OPS").is_ok_and(|v| v == "1").then(RefCell::default),
             fp8_prefill: Fp8Prefill::default(), kda_fp32_partials: false,
             kda_output_shard: false, mark_slots: 0,
@@ -2427,69 +2420,6 @@ impl<'a> GlmfEngine<'a> {
         use crate::shared::placement::layers::ExpertRoute;
         self.expert_routing.as_ref().and_then(|routes| routes.route(layer))
             == Some(ExpertRoute::Backend(cuteafd_loader::placement::ExpertHome::RtxTp2))
-    }
-
-    /// Bind the actual admitted TP1/TP2/Spark homes, not catalog availability.
-    pub(crate) fn draft_geometry(&self, catalog: Option<&cuteafd_loader::OfficialV41Catalog>, width: usize,
-        extension: usize) -> Result<cuteafd_core::PolicyGeometry> {
-        use crate::shared::draft::resource::{self, LayerHome};
-        let remote = match &self.experts {
-            Some(Experts::Spark { transport, .. }) => transport.borrow().installed_grouping()?,
-            _ => Vec::new(),
-        };
-        let homes = self.weights.layers.iter().enumerate().map(|(layer, weights)| {
-            if weights.dense { return Ok(LayerHome::Dense); }
-            let tp = if self.tp2_layer(layer) { 2 } else {
-                match self.routed_experts(layer) {
-                    Some(Experts::Local(_) | Experts::LocalExl3(_) | Experts::LocalNative(_)) => 1,
-                    Some(Experts::Spark { .. }) => remote.len(),
-                    _ => anyhow::bail!("GLM Flash layer {layer} has no installed expert home"),
-                }
-            };
-            ensure!(tp > 0, "GLM Flash layer {layer} has no installed expert ranks");
-            let catalog = catalog.context("GLM Flash routed expert catalog missing")?;
-            let slice_bytes = resource::layer_slice_bytes(catalog.exl3(), layer, tp, || {
-                if let Some(tp2) = self.tp2.as_ref().filter(|tp2| tp2.layers.contains(&layer)) {
-                    let left = tp2.ranks[0].borrow();
-                    let right = tp2.ranks[1].borrow();
-                    tp2_weight_read_bytes([left.as_ref(), right.as_ref()])
-                } else if catalog.format() == cuteafd_loader::plan::checkpoint::CheckpointFormat::Exlr8 {
-                    match self.routed_experts(layer) {
-                        Some(Experts::LocalNative(local)) => local.borrow().weight_read_bytes(),
-                        Some(Experts::Spark { .. }) => resource::worker_weight_read_bytes(&remote, layer),
-                        _ => anyhow::bail!("GLM Flash layer {layer} has no installed native byte descriptor"),
-                    }
-                } else {
-                    anyhow::ensure!(catalog.fp8().is_some(), "GLM Flash routed expert format cannot be priced");
-                    match self.routed_experts(layer) {
-                        Some(Experts::Local(local)) => Ok(local.experts.borrow().weight_read_bytes()),
-                        Some(Experts::Spark { .. }) => resource::worker_weight_read_bytes(&remote, layer),
-                        _ => anyhow::bail!("GLM Flash layer {layer} has no installed FP8-family byte descriptor"),
-                    }
-                }
-            })?;
-            Ok(if matches!(self.routed_experts(layer), Some(Experts::Spark { .. })) && !self.tp2_layer(layer) {
-                LayerHome::Remote { slice_bytes }
-            } else { LayerHome::Local { slice_bytes } })
-        }).collect::<Result<Vec<_>>>()?;
-        resource::geometry_with_grouping(&homes, self.cfg.experts, self.cfg.topk, self.verify_rows, width,
-            extension, |layer, rows| {
-                if let Some(tp2) = self.tp2.as_ref().filter(|tp2| tp2.layers.contains(&layer)) {
-                    let group = tp2.ranks[0].borrow().group_rows(rows)?;
-                    ensure!(tp2.ranks[1].borrow().group_rows(rows)? == group,
-                        "GLM Flash installed TP2 ranks disagree on layer {layer} grouping");
-                    return Ok(group);
-                }
-                match self.routed_experts(layer) {
-                    Some(Experts::LocalNative(local)) => local.borrow().group_rows(rows),
-                    Some(Experts::Local(local)) => Ok(local.experts.borrow().weight_read_group(rows, true)?.0),
-                    Some(Experts::LocalExl3(local)) => crate::families::deepseek_v4::local::installed_window_group_rows(
-                        &local.resident, || local.ensure(layer, self.stream), rows,
-                        |experts, rows| experts.group_rows(rows)),
-                    Some(Experts::Spark { .. }) => resource::worker_group_rows_for_input(&remote, layer, rows, self.spark_bf16),
-                    _ => anyhow::bail!("GLM Flash layer {layer} has no installed expert grouping"),
-                }
-            })
     }
 
     fn record_exchange(&self, rank: usize, name: &'static str, slot: usize, push: bool) {
@@ -4394,7 +4324,6 @@ impl<'a> GlmfEngine<'a> {
                 on_layer(index, &self.download(&w.streams[cur], t * HC * row)?)?;
             }
             crate::shared::console::layer_mark(index);
-            self.probe_mark(index)?;
         }
         if let Some(w1) = w1 { self.replicate_terminal(w, w1, cur, t)?; }
         self.finish_route_checks()?;
@@ -4558,7 +4487,6 @@ impl<'a> GlmfEngine<'a> {
             }
             if index < layers.len() {
                 crate::shared::console::layer_mark(index);
-                self.probe_mark(index)?;
             }
         }
         if layers.len() < self.cfg.layers {
@@ -5245,7 +5173,6 @@ impl<'a> GlmfEngine<'a> {
                     self.cfg.routed_scale as f32, true, self.stream)
             }
         })?;
-        self.probe_ring(index, w, t)?;
         if !matches!(experts, Some(Experts::Local(_))) && !self.spark_bf16 {
             let grid = self.quantize_grid.blocks(t, h);
             self.run("expert_input_quant", &[("source_ptr", w.x.buffer.ptr), ("values_ptr", w.wire.buffer.ptr),
@@ -5396,64 +5323,6 @@ impl<'a> GlmfEngine<'a> {
             }
         }
         self.run("add", &[("a", w.routed_ptr()?), ("b", w.shared.buffer.ptr), ("out", w.delta.buffer.ptr)], &[rows])
-    }
-
-    /// The draft probe's layer mark: the end of `index` on the engine stream.
-    fn probe_mark(&self, index: usize) -> Result<()> {
-        if let Some(probe) = self.draft_probe.borrow_mut().as_mut() {
-            // SAFETY: the engine's own stream, live for the engine's lifetime.
-            unsafe { probe.mark(index, self.stream)? };
-        }
-        Ok(())
-    }
-
-    /// Queue layer `index`'s router ids into the draft probe's ring right
-    /// behind the router. Spark layers ring too: their routes reach the host
-    /// only on the exchange worker, after the post.
-    fn probe_ring(&self, index: usize, w: &Workspace<'_>, t: usize) -> Result<()> {
-        if self.capturing.get() { return Ok(()); }
-        let mut probe = self.draft_probe.borrow_mut();
-        let Some(probe) = probe.as_mut().filter(|p| p.wants_ring(false)) else { return Ok(()) };
-        // SAFETY: the router just wrote `t` rows of ids into `route_ids` on this stream; the ring
-        // is read after the step's sync.
-        unsafe { probe.ring(self.library, index, w.route_ids.buffer, t, self.stream) }
-    }
-
-    /// Arm the shared draft policy's per-step signals for verify steps of up
-    /// to `rows` rows (`serve-glmf` under the shared policy only).
-    pub(crate) fn arm_draft_probe(&self, rows: usize) -> Result<()> {
-        let dense = self.weights.layers.iter().map(|layer| layer.dense).collect();
-        *self.draft_probe.borrow_mut() = Some(super::draft_probe::RoundProbe::new(self.library, dense,
-            self.cfg.topk, rows)?);
-        Ok(())
-    }
-
-    /// Start recording a verify step of `rows` rows (with the draft probe armed).
-    pub(crate) fn probe_begin(&self, rows: usize) {
-        if let Some(probe) = self.draft_probe.borrow_mut().as_mut() { probe.begin(rows); }
-    }
-
-    /// Stop recording after the step and its token selection (which drains the
-    /// engine stream); a failed step's signals are dropped.
-    pub(crate) fn probe_end(&self, ok: bool) {
-        if let Some(probe) = self.draft_probe.borrow_mut().as_mut() {
-            probe.end();
-            if !ok { let _ = probe.finish(); }
-        }
-    }
-
-    /// The probed step's routes and layer µs, once its stream drained, handed
-    /// to `observe` (nothing when the step's signals are incomplete).
-    pub(crate) fn probe_finish<T>(&self, observe: impl FnOnce(&crate::shared::draft::routes::RoundRoutes,
-        &[Option<f64>]) -> T) -> Option<T> {
-        let mut probe = self.draft_probe.borrow_mut();
-        let (routes, layer_us) = probe.as_mut()?.finish()?;
-        Some(observe(routes, &layer_us))
-    }
-
-    /// Ring and staged-id agreement under `CUTEAFD_GLMF_ROUTE_RING_CHECK`.
-    pub(crate) fn probe_ring_check(&self) -> Option<super::draft_probe::RingCheck> {
-        self.draft_probe.borrow().as_ref().map(|probe| probe.ring_check)
     }
 
     /// Layer `index`'s wave on the link's exchange: routes and wire rows copy
@@ -5625,26 +5494,6 @@ mod tp2_tests {
         let mut wrong = valid(); wrong.fp8 = false;
         assert!(native_local_layers(&wrong, 4).is_err());
         assert!(native_local_layers(&valid(), 0).is_err());
-    }
-    #[test]
-    fn draft_geometry_prices_installed_tp2_owners_and_propagates_errors() {
-        struct Rank(Option<usize>);
-        impl RtxExpertLayer for Rank {
-            fn shard(&self) -> crate::shared::experts::rtx::RtxShard { unreachable!() }
-            fn partial(&self) -> PartialDtype { PartialDtype::Bf16 }
-            fn uses_fp8_input(&self) -> bool { true }
-            fn layers(&self) -> &[usize] { &[3] }
-            fn device(&self) -> i32 { 0 }
-            fn workspace_bytes(&self) -> usize { 0 }
-            fn output(&self) -> *mut c_void { std::ptr::null_mut() }
-            fn weight_read_bytes(&self) -> Result<usize> { self.0.context("installed descriptor missing") }
-            unsafe fn enqueue(&mut self, _: usize, _: usize, _: ExpertInput, _: Routes,
-                _: *mut c_void, _: &mut dyn FnMut()) -> Result<()> { unreachable!() }
-        }
-        assert_eq!(tp2_weight_read_bytes([&Rank(Some(123)), &Rank(Some(456))]).unwrap(), 456);
-        assert_eq!(tp2_weight_read_bytes([&Rank(Some(456)), &Rank(Some(123))]).unwrap(), 456);
-        assert!(tp2_weight_read_bytes([&Rank(None), &Rank(Some(456))]).is_err());
-        assert!(tp2_weight_read_bytes([&Rank(Some(456)), &Rank(None)]).is_err());
     }
 
     #[test]

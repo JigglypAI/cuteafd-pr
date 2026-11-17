@@ -117,7 +117,6 @@ impl<'a> UnitHooks<'_, 'a, '_, '_, '_, '_, '_, '_> {
             }
         }
         crate::shared::console::layer_mark(layer);
-        e.probe_mark(layer)?;
         Ok(())
     }
 }

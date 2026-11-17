@@ -1,6 +1,6 @@
 //! Inkling adapter for the shared request scheduler; no family scheduling loop.
 use super::{cache::{InklingPrefix, Placement}, engine::Execution};
-use crate::shared::{draft::routes::RoundRoutes, prefix::{CudaCopyEngine, PrefixArgs}, probe,
+use crate::shared::{prefix::{CudaCopyEngine, PrefixArgs}, probe,
     prefill_packing::{Limits, MemberOutcome}, prefill_pipeline::{sequence_units, Unit, UnitSegment},
     qwen::scheduler::{self, Backend}, token_io::{DeviceLogits, TokenSelector}};
 use anyhow::{ensure, Context, Result};
@@ -45,28 +45,6 @@ enum Pending<'a>{
     Spec{mark:super::verify::TargetMark<'a>,tokens:Vec<Vec<u32>>},
 }
 
-fn draft_policy_geometry(layers:usize,concurrency:usize,block:usize,width:usize)->Result<cuteafd_core::PolicyGeometry>{
-    let proposals=block.checked_sub(1).context("Inkling draft block lacks anchor")?;
-    ensure!(width>0 && width<=proposals,"Inkling draft width exceeds bundled proposal cap");
-    Ok(cuteafd_core::PolicyGeometry{layers:vec![cuteafd_core::LayerResource{class:None,slice_bytes:0.,group_rows:1,timed:false};layers],
-        group_rows_by_rows:vec![],experts:0,topk:0,max_requests:concurrency,max_positions:proposals,
-        widths:vec![width],classes:vec![cuteafd_core::ResourceClass::rtx()],regimes:1})
-}
-
-#[derive(Default)]
-struct PolicyProbe{routes:Option<RoundRoutes>}
-impl PolicyProbe{
-    fn arm(&mut self,layers:usize){self.routes=Some(RoundRoutes::new(layers,0));}
-    fn begin(&mut self,rows:usize){if let Some(routes)=&mut self.routes{
-        routes.begin(rows);
-        // Fit whole-round cost, including MoE exchange, without invented route timings.
-        for route_index in 0..routes.layers(){routes.dense(route_index).expect("admitted Inkling policy layer");}
-    }}
-    fn finish<T>(&self,observe:impl FnOnce(&RoundRoutes,&[Option<f64>])->T)->Option<T>{
-        self.routes.as_ref().map(|routes|observe(routes,&[]))
-    }
-}
-
 pub(crate) struct InklingBackend<'a> {
     execution: RefCell<Execution<'a>>,
     family: InklingPrefix<'a>,
@@ -78,7 +56,6 @@ pub(crate) struct InklingBackend<'a> {
     vocab: usize,
     host: Option<cuteafd_hostcache::config::Config>,
     profile: RefCell<[f64; 2]>,
-    policy_probe:RefCell<PolicyProbe>,
     pending: RefCell<Option<Pending<'a>>>,
     selector: Vec<cuteafd_loader::placement::planner::Allocation>,
     selector_ready: std::cell::Cell<bool>,
@@ -99,7 +76,7 @@ impl<'a> InklingBackend<'a> {
         ensure!(!selector.is_empty(), "Inkling selector was not admitted before startup");
         let family=InklingPrefix::with_draft(cache,execution.draft.clone());
         Ok(Self { execution: RefCell::new(execution), family, library,
-            context, concurrency, unit_rows, waves, vocab, host, profile: RefCell::new([0.; 2]), policy_probe:RefCell::new(PolicyProbe::default()),
+            context, concurrency, unit_rows, waves, vocab, host, profile: RefCell::new([0.; 2]),
             pending: RefCell::new(None), selector, vision: None, selector_ready: std::cell::Cell::new(false) })
     }
     pub fn with_vision(mut self, binding: crate::shared::vision::perception::Binding) -> Self {
@@ -335,12 +312,9 @@ impl<'a> Backend<'a> for InklingBackend<'a> {
     fn verify_attention_trace(&self, _: &[Vec<usize>], rows: usize) -> crate::shared::speculation_trace::Deferred {
         crate::shared::speculation_trace::Deferred::new(move || serde_json::json!({"kind":"inkling2", "rows":rows, "attention":"eager"}))
     }
-    fn draft_geometry(&self,_:&Path,width:usize)->Result<cuteafd_core::PolicyGeometry>{
-        let execution=self.execution.borrow();
-        let draft=execution.draft.as_ref().context("Inkling drafter not admitted")?;
-        draft_policy_geometry(execution.cfg.layers,self.concurrency,draft.layout.config.transformer.block,width)
-    }
-    fn arm_draft_probe(&self)->Result<()>{self.policy_probe.borrow_mut().arm(self.execution.borrow().cfg.layers);Ok(())}
+    fn draft_head_kind(&self) -> cuteafd_core::HeadScore { cuteafd_core::HeadScore::None }
+    // Exact FIR verification owns one anchor plus the native seven drafts.
+    fn draft_copies(&self) -> bool { false }
     fn prefill_draft(&self,p:&Placement,_:usize,_:&[u32],next:Option<u32>,state:&mut Draft)->Result<()>{
         if let Some(draft)=&self.execution.borrow().draft{ensure!(draft.drafter.frontier(p.slot)?.1==p.len,"Inkling draft prefill frontier differs");}
         state.anchor=next;Ok(())
@@ -398,11 +372,7 @@ impl<'a> Backend<'a> for InklingBackend<'a> {
         }
         execution.requests.cache.drain()?;Ok(())
     }
-    fn probe_begin(&self, rows: usize) {self.policy_probe.borrow_mut().begin(rows);}
-    fn probe_end(&self) {}
-    fn probe_finish<T>(&self, observe: impl FnOnce(&RoundRoutes, &[Option<f64>]) -> T) -> Option<T> {
-        self.policy_probe.borrow().finish(observe)
-    }
+
 }
 
 #[cfg(test)]
@@ -410,52 +380,51 @@ mod tests {
     use super::*;
 
     #[test]
-    fn copied_proposals_respect_per_sequence_cap_and_exact_fir_prefixes()->Result<()>{
-        use crate::shared::draft::{copy,resource};
-        use cuteafd_loader::families::inkling2::verify::{accepted_history,Source};
-        let mut policy=cuteafd_core::DraftPolicy::seeded(draft_policy_geometry(48,16,8,7)?,cuteafd_core::PolicySeed::weak(7))?;
-        let mut history=vec![1,2,3,4,20,21,22];history.extend(50..100);history.extend([1,2,3,4]);
-        let mut prior=vec![0.99,0.99,0.99,0.01,0.01,0.01,0.01];
-        let continuation=resource::copy_continuation(&policy,1,1,&history,&[20,21,22,23,24,25,26],&mut prior,39,true).unwrap();
-        assert!(continuation.tokens.len()>7 && continuation.neural==copy::MIN_DRAFT_AGREEMENT);
-        let candidates=[resource::Candidate{id:1,prior:&prior,limit:63,selector:false,cold:false}];
-        let selected=resource::select_drafted(&mut policy,&candidates,7,64,1);
-        assert!(selected.lengths[0]<=7);
-        let rows=std::iter::once(9).chain(continuation.tokens.into_iter().take(selected.lengths[0])).collect::<Vec<_>>();
-        assert!(rows.len()<=8);
-        let prior=[100,99,98];
-        for keep in 0..=rows.len(){
-            let committed=accepted_history(3,rows.len(),keep)?.into_iter().map(|source|match source{Source::Input(i)=>rows[i],Source::Prior(i)=>prior[i]}).collect::<Vec<_>>();
-            let mut serial=prior.to_vec();for &token in &rows[..keep]{serial.insert(0,token);serial.truncate(3);}
-            assert_eq!(committed,serial);
+    fn recurrent_native_seven_history_always_explores_and_never_head_skips() -> Result<()> {
+        use cuteafd_core::{DraftControl, DraftHistory, DraftOutcome, DrafterSpec, HeadScore};
+        let config = cuteafd_loader::formats::block_dspark::recurrent::RecurrentBlockConfig::from_hf(
+            &serde_json::from_str(include_str!("../../../../cuteafd-loader/src/families/inkling2/fixtures/config.json"))?)?;
+        let width = config.predictions();
+        assert_eq!(width, 7);
+        let mut policy = DraftHistory::new(DrafterSpec { block: width, head: HeadScore::None, copy: 0 }, DraftControl::History);
+        assert_eq!(policy.plan(&[(1, width)], 64), [7]);
+        for _ in 0..256 {
+            let depth = policy.plan(&[(1, width)], 64)[0];
+            let kept = policy.refine(1, depth, None);
+            assert!(kept >= 1, "headless drafter must explore suppressed first position");
+            policy.observe(&[DraftOutcome { id: 1, proposed: kept, accepted: 0, censored: false }], false);
         }
-        let packed=decode_spans([8;8],cuteafd_loader::placement::families::inkling2::DECODE_ROWS as usize)?;
-        assert_eq!(packed.last().unwrap().end,64,"packed capacity is independent of per-sequence cap");
-        assert!(draft_policy_geometry(48,16,8,8).is_err());Ok(())
+        assert_eq!(policy.plan(&[(1, width)], 64), [1]);
+        assert_eq!(policy.stats().head_skips, 0);
+        assert!(policy.stats().explored > 0);
+        for _ in 0..32 {
+            let depth = policy.plan(&[(1, width)], 64)[0];
+            policy.observe(&[DraftOutcome { id: 1, proposed: depth, accepted: depth, censored: false }], false);
+        }
+        assert_eq!(policy.plan(&[(1, width)], 64), [7]);
+        assert_eq!(policy.stats().head_skips, 0);
+        Ok(())
     }
 
     #[test]
-    fn whole_round_probe_updates_acceptance_and_adaptive_depth()->Result<()>{
-        use crate::shared::draft::{resource,clock::RoundTimes,evidence::DraftSource};
-        let mut policy=cuteafd_core::DraftPolicy::seeded(draft_policy_geometry(48,16,8,7)?,cuteafd_core::PolicySeed::weak(7))?;
-        policy.set_draft_mode(cuteafd_core::DraftMode::Simple);
-        let mut probe=PolicyProbe::default();probe.arm(48);
-        let raw=[0.9,0.16,0.16,0.16,0.16,0.16,0.16];
-        let before=policy.probabilities(1,cuteafd_core::DraftCandidate{id:1,confidence:&raw});
-        let mut state=7u64;let mut depths=std::collections::BTreeSet::new();
-        for _ in 0..400{
-            let candidates=[resource::Candidate{id:1,prior:&raw,limit:7,selector:false,cold:false}];
-            let selected=resource::select_drafted(&mut policy,&candidates,7,64,1);let depth=selected.lengths[0];depths.insert(depth);
-            let mut accepted=1;for _ in 0..depth{state=state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);if (state>>33)%10<8{accepted+=1;}else{break;}}
-            probe.begin(depth+1);
-            let requests=[resource::Verified{id:1,rows:depth+1,accepted,source:DraftSource::Neural,prior:Some(&raw),features:None,censor:None}];
-            probe.finish(|routes,times|{routes.complete().unwrap();resource::observe_drafted(&mut policy,&requests,routes,times,
-                RoundTimes{total_us:5000,draft_us:Some(300)},7,None,Some(1))}).unwrap()?;
+    fn agreeing_history_copies_preserve_exact_fir_prefixes() -> Result<()> {
+        use cuteafd_loader::families::inkling2::verify::{accepted_history, Source};
+        let history = [1,2,3,4,5,6,7,8,20,21,22,23,24,25,26,27,28,29,50,1,2,3,4,5,6,7,8];
+        let draft = [20,21,22,23,24,25,26];
+        let tail = crate::shared::draft::copy::continuation(&history, &draft, true).unwrap();
+        assert!(!tail.is_empty());
+        let rows = std::iter::once(9).chain(draft).collect::<Vec<_>>();
+        assert_eq!(rows.len(), 8, "Inkling FIR verifier remains at its admitted native block");
+        let prior = [100,99,98];
+        for keep in 0..=rows.len() {
+            let committed = accepted_history(3, rows.len(), keep)?.into_iter().map(|source| match source {
+                Source::Input(i) => rows[i], Source::Prior(i) => prior[i] }).collect::<Vec<_>>();
+            let mut serial = prior.to_vec();
+            for &token in &rows[..keep] { serial.insert(0, token); serial.truncate(3); }
+            assert_eq!(committed, serial);
         }
-        assert_eq!(policy.stats().rounds,400);assert!(policy.stats().verified_drafts>0 && policy.stats().accepted_drafts>0);
-        let after=policy.probabilities(1,cuteafd_core::DraftCandidate{id:1,confidence:&raw});
-        assert!(after[1]>before[1] && after[1]>0.6,"{before:?}->{after:?}");
-        assert!(depths.len()>1,"adaptive depth never changed: {depths:?}");Ok(())
+        assert_eq!(decode_spans([8;8],64)?.last().unwrap().end,64);
+        Ok(())
     }
 
     #[test]

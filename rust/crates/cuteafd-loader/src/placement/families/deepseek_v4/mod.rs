@@ -196,13 +196,6 @@ pub fn mark_slots(cfg: &DeepseekV4Config, gpus: usize, prefill_rows: u64, cache_
     Ok(cuteafd_core::prefix::mark_slots_with_host(sequences, entries, mark, budget_bytes, host))
 }
 
-/// Owner-local route ring of the shared draft probe; pinned host bytes have the same extent.
-pub fn draft_probe_bytes(cfg: &DeepseekV4Config, decode_rows: u64) -> Result<u64, PlacementError> {
-    [cfg.n_layers as u64, decode_rows, cfg.n_activated_experts as u64, 4].into_iter()
-        .try_fold(1u64, |bytes, extent| bytes.checked_mul(extent)
-            .ok_or(PlacementError::Overflow("V4 draft route ring"))).map(|bytes| bytes.max(256))
-}
-
 /// Sum one owner's exact device requests.
 fn requests_bytes(what: &'static str, requests: &[u64]) -> Result<u64, PlacementError> {
     requests.iter().try_fold(0u64, |sum, &bytes| sum.checked_add(bytes))
@@ -223,17 +216,8 @@ fn intake_requests(inputs: &V4Inputs, rank: usize) -> Result<Vec<u64>, Placement
     Ok(requests)
 }
 
-/// The rank's draft route probe: one contiguous device ring.
-fn probe_requests(inputs: &V4Inputs, rank: usize) -> Result<Vec<u64>, PlacementError> {
-    if rank == 0 && !inputs.draft.is_empty() {
-        Ok(vec![draft_probe_bytes(&inputs.cfg, inputs.decode_rows)?])
-    } else {
-        Ok(Vec::new())
-    }
-}
-
 /// The "steps" demand's exact device requests: this rank's workspace
-/// builders plus its intake planes and route probe. `None` when the caller
+/// builders plus its intake planes. `None` when the caller
 /// supplied no exact workspace geometry for this rank.
 pub fn steps_requests(inputs: &V4Inputs, rank: usize) -> Result<Option<Vec<u64>>, PlacementError> {
     let Some(workspace) = inputs.workspace.as_ref().and_then(|ranks| ranks.get(rank)) else {
@@ -241,7 +225,6 @@ pub fn steps_requests(inputs: &V4Inputs, rank: usize) -> Result<Option<Vec<u64>>
     };
     let mut requests = workspace.requests.clone();
     requests.extend(intake_requests(inputs, rank)?);
-    requests.extend(probe_requests(inputs, rank)?);
     Ok(Some(requests))
 }
 
@@ -266,9 +249,8 @@ pub fn fixed_demands(inputs: &V4Inputs) -> Result<(Vec<Demand>, Vec<u64>), Place
             deepseek_v4_expert_exchange_bytes(hidden, topk, inputs.prefill_rows, inputs.decode_rows, rank, inputs.prefill_waves)
                 .map_err(|_| PlacementError::Overflow("V4 expert exchange"))?
         } else { 0 };
-        let probe = requests_bytes("V4 draft route probe", &probe_requests(inputs, rank)?)?;
         let workspace = inputs.workspace.as_ref().and_then(|w| w.get(rank)).map(|w| w.fixed_device_bytes)
-            .unwrap_or(WORKSPACE_BYTES[role] * inputs.prefill_rows / 4096) + intake + probe;
+            .unwrap_or(WORKSPACE_BYTES[role] * inputs.prefill_rows / 4096) + intake;
         reserves.push(crate::placement::reserve::gpu("deepseek_v4"));
         // The pre-weight base (the planner's context and module allowance
         // offline, the measured sample's occupancy in serve) and the code
@@ -392,15 +374,6 @@ mod default_tests {
     }
 
     #[test]
-    fn draft_probe_extent_matches_the_owner_local_ring() {
-        let cfg = context_cfg();
-        assert_eq!(draft_probe_bytes(&cfg, 64).unwrap(), 43 * 64 * 6 * 4);
-        assert_eq!(draft_probe_bytes(&cfg, 1).unwrap(), 43 * 6 * 4);
-        assert_eq!(draft_probe_bytes(&cfg, 0).unwrap(), 256);
-        assert!(draft_probe_bytes(&cfg, u64::MAX).is_err());
-    }
-
-    #[test]
     fn context_workspace_charges_distinct_scratch_pages_and_four_commit_planes() {
         let mut cfg = context_cfg();
         for (heads, topk, c4_layers) in [(64, 512, 21), (128, 1024, 30)] {
@@ -460,6 +433,20 @@ mod default_tests {
         let prepared = prepare(input)?;
         let request = production_request(input);
         prepared.admit(request).map(|admitted| admitted.placement)
+    }
+
+    #[test]
+    fn speculating_v4_fixed_steps_do_not_charge_removed_route_probe_storage() {
+        let mut input = plan_inputs(&context_cfg());
+        let before = fixed_demands(&input).unwrap().0;
+        input.draft = vec![V4ExpertCost { resident_bytes: 1024, staging_bytes: 0 }];
+        let after = fixed_demands(&input).unwrap().0;
+        for gpu in 0..2 {
+            let steps = |items: &[Demand]| items.iter().find(|owner|
+                owner.gpu == gpu && owner.group == "steps").unwrap().bytes;
+            assert_eq!(steps(&before), steps(&after), "a drafter adds no route-probe workspace");
+        }
+        assert!(after.iter().all(|owner| !owner.group.contains("probe")));
     }
 
     #[test]

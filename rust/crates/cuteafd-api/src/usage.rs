@@ -131,6 +131,7 @@ struct Inner {
     tokens_cached: AtomicU64,
     tokens_out: AtomicU64,
     tokens_reasoning: AtomicU64,
+    speculation_enabled: AtomicU64,
     proposed: AtomicU64,
     accepted: AtomicU64,
     rounds: AtomicU64,
@@ -177,6 +178,7 @@ impl UsageHandle {
             tokens_cached: AtomicU64::new(u64::MAX),
             tokens_out: AtomicU64::new(u64::MAX),
             tokens_reasoning: AtomicU64::new(u64::MAX),
+            speculation_enabled: AtomicU64::new(0),
             proposed: AtomicU64::new(0),
             accepted: AtomicU64::new(0),
             rounds: AtomicU64::new(0),
@@ -315,6 +317,9 @@ impl UsageHandle {
             field.store(value, Relaxed);
         }
     }
+    /// The serving engine has a drafter and an enabled draft policy.
+    pub fn enable_speculation(&self) { self.0.speculation_enabled.store(1, Relaxed); }
+
     pub fn round(&self, proposed: u64, accepted: u64) {
         self.0.proposed.fetch_add(proposed, Relaxed);
         self.0.accepted.fetch_add(accepted, Relaxed);
@@ -323,7 +328,7 @@ impl UsageHandle {
     /// Request-local engine counters; never subtract concurrent global totals.
     pub fn speculation(&self) -> Option<serde_json::Value> {
         let proposed = self.0.proposed.load(Relaxed);
-        (proposed > 0).then(|| serde_json::json!({"request_id":self.rid(), "proposed":proposed,
+        (proposed > 0 || self.0.speculation_enabled.load(Relaxed) != 0).then(|| serde_json::json!({"request_id":self.rid(), "proposed":proposed,
             "accepted":self.0.accepted.load(Relaxed), "cycles":self.0.rounds.load(Relaxed)}))
     }
     pub fn finished(&self, status: u16) {
@@ -932,6 +937,18 @@ pub(crate) mod tests {
         scope.retired(5,"finished");
         assert_eq!(task.await.unwrap().unwrap()["accepted"],3);
         scope.wait_retired().await.unwrap();
+    }
+
+    #[test]
+    fn enabled_speculator_reports_zero_proposals_without_inventing_rounds() {
+        let sink = Arc::new(Sink::default());
+        let scope = UsageHandle::new(Record { rid:"zero-draft".into(), ..Default::default() }, sink);
+        assert!(scope.speculation().is_none());
+        scope.enable_speculation();
+        assert_eq!(scope.speculation().unwrap(), serde_json::json!({"request_id":"zero-draft",
+            "proposed":0,"accepted":0,"cycles":0}));
+        scope.round(0, 0);
+        assert_eq!(scope.speculation().unwrap()["cycles"], 1);
     }
 
     #[test]

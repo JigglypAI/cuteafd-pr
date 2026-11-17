@@ -17,7 +17,7 @@
 //!   restored prefix does not have).
 use super::{engine::RankResources, experts::{SparkExperts, WaveSegment, WaveStep}, forward, prefill::{MusePrefill, PrefillCall},
     prefix::{MusePrefix, Placement}, step::{StepMetadata, StepSequence}};
-use crate::shared::{draft::routes::RoundRoutes, prefix::{CudaCopyEngine, PrefixArgs, Toggle},
+use crate::shared::{prefix::{CudaCopyEngine, PrefixArgs, Toggle},
     qwen::scheduler::{self, Backend}, token_io::{DeviceLogits, TokenEmbedding}};
 use anyhow::{ensure, Context, Result};
 use cuteafd_api::openai::NativeRequest;
@@ -75,30 +75,6 @@ fn ungraphed_kind(speculative: bool, kind: scheduler::UngraphedKind) -> cuteafd_
     }
 }
 
-/// What the draft policy prices a verify row with: every layer's expert
-/// slice bytes (onboarded layers per RTX, Spark layers per rank) and the
-/// installed groupings (the Sparks' bootstrap reports; the onboarded EXL3
-/// executors' are read at use).
-pub(crate) struct DraftPricing {
-    pub homes: Vec<crate::shared::draft::resource::LayerHome>,
-    pub grouping: Vec<cuteafd_transport::worker_selection::InstalledExpertGrouping>,
-}
-
-impl DraftPricing {
-    /// From the checkpoint's EXL3 headers: an onboarded layer's slice is the
-    /// GPU's (TP over the coordinator GPUs), a Spark layer's the rank's.
-    pub(crate) fn new(cfg: &MuseSparkConfig, manifest: &cuteafd_loader::V41Exl3Manifest, onboarded: &[usize],
-        gpus: usize, world: usize, grouping: Vec<cuteafd_transport::worker_selection::InstalledExpertGrouping>)
-        -> Result<Self> {
-        use crate::shared::draft::resource::{exl3_slice_bytes, LayerHome};
-        let homes = (0..cfg.layers).map(|layer| Ok(if onboarded.contains(&layer) {
-            LayerHome::Local { slice_bytes: exl3_slice_bytes(manifest, layer, gpus)? }
-        } else { LayerHome::Remote { slice_bytes: exl3_slice_bytes(manifest, layer, world)? } }))
-            .collect::<Result<Vec<_>>>()?;
-        Ok(Self { homes, grouping })
-    }
-}
-
 /// A sequence's drafter state: the next block's anchor, whether its context
 /// is current (prefilled or accepted through the frontier), and the first
 /// position the drafter's context holds for it.
@@ -145,10 +121,6 @@ pub(crate) struct MuseBackend<'r, 'a> {
     local: RefCell<Vec<super::onboard::OnboardedExperts<'a>>>,
     /// The DFlash2 drafter on the head rank's stream (`--draft`).
     draft: Option<super::draft::MuseDraft<'a>>,
-    /// The draft policy's expert pricing (`policy_geometry`), present with a drafter.
-    pricing: Option<DraftPricing>,
-    /// The verify rounds' routes and layer clock on the head rank (with a drafter).
-    probe: RefCell<Option<crate::shared::memory::device::DeviceOwner<'a, crate::shared::draft::probe::RoundProbe<'a>>>>,
 }
 
 impl<'r, 'a> MuseBackend<'r, 'a> {
@@ -186,12 +158,7 @@ impl<'r, 'a> MuseBackend<'r, 'a> {
         table: &'r TokenEmbedding<'a>, experts: &'r mut dyn SparkExperts, peer: Option<&'r super::peer::MusePeer<'a>>,
         unit_rows: usize, waves: usize, slots: usize, context: usize, pages: usize,
         local: Vec<super::onboard::OnboardedExperts<'a>>, draft: Option<super::draft::MuseDraft<'a>>,
-        pricing: Option<DraftPricing>, media_binding: super::media::Binding, packing: crate::shared::prefill_packing::PackingMode, host_prefix_bytes: u64) -> Result<Self> {
-        ensure!(draft.is_some() == pricing.is_some(), "Muse drafter and its policy pricing come together");
-        // Every Muse layer is MoE; the probe rings the head rank's route ids per layer.
-        let head = ranks.last().context("Muse backend without ranks")?.device;
-        let probe = draft.as_ref().map(|_| head.own(|| crate::shared::draft::probe::RoundProbe::new(head.library,
-            vec![false; cfg.layers], cfg.topk, HEAD_ROWS))).transpose()?;
+        media_binding: super::media::Binding, packing: crate::shared::prefill_packing::PackingMode, host_prefix_bytes: u64) -> Result<Self> {
         ensure!(draft.as_ref().is_none_or(|draft| streams.last() == Some(&draft.stream)),
             "Muse drafter must run on the head rank's stream");
         ensure!(!ranks.is_empty() && streams.len() == ranks.len() && (ranks.len() == 1) == peer.is_none()
@@ -212,7 +179,7 @@ impl<'r, 'a> MuseBackend<'r, 'a> {
         } else { (None, String::new()) };
         Ok(Self { cfg, ranks, streams, table, experts: RefCell::new(experts), peer, library: ranks[0].device.library,
             profile: RefCell::new([0.0; 2]), graphs: Vec::new(), graph_enabled: std::cell::Cell::new(false), graph_warming: std::cell::Cell::new(false), media_binding, unit_rows, packed_row_cap, packed_fallback_reason, waves, slots, context, host_prefix_bytes, pages, ring_rows,
-            local: RefCell::new(local), draft, pricing, probe: RefCell::new(probe) })
+            local: RefCell::new(local), draft })
     }
 
     pub(crate) fn configure_graphs(&mut self, enabled: bool, onboard_layers: usize) -> Result<()> {
@@ -297,7 +264,7 @@ impl<'r, 'a> MuseBackend<'r, 'a> {
 
     fn shutdown(&self) -> Result<()> {
         let result = super::engine::shutdown(&mut **self.experts.borrow_mut(), self.peer, self.ranks, &self.streams);
-        // This backend owns queued local/draft/probe storage; failed drainage
+        // This backend owns queued local/draft storage; failed drainage
         // cannot return and allow those fields to be destroyed.
         crate::shared::decode_graph::fatal_drain(result, "Muse backend terminal teardown");
         Ok(())
@@ -308,24 +275,6 @@ impl<'r, 'a> MuseBackend<'r, 'a> {
         let logits = self.step(sequences, kind)?;
         for (placement, tokens) in sequences.iter_mut() { placement.len = after_verify(placement.len, tokens.len(), speculative); }
         Ok(Some(logits))
-    }
-
-    /// The shared policy geometry over this placement's layer homes and the
-    /// installed groupings at every verify row count up to `HEAD_ROWS`.
-    fn policy_geometry(&self, width: usize) -> Result<cuteafd_core::PolicyGeometry> {
-        use crate::shared::{draft::resource::{self, LayerHome}, experts::rtx::RtxExpertLayer};
-        let pricing = self.pricing.as_ref().context("Muse draft pricing absent")?;
-        let local = self.local.borrow();
-        resource::geometry_with_grouping(&pricing.homes, self.cfg.experts, self.cfg.topk, HEAD_ROWS, width, 0,
-            |layer, rows| match pricing.homes[layer] {
-                LayerHome::Local { .. } => {
-                    let group = local.first().context("Muse onboarded layer without executors")?.executor.group_rows(rows)?;
-                    ensure!(local.iter().all(|rank| rank.executor.group_rows(rows).ok() == Some(group)),
-                        "Muse onboarded ranks disagree on grouping");
-                    Ok(group)
-                }
-                _ => resource::worker_group_rows(&pricing.grouping, layer, rows),
-            })
     }
 
     fn logits(&self, buffer: cuteafd_ffi::CuteafdDeviceBuffer, rows: usize) -> DeviceLogits {
@@ -351,7 +300,6 @@ impl<'r, 'a> MuseBackend<'r, 'a> {
             let mut ends = self.peer.map(|peer| (0..2).map(|rank| peer.rank(rank)).collect::<Vec<_>>()).unwrap_or_default();
             let peers = ends.iter_mut().map(|end| end as &mut dyn super::device::PeerExchange).collect();
             let mut experts = self.experts.borrow_mut();
-            let mut probe = self.probe.borrow_mut();
             let cycle = if self.graph_warming.get() {
                 crate::shared::decode_graph::device::Cycle::Other
             } else if kind == cuteafd_transport::ExpertV2SourceKind::MtpVerify {
@@ -360,7 +308,7 @@ impl<'r, 'a> MuseBackend<'r, 'a> {
             for bank in &self.graphs { bank.cycle(cycle); }
             let logits = forward::step(self.cfg, self.ranks, &self.streams, self.table, &tokens, &media, &meta, false, wave,
                 &mut **experts, peers, &mut self.local.borrow_mut(), self.draft.as_ref(),
-                probe.as_mut().map(|owner| owner.get_mut()), 0..rows,
+                0..rows,
                 if self.graph_enabled.get() { &self.graphs } else { &[] })?;
             self.graph_completed()?;
             Ok(self.logits(logits, rows))
@@ -532,15 +480,6 @@ impl<'r, 'a> Backend<'a> for MuseBackend<'r, 'a> {
         let contexts = contexts.to_vec();
         crate::shared::speculation_trace::Deferred::new(move || serde_json::json!({"kind": "muse_gqa_swa2048_full", "rows": rows, "contexts": contexts}))
     }
-    fn draft_geometry(&self, _snapshot: &Path, width: usize) -> Result<cuteafd_core::PolicyGeometry> {
-        let draft = self.draft.as_ref().context("Muse drafter was not admitted")?;
-        ensure!(width > 0 && width < draft.block, "Muse draft width {width} beyond the drafter's block {}", draft.block);
-        self.policy_geometry(width)
-    }
-    fn arm_draft_probe(&self) -> Result<()> {
-        ensure!(self.probe.borrow().is_some(), "Muse draft policy probe was not admitted");
-        Ok(())
-    }
     /// The chunk's tail was tapped during its prefill call: commit it as context.
     fn prefill_draft(&self, placement: &Placement, start: usize, chunk: &[u32], next: Option<u32>,
         seq: &mut DraftState) -> Result<()> {
@@ -603,19 +542,6 @@ impl<'r, 'a> Backend<'a> for MuseBackend<'r, 'a> {
             }
             Ok(())
         })
-    }
-    fn probe_begin(&self, rows: usize) {
-        if let Some(probe) = self.probe.borrow_mut().as_mut() { probe.get_mut().begin(rows); }
-    }
-    fn probe_end(&self) {
-        if let Some(probe) = self.probe.borrow_mut().as_mut() { probe.get_mut().end(); }
-    }
-    fn probe_finish<T>(&self, observe: impl FnOnce(&RoundRoutes, &[Option<f64>]) -> T) -> Option<T> {
-        let mut probe = self.probe.borrow_mut();
-        let owner = probe.as_mut()?;
-        let _scope = owner.device.enter().ok()?;
-        let (routes, times) = owner.get_mut().finish()?;
-        Some(observe(routes, &times))
     }
 }
 

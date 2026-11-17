@@ -136,7 +136,7 @@ pub(crate) fn step<'a>(cfg: &MuseSparkConfig, ranks: &[RankResources<'a>], strea
     wave: super::experts::WaveStep,
     experts: &mut dyn SparkExperts, mut peers: Vec<&mut dyn PeerExchange>,
     local: &mut [super::onboard::OnboardedExperts<'_>], draft: Option<&super::draft::MuseDraft<'_>>,
-    mut probe: Option<&mut crate::shared::draft::probe::RoundProbe<'_>>, head_rows: std::ops::Range<usize>,
+    head_rows: std::ops::Range<usize>,
     graphs: &[super::graphs::Graphs<'a>])
     -> Result<Buffer> {
     ensure!(ranks.len() == streams.len() && (ranks.len() == 1 || peers.len() == 2) && tokens.len() == meta.positions.len()
@@ -209,16 +209,6 @@ pub(crate) fn step<'a>(cfg: &MuseSparkConfig, ranks: &[RankResources<'a>], strea
         let last = ranks.len() - 1;
         if let Some(draft) = draft {
             draft.tap(layer, ranks[last].lane.views.plane("hidden")?, 0, tokens.len(), 0)?;
-        }
-        // The draft policy's round: this layer's route ids and its end mark, on the head rank's stream.
-        if let Some(probe) = probe.as_deref_mut() {
-            let ids = ranks[last].lane.views.rows("route_ids", tokens.len())?;
-            ranks[last].device.run(|| {
-                // SAFETY: the router wrote these ids on this stream; the ring is read after the step's sync.
-                if probe.wants_ring(false) { unsafe { probe.ring(ranks[last].device.library, layer, ids, tokens.len(), streams[last])?; } }
-                // SAFETY: the probe's events belong to the head rank's device and stream.
-                unsafe { probe.mark(layer, streams[last]) }
-            })?;
         }
     }
     let last = ranks.len() - 1;

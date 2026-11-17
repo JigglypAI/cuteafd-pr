@@ -67,6 +67,23 @@ mod tests {
             "../../../families/inkling2/fixtures/config.json")).unwrap()).unwrap()
     }
     #[test]
+    fn recurrent_runtime_exact_owners_have_no_history_policy_probe_charge() -> Result<()> {
+        let config = release();
+        assert_eq!(config.predictions(), 7);
+        let runtime = RecurrentRuntimeLayout::new(&config, 16, 16, 2048, 32768, 32768,
+            188, Qwen4KvCache::Fp8, 0, 1, 0)?;
+        // Five K/V pairs + table + last features, seven context planes,
+        // twelve block planes, six projection/metadata owners and seventeen head planes.
+        assert_eq!(runtime.buffers.len(), 54);
+        let bytes = |name: &str| runtime.buffers.iter().find(|(id, _)| id == name).unwrap().1;
+        assert_eq!(bytes("step.ids"), 256);
+        assert_eq!(bytes("head.tokens"), 16 * 7 * 4);
+        assert_eq!(bytes("step.tables"), 256);
+        assert!(runtime.buffers.iter().all(|(id, _)| !id.contains("probe") && !id.contains("route")));
+        Ok(())
+    }
+
+    #[test]
     fn recurrent_cache_preserves_one_full_layer_and_four_bounded_rings() -> Result<()> {
         let c = release();
         for format in [Qwen4KvCache::Fp8, Qwen4KvCache::Bf16] {

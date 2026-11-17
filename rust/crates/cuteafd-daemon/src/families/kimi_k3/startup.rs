@@ -290,7 +290,6 @@ pub(crate) fn load<'a, const RANKS: usize>(library: &'a Arc<cuteafd_ffi::NativeL
     }
     if let Some(layout) = &draft_layout {
         fixed.extend(cuteafd_loader::families::kimi_k3::draft::bridge_demands(layout, rows, RANKS)?);
-        fixed.push(cuteafd_loader::families::kimi_k3::draft_probe_demand(cfg.layers, cfg.topk, rows.min(64))?);
         if core.projections.contains_key("language_model.lm_head") {
             if let Some(mut demand) = cuteafd_loader::families::kimi_k3::core::draft_head_demand(&core,
                 layout.capacity().block_rows, programs.family_metadata("dense_trellis_k6")?)? {

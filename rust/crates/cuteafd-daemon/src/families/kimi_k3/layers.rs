@@ -24,12 +24,6 @@ struct LaneJoins<'a> {
 #[derive(Clone, Copy)]
 pub(crate) enum Output { Normalized, Residual }
 
-/// Own these bindings for the engine lifetime, not in a temporary submission:
-/// recorded event nodes, streams and all exchanged operands must survive replay.
-/// The enclosing submission owner aborts all links before draining these streams.
-type DraftProbe<'a> = RefCell<Option<crate::shared::memory::device::DeviceOwner<'a,
-    crate::shared::draft::probe::RoundProbe<'a>>>>;
-
 pub(crate) struct Execution<'a> {
     pub skip_routed_experts: bool,
     pub expert_usage: Option<Rc<cuteafd_ffi::expert_usage::ExpertUsage<'a>>>,
@@ -105,14 +99,14 @@ impl<'a> Execution<'a> {
     pub(crate) fn run<'e>(&'e self, scope: &'e SubmissionScope<'_>,
         peer: Option<&'e PeerExchange<'a>>, hops: Option<&'e HopLink<'a>>,
         locals: &'e mut [Vec<LocalLane<'a>>], routed: &'e mut [RoutedLane<'a>],
-        experts: &'e mut [Vec<Option<Exl3Tp2<'a>>>], rows: &[usize], speculative: bool, output: Output, draft: Option<&'e super::draft::NativeDraft<'a>>, probe: Option<&'e DraftProbe<'a>>) -> Result<Vec<CuteafdDeviceBuffer>> {
+        experts: &'e mut [Vec<Option<Exl3Tp2<'a>>>], rows: &[usize], speculative: bool, output: Output, draft: Option<&'e super::draft::NativeDraft<'a>>) -> Result<Vec<CuteafdDeviceBuffer>> {
         ensure!(!rows.is_empty() && rows.len() == locals.len() && rows.len() == routed.len() && rows.len() == experts.len(),
             "Kimi shared pipeline needs matching local, Spark and row lanes");
         let protocol = self.protocol(peer, hops)?;
         let mut bindings = locals.iter_mut().zip(routed).zip(experts).zip(rows).enumerate().map(
             |(lane, (((local, routed), experts), &rows))| Bindings::new(local, routed, experts, self, peer, hops, scope, lane, rows, speculative)
         ).collect::<Result<Vec<_>>>()?;
-        for binding in &mut bindings { binding.draft = draft; binding.probe = probe; }
+        for binding in &mut bindings { binding.draft = draft; }
         crate::shared::peer_split::attention::layer_pipeline_with(scope, &self.plan, &protocol,
             crate::shared::peer_split::attention::LaneOrder::OrderedChunks, rows, &mut bindings)?;
         bindings.iter_mut().map(|binding| binding.output(output)).collect()
@@ -623,7 +617,6 @@ pub(crate) struct Bindings<'e, 'a, 's> {
     completed: usize,
     pending: Option<FfnTicket>,
     draft: Option<&'e super::draft::NativeDraft<'a>>,
-    probe: Option<&'e DraftProbe<'a>>,
     tap_first: usize,
     defer_publication: bool,
     packed: Option<Vec<super::device::AttentionRows>>,
@@ -684,7 +677,7 @@ impl<'e, 'a, 's> Bindings<'e, 'a, 's> {
             for rank in 0..local.len() { peer.recv(rank, lane)?; }
             ensure!(peer.slot_bytes() >= rows * 7168 * 2, "Kimi peer slot shorter than hidden rows");
         }
-        Ok(Self { execution, scope, local, routed, experts, protocol, lane, rows, speculative, owners, completed: 0, pending: None, draft: None, probe: None, tap_first: 0, defer_publication: false, packed: None })
+        Ok(Self { execution, scope, local, routed, experts, protocol, lane, rows, speculative, owners, completed: 0, pending: None, draft: None, tap_first: 0, defer_publication: false, packed: None })
     }
 
     fn begin_local_ffn(&mut self, layer: usize, owner: Option<usize>) -> Result<FfnTicket> {
@@ -696,14 +689,6 @@ impl<'e, 'a, 's> Bindings<'e, 'a, 's> {
             let tally = self.execution.expert_usage.as_ref().map(|usage|
                 usage.routes(self.local[0].stream().device.id, layer, self.execution.usage_phase.get())).transpose()?;
             let (routes, wire) = self.local[0].route(layer, self.rows, tally)?;
-            self.with_probe(|probe| {
-                if probe.wants_ring(false) {
-                    let stream = self.local[0].stream();
-                    // SAFETY: this lane owns the route plane until its ordered readers finish.
-                    unsafe { probe.ring(stream.device.library, layer, routes.ids, self.rows, stream.raw)?; }
-                }
-                Ok(())
-            })?;
             if self.execution.skip_routed_experts { None } else if rtx {
                 let stream = self.local[0].stream();
                 let expert = self.experts[0].as_mut().context("Kimi whole expert absent")?;
@@ -747,22 +732,8 @@ impl<'e, 'a, 's> Bindings<'e, 'a, 's> {
         }
         self.local[0].capture_post_ffn(layer, self.rows)?;
         if let Some(draft) = self.draft { draft.tap_at(layer, &mut self.local[0], self.rows, self.tap_first)?; }
-        self.with_probe(|probe| {
-            // SAFETY: this mark follows all FFN consumers on the only physical lane stream.
-            unsafe { probe.mark(layer, self.local[0].stream().raw) }
-        })?;
         self.pending = None;
         self.completed += 1;
-        Ok(())
-    }
-
-    fn with_probe(&self, work: impl FnOnce(&mut crate::shared::draft::probe::RoundProbe<'a>) -> Result<()>) -> Result<()> {
-        if let Some(owner) = self.probe {
-            if let Some(probe) = owner.borrow_mut().as_mut() {
-                let device = probe.device;
-                device.run(|| work(probe))?;
-            }
-        }
         Ok(())
     }
 
@@ -890,14 +861,6 @@ impl<'e, 'a, 's> Bindings<'e, 'a, 's> {
         ensure!(self.pending.is_none() && self.completed == self.protocol.execution.plan.modes().len(),
             "Kimi output requested before admitted layer completion");
         let head = self.protocol.execution.plan.spec().head_gpu as usize;
-        let mut probed = false;
-        self.with_probe(|probe| { probed = probe.active(); Ok(()) })?;
-        if probed && self.local.len() == 2 {
-            // The final GPU0 ring download must precede GPU1's existing selector sync.
-            // Join the exact lane producers into the retained head exchange/consumer.
-            self.protocol.producers(self.lane, 1)?;
-            self.protocol.consumer(self.lane, 1)?;
-        }
         match output {
             Output::Normalized => self.local[head].residual(MixSite::Output, self.rows),
             Output::Residual => self.local[head].terminal_residual(self.rows),
@@ -1056,22 +1019,6 @@ impl PipelineKernels for Bindings<'_, '_, '_> {
                 self.transfer_planes(owner, &[("route ids", canonical.ids.bytes),
                     ("route weights", canonical.weights.bytes), ("expert wire", wire.bytes)])?;
             }
-            // The optional shared ring check also preserves remote rank1 routes on GPU0.
-            let mut check_remote = false;
-            // Every routed layer rings its ids on rank 0 (Spark layers included:
-            // their staged ids are read by the exchange worker, not the host).
-            self.with_probe(|probe| { check_remote = probe.wants_ring(false); Ok(()) })?;
-            if check_remote && !rtx && owner == 1 { self.transfer(1, "route ids", canonical.ids.bytes)?; }
-            // Local IDs have joined rank0 before the reusable router outputs change.
-            self.with_probe(|probe| {
-                if probe.wants_ring(false) {
-                    let stream = self.local[0].stream();
-                    // SAFETY: transfer joined these exact rank0 operands and stream.
-                    unsafe { probe.ring(stream.device.library, layer,
-                        self.local[0].buffer("route ids")?, self.rows, stream.raw)?; }
-                }
-                Ok(())
-            })?;
             if rtx {
                 for rank in 0..2 {
                     let stream = self.local[rank].stream();
@@ -1153,10 +1100,6 @@ impl PipelineKernels for Bindings<'_, '_, '_> {
         // Checkpoint taps are the completed decoder prefix plus final FFN
         // delta, before the following residual mixer or final output norm.
         if let Some(draft) = self.draft { draft.tap_at(layer, &mut self.local[0], self.rows, self.tap_first)?; }
-        self.with_probe(|probe| {
-            // SAFETY: the FFN join above orders both ranks before this rank0 mark.
-            unsafe { probe.mark(layer, self.local[0].stream().raw) }
-        })?;
         self.pending = None;
         self.completed += 1;
         Ok(())

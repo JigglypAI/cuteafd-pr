@@ -340,6 +340,10 @@ impl Ticket {
     /// A ticket for request `id` on `lane` whose family owns the id. Nothing is
     /// counted or shown until [`Self::announce`]; dropped before that, it is silent.
     pub fn new(id: u64, lane: u8, usage: Option<cuteafd_api::usage::UsageHandle>) -> Self {
+        if let Some(usage) = &usage {
+            if crate::shared::draft::history::speculation_enabled() { usage.enable_speculation(); }
+            crate::shared::draft::history::register_request(id, usage.rid());
+        }
         Self { id, lane, done: true, finished: false, usage }
     }
 
@@ -413,7 +417,10 @@ impl Ticket {
 }
 
 impl Drop for Ticket {
-    fn drop(&mut self) { self.retire("failed", 0); }
+    fn drop(&mut self) {
+        self.retire("failed", 0);
+        crate::shared::draft::history::unregister_request(self.id);
+    }
 }
 
 thread_local! {

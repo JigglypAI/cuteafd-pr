@@ -1586,22 +1586,13 @@ mod tests {
 
     #[test]
     fn replay_capture_never_drains_layer_events_without_profiling() -> Result<()> {
-        use crate::families::deepseek_v41::v41_native_serve::speculative::round_capture;
-        use cuteafd_core::{DraftMode, DraftPolicy, PolicySeed};
         let (_directory, fixture) = crate::shared::memory::cpu_stream_fixture()?;
         let library = fixture.load()?;
         let mut clock = LayerClock::new(&library, 2)?;
-        let mut policy = DraftPolicy::new(cuteafd_core::PolicyGeometry {
-            layers: vec![cuteafd_core::LayerResource { class: Some(0), slice_bytes: 1024., group_rows: 16, timed: true }; 2],
-            experts: 384, topk: 6, max_requests: 16, max_positions: 7, widths: vec![7],
-            classes: vec![cuteafd_core::ResourceClass::rtx()], group_rows_by_rows: Vec::new(), regimes: 2,
-        }, PolicySeed::weak(7), false)?;
-        policy.set_draft_mode(DraftMode::Simple);
         for profiling in [false, true] {
             clock.reset();
             let before = fixture.events()?;
-            let capture = round_capture(Some(&policy), true, true, profiling);
-            assert!(capture.routes);
+            let capture = Capture { routes: true, timing: profiling };
             // SAFETY: the CPU fixture accepts a synthetic stream and owns all events.
             unsafe {
                 capture.record(&mut clock, 0, std::ptr::null_mut(), true);

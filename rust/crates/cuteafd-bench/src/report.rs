@@ -1122,6 +1122,26 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn reports_roundtrip_request_speculation_for_content_and_concurrency_and_old_reports() {
+        for speculation in [None, Some(json!({"request_id":"history-http-id", "proposed":7,
+            "accepted":5, "cycles":2}))] {
+            let mut report = crate::sample::report(false);
+            let baseline = report.baseline.as_mut().unwrap();
+            baseline.card.decode[0].runs[0].speculation = speculation.clone();
+            baseline.card.concurrency[0].runs[0].timing.speculation = speculation.clone();
+            let encoded = serde_json::to_value(&report).unwrap();
+            let decoded: Report = serde_json::from_value(encoded).unwrap();
+            let card = decoded.baseline.unwrap().card;
+            assert_eq!(card.decode[0].runs[0].speculation, speculation);
+            assert_eq!(card.concurrency[0].runs[0].timing.speculation, speculation);
+        }
+        let old = json!({"content":"prose", "tok_s":10., "runs":[{"prompt_tokens":10,
+            "completion_tokens":20,"ttft_s":0.1,"total_s":2.,"decode_s":1.9}]});
+        let rate: ContentRate = serde_json::from_value(old).unwrap();
+        assert!(rate.runs[0].speculation.is_none());
+    }
+
+    #[test]
     fn configuration_preserves_resolved_mapped_placement() {
         use cuteafd_loader::formats::mapped_preload::MappedPlacement;
         let mut configuration = Configuration::default();

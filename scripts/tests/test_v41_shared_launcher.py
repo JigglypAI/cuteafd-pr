@@ -34,8 +34,6 @@ INTENDED = {
         "CUTEAFD_FP8_PREFILL": "auto",
         # Admission follows the launcher's bounded readiness deadline.
         "CUTEAFD_SPARK_ADMISSION_TIMEOUT_SECONDS": "30",
-        # shared_trace_args: the shared draft policy switches, default off.
-        "CUTEAFD_DRAFT_SURVIVAL_LENGTHS": "0",
         # shared_thermal_args: the GPU throttle sampler (#114), default on.
         "CUTEAFD_THERMAL": "on",
         # Dashboard fidelity reads the host's shared reference cache.
@@ -191,9 +189,8 @@ def test_shared_launcher_matches_the_private_v41_path(case: str, tmp_root) -> No
         else:
             config = ROOT / "examples/configs" / f"{case}.config"
             overrides = {}
-        for flag in ("--kv-pool-size", "--draft-length"):
-            if flag in command:
-                additions += [flag, command[command.index(flag) + 1]]
+        if "--kv-pool-size" in command:
+            additions += ["--kv-pool-size", command[command.index("--kv-pool-size") + 1]]
         cache = command[command.index("--host-cache-bytes") + 1] if "--host-cache-bytes" in command else "0"
         expected[expected.index("--prefix-cache-entries") + 2:expected.index("--prefix-cache-entries") + 2] = ["--host-cache-bytes", cache]
         additions += ["--speculator", "dspark" if "--dspark" in command else "off",
@@ -202,10 +199,9 @@ def test_shared_launcher_matches_the_private_v41_path(case: str, tmp_root) -> No
         index = expected.index("--available-sparks") + 2
         expected[index:index] = ["--mapped-scale-preload-gib", "0", "--config", "/run/cuteafd-plan.config"]
         enabled = command[command.index("--rtx-gpus") + 1] == "2" and "--dspark" in command
-        draft_limit = command[command.index("--draft-length") + 1] if "--draft-length" in command else ""
         available = int(expected[expected.index("--available-sparks") + 1])
         normalized = (f"TP2_DSPARK_EXPERTS={'on' if enabled else 'off'}\nSPECULATOR=dspark\n"
-                      f"DRAFT_LENGTH={draft_limit}\nEXPERT_USAGE=on\n"
+                      "EXPERT_USAGE=on\n"
                       + ''.join(f"SPARK_{rank}_HOST={host}\n" for rank, host in enumerate(HOSTS[:available])))
         digest = hashlib.sha256(normalized.encode()).hexdigest()[:16]
         mount_index = expected.index("-v") + 2
@@ -244,7 +240,7 @@ def test_scale_preload_cap_reaches_plan_and_native_serve(tmp_root, monkeypatch, 
 
 
 @pytest.mark.parametrize("limit", [None, "7", "99"])
-def test_draft_length_reaches_plan_and_serve(tmp_root, monkeypatch, limit) -> None:
+def test_draft_length_reaches_serve_and_never_the_plan(tmp_root, monkeypatch, limit) -> None:
     import v41_launch_capture as capture_module
     original = capture_module.example_config
 
@@ -260,10 +256,11 @@ def test_draft_length_reaches_plan_and_serve(tmp_root, monkeypatch, limit) -> No
     monkeypatch.setattr(capture_module, "example_config", with_limit)
     result = capture_module.capture(ROOT, "deepseek-v41-mxfp4-max")
     command = parse_run(result["containers"][0]["argv"])["command"]
-    for args in [command, *result["plans"]]:
-        assert args.count("--draft-length") == (limit is not None)
-        resolved = args[args.index("--draft-length") + 1] if limit is not None else "5"
-        assert resolved == (limit or "5")
+    # The drafter always loads its native block, so the plan does not depend on the fixed width.
+    assert command.count("--draft-length") == (limit is not None)
+    if limit is not None:
+        assert command[command.index("--draft-length") + 1] == limit
+    assert all("--draft-length" not in plan for plan in result["plans"])
 
 
 def test_goldens_cover_every_v41_example_and_gate_card() -> None:
@@ -303,7 +300,7 @@ def test_shared_features_reach_v41_with_no_v41_code(tmp_root, monkeypatch) -> No
     probe = tmp_root / "probe"
     probe.mkdir()
     extra = (f"SPECULATION_TRACE={trace}\nTHERMAL=off\nPROFILE=transport-timing,expert-timing\n"
-             f"DRAFT_SURVIVAL_LENGTHS=on\nPROBE_DUMP_ROOT={probe}\nSPARK_INTAKE=pinned\nCONSOLE_TEXT=off\n")
+             f"DRAFT_POLICY=off\nPROBE_DUMP_ROOT={probe}\nSPARK_INTAKE=pinned\nCONSOLE_TEXT=off\n")
     original = capture_module.example_config
 
     def with_keys(name, directory):
@@ -319,7 +316,8 @@ def test_shared_features_reach_v41_with_no_v41_code(tmp_root, monkeypatch) -> No
     assert f"{trace.parent}:{trace.parent}" in coordinator["mounts"]
     assert env["CUTEAFD_THERMAL"] == "off"
     assert env["CUTEAFD_PROTOCOL_V2_TCP_TIMING"] == "1" and env["CUTEAFD_PROFILE_HOST"]
-    assert env["CUTEAFD_DRAFT_SURVIVAL_LENGTHS"] == "1"
+    command = coordinator["command"]
+    assert command[command.index("--draft-policy") + 1] == "off"
     assert env["CUTEAFD_PROBE_DUMP_ROOT"] == str(probe)
     assert env["CUTEAFD_SPARK_INTAKE"] == "pinned" and env["CUTEAFD_CONSOLE_TEXT"] == "false"
     for container in result["containers"][1:]:

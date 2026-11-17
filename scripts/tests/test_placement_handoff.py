@@ -73,9 +73,11 @@ RELEASE_MODEL_REVISION=0123456789012345678901234567890123456789
 lanes=(10.55.0.1 10.55.0.2 10.55.0.3 10.55.0.4)
 # Mirror the run.sh scope the extracted block relies on: release_load_config
 # defaults DRAFT_LENGTH, and run.sh's argument parsing always defines
-# draft_length (empty unless --draft-length was passed). Omitting
-# either makes the block die on `set -u` before any stub is invoked.
+# draft_length (empty unless --draft-length was passed) and the draft policy
+# arguments (empty for the default history policy). Omitting any of them makes
+# the block die on `set -u` before any stub is invoked.
 draft_length=
+draft_policy_args=()
 TP2_ATTENTION=off
 TP2_QUERY_PROJECTION=off
 TP2_OUTPUT_PROJECTION=off

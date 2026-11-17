@@ -420,16 +420,19 @@ mod tests {
     #[test]
     fn mtp_source_charge_uses_scheduler_verify_budget() -> anyhow::Result<()> {
         use super::{DECODE_ROWS, MTP_DEFERRED_STEPS};
-        use crate::shared::draft::resource::trim_budget;
+        use cuteafd_core::{DraftControl, DraftHistory, DrafterSpec, HeadScore};
         assert_eq!(DECODE_ROWS, cuteafd_loader::families::qwen4::VERIFY_ROWS);
-        for requests in 1..=DECODE_ROWS {
-            let mut depths = vec![MTP_DEFERRED_STEPS; requests];
-            trim_budget(&mut depths, DECODE_ROWS);
-            assert!(depths.iter().map(|depth| depth + 1).sum::<usize>() <= DECODE_ROWS);
+        let spec = DrafterSpec { block: MTP_DEFERRED_STEPS, head: HeadScore::None, copy: 0 };
+        for control in [DraftControl::History, DraftControl::Fixed(MTP_DEFERRED_STEPS)] {
+            for requests in 1..=DECODE_ROWS {
+                let plan: Vec<_> = (0..requests as u64).map(|id| (id, MTP_DEFERRED_STEPS)).collect();
+                let depths = DraftHistory::new(spec, control).plan(&plan, DECODE_ROWS);
+                assert!(depths.iter().map(|depth| depth + 1).sum::<usize>() <= DECODE_ROWS);
+                assert!(depths.iter().all(|&depth| depth <= MTP_DEFERRED_STEPS));
+            }
         }
-        let mut negative = vec![MTP_DEFERRED_STEPS; DECODE_ROWS];
-        assert!(negative.iter().map(|depth| depth + 1).sum::<usize>() > DECODE_ROWS);
-        assert!(trim_budget(&mut negative, DECODE_ROWS));
+        // Unbudgeted, a full lane of full chains would not fit.
+        assert!(DECODE_ROWS * (MTP_DEFERRED_STEPS + 1) > DECODE_ROWS);
         Ok(())
     }
 
@@ -967,7 +970,6 @@ pub(crate) struct Qwen4Engine<'a> {
     hops: Option<crate::shared::peer_split::hop::HopLink<'a>>,
     /// Host seconds: GPU wait before expert exchanges, the exchanges.
     pub profile: RefCell<[f64; 2]>,
-    draft_probes: RefCell<Vec<DeviceOwner<'a, crate::shared::draft::probe::RoundProbe<'a>>>>,
     graphs: RefCell<Vec<GraphBank<GraphKey, GraphExec<'a>>>>,
     use_graphs: bool,
     /// The bounded graph cache is configured for this launch: bucketing, lazy
@@ -1180,7 +1182,7 @@ impl<'a> Qwen4Engine<'a> {
             last_streams: std::cell::Cell::new((false, 0)), last_stream_offset: Cell::new(0), mtp_streams: std::cell::Cell::new((false, 0)),
             pool_pages, workspace: RefCell::new(None), mtp_prefill_workspace: RefCell::new(None),
             decode_workspace: RefCell::new(None), peer_workspace: RefCell::new(None),
-            peer_decode_workspace: RefCell::new(None), workspaces_prepared: Cell::new(false), experts: None, hops: None, profile: RefCell::new([0.0; 2]), draft_probes: RefCell::new(Vec::new()),
+            peer_decode_workspace: RefCell::new(None), workspaces_prepared: Cell::new(false), experts: None, hops: None, profile: RefCell::new([0.0; 2]),
             graphs: RefCell::new(graphs),
             use_graphs: graphs_enabled(std::env::var("CUTEAFD_QWEN4_GRAPHS").ok().as_deref()),
             graph_capture: Cell::new(false),
@@ -1702,116 +1704,6 @@ impl<'a> Qwen4Engine<'a> {
             out.push([kv.buffer, keys.buffer, pools.buffer]);
         }
         out
-    }
-
-    /// Retain every backing allocation the host tier can read or restore.
-    pub(crate) fn arm_draft_probe(&self) -> Result<()> {
-        let probes = self.gdn_banks.iter().enumerate().map(|(owner, bank)| bank.device.own(|| {
-            let dense = self.state_map.layers.iter().map(|layer| layer.owner != owner).collect();
-            crate::shared::draft::probe::RoundProbe::new(self.library, dense, self.cfg.topk, DECODE_ROWS)
-        })).collect::<Result<Vec<_>>>()?;
-        *self.draft_probes.borrow_mut() = probes;
-        Ok(())
-    }
-
-    pub(crate) fn draft_homes(&self, snapshot: &std::path::Path) -> Result<Vec<crate::shared::draft::resource::LayerHome>> {
-        use crate::shared::draft::resource;
-        let catalog = cuteafd_loader::read_expert_catalog(snapshot)?;
-        let Some(Experts::Hybrid(experts)) = &self.experts else { anyhow::bail!("Qwen expert homes missing") };
-        let remote = self.spark_link(0).map(|link| link.borrow().installed_grouping()).transpose()?.unwrap_or_default();
-        let world = self.spark_link(0).map_or(0, |link| link.borrow().world_size());
-        let local_tp = if matches!(experts.local, Some(LocalRouted::Tp2(_))) { 2 } else { 1 };
-        resource::layer_homes((0..self.cfg.layers).map(|layer| {
-            let local = experts.local_layer(layer);
-            (false, local, if local { local_tp } else { world })
-        }), catalog.exl3(), |layer| {
-            if experts.local_layer(layer) { experts.local.as_ref().context("Qwen local owner")?.weight_read_bytes() }
-            else { resource::worker_weight_read_bytes(&remote, layer) }
-        })
-    }
-
-    pub(crate) fn draft_geometry(&self, snapshot: &std::path::Path, width: usize)
-        -> Result<cuteafd_core::PolicyGeometry> {
-        use crate::shared::draft::resource;
-        let remote = self.spark_link(0).map(|link| link.borrow().installed_grouping()).transpose()?.unwrap_or_default();
-        resource::geometry_with_grouping(&self.draft_homes(snapshot)?, self.cfg.experts, self.cfg.topk,
-            DECODE_ROWS, width, resource::COPY_EXTENSION, |layer, rows| {
-                match &self.experts {
-                    Some(Experts::Hybrid(experts)) if experts.local_layer(layer) =>
-                        experts.local.as_ref().context("Qwen local owner")?.group_rows(rows),
-                    _ => resource::worker_group_rows_for_input(&remote, layer, rows, self.spark_bf16),
-                }
-            })
-    }
-
-    pub(crate) fn probe_begin(&self, rows: usize) {
-        for probe in self.draft_probes.borrow_mut().iter_mut() { probe.begin(rows); }
-    }
-
-    pub(crate) fn probe_end(&self) {
-        for probe in self.draft_probes.borrow_mut().iter_mut() { probe.end(); }
-    }
-
-    pub(crate) fn probe_finish<T>(&self, observe: impl FnOnce(&crate::shared::draft::routes::RoundRoutes,
-        &[Option<f64>]) -> T) -> Option<T> {
-        let mut probes = self.draft_probes.borrow_mut();
-        if probes.is_empty() { return None; }
-        if !probes[0].collects_routes() {
-            let mut times = Vec::new();
-            for (owner, probe) in probes.iter_mut().enumerate() {
-                let _scope = probe.device.enter().ok()?;
-                let (_, elapsed) = probe.finish()?;
-                if elapsed.is_empty() { continue; }
-                times.resize(self.cfg.layers, None);
-                for (index, _) in self.state_map.layers.iter().enumerate().filter(|(_, layer)| layer.owner == owner) {
-                    times[index] = elapsed[index];
-                }
-            }
-            return Some(observe(&crate::shared::draft::routes::RoundRoutes::new(0, 0), &times));
-        }
-        if probes.len() == 1 {
-            let probe = &mut probes[0];
-            let _scope = probe.device.enter().ok()?;
-            let (routes, times) = probe.finish()?;
-            return Some(observe(routes, &times));
-        }
-        let mut routes = crate::shared::draft::routes::RoundRoutes::new(self.cfg.layers, self.cfg.topk);
-        let mut times = vec![None; self.cfg.layers];
-        for (owner, probe) in probes.iter_mut().enumerate() {
-            let device = probe.device;
-            let _scope = device.enter().ok()?;
-            let (part, elapsed) = probe.finish()?;
-            if owner == 0 { routes.begin(part.rows()); }
-            for (index, _) in self.state_map.layers.iter().enumerate().filter(|(_, layer)| layer.owner == owner) {
-                let words = part.rows() * self.cfg.topk;
-                routes.push_narrow(index, &part.flat()[index * words..][..words]).ok()?;
-                times[index] = elapsed[index];
-            }
-        }
-        Some(observe(&routes, &times))
-    }
-
-    fn probe_entry(&self, index: usize) {
-        if index == 0 || self.state_map.layers[index - 1].owner == self.state_map.layers[index].owner { return; }
-        if let Some(probe) = self.draft_probes.borrow_mut().get_mut(self.active_owner.get()) {
-            // SAFETY: called after the cut transfer on this owner's live stream.
-            unsafe { probe.mark_entry(index, self.execution_stream()); }
-        }
-    }
-
-    fn probe_layer(&self, w: &Workspace<'_>, index: usize, rows: usize) -> Result<()> {
-        if index >= self.cfg.layers { return Ok(()); }
-        if let Some(probe) = self.draft_probes.borrow_mut().get_mut(self.active_owner.get()) {
-            // Spark layers ring too: their routes reach the host only on the
-            // exchange worker, after the post.
-            if probe.wants_ring(false) {
-                // SAFETY: replay/router precedes this async copy on the owning device stream.
-                unsafe { probe.ring(self.library, index, w.route_ids.buffer, rows, self.execution_stream())?; }
-            }
-            // SAFETY: this probe's CUDA events belong to the current layer's owner.
-            unsafe { probe.mark(index, self.execution_stream())?; }
-        }
-        Ok(())
     }
 
     pub(crate) fn snapshot_owners(&self) -> Vec<Rc<Allocation<'a>>> {
@@ -3084,7 +2976,6 @@ impl<'a> Qwen4Engine<'a> {
                 }
             }
             crate::shared::console::layer_mark(index);
-            self.on_owner(self.state_map.layers[index].owner, || self.probe_layer(w, index, t))?;
         }
         self.last_streams.set((tables.decode, cur));
         if layers.len() < self.cfg.layers {
@@ -3191,7 +3082,6 @@ impl<'a> Qwen4Engine<'a> {
                 Ok(())
             })?;
             crate::shared::console::layer_mark(index);
-            self.on_owner(owner, || self.probe_layer(w, index, t))?;
             if let Some(next) = next {
                 let next_owner = next_owner.context("Qwen next attention owner")?;
                 if next_owner != owner {
@@ -3205,7 +3095,6 @@ impl<'a> Qwen4Engine<'a> {
                     })?;
                 }
                 self.on_owner(next_owner, || {
-                    self.probe_entry(index + 1);
                     if self.cfg.ple_layers.contains(&(index + 1)) { self.finish_ple(work[next_owner])?; }
                     self.enter(work[next_owner], &mut cur[next_owner], (!materialize).then_some(()), next,
                         index + 1, rows, tables.spec)
@@ -3258,7 +3147,6 @@ impl<'a> Qwen4Engine<'a> {
                 })?;
             }
             self.on_owner(owner, || {
-                self.probe_entry(index);
                 if self.cfg.ple_layers.contains(&index) { self.finish_ple(w)?; }
                 let start = cur[owner];
                 self.replay(key(index), || {
@@ -3304,7 +3192,6 @@ impl<'a> Qwen4Engine<'a> {
             })?;
             if !self.warming_graphs.get() {
                 crate::shared::console::layer_mark(index);
-                self.on_owner(self.state_map.layers[index].owner, || self.probe_layer(w, index, real_rows))?;
             }
         }
         self.on_owner(1, || {
@@ -3503,7 +3390,6 @@ impl<'a> Qwen4Engine<'a> {
                 }
                 if !self.warming_graphs.get() {
                     crate::shared::console::layer_mark(index);
-                    self.on_owner(self.state_map.layers[index].owner, || self.probe_layer(w, index, real_rows))?;
                 }
             }
         }
