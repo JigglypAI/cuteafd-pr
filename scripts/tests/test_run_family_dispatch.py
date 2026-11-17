@@ -977,7 +977,8 @@ def _family_launch_result(tmp_path: Path, family_config: dict, model: str, keys:
         (selected / "config.k6.json").write_text(json.dumps(family_config))
     if "SPECULATOR_MODEL_ID=test/draft" in keys:
         _snapshot(hf, "test/draft", {"speculators_model_type":"dspark"})
-    if model == "wrldsuksgo2mars/Kimi-K3.1-Pro-EXL3-K2-MC":
+    if model == "wrldsuksgo2mars/Kimi-K3.1-Pro-EXL3-K2-MC" and not (
+            hf / "hub/models--Inferact--Kimi-K3.1-Pro-DSpark").exists():
         _snapshot(hf, "Inferact/Kimi-K3.1-Pro-DSpark", {"speculators_model_type": "dspark"},
                   "e4e6e6261e9f8b6d5f249f9627eb6b109d762d5f")
     if checkpoint_source is not None:
@@ -1413,7 +1414,8 @@ def capture_resolver_config_parity(snapshot: Path, example: Path, binary: Path,
     hub = temporary / "hf/hub"
     hub.mkdir(parents=True)
     for model in (config.get("SPECULATOR_MODEL_ID"), "incoai/GLM-5.3-Flash-DFlash2",
-                  "incoai/GLM-5.3-DFlash2", "nvidia/Muse-Spark-Open-816B-A42B-DFlash2"):
+                  "incoai/GLM-5.3-DFlash2", "nvidia/Muse-Spark-Open-816B-A42B-DFlash2",
+                  "Inferact/Kimi-K3.1-Pro-DSpark"):
         if model:
             cache = "models--" + model.replace("/", "--")
             source = hf_home / "hub" / cache
@@ -1422,15 +1424,16 @@ def capture_resolver_config_parity(snapshot: Path, example: Path, binary: Path,
     keys = "\n".join(line for line in raw.splitlines()
                      if not line.startswith(("MODEL_ID=", "MODEL_REVISION="))) + "\nMODEL_REVISION=\n"
     output = temporary / "resolver-deployment.json"
+    identity = config.get("MODEL_ID", "test/resolver-parity")
     result = _family_launch_result(temporary, json.loads((snapshot / "config.json").read_text()),
-        "test/resolver-parity", keys, physical_gpus=tuple(range(gpus)), root_launcher=True,
+        identity, keys, physical_gpus=tuple(range(gpus)), root_launcher=True,
         cuda_total_bytes=101_973_491_712, gpu_free_mib=98304,
         extra_args=("--wip", "real-planner-test"), extra_env={
             "STUB_REAL_PLANNER": str(binary), "STUB_REAL_SNAPSHOT": str(snapshot),
             "STUB_REAL_PROGRAMS": str(programs), "STUB_REAL_HF_HOME": str(hf_home),
             "STUB_REAL_PLAN_OUTPUT": str(output), "CUTEAFD_CDI_CHECK": "off",
             "STUB_SPARK_ROLES": f"tp{config['SPARK_COUNT']}",
-            "STUB_SERVED_MODEL_ID": "test/resolver-parity"})
+            "STUB_SERVED_MODEL_ID": identity})
     assert result.returncode == 0, result.stderr
     launched = _read_real_deployment(output)
     plans = [shlex.split(line) for line in result.stderr.splitlines()
