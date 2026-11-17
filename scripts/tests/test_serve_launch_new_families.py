@@ -30,7 +30,7 @@ KIMI = {"model_type": "kimi_k3", "text_config": {"model_type": "kimi_linear", "n
 KIMI_ID = "wrldsuksgo2mars/Kimi-K3-EXL3-K2"
 SIX = "".join(f"SPARK_{i}_HOST=h{i}\nSPARK_{i}_LANE_A=10.0.0.{i + 1}\n" for i in range(6))
 KIMI_KEYS = "SPARK_COUNT=6\nRTX_GPUS=2\nSPECULATOR=off\n" + SIX
-PLANNED = {"placement_supported": True, "fits": True, "spark_budget_bytes": 108 << 30}
+PLANNED = {"placement_supported": True, "fits": True, "spark_budget_bytes": 108 << 30, "encoder": None, "encoder_plan_hash": "ab" * 32}
 
 
 def _kimi(tmp_path: Path, keys: str = "", *, wip: bool = True, **kwargs):
@@ -64,7 +64,7 @@ def test_inkling_native_launcher_composes_shared_argv_and_rejects_pair(tmp_path:
     assert _flag(serve, "--core-view") == "original"
     assert (_flag(serve, "--prefill-rows"), _flag(serve, "--prefill-waves")) == ("2752", "3")
     assert _flag(serve, "--rtx-expert-layers") == "auto"
-    for flag in ("--split-device", "--attention-placement", "--vision", "--audio", "--dspark", "--prefill-packing"):
+    for flag in ("--split-device", "--attention-placement", "--dspark", "--prefill-packing"):
         assert flag not in shlex.split(serve)
     pair = _family_launch_result(tmp_path / "pair", config, "thinkingmachines/Inkling-2-Small-MXFP8",
         keys.replace("RTX_GPUS=1", "RTX_GPUS=2"), extra_args=("--wip", "inkling"), encoder_plan=PLANNED)
@@ -157,7 +157,8 @@ def test_kimi_dispatches_to_serve_kimi_with_its_own_defaults(tmp_path: Path) -> 
     # The planner picks onboarded layers; no speculator or media options are passed.
     assert _flag(serve, "--rtx-expert-layers") == "auto"
     assert _flag(serve, "--max-context-tokens") == "auto"
-    for absent in ("--pool-tokens", "--vision", "--audio",
+    assert _flag(serve,"--vision")=="off"  # Fixture admits no tower; Auto falls back explicitly.
+    for absent in ("--pool-tokens",
                    "--draft", "--draft-fp8", "--mtp", "--dspark", "--local-experts"):
         assert absent not in serve.split(), absent
     workers = [line for line in result.stderr.splitlines() if "cuteafd expertd-native" in line]
@@ -166,7 +167,7 @@ def test_kimi_dispatches_to_serve_kimi_with_its_own_defaults(tmp_path: Path) -> 
     plan = _line(result, "cuteafd plan")
     assert "--spark-memory-cap" not in plan.split()
     assert all(f"--device-budget-bytes {108 << 30} " in worker for worker in workers)
-    assert "--world 6" in workers[0] and "--vision off --audio off" in plan
+    assert "--world 6" in workers[0] and "--vision auto --audio off" in plan
     assert _flag(plan, "--spark-ranks") == "6" and _flag(plan, "--rtx") == "2"
     assert _flag(plan, "--speculator") == "off" and "--require-ready" not in plan.split()
     assert "--drafter-snapshot" not in plan.split() and "--draft-fp8" not in plan.split()
@@ -236,7 +237,7 @@ def test_kimi_dflash2_uses_one_resolved_fp8_snapshot_for_plan_and_serve(tmp_path
 
 @pytest.mark.parametrize("cache", ["bf16", "fp8"])
 def test_kimi_dspark_uses_resolved_native_weights_and_independent_draft_kv(tmp_path: Path, cache) -> None:
-    model, revision = "Inferact/Kimi-K3.1-Pro-DSpark", "e4e6e6261e9f8b6d5f249f9627eb6b109d762d5f"
+    model, revision = "Inferact/Kimi-K3.1-Pro-DSpark", "c197a09072916cf63172df2d9d4baef0b77ed83a"
     _snapshot(tmp_path / "hf", model, {}, revision=revision)
     result = _kimi(tmp_path, f"SPECULATOR=dspark\nDRAFT_KV_CACHE={cache}\n")
     serve = _line(result,"serve-kimi --snapshot")
@@ -291,8 +292,8 @@ def test_kimi_unset_spark_budget_leaves_serve_on_the_family_default(tmp_path: Pa
     ("SPECULATOR=dflash2\n", "SPECULATOR=dflash2 needs SPECULATOR_MODEL_ID"),
     ("SPECULATOR=mtp\n", "SPECULATOR=mtp does not apply to kimi_k3"),
     ("ATTENTION_PLACEMENT=invalid\n", "ATTENTION_PLACEMENT must be auto, context, layers or heads"),
-    ("VISION=rtx\n", "kimi_k3 bundled media execution is not qualified"),
-    ("AUDIO=spark\n", "kimi_k3 bundled media execution is not qualified"),
+    
+    ("AUDIO=spark\n", "kimi_k3 has no bundled audio execution owner"),
     ("EMBEDDING=host\n", "GPU token embeddings only"),
     ("RTX_EXPERT_LAYERS=max\n", "RTX_EXPERT_LAYERS must be auto, all or N"),
     ("RTX_EXPERT_LAYERS=50%\n", "RTX_EXPERT_LAYERS must be auto, all or N"),
@@ -488,7 +489,7 @@ STEP5 = {"model_type": "step5_vl", "vision_config": {"depth": 2},
          "text_config": {"model_type": "step5", "num_hidden_layers": 92, "moe_layer_list": list(range(3, 91))}}
 STEP5_FP8 = "stepfun-ai/Step-5-Preview"
 STEP5_NVFP4 = "stepfun-ai/Step-5-Preview-NVFP4"
-STEP5_PLANNED = {"placement_supported": True, "fits": True, "spark_budget_bytes": 100 << 30}
+STEP5_PLANNED = {"placement_supported": True, "fits": True, "spark_budget_bytes": 100 << 30, "encoder": None, "encoder_plan_hash": "ab" * 32}
 
 
 def _hosts(count: int) -> str:
@@ -512,7 +513,7 @@ def test_step5_dispatches_to_serve_step5(tmp_path: Path, model: str, gpus: int, 
     assert _flag(serve, "--prefix-cache-entries") == "20"
     assert ((_flag(serve, "--device"), _flag(serve, "--split-device")) == ("0", "1")) == (gpus == 2)
     assert _flag(serve, "--max-context-tokens") == "auto"
-    for absent in ("--pool-tokens", "--rtx-expert-layers", "--vision", "--audio",
+    for absent in ("--pool-tokens", "--rtx-expert-layers",
                    "--draft", "--draft-fp8", "--dspark", "--local-experts"):
         assert absent not in serve.split(), absent
     workers = [line for line in result.stderr.splitlines() if "cuteafd expertd-native" in line]
@@ -521,7 +522,7 @@ def test_step5_dispatches_to_serve_step5(tmp_path: Path, model: str, gpus: int, 
     assert "--spark-memory-cap" not in plan.split()
     assert all(f"--device-budget-bytes {100 << 30} " in worker for worker in workers)
     assert _flag(plan, "--spark-ranks") == str(sparks) and _flag(plan, "--rtx") == str(gpus)
-    assert "--vision off --audio off" in plan and "--require-ready" not in plan.split()
+    assert "--vision auto --audio off" in plan and "--require-ready" not in plan.split()
     lines = result.stderr.splitlines()
     probe = next(i for i, line in enumerate(lines) if "dst=/opt/cuteafd-serve-probe" in line)
     assert lines[probe].endswith("serve-step5 --help ") and probe < lines.index(plan)
@@ -550,7 +551,6 @@ def test_step5_cache_format_matches_plan_and_serve(tmp_path: Path, model, gpus, 
 @pytest.mark.parametrize("keys,diagnostic", [
     ("SPECULATOR=dflash2\n", "SPECULATOR=dflash2 does not apply to step5"),
     ("ATTENTION_PLACEMENT=heads\n", "step5 supports only ATTENTION_PLACEMENT=auto"),
-    ("VISION=rtx\n", "step5 bundled media execution is not qualified"),
     ("EMBEDDING=host\n", "step5 serves GPU token embeddings only"),
     ("SPECULATOR_MODEL_ID=x/y\n", "unused configuration key: SPECULATOR_MODEL_ID"),
     ("SPECULATOR_MODEL_REVISION=abc\n", "unused configuration key: SPECULATOR_MODEL_REVISION"),
@@ -959,3 +959,39 @@ def test_family_table_and_planner_fixtures_name_muse() -> None:
     fixtures = json.loads((ROOT / "rust/crates/cuteafd-loader/tests/fixtures/launch-families.json").read_text())
     assert "muse_spark muse_spark 0 61" in {case["line"] for case in fixtures}
     assert '"muse_spark" =>' in (ROOT / "rust/crates/cuteafd-loader/src/plan/launch.rs").read_text()
+
+@pytest.mark.parametrize("family,model,ranks", [("inkling2", "thinkingmachines/Inkling-2-Small", 4),
+    ("step5", "wrldsuksgo2mars/Step-5-Preview-EXL3-K4-MC", 3)])
+@pytest.mark.parametrize("vision", ["spark", "rtx", "off"])
+def test_pe_shared_encoder_plan_handoff(tmp_path, family, model, ranks, vision):
+    config = {"model_type": "inkling2" if family == "inkling2" else "step5_vl", "vision_config": {"depth": 2},
+        "text_config": {"model_type": "inkling2" if family == "inkling2" else "step5", "num_hidden_layers": 48 if family == "inkling2" else 92, "moe_layer_list": list(range(3, 91))}}
+    owner = None if vision == "off" else {"kind": {"kind": vision, "rank" if vision == "spark" else "gpu": 0}, "replicas": []}
+    plan = {**PLANNED, "encoder_plan_hash": "ab" * 32, "encoder": owner}
+    keys = f"SPARK_COUNT={ranks}\nRTX_GPUS=1\nSPECULATOR=off\nVISION={vision}\nAUDIO=off\n" + _hosts(ranks)
+    result = _family_launch_result(tmp_path, config, model, keys, physical_gpus=(0,),
+        extra_args=("--wip", "pe"), encoder_plan=plan)
+    serve = _line(result, f"serve-{'inkling2' if family == 'inkling2' else 'step5'} --snapshot")
+    assert _flag(serve, "--vision") == ("off" if vision == "off" else f"{vision}:0")
+    if vision == "spark":
+        assert _flag(serve, "--vision-peers") == "10.0.0.1:19442"
+        assert _flag(serve, "--encoder-plan-hash") == "ab" * 32
+        assert _flag(serve, "--encoder-revision") == "abc"
+    workers = [line for line in result.stderr.splitlines() if "cuteafd expertd-native" in line]
+    assert sum("--encoder " in worker for worker in workers) == (vision == "spark")
+
+
+@pytest.mark.parametrize("family,model,ranks", [("inkling2", "thinkingmachines/Inkling-2-Small", 4),
+    ("step5", "wrldsuksgo2mars/Step-5-Preview-EXL3-K4-MC", 3)])
+def test_pe_encoder_replicas_match_plan_and_runtime(tmp_path, family, model, ranks):
+    config = {"model_type": "inkling2" if family == "inkling2" else "step5_vl", "vision_config": {"depth": 2},
+        "text_config": {"model_type": "step5", "num_hidden_layers": 48 if family == "inkling2" else 92,
+            "moe_layer_list": list(range(3,91))}}
+    plan = {**PLANNED, "encoder": {"kind":{"kind":"spark","rank":0},"replicas":[1]},"encoder_plan_hash":"ab"*32}
+    keys = f"SPARK_COUNT={ranks}\nRTX_GPUS=1\nSPECULATOR=off\nVISION=spark\nVISION_REPLICAS=2\nAUDIO=off\n"+_hosts(ranks)
+    result = _family_launch_result(tmp_path, config, model, keys, physical_gpus=(0,),
+        extra_args=("--wip","pe"), encoder_plan=plan)
+    serve = _line(result,f"serve-{family} --snapshot")
+    assert _flag(serve,"--vision-replicas")=="2"
+    assert _flag(_line(result,"cuteafd plan"),"--vision-replicas")=="2"
+    assert _flag(serve,"--vision-peers")=="10.0.0.1:19442,10.0.0.2:19442"

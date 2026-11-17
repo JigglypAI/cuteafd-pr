@@ -126,19 +126,20 @@ impl<'a> CacheBank<'a> {
 }
 /// Logical pages and frontiers belong to the shared scheduler. Mutable model
 /// bytes stay in the bank and are never reconstructed from a continuation.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub(crate) struct Placement {
     pub units: Vec<u32>,
     pub slot: usize,
     pub len: usize,
     pub state_len: usize,
+    pub media: Option<cuteafd_engine::media::RequestMedia>,
 }
 impl crate::shared::qwen::scheduler::Placement for Placement {
     fn len(&self) -> usize { self.len }
     fn set_len(&mut self, len: usize) { self.len = len; }
     fn units(&self) -> &[u32] { &self.units }
     fn slot(&self) -> i32 { self.slot as i32 }
-    fn spans(&self) -> &[cuteafd_core::MediaSpan] { &[] }
+    fn spans(&self) -> &[cuteafd_core::MediaSpan] { self.media.as_ref().map_or(&[], |media| media.spans()) }
 }
 
 #[derive(Clone)]
@@ -241,7 +242,7 @@ mod tests {
             PrefixConfig { entries: 3, mark_slots: 3, keep_logits: true, min_tokens: 1 }, None)?;
         let tokens = (0..65).collect::<Vec<u32>>();
         let mut source = cache.admit(&family, &tokens, 128, false,
-            |units| Placement { units, slot: 0, len: 0, state_len: 0 })?.placement;
+            |units| Placement { media: None, units, slot: 0, len: 0, state_len: 0 })?.placement;
         let state = bank.sequence(0)?;
         let prompt = vec![0x17; state.bytes];
         library.copy_h2d(state, &prompt)?;
@@ -253,7 +254,7 @@ mod tests {
         assert!(cache.capture(&family, SnapshotKind::Prompt, &tokens, &source, After::from_logits(&[1., 0.], true))?);
         cache.release(&family, &source.units)?;
         let restored = cache.admit(&family, &tokens, 128, false,
-            |units| Placement { units, slot: 1, len: 0, state_len: 0 })?;
+            |units| Placement { media: None, units, slot: 1, len: 0, state_len: 0 })?;
         assert_eq!(restored.resume, tokens.len());
         let mut observed = vec![0; state.bytes];
         library.copy_d2h(&mut observed, bank.sequence(1)?)?;
@@ -266,13 +267,13 @@ mod tests {
         assert!(cache.capture(&family, SnapshotKind::Turn, &turn_tokens, &continued, After::from_logits(&[0., 1.], true))?);
         cache.release(&family, &continued.units)?;
         let restored = cache.admit(&family, &turn_tokens, 128, false,
-            |units| Placement { units, slot: 0, len: 0, state_len: 0 })?;
+            |units| Placement { media: None, units, slot: 0, len: 0, state_len: 0 })?;
         assert_eq!(restored.resume, turn_tokens.len());
         library.copy_d2h(&mut observed, bank.sequence(0)?)?;
         assert_eq!(observed, turn);
         cache.release(&family, &restored.placement.units)?;
         let restored = cache.admit(&family, &tokens, 128, false,
-            |units| Placement { units, slot: 1, len: 0, state_len: 0 })?;
+            |units| Placement { media: None, units, slot: 1, len: 0, state_len: 0 })?;
         assert_eq!(restored.resume, tokens.len());
         library.copy_d2h(&mut observed, bank.sequence(1)?)?;
         assert_eq!(observed, prompt, "turn divergence must not mutate the prompt mark");
@@ -302,7 +303,7 @@ mod tests {
             PrefixConfig { entries: 3, mark_slots: 3, keep_logits: true, min_tokens: 1 }, None)?;
         let tokens = (0..65).collect::<Vec<u32>>();
         let mut source = cache.admit(&family, &tokens, 128, false,
-            |units| Placement { units, slot: 0, len: 0, state_len: 0 })?.placement;
+            |units| Placement { media: None, units, slot: 0, len: 0, state_len: 0 })?.placement;
         prefill(&library, &bank, &mut source, &tokens, 0x51)?;
         assert!(cache.capture(&family, SnapshotKind::Prompt, &tokens, &source,
             After::from_logits(&[1.0, 0.0], true))?);
@@ -314,7 +315,7 @@ mod tests {
         let builds = std::cell::Cell::new(0);
         let mut fallback = cache.admit(&family, &tokens, 128, false, |mut units| {
             if builds.replace(builds.get() + 1) == 0 { units.truncate(1); }
-            Placement { units, slot: 1, len: 0, state_len: 0 }
+            Placement { media: None, units, slot: 1, len: 0, state_len: 0 }
         })?;
         assert_eq!((fallback.resume, cache.stats().restore_failures, builds.get()), (0, 1, 2));
         assert_eq!((fallback.placement.len, fallback.placement.state_len), (0, 0));
@@ -323,7 +324,7 @@ mod tests {
         assert!(state.iter().all(|&byte| byte == 0), "cold bind must reset the abandoned slot");
 
         let mut cold = cache.admit_cold(&family, tokens.len(), 128,
-            |units| Placement { units, slot: 2, len: 0, state_len: 0 })?;
+            |units| Placement { media: None, units, slot: 2, len: 0, state_len: 0 })?;
         prefill(&library, &bank, &mut fallback.placement, &tokens, 0x51)?;
         prefill(&library, &bank, &mut cold.placement, &tokens, 0x51)?;
         assert_eq!(fallback.placement.units.len(), cold.placement.units.len());
@@ -442,12 +443,12 @@ mod tests {
         use cuteafd_engine::prefix::{MarkSlot, PrefixFamily, TailCopy};
         let cache = Rc::new(cache);
         let family = InklingPrefix::new(cache.clone());
-        let mut source = Placement { units: vec![0, 1], slot: 0, len: 65, state_len: 65 };
+        let mut source = Placement { media: None, units: vec![0, 1], slot: 0, len: 65, state_len: 65 };
         library.copy_h2d(cache.sequence(0)?, &pattern)?;
         family.capture(MarkSlot(0), &source, 65).map_err(|e| anyhow::anyhow!("{e}"))?;
         source.state_len = 64;
         assert!(family.capture(MarkSlot(0), &source, 65).is_err());
-        let mut destination = Placement { units: vec![0, 2], slot: 1, len: 0, state_len: 0 };
+        let mut destination = Placement { media: None, units: vec![0, 2], slot: 1, len: 0, state_len: 0 };
         family.bind(&mut destination).map_err(|e| anyhow::anyhow!("{e}"))?;
         assert!(family.restore(None, &mut destination, 65).is_err());
         family.restore(Some(MarkSlot(0)), &mut destination, 65).map_err(|e| anyhow::anyhow!("{e}"))?;

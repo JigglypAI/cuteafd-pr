@@ -220,6 +220,19 @@ these request values do not imply that a Planned checkpoint has a serving execut
 | --- | --- | --- | --- |
 | `reasoning_effort` (Inkling) | `high` (= 0.9) | `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, or a JSON number in `[0, 0.99]` | Native template values are 0, 0.1, 0.2, 0.7, 0.9, 0.99 and 0.99, respectively. A top-level value takes precedence over `chat_template_kwargs.reasoning_effort`; explicit thinking-off resolves to `none`. Reasoning and tool calls use native message channels. Only `<|content_model_end_sampling|>` (token 200006) ends generation; `<|end_message|>` closes a channel and is not an EOS stop. |
 
+### PE Vision Qualification
+
+Inkling and Step-5 use the shared bundled PE tower runtime and image admission.
+`VISION=off` remains the qualified text-only configuration while normal image
+answers are being qualified (#1930, #1994). Explicit `VISION=spark[:rank]` or
+`VISION=rtx[:gpu]` selects the jointly admitted packed tower owner in WIP builds;
+`VISION_REPLICAS=1..8` and `MEDIA_CACHE_BYTES` use the shared media options.
+Each tower has one weight arena and one scratch backing per replica; tensor
+views do not add another charge. Step-5 images retain ordered local crops and
+the global view with native separators; the 896x812 processor case expands to
+493 feature rows plus 11 native markers (504 inserted tokens; 506 tokens in
+the text/image/text boundary fixture). Audio remains unsupported.
+
 ### Inkling Serving
 
 Inkling exposes `cuteafd serve --family inkling2` and `./run.sh --wip SLOT`
@@ -278,13 +291,13 @@ to preserve projection shapes and bytes. Each planned intermediate prefix mark
 gets its own window; MiniMax withholds an unexpected partial-prefill snapshot
 until its window is complete. Full-context paged drafters are unchanged.
 `DRAFT_LENGTH` caps the seven-token native block; `SPECULATION_TRACE` records
-shared draft/verify evidence. MiniMax alone defaults to `DRAFT_POLICY=shared`,
-the existing cost-based concurrency-bucket policy, including native zero-proposal
-decode when drafting cannot pay. Explicit `shared|simple|simple-rc|simple-derived`
-overrides win; other families retain their `simple` fallback (global decision #2220).
-The retained matched A/B (#2165) improves warmed C1/C4/C16 decode on the three
-cards; reversed Heads 8K prefill costs about 2.5%. See the family page for arm-order
-and instrumentation caveats. The example config's explicit off remains an override
+shared draft/verify evidence. Unset `DRAFT_POLICY` selects `simple` for every
+family; `shared`, `simple-rc` and `simple-derived` remain explicit opt-ins
+(global decision #2220). `shared` is the cost-based concurrency-bucket policy,
+including native zero-proposal decode when drafting cannot pay. The #2220
+campaign measured MiniMax `shared` against `simple` at C1 1.00, sweep C16 1.03
+and sustained C8/C16 1.02/1.04, all within single-launch noise. See the family
+page for instrumentation caveats. The example config's explicit off remains an override
 until its separate line change joins the next placement-input publication batch.
 `VISION=off` and `AUDIO=off` remain required.
 
@@ -675,7 +688,7 @@ Each key is also a global `cuteafd` flag (`--gpu-memory-cap`, `--kv-max-tokens`,
 | `SPECULATOR_DEPTH` | 3 for local Qwen/Step-5, else 1 | positive int | Native MTP draft depth. |
 | `DRAFT_LENGTH` | unset (adaptive) | positive int | Fixed verified draft tokens per step: min(value, native head width), further capped by the existing row budget at high concurrency. Overrides `DRAFT_POLICY`; statistics still recorded. Every family and speculator (DFlash2, dSpark, MTP, Markov). V4.1 adaptive maximum remains 5 when unset; fixed supports up to 7. Without a speculator it is ignored with one startup log; reports and cards say `no speculation`. |
 | `SPECULATOR_FP8` | `auto` | `auto`, `on`, `off` | GLM/Qwen/MiMo/Kimi drafter precision: `on` converts projection matrices to single-copy FP8. Kimi block DSpark supports TP1 and physical TP2 with native BF16 norms/Markov tensors; `auto` selects FP8 for qualified K3.1 MC original/K6 on TP1/TP2; explicit `off` keeps BF16. Independent of `DRAFT_KV_CACHE`. |
-| `DRAFT_POLICY` | unset | `shared`, `simple`, `simple-rc`, `simple-derived` | Drafter block policy: unset selects shared for MiniMax, simple elsewhere. Shared prices draft/skip actions per concurrency bucket and collects per-layer timing. Explicit values override the family default. |
+| `DRAFT_POLICY` | unset | `shared`, `simple`, `simple-rc`, `simple-derived` | Drafter block policy: unset selects `simple` for every family; the others are explicit opt-ins. Shared prices draft/skip actions per concurrency bucket and collects per-layer timing. |
 | `DRAFT_ROW_COST` | unset | `linear`, `power`, `log` | Drafter row cost model diagnostic. |
 | `DRAFT_SURVIVAL_LENGTHS` | `off` | `on`, `off` | Record draft survival lengths. |
 | `DRAFT_CONTEXT_SLOTS` | `max(20, drafts)` | positive int | GLM/MiMo drafter context slots. |
@@ -1140,8 +1153,8 @@ original core is already FP8, not an MC publication.
 | **Media** | | | | | | | | | | |  |
 | `VISION` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | `AUDIO` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| `VISION_REPLICAS` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✗ | ✗ | ✓ | ✗ |
-| `MEDIA_CACHE_BYTES` | ✗ | ✗ | ✗ | ✓ | ✓ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ |
+| `VISION_REPLICAS` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✗ | ✓ | ✓ | ✓ |
+| `MEDIA_CACHE_BYTES` | ✗ | ✗ | ✗ | ✓ | ✓ | ✓ | ✗ | ✗ | ✓ | ✗ | ✓ |
 | `MEDIA_FEATURES_DIR` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | `AUDIO_FEATURES_DIR` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | `CHAT_TEMPLATE_FROM` | ✗ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ |

@@ -287,6 +287,59 @@ mod tests {
         }
     }
     #[test]
+    fn grouped_pe_requests_expand_features_and_native_markers_once() -> anyhow::Result<()> {
+        use cuteafd_loader::media::{DecodedPixels, EncoderId, ImageFamily, ProcessorConfig, RgbImage};
+        fn request(groups: Vec<cuteafd_loader::media::PreparedImageGroup>) -> cuteafd_api::openai::NativeRequest {
+            let (events, _) = tokio::sync::mpsc::unbounded_channel();
+            cuteafd_api::openai::NativeRequest { prompt: String::new(), literal_spans: vec![], constraint: None,
+                images: vec![], media: groups.iter().flat_map(|g| g.images.iter().cloned()).collect(), image_groups: groups,
+                audio: vec![], max_tokens: 1, sampling: Default::default(), stop_token_ids: vec![], events,
+                probe: None, usage: None, prefix_cache_source: Default::default(), finish_detail: Default::default() }
+        }
+        for (inkling, family, size, hidden, features, prompt_rows) in [
+            (true, ImageFamily::Inkling2, [197,157], 4608, 20, 20),
+            (false, ImageFamily::Step5, [896,812], 4096, 493, 504),
+        ] {
+            let root = sparse_snapshot(inkling);
+            cuteafd_loader::plan::testing::write_kimi_tokenizer(root.path());
+            let mut config: serde_json::Value = cuteafd_loader::read_json_file(&root.path().join("tokenizer_config.json"))?;
+            for (id, token) in [(258,"<|unused_200054|>"),(259,"<im_patch>"),(260,"<patch_start>"),
+                (261,"<patch_end>"),(262,"<patch_newline>"),(263,"<im_start>"),(264,"<im_end>")] {
+                config["added_tokens_decoder"][id.to_string()] = serde_json::json!({"content":token});
+            }
+            std::fs::write(root.path().join("tokenizer_config.json"), serde_json::to_vec(&config)?)?;
+            let processor = ProcessorConfig::from_snapshot(root.path(), family)?;
+            let group = processor.prepare_group(DecodedPixels::Rgb(RgbImage { width:size[0], height:size[1],
+                data: vec![71; size[0] as usize*size[1] as usize*3] }), EncoderId([3;32]))?;
+            let binding = Binding::new(root.path(), family, true, 512)?;
+            let placeholder = if inkling {258} else {259};
+            let (prompt, media, jobs) = binding.prepare(request(vec![group.clone()]), vec![1,placeholder,2], 512, hidden, 1024)?;
+            assert_eq!(prompt.tokens.len(), prompt_rows+2);
+            assert_eq!(media.spans().iter().map(|s| s.len).sum::<usize>(), features);
+            assert_eq!(jobs.iter().map(|j| j.tokens).sum::<usize>(), features);
+            assert_eq!(jobs.len(), if inkling {1} else {5});
+            assert_eq!(prompt.job.media.len(), jobs.len());
+            if !inkling {
+                assert_eq!(media.spans().iter().map(|s|s.len).collect::<Vec<_>>(), [81,81,81,81,169]);
+                assert_eq!(prompt.tokens[1],260);
+                assert_eq!(prompt.tokens[prompt.tokens.len()-2],264);
+            }
+            let off = Binding::new(root.path(), family, false, 512)?;
+            assert!(off.prepare(request(vec![group.clone()]), vec![1,placeholder,2], 512, hidden, 1024).is_err());
+            let text = vec![4,5,6];
+            let (plain, empty, jobs) = off.prepare(request(vec![]), text.clone(), 512, hidden, 1024)?;
+            assert_eq!(plain.tokens,text);
+            assert!(empty.spans().is_empty() && jobs.is_empty());
+            assert!(binding.prepare(request(vec![group.clone()]), vec![1,placeholder,2], 512, hidden, prompt_rows).is_err());
+            assert!(binding.prepare(request(vec![group.clone()]), vec![1,2], 512, hidden, 1024).is_err());
+            let mut malformed = group;
+            malformed.source[0] += 1;
+            assert!(binding.prepare(request(vec![malformed]), vec![1,placeholder,2], 512, hidden, 1024).is_err());
+        }
+        Ok(())
+    }
+
+    #[test]
     fn qualified_pe_towers_have_explicit_shared_dispatch() {
         let source=include_str!("../vision.rs");
         assert!(source.contains("Some(\"inkling2\"|\"step5_vl\") => Self::perception"));
@@ -295,5 +348,42 @@ mod tests {
             let tower=TowerSpec::from_snapshot(directory.path(),169).unwrap();
             assert_eq!(tower.image_family(),family);
         }
+    }
+}
+
+/// Checkpoint-native PE prompt markers. Crop construction stays in the shared
+/// processor; this adapter supplies only the family's tokenizer layout.
+pub(crate) struct Binding {
+    processor: cuteafd_loader::media::ProcessorConfig,
+    layout: cuteafd_loader::media::ImagePromptLayout,
+    enabled: bool,
+}
+impl Binding {
+    pub fn new(snapshot: &Path, family: cuteafd_loader::media::ImageFamily, enabled: bool,
+        vocabulary: u32) -> anyhow::Result<Self> {
+        use cuteafd_loader::media::{ImageFamily, ImagePromptLayout, ProcessorConfig};
+        let tokenizer = cuteafd_loader::cached_tokenizer(snapshot)?;
+        let marker = |name: &str| -> anyhow::Result<u32> {
+            let ids = tokenizer.encode_ids(name)?;
+            anyhow::ensure!(ids.len() == 1 && ids[0] < vocabulary, "PE marker {name} is not one native token");
+            Ok(ids[0])
+        };
+        let layout = match family {
+            ImageFamily::Inkling2 => ImagePromptLayout::Single { placeholder: marker("<|unused_200054|>")? },
+            ImageFamily::Step5 => ImagePromptLayout::LocalGlobal { placeholder: marker("<im_patch>")?,
+                local_start: marker("<patch_start>")?, local_end: marker("<patch_end>")?,
+                newline: marker("<patch_newline>")?, global_start: marker("<im_start>")?, global_end: marker("<im_end>")? },
+            _ => anyhow::bail!("not a PE prompt family"),
+        };
+        Ok(Self { processor: ProcessorConfig::from_snapshot(snapshot, family)?, layout, enabled })
+    }
+    pub fn prepare(&self, mut job: cuteafd_api::openai::NativeRequest, tokens: Vec<u32>, vocabulary: u32,
+        hidden: usize, context: usize) -> anyhow::Result<(crate::shared::qwen::scheduler::Prompt,
+            cuteafd_engine::media::RequestMedia, Vec<cuteafd_engine::media::EncodeJob>)> {
+        anyhow::ensure!(self.enabled || (job.media.is_empty() && job.image_groups.is_empty()), "vision is disabled");
+        let mut groups = std::mem::take(&mut job.image_groups);
+        anyhow::ensure!(job.media.is_empty() || !groups.is_empty(), "PE images require grouped preparation");
+        for group in &mut groups { self.processor.assemble_group_prompt(group, &self.layout)?; }
+        super::still::Binding::prepare(job, tokens, vocabulary, hidden, context, self.layout.placeholder(), groups)
     }
 }
