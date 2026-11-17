@@ -22,7 +22,7 @@ impl OnboardBudget {
     fn package(self, format: &super::experts::StepExperts, native_lib: &std::path::Path) -> Result<PathBuf> {
         match (self, format) {
             (Self::Whole(_), super::experts::StepExperts::Native(_)) =>
-                anyhow::bail!("Step-5 whole-layer onboarding requires EXL3 experts"),
+                anyhow::bail!("Step-5 native whole-layer RTX expert onboarding on one GPU is unimplemented (#2429); use EXL3 whole-layer or native TP2 onboarding"),
             (_, super::experts::StepExperts::Exl3(_)) => Ok(format.package_manifest(native_lib)?
                 .parent().context("EXL3 package")?.join(if matches!(self, Self::Whole(_)) { "rtx-tp1" } else { "rtx-tp2" })),
             (Self::Tp2(_), super::experts::StepExperts::Native(expert)) =>
