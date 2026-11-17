@@ -5016,6 +5016,11 @@ front ends land; 5 after 4; 6 after 1; 7 and 8 after 1 and 4; 9 and 10 last.
 
 ## v3 draft policy: resource-priced, shared (design, 2026-10-09)
 
+> Superseded 2026-11-18 (TJ): the resource-priced policy, the `simple` family
+> and their confidence plumbing are deleted. Every family drafts on the one
+> `history` policy (`cuteafd_core::draft_history`, `DRAFT_POLICY` in
+> `docs/options.md`). The rest of this section is history.
+
 Design for v3 item 6. Inputs: `cuteafd-core::dspark_policy` (1,214 lines) and
 its V4.1 binding (`v41_native_serve/speculative/policy.rs`), today's
 `shared/draft_policy.rs` (`CycleCost`, `allocate`, `DraftHistory`,
