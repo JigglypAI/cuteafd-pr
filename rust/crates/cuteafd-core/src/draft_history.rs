@@ -1,11 +1,10 @@
 //! The `history` draft policy: how many drafted positions each request
 //! verifies, decided from per-position acceptance history alone.
 //!
-//! A drafter declares its native block width and whether it has a trained
-//! confidence head ([`DrafterSpec`]). Each round the serve loop:
+//! A drafter declares its native block width ([`DrafterSpec`]) and reports each
+//! round's outcome; nothing else. Each round the serve loop:
 //! 1. [`DraftHistory::plan`]s a length per request before the draft pass;
-//! 2. [`DraftHistory::refine`]s it with what the drafter actually proposed
-//!    (and its head scores, where it has a head);
+//! 2. [`DraftHistory::refine`]s it with what the drafter actually proposed;
 //! 3. optionally [`DraftHistory::extend_copy`]s it with a history copy;
 //! 4. [`DraftHistory::settle`]s the round under the verify-row budget;
 //! 5. [`DraftHistory::observe`]s what the target accepted.
@@ -25,10 +24,11 @@
 //! **Exploration.** One position past the stop is always verified, up to the
 //! block, so neither the request's nor the server's estimate can lock low.
 //!
-//! **Head skip.** A drafter with a trained head keeps one online Platt fit per
-//! position from raw head score to acceptance, trained on reached positions.
-//! The explore position is skipped for a round when its calibrated probability
-//! is below [`SKIP_CUT`]. Drafters without a head always explore.
+//! Every drafter follows this one rule. A drafter's confidence head, where it
+//! has one, is recorded in traces as data and read by nothing here: replayed on
+//! a recorded fixed-7 code and prose trace, skipping the explore on a calibrated
+//! head probability below 0.1-0.3 moved tokens by -0.4% to +0.2% and raised
+//! prose rounds at one draft or fewer from 26% to 31-39%.
 //!
 //! **Budget.** When the round's rows exceed the verify-row budget, positions
 //! are granted across requests by the same probabilities, highest first, each
@@ -56,31 +56,16 @@ pub const SERVER_WINDOW: usize = 256;
 pub const PRIOR_STRENGTH: f64 = 8.;
 /// A position is kept while its probability is above this.
 pub const KEEP_CUT: f64 = 0.5;
-/// A head-calibrated explore position below this is skipped for the round.
-pub const SKIP_CUT: f64 = 0.2;
 /// Server rate of a neural position nobody has reached yet.
 pub const NEURAL_COLD_RATE: f64 = 1.;
 /// Server rate of a copy position nobody has reached yet.
 pub const COPY_COLD_RATE: f64 = 0.5;
-
-/// What a drafter's confidence head reports per drafted position.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "lowercase")]
-pub enum HeadScore {
-    /// No trained head: the drafter always explores.
-    None,
-    /// The head's raw logit.
-    Logit,
-    /// The head's sigmoid.
-    Probability,
-}
 
 /// Everything a drafter declares to the policy.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DrafterSpec {
     /// Native block: the most positions one draft pass proposes.
     pub block: usize,
-    pub head: HeadScore,
     /// Most copy positions a history copy may add past the neural draft.
     pub copy: usize,
 }
@@ -141,9 +126,8 @@ pub struct PositionTrace {
     pub server_reached: u32,
     /// Verified past the stop.
     pub explore: bool,
-    /// Raw head score and its calibrated probability, where the drafter has a head.
+    /// The drafter's raw confidence head score, where it has one. Data only: the policy never reads it.
     pub head: Option<f32>,
-    pub calibrated: Option<f64>,
     /// What the target said: accepted, rejected, or not reached.
     pub outcome: Option<bool>,
 }
@@ -155,8 +139,6 @@ pub struct RequestTrace {
     pub room: usize,
     /// Leading neural positions above the cut.
     pub keep: usize,
-    /// The head skipped this round's explore.
-    pub skipped: bool,
     /// Neural and copy positions granted under the row budget.
     pub neural: usize,
     pub copy: usize,
@@ -186,8 +168,6 @@ pub struct DraftHistoryStats {
     /// Explore positions verified, and how many the target accepted.
     pub explored: u64,
     pub explore_accepted: u64,
-    /// Explore positions the head skipped.
-    pub head_skips: u64,
     /// Positions the row budget removed from plans.
     pub budget_cut: u64,
     /// Request rounds by verified draft count.
@@ -231,50 +211,6 @@ impl Window {
     }
 }
 
-/// Online Platt scaling `p = sigmoid(a * logit + b)` by a Newton step on the
-/// log-loss with a decayed information matrix (a running fit over the last
-/// few hundred reached positions).
-#[derive(Clone, Copy, Debug)]
-struct Platt {
-    theta: [f64; 2],
-    information: [[f64; 2]; 2],
-}
-
-const PLATT_DECAY: f64 = 0.998;
-const PLATT_PRIOR: f64 = 2.;
-
-impl Platt {
-    fn new() -> Self { Self { theta: [1., 0.], information: [[PLATT_PRIOR, 0.], [0., PLATT_PRIOR]] } }
-
-    fn apply(&self, logit: f64) -> f64 {
-        let z = self.theta[0] * logit + self.theta[1];
-        1. / (1. + (-z).exp())
-    }
-
-    fn observe(&mut self, logit: f64, accepted: bool) {
-        let x = [logit, 1.];
-        let p = self.apply(logit);
-        let outcome = f64::from(u8::from(accepted));
-        let curvature = (p * (1. - p)).max(0.02);
-        for i in 0..2 {
-            for j in 0..2 {
-                self.information[i][j] = PLATT_DECAY * self.information[i][j] + curvature * x[i] * x[j];
-            }
-            // Stay well conditioned when one direction is unexcited (a constant score).
-            self.information[i][i] = self.information[i][i].max(1e-3);
-        }
-        let [[a, b], [c, d]] = self.information;
-        let determinant = a * d - b * c;
-        if !(determinant.is_finite() && determinant > 1e-12) { return; }
-        let gradient = [(outcome - p) * x[0], outcome - p];
-        let step = [(d * gradient[0] - b * gradient[1]) / determinant,
-            (a * gradient[1] - c * gradient[0]) / determinant];
-        // Slope in [0, 3]: calibration may flatten a head, never invert it.
-        self.theta[0] = (self.theta[0] + step[0].clamp(-1., 1.)).clamp(0., 3.);
-        self.theta[1] = (self.theta[1] + step[1].clamp(-2., 2.)).clamp(-8., 8.);
-    }
-}
-
 /// One verify round of a request: positions reached and accepted per track.
 #[derive(Clone, Copy, Debug, Default)]
 struct Round {
@@ -297,7 +233,6 @@ struct Planned {
 struct Pending {
     room: usize,
     keep: usize,
-    skipped: bool,
     /// Planned positions per track, and how many of them the budget granted.
     planned: [Vec<Planned>; 2],
     granted: [usize; 2],
@@ -331,7 +266,6 @@ pub struct DraftHistory {
     spec: DrafterSpec,
     control: DraftControl,
     server: [Vec<Window>; 2],
-    platt: Vec<Platt>,
     requests: HashMap<u64, Request>,
     stats: DraftHistoryStats,
 }
@@ -345,7 +279,6 @@ impl DraftHistory {
         Self {
             spec, control,
             server: [vec![Window::new(); spec.block], vec![Window::new(); spec.copy]],
-            platt: vec![Platt::new(); spec.block],
             requests: HashMap::new(),
             stats: DraftHistoryStats {
                 length_histogram: vec![0; spec.block + spec.copy + 1],
@@ -415,7 +348,7 @@ impl DraftHistory {
                 }
             };
             let granted = planned.len();
-            let pending = Pending { room, keep, skipped: false, planned: [planned, Vec::new()],
+            let pending = Pending { room, keep, planned: [planned, Vec::new()],
                 granted: [granted, 0], head: Vec::new() };
             self.requests.insert(id, Request { pending: Some(pending), ..request });
         }
@@ -423,26 +356,14 @@ impl DraftHistory {
         self.settle(&ids, max_rows)
     }
 
-    /// Report what the drafter proposed for `id`: `drafted` positions and, for
-    /// a drafter with a head, their raw scores. Returns the neural positions
-    /// still planned (the head may skip the explore).
+    /// Report what the drafter proposed for `id`: `drafted` positions and, where
+    /// it has a confidence head, their raw scores (kept for the trace only).
+    /// Returns the neural positions still planned.
     pub fn refine(&mut self, id: u64, drafted: usize, head: Option<&[f32]>) -> usize {
         let Some(pending) = self.requests.get_mut(&id).and_then(|request| request.pending.as_mut()) else { return 0 };
         pending.granted[NEURAL] = pending.granted[NEURAL].min(drafted);
         pending.planned[NEURAL].truncate(pending.granted[NEURAL]);
-        let Some(head) = head.filter(|_| self.spec.head != HeadScore::None) else { return pending.granted[NEURAL] };
-        pending.head = head[..head.len().min(self.spec.block)].to_vec();
-        let explore = pending.keep;
-        if self.control == DraftControl::History && pending.granted[NEURAL] > explore {
-            if let Some(&score) = pending.head.get(explore) {
-                if score.is_finite() && self.platt[explore].apply(logit(self.spec.head, score)) < SKIP_CUT {
-                    pending.granted[NEURAL] = explore;
-                    pending.planned[NEURAL].truncate(explore);
-                    pending.skipped = true;
-                    self.stats.head_skips += 1;
-                }
-            }
-        }
+        if let Some(head) = head { pending.head = head[..head.len().min(self.spec.block)].to_vec(); }
         pending.granted[NEURAL]
     }
 
@@ -524,11 +445,6 @@ impl DraftHistory {
                     } else { (&mut self.stats.copy_reached, &mut self.stats.copy_accepted) };
                     reached[position] += 1;
                     accepted[position] += u64::from(hit);
-                    if track == NEURAL && self.spec.head != HeadScore::None {
-                        if let Some(&score) = pending.head.get(position).filter(|score| score.is_finite()) {
-                            self.platt[position].observe(logit(self.spec.head, score), hit);
-                        }
-                    }
                 }
             }
             let explores = self.control == DraftControl::History;
@@ -553,13 +469,11 @@ impl DraftHistory {
                             server_reached: planned.server_reached,
                             explore: explores && if track == NEURAL { position >= pending.keep }
                                 else { position + 1 == pending.planned[COPY].len() && planned.p <= KEEP_CUT },
-                            head, calibrated: head.filter(|score| score.is_finite())
-                                .map(|score| self.platt[position].apply(logit(self.spec.head, score))),
-                            outcome: (position < reached[track]).then_some(position < kept[track]) });
+                            head, outcome: (position < reached[track]).then_some(position < kept[track]) });
                     }
                 }
                 requests.push(RequestTrace { id: outcome.id, room: pending.room, keep: pending.keep,
-                    skipped: pending.skipped, neural: pending.granted[NEURAL], copy: pending.granted[COPY],
+                    neural: pending.granted[NEURAL], copy: pending.granted[COPY],
                     proposed, accepted_drafts: accepted, censored: outcome.censored, positions });
             }
             self.requests.insert(outcome.id, request);
@@ -576,33 +490,20 @@ impl DraftHistory {
             self.server[track].iter().enumerate().map(|(position, window)| serde_json::json!({
                 "position": position + 1, "window_rate": window.rate(Self::cold(track)), "window_rounds": window.len,
                 "reached": reached[position], "accepted": accepted[position],
-                "calibration": (track == NEURAL && self.spec.head != HeadScore::None)
-                    .then(|| self.platt[position].theta),
             })).collect()
         };
         serde_json::json!({
-            "policy": self.control.label(), "block": self.spec.block, "head": self.spec.head,
+            "policy": self.control.label(), "block": self.spec.block,
             "copy_positions": self.spec.copy, "request_window": REQUEST_WINDOW, "server_window": SERVER_WINDOW,
             "prior_strength": PRIOR_STRENGTH, "active_requests": self.requests.len(),
             "rounds": self.stats.rounds, "verified_drafts": self.stats.verified_drafts,
             "accepted_drafts": self.stats.accepted_drafts, "short_rounds": self.stats.short_rounds,
             "explored": self.stats.explored, "explore_accepted": self.stats.explore_accepted,
-            "head_skips": self.stats.head_skips, "budget_cut": self.stats.budget_cut,
+            "budget_cut": self.stats.budget_cut,
             "length_histogram": self.stats.length_histogram,
             "positions": track(NEURAL, &self.stats.position_reached, &self.stats.position_accepted),
             "copy": track(COPY, &self.stats.copy_reached, &self.stats.copy_accepted),
         })
-    }
-}
-
-fn logit(kind: HeadScore, score: f32) -> f64 {
-    let score = f64::from(score);
-    match kind {
-        HeadScore::Probability => {
-            let p = score.clamp(1e-6, 1. - 1e-6);
-            (p / (1. - p)).ln()
-        }
-        HeadScore::Logit | HeadScore::None => score.clamp(-30., 30.),
     }
 }
 
@@ -611,7 +512,7 @@ mod tests {
     use super::*;
 
     fn policy(block: usize) -> DraftHistory {
-        DraftHistory::new(DrafterSpec { block, head: HeadScore::None, copy: 0 }, DraftControl::History)
+        DraftHistory::new(DrafterSpec { block, copy: 0 }, DraftControl::History)
     }
 
     fn outcome(id: u64, proposed: usize, accepted: usize) -> DraftOutcome {
@@ -793,59 +694,27 @@ mod tests {
     }
 
     #[test]
-    fn the_head_skips_only_explores_calibrated_below_the_cut() {
-        let spec = DrafterSpec { block: 4, head: HeadScore::Probability, copy: 0 };
-        let mut policy = DraftHistory::new(spec, DraftControl::History);
-        for _ in 0..REQUEST_WINDOW {
-            policy.plan(&[(1, 4)], 64);
-            policy.refine(1, 4, Some(&[0.9, 0.5, 0.5, 0.5]));
-            policy.observe(&[outcome(1, 4, 1)], false);
+    fn a_confidence_head_is_recorded_and_never_changes_the_plan() {
+        let mut with_head = policy(4);
+        let mut without = policy(4);
+        for round in 0..3 * REQUEST_WINDOW {
+            let scores = [0.9f32, if round % 2 == 0 { 0.001 } else { 0.999 }, f32::NAN, 0.5];
+            let planned = with_head.plan(&[(1, 4)], 64);
+            assert_eq!(planned, without.plan(&[(1, 4)], 64));
+            let length = with_head.refine(1, planned[0], Some(&scores[..planned[0]]));
+            assert_eq!(length, without.refine(1, planned[0], None));
+            assert_eq!(length, planned[0]);
+            let accepted = length.min(1);
+            let trace = with_head.observe(&[outcome(1, length, accepted)], true).unwrap();
+            without.observe(&[outcome(1, length, accepted)], false);
+            let heads: Vec<_> = trace.requests[0].positions.iter().map(|position| position.head).collect();
+            assert_eq!(heads.len(), length);
+            assert_eq!(heads[0], Some(0.9));
         }
-        // Position 1 is the explore; its fit has learned that a 0.5 there misses.
-        let mut skipped = 0;
-        for score in [0.02, 0.19, 0.35, 0.6, 0.9, 0.99] {
-            assert_eq!(policy.plan(&[(1, 4)], 64), [2]);
-            let calibrated = policy.platt[1].apply(logit(HeadScore::Probability, score));
-            let kept = calibrated >= SKIP_CUT;
-            let length = if kept { 2 } else { 1 };
-            assert_eq!(policy.refine(1, 2, Some(&[0.9, score])), length, "score {score} calibrated {calibrated}");
-            assert_eq!(policy.settle(&[1], 64), [length]);
-            let trace = policy.observe(&[outcome(1, length, 1)], true).unwrap();
-            assert_eq!(trace.requests[0].skipped, !kept);
-            skipped += u64::from(!kept);
-        }
-        assert!((1..6).contains(&skipped), "{skipped} of 6 skipped");
-        assert_eq!(policy.stats().head_skips, skipped);
-        // A kept position is never skipped, whatever the head says.
-        let mut policy = DraftHistory::new(spec, DraftControl::History);
-        assert_eq!(policy.plan(&[(1, 4)], 64), [4]);
-        assert_eq!(policy.refine(1, 4, Some(&[0.01; 4])), 4);
-        // Without a head the same scores change nothing.
-        let mut policy = self::policy(4);
-        for _ in 0..REQUEST_WINDOW {
-            policy.plan(&[(1, 4)], 64);
-            policy.observe(&[outcome(1, 4, 1)], false);
-        }
-        assert_eq!(policy.plan(&[(1, 4)], 64), [2]);
-        assert_eq!(policy.refine(1, 2, Some(&[0.9, 0.01])), 2);
-    }
-
-    #[test]
-    fn head_calibration_trains_on_reached_positions_only() {
-        let spec = DrafterSpec { block: 3, head: HeadScore::Logit, copy: 0 };
-        let mut policy = DraftHistory::new(spec, DraftControl::Fixed(3));
-        let before = policy.platt[2].theta;
-        // An overconfident head at position 0: says 0.88, accepted half the time.
-        for round in 0..400 {
-            policy.plan(&[(1, 3)], 64);
-            policy.refine(1, 3, Some(&[2., 2., 2.]));
-            policy.observe(&[outcome(1, 3, round % 2)], false);
-        }
-        let calibrated = policy.platt[0].apply(2.);
-        assert!((calibrated - 0.5).abs() < 0.1, "calibrated {calibrated}");
-        // Position 1 was reached on accepted rounds only and always missed; position 2 never.
-        assert!(policy.platt[1].apply(2.) < 0.2);
-        assert_eq!(policy.platt[2].theta, before);
+        assert_eq!(with_head.stats(), without.stats());
+        // The stop is explored whatever the head says about it.
+        assert_eq!(with_head.plan(&[(1, 4)], 64), [2]);
+        assert_eq!(with_head.refine(1, 2, Some(&[0.9, 0.0])), 2);
     }
 
     #[test]
@@ -879,7 +748,7 @@ mod tests {
 
     #[test]
     fn fixed_and_off_ignore_history_but_keep_recording_it() {
-        let spec = DrafterSpec { block: 7, head: HeadScore::None, copy: 32 };
+        let spec = DrafterSpec { block: 7, copy: 32 };
         let mut fixed = DraftHistory::new(spec, DraftControl::Fixed(9));
         assert_eq!(fixed.control(), DraftControl::Fixed(7));
         for _ in 0..REQUEST_WINDOW {
@@ -898,7 +767,7 @@ mod tests {
 
     #[test]
     fn copies_are_a_second_track_that_starts_at_one_explored_position() {
-        let spec = DrafterSpec { block: 4, head: HeadScore::None, copy: 32 };
+        let spec = DrafterSpec { block: 4, copy: 32 };
         let mut policy = DraftHistory::new(spec, DraftControl::History);
         let mut lengths = Vec::new();
         for _ in 0..40 {
@@ -951,8 +820,7 @@ mod tests {
 
     #[test]
     fn trace_records_probability_counts_explore_and_head() {
-        let spec = DrafterSpec { block: 3, head: HeadScore::Logit, copy: 0 };
-        let mut policy = DraftHistory::new(spec, DraftControl::History);
+        let mut policy = policy(3);
         for _ in 0..4 {
             policy.plan(&[(1, 3)], 64);
             policy.refine(1, 3, Some(&[3., 1., 0.]));
@@ -971,7 +839,7 @@ mod tests {
         assert_eq!(explore["p"], 0.);
         assert_eq!(explore["explore"], true);
         assert_eq!(explore["head"], 1.);
-        assert!(explore["calibrated"].as_f64().unwrap() > 0.);
+        assert!(explore.get("calibrated").is_none() && value["requests"][0].get("skipped").is_none());
         assert_eq!(explore["outcome"], true);
         let snapshot = policy.snapshot();
         assert_eq!(snapshot["positions"][0]["reached"], 5);

@@ -420,9 +420,9 @@ mod tests {
     #[test]
     fn mtp_source_charge_uses_scheduler_verify_budget() -> anyhow::Result<()> {
         use super::{DECODE_ROWS, MTP_DEFERRED_STEPS};
-        use cuteafd_core::{DraftControl, DraftHistory, DrafterSpec, HeadScore};
+        use cuteafd_core::{DraftControl, DraftHistory, DrafterSpec};
         assert_eq!(DECODE_ROWS, cuteafd_loader::families::qwen4::VERIFY_ROWS);
-        let spec = DrafterSpec { block: MTP_DEFERRED_STEPS, head: HeadScore::None, copy: 0 };
+        let spec = DrafterSpec { block: MTP_DEFERRED_STEPS, copy: 0 };
         for control in [DraftControl::History, DraftControl::Fixed(MTP_DEFERRED_STEPS)] {
             for requests in 1..=DECODE_ROWS {
                 let plan: Vec<_> = (0..requests as u64).map(|id| (id, MTP_DEFERRED_STEPS)).collect();

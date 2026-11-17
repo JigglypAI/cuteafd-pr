@@ -2059,9 +2059,9 @@ fn validate_proposals(active: &[Option<Active<'_>>], members: &[usize], inputs: 
     Ok(())
 }
 
-/// Fit the lane's proposals to the shared draft policy's plan: the confidence
-/// head may skip an explore, an agreeing history copy extends a draft, and the
-/// verifier row budget caps the round. Grammar truncation follows.
+/// Fit the lane's proposals to the shared draft policy's plan: an agreeing
+/// history copy extends a draft, and the verifier row budget caps the round.
+/// Grammar truncation follows.
 fn shape_inputs<'a, C: DraftChain<'a>>(draft: &mut DraftRuntime<'_, 'a, C>, active: &[Option<Active<'_>>],
     members: &[usize], inputs: &mut [Vec<u32>]) {
     let lane: Vec<_> = members.iter().map(|&slot| {

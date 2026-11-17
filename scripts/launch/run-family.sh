@@ -204,20 +204,22 @@ for feature_key in MEDIA_FEATURES_DIR AUDIO_FEATURES_DIR; do
   probe_args+=(-v "$feature_root:$feature_root:ro" -e "CUTEAFD_$feature_key=$feature_root")
 done
 }
-# SPECULATION_TRACE=/abs/host/file.jsonl: the per-cycle speculation trace
-# (CUTEAFD_SPECULATION_TRACE, written by serve-glm and serve-qwen4; read by
-# scripts/qualify/glm5/glm-draft-trace.py and qualify/qwen4/qwen4-draft-trace.py).
-shared_trace_args() {
-trace_args=()
 # DRAFT_POLICY: history (the default: per-position acceptance history with
 # exploration) or off (verify no drafts). DRAFT_LENGTH is the fixed-width
 # measurement override. Sets draft_policy_args for the serve command.
+shared_draft_policy_args() {
 draft_policy_args=()
 case "$(get DRAFT_POLICY history)" in
   history) ;;
   off) draft_policy_args=(--draft-policy off) ;;
   *) echo "DRAFT_POLICY must be history or off" >&2; exit 2 ;;
 esac
+}
+# SPECULATION_TRACE=/abs/host/file.jsonl: the per-cycle speculation trace
+# (CUTEAFD_SPECULATION_TRACE, written by serve-glm and serve-qwen4; read by
+# scripts/qualify/glm5/glm-draft-trace.py and qualify/qwen4/qwen4-draft-trace.py).
+shared_trace_args() {
+trace_args=()
 trace="$(get SPECULATION_TRACE)"
 if [[ -n "$trace" ]]; then
   [[ "$trace" == /* ]] || { echo 'SPECULATION_TRACE must be an absolute path' >&2; exit 2; }
@@ -1177,6 +1179,7 @@ if [[ -n "${POOL_TOKENS:-}" ]]; then
 fi
 [[ "$SPECULATOR" != dspark ]] || args+=(--dspark)
 [[ -z "$draft_length" ]] || args+=(--draft-length "$draft_length")
+shared_draft_policy_args
 args+=("${draft_policy_args[@]}")
 [[ "$TP2_ATTENTION" != on ]] || args+=(--tp2-attention)
 [[ "$TP2_QUERY_PROJECTION" != on ]] || args+=(--tp2-query-projection)
@@ -1852,6 +1855,7 @@ if [[ -n "$draft_length" ]]; then
   [[ "$draft_length" =~ ^[1-9][0-9]*$ ]] || release_die "DRAFT_LENGTH must be a positive integer"
   draft_args+=(--draft-length "$draft_length")
 fi
+shared_draft_policy_args
 draft_args+=("${draft_policy_args[@]}")
 # Prefix cache (MiMo, GLM 5.3, GLM 5.3 Flash, Qwen 3.8, DeepSeek V4): PREFIX_CACHE_ENTRIES
 # snapshots per bank (prompts, turns; 0 = off), HOST_CACHE_BYTES of pinned host memory for

@@ -19,11 +19,13 @@
 //! - this fixture's trace by content (37k rounds): code 99.4% at 6.87 of 7
 //!   drafts, none short; prose 91.2% at 2.19 of 7 drafts (rejected rows per
 //!   round 1.42, against about 6 at fixed width), 26% of rounds short.
-//! - the dSpark explore skip on that trace: 6,445 skips in 28,478 prose
-//!   rounds, tokens 91.2% -> 91.0%, drafts 2.19 -> 2.18. It saves nothing: a
-//!   skipped explore also withholds the miss that would have kept the
-//!   position suppressed, so the position returns and is verified again.
-use cuteafd_core::{DraftControl, DraftHistory, DraftOutcome, DrafterSpec, HeadScore};
+//! - skipping the explore on dSpark's confidence head was replayed on that
+//!   trace and rejected: at a calibrated cut of 0.2, 6,445 skips in 28,478
+//!   prose rounds moved tokens 91.2% -> 91.0% and drafts 2.19 -> 2.18. A
+//!   skipped explore also withholds the miss that keeps the position
+//!   suppressed, so the position returns and is verified anyway. The head
+//!   scores stay in the fixture as recorded data; the policy does not read them.
+use cuteafd_core::{DraftControl, DraftHistory, DraftOutcome, DrafterSpec};
 
 const BLOCK: usize = 7;
 
@@ -52,13 +54,13 @@ struct Tally {
     short: usize,
 }
 
-/// (prose, code) tallies and the head's skips.
-fn replay(head: HeadScore, control: DraftControl) -> ([Tally; 2], u64) {
-    let mut policy = DraftHistory::new(DrafterSpec { block: BLOCK, head, copy: 0 }, control);
+/// (prose, code) tallies, with or without reporting the recorded head scores.
+fn replay(head: bool, control: DraftControl) -> [Tally; 2] {
+    let mut policy = DraftHistory::new(DrafterSpec { block: BLOCK, copy: 0 }, control);
     let mut tallies = [Tally::default(); 2];
     for round in rounds() {
         policy.plan(&[(round.id, BLOCK)], 64);
-        let length = policy.refine(round.id, BLOCK, Some(&round.head));
+        let length = policy.refine(round.id, BLOCK, head.then_some(round.head.as_slice()));
         assert_eq!(policy.settle(&[round.id], 64), [length]);
         let accepted = round.accepted.min(length);
         policy.observe(&[DraftOutcome { id: round.id, proposed: length, accepted, censored: false }], false);
@@ -69,16 +71,15 @@ fn replay(head: HeadScore, control: DraftControl) -> ([Tally; 2], u64) {
         tally.short += usize::from(length <= 1);
     }
     assert_eq!(policy.stats().short_rounds as usize, tallies[0].short + tallies[1].short);
-    (tallies, policy.stats().head_skips)
+    tallies
 }
 
 #[test]
 fn history_drafts_long_on_code_and_short_on_prose() {
-    let ([fixed_prose, fixed_code], _) = replay(HeadScore::None, DraftControl::Fixed(BLOCK));
+    let [fixed_prose, fixed_code] = replay(false, DraftControl::Fixed(BLOCK));
     assert_eq!(fixed_prose, Tally { rounds: 1112, tokens: 2219, drafts: 7784, short: 0 });
     assert_eq!(fixed_code, Tally { rounds: 646, tokens: 3154, drafts: 4522, short: 0 });
-    let ([prose, code], skips) = replay(HeadScore::None, DraftControl::History);
-    assert_eq!(skips, 0);
+    let [prose, code] = replay(false, DraftControl::History);
     // Code: 99.3% of fixed width's tokens at 6.78 of 7 drafts, never stuck short,
     // although it starts from a server window that 1,112 prose rounds taught.
     assert_eq!(code, Tally { rounds: 646, tokens: 3131, drafts: 4383, short: 0 });
@@ -87,17 +88,10 @@ fn history_drafts_long_on_code_and_short_on_prose() {
     assert!(code.drafts * prose.rounds > 3 * prose.drafts * code.rounds);
 }
 
-/// The dSpark head skip: bounds, not exact counts (the fit is floating point).
-/// On this sample 266 prose explores are skipped and none on code; tokens move
-/// by under 1% and prose drafts do not fall (2,232 -> about 2,340).
+/// A drafter's head scores are data: reporting them changes no decision.
 #[test]
-fn the_head_skip_fires_on_prose_only_and_changes_little() {
-    let ([prose, code], _) = replay(HeadScore::None, DraftControl::History);
-    let ([skip_prose, skip_code], skips) = replay(HeadScore::Probability, DraftControl::History);
-    eprintln!("head skip: {skips} skips; prose {prose:?} -> {skip_prose:?}; code {code:?} -> {skip_code:?}");
-    assert!((100..=500).contains(&skips), "{skips} skips");
-    assert!(skip_code.tokens.abs_diff(code.tokens) * 100 <= code.tokens);
-    assert!(skip_code.drafts.abs_diff(code.drafts) * 50 <= code.drafts);
-    assert!(skip_prose.tokens.abs_diff(prose.tokens) * 50 <= prose.tokens);
-    assert!(skip_prose.drafts.abs_diff(prose.drafts) * 10 <= prose.drafts);
+fn recorded_head_scores_do_not_change_the_replay() {
+    for control in [DraftControl::History, DraftControl::Fixed(BLOCK)] {
+        assert_eq!(replay(true, control), replay(false, control));
+    }
 }

@@ -857,7 +857,7 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
     let mut shared = match drafter {
         Some(drafter) => {
             engine.arm_draft_probe(engine.decode_rows)?;
-            Some(DraftPolicy::new(policy.length, drafter.drafts(), drafter.head_kind(), true))
+            Some(DraftPolicy::new(policy.length, drafter.drafts(), true))
         }
         _ => None,
     };
@@ -2052,8 +2052,8 @@ mod verify_rows_tests {
             let proposals: Vec<(Vec<u32>, Vec<f32>)> = history.iter().map(|h| drafts(h)).collect();
             let room = verify_room(64, streams);
             let requests: Vec<_> = (0..streams as u64).map(|id| (id, room)).collect();
-            let ks = cuteafd_core::DraftHistory::new(cuteafd_core::DrafterSpec { block: 7,
-                head: cuteafd_core::HeadScore::None, copy: 0 }, cuteafd_core::DraftControl::Fixed(7)).plan(&requests, 64);
+            let ks = cuteafd_core::DraftHistory::new(cuteafd_core::DrafterSpec { block: 7, copy: 0 },
+                cuteafd_core::DraftControl::Fixed(7)).plan(&requests, 64);
             for (i, ((tokens_i, _), &k)) in proposals.iter().zip(&ks).enumerate() {
                 let rows: Vec<u32> = std::iter::once(next[i]).chain(tokens_i[..k].iter().copied()).collect();
                 verified += rows.len();
