@@ -818,8 +818,10 @@ def test_shared_mla_drafter_requested_names_exist_in_family_catalog(exporter, na
     startup = (daemon / "families/kimi_k3/startup.rs").read_text()
     admission = (daemon / "families/kimi_k3/admission.rs").read_text()
     shared = (daemon / "shared/speculation/dflash.rs").read_text()
-    assert f'MlaDraft::load(programs, "{namespace}", MlaDraftWindow::Full, cache)' in startup
-    assert f'MlaDraft::load(programs, "{namespace}", MlaDraftWindow::Sliding4096, cache)' in startup
+    assert "MlaDraft::load_fp8_weights(programs, namespace, window, cache)" in startup
+    assert "MlaDraft::load(programs, namespace, window, cache)" in startup
+    assert f'load("{namespace}", MlaDraftWindow::Full)' in startup
+    assert f'load("{namespace}", MlaDraftWindow::Sliding4096)' in startup
     assert re.search(r'DflashDrafter::load_mla_with\(device\.library, programs,\s*'
                      r'target_projection, namespace,', admission)
     assert "MlaDraft::load(programs, program_namespace," in shared

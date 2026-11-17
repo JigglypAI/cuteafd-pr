@@ -180,6 +180,11 @@ fn packing_inventory(core: Option<&serde_json::Value>, native: &[String])
     for cache in ["", "_fp8"] {
         add(format!("kimik31_paged_staging_gather{cache}"), SequenceLocal)?;
     }
+    add("kimik31_mla_draft_output_causal_h96_m64".into(), SequenceLocal)?;
+    for cache in ["", "_fp8"] {
+        add(format!("kimik31_mla_draft_producer_causal_h96{cache}_m64"), SequenceLocal)?;
+        add(format!("kimik31_mla_draft_attention_causal_w1024{cache}_m64"), SequenceLocal)?;
+    }
     add("kimik3_lse_combine2".into(), SequenceLocal)?;
     for cache in ["", "_fp8"] {
         add(format!("kimik3_paged_staging_gather{cache}"), SequenceLocal)?;
