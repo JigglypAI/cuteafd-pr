@@ -291,17 +291,24 @@ def _admit_locked(root, per_worker, count, spacing, details):
     global _context_lease, _context_prepaid
     prepaid = _context_prepaid
     if prepaid is not None:
-        per_worker = int(prepaid.read_text())
+        with prepaid.open() as token:
+            try:
+                fcntl.flock(token, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                per_worker = int(token.read())
+            else:
+                raise RuntimeError('EXL3 context reservation owner exited before worker admission')
     available, budget, leased, parked, reserved = _context_budget(root, per_worker)
+    needed = per_worker + 1024
     if prepaid is not None:
-        # The entire pool already passed the baseline reservation check.
-        # Rechecking it could strand a task behind its own growing siblings.
-        budget = available
+        # The pool already reserved this worker. Requiring its entire charge
+        # again strands its task behind idle siblings' RSS until pool shutdown.
+        budget, needed = available, 1024
     pressure = memory_pressure()
-    details['status'] = (f'available={available} MiB, budget={budget} MiB, needed={per_worker + 1024} MiB, '
+    details['status'] = (f'available={available} MiB, budget={budget} MiB, needed={needed} MiB, '
                          f'leases={leased}/{count}, parked={parked}, reserved={reserved} MiB; '
                          f'memory pressure some avg10={pressure:.2f} (limit {MEMORY_PSI_LIMIT:g})')
-    if (pressure > MEMORY_PSI_LIMIT or budget < per_worker + 1024
+    if (pressure > MEMORY_PSI_LIMIT or budget < needed
             or (prepaid is None and leased >= count)):
         return None
     for index in range(count):

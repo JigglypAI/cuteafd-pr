@@ -991,6 +991,8 @@ def compile_variant(payload):
     from export_b12x_exl3_aot import export
     from _export_jobs import export_slot
     import torch
+    # Admission may wait for another package; never occupy its export slot.
+    torch.cuda.current_device()
     with export_slot():
         real = torch.cuda.get_device_capability(0)
         if tuple(target_compute) == (12, 1) and real == (12, 0):
