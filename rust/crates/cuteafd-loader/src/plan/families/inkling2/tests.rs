@@ -2,10 +2,10 @@ use super::*;
 use crate::plan::{self, testing, PlanOptions};
 
 /// Pool facts from the family's real per-rank page geometry.
-fn pool_facts<'a>(cfg: &crate::families::inkling2::Inkling2Config,
-    modes: &[crate::placement::LayerMode], page_rows: u64, cards: &'a [u64],
+fn pool_facts(cfg: &crate::families::inkling2::Inkling2Config,
+    modes: &[crate::placement::LayerMode], page_rows: u64, cards: &[u64],
     context: impl Into<crate::placement::planner::Context>, requested: Option<u64>)
-    -> crate::placement::PoolFacts<'a> {
+    -> crate::placement::PoolFacts {
     let units = crate::families::inkling2::admission::pool_memory(cfg,
         crate::families::inkling2::InklingKvCache::Bf16, modes, page_rows, cards)
         .iter().map(|memory| memory.bytes_per_unit).collect::<Vec<_>>();
@@ -713,8 +713,7 @@ fn shared_recipe_charges_every_owner_once_on_one_and_two_rtx() {
             "{placement:?} on {gpus} GPUs: {} -> {}", admitted.solved.pool_tokens, grown.solved.pool_tokens);
         let explicit = grow.scoped(|| {
             let mut pinned = inputs.clone();
-            pinned.pool = crate::placement::prepare_pool(crate::placement::PoolFacts::new(
-                &vec![96 << 30; gpus], inputs.context, Some(admitted.solved.pool_tokens), inputs.page_rows())).unwrap();
+            pinned.pool = crate::placement::prepare_pool(crate::placement::PoolFacts::new(inputs.context, Some(admitted.solved.pool_tokens), inputs.page_rows())).unwrap();
             let mut exact = request.clone();
             exact.pool = crate::placement::planner::Pin::Exact(admitted.solved.pool_tokens);
             pinned.admit(exact).unwrap()

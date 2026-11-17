@@ -416,8 +416,7 @@ pub fn gather(request: &FactsRequest<'_>) -> Result<MiniMaxInputs, Refused> {
     let layer_owner = shared::layer_owners(cfg.layers, gpus);
     let rank_bytes = |gpu: usize| -> u64 { page * if heads { cfg.layers as u64 }
         else { layer_owner.iter().filter(|&&owner| usize::from(owner) == gpu).count() as u64 } };
-    let mut pool_facts = crate::placement::PoolFacts::new(&capacities,
-        Context::resolve(context, (request.context_tokens > 0).then_some(request.context_tokens)), request.pool_tokens, shared::PAGE_ROWS);
+    let mut pool_facts = crate::placement::PoolFacts::new(Context::resolve(context, (request.context_tokens > 0).then_some(request.context_tokens)), request.pool_tokens, shared::PAGE_ROWS);
     pool_facts.memory = capacities.iter().enumerate().map(|(gpu, &available_bytes)|
         crate::placement::PoolMemory { available_bytes, bytes_per_unit: rank_bytes(gpu) }).collect();
     pool_facts.target = request.target_pool_tokens;

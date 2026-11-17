@@ -275,8 +275,7 @@ impl<'a> Step5Recipe<'a> {
             .iter()
             .map(|gpu| gpu.capacity_bytes)
             .collect::<Vec<_>>();
-        let mut facts = crate::placement::PoolFacts::new(
-            &capacities, inputs.serving_context, inputs.requested_pool, PAGE_ROWS);
+        let mut facts = crate::placement::PoolFacts::new(inputs.serving_context, inputs.requested_pool, PAGE_ROWS);
         facts.memory = vec![crate::placement::PoolMemory {
             available_bytes: checked_sum(capacities.iter().copied())?,
             bytes_per_unit: pool_unit_lower_bound(cfg, gpus, inputs.context, depth,

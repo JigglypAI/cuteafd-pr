@@ -492,7 +492,7 @@ mod tests {
                 let prepared = ProductionInput {
                     blas: Vec::new(),
                     expert_usage: enabled, config: &config, gpus: ranks, context: 512,
-                    pool: crate::placement::prepare_pool(crate::placement::PoolFacts::new(&vec![96 << 30; ranks], 512, Some(4096), 512)).unwrap(), prefill: PrefillShape { rows: 128, waves: 1 },
+                    pool: crate::placement::prepare_pool(crate::placement::PoolFacts::new(512, Some(4096), 512)).unwrap(), prefill: PrefillShape { rows: 128, waves: 1 },
                     concurrency: 1, retained_turns: 0, replicated: false, spark_ranks: 4,
                     onboard_minimum: 0, onboard_counts: None, experts: vec![cost(ranks); 40],
                     workspace: 0, owners: Vec::new(), weight_arenas: Vec::new(), startup: Vec::new(), allowances: Vec::new(),
@@ -553,7 +553,7 @@ mod tests {
         let config = config();
         let input = ProductionInput {
             blas: Vec::new(),
-            expert_usage: false, config: &config, gpus: 2, context: 32768, pool: crate::placement::prepare_pool(crate::placement::PoolFacts::new(&[96 << 30; 2], 32768, Some(32768), 512)).unwrap(),
+            expert_usage: false, config: &config, gpus: 2, context: 32768, pool: crate::placement::prepare_pool(crate::placement::PoolFacts::new(32768, Some(32768), 512)).unwrap(),
             prefill: PrefillShape { rows: 128, waves: 1 }, concurrency: 1, retained_turns: 0,
             replicated: false, spark_ranks: 1, onboard_minimum: 0, onboard_counts: None,
             experts: vec![cost(2); 40], workspace: 0, owners: vec![], weight_arenas: Vec::new(), startup: vec![], allowances: vec![],
@@ -601,7 +601,7 @@ mod tests {
                 }).collect();
                 let mut prepared = ProductionInput {
                     blas: Vec::new(),
-                    expert_usage: false, config: &config, gpus: ranks, context: 512, pool: crate::placement::prepare_pool(crate::placement::PoolFacts::new(&vec![96 << 30; ranks], 512, Some(512), 512)).unwrap(),
+                    expert_usage: false, config: &config, gpus: ranks, context: 512, pool: crate::placement::prepare_pool(crate::placement::PoolFacts::new(512, Some(512), 512)).unwrap(),
                     prefill: PrefillShape { rows: 128, waves: 1 }, concurrency: 1, retained_turns: 0,
                     replicated: false, spark_ranks: 4, onboard_minimum: 0, onboard_counts: None,
                     experts: vec![cost(ranks); 40], workspace: 0, owners: vec![], weight_arenas: vec![],

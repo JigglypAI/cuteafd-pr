@@ -907,8 +907,7 @@ mod tests {
         args.validate()?;
         assert_eq!(args.max_context, 262_144);
         assert_eq!(args.pool_tokens, Some(args.max_context));
-        let policy = cuteafd_loader::placement::prepare_pool(cuteafd_loader::placement::PoolFacts::new(
-            &[96 << 30; 2], args.max_context, args.pool_tokens, 64)).unwrap();
+        let policy = cuteafd_loader::placement::prepare_pool(cuteafd_loader::placement::PoolFacts::new(args.max_context, args.pool_tokens, 64)).unwrap();
         policy.validate_explicit()?;
         assert_eq!(policy.compiled_context(), args.max_context);
         assert!(args.max_context >= 640 + u64::from(args.mtp));

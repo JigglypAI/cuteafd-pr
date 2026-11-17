@@ -12,10 +12,10 @@ use std::io::Write;
 use std::path::Path;
 
 /// Derive a fixture's finite pool domain from its simulated budgets and native slopes.
-pub fn pool_facts<'a>(cards: &'a [u64], context: impl Into<crate::placement::planner::Context>,
-    requested: Option<u64>, unit_rows: u64, rank_unit_bytes: &[u64]) -> crate::placement::PoolFacts<'a> {
+pub fn pool_facts(cards: &[u64], context: impl Into<crate::placement::planner::Context>,
+    requested: Option<u64>, unit_rows: u64, rank_unit_bytes: &[u64]) -> crate::placement::PoolFacts {
     assert_eq!(cards.len(), rank_unit_bytes.len(), "one pool slope per simulated card");
-    let mut facts = crate::placement::PoolFacts::new(cards, context, requested, unit_rows);
+    let mut facts = crate::placement::PoolFacts::new(context, requested, unit_rows);
     facts.memory = cards.iter().zip(rank_unit_bytes).map(|(&available_bytes, &bytes_per_unit)|
         crate::placement::PoolMemory { available_bytes, bytes_per_unit }).collect();
     facts

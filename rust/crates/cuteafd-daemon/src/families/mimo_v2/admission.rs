@@ -501,8 +501,7 @@ fn preflight_shape(
     use cuteafd_loader::placement::families::mimo_v2::admission::{self as contract, ProductionInput};
     use cuteafd_loader::placement::planner::{Baseline, EmbeddingHome, Operation, Phase, PrefillShape};
     let cards = memory.iter().map(|sample| sample.total_bytes).collect::<Vec<_>>();
-    let mut facts = cuteafd_loader::placement::PoolFacts::new(&cards,
-        serving_context, Some(args.pool_tokens as u64), spark_profiles.steady.pool_unit_rows);
+    let mut facts = cuteafd_loader::placement::PoolFacts::new(serving_context, Some(args.pool_tokens as u64), spark_profiles.steady.pool_unit_rows);
     facts.memory = spark_profiles.steady.devices.iter().zip(&cards).map(|(rank, &available_bytes)|
         cuteafd_loader::placement::PoolMemory { available_bytes, bytes_per_unit: rank.pool_unit_bytes }).collect();
     let pool = cuteafd_loader::placement::prepare_pool(facts)?;
@@ -1028,8 +1027,7 @@ mod tests {
             assert!(baseline.fits && grown.fits, "{:?}", grown.hints);
             assert_eq!(grown.onboard_layers, baseline.onboard_layers);
             assert!(grown.memory_layout.unwrap().pool_tokens > baseline.memory_layout.unwrap().pool_tokens);
-            let explicit = cuteafd_loader::placement::prepare_pool(cuteafd_loader::placement::PoolFacts::new(
-                &[96 << 30], 65_536, Some(1 << 20), 64)).unwrap();
+            let explicit = cuteafd_loader::placement::prepare_pool(cuteafd_loader::placement::PoolFacts::new(65_536, Some(1 << 20), 64)).unwrap();
             assert_eq!(explicit.capacity_policy(16).pool_tokens, Some(1 << 20));
             Ok(())
         })

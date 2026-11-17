@@ -26,7 +26,7 @@ pub fn admit_dual(request: Request, budgets: Vec<Budget>, facts: DenseFacts<'_>)
         .any(|location| matches!(location.device, Device::Coordinator(_))))
         .map(|budget| budget.logical_bytes).collect::<Vec<_>>();
     let requested = match request.pool { Pin::Auto => None, Pin::Exact(tokens) => Some(tokens) };
-    let mut pool_facts = crate::placement::PoolFacts::new(&cards, request.context, requested, PAGE_ROWS);
+    let mut pool_facts = crate::placement::PoolFacts::new(request.context, requested, PAGE_ROWS);
     // A whole-layer cut gives either rank a contiguous run of full-attention
     // layers. Sum memory against the checkpoint's total record slope to bound
     // every legal cut, exactly as the single-owner page geometry prices it.

@@ -31,9 +31,7 @@ impl CoordinatorCard {
 
 /// Geometry and operator inputs, before the shared placement preparation resolves policy.
 #[derive(Debug, Clone)]
-pub struct PoolFacts<'a> {
-    /// Logical per-card ceilings; a capped PRO intentionally simulates a small card.
-    pub card_bytes: &'a [u64],
+pub struct PoolFacts {
     pub context: super::planner::Context,
     pub requested: Option<u64>,
     pub target: Option<u64>,
@@ -50,16 +48,16 @@ pub struct PoolMemory {
     pub bytes_per_unit: u64,
 }
 
-impl<'a> PoolFacts<'a> {
-    pub fn new(card_bytes: &'a [u64], context: impl Into<super::planner::Context>,
+impl PoolFacts {
+    pub fn new(context: impl Into<super::planner::Context>,
         requested: Option<u64>, unit_rows: u64) -> Self {
-        Self { card_bytes, context: context.into(), requested, target: None,
+        Self { context: context.into(), requested, target: None,
             unit_rows, encoding_limit: None, memory: Vec::new() }
     }
 }
 
 /// The only policy resolution entry point for plan and runtime preparation.
-pub fn prepare_pool(facts: PoolFacts<'_>) -> Result<PoolPolicy, cuteafd_core::memory_policy::PolicyError> {
+pub fn prepare_pool(facts: PoolFacts) -> Result<PoolPolicy, cuteafd_core::memory_policy::PolicyError> {
     let mut policy = MemoryPolicy::current();
     policy.kv_target = facts.target.or(policy.kv_target);
     let bounds = policy.kv(facts.context.maximum)?;
@@ -142,9 +140,7 @@ impl PoolPolicy {
         }
     }
 
-    /// `card_bytes` are the coordinator GPUs' totals; `context` the compiled
-    /// serving context; `requested` 0 or `None` means automatic. KV target,
-    /// min and max come from the installed memory policy.
+    /// Retained policy bounds; a zero or omitted request selected automatic sizing.
     pub fn bounds(&self) -> cuteafd_core::memory_policy::KvBounds {
         cuteafd_core::memory_policy::KvBounds { target: self.target, min: self.floor, max: self.max }
     }
@@ -192,8 +188,7 @@ mod tests {
 
     #[test]
     fn preparation_derives_unbounded_extent_and_respects_explicit_cap() {
-        let cards = [96 << 30];
-        let mut facts = PoolFacts::new(&cards, 262_144, None, 64);
+        let mut facts = PoolFacts::new(262_144, None, 64);
         facts.memory = vec![PoolMemory { available_bytes: 80 << 30, bytes_per_unit: 64 * 1024 }];
         let pool = MemoryPolicy::default().scoped(|| prepare_pool(facts.clone())).unwrap();
         assert_eq!(pool.max(), None);
@@ -204,7 +199,7 @@ mod tests {
         assert_eq!(capped.maximum_tokens(), pool.maximum_tokens().min(100_000_000));
         facts.target = Some(3 << 20);
         assert_eq!(prepare_pool(facts).unwrap().target(), 3 << 20);
-        assert!(prepare_pool(PoolFacts::new(&cards, 262_144, None, 64)).is_err());
+        assert!(prepare_pool(PoolFacts::new(262_144, None, 64)).is_err());
     }
 
     #[test]
@@ -224,15 +219,15 @@ mod tests {
 
     #[test]
     fn explicit_pool_rounds_once_and_preserves_raw_context_refusals() {
-        let pool = prepare_pool(PoolFacts::new(&[96 << 30], 4096, Some(4097), 256)).unwrap();
+        let pool = prepare_pool(PoolFacts::new(4096, Some(4097), 256)).unwrap();
         assert_eq!(pool.requested(), Some(4352));
         assert_eq!(pool.raw_requested(), Some(4097));
         assert_eq!(pool.maximum_tokens(), 4352);
         assert_eq!(pool.capacity_policy(16).pool_tokens, Some(4352));
-        let short = prepare_pool(PoolFacts::new(&[96 << 30], 4096, Some(4095), 256)).unwrap();
+        let short = prepare_pool(PoolFacts::new(4096, Some(4095), 256)).unwrap();
         assert_eq!(short.requested(), Some(4095));
         assert!(short.validate_explicit().is_err());
-        assert!(matches!(prepare_pool(PoolFacts::new(&[96 << 30], 4096, Some(u64::MAX), 256)),
+        assert!(matches!(prepare_pool(PoolFacts::new(4096, Some(u64::MAX), 256)),
             Err(cuteafd_core::memory_policy::PolicyError::PoolAlignment { .. })));
     }
 

@@ -15,8 +15,8 @@ fn cfg() -> GlmDsaConfig {
 }
 
 /// Pool facts from the family's real per-rank page geometry.
-fn pool_facts<'a>(cfg: &GlmDsaConfig, cards: &'a [u64], context: impl Into<planner::Context>,
-    requested: Option<u64>, unit_rows: u64) -> crate::placement::PoolFacts<'a> {
+fn pool_facts(cfg: &GlmDsaConfig, cards: &[u64], context: impl Into<planner::Context>,
+    requested: Option<u64>, unit_rows: u64) -> crate::placement::PoolFacts {
     let cache = match cfg.variant.ml4() {
         Some(ml4) => crate::serving_capacity::mistral_large4_cache_geometry(ml4, cards.len()).unwrap(),
         None => crate::serving_capacity::glm_cache_geometry(cfg, cfg.layers, cards.len()).unwrap(),
@@ -2474,8 +2474,7 @@ fn prepared_pool_survives_policy_scope_and_matches_sampled_admission() {
             let mut exact = req.clone();
             exact.pool = Pin::Exact(default.solved.pool_tokens);
             let mut pinned = production_input(&cfg, gpus, 4, PrefillShape { rows: 128, waves: 3 });
-            pinned.pool = crate::placement::prepare_pool(crate::placement::PoolFacts::new(
-                &vec![96 << 30; gpus], exact.context, Some(default.solved.pool_tokens), if gpus == 2 { 128 } else { 64 })).unwrap();
+            pinned.pool = crate::placement::prepare_pool(crate::placement::PoolFacts::new(exact.context, Some(default.solved.pool_tokens), if gpus == 2 { 128 } else { 64 })).unwrap();
             assert_eq!(pinned.prepare().unwrap().admit(exact).unwrap().solved.pool_tokens, default.solved.pool_tokens);
         }
     }

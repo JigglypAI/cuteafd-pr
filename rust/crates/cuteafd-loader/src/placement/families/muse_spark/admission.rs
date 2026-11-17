@@ -1076,8 +1076,8 @@ mod contract_tests {
     use super::*;
 
     /// Pool facts from the family's real per-rank page geometry.
-    fn pool_facts<'a>(cfg: &MuseSparkConfig, cards: &'a [u64], context: impl Into<Context>,
-        requested: Option<u64>) -> crate::placement::PoolFacts<'a> {
+    fn pool_facts(cfg: &MuseSparkConfig, cards: &[u64], context: impl Into<Context>,
+        requested: Option<u64>) -> crate::placement::PoolFacts {
         let cache = crate::families::muse_spark::cache::MuseCacheLayout::with_format(cfg, cards.len(),
             crate::families::muse_spark::cache::MuseKvCache::Bf16).unwrap();
         let units = cache.geometry.ranks.iter().map(|rank| rank.persistent_unit_bytes).collect::<Vec<_>>();

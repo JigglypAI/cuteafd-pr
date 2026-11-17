@@ -91,8 +91,7 @@ pub(crate) fn admit(options: Options<'_>) -> Result<shared::AdmittedMuse> {
     let capacities = options.measured.iter().map(|sample| sample.total_bytes).collect::<Vec<_>>();
     let cache = cuteafd_loader::families::muse_spark::cache::MuseCacheLayout::with_format(options.cfg,
         gpus, options.kv_cache)?;
-    let mut facts = cuteafd_loader::placement::PoolFacts::new(
-        &capacities, cuteafd_loader::placement::planner::Context::resolve(context, options.max_context),
+    let mut facts = cuteafd_loader::placement::PoolFacts::new(cuteafd_loader::placement::planner::Context::resolve(context, options.max_context),
         options.pool_tokens, shared::PAGE_ROWS);
     facts.memory = cache.geometry.ranks.iter().zip(&capacities).map(|(rank, &available_bytes)|
         cuteafd_loader::placement::PoolMemory { available_bytes, bytes_per_unit: rank.persistent_unit_bytes }).collect();

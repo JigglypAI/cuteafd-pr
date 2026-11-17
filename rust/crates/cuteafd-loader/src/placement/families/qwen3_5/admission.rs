@@ -112,7 +112,7 @@ pub fn admit(request: Request, mut budgets: Vec<Budget>, facts: DenseFacts<'_>)
         .any(|location| matches!(location.device, Device::Coordinator(_))))
         .map(|budget| budget.logical_bytes).collect::<Vec<_>>();
     let requested = match request.pool { Pin::Auto => None, Pin::Exact(tokens) => Some(tokens) };
-    let mut pool_facts = crate::placement::PoolFacts::new(&cards, request.context, requested, PAGE_ROWS);
+    let mut pool_facts = crate::placement::PoolFacts::new(request.context, requested, PAGE_ROWS);
     // One rank holds every full-attention layer's records: the same page
     // geometry the runtime prefix cache and the KV owners are priced from.
     let page_bytes = super::host_prefix_geometry(facts.cfg, facts.record_bytes, 0).page_bytes;

@@ -845,9 +845,6 @@ pub fn solve(
     budgets: Vec<Budget>,
     recipe: &impl Recipe,
 ) -> Result<ResolvedPlan, Refusal> {
-    let cards = budgets.iter().filter(|budget| budget.locations.iter()
-        .any(|location| matches!(location.device, Device::Coordinator(_))))
-        .map(|budget| budget.logical_bytes).collect::<Vec<_>>();
     let requested = match request.pool { Pin::Auto => None, Pin::Exact(tokens) => Some(tokens) };
     // Generic solver fixtures declare their exact finite curve domain. Shipping
     // family paths prepare their memory-bounded policy before building curves.
@@ -860,7 +857,7 @@ pub fn solve(
             return Err(Refusal::MisalignedPool { tokens, page_rows: contract.page_rows });
         }
     }
-    let mut facts = crate::placement::PoolFacts::new(&cards, request.context, requested, contract.page_rows);
+    let mut facts = crate::placement::PoolFacts::new(request.context, requested, contract.page_rows);
     facts.encoding_limit = contract.maximum_pages.checked_mul(contract.page_rows);
     let pool = crate::placement::prepare_pool(facts)
         .map_err(|error| Refusal::InvalidFact(error.to_string()))?;

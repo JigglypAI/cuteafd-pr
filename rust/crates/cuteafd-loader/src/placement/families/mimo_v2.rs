@@ -242,8 +242,7 @@ mod tests {
             expert_usage: false,
             blas_head: crate::placement::planner::serving::BlasHead::Native, draft_head: false,
             cfg, layers: 4, kv: MimoKvFormats::default(), mtp_stages: 0, context,
-            pool: crate::placement::prepare_pool(crate::placement::PoolFacts::new(
-                &[96 << 30; 2][..ranks], context, Some(context), spark.pool_unit_rows)).unwrap(),
+            pool: crate::placement::prepare_pool(crate::placement::PoolFacts::new(context, Some(context), spark.pool_unit_rows)).unwrap(),
             prefill: crate::placement::planner::PrefillShape { rows: 4096, waves: 3 },
             lanes: 3, embedding: crate::placement::planner::EmbeddingHome::Device(0),
             gpus: ranks, spark_ranks: 6,
@@ -591,8 +590,7 @@ mod tests {
         let (cfg, spark, no_spark) = fixture(1, 4096);
         let mut facts = input(&cfg, &spark, &no_spark, 1, 4096);
         let page = spark.pool_unit_rows;
-        facts.pool = crate::placement::prepare_pool(crate::placement::PoolFacts::new(
-            &[96 << 30], 4096, Some(4097), page)).unwrap();
+        facts.pool = crate::placement::prepare_pool(crate::placement::PoolFacts::new(4096, Some(4097), page)).unwrap();
         let prepared = facts.prepare().unwrap();
         let request = admission::production_request(4096, Some(4097), Onboard::Auto,
             prepared.recipe.prefill, crate::placement::planner::Operation::Serving,

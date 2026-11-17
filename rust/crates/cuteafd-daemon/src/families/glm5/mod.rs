@@ -1191,7 +1191,7 @@ impl Opened {
             cuteafd_loader::serving_capacity::mistral_large4_cache_geometry(ml4, 1)?
         } else { cuteafd_loader::serving_capacity::glm_cache_geometry(&self.cfg, layers, 1)? };
         let unit = cache.ranks[0].persistent_unit_bytes;
-        let mut pool_facts = cuteafd_loader::placement::PoolFacts::new(&card_bytes, *serving_context,
+        let mut pool_facts = cuteafd_loader::placement::PoolFacts::new(*serving_context,
             requested_pool, page_tokens);
         // Whole-layer attention splits the replicated record slope between the
         // cards; heads and context keep the whole latent pool on each.

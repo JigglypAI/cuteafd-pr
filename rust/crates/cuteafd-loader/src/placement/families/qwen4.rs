@@ -230,7 +230,7 @@ impl<'a> QwenSingle<'a> {
         }
         let requested = inputs.requested_pool;
         let cards = [inputs.capacity_bytes];
-        let mut facts = PoolFacts::new(&cards, inputs.context, requested, page);
+        let mut facts = PoolFacts::new(inputs.context, requested, page);
         let a = &inputs.admission;
         let geometry = crate::serving_capacity::qwen_cache_geometry(a.cfg, a.layers, a.mtp, a.kv_format)
             .map_err(|error| Refusal::InvalidFact(format!("Qwen cache geometry: {error}")))?;
@@ -912,7 +912,7 @@ impl<'a> QwenDual<'a> {
         }
         let requested = inputs.requested_pool;
         let cards = inputs.gpus.map(|gpu| gpu.capacity_bytes);
-        let mut facts = PoolFacts::new(&cards, inputs.context, requested, page);
+        let mut facts = PoolFacts::new(inputs.context, requested, page);
         let compute = |layers, mtp| crate::serving_capacity::qwen_cache_geometry(
             a.cfg, layers, mtp, a.kv_format)
             .map_err(|error| Refusal::InvalidFact(format!("Qwen cache geometry: {error}")));
