@@ -193,6 +193,10 @@ impl<'a> Backend<'a> for InklingBackend<'a> {
         Ok((self.family.clone(), cache))
     }
     fn prepare(&self, job: NativeRequest, tokens: Vec<u32>) -> Result<(scheduler::Prompt, RequestMedia, Vec<EncodeJob>)> {
+        if self.vision.is_none() {
+            ensure!(job.media.is_empty() && job.image_groups.is_empty(), "vision is disabled");
+            return crate::shared::vision::still::Binding::prepare(job, tokens, u32::try_from(self.vocab)?, 4608, self.context, 0, vec![]);
+        }
         self.vision.as_ref().context("Inkling media binding absent")?.prepare(job, tokens,
             u32::try_from(self.vocab)?, 4608, self.context)
     }

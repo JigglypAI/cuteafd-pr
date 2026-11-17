@@ -518,6 +518,10 @@ impl<'e, 'a> Backend<'a> for Step5Backend<'e, 'a> {
         Ok((family, cache))
     }
     fn prepare(&self, job: NativeRequest, tokens: Vec<u32>) -> Result<(scheduler::Prompt, RequestMedia, Vec<EncodeJob>)> {
+        if self.vision.is_none() {
+            ensure!(job.media.is_empty() && job.image_groups.is_empty(), "vision is disabled");
+            return crate::shared::vision::still::Binding::prepare(job, tokens, V as u32, H, self.context, 0, vec![]);
+        }
         self.vision.as_ref().context("Step-5 media binding absent")?.prepare(job, tokens, V as u32, H, self.context)
     }
     fn probe_features(&self, _: &scheduler::Prompt, _: &mut RequestMedia, _: &mut EmbeddingCache, _: &Path) -> Result<()> { Ok(()) }

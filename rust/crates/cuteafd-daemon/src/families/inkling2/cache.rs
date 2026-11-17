@@ -126,7 +126,7 @@ impl<'a> CacheBank<'a> {
 }
 /// Logical pages and frontiers belong to the shared scheduler. Mutable model
 /// bytes stay in the bank and are never reconstructed from a continuation.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub(crate) struct Placement {
     pub units: Vec<u32>,
     pub slot: usize,

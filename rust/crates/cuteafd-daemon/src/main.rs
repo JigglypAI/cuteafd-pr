@@ -52,6 +52,10 @@ struct ServeMedia<'a> {
 
 fn serve_media(command: &mut Commands) -> Option<ServeMedia<'_>> {
     match command {
+        Commands::ServeInkling2(args) => Some(ServeMedia { snapshot: &args.snapshot,
+            vision: &mut args.vision.vision, audio: None }),
+        Commands::ServeStep5(args) => Some(ServeMedia { snapshot: &args.snapshot,
+            vision: &mut args.vision.vision, audio: None }),
         Commands::ServeMimo(args) => Some(ServeMedia { snapshot: &args.engine.snapshot,
             vision: &mut args.vision, audio: Some(&mut args.audio) }),
         Commands::ServeMuse(args) => Some(ServeMedia { snapshot: &args.snapshot,

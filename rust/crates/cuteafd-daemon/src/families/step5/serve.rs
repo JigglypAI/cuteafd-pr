@@ -67,7 +67,7 @@ fn resident_budget(peak: usize, workspace: usize) -> Result<usize> {
 #[derive(Debug, Clone, clap::Args)]
 pub(crate) struct ServeArgs {
     #[command(flatten)]
-    vision: crate::shared::vision::still::Options,
+    pub(crate) vision: crate::shared::vision::still::Options,
     /// Replay bounded persistent decode/verify sections (prefill remains eager).
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     decode_graphs: bool,
