@@ -260,7 +260,10 @@ pub(crate) trait PrefixDevice {
     fn restore(&self, mark: Option<MarkSlot>, placement: &mut GlmPlacement, len: usize) -> Result<(), BoxError>;
     fn bind(&self, placement: &mut GlmPlacement) -> Result<(), BoxError>;
     fn discard(&self, placement: &mut GlmPlacement) -> Result<(), BoxError>;
-    fn quarantine_draft_pages(&self, placement: &GlmPlacement) { let _ = placement; }
+    fn quarantine_draft_pages(&self, placement: &GlmPlacement) {
+        let _ = placement;
+        debug_assert_eq!(self.draft_page_bytes(), 0, "pooled GLM drafter requires quarantine");
+    }
     fn draft_page_bytes(&self) -> usize;
     fn admit_draft_pages(&self, placement: &mut GlmPlacement, capacity: usize) -> Result<(), BoxError>;
     fn draft_pages_valid(&self, attachment: &cuteafd_engine::prefix::DraftPageAttachment) -> bool;
