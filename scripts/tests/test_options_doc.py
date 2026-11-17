@@ -525,8 +525,14 @@ def test_mc_fp8_lever_reports_measured_glm_and_step_quality_costs():
     assert "no paired non-inferiority claim" in text
 
 
-def test_kimi_accepts_existing_shared_draft_policy_key():
-    assert "DRAFT_POLICY" in family_keys("kimi_k3")
-    assert MATRIX["DRAFT_POLICY"]["Kimi K3"]
+def test_every_family_accepts_the_shared_draft_policy_key():
     launcher = (ROOT / "scripts/launch/run-family.sh").read_text()
-    assert 'CUTEAFD_DRAFT_POLICY=$(get DRAFT_POLICY)' in launcher
+    assert "DRAFT_POLICY must be history or off" in launcher
+    assert "CUTEAFD_DRAFT_POLICY" not in launcher
+    for removed in ("DRAFT_SURVIVAL_LENGTHS", "DRAFT_ROW_COST"):
+        assert removed not in MATRIX and removed not in launcher
+    assert all(MATRIX["DRAFT_POLICY"].values())
+    for family in ("deepseek_v4", "glm5", "glm5_flash", "mimo_v2", "qwen4", "qwen3_5", "kimi_k3", "step5",
+                   "muse_spark", "minimax_m3", "inkling2"):
+        assert "DRAFT_POLICY" in family_keys(family), family
+

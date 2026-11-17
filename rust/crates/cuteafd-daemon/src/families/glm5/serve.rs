@@ -284,12 +284,11 @@ fn serve_loop(resolved: super::ResolvedEngineArgs, mut receive: mpsc::Receiver<N
         let mut hub = Some(console::hub(console_text, || Ok(layout)));
         media_push.commit()?;
         anyhow::ensure!(transport.is_some() || engine.skip_routed() || engine.has_local(), "serve-glm needs Spark peers, local TP2 or --skip-routed-experts");
-        let ranks = args.peers.as_deref().map_or(4, |peers| peers.split(',').count());
         let spark = transport.is_some();
         console::layer_classes(engine.weights.layers.iter().map(|l| console::layer_class(l.dense, spark)).collect());
         anyhow::ensure!(preparer.is_none() || media.encoder().available(), "vision encoder unavailable before readiness");
         schedule(engine, &opened, &mut receive, transport, runtime, &stats, max_sequences, policy,
-            ranks, &prefix, loop_abort, args.token_io.token_select, &mut media, expander.as_ref(), || {
+            &prefix, loop_abort, args.token_io.token_select, &mut media, expander.as_ref(), || {
                 if let Some(ready) = ready.take() {
                     let _ = ready.send(Ok((engine.max_context, preparer.clone().map(|p| (p, health.clone())), hub.take().expect("console hub"))));
                 }
@@ -637,7 +636,7 @@ fn publish(stats: &Mutex<serde_json::Value>, requests: u64, generated: u64, acti
 #[allow(clippy::too_many_arguments)]
 fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receiver<NativeRequest>,
     mut transport: Option<&mut SparkLink<'_>>, runtime: &tokio::runtime::Runtime, stats: &Mutex<serde_json::Value>,
-    max_sequences: usize, policy: Policy, ranks: usize, prefix: &PrefixArgs,
+    max_sequences: usize, policy: Policy, prefix: &PrefixArgs,
     loop_abort: crate::shared::loop_abort::LoopAbortConfig, select: SelectPlacement,
     media: &mut MediaAdmission<ml4_media::Prompt, ml4_media::Encoder>,
     expander: Option<&cuteafd_loader::media::MistralSpanExpander>, ready: impl FnOnce()) -> Result<()> {
@@ -1079,7 +1078,7 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
         let cycle = Instant::now();
         let Some(finished) = runtime.block_on(lanes.run_one(|lease| decode_round(lease, engine, opened,
             &mut transport, runtime, &mut phases, &mut active, &mut shared, &mut selector, &family, &mut cache,
-            &mut free_slots, &mut trace, cycle)))? else { continue };
+            &mut free_slots, &mut trace)))? else { continue };
         for index in (0..active.len()).rev() {
             if !finished[index] {
                 continue;
@@ -1154,7 +1153,7 @@ async fn decode_round(lease: LaneLease<'_>, engine: &GlmEngine<'_>, opened: &Ope
     transport: &mut Option<&mut SparkLink<'_>>, runtime: &tokio::runtime::Runtime, phases: &mut [f64; 8],
     active: &mut Vec<Active<'_>>, shared: &mut Option<DraftPolicy>,
     selector: &mut TokenSelector<'_>, family: &GlmPrefix<'_, '_>, cache: &mut PrefixCache<CudaCopyEngine<'_>>,
-    free_slots: &mut Vec<usize>, trace: &mut Option<Trace>, cycle: Instant) -> Result<Option<Vec<bool>>> {
+    free_slots: &mut Vec<usize>, trace: &mut Option<Trace>) -> Result<Option<Vec<bool>>> {
     let drafter = engine.drafter.as_ref();
     let mut tally = console::Step::begin(lease.index());
     let (phases_before, engine_before) = (*phases, tally.live().then(|| *engine.profile.borrow()));

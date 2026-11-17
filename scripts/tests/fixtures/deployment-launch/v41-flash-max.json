@@ -56,8 +56,6 @@
       "-e",
       "CUTEAFD_V41_IMAGE_ADMISSIONS=2",
       "-e",
-      "CUTEAFD_DRAFT_SURVIVAL_LENGTHS=0",
-      "-e",
       "CUTEAFD_SPARK_INTAKE=auto",
       "-e",
       "CUTEAFD_CONSOLE_TEXT=true",

@@ -490,10 +490,6 @@ fn tp2_input(experts: &dyn RtxExpertLayer, wire: *mut c_void, hidden: *mut c_voi
     if experts.uses_fp8_input() { ExpertInput::Fp8K32(wire) } else { ExpertInput::Bf16(hidden) }
 }
 
-fn tp2_weight_read_bytes(ranks: [&dyn RtxExpertLayer; 2]) -> Result<usize> {
-    ranks.into_iter().try_fold(0, |largest, rank| Ok(largest.max(rank.weight_read_bytes()?)))
-}
-
 /// Per-program GPU times (CUTEAFD_GLMF_PROFILE_OPS=1): timing events around
 /// every launch, read back by [`GlmfEngine::op_profile`].
 #[derive(Default)]

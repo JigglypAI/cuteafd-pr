@@ -1996,7 +1996,6 @@ mod tests {
             index_cache: Some(crate::families::glm5_flash::engine::IndexCache::Keys),
             replay_records: Some(crate::cli::PlanReplayRecords::Own),
             concurrency: 8,
-            draft_length: None,
             tp2_dspark_experts: false,
             tp2_dflash: None,
             state_slots: None,

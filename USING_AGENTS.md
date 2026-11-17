@@ -136,7 +136,7 @@ nice 19 with 16 jobs (`CARGO_BUILD_JOBS=16`, `RUST_TEST_THREADS=16`).
   matched pair cannot decide C8 there. Use 3 interleaved pairs with
   alternating order, plus a fixed-policy control (`DRAFT_LENGTH=5`).
   Fixed mode is shared by every family; native head width and the step row
-  budget cap the requested length. Unset remains adaptive (V4.1 maximum 5).
+  budget cap the requested length. Unset follows `DRAFT_POLICY` (`history`).
   A shared-build toggle (`--arm-wip`) isolates a flag from the build.
 - **Judge on the paired median**, not on the ratio of arm medians, and report
   the raw pairs and their order.

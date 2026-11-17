@@ -1006,39 +1006,6 @@ impl<'a> MimoEngine<'a> {
         Some(observe(routes, &times))
     }
 
-    fn draft_group(&self, layer: usize, rows: usize,
-        reports: &[cuteafd_transport::worker_selection::InstalledExpertGrouping])
-        -> Result<(usize, cuteafd_transport::worker_selection::ExpertTrafficContract)> {
-        if self.tp2_layer(layer) {
-            let tp2 = self.tp2.as_ref().context("MiMo TP2")?;
-            let group = tp2.ranks[0].borrow().weight_read_group(rows)?;
-            ensure!(tp2.ranks[1].borrow().weight_read_group(rows)? == group,
-                "MiMo TP2 ranks disagree on installed expert grouping");
-            return Ok(group);
-        }
-        if let Some(local) = self.rtx_local.as_ref().filter(|local| local.index_of(layer).is_ok()) {
-            return local.weight_read_group(rows, true);
-        }
-        match &self.experts {
-            Some(Experts::Local(local)) => local.weight_read_group(rows, !local.wire_input()),
-            Some(Experts::Streamed { experts, .. }) => {
-                let local = experts.borrow();
-                local.weight_read_group(rows, !local.wire_input())
-            }
-            Some(Experts::Spark { .. }) => {
-                let group = crate::shared::draft::resource::worker_group_rows_for_input(
-                    reports, layer, rows, self.expert_bf16_input(true))?;
-                let mut contracts = reports.iter().filter(|report| report.layers().iter()
-                    .any(|range| (range.first as usize..range.end as usize).contains(&layer)))
-                    .map(|report| report.traffic_contract());
-                let contract = contracts.next().with_context(|| format!("installed MiMo worker missing layer {layer}"))?;
-                ensure!(contracts.all(|other| other == contract), "MiMo workers disagree on installed traffic contract");
-                Ok((group, contract))
-            }
-            Some(Experts::Skip) | None => anyhow::bail!("MiMo routed layer {layer} has no installed expert owner"),
-        }
-    }
-
     fn probe_mark(&self, index: usize) -> Result<()> {
         if self.graphs_warming.get() { return Ok(()); }
         if let Some(probe) = self.draft_probe.borrow_mut().as_mut() {

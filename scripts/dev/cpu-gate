@@ -26,8 +26,8 @@ user is in the docker group. Don't pass -p SupplementaryGroups=docker: a user
 manager can't set supplementary groups and the unit fails with 216/GROUP.
 
 With none of --cargo, --scripts, --benches the first two run. --benches runs
-the release host-cost bounds (BENCHES: the draft policy's select median at the
-V4.1 C16 geometry under CUTEAFD_POLICY_BENCH_MAX_US) as their own suite,
+the release host-cost bounds (BENCHES: the draft policy's round median at C16
+under CUTEAFD_POLICY_BENCH_MAX_US) as their own suite,
 recording each bench's medians. Everything lives under
 ~/.cache/cuteafd/builds/NAME (asserted build filesystem): the Cargo target
 (fresh target-cpu-gate-kache/plain directories), TMPDIR and
@@ -159,7 +159,7 @@ CARGO_PANIC_ID = re.compile(r"^---- (\S+) stdout ----$", re.M)
 PYTEST_SUMMARY = re.compile(r'^=*\s*(.*?\b(?:passed|failed|error|errors|no tests ran)\b.*?) in [\d.]+s', re.M)
 PYTEST_FAIL = re.compile(r'^(?:FAILED|ERROR) (\S+)', re.M)
 # Release benches with a bound: (crate, label, test target, test-name filter, environment).
-BENCHES = (('cuteafd-core', 'draft_policy_bench', 'all', 'draft_policy_host_cost_per_round',
+BENCHES = (('cuteafd-core', 'draft_history_bench', 'all', 'draft_history_host_cost_per_round',
             {'CUTEAFD_POLICY_BENCH_MAX_US': '1200'}),)
 BENCH_MEDIANS = re.compile(r'medians: (.*?)(?:, total|$)', re.M)
 BENCH_VALUE = re.compile(r'(\w+) ([\d.]+) us')

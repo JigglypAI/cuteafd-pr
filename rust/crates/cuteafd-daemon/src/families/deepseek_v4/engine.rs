@@ -1899,20 +1899,11 @@ impl<'a> Engine<'a> {
         self.tp2.as_ref().map_or_else(|| self.local.borrow().as_ref().map_or(0, |l| l.layers().len()), |t| t.layers.last().map_or(0, |id| id + 1))
     }
 
-    pub(crate) fn local_expert_tp(&self) -> usize { if self.tp2.is_some() { 2 } else { 1 } }
-
     pub fn install_local(&mut self, local: Option<super::local::LocalExperts<'a>>) -> Result<()> {
         ensure!(local.as_ref().is_none_or(|local| local.layers().iter().copied().eq(0..local.layers().len())),
             "V4 local experts currently require a prefix starting at layer 0");
         *self.local.borrow_mut() = local;
         Ok(())
-    }
-
-    pub(crate) fn local_group_rows(&self, rows: usize) -> Result<usize> {
-        match &self.tp2 {
-            Some(tp2) => tp2.group_rows(rows),
-            None => self.local.borrow().as_ref().context("local experts")?.group_rows(rows),
-        }
     }
 
     pub(crate) fn arm_draft_probe(&self) -> Result<()> {

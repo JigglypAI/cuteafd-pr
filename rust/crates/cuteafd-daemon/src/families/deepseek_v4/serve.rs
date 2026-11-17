@@ -442,7 +442,6 @@ fn speculative_step(
     selector: &mut TokenSelector<'_>,
     caching: bool,
     shape: &mut StepShape,
-    cycle: Instant,
 ) -> Result<Vec<bool>> {
     let limits: Vec<usize> = active.iter().map(|a| if probe::no_speculation(&a.job.probe) { 0 } else {
         engine.decode_rows.saturating_sub(active.len())
@@ -1111,7 +1110,7 @@ async fn decode_round(lease: LaneLease<'_>, engine: &super::engine::Engine<'_>, 
     // Undrafted rounds use the same route and resource observations.
     let step = if let Some(shared) = shared.as_mut() {
         speculative_step(engine, active, shared, &mut lane.rounds, eos,
-            transports, runtime, selector, caching, &mut shape, cycle)
+            transports, runtime, selector, caching, &mut shape)
     } else {
         let sequences: Vec<Vec<u32>> = active.iter().map(|a| vec![a.next]).collect();
         let starts: Vec<usize> = active.iter().map(|a| a.placement.len).collect();

@@ -608,9 +608,6 @@ pub(crate) struct PlanArgs {
     /// Concurrent sequences for --layout (0: family serving default; otherwise 8 at <=32 GiB, 16 above).
     #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(u64).range(0..=64))]
     pub(crate) concurrency: u64,
-    /// Fixed draft length for --layout (otherwise DRAFT_LENGTH or adaptive).
-    #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
-    pub(crate) draft_length: Option<u64>,
     /// V4.1 native dSpark routed-expert TP2; requires --layout, --rtx 2 and dSpark.
     #[arg(long, requires = "layout")]
     pub(crate) tp2_dspark_experts: bool,
@@ -1303,7 +1300,7 @@ mod tests {
         assert_eq!(args.prefix.reserve.limits(1_048_576).unwrap().output(), 131_072);
         assert_eq!(args.concurrency, 16);
         assert_eq!(args.resolved_prefix_entries(), 20);
-        assert_eq!(args.draft_length.effective(5), 5);
+        assert_eq!(args.draft_length.effective(7), 7);
         assert!(!args.adaptive_dspark()); // Target-only remains target-only.
         for (flags, adaptive) in [
             (vec!["--dspark"], true),
@@ -1321,18 +1318,20 @@ mod tests {
             &["--dspark", "--dspark-reuse-floor", "0.5"]] {
             assert!(super::Cli::try_parse_from(base.into_iter().chain(removed.iter().copied())).is_err());
         }
+        // Unset verifies up to the drafter's native seven-token block.
         for (flags, expected) in [
-            (vec!["--dspark"], 5),
-            (vec!["--dspark", "--rtx-gpus", "1"], 5),
-            (vec!["--dspark", "--rtx-gpus", "2"], 5),
+            (vec!["--dspark"], 7),
+            (vec!["--dspark", "--rtx-gpus", "1"], 7),
+            (vec!["--dspark", "--rtx-gpus", "2"], 7),
             (vec!["--dspark", "--rtx-gpus", "2", "--draft-length", "5"], 5),
             (vec!["--dspark", "--draft-length", "5", "--rtx-gpus", "2"], 5),
             (vec!["--dspark", "--draft-length", "5"], 5),
             (vec!["--dspark", "--rtx-gpus", "2", "--draft-length", "7"], 7),
+            (vec!["--dspark", "--draft-policy", "off"], 0),
         ] {
             let super::Commands::ServeNative(args) = super::Cli::try_parse_from(
                 base.into_iter().chain(flags)).unwrap().command else { panic!("expected native serving"); };
-            assert_eq!(args.draft_length.draft_length.unwrap_or(5).min(7), expected);
+            assert_eq!(args.draft_length.effective(cuteafd_core::MAX_DSPARK_PROPOSALS), expected);
         }
         for limit in ["1", "2", "3", "4", "5", "6", "7"] {
             assert!(super::Cli::try_parse_from(base.into_iter().chain(["--draft-length", limit])).is_ok());

@@ -320,10 +320,9 @@ fn serve_loop(mut args: super::EngineArgs, mut receive: mpsc::Receiver<NativeReq
         anyhow::ensure!(engine.has_expert_homes(), "serve-glmf needs an admitted home for every routed layer");
         anyhow::ensure!(preparer.is_none() || media.encoder().available(), "vision encoder unavailable before readiness");
         let _capture_session = crate::shared::decode_graph::CaptureWatch::session();
-        let ranks = args.peers.as_deref().map(|peers| peers.split(',').count());
         let spark = matches!(engine.experts(), Some(super::engine::Experts::Spark { .. }));
         console::layer_classes(engine.weights.layers.iter().map(|l| console::layer_class(l.dense, spark)).collect());
-        schedule(engine, &opened, &args.snapshot, &mut receive, &stats, lanes, policy, ranks, decode_share, &prefix,
+        schedule(engine, &opened, &args.snapshot, &mut receive, &stats, lanes, policy, decode_share, &prefix,
             loop_abort, (args.prefix_marks, args.mark_arena), args.token_io.token_select, &mut media, preparer.as_deref(),
             || {
                 // Ready once the prefix cache and the token selector exist: the ledger then lists
@@ -829,7 +828,7 @@ pub(crate) const MESSAGE_STARTS: [&str; 4] = ["<|system|>", "<|user|>", "<|assis
 #[allow(clippy::too_many_arguments)]
 fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path,
     receive: &mut mpsc::Receiver<NativeRequest>, stats: &Mutex<serde_json::Value>, max_sequences: usize,
-    policy: Policy, ranks: Option<usize>, decode_share: DecodeShareArgs, prefix: &PrefixArgs,
+    policy: Policy, decode_share: DecodeShareArgs, prefix: &PrefixArgs,
     loop_abort: crate::shared::loop_abort::LoopAbortConfig,
     marks: (PrefixMarks, super::prefix::ArenaMarks), select: SelectPlacement,
     media: &mut MediaAdmission<super::media::Prompt, super::media::Encoder>,
@@ -1225,7 +1224,7 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
         let cycle = Instant::now();
         let Some(finished) = runtime.block_on(lanes.run_one(|lease| decode_round(lease, engine, opened,
             verify_rows, &mut lane, &mut active, &mut shared, &mut selector, &family, &mut cache, &mut free_kda,
-            &mut free_slots, &mut trace, cycle)))? else { continue };
+            &mut free_slots, &mut trace)))? else { continue };
         for index in (0..active.len()).rev() {
             if !finished[index] {
                 continue;
@@ -1322,8 +1321,8 @@ impl LaneCommit for Commit<'_, '_, '_, '_> {
 async fn decode_round(lease: LaneLease<'_>, engine: &GlmfEngine<'_>, opened: &Opened,
     verify_rows: usize, lane: &mut DecodeLane, active: &mut Vec<Active<'_>>, shared: &mut Option<DraftPolicy>,
     selector: &mut TokenSelector<'_>, family: &GlmfPrefix<'_, '_>, cache: &mut PrefixCache<CudaCopyEngine<'_>>,
-    free_kda: &mut Vec<i32>, free_slots: &mut Vec<usize>, trace: &mut Option<crate::shared::speculation_trace::Trace>,
-    cycle: Instant) -> Result<Option<Vec<bool>>> {
+    free_kda: &mut Vec<i32>, free_slots: &mut Vec<usize>, trace: &mut Option<crate::shared::speculation_trace::Trace>)
+    -> Result<Option<Vec<bool>>> {
     let drafter = engine.drafter.as_ref();
     let mut tally = console::Step::begin(lease.index());
     let (draft0, verify0, emit0) = (lane.draft_s, lane.verify_s, lane.emit_s);

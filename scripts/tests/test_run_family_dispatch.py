@@ -411,16 +411,16 @@ def test_deepseek_v41_goes_to_run_family_like_every_family(tmp_path: Path) -> No
         assert private not in run_sh, private
 
 
-@pytest.mark.parametrize("value", [None, "on", "off"])
-def test_shared_draft_policy_switches_are_explicit_and_default_off(tmp_path: Path, value) -> None:
-    names = ["DRAFT_SURVIVAL_LENGTHS"]
-    keys = "".join(f"{name}={value}\n" for name in names) if value else ""
+@pytest.mark.parametrize("value", [None, "history", "off"])
+def test_draft_policy_reaches_serve_only_when_off(tmp_path: Path, value) -> None:
+    keys = f"DRAFT_POLICY={value}\n" if value else ""
     result = _family_launch_result(tmp_path, {"model_type": "mimo_v2_flash", "num_hidden_layers": 2,
                                             "moe_layer_freq": [0, 1]}, "XiaomiMiMo/MiMo-V2-Flash",
                                   keys + "SPECULATION_TRACE=" + str(tmp_path / "trace.jsonl") + "\n")
     assert result.returncode == 0, result.stderr
-    for name in names:
-        assert f"CUTEAFD_{name}={int(value == 'on')}" in result.stderr
+    launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-mimo" in line)
+    assert ("--draft-policy off" in launch) == (value == "off"), launch
+    assert "CUTEAFD_DRAFT_POLICY" not in result.stderr
     assert "CUTEAFD_SPECULATION_TRACE=" in result.stderr
 
 
@@ -434,7 +434,7 @@ def test_glm53_bare_default_uses_release_dflash2(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize("key", ["COPY_DRAFTS", "COPY_DRAFT_POLICY", "CUTEAFD_COPY_DRAFT_POLICY",
-    "DRAFT_CONFIDENCE", "DRAFT_COST_BUCKETS", "MIMO_COPY_WINDOWS", "GLM5_FLASH_DRAFT_POLICY",
+    "DRAFT_SURVIVAL_LENGTHS", "DRAFT_ROW_COST", "DRAFT_CONFIDENCE", "DRAFT_COST_BUCKETS", "MIMO_COPY_WINDOWS", "GLM5_FLASH_DRAFT_POLICY",
     "DRAFT_MODEL_ID", "DRAFT_MODEL_REVISION", "DRAFT_FP8", "DFLASH", "MTP"])
 @pytest.mark.parametrize("value", ["on", "off"])
 def test_removed_draft_keys_are_unknown(tmp_path: Path, key: str, value: str) -> None:
@@ -522,41 +522,13 @@ def test_thermal_report_key_rejects_unknown_value(tmp_path: Path) -> None:
     assert "THERMAL must be on or off" in result.stderr
 
 
-def test_shared_draft_policy_rejects_unknown_switch_value(tmp_path: Path) -> None:
+@pytest.mark.parametrize("value", ["shared", "simple", "simple-rc", "simple-derived", "clever"])
+def test_removed_and_unknown_draft_policies_are_rejected(tmp_path: Path, value) -> None:
     result = _family_launch_result(tmp_path, {"model_type": "mimo_v2_flash", "num_hidden_layers": 2,
                                             "moe_layer_freq": [0, 1]}, "XiaomiMiMo/MiMo-V2-Flash",
-                                  "DRAFT_SURVIVAL_LENGTHS=maybe\n")
+                                  f"DRAFT_POLICY={value}\n")
     assert result.returncode != 0
-    assert "DRAFT_SURVIVAL_LENGTHS must be on or off" in result.stderr
-
-
-@pytest.mark.parametrize("value", [None, "shared", "simple", "simple-rc", "simple-derived"])
-def test_simple_draft_policy_is_forwarded_only_when_set(tmp_path: Path, value) -> None:
-    keys = f"DRAFT_POLICY={value}\n" if value else ""
-    result = _family_launch_result(tmp_path, {"model_type": "mimo_v2_flash", "num_hidden_layers": 2,
-                                            "moe_layer_freq": [0, 1]}, "XiaomiMiMo/MiMo-V2-Flash", keys)
-    assert result.returncode == 0, result.stderr
-    if value:
-        assert f"CUTEAFD_DRAFT_POLICY={value}" in result.stderr
-    else:
-        assert "CUTEAFD_DRAFT_POLICY" not in result.stderr
-
-
-@pytest.mark.parametrize("value", ["linear", "power", "log"])
-def test_simple_draft_row_cost_is_forwarded(tmp_path: Path, value) -> None:
-    result = _family_launch_result(tmp_path, {"model_type": "mimo_v2_flash", "num_hidden_layers": 2,
-                                            "moe_layer_freq": [0, 1]}, "XiaomiMiMo/MiMo-V2-Flash",
-                                  f"DRAFT_POLICY=simple-derived\nDRAFT_ROW_COST={value}\n")
-    assert result.returncode == 0, result.stderr
-    assert f"CUTEAFD_DRAFT_ROW_COST={value}" in result.stderr
-
-
-def test_simple_draft_policy_rejects_unknown_value(tmp_path: Path) -> None:
-    result = _family_launch_result(tmp_path, {"model_type": "mimo_v2_flash", "num_hidden_layers": 2,
-                                            "moe_layer_freq": [0, 1]}, "XiaomiMiMo/MiMo-V2-Flash",
-                                  "DRAFT_POLICY=clever\n")
-    assert result.returncode != 0
-    assert "DRAFT_POLICY must be shared, simple, simple-rc or simple-derived" in result.stderr
+    assert "DRAFT_POLICY must be history or off" in result.stderr
 
 
 def test_family_table_names_every_launchable_family() -> None:

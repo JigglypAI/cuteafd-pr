@@ -534,7 +534,8 @@ fn schedule_inner(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path
     // DFlash and the native MTP chain propose tokens only: neither has a trained confidence head.
     let mut shared = if width > 0 {
         engine.arm_draft_probe()?;
-        Some(DraftPolicy::new(policy.length, width, cuteafd_core::HeadScore::None, true))    } else { None };
+        Some(DraftPolicy::new(policy.length, width, cuteafd_core::HeadScore::None, true))
+    } else { None };
 
     let mut trace = crate::shared::speculation_trace::Trace::open()?;
     let (family, cache, selector) = owners.parts();
@@ -972,7 +973,7 @@ fn schedule_inner(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path
         }
         let cycle = Instant::now();
         let Some(finished) = runtime.block_on(lanes.run_one(|lease| decode_round(lease, engine,
-            prefix.mimo_prefix_draft, width, &mut lane, &mut active, &mut shared, selector, family, cache,
+            prefix.mimo_prefix_draft, &mut lane, &mut active, &mut shared, selector, family, cache,
             &mut free_rings, &mut free_slots, &mut failures, &mut trace, cycle)))? else { continue };
         for index in (0..active.len()).rev() {
             if !finished[index] {
@@ -1054,7 +1055,7 @@ impl LaneCommit for DraftContext<'_, '_> {
 /// when a non-terminal step failure released every active request.
 #[allow(clippy::too_many_arguments)]
 async fn decode_round(lease: LaneLease<'_>, engine: &MimoEngine<'_>, prefix_draft: bool,
-    width: usize, lane: &mut DecodeLane, active: &mut Vec<Active<'_>>,
+    lane: &mut DecodeLane, active: &mut Vec<Active<'_>>,
     shared: &mut Option<DraftPolicy>, selector: &mut TokenSelector<'_>,
     family: &MimoPrefix<'_, '_>, cache: &mut PrefixCache<CudaCopyEngine<'_>>, free_rings: &mut Vec<i32>,
     free_slots: &mut Vec<usize>, failures: &mut FailureRecipients,

@@ -2122,7 +2122,6 @@ mod tests {
         use cuteafd_loader::{placement::*, plan::{self, layout::LayoutOptions, testing, ExpertPlacement, PlanOptions}};
         use cuteafd_transport::worker_selection::{ExpertGroupingSelector,
             InstalledExpertGrouping, InstalledExpertVariant, WorkerIdentity, WorkerSelection};
-        use crate::shared::draft::resource::{self, LayerHome};
         let fixture = tempfile::tempdir()?;
         testing::write_step5_exl3_snapshot(fixture.path());
         let manifest = testing::step5_native_manifest(fixture.path());

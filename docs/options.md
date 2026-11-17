@@ -319,14 +319,10 @@ chunks overlapping the final context window, retaining a straddling chunk whole
 to preserve projection shapes and bytes. Each planned intermediate prefix mark
 gets its own window; MiniMax withholds an unexpected partial-prefill snapshot
 until its window is complete. Full-context paged drafters are unchanged.
-`DRAFT_LENGTH` caps the seven-token native block; `SPECULATION_TRACE` records
-shared draft/verify evidence. Unset `DRAFT_POLICY` selects `simple` for every
-family; `shared`, `simple-rc` and `simple-derived` remain explicit opt-ins
-(global decision #2220). `shared` is the cost-based concurrency-bucket policy,
-including native zero-proposal decode when drafting cannot pay. The #2220
-campaign measured MiniMax `shared` against `simple` at C1 1.00, sweep C16 1.03
-and sustained C8/C16 1.02/1.04, all within single-launch noise. See the family
-page for instrumentation caveats. The example config's explicit off remains an override
+`DRAFT_LENGTH` fixes the verified width within the seven-token native block;
+`SPECULATION_TRACE` records each draft round. MiniMax drafts on the shared
+`history` policy like every other family (see [Speculation](#speculation)); its
+confidence head feeds the policy's explore skip. The example config's explicit off remains an override
 until its separate line change joins the next placement-input publication batch.
 `VISION=off` and `AUDIO=off` remain required.
 
@@ -729,11 +725,9 @@ Each key is also a global `cuteafd` flag (`--gpu-memory-cap`, `--kv-max-tokens`,
 | `SPECULATOR_MODEL_ID` | family default | HF repo id | External drafter checkpoint. |
 | `SPECULATOR_MODEL_REVISION` | empty | 40–64 lowercase hex | Drafter revision. |
 | `SPECULATOR_DEPTH` | 3 for local Qwen/Step-5, else 1 | positive int | Native MTP draft depth. |
-| `DRAFT_LENGTH` | unset (adaptive) | positive int | Fixed verified draft tokens per step: min(value, native head width), further capped by the existing row budget at high concurrency. Overrides `DRAFT_POLICY`; statistics still recorded. Every family and speculator (DFlash2, dSpark, MTP, Markov). V4.1 adaptive maximum remains 5 when unset; fixed supports up to 7. Without a speculator it is ignored with one startup log; reports and cards say `no speculation`. |
+| `DRAFT_LENGTH` | unset (follows `DRAFT_POLICY`) | positive int | Measurement override: verify a fixed number of draft tokens per step, min(value, the drafter's native block), further capped by the row budget at high concurrency. Overrides `DRAFT_POLICY`; acceptance history is still recorded. Every family and speculator (DFlash2, dSpark, MTP, Markov). Without a speculator it is ignored with one startup log; reports and cards say `no speculation`. |
 | `SPECULATOR_FP8` | `auto` | `auto`, `on`, `off` | GLM/Qwen/MiMo/Kimi drafter precision: unset, `auto` and `on` select single-copy FP8 projection weights; `off` keeps BF16. Rust resolves the same MiMo precision for planning and serving, independent of checkpoint alias or core view. Kimi block DSpark supports TP1 and physical TP2 with native BF16 norms/Markov tensors; FP8 applies to content-paired K3.1 DSpark in every core view and layout. Independent of `DRAFT_KV_CACHE`. |
-| `DRAFT_POLICY` | unset | `shared`, `simple`, `simple-rc`, `simple-derived` | Drafter block policy: unset selects `simple` for every family; the others are explicit opt-ins. Shared prices draft/skip actions per concurrency bucket and collects per-layer timing. |
-| `DRAFT_ROW_COST` | unset | `linear`, `power`, `log` | Drafter row cost model diagnostic. |
-| `DRAFT_SURVIVAL_LENGTHS` | `off` | `on`, `off` | Record draft survival lengths. |
+| `DRAFT_POLICY` | `history` | `history`, `off` | How many drafted positions each request verifies; one policy for every family and drafter. `history` keeps a position while its acceptance probability is above 0.5, where the probability is the request's accepted/reached counts at that position over its last 8 verify rounds, shrunk toward the server-wide rate over the last 256 rounds that reached it (prior strength 8). One position past the stop is always verified so an estimate cannot lock low; a drafter with a trained confidence head (dSpark) skips that explore when its calibrated probability is below 0.2. The drafter's full native block is available (V4.1: 7). When a round exceeds the 64 verify rows, positions are granted across requests by the same probabilities, highest first. History copies past an agreeing draft use the same rule on their own counts. `off` verifies no drafts. |
 | `DRAFT_CONTEXT_SLOTS` | `max(20, drafts)` | positive int | GLM/MiMo drafter context slots. |
 | `DRAFT_SEQUENCES` | engine default | positive int | Maximum drafts in one batch. |
 | `SPECULATION_TRACE` | unset | absolute path | JSONL speculation trace. |
@@ -1175,9 +1169,7 @@ original core is already FP8, not an MC publication.
 | `DRAFT_LENGTH` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | `DRAFT_CONTEXT_WINDOW` | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✓ | ✗ | ✗ | ✗ |
 | `SPECULATOR_FP8` | ✗ | ✗ | ✓ | ✓ | ✓ | ✓ | ✗ | ✓ | ✗ | ✗ | ✗ |
-| `DRAFT_POLICY` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✓ | ✗ | ✗ | ✗ |
-| `DRAFT_ROW_COST` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ |
-| `DRAFT_SURVIVAL_LENGTHS` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ |
+| `DRAFT_POLICY` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | `DRAFT_CONTEXT_SLOTS` | ✗ | ✗ | ✓ | ✓ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
 | `DRAFT_SEQUENCES` | ✗ | ✗ | ✓ | ✓ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
 | `SPECULATION_TRACE` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✓ | ✗ |

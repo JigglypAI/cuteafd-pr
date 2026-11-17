@@ -3357,12 +3357,11 @@ def test_planned_speculator_identity_is_stable_and_explicit(entry, tmp_path):
         cards.planned_speculator(job, {'speculator': 'off'})
 
 
-@pytest.mark.parametrize('profile,policy,expected', [('', 'simple', 'off'),
-    ('', 'shared', 'on (perturbing)'), ('draft-timing', 'simple', 'on (perturbing)'),
-    ('transport-timing', 'simple', 'on (perturbing)'), ('census', 'simple', 'off')])
-def test_layer_timing_reported_in_result_and_summary(entry, tmp_path, profile, policy, expected):
+@pytest.mark.parametrize('profile,expected', [('', 'off'), ('draft-timing', 'on (perturbing)'),
+    ('transport-timing', 'on (perturbing)'), ('census', 'off')])
+def test_layer_timing_reported_in_result_and_summary(entry, tmp_path, profile, expected):
     job = cards.generate(entry, 'a', dict(instance='a', slot='s'), tmp_path, tmp_path / 'key',
-                         {'PROFILE': profile, 'DRAFT_POLICY': policy}, set(), None, 1)
+                         {'PROFILE': profile}, set(), None, 1)
     job['entry'].update(profile='panels:', baseline=False)
     row = cards.summarize_job(job, 0)
     assert row['instrumentation']['per_layer_timing'] == expected

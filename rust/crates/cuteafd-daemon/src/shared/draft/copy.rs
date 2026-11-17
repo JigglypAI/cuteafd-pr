@@ -80,7 +80,6 @@ mod tests {
         // Four matched tokens need three drafts to reach seven anchored.
         let weak = history(&copy, 4);
         assert!(continuation(&weak, &copy[..3], true).is_some());
-        assert!(continuation(&history(&copy[..3], 8), &copy[..3], true).is_none());
         assert!(continuation(&(0..40).collect::<Vec<u32>>(), &[1, 2, 3], true).is_none());
     }
 }

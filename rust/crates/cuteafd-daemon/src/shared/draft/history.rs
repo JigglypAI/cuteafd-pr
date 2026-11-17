@@ -174,13 +174,14 @@ mod tests {
         // A cold copy track verifies one explored position.
         assert_eq!((neural, agreeing.as_slice(), differing.len()), (vec![4, 4], &[100, 101, 102, 103, 104][..], 4));
         policy.observe(&[outcome(1, 6, 6, false), outcome(2, 5, 3, false)]);
-        // Sampled requests never copy; the budget cuts the least likely positions.
+        // Sampled requests never copy. Five drafts fit: both requests' first two positions
+        // (probability 1), then request 1's third (0.56) ahead of request 2's explore (0.44).
         assert_eq!(policy.plan(&[(1, 40), (2, 40)], 64), [4, 3]);
         let (mut first, mut second) = (vec![100, 101, 102, 103], vec![100, 101, 7]);
         let neural = policy.shape(&mut [
             Proposal { id: 1, tokens: &mut first, head: None, history: &history, greedy: false },
             Proposal { id: 2, tokens: &mut second, head: None, history: &history, greedy: true }], 7);
-        assert_eq!((neural, first.len(), second.len()), (vec![4, 1], 4, 1));
+        assert_eq!((neural, first.len(), second.len()), (vec![3, 2], 3, 2));
     }
 
     #[test]

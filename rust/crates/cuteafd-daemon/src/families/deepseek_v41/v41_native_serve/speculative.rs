@@ -214,8 +214,6 @@ impl<'w, 'a, C: DraftChain<'a>> DraftRuntime<'w, 'a, C> {
         LOCAL_LAYERS.store(local_layers as u64, std::sync::atomic::Ordering::Relaxed);
         self.policy = Some(Policy::new(self.length, self.draft_width, cuteafd_core::HeadScore::Logit, true));
     }
-    /// A draft policy is bound (it observes every verification round).
-    pub fn has_policy(&self) -> bool { self.policy.is_some() }
     /// What a verification round records besides its outputs: layer events under the timing profile.
     pub fn capture(&self) -> Capture {
         Capture { routes: false, timing: crate::shared::draft::timing_profile() }
