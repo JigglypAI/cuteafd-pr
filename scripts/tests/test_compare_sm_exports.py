@@ -2079,3 +2079,18 @@ def test_native_fp8_auto_preference_uses_capability_shape_and_output_only():
         other = "bf16" if output=="f32" else "f32"
         assert exporter.native_attention_prefill_preference(n,k,other)=={"12.0":False,"12.1":False}
     assert exporter.native_attention_prefill_preference(128,128,"bf16")=={"12.0":False,"12.1":False}
+
+
+def test_v4_placement_inputs_export_native_expert_segments():
+    """A V4 case manifest must carry the segment programs Spark worlds charge."""
+    jobs = compare_sm.v4_export_jobs()
+    contexts = [job for job in jobs if job[0] != "exl3"]
+    assert [job[0] for job in contexts] == ["131072", "1048576"]
+    for _, exporter, args in contexts:
+        assert exporter == "export_b12x_dsv4_aot.py"
+        geometry = args[args.index("--geometry") + 1].split(",")
+        assert {"flash", "pro", "flash2", "pro2", "native_experts"} <= set(geometry)
+        families = args[args.index("--native-expert-families") + 1].split(",")
+        assert families == ["dsv4f", "dsv4p"]
+    exl3 = [job for job in jobs if job[0] == "exl3"]
+    assert len(exl3) == 1 and exl3[0][1] == "package_exl3_aot.py"
