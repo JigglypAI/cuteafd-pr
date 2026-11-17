@@ -1677,7 +1677,7 @@ fn nvfp4_whole_onboarding_is_refused_with_its_missing_executor() {
     assert!(auto.memory_layout.as_ref().unwrap().notes.iter()
         .any(|n| n == super::admission::NATIVE_ONBOARDING_TWO_RTX));
     let explicit = plan_with(Some(crate::placement::OnboardSetting::Layers(2)));
-    assert!(explicit.hints.iter().any(|h| h.what.contains("whole-layer RTX expert executor is not implemented")), "{:#?}", explicit.hints);
+    assert!(explicit.hints.iter().any(|h| h.what.contains(super::admission::NATIVE_ONBOARDING_TWO_RTX)), "{:#?}", explicit.hints);
 }
 
 #[test]
