@@ -19,14 +19,6 @@ pub(crate) struct Options {
 }
 
 impl Options {
-    pub(crate) fn kind(&self) -> Result<cuteafd_loader::families::kimi_k3::draft::DraftKind> {
-        use cuteafd_loader::families::kimi_k3::draft::DraftKind;
-        cuteafd_loader::families::kimi_k3::draft::DraftHiddenStream::read(&self.snapshot)?;
-        Ok(if crate::shared::speculation::block_dspark::is_dspark(&self.snapshot)? {
-            DraftKind::BlockDspark
-        } else { DraftKind::MlaDflash })
-    }
-
     pub(crate) fn representation(&self) -> GlmDraftRepresentation {
         if self.fp8 { GlmDraftRepresentation::Fp8Only } else { GlmDraftRepresentation::Bf16Only }
     }
@@ -53,7 +45,7 @@ impl Options {
         let cfg=MlaDflashConfig::read(&self.snapshot)?;
         Ok(cfg.runtime_layout(self.representation(),GlmDraftCapacity::new(slots,slots.min(8),cfg.block)?,
             context,slots.checked_mul(context).context("draft pool overflow")?,sms,Fp8Rows::W8a16.code() as u8,
-            cfg.cache_format(self.cache_format,self.draft_kv_cache))?.with_context_split(self.tp2_dflash)?.into())
+            cfg.cache_format(self.draft_kv_cache))?.with_context_split(self.tp2_dflash)?.into())
     }
 
 }
@@ -190,7 +182,7 @@ impl<'a> NativeDraft<'a> {
         ensure!(hidden_stream == layout.hidden_stream(), "Kimi draft hidden stream differs from admitted checkpoint fact");
         if let DraftLayout::Mla(layout) = layout {
             let config=MlaDflashConfig::read(&options.snapshot)?;
-            ensure!(config.cache_format(options.cache_format,options.draft_kv_cache) == layout.cache_format(),
+            ensure!(config.cache_format(options.draft_kv_cache) == layout.cache_format(),
                 "Kimi draft options/admission cache records differ");
         }
         ensure!(matches!(streams.len(), 1 | 2)

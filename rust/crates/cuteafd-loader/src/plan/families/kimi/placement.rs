@@ -322,7 +322,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
                 else { GlmDraftRepresentation::Bf16Only };
             DraftLayout::Mla(draft.runtime_layout(representation, GlmDraftCapacity::new(slots, slots.min(8), draft.block)?,
                 usize::try_from(context)?,slots.checked_mul(usize::try_from(context)?).context("draft pool overflow")?,
-                opts.physical_sms.unwrap_or(188) as usize,0,draft.cache_format(opts.mla_kv,opts.draft_kv_cache))?.with_context_split(opts.tp2_dflash)?)
+                opts.physical_sms.unwrap_or(188) as usize,0,draft.cache_format(opts.draft_kv_cache))?.with_context_split(opts.tp2_dflash)?)
         };
         match &layout {
             DraftLayout::Block(local)=>{ local.validate_projection_programs(manifest.as_ref().context("block dSpark requires installed projection inventory")?)?; }

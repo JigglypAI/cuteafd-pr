@@ -19,9 +19,6 @@ impl DraftHiddenStream {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DraftKind { MlaDflash, BlockDspark }
-
 #[derive(Debug, Clone, PartialEq)]
 pub enum DraftLayout {
     Mla(MlaDraftRuntimeLayout),
@@ -83,11 +80,11 @@ impl DraftLayout {
         Ok(match self { Self::Mla(l) => Self::Mla(l.with_pool_tokens(tokens)?), Self::Block(l) => Self::Block(l.clone()),Self::BlockTp2 { ranks,lead }=>Self::BlockTp2 { ranks:ranks.clone(),lead:*lead } })
     }
     pub fn validate_capacity(&self, slots: usize, rows: usize, context: usize,
-        cache: cuteafd_core::MlaCacheFormat) -> Result<()> {
+        _target_cache: cuteafd_core::MlaCacheFormat) -> Result<()> {
         ensure!(self.capacity().context_slots == slots && self.capacity().max_batch_sequences <= rows.min(64),
             "Kimi drafter capacity differs from target slots/rows");
         match self {
-            Self::Mla(l) => ensure!((l.kind() == cuteafd_core::coordinator_programs::MlaDraftKind::CausalDflash2 || l.cache_format() == cache) && l.program().context == context
+            Self::Mla(l) => ensure!(l.program().context == context
                 && l.cache().layers.iter().all(|layer| layer.slots() == slots),
                 "Kimi MLA drafter cache differs from target capacity"),
             Self::Block(l) => ensure!(l.config.window.is_some(), "block drafter requires window-bounded KV"),
