@@ -135,20 +135,20 @@ class Grok(Adapter):
 
 class Agy(Adapter):
     # Antigravity's own default model changes underneath us (it drifted to
-    # Argon/medium); pin the roster default from USING_AGENTS.md unless the
-    # caller names a model or only an effort for the CLI's current model.
+    # Argon/medium), and Carbon carries its effort in the model name. Always
+    # pin a model: an explicit --model wins, otherwise --effort selects the
+    # matching Carbon model, and neither means the roster default.
+    CARBON_EFFORTS = ('high', 'medium', 'low')
     default_model = 'gemini-4-carbon-high'
 
     def command(self, meta):
         cmd = [meta['executable'], '--add-dir', meta['cwd']]
         if meta.get('auto_approve'):
             cmd += ['--dangerously-skip-permissions']
-        if meta.get('model'):
-            cmd += ['--model', meta['model']]
-        elif meta.get('effort'):
-            cmd += ['--effort', meta['effort']]
-        else:
-            cmd += ['--model', self.default_model]
+        effort = meta.get('effort')
+        model = meta.get('model') or (
+            'gemini-4-carbon-' + effort if effort in self.CARBON_EFFORTS else self.default_model)
+        cmd += ['--model', model]
         return cmd
 
 
