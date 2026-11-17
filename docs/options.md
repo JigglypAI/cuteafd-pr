@@ -789,7 +789,7 @@ reported 4.16 because its draft sampling/rejection method differs (#2312). `TP2_
 MiniMax and Kimi default to their bundled still-image towers (`VISION=auto`), placed
 Spark-first with RTX fallback by joint admission. `VISION=off` keeps text-only
 serving and rejects image chat. Step-5 production serving remains text-only; dense Qwen
-has media off. Kimi and MiniMax `plan --layout` now reserve their bundled
+has media off. Kimi and MiniMax `plan --layout` reserve their bundled
 still-image tower as an independent packed arena plus phase-peak scratch,
 Spark-first with RTX fallback in the joint admission solve. Native still-image serving uses the admitted owner through the shared vision
 runtime; the numerical drift diagnostics remain on #1984 and #1779. GLM 5.3 / ML4,
