@@ -138,7 +138,7 @@ concurrency point is that limit.
 <td width="19%" valign="top"><a href="docs/models/kimi_k3.md"><b>Kimi K3</b></a><br><sub>wrldsuksgo2mars/Kimi-K3.1-Pro-EXL3-K2-MC</sub><br><sub>exl3-k2</sub></td>
 <td width="27%" valign="top">n/a<br><sub>doesn&#39;t fit</sub></td>
 <td width="27%" valign="top">n/a<br><sub>original BF16 core doesn&#39;t fit: RTX load needs 121.96 GB vs 101.87 GB available; K6 Spark 0 load needs 121.86 GB vs 115.96 GB available</sub></td>
-<td width="27%" valign="top"><a href="benchmarks/kimi_k31/2026-11-16-smoke-kimi-k3-1-pro-exl3-k2-mc-2rtx-6spark-kimi-k31-mc-original-max/card.svg"><img src="benchmarks/kimi_k31/2026-11-16-smoke-kimi-k3-1-pro-exl3-k2-mc-2rtx-6spark-kimi-k31-mc-original-max/card.svg" alt="wrldsuksgo2mars/Kimi-K3.1-Pro-EXL3-K2-MC on 2× RTX PRO 6000 @ gpu-powerd 425/425 W (395–450) + 6× DGX Spark"></a><br><sub>2× RTX + 6× Spark</sub></td>
+<td width="27%" valign="top"><a href="benchmarks/kimi_k31/2026-11-17-smoke-kimi-k3-1-pro-exl3-k2-mc-2rtx-6spark-kimi-k31-mc-original-max-default-on/card.svg"><img src="benchmarks/kimi_k31/2026-11-17-smoke-kimi-k3-1-pro-exl3-k2-mc-2rtx-6spark-kimi-k31-mc-original-max-default-on/card.svg" alt="wrldsuksgo2mars/Kimi-K3.1-Pro-EXL3-K2-MC on 2× RTX PRO 6000 @ gpu-powerd 425/425 W (360–450) + 6× DGX Spark"></a><br><sub>2× RTX + 6× Spark</sub></td>
 </tr>
 <tr>
 <td width="19%" valign="top"><a href="docs/models/glm5.md"><b>GLM 5.3</b></a><br><sub>wrldsuksgo2mars/GLM-5.3-EXL3-K4-MC</sub><br><sub>exl3-k4</sub></td>
