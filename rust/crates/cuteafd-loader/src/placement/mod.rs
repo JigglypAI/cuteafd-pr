@@ -25,6 +25,7 @@ pub mod inventory;
 pub mod graph_nodes;
 pub mod planner;
 pub mod runtime_memory;
+pub mod still_encoder;
 mod pool;
 pub mod reserve;
 pub mod graph_reserve;

@@ -319,8 +319,8 @@ impl Family for KimiK3 {
     fn component_hint(&self, component: Component) -> Option<Hint> {
         match component {
             Component::Vision => Some(Hint {
-                what: "Kimi K3 vision execution is not implemented".into(),
-                how: "Add the bundled MoonViT3d tower and patchmergerv2 projector; serve text with --vision off today".into(),
+                what: "Kimi K3 bundled vision is planned; production qualification remains pending (#1984)".into(),
+                how: "The joint planner admits MoonViT3d and patchmergerv2; normal serving remains text-only until qualification.".into(),
             }),
             Component::Speculator | Component::SpeculatorExpert => Some(Hint {
                 what: "Kimi K3 draft execution is not implemented".into(),
@@ -339,9 +339,6 @@ impl FamilyModel for Model {
         self.core.validate_runtime_groups(&self.cfg).map_err(ConfigError::from_anyhow)
     }
     fn native_serving_admission(&self) -> bool { self.core.serving_qualified(&self.cfg) }
-    fn vision_mode(&self, mode: crate::plan::MediaMode) -> crate::plan::MediaMode {
-        if mode == crate::plan::MediaMode::Auto { crate::plan::MediaMode::Off } else { mode }
-    }
     fn cache_geometry(&self, options: crate::serving_capacity::CacheOptions)
         -> Result<Option<crate::serving_capacity::FamilyCacheGeometry>, crate::serving_capacity::CacheGeometryError> {
         use crate::{placement::AttentionPlacement, serving_capacity::CacheGeometryError};

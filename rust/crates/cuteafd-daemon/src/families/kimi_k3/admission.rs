@@ -911,7 +911,7 @@ pub(crate) fn admit<'a, const RANKS: usize>(mut inputs: Inputs<'_, RANKS>) -> Re
             bytes: request.inventory.gpus[rank].capacity_bytes.saturating_sub(free_bytes), weights: 0,
             lifetime: contract::Lifetime::RESIDENT, basis: Basis::Exact });
     }
-    let mut recipe = KimiRecipe { expert_usage: kimi::usage_geometry(cfg, expert_usage), context: request.pool.compiled_context, gpus: RANKS,
+    let mut recipe = KimiRecipe { vision: None, expert_usage: kimi::usage_geometry(cfg, expert_usage), context: request.pool.compiled_context, gpus: RANKS,
         placement: placement_mode, attention,
         prefill: contract::PrefillShape { rows: unit_rows as u64, waves: inputs_waves as u64 },
         lanes, spark_links: spark_ranks > 0, hop_spec: request.hops.clone(),

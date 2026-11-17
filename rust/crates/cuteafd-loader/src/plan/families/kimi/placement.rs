@@ -501,6 +501,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
             "Supply supported Spark endpoint geometry."); return memory; }
     };
     let mut recipe = KimiRecipe {
+        vision: None,
         expert_usage: kimi::usage_geometry(cfg, opts.expert_usage),
         context, gpus, placement: attention, attention: modes,
         prefill, lanes: LANES, spark_links: ranks > 0,
@@ -598,6 +599,13 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
             "Check the requested card capacities."); return memory; }
     };
     budgets.push(kimi::host_budget(host_total, host_available));
+    recipe.vision = match crate::placement::still_encoder::StillEncoder::planned(input.checkpoint(),
+        report.vision, opts.vision_replicas, &budgets,
+        opts.media_cache_bytes.unwrap_or((8 << 30).min(host_total / 20))) {
+        Ok(vision) => vision,
+        Err(error) => { report.refuse_placement(format!("Kimi bundled vision inventory refused: {error:#}"),
+            "Supply the bundled MoonViT3d tensors or use --vision off."); return memory; }
+    };
     report.host_budget_bytes = host_quota;
     let mut host_items = vec![cuteafd_core::memory_layout::host_table_item("Kimi host scoring logits", scoring_bytes),
         cuteafd_core::memory_layout::host_table_item("Kimi reusable H2D staging (estimated)", kimi::HOST_UPLOAD_BYTES)];
@@ -614,6 +622,8 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
         crate::placement::planner::Operation::Serving, ResidentWeights(opts.weight_budget_bytes), opts.spark_reply_formats), budgets);
     let onboarded = match resolved {
         Ok(selection) => {
+            report.encoder = recipe.vision.as_ref().and_then(|vision| vision.admitted(&selection.solved));
+            report.phase_ledger = Some(crate::plan::SolvedPhaseLedger::from(&selection.solved));
             let served = selection.solved.request.context.served(selection.solved.pool_tokens);
             memory.notes.retain(|note| !note.starts_with("Kimi API max context:"));
             memory.notes.push(format!("Kimi API max context: {served} tokens; compiled max context: {COMPILED_CAPACITY} tokens"));

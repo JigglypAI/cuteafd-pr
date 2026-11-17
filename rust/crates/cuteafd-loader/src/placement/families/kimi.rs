@@ -297,6 +297,7 @@ pub fn draft_layout_facts(layout: &DraftLayout, page_rows: u64, maximum_pages: u
 /// attention modes, retention, expert inventory and the transient load peaks.
 #[derive(Debug, Clone)]
 pub struct KimiRecipe {
+    pub vision: Option<crate::placement::still_encoder::StillEncoder>,
     pub expert_usage: Option<cuteafd_core::expert_usage::Geometry>,
     pub context: u64,
     pub gpus: usize,
@@ -957,6 +958,9 @@ impl Recipe for KimiRecipe {
         // carry granularity on their own curve, packed arenas already own a
         // tail, and the measured context plus captured-graph reserves are
         // physical baselines, not single driver requests.
+        if let Some(vision) = &self.vision {
+            vision.extend(&mut contract.variables, &mut contract.components, self.maximum_pages)?;
+        }
         crate::placement::planner::fixed_request_tails(&mut contract.components, self.maximum_pages,
             &[allocation::GRAPH_RESERVE, allocation::CODE_OWNER,
                 allocation::CONTEXT_ESTIMATE, allocation::CONTEXT_MEASURED])?;
@@ -1152,6 +1156,7 @@ mod tests {
 
     pub(super) fn recipe() -> KimiRecipe {
         let mut recipe = KimiRecipe {
+            vision: None,
             expert_usage: None,
             shaped: Vec::new(),
             context: 256,

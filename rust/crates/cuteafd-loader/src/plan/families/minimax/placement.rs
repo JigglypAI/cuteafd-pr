@@ -102,11 +102,18 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
         Err(refused) => { report.refuse_placement(refused.what, refused.how); return empty(notes); }
     };
     opts.apply_spark_capacities(&mut inputs.budgets);
+    inputs.vision = match crate::placement::still_encoder::StillEncoder::planned(input.checkpoint(),
+        report.vision, opts.vision_replicas, &inputs.budgets,
+        opts.media_cache_bytes.unwrap_or((8 << 30).min(host.0 / 20))) {
+        Ok(vision) => vision,
+        Err(error) => { report.refuse_placement(format!("MiniMax bundled vision inventory refused: {error:#}"),
+            "Supply the bundled CLIP tower tensors or use --vision off."); return empty(notes); }
+    };
     if let LocalPackage::Missing(reason) = &inputs.local {
         notes.push(format!("MiniMax RTX onboarding unavailable: {reason}"));
     }
-    notes.push("MiniMax bundled dSpark (M8) and CLIP vision tower (M9) are declared recipe domains with their own \
-        arenas; this build has no executor for either, so the plan charges neither".into());
+    notes.push("MiniMax bundled vision uses an independent packed arena, Spark-first with RTX fallback; \
+        native production execution remains qualification-gated (#1779)".into());
     let routed = inputs.routed.len();
     let onboard = opts.resolve_onboard(routed).unwrap_or(Onboard::Auto);
     if matches!(onboard, Onboard::Layers(count) if count > 0) {
@@ -141,6 +148,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
         }
     }
     report.phase_ledger = Some(crate::plan::SolvedPhaseLedger::from(&admitted.solved));
+    report.encoder = inputs.vision.as_ref().and_then(|vision| vision.admitted(&admitted.solved));
     report.host_budget_bytes = inputs.host_prefix.quota_bytes;
     let placed = admitted.placement;
     let onboarded = placed.onboard_layers;
