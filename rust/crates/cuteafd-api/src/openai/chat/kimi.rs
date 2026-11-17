@@ -125,7 +125,7 @@ fn content_literals(value:&Value,literal:&mut dyn FnMut(&str)->String)->Result<S
         for part in parts {
             match part["type"].as_str() {
                 Some("text")=>out.push_str(&literal(part["text"].as_str().context("Kimi text")?)),
-                Some("image_url")=>out.push_str("<|kimi_image_placeholder|>"),
+                Some("image_url")=>out.push_str("<|media_pad|>"),
                 _=>bail!("unsupported Kimi media part"),
             }
         }

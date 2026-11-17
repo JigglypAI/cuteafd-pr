@@ -78,16 +78,16 @@ impl<'e, 'a> Backend<'a> for KimiBackend<'e, 'a> {
         }
         ensure!(self.media_enabled,"vision is disabled");
         let tokenizer=cuteafd_loader::cached_tokenizer(snapshot)?;
-        let ids=tokenizer.added_token_ids(&["<|kimi_image_placeholder|>","<|media_pad|>","<|media_end|>"]);
-        ensure!(ids.len()==3,"Kimi image markers absent");
+        let ids=tokenizer.added_token_ids(&["<|media_pad|>","<|media_end|>"]);
+        ensure!(ids.len()==2,"Kimi image markers absent");
         let mut job=job;let mut groups=std::mem::take(&mut job.image_groups);
         ensure!(groups.len()==job.media.len(),"Kimi source groups absent");
         for group in &mut groups {
             let [w,h]=group.source;
             let prefix=tokenizer.encode_ids(&format!("<|media_begin|>image {w}x{h}<|media_content|>"))?;
             group.fragments=vec![cuteafd_loader::media::ImageFragment::Tokens(prefix),
-                cuteafd_loader::media::ImageFragment::Features {image:0,placeholder:ids[1]},
-                cuteafd_loader::media::ImageFragment::Tokens(vec![ids[2]])];
+                cuteafd_loader::media::ImageFragment::Features {image:0,placeholder:ids[0]},
+                cuteafd_loader::media::ImageFragment::Tokens(vec![ids[1]])];
         }
         crate::shared::vision::still::Binding::prepare(job,tokens,self.geometry.vocab_size as u32,7168,
             self.geometry.max_context,ids[0],groups)
