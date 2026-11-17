@@ -1734,7 +1734,7 @@ mod tests {
         for wire in [WirePrecision::Bf16, WirePrecision::F32] {
             let mut inputs = owners::tests::inputs(&checkpoint, &cfg, &[0, 1], 1)?;
             inputs.split_wire = Some(wire);
-            let request = canonical::request(ModelContext::automatic(inputs.context.maximum), Some(129 * 64),
+            let request = canonical::request(inputs.context, Some(129 * 64),
                 cuteafd_loader::placement::Onboard::Layers(0), inputs.prefill,
                 Operation::Serving, None, Default::default());
             let admitted = inputs.admit(request)?;

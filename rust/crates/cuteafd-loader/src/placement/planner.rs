@@ -590,7 +590,7 @@ pub use contract::{
     Activation, ByteCurve, BytePiece, Choice, Component, ComponentKind, Contract, Requires,
     Variable,
 };
-pub use search::solve;
+pub use search::{solve, solve_prepared};
 
 /// Prepare immutable geometry/cost terms once. A family unable to describe its
 /// demand with finite piecewise curves refuses preparation, never searches it.
@@ -608,6 +608,9 @@ pub struct PhaseBudget {
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResolvedPlan {
+    /// Immutable preparation witness, shared by offline and runtime admission.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pool_policy: Option<crate::placement::PoolPolicy>,
     /// Rejected earlier encoder choices at the admitted pool and onboarding.
     pub encoder_diagnostics: Vec<(String, u64)>,
     pub request: Request,

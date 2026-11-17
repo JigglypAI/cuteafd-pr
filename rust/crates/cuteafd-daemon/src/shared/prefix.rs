@@ -315,7 +315,7 @@ mod tests {
         for adapter in family::registry().iter().filter(|family| family.media_cache_headroom()) {
             let dir = tempfile::tempdir()?;
             let mut options = LayoutOptions { host_memory: Some((memory.total, memory.available)),
-                host_cache_bytes: Some(0), pool_tokens: Some(32768), target_pool_tokens: 32768,
+                host_cache_bytes: Some(0), pool_tokens: Some(32768), target_pool_tokens: Some(32768),
                 ..Default::default() };
             let mut placement = ExpertPlacement::Local;
             match adapter.id() {

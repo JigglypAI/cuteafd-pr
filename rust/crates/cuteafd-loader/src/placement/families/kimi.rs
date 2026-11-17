@@ -297,6 +297,7 @@ pub fn draft_layout_facts(layout: &DraftLayout, page_rows: u64, maximum_pages: u
 /// attention modes, retention, expert inventory and the transient load peaks.
 #[derive(Debug, Clone)]
 pub struct KimiRecipe {
+    pub pool: crate::placement::PoolPolicy,
     pub vision: Option<crate::placement::still_encoder::StillEncoder>,
     pub expert_usage: Option<cuteafd_core::expert_usage::Geometry>,
     pub context: u64,
@@ -373,7 +374,7 @@ impl KimiRecipe {
             request.onboard == Pin::Exact(profile.layers.len() as u64)) {
             return Err(LOCAL_ONLY_REFUSAL);
         }
-        let mut solved = solve(request, budgets, self)?;
+        let mut solved = crate::placement::planner::solve_prepared(request, budgets, self, &self.pool)?;
         self.refine_shaped(&mut solved)?;
         let placement = self.execution(&solved)?;
         if self.spark_links && self.experts.is_some()
@@ -1157,6 +1158,7 @@ mod tests {
 
     pub(super) fn recipe() -> KimiRecipe {
         let mut recipe = KimiRecipe {
+            pool: crate::placement::prepare_pool(crate::placement::PoolFacts::new(&[96 << 30], 256, None, 64)).unwrap(),
             vision: None,
             expert_usage: None,
             shaped: Vec::new(),
@@ -1575,7 +1577,9 @@ mod tests {
         }
         let request = |pool| Request { context: (128).into(), ..request_with(Some(pool)) };
         recipe.context = 128;
+        recipe.pool = crate::placement::prepare_pool(crate::placement::PoolFacts::new(&[1 << 30; 2], 128, Some(192), 64)).unwrap();
         assert!(recipe.admit(request(192), budget.clone()).is_err());
+        recipe.pool = crate::placement::prepare_pool(crate::placement::PoolFacts::new(&[1 << 30; 2], 128, Some(128), 64)).unwrap();
         assert_eq!(recipe.admit(request(128), budget).unwrap().solved.pool_tokens, 128);
     }
 
@@ -1678,6 +1682,8 @@ mod tests {
             FixedOwner { rank: rank as u8, category: Category::Runtime, group: "replayed max owners".into(),
                 bytes: bytes - 12 * per_layer, weights: 0, lifetime: Lifetime::RESIDENT, basis: Basis::Exact }).collect();
         toy_weight_owners(&mut recipe);
+        recipe.pool = crate::placement::prepare_pool(crate::placement::PoolFacts::new(
+            &[102 << 30; 2], recipe.context, Some(recipe.context), PAGE_ROWS)).unwrap();
         let request = request(recipe.context, Some(recipe.context), crate::placement::Onboard::Auto,
             recipe.prefill, Operation::Serving, ResidentWeights(u64::MAX), SparkReplyFormats::default());
         let started = std::time::Instant::now();

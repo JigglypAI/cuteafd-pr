@@ -835,7 +835,7 @@ fn k6_max_context_plan_charges_parity_pool_and_each_shared_allocation() -> Resul
     layout.workspace_manifest = Some(path);
     layout.context_tokens = 262_144;
     layout.pool_tokens = Some(2_097_152);
-    layout.target_pool_tokens = 2_097_152;
+    layout.target_pool_tokens = Some(2_097_152);
     layout.mla_kv = MlaCacheFormat::Fp8;
     layout.prefix_slots = Some(1);
     options.attention_placement = None;

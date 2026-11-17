@@ -151,7 +151,7 @@ fn full_context_mtp_forecast_charges_private_predictors_before_allocation() -> a
                 baseline: Baseline::Planned { context_bytes: arch.context_bytes, loaded_bytes: 0 },
                 reserve_bytes: 1 << 30 }; 2], spark_ranks: 6, peer_access: true },
             rows: 256, waves: 1, unit: 0, sequences: 16, context: 1_048_576, serving_context: crate::placement::planner::Context::pinned(1_048_576),
-            requested_pool: Some(1_048_576),
+            requested_pool: Some(1_048_576), target_pool: None,
             marks: MarkRule { lanes: 16, entries: 20, budget_bytes: 2 << 30, host: true },
             pending_code: (0..2).map(|rank| inventory::loaded_code_allowance(
                 "step5", "step5:fp8", true, rank, &arch, Some(&programs)).bytes).collect(),
@@ -774,7 +774,7 @@ fn nvfp4_min_card_admits_native_w4a4_and_bf16_root_stays_reference_only() {
         if let Some(tokens) = pool {
             assert_eq!(memory.pool_tokens, tokens);
         } else {
-            let target = crate::placement::PoolPolicy::resolve(&[96 << 30], context, None, 64).target;
+            let target = crate::placement::prepare_pool(crate::placement::PoolFacts::new(&[96 << 30], context, None, 64)).unwrap().target();
             assert!((context..=target).contains(&memory.pool_tokens));
             // More free capacity must grow the same default-format pool to its cap.
             let roomy = report_context(dir.path(), 1, 160, 4, None, context);

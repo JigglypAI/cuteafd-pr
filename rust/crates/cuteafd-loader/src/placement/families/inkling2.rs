@@ -135,8 +135,8 @@ pub struct InklingInputs {
     pub gpus: usize,
     pub spark_ranks: usize,
     pub context: Context,
-    /// Largest pool the build indexes (KV max), in tokens.
-    pub maximum_pool_tokens: u64,
+    /// The resolved pool policy used for both curve preparation and admission.
+    pub pool: crate::placement::PoolPolicy,
     pub prefill: PrefillShape,
     /// Boot concurrency C: per-sequence rings, conv lags, page tables, selector.
     pub sequences: u64,
@@ -275,7 +275,7 @@ fn with(mut components: Vec<Component>, activation: &Activation) -> Vec<Componen
 }
 
 impl InklingInputs {
-    pub fn maximum_pages(&self) -> u64 { self.maximum_pool_tokens.div_ceil(self.page_rows()) }
+    pub fn maximum_pages(&self) -> u64 { self.pool.maximum_tokens().div_ceil(self.page_rows()) }
 
     fn mark_bytes(&self) -> Result<u64, Refusal> {
         (0..self.cfg.layers).try_fold(0u64, |bytes, layer| {
@@ -327,7 +327,7 @@ impl InklingInputs {
     pub fn counts(&self) -> Vec<usize> { (0..=self.routed.len()).collect() }
 
     pub fn admit(&self, request: Request) -> Result<AdmittedInkling, Refusal> {
-        let solved = solve(request, self.budgets.clone(), self)?;
+        let solved = solve_prepared(request, self.budgets.clone(), self, &self.pool)?;
         let placement = self.execution(&solved)?;
         let onboard = placement.onboard_layers;
         Ok(AdmittedInkling { placement, onboard, draft_home: solved.decisions.draft_home,

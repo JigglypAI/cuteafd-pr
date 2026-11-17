@@ -89,14 +89,16 @@ pub(crate) fn admit(options: Options<'_>) -> Result<shared::AdmittedMuse> {
     budgets.extend((0..options.spark_ranks).map(|rank| shared::spark_budget(rank as u8, options.spark_rank_bytes[rank])));
     let context = options.max_context.unwrap_or(options.cfg.max_position as u64);
     let capacities = options.measured.iter().map(|sample| sample.total_bytes).collect::<Vec<_>>();
-    let maximum_pool_tokens = shared::maximum_pool_tokens(&capacities, context, options.pool_tokens);
+    let pool = cuteafd_loader::placement::prepare_pool(cuteafd_loader::placement::PoolFacts::new(
+        &capacities, cuteafd_loader::placement::planner::Context::resolve(context, options.max_context),
+        options.pool_tokens, shared::PAGE_ROWS))?;
     let media = options.media.unwrap_or(shared::MediaOptions { vision: cuteafd_loader::plan::MediaMode::Off,
         audio: cuteafd_loader::plan::MediaMode::Off, replicas: 1, vision_bytes: (0, 0), audio_bytes: (0, 0) });
     let prepared = shared::ProductionInput { kv_cache: options.kv_cache, cfg: options.cfg, core: options.core, projections: options.projections,
         catalog: options.catalog,
         budgets, host: options.host, prefill: options.prefill,
         bf16_target_head: crate::shared::target_head::TargetHead::configured().blas_head(true), slots: options.slots,
-        mark_slots: options.mark_slots, context, maximum_pool_tokens,
+        mark_slots: options.mark_slots, context, pool,
         partial_bf16_max_rows: options.partial_bf16_max_rows, partial_reply_formats: options.partial_reply_formats,
         local: options.local, drafter: options.drafter, fixed, media }.prepare()?;
     let request = shared::production_request(cuteafd_loader::placement::planner::Context::resolve(context, options.max_context), options.pool_tokens, options.onboard,
@@ -295,8 +297,9 @@ mod tests {
                 partial_bf16_max_rows: cutoff_rows, partial_reply_formats: formats,
                 local: shared::local_workspace(input.expert_catalog()?, Some(&path), gpus, prefill.unit_rows)?,
                 drafter: served_drafter, media: None })
-            })?.placement;
-            let live = without_sampled_baseline(live, arch.context_bytes);
+            })?;
+            assert_eq!(report.phase_ledger.as_ref().context("solved ledger")?.pool_policy, live.solved.pool_policy);
+            let live = without_sampled_baseline(live.placement, arch.context_bytes);
             // Coordinator ledgers, item by item (then the whole placement).
             for gpu in 0..gpus {
                 assert_eq!(live.items[gpu], planned.items[gpu], "{label}: GPU {gpu} ledger");
@@ -377,8 +380,9 @@ mod tests {
                 partial_reply_formats: Default::default(),
                 local: shared::local_workspace(input.expert_catalog()?, Some(&path), gpus, prefill.unit_rows)?,
                 drafter: None, media: Some(shared::MediaOptions::from_checkpoint(checkpoint,
-                    vision, cuteafd_loader::plan::MediaMode::Off, 1)?) })?.placement;
-            let live = without_sampled_baseline(live, arch.context_bytes);
+                    vision, cuteafd_loader::plan::MediaMode::Off, 1)?) })?;
+            assert_eq!(report.phase_ledger.as_ref().context("solved ledger")?.pool_policy, live.solved.pool_policy);
+            let live = without_sampled_baseline(live.placement, arch.context_bytes);
             assert_eq!(live, planned, "{gpus} RTX + {sparks} Sparks");
             for gpu in 0..gpus {
                 let output = live.items[gpu].iter().find(|item| item.group == "Muse prefill logits");
@@ -503,6 +507,7 @@ mod tests {
         let live = without_sampled_baseline(built.placement.clone(), arch.context_bytes);
         assert_eq!(&live, planned);
         let planned_phases = report.phase_ledger.as_ref().context("admitted phase ledger")?;
+        assert_eq!(planned_phases.pool_policy, built.solved.pool_policy);
         assert_eq!(planned_phases.budgets.len(), built.solved.budgets.len());
         for (planned, live) in planned_phases.budgets.iter().zip(&built.solved.budgets) {
             assert_eq!((&planned.id, &planned.locations, planned.physical_bytes,

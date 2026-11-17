@@ -930,7 +930,7 @@ mod tests {
             allocations.push(cuteafd_loader::placement::planner::Allocation::buffer(id, location,
                 u64::from(capacity.decode.rows) * 4, Lifetime::TARGET, category, "decode token ids"));
         }
-        let solved = ResolvedPlan { encoder_diagnostics: vec![],
+        let solved = ResolvedPlan { pool_policy: None, encoder_diagnostics: vec![],
             request: cuteafd_loader::placement::families::minimax_m3::request(Context::automatic(257),
                 Some(pool_tokens), cuteafd_loader::placement::Onboard::Layers(0), shape,
                 Operation::Serving, None, Default::default()),

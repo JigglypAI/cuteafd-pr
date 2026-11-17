@@ -739,7 +739,7 @@ pub struct ProductionInput<'a> {
     pub cfg: &'a GlmDsaConfig,
     pub layers: usize,
     pub context: u64,
-    pub maximum_pool_tokens: u64,
+    pub pool: crate::placement::PoolPolicy,
     pub attention: AttentionPlacement,
     pub gpus: usize,
     pub prefill: PrefillShape,
@@ -771,6 +771,7 @@ pub struct ProductionInput<'a> {
 /// Prepared physical alternatives, retained until the one shared solve selects
 /// them. Enumerating finite owner geometries is not a family-private fit loop.
 pub struct PreparedGlm<'a> {
+    pub pool: crate::placement::PoolPolicy,
     pub recipe: GlmRecipe<'a>,
     pub budgets: Vec<Budget>,
     local: BTreeMap<usize, super::local_physical::LocalPhysicalInventory>,
@@ -894,8 +895,8 @@ impl<'a> ProductionInput<'a> {
     pub fn prepare(mut self) -> Result<PreparedGlm<'a>, Refusal> {
         use super::local_physical::LocalPhysicalInventory;
         use crate::placement::{FfnMode, SparkIntakeMode, SparkIntakeOwners};
-        if self.maximum_pool_tokens < self.context {
-            return Err(Refusal::PoolBelowContext { tokens: self.maximum_pool_tokens, context: self.context });
+        if self.pool.maximum_tokens() < self.context {
+            return Err(Refusal::PoolBelowContext { tokens: self.pool.maximum_tokens(), context: self.context });
         }
         if !(1..=2).contains(&self.gpus) || self.layers == 0 || self.layers > self.cfg.layers
             || self.context == 0
@@ -925,7 +926,7 @@ impl<'a> ProductionInput<'a> {
             return Err(invalid("production attention or exchange geometry"));
         }
         let page_tokens = if partitioned { 2 * PAGE_ROWS } else { PAGE_ROWS };
-        let maximum_pages = self.maximum_pool_tokens.div_ceil(page_tokens);
+        let maximum_pages = self.pool.maximum_tokens().div_ceil(page_tokens);
         let owners = (self.attention == AttentionPlacement::Layers)
             .then(|| super::attention_owners(self.cfg, self.layers))
             .transpose().map_err(|error| invalid(&error.to_string()))?;
@@ -1121,7 +1122,7 @@ impl<'a> ProductionInput<'a> {
                     value: link.components(maximum_pages)? });
             }
         }
-        Ok(PreparedGlm { recipe, budgets: self.budgets, local, runtime,
+        Ok(PreparedGlm { pool: self.pool, recipe, budgets: self.budgets, local, runtime,
             load_overcharge_bytes: native_load.as_ref().map_or(0, |load| load.coarse_overcharge_bytes),
             decode_link: self.decode_link, prefill_link: self.prefill_link })
     }
@@ -1129,7 +1130,7 @@ impl<'a> ProductionInput<'a> {
 
 impl PreparedGlm<'_> {
     pub fn admit(mut self, request: Request) -> Result<AdmittedGlm, Refusal> {
-        let mut solved = crate::placement::planner::solve(request, self.budgets, &self.recipe)?;
+        let mut solved = crate::placement::planner::solve_prepared(request, self.budgets, &self.recipe, &self.pool)?;
         self.recipe.refine_pool_receipts(&mut solved)?;
         let count = solved.decisions.onboard_layers.iter().flatten().copied()
             .collect::<BTreeSet<_>>().len();

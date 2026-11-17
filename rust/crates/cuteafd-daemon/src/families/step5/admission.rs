@@ -320,7 +320,7 @@ mod tests {
                 unit,
                 sequences: 16,
                 context, serving_context: cuteafd_loader::placement::planner::Context::pinned(context),
-                requested_pool: pool,
+                requested_pool: pool, target_pool: None,
                 marks: prefix_marks(&<PrefixCli as clap::Parser>::parse_from([
                     "step5", "--host-cache-bytes", &host.map_or_else(|| "auto".into(), |n| n.to_string()),
                     "--prefix-cache-entries", &entries.to_string(),
@@ -333,6 +333,10 @@ mod tests {
                     Some(&path), unit, ranks, waves, cuteafd_loader::placement::Onboard::Auto)?,
             };
             let live = checkpoint_admission(&checkpoint, &inputs);
+            if let (Some(ledger), Ok(admitted)) = (&report.phase_ledger, &live) {
+                assert_eq!(ledger.pool_policy, admitted.solved.pool_policy,
+                    "Step-5 public plan and serve must carry identical resolved policy");
+            }
             if !report.wip_launchable() {
                 let error = live.err().expect("both edges must refuse the unsupported allocation");
                 let refusal = error.to_string();
