@@ -982,7 +982,13 @@ fn assert_pool_max_growth(input: &BudgetedPlanInput, options: &PlanOptions) {
     let target = 2 << 20;
     let capped = MemoryPolicy { kv_max: Some(target), ..Default::default() }
         .scoped(|| input.plan(options)).unwrap();
-    assert_eq!(default.memory_layout, capped.memory_layout, "default max must be byte-identical");
+    let physical = |report: &PlanReport| {
+        let mut memory = report.memory_layout.clone().unwrap();
+        // Muse reports elapsed solve time in notes; it is not an owner or placement.
+        memory.notes.retain(|note| !note.starts_with("Muse shared solve "));
+        memory
+    };
+    assert_eq!(physical(&default), physical(&capped), "default max must be byte-identical");
     let grown = MemoryPolicy { kv_max: Some(100_000_000), ..Default::default() }
         .scoped(|| input.plan(options)).unwrap();
     assert!(grown.fits && grown.placement_supported, "{}", render(&grown));
@@ -1048,7 +1054,7 @@ fn pool_max_grows_after_onboarding_in_every_family_planner() {
         options.vision = MediaMode::Off;
         let layout = options.layout.as_mut().unwrap();
         layout.pool_tokens = None;
-        if family == "kimi_k3" { layout.rtx_bytes = vec![crate::placement::inventory::PRO_TOTAL_BYTES; 2]; }
+        layout.rtx_bytes = vec![crate::placement::inventory::PRO_TOTAL_BYTES; 2];
         layout.workspace_manifest = Some(manifest);
         assert_pool_max_growth(&BudgetedPlanInput::open(dir.path()).unwrap(), &options);
     }
