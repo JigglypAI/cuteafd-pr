@@ -310,13 +310,15 @@ def stop_tree(process):
     except (ProcessLookupError, PermissionError):
         pass
     try:
-        process.wait(timeout=5)
+        process.wait(timeout=10)
     except subprocess.TimeoutExpired:
-        try:
-            os.killpg(process.pid, signal.SIGKILL)
-        except (ProcessLookupError, PermissionError):
-            pass
-        process.wait()
+        pass
+    # Kill the group even if its leader exited: descendants may ignore TERM.
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        pass
+    process.wait()
 
 
 def interrupt(signum, frame):
@@ -327,11 +329,10 @@ def interrupt(signum, frame):
     TERMINATED_SIGNAL = signum
     with CHILDREN_LOCK:
         running = list(CHILDREN)
-    for process in running:
-        try:
-            os.killpg(process.pid, signal.SIGTERM)
-        except (ProcessLookupError, PermissionError):
-            pass
+    # Stop children before the executor joins; a TERM-ignoring compile must
+    # not leave the signal handler waiting for the multi-hour suite timeout.
+    with ThreadPoolExecutor(max_workers=max(1, len(running))) as stopper:
+        list(stopper.map(stop_tree, running))
     raise KeyboardInterrupt(f'signal {signum}')
 
 

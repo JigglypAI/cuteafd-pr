@@ -910,3 +910,44 @@ def test_cpu_gate_terminated_in_lease_queue_writes_nonzero_receipt(tmp_path):
                 if process.poll() is None:
                     os.killpg(process.pid, 9)
                     process.wait()
+
+
+def test_term_ignoring_suite_has_bounded_unwind_and_terminated_receipt(tmp_path, monkeypatch):
+    import threading
+    (tmp_path / 'logs').mkdir()
+    ready = tmp_path / 'ready'
+    root = tmp_path / 'builds/term-ignoring'
+    root.mkdir(parents=True)
+    suite_log = tmp_path / 'logs/suite.log'
+    command = [sys.executable, '-c',
+               'import signal,time,pathlib; signal.signal(signal.SIGTERM, signal.SIG_IGN); '
+               f'pathlib.Path({str(ready)!r}).touch(); time.sleep(120)']
+    monkeypatch.setattr(gate, 'BUILDS', tmp_path / 'builds')
+    monkeypatch.setattr(gate, 'gate_lease', lambda: gate.nullcontext(None))
+    monkeypatch.setattr(gate, 'checked', lambda *a, **k: 'deadbeef')
+    monkeypatch.setattr(gate.signal, 'signal', lambda *a: None)
+    monkeypatch.setattr(sys, 'argv', ['cpu-gate', '--task', 'term-ignoring'])
+    gate.STOPPING.clear()
+    gate.TERMINATED_SIGNAL = None
+
+    def run_gate(args, root):
+        with gate.ThreadPoolExecutor(max_workers=1) as pool:
+            result = pool.submit(gate.run_logged, command, suite_log, dict(os.environ), tmp_path, 180)
+            deadline = time.monotonic() + 10
+            while not ready.exists():
+                assert time.monotonic() < deadline
+                threading.Event().wait(0.01)
+            gate.interrupt(15, None)
+            result.result()
+
+    monkeypatch.setattr(gate, 'run_gate', run_gate)
+    try:
+        started = time.monotonic()
+        assert gate.main() == 143
+        assert time.monotonic() - started < 13
+        record = json.loads((root / 'cpu-gate.json').read_text())
+        assert record['verdict'] == 'terminated' and record['exit'] == 143
+        assert not gate.CHILDREN
+    finally:
+        gate.STOPPING.clear()
+        gate.TERMINATED_SIGNAL = None
