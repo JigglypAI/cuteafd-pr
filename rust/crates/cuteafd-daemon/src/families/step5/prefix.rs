@@ -628,3 +628,38 @@ mod tests {
         Ok(())
     }
 }
+
+/// #2342: Step-5's state is GPU-only; its bind resets every empty sequence so a
+/// cold admission after a failed restore starts from a clean executor slot, and
+/// restore_with validates a fresh destination before it writes retained state.
+#[cfg(test)]
+mod rollback_tests {
+    fn production() -> &'static str {
+        include_str!("prefix.rs").split("\n#[cfg(test)]").next().unwrap()
+    }
+    fn body<'a>(source: &'a str, needle: &str) -> &'a str {
+        let rest = &source[source.find(needle).unwrap_or_else(|| panic!("{needle}"))..];
+        let end = rest.find("\n    }\n").map_or(rest.len(), |e| e + 6);
+        &rest[..end]
+    }
+
+    #[test]
+    fn bind_resets_empty_sequences_before_a_cold_prefill() {
+        let source = production();
+        let bind = body(source, "fn bind(&self, placement: &mut Placement)");
+        let empty = bind.find("if placement.committed == 0")
+            .expect("bind special-cases an empty destination");
+        let reset = bind.find("reset_sequence(placement.sequence)")
+            .expect("bind resets the sequence a failed restore abandoned");
+        assert!(empty < reset, "only an empty placement is reset");
+        let restore_with = body(source, "fn restore_with(");
+        let validate = restore_with.find("saved.validate_restore(placement, plan)?")
+            .expect("restore_with validates the retained frontier first");
+        let write = restore_with.find("self.restore_mark(*slot, placement, plan.resume())?")
+            .expect("restore_with installs the mark");
+        assert!(validate < write, "a rejected frontier must not reach the executor");
+        let validator = body(source, "fn validate_restore(");
+        assert!(validator.contains("placement.committed == 0"),
+            "a restore requires a fresh destination");
+    }
+}

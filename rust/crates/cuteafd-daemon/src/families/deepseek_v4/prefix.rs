@@ -865,3 +865,36 @@ mod tests {
         assert_eq!(a.0, c.0);
     }
 }
+
+/// #2342: V4 keeps no family discard; its restore validates the mark and the
+/// destination extent before it moves any window/compressor state, and the cold
+/// admission builds a fresh placement at len 0. The state is GPU-only, so this
+/// is a source contract.
+#[cfg(test)]
+mod rollback_tests {
+    fn production() -> &'static str {
+        include_str!("prefix.rs").split("\n#[cfg(test)]").next().unwrap()
+    }
+    fn body<'a>(source: &'a str, needle: &str) -> &'a str {
+        let rest = &source[source.find(needle).unwrap_or_else(|| panic!("{needle}"))..];
+        let end = rest.find("\n    }\n").map_or(rest.len(), |e| e + 6);
+        &rest[..end]
+    }
+
+    #[test]
+    fn a_failed_restore_cannot_leave_a_bound_partial_placement() {
+        let source = production();
+        let restore = body(source, "fn restore(&self, mark: Option<MarkSlot>");
+        let missing = restore.find("DeepSeek V4 restores exact snapshots with their window and compressor state")
+            .expect("restore requires the exact mark");
+        let extent = restore.find("len.div_ceil(SOURCE_PAGE_TOKENS) > placement.units.len()")
+            .expect("restore validates the destination extent");
+        let write = restore.find("self.move_mark(slot, placement, len, false)?")
+            .expect("restore installs the mark");
+        assert!(missing < write && extent < write, "restore must validate before writing state");
+        assert!(!source.contains("fn discard("), "V4 relies on the fresh cold placement");
+        let pool = include_str!("pool.rs");
+        assert!(body(pool, "pub fn new(state: usize, units: Vec<u32>)")
+            .contains("len: 0"), "the cold build starts every request at zero rows");
+    }
+}

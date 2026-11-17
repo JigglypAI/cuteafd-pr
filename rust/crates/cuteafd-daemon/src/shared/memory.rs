@@ -373,6 +373,7 @@ impl LoadStream<'_> {
 }
 impl Drop for LoadStream<'_> {
     fn drop(&mut self) {
+        if self.library.is_quarantined_after_failed_drain() { return; }
         // Owners must drop this stream before releasing buffers used by queued work.
         // SAFETY: this owner retains the stream until its queued work has drained.
         crate::shared::decode_graph::fatal_drain(

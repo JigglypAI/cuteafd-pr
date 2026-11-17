@@ -1867,6 +1867,16 @@ impl<'a> DflashDrafter<'a> {
         Ok(())
     }
 
+    /// No-copy host-only quarantine includes provisional suffix destinations.
+    pub(crate) fn quarantine_mla_pages(&self, slot: usize) {
+        if let DraftContext::Mla(context) = &self.context {
+            let mut state = context.state.borrow_mut();
+            if let Some(binding) = state.bindings.get(slot).copied().flatten() {
+                state.pool.quarantine(binding).expect("live MLA binding belongs to its pool");
+            }
+        }
+    }
+
     pub(crate) fn discard_context(&self, slot: usize) -> Result<()> {
         ensure!(slot < self.slots, "DFlash discard outside admitted slots");
         if let DraftContext::Mla(context) = &self.context {
