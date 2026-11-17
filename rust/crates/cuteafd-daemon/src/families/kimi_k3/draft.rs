@@ -21,6 +21,7 @@ pub(crate) struct Options {
 impl Options {
     pub(crate) fn kind(&self) -> Result<cuteafd_loader::families::kimi_k3::draft::DraftKind> {
         use cuteafd_loader::families::kimi_k3::draft::DraftKind;
+        cuteafd_loader::families::kimi_k3::draft::DraftHiddenStream::read(&self.snapshot)?;
         Ok(if crate::shared::speculation::block_dspark::is_dspark(&self.snapshot)? {
             DraftKind::BlockDspark
         } else { DraftKind::MlaDflash })
@@ -185,6 +186,8 @@ impl<'a> NativeDraft<'a> {
         programs: &'a Programs<'a>, options: &Options, streams: Vec<Rc<Stream<'a>>>,
         layout: &DraftLayout,
         exchange: Option<([Rc<Stream<'a>>; 2], Rc<crate::shared::peer_split::PeerExchange<'a>>)>) -> Result<Self> {
+        let hidden_stream = cuteafd_loader::families::kimi_k3::draft::DraftHiddenStream::read(&options.snapshot)?;
+        ensure!(hidden_stream == layout.hidden_stream(), "Kimi draft hidden stream differs from admitted checkpoint fact");
         if let DraftLayout::Mla(layout) = layout {
             ensure!(options.cache_format == layout.cache_format(), "Kimi draft options/admission cache records differ");
         }
@@ -243,7 +246,7 @@ impl<'a> NativeDraft<'a> {
             }
             None
         } else { admission.allocate_draft_marks(streams[head].device)? };
-        Ok(Self { hidden_stream: cuteafd_loader::families::kimi_k3::draft::DraftHiddenStream::read(&options.snapshot)?,
+        Ok(Self { hidden_stream,
             block_marks,window_marks, window_bytes, programs, k6_head: None, cache_format: options.cache_format, marks, owners: Owners { draft, target: None }, taps: allocate("DFlash bridge taps")?,
             ids: allocate("DFlash bridge input ids")?, input: allocate("DFlash bridge gathered input")?,
             bridge, producer: RefCell::new(crate::shared::memory::device::Event::new(device)?),
