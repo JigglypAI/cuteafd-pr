@@ -119,10 +119,6 @@ pub struct SparkSlice {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimeSample {
     pub device: i32,
-    /// Physical card identity, independent of total_bytes' logical ceiling.
-    /// Historical receipts omit it; fresh coordinator samples always provide it.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub physical_bytes: Option<u64>,
     pub total_bytes: u64,
     pub free_bytes: u64,
     /// Device use outside this process's tracked allocations, including modules.

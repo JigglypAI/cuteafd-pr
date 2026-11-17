@@ -1188,7 +1188,7 @@ mod tests {
             slices: vec![SparkSlice { unit_map: None, layer: 13, first: 0, width: 2048, stored_width: 2048,
                 tiers: vec![], projection_counts: vec![] }],
             runtime: SparkRuntimeInventory { detail: Default::default(), sample: RuntimeSample { device: 0, arch: "sm_121".into(),
-                sms: 48, driver: "test".into(), physical_bytes: Some(121 << 30), total_bytes: 121 << 30, free_bytes: 100 << 30,
+                sms: 48, driver: "test".into(), total_bytes: 121 << 30, free_bytes: 100 << 30,
                 context_bytes: 1 << 30, module_bytes: 1 << 20 },
                 workspace_bytes: 1 << 28, pinned_workspace_bytes: 0 },
             mapped_ring_bytes: selection.model().unwrap().ring_bytes(selection.geometry()).unwrap() as u64,

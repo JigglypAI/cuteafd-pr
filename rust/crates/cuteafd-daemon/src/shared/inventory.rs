@@ -54,15 +54,13 @@ impl RuntimeInventory {
                 }, || library.cuda_memory_info())?;
                 let tracked = cuteafd_ffi::memory_ledger::snapshot().total(cuteafd_ffi::memory_ledger::Space::Device, device);
                 let info = library.cuda_device_info(device)?;
-                anyhow::ensure!(info.total_memory_bytes > 0,
-                    "fresh coordinator sample lacks physical card memory");
                 let text = |chars: &[std::ffi::c_char]| {
                     // SAFETY: the native info call NUL-terminates every fixed-width string field.
                     unsafe { std::ffi::CStr::from_ptr(chars.as_ptr()) }.to_string_lossy().into_owned()
                 };
                 Ok(RuntimeSample {
                     device,
-                    physical_bytes: Some(info.total_memory_bytes), total_bytes: total as u64,
+                    total_bytes: total as u64,
                     free_bytes: free as u64,
                     context_bytes: (total.saturating_sub(free) as u64).saturating_sub(tracked as u64),
                     module_bytes: phase.module_bytes(before, free),

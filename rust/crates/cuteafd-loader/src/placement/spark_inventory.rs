@@ -570,7 +570,7 @@ mod tests {
             pinned: vec![], host: vec![term("host_measured_residual", 30, SparkRuntimeMethod::MeasuredResidual)] }
     }
     fn runtime_sample() -> cuteafd_core::RuntimeSample {
-        cuteafd_core::RuntimeSample { device: 0, physical_bytes: Some(16384 << 20), total_bytes: 16384 << 20,
+        cuteafd_core::RuntimeSample { device: 0, total_bytes: 16384 << 20,
             free_bytes: 8192 << 20, context_bytes: 0, module_bytes: 0, sms: 48,
             arch: "sm_121".into(), driver: "test".into() }
     }
@@ -629,7 +629,7 @@ mod tests {
     #[test]
     fn public_constructor_requires_dual_witness_evidence_and_package_identity() {
         let e = execution();
-        let runtime = cuteafd_core::RuntimeSample { device: 0, physical_bytes: Some(16384 << 20), total_bytes: 16384 << 20,
+        let runtime = cuteafd_core::RuntimeSample { device: 0, total_bytes: 16384 << 20,
             free_bytes: 8192 << 20, context_bytes: 0, module_bytes: 0, sms: 48,
             arch: "sm_121".into(), driver: "test".into() };
         let hashes: Vec<_> = e.manifests().iter().map(|m| m.sha256().to_owned()).collect();

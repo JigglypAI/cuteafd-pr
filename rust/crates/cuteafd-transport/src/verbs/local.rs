@@ -954,7 +954,7 @@ mod budget_tests {
             slices: vec![SparkSlice { unit_map: None, layer: 13, first: 0, width: 1024, stored_width: 1024,
                 tiers: vec![], projection_counts: vec![] }],
             runtime: SparkRuntimeInventory { detail: Default::default(), sample: RuntimeSample {
-                device: 0, physical_bytes: Some(121 << 30), total_bytes: 121 << 30, free_bytes: 100 << 30, context_bytes: 1,
+                device: 0, total_bytes: 121 << 30, free_bytes: 100 << 30, context_bytes: 1,
                 module_bytes: 1, sms: 48, arch: "sm_121".into(), driver: "test".into(),
             }, workspace_bytes: 1, pinned_workspace_bytes: 0 },
             mapped_ring_bytes: selection.model().unwrap().ring_bytes(selection.geometry())? as u64,

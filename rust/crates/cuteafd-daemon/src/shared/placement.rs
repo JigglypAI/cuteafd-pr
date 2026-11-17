@@ -454,7 +454,7 @@ mod tests {
     fn idle_report(rank: u32) -> ModelAdmissionResponse {
         ModelAdmissionResponse { rank, resident_bytes: 0, slices: vec![],
             runtime: SparkRuntimeInventory { detail: Default::default(), sample: RuntimeSample { device: 0,
-                physical_bytes: Some(120 << 30), total_bytes: 120 << 30, free_bytes: 100 << 30, context_bytes: 1 << 30,
+                total_bytes: 120 << 30, free_bytes: 100 << 30, context_bytes: 1 << 30,
                 module_bytes: 0, sms: 48, arch: "sm_121".into(), driver: "test".into() },
                 workspace_bytes: 0, pinned_workspace_bytes: 0 },
             mapped_ring_bytes: 0, host_exchange_bytes: 0, row_indices_bytes: 0 }
