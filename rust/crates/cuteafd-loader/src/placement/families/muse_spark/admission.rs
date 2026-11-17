@@ -695,7 +695,7 @@ impl<'a> ProductionInput<'a> {
                         placement.weights
                     } else { 0 };
                     components.extend(weights(format!("muse.{name}.weights.{option}.{copy}"), location,
-                        placement.weights, resident, Category::Weights, &format!("{name} tower"),
+                        placement.weights, resident, Category::Weights, if name == "vision" { crate::media::still_tower::vision_weight_arena_label() } else { "audio tower" },
                         maximum_pages)?);
                     components.extend(buffer(format!("muse.{name}.scratch.{option}.{copy}"), location,
                         placement.scratch, Lifetime::RESIDENT, Category::Workspace,
@@ -823,7 +823,7 @@ impl MuseRecipe<'_> {
             .ok_or_else(|| invalid("admitted encoder outside the prepared options"))?.clone();
         let mut spark_items = vec![Vec::new(); self.spark_ranks];
         for (name, placement) in [("vision", &vision), ("audio", &audio)] {
-            let items = [Item::new(Category::Weights, format!("{name} tower"), "BF16 native",
+            let items = [Item::new(Category::Weights, if name == "vision" { crate::media::still_tower::vision_weight_arena_label() } else { "audio tower" }, "BF16 native",
                 placement.weights, Basis::Exact),
                 Item::new(Category::Workspace, format!("{name} scratch"), "resident", placement.scratch,
                     Basis::Exact)];

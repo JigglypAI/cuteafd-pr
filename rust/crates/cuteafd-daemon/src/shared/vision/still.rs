@@ -99,6 +99,40 @@ pub(crate) fn inject(stream:&crate::shared::memory::device::Stream<'_>,
         &chunk.features,&chunk.indices,features,indices,output,rows,width,1,stream.raw)?))
 }
 
+/// Bind the entry device for both token gathering and image scatter. The
+/// scheduler may currently own a different terminal/head device.
+pub(crate) fn embed_inject(stream:&crate::shared::memory::device::Stream<'_>,
+    embed:impl FnOnce()->Result<()>,chunk:&cuteafd_engine::media::MediaChunk,
+    features:cuteafd_ffi::CuteafdDeviceBuffer,indices:cuteafd_ffi::CuteafdDeviceBuffer,
+    output:cuteafd_ffi::CuteafdDeviceBuffer,rows:usize,width:usize)->Result<()> {
+    stream.device.run(|| {
+        embed()?;
+        inject(stream,chunk,features,indices,output,rows,width)
+    })
+}
+
+#[cfg(test)]
+mod device_tests {
+    use super::*;
+    #[test]
+    fn gather_and_scatter_bind_entry_device_and_restore_terminal_device() -> Result<()> {
+        use crate::shared::memory::device::{Device,Stream};
+        let fixture=cuteafd_ffi::native_library_lifetime_fixture::Fixture::build_for_tests()?;
+        let library=fixture.load()?;
+        let stream=Stream::new(Device {library:&library,id:0})?;
+        library.cuda_set_device(1)?;
+        let empty=cuteafd_ffi::CuteafdDeviceBuffer {ptr:std::ptr::null_mut(),bytes:0,device_id:0,flags:0};
+        let mut gathered=false;
+        embed_inject(&stream,|| {
+            assert_eq!(library.cuda_get_device()?,0,"token gather must own the entry device, not the scheduler's head");
+            gathered=true;Ok(())
+        },&Default::default(),empty,empty,empty,1,2)?;
+        assert!(gathered);assert_eq!(library.cuda_get_device()?,1);
+        assert!(embed_inject(&stream,||anyhow::bail!("gather failed"),&Default::default(),empty,empty,empty,1,2).is_err());
+        assert_eq!(library.cuda_get_device()?,1);
+        Ok(())
+    }
+}
 /// Replace selected F32 embedding rows with exact BF16 feature widenings.
 /// BF16 scatter and F32 output use disjoint, caller-admitted row planes.
 pub(crate) fn inject_f32(stream: &crate::shared::memory::device::Stream<'_>,

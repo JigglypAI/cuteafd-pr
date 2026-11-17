@@ -298,7 +298,7 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
         ensure_tower_spark(&mut sparks, rank, options);
         let Some(device) = sparks.iter_mut().find(|device| device.index as usize == rank) else { continue };
         let overhead = crate::plan::encoder::V41_SPARK_CUDA_OVERHEAD_BYTES;
-        device.items.push(Item::new(Category::Weights, "vision tower", "", vision_extent, Basis::Exact));
+        device.items.push(Item::new(Category::Weights, crate::media::still_tower::vision_weight_arena_label(), "", vision_extent, Basis::Exact));
         device.items.push(Item::new(Category::Workspace, "vision scratch", "",
             encoder.scratch.saturating_sub(overhead), Basis::Exact));
         device.items.push(Item::new(Category::Runtime, "vision CUDA overhead", "", overhead, Basis::Exact));

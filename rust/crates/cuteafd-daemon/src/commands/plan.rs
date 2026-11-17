@@ -1030,7 +1030,7 @@ fn file_args(mut args: PlanArgs, snapshot: &std::path::Path) -> Result<PlanArgs>
         }
     }
     if let Some(mode) = cfg.get("VISION") { args.vision = mode.parse().map_err(anyhow::Error::msg)?; }
-    else if !matches!(family, "mimo_v2" | "glm5_flash" | "qwen4") && args.vision == MediaMode::Auto {
+    else if !matches!(family, "mimo_v2" | "glm5_flash" | "qwen4" | "minimax_m3") && args.vision == MediaMode::Auto {
         args.vision = MediaMode::Off;
     }
     if let Some(mode) = cfg.get("AUDIO") { args.audio = mode.parse().map_err(anyhow::Error::msg)?; }
