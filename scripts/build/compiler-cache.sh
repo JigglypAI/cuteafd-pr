@@ -135,6 +135,8 @@ PY
     cuteafd_compiler_cache_warn 'cannot create compiler shims'; return 0
   fi
   export CUTEAFD_KACHE_ACTIVE="$wrapper" KACHE_CONFIG="$config" KACHE_HOST_CONFIG=
+  # Nested per-invocation gate configs must not inherit kache's nearest Cargo root.
+  export KACHE_EVENT_ROOT="$(realpath -m "$build_dir")"
   export KACHE_CACHE_DIR="$cache" KACHE_BUILD_SCRIPT_CACHE=0 KACHE_OUT_DIR_ALIAS=0
   export KACHE_VERIFY_RESTORES=always
   export CUTEAFD_KACHE_WARNING_DIR="$build_dir/compiler-cache/warned"

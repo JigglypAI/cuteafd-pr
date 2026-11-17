@@ -485,3 +485,11 @@ exec "$@"
                          'PATH': str(binary) + os.pathsep + os.environ['PATH']},
               '"$RUSTC_WRAPPER" /bin/true')
     assert f'-k 5 900 {wrapper} /bin/true' in calls.read_text()
+
+
+def test_nested_gate_cache_config_pins_event_root(tmp_path):
+    build = tmp_path / 'build'
+    result = run_setup(tmp_path, {'CUTEAFD_KACHE': fake_kache(tmp_path),
+                                 'CUTEAFD_KACHE_CACHE_DIR': str(tmp_path / 'cache'),
+                                 'KACHE_EVENT_ROOT': '/inherited/other-build'})
+    assert f'KACHE_EVENT_ROOT={build.resolve()}\n' in result.stdout
