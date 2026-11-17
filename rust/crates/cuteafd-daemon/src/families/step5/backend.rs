@@ -6,7 +6,7 @@ use crate::shared::{draft::routes::RoundRoutes, memory::{device::{Allocation, De
     token_io::{DeviceLogits, TokenEmbedding}};
 use anyhow::{ensure, Context, Result};
 use cuteafd_api::openai::NativeRequest;
-use cuteafd_engine::{media::{EncodeJob, EmbeddingCache, MediaKeys, RequestMedia},
+use cuteafd_engine::{media::{EncodeJob, EmbeddingCache, RequestMedia},
     prefix::{PrefixCache, PrefixConfig, PrefixFamily, RefPagePool}};
 use cuteafd_ffi::NativeLibrary;
 use std::{cell::{Cell, RefCell}, path::Path};
@@ -150,6 +150,7 @@ pub(super) struct Step5Backend<'e, 'a> {
     depth: Option<crate::shared::prefill_depth::PrefillDepth>,
     packed_row_cap: Option<usize>,
     admitted_host: Option<(u64, cuteafd_core::prefix::HostCacheGeometry)>,
+    vision: Option<crate::shared::vision::perception::Binding>,
 }
 
 impl<'e, 'a> Step5Backend<'e, 'a> {
@@ -182,7 +183,11 @@ impl<'e, 'a> Step5Backend<'e, 'a> {
         };
         Ok(Self { state: BackendState::new(fail_verify_once), execution, ranks, embedding, inputs,
             profile: RefCell::new([0.0; 2]), rows, context, sequences, library, mtp: None,
-            prefill: (rows, 1), depth: None, packed_row_cap: None, admitted_host: None })
+            prefill: (rows, 1), depth: None, packed_row_cap: None, admitted_host: None, vision: None })
+    }
+
+    pub(super) fn with_vision(mut self, binding: crate::shared::vision::perception::Binding) -> Self {
+        self.vision = Some(binding); self
     }
 
     pub(super) fn with_served_context(mut self, context: usize) -> Result<Self> {
@@ -251,7 +256,7 @@ impl<'e, 'a> Step5Backend<'e, 'a> {
         let result = self.execution.warming_graphs(|| -> Result<()> {
             for &(rows, _) in &selected {
                 let pages = pool.alloc(rows.div_ceil(64)).context("Step-5 graph prewarm scratch pages")?;
-                let mut placement = Placement { pages, sequence: 0, committed: 0 };
+                let mut placement = Placement { media: None, pages, sequence: 0, committed: 0 };
                 let tokens = vec![0u32; rows];
                 // First-touch eagerly, seed after lazy module/workspace setup,
                 // then capture the same persistent geometry on the next pass.
@@ -351,6 +356,19 @@ impl<'e, 'a> Step5Backend<'e, 'a> {
         let entry = self.execution.ownership().execution().spec().entry_gpu as usize;
         step.compose(entry, input, |input, meta| meta.stream.device.run(|| {
             self.embedding.embed(&tokens, input.ids.buffer, 1, input.bf16.buffer, meta.stream.raw)?;
+            let mut chunk = cuteafd_engine::media::MediaChunk::default();
+            let mut offset = 0usize;
+            for (placement, tokens) in sequences.iter() {
+                if let Some(media) = &placement.media {
+                    let mut member = cuteafd_engine::media::MediaChunk::default();
+                    media.write_chunk(placement.committed, placement.committed + tokens.len(), &mut member)?;
+                    chunk.indices.extend(member.indices.into_iter().map(|row| row + offset as u32));
+                    chunk.features.extend(member.features);
+                }
+                offset += tokens.len();
+            }
+            crate::shared::vision::still::inject(meta.stream, &chunk, input.residual.buffer,
+                input.ids.buffer, input.bf16.buffer, meta.rows, H)?;
             // SAFETY: all three admitted input owners are retained by the backend;
             // the Step drains this stream before reuse, including on submission errors.
             unsafe {
@@ -500,26 +518,21 @@ impl<'e, 'a> Backend<'a> for Step5Backend<'e, 'a> {
         Ok((family, cache))
     }
     fn prepare(&self, job: NativeRequest, tokens: Vec<u32>) -> Result<(scheduler::Prompt, RequestMedia, Vec<EncodeJob>)> {
-        ensure!(job.media.is_empty(), "Step-5 bundled media encoder is not yet qualified");
-        let keys = MediaKeys::new(&tokens, V as u32, &[])?;
-        let media = RequestMedia::new(Vec::new(), H, tokens.len())?;
-        Ok((scheduler::Prompt { job, tokens, keys }, media, Vec::new()))
+        if self.vision.is_none() {
+            ensure!(job.media.is_empty() && job.image_groups.is_empty(), "vision is disabled");
+            return crate::shared::vision::still::Binding::prepare(job, tokens, V as u32, H, self.context, 0, vec![]);
+        }
+        self.vision.as_ref().context("Step-5 media binding absent")?.prepare(job, tokens, V as u32, H, self.context)
     }
-    fn probe_features(&self, prompt: &scheduler::Prompt, media: &mut RequestMedia,
-        _cache: &mut EmbeddingCache, _snapshot: &Path) -> Result<()> {
-        ensure!(prompt.job.media.is_empty() && media.spans().is_empty(), "Step-5 text target cannot accept media");
-        Ok(())
-    }
-    fn coordinates(&self, _tokens: &[u32], job: &NativeRequest, media: &RequestMedia) -> Result<()> {
-        ensure!(job.media.is_empty() && media.spans().is_empty(), "Step-5 text coordinates cannot accept media");
-        Ok(())
-    }
+    fn probe_features(&self, _: &scheduler::Prompt, _: &mut RequestMedia, _: &mut EmbeddingCache, _: &Path) -> Result<()> { Ok(()) }
+    fn coordinates(&self, _: &[u32], _: &NativeRequest, _: &RequestMedia) -> Result<()> { Ok(()) }
     fn placement(&self, pages: Vec<u32>, slot: i32) -> Placement {
-        Placement { pages, sequence: slot as u64, committed: 0 }
+        Placement { media: None, pages, sequence: slot as u64, committed: 0 }
     }
-    fn bind_request(&self, placement: &mut Placement, _coordinates: (), _media: RequestMedia,
+    fn bind_request(&self, placement: &mut Placement, _: (), media: RequestMedia,
         tokens: &[u32], resume: usize) -> Result<()> {
         self.state.retire();
+        placement.media = (!media.spans().is_empty()).then_some(media);
         if let Some(mtp) = self.mtp { mtp.bind(placement.sequence, tokens, resume); }
         Ok(())
     }
@@ -801,7 +814,7 @@ mod tests {
     fn immediate_accept_matches_consumes_and_retires_exact_wave() -> Result<()> {
         for fault in 0..8 {
             let wave = ImmediateWave::default();
-            let mut placement = Placement { pages: vec![3], sequence: 2, committed: 7 };
+            let mut placement = Placement { media: None, pages: vec![3], sequence: 2, committed: 7 };
             let tokens = [11, 13];
             *wave.0.borrow_mut() = Some(ImmediateWave::record(&[(&mut placement, &tokens)]));
             placement.committed = 9;
@@ -826,7 +839,7 @@ mod tests {
         // already-published state is released, never rolled back approximately.
         for committed in 6..=10 {
             let wave = ImmediateWave::default();
-            let mut placement = Placement { pages: vec![3], sequence: 2, committed: 7 };
+            let mut placement = Placement { media: None, pages: vec![3], sequence: 2, committed: 7 };
             *wave.0.borrow_mut() = Some(ImmediateWave::record(&[(&mut placement, &[11, 13])]));
             placement.committed = committed;
             let mut draft = NoDraft::default();

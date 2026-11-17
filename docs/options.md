@@ -220,6 +220,18 @@ these request values do not imply that a Planned checkpoint has a serving execut
 | --- | --- | --- | --- |
 | `reasoning_effort` (Inkling) | `high` (= 0.9) | `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, or a JSON number in `[0, 0.99]` | Native template values are 0, 0.1, 0.2, 0.7, 0.9, 0.99 and 0.99, respectively. A top-level value takes precedence over `chat_template_kwargs.reasoning_effort`; explicit thinking-off resolves to `none`. Reasoning and tool calls use native message channels. Only `<|content_model_end_sampling|>` (token 200006) ends generation; `<|end_message|>` closes a channel and is not an EOS stop. |
 
+### PE Vision Qualification
+
+Inkling and Step-5 use the shared bundled PE tower runtime and image admission.
+`VISION=off` remains the qualified text-only configuration while normal image
+answers are being qualified (#1930, #1994). Explicit `VISION=spark[:rank]` or
+`VISION=rtx[:gpu]` selects the jointly admitted packed tower owner in WIP builds;
+`VISION_REPLICAS=1..8` and `MEDIA_CACHE_BYTES` use the shared media options.
+Each tower has one weight arena and one scratch backing per replica; tensor
+views do not add another charge. Step-5 images retain ordered local crops and
+the global view with native separators; the 896x812 processor case expands to
+493 feature rows and 506 prompt tokens. Audio remains unsupported.
+
 ### Inkling Serving
 
 Inkling exposes `cuteafd serve --family inkling2` and `./run.sh --wip SLOT`

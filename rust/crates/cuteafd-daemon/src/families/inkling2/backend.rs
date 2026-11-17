@@ -5,7 +5,7 @@ use crate::shared::{draft::routes::RoundRoutes, prefix::{CudaCopyEngine, PrefixA
     qwen::scheduler::{self, Backend}, token_io::{DeviceLogits, TokenSelector}};
 use anyhow::{ensure, Context, Result};
 use cuteafd_api::openai::NativeRequest;
-use cuteafd_engine::{media::{EncodeJob, EmbeddingCache, MediaKeys, RequestMedia},
+use cuteafd_engine::{media::{EncodeJob, EmbeddingCache, RequestMedia},
     prefix::{PrefixCache, PrefixConfig, PrefixFamily, RefPagePool}};
 use std::{cell::RefCell, collections::BTreeSet, path::Path};
 
@@ -54,6 +54,7 @@ pub(crate) struct InklingBackend<'a> {
     pending: RefCell<Option<Vec<(usize, usize, Vec<u32>)>>>,
     selector: Vec<cuteafd_loader::placement::planner::Allocation>,
     selector_ready: std::cell::Cell<bool>,
+    vision: Option<crate::shared::vision::perception::Binding>,
 }
 impl<'a> InklingBackend<'a> {
     pub fn new(execution: Execution<'a>, context: usize,
@@ -70,7 +71,10 @@ impl<'a> InklingBackend<'a> {
         ensure!(!selector.is_empty(), "Inkling selector was not admitted before startup");
         Ok(Self { execution: RefCell::new(execution), family: InklingPrefix::new(cache), library,
             context, concurrency, unit_rows, waves, vocab, host, profile: RefCell::new([0.; 2]),
-            pending: RefCell::new(None), selector, selector_ready: std::cell::Cell::new(false) })
+            pending: RefCell::new(None), selector, vision: None, selector_ready: std::cell::Cell::new(false) })
+    }
+    pub fn with_vision(mut self, binding: crate::shared::vision::perception::Binding) -> Self {
+        self.vision = Some(binding); self
     }
     fn check(&self, placement: &Placement, tokens: &[u32], pool: &RefPagePool) -> Result<()> {
         ensure!(!tokens.is_empty() && tokens.iter().all(|&token| (token as usize) < self.vocab)
@@ -189,21 +193,21 @@ impl<'a> Backend<'a> for InklingBackend<'a> {
         Ok((self.family.clone(), cache))
     }
     fn prepare(&self, job: NativeRequest, tokens: Vec<u32>) -> Result<(scheduler::Prompt, RequestMedia, Vec<EncodeJob>)> {
-        ensure!(job.media.is_empty(), "Inkling initial text executor does not load its bundled vision tower");
-        let keys = MediaKeys::new(&tokens, u32::try_from(self.vocab)?, &[])?;
-        let media = RequestMedia::new(vec![], 4608, tokens.len())?;
-        Ok((scheduler::Prompt { job, tokens, keys }, media, vec![]))
+        if self.vision.is_none() {
+            ensure!(job.media.is_empty() && job.image_groups.is_empty(), "vision is disabled");
+            return crate::shared::vision::still::Binding::prepare(job, tokens, u32::try_from(self.vocab)?, 4608, self.context, 0, vec![]);
+        }
+        self.vision.as_ref().context("Inkling media binding absent")?.prepare(job, tokens,
+            u32::try_from(self.vocab)?, 4608, self.context)
     }
-    fn probe_features(&self, _: &scheduler::Prompt, media: &mut RequestMedia, _: &mut EmbeddingCache, _: &Path) -> Result<()> {
-        ensure!(media.spans().is_empty(), "Inkling media executor absent"); Ok(())
-    }
-    fn coordinates(&self, _: &[u32], job: &NativeRequest, media: &RequestMedia) -> Result<()> {
-        ensure!(job.media.is_empty() && media.spans().is_empty(), "Inkling media executor absent"); Ok(())
-    }
-    fn placement(&self, units: Vec<u32>, slot: i32) -> Placement { Placement { units, slot: slot as usize, len: 0, state_len: 0 } }
-    fn bind_request(&self, placement: &mut Placement, _: (), _: RequestMedia, tokens: &[u32], resume: usize) -> Result<()> {
+    fn probe_features(&self, _: &scheduler::Prompt, _: &mut RequestMedia, _: &mut EmbeddingCache, _: &Path) -> Result<()> { Ok(()) }
+    fn coordinates(&self, _: &[u32], _: &NativeRequest, _: &RequestMedia) -> Result<()> { Ok(()) }
+    fn placement(&self, units: Vec<u32>, slot: i32) -> Placement { Placement { media: None, units, slot: slot as usize, len: 0, state_len: 0 } }
+    fn bind_request(&self, placement: &mut Placement, _: (), media: RequestMedia, tokens: &[u32], resume: usize) -> Result<()> {
         ensure!(placement.len == resume && placement.state_len == resume && resume <= tokens.len(),
-            "Inkling restored request frontier differs"); Ok(())
+            "Inkling restored request frontier differs");
+        placement.media = (!media.spans().is_empty()).then_some(media);
+        Ok(())
     }
     fn history(&self, placement: &Placement) -> usize { placement.slot }
     fn require_live(&self) -> Result<()> { self.execution.borrow().require_live() }
@@ -316,7 +320,7 @@ mod tests {
     fn append_writes_only_reserved_private_nonaliased_pages() -> Result<()> {
         let mut pool = RefPagePool::new(4, 64);
         let units = pool.alloc_for(0..2)?;
-        let placement = Placement { units: units.clone(), slot: 0, len: 63, state_len: 63 };
+        let placement = Placement { media: None, units: units.clone(), slot: 0, len: 63, state_len: 63 };
         check_writable(&placement, 3, 128, &pool)?;
         pool.share(&units[..1]);
         assert!(check_writable(&placement, 3, 128, &pool).is_err());
