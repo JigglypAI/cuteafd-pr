@@ -7,7 +7,7 @@ use cuteafd_loader::media::{ImageFamily, ProcessorConfig};
 use std::{path::Path, sync::Arc};
 
 pub(crate) fn install(profile: ModelProfile, snapshot: &Path, family: ImageFamily) -> Result<ModelProfile> {
-    let config = cuteafd_loader::read_json_file(&snapshot.join("config.json"))?;
+    let config: serde_json::Value = cuteafd_loader::read_json_file(&snapshot.join("config.json"))?;
     if config.get("vision_config").is_none_or(serde_json::Value::is_null) { return Ok(profile); }
     let processor = ProcessorConfig::from_snapshot(snapshot, family)?;
     let spec = crate::shared::vision::TowerSpec::from_snapshot(snapshot, processor.max_image_tokens)?;
@@ -34,6 +34,7 @@ fn marker(snapshot: &Path, name: &str, vocabulary: u32) -> Result<u32> {
 
 pub(crate) fn spans(job: &NativeRequest, tokens: &[u32], vocabulary: u32, context: usize,
     snapshot: &Path, family: ImageFamily) -> Result<Vec<MediaSpan>> {
+    ensure!(job.audio.is_empty(), "still probe does not accept audio");
     if job.media.is_empty() { return Ok(Vec::new()); }
     let probe = job.probe.as_ref().filter(|p| p.spec.feature_scoring())
         .context("bundled vision is not production-qualified; images require a cold fidelity feature override")?;
@@ -57,6 +58,11 @@ pub(crate) fn spans(job: &NativeRequest, tokens: &[u32], vocabulary: u32, contex
             let suffix = marker(snapshot, "<|media_end|>", vocabulary)?;
             ensure!(span.start >= prefix.len() && tokens[span.start-prefix.len()..span.start] == prefix
                 && tokens.get(end) == Some(&suffix), "Kimi probe source-dimension markers differ");
+        }
+        else {
+            ensure!(span.start > 0 && tokens.get(span.start - 1) == Some(&marker(snapshot, "]<]start of image[>[", vocabulary)?)
+                && tokens.get(end) == Some(&marker(snapshot, "]<]end of image[>[", vocabulary)?),
+                "MiniMax probe image boundaries differ");
         }
         covered.extend(span.start..end);
         spans.push(MediaSpan { start: span.start, len: span.len, key: image.key.into() });
@@ -94,7 +100,7 @@ pub(crate) fn features(prompt: &crate::shared::qwen::scheduler::Prompt, media: &
     if media.spans().is_empty() { return Ok(()); }
     ensure!(prompt.job.probe.as_ref().is_some_and(|p| p.spec.feature_scoring()), "still media is fidelity-only");
     let root = std::env::var_os("CUTEAFD_MEDIA_FEATURES_DIR").context("fidelity image feature payload directory absent")?;
-    super::features::apply_probe_features(&prompt.job, media, cache, &root.into(),
+    super::features::apply_probe_features(&prompt.job, media, cache, &std::path::PathBuf::from(root),
         &snapshot_identity(snapshot, family)?, "a9bf8c76")
 }
 
@@ -122,4 +128,59 @@ pub(crate) fn inject(stream: &crate::shared::memory::device::Stream<'_>,
         stream.device.library.copy_h2d(target, data)?;
     }
     Ok(())
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cuteafd_api::openai::probe::{Probe, ProbeFixture, ProbeImageUrl, ProbeMedia, ProbeSpec};
+    use cuteafd_loader::media::{EncoderId, ImageGrid, ImageKey, PreparedImage, PreprocessId};
+
+    #[test]
+    fn kimi_full_span_dimensions_reach_media_ready_and_exact_kv_lease() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        cuteafd_loader::plan::testing::write_kimi_tokenizer(root.path());
+        let mut config: serde_json::Value = cuteafd_loader::read_json_file(&root.path().join("tokenizer_config.json"))?;
+        for (id, token) in [(258, "<|media_begin|>"), (259, "<|media_content|>"),
+            (260, "<|media_pad|>"), (261, "<|media_end|>")] {
+            config["added_tokens_decoder"][id.to_string()] = serde_json::json!({"content":token});
+        }
+        std::fs::write(root.path().join("tokenizer_config.json"), serde_json::to_vec(&config)?)?;
+        let tokenizer = cuteafd_loader::cached_tokenizer(root.path())?;
+        let prefix = tokenizer.encode_ids("<|media_begin|>image 7069x1833<|media_content|>")?;
+        let mut tokens = vec![1]; tokens.extend(prefix);
+        let start = tokens.len();
+        tokens.extend(std::iter::repeat_n(260, 16698)); tokens.extend([261, 2, 3]);
+        let image = Arc::new(PreparedImage { key: ImageKey([7;32]), encoder: EncoderId([1;32]),
+            processor: PreprocessId([2;32]), grid: ImageGrid { t:1, h:132, w:506 }, tokens:16698,
+            rgb8: vec![0; 7084 * 1848 * 3].into(),
+            pixels: cuteafd_core::media::ImagePixels { source:[7069,1833], content:[0,0,7069,1833],
+                canvas:[7084,1848] } });
+        let probe = Probe::new(ProbeSpec { cold:true, no_speculation:true, score_from:Some(tokens.len()-1),
+            prompt_ids:Some(tokens.clone()), media:vec![ProbeMedia { start,len:16698,kind:"image".into(),
+                key:"07".repeat(32),grid:[1,132,506],identity:None,input_key:None,
+                fixture:Some(ProbeFixture {path:"image.png".into(),sha256:"ab".repeat(32)}),
+                image_url:Some(ProbeImageUrl {url:"fixture".into(),detail:None}) }], ..Default::default() });
+        let mut job = NativeRequest { prefix_cache_source:Default::default(),finish_detail:Default::default(),
+            literal_spans:vec![],prompt:String::new(),constraint:None,images:vec![],media:vec![image],audio:vec![],
+            max_tokens:64,sampling:Default::default(),stop_token_ids:vec![],
+            events:tokio::sync::mpsc::unbounded_channel().0,usage:None,probe:None };
+        assert!(spans(&job, &tokens,512,32768,root.path(),ImageFamily::Kimi).is_err());
+        job.probe=Some(probe);
+        let (prompt,mut media,jobs)=prepare(job,tokens.clone(),512,1,32768,root.path(),ImageFamily::Kimi)?;
+        assert_eq!(media.spans()[0].len,16698);
+        let mut queue=admission();
+        let key=ImageKey([8;32]); let pin=queue.cache.reserve(key,16698*2)?;
+        let lease=queue.cache.complete(key,vec![0;16698*2].into())?;
+        media.attach_probe_override(ImageKey([7;32]),lease)?; drop(pin);
+        queue.enqueue(cuteafd_engine::media::MediaWaiter::new(prompt,media,jobs,0)?).map_err(|(_,e)|e)?;
+        let ready=match queue.poll(|_|false) {cuteafd_engine::media::MediaPoll::Ready(ready)=>ready,
+            _=>anyhow::bail!("not media-ready")};
+        let reserve=cuteafd_engine::reserve::KvReserve::new(
+            cuteafd_engine::reserve::ReserveConfig::new(16384,0,-1,131072)?,64);
+        let ready_tokens=ready.job().tokens.len();
+        let lease=reserve.lease(ready_tokens,64,8,32768)?;
+        assert_eq!(lease.lifetime(),ready_tokens+64+8);
+        assert_eq!(reserve.admission_rows(&lease),ready_tokens+64+8);
+        Ok(())
+    }
 }

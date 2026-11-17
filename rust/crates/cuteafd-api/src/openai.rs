@@ -2712,6 +2712,65 @@ mod tests {
         }
     }
     #[tokio::test]
+    async fn fidelity_preparer_never_enables_public_vision_or_ordinary_image_chat() {
+        use base64::Engine;
+        use sha2::{Digest, Sha256};
+        use cuteafd_loader::media::{EncoderId, ImageFamily, ProcessorConfig};
+        let preparer = Arc::new(media::MediaPreparer::new(ProcessorConfig::for_family(ImageFamily::Mimo),
+            EncoderId([1; 32]), media::ImageUrlFetch::Off, 1).unwrap());
+        let bytes = include_bytes!("openai/fixtures/black.png");
+        let url = format!("data:image/png;base64,{}", base64::engine::general_purpose::STANDARD.encode(bytes));
+        let image = preparer.prepare(&[media::MediaSource { url: url.clone(), low: false }]).unwrap().images.remove(0);
+        let spec = probe::ProbeSpec { cold: true, no_speculation: true, score_from: Some(image.tokens + 1),
+            prompt_ids: Some(vec![1; image.tokens + 3]),
+            media: vec![probe::ProbeMedia { start: 1, len: image.tokens, kind: "image".into(),
+                key: image.key.0.iter().map(|v| format!("{v:02x}")).collect(),
+                grid: [image.grid.t, image.grid.h, image.grid.w], identity: None, input_key: None,
+                fixture: Some(probe::ProbeFixture { path: "image.png".into(), sha256: format!("{:x}", Sha256::digest(bytes)) }),
+                image_url: Some(probe::ProbeImageUrl { url: url.clone(), detail: None }) }], ..Default::default() };
+        let profile = ModelProfile::new(MODEL, ModelEncoding::DeepseekV4).with_probe_media(preparer);
+        assert!(!profile.capabilities.vision && profile.media_preparer.is_none());
+        let (tx, mut rx) = mpsc::channel::<NativeRequest>(1);
+        let app = router_for_model(tx, NativeLimits::default(), Arc::new(Mutex::new(Value::Null)),
+            std::time::Duration::from_secs(1), ConsoleHub::disabled(), profile);
+        let response = app.clone().oneshot(axum::http::Request::get("/v1/models").body(Body::empty()).unwrap()).await.unwrap();
+        let models: Value = serde_json::from_slice(&axum::body::to_bytes(response.into_body(), 1 << 20).await.unwrap()).unwrap();
+        assert_eq!(models["data"][0]["capabilities"]["vision"], false);
+        let normal = json!({"model":MODEL,"messages":[{"role":"user","content":[
+            {"type":"image_url","image_url":{"url":url}}, {"type":"text","text":"describe"}]}],"max_tokens":1});
+        let response = app.clone().oneshot(axum::http::Request::post("/v1/chat/completions")
+            .header("content-type","application/json").body(Body::from(normal.to_string())).unwrap()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(rx.try_recv().is_err());
+        let body = json!({"model":MODEL,"messages":[{"role":"user","content":"probe"}],"max_tokens":1});
+        for index in 0..4 {
+            let mut invalid = spec.clone();
+            match index { 0 => invalid.cold = false, 1 => invalid.no_speculation = false,
+                2 => invalid.score_from = None, _ => invalid.media[0].fixture = None }
+            let (id, _) = probe::registry().register(invalid);
+            let response = app.clone().oneshot(axum::http::Request::post("/v1/chat/completions")
+                .header(probe::HEADER,id).header("content-type","application/json")
+                .body(Body::from(body.to_string())).unwrap()).await.unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            assert!(rx.try_recv().is_err());
+        }
+        let worker = tokio::spawn(async move {
+            let job = rx.recv().await.unwrap();
+            assert!(job.probe.as_ref().unwrap().spec.feature_scoring());
+            assert_eq!(job.media[0].key, image.key);
+            job.events.send(Ok(InferenceChunk::Ready { system_fingerprint: None,
+                prompt_usage: PromptUsage { prompt_tokens: 1, prompt_cache_hit_tokens: 0 } })).unwrap();
+            job.events.send(Ok(InferenceChunk::Finish { finish_reason: InferenceFinishReason::Length })).unwrap();
+        });
+        let (id, _) = probe::registry().register(spec);
+        let response = app.oneshot(axum::http::Request::post("/v1/chat/completions")
+            .header(probe::HEADER,id).header("content-type","application/json")
+            .body(Body::from(body.to_string())).unwrap()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        worker.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn expanded_media_probe_prepares_sources_without_chat_rendering() {
         use base64::Engine;
         use cuteafd_loader::media::{EncoderId, ImageFamily, ProcessorConfig};

@@ -6,7 +6,7 @@ use crate::shared::{draft::routes::RoundRoutes, prefix::{CudaCopyEngine, PrefixA
     qwen::scheduler::{self, Backend}, token_io::{DeviceLogits, TokenSelector}};
 use anyhow::{ensure, Context, Result};
 use cuteafd_api::openai::NativeRequest;
-use cuteafd_engine::{media::{EncodeJob, EmbeddingCache, MediaKeys, RequestMedia},
+use cuteafd_engine::{media::{EncodeJob, EmbeddingCache, RequestMedia},
     prefix::{PrefixCache, PrefixConfig, PrefixFamily, RefPagePool}};
 use cuteafd_loader::families::minimax_m3::MiniMaxM3Config;
 use cuteafd_transport::ExpertV2SourceKind;
@@ -61,8 +61,6 @@ fn validate_prefix_concurrency(requested: usize, admitted: usize) -> Result<()> 
 pub(crate) enum BackendError {
     #[error("MiniMax neural/speculative drafts are not qualified")]
     DraftsNotQualified,
-    #[error("MiniMax bundled media serving is not qualified")]
-    MediaNotQualified,
     #[error("MiniMax backend is terminal after a failed native submission")]
     Terminal,
 }

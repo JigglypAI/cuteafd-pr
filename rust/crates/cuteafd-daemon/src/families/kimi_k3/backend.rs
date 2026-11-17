@@ -4,7 +4,7 @@ use crate::shared::{draft::routes::RoundRoutes, prefix::{CudaCopyEngine, PrefixA
     qwen::scheduler::{self, Backend}, token_io::DeviceLogits};
 use anyhow::{ensure, Result};
 use cuteafd_api::openai::NativeRequest;
-use cuteafd_engine::{media::{EncodeJob, EmbeddingCache, MediaKeys, RequestMedia},
+use cuteafd_engine::{media::{EncodeJob, EmbeddingCache, RequestMedia},
     prefix::{PrefixCache, PrefixConfig, PrefixFamily, RefPagePool}};
 use std::{cell::{Cell, RefCell}, path::Path};
 

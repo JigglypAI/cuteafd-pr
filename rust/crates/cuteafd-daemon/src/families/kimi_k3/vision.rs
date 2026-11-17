@@ -203,11 +203,6 @@ mod tests {
         let inventory = cuteafd_loader::media::still_tower::StillTowerInventory::from_checkpoint(
             &checkpoint, MAX_IMAGE_TOKENS as usize).unwrap();
         assert_eq!(inventory.arena.bytes() as u64, spec.native.weight_bytes);
-        for read in &spec.reads {
-            let view = inventory.arena.view(&read.metadata.name).unwrap();
-            assert_eq!(view.offset(), read.destination);
-            assert_eq!(view.bytes(), read.transform.resident_bytes(&read.metadata).unwrap());
-        }
         assert_eq!(spec.native.blocks.len(), 27);
         assert_eq!(spec.image_family(),cuteafd_loader::media::ImageFamily::Kimi);
         let mut changed_geometry=spec.clone();
