@@ -28,9 +28,10 @@ Everything is read from `config.json` and the safetensors headers;
 `quantize_config.json` is only cross-checked. `cuteafd plan` finds the
 fit for each selected view. The card layouts are 1 RTX PRO 6000 + 3 Sparks
 and 2 RTX PRO 6000 + 6 Sparks. Routed layers are onboarded to the RTX by default
-(`RTX_EXPERT_LAYERS` unset is pool-first auto). Once the 2M KV pool fits,
+(`RTX_EXPERT_LAYERS` unset is pool-first auto). After admission sizes the layout for the 2M KV target,
 one RTX runs whole layers from `rtx-tp1`; two RTX split each onboarded layer
-TP2 through the shared pair and `rtx-tp2`, with F32 partial exchange. The
+TP2 through the shared pair and `rtx-tp2`, with F32 partial exchange.
+The automatic pool then grows into remaining memory; `KV_MAX_TOKENS` can cap it. The
 prior K6 96 GiB header-fixture maximum onboards 24 layers; its minimum prioritizes
 its roughly 1.81M-token pool and onboards none. These are planner results,
 not hardware qualification. Start from

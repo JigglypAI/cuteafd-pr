@@ -413,16 +413,14 @@ mod tests {
     }
 
     #[test]
-    fn kv_defaults_follow_card_and_context() {
+    fn kv_defaults_are_unbounded_with_one_target_on_every_card() {
         let policy = MemoryPolicy::default();
-        assert_eq!(policy.kv(96 * GIB, 1 << 20).unwrap(), KvBounds { target: 2 << 20, min: AGENTIC_FLOOR_TOKENS, max: 2 << 20 });
-        assert_eq!(policy.kv(96 * GIB, 65_536).unwrap(), KvBounds { target: 2 << 20, min: 65_536, max: 2 << 20 });
-        assert_eq!(policy.kv(32 * GIB, 65_536).unwrap(), KvBounds { target: 1 << 20, min: 65_536, max: 1 << 20 });
-        let short_target = MemoryPolicy { kv_target: Some(131_072), ..policy };
-        assert_eq!(short_target.kv(96 * GIB, 1 << 20).unwrap(),
-            KvBounds { target: 131_072, min: 131_072, max: 131_072 });
-        let grow = MemoryPolicy { kv_max: Some(4 << 20), ..policy };
-        assert_eq!(grow.kv(96 * GIB, 1 << 20).unwrap().max, 4 << 20);
+        for bytes in [24 * GIB, 32 * GIB, 96 * GIB, 192 * GIB] {
+            assert_eq!(policy.kv(bytes, 65_536).unwrap(),
+                KvBounds { target: 2 << 20, min: 65_536, max: None });
+        }
+        let pinned = MemoryPolicy { kv_max: Some(4 << 20), ..policy };
+        assert_eq!(pinned.kv(32 * GIB, 1 << 20).unwrap().max, Some(4 << 20));
         assert!(MemoryPolicy { kv_max: Some(1 << 20), ..policy }.kv(96 * GIB, 0).is_err());
         assert!(MemoryPolicy { kv_min: Some(3 << 20), ..policy }.kv(96 * GIB, 0).is_err());
     }
@@ -455,7 +453,7 @@ mod tests {
                 ReserveComponent { name: "graphs".into(), bytes: GIB },
                 ReserveComponent { name: "family".into(), bytes: 0 }],
             reserve_overridden: false, kv_bytes: 30 * GIB, other_bytes: GIB };
-        let pool = PoolBreakdown { kv: KvBounds { target: 2 << 20, min: 262_144, max: 2 << 20 }, pool_tokens: 2 << 20 };
+        let pool = PoolBreakdown { kv: KvBounds { target: 2 << 20, min: 262_144, max: Some(2 << 20) }, pool_tokens: 2 << 20 };
         let line = render_line(&device, &pool);
         for part in ["rtx0: cap 98304MiB", "weights 40960MiB", "workspaces 8192MiB", "reserve 1584MiB [cuda context 560MiB, graphs 1024MiB, family 0MiB]",
             "KV target 2097152 min 262144 max 2097152, pool 2097152 tokens / 30720MiB"] {

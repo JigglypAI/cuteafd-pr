@@ -1,6 +1,6 @@
 //! The one KV pool policy (`cuteafd_core::memory_policy`): the layout is
-//! sized for `KV_TARGET_TOKENS` (2M tokens on cards above 32 GiB, 1M at 32 GiB
-//! or less by default); the pool then grows into what
+//! sized for `KV_TARGET_TOKENS` (2M tokens on every card by default);
+//! the pool then grows into what
 //! the fixed layout leaves, up to `KV_MAX_TOKENS`; below `KV_MIN_TOKENS` the
 //! launch is refused.
 use cuteafd_core::memory_policy::MemoryPolicy;
@@ -105,7 +105,7 @@ pub struct PoolPolicy {
     /// The largest pool the build can index; a fixed onboard fills up to it.
     pub(super) ceiling: u64,
     /// After an automatic layout is fixed for the target, the pool grows into
-    /// what is left up to this (`KV_MAX_TOKENS`, default the target).
+    /// what is left up to this (`KV_MAX_TOKENS`, unbounded by default).
     pub(super) max: Option<u64>,
     pub(super) unit_rows: u64,
 }
@@ -193,38 +193,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn preparation_uses_one_shared_target_precedence_and_small_card_default() {
-        MemoryPolicy { kv_target: Some(3 << 20), kv_max: Some(100_000_000), ..Default::default() }.scoped(|| {
-            let mut facts = PoolFacts::new(&[32 << 30], super::super::planner::Context::automatic(262_144), None, 64);
-            assert_eq!(prepare_pool(facts).unwrap().target(), 3 << 20);
-            facts.target = Some(4 << 20);
-            let pool = prepare_pool(facts).unwrap();
-            assert_eq!(pool.target(), 4 << 20);
-            assert_eq!(pool.maximum_tokens(), 100_000_000);
-            facts.requested = Some(524_288);
-            let explicit = prepare_pool(facts).unwrap();
-            assert_eq!(explicit.maximum_tokens(), 524_288);
-            assert_eq!(explicit.capacity_policy(16).pool_tokens, Some(524_288));
-        });
-        MemoryPolicy::default().scoped(|| {
-            for cards in [&[32 << 30][..], &[96 << 30, 32 << 30][..]] {
-                assert_eq!(prepare_pool(PoolFacts::new(cards, 262_144, None, 64)).unwrap().target(), 1 << 20);
-            }
-            assert_eq!(prepare_pool(PoolFacts::new(&[96 << 30], 262_144, None, 64)).unwrap().target(), 2 << 20);
-        });
-    }
-
-    #[test]
-    fn maximum_extent_includes_growth_without_changing_the_layout_target() {
-        let defaults = legacy_fixture_pool(&[96 << 30], 262_144, None, 256);
-        assert_eq!(defaults.maximum_tokens(), defaults.target);
-        let growing = MemoryPolicy { kv_max: Some(100_000_000), ..Default::default() }.scoped(||
-            legacy_fixture_pool(&[96 << 30], 262_144, None, 256));
-        assert_eq!(growing.maximum_tokens(), 100_000_000);
-        assert_eq!((growing.target, growing.floor, growing.compiled_context),
-            (defaults.target, defaults.floor, defaults.compiled_context));
-        assert_eq!(growing.wanted_units(), defaults.wanted_units());
-        assert_eq!(growing.max_units(), 100_000_000 / 256);
+    fn preparation_derives_unbounded_extent_and_respects_explicit_cap() {
+        let cards = [96 << 30];
+        let mut facts = PoolFacts::new(&cards, 262_144, None, 64);
+        facts.memory = vec![PoolMemory { available_bytes: 80 << 30, bytes_per_unit: 64 * 1024 }];
+        let pool = MemoryPolicy::default().scoped(|| prepare_pool(facts.clone())).unwrap();
+        assert_eq!(pool.max(), None);
+        assert_eq!(pool.target(), 2 << 20);
+        assert_eq!(pool.maximum_tokens(), (80 << 30) / (64 * 1024) * 64);
+        let capped = MemoryPolicy { kv_max: Some(100_000_000), ..Default::default() }
+            .scoped(|| prepare_pool(facts.clone())).unwrap();
+        assert_eq!(capped.maximum_tokens(), pool.maximum_tokens().min(100_000_000));
+        facts.target = Some(3 << 20);
+        assert_eq!(prepare_pool(facts).unwrap().target(), 3 << 20);
+        assert!(prepare_pool(PoolFacts::new(&cards, 262_144, None, 64)).is_err());
     }
 
     #[test]
@@ -234,7 +216,7 @@ mod tests {
             for requested in [Some(524_288), Some(4 << 20)] {
                 let pool = legacy_fixture_pool(&[96 << 30], 262_144, requested, 256);
                 assert_eq!(pool.maximum_tokens(), requested.unwrap());
-                assert_eq!(pool.max, requested.unwrap());
+                assert_eq!(pool.max, requested);
                 assert_eq!(pool.wanted_units(), requested.unwrap() / 256);
             }
             assert_eq!(legacy_fixture_pool(&[96 << 30], 262_144, Some(0), 256),
@@ -257,23 +239,10 @@ mod tests {
     }
 
     #[test]
-    fn capped_pro_uses_the_same_small_card_pool_as_a_logical_simulation() {
-        let planned = CoordinatorCard::planned(32 << 30, Some(188));
-        let sampled = CoordinatorCard { physical_bytes: super::super::inventory::PRO_TOTAL_BYTES,
-            logical_bytes: 32 << 30 };
-        assert_eq!(planned, sampled);
-        assert_eq!(prepare_pool(PoolFacts::new(&[planned.logical_bytes], 262_144, None, 64)).unwrap().maximum_tokens(), 1 << 20);
-        assert_eq!(prepare_pool(PoolFacts::new(&[planned.logical_bytes], 262_144, Some(0), 64)).unwrap().maximum_tokens(),
-            prepare_pool(PoolFacts::new(&[sampled.logical_bytes], 262_144, None, 64)).unwrap().maximum_tokens());
-        assert_eq!(CoordinatorCard::planned(32 << 30, None), planned);
-        assert_eq!(prepare_pool(PoolFacts::new(&[28 << 30], 262_144, None, 64)).unwrap().maximum_tokens(), 1 << 20);
-    }
-
-    #[test]
     fn targets_follow_the_smallest_card_and_the_context() {
         let gib = 1u64 << 30;
         assert_eq!(legacy_fixture_pool(&[96 * gib], 131_072, None, 256).target, 2 << 20);
-        assert_eq!(legacy_fixture_pool(&[96 * gib, 32 * gib], 131_072, None, 256).target, 1 << 20);
+        assert_eq!(legacy_fixture_pool(&[96 * gib, 32 * gib], 131_072, None, 256).target, 2 << 20);
         assert_eq!(legacy_fixture_pool(&[32 * gib], 1 << 21, None, 256).target, 1 << 21);
         let explicit = legacy_fixture_pool(&[96 * gib], 131_072, Some(32_768), 256);
         assert_eq!((explicit.requested, explicit.floor), (Some(32_768), 131_072));

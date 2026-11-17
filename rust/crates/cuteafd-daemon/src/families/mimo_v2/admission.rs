@@ -987,7 +987,7 @@ mod tests {
     fn kv_max_widens_extent_without_inflating_reservation_floor_or_displacing_onboarding() -> Result<()> {
         use cuteafd_core::memory_policy::MemoryPolicy;
         use cuteafd_core::serving_capacity::*;
-        
+
         let dir = tempfile::tempdir()?;
         cuteafd_loader::plan::testing::write_snapshot(dir.path(),
             &cuteafd_loader::plan::testing::mimo_flash_config(),
