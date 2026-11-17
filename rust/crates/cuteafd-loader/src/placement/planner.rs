@@ -710,6 +710,8 @@ pub enum Refusal {
     InvalidFact(String),
     #[error("invalid exact pin: {0}")]
     InvalidPin(&'static str),
+    #[error("requested pool {requested} tokens exceeds the memory-derived bound of {bound} tokens")]
+    PoolExceedsMemoryBound { requested: u64, bound: u64 },
     #[error("pool pin {tokens} is not aligned to {page_rows} rows")]
     MisalignedPool { tokens: u64, page_rows: u64 },
     #[error("pool {tokens} cannot hold selected context {context}; pass a lower explicit context no greater than {tokens} tokens")]

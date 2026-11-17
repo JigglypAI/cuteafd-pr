@@ -2434,6 +2434,14 @@ pub(super) mod tests {
                             assert!(required > available, "{typed}"),
                         Refusal::PoolBelowContext { tokens, context: floor } =>
                             assert!(*tokens < *floor, "{typed}"),
+                        Refusal::PoolExceedsMemoryBound { requested, bound } => {
+                            assert_eq!(Some(*requested), requested_pool);
+                            let derived = 2 * capacity / (cfg.mla_layers() as u64 * 64
+                                * format.record_bytes() as u64) * 64;
+                            assert_eq!(*bound, derived);
+                            assert!(*requested > *bound, "{typed}");
+                            assert!(typed.to_string().contains(&format!("memory-derived bound of {bound} tokens")));
+                        }
                         _ => panic!("unexpected Kimi capacity refusal: {typed}"),
                     }
                     assert!(report.hints.iter().any(|hint| hint.what.contains(&typed.to_string())),

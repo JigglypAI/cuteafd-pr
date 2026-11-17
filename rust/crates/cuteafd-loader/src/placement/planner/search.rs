@@ -957,8 +957,14 @@ pub fn solve_prepared(
             tokens: compiled.checked_mul(page).ok_or(Refusal::Overflow("pool domain tokens"))?,
             limiting: Box::new(Refusal::InvalidFact("memory-derived pool domain is below the required floor".into())) });
     }
-    if wanted < minimum || wanted > compiled {
-        return Err(Refusal::InvalidPin("pool exceeds compiled extent"));
+    if wanted > compiled {
+        return Err(Refusal::PoolExceedsMemoryBound {
+            requested: pool.requested().expect("only exact pools can exceed the domain"),
+            bound: compiled.checked_mul(page).ok_or(Refusal::Overflow("pool domain tokens"))?,
+        });
+    }
+    if wanted < minimum {
+        return Err(Refusal::PoolBelowContext { tokens: wanted * page, context: floor });
     }
     let exact = match request.onboard {
         Pin::Auto => None,
