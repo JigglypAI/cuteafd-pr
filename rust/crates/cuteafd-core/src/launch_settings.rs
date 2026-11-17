@@ -53,7 +53,7 @@ pub fn coordinator_weight_budget(explicit_gib: Option<f64>, configured_gib: Opti
 pub struct KimiSpeculatorError(String);
 
 pub const KIMI_K31_DSPARK: &str = "Inferact/Kimi-K3.1-Pro-DSpark";
-pub const KIMI_K31_DSPARK_REVISION: &str = "e4e6e6261e9f8b6d5f249f9627eb6b109d762d5f";
+pub const KIMI_K31_DSPARK_REVISION: &str = "c197a09072916cf63172df2d9d4baef0b77ed83a";
 
 pub const KIMI_K31_MC: &str = "wrldsuksgo2mars/Kimi-K3.1-Pro-EXL3-K2-MC";
 
