@@ -4070,6 +4070,13 @@ def test_image_prefix_probe_receipts_and_http_failure(tmp_path, monkeypatch, fai
                 self.end_headers()
                 self.wfile.write(json.dumps(dict(exact_token_count=True, input_tokens=count)).encode())
                 return
+            if self.path == '/v1/bench/probe':
+                cold = body['spec']['cold']
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(json.dumps(dict(probe=dict(cold=cold, no_speculation=True,
+                    generated=[7, 8, 9], prompt_ids=[1, 2, 3], cached_tokens=0 if cold else 3))).encode())
+                return
             calls.append(body)
             index = (len(calls) - 1) % 5
             if fail_fourth and len(calls) == 4:
@@ -4100,7 +4107,7 @@ def test_image_prefix_probe_receipts_and_http_failure(tmp_path, monkeypatch, fai
                 cards.image_prefix_probe(url, tmp_path)
         else:
             assert len(cards.image_prefix_probe(url, tmp_path)) == 15
-            assert len(list(tmp_path.glob('image-prefix-*.json'))) == 18
+            assert len(list(tmp_path.glob('image-prefix-*.json'))) == 30
             assert calls[0]['messages'][0]['content'][0] == calls[3]['messages'][0]['content'][0]
             assert len(calls[10]['messages'][0]['content'][0]['text']) > 100_000
             assert len(calls[4]['messages']) == 3
@@ -4120,3 +4127,26 @@ def test_matched_prompts_refuses_arm_scoped_image_probe(entry, tmp_path, monkeyp
         '--probe', f'candidate:v41-min:{probe}', '--state', str(tmp_path / 'state'), '--dry-run'])
     with pytest.raises(ValueError, match='image probe'):
         cards.main()
+
+
+def test_image_prefix_probe_rejects_cold_warm_token_drift(tmp_path, monkeypatch):
+    # Exercise the exactness comparison directly without depending on language answers.
+    def http(url, path, body=None, timeout=120):
+        if path == '/v1/models':
+            return {'data': [{'id': 'test'}]}
+        if path == '/v1/responses/input_tokens':
+            return dict(exact_token_count=True, input_tokens=1200)
+        if path == '/v1/bench/probe':
+            cold = body['spec']['cold']
+            return dict(probe=dict(cold=cold, no_speculation=True, generated=[1 if cold else 2],
+                                  prompt_ids=[1], cached_tokens=0 if cold else 1))
+        messages = body['messages']
+        question = messages[-1]['content']
+        if isinstance(question, list): question = question[-1]['text']
+        answer = '21' if 'entry 3' in question else '35' if 'entry 5' in question else 'Red and blue' if 'colours' in question else 'Yes'
+        return {'choices': [{'message': {'content': answer}}], 'usage': {
+            'prompt_tokens': 1200, 'prompt_cache_hit_tokens': 1200 if len(messages) == 3 else 0,
+            'prefix_cache_source': 'device' if len(messages) == 3 else 'miss'}}
+    monkeypatch.setattr(cards, 'http', http)
+    with pytest.raises(ValueError, match='cold/warm image output token IDs differ'):
+        cards.image_prefix_probe('fixture', tmp_path)

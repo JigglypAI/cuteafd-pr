@@ -316,6 +316,10 @@ impl PrefixFamily for DensePrefix<'_, '_> {
             (None, None) => None,
         }
     }
+    fn quarantine_draft_pages(&self, placement: &Placement) {
+        if let Some(mtp) = &self.mtp { mtp.quarantine_pages(placement.slot); }
+        if let Some(draft) = &self.drafter { draft.quarantine_pages(placement.slot); }
+    }
     fn admit_draft_pages(&self, placement: &mut Placement, capacity: usize) -> Result<(), BoxError> {
         if let Some(mtp) = &self.mtp { mtp.admit_pages(placement.slot, capacity)?; }
         if let Some(draft) = &self.drafter { draft.admit_pages(placement.slot, capacity)?; }

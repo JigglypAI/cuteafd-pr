@@ -146,6 +146,9 @@ impl<'a> CommonDraft<'a> {
     pub fn mla_admission(&self,origin:usize)->Option<cuteafd_engine::reserve::DraftDemand> {
         match self { Self::Mla(d)=>d.mla_admission(origin),Self::Block { .. }=>None }
     }
+    pub fn quarantine_mla_pages(&self, slot: usize) {
+        match self { Self::Mla(d) => d.quarantine_mla_pages(slot), Self::Block { draft, .. } => draft.quarantine_pages(slot) }
+    }
     pub fn admit_mla_pages(&self,slot:usize,capacity:usize)->std::result::Result<(),BoxError> {
         match self { Self::Mla(d)=>d.admit_mla_pages(slot,capacity),Self::Block { .. }=>Ok(()) }
     }

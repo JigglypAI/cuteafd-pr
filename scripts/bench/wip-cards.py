@@ -1068,6 +1068,7 @@ def image_prefix_probe(url, dest):
             ('image-b', True, 'Is there red in the image? yes/no.', r'\byes\b'),
         ]
         previous_content = previous_answer = None
+        exact_bodies = []
         for label, with_image, question, expected in requests + [('next-turn', True, 'Is there red in the image? yes/no.', r'\byes\b')]:
             content = [dict(type='text', text=prefix)]
             if with_image:
@@ -1107,6 +1108,25 @@ def image_prefix_probe(url, dest):
             if label == 'image-b':
                 previous_content, previous_answer = content, answer
             results.append(dict(variant=variant, request=label, answer=answer, cached=cached, source=source))
+            if label in {'image-b', 'next-turn'}:
+                exact_bodies.append((label, dict(model=model, messages=messages, max_tokens=32,
+                    reasoning_effort='none', temperature=0, stream=False)))
+        for label, body in exact_bodies:
+            probes = []
+            for cold in [True, False]:
+                reply = http(url, '/v1/bench/probe', dict(body=body,
+                    spec=dict(cold=cold, no_speculation=True, pair_exempt=True)), timeout=600)
+                save(dest / f'image-prefix-{variant}-{label}-{"cold" if cold else "warm"}.json', reply)
+                record = reply.get('probe') or {}
+                if record.get('cold') is not cold or record.get('no_speculation') is not True:
+                    raise ValueError(f'{variant}/{label}: engine did not honor exact probe switches')
+                if not record.get('generated'):
+                    raise ValueError(f'{variant}/{label}: exact probe omitted generated token IDs')
+                probes.append(record)
+            if probes[0]['generated'] != probes[1]['generated']:
+                raise ValueError(f'{variant}/{label}: cold/warm image output token IDs differ')
+            if probes[1].get('cached_tokens', 0) < len(probes[0].get('prompt_ids') or []):
+                raise ValueError(f'{variant}/{label}: exact image prompt was not fully restored')
     return results
 
 

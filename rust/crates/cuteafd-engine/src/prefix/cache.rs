@@ -452,7 +452,8 @@ impl<E: CopyEngine, M: Clone + Default> PrefixCache<E, M> {
     fn rollback<F: PrefixFamily<M>>(&mut self, family: &F, placement: &mut F::Placement,
         pages: Vec<u32>, temporary_mark: Option<Mark>, error: PrefixError) -> Result<(), PrefixError> {
         let drained = if matches!(error, PrefixError::Drain { .. }) { Err(error) }
-            else { self.drain(family).map(|()| error) };
+            else { family.drain_rollback().map(|()| { self.dirty = false; error })
+                .map_err(|source| PrefixError::Drain { source }) };
         let (error, failure) = match drained {
             Ok(error) => (Some(error), family.discard(placement).err()),
             Err(error) => (None, Some(Box::new(error) as BoxError)),
@@ -460,6 +461,7 @@ impl<E: CopyEngine, M: Clone + Default> PrefixCache<E, M> {
         if let Some(source) = failure {
             tracing::warn!(target: "cuteafd::prefix", slot = ?family.placement_slot(placement),
                 pages = pages.len(), cause = %source, "prefix rollback quarantined until restart");
+            family.quarantine_draft_pages(placement);
             family.quarantine(placement);
             self.quarantine.push(Quarantined { _pages: pages, _mark: temporary_mark, _draft: None });
             self.stats.quarantined += 1;
