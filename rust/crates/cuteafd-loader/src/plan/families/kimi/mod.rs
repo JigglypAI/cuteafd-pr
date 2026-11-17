@@ -338,7 +338,7 @@ impl FamilyModel for Model {
     fn configure(&mut self) -> Result<(), ConfigError> {
         self.core.validate_runtime_groups(&self.cfg).map_err(ConfigError::from_anyhow)
     }
-    fn native_serving_admission(&self) -> bool { self.core.serving_qualified(&self.cfg) }
+    fn native_serving_admission(&self) -> bool { true }
     fn cache_geometry(&self, options: crate::serving_capacity::CacheOptions)
         -> Result<Option<crate::serving_capacity::FamilyCacheGeometry>, crate::serving_capacity::CacheGeometryError> {
         use crate::{placement::AttentionPlacement, serving_capacity::CacheGeometryError};

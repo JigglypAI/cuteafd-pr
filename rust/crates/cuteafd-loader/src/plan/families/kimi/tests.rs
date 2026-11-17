@@ -748,6 +748,7 @@ fn header_native_k4_k6_k8_core_is_admitted_by_default() -> Result<()> {
     let mut model=Model::open(&checkpoint)?;
     model.configure().map_err(anyhow::Error::msg)?;
     assert!(model.native_serving_admission());
+    assert_eq!(KIMI_K3.runtime(), crate::plan::RuntimeStatus::Serving);
     assert!(model.core.projections.values().all(|p| p.bits == bits));
     for (stem,projection) in &model.core.projections {
         let members=checkpoint.tensors.iter().filter(|t|format::split_stem(&t.meta.name).0==stem)

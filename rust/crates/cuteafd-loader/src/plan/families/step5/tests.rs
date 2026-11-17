@@ -704,10 +704,22 @@ fn official_nested_inventory_separates_target_tail_mtp_vision() {
     let result = report(dir.path(),1,96,6,Some(262_144));
     assert!(result.config_error.is_none(),"{:?}",result.config_error);
     assert!(result.unclassified.is_empty(),"{:?}",result.unclassified);
-    assert!(!result.executable() && !result.wip_launchable() && !result.native_serving_admitted);
-    assert!(result.components.iter().any(|c| c.status != Status::Ready));
-    assert!(result.hints.iter().any(|hint|hint.what.contains("unqualified")));
+    assert!(result.executable() && result.wip_launchable() && result.native_serving_admitted, "{:?}", result.hints);
     assert_eq!(result.min_spark_ranks,Some(6));
+}
+
+#[test]
+fn native_formats_use_executor_counts_and_memory_not_card_or_fidelity_allowlists() {
+    for (kind, gpus, ranks) in [("fp8", 1, 6), ("nvfp4", 2, 4)] {
+        let dir = snapshot(kind);
+        let admitted = report(dir.path(), gpus, 96, ranks, None);
+        assert!(admitted.native_serving_admitted && admitted.executable(), "{kind}: {:?}", admitted.hints);
+        let capped = report(dir.path(), gpus, 32, ranks, None);
+        assert!(!capped.hints.iter().any(|hint| hint.what.contains("5090")
+            || hint.what.contains("unqualified") || hint.what.contains("coordinator/Spark count")), "{:?}", capped.hints);
+        assert!(capped.native_serving_admitted || capped.hints.iter().any(|hint|
+            hint.what.contains("memory budget") || hint.what.contains("rtx")), "{:?}", capped.hints);
+    }
 }
 
 #[test]
@@ -728,14 +740,14 @@ fn card_memory_conclusions_and_request_vs_pool_extent() {
     let pinned = report_context(dir.path(), 2, 96, 6, Some(262_144), 1_048_576);
     assert!(!pinned.wip_launchable());
     assert!(pinned.hints.iter().any(|h| h.what.contains("explicit KV pool of 262144 tokens is below the compiled/max-context floor of 1048576 tokens")), "{:?}", pinned.hints);
-    for (gpus, gib, ranks) in [(1,96,6), (1,32,6), (2,96,4), (2,96,0)] {
+    for (gpus, gib, ranks) in [(1,32,6), (2,96,4), (2,96,0)] {
         let r = report(dir.path(), gpus, gib, ranks, None);
         assert!(!r.wip_launchable() && !r.native_serving_admitted);
         if ranks == 0 {
             assert!(r.hints.iter().any(|h| h.what.contains("no local expert package for step5")), "{:?}", r.hints);
             assert!(r.hints.iter().any(|h| h.what.contains("memory budget 'rtx0'")), "{:?}", r.hints);
         } else {
-            assert!(r.hints.iter().any(|h| h.what.contains("unqualified") || h.what.contains("Spark") || h.what.contains("routed experts")), "{:?}", r.hints);
+            assert!(r.hints.iter().any(|h| h.what.contains("memory budget") || h.what.contains("Spark") || h.what.contains("rtx") || h.what.contains("routed experts")), "{:?}", r.hints);
         }
     }
     let r = report(dir.path(), 2, 96, 6, Some(32_768));
@@ -799,7 +811,7 @@ fn nvfp4_min_card_admits_native_w4a4_and_bf16_root_stays_reference_only() {
             assert_eq!(mapped.bytes, lane_rings as u64, "one main transport endpoint");
         }
     }
-    for (gpus, gib, ranks) in [(2, 96, 4), (1, 32, 4), (1, 96, 6), (1, 96, 0)] {
+    for (gpus, gib, ranks) in [(1, 32, 4), (1, 96, 6), (1, 96, 0)] {
         let result = report(dir.path(), gpus, gib, ranks, None);
         assert!(!result.wip_launchable() && !result.native_serving_admitted);
         if ranks == 0 {
@@ -807,13 +819,13 @@ fn nvfp4_min_card_admits_native_w4a4_and_bf16_root_stays_reference_only() {
                 "no local expert package for step5: missing RTX expert export step5:bf16")),
                 "{:?}", result.hints);
         } else {
-            assert!(result.hints.iter().any(|h| h.what.contains("unqualified") || h.what.contains("Spark")), "{:?}", result.hints);
+            assert!(result.hints.iter().any(|h| h.what.contains("memory budget") || h.what.contains("Spark") || h.what.contains("rtx")), "{:?}", result.hints);
         }
     }
     let dir = snapshot("bf16");
     let r = report(dir.path(),2,96,6,None);
     assert!(r.config_error.is_none(),"{:?}",r.config_error);
-    assert!(r.hints.iter().any(|h| h.what.contains("BF16 target format")));
+    assert!(r.hints.iter().any(|h| h.what.contains("BF16 routed experts: no native BF16 expert execution kernel")));
 }
 
 #[test]
@@ -1342,7 +1354,7 @@ fn assert_native_prefill_refusal(kind: &str, gpus: usize, ranks: usize) {
 }
 
 #[test]
-fn native_prefill_refuses_every_unqualified_spark_count() {
+fn native_prefill_refuses_missing_spark_packages() {
     for (kind, gpus) in [("nvfp4", 1), ("fp8", 2)] {
         for ranks in [0, 1, 3, 8] {
             assert_native_prefill_refusal(kind, gpus, ranks);

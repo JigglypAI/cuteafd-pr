@@ -11,8 +11,8 @@ use anyhow::{ensure, Context, Result};
 use cuteafd_core::memory_layout::{Basis, Category, DeviceKind, DeviceLayout, Item, MemoryLayout};
 
 #[derive(Debug, thiserror::Error)]
-#[error("Step-5 layout is unqualified: {0}; use one or two RTX PRO 6000 for EXL3, two for FP8 or one for NVFP4, with a covered Spark width and enough memory")]
-struct Unqualified(&'static str);
+#[error("Step-5 executor does not support {0}")]
+struct Unsupported(&'static str);
 
 pub(super) fn layout(
     model: &Model,
@@ -27,47 +27,32 @@ pub(super) fn layout(
     );
     let nvfp4 = model.formats.iter().any(|f| f == "nvfp4-g16-w4a4");
     let exl3 = model.is_exl3();
-    // Coordinator GPUs are a placement qualification: EXL3 runs on one or two
-    // RTX; the official releases keep their qualified GPU counts. Spark worlds
-    // come from the shared width-class package ranges for every format, and a
-    // frozen format admits only the worlds it shipped on.
-    let coordinators = if exl3 { opts.rtx_bytes.len() } else if nvfp4 { 1 } else { 2 };
+    let coordinators = opts.rtx_bytes.len();
     let spark_ranks = requested.spark_ranks();
     let format = if exl3 { "exl3" } else if nvfp4 { "nvfp4" } else { "fp8" };
     let package = if exl3 { format!("step5:{}", model.exl3_package().context("Step-5 EXL3 expert tiers")?) }
         else { format!("step5:{format}") };
-    let worlds = cuteafd_core::tp_units::frozen_admitted_worlds("step5", format)
-        .unwrap_or_else(|| cuteafd_core::tp_units::spark_package_worlds("step5", format));
-    // The recipe names an impossible Spark count first; a valid count a
-    // frozen format never shipped on refuses with its deprecation.
     if spark_ranks > 0 {
         crate::plan::experts::spark_recipe(&package, 1536, spark_ranks)?;
     }
-    if let Some(refusal) = (spark_ranks > 0).then(|| crate::plan::experts::frozen_refusal(&package, spark_ranks)).flatten() {
-        anyhow::bail!("Step-5 layout is unqualified: {refusal}");
-    }
     ensure!(
         exl3 || nvfp4 || model.formats.iter().any(|f| f == "fp8-block128"),
-        Unqualified("BF16 target format")
+        Unsupported("BF16 routed experts: no native BF16 expert execution kernel; use FP8, NVFP4 or EXL3 expert tensors")
     );
-    ensure!(
-        matches!(coordinators, 1 | 2) && opts.rtx_bytes.len() == coordinators
-            && (spark_ranks == 0 || worlds.contains(&spark_ranks))
-            && opts.rtx_bytes.iter().all(|&bytes| bytes > 32 << 30),
-        Unqualified("coordinator/Spark count or 5090")
-    );
+    ensure!(matches!(coordinators, 1 | 2),
+        Unsupported("more than two coordinator GPUs; native execution owns one or two ranks"));
     ensure!(
         opts.head_split
             && report
                 .requested_attention
                 .is_none_or(|a| a == AttentionPlacement::Heads),
-        Unqualified("two-GPU execution requires head-split SWA with whole-owned CSA; all-whole SWA has no routed reply reuse proof")
+        Unsupported("attention placement other than heads: SWA uses split heads and CSA uses whole owners")
     );
     ensure!(
         !opts.host_embedding
             && opts.drafter_bytes == 0
             && report.audio == MediaMode::Off,
-        Unqualified("host embedding, external draft or audio owners")
+        Unsupported("host embedding, external draft or audio owners")
     );
     let shape = crate::plan::layout::resolve_prefill(input, report, opts, spark_ranks,
         crate::plan::Family::prefill_limits(&super::STEP5))?;
@@ -78,11 +63,11 @@ pub(super) fn layout(
     let sequences = usize::try_from(opts.resolved_concurrency("step5"))?;
     ensure!(
         opts.state_slots.is_none_or(|n| n == sequences as u64),
-        Unqualified("sequence-slot mismatch")
+        Unsupported("sequence-slot mismatch")
     );
     ensure!(
         opts.prefix_slots.is_none(),
-        Unqualified("explicit prefix slots; use mark entries/budget")
+        Unsupported("explicit prefix slots; use mark entries/budget")
     );
     let context = if opts.context_tokens == 0 {
         model.cfg.max_context

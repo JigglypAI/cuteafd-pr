@@ -22,9 +22,10 @@ addresses): [max](../../examples/configs/kimi-k3-exl3-k6-max.config).
 [Max starting config](../../examples/configs/kimi-k31-exl3-k2-mc-max.config):
 MC original BF16 core, 2 RTX + 6 Sparks, automatic pool/context/onboarding,
 automatic native DSpark. `CORE_VIEW=k6-compact` and the standalone native Core-K6
-checkpoint are also qualified. MC revision `1455b31b` corrects compact-view
+checkpoint are also supported. MC revision `1455b31b` corrects compact-view
 metadata (unchanged weight shards); older `d6c4b6ce` compact views refuse (#2118).
-K8 remains Planned and whole-core FP8 refuses.
+K8 compact uses the same runtime admission; fidelity does not gate serving.
+Whole-core FP8 refuses only unsupported tensor roles with the missing route.
 K3 DFlash2 hidden-state compatibility remains independently unqualified.
 Inferact block dSpark integration is tracked in #2261: native BF16 weights,
 checkpoint-derived 2,048-token GQA window, rank-512 Markov confidence, shared

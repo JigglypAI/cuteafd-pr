@@ -566,7 +566,7 @@ fn run_plan_with_host(mut args: PlanArgs) -> Result<()> {
     if family == "mimo_v2" {
         settings.insert("speculator".into(), setting(cuteafd_core::launch_settings::mimo_speculator(
             (requested_speculator != "auto" || args.explicit_settings.contains("speculator")).then_some(requested_speculator.as_str()),
-            cfg.get("SPECULATOR").map(String::as_str), checkpoint_model_id(&args, &cfg))));
+            cfg.get("SPECULATOR").map(String::as_str), mimo_drafter_available(&args, &snapshot, &cfg))));
     }
     if (args.no_speculator || args.include_speculator || args.drafter_snapshot.is_some())
         && matches!(family, "glm5_flash" | "mimo_v2") {
@@ -947,6 +947,16 @@ fn kimi_qualification<'a>(args: &'a PlanArgs, _cfg: &'a std::collections::BTreeM
 }
 
 
+// Family detection already establishes the target architecture. Drafter loading
+// validates native config, taps and tensor shapes; aliases and MC views do not
+// change whether the checkpoint bundles (or explicitly configures) a drafter.
+fn mimo_drafter_available(args: &PlanArgs, snapshot: &std::path::Path,
+    cfg: &std::collections::BTreeMap<String, String>) -> bool {
+    args.drafter_snapshot.is_some() || snapshot.join("dflash").is_dir()
+        || ["SPECULATOR_MODEL_ID", "DRAFT_MODEL_ID"].iter()
+            .any(|key| cfg.get(*key).is_some_and(|value| !value.is_empty()))
+}
+
 fn resolve_speculator(args: &mut PlanArgs, snapshot: &std::path::Path, family: &str,
     cfg: &std::collections::BTreeMap<String, String>) -> Result<()> {
     if family == "kimi_k3" {
@@ -981,7 +991,7 @@ fn resolve_speculator(args: &mut PlanArgs, snapshot: &std::path::Path, family: &
     if family == "mimo_v2" && !args.no_speculator {
         args.speculator = cuteafd_core::launch_settings::mimo_speculator(
             (args.speculator != "auto" || args.explicit_settings.contains("speculator")).then_some(args.speculator.as_str()),
-            cfg.get("SPECULATOR").map(String::as_str), checkpoint_model_id(args, cfg)).value;
+            cfg.get("SPECULATOR").map(String::as_str), mimo_drafter_available(args, snapshot, cfg)).value;
     }
     if args.speculator == "auto" {
         args.speculator = cfg.get("SPECULATOR").cloned().unwrap_or_else(|| {
@@ -1084,9 +1094,6 @@ fn file_args(mut args: PlanArgs, snapshot: &std::path::Path) -> Result<PlanArgs>
         }
     }
     if let Some(mode) = cfg.get("VISION") { args.vision = mode.parse().map_err(anyhow::Error::msg)?; }
-    else if !matches!(family, "mimo_v2" | "glm5_flash" | "qwen4" | "minimax_m3") && args.vision == MediaMode::Auto {
-        args.vision = MediaMode::Off;
-    }
     if let Some(mode) = cfg.get("AUDIO") { args.audio = mode.parse().map_err(anyhow::Error::msg)?; }
     args.audio = cuteafd_loader::plan::resolve_audio_config(args.audio, snapshot, &inventory.config)?;
     Ok(args)
@@ -2606,6 +2613,53 @@ mod tests {
         request.native_mtp_layers = 0;
         resolve_speculator(&mut request, dir.path(), "deepseek_v4", &Default::default()).unwrap();
         assert_eq!(request.speculator, "off");
+    }
+
+    #[test]
+    fn mimo_default_drafter_tracks_checkpoint_contents_not_alias_or_core_view() {
+        let dir = tempfile::tempdir().unwrap();
+        for view in [cuteafd_loader::plan::checkpoint::CoreView::Original,
+            cuteafd_loader::plan::checkpoint::CoreView::K8Compact,
+            cuteafd_loader::plan::checkpoint::CoreView::K6Compact] {
+            let mut request = args(dir.path(), 6, false);
+            request.attention.core_view = view;
+            request.checkpoint_model_id = Some("community/MiMo-MC".into());
+            assert!(!mimo_drafter_available(&request, dir.path(), &Default::default()));
+            std::fs::create_dir_all(dir.path().join("dflash")).unwrap();
+            resolve_speculator(&mut request, dir.path(), "mimo_v2", &Default::default()).unwrap();
+            assert_eq!(request.speculator, "dflash2");
+            request.speculator = "off".into();
+            resolve_speculator(&mut request, dir.path(), "mimo_v2", &Default::default()).unwrap();
+            assert_eq!(request.speculator, "off");
+            std::fs::remove_dir(dir.path().join("dflash")).unwrap();
+        }
+        let request = args(dir.path(), 4, false);
+        let configured = [("SPECULATOR_MODEL_ID".into(), "community/pairable-drafter".into())].into_iter().collect();
+        assert!(mimo_drafter_available(&request, dir.path(), &configured));
+    }
+
+    #[test]
+    fn file_planning_preserves_auto_vision_for_bundled_towers_and_explicit_off() {
+        use cuteafd_loader::plan::{testing::*, MediaMode};
+        for mut config in [serde_json::json!({"model_type":"inkling2"}),
+            serde_json::json!({"model_type":"minimax_m3_vl", "vision_config":{}}),
+            serde_json::json!({"model_type":"deepseek_v4", "architectures":["DeepseekV4ForCausalLM"]})] {
+            let dir = tempfile::tempdir().unwrap();
+            config["architectures"] = match config["model_type"].as_str().unwrap() {
+                "inkling2" => serde_json::json!(["Inkling2ForConditionalGeneration"]),
+                "minimax_m3_vl" => serde_json::json!(["MiniMaxM3SparseForConditionalGeneration"]),
+                _ => config["architectures"].clone(),
+            };
+            write_snapshot(dir.path(), &config, &[t("unused.weight", "BF16", &[2])], None);
+            let mut request = args(dir.path(), 4, false);
+            request.speculator = "off".into();
+            request.vision = MediaMode::Auto;
+            assert_eq!(file_args(request.clone(), dir.path()).unwrap().vision, MediaMode::Auto);
+            let config_path = dir.path().join("launch.config");
+            std::fs::write(&config_path, "VISION=off\nSPECULATOR=off\n").unwrap();
+            request.config = Some(config_path);
+            assert_eq!(file_args(request, dir.path()).unwrap().vision, MediaMode::Off);
+        }
     }
 
     #[test]
