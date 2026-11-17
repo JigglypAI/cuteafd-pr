@@ -344,7 +344,7 @@ impl PrefixFamily<SnapshotMeta> for KimiPrefix<'_> {
         }
         let mut units = placement.units.clone();
         units.extend_from_slice(pages);
-        self.validate(&Placement { media_spans: Vec::new(), units: units.clone(), ..placement.clone() }, placement.len)?;
+        self.validate(&Placement { units: units.clone(), ..placement.clone() }, placement.len)?;
         frontier.units.clone_from(&units);
         placement.units = units;
         Ok(())
