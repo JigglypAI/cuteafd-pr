@@ -730,7 +730,7 @@ fn card_memory_conclusions_and_request_vs_pool_extent() {
     assert!(pinned.hints.iter().any(|h| h.what.contains("explicit KV pool of 262144 tokens is below the compiled/max-context floor of 1048576 tokens")), "{:?}", pinned.hints);
     for (gpus, gib, ranks) in [(1,96,6), (1,32,6), (2,96,4), (2,96,0)] {
         let r = report(dir.path(), gpus, gib, ranks, None);
-        assert!(!r.wip_launchable() && !r.native_serving_admitted);
+        assert!(!r.wip_launchable() && !r.native_serving_admitted, "{gpus} RTX x{gib}GiB +{ranks}: {:?}", r.hints);
         if ranks == 0 {
             assert!(r.hints.iter().any(|h| h.what.contains("no local expert package for step5")), "{:?}", r.hints);
             assert!(r.hints.iter().any(|h| h.what.contains("memory budget 'rtx0'")), "{:?}", r.hints);

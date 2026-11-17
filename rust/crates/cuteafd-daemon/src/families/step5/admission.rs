@@ -452,7 +452,21 @@ mod tests {
         for kind in ["fp8", "mc", "nvfp4"] {
             let dir = tempfile::tempdir()?;
             if kind == "mc" {
-                testing::write_step5_exl3_snapshot(dir.path());
+                let source = tempfile::tempdir()?;
+                testing::write_step5_exl3_snapshot(source.path());
+                let cp = Checkpoint::open(source.path())?;
+                let cfg = plan::families::step5::Config::parse(&cp)?;
+                let tensors = cp.tensors.iter().map(|tensor| testing::t(&tensor.meta.name,
+                    match tensor.meta.dtype {
+                        cuteafd_core::DType::Bf16 => "BF16", cuteafd_core::DType::F32 => "F32",
+                        cuteafd_core::DType::I16 => "I16", cuteafd_core::DType::I32 => "I32",
+                        cuteafd_core::DType::U8 => "U8", other => panic!("{other:?}"),
+                    }, &tensor.meta.shape)).collect::<Vec<_>>();
+                let (mtp, target) = plan::families::step5::exl3::expected(&cfg).into_iter()
+                    .partition(|(name, _)| name.strip_prefix("model.layers.")
+                        .and_then(|rest| rest.split('.').next()).and_then(|layer| layer.parse::<usize>().ok())
+                        .is_some_and(|layer| layer >= cfg.layers));
+                testing::write_mc_snapshot_with_mtp(dir.path(), &cp.config, &tensors, &target, &mtp);
             } else {
                 let (config, tensors) = testing::step5_fixture(kind);
                 testing::write_snapshot(dir.path(), &config, &tensors, None);
@@ -486,8 +500,8 @@ mod tests {
             let waves = report.prefill_waves.context("prefill waves")?;
             let backend = plan::spark_executions::SparkBackend::for_catalog(catalog)?;
             let endpoint = cuteafd_core::SparkEndpoint { ring_depth: None, capacity: rows.try_into()?,
-                ingress: if kind == "nvfp4" { cuteafd_core::SparkIngress::Bf16 }
-                    else { cuteafd_core::SparkIngress::Native }, partial_reply_bytes: None };
+                ingress: super::super::experts::StepExperts::from_catalog(catalog)?.ingress(),
+                partial_reply_bytes: None };
             let model = super::super::serve::spark_model(&backend.exports(), endpoint, waves, 1, 64 << 20)?;
             let startup = SparkAdmission::plan_view(&view, cuteafd_core::ExpertGeometry::STEP5,
                 Some(catalog), &working, sparks, model, None)?;

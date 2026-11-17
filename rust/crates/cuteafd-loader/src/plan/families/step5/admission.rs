@@ -364,36 +364,47 @@ pub fn spark_owners(catalog: &crate::OfficialV41Catalog, inputs: &RuntimeInputs)
     let executions = crate::plan::spark_executions::admit_family("step5", &backend.exports(), None,
         inputs.unit_rows() as u64, inputs.waves as u64)?;
     let endpoint = cuteafd_core::SparkEndpoint { ring_depth: None, capacity: inputs.unit_rows().try_into()?,
-        ingress: if catalog.fp8().is_some_and(|tensors| tensors.format().bf16_input()) {
+        ingress: if catalog.exl3().is_some() { cuteafd_core::SparkIngress::Fp8K32 }
+        else if catalog.fp8().is_some_and(|tensors| tensors.format().bf16_input()) {
             cuteafd_core::SparkIngress::Bf16
         } else { cuteafd_core::SparkIngress::Native }, partial_reply_bytes: None };
     let rings = cuteafd_core::SparkRings { max_frame_bytes: 64 << 20, depth: 8,
         slot_bytes: 8 << 20, alignment: 4096 };
+    let layouts = (0..ranks).map(|rank| -> Result<_> {
+        if catalog.exl3().is_some() { return Ok(SparkResidentLayout::Exl3 { world: ranks, rank }); }
+        let format = catalog.fp8().context("Step-5 native expert headers")?.format();
+        let name = match format {
+            crate::formats::fp8_experts::ExpertFormat::Nvfp4 => "nvfp4",
+            crate::formats::fp8_experts::ExpertFormat::Bf16 => "bf16",
+            _ => "fp8",
+        };
+        let recipe = crate::plan::experts::spark_recipe(&format!("step5:{name}"), shape.intermediate, ranks)?;
+        Ok(SparkResidentLayout::Fp8 { world: ranks, rank, slicing: recipe.slicing })
+    }).collect::<Result<Vec<_>>>()?;
+    // Validate each layer/rank once, not again for every onboarding suffix.
+    let resident = (0..ranks).map(|rank| routed.iter().map(|&layer| {
+        if catalog.exl3().is_some() {
+            return usize::try_from(catalog.exl3_spark_arena_bytes(layer, ranks)?[rank]).map_err(Into::into);
+        }
+        let working = SparkWorkingSet { spark_layers: vec![layer], spark_ranks: ranks,
+            prefill_lanes: 1, ..Default::default() };
+        Ok(usize::try_from(SparkAssignment::resident_from_catalog(catalog, &working, rank,
+            layouts[rank])?.resident_bytes)?)
+    }).collect::<Result<Vec<_>>>()).collect::<Result<Vec<_>>>()?;
     let count_max = if inputs.onboard.is_some() { routed.len() } else { 0 };
     (0..=count_max).map(|count| {
         let working = SparkWorkingSet { rtx_layers: routed[..count].to_vec(), spark_layers: routed[count..].to_vec(),
             spark_ranks: ranks, prefill_lanes: 1 };
         (0..ranks).map(|rank| {
             if working.spark_layers.is_empty() { return Ok(Vec::new()); }
-            let layout = if catalog.exl3().is_some() { SparkResidentLayout::Exl3 { world: ranks, rank } }
-                else {
-                    let format = catalog.fp8().context("Step-5 native expert headers")?.format();
-                    let name = match format {
-                        crate::formats::fp8_experts::ExpertFormat::Nvfp4 => "nvfp4",
-                        crate::formats::fp8_experts::ExpertFormat::Bf16 => "bf16",
-                        _ => "fp8",
-                    };
-                    let recipe = crate::plan::experts::spark_recipe(&format!("step5:{name}"),
-                        catalog.routed_experts().intermediate, ranks)?;
-                    SparkResidentLayout::Fp8 { world: ranks, rank, slicing: recipe.slicing }
-                };
-            let assignment = SparkAssignment::from_catalog(catalog, &working, rank, layout, &[endpoint], rings)?;
+            let resident_bytes = crate::serving_capacity::PackedWeightRegions::new(
+                resident[rank][count..].iter().copied())?.bytes as u64;
             let workspace = executions.workspace_bytes(|extent|
                 crate::plan::layout::spark_slots::catalog_owner_bytes(catalog, "step5", &working, rank, extent))?
                 .context("Step-5 Spark execution owner overflow")?;
-            let io = assignment.io;
+            let io = working.rank_endpoints_io(rank, cuteafd_core::ExpertGeometry::STEP5, &[endpoint], rings)?;
             let mut items = vec![Item::new(Category::Experts, "routed expert arena", "",
-                assignment.resident_bytes, Basis::Exact)];
+                resident_bytes, Basis::Exact)];
             for (category, group, bytes) in [
                 (Category::Transport, "expert intake", io.intake),
                 (Category::Transport, "host expert exchange", io.host_exchange),
@@ -1370,6 +1381,8 @@ mod tests {
             for ranks in [1, 2] {
                 for mode in [BlasHead::TensorLt, BlasHead::Gemm] {
                     let mut input = inputs(ranks);
+                    // This isolates head/handle ownership, not the unsupported BF16 card fit.
+                    input.spark_bytes = vec![512 << 30; input.inventory.spark_ranks];
                     input.bf16_target_head = mode;
                     for depth in [0, 1, 3] {
                         let admitted = admit_mtp_with_contract(&checkpoint, &input, depth, &contract)?;
