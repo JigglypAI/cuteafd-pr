@@ -3,7 +3,6 @@
 pub(crate) mod dspark;
 #[cfg(test)]
 mod draft_push_tests;
-use crate::shared::draft::probe as draft_probe;
 pub(crate) mod engine;
 pub(crate) mod fp8;
 pub(crate) mod prefix;

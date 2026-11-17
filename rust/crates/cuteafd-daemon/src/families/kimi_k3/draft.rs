@@ -1067,12 +1067,10 @@ mod tests {
             else { assert_eq!(common_verify[0], anchor); }
             proposals.push(proposed);
             let start = placement.len;
-            backend.probe_begin(common_verify.len());
             let logits = backend.verify_device(&mut [(&mut placement, &common_verify)], true, &pool)?
                 .context("native verify logits absent")?;
             library.cuda_set_device(1)?;
             let values = logits.to_host(&library)?;
-            backend.probe_end();
             verifies.push(values.iter().map(|value| value.to_bits()).collect::<Vec<_>>());
             // Keep only the anchor: rejected provisional rows must not enter the next context.
             placement.len = start + 1;

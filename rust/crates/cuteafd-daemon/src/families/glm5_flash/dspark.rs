@@ -26,7 +26,6 @@
 //! Drafts only steer speculation: the
 //! verify step keeps output identical to plain greedy decoding.
 //! python/reference/families/glm5_flash/dspark/reference.py is the oracle.
-use crate::shared::draft::resource;
 use crate::shared::speculation::dflash::{ContextRow, Draft, DraftSeq, ReplayDrafter, TargetHead};
 use crate::shared::fp8_linear;
 use crate::shared::token_io::TokenEmbedding;
@@ -158,14 +157,12 @@ impl<'a> Drafter<'a> {
         if let Self::RemoteDflash(d) = self { d.finish_terminal(drained); }
     }
 
-    /// The shared draft policy's prior: DFlash2's keyed selector fit, or the
-    /// dSpark confidence head blended with the history rate.
-    pub fn draft_prior(&self, fp8_head: bool) -> Result<resource::Prior> {
-        Ok(match self {
-            Self::Dflash2(d) => resource::Prior::Selector(d.selector_fit("glm5_flash", fp8_head)?),
-            Self::RemoteDflash(d) => resource::Prior::Selector(d.draft.selector_fit("glm5_flash", fp8_head)?),
-            Self::Dspark(_) => resource::Prior::Head,
-        })
+    /// dSpark's trained confidence head reports a sigmoid per position; DFlash2 has no head.
+    pub fn head_kind(&self) -> cuteafd_core::HeadScore {
+        match self {
+            Self::Dspark(_) => cuteafd_core::HeadScore::Probability,
+            Self::Dflash2(_) | Self::RemoteDflash(_) => cuteafd_core::HeadScore::None,
+        }
     }
 
     /// Loads the drafter `snapshot` names (dSpark when its config says so,

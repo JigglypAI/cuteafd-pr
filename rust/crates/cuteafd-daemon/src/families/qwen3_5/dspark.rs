@@ -1,12 +1,11 @@
-//! Dense-target binding of the shared block drafter and online draft policy.
+//! Dense-target binding of the shared block drafter and the history draft policy.
 use super::{engine::{DenseEngine, DrafterBytes}, GoldenArgs};
 use crate::shared::speculation::dflash::{ContextRow, DraftSeq, TargetHead, TAP_ROWS};
-use crate::shared::{draft::{binding, clock::RoundTimes, evidence::{Censor, DraftSource, Evidence}, routes::RoundRoutes},
+use crate::shared::{draft::history,
     fp8_linear::{Fp8Rows, Fp8Scales}, speculation::{block_dspark::{self, DsparkConfig, DsparkDrafter},
         target::{verify_commit, AcceptedPrefix, VerifyRequest, VerifyRow}}};
 use anyhow::{ensure, Context, Result};
-use cuteafd_core::{verify_dspark_greedy_vocab, DraftCandidate, DraftPolicy, LayerResource, PolicyGeometry,
-    PolicySeed, ResourceClass};
+use cuteafd_core::{verify_dspark_greedy_vocab, DraftControl, DraftHistory, DrafterSpec, HeadScore};
 use cuteafd_ffi::{programs::Programs, CuteafdDeviceBuffer, NativeLibrary};
 use cuteafd_loader::{families::{glm5::draft_representation::GlmDraftRepresentation,
     qwen3_5::Qwen35Config}, plan::checkpoint::Checkpoint};
@@ -54,12 +53,9 @@ pub(super) fn weight_receipts(drafter: &DsparkDrafter<'_>,
     Ok(inventory.receipts)
 }
 
-fn policy(layers: usize, block: usize) -> Result<DraftPolicy> {
-    Ok(DraftPolicy::seeded(PolicyGeometry {
-        layers: vec![LayerResource { class: None, slice_bytes: 0., group_rows: 1, timed: false }; layers],
-        group_rows_by_rows: vec![], experts: 0, topk: 0, max_requests: 1, max_positions: block,
-        widths: vec![block], classes: vec![ResourceClass::rtx()], regimes: 1,
-    }, PolicySeed::weak(block))?)
+/// The serving policy for one request: dSpark's block and its confidence head.
+fn policy(block: usize) -> DraftHistory {
+    DraftHistory::new(DrafterSpec { block, head: HeadScore::Probability, copy: 0 }, DraftControl::History)
 }
 
 fn argmax(row: &[f32]) -> Result<u32> {
@@ -76,7 +72,6 @@ fn top_margin(row: &[f32], best: u32) -> (f32, Vec<u32>) {
         .map(|(index, _)| index as u32).collect())
 }
 
-fn micros(duration: Duration) -> u64 { duration.as_micros().min(u128::from(u64::MAX)) as u64 }
 
 fn tapped_rows(library: &NativeLibrary, drafter: &DsparkDrafter<'_>, rows: usize) -> Result<Vec<u8>> {
     let bytes = rows * drafter.cfg.taps.len() * drafter.cfg.hidden * 2;
@@ -223,13 +218,11 @@ pub(super) fn spec_decode<'a>(args: &GoldenArgs, library: &'a NativeLibrary, pro
     if args.prefix_check { check_draft_prefix(library, &drafter, &canonical_taps, &update_rows, "prompt")?; }
     let mut next = argmax(&last[last.len() - cfg.vocab..])?;
     let mut output = vec![next];
-    let mut policy = policy(cfg.attention.len(), draft_cfg.block)?;
-    let mut routes = RoundRoutes::new(cfg.attention.len(), 0);
+    let mut policy = policy(draft_cfg.block);
     let (mut cycles, mut proposed, mut accepted) = (0usize, 0usize, 0usize);
     let (mut draft_time, mut verify_time) = (Duration::ZERO, Duration::ZERO);
     let started = Instant::now();
     while output.len() < count {
-        let round_start = Instant::now();
         let position = engine.position;
         let draft_start = Instant::now();
         let embedding = engine.token_embedding();
@@ -245,12 +238,10 @@ pub(super) fn spec_decode<'a>(args: &GoldenArgs, library: &'a NativeLibrary, pro
             embedding, head)?.remove(0);
         let draft_elapsed = draft_start.elapsed();
         draft_time += draft_elapsed;
-        let confidence: Vec<_> = draft.confidence.iter().map(|&value| f64::from(value)).collect();
-        let candidates = [DraftCandidate { id: 0, confidence: &confidence }];
         let room = count - output.len();
-        let selection = policy.select_within(false, &candidates, draft_cfg.block, (room + 1).min(64))?;
-        let want = selection.as_ref().map_or(policy.cold_drafts(), |s| s.lengths[0])
-            .min(draft.tokens.len()).min(room.saturating_sub(1));
+        policy.plan(&[(0, room.saturating_sub(1))], 64);
+        let want = policy.refine(0, draft.tokens.len(), Some(&draft.confidence));
+        assert_eq!(policy.settle(&[0], 64), [want]);
         let inputs: Vec<_> = std::iter::once(next).chain(draft.tokens[..want].iter().copied()).collect();
         let rows: Vec<_> = inputs.iter().enumerate().map(|(index, &token)| VerifyRow {
             slot: 0, position: position + index, token: Some(token) }).collect();
@@ -282,16 +273,7 @@ pub(super) fn spec_decode<'a>(args: &GoldenArgs, library: &'a NativeLibrary, pro
         cycles += 1;
         next = *result.emitted.last().context("verify emitted no correction/bonus")?;
         output.extend(&result.emitted);
-        routes.begin(inputs.len());
-        for layer in 0..cfg.attention.len() { routes.dense(layer)?; }
-        let requests = [binding::RoundRequest { id: 0, rows: inputs.len(), accepted: retained,
-            source: DraftSource::Neural, evidence: Some(Evidence::Head(&confidence)),
-            censor: result.length_limit.then_some(Censor::OutputLimit) }];
-        binding::observe(&mut policy, &binding::RoundRecord { shared: false, requests: &requests,
-            routes: &routes, layer_us: &vec![None; cfg.attention.len()],
-            times: RoundTimes { total_us: micros(round_start.elapsed()), draft_us: Some(micros(draft_elapsed)) },
-            draft: Some(binding::DraftPass { width: draft_cfg.block, requests: Some(1) }),
-            predicted: selection.as_ref().map(|selection| selection.predicted_us) })?;
+        policy.observe(&[history::outcome(0, inputs.len(), retained, result.length_limit || result.eos)], false);
     }
     let elapsed = started.elapsed();
     let same = plain.0.iter().zip(&output).take_while(|(a, b)| a == b).count();
@@ -401,9 +383,9 @@ mod tests {
     }
 
     #[test]
-    fn dense_draft_binding_uses_empty_route_geometry_and_checkpoint_vocabulary() {
-        let policy = policy(64, 7).unwrap();
-        assert_eq!(policy.widths(), &[7]);
+    fn dense_draft_binding_uses_the_drafter_block_and_checkpoint_vocabulary() {
+        let policy = policy(7);
+        assert_eq!((policy.spec().block, policy.spec().head), (7, HeadScore::Probability));
         assert_eq!(argmax(&[2., 2., 1.]).unwrap(), 0);
         assert_eq!(top_margin(&[2., 2., 1.], 0), (0., vec![0, 1]));
         assert_eq!(top_margin(&[3., 2., 1.], 0), (1., vec![0]));

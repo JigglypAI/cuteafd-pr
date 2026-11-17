@@ -137,7 +137,7 @@ printf 'mount=%s\\n' "${count_mounts[@]}"
                 lines = result.stdout.splitlines()
                 self.assertEqual(lines[:4], [expected, 'dspark', '7', '2'])
                 normalized = dict(line.split('=', 1) for line in lines[4:] if not line.startswith(('arg=', 'mount=')))
-                self.assertEqual(normalized, dict(TP2_DSPARK_EXPERTS=expected, SPECULATOR='dspark', DRAFT_LENGTH='7', EXPERT_USAGE=usage or 'on',
+                self.assertEqual(normalized, dict(TP2_DSPARK_EXPERTS=expected, SPECULATOR='dspark', EXPERT_USAGE=usage or 'on',
                     **{f'SPARK_{rank}_HOST': host for rank, host in enumerate(['ostrich', 'dodo'])}))
                 self.assertIn('arg=--config', lines)
                 self.assertIn('arg=/run/cuteafd-plan.config', lines)
@@ -544,8 +544,7 @@ printf '%s\0' "${RELEASE_SERVING_ARGS[@]}"
                         '\nprintf "%s\\0" before "${trace_args[@]}" after'], env=environment, capture_output=True)
                     self.assertEqual(result.returncode == 0, valid, result.stderr)
                     if valid:
-                        # The shared draft policy switches (default off) precede the trace.
-                        expected = ['before', '-e', 'CUTEAFD_DRAFT_SURVIVAL_LENGTHS=0']
+                        expected = ['before']
                         if value:
                             parent = str(Path(value).parent)
                             self.assertTrue(Path(parent).is_dir())

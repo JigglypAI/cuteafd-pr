@@ -103,16 +103,6 @@ mod bridge_tests {
     }
 }
 
-/// The shared probe retains one GPU0 route arena; its pinned mirror is host memory.
-pub fn draft_probe_demand(layers: usize, topk: usize, rows: usize) -> anyhow::Result<crate::placement::Demand> {
-    use anyhow::Context;
-    use crate::placement::Demand;
-    use cuteafd_core::memory_layout::{Basis, Category};
-    let bytes = layers.checked_mul(topk).and_then(|n| n.checked_mul(rows))
-        .and_then(|n| n.checked_mul(4)).context("Kimi draft probe extent overflow")?;
-    Ok(Demand::new(0, Category::Workspace, "draft policy route arena", bytes.max(256) as u64, Basis::Formula))
-}
-
 /// Validate sealed role artifacts at runtime, never during checkpoint planning.
 pub fn validate_expert_inventory(path: &std::path::Path, root: &std::path::Path) -> anyhow::Result<()> {
     use crate::plan::checkpoint::read_json;

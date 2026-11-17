@@ -188,8 +188,10 @@ re-run when BF16 attention lands (#2146).
 The launcher resolves these after selecting the coordinator split. Explicit
 values always win; selecting the old values restores the old command stream.
 The `serve-glmf` CLI defaults remain unchanged. Rows 128 stay opt-in because
-wider verification costs C16 and post-C16 C1 through the draft cost model;
-rows 64 recover the matched gate while retaining the four other defaults.
+wider verification cost C16 and post-C16 C1 in the qualification measurement;
+rows 64 recovered the matched gate while retaining the four other defaults.
+That measurement used the retired cost-model policy. Current serving uses the
+shared per-position `history` policy; it does not fit draft or verify costs.
 
 | Launcher key | Default | Resolution / old value |
 | --- | --- | --- |

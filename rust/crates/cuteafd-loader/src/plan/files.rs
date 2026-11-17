@@ -118,16 +118,6 @@ pub fn manifest_roles_view(view: &super::checkpoint::CheckpointView, roles: &[Re
     let mut tensors = BTreeSet::new();
     for role in roles { tensors.extend(required_tensors(&inventory, *role)?); }
     let mut files: BTreeSet<String> = tensors.iter().filter_map(|name| inventory.weight_map.get(name).cloned()).collect();
-    if roles.iter().any(|r| matches!(r, ReadRole::Drafter | ReadRole::Coordinator { speculator: true, .. })) {
-        // Native speculators read calibrated confidence files by numerical key.
-        for entry in std::fs::read_dir(snapshot)? {
-            let entry = entry?;
-            let name = entry.file_name().to_string_lossy().into_owned();
-            if entry.path().is_file() && name.starts_with("draft-confidence.") && name.ends_with(".json") {
-                files.insert(name);
-            }
-        }
-    }
     if roles.contains(&ReadRole::Audio) && snapshot.join("audio_tokenizer").is_dir() {
         collect_directory(snapshot, &snapshot.join("audio_tokenizer"), &mut files)?;
     }
@@ -279,7 +269,6 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             std::fs::write(dir.path().join("config.json"), serde_json::json!({"architectures":[architecture]}).to_string()).unwrap();
             std::fs::write(dir.path().join("model.safetensors"), b"fixture").unwrap();
-            std::fs::write(dir.path().join("draft-confidence.fp8-w8a16-r1.json"), b"{}").unwrap();
             let manifest = manifest_standalone(dir.path(), "drafter").unwrap();
             for entry in std::fs::read_dir(dir.path()).unwrap() {
                 let name = entry.unwrap().file_name().to_string_lossy().into_owned();

@@ -118,8 +118,8 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
         let bytes = resident.iter().flatten().try_fold(0u64, |sum, owner|
             sum.checked_add(owner.bytes).context("V4.1 draft weight budget overflow"))?;
         let staging = catalog.expert_staging(crate::V41ExpertSelection::Dspark { stage: 0, expert: 0 })?.staging_bytes() as u64;
-        ensure!((1..=cuteafd_core::MAX_DSPARK_PROPOSALS as u8).contains(&options.v41_draft_width), "invalid V4.1 dSpark draft limit");
-        let width = if options.v41_draft_width > 5 { 7 } else { 5 };
+        // The drafter always loads its full native block; DRAFT_LENGTH only caps what is verified.
+        let width = cuteafd_core::MAX_DSPARK_PROPOSALS as u64;
         let dense = v41::weight_layout::draft_layout_from_headers(checkpoint.tensors.iter().map(|tensor| &tensor.meta))?;
         let mut draft = DraftInventory { resident: bytes, runtime: programs.dspark(&manifest, rows, shape.concurrency, width, ranks,
             mode)?, marks: marks * 3 * 128 * 528,
@@ -164,7 +164,7 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
     // and the routed-expert arenas are separate contract components.
     let mut physical = owners.fixed.iter().map(Owner::from_demand).collect::<Vec<_>>();
     let mut reserves = Vec::new();
-    let draft_rows = dspark.then(|| v41::owners::draft_rows(shape.concurrency, options.v41_draft_width));
+    let draft_rows = dspark.then(|| v41::owners::draft_rows(shape.concurrency));
     let modules = programs.modules(v41::owners::DECODE_LANE_ROWS, rows, ranks, draft_rows)?;
     let mut cards = Vec::with_capacity(ranks);
     for (gpu, &total) in options.rtx_bytes.iter().enumerate() {

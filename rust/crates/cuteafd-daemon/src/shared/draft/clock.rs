@@ -1,8 +1,7 @@
-//! Round timing: per-layer device time and the host round/draft boundaries.
+//! Per-layer device time of a pass, for the layer profile and timing captures.
 use anyhow::Result;
 use cuteafd_ffi::NativeLibrary;
 use std::ffi::c_void;
-use std::time::Instant;
 
 /// Per-layer device time of one pass from CUDA timing events.
 ///
@@ -29,12 +28,6 @@ pub(crate) struct LayerClock<'a> {
 }
 
 impl<'a> LayerClock<'a> {
-    /// CUDA event state is a separately measured startup owner, not a guessed buffer.
-    pub(crate) fn allocation_receipts(&self,
-        inventory: &mut crate::shared::memory::receipts::Inventory<'_>, name: &str) -> Result<()> {
-        inventory.host(&format!("{name}.events"), &self.events)?;
-        inventory.host(&format!("{name}.recorded"), &self.recorded)
-    }
     /// Timing events for `layers` layers on the current device.
     pub fn new(library: &'a NativeLibrary, layers: usize) -> Result<Self> {
         let mut events = Vec::with_capacity(layers + 1);
@@ -145,68 +138,6 @@ impl Drop for LayerClock<'_> {
     }
 }
 
-/// Aggregate host-only probe/policy work without per-round logging or switches.
-#[derive(Clone, Copy)]
-pub(crate) enum HostStage { Routes, Observe, Select, Publish }
-
-pub(crate) struct HostSpan { stage: HostStage, start: Instant }
-
-impl HostSpan {
-    pub(crate) fn new(stage: HostStage) -> Self { Self { stage, start: Instant::now() } }
-}
-
-impl Drop for HostSpan {
-    fn drop(&mut self) {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static SAMPLES: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
-        static MICROS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
-        let index = self.stage as usize;
-        let micros = self.start.elapsed().as_micros() as u64;
-        let total = MICROS[index].fetch_add(micros, Ordering::Relaxed) + micros;
-        let samples = SAMPLES[index].fetch_add(1, Ordering::Relaxed) + 1;
-        if samples % 64 == 0 {
-            let stage = match self.stage { HostStage::Routes => "routes", HostStage::Observe => "observe", HostStage::Select => "select", HostStage::Publish => "publish" };
-            tracing::info!(stage, samples, mean_us = total as f64 / samples as f64, "draft policy host timing");
-        }
-    }
-}
-
-/// Host boundaries of one lane round: `total_us` runs from the round's start
-/// to its observation, and `draft_us` brackets the draft call alone. Sequence
-/// collection, copy lookup and length selection are round work, not draft
-/// work. Verify time is not a separate signal: it is the layer sum plus the
-/// round residual.
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct RoundClock {
-    round_start: Instant,
-    draft_us: Option<u64>,
-}
-
-impl RoundClock {
-    /// A round that started at `round_start`.
-    pub fn at(round_start: Instant) -> Self { Self { round_start, draft_us: None } }
-    /// Bracket a synchronous draft call.
-    pub fn draft<T>(&mut self, call: impl FnOnce() -> T) -> T {
-        let start = Instant::now();
-        let value = call();
-        self.draft_us = Some(start.elapsed().as_micros() as u64);
-        value
-    }
-    /// A polled drafter that times itself from issue to completion.
-    pub fn drafted_us(&mut self, us: u64) { self.draft_us = Some(us); }
-    /// The round's boundaries, observed now.
-    pub fn observe(&self) -> RoundTimes {
-        RoundTimes { total_us: self.round_start.elapsed().as_micros() as u64, draft_us: self.draft_us }
-    }
-}
-
-/// One round's observed host times.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct RoundTimes {
-    pub total_us: u64,
-    pub draft_us: Option<u64>,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -234,20 +165,4 @@ mod tests {
         assert_eq!(layer_start(&[true, false, true], None, 2), None);
     }
 
-    #[test]
-    fn round_clock_brackets_the_draft_call_alone() {
-        let mut clock = RoundClock::at(Instant::now());
-        assert_eq!(clock.observe().draft_us, None);
-        std::thread::sleep(std::time::Duration::from_millis(3));
-        let value = clock.draft(|| { std::thread::sleep(std::time::Duration::from_millis(2)); 7 });
-        assert_eq!(value, 7);
-        std::thread::sleep(std::time::Duration::from_millis(3));
-        let times = clock.observe();
-        let draft = times.draft_us.unwrap();
-        assert!((2_000..times.total_us).contains(&draft), "{times:?}");
-        assert!(times.total_us >= draft + 6_000, "round work outside the draft call: {times:?}");
-        let mut polled = RoundClock::at(Instant::now());
-        polled.drafted_us(1_234);
-        assert_eq!(polled.observe().draft_us, Some(1_234));
-    }
 }

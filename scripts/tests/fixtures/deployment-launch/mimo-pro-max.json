@@ -77,8 +77,6 @@
       "<root>/hosts/coordinator/.cache/cuteafd/instances/default/usage:/run/cuteafd/usage",
       "-e",
       "CUTEAFD_CONSOLE_LINK_COMMAND=echo \"http://coordinator:8819/console/unlock?token=$(cat ~/.cache/cuteafd/console/secret)\"",
-      "-e",
-      "CUTEAFD_DRAFT_SURVIVAL_LENGTHS=0",
       "ghcr.io/tpurtell/cuteafd-coordinator:v2.0.0",
       "cuteafd",
       "serve-mimo",

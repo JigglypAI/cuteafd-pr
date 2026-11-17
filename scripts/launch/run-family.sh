@@ -204,30 +204,22 @@ for feature_key in MEDIA_FEATURES_DIR AUDIO_FEATURES_DIR; do
   probe_args+=(-v "$feature_root:$feature_root:ro" -e "CUTEAFD_$feature_key=$feature_root")
 done
 }
+# DRAFT_POLICY: history (the default: per-position acceptance history with
+# exploration) or off (verify no drafts). DRAFT_LENGTH is the fixed-width
+# measurement override. Sets draft_policy_args for the serve command.
+shared_draft_policy_args() {
+draft_policy_args=()
+case "$(get DRAFT_POLICY history)" in
+  history) ;;
+  off) draft_policy_args=(--draft-policy off) ;;
+  *) echo "DRAFT_POLICY must be history or off" >&2; exit 2 ;;
+esac
+}
 # SPECULATION_TRACE=/abs/host/file.jsonl: the per-cycle speculation trace
 # (CUTEAFD_SPECULATION_TRACE, written by serve-glm and serve-qwen4; read by
 # scripts/qualify/glm5/glm-draft-trace.py and qualify/qwen4/qwen4-draft-trace.py).
 shared_trace_args() {
 trace_args=()
-# Optional diagnostic length rule; production selection uses resource prices.
-case "$(get DRAFT_SURVIVAL_LENGTHS off)" in
-  on) trace_args+=(-e CUTEAFD_DRAFT_SURVIVAL_LENGTHS=1) ;;
-  off) trace_args+=(-e CUTEAFD_DRAFT_SURVIVAL_LENGTHS=0) ;;
-  *) echo "DRAFT_SURVIVAL_LENGTHS must be on or off" >&2; exit 2 ;;
-esac
-# Draft length policy (cuteafd_core::DraftMode): simple by default; simple-rc, simple-derived, or shared
-# for the resource-priced one. Forwarded only when set.
-case "$(get DRAFT_POLICY)" in
-  "") ;;
-  shared|simple|simple-rc|simple-derived) trace_args+=(-e "CUTEAFD_DRAFT_POLICY=$(get DRAFT_POLICY)") ;;
-  *) echo "DRAFT_POLICY must be shared, simple, simple-rc or simple-derived" >&2; exit 2 ;;
-esac
-# How the simple draft rules price rows (linear by default); forwarded only when set.
-case "$(get DRAFT_ROW_COST)" in
-  "") ;;
-  linear|power|log) trace_args+=(-e "CUTEAFD_DRAFT_ROW_COST=$(get DRAFT_ROW_COST)") ;;
-  *) echo "DRAFT_ROW_COST must be linear, power or log" >&2; exit 2 ;;
-esac
 trace="$(get SPECULATION_TRACE)"
 if [[ -n "$trace" ]]; then
   [[ "$trace" == /* ]] || { echo 'SPECULATION_TRACE must be an absolute path' >&2; exit 2; }
@@ -624,10 +616,11 @@ release_validate_tp2_options
 [[ "$HTTP_QUEUE_WAIT_MS" =~ ^[0-9]+$ ]] || release_die "HTTP_QUEUE_WAIT_MS must be non-negative"
 [[ "$HOST_CACHE_BYTES" == auto || "$HOST_CACHE_BYTES" =~ ^[0-9]+([.][0-9]{1,6})?(B|MB|GB|MiB|GiB)?$ ]] || release_die "HOST_CACHE_BYTES must be auto, 0, or a byte size"
 case "$SPECULATOR" in dspark|off) ;; *) release_die "SPECULATOR must be dspark or off for DeepSeek V4.1" ;; esac
-# Unset preserves V4.1's adaptive five-token maximum.
+# Unset follows DRAFT_POLICY over the drafter's native seven-token block.
 draft_length="$DRAFT_LENGTH"
 [[ -z "$draft_length" || "$draft_length" =~ ^[1-9][0-9]*$ ]] ||
   release_die "DRAFT_LENGTH must be a positive integer"
+shared_draft_policy_args
 release_validate_verbs_device_map
 # V41_FP8_HEAD: unset/auto is resolved once by the shared loader parser to
 # packed (exact BF16 target weights, coarse dSpark plane), on one or two RTX.
@@ -783,7 +776,7 @@ esac
 count_args=(--available-sparks "$RELEASE_AVAILABLE_SPARKS" --mapped-scale-preload-gib "$(get MAPPED_SCALE_PRELOAD_GIB 0)")
 # Pass loader-resolved values: the planner's plain config parser does not parse
 # shell quoting/comments or supply the loader's default Spark inventory.
-count_config_text="$(printf '%s=%s\n' TP2_DSPARK_EXPERTS "$TP2_DSPARK_EXPERTS" SPECULATOR "$SPECULATOR" DRAFT_LENGTH "$draft_length" EXPERT_USAGE "$(get EXPERT_USAGE on)"
+count_config_text="$(printf '%s=%s\n' TP2_DSPARK_EXPERTS "$TP2_DSPARK_EXPERTS" SPECULATOR "$SPECULATOR" EXPERT_USAGE "$(get EXPERT_USAGE on)"
   for ((rank = 0; rank < SPARK_COUNT; rank++)); do
     host_key="SPARK_${rank}_HOST"
     printf '%s=%s\n' "$host_key" "${!host_key}"
@@ -820,7 +813,6 @@ v41_prefill_waves="$(get PREFILL_WAVES)"
 [[ "$SPECULATOR" != off ]] || count_args+=(--native-mtp-layers 0)
 [[ -z "$KV_POOL_SIZE" ]] || count_args+=(--kv-pool-size "$KV_POOL_SIZE")
 count_args+=(--speculator "$SPECULATOR")
-[[ -z "$draft_length" ]] || count_args+=(--draft-length "$draft_length")
 deployment_peers=()
 for ((rank = 0; rank < RELEASE_AVAILABLE_SPARKS; rank++)); do
   lane_key="SPARK_${rank}_LANE_A"
@@ -1024,7 +1016,7 @@ assert hashlib.sha256((root / "lib/libcuteafd_native.so").read_bytes()).hexdiges
 fi
 
 peers="$(jq -er '.peers | join(",")' <<<"$count_plan")"
-fingerprint="$(printf '%s\n' "$engine_commit" "$RELEASE_MODEL_ID" "$RELEASE_MODEL_REVISION" "$ADDR" "$RELEASE_RTX_GPUS" "$gpu_uuid_csv" "$gpu_pci_csv" "$CONCURRENCY" "${HTTP_QUEUE_DEPTH:-$CONCURRENCY}" "$HTTP_QUEUE_WAIT_MS" "$HOST_CACHE_BYTES" "$RTX_EXPERT_LAYERS" "${KV_POOL_SIZE}${POOL_TOKENS:+:planner=$POOL_TOKENS}" "$EMBEDDING" "$VISION" "$AUDIO" "memory=${memory_policy_args[*]}" "$PREFIX_CACHE_ENTRIES" "$MAX_CONTEXT_TOKENS" "$MAX_OUTPUT_TOKENS" "$PREFILL_BATCH_TOKENS" "prefill-waves=${V41_PREFILL_WAVES:-}" "prefill-reserve=${V41_PREFILL_RESERVE_ROWS:-}" "$SPECULATOR" "${DRAFT_SURVIVAL_LENGTHS:-off}"${DRAFT_POLICY:+ "draft-policy=$DRAFT_POLICY"}${DRAFT_ROW_COST:+ "draft-row-cost=$DRAFT_ROW_COST"} "${draft_length:-auto}" "$TP2_ATTENTION" "$TP2_QUERY_PROJECTION" "$TP2_OUTPUT_PROJECTION" "$TP2_DSPARK_EXPERTS" "${CUTEAFD_PROTOCOL_V2_VERBS_HOST_DEVICE_MAP:-}" "${CUTEAFD_PROTOCOL_V2_VERBS_HOST_EXECUTION_LANES:-}" "${v41_worker_budget:-}" "$SPARK_COUNT" "$(release_hosts_csv)" "$peers" "spark-tp=${spark_tp}" "v41-spark-tp-roles=${spark_tp_roles_required}" | sha256sum | awk '{print $1}')"
+fingerprint="$(printf '%s\n' "$engine_commit" "$RELEASE_MODEL_ID" "$RELEASE_MODEL_REVISION" "$ADDR" "$RELEASE_RTX_GPUS" "$gpu_uuid_csv" "$gpu_pci_csv" "$CONCURRENCY" "${HTTP_QUEUE_DEPTH:-$CONCURRENCY}" "$HTTP_QUEUE_WAIT_MS" "$HOST_CACHE_BYTES" "$RTX_EXPERT_LAYERS" "${KV_POOL_SIZE}${POOL_TOKENS:+:planner=$POOL_TOKENS}" "$EMBEDDING" "$VISION" "$AUDIO" "memory=${memory_policy_args[*]}" "$PREFIX_CACHE_ENTRIES" "$MAX_CONTEXT_TOKENS" "$MAX_OUTPUT_TOKENS" "$PREFILL_BATCH_TOKENS" "prefill-waves=${V41_PREFILL_WAVES:-}" "prefill-reserve=${V41_PREFILL_RESERVE_ROWS:-}" "$SPECULATOR" "draft-policy=$(get DRAFT_POLICY history)" "${draft_length:-auto}" "$TP2_ATTENTION" "$TP2_QUERY_PROJECTION" "$TP2_OUTPUT_PROJECTION" "$TP2_DSPARK_EXPERTS" "${CUTEAFD_PROTOCOL_V2_VERBS_HOST_DEVICE_MAP:-}" "${CUTEAFD_PROTOCOL_V2_VERBS_HOST_EXECUTION_LANES:-}" "${v41_worker_budget:-}" "$SPARK_COUNT" "$(release_hosts_csv)" "$peers" "spark-tp=${spark_tp}" "v41-spark-tp-roles=${spark_tp_roles_required}" | sha256sum | awk '{print $1}')"
 spark_prefix="$RELEASE_SPARK_CONTAINER_PREFIX"
 # Launch features shared with every family, validated before a dry run returns
 # and before any service is stopped.
@@ -1051,7 +1043,7 @@ if ((dry_run)); then
   echo "  graph node padding: ${GRAPH_NODE_PADDING:-2.5%} (independent of GPU_RESERVE)"
   echo "  memory policy: ${memory_policy_args[*]:-defaults (full GPU cap, family reserves, 2M KV target)}"
   echo "  prefill batch tokens: $PREFILL_BATCH_TOKENS; expert capacity: $expert_capacity"
-  echo "  dSpark draft: ${draft_length:+fixed }${draft_length:-adaptive (maximum 5)}"
+  echo "  dSpark draft: ${draft_length:+fixed }${draft_length:-$(get DRAFT_POLICY history) (native block 7)}"
   [[ -z "${CUTEAFD_PROTOCOL_V2_VERBS_HOST_DEVICE_MAP:-}" ]] || echo "  RDMA device map: $CUTEAFD_PROTOCOL_V2_VERBS_HOST_DEVICE_MAP"
   [[ -z "${CUTEAFD_PROTOCOL_V2_VERBS_HOST_EXECUTION_LANES:-}" ]] || echo "  RDMA execution lanes: $CUTEAFD_PROTOCOL_V2_VERBS_HOST_EXECUTION_LANES"
   echo "  release identity: $fingerprint"
@@ -1188,6 +1180,7 @@ if [[ -n "${POOL_TOKENS:-}" ]]; then
 fi
 [[ "$SPECULATOR" != dspark ]] || args+=(--dspark)
 [[ -z "$draft_length" ]] || args+=(--draft-length "$draft_length")
+args+=("${draft_policy_args[@]}")
 [[ "$TP2_ATTENTION" != on ]] || args+=(--tp2-attention)
 [[ "$TP2_QUERY_PROJECTION" != on ]] || args+=(--tp2-query-projection)
 [[ "$TP2_OUTPUT_PROJECTION" != on ]] || args+=(--tp2-output-projection)
@@ -1855,6 +1848,8 @@ if [[ -n "$draft_length" ]]; then
   [[ "$draft_length" =~ ^[1-9][0-9]*$ ]] || release_die "DRAFT_LENGTH must be a positive integer"
   draft_args+=(--draft-length "$draft_length")
 fi
+shared_draft_policy_args
+draft_args+=("${draft_policy_args[@]}")
 # Prefix cache (MiMo, GLM 5.3, GLM 5.3 Flash, Qwen 3.8, DeepSeek V4): PREFIX_CACHE_ENTRIES
 # snapshots per bank (prompts, turns; 0 = off), HOST_CACHE_BYTES of pinned host memory for
 # retention (auto by default, e.g. 64GiB explicitly; 0 = off). POOL_TOKENS: paged KV tokens shared by
@@ -2347,13 +2342,6 @@ if [[ $family == glm5_flash ]]; then
         { echo "GLM5_FLASH_DECODE_ROWS=128 runs the wide decode programs on one GPU; a head split takes 64" >&2; exit 2; }
       family_args+=(--decode-rows 128) ;;
     *) echo "GLM5_FLASH_DECODE_ROWS must be 64 or 128" >&2; exit 2 ;;
-  esac
-  # GLM5_FLASH_ROUTE_RING_CHECK=on (diagnostic) also copies Spark layers' router ids through the local
-  # route ring and counts disagreements with the staged ids.
-  case "$(get GLM5_FLASH_ROUTE_RING_CHECK off)" in
-    off) ;;
-    on) trace_args+=(-e "CUTEAFD_GLMF_ROUTE_RING_CHECK=1") ;;
-    *) echo "GLM5_FLASH_ROUTE_RING_CHECK must be on or off" >&2; exit 2 ;;
   esac
 fi
 # INSTANCE names a launch that runs beside others on disjoint hardware

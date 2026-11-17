@@ -322,7 +322,6 @@ impl PipelineKernels for Bindings<'_, '_, '_, '_, '_> {
         let rows = Scalar::I32(self.rows() as i32);
         if !layer.dense && e.tp2_layer(index) {
             e.moe_front(index, w, layer, self.rows())?;
-            e.ring_local_routes(index, w, self.rows())?;
             e.shared_on(0, index, w, layer, rows, self.cap())?;
             e.moe_front_on(1, index, w1, self.layer(1, index), self.rows())?;
             e.shared_on(1, index, w1, self.layer(1, index), rows, self.cap())?;
@@ -410,10 +409,6 @@ impl PipelineKernels for Bindings<'_, '_, '_, '_, '_> {
         if !self.layer(0, index).dense { e.finish_width_tap(w, index, real)?; }
         let bytes = self.rows() * e.cfg.hidden * 2;
         if let Some(callback) = self.on_layer.as_mut() { callback(index, &e.download(&w.h, bytes)?)?; }
-        if let Some(probe) = e.draft_probe.borrow_mut().as_mut() {
-            // SAFETY: this submission retains the rank-0 stream and probe events.
-            unsafe { probe.mark(index, e.stream)?; }
-        }
         crate::shared::console::layer_mark(index);
         Ok(())
     }

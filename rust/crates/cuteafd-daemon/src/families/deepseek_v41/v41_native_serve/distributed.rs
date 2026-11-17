@@ -339,7 +339,8 @@ pub(super) fn worker(mut args: crate::cli::NativeServeArgs, mut receive: mpsc::R
     // dSpark is admitted before it exists (#65): plan every retained owner from
     // the native plans and AOT packages, sample with no draft allocation, solve
     // with the drafter as a shared Movable, then load with the admitted bytes.
-    let draft_width = if args.draft_length.draft_length.unwrap_or(5) > 5 { 7 } else { 5 };
+    // The drafter loads its full native block; history and exploration decide how much of it to verify.
+    let draft_width = cuteafd_core::MAX_DSPARK_PROPOSALS;
     ensure!(args.resolved_prefix_entries() <= 128, "invalid retained-turn limit");
     let snapshot_slots = super::prefix::Arenas::slots_for(&args);
     let dspark_inventory = if args.dspark {
@@ -519,7 +520,7 @@ pub(super) fn worker(mut args: crate::cli::NativeServeArgs, mut receive: mpsc::R
         devices[1].run(|| link.get_mut().bootstrap(catalog.nvfp4().is_some()))?;
     }
     memory_checkpoint("TP2 transports")?;
-    if let Some(draft) = &mut draft { draft.configure_policy(&transport, catalog.nvfp4().is_some())?; }
+    if let Some(draft) = &mut draft { draft.bind_policy((0..40).filter(|&layer| transport.has_local_layer(layer)).count()); }
     args.max_context_tokens = admission::adopt_measured_pool(&lib, &args, &mut pool)?;
     cuteafd_bench::context::set_resolved("max-context-tokens", &args.max_context_tokens.to_string());
     cuteafd_bench::context::set_resolved("kv-pool-size", &pool.global_bytes.to_string());

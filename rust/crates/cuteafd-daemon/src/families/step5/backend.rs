@@ -1,7 +1,7 @@
 //! Shared scheduler adapter; a native Step is the only pending verify evidence.
 use super::{cache::CacheRank, execution::Execution, prefix::{Frontier, Placement, Step5Prefix},
     transaction::{Pending, SequenceRows, Step}};
-use crate::shared::{draft::routes::RoundRoutes, memory::{device::{Allocation, Device}, Tag},
+use crate::shared::{memory::{device::{Allocation, Device}, Tag},
     prefix::{CudaCopyEngine, PrefixArgs, Toggle}, qwen::scheduler::{self, Backend},
     token_io::{DeviceLogits, TokenEmbedding}};
 use anyhow::{ensure, Context, Result};
@@ -649,14 +649,6 @@ impl<'e, 'a> Backend<'a> for Step5Backend<'e, 'a> {
         crate::shared::speculation_trace::Deferred::new(move || serde_json::json!({"kind":"step5_swa512_csa64", "rows":rows, "contexts":contexts,
             "attention":"eager_per_sequence", "arithmetic":"eager"}))
     }
-    fn draft_geometry(&self, _snapshot: &Path, width: usize) -> Result<cuteafd_core::PolicyGeometry> {
-        ensure!(self.mtp.is_some(), "Step-5 MTP runtime is not admitted");
-        self.execution.draft_geometry(width, self.geometry().decode_rows)
-    }
-    fn arm_draft_probe(&self) -> Result<()> {
-        ensure!(self.mtp.is_some(), "Step-5 MTP runtime is not admitted");
-        self.execution.arm_draft_probe()
-    }
     fn prefill_draft(&self, placement: &Placement, start: usize, chunk: &[u32], _next: Option<u32>,
         draft: &mut NoDraft) -> Result<()> {
         let mtp = self.mtp.context("Step-5 MTP runtime is not admitted")?;
@@ -705,11 +697,6 @@ impl<'e, 'a> Backend<'a> for Step5Backend<'e, 'a> {
             }
         }
         Ok(())
-    }
-    fn probe_begin(&self, rows: usize) { self.execution.probe_begin(rows); }
-    fn probe_end(&self) { self.execution.probe_end(); }
-    fn probe_finish<T>(&self, observe: impl FnOnce(&RoundRoutes, &[Option<f64>]) -> T) -> Option<T> {
-        self.execution.probe_finish(observe)
     }
 }
 

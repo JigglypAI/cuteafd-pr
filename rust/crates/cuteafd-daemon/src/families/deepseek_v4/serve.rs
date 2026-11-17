@@ -1,5 +1,5 @@
 //! OpenAI-compatible serving for DeepSeek V4: continuous batching over the
-//! prefill/decode engine, with resource-priced dSpark speculation.
+//! prefill/decode engine, with dSpark speculation on the shared history draft policy.
 //!
 //! Prefix cache (`cuteafd_engine::prefix` over `super::prefix::Dsv4Prefix`):
 //! admission restores the deepest retained snapshot whose tokens prefix the
@@ -21,9 +21,7 @@ use crate::shared::serve::lanes::{self, LaneCommit, LaneLease, LaneSet};
 use crate::shared::kv_reserve::{reserved_drafts, Holding, Reserve, Reserving};
 use cuteafd_engine::reserve::Lease;
 use super::metadata::SOURCE_PAGE_TOKENS;
-use crate::shared::draft::{binding::{self, DraftPass, RoundRecord, RoundRequest}, clock::RoundClock,
-    evidence::{Censor, DraftSource, Evidence}, resource, runtime::SharedPolicy};
-use crate::shared::draft_policy::DraftHistory;
+use crate::shared::draft::history::{self, Policy as DraftPolicy, Proposal};
 use crate::shared::token_io::{DeviceLogits, RowResult, SelectBatch, TokenSelector};
 use crate::shared::prefill_share::{Chunk, DecodeShareArgs};
 use cuteafd_engine::prefix::{After, MarkArena, PointPlan, PointPolicy, PrefixCache, PrefixConfig, PrefixFamily, SnapshotKind};
@@ -145,7 +143,7 @@ fn console_layout(args: &ServeArgs, model: &str) -> console::Layout {
             .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
             .and_then(|config| config["dspark_block_size"].as_u64()).unwrap_or(8) as usize;
         layout.speculator = Some(console::Speculator { name: "dSpark".into(), positions: block.clamp(1, 16),
-            policy: "shared resource-priced drafts and agreeing copies".into() });
+            policy: "history drafts and agreeing copies".into() });
     }
     layout.steps = vec![
         StepGroup::new("Decode step", "host clock", &[("round.cycle", "step", Target),
@@ -196,7 +194,6 @@ fn serve_loop(
     let mut ready = Some(ready);
     // The mark arena is allocated before local experts fill the device.
     let arena = |engine: &super::engine::Engine<'_>| -> Result<usize> {
-        if args.dspark && !engine.skip_routed && engine.weights.dspark.is_some() { engine.arm_draft_probe()?; }
         let mark = Dsv4Prefix::mark_bytes_of(engine)?;
         Ok(mark_slots(engine, &prefix, mark) * mark)
     };
@@ -209,7 +206,9 @@ fn serve_loop(
                 "--max-context-tokens exceeds the exported programs; requests are limited to the programs' context");
         }
         engine.configure_packing(packing, transports)?;
-        let shared = super::draft_binding::new(engine, &loaded, transports, length)?;
+        // V4's Markov dSpark proposes tokens only: no trained confidence head.
+        let shared = (engine.draft_block() > 0 && !engine.skip_routed).then(||
+            DraftPolicy::new(length, engine.draft_block(), cuteafd_core::HeadScore::None, true));
         let local = engine.local_layers();
         console::layer_classes((0..engine.weights.layers.len()).map(|l| console::layer_class(false, l >= local)).collect());
         let mut selector = TokenSelector::new(&loaded.library, args.token_io.token_select, engine.cfg.vocab_size,
@@ -274,7 +273,6 @@ struct Active<'a> {
     decoder: cuteafd_loader::StreamingTokenDecoder,
     generated: usize,
     draft_calls: usize,
-    drafts: DraftHistory,
     buffered: usize,
     started: Instant,
     ticket: console::Ticket,
@@ -393,14 +391,6 @@ fn finish_row_status(request: &mut Active<'_>, token: Result<u32>, eos: u32, log
     }
 }
 
-fn round_censor(done: bool, failed: bool, committed: usize, rows: &[u32], token: Option<u32>, eos: u32) -> Option<Censor> {
-    if failed {
-        // A selected mismatch was judged even if streaming it failed.
-        if token.is_some() && rows.get(committed).is_some_and(|next| Some(*next) != token) { None }
-        else { Some(Censor::Cancelled) }
-    } else { resource::finish_censor(done, committed, rows, token, &[eos]) }
-}
-
 /// Each row draws at the position after it, masked along its sequence's
 /// drafts. A sequence whose grammar fails gets its error (and unmasked rows):
 /// it fails alone, never the batch.
@@ -412,6 +402,17 @@ fn select_rows(selector: &mut TokenSelector<'_>, logits: &crate::shared::token_i
     Ok((selector.select(logits, &batch)?, poisoned))
 }
 
+/// Whether a row's outcome left the next draft unjudged. A selected mismatch
+/// was judged even if streaming it failed.
+fn round_censored(done: bool, failed: bool, committed: usize, rows: &[u32], token: Option<u32>) -> bool {
+    if failed { !(token.is_some() && rows.get(committed).is_some_and(|next| Some(*next) != token)) }
+    else { history::finish_censored(done, committed, rows, token) }
+}
+
+/// The drafter's installed block widths: its native block and half of it.
+fn draft_widths(native: usize) -> [usize; 2] { [native.div_ceil(2), native] }
+
+/// Which requests one draft pass of `width` takes, and their room.
 fn action_rooms(limits: &[usize], width: usize, rows: usize, start: usize) -> Vec<usize> {
     let mut rooms = vec![0; limits.len()];
     if width == 0 || limits.is_empty() { return rooms; }
@@ -427,55 +428,38 @@ fn action_rooms(limits: &[usize], width: usize, rows: usize, start: usize) -> Ve
     rooms
 }
 
-fn cold_action(widths: &[usize], rooms: &[Vec<usize>], preferred: usize) -> usize {
-    let fits = |index: usize| rooms[index].iter().any(|&room| room > 0);
-    widths.iter().position(|&width| width == preferred).filter(|&index| fits(index))
-        .or_else(|| (0..rooms.len()).find(|&index| fits(index))).unwrap_or(0)
-}
-
 /// One global verifier budget, including requests that did not draft.
 #[allow(clippy::too_many_arguments)]
 fn speculative_step(
     engine: &super::engine::Engine<'_>,
     active: &mut [Active<'_>],
-    shared: &mut SharedPolicy,
-    observed: &mut u64,
-    skipped: &mut u64,
+    shared: &mut DraftPolicy,
+    round: &mut u64,
     eos: u32,
     transports: &mut [crate::shared::spark_intake::SparkLink<'_>],
     runtime: &tokio::runtime::Runtime,
     selector: &mut TokenSelector<'_>,
     caching: bool,
     shape: &mut StepShape,
-    cycle: Instant,
 ) -> Result<Vec<bool>> {
-    let mut clock = RoundClock::at(cycle);
     let limits: Vec<usize> = active.iter().map(|a| if probe::no_speculation(&a.job.probe) { 0 } else {
         engine.decode_rows.saturating_sub(active.len())
             .min(a.job.max_tokens.saturating_sub(a.generated + 1))
             .min(a.capacity.saturating_sub(a.placement.len + 2))
             .min(reserved_drafts(a.placement.len, a.placement.units.len(), SOURCE_PAGE_TOKENS))
     }).collect();
+    let native = shared.block();
     let requests: Vec<_> = active.iter().zip(&limits).map(|(request, &room)| (request.ticket.id(), room)).collect();
-    let widths: Vec<_> = std::iter::once(0).chain(shared.policy.widths().iter().copied()).collect();
-    let rooms: Vec<_> = widths.iter().map(|&width| action_rooms(&limits, width, engine.decode_rows,
-        observed.wrapping_add(*skipped) as usize)).collect();
-    let actions: Vec<_> = widths.iter().zip(&rooms).map(|(&width, rooms)| cuteafd_core::DraftAction {
-        width, draft_us: shared.policy.draft_cost_drafted(false, active.len(),
-            rooms.iter().filter(|&&room| room > 0).count(), width),
-    }).collect();
-    let masks: Vec<_> = rooms.iter().map(Vec::as_slice).collect();
-    let priced = shared.policy.choose_action_with_rooms(false, &requests, &actions, &masks, engine.decode_rows)?;
-    let chosen = priced.unwrap_or_else(|| {
-        // Collect installed width fits before pricing can choose skip, but do
-        // not discard an eligible narrow pass when the preferred width cannot fit.
-        cold_action(&widths, &rooms, shared.policy.choose_width(false, &requests))
-    });
-    binding::trace_action(&shared.policy, false, &requests, &actions, Some(&masks), engine.decode_rows,
-        priced, chosen);
-    let block = actions[chosen].width;
+    let depths = shared.plan(&requests, engine.decode_rows);
+    // The narrowest installed block that covers the longest planned draft; the drafter's
+    // workspace fits `rows / block` participants, rotated so none is starved.
+    let longest = depths.iter().copied().max().unwrap_or(0);
+    let block = draft_widths(native).into_iter().find(|&width| width >= longest).unwrap_or(native);
+    let wanted: Vec<usize> = depths.iter().map(|&depth| depth.min(block)).collect();
+    let rooms = if longest == 0 { vec![0; active.len()] } else { action_rooms(&wanted, block, engine.decode_rows, *round as usize) };
+    *round += 1;
     let noise = engine.cfg.dspark_noise_token_id as u32;
-    let draft_indices: Vec<usize> = rooms[chosen].iter().enumerate().filter_map(|(i, &room)|
+    let draft_indices: Vec<usize> = rooms.iter().enumerate().filter_map(|(i, &room)|
         (room > 0).then_some(i)).collect();
     let mut drafts = vec![Vec::new(); active.len()];
     if !draft_indices.is_empty() {
@@ -483,53 +467,40 @@ fn speculative_step(
             std::iter::once(active[i].next).chain(std::iter::repeat_n(noise, block - 1))).collect();
         let requests: Vec<super::engine::DraftRequest<'_>> = draft_indices.iter().map(|&i|
             super::engine::DraftRequest { placement: &active[i].placement, token: active[i].next }).collect();
-        let proposed = clock.draft(|| engine.draft_width(&requests, &inputs, block))?;
-        shape.draft_us = clock.observe().draft_us.unwrap_or(0) as f64;
+        let timer = Instant::now();
+        let proposed = engine.draft_width(&requests, &inputs, block)?;
+        shape.draft_us = console::us(timer);
         ensure!(proposed.len() == draft_indices.len(), "dSpark proposal count differs from participating requests");
         for (&i, proposal) in draft_indices.iter().zip(proposed) {
             ensure!(proposal.len() == block, "dSpark proposal width differs from installed block");
             active[i].draft_calls += 1;
-            drafts[i] = proposal;
+            drafts[i] = proposal[..rooms[i]].to_vec();
         }
     }
-    let width = if draft_indices.is_empty() { 0 } else { block };
-    let mut priors: Vec<Vec<f64>> = active.iter().enumerate().map(|(i, a)| {
-        let rates = a.drafts.pooled(drafts[i].len(), active.iter().enumerate()
-            .filter_map(|(j, other)| (i != j).then_some(&other.drafts)));
-        shared.prior(&a.drafts, &resource::DraftEvidence::History(&rates), 0)
-    }).collect();
-    let copies: Vec<_> = active.iter().zip(&drafts).zip(&limits).zip(&mut priors)
-        .map(|(((a, draft), &limit), prior)| resource::copy_continuation(&shared.policy, active.len(), a.ticket.id(),
-            &a.history, draft, prior, limit, a.job.sampling.is_greedy())).collect();
-    let candidates: Vec<_> = active.iter().zip(&priors).zip(&limits).map(|((a, prior), &limit)|
-        resource::Candidate { id: a.ticket.id(), prior, limit, selector: false, cold: a.drafts.cold() }).collect();
-    let selection = resource::select_drafted(&mut shared.policy, &candidates, width, engine.decode_rows,
-        draft_indices.len());
-    let sequences: Vec<Vec<u32>> = active.iter().enumerate().map(|(i, a)| {
-        let proposal = copies[i].as_ref().map_or(drafts[i].as_slice(), |copy| copy.tokens.as_slice());
-        let mut rows: Vec<u32> = std::iter::once(a.next)
-            .chain(proposal.iter().copied().take(selection.lengths[i])).collect();
+    // Cut each draft to its plan, extend agreeing ones with a history copy, fit the row budget.
+    {
+        let mut shaped: Vec<_> = active.iter().zip(drafts.iter_mut()).map(|(a, tokens)| Proposal {
+            id: a.ticket.id(), tokens, head: None, history: &a.history, greedy: a.job.sampling.is_greedy() }).collect();
+        shared.shape(&mut shaped, engine.decode_rows);
+    }
+    let sequences: Vec<Vec<u32>> = active.iter().zip(&drafts).map(|(a, proposal)| {
+        let mut rows: Vec<u32> = std::iter::once(a.next).chain(proposal.iter().copied()).collect();
         if let Some(state) = a.constraint.as_ref() { state.truncate_proposal(&mut rows)?; }
         ensure!(!rows.is_empty(), "grammar removed V4 verifier anchor");
         Ok(rows)
     }).collect::<Result<_>>()?;
-    let total_rows = sequences.iter().map(Vec::len).sum();
+    let total_rows: usize = sequences.iter().map(Vec::len).sum();
     ensure!(total_rows <= engine.decode_rows, "shared V4 verifier budget exceeded");
-    // Prediction follows executed rows, not the pre-grammar selection.
-    let ids: Vec<_> = active.iter().map(|a| a.ticket.id()).collect();
     let lengths: Vec<_> = sequences.iter().map(|rows| rows.len() - 1).collect();
-    let predicted = shared.policy.predict_drafted(false, &ids, &lengths, width, draft_indices.len());
     let starts: Vec<usize> = active.iter().map(|a| a.placement.len).collect();
     let mut rows: Vec<(&mut Placement, &[u32])> = active.iter_mut().zip(&sequences)
         .map(|(a, tokens)| (&mut a.placement, tokens.as_slice())).collect();
     let timer = Instant::now();
-    engine.probe_begin(total_rows);
     let verified = engine.verify_device(&mut rows, transports, runtime).and_then(|logits| {
         let (selected, poisoned) = select_rows(selector, &logits, active, &sequences, &starts)?;
         crate::shared::spark_waves::healthy()?;
         Ok((logits, selected, poisoned))
     });
-    engine.probe_end(verified.is_ok());
     let (logits, selected, mut poisoned) = verified?;
     shape.verify_us = console::us(timer);
     shape.verified = lengths;
@@ -538,50 +509,28 @@ fn speculative_step(
     let finished: Vec<_> = active.iter_mut().zip(&sequences).zip(starts).enumerate().map(|(i, ((request, rows), start))| {
         if let Some(error) = poisoned[i].take() {
             request.placement.len = start + 1;
-            outcomes.push((1, Some(Censor::Cancelled)));
+            outcomes.push((1, true));
             let done = finish_row(request, Err(anyhow::anyhow!(error)), eos, &logits, offset, caching, engine.library);
             offset += rows.len();
             return done;
         }
-        let (mut done, mut censor) = (false, None);
+        let (mut done, mut censored) = (false, false);
         for j in 0..rows.len() {
             request.placement.len = start + j + 1;
             let token = take(request.constraint.as_mut(), &selected[offset + j]);
             let kept = token.as_ref().ok().copied();
             let failed;
             (done, failed) = finish_row_status(request, token, eos, &logits, offset + j, caching, engine.library);
-            censor = round_censor(done, failed, j + 1, rows, kept, eos);
+            censored = round_censored(done, failed, j + 1, rows, kept);
             if done || rows.get(j + 1) != kept.as_ref() { break; }
         }
-        outcomes.push((request.placement.len - start, censor));
+        outcomes.push((request.placement.len - start, censored));
         offset += rows.len();
         done
     }).collect();
-    let times = clock.observe();
-    let round: Vec<_> = active.iter().enumerate().map(|(i, request)| {
-        let (accepted, censor) = outcomes[i];
-        let neural = copies[i].as_ref().map_or(drafts[i].len(), |copy| copy.neural);
-        let copied = sequences[i].len() - 1 > neural;
-        RoundRequest { id: request.ticket.id(), rows: sequences[i].len(), accepted,
-            source: if copied { DraftSource::Copy } else if drafts[i].is_empty() { DraftSource::Undrafted } else { DraftSource::Neural },
-            evidence: (!drafts[i].is_empty()).then_some(Evidence::History(&priors[i][..neural.min(priors[i].len())])), censor }
-    }).collect();
-    let result = engine.probe_finish(|routes, layer_us| binding::observe(&mut shared.policy, &RoundRecord {
-        shared: false, requests: &round, routes, layer_us, times,
-        draft: (width > 0).then_some(DraftPass { width, requests: Some(draft_indices.len()) }), predicted,
-    }));
-    match result {
-        Some(Ok(())) => *observed += 1,
-        Some(Err(error)) => { *skipped += 1; tracing::debug!(%error, "V4 draft policy round not observed"); }
-        None => *skipped += 1,
-    }
-    for (i, request) in active.iter_mut().enumerate() {
-        let (accepted, censor) = outcomes[i];
-        let neural = copies[i].as_ref().map_or(drafts[i].len(), |copy| copy.neural).min(sequences[i].len() - 1);
-        let accepted = accepted.saturating_sub(1).min(neural);
-        request.drafts.observe(neural.min(accepted + usize::from(censor.is_none())), accepted);
-    }
-    resource::publish(&shared.policy, *observed, *skipped, None);
+    let outcomes: Vec<_> = active.iter().zip(&sequences).zip(&outcomes).map(|((request, rows), &(accepted, censored))|
+        history::outcome(request.ticket.id(), rows.len(), accepted, censored)).collect();
+    shared.observe(&outcomes);
     shape.drafts = sequences.iter().map(|rows| rows[1..].to_vec()).collect();
     Ok(finished)
 }
@@ -656,7 +605,7 @@ fn publish(engine: &super::engine::Engine<'_>, stats: &Mutex<serde_json::Value>,
     }
     if let Ok(mut stats) = stats.lock() {
         *stats = serde_json::json!({"requests": requests, "generated_tokens": generated, "active": active,
-            "prefilling": prefilling, "prefix_cache": prefix_stats, "draft_policy": resource::snapshot(),
+            "prefilling": prefilling, "prefix_cache": prefix_stats, "draft_policy": history::snapshot(),
             "kv_reserve": reserve.snapshot(stalled)});
         stats["v4_runtime"] = engine.runtime_stats();
     }
@@ -744,7 +693,7 @@ fn schedule(
     loop_abort: crate::shared::loop_abort::LoopAbortConfig,
     host_config: Option<cuteafd_hostcache::config::Config>,
     selector: &mut TokenSelector<'_>,
-    mut shared: Option<SharedPolicy>,
+    mut shared: Option<DraftPolicy>,
     ready: impl FnOnce(),
 ) -> Result<()> {
     let mut lane = DecodeLane::default();
@@ -1041,7 +990,7 @@ fn schedule(
                 let mut request = Active {
                     decoder, job: p.job, constraint: p.constraint, placement: p.placement, capacity: p.capacity,
                     lease: p.lease, next: first, history: p.tokens, turn: None, generated: 0, draft_calls: 0, buffered: 0, started: Instant::now(),
-                    ticket: p.ticket, drafts: DraftHistory::default(),
+                    ticket: p.ticket,
                     loop_abort,
                     looped: false,
                 };
@@ -1066,7 +1015,7 @@ fn schedule(
         // Ended requests (early termination, the deadlock break, closed stalls) release their
         // pages inside the round, before anything is granted.
         reserve.round(&mut cache, &family, &mut active, &mut stalled, &holding, |cache, mut request| {
-            if let Some(shared) = shared.as_mut() { shared.policy.release(request.ticket.id()); }
+            if let Some(shared) = shared.as_mut() { shared.release(request.ticket.id()); }
             if !request.job.events.is_closed() { let _ = request.finish(InferenceFinishReason::Length); }
             request.ticket.done(request.generated);
             requests += 1;
@@ -1091,7 +1040,7 @@ fn schedule(
                 continue;
             }
             let mut request = active.remove(index);
-            if let Some(shared) = shared.as_mut() { shared.policy.release(request.ticket.id()); }
+            if let Some(shared) = shared.as_mut() { shared.release(request.ticket.id()); }
             request.ticket.done(request.generated);
             requests += 1;
             generated_total += request.generated as u64;
@@ -1120,11 +1069,10 @@ fn schedule(
 }
 
 /// Lane-owned decode state: V4's only lane (`LaneSupport::One`), with its
-/// observed and skipped draft-policy rounds.
+/// draft rounds (which rotate the drafter's participants).
 #[derive(Default)]
 struct DecodeLane {
-    observed: u64,
-    skipped: u64,
+    rounds: u64,
 }
 
 /// The lane's commit. V4 commits by position inside the round: a verify
@@ -1147,7 +1095,7 @@ impl LaneCommit for Committed {
 #[allow(clippy::too_many_arguments)]
 async fn decode_round(lease: LaneLease<'_>, engine: &super::engine::Engine<'_>, eos: u32,
     transports: &mut [crate::shared::spark_intake::SparkLink<'_>], runtime: &tokio::runtime::Runtime,
-    lane: &mut DecodeLane, active: &mut Vec<Active<'_>>, shared: &mut Option<SharedPolicy>,
+    lane: &mut DecodeLane, active: &mut Vec<Active<'_>>, shared: &mut Option<DraftPolicy>,
     selector: &mut TokenSelector<'_>, family: &Dsv4Prefix<'_, '_>, cache: &mut PrefixCache<CudaCopyEngine<'_>>,
     states: &mut Vec<usize>, cycle: Instant) -> Result<Option<Vec<bool>>> {
     let mut tally = console::Step::begin(lease.index());
@@ -1157,8 +1105,8 @@ async fn decode_round(lease: LaneLease<'_>, engine: &super::engine::Engine<'_>, 
     let caching = cache.enabled();
     // Undrafted rounds use the same route and resource observations.
     let step = if let Some(shared) = shared.as_mut() {
-        speculative_step(engine, active, shared, &mut lane.observed, &mut lane.skipped, eos,
-            transports, runtime, selector, caching, &mut shape, cycle)
+        speculative_step(engine, active, shared, &mut lane.rounds, eos,
+            transports, runtime, selector, caching, &mut shape)
     } else {
         let sequences: Vec<Vec<u32>> = active.iter().map(|a| vec![a.next]).collect();
         let starts: Vec<usize> = active.iter().map(|a| a.placement.len).collect();
@@ -1182,7 +1130,7 @@ async fn decode_round(lease: LaneLease<'_>, engine: &super::engine::Engine<'_>, 
         Err(error) => {
             tracing::warn!("decode step failed: {error:#}");
             for request in active.drain(..) {
-                if let Some(shared) = shared.as_mut() { shared.policy.release(request.ticket.id()); }
+                if let Some(shared) = shared.as_mut() { shared.release(request.ticket.id()); }
                 let _ = request.job.events.send(Err(NativeFailure::Worker(format!("{error:#}"))));
                 release(family, cache, states, &request.placement);
             }
@@ -1263,32 +1211,6 @@ mod tests {
             let rooms = action_rooms(&limits, width, 64, 0);
             assert!(rooms.iter().filter(|&&room| room > 0).count() * width <= 64);
         }
-    }
-
-    #[test]
-    fn cold_action_keeps_eligible_pass_when_preferred_width_cannot_fit() {
-        let widths = [0, 3, 5];
-        let limits = [5, 5];
-        let rooms: Vec<_> = widths.iter().map(|&width| action_rooms(&limits, width, 4, 0)).collect();
-        assert_eq!(cold_action(&widths, &rooms, 5), 1);
-        assert_eq!(cold_action(&widths, &rooms, 3), 1);
-        let rooms: Vec<_> = widths.iter().map(|&width| action_rooms(&limits, width, 10, 0)).collect();
-        assert_eq!(cold_action(&widths, &rooms, 5), 2);
-        let rooms: Vec<_> = widths.iter().map(|&width| action_rooms(&[0, 0], width, 10, 0)).collect();
-        assert_eq!(cold_action(&widths, &rooms, 5), 0);
-    }
-
-    #[test]
-    fn terminal_and_stream_failures_keep_only_judged_rejections() {
-        let rows = [10, 11, 12, 13];
-        assert_eq!(round_censor(false, false, 2, &rows, Some(99), 99), None);
-        assert_eq!(round_censor(true, false, 2, &rows, Some(99), 99), None);
-        assert_eq!(round_censor(true, false, 2, &rows, Some(12), 12), Some(Censor::Eos));
-        assert_eq!(round_censor(true, false, 2, &rows, Some(12), 99), Some(Censor::OutputLimit));
-        assert_eq!(round_censor(true, true, 2, &rows, Some(12), 99), Some(Censor::Cancelled));
-        assert_eq!(round_censor(true, true, 2, &rows, None, 99), Some(Censor::Cancelled));
-        assert_eq!(round_censor(true, true, 2, &rows, Some(99), 99), None);
-        assert_eq!(round_censor(true, true, 4, &rows, Some(99), 99), Some(Censor::Cancelled));
     }
 
     #[test]

@@ -372,7 +372,7 @@ def test_build_slot_refuses_a_missing_lock_directory(tmp_path):
 
 def test_benches_record_medians_and_fail_on_a_bound_or_an_empty_run(tmp_path, monkeypatch):
     (tmp_path / 'logs').mkdir()
-    ran = ('C16 V4.1 geometry, medians: select 937.1 us, choose_width 1603.7 us, observe 56.8 us, total 2597.6 us\n'
+    ran = ('C16 block 7 + copy 32, medians: round 37.1 us, plan 9.7 us, shape 12.6 us, observe 14.8 us\n'
            'test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured\n')
     calls = _fake(monkeypatch, [(0, BUILD_OK), (0, ran)])
     envs = []
@@ -383,17 +383,17 @@ def test_benches_record_medians_and_fail_on_a_bound_or_an_empty_run(tmp_path, mo
     monkeypatch.setattr(gate, 'run_logged', run_logged)
     result = gate.benches(ROOT, tmp_path, ARGS, {})
     assert result['status'] == 'pass' and result['passed'] == 1
-    assert result['medians']['draft_policy_bench'] == {'select': 937.1, 'choose_width': 1603.7, 'observe': 56.8}
+    assert result['medians']['draft_history_bench'] == {'round': 37.1, 'plan': 9.7, 'shape': 12.6, 'observe': 14.8}
     assert '--release' in calls[0] and '--ignored' in calls[1]
     assert envs[1]['CUTEAFD_POLICY_BENCH_MAX_US'] == '1200'
     record = {'task': 't', 'verdict': 'pass', 'head': 'a' * 40, 'dirty': False, 'suites': [result]}
-    assert 'select 937 us' in gate.render(record)
-    over = 'medians: select 1500.0 us, choose_width 2500.0 us, observe 57.0 us\nselect median 1500.0 us exceeds 1200 us\n' \
+    assert 'round 37 us' in gate.render(record)
+    over = 'medians: round 1500.0 us, plan 500.0 us, shape 500.0 us, observe 500.0 us\nround median 1500.0 us exceeds 1200 us\n' \
            'test result: FAILED. 0 passed; 1 failed; 0 ignored\n'
     _fake(monkeypatch, [(0, BUILD_OK), (101, over)])
     result = gate.benches(ROOT, tmp_path, ARGS, {})
-    assert result['status'] == 'failed' and result['failing'] == ['draft_policy_bench']
-    assert result['medians']['draft_policy_bench']['select'] == 1500.
+    assert result['status'] == 'failed' and result['failing'] == ['draft_history_bench']
+    assert result['medians']['draft_history_bench']['round'] == 1500.
     _fake(monkeypatch, [(0, BUILD_OK), (0, 'running 0 tests\n')])
     assert gate.benches(ROOT, tmp_path, ARGS, {})['status'] == 'failed'
 

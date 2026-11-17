@@ -609,7 +609,6 @@ pub(crate) struct GlmEngine<'a> {
     /// Host seconds inside the exchanges: building and posting requests,
     /// copying received partials into the pinned staging.
     pub exchange_host: RefCell<[f64; 4]>,
-    draft_probe: RefCell<Option<crate::shared::draft::probe::RoundProbe<'a>>>,
     /// `glm-golden --width-invariance` only: each MoE layer's input rows, staged
     /// routes and routed+shared output of the steps it verifies.
     pub(crate) width_taps: RefCell<Option<Vec<WidthTap>>>,
@@ -790,7 +789,7 @@ impl<'a> GlmEngine<'a> {
             attention_plan: cuteafd_core::coordinator_programs::AttentionReductionPlan::new(DECODE_ROWS, None, None)?,
             terminal: Cell::new(crate::shared::peer_split::TerminalState::Active), spark_bf16: false, prefill_span_rows: prefill_lanes * prefill_rows, skip: None, l2: None, profile: RefCell::new([0.0; 3]),
             pending_media: RefCell::new(None),
-            exchange_host: RefCell::new([0.0; 4]), draft_probe: RefCell::new(None), width_taps: RefCell::new(None),
+            exchange_host: RefCell::new([0.0; 4]), width_taps: RefCell::new(None),
             graphs: RefCell::new(crate::shared::decode_graph::GraphBank::new()), expert_usage: None, usage_lookup: None, usage_active: Cell::new(false), graphs_warmed: Cell::new(false), graphs_warming: Cell::new(false), graph_basis: Cell::new(None), drafter: None, draft_window_marks: 0, draft_core_head: None, target_core_head: None, embedding, prefill_w8a8: true })
     }
 
@@ -872,30 +871,6 @@ impl<'a> GlmEngine<'a> {
                 .context("GLM K6 drafter head scratch not admitted")?.target(&self.weights.head)),
             head => head.target(),
         }
-    }
-
-    /// Arm after graph warmup; only explicit verify rounds record signals.
-    pub(crate) fn arm_draft_probe(&self) -> Result<()> {
-        let dense = self.weights.layers.iter().map(|layer| layer.dense).collect();
-        *self.draft_probe.borrow_mut() = Some(crate::shared::draft::probe::RoundProbe::new(
-            self.library, dense, self.cfg.topk, DECODE_ROWS)?);
-        Ok(())
-    }
-
-    pub(crate) fn probe_begin(&self, rows: usize) {
-        if let Some(probe) = self.draft_probe.borrow_mut().as_mut() { probe.begin(rows); }
-    }
-
-    pub(crate) fn probe_end(&self) {
-        if let Some(probe) = self.draft_probe.borrow_mut().as_mut() { probe.end(); }
-    }
-
-    /// Read only after the verifier's normal stream synchronization.
-    pub(crate) fn probe_finish<T>(&self, observe: impl FnOnce(&crate::shared::draft::routes::RoundRoutes,
-        &[Option<f64>]) -> T) -> Option<T> {
-        let mut probe = self.draft_probe.borrow_mut();
-        let (routes, times) = probe.as_mut()?.finish()?;
-        Some(observe(routes, &times))
     }
 
     /// Every layer's latent record pool at its row bytes (64-row pages; none on a layer
@@ -1927,10 +1902,6 @@ impl<'a> GlmEngine<'a> {
             if let Some(on_layer) = on_layer.as_mut() {
                 on_layer(index, &self.download(&w.h, t * h * 2)?)?;
             }
-            if let Some(probe) = self.draft_probe.borrow_mut().as_mut() {
-                // SAFETY: the engine stream owns this round and its layer events.
-                unsafe { probe.mark(index, self.stream)? };
-            }
             crate::shared::console::layer_mark(index);
         }
         if let Some(pair) = &self.tp2 { pair.finish_checks()?; }
@@ -2278,10 +2249,6 @@ impl<'a> GlmEngine<'a> {
             // Instantiating the next peer graph can wait for that device to drain.
             // Queue rank 0's current shared meet first so rank 1 can reach its end.
             if defer_peer { peer_next()?; }
-            if let Some(probe) = self.draft_probe.borrow_mut().as_mut() {
-                // SAFETY: the engine stream owns this round and its layer events.
-                unsafe { probe.mark(index, self.stream)? };
-            }
             crate::shared::console::layer_mark(index);
         }
         Ok(())

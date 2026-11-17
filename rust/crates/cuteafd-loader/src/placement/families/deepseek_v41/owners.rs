@@ -250,9 +250,9 @@ pub fn blas_owners(ranks: usize, head: crate::placement::planner::serving::BlasH
 /// compiled draft shape the lanes' live rows fit. Offline layout and serving
 /// admission both select modules with it, so the predicted module set and the
 /// one the drafter loads are the same.
-pub fn draft_rows(concurrency: u64, width: u8) -> u64 {
+pub fn draft_rows(concurrency: u64) -> u64 {
     let lanes = if concurrency == 1 { 1 } else { 2 };
-    let live = concurrency.div_ceil(lanes) * if width > 5 { 7u64 } else { 5u64 };
+    let live = concurrency.div_ceil(lanes) * cuteafd_core::MAX_DSPARK_PROPOSALS as u64;
     [16, 40, cuteafd_core::V41_DRAFT_LEGACY_ROWS as u64,
         cuteafd_core::V41_DRAFT_WIDE_ROWS as u64].into_iter()
         .find(|&rows| rows >= live)
@@ -926,6 +926,14 @@ mod tests {
         assert!(window_batch_bytes(0).is_err());
         assert!(window_batch_bytes(4097).is_err());
         Ok(())
+    }
+
+    #[test]
+    fn native_seven_draft_rows_select_the_wide_module_bucket_before_admission() {
+        for (requests, rows) in [(1, 16), (2, 16), (4, 16), (8, 40), (16, 80),
+            (17, 80), (23, 256), (32, 256), (64, 256)] {
+            assert_eq!(draft_rows(requests), rows, "C{requests}: seven-position lanes");
+        }
     }
 
     #[test]

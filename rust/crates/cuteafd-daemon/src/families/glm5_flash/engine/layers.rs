@@ -412,7 +412,6 @@ impl PipelineKernels for Bindings<'_, '_, '_> {
             e.ffn(w, layer, e.cfg.dense_intermediate, self.cap(), w.delta.buffer.ptr, rows)?;
         } else {
             e.moe_front(w, index, layer, real, rows, self.cap(), &[Span { first: 0, rows: real }])?;
-            e.probe_ring(index, w, real)?;
             if e.tp2_layer(index) {
                 e.tp2_pair(index, self.lane, w, Some(w1), real, rows, self.cap())?;
             } else if let Some(Experts::Spark { transport, .. }) = e.routed_experts(index) {
@@ -462,7 +461,6 @@ impl PipelineKernels for Bindings<'_, '_, '_> {
         e.exchange_push(e.exchange()?, "main", 1, slot(index, true, self.lane),
             e.peer_ffn_out(index, self.work[1], self.layer(1, index))?, self.rows * e.cfg.hidden * 2)?;
         crate::shared::console::layer_mark(index);
-        e.probe_mark(index)?;
         if self.on_layer.is_some() && index + 1 < e.weights.layers.len() {
             // Materialize the normal fused boundary early for diagnostics.
             // Both rank joins must precede any callback host synchronization.

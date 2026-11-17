@@ -207,8 +207,9 @@ Extend (new families; kernels largely exist in b12x already):
 | Qwen/Qwen3.8-Flash-Next (+ EXL3 K4.25 PLE variants) | qwen4 | GDN linear attention, n-gram memory tables, PLE, MTP; `../qflashrt` has a single-device port |
 
 Speculation: one best speculator per family (native MTP/nextn, dSpark,
-DFlash2). Adaptive width with calibrated confidence and cost model, as in
-ds41rt `dspark_policy` and glmrt `dflash2_confidence`.
+DFlash2). The shared `history` policy chooses verified width from per-position
+acceptance windows, with one explore past the stop. A calibrated trained
+head may skip that explore below 0.3; there is no cost or selector model.
 Qwen's launcher defaults to MTP3 for qualified local EXL3 and NVFP4
 (admitted Spark expert world 0, independent of inventory); explicit overrides
 win. Spark-backed expert layouts leave the
@@ -1282,7 +1283,9 @@ Work, in priority order:
    split choices. This widens paired precision noise for V4 Flash and
    blocks byte-exact speculation there.
    **Separate task: GLM Flash speculative decode is not launch-deterministic
-   (2026-10-07, WP-9):** greedy, temperature 0 / seed 0, identical prompt and
+   (2026-10-07, WP-9; historical):** The timing-based policy hypothesis and
+   repeat-run prescription below are superseded by `history` (2026-11-18)
+   and the current tiered gates in AGENTS.md. Greedy, temperature 0 / seed 0, identical prompt and
    tokenizer diverge at token 6 between launches on the unchanged lazy path
    (retokenized SSE text, not a raw generated-ID trace). Lazy/startup also
    diverge; the lazy/lazy control rules out attributing this to bucket padding
@@ -5016,6 +5019,11 @@ front ends land; 5 after 4; 6 after 1; 7 and 8 after 1 and 4; 9 and 10 last.
 
 ## v3 draft policy: resource-priced, shared (design, 2026-10-09)
 
+> Superseded 2026-11-18 (TJ): the resource-priced policy, the `simple` family
+> and their confidence plumbing are deleted. Every family drafts on the one
+> `history` policy (`cuteafd_core::draft_history`, `DRAFT_POLICY` in
+> `docs/options.md`). The rest of this section is history.
+
 Design for v3 item 6. Inputs: `cuteafd-core::dspark_policy` (1,214 lines) and
 its V4.1 binding (`v41_native_serve/speculative/policy.rs`), today's
 `shared/draft_policy.rs` (`CycleCost`, `allocate`, `DraftHistory`,
@@ -5408,6 +5416,10 @@ of their own (decode rows 128 stays opt-in until D2's C1-after-C16 card).
    (three family loops carry the D1 binding).
 
 ## First after rc3: per-key draft confidence calibration (TJ, 2026-10-09)
+
+> Superseded 2026-11-18: `history` deletes selector confidence fits and cost
+> models. Only trained dSpark heads calibrate online to decide whether to skip
+> an explore. This section records historical measurements, not pending work.
 
 Items 1-2 are the prior stage of the v3 draft policy's calibration chain
 (section 3 above) and are built on work/draft-policy-v2 (`SelectorFit`,

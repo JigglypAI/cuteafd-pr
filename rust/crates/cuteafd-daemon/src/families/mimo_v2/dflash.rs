@@ -128,12 +128,10 @@ pub(crate) struct ContextRow {
     pub position: usize,
 }
 
-/// The drafted tokens after one anchor and per-token features (margin of the
-/// top logit, its probability and the entropy over the top 16, rank 0).
+/// The drafted tokens after one anchor.
 #[derive(Debug, Clone)]
 pub(crate) struct Draft {
     pub tokens: Vec<u32>,
-    pub features: Vec<[f32; 4]>,
 }
 
 pub(crate) struct MimoDrafter<'a> {
@@ -168,8 +166,6 @@ pub(crate) struct MimoDrafter<'a> {
     bf16_head: bool,
     fp8_workspace: Option<Dev<'a>>,
 
-    confidence_directory: std::path::PathBuf,
-    confidence_scales: fp8_linear::Fp8Scales,
     rank: usize,
     ranks: usize,
     peer: Option<DeviceOwner<'a, Box<MimoDrafter<'a>>>>,
@@ -559,18 +555,6 @@ mod mask_tests {
 }
 
 impl<'a> MimoDrafter<'a> {
-    pub fn confidence_prior(&self, head: &str) -> Result<crate::shared::draft_confidence::SelectorFit> {
-        let (storage, rows) = match self.representation {
-            MimoDraftRepresentation::Bf16Only => ("bf16", "bf16-linear"),
-            MimoDraftRepresentation::Fp8Only => ("fp8", "w8a16-chunk64"),
-        };
-        let kv = if self.kv_cache == cuteafd_loader::families::qwen4::Qwen4KvCache::Fp8 { "-kv-fp8" } else { "" };
-        let numerics = format!("{storage}-{rows}-{head}-{:?}{kv}-r1", self.confidence_scales).to_ascii_lowercase();
-        let key = format!("mimo_v2/dflash/{numerics}");
-        let mut fit = crate::shared::draft_confidence::SelectorFit::load(&self.confidence_directory, &key)?;
-        fit.key = key;
-        Ok(fit)
-    }
 
     /// Loads the drafter's weights from `file` (its safetensors bytes, see
     /// [`prefetch`]) and allocates `slots` ring contexts; draft steps take up
@@ -695,8 +679,6 @@ impl<'a> MimoDrafter<'a> {
             workspace: RefCell::new(None),
             representation,
             bf16_head,
-            confidence_directory: dir.into(),
-            confidence_scales: scales,
             fp8_workspace,
             timing: crate::shared::draft::timing::DraftTiming::from_env(library, "mimo-dflash")?,
             cfg,
@@ -1054,33 +1036,24 @@ impl<'a> MimoDrafter<'a> {
         let landing = |offset: usize| cuteafd_ffi::CuteafdHostBuffer {
             // SAFETY: both halves stay inside the 2 x drafted x 64-byte landing.
             ptr: unsafe { output.landing.buffer.ptr.cast::<u8>().add(offset) }.cast(), bytes: drafted * 64, ..output.landing.buffer };
-        // The round's results download on its stream, then one host wait
-        // covers the round and both copies (no second, synchronous drain).
+        // Only candidate ids are consumed; history needs no logit features.
         // SAFETY: the device buffers hold `drafted` 64-byte rows; the landing
         // is pinned, owned by the workspace, and read only after the wait.
         unsafe {
-            l.copy_d2h_host_buffer_async(landing(0), CuteafdDeviceBuffer { bytes: drafted * 64, ..output.unary.buffer },
-                drafted * 64, s)?;
             l.copy_d2h_host_buffer_async(landing(drafted * 64),
                 CuteafdDeviceBuffer { bytes: drafted * 64, ..output.candidates.buffer }, drafted * 64, s)?;
             self.round.borrow_mut().wait(s)?;
         }
         self.timing.publish_completed()?;
         self.timing.dump_head_input(w.n.buffer, rows, h)?;
-        let confidence_span = self.timing.host_span();
-        let (unary, candidates) = output.landing.bytes()[..2 * drafted * 64].split_at(drafted * 64);
+        let candidates = &output.landing.bytes()[drafted * 64..2 * drafted * 64];
         let word = |b: &[u8], i: usize| u32::from_le_bytes(b[i * 4..i * 4 + 4].try_into().unwrap());
         let drafts = (0..s_count).map(|i| {
             let rows = (0..c.drafts()).map(|j| i * c.drafts() + j);
             Draft {
-                tokens: rows.clone().map(|r| word(&candidates, r * 16)).collect(),
-                features: rows.map(|r| {
-                    let values: Vec<f32> = (0..16).map(|k| f32::from_bits(word(&unary, r * 16 + k))).collect();
-                    features(&values)
-                }).collect(),
+                tokens: rows.map(|r| word(candidates, r * 16)).collect(),
             }
         }).collect();
-        self.timing.publish_host("download_confidence", rows, confidence_span)?;
         Ok(drafts)
     }
 
@@ -1172,16 +1145,6 @@ impl<'a> MimoDrafter<'a> {
     pub fn put_taps(&self, rows: &[u8]) -> Result<()> {
         self.put(&self.taps, rows)
     }
-}
-
-/// (margin, top probability, entropy, rank 0) over one row's top-16 logits
-/// (largest first); probabilities are renormalized over the 16.
-pub(crate) fn features(top: &[f32]) -> [f32; 4] {
-    let best = top[0];
-    let mass: Vec<f32> = top.iter().map(|&u| (u - best).exp()).collect();
-    let total: f32 = mass.iter().sum();
-    let entropy = total.ln() - top.iter().zip(&mass).map(|(&u, &m)| m * (u - best)).sum::<f32>() / total;
-    [best - top.get(1).copied().unwrap_or(f32::NEG_INFINITY), 1.0 / total, entropy.max(0.0), 0.0]
 }
 
 impl crate::shared::speculation::dflash::ReplayDrafter for MimoDrafter<'_> {

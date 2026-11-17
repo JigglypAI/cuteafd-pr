@@ -212,16 +212,6 @@ mod tests {
     }
 
     #[test]
-    fn minimax_resolves_the_global_draft_policy_default() {
-        let source = include_str!("serve.rs").split_once("#[cfg(test)]").unwrap().0;
-        assert!(!source.contains("draft_mode_with_default"));
-        assert!(!source.contains("DraftMode::Shared"));
-        if std::env::var("CUTEAFD_DRAFT_POLICY").unwrap_or_default().is_empty() {
-            assert_eq!(crate::shared::draft::draft_mode(), cuteafd_core::DraftMode::Simple);
-        }
-    }
-
-    #[test]
     fn serve_fixes_expert_geometry_before_any_native_library_load() {
         let source = include_str!("serve.rs").split_once("pub(crate) async fn run(").unwrap().1
             .split_once("#[cfg(test)]").unwrap().0;

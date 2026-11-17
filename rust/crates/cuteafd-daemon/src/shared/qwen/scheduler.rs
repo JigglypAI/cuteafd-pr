@@ -3,8 +3,7 @@ use anyhow::Result;
 use cuteafd_api::openai::NativeRequest;
 use cuteafd_engine::media::{EncodeJob, EncoderClient, MediaKeys, RequestMedia};
 use cuteafd_ffi::NativeLibrary;
-use crate::shared::{draft::routes::RoundRoutes, draft_policy::DraftHistory,
-    prefix::{CudaCopyEngine, PrefixArgs}, token_io::DeviceLogits};
+use crate::shared::{prefix::{CudaCopyEngine, PrefixArgs}, token_io::DeviceLogits};
 use std::{cell::RefCell, path::Path};
 
 #[derive(Debug, Clone, Copy)]
@@ -180,21 +179,20 @@ pub(crate) trait Backend<'a> {
         -> Result<Option<DeviceLogits>>;
     fn verify_bucket_rows(&self, rows: usize, speculative: bool, diagnostic: bool) -> usize;
     fn verify_attention_trace(&self, contexts: &[Vec<usize>], rows: usize) -> crate::shared::speculation_trace::Deferred;
-    fn draft_geometry(&self, snapshot: &Path, width: usize) -> Result<cuteafd_core::PolicyGeometry>;
-    fn arm_draft_probe(&self) -> Result<()>;
     fn prefill_draft(&self, placement: &Self::Placement, start: usize, chunk: &[u32], next: Option<u32>,
         draft: &mut Self::Draft) -> Result<()>;
     fn draft(&self, sequences: &mut [DraftSeq<'_, Self::Placement, Self::Draft>], timing: &mut DraftTiming, selector: &mut crate::shared::token_io::TokenSelector<'_>)
         -> Result<Vec<Vec<u32>>>;
-    /// Optional current-proposal evidence; omission preserves history-only policy exactly.
-    fn draft_evidence<'d>(&self, _draft: &'d Self::Draft) -> Option<&'d [f32]> { None }
+    /// What the drafter's trained confidence head reports; `None` without one.
+    fn draft_head_kind(&self) -> cuteafd_core::HeadScore { cuteafd_core::HeadScore::None }
+    /// The head's raw score of each position of the request's current proposal.
+    fn draft_head<'d>(&self, _draft: &'d Self::Draft) -> Option<&'d [f32]> { None }
+    /// Whether verification and acceptance take history-copy rows past the drafter's block.
+    fn draft_copies(&self) -> bool { false }
     fn accept(&self, verified: &mut [Verified<'_, Self::Placement, Self::Draft, Self::History>],
         speculative: bool) -> Result<()>;
     /// Drop any unaccepted replay owned by this request before its storage is released.
     fn cancel(&self, _placement: &Self::Placement) -> Result<()> { Ok(()) }
-    fn probe_begin(&self, rows: usize);
-    fn probe_end(&self);
-    fn probe_finish<T>(&self, observe: impl FnOnce(&RoundRoutes, &[Option<f64>]) -> T) -> Option<T>;
 }
 
 
@@ -202,7 +200,7 @@ use cuteafd_engine::media::{MediaAdmission, MediaPoll, MediaReady, MediaWaiter};
 use crate::shared::probe;
 use crate::shared::token_io::{RowResult, SelectBatch, SelectPlacement, TokenSelector};
 use cuteafd_engine::prefix::{After, PointPlan, PointPolicy, PrefixCache, PrefixFamily, SnapshotKind};
-use crate::shared::draft::{resource, clock::RoundClock, evidence::{Censor, DraftSource}};
+use crate::shared::draft::history::{self, Policy, Proposal};
 use crate::shared::prefill_share::{add_phases, isolated_phases, Chunk, DecodeShareArgs};
 use anyhow::Context;
 use cuteafd_api::openai::{
@@ -226,9 +224,8 @@ struct Active<'a, P: Placement, D> {
     keyed_history: Vec<u32>,
     constraint: Option<crate::shared::constraints::State<'a>>,
     placement: P,
-    /// Family draft continuation and recent outcomes.
+    /// Family draft continuation.
     draft: D,
-    outcomes: DraftHistory,
     /// Drafts proposed and accepted, verify cycles.
     proposed: usize,
     accepted: usize,
@@ -541,7 +538,7 @@ fn publish<E: Encoder, M: Clone + Default>(stats: &Mutex<serde_json::Value>, req
     if active == 0 && prefilling == 0 { cache.refresh_serving_stats(); }
     let prefix_stats = cache.serving_stats();
     if let Ok(mut stats) = stats.lock() {
-        *stats = serde_json::json!({ "draft_policy": resource::snapshot(),"requests": requests, "generated_tokens": generated, "active": active,
+        *stats = serde_json::json!({ "draft_policy": history::snapshot(),"requests": requests, "generated_tokens": generated, "active": active,
             "prefilling": prefilling, "prefix_cache": prefix_stats, "verify": verify.snapshot(), "kv_reserve": reserve.snapshot(stalled),
             "media": media.stats(prefix_stats.media_key_collisions, preparer.map_or(0, |p| p.memo_hits()))});
     }
@@ -807,10 +804,6 @@ pub(crate) fn schedule<'a, B: Backend<'a>>(engine: &B, snapshot: &std::path::Pat
     anyhow::ensure!(geometry.decode_rows > 0 && max_sequences <= geometry.decode_rows
         && max_sequences <= geometry.slots, "scheduler lanes exceed target decode/state capacity");
     let width = match drafts { Drafts::Neural { depth, .. } => depth, Drafts::None => 0 };
-    let drafts = match drafts {
-        Drafts::Neural { depth } => Drafts::Neural { depth: length.effective(depth) },
-        Drafts::None => Drafts::None,
-    };
     // Publish readiness only after all fallible scheduler-owned startup work.
     let (family, mut cache, markers, mut grammars, tokenizer, mut selector, mut shared, mut trace, mut prefills) = initialize(|| {
         let (family, cache) = engine.prefix_cache(prefix, max_sequences)?;
@@ -825,10 +818,7 @@ pub(crate) fn schedule<'a, B: Backend<'a>>(engine: &B, snapshot: &std::path::Pat
         let mut selector = TokenSelector::new(engine.library(), select, geometry.vocab_size, geometry.decode_rows)?;
         engine.selector_ready(&mut selector)?;
         let shared = if width > 0 {
-            let geometry = engine.draft_geometry(snapshot, width)?;
-            engine.arm_draft_probe()?;
-            let policy = length.policy(geometry, cuteafd_core::PolicySeed::weak(width), width)?;
-            Some(policy)
+            Some(Policy::new(length, width, engine.draft_head_kind(), engine.draft_copies()))
         } else { None };
         let trace = Trace::open()?;
         let prefills = decode_share.queue::<Prefill<'_, B::Placement, B::Draft>>()?;
@@ -1215,7 +1205,7 @@ pub(crate) fn schedule<'a, B: Backend<'a>>(engine: &B, snapshot: &std::path::Pat
                         history: p.tokens,
                         decoder: cuteafd_loader::streaming_token_decoder(snapshot, false)?,
                         job: p.job, constraint: p.constraint, placement: p.placement, draft: p.seq,
-                        outcomes: DraftHistory::default(), proposed: 0, accepted: 0, cycles: 0, turn: None,
+                        proposed: 0, accepted: 0, cycles: 0, turn: None,
                         capacity: p.capacity, lease: p.lease, next: 0, generated: 0, buffered: 0, started: Instant::now(), id: p.id,
                         ticket: p.ticket,
                         loop_abort,
@@ -1344,84 +1334,36 @@ impl<'a, B: Backend<'a>> LaneCommit for Accept<'_, '_, 'a, B> {
     }
 }
 
-fn apply_draft_evidence(prior:&mut Vec<f64>,history:&DraftHistory,head:Option<&[f32]>,rows:usize)
-    -> Result<()> {
-    let Some(head)=head else { return Ok(()) };
-    anyhow::ensure!(head.len()>=rows,"draft evidence shorter than current proposal");
-    *prior=resource::head_confidence(history,&head[..rows]);
-    Ok(())
-}
-
-/// Price the optional block separately from its verify lengths. Every active
-/// request still contributes an anchor when the concurrency-local policy skips.
-fn select_neural_round(policy: &mut cuteafd_core::DraftPolicy, candidates: &[resource::Candidate<'_>],
-    width: usize, rows: usize) -> Result<resource::Selection> {
-    let requests = candidates.iter().map(|candidate|
-        (candidate.id, candidate.limit.min(candidate.prior.len()))).collect::<Vec<_>>();
-    let drafted = requests.iter().filter(|(_, room)| *room > 0).count();
-    if !resource::choose_block(policy, &requests, width, drafted, rows, false)? {
-        return Ok(resource::Selection { lengths: vec![0; candidates.len()], predicted: None });
-    }
-    Ok(resource::select_drafted(policy, candidates, width, rows, drafted))
-}
-
 /// One round of lane 0: draft, verify, select, emit and commit. `None` when
 /// the step failed and its requests were released.
 #[allow(clippy::too_many_arguments)]
 async fn decode_round<'a, B: Backend<'a>>(lease: LaneLease<'_>, engine: &B, geometry: &Geometry, drafts: Drafts,
     lane: &mut DecodeLane, active: &mut Vec<Active<'_, B::Placement, B::Draft>>,
-    shared: &mut Option<cuteafd_core::DraftPolicy>, selector: &mut TokenSelector<'_>,
+    shared: &mut Option<Policy>, selector: &mut TokenSelector<'_>,
     cache: &mut PrefixCache<CudaCopyEngine<'a>, B::Meta>, family: &B::Prefix, free_slots: &mut Vec<i32>,
     trace: &mut Option<Trace>, cycle: Instant) -> Result<Option<Vec<bool>>> {
     let neural = matches!(drafts, Drafts::Neural { .. });
     let mut tally = console::Step::begin(lease.index());
     let engine_before = tally.live().then(|| *engine.profile().borrow());
-    let mut neural_confidence: Vec<Vec<f64>> = vec![Vec::new(); active.len()];
-    let mut round_clock = RoundClock::at(cycle);
-    let mut drafted_width = 0;
-    let mut drafted_requests = 0;
-    let mut predicted = None;
     let (steps_before, draft_s_before) = (lane.timing.steps, lane.timing.seconds);
     // Each sequence verifies its next token plus its drafts within the decode programs' rows.
     let room = geometry.decode_rows.saturating_sub(active.len());
     let limits: Vec<usize> = active.iter().map(|a| if probe::no_speculation(&a.job.probe) { 0 } else {
         room.min(a.job.max_tokens - a.generated - 1).min(a.capacity - a.placement.len() - 1)
             .min(reserved_drafts(a.placement.len(), a.placement.units().len(), cache.pool().page_rows())) }).collect();
-    let mut proposals: Vec<Vec<u32>> = match drafts {
-        Drafts::None => vec![Vec::new(); active.len()],
-        Drafts::Neural { depth } => {
-            let limits: Vec<usize> = limits.iter().map(|&l| l.min(depth)).collect();
-            let histories: Vec<&DraftHistory> = active.iter().map(|a| &a.outcomes).collect();
-            neural_confidence = DraftHistory::acceptance(&histories, &limits);
-            for (a, prior) in active.iter().zip(&mut neural_confidence) {
-                if a.draft.pending_rows() == 0 { prior.clear(); }
-            }
-            let shared = shared.as_mut().expect("neural drafts have a shared policy");
-            let candidates: Vec<_> = active.iter().zip(&neural_confidence).zip(&limits).map(|((a, prior), &limit)|
-                resource::Candidate { id: a.ticket.id(), prior, limit, selector: false, cold: false }).collect();
-            let selection = select_neural_round(shared, &candidates, depth, geometry.decode_rows)?;
-            predicted = selection.predicted;
-            let mut depths = selection.lengths;
-            for (a, d) in active.iter().zip(depths.iter_mut()) {
-                // A whole-prompt prefix hit has no draft continuation yet: it drafts after its first step.
-                if a.draft.pending_rows() == 0 {
-                    *d = 0;
-                }
-            }
+    let mut proposals: Vec<Vec<u32>> = match shared.as_mut().filter(|_| neural) {
+        None => vec![Vec::new(); active.len()],
+        Some(policy) => {
+            // A whole-prompt prefix hit has no draft continuation yet: it drafts after its first step.
+            let requests: Vec<(u64, usize)> = active.iter().zip(&limits).map(|(a, &limit)|
+                (a.ticket.id(), if a.draft.pending_rows() == 0 { 0 } else { limit })).collect();
+            let depths = policy.plan(&requests, geometry.decode_rows);
             let pending: usize = active.iter().map(|a| a.draft.pending_rows()).sum();
-            if resource::trim_budget_with_priors(&mut depths, geometry.decode_rows, &neural_confidence, |i| active[i].ticket.id()) { predicted = None; }
             let rows: usize = depths.iter().map(|d| d + 1).sum();
             if depths.iter().any(|&d| d > 0) || pending + rows > geometry.decode_rows / 2 {
                 let mut seqs: Vec<DraftSeq<'_, _, _>> = active.iter_mut().zip(&depths).map(|(a, &depth)| DraftSeq {
                     placement: &a.placement, seq: &mut a.draft, depth }).collect();
-                drafted_requests = depths.iter().filter(|&&n| n > 0).count();
-                drafted_width = depths.iter().copied().max().unwrap_or(0);
-                let proposals = round_clock.draft(|| engine.draft(&mut seqs, &mut lane.timing, selector))?;
-                drop(seqs);
-                for ((request,prior),proposal) in active.iter().zip(&mut neural_confidence).zip(&proposals) {
-                    apply_draft_evidence(prior,&request.outcomes,engine.draft_evidence(&request.draft),proposal.len())?;
-                }
-                proposals
+                engine.draft(&mut seqs, &mut lane.timing, selector)?
             } else {
                 vec![Vec::new(); active.len()]
             }
@@ -1431,28 +1373,16 @@ async fn decode_round<'a, B: Backend<'a>>(lease: LaneLease<'_>, engine: &B, geom
     let trace_copy = trace.as_ref().map(|_| active.iter().zip(&proposals).map(|(a, p)|
         crate::shared::draft::copy::trace_window(&a.history, p.len() + crate::shared::draft::copy::COPY_EXTENSION))
         .collect::<Vec<_>>());
-    let mut neural_lengths: Vec<_> = proposals.iter().map(Vec::len).collect();
-    let copies: Vec<_> = active.iter().zip(&proposals).zip(&limits).zip(&mut neural_confidence)
-        .map(|(((a, proposal), &limit), prior)| {
-            prior.truncate(proposal.len());
-            shared.as_ref().filter(|policy| !policy.fixed())
-                .and_then(|shared| resource::copy_continuation(shared, active.len(), a.ticket.id(), &a.history,
-                    proposal, prior, limit, a.job.sampling.is_greedy()))
-        }).collect();
-    if let Some(shared) = shared.as_mut().filter(|policy| drafted_width > 0 && !policy.fixed()) {
-        let candidates: Vec<_> = active.iter().zip(&neural_confidence).zip(&limits).map(|((a, prior), &limit)|
-            resource::Candidate { id: a.ticket.id(), prior, limit, selector: false, cold: false }).collect();
-        let selection = resource::select_drafted(shared, &candidates, drafted_width, geometry.decode_rows, drafted_requests);
-        predicted = selection.predicted;
-        for (((proposal, copy), neural), length) in proposals.iter_mut().zip(copies)
-            .zip(&mut neural_lengths).zip(selection.lengths) {
-            if let Some(copy) = copy {
-                *neural = copy.neural;
-                *proposal = copy.tokens;
-            }
-            proposal.truncate(length);
+    // Cut each proposal to its plan, extend agreeing ones with a history copy, fit the row budget.
+    let neural_lengths = match shared.as_mut() {
+        Some(policy) => {
+            let mut shaped: Vec<_> = active.iter().zip(proposals.iter_mut()).map(|(a, tokens)| Proposal {
+                id: a.ticket.id(), tokens, head: engine.draft_head(&a.draft), history: &a.history,
+                greedy: a.job.sampling.is_greedy() }).collect();
+            policy.shape(&mut shaped, geometry.decode_rows)
         }
-    }
+        None => vec![0; active.len()],
+    };
     let sequences: Vec<Vec<u32>> = active.iter().zip(&proposals).map(|(a, drafted)| {
         let mut rows: Vec<u32> = std::iter::once(a.next).chain(drafted.iter().copied()).collect();
         // Drafts the grammar rejects could never be kept: verify none of them.
@@ -1480,7 +1410,6 @@ async fn decode_round<'a, B: Backend<'a>>(lease: LaneLease<'_>, engine: &B, geom
         .map(|(a, s)| (&mut a.placement, s.as_slice())).collect();
     lane.steps += 1;
     let timer = Instant::now();
-    engine.probe_begin(tokens.len());
     let step = if diagnostic {
         engine.verify_device_ungraphed(&mut rows, spec, UngraphedKind::Decode, cache.pool())
     } else {
@@ -1495,7 +1424,6 @@ async fn decode_round<'a, B: Backend<'a>>(lease: LaneLease<'_>, engine: &B, geom
             }
             Ok((selector.select(&logits, &batch)?, logits))
         });
-    engine.probe_end();
     let elapsed = timer.elapsed().as_secs_f64();
     lane.stats.record(tokens.len(), engine.verify_bucket_rows(tokens.len(), spec, diagnostic), spec, 1e3 * elapsed);
     lane.verify_s += elapsed;
@@ -1519,12 +1447,12 @@ async fn decode_round<'a, B: Backend<'a>>(lease: LaneLease<'_>, engine: &B, geom
     let mut kept = Vec::with_capacity(active.len());
     let before: Vec<usize> = active.iter().map(|a| a.history.len()).collect();
     let emit_timer = Instant::now();
-    let mut outcomes = vec![(0usize, 1usize, Some(Censor::Cancelled)); active.len()];
+    let mut outcomes: Vec<_> = active.iter().map(|a| history::outcome(a.ticket.id(), 1, 1, true)).collect();
     let finished: Vec<bool> = active.iter_mut().zip(&sequences).zip(&starts).enumerate()
         .map(|(index, ((request, rows), &start))| {
         if let Some(error) = poisoned[index].take() {
             let _ = request.job.events.send(Err(NativeFailure::Worker(error)));
-            outcomes[index] = (rows.len(), 1, Some(Censor::Cancelled));
+            outcomes[index] = history::outcome(request.ticket.id(), rows.len(), 1, true);
             kept.push(None);
             offset += rows.len();
             return true;
@@ -1568,17 +1496,14 @@ async fn decode_round<'a, B: Backend<'a>>(lease: LaneLease<'_>, engine: &B, geom
             }
         }
         offset += rows.len();
-        // Adapt the draft length to how much of it the model reproduced.
         let drafted = rows.len() - 1;
         let accepted = (request.placement.len() - start).saturating_sub(1);
         request.cycles += 1;
         request.proposed += drafted;
         request.accepted += accepted;
-        let censor = if cancelled { Some(Censor::Cancelled) } else {
-            resource::finish_censor(finished, accepted + 1, rows, last.map(|(_, token)| token), &request.job.stop_token_ids) };
-        outcomes[index] = (rows.len(), accepted + 1, censor);
-        let neural = drafted.min(neural_lengths[index]);
-        request.outcomes.observe(neural.min(accepted + usize::from(censor.is_none())), accepted.min(neural));
+        // A stop the next draft agreed with, or a cancellation, is not a miss.
+        let censored = cancelled || history::finish_censored(finished, accepted + 1, rows, last.map(|(_, token)| token));
+        outcomes[index] = history::outcome(request.ticket.id(), rows.len(), accepted + 1, censored);
         // A turn snapshot captures the state at the kept length: commit it too.
         kept.push(if !finished || request.turn.is_some() { last } else { None });
         finished
@@ -1596,20 +1521,7 @@ async fn decode_round<'a, B: Backend<'a>>(lease: LaneLease<'_>, engine: &B, geom
     }
     lanes::commit(&mut Accept { engine, verified, spec }).await?;
     let commit_us = console::us(commit_timer);
-    if let Some(shared) = shared.as_mut() {
-        let requests: Vec<_> = active.iter().enumerate().map(|(i, a)| {
-            let (rows, accepted, censor) = outcomes[i];
-            resource::Verified { id: a.ticket.id(), rows, accepted,
-                source: if rows > 1 { DraftSource::Neural } else { DraftSource::Undrafted },
-                prior: Some(neural_confidence[i].as_slice()), features: None, censor }
-        }).collect();
-        let times = round_clock.observe();
-        if let Some(Err(error)) = engine.probe_finish(|routes, layer_us| resource::observe_drafted(shared,
-            &requests, routes, layer_us, times, drafted_width, predicted, Some(drafted_requests))) {
-            tracing::debug!(%error, "Qwen draft round not observed");
-        }
-        resource::publish(shared, shared.stats().rounds, 0, None);
-    }
+    if let Some(policy) = shared.as_mut() { policy.observe(&outcomes); }
     for (i, request) in active.iter().enumerate() {
         tally.member(&request.ticket, &proposals[i], sequences[i].len() - 1, &request.history[before[i]..],
             request.constraint.is_some(), finished[i]);
@@ -1636,8 +1548,8 @@ async fn decode_round<'a, B: Backend<'a>>(lease: LaneLease<'_>, engine: &B, geom
             copy_windows: trace_copy.as_ref().map(|windows| windows.iter().map(|(start, suffix, tokens)|
                 crate::shared::speculation_trace::record! {start: *start, matched_suffix: *suffix, tokens: tokens.clone()}).collect::<Vec<_>>()),
             committed_tokens: active.iter().zip(&before).map(|(a, &n)| a.history[n..].to_vec()).collect::<Vec<_>>(),
-            predicted_us: predicted, rates: neural_confidence,
-            draft_policy: resource::trace_snapshot()});
+            neural_lengths: neural_lengths,
+            draft_policy: history::trace_snapshot()});
     }
     Ok(Some(finished))
 }
@@ -2007,7 +1919,7 @@ mod loop_abort_tests {
         let request = Active {
             job,
             history: Vec::new(), keyed_history: Vec::new(), constraint: None,
-            placement: TestPlacement::default(), draft: TestDraft, outcomes: DraftHistory::default(),
+            placement: TestPlacement::default(), draft: TestDraft,
             proposed: 0, accepted: 0, cycles: 0, turn: None, capacity: usize::MAX,
             lease: test_lease(max_tokens), next: 0,
             decoder: cuteafd_loader::streaming_token_decoder(dir.path(), false).unwrap(),
@@ -2075,101 +1987,6 @@ mod loop_abort_tests {
             InferenceChunk::Finish { finish_reason } =>
                 assert_eq!(*finish_reason, InferenceFinishReason::Length),
             other => panic!("last chunk is not Finish: {other:?}"),
-        }
-    }
-}
-
-#[cfg(test)]
-mod draft_action_tests {
-    use super::*;
-    use crate::shared::draft::{clock::RoundTimes, evidence::DraftSource};
-
-    #[test]
-    fn omitted_evidence_keeps_existing_minimax_history_policy_bytes() -> Result<()> {
-        // MiniMax intentionally inherits Backend's history-only default.
-        let source=include_str!("../../families/minimax_m3/backend.rs");
-        assert!(!source.contains("fn draft_evidence("));
-        let mut history=DraftHistory::default();
-        history.observe(7,4);
-        history.observe(7,2);
-        for rows in [0,1,4,7] {
-            let mut prior=DraftHistory::acceptance(&[&history],&[rows]).remove(0);
-            let before=prior.iter().map(|p|p.to_bits()).collect::<Vec<_>>();
-            apply_draft_evidence(&mut prior,&history,None,rows)?;
-            assert_eq!(prior.iter().map(|p|p.to_bits()).collect::<Vec<_>>(),before);
-        }
-        let head=[0.9,0.7,0.5];
-        let mut prior=Vec::new();
-        apply_draft_evidence(&mut prior,&history,Some(&head),2)?;
-        assert_eq!(prior,resource::head_confidence(&history,&head[..2]));
-        assert!(apply_draft_evidence(&mut prior,&history,Some(&head),4).is_err());
-        Ok(())
-    }
-
-    fn geometry() -> cuteafd_core::PolicyGeometry {
-        cuteafd_core::PolicyGeometry {
-            layers: vec![cuteafd_core::LayerResource { class: None, slice_bytes: 0., group_rows: 1,
-                timed: false }], group_rows_by_rows: vec![], experts: 0, topk: 0,
-            max_requests: 16, max_positions: 128, widths: vec![7],
-            classes: vec![cuteafd_core::ResourceClass::rtx()], regimes: 1,
-        }
-    }
-
-    fn warm(policy: &mut cuteafd_core::DraftPolicy, count: usize, draft_us: u64) {
-        let mut routes = RoundRoutes::new(1, 0);
-        for round in 0..160 {
-            let per = 1 + round % 4;
-            routes.begin(count * per);
-            routes.dense(0).unwrap();
-            let prior = [0.8; 7];
-            let requests = (0..count).map(|id| resource::Verified {
-                id: id as u64 + 1, rows: per, accepted: per, source: DraftSource::Neural,
-                prior: Some(&prior[..per - 1]), features: None, censor: None,
-            }).collect::<Vec<_>>();
-            resource::observe_drafted(policy, &requests, &routes, &[],
-                RoundTimes { total_us: 10_000 + 100 * (count * per) as u64 + draft_us,
-                    draft_us: Some(draft_us) }, 7, None, Some(count)).unwrap();
-        }
-        assert!(policy.engaged(false, count));
-    }
-
-    #[test]
-    fn skip_action_preserves_all_anchors_and_is_concurrency_local() {
-        let mut policy = cuteafd_core::DraftPolicy::seeded(geometry(), cuteafd_core::PolicySeed::weak(7)).unwrap();
-        policy.set_draft_mode(cuteafd_core::DraftMode::Shared);
-        warm(&mut policy, 1, 100);
-        warm(&mut policy, 16, 1_000_000);
-        for id in 1..=16 { policy.release(id); }
-        let prior = [0.8; 7];
-        let candidates = (0..16).map(|id| resource::Candidate { id: 100 + id, prior: &prior,
-            limit: 7, selector: false, cold: false }).collect::<Vec<_>>();
-        let mut direct = policy.clone();
-        let requests = (0..16).map(|id| (100 + id, 7)).collect::<Vec<_>>();
-        let expected = resource::choose_block(&mut direct, &requests, 7, 16, 128, false).unwrap();
-        assert!(!expected, "a million-microsecond block cannot pay for a cheap anchor-only step");
-        let selected = select_neural_round(&mut policy, &candidates, 7, 128).unwrap();
-        assert_eq!(selected.lengths, vec![0; 16]);
-        assert!(selected.predicted.is_none());
-        let selected = select_neural_round(&mut policy, &candidates[..1], 7, 128).unwrap();
-        assert!(selected.lengths[0] > 0, "C16 skip evidence must not suppress C1 drafting");
-    }
-
-    #[test]
-    fn fixed_and_simple_modes_keep_existing_lengths_and_empty_room_never_drafts() {
-        let prior = [0.8; 7];
-        let candidates = [resource::Candidate { id: 1, prior: &prior, limit: 7,
-            selector: false, cold: false }];
-        for fixed in [false, true] {
-            let mut policy = cuteafd_core::DraftPolicy::new(geometry(), cuteafd_core::PolicySeed::weak(7), fixed).unwrap();
-            if fixed { policy.set_fixed_length(3).unwrap(); }
-            else { policy.set_draft_mode(cuteafd_core::DraftMode::Simple); }
-            let mut direct = policy.clone();
-            let expected = resource::select_drafted(&mut direct, &candidates, 7, 128, 1);
-            let selected = select_neural_round(&mut policy, &candidates, 7, 128).unwrap();
-            assert_eq!(selected.lengths, expected.lengths);
-            assert_eq!(selected.predicted, expected.predicted);
-            let empty = [resource::Candidate { id: 1, prior: &[], limit: 7, selector: false, cold: false }];
-            assert_eq!(select_neural_round(&mut policy, &empty, 7, 128).unwrap().lengths, [0]);
         }
     }
 }

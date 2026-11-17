@@ -104,7 +104,6 @@ fn options(args: &PlanArgs) -> Result<PlanOptions, PlanError> {
                 glmf_shared_replay: args.replay_records == Some(crate::cli::PlanReplayRecords::Shared),
                 glmf_auto_replay: args.replay_records == Some(crate::cli::PlanReplayRecords::Auto),
                 concurrency: args.concurrency,
-                v41_draft_width: args.draft_length.unwrap_or(5).min(7) as u8,
                 tp2_dspark_experts: args.tp2_dspark_experts,
                 tp2_dflash: args.tp2_dflash.unwrap_or(false),
                 state_slots: args.state_slots,
@@ -486,17 +485,6 @@ fn resolve_exlr8_draft(args: &mut PlanArgs, snapshot: &std::path::Path, family: 
     Ok(())
 }
 
-fn v41_draft_limit(args: &PlanArgs, cfg: &std::collections::BTreeMap<String, String>) -> Result<u8> {
-    let limit = args.draft_length.map(Ok).unwrap_or_else(|| {
-        cfg.get("DRAFT_LENGTH").filter(|limit| !limit.is_empty())
-            .map(|limit| limit.parse::<u64>().context("DRAFT_LENGTH must be a positive integer"))
-            .unwrap_or(Ok(5))
-    })?;
-    anyhow::ensure!(limit > 0, "DRAFT_LENGTH must be a positive integer");
-    let limit = limit.min(7) as u8;
-    Ok(limit)
-}
-
 fn validate_glmf_precision(args: &PlanArgs, family: &str) -> Result<(), PlanError> {
     use crate::families::glm5_flash::head::GlmfHeadFormat;
     if family == "glm5_flash" && args.target_head == Some(crate::shared::target_head::TargetHead::Tensor)
@@ -720,7 +708,6 @@ fn run_plan_with_host(mut args: PlanArgs) -> Result<()> {
             || config.get("architectures").and_then(serde_json::Value::as_array)
                 .is_some_and(|arches| arches.iter().any(|arch| arch == "DeepseekV41ForCausalLM"));
         if v41 { v41_layout(layout, &args); }
-        if v41 { layout.v41_draft_width = v41_draft_limit(&args, &cfg)?; }
     }
     if args.files || args.fetch || args.role.is_some() {
         use cuteafd_loader::plan::files::{manifest_roles_view, ReadRole};
@@ -2041,24 +2028,6 @@ mod tests {
         assert!(tp2_dspark_experts(&request, "deepseek_v41", &invalid).is_err());
     }
 
-    #[test]
-    fn v41_configured_draft_limit_matches_serving_width() {
-        let mut request = args(std::path::Path::new("/not-read"), 3, false);
-        for (configured, expected) in [(None, 5), (Some(""), 5), (Some("5"), 5), (Some("6"), 6), (Some("7"), 7)] {
-            let cfg = configured.map(|value| [("DRAFT_LENGTH".into(), value.into())].into()).unwrap_or_default();
-            assert_eq!(v41_draft_limit(&request, &cfg).unwrap(), expected);
-        }
-        for value in ["0", "invalid"] {
-            let cfg = [("DRAFT_LENGTH".into(), value.into())].into();
-            assert!(v41_draft_limit(&request, &cfg).is_err());
-            request.draft_length = Some(7);
-            assert_eq!(v41_draft_limit(&request, &cfg).unwrap(), 7);
-            request.draft_length = None;
-        }
-        request.draft_length = Some(7);
-        assert_eq!(options(&request).unwrap().layout.unwrap().v41_draft_width, 7);
-    }
-
     fn args(model: &std::path::Path, spark_ranks: usize, require_ready: bool) -> PlanArgs {
         PlanArgs {
             kimi_content_qualified: false,
@@ -2117,7 +2086,6 @@ mod tests {
             index_cache: Some(crate::families::glm5_flash::engine::IndexCache::Keys),
             replay_records: Some(crate::cli::PlanReplayRecords::Own),
             concurrency: 8,
-            draft_length: None,
             tp2_dspark_experts: false,
             tp2_dflash: None,
             state_slots: None,
