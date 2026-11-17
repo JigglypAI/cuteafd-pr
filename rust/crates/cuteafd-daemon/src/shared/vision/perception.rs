@@ -331,7 +331,10 @@ mod tests {
             assert_eq!(plain.tokens,text);
             assert!(empty.spans().is_empty() && jobs.is_empty());
             assert!(binding.prepare(request(vec![group.clone()]), vec![1,placeholder,2], 512, hidden, prompt_rows).is_err());
-            assert!(binding.prepare(request(vec![group]), vec![1,2], 512, hidden, 1024).is_err());
+            assert!(binding.prepare(request(vec![group.clone()]), vec![1,2], 512, hidden, 1024).is_err());
+            let mut malformed = group;
+            malformed.source[0] += 1;
+            assert!(binding.prepare(request(vec![malformed]), vec![1,placeholder,2], 512, hidden, 1024).is_err());
         }
         Ok(())
     }

@@ -230,7 +230,8 @@ answers are being qualified (#1930, #1994). Explicit `VISION=spark[:rank]` or
 Each tower has one weight arena and one scratch backing per replica; tensor
 views do not add another charge. Step-5 images retain ordered local crops and
 the global view with native separators; the 896x812 processor case expands to
-493 feature rows and 506 prompt tokens. Audio remains unsupported.
+493 feature rows plus 11 native markers (504 inserted tokens; 506 tokens in
+the text/image/text boundary fixture). Audio remains unsupported.
 
 ### Inkling Serving
 
