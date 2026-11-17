@@ -138,6 +138,7 @@ fn runtime_with_host(shared: &Shared, case: &Case<'_>, layout: &MemoryLayout, tp
     if host { argv.extend(["--host-cache-bytes".into(), "auto".into()]); }
     if let Some(attention) = case.attention { argv.extend(["--attention-placement".into(), attention.to_string()]); }
     let mut cli = Cli::try_parse_from(argv)?;
+    cli.engine.max_context = case.context as usize;
     crate::commands::bench::assert_resolved_family_seam("deepseek_v4", &["attention-plan-rows"], || {
     cli.prefix.resolve_entries(cli.engine.max_sequences);
     // The selected model owns caches only for its retained dSpark stages.
@@ -165,6 +166,9 @@ fn runtime_with_host(shared: &Shared, case: &Case<'_>, layout: &MemoryLayout, tp
             &catalog, Some(case.manifest), max_rows).ok().map(|b| [b; 2]) } else { None },
         exchange_f32: case.exchange_f32, physical: Vec::new(), host_memory: cuteafd_loader::plan::testing::SimulatedHost::raptor().host_ram };
     let facts = admission::inputs(&cli.engine, &inputs)?;
+    let solved = cuteafd_loader::placement::families::deepseek_v4::prepare(&facts)?
+        .admit(cuteafd_loader::placement::families::deepseek_v4::production_request(&facts))?.solved;
+    assert_eq!(solved.pool_policy, report.phase_ledger.as_ref().unwrap().pool_policy);
     let placement = admission::admit(&facts)?.placement;
     crate::shared::context::pool_context("deepseek_v4", facts.serving_context, usize::try_from(placement.pool_tokens)?)?;
     assert_eq!(placement.residual.last(), Some(&cuteafd_loader::placement::ResidualHome::Owned(0)),
@@ -936,6 +940,7 @@ fn runtime_measured(shared: &Shared, case: &Case<'_>, fixture: &Fixture) -> anyh
     if let Some(onboard) = case.onboard { argv.extend(["--rtx-expert-layers".into(), onboard.to_string()]); }
     if case.rtx == 2 { argv.extend(["--split-device".into(), "1".into()]); }
     let mut cli = Cli::try_parse_from(argv)?;
+    cli.engine.max_context = case.context as usize;
     cli.prefix.resolve_entries(cli.engine.max_sequences);
     let stages = (0..).take_while(|stage| catalog.tensors().iter()
         .any(|t| t.metadata.name.starts_with(&format!("mtp.{stage}.")))).count();

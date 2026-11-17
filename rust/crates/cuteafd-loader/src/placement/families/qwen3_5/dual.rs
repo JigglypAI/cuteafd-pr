@@ -22,6 +22,14 @@ pub struct DualAdmission {
 /// cut with the smallest residual-headroom gap, including KV and workspaces.
 pub fn admit_dual(request: Request, budgets: Vec<Budget>, facts: DenseFacts<'_>)
     -> Result<DualAdmission, Refusal> {
+    let cards = budgets.iter().filter(|budget| budget.locations.iter()
+        .any(|location| matches!(location.device, Device::Coordinator(_))))
+        .map(|budget| budget.logical_bytes).collect::<Vec<_>>();
+    let requested = match request.pool { Pin::Auto => None, Pin::Exact(tokens) => Some(tokens) };
+    let mut pool_facts = crate::placement::PoolFacts::new(&cards, request.context, requested, PAGE_ROWS);
+    pool_facts.encoding_limit = Some(if facts.drafter.is_some() { i32::MAX as u64 } else { u32::MAX as u64 });
+    pool_facts.target = facts.target_pool;
+    let pool = crate::placement::prepare_pool(pool_facts).map_err(|error| Refusal::InvalidFact(error.to_string()))?;
     let groups = vec![(true, None); facts.cfg.attention.len()];
     let mut best: Option<((u64, std::cmp::Reverse<u64>), DualAdmission)> = None;
     let mut failure = None;
@@ -30,7 +38,7 @@ pub fn admit_dual(request: Request, budgets: Vec<Budget>, facts: DenseFacts<'_>)
         let arenas = crate::families::qwen3_5::weight_layout::placed_arenas(facts.target_arena, &owners)
             .map_err(|error| Refusal::InvalidFact(error.to_string()))?;
         let candidate = prepare(&facts, &owners, &arenas).and_then(|contract| {
-            super::admission::admit_contract(request.clone(), budgets.clone(), contract)
+            super::admission::admit_contract(request.clone(), budgets.clone(), contract, &pool)
         });
         match candidate {
             Ok(plan) => {
@@ -175,7 +183,7 @@ mod tests {
         let owners = (0..cfg.attention.len()).map(|i| u8::from(i >= 2)).collect::<Vec<_>>();
         let arenas = crate::families::qwen3_5::weight_layout::placed_arenas(&target, &owners).unwrap();
         for host in [false, true] {
-            let facts = DenseFacts { cfg: &cfg, weights: &weights, target_arena: &target, buffers: &buffers,
+            let facts = DenseFacts { target_pool: None, cfg: &cfg, weights: &weights, target_arena: &target, buffers: &buffers,
                 slots: 4, record_bytes: 4096, graph_variant: "fixture".into(), graphs_enabled: false,
                 drafter: None, blas_head: serving::BlasHead::Native, serving: None,
                 host_prefix: serving::HostPrefixOwners { quota_bytes: if host { 1 << 30 } else { 0 },
@@ -225,7 +233,7 @@ mod tests {
             onboard: Pin::Auto, prefill: Pin::Auto, operation: Operation::Serving,
             resident_weight_limit: None, spark_reply_formats: Default::default() };
         for draft in [false, true] {
-            let facts = DenseFacts { cfg: &cfg, weights: &weights, target_arena: &target, buffers: &buffers,
+            let facts = DenseFacts { target_pool: None, cfg: &cfg, weights: &weights, target_arena: &target, buffers: &buffers,
                 slots: 4, record_bytes: 4096, graph_variant: "fixture".into(), graphs_enabled: false,
                 drafter: draft.then(|| DrafterBytes { owned: 4096, weights: ResidentWeights(1024),
                     weight_arena: Some(("qwen3_5/mtp/gpu0", 1280)), pools: vec![4096],
@@ -248,7 +256,7 @@ mod tests {
                 let owners = (0..cfg.attention.len()).map(|i| u8::from(i >= cut)).collect::<Vec<_>>();
                 let arenas = crate::families::qwen3_5::weight_layout::placed_arenas(&target, &owners).unwrap();
                 let candidate = super::super::admission::admit_contract(request.clone(), budgets.clone(),
-                    prepare(&facts, &owners, &arenas).unwrap()).unwrap();
+                    prepare(&facts, &owners, &arenas).unwrap(), &admission.plan.pool_policy.unwrap()).unwrap();
                 let free = slack(&candidate);
                 assert!(gap <= free[0].abs_diff(free[1]), "cut {cut} has a smaller admitted headroom gap");
             }
