@@ -1037,7 +1037,7 @@ mod tests {
         assert_eq!(MAX_PATCHES,MAX_IMAGE_PATCHES);assert_eq!(MAX_OUTPUT_ROWS,MAX_IMAGE_TOKENS);
         let mut declared=handshake();declared.max_patches=MAX_IMAGE_PATCHES;
         declared.max_output_rows=MAX_IMAGE_TOKENS;declared.max_canvas_pixels=MAX_IMAGE_CANVAS_PIXELS;
-        declared.patch_size=14;declared.merge_size=2;declared.validate().unwrap();
+        declared.patch_size=14;declared.merge_size=2;declared.output_width=7168;declared.validate().unwrap();
         let geometry=cuteafd_core::media::ImagePixels {source:[7069,1833],canvas:[7084,1848],content:[0,0,7069,1833]};
         let job=EncodeJob::image_with_pixels(ImageKey([8;32]),[1,132,506],
             vec![0;7084*1848*3].into(),geometry,MAX_IMAGE_TOKENS as usize,7168);
