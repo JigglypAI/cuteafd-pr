@@ -162,6 +162,7 @@ pub enum ImageFamily {
     Inkling2,
     Step5,
     Kimi,
+    MiniMax,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -221,6 +222,7 @@ impl ProcessorConfig {
             ImageFamily::Inkling2 => (20, 1, 64 << 20, CLIP_MEAN, CLIP_STD),
             ImageFamily::Step5 => (14, 1, 3024 * 3024, CLIP_MEAN, CLIP_STD),
             ImageFamily::Kimi => (14, 1, crate::families::kimi_k3::vision::MAX_IMAGE_CANVAS_PIXELS, [0.5;3], [0.5;3]),
+            ImageFamily::MiniMax => (14, 28 * 28, 672 * 672, CLIP_MEAN, CLIP_STD),
         };
         Self {
             resample: match family {ImageFamily::Muse=>Resample::Lanczos,ImageFamily::Step5=>Resample::Bilinear,_=>Resample::Bicubic},
@@ -236,6 +238,7 @@ impl ProcessorConfig {
                 ImageFamily::Qwen => QWEN_MAX_IMAGE_TOKENS,
                 ImageFamily::Mistral => MISTRAL_MAX_IMAGE_TOKENS,
                 ImageFamily::Kimi => crate::families::kimi_k3::vision::MAX_IMAGE_TOKENS as usize,
+                ImageFamily::MiniMax => crate::families::minimax_m3::vision::MAX_IMAGE_TOKENS,
                 _ => 4096,
             },
             decode: DecodePolicy::default(),
@@ -252,6 +255,9 @@ impl ProcessorConfig {
             config.family_processor=FamilyProcessor::Kimi(kimi::KimiProcessor::from_snapshot(snapshot)?);
             config.validate()?;
             return Ok(config);
+        }
+        if family == ImageFamily::MiniMax {
+            return minimax::processor_config(snapshot);
         }
         if matches!(family,ImageFamily::Inkling2|ImageFamily::Step5) {
             let cfg:serde_json::Value=crate::read_json_file(&snapshot.join("config.json"))
@@ -438,6 +444,16 @@ impl ProcessorConfig {
             }
             return Ok(());
         }
+        if self.family == ImageFamily::MiniMax {
+            let expected = Self::for_family(ImageFamily::MiniMax);
+            if self.patch != expected.patch || self.merge != expected.merge || self.temporal != expected.temporal
+                || self.mean != expected.mean || self.std != expected.std || self.resample != expected.resample
+                || self.min_pixels != expected.min_pixels || self.max_pixels != expected.max_pixels
+                || self.max_image_tokens > expected.max_image_tokens {
+                return Err(MediaError::Config("MiniMax processor differs from supported SGLang defaults".into()));
+            }
+            return Ok(());
+        }
         if self.family == ImageFamily::Mistral {
             return Ok(());
         }
@@ -495,6 +511,7 @@ impl ProcessorConfig {
         match self.family {
             ImageFamily::Inkling2=>Some("Inkling bundled vision.py sha256=34525c3b6afb44851de1f0341f60f6006760256c5e507b18cf5167a17497117c:processor-CLIP-bf16/encoder-CLIP-remap"),
             ImageFamily::Step5=>Some("Step bundled step3_processor.py sha256=ce0265261a6bffaf40b98911ef5b9babe30d20443af83a4c8ecf251ce6a861fa:Step3VisionProcessor/Step3VLImageProcessor:CLIP-bilinear-antialias728/504"),
+            ImageFamily::MiniMax=>Some("sglang@a9bf8c76 MiniMaxM31ImageProcessor:RGB-before-Pillow-bicubic:ceil28-fit672:CLIP-f32:duplicate-still"),
             _=>None,
         }
     }
@@ -528,6 +545,8 @@ impl ProcessorConfig {
             let FamilyProcessor::Kimi(processor)=&self.family_processor else {unreachable!("validated Kimi variant")};
             let (_,canvas)=processor.geometry(width,height)?;
             Ok((canvas[1],canvas[0]))
+        } else if self.family == ImageFamily::MiniMax {
+            minimax::resize_shape(height, width)
         } else if self.family == ImageFamily::Muse {
             muse::resize_shape(height, width, factor, self.effective_max() as u32)
                 .ok_or_else(|| invalid("Muse resize dimensions overflow"))
