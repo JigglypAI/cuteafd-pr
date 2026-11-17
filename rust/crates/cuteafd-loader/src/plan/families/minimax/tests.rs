@@ -216,6 +216,10 @@ fn fixture() -> (tempfile::TempDir, serde_json::Value, Vec<testing::Tensor>) {
 }
 
 fn fixture_with_experts(experts: usize) -> (tempfile::TempDir, serde_json::Value, Vec<testing::Tensor>) {
+    fixture_with_routed_layers(experts, false)
+}
+
+fn fixture_with_routed_layers(experts: usize, two_routed: bool) -> (tempfile::TempDir, serde_json::Value, Vec<testing::Tensor>) {
     let dir = tempfile::tempdir().unwrap();
     let cfg = crate::families::minimax_m3::config::tests::release_config();
     // Use the checkpoint's real shape recipe without writing 89k sparse records per test.
@@ -228,6 +232,7 @@ fn fixture_with_experts(experts: usize) -> (tempfile::TempDir, serde_json::Value
     for key in ["sparse_attention_freq", "sparse_disable_index_value"] {
         small["text_config"]["sparse_attention_config"][key].as_array_mut().unwrap().truncate(4);
     }
+    if two_routed { small["text_config"]["moe_layer_freq"][2] = 1.into(); }
     // Construct headers from the independent Python reference's spelling and shapes.
     let c = MiniMaxM3Config::from_hf(&small).unwrap();
     let mut tensors = Vec::new();
@@ -248,14 +253,14 @@ fn fixture_with_experts(experts: usize) -> (tempfile::TempDir, serde_json::Value
             ("o_proj", 6144, 8192), ("index_q_proj", 512, 6144), ("index_k_proj", 128, 6144)] {
             matrix(format!("{p}self_attn.{name}"), n, k);
         }
-        let (stem, inter) = if layer == 3 { ("block_sparse_moe.shared_experts", 3072) } else { ("mlp", 12288) };
+        let (stem, inter) = if layer == 3 || two_routed && layer == 2 { ("block_sparse_moe.shared_experts", 3072) } else { ("mlp", 12288) };
         for (proj, n, k) in [("gate", inter, 6144), ("up", inter, 6144), ("down", 6144, inter)] {
             matrix(format!("{p}{stem}.{proj}_proj"), n, k);
         }
         for norm in ["q_norm", "k_norm", "index_q_norm", "index_k_norm"] {
             plain(format!("{p}self_attn.{norm}.weight"), "BF16", vec![128]);
         }
-        if layer == 3 {
+        if layer == 3 || two_routed && layer == 2 {
             plain(format!("{p}block_sparse_moe.gate.weight"), "F32", vec![experts, 6144]);
             plain(format!("{p}block_sparse_moe.e_score_correction_bias"), "F32", vec![experts]);
             for e in 0..experts {
@@ -276,8 +281,16 @@ fn fixture_with_experts(experts: usize) -> (tempfile::TempDir, serde_json::Value
 }
 
 pub(crate) fn concurrency_matrix_snapshot() -> (tempfile::TempDir, std::path::PathBuf) {
+    concurrency_snapshot(false)
+}
+
+pub(crate) fn onboarding_matrix_snapshot() -> (tempfile::TempDir, std::path::PathBuf) {
+    concurrency_snapshot(true)
+}
+
+fn concurrency_snapshot(two_routed: bool) -> (tempfile::TempDir, std::path::PathBuf) {
     use crate::families::minimax_m3::weight_layout::CoordinatorWeights;
-    let (dir, config, _) = fixture_with_experts(128);
+    let (dir, config, _) = fixture_with_routed_layers(128, two_routed);
     let checkpoint = Checkpoint::open(dir.path()).unwrap();
     let cfg = MiniMaxM3Config::from_hf(&config).unwrap();
     let weights = CoordinatorWeights::plan(&checkpoint, &cfg, 1, &[0; 4]).unwrap();

@@ -1065,7 +1065,7 @@ fn pool_max_grows_after_onboarding_in_every_family_planner() {
         layout.workspace_manifest = Some(manifest);
         assert_pool_max_growth(&BudgetedPlanInput::open(dir.path()).unwrap(), &options);
     }
-    let (dir, manifest) = families::minimax::tests::concurrency_matrix_snapshot();
+    let (dir, manifest) = families::minimax::tests::onboarding_matrix_snapshot();
     let mut options = wave_plan_options(dir.path(), 4);
     options.attention_placement = None;
     let layout = options.layout.as_mut().unwrap();
