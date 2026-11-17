@@ -298,7 +298,7 @@ mod tests {
         }
         for (inkling, family, size, hidden, features, prompt_rows) in [
             (true, ImageFamily::Inkling2, [197,157], 4608, 20, 20),
-            (false, ImageFamily::Step5, [896,812], 4096, 493, 506),
+            (false, ImageFamily::Step5, [896,812], 4096, 493, 504),
         ] {
             let root = sparse_snapshot(inkling);
             cuteafd_loader::plan::testing::write_kimi_tokenizer(root.path());

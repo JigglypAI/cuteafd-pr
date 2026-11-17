@@ -965,7 +965,7 @@ def test_family_table_and_planner_fixtures_name_muse() -> None:
 @pytest.mark.parametrize("vision", ["spark", "rtx", "off"])
 def test_pe_shared_encoder_plan_handoff(tmp_path, family, model, ranks, vision):
     config = {"model_type": "inkling2" if family == "inkling2" else "step5_vl", "vision_config": {"depth": 2},
-        "text_config": {"num_hidden_layers": 48 if family == "inkling2" else 92, "moe_layer_list": list(range(3, 91))}}
+        "text_config": {"model_type": "inkling2" if family == "inkling2" else "step5", "num_hidden_layers": 48 if family == "inkling2" else 92, "moe_layer_list": list(range(3, 91))}}
     owner = None if vision == "off" else {"kind": {"kind": vision, "rank" if vision == "spark" else "gpu": 0}, "replicas": []}
     plan = {**PLANNED, "encoder_plan_hash": "ab" * 32, "encoder": owner}
     keys = f"SPARK_COUNT={ranks}\nRTX_GPUS=1\nSPECULATOR=off\nVISION={vision}\nAUDIO=off\n" + _hosts(ranks)
