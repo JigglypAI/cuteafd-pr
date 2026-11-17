@@ -530,6 +530,13 @@ for its entire invocation, including container creation, native cache keys and
 sealed metadata, so a concurrent default-tag move cannot change its build inputs.
 Versioned `tc-*` image tags remain available for older checkouts.
 
+Automatic WIP coordinator export placement yields raptor whenever a live hardware
+queue ticket requests `gpu0` or `gpu1`: it uses maxq and waits there within the
+existing export timeout, never falling back to a raptor GPU while that remote
+placement is selected. Remote exports hold coordinator `maxq.lock` and maxq's
+local `maxq-gpu.lock`, not raptor's GPU locks. Explicit
+`CUTEAFD_WIP_COORDINATOR_EXPORT=capped` retains fair queued raptor placement.
+
 `./wip.sh --from-slot NAME` reuses that slot's seed within the selected
 `WIP_INSTANCE`/`WIP_ROOT`, rather than choosing the least-loaded seed. New
 builds record `slots/NAME/seed-host`; older slots are located with bounded
