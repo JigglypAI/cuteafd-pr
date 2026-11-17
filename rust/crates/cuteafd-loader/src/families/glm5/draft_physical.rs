@@ -512,7 +512,7 @@ mod arena_tests {
 
     #[test]
     fn glm_body_fp8_recipe_and_shared_roles_agree_for_every_operand() -> Result<()> {
-        use super::draft_representation::{draft_weight_role, DraftWeightRole};
+        use crate::families::glm5::draft_representation::{draft_weight_role, DraftWeightRole};
         let cfg = GlmDflashConfig { hidden:256,intermediate:256,layers:2,heads:2,kv_heads:1,head_dim:128,
             eps:1e-6,theta:10000.,block:8,group:16,mask_token:0,rank:256,taps:vec![0,1],vocab:32,
             window:2048,row_window:true,sample_from_anchor:false };
