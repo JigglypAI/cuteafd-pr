@@ -85,20 +85,19 @@ fn history_drafts_long_on_code_and_short_on_prose() {
     assert_eq!(fixed_code, Tally { rounds: 646, tokens: 3154, drafts: 4522, short: 0 });
     let ([prose, code], skips) = replay(HeadScore::None, DraftControl::History);
     assert_eq!(skips, 0);
-    // Code: 99.3% of fixed width's tokens at 6.78 of 7 drafts, never stuck short,
+    // At prior strength two: code keeps 97.8% of fixed tokens at 6.46 drafts, never stuck short,
     // although it starts from a server window that 1,112 prose rounds taught.
-    assert_eq!(code, Tally { rounds: 646, tokens: 3131, drafts: 4383, short: 0 });
-    // Prose: 87.7% of fixed width's tokens for 28.7% of its verified drafts.
-    assert_eq!(prose, Tally { rounds: 1112, tokens: 1946, drafts: 2232, short: 389 });
+    assert_eq!(code, Tally { rounds: 646, tokens: 3084, drafts: 4173, short: 0 });
+    // Prose: 87.7% of fixed tokens for 29.0% of its verified drafts.
+    assert_eq!(prose, Tally { rounds: 1112, tokens: 1947, drafts: 2259, short: 393 });
     assert!(code.drafts * prose.rounds > 3 * prose.drafts * code.rounds);
 }
 
 /// The dSpark head skip, booked as a miss: bounds, not exact counts (the fit
 /// is floating point). It fires on prose, not on code, and spends fewer verify
-/// rows on prose for nearly the same tokens. On this sample: 454 skips; prose
-/// drafts 2,232 -> 1,490 (-33%) for tokens 1,946 -> 1,855 (-4.7%), rounds at
-/// one draft or fewer 389 -> 738 of 1,112; code 4,383 -> 4,365 drafts and
-/// 3,131 -> 3,133 tokens.
+/// rows on prose for nearly the same tokens. At prior strength two, this
+/// sample has 467 skips: prose drafts 2,259 -> 1,604 and tokens 1,947 ->
+/// 1,863; code drafts 4,173 -> 4,123 and tokens 3,084 -> 3,073.
 #[test]
 fn the_head_skip_saves_prose_rows_and_leaves_code_alone() {
     let ([prose, code], _) = replay(HeadScore::None, DraftControl::History);
