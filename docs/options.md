@@ -40,6 +40,9 @@ The prior untimed width warm-ups and all closed-batch points run first.
 Sustained `aggregate_tok_s` is an **estimate**: exact final usage token totals are
 credited pro rata by each request's first-to-last-content-token overlap with the
 window, assuming uniform per-request emission (SSE text chunks are not tokens).
+Only output/decode tokens enter the numerator; refill prompt/prefill work consumes
+time inside the window but contributes no prompt tokens to throughput. This is
+the intended under-load decode rate, not prefill throughput.
 This includes boundary-crossing requests without crediting their warm-up/drain
 output. `sustained` records relative window bounds, duration, initial/total/refill/
 completed and overlapping request counts, fractional token credits, the explicit
