@@ -37,6 +37,9 @@ fn decode(execution:&mut Execution<'_>,placement:&mut Placement,tokens:&[u32])->
         ..execution.head.logits.buffer})?;Ok(data)
 }
 fn verify(execution:&mut Execution<'_>,placement:&mut Placement,tokens:&[u32])->Result<Vec<u8>>{
+    verify_kept(execution,placement,tokens,None)
+}
+fn verify_kept(execution:&mut Execution<'_>,placement:&mut Placement,tokens:&[u32],keep:Option<usize>)->Result<Vec<u8>>{
     let taps=execution.draft.as_ref().context("width oracle needs admitted FIR verifier")?.layout.config.taps.clone();
     let rows=tokens.iter().enumerate().map(|(offset,&token)|VerifyRow{slot:placement.slot,position:placement.len+offset,token:Some(token)}).collect::<Vec<_>>();
     let library=execution.requests.decode.stream.device.library;
@@ -48,8 +51,62 @@ fn verify(execution:&mut Execution<'_>,placement:&mut Placement,tokens:&[u32])->
         let bytes=tokens.len()*logits.vocab*4;let mut data=vec![0;bytes];
         library.copy_d2h(&mut data,Buffer{ptr:logits.ptr.cast_mut(),bytes,..template})?;Ok(data)
     })();
-    let restore=target.restore(&mark);
-    let result=result?;restore?;Ok(result)
+    if result.is_err(){target.restore(&mark)?;}
+    let result=result?;
+    if let Some(rows)=keep{target.commit(&mark,&[crate::shared::speculation::target::AcceptedPrefix{slot:0,rows}])?;}
+    else{target.restore(&mark)?;}
+    Ok(result)
+}
+fn state(execution:&Execution<'_>,placement:&Placement)->Result<BTreeMap<String,Vec<u8>>>{
+    let bank=&execution.requests.cache;let library=execution.requests.decode.stream.device.library;
+    execution.requests.decode.stream.drain()?;
+    let read=|buffer:Buffer|->Result<Vec<u8>>{let mut bytes=vec![0;buffer.bytes];library.copy_d2h(&mut bytes,buffer)?;Ok(bytes)};
+    let mut output=BTreeMap::new();
+    output.insert("bookkeeping".into(),serde_json::to_vec(&(placement.len,placement.state_len,&placement.units))?);
+    output.insert("conv".into(),read(bank.conv_for_sequence(placement.slot)?)?);
+    for &layer in &bank.layout.global_layers{
+        let stride=bank.layout.page_bytes/64;let mut bytes=Vec::new();
+        for position in (0..placement.len).step_by(64){
+            let page=bank.page(layer,placement.units[position/64] as usize)?;
+            bytes.extend(read(Buffer{bytes:(placement.len-position).min(64)*stride,..page})?);
+        }
+        output.insert(format!("global.layer.{layer}"),bytes);
+    }
+    for (layer,geometry) in bank.layout.layers.iter().enumerate(){if geometry.ring_rows==0{continue;}
+        let ring=bank.field(placement.slot,layer,"ring")?;let stride=geometry.kv_width*4;
+        let mut bytes=Vec::new();
+        // Rejected rows outside the live horizon are not model state.
+        for position in placement.len.saturating_sub(execution.cfg.window)..placement.len{
+            let offset=position%geometry.ring_rows*stride;
+            bytes.extend(read(Buffer{ptr:ring.ptr.wrapping_byte_add(offset),bytes:stride,..ring})?);
+        }
+        output.insert(format!("ring.layer.{layer}"),bytes);
+    }Ok(output)
+}
+fn state_difference(actual:&BTreeMap<String,Vec<u8>>,expected:&BTreeMap<String,Vec<u8>>)->Option<serde_json::Value>{
+    actual.iter().find_map(|(owner,bytes)|{let reference=expected.get(owner)?;
+        if bytes==reference{return None;}
+        let first=bytes.iter().zip(reference).position(|(a,b)|a!=b).unwrap_or(bytes.len().min(reference.len()));
+        Some(serde_json::json!({"owner":owner,"byte":first,"actual_bytes":bytes.len(),"reference_bytes":reference.len(),
+            "actual":bytes.get(first),"reference":reference.get(first)}))
+    })
+}
+fn commit_sweep(execution:&mut Execution<'_>,saved:&Placement,tokens:&[u32],widths:&[usize])->Result<serde_json::Value>{
+    let bank=execution.requests.cache.clone();let mut passes=Vec::new();let mut clean=true;
+    execution.width_trace=None;
+    for &width in widths{for keep in 0..=width{
+        bank.restore(0,0)?;bank.drain()?;let mut reference=saved.clone();
+        for token in &tokens[..keep]{decode(execution,&mut reference,std::slice::from_ref(token))?;}
+        let expected=state(execution,&reference)?;
+        let next_reference=decode(execution,&mut reference,&tokens[keep..keep+1])?;
+        bank.restore(0,0)?;bank.drain()?;let mut candidate=saved.clone();
+        verify_kept(execution,&mut candidate,&tokens[..width],Some(keep))?;
+        let actual=state(execution,&candidate)?;let difference=state_difference(&actual,&expected);
+        let next=decode(execution,&mut candidate,&tokens[keep..keep+1])?;
+        let next_equal=next==next_reference;clean&=difference.is_none()&&next_equal;
+        let result=serde_json::json!({"width":width,"accepted":keep,"first_state_difference":difference,"next_logits_equal":next_equal});
+        println!("Inkling commit: {}",result);passes.push(result);
+    }}Ok(serde_json::json!({"pass":clean,"passes":passes}))
 }
 fn compare(candidate:&Trace,reference:&[Trace],logits:&[u8],base_logits:&[Vec<u8>],vocab:usize)->Result<Vec<serde_json::Value>>{
     let mut differences=Vec::new();
@@ -119,7 +176,7 @@ pub(crate) fn run(args:&mut GoldenArgs)->Result<()>{
     ensure!(!args.save_logits.exists(),"width oracle output must be new");
     let maximum=*args.width_invariance.iter().max().context("width list empty")?;
     let tokens:Vec<u32>=serde_json::from_slice(&std::fs::read(&args.tokens)?)?;
-    ensure!(args.prefill>0 && tokens.len()>=args.prefill+maximum,"width oracle needs prefix plus maximum-width teacher-forced tokens");
+    ensure!(args.prefill>0 && tokens.len()>=args.prefill+maximum+usize::from(args.commit_invariance),"width oracle needs prefix plus maximum-width teacher-forced tokens");
     let view=args.attention.selected_view.clone().map(Ok).unwrap_or_else(||args.attention.select(&args.snapshot))?;
     args.attention.validate_view(&view)?;
     let checkpoint=Checkpoint::open_view(&view)?;
@@ -142,7 +199,7 @@ pub(crate) fn run(args:&mut GoldenArgs)->Result<()>{
     ensure!(inputs.prefix_mark_slots>0,"width oracle has no admitted target mark");
     let bank=execution.requests.cache.clone();bank.reset(0)?;
     execution.draft.as_ref().unwrap().drafter.reset_context(0,0)?;
-    let mut placement=Placement{units:(0..(args.prefill+maximum).div_ceil(64)).map(|page|page as u32).collect(),slot:0,len:0,state_len:0};
+    let mut placement=Placement{units:(0..(args.prefill+maximum+usize::from(args.commit_invariance)).div_ceil(64)).map(|page|page as u32).collect(),slot:0,len:0,state_len:0};
     ensure!(placement.units.len()<=bank.layout.pool_pages,"width oracle prefix exceeds admitted target pages");
     execution.draft.as_ref().unwrap().drafter.admit_pages(0,args.prefill+maximum)?;
     let mut units=crate::shared::prefill_pipeline::sequence_units(args.prefill,args.prefill_rows,args.prefill_waves as usize,cfg.layers)?;
@@ -168,7 +225,9 @@ pub(crate) fn run(args:&mut GoldenArgs)->Result<()>{
         println!("Inkling width {width}: {}",serde_json::to_string(&differences)?);
         clean&=differences.is_empty();passes.push(serde_json::json!({"width":width,"differences":differences}));
     }
-    let report=serde_json::json!({"prefill":args.prefill,"pool_tokens":admitted.solved.pool_tokens,"onboard":admitted.onboard,
+    let commits=if args.commit_invariance{Some(commit_sweep(&mut execution,&saved,&tokens[args.prefill..],&args.width_invariance)?)}else{None};
+    clean&=commits.as_ref().is_none_or(|result|result["pass"]==true);
+    let report=serde_json::json!({"commits":commits,"prefill":args.prefill,"pool_tokens":admitted.solved.pool_tokens,"onboard":admitted.onboard,
         "target":"served startup/push/Spark path","reference":"serial width1 decode from exact prompt state","passes":passes,"pass":clean});
     std::fs::write(args.save_logits.join("width-invariance.json"),serde_json::to_vec_pretty(&report)?)?;
     ensure!(clean,"Inkling width invariance failed; first layer/stage operands in width-invariance.json");Ok(())

@@ -29,6 +29,8 @@ pub(crate) struct GoldenArgs {
     #[arg(long, value_delimiter=',')] tap_layers: Vec<usize>,
     /// Compare the actual served target's teacher-forced decode/verify widths.
     #[arg(long, value_delimiter=',')] pub width_invariance: Vec<usize>,
+    /// Compare every accepted prefix's live KV/FIR state and next-cycle logits.
+    #[arg(long, requires="width_invariance")] pub commit_invariance: bool,
     #[arg(long, default_value_t=64)] pub prefill: usize,
     #[arg(long, value_delimiter=',')] pub peers: Vec<std::net::SocketAddr>,
     #[arg(long, default_value="auto")] pub rtx_expert_layers: cuteafd_loader::placement::OnboardSetting,

@@ -435,6 +435,11 @@ Widths are 1..8 total verify rows (anchor included), independently of the
 before each width; width 1 repeats after the wide pass. The JSON receipt names
 the first differing layer, stage and operand per row, including route ids,
 weights and expert outputs; no tolerance or automatic numerical fix applies.
+Add `--commit-invariance` to compare every accepted prefix (0..width) against
+serial decode: live global KV rows, sliding-window KV, contiguous FIR bytes and
+logical bookkeeping, followed by one more cycle's logits. Dead rejected KV
+outside the committed horizon is excluded. The receipt names the first owner
+and differing byte; this remains a diagnostic, not a tolerance.
 Run through `scripts/bench/golden-run.py --family inkling2 --spark-hosts ...`.
 Without `--width-invariance`, Inkling retains its cold native-MXFP8 golden path.
 
