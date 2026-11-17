@@ -186,6 +186,13 @@ fn packing_inventory(core: Option<&serde_json::Value>, native: &[String])
     }
     // The drafter consumes each member's private context after packed target work.
     add("kimik3_mla_draft_output_m64".into(), SequenceLocal)?;
+    for name in ["kimik3_mla_draft_output_fp8_weights_m64",
+        "kimik3_mla_draft_producer_fp8_weights_m64", "kimik3_mla_draft_producer_fp8_weights_fp8_m64",
+        "kimik31_mla_draft_output_fp8_weights_causal_h96_m64",
+        "kimik31_mla_draft_producer_fp8_weights_causal_h96_m64",
+        "kimik31_mla_draft_producer_fp8_weights_causal_h96_fp8_m64"] {
+        add(name.into(), SequenceLocal)?;
+    }
     add("kimik3_mla_draft_lse_combine2".into(), SequenceLocal)?;
     for cache in ["", "_fp8"] {
         add(format!("kimik3_mla_draft_producer{cache}_m64"), SequenceLocal)?;
