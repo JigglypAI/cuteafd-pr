@@ -547,8 +547,10 @@ fn apply_selected(input: &super::super::PlanInput, options: &LayoutOptions,
     let (experts, expert_workspace, tp2_workspace, onboard) = expert_costs(input, &cfg, options, ranks, spark_ranks, rows)?;
     let lanes = if options.prefill_lanes > 0 { options.prefill_lanes } else { prefill_shape(spark_ranks, None)?.waves } as usize;
     let kv = MimoKvFormats { full: options.mimo_full_kv, sliding: options.mimo_swa_kv };
-    let maximum_pool_tokens = admission::maximum_pool_tokens(&options.rtx_bytes[..ranks], context,
-        options.pool_tokens, profiles.steady.pool_unit_rows);
+    let pool = crate::placement::prepare_pool(crate::placement::PoolFacts::new(
+        &options.rtx_bytes[..ranks], crate::placement::planner::Context::resolve(context,
+            (options.context_tokens > 0).then_some(options.context_tokens)),
+        options.pool_tokens, profiles.steady.pool_unit_rows));
     let prefill = PrefillShape { rows, waves: lanes as u64 };
     let operation = Operation::Serving;
     let embedding = if use_host_embedding(checkpoint, options) { EmbeddingHome::HostPinned }
@@ -572,7 +574,7 @@ fn apply_selected(input: &super::super::PlanInput, options: &LayoutOptions,
             && default_policy(checkpoint, &cfg) != MimoDefaultPolicy::Fp8 { options.bf16_target_head }
             else { crate::placement::planner::serving::BlasHead::Native },
         draft_head: mimo_dflash_dir(checkpoint, options).is_some(),
-        cfg: &cfg, layers: cfg.layers, kv, mtp_stages: selected_mtp(checkpoint, options), context, maximum_pool_tokens,
+        cfg: &cfg, layers: cfg.layers, kv, mtp_stages: selected_mtp(checkpoint, options), context, pool,
         prefill, lanes: lanes as u64, embedding, gpus: ranks, spark_ranks,
         experts, expert_workspace, tp2_workspace,
         spark: profiles.clone(), no_spark: no_spark.clone(),
@@ -755,7 +757,9 @@ mod tests {
                             startup_probe_bytes: probe,
                             blas_head: opts.bf16_target_head, draft_head: false,
                             expert_usage: opts.expert_usage, cfg: &cfg, layers: cfg.layers, kv,
-                            mtp_stages: 0, context: 32768, maximum_pool_tokens: 32768, prefill,
+                            mtp_stages: 0, context: 32768, pool: crate::placement::prepare_pool(crate::placement::PoolFacts::new(
+                                &opts.rtx_bytes, crate::placement::planner::Context::automatic(32768), opts.pool_tokens,
+                                admitted.steady.pool_unit_rows)), prefill,
                             lanes: lanes as u64, embedding: EmbeddingHome::Device(0), gpus: ranks, spark_ranks: 4,
                             experts, expert_workspace, tp2_workspace, spark: admitted.clone(),
                             no_spark: profile(checkpoint, &opts, ranks, 0, 4096, 4, 32768, None).unwrap(),

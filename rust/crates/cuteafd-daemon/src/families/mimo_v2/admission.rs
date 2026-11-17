@@ -500,14 +500,10 @@ fn preflight_shape(
         &devices, args.planner_media_weights, crate::shared::memory::budget::resident_weight_limit())?;
     use cuteafd_loader::placement::families::mimo_v2::admission::{self as contract, ProductionInput};
     use cuteafd_loader::placement::planner::{Baseline, EmbeddingHome, Operation, Phase, PrefillShape};
-    let maximum_pool_tokens = contract::maximum_pool_tokens(
+    let pool = cuteafd_loader::placement::prepare_pool(cuteafd_loader::placement::PoolFacts::new(
         &memory.iter().map(|sample| sample.total_bytes).collect::<Vec<_>>(),
-        args.max_context as u64, (args.pool_tokens > 0).then_some(args.pool_tokens as u64),
-        spark_profiles.steady.pool_unit_rows);
-    let pool = cuteafd_loader::placement::PoolPolicy::resolve(
-        &memory.iter().map(|sample| sample.total_bytes).collect::<Vec<_>>(),
-        args.max_context as u64, Some(args.pool_tokens as u64), spark_profiles.steady.pool_unit_rows);
-    let policy = reservation_policy(&pool, u32::try_from(concurrency)?);
+        serving_context, Some(args.pool_tokens as u64), spark_profiles.steady.pool_unit_rows));
+    let policy = pool.capacity_policy(u32::try_from(concurrency)?);
     let report = reservation_report(&spark_profiles.steady, &memory, policy)?;
     let intake_probe_bytes = cuteafd_loader::families::mimo_v2::admission::spark_intake_probe_bytes(
         spark_ranks > 0, std::env::var("CUTEAFD_SPARK_INTAKE").ok().as_deref())?;
@@ -548,7 +544,7 @@ fn preflight_shape(
             opened.weight_formats.head == cuteafd_loader::families::mimo_v2::projection::MimoProjectionRepresentation::Bf16),
         draft_head: args.draft.is_some(),
         cfg, layers, kv, mtp_stages: args.mtp, context: args.max_context as u64,
-        maximum_pool_tokens, prefill, lanes: transport_lanes as u64, embedding, gpus: ranks,
+        pool, prefill, lanes: transport_lanes as u64, embedding, gpus: ranks,
         spark_ranks, experts: expert_costs, expert_workspace, tp2_workspace,
         spark: spark_profiles.clone(), no_spark: no_spark_profiles.clone(),
         post_kv_additional: post_kv_loading_additional, draft_packing,
@@ -637,17 +633,6 @@ fn preflight_shape(
         prefill_rows: args.prefill_rows,
         push_host, expert_resident_bytes,
     })
-}
-
-fn reservation_policy(pool: &cuteafd_loader::placement::PoolPolicy, concurrency: u32)
-    -> cuteafd_core::serving_capacity::CapacityPolicy {
-    cuteafd_core::serving_capacity::CapacityPolicy {
-        concurrency,
-        target_pool_tokens: pool.target,
-        max_context_tokens: Some(pool.compiled_context),
-        pool_tokens: Some(pool.requested.unwrap_or(pool.target)),
-        ..Default::default()
-    }
 }
 
 /// Summarize all fixed categories plus the selected aligned pool even when
@@ -999,7 +984,7 @@ mod tests {
     fn kv_max_widens_extent_without_inflating_reservation_floor_or_displacing_onboarding() -> Result<()> {
         use cuteafd_core::memory_policy::MemoryPolicy;
         use cuteafd_core::serving_capacity::*;
-        use cuteafd_loader::placement::{PoolPolicy, families::mimo_v2::admission as contract};
+        
         let dir = tempfile::tempdir()?;
         cuteafd_loader::plan::testing::write_snapshot(dir.path(),
             &cuteafd_loader::plan::testing::mimo_flash_config(),
@@ -1017,9 +1002,10 @@ mod tests {
         let baseline = MemoryPolicy::default().scoped(|| input.plan(&options))?;
         let grow = MemoryPolicy { kv_max: Some(100_000_000), ..Default::default() };
         grow.scoped(|| -> Result<()> {
-            let pool = PoolPolicy::resolve(&[96 << 30], 65_536, Some(0), 64);
-            assert_eq!(contract::maximum_pool_tokens(&[96 << 30], 65_536, None, 64), 100_000_000);
-            let policy = reservation_policy(&pool, 16);
+            let pool = cuteafd_loader::placement::prepare_pool(cuteafd_loader::placement::PoolFacts::new(
+                &[96 << 30], 65_536, Some(0), 64));
+            assert_eq!(pool.maximum_tokens(), 100_000_000);
+            let policy = pool.capacity_policy(16);
             assert_eq!(policy.target_pool_tokens, 2 << 20);
             assert_eq!(policy.pool_tokens, Some(2 << 20));
             let profile = CapacityProfile {
@@ -1038,8 +1024,9 @@ mod tests {
             assert!(baseline.fits && grown.fits, "{:?}", grown.hints);
             assert_eq!(grown.onboard_layers, baseline.onboard_layers);
             assert!(grown.memory_layout.unwrap().pool_tokens > baseline.memory_layout.unwrap().pool_tokens);
-            let explicit = PoolPolicy::resolve(&[96 << 30], 65_536, Some(1 << 20), 64);
-            assert_eq!(reservation_policy(&explicit, 16).pool_tokens, Some(1 << 20));
+            let explicit = cuteafd_loader::placement::prepare_pool(cuteafd_loader::placement::PoolFacts::new(
+                &[96 << 30], 65_536, Some(1 << 20), 64));
+            assert_eq!(explicit.capacity_policy(16).pool_tokens, Some(1 << 20));
             Ok(())
         })
     }
