@@ -318,10 +318,7 @@ impl Family for KimiK3 {
     }
     fn component_hint(&self, component: Component) -> Option<Hint> {
         match component {
-            Component::Vision => Some(Hint {
-                what: "Kimi K3 bundled vision is planned; production qualification remains pending (#1984)".into(),
-                how: "The joint planner admits MoonViT3d and patchmergerv2; normal serving remains text-only until qualification.".into(),
-            }),
+            Component::Vision => None,
             Component::Speculator | Component::SpeculatorExpert => Some(Hint {
                 what: "Kimi K3 draft execution is not implemented".into(),
                 how: "Serve text without speculation; a windowed external drafter needs a native integration".into(),
@@ -368,6 +365,10 @@ impl FamilyModel for Model {
         (layer < self.cfg.layers).then(|| self.cfg.activation())
     }
     fn accepts(&self, role: &TensorRole, stem: &str, operand: &mut QuantOperand) -> Result<(), String> {
+        if role.component==Component::Vision {
+            return super::require(operand.is_plain(&[format::Encoding::Bf16])&&operand.input_scale.is_none(),
+                ||format!("{stem}: Kimi tower requires BF16"));
+        }
         if let Some(projection) = self.core.projections.get(stem) {
             return super::require(matches!(operand.encoding, format::Encoding::Exl3 { bits } if bits == projection.bits)
                 && operand.logical == [projection.stored_outputs, projection.shape[1]],

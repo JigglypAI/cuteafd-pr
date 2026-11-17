@@ -66,6 +66,7 @@ pub(super) fn check_prefix(full: &KimiK3Config, selected: &KimiK3Config) -> Resu
 /// page tables; global weights, token IO and state banks add their own demands.
 #[cfg_attr(test, derive(Clone))]
 pub(crate) struct Inputs<'a, const RANKS: usize = 2> {
+    pub vision: Option<(cuteafd_loader::media::still_tower::StillTowerInventory,cuteafd_loader::plan::MediaMode,usize,u64)>,
     pub skip_routed_experts: bool,
     pub expert_usage: bool,
     pub cfg: &'a KimiK3Config,
@@ -135,6 +136,8 @@ pub(crate) fn plan_rtx_for_ranks(cfg: &KimiK3Config, catalog: &cuteafd_loader::O
 }
 
 pub(crate) struct Admission<'a> {
+    pub vision: Option<cuteafd_loader::plan::encoder::EncoderPlacement>,
+    pub media_cache_bytes: u64,
     pub skip_routed_experts: bool,
     pub expert_usage: Option<cuteafd_core::expert_usage::Geometry>,
     pub placement: Placement,
@@ -982,6 +985,13 @@ pub(crate) fn admit<'a, const RANKS: usize>(mut inputs: Inputs<'_, RANKS>) -> Re
     let mut host_budget = kimi::host_budget(host_total, host_available);
     host_budget.headroom = host_budget.headroom.max(prefix_args.map_or(0, |args| args.host_cache_headroom_bytes));
     budgets.push(host_budget);
+    if let Some((inventory,mode,copies,cache))=&inputs.vision {
+        let hardware=cuteafd_loader::plan::encoder::EncoderHardware {v41:false,
+            gpus:cards.iter().map(|(_,bytes)|cuteafd_loader::plan::encoder::EncoderGpuBudget {free_bytes:*bytes,kv_target_bytes:0}).collect(),
+            sparks:sparks.iter().enumerate().map(|(rank,&bytes)|cuteafd_loader::plan::encoder::EncoderSparkBudget {
+                rank,host:format!("spark{rank}"),idle:false,expert_bytes:0,free_bytes:bytes}).collect()};
+        recipe.vision=Some(cuteafd_loader::placement::still_encoder::StillEncoder::new(inventory.clone(),*mode,*copies,&hardware,*cache)?);
+    }
     let admitted = recipe.admit(kimi::request(request.pool.context, request.pool.requested, request.onboard,
         recipe.prefill, contract::Operation::Serving, request.resident_weight_limit.unwrap_or(ResidentWeights::DEFAULT_LIMIT),
         cuteafd_core::spark_reply::requested()), budgets)?;
@@ -1030,7 +1040,9 @@ pub(crate) fn admit<'a, const RANKS: usize>(mut inputs: Inputs<'_, RANKS>) -> Re
     let lane_readers = vec![vec![Weak::new(); devices.len()]; lane_layouts.len()];
     let mla_layouts = (0..devices.len()).map(|rank| CacheLayout::for_ranks(cfg, &placement, rank, cache_format, devices.len()))
         .collect::<Result<Vec<_>>>()?;
-    let admission = Admission { receipt: admitted.solved, expert_usage: recipe.expert_usage.clone(), placement, host_prefix, mark_selection, graph_set, rtx, rtx_loaded: false, draft, draft_allocated: false, draft_marks_allocated: false, context, context_allocated: false, cfg: cfg.clone(), core, layouts, layer_owners, layer_uploaded, local_bound,
+    let vision=recipe.vision.as_ref().and_then(|v|v.admitted(&admitted.solved));
+    let media_cache_bytes=recipe.vision.as_ref().map_or(0,|v|v.media_cache);
+    let admission = Admission { vision,media_cache_bytes,receipt: admitted.solved, expert_usage: recipe.expert_usage.clone(), placement, host_prefix, mark_selection, graph_set, rtx, rtx_loaded: false, draft, draft_allocated: false, draft_marks_allocated: false, context, context_allocated: false, cfg: cfg.clone(), core, layouts, layer_owners, layer_uploaded, local_bound,
         skip_routed_experts, devices: devices.to_vec(), lanes, spark_ranks, waves: inputs_waves, unit_rows, lane_layouts, lane_allocated, lane_readers,
         kda_layout, kda_allocated: vec![false; devices.len()], kda_owners: vec![Weak::new(); devices.len()],
         mla_layouts, mla_allocated: vec![false; devices.len()], mla_owners: vec![Weak::new(); devices.len()],
@@ -1496,7 +1508,7 @@ pub(super) mod tests {
     }
 
     fn inputs_for_ranks<const RANKS: usize>(cfg: &KimiK3Config) -> Inputs<'_, RANKS> {
-        Inputs { skip_routed_experts: false, expert_usage: false, cfg, resident_weight_limit: ResidentWeights::DEFAULT_LIMIT, core: Default::default(), cache_format: cuteafd_core::MlaCacheFormat::Bf16, gpus: [GpuBudget { capacity_bytes: 96 << 30, reserve_bytes: 2 << 30,
+        Inputs { vision: None, skip_routed_experts: false, expert_usage: false, cfg, resident_weight_limit: ResidentWeights::DEFAULT_LIMIT, core: Default::default(), cache_format: cuteafd_core::MlaCacheFormat::Bf16, gpus: [GpuBudget { capacity_bytes: 96 << 30, reserve_bytes: 2 << 30,
             baseline: Baseline::Measured { free_bytes: 96 << 30 } }; RANKS], devices: std::array::from_fn(|rank| rank as i32), peer_access: RANKS == 2, spark_ranks: 6,
             attention: (RANKS == 2).then_some(AttentionPlacement::Layers), context: None, serving_context: cuteafd_loader::placement::planner::Context::pinned(1 << 20), requested_pool: None, state_slots: 2, prefix_marks: 2, rows: 4096, lanes: 2, waves: 2, unit_rows: None,
             lane_layouts: vec![std::array::from_fn(|_| LaneLayout::for_ranks(
@@ -3136,7 +3148,7 @@ pub(super) mod tests {
             } else {
                 vec![]
             };
-            admit(Inputs::<1> {
+            admit(Inputs::<1> { vision: None,
                 skip_routed_experts: true,
                 expert_usage: false,
                 cfg: &truncated,

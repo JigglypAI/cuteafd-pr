@@ -448,8 +448,8 @@ impl<'a> Engine<'a> {
             let mut offset = 0;
             for (placement, ids) in sequences.iter() {
                 if let Some(media) = self.probe_media.borrow().get(&placement.slot) {
-                    lanes.io[0][0].inject_probe(media, placement.len, ids.len(), offset,
-                        lanes.local[0][0].buffer("delta")?)?;
+                    lanes.io[0][0].inject_media(media, placement.len, ids.len(), offset,
+                        lanes.local[0][0].buffer("delta")?,lanes.local[0][0].buffer("normalized")?)?;
                 }
                 offset += ids.len();
             }
@@ -755,8 +755,8 @@ impl<'a> Engine<'a> {
             let mut offset = 0;
             for (placement, ids) in sequences.iter() {
                 if let Some(media) = self.probe_media.borrow().get(&placement.slot) {
-                    lanes.io[0][0].inject_probe(media, placement.len, ids.len(), offset,
-                        lanes.local[0][0].buffer("delta")?)?;
+                    lanes.io[0][0].inject_media(media, placement.len, ids.len(), offset,
+                        lanes.local[0][0].buffer("delta")?,lanes.local[0][0].buffer("normalized")?)?;
                 }
                 offset += ids.len();
             }
