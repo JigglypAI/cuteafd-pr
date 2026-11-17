@@ -2851,7 +2851,8 @@ impl<'a> DflashDrafter<'a> {
                 } else { draft_view(w.head()?.tokens.buffer, 0, drafted * 4)? }
             } else { draft_view(w.head()?.tokens.buffer, 0, drafted * 4)? };
             l.copy_d2h_host_buffer_async(landing(0, drafted * 4), token_buffer, drafted * 4, s)?;
-            if matches!(self.head_ops, DraftHeadOps::Selector { .. }) {
+            // Only the explicit golden selector oracle consumes these features.
+            if !serving && matches!(self.head_ops, DraftHeadOps::Selector { .. }) {
                 l.copy_d2h_host_buffer_async(landing(drafted * 4, drafted * 16),
                     CuteafdDeviceBuffer { bytes: drafted * 16, ..w.head()?.features.as_ref().context("selector workspace missing")?.buffer }, drafted * 16, s)?;
             }
@@ -2869,7 +2870,7 @@ impl<'a> DflashDrafter<'a> {
         self.timing.publish_completed()?;
         self.timing.dump_head_input(w.n.buffer, rows, h)?;
         let drafted = s_count * c.drafts();
-        let selector = matches!(self.head_ops, DraftHeadOps::Selector { .. });
+        let selector = !serving && matches!(self.head_ops, DraftHeadOps::Selector { .. });
         let landing_bytes = drafted * if selector { 20 } else { 4 };
         let (tokens, features) = w.head()?.landing.bytes()[..landing_bytes].split_at(drafted * 4);
         let word = |b: &[u8], i: usize| u32::from_le_bytes(b[i * 4..i * 4 + 4].try_into().unwrap());

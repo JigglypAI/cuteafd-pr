@@ -322,6 +322,9 @@ struct Pending {
     keep: usize,
     /// The skipped explore's calibrated probability.
     skipped: Option<f64>,
+    skipped_position: Option<Planned>,
+    /// Calibration used before this round's outcomes train the fit.
+    calibrated: Vec<Option<f64>>,
     /// Planned positions per track, and how many of them the budget granted.
     planned: [Vec<Planned>; 2],
     granted: [usize; 2],
@@ -440,7 +443,7 @@ impl DraftHistory {
             };
             let granted = planned.len();
             let pending = Pending { room, keep, skipped: None, planned: [planned, Vec::new()],
-                granted: [granted, 0], head: Vec::new() };
+                granted: [granted, 0], ..Default::default() };
             self.requests.insert(id, Request { pending: Some(pending), ..request });
         }
         let ids: Vec<u64> = requests.iter().map(|&(id, _)| id).collect();
@@ -456,12 +459,15 @@ impl DraftHistory {
         pending.planned[NEURAL].truncate(pending.granted[NEURAL]);
         let Some(head) = head.filter(|_| self.spec.head != HeadScore::None) else { return pending.granted[NEURAL] };
         pending.head = head[..head.len().min(self.spec.block)].to_vec();
+        pending.calibrated = pending.head.iter().enumerate().map(|(position, &score)|
+            score.is_finite().then(|| self.platt[position].apply(logit(self.spec.head, score)))).collect();
         let explore = pending.keep;
         if self.control == DraftControl::History && pending.granted[NEURAL] > explore {
             if let Some(&score) = pending.head.get(explore) {
                 let calibrated = self.platt[explore].apply(logit(self.spec.head, score));
                 if score.is_finite() && calibrated < SKIP_CUT {
                     pending.granted[NEURAL] = explore;
+                    pending.skipped_position = pending.planned[NEURAL].get(explore).cloned();
                     pending.planned[NEURAL].truncate(explore);
                     pending.skipped = Some(calibrated);
                     self.stats.head_skips += 1;
@@ -580,16 +586,21 @@ impl DraftHistory {
             if trace {
                 let mut positions = Vec::with_capacity(proposed);
                 for (track, label) in [(NEURAL, Track::Neural), (COPY, Track::Copy)] {
-                    for (position, planned) in pending.planned[track].iter().enumerate() {
+                    let skipped = if track == NEURAL { pending.skipped_position.as_ref() } else { None };
+                    let planned = pending.planned[track].iter().enumerate()
+                        .chain(skipped.map(|planned| (pending.keep, planned)));
+                    for (position, planned) in planned {
                         let head = if track == NEURAL { pending.head.get(position).copied() } else { None };
                         positions.push(PositionTrace { track: label, position, p: planned.p,
                             accepted: planned.accepted, reached: planned.reached, server: planned.server,
                             server_reached: planned.server_reached,
                             explore: explores && if track == NEURAL { position >= pending.keep }
                                 else { position + 1 == pending.planned[COPY].len() && planned.p <= KEEP_CUT },
-                            head, calibrated: head.filter(|score| score.is_finite())
-                                .map(|score| self.platt[position].apply(logit(self.spec.head, score))),
-                            outcome: (position < reached[track]).then_some(position < kept[track]) });
+                            head, calibrated: if track == NEURAL { pending.calibrated.get(position).copied().flatten() }
+                                else { None },
+                            outcome: (position < reached[track] && !(track == NEURAL
+                                && pending.skipped.is_some() && position == pending.keep))
+                                .then_some(position < kept[track]) });
                     }
                 }
                 requests.push(RequestTrace { id: outcome.id, room: pending.room, keep: pending.keep,
@@ -878,6 +889,24 @@ mod tests {
         }
         assert_eq!(policy.plan(&[(1, 4)], 64), [2]);
         assert_eq!(policy.refine(1, 2, Some(&[0.9, 0.01])), 2);
+    }
+
+    #[test]
+    fn skipped_explore_trace_retains_the_decision_and_never_claims_a_verified_miss() {
+        let mut policy = suppressed_head_policy();
+        assert_eq!(policy.plan(&[(1, 4)], 64), [2]);
+        let before = policy.platt[0].apply(logit(HeadScore::Probability, 0.9));
+        assert_eq!(policy.refine(1, 2, Some(&[0.9, 0.02])), 1);
+        let trace = policy.observe(&[outcome(1, 1, 1)], true).unwrap();
+        let request = &trace.requests[0];
+        assert_eq!(request.proposed, 1);
+        assert_eq!(request.positions.len(), 2);
+        assert_eq!(request.positions[0].calibrated, Some(before));
+        let skipped = &request.positions[1];
+        assert_eq!((skipped.position, skipped.head, skipped.outcome), (1, Some(0.02), None));
+        assert!(skipped.explore && skipped.reached > 0);
+        assert_eq!(skipped.calibrated, request.explore_skipped);
+        assert_eq!(policy.stats().skip_misses, 1);
     }
 
     #[test]

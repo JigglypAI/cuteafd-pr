@@ -260,7 +260,7 @@ fn serving_stats<C: cuteafd_engine::media::EncoderClient>(prefixes: &PrefixCache
         // restores), captures, evictions and page/mark occupancy.
         "prefix": prefixes.serving_stats(),
         "target_sampling": sampling_stats::snapshot(),
-        "dspark_policy": super::speculative::policy_snapshot(),
+        "draft_policy": super::speculative::policy_snapshot(),
         "admission": kv_waiter.stats(),
         "kv_reserve": {"stats": reserve.stats(), "stalled": stalled, "config": reserve.config()},
         "media": media.stats(),

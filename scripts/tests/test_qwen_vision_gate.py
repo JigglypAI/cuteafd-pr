@@ -19,24 +19,17 @@ def module(path, name):
     return result
 
 
-def test_lazy_exl3_draft_grouping_uses_the_shared_installed_window_order():
-    daemon = ROOT / "rust/crates/cuteafd-daemon/src/families"
-    for family, stream in (("glm5_flash", "self.stream"),):
-        source = (daemon / family / "engine.rs").read_text()
-        geometry = source.split("pub(crate) fn draft_geometry(", 1)[1].split("\n    }", 1)[0]
-        assert "crate::families::deepseek_v4::local::installed_window_group_rows(" in geometry
-        assert f"&local.resident, || local.ensure(layer, {stream}), rows," in geometry
-        assert "|experts, rows| experts.group_rows(rows)" in geometry
-        assert "local.resident.borrow()" not in geometry
-    qwen = (daemon / "qwen4/engine.rs").read_text()
-    geometry = qwen.split("pub(crate) fn draft_geometry(", 1)[1].split("\n    }", 1)[0]
-    assert "experts.local_layer(layer)" in geometry
-    assert 'context("Qwen local owner")?.group_rows(rows)' in geometry
-    assert "worker_group_rows_for_input" in geometry
-    assert "local.ensure(" not in qwen
-    # GLM Flash already installs TP1 windows during admitted onboarding; the
-    # shared helper reuses these without changing their stream or load timing.
-    glm = (daemon / "glm5_flash/mod.rs").read_text()
+def test_history_policy_removes_unused_route_geometry_probes():
+    daemon = ROOT / "rust/crates/cuteafd-daemon/src"
+    for family in ("glm5_flash", "qwen4"):
+        source = (daemon / "families" / family / "engine.rs").read_text()
+        assert "fn draft_geometry(" not in source
+        assert "RouteProbe" not in source
+    policy = (daemon / "shared/draft/history.rs").read_text()
+    assert "DraftHistory::new(spec, length.control())" in policy
+    assert "self.history.settle(&ids, rows)" in policy
+    # Removing route probes does not move admitted EXL3 onboarding.
+    glm = (daemon / "families/glm5_flash/mod.rs").read_text()
     assert glm.index("local.ensure(local_layers[0], stream)?;") < glm.index("engine.install_local(local_layers, experts)?;")
 
 
@@ -347,7 +340,7 @@ def test_qwen_verify_histogram_uses_existing_timer_and_physical_rows():
     serve = (ROOT / "rust/crates/cuteafd-daemon/src/shared/qwen/scheduler.rs").read_text()
     engine = (ROOT / "rust/crates/cuteafd-daemon/src/families/qwen4/engine.rs").read_text()
     timer = serve[serve.index("    let elapsed = timer.elapsed().as_secs_f64();"):]
-    assert timer.index("lane.stats.record(tokens.len(), engine.verify_bucket_rows(tokens.len(), spec, diagnostic)") < timer.index("resource::observe_drafted(")
+    assert timer.index("lane.stats.record(tokens.len(), engine.verify_bucket_rows(tokens.len(), spec, diagnostic)") < timer.index("policy.observe(&outcomes)")
     assert '"verify": verify.snapshot()' in serve
     assert serve.count("&cache, media, preparer, &lane.stats,\n") == 2
     assert "self.use_graphs && self.graph_capture.get() && !diagnostic" in engine
@@ -361,10 +354,10 @@ def test_shared_copy_extensions_precede_grammar_and_verify_width():
     trim = serve[serve.index("    let sequences: Vec<Vec<u32>>"):serve.index("    let starts: Vec<usize>")]
     assert trim.index("state.truncate_proposal") < trim.index("let spec = sequences.iter().any")
     assert "Drafts::Copy" not in serve
-    copy = serve.index("resource::copy_continuation(")
-    select = serve.index("resource::select_drafted(", copy)
-    substitute = serve.index("*proposal = copy.tokens;", select)
-    assert copy < select < substitute < serve.index("let sequences: Vec<Vec<u32>>")
+    copy = serve.index("policy.shape(&mut shaped, geometry.decode_rows)")
+    assert copy < serve.index("let sequences: Vec<Vec<u32>>")
+    policy = (ROOT / "rust/crates/cuteafd-daemon/src/shared/draft/history.rs").read_text()
+    assert policy.index("copy::continuation(") < policy.index("self.history.settle(&ids, rows)")
     route = engine[engine.index("pub(crate) fn copy_verify_row_limit"):engine.index("pub(crate) fn verify_bucket_rows")]
     assert "self.use_graphs && self.graph_capture.get() && !diagnostic" in route
     assert "copy_row_limit(rows, sequences)" in route and "else { rows }" in route

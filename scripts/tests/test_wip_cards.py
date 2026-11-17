@@ -74,7 +74,7 @@ def test_console_observer_records_policy_stats(entry, tmp_path, monkeypatch):
         calls.append(path)
         if path == '/v1/stats':
             stop.touch()
-            return {'dspark_policy': {'solo': {'concurrency_buckets': [{'engaged': True}]}}}
+            return {'draft_policy': {'policy': 'history', 'short_share': 0.125, 'head_skips': 2}}
         return {'type': 'snapshot'}
 
     monkeypatch.setattr(cards, 'http', http)
@@ -82,7 +82,7 @@ def test_console_observer_records_policy_stats(entry, tmp_path, monkeypatch):
     monkeypatch.setattr(cards.time, 'sleep', lambda _: None)
     cards.observe(job)
     record = json.loads((Path(job['state']) / 'policy-stats.jsonl').read_text())
-    assert record['stats']['dspark_policy']['solo']['concurrency_buckets'][0]['engaged']
+    assert record['stats']['draft_policy'] == {'policy': 'history', 'short_share': 0.125, 'head_skips': 2}
     assert calls == ['/v1/console/snapshot', '/v1/stats']
 
 

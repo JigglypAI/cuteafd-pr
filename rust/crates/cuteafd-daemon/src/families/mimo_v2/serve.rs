@@ -1134,8 +1134,7 @@ async fn decode_round(lease: LaneLease<'_>, engine: &MimoEngine<'_>, prefix_draf
                 Ok(drafts) => {
                     let mut out = vec![None; active.len()];
                     for (i, tokens) in indices.into_iter().zip(drafts) {
-                        let features = vec![[0.0, 1.0, 0.0, 0.0]; tokens.len()];
-                        out[i] = Some(super::dflash::Draft { tokens, features });
+                        out[i] = Some(super::dflash::Draft { tokens });
                     }
                     out
                 },

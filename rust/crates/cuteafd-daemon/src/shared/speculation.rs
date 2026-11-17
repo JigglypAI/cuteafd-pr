@@ -30,6 +30,16 @@ mod tests {
     use super::*;
 
     #[test]
+    fn serving_dflash_does_not_download_or_compute_policy_features() {
+        let source = include_str!("speculation/dflash.rs");
+        assert!(source.contains("if !serving && matches!(self.head_ops, DraftHeadOps::Selector"));
+        assert!(source.contains("let selector = !serving && matches!(self.head_ops, DraftHeadOps::Selector"));
+        let mimo = include_str!("../families/mimo_v2/dflash.rs");
+        assert!(!mimo.contains("fn features("));
+        assert!(!mimo.contains("..output.unary.buffer },"));
+    }
+
+    #[test]
     fn planned_marks_and_disconnects_publish_only_complete_windows() {
         let (window, end) = (4096, 16384);
         let points = [8192, 12288];
