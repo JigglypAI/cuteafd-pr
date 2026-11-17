@@ -2,7 +2,7 @@
 //! means interleaving: several lanes of plan/commit/abort/lookup/pin/evict/free steps are run in
 //! a seeded, logged order with shared device pages, and the model is checked after every step.
 //! A failure prints the schedule log and reproduces from its seed.
-mod common;
+use super::common;
 
 use common::{apply, Model, Op, ORDERS};
 use cuteafd_hostcache::snapshot::testing::snapshots_ordered;

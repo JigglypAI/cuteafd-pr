@@ -1,4 +1,8 @@
 //! Shared-prefix failures survive the real runner, JSON export and SQLite store.
+//!
+//! Its own binary: `ready()` seals the process-wide `context::loopback()`
+//! (`src/context.rs`: `listen: OnceLock<SocketAddr>`, set once by `seal()`); this test
+//! publishes the context settings its report must show, which readiness seals too.
 use axum::{http::StatusCode, response::IntoResponse, routing::{get, post}, Json, Router};
 use cuteafd_bench::{context, report::Setting, store::Store, Bench};
 use serde_json::{json, Value};

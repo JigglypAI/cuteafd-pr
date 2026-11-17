@@ -2,8 +2,8 @@
 //! documented error path (skips, exhaustion, issue failure, budget timeouts), the disabled
 //! no-ops, exact sharing end to end, content fidelity, the late-overwrite hazard, and proptest
 //! properties over random store/tick/evict/lookup/restore sequences against the HC-2 model.
-mod common;
-mod common_hc_5;
+use super::common;
+use super::common_hc_5;
 
 use common::{reconcile, Model};
 use common_hc_5::{
