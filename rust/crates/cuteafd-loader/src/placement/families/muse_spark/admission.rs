@@ -1080,10 +1080,8 @@ mod contract_tests {
         requested: Option<u64>) -> crate::placement::PoolFacts<'a> {
         let cache = crate::families::muse_spark::cache::MuseCacheLayout::with_format(cfg, cards.len(),
             crate::families::muse_spark::cache::MuseKvCache::Bf16).unwrap();
-        let mut facts = crate::placement::PoolFacts::new(cards, context, requested, PAGE_ROWS);
-        facts.memory = cache.geometry.ranks.iter().zip(cards).map(|(rank, &available_bytes)|
-            crate::placement::PoolMemory { available_bytes, bytes_per_unit: rank.persistent_unit_bytes }).collect();
-        facts
+        let units = cache.geometry.ranks.iter().map(|rank| rank.persistent_unit_bytes).collect::<Vec<_>>();
+        crate::plan::testing::pool_facts(cards, context, requested, PAGE_ROWS, &units)
     }
 
     #[test]

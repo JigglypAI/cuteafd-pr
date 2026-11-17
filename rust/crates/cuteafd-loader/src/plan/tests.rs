@@ -4328,8 +4328,9 @@ fn glm5_flash_index_layout_pool_matches_runtime_geometry() {
                         let geometry = glm_flash_rank_cache_geometry_rows(&cfg, cfg.layers, gpus,
                             served_index, 4, rows).unwrap();
                         let unit = geometry.logical_unit_rows;
-                        let mut served_pool = crate::placement::prepare_pool(crate::placement::PoolFacts::new(&vec![24 << 30; gpus],
-                            131_072, None, 256)).unwrap().target();
+                        let slopes = geometry.ranks.iter().map(|rank| rank.persistent_unit_bytes).collect::<Vec<_>>();
+                        let mut served_pool = crate::placement::prepare_pool(crate::plan::testing::pool_facts(
+                            &vec![24 << 30; gpus], 131_072, None, 256, &slopes)).unwrap().target();
                         let pieces = crate::serving_capacity::glm_flash_mla_unit_pieces(served_index,
                             AttentionPlacement::Heads);
                         for (device, rank) in memory.devices.iter().filter(|d| d.kind == cuteafd_core::memory_layout::DeviceKind::Rtx)

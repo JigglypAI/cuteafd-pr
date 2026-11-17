@@ -14,13 +14,13 @@ fn pool_facts(cfg: &crate::families::minimax_m3::MiniMaxM3Config, gpus: usize,
     let page = shared::PAGE_ROWS * cuteafd_ffi::minimax_m3::kv_plane_record_bytes(rank_heads) as u64 * 2
         + (cfg.msa.index_dim as u64 + 4) * shared::PAGE_ROWS;
     let owners = shared::layer_owners(cfg.layers, gpus);
-    let mut facts = crate::placement::PoolFacts::new(cards, context, requested, shared::PAGE_ROWS);
-    facts.memory = cards.iter().enumerate().map(|(gpu, &available_bytes)| {
+    let units = (0..cards.len()).map(|gpu| {
         let layers = if heads { cfg.layers as u64 }
             else { owners.iter().filter(|&&owner| usize::from(owner) == gpu).count() as u64 };
-        crate::placement::PoolMemory { available_bytes, bytes_per_unit: page * layers }
-    }).collect();
-    crate::placement::prepare_pool(facts).unwrap()
+        page * layers
+    }).collect::<Vec<_>>();
+    crate::placement::prepare_pool(crate::plan::testing::pool_facts(cards, context,
+        requested, shared::PAGE_ROWS, &units)).unwrap()
 }
 
 #[test]

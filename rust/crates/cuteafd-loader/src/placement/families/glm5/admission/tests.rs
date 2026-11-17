@@ -21,10 +21,8 @@ fn pool_facts<'a>(cfg: &GlmDsaConfig, cards: &'a [u64], context: impl Into<plann
         Some(ml4) => crate::serving_capacity::mistral_large4_cache_geometry(ml4, cards.len()).unwrap(),
         None => crate::serving_capacity::glm_cache_geometry(cfg, cfg.layers, cards.len()).unwrap(),
     };
-    let mut facts = crate::placement::PoolFacts::new(cards, context, requested, unit_rows);
-    facts.memory = cache.ranks.iter().zip(cards).map(|(rank, &available_bytes)|
-        crate::placement::PoolMemory { available_bytes, bytes_per_unit: rank.persistent_unit_bytes }).collect();
-    facts
+    let units = cache.ranks.iter().map(|rank| rank.persistent_unit_bytes).collect::<Vec<_>>();
+    crate::plan::testing::pool_facts(cards, context, requested, unit_rows, &units)
 }
 
 fn production_link(cfg: &GlmDsaConfig, ranks: usize, shape: PrefillShape, prefill: bool)

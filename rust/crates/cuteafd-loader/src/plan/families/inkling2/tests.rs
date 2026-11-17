@@ -6,10 +6,10 @@ fn pool_facts<'a>(cfg: &crate::families::inkling2::Inkling2Config,
     modes: &[crate::placement::LayerMode], page_rows: u64, cards: &'a [u64],
     context: impl Into<crate::placement::planner::Context>, requested: Option<u64>)
     -> crate::placement::PoolFacts<'a> {
-    let mut facts = crate::placement::PoolFacts::new(cards, context, requested, page_rows);
-    facts.memory = crate::families::inkling2::admission::pool_memory(cfg,
-        crate::families::inkling2::InklingKvCache::Bf16, modes, page_rows, cards);
-    facts
+    let units = crate::families::inkling2::admission::pool_memory(cfg,
+        crate::families::inkling2::InklingKvCache::Bf16, modes, page_rows, cards)
+        .iter().map(|memory| memory.bytes_per_unit).collect::<Vec<_>>();
+    crate::plan::testing::pool_facts(cards, context, requested, page_rows, &units)
 }
 
 /// Which routed-expert storage the fixture writes.
