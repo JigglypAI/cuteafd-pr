@@ -18,7 +18,7 @@
 //! per-commit byte accounting closure under sustained capacity pressure; hit counting vs
 //! lookup outcomes; restore failure is a fall-through (the daemon's 5173e44 prefill path),
 //! never a cache-state loss.
-mod common_hc_5;
+use super::common_hc_5;
 
 use common_hc_5::{
     cache, config, default_cache, store_resident, target, write_snapshot, Device, Payload,

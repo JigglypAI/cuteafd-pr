@@ -1,4 +1,8 @@
 //! Run in the matching coordinator dev image through golden-run's native-test mode.
+//!
+//! Its own binary: the CUDA suites own both RTX devices, capture graphs and account
+//! through the process-global memory ledger, so the ignored native tests run one
+//! process per family (`rtx_tp2_cuda` says the same).
 #![cfg(feature = "test-support")]
 use anyhow::{ensure, Result};
 use cuteafd_core::expert_usage::{Geometry, Reader};

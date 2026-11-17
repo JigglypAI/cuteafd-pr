@@ -11,7 +11,7 @@ pub fn with_fake_token_count(router: axum::Router) -> axum::Router {
     async fn count(axum::Json(body): axum::Json<serde_json::Value>) -> axum::Json<serde_json::Value> {
         static OVERHEAD: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
         let fixture: serde_json::Value = serde_json::from_str(include_str!(
-            "../../../cuteafd-api/tests/fixtures/v41-encoding/deepseek-v4.1-flash.json")).unwrap();
+            "../../../../cuteafd-api/tests/fixtures/v41-encoding/deepseek-v4.1-flash.json")).unwrap();
         let case = fixture["cases"].as_array().unwrap().iter().find(|case| {
             case["request"]["messages"].as_array().is_some_and(|messages| messages.len() == 1
                 && messages[0]["role"] == "user" && messages[0]["content"] == "hello")

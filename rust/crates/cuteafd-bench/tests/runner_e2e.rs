@@ -1,7 +1,11 @@
 //! The runner end to end against a fake engine behind the real OpenAI router:
 //! a share run over loopback completes, exports render, and other clients get
 //! 503 + Retry-After while it runs.
-mod common;
+//!
+//! Its own binary: `ready()` seals the process-wide `context::loopback()`
+//! (`src/context.rs`: `listen: OnceLock<SocketAddr>`, set once by `seal()`), and the
+//! runner drives the run started here at that sealed address (`src/runner.rs`).
+#[path = "all/common/mod.rs"] mod common;
 use common::fake_engine;
 use cuteafd_api::openai::{auth::ApiKey, router_with_console, ConsoleHub, NativeLimits, NativeRequest};
 use cuteafd_bench::report::RunStatus;
