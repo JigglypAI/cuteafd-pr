@@ -2183,6 +2183,7 @@ mod tests {
             write_snapshot(target.path(), &config, &[t("unused.weight", "BF16", &[2])], None);
             if name == "mimo26-flash" { std::fs::create_dir(target.path().join("dflash")).unwrap(); }
             let draft = tempfile::tempdir().unwrap();
+            std::fs::write(draft.path().join("config.json"), "{}").unwrap();
             let mut auto = args(target.path(), 4, false);
             if name == "mimo26-flash" { auto.checkpoint_model_id = Some("XiaomiMiMo/MiMo-V2.6-Flash-MOPD".into()); }
             // Resolve policy independently of the machine's HF cache.
