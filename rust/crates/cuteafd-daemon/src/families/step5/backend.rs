@@ -520,7 +520,10 @@ impl<'e, 'a> Backend<'a> for Step5Backend<'e, 'a> {
     fn prepare(&self, job: NativeRequest, tokens: Vec<u32>) -> Result<(scheduler::Prompt, RequestMedia, Vec<EncodeJob>)> {
         if self.vision.is_none() {
             ensure!(job.media.is_empty() && job.image_groups.is_empty(), "vision is disabled");
-            return crate::shared::vision::still::Binding::prepare(job, tokens, V as u32, H, self.context, 0, vec![]);
+            ensure!(job.audio.is_empty(), "no bundled audio execution owner");
+            let keys = cuteafd_engine::media::MediaKeys::new(&tokens, V as u32, &[])?;
+            let media = RequestMedia::new(vec![], H, tokens.len())?;
+            return Ok((scheduler::Prompt { job, tokens, keys }, media, vec![]));
         }
         self.vision.as_ref().context("Step-5 media binding absent")?.prepare(job, tokens, V as u32, H, self.context)
     }
