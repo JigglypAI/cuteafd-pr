@@ -186,6 +186,13 @@ fn packing_inventory(core: Option<&serde_json::Value>, native: &[String])
     }
     // The drafter consumes each member's private context after packed target work.
     add("kimik3_mla_draft_output_m64".into(), SequenceLocal)?;
+    for name in ["kimik3_mla_draft_output_fp8_weights_m64",
+        "kimik3_mla_draft_producer_fp8_weights_m64", "kimik3_mla_draft_producer_fp8_weights_fp8_m64",
+        "kimik31_mla_draft_output_fp8_weights_causal_h96_m64",
+        "kimik31_mla_draft_producer_fp8_weights_causal_h96_m64",
+        "kimik31_mla_draft_producer_fp8_weights_causal_h96_fp8_m64"] {
+        add(name.into(), SequenceLocal)?;
+    }
     add("kimik3_mla_draft_lse_combine2".into(), SequenceLocal)?;
     for cache in ["", "_fp8"] {
         add(format!("kimik3_mla_draft_producer{cache}_m64"), SequenceLocal)?;
@@ -2498,11 +2505,14 @@ impl TokenIo<'_> {
         })
     }
 
-    pub(crate) fn inject_probe(&self, media: &cuteafd_engine::media::RequestMedia,
-        start: usize, rows: usize, offset: usize, output: CuteafdDeviceBuffer) -> Result<()> {
-        let output = view(output, offset * self.layout.hidden * 2, rows * self.layout.hidden * 2)?;
-        self.stream.device.run(|| crate::shared::probe::still::inject(&self.stream, output,
-            media, start, rows, self.layout.hidden, false))
+    pub(crate) fn inject_media(&self,media:&cuteafd_engine::media::RequestMedia,start:usize,rows:usize,
+        offset:usize,output:CuteafdDeviceBuffer,scratch:CuteafdDeviceBuffer)->Result<()> {
+        let end=start.checked_add(rows).context("Kimi media span extent")?;
+        if media.needed(start,end).next().is_none(){return Ok(());}
+        let mut chunk=cuteafd_engine::media::MediaChunk::default();media.write_chunk(start,end,&mut chunk)?;
+        let output=view(output,offset*self.layout.hidden*2,rows*self.layout.hidden*2)?;
+        let ids=self.ids.as_ref().context("Kimi image injection IDs absent")?.buffer;
+        crate::shared::vision::still::inject(&self.stream,&chunk,scratch,ids,output,rows,self.layout.hidden)
     }
 
     /// Wide scoring retains all admitted outputs, but reuses the ordinary

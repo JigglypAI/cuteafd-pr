@@ -492,9 +492,12 @@ impl RemoteEncoder {
                             Ok(work) => work,
                             Err(mpsc::RecvTimeoutError::Disconnected) => break,
                             Err(mpsc::RecvTimeoutError::Timeout) => {
-                                if !failure.load(Ordering::Acquire) && ping(&mut stream).is_err() {
-                                    failure.store(true, Ordering::Release);
-                                    _health.0.store(false, Ordering::Release);
+                                if !failure.load(Ordering::Acquire) {
+                                    if let Err(error) = ping(&mut stream) {
+                                        tracing::warn!(%address, %error, "vision encoder heartbeat failed");
+                                        failure.store(true, Ordering::Release);
+                                        _health.0.store(false, Ordering::Release);
+                                    }
                                 }
                                 continue;
                             }
@@ -507,7 +510,8 @@ impl RemoteEncoder {
                         } else {
                             exchange(&mut stream, &work.job, &expected)
                         };
-                        if result.is_err() {
+                        if let Err(error) = &result {
+                            tracing::warn!(%address, %error, "vision encoder exchange failed");
                             failure.store(true, Ordering::Release);
                             _health.0.store(false, Ordering::Release);
                         }
@@ -858,7 +862,7 @@ impl EncoderServer {
                                     })
                             });
                             if let Err(e) = result {
-                                tracing::debug!(%e, "vision peer closed/failed");
+                                tracing::warn!(%e, "vision peer closed/failed");
                             }
                             active.lock().unwrap().take();
                         }
