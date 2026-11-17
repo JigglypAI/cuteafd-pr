@@ -294,22 +294,12 @@ pub fn tp2_exchange_requests(unit_rows: usize, lanes: usize, exchange: Tp2Exchan
     Ok(requests)
 }
 
-/// Why NVFP4 Step plans onboard nothing (and refuse an explicit layer count).
-pub const NVFP4_ONBOARDING_DEPRECATED: &str = "Step-5 NVFP4 is deprecated (its cards retire this release): \
-    RTX expert onboarding is not built for it; its routed experts stay on the Sparks";
-/// FP8 Step is qualified only on two RTX (2 RTX + 6 Sparks); there its
-/// onboarded layers split TP2. No whole-layer fp8moe executor exists.
-pub const FP8_ONBOARDING_TWO_RTX: &str = "Step-5 FP8 onboards TP2 on two RTX only (its qualified card): \
-    its routed experts stay on the Sparks";
+/// Native fp8moe experts have a TP2 owner; the single-GPU whole owner is EXL3-only.
+pub const NATIVE_ONBOARDING_TWO_RTX: &str = "Step-5 native FP8/NVFP4 whole-layer RTX expert executor is not implemented;     use two coordinator GPUs for native TP2 onboarding or leave routed experts on Sparks";
 
-/// The named reason a routed format does not onboard here, or None.
+/// The named structural reason a routed format cannot onboard, or None.
 pub fn onboarding_unavailable(catalog: &crate::OfficialV41Catalog, gpus: usize) -> Option<&'static str> {
-    use crate::formats::fp8_experts::ExpertFormat;
-    match catalog.fp8().map(|fp8| fp8.format()) {
-        Some(ExpertFormat::Nvfp4) => Some(NVFP4_ONBOARDING_DEPRECATED),
-        Some(_) if gpus != 2 => Some(FP8_ONBOARDING_TWO_RTX),
-        _ => None,
-    }
+    (catalog.fp8().is_some() && gpus != 2).then_some(NATIVE_ONBOARDING_TWO_RTX)
 }
 
 /// Header-exact costs of the routed layers in order (whole, and TP2 halves on

@@ -1633,10 +1633,10 @@ fn exl3_zero_spark_refuses_partial_ownership_in_the_joint_planner() {
     assert!(report.hints.iter().any(|hint| hint.what.contains("native placement refused")), "{:?}", report.hints);
 }
 
-/// NVFP4 Step is deprecated: auto onboards nothing (with the named reason),
+/// Single-GPU native expert execution is unimplemented: auto onboards nothing,
 /// an explicit layer count is refused.
 #[test]
-fn nvfp4_onboarding_is_refused_with_its_deprecation() {
+fn nvfp4_whole_onboarding_is_refused_with_its_missing_executor() {
     let dir = snapshot("nvfp4");
     let manifest = native_manifest(dir.path());
     let plan_with = |onboard: Option<crate::placement::OnboardSetting>| plan::plan(dir.path(), &PlanOptions {
@@ -1647,9 +1647,27 @@ fn nvfp4_onboarding_is_refused_with_its_deprecation() {
     let auto = plan_with(None);
     assert_eq!(auto.onboard_layers, Some(0), "{:#?}", auto.hints);
     assert!(auto.memory_layout.as_ref().unwrap().notes.iter()
-        .any(|n| n == super::admission::NVFP4_ONBOARDING_DEPRECATED));
+        .any(|n| n == super::admission::NATIVE_ONBOARDING_TWO_RTX));
     let explicit = plan_with(Some(crate::placement::OnboardSetting::Layers(2)));
-    assert!(explicit.hints.iter().any(|h| h.what.contains("Step-5 NVFP4 is deprecated")), "{:#?}", explicit.hints);
+    assert!(explicit.hints.iter().any(|h| h.what.contains("whole-layer RTX expert executor is not implemented")), "{:#?}", explicit.hints);
+}
+
+#[test]
+fn nvfp4_two_rtx_onboards_exported_native_tp2_without_a_retirement_gate() {
+    use crate::placement::{ExpertHome, OnboardSetting};
+    let dir = snapshot("nvfp4");
+    let manifest = native_manifest(dir.path());
+    let report = plan::plan(dir.path(), &PlanOptions {
+        placement: ExpertPlacement::from_spark_ranks(6), draft_ownership: Some(spec::DraftOwnership::None),
+        layout: Some(layout::LayoutOptions { host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram),
+            rtx_bytes: vec![crate::placement::inventory::PRO_TOTAL_BYTES; 2], workspace_manifest: Some(manifest),
+            onboard: Some(OnboardSetting::Layers(2)), ..Default::default() }), ..Default::default()
+    }).unwrap();
+    assert!(report.executable(), "{:?}", report.hints);
+    assert_eq!(report.onboard_layers, Some(2));
+    assert_eq!(report.solver_placement.as_ref().unwrap().layers.iter()
+        .filter(|layer| layer.experts == ExpertHome::RtxTp2).count(), 2);
+    assert!(!report.hints.iter().any(|hint| hint.what.contains("deprecated")));
 }
 
 #[test]
@@ -1844,7 +1862,7 @@ fn tp2_onboarded_layers_skip_replication_and_validate_their_exchange() {
 #[test]
 fn fp8_two_rtx_onboards_tp2_halves_with_the_bf16_exchange() {
     use crate::placement::ExpertHome;
-    use super::admission::{tp2_exchange_bytes, Tp2Exchange, FP8_ONBOARDING_TWO_RTX};
+    use super::admission::{tp2_exchange_bytes, Tp2Exchange, NATIVE_ONBOARDING_TWO_RTX};
     let dir = snapshot("fp8");
     let report = report(dir.path(), 2, 96, 6, None);
     assert!(report.wip_launchable(), "{:#?}", report.hints);
@@ -1857,7 +1875,7 @@ fn fp8_two_rtx_onboards_tp2_halves_with_the_bf16_exchange() {
     eprintln!("Step-5 FP8 2 RTX + 6 Sparks: onboard {onboarded} layers TP2, pool {}", solved.pool_tokens);
     let one = Checkpoint::open(dir.path()).unwrap();
     let catalog = crate::read_expert_catalog(&one.snapshot).unwrap();
-    assert_eq!(super::admission::onboarding_unavailable(&catalog, 1), Some(FP8_ONBOARDING_TWO_RTX));
+    assert_eq!(super::admission::onboarding_unavailable(&catalog, 1), Some(NATIVE_ONBOARDING_TWO_RTX));
     assert_eq!(super::admission::onboarding_unavailable(&catalog, 2), None);
 }
 
