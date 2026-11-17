@@ -1,8 +1,8 @@
 //! Stability suite for packet HC-5: a wall-clock soak of the concurrency interleaver under quota
 //! pressure. Between phases the pool must hold exactly the model's bytes (no leaked slabs) and
 //! the counters must balance: every completed store is either resident, evicted or a replacement.
-mod common;
-mod common_hc_5;
+use super::common;
+use super::common_hc_5;
 
 use common::{reconcile, Model};
 use common_hc_5::{

@@ -7,7 +7,7 @@
 //! The suite's specific instrument is `copy_submissions`: every store and every restore is
 //! exactly one batch, so the gauge must equal the number of store+restore issues, and the
 //! merged plan must stay an order of magnitude below the raw 1D plan across the run.
-mod common;
+use super::common;
 
 use common::Rng;
 use cuteafd_hostcache::cache::{

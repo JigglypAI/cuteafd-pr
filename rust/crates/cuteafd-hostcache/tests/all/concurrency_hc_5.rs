@@ -4,8 +4,8 @@
 //! small quota that forces host eviction. The HC-2 model is driven in lockstep, and the
 //! invariants are checked after every step; a failure prints the schedule and reproduces from
 //! its seed.
-mod common;
-mod common_hc_5;
+use super::common;
+use super::common_hc_5;
 
 use common::{reconcile, Model, ORDERS};
 use common_hc_5::{

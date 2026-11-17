@@ -3,7 +3,7 @@
 //! every outcome branch) and the store-copy latency histogram (recorded once per completed
 //! store at its commit, wherever the completion is observed), plus the disabled no-ops and
 //! proptest properties over the named invariants.
-mod common_hc_5;
+use super::common_hc_5;
 
 use common_hc_5::{
     cache as build_cache, config, default_cache, modelled_store_ns, settle, snapshot, tokens,

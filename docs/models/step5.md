@@ -203,7 +203,11 @@ preserve target KV/CSA, predictor histories and cursors exactly.
 
 Start with `examples/configs/step5-fp8-max.config` or
 `examples/configs/step5-nvfp4-min.config`. Replace the sample fabric endpoints
-and select a sealed WIP slot containing `serve-step5`. Keep media disabled;
+and select a sealed WIP slot containing `serve-step5`. One or two coordinator
+GPUs execute every supported expert format; memory admission, not card name or
+a 32 GiB policy floor, determines fit. Deprecated NVFP4 still runs wherever its
+native packages are exported (including TP6), without a fidelity allowlist.
+Keep media disabled;
 Step-5's bundled vision execution is not yet qualified. Pool sizing remains
 automatic, and admission refuses configurations below the 256K context floor.
 

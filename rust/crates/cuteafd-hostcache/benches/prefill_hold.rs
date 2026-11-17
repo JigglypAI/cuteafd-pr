@@ -4,7 +4,7 @@
 //! scan, one clock read), an overdue store whose wait completes immediately, and an overdue
 //! store on a stalled stream (one budgeted wait that burns the pace on the virtual clock
 //! and counts a timeout — the worst case). Throughput is hold decisions per second; the
-//! debug-build floor test lives in `tests/concurrency_hc_9.rs`.
+//! debug-build floor test lives in `tests/all/concurrency_hc_9.rs`.
 use criterion::{criterion_group, criterion_main, Criterion, Throughput};
 use cuteafd_hostcache::cache::{DevicePage, DeviceSnapshot, HostCache, StoreOutcome};
 use cuteafd_hostcache::config::{Config, StoreMode};

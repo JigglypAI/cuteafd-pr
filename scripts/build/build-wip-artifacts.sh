@@ -262,7 +262,7 @@ elif [[ "$phase" != native ]]; then
     cuteafd_host_isa_cargo_build "$CARGO_TARGET_DIR" "$host_isa" "$source_dir/rust/Cargo.toml" --quiet "${cargo_feature_args[@]}"
   done
   printf '%s %s' "$wip_rust_fingerprint" "${host_isas[*]}" >"$rust_phase_marker"
-  wip_phase_mark rust $((SECONDS - rust_started)) "kache ${CUTEAFD_KACHE_MODE:-disabled}$([[ -d "${CUTEAFD_KACHE_WARNING_DIR:-/nonexistent}" ]] && echo ' fallback')${cargo_features:+ features $cargo_features}"
+  wip_phase_mark rust $((SECONDS - rust_started)) "kache ${CUTEAFD_KACHE_MODE:-disabled}$([[ -f "${CUTEAFD_KACHE_WARNING_DIR:-/nonexistent}/first-failure" ]] && echo ' fallback')${cargo_features:+ features $cargo_features}"
 else
   [[ "$(cat "$rust_phase_marker" 2>/dev/null || true)" == "$wip_rust_fingerprint ${host_isas[*]}" && -x "$(cuteafd_host_isa_daemon "$CARGO_TARGET_DIR" "${host_isas[0]}")" ]] ||
     { echo 'native phase needs a successful rust phase for this source and cache mode' >&2; exit 2; }

@@ -2,7 +2,11 @@
 //! in-process console for as long as it holds the server (the lockout makes
 //! the run's own synthetic prompts the only requests served) and clears it
 //! when the run finishes or is cancelled.
-mod common;
+//!
+//! Its own binary: `ready()` seals the process-wide `context::loopback()`
+//! (`src/context.rs`: `listen: OnceLock<SocketAddr>`, set once by `seal()`), and the
+//! runner drives the run started here at that sealed address (`src/runner.rs`).
+#[path = "all/common/mod.rs"] mod common;
 use common::fake_engine;
 use cuteafd_api::openai::{auth::ApiKey, router_with_console, ConsoleHub, NativeLimits, NativeRequest};
 use cuteafd_bench::store::Store;

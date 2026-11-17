@@ -9,7 +9,7 @@
 //! random page sets and slab layouts assert the coalesced plan covers exactly the same
 //! ordered `(src, dst, bytes)` mapping as the 1D plan with no overlaps, and that a random
 //! snapshot round-trips byte-for-byte through the batch path.
-mod common_hc_5;
+use super::common_hc_5;
 
 use common_hc_5::{
     default_cache, restored_bytes, snapshot, stored_bytes, target, tokens, write_snapshot, Device,
