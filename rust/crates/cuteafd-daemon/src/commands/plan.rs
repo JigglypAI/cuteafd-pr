@@ -246,11 +246,11 @@ fn resolve_settings(args: &mut PlanArgs, family: &str, cfg: &std::collections::B
     }
     if family == "mimo_v2" {
         let configured = match cfg.get("SPECULATOR_FP8").map(String::as_str) {
-            Some("on") => Some(true), Some("off" | "auto") => Some(false), None | Some("") => None,
+            Some("on" | "auto") => Some(true), Some("off") => Some(false), None | Some("") => None,
             _ => anyhow::bail!("SPECULATOR_FP8 must be auto, on or off"),
         };
         let fp8 = defaults::selected(args.draft_fp8.or(args.mimo_draft_bf16.then_some(false)),
-            configured, true, "FP8 MiMo DFlash body; explicit auto preserves checkpoint BF16");
+            configured, true, "FP8 MiMo DFlash body for unset/auto/on; off keeps BF16");
         args.draft_fp8 = Some(fp8.value);
         args.mimo_draft_bf16 = !fp8.value;
         resolved.insert("draft_fp8".into(), setting(fp8));
@@ -2628,7 +2628,7 @@ mod tests {
     fn mimo_draft_precision_and_plan_accounting_share_one_resolution() {
         let dir = tempfile::tempdir().unwrap();
         for alias in ["XiaomiMiMo/MiMo-V2.6-Flash-MOPD", "community/MiMo-MC", "renamed/local"] {
-            for (mode, expected) in [(None, true), (Some("on"), true), (Some("auto"), false), (Some("off"), false)] {
+            for (mode, expected) in [(None, true), (Some("on"), true), (Some("auto"), true), (Some("off"), false)] {
                 let mut request = args(dir.path(), 4, false);
                 request.checkpoint_model_id = Some(alias.into());
                 request.speculator = "dflash2".into();

@@ -1,5 +1,5 @@
-//! Inkling 2 `cuteafd plan --layout` over the shared contract planner (#1930
-//! stage 1). Facts come from the one gatherer serving startup also calls
+//! Inkling 2 `cuteafd plan --layout` over the shared contract planner.
+//! Facts come from the one gatherer serving startup also calls
 //! ([`crate::families::inkling2::admission::gather`]); the planned edge
 //! differs only in its coordinator baseline. This module renders the solve.
 use super::{ExpertStorage, Model};
@@ -59,8 +59,8 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
         }
     };
     report.attention_placement = attention;
-    // The program manifest is optional in stage 1: no Inkling 2 program is
-    // installed yet, so the loaded-code allowance uses the shared estimate.
+    // Header-only planning may use the shared loaded-code estimate; an
+    // installed manifest supplies exact program workspace requirements.
     let manifest_path = opts.workspace_manifest.clone().or_else(|| {
         let path = std::path::PathBuf::from("/opt/cuteafd/share/PROGRAMS.json");
         path.is_file().then_some(path) });

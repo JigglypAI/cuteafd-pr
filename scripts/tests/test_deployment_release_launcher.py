@@ -288,6 +288,17 @@ def test_deployment_preserves_release_container_commands(
             else:
                 position = command.index("--coordinator-weight-budget-gib")
             before["command"][position:position] = ["--coordinator-weight-budget-gib", budget]
+        if old["host"] == "coordinator" and entry["family"] == "mimo_v2" and "--draft" in after["command"]:
+            # Rust now emits the same default FP8 choice for every MiMo alias.
+            # Its position moves from family_args to draft_args; no KV/owner key changes.
+            position = after["command"].index("--draft-fp8")
+            assert after["command"].count("--draft-fp8") == 1
+            assert after["command"][position + 1] == "true"
+            del after["command"][position:position + 2]
+            if "--draft-fp8" in before["command"]:
+                position = before["command"].index("--draft-fp8")
+                assert before["command"][position + 1] == "true"
+                del before["command"][position:position + 2]
         fingerprint = "CUTEAFD_RELEASE_CONFIG_SHA256"
         if entry["family"] == "deepseek_v41" and fingerprint in before["env"]:
             assert after["env"][fingerprint] != before["env"][fingerprint], (entry["name"], old["host"])

@@ -735,7 +735,7 @@ def test_named_step5_refusal_cases_are_not_full_tier_exclusions():
     assert not any('local_without_bf16_tail_export' in name or 'spark_count_one' in name
                    or 'spark_count_three' in name or 'spark_count_eight' in name
                    for name in gate.FULL_TESTS)
-    assert 'plan::families::step5::tests::native_prefill_refuses_every_unqualified_spark_count' in gate.FULL_TESTS
+    assert 'plan::families::step5::tests::native_prefill_refuses_missing_spark_packages' in gate.FULL_TESTS
     assert 'plan::families::step5::tests::nvfp4_min_card_admits_native_w4a4_and_bf16_root_stays_reference_only' in gate.FULL_TESTS
 
 

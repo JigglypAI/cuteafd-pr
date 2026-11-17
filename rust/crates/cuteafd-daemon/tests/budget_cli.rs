@@ -59,13 +59,13 @@ fn settings_query_rejects_shared_replay_before_placement() {
 }
 
 #[test]
-fn mimo_automatic_drafter_uses_official_identity_not_directory() {
+fn mimo_automatic_drafter_uses_contents_not_repository_identity() {
     let snapshot = tempfile::tempdir().unwrap();
     std::fs::write(snapshot.path().join("config.json"), r#"{"model_type":"mimo_v2"}"#).unwrap();
     for present in [false, true] {
         if present { std::fs::create_dir(snapshot.path().join("dflash")).unwrap(); }
-        for (id, expected) in [("XiaomiMiMo/MiMo-V2.6-Flash-MOPD", "dflash2"),
-            ("XiaomiMiMo/MiMo-V2.6-Pro-MOPD", "dflash2"), ("community/lookalike", "off")] {
+        for id in ["XiaomiMiMo/MiMo-V2.6-Flash-MOPD", "XiaomiMiMo/MiMo-V2.6-Pro-MOPD", "community/lookalike"] {
+            let expected = if present { "dflash2" } else { "off" };
             let output = test_command(env!("CARGO_BIN_EXE_cuteafd"))
                 .args(["plan", snapshot.path().to_str().unwrap(), "--resolve-settings-only", "--checkpoint-model-id", id])
                 .output().unwrap();

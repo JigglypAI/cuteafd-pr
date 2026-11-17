@@ -989,7 +989,7 @@ fn planner_rejects_all_whole_swa_before_serving_admission() {
         }).unwrap();
         assert!(!result.wip_launchable() && !result.native_serving_admitted);
         assert!(result.hints.iter().any(|hint| hint.what.contains(
-            "two-GPU execution requires head-split SWA with whole-owned CSA")),
+            "attention placement other than heads: SWA uses split heads and CSA uses whole owners")),
             "{:?}", result.hints);
     }
 }
@@ -1185,7 +1185,7 @@ fn spark_admission_is_scoped_to_qualified_native_layers() {
             }
             if kind == "nvfp4" {
                 let error = checkpoint_spark_recipe(&cp, 5, &[3]).unwrap_err();
-                assert!(format!("{error:#}").contains("NVFP4 is deprecated"));
+                assert!(format!("{error:#}").contains("missing Spark package recipe"));
             } else {
                 assert!(checkpoint_spark_recipe(&cp, 5, &[3]).is_ok());
             }

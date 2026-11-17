@@ -154,6 +154,24 @@ mod tests {
         }
     }
     #[test]
+    fn auto_towers_and_explicit_off_share_the_same_family_independent_candidates() {
+        use crate::plan::encoder::EncoderGpuBudget;
+        let hardware = EncoderHardware { v41: false,
+            gpus: vec![EncoderGpuBudget { free_bytes: 96 << 30, kv_target_bytes: 0 }], sparks: vec![] };
+        for kind in [StillTowerKind::Inkling2, StillTowerKind::MiniMax] {
+            let auto = StillEncoder::new(inventory(kind), MediaMode::Auto, 1, &hardware, 0).unwrap();
+            assert_eq!(auto.candidates[0].kind, EncoderKind::Rtx { gpu: 0 });
+            let off = StillEncoder::new(inventory(kind), MediaMode::Off, 1, &hardware, 0).unwrap();
+            assert_eq!(off.candidates.len(), 1);
+            assert_eq!(off.candidates[0].kind, EncoderKind::Off);
+            assert!(off.candidates[0].reason.contains("disabled"));
+        }
+        let absent = encoder::encoder_placement(MediaMode::Auto, &hardware, 0, 0, 1);
+        assert_eq!(absent.kind, EncoderKind::Off);
+        assert!(absent.reason.contains("no checkpoint tower"));
+    }
+
+    #[test]
     fn joint_solve_retries_rtx_when_spark_experts_leave_no_tower_room() {
         use crate::plan::encoder::{EncoderGpuBudget, EncoderSparkBudget};
         struct Prepared(Contract);

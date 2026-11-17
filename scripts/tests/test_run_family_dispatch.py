@@ -3560,7 +3560,7 @@ def test_expert_input_is_opt_in_and_mimo_only(tmp_path):
 
 
 @pytest.mark.parametrize("key", ["SPECULATOR_FP8"])
-@pytest.mark.parametrize("value, expected", [(None, None), ("", None), ("auto", None),
+@pytest.mark.parametrize("value, expected", [(None, "true"), ("", "true"), ("auto", "true"),
                                             ("on", "true"), ("off", "false")])
 def test_mimo_drafter_precision_preserves_auto_and_forwards_explicit_conversion(tmp_path, key, value, expected):
     config = {"model_type": "mimo_v2_flash", "num_hidden_layers": 2, "moe_layer_freq": [0, 1]}
@@ -4147,7 +4147,7 @@ def test_memory_keys_are_accepted_for_cleanup_and_native_launchers(tmp_path):
 
 @pytest.mark.parametrize("keys,expected", [
     ("", "fp8"), ("SPECULATOR=dflash2\n", "fp8"),
-    ("SPECULATOR_FP8=auto\n", "bf16"), ("SPECULATOR_FP8=off\n", "bf16"),
+    ("SPECULATOR_FP8=auto\n", "fp8"), ("SPECULATOR_FP8=off\n", "bf16"),
     ("SPECULATOR=off\n", "off"), ("SPECULATOR=mtp\n", "mtp"),
 ])
 @pytest.mark.parametrize("draft_kv", ["bf16", "fp8"])
