@@ -109,24 +109,12 @@ impl SparkRecipe {
     }
 }
 
-/// The named deprecation refusal when any package of `contract` (keys joined
-/// by " + ") is frozen and `world` is not one of its admitted worlds.
-pub fn frozen_refusal(contract: &str, world: usize) -> Option<SparkRecipeRefusal> {
-    contract.split(" + ").find_map(|key| {
-        let (family, format) = key.split_once(':')?;
-        let worlds = cuteafd_core::tp_units::frozen_admitted_worlds(family, format)?;
-        (!worlds.contains(&world)).then(|| SparkRecipeRefusal::Deprecated { package: key.into(), world, worlds })
-    })
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum SparkRecipeRefusal {
     #[error("geometry-invalid: intermediate {intermediate} cannot give {world} ranks nonempty whole-{block} row slices")]
     GeometryInvalid { intermediate: usize, world: usize, block: usize },
     #[error("missing Spark package recipe: {package} TP{world}; export its balanced per-rank widths in package_exl3_aot.py (EXL3) or package_fp8_moe_aot.py (FP8/NVFP4), register spark_recipe, and include those layouts in the Spark image")]
     MissingPackage { package: String, world: usize },
-    #[error("NVFP4 is deprecated; Spark worlds {worlds:?}; requested {package} TP{world}")]
-    Deprecated { package: String, world: usize, worlds: Vec<usize> },
     #[error("unknown Spark package recipe: {0}")]
     UnknownPackage(String),
     #[error("mixed Spark packages {package} require incompatible row ownership at TP{world}")]
@@ -240,9 +228,6 @@ pub fn spark_recipe(package: &str, intermediate: usize, world: usize) -> Result<
     let coverage = cuteafd_core::tp_units::spark_package_entry(&coverage_key);
     let worlds = coverage["worlds"].as_array().map(|values| values.iter()
         .filter_map(|value| value.as_u64().map(|value| value as usize)).collect::<Vec<_>>()).unwrap_or_default();
-    if coverage["deprecated"].as_bool() == Some(true) && !worlds.contains(&world) {
-        return Err(SparkRecipeRefusal::Deprecated { package: key.into(), world, worlds });
-    }
     let packaged_intermediate = coverage["intermediate"].as_u64().unwrap_or(0) as usize;
     let required = package_width_keys(intermediate, block, world, exl3, native, nvfp4 && !policy.exact_storage(world));
     let available = worlds.iter().flat_map(|&count|
@@ -506,44 +491,34 @@ mod tests {
             for world in [7, 8] {
                 let refusal = spark_recipe(package, 640, world).unwrap_err();
                 if package == "qwen4:nvfp4" {
-                    assert!(matches!(refusal, SparkRecipeRefusal::Deprecated { .. }));
+                    assert!(matches!(refusal, SparkRecipeRefusal::MissingPackage { .. }));
                 } else {
                     assert!(matches!(refusal, SparkRecipeRefusal::GeometryInvalid { .. }));
                 }
             }
             match package {
                 "qwen4:fp8" => assert!(spark_recipe(package, 640, 5).is_ok()),
-                "qwen4:nvfp4" => assert!(matches!(spark_recipe(package, 640, 5), Err(SparkRecipeRefusal::Deprecated { .. }))),
+                "qwen4:nvfp4" => assert!(matches!(spark_recipe(package, 640, 5), Err(SparkRecipeRefusal::MissingPackage { .. }))),
                 _ => assert!(matches!(spark_recipe(package, 640, 5), Err(SparkRecipeRefusal::MissingPackage { .. }))),
             }
         }
     }
 
-    /// Frozen NVFP4 admits only the worlds it shipped on, for every family,
-    /// with the named deprecation reason; Step NVFP4 shipped only 1 RTX + 4,
-    /// although its Spark package also covers TP6 (the BF16 tails' layout).
     #[test]
-    fn frozen_formats_refuse_every_world_they_did_not_ship_on() {
-        use cuteafd_core::tp_units::frozen_admitted_worlds;
-        for (family, admitted) in [("step5", vec![4]), ("glm", vec![2, 3, 4, 6]), ("glmf", vec![2, 3, 4, 5, 6]),
-            ("qwen4", vec![1, 2, 3, 4, 6]), ("v41", vec![2, 3, 4, 6])] {
-            assert_eq!(frozen_admitted_worlds(family, "nvfp4"), Some(admitted.clone()), "{family}");
-            assert_eq!(frozen_admitted_worlds(family, "nvfp4a4"), Some(admitted.clone()), "{family}");
-            for world in 1..=8 {
-                let refusal = frozen_refusal(&format!("{family}:nvfp4"), world);
-                assert_eq!(refusal.is_none(), admitted.contains(&world), "{family} TP{world}");
-                if let Some(refusal) = refusal {
-                    assert!(refusal.to_string().contains("NVFP4 is deprecated"));
-                }
+    fn deprecated_formats_admit_exported_widths_without_a_qualification_allowlist() {
+        for (family, intermediate) in [("step5", 1536), ("glm", 2048), ("glmf", 2048),
+            ("qwen4", 640), ("v41", 2304)] {
+            let package = format!("{family}:nvfp4");
+            for world in cuteafd_core::tp_units::spark_package_worlds(family, "nvfp4") {
+                assert!(spark_recipe(&package, intermediate, world).is_ok(), "{package} TP{world}");
             }
         }
-        assert!(spark_recipe("step5:nvfp4", 1536, 6).is_ok(), "the package still covers TP6");
-        assert!(frozen_refusal("step5:nvfp4", 6).is_some());
-        assert!(frozen_refusal("step5:bf16 + step5:nvfp4", 6).is_some());
-        for package in ["step5:fp8", "step5:bf16", "glm:exl3-k45", "v41:mxfp4"] {
-            assert!(frozen_refusal(package, 6).is_none(), "{package}");
-            let (family, format) = package.split_once(':').unwrap();
-            assert!(frozen_admitted_worlds(family, format).is_none());
+        assert!(spark_recipe("step5:nvfp4", 1536, 6).is_ok());
+        assert!(spark_recipe("step5:bf16 + step5:nvfp4", 1536, 6).is_ok());
+        for (package, intermediate, world) in [("step5:nvfp4", 1536, 5),
+            ("qwen4:nvfp4", 640, 5), ("glmf:nvfp4", 2048, 7)] {
+            assert!(matches!(spark_recipe(package, intermediate, world),
+                Err(SparkRecipeRefusal::MissingPackage { .. })), "{package} TP{world}");
         }
     }
 

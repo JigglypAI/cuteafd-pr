@@ -1883,7 +1883,7 @@ fn fp8_tp5_uses_width_recipe_but_still_requires_memory() {
     assert!(!small.fits, "{:?}", small.hints);
     assert!(small.hints.iter().any(|hint| hint.what.contains("budget") || hint.what.contains("memory")), "{:?}", small.hints);
     assert!(matches!(crate::plan::experts::spark_recipe("step5:nvfp4",1536,5),
-        Err(crate::plan::experts::SparkRecipeRefusal::Deprecated { .. })));
+        Err(crate::plan::experts::SparkRecipeRefusal::MissingPackage { .. })));
 }
 
 fn native_outputs_snapshot() -> tempfile::TempDir {

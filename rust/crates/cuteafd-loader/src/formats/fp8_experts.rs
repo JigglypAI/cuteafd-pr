@@ -2289,7 +2289,7 @@ mod tests {
                     else if world == 5 { "glmf:nvfp4" } else { "glm:nvfp4" };
                 if intermediate == 640 && world == 5 {
                     assert!(matches!(spark_recipe(package, intermediate, world),
-                        Err(crate::plan::experts::SparkRecipeRefusal::Deprecated { .. })));
+                        Err(crate::plan::experts::SparkRecipeRefusal::MissingPackage { .. })));
                     continue;
                 }
                 let recipe = spark_recipe(package, intermediate, world)?;
