@@ -67,9 +67,7 @@ pub struct KimiDraftQualification<'a> {
 
 impl KimiDraftQualification<'_> {
     pub fn qualified(self) -> bool {
-        self.content_qualified && matches!(self.core_view, "original" | "k6-compact")
-            && matches!(self.rtx, 1 | 2) && self.target_kv == "fp8"
-            && matches!(self.draft_kv, "bf16" | "fp8")
+        self.content_qualified
     }
 }
 
@@ -78,7 +76,7 @@ pub fn kimi_speculator(explicit:Option<&str>,configured:Option<&str>, qualificat
     let resolved=selected(explicit.filter(|v|!v.is_empty() && *v!="auto").map(str::to_owned),
         configured.filter(|_|explicit.is_none()).filter(|v|!v.is_empty() && *v!="auto").map(str::to_owned),
         if qualification.qualified() { "dspark" } else { "off" }.into(),
-        "DSpark for qualified K3.1 MC original/K6 on one or two coordinators; off otherwise");
+        "DSpark for paired K3.1 target/drafter content in every view and layout; off otherwise");
     if !matches!(resolved.value.as_str(),"off"|"dflash2"|"dspark") {
         return Err(KimiSpeculatorError(resolved.value));
     }
@@ -103,21 +101,20 @@ pub fn mimo_mtp_depth(explicit: Option<usize>, configured: Option<usize>, mtp: b
 mod tests {
     use super::*;
     #[test]
-    fn kimi_defaults_only_cover_qualified_identity_view_layout_and_kv() {
+    fn kimi_defaults_follow_content_pairing_not_view_layout_or_kv() {
         let qualified = KimiDraftQualification { content_qualified: true, core_view: "original", rtx: 2,
             target_kv: "fp8", draft_kv: "bf16" };
         assert_eq!(kimi_speculator(None, None, qualified).unwrap().value, "dspark");
         assert_eq!(kimi_speculator(Some("auto"), Some("off"), qualified).unwrap().value, "dspark");
         assert_eq!(kimi_speculator(Some("off"), None, qualified).unwrap().value, "off");
         assert_eq!(kimi_speculator(None, Some("off"), qualified).unwrap().value, "off");
-        for view in ["original", "k6-compact"] { for rtx in [1, 2] { for kv in ["bf16", "fp8"] {
-            assert_eq!(kimi_speculator(None, None, KimiDraftQualification {
-                core_view: view, rtx, draft_kv: kv, ..qualified }).unwrap().value, "dspark");
-        } } }
-        for other in [KimiDraftQualification { content_qualified: false, ..qualified },
-            KimiDraftQualification { core_view: "k8-compact", ..qualified },
-            KimiDraftQualification { rtx: 3, ..qualified },
-            KimiDraftQualification { target_kv: "bf16", ..qualified }] {
+        for view in ["original", "k6-compact", "k8-compact", "fp8-compact"] { for rtx in [1, 2, 3] {
+            for target_kv in ["bf16", "fp8"] { for draft_kv in ["bf16", "fp8"] {
+                assert_eq!(kimi_speculator(None, None, KimiDraftQualification {
+                    core_view: view, rtx, target_kv, draft_kv, ..qualified }).unwrap().value, "dspark");
+            } }
+        } }
+        for other in [KimiDraftQualification { content_qualified: false, ..qualified }] {
             assert_eq!(kimi_speculator(None, None, other).unwrap().value, "off");
             assert_eq!(kimi_speculator(Some("dspark"), None, other).unwrap().value, "dspark");
         }

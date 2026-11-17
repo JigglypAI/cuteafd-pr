@@ -240,7 +240,7 @@ fn resolve_settings(args: &mut PlanArgs, family: &str, cfg: &std::collections::B
         let native_default = args.speculator == "dspark" && kimi_qualification(args, cfg).qualified();
         let fp8 = defaults::selected(args.draft_fp8, None,
             args.speculator == "dflash2" || native_default,
-            "FP8 for qualified K3.1 block DSpark and explicit Kimi DFlash2");
+            "FP8 for content-paired K3.1 block DSpark in every view and explicit Kimi DFlash2");
         args.draft_fp8 = Some(fp8.value);
         resolved.insert("draft_fp8".into(), setting(fp8));
     }
@@ -1656,7 +1656,7 @@ mod tests {
     #[test]
     fn kimi_mc_default_weight_precision_tracks_content_and_explicit_override() {
         use clap::Parser;
-        for tp in ["1", "2"] { for view in ["original", "k6-compact"] {
+        for tp in ["1", "2"] { for view in ["original", "k6-compact", "k8-compact", "fp8-compact"] {
             let crate::cli::Commands::Plan(mut request) = crate::cli::Cli::try_parse_from([
                 "cuteafd", "plan", "/renamed/local", "--rtx", tp, "--core-view", view
             ]).unwrap().command else { panic!("plan") };
