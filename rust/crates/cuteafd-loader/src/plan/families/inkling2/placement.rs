@@ -95,7 +95,8 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
             return empty(notes);
         }
     };
-    let request = FactsRequest { checkpoint: input.checkpoint(), catalog, cfg, kv_format: opts.inkling_kv, manifest_path: manifest_path.as_deref(),
+    let request = FactsRequest { vision: report.vision, vision_replicas: opts.vision_replicas,
+        media_cache_bytes: opts.media_cache_bytes, checkpoint: input.checkpoint(), catalog, cfg, kv_format: opts.inkling_kv, manifest_path: manifest_path.as_deref(),
         manifest, coordinator: Coordinator::Planned { cards: cards.clone() }, attention, spark_ranks: ranks,
         spark_bytes, prefill: shape, context_tokens: opts.context_tokens, pool_tokens: opts.pool_tokens, sequences,
         host, host_cache_bytes: opts.host_cache_bytes, prefix_entries: opts.prefix_entries("inkling2"),
@@ -110,8 +111,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
     if let LocalPackage::Missing(reason) = &inputs.local {
         notes.push(format!("Inkling 2 RTX onboarding unavailable: {reason}"));
     }
-    notes.push("Inkling 2 bundled dSpark drafter and ViT are declared recipe domains with their own arenas; this \
-        build has no executor for either, so the plan charges neither".into());
+    notes.push("Inkling bundled PE uses the shared packed Spark-first encoder owner; serving qualification remains separate".into());
     let routed = inputs.routed.len();
     let onboard = opts.resolve_onboard(routed).unwrap_or(Onboard::Auto);
     let solve_request = crate::placement::families::inkling2::request(inputs.context, opts.pool_tokens, onboard,
@@ -139,6 +139,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
         report.hints.retain(|hint| !hint.what.starts_with("Inkling 2 ")
             || !hint.what.ends_with(" execution is not implemented in this build"));
     }
+    report.encoder = inputs.vision.as_ref().and_then(|vision| vision.admitted(&admitted.solved));
     report.phase_ledger = Some(crate::plan::SolvedPhaseLedger::from(&admitted.solved));
     report.host_budget_bytes = inputs.host_prefix.quota_bytes;
     let placed = admitted.placement;
@@ -177,12 +178,15 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
     for rank in 0..ranks {
         let charge = inputs.spark[onboarded][rank];
         widest = widest.max(charge.experts);
+        let location = crate::placement::planner::Location { device: crate::placement::planner::Device::Spark(rank as u8),
+            domain: crate::placement::planner::Domain::Managed };
+        let items = match admitted.solved.items(location) {
+            Ok(items) => items,
+            Err(error) => { report.refuse_placement(format!("Inkling Spark ledger refused: {error}"),
+                "Provide complete admission owner facts."); return empty(notes); }
+        };
         devices.push(DeviceLayout { kind: DeviceKind::Spark, index: rank as u32, capacity_bytes: opts.spark_capacity(rank),
-            worker_budget_bytes: opts.spark_capacity(rank), kv_tokens: 0, items: vec![
-                Item::new(Category::Experts, "routed experts (header-exact intermediate slices)", &storage_note,
-                    charge.experts, Basis::Exact),
-                Item::new(Category::Workspace, "Spark rank I/O and execution owners", "", charge.owners,
-                    Basis::Formula)] });
+            worker_budget_bytes: opts.spark_capacity(rank), kv_tokens: 0, items });
     }
     report.spark_rank_share = if model.routed_bytes == 0 { 0.0 } else { widest as f64 / model.routed_bytes as f64 };
     if ranks > 0 {

@@ -773,6 +773,10 @@ impl Recipe for Step5Recipe<'_> {
             }
         }
         self.expert_components(&mut contract, onboard)?;
+        if let Some(vision) = &self.inputs.vision {
+            vision.extend(&mut contract.variables, &mut contract.components, self.maximum_pages)?;
+            vision.require_spark_worker(&contract.variables, &mut contract.requires);
+        }
         Ok(contract)
     }
 }

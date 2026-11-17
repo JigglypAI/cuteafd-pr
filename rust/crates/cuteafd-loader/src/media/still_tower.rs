@@ -4,7 +4,7 @@ use crate::{plan::Checkpoint, serving_capacity::WeightArenaLayout};
 use anyhow::{ensure, Context, Result};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum StillTowerKind { Kimi, MiniMax }
+pub enum StillTowerKind { Kimi, MiniMax, Inkling2, Step5 }
 
 #[derive(Clone, Debug)]
 pub struct StillTowerInventory {
@@ -16,6 +16,21 @@ pub struct StillTowerInventory {
 
 impl StillTowerInventory {
     pub fn from_checkpoint(checkpoint: &Checkpoint, max_output_rows: usize) -> Result<Self> {
+        if matches!(checkpoint.model_type(), Some("inkling2" | "step5_vl")) {
+            use super::perception_vision::{PerceptionGeometry, PerceptionKind};
+            let geometry = PerceptionGeometry::from_config(&checkpoint.config).map_err(anyhow::Error::msg)?;
+            let physical = geometry.resident_weights(checkpoint.tensors.iter().map(|t| &t.meta))
+                .map_err(anyhow::Error::msg)?;
+            let kind = match geometry.kind { PerceptionKind::Inkling2 => StillTowerKind::Inkling2,
+                PerceptionKind::Step5 => StillTowerKind::Step5 };
+            let regions = geometry.tensor_shapes().into_iter().map(|(name, shape)|
+                (name, shape.into_iter().product::<usize>() * 2));
+            let arena = WeightArenaLayout::new(if kind == StillTowerKind::Inkling2 { "inkling2/vision" }
+                else { "step5/vision" }, regions.chain([("rotary.inv_freq".into(), geometry.inv_freq().len()*4)]))?;
+            ensure!(arena.bytes() as u64 == physical, "PE packed arena differs from native inventory");
+            let scratch = geometry.scratch_bytes(u64::try_from(max_output_rows)?).map_err(anyhow::Error::msg)?;
+            return Ok(Self { kind, arena, scratch, max_output_rows });
+        }
         let tensors=checkpoint.tensors.iter().map(|tensor| &tensor.meta);
         let (kind,id,regions,constant_bytes,limit)=match checkpoint.model_type() {
             Some("kimi_k3"|"kimi_k31")=>{
@@ -49,11 +64,14 @@ impl StillTowerInventory {
 /// Mirror the production phase liveness in scratch_generic_tower, with every
 /// individually aligned request and the same peak union (not a payload sum).
 pub fn scratch_bytes(kind: StillTowerKind, rows: usize) -> Result<u64> {
-    let limit=match kind {StillTowerKind::Kimi=>16698,StillTowerKind::MiniMax=>576};
+    ensure!(!matches!(kind, StillTowerKind::Inkling2 | StillTowerKind::Step5),
+        "PE scratch requires checkpoint-native PerceptionGeometry");
+    let limit=match kind {StillTowerKind::Kimi=>16698,StillTowerKind::MiniMax=>576,_=>unreachable!()};
     ensure!((1..=limit).contains(&rows),"still tower scratch capacity outside native range");
     let (hidden,attention,heads,intermediate,rotated,temporal,output,projector_hidden)=match kind {
         StillTowerKind::Kimi=>(1024u64,1536u64,12u64,4096u64,128u64,1u64,7168u64,4096u64),
         StillTowerKind::MiniMax=>(1280,1280,16,5120,78,2,6144,6144),
+        _=>unreachable!(),
     };
     let units=u64::try_from(rows)?;
     let n=units.checked_mul(4).context("tower patch extent overflow")?;
@@ -84,6 +102,32 @@ pub fn scratch_bytes(kind: StillTowerKind, rows: usize) -> Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn pe_checkpoint_inventory_matches_native_arena_and_scratch() -> Result<()> {
+        use crate::media::perception_vision::PerceptionGeometry;
+        use crate::plan::testing::{t, write_snapshot};
+        let inkling: serde_json::Value = serde_json::from_str(include_str!("../families/inkling2/fixtures/config.json"))?;
+        let step: serde_json::Value = serde_json::from_str(include_str!("../plan/families/step5/fixtures/official-nvfp4-config.json"))?;
+        for (config, kind, expected) in [(inkling, StillTowerKind::Inkling2, 655_386_688),
+            (step, StillTowerKind::Step5, 3_962_029_664)] {
+            let geometry = PerceptionGeometry::from_config(&config).map_err(anyhow::Error::msg)?;
+            let tensors = geometry.tensor_shapes().into_iter().map(|(name, shape)| t(name, "BF16", &shape)).collect::<Vec<_>>();
+            let root = tempfile::tempdir()?;
+            write_snapshot(root.path(), &config, &tensors, None);
+            let checkpoint = Checkpoint::open(root.path())?;
+            let inventory = StillTowerInventory::from_checkpoint(&checkpoint, 4096)?;
+            assert_eq!(inventory.kind, kind);
+            assert_eq!(inventory.arena.bytes() as u64, expected);
+            assert_eq!(inventory.scratch, geometry.scratch_bytes(4096).map_err(anyhow::Error::msg)?);
+            assert_eq!(inventory.arena.views().len(), tensors.len()+1);
+            for (name, offset) in &inventory.arena.views() {
+                assert_eq!(offset.offset() % 256, 0, "{name}");
+            }
+            assert!(StillTowerInventory::from_checkpoint(&checkpoint, 4097).is_err());
+        }
+        Ok(())
+    }
+
     #[test]
     fn phase_scratch_matches_native_capacity_receipts() {
         assert_eq!(scratch_bytes(StillTowerKind::Kimi,16698).unwrap(),1_538_887_936);
