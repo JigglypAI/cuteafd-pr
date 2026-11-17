@@ -303,7 +303,9 @@ mod tests {
             resident as u64 + spec.constants[0].bytes.len() as u64,
             spec.native.weight_bytes
         );
-        assert!(TowerSpec::from_snapshot(directory.path(), MAX_IMAGE_TOKENS).is_err());
+        let registered = TowerSpec::from_snapshot(directory.path(), MAX_IMAGE_TOKENS).unwrap();
+        assert_eq!(registered.native.weight_bytes, spec.native.weight_bytes);
+        assert_eq!(registered.image_family(), cuteafd_loader::media::ImageFamily::MiniMax);
     }
 
     #[test]
