@@ -4,6 +4,7 @@
 mod glm_flash;
 mod muse;
 mod perception;
+mod minimax;
 mod constants;
 pub(crate) use constants::ConstantRegion;
 mod read_transform;
