@@ -589,7 +589,7 @@ mod tests {
         }).collect::<Vec<_>>();
         let response = respond(Running { chunks: Box::pin(futures::stream::iter(chunks)),
             failure: Default::default(), image_tokens: 0, audio_tokens: 0,
-            prefix_cache_source: Default::default(), finish_detail: Default::default(),
+            prefix_cache_source: Default::default(), finish_detail: Default::default(), usage: None,
             tap: Default::default(), streaming: true, include_usage: false, id: "test".into(), model: MODEL.into(),
         }).await;
         let bytes = to_bytes(response.into_body(), 1 << 20).await.unwrap();

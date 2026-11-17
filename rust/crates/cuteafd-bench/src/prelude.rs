@@ -41,8 +41,8 @@ pub(crate) fn run(client: &Client, tokens: u64) -> Result<Value> {
                 .with_context(|| format!("untimed prelude round {} {content}", round + 1))?;
             let after = counters(client);
             let console_after = client.decode_counters();
-            let cycles = console_before.as_ref().zip(console_after.as_ref()).and_then(|(a,b)|
-                Some(b["verification_rounds"].as_u64()?.saturating_sub(a["verification_rounds"].as_u64()?)));
+            let cycles = chat.usage["speculation"]["cycles"].as_u64().or_else(|| console_before.as_ref().zip(console_after.as_ref()).and_then(|(a,b)|
+                Some(b["verification_rounds"].as_u64()?.saturating_sub(a["verification_rounds"].as_u64()?))));
             let width = console_before.as_ref().zip(console_after.as_ref()).and_then(|(a,b)| {
                 let passes = b["draft_verify_passes"].as_f64()? - a["draft_verify_passes"].as_f64()?;
                 let rows = b["verified_drafts"].as_f64()? - a["verified_drafts"].as_f64()?;

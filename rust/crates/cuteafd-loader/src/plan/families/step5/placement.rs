@@ -192,7 +192,7 @@ pub(super) fn layout(
         unit: checked_rows,
         sequences,
         context, serving_context: crate::placement::planner::Context::resolve(context, (opts.context_tokens > 0).then_some(opts.context_tokens)),
-        requested_pool: opts.pool_tokens,
+        requested_pool: opts.pool_tokens, target_pool: opts.target_pool_tokens,
         marks: MarkRule {
             lanes: sequences,
             entries: usize::try_from(opts.prefix_entries("step5"))?,

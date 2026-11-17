@@ -105,7 +105,8 @@ pub(crate) fn prepare<'a>(library: &'a NativeLibrary, programs: &'a Programs<'a>
         HostBudget::Auto => None, HostBudget::Bytes(bytes) => Some(bytes),
     };
     let manifest = Arc::new(serde_json::from_slice(&std::fs::read(options.manifest)?)?);
-    let request = FactsRequest { vision: options.vision.vision, vision_replicas: options.vision.vision_replicas,
+    let request = FactsRequest { target_pool_tokens: None, vision: options.vision.vision,
+        vision_replicas: options.vision.vision_replicas,
         media_cache_bytes: options.vision.media_cache_bytes.map(|bytes| bytes.0 as u64), kv_format: options.kv_format, checkpoint, catalog: &catalog, cfg, manifest_path: Some(options.manifest), manifest: Some(manifest),
         coordinator: Coordinator::Measured { samples, loaded_code: vec![0] }, attention: AttentionPlacement::Heads,
         spark_ranks: options.peers.len(), spark_bytes: cuteafd_loader::serving_capacity::spark_memory::runtime_bytes(&options.peers.iter().map(ToString::to_string).collect::<Vec<_>>())?.into_iter().max().unwrap_or(0),

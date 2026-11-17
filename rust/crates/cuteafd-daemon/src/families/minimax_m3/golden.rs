@@ -365,7 +365,7 @@ fn run_split(args: GoldenArgs, view: CheckpointView, checkpoint: Checkpoint,
     let manifest: Arc<serde_json::Value> = Arc::new(serde_json::from_slice(&std::fs::read(&args.manifest)?)?);
     let catalog = cuteafd_loader::read_expert_catalog_view(&view)?;
     let host = cuteafd_loader::formats::mapped_preload::host_memory_before_process()?;
-    let fact_request = |coordinator| FactsRequest { vision: cuteafd_loader::plan::MediaMode::Off, vision_replicas: 1, media_cache_bytes: None, spark_rank_bytes: Vec::new(), checkpoint: &checkpoint, cfg: &cfg, catalog: &catalog,
+    let fact_request = |coordinator| FactsRequest { target_pool_tokens: None, vision: cuteafd_loader::plan::MediaMode::Off, vision_replicas: 1, media_cache_bytes: None, spark_rank_bytes: Vec::new(), checkpoint: &checkpoint, cfg: &cfg, catalog: &catalog,
         manifest_path: &args.manifest, manifest: Arc::clone(&manifest), coordinator,
         attention: Some(attention), split_wire: Some(wire), physical_devices: &devices,
         spark_ranks: args.peers.len(), spark_bytes: 100 << 30,

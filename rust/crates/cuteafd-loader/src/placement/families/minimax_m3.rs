@@ -345,8 +345,8 @@ pub struct MiniMaxInputs {
     pub split_wire: Option<WirePrecision>,
     pub spark_ranks: usize,
     pub context: Context,
-    /// Largest pool the build indexes (KV max), in tokens.
-    pub maximum_pool_tokens: u64,
+    /// The resolved pool policy used for both curve preparation and admission.
+    pub pool: crate::placement::PoolPolicy,
     pub prefill: PrefillShape,
     /// Boot concurrency C: per-sequence page tables, lane members, selector.
     pub sequences: u64,
@@ -486,7 +486,7 @@ fn with(mut components: Vec<Component>, activation: &Activation) -> Vec<Componen
 }
 
 impl MiniMaxInputs {
-    pub fn maximum_pages(&self) -> u64 { self.maximum_pool_tokens.div_ceil(PAGE_ROWS) }
+    pub fn maximum_pages(&self) -> u64 { self.pool.maximum_tokens().div_ceil(PAGE_ROWS) }
 
     pub fn request_capacity(&self) -> Result<RequestCapacity, Refusal> {
         RequestCapacity::with_queries(self.sequences, self.prefill.rows,
@@ -569,7 +569,7 @@ impl MiniMaxInputs {
     pub fn counts(&self) -> Vec<usize> { (0..=self.routed.len()).collect() }
 
     pub fn admit(&self, request: Request) -> Result<AdmittedMiniMax, Refusal> {
-        let solved = solve(request, self.budgets.clone(), self)?;
+        let solved = solve_prepared(request, self.budgets.clone(), self, &self.pool)?;
         let placement = self.execution(&solved)?;
         let onboard = placement.onboard_layers;
         Ok(AdmittedMiniMax { placement, onboard, expert_backings: self.expert_backings[onboard].clone(),

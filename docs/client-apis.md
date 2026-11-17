@@ -30,6 +30,15 @@ them off with `--gateway off` (launchers: `GATEWAY=off`). Structured output
 passed; `json_object` works. `count_tokens` is exact (the checkpoint's
 tokenizer) for text turns.
 
+**Chat speculation usage.** When speculation proposes tokens, Chat Completions
+adds `usage.speculation = {request_id, proposed, accepted, cycles}`. The request
+id is the usage-history record's `rid`; all counters belong to that request,
+including at concurrency greater than one. Non-streamed JSON includes it in
+`usage`; streamed requests with `stream_options.include_usage=true` include it
+in the final usage-only chunk. It is absent when no drafts were proposed.
+Benchmark request records retain these counters and derive tokens/cycle from
+emitted decode tokens, without subtracting overlapping global counters.
+
 **Request capacity failures.** A request refused for decode-lane capacity or
 an attributable host-side decode validation failure is retryable: JSON returns
 HTTP 429 with `Retry-After: 1`. Chat errors carry `type: rate_limit_error`,

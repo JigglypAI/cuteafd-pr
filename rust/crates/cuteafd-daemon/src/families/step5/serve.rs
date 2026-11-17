@@ -336,7 +336,7 @@ fn with_backend<T>(args: &ServeArgs,
         spark_ranks: args.peers.len(), peer_access: ids.len() == 2 }, rows: usize::try_from(shape.span_rows)?,
         waves: usize::from(args.prefill_waves), unit: args.prefill_rows as usize,
         sequences: usize::from(args.max_sequences), context: args.max_context, serving_context,
-        requested_pool: args.pool_tokens,
+        requested_pool: args.pool_tokens, target_pool: None,
         marks: admission::prefix_marks(&args.prefix, usize::from(args.max_sequences)),
         peer_diagnostics: cuteafd_loader::serving_capacity::peer_wait_diagnostics(), pending_code,
         onboard: cuteafd_loader::plan::families::step5::admission::OnboardInputs::new(&catalog,
@@ -907,10 +907,10 @@ mod tests {
         args.validate()?;
         assert_eq!(args.max_context, 262_144);
         assert_eq!(args.pool_tokens, Some(args.max_context));
-        let policy = cuteafd_loader::placement::PoolPolicy::resolve(
-            &[96 << 30; 2], args.max_context, args.pool_tokens, 64);
+        let policy = cuteafd_loader::placement::prepare_pool(cuteafd_loader::placement::PoolFacts::new(
+            &[96 << 30; 2], args.max_context, args.pool_tokens, 64)).unwrap();
         policy.validate_explicit()?;
-        assert_eq!(policy.compiled_context, args.max_context);
+        assert_eq!(policy.compiled_context(), args.max_context);
         assert!(args.max_context >= 640 + u64::from(args.mtp));
         Ok(())
     }
@@ -956,7 +956,7 @@ mod tests {
             inventory: Inventory { gpus: vec![GpuBudget { capacity_bytes: capacity,
                 baseline: Baseline::Measured { free_bytes: capacity - arch.context_bytes },
                 reserve_bytes: 0 }; 2], spark_ranks: 6, peer_access: true },
-            rows: 256, waves: 1, unit: 0, sequences: 16, context: args.max_context, serving_context: cuteafd_loader::placement::planner::Context::pinned(args.max_context), requested_pool: None,
+            rows: 256, waves: 1, unit: 0, sequences: 16, context: args.max_context, serving_context: cuteafd_loader::placement::planner::Context::pinned(args.max_context), requested_pool: None, target_pool: None,
             marks: admission::prefix_marks(&args.prefix, 16), peer_diagnostics: false,
             pending_code: (0..2).map(|rank| placement::inventory::loaded_code_allowance(
                 "step5", &format.package_name(), true, rank, &arch, Some(&selected)).bytes).collect(),

@@ -57,7 +57,7 @@ mod tests {
             let placement = ProductionInput {
             blas: Vec::new(),
             expert_usage: false,
-                config: &config, gpus: ranks, context: 4096, maximum_pool_tokens: 8192,
+                config: &config, gpus: ranks, context: 4096, pool: cuteafd_loader::placement::prepare_pool(cuteafd_loader::placement::PoolFacts::new(&vec![1 << 40; ranks], 4096, Some(4096), 512)).unwrap(),
                 prefill, concurrency: 1, retained_turns: 0, replicated: false, spark_ranks: 4,
                 onboard_minimum: 0, onboard_counts: None,
                 experts: vec![ExpertCost { whole: Bytes2::default(), half: [Bytes2::default(); 2],
