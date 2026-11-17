@@ -519,3 +519,10 @@ def test_mc_fp8_lever_reports_measured_glm_and_step_quality_costs():
     assert "59.87/216.73/2740 to 68.98/266.95/2562" in text
     assert "0.04530/0.03880" in text and "0.01597/0.01429" in text
     assert "no paired non-inferiority claim" in text
+
+
+def test_kimi_accepts_existing_shared_draft_policy_key():
+    assert "DRAFT_POLICY" in family_keys("kimi_k3")
+    assert MATRIX["DRAFT_POLICY"]["Kimi K3"]
+    launcher = (ROOT / "scripts/launch/run-family.sh").read_text()
+    assert 'CUTEAFD_DRAFT_POLICY=$(get DRAFT_POLICY)' in launcher
