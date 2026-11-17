@@ -134,8 +134,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
         report.runtime = Some(crate::plan::RuntimeStatus::Serving);
         for component in &mut report.components {
             if component.status == crate::plan::Status::Planned && component.rejected == 0
-                && !matches!(component.component, crate::plan::spec::Component::Vision
-                    | crate::plan::spec::Component::Audio | crate::plan::spec::Component::Speculator) {
+                && !matches!(component.component, crate::plan::spec::Component::Audio | crate::plan::spec::Component::Speculator) {
                 component.status = crate::plan::Status::Ready;
             }
         }

@@ -185,15 +185,13 @@ pub(crate) fn load<'a>(library: &'a Arc<cuteafd_ffi::NativeLibrary>, programs: &
     let host_cache_bytes = match options.prefix.host_cache_bytes {
         HostBudget::Auto => None, HostBudget::Bytes(bytes) => Some(bytes),
     };
-    let media_checkpoint = if options.media.vision != cuteafd_loader::plan::MediaMode::Off {
-        Some(Checkpoint::open_view_for_role(view, "MiniMax still tower", |name|
-            cuteafd_loader::families::minimax_m3::vision::VisionContract::is_tensor(name))?)
-    } else { None };
-    let mut gathered_checkpoint = checkpoint.clone();
-    if let Some(media) = media_checkpoint { gathered_checkpoint.tensors.extend(media.tensors); }
+    let gathered_checkpoint = if options.media.vision != cuteafd_loader::plan::MediaMode::Off {
+        Some(Checkpoint::open_view_for_role(view, "MiniMax target and still tower", |name|
+            checkpoint.contains_tensor(name) || cuteafd_loader::families::minimax_m3::vision::VisionContract::is_tensor(name))?)
+    }else{None};
     let replies = cuteafd_core::spark_reply::requested();
     fp8::validate_reply_formats(catalog.fp8().context("MiniMax expert catalog")?.format(), replies)?;
-    let (inputs, admitted) = serve_admission::prepare(FactsRequest { vision: options.media.vision, vision_replicas: options.media.vision_replicas, media_cache_bytes: options.media.media_cache_bytes.map(|bytes|bytes.0 as u64), spark_rank_bytes: cuteafd_loader::serving_capacity::spark_memory::runtime_bytes(&options.peers.iter().map(ToString::to_string).collect::<Vec<_>>())?, checkpoint: &gathered_checkpoint, cfg,
+    let (inputs, admitted) = serve_admission::prepare(FactsRequest { vision: options.media.vision, vision_replicas: options.media.vision_replicas, media_cache_bytes: options.media.media_cache_bytes.map(|bytes|bytes.0 as u64), spark_rank_bytes: cuteafd_loader::serving_capacity::spark_memory::runtime_bytes(&options.peers.iter().map(ToString::to_string).collect::<Vec<_>>())?, checkpoint: gathered_checkpoint.as_ref().unwrap_or(checkpoint), cfg,
         catalog: &catalog, manifest_path: options.manifest_path, manifest: Arc::clone(&manifest),
         coordinator: Coordinator::Measured { samples: vec![], loaded_code: vec![] },
         attention: Some(options.attention_placement), split_wire: Some(options.split_wire), physical_devices: &physical,
