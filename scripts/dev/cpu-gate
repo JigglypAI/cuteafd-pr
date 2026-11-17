@@ -643,9 +643,10 @@ def validate_full_test_ids(source, root, args, env):
 
 
 def cargo(source, root, args, env):
-    env = compiler_cache_env(source, root, env)
+    run_id = uuid.uuid4().hex[:12]
+    env = compiler_cache_env(source, root / 'compiler-cache-runs' / run_id, env)
     mode = 'kache' if env.get('CUTEAFD_KACHE_ACTIVE') else 'plain'
-    target = root / f'target-cpu-gate-{mode}-{uuid.uuid4().hex[:12]}'
+    target = root / f'target-cpu-gate-{mode}-{run_id}'
     checked([sys.executable, str(source / 'scripts/build/assert-build-filesystem.py'), str(target)])
     env = {**env, 'CARGO_TARGET_DIR': str(target), 'CARGO_BUILD_JOBS': str(getattr(args, 'cargo_jobs', 16)),
            'RUST_TEST_THREADS': str(getattr(args, 'cargo_jobs', 16))}
@@ -783,9 +784,10 @@ def parse_nextest(report):
 
 def benches(source, root, args, env):
     """Release-mode bound checks: each bench passes only when its test ran and passed."""
-    env = compiler_cache_env(source, root, env)
+    run_id = uuid.uuid4().hex[:12]
+    env = compiler_cache_env(source, root / 'compiler-cache-runs' / run_id, env)
     mode = 'kache' if env.get('CUTEAFD_KACHE_ACTIVE') else 'plain'
-    target = root / f'target-cpu-gate-release-{mode}-{uuid.uuid4().hex[:12]}'
+    target = root / f'target-cpu-gate-release-{mode}-{run_id}'
     checked([sys.executable, str(source / 'scripts/build/assert-build-filesystem.py'), str(target)])
     env = {**env, 'CARGO_TARGET_DIR': str(target), 'CARGO_BUILD_JOBS': str(getattr(args, 'cargo_jobs', 16))}
     result = dict(suite='benches', passed=0, failed=0, failing=[], medians={}, logs=[], scrubbed_env=[])
