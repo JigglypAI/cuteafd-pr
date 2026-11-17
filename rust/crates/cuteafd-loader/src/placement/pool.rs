@@ -54,22 +54,19 @@ impl<'a> PoolFacts<'a> {
 }
 
 /// The only policy resolution entry point for plan and runtime preparation.
-pub fn prepare_pool(facts: PoolFacts<'_>) -> PoolPolicy {
-    let policy = MemoryPolicy::current();
-    let requested = PoolPolicy::normalize_request(facts.requested);
+pub fn prepare_pool(facts: PoolFacts<'_>) -> Result<PoolPolicy, cuteafd_core::memory_policy::PolicyError> {
+    let mut policy = MemoryPolicy::current();
+    policy.kv_target = facts.target.or(policy.kv_target);
     let smallest = facts.card_bytes.iter().copied().min().unwrap_or(u64::MAX);
-    let default = if smallest <= SMALL_CARD_BYTES { cuteafd_core::memory_policy::SMALL_CARD_KV_TARGET_TOKENS }
-        else { cuteafd_core::serving_capacity::DEFAULT_GPU_KV_TOKENS };
-    let target = facts.target.or(policy.kv_target).unwrap_or(default.max(facts.context.maximum))
-        .max(facts.context.required());
-    let minimum = policy.kv_min.unwrap_or(facts.context.maximum.min(AGENTIC_FLOOR_TOKENS).min(target));
-    PoolPolicy {
-        context: facts.context, compiled_context: facts.context.maximum, requested, target,
-        floor: requested.unwrap_or(minimum).max(facts.context.required()),
+    let bounds = policy.kv(smallest, facts.context.maximum)?;
+    let requested = PoolPolicy::normalize_request(facts.requested);
+    Ok(PoolPolicy {
+        context: facts.context, compiled_context: facts.context.maximum, requested,
+        target: bounds.target.max(facts.context.required()),
+        floor: requested.unwrap_or(bounds.min).max(facts.context.required()),
         ceiling: facts.encoding_limit.unwrap_or(u64::MAX),
-        max: requested.unwrap_or_else(|| policy.kv_max.unwrap_or(target).max(target)),
-        unit_rows: facts.unit_rows,
-    }
+        max: requested.unwrap_or(bounds.max), unit_rows: facts.unit_rows,
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
