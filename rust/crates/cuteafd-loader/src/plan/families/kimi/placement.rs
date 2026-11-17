@@ -465,9 +465,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
         context_buffers.query_row_bytes.saturating_add(context_buffers.partial_row_bytes)
     } else { 0 };
     let page_rows = if modes.iter().any(|mode| *mode == LayerMode::ContextSplit) { PAGE * 2 } else { PAGE };
-    let physical = opts.rtx_bytes[..gpus].iter().map(|&bytes| crate::placement::CoordinatorCard::planned(
-        bytes, opts.physical_sms).physical_bytes).collect::<Vec<_>>();
-    let mut facts = crate::placement::PoolFacts::new(&physical,
+    let mut facts = crate::placement::PoolFacts::new(&opts.rtx_bytes[..gpus],
         crate::placement::planner::Context::resolve(context, (opts.context_tokens > 0).then_some(opts.context_tokens)),
         requested_pool, page_rows);
     facts.target = opts.target_pool_tokens;

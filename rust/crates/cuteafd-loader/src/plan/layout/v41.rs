@@ -145,9 +145,7 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
         }
         Some(draft)
     } else { None };
-    let physical = options.rtx_bytes.iter().map(|&bytes| crate::placement::CoordinatorCard::planned(
-        bytes, options.physical_sms).physical_bytes).collect::<Vec<_>>();
-    let mut facts = crate::placement::PoolFacts::new(&physical,
+    let mut facts = crate::placement::PoolFacts::new(&options.rtx_bytes,
         crate::placement::planner::Context::resolve(shape.context_tokens,
             (options.context_tokens > 0).then_some(options.context_tokens)), options.pool_tokens, 512);
     facts.target = options.target_pool_tokens;

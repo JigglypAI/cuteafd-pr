@@ -1624,7 +1624,7 @@ mod tests {
             cuteafd_loader::serving_capacity::spark_memory::serving_bytes().into_iter().max().unwrap_or(0),
             cuteafd_loader::families::kimi_k3::spark::reserve_bytes(6, 2, rows as u64)?)?;
         let admitted = admission::admit(admission::Inputs { skip_routed_experts: false, expert_usage: false, cfg: &cfg, core: Default::default(),
-            resident_weight_limit: cuteafd_loader::placement::ResidentWeights::DEFAULT_LIMIT, cache_format: cuteafd_core::MlaCacheFormat::Bf16, physical_bytes: [96 << 30; 2], gpus: [GpuBudget {
+            resident_weight_limit: cuteafd_loader::placement::ResidentWeights::DEFAULT_LIMIT, cache_format: cuteafd_core::MlaCacheFormat::Bf16, gpus: [GpuBudget {
             capacity_bytes: 96 << 30, reserve_bytes: 2 << 30,
             baseline: cuteafd_loader::placement::Baseline::Measured { free_bytes: (96 << 30) - reserve } }; 2],
             devices: [0, 1], peer_access: true, spark_ranks: 6, attention: None, context: None, serving_context: cuteafd_loader::placement::planner::Context::pinned(1_048_576),

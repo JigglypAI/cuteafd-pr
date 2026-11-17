@@ -203,9 +203,12 @@ impl<'a> Step5Recipe<'a> {
         inputs.validate(cfg)?;
         ensure!(depth <= cfg.mtp, "Step-5 forecast predictor depth exceeds checkpoint");
         let gpus = inputs.inventory.gpus.len();
-        let capacities = inputs.physical_bytes.clone();
-        ensure!(capacities.len() == gpus && capacities.iter().all(|&bytes| bytes > 0),
-            "Step-5 physical card facts missing");
+        let capacities = inputs
+            .inventory
+            .gpus
+            .iter()
+            .map(|gpu| gpu.capacity_bytes)
+            .collect::<Vec<_>>();
         let mut facts = crate::placement::PoolFacts::new(
             &capacities, inputs.serving_context, inputs.requested_pool, PAGE_ROWS);
         facts.target = inputs.target_pool;

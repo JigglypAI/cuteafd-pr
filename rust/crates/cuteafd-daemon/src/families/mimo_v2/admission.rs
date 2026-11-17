@@ -364,10 +364,6 @@ fn preflight_shape(
         None => 0,
     };
     let (expert_costs, expert_workspace, tp2_workspace, expert_directory) = routed_costs(opened, args, layers, ranks)?;
-    let inventory = crate::shared::inventory::RuntimeInventory::measure(library, &devices,
-        crate::shared::inventory::InventoryPhase::PostLoad, |_| Ok(()))?;
-    let physical = inventory.gpus.iter().map(|sample| sample.physical_bytes
-        .context("fresh MiMo physical card sample")).collect::<Result<Vec<_>>>()?;
     let mut runtime = Vec::with_capacity(ranks);
     let mut memory = Vec::with_capacity(ranks);
     let mut post_kv_loading_additional = Vec::with_capacity(ranks);
@@ -505,7 +501,7 @@ fn preflight_shape(
     use cuteafd_loader::placement::families::mimo_v2::admission::{self as contract, ProductionInput};
     use cuteafd_loader::placement::planner::{Baseline, EmbeddingHome, Operation, Phase, PrefillShape};
     let pool = cuteafd_loader::placement::prepare_pool(cuteafd_loader::placement::PoolFacts::new(
-        &physical,
+        &memory.iter().map(|sample| sample.total_bytes).collect::<Vec<_>>(),
         serving_context, Some(args.pool_tokens as u64), spark_profiles.steady.pool_unit_rows));
     let policy = pool.capacity_policy(u32::try_from(concurrency)?);
     let report = reservation_report(&spark_profiles.steady, &memory, policy)?;

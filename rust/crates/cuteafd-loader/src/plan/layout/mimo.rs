@@ -547,10 +547,8 @@ fn apply_selected(input: &super::super::PlanInput, options: &LayoutOptions,
     let (experts, expert_workspace, tp2_workspace, onboard) = expert_costs(input, &cfg, options, ranks, spark_ranks, rows)?;
     let lanes = if options.prefill_lanes > 0 { options.prefill_lanes } else { prefill_shape(spark_ranks, None)?.waves } as usize;
     let kv = MimoKvFormats { full: options.mimo_full_kv, sliding: options.mimo_swa_kv };
-    let physical = options.rtx_bytes[..ranks].iter().map(|&bytes| crate::placement::CoordinatorCard::planned(
-        bytes, options.physical_sms).physical_bytes).collect::<Vec<_>>();
     let mut facts = crate::placement::PoolFacts::new(
-        &physical, crate::placement::planner::Context::resolve(context,
+        &options.rtx_bytes[..ranks], crate::placement::planner::Context::resolve(context,
             (options.context_tokens > 0).then_some(options.context_tokens)),
         options.pool_tokens, profiles.steady.pool_unit_rows);
     facts.target = options.target_pool_tokens;

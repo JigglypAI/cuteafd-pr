@@ -257,7 +257,6 @@ pub(super) fn admit_startup(
     catalog: &cuteafd_loader::OfficialV41Catalog,
     args: &crate::cli::NativeServeArgs,
     preweight_context: &[u64],
-    physical_bytes: &[u64],
 ) -> Result<Admitted> {
     use super::*;
     validate_owner_modes(args)?;
@@ -345,8 +344,8 @@ pub(super) fn admit_startup(
         memory.push(measured_pool_memory(lib)?);
     }
     lib.cuda_set_device(0)?;
-    let pool = resolve_with_cards(args, &memory, experts, workspace, &vec![0; ranks], usize::from(ranks == 2),
-        &fixed_demands, &weight_arenas, &startup, draft.as_ref(), preweight_context, physical_bytes)
+    let pool = resolve_with_owners(args, &memory, experts, workspace, &vec![0; ranks], usize::from(ranks == 2),
+        &fixed_demands, &weight_arenas, &startup, draft.as_ref(), preweight_context)
         .with_context(|| format!("V4.1 startup refused before weights: fixed owners {fixed}"))?;
     tracing::info!(fixed_owner_bytes=fixed, admitted_cache_bytes=?pool.cache_bytes,
         host_ledger=?pool.host_ledger, "V4.1 single allocation-owner startup admission before weight loads");
@@ -535,25 +534,6 @@ pub(super) fn resolve_with_owners(
     draft: Option<&families::deepseek_v41::DraftInventory>,
     preweight_context: &[u64],
 ) -> Result<Admitted> {
-    let physical = memory.iter().map(|&(_, total)| total as u64).collect::<Vec<_>>();
-    resolve_with_cards(args, memory, experts, workspace, deferred, minimum, owners,
-        weight_arenas, startup, draft, preweight_context, &physical)
-}
-
-fn resolve_with_cards(
-    args: &crate::cli::NativeServeArgs,
-    memory: &[(usize, usize)],
-    experts: Vec<ExpertCost>,
-    workspace: u64,
-    deferred: &[u64],
-    minimum: usize,
-    owners: &[Demand],
-    weight_arenas: &[cuteafd_loader::serving_capacity::WeightArenaLayout],
-    startup: &[Demand],
-    draft: Option<&families::deepseek_v41::DraftInventory>,
-    preweight_context: &[u64],
-    physical_bytes: &[u64],
-) -> Result<Admitted> {
     use families::deepseek_v41::admission::{
         self, live_budgets, production_request, Owner, ProductionInput,
     };
@@ -597,8 +577,7 @@ fn resolve_with_cards(
         if args.max_context_tokens == 0 { maximum } else { u64::from(args.max_context_tokens) },
         Some(u64::from(args.max_context_tokens)));
     let context = serving_context.maximum;
-    let totals = physical_bytes.to_vec();
-    ensure!(totals.len() == memory.len() && totals.iter().all(|&bytes| bytes > 0), "V4.1 physical card facts missing");
+    let totals = memory.iter().map(|&(_, total)| total as u64).collect::<Vec<_>>();
     let tails = args.concurrency as u64 + 2 * args.resolved_prefix_entries() as u64;
     let requested = if let Some(bytes) = args.kv_pool_size.filter(|_| args.pool_tokens.is_none()) {
         let groups = bytes.0 as u64 / (5 * 256 * 356);
