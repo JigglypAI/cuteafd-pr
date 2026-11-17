@@ -849,8 +849,13 @@ pub fn solve(
         .any(|location| matches!(location.device, Device::Coordinator(_))))
         .map(|budget| budget.logical_bytes).collect::<Vec<_>>();
     let requested = match request.pool { Pin::Auto => None, Pin::Exact(tokens) => Some(tokens) };
-    let pool = crate::placement::prepare_pool(crate::placement::PoolFacts::new(
-        &cards, request.context, requested, 1)).map_err(|error| Refusal::InvalidFact(error.to_string()))?;
+    // Generic solver fixtures declare their exact finite curve domain. Shipping
+    // family paths prepare their memory-bounded policy before building curves.
+    let contract = recipe.prepare(&request)?;
+    let mut facts = crate::placement::PoolFacts::new(&cards, request.context, requested, contract.page_rows);
+    facts.encoding_limit = contract.maximum_pages.checked_mul(contract.page_rows);
+    let pool = crate::placement::prepare_pool(facts)
+        .map_err(|error| Refusal::InvalidFact(error.to_string()))?;
     solve_prepared(request, budgets, recipe, &pool)
 }
 

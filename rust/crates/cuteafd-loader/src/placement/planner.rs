@@ -622,6 +622,8 @@ pub struct ResolvedPlan {
     pub phases: Vec<PhaseBudget>,
 }
 impl ResolvedPlan {
+    /// Exact stage-two extent after the target-sized layout fixes onboarding.
+    pub fn admitted_extent(&self) -> u64 { self.pool_tokens }
     pub fn served_context(&self) -> u64 { self.request.context.served(self.pool_tokens) }
 
     pub fn items(&self, location: Location) -> Result<Vec<Item>, Refusal> {
