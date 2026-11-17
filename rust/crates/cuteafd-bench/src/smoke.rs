@@ -53,6 +53,11 @@ pub struct SmokeArgs {
     /// Print the plan and exit.
     #[arg(long)]
     pub dry_run: bool,
+    /// Print the hardware lock set these entries would take, then exit without
+    /// launching anything. Under an enclosing `hwlock.py` hold this is the set
+    /// the hold must already cover.
+    #[arg(long)]
+    pub print_locks: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -538,6 +543,10 @@ impl Entry {
         }
     }
 
+    /// V4.1 runs with nothing else at once (one entry at a time, no parallel
+    /// neighbour). This is a scheduling rule inside a smoke run only: the
+    /// locks a launch takes come from its resolved GPUs and Spark hosts, so an
+    /// entry resolving GPU0 alone still locks only GPU0 (#2364).
     fn exclusive(&self) -> bool {
         self.exclusive.unwrap_or(self.family.as_deref() == Some("deepseek_v41"))
     }
@@ -761,25 +770,72 @@ mod fair {
 }
 
 /// Lock order: Spark pool, GPU0, GPU1, then the two out-of-pool hosts.
+///
+/// The set follows the entry's resolved layout only: every coordinator GPU it
+/// names, `sparks` when it attaches a pool host (ostrich/dodo/emu/kiwi), and
+/// rhea/moa when those out-of-pool hosts are used. `exclusive` never widens it
+/// (#2364). GPU0 no longer implies `sparks`: that dated from the launcher
+/// defaulting an unset SPARK_COUNT to every available Spark, and matrix entries
+/// and example configs now resolve the Spark count explicitly (a 0-Spark entry
+/// sets SPARK_COUNT=0). `wip_cards.serving_locks` in scripts/bench/wip-cards.py
+/// mirrors this; tests/fixtures/serving-locks.json is the shared parity table.
 fn locks_for(entry: &Entry) -> Vec<&'static str> {
     let gpus = entry.gpus.clone().unwrap_or_else(|| vec![0]);
+    let hosts = entry.sparks.clone().unwrap_or_default();
     let mut locks = Vec::new();
-    let pool = entry.sparks.as_ref().is_some_and(|hosts| hosts.iter().any(|h| matches!(h.as_str(), "ostrich" | "dodo" | "emu" | "kiwi")));
-    if gpus.contains(&0) || pool || entry.exclusive() {
+    if hosts.iter().any(|h| matches!(h.as_str(), "ostrich" | "dodo" | "emu" | "kiwi")) {
         locks.push("sparks.lock");
     }
-    if gpus.contains(&0) || entry.exclusive() {
-        locks.push("gpu0.lock");
-    }
-    if gpus.contains(&1) || entry.exclusive() {
-        locks.push("gpu1.lock");
+    for (gpu, lock) in [(0, "gpu0.lock"), (1, "gpu1.lock")] {
+        if gpus.contains(&gpu) {
+            locks.push(lock);
+        }
     }
     for (host, lock) in [("rhea", "rhea.lock"), ("moa", "moa.lock")] {
-        if entry.sparks.as_ref().is_some_and(|hosts| hosts.iter().any(|h| h == host)) {
+        if hosts.iter().any(|h| h == host) {
             locks.push(lock);
         }
     }
     locks
+}
+
+/// Canonical order of the serving locks a run takes (`locks_for`'s order).
+const SERVING_LOCK_ORDER: [&str; 5] = ["sparks.lock", "gpu0.lock", "gpu1.lock", "rhea.lock", "moa.lock"];
+
+/// The union of every entry's locks, in canonical order.
+fn run_locks(entries: &[Entry]) -> Vec<&'static str> {
+    let needed: std::collections::HashSet<&str> = entries.iter().flat_map(locks_for).collect();
+    SERVING_LOCK_ORDER.iter().copied().filter(|lock| needed.contains(lock)).collect()
+}
+
+/// `--print-locks` output: the run's set in `hwlock.py --locks` spelling.
+fn print_locks_line(entries: &[Entry]) -> String {
+    run_locks(entries).iter().map(|lock| lock.trim_end_matches(".lock")).collect::<Vec<_>>().join(",")
+}
+
+/// Locks `entries` need beyond an enclosing hwlock hold.
+fn uncovered_locks(entries: &[Entry], held: &[String]) -> Vec<&'static str> {
+    run_locks(entries).into_iter().filter(|lock| !held.iter().any(|h| h == lock)).collect()
+}
+
+/// A nested `hwlock.py` hold names its locks in CUTEAFD_HW_LOCKS_HELD. An inner
+/// ticket for a lock the hold does not cover queues behind tickets waiting on
+/// the outer hold itself and cannot be granted (#2364): fail at once instead.
+fn check_nested_holds(entries: &[Entry]) -> Result<()> {
+    let held: Vec<String> = std::env::var("CUTEAFD_HW_LOCKS_HELD").unwrap_or_default()
+        .split(',').filter(|s| !s.is_empty())
+        .map(|s| format!("{}.lock", s.trim_end_matches(".lock"))).collect();
+    if held.is_empty() {
+        return Ok(());
+    }
+    let missing = uncovered_locks(entries, &held);
+    if !missing.is_empty() {
+        let wanted: Vec<&str> = run_locks(entries).iter().map(|lock| lock.trim_end_matches(".lock")).collect();
+        bail!("nested hwlock: this run needs {missing:?} beyond CUTEAFD_HW_LOCKS_HELD={}; \
+               an inner ticket cannot be granted while the outer hold waits; \
+               rerun under `hwlock.py --locks {}`", held.join(","), wanted.join(","));
+    }
+    Ok(())
 }
 
 fn disjoint(a: &Entry, b: &Entry, base: &HashMap<String, String>) -> bool {
@@ -1045,6 +1101,11 @@ pub fn run(args: SmokeArgs) -> Result<()> {
         args.force || !done
     }).cloned().collect();
     eprintln!("{} entries, {} to run, build {build}, up to {} at once", entries.len(), pending.len(), args.parallel);
+    if args.print_locks {
+        println!("{}", print_locks_line(&pending));
+        return Ok(());
+    }
+    check_nested_holds(&pending)?;
     if args.dry_run {
         for e in &pending {
             eprintln!("  {} api_key_file={} family={} gpus={:?} sparks={:?} locks={:?} levels={:?} post_load_c1={} post_load_repeat={} prefill_lengths={:?} prefill_repeat={} prefill_idle_seconds={} prefill_purge={} sweep_tokens={} baseline={} window={} lossless_set={} lossless_dump={:?} lossless_concurrency={} context_lengths={:?} context_levels={:?} context_suffix={} panel_config={} fabric={} worker_stop={} set={:?}",
@@ -2390,22 +2451,61 @@ mod tests {
     }
 
     #[test]
-    fn pool_lock_narrowing_changes_only_gpu1_out_of_pool() {
+    fn locks_follow_the_resolved_layout_not_exclusive() {
         for gpus in [vec![0], vec![1], vec![0, 1]] {
             for hosts in [vec![], vec!["ostrich", "dodo", "emu", "kiwi"], vec!["rhea"], vec!["moa"], vec!["rhea", "moa"], vec!["ostrich", "rhea"]] {
-                for exclusive in [false, true] {
+                for exclusive in [None, Some(false), Some(true)] {
                     let mut e = entry("test", &gpus, &hosts, 8000);
-                    e.exclusive = Some(exclusive);
-                    let old_pool = gpus.contains(&0) || !hosts.is_empty() || exclusive;
-                    let new_pool = locks_for(&e).contains(&"sparks.lock");
-                    if old_pool != new_pool {
-                        assert_eq!(gpus, vec![1]);
-                        assert!(!exclusive && !hosts.is_empty());
-                        assert!(hosts.iter().all(|h| matches!(*h, "rhea" | "moa")));
+                    e.exclusive = exclusive;
+                    // exclusivity never widens (nor narrows) the lock set
+                    assert_eq!(locks_for(&e), locks_for(&{ let mut plain = e.clone(); plain.exclusive = None; plain }));
+                    let pool = hosts.iter().any(|h| matches!(*h, "ostrich" | "dodo" | "emu" | "kiwi"));
+                    assert_eq!(locks_for(&e).contains(&"sparks.lock"), pool, "{gpus:?} {hosts:?}");
+                    assert_eq!(locks_for(&e).contains(&"gpu0.lock"), gpus.contains(&0), "{gpus:?} {hosts:?}");
+                    assert_eq!(locks_for(&e).contains(&"gpu1.lock"), gpus.contains(&1), "{gpus:?} {hosts:?}");
+                    for host in ["rhea", "moa"] {
+                        let lock = if host == "rhea" { "rhea.lock" } else { "moa.lock" };
+                        assert_eq!(locks_for(&e).contains(&lock), hosts.contains(&host), "{gpus:?} {hosts:?}");
                     }
                 }
             }
         }
+    }
+
+    #[test]
+    fn lock_cases_match_the_shared_parity_fixture() {
+        // scripts/tests/test_wip_cards.py reads the same table for wip_cards.serving_locks.
+        let fixture: serde_json::Value = serde_json::from_str(include_str!("../tests/fixtures/serving-locks.json")).unwrap();
+        for case in fixture["cases"].as_array().unwrap() {
+            let e = Entry {
+                name: case["name"].as_str().unwrap().into(),
+                family: case["family"].as_str().map(str::to_string),
+                gpus: Some(case["gpus"].as_array().unwrap().iter().map(|g| g.as_u64().unwrap() as u32).collect()),
+                sparks: Some(case["sparks"].as_array().unwrap().iter().map(|h| h.as_str().unwrap().to_string()).collect()),
+                exclusive: case["exclusive"].as_bool(),
+                ..Entry::default()
+            };
+            let expected: Vec<String> = case["locks"].as_array().unwrap().iter().map(|l| l.as_str().unwrap().to_string()).collect();
+            assert_eq!(locks_for(&e), expected, "{}", case["name"]);
+            // A run's print-lock set is the union, in canonical order.
+            assert_eq!(run_locks(std::slice::from_ref(&e)), expected, "{}", case["name"]);
+            let names: Vec<&str> = expected.iter().map(|l| l.trim_end_matches(".lock")).collect();
+            assert_eq!(print_locks_line(std::slice::from_ref(&e)), names.join(","), "{}", case["name"]);
+        }
+    }
+
+    #[test]
+    fn a_nested_hold_must_cover_the_whole_lock_set() {
+        let entries = vec![entry("v41", &[0], &["ostrich", "dodo", "emu"], 8000)];
+        let held = |names: &[&str]| names.iter().map(|n| format!("{n}.lock")).collect::<Vec<_>>();
+        assert!(uncovered_locks(&entries, &held(&["sparks", "gpu0"])).is_empty());
+        assert!(uncovered_locks(&entries, &held(&["sparks", "gpu0", "gpu1"])).is_empty());
+        // A hold covering only part of the inner set is never queued.
+        assert_eq!(uncovered_locks(&entries, &held(&["sparks"])), vec!["gpu0.lock"]);
+        assert_eq!(uncovered_locks(&entries, &held(&["gpu0"])), vec!["sparks.lock"]);
+        let max = vec![entry("max", &[0, 1], &["ostrich", "rhea", "moa"], 8001)];
+        assert_eq!(uncovered_locks(&max, &held(&["sparks", "gpu0"])).len(), 3);
+        assert!(uncovered_locks(&max, &held(&["sparks", "gpu0", "gpu1", "rhea", "moa"])).is_empty());
     }
 
     #[test]
