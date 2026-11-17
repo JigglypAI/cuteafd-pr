@@ -935,7 +935,7 @@ pub fn solve_prepared(
         Pin::Auto => target.min(compiled),
         Pin::Exact(n) => n / page,
     };
-    if wanted < minimum || wanted > contract.maximum_pages {
+    if wanted < minimum || wanted > compiled {
         return Err(Refusal::InvalidPin("pool exceeds compiled extent"));
     }
     let exact = match request.onboard {

@@ -1682,6 +1682,8 @@ mod tests {
             FixedOwner { rank: rank as u8, category: Category::Runtime, group: "replayed max owners".into(),
                 bytes: bytes - 12 * per_layer, weights: 0, lifetime: Lifetime::RESIDENT, basis: Basis::Exact }).collect();
         toy_weight_owners(&mut recipe);
+        recipe.pool = crate::placement::prepare_pool(crate::placement::PoolFacts::new(
+            &[102 << 30; 2], recipe.context, Some(recipe.context), PAGE_ROWS));
         let request = request(recipe.context, Some(recipe.context), crate::placement::Onboard::Auto,
             recipe.prefill, Operation::Serving, ResidentWeights(u64::MAX), SparkReplyFormats::default());
         let started = std::time::Instant::now();
