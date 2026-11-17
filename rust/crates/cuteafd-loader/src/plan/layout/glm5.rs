@@ -134,7 +134,7 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
                 for rank in encoder.spark_ranks() {
                     ensure_tower_spark(&mut sparks, rank, options);
                     if let Some(device) = sparks.iter_mut().find(|device| device.index as usize == rank) {
-                        device.items.push(Item::new(Category::Weights, "vision tower", "", encoder.weights, Basis::Exact));
+                        device.items.push(Item::new(Category::Weights, crate::media::still_tower::vision_weight_arena_label(), "", encoder.weights, Basis::Exact));
                         device.items.push(Item::new(Category::Workspace, "vision scratch", "", encoder.scratch, Basis::Exact));
                     }
                 }
