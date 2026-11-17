@@ -1,5 +1,5 @@
 //! The officially bundled GLM 5.3 Flash tower; header-only until admission.
-use super::{axial_frequency, ConstantRegion, Result, TensorRead, TowerSpec, VisionError};
+use super::{ReadTransform,axial_frequency, ConstantRegion, Result, TensorRead, TowerSpec, VisionError};
 use cuteafd_core::DType;
 use cuteafd_ffi::vision::{VisionBlock, VisionSpec, NO_VISION_OFFSET};
 use std::{
@@ -92,7 +92,7 @@ impl TowerSpec {
                 path: path.clone(),
                 metadata: metadata.clone(),
                 destination,
-                vector,
+                transform: if vector {ReadTransform::Bf16ToF32}else{ReadTransform::Direct},
             });
             Ok(destination as u64)
         };

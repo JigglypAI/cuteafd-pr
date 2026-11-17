@@ -66,6 +66,7 @@ pub(super) fn check_prefix(full: &KimiK3Config, selected: &KimiK3Config) -> Resu
 /// page tables; global weights, token IO and state banks add their own demands.
 #[cfg_attr(test, derive(Clone))]
 pub(crate) struct Inputs<'a, const RANKS: usize = 2> {
+    pub vision: Option<(cuteafd_loader::media::still_tower::StillTowerInventory,cuteafd_loader::plan::MediaMode,usize,u64)>,
     pub skip_routed_experts: bool,
     pub expert_usage: bool,
     pub cfg: &'a KimiK3Config,
@@ -135,6 +136,8 @@ pub(crate) fn plan_rtx_for_ranks(cfg: &KimiK3Config, catalog: &cuteafd_loader::O
 }
 
 pub(crate) struct Admission<'a> {
+    pub vision: Option<cuteafd_loader::plan::encoder::EncoderPlacement>,
+    pub media_cache_bytes: u64,
     pub skip_routed_experts: bool,
     pub expert_usage: Option<cuteafd_core::expert_usage::Geometry>,
     pub placement: Placement,
@@ -271,7 +274,7 @@ impl<'a> Admission<'a> {
                     .map_err(|_|anyhow::anyhow!("block draft reader panicked"))?? };
             let draft=DsparkDrafter::load_with(device.library,programs,target_projection,snapshot,tensors,stream,
                 layout.capacity.context_slots,layout.capacity.max_batch_sequences,vec![0;layout.config.hidden*2],
-                GlmDraftRepresentation::Bf16Only,Fp8Scales::Amax,Fp8Rows::W8a16,layout.kv_cache,
+                layout.representation,Fp8Scales::Amax,Fp8Rows::W8a16,layout.kv_cache,
                 |physical,name,bytes| { ensure!(physical==device.id,"block draft physical arena changed"); arena.view(name,bytes) })?;
             draft.prepare_workspace()?;
             Ok(super::draft_common::CommonDraft::Block { draft,
@@ -295,7 +298,7 @@ impl<'a> Admission<'a> {
             }).collect::<Result<std::collections::BTreeMap<_,_>>>()?;
             let capacity=ranks[lead].capacity;
             let draft=DsparkDrafter::load_tp2_with(device.library,programs,projection,snapshot,
-                capacity.context_slots,capacity.max_batch_sequences,ranks[lead].kv_cache,
+                capacity.context_slots,capacity.max_batch_sequences,ranks[lead].kv_cache,ranks[lead].representation,
                 [physical[0],physical[1]],stream,lead,
                 |physical,name,bytes|arenas.get(&physical).context("paired block arena owner absent")?.view(name,bytes))?;
             Ok(super::draft_common::CommonDraft::Block { draft,
@@ -812,6 +815,7 @@ pub(crate) fn admit<'a, const RANKS: usize>(mut inputs: Inputs<'_, RANKS>) -> Re
     let context = inputs.context.clone();
     let prefix_args = inputs.prefix;
     let expert_usage = inputs.expert_usage;
+    let vision=inputs.vision.take();
     let mut request = request(inputs)?;
     if let Some(layout) = &draft {
         for demand in layout.window_mark_demands((RANKS-1) as u8)? {
@@ -852,7 +856,7 @@ pub(crate) fn admit<'a, const RANKS: usize>(mut inputs: Inputs<'_, RANKS>) -> Re
         } }
     }).collect::<Vec<_>>();
     let page_rows = if placement_mode == AttentionPlacement::Context { 128 } else { 64 };
-    let maximum_pages = request.pool.ceiling.div_ceil(page_rows);
+    let maximum_pages = request.pool.maximum_tokens().div_ceil(page_rows);
     let routed = request.layers.iter().enumerate().filter_map(|(layer, demand)| demand.experts.is_some().then_some(layer)).collect::<Vec<_>>();
     let counts = match request.onboard {
         Onboard::Auto => (0..=routed.len()).collect::<Vec<_>>(),
@@ -911,7 +915,7 @@ pub(crate) fn admit<'a, const RANKS: usize>(mut inputs: Inputs<'_, RANKS>) -> Re
             bytes: request.inventory.gpus[rank].capacity_bytes.saturating_sub(free_bytes), weights: 0,
             lifetime: contract::Lifetime::RESIDENT, basis: Basis::Exact });
     }
-    let mut recipe = KimiRecipe { expert_usage: kimi::usage_geometry(cfg, expert_usage), context: request.pool.compiled_context, gpus: RANKS,
+    let mut recipe = KimiRecipe { pool: request.pool, vision: None, expert_usage: kimi::usage_geometry(cfg, expert_usage), context: request.pool.compiled_context(), gpus: RANKS,
         placement: placement_mode, attention,
         prefill: contract::PrefillShape { rows: unit_rows as u64, waves: inputs_waves as u64 },
         lanes, spark_links: spark_ranks > 0, hop_spec: request.hops.clone(),
@@ -968,7 +972,7 @@ pub(crate) fn admit<'a, const RANKS: usize>(mut inputs: Inputs<'_, RANKS>) -> Re
         mark_store: cuteafd_engine::prefix::MarkStore::Arena,
         page_owners: if placement_mode == AttentionPlacement::Context { cuteafd_engine::prefix::PageOwners::Parity }
             else { Default::default() },
-    }, usize::try_from(request.pool.compiled_context)?, graph_slots)).transpose()?.flatten();
+    }, usize::try_from(request.pool.compiled_context())?, graph_slots)).transpose()?.flatten();
     recipe.owners.push(kimi::host_prefix_owner(host_prefix.as_ref().map_or(0, |config| config.bytes), maximum_pages));
     let rows = lane_layouts[0][0].rows();
     let scoring_bytes = kimi::host_scoring_bytes(rows.min(64), rows, cfg.vocab_size)?;
@@ -982,7 +986,14 @@ pub(crate) fn admit<'a, const RANKS: usize>(mut inputs: Inputs<'_, RANKS>) -> Re
     let mut host_budget = kimi::host_budget(host_total, host_available);
     host_budget.headroom = host_budget.headroom.max(prefix_args.map_or(0, |args| args.host_cache_headroom_bytes));
     budgets.push(host_budget);
-    let admitted = recipe.admit(kimi::request(request.pool.context, request.pool.requested, request.onboard,
+    if let Some((inventory,mode,copies,cache))=&vision {
+        let hardware=cuteafd_loader::plan::encoder::EncoderHardware {v41:false,
+            gpus:cards.iter().map(|(_,bytes)|cuteafd_loader::plan::encoder::EncoderGpuBudget {free_bytes:*bytes,kv_target_bytes:0}).collect(),
+            sparks:sparks.iter().enumerate().map(|(rank,&bytes)|cuteafd_loader::plan::encoder::EncoderSparkBudget {
+                rank,host:format!("spark{rank}"),idle:false,expert_bytes:0,free_bytes:bytes}).collect()};
+        recipe.vision=Some(cuteafd_loader::placement::still_encoder::StillEncoder::new(inventory.clone(),*mode,*copies,&hardware,*cache)?);
+    }
+    let admitted = recipe.admit(kimi::request(request.pool.context(), request.pool.requested(), request.onboard,
         recipe.prefill, contract::Operation::Serving, request.resident_weight_limit.unwrap_or(ResidentWeights::DEFAULT_LIMIT),
         cuteafd_core::spark_reply::requested()), budgets)?;
     tracing::info!(phases = ?admitted.solved.phases, "Kimi admitted per-phase physical ledger");
@@ -1030,7 +1041,9 @@ pub(crate) fn admit<'a, const RANKS: usize>(mut inputs: Inputs<'_, RANKS>) -> Re
     let lane_readers = vec![vec![Weak::new(); devices.len()]; lane_layouts.len()];
     let mla_layouts = (0..devices.len()).map(|rank| CacheLayout::for_ranks(cfg, &placement, rank, cache_format, devices.len()))
         .collect::<Result<Vec<_>>>()?;
-    let admission = Admission { receipt: admitted.solved, expert_usage: recipe.expert_usage.clone(), placement, host_prefix, mark_selection, graph_set, rtx, rtx_loaded: false, draft, draft_allocated: false, draft_marks_allocated: false, context, context_allocated: false, cfg: cfg.clone(), core, layouts, layer_owners, layer_uploaded, local_bound,
+    let vision=recipe.vision.as_ref().and_then(|v|v.admitted(&admitted.solved));
+    let media_cache_bytes=recipe.vision.as_ref().map_or(0,|v|v.media_cache);
+    let admission = Admission { vision,media_cache_bytes,receipt: admitted.solved, expert_usage: recipe.expert_usage.clone(), placement, host_prefix, mark_selection, graph_set, rtx, rtx_loaded: false, draft, draft_allocated: false, draft_marks_allocated: false, context, context_allocated: false, cfg: cfg.clone(), core, layouts, layer_owners, layer_uploaded, local_bound,
         skip_routed_experts, devices: devices.to_vec(), lanes, spark_ranks, waves: inputs_waves, unit_rows, lane_layouts, lane_allocated, lane_readers,
         kda_layout, kda_allocated: vec![false; devices.len()], kda_owners: vec![Weak::new(); devices.len()],
         mla_layouts, mla_allocated: vec![false; devices.len()], mla_owners: vec![Weak::new(); devices.len()],
@@ -1207,9 +1220,13 @@ fn request<const RANKS: usize>(mut i: Inputs<'_, RANKS>) -> Result<PlacementRequ
                 half: [Bytes2::default(); 2], tp2: false, whole_supported: true, spark_ok: true }),
             modes: if RANKS == 1 { vec![WHOLE] } else if mla { MODES.to_vec() } else { vec![LayerMode::HeadSplit] } });
     }
-    let mut pool = PoolPolicy::resolve(&i.gpus.map(|gpu| gpu.capacity_bytes), context as u64,
-        i.requested_pool, MLA_PAGE_ROWS as u64).with_context(i.serving_context);
-    pool.ceiling = pool.target.max(pool.requested.unwrap_or(0));
+    let cards = i.gpus.map(|gpu| gpu.capacity_bytes);
+    let mut facts = cuteafd_loader::placement::PoolFacts::new(i.serving_context, i.requested_pool, MLA_PAGE_ROWS as u64);
+    facts.memory = vec![cuteafd_loader::placement::PoolMemory {
+        available_bytes: cards.iter().sum(),
+        bytes_per_unit: cfg.mla_layers() as u64 * MLA_PAGE_ROWS as u64 * i.cache_format.record_bytes() as u64,
+    }];
+    let pool = cuteafd_loader::placement::prepare_pool(facts)?;
     Ok(PlacementRequest {
         resident_weight_limit: Some(i.resident_weight_limit), inventory: Inventory { gpus: i.gpus.to_vec(), spark_ranks: i.spark_ranks, peer_access: i.peer_access },
         attention_placement: i.attention, context_buffers: i.context.as_ref().map_or_else(ContextBuffers::default, |layout| layout.buffers()), layers_first_gpu: 0,
@@ -1458,9 +1475,7 @@ pub(super) mod tests {
                         let units = (low + high + 1) / 2;
                         let tokens = units * 64;
                         let mut trial = candidate.clone();
-                        trial.pool.compiled_context = 0;
-                        trial.pool.requested = Some(tokens); trial.pool.floor = tokens;
-                        trial.pool.target = tokens; trial.pool.ceiling = tokens; trial.pool.max = tokens;
+                        trial.pool = cuteafd_loader::placement::prepare_pool(cuteafd_loader::placement::PoolFacts::new(0, Some(tokens), 64)).unwrap();
                         if enabled {
                             let layout = draft.with_pool_tokens(pool_cap.map_or(tokens as usize, |cap| cap.min(tokens as usize)))?;
                             let (mut demand, peak) = layout.demands(1)?;
@@ -1496,7 +1511,7 @@ pub(super) mod tests {
     }
 
     fn inputs_for_ranks<const RANKS: usize>(cfg: &KimiK3Config) -> Inputs<'_, RANKS> {
-        Inputs { skip_routed_experts: false, expert_usage: false, cfg, resident_weight_limit: ResidentWeights::DEFAULT_LIMIT, core: Default::default(), cache_format: cuteafd_core::MlaCacheFormat::Bf16, gpus: [GpuBudget { capacity_bytes: 96 << 30, reserve_bytes: 2 << 30,
+        Inputs { vision: None, skip_routed_experts: false, expert_usage: false, cfg, resident_weight_limit: ResidentWeights::DEFAULT_LIMIT, core: Default::default(), cache_format: cuteafd_core::MlaCacheFormat::Bf16, gpus: [GpuBudget { capacity_bytes: 96 << 30, reserve_bytes: 2 << 30,
             baseline: Baseline::Measured { free_bytes: 96 << 30 } }; RANKS], devices: std::array::from_fn(|rank| rank as i32), peer_access: RANKS == 2, spark_ranks: 6,
             attention: (RANKS == 2).then_some(AttentionPlacement::Layers), context: None, serving_context: cuteafd_loader::placement::planner::Context::pinned(1 << 20), requested_pool: None, state_slots: 2, prefix_marks: 2, rows: 4096, lanes: 2, waves: 2, unit_rows: None,
             lane_layouts: vec![std::array::from_fn(|_| LaneLayout::for_ranks(
@@ -2054,20 +2069,40 @@ pub(super) mod tests {
     }
 
     #[test]
+    fn automatic_pool_ceiling_includes_max_but_explicit_requests_stay_strict() -> Result<()> {
+        use cuteafd_core::memory_policy::MemoryPolicy;
+        let cfg = cfg();
+        MemoryPolicy { kv_max: Some(100_000_000), ..Default::default() }.scoped(|| -> Result<()> {
+            let automatic = request(inputs(&cfg))?;
+            let derived = (192u64 << 30) / (cfg.mla_layers() as u64 * MLA_PAGE_ROWS as u64
+                * cuteafd_core::MlaCacheFormat::Bf16.record_bytes() as u64) * MLA_PAGE_ROWS as u64;
+            assert_eq!(automatic.pool.maximum_tokens(), 100_000_000.min(derived));
+            assert_eq!(automatic.pool.target(), 2 << 20);
+            assert_eq!(automatic.pool.compiled_context(), 1 << 20);
+            let mut pinned = inputs(&cfg);
+            pinned.requested_pool = Some(2 << 20);
+            let pinned = request(pinned)?;
+            assert_eq!(pinned.pool.maximum_tokens(), 2 << 20);
+            assert_eq!(pinned.pool.requested(), Some(2 << 20));
+            Ok(())
+        })
+    }
+
+    #[test]
     fn automatic_and_explicit_pools_preserve_compiled_context() -> Result<()> {
         let cfg = cfg();
         for requested in [None, Some(0), Some(262_144), Some(2 << 20)] {
             let mut i = inputs(&cfg);
             i.requested_pool = requested;
             let request = request(i)?;
-            assert_eq!(request.pool.target, 2 << 20);
-            assert_eq!(request.pool.floor, requested.filter(|&n| n > 0).unwrap_or(1 << 20).max(1 << 20));
+            assert_eq!(request.pool.target(), 2 << 20);
+            assert_eq!(request.pool.floor(), requested.filter(|&n| n > 0).unwrap_or(1 << 20).max(1 << 20));
             if requested.is_some_and(|n| n > 0 && n < 1 << 20) {
                 assert_eq!(solve(&request), Err(PlacementError::RequestedBelowContext {
                     requested: requested.unwrap(), floor: 1 << 20,
                 }));
             }
-            assert_eq!(request.pool.requested, requested.filter(|&n| n > 0));
+            assert_eq!(request.pool.requested(), requested.filter(|&n| n > 0));
         }
         let mut i = inputs(&cfg);
         let full = KimiK3Config::from_hf(&cuteafd_loader::plan::testing::kimi_k3_config())?;
@@ -2096,6 +2131,7 @@ pub(super) mod tests {
         let rows = unit * waves;
         let spark_bytes = 110 << 30;
         let options = PlanOptions {
+            vision: cuteafd_loader::plan::MediaMode::Off,
             placement: ExpertPlacement::Sparks { ranks: 6 }, coordinator_budget_bytes: capacity,
             layout: Some(LayoutOptions { host_memory: Some(cuteafd_loader::plan::testing::SimulatedHost::raptor().host_ram),
                 rtx_bytes: vec![capacity], head_split: false, concurrency: slots as u64,
@@ -2146,6 +2182,8 @@ pub(super) mod tests {
         let mut i = runtime_inputs()?;
         i.rtx = Some(rtx); i.spark_budget = Some(spark);
         let admitted = admit(i)?;
+        assert_eq!(report.phase_ledger.as_ref().context("Kimi planned policy")?.pool_policy,
+            admitted.receipt.pool_policy, "Kimi plan and runtime policy must be identical");
         let memory = report.memory_layout.context("single-owner installed ledger")?;
         assert_eq!(memory.pool_tokens, admitted.placement.pool_tokens);
         assert_eq!(admitted.devices, [0]);
@@ -2217,6 +2255,8 @@ pub(super) mod tests {
             ])?;
             let crate::cli::Commands::Plan(mut args) = cli.command else { panic!("plan command") };
             args.coordinator_weight_budget_gib = Some(cli.coordinator_weight_budget_gib.context("global cap")?);
+            args.vision = cli.vision.unwrap_or(args.vision);
+            args.audio = cli.audio.unwrap_or(args.audio);
             args.memory = cli.memory;
             let planned = crate::commands::plan::run_plan(args);
             let mut i = inputs(&cfg);
@@ -2266,6 +2306,7 @@ pub(super) mod tests {
         let spark_bytes = 115_964_116_992;
         use cuteafd_core::MlaCacheFormat;
         let automatic = plan_input.plan_spark_count(&PlanOptions {
+            vision: plan::MediaMode::Off,
             attention_placement: Some(AttentionPlacement::Layers),
             placement: ExpertPlacement::Sparks { ranks: 6 },
             layout: Some(LayoutOptions { host_memory: Some(cuteafd_loader::plan::testing::SimulatedHost::raptor().host_ram),
@@ -2318,7 +2359,7 @@ pub(super) mod tests {
             let mark_bytes = cfg.kda_layers() as u64 * (cfg.kda_state_bytes() + cfg.kda_conv_bytes());
             let marks = prefix_slots.unwrap_or_else(|| rule.slots(usize::try_from(mark_bytes).unwrap()) as u64);
             assert_eq!(marks, if entries == 0 { 0 } else if rule.host { 2 } else { 1 });
-            let options = PlanOptions { attention_placement: Some(AttentionPlacement::Layers), placement: ExpertPlacement::Sparks { ranks: 6 },
+            let options = PlanOptions { vision: plan::MediaMode::Off, attention_placement: Some(AttentionPlacement::Layers), placement: ExpertPlacement::Sparks { ranks: 6 },
                 layout: Some(LayoutOptions { host_memory: Some(cuteafd_loader::plan::testing::SimulatedHost::raptor().host_ram), rtx_bytes: vec![capacity; 2], prefill_rows: unit as u64, prefill_lanes: waves as u64,
                     concurrency: slots, state_slots: Some(slots), prefix_slots,
                     mimo_prefix_entries: entries as u64, mimo_prefix_mark_bytes: rule.budget_bytes,
@@ -2393,6 +2434,14 @@ pub(super) mod tests {
                             assert!(required > available, "{typed}"),
                         Refusal::PoolBelowContext { tokens, context: floor } =>
                             assert!(*tokens < *floor, "{typed}"),
+                        Refusal::PoolExceedsMemoryBound { requested, bound } => {
+                            assert_eq!(Some(*requested), requested_pool);
+                            let derived = 2 * capacity / (cfg.mla_layers() as u64 * 64
+                                * format.record_bytes() as u64) * 64;
+                            assert_eq!(*bound, derived);
+                            assert!(*requested > *bound, "{typed}");
+                            assert!(typed.to_string().contains(&format!("memory-derived bound of {bound} tokens")));
+                        }
                         _ => panic!("unexpected Kimi capacity refusal: {typed}"),
                     }
                     assert!(report.hints.iter().any(|hint| hint.what.contains(&typed.to_string())),
@@ -2402,6 +2451,8 @@ pub(super) mod tests {
                     continue;
                 }
             };
+            assert_eq!(report.phase_ledger.as_ref().context("TP2 Kimi planned policy")?.pool_policy,
+                admitted.receipt.pool_policy, "TP2 Kimi plan and serve policy must match");
             let memory = report.memory_layout.context("installed Kimi planner ledger")?;
             assert_eq!(memory.pool_tokens, admitted.placement.pool_tokens);
             assert_eq!(admitted.mark_selection.slots, marks);
@@ -2477,9 +2528,9 @@ pub(super) mod tests {
                     super::super::device::NativeScratch { kda: 1024, mla: [512, 0, 1024] }).unwrap()); i.lanes];
                 lane_bytes.push(i.lane_layouts[0][0].bytes()?);
                 let mut under = request(i)?;
-                assert_eq!(under.pool.compiled_context, context);
-                assert_eq!(under.pool.floor, context);
-                under.pool.requested = Some(context - 64);
+                assert_eq!(under.pool.compiled_context(), context);
+                assert_eq!(under.pool.floor(), context);
+                under.pool = cuteafd_loader::placement::prepare_pool(cuteafd_loader::placement::PoolFacts::new(under.pool.context(), Some(context - 64), 64)).unwrap();
                 assert_eq!(solve(&under), Err(PlacementError::RequestedBelowContext {
                     requested: context - 64, floor: context,
                 }));
@@ -2544,10 +2595,10 @@ pub(super) mod tests {
             i.lane_layouts = vec![std::array::from_fn(|_| LaneLayout::new(&cfg, i.rows, test_unit(i.rows, i.waves, i.unit_rows), cfg.max_position,
                 super::super::device::NativeScratch { kda: 1024, mla: [512, 0, 1024] }).unwrap()); i.lanes];
             let request = request(i)?;
-            assert_eq!(request.pool.floor, AGENTIC_FLOOR_TOKENS);
-            assert_eq!(request.pool.compiled_context, cfg.max_position as u64);
-            assert!(request.pool.target > request.pool.floor);
-            assert!(solve(&request)?.pool_tokens > request.pool.floor);
+            assert_eq!(request.pool.floor(), AGENTIC_FLOOR_TOKENS);
+            assert_eq!(request.pool.compiled_context(), cfg.max_position as u64);
+            assert!(request.pool.target() > request.pool.floor());
+            assert!(solve(&request)?.pool_tokens > request.pool.floor());
             let report = plan_input.plan(&PlanOptions {
                 attention_placement: Some(AttentionPlacement::Layers),
                 placement: ExpertPlacement::Sparks { ranks: 6 },
@@ -2571,7 +2622,9 @@ pub(super) mod tests {
         for layers in [1, 2, 4, 5, 12, 92, 93] {
             let selected = prefix(&full, layers)?;
             check_prefix(&full, &selected)?;
-            let admitted = admit(inputs(&selected))?;
+            let mut input = inputs(&selected);
+            input.requested_pool = Some(2 << 20);
+            let admitted = admit(input)?;
             assert_eq!(admitted.execution_plan()?.modes().len(), layers);
             assert_eq!(admitted.layouts.len(), layers);
             assert_eq!(admitted.cfg, selected);
@@ -2590,7 +2643,8 @@ pub(super) mod tests {
     #[test]
     fn owned_mla_charges_nonowner_ffn_and_exact_native_weights() -> Result<()> {
         let cfg = cfg();
-        let admitted = admit(inputs(&cfg))?;
+        let admitted = cuteafd_core::memory_policy::MemoryPolicy { kv_max: Some(2 << 20),
+            ..Default::default() }.scoped(|| admit(inputs(&cfg)))?;
         assert_eq!(admitted.placement.pool_tokens, 2 << 20);
         for (layer, owner) in [(1, 0), (3, 1)] {
             assert_eq!(admitted.placement.layers[layer].mode, LayerMode::Whole { gpu: owner, ffn: FfnMode::Split });
@@ -2679,23 +2733,25 @@ pub(super) mod tests {
 
     #[test]
     fn explicit_heads_preserves_ffns_and_replicates_mla_cache() -> Result<()> {
-        let cfg = cfg();
-        let owned = admit(inputs(&cfg))?;
-        let mut i = inputs(&cfg);
-        i.attention = Some(AttentionPlacement::Heads);
-        let heads = admit(i)?;
-        assert!(heads.placement.layers.iter().all(|layer| layer.mode == LayerMode::HeadSplit));
-        let records = |admitted: &Admission| admitted.placement.items.iter().flatten()
-            .filter(|item| item.group == "records").map(|item| item.bytes).sum::<u64>();
-        assert_eq!(records(&heads), 2 * records(&owned));
-        for rank in 0..2 {
-            for category in [Category::Kv, Category::Workspace, Category::Prefix] {
-                let state = |a: &Admission| a.placement.items[rank].iter().filter(|item|
-                    item.category == category && item.group.starts_with("Kimi")).map(|item| item.bytes).sum::<u64>();
-                assert_eq!(state(&heads), state(&owned));
+        cuteafd_core::memory_policy::MemoryPolicy { kv_max: Some(2 << 20), ..Default::default() }.scoped(|| {
+            let cfg = cfg();
+            let owned = admit(inputs(&cfg))?;
+            let mut i = inputs(&cfg);
+            i.attention = Some(AttentionPlacement::Heads);
+            let heads = admit(i)?;
+            assert!(heads.placement.layers.iter().all(|layer| layer.mode == LayerMode::HeadSplit));
+            let records = |admitted: &Admission| admitted.placement.items.iter().flatten()
+                .filter(|item| item.group == "records").map(|item| item.bytes).sum::<u64>();
+            assert_eq!(records(&heads), 2 * records(&owned));
+            for rank in 0..2 {
+                for category in [Category::Kv, Category::Workspace, Category::Prefix] {
+                    let state = |a: &Admission| a.placement.items[rank].iter().filter(|item|
+                        item.category == category && item.group.starts_with("Kimi")).map(|item| item.bytes).sum::<u64>();
+                    assert_eq!(state(&heads), state(&owned));
+                }
             }
-        }
-        Ok(())
+            Ok(())
+                })
     }
 
     #[test]
@@ -2725,51 +2781,53 @@ pub(super) mod tests {
 
     #[test]
     fn mla_cache_residency_and_pages_follow_accepted_core_views() -> Result<()> {
-        let cfg = cfg();
-        let owned = admit(inputs(&cfg))?;
-        let mut i = inputs(&cfg);
-        i.attention = Some(AttentionPlacement::Heads);
-        let heads = admit(i)?;
-        let tokens = owned.placement.pool_tokens as usize;
-        let pages = tokens / MLA_PAGE_ROWS;
-        let layer_bytes = tokens * MLA_RECORD_BYTES;
-        for rank in 0..2 {
-            let layout = owned.check_mla(rank, rank as i32)?;
-            assert_eq!(layout.bytes(), layer_bytes);
-            assert_eq!(heads.check_mla(rank, rank as i32)?.bytes(), 2 * layer_bytes);
-            for layer in 0..cfg.layers {
-                let resident = layer == 1 + 2 * rank;
-                assert_eq!(layout.page_range(layer, 0, 64).is_ok(), resident);
-                assert_eq!(heads.mla_layouts[rank].page_range(layer, 0, 64).is_ok(),
-                    cfg.attention[layer] == KimiAttention::Mla);
-                if !resident { continue; }
-                let mut next = 0;
-                for page in 0..pages {
-                    let (offset, bytes) = layout.page_range(layer, page, 64)?;
-                    assert_eq!(offset, next);
-                    next += bytes;
+        cuteafd_core::memory_policy::MemoryPolicy { kv_max: Some(2 << 20), ..Default::default() }.scoped(|| {
+            let cfg = cfg();
+            let owned = admit(inputs(&cfg))?;
+            let mut i = inputs(&cfg);
+            i.attention = Some(AttentionPlacement::Heads);
+            let heads = admit(i)?;
+            let tokens = owned.placement.pool_tokens as usize;
+            let pages = tokens / MLA_PAGE_ROWS;
+            let layer_bytes = tokens * MLA_RECORD_BYTES;
+            for rank in 0..2 {
+                let layout = owned.check_mla(rank, rank as i32)?;
+                assert_eq!(layout.bytes(), layer_bytes);
+                assert_eq!(heads.check_mla(rank, rank as i32)?.bytes(), 2 * layer_bytes);
+                for layer in 0..cfg.layers {
+                    let resident = layer == 1 + 2 * rank;
+                    assert_eq!(layout.page_range(layer, 0, 64).is_ok(), resident);
+                    assert_eq!(heads.mla_layouts[rank].page_range(layer, 0, 64).is_ok(),
+                        cfg.attention[layer] == KimiAttention::Mla);
+                    if !resident { continue; }
+                    let mut next = 0;
+                    for page in 0..pages {
+                        let (offset, bytes) = layout.page_range(layer, page, 64)?;
+                        assert_eq!(offset, next);
+                        next += bytes;
+                    }
+                    assert_eq!(next, layer_bytes);
+                    assert_eq!(layout.page_range(layer, pages - 1, 1)?,
+                        (layer_bytes - MLA_PAGE_ROWS * MLA_RECORD_BYTES, MLA_RECORD_BYTES));
+                    for (page, rows) in [(pages, 1), (0, 0), (0, 65)] {
+                        assert!(layout.page_range(layer, page, rows).is_err());
+                    }
                 }
-                assert_eq!(next, layer_bytes);
-                assert_eq!(layout.page_range(layer, pages - 1, 1)?,
-                    (layer_bytes - MLA_PAGE_ROWS * MLA_RECORD_BYTES, MLA_RECORD_BYTES));
-                for (page, rows) in [(pages, 1), (0, 0), (0, 65)] {
-                    assert!(layout.page_range(layer, page, rows).is_err());
-                }
+                assert!(layout.page_range(cfg.layers, 0, 1).is_err());
             }
-            assert!(layout.page_range(cfg.layers, 0, 1).is_err());
-        }
-        let mut placement = owned.placement.clone();
-        for invalid in [LayerMode::ContextSplit, LayerMode::Whole { gpu: 2, ffn: FfnMode::Split }] {
-            placement.layers[1].mode = invalid;
-            assert!(CacheLayout::new(&cfg, &placement, 0, cuteafd_core::MlaCacheFormat::Bf16).is_err());
-        }
-        placement = owned.placement.clone();
-        for pool in [0, 65, u64::MAX] {
-            placement.pool_tokens = pool;
-            assert!(CacheLayout::new(&cfg, &placement, 0, cuteafd_core::MlaCacheFormat::Bf16).is_err());
-        }
-        assert!(CacheLayout::new(&cfg, &owned.placement, 2, cuteafd_core::MlaCacheFormat::Bf16).is_err());
-        Ok(())
+            let mut placement = owned.placement.clone();
+            for invalid in [LayerMode::ContextSplit, LayerMode::Whole { gpu: 2, ffn: FfnMode::Split }] {
+                placement.layers[1].mode = invalid;
+                assert!(CacheLayout::new(&cfg, &placement, 0, cuteafd_core::MlaCacheFormat::Bf16).is_err());
+            }
+            placement = owned.placement.clone();
+            for pool in [0, 65, u64::MAX] {
+                placement.pool_tokens = pool;
+                assert!(CacheLayout::new(&cfg, &placement, 0, cuteafd_core::MlaCacheFormat::Bf16).is_err());
+            }
+            assert!(CacheLayout::new(&cfg, &owned.placement, 2, cuteafd_core::MlaCacheFormat::Bf16).is_err());
+            Ok(())
+                })
     }
 
     #[test]
@@ -3133,7 +3191,7 @@ pub(super) mod tests {
             } else {
                 vec![]
             };
-            admit(Inputs::<1> {
+            admit(Inputs::<1> { vision: None,
                 skip_routed_experts: true,
                 expert_usage: false,
                 cfg: &truncated,

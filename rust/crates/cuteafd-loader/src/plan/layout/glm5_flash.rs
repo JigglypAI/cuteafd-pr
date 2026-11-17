@@ -56,8 +56,7 @@ fn layout_with_native(report: &mut PlanReport, model: &dyn super::super::FamilyM
     report.tp2_dflash = Some(options.tp2_dflash);
     let remote_experts = report.spark_ranks > 0 && (exlr8.is_some() || report.experts.as_ref().is_some_and(|contract|
         model.spec().moe.as_ref().is_some_and(|moe|
-            (super::super::experts::frozen_refusal(&contract.package, report.spark_ranks).is_none()
-                && super::super::experts::spark_recipe(&contract.package, moe.intermediate, report.spark_ranks).is_ok()))))
+            super::super::experts::spark_recipe(&contract.package, moe.intermediate, report.spark_ranks).is_ok())))
         && options.resolve_onboard(model.spec().moe_layers()) != Some(Onboard::Layers(model.spec().moe_layers()));
     let expert_world = if remote_experts { report.spark_ranks } else { 0 };
     let prefill = match resolve_prefill(input, report, options, expert_world,
@@ -350,7 +349,7 @@ fn layout_with_native(report: &mut PlanReport, model: &dyn super::super::FamilyM
             baselines.push((total, Baseline::Planned { context_bytes: context, loaded_bytes: 0 }));
         }
         let speculation = draft > 0 || !draft_tp2.is_empty();
-        let inputs = glmf::GlmfInputs {
+        let inputs = glmf::GlmfInputs { target_pool_tokens: options.target_pool_tokens,
         resident_weight_limit: Some(crate::placement::ResidentWeights(options.weight_budget_bytes)), spark_reply_format: options.resolved_spark_reply_format(false), context: crate::placement::planner::Context::resolve(context, (options.context_tokens > 0).then_some(options.context_tokens)), attention, cfg: &cfg, layers: cfg.layers, local_tp2_exl3: local_tp2_exl3 && exlr8.is_none() && core.projections.is_empty(), gpus: baselines, pending_code,
             headroom_bytes: crate::placement::reserve::gpu("glm5_flash"), spark_ranks, prefill_lanes: lanes, prefill_rows: rows,
             decode_rows, partial_bytes: if options.glmf_kda_fp32_partials && !native_kda { 4 } else { 2 }, max_context: context, sequences, speculation, state_slots: options.resolved_state_slots("glm5_flash"),
@@ -575,7 +574,7 @@ fn layout_with_native(report: &mut PlanReport, model: &dyn super::super::FamilyM
             ensure_tower_spark(&mut devices, rank, options);
             if let Some(device) = devices.iter_mut().find(|device|
                 device.kind == DeviceKind::Spark && device.index as usize == rank) {
-                device.items.push(Item::new(Category::Weights, "vision weights", "bundled encoder", encoder.weights, Basis::Exact));
+                device.items.push(Item::new(Category::Weights, crate::media::still_tower::vision_weight_arena_label(), "bundled encoder", encoder.weights, Basis::Exact));
                 device.items.push(Item::new(Category::Workspace, "vision scratch", "bundled encoder", encoder.scratch, Basis::Formula));
             }
         }

@@ -1304,6 +1304,7 @@ def kimi_kda_programs(g, decode_rows: int, prefill_rows: int, max_context: int):
     out.extend(kimi_context_programs(decode_rows, max_context))
     out.extend(kimi_shared_programs())
     out.extend(mla_draft_programs(decode_rows, max_context))
+    out.extend(mla_draft_fp8_weight_programs(64))
     return out
 
 
@@ -1370,6 +1371,7 @@ def kimi_k31_programs(g, decode_rows: int, prefill_rows: int, max_context: int):
                     {"row_bytes": record_bytes, "page_rows": PAGE_ROWS},
                     lambda rb=record_bytes: context_split.compile_paged_staging_gather_aot(
                         row_bytes=rb, page_rows=PAGE_ROWS)))
+    out.extend(mla_draft_fp8_weight_programs(64, causal=True))
     return out
 
 
@@ -1443,6 +1445,25 @@ def mla_draft_programs(max_rows: int, max_context: int):
     return out
 
 
+def mla_draft_fp8_weight_programs(max_rows: int, causal: bool = False):
+    """Additive #385 body-weight wrappers; attention and existing BF16 exports stay unchanged."""
+    from b12x.integration.cuteafd import kimi_mla
+
+    def build(op, cache="bf16"):
+        geometry = (kimi_mla.CausalMlaDraftGeometry if causal else kimi_mla.MlaDraftGeometry)(kv_cache=cache)
+        return getattr(kimi_mla, f"compile_mla_draft_{op}_fp8_weights_aot")(geometry, max_rows=max_rows)
+
+    tag = "_causal_h96" if causal else ""
+    out = [(f"mla_draft_output_fp8_weights{tag}_m{max_rows}", "mla_draft_output_fp8_weights",
+            {"max_rows": max_rows, "heads": 96 if causal else 64}, lambda: build("output"))]
+    for cache in ("bf16", "fp8"):
+        suffix = "" if cache == "bf16" else "_fp8"
+        out.append((f"mla_draft_producer_fp8_weights{tag}{suffix}_m{max_rows}", "mla_draft_producer_fp8_weights",
+                    {"max_rows": max_rows, "heads": 96 if causal else 64, "kv_cache": cache},
+                    lambda c=cache: build("producer", c)))
+    return out
+
+
 def kimi_route_programs():
     """Reuse the shared BF16 router and FP8-K32 wire kernels at Kimi widths."""
     from types import SimpleNamespace
@@ -1483,6 +1504,10 @@ def kimi_w8_programs():
         from b12x.integration.cuteafd import kimi_residual
         return kimi_residual.compile_kimi_attn_res_rmsnorm_aot(**params)
 
+    def build_stream(params):
+        from b12x.integration.cuteafd import kimi_residual
+        return kimi_residual.compile_kimi_attn_res_stream_aot(**params)
+
     def build_situ(width):
         from b12x.integration.cuteafd import kimi_residual
         return kimi_residual.compile_kimi_situ_aot(intermediate=width)
@@ -1502,6 +1527,10 @@ def kimi_w8_programs():
         name = f"attn_res_c{candidates}_{mode}" + ("_append" if append else "")
         out.append((name, "attn_res_rmsnorm", params,
                     lambda kw=params: build_residual(kw)))
+    for candidates in range(2, 10):
+        params = dict(hidden=7168, candidates=candidates)
+        out.append((f"attn_res_stream_c{candidates}", "attn_res_stream", params,
+                    lambda kw=params: build_stream(kw)))
     for width in (3072, 6144, 16896, 33792):
         out.append((f"situ_i{width}", "situ", {"intermediate": width},
                     lambda w=width: build_situ(w)))

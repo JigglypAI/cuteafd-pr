@@ -590,7 +590,7 @@ pub use contract::{
     Activation, ByteCurve, BytePiece, Choice, Component, ComponentKind, Contract, Requires,
     Variable,
 };
-pub use search::solve;
+pub use search::{solve, solve_prepared};
 
 /// Prepare immutable geometry/cost terms once. A family unable to describe its
 /// demand with finite piecewise curves refuses preparation, never searches it.
@@ -608,6 +608,9 @@ pub struct PhaseBudget {
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResolvedPlan {
+    /// Immutable preparation witness, shared by offline and runtime admission.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pool_policy: Option<crate::placement::PoolPolicy>,
     /// Rejected earlier encoder choices at the admitted pool and onboarding.
     pub encoder_diagnostics: Vec<(String, u64)>,
     pub request: Request,
@@ -619,6 +622,8 @@ pub struct ResolvedPlan {
     pub phases: Vec<PhaseBudget>,
 }
 impl ResolvedPlan {
+    /// Exact stage-two extent after the target-sized layout fixes onboarding.
+    pub fn admitted_extent(&self) -> u64 { self.pool_tokens }
     pub fn served_context(&self) -> u64 { self.request.context.served(self.pool_tokens) }
 
     pub fn items(&self, location: Location) -> Result<Vec<Item>, Refusal> {
@@ -705,6 +710,8 @@ pub enum Refusal {
     InvalidFact(String),
     #[error("invalid exact pin: {0}")]
     InvalidPin(&'static str),
+    #[error("requested pool {requested} tokens exceeds the memory-derived bound of {bound} tokens")]
+    PoolExceedsMemoryBound { requested: u64, bound: u64 },
     #[error("pool pin {tokens} is not aligned to {page_rows} rows")]
     MisalignedPool { tokens: u64, page_rows: u64 },
     #[error("pool {tokens} cannot hold selected context {context}; pass a lower explicit context no greater than {tokens} tokens")]

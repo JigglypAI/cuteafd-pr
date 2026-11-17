@@ -144,6 +144,12 @@ impl ImageTokenGeometry {
     }
 }
 
+/// Largest currently declared still tower: Kimi's floor-to14 then pad-to28
+/// processor reaches132x506 patches (7069x1833 source). These are sanity
+/// ceilings only; each owner declares and enforces its own exact limits.
+pub const MAX_DECLARED_IMAGE_PATCHES: u32 = 66_792;
+pub const MAX_DECLARED_IMAGE_OUTPUT_ROWS: u32 = 16_698;
+
 /// One image owner's declared limits, shared by local and remote admission.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ImageEncodeLimits {
@@ -161,9 +167,9 @@ impl ImageEncodeLimits {
         bytes: u64,
     ) -> Result<(), &'static str> {
         if self.max_patches == 0
-            || self.max_patches > 65536
+            || self.max_patches > MAX_DECLARED_IMAGE_PATCHES
             || self.max_output_rows == 0
-            || self.max_output_rows > 16384
+            || self.max_output_rows > MAX_DECLARED_IMAGE_OUTPUT_ROWS
             || self.max_canvas_pixels == 0
             || self.max_canvas_pixels > 64 << 20
         {
@@ -241,6 +247,18 @@ impl MediaSpan {
 mod tests {
     use super::*;
 
+    #[test]
+    fn declared_padding_maximum_is_valid_but_each_owner_stays_bounded() {
+        let pixels=ImagePixels {source:[7069,1833],canvas:[7084,1848],content:[0,0,7069,1833]};
+        let limits=ImageEncodeLimits {max_patches:MAX_DECLARED_IMAGE_PATCHES,
+            max_output_rows:MAX_DECLARED_IMAGE_OUTPUT_ROWS,max_canvas_pixels:66792*196,
+            geometry:ImageTokenGeometry::MERGED};
+        assert!(limits.validate([1,132,506],pixels,16698,7084*1848*3).is_ok());
+        let smaller=ImageEncodeLimits {max_patches:65536,max_output_rows:16384,..limits};
+        assert!(smaller.validate([1,132,506],pixels,16698,7084*1848*3).is_err());
+        let invalid=ImageEncodeLimits {max_patches:MAX_DECLARED_IMAGE_PATCHES+1,..limits};
+        assert!(invalid.validate([1,132,506],pixels,16698,7084*1848*3).is_err());
+    }
     #[test]
     fn image_content_extent_preserves_source_and_rejects_overflow() {
         let mut pixels = ImagePixels::full(640, 480);

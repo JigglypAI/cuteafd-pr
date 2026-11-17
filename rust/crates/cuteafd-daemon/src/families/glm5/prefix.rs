@@ -260,6 +260,10 @@ pub(crate) trait PrefixDevice {
     fn restore(&self, mark: Option<MarkSlot>, placement: &mut GlmPlacement, len: usize) -> Result<(), BoxError>;
     fn bind(&self, placement: &mut GlmPlacement) -> Result<(), BoxError>;
     fn discard(&self, placement: &mut GlmPlacement) -> Result<(), BoxError>;
+    fn quarantine_draft_pages(&self, placement: &GlmPlacement) {
+        let _ = placement;
+        debug_assert_eq!(self.draft_page_bytes(), 0, "pooled GLM drafter requires quarantine");
+    }
     fn draft_page_bytes(&self) -> usize;
     fn admit_draft_pages(&self, placement: &mut GlmPlacement, capacity: usize) -> Result<(), BoxError>;
     fn draft_pages_valid(&self, attachment: &cuteafd_engine::prefix::DraftPageAttachment) -> bool;
@@ -299,6 +303,7 @@ impl<D: PrefixDevice> PrefixFamily for Prefix<D> {
     fn restore(&self, mark: Option<MarkSlot>, placement: &mut GlmPlacement, len: usize) -> Result<(), BoxError>{ self.device.restore(mark, placement, len) }
     fn bind(&self, placement: &mut GlmPlacement) -> Result<(), BoxError>{ self.device.bind(placement) }
     fn discard(&self, placement: &mut GlmPlacement) -> Result<(), BoxError>{ self.device.discard(placement) }
+    fn quarantine_draft_pages(&self, placement: &GlmPlacement) { self.device.quarantine_draft_pages(placement) }
     fn draft_page_bytes(&self) -> usize{ self.device.draft_page_bytes() }
     fn admit_draft_pages(&self, placement: &mut GlmPlacement, capacity: usize) -> Result<(), BoxError>{ self.device.admit_draft_pages(placement, capacity) }
     fn draft_pages_valid(&self, attachment: &cuteafd_engine::prefix::DraftPageAttachment) -> bool{ self.device.draft_pages_valid(attachment) }
@@ -376,6 +381,9 @@ impl PrefixDevice for NativePrefix<'_, '_> {
         Ok(())
     }
 
+    fn quarantine_draft_pages(&self, placement: &GlmPlacement) {
+        if let Some((drafter, slot)) = self.draft_of(placement) { drafter.quarantine_mla_pages(slot); }
+    }
     fn discard(&self, placement: &mut GlmPlacement) -> Result<(), BoxError> {
         if let Some((drafter, draft_slot)) = self.draft_of(placement) { drafter.discard_context(draft_slot)?; }
         Ok(())
@@ -1023,5 +1031,50 @@ mod ownership_tests {
     fn parity_tail_copy_rejects_cross_owner_pages() {
         assert!(copy_rows(&[], true, TailCopy { from: 0, to: 1, rows: 1, owner: Some(0) },
             |_, _, _| panic!("cross-owner copy must not submit")).is_err());
+    }
+}
+
+/// #2342: GLM 5.3's drafter/target state is GPU-only, so the rollback contract is
+/// checked on the source: a restore rejects a noncanonical mark before moving
+/// windows, and discard drops the slot's drafter context for the cold bind.
+#[cfg(test)]
+mod rollback_tests {
+    fn production() -> &'static str {
+        include_str!("prefix.rs").split("\n#[cfg(test)]").next().unwrap()
+    }
+    fn body<'a>(source: &'a str, needle: &str) -> &'a str {
+        let rest = &source[source.find(needle).unwrap_or_else(|| panic!("{needle}"))..];
+        let end = rest.find("\n    }\n").map_or(rest.len(), |e| e + 6);
+        &rest[..end]
+    }
+    fn body_containing<'a>(source: &'a str, needle: &str, marker: &str) -> &'a str {
+        let mut at = 0;
+        while let Some(found) = source[at..].find(needle) {
+            let start = at + found;
+            let rest = &source[start..];
+            let end = rest.find("\n    }\n").map_or(rest.len(), |e| e + 6);
+            if rest[..end].contains(marker) { return &rest[..end]; }
+            at = start + needle.len();
+        }
+        panic!("no {needle} body contains {marker}");
+    }
+
+    #[test]
+    fn a_failed_restore_is_discarded_before_the_cold_bind() {
+        let source = production();
+        let restore = body_containing(source, "fn restore(&self, mark: Option<MarkSlot>, placement: &mut GlmPlacement, len: usize) -> Result<(), BoxError> {", "read_draft_header");
+        let extent = restore.find("len.div_ceil(PAGE_ROWS) > placement.pages.len()")
+            .expect("restore validates the destination pages");
+        let write = restore.find("self.move_draft_windows").expect("restore moves the window mark");
+        assert!(extent < write, "restore must reject before moving any state");
+        let discard = body_containing(source, "fn discard(&self, placement: &mut GlmPlacement) -> Result<(), BoxError> {",
+            "discard_context");
+        assert!(discard.contains("discard_context(draft_slot)"),
+            "discard drops the partially restored drafter context");
+        let bind = body_containing(source, "fn bind(&self, placement: &mut GlmPlacement) -> Result<(), BoxError> {", "reset_context");
+        assert!(bind.contains("reset_context(draft_slot, 0)"),
+            "a cold bind starts the drafter slot empty");
+        assert!(source.contains("fn discard(&self, placement: &mut GlmPlacement) -> Result<(), BoxError>{ self.device.discard(placement) }"),
+            "the family wrapper delegates discard to the device");
     }
 }

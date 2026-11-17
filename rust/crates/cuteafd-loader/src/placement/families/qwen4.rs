@@ -8,7 +8,7 @@
 //! solve instead of a second pass over the pool.
 use crate::families::qwen4::Qwen4Attention;
 use crate::placement::planner::{
-    solve, Activation, Allocation, Allowance, Baseline as PlanBaseline, Budget, ByteCurve, BytePiece,
+    solve_prepared, Activation, Allocation, Allowance, Baseline as PlanBaseline, Budget, ByteCurve, BytePiece,
     Component, ComponentKind, Contract, Lifetime as PlanLifetime, Location, Operation, Phase, PhaseOrder,
     Pin, PrefillShape as PlanPrefill, Recipe, Refusal, Request, ResidentWeight, ResolvedPlan, Variable,
     weight_arena_components, SM120_ALLOCATION_GRANULARITY_BYTES,
@@ -45,6 +45,7 @@ pub fn check_dual_layer_owners(owners: &[usize]) -> anyhow::Result<()> {
 }
 
 pub struct QwenInputs<'a> {
+    pub target_pool: Option<u64>,
     pub experts: Option<QwenExperts>,
     pub onboard: Onboard,
     pub resident_weight_limit: Option<ResidentWeights>,
@@ -78,40 +79,6 @@ pub struct QwenInputs<'a> {
 }
 
 const WHOLE_OWNER_0: LayerMode = LayerMode::Whole { gpu: 0, ffn: FfnMode::Owner };
-
-/// The single-owner pool policy: CLI zero and an omitted pool select the same
-/// automatic admission, and an automatic Spark-free layout keeps the agentic
-/// context floor.
-pub fn single_policy(inputs: &QwenInputs<'_>) -> PoolPolicy {
-    PoolPolicy::resolve(&[inputs.capacity_bytes], inputs.max_context, inputs.requested_pool,
-        QWEN_UNIT_ROWS as u64)
-        .with_context(inputs.context)
-}
-
-/// Serving context and the finite compiled pool extent, both derived from the
-/// same policy. The legacy ceiling was unbounded; a contract curve needs a
-/// finite domain, so the extent is the larger of the automatic target and the
-/// explicit request. Every pool the policy accepts is inside it.
-fn single_extent(policy: &PoolPolicy) -> Result<(u64, u64), Refusal> {
-    let page = QWEN_UNIT_ROWS as u64;
-    let tokens = policy.maximum_tokens().max(policy.floor);
-    let pages = tokens.div_ceil(page);
-    if policy.floor == 0 || tokens == 0 || pages == 0 || pages == u64::MAX {
-        return Err(Refusal::InvalidFact("invalid Qwen single-owner pool extent".into()));
-    }
-    Ok((policy.compiled_context, pages))
-}
-
-/// One normalization for both routes: an omitted or zero pool is automatic and
-/// an explicit pool rounds up to the allocation unit, exactly as the former
-/// unit rounding did.
-fn pool_pin(policy: &PoolPolicy, page: u64) -> Result<Pin<u64>, Refusal> {
-    Ok(match policy.requested {
-        None => Pin::Auto,
-        Some(tokens) => Pin::Exact(tokens.div_ceil(page).checked_mul(page)
-            .ok_or(Refusal::Overflow("Qwen pool request"))?),
-    })
-}
 
 fn prefill_of(admission: &QwenAdmissionInputs<'_>) -> PlanPrefill {
     match admission.prefill_shape {
@@ -248,6 +215,7 @@ fn graph_reserve_owner(shape: QwenGraphShapeKey, rank: usize, location: Location
 pub struct QwenSingle<'a> {
     inputs: &'a QwenInputs<'a>,
     admission: QwenAdmission,
+    pool: PoolPolicy,
     context: u64,
     maximum_pages: u64,
 }
@@ -256,15 +224,34 @@ impl<'a> QwenSingle<'a> {
     pub fn new(inputs: &'a QwenInputs<'a>) -> Result<Self, Refusal> {
         let admission = qwen_admission(&inputs.admission)
             .map_err(|error| Refusal::InvalidFact(format!("Qwen admission: {error}")))?;
-        let policy = single_policy(inputs);
-        let (context, maximum_pages) = single_extent(&policy)?;
-        Ok(Self { inputs, admission, context, maximum_pages })
+        let page = QWEN_UNIT_ROWS as u64;
+        if let Some(tokens) = inputs.requested_pool.filter(|&tokens| tokens > 0 && tokens < inputs.context.required()) {
+            return Err(Refusal::PoolBelowContext { tokens, context: inputs.context.required() });
+        }
+        let requested = inputs.requested_pool;
+        let cards = [inputs.capacity_bytes];
+        let mut facts = PoolFacts::new(inputs.context, requested, page);
+        // The pool unit's real admitted cost: records plus the page map and
+        // metadata, exactly the per-token charge the contract prices. A model
+        // with no full-attention records still pays its page tables, so this
+        // slope is never zero and always yields a finite pool domain.
+        let unit_bytes = admission.per_token.checked_mul(page)
+            .ok_or(Refusal::Overflow("Qwen pool unit"))?;
+        facts.memory = cards.iter().map(|&available_bytes| PoolMemory { available_bytes,
+            bytes_per_unit: unit_bytes }).collect();
+        facts.target = inputs.target_pool;
+        let pool = prepare_pool(facts).map_err(|error| Refusal::InvalidFact(error.to_string()))?;
+        let context = pool.compiled_context();
+        let maximum_pages = pool.maximum_tokens().max(pool.floor()).div_ceil(page);
+        if pool.floor() == 0 || maximum_pages == 0 || maximum_pages == u64::MAX {
+            return Err(Refusal::InvalidFact("invalid Qwen single-owner pool extent".into()));
+        }
+        Ok(Self { inputs, admission, pool, context, maximum_pages })
     }
 
     pub fn request(&self) -> Result<Request, Refusal> {
         let inputs = self.inputs;
-        let policy = single_policy(inputs);
-        Ok(Request { context: inputs.context, pool: pool_pin(&policy, QWEN_UNIT_ROWS as u64)?,
+        Ok(Request { context: inputs.context, pool: self.pool.requested().map_or(Pin::Auto, Pin::Exact),
             onboard: QwenExperts::pin(inputs.onboard), prefill: Pin::Exact(prefill_of(&inputs.admission)),
             operation: Operation::Serving, resident_weight_limit: inputs.resident_weight_limit,
             spark_reply_formats: reply_formats(inputs.spark_reply_format, inputs.spark_ranks) })
@@ -285,7 +272,7 @@ impl<'a> QwenSingle<'a> {
     pub fn admit(&self) -> Result<ResolvedPlan, Refusal> {
         let mut budgets = vec![self.budget()?, self.inputs.host.budget()?];
         budgets.extend(self.inputs.encoders.spark_budgets.iter().cloned());
-        solve(self.request()?, budgets, self)
+        solve_prepared(self.request()?, budgets, self, &self.pool)
     }
 
     /// Mechanical executor output: the admitted owners, not a second solve.
@@ -771,6 +758,7 @@ pub fn dual_peer_diagnostics(enabled: bool) -> Vec<Demand> {
         "expert peer diagnostics", 256, Basis::Exact)).to_vec()
 }
 pub struct QwenDualInputs<'a> {
+    pub target_pool: Option<u64>,
     pub experts: Option<QwenExperts>,
     pub resident_weight_limit: Option<ResidentWeights>,
     /// Shared model extent and optional operator context pin.
@@ -810,14 +798,6 @@ pub fn dual_cut(layers: usize) -> usize { layers / 2 }
 pub fn dual_owners(layers: usize) -> Vec<usize> {
     let cut = dual_cut(layers);
     (0..layers).map(|layer| usize::from(layer >= cut)).collect()
-}
-
-/// The dual pool stops at the common target: the executor allocates both
-/// ranks' page tables for the same admitted pool.
-fn dual_policy(inputs: &QwenDualInputs<'_>) -> PoolPolicy {
-    PoolPolicy::resolve(&inputs.gpus.map(|gpu| gpu.capacity_bytes), inputs.max_context,
-        inputs.requested_pool, QWEN_UNIT_ROWS as u64)
-        .with_context(inputs.context)
 }
 
 /// TP2 arenas follow the executor's load chronology: one workspace opened once,
@@ -875,6 +855,7 @@ fn check_dual_arenas(arenas: &[(usize, crate::serving_capacity::WeightArenaLayou
 /// The dual route prepared once: the balanced cut, per-owner pool units, both
 /// TP2 arenas and each owner chain's graph reserve.
 pub struct QwenDual<'a> {
+    pool: PoolPolicy,
     inputs: &'a QwenDualInputs<'a>,
     owners: Vec<usize>,
     context: u64,
@@ -929,19 +910,61 @@ impl<'a> QwenDual<'a> {
             .ok_or(Refusal::Overflow("Qwen residual hop buffers"))?
             .try_into().map_err(|_| Refusal::InvalidFact("Qwen hop owner count".into()))?;
         let (arena, resident) = tp2_arena(inputs)?;
-        let policy = dual_policy(inputs);
-        let maximum_pages = policy.maximum_tokens().max(policy.floor).div_ceil(page);
-        if maximum_pages == 0 || maximum_pages == u64::MAX || policy.floor == 0 {
+        if let Some(tokens) = inputs.requested_pool.filter(|&tokens| tokens > 0 && tokens < inputs.context.required()) {
+            return Err(Refusal::PoolBelowContext { tokens, context: inputs.context.required() });
+        }
+        let requested = inputs.requested_pool;
+        let cards = inputs.gpus.map(|gpu| gpu.capacity_bytes);
+        let mut facts = PoolFacts::new(inputs.context, requested, page);
+        let compute = |layers, mtp| crate::serving_capacity::qwen_cache_geometry(
+            a.cfg, layers, mtp, a.kv_format)
+            .map_err(|error| Refusal::InvalidFact(format!("Qwen cache geometry: {error}")));
+        // Records are owned by the layer's rank; the probe accumulates each
+        // owner's full-attention layers exactly as the contract prices them.
+        let mut records = [0u64; 2];
+        let mut previous = 0u64;
+        for (layer, &gpu) in owners.iter().enumerate() {
+            let current = compute(layer + 1, false)?.ranks[0].persistent_unit_bytes;
+            records[gpu] = records[gpu].checked_add(current.checked_sub(previous)
+                .ok_or_else(|| Refusal::InvalidFact("Qwen per-layer records shrink".into()))?)
+                .ok_or(Refusal::Overflow("Qwen per-rank records"))?;
+            previous = current;
+        }
+        if a.mtp {
+            let complete = compute(a.layers, true)?.ranks[0].persistent_unit_bytes;
+            records[0] = records[0].checked_add(complete.checked_sub(previous)
+                .ok_or_else(|| Refusal::InvalidFact("Qwen MTP records shrink".into()))?)
+                .ok_or(Refusal::Overflow("Qwen per-rank records"))?;
+        }
+        // Each rank also owns its pool page map and metadata for the whole
+        // pool, so a model with no full-attention records still pays a
+        // nonzero slope and keeps a finite domain. Mirrors `prepare`.
+        let complete = compute(a.layers, a.mtp)?.ranks[0];
+        let tables = (1 + QWEN_DECODE_ROWS as u64) * 5 * 4;
+        let mut slopes = [0u64; 2];
+        for (gpu, slope) in slopes.iter_mut().enumerate() {
+            let overhead = tables.checked_add(if gpu == 0 { complete.pool_metadata_unit_bytes } else { 0 })
+                .ok_or(Refusal::Overflow("Qwen pool metadata"))?;
+            let overhead = overhead.div_ceil(page).checked_mul(page)
+                .ok_or(Refusal::Overflow("Qwen pool page map"))?;
+            *slope = records[gpu].checked_add(overhead)
+                .ok_or(Refusal::Overflow("Qwen per-rank pool unit"))?;
+        }
+        facts.memory = cards.iter().zip(slopes).map(|(&available_bytes, bytes_per_unit)|
+            PoolMemory { available_bytes, bytes_per_unit }).collect();
+        facts.target = inputs.target_pool;
+        let policy = prepare_pool(facts).map_err(|error| Refusal::InvalidFact(error.to_string()))?;
+        let maximum_pages = policy.maximum_tokens().max(policy.floor()).div_ceil(page);
+        if maximum_pages == 0 || maximum_pages == u64::MAX || policy.floor() == 0 {
             return Err(Refusal::InvalidFact("invalid Qwen dual pool extent".into()));
         }
-        Ok(Self { inputs, owners, context: policy.compiled_context, maximum_pages, arena, resident,
+        Ok(Self { inputs, owners, pool: policy, context: policy.compiled_context(), maximum_pages, arena, resident,
             hop_spec, hop_bytes })
     }
 
     pub fn request(&self) -> Result<Request, Refusal> {
         let inputs = self.inputs;
-        let policy = dual_policy(inputs);
-        Ok(Request { context: inputs.context, pool: pool_pin(&policy, QWEN_UNIT_ROWS as u64)?,
+        Ok(Request { context: inputs.context, pool: self.pool.requested().map_or(Pin::Auto, Pin::Exact),
             onboard: QwenExperts::pin(inputs.onboard), prefill: Pin::Exact(prefill_of(&inputs.admission)),
             operation: Operation::Serving, resident_weight_limit: inputs.resident_weight_limit,
             spark_reply_formats: reply_formats(SparkReplyFormat::Bf16, inputs.spark_ranks) })
@@ -960,7 +983,7 @@ impl<'a> QwenDual<'a> {
     }
 
     pub fn admit(&self) -> Result<ResolvedPlan, Refusal> {
-        solve(self.request()?, self.budgets()?, self)
+        solve_prepared(self.request()?, self.budgets()?, self, &self.pool)
     }
 
     /// Mechanical executor output: the prepared cut, TP2 arenas and hop
@@ -1343,7 +1366,7 @@ mod tests {
         let costs = vec![Some(tp2_cost()); 4];
         let extra = vec![vec![]; 4];
         for count in 0..=4 {
-            let inputs = QwenDualInputs { experts: Some(hybrid_fixture(2, 4)),
+            let inputs = QwenDualInputs { target_pool: None, experts: Some(hybrid_fixture(2, 4)),
                 blas_head: crate::placement::planner::serving::BlasHead::Native,
                 resident_weight_limit: None, context: crate::placement::planner::Context::pinned(131072),
                 admission: QwenAdmissionInputs { prefill_shape: None, cfg: &cfg, layers: 4, mtp: false,
@@ -1468,7 +1491,7 @@ mod tests {
         let extra = dual_ple_demands(&cfg, 4, &resident).unwrap();
         let experts = vec![Some(tp2_cost()); 4];
         let gib = 1u64 << 30;
-        let inputs = QwenDualInputs {
+        let inputs = QwenDualInputs { target_pool: None,
         experts: None,            blas_head: crate::placement::planner::serving::BlasHead::Native, resident_weight_limit: None, context: crate::placement::planner::Context::pinned(131_072),
             admission: QwenAdmissionInputs { prefill_shape: None, cfg: &cfg, layers: 4, mtp: false,
                 kv_format: Qwen4KvCache::Bf16, manifest: None, prefill_rows: 4096, slots: 16,
@@ -1697,7 +1720,7 @@ mod tests {
         requested_pool: Option<u64>,
         loaded: ResidentWeights, limit: Option<ResidentWeights>) -> QwenInputs<'a> {
         let gib = 1u64 << 30;
-        QwenInputs { experts: None, onboard: Onboard::Auto,
+        QwenInputs { target_pool: None, experts: None, onboard: Onboard::Auto,
             blas_head: crate::placement::planner::serving::BlasHead::Native, resident_weight_limit: limit, loaded_weights: loaded,
             arenas: vec![], expert_arenas: vec![], preallocation: false, future: vec![],
             spark_reply_format: cuteafd_core::SparkReplyFormat::Bf16, context: crate::placement::planner::Context::pinned(131_072),
@@ -1772,7 +1795,7 @@ mod tests {
         let experts = vec![Some(tp2_cost()); cfg.layers];
         let extra = vec![vec![]; cfg.layers];
         check_spark_encoder_budgets(|encoders| {
-            let inputs = QwenDualInputs {
+            let inputs = QwenDualInputs { target_pool: None,
         experts: None,                blas_head: crate::placement::planner::serving::BlasHead::Native,
                 resident_weight_limit: None, context: crate::placement::planner::Context::pinned(131072),
                 admission: QwenAdmissionInputs { prefill_shape: None, cfg: &cfg, layers: cfg.layers, mtp: false,
@@ -1792,76 +1815,134 @@ mod tests {
     /// Plan-time and serve-time baselines describe the same owners; the recipe
     /// declares every allocation after them, so both must admit one placement.
     #[test]
+    fn explicit_unaligned_pool_keeps_shared_round_up() {
+        let cfg = Qwen4Config::from_hf(&crate::plan::testing::qwen4_config(4)).unwrap();
+        let inputs = single_inputs(&cfg, Baseline::Measured { free_bytes: 96 << 30 },
+            0, Some(131_073), ResidentWeights(0), None);
+        let admitted = QwenSingle::new(&inputs).unwrap().admit().unwrap();
+        assert_eq!(admitted.pool_tokens, 131_328);
+        assert_eq!(admitted.pool_policy.unwrap().requested(), Some(131_328));
+    }
+
+    #[test]
     fn planner_equals_runtime_qwen4() {
         let cfg = Qwen4Config::from_hf(&crate::plan::testing::qwen4_config(4)).unwrap();
-        let planned = placement(&single_inputs(&cfg, Baseline::Planned { context_bytes: 0, loaded_bytes: 0 },
-            0, None, ResidentWeights(1024), None)).unwrap();
-        let runtime = placement(&single_inputs(&cfg, Baseline::Measured { free_bytes: 96 << 30 },
-            0, None, ResidentWeights(1024), None)).unwrap();
-        assert_eq!(planned, runtime);
-        assert!(!planned.items.iter().flatten().any(|item| item.group == "residual hop control"));
-        assert_eq!(planned.pool_tokens, 2 << 20);
-        // Both baselines and CLI zero select the same automatic admission.
-        let zero = placement(&single_inputs(&cfg, Baseline::Measured { free_bytes: 96 << 30 },
-            0, Some(0), ResidentWeights(1024), None)).unwrap();
-        assert_eq!(zero, runtime);
-        let admission = qwen_admission(&single_inputs(&cfg, Baseline::Measured { free_bytes: 96 << 30 },
-            0, None, ResidentWeights(1024), None).admission).unwrap();
-        // One arena per pooled record set: the engine allocates the layer's
-        // records, token keys and pool keys as one block, so each set is
-        // charged as its single physical cudaMalloc, rounding once at the
-        // SM120 granule. Everything else in the pool total (page tables and
-        // their per-token rounding) stays linear.
-        let granule = SM120_ALLOCATION_GRANULARITY_BYTES;
-        let pool_pages = (2u64 << 20) / QWEN_UNIT_ROWS as u64;
-        let geometry = |layers, mtp| crate::serving_capacity::qwen_cache_geometry(&cfg, layers, mtp,
-            Qwen4KvCache::Bf16).unwrap().ranks[0].persistent_unit_bytes;
-        let (mut previous, mut expected) = (0u64, 0u64);
-        for layer in 0..cfg.layers {
-            let current = geometry(layer + 1, false);
-            expected += ((current - previous) * pool_pages).div_ceil(granule) * granule;
-            previous = current;
-        }
-        expected += (admission.per_token * QWEN_UNIT_ROWS as u64 - geometry(cfg.layers, false)) * pool_pages;
-        assert_eq!(planned.items[0].iter().filter(|item| item.group == "records")
-            .map(|item| item.bytes).sum::<u64>(), expected);
-        let (base, extra) = qwen_reserve(QwenGraphShapeKey::Single0Spark, 0).unwrap();
-        let reserve = crate::placement::graph_reserve::current(0, false, base, extra).unwrap();
-        assert_eq!(planned.items[0].iter().filter(|item| item.group == "graph reserve: qwen4.graphs.0")
-            .map(|item| item.bytes).collect::<Vec<_>>(), vec![reserve.bytes]);
+        use cuteafd_core::memory_policy::MemoryPolicy;
+        // A finite KV max pins this fixture's record arithmetic; the prepared-pool test covers unbounded growth.
+        MemoryPolicy { kv_max: Some(2 << 20), ..Default::default() }.scoped(|| {
+            let planned = placement(&single_inputs(&cfg, Baseline::Planned { context_bytes: 0, loaded_bytes: 0 },
+                0, None, ResidentWeights(1024), None)).unwrap();
+            let runtime = placement(&single_inputs(&cfg, Baseline::Measured { free_bytes: 96 << 30 },
+                0, None, ResidentWeights(1024), None)).unwrap();
+            assert_eq!(planned, runtime);
+            assert!(!planned.items.iter().flatten().any(|item| item.group == "residual hop control"));
+            assert_eq!(planned.pool_tokens, 2 << 20);
+            // Both baselines and CLI zero select the same automatic admission.
+            let zero = placement(&single_inputs(&cfg, Baseline::Measured { free_bytes: 96 << 30 },
+                0, Some(0), ResidentWeights(1024), None)).unwrap();
+            assert_eq!(zero, runtime);
+            let admission = qwen_admission(&single_inputs(&cfg, Baseline::Measured { free_bytes: 96 << 30 },
+                0, None, ResidentWeights(1024), None).admission).unwrap();
+            // One arena per pooled record set: the engine allocates the layer's
+            // records, token keys and pool keys as one block, so each set is
+            // charged as its single physical cudaMalloc, rounding once at the
+            // SM120 granule. Everything else in the pool total (page tables and
+            // their per-token rounding) stays linear.
+            let granule = SM120_ALLOCATION_GRANULARITY_BYTES;
+            let pool_pages = (2u64 << 20) / QWEN_UNIT_ROWS as u64;
+            let geometry = |layers, mtp| crate::serving_capacity::qwen_cache_geometry(&cfg, layers, mtp,
+                Qwen4KvCache::Bf16).unwrap().ranks[0].persistent_unit_bytes;
+            let (mut previous, mut expected) = (0u64, 0u64);
+            for layer in 0..cfg.layers {
+                let current = geometry(layer + 1, false);
+                expected += ((current - previous) * pool_pages).div_ceil(granule) * granule;
+                previous = current;
+            }
+            expected += (admission.per_token * QWEN_UNIT_ROWS as u64 - geometry(cfg.layers, false)) * pool_pages;
+            assert_eq!(planned.items[0].iter().filter(|item| item.group == "records")
+                .map(|item| item.bytes).sum::<u64>(), expected);
+            let (base, extra) = qwen_reserve(QwenGraphShapeKey::Single0Spark, 0).unwrap();
+            let reserve = crate::placement::graph_reserve::current(0, false, base, extra).unwrap();
+            assert_eq!(planned.items[0].iter().filter(|item| item.group == "graph reserve: qwen4.graphs.0")
+                .map(|item| item.bytes).collect::<Vec<_>>(), vec![reserve.bytes]);
 
-        // MTP records are their own record arena on owner zero, so they round
-        // once as a physical cudaMalloc instead of sharing the pool table
-        // rounding; everything left in the per-token total is page tables.
-        let mut mtp_json = crate::plan::testing::qwen4_config(4);
-        mtp_json["text_config"]["mtp_num_hidden_layers"] = serde_json::json!(1);
-        let mtp_cfg = Qwen4Config::from_hf(&mtp_json).unwrap();
-        let mut mtp_inputs = single_inputs(&mtp_cfg, Baseline::Measured { free_bytes: 96 << 30 },
-            0, None, ResidentWeights(1024), None);
-        mtp_inputs.admission.mtp = true;
-        let mtp_admission = qwen_admission(&mtp_inputs.admission).unwrap();
-        let mtp_planned = placement(&mtp_inputs).unwrap();
-        assert_eq!(mtp_planned.pool_tokens, 2 << 20);
-        let geometry_mtp = |layers, mtp| crate::serving_capacity::qwen_cache_geometry(&mtp_cfg, layers, mtp,
-            Qwen4KvCache::Bf16).unwrap().ranks[0].persistent_unit_bytes;
-        let mtp_records = geometry_mtp(mtp_cfg.layers, true) - geometry_mtp(mtp_cfg.layers, false);
-        let (mut previous, mut mtp_expected) = (0u64, 0u64);
-        for layer in 0..mtp_cfg.layers {
-            let current = geometry_mtp(layer + 1, false);
-            mtp_expected += ((current - previous) * pool_pages).div_ceil(granule) * granule;
-            previous = current;
+            // MTP records are their own record arena on owner zero, so they round
+            // once as a physical cudaMalloc instead of sharing the pool table
+            // rounding; everything left in the per-token total is page tables.
+            let mut mtp_json = crate::plan::testing::qwen4_config(4);
+            mtp_json["text_config"]["mtp_num_hidden_layers"] = serde_json::json!(1);
+            let mtp_cfg = Qwen4Config::from_hf(&mtp_json).unwrap();
+            let mut mtp_inputs = single_inputs(&mtp_cfg, Baseline::Measured { free_bytes: 96 << 30 },
+                0, None, ResidentWeights(1024), None);
+            mtp_inputs.admission.mtp = true;
+            let mtp_admission = qwen_admission(&mtp_inputs.admission).unwrap();
+            let mtp_planned = placement(&mtp_inputs).unwrap();
+            assert_eq!(mtp_planned.pool_tokens, 2 << 20);
+            let geometry_mtp = |layers, mtp| crate::serving_capacity::qwen_cache_geometry(&mtp_cfg, layers, mtp,
+                Qwen4KvCache::Bf16).unwrap().ranks[0].persistent_unit_bytes;
+            let mtp_records = geometry_mtp(mtp_cfg.layers, true) - geometry_mtp(mtp_cfg.layers, false);
+            let (mut previous, mut mtp_expected) = (0u64, 0u64);
+            for layer in 0..mtp_cfg.layers {
+                let current = geometry_mtp(layer + 1, false);
+                mtp_expected += ((current - previous) * pool_pages).div_ceil(granule) * granule;
+                previous = current;
+            }
+            mtp_expected += (mtp_records * pool_pages).div_ceil(granule) * granule;
+            mtp_expected += (mtp_admission.per_token * QWEN_UNIT_ROWS as u64
+                - geometry_mtp(mtp_cfg.layers, true)) * pool_pages;
+            assert_eq!(mtp_planned.items[0].iter().filter(|item| item.group == "records")
+                .map(|item| item.bytes).sum::<u64>(), mtp_expected);
+            // The first typed refusal is preserved, not clamped or re-solved.
+            let limited = single_inputs(&cfg, Baseline::Measured { free_bytes: 96 << 30 }, 0,
+                None, ResidentWeights(2048), Some(ResidentWeights(1)));
+            let refused = QwenSingle::new(&limited).unwrap();
+            assert_eq!(refused.admit().unwrap_err(),
+                Refusal::ResidentWeightLimit { gpu: 0, required: 2048, limit: 1 });
+        });
+    }
+
+    #[test]
+    fn prepared_pool_matches_plan_and_runtime_and_is_not_reresolved() {
+        use cuteafd_core::memory_policy::MemoryPolicy;
+        let cfg = Qwen4Config::from_hf(&crate::plan::testing::qwen4_config(4)).unwrap();
+        for requested in [None, Some(262_145)] {
+            let plan = single_inputs(&cfg, Baseline::Planned { context_bytes: 0, loaded_bytes: 0 },
+                0, requested, ResidentWeights(0), None);
+            let serve = single_inputs(&cfg, Baseline::Measured { free_bytes: 96 << 30 },
+                0, requested, ResidentWeights(0), None);
+            let default = QwenSingle::new(&plan).unwrap().admit().unwrap();
+            MemoryPolicy { kv_max: Some(2 << 20), ..Default::default() }.scoped(|| {
+                let prepared = QwenSingle::new(&plan).unwrap();
+                let live = QwenSingle::new(&serve).unwrap();
+                // A resolved preparation stays authoritative after the ambient policy changes.
+                let solved = MemoryPolicy::default().scoped(|| prepared.admit()).unwrap();
+                let runtime = live.admit().unwrap();
+                assert_eq!(solved.pool_policy, Some(prepared.pool));
+                assert_eq!(solved.pool_policy, runtime.pool_policy);
+                assert_eq!(solved.pool_tokens, runtime.pool_tokens);
+                assert_eq!(solved.decisions, runtime.decisions);
+                assert_eq!(solved.decisions.onboard_layers, default.decisions.onboard_layers);
+                if requested.is_some() {
+                    assert_eq!(solved.pool_tokens, 262_400);
+                } else {
+                    assert!(default.pool_tokens > 2 << 20, "an unbounded max grows into the admitted memory");
+                    assert_eq!(solved.pool_tokens, 2 << 20);
+                }
+            });
         }
-        mtp_expected += (mtp_records * pool_pages).div_ceil(granule) * granule;
-        mtp_expected += (mtp_admission.per_token * QWEN_UNIT_ROWS as u64
-            - geometry_mtp(mtp_cfg.layers, true)) * pool_pages;
-        assert_eq!(mtp_planned.items[0].iter().filter(|item| item.group == "records")
-            .map(|item| item.bytes).sum::<u64>(), mtp_expected);
-        // The first typed refusal is preserved, not clamped or re-solved.
-        let limited = single_inputs(&cfg, Baseline::Measured { free_bytes: 96 << 30 }, 0,
-            None, ResidentWeights(2048), Some(ResidentWeights(1)));
-        let refused = QwenSingle::new(&limited).unwrap();
-        assert_eq!(refused.admit().unwrap_err(),
-            Refusal::ResidentWeightLimit { gpu: 0, required: 2048, limit: 1 });
+    }
+
+    #[test]
+    fn small_card_pool_defaults_and_supplied_target_are_shared_facts() {
+        let cfg = Qwen4Config::from_hf(&crate::plan::testing::qwen4_config(4)).unwrap();
+        let mut inputs = single_inputs(&cfg, Baseline::Measured { free_bytes: 32 << 30 },
+            0, None, ResidentWeights(0), None);
+        inputs.capacity_bytes = 32 << 30;
+        assert_eq!(QwenSingle::new(&inputs).unwrap().admit().unwrap().pool_policy.unwrap().target(), 2 << 20);
+        inputs.target_pool = Some(524_288);
+        let solved = QwenSingle::new(&inputs).unwrap().admit().unwrap();
+        assert_eq!(solved.pool_policy.unwrap().target(), 524_288);
+        assert!(solved.pool_tokens >= 524_288, "the target sizes the layout; the pool still grows");
     }
 
     /// The header-only planner reserves Spark return planes beside a planned
@@ -1875,7 +1956,9 @@ mod tests {
                 ResidentWeights(0), None);
             (placement(&inputs).unwrap(), inputs)
         };
-        let (planned, inputs) = intake(Baseline::Planned { context_bytes: 0, loaded_bytes: 0 });
+        use cuteafd_core::memory_policy::MemoryPolicy;
+        let pinned = || MemoryPolicy { kv_max: Some(2 << 20), ..Default::default() };
+        let (planned, inputs) = pinned().scoped(|| intake(Baseline::Planned { context_bytes: 0, loaded_bytes: 0 }));
         let planes = planned.items[0].iter().filter(|item| item.group == "Spark intake planes")
             .map(|item| item.bytes).collect::<Vec<_>>();
         assert_eq!(planes.len(), 1);
@@ -1883,7 +1966,7 @@ mod tests {
             4, cfg.hidden as u64, cuteafd_core::SparkReplyFormat::Bf16).unwrap());
         assert_eq!(planned.pool_tokens, 2 << 20);
         drop(inputs);
-        let (runtime, _) = intake(Baseline::Measured { free_bytes: 96 << 30 });
+        let (runtime, _) = pinned().scoped(|| intake(Baseline::Measured { free_bytes: 96 << 30 }));
         assert!(!runtime.items[0].iter().any(|item| item.group == "Spark intake planes"));
         assert_eq!(runtime.pool_tokens, planned.pool_tokens);
     }
@@ -2024,7 +2107,7 @@ mod tests {
             let build = |bytes| {
                 let mut host = QwenHost::ample(&cfg, 2, 4096).unwrap();
                 host.host_embedding = bytes;
-                let inputs = QwenDualInputs {
+                let inputs = QwenDualInputs { target_pool: None,
         experts: None,                    blas_head: crate::placement::planner::serving::BlasHead::Native,
                     resident_weight_limit: None, context: crate::placement::planner::Context::pinned(131072),
                     admission: single_inputs(&cfg, Baseline::Planned { context_bytes: 0, loaded_bytes: 0 },
@@ -2084,9 +2167,12 @@ mod tests {
         // An explicit pool below the context is the first typed refusal.
         let short = single_inputs(&cfg, Baseline::Measured { free_bytes: 96 << 30 }, 0,
             Some(65536), ResidentWeights(0), None);
-        let below = QwenSingle::new(&short).unwrap();
-        assert_eq!(below.admit().unwrap_err(),
-            Refusal::PoolBelowContext { tokens: 65536, context: 131072 });
+        assert!(matches!(QwenSingle::new(&short), Err(Refusal::PoolBelowContext {
+            tokens: 65536, context: 131072 })));
+        let almost = single_inputs(&cfg, Baseline::Measured { free_bytes: 96 << 30 }, 0,
+            Some(131_071), ResidentWeights(0), None);
+        assert!(matches!(QwenSingle::new(&almost), Err(Refusal::PoolBelowContext {
+            tokens: 131_071, context: 131_072 })));
     }
 
     /// The dual route states its cut, arenas and receive-slot hops once; the
@@ -2101,7 +2187,7 @@ mod tests {
         let experts: Vec<_> = (0..4).map(|_| Some(ExpertCost { whole: Bytes2 { resident: 0, staging: 0 },
             half: costs, tp2: true, whole_supported: true, spark_ok: true })).collect();
         let gib = 1u64 << 30;
-        let build = || QwenDualInputs {
+        let build = || QwenDualInputs { target_pool: None,
         experts: None,            blas_head: crate::placement::planner::serving::BlasHead::Native, resident_weight_limit: None, context: crate::placement::planner::Context::pinned(131_072),
             admission: QwenAdmissionInputs { prefill_shape: None, cfg: &cfg, layers: 4, mtp: false,
                 kv_format: Qwen4KvCache::Bf16, manifest: None, prefill_rows: 4096, slots: 16,

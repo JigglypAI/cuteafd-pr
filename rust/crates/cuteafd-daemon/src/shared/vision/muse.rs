@@ -25,7 +25,7 @@ impl TowerSpec {
             cursor = (cursor+255)&!255;
             let destination = cursor;
             cursor += metadata.byte_length as usize;
-            reads.push(TensorRead { path:path.clone(), metadata:metadata.clone(), destination, vector:false });
+            reads.push(TensorRead { path:path.clone(), metadata:metadata.clone(), destination, transform:ReadTransform::Direct });
             Ok(destination as u64)
         };
         let mut native = VisionSpec { abi_version:2, reserved:5, max_tokens:max_tokens as u32,

@@ -1,0 +1,60 @@
+{
+  "_comment": "Shared parity table for the serving lock set: smoke.rs locks_for (Rust) and wip-cards.py serving_locks (Python) must both match every case. Locks follow the resolved layout only; `exclusive` (V4.1's default) never widens it (#2364).",
+  "cases": [
+    {
+      "name": "v41-min-1rtx-3sparks",
+      "family": "deepseek_v41",
+      "gpus": [0],
+      "sparks": ["ostrich", "dodo", "emu"],
+      "locks": ["sparks.lock", "gpu0.lock"]
+    },
+    {
+      "name": "glmf-2rtx-0spark",
+      "family": "glm5_flash",
+      "gpus": [0, 1],
+      "sparks": [],
+      "locks": ["gpu0.lock", "gpu1.lock"]
+    },
+    {
+      "name": "v41-max-2rtx-6sparks",
+      "family": "deepseek_v41",
+      "gpus": [0, 1],
+      "sparks": ["ostrich", "dodo", "emu", "kiwi", "rhea", "moa"],
+      "locks": ["sparks.lock", "gpu0.lock", "gpu1.lock", "rhea.lock", "moa.lock"]
+    },
+    {
+      "name": "gpu1-only-0spark",
+      "gpus": [1],
+      "sparks": [],
+      "locks": ["gpu1.lock"]
+    },
+    {
+      "name": "gpu1-rhea",
+      "gpus": [1],
+      "sparks": ["rhea"],
+      "locks": ["gpu1.lock", "rhea.lock"]
+    },
+    {
+      "name": "gpu0-only-0spark",
+      "gpus": [0],
+      "sparks": [],
+      "locks": ["gpu0.lock"]
+    },
+    {
+      "name": "v41-exclusive-does-not-widen",
+      "family": "deepseek_v41",
+      "exclusive": true,
+      "gpus": [0],
+      "sparks": [],
+      "locks": ["gpu0.lock"]
+    },
+    {
+      "name": "v41-exclusive-gpu1-does-not-add-gpu0",
+      "family": "deepseek_v41",
+      "exclusive": true,
+      "gpus": [1],
+      "sparks": ["rhea", "moa"],
+      "locks": ["gpu1.lock", "rhea.lock", "moa.lock"]
+    }
+  ]
+}

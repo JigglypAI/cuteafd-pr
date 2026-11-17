@@ -8,6 +8,7 @@ use std::{net::SocketAddr, sync::Arc};
 
 #[derive(Debug, Clone, clap::Args)]
 pub(crate) struct ServeArgs {
+    #[command(flatten)] pub media: crate::shared::vision::still::Options,
     #[command(flatten)] pub(crate) attention: crate::cli::CoreViewArgs,
     #[arg(long)] pub snapshot: std::path::PathBuf,
     #[arg(long, env = "CUTEAFD_NATIVE_LIB")] pub native_lib: std::path::PathBuf,
@@ -74,8 +75,6 @@ pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
     use cuteafd_api::openai::{ModelProfile, NativeRequest};
     use std::sync::Mutex;
     cuteafd_core::concurrency::validate("minimax_m3", u64::from(args.max_sequences))?;
-    // Probes and selection must resolve the same policy before either is initialized.
-    crate::shared::draft::draft_mode_with_default(cuteafd_core::DraftMode::Shared);
     ensure!(matches!(args.token_io.embed_placement, crate::shared::token_io::EmbedPlacement::Gpu)
         && args.token_io.token_select == crate::shared::token_io::SelectPlacement::Device,
         "MiniMax serving requires admitted GPU embedding and device selection");
@@ -99,11 +98,12 @@ pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
         .context("MiniMax serving requires --model-id for a snapshot without HF identity")?;
     let mut profile = ModelProfile::new(model, encoding);
     profile.expert_usage = args.expert_usage_reader.clone();
+
     let (queue, mut receive) = tokio::sync::mpsc::channel::<NativeRequest>(
         cuteafd_core::concurrency::queue_depth(u64::from(args.max_sequences)) as usize);
     let stats = Arc::new(Mutex::new(serde_json::Value::Null));
     let worker_stats = Arc::clone(&stats);
-    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<Result<usize>>();
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<Result<(usize, Option<Arc<cuteafd_api::openai::media::MediaPreparer>>, Option<Arc<std::sync::atomic::AtomicBool>>)>>();
     let worker_args = args.clone();
     let worker = tokio::task::spawn_blocking(move || -> Result<()> {
         let mut ready = Some(ready_tx);
@@ -123,6 +123,7 @@ pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
             let programs = library.programs()?.with_manifest(&worker_args.manifest)?;
             let concurrency = usize::from(worker_args.max_sequences);
             let loaded = super::startup::load(&library, &programs, &view, &checkpoint, &cfg, super::startup::Options {
+                media: &worker_args.media,
                 device: worker_args.device, split_device: worker_args.split_device,
                 peers: &worker_args.peers, native_lib: &worker_args.native_lib,
                 manifest_path: &worker_args.manifest,
@@ -140,18 +141,23 @@ pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
                 resident_weights: crate::shared::memory::budget::resident_weight_limit(),draft:worker_args.dspark })?;
             let served_context = usize::try_from(loaded.admitted.solved.served_context())?;
             let backend = super::backend::MiniMaxBackend::new(&loaded.owners, &cfg,
-                loaded.execution, served_context, loaded.host_prefix, worker_args.prefill_packing)?;
+                loaded.execution, served_context, loaded.host_prefix, worker_args.prefill_packing)?.with_probe_snapshot(&worker_args.snapshot)
+                .with_media_enabled(loaded.media.preparer.is_some());
+            let image = loaded.media.preparer.clone();
+            let health = loaded.media.encoder.health_handle();
+            let mut media = cuteafd_engine::media::MediaAdmission::new(
+                cuteafd_engine::media::EmbeddingCache::new(loaded.media.cache_bytes), loaded.media.encoder, 16);
             library.cuda_set_device(worker_args.split_device.unwrap_or(worker_args.device))?;
             let physical = std::iter::once(worker_args.device).chain(worker_args.split_device).collect::<Vec<_>>();
             scheduler::schedule(&backend, &worker_args.snapshot, &mut receive, &worker_stats,
                 concurrency, if worker_args.dspark { scheduler::Drafts::Neural { depth:7 } } else { scheduler::Drafts::None },
                 worker_args.draft_length, eos, worker_args.decode_share,
                 &worker_args.prefix, worker_args.loop_abort.config(), worker_args.token_io.token_select,
-                &mut super::super::qwen3_5::serve::text_media(), None, || {
+                &mut media, None, || {
                     backend.require_live()?;
                     RuntimeInventory::measure(&library, &physical, InventoryPhase::PostLoad,
                         |_| Ok(()))?.record("minimax_m3-serving-loaded", &loaded.admission_free);
-                    if let Some(ready) = ready.take() { let _ = ready.send(Ok(served_context)); }
+                    if let Some(ready) = ready.take() { let _ = ready.send(Ok((served_context, image, health))); }
                     Ok(())
                 })
         })();
@@ -160,7 +166,8 @@ pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
                 Err(error) => error, Ok(_) => unreachable!("sent an error") })
         })
     });
-    let context = ready_rx.await.context("MiniMax worker exited before readiness")??;
+    let (context, image, health) = ready_rx.await.context("MiniMax worker exited before readiness")??;
+    if let Some(image) = image { profile = profile.with_grouped_vision(image); profile.vision_health=health; }
     let limits = args.prefix.reserve.limits(context)?;
     let snapshot = args.snapshot.clone();
     let hub = crate::shared::console::hub(false, || Ok(crate::shared::console::Layout::new(
@@ -205,12 +212,13 @@ mod tests {
     }
 
     #[test]
-    fn shared_policy_fallback_is_selected_before_probes_and_native_startup() {
-        let source = include_str!("serve.rs").split_once("pub(crate) async fn run(").unwrap().1
-            .split_once("#[cfg(test)]").unwrap().0;
-        let policy = source.find("draft_mode_with_default(cuteafd_core::DraftMode::Shared)").unwrap();
-        assert!(policy < source.find("cuteafd_ffi::NativeLibrary::load(").unwrap());
-        assert!(policy < source.find("super::startup::load(").unwrap());
+    fn minimax_resolves_the_global_draft_policy_default() {
+        let source = include_str!("serve.rs").split_once("#[cfg(test)]").unwrap().0;
+        assert!(!source.contains("draft_mode_with_default"));
+        assert!(!source.contains("DraftMode::Shared"));
+        if std::env::var("CUTEAFD_DRAFT_POLICY").unwrap_or_default().is_empty() {
+            assert_eq!(crate::shared::draft::draft_mode(), cuteafd_core::DraftMode::Simple);
+        }
     }
 
     #[test]

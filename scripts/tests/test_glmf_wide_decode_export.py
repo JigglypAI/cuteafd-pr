@@ -54,6 +54,8 @@ def exporter(monkeypatch):
         index_topk=2048, index_norm_eps=1e-5, hidden=7168, q_lora_rank=1536, page_rows=64,
         sparse_mla_row_chunk_size=64)
     package.kimi_mla.KimiMlaGeometry = lambda **kw: KimiGeometry(**kw)
+    package.kimi_mla.MlaDraftGeometry = lambda **kw: KimiGeometry(heads=64, **kw)
+    package.kimi_mla.CausalMlaDraftGeometry = lambda **kw: KimiGeometry(heads=96, window_size=1024, **kw)
     package.kimi_mla.kimi_context_heads_per_tile = lambda *, rows: 8 if rows < 4 else 16
     @dataclasses.dataclass(frozen=True)
     class PartialProgram:
@@ -647,7 +649,7 @@ def test_kimi_nope_mla_exports_both_head_layouts_and_all_modes(exporter, decode_
     programs = exporter.kimi_kda_programs(GEOMETRY, decode_rows, prefill_rows, 1048576)
     calls = {stem: (op, params, thunk()) for stem, op, params, thunk in programs
              if op in ("mla_producer", "mla_output", "dense_mla")}
-    assert len([p for p in programs if p[1].startswith("mla_draft_")]) == 11
+    assert len([p for p in programs if p[1].startswith("mla_draft_")]) == 14
     assert len(calls) == 2 * (3 * len({decode_rows, prefill_rows}) + 6)
     for heads in (48, 96):
         suffix = "" if heads == 48 else "_h96"
@@ -676,7 +678,9 @@ def test_kimi_k31_exports_native_dsa_without_changing_k3_or_enabling_a_drafter(e
     programs = exporter.kimi_k31_programs(GEOMETRY, decode_rows, prefill_rows, 1048576)
     catalog = {stem: (op, params, build) for stem, op, params, build in programs}
     assert len(catalog) == len(programs)
-    assert not any("draft" in stem or "dense_mla" in stem for stem in catalog)
+    assert not any("dense_mla" in stem for stem in catalog)
+    assert {stem for stem in catalog if "draft" in stem} == {
+        stem for stem, *_ in exporter.mla_draft_fp8_weight_programs(64, causal=True)}
     assert {"kda_commit", "lse_combine2", "dsa_candidate_merge"} <= catalog.keys()
     for suffix, row_bytes in [("", 1152), ("_fp8", 656)]:
         module, function, args, kwargs = catalog[f"paged_staging_gather{suffix}"][2]()
@@ -758,6 +762,23 @@ def test_kimi_context_exports_native_partial_ranges_and_shared_primitives(export
     assert {stem for stem, *_ in programs} <= catalog
 
 
+@pytest.mark.parametrize("causal", [False, True])
+def test_mla_fp8_weight_exports_are_additive_and_cache_independent(exporter, causal):
+    wrappers = exporter.mla_draft_fp8_weight_programs(64, causal=causal)
+    assert len(wrappers) == 3 and len({stem for stem, *_ in wrappers}) == 3
+    for stem, op, params, build in wrappers:
+        module, function, args, kwargs = build()
+        assert module == "kimi_mla" and function == f"compile_{op}_aot"
+        assert args[0].heads == (96 if causal else 64)
+        assert kwargs == {"max_rows": 64}
+        assert "fp8_weights" in stem
+        if "producer" in stem:
+            assert args[0].kv_cache == params["kv_cache"]
+    if not causal:
+        assert not {stem for stem, *_ in wrappers}.intersection(
+            stem for stem, *_ in exporter.mla_draft_programs(64, 1048576))
+
+
 @pytest.mark.parametrize("namespace", ["kimik3"])
 def test_shared_mla_drafter_requested_names_exist_in_family_catalog(exporter, namespace):
     ffi = (ROOT / "rust/crates/cuteafd-ffi/src/shared/mla_draft.rs").read_text()
@@ -810,7 +831,7 @@ def test_shared_gqa_drafter_requested_symbols_exist_in_native_catalog(family):
 def test_kimi_w8_exports_every_residual_transition_and_situ_width(exporter):
     programs = exporter.kimi_w8_programs()
     calls = {stem: (op, params, thunk()) for stem, op, params, thunk in programs}
-    assert len(calls) == len(programs) == 48
+    assert len(calls) == len(programs) == 56
     for stem, (op, params, (module, fn, args, kwargs)) in calls.items():
         assert args == () and kwargs == params
         if op == "bf16_projection":
@@ -825,7 +846,10 @@ def test_kimi_w8_exports_every_residual_transition_and_situ_width(exporter):
             assert params == expected
             continue
         assert module == "kimi_residual"
-        if op == "situ":
+        if op == "attn_res_stream":
+            assert fn == "compile_kimi_attn_res_stream_aot"
+            assert params == {"hidden": 7168, "candidates": int(stem.removeprefix("attn_res_stream_c"))}
+        elif op == "situ":
             assert fn == "compile_kimi_situ_aot"
             assert params == {"intermediate": int(stem.removeprefix("situ_i"))}
         else:

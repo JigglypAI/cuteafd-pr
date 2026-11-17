@@ -48,6 +48,10 @@ pub enum PrefixError {
         #[source]
         source: BoxError,
     },
+    #[error("prefix copy drain failed: {source}")]
+    Drain { #[source] source: BoxError },
+    #[error("prefix restore rollback failed: {source}")]
+    Rollback { #[source] source: BoxError },
     #[error("snapshot of {tokens} tokens, but the placement committed {committed} (reach {reach})")]
     Frontier { tokens: usize, committed: usize, reach: usize },
     #[error(transparent)]
@@ -430,18 +434,42 @@ impl<E: CopyEngine, M: Clone + Default> PrefixCache<E, M> {
         self.make_room_for(family, self.pool.need_for(0..total), None)?;
         let pages = self.pool.alloc_for(0..total)?;
         let mut placement = build(pages.clone());
-        if let Err(source) = family.bind(&mut placement) {
-            self.release(family, &pages)?;
-            return Err(PrefixError::Family { what: "bind", source });
-        }
-        if let Err(error) = self.admit_draft(family, &mut placement, capacity.max(tokens)) {
-            self.drain(family)?;
-            family.discard(&mut placement).map_err(|source|
-                PrefixError::Family { what: "discard draft admission", source })?;
-            self.release(family, &pages)?;
-            return Err(error);
+        let admitted = family.bind(&mut placement)
+            .map_err(|source| PrefixError::Family { what: "bind", source })
+            .and_then(|()| self.admit_draft(family, &mut placement, capacity.max(tokens)));
+        if let Err(error) = admitted {
+            // A failing bind may already have queued writes; successful cold admission
+            // retains the existing no-copy/no-extra-drain hot path.
+            self.dirty = true;
+            self.rollback(family, &mut placement, pages, None, error)?;
+            unreachable!("rollback always returns the admission error");
         }
         Ok(Admitted { placement, resume: 0, after: None, source: None })
+    }
+
+    /// Undo every stage of a failed admission before retrying cold. Only the original family
+    /// operation is recoverable; an unproved drain or reset quarantines the references forever.
+    fn rollback<F: PrefixFamily<M>>(&mut self, family: &F, placement: &mut F::Placement,
+        pages: Vec<u32>, temporary_mark: Option<Mark>, error: PrefixError) -> Result<(), PrefixError> {
+        let drained = if matches!(error, PrefixError::Drain { .. }) { Err(error) }
+            else { family.drain_rollback().map(|()| { self.dirty = false; error })
+                .map_err(|source| PrefixError::Drain { source }) };
+        let (error, failure) = match drained {
+            Ok(error) => (Some(error), family.discard(placement).err()),
+            Err(error) => (None, Some(Box::new(error) as BoxError)),
+        };
+        if let Some(source) = failure {
+            tracing::warn!(target: "cuteafd::prefix", slot = ?family.placement_slot(placement),
+                pages = pages.len(), cause = %source, "prefix rollback quarantined until restart");
+            family.quarantine_draft_pages(placement);
+            family.quarantine(placement);
+            self.quarantine.push(Quarantined { _pages: pages, _mark: temporary_mark, _draft: None });
+            self.stats.quarantined += 1;
+            return Err(PrefixError::Rollback { source });
+        }
+        self.release(family, &pages)?;
+        self.give_back(family, temporary_mark)?;
+        Err(error.expect("successful drain preserved the admission error"))
     }
 
     /// Device lookup under the family's rule. An exact-length match whose snapshot cannot
@@ -647,37 +675,28 @@ impl<E: CopyEngine, M: Clone + Default> PrefixCache<E, M> {
                         .map_err(|e| ("restore draft pages cold", e)),
                 result => result.map_err(|e| ("restore draft pages", e)),
             });
-        if let Err((what, source)) = restored {
-            // Drain before the pages can be handed out again; the family resets what it bound.
-            self.drain(family)?;
-            if let Err(error) = family.discard(&mut placement) {
-                tracing::error!(target: "cuteafd::prefix", %error, "discarding a failed restore");
+        let restored = restored.map_err(|(what, source)| PrefixError::Family { what, source });
+        let restored = restored.and_then(|()| {
+            let mut admitted = self.admit_draft(family, &mut placement, draft_capacity);
+            if matches!(admitted, Err(PrefixError::DraftPages(_))) && draft.is_some() {
+                // Optional retained draft history must not reject an otherwise admissible hit.
+                self.drain(family)?;
+                family.restore_draft_pages(None, &mut placement, resume).map_err(|source|
+                    PrefixError::Family { what: "drop unadmitted draft history", source })?;
+                admitted = self.admit_draft(family, &mut placement, draft_capacity);
             }
-            self.release(family, &pages)?;
-            if temporary { self.give_back(family, mark)?; }
-            return Err(PrefixError::Family { what, source });
+            admitted?;
+            if self.host.is_some() && mark.is_some() { self.drain(family)?; }
+            Ok(())
+        });
+        if let Err(error) = restored {
+            self.rollback(family, &mut placement, pages, if temporary { mark } else { None }, error)?;
+            unreachable!("rollback always returns the admission error");
         }
-        if self.host.is_some() && mark.is_some() { self.drain(family)?; }
         if temporary { self.give_back(family, mark)?; }
         if promoted {
             let mark = self.entries.get_mut(&hit.id).and_then(|e| e.mark.take());
             self.give_back(family, mark)?;
-        }
-        let mut admitted = self.admit_draft(family, &mut placement, draft_capacity);
-        if matches!(admitted, Err(PrefixError::DraftPages(_))) && draft.is_some() {
-            // Retained history is optional; do not reject a target hit when a cold
-            // drafter's smaller live credit fits beside the other active requests.
-            self.drain(family)?;
-            family.restore_draft_pages(None, &mut placement, resume).map_err(|source|
-                PrefixError::Family { what: "drop unadmitted draft history", source })?;
-            admitted = self.admit_draft(family, &mut placement, draft_capacity);
-        }
-        if let Err(error) = admitted {
-            self.drain(family)?;
-            family.discard(&mut placement).map_err(|source|
-                PrefixError::Family { what: "discard draft admission", source })?;
-            self.release(family, &pages)?;
-            return Err(error);
         }
         let host_hit = promoted || temporary;
         self.stats.host_hits += u64::from(host_hit);
@@ -1327,7 +1346,7 @@ impl<E: CopyEngine, M: Clone + Default> PrefixCache<E, M> {
 
     fn drain<F: PrefixFamily<M>>(&mut self, family: &F) -> Result<(), PrefixError> {
         if self.dirty {
-            family.drain().map_err(|source| PrefixError::Family { what: "drain", source })?;
+            family.drain().map_err(|source| PrefixError::Drain { source })?;
             self.dirty = false;
         }
         Ok(())

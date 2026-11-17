@@ -480,11 +480,18 @@ case "$(get GRAPH_PREWARM on)" in
     graph_policy_args+=(--graph-no-prewarm) ;;
   *) release_die 'GRAPH_PREWARM must be on or off' ;;
 esac
-case "$(get GRAPH_DONOR_ALWAYS off)" in
+graph_donor_always="$(get GRAPH_DONOR_ALWAYS off)"
+case "$graph_donor_always" in
   on) graph_policy_args+=(--graph-donor-always) ;;
   off) ;;
   *) release_die 'GRAPH_DONOR_ALWAYS must be on or off' ;;
 esac
+graph_donor_cold_lag="$(get GRAPH_DONOR_COLD_LAG 0)"
+[[ "$graph_donor_cold_lag" =~ ^[0-9]+$ ]] || release_die 'GRAPH_DONOR_COLD_LAG must be a non-negative integer'
+if [[ "$graph_donor_cold_lag" =~ [1-9] ]]; then
+  [[ "$graph_donor_always" == on ]] || release_die 'GRAPH_DONOR_COLD_LAG requires GRAPH_DONOR_ALWAYS=on when non-zero'
+  graph_policy_args+=(--graph-donor-cold-lag "$graph_donor_cold_lag")
+fi
 if [[ "$family" == qwen3_5 ]]; then
   case "$(get DECODE_GRAPHS on)" in
     on) graph_census_args+=(-e CUTEAFD_QWEN35_GRAPHS=1) ;;
@@ -1413,20 +1420,11 @@ case "$family" in
   muse_spark) serve=serve-muse ;;
   *) echo "run-family.sh serves DeepSeek V4, GLM 5.x, GLM 5.3 Flash, MiMo V2, Qwen 3.8, Kimi K3, Step-5 and Muse Spark checkpoints, not $family (./run.sh serves DeepSeek V4.1)" >&2; exit 2 ;;
 esac
-# Kimi K3 and Step-5 serve through their own commands: automatic attention
-# placement, text only (their bundled vision towers are not in scope) and GPU
-# token embeddings. Kimi ships no MTP head; Step-5 defaults to native MTP
-# depth 3 (SPECULATOR=off disables it).
-text_family=0
-[[ "$family" != kimi_k3 && "$family" != step5 && "$family" != minimax_m3 && "$family" != inkling2 ]] || text_family=1
 # These commands own automatic context, pool and Spark budgets independently of media.
-standalone_family=$text_family
-[[ "$family" != muse_spark ]] || standalone_family=1
-if ((text_family)); then
-  case "$vision:$audio" in
-    auto:auto|auto:off|off:auto|off:off) vision=off; audio=off ;;
-    *) release_die "$family bundled media execution is not qualified; set VISION=off and AUDIO=off" ;;
-  esac
+standalone_family=0
+[[ "$family" != minimax_m3 && "$family" != kimi_k3 && "$family" != inkling2 && "$family" != step5 && "$family" != muse_spark ]] || standalone_family=1
+if [[ "$family" == kimi_k3 || "$family" == minimax_m3 || "$family" == inkling2 || "$family" == step5 ]]; then
+  case "$audio" in auto|off) audio=off ;; *) release_die "$family has no bundled audio execution owner" ;; esac
 fi
 if [[ "$family" == qwen3_5 ]]; then
   case "$vision:$audio" in
@@ -1604,9 +1602,6 @@ fi
 # 2 Sparks and 2 RTX + 4 Sparks) for each checkpoint. DFlash2 led on every one
 # measured (2026-10-04: wrldsuksgo2mars EXL3 K3.25, nvidia NVFP4, brandonmusic
 # tr3 4bpw; agentic 1.3-1.5x dSpark); SPECULATOR=dspark selects the RedHat dSpark.
-# Qualification is for these official checkpoints, not a shape-compatible sibling.
-mimo_flash_mopd=0
-[[ "$family:$model" != mimo_v2:XiaomiMiMo/MiMo-V2.6-Flash-MOPD ]] || mimo_flash_mopd=1
 # DeepSeek V4 checkpoints carry their dSpark drafter beside the target (mtp.0.*,
 # dspark_block_size in config.json); one without it serves without speculation.
 dsv4_dspark=0
@@ -1614,19 +1609,14 @@ if [[ $family == deepseek_v4 ]]; then
   dsv4_dspark="$(python3 -c 'import json,sys; print(int(int(json.load(open(sys.argv[1])).get("dspark_block_size") or 0) > 0))' "$root/snapshots/$revision/$selected_config")"
 fi
 speculator="$(get SPECULATOR)"
+if [[ "$family" == kimi_k3 ]]; then kimi_requested_speculator="$speculator"; speculator=off; fi
 # MiniMax uses its bundled native drafter on whole, Layers and Heads placements.
 if [[ ( "$family" == minimax_m3 || "$family" == inkling2 ) && ( -z "$speculator" || "$speculator" == auto ) ]]; then speculator=dspark; fi
 # Qwen resolves auto only after expert admission, not from configured inventory.
 if [[ "$family" == qwen4 && ( -z "$speculator" || "$speculator" == auto ) ]]; then speculator=auto; fi
 default_drafter=""
 [[ "$family" != muse_spark ]] || default_drafter=nvidia/Muse-Spark-Open-816B-A42B-DFlash2
-if [[ "$family" == kimi_k3 ]]; then
-  kimi_defaults="$(docker run --rm --network none -e "HF_HOME=$container_hf_home" \
-    "${generic_worker_mounts[@]}" "${wip_mount_args[@]}" "$coordinator_image" cuteafd plan "$snapshot" \
-    --checkpoint-model-id "$model" --speculator "${speculator:-auto}" --resolve-settings-only)" || exit 2
-  speculator="$(jq -er '.speculator' <<<"$kimi_defaults")"
-  if [[ "$speculator" == dspark ]]; then default_drafter="$(jq -er '.default_drafter' <<<"$kimi_defaults")"; fi
-fi
+
 if [[ -z "$speculator" ]]; then
   speculator=off
   if [[ $speculator == off && $family == glm5 && -z ${cfg[SPECULATOR]+set} ]]; then
@@ -1699,6 +1689,17 @@ if [[ "$family" == inkling2 ]]; then
   coordinator_gpu_count=1
 fi
 release_resolve_coordinator_gpus "$explicit_coordinator_gpus" "$coordinator_gpu_count"
+if [[ "$family" == kimi_k3 ]]; then
+  kimi_rtx="${#RELEASE_COORDINATOR_GPU_INDICES[@]}"
+  [[ "$split" != off ]] || kimi_rtx=1
+  kimi_draft_kv_default=fp8
+  kimi_draft_kv="$(get DRAFT_KV_CACHE "$kimi_draft_kv_default")"
+  kimi_defaults="$(docker run --rm --network none -e "HF_HOME=$container_hf_home" \
+    "${generic_worker_mounts[@]}" "${wip_mount_args[@]}" "$coordinator_image" cuteafd plan "$snapshot" \
+    --checkpoint-model-id "$model" --rtx "$kimi_rtx" --core-view "$core_view" --kv-cache "$(get KV_CACHE fp8)" --draft-kv-cache "$kimi_draft_kv" --speculator "${kimi_requested_speculator:-auto}" --resolve-settings-only)" || exit 2
+  speculator="$(jq -er '.speculator' <<<"$kimi_defaults")"
+  if [[ "$speculator" == dspark ]]; then default_drafter="$(jq -er '.default_drafter' <<<"$kimi_defaults")"; fi
+fi
 profile_bytes="$(release_cuda_total_bytes "$RELEASE_COORDINATOR_GPU_UUID")" || release_die "cannot query coordinator CUDA capacity"
 profile="$(release_coordinator_profile "$profile_bytes" "$coordinator_budget")" || release_die "cannot resolve coordinator capacity profile"
 read -r profile_cap default_concurrency <<<"$profile"
@@ -1781,8 +1782,11 @@ if [[ -n "$chat_template_from" && "$vision" != off ]]; then
   fi
   family_args+=(--chat-template-from "$chat_template_from")
 fi
-# Kimi K3 and Step-5 serve text only; their commands take no media options.
-((text_family)) || family_args+=(--vision "$vision" --audio "$audio")
+# Still towers use the shared media options and the admitted encoder owner.
+family_args+=(--vision "$vision" --audio "$audio")
+if [[ "$family" == inkling2 || "$family" == step5 || "$family" == kimi_k3 ]]; then
+  family_args+=(--vision-replicas "$vision_replicas")
+fi
 
 dspark_args=()
 if [[ $family == mimo_v2 ]]; then
@@ -1833,6 +1837,7 @@ case "$speculator" in
       draft_args=(--draft "$draft_snapshot")
       if [[ "$family" == muse_spark || "$family:$speculator" == kimi_k3:dspark ]]; then
         muse_draft_kv="$(get DRAFT_KV_CACHE fp8)"
+        [[ "$family" != kimi_k3 ]] || muse_draft_kv="$kimi_draft_kv"
         case "$muse_draft_kv" in bf16|fp8) ;; *) release_die "DRAFT_KV_CACHE must be bf16 or fp8" ;; esac
         draft_args+=(--draft-kv-cache "$muse_draft_kv")
       fi
@@ -1867,7 +1872,7 @@ case $family in
     family_args+=(--prefix-cache-entries "$effective_prefix_entries")
     [[ "$(get HOST_CACHE_BYTES auto)" == 0 ]] || family_args+=(--host-cache-bytes "$(get HOST_CACHE_BYTES auto)") ;;
 esac
-if [[ ( $family == mimo_v2 || $family == qwen4 || $family == glm5_flash ) && $vision != off ]]; then
+if [[ ( $family == mimo_v2 || $family == qwen4 || $family == glm5_flash || $family == inkling2 || $family == step5 || $family == kimi_k3 ) && $vision != off ]]; then
   # Text-only frozen daemons can predate the optional media-cache flag.
   [[ -z "$(get MEDIA_CACHE_BYTES)" ]] || family_args+=(--media-cache-bytes "$(get MEDIA_CACHE_BYTES)")
 fi
@@ -2085,16 +2090,14 @@ if [[ $serve != serve-dsv4 ]]; then
     if [[ $family == mimo_v2 ]]; then
       [[ -z "$(get DRAFT_CONTEXT_SLOTS)" ]] || family_args+=(--draft-context-slots "$(get DRAFT_CONTEXT_SLOTS)")
       [[ -z "$(get DRAFT_SEQUENCES)" ]] || family_args+=(--draft-sequences "$(get DRAFT_SEQUENCES)")
-      mimo_draft_default=""
-      if [[ $mimo_flash_mopd == 1 && $speculator == dflash2 && -z "$drafter" ]]; then
-        mimo_draft_default=on
-      fi
-      case "$(get SPECULATOR_FP8 "$mimo_draft_default")" in
-        "") ;;
-        auto) family_args+=(--draft-representation checkpoint) ;;
-        on) family_args+=(--draft-fp8 true) ;;
-        off) family_args+=(--draft-fp8 false) ;;
+      case "$(get SPECULATOR_FP8)" in
+        ""|auto|on|off) ;; # Rust emits the one precision choice after admission.
         *) echo "MiMo SPECULATOR_FP8 must be auto, on or off" >&2; exit 2 ;;
+      esac
+    elif [[ $family == kimi_k3 ]]; then
+      case "$(get SPECULATOR_FP8 auto)" in
+        auto|on|off) ;; # Planner resolves this key and emits the sole serve flag below.
+        *) release_die "Kimi SPECULATOR_FP8 must be auto, on or off" ;;
       esac
     elif [[ $family == glm5 || $family == glm5_flash ]]; then
       case "$(get SPECULATOR_FP8 auto)" in
@@ -2412,7 +2415,7 @@ audio_encoder_hash=""
   fi
   if [[ "$family" == kimi_k3 && ( "$speculator" == dflash2 || "$speculator" == dspark ) ]]; then
     plan_draft_args+=(--drafter-snapshot "$draft_snapshot")
-    if [[ "$speculator" == dspark ]]; then plan_draft_args+=(--draft-kv-cache "$(get DRAFT_KV_CACHE fp8)"); fi
+    if [[ "$speculator" == dspark ]]; then plan_draft_args+=(--draft-kv-cache "$(get DRAFT_KV_CACHE "${kimi_draft_kv_default:-fp8}")"); fi
   fi
   if [[ "$family:$speculator" == muse_spark:dflash2 ]]; then
     plan_draft_args+=(--drafter-snapshot "$draft_snapshot")
@@ -2422,7 +2425,7 @@ audio_encoder_hash=""
   for ((i=0; i<${#family_args[@]}; i++)); do
     [[ "${family_args[i]}" != --host-cache-bytes ]] || plan_host_cache="${family_args[i+1]}"
     [[ "${family_args[i]}" != --media-cache-bytes ]] || plan_draft_args+=(--media-cache-bytes "${family_args[i+1]}")
-    if [[ "$family" == glm5_flash && ( "${family_args[i]}" == --draft-fp8 || "${family_args[i]}" == --draft-linear ) ]]; then
+    if [[ ( "$family" == glm5_flash || "$family" == kimi_k3 ) && ( "${family_args[i]}" == --draft-fp8 || "${family_args[i]}" == --draft-linear ) ]]; then
       plan_draft_args+=("${family_args[i]}" "${family_args[i+1]}")
     fi
   done
@@ -2656,6 +2659,9 @@ audio_encoder_hash=""
   if [[ "$family" == kimi_k3 && ( "$speculator" == dflash2 || "$speculator" == dspark ) ]]; then
     draft_args+=(--draft-fp8 "$(jq -er '.resolved_settings.draft_fp8.value | tostring' <<<"$deployment_json")")
   fi
+  if [[ "$family:$speculator" == mimo_v2:dflash2 ]]; then
+    draft_args+=(--draft-fp8 "$(jq -er '.resolved_settings.draft_fp8.value | tostring' <<<"$deployment_json")")
+  fi
   if [[ "$family:$speculator" == mimo_v2:mtp ]]; then
     family_args+=(--mtp "$(jq -er '.resolved_settings.native_mtp_layers.value' <<<"$deployment_json")")
   fi
@@ -2724,7 +2730,7 @@ if [[ -n "$expert_input" && "$expert_input" != fp8 ]]; then
   done
 fi
 if { [[ ( "$family" == mimo_v2 || "$family" == qwen4 || "$family" == glm5_flash
-          || "$family" == muse_spark || "$checkpoint_family" == mistral_large4 ) && "$vision" != off ]] &&
+          || "$family" == muse_spark || "$family" == minimax_m3 || "$family" == kimi_k3 || "$family" == inkling2 || "$family" == step5 || "$checkpoint_family" == mistral_large4 ) && "$vision" != off ]] &&
    python3 -c 'import json,sys; sys.exit(0 if json.load(open(sys.argv[1])).get("vision_config") else 1)' "$root/snapshots/$revision/$selected_config"; } ||
    [[ "$audio" != off ]]; then
   selected="$(python3 -c '
@@ -2732,8 +2738,8 @@ import json,sys
 p=json.load(sys.stdin); e=p.get("encoder")
 assert p["placement_supported"] and p["fits"], "encoder deployment cannot fit: "+str(p.get("hints"))
 k=e["kind"] if e else {"kind":"off"}; kind=k["kind"]; h=p["encoder_plan_hash"]
-cap=p.get("max_image_tokens") or (1024 if sys.argv[1]=="qwen4" else 4096)
-assert type(cap) is int and 1<=cap<=4096, "invalid encoder image cap"
+cap=p.get("max_image_tokens") or ({"qwen4":1024,"minimax_m3":576,"kimi_k3":16698,"inkling2":4096,"step5":4096}.get(sys.argv[1],4096))
+assert type(cap) is int and 1<=cap<=16698, "invalid encoder image cap"
 assert len(h)==64 and all(c in "0123456789abcdef" for c in h), "invalid encoder plan hash"
 if kind=="spark":
     ranks=[k["rank"]]+e["replicas"]

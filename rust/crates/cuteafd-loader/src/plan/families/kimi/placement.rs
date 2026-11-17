@@ -46,15 +46,6 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
     let rows = prefill.span_rows as usize;
     let unit = prefill.unit_rows as usize;
     let cfg = model.cfg();
-    if !model.core.serving_qualified(cfg) {
-        report.runtime = Some(crate::plan::RuntimeStatus::Planned);
-        if !report.hints.iter().any(|h| h.what.contains("Kimi K3.1 serving remains gated")) {
-            report.hints.push(crate::plan::Hint {
-                what: "Kimi K3.1 K8/FP8 core serving remains Planned: fidelity is unmeasured (#1777)".into(),
-                how: "Use CORE_VIEW=original (BF16) or k6-compact, or the native standalone Core-K6 checkpoint.".into(),
-            });
-        }
-    }
     let ranks = requested.spark_ranks();
     let gpus = opts.rtx_bytes.len();
     let mut memory = MemoryLayout { devices: Vec::new(), pool_tokens: 0, waste: Vec::new(), notes: vec![
@@ -91,7 +82,6 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
     let head_rank = gpus - 1;
     let modes = if gpus == 1 { &[WHOLE][..] } else { MODES };
     let requested_pool = opts.pool_tokens.filter(|n| *n > 0);
-    let target_pool = opts.target_pool_tokens.max(context);
     let edge = |c| *model.bytes.get(&c).unwrap_or(&0);
     let (embedding, head) = (edge(Component::Embedding), model.core.projections.get("language_model.lm_head")
         .map_or(edge(Component::LmHead), |p| p.resident_bytes(1).expect("validated core dimensions")));
@@ -292,16 +282,18 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
         let raw: serde_json::Value = serde_json::from_slice(&std::fs::read(snapshot.join("config.json"))?)?;
         let slots = usize::try_from(slots)?;
         let layout = if raw["speculators_model_type"] == "dspark" {
-            anyhow::ensure!(!opts.kimi_draft_fp8 && !opts.tp2_dflash,
-                "block dSpark uses native BF16 weights and physical GQA head splits, not TP2_DFLASH");
+            anyhow::ensure!(!opts.tp2_dflash,
+                "block dSpark uses physical GQA head splits, not TP2_DFLASH");
+            let representation=if opts.kimi_draft_fp8 { GlmDraftRepresentation::Fp8Only }
+                else { GlmDraftRepresentation::Bf16Only };
             if gpus==2 {
-                let rank=|rank|crate::formats::block_dspark::BlockDsparkRuntimeLayout::for_rank(snapshot,
+                let rank=|rank|crate::formats::block_dspark::BlockDsparkRuntimeLayout::for_rank_representation(snapshot,
                     slots,slots.min(8),opts.physical_sms.unwrap_or(188) as usize,&format!("kimi/draft/{rank}"),
-                    opts.draft_kv_cache,rank,2,head_rank);
+                    opts.draft_kv_cache,rank,2,head_rank,representation);
                 DraftLayout::BlockTp2 { ranks:Box::new([rank(0)?,rank(1)?]),lead:head_rank }
             } else {
-                DraftLayout::Block(crate::formats::block_dspark::BlockDsparkRuntimeLayout::with_kv(snapshot,
-                    slots,slots.min(8),opts.physical_sms.unwrap_or(188) as usize,&format!("kimi/draft/{head_rank}"),opts.draft_kv_cache)?)
+                DraftLayout::Block(crate::formats::block_dspark::BlockDsparkRuntimeLayout::with_representation(snapshot,
+                    slots,slots.min(8),opts.physical_sms.unwrap_or(188) as usize,&format!("kimi/draft/{head_rank}"),opts.draft_kv_cache,representation)?)
             }
         } else {
             let draft = MlaDflashConfig::from_json(&raw)?;
@@ -464,7 +456,21 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
         context_buffers.query_row_bytes.saturating_add(context_buffers.partial_row_bytes)
     } else { 0 };
     let page_rows = if modes.iter().any(|mode| *mode == LayerMode::ContextSplit) { PAGE * 2 } else { PAGE };
-    let ceiling = target_pool.max(requested_pool.unwrap_or(0));
+    let mut facts = crate::placement::PoolFacts::new(crate::placement::planner::Context::resolve(context, (opts.context_tokens > 0).then_some(opts.context_tokens)),
+        requested_pool, PAGE);
+    // Whole-layer placements may give all MLA to either owner. Sum memory
+    // against the checkpoint's total record slope to bound every legal cut.
+    facts.memory = vec![crate::placement::PoolMemory {
+        available_bytes: opts.rtx_bytes[..gpus].iter().sum(),
+        bytes_per_unit: cfg.mla_layers() as u64 * PAGE * opts.mla_kv.record_bytes() as u64,
+    }];
+    facts.target = opts.target_pool_tokens;
+    let pool = match crate::placement::prepare_pool(facts) {
+        Ok(pool) => pool,
+        Err(error) => { report.refuse_placement(format!("Kimi pool policy: {error}"),
+            "Supply consistent KV target, min and max bounds."); return memory; }
+    };
+    let ceiling = pool.maximum_tokens();
     let maximum_pages = ceiling.div_ceil(page_rows);
     let draft_window_bytes = match draft.as_ref().map(|layout| layout.window_mark_bytes()).transpose() {
         Ok(bytes) => bytes.unwrap_or(0) as u64,
@@ -499,6 +505,8 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
             "Supply supported Spark endpoint geometry."); return memory; }
     };
     let mut recipe = KimiRecipe {
+        pool,
+        vision: None,
         expert_usage: kimi::usage_geometry(cfg, opts.expert_usage),
         context, gpus, placement: attention, attention: modes,
         prefill, lanes: LANES, spark_links: ranks > 0,
@@ -596,6 +604,13 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
             "Check the requested card capacities."); return memory; }
     };
     budgets.push(kimi::host_budget(host_total, host_available));
+    recipe.vision = match crate::placement::still_encoder::StillEncoder::planned(input.checkpoint(),
+        report.vision, opts.vision_replicas, &budgets,
+        opts.media_cache_bytes.unwrap_or((8 << 30).min(host_total / 20))) {
+        Ok(vision) => vision,
+        Err(error) => { report.refuse_placement(format!("Kimi bundled vision inventory refused: {error:#}"),
+            "Supply the bundled MoonViT3d tensors or use --vision off."); return memory; }
+    };
     report.host_budget_bytes = host_quota;
     let mut host_items = vec![cuteafd_core::memory_layout::host_table_item("Kimi host scoring logits", scoring_bytes),
         cuteafd_core::memory_layout::host_table_item("Kimi reusable H2D staging (estimated)", kimi::HOST_UPLOAD_BYTES)];
@@ -610,8 +625,17 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
         (8 << 30).max(host_total / 10), host_quota, host_items);
     let resolved = recipe.admit(kimi::request(crate::placement::planner::Context::resolve(context, (opts.context_tokens > 0).then_some(opts.context_tokens)), requested_pool, onboard, prefill,
         crate::placement::planner::Operation::Serving, ResidentWeights(opts.weight_budget_bytes), opts.spark_reply_formats), budgets);
+    let mut vision_items = vec![Vec::new(); ranks];
     let onboarded = match resolved {
         Ok(selection) => {
+            report.encoder = recipe.vision.as_ref().and_then(|vision| vision.admitted(&selection.solved));
+            report.phase_ledger = Some(crate::plan::SolvedPhaseLedger::from(&selection.solved));
+            for (rank, items) in vision_items.iter_mut().enumerate() {
+                *items = selection.solved.items(crate::placement::planner::Location {
+                    device: crate::placement::planner::Device::Spark(rank as u8),
+                    domain: crate::placement::planner::Domain::Managed }).unwrap_or_default().into_iter()
+                    .filter(|item| item.group.starts_with("vision ")).collect();
+            }
             let served = selection.solved.request.context.served(selection.solved.pool_tokens);
             memory.notes.retain(|note| !note.starts_with("Kimi API max context:"));
             memory.notes.push(format!("Kimi API max context: {served} tokens; compiled max context: {COMPILED_CAPACITY} tokens"));
@@ -672,6 +696,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
         if let Err(error) = kimi_owners(&mut device, &working, admitted.unit_rows, admitted.waves) {
             report.refuse_placement(format!("Kimi Spark execution owners: {error:#}"), "Use a supported wave count.");
         }
+        device.items.extend(vision_items[rank].clone());
         memory.devices.push(device);
     }
     memory.notes.push(format!("Spark budget {} B/rank includes rank-specific header arenas, endpoint I/O, runtime residual and typed execution owners (one prefill scratch, {} x {}-row units)",

@@ -179,6 +179,7 @@ impl Panel for DecodeContent {
             let acceptance = common::acceptance(before, after);
             rows.push(json!({"content": content, "tok_s": chat.timing.decode_tok_s(),
                 "tokens": chat.timing.completion_tokens, "ttft_s": chat.timing.ttft_s, "acceptance": acceptance,
+                "request": chat.timing,
                 "mapped_tables": common::mapped_interval(&table_before, &common::mapped_counters(ctx.client)),
                 "fabric": ctx.client.fabric_since(fabric_mark, &format!("{}/{}", self.id(), i), true)}));
             let row = rows.last_mut().expect("decode row");
@@ -220,6 +221,7 @@ impl Panel for Concurrency {
     }
     fn run(&self, ctx: &Ctx<'_>) -> Result<Value> {
         let levels = Self::levels(ctx.info);
+        let options = ctx.panel_config.map(crate::sustained::Options::parse).transpose()?.unwrap_or_default();
         let mut points = Vec::new();
         for (i, &c) in levels.iter().enumerate() {
             ctx.progress.step(i as f64 / levels.len() as f64, format!("C{c}"));
@@ -244,7 +246,21 @@ impl Panel for Concurrency {
                 "fabric": ctx.client.fabric_since(fabric_mark, &format!("{}/{}", self.id(), i), true)}));
             ctx.progress.partial(json!({"points": points}));
         }
-        let rows = points.iter().map(|p| vec![json!(format!("C{}", p["c"])), p["aggregate_tok_s"].clone(),
+        if options.sustained {
+            for &c in &levels {
+                ctx.progress.step(0.5, format!("sustained C{c}"));
+                let thermal_mark = ctx.client.thermal_mark();
+                let fabric_mark = ctx.client.fabric_mark();
+                let window = crate::sustained::run(ctx.client, c, &options, 192)?;
+                points.push(json!({"c": c, "phase": "sustained", "aggregate_tok_s": window.tok_s(),
+                    "per_request_tok_s": window.per_request_tok_s(), "ttft_s": window.ttft_s(),
+                    "sustained": window, "errors": 0,
+                    "thermal": ctx.client.thermal_since(thermal_mark),
+                    "fabric": ctx.client.fabric_since(fabric_mark, &format!("sustained/c{c}"), true)}));
+                ctx.progress.partial(json!({"points": points}));
+            }
+        }
+        let rows = points.iter().map(|p| vec![json!(if p["phase"] == "sustained" { format!("sustained C{}", p["c"]) } else { format!("C{}", p["c"]) }), p["aggregate_tok_s"].clone(),
             p["per_request_tok_s"].clone(), json!(p["ttft_s"].as_f64().unwrap_or(0.0) * 1e3), p["errors"].clone()]).collect();
         Ok(json!({"points": points, "table": table(&["concurrency", "aggregate tok/s", "per request tok/s", "TTFT ms",
             "errors"], rows)}))

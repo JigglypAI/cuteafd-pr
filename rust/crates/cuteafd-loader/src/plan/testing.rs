@@ -11,6 +11,16 @@ use std::fs;
 use std::io::Write;
 use std::path::Path;
 
+/// Derive a fixture's finite pool domain from its simulated budgets and native slopes.
+pub fn pool_facts(cards: &[u64], context: impl Into<crate::placement::planner::Context>,
+    requested: Option<u64>, unit_rows: u64, rank_unit_bytes: &[u64]) -> crate::placement::PoolFacts {
+    assert_eq!(cards.len(), rank_unit_bytes.len(), "one pool slope per simulated card");
+    let mut facts = crate::placement::PoolFacts::new(context, requested, unit_rows);
+    facts.memory = cards.iter().zip(rank_unit_bytes).map(|(&available_bytes, &bytes_per_unit)|
+        crate::placement::PoolMemory { available_bytes, bytes_per_unit }).collect();
+    facts
+}
+
 /// A planner's reference machine, never a sample of the machine running the test.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -171,13 +181,13 @@ pub fn write_kimi_tokenizer(snapshot: &Path) {
 
 /// Real Kimi geometry with one sparse shard per layer, below the header limit.
 pub fn write_kimi_snapshot(dir: &Path, all: bool) {
-    header_templates::snapshot(dir, &format!("kimi-headers-v1-{all}"), |root| write_kimi_tensors(root, kimi_k3_tensors(all)));
+    header_templates::snapshot(dir, &format!("kimi-headers-v2-{all}"), |root| write_kimi_tensors(root, kimi_k3_tensors(all)));
 }
 
 /// Sparse K6 header fixture only, not a numerically quantized checkpoint.
 /// The payload is intentionally unsuitable for layer-forward qualification.
 pub fn write_kimi_core_snapshot(dir: &Path, all: bool) {
-    header_templates::snapshot(dir, &format!("kimi-core-headers-v1-{all}"), |root| write_kimi_core_snapshot_uncached(root, all));
+    header_templates::snapshot(dir, &format!("kimi-core-headers-v2-{all}"), |root| write_kimi_core_snapshot_uncached(root, all));
 }
 
 fn write_kimi_core_snapshot_uncached(dir: &Path, all: bool) {
@@ -1309,7 +1319,16 @@ pub fn kimi_k3_config() -> Value {
         "tie_word_embeddings": false,
         "quantization_config": {"bits": 2.0, "checkpoint_format": "exl3", "format": "exl3", "quant_method": "exl3"},
         "text_config": text,
-        "vision_config": {"vt_num_hidden_layers": 27},
+        "vision_config": {
+            "vt_hidden_size":1024,"vt_num_hidden_layers":27,"vt_num_attention_heads":12,
+            "qkv_hidden_size":1536,"vt_intermediate_size":4096,"patch_size":14,
+            "init_pos_emb_height":64,"init_pos_emb_width":64,"init_pos_emb_time":4,
+            "mm_hidden_size":1024,"text_hidden_size":7168,"activation_func":"gelu_pytorch_tanh",
+            "norm_type":"rmsnorm","mlp_type":"mlp2","pos_emb_type":"divided_fixed",
+            "pos_emb_interpolation_mode":"bilinear","merge_type":"sd2_tpool",
+            "mm_projector_type":"patchmergerv2","projector_hidden_act":"gelu",
+            "attn_bias":false,"linear_bias":false,"patch_embed_proj_bias":false,
+            "merge_kernel_size":[2,2],"projector_ln_eps":1e-5},
     })
 }
 
@@ -1374,8 +1393,8 @@ pub fn kimi_k3_tensors(all: bool) -> Vec<Tensor> {
             }
         }
     }
-    out.push(t("vision_tower.encoder.blocks.0.wqkv.weight", "BF16", &[1536, 1024]));
-    out.push(t("mm_projector.proj.0.weight", "BF16", &[4096, 4096]));
+    out.extend(crate::families::kimi_k3::vision::VisionContract::from_config(&kimi_k3_config()).unwrap()
+        .tensor_shapes().into_iter().map(|(name, shape)| t(name, "BF16", &shape)));
     out
 }
 

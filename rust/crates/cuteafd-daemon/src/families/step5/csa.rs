@@ -1412,7 +1412,7 @@ mod tests {
             None,
         )?);
         let mut placement = pool.borrow_mut()
-            .admit_cold(&family, 1, 1, |pages| Placement {
+            .admit_cold(&family, 1, 1, |pages| Placement { media: None,
                 pages,
                 sequence: 0,
                 committed: 0,
@@ -1485,7 +1485,7 @@ mod tests {
         chain.stream.drain()?;
         let eager = read(&chain, POST, 0, 64 * H * 4)?;
         let mut placement = pool.borrow_mut()
-            .admit_cold(&family, 1, 1, |pages| Placement {
+            .admit_cold(&family, 1, 1, |pages| Placement { media: None,
                 pages,
                 sequence: 0,
                 committed: 0,

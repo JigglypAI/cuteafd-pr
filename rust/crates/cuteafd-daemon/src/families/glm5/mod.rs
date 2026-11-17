@@ -1186,10 +1186,24 @@ impl Opened {
         } else { cuteafd_loader::placement::AttentionPlacement::Heads });
         let page_tokens = if attention == cuteafd_loader::placement::AttentionPlacement::Context { 128 } else { 64 };
         let requested_pool = cuteafd_loader::placement::PoolPolicy::normalize_request(Some(args.pool_tokens as u64));
-        let maximum_pool_tokens = cuteafd_loader::placement::PoolPolicy::resolve(
-            &cards.iter().map(|&(_, ceiling)| ceiling).collect::<Vec<_>>(), args.max_context as u64,
-            requested_pool, page_tokens).maximum_tokens();
-        let maximum_pages = maximum_pool_tokens.div_ceil(page_tokens);
+        let card_bytes = cards.iter().map(|&(_, logical)| logical).collect::<Vec<_>>();
+        let cache = if let Some(ml4) = self.cfg.variant.ml4() {
+            cuteafd_loader::serving_capacity::mistral_large4_cache_geometry(ml4, 1)?
+        } else { cuteafd_loader::serving_capacity::glm_cache_geometry(&self.cfg, layers, 1)? };
+        let unit = cache.ranks[0].persistent_unit_bytes;
+        let mut pool_facts = cuteafd_loader::placement::PoolFacts::new(*serving_context,
+            requested_pool, page_tokens);
+        // Whole-layer attention splits the replicated record slope between the
+        // cards; heads and context keep the whole latent pool on each.
+        pool_facts.memory = if attention == cuteafd_loader::placement::AttentionPlacement::Layers {
+            vec![cuteafd_loader::placement::PoolMemory { available_bytes: card_bytes.iter().sum(),
+                bytes_per_unit: unit }]
+        } else {
+            card_bytes.iter().map(|&available_bytes|
+                cuteafd_loader::placement::PoolMemory { available_bytes, bytes_per_unit: unit }).collect()
+        };
+        let pool = cuteafd_loader::placement::prepare_pool(pool_facts)?;
+        let maximum_pages = pool.maximum_tokens().div_ceil(page_tokens);
         let prefill = PrefillShape { rows: args.prefill_rows as u64, waves: prefill_lanes as u64 };
         let operation = Operation::Serving;
         let push_policy = crate::shared::experts::rtx::push::PushPolicy::for_snapshot(&self.snapshot)?;
@@ -1220,13 +1234,10 @@ impl Opened {
         let source = local.as_ref().map(|local| LocalPhysicalSource::read(&self.cfg, &self.catalog, local,
             &physical, metadata.as_ref())).transpose()?;
         let host = cuteafd_loader::formats::mapped_preload::host_memory_before_process()?;
-        let cache = if let Some(ml4) = self.cfg.variant.ml4() {
-            cuteafd_loader::serving_capacity::mistral_large4_cache_geometry(ml4, 1)?
-        } else { cuteafd_loader::serving_capacity::glm_cache_geometry(&self.cfg, layers, 1)? };
         let mark_bytes = ml4_draft.as_ref().map(glm::draft_window_mark_bytes).transpose()?.unwrap_or(0);
         let host_config = if devices.len() == 2 && attention == cuteafd_loader::placement::AttentionPlacement::Heads { None }
             else { serving.map(|(prefix, concurrency)| prefix.resolve_host_config(cuteafd_engine::prefix::FamilyLayout {
-                page_rows: 64, pages: maximum_pool_tokens as usize / 64,
+                page_rows: 64, pages: pool.maximum_tokens() as usize / 64,
                 page_bytes: cache.ranks[0].persistent_unit_bytes as usize, mark_bytes, draft_bytes: 0,
                 rule: cuteafd_engine::prefix::ReuseRule::EXACT, mark_store: cuteafd_engine::prefix::MarkStore::Arena,
                 page_owners: if attention == cuteafd_loader::placement::AttentionPlacement::Context {
@@ -1300,7 +1311,7 @@ impl Opened {
             if args.skip_routed_experts { cuteafd_loader::placement::Onboard::Layers(0) } else { onboard },
             prefill, operation, crate::shared::memory::budget::resident_weight_limit(), cuteafd_core::spark_reply::requested());
         let mut admitted = ProductionInput { expert_usage, cfg: &self.cfg, layers, context: args.max_context as u64,
-            maximum_pool_tokens, attention, gpus: devices.len(), prefill,
+            pool, attention, gpus: devices.len(), prefill,
             blas_head: crate::shared::target_head::TargetHead::configured().blas_head(!native
                 && !core.as_ref().is_some_and(|core| core.ranks[0].target_head.is_some() || core.ranks[0].fp8_head_scratch.is_some())), blas, target,
             draft: draft_facts.clone().with_window_marks(mark_bytes.checked_mul(args.draft_window_marks)

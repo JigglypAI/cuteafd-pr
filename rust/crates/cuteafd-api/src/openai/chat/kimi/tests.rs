@@ -6,16 +6,94 @@ fn fixtures() -> Value {
     serde_json::from_str(include_str!("goldens.json")).unwrap()
 }
 
+fn simulated_off_golden(case: &Value) -> String {
+    let prompt = case["prompt"].as_str().unwrap();
+    if case["body"]["enable_thinking"] != false {
+        return prompt.to_owned();
+    }
+    prompt.replace("<|open|>response<|sep|>",
+        "<|open|>think<|sep|><|close|>think<|sep|><|open|>response<|sep|>")
+}
+
 #[test]
 fn prompts_match_official_cpu_encoder() {
     for case in fixtures()["prompts"].as_array().unwrap() {
         let thinking = case["body"]["enable_thinking"].as_bool().unwrap_or(true);
         assert_eq!(
             render(&case["body"], thinking).unwrap(),
-            case["prompt"].as_str().unwrap(),
+            simulated_off_golden(case),
             "{}",
             case["name"]
         );
+    }
+}
+
+#[test]
+fn thinking_disabled_bench_prompt_has_exact_response_prefix_and_greedy_sampling() {
+    use crate::openai::{build, ModelEncoding, ModelProfile, NativeLimits};
+    let profile = ModelProfile::new("kimi-fixture", ModelEncoding::Kimi(std::sync::Arc::new(
+        KimiEncoding { eos: vec![163586] },
+    )));
+    let fixture = fixtures();
+    let case = &fixture["simulated_off"];
+    let mut body = case["body"].clone();
+    body["model"] = json!("kimi-fixture");
+    let built = build(&profile, NativeLimits::default(), &Default::default(), body)
+        .unwrap_or_else(|error| panic!("{}", error.message));
+    assert_eq!(built.prompt(), case["prompt"].as_str().unwrap());
+    let expected: Vec<u32> = serde_json::from_value(case["token_ids"].clone()).unwrap();
+    assert_eq!(&expected[expected.len()-9..], &[163587,39964,163589,163588,39964,163589,163587,12092,163589]);
+    assert_eq!(built.sampling.temperature(), 0.0);
+    assert_eq!(built.sampling.top_p(), 1.0);
+    assert_eq!(built.sampling.top_k(), None);
+    assert_eq!(built.sampling.min_p(), 0.0);
+    assert_eq!(built.stop_token_ids, [163586]);
+    assert!(built.constraint.is_none());
+    assert!(profile.encoding.supports_thinking_off());
+}
+
+#[test]
+fn thinking_disabled_history_keeps_empty_structural_think_channels() {
+    let body = json!({"messages":[{"role":"user","content":"Question"},
+        {"role":"assistant","content":"Answer", "reasoning_content":"private", "reasoning":"also private"},
+        {"role":"user","content":"Next"}]});
+    let rendered = render(&body, false).unwrap();
+    let mut oracle = body.clone();
+    oracle["messages"][1]["reasoning_content"] = json!("");
+    oracle["messages"][1]["reasoning"] = json!("");
+    let thinking = render(&oracle, true).unwrap();
+    assert_eq!(rendered, format!("{thinking}{}{}", close("think"), open("response", &[])));
+    assert_eq!(rendered.matches("<|open|>think<|sep|><|close|>think<|sep|>").count(), 2);
+    assert!(!rendered.contains("private"));
+}
+
+/// Reuses the loader's installed TikToken oracle contract; each case also carries
+/// the original request body so the API and tokenizer are checked together.
+#[test]
+#[ignore = "requires explicit installed-checkpoint input"]
+fn thinking_disabled_bench_matches_official_segment_tokens_when_present() {
+    use crate::openai::{build, ModelEncoding, ModelProfile, NativeLimits};
+    let spec = std::env::var("CUTEAFD_KIMI_TOKENIZER_ORACLE")
+        .expect("set CUTEAFD_KIMI_TOKENIZER_ORACLE for this installed test");
+    let (snapshot, oracle) = spec.rsplit_once(':').expect("<snapshot>:<oracle.json>");
+    let snapshot = Path::new(snapshot);
+    let profile = ModelProfile::new("kimi-fixture", ModelEncoding::Kimi(std::sync::Arc::new(
+        KimiEncoding::from_snapshot(snapshot).unwrap(),
+    )));
+    let cases: Vec<Value> = serde_json::from_slice(&std::fs::read(oracle).unwrap()).unwrap();
+    assert!(cases.len() >= 8);
+    for case in cases {
+        let mut body = case["body"].clone();
+        body["model"] = json!("kimi-fixture");
+        let built = build(&profile, NativeLimits::default(), &Default::default(), body)
+            .unwrap_or_else(|error| panic!("{}", error.message));
+        assert_eq!(built.prompt(), case["text"].as_str().unwrap());
+        let ids = cuteafd_loader::encode_tokenizer_text(snapshot, built.prompt(), false).unwrap().token_ids;
+        let expected: Vec<u32> = serde_json::from_value(case["ids"].clone()).unwrap();
+        assert_eq!(ids, expected);
+        assert_eq!(ids.last(), Some(&163589));
+        assert!(built.prompt().ends_with("<|open|>response<|sep|>"));
+        assert_eq!(built.stop_token_ids, [163586]);
     }
 }
 
@@ -70,6 +148,21 @@ fn official_outputs_are_chunk_invariant() {
             .collect::<Vec<_>>();
         assert_eq!(parse(&chars, case["thinking"].as_bool().unwrap()).0, expected);
     }
+}
+
+#[test]
+fn thinking_disabled_telegraphic_text_is_response_content_not_a_hidden_channel() {
+    let text = "I need craft response only code complete Python module";
+    let wire = format!("{text}<|close|>response<|sep|><|close|>message<|sep|><|end_of_msg|>");
+    for split in wire.char_indices().map(|(at, _)| at).chain([wire.len()]) {
+        let (parsed, calls) = parse(&[&wire[..split], &wire[split..]], false);
+        assert_eq!(parsed.content, text);
+        assert!(parsed.reasoning.is_empty());
+        assert_eq!(calls, 0);
+    }
+    let (parsed, _) = parse(&["<|open|>think<|sep|>Plan<|close|>think<|sep|>"], false);
+    // An unexpected think opener is not silently swallowed into plain content.
+    assert!(parsed.content.contains("<|open|>think<|sep|>"));
 }
 
 #[test]
@@ -246,6 +339,9 @@ async fn native_api_streams_official_reasoning_and_calls() {
             let bytes = to_bytes(response.into_body(), 1 << 20).await.unwrap();
             let text = String::from_utf8(bytes.to_vec()).unwrap();
             if streaming {
+                if case["thinking"] == false {
+                    assert!(!text.contains("reasoning_content"), "{text}");
+                }
                 assert!(text.contains("[DONE]"), "{text}");
                 assert!(!text.contains("\"error\""), "{text}");
                 assert!(
@@ -279,6 +375,9 @@ async fn native_api_streams_official_reasoning_and_calls() {
                 }
                 if case["thinking"] == true {
                     assert_eq!(choice["message"]["reasoning_content"], "reason");
+                } else {
+                    assert!(choice["message"]["reasoning_content"].as_str().is_none_or(str::is_empty));
+                    assert_eq!(value["usage"]["completion_tokens_details"]["reasoning_tokens"].as_u64().unwrap_or(0), 0);
                 }
             }
             worker.await.unwrap();
@@ -304,7 +403,7 @@ fn literal_spans_match_official_segments_without_normalizing_json() {
             })
             .unwrap();
         let (prompt, spans) = shield.finish(prompt, false);
-        assert_eq!(prompt, case["prompt"].as_str().unwrap(), "{}", case["name"]);
+        assert_eq!(prompt, simulated_off_golden(case), "{}", case["name"]);
         let expected = case["literal_spans"]
             .as_array()
             .unwrap()
@@ -609,4 +708,16 @@ async fn malformed_object_envelopes_fail_chat_and_gateway_streams() {
             }
         }
     }
+}
+
+#[test]
+fn normal_image_parts_render_native_pad_but_text_pad_spelling_stays_literal() {
+    let body=json!({"messages":[{"role":"user","content":[
+        {"type":"text","text":"Literal <|media_pad|> before "},
+        {"type":"image_url","image_url":{"url":"data:image/png;base64,ignored"}},
+        {"type":"text","text":" after"}]}]});
+    let encoding=KimiEncoding {eos:vec![163586]};
+    let rendered=encoding.render_literals(&body,false,&mut |text|format!("[literal:{text}]")).unwrap();
+    assert!(rendered.contains("[literal:Literal <|media_pad|> before ]<|media_pad|>[literal: after]"));
+    assert!(!rendered.contains("base64"));
 }

@@ -355,7 +355,7 @@ impl Family for Inkling2 {
         Some(crate::plan::spark_executions::SparkDecode { rows: 64 })
     }
     fn id(&self) -> &'static str { "inkling2" }
-    fn runtime(&self) -> RuntimeStatus { RuntimeStatus::Planned }
+    fn runtime(&self) -> RuntimeStatus { RuntimeStatus::Serving }
     fn detect(&self, checkpoint: &Checkpoint) -> bool {
         checkpoint.architectures().iter().any(|a| a == "Inkling2ForConditionalGeneration")
             || checkpoint.model_type() == Some("inkling2")
@@ -500,8 +500,6 @@ impl FamilyModel for Model {
         Some(ExpertContract {
             package: package.into(), block,
             spark_worlds: crate::plan::experts::spark_worlds(package, self.cfg.intermediate),
-            // Stage 1 plans whole and TP2 RTX layers in the shared recipe; the
-            // executors (stage 3) and serve stay unqualified until their kernels land.
             local: Ok(format!("Inkling 2 RTX expert onboarding ({package} whole/TP2 package)")),
         })
     }

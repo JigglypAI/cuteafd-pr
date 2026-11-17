@@ -535,9 +535,22 @@ impl<F: FnMut(usize, Range<usize>, DeviceLogits) -> Result<()>> SlotArithmetic f
             requests[segment.sequence].tokens_at(segment.tokens.clone())).collect::<Result<Vec<_>>>()?
             .into_iter().flatten().copied().collect::<Vec<_>>();
         let capacity = state.capacity.prefill.rows as usize;
-        Head::embed_tokens(self.cfg, capacity, &self.storage.embedding, &tokens, &owner.stream,
-            super::cache::view(owner.plane("route_ids")?, 0, capacity * 4)?,
-            owner.dense.producer_destination(), owner.plane("residual")?)?;
+        let media = self.storage.probe_media.borrow();
+        let mut packed=cuteafd_engine::media::MediaChunk::default();
+        for segment in &unit.segments {
+            let request=&requests[segment.sequence];
+            if let Some(media)=media.get(&request.placement.slot) {
+                if media.needed(segment.tokens.start,segment.tokens.end).next().is_none() {continue;}
+                let mut chunk=cuteafd_engine::media::MediaChunk::default();
+                media.write_chunk(segment.tokens.start,segment.tokens.end,&mut chunk)?;
+                for index in chunk.indices {packed.indices.push(index.checked_add(u32::try_from(segment.rows.start)?)
+                    .context("MiniMax media packed row overflow")?);}
+                packed.features.extend(chunk.features);
+            }
+        }
+        Head::embed_media(self.cfg,capacity,&self.storage.embedding,&tokens,&packed,&owner.stream,
+            super::cache::view(owner.plane("route_ids")?,0,capacity*4)?,
+            owner.dense.producer_destination(),owner.plane("residual")?)?;
         if let Some(heads) = &self.storage.heads {
             let peer = self.storage.ranks[1].prefill[unit.slot].borrow();
             heads.replicate([&owner, &peer], "residual", unit.rows.len() * self.cfg.hidden * 4)?;
@@ -1581,9 +1594,9 @@ mod tests {
         let bank = PageBank::new(vec![stream.clone()], &cfg, capacity, MsaCache::new(2, 16, 4, 320)?,
             MsaRope::new(&cfg, 320)?, 0..2)?;
         bank.reserve_tables(stream.raw)?;
-        let mut placements = [Placement { units: vec![7, 2, 9, 14, 15], slot: 3, len: 63 },
-            Placement { units: vec![4, 11, 1], slot: 0, len: 128 },
-            Placement { units: vec![8, 6], slot: 2, len: 1 }];
+        let mut placements = [Placement { media_spans: Vec::new(), units: vec![7, 2, 9, 14, 15], slot: 3, len: 63 },
+            Placement { media_spans: Vec::new(), units: vec![4, 11, 1], slot: 0, len: 128 },
+            Placement { media_spans: Vec::new(), units: vec![8, 6], slot: 2, len: 1 }];
         for placement in &placements { bank.install(placement, stream.raw)?; }
         let tokens = [vec![37; 270], vec![71; 133], vec![113; 2]];
         let starts = placements.iter().map(|placement| placement.len).collect::<Vec<_>>();
@@ -1640,7 +1653,7 @@ mod tests {
     #[test]
     fn heads_flattened_queries_share_identity_validation_and_verify_cycle() -> Result<()> {
         let schedule = Requests::new(RequestCapacity::with_queries(4, 64, 32)?, 4096, 60, 3)?;
-        let mut placements = (0..4).map(|row| Placement { units: vec![3, 7], slot: 2, len: 63 + row })
+        let mut placements = (0..4).map(|row| Placement { media_spans: Vec::new(), units: vec![3, 7], slot: 2, len: 63 + row })
             .collect::<Vec<_>>();
         let token = [17];
         let mut requests = placements.iter_mut().map(|placement| ServingRequest {
@@ -1721,7 +1734,7 @@ mod tests {
         for wire in [WirePrecision::Bf16, WirePrecision::F32] {
             let mut inputs = owners::tests::inputs(&checkpoint, &cfg, &[0, 1], 1)?;
             inputs.split_wire = Some(wire);
-            let request = canonical::request(ModelContext::automatic(inputs.context.maximum), Some(129 * 64),
+            let request = canonical::request(inputs.context, Some(129 * 64),
                 cuteafd_loader::placement::Onboard::Layers(0), inputs.prefill,
                 Operation::Serving, None, Default::default());
             let admitted = inputs.admit(request)?;
@@ -1855,7 +1868,7 @@ mod tests {
             Tag::workspace("minimax/test/fault-abort"))?, stream: Rc::new(Stream::new(device)?) };
         device.run(|| library.cuda_zero_bytes(arithmetic.abort.buffer, 256))?;
         fixture.peer_stream_fault(&library, stream.raw)?;
-        let mut placement = Placement { units: vec![0], slot: 0, len: 0 };
+        let mut placement = Placement { media_spans: Vec::new(), units: vec![0], slot: 0, len: 0 };
         let mut requests = [ServingRequest { identity: 1, kind: ExpertV2SourceKind::Prefill,
             placement: &mut placement, start: 0, tokens: &[7], heads: 0..1 }];
         let unit = Unit { index: 0, sequence: 0, segments: vec![UnitSegment { sequence: 0,

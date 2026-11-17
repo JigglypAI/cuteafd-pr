@@ -1,5 +1,5 @@
-//! Inkling 2 `cuteafd plan --layout` over the shared contract planner (#1930
-//! stage 1). Facts come from the one gatherer serving startup also calls
+//! Inkling 2 `cuteafd plan --layout` over the shared contract planner.
+//! Facts come from the one gatherer serving startup also calls
 //! ([`crate::families::inkling2::admission::gather`]); the planned edge
 //! differs only in its coordinator baseline. This module renders the solve.
 use super::{ExpertStorage, Model};
@@ -12,21 +12,6 @@ use cuteafd_core::memory_layout::{Basis, Category, DeviceKind, DeviceLayout, Ite
 
 const GIB: f64 = (1u64 << 30) as f64;
 
-fn qualified_text(snapshot: &std::path::Path, view: crate::plan::checkpoint::CoreView,
-    gpus: usize, ranks: usize, vision: crate::plan::MediaMode, audio: crate::plan::MediaMode,
-    native_mtp_layers: usize) -> bool {
-    if gpus != 1 || ranks != 4 || view != crate::plan::checkpoint::CoreView::Original
-        || vision != crate::plan::MediaMode::Off || audio != crate::plan::MediaMode::Off || native_mtp_layers != 0 {
-        return false;
-    }
-    let repository = snapshot.parent().filter(|path| path.file_name().is_some_and(|name| name == "snapshots"))
-        .and_then(std::path::Path::parent).and_then(std::path::Path::file_name).and_then(|name| name.to_str());
-    let revision = snapshot.file_name().and_then(|name| name.to_str());
-    matches!((repository, revision),
-        (Some("models--thinkingmachines--Inkling-2-Small"), Some("aac974122acd33ddb0d3e1f54433a9c5dd2249ce"))
-        | (Some("models--wrldsuksgo2mars--Inkling-2-Small-EXL3-K4-MC"), Some("6caa0ba08eb564ddc88b98df06ac73e853cc559e")))
-}
-
 fn empty(notes: Vec<String>) -> MemoryLayout {
     MemoryLayout { devices: Vec::new(), pool_tokens: 0, waste: Vec::new(), notes }
 }
@@ -38,8 +23,13 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
     let ranks = requested.spark_ranks();
     report.bytes_by_owner.clear();
     let mut notes = vec![
-        "Inkling 2 shared contract (#1930 stage 1): one solve over named physical owners; serving stays Planned".to_string(),
+        "Inkling 2 shared contract: one solve over named physical owners".to_string(),
     ];
+    if gpus != 1 {
+        report.refuse_placement("Inkling multi-GPU serving executor not implemented (#2316)".into(),
+            "Use one coordinator GPU; the shared planner can describe TP2 owners, but serving cannot execute them yet.");
+        return empty(notes);
+    }
     if opts.host_embedding {
         report.refuse_placement("Inkling 2 does not support --embedding-placement host yet".into(),
             "Use --embedding-placement gpu; the shared host TokenEmbedding lands with the serving stage.");
@@ -64,8 +54,8 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
         }
     };
     report.attention_placement = attention;
-    // The program manifest is optional in stage 1: no Inkling 2 program is
-    // installed yet, so the loaded-code allowance uses the shared estimate.
+    // Header-only planning may use the shared loaded-code estimate; an
+    // installed manifest supplies exact program workspace requirements.
     let manifest_path = opts.workspace_manifest.clone().or_else(|| {
         let path = std::path::PathBuf::from("/opt/cuteafd/share/PROGRAMS.json");
         path.is_file().then_some(path) });
@@ -100,7 +90,8 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
         sms: opts.physical_sms.unwrap_or(crate::placement::ArchContext::for_device("sm_120",
             cards.last().map_or(96 << 30, |card| card.physical_bytes)).sms) as usize,
     });
-    let request = FactsRequest { checkpoint: input.checkpoint(), catalog, cfg, kv_format: opts.inkling_kv, drafter, manifest_path: manifest_path.as_deref(),
+    let request = FactsRequest { target_pool_tokens: opts.target_pool_tokens, vision: report.vision, vision_replicas: opts.vision_replicas,
+        media_cache_bytes: opts.media_cache_bytes, checkpoint: input.checkpoint(), catalog, cfg, kv_format: opts.inkling_kv, drafter, manifest_path: manifest_path.as_deref(),
         manifest, coordinator: Coordinator::Planned { cards: cards.clone() }, attention, spark_ranks: ranks,
         spark_bytes, prefill: shape, context_tokens: opts.context_tokens, pool_tokens: opts.pool_tokens, sequences,
         host, host_cache_bytes: opts.host_cache_bytes, prefix_entries: opts.prefix_entries("inkling2"),
@@ -116,10 +107,11 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
         notes.push(format!("Inkling 2 RTX onboarding unavailable: {reason}"));
     }
     notes.push(if drafter.is_some() {
-        "Inkling bundled recurrent dSpark charges rank-local weight arenas, pool-coupled KV, workspaces and exact prefix marks; served qualification pending #2320"
+        "Inkling bundled recurrent dSpark charges rank-local weight arenas, pool-coupled KV, workspaces and exact prefix marks"
     } else {
         "Inkling bundled recurrent dSpark is disabled; no drafter owners are charged"
     }.into());
+    notes.push("Inkling bundled PE uses the shared packed Spark-first encoder owner".into());
     let routed = inputs.routed.len();
     let onboard = opts.resolve_onboard(routed).unwrap_or(Onboard::Auto);
     let solve_request = crate::placement::families::inkling2::request(inputs.context, opts.pool_tokens, onboard,
@@ -133,20 +125,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
             return empty(notes);
         }
     };
-    if !opts.inkling_dspark && qualified_text(&input.checkpoint().snapshot,
-        input.checkpoint().view.as_ref().map_or(crate::plan::checkpoint::CoreView::Original, |view| view.mode()),
-        gpus, ranks, report.vision, report.audio, opts.native_mtp_layers) {
-        report.runtime = Some(crate::plan::RuntimeStatus::Serving);
-        for component in &mut report.components {
-            if component.status == crate::plan::Status::Planned && component.rejected == 0
-                && !matches!(component.component, crate::plan::spec::Component::Vision
-                    | crate::plan::spec::Component::Audio | crate::plan::spec::Component::Speculator) {
-                component.status = crate::plan::Status::Ready;
-            }
-        }
-        report.hints.retain(|hint| !hint.what.starts_with("Inkling 2 ")
-            || !hint.what.ends_with(" execution is not implemented in this build"));
-    }
+    report.encoder = inputs.vision.as_ref().and_then(|vision| vision.admitted(&admitted.solved));
     report.phase_ledger = Some(crate::plan::SolvedPhaseLedger::from(&admitted.solved));
     report.host_budget_bytes = inputs.host_prefix.quota_bytes;
     let placed = admitted.placement;
@@ -185,48 +164,22 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
     for rank in 0..ranks {
         let charge = inputs.spark[onboarded][rank];
         widest = widest.max(charge.experts);
+        let location = crate::placement::planner::Location { device: crate::placement::planner::Device::Spark(rank as u8),
+            domain: crate::placement::planner::Domain::Managed };
+        let items = match admitted.solved.items(location) {
+            Ok(items) => items,
+            Err(error) => { report.refuse_placement(format!("Inkling Spark ledger refused: {error}"),
+                "Provide complete admission owner facts."); return empty(notes); }
+        };
         devices.push(DeviceLayout { kind: DeviceKind::Spark, index: rank as u32, capacity_bytes: opts.spark_capacity(rank),
-            worker_budget_bytes: opts.spark_capacity(rank), kv_tokens: 0, items: vec![
-                Item::new(Category::Experts, "routed experts (header-exact intermediate slices)", &storage_note,
-                    charge.experts, Basis::Exact),
-                Item::new(Category::Workspace, "Spark rank I/O and execution owners", "", charge.owners,
-                    Basis::Formula)] });
+            worker_budget_bytes: opts.spark_capacity(rank), kv_tokens: 0, items });
     }
     report.spark_rank_share = if model.routed_bytes == 0 { 0.0 } else { widest as f64 / model.routed_bytes as f64 };
     if ranks > 0 {
-        notes.push(format!("Spark: TP{ranks} slices of routed layers {}..={}; widest rank {:.1} GiB; no Inkling 2 Spark \
-            package ships yet, so the world is a planner result, not a package qualification (#1930 stage 3)",
+        notes.push(format!("Spark: TP{ranks} slices of routed layers {}..={}; widest rank {:.1} GiB",
             inputs.routed.get(onboarded).copied().unwrap_or(cfg.layers), cfg.layers - 1, widest as f64 / GIB));
     }
     report.solver_placement = Some(placed);
     MemoryLayout { devices, pool_tokens: report.solver_placement.as_ref().map_or(0, |p| p.pool_tokens),
         waste: Vec::new(), notes }
-}
-
-#[cfg(test)]
-mod qualification_tests {
-    use super::*;
-    use crate::plan::{checkpoint::CoreView, MediaMode};
-    #[test]
-    fn only_measured_original_text_checkpoint_layouts_are_serving_qualified() {
-        for (repository, revision) in [
-            ("models--thinkingmachines--Inkling-2-Small", "aac974122acd33ddb0d3e1f54433a9c5dd2249ce"),
-            ("models--wrldsuksgo2mars--Inkling-2-Small-EXL3-K4-MC", "6caa0ba08eb564ddc88b98df06ac73e853cc559e"),
-        ] {
-            let path = std::path::PathBuf::from(repository).join("snapshots").join(revision);
-            assert!(qualified_text(&path, CoreView::Original, 1, 4, MediaMode::Off, MediaMode::Off, 0));
-            for (view, gpus, ranks, vision, mtp) in [
-                (CoreView::Original, 2, 4, MediaMode::Off, 0),
-                (CoreView::Original, 1, 6, MediaMode::Off, 0),
-                (CoreView::K8Compact, 1, 4, MediaMode::Off, 0),
-                (CoreView::K6Compact, 1, 4, MediaMode::Off, 0),
-                (CoreView::Original, 1, 4, MediaMode::Auto, 0),
-                (CoreView::Original, 1, 4, MediaMode::Off, 1),
-            ] {
-                assert!(!qualified_text(&path, view, gpus, ranks, vision, MediaMode::Off, mtp));
-            }
-            assert!(!qualified_text(&path.with_file_name("unmeasured-revision"), CoreView::Original,
-                1, 4, MediaMode::Off, MediaMode::Off, 0));
-        }
-    }
 }

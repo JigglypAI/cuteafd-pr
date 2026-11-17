@@ -52,6 +52,9 @@ impl Coordinator {
 
 /// Every operator input admission reads, resolved once by the caller.
 pub struct FactsRequest<'a> {
+    pub vision: crate::plan::MediaMode,
+    pub vision_replicas: usize,
+    pub media_cache_bytes: Option<u64>,
     pub checkpoint: &'a crate::plan::Checkpoint,
     pub cfg: &'a MiniMaxM3Config,
     pub catalog: &'a crate::OfficialV41Catalog,
@@ -71,6 +74,7 @@ pub struct FactsRequest<'a> {
     /// Explicit context, or 0 for the checkpoint's maximum.
     pub context_tokens: u64,
     pub pool_tokens: Option<u64>,
+    pub target_pool_tokens: Option<u64>,
     pub sequences: u64,
     pub host: (u64, u64),
     pub host_cache_bytes: Option<u64>,
@@ -401,17 +405,36 @@ pub fn gather(request: &FactsRequest<'_>) -> Result<MiniMaxInputs, Refused> {
             geometry.chunk_bytes()).unwrap_or(0);
         serving::HostPrefixOwners { quota_bytes: quota, chunk_bytes: geometry.chunk_bytes().min(quota.max(1)) }
     };
-    let physical = (0..gpus).map(|gpu| request.coordinator.physical(gpu)).collect::<Vec<_>>();
-    let maximum_pool_tokens = crate::placement::PoolPolicy::resolve(&physical, context, request.pool_tokens,
-        shared::PAGE_ROWS).maximum_tokens();
+    let capacities = (0..gpus).map(|gpu| request.coordinator.budget(gpu).logical_bytes).collect::<Vec<_>>();
+    // The planner's MSA page geometry (`plan::families::minimax`): two KV
+    // planes plus one index record per 64-token page, owned per rank by the
+    // selected head split or balanced whole layers.
+    let rank_heads = cfg.kv_heads / if heads { 2 } else { 1 };
+    let page = shared::PAGE_ROWS
+        * cuteafd_ffi::minimax_m3::kv_plane_record_bytes(rank_heads) as u64 * 2
+        + (cfg.msa.index_dim as u64 + 4) * shared::PAGE_ROWS;
+    let layer_owner = shared::layer_owners(cfg.layers, gpus);
+    let rank_bytes = |gpu: usize| -> u64 { page * if heads { cfg.layers as u64 }
+        else { layer_owner.iter().filter(|&&owner| usize::from(owner) == gpu).count() as u64 } };
+    let mut pool_facts = crate::placement::PoolFacts::new(Context::resolve(context, (request.context_tokens > 0).then_some(request.context_tokens)), request.pool_tokens, shared::PAGE_ROWS);
+    pool_facts.memory = capacities.iter().enumerate().map(|(gpu, &available_bytes)|
+        crate::placement::PoolMemory { available_bytes, bytes_per_unit: rank_bytes(gpu) }).collect();
+    pool_facts.target = request.target_pool_tokens;
+    let pool = crate::placement::prepare_pool(pool_facts).map_err(|error|
+        refused(format!("invalid KV pool policy: {error}"), "Set KV min <= target <= max."))?;
     Ok(MiniMaxInputs { cfg: cfg.clone(), gpus, attention, split_wire: request.split_wire, spark_ranks: ranks,
         context: Context::resolve(context, (request.context_tokens > 0).then_some(request.context_tokens)),
-        maximum_pool_tokens, prefill: shape, sequences: request.sequences, targets, owners,
+        pool, prefill: shape, sequences: request.sequences, targets, owners,
         manifest: request.manifest.clone(), routed: routed.clone(), expert_backings, local, spark, links,
         spark_ingress: ingress,
         spark_reply_formats: request.replies, drafter: request.drafter.as_ref().map(|native| shared::Drafter {
             arena:native.weights.clone(),native:native.clone(),scratch:Vec::new(),state_per_page:0 }),
-        vision: None, budgets, code, measured_context, graph_reserve,
+        vision: crate::placement::still_encoder::StillEncoder::planned(request.checkpoint,
+            request.vision, request.vision_replicas, &budgets,
+            request.media_cache_bytes.unwrap_or((8 << 30).min(host_total / 20)))
+            .map_err(|error| refused(format!("MiniMax bundled vision inventory refused: {error:#}"),
+                "Supply the bundled CLIP tower tensors or use --vision off."))?,
+        budgets, code, measured_context, graph_reserve,
         head: request.head, host_prefix, device_sampling: true,
         expert_usage: request.expert_usage.then(|| cuteafd_core::expert_usage::Geometry { layers: cfg.layers,
             experts: cfg.experts, topk: cfg.topk, routed_layers: routed }),

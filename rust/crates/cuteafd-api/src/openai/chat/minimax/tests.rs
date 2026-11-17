@@ -220,3 +220,13 @@ fn malformed_partial_and_unknown_calls_return_as_text_not_tools() {
         assert_eq!(run(&stopped, true, split), ("".into(), prefix.clone(), vec![], 0));
     }
 }
+
+#[test]
+fn ordinary_image_url_renders_native_placeholder_and_never_the_payload() {
+    let body=serde_json::json!({"messages":[{"role":"user","content":[
+        {"type":"text","text":"What is here?"},
+        {"type":"image_url","image_url":{"url":"data:image/png;base64,not-rendered"}}]}]});
+    let encoded=super::fixtures::encoding().render(&body,&super::MiniMaxPromptOptions::default()).unwrap();
+    assert!(encoded.contains("What is here?")&&encoded.contains("]<]image[>["));
+    assert!(!encoded.contains("not-rendered")&&!encoded.contains("base64"));
+}

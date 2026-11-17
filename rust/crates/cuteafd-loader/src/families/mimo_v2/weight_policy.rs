@@ -43,10 +43,8 @@ pub fn default_policy(_checkpoint: &Checkpoint, _cfg: &MimoV2Config) -> MimoDefa
     MimoDefaultPolicy::Checkpoint
 }
 
-/// Preserve the independently qualified FP8 drafter default.
-pub fn default_draft_fp8(cfg: &MimoV2Config) -> bool {
-    !matches!(cfg.program_family().ok(), Some("mimof" | "mimof2"))
-}
+/// FP8 packing validates the drafter matrix geometry, not the target family.
+pub fn default_draft_fp8(_cfg: &MimoV2Config) -> bool { true }
 
 #[cfg(test)]
 pub(crate) mod tests {
@@ -93,6 +91,8 @@ pub(crate) mod tests {
         let cfg = MimoV2Config::from_hf(&checkpoint.config).unwrap();
         assert_eq!(default_policy(&checkpoint, &cfg), MimoDefaultPolicy::Checkpoint);
         assert_eq!(default_policy(&checkpoint, &cfg.head_split(2).unwrap()), MimoDefaultPolicy::Checkpoint);
+        assert!(default_draft_fp8(&cfg));
+        assert!(default_draft_fp8(&cfg.head_split(2).unwrap()));
     }
 
     #[test]

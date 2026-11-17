@@ -558,7 +558,7 @@ mod tests {
             input_key: None, fixture: None, image_url: None };
         let run = |span: ProbeMedia| {
             let probe = Probe::new(ProbeSpec { prompt_ids: Some(tokens.clone()), media: vec![span], ..Default::default() });
-            let job = NativeRequest { prefix_cache_source: Default::default(), finish_detail: Default::default(), literal_spans: Vec::new(),
+            let job = NativeRequest { image_groups: Vec::new(), prefix_cache_source: Default::default(), finish_detail: Default::default(), literal_spans: Vec::new(),
                 prompt: String::new(), constraint: None, images: Vec::new(), media: vec![image.clone()], audio: Vec::new(),
                 max_tokens: 8, sampling: Default::default(), stop_token_ids: Vec::new(),
                 events: tokio::sync::mpsc::unbounded_channel().0, usage: None, probe: Some(probe) };
@@ -589,7 +589,7 @@ mod tests {
         let probe = Probe::new(ProbeSpec { prompt_ids: Some(tokens.clone()), cold: true, no_speculation: true,
             score_from: Some(4), audio: vec![ProbeAudio { start: 2, len: 1, key: key_hex(clip.key.into()),
                 samples: 1, pcm_sha256: pcm_hash(&clip.pcm) }], ..Default::default() });
-        let job = NativeRequest { prefix_cache_source: Default::default(), finish_detail: Default::default(),
+        let job = NativeRequest { image_groups: Vec::new(), prefix_cache_source: Default::default(), finish_detail: Default::default(),
             literal_spans: Vec::new(), prompt: String::new(), constraint: None, images: Vec::new(), media: Vec::new(),
             audio: vec![clip.clone()], max_tokens: 1, sampling: Default::default(), stop_token_ids: Vec::new(),
             events: tokio::sync::mpsc::unbounded_channel().0, usage: None, probe: Some(probe) };

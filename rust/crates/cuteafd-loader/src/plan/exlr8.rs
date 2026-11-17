@@ -316,12 +316,13 @@ pub(super) fn native_plan_of(input: &super::PlanInput, selected: &str,
                 device.index, used - cap), "Increase Spark memory or onboard more layers; execution arenas must fit at plan time.");
         }
     }
-    let context = if layout.context_tokens > 0 { layout.context_tokens } else {
-        report.cache_requirements.as_ref().and_then(|cache| cache.checkpoint_max_context_tokens).unwrap_or(0) };
-    let physical = layout.rtx_bytes.iter().map(|&bytes| crate::placement::CoordinatorCard::planned(
-        bytes, layout.physical_sms).physical_bytes).min().unwrap_or(u64::MAX);
-    report.memory_policy_lines = crate::placement::reserve::layout_lines(&memory,
-        family.id(), context, &layout.rtx_bytes, physical);
+    let maximum = report.cache_requirements.as_ref().and_then(|cache|
+        cache.checkpoint_max_context_tokens).unwrap_or(layout.context_tokens);
+    report.memory_policy_lines = crate::placement::reserve::report_layout_lines(&memory,
+        family.id(), &layout.rtx_bytes, report.phase_ledger.as_ref().and_then(|ledger| ledger.pool_policy),
+        crate::placement::planner::Context::resolve(maximum,
+            (layout.context_tokens > 0).then_some(layout.context_tokens)),
+        layout.pool_tokens, layout.target_pool_tokens)?;
     report.memory_layout = Some(memory);
     report.solver_placement = Some(placement);
     if !model.contract_admission() {
@@ -379,7 +380,7 @@ fn append_spark_encoder(memory: &mut cuteafd_core::memory_layout::MemoryLayout,
             // Flash's joint admission already publishes its tower ledger; GLM's
             // native adapter leaves these charges to this shared finalization.
             for (category, group, bytes, basis) in [
-                (Category::Weights, "vision weights", encoder.weights, Basis::Exact),
+                (Category::Weights, crate::media::still_tower::vision_weight_arena_label(), encoder.weights, Basis::Exact),
                 (Category::Workspace, "vision scratch", encoder.scratch, Basis::Formula),
             ] {
                 let existing = device.items.iter().filter(|item| item.category == category && item.group == group)
@@ -1466,7 +1467,7 @@ mod tests {
             kind: DeviceKind::Spark, index: 0, capacity_bytes: layout.spark_capacity(0),
             worker_budget_bytes: layout.spark_capacity(0), kv_tokens: 0,
             items: vec![Item::new(Category::Runtime, "context+modules", "tower only", runtime, Basis::Calibrated),
-                Item::new(Category::Weights, "vision weights", "bundled encoder", encoder.weights, Basis::Exact),
+                Item::new(Category::Weights, crate::media::still_tower::vision_weight_arena_label(), "bundled encoder", encoder.weights, Basis::Exact),
                 Item::new(Category::Workspace, "vision scratch", "bundled encoder", encoder.scratch, Basis::Formula)],
         }], pool_tokens: 2097152, waste: Vec::new(), notes: Vec::new() };
         append_spark_devices(&mut memory, &layout, &[experts]).unwrap();

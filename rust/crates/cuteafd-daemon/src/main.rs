@@ -52,8 +52,16 @@ struct ServeMedia<'a> {
 
 fn serve_media(command: &mut Commands) -> Option<ServeMedia<'_>> {
     match command {
+        Commands::ServeInkling2(args) => Some(ServeMedia { snapshot: &args.snapshot,
+            vision: &mut args.vision.vision, audio: None }),
+        Commands::ServeStep5(args) => Some(ServeMedia { snapshot: &args.snapshot,
+            vision: &mut args.vision.vision, audio: None }),
         Commands::ServeMimo(args) => Some(ServeMedia { snapshot: &args.engine.snapshot,
             vision: &mut args.vision, audio: Some(&mut args.audio) }),
+        Commands::ServeKimi(args) => Some(ServeMedia { snapshot: &args.snapshot,
+            vision: &mut args.media.vision, audio: None }),
+        Commands::ServeMinimax(args) => Some(ServeMedia { snapshot: &args.snapshot,
+            vision: &mut args.media.vision, audio: None }),
         Commands::ServeMuse(args) => Some(ServeMedia { snapshot: &args.snapshot,
             vision: &mut args.vision, audio: Some(&mut args.audio) }),
         Commands::ServeQwen4(args) => Some(ServeMedia { snapshot: &args.engine.snapshot,
@@ -174,6 +182,22 @@ mod media_defaults_tests {
                 .chain(["--exlr8-prefill-activations", value])).unwrap_err();
             assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
             assert!(error.to_string().contains("native Flash EXLR8 prefill is A16"), "{error}");
+        }
+    }
+
+    #[test]
+    fn absent_daemon_image_cap_keeps_native_family_defaults() {
+        use clap::Parser;
+        use cuteafd_loader::media::{ImageFamily,ProcessorConfig};
+        let cli=super::cli::Cli::try_parse_from(["cuteafd","plan","/model"]).unwrap();
+        assert_eq!(cli.max_image_tokens,None);
+        for (family,expected) in [(ImageFamily::Kimi,16698),(ImageFamily::MiniMax,576)] {
+            let config=ProcessorConfig::for_family(family);
+            assert_eq!(config.resolved_span_cap(cli.max_image_tokens.map(|n|n as usize)).unwrap(),expected);
+        }
+        let explicit=super::cli::Cli::try_parse_from(["cuteafd","--max-image-tokens","512","plan","/model"]).unwrap();
+        for family in [ImageFamily::Kimi,ImageFamily::MiniMax] {
+            assert_eq!(ProcessorConfig::for_family(family).resolved_span_cap(explicit.max_image_tokens.map(|n|n as usize)).unwrap(),512);
         }
     }
 
@@ -352,7 +376,7 @@ async fn run() -> Result<()> {
                     cuteafd_transport::wait_policy::WaitPolicy { wait: cli.host_wait,
                         idle_park: std::time::Duration::from_secs_f64(cli.idle_park_seconds) }, cuteafd_core::spark_reply::SparkReplyFormats {
                             prefill: cli.spark_prefill_reply_format, decode: cli.spark_decode_reply_format },
-                    cli.coordinator_weight_budget_gib, cli.graph_disable_low_mem, (cli.graph_no_prewarm, cli.graph_donor_always))
+                    cli.coordinator_weight_budget_gib, cli.graph_disable_low_mem, (cli.graph_no_prewarm, cli.graph_donor_always, cli.graph_donor_cold_lag))
             },
             Err(error) => error.exit(),
         }
@@ -381,7 +405,8 @@ async fn run() -> Result<()> {
     };
     anyhow::ensure!(!no_prewarm || prewarm_supported,
         "--graph-no-prewarm requires single-GPU V4.1 or GLM Flash; cross-device runtime instantiation can deadlock behind peer waits (#1878)");
-    shared::decode_graph::configure(no_prewarm, initial_graph_policy.1 || family_graph_policy.1);
+    shared::decode_graph::configure(no_prewarm, initial_graph_policy.1 || family_graph_policy.1,
+        initial_graph_policy.2.max(family_graph_policy.2))?;
     if let Some((role, directory)) = shared::memory_report::dump_location(&matches) {
         let host = std::env::var("CUTEAFD_PROFILE_HOST").unwrap_or_else(|_| {
             std::env::var("HOSTNAME").map(|name| format!("container {name}")).unwrap_or_else(|_| "unknown".into())
@@ -433,7 +458,7 @@ async fn run() -> Result<()> {
     cuteafd_api::openai::set_media_input_policy(vision != cuteafd_loader::plan::MediaMode::Off,
         audio != cuteafd_loader::plan::MediaMode::Off);
     cuteafd_api::openai::media::set_preparation_policy(
-        family_image_cap.or(initial_image_cap).unwrap_or(4096) as usize,
+        family_image_cap.or(initial_image_cap).map(|cap| cap as usize),
         family_fetch.or(initial_fetch).unwrap_or(cuteafd_api::openai::media::ImageUrlFetch::Public))?;
     let weight_budget_gib = family_weight_budget.or(initial_weight_budget);
     if let Commands::Plan(args) = &mut command {

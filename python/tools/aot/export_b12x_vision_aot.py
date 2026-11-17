@@ -29,6 +29,20 @@ def muse_transformer_names():
     return [f"vision_{name}" for name in names]
 
 
+def perception_names(kind):
+    h,i,p,o = (1024,4096,1200,4608) if kind == "inkling2" else (1536,8960,588,4096)
+    names = [f"pe_norm_h{h}",f"pe_scale_h{h}",f"pe_position_h{h}",f"pe_rotary_d{h//16}"]
+    names += [f"biased_projection_h{w}_o{n}" for w,n in ((h,3*h),(h,h),(h,i),(i,h))]
+    names += [f"projection_h{p}_o{h}"]
+    if kind == "inkling2":
+        names += ["pe_rgb_p20","pe_merge_h1024","pe_patch_projection_h4096_o4096","projection_h4096_o4608","gelu_h4096"]
+    else:
+        names += ["rgb_normalize","resize_coefficients_bilinear","resize_horizontal","resize_vertical",
+            "pe_patches_p14","pe_conv_lower_h1536","pe_conv_lower_h3072","pe_quick_gelu_h8960",
+            "biased_projection_h13824_o3072","biased_projection_h27648_o6144","pe_patch_projection_h6144_o4096"]
+    return ["vision_"+name for name in names]
+
+
 def tile_for_head_dim(head_dim):
     if head_dim <= 0 or head_dim > 128 or head_dim % 8:
         raise ValueError("vision head dimension must be an aligned value in 8..128")
@@ -39,8 +53,12 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output-dir", type=Path)
     parser.add_argument("--capability", type=int, choices=(120, 121))
-    parser.add_argument("--group", choices=("legacy", "pointwise", "attention", "transformer"), default="legacy")
+    parser.add_argument("--group", choices=("legacy", "pointwise", "attention", "transformer", "perception", "tower"), default="legacy")
     parser.add_argument("--list-transformer-programs", action="store_true")
+    parser.add_argument("--perception", choices=("inkling2","step5"))
+    parser.add_argument("--list-perception-programs", action="store_true")
+    parser.add_argument("--tower", choices=("kimi","minimax"))
+    parser.add_argument("--list-tower-programs", action="store_true")
     parser.add_argument("--head-dim", type=int, default=96)
     parser.add_argument("--hidden", type=int, default=1536)
     parser.add_argument("--bf16-products", action="store_true")
@@ -48,9 +66,19 @@ def main():
     parser.add_argument("--with-transformer", action="store_true")
     parser.add_argument("--bf16-before-gamma", action="store_true")
     parser.add_argument("--windowed", action="store_true")
+    parser.add_argument("--omit-program", action="append", default=[])
     args = parser.parse_args()
     if args.list_transformer_programs:
         print(";".join(muse_transformer_names()))
+        return
+    if args.list_perception_programs:
+        if args.perception is None:parser.error("--list-perception-programs needs --perception")
+        print(";".join(perception_names(args.perception)))
+        return
+    if args.list_tower_programs:
+        if args.tower is None:parser.error("--list-tower-programs needs --tower")
+        from vision_tower_programs import names
+        print(";".join(names(args.tower)))
         return
     if args.output_dir is None or args.capability is None:
         parser.error("--output-dir and --capability are required for export")
@@ -101,13 +129,25 @@ def main():
     destination = args.output_dir
     destination.mkdir(parents=True, exist_ok=True)
     if args.group != "legacy":
-        declarations = builders(args.group, head_dim=args.head_dim, hidden=args.hidden,
-            bf16_products=args.bf16_products, learned_position=args.learned_position,
-            bf16_before_gamma=args.bf16_before_gamma, windowed=args.windowed)
+        if args.group == "tower":
+            if args.tower is None:parser.error("--group tower needs --tower")
+            from vision_tower_programs import builders as tower_builders
+            declarations = tower_builders(args.tower)
+        elif args.group == "perception":
+            if args.perception is None:parser.error("--group perception needs --perception")
+            declarations = perception_builders(args.perception)
+        else:
+            declarations = builders(args.group, head_dim=args.head_dim, hidden=args.hidden,
+                bf16_products=args.bf16_products, learned_position=args.learned_position,
+                bf16_before_gamma=args.bf16_before_gamma, windowed=args.windowed)
         if args.with_transformer:
             if args.group != "pointwise":
                 parser.error("--with-transformer requires --group pointwise")
             declarations.update(builders("transformer"))
+        omitted = set(args.omit_program)
+        unknown = omitted - {f"vision_{name}" for name in declarations}
+        if unknown:parser.error(f"unknown omitted programs: {sorted(unknown)}")
+        declarations = {name:build for name,build in declarations.items() if f"vision_{name}" not in omitted}
         export_programs(destination, "vision", declarations)
         if torch.cuda.is_initialized():
             raise RuntimeError("offline vision export initialized CUDA")
@@ -152,6 +192,44 @@ def main():
         print(manifest_path, flush=True)
     if torch.cuda.is_initialized():
         raise RuntimeError("offline vision export initialized CUDA")
+
+
+def perception_builders(kind):
+    from b12x.integration.cuteafd import media,perception,perception_forward,image_resize
+    from b12x.integration.cuteafd import perception_pixels
+    h,i,p,o = (1024,4096,1200,4608) if kind == "inkling2" else (1536,8960,588,4096)
+    inkling = kind == "inkling2"
+    result = {
+        f"pe_norm_h{h}":lambda:perception_forward.compile_layer_norm_aot(hidden=h,vendor_rsqrt=inkling),
+        f"pe_scale_h{h}":lambda:perception.compile_scaled_residual_aot(width=h),
+        f"pe_position_h{h}":lambda:perception_forward.compile_learned_position_aot(hidden=h,grid=32 if inkling else 52,class_token=inkling,torch_bilinear=not inkling),
+        f"pe_rotary_d{h//16}":lambda:perception.compile_rotary_2d_aot(heads=16,dim=h//16,class_token=inkling),
+    }
+    for w,n in ((h,3*h),(h,h),(h,i),(i,h)):
+        result[f"biased_projection_h{w}_o{n}"] = lambda w=w,n=n:media.compile_biased_projection_aot(width=w,outputs=n)
+    result[f"projection_h{p}_o{h}"] = lambda:media.compile_patch_projection_aot(width=p,outputs=h)
+    if inkling:
+        result["pe_rgb_p20"] = lambda:perception_pixels.compile_pixel_patches_aot(patch=20)
+        result["pe_merge_h1024"] = lambda:perception.compile_merge2_aot(width=1024,class_token=True)
+        for w,n in ((4096,4096),(4096,4608)):
+            name = f"pe_patch_projection_h{w}_o{n}" if n == 4096 else f"projection_h{w}_o{n}"
+            result[name] = lambda w=w,n=n:media.compile_patch_projection_aot(width=w,outputs=n)
+        result["gelu_h4096"] = lambda:media.compile_gelu_aot(width=4096)
+    else:
+        result.update({"rgb_normalize":image_resize.compile_rgb_normalize_aot,
+            "resize_coefficients_bilinear":lambda:image_resize.compile_resize_coefficients_aot(filter="bilinear"),
+            "resize_horizontal":lambda:image_resize.compile_resize_pass_aot(vertical=False),
+            "resize_vertical":lambda:image_resize.compile_resize_pass_aot(vertical=True),
+            "pe_patches_p14":lambda:perception_forward.compile_normalized_patches_aot(patch=14),
+            "pe_conv_lower_h1536":lambda:perception.compile_conv3_stride2_lower_aot(channels=1536),
+            "pe_conv_lower_h3072":lambda:perception.compile_conv3_stride2_lower_aot(channels=3072),
+            "pe_quick_gelu_h8960":lambda:perception.compile_quick_gelu_aot(width=8960)})
+        for w,n in ((13824,3072),(27648,6144)):
+            result[f"biased_projection_h{w}_o{n}"] = lambda w=w,n=n:media.compile_biased_projection_aot(width=w,outputs=n)
+        result["pe_patch_projection_h6144_o4096"] = lambda:media.compile_patch_projection_aot(width=6144,outputs=4096)
+    if ["vision_"+name for name in result] != perception_names(kind):
+        raise ValueError("PE declaration inventory differs from CMake")
+    return result
 
 
 def builders(group, *, head_dim=96, hidden=1536, bf16_products=False,

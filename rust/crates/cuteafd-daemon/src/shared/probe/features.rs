@@ -64,8 +64,10 @@ pub(crate) fn apply_probe_features(job: &NativeRequest, media: &mut RequestMedia
     anyhow::ensure!(probe.spec.cold && probe.spec.no_speculation && probe.spec.score_from.is_some()
         && !probe.spec.media.is_empty(), "features require a cold, speculation-free media scoring probe");
     let root = root.canonicalize()?;
+    anyhow::ensure!(probe.spec.media.len() == job.media.len(), "feature source count differs");
     let mut provenance = Vec::new();
-    for span in &probe.spec.media {
+    for (span, image) in probe.spec.media.iter().zip(&job.media) {
+        span.verify_image(image)?;
         let fixture = span.fixture.as_ref().context("feature probes require fixture identity")?;
         anyhow::ensure!(cuteafd_api::openai::probe::sha256_hex(&span.key), "invalid feature key");
         let metadata_path = root.join(format!("{}.json", span.key)).canonicalize()?;
@@ -83,7 +85,6 @@ pub(crate) fn apply_probe_features(job: &NativeRequest, media: &mut RequestMedia
         let mut hash = Sha256::new();
         hash.update(b"cuteafd.probe.feature_override/1\0"); hash.update(span.key.as_bytes()); hash.update(&raw);
         let override_key = cuteafd_loader::media::ImageKey(hash.finalize().into());
-        let image = job.media.iter().find(|i| key_hex(i.key) == span.key).context("feature span has no prepared image")?;
         // Admission precedes payload allocation, including on a warm override-cache hit.
         let pin = cache.reserve(override_key, bytes)?;
         let payload = feature_payload(&payload_path, bytes, &meta.sha256, pin.features())?;
@@ -96,7 +97,4 @@ pub(crate) fn apply_probe_features(job: &NativeRequest, media: &mut RequestMedia
     Ok(())
 }
 
-fn key_hex(key: impl Into<cuteafd_core::MediaKey>) -> String {
-    key.into().bytes().iter().map(|b| format!("{b:02x}")).collect()
-}
 

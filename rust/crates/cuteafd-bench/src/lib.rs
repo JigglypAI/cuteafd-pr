@@ -22,6 +22,7 @@ pub mod panels;
 pub mod panel_config;
 pub mod profiles;
 pub mod prefill;
+pub mod prelude;
 pub mod publish;
 pub mod quality;
 pub mod reference;
@@ -34,6 +35,7 @@ pub mod server;
 pub mod smoke;
 pub mod store;
 pub mod sweep;
+pub mod sustained;
 pub mod tables;
 pub mod text;
 

@@ -369,10 +369,14 @@ fn release_headers_classify_native_text_without_installed_artifacts() {
     assert!(!report.executable());
     assert!(report.hints.iter().any(|hint| hint.what.contains("Kimi header inventory refused: missing projection")),
         "{:?}", report.hints);
-    assert_eq!(model.vision_mode(MediaMode::Auto), MediaMode::Off);
+    assert_eq!(model.vision_mode(MediaMode::Auto), MediaMode::Auto);
+    let vision=report.components.iter().find(|c|c.component==Component::Vision).unwrap();
+    assert_eq!(vision.status,Status::Ready,"Auto vision is structural, never qualification-Planned");
+    assert_eq!(vision.rejected,0);
+    assert!(!report.hints.iter().any(|h|h.what.contains("vision")&&h.what.contains("qualification")));
     let vision_report = testing::plan(dir.path(), &PlanOptions { vision: MediaMode::Rtx(None), ..Default::default() }).unwrap();
     assert!(!vision_report.wip_launchable());
-    assert!(vision_report.hints.iter().any(|h| h.what.contains("vision execution is not implemented")));
+    assert!(!vision_report.hints.iter().any(|h| h.what.contains("production qualification remains pending")));
 }
 
 #[test]
@@ -748,6 +752,7 @@ fn header_native_k4_k6_k8_core_is_admitted_by_default() -> Result<()> {
     let mut model=Model::open(&checkpoint)?;
     model.configure().map_err(anyhow::Error::msg)?;
     assert!(model.native_serving_admission());
+    assert_eq!(KIMI_K3.runtime(), crate::plan::RuntimeStatus::Serving);
     assert!(model.core.projections.values().all(|p| p.bits == bits));
     for (stem,projection) in &model.core.projections {
         let members=checkpoint.tensors.iter().filter(|t|format::split_stem(&t.meta.name).0==stem)
@@ -835,7 +840,7 @@ fn k6_max_context_plan_charges_parity_pool_and_each_shared_allocation() -> Resul
     layout.workspace_manifest = Some(path);
     layout.context_tokens = 262_144;
     layout.pool_tokens = Some(2_097_152);
-    layout.target_pool_tokens = 2_097_152;
+    layout.target_pool_tokens = Some(2_097_152);
     layout.mla_kv = MlaCacheFormat::Fp8;
     layout.prefix_slots = Some(1);
     options.attention_placement = None;
@@ -1050,6 +1055,7 @@ fn k31_qualified_cores_charge_index_records_once_and_unlock_serve() -> Result<()
     std::fs::write(&programs_path, manifest.to_string())?;
     options.layout.as_mut().unwrap().workspace_manifest = Some(programs_path);
     options.attention_placement = Some(crate::placement::AttentionPlacement::Layers);
+    options.vision = MediaMode::Off;
     let k6_report = testing::BudgetedPlanInput::open(k6_dir.path())?.plan(&options)?;
     assert!(k6_report.placement_supported, "{:?}", k6_report.hints);
     assert!(k6_report.memory_layout.as_ref().is_some_and(|memory| memory.pool_tokens > 0));

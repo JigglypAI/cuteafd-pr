@@ -242,7 +242,7 @@ fn reconciliation_provenance(source_commit: &str, source_dirty: &str, toolchain:
 fn placement_inputs<'a>(args: &EngineArgs, admission: QwenAdmissionInputs<'a>, sparks: usize,
     (available, total): (u64, u64), pending: u64, context: cuteafd_loader::placement::planner::Context,
     host: qwen4::QwenHost) -> qwen4::QwenInputs<'a> {
-    qwen4::QwenInputs {
+    qwen4::QwenInputs { target_pool: None,
         experts: None, onboard: cuteafd_loader::placement::Onboard::Auto,        arenas: vec![], expert_arenas: vec![], preallocation: false, future: vec![],
         blas_head: crate::shared::target_head::TargetHead::configured().blas_head(!args.mtp_fp8_head),
         loaded_weights: Default::default(),
@@ -792,7 +792,7 @@ mod tests {
         for capacity in [96u64 << 30, 192u64 << 30] {
             let onboard = Onboard::Auto;
             {
-                let mut inputs = qwen4::QwenDualInputs {
+                let mut inputs = qwen4::QwenDualInputs { target_pool: None,
         experts: None,        blas_head: cuteafd_loader::placement::planner::serving::BlasHead::Native,
         resident_weight_limit: None, context: cuteafd_loader::placement::planner::Context::pinned(131_072),
                     owner_manifests: [None; 2],
@@ -1028,11 +1028,11 @@ mod tests {
             let host_embedding = if host {
                 u64::try_from(cuteafd_loader::families::qwen4::weight_layout::embedding_table_bytes(&checkpoint)?)?
             } else { 0 };
-            let runtime = qwen4::dual_placement(&qwen4::QwenDualInputs {
+            let (runtime, solved) = qwen4::dual_admitted(&qwen4::QwenDualInputs { target_pool: None,
         experts: Some(qwen4::QwenExperts::read(&catalog, &lib, 4, 2, args.prefill_rows.max(64) as u64)?), blas_head: crate::shared::target_head::TargetHead::configured().blas_head(!args.mtp_fp8_head),
         resident_weight_limit: None, context: cuteafd_loader::placement::planner::Context::pinned(131_072), owner_manifests: manifests.each_ref().map(Some), admission,
                 gpus: [0, 1].map(|rank| GpuBudget { capacity_bytes: capacities[rank],
-                    reserve_bytes: 3 << 30, baseline: Baseline::Measured { free_bytes: capacities[rank]
+                    reserve_bytes: cuteafd_loader::placement::reserve::gpu("qwen4"), baseline: Baseline::Measured { free_bytes: capacities[rank]
                         - layout.devices[rank].items.iter().filter(|item| item.group == "context+modules")
                             .map(|item| item.bytes).sum::<u64>() } }),
                 arenas: &weights.arenas, layer_experts: &experts.costs,
@@ -1041,7 +1041,9 @@ mod tests {
                 spark_ranks: 0, onboard: Onboard::Auto,
                 host: super::host_owners_with_memory(&args, &cfg, 4, mtp, 2, 0, false, None,
                     host_embedding, Vec::new(), cuteafd_loader::plan::testing::SimulatedHost::raptor().host_ram)?, encoders: Default::default() })?;
-            assert_eq!(runtime.pool_tokens, if capacities.iter().any(|&bytes| bytes <= 32 << 30) { 1 << 20 } else { 2 << 20 });
+            assert_eq!(solved.pool_policy, report.phase_ledger.as_ref().unwrap().pool_policy);
+            // The layout target is uniform; an automatic pool then grows into memory.
+            assert_eq!(solved.pool_policy.as_ref().unwrap().target(), 2 << 20);
             assert_eq!(runtime.pool_tokens, layout.pool_tokens);
             assert_eq!(runtime.tp2.unwrap().layers, 4);
             assert!(layout.notes.contains(&format!("placement: {}", runtime.summary())));
@@ -1102,6 +1104,9 @@ mod tests {
                     placement: ExpertPlacement::Local,
                     layout: Some(LayoutOptions { host_memory: Some(cuteafd_loader::plan::testing::SimulatedHost::raptor().host_ram), rtx_bytes: vec![capacity], context_tokens: context,
                         pool_tokens: pool, qwen_kv: kv_format, concurrency, state_slots: Some(concurrency), prefix_slots: Some(0),
+                        // A device-only parity fixture: no host prefix tier, so the
+                        // runtime's no-prefix engine args declare the same owners.
+                        host_cache_bytes: Some(0),
                         ..Default::default() }), ..Default::default()
                 })?;
                 assert!(report.placement_supported, "{}", cuteafd_loader::plan::render(&report));
@@ -1110,9 +1115,14 @@ mod tests {
                 assert!(device.items.iter().any(|i| i.group == "weight arena" && i.bytes > 0));
                 let baseline = device.items.iter().filter(|item| item.group == "context+modules")
                     .map(|item| item.bytes).sum::<u64>();
+                // The fixture has no manifest, so the planner's prefill rows are
+                // its default; hand the runtime exactly the plan's shape so both
+                // price the same workspaces.
+                let prefill_rows = report.prefill_span_rows.unwrap_or(4096).to_string();
                 let mut args = Cli::try_parse_from(["serve", "--snapshot", snapshot.path().to_str().unwrap(),
                     "--native-lib", "/nonexistent/lib.so", "--max-context-tokens", &context.to_string(),
-                    "--slots", &concurrency.to_string(),
+                    "--slots", &concurrency.to_string(), "--prefill-rows", &prefill_rows,
+                    "--prefill-waves", "1",
                     "--pool-tokens", &pool.unwrap_or(0).to_string(), "--kv-cache", &kv_format.to_string()])?.engine;
                 args.planner_prefix_bytes = Some(0);
                 let inputs = super::inputs(&args, &cfg, cfg.layers, false, None, None, 0)?;
@@ -1120,7 +1130,7 @@ mod tests {
                     &cfg, &vec![0; cfg.layers], 1, false, Default::default(),
                     cuteafd_loader::families::qwen4::weight_layout::embedding_table_bytes(&checkpoint)?)?
                     .into_iter().map(|(_, arena)| arena).collect();
-                let planned = qwen4::QwenInputs {
+                let planned = qwen4::QwenInputs { target_pool: None,
                     experts: Some(qwen4::QwenExperts::headers(&catalog, cfg.layers, 1)?),
                     onboard: Default::default(), arenas, expert_arenas: vec![], preallocation: true, future: vec![],
                     blas_head: crate::shared::target_head::TargetHead::configured().blas_head(!args.mtp_fp8_head),
@@ -1129,10 +1139,23 @@ mod tests {
                     context: cuteafd_loader::placement::planner::Context::pinned(context), admission: inputs,
                     capacity_bytes: capacity, baseline: Baseline::Measured { free_bytes: capacity - baseline },
                     pending_code_bytes: 0, max_context: context, requested_pool: pool, spark_ranks: 0,
-                    host: qwen4::QwenHost::ample(&cfg, 1, 4096)?, encoders: Default::default() };
+                    // The production host builder plus the planner's mapped-table
+                    // placement, so both contracts charge the same pinned upload
+                    // owners and their mapped-buffer page tables.
+                    host: {
+                        let mut host = super::host_owners_with_memory(&args, &cfg, cfg.layers, false, 1, 0,
+                            false, None, 0, Vec::new(),
+                            cuteafd_loader::plan::testing::SimulatedHost::raptor().host_ram)?;
+                        host.table_reactor = cuteafd_loader::formats::mapped_table::table_reactor_workspace_bytes(
+                            report.mapped_placement.mapped) as u64;
+                        host.preloaded_tables = report.mapped_placement.preloaded_bytes;
+                        host
+                    },
+                    encoders: Default::default() };
                 // The graph reserve is one owner at the resolved capture shape,
                 // charged once before KV sizing.
-                let placement = qwen4::placement(&planned)?;
+                let (placement, solved) = qwen4::admitted(&planned)?;
+                assert_eq!(solved.pool_policy, report.phase_ledger.as_ref().unwrap().pool_policy);
                 assert_eq!(placement.pool_tokens, layout.pool_tokens);
                 assert!(device.items.iter().any(|item| item.group == "graph reserve: qwen4.graphs.0"),
                     "the plan charges the graph reserve");

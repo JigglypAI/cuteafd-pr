@@ -121,7 +121,10 @@ Same build, two configurations: `--arm-wip` both arms to one sealed WIP
 instance and `--arm-set ARM:CARD:KEY=VALUE`. `--set CARD:PROFILE=...` turns
 on profiling everywhere, `--preflight-only` checks without queuing, and
 `--resume` reruns only failed jobs. Do not copy an RC driver or take outer serving
-locks: `cuteafd bench smoke` takes its own locks. CPU builds/tests run at
+locks: `cuteafd bench smoke` takes its own locks. The set follows the resolved
+layout; `wip-cards --print-locks` and `cuteafd bench smoke --print-locks` print
+it without running, and a wip-cards or smoke run nested in an `hwlock` hold that
+does not cover the whole set fails immediately instead of queueing. CPU builds/tests run at
 nice 19 with 16 jobs (`CARGO_BUILD_JOBS=16`, `RUST_TEST_THREADS=16`).
 
 **A/B rules learned in v3 (2026-10-10):**
@@ -287,6 +290,8 @@ orchestrator's to use; TJ isn't using these subscriptions.
 |---|---|---|---|
 | `grok` (X Premium+) | `grok-4.7` (default), `grok-4.7-build-fast` | `--always-approve`, `--prompt-file`, `--reasoning-effort` | mechanical work; a fallback when Codex is down or out of quota |
 | `agy` (Google Antigravity) | `gemini-4-carbon-high` (default, TJ 2026-11-11), `gemini-4-carbon-medium`/`-low`, `gemini-4-argon-*`, `gemini-3.8-flash-*` | `--dangerously-skip-permissions`, `-p`, `--effort`, `--add-dir` | second opinions on hard kernel and technical problems, vision, deep research and search |
+
+`ext-agent.py start --tool agy` and `ext-launch.sh agy` always pass `--model`: an explicit model wins, `--effort low|medium|high` pins `gemini-4-carbon-{effort}`, and neither pins `gemini-4-carbon-high`.
 
 Use the interactive stdlib driver for a worker that needs steering or answers:
 

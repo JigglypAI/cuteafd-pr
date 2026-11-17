@@ -12,6 +12,7 @@ pub(super) struct Placement {
     pub pages: Vec<u32>,
     pub sequence: u64,
     pub committed: usize,
+    pub media: Option<cuteafd_engine::media::RequestMedia>,
 }
 
 impl crate::shared::qwen::scheduler::Placement for Placement {
@@ -19,7 +20,7 @@ impl crate::shared::qwen::scheduler::Placement for Placement {
     fn set_len(&mut self, len: usize) { self.committed = len; }
     fn units(&self) -> &[u32] { &self.pages }
     fn slot(&self) -> i32 { self.sequence as i32 }
-    fn spans(&self) -> &[cuteafd_core::MediaSpan] { &[] }
+    fn spans(&self) -> &[cuteafd_core::MediaSpan] { self.media.as_ref().map_or(&[], |media| media.spans()) }
 }
 
 /// Carried by both device and host entries. Actual stage lengths are in the mark.
@@ -285,7 +286,7 @@ mod tests {
             let lease = reserve.lease(16_320, 3000, 4, Reserve::limit(&cache, &family, 1 << 20))?;
             let rows = reserve.admit(&cache, &family, &active, &stalled, &[], &lease).unwrap();
             let placement = cache.admit_cold(&family, 16_320, rows,
-                |pages| Placement { pages, sequence, committed: 16_320 })?.placement;
+                |pages| Placement { media: None, pages, sequence, committed: 16_320 })?.placement;
             let initial_rows = placement.pages.len() * 64;
             active.push(Request { placement, lease, produced: 1, initial_rows });
         }
@@ -362,7 +363,7 @@ mod tests {
         assert_ne!(family.record_format(), bf16_identity);
         family.kv_format = cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16;
         assert_eq!(family.record_format(), bf16_identity);
-        let mut placement = Placement { pages: vec![0], sequence: 0, committed: 1 };
+        let mut placement = Placement { media: None, pages: vec![0], sequence: 0, committed: 1 };
         pending.verify(|| Ok((Evidence(retired.clone()), ())))?;
         assert!(family.bind(&mut placement).is_err());
         assert_eq!(retired.get(), 1);
@@ -386,7 +387,7 @@ mod tests {
             let frontier = Frontier::at(len);
             let plan = RestorePlan { snapshot_end: len, target_end: len + 1,
                 lag: LaggedState { source_end: len, replay_start: len }, fidelity: RestoreFidelity::Exact };
-            let placement = Placement { pages: vec![37; len.div_ceil(64)], sequence: 1, committed: 0 };
+            let placement = Placement { media: None, pages: vec![37; len.div_ceil(64)], sequence: 1, committed: 0 };
             frontier.validate_restore(&placement, &plan).unwrap();
             let mut remapped = placement.clone();
             remapped.pages.fill(19);
@@ -464,7 +465,7 @@ mod tests {
                 }).collect()
             };
             let before = pristine()?;
-            let mut destination = Placement { pages: vec![0, 1], sequence: 0, committed: 0 };
+            let mut destination = Placement { media: None, pages: vec![0, 1], sequence: 0, committed: 0 };
             // Corrupt both target ranks and every predictor stage independently.
             for &(rank, span, value) in &counters {
                 let mark = ranks[rank].borrow().mark_view(0)?;
@@ -508,7 +509,7 @@ mod tests {
         let mut shared = PrefixCache::<StubCopyEngine, Frontier>::new(family.layout(), config, None)?;
         let tokens: Vec<u32> = (0..65).collect();
         let mut source = shared.admit(&family, &tokens, 65, false,
-            |pages| Placement { pages, sequence: 0, committed: 0 })?.placement;
+            |pages| Placement { media: None, pages, sequence: 0, committed: 0 })?.placement;
         source.committed = 65;
         assert!(family.capture(MarkSlot(0), &source, 64).is_err());
         assert!(family.restore(None, &mut source, 65).is_err());
@@ -594,7 +595,7 @@ mod tests {
         let mut continuation = tokens.clone();
         continuation.push(66);
         let resumed = shared.admit(&family, &continuation, 66, false,
-            |pages| Placement { pages, sequence: 1, committed: 0 })?;
+            |pages| Placement { media: None, pages, sequence: 1, committed: 0 })?;
         assert_eq!(resumed.resume, 65);
         assert_eq!(resumed.placement.committed, 65);
         assert_eq!(resumed.placement.pages[0], first);
@@ -626,5 +627,40 @@ mod tests {
         shared.release(&family, &source.pages)?;
         shared.release(&family, &resumed.placement.pages)?;
         Ok(())
+    }
+}
+
+/// #2342: Step-5's state is GPU-only; its bind resets every empty sequence so a
+/// cold admission after a failed restore starts from a clean executor slot, and
+/// restore_with validates a fresh destination before it writes retained state.
+#[cfg(test)]
+mod rollback_tests {
+    fn production() -> &'static str {
+        include_str!("prefix.rs").split("\n#[cfg(test)]").next().unwrap()
+    }
+    fn body<'a>(source: &'a str, needle: &str) -> &'a str {
+        let rest = &source[source.find(needle).unwrap_or_else(|| panic!("{needle}"))..];
+        let end = rest.find("\n    }\n").map_or(rest.len(), |e| e + 6);
+        &rest[..end]
+    }
+
+    #[test]
+    fn bind_resets_empty_sequences_before_a_cold_prefill() {
+        let source = production();
+        let bind = body(source, "fn bind(&self, placement: &mut Placement)");
+        let empty = bind.find("if placement.committed == 0")
+            .expect("bind special-cases an empty destination");
+        let reset = bind.find("reset_sequence(placement.sequence)")
+            .expect("bind resets the sequence a failed restore abandoned");
+        assert!(empty < reset, "only an empty placement is reset");
+        let restore_with = body(source, "fn restore_with(");
+        let validate = restore_with.find("saved.validate_restore(placement, plan)?")
+            .expect("restore_with validates the retained frontier first");
+        let write = restore_with.find("self.restore_mark(*slot, placement, plan.resume())?")
+            .expect("restore_with installs the mark");
+        assert!(validate < write, "a rejected frontier must not reach the executor");
+        let validator = body(source, "fn validate_restore(");
+        assert!(validator.contains("placement.committed == 0"),
+            "a restore requires a fresh destination");
     }
 }

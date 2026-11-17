@@ -1,6 +1,28 @@
 use super::*;
 use crate::plan::{self, testing, PlanOptions};
 
+/// Pool facts from the family's real MSA page geometry (the planner's
+/// `cache_geometry` arithmetic): two KV planes plus one index record per
+/// 64-token page, owned per rank by the head split or balanced whole layers.
+fn pool_facts(cfg: &crate::families::minimax_m3::MiniMaxM3Config, gpus: usize,
+    attention: crate::placement::AttentionPlacement, cards: &[u64],
+    context: crate::placement::planner::Context, requested: Option<u64>)
+    -> crate::placement::PoolPolicy {
+    use crate::placement::families::minimax_m3 as shared;
+    let heads = gpus == 2 && attention == crate::placement::AttentionPlacement::Heads;
+    let rank_heads = cfg.kv_heads / if heads { 2 } else { 1 };
+    let page = shared::PAGE_ROWS * cuteafd_ffi::minimax_m3::kv_plane_record_bytes(rank_heads) as u64 * 2
+        + (cfg.msa.index_dim as u64 + 4) * shared::PAGE_ROWS;
+    let owners = shared::layer_owners(cfg.layers, gpus);
+    let units = (0..cards.len()).map(|gpu| {
+        let layers = if heads { cfg.layers as u64 }
+            else { owners.iter().filter(|&&owner| usize::from(owner) == gpu).count() as u64 };
+        page * layers
+    }).collect::<Vec<_>>();
+    crate::placement::prepare_pool(crate::plan::testing::pool_facts(cards, context,
+        requested, shared::PAGE_ROWS, &units)).unwrap()
+}
+
 #[test]
 fn bundled_draft_head_shares_one_blas_pool_with_target() {
     use crate::placement::{families::minimax_m3::{self as shared,Drafter},planner::*};
@@ -216,6 +238,10 @@ fn fixture() -> (tempfile::TempDir, serde_json::Value, Vec<testing::Tensor>) {
 }
 
 fn fixture_with_experts(experts: usize) -> (tempfile::TempDir, serde_json::Value, Vec<testing::Tensor>) {
+    fixture_with_routed_layers(experts, false)
+}
+
+fn fixture_with_routed_layers(experts: usize, two_routed: bool) -> (tempfile::TempDir, serde_json::Value, Vec<testing::Tensor>) {
     let dir = tempfile::tempdir().unwrap();
     let cfg = crate::families::minimax_m3::config::tests::release_config();
     // Use the checkpoint's real shape recipe without writing 89k sparse records per test.
@@ -228,6 +254,7 @@ fn fixture_with_experts(experts: usize) -> (tempfile::TempDir, serde_json::Value
     for key in ["sparse_attention_freq", "sparse_disable_index_value"] {
         small["text_config"]["sparse_attention_config"][key].as_array_mut().unwrap().truncate(4);
     }
+    if two_routed { small["text_config"]["moe_layer_freq"][2] = 1.into(); }
     // Construct headers from the independent Python reference's spelling and shapes.
     let c = MiniMaxM3Config::from_hf(&small).unwrap();
     let mut tensors = Vec::new();
@@ -248,14 +275,14 @@ fn fixture_with_experts(experts: usize) -> (tempfile::TempDir, serde_json::Value
             ("o_proj", 6144, 8192), ("index_q_proj", 512, 6144), ("index_k_proj", 128, 6144)] {
             matrix(format!("{p}self_attn.{name}"), n, k);
         }
-        let (stem, inter) = if layer == 3 { ("block_sparse_moe.shared_experts", 3072) } else { ("mlp", 12288) };
+        let (stem, inter) = if layer == 3 || two_routed && layer == 2 { ("block_sparse_moe.shared_experts", 3072) } else { ("mlp", 12288) };
         for (proj, n, k) in [("gate", inter, 6144), ("up", inter, 6144), ("down", 6144, inter)] {
             matrix(format!("{p}{stem}.{proj}_proj"), n, k);
         }
         for norm in ["q_norm", "k_norm", "index_q_norm", "index_k_norm"] {
             plain(format!("{p}self_attn.{norm}.weight"), "BF16", vec![128]);
         }
-        if layer == 3 {
+        if layer == 3 || two_routed && layer == 2 {
             plain(format!("{p}block_sparse_moe.gate.weight"), "F32", vec![experts, 6144]);
             plain(format!("{p}block_sparse_moe.e_score_correction_bias"), "F32", vec![experts]);
             for e in 0..experts {
@@ -276,8 +303,16 @@ fn fixture_with_experts(experts: usize) -> (tempfile::TempDir, serde_json::Value
 }
 
 pub(crate) fn concurrency_matrix_snapshot() -> (tempfile::TempDir, std::path::PathBuf) {
+    concurrency_snapshot(false)
+}
+
+pub(crate) fn onboarding_matrix_snapshot() -> (tempfile::TempDir, std::path::PathBuf) {
+    concurrency_snapshot(true)
+}
+
+fn concurrency_snapshot(two_routed: bool) -> (tempfile::TempDir, std::path::PathBuf) {
     use crate::families::minimax_m3::weight_layout::CoordinatorWeights;
-    let (dir, config, _) = fixture_with_experts(128);
+    let (dir, config, _) = fixture_with_routed_layers(128, two_routed);
     let checkpoint = Checkpoint::open(dir.path()).unwrap();
     let cfg = MiniMaxM3Config::from_hf(&config).unwrap();
     let weights = CoordinatorWeights::plan(&checkpoint, &cfg, 1, &[0; 4]).unwrap();
@@ -309,7 +344,7 @@ fn only_optional_bundled_components_keep_missing_execution_hints() {
         Component::Indexer, Component::Router, Component::SharedExpert, Component::RoutedExpert,
         Component::DenseFfn, Component::Vision, Component::Speculator].into_iter()
         .filter(|&component| MINIMAX_M3.component_hint(component).is_some()).collect::<Vec<_>>();
-    assert_eq!(missing, [Component::Vision, Component::Speculator]);
+    assert_eq!(missing, [Component::Speculator]);
 }
 
 #[test]
@@ -795,9 +830,13 @@ fn recipe_inputs(gpus: usize, ranks: usize) -> crate::placement::families::minim
         .chain([crate::placement::families::kimi::host_budget(512 << 30, 480 << 30)]).collect();
     // Executor geometry checks are release-exact (E128); the fixture keeps four experts' headers.
     let mut release = cfg.clone(); release.experts = 128;
-    MiniMaxInputs { cfg: release, gpus, split_wire: Some(crate::families::minimax_m3::execution::WirePrecision::Bf16), attention: if gpus == 2 { crate::placement::AttentionPlacement::Layers }
-        else { crate::placement::AttentionPlacement::Heads }, spark_ranks: ranks, context: Context::automatic(1 << 20),
-        maximum_pool_tokens: 4 << 20, prefill, sequences: 16, targets: targets.clone(), owners: owners.clone(),
+    let attention = if gpus == 2 { crate::placement::AttentionPlacement::Layers }
+        else { crate::placement::AttentionPlacement::Heads };
+    let pool = pool_facts(&release, gpus, attention,
+        &vec![96 << 30; gpus], Context::automatic(1 << 20), None);
+    MiniMaxInputs { cfg: release, gpus, split_wire: Some(crate::families::minimax_m3::execution::WirePrecision::Bf16), attention,
+        spark_ranks: ranks, context: Context::automatic(1 << 20),
+        pool, prefill, sequences: 16, targets: targets.clone(), owners: owners.clone(),
         manifest, routed: routed.clone(),
         expert_backings: (0..=routed.len()).map(|count| if count == 0 { Vec::new() } else {
             let catalog = crate::read_expert_catalog(dir.path()).unwrap();
@@ -882,6 +921,8 @@ fn shared_recipe_supports_layouts_and_measured_baselines_without_replanning() {
         let inputs = recipe_inputs(gpus, ranks);
         let request = shared::request(inputs.context, Some(32768), Onboard::Layers(0), inputs.prefill,
             Operation::Serving, None, Default::default());
+        let mut inputs = inputs.clone();
+        inputs.pool = crate::placement::prepare_pool(crate::placement::PoolFacts::new(inputs.context, Some(32768), shared::PAGE_ROWS)).unwrap();
         let planned = inputs.admit(request.clone()).unwrap();
         assert_eq!(planned.placement.pool_tokens, 32768);
         assert!(planned.placement.layers.iter().filter(|l| l.experts != ExpertHome::Dense)
@@ -893,6 +934,7 @@ fn shared_recipe_supports_layouts_and_measured_baselines_without_replanning() {
                 phase: Phase::Load, source: "same pre-weight sample".into() };
         }
         let runtime = measured.admit(request).unwrap();
+        assert_eq!(planned.solved.pool_policy, runtime.solved.pool_policy);
         assert_eq!(planned.solved.pool_tokens, runtime.solved.pool_tokens);
         assert_eq!(planned.solved.decisions, runtime.solved.decisions);
         assert_eq!(planned.solved.facts, runtime.solved.facts);
@@ -914,6 +956,8 @@ fn shared_recipe_refuses_invalid_owners_and_request_geometry() {
     let inputs = recipe_inputs(2, 4);
     let request = shared::request(inputs.context, Some(32768), crate::placement::Onboard::Layers(0),
         inputs.prefill, Operation::Serving, None, Default::default());
+    let mut inputs = inputs.clone();
+    inputs.pool = crate::placement::prepare_pool(crate::placement::PoolFacts::new(inputs.context, Some(32768), shared::PAGE_ROWS)).unwrap();
     for concurrency in [0, 65, 128] {
         let mut bad = inputs.clone();
         bad.sequences = concurrency;
@@ -947,6 +991,8 @@ fn shared_recipe_names_every_missing_duplicate_or_malformed_native_export() {
         let inputs = recipe_inputs(gpus, 4);
         let request = shared::request(inputs.context, Some(32768), crate::placement::Onboard::Layers(0),
             inputs.prefill, Operation::Serving, None, Default::default());
+        let mut inputs = inputs.clone();
+        inputs.pool = crate::placement::prepare_pool(crate::placement::PoolFacts::new(inputs.context, Some(32768), shared::PAGE_ROWS)).unwrap();
         inputs.prepare(&request).unwrap();
         for entry in inputs.manifest["programs"].as_array().unwrap() {
             let name = entry["name"].as_str().unwrap();
@@ -984,6 +1030,8 @@ fn shared_recipe_refuses_valid_but_undersized_native_exports() {
         let inputs = recipe_inputs(gpus, 4);
         let request = shared::request(inputs.context, Some(32768), crate::placement::Onboard::Layers(0),
             inputs.prefill, Operation::Serving, None, Default::default());
+        let mut inputs = inputs.clone();
+        inputs.pool = crate::placement::prepare_pool(crate::placement::PoolFacts::new(inputs.context, Some(32768), shared::PAGE_ROWS)).unwrap();
         let msa = [Mode::IndexDecode, Mode::IndexPrefill, Mode::AttentionDecode, Mode::AttentionExtend];
         for original in inputs.manifest["programs"].as_array().unwrap().iter()
             .filter(|entry| entry["name"].as_str().unwrap().starts_with("minimax_")) {
@@ -1045,6 +1093,8 @@ fn shared_recipe_onboards_whole_layers_or_tp2_halves() {
         let inputs = recipe_inputs(gpus, 0);
         let request = shared::request(inputs.context, Some(32768), Onboard::Layers(1), inputs.prefill,
             Operation::Serving, None, Default::default());
+        let mut inputs = inputs.clone();
+        inputs.pool = crate::placement::prepare_pool(crate::placement::PoolFacts::new(inputs.context, Some(32768), shared::PAGE_ROWS)).unwrap();
         let admitted = inputs.admit(request).unwrap();
         assert_eq!(admitted.onboard, 1);
         assert_eq!(admitted.placement.layers[3].experts,
@@ -1077,6 +1127,8 @@ fn zero_onboard_pair_has_no_local_expert_or_exchange_owners() {
         let inputs = recipe_inputs(2, ranks);
         let request = shared::request(inputs.context, Some(32768), crate::placement::Onboard::Layers(count),
             inputs.prefill, Operation::Serving, None, Default::default());
+        let mut inputs = inputs.clone();
+        inputs.pool = crate::placement::prepare_pool(crate::placement::PoolFacts::new(inputs.context, Some(32768), shared::PAGE_ROWS)).unwrap();
         let admitted = inputs.admit(request).unwrap();
         let owners = &admitted.solved.facts.allocations;
         let exchange = owners.iter().filter(|owner| owner.id.starts_with("minimax.tp2.")).count();
@@ -1115,6 +1167,8 @@ fn synchronous_upload_chunk_is_one_startup_only_pinned_backing() {
         let inputs = recipe_inputs(gpus, 4);
         let request = shared::request(inputs.context, Some(32768), crate::placement::Onboard::Layers(0),
             inputs.prefill, Operation::Serving, None, Default::default());
+        let mut inputs = inputs.clone();
+        inputs.pool = crate::placement::prepare_pool(crate::placement::PoolFacts::new(inputs.context, Some(32768), shared::PAGE_ROWS)).unwrap();
         let admitted = inputs.admit(request).unwrap();
         let facts = &admitted.solved.facts;
         let owners = facts.allocations.iter().filter(|owner| owner.id == "staging/sync-h2d")
@@ -1146,6 +1200,8 @@ fn prefill_token_uploads_match_entry_units_only() {
             inputs.sequences = concurrency;
             let request = shared::request(inputs.context, Some(32768), crate::placement::Onboard::Layers(0),
                 inputs.prefill, Operation::Serving, None, Default::default());
+            let mut inputs = inputs.clone();
+            inputs.pool = crate::placement::prepare_pool(crate::placement::PoolFacts::new(inputs.context, Some(32768), shared::PAGE_ROWS)).unwrap();
             let admitted = inputs.admit(request).unwrap();
             let owners = admitted.solved.facts.allocations.iter()
                 .filter(|owner| owner.id.ends_with(".route_ids.upload"))
@@ -1175,6 +1231,8 @@ fn prefix_ordered_uploads_match_each_request_destination() {
             inputs.sequences = concurrency;
             let request = shared::request(inputs.context, Some(32768), crate::placement::Onboard::Layers(0),
                 inputs.prefill, Operation::Serving, None, Default::default());
+            let mut inputs = inputs.clone();
+            inputs.pool = crate::placement::prepare_pool(crate::placement::PoolFacts::new(inputs.context, Some(32768), shared::PAGE_ROWS)).unwrap();
             let admitted = inputs.admit(request).unwrap();
             let mut bytes = 0;
             for gpu in 0..gpus {
@@ -1498,6 +1556,8 @@ fn request_descriptor_allocations_equal_recipe_on_one_and_two_rtx() {
             }
             let request = shared::request(inputs.context, Some(32768), crate::placement::Onboard::Layers(0),
                 inputs.prefill, Operation::Serving, None, Default::default());
+            let mut inputs = inputs.clone();
+            inputs.pool = crate::placement::prepare_pool(crate::placement::PoolFacts::new(inputs.context, Some(32768), shared::PAGE_ROWS)).unwrap();
             let admitted = inputs.admit(request).unwrap();
             let actual = admitted.solved.facts.allocations.iter().filter(|owner|
                 ["minimax.cache.", "minimax.prefix.h2d.", "minimax.rope.", "minimax.decode.",
@@ -1521,6 +1581,8 @@ fn compact_decode_table_upload_is_one_exact_pinned_owner_per_rank() {
             inputs.sequences = concurrency;
             let request = shared::request(inputs.context, Some(32768), crate::placement::Onboard::Layers(0),
                 inputs.prefill, Operation::Serving, None, Default::default());
+            let mut inputs = inputs.clone();
+            inputs.pool = crate::placement::prepare_pool(crate::placement::PoolFacts::new(inputs.context, Some(32768), shared::PAGE_ROWS)).unwrap();
             let admitted = inputs.admit(request).unwrap();
             let allocations = &admitted.solved.facts.allocations;
             for gpu in 0..gpus {
@@ -1681,9 +1743,11 @@ fn heads_recipe_matches_native_cache_units_peer_slots_and_one_tail_per_backing()
     for concurrency in [1, 16, 64] {
         let mut inputs = heads_recipe_inputs();
         inputs.sequences = concurrency;
-        let maximum = inputs.maximum_pages();
         let request = shared::request(inputs.context, Some(1 << 20), crate::placement::Onboard::Auto,
             inputs.prefill, Operation::Serving, None, Default::default());
+        let mut inputs = inputs.clone();
+        inputs.pool = crate::placement::prepare_pool(crate::placement::PoolFacts::new(inputs.context, Some(1 << 20), shared::PAGE_ROWS)).unwrap();
+        let maximum = inputs.maximum_pages();
         let contract = inputs.prepare(&request).unwrap();
         assert!(!contract.components.iter().any(|component| matches!(&component.kind,
             ComponentKind::Allocation { template, .. } if template.group == "residual hop control")));
@@ -1758,12 +1822,16 @@ fn explicit_heads_and_layers_both_qualify_serving() {
     let heads = heads_recipe_inputs();
     let request = shared::request(heads.context, Some(1 << 20), crate::placement::Onboard::Auto,
         heads.prefill, Operation::Serving, None, Default::default());
+    let mut heads = heads.clone();
+    heads.pool = crate::placement::prepare_pool(crate::placement::PoolFacts::new(heads.context, Some(1 << 20), shared::PAGE_ROWS)).unwrap();
     assert!(heads.admit_serving(request.clone()).is_ok());
     assert!(heads.admit(request).is_ok(), "explicit planning remains available");
     let layers = recipe_inputs(2, 4);
     assert_eq!(layers.attention, AttentionPlacement::Layers);
     let request = shared::request(layers.context, Some(1 << 20), crate::placement::Onboard::Auto,
         layers.prefill, Operation::Serving, None, Default::default());
+    let mut layers = layers.clone();
+    layers.pool = crate::placement::prepare_pool(crate::placement::PoolFacts::new(layers.context, Some(1 << 20), shared::PAGE_ROWS)).unwrap();
     assert!(layers.admit_serving(request).is_ok());
     assert_eq!(shared::Owner::Kv { layer: 3, plane: "index" }.id(), "minimax.kv.3.index");
     for gpu in 0..2 {
@@ -1818,6 +1886,8 @@ fn heads_expert_backend_charges_tp2_exchange_separately_without_weight_replicati
             }
             let request = shared::request(inputs.context, Some(1 << 20), Onboard::Layers(count),
                 inputs.prefill, Operation::Serving, None, Default::default());
+            let mut inputs = inputs.clone();
+            inputs.pool = crate::placement::prepare_pool(crate::placement::PoolFacts::new(inputs.context, Some(1 << 20), shared::PAGE_ROWS)).unwrap();
             let admitted = inputs.admit(request).unwrap();
             let facts = &admitted.solved.facts;
             let ids = facts.allocations.iter().map(|a| a.id.as_str()).collect::<Vec<_>>();
@@ -1865,6 +1935,8 @@ fn measured_context_changes_only_the_named_owner_with_a_pinned_pool() {
         }
         let request = shared::request(inputs.context, Some(32768), crate::placement::Onboard::Layers(0),
             inputs.prefill, Operation::Serving, None, Default::default());
+        let mut inputs = inputs.clone();
+        inputs.pool = crate::placement::prepare_pool(crate::placement::PoolFacts::new(inputs.context, Some(32768), shared::PAGE_ROWS)).unwrap();
         let before = inputs.admit(request.clone()).unwrap();
         inputs.measured_context[0] += 65_536;
         let after = inputs.admit(request).unwrap();
@@ -1902,7 +1974,7 @@ fn heads_gather_uses_sliced_targets_mount_sources_and_replicated_host_prefix_pag
     let catalog = crate::read_expert_catalog(dir.path()).unwrap();
     let manifest_path = dir.path().join("PROGRAMS.json");
     std::fs::write(&manifest_path, expected.manifest.to_string()).unwrap();
-    let mut request = FactsRequest { spark_rank_bytes: Vec::new(), checkpoint: &checkpoint, cfg: &cfg, catalog: &catalog,
+    let mut request = FactsRequest { target_pool_tokens: None, vision: crate::plan::MediaMode::Off, vision_replicas: 1, media_cache_bytes: None, spark_rank_bytes: Vec::new(), checkpoint: &checkpoint, cfg: &cfg, catalog: &catalog,
         manifest_path: &manifest_path, manifest: expected.manifest.clone(),
         coordinator: Coordinator::Planned { cards: vec![CoordinatorCard {
             physical_bytes: 96 << 30, logical_bytes: 96 << 30 }; 2] },
@@ -1950,6 +2022,7 @@ fn heads_gather_uses_sliced_targets_mount_sources_and_replicated_host_prefix_pag
             source: "same automatic Heads baseline".into() };
     }
     let runtime = measured.admit_serving(solve).unwrap();
+    assert_eq!(planned.solved.pool_policy, runtime.solved.pool_policy);
     assert_eq!(planned.solved.pool_tokens, runtime.solved.pool_tokens);
     assert_eq!(planned.solved.decisions, runtime.solved.decisions);
     assert_eq!(planned.solved.facts, runtime.solved.facts);
@@ -2014,6 +2087,25 @@ fn explicit_and_auto_heads_public_layouts_are_executable() {
         assert_eq!(report.attention_placement, attention.unwrap_or(AttentionPlacement::Heads));
         let placed = report.solver_placement.as_ref().unwrap_or_else(|| panic!("qualified default wire produces a shared solved plan: {report:#?}"));
         assert_eq!(placed.attention_placement, report.attention_placement);
+        let checkpoint = Checkpoint::open(dir.path()).unwrap();
+        let catalog = crate::read_expert_catalog(dir.path()).unwrap();
+        let cfg = MiniMaxM3Config::from_hf(&checkpoint.config).unwrap();
+        use crate::families::minimax_m3::admission::{gather, Coordinator, FactsRequest};
+        let runtime = gather(&FactsRequest { target_pool_tokens: None, vision: plan::MediaMode::Off,
+            vision_replicas: 1, media_cache_bytes: None, checkpoint: &checkpoint, cfg: &cfg, catalog: &catalog,
+            manifest_path: &manifest, manifest: std::sync::Arc::new(serde_json::from_slice(&std::fs::read(&manifest).unwrap()).unwrap()),
+            coordinator: Coordinator::Measured { samples: vec![(96 << 30, 96 << 30, 95 << 30); 2], loaded_code: vec![0; 2] },
+            attention, split_wire: plan::layout::LayoutOptions::default().minimax_split_wire, physical_devices: &[0, 1],
+            spark_ranks: 4, spark_bytes: 100 << 30, spark_rank_bytes: vec![],
+            prefill: crate::placement::planner::PrefillShape { rows: 1024, waves: 3 }, context_tokens: 32768,
+            pool_tokens: Some(32768), sequences: 16, host: (512 << 30, 480 << 30), host_cache_bytes: Some(0),
+            prefix_entries: 64, drafter: None, replies: Default::default(),
+            head: crate::placement::planner::serving::BlasHead::Gemm, expert_usage: false,
+            resident_weight_limit: crate::placement::ResidentWeights(80 << 30) }).unwrap();
+        let request = crate::placement::families::minimax_m3::request(runtime.context, Some(32768),
+            crate::placement::Onboard::Layers(0), runtime.prefill, crate::placement::planner::Operation::Serving,
+            runtime.resident_weight_limit, Default::default());
+        assert_eq!(report.phase_ledger.as_ref().unwrap().pool_policy, runtime.admit(request).unwrap().solved.pool_policy);
         assert_eq!(plan::layout::LayoutOptions::default().minimax_split_wire,
             Some(crate::families::minimax_m3::execution::WirePrecision::F32));
     }
@@ -2042,6 +2134,8 @@ fn selected_push_envelope_replaces_mount_until_commit() {
             }
             let request = shared::request(inputs.context, Some(1 << 20), Onboard::Layers(count),
                 inputs.prefill, Operation::Serving, None, Default::default());
+            let mut inputs = inputs.clone();
+            inputs.pool = crate::placement::prepare_pool(crate::placement::PoolFacts::new(inputs.context, Some(1 << 20), shared::PAGE_ROWS)).unwrap();
             let admitted = inputs.admit(request.clone()).unwrap();
             let expected = inputs.push_host_envelopes[count].as_ref().unwrap();
             assert_eq!(admitted.push_host_envelope.as_ref(), Some(expected));
@@ -2073,6 +2167,8 @@ fn push_envelope_refuses_mixed_routes_bad_topology_and_mount_candidates() {
         let mut inputs = recipe_inputs(gpus, 4);
         let request = shared::request(inputs.context, Some(1 << 20), Onboard::Layers(0),
             inputs.prefill, Operation::Serving, None, Default::default());
+        let mut inputs = inputs.clone();
+        inputs.pool = crate::placement::prepare_pool(crate::placement::PoolFacts::new(inputs.context, Some(1 << 20), shared::PAGE_ROWS)).unwrap();
         inputs.push_host_envelopes.clear();
         assert!(inputs.prepare(&request).is_err());
         inputs.push_host_envelopes = vec![Some(PushHostEnvelope::new(vec![0; gpus], vec![0; gpus], 128, 1 << 20).unwrap()); 2];
@@ -2096,6 +2192,8 @@ fn recipe_asserts_embedding_home_is_coordinator_gpu_zero() {
         let mut inputs = recipe_inputs(gpus, 4);
         let request = shared::request(inputs.context, Some(1 << 20), Onboard::Layers(0),
             inputs.prefill, Operation::Serving, None, Default::default());
+        let mut inputs = inputs.clone();
+        inputs.pool = crate::placement::prepare_pool(crate::placement::PoolFacts::new(inputs.context, Some(1 << 20), shared::PAGE_ROWS)).unwrap();
         assert!(inputs.prepare(&request).is_ok());
         let target = &mut inputs.targets[0];
         target.arena = crate::serving_capacity::WeightArenaLayout::new(target.arena.id(),
@@ -2125,6 +2223,8 @@ fn decode_token_upload_is_one_exact_entry_rank_pair() {
             inputs.sequences = concurrency;
             let request = shared::request(inputs.context, Some(32768), crate::placement::Onboard::Layers(0),
                 inputs.prefill, Operation::Serving, None, Default::default());
+            let mut inputs = inputs.clone();
+            inputs.pool = crate::placement::prepare_pool(crate::placement::PoolFacts::new(inputs.context, Some(32768), shared::PAGE_ROWS)).unwrap();
             let admitted = inputs.admit(request).unwrap();
             let id = Owner::DecodeTokenIds { gpu: 0 };
             assert_eq!(id.inventory_name().unwrap(), "decode.token_ids.0");
@@ -2163,6 +2263,8 @@ fn split_recipe_precision_roles_and_onboard_route_receives_are_exact() {
                 assert_eq!(inputs.usage_devices(), vec![0]);
                 let request = shared::request(inputs.context, Some(32768), Onboard::Layers(count),
                     inputs.prefill, Operation::Serving, None, Default::default());
+                let mut inputs = inputs.clone();
+                inputs.pool = crate::placement::prepare_pool(crate::placement::PoolFacts::new(inputs.context, Some(32768), shared::PAGE_ROWS)).unwrap();
                 let admitted = inputs.admit(request.clone()).unwrap();
                 assert!(admitted.placement.layers.iter().zip(&inputs.owners).all(|(layer, &gpu)|
                     layer.mode == LayerMode::Whole { gpu, ffn: FfnMode::Split }));
@@ -2243,5 +2345,38 @@ fn split_recipe_precision_roles_and_onboard_route_receives_are_exact() {
                 assert!(matches!(inputs.admit_serving(request), Err(ServingRefusal::SplitWireNotQualified)));
             }
         }
+    }
+}
+
+#[test]
+fn prepared_pool_growth_retains_onboarding_and_policy_after_scope_exit() {
+    use crate::placement::families::minimax_m3 as shared;
+    use crate::placement::planner::Operation;
+    use cuteafd_core::memory_policy::MemoryPolicy;
+    for gpus in [1, 2] {
+        let inputs = recipe_inputs(gpus, 4);
+        let request = shared::request(inputs.context, None, crate::placement::Onboard::Auto,
+            inputs.prefill, Operation::Serving, None, Default::default());
+        let small = pool_facts(&inputs.cfg, gpus, inputs.attention,
+            &vec![32 << 30; gpus], inputs.context, None);
+        assert_eq!(small.target(), 2 << 20);
+        let default = inputs.admit(request.clone()).unwrap();
+        let mut growing = inputs.clone();
+        growing.pool = MemoryPolicy { kv_max: Some(100_000_000), ..Default::default() }.scoped(||
+            pool_facts(&inputs.cfg, gpus, inputs.attention,
+                &vec![96 << 30; gpus], inputs.context, None));
+        let grown = growing.admit(request.clone()).unwrap();
+        assert_eq!(grown.solved.pool_policy, Some(growing.pool));
+        assert_eq!(grown.onboard, default.onboard);
+        // The unbounded default already grows into the declared memory bound;
+        // an explicit max can only cap that growth lower.
+        assert!(default.solved.pool_tokens > inputs.pool.target(),
+            "the unbounded default grows into the memory bound");
+        assert!(grown.solved.pool_tokens <= default.solved.pool_tokens);
+        let mut explicit = inputs.clone();
+        explicit.pool = crate::placement::prepare_pool(crate::placement::PoolFacts::new(inputs.context, Some(default.solved.pool_tokens), shared::PAGE_ROWS)).unwrap();
+        let mut pinned = request.clone();
+        pinned.pool = crate::placement::planner::Pin::Exact(default.solved.pool_tokens);
+        assert_eq!(explicit.admit(pinned).unwrap().solved.pool_tokens, default.solved.pool_tokens);
     }
 }

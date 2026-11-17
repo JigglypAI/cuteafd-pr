@@ -146,6 +146,28 @@ fn check_panel_config(report: &mut Report, configs: &crate::panel_config::PanelC
             }
             continue;
         }
+        if panel == "concurrency" {
+            let sustained = crate::sustained::Options::parse(config).map(|o| o.sustained).unwrap_or(false);
+            // Without the in-server panel the config is for the external sweep,
+            // which validates its own output (it fails when no sustained point ran).
+            let Some(evidence) = report.panels.iter().find(|p| &p.id == panel) else { continue };
+            let points: Vec<&Value> = evidence.passes.iter()
+                .filter_map(|pass| pass["points"].as_array()).flatten().collect();
+            let supported = if sustained {
+                // Every level the panel measured needs its sustained point and window.
+                let levels: std::collections::BTreeSet<u64> = points.iter()
+                    .filter(|p| p["phase"] != "sustained").filter_map(|p| p["c"].as_u64()).collect();
+                !levels.is_empty() && levels.iter().all(|level| points.iter().any(|p|
+                    p["phase"] == "sustained" && p["c"].as_u64() == Some(*level) && p["sustained"].is_object()))
+            } else {
+                !points.iter().any(|p| p["phase"] == "sustained")
+            };
+            if !supported {
+                report.status = RunStatus::Failed;
+                report.error = Some("server did not record requested concurrency panel-config settings".into());
+            }
+            continue;
+        }
         let options = match panel.as_str() {
             "decode_content" => crate::panels::speed::DecodeOptions::parse(config).ok(),
             _ => None,
@@ -170,6 +192,9 @@ pub fn run(options: &RunOptions) -> Result<(Report, PathBuf)> {
     crate::panel_config::validate(&options.panel_config)?;
     let base = options.url.trim_end_matches('/').to_string();
     let agent = agent();
+    let key = options.api_key.as_deref().map(cuteafd_api::openai::auth::ApiKey::new).transpose().map_err(anyhow::Error::msg)?;
+    let client = crate::client::Client::new(&base, None, Default::default()).with_api_key(key);
+    let prelude = client.warm_prelude(crate::sweep::TOKENS)?;
     let mut body = json!({});
     if let Some(profile) = &options.profile {
         body["profile"] = json!(profile);
@@ -231,6 +256,7 @@ pub fn run(options: &RunOptions) -> Result<(Report, PathBuf)> {
     // run's own gate check and a run recovered from the local store after the
     // server went away cannot carry a verdict the data no longer earns.
     let mut report = crate::quality::under_current_rule(&report);
+    anyhow::ensure!(report.prelude.as_ref() == Some(&prelude), "timed report omitted or changed this server's warm prelude receipt");
     check_context_suffix(&mut report, options.context_suffix.unwrap_or(0));
     check_panel_config(&mut report, &options.panel_config);
     let written = write_exports(&report, &dir, &options.export)?;
@@ -396,6 +422,36 @@ mod tests {
         report.status = crate::report::RunStatus::Done;
         report.panels.last_mut().unwrap().passes[0]["sampling"] =
             serde_json::json!({"temperature":1.0,"top_p":0.95,"seed":42});
+        super::check_panel_config(&mut report, &configs);
+        assert_eq!(report.status, crate::report::RunStatus::Done);
+    }
+
+    #[test]
+    fn sustained_concurrency_requires_server_evidence_not_ignored_configuration() {
+        let configs = std::collections::BTreeMap::from([("concurrency".into(),
+            serde_json::json!({"sustained":true,"multiplier":4}))]);
+        let mut report = crate::sample::report(false);
+        report.panels.retain(|p| p.id != "concurrency");
+        report.panels.push(crate::report::PanelResult { id:"concurrency".into(),
+            passes:vec![serde_json::json!({"points":[{"c":1},{"c":4}]})], ..Default::default() });
+        super::check_panel_config(&mut report, &configs);
+        assert_eq!(report.status, crate::report::RunStatus::Failed);
+        report.status = crate::report::RunStatus::Done;
+        report.error = None;
+        report.panels.last_mut().unwrap().passes[0]["points"] = serde_json::json!([
+            {"c":1},{"c":4},
+            {"c":1,"phase":"sustained","sustained":{"credited_tokens":10.0,"elapsed_s":1.0}},
+            {"c":4,"phase":"sustained","sustained":{"credited_tokens":10.0,"elapsed_s":1.0}}]);
+        super::check_panel_config(&mut report, &configs);
+        assert_eq!(report.status, crate::report::RunStatus::Done);
+    }
+
+    #[test]
+    fn external_only_concurrency_config_skips_the_server_check() {
+        let configs = std::collections::BTreeMap::from([("concurrency".into(),
+            serde_json::json!({"sustained":true,"multiplier":4}))]);
+        let mut report = crate::sample::report(false);
+        report.panels.retain(|p| p.id != "concurrency");
         super::check_panel_config(&mut report, &configs);
         assert_eq!(report.status, crate::report::RunStatus::Done);
     }

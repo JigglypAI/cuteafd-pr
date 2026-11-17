@@ -59,13 +59,13 @@ fn settings_query_rejects_shared_replay_before_placement() {
 }
 
 #[test]
-fn mimo_automatic_drafter_uses_official_identity_not_directory() {
+fn mimo_automatic_drafter_uses_contents_not_repository_identity() {
     let snapshot = tempfile::tempdir().unwrap();
     std::fs::write(snapshot.path().join("config.json"), r#"{"model_type":"mimo_v2"}"#).unwrap();
     for present in [false, true] {
         if present { std::fs::create_dir(snapshot.path().join("dflash")).unwrap(); }
-        for (id, expected) in [("XiaomiMiMo/MiMo-V2.6-Flash-MOPD", "dflash2"),
-            ("XiaomiMiMo/MiMo-V2.6-Pro-MOPD", "dflash2"), ("community/lookalike", "off")] {
+        for id in ["XiaomiMiMo/MiMo-V2.6-Flash-MOPD", "XiaomiMiMo/MiMo-V2.6-Pro-MOPD", "community/lookalike"] {
+            let expected = if present { "dflash2" } else { "off" };
             let output = test_command(env!("CARGO_BIN_EXE_cuteafd"))
                 .args(["plan", snapshot.path().to_str().unwrap(), "--resolve-settings-only", "--checkpoint-model-id", id])
                 .output().unwrap();
@@ -652,13 +652,13 @@ fn installed_flash_exlr8_automatic_tp2_plan(ranks: &str) -> serde_json::Value {
 
 #[test]
 #[ignore = "requires CUTEAFD_EXLR8_FLASH_SNAPSHOT and current CUTEAFD_DEPLOYMENT_TEST_PROGRAMS"]
-fn installed_flash_exlr8_automatic_zero_spark_pool_stops_at_2m() {
+fn installed_flash_exlr8_automatic_zero_spark_pool_grows_past_target() {
     let deployment = installed_flash_exlr8_automatic_tp2_plan("0");
     let devices = deployment["memory_layout"]["devices"].as_array().unwrap();
     assert_eq!(devices.len(), 2);
     for device in devices {
-        assert_eq!(device["kv_tokens"], 2_097_152,
-            "automatic zero-Spark pool must stop at its 2M target when capacity permits");
+        assert!(device["kv_tokens"].as_u64().unwrap() >= 2_097_152,
+            "automatic zero-Spark pool grows into admitted remaining memory");
     }
 }
 
@@ -688,7 +688,7 @@ fn installed_flash_exlr8_automatic_tp2_max_is_zero_spark_and_launchable() {
         for (rank, device) in devices.iter().enumerate() {
             assert_eq!(device["kind"], "rtx");
             assert_eq!(device["index"], rank);
-            assert_eq!(device["kv_tokens"], 2_097_152);
+            assert!(device["kv_tokens"].as_u64().unwrap() >= 2_097_152);
             let items = device["items"].as_array().unwrap();
             let routed = items.iter().find(|item| item["group"] == "RTX expert arena")
                 .expect("the selected routed expert backing must be charged on each RTX");
@@ -789,7 +789,7 @@ fn installed_mimo_min_onboarding_matches_smoke(root: &std::path::Path,
     // 15 layers under the retired 97% ceiling; the one-cap policy (#1440) admits a 16th
     // with the measured 575 MiB baseline and the named Ready owners charged.
     assert_eq!(deployment["report"]["onboard_layers"], 16, "measured min-card local prefix must not drift");
-    assert_eq!(deployment["memory_layout"]["pool_tokens"], 2_097_152);
+    assert!(deployment["memory_layout"]["pool_tokens"].as_u64().unwrap() >= 2_097_152);
     assert_eq!(deployment["prefill_unit_rows"], 2752);
     assert_eq!(deployment["prefill_waves"], 3);
     let lead = deployment["memory_layout"]["devices"].as_array().unwrap().iter()
@@ -919,12 +919,15 @@ fn assert_v41_sim5090_head_pools(root: &std::path::Path, snapshot: &std::path::P
         let report: serde_json::Value = serde_json::from_slice(&output.stdout)
             .unwrap_or_else(|error| panic!("sim5090 {head}: {error}; {stderr}"));
         assert!(output.status.success(), "sim5090 {head}: {stderr}; {:?}", report["hints"]);
-        assert_eq!(report["memory_layout"]["pool_tokens"], 1_048_576, "sim5090 {head}: {report}");
+        let pool = report["memory_layout"]["pool_tokens"].as_u64().unwrap();
+        let policy = &report["phase_ledger"]["pool_policy"];
+        assert_eq!(policy["target"], 2_097_152, "sim5090 {head}: {report}");
+        assert!(pool >= context.parse::<u64>().unwrap(), "sim5090 {head}: {report}");
     }
 }
 
 #[test]
-fn v41_sim5090_overlay_preserves_1m_pool_for_all_and_packed() {
+fn v41_sim5090_overlay_uses_uniform_target_and_memory_pool_for_all_and_packed() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
     let snapshot = tempfile::tempdir().unwrap();
     cuteafd_loader::plan::testing::write_v41_snapshot(snapshot.path());
@@ -1166,7 +1169,8 @@ fn installed_release_and_example_families_match_dev_d6aecfcb7() {
         &std::fs::read(root.join("benchmarks/current-matrix.json")).unwrap()).unwrap();
     let retired = retired_configs(&matrix);
     // Original detector baseline, extended with verified published MC configurations
-    // and deliberate pinned qualifications. Keep old MC revisions until their
+    // and deliberate pinned qualifications, including all three live Inkling
+    // formats verified from installed configs. Keep old MC revisions until their
     // historical live matrix cards are replaced by repaired #2207 revisions.
     let baseline: serde_json::Value = serde_json::from_str(include_str!(
         "fixtures/family-detection-devd6aecfcb7.json")).unwrap();
@@ -1226,8 +1230,8 @@ fn installed_release_and_example_families_match_dev_d6aecfcb7() {
         (expected_absent.0.to_owned(), expected_absent.1.to_owned())]));
     assert_eq!(installed.iter().map(|(model, revision)| (model.as_str(), revision.as_str()))
         .collect::<std::collections::BTreeSet<_>>(), expected_installed);
-    assert_eq!(tested, 35, "installed checkpoint revision set changed (including three repaired MC revisions)");
-    eprintln!("family detection baseline d6aecfcb7 plus deliberate MiniMax (#2081), Muse MC, Kimi K3.1 MC and repaired MC entries: {tested} installed checkpoint revisions verified");
+    assert_eq!(tested, 38, "installed checkpoint revision set changed (including repaired MC and three live Inkling revisions)");
+    eprintln!("family detection baseline d6aecfcb7 plus deliberate MiniMax (#2081), Muse MC, Kimi K3.1 MC, repaired MC and three live Inkling entries: {tested} installed checkpoint revisions verified");
 }
 
 fn retired_configs(matrix: &serde_json::Value) -> std::collections::BTreeSet<String> {
@@ -1315,6 +1319,7 @@ fn installed_mc_views_cover_executable_projection_manifests() {
         ("GLM-5.3-EXL3-K4-MC", "2e42b53e61f0f59f664c915fe2424ce9c9fa5f8e"),
         ("GLM-5.3-Flash-EXL3-K4-MC", "558931fe149f59b49d19b2376a692bd7a12fb8b7"),
         ("Step-5-Preview-EXL3-K4-MC", "aedda90d25bd02bb6520bcaf88e06e6c9bc932c4"),
+        ("Kimi-K3.1-Pro-EXL3-K2-MC", "1455b31b0acc53f36df916864fb541d9f536b3f8"),
     ] {
         let snapshot = require_installed_snapshot("MC projection coverage",
             &format!("wrldsuksgo2mars/{model}"), Some(revision), &hf_home);
@@ -1328,6 +1333,7 @@ fn installed_mc_views_cover_executable_projection_manifests() {
             assert!(output.status.success(), "{model}/{view}: {}", String::from_utf8_lossy(&output.stderr));
             let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
             assert_eq!(report["placement_supported"], true, "{model}/{view}: {}", report["hints"]);
+            assert_eq!(report["runtime"], "serving", "{model}/{view}: {}", report["hints"]);
             assert!(report["memory_layout"]["devices"].as_array().is_some_and(|owners| !owners.is_empty()),
                 "{model}/{view}: no executable projection owners");
             assert!(!report["hints"].to_string().contains("MissingExport"), "{model}/{view}: {}", report["hints"]);
@@ -1467,6 +1473,58 @@ fn installed_dense_qwen_one_and_two_rtx_publish_exact_native_owners() {
         if ranks == 2 {
             assert_eq!(report.attention_placement, cuteafd_loader::placement::AttentionPlacement::Layers);
             assert!(memory.devices.iter().all(|device| device.items.iter().any(|item| item.group == "residual hops")));
+        }
+    }
+}
+
+#[test]
+fn installed_pe_min_max_plans_charge_one_native_tower_arena() {
+    let hf_home = require_installed_hf_home("installed_pe_min_max_plans_charge_one_native_tower_arena",
+        std::env::var_os("CUTEAFD_DEPLOYMENT_TEST_HF_HOME"));
+    let programs = installed_example_programs(
+        std::env::var_os("CUTEAFD_DEPLOYMENT_TEST_PROGRAMS").map(Into::into),
+        &std::path::PathBuf::from(std::env::var_os("HOME").unwrap()));
+    for (model, revision, layouts, expected_weights) in [
+        ("Inkling-2-Small-EXL3-K4-MC", "6caa0ba08eb564ddc88b98df06ac73e853cc559e", [("1", "4"), ("2", "6")], 655_386_688u64),
+        ("Step-5-Preview-EXL3-K4-MC", "aedda90d25bd02bb6520bcaf88e06e6c9bc932c4", [("1", "3"), ("2", "6")], 3_962_029_664),
+    ] {
+        let snapshot = require_installed_snapshot("PE min/max tower admission",
+            &format!("wrldsuksgo2mars/{model}"), Some(revision), &hf_home);
+        for (gpus, ranks) in layouts {
+            for vision in ["spark", "off"] {
+                let output = test_command(env!("CARGO_BIN_EXE_cuteafd"))
+                    .arg("plan").arg(&snapshot).args(["--core-view", "original", "--layout", "--rtx", gpus,
+                        "--spark-ranks", ranks, "--concurrency", "16", "--max-context-tokens", "auto",
+                        "--no-speculator", "--vision", vision, "--audio", "off", "--json", "--workspace-manifest"])
+                    .arg(&programs).env("HF_HOME", &hf_home).output().unwrap();
+                assert!(output.status.success(), "{model}/{gpus}RTX/{vision}: {}", String::from_utf8_lossy(&output.stderr));
+                let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+                if model.starts_with("Inkling") && gpus == "2" {
+                    assert_eq!(report["placement_supported"], false);
+                    assert!(report["hints"].to_string().contains(
+                        "Inkling multi-GPU serving executor not implemented (#2316)"));
+                    continue;
+                }
+                assert_eq!(report["placement_supported"], true, "{model}/{gpus}RTX/{vision}: {}", report["hints"]);
+                let items = report["memory_layout"]["devices"].as_array().unwrap().iter()
+                    .flat_map(|device| device["items"].as_array().unwrap()).collect::<Vec<_>>();
+                let weights = items.iter().filter(|item| item["group"] == "vision packed weight arena").collect::<Vec<_>>();
+                let scratch = items.iter().filter(|item| item["group"] == "vision scratch").collect::<Vec<_>>();
+                if vision == "spark" {
+                    assert_eq!(report["encoder"]["kind"]["kind"], "spark", "{model}/{gpus}RTX: {}", report["encoder"]);
+                    assert_eq!(report["encoder"]["weights"], expected_weights);
+                    assert_eq!(weights.len(), 1, "{model}/{gpus}RTX: packed arena charged more than once");
+                    assert_eq!(weights[0]["bytes"], expected_weights);
+                    assert_eq!(scratch.len(), 1);
+                    assert_eq!(scratch[0]["bytes"], report["encoder"]["scratch"]);
+                } else {
+                    assert!(weights.is_empty() && scratch.is_empty(), "off retains a PE charge");
+                }
+                for phase in report["phase_ledger"]["phases"].as_array().unwrap() {
+                    assert!(phase["owned"].as_u64().unwrap() + phase["opaque"].as_u64().unwrap()
+                        <= phase["available"].as_u64().unwrap(), "{model}/{gpus}RTX/{vision}: {phase}");
+                }
+            }
         }
     }
 }

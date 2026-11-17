@@ -268,11 +268,11 @@ impl Family for MiniMaxM3 {
         Some(TensorRole::layer(component, layer))
     }
     fn component_hint(&self, component: Component) -> Option<Hint> {
+        if component == Component::Vision { return None; }
         let how = match component {
             Component::Attention | Component::Indexer | Component::DenseFfn | Component::SharedExpert
                 | Component::Router | Component::Norm | Component::RoutedExpert | Component::Embedding
                 | Component::LmHead => return None,
-            Component::Vision => "Wire the bundled CLIP 3D-RoPE tower, patch merge and projector through shared media admission with their own packed arena.",
             Component::Speculator => "Wire the bundled dspark/ dense drafter through shared speculation and DRAFT_LENGTH; taps 3/17/31/45/59, block7, Markov256.",
             _ => "Add native MXFP8 dense execution and SwiGLU-OAI family hooks over the shared scheduler, fixed-depth packed prefill and bounded graph cache; admit named owners and packed arenas through planner v5.",
         };

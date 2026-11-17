@@ -500,3 +500,35 @@ mod tests {
         assert_eq!(runs(0, 256, 132, 1100), vec![(200, 0, 56), (0, 56, 76)]);
     }
 }
+
+/// #2342: MiMo keeps no family discard; its restore validates the destination
+/// pages before it moves ring state, and the cold admission builds a placement
+/// at len 0. The state is GPU-only, so this is a source contract.
+#[cfg(test)]
+mod rollback_tests {
+    fn production() -> &'static str {
+        include_str!("prefix.rs").split("\n#[cfg(test)]").next().unwrap()
+    }
+    fn body<'a>(source: &'a str, needle: &str) -> &'a str {
+        let rest = &source[source.find(needle).unwrap_or_else(|| panic!("{needle}"))..];
+        let end = rest.find("\n    }\n").map_or(rest.len(), |e| e + 6);
+        &rest[..end]
+    }
+
+    #[test]
+    fn a_failed_restore_cannot_leave_a_bound_partial_placement() {
+        let source = production();
+        let restore = body(source, "fn restore(&self, mark: Option<MarkSlot>");
+        let extent = restore.find("len.div_ceil(PAGE_ROWS) > placement.pages.len()")
+            .expect("restore validates the destination extent");
+        restore.find("MiMo restores exact snapshots with their positional mark")
+            .expect("an exact restore requires its typed mark");
+        let write = restore.find("self.move_mark(slot, placement.ring as usize, len, false)?")
+            .expect("restore installs the ring state");
+        assert!(extent < write, "restore must validate before writing state");
+        assert!(!source.contains("fn discard("), "MiMo relies on the fresh cold placement");
+        let serve = include_str!("serve.rs");
+        assert!(serve.contains("MimoPlacement { pages, ring, len: 0 }"),
+            "the cold admission starts every request at zero rows");
+    }
+}

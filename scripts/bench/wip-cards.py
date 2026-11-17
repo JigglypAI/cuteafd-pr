@@ -84,7 +84,7 @@ ANSI = re.compile(r'\x1b\[[0-9;]*m')
 METRICS = ('C1', 'C8', '8K', 'kl', 'top1', 'pool', 'readiness_s')
 # Before -> after table: baseline card metrics, then the client sweep's levels
 # (sweep C<n>) and post-load C1, which are separate measurements.
-SUMMARY_METRICS = ('C1', 'C8', 'sweep C1', 'sweep C4', 'sweep C8', 'sweep C16', 'post-load C1', '8K', '8K w/tail', 'kl', 'top1', 'pool', 'readiness_s')
+SUMMARY_METRICS = ('C1', 'C8', 'sweep C1', 'sweep C4', 'sweep C8', 'sweep C16', 'sustained C1', 'sustained C4', 'sustained C8', 'sustained C16', 'post-load C1', '8K', '8K w/tail', 'kl', 'top1', 'pool', 'readiness_s')
 FIDELITY_PANELS = {'fidelity', 'fidelity_full'}
 LOWER_IS_BETTER = {'kl', 'readiness_s'}  # also every 'prefill N TTFT s'
 FAILURE = re.compile(r'(?i)(\berror\b|\bpanicked\b|\bfatal\b|\bfailed\b|undefined symbol|no such file|refus|exited:|timed out|out of memory|traceback)')
@@ -220,6 +220,39 @@ def run(cmd, **kwargs):
     return subprocess.run(cmd, check=True, text=True, capture_output=True, timeout=timeout, **kwargs)
 
 
+def card_layout(card, overrides=None):
+    """(coordinator GPUs, Spark hosts) a card launches on: its resolved layout.
+
+    The single source every lock derivation follows (#2364): COORDINATOR_GPUS
+    (defaulting to the card's gpus) and the first SPARK_COUNT ranks' hosts
+    (defaulting to the card's sparks). `overrides` are arm config values,
+    applied on top exactly as generate() does.
+    """
+    values = card.get('resolved_values')
+    if values is None:
+        values = {**config(card['config']), **card.get('set', {})}
+    if overrides:
+        values = {**values, **overrides}
+    try:
+        gpus = [int(x) for x in str(values.get('COORDINATOR_GPUS', '')).split(',') if x]
+    except ValueError:
+        raise ValueError('invalid coordinator GPUs') from None
+    gpus = gpus or list(card.get('gpus', [0]))
+    if not 1 <= len(gpus) <= 2 or len(set(gpus)) != len(gpus) or not set(gpus) <= {0, 1}:
+        raise ValueError('invalid coordinator GPUs')
+    hosts = list(card.get('sparks', []))
+    try:
+        count = int(values.get('SPARK_COUNT', len(hosts)))
+    except ValueError:
+        raise ValueError('invalid Spark count') from None
+    if not 0 <= count <= len(HOSTS):
+        raise ValueError('invalid Spark count')
+    hosts = [values.get(f'SPARK_{i}_HOST', hosts[i] if i < len(hosts) else HOSTS[i]) for i in range(count)]
+    if len(set(hosts)) != count or not set(hosts) <= set(HOSTS):
+        raise ValueError('invalid Spark inventory')
+    return gpus, hosts
+
+
 def arms_from(values, releases=()):
     arms = {}
     for value in values:
@@ -330,7 +363,7 @@ def probe_selection(items, cards, arms):
         if card not in probes:
             raise ValueError('probe card must be selected')
         values = set(filter(None, values.split(',')))
-        if not values <= {'image', 'memory', 'console', 'fabric'}:
+        if not values <= {'image', 'image-prefix', 'memory', 'console', 'fabric'}:
             raise ValueError('unknown probe')
         if arm is None:
             probes[card] = values
@@ -344,6 +377,7 @@ def generate(entry, arm_name, arm, state, key_file, overrides, probes, expected_
     entry = json.loads(json.dumps(entry))
     requested_panels(entry.get('profile', 'smoke'), binary=binary)
     entry['fabric'] = 'fabric' in probes
+    gpus, hosts = card_layout(entry, overrides)
     values = entry.pop('resolved_values', None)
     if values is None:
         values = config(entry['config'])
@@ -364,18 +398,8 @@ def generate(entry, arm_name, arm, state, key_file, overrides, probes, expected_
     if 'CUTEAFD_API_KEY' in values:
         raise ValueError('inline API keys are forbidden')
     # The sanitized base also removes publication-only keys from original configs.
-    # The card's GPUs, primary first, unless its config or --set names them.
-    gpus = [int(x) for x in values.get('COORDINATOR_GPUS', '').split(',') if x] or list(entry.get('gpus', [0]))
-    if not 1 <= len(gpus) <= 2 or len(set(gpus)) != len(gpus) or not set(gpus) <= {0, 1}:
-        raise ValueError('invalid coordinator GPUs')
-    hosts = list(entry.get('sparks', []))
     values.pop('SPARK_HOSTS', None)
-    count = int(values.get('SPARK_COUNT', len(hosts)))
-    if not 0 <= count <= len(HOSTS):
-        raise ValueError('invalid Spark count')
-    hosts = [values.get(f'SPARK_{i}_HOST', hosts[i] if i < len(hosts) else HOSTS[i]) for i in range(count)]
-    if len(set(hosts)) != count or not set(hosts) <= set(HOSTS):
-        raise ValueError('invalid Spark inventory')
+    count = len(hosts)
     for key in list(values):
         if re.fullmatch(r'SPARK_[0-7]_(HOST|LANE_A|LANE_B)', key):
             del values[key]
@@ -490,8 +514,8 @@ def generate(entry, arm_name, arm, state, key_file, overrides, probes, expected_
                                  finish_timeout_s=OBSERVER_FINISH_TIMEOUT_S, required=True)
         if 'memory' in probes:
             entry['observer']['cleanup'] = sampler_cleanup(job)
-    if expected_pool is not None or 'image' in probes or ('memory' in probes and hosts):
-        entry['precheck'] = dict(argv=hook + ['--precheck', str(dest / 'job.json')], timeout_s=180, required=True)
+    if expected_pool is not None or probes & {'image', 'image-prefix'} or ('memory' in probes and hosts):
+        entry['precheck'] = dict(argv=hook + ['--precheck', str(dest / 'job.json')], timeout_s=1800 if 'image-prefix' in probes else 180, required=True)
     if 'memory' in probes and hosts and (entry.get('levels') or entry.get('prefill_lengths')):
         sample = dict(argv=hook + ['--spark-memory-boundary', str(dest / 'job.json')], timeout_s=20, required=True)
         window = entry.setdefault('window', dict(open=dict(argv=['true'], timeout_s=10, required=True)))
@@ -564,23 +588,34 @@ def smoke_groups(jobs, parallel):
     return [[job] for job in jobs]
 
 
-def serving_locks(jobs):
-    """Match smoke.rs locks_for, including its V4.1 exclusive default."""
+def layout_locks(layouts):
+    """The locks a serving turn needs, from resolved (GPUs, Spark hosts) layouts.
+
+    Mirrors smoke.rs locks_for: every coordinator GPU the layout resolves to,
+    `sparks` only when a pool host (ostrich/dodo/emu/kiwi) is attached, and
+    rhea/moa only when those out-of-pool hosts are used (they have their own
+    locks). `exclusive` is a scheduling rule inside one smoke run (V4.1 runs
+    alone), not a claim on both GPUs: it never widens this set (#2364). GPU0
+    no longer implies `sparks`; card_layout resolves SPARK_COUNT and the hosts
+    explicitly, so a zero-Spark layout takes no pool lock.
+    """
     names = set()
-    for job in jobs:
-        entry = job['entry']
-        gpus = entry.get('gpus', [0])
-        hosts = entry.get('sparks', [])
-        exclusive = entry.get('exclusive')
-        if exclusive is None:
-            exclusive = entry.get('family') == 'deepseek_v41'
-        if 0 in gpus or set(hosts) & set(HOSTS[:4]) or exclusive:
+    for gpus, hosts in layouts:
+        if set(hosts) & set(HOSTS[:4]):
             names.add('sparks')
-        for gpu in (0, 1):
-            if gpu in gpus or exclusive:
-                names.add(f'gpu{gpu}')
+        names.update(f'gpu{gpu}' for gpu in gpus)
         names.update(set(hosts) & {'rhea', 'moa'})
     return hwlock.canonical(names)
+
+
+def serving_locks(jobs):
+    """The serving turn's lock set; mirror of smoke.rs locks_for (parity test)."""
+    layouts = []
+    for job in jobs:
+        entry = job['entry']
+        gpus = entry.get('gpus')
+        layouts.append(([0] if gpus is None else gpus, entry.get('sparks') or []))
+    return layout_locks(layouts)
 
 
 @contextlib.contextmanager
@@ -590,9 +625,21 @@ def serving_turn(jobs, env, wait):
     The caller drains detached smokes before leaving, even on a stop signal:
     60 s smoke teardown, 75 s here, 80 s outer hwlock if used, 90 s systemd.
     Never put a build or export inside this scope.
+
+    Under an enclosing hwlock hold (`CUTEAFD_HW_LOCKS_HELD`), the turn's set
+    must already be covered: an inner ticket for a lock the outer hold does not
+    cover queues behind tickets waiting on the outer hold itself and cannot be
+    granted (#2364). Fail at once instead.
     """
     parent = hwlock.canonical(filter(None, env.get('CUTEAFD_HW_LOCKS_HELD', '').split(',')))
     locks = serving_locks(jobs)
+    if parent:
+        missing = [name for name in locks if name not in parent]
+        if missing:
+            raise ValueError(
+                f'serving turn needs {",".join(locks)}, but the enclosing hwlock holds {",".join(parent)}: '
+                f'an inner ticket for {",".join(missing)} cannot be granted while the outer hold waits. '
+                f'Rerun under: hwlock.py --locks {",".join(locks)}')
     wanted = [name for name in locks if name not in parent]
     with contextlib.ExitStack() as stack:
         if wanted:
@@ -674,6 +721,8 @@ def binary_supports(binary, repo, job, needs):
                             capture_output=True, text=True, timeout=120)
     if result.returncode:
         raise ValueError(f"{binary} bench smoke --dry-run failed: {(result.stderr or result.stdout).strip().splitlines()[-1:]}")
+    if 'warm_prelude' in needs and 'warm_prelude=server-v1' not in result.stderr:
+        raise ValueError(f'{binary} lacks the server-owned warm prelude; build a current cuteafd and pass --binary before using hardware')
     missing = [field for field in needs if field + '=' not in result.stderr]
     if missing:
         raise ValueError(f"{binary} predates smoke fields {', '.join(missing)}; build cuteafd from this checkout and pass --binary")
@@ -691,6 +740,23 @@ def launcher_forwards_v41_trace(repo):
 def speculating(values):
     """Whether a launch resolves a speculator (traces are written only then)."""
     return values.get('SPECULATOR', 'auto') != 'off' and values.get('DSPARK', 'on') != 'off'
+
+
+def planned_speculator(job, deployment):
+    """Attest the identity, not just that deployment admission succeeded."""
+    selected = deployment.get('speculator')
+    if selected not in {'off', 'mtp', 'dspark', 'dflash2'}:
+        raise ValueError('launcher deployment preflight returned no resolved speculator identity')
+    values = job['entry']['set']
+    requested = values.get('SPECULATOR', 'auto')
+    if requested != 'auto' and requested != selected:
+        raise ValueError(f'planned speculator {selected} differs from requested {requested}')
+    previous = job.get('planned_speculator')
+    if previous is not None and previous != selected:
+        raise ValueError(f'planned speculator changed since enqueue: {previous} -> {selected}')
+    if selected == 'off' and values.get('DRAFT_LENGTH') and speculating(values):
+        raise ValueError('DRAFT_LENGTH requested but the planned launch has no speculator')
+    job['planned_speculator'] = selected
 
 
 def preflight_at_grant(job, arm):
@@ -728,6 +794,7 @@ def preflight_deployment(job, arm):
         except ValueError:
             continue
         if isinstance(deployment, dict) and isinstance(deployment.get('spark_roles'), list):
+            planned_speculator(job, deployment)
             return deployment
     raise ValueError('launcher deployment preflight returned no typed Spark roles')
 
@@ -928,12 +995,15 @@ def stopped_code():
 
 def detached(cmd, log, exit_file, env):
     # Shell remains in the detached group and writes a numeric status even if the
-    # CLI disappears. It ignores stop signals itself (smoke handles them), so it
-    # waits for smoke's teardown and still records smoke's exit status. The
+    # CLI disappears. It records stop signals but waits for smoke's teardown;
+    # even a child that exits zero after termination cannot publish success. The
     # parent's serving turn outlives this process and its container teardown.
     # setsid may fork when its caller is a process-group leader; --wait must
     # propagate the child status rather than report the successful fork.
-    script = 'trap : TERM INT HUP; "$@"; rc=$?; printf "%s\\n" "$rc" > "$CARD_EXIT"; exit "$rc"'
+    script = ('terminated=0; trap \'terminated=143\' TERM; trap \'terminated=130\' INT; '
+              'trap \'terminated=129\' HUP; "$@"; rc=$?; '
+              'if ((terminated)); then rc=$terminated; echo "terminated (exit $rc)" >&2; fi; '
+              'printf "%s\\n" "$rc" > "$CARD_EXIT"; exit "$rc"')
     with Path(log).open('w') as output:
         process = subprocess.Popen(['setsid', '--wait', 'bash', '-c', script, 'wip-card', *cmd], stdin=subprocess.DEVNULL, stdout=output, stderr=subprocess.STDOUT, env={**env, 'CARD_EXIT': str(exit_file)}, start_new_session=False)
     with _LIVE_LOCK:
@@ -1028,6 +1098,159 @@ def red_square():
     return 'data:image/png;base64,' + base64.b64encode(png).decode()
 
 
+def image_prefix_probe(url, dest):
+    """Keep every attempt and its assertion, including a smoke hook's teardown retry."""
+    dest = Path(dest)
+    dest.mkdir(parents=True, exist_ok=True)
+    for number in itertools.count(1):
+        attempt = dest / f'image-prefix-attempt-{number}'
+        try:
+            attempt.mkdir()
+            break
+        except FileExistsError:
+            continue
+    try:
+        result = image_prefix_attempt(url, attempt)
+    except Exception as error:
+        save(attempt / 'verdict.json', dict(status='failed', error=str(error)))
+        raise
+    save(attempt / 'verdict.json', dict(status='pass', requests=result))
+    return result
+
+
+def image_prefix_attempt(url, dest):
+    """Divergence after the same image must restore exactly or prefill cold (#2340)."""
+    model = http(url, '/v1/models')['data'][0]['id']
+    def chunk(tag, data):
+        return struct.pack('>I', len(data)) + tag + data + struct.pack('>I', zlib.crc32(tag + data))
+    raw = (b'\x00' + b'\xff\x00\x00' * 160 + b'\x00\x00\xff' * 160) * 200
+    png = (b'\x89PNG\r\n\x1a\n' + chunk(b'IHDR', struct.pack('>2I5B', 320, 200, 8, 2, 0, 0, 0))
+           + chunk(b'IDAT', zlib.compress(raw)) + chunk(b'IEND', b''))
+    image = 'data:image/png;base64,' + base64.b64encode(png).decode()
+    nonce = str(time.time_ns())
+    results = []
+    for variant, entries, padding in [('even', 120, ''), ('odd', 120, ' x'), ('long', 4096, '')]:
+        prefix = f'Run {nonce} {variant}. Reference notes. ' + ' '.join(
+            f'Entry {i} is code {i * 7}.' for i in range(entries)) + padding
+        # Count the same image/question template, without generation, to exercise actual
+        # odd/even prompt frontiers rather than guessing from a character's tokenization.
+        desired = 1 if variant == 'odd' else 0
+        for pad in range(16):
+            candidate = prefix + ' x' * pad
+            counted = http(url, '/v1/responses/input_tokens', dict(model=model,
+                input=[dict(role='user', content=[dict(type='input_text', text=candidate),
+                    dict(type='input_image', image_url=image),
+                    dict(type='input_text', text='Is there red in the image? yes/no.')])],
+                reasoning=dict(effort='none')), timeout=120)
+            if counted.get('exact_token_count') is not True:
+                raise ValueError('image-prefix boundary probe requires exact token counts')
+            if counted['input_tokens'] % 2 == desired:
+                prefix, prompt_tokens = candidate, counted['input_tokens']
+                break
+        else:
+            raise ValueError(f'{variant}: could not select an exact prompt frontier parity')
+        save(dest / f'image-prefix-{variant}-boundary.json',
+             dict(input_tokens=prompt_tokens, parity=desired, padding=pad))
+        requests = [
+            ('text-a', False, 'What is the code of entry 3? Number only.', r'\b21\b'),
+            ('text-b', False, 'What is the code of entry 5? Number only.', r'\b35\b'),
+            ('image-a', True, 'Which colours are in the image? Brief.', r'(?is)(?=.*\bred\b)(?=.*\bblue\b)'),
+            ('image-b', True, 'Is there red in the image? yes/no.', r'\byes\b'),
+        ]
+        previous_content = previous_answer = None
+        exact_bodies = []
+        for label, with_image, question, expected in requests + [('next-turn', True, 'Is there red in the image? yes/no.', r'\byes\b')]:
+            content = [dict(type='text', text=prefix)]
+            if with_image:
+                content.append(dict(type='image_url', image_url=dict(url=image)))
+            content.append(dict(type='text', text=question))
+            messages = [dict(role='user', content=content)]
+            if label == 'next-turn':
+                messages = [dict(role='user', content=previous_content),
+                            dict(role='assistant', content=previous_answer),
+                            dict(role='user', content=question)]
+            receipt = dest / f'image-prefix-{variant}-{label}.json'
+            try:
+                response = http(url, '/v1/chat/completions', dict(model=model,
+                    messages=messages, max_tokens=32,
+                    reasoning_effort='none', temperature=0, stream=False), timeout=600)
+            except Exception as error:
+                save(receipt, dict(error=str(error)))
+                raise
+            save(receipt, response)
+            answer = response['choices'][0]['message'].get('content') or ''
+            if not re.search(expected, answer, re.I):
+                raise ValueError(f'{variant}/{label}: incorrect answer {answer!r}')
+            usage = response['usage']
+            cached = usage.get('prompt_cache_hit_tokens', 0)
+            source = usage.get('prefix_cache_source')
+            if label == 'image-b' and usage['prompt_tokens'] != prompt_tokens:
+                raise ValueError(f'{variant}: count and serving frontiers differ: {usage} != {prompt_tokens}')
+            # Exact-only families deliberately miss on divergence, while page/replay
+            # families may reuse the common prefix. Both are valid if provenance agrees.
+            if label == 'text-a' and (cached != 0 or source != 'miss'):
+                raise ValueError(f'{variant}/{label}: unique prefix was not a miss: {usage}')
+            if label != 'text-a' and (source not in {'miss', 'device', 'host'}
+                    or (cached > 0) != (source != 'miss')):
+                raise ValueError(f'{variant}/{label}: inconsistent prefix provenance: {usage}')
+            if label == 'next-turn' and not (cached >= prompt_tokens and source in {'device', 'host'}):
+                raise ValueError(f'{variant}/{label}: exact image ancestor did not hit: {usage}')
+            if label == 'image-b':
+                previous_content, previous_answer = content, answer
+            results.append(dict(variant=variant, request=label, answer=answer, cached=cached, source=source))
+            if label in {'image-b', 'next-turn'}:
+                exact_bodies.append((label, dict(model=model, messages=messages, max_tokens=32,
+                    reasoning_effort='none', temperature=0, stream=False)))
+        for label, body in exact_bodies:
+            # A next-turn prompt inherits decode-produced KV from its turn ancestor. Cold
+            # prefill may round differently; compare restore to its own captured state.
+            reference = None
+            if label == 'next-turn':
+                reference = http(url, '/v1/bench/probe', dict(body=body,
+                    spec=dict(no_speculation=True, pair_exempt=True, record_state=True,
+                              record_rows=1, top_k=5)), timeout=600)
+                save(dest / f'image-prefix-{variant}-{label}-reference.json', reference)
+            probes = []
+            for name, cold in [('cold', True), ('warm', False)] + ([('warm-repeat', False)] if reference else []):
+                reply = http(url, '/v1/bench/probe', dict(body=body,
+                    spec=dict(cold=cold, no_speculation=True, pair_exempt=True,
+                              record_state=reference is not None, record_rows=1, top_k=5)), timeout=600)
+                save(dest / f'image-prefix-{variant}-{label}-{name}.json', reply)
+                record = reply.get('probe') or {}
+                if record.get('cold') is not cold or record.get('no_speculation') is not True:
+                    raise ValueError(f'{variant}/{label}: engine did not honor exact probe switches')
+                if not record.get('generated'):
+                    raise ValueError(f'{variant}/{label}: exact probe omitted generated token IDs')
+                probes.append(record)
+            if reference is None:
+                if probes[0]['generated'] != probes[1]['generated']:
+                    raise ValueError(f'{variant}/{label}: cold/warm image output token IDs differ')
+            else:
+                image_next_turn_fidelity(reference['probe'], probes[1], probes[2])
+            if probes[1].get('cached_tokens', 0) < len(probes[0].get('prompt_ids') or []):
+                raise ValueError(f'{variant}/{label}: exact image prompt was not fully restored')
+    return results
+
+
+def image_next_turn_fidelity(reference, warm, repeat):
+    """Restore identity is relative to the capture, not a differently rounded cold prefill."""
+    def state(record, kind):
+        rows = [s for s in record.get('states', []) if s['kind'] == kind]
+        if len(rows) != 1:
+            raise ValueError(f'next-turn probe requires one {kind} state')
+        return {k: rows[0][k] for k in ('end', 'sha256', 'bytes')}
+    captured = state(reference, 'prompt')
+    for record in (warm, repeat):
+        if state(record, 'restore') != captured or state(record, 'prompt') != captured:
+            raise ValueError('next-turn restored state differs from captured state')
+        if record.get('prompt_ids') != reference.get('prompt_ids'):
+            raise ValueError('next-turn probe prompt IDs differ')
+    if any(warm.get(k) != repeat.get(k) for k in ('generated', 'rows', 'states')):
+        raise ValueError('next-turn warm repeat is not byte-identical')
+    if warm.get('generated') != reference.get('generated') or warm.get('rows') != reference.get('rows'):
+        raise ValueError('next-turn warm output differs from fixed reference')
+
+
 def ready_log(job):
     name = 'cuteafd-coordinator-' + job['entry']['set']['INSTANCE']
     result = run(['docker', 'logs', name])
@@ -1052,7 +1275,7 @@ def precheck(job):
     try:
         if 'memory' in job['probes'] and job['entry'].get('sparks'):
             spark_memory_boundary(job, 'ready')
-        text = ready_log(job) if job['expected_pool'] is not None or 'image' in job['probes'] else ''
+        text = ready_log(job) if job['expected_pool'] is not None or set(job['probes']) & {'image', 'image-prefix'} else ''
         if job['expected_pool'] is not None:
             result['pool'] = admitted_pool(text)
             if result['pool'] != job['expected_pool']:
@@ -1066,6 +1289,8 @@ def precheck(job):
             result['image'] = {'model': model, 'answer': answer}
             if not re.search(r'\bred\b', answer, re.I):
                 raise ValueError('image answer does not identify red')
+        if 'image-prefix' in job['probes']:
+            result['image-prefix'] = [image_prefix_probe(os.environ['CUTEAFD_SMOKE_URL'], dest) for _ in range(3)]
         result['status'] = 'pass'
     except Exception as error:
         result.update(status='failed', error=str(error))
@@ -1955,11 +2180,32 @@ def summarize_job(job, exit_code):
     trace_path = job['entry']['set'].get('SPECULATION_TRACE')
     if trace_path and job.get('trace'):
         path = Path(trace_path)
-        records = sum(1 for line in path.open(errors='replace') if line.strip()) if path.is_file() else 0
+        records, proposed, cycles = 0, 0, 0
+        if path.is_file():
+            for line in path.open(errors='replace'):
+                if not line.strip():
+                    continue
+                records += 1
+                try:
+                    observation = json.loads(line)
+                except ValueError:
+                    continue
+                if 'depths' in observation and 'cycle_ms' in observation:
+                    cycles += 1
+                    proposed += sum(max(0, n) for n in observation['depths'])
+                elif observation.get('type') == 'draft_round':
+                    proposed += sum(max(0, r.get('verified_rows', 1) - 1) for r in observation.get('requests', []))
+        expected = speculating(job['entry']['set']) or job.get('planned_speculator', 'off') != 'off'
         row['trace'] = {'path': trace_path, 'bytes': path.stat().st_size if path.is_file() else 0, 'records': records,
-                        'expected': speculating(job['entry']['set'])}
-        if row['trace']['expected'] and not records:
+                        'expected': expected, 'proposal_evidence_rows': proposed, 'cycles': cycles}
+        if expected and not records:
             fail(row, 'speculation trace is empty after the run (' + trace_path + ')', 'measurement')
+        elif expected and cycles >= 8 and not proposed:
+            fail(row, 'speculation requested but nonempty trace contains zero proposed tokens', 'measurement')
+        if expected:
+            for log in (dest / 'smoke' / 'logs').glob('*coordinator.log'):
+                if re.search(r'DRAFT_LENGTH=.*ignored: no speculator|DRAFT_LENGTH.*no speculator', log.read_text(errors='replace')):
+                    fail(row, 'DRAFT_LENGTH ignored: launch has no speculator', 'measurement')
     sweeps = [p for p in (dest / 'reports').glob('**/sweep.json')
               if not job.get('grouped') or p.parent.name.endswith('-' + job['entry']['name']) or p.parent.name == job['entry']['name']]
     if job['entry'].get('levels') or job['entry'].get('prefill_lengths'):
@@ -1971,7 +2217,8 @@ def summarize_job(job, exit_code):
                 row['fabric'].extend(p['fabric'] for p in [*sweep.get('points', []), *sweep.get('prefill', [])] if p.get('fabric'))
             row['sweep'] = sweep.get('points', [])
             for point in row['sweep']:
-                key = 'post-load C1' if point['phase'] == 'post_load' else f"sweep C{point['c']}"
+                key = (f"sustained C{point['c']}" if point['phase'] == 'sustained' else
+                       'post-load C1' if point['phase'] == 'post_load' else f"sweep C{point['c']}")
                 row[key] = point['aggregate_tok_s']
             for point in sweep.get('prefill', []):
                 row[f"prefill {point['length']}"] = point['tok_s']
@@ -2894,7 +3141,7 @@ def main():
     parser.add_argument('--arm-env', action='append', default=[], metavar='ARM:CUTEAFD_DIAG_NAME=VALUE',
                         help='arm-specific private diagnostic in the launch environment (CUTEAFD_DIAG_* only; '
                         'the launcher forwards those to the coordinator unchanged)')
-    parser.add_argument('--probe', action='append', default=[], metavar='[ARM:]CARD:image,memory,console,fabric')
+    parser.add_argument('--probe', action='append', default=[], metavar='[ARM:]CARD:image,image-prefix,memory,console,fabric')
     parser.add_argument('--spark-memory-guard', action='store_true',
                         help='with --probe memory: stop only a verified card WIP worker if host MemAvailable falls below 512 MiB')
     parser.add_argument('--panels', metavar='LIST', help='run these server panels on every card instead of its profile '
@@ -2946,6 +3193,8 @@ def main():
                         'build-only hosts whose slots reach the serving Sparks through sparknest; a named seed is a placement request')
     parser.add_argument('--cleanup', action='store_true')
     parser.add_argument('--dry-run', action='store_true')
+    parser.add_argument('--print-locks', action='store_true',
+                        help='print the serving turn lock set this run would take and exit, without building or running')
     parser.add_argument('--observe', type=Path, help=argparse.SUPPRESS)
     parser.add_argument('--precheck', type=Path, help=argparse.SUPPRESS)
     parser.add_argument('--preflight-job', type=Path, help=argparse.SUPPRESS)
@@ -3155,7 +3404,9 @@ def main():
         raise ValueError('override/probe names must be selected cards')
     for card in cards:
         if args.matched_prompts or args.nonce_seed is not None:
-            if args.matched_prompts and 'image' in probes[card['name']]:
+            if args.matched_prompts and any(
+                    (probes[card['name']] | arm_probes.get(arm, {}).get(card['name'], set()))
+                    & {'image', 'image-prefix'} for arm in arms):
                 raise ValueError('--matched-prompts cannot precede its first benchmark request with an image probe')
         requested_panels(card.get('profile', 'smoke'), binary=panel_binary(args.binary, arms))
         card['set'].update(overrides.get(card['name'], {}))
@@ -3166,6 +3417,19 @@ def main():
         if not 0 <= count <= len(HOSTS):
             raise ValueError('invalid Spark count')
         card['sparks'] = [values.get(f'SPARK_{i}_HOST', card.get('sparks', [])[i] if i < len(card.get('sparks', [])) else HOSTS[i]) for i in range(count)]
+    bindings = dict(item.split('=', 1) for item in args.card_arm)
+    if bindings and (args.interleave or set(bindings) - set(args.cards) or set(bindings.values()) - set(arms)):
+        raise ValueError('--card-arm needs selected cards/arms in matrix mode')
+    if args.print_locks:
+        layouts = []
+        for name in arms:
+            for card in cards:
+                if card['name'] in bindings and bindings[card['name']] != name:
+                    continue
+                layouts.append(card_layout(resolved_card(card, {**arm_overrides.get(name, {}).get(card['name'], {}),
+                    **arm_config.get(name, {})}, arm_unsets.get(name, set()))))
+        print(','.join(layout_locks(layouts)))
+        return 0
     # Build and stage every arm's layout, even when only one arm requests it.
     build_cards = []
     for name in arms:
@@ -3193,9 +3457,6 @@ def main():
             key.write(secrets.token_hex(32) + '\n')
     if key_file.is_symlink() or key_file.stat().st_mode & 0o077:
         raise ValueError('API key file must be private (0600), not a symlink')
-    bindings = dict(item.split('=', 1) for item in args.card_arm)
-    if bindings and (args.interleave or set(bindings) - set(args.cards) or set(bindings.values()) - set(arms)):
-        raise ValueError('--card-arm needs selected cards/arms in matrix mode')
     jobs = [generate(resolved_card(card, {**arm_overrides.get(name, {}).get(card['name'], {}), **arm_config.get(name, {})}, arm_unsets.get(name, set())), name, arm, state, key_file, {}, probes[card['name']] | arm_probes.get(name, {}).get(card['name'], set()), expected[card['name']], repeat, args.trace, shlex.split(args.exact_state) if args.exact_state else None, [h for h in (args.cold_window or '').split(',') if h] or None, binary=panel_binary(args.binary, arms)) for card, name, arm, repeat in schedule(cards, arms, args.repeats if args.interleave else 1, args.interleave) if card['name'] not in bindings or bindings[card['name']] == name]
     variants = {(c['name'], n): resolved_card(c, {**arm_overrides.get(n, {}).get(c['name'], {}),
         **arm_config.get(n, {})}, arm_unsets.get(n, set())) for c in cards for n in arms}
@@ -3275,7 +3536,7 @@ def main():
                         save(Path(job['entry']['set']['PROFILE_DIR']) / 'observer-context.json', {'pending': True})
         if kept:
             print(f'wip-cards: resume keeps {len(kept)} passed job(s), reruns {len(jobs) - len(kept)}', file=sys.stderr)
-    fields = ['fabric'] + (['levels', 'post_load_c1'] + (['post_load_repeat'] if args.post_load_repeat else []) if args.levels else []) + (['prefill_lengths'] if prefill_lengths else []) + \
+    fields = ['fabric', 'warm_prelude'] + (['levels', 'post_load_c1'] + (['post_load_repeat'] if args.post_load_repeat else []) if args.levels else []) + (['prefill_lengths'] if prefill_lengths else []) + \
         (['prefill_repeat'] if args.prefill_repeat else []) + \
         (['prefill_idle_seconds'] if args.prefill_idle_seconds is not None else []) + \
         (['prefill_purge'] if any(job['entry'].get('prefill_purge') for job in jobs) else []) + \

@@ -304,7 +304,7 @@ mod tests {
                 .collect();
             let contract = cuteafd_loader::plan::families::step5::coordinator::CoordinatorContract::from_checkpoint(&checkpoint)?;
             let cfg = cuteafd_loader::plan::families::step5::Config::parse(&checkpoint)?;
-            let mut inputs = RuntimeInputs { spark_bytes: cuteafd_loader::plan::testing::SimulatedHost::raptor().layout().spark_capacities(8), graph_layout: None, decode_graphs: false,
+            let mut inputs = RuntimeInputs { vision: None, spark_owners: Vec::new(), spark_bytes: cuteafd_loader::plan::testing::SimulatedHost::raptor().layout().spark_capacities(8), graph_layout: None, decode_graphs: false,
                 bf16_target_head: opts.bf16_target_head,
                 host: admission::HostInputs::from_contract(&contract, &cfg, ranks,
                     opts.host_memory.unwrap(), host, 8 << 30)?, resident_weight_limit: Some(crate::shared::memory::budget::resident_weight_limit()),
@@ -320,7 +320,7 @@ mod tests {
                 unit,
                 sequences: 16,
                 context, serving_context: cuteafd_loader::placement::planner::Context::pinned(context),
-                requested_pool: pool,
+                requested_pool: pool, target_pool: None,
                 marks: prefix_marks(&<PrefixCli as clap::Parser>::parse_from([
                     "step5", "--host-cache-bytes", &host.map_or_else(|| "auto".into(), |n| n.to_string()),
                     "--prefix-cache-entries", &entries.to_string(),
@@ -333,6 +333,10 @@ mod tests {
                     Some(&path), unit, ranks, waves, cuteafd_loader::placement::Onboard::Auto)?,
             };
             let live = checkpoint_admission(&checkpoint, &inputs);
+            if let (Some(ledger), Ok(admitted)) = (&report.phase_ledger, &live) {
+                assert_eq!(ledger.pool_policy, admitted.solved.pool_policy,
+                    "Step-5 public plan and serve must carry identical resolved policy");
+            }
             if !report.wip_launchable() {
                 let error = live.err().expect("both edges must refuse the unsupported allocation");
                 let refusal = error.to_string();
@@ -436,6 +440,99 @@ mod tests {
                 .err()
                 .expect("live requires measured baseline");
             assert!(error.to_string().contains("measured baseline"));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn joint_spark_owners_match_startup_assignments_for_fp8_mc_and_nvfp4() -> Result<()> {
+        use anyhow::Context;
+        use cuteafd_core::memory_layout::{Category, DeviceKind};
+        use crate::shared::placement::SparkAdmission;
+        for kind in ["fp8", "mc", "nvfp4"] {
+            let dir = tempfile::tempdir()?;
+            if kind == "mc" {
+                let source = tempfile::tempdir()?;
+                testing::write_step5_exl3_snapshot(source.path());
+                let cp = Checkpoint::open(source.path())?;
+                let cfg = plan::families::step5::Config::parse(&cp)?;
+                let tensors = cp.tensors.iter().map(|tensor| testing::t(&tensor.meta.name,
+                    match &tensor.meta.dtype {
+                        cuteafd_core::DType::Bf16 => "BF16", cuteafd_core::DType::F16 => "F16",
+                        cuteafd_core::DType::F32 => "F32",
+                        cuteafd_core::DType::I16 => "I16", cuteafd_core::DType::I32 => "I32",
+                        cuteafd_core::DType::U8 => "U8", other => panic!("{other:?}"),
+                    }, &tensor.meta.shape)).collect::<Vec<_>>();
+                let (mtp, target) = plan::families::step5::exl3::expected(&cfg).into_iter()
+                    .partition(|(name, _)| name.strip_prefix("model.layers.")
+                        .and_then(|rest| rest.split('.').next()).and_then(|layer| layer.parse::<usize>().ok())
+                        .is_some_and(|layer| layer >= cfg.layers));
+                let mut config = cp.config.clone();
+                for key in ["core_bits", "head_bits"] {
+                    config["quantization_config"].as_object_mut().unwrap().remove(key);
+                }
+                testing::write_mc_snapshot_with_mtp(dir.path(), &config, &tensors, &target, &mtp);
+            } else {
+                let (config, tensors) = testing::step5_fixture(kind);
+                testing::write_snapshot(dir.path(), &config, &tensors, None);
+            }
+            let manifest = testing::step5_native_manifest(dir.path());
+            let (gpus, sparks) = if kind == "nvfp4" { (1, 4) } else { (2, 6) };
+            let view = plan::checkpoint::CheckpointView::select(dir.path(), plan::checkpoint::CoreView::Original)?;
+            let input = plan::PlanInput::open_view(&view)?;
+            let report = input.plan(&PlanOptions {
+                placement: ExpertPlacement::Sparks { ranks: sparks },
+                draft_ownership: Some(plan::spec::DraftOwnership::None),
+                layout: Some(LayoutOptions {
+                    host_memory: Some(testing::SimulatedHost::raptor().host_ram),
+                    rtx_bytes: vec![inventory::PRO_TOTAL_BYTES; gpus], pool_tokens: Some(262_144),
+                    context_tokens: 262_144, workspace_manifest: Some(manifest),
+                    ..Default::default()
+                }), ..Default::default()
+            })?;
+            ensure!(report.wip_launchable(), "{kind}: {:?}", report.hints);
+            let catalog = input.expert_catalog()?;
+            let placement = report.solver_placement.as_ref().context("joint placement")?;
+            let routed = catalog.routed_experts();
+            let working = SparkWorkingSet {
+                rtx_layers: (routed.first_layer..routed.layers).filter(|&layer|
+                    !matches!(placement.layers[layer].experts, ExpertHome::Spark)).collect(),
+                spark_layers: (routed.first_layer..routed.layers).filter(|&layer|
+                    matches!(placement.layers[layer].experts, ExpertHome::Spark)).collect(),
+                spark_ranks: sparks, prefill_lanes: 1,
+            };
+            let rows = report.prefill_unit_rows.context("prefill unit")?;
+            let waves = report.prefill_waves.context("prefill waves")?;
+            let backend = plan::spark_executions::SparkBackend::for_catalog(catalog)?;
+            let endpoint = cuteafd_core::SparkEndpoint { ring_depth: None, capacity: rows.try_into()?,
+                ingress: super::super::experts::StepExperts::from_catalog(catalog)?.ingress(),
+                partial_reply_bytes: None };
+            let model = super::super::serve::spark_model(&backend.exports(), endpoint, waves, 1, 64 << 20)?;
+            let startup = SparkAdmission::plan_view(&view, cuteafd_core::ExpertGeometry::STEP5,
+                Some(catalog), &working, sparks, model, None)?;
+            let (_, assignments) = startup.admitted();
+            for device in report.memory_layout.as_ref().context("joint memory")?.devices.iter()
+                .filter(|device| device.kind == DeviceKind::Spark) {
+                let assignment = &assignments[device.index as usize];
+                let experts: u64 = device.items.iter().filter(|item| item.category == Category::Experts)
+                    .map(|item| item.bytes).sum();
+                assert!(experts > 0, "{kind}: {}", device.name());
+                assert_eq!(experts, assignment.resident_bytes, "{kind}: {} weights", device.name());
+                for (group, expected) in [
+                    ("expert intake", assignment.io.intake),
+                    ("host expert exchange", assignment.io.host_exchange),
+                    ("expert row indices", assignment.io.row_indices),
+                    ("endpoint response prefixes", assignment.io.endpoint_staging),
+                    ("rdma rings", assignment.io.mapped_rings),
+                ] {
+                    let bytes: u64 = device.items.iter().filter(|item|
+                        item.category == Category::Transport && item.group == group).map(|item| item.bytes).sum();
+                    assert_eq!(bytes, expected, "{kind}: {} {group}", device.name());
+                }
+                assert!(device.items.iter().any(|item| item.group == "execution owners" && item.bytes > 0));
+                eprintln!("Step-5 {kind} {}: experts={experts} rings={} total={}",
+                    device.name(), assignment.io.mapped_rings, device.used_bytes());
+            }
         }
         Ok(())
     }

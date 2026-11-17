@@ -503,12 +503,11 @@ fn plan_matrix(column: usize) {
             assert_eq!(prefix_bytes, marks * mark_bytes, "host-off marks obey the aggregate byte budget");
             assert!(memory.notes.iter().any(|note|
                 note.contains(&format!("host prefix tier off: retains {marks} exact prefix marks"))));
-            // The shared pool policy is the only pool rule: 2M on a 96 GiB
-            // card, never below the declared serving context, capped by what
-            // the admission actually fits.
-            assert!(memory.pool_tokens >= if rtx == 1 { MIN_CARD_CONTEXT } else { 1 << 20 });
-            assert!(memory.pool_tokens <= cuteafd_core::serving_capacity::DEFAULT_GPU_KV_TOKENS);
-            if rtx == 2 { assert_eq!(memory.pool_tokens, 2 << 20, "the pooled target, not a fit cap"); }
+            // The shared pool policy is the only pool rule: a 2M target, never
+            // below the declared serving context, and the unbounded default
+            // grows into the memory the admitted layout leaves.
+            assert!(memory.pool_tokens >= if rtx == 1 { MIN_CARD_CONTEXT } else { 2 << 20 });
+            if rtx == 2 { assert!(memory.pool_tokens >= 2 << 20, "the pool grows beyond the target into memory"); }
             else { assert!(memory.pool_tokens < 1 << 20, "one RTX is fit-capped below the compiled context"); }
         }
         if (rtx, ranks) == (2, 6) {
@@ -854,7 +853,6 @@ fn drafter_is_charged_on_the_head_gpu_and_must_match_the_target_head() {
     let page_bytes = (cfg.kv_record_bytes() * cfg.full_layers()) as u64 * page_rows;
     let context = crate::placement::ArchContext::for_device("sm_120", device.capacity_bytes).context_bytes;
     let available = device.capacity_bytes - context - fixed(device);
-    assert!(memory.pool_tokens < cuteafd_core::serving_capacity::DEFAULT_GPU_KV_TOKENS);
     assert_eq!(memory.pool_tokens, available / page_bytes * page_rows);
     let displaced_pages = available / page_bytes - (available - charged) / page_bytes;
     assert!(displaced_pages > 0);

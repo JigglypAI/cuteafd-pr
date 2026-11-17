@@ -129,6 +129,9 @@ pub struct ModelProfile {
     /// Live readiness for remote vision; absent on existing local serving paths.
     pub vision_health: Option<Arc<std::sync::atomic::AtomicBool>>,
     pub media_preparer: Option<Arc<media::MediaPreparer>>,
+    /// Fidelity feature overrides only; never advertises a loaded vision encoder.
+    pub probe_media_preparer: Option<Arc<media::MediaPreparer>>,
+    pub grouped_images: bool,
     pub audio_preparer: Option<Arc<media::audio::AudioPreparer>>,
     pub audio_health: Option<Arc<std::sync::atomic::AtomicBool>>,
     /// Loaded encoder capabilities, not checkpoint metadata or requested placement.
@@ -170,7 +173,7 @@ impl ModelProfile {
     pub fn new(id: impl Into<String>, encoding: ModelEncoding) -> Self {
         let eos_token_ids = encoding.eos_token_ids();
         let capabilities = MediaCapabilities { vision: matches!(encoding, ModelEncoding::DeepseekV41), audio: false };
-        Self { stats_diagnostics: None, expert_usage: Default::default(), id: id.into(), encoding, eos_token_ids, capabilities, engine_health: None, media_preparer: None, vision_health: None,
+        Self { stats_diagnostics: None, expert_usage: Default::default(), id: id.into(), encoding, eos_token_ids, capabilities, engine_health: None, media_preparer: None, probe_media_preparer: None, grouped_images: false, vision_health: None,
             audio_preparer: None, audio_health: None, gateway: None, v41_turns: V41Turns::default(),
             literal_tokens: Arc::new(cuteafd_loader::LiteralTokens::new([
                 "<｜deepseek_image｜>", "<｜begin▁of▁sentence｜>", "<｜end▁of▁sentence｜>",
@@ -198,6 +201,15 @@ impl ModelProfile {
     pub fn with_loaded_vision(mut self, preparer: Arc<media::MediaPreparer>) -> Self {
         self.media_preparer = Some(preparer);
         self.capabilities.vision = true;
+        self
+    }
+
+    pub fn with_grouped_vision(mut self, preparer: Arc<media::MediaPreparer>) -> Self {
+        self.grouped_images=true; self.with_loaded_vision(preparer)
+    }
+
+    pub fn with_probe_media(mut self, preparer: Arc<media::MediaPreparer>) -> Self {
+        self.probe_media_preparer = Some(preparer);
         self
     }
 
@@ -350,6 +362,7 @@ pub struct NativeRequest {
     pub constraint: Option<NativeConstraint>,
     pub images: Vec<cuteafd_loader::V41Image>,
     /// Generic-family media, in template order. V4.1 only uses `images`.
+    pub image_groups: Vec<cuteafd_loader::media::PreparedImageGroup>,
     pub media: Vec<Arc<cuteafd_loader::media::PreparedImage>>,
     pub audio: Vec<Arc<cuteafd_loader::media::audio::PreparedAudio>>,
     pub max_tokens: usize,
@@ -441,7 +454,7 @@ pub fn router_for_model(queue: mpsc::Sender<NativeRequest>, limits: NativeLimits
         .route("/assets/cuteafd-logo.svg", get(console::logo))
         .route("/assets/cuteafd-mark.svg", get(console::mark))
         .with_state(console);
-    let body_limit = axum::extract::DefaultBodyLimit::max(if profile.media_preparer.is_some() || profile.audio_preparer.is_some() { 256 << 20 } else { images::BODY_BYTES });
+    let body_limit = axum::extract::DefaultBodyLimit::max(if profile.media_preparer.is_some() || profile.probe_media_preparer.is_some() || profile.audio_preparer.is_some() { 256 << 20 } else { images::BODY_BYTES });
     let mount = profile.gateway.clone();
     let state = NativeState { queue, limits, images, stats, tables, admission, profile: Arc::new(profile) };
     let mut routes = Router::new()
@@ -807,10 +820,19 @@ impl Built {
 /// free of side effects except claiming a benchmark probe.
 pub(crate) fn build(profile: &ModelProfile, limits: NativeLimits, headers: &axum::http::HeaderMap, mut body: Value)
     -> Result<Built, Rejection> {
+    if matches!(profile.encoding, ModelEncoding::MiniMax(_)) {
+        minimax::vision::validate_policy(&body).map_err(|message| Rejection {
+            status:StatusCode::BAD_REQUEST,message:message.clone(),retry:false,
+            response:Some((StatusCode::BAD_REQUEST,Json(json!({"error":{
+                "message":message,"type":"invalid_request_error","param":"max_pixels"}}))).into_response()),
+        })?;
+    }
     images::guard_content(&body, profile.capabilities).map_err(Rejection::bad)?;
     let probe = headers.get(probe::HEADER).and_then(|v| v.to_str().ok()).and_then(|id| probe::registry().claim(id));
+    let probe_preparer = probe.as_ref().filter(|p| p.spec.feature_scoring())
+        .and(profile.probe_media_preparer.as_ref());
     if let Some(p) = &probe {
-        let geometry = profile.media_preparer.as_ref().map(|p| p.config().token_geometry())
+        let geometry = profile.media_preparer.as_ref().or(probe_preparer).map(|p| p.config().token_geometry())
             .unwrap_or(cuteafd_core::media::ImageTokenGeometry::MERGED);
         let audio = profile.audio_preparer.as_ref().map(|p| p.geometry())
             .unwrap_or(cuteafd_core::media::AudioTokenGeometry::MimoRvq);
@@ -818,8 +840,8 @@ pub(crate) fn build(profile: &ModelProfile, limits: NativeLimits, headers: &axum
             p.fail(format!("{message:#}"));
             return Err(Rejection::bad(message));
         }
-        if !p.spec.media.is_empty() && (!profile.capabilities.vision || profile.media_preparer.is_none()
-            || matches!(profile.encoding, ModelEncoding::DeepseekV41)) {
+        if !p.spec.media.is_empty() && ((!profile.capabilities.vision || profile.media_preparer.is_none())
+            && probe_preparer.is_none() || matches!(profile.encoding, ModelEncoding::DeepseekV41)) {
             p.fail("probe media requires a loaded encoder");
             return Err(Rejection::bad("probe media requires a loaded encoder"));
         }
@@ -1191,6 +1213,7 @@ pub(crate) fn build(profile: &ModelProfile, limits: NativeLimits, headers: &axum
 
 /// Prepared media for one request (decoded on blocking threads).
 struct Prepared {
+    image_groups: Vec<cuteafd_loader::media::PreparedImageGroup>,
     images: Vec<cuteafd_loader::V41Image>,
     media: Vec<Arc<cuteafd_loader::media::PreparedImage>>,
     audio: Vec<Arc<cuteafd_loader::media::audio::PreparedAudio>>,
@@ -1220,17 +1243,23 @@ async fn prepare_media(profile: &ModelProfile, decoder: &images::ImageDecoder, w
             Err(e) => return Err(Rejection::new(StatusCode::INTERNAL_SERVER_ERROR, e)),
         }
     };
-    let media = if media_sources.is_empty() { Vec::new() } else {
-        let preparer = profile.media_preparer.as_ref().expect("sources require preparer").clone();
+    let grouped=profile.grouped_images && probe.is_none_or(|p|p.spec.media.is_empty());
+    let (media,image_groups) = if media_sources.is_empty() { (Vec::new(),Vec::new()) } else {
+        let preparer = profile.media_preparer.as_ref().or_else(|| probe.filter(|p| p.spec.feature_scoring())
+            .and(profile.probe_media_preparer.as_ref())).expect("validated media preparer").clone();
         let slot = preparer.slots.clone().acquire_owned().await
             .map_err(|_| Rejection::unavailable("image preparation is closed"))?;
         let hashes = probe.map(|p| p.spec.media.iter()
             .map(|span| span.fixture.as_ref().map(|f| f.sha256.clone())).collect::<Vec<_>>()).unwrap_or_default();
         match tokio::task::spawn_blocking(move || {
             let _slot = slot;
-            preparer.prepare_verified(&media_sources, &hashes)
+            if grouped {
+                let groups=preparer.prepare_groups(&media_sources)?;
+                let images=groups.iter().flat_map(|g|g.images.iter().cloned()).collect();
+                Ok::<_,anyhow::Error>((images,groups))
+            }else {Ok((preparer.prepare_verified(&media_sources, &hashes)?.images,Vec::new()))}
         }).await {
-            Ok(Ok(prepared)) => prepared.images,
+            Ok(Ok(prepared)) => prepared,
             Ok(Err(message)) => return Err(Rejection::bad(message)),
             Err(message) => return Err(Rejection::new(StatusCode::INTERNAL_SERVER_ERROR, message)),
         }
@@ -1249,7 +1278,7 @@ async fn prepare_media(profile: &ModelProfile, decoder: &images::ImageDecoder, w
             Err(message) => return Err(Rejection::new(StatusCode::INTERNAL_SERVER_ERROR, message)),
         }
     };
-    Ok(Prepared { images, media, audio })
+    Ok(Prepared { image_groups, images, media, audio })
 }
 
 /// Shared engine-facing state the chat route and the gateway backend submit through.
@@ -1270,6 +1299,7 @@ pub(crate) struct Running {
     pub(crate) audio_tokens: usize,
     prefix_cache_source: PrefixCacheSource,
     finish_detail: FinishDetail,
+    usage: Option<crate::usage::UsageHandle>,
     /// The prompt usage and matched client stop string, observed as the
     /// generator sees them.
     pub(crate) tap: Arc<Mutex<Tap>>,
@@ -1335,6 +1365,7 @@ impl Submitter {
             prefix_cache_source: prefix_cache_source.clone(),
             finish_detail: finish_detail.clone(),
             audio: prepared.audio,
+            image_groups: prepared.image_groups,
             media: prepared.media,
             prompt,
             literal_spans,
@@ -1381,6 +1412,7 @@ impl Submitter {
             }
         };
         let chunks = processor.process(input);
+        let response_usage = usage.clone();
         let output_usage = usage.filter(|_| chat_accounting);
         let chunks = async_stream::stream! {
             futures::pin_mut!(chunks);
@@ -1402,7 +1434,7 @@ impl Submitter {
                 }
             }
         };
-        Ok(Running { prefix_cache_source, finish_detail, chunks: Box::pin(chunks), failure, image_tokens, audio_tokens, tap, streaming, include_usage, id, model })
+        Ok(Running { prefix_cache_source, finish_detail, usage: response_usage, chunks: Box::pin(chunks), failure, image_tokens, audio_tokens, tap, streaming, include_usage, id, model })
     }
 }
 
@@ -1465,7 +1497,7 @@ async fn chat(State(state): State<NativeState>, headers: axum::http::HeaderMap,
 
 /// Render an accepted request as Chat Completions SSE or JSON.
 async fn respond(running: Running) -> Response {
-    let Running { chunks, failure, image_tokens, audio_tokens, prefix_cache_source, finish_detail, streaming, include_usage, id, model, .. } = running;
+    let Running { chunks, failure, image_tokens, audio_tokens, prefix_cache_source, finish_detail, usage: request_usage, streaming, include_usage, id, model, .. } = running;
     if streaming {
         let stream = async_stream::stream! {
             let mut chunks = chunks;
@@ -1509,6 +1541,9 @@ async fn respond(running: Running) -> Response {
             let failed = failure.lock().unwrap().clone();
             if let Some(message) = failed { yield Ok(message.sse_error()); return; }
             if let Some(mut usage) = usage_chunk {
+                if final_speculation_ready(request_usage.as_ref()).await {
+                    add_speculation_usage(&mut usage, request_usage.as_ref());
+                }
                 add_finish_detail(&mut usage, &finish_detail);
                 yield Ok(format!("data: {}\n\n", serde_json::to_string(&usage).unwrap()));
             }
@@ -1542,11 +1577,31 @@ async fn respond(running: Running) -> Response {
     if let Some(message) = failure.lock().unwrap().clone() {
         return message.rejection().into_response();
     }
+    let speculation_ready = final_speculation_ready(request_usage.as_ref()).await;
     let mut value = serde_json::to_value(response).expect("chat response serializes");
     add_media_usage(&mut value, image_tokens, audio_tokens);
     add_prefix_source(&mut value, &prefix_cache_source);
     add_finish_detail(&mut value, &finish_detail);
+    if speculation_ready { add_speculation_usage(&mut value, request_usage.as_ref()); }
     Json(value).into_response()
+}
+
+async fn final_speculation_ready(usage: Option<&crate::usage::UsageHandle>) -> bool {
+    if let Some(scope) = usage {
+        if let Err(error) = scope.wait_retired().await {
+            tracing::warn!(request_id=scope.rid(), %error, "omitting incomplete speculation usage");
+            return false;
+        }
+    }
+    true
+}
+
+fn add_speculation_usage(response: &mut Value, usage: Option<&crate::usage::UsageHandle>) {
+    if let Some(counters) = usage.and_then(crate::usage::UsageHandle::speculation) {
+        if let Some(usage) = response.get_mut("usage").and_then(Value::as_object_mut) {
+            usage.insert("speculation".into(), counters);
+        }
+    }
 }
 
 fn count_parts(items: &Value, kind: &str) -> u64 {
@@ -2268,6 +2323,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn minimax_pixel_override_returns_typed_400_before_admission() {
+        let (tx,mut rx)=mpsc::channel::<NativeRequest>(1);
+        let profile=ModelProfile::new("minimax-test",ModelEncoding::MiniMax(Arc::new(minimax::fixtures::encoding())));
+        let app=router_for_model(tx,NativeLimits::default(),Arc::new(Mutex::new(Value::Null)),
+            std::time::Duration::from_secs(5),ConsoleHub::disabled(),profile);
+        let body=json!({"model":"minimax-test","messages":[{"role":"user","content":"describe"}],
+            "mm_processor_kwargs":{"max_pixels":451584}});
+        let response=app.oneshot(axum::http::Request::post("/v1/chat/completions")
+            .header("content-type","application/json").body(Body::from(body.to_string())).unwrap()).await.unwrap();
+        assert_eq!(response.status(),StatusCode::BAD_REQUEST);
+        let bytes=axum::body::to_bytes(response.into_body(),1<<20).await.unwrap();
+        let value:Value=serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value["error"]["type"],"invalid_request_error");
+        assert!(value["error"]["message"].as_str().unwrap().contains("max_pixels"));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
     async fn inkling_malformed_or_truncated_output_is_an_error_not_a_partial_call() {
         for streaming in [false, true] {
             for wire in ["<|message_model|>read_file<|content_invoke_tool_json|>{bad}<|end_message|>",
@@ -2383,6 +2456,52 @@ mod tests {
             let error = String::from_utf8_lossy(&bytes);
             assert!(error.contains("does not support disabling thinking"), "{error}");
         }
+    }
+
+    #[tokio::test]
+    async fn request_local_speculation_usage_matches_records_for_json_and_sse() {
+        for streaming in [false, true] { for speculative in [false, true] {
+            let sink = Arc::new(crate::usage::tests::Sink::default());
+            let (tx, mut rx) = mpsc::channel::<NativeRequest>(1);
+            let worker = tokio::spawn(async move {
+                let job = rx.recv().await.unwrap();
+                if let Some(usage) = &job.usage {
+                    usage.round(if speculative { 5 } else { 0 }, if speculative { 3 } else { 0 });
+                    usage.round(if speculative { 3 } else { 0 }, if speculative { 2 } else { 0 });
+                }
+                for event in [InferenceChunk::Ready { system_fingerprint: None,
+                    prompt_usage: PromptUsage { prompt_tokens: 18, prompt_cache_hit_tokens: 0 } },
+                    InferenceChunk::Text { content: "answer".into(), content_tokens: 8 },
+                    InferenceChunk::Finish { finish_reason: InferenceFinishReason::Stop }] {
+                    job.events.send(Ok(event)).unwrap();
+                }
+            });
+            let app = router(tx).layer(axum::middleware::from_fn_with_state(
+                crate::usage::Middleware::new(sink.clone()), crate::usage::track));
+            let mut body = json!({"model":MODEL,"messages":[{"role":"user","content":"Hi"}],"max_tokens":16,
+                "thinking":{"type":"disabled"},"stream":streaming});
+            if streaming { body["stream_options"] = json!({"include_usage":true}); }
+            let response = app.oneshot(axum::http::Request::post("/v1/chat/completions")
+                .header("content-type","application/json").body(Body::from(body.to_string())).unwrap()).await.unwrap();
+            let status = response.status();
+            let bytes = axum::body::to_bytes(response.into_body(),1<<20).await.unwrap();
+            assert_eq!(status,StatusCode::OK,"{}",String::from_utf8_lossy(&bytes));
+            worker.await.unwrap();
+            let value: Value = if streaming {
+                std::str::from_utf8(&bytes).unwrap().split("data: ")
+                    .filter_map(|s| s.trim().parse::<Value>().ok()).find(|v| v["choices"] == json!([])).unwrap()
+            } else { serde_json::from_slice(&bytes).unwrap() };
+            let rows = sink.0.lock().unwrap();
+            assert_eq!(rows.len(),1);
+            if speculative {
+                let s = &value["usage"]["speculation"];
+                assert_eq!(s["request_id"],rows[0].rid);
+                assert_eq!(s["proposed"],8); assert_eq!(s["accepted"],5); assert_eq!(s["cycles"],2);
+                assert_eq!(s["proposed"].as_u64(),rows[0].draft_proposed);
+                assert_eq!(s["accepted"].as_u64(),rows[0].draft_accepted);
+                assert_eq!(s["cycles"].as_u64(),rows[0].rounds);
+            } else { assert!(value["usage"].get("speculation").is_none()); }
+        } }
     }
 
     #[tokio::test]
@@ -2640,6 +2759,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn encoder_failure_503_retains_precise_source_geometry_reason() {
+        let (tx,mut rx)=mpsc::channel::<NativeRequest>(1);
+        let reason="vision encoder unavailable: tower does not support source/content geometry";
+        let worker=tokio::spawn(async move {
+            let job=rx.recv().await.unwrap();
+            job.events.send(Err(NativeFailure::Unavailable(reason.into()))).unwrap();
+        });
+        let body=json!({"model":MODEL,"messages":[{"role":"user","content":"check"}],"max_tokens":1});
+        let response=router(tx).oneshot(axum::http::Request::post("/v1/chat/completions")
+            .header("content-type","application/json").body(Body::from(body.to_string())).unwrap()).await.unwrap();
+        assert_eq!(response.status(),StatusCode::SERVICE_UNAVAILABLE);
+        let bytes=axum::body::to_bytes(response.into_body(),4096).await.unwrap();
+        assert_eq!(serde_json::from_slice::<Value>(&bytes).unwrap()["error"]["message"],reason);
+        worker.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn expanded_audio_probe_binds_ordinary_sources_without_chat_rendering() {
         use base64::Engine;
         use cuteafd_loader::media::EncoderId;
@@ -2676,6 +2812,108 @@ mod tests {
             if let Some(worker) = worker { worker.await.unwrap(); }
         }
     }
+    #[tokio::test]
+    async fn fidelity_preparer_never_enables_public_vision_or_ordinary_image_chat() {
+        use base64::Engine;
+        use sha2::{Digest, Sha256};
+        use cuteafd_loader::media::{EncoderId, ImageFamily, ProcessorConfig};
+        let preparer = Arc::new(media::MediaPreparer::new(ProcessorConfig::for_family(ImageFamily::Mimo),
+            EncoderId([1; 32]), media::ImageUrlFetch::Off, 1).unwrap());
+        let bytes = include_bytes!("openai/fixtures/black.png");
+        let url = format!("data:image/png;base64,{}", base64::engine::general_purpose::STANDARD.encode(bytes));
+        let image = preparer.prepare(&[media::MediaSource { url: url.clone(), low: false }]).unwrap().images.remove(0);
+        let spec = probe::ProbeSpec { cold: true, no_speculation: true, score_from: Some(image.tokens + 1),
+            prompt_ids: Some(vec![1; image.tokens + 3]),
+            media: vec![probe::ProbeMedia { start: 1, len: image.tokens, kind: "image".into(),
+                key: image.key.0.iter().map(|v| format!("{v:02x}")).collect(),
+                grid: [image.grid.t, image.grid.h, image.grid.w], identity: None, input_key: None,
+                fixture: Some(probe::ProbeFixture { path: "image.png".into(), sha256: format!("{:x}", Sha256::digest(bytes)) }),
+                image_url: Some(probe::ProbeImageUrl { url: url.clone(), detail: None }) }], ..Default::default() };
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("tokenizer_config.json"), json!({"added_tokens_decoder":{
+            "163587":{"content":kimi::OPEN},"163588":{"content":kimi::CLOSE},
+            "163589":{"content":kimi::SEP},"163586":{"content":kimi::END}}}).to_string()).unwrap();
+        std::fs::write(root.path().join("generation_config.json"), "{\"eos_token_id\":163586}").unwrap();
+        for encoding in [ModelEncoding::Kimi(Arc::new(kimi::KimiEncoding::from_snapshot(root.path()).unwrap())),
+            ModelEncoding::MiniMax(Arc::new(minimax::fixtures::encoding()))] {
+        let profile = ModelProfile::new(MODEL, encoding).with_probe_media(preparer.clone());
+        assert!(!profile.capabilities.vision && profile.media_preparer.is_none());
+        let (tx, mut rx) = mpsc::channel::<NativeRequest>(1);
+        let app = router_for_model(tx, NativeLimits::default(), Arc::new(Mutex::new(Value::Null)),
+            std::time::Duration::from_secs(1), ConsoleHub::disabled(), profile);
+        let response = app.clone().oneshot(axum::http::Request::get("/v1/models").body(Body::empty()).unwrap()).await.unwrap();
+        let models: Value = serde_json::from_slice(&axum::body::to_bytes(response.into_body(), 1 << 20).await.unwrap()).unwrap();
+        assert_eq!(models["data"][0]["capabilities"]["vision"], false);
+        let normal = json!({"model":MODEL,"messages":[{"role":"user","content":[
+            {"type":"image_url","image_url":{"url":url}}, {"type":"text","text":"describe"}]}],"max_tokens":1});
+        let response = app.clone().oneshot(axum::http::Request::post("/v1/chat/completions")
+            .header("content-type","application/json").body(Body::from(normal.to_string())).unwrap()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(rx.try_recv().is_err());
+        let body = json!({"model":MODEL,"messages":[{"role":"user","content":"probe"}],"max_tokens":1});
+        for index in 0..4 {
+            let mut invalid = spec.clone();
+            match index { 0 => invalid.cold = false, 1 => invalid.no_speculation = false,
+                2 => invalid.score_from = None, _ => invalid.media[0].fixture = None }
+            let (id, _) = probe::registry().register(invalid);
+            let response = app.clone().oneshot(axum::http::Request::post("/v1/chat/completions")
+                .header(probe::HEADER,id).header("content-type","application/json")
+                .body(Body::from(body.to_string())).unwrap()).await.unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            assert!(rx.try_recv().is_err());
+        }
+        let image = image.clone();
+        let worker = tokio::spawn(async move {
+            let job = rx.recv().await.unwrap();
+            assert!(job.probe.as_ref().unwrap().spec.feature_scoring());
+            assert_eq!(job.media[0].key, image.key);
+            job.events.send(Ok(InferenceChunk::Ready { system_fingerprint: None,
+                prompt_usage: PromptUsage { prompt_tokens: 1, prompt_cache_hit_tokens: 0 } })).unwrap();
+            job.events.send(Ok(InferenceChunk::Finish { finish_reason: InferenceFinishReason::Length })).unwrap();
+        });
+        let (id, _) = probe::registry().register(spec.clone());
+        let response = app.oneshot(axum::http::Request::post("/v1/chat/completions")
+            .header(probe::HEADER,id).header("content-type","application/json")
+            .body(Body::from(body.to_string())).unwrap()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        worker.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn grouped_step_image_chat_preserves_local_global_jobs_at_api_boundary() {
+        use base64::Engine;
+        use cuteafd_loader::media::{EncoderId, ImageFamily, ProcessorConfig};
+        let mut png = std::io::Cursor::new(Vec::new());
+        image::RgbImage::from_pixel(896,812,image::Rgb([83;3]))
+            .write_to(&mut png,image::ImageFormat::Png).unwrap();
+        let url = format!("data:image/png;base64,{}", base64::engine::general_purpose::STANDARD.encode(png.into_inner()));
+        let preparer = Arc::new(media::MediaPreparer::new(ProcessorConfig::for_family(ImageFamily::Step5),
+            EncoderId([4;32]), media::ImageUrlFetch::Off, 1).unwrap());
+        let profile = ModelProfile::new(MODEL, ModelEncoding::Step5(Arc::new(step5::fixtures::encoding())))
+            .with_grouped_vision(preparer);
+        let (tx, mut rx) = mpsc::channel::<NativeRequest>(1);
+        let worker = tokio::spawn(async move {
+            let job = rx.recv().await.unwrap();
+            assert_eq!(job.image_groups.len(),1);
+            assert_eq!(job.image_groups[0].source,[896,812]);
+            assert!(job.image_groups[0].fragments.is_empty());
+            assert_eq!(job.media.iter().map(|i| i.tokens).collect::<Vec<_>>(),[81,81,81,81,169]);
+            assert_eq!(job.prompt.matches("<im_patch>").count(),1);
+            job.events.send(Ok(InferenceChunk::Ready { system_fingerprint: None,
+                prompt_usage: PromptUsage { prompt_tokens: 506, prompt_cache_hit_tokens: 0 } })).unwrap();
+            job.events.send(Ok(InferenceChunk::Finish { finish_reason: InferenceFinishReason::Length })).unwrap();
+        });
+        let app = router_for_model(tx, NativeLimits::default(), Arc::new(Mutex::new(Value::Null)),
+            std::time::Duration::from_secs(1), ConsoleHub::disabled(), profile);
+        let body = json!({"model":MODEL,"messages":[{"role":"user","content":[
+            {"type":"image_url","image_url":{"url":url}},{"type":"text","text":"describe"}]}],"max_tokens":1});
+        let response = app.oneshot(axum::http::Request::post("/v1/chat/completions")
+            .header("content-type","application/json").body(Body::from(body.to_string())).unwrap()).await.unwrap();
+        assert_eq!(response.status(),StatusCode::OK);
+        worker.await.unwrap();
+    }
+
     #[tokio::test]
     async fn expanded_media_probe_prepares_sources_without_chat_rendering() {
         use base64::Engine;
@@ -2761,6 +2999,52 @@ mod tests {
             panic!("replayed media rejected: {status}: {}", String::from_utf8_lossy(&bytes));
         }
         worker.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn native_still_image_chat_uses_grouped_preparation_and_off_rejects() {
+        use base64::Engine;
+        use cuteafd_loader::media::{EncoderId, ImageFamily, ProcessorConfig};
+        let preparer=Arc::new(media::MediaPreparer::new(ProcessorConfig::for_family(ImageFamily::MiniMax),
+            EncoderId([1;32]),media::ImageUrlFetch::Off,1).unwrap());
+        let root=tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("tokenizer_config.json"),json!({"added_tokens_decoder":{
+            "163587":{"content":kimi::OPEN},"163588":{"content":kimi::CLOSE},
+            "163589":{"content":kimi::SEP},"163586":{"content":kimi::END}}}).to_string()).unwrap();
+        std::fs::write(root.path().join("generation_config.json"),"{\"eos_token_id\":163586}").unwrap();
+        let encodings=[ModelEncoding::Kimi(Arc::new(kimi::KimiEncoding::from_snapshot(root.path()).unwrap())),
+            ModelEncoding::MiniMax(Arc::new(minimax::fixtures::encoding()))];
+        let url=format!("data:image/png;base64,{}",base64::engine::general_purpose::STANDARD.encode(include_bytes!("openai/fixtures/black.png")));
+        for encoding in encodings {
+            for enabled in [false,true] {
+                for image in [false,true] {
+                    let (tx,mut rx)=mpsc::channel::<NativeRequest>(1);
+                    let mut profile=ModelProfile::new(MODEL,encoding.clone());
+                    if enabled {profile=profile.with_grouped_vision(preparer.clone());}
+                    let app=router_for_model(tx,NativeLimits::default(),Arc::new(Mutex::new(Value::Null)),
+                        std::time::Duration::from_secs(1),ConsoleHub::disabled(),profile);
+                    let worker_encoding=encoding.clone();
+                    let worker=if enabled||!image {Some(tokio::spawn(async move {
+                        let job=rx.recv().await.unwrap();
+                        if image {
+                            assert_eq!(job.image_groups.len(),1);assert_eq!(job.media.len(),1);
+                            assert_eq!(job.image_groups[0].images[0].key,job.media[0].key);
+                            assert!(job.prompt.contains(if matches!(worker_encoding,ModelEncoding::Kimi(_)){"<|media_pad|>"}else{"]<]image[>["}));
+                        }else{assert!(job.media.is_empty()&&job.image_groups.is_empty());}
+                        job.events.send(Ok(InferenceChunk::Ready {system_fingerprint:None,prompt_usage:PromptUsage {
+                            prompt_tokens:1,prompt_cache_hit_tokens:0}})).unwrap();
+                        job.events.send(Ok(InferenceChunk::Finish {finish_reason:InferenceFinishReason::Length})).unwrap();
+                    }))}else{None};
+                    let content=if image {json!([{"type":"image_url","image_url":{"url":url}},
+                        {"type":"text","text":"What is in the image?"}])}else{json!("What is in the image?")};
+                    let body=json!({"model":MODEL,"messages":[{"role":"user","content":content}],"max_tokens":1});
+                    let response=app.oneshot(axum::http::Request::post("/v1/chat/completions")
+                        .header("content-type","application/json").body(Body::from(body.to_string())).unwrap()).await.unwrap();
+                    assert_eq!(response.status(),if enabled||!image {StatusCode::OK}else{StatusCode::BAD_REQUEST});
+                    if let Some(worker)=worker {worker.await.unwrap();}
+                }
+            }
+        }
     }
 
     #[tokio::test]

@@ -31,12 +31,15 @@ def seal(source, binary):
                 stamp = []
             identity = {"commit": stamp[0] if stamp else "unknown", "dirty": "dirty" in stamp[1:]}
     active = os.environ.get("CUTEAFD_KACHE_ACTIVE")
-    fallback = Path(os.environ.get("CUTEAFD_KACHE_WARNING_DIR", "/nonexistent")).exists()
+    warning = Path(os.environ.get("CUTEAFD_KACHE_WARNING_DIR", "/nonexistent"))
+    fallback = (warning / "first-failure").is_file()
+    timeouts = [path.read_text(errors="replace").strip() for path in sorted(warning.glob("timeouts/*")) if path.is_file()]
     with binary.open("rb") as stream:
         binary_sha256 = hashlib.file_digest(stream, "sha256").hexdigest()
     return {"schema": 1, "source": identity,
             "rustc": output("rustc", "-vV"), "cargo": output("cargo", "-V"),
-            "kache_mode": "fallback" if fallback else os.environ.get("CUTEAFD_KACHE_MODE", "disabled"),
+            "kache_mode": "fallback" if fallback else "enabled-with-timeouts" if timeouts else os.environ.get("CUTEAFD_KACHE_MODE", "disabled"),
+            "kache_invocation_timeouts": timeouts,
             "kache": output(active, "--version") if active else None,
             "rustflags": os.environ.get("RUSTFLAGS", ""),
             "cargo_encoded_rustflags": os.environ.get("CARGO_ENCODED_RUSTFLAGS", ""),

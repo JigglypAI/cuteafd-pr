@@ -11,6 +11,7 @@ pub mod reference;
 pub mod spark;
 pub mod w8;
 pub mod weight_layout;
+pub mod vision;
 
 pub const COMPILED_CONTEXT: usize = 1_048_576;
 

@@ -6,7 +6,7 @@ use crate::shared::{draft::routes::RoundRoutes, prefix::{CudaCopyEngine, PrefixA
     qwen::scheduler::{self, Backend}, token_io::{DeviceLogits, TokenSelector}};
 use anyhow::{ensure, Context, Result};
 use cuteafd_api::openai::NativeRequest;
-use cuteafd_engine::{media::{EncodeJob, EmbeddingCache, MediaKeys, RequestMedia},
+use cuteafd_engine::{media::{EncodeJob, EmbeddingCache, RequestMedia},
     prefix::{PrefixCache, PrefixConfig, PrefixFamily, RefPagePool}};
 use cuteafd_loader::families::minimax_m3::MiniMaxM3Config;
 use cuteafd_transport::ExpertV2SourceKind;
@@ -61,8 +61,6 @@ fn validate_prefix_concurrency(requested: usize, admitted: usize) -> Result<()> 
 pub(crate) enum BackendError {
     #[error("MiniMax neural/speculative drafts are not qualified")]
     DraftsNotQualified,
-    #[error("MiniMax bundled media serving is not qualified")]
-    MediaNotQualified,
     #[error("MiniMax backend is terminal after a failed native submission")]
     Terminal,
 }
@@ -129,6 +127,8 @@ impl PolicyProbe {
 /// No allocations or placement choices here: startup passes its admitted context
 /// and host-prefix config, and the Owners borrow pins every native backing.
 pub(crate) struct MiniMaxBackend<'e, 'a> {
+    media_enabled: bool,
+    snapshot: std::path::PathBuf,
     owners: &'e Owners<'a>,
     cfg: &'e MiniMaxM3Config,
     execution: RefCell<ServingPrefill<'a>>,
@@ -146,6 +146,10 @@ pub(crate) struct MiniMaxBackend<'e, 'a> {
 }
 
 impl<'e, 'a> MiniMaxBackend<'e, 'a> {
+    pub(crate) fn with_media_enabled(mut self, enabled: bool) -> Self { self.media_enabled=enabled; self }
+    pub(crate) fn with_probe_snapshot(mut self, snapshot: &Path) -> Self {
+        self.snapshot = snapshot.to_owned(); self
+    }
     pub fn new(owners: &'e Owners<'a>, cfg: &'e MiniMaxM3Config, execution: ServingPrefill<'a>,
         served_context: usize, host: Option<cuteafd_hostcache::config::Config>,
         packing: crate::shared::prefill_packing::PackingMode) -> Result<Self> {
@@ -171,7 +175,7 @@ impl<'e, 'a> MiniMaxBackend<'e, 'a> {
         }
         let schedule = Requests::new(state.capacity, served_context, cfg.layers, rank.prefill.len())?;
         drop(state);
-        Ok(Self { owners, cfg, execution: RefCell::new(execution), schedule, context: served_context,
+        Ok(Self { media_enabled: false, snapshot: Default::default(), owners, cfg, execution: RefCell::new(execution), schedule, context: served_context,
             host, profile: RefCell::new([0.0; 2]), policy_probe:RefCell::new(PolicyProbe::default()), identities: RefCell::new(BTreeMap::new()),
             next_identity: Cell::new(1), pending: RefCell::new(None), terminal: Cell::new(false),
             selector_receipts: RefCell::new(None), packing })
@@ -353,26 +357,53 @@ impl<'e, 'a> Backend<'a> for MiniMaxBackend<'e, 'a> {
         Ok((family, cache))
     }
     fn prepare(&self, job: NativeRequest, tokens: Vec<u32>) -> Result<(scheduler::Prompt, RequestMedia, Vec<EncodeJob>)> {
-        ensure!(job.media.is_empty(), BackendError::MediaNotQualified);
         self.owners.storage.embedding.check(&tokens)?;
-        let keys = MediaKeys::new(&tokens, u32::try_from(self.cfg.vocab_size)?, &[])?;
-        let media = RequestMedia::new(Vec::new(), self.cfg.hidden, tokens.len())?;
-        Ok((scheduler::Prompt { job, tokens, keys }, media, Vec::new()))
+        if job.probe.as_ref().is_some_and(|p|!p.spec.media.is_empty()) {
+            return crate::shared::probe::still::prepare(job,tokens,self.cfg.vocab_size as u32,self.cfg.hidden,
+                self.context,&self.snapshot,cuteafd_loader::media::ImageFamily::MiniMax);
+        }
+        ensure!(self.media_enabled || job.media.is_empty(),"vision is disabled");
+        if job.media.is_empty() {
+            return crate::shared::probe::still::prepare(job,tokens,self.cfg.vocab_size as u32,self.cfg.hidden,
+                self.context,&self.snapshot,cuteafd_loader::media::ImageFamily::MiniMax);
+        }
+        let tokenizer=cuteafd_loader::cached_tokenizer(&self.snapshot)?;
+        let ids=tokenizer.added_token_ids(&["]<]image[>[","]<]start of image[>[","]<]end of image[>["]);
+        ensure!(ids.len()==3,"MiniMax image markers absent");
+        let mut job=job;
+        let mut groups=std::mem::take(&mut job.image_groups);
+        ensure!(groups.len()==job.media.len(),"MiniMax source groups absent");
+        for group in &mut groups {
+            group.fragments=vec![cuteafd_loader::media::ImageFragment::Tokens(vec![ids[1]]),
+                cuteafd_loader::media::ImageFragment::Features {image:0,placeholder:ids[0]},
+                cuteafd_loader::media::ImageFragment::Tokens(vec![ids[2]])];
+        }
+        crate::shared::vision::still::Binding::prepare(job,tokens,self.cfg.vocab_size as u32,self.cfg.hidden,
+            self.context,ids[0],groups)
     }
     fn probe_features(&self, prompt: &scheduler::Prompt, media: &mut RequestMedia,
-        _: &mut EmbeddingCache, _: &Path) -> Result<()> {
-        ensure!(prompt.job.media.is_empty() && media.spans().is_empty(), BackendError::MediaNotQualified);
+        cache: &mut EmbeddingCache, snapshot: &Path) -> Result<()> {
+        if prompt.job.probe.as_ref().is_some_and(|p|p.spec.feature_scoring()) {
+            crate::shared::probe::still::features(prompt, media, cache, snapshot, cuteafd_loader::media::ImageFamily::MiniMax)?;
+        }
         Ok(())
     }
-    fn coordinates(&self, _: &[u32], job: &NativeRequest, media: &RequestMedia) -> Result<()> {
-        ensure!(job.media.is_empty() && media.spans().is_empty(), BackendError::MediaNotQualified);
+    fn coordinates(&self, tokens: &[u32], job: &NativeRequest, media: &RequestMedia) -> Result<()> {
+        if self.media_enabled && job.probe.as_ref().is_none_or(|p|p.spec.media.is_empty()) {
+            ensure!(media.prompt_len()==tokens.len(),"MiniMax media prompt extent");return Ok(());
+        }
+        let spans = crate::shared::probe::still::spans(job, tokens, self.cfg.vocab_size as u32,
+            self.context, &self.snapshot, cuteafd_loader::media::ImageFamily::MiniMax)?;
+        ensure!(spans == media.spans(), "MiniMax probe media coordinates differ");
         Ok(())
     }
-    fn placement(&self, units: Vec<u32>, slot: i32) -> Placement { Placement { units, slot: slot as usize, len: 0 } }
+    fn placement(&self, units: Vec<u32>, slot: i32) -> Placement { Placement { media_spans: Vec::new(), units, slot: slot as usize, len: 0 } }
     fn bind_request(&self, placement: &mut Placement, _: (), media: RequestMedia,
         tokens: &[u32], resume: usize) -> Result<()> {
         self.idle()?;
-        ensure!(media.spans().is_empty(), BackendError::MediaNotQualified);
+        self.owners.storage.probe_media.borrow_mut().remove(&placement.slot);
+        placement.media_spans=media.spans().to_vec();
+        if !media.spans().is_empty() { self.owners.storage.probe_media.borrow_mut().insert(placement.slot, media); }
         ensure!(placement.len == resume && resume <= tokens.len(), "MiniMax restored request frontier differs");
         self.owners.storage.requests.borrow().ranks[0].bank.validate(placement, resume)?;
         let identity = self.next_identity.get();
@@ -580,6 +611,7 @@ impl<'e, 'a> Backend<'a> for MiniMaxBackend<'e, 'a> {
             self.pending.borrow_mut().take();
         }
         self.identities.borrow_mut().remove(&placement.slot);
+        self.owners.storage.probe_media.borrow_mut().remove(&placement.slot);
         Ok(())
     }
     fn probe_begin(&self, rows: usize) { self.policy_probe.borrow_mut().begin(rows); }
@@ -632,7 +664,7 @@ mod tests {
         let library = Arc::new(unsafe { NativeLibrary::load(&args.native_lib)? });
         let programs = library.programs()?.with_manifest(&args.manifest)?;
         let loaded = super::super::startup::load(&library, &programs, &view, &checkpoint, &cfg,
-            super::super::startup::Options {
+            super::super::startup::Options { media: &crate::shared::vision::still::Options {vision:cuteafd_loader::plan::MediaMode::Off,..Default::default()},
                 device: args.device, split_device: args.split_device, peers: &args.peers,
                 native_lib: &args.native_lib, manifest_path: &args.manifest,
                 split_wire: super::super::dense::PartialPrecision::DEFAULT,
@@ -744,7 +776,7 @@ mod tests {
                         }
                     }
                     let mut placements=members.iter().map(|&slot| -> Result<_> {
-                        let mut placement=Placement { units:pages[slot].clone(),slot,len:0 };
+                        let mut placement=Placement { media_spans: Vec::new(), units:pages[slot].clone(),slot,len:0 };
                         family.bind(&mut placement).map_err(|e| anyhow::anyhow!(e.to_string()))?;
                         backend.identities.borrow_mut().insert(slot,(slot+1) as u64);
                         backend.prefill_device(&mut placement,&tokens[slot..slot+prompt],0,&pool)?;
@@ -823,7 +855,7 @@ mod tests {
                     }
                 }
                 let mut placements = pages.iter().enumerate().map(|(slot,pages)| -> Result<_> {
-                    let mut placement = Placement { units:pages.clone(),slot,len:0 };
+                    let mut placement = Placement { media_spans: Vec::new(), units:pages.clone(),slot,len:0 };
                     family.bind(&mut placement).map_err(|e| anyhow::anyhow!(e.to_string()))?;
                     backend.identities.borrow_mut().insert(slot,(slot+1) as u64);
                     Ok(placement)
@@ -1164,7 +1196,7 @@ mod tests {
         let library = fixture.load()?;
         fixture.immediate_copies(&library)?;
         let (bank, family) = family(&library)?;
-        let mut placement = Placement { units: vec![7, 3, 11], slot: 2, len: 0 };
+        let mut placement = Placement { media_spans: Vec::new(), units: vec![7, 3, 11], slot: 2, len: 0 };
         let tokens = (0..65).map(|i| (i * 37 % 251) as u32).collect::<Vec<_>>();
         append(&family, &bank, &mut placement, &tokens[..64])?;
         append(&family, &bank, &mut placement, &tokens[64..])?;
@@ -1217,7 +1249,7 @@ mod tests {
             entries: 8, mark_slots: 0, keep_logits: true, min_tokens: 1 }, None)?;
         let tokens = (0..end).map(|i| (i * 73 + i / 7) as u32 % 251).collect::<Vec<_>>();
         let mut original = cache.admit(&family, &tokens[..65], 256, false,
-            |units| Placement { units, slot: 0, len: 0 })?.placement;
+            |units| Placement { media_spans: Vec::new(), units, slot: 0, len: 0 })?.placement;
         append(&family, &bank, &mut original, &tokens[..65])?;
         assert!(cache.capture(&family, SnapshotKind::Prompt, &tokens[..65], &original,
             After::from_logits(&[0.0, 1.0], true))?);
@@ -1231,14 +1263,14 @@ mod tests {
         append(&family, &bank, &mut original, &[239; 41])?;
         cache.release(&family, &original.units)?;
         let hit = cache.admit(&family, &tokens, 256, false,
-            |units| Placement { units, slot: 1, len: 0 })?;
+            |units| Placement { media_spans: Vec::new(), units, slot: 1, len: 0 })?;
         assert_eq!(hit.resume, resume);
         assert_eq!(hit.source.as_ref().unwrap().kind, kind);
         assert!(hit.source.as_ref().unwrap().plan.exact());
         let mut restored = hit.placement;
         binding(&bank, &restored)?;
         let mut cold = cache.admit_cold(&family, tokens.len(), 256,
-            |units| Placement { units, slot: 2, len: 0 })?.placement;
+            |units| Placement { media_spans: Vec::new(), units, slot: 2, len: 0 })?.placement;
         append(&family, &bank, &mut cold, &tokens[..resume])?;
         assert_live_rows_equal(&bank, &restored, &cold, 0..resume)?;
         assert_eq!(model_logits(&bank, &restored)?, model_logits(&bank, &cold)?);
@@ -1284,7 +1316,7 @@ mod tests {
 
     #[test]
     fn accept_checks_original_identity_pages_start_and_tokens_not_mutated_length() -> Result<()> {
-        let sent = Submitted { identity: 91, placement: Placement { units: vec![3, 7], slot: 2, len: 63 }, tokens: vec![101] };
+        let sent = Submitted { identity: 91, placement: Placement { media_spans: Vec::new(), units: vec![3, 7], slot: 2, len: 63 }, tokens: vec![101] };
         let mut actual = sent.placement.clone();
         actual.len = 64;
         sent.validate(91, &actual, 63, &[101])?;

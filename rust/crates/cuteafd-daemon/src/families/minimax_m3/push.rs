@@ -15,6 +15,8 @@ pub(crate) struct Prepared<'a, T> {
     devices: Vec<Device<'a>>,
     sparks: usize,
     dense: (Vec<DensePlan>, Vec<dense::DenseArena<'a>>),
+    media: crate::shared::vision::push::Contribution,
+    records: dense::Records,
 }
 
 /// The caller has solved the complete host/device recipe before invoking this.
@@ -33,7 +35,7 @@ pub(crate) fn prepare<'a, T>(view: &CheckpointView, catalog: &OfficialV41Catalog
             && devices[..rank].iter().all(|other| other.id != device.id)),
         "MiniMax push needs distinct coordinator devices in one library");
     let (owners, records) = dense::recording(load)?;
-    let dense = dense::plan_records(view.snapshot(), records, devices, sparks)?;
+    let dense = dense::plan_records(view.snapshot(), records.clone(), devices, sparks)?;
     let experts = (!expert_sets.is_empty()).then_some(CoordinatorExperts::Sets(expert_sets));
     let (push, membership) = if sparks == 0 {
         (CoordinatorPush::prepare_alone_view_admitted(view, Some(catalog), devices.len(), experts, envelope)?, None)
@@ -42,17 +44,18 @@ pub(crate) fn prepare<'a, T>(view: &CheckpointView, catalog: &OfficialV41Catalog
             devices.len(), experts, envelope)?;
         (push, Some((streams, ranks)))
     };
-    Ok((Prepared { push, owners, devices: devices.to_vec(), sparks, dense }, membership))
+    Ok((Prepared { push, owners, devices: devices.to_vec(), sparks, dense, records, media: Default::default() }, membership))
 }
 
 impl<'a, T> Prepared<'a, T> {
     /// Call while awaiting the Spark admission transaction. No initialized owner
     /// escapes a declined, failed, or partially committed group.
     pub(crate) fn receive(self, catalog: &OfficialV41Catalog) -> Result<(T, Vec<Vec<PushedExperts<'a>>>)> {
-        let Self { push, owners, devices, sparks, dense } = self;
+        let Self { push, owners, devices, sparks, dense, media, records: _ } = self;
         let (received, ()) = push.receive_sets_with(devices, Some(catalog), sparks, Some(Ok(dense)), || ());
         let experts = PushPolicy::Required.committed(received)?
             .context("MiniMax group did not publish coordinator ranks")?;
+        media.commit()?;
         Ok((owners, experts))
     }
 }
@@ -170,7 +173,23 @@ fn serving_expert_plan(backings: &[cuteafd_loader::placement::families::minimax_
             budget: budgets[0] }] } }))
 }
 
+fn compose_media_plans<P,A>(base:(Vec<P>,Vec<A>),mut records:dense::Records,media:dense::Records,
+    plan:impl FnOnce(dense::Records)->Result<(Vec<P>,Vec<A>)>)->Result<(Vec<P>,Vec<A>)> {
+    if media.operands.is_empty() && media.host_operands.is_empty() && media.steps.is_empty()
+        && media.finishes.is_empty() && media.peer_copies.is_empty() { return Ok(base); }
+    records.extend(media);
+    // Retire the unpublished planning streams before constructing their replacements.
+    drop(base);
+    plan(records)
+}
+
 impl<'a> PendingServing<'a> {
+    pub(crate) fn with_media(mut self, snapshot: &std::path::Path, media: crate::shared::vision::push::Contribution) -> Result<Self> {
+        self.prepared.dense=compose_media_plans(self.prepared.dense,self.prepared.records.clone(),media.records(),|records|
+            dense::plan_records(snapshot,records,&self.prepared.devices,self.prepared.sparks))?;
+        self.prepared.media=media;Ok(self)
+    }
+
     pub(crate) fn finish(self, catalog: &OfficialV41Catalog,
         pending: Option<crate::shared::placement::PendingSparkAdmission>) -> Result<ServingWeights<'a>> {
         let Self { prepared, expected } = self;
@@ -344,6 +363,32 @@ mod serving_tests {
         placement::{families::minimax_m3::ExpertBacking,
             planner::{weight_arena_components, ComponentKind, Facts, Lifetime, Location, PhaseOrder}},
         serving_capacity::WeightArenaLayout};
+
+    #[test]
+    fn remote_tower_adds_no_coordinator_push_plans() -> Result<()> {
+        let mut planned=0;
+        let base=(vec![10,20],vec![30,40]);
+        let actual=compose_media_plans(base,dense::Records::default(),dense::Records::default(),|_| {
+            planned+=1;Ok((vec![0,0],vec![0,0]))
+        })?;
+        assert_eq!(actual,(vec![10,20],vec![30,40]));
+        assert_eq!(planned,0,"a Spark tower must not plan a coordinator contribution");
+        Ok(())
+    }
+
+    #[test]
+    fn local_tower_replans_combined_raw_records_without_appending_rank_sets() -> Result<()> {
+        let buffer=cuteafd_ffi::CuteafdDeviceBuffer {ptr:std::ptr::dangling_mut::<u8>().cast(),bytes:2,device_id:0,flags:0};
+        let finish=dense::Finish::RowNorms {source:buffer,norms:buffer,rows:1,cols:1};
+        let base=dense::Records {finishes:vec![finish.clone()],..Default::default()};
+        let media=dense::Records {finishes:vec![finish],..Default::default()};
+        let actual=compose_media_plans((vec![10,20],vec![30,40]),base,media,|records| {
+            assert_eq!(records.finishes.len(),2,"target and local tower raw records must share one rank planner");
+            Ok((vec![11,21],vec![31,41]))
+        })?;
+        assert_eq!(actual,(vec![11,21],vec![31,41]));
+        Ok(())
+    }
 
     fn facts(targets: &[CoordinatorWeights], experts: &[ExpertBacking]) -> Result<Facts> {
         let mut facts = Facts { phase_order: PhaseOrder::TARGET_THEN_DRAFT,

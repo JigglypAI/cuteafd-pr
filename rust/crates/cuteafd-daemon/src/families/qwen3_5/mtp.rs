@@ -442,6 +442,12 @@ impl MtpCache<'_> {
     }
     pub(crate) fn reservable(&self) -> usize { self.0.borrow().pool.reservable() }
     pub(crate) fn lifetime_rows(&self) -> usize { self.0.borrow().pool.lifetime_rows(2) }
+    pub(crate) fn quarantine_pages(&self, slot: usize) {
+        let mut mtp = self.0.borrow_mut();
+        if let Some(binding) = mtp.bindings.get(slot).copied().flatten() {
+            mtp.pool.quarantine(binding).expect("live MTP binding belongs to its pool");
+        }
+    }
     pub(crate) fn admit_pages(&self, slot: usize, end: usize) -> Result<()> {
         let mut mtp = self.0.borrow_mut();
         mtp.select_slot(slot)?;

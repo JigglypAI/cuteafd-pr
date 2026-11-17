@@ -686,6 +686,7 @@ dependencies = [
  "futures",
  "hmac",
  "http-body",
+ "image",
  "jiter",
  "jsonschema",
  "minijinja",

@@ -303,7 +303,7 @@ def test_unknown_family_has_no_silent_empty_scope(operation, tmp_path):
      {'CUTEAFD_WIP_AUDIO_AOT': 'ON', 'CUTEAFD_WIP_MIMO_GEOMETRIES': 'mimop'}),
     ('qwen4', 'Qwen3.8-Flash-Next-EXL3', 0, 'QWEN4', 'qwen4:exl3-k45;qwen4:nvfp4', '', '', '',
      {'CUTEAFD_WIP_VISION_ATTENTION_AOT': 'ON'}),
-    ('kimi_k3', 'Kimi-K3-EXL3-K2', 6, 'KIMIK3', 'kimik3:exl3-k23', 'kimik3:exl3-k23', 'kimik3=6', '', {}),
+    ('kimi_k3', 'Kimi-K3-EXL3-K2', 6, 'KIMIK3', 'kimik3:exl3-k23', 'kimik3:exl3-k23', 'kimik3=6', '', {'CUTEAFD_WIP_VISION_ATTENTION_AOT': 'ON'}),
     ('muse_spark', 'Muse-Spark-Open-EXL3-K4-Core-K6', 6, 'MUSE', 'muse:exl3-k45', 'muse:exl3-k45', 'muse=6', '',
      {'CUTEAFD_WIP_AUDIO_AOT': 'ON', 'CUTEAFD_WIP_VISION_ATTENTION_AOT': 'ON'}),
     ('mistral_large4', 'Mistral-Large-4-EXL3-K4', 6, 'ML4', 'ml4:exl3-k45', 'ml4:exl3-k45', 'ml4=6', '',

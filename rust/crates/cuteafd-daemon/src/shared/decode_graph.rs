@@ -1,13 +1,23 @@
 //! Canonical serving decode shapes and exact-key graph ownership.
 
 #[derive(Clone, Copy, Default)]
-struct Options { no_prewarm: bool, donor_always: bool }
+struct Options { no_prewarm: bool, donor_always: bool, donor_cold_lag: u64 }
+impl Options {
+    fn validate(self) -> anyhow::Result<Self> {
+        anyhow::ensure!(self.donor_always || self.donor_cold_lag == 0,
+            "--graph-donor-cold-lag requires --graph-donor-always when non-zero");
+        Ok(self)
+    }
+}
 static OPTIONS: std::sync::OnceLock<Options> = std::sync::OnceLock::new();
-pub(crate) fn configure(no_prewarm: bool, donor_always: bool) {
-    assert!(OPTIONS.set(Options { no_prewarm, donor_always }).is_ok(), "graph policy configured twice");
+pub(crate) fn configure(no_prewarm: bool, donor_always: bool, donor_cold_lag: u64) -> anyhow::Result<()> {
+    let options = Options { no_prewarm, donor_always, donor_cold_lag }.validate()?;
+    assert!(OPTIONS.set(options).is_ok(), "graph policy configured twice");
+    Ok(())
 }
 pub(crate) fn prewarm_enabled() -> bool { !OPTIONS.get().copied().unwrap_or_default().no_prewarm }
 fn donor_always() -> bool { OPTIONS.get().copied().unwrap_or_default().donor_always }
+fn donor_cold_lag() -> u64 { OPTIONS.get().copied().unwrap_or_default().donor_cold_lag }
 
 /// Object-safe control surface for a family's heterogeneous graph owners.
 /// The caller drains the complete submitted step before invoking `drain`.
@@ -60,6 +70,20 @@ pub(crate) use watch::CaptureWatch;
 pub(crate) use native::{LayerGraphs, RowGraphs};
 pub(crate) use bank::{missing_variants, note_eager, CaptureTicket, GraphBank};
 pub(crate) use owner::GraphOwner;
+
+/// Recording runs host code without executing device work. Restore the complete
+/// host checkpoint on failure before an eager retry. The recorder must end
+/// capture and destroy unaccepted executables on errors; rollback changes no
+/// device storage or cache policy.
+pub(crate) fn capture_transaction<S: ?Sized, C, T>(
+    state: &mut S, checkpoint: C,
+    record: impl FnOnce(&mut S) -> anyhow::Result<T>,
+    rollback: impl FnOnce(&mut S, C),
+) -> anyhow::Result<T> {
+    let result = record(state);
+    if result.is_err() { rollback(state, checkpoint); }
+    result
+}
 
 /// # Safety
 /// The ticket admits this capture; the caller owns the stream and pins every
@@ -159,6 +183,34 @@ pub(crate) fn real_row_moe(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn capture_transaction_commits_success_and_restores_partial_errors() {
+        let mut flags = [1, 2, 3];
+        let checkpoint = flags;
+        let value = super::capture_transaction(&mut flags, checkpoint,
+            |state| { state[0] = 9; Ok(42) }, |state, saved| *state = saved).unwrap();
+        assert_eq!((value, flags), (42, [9, 2, 3]));
+        let checkpoint = flags;
+        let error = super::capture_transaction(&mut flags, checkpoint,
+            |state| -> anyhow::Result<()> { state[1] = 8; anyhow::bail!("partial recording failed") },
+            |state, saved| *state = saved).unwrap_err();
+        assert_eq!(error.to_string(), "partial recording failed");
+        assert_eq!(flags, checkpoint);
+    }
+
+    #[test]
+    fn donor_cold_lag_requires_donor_always() {
+        use super::Options;
+        for donor_always in [false, true] {
+            assert!(Options { no_prewarm: false, donor_always, donor_cold_lag: 0 }.validate().is_ok());
+            let result = Options { no_prewarm: false, donor_always, donor_cold_lag: 16 }.validate();
+            assert_eq!(result.is_ok(), donor_always);
+            if let Err(error) = result {
+                assert!(error.to_string().contains("--graph-donor-cold-lag requires --graph-donor-always"));
+            }
+        }
+    }
+
     #[test]
     fn skinny_thresholds_fail_closed_with_projection_name() {
         use super::*;

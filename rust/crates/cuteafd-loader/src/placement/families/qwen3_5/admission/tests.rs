@@ -27,7 +27,7 @@ fn request() -> Request {
 
 fn facts<'a>(cfg: &'a Qwen35Config, weights: &'a NativeWeights, buffers: &'a NativeBuffers,
     target_arena: &'a crate::serving_capacity::WeightArenaLayout) -> DenseFacts<'a> {
-    DenseFacts { graph_variant: "fixture".into(), graphs_enabled: true, cfg, weights, target_arena, buffers, slots: 4, record_bytes: 4096, drafter: None, blas_head: serving::BlasHead::TensorLt, serving: None,
+    DenseFacts { target_pool: None, graph_variant: "fixture".into(), graphs_enabled: true, cfg, weights, target_arena, buffers, slots: 4, record_bytes: 4096, drafter: None, blas_head: serving::BlasHead::TensorLt, serving: None,
         host_prefix: serving::HostPrefixOwners { quota_bytes: 0, chunk_bytes: 0 }, verify_check: false }
 }
 
@@ -40,8 +40,8 @@ fn sampled_preweight_occupancy_is_one_capacity_neutral_named_owner() {
             let input = facts(&cfg, &weights, &buffers, &arena);
             let live = sampled_budgets((96 << 30) - sampled, 96 << 30, Some(logical),
                 crate::plan::testing::SimulatedHost::raptor().host_ram).unwrap();
-            let previous = solve(request(), live.clone(), &input).unwrap();
-            let plan = admit(request(), live, input).unwrap();
+            let plan = admit(request(), live.clone(), input.clone()).unwrap();
+            let previous = solve_prepared(request(), live, &input, &plan.pool_policy.unwrap()).unwrap();
             assert_eq!(plan.pool_tokens, previous.pool_tokens);
             assert_eq!(plan.decisions, previous.decisions);
             assert_eq!(plan.budgets[0].logical_bytes, logical);
@@ -82,8 +82,9 @@ fn sampled_preweight_owner_survives_gpu_reserve_override_without_changing_capaci
         MemoryPolicy { gpu_reserve: Some(reserve), ..Default::default() }.scoped(|| {
             let live = sampled_budgets((96 << 30) - occupied, 96 << 30, Some(80 << 30),
                 crate::plan::testing::SimulatedHost::raptor().host_ram).unwrap();
-            let previous = solve(request(), live.clone(), &facts(&cfg, &weights, &buffers, &arena)).unwrap();
-            let plan = admit(request(), live, facts(&cfg, &weights, &buffers, &arena)).unwrap();
+            let plan = admit(request(), live.clone(), facts(&cfg, &weights, &buffers, &arena)).unwrap();
+            let previous = solve_prepared(request(), live, &facts(&cfg, &weights, &buffers, &arena),
+                &plan.pool_policy.unwrap()).unwrap();
             assert_eq!(plan.pool_tokens, previous.pool_tokens);
             assert_eq!(plan.decisions, previous.decisions);
             assert_eq!(plan.budgets[0].headroom, reserve);
@@ -128,7 +129,7 @@ fn blas_heads_share_one_pool_only_for_genuine_bf16_drafts() {
 fn auto_pool_matches_the_declared_owners_and_never_shrinks_context() {
     let (cfg, weights, buffers, arena) = fixture();
     let plan = admit(request(), budgets(), facts(&cfg, &weights, &buffers, &arena)).unwrap();
-    assert_eq!(plan.pool_tokens, 2 << 20);
+    assert!(plan.pool_tokens > 2 << 20, "an unbounded max grows into the admitted memory");
     assert_eq!(plan.pool_tokens % PAGE_ROWS, 0);
     assert_eq!(plan.decisions.embedding, Some(planner::EmbeddingHome::Device(0)));
     assert!(plan.decisions.onboard_layers.iter().all(Vec::is_empty));
@@ -291,7 +292,7 @@ fn exact_pools_report_typed_refusals_instead_of_shrinking_the_context() {
     for (pool, expected) in [
         (Pin::Exact(PAGE_ROWS), "below context"),
         (Pin::Exact(3 * PAGE_ROWS + 1), "misaligned"),
-        (Pin::Exact((32 << 20) * PAGE_ROWS), "beyond memory"),
+        (Pin::Exact((32 << 20) * PAGE_ROWS), "beyond the compiled extent"),
     ] {
         let mut ask = request();
         ask.pool = pool;
@@ -299,8 +300,7 @@ fn exact_pools_report_typed_refusals_instead_of_shrinking_the_context() {
         match expected {
             "below context" => assert!(matches!(&refusal, Refusal::PoolBelowContext { .. }), "{refusal}"),
             "misaligned" => assert!(matches!(&refusal, Refusal::MisalignedPool { .. }), "{refusal}"),
-            _ => assert!(matches!(&refusal, Refusal::Capacity { budget, .. } if budget == "rtx0"),
-                "{refusal}"),
+            _ => assert!(matches!(&refusal, Refusal::InvalidPin(_)), "{refusal}"),
         }
     }
     // The compiled extent is a real ceiling, refused before any arithmetic.
@@ -504,4 +504,28 @@ fn graph_reserve_is_one_canonical_owner_before_pool_sizing() {
     assert!(!off.facts.allowances.iter().any(|allowance|
         crate::placement::graph_reserve::is_source(&allowance.source)));
     assert!(off.pool_tokens >= plan.pool_tokens);
+}
+
+#[test]
+fn prepared_pool_matches_plan_and_runtime_and_preserves_strict_requests() {
+    use cuteafd_core::memory_policy::MemoryPolicy;
+    let (cfg, weights, buffers, arena) = fixture();
+    let default = admit(request(), budgets(), facts(&cfg, &weights, &buffers, &arena)).unwrap();
+    assert!(default.pool_tokens > 2 << 20, "an unbounded max grows into the admitted memory");
+    MemoryPolicy { kv_max: Some(2 << 20), ..Default::default() }.scoped(|| {
+        let planned = admit(request(), budgets(), facts(&cfg, &weights, &buffers, &arena)).unwrap();
+        let live = sampled_budgets(96 << 30, 96 << 30, None,
+            crate::plan::testing::SimulatedHost::raptor().host_ram).unwrap();
+        let served = admit(request(), live, facts(&cfg, &weights, &buffers, &arena)).unwrap();
+        assert_eq!(planned.pool_policy, served.pool_policy);
+        let pool = planned.pool_policy.unwrap();
+        assert_eq!(pool.ceiling(), 2 << 20);
+        assert_eq!(pool.maximum_tokens(), 2 << 20);
+        assert_eq!(planned.pool_tokens, 2 << 20);
+        assert_eq!(planned.decisions.onboard_layers, default.decisions.onboard_layers);
+        let mut strict = request();
+        strict.pool = Pin::Exact(262_144);
+        let pinned = admit(strict, budgets(), facts(&cfg, &weights, &buffers, &arena)).unwrap();
+        assert_eq!(pinned.pool_tokens, 262_144);
+    });
 }

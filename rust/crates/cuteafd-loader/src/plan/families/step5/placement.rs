@@ -11,8 +11,8 @@ use anyhow::{ensure, Context, Result};
 use cuteafd_core::memory_layout::{Basis, Category, DeviceKind, DeviceLayout, Item, MemoryLayout};
 
 #[derive(Debug, thiserror::Error)]
-#[error("Step-5 layout is unqualified: {0}; use one or two RTX PRO 6000 for EXL3, two for FP8 or one for NVFP4, with a covered Spark width and enough memory")]
-struct Unqualified(&'static str);
+#[error("Step-5 executor does not support {0}")]
+struct Unsupported(&'static str);
 
 pub(super) fn layout(
     model: &Model,
@@ -27,48 +27,32 @@ pub(super) fn layout(
     );
     let nvfp4 = model.formats.iter().any(|f| f == "nvfp4-g16-w4a4");
     let exl3 = model.is_exl3();
-    // Coordinator GPUs are a placement qualification: EXL3 runs on one or two
-    // RTX; the official releases keep their qualified GPU counts. Spark worlds
-    // come from the shared width-class package ranges for every format, and a
-    // frozen format admits only the worlds it shipped on.
-    let coordinators = if exl3 { opts.rtx_bytes.len() } else if nvfp4 { 1 } else { 2 };
+    let coordinators = opts.rtx_bytes.len();
     let spark_ranks = requested.spark_ranks();
     let format = if exl3 { "exl3" } else if nvfp4 { "nvfp4" } else { "fp8" };
     let package = if exl3 { format!("step5:{}", model.exl3_package().context("Step-5 EXL3 expert tiers")?) }
         else { format!("step5:{format}") };
-    let worlds = cuteafd_core::tp_units::frozen_admitted_worlds("step5", format)
-        .unwrap_or_else(|| cuteafd_core::tp_units::spark_package_worlds("step5", format));
-    // The recipe names an impossible Spark count first; a valid count a
-    // frozen format never shipped on refuses with its deprecation.
     if spark_ranks > 0 {
         crate::plan::experts::spark_recipe(&package, 1536, spark_ranks)?;
     }
-    if let Some(refusal) = (spark_ranks > 0).then(|| crate::plan::experts::frozen_refusal(&package, spark_ranks)).flatten() {
-        anyhow::bail!("Step-5 layout is unqualified: {refusal}");
-    }
     ensure!(
         exl3 || nvfp4 || model.formats.iter().any(|f| f == "fp8-block128"),
-        Unqualified("BF16 target format")
+        Unsupported("BF16 routed experts: no native BF16 expert execution kernel; use FP8, NVFP4 or EXL3 expert tensors")
     );
-    ensure!(
-        matches!(coordinators, 1 | 2) && opts.rtx_bytes.len() == coordinators
-            && (spark_ranks == 0 || worlds.contains(&spark_ranks))
-            && opts.rtx_bytes.iter().all(|&bytes| bytes > 32 << 30),
-        Unqualified("coordinator/Spark count or 5090")
-    );
+    ensure!(matches!(coordinators, 1 | 2),
+        Unsupported("more than two coordinator GPUs; native execution owns one or two ranks"));
     ensure!(
         opts.head_split
             && report
                 .requested_attention
                 .is_none_or(|a| a == AttentionPlacement::Heads),
-        Unqualified("two-GPU execution requires head-split SWA with whole-owned CSA; all-whole SWA has no routed reply reuse proof")
+        Unsupported("attention placement other than heads: SWA uses split heads and CSA uses whole owners")
     );
     ensure!(
         !opts.host_embedding
             && opts.drafter_bytes == 0
-            && report.vision == MediaMode::Off
             && report.audio == MediaMode::Off,
-        Unqualified("host embedding, draft or media owners")
+        Unsupported("host embedding, external draft or audio owners")
     );
     let shape = crate::plan::layout::resolve_prefill(input, report, opts, spark_ranks,
         crate::plan::Family::prefill_limits(&super::STEP5))?;
@@ -79,11 +63,11 @@ pub(super) fn layout(
     let sequences = usize::try_from(opts.resolved_concurrency("step5"))?;
     ensure!(
         opts.state_slots.is_none_or(|n| n == sequences as u64),
-        Unqualified("sequence-slot mismatch")
+        Unsupported("sequence-slot mismatch")
     );
     ensure!(
         opts.prefix_slots.is_none(),
-        Unqualified("explicit prefix slots; use mark entries/budget")
+        Unsupported("explicit prefix slots; use mark entries/budget")
     );
     let context = if opts.context_tokens == 0 {
         model.cfg.max_context
@@ -183,7 +167,7 @@ pub(super) fn layout(
         spark_ranks,
         peer_access: coordinators == 2,
     };
-    let inputs = RuntimeInputs { spark_bytes: opts.spark_capacities(spark_ranks), graph_layout: crate::serving_capacity::step5_graphs::Step5GraphLayout::resolve(
+    let mut inputs = RuntimeInputs { vision: None, spark_owners: Vec::new(), spark_bytes: opts.spark_capacities(spark_ranks), graph_layout: crate::serving_capacity::step5_graphs::Step5GraphLayout::resolve(
             &catalog, &contract, coordinators, spark_ranks), decode_graphs: opts.step5_decode_graphs, host: super::admission::HostInputs::from_contract(&contract, &model.cfg, coordinators,
             crate::plan::layout::recipe_host_memory(opts)?, opts.host_cache_bytes, 8 << 30)?, resident_weight_limit: Some(ResidentWeights(opts.weight_budget_bytes)), spark_reply_format: opts.resolved_spark_reply_format(false),
                 kv_format: opts.step5_kv, bf16_target_head: opts.bf16_target_head,
@@ -193,7 +177,7 @@ pub(super) fn layout(
         unit: checked_rows,
         sequences,
         context, serving_context: crate::placement::planner::Context::resolve(context, (opts.context_tokens > 0).then_some(opts.context_tokens)),
-        requested_pool: opts.pool_tokens,
+        requested_pool: opts.pool_tokens, target_pool: opts.target_pool_tokens,
         marks: MarkRule {
             lanes: sequences,
             entries: usize::try_from(opts.prefix_entries("step5"))?,
@@ -205,6 +189,10 @@ pub(super) fn layout(
         onboard: super::admission::OnboardInputs::new(input.expert_catalog()?, opts.workspace_manifest.as_deref(),
             checked_rows, coordinators, waves, opts.resolve_onboard(catalog.routed_experts().routed_layers()).unwrap_or(Onboard::Auto))?,
     };
+    inputs.spark_owners = admission::spark_owners(catalog, &inputs)?;
+    inputs.vision = crate::placement::still_encoder::StillEncoder::planned(input.checkpoint(),
+        report.vision, opts.vision_replicas, &crate::placement::families::step5::budgets(&inputs)?,
+        opts.media_cache_bytes.unwrap_or(256 << 20))?;
     let admitted = admission::admit_mtp_with_contract(input.checkpoint(), &inputs, opts.native_mtp_layers, &contract)?;
     for rank in 0..coordinators {
         let layout = super::coordinator::RankWeightLayout::from_contract(&contract, &model.cfg, rank,
@@ -214,6 +202,7 @@ pub(super) fn layout(
     let mtp = super::coordinator::RankWeightLayout::mtp_from_contract(input.checkpoint(), &contract,
         opts.native_mtp_layers)?;
     native_selection.validate_layout(&mtp, checked_rows)?;
+    report.encoder = inputs.vision.as_ref().and_then(|vision| vision.admitted(&admitted.solved));
     report.phase_ledger = Some(crate::plan::SolvedPhaseLedger::from(&admitted.solved));
     let mut host_items: Vec<_> = [planner::Location::HOST, planner::Location::PINNED].into_iter()
         .map(|location| admitted.solved.items(location)).collect::<Result<Vec<_>, _>>()?
@@ -240,7 +229,7 @@ pub(super) fn layout(
             .sum(),
     );
     let mut memory = MemoryLayout { devices: Vec::new(), pool_tokens: admitted.placement.pool_tokens,
-        waste: vec![], notes: vec![format!("Step-5: exact native allocation owners; decode graphs {}; {} native MTP stages; eager prefill; no media", opts.step5_decode_graphs, opts.native_mtp_layers),
+        waste: vec![], notes: vec![format!("Step-5: exact native allocation owners; decode graphs {}; {} native MTP stages; eager prefill; shared packed PE owner", opts.step5_decode_graphs, opts.native_mtp_layers),
             "Offline CUDA/code baseline is estimated; serving must re-admit against pre-weight live samples and native export ABIs".into(),
             format!("{}; {sequences} sequences, request context {}, compiled extent {}",
                 if coordinators == 2 { "SWA head split, complete-cost contiguous CSA owners" } else { "Single-device SWA and CSA ownership" },
@@ -313,44 +302,10 @@ pub(super) fn layout(
             .bytes_by_owner
             .entry("routed expert weights".into())
             .or_default() += assignment.resident_bytes;
-        let io = assignment.io;
-        let mut device = DeviceLayout {
-            kind: DeviceKind::Spark,
-            index: rank as u32,
+        let location = planner::Location { device: planner::Device::Spark(rank as u8), domain: planner::Domain::Managed };
+        let device = DeviceLayout { kind: DeviceKind::Spark, index: rank as u32,
             capacity_bytes: opts.spark_capacity(rank), worker_budget_bytes: opts.spark_capacity(rank),
-            kv_tokens: 0,
-            items: vec![
-                Item::new(
-                    Category::Experts,
-                    if exl3 { "EXL3 K4 experts and K6 tails" } else if nvfp4 { "native NVFP4 TP4 and BF16 tails" }
-                        else { "native FP8 TP6 and BF16 tails" },
-                    if exl3 { "MCG W4A16" } else if nvfp4 { "W4A4" } else { "W8A16" },
-                    assignment.resident_bytes,
-                    Basis::Exact,
-                ),
-                cuteafd_core::memory_layout::spark_worker_process_resident_item(),
-            ],
-        };
-        for (group, bytes) in [
-            ("expert intake", io.intake),
-            ("host expert exchange", io.host_exchange),
-            ("expert row indices", io.row_indices),
-            ("endpoint response prefixes", io.endpoint_staging),
-            ("rdma rings", io.mapped_rings),
-        ] {
-            device.items.push(Item::new(
-                Category::Transport,
-                group,
-                "BF16 ingress",
-                bytes,
-                Basis::Formula,
-            ));
-        }
-        // Unlike the legacy family wave allowances, Step-5 has no first-slot scratch reserve.
-        let backend = crate::plan::spark_executions::SparkBackend::for_catalog(input.expert_catalog()?)?;
-        let executions = crate::plan::spark_executions::admit_family("step5", &backend.exports(), None,
-            shape.unit_rows, shape.waves)?;
-        crate::plan::layout::spark_slots::charge_executions(&mut device, input, &working, "step5", &executions)?;
+            kv_tokens: 0, items: admitted.solved.items(location)? };
         memory.devices.push(device);
     }
     report.solver_placement = Some(admitted.placement);

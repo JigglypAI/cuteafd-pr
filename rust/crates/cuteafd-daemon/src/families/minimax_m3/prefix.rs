@@ -335,7 +335,7 @@ mod tests {
         let scratch = Rc::new(Allocation::new(banks[0].stream.device, 256, Tag::workspace("minimax/unit"))?);
         MiniMaxPrefix::new(banks, scratch)
     }
-    fn build(units: Vec<u32>, slot: usize) -> Placement { Placement { units, slot, len: 0 } }
+    fn build(units: Vec<u32>, slot: usize) -> Placement { Placement { media_spans: Vec::new(), units, slot, len: 0 } }
     fn read_page(family: &MiniMaxPrefix<'_>, page: u32) -> Result<Vec<Vec<u8>>> {
         family.0.copies.drain()?;
         let mut out = Vec::new();
@@ -461,7 +461,7 @@ mod tests {
                         let staging = library.ordered_h2d_staging_buffer(destination, stream)?.unwrap();
                         assert_eq!(staging.bytes, destination.bytes);
                         for len in [0, 1, 64, 65, 128] {
-                            bank.install(&Placement { units: vec![0, 1], slot, len }, stream)?;
+                            bank.install(&Placement { media_spans: Vec::new(), units: vec![0, 1], slot, len }, stream)?;
                         }
                         assert_eq!(library.ordered_h2d_staging_buffer(destination, stream)?.unwrap().ptr,
                             staging.ptr);
@@ -470,11 +470,11 @@ mod tests {
                 Ok(())
             })?;
         }
-        for placement in [Placement { units: vec![0, 0], slot: 0, len: 65 },
-            Placement { units: vec![12], slot: 0, len: 1 },
-            Placement { units: vec![0], slot: 4, len: 1 },
-            Placement { units: vec![0], slot: 0, len: 65 },
-            Placement { units: vec![], slot: 0, len: 0 }] {
+        for placement in [Placement { media_spans: Vec::new(), units: vec![0, 0], slot: 0, len: 65 },
+            Placement { media_spans: Vec::new(), units: vec![12], slot: 0, len: 1 },
+            Placement { media_spans: Vec::new(), units: vec![0], slot: 4, len: 1 },
+            Placement { media_spans: Vec::new(), units: vec![0], slot: 0, len: 65 },
+            Placement { media_spans: Vec::new(), units: vec![], slot: 0, len: 0 }] {
             assert!(family.install(&placement).is_err());
         }
         family.0.copies.drain()?;
@@ -609,6 +609,76 @@ mod tests {
         cache.release(family, &partial.placement.units)?;
         cache.clear(family)?;
         assert_eq!(cache.pool().used(), 0);
+        Ok(())
+    }
+
+    /// #2342: a restore that fails after the engine bound the placement falls back
+    /// to a cold admission whose pages match a plain cold prefill row for row.
+    #[test]
+    fn failed_restore_fallback_matches_a_plain_cold_prefill() -> Result<()> {
+        let fixture = Fixture::build_for_tests()?;
+        let library = fixture.load()?;
+        fixture.immediate_copies(&library)?;
+        let family = family(&library, 12)?;
+        let mut cache = cache(&family)?;
+        let tokens = (0..65).collect::<Vec<u32>>();
+        let mut source = cache.admit(&family, &tokens, 128, false, |pages| build(pages, 0))?.placement;
+        for (index, &page) in source.units.iter().enumerate() { fill_page(&family, page, index)?; }
+        source.len = tokens.len();
+        assert!(cache.capture(&family, SnapshotKind::Prompt, &tokens, &source,
+            After::from_logits(&[0.0, 1.0], true))?);
+        cache.release(&family, &source.units)?;
+
+        // The restore attempt binds slot 1 one unit short, so the family's restore
+        // rejects the frontier after the engine already installed the placement.
+        let builds = std::cell::Cell::new(0);
+        let mut fallback = cache.admit(&family, &tokens, 128, false, |mut units| {
+            if builds.replace(builds.get() + 1) == 0 { units.truncate(1); }
+            build(units, 1)
+        })?;
+        assert_eq!((fallback.resume, cache.stats().restore_failures, builds.get()), (0, 1, 2));
+        assert_eq!(fallback.placement.len, 0);
+        let mut cold = cache.admit_cold(&family, tokens.len(), 128, |pages| build(pages, 2))?;
+        prefill(&family, &mut fallback.placement, &tokens)?;
+        prefill(&family, &mut cold.placement, &tokens)?;
+        for index in 0..tokens.len().div_ceil(64) {
+            assert_eq!(read_page(&family, fallback.placement.units[index])?,
+                read_page(&family, cold.placement.units[index])?,
+                "page {index} differs from a plain cold prefill");
+        }
+        cache.release(&family, &fallback.placement.units)?;
+        cache.release(&family, &cold.placement.units)?;
+        Ok(())
+    }
+
+    /// Writes the pages a prefill would reach from `placement.len` onward; pages
+    /// the fallback would resume past stay untouched and differ from a cold arm.
+    fn prefill(family: &MiniMaxPrefix<'_>, placement: &mut Placement, tokens: &[u32]) -> Result<()> {
+        for (index, &page) in placement.units.iter().enumerate() {
+            if index * PAGE_ROWS >= tokens.len() || (index + 1) * PAGE_ROWS <= placement.len {
+                continue;
+            }
+            if index * PAGE_ROWS < placement.len { continue; }
+            fill_page(family, page, index)?;
+        }
+        placement.len = tokens.len();
+        Ok(())
+    }
+
+    /// The page bytes a prefill of the page at logical `index` writes, keyed by
+    /// logical position so two placements with different physical pages compare.
+    fn fill_page(family: &MiniMaxPrefix<'_>, page: u32, index: usize) -> Result<()> {
+        family.0.copies.drain()?;
+        for (rank, bank) in family.0.banks.iter().enumerate() {
+            for layer in bank.layers.clone() {
+                for (plane, stride) in bank.layout.page_planes() {
+                    let bytes = (0..stride as usize).map(|i|
+                        ((i * 31 + index * 101 + layer * 7 + rank * 17) % 251) as u8).collect::<Vec<_>>();
+                    bank.stream.device.run(|| bank.stream.device.library.copy_h2d(
+                        bank.page(layer, plane, page)?, &bytes))?;
+                }
+            }
+        }
         Ok(())
     }
 }

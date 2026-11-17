@@ -11,11 +11,15 @@ ROOT = Path(__file__).resolve().parents[2]
 HELPER = ROOT / "scripts/build/compiler-cache.sh"
 
 
-def run_setup(tmp_path, extra=None, expression='env | sort'):
-    env = {key: value for key, value in os.environ.items()
+def clean_env():
+    return {key: value for key, value in os.environ.items()
            if not key.startswith(("CUTEAFD_KACHE", "KACHE_", "CUTEAFD_SCCACHE", "SCCACHE_")) and key not in
            ("RUSTC_WRAPPER", "RUSTC_WORKSPACE_WRAPPER", "CC", "CXX",
             "CMAKE_C_COMPILER_LAUNCHER", "CMAKE_CXX_COMPILER_LAUNCHER", "CMAKE_CUDA_COMPILER_LAUNCHER")}
+
+
+def run_setup(tmp_path, extra=None, expression='env | sort'):
+    env = clean_env()
     env.update(extra or {})
     return subprocess.run(["bash", "-c", f'set -eu; source "{HELPER}"; '
                            'cuteafd_compiler_cache_setup "$1"; ' + expression,
@@ -247,7 +251,7 @@ def test_cmake_opt_out_clears_persisted_cache_launcher(tmp_path):
     (native / "CMakeCache.txt").write_text(f'CMAKE_C_COMPILER_LAUNCHER:STRING={HELPER}\n')
     result = subprocess.run(["bash", "-c", f'source "{HELPER}"; unset CUTEAFD_KACHE_MODE; '
                              'cuteafd_compiler_cache_cmake_args "$1"', "test", str(native)],
-                            text=True, capture_output=True, check=True)
+                            env=clean_env(), text=True, capture_output=True, check=True)
     assert result.stdout.splitlines() == ["-DCMAKE_C_COMPILER_LAUNCHER="]
 
 
@@ -380,6 +384,7 @@ def test_provenance_records_fallback_and_hash(tmp_path):
     binary.write_bytes(b"test binary")
     warning = tmp_path / "warned"
     warning.mkdir()
+    (warning / "first-failure").write_text("exit 42: cache fault\n")
     destination = tmp_path / "seal.json"
     subprocess.run(["python3", str(ROOT / "scripts/build/write-compiler-provenance.py"),
                     str(tmp_path), str(binary), str(destination)],
@@ -438,3 +443,53 @@ def test_managed_cache_preserves_other_launchers(tmp_path, language):
                                  "PATH": str(tmp_path) + os.pathsep + os.environ["PATH"]},
                        'cuteafd_compiler_cache_cmake_args "$1/native"')
     assert f"-DCMAKE_{language}_COMPILER_LAUNCHER=/custom/launcher" in result.stdout
+
+
+@pytest.mark.parametrize('status', [124, 137])
+def test_cache_timeout_is_isolated_to_one_compile(tmp_path, status):
+    binary = tmp_path / 'kache'
+    count = tmp_path / 'calls'
+    binary.write_text(f'''#!/bin/sh
+if [ "$1" = --version ]; then exit 0; fi
+printf 'cached\\n' >>"{count}"
+if [ ! -e "{count}.once" ]; then touch "{count}.once"; exit {status}; fi
+exec "$@"
+''')
+    binary.chmod(0o755)
+    result = run_setup(tmp_path, {'CUTEAFD_KACHE': str(binary),
+                                 'CUTEAFD_KACHE_CACHE_DIR': str(tmp_path / 'cache')},
+                       '"$RUSTC_WRAPPER" /bin/true; "$RUSTC_WRAPPER" /bin/true; '
+                       'test ! -e "$CUTEAFD_KACHE_WARNING_DIR/first-failure"')
+    assert count.read_text().splitlines() == ['cached', 'cached']
+    assert 'later invocations remain cached' in result.stderr
+    receipts = list((tmp_path / 'build/compiler-cache/warned/timeouts').iterdir())
+    assert len(receipts) == 1 and f'exit {status} (plain 0' in receipts[0].read_text()
+
+
+def test_default_cache_timeout_has_cold_compile_margin(tmp_path):
+    binary = tmp_path / 'bin'
+    binary.mkdir()
+    timeout = binary / 'timeout'
+    calls = tmp_path / 'timeouts'
+    timeout.write_text(f'''#!/bin/sh
+printf '%s\\n' "$*" >>"{calls}"
+case "$1" in -k) shift 3;; *) shift;; esac
+exec "$@"
+''')
+    timeout.chmod(0o755)
+    wrapper = tmp_path / 'kache'
+    wrapper.write_text('#!/bin/sh\n[ "$1" = --version ] && exit 0\nexec "$@"\n')
+    wrapper.chmod(0o755)
+    run_setup(tmp_path, {'CUTEAFD_KACHE': str(wrapper),
+                         'CUTEAFD_KACHE_CACHE_DIR': str(tmp_path / 'cache'),
+                         'PATH': str(binary) + os.pathsep + os.environ['PATH']},
+              '"$RUSTC_WRAPPER" /bin/true')
+    assert f'-k 5 900 {wrapper} /bin/true' in calls.read_text()
+
+
+def test_nested_gate_cache_config_pins_event_root(tmp_path):
+    build = tmp_path / 'build'
+    result = run_setup(tmp_path, {'CUTEAFD_KACHE': fake_kache(tmp_path),
+                                 'CUTEAFD_KACHE_CACHE_DIR': str(tmp_path / 'cache'),
+                                 'KACHE_EVENT_ROOT': '/inherited/other-build'})
+    assert f'KACHE_EVENT_ROOT={build.resolve()}\n' in result.stdout

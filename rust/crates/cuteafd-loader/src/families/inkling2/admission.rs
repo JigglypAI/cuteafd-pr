@@ -52,6 +52,9 @@ impl Coordinator {
 
 /// Every operator input admission reads, resolved once by the caller.
 pub struct FactsRequest<'a> {
+    pub vision: crate::plan::MediaMode,
+    pub vision_replicas: usize,
+    pub media_cache_bytes: Option<u64>,
     pub checkpoint: &'a crate::plan::Checkpoint,
     pub catalog: &'a crate::OfficialV41Catalog,
     pub cfg: &'a Inkling2Config,
@@ -69,6 +72,7 @@ pub struct FactsRequest<'a> {
     /// Explicit context, or 0 for the checkpoint's maximum.
     pub context_tokens: u64,
     pub pool_tokens: Option<u64>,
+    pub target_pool_tokens: Option<u64>,
     pub sequences: u64,
     pub host: (u64, u64),
     pub host_cache_bytes: Option<u64>,
@@ -195,6 +199,26 @@ pub fn spark_charges(catalog: &crate::OfficialV41Catalog, experts: &[LayerExpert
     }).collect()
 }
 
+/// One pool unit's global-layer records on each rank: a wholly owned layer
+/// carries the full page, a head- or context-split layer half of it, and a
+/// layer owned by the peer none (the shares `rank_owners` charges).
+pub(crate) fn pool_memory(cfg: &Inkling2Config, kv_format: super::InklingKvCache,
+    modes: &[crate::placement::LayerMode], page_rows: u64, capacities: &[u64])
+    -> Vec<crate::placement::PoolMemory> {
+    let record_bytes = kv_format.record_bytes(cfg.kv_heads, cfg.head_dim) as u64;
+    let rank_unit_bytes = |gpu: usize| -> u64 {
+        cfg.local.iter().zip(modes).filter(|(local, _)| !**local).map(|(_, mode)| match mode {
+            crate::placement::LayerMode::Whole { gpu: owner, .. } if usize::from(*owner) == gpu =>
+                page_rows * record_bytes,
+            crate::placement::LayerMode::Whole { .. } => 0,
+            crate::placement::LayerMode::HeadSplit | crate::placement::LayerMode::ContextSplit =>
+                page_rows * record_bytes / 2,
+        }).sum()
+    };
+    capacities.iter().enumerate().map(|(gpu, &available_bytes)|
+        crate::placement::PoolMemory { available_bytes, bytes_per_unit: rank_unit_bytes(gpu) }).collect()
+}
+
 /// Gather every admitted owner fact into the shared recipe.
 pub fn gather(request: &FactsRequest<'_>) -> Result<InklingInputs, Refused> {
     let cfg = request.cfg;
@@ -295,25 +319,31 @@ pub fn gather(request: &FactsRequest<'_>) -> Result<InklingInputs, Refused> {
         super::weight_layout::push_host_envelope(&catalog, backings, gpus).map(Some)
     }).collect::<anyhow::Result<Vec<_>>>().map_err(|error| refused(format!("Inkling push host inventory refused: {error:#}"),
         "Provide complete native push source/descriptor headers."))?;
-    let physical = (0..gpus).map(|gpu| request.coordinator.physical(gpu)).collect::<Vec<_>>();
-    let maximum_pool_tokens = crate::placement::PoolPolicy::resolve(&physical, context, request.pool_tokens,
-        page_rows).maximum_tokens();
+    let capacities = (0..gpus).map(|gpu| request.coordinator.budget(gpu).logical_bytes).collect::<Vec<_>>();
+    let mut pool_facts = crate::placement::PoolFacts::new(Context::resolve(context, (request.context_tokens > 0).then_some(request.context_tokens)), request.pool_tokens, page_rows);
+    pool_facts.memory = pool_memory(cfg, request.kv_format, &modes, page_rows, &capacities);
+    pool_facts.target = request.target_pool_tokens;
+    let pool = crate::placement::prepare_pool(pool_facts).map_err(|error|
+        refused(format!("invalid KV pool policy: {error}"), "Set KV min <= target <= max."))?;
+    let vision = crate::placement::still_encoder::StillEncoder::planned(request.checkpoint,
+        request.vision, request.vision_replicas, &budgets, request.media_cache_bytes.unwrap_or(256 << 20))
+        .map_err(|error| refused(format!("Inkling vision inventory refused: {error:#}"), "Provide the bundled PE tensors."))?;
     let prefix_mark_slots=super::draft::prefix_mark_slots(request.sequences,request.prefix_entries,
         mark_bytes,draft_mark,request.prefix_mark_budget,host_prefix.quota_bytes>0)
         .map_err(|error|refused(format!("Inkling prefix slots refused: {error:#}"),"Check combined mark extent."))?;
     let drafter=request.drafter.map(|selection| {
         let view=request.checkpoint.view.as_ref().context("bundled drafter needs selected checkpoint view")?;
         super::draft::DraftLayout::new(view,gpus,usize::try_from(request.sequences)?,
-            usize::try_from(request.sequences)?.min(8),usize::try_from(context)?,usize::try_from(maximum_pool_tokens)?,
+            usize::try_from(request.sequences)?.min(8),usize::try_from(context)?,usize::try_from(pool.maximum_tokens())?,
             usize::try_from(shape.rows)?,usize::try_from(shape.waves)?,selection.sms,selection.kv_cache)
             .map(|layout|shared::Drafter{layout})
     }).transpose().map_err(|error|refused(format!("bundled drafter inventory refused: {error:#}"),"Check MTP tensor headers and exports."))?;
     Ok(InklingInputs { cfg: cfg.clone(), kv_format: request.kv_format, gpus, spark_ranks: ranks,
         context: Context::resolve(context, (request.context_tokens > 0).then_some(request.context_tokens)),
-        maximum_pool_tokens, prefill: shape, sequences: request.sequences, prefix_entries: request.prefix_entries,
+        pool, prefill: shape, sequences: request.sequences, prefix_entries: request.prefix_entries,
         prefix_mark_budget: request.prefix_mark_budget, prefix_mark_slots, targets, placement, modes,
         routed: routed.clone(), experts, local, spark, links,
-        spark_reply_formats: request.replies, drafter, vision: None, budgets, code, graph_reserve,
+        spark_reply_formats: request.replies, drafter, vision, budgets, code, graph_reserve,
         head: request.head, host_prefix, device_sampling: true,
         expert_usage: request.expert_usage.then(|| cuteafd_core::expert_usage::Geometry { layers: cfg.layers,
             experts: cfg.experts, topk: cfg.topk, routed_layers: routed }),

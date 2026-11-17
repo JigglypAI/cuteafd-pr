@@ -196,17 +196,21 @@ impl<'a> DualAttentionWave<'a> {
         let owner=wave.halves[0].device;
         owner.run(||unsafe {
             tail.restore_warmup()?;
-            ticket.capture_result(crate::shared::decode_graph::begin_capture(&library, stream, &ticket))?;
-            let queued=tail.enqueue(&attention,stream);
-            let captured={ let captured = crate::shared::decode_graph::end_capture(&library, stream, &mut ticket); ticket.capture_result(captured) };
-            let (graph,nodes,width,spans,inspection)=match (queued,captured) {
-                (Ok(()),Ok(graph))=>graph,
-                (Err(error),Ok((graph,_,_,_,_)))=> { library.cuda_graph_exec_destroy(graph)?;return Err(error); },
-                (Ok(()),Err(error)) if cuteafd_ffi::is_small_graph(&error) => {
-                    // Warmup restored host tail state; complete that same tail eagerly.
-                    return tail.enqueue(&attention, stream);
+            let checkpoint = tail.checkpoint();
+            let recorded = crate::shared::decode_graph::capture_transaction(tail, checkpoint, |tail| {
+                ticket.capture_result(crate::shared::decode_graph::begin_capture(&library, stream, &ticket))?;
+                let queued=tail.enqueue(&attention,stream);
+                let captured={ let captured = crate::shared::decode_graph::end_capture(&library, stream, &mut ticket); ticket.capture_result(captured) };
+                match (queued,captured) {
+                    (Ok(()),Ok(graph))=>Ok(graph),
+                    (Err(error),Ok((graph,_,_,_,_)))=> { library.cuda_graph_exec_destroy(graph)?;Err(error) },
+                    (Err(error),Err(_)) | (Ok(()),Err(error))=>Err(error),
                 }
-                (Err(error),Err(_)) | (Ok(()),Err(error))=>return Err(error),
+            }, |tail, checkpoint| tail.rollback(checkpoint));
+            let (graph,nodes,width,spans,inspection) = match recorded {
+                Ok(graph) => graph,
+                Err(error) if cuteafd_ffi::is_small_graph(&error) => return tail.enqueue(&attention, stream),
+                Err(error) => return Err(error),
             };
             if let Some(error) = inspection { tracing::warn!(%error, "dual attention tail topology inspection failed"); }
             // SAFETY: the enclosing lane retains tail weights and storage and

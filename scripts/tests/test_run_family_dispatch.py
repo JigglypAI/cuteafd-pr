@@ -972,9 +972,18 @@ def _family_launch_result(tmp_path: Path, family_config: dict, model: str, keys:
         (repo / "scripts" / "build" / "verify-sparkinfer-source.py").write_text("print('test-pin')\n")
     hf = tmp_path / "hf"
     _snapshot(hf, model, family_config, "a" * 40 if native_v41 else "abc")
+    if family_config.get("model_type") == "mimo_v2":
+        (hf / "hub" / f"models--{model.replace('/', '--')}" / "snapshots/abc/dflash").mkdir(exist_ok=True)
+
     if "CORE_VIEW=k6-compact" in keys:
         selected = hf / "hub" / f"models--{model.replace('/', '--')}" / "snapshots" / ("a" * 40 if native_v41 else "abc")
         (selected / "config.k6.json").write_text(json.dumps(family_config))
+    if "SPECULATOR_MODEL_ID=test/draft" in keys:
+        _snapshot(hf, "test/draft", {"speculators_model_type":"dspark"})
+    if model == "wrldsuksgo2mars/Kimi-K3.1-Pro-EXL3-K2-MC" and not (
+            hf / "hub/models--Inferact--Kimi-K3.1-Pro-DSpark").exists():
+        _snapshot(hf, "Inferact/Kimi-K3.1-Pro-DSpark", {"speculators_model_type": "dspark"},
+                  "c197a09072916cf63172df2d9d4baef0b77ed83a")
     if checkpoint_source is not None:
         staged = hf / "hub" / f"models--{model.replace('/', '--')}" / "snapshots" / ("a" * 40 if native_v41 else "abc")
         # Header fixtures have huge sparse tensor payloads; never materialize them.
@@ -1090,16 +1099,21 @@ if "--resolve-settings-only" in args:
     checkpoint = json.loads(os.environ["STUB_CHECKPOINT"])
     if checkpoint.get("model_type", "") in ("kimi_k3", "kimi_k31"):
         selected = args[args.index("--speculator") + 1] if "--speculator" in args else "off"
-        if selected == "auto": selected = "off"
+        if selected == "auto":
+            def option(flag, default): return args[args.index(flag) + 1] if flag in args else default
+            qualified = (option("--checkpoint-model-id", "") == "wrldsuksgo2mars/Kimi-K3.1-Pro-EXL3-K2-MC"
+                and option("--rtx", "1") in ("1", "2") and option("--core-view", "original") in ("original", "k6-compact")
+                and option("--kv-cache", "fp8") == "fp8" and option("--draft-kv-cache", "fp8") in ("fp8", "bf16"))
+            selected = "dspark" if qualified else "off"
         if selected not in ("off", "dflash2", "dspark"):
             print(f"SPECULATOR={selected} does not apply to kimi_k3", file=sys.stderr)
             sys.exit(2)
         print(json.dumps(dict(speculator=selected, default_drafter="Inferact/Kimi-K3.1-Pro-DSpark",
-            default_drafter_revision="e4e6e6261e9f8b6d5f249f9627eb6b109d762d5f")))
+            default_drafter_revision="c197a09072916cf63172df2d9d4baef0b77ed83a")))
         sys.exit(0)
     if checkpoint.get("model_type", "").startswith("mimo"):
         selected = "off"
-        if (args[args.index("--checkpoint-model-id") + 1] if "--checkpoint-model-id" in args else None) in ("XiaomiMiMo/MiMo-V2.6-Flash-MOPD", "XiaomiMiMo/MiMo-V2.6-Pro-MOPD"):
+        if (Path(os.environ["STUB_CONFIG_PATH"]).parent / "dflash").is_dir():
             selected = "dflash2"
     else:
         selected = "dflash2" if (hf / "hub/models--incoai--GLM-5.3-Flash-DFlash2").is_dir() else "off"
@@ -1301,8 +1315,10 @@ def _assert_real_deployment_ledger(deployment: dict) -> None:
             placement = role.get(field)
             if placement is None:
                 continue
-            weights = [item for item in device["items"]
-                       if item["group"] in (f"{prefix} weights", f"{prefix} tower")]
+            if prefix == "vision":
+                assert not any(item["group"] in ("vision weights", "vision tower") for item in device["items"]), (role, device)
+            weight_groups = ("vision packed weight arena",) if prefix == "vision" else ("audio weights", "audio tower")
+            weights = [item for item in device["items"] if item["group"] in weight_groups]
             scratch = [item for item in device["items"] if item["group"] == f"{prefix} scratch"]
             overhead = [item for item in device["items"] if item["group"] == f"{prefix} CUDA overhead"]
             assert len(weights) == 1 and weights[0]["bytes"] == placement["weights"], (role, device)
@@ -1327,13 +1343,13 @@ def _shared_tower_expert_deployment() -> dict:
             "memory_layout": {"devices": [{"kind": "spark", "index": 2,
                 "worker_budget_bytes": 100, "items": [
                     {"group": "routed_expert", "bytes": 30},
-                    {"group": "vision weights", "bytes": 20},
+                    {"group": "vision packed weight arena", "bytes": 20},
                     {"group": "vision scratch", "bytes": 6},
                     {"group": "vision CUDA overhead", "bytes": 2}]}]}}
 
 
 @pytest.mark.parametrize("defect", ["duplicate_device", "missing_device", "missing_ceiling",
-                                  "duplicate_weights", "duplicate_scratch", "wrong_scratch"])
+                                  "duplicate_weights", "duplicate_scratch", "wrong_scratch", "legacy_weights", "legacy_tower", "wrong_weights"])
 def test_real_deployment_ledger_rejects_inconsistent_physical_owners(defect):
     deployment = _shared_tower_expert_deployment()
     devices = deployment["memory_layout"]["devices"]
@@ -1348,6 +1364,10 @@ def test_real_deployment_ledger_rejects_inconsistent_physical_owners(defect):
         device["items"].append(device["items"][1].copy())
     elif defect == "duplicate_scratch":
         device["items"].append(device["items"][2].copy())
+    elif defect in ("legacy_weights", "legacy_tower"):
+        device["items"][1]["group"] = "vision weights" if defect == "legacy_weights" else "vision tower"
+    elif defect == "wrong_weights":
+        device["items"][1]["bytes"] += 1
     else:
         device["items"][2]["bytes"] += 1
     with pytest.raises(AssertionError):
@@ -1403,7 +1423,8 @@ def capture_resolver_config_parity(snapshot: Path, example: Path, binary: Path,
     hub = temporary / "hf/hub"
     hub.mkdir(parents=True)
     for model in (config.get("SPECULATOR_MODEL_ID"), "incoai/GLM-5.3-Flash-DFlash2",
-                  "incoai/GLM-5.3-DFlash2", "nvidia/Muse-Spark-Open-816B-A42B-DFlash2"):
+                  "incoai/GLM-5.3-DFlash2", "nvidia/Muse-Spark-Open-816B-A42B-DFlash2",
+                  "Inferact/Kimi-K3.1-Pro-DSpark"):
         if model:
             cache = "models--" + model.replace("/", "--")
             source = hf_home / "hub" / cache
@@ -1412,15 +1433,16 @@ def capture_resolver_config_parity(snapshot: Path, example: Path, binary: Path,
     keys = "\n".join(line for line in raw.splitlines()
                      if not line.startswith(("MODEL_ID=", "MODEL_REVISION="))) + "\nMODEL_REVISION=\n"
     output = temporary / "resolver-deployment.json"
+    identity = config.get("MODEL_ID", "test/resolver-parity")
     result = _family_launch_result(temporary, json.loads((snapshot / "config.json").read_text()),
-        "test/resolver-parity", keys, physical_gpus=tuple(range(gpus)), root_launcher=True,
+        identity, keys, physical_gpus=tuple(range(gpus)), root_launcher=True,
         cuda_total_bytes=101_973_491_712, gpu_free_mib=98304,
         extra_args=("--wip", "real-planner-test"), extra_env={
             "STUB_REAL_PLANNER": str(binary), "STUB_REAL_SNAPSHOT": str(snapshot),
             "STUB_REAL_PROGRAMS": str(programs), "STUB_REAL_HF_HOME": str(hf_home),
             "STUB_REAL_PLAN_OUTPUT": str(output), "CUTEAFD_CDI_CHECK": "off",
             "STUB_SPARK_ROLES": f"tp{config['SPARK_COUNT']}",
-            "STUB_SERVED_MODEL_ID": "test/resolver-parity"})
+            "STUB_SERVED_MODEL_ID": identity})
     assert result.returncode == 0, result.stderr
     launched = _read_real_deployment(output)
     plans = [shlex.split(line) for line in result.stderr.splitlines()
@@ -1444,7 +1466,7 @@ def capture_resolver_config_parity(snapshot: Path, example: Path, binary: Path,
     assert launched["memory_layout"]["pool_tokens"] == planned["memory_layout"]["pool_tokens"], (example.name, launched["memory_layout"]["pool_tokens"], planned["memory_layout"]["pool_tokens"])
     if example.name == "glm53-flash-exlr8-k4-min.config":
         assert onboard(planned) == 18, planned
-        assert planned["memory_layout"]["pool_tokens"] == 2_097_152, planned
+        assert planned["memory_layout"]["pool_tokens"] >= 2_097_152, planned
         assert planned["resolved_settings"]["index_cache"]["value"] == "compact"
 
 
@@ -3538,7 +3560,7 @@ def test_expert_input_is_opt_in_and_mimo_only(tmp_path):
 
 
 @pytest.mark.parametrize("key", ["SPECULATOR_FP8"])
-@pytest.mark.parametrize("value, expected", [(None, None), ("", None), ("auto", None),
+@pytest.mark.parametrize("value, expected", [(None, "true"), ("", "true"), ("auto", "true"),
                                             ("on", "true"), ("off", "false")])
 def test_mimo_drafter_precision_preserves_auto_and_forwards_explicit_conversion(tmp_path, key, value, expected):
     config = {"model_type": "mimo_v2_flash", "num_hidden_layers": 2, "moe_layer_freq": [0, 1]}
@@ -4125,14 +4147,14 @@ def test_memory_keys_are_accepted_for_cleanup_and_native_launchers(tmp_path):
 
 @pytest.mark.parametrize("keys,expected", [
     ("", "fp8"), ("SPECULATOR=dflash2\n", "fp8"),
-    ("SPECULATOR_FP8=auto\n", "checkpoint"), ("SPECULATOR_FP8=off\n", "bf16"),
+    ("SPECULATOR_FP8=auto\n", "fp8"), ("SPECULATOR_FP8=off\n", "bf16"),
     ("SPECULATOR=off\n", "off"), ("SPECULATOR=mtp\n", "mtp"),
 ])
 @pytest.mark.parametrize("draft_kv", ["bf16", "fp8"])
-def test_flash_mopd_defaults_to_its_qualified_bundled_drafter(tmp_path: Path, keys: str, expected: str, draft_kv: str) -> None:
+@pytest.mark.parametrize("model", ["XiaomiMiMo/MiMo-V2.6-Flash-MOPD", "community/MiMo-MC", "renamed/copy"])
+def test_flash_mopd_defaults_to_its_bundled_drafter(tmp_path: Path, keys: str, expected: str, draft_kv: str, model: str) -> None:
     config = {"model_type": "mimo_v2", "hidden_size": 4096, "num_hidden_layers": 2,
               "moe_layer_freq": [0, 1], "quantization_config": {"store_dtype": "mxfp4"}}
-    model = "XiaomiMiMo/MiMo-V2.6-Flash-MOPD"
     result = _family_launch_result(tmp_path, config, model, keys + f"DRAFT_KV_CACHE={draft_kv}\n")
     assert result.returncode == 0, result.stderr
     launch = next(line for line in result.stderr.splitlines() if "serve-mimo --snapshot" in line)
@@ -4144,7 +4166,7 @@ def test_flash_mopd_defaults_to_its_qualified_bundled_drafter(tmp_path: Path, ke
         assert "--draft" not in command
         assert ("--mtp 1" in launch) == (expected == "mtp")
     else:
-        assert f"--draft {tmp_path}/hf/hub/models--XiaomiMiMo--MiMo-V2.6-Flash-MOPD/snapshots/abc" in launch
+        assert f"--draft {tmp_path}/hf/hub/models--{model.replace('/', '--')}/snapshots/abc" in launch
         if expected == "checkpoint":
             assert "--draft-representation checkpoint" in launch and "--draft-fp8" not in launch
         else:
@@ -4159,7 +4181,7 @@ def test_flash_mopd_external_drafter_does_not_inherit_bundled_precision(tmp_path
     assert result.returncode == 0, result.stderr
     launch = next(line for line in result.stderr.splitlines() if "serve-mimo --snapshot" in line)
     assert "models--test--external-draft/snapshots/abc" in launch
-    assert "--draft-fp8" not in launch
+    assert "--draft-fp8 true" in launch
 
 
 def test_family_config_reads_share_the_stop_key_grammar() -> None:
@@ -5780,13 +5802,13 @@ def test_spark_probe_is_bounded_by_selected_count_and_restart_stops_first(tmp_pa
         stop = result.stderr.index(f"cuteafd-spark-expert-h{rank}-")
         probe_at = next(result.stderr.index(line) for line in probes if f"h{rank} " in line)
         assert stop < probe_at
-@pytest.mark.parametrize("prewarm,donor", [("on", "off"), ("off", "on")])
-def test_graph_cache_experiment_flags_are_cli_only(tmp_path, prewarm, donor):
+@pytest.mark.parametrize("prewarm,donor,lag", [("on", "off", "0"), ("off", "on", "0"), ("off", "on", "16")])
+def test_graph_cache_experiment_flags_are_cli_only(tmp_path, prewarm, donor, lag):
     config = {"model_type": "glm5_next", "num_hidden_layers": 2,
               "mlp_layer_types": ["sparse"] * 2,
               "layer_types": ["linear_attention", "deepseek_sparse_attention"]}
     result = _family_launch_result(tmp_path, config, "test/glmf",
-        f"RTX_GPUS=1\nGRAPH_PREWARM={prewarm}\nGRAPH_DONOR_ALWAYS={donor}\n")
+        f"RTX_GPUS=1\nGRAPH_PREWARM={prewarm}\nGRAPH_DONOR_ALWAYS={donor}\nGRAPH_DONOR_COLD_LAG={lag}\n")
     assert result.returncode == 0, result.stderr
     serve = shlex.split(next(line for line in result.stderr.splitlines()
         if "serve-glmf" in line and "--snapshot" in line))
@@ -5794,6 +5816,27 @@ def test_graph_cache_experiment_flags_are_cli_only(tmp_path, prewarm, donor):
     assert ("--graph-donor-always" in serve) == (donor == "on")
     assert "CUTEAFD_GRAPH_PREWARM" not in result.stderr
     assert "CUTEAFD_GRAPH_DONOR_ALWAYS" not in result.stderr
+    assert ("--graph-donor-cold-lag" in serve) == (lag != "0")
+    if lag != "0":
+        assert serve[serve.index("--graph-donor-cold-lag") + 1] == lag
+    assert "CUTEAFD_GRAPH_DONOR_COLD_LAG" not in result.stderr
+
+
+@pytest.mark.parametrize("lag,donor,error", [
+    ("16", "off", "requires GRAPH_DONOR_ALWAYS=on"),
+    ("-1", "on", "must be a non-negative integer"),
+    ("1.5", "on", "must be a non-negative integer"),
+    ("cold", "on", "must be a non-negative integer"),
+])
+def test_graph_donor_cold_lag_refuses_invalid_launch(tmp_path, lag, donor, error):
+    config = {"model_type": "glm5_next", "num_hidden_layers": 2,
+              "mlp_layer_types": ["sparse"] * 2,
+              "layer_types": ["linear_attention", "deepseek_sparse_attention"]}
+    result = _family_launch_result(tmp_path, config, "test/glmf",
+        f"RTX_GPUS=1\nGRAPH_DONOR_ALWAYS={donor}\nGRAPH_DONOR_COLD_LAG={lag}\n")
+    assert result.returncode == 2, result.stderr
+    assert error in result.stderr
+    assert "serve-glmf --snapshot" not in result.stderr
 
 
 def test_graph_prewarm_off_refuses_unqualified_family(tmp_path):
@@ -5812,3 +5855,47 @@ def test_graph_prewarm_off_refuses_cross_device_graphs(tmp_path):
         "RTX_GPUS=2\nGRAPH_PREWARM=off\n")
     assert result.returncode == 2, result.stderr
     assert "runtime cross-device graph instantiation can deadlock" in result.stderr
+
+
+@pytest.mark.parametrize("precision,flag", [("on", "true"), ("off", "false")])
+@pytest.mark.parametrize("kv", ["bf16", "fp8"])
+def test_kimi_draft_weights_and_kv_are_independent(tmp_path, precision, flag, kv):
+    config = {"model_type":"kimi_k31","text_config":{"model_type":"kimi_linear", "num_hidden_layers":93,
+        "first_k_dense_replace":1,"moe_layer_freq":1}}
+    result = _family_launch_result(tmp_path, config, "test/kimi",
+        f"SPECULATOR=dspark\nSPECULATOR_MODEL_ID=test/draft\nSPECULATOR_FP8={precision}\nDRAFT_KV_CACHE={kv}\nVISION=off\nAUDIO=off\n")
+    assert result.returncode == 0, result.stderr
+    serve = next(line for line in result.stderr.splitlines() if "cuteafd serve-kimi" in line)
+    assert f"--draft-fp8 {flag}" in serve and f"--draft-kv-cache {kv}" in serve
+    assert shlex.split(serve).count("--draft-fp8") == 1, serve
+    plans = [line for line in result.stderr.splitlines() if "cuteafd plan" in line and "--resolve-settings-only" not in line]
+    assert plans
+    assert all("SPECULATOR_FP8" in line or "--config" in line for line in plans)
+
+
+def test_kimi_shared_speculation_trace_reaches_coordinator(tmp_path):
+    config = {"model_type":"kimi_k31","text_config":{"model_type":"kimi_linear", "num_hidden_layers":93,
+        "first_k_dense_replace":1,"moe_layer_freq":1}}
+    trace = tmp_path / "speculation.jsonl"
+    result = _family_launch_result(tmp_path, config, "test/kimi",
+        f"SPECULATOR=off\nSPECULATION_TRACE={trace}\nVISION=off\nAUDIO=off\n")
+    assert result.returncode == 0, result.stderr
+    serve = next(line for line in result.stderr.splitlines() if "cuteafd serve-kimi" in line)
+    assert f"CUTEAFD_SPECULATION_TRACE={trace}" in serve
+
+
+@pytest.mark.parametrize("layout,enabled", [("RTX_GPUS=2\n", True), ("RTX_GPUS=1\n", True),
+    ("RTX_GPUS=2\nCORE_VIEW=k6-compact\n", True), ("RTX_GPUS=2\nSPECULATOR=off\n", False),
+    ("RTX_GPUS=2\nDRAFT_KV_CACHE=fp8\n", True), ("RTX_GPUS=2\nKV_CACHE=bf16\n", False),
+    ("RTX_GPUS=2\nCOORDINATOR_SPLIT=off\n", True)])
+def test_k31_qualified_default_tracks_physical_tp_and_kv(tmp_path, layout, enabled):
+    config = {"model_type": "kimi_k31", "text_config": {"model_type": "kimi_linear", "num_hidden_layers": 93,
+        "first_k_dense_replace": 1, "moe_layer_freq": 1}}
+    result = _family_launch_result(tmp_path, config, "wrldsuksgo2mars/Kimi-K3.1-Pro-EXL3-K2-MC",
+        layout + "VISION=off\nAUDIO=off\n", physical_gpus=(0, 1))
+    assert result.returncode == 0, result.stderr
+    launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-kimi" in line)
+    assert ("--draft " in launch) == enabled, launch
+    if enabled:
+        assert "--draft-kv-cache fp8" in launch
+        assert "--draft-fp8 true" in launch

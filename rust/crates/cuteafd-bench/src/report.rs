@@ -30,6 +30,8 @@ pub struct Report {
     /// Absent in historical reports that used synthetic prompts.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt_content: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prelude: Option<Value>,
     pub id: String,
     /// RFC 3339 UTC.
     pub created: String,
@@ -848,6 +850,14 @@ pub struct PrefillShape {
 /// One streamed request as the client saw it.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct StreamTiming {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub opening: String,
+    #[serde(default)]
+    pub tokens_per_cycle: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub speculation: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cycles_unavailable: Option<String>,
     pub prompt_tokens: u64,
     pub completion_tokens: u64,
     #[serde(default)]

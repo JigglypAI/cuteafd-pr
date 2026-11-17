@@ -67,7 +67,8 @@ impl<'a> Head<'a> {
     /// head's <=64-row token/normalization storage. `first` is metadata scratch
     /// until segment_metadata publishes convolution starts before attention.
     pub fn embed_unit(&self, k: &Kernels<'a>, owner: &UnitOwner<'a>, target: &TargetWeights<'_>,
-        cfg: &Inkling2Config, tokens: &[u32], uploads: &mut crate::shared::token_table::RetainedUploads<'a>) -> Result<()> {
+        cfg: &Inkling2Config, tokens: &[u32], media: &cuteafd_engine::media::MediaChunk,
+        uploads: &mut crate::shared::token_table::RetainedUploads<'a>) -> Result<()> {
         ensure!(!tokens.is_empty() && tokens.len() <= owner.layout.rows
             && tokens.iter().all(|&token| (token as usize) < cfg.unpadded_vocab_size)
             && owner.stream.raw == self.stream.raw && owner.stream.device.id == self.stream.device.id,
@@ -80,12 +81,21 @@ impl<'a> Head<'a> {
                 uploads.upload(owner.buffer("first")?, &bytes, self.stream.raw)?;
                 self.stream.device.library.cuda_embedding_lookup_bf16_async(target.operand("model.llm.embed.weight")?.buffer,
                     owner.buffer("first")?, owner.buffer("projection_input")?, tokens.len(), cfg.vocab_size, cfg.hidden, self.stream.raw)?;
+            }
+            // SAFETY: admitted planes and the retained unit stream order gather
+            // before the exact widening of the text embeddings.
+            unsafe {
                 self.stream.device.library.cuda_zero_bytes_async(owner.buffer("branch")?, tokens.len()*cfg.hidden*4, self.stream.raw)?;
                 self.stream.device.library.cuda_accumulate_bf16_to_f32_async(owner.buffer("projection_input")?, owner.buffer("branch")?,
                     tokens.len()*cfg.hidden, self.stream.raw)?;
             }
             k.norm(owner, owner.buffer("branch")?, target.operand("model.llm.embed_norm.weight")?.buffer,
-                owner.buffer("partial")?, false, Precision::F32, tokens.len())
+                owner.buffer("partial")?, false, Precision::F32, tokens.len())?;
+            // Vendor Inkling2 embed_input_ids normalizes text before merging
+            // projected image features (vLLM d664cd1e model.py:663-671).
+            crate::shared::vision::still::inject_f32(&owner.stream, media, owner.buffer("branch")?,
+                owner.buffer("route_ids")?, owner.buffer("projection_input")?, owner.buffer("partial")?,
+                tokens.len(), cfg.hidden)
         })
     }
     pub fn project(&self, k: &Kernels<'a>, owner: &impl UnitBuffers<'a>, target: &TargetWeights<'_>,
@@ -149,4 +159,17 @@ impl<'a> Head<'a> {
 }
 impl Drop for Head<'_> {
     fn drop(&mut self) { self.stream.drain_or_abort("Inkling head handle/workspace retirement"); }
+}
+
+
+#[cfg(test)]
+mod media_tests {
+    #[test]
+    fn vendor_image_rows_replace_normalized_text_without_a_second_norm() {
+        let source = include_str!("head.rs").split("#[cfg(test)]").next().unwrap();
+        let unit = source.split("pub fn embed_unit(").nth(1).unwrap().split("pub fn project(").next().unwrap();
+        assert!(unit.find("k.norm(").unwrap() < unit.find("still::inject_f32(").unwrap());
+        assert_eq!(unit.matches("k.norm(").count(),1);
+        assert!(unit.contains("owner.buffer(\"partial\")?"));
+    }
 }

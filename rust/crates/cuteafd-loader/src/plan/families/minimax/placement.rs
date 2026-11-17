@@ -91,7 +91,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
                 "Supply the bundled dspark/config.json and native safetensors headers.");return empty(notes); }
         }
     } else { None };
-    let request = FactsRequest { spark_rank_bytes: Vec::new(), checkpoint: input.checkpoint(), cfg, catalog, manifest_path: &manifest_path,
+    let request = FactsRequest { target_pool_tokens: opts.target_pool_tokens, vision: report.vision, vision_replicas: opts.vision_replicas, media_cache_bytes: opts.media_cache_bytes, spark_rank_bytes: Vec::new(), checkpoint: input.checkpoint(), cfg, catalog, manifest_path: &manifest_path,
         manifest: manifest.clone(), attention: Some(attention), split_wire: opts.minimax_split_wire, physical_devices: &physical_devices, coordinator: Coordinator::Planned { cards: cards.clone() }, spark_ranks: ranks,
         spark_bytes, prefill: shape, context_tokens: opts.context_tokens, pool_tokens: opts.pool_tokens, sequences,
         host, host_cache_bytes: opts.host_cache_bytes, prefix_entries: opts.prefix_entries("minimax_m3"), drafter,
@@ -105,8 +105,8 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
     if let LocalPackage::Missing(reason) = &inputs.local {
         notes.push(format!("MiniMax RTX onboarding unavailable: {reason}"));
     }
-    notes.push("MiniMax bundled dSpark (M8) and CLIP vision tower (M9) are declared recipe domains with their own \
-        arenas; this build has no executor for either, so the plan charges neither".into());
+    notes.push("MiniMax bundled vision uses an independent packed arena, Spark-first with RTX fallback; \
+        native production execution remains qualification-gated (#1779)".into());
     let routed = inputs.routed.len();
     let onboard = opts.resolve_onboard(routed).unwrap_or(Onboard::Auto);
     if matches!(onboard, Onboard::Layers(count) if count > 0) {
@@ -134,13 +134,13 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
         report.runtime = Some(crate::plan::RuntimeStatus::Serving);
         for component in &mut report.components {
             if component.status == crate::plan::Status::Planned && component.rejected == 0
-                && !matches!(component.component, crate::plan::spec::Component::Vision
-                    | crate::plan::spec::Component::Audio | crate::plan::spec::Component::Speculator) {
+                && !matches!(component.component, crate::plan::spec::Component::Audio | crate::plan::spec::Component::Speculator) {
                 component.status = crate::plan::Status::Ready;
             }
         }
     }
     report.phase_ledger = Some(crate::plan::SolvedPhaseLedger::from(&admitted.solved));
+    report.encoder = inputs.vision.as_ref().and_then(|vision| vision.admitted(&admitted.solved));
     report.host_budget_bytes = inputs.host_prefix.quota_bytes;
     let placed = admitted.placement;
     let onboarded = placed.onboard_layers;

@@ -1,5 +1,11 @@
 # MiniMax M3.1 Flash
 
+Automatic KV sizing uses the shared 2M-token target on every card, including
+32 GB / RTX 5090. Placement and expert onboarding are fixed at that target;
+the pool then grows into remaining admitted memory, within native encoding
+limits. `KV_MAX_TOKENS` is unset by default and can explicitly cap growth.
+See [memory policy](../options.md#memory-and-pools).
+
 Native MiniMax M3.1 Flash serves through the shared scheduler, continuous
 prefill executor, Spark exchange, exact prefix cache and device token selector.
 Qualified layouts are one RTX PRO 6000 with three Sparks or two RTX PRO 6000
@@ -16,9 +22,9 @@ older image tags. Shared settings are in [MiniMax Serving](../options.md#minimax
 Bundled native DSpark defaults on for one RTX, two-RTX Layers and two-RTX Heads:
 unset/`SPECULATOR=auto` selects `dspark`; `SPECULATOR=off` disables it. Direct
 `cuteafd serve --family minimax_m3` uses the same default, with `--dspark=false`
-as its explicit disable. MiniMax alone uses the shared concurrency-aware draft
-policy by default; explicit `DRAFT_POLICY` values still win, and `DRAFT_LENGTH`
-keeps its fixed-length override. Other families are unchanged (#2220).
+as its explicit disable. Unset `DRAFT_POLICY` resolves to `simple`, the same
+policy as every other family; `DRAFT_POLICY=shared` remains an explicit opt-in,
+and `DRAFT_LENGTH` keeps its fixed-length override (#2220).
 The example's explicit `SPECULATOR=off` stays in force until its separate line
 change joins the next placement-input publication batch; remove that line or set
 `dspark` to use the family default now. Keep `VISION=off` and `AUDIO=off`;

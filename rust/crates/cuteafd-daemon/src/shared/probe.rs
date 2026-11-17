@@ -10,6 +10,7 @@ use cuteafd_ffi::NativeLibrary;
 use std::sync::Arc;
 
 pub(crate) mod features;
+pub(crate) mod still;
 
 pub(crate) type ProbeRef = Option<Arc<Probe>>;
 
@@ -199,7 +200,7 @@ mod image_span_tests {
         use cuteafd_api::openai::probe::ProbeImageIdentity;
         let grid = ImageGrid { t: 1, h: 4, w: 4 };
         let processor = PreprocessId([2; 32]);
-        let rgb: Arc<[u8]> = Arc::from([37; 48]);
+        let rgb: Arc<[u8]> = Arc::from(vec![37; 56 * 56 * 3]);
         let key = PreparedImage::key_for(EncoderId([120; 32]), processor, grid, &rgb);
         let mut remote = PreparedImage { key: PreparedImage::key_for(EncoderId([121; 32]), processor, grid, &rgb),
             encoder: EncoderId([121; 32]), processor, grid, rgb8: rgb, pixels:cuteafd_core::media::ImagePixels::full(56,56), tokens: 6 };
@@ -212,7 +213,7 @@ mod image_span_tests {
         let markers = ImageMarkers::Rows(RowMarkers { image: 5, row_break: 4, end: 6, merge: 2, vocabulary: 32 });
         let spans = image_spans(&spec, &tokens, &[remote.clone()], markers, 16).unwrap();
         assert_eq!(spans[0].key, remote.key.into());
-        remote.rgb8 = Arc::from([38; 48]);
+        remote.rgb8 = Arc::from(vec![38; 56 * 56 * 3]);
         assert!(image_spans(&spec, &tokens, &[remote], markers, 16).is_err());
     }
 

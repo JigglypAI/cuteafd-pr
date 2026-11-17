@@ -29,9 +29,10 @@ PROGRAM_SWITCHES = dict(deepseek_v4='DSV4', glm5='GLM', glm5_flash='GLMF', mimo_
 FORMAT_ALIASES = dict(exl3='exl3', tr3='exl3', nvfp4='nvfp4', nvfp4a4='nvfp4',
                       fp8='fp8', mxfp4='fp8', bf16='fp8', native='fp8')
 # Families whose bundled vision tower runs the shared BF16 attention exports
-# (native/shared/cuda/vision_runtime.cu ABI-2 towers). MiMo's ABI-1 tower and
-# V4.1's own tower (v41_vision.cu) need none; text-only families place none.
-VISION_ATTENTION_FAMILIES = {'qwen4', 'glm5_flash', 'muse_spark', 'mistral_large4'}
+# (native/shared/cuda/vision_runtime.cu shared-runtime towers, including PE and
+# independent still towers). MiMo's ABI-1 tower and V4.1's own tower need none.
+VISION_ATTENTION_FAMILIES = {'qwen4', 'glm5_flash', 'muse_spark', 'mistral_large4',
+                             'minimax_m3', 'kimi_k3', 'inkling2', 'step5'}
 NATIVE_FAMILY_TOKENS = {'deepseek', 'glm', 'glmf', 'mimo', 'mimof', 'mimop', 'qwen', 'qwen4', 'step', 'step5'}
 NATIVE_FP8_SLUGS = {
     'deepseek-v4-flash', 'deepseek-v4-flash-0731', 'deepseek-v4-pro',

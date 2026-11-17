@@ -121,13 +121,7 @@ pub struct Drafter {
 }
 
 /// Bundled PE-Lang ViT and merge projector: own arena plus scratch.
-#[derive(Debug, Clone)]
-pub struct Vision {
-    pub arena: WeightArenaLayout,
-    pub scratch: u64,
-    /// Host embedding cache quota for prepared images.
-    pub media_cache: u64,
-}
+pub type Vision = crate::placement::still_encoder::StillEncoder;
 
 /// Everything both edges know before one solve.
 #[derive(Debug, Clone)]
@@ -137,8 +131,8 @@ pub struct InklingInputs {
     pub gpus: usize,
     pub spark_ranks: usize,
     pub context: Context,
-    /// Largest pool the build indexes (KV max), in tokens.
-    pub maximum_pool_tokens: u64,
+    /// The resolved pool policy used for both curve preparation and admission.
+    pub pool: crate::placement::PoolPolicy,
     pub prefill: PrefillShape,
     /// Boot concurrency C: per-sequence rings, conv lags, page tables, selector.
     pub sequences: u64,
@@ -279,7 +273,7 @@ fn with(mut components: Vec<Component>, activation: &Activation) -> Vec<Componen
 }
 
 impl InklingInputs {
-    pub fn maximum_pages(&self) -> u64 { self.maximum_pool_tokens.div_ceil(self.page_rows()) }
+    pub fn maximum_pages(&self) -> u64 { self.pool.maximum_tokens().div_ceil(self.page_rows()) }
 
     fn mark_bytes(&self) -> Result<u64, Refusal> {
         (0..self.cfg.layers).try_fold(0u64, |bytes, layer| {
@@ -331,7 +325,7 @@ impl InklingInputs {
     pub fn counts(&self) -> Vec<usize> { (0..=self.routed.len()).collect() }
 
     pub fn admit(&self, request: Request) -> Result<AdmittedInkling, Refusal> {
-        let solved = solve(request, self.budgets.clone(), self)?;
+        let solved = solve_prepared(request, self.budgets.clone(), self, &self.pool)?;
         let placement = self.execution(&solved)?;
         let onboard = placement.onboard_layers;
         Ok(AdmittedInkling { placement, onboard, draft_home: solved.decisions.draft_home,
@@ -688,19 +682,9 @@ impl Recipe for InklingInputs {
                     Category::Drafter,"target tap and accepted-prefix FIR owner",maximum));
             }
         }
-        // Optional bundled vision tower: own arena; `Encoder` domain [on, off].
         if let Some(vision) = &self.vision {
-            let variable = contract_variables.len();
-            contract_variables.push(Variable::Encoder(vec![0, 1]));
-            let on = Activation::choice(variable, 0);
-            let location = Location::coordinator(0);
-            components.extend(with(weight_arena_components(&vision.arena, location, Lifetime::RESIDENT, maximum,
-                MemoryKind::Weights)?, &on));
-            components.extend(buffer("inkling2.vision.scratch", location, vision.scratch, Lifetime::TARGET,
-                Category::Workspace, "vision tower scratch", maximum).map(|mut c| { c.activation = on.clone(); c }));
-            components.extend(buffer("inkling2.host.media", Location::HOST, vision.media_cache,
-                Lifetime { first: Phase::Warmup, last: Phase::Growth }, Category::Embedding, "media/embedding-cache",
-                maximum).map(|mut c| { c.activation = on.clone(); c }));
+            vision.extend(&mut contract_variables, &mut components, maximum)?;
+            vision.require_spark_worker(&contract_variables, &mut requires);
         }
         // BLAS: the BF16 vocabulary head borrows one serving-thread pool.
         if self.head.bf16() {

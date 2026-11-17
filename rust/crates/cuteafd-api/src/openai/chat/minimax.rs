@@ -1,6 +1,7 @@
 //! MiniMax M3's checkpoint template, adaptive reasoning and namespaced XML calls.
 pub mod parser;
 pub mod prompt;
+pub(crate) mod vision;
 
 use anyhow::{Context, Result};
 use serde_json::Value;

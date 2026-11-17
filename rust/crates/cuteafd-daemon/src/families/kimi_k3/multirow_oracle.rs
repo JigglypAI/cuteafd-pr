@@ -76,7 +76,7 @@ fn prepare(engine: &Engine<'_>, histories: &[usize], tokens: &[Vec<u32>])
     let mut pool = super::super::prefix::diagnostic_pool(family.layout());
     let mut placements = Vec::new();
     for (slot, &history) in histories.iter().enumerate() {
-        let mut placement = Placement { units: pool.alloc((history + 8).div_ceil(64))?,
+        let mut placement = Placement { media_spans: Vec::new(), units: pool.alloc((history + 8).div_ceil(64))?,
             slot, len: 0, state_len: 0 };
         family.bind(&mut placement).map_err(|e| anyhow::anyhow!("{e}"))?;
         for chunk in tokens[slot][..history].chunks(256) {
@@ -253,7 +253,7 @@ fn run_checkpoint(k31: bool) -> Result<()> {
         let label = format!("{:?}", view.mode());
         runtime.block_on(async {
             let loaded = super::super::startup::load(&library, &programs, &checkpoint, &full, &cfg,
-                super::super::startup::Options {
+                super::super::startup::Options { media: None,
                     role: super::super::startup::Role::Golden { skip_routed_experts: true },
                     expert_usage: false, expert_usage_reader: Default::default(), cache_format: cuteafd_core::MlaCacheFormat::Fp8,
                     devices: [0, 1], attention: Some(cuteafd_loader::placement::AttentionPlacement::Context),

@@ -26,6 +26,7 @@ pub(crate) struct Options<'a> {
     pub prefix: &'a PrefixArgs,
     pub resident_weights: ResidentWeights,
     pub expert_usage: bool,
+    pub vision: &'a crate::shared::vision::still::Options,
 }
 
 /// Prepared owner facts, not readiness. No target/cache/transport allocation
@@ -110,7 +111,9 @@ pub(crate) fn prepare<'a>(library: &'a NativeLibrary, programs: &'a Programs<'a>
         HostBudget::Auto => None, HostBudget::Bytes(bytes) => Some(bytes),
     };
     let manifest = Arc::new(serde_json::from_slice(&std::fs::read(options.manifest)?)?);
-    let request = FactsRequest { kv_format: options.kv_format, drafter: options.drafter.map(|kv_cache|cuteafd_loader::families::inkling2::draft::Selection{
+    let request = FactsRequest { target_pool_tokens: None, vision: options.vision.vision,
+        vision_replicas: options.vision.vision_replicas,
+        media_cache_bytes: options.vision.media_cache_bytes.map(|bytes| bytes.0 as u64), kv_format: options.kv_format, drafter: options.drafter.map(|kv_cache|cuteafd_loader::families::inkling2::draft::Selection{
         kv_cache,sms:library.sm_count().unwrap_or(1) as usize}), checkpoint, catalog: &catalog, cfg, manifest_path: Some(options.manifest), manifest: Some(manifest),
         coordinator: Coordinator::Measured { samples, loaded_code: vec![0] }, attention: AttentionPlacement::Heads,
         spark_ranks: options.peers.len(), spark_bytes: cuteafd_loader::serving_capacity::spark_memory::runtime_bytes(&options.peers.iter().map(ToString::to_string).collect::<Vec<_>>())?.into_iter().max().unwrap_or(0),
@@ -138,7 +141,7 @@ pub(crate) fn prepare<'a>(library: &'a NativeLibrary, programs: &'a Programs<'a>
 /// until both push participants and Spark workers commit their exact assignment.
 pub(crate) fn deliver<'a>(library: &'a NativeLibrary,
     view: &cuteafd_loader::plan::checkpoint::CheckpointView, checkpoint: &Checkpoint,
-    prepared: &Prepared<'a>, options: &Options<'_>)
+    prepared: &Prepared<'a>, options: &Options<'_>, media: crate::shared::vision::push::Contribution)
     -> Result<(super::weights::TargetWeights<'a>, Vec<Vec<crate::shared::experts::rtx::push::PushedExperts<'a>>>,
         Option<crate::shared::speculation::recurrent_weights::Weights<'a>>)> {
     use crate::shared::{memory::device::Device, placement::{spark_rings, SparkAdmission}};
@@ -163,7 +166,7 @@ pub(crate) fn deliver<'a>(library: &'a NativeLibrary,
     let spark = SparkAdmission::plan_view(view, ExpertGeometry::INKLING2, Some(&catalog),
         &working, inputs.spark_ranks, model, None)?;
     let (target, membership) = super::weights::PendingTarget::prepare(Device { library, id: options.device },
-        view, checkpoint, &catalog, inputs, admitted)?;
+        view, checkpoint, &catalog, inputs, admitted, media)?;
     let pending = spark.start_with(options.peers, Some(membership))?;
     target.finish(&catalog, pending)
 }
@@ -173,7 +176,7 @@ pub(crate) fn deliver<'a>(library: &'a NativeLibrary,
 /// edge is intentionally separate and remains unqualified until native gates.
 pub(crate) fn whole<'a>(library: &'a Arc<NativeLibrary>, programs: &'a Programs<'a>,
     view: &cuteafd_loader::plan::checkpoint::CheckpointView, checkpoint: &Checkpoint,
-    cfg: &Inkling2Config, options: Options<'_>) -> Result<(super::engine::Execution<'a>, InklingInputs, AdmittedInkling, ModelEncoding)> {
+    cfg: &Inkling2Config, options: Options<'_>) -> Result<(super::engine::Execution<'a>, InklingInputs, AdmittedInkling, ModelEncoding, crate::shared::vision::still::Ready)> {
     use crate::shared::{memory::device::{Device, Stream}, spark_intake::SparkLink};
     use cuteafd_transport::{expert::{SparkWorld, EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16},
         ExpertV2Dtype, SparkSessionShape, TcpTransportConfig};
@@ -182,7 +185,11 @@ pub(crate) fn whole<'a>(library: &'a Arc<NativeLibrary>, programs: &'a Programs<
     phase.log("inkling2 code and admission");
     cuteafd_bench::context::phase("Inkling code and admission");
     let phase = crate::shared::memory::load_timing::Split::start();
-    let (target, pushed, draft_weights) = deliver(library, view, checkpoint, &prepared, &options)?;
+    let mut media = crate::shared::vision::still::Ready::load(options.vision, &checkpoint.snapshot,
+        options.native_lib, library, &[options.device], prepared.inputs.vision.as_ref()
+            .and_then(|vision| vision.admitted(&prepared.admitted.solved)),
+        cuteafd_loader::media::ImageFamily::Inkling2, prepared.inputs.vision.as_ref().map_or(0, |vision| vision.media_cache))?;
+    let (target, pushed, draft_weights) = deliver(library, view, checkpoint, &prepared, &options, std::mem::take(&mut media.push))?;
     phase.log("inkling2 grouped weight delivery");
     cuteafd_bench::context::phase("Inkling grouped weight delivery");
     let phase = crate::shared::memory::load_timing::Split::start();
@@ -243,7 +250,7 @@ pub(crate) fn whole<'a>(library: &'a Arc<NativeLibrary>, programs: &'a Programs<
     drop(module_pins); drop(exl3_modules);
     phase.log("inkling2 request owners and transport bootstrap");
     cuteafd_bench::context::phase("Inkling request owners and transport bootstrap");
-    Ok((execution, inputs, admitted, encoding))
+    Ok((execution, inputs, admitted, encoding, media))
 }
 
 #[cfg(test)]

@@ -1,5 +1,12 @@
 # WIP hardware cards
 
+Every launch conditions the shared draft policy before timing with the server's
+cached warm-prelude receipt: two fixed code/prose/JSON triples at the sweep
+output length, identical nonces across arms. Both report and sweep retain the
+receipt; an older server without this endpoint is refused. Per-point warm waves
+remain, and Nsight windows exclude the prelude. This normalizes preceding
+benchmark traffic rather than claiming widths have converged.
+
 Use `scripts/bench/wip-cards.py` instead of copying an RC kit driver. It reads
 `cfg/*.config` and `matrix-*.json` from the kit (default: release-v2-rc2), writes
 private one-card matrices and a 0600 API key, and runs `cuteafd bench smoke`
@@ -89,7 +96,12 @@ and arms for cleanup. Source worktrees are retained for inspection.
   level); `--post-load-c1` measures C1 again after the widest level. The sweep
   runs in the smoke binary, so arms with different server builds measure the
   same workload; pass `--binary` built from a checkout that has it (wip-cards
-  checks).
+  checks). Add `--panel-config 'concurrency={"sustained":true,"multiplier":4}'`
+  for separate continuous-refill rows at those levels (or in the server's
+  `concurrency` panel). The steady window excludes initial warm-up and final
+  drain; output-only tok/s includes the time spent on refill prefills. See
+  [benchmark panel configuration](options.md#benchmark-panel-configuration)
+  for window metadata and the explicit uniform-emission overlap estimate.
 - `--panels baseline,spec_lossless_set` adds the lossless merge gate: every
   case of `scripts/bench/fixtures/spec-lossless-set-v1.json` (or
   `--lossless-set FILE`, `[{id, prompt, nonce}]` with the full nonce string)

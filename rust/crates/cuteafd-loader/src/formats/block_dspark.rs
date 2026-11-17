@@ -90,6 +90,7 @@ impl NativeDsparkLayout {
 /// Window rings are fixed by checkpoint geometry, independent of the target pool.
 #[derive(Debug, Clone, PartialEq)]
 pub struct BlockDsparkRuntimeLayout {
+    pub representation: crate::families::glm5::draft_representation::GlmDraftRepresentation,
     pub config: BlockDsparkConfig,
     pub kv_cache: crate::families::qwen4::Qwen4KvCache,
     pub weight_requests: Vec<(String, usize)>,
@@ -111,8 +112,14 @@ impl BlockDsparkRuntimeLayout {
     }
     pub fn with_kv(snapshot: &Path, slots: usize, sequences: usize, sms: usize, arena: &str,
         kv_cache:crate::families::qwen4::Qwen4KvCache) -> anyhow::Result<Self> {
+        Self::with_representation(snapshot, slots, sequences, sms, arena, kv_cache,
+            crate::families::glm5::draft_representation::GlmDraftRepresentation::Bf16Only)
+    }
+    pub fn with_representation(snapshot: &Path, slots: usize, sequences: usize, sms: usize, arena: &str,
+        kv_cache: crate::families::qwen4::Qwen4KvCache,
+        representation: crate::families::glm5::draft_representation::GlmDraftRepresentation) -> anyhow::Result<Self> {
         use anyhow::{ensure, Context};
-        use crate::families::glm5::draft_representation::{GlmDraftCapacity, GlmDraftRepresentation};
+        use crate::families::glm5::draft_representation::GlmDraftCapacity;
         let config = BlockDsparkConfig::read(snapshot)?;
         ensure!(config.dialect == DsparkDialect::Qwen3 && config.backbone.is_qwen3(config.head_dim)
             && matches!(config.head_dim, 64 | 128) && matches!(config.rank, 256 | 512)
@@ -122,7 +129,7 @@ impl BlockDsparkRuntimeLayout {
         let window = config.window.context("block runtime layout requires checkpoint sliding window")?;
         let cache = config.paged_cache_layout(slots, window, slots.checked_mul(window)
             .context("block ring capacity overflow")?, kv_cache)?;
-        let weight_requests = block_dspark_arena_requests(snapshot, GlmDraftRepresentation::Bf16Only)?;
+        let weight_requests = block_dspark_arena_requests(snapshot, representation)?;
         let weights = crate::serving_capacity::WeightArenaLayout::new(arena, weight_requests.clone())?;
         let mul = |values: &[usize]| values.iter().try_fold(1usize, |n, value| n.checked_mul(*value))
             .context("block runtime owner extent overflow");
@@ -158,23 +165,31 @@ impl BlockDsparkRuntimeLayout {
             sequences as u64, config.kv_heads as u64,
             mul(&[config.heads / config.kv_heads, config.block])?.div_ceil(32) as u64,
             add(&[window, config.block])? as u64, config.head_dim as u64, sms as u64)?)?);
-        Ok(Self { config, kv_cache, weight_requests, capacity, weights, buffers, host_landing:mul(&[rows,8])?,
-            reduction_bytes:0,reduction_peer:false,exchange_buffers:Vec::new() })
+        let mut layout = Self { representation, config, kv_cache, weight_requests, capacity, weights, buffers,
+            host_landing:mul(&[rows,8])?, reduction_bytes:0,reduction_peer:false,exchange_buffers:Vec::new() };
+        layout.set_fp8_scratch(sms)?;
+        Ok(layout)
     }
 
     /// Rank-local body workspace sized from the source checkpoint. Each peer
     /// retains full residual rows but only its own heads, neurons and KV planes.
     pub fn for_rank(snapshot:&Path,slots:usize,sequences:usize,sms:usize,arena:&str,
         kv_cache:crate::families::qwen4::Qwen4KvCache,rank:usize,ranks:usize,lead:usize)->anyhow::Result<Self> {
+        Self::for_rank_representation(snapshot, slots, sequences, sms, arena, kv_cache, rank, ranks, lead,
+            crate::families::glm5::draft_representation::GlmDraftRepresentation::Bf16Only)
+    }
+    pub fn for_rank_representation(snapshot:&Path,slots:usize,sequences:usize,sms:usize,arena:&str,
+        kv_cache:crate::families::qwen4::Qwen4KvCache,rank:usize,ranks:usize,lead:usize,
+        representation:crate::families::glm5::draft_representation::GlmDraftRepresentation)->anyhow::Result<Self> {
         use anyhow::{ensure,Context};
         ensure!(matches!(ranks,1|2) && rank<ranks && lead<ranks,"invalid block draft rank");
-        let mut layout=Self::with_kv(snapshot,slots,sequences,sms,arena,kv_cache)?;
+        let mut layout=Self::with_representation(snapshot,slots,sequences,sms,arena,kv_cache,representation)?;
         if ranks==1 { return Ok(layout); }
         let source=layout.config.clone();
         ensure!(source.heads%ranks==0 && source.kv_heads%ranks==0 && source.intermediate%ranks==0,
             "block draft rank split cuts checkpoint dimensions");
         layout.config.heads/=ranks; layout.config.kv_heads/=ranks; layout.config.intermediate/=ranks;
-        layout.weight_requests=block_dspark_rank_arena_requests(snapshot,rank,ranks,lead)?;
+        layout.weight_requests=block_dspark_rank_arena_requests_with_representation(snapshot,rank,ranks,lead,representation)?;
         layout.weights=crate::serving_capacity::WeightArenaLayout::new(arena,layout.weight_requests.clone())?;
         let (h,q,kv,inter,rows)=(source.hidden,layout.config.heads*source.head_dim,
             layout.config.kv_heads*source.head_dim,layout.config.intermediate,layout.capacity.block_rows);
@@ -211,7 +226,20 @@ impl BlockDsparkRuntimeLayout {
             ("tp2.exchange.control".into(),transport.control_bytes),
             ("tp2.exchange.abort".into(),crate::serving_capacity::WeightArenaLayout::ALIGNMENT)]);
         if transport.progress_bytes>0 { layout.exchange_buffers.push(("tp2.exchange.progress".into(),transport.progress_bytes)); }
+        layout.set_fp8_scratch(sms)?;
         Ok(layout)
+    }
+
+    fn set_fp8_scratch(&mut self, sms: usize) -> anyhow::Result<()> {
+        self.buffers.retain(|(name,_)| name != "workspace.fp8-linear");
+        if self.representation == crate::families::glm5::draft_representation::GlmDraftRepresentation::Fp8Only {
+            let rows = 2048usize.max(self.capacity.block_rows);
+            let bytes = self.projection_shapes().into_iter().map(|(k,n)|
+                crate::families::glm5::draft_representation::draft_fp8_scratch_bytes(rows as u64,k as u64,n as u64,sms as u64,0))
+                .max().unwrap_or(256);
+            self.buffers.push(("workspace.fp8-linear".into(), usize::try_from(bytes)?.max(256)));
+        }
+        Ok(())
     }
 
     pub fn projection_shapes(&self)->Vec<(usize,usize)> {
@@ -221,6 +249,9 @@ impl BlockDsparkRuntimeLayout {
     }
 
     pub fn validate_projection_programs(&self,manifest:&serde_json::Value)->anyhow::Result<Vec<String>> {
+        if self.representation == crate::families::glm5::draft_representation::GlmDraftRepresentation::Fp8Only {
+            return Ok(Vec::new());
+        }
         let rows=2048usize.max(self.capacity.block_rows).max(64);
         self.projection_shapes().into_iter().map(|(k,n)|Ok(cuteafd_ffi::draft_projection::validate_package_geometry(
             manifest,k,n,rows)?)).collect()
@@ -873,6 +904,22 @@ mod tests {
         assert_eq!(total(&one)-total(&fp8),5*2*2048*(8*128*2-plane));
         assert_eq!(fp8.window_mark_bytes()?,(16usize+5*2*2048*plane).div_ceil(256)*256);
         assert_eq!(one.weights,fp8.weights);
+        use crate::families::glm5::draft_representation::GlmDraftRepresentation;
+        let quant=BlockDsparkRuntimeLayout::with_representation(root.path(),1,1,188,"test/quant",
+            crate::families::qwen4::Qwen4KvCache::Bf16,GlmDraftRepresentation::Fp8Only)?;
+        assert!(quant.weights.payload_bytes() < one.weights.payload_bytes());
+        assert_eq!(quant.window_mark_bytes()?,one.window_mark_bytes()?);
+        assert!(quant.buffers.iter().any(|(name,bytes)|name=="workspace.fp8-linear" && *bytes>0));
+        for rank in 0..2 {
+            let quant=BlockDsparkRuntimeLayout::for_rank_representation(root.path(),1,1,188,"test/quant",
+                crate::families::qwen4::Qwen4KvCache::Fp8,rank,2,0,GlmDraftRepresentation::Fp8Only)?;
+            let native=BlockDsparkRuntimeLayout::for_rank(root.path(),1,1,188,"test/native",
+                crate::families::qwen4::Qwen4KvCache::Fp8,rank,2,0)?;
+            assert!(quant.weights.payload_bytes()<native.weights.payload_bytes());
+            assert_eq!(quant.weight_requests.iter().filter(|(name,_)|name.ends_with(".payload")).count(),21);
+            assert_eq!(quant.window_mark_bytes()?,native.window_mark_bytes()?);
+            assert!(quant.buffers.iter().any(|(name,_)|name=="workspace.fp8-linear"));
+        }
         let lead=BlockDsparkRuntimeLayout::for_rank(root.path(),1,1,188,"test/draft/1",
             crate::families::qwen4::Qwen4KvCache::Bf16,0,2,0)?;
         let peer=BlockDsparkRuntimeLayout::for_rank(root.path(),1,1,188,"test/draft/0",
@@ -1340,8 +1387,13 @@ pub fn block_dspark_rank_recipe<T,M>(cfg:&BlockDsparkConfig,rank:usize,ranks:usi
 /// Header-validated final BF16 rank destinations; source tensors never convert.
 pub fn block_dspark_rank_arena_requests(snapshot:&Path,rank:usize,ranks:usize,lead:usize)
     ->anyhow::Result<Vec<(String,usize)>> {
+    block_dspark_rank_arena_requests_with_representation(snapshot,rank,ranks,lead,
+        crate::families::glm5::draft_representation::GlmDraftRepresentation::Bf16Only)
+}
+pub fn block_dspark_rank_arena_requests_with_representation(snapshot:&Path,rank:usize,ranks:usize,lead:usize,
+    representation:crate::families::glm5::draft_representation::GlmDraftRepresentation)
+    ->anyhow::Result<Vec<(String,usize)>> {
     use anyhow::{ensure,Context};
-    use crate::families::glm5::draft_physical::ShardAxis;
     let cfg=BlockDsparkConfig::read(snapshot)?;
     let checkpoint=crate::plan::Checkpoint::open(snapshot)?;
     let headers=checkpoint.tensors.iter().map(|t|(t.meta.name.as_str(),&t.meta)).collect::<std::collections::BTreeMap<_,_>>();
@@ -1364,7 +1416,13 @@ pub fn block_dspark_rank_arena_requests(snapshot:&Path,rank:usize,ranks:usize,le
                 .context("block rank part extent overflow")?;
             bytes=bytes.checked_add(local).context("block rank matrix overflow")?;
         }
-        requests.borrow_mut().push((parts.iter().map(|(name,_)|*name).collect::<Vec<_>>().join("+"),crate::serving_capacity::WeightArenaLayout::allocation_bytes(bytes)));
+        let name=parts.iter().map(|(name,_)|*name).collect::<Vec<_>>().join("+");
+        if representation == crate::families::glm5::draft_representation::GlmDraftRepresentation::Fp8Only {
+            requests.borrow_mut().extend([(format!("{name}.payload"),bytes/2),
+                (format!("{name}.scales"),bytes/2/128*4)]);
+        } else {
+            requests.borrow_mut().push((name,crate::serving_capacity::WeightArenaLayout::allocation_bytes(bytes)));
+        }
         Ok(())
     })?;
     if rank==lead { requests.borrow_mut().push(("markov_norms".into(),cfg.vocab*4)); }

@@ -27,6 +27,12 @@ host="$1" staging="$2" key="$3" env_file="$4" image="$5" layers="$6"
 # under the key raptor's own build expects.
 [[ "$key" =~ ^[0-9a-f]{64}$ ]] || { echo "export-remote: bad native key" >&2; exit 2; }
 NO_TURN=75
+# Remote placement owns no raptor GPU mutex. Coordinate maxq users on the
+# coordinator, then protect its physical GPU against native host jobs too.
+if [[ "$host" == maxq && ",${CUTEAFD_HW_LOCKS_HELD:-}," != *,maxq,* ]]; then
+  exec python3 "$(dirname "$0")/../hw/hwlock.py" --locks maxq \
+    --wait "${CUTEAFD_WIP_EXPORT_WAIT_S:-14400}" --preflight 'command -v ssh >/dev/null' -- "$0" "$@"
+fi
 # Connect by name using HOST's own ssh configuration.
 ssh_host=(ssh -o BatchMode=yes -o ConnectTimeout=10 "$host")
 run_id="$$-$(date +%s%N)"
@@ -80,6 +86,8 @@ for ((slot = 0; slot < slots; slot++)); do
 done
 [[ -n "$export_slot" ]] || { echo "export-remote: all $slots export slots busy"; exit "$NO_TURN"; }
 NO_TURN=75
+exec 7>>"$HOME/.cache/cuteafd/maxq-gpu.lock"
+flock -w 7200 7 || { echo "export-remote: timed out waiting for maxq-gpu.lock" >&2; exit "$NO_TURN"; }
 smi=/usr/lib/wsl/lib/nvidia-smi
 [[ -x "$smi" ]] || smi=nvidia-smi
 root="$(mktemp -d "$HOME/.cache/cuteafd/builds/export-$key.XXXXXXXX")"
@@ -105,7 +113,7 @@ cleanup_export() {
   rm -rf "$root"
 }
 trap cleanup_export EXIT
-trap 'exit 143' TERM HUP INT QUIT
+trap 'echo "export terminated (TERM)" >&2; exit 143' TERM HUP INT QUIT
 mkdir -p "$HOME/.cache/cuteafd/export-workers"
 mkdir -p "$root/src" "$root/build" "$root/output" "$root/home"
 zstd -d -q <"$area/source.tar.zst" | tar -C "$root/src" -xf -

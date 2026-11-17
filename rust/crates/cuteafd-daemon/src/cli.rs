@@ -68,13 +68,13 @@ pub(crate) struct MemoryArgs {
     /// Graph node/executable padding: percentage (default 2.5%), bytes per coefficient, or rtx=VALUE,spark=VALUE; independent of GPU_RESERVE.
     #[arg(long, global = true)]
     pub(crate) graph_node_padding: Option<cuteafd_core::memory_policy::GraphNodePadding>,
-    /// KV tokens the layout is sized for (default 2M; 1M on cards of 32 GiB or less).
+    /// KV tokens the layout is sized for (default 2M on every card).
     #[arg(long, global = true)]
     pub(crate) kv_target_tokens: Option<u64>,
     /// Refuse the launch below this many KV tokens (default: min(256K, model context)).
     #[arg(long, global = true)]
     pub(crate) kv_min_tokens: Option<u64>,
-    /// Grow the pool into memory left after the layout is fixed, up to this (default: the target).
+    /// Cap pool growth after the layout is fixed (default: all remaining memory).
     #[arg(long, global = true)]
     pub(crate) kv_max_tokens: Option<u64>,
 }
@@ -130,6 +130,9 @@ pub(crate) struct Cli {
     /// Prefer a cold compatible donor even below the graph soft cap.
     #[arg(long, global = true)]
     pub(crate) graph_donor_always: bool,
+    /// Extra idle cycles required of below-soft-cap donors (requires donor-always when non-zero).
+    #[arg(long, global = true, default_value_t = 0)]
+    pub(crate) graph_donor_cold_lag: u64,
     /// Minimum physical GPU free bytes after graph capture (default MEMORY_PADDING/2); size or gpuN=size, 0 disables.
     #[arg(long, global = true)]
     pub(crate) graph_disable_low_mem: Option<String>,
@@ -368,6 +371,8 @@ pub(crate) fn core_view_settings(view: &cuteafd_loader::plan::checkpoint::Checkp
 
 #[derive(Debug, Clone, Args)]
 pub(crate) struct PlanArgs {
+    #[arg(skip)]
+    pub(crate) kimi_content_qualified: bool,
     #[arg(skip)]
     pub(crate) explicit_settings: std::collections::BTreeSet<String>,
     #[cfg(test)]
@@ -734,7 +739,7 @@ pub(crate) struct NativeExpertDaemonArgs {
     /// Explicit checkpoint revision (defaults to snapshot directory name).
     #[arg(long)]
     pub(crate) encoder_revision: Option<String>,
-    #[arg(long, default_value_t = 4096, value_parser = clap::value_parser!(u32).range(1..=4096))]
+    #[arg(long, default_value_t = 4096, value_parser = clap::value_parser!(u32).range(1..=16698))]
     pub(crate) encoder_max_tokens: u32,
     /// Load the checkpoint audio tower in this expert process.
     #[arg(long, conflicts_with = "audio_encoder_only")]
@@ -1167,6 +1172,23 @@ mod tests {
     }
 
     #[test]
+    fn graph_donor_cold_lag_is_a_typed_cli_option() {
+        use clap::Parser;
+        let base = ["cuteafd", "bench-rdma-ring"];
+        assert_eq!(super::Cli::try_parse_from(base).unwrap().graph_donor_cold_lag, 0);
+        for lag in ["0", "16", "18446744073709551615"] {
+            let cli = super::Cli::try_parse_from(base.into_iter().chain([
+                "--graph-donor-always", "--graph-donor-cold-lag", lag])).unwrap();
+            assert!(cli.graph_donor_always);
+            assert_eq!(cli.graph_donor_cold_lag, lag.parse::<u64>().unwrap());
+        }
+        for lag in ["-1", "cold", "18446744073709551616"] {
+            assert!(super::Cli::try_parse_from(base.into_iter().chain([
+                "--graph-donor-cold-lag", lag])).is_err());
+        }
+    }
+
+    #[test]
     fn qwen4_golden_saves_prefill_or_decode_logits() {
         use clap::Parser;
         let base = ["cuteafd", "qwen4-golden", "--snapshot", "/model", "--native-lib", "/native.so",
@@ -1511,6 +1533,14 @@ mod tests {
             "--rank", "7", "--world", "8"]).unwrap();
         let Commands::Expertd(args) = cli.command else { panic!("expertd-native") };
         assert_eq!((args.rank, args.world), (7, 8));
+        let encoder=["cuteafd","expertd-native","--snapshot","/model","--native-lib","/native.so",
+            "--device-budget-bytes","1000","--rank","0","--encoder-max-tokens"];
+        for rows in ["1","4096","16698"] {
+            let cli=Cli::try_parse_from(encoder.into_iter().chain([rows])).unwrap();
+            let Commands::Expertd(args)=cli.command else{panic!("expertd-native")};
+            assert_eq!(args.encoder_max_tokens,rows.parse::<u32>().unwrap());
+        }
+        for rows in ["0","16699"] {assert!(Cli::try_parse_from(encoder.into_iter().chain([rows])).is_err());}
     }
 }
 

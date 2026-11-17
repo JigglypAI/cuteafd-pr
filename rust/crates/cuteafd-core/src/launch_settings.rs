@@ -34,11 +34,10 @@ pub fn glmf_draft_linear(explicit: Option<&str>, configured: Option<&str>, exter
         if external_fp8 { "w8a8" } else { "w8a16" }.into(), "w8a8 with an external FP8 drafter; w8a16 otherwise")
 }
 
-pub fn glmf_speculator(explicit: Option<&str>, configured: Option<&str>, default_drafter_present: bool) -> Resolved<String> {
+pub fn glmf_speculator(explicit: Option<&str>, configured: Option<&str>) -> Resolved<String> {
     selected(explicit.filter(|v| !v.is_empty() && *v != "auto").map(str::to_owned),
         configured.filter(|_| explicit.is_none()).filter(|v| !v.is_empty() && *v != "auto").map(str::to_owned),
-        if default_drafter_present { "dflash2" } else { "off" }.into(),
-        "DFlash2 when the default drafter is available; off otherwise")
+        "dflash2".into(), "DFlash2; the default drafter must be available")
 }
 
 /// Occupancy is a supplied live measurement, never sampled by this resolver.
@@ -53,13 +52,31 @@ pub fn coordinator_weight_budget(explicit_gib: Option<f64>, configured_gib: Opti
 pub struct KimiSpeculatorError(String);
 
 pub const KIMI_K31_DSPARK: &str = "Inferact/Kimi-K3.1-Pro-DSpark";
-pub const KIMI_K31_DSPARK_REVISION: &str = "e4e6e6261e9f8b6d5f249f9627eb6b109d762d5f";
+pub const KIMI_K31_DSPARK_REVISION: &str = "c197a09072916cf63172df2d9d4baef0b77ed83a";
 
-pub fn kimi_speculator(explicit:Option<&str>,configured:Option<&str>)
+pub const KIMI_K31_MC: &str = "wrldsuksgo2mars/Kimi-K3.1-Pro-EXL3-K2-MC";
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct KimiDraftQualification<'a> {
+    pub content_qualified: bool,
+    pub core_view: &'a str,
+    pub rtx: usize,
+    pub target_kv: &'a str,
+    pub draft_kv: &'a str,
+}
+
+impl KimiDraftQualification<'_> {
+    pub fn qualified(self) -> bool {
+        self.content_qualified
+    }
+}
+
+pub fn kimi_speculator(explicit:Option<&str>,configured:Option<&str>, qualification: KimiDraftQualification<'_>)
     -> Result<Resolved<String>,KimiSpeculatorError> {
     let resolved=selected(explicit.filter(|v|!v.is_empty() && *v!="auto").map(str::to_owned),
         configured.filter(|_|explicit.is_none()).filter(|v|!v.is_empty() && *v!="auto").map(str::to_owned),
-        "off".into(),"Kimi speculation remains opt-in until measured");
+        if qualification.qualified() { "dspark" } else { "off" }.into(),
+        "DSpark for paired K3.1 target/drafter content in every view and layout; off otherwise");
     if !matches!(resolved.value.as_str(),"off"|"dflash2"|"dspark") {
         return Err(KimiSpeculatorError(resolved.value));
     }
@@ -70,10 +87,10 @@ pub fn kimi_draft_fp8(explicit: Option<bool>, dflash: bool) -> Resolved<bool> {
     selected(explicit, None, dflash, "FP8 for explicit Kimi DFlash2")
 }
 
-pub fn mimo_speculator(explicit: Option<&str>, configured: Option<&str>, model_id: &str) -> Resolved<String> {
+pub fn mimo_speculator(explicit: Option<&str>, configured: Option<&str>, drafter_available: bool) -> Resolved<String> {
     selected(explicit.filter(|v| !v.is_empty() && *v != "auto").map(str::to_owned),
         configured.filter(|_| explicit.is_none()).filter(|v| !v.is_empty() && *v != "auto").map(str::to_owned),
-        if matches!(model_id, "XiaomiMiMo/MiMo-V2.6-Flash-MOPD" | "XiaomiMiMo/MiMo-V2.6-Pro-MOPD") { "dflash2" } else { "off" }.into(), "DFlash2 for official MiMo V2.6 Flash/Pro MOPD model ids; off otherwise")
+        if drafter_available { "dflash2" } else { "off" }.into(), "DFlash2 with a bundled or configured MiMo drafter; off otherwise")
 }
 
 pub fn mimo_mtp_depth(explicit: Option<usize>, configured: Option<usize>, mtp: bool) -> Resolved<usize> {
@@ -84,6 +101,26 @@ pub fn mimo_mtp_depth(explicit: Option<usize>, configured: Option<usize>, mtp: b
 mod tests {
     use super::*;
     #[test]
+    fn kimi_defaults_follow_content_pairing_not_view_layout_or_kv() {
+        let qualified = KimiDraftQualification { content_qualified: true, core_view: "original", rtx: 2,
+            target_kv: "fp8", draft_kv: "bf16" };
+        assert_eq!(kimi_speculator(None, None, qualified).unwrap().value, "dspark");
+        assert_eq!(kimi_speculator(Some("auto"), Some("off"), qualified).unwrap().value, "dspark");
+        assert_eq!(kimi_speculator(Some("off"), None, qualified).unwrap().value, "off");
+        assert_eq!(kimi_speculator(None, Some("off"), qualified).unwrap().value, "off");
+        for view in ["original", "k6-compact", "k8-compact", "fp8-compact"] { for rtx in [1, 2, 3] {
+            for target_kv in ["bf16", "fp8"] { for draft_kv in ["bf16", "fp8"] {
+                assert_eq!(kimi_speculator(None, None, KimiDraftQualification {
+                    core_view: view, rtx, target_kv, draft_kv, ..qualified }).unwrap().value, "dspark");
+            } }
+        } }
+        for other in [KimiDraftQualification { content_qualified: false, ..qualified }] {
+            assert_eq!(kimi_speculator(None, None, other).unwrap().value, "off");
+            assert_eq!(kimi_speculator(Some("dspark"), None, other).unwrap().value, "dspark");
+        }
+    }
+
+    #[test]
     fn defaults_and_precedence() {
         assert_eq!(glmf_index_cache(None, None, 1).value, "compact");
         assert_eq!(glmf_index_cache(None, None, 2).value, "keys");
@@ -93,20 +130,20 @@ mod tests {
         } } }
         assert_eq!(glmf_draft_linear(None, None, true).value, "w8a8");
         assert_eq!(glmf_draft_linear(None, Some("wide"), true).provenance, "config");
-        assert_eq!(glmf_speculator(None, None, false).value, "off");
-        assert_eq!(glmf_speculator(None, Some("dflash2"), false).value, "dflash2");
+        assert_eq!(glmf_speculator(None, None).value, "dflash2");
+        assert_eq!(glmf_speculator(None, Some("off")).value, "off");
         assert_eq!(coordinator_weight_budget(None, None, 32 << 30).value, 32.0);
         assert_eq!(coordinator_weight_budget(Some(20.0), None, 32 << 30).value, 20.0);
         assert_eq!(glmf_replay_records(Some("auto"), Some("shared"), 2, true, true).value, "own");
-        assert_eq!(mimo_speculator(None, None, "community/lookalike").value, "off");
-        assert_eq!(mimo_speculator(None, None, "XiaomiMiMo/MiMo-V2.6-Flash-MOPD").value, "dflash2");
-        assert_eq!(mimo_speculator(Some("mtp"), Some("off"), "XiaomiMiMo/MiMo-V2.6-Pro-MOPD").value, "mtp");
+        assert_eq!(mimo_speculator(None, None, false).value, "off");
+        assert_eq!(mimo_speculator(None, None, true).value, "dflash2");
+        assert_eq!(mimo_speculator(Some("mtp"), Some("off"), true).value, "mtp");
         assert_eq!(mimo_mtp_depth(None, None, true).value, 1);
         assert_eq!(mimo_mtp_depth(Some(3), Some(2), true).value, 3);
-        assert_eq!(kimi_speculator(None,None).unwrap().value,"off");
-        assert_eq!(kimi_speculator(None,Some("dspark")).unwrap().value,"dspark");
-        assert_eq!(kimi_speculator(Some("off"),Some("dspark")).unwrap().value,"off");
-        assert!(kimi_speculator(Some("mtp"),None).is_err());
+        assert_eq!(kimi_speculator(None,None, KimiDraftQualification::default()).unwrap().value,"off");
+        assert_eq!(kimi_speculator(None,Some("dspark"), KimiDraftQualification::default()).unwrap().value,"dspark");
+        assert_eq!(kimi_speculator(Some("off"),Some("dspark"), KimiDraftQualification::default()).unwrap().value,"off");
+        assert!(kimi_speculator(Some("mtp"),None, KimiDraftQualification::default()).is_err());
         assert!(kimi_draft_fp8(None, true).value);
         assert!(!kimi_draft_fp8(Some(false), true).value);
     }

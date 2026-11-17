@@ -691,20 +691,20 @@ fn check_prefix_state<'a>(
         let pool = RefCell::new(PrefixCache::<StubCopyEngine, Frontier>::new(family.layout(),
             PrefixConfig { entries: 1, mark_slots: 2, keep_logits: false, min_tokens: 1 }, None)?);
         let mut source = pool.borrow_mut().admit_cold(&family, frontier, frontier + 1,
-            |pages| Placement { pages, sequence: 0, committed: 0 })?.placement;
+            |pages| Placement { media: None, pages, sequence: 0, committed: 0 })?.placement;
         committed_step(checkpoint, cfg.vocab, &tokens[..frontier], chain, &cache, &staging,
             &pool, &mut source, input, link)?;
         let expected = canonical_state(&cache, &source)?;
         ensure!(pool.borrow_mut().capture(&family, SnapshotKind::Prompt, &tokens[..frontier], &source, After::default())?,
             "Step-5 diagnostic snapshot was not retained");
         let mut cold = pool.borrow_mut().admit_cold(&family, frontier, frontier + 1,
-            |pages| Placement { pages, sequence: 1, committed: 0 })?.placement;
+            |pages| Placement { media: None, pages, sequence: 1, committed: 0 })?.placement;
         committed_step(checkpoint, cfg.vocab, &tokens[..frontier], chain, &cache, &staging,
             &pool, &mut cold, input, link)?;
         ensure!(expected == canonical_state(&cache, &cold)?,
             "Step-5 independently cold state differs at {frontier}");
         let admitted = pool.borrow_mut().admit(&family, &tokens[..frontier + 1], frontier + 1, false,
-            |pages| Placement { pages, sequence: 2, committed: 0 })?;
+            |pages| Placement { media: None, pages, sequence: 2, committed: 0 })?;
         ensure!(admitted.resume == frontier && admitted.source.as_ref().is_some_and(|s|
             !s.partial && s.frontier == frontier && s.plan.exact()),
             "Step-5 expected deepest exact prefix hit at {frontier}");
@@ -827,7 +827,7 @@ fn layer0_run(args: &GoldenArgs, checkpoint: &Checkpoint, cfg: &Config, referenc
             Staging::new(devices[1], &programs, &caches[1].borrow(), stage_bytes[1] as usize)?];
         let family = Step5Prefix::new(vec![&caches[0], &caches[1]])?;
         let pool = RefCell::new(PrefixCache::<StubCopyEngine, Frontier>::new(family.layout(), config, None)?);
-        let mut placement = pool.borrow_mut().admit_cold(&family, 1, 1, |pages| Placement { pages, sequence: 0, committed: 0 })?.placement;
+        let mut placement = pool.borrow_mut().admit_cold(&family, 1, 1, |pages| Placement { media: None, pages, sequence: 0, committed: 0 })?.placement;
         let execution = Execution::load_count(&programs, checkpoint, ownership, vec![&caches[0], &caches[1]],
             vec![&stages[0], &stages[1]], rows, available.to_vec(), reservations.to_vec(), None, 1, 17)?;
         let input = Allocation::new(devices[0], rows * H * 4, Tag::workspace("step5/golden-input"))?;
@@ -853,7 +853,7 @@ fn layer0_run(args: &GoldenArgs, checkpoint: &Checkpoint, cfg: &Config, referenc
         let staging = Staging::new(device, &programs, &cache.borrow(), staging_bytes as usize)?;
         let family = Step5Prefix::new(vec![&cache])?;
         let pool = RefCell::new(PrefixCache::<StubCopyEngine, Frontier>::new(family.layout(), config, None)?);
-        let mut placement = pool.borrow_mut().admit_cold(&family, 1, 1, |pages| Placement { pages, sequence: 0, committed: 0 })?.placement;
+        let mut placement = pool.borrow_mut().admit_cold(&family, 1, 1, |pages| Placement { media: None, pages, sequence: 0, committed: 0 })?.placement;
         let mut chain = TargetChain::load(device, &programs, checkpoint, 1, rows, available, &[reserved], args.kv_cache)?;
         let input = Allocation::new(device, rows * H * 4, Tag::workspace("step5/golden-input"))?;
         library.copy_h2d(input.buffer, &embedding_rows(checkpoint, &reference.tokens, cfg.vocab)?)?;
@@ -1005,7 +1005,7 @@ fn split_run(args: &GoldenArgs, checkpoint: &Checkpoint, cfg: &Config,
     let pool = RefCell::new(PrefixCache::<StubCopyEngine, Frontier>::new(family.layout(), PrefixConfig {
         entries: 0, mark_slots: 0, keep_logits: false, min_tokens: 1 }, None)?);
     let mut placement = pool.borrow_mut().admit_cold(&family, 1, 1,
-        |pages| Placement { pages, sequence: 0, committed: 0 })?.placement;
+        |pages| Placement { media: None, pages, sequence: 0, committed: 0 })?.placement;
     let mut execution = Execution::bind_native(checkpoint, ownership, native,
         vec![&caches[0], &caches[1]], vec![&stages[0], &stages[1]], rows, Some(transport), 92, 17)?;
     if args.poison_scratch { execution.poison_scratch_between_layers(); }
@@ -1368,7 +1368,7 @@ fn run(args: GoldenArgs) -> Result<()> {
         None,
     )?);
     let mut placement = pool.borrow_mut()
-        .admit_cold(&family, 1, 1, |pages| Placement {
+        .admit_cold(&family, 1, 1, |pages| Placement { media: None,
             pages,
             sequence: 0,
             committed: 0,

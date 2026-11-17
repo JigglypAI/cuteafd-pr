@@ -135,6 +135,8 @@ PY
     cuteafd_compiler_cache_warn 'cannot create compiler shims'; return 0
   fi
   export CUTEAFD_KACHE_ACTIVE="$wrapper" KACHE_CONFIG="$config" KACHE_HOST_CONFIG=
+  # Nested per-invocation gate configs must not inherit kache's nearest Cargo root.
+  export KACHE_EVENT_ROOT="$(realpath -m "$build_dir")"
   export KACHE_CACHE_DIR="$cache" KACHE_BUILD_SCRIPT_CACHE=0 KACHE_OUT_DIR_ALIAS=0
   export KACHE_VERIFY_RESTORES=always
   export CUTEAFD_KACHE_WARNING_DIR="$build_dir/compiler-cache/warned"
@@ -274,27 +276,33 @@ if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
      [[ "${1:-}" == "$CUTEAFD_KACHE_SHIM_DIR/cc" || "${1:-}" == "$CUTEAFD_KACHE_SHIM_DIR/c++" ]]; then
     exec "$@"
   fi
-  # One failing cache invocation disables it for the remainder of this build.
-  if [[ -d "${CUTEAFD_KACHE_WARNING_DIR:-/nonexistent}" ]]; then
+  # A confirmed cache fault disables it; timeouts are recorded separately.
+  if [[ -f "${CUTEAFD_KACHE_WARNING_DIR:-/nonexistent}/first-failure" ]]; then
     exec "$@"
   fi
   # Preserve genuine compiler errors, but never let an optional cache break a build.
   [[ -n "${CUTEAFD_KACHE_ACTIVE:-}" ]] || exec "$@"
   status=0
-  timeout -k 5 "${CUTEAFD_KACHE_TIMEOUT_SECONDS:-300}" "$CUTEAFD_KACHE_ACTIVE" "$@" && exit 0
+  # Includes key discovery, in-flight dedup waits, compilation and publication.
+  # Recent cold loader/daemon compiles take 220-258s before shared-host variation.
+  timeout -k 5 "${CUTEAFD_KACHE_TIMEOUT_SECONDS:-900}" "$CUTEAFD_KACHE_ACTIVE" "$@" && exit 0
   status=$?
-  # Retry plain. A compile that also fails plain is the compiler's own error
-  # (e.g. proc-macro2's procmacro2_build_probe, which fails by design on stable
-  # rustc), not a cache fault: keep caching for the rest of the build. Only a
-  # timeout, or a kache failure that the plain compiler does not reproduce,
-  # disables it.
+  # A timeout belongs to this invocation, not the cache store. Slow compilation
+  # or an in-flight wait must not turn every subsequent crate into a cold build.
+  plain_started=$SECONDS
   plain=0
   "$@" || plain=$?
-  if [[ "$status" == 124 || "$status" == 137 || "$plain" == 0 ]] &&
-     mkdir "${CUTEAFD_KACHE_WARNING_DIR:-/nonexistent}" 2>/dev/null; then
-    # Record why caching stopped: 124/137 is the timeout, anything else kache.
-    printf 'exit %s (plain %s): %s\n' "$status" "$plain" "$*" > "$CUTEAFD_KACHE_WARNING_DIR/first-failure" 2>/dev/null || true
-    printf 'warning: cuteafd kache invocation failed or timed out (exit %s); continuing with plain compiler\n' "$status" >&2
+  plain_seconds=$((SECONDS - plain_started))
+  warning_dir="${CUTEAFD_KACHE_WARNING_DIR:-/nonexistent}"
+  if [[ "$status" == 124 || "$status" == 137 ]]; then
+    mkdir -p "$warning_dir/timeouts" 2>/dev/null || true
+    printf 'exit %s (plain %s, %ss): %s\n' "$status" "$plain" "$plain_seconds" "$*" > "$warning_dir/timeouts/$BASHPID" 2>/dev/null || true
+    printf 'warning: cuteafd kache invocation timed out (exit %s, plain %ss); later invocations remain cached\n' "$status" "$plain_seconds" >&2
+  # Compiler errors reproduced plain (e.g. rustc feature probes) are not cache
+  # faults. Only a non-timeout cache failure repaired by plain disables caching.
+  elif [[ "$plain" == 0 ]] && mkdir -p "$warning_dir" 2>/dev/null && mkdir "$warning_dir/disabled" 2>/dev/null; then
+    printf 'exit %s (plain %s, %ss): %s\n' "$status" "$plain" "$plain_seconds" "$*" > "$warning_dir/first-failure" 2>/dev/null || true
+    printf 'warning: cuteafd kache invocation failed (exit %s); continuing with plain compiler\n' "$status" >&2
   fi
   exit "$plain"
 fi

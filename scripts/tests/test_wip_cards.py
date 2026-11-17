@@ -32,6 +32,7 @@ def no_stop_handlers(monkeypatch, tmp_path):
     cards.bench_panels.cache_clear()
     monkeypatch.setattr(cards, 'observer_gpu_uuids', lambda devices: ','.join(f'GPU-host-{device}' for device in devices))
     monkeypatch.setattr(cards, 'preflight_deployment', lambda job, arm: {
+        'speculator': job['entry']['set'].get('SPECULATOR', 'dspark').replace('auto', 'dspark'),
         'spark_roles': [dict(rank=i, experts=True, audio_encoder=bool((job.get('needs') or {}).get('audio')))
                         for i in range(len(job['entry'].get('sparks', [])))],
         'artifact_requirements': {'spark_packages': {}, 'spark_tp_role': (job.get('needs') or {}).get('tp_role')}})
@@ -1470,6 +1471,16 @@ def test_binary_without_sweep_fields_is_refused(entry, tmp_path, monkeypatch):
     cards.binary_supports('/new/cuteafd', ROOT, job, ['levels', 'post_load_c1'])
 
 
+def test_old_runner_without_server_prelude_is_refused_before_hardware(entry, tmp_path, monkeypatch):
+    job = make(entry, tmp_path)
+    for marker in ['', 'warm_prelude=client-local']:
+        monkeypatch.setattr(cards.subprocess, 'run', lambda *a, **k: SimpleNamespace(returncode=0, stderr=marker, stdout=''))
+        with pytest.raises(ValueError, match='/old/cuteafd lacks the server-owned warm prelude'):
+            cards.binary_supports('/old/cuteafd', ROOT, job, ['warm_prelude'])
+    monkeypatch.setattr(cards.subprocess, 'run', lambda *a, **k: SimpleNamespace(returncode=0, stderr='warm_prelude=server-v1', stdout=''))
+    cards.binary_supports('/new/cuteafd', ROOT, job, ['warm_prelude'])
+
+
 def test_toolchain_hash_matches_canonical_head_identity():
     canonical = subprocess.run([sys.executable, str(ROOT / 'scripts/build/dev-toolchain.py')],
                                capture_output=True, text=True, check=True).stdout.strip()
@@ -2522,7 +2533,7 @@ def test_every_required_smoke_field_is_advertised_by_the_dry_run():
     # binary_supports looks for FIELD= in the smoke dry-run line; a field wip-cards can
     # require but smoke.rs never prints would refuse every binary, however new.
     source = (ROOT / 'scripts/bench/wip-cards.py').read_text()
-    block = source[source.index("    fields = ['fabric']"):source.index('    for job in {j[\'launcher\'][\'repo\']')]
+    block = source[source.index("    fields = ['fabric', 'warm_prelude']"):source.index('    for job in {j[\'launcher\'][\'repo\']')]
     required = {name for name in re.findall(r"\['([a-z_0-9]+)'\]", block) if name not in ('entry', 'launcher', 'repo')}
     dry_run = (ROOT / 'rust/crates/cuteafd-bench/src/smoke.rs').read_text()
     line = next(text for text in dry_run.splitlines() if 'api_key_file={}' in text)
@@ -2649,7 +2660,7 @@ def test_one_serving_turn_covers_all_arms_repeats_and_teardown(entry, tmp_path, 
     monkeypatch.setattr(cards.hwlock, 'hold', hold)
     original_preflight = cards.preflight_at_grant
     def at_grant(job, arm):
-        assert held == ['sparks', 'gpu0', 'gpu1']
+        assert held == ['sparks', 'gpu0']
         events.append('prelaunch-' + job['arm'])
         return original_preflight(job, arm)
     monkeypatch.setattr(cards, 'preflight_at_grant', at_grant)
@@ -2668,9 +2679,9 @@ def test_one_serving_turn_covers_all_arms_repeats_and_teardown(entry, tmp_path, 
     expected = ['base'] if stop else ['base', 'cand', 'cand', 'base']
     assert launched == ['v41-min/' + arm for arm in expected]
     assert events == ['grant', *[event for arm in expected for event in ('prelaunch-' + arm, 'teardown-' + arm)], 'release']
-    assert all(env['CUTEAFD_HW_LOCKS_HELD'] == 'sparks,gpu0,gpu1' for env in smoke_envs)
+    assert all(env['CUTEAFD_HW_LOCKS_HELD'] == 'sparks,gpu0' for env in smoke_envs)
     assert not held
-    locks = cards.hwlock._try_flocks(['sparks', 'gpu0', 'gpu1'])
+    locks = cards.hwlock._try_flocks(['sparks', 'gpu0'])
     assert locks is not None
     for handle in locks:
         handle.close()
@@ -2705,7 +2716,7 @@ def test_all_build_paths_finish_before_shared_serving_turn(entry, tmp_path, monk
     assert events == ['build-base', 'build-cand', 'grant', 'release']
 
 
-def test_serving_lock_union_matches_smoke_rules():
+def test_serving_lock_union_follows_the_resolved_layout():
     import itertools
     for gpus, hosts, exclusive, family in itertools.product(
             ([0], [1], [0, 1]), ([], ['ostrich'], ['rhea'], ['moa'], ['rhea', 'moa']),
@@ -2713,13 +2724,47 @@ def test_serving_lock_union_matches_smoke_rules():
         entry = dict(gpus=gpus, sparks=hosts, family=family)
         if exclusive is not None:
             entry['exclusive'] = exclusive
-        expected_exclusive = exclusive if exclusive is not None else family == 'deepseek_v41'
-        expected = []
-        if 0 in gpus or 'ostrich' in hosts or expected_exclusive:
-            expected.append('sparks')
-        expected += [f'gpu{gpu}' for gpu in (0, 1) if gpu in gpus or expected_exclusive]
+        expected = (['sparks'] if set(hosts) & set(cards.HOSTS[:4]) else []) + [f'gpu{gpu}' for gpu in (0, 1) if gpu in gpus]
         expected += [host for host in ('rhea', 'moa') if host in hosts]
         assert cards.serving_locks([dict(entry=entry)]) == expected
+
+
+def test_serving_lock_cases_match_the_shared_parity_fixture():
+    # Rust smoke.rs locks_for reads the same table (lock_cases_match_the_shared_parity_fixture).
+    fixture = json.loads((ROOT / 'rust/crates/cuteafd-bench/tests/fixtures/serving-locks.json').read_text())
+    for case in fixture['cases']:
+        entry = dict(gpus=case['gpus'], sparks=case['sparks'], family=case.get('family'))
+        if 'exclusive' in case:
+            entry['exclusive'] = case['exclusive']
+        expected = [lock.removesuffix('.lock') for lock in case['locks']]
+        assert cards.serving_locks([dict(entry=entry)]) == expected, case['name']
+
+
+def test_card_layout_is_the_lock_source():
+    # V4.1 min card: one coordinator GPU and three pool Sparks.
+    card = dict(config='unused.config', gpus=[0], sparks=['ostrich', 'dodo', 'emu'],
+                resolved_values={'COORDINATOR_GPUS': '0', 'SPARK_COUNT': '3'})
+    assert cards.card_layout(card) == ([0], ['ostrich', 'dodo', 'emu'])
+    assert cards.layout_locks([cards.card_layout(card)]) == ['sparks', 'gpu0']
+    # A 0-Spark card keeps its GPUs and takes no sparks lock, even on GPU0.
+    card['resolved_values'] = {'COORDINATOR_GPUS': '0,1', 'SPARK_COUNT': '0'}
+    assert cards.serving_locks([dict(entry=dict(gpus=[0, 1], sparks=[]))]) == ['gpu0', 'gpu1']
+    # The 2-RTX + 6-Spark layout: pool Sparks plus rhea and moa.
+    card['resolved_values'] = {'COORDINATOR_GPUS': '0,1', 'SPARK_COUNT': '6',
+                               'SPARK_4_HOST': 'rhea', 'SPARK_5_HOST': 'moa'}
+    assert cards.layout_locks([cards.card_layout(card)]) == ['sparks', 'gpu0', 'gpu1', 'rhea', 'moa']
+
+
+def test_print_locks_never_builds_or_serves(entry, tmp_path, monkeypatch, capsys):
+    def forbidden(*args, **kwargs):
+        pytest.fail('--print-locks must not build, preflight or take a lock')
+    monkeypatch.setattr(cards, 'build_arms', forbidden)
+    monkeypatch.setattr(cards, 'resolve_launchers', forbidden)
+    monkeypatch.setattr(cards.hwlock, 'hold', forbidden)
+    monkeypatch.setattr(sys, 'argv', ['wip-cards', '--kit', str(_kit(tmp_path, entry)), '--cards', entry['name'],
+                        '--matrix', '--arm', 'base=b:s', '--state', str(tmp_path / 'state'), '--print-locks'])
+    assert cards.main() == 0
+    assert capsys.readouterr().out.strip() == 'sparks,gpu0'
 
 
 def test_dry_run_prints_one_turn_after_builds(entry, tmp_path, monkeypatch, capsys):
@@ -2729,7 +2774,7 @@ def test_dry_run_prints_one_turn_after_builds(entry, tmp_path, monkeypatch, caps
     assert cards.main() == 0
     output = capsys.readouterr().out
     assert output.count('single serving turn') == 1
-    assert 'hwlock --locks sparks,gpu0,gpu1 --wait 21600' in output
+    assert 'hwlock --locks sparks,gpu0 --wait 21600' in output
     assert output.count('setsid ') == 4
     assert not cards.hwlock.LOCK_DIR.exists()
 
@@ -2761,7 +2806,7 @@ def test_real_stopped_smoke_tears_down_before_parent_unlocks(entry, tmp_path, mo
              '(d/"ready").write_text(os.environ["CUTEAFD_HW_LOCKS_HELD"])\n'
              'while True: time.sleep(0.01)\n']
     with cards.serving_turn([job], dict(os.environ), 5):
-        env = {**os.environ, 'CUTEAFD_HW_LOCKS_HELD': 'sparks,gpu0,gpu1'}
+        env = {**os.environ, 'CUTEAFD_HW_LOCKS_HELD': 'sparks,gpu0'}
         process = cards.detached(smoke, tmp_path / 'driver.log', tmp_path / 'exit', env)
         try:
             deadline = time.monotonic() + 10
@@ -2826,18 +2871,31 @@ def test_failed_build_never_takes_serving_turn(entry, tmp_path, monkeypatch):
                    '--matrix', '--arm', 'base=b:s', '--build', 'base=HEAD', '--state', str(tmp_path / 'state')])
 
 
-def test_serving_turn_preserves_inherited_locks(entry, tmp_path, monkeypatch):
-    import contextlib
-    requested = []
-    @contextlib.contextmanager
-    def hold(names, *args, **kwargs):
-        requested.append(names)
-        yield
-    monkeypatch.setattr(cards.hwlock, 'hold', hold)
+def test_serving_turn_takes_no_ticket_when_the_hold_covers_it(entry, tmp_path, monkeypatch):
+    # An enclosing hold that covers the whole set needs no inner ticket, and the
+    # child smokes inherit the canonical union.
+    def forbidden(*args, **kwargs):
+        pytest.fail('a covering hold needs no inner ticket')
+    monkeypatch.setattr(cards.hwlock, 'hold', forbidden)
     env = {'CUTEAFD_HW_LOCKS_HELD': 'sparks.lock,gpu0.lock'}
     with cards.serving_turn([make(entry, tmp_path)], env, 5):
-        assert env['CUTEAFD_HW_LOCKS_HELD'] == 'sparks,gpu0,gpu1'
-    assert requested == [['gpu1']]
+        assert env['CUTEAFD_HW_LOCKS_HELD'] == 'sparks,gpu0'
+
+
+def test_nested_hold_must_cover_the_whole_serving_set(entry, tmp_path, monkeypatch):
+    def forbidden(*args, **kwargs):
+        pytest.fail('a lock the outer hold does not cover must never be queued')
+    monkeypatch.setattr(cards.hwlock, 'hold', forbidden)
+    # #2364: the outer hwlock held sparks,gpu0 while the V4.1 card resolved both GPUs.
+    job = make({**entry, 'gpus': [0, 1]}, tmp_path)
+    with pytest.raises(ValueError, match=r'gpu1.*cannot be granted'):
+        with cards.serving_turn([job], {'CUTEAFD_HW_LOCKS_HELD': 'sparks,gpu0'}, 5):
+            pytest.fail('nothing may run')
+    # A hold that covers none of them fails the same way.
+    job = make(entry, tmp_path)
+    with pytest.raises(ValueError, match=r'sparks,gpu0'):
+        with cards.serving_turn([job], {'CUTEAFD_HW_LOCKS_HELD': 'rhea'}, 5):
+            pytest.fail('nothing may run')
 
 
 def test_resume_with_every_job_kept_never_queues(entry, tmp_path, monkeypatch):
@@ -2854,7 +2912,7 @@ def test_resume_with_every_job_kept_never_queues(entry, tmp_path, monkeypatch):
 def test_serving_turn_wait_is_bounded(entry, tmp_path, monkeypatch):
     monkeypatch.setattr(cards.hwlock, 'POLL_S', 0.005)
     job = make(entry, tmp_path)
-    with cards.hwlock.hold(['gpu1'], 1):
+    with cards.hwlock.hold(['gpu0'], 1):
         with pytest.raises(TimeoutError, match='no turn'):
             with cards.serving_turn([job], {}, 0.02):
                 pytest.fail('a conflicting turn cannot be granted')
@@ -2888,9 +2946,11 @@ def test_grouped_smoke_inherits_union_turn(entry, tmp_path, monkeypatch):
     assert seen == ['launch', ('absent', 'one'), ('absent', 'two')]
 
 
-def test_null_exclusive_uses_smokes_family_default():
-    assert cards.serving_locks([{'entry': dict(family='deepseek_v41', exclusive=None, gpus=[1])}]) == [
-        'sparks', 'gpu0', 'gpu1']
+def test_null_exclusive_does_not_widen_v41_locks():
+    # V4.1's exclusive default is a scheduling rule; the card resolved GPU1 only.
+    assert cards.serving_locks([{'entry': dict(family='deepseek_v41', exclusive=None, gpus=[1])}]) == ['gpu1']
+    assert cards.serving_locks([{'entry': dict(family='deepseek_v41', exclusive=True, gpus=[0],
+                                              sparks=['ostrich', 'dodo', 'emu'])}]) == ['sparks', 'gpu0']
 
 
 def test_cancelled_smoke_skips_remote_profile_collection(entry, tmp_path, monkeypatch):
@@ -3264,6 +3324,39 @@ def test_observer_slow_cleanup_exits_within_hook_wait_and_preserves_failures(ent
         cards.observe(job)
 
 
+def test_trace_rejects_nonempty_off_only_cycles(entry, tmp_path):
+    job = cards.generate(entry, 'a', dict(instance='t', slot='s'), tmp_path, tmp_path / 'key', {}, set(), None, 1, trace=True)
+    job['entry'].update(profile='panels:', baseline=False)
+    trace = Path(job['state']) / 'speculation-trace.jsonl'
+    trace.write_text(('{}\n'.format(json.dumps({'cycle_ms': 10, 'depths': [0]}))) * 10)
+    row = cards.summarize_job(job, 0)
+    assert row['failure_kind'] == 'measurement'
+    assert 'zero proposed tokens' in row['error']
+    trace.write_text(('{}\n'.format(json.dumps({'cycle_ms': 10, 'depths': [3]}))) * 10)
+    assert cards.summarize_job(job, 0)['status'] == 'pass'
+    logs = Path(job['state']) / 'smoke' / 'logs'
+    logs.mkdir(parents=True)
+    (logs / 'test.coordinator.log').write_text('DRAFT_LENGTH=5 ignored: no speculator\n')
+    assert 'no speculator' in cards.summarize_job(job, 0)['error']
+
+
+def test_planned_speculator_identity_is_stable_and_explicit(entry, tmp_path):
+    job = make(entry, tmp_path)
+    cards.planned_speculator(job, {'speculator': 'dspark'})
+    assert job['planned_speculator'] == 'dspark'
+    with pytest.raises(ValueError, match='changed since enqueue'):
+        cards.planned_speculator(job, {'speculator': 'off'})
+    job.pop('planned_speculator')
+    job['entry']['set']['SPECULATOR'] = 'off'
+    cards.planned_speculator(job, {'speculator': 'off'})
+    with pytest.raises(ValueError, match='differs from requested'):
+        cards.planned_speculator(job, {'speculator': 'dspark'})
+    job.pop('planned_speculator')
+    job['entry']['set'].update(SPECULATOR='auto', DRAFT_LENGTH='5')
+    with pytest.raises(ValueError, match='no speculator'):
+        cards.planned_speculator(job, {'speculator': 'off'})
+
+
 @pytest.mark.parametrize('profile,policy,expected', [('', 'simple', 'off'),
     ('', 'shared', 'on (perturbing)'), ('draft-timing', 'simple', 'on (perturbing)'),
     ('transport-timing', 'simple', 'on (perturbing)'), ('census', 'simple', 'off')])
@@ -3287,9 +3380,9 @@ def test_deployment_preflight_uses_the_same_launcher_admission(entry, tmp_path, 
     calls = []
     def launch(cmd, **kwargs):
         calls.append((cmd, kwargs))
-        return SimpleNamespace(stdout='launcher summary\n{"spark_roles": []}\n')
+        return SimpleNamespace(stdout='launcher summary\n{"spark_roles": [], "speculator": "dspark"}\n')
     monkeypatch.setattr(original, "run", launch)
-    assert original.preflight_deployment(job, arm) == {"spark_roles": []}
+    assert original.preflight_deployment(job, arm) == {"spark_roles": [], "speculator": "dspark"}
     cmd, kwargs = calls[0]
     assert cmd[:3] == [str(ROOT / "run.sh"), "--config", job["entry"]["config"]]
     assert "--dry-run" in cmd and "--total-capacity" in cmd
@@ -4047,3 +4140,175 @@ def test_warm_lossless_panel_config_reaches_matrix(entry, tmp_path, monkeypatch)
     e = json.loads(next(state.glob('*/matrix.json')).read_text())['entries'][0]
     assert e['profile'] == 'panels:spec_lossless_set' and e['baseline'] is False
     assert e['panel_config'] == {'spec_lossless_set': {'warm': True}}
+
+
+@pytest.mark.parametrize('fail_fourth,short_hit', [(False, False), (True, False), (False, True)])
+def test_image_prefix_probe_receipts_and_http_failure(tmp_path, monkeypatch, fail_fourth, short_hit):
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    calls = []
+    class Server(BaseHTTPRequestHandler):
+        def log_message(self, *args):
+            pass
+        def do_GET(self):
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(json.dumps({'data': [{'id': 'test'}]}).encode())
+        def do_POST(self):
+            body = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
+            if self.path == '/v1/responses/input_tokens':
+                prefix = body['input'][0]['content'][0]['text']
+                count = 1201 if ' odd.' in prefix else 1200
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(json.dumps(dict(exact_token_count=True, input_tokens=count)).encode())
+                return
+            if self.path == '/v1/bench/probe':
+                cold = body['spec'].get('cold', False)
+                self.send_response(200)
+                self.end_headers()
+                state = dict(end=3, sha256='capture', bytes=12)
+                self.wfile.write(json.dumps(dict(probe=dict(cold=cold, no_speculation=True,
+                    generated=[7, 8, 9], prompt_ids=[1, 2, 3], rows=[],
+                    states=[dict(kind='prompt', **state)] + ([] if cold else [dict(kind='restore', **state)]),
+                    cached_tokens=0 if cold else 3))).encode())
+                return
+            calls.append(body)
+            index = (len(calls) - 1) % 5
+            if fail_fourth and len(calls) == 4:
+                self.send_response(500)
+                self.end_headers()
+                self.wfile.write(b'{"error":"injected restore failure"}')
+                return
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(json.dumps({'choices': [{'message': {'content':
+                ['21', '35', 'Red and blue.', 'Yes.', 'Yes.'][index]}}], 'usage': {
+                'prompt_tokens': 1201 if ' odd.' in body['messages'][0]['content'][0]['text'] else 1200,
+                'prompt_cache_hit_tokens': (1 if short_hit else (1201 if ' odd.' in body['messages'][0]['content'][0]['text'] else 1200)) if index == 4 else 0,
+                'prefix_cache_source': 'device' if index == 4 else 'miss'}}).encode())
+    server = ThreadingHTTPServer(('127.0.0.1', 0), Server)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    monkeypatch.setenv('CUTEAFD_API_KEY', 'fixture')
+    try:
+        url = f'http://127.0.0.1:{server.server_port}'
+        if fail_fourth:
+            with pytest.raises(RuntimeError, match='HTTP 500'):
+                cards.image_prefix_probe(url, tmp_path)
+            assert 'HTTP 500' in json.loads((tmp_path / 'image-prefix-attempt-1/image-prefix-even-image-b.json').read_text())['error']
+            assert len(calls) == 4
+        elif short_hit:
+            with pytest.raises(ValueError, match='exact image ancestor did not hit'):
+                cards.image_prefix_probe(url, tmp_path)
+        else:
+            assert len(cards.image_prefix_probe(url, tmp_path)) == 15
+            assert len(list((tmp_path / 'image-prefix-attempt-1').glob('image-prefix-*.json'))) == 36
+            assert calls[0]['messages'][0]['content'][0] == calls[3]['messages'][0]['content'][0]
+            assert len(calls[10]['messages'][0]['content'][0]['text']) > 100_000
+            assert len(calls[4]['messages']) == 3
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()
+
+
+@pytest.mark.parametrize('probe', ['image', 'image-prefix'])
+def test_matched_prompts_refuses_arm_scoped_image_probe(entry, tmp_path, monkeypatch, probe):
+    kit = tmp_path / 'kit'
+    kit.mkdir()
+    (kit / 'matrix-main.json').write_text(json.dumps(dict(entries=[entry])))
+    monkeypatch.setattr(sys, 'argv', ['wip-cards', '--kit', str(kit), '--cards', 'v41-min',
+        '--interleave', '--matched-prompts', '--arm', 'candidate=test:s', '--arm', 'base=base:s',
+        '--probe', f'candidate:v41-min:{probe}', '--state', str(tmp_path / 'state'), '--dry-run'])
+    with pytest.raises(ValueError, match='image probe'):
+        cards.main()
+
+
+def test_image_prefix_probe_rejects_cold_warm_token_drift(tmp_path, monkeypatch):
+    # Exercise the exactness comparison directly without depending on language answers.
+    def http(url, path, body=None, timeout=120):
+        if path == '/v1/models':
+            return {'data': [{'id': 'test'}]}
+        if path == '/v1/responses/input_tokens':
+            return dict(exact_token_count=True, input_tokens=1200)
+        if path == '/v1/bench/probe':
+            cold = body['spec'].get('cold', False)
+            return dict(probe=dict(cold=cold, no_speculation=True, generated=[1 if cold else 2],
+                                  prompt_ids=[1], cached_tokens=0 if cold else 1))
+        messages = body['messages']
+        question = messages[-1]['content']
+        if isinstance(question, list): question = question[-1]['text']
+        answer = '21' if 'entry 3' in question else '35' if 'entry 5' in question else 'Red and blue' if 'colours' in question else 'Yes'
+        return {'choices': [{'message': {'content': answer}}], 'usage': {
+            'prompt_tokens': 1200, 'prompt_cache_hit_tokens': 1200 if len(messages) == 3 else 0,
+            'prefix_cache_source': 'device' if len(messages) == 3 else 'miss'}}
+    monkeypatch.setattr(cards, 'http', http)
+    with pytest.raises(ValueError, match='cold/warm image output token IDs differ'):
+        cards.image_prefix_probe('fixture', tmp_path)
+
+
+def test_image_prefix_attempts_preserve_failed_verdict_and_receipts(tmp_path, monkeypatch):
+    def attempt(url, dest):
+        cards.save(dest / 'response.json', {'cached_tokens': 7})
+        raise ValueError('next-turn exactness injected')
+    monkeypatch.setattr(cards, 'image_prefix_attempt', attempt)
+    for _ in range(2):
+        with pytest.raises(ValueError, match='next-turn exactness injected'):
+            cards.image_prefix_probe('fixture', tmp_path)
+    for number in [1, 2]:
+        path = tmp_path / f'image-prefix-attempt-{number}'
+        assert json.loads((path / 'response.json').read_text()) == {'cached_tokens': 7}
+        assert json.loads((path / 'verdict.json').read_text()) == {
+            'status': 'failed', 'error': 'next-turn exactness injected'}
+
+
+@pytest.mark.parametrize('failure', [None, 'state', 'repeat', 'reference'])
+def test_next_turn_fidelity_checks_capture_and_self_determinism(failure):
+    import copy
+    state = dict(end=40061, sha256='captured', bytes=38370299)
+    reference = dict(prompt_ids=[1, 2], generated=[10240, 1], rows=[{'hash': 'fixed'}],
+                     states=[dict(kind='prompt', **state)])
+    warm = dict(reference, states=[dict(kind='restore', **state), dict(kind='prompt', **state)])
+    repeat = copy.deepcopy(warm)
+    if failure == 'state': warm['states'][0]['sha256'] = 'corrupted'
+    if failure == 'repeat': repeat['generated'] = [16520, 1]
+    if failure == 'reference': reference['generated'] = [16520, 1]
+    if failure:
+        with pytest.raises(ValueError): cards.image_next_turn_fidelity(reference, warm, repeat)
+    else:
+        cards.image_next_turn_fidelity(reference, warm, repeat)
+
+
+def test_sustained_levels_panel_config_reaches_matrix(entry, tmp_path, monkeypatch):
+    kit = _kit(tmp_path, entry)
+    state = tmp_path / 'sustained-state'
+    monkeypatch.setattr(sys, 'argv', ['wip-cards', '--kit', str(kit), '--cards', 'v41-min', '--matrix',
+        '--arm', 'a=b:s', '--state', str(state), '--panels', 'none', '--levels', '8,16',
+        '--panel-config', 'concurrency={"sustained":true,"multiplier":4}', '--dry-run'])
+    assert cards.main() == 0
+    e = json.loads(next(state.glob('*/matrix.json')).read_text())['entries'][0]
+    assert e['levels'] == [8, 16]
+    assert e['panel_config'] == {'concurrency': {'sustained': True, 'multiplier': 4}}
+
+
+def test_detached_termination_cannot_publish_child_success(tmp_path):
+    import signal
+    smoke = [sys.executable, '-c', 'import pathlib,signal,sys,time\n'
+             f'd=pathlib.Path({str(tmp_path)!r})\n'
+             'signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))\n'
+             '(d/"ready").touch()\nwhile True: time.sleep(0.01)\n']
+    process = cards.detached(smoke, tmp_path / 'driver.log', tmp_path / 'exit', dict(os.environ))
+    try:
+        deadline = time.monotonic() + 10
+        while not (tmp_path / 'ready').exists():
+            assert time.monotonic() < deadline and process.poll() is None
+            time.sleep(0.01)
+        cards.forward_stop(signal.SIGTERM)
+        assert cards.wait_detached(process, grace=5) == 143
+        assert (tmp_path / 'exit').read_text().strip() == '143'
+        assert 'terminated' in (tmp_path / 'driver.log').read_text()
+    finally:
+        if process.poll() is None:
+            os.killpg(process.pid, signal.SIGKILL)
+            process.wait(timeout=5)

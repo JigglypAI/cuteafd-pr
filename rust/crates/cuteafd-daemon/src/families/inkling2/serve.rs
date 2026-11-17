@@ -6,6 +6,7 @@ use std::{net::SocketAddr, path::PathBuf, sync::{Arc, Mutex}};
 
 #[derive(Debug, Clone, clap::Args)]
 pub(crate) struct ServeArgs {
+    #[command(flatten)] pub vision: crate::shared::vision::still::Options,
     #[command(flatten)] pub attention: crate::cli::CoreViewArgs,
     #[arg(long)] pub snapshot: PathBuf,
     #[arg(long, env="CUTEAFD_NATIVE_LIB")] pub native_lib: PathBuf,
@@ -62,7 +63,7 @@ pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
         cuteafd_core::concurrency::queue_depth(args.max_sequences as u64) as usize);
     let stats = Arc::new(Mutex::new(serde_json::Value::Null));
     let worker_stats = stats.clone();
-    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<Result<usize>>();
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<Result<(usize, Option<Arc<cuteafd_api::openai::media::MediaPreparer>>)>>();
     let worker_args = args.clone();
     let worker = tokio::task::spawn_blocking(move || -> Result<()> {
         let mut ready = Some(ready_tx);
@@ -81,14 +82,14 @@ pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
             // this worker before its native library and program table drop.
             let library = Arc::new(unsafe { cuteafd_ffi::NativeLibrary::load(&worker_args.native_lib)? });
             let programs = library.programs()?.with_manifest(&worker_args.manifest)?;
-            let (execution, inputs, admitted, _) = super::startup::whole(&library, &programs, &view, &checkpoint, &cfg,
+            let (execution, inputs, admitted, _, media) = super::startup::whole(&library, &programs, &view, &checkpoint, &cfg,
                 super::startup::Options { device: worker_args.device, peers: &worker_args.peers,
                     native_lib: &worker_args.native_lib, manifest: &worker_args.manifest,
                     prefill: PrefillShape { rows: prefill.unit_rows, waves: prefill.waves },
                     sequences: worker_args.max_sequences as u64, context_tokens: worker_args.max_context.unwrap_or(0) as u64,
                     pool_tokens: worker_args.pool_tokens, kv_format: worker_args.kv_format, drafter:worker_args.dspark.then_some(worker_args.draft_kv_cache), onboard: worker_args.rtx_expert_layers.resolve(cfg.layers),
                     prefix: &worker_args.prefix, resident_weights: crate::shared::memory::budget::resident_weight_limit(),
-                    expert_usage: false })?;
+                    expert_usage: false, vision: &worker_args.vision })?;
             let context = usize::try_from(admitted.solved.served_context())?;
             let family = super::cache::InklingPrefix::with_draft(execution.requests.cache.clone(),execution.draft.clone());
             let host = (inputs.host_prefix.quota_bytes > 0).then(|| {
@@ -97,16 +98,20 @@ pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
             }).transpose()?;
             let drafts = execution.draft.as_ref().map_or(scheduler::Drafts::None, |draft|
                 scheduler::Drafts::Neural { depth: draft.layout.config.transformer.block - 1 });
-            let backend = super::backend::InklingBackend::new(execution, context, host, &admitted.solved)?;
+            let binding = crate::shared::vision::perception::Binding::new(&worker_args.snapshot,
+                cuteafd_loader::media::ImageFamily::Inkling2, media.preparer.is_some(), cfg.unpadded_vocab_size as u32)?;
+            let backend = super::backend::InklingBackend::new(execution, context, host, &admitted.solved)?.with_vision(binding);
+            let mut media_admission = cuteafd_engine::media::MediaAdmission::new(
+                cuteafd_engine::media::EmbeddingCache::new(media.cache_bytes), media.encoder, worker_args.max_sequences);
             library.cuda_set_device(worker_args.device)?;
             scheduler::schedule(&backend, &worker_args.snapshot, &mut receive, &worker_stats,
                 worker_args.max_sequences, drafts, worker_args.draft_length, eos,
                 worker_args.decode_share, &worker_args.prefix, worker_args.loop_abort.config(),
-                worker_args.token_io.token_select, &mut crate::families::qwen3_5::serve::text_media(), None, || {
+                worker_args.token_io.token_select, &mut media_admission, None, || {
                     backend.require_live()?;
                     RuntimeInventory::measure(&library, &[worker_args.device], InventoryPhase::PostLoad,
                         |_| Ok(()))?.record("inkling2-serving-loaded", &[]);
-                    if let Some(ready) = ready.take() { let _ = ready.send(Ok(context)); }
+                    if let Some(ready) = ready.take() { let _ = ready.send(Ok((context, media.preparer.clone()))); }
                     Ok(())
                 })
         })();
@@ -114,7 +119,8 @@ pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
             ready.take().expect("pending readiness").send(Err(error)).map_err(|result| match result {
                 Err(error) => error, Ok(_) => unreachable!("sent error") }))
     });
-    let context = ready_rx.await.context("Inkling worker exited before readiness")??;
+    let (context, preparer) = ready_rx.await.context("Inkling worker exited before readiness")??;
+    let profile = if let Some(preparer) = preparer { profile.with_grouped_vision(preparer) } else { profile };
     let limits = args.prefix.reserve.limits(context)?;
     let snapshot = args.snapshot.clone();
     let hub = crate::shared::console::hub(false, || Ok(crate::shared::console::Layout::new("inkling2", profile.id.clone(), snapshot.clone())));
@@ -180,7 +186,7 @@ mod tests {
         assert!(source.contains("forward_initialization("));
         assert!(source.contains("finish_scheduler(&mut worker"));
         assert!(source.find("InklingEncoding::from_snapshot").unwrap() < source.find("NativeLibrary::load").unwrap());
-        let ready = source.find("ready.send(Ok(context))").unwrap();
+        let ready = source.find("ready.send(Ok((context, media.preparer.clone())))").unwrap();
         assert!(source.find("startup::whole(").unwrap() < ready);
         assert!(source.find("InklingBackend::new(").unwrap() < ready);
         assert!(source.find("backend.require_live()?").unwrap() < ready);

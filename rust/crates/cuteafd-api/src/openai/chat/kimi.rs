@@ -119,6 +119,20 @@ fn kind(value: &Value) -> &'static str {
         Value::Array(_) => "array",
     }
 }
+fn content_literals(value:&Value,literal:&mut dyn FnMut(&str)->String)->Result<String> {
+    if let Some(parts)=value.as_array() {
+        let mut out=String::new();
+        for part in parts {
+            match part["type"].as_str() {
+                Some("text")=>out.push_str(&literal(part["text"].as_str().context("Kimi text")?)),
+                Some("image_url")=>out.push_str("<|media_pad|>"),
+                _=>bail!("unsupported Kimi media part"),
+            }
+        }
+        Ok(out)
+    }else{Ok(literal(&content(value)?))}
+}
+
 fn content(value: &Value) -> Result<String> {
     match value {
         Value::Null => Ok(String::new()),
@@ -388,18 +402,18 @@ fn render_literals(body: &Value, thinking: bool, literal: &mut dyn FnMut(&str) -
         if role == "assistant" {
             calls = message["tool_calls"].as_array().cloned().unwrap_or_default();
             tool_index = 0;
+            out.push_str(&open("think", &[]));
             if thinking {
-                out.push_str(&open("think", &[]));
                 let reasoning = message
                     .get("reasoning_content")
                     .filter(|value| value.as_str().is_some_and(|s| !s.is_empty()))
                     .or_else(|| message.get("reasoning"))
                     .unwrap_or(&Value::Null);
                 out.push_str(&literal(&content(reasoning)?));
-                out.push_str(&close("think"));
             }
+            out.push_str(&close("think"));
             out.push_str(&open("response", &[]));
-            out.push_str(&literal(&content(&message["content"])?));
+            out.push_str(&content_literals(&message["content"],literal)?);
             out.push_str(&close("response"));
             if !calls.is_empty() {
                 out.push_str(&open("tools", &[]));
@@ -419,7 +433,7 @@ fn render_literals(body: &Value, thinking: bool, literal: &mut dyn FnMut(&str) -
                 out.push_str(&close("tools"));
             }
         } else {
-            out.push_str(&literal(&content(&message["content"])?));
+            out.push_str(&content_literals(&message["content"],literal)?);
         }
         out.push_str(&close("message"));
         out.push_str(END);
@@ -449,7 +463,13 @@ fn render_literals(body: &Value, thinking: bool, literal: &mut dyn FnMut(&str) -
         _ => {}
     }
     out.push_str(&open("message", &[("role", "assistant".into())]));
-    out.push_str(&open(if thinking { "think" } else { "response" }, &[]));
+    out.push_str(&open("think", &[]));
+    if !thinking {
+        // Like GLM's empty-think form, keep the trained channel structure while
+        // prefilling reasoning as empty instead of dropping the channel.
+        out.push_str(&close("think"));
+        out.push_str(&open("response", &[]));
+    }
     Ok(out)
 }
 

@@ -639,7 +639,7 @@ impl<'a> DsparkDrafter<'a> {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn load_tp2_with(library:&'a NativeLibrary,programs:&'a cuteafd_ffi::programs::Programs<'a>,
         target_projection:super::dflash::TargetProjection,snapshot:&Path,slots:usize,sequences:usize,
-        kv:cuteafd_loader::families::qwen4::Qwen4KvCache,
+        kv:cuteafd_loader::families::qwen4::Qwen4KvCache,representation:GlmDraftRepresentation,
         devices:[i32;2],lead_stream:*mut c_void,lead:usize,
         mut allocate:impl FnMut(i32,&str,usize)->Result<device::Allocation<'a>>)->Result<Self> {
         ensure!(lead<2 && library.cuda_get_device()?==devices[lead] && !lead_stream.is_null(),"block TP2 current device differs from lead");
@@ -652,7 +652,7 @@ impl<'a> DsparkDrafter<'a> {
         let cfg=DsparkConfig::read(snapshot)?;
         let window=cfg.window.context("block TP2 requires sliding window")?;
         let mut load=|rank,projection|Self::load_rank_with(library,programs,projection,snapshot,HashMap::new(),
-            exchange.stream(rank),slots,sequences,vec![0;cfg.hidden*2],GlmDraftRepresentation::Bf16Only,
+            exchange.stream(rank),slots,sequences,vec![0;cfg.hidden*2],representation,
             fp8_linear::Fp8Scales::Amax,fp8_linear::Fp8Rows::W8a16,window,slots*window,kv,None,
             rank,2,lead,&mut allocate);
         let mut body=load(lead,target_projection)?;
@@ -775,9 +775,9 @@ impl<'a> DsparkDrafter<'a> {
         ensure!(matches!(physical_ranks,1|2) && physical_rank<physical_ranks && lead<physical_ranks,
             "invalid block physical rank inventory");
         if physical_ranks==2 {
-            ensure!(native_rope.is_none() && representation==GlmDraftRepresentation::Bf16Only
+            ensure!(native_rope.is_none()
                 && cfg.window.is_some() && cfg.heads%2==0 && cfg.kv_heads%2==0 && cfg.intermediate%2==0,
-                "block TP2 requires checkpoint-native BF16 GQA with divisible heads/neurons");
+                "block TP2 requires GQA with divisible heads/neurons");
             cfg.heads/=2; cfg.kv_heads/=2; cfg.intermediate/=2;
         }
         ensure!(cfg.backbone.is_qwen3(cfg.head_dim) == native_rope.is_none(),
@@ -828,8 +828,8 @@ impl<'a> DsparkDrafter<'a> {
             cuteafd_loader::formats::block_dspark::block_dspark_rank_recipe(&source,physical_rank,physical_ranks,lead,
                 |name,shape|load.tensor(name,shape),|parts,columns,axis| {
                     match axis {
-                        Some(axis)=>load.matrix_shard(parts,columns,axis,physical_rank,physical_ranks,false,scales,stream),
-                        None=>load.matrix(parts,columns,false,scales,stream),
+                        Some(axis)=>load.matrix_shard(parts,columns,axis,physical_rank,physical_ranks,representation==GlmDraftRepresentation::Fp8Only,scales,stream),
+                        None=>load.matrix(parts,columns,representation==GlmDraftRepresentation::Fp8Only,scales,stream),
                     }.map(Matrix::Legacy)
                 })?
         } else {
@@ -931,6 +931,7 @@ impl<'a> DsparkDrafter<'a> {
             ("context_kv",&self.context_kv),("context_positions",&self.context_positions),("context_slots",&self.context_slots)] {
             owner.inventory(&mut inventory,name)?;
         }
+        if let Some(owner) = &self.fp8_workspace { owner.inventory(&mut inventory,"workspace.fp8-linear")?; }
         if let Some(workspace) = self.workspace.borrow().as_ref() {
             for (name,owner) in [("h",&workspace.h),("n",&workspace.n),("qkv",&workspace.qkv),
                 ("q",&workspace.q),("k",&workspace.k),("v",&workspace.v),("attn",&workspace.attn),
@@ -1256,6 +1257,16 @@ impl<'a> DsparkDrafter<'a> {
             }
         }
         Ok(())
+    }
+
+    pub(crate) fn quarantine_pages(&self, slot: usize) {
+        if let Some(split) = &self.head_split { split.peer.quarantine_pages(slot); }
+        if let Some(context) = &self.paged {
+            let mut state = context.state.borrow_mut();
+            if let Some(binding) = state.bindings.get(slot).copied().flatten() {
+                state.pool.quarantine(binding).expect("live block binding belongs to its pool");
+            }
+        }
     }
 
     pub(crate) fn discard_context(&self, slot: usize) -> Result<()> {
@@ -1973,7 +1984,7 @@ mod tests {
                 crate::shared::memory::TEST_ARENA)).collect::<Result<Vec<_>>>()?;
             let stream=Stream::new(devices[lead])?;
             let mut draft=devices[lead].own(||DsparkDrafter::load_tp2_with(&library,&programs,
-                super::super::dflash::TargetProjection::Native,root.path(),2,2,kv,[0,1],stream.raw,lead,
+                super::super::dflash::TargetProjection::Native,root.path(),2,2,kv,GlmDraftRepresentation::Bf16Only,[0,1],stream.raw,lead,
                 |physical,name,bytes|arenas[physical as usize].view(name,bytes)))?;
             let split=draft.head_split.as_ref().context("missing paired block owner")?;
             assert!(draft.head.is_some() && split.peer.head.is_none());

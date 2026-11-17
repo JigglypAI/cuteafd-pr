@@ -47,10 +47,11 @@ impl<'a> Execution<'a> {
         self.graphs.cache_cycle(crate::shared::decode_graph::device::Cycle::Prefill);
         let slots = placements.iter().map(|placement| placement.slot).collect::<Vec<_>>();
         let starts = placements.iter().map(|placement| placement.len).collect::<Vec<_>>();
+        let media = placements.iter().map(|placement| placement.media.clone()).collect::<Vec<_>>();
         let result = (|| {
             let waves = self.link.exchange()?;
             let mut io = TokenIo { kernels: &self.kernels, head: &self.head, cache: &self.requests.cache,
-                target: &self.target, cfg: &self.cfg, tokens, starts: &starts, slots: &slots, retained_rows: false, draft:self.draft.as_deref(),publish_draft:true,trace:None,on_logits };
+                target: &self.target, cfg: &self.cfg, tokens, media: &media, starts: &starts, slots: &slots, retained_rows: false, draft:self.draft.as_deref(),publish_draft:true,trace:None,on_logits };
             Stateful { kernels: &self.kernels, owners: &self.requests.prefill, cache: &self.requests.cache,
                 target: &self.target, cfg: &self.cfg, ingress: &self.ingress, placements, uploads: &mut self.requests.prefill_uploads,
                 waves, onboarded: self.local.len(), local: &self.local, next_identity: &mut self.next_identity,
@@ -71,10 +72,11 @@ impl<'a> Execution<'a> {
         self.graphs.cache_cycle(crate::shared::decode_graph::device::Cycle::Decode);
         let slots = placements.iter().map(|placement| placement.slot).collect::<Vec<_>>();
         let starts = placements.iter().map(|placement| placement.len).collect::<Vec<_>>();
+        let media = placements.iter().map(|placement| placement.media.clone()).collect::<Vec<_>>();
         let result = (|| {
             let waves = self.link.exchange()?;
             let mut io = TokenIo { kernels: &self.kernels, head: &self.head, cache: &self.requests.cache,
-                target: &self.target, cfg: &self.cfg, tokens, starts: &starts, slots: &slots, retained_rows: true, draft:self.draft.as_deref(),publish_draft:false,trace:self.width_trace.as_ref(),
+                target: &self.target, cfg: &self.cfg, tokens, media: &media, starts: &starts, slots: &slots, retained_rows: true, draft:self.draft.as_deref(),publish_draft:false,trace:self.width_trace.as_ref(),
                 on_logits: &mut |_, _, _| Ok(()) };
             Stateful { kernels: &self.kernels, owners: std::slice::from_ref(&self.requests.decode),
                 cache: &self.requests.cache, target: &self.target, cfg: &self.cfg, ingress: &self.ingress, placements,

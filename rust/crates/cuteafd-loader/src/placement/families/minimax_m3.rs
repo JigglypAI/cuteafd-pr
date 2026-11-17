@@ -333,13 +333,7 @@ pub struct Drafter {
 }
 
 /// Bundled CLIP 3D-RoPE tower and projector: own arena plus scratch.
-#[derive(Debug, Clone)]
-pub struct Vision {
-    pub arena: WeightArenaLayout,
-    pub scratch: u64,
-    /// Host embedding cache quota for prepared images.
-    pub media_cache: u64,
-}
+pub type Vision = crate::placement::still_encoder::StillEncoder;
 
 /// Everything both edges know before one solve.
 #[derive(Debug, Clone)]
@@ -351,8 +345,8 @@ pub struct MiniMaxInputs {
     pub split_wire: Option<WirePrecision>,
     pub spark_ranks: usize,
     pub context: Context,
-    /// Largest pool the build indexes (KV max), in tokens.
-    pub maximum_pool_tokens: u64,
+    /// The resolved pool policy used for both curve preparation and admission.
+    pub pool: crate::placement::PoolPolicy,
     pub prefill: PrefillShape,
     /// Boot concurrency C: per-sequence page tables, lane members, selector.
     pub sequences: u64,
@@ -492,7 +486,7 @@ fn with(mut components: Vec<Component>, activation: &Activation) -> Vec<Componen
 }
 
 impl MiniMaxInputs {
-    pub fn maximum_pages(&self) -> u64 { self.maximum_pool_tokens.div_ceil(PAGE_ROWS) }
+    pub fn maximum_pages(&self) -> u64 { self.pool.maximum_tokens().div_ceil(PAGE_ROWS) }
 
     pub fn request_capacity(&self) -> Result<RequestCapacity, Refusal> {
         RequestCapacity::with_queries(self.sequences, self.prefill.rows,
@@ -575,7 +569,7 @@ impl MiniMaxInputs {
     pub fn counts(&self) -> Vec<usize> { (0..=self.routed.len()).collect() }
 
     pub fn admit(&self, request: Request) -> Result<AdmittedMiniMax, Refusal> {
-        let solved = solve(request, self.budgets.clone(), self)?;
+        let solved = solve_prepared(request, self.budgets.clone(), self, &self.pool)?;
         let placement = self.execution(&solved)?;
         let onboard = placement.onboard_layers;
         Ok(AdmittedMiniMax { placement, onboard, expert_backings: self.expert_backings[onboard].clone(),
@@ -1021,19 +1015,10 @@ impl Recipe for MiniMaxInputs {
                     ByteCurve::linear(draft.state_per_page, draft.state_per_page, maximum), false, maximum));
             }
         }
-        // Optional bundled vision tower: own arena; `Encoder` domain [on, off].
+        // Independent bundled tower shares the target/KV/expert joint solve.
         if let Some(vision) = &self.vision {
-            let variable = contract_variables.len();
-            contract_variables.push(Variable::Encoder(vec![0, 1]));
-            let on = Activation::choice(variable, 0);
-            let location = Location::coordinator(head);
-            components.extend(with(weight_arena_components(&vision.arena, location, Lifetime::RESIDENT, maximum,
-                MemoryKind::Weights)?, &on));
-            components.extend(buffer("minimax.vision.scratch", location, vision.scratch, Lifetime::TARGET,
-                Category::Workspace, "vision tower scratch", maximum).map(|mut c| { c.activation = on.clone(); c }));
-            components.extend(buffer("minimax.host.media", Location::HOST, vision.media_cache,
-                Lifetime { first: Phase::Warmup, last: Phase::Growth }, Category::Embedding, "media/embedding-cache",
-                maximum).map(|mut c| { c.activation = on.clone(); c }));
+            vision.extend(&mut contract_variables, &mut components, maximum)?;
+            vision.require_spark_worker(&contract_variables, &mut requires);
         }
         // Target and drafter borrow the same native thread-local BLAS pool.
         // The shared borrower union charges its GEMM handle exactly once.

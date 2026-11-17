@@ -231,11 +231,29 @@ fn resolve_settings(args: &mut PlanArgs, family: &str, cfg: &std::collections::B
             "GLM5_FLASH_REPLAY_RECORDS=shared keeps the records in one GPU's prefill scratch; serve it without a head split");
     }
     if family == "kimi_k3" {
-        let fp8 = defaults::kimi_draft_fp8(args.draft_fp8, args.speculator == "dflash2");
+        if args.draft_fp8.is_none() {
+            args.draft_fp8 = match cfg.get("SPECULATOR_FP8").map(String::as_str) {
+                Some("on") => Some(true), Some("off") => Some(false), None | Some("") | Some("auto") => None,
+                _ => anyhow::bail!("SPECULATOR_FP8 must be auto, on or off"),
+            };
+        }
+        let native_default = args.speculator == "dspark" && kimi_qualification(args, cfg).qualified();
+        let fp8 = defaults::selected(args.draft_fp8, None,
+            args.speculator == "dflash2" || native_default,
+            "FP8 for content-paired K3.1 block DSpark in every view and explicit Kimi DFlash2");
         args.draft_fp8 = Some(fp8.value);
         resolved.insert("draft_fp8".into(), setting(fp8));
     }
     if family == "mimo_v2" {
+        let configured = match cfg.get("SPECULATOR_FP8").map(String::as_str) {
+            Some("on" | "auto") => Some(true), Some("off") => Some(false), None | Some("") => None,
+            _ => anyhow::bail!("SPECULATOR_FP8 must be auto, on or off"),
+        };
+        let fp8 = defaults::selected(args.draft_fp8.or(args.mimo_draft_bf16.then_some(false)),
+            configured, true, "FP8 MiMo DFlash body for unset/auto/on; off keeps BF16");
+        args.draft_fp8 = Some(fp8.value);
+        args.mimo_draft_bf16 = !fp8.value;
+        resolved.insert("draft_fp8".into(), setting(fp8));
         let depth = defaults::mimo_mtp_depth((args.explicit_settings.contains("native_mtp_layers")).then_some(args.native_mtp_layers),
             cfg.get("SPECULATOR_DEPTH").filter(|v| !v.is_empty()).map(|v| v.parse().context("SPECULATOR_DEPTH")).transpose()?, args.speculator == "mtp");
         args.native_mtp_layers = depth.value;
@@ -559,15 +577,13 @@ fn run_plan_with_host(mut args: PlanArgs) -> Result<()> {
     let replay_explicit = args.replay_records;
     let mut settings = resolve_settings(&mut args, family, &cfg)?;
     if family == "glm5_flash" {
-        let home = args.hf_home.clone().unwrap_or_else(default_hf_home);
         settings.insert("speculator".into(), setting(cuteafd_core::launch_settings::glmf_speculator(
-            (requested_speculator != "auto" || args.explicit_settings.contains("speculator")).then_some(requested_speculator.as_str()), cfg.get("SPECULATOR").map(String::as_str),
-            cuteafd_loader::model_cache_dir(&home, GLMF_DEFAULT_DRAFTER).is_dir())));
+            (requested_speculator != "auto" || args.explicit_settings.contains("speculator")).then_some(requested_speculator.as_str()), cfg.get("SPECULATOR").map(String::as_str))));
     }
     if family == "mimo_v2" {
         settings.insert("speculator".into(), setting(cuteafd_core::launch_settings::mimo_speculator(
             (requested_speculator != "auto" || args.explicit_settings.contains("speculator")).then_some(requested_speculator.as_str()),
-            cfg.get("SPECULATOR").map(String::as_str), checkpoint_model_id(&args, &cfg))));
+            cfg.get("SPECULATOR").map(String::as_str), mimo_drafter_available(&args, &snapshot, &cfg))));
     }
     if (args.no_speculator || args.include_speculator || args.drafter_snapshot.is_some())
         && matches!(family, "glm5_flash" | "mimo_v2") {
@@ -576,13 +592,13 @@ fn run_plan_with_host(mut args: PlanArgs) -> Result<()> {
     }
     if family == "kimi_k3" {
         settings.insert("speculator".into(),setting(cuteafd_core::launch_settings::kimi_speculator(
-            (requested_speculator != "auto").then_some(requested_speculator.as_str()),cfg.get("SPECULATOR").map(String::as_str))?));
+            (requested_speculator != "auto").then_some(requested_speculator.as_str()),cfg.get("SPECULATOR").map(String::as_str), kimi_qualification(&args, &cfg))?));
     }
     if args.resolve_settings_only {
         let mut output = resolved_output(serde_json::json!({"family": family}), &args, settings, &cfg, replay_explicit);
         output["speculator"] = serde_json::json!(args.speculator);
         output["default_drafter"] = serde_json::json!(if family == "kimi_k3" { cuteafd_core::launch_settings::KIMI_K31_DSPARK } else { GLMF_DEFAULT_DRAFTER });
-        if family == "kimi_k3" { output["default_drafter_revision"]=serde_json::json!(cuteafd_core::launch_settings::KIMI_K31_DSPARK_REVISION); }
+        if family == "kimi_k3" { output["draft_kv_cache"]=serde_json::json!(kimi_qualification(&args, &cfg).draft_kv); output["default_drafter_revision"]=serde_json::json!(cuteafd_core::launch_settings::KIMI_K31_DSPARK_REVISION); }
         println!("{}", serde_json::to_string(&output)?);
         return Ok(());
     }
@@ -852,11 +868,169 @@ fn checkpoint_model_id<'a>(args: &'a PlanArgs, cfg: &'a std::collections::BTreeM
 
 const GLMF_DEFAULT_DRAFTER: &str = "incoai/GLM-5.3-Flash-DFlash2";
 
+fn kimi_target_matches(snapshot: &std::path::Path) -> Result<bool> {
+    let config: serde_json::Value = cuteafd_loader::read_json_file(&snapshot.join("config.json"))?;
+    Ok(config["model_type"] == "kimi_k31" || config["architectures"].as_array()
+        .is_some_and(|a| a.iter().any(|v| v == "KimiK31ForConditionalGeneration")))
+}
+
+fn kimi_content_matches(snapshot: &std::path::Path, draft: &std::path::Path) -> Result<bool> {
+    let target: serde_json::Value = cuteafd_loader::read_json_file(&snapshot.join("config.json"))?;
+    let drafter: serde_json::Value = cuteafd_loader::read_json_file(&draft.join("config.json"))?;
+    kimi_pair_metadata(&target, &drafter, snapshot)?;
+    Ok(true)
+}
+
+enum DraftPairDialect<'a> {
+    Speculators,
+    Native { config: &'a serde_json::Value, draft: &'a serde_json::Value },
+}
+
+impl<'a> DraftPairDialect<'a> {
+    fn read(draft: &'a serde_json::Value) -> Result<Self> {
+        if draft.get("speculators_config").is_some() || draft["speculators_model_type"] == "dspark" {
+            return Ok(Self::Speculators);
+        }
+        anyhow::ensure!(draft["architectures"].as_array().is_some_and(|a| a.iter().any(|v|
+            matches!(v.as_str(),Some("Qwen3DSparkModel"|"DSparkDraftModel"|"DFlash2DraftModel")))),
+            "drafter pairing: unsupported native draft architecture");
+        let config=draft.get("dflash_config").context("drafter pairing: native dflash_config missing")?;
+        Ok(Self::Native {config,draft})
+    }
+}
+
+fn kimi_pair_metadata(target: &serde_json::Value, draft: &serde_json::Value, snapshot: &std::path::Path) -> Result<()> {
+    if let DraftPairDialect::Native {config,draft}=DraftPairDialect::read(draft)? {
+        let text=target.get("text_config").unwrap_or(target);
+        anyhow::ensure!(target["architectures"].as_array().is_some_and(|a|
+            a.iter().any(|v|v=="KimiK31ForConditionalGeneration")),
+            "drafter pairing mismatch: native draft requires K3.1 target architectures");
+        for (field,target_field) in [("num_target_layers","num_hidden_layers"),("hidden_size","hidden_size"),
+            ("vocab_size","vocab_size"),("draft_vocab_size","vocab_size")] {
+            anyhow::ensure!(draft[field].as_u64().is_some()&&draft[field]==text[target_field],
+                "drafter pairing mismatch: {field}: drafter={}, target={}",draft[field],text[target_field]);
+        }
+        let layers=text["num_hidden_layers"].as_u64().context("drafter pairing: target layer count missing")?;
+        let taps=config["target_layer_ids"].as_array().context("drafter pairing: native target_layer_ids missing")?;
+        let mut unique=std::collections::BTreeSet::new();
+        anyhow::ensure!(!taps.is_empty()&&taps.iter().all(|v|v.as_u64().is_some_and(|n|n<layers&&unique.insert(n))),
+            "drafter pairing mismatch: target_layer_ids outside target layer count or duplicated");
+        for field in ["bos_token_id","eos_token_id","pad_token_id"] {
+            let expected=text.get(field).or_else(||target.get(field));
+            anyhow::ensure!(draft.get(field).is_some_and(|v|!v.is_null()&&Some(v)==expected),
+                "drafter pairing mismatch: {field} differs from target");
+        }
+        let vocab=text["vocab_size"].as_u64().unwrap_or(0);
+        // Native block masking uses a dedicated vocabulary token, not PAD.
+        anyhow::ensure!(config["mask_token_id"].as_u64().is_some_and(|n|n<vocab),
+            "drafter pairing mismatch: native mask_token_id outside target vocabulary");
+        return Ok(());
+    }
+    let verifier = &draft["speculators_config"]["verifier"];
+    let architectures = verifier["architectures"].as_array().context("drafter pairing: verifier.architectures missing")?;
+    anyhow::ensure!(architectures.iter().any(|v| target["architectures"].as_array().is_some_and(|a| a.contains(v))),
+        "drafter pairing mismatch: verifier.architectures differs from target architectures");
+    let declared = verifier["name_or_path"].as_str().context("drafter pairing: verifier.name_or_path missing")?;
+    let manifest = snapshot.join("cuteafd-mc.json");
+    let mc: serde_json::Value = if manifest.is_file() { cuteafd_loader::read_json_file(&manifest)? } else { serde_json::Value::Null };
+    let hub_identity = snapshot.components().find_map(|part| part.as_os_str().to_str()?.strip_prefix("models--")
+        .map(|name| name.replace("--", "/")));
+    let identity = mc["source"]["repo"].as_str().or_else(|| target["_name_or_path"].as_str().filter(|s| !s.is_empty()))
+        .or(hub_identity.as_deref()).context("drafter pairing: target model identity missing (source.repo or _name_or_path)")?;
+    // Organization aliases preserve the declared model name (official and verifier mirrors).
+    let model_name = |id: &str| id.trim_end_matches('/').rsplit('/').next().unwrap_or("").to_ascii_lowercase();
+    anyhow::ensure!(model_name(declared) == model_name(identity),
+        "drafter pairing mismatch: verifier.name_or_path={declared} differs from target source.repo={identity}");
+    let text = target.get("text_config").unwrap_or(target);
+    let body = draft.get("transformer_layer_config").unwrap_or(draft);
+    for (field, value) in [("hidden_size",draft.get("target_hidden_size").filter(|v| !v.is_null()).unwrap_or(&body["hidden_size"])),
+        ("vocab_size", &draft["draft_vocab_size"])] {
+        anyhow::ensure!(value.as_u64().is_some() && value == &text[field],
+            "drafter pairing mismatch: {field}: drafter={value}, target={}",text[field]);
+    }
+    anyhow::ensure!(body["vocab_size"] == text["vocab_size"], "drafter pairing mismatch: transformer_layer_config.vocab_size");
+    let layers = text["num_hidden_layers"].as_u64().context("drafter pairing: num_hidden_layers missing")?;
+    let taps = draft["aux_hidden_state_layer_ids"].as_array().context("drafter pairing: aux_hidden_state_layer_ids missing")?;
+    anyhow::ensure!(!taps.is_empty() && taps.iter().all(|v| v.as_u64().is_some_and(|n| n > 0 && n <= layers)),
+        "drafter pairing mismatch: aux_hidden_state_layer_ids outside target num_hidden_layers={layers}");
+    let mask = draft["mask_token_id"].as_u64().context("drafter pairing: mask_token_id missing")?;
+    anyhow::ensure!(mask < text["vocab_size"].as_u64().unwrap_or(0)
+        && text.get("pad_token_id").or_else(|| target.get("pad_token_id")).and_then(|v|v.as_u64()) == Some(mask),
+        "drafter pairing mismatch: mask_token_id differs from target pad_token_id or vocabulary");
+    Ok(())
+}
+
+fn require_default_drafter(args: &PlanArgs, cfg: &std::collections::BTreeMap<String, String>,
+    default_model: &str, default_revision: Option<&str>) -> Result<PathBuf> {
+    let model = cfg.get("SPECULATOR_MODEL_ID").filter(|v| !v.is_empty()).map(String::as_str).unwrap_or(default_model);
+    let revision = cfg.get("SPECULATOR_MODEL_REVISION").filter(|v| !v.is_empty()).map(String::as_str)
+        .or_else(|| (model == default_model).then_some(default_revision).flatten());
+    let home = args.hf_home.clone().unwrap_or_else(default_hf_home);
+    let remedy = format!("default drafter {model}@{} is unavailable or missing config.json; run `nest hf download {model}{}` or set SPECULATOR=off",
+        revision.unwrap_or("main"), revision.map(|r| format!(" --revision {r}")).unwrap_or_default());
+    let path = if let Some(path) = &args.drafter_snapshot { path.clone() } else {
+        resolve_snapshot_at_revision(model, Some(&home), revision).with_context(|| remedy.clone())?
+            .snapshot_path.with_context(|| remedy.clone())?
+    };
+    anyhow::ensure!(path.join("config.json").is_file(), "{remedy}: {}", path.display());
+    Ok(path)
+}
+
+fn resolve_kimi_content(args: &PlanArgs, snapshot: &std::path::Path,
+    cfg: &std::collections::BTreeMap<String, String>) -> Result<bool> {
+    if args.no_speculator || args.speculator == "off"
+        || (args.speculator == "auto" && cfg.get("SPECULATOR").is_some_and(|v| v == "off")) { return Ok(false); }
+    if !kimi_target_matches(snapshot)? {
+        anyhow::ensure!(args.speculator != "dspark" && cfg.get("SPECULATOR").is_none_or(|v| v != "dspark"),
+            "drafter pairing mismatch: verifier.architectures requires a K3.1 target");
+        return Ok(false);
+    }
+    let mut qualification = kimi_qualification(args, cfg);
+    qualification.content_qualified = true;
+    let selection = cuteafd_core::launch_settings::kimi_speculator(
+        (args.speculator != "auto").then_some(args.speculator.as_str()), cfg.get("SPECULATOR").map(String::as_str), qualification)?;
+    if args.no_speculator || selection.value == "off" { return Ok(false); }
+    if selection.value != "dspark" { return Ok(false); }
+    let draft = require_default_drafter(args, cfg, cuteafd_core::launch_settings::KIMI_K31_DSPARK,
+        Some(cuteafd_core::launch_settings::KIMI_K31_DSPARK_REVISION))?;
+    kimi_content_matches(snapshot, &draft)
+}
+
+fn kimi_qualification<'a>(args: &'a PlanArgs, _cfg: &'a std::collections::BTreeMap<String, String>)
+    -> cuteafd_core::launch_settings::KimiDraftQualification<'a> {
+    use cuteafd_loader::{plan::checkpoint::CoreView, families::qwen4::Qwen4KvCache};
+    cuteafd_core::launch_settings::KimiDraftQualification {
+        content_qualified: args.kimi_content_qualified,
+        core_view: match args.attention.core_view { CoreView::Original => "original", CoreView::K6Compact => "k6-compact", _ => "unqualified" },
+        rtx: args.rtx,
+        target_kv: if args.kv_format.unwrap_or_default() == cuteafd_core::MlaCacheFormat::Fp8 { "fp8" } else { "bf16" },
+        draft_kv: if args.draft_kv_cache == Qwen4KvCache::Bf16 { "bf16" } else { "fp8" },
+    }
+}
+
+
+// Family detection already establishes the target architecture. Drafter loading
+// validates native config, taps and tensor shapes; aliases and MC views do not
+// change whether the checkpoint bundles (or explicitly configures) a drafter.
+fn mimo_drafter_available(args: &PlanArgs, snapshot: &std::path::Path,
+    cfg: &std::collections::BTreeMap<String, String>) -> bool {
+    args.drafter_snapshot.is_some() || snapshot.join("dflash").is_dir()
+        || ["SPECULATOR_MODEL_ID", "DRAFT_MODEL_ID"].iter()
+            .any(|key| cfg.get(*key).is_some_and(|value| !value.is_empty()))
+}
+
 fn resolve_speculator(args: &mut PlanArgs, snapshot: &std::path::Path, family: &str,
     cfg: &std::collections::BTreeMap<String, String>) -> Result<()> {
     if family == "kimi_k3" {
+        if !args.explicit_settings.contains("draft_kv_cache") {
+            args.draft_kv_cache = match cfg.get("DRAFT_KV_CACHE") {
+                Some(value) => value.parse()?,
+                None => args.draft_kv_cache,
+            };
+        }
+        args.kimi_content_qualified = resolve_kimi_content(args, snapshot, cfg)?;
         args.speculator=cuteafd_core::launch_settings::kimi_speculator(
-            (args.speculator != "auto").then_some(args.speculator.as_str()),cfg.get("SPECULATOR").map(String::as_str))?.value;
+            (args.speculator != "auto").then_some(args.speculator.as_str()),cfg.get("SPECULATOR").map(String::as_str), kimi_qualification(&args, &cfg))?.value;
     }
     let default = match family {
         "minimax_m3" | "inkling2" => "dspark",
@@ -869,15 +1043,17 @@ fn resolve_speculator(args: &mut PlanArgs, snapshot: &std::path::Path, family: &
         _ => "off",
     };
     if family == "glm5_flash" && !args.no_speculator {
-        let hf_home = args.hf_home.clone().unwrap_or_else(default_hf_home);
-        let available = cuteafd_loader::model_cache_dir(&hf_home, GLMF_DEFAULT_DRAFTER).is_dir();
-        args.speculator = cuteafd_core::launch_settings::glmf_speculator((args.speculator != "auto" || args.explicit_settings.contains("speculator")).then_some(args.speculator.as_str()),
-            cfg.get("SPECULATOR").map(String::as_str), available).value;
+        let resolved = cuteafd_core::launch_settings::glmf_speculator((args.speculator != "auto" || args.explicit_settings.contains("speculator")).then_some(args.speculator.as_str()),
+            cfg.get("SPECULATOR").map(String::as_str));
+        if resolved.provenance.starts_with("auto:") {
+            require_default_drafter(args, cfg, GLMF_DEFAULT_DRAFTER, None)?;
+        }
+        args.speculator = resolved.value;
     }
     if family == "mimo_v2" && !args.no_speculator {
         args.speculator = cuteafd_core::launch_settings::mimo_speculator(
             (args.speculator != "auto" || args.explicit_settings.contains("speculator")).then_some(args.speculator.as_str()),
-            cfg.get("SPECULATOR").map(String::as_str), checkpoint_model_id(args, cfg)).value;
+            cfg.get("SPECULATOR").map(String::as_str), mimo_drafter_available(args, snapshot, cfg)).value;
     }
     if args.speculator == "auto" {
         args.speculator = cfg.get("SPECULATOR").cloned().unwrap_or_else(|| {
@@ -980,9 +1156,6 @@ fn file_args(mut args: PlanArgs, snapshot: &std::path::Path) -> Result<PlanArgs>
         }
     }
     if let Some(mode) = cfg.get("VISION") { args.vision = mode.parse().map_err(anyhow::Error::msg)?; }
-    else if !matches!(family, "mimo_v2" | "glm5_flash" | "qwen4") && args.vision == MediaMode::Auto {
-        args.vision = MediaMode::Off;
-    }
     if let Some(mode) = cfg.get("AUDIO") { args.audio = mode.parse().map_err(anyhow::Error::msg)?; }
     args.audio = cuteafd_loader::plan::resolve_audio_config(args.audio, snapshot, &inventory.config)?;
     Ok(args)
@@ -1495,6 +1668,126 @@ mod tests {
     }
 
     #[test]
+    fn kimi_pairing_accepts_new_mc_revisions_and_k8_but_names_mismatches() -> Result<()> {
+        use clap::Parser;
+        let root = tempfile::tempdir()?;
+        let target = root.path().join("another-revision");
+        let draft = root.path().join("drafter");
+        std::fs::create_dir_all(&target)?;
+        std::fs::create_dir_all(&draft)?;
+        let config = serde_json::json!({"model_type":"kimi_k31","architectures":["KimiK31ForConditionalGeneration"],
+            "text_config":{"hidden_size":7168,"vocab_size":163840,"num_hidden_layers":93,"pad_token_id":163839}});
+        let mut drafter = serde_json::json!({"speculators_config":{"verifier":{"name_or_path":"Inferact/Kimi-K3.1-Pro",
+            "architectures":["KimiK31ForConditionalGeneration"]}},"target_hidden_size":null,
+            "transformer_layer_config":{"hidden_size":7168,"vocab_size":163840},"draft_vocab_size":163840,
+            "aux_hidden_state_layer_ids":[76,80,84,88,92],"mask_token_id":163839});
+        std::fs::write(target.join("config.json"),serde_json::to_vec(&config)?)?;
+        std::fs::write(target.join("cuteafd-mc.json"),br#"{"source":{"repo":"moonshotai/Kimi-K3.1-Pro","revision":"another-revision"}}"#)?;
+        std::fs::write(draft.join("config.json"),serde_json::to_vec(&drafter)?)?;
+        assert!(kimi_content_matches(&target,&draft)?);
+        let crate::cli::Commands::Plan(mut request) = crate::cli::Cli::try_parse_from([
+            "cuteafd","plan",target.to_str().unwrap(),"--core-view","k8-compact","--rtx","2",
+            "--drafter-snapshot",draft.to_str().unwrap()
+        ])?.command else { panic!("plan") };
+        resolve_speculator(&mut request,&target,"kimi_k3",&Default::default())?;
+        resolve_settings(&mut request,"kimi_k3",&Default::default())?;
+        assert_eq!(request.speculator,"dspark"); assert_eq!(request.draft_fp8,Some(true));
+        drafter["speculators_config"]["verifier"]["name_or_path"] = serde_json::json!("other/Wrong-Model");
+        std::fs::write(draft.join("config.json"),serde_json::to_vec(&drafter)?)?;
+        assert!(kimi_content_matches(&target,&draft).unwrap_err().to_string().contains("verifier.name_or_path"));
+        request.speculator="dspark".into();
+        assert!(resolve_speculator(&mut request,&target,"kimi_k3",&Default::default()).unwrap_err().to_string().contains("verifier.name_or_path"));
+        for field in ["hidden_size","vocab_size","aux_hidden_state_layer_ids","mask_token_id"] {
+            let mut changed=drafter.clone();
+            changed["speculators_config"]["verifier"]["name_or_path"]=serde_json::json!("Inferact/Kimi-K3.1-Pro");
+            match field {
+                "hidden_size"=>changed["transformer_layer_config"][field]=serde_json::json!(123),
+                "vocab_size"=>changed["draft_vocab_size"]=serde_json::json!(123),
+                "aux_hidden_state_layer_ids"=>changed[field]=serde_json::json!([94]),
+                _=>changed[field]=serde_json::json!(123),
+            }
+            assert!(kimi_pair_metadata(&config,&changed,&target).unwrap_err().to_string().contains(field));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn native_draft_pairing_checks_checkpoint_geometry_taps_and_token_ids() -> Result<()> {
+        let target=serde_json::json!({"architectures":["KimiK31ForConditionalGeneration"],
+            "text_config":{"hidden_size":7168,"vocab_size":163840,"num_hidden_layers":93,
+                "bos_token_id":163584,"eos_token_id":163586,"pad_token_id":163839}});
+        let draft=serde_json::json!({"architectures":["Qwen3DSparkModel"],"num_target_layers":93,
+            "hidden_size":7168,"vocab_size":163840,"draft_vocab_size":163840,
+            "bos_token_id":163584,"eos_token_id":163586,"pad_token_id":163839,
+            "dflash_config":{"mask_token_id":163824,"target_layer_ids":[7,23,67,83,91]}});
+        let nonexistent=std::path::Path::new("/native-pairing-needs-no-side-files");
+        for architecture in ["Qwen3DSparkModel","DSparkDraftModel","DFlash2DraftModel"] {
+            let mut selected=draft.clone();selected["architectures"]=serde_json::json!([architecture]);
+            kimi_pair_metadata(&target,&selected,nonexistent)?;
+        }
+        for field in ["hidden_size","vocab_size","draft_vocab_size","num_target_layers",
+            "bos_token_id","eos_token_id","pad_token_id"] {
+            let mut changed=draft.clone();changed[field]=serde_json::json!(123);
+            assert!(kimi_pair_metadata(&target,&changed,nonexistent).unwrap_err().to_string().contains(field));
+        }
+        for taps in [serde_json::json!([93]),serde_json::json!([7,7]),serde_json::json!([])] {
+            let mut changed=draft.clone();changed["dflash_config"]["target_layer_ids"]=taps;
+            assert!(kimi_pair_metadata(&target,&changed,nonexistent).unwrap_err().to_string().contains("target_layer_ids"));
+        }
+        let mut changed=draft.clone();changed["dflash_config"]["mask_token_id"]=serde_json::json!(163840);
+        assert!(kimi_pair_metadata(&target,&changed,nonexistent).unwrap_err().to_string().contains("mask_token_id"));
+        Ok(())
+    }
+
+    #[test]
+    fn automatic_external_drafter_requires_snapshot_and_config_but_off_does_not() -> Result<()> {
+        use clap::Parser;
+        let root = tempfile::tempdir()?;
+        let target = root.path().join("target");
+        std::fs::create_dir_all(&target)?;
+        std::fs::write(target.join("config.json"), "{}")?;
+        for family in ["glm5_flash", "kimi_k3"] {
+            let crate::cli::Commands::Plan(mut request) = crate::cli::Cli::try_parse_from([
+                "cuteafd", "plan", target.to_str().unwrap(), "--rtx", "2"
+            ])?.command else { panic!("plan") };
+            request.hf_home = Some(root.path().join("hf"));
+            let model = if family == "glm5_flash" { GLMF_DEFAULT_DRAFTER } else { cuteafd_core::launch_settings::KIMI_K31_DSPARK };
+            let revision = (family == "kimi_k3").then_some(cuteafd_core::launch_settings::KIMI_K31_DSPARK_REVISION);
+            let error = require_default_drafter(&request, &Default::default(), model, revision).unwrap_err();
+            assert!(error.to_string().contains(model) && error.to_string().contains("nest hf download"));
+            if let Some(revision) = revision { assert!(error.to_string().contains(revision)); }
+            let draft = root.path().join(format!("{family}-draft"));
+            std::fs::create_dir_all(&draft)?;
+            request.drafter_snapshot = Some(draft.clone());
+            assert!(require_default_drafter(&request, &Default::default(), model, revision).unwrap_err().to_string().contains("config.json"));
+            std::fs::write(draft.join("config.json"), "{}")?;
+            assert_eq!(require_default_drafter(&request, &Default::default(), model, revision)?, draft);
+            request.drafter_snapshot = None;
+            request.speculator = "off".into();
+            resolve_speculator(&mut request, &target, family, &Default::default())?;
+            assert_eq!(request.speculator, "off");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn kimi_mc_default_weight_precision_tracks_content_and_explicit_override() {
+        use clap::Parser;
+        for tp in ["1", "2"] { for view in ["original", "k6-compact", "k8-compact", "fp8-compact"] {
+            let crate::cli::Commands::Plan(mut request) = crate::cli::Cli::try_parse_from([
+                "cuteafd", "plan", "/renamed/local", "--rtx", tp, "--core-view", view
+            ]).unwrap().command else { panic!("plan") };
+            request.kimi_content_qualified = true;
+            request.speculator = "dspark".into();
+            resolve_settings(&mut request, "kimi_k3", &Default::default()).unwrap();
+            assert_eq!(request.draft_fp8, Some(true));
+            request.draft_fp8 = Some(false);
+            resolve_settings(&mut request, "kimi_k3", &Default::default()).unwrap();
+            assert_eq!(request.draft_fp8, Some(false));
+        } }
+    }
+
+    #[test]
     fn expert_usage_plan_defaults_on_and_config_off_matches_explicit_cli_off() {
         use clap::Parser;
         for configured in [None, Some("on"), Some("off")] {
@@ -1706,6 +1999,7 @@ mod tests {
 
     fn args(model: &std::path::Path, spark_ranks: usize, require_ready: bool) -> PlanArgs {
         PlanArgs {
+            kimi_content_qualified: false,
             explicit_settings: Default::default(),
             test_host_memory: Some(cuteafd_loader::plan::testing::SimulatedHost::raptor().host_ram),
             fp8_prefill: Default::default(),
@@ -2027,6 +2321,7 @@ mod tests {
             write_snapshot(target.path(), &config, &[t("unused.weight", "BF16", &[2])], None);
             if name == "mimo26-flash" { std::fs::create_dir(target.path().join("dflash")).unwrap(); }
             let draft = tempfile::tempdir().unwrap();
+            std::fs::write(draft.path().join("config.json"), "{}").unwrap();
             let mut auto = args(target.path(), 4, false);
             if name == "mimo26-flash" { auto.checkpoint_model_id = Some("XiaomiMiMo/MiMo-V2.6-Flash-MOPD".into()); }
             // Resolve policy independently of the machine's HF cache.
@@ -2429,6 +2724,73 @@ mod tests {
         request.native_mtp_layers = 0;
         resolve_speculator(&mut request, dir.path(), "deepseek_v4", &Default::default()).unwrap();
         assert_eq!(request.speculator, "off");
+    }
+
+    #[test]
+    fn mimo_draft_precision_and_plan_accounting_share_one_resolution() {
+        let dir = tempfile::tempdir().unwrap();
+        for alias in ["XiaomiMiMo/MiMo-V2.6-Flash-MOPD", "community/MiMo-MC", "renamed/local"] {
+            for (mode, expected) in [(None, true), (Some("on"), true), (Some("auto"), true), (Some("off"), false)] {
+                let mut request = args(dir.path(), 4, false);
+                request.checkpoint_model_id = Some(alias.into());
+                request.speculator = "dflash2".into();
+                let cfg = mode.map(|mode| [("SPECULATOR_FP8".into(), mode.into())].into()).unwrap_or_default();
+                let resolved = resolve_settings(&mut request, "mimo_v2", &cfg).unwrap();
+                assert_eq!(resolved["draft_fp8"].value, serde_json::json!(expected));
+                assert_eq!(request.draft_fp8, Some(expected));
+                assert_eq!(options(&request).unwrap().layout.unwrap().mimo_draft_bf16, !expected);
+                request.draft_fp8 = Some(!expected);
+                resolve_settings(&mut request, "mimo_v2", &cfg).unwrap();
+                assert_eq!(options(&request).unwrap().layout.unwrap().mimo_draft_bf16, expected);
+            }
+        }
+    }
+
+    #[test]
+    fn mimo_default_drafter_tracks_checkpoint_contents_not_alias_or_core_view() {
+        let dir = tempfile::tempdir().unwrap();
+        for view in [cuteafd_loader::plan::checkpoint::CoreView::Original,
+            cuteafd_loader::plan::checkpoint::CoreView::K8Compact,
+            cuteafd_loader::plan::checkpoint::CoreView::K6Compact] {
+            let mut request = args(dir.path(), 6, false);
+            request.attention.core_view = view;
+            request.checkpoint_model_id = Some("community/MiMo-MC".into());
+            assert!(!mimo_drafter_available(&request, dir.path(), &Default::default()));
+            std::fs::create_dir_all(dir.path().join("dflash")).unwrap();
+            resolve_speculator(&mut request, dir.path(), "mimo_v2", &Default::default()).unwrap();
+            assert_eq!(request.speculator, "dflash2");
+            request.speculator = "off".into();
+            resolve_speculator(&mut request, dir.path(), "mimo_v2", &Default::default()).unwrap();
+            assert_eq!(request.speculator, "off");
+            std::fs::remove_dir(dir.path().join("dflash")).unwrap();
+        }
+        let request = args(dir.path(), 4, false);
+        let configured = [("SPECULATOR_MODEL_ID".into(), "community/pairable-drafter".into())].into_iter().collect();
+        assert!(mimo_drafter_available(&request, dir.path(), &configured));
+    }
+
+    #[test]
+    fn file_planning_preserves_auto_vision_for_bundled_towers_and_explicit_off() {
+        use cuteafd_loader::plan::{testing::*, MediaMode};
+        for mut config in [serde_json::json!({"model_type":"inkling2"}),
+            serde_json::json!({"model_type":"minimax_m3_vl", "vision_config":{}}),
+            serde_json::json!({"model_type":"deepseek_v4", "architectures":["DeepseekV4ForCausalLM"]})] {
+            let dir = tempfile::tempdir().unwrap();
+            config["architectures"] = match config["model_type"].as_str().unwrap() {
+                "inkling2" => serde_json::json!(["Inkling2ForConditionalGeneration"]),
+                "minimax_m3_vl" => serde_json::json!(["MiniMaxM3SparseForConditionalGeneration"]),
+                _ => config["architectures"].clone(),
+            };
+            write_snapshot(dir.path(), &config, &[t("unused.weight", "BF16", &[2])], None);
+            let mut request = args(dir.path(), 4, false);
+            request.speculator = "off".into();
+            request.vision = MediaMode::Auto;
+            assert_eq!(file_args(request.clone(), dir.path()).unwrap().vision, MediaMode::Auto);
+            let config_path = dir.path().join("launch.config");
+            std::fs::write(&config_path, "VISION=off\nSPECULATOR=off\n").unwrap();
+            request.config = Some(config_path);
+            assert_eq!(file_args(request, dir.path()).unwrap().vision, MediaMode::Off);
+        }
     }
 
     #[test]

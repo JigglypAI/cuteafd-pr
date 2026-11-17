@@ -882,7 +882,8 @@ pub(crate) fn schedule<'a, B: Backend<'a>>(engine: &B, snapshot: &std::path::Pat
                             let _ = job.events.send(Err(NativeFailure::BadRequest(format!("scoring: {error:#}"))));
                             continue;
                         }
-                        if !job.media.is_empty() && !media.encoder().available() {
+                        if !job.media.is_empty() && !media.encoder().available()
+                            && !job.probe.as_ref().is_some_and(|p| p.spec.feature_scoring()) {
                             let _ = job.events.send(Err(NativeFailure::Unavailable("vision encoder unavailable".into())));
                             continue;
                         }
@@ -917,7 +918,8 @@ pub(crate) fn schedule<'a, B: Backend<'a>>(engine: &B, snapshot: &std::path::Pat
                     }
                 },
             };
-            if !ready.job().job.media.is_empty() && !media.encoder().available() {
+            if !ready.job().job.media.is_empty() && !media.encoder().available()
+                && !ready.job().job.probe.as_ref().is_some_and(|p| p.spec.feature_scoring()) {
                 let _ = ready.job().job.events.send(Err(NativeFailure::Unavailable("vision encoder unavailable".into())));
                 continue;
             }
@@ -1643,7 +1645,7 @@ async fn decode_round<'a, B: Backend<'a>>(lease: LaneLease<'_>, engine: &B, geom
 
 fn media_failure(error: cuteafd_engine::media::MediaError) -> cuteafd_api::openai::NativeFailure {
     match error {
-        cuteafd_engine::media::MediaError::Encoder(_) => cuteafd_api::openai::NativeFailure::Unavailable("vision encoder unavailable".into()),
+        cuteafd_engine::media::MediaError::Encoder(reason) => cuteafd_api::openai::NativeFailure::Unavailable(format!("vision encoder unavailable: {reason}")),
         error @ (cuteafd_engine::media::MediaError::CacheFull { .. } | cuteafd_engine::media::MediaError::QueueFull) =>
             cuteafd_api::openai::NativeFailure::Unavailable(error.to_string()),
         error => cuteafd_api::openai::NativeFailure::BadRequest(error.to_string()),
@@ -1907,9 +1909,9 @@ mod media_failure_tests {
         assert!(matches!(super::media_failure(MediaError::QueueFull), cuteafd_api::openai::NativeFailure::Unavailable(_)));
     }
     #[test]
-    fn encoder_failure_does_not_expose_internal_error() {
+    fn encoder_failure_retains_the_precise_reason() {
         assert!(matches!(super::media_failure(cuteafd_engine::media::MediaError::Encoder("socket died".into())),
-            cuteafd_api::openai::NativeFailure::Unavailable(message) if message == "vision encoder unavailable"));
+            cuteafd_api::openai::NativeFailure::Unavailable(message) if message == "vision encoder unavailable: socket died"));
     }
 }
 
@@ -1997,7 +1999,7 @@ mod loop_abort_tests {
     fn active(dir: &tempfile::TempDir, max_tokens: usize, config: crate::shared::loop_abort::LoopAbortConfig)
         -> (Active<'static, TestPlacement, TestDraft>, mpsc::UnboundedReceiver<Result<InferenceChunk, cuteafd_api::openai::NativeFailure>>) {
         let (events, receive) = mpsc::unbounded_channel();
-        let job = NativeRequest { prefix_cache_source: Default::default(), finish_detail: Default::default(),
+        let job = NativeRequest { image_groups: Vec::new(), prefix_cache_source: Default::default(), finish_detail: Default::default(),
             literal_spans: Vec::new(), prompt: String::new(), constraint: None, images: Vec::new(),
             media: Vec::new(), audio: Vec::new(), max_tokens, sampling: Default::default(),
             stop_token_ids: Vec::new(), events, usage: None, probe: None };

@@ -18,6 +18,7 @@ pub(super) fn diagnostic_pool(layout: FamilyLayout) -> cuteafd_engine::prefix::R
 
 #[derive(Clone)]
 pub(crate) struct Placement {
+    pub media_spans: Vec<cuteafd_core::MediaSpan>,
     pub units: Vec<u32>,
     pub slot: usize,
     pub len: usize,
@@ -29,7 +30,7 @@ impl crate::shared::qwen::scheduler::Placement for Placement {
     fn set_len(&mut self, len: usize) { self.len = len; }
     fn units(&self) -> &[u32] { &self.units }
     fn slot(&self) -> i32 { self.slot as i32 }
-    fn spans(&self) -> &[cuteafd_core::MediaSpan] { &[] }
+    fn spans(&self) -> &[cuteafd_core::MediaSpan] { &self.media_spans }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -277,6 +278,9 @@ impl PrefixFamily<SnapshotMeta> for KimiPrefix<'_> {
     fn retain_draft_pages(&self, attachment: &cuteafd_engine::prefix::DraftPageAttachment) -> Result<(), BoxError> {
         let draft = self.0.draft.as_ref().context("Kimi draft attachment without executor")?;
         Ok(draft.common().retain_mla_pages(attachment)?)
+    }
+    fn quarantine_draft_pages(&self, placement: &Placement) {
+        if let Some(draft) = &self.0.draft { draft.common().quarantine_mla_pages(placement.slot); }
     }
     fn capture_draft_pages(&self, placement: &Placement, len: usize)
         -> Result<Option<cuteafd_engine::prefix::DraftPageAttachment>, BoxError> {
@@ -612,7 +616,7 @@ mod tests {
                 cache.tick();
                 Ok(())
             };
-            let build = |slot| move |units| Placement { units, slot, len: 0, state_len: 0 };
+            let build = |slot| move |units| Placement { media_spans: Vec::new(), units, slot, len: 0, state_len: 0 };
             let mut cache = make_cache()?;
             let tokens = (100..230).collect::<Vec<u32>>();
             let mut original = cache.admit(&family, &tokens[..65], 131, false, build(0))?.placement;
@@ -782,7 +786,7 @@ mod tests {
                 Ok(bytes)
             };
             let boxed = |error: BoxError| anyhow::anyhow!("Kimi prefix fixture: {error}");
-            let mut original = Placement { units: vec![0, 1], slot: 0, len: 0, state_len: 0 };
+            let mut original = Placement { media_spans: Vec::new(), units: vec![0, 1], slot: 0, len: 0, state_len: 0 };
             family.bind(&mut original).map_err(boxed)?;
             family.check_append(&original, 65)?;
             assert!(family.check_append(&original, 0).is_err());
@@ -843,7 +847,7 @@ mod tests {
                     }
                 }
             }
-            let mut restored = Placement { units: vec![2, 3], slot: 1, len: 0, state_len: 0 };
+            let mut restored = Placement { media_spans: Vec::new(), units: vec![2, 3], slot: 1, len: 0, state_len: 0 };
             family.bind(&mut restored).map_err(boxed)?;
             assert!(family.restore(None, &mut restored, 65).is_err());
             family.restore(Some(MarkSlot(0)), &mut restored, 65).map_err(boxed)?;
@@ -903,6 +907,103 @@ mod tests {
             family.discard(&mut restored).map_err(boxed)?;
             assert_eq!(family.commit_point(&restored), 0);
         }
+        Ok(())
+    }
+
+    /// #2342: a restore that fails after the engine bound the placement rolls the
+    /// slot back and cold-binds; the fallback's state and page rows then match a
+    /// plain cold prefill of the same prompt byte for byte.
+    #[test]
+    fn failed_restore_fallback_matches_a_plain_cold_prefill() -> Result<()> {
+        use crate::shared::prefix::CudaCopyEngine;
+        use cuteafd_engine::prefix::{After, PrefixCache, PrefixConfig, SnapshotKind};
+        let fixture = Fixture::build_for_tests()?;
+        let library = fixture.load()?;
+        fixture.immediate_copies(&library)?;
+        let context = 8192usize;
+        let mut cfg = KimiK3Config::from_hf(&cuteafd_loader::plan::testing::kimi_k3_config())?;
+        cfg.layers = 3;
+        cfg.attention = vec![KimiAttention::Kda, KimiAttention::Mla, KimiAttention::Mla];
+        cfg.dense.truncate(3);
+        let mut inputs = super::super::admission::tests::inputs(&cfg);
+        inputs.attention = Some(AttentionPlacement::Layers);
+        inputs.cache_format = cuteafd_core::MlaCacheFormat::Bf16;
+        inputs.serving_context = cuteafd_loader::placement::planner::Context::pinned(context as u64);
+        let unit = cuteafd_loader::families::kimi_k3::allocation::prefill_shape_with(
+            inputs.rows, inputs.waves, inputs.unit_rows)?.unit_rows as usize;
+        for layouts in &mut inputs.lane_layouts {
+            for layout in layouts {
+                *layout = super::super::device::LaneLayout::new(
+                    &KimiK3Config::from_hf(&cuteafd_loader::plan::testing::kimi_k3_config())?,
+                    inputs.rows, unit, context, super::super::device::NativeScratch { kda: 1024, mla: [512, 0, 1024] })?;
+            }
+        }
+        let mut placement = super::super::admission::admit(inputs)?.placement;
+        placement.pool_tokens = 512;
+        for layer in &mut placement.layers {
+            layer.mode = cuteafd_loader::placement::LayerMode::Whole { gpu: 0,
+                ffn: cuteafd_loader::placement::FfnMode::Owner };
+        }
+        let device = Device { library: &library, id: 0 };
+        let readers = (0..2).map(|_| Stream::new(device).map(Rc::new)).collect::<Result<Vec<_>>>()?;
+        let kda = super::super::state::KdaLayout::for_ranks(&cfg, 3, 1, 2, 1)?
+            .allocate(device, readers.clone())?;
+        let mla = super::super::mla::CacheLayout::for_ranks(&cfg, &placement, 0,
+            cuteafd_core::MlaCacheFormat::Bf16, 1)?.allocate(device, readers)?;
+        let family = KimiPrefix::from_ranks(&cfg, context, vec![Rc::new(kda)], vec![Rc::new(mla)])?;
+        let mut cache = PrefixCache::<CudaCopyEngine<'_>, SnapshotMeta>::new(family.layout(),
+            PrefixConfig { entries: 8, mark_slots: family.slots(), keep_logits: true, min_tokens: 1 },
+            None)?;
+        let tokens = (100..165).collect::<Vec<u32>>();
+        let build = |slot: usize| move |units| Placement { media_spans: Vec::new(), units, slot, len: 0, state_len: 0 };
+        let mut source = cache.admit(&family, &tokens, 192, false, build(0))?.placement;
+        prefill(&library, &family, &mut source, &tokens, 0x37)?;
+        assert!(cache.capture(&family, SnapshotKind::Prompt, &tokens, &source,
+            After::from_logits(&[1.0, 2.0], true))?);
+        cache.release(&family, &source.units)?;
+
+        // The restore attempt binds slot 1 with one unit short, so the family's
+        // restore rejects the frontier after the engine already bound the slot.
+        let builds = std::cell::Cell::new(0);
+        let mut fallback = cache.admit(&family, &tokens, 192, false, |mut units| {
+            if builds.replace(builds.get() + 1) == 0 { units.truncate(1); }
+            Placement { media_spans: Vec::new(), units, slot: 1, len: 0, state_len: 0 }
+        })?;
+        assert_eq!((fallback.resume, cache.stats().restore_failures, builds.get()), (0, 1, 2));
+        assert_eq!((fallback.placement.len, fallback.placement.state_len), (0, 0));
+        let mut cold = cache.admit_cold(&family, tokens.len(), 192, build(2))?;
+        prefill(&library, &family, &mut fallback.placement, &tokens, 0x37)?;
+        prefill(&library, &family, &mut cold.placement, &tokens, 0x37)?;
+        assert_eq!(family.live_digest(&fallback.placement)?, family.live_digest(&cold.placement)?,
+            "the cold fallback must reach the state and rows of a plain cold prefill");
+        cache.release(&family, &fallback.placement.units)?;
+        cache.release(&family, &cold.placement.units)?;
+        Ok(())
+    }
+
+    /// The prefill a family would run from `placement.len`: rows from that frontier
+    /// onward, then the recurrent state the whole prompt reaches.
+    fn prefill(library: &cuteafd_ffi::NativeLibrary, family: &KimiPrefix<'_>,
+        placement: &mut Placement, tokens: &[u32], seed: u8) -> Result<()> {
+        let start = placement.len;
+        for (index, &page) in placement.units.iter().enumerate() {
+            let first = index * cuteafd_ffi::MLA_PAGE_ROWS;
+            if first >= tokens.len() || first + cuteafd_ffi::MLA_PAGE_ROWS <= start { continue; }
+            let row_first = start.saturating_sub(first);
+            let rows = (first + cuteafd_ffi::MLA_PAGE_ROWS).min(tokens.len()) - first - row_first;
+            if rows == 0 { continue; }
+            for buffer in family.page_buffers(0, page, cuteafd_ffi::MLA_PAGE_ROWS)? {
+                let row_bytes = buffer.bytes / cuteafd_ffi::MLA_PAGE_ROWS;
+                let bytes = (0..rows * row_bytes).map(|i|
+                    seed.wrapping_add(((first + row_first) * 31 + i) as u8)).collect::<Vec<_>>();
+                library.copy_h2d(crate::shared::prefix::view(buffer, row_first * row_bytes,
+                    rows * row_bytes)?, &bytes)?;
+            }
+        }
+        for (layer, buffer) in family.state_buffers(0, placement.slot)?.into_iter().enumerate() {
+            library.copy_h2d(buffer, &vec![seed.wrapping_add(layer as u8); buffer.bytes])?;
+        }
+        family.commit(placement, start, tokens.len() - start)?;
         Ok(())
     }
 }

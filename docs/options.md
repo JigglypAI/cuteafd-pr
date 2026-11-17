@@ -11,15 +11,62 @@ while publication requires `all` and complete image inventories.
 
 ## Benchmark panel configuration
 
+Before any timed profile or sweep, the server runs one untimed, authenticated
+warm prelude per serving instance: code, prose, JSON, then code, prose, JSON,
+at the sweep output-token count (192 for a direct profile). The fixed prompts
+and nonces are identical across arms. Existing per-point warm waves remain.
+The prelude receipt is cached by the server; subsequent calls do no inference.
+Missing receipts or a different server-instance identity refuse timing. The
+receipt is embedded in `report.json` and `sweep.json`, including each request's
+cycles, selected mean width and final policy telemetry when exposed. Profiling
+windows open afterward. This is deterministic conditioning, not convergence:
+K3.1 traces show initial width drift over 64-128 cycles, and about 316 cycles
+for one 256-token triple; two triples provide roughly 630 cycles of conditioning.
+Timed request records retain a 120-character opening without classifying it;
+unknown per-request cycle counts are explicitly unavailable, not overlapping
+global-counter estimates.
+
 `cuteafd bench --panels decode_content --panel-config
 'decode_content={"contents":["code"],"temperature":1.0,"top_p":0.95,"seed":42}'`
 runs sampled C1 code decode. `scripts/bench/wip-cards.py` accepts the same
 repeatable `--panel-config PANEL=JSON` option; smoke matrix entries/defaults use
 `"panel_config":{"decode_content":{"contents":["code"],"temperature":1.0,
 "top_p":0.95,"seed":42}}`. Entry settings replace defaults for the same panel.
-The in-server run API accepts this same `panel_config` map. The `decode_content` and
+The in-server run API accepts this same `panel_config` map. The `decode_content`, `concurrency` and
 `spec_lossless_set` panels accept configuration; unknown panels and fields fail before
-running. This does not change the baseline, concurrency sweep or goldens.
+running. This does not change the baseline or goldens.
+
+`concurrency={"sustained":true,"multiplier":4}` adds continuous-refill rows after
+the existing closed-batch concurrency rows (which retain their schema and workload).
+`sustained` defaults to false; `multiplier` is an integer in 2..64, default 4.
+The in-server concurrency panel uses its usual levels. For an external sweep use
+`wip-cards.py --levels 8,16 --panel-config 'concurrency={"sustained":true}'`
+(with the usual kit/arms), or set that same `panel_config` in the smoke matrix.
+`--sweep-tokens` still controls the external sweep's per-request output budget.
+
+At level C, C workers immediately refill from a pool of N = multiplier * C
+requests. The steady window starts at the first completion and ends when the
+last refill is dispatched, excluding initial warm-up and final drain. Requests
+are indexed before dispatch, so scheduling cannot change the prompt/nonces across
+arms. The pool uses `CUTEAFD_BENCH_NONCE_SEED` (or `sustained-v1`) and records
+`pool_sha256`; use a fresh shared seed for independent pairs to avoid cache reuse.
+The prior untimed width warm-ups and all closed-batch points run first.
+
+Sustained `aggregate_tok_s` is an **estimate**: exact final usage token totals are
+credited pro rata by each request's first-to-last-content-token overlap with the
+window, assuming uniform per-request emission (SSE text chunks are not tokens).
+Only output/decode tokens enter the numerator; refill prompt/prefill work consumes
+time inside the window but contributes no prompt tokens to throughput. This is
+the intended under-load decode rate, not prefill throughput.
+This includes boundary-crossing requests without crediting their warm-up/drain
+output. `sustained` records relative window bounds, duration, initial/total/refill/
+completed and overlapping request counts, fractional token credits, the explicit
+accounting assumption, and every request's send/completion times, token span and
+exact usage total. Errors invalidate the sustained run instead of silently
+reducing concurrency. Thermal/fabric/counter observations cover the full refill
+run including its warm-up and drain, not just the steady window. External sweep
+rows use `phase: "sustained"`; wip-cards reports `sustained C8`, `sustained C16`,
+etc., separately from `sweep C8`/`sweep C16`.
 
 `decode_content` fields are optional: `contents` selects unique names from
 `code,prose,json,math,chat,translation,summary,table` (all by default),
@@ -72,6 +119,7 @@ default-off performance lever adds its row here in the same PR (AGENTS.md).
 | --- | --- | --- | --- | --- |
 | `GRAPH_PREWARM` | V4.1, GLM Flash | `GRAPH_PREWARM=off` (default `on`) | Skip startup graph prewarm and allow lazy request-time capture on single-GPU layouts. With donor-always, V4.1 min measured graph high-water 3.114 GB to 0.902 GB; GLM Flash min 52.4 MB to 35.7 MB (2026-11-16, RTX PRO 6000, one warmed launch/arm). Other families and cross-device layouts reject `off` (#1878). | First-use capture latency; no intended precision change. Admission reserve is unchanged: lower physical high-water alone does not expand KV; a separately qualified lower explicit reserve is needed. |
 | `GRAPH_DONOR_ALWAYS` | V4.1, V4, GLM 5.3 / ML4, GLM Flash, MiMo, Qwen4, Qwen dense, Kimi K3, Step-5, Muse, Inkling | `GRAPH_DONOR_ALWAYS=on` (default `off`) | Prefer a same-topology cold donor below the soft cap as well as above it. With prewarm off, V4.1 min C1/C16/post-C1 126.02/541.62/123.42 to 125.49/501.17/121.26 tok/s; 165,824 request-time updates/re-keys. GLM Flash min 109.41/393.98/87.17 to 109.02/397.93/87.10 tok/s; 1,270 updates/re-keys. One warmed matched launch/arm, RTX PRO 6000, no thermal slowdown, unchanged KL/top-1. | May replace a reusable cached shape and require a later update; no intended precision change. |
+| `GRAPH_DONOR_COLD_LAG` | V4.1, V4, GLM 5.3 / ML4, GLM Flash, MiMo, Qwen4, Qwen dense, Kimi K3, Step-5, Muse, Inkling | `GRAPH_DONOR_ALWAYS=on GRAPH_DONOR_COLD_LAG=16` (default `0`) | Require age > K + N below the soft cap; pressure keeps age > K. V4.1 min, 1 RTX PRO 6000 + 3 Sparks, DSpark, dev `0edd9b6c4` (2026-11-17), one warmed matched launch/arm: defaults / donor-always lag 0 / lag 16 C1 132.73/125.88/132.99, C16 556.17/499.76/527.38, post-C1 124.24/117.20/123.11 tok/s. Donor arms disable prewarm. Lag 16 cuts request-time updates/re-keys 164,366 to 47,057; physical graph charge 3.043/0.935/1.669 GB (admission reserve unchanged). Its C16/default ratio 0.948 meets the experiment's stop bar, not the 0.98 recovery goal; no further tuning. No thermal slowdown; C16 power-cap seconds 1.004/0/0, max temperatures 60/57/58 C, min T.Limit headroom 38/38/37 C; donor busy clocks unavailable (default 2805 MHz). Other families unmeasured. | Lag 16 retains more graph memory than lag 0; quality unchanged (baseline KL 0.01328, top-1 96.956%). Remains opt-in; no intended precision change. |
 | `L2_PREFETCH` | V4.1, MiMo, Qwen4 | `L2_PREFETCH=auto` or a MiB count (unset = off; GLM 5.3 and GLM Flash already default it to `auto`) | Pulls the next layer's weights into L2 while a one-lane decode step waits on its Spark exchange. V4.1 1× RTX 5090 + 4 Sparks: every C1 cell +1.7–3.9%, C4/C8 and 8K prefill unchanged (#623); GLM 5.3 weighted +4.4%, GLM Flash C1 +6–15% (2026-09-30). | None in values (outputs byte-identical); only extra L2 traffic. |
 | `QWEN_FP8_DECODE` | Qwen4 | `QWEN_FP8_DECODE=on` (unset = checkpoint BF16) | Holds the GDN/attention projections as one resident E4M3 copy; with `QWEN_FP8_HEAD=on`, 1× RTX code C1 222→247 tok/s, C4 441→489, 8K prefill 6100→6177 (2026-10-03). | Converts target projections to FP8 at load: golden KL 0.036→0.046, top-1 88.5%→86.7%; fails the KL gate, so opt-in only. |
 | `CORE_VIEW` | GLM 5.3 / ML4, GLM Flash, Kimi K3, Step-5, Muse | `CORE_VIEW=k8-compact`, `k6-compact` or `fp8-compact` (unset = original) | Stored MC core or generic load-time block FP8 of exactly the original variant's `core_tensors`; BF16 index only. GLM Flash K4 MC, 2 RTX PRO 6000 / 0 Sparks, DFlash2, fixed 425/425 W (2026-11-12): FP8 vs original C1/C16/8K prefill 171.12/741.93/7837.57 to 196.74/772.56/7741.92 tok/s (+15.0%/+4.1%/-1.2%); pool 1628160 to 2097152. K6 is non-inferior on both measured Standard-v2 paths, with +22.8% C1 and -12.5% 8K prefill vs original. Muse K4 MC `fp8-compact` is measured below (+15.2% C1, C16 flat, -5.1% 8K prefill; larger pool). GLM/Step whole-core FP8, 2 RTX PRO 6000 + 6 Sparks, 425 W/card (2026-11-16): GLM C1/C16/8K 49.04/180.68/3392 to 53.52/191.81/3122 tok/s (+9.1%/+6.2%/-8.0%), onboarded layers 5 to 8; Step 59.87/216.73/2740 to 68.98/266.95/2562 (+15.2%/+23.2%/-6.5%), onboarded layers 13 to 19. Both keep the 2,097,152-token pool; one warmed launch per arm, strict lossless 10/10. Step FP8 replay matches all 106 saved original prompt hashes. No thermal slowdown; prefill power-cap windows differ. Requires v52e exports. Other checkpoints unmeasured. | K8/K6 and FP8 quantize target weights. FP8 uses E4M3 + FP32 128x128 block scales. GLM generated Standard decode/prefill KL 0.03686/0.03100 to 0.04530/0.03880, top-1 94.544%/95.177% to 94.091%/94.775%; Step KL 0.01337/0.01164 to 0.01597/0.01429, top-1 96.069%/96.008% to 95.166%/95.811%. Absolute family bars pass; no paired non-inferiority claim. Original stays default. Matched Standard-v2 generated positions: FP8-minus-original KL to official BF16 ancestry +0.00289 decode/+0.00325 prefill, top-1 -0.013/-0.526 percentage points; absolute ancestry gates pass, paired decode non-inferiority passes but prefill fails (0.005 margin). Those figures ran W8A8 prefill over every group; W8A16 prefill (`FP8_PREFILL=off`) also fails prefill non-inferiority (top-1 loss 0.00263, upper95 0.00614). FP8 stays opt-in. Unsupported executor roles refuse by tensor name, never skip. Plain checkpoints refuse every compact selector, including the former plain Flash FP8 path. |
@@ -177,6 +225,17 @@ A launch reads one plain `KEY=VALUE` config file (`cuteafd.config` by default):
 - `CONCURRENCY` unset is a boot-time memory derivation; all C-dependent sizes
   follow it. Set it only to pin a value.
 
+### Kimi Request Reasoning
+
+Kimi thinking-off is simulated with an empty, preclosed native XTML `think`
+channel followed by an open `response` channel. Assistant history likewise keeps
+an empty `think` channel and drops its reasoning text when thinking is disabled.
+The API advertises `supports_thinking_off: true`: generated answer bytes appear
+as content, with no reasoning output. This preserves the trained channel shape;
+it does not use the checkpoint encoder's direct-response-only branch. Explicit
+`thinking: {"type":"disabled"}` and the supported `enable_thinking: false` aliases
+select this form. Thinking-on rendering and effort selection are unchanged.
+
 ### Inkling Request Reasoning
 
 The Inkling chat adapter reads the checkpoint's own `chat_template.jinja` and
@@ -186,6 +245,19 @@ these request values do not imply that a Planned checkpoint has a serving execut
 | Request Field | Default | Values | Notes |
 | --- | --- | --- | --- |
 | `reasoning_effort` (Inkling) | `high` (= 0.9) | `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, or a JSON number in `[0, 0.99]` | Native template values are 0, 0.1, 0.2, 0.7, 0.9, 0.99 and 0.99, respectively. A top-level value takes precedence over `chat_template_kwargs.reasoning_effort`; explicit thinking-off resolves to `none`. Reasoning and tool calls use native message channels. Only `<|content_model_end_sampling|>` (token 200006) ends generation; `<|end_message|>` closes a channel and is not an EOS stop. |
+
+### PE Vision Qualification
+
+Inkling and Step-5 use the shared bundled PE tower runtime and image admission.
+`VISION=off` remains the qualified text-only configuration while normal image
+answers are being qualified (#1930, #1994). Explicit `VISION=spark[:rank]` or
+`VISION=rtx[:gpu]` selects the jointly admitted packed tower owner in WIP builds;
+`VISION_REPLICAS=1..8` and `MEDIA_CACHE_BYTES` use the shared media options.
+Each tower has one weight arena and one scratch backing per replica; tensor
+views do not add another charge. Step-5 images retain ordered local crops and
+the global view with native separators; the 896x812 processor case expands to
+493 feature rows plus 11 native markers (504 inserted tokens; 506 tokens in
+the text/image/text boundary fixture). Audio remains unsupported.
 
 ### Inkling Serving
 
@@ -197,15 +269,15 @@ Sparks. Mixed TP4 owns and stores exactly 576 intermediate columns per rank;
 no checkpoint weight padding is required. Target core, RTX-onboarded experts
 and every Spark rank load in one required SparkNest push transaction.
 
-Planner reports mark the measured mixed and MC-original text checkpoints
-Serving on 1 RTX + 4 Sparks. Other configurations remain Planned while target
-TP2 (#2316), bundled dSpark (#2320), compact-core serving and bundled media
-qualification (#1930) are pending; their separate gates stay in place. A matching WIP build must include the Inkling padded-transpose
-load export and native expert packages.
+Planner reports mark admitted configurations Serving, independent of checkpoint
+repository, revision, MC view or fidelity measurement. Missing formats or native
+programs still refuse with their structural cause. The current serving executor
+owns one RTX and 2-8 Spark endpoints; target TP2 is separate implementation work (#2316), not a fidelity gate. A matching WIP build must include the
+Inkling padded-transpose load export and native expert packages.
 
-`ATTENTION_PLACEMENT=auto` and GPU embedding/device selection are required;
-explicit `heads`, `layers`, `context` and multi-RTX serving refuse. Set
-`VISION=off` and `AUDIO=off`. `SPECULATOR=off|dspark` defaults to `dspark`
+`ATTENTION_PLACEMENT=auto|heads` and GPU embedding/device selection are supported;
+explicit `layers`, `context` and multi-RTX serving need a multi-GPU executor (#2316).
+Set `AUDIO=off`; bundled vision follows `VISION=auto` and normal encoder admission. `SPECULATOR=off|dspark` defaults to `dspark`
 (unset/`auto` selects the bundled drafter); explicit `off` wins and passes
 `--dspark=false`. Direct serving also defaults on;
 `dspark` selects the bundled recurrent-hidden block drafter (seven proposals
@@ -214,8 +286,8 @@ per eight-token block), with `DRAFT_KV_CACHE=fp8|bf16` (default `fp8`).
 Drafter weights join the target's required push transaction in their own
 admitted arena. MC original EXL3 K4 on 1 RTX + 4 Sparks passes strict cold and
 warm lossless with FP8 draft KV (10/10 each, exact ids, row hashes and emitted
-bytes, complete prompt-end restores). BF16 draft-KV and emitted-speed
-measurement remain pending (#2320); no speed figure is claimed here. Inkling accepts the shared
+bytes, complete prompt-end restores). BF16 draft KV also passes strict cold and warm 10/10; emitted-speed
+measurement remains pending (#2320); no speed figure is claimed here. Inkling accepts the shared
 `CONCURRENCY`, `POOL_TOKENS=auto|N`, `MAX_CONTEXT_TOKENS`,
 `PREFIX_CACHE_ENTRIES`, `HOST_CACHE_BYTES`, KV reservation and loop-abort keys,
 plus `RTX_EXPERT_LAYERS=auto|all|N`, `PREFILL_ROWS` (a multiple of 64 up to
@@ -255,13 +327,13 @@ to preserve projection shapes and bytes. Each planned intermediate prefix mark
 gets its own window; MiniMax withholds an unexpected partial-prefill snapshot
 until its window is complete. Full-context paged drafters are unchanged.
 `DRAFT_LENGTH` caps the seven-token native block; `SPECULATION_TRACE` records
-shared draft/verify evidence. MiniMax alone defaults to `DRAFT_POLICY=shared`,
-the existing cost-based concurrency-bucket policy, including native zero-proposal
-decode when drafting cannot pay. Explicit `shared|simple|simple-rc|simple-derived`
-overrides win; other families retain their `simple` fallback (global decision #2220).
-The retained matched A/B (#2165) improves warmed C1/C4/C16 decode on the three
-cards; reversed Heads 8K prefill costs about 2.5%. See the family page for arm-order
-and instrumentation caveats. The example config's explicit off remains an override
+shared draft/verify evidence. Unset `DRAFT_POLICY` selects `simple` for every
+family; `shared`, `simple-rc` and `simple-derived` remain explicit opt-ins
+(global decision #2220). `shared` is the cost-based concurrency-bucket policy,
+including native zero-proposal decode when drafting cannot pay. The #2220
+campaign measured MiniMax `shared` against `simple` at C1 1.00, sweep C16 1.03
+and sustained C8/C16 1.02/1.04, all within single-launch noise. See the family
+page for instrumentation caveats. The example config's explicit off remains an override
 until its separate line change joins the next placement-input publication batch.
 `VISION=off` and `AUDIO=off` remain required.
 
@@ -419,8 +491,8 @@ reference generated by `python/reference/families/kimi_k3/golden.py
 subset (legacy, a00, a04, a08, a20, c00, d00, e00); a20 scores beyond 8K history
 and exercises sparse DSA selection. Full-model reference defaults are unchanged.
 This all-layer dense/attention/DSA diagnostic is **not** a full-model golden.
-K3.1 DSA is admitted only through the explicit golden role;
-serving remains refused until qualification. The flag is unavailable to serve.
+The skipped-routed diagnostic is available only through the explicit golden
+role; the flag is unavailable to serve and does not restrict ordinary serving.
 
 `cuteafd glm-golden --nll --save-logits DIR` writes `tokens.bin` and all
 prefill rows as F32 `logits.bin` for same-engine build or core-view comparisons.
@@ -485,6 +557,19 @@ when adopting the new toolchain. Each WIP build pins immutable per-host image ID
 for its entire invocation, including container creation, native cache keys and
 sealed metadata, so a concurrent default-tag move cannot change its build inputs.
 Versioned `tc-*` image tags remain available for older checkouts.
+
+Automatic WIP coordinator export placement yields raptor whenever a live hardware
+queue ticket requests `gpu0` or `gpu1`: it uses maxq and waits there within the
+existing export timeout, never falling back to a raptor GPU while that remote
+placement is selected. Remote exports hold coordinator `maxq.lock` and maxq's
+local `maxq-gpu.lock`, not raptor's GPU locks. Explicit
+`CUTEAFD_WIP_COORDINATOR_EXPORT=capped` retains fair queued raptor placement.
+
+`./wip.sh --from-slot NAME` reuses that slot's seed within the selected
+`WIP_INSTANCE`/`WIP_ROOT`, rather than choosing the least-loaded seed. New
+builds record `slots/NAME/seed-host`; older slots are located with bounded
+instance-container probes. An explicit `--seed HOST` that conflicts with the
+source seed fails with the host and source path before cloning.
 
 The host-only environment overrides `CUTEAFD_SPARKNEST_RUN_DIR` and
 `CUTEAFD_FUSE_SYSFS_ROOT` select the source directories for the optional
@@ -610,9 +695,9 @@ Each key is also a global `cuteafd` flag (`--gpu-memory-cap`, `--kv-max-tokens`,
 
 | Key | Default | Values | Notes |
 | --- | --- | --- | --- |
-| `KV_TARGET_TOKENS` | 2M; 1M on cards of 32 GB or less | positive count | KV the layout is sized for: layer placement, onboarding, buffers. |
+| `KV_TARGET_TOKENS` | 2M on every card | positive count | KV the layout is sized for: layer placement, onboarding, buffers. |
 | `KV_MIN_TOKENS` | min(256K, model max context, KV target), on every layout | positive count | Refuse automatic pools below this; missing the target is fine down to it. Automatic context serves min(model max context, admitted pool); an explicit context still requires the pool to cover it. |
-| `KV_MAX_TOKENS` | the target | positive count, at least the target | After an automatic layout is fixed, the pool grows into free memory up to this. A pinned `RTX_EXPERT_LAYERS` already makes the pool the output (it fills what is left). |
+| `KV_MAX_TOKENS` | unbounded (all remaining memory) | positive count, at least the target | After the target-sized layout and expert onboarding are fixed, the pool takes the remaining admitted memory, bounded by native encoding limits. An explicit value caps this growth. A pinned `RTX_EXPERT_LAYERS` already makes the pool the output (it fills what is left). |
 | `GPU_MEMORY_CAP` | full device | size | Total per-GPU ceiling for plan, serve and golden; leaves SM count and L2 unchanged. |
 | `SPARK_MEMORY_CAP` | each host's measured idle `MemAvailable` | size | Explicit total per-Spark engine ceiling overrides measured capacities, including worker process residency and routed weights. No extra margin. |
 | `GPU_RESERVE` | auto | size | Sets the total GPU reserve; built-in reserve components (including release padding) become 0, but physical driver page tables, named sampled pre-weight occupancy and the bounded graph-cache reserve stay charged. Still inside the cap. |
@@ -622,6 +707,7 @@ Each key is also a global `cuteafd` flag (`--gpu-memory-cap`, `--kv-max-tokens`,
 | `GPU_GRAPH_RESERVE` | trace-derived family base + bounded extra | size or `gpuN=size,...` | Optional **whole** coordinator graph reserve per device; a user value is charged exactly, without extra, and conflicts with either extra key for that device. Unspecified devices use the checked-in prewarm arena plus its 2 MiB tail as the base, then add `min(GPU_GRAPH_RESERVE_EXTRA, GPU_GRAPH_RESERVE_EXTRA_CAP)`. Resolved checkpoint/layout defaults: GLM 5.3 one-rank `glm_prewarm_1.json` base 337,641,472 bytes, charged 675,282,944 bytes; two-rank `glm_prewarm_2.json` base 1,379,926,016 bytes (1,377,828,864 measured plus the 2 MiB tail), charged 1,879,926,016 bytes per rank, traced on K4+Core-K6 with 2 RTX + 6 Sparks, 73 replayed geometries and no pins; untraced coordinator rank counts retain the one-rank bootstrap geometry/base without borrowing its pins and warn at startup; GLM Flash per resolved layout in `glmf_prewarm.json`: `1-sparks` base 115,343,360 bytes (113,246,208 measured plus the 2 MiB tail), charged 230,686,720 bytes, and `2` rank 0 / rank 1 bases 127,926,272 / 119,537,664 bytes (125,829,120 / 117,440,512 measured); Mistral Large 4 uses `ml4_prewarm_1.json` (base 715,128,832 bytes) or `ml4_prewarm_2.json` (base 914,358,272 bytes), each plus 500 MB extra; V4 selects `v4_prewarm.json` by resolved shape (coordinator GPU count x Sparks attached: `rtx1-spark`, `rtx1-local`, `rtx2-spark`, `rtx2-local`); a traced shape's base is its startup warm's measured arena plus its 2 MiB tail — 671,088,640 bytes on `rtx1-spark`; 954,204,160 on each `rtx2-spark` rank; 914,358,272 and 924,844,032 on `rtx2-local`, charged 1,171,088,640 / 1,454,204,160 / 1,414,358,272 and 1,424,844,032 bytes at the default extra — covering the replayed width-0 startup rows and 53 / 42 / 37 recurring verify geometries out of the traces' 5,476 / 5,169 / 5,264 verify keys (a width-0 row the trace never replayed, or a verify geometry used only inside one sampling interval such as a single panel or the 32K context pass, stays lazy under the extra), and an untraced shape keeps its provisional numbers (charged 751,619,276 bytes on `rtx1-local` at the default extra) and logs that its shape has no trace card. Qwen4 selects its checked-in prewarm base by resolved capture shape (RTX count, Sparks attached) from `qwen_prewarm.json`, plus the shared extra. V4.1 uses layout/rank inventories in `v41_prewarm.json`: one-rank measured base 3,630,170,112 bytes, charged 4,132,267,264 bytes; two-rank measured bases 1,625,292,800 / 1,279,262,720 bytes, charged 2,127,389,952 / 1,781,359,872 bytes (each charge includes one 2 MiB tail and 500 MB extra). An unmeasured V4.1 layout borrows neither another layout's base nor its pins. MiMo selects `mimo_prewarm.json` by checkpoint variant, coordinator rank count and Spark attachment: Flash `mimof-48` 1 RTX + Sparks has a 423,624,704-byte base including its 2 MiB tail, charged 847,249,408 bytes. Pro `mimop-70` 2 RTX + Sparks uses its own per-rank measured row shares and tails; an untraced checkpoint/layout uses unpinned bootstrap, never another key's evidence. Charged once before KV, independent of `GPU_RESERVE`; cache bound equals charged total. GLM/Mistral prewarm fits the base (or user total): pinned entries first, then list order until the next entry does not fit; if the pinned set cannot fit, prewarm none. V4 warms every geometry its list holds that its pool can express. Skips warn and become runtime misses. Qwen4's traced list is already the base by construction, so it warms in pinned-first list order and an explicit total below the base evicts the rare tail. Zero runs eagerly. A scalar applies independently to each GPU; unspecified `gpuN` selectors retain defaults. Startup, Ready and `/v1/stats` report charge and policy sources. Kimi K3 selects the per-physical-rank base in `kimi_prewarm.json` by checkpoint-native core format (`k6` or `bf16`) and coordinator rank count, plus the same fixed tail and bounded extra; untraced core views use bootstrap keys. BF16 2 RTX + 6 Sparks uses measured bases 1,281,359,872 / 1,279,262,720 bytes, charged 1,783,457,024 / 1,781,359,872 bytes including one 2 MiB tail and 500 MB extra; its coverage-1 adaptive trace selects 168 geometries with 21 pins. Untraced core/layout combinations use unpinned bootstrap geometry and a provisional census base, never another key's measured base, list or pins. Kimi startup fits indivisible pinned geometries first, then replay-hot unpinned geometries using measured per-rank capture shares within the base, never runtime extra. Kimi prefill remains eager and startup expands only replayable rows 1..64. Dense Qwen uses checkpoint/quant/KV-specific single-RTX inventories in `qwen35_prewarm.json`; untraced variants bootstrap unpinned with a provisional 64 MiB base plus one 2 MiB tail. Muse uses `muse_prewarm.json` per rank count and resolved onboarded-layer prefix: (1,2) measured base 1,056,964,608 bytes, charged 1,559,061,760 bytes; (2,0) measured bases 1,287,651,328 / 1,302,331,392 bytes, charged 1,789,748,480 / 1,804,428,544 bytes (each includes one 2 MiB tail and 500 MB extra); an untraced layout has an empty, unpinned bootstrap (zero base), so set an explicit reserve for initial trace collection. Step-5 EXL3 K4+Core-K6 inventories in `step5_prewarm.json` have measured bases 3,407,872,000 bytes (1 RTX + 3 Sparks) and 2,835,349,504 / 2,629,828,608 bytes (2 RTX + 6 Sparks); each adds one 2 MiB tail and the shared 500 MB extra when `DECODE_GRAPHS=on`. Untraced Step-5 layouts have no borrowed base or pins; explicit totals or extra enable bounded bootstrap captures. Other families await cache integration. |
 | `GRAPH_PREWARM` | on | `on`, `off` | `off` skips startup graph prewarm only for single-GPU V4.1 and GLM Flash while retaining lazy runtime capture. Other families accept `on` and explicitly refuse `off`. Cross-device layouts refuse `off`: runtime graph instantiation can deadlock behind a peer wait (#1878). Does not reduce the admitted graph reserve. CLI: `--graph-no-prewarm`. |
 | `GRAPH_DONOR_ALWAYS` | off | `on`, `off` | Apply the shared cold-donor rule below the soft cap too: owner age must exceed K (V4.1 K=2, other families K=1), with matching native topology. Spanning sites never donate, including prewarm, because their missing shapes cannot be recaptured after readiness; their update safety under peer waits is unproven. CLI: `--graph-donor-always`. |
+| `GRAPH_DONOR_COLD_LAG` | 0 | Non-negative integer | Extra idle cycles N for donor-always below the soft cap: donor age must exceed K + N. Non-zero requires `GRAPH_DONOR_ALWAYS=on`. At or above the soft cap (including hard-cap pressure), age > K is unchanged. CLI: `--graph-donor-cold-lag N`. |
 | `GPU_GRAPH_RESERVE_EXTRA` | 500 MB | size, percentage or `gpuN=value,...` | Runtime capture headroom beyond the family prewarm base, coordinator GPUs only. MB is decimal: 500 MB = 500,000,000 bytes (MiB is binary). Percentages are of the base. An explicit value has no implicit cap; otherwise the default cap is 100% of the base. Conflicts with an explicit `GPU_GRAPH_RESERVE` total on that device. |
 | `GPU_GRAPH_RESERVE_EXTRA_CAP` | 100% of base for default extra; no cap for explicit extra | size, percentage or `gpuN=value,...` | Upper bound on extra runtime headroom; percentages are of the family base. Charged total = base + min(extra, cap). Conflicts with an explicit `GPU_GRAPH_RESERVE` total on that device. No Spark extra keys: workers have no graph owner. |
 | `SPARK_GRAPH_RESERVE` | worker family default | size | One graph reserve per Spark worker, matching the scalar `SPARK_RESERVE` convention. Forwarded to workers for GLM 5.3, GLM Flash, Qwen4, V4.1 and MiMo; the live native worker currently runs eagerly with no capture/replay sites, so no worker graph owner is active. Enabling worker capture requires admission ownership and bounded-cache integration together. |
@@ -630,7 +716,7 @@ Each key is also a global `cuteafd` flag (`--gpu-memory-cap`, `--kv-max-tokens`,
 | `FAMILY_RESERVE` | per-family constant (0 in every family) | size | A named per-GPU reserve added to the measured components; `GPU_RESERVE` overrides it. One key for coordinator GPUs only: no family keeps a per-family Spark margin (Sparks use `SPARK_RESERVE`). |
 | `KV_POOL_TOKENS` | unset | multiple of 64 | V4.1 only: fixed KV pool. Conflicts with `POOL_TOKENS`. |
 | `KV_POOL_SIZE` | unset | `B/MB/GB/MiB/GiB` | V4.1 only: fixed KV pool size. |
-| `POOL_TOKENS` | `auto` where offered | `auto` or count | Planner-sized pool up to 2M tokens; a number pins it. |
+| `POOL_TOKENS` | `auto` where offered | `auto` or count | Automatic pool uses memory left after target-sized placement and onboarding; a number pins it. |
 | `HOST_CACHE_BYTES` | `auto` | `auto`, `0`, byte size | Prefix-cache host tier; `0` disables it. |
 
 ## Attention and KV
@@ -665,13 +751,13 @@ Each key is also a global `cuteafd` flag (`--gpu-memory-cap`, `--kv-max-tokens`,
 
 | Key | Default | Values | Notes |
 | --- | --- | --- | --- |
-| `SPECULATOR` | family default | `auto` (Qwen4), `off`, `dflash2`, `dspark`, `mtp` | Which fail is in the table below. |
+| `SPECULATOR` | family default | `auto` (Qwen4/Kimi), `off`, `dflash2`, `dspark`, `mtp` | An eligible Kimi/GLM Flash automatic external drafter must be installed, including its config; a missing checkpoint fails with a `nest hf download` command rather than silently serving without speculation. Explicit `off` and unsupported automatic targets remain off. K3.1 pairing reads verifier model/architecture declarations and target hidden/vocabulary/tap/mask dimensions from checkpoint metadata, including MC source identity; no checkpoint revision or core-view allowlist is used. Pairing mismatches name the field and refuse launch. |
 | `SPECULATOR_MODEL_ID` | family default | HF repo id | External drafter checkpoint. |
 | `SPECULATOR_MODEL_REVISION` | empty | 40–64 lowercase hex | Drafter revision. |
 | `SPECULATOR_DEPTH` | 3 for local Qwen/Step-5, else 1 | positive int | Native MTP draft depth. |
 | `DRAFT_LENGTH` | unset (adaptive) | positive int | Fixed verified draft tokens per step: min(value, native head width), further capped by the existing row budget at high concurrency. Overrides `DRAFT_POLICY`; statistics still recorded. Every family and speculator (DFlash2, dSpark, MTP, Markov). V4.1 adaptive maximum remains 5 when unset; fixed supports up to 7. Without a speculator it is ignored with one startup log; reports and cards say `no speculation`. |
-| `SPECULATOR_FP8` | `auto` | `auto`, `on`, `off` | GLM/Qwen/MiMo drafter precision: `on` converts to single-copy FP8. Inkling accepts `auto|off` only (checkpoint native). |
-| `DRAFT_POLICY` | unset | `shared`, `simple`, `simple-rc`, `simple-derived` | Drafter block policy: unset selects shared for MiniMax, simple elsewhere. Shared prices draft/skip actions per concurrency bucket and collects per-layer timing. Explicit values override the family default. |
+| `SPECULATOR_FP8` | `auto` | `auto`, `on`, `off` | GLM/Qwen/MiMo/Kimi drafter precision: unset, `auto` and `on` select single-copy FP8 projection weights; `off` keeps BF16. Rust resolves the same MiMo precision for planning and serving, independent of checkpoint alias or core view. Kimi block DSpark supports TP1 and physical TP2 with native BF16 norms/Markov tensors; FP8 applies to content-paired K3.1 DSpark in every core view and layout. Independent of `DRAFT_KV_CACHE`. Inkling accepts `auto|off` only (checkpoint native). |
+| `DRAFT_POLICY` | unset | `shared`, `simple`, `simple-rc`, `simple-derived` | Drafter block policy: unset selects `simple` for every family; the others are explicit opt-ins. Shared prices draft/skip actions per concurrency bucket and collects per-layer timing. |
 | `DRAFT_ROW_COST` | unset | `linear`, `power`, `log` | Drafter row cost model diagnostic. |
 | `DRAFT_SURVIVAL_LENGTHS` | `off` | `on`, `off` | Record draft survival lengths. |
 | `DRAFT_CONTEXT_SLOTS` | `max(20, drafts)` | positive int | GLM/MiMo drafter context slots. |
@@ -711,6 +797,16 @@ Each key is also a global `cuteafd` flag (`--gpu-memory-cap`, `--kv-max-tokens`,
 | `MEDIA_FEATURES_DIR`, `AUDIO_FEATURES_DIR` | unset | absolute dir | Encoder feature caches. |
 | `CHAT_TEMPLATE_FROM` | checkpoint | snapshot dir | GLM Flash template source when the checkpoint's template cannot mark images. |
 
+The direct daemon's `--max-image-tokens` accepts an explicit 1-16384 per-image
+LM span cap. Omission uses the processor's default span, limited by its
+architectural ceiling: existing families default to 4096 (Qwen capped at 1024,
+Mistral at its checkpoint span), MiniMax to 576, and Kimi to 16698. Spark encoder workers accept this full native ceiling; each
+checkpoint tower contract still validates its own smaller shape limit. An explicit
+cap can only lower a declared ceiling; it never changes vendor resize geometry
+or silently truncates feature rows. Kimi's full default is intentionally above
+the CLI's largest explicit value. These registration limits do not qualify an
+otherwise inactive tower for serving. `detail=low` remains capped at 256.
+
 Kimi K3.1 (`kimi_k31`) uses the shared Kimi engine. MC `original` (BF16),
 MC `k6-compact` and standalone native Core-K6 are launchable with real Spark
 experts after accepted full-model fidelity and partial paired scoring proof
@@ -720,22 +816,43 @@ MC `CORE_VIEW=original`, 2 RTX + 6 Sparks and automatic pool/onboarding.
 With measured idle Spark capacities (#2082), MC `k6-compact` plans on
 1 RTX + 6 Sparks with an automatic 2,081,152-token pool and no RTX expert
 onboarding; this is a CPU placement result, not a new serving benchmark.
-K8 compact remains `Planned` because fidelity is
-unmeasured; whole-core `fp8-compact` remains unsupported and unqualified.
+K8 compact serves under the same structural and memory admission as original
+and K6; fidelity measurements are reported separately, never a launch gate.
+Whole-core `fp8-compact` still refuses unsupported tensor roles before loading.
 All accepted views retain native BF16 indexer weights. K3 DFlash2 hidden-state
 compatibility is independently unqualified. `SPECULATOR=dspark` selects the
 checkpoint-native Inferact K3.1 block drafter (override with `SPECULATOR_MODEL_ID`
-and `SPECULATOR_MODEL_REVISION`), with native BF16 weights and independent
+and `SPECULATOR_MODEL_REVISION`), with BF16 or opt-in FP8 projection weights (`SPECULATOR_FP8=on`) and independent
 `DRAFT_KV_CACHE=fp8|bf16` window rings (default FP8). One coordinator runs TP1;
 two coordinators split query/KV heads and FFN neurons across both devices,
 with per-rank packed arenas, local rings and exact local prefix marks. FC and
 norms are replicated; only the head GPU owns Markov/confidence and borrows the
 target vocabulary head. The shared GQA TP2 reduction uses drafter-private
-exchange flags, never target exchange slots. `SPECULATOR=off` remains the
-default. Full-model served lossless qualification is still pending (#2261);
-this is not a performance claim. `TP2_DFLASH` does not select this GQA split.
+exchange flags, never target exchange slots. Unset/`auto` `SPECULATOR` selects DSpark
+for `wrldsuksgo2mars/Kimi-K3.1-Pro-EXL3-K2-MC`, `CORE_VIEW=original|k6-compact`,
+on one or two coordinators with target FP8 KV. The independent defaults are
+`SPECULATOR_FP8=auto` (FP8 projection weights) and `DRAFT_KV_CACHE=fp8`;
+explicit `SPECULATOR=off`, weight precision or draft KV overrides win.
+The max example uses this automatic selection, not an off pin. Qualification
+uses the measured config and MC-manifest SHA-256 digests plus selected view and physical TP,
+never a repository/path string or Spark count; identical local/renamed copies qualify.
+The Inferact drafter config digest is checked independently;
+normal memory admission still decides fit. K8/whole-core FP8 target views,
+other checkpoints and target BF16 KV remain default-off.
+Cold and full-prompt warm strict sets passed 10/10 on the qualified TP2 views;
+TP1 K6 is separately gated. FP8 weights save 1.227 GB net per coordinator versus
+BF16 after scratch, independently of draft KV. Closed-batch C16 has a substantial
+uneven-completion drain penalty; sustained C8/C16 measurements in #2261 select
+the throughput arm. Sampled acceptance is not directly comparable to Inferact's
+reported 4.16 because its draft sampling/rejection method differs (#2312). `TP2_DFLASH` does not select this GQA split.
 
-Kimi K3 and Step-5 are text-only; dense Qwen has media off. GLM 5.3 / ML4,
+MiniMax and Kimi default to their bundled still-image towers (`VISION=auto`), placed
+Spark-first with RTX fallback by joint admission. `VISION=off` keeps text-only
+serving and rejects image chat. Step-5 production serving remains text-only; dense Qwen
+has media off. Kimi and MiniMax `plan --layout` reserve their bundled
+still-image tower as an independent packed arena plus phase-peak scratch,
+Spark-first with RTX fallback in the joint admission solve. Native still-image serving uses the admitted owner through the shared vision
+runtime; the numerical drift diagnostics remain on #1984 and #1779. GLM 5.3 / ML4,
 GLM Flash, MiMo, Qwen4 and Muse carry their own towers. Native GLM Flash EXLR8
 K4 min/max examples use automatic bundled vision; the planner admits its resident
 weights and scratch alongside the KV pool and routed experts.
@@ -880,7 +997,7 @@ family's planner and runtime policy):
 | Value | V4.1 | V4 | GLM 5.3 / ML4 | GLM Flash | MiMo | Qwen4 | Qwen dense | Kimi K3 | Step-5 | Muse | Inkling |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | `auto` (default) | ✓ layers¹ | ✓ context | ✓ context | ✓ context | ✓ heads | ✓ layers | ✓ layers² | ✓ context⁴ | ✓ layers | ✓ heads | ✓ heads |
-| `heads` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✓⁴ | ✗ | ✗ | ✗ |
+| `heads` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✓⁴ | ✓ | ✓ | ✓ |
 | `context` | ✗ | ✓ | ✓ | ✓ | ✗ | ✗ | ✗ | ✓⁴ | ✗ | ✗ | ✗ |
 | `layers` | ✗ | ✗ | ✓ (explicit; auto stays context)³ | ✓ (explicit; auto stays context) | ✗ | ✓ | ✓ (two RTX) | ✓ | ✗ | ✗ | ✗ |
 
@@ -926,7 +1043,7 @@ Speculator (`SPECULATOR`):
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | `off` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ (default) |
 | `dflash2` | ✗ | ✗ | ✓ (default) | ✓ (default) | ✓ | ✗ | ✗ | ✓ (default) | ✗ | ✓ (default) | ✗ |
-| `dspark` | ✓ (default) | ✓ (default) | ✓ (Mistral Large 4 only) | ✓ | ✗ | ✗ | ✓ (default unless hidden is 5120) | ✓ (K3.1 opt-in; qualification gate) | ✗ | ✗ | ✗ |
+| `dspark` | ✓ (default) | ✓ (default) | ✓ (Mistral Large 4 only) | ✓ | ✗ | ✗ | ✓ (default unless hidden is 5120) | ✓ (content-paired K3.1 default in every view/layout; otherwise opt-in) | ✗ | ✗ | ✗ |
 | `mtp` | ✗ | ✗ | ✗ | ✗ | ✓ | ✓ (default) | ✓ (local EXL3/NVFP4 default, depth 3) | ✗ | ✓ (default) | ✗ | ✗ |
 
 Qwen4 unset/`auto` selects native MTP (depth 3) only for qualified local
@@ -1041,6 +1158,7 @@ original core is already FP8, not an MC publication.
 | `GRAPH_DISABLE_LOW_MEM` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | `GRAPH_PREWARM` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | `GRAPH_DONOR_ALWAYS` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `GRAPH_DONOR_COLD_LAG` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | `GPU_GRAPH_RESERVE` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | `GPU_GRAPH_RESERVE_EXTRA` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | `GPU_GRAPH_RESERVE_EXTRA_CAP` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
@@ -1081,13 +1199,13 @@ original core is already FP8, not an MC publication.
 | `SPECULATOR_MODEL_REVISION` | ✗ | ✓ | ✓ | ✓ | ✓ | ✗ | ✓ | ✓ | ✗ | ✓ | ✗ |
 | `SPECULATOR_DEPTH` | ✗ | ✗ | ✗ | ✗ | ✓ | ✓ | ✓ | ✗ | ✓ | ✗ | ✗ |
 | `DRAFT_LENGTH` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| `SPECULATOR_FP8` | ✗ | ✗ | ✓ | ✓ | ✓ | ✓ | ✗ | ✗ | ✗ | ✗ | ✓ |
-| `DRAFT_POLICY` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✗ | ✗ | ✗ | ✓ |
+| `SPECULATOR_FP8` | ✗ | ✗ | ✓ | ✓ | ✓ | ✓ | ✗ | ✓ | ✗ | ✗ | ✓ |
+| `DRAFT_POLICY` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✓ | ✗ | ✗ | ✓ |
 | `DRAFT_ROW_COST` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ |
 | `DRAFT_SURVIVAL_LENGTHS` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ |
 | `DRAFT_CONTEXT_SLOTS` | ✗ | ✗ | ✓ | ✓ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
 | `DRAFT_SEQUENCES` | ✗ | ✗ | ✓ | ✓ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
-| `SPECULATION_TRACE` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✗ | ✓ | ✓ |
+| `SPECULATION_TRACE` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✓ | ✓ |
 | `GLM5_FLASH_DRAFT_LINEAR` | ✗ | ✗ | ✗ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
 | **Prefill** | | | | | | | | | | |  |
 | `PREFILL_PACKING` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ |
@@ -1108,8 +1226,8 @@ original core is already FP8, not an MC publication.
 | **Media** | | | | | | | | | | |  |
 | `VISION` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | `AUDIO` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| `VISION_REPLICAS` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✗ | ✗ | ✓ | ✗ |
-| `MEDIA_CACHE_BYTES` | ✗ | ✗ | ✗ | ✓ | ✓ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ |
+| `VISION_REPLICAS` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✓ | ✓ | ✓ | ✓ |
+| `MEDIA_CACHE_BYTES` | ✗ | ✗ | ✗ | ✓ | ✓ | ✓ | ✗ | ✓ | ✓ | ✗ | ✓ |
 | `MEDIA_FEATURES_DIR` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | `AUDIO_FEATURES_DIR` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | `CHAT_TEMPLATE_FROM` | ✗ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ |
@@ -1192,8 +1310,11 @@ explicit device capacity and estimated runtime owners. The plan
 capacity. Explicit weight ceilings override that derivation.
 
 Kimi DFlash2 planning resolves the configured external drafter snapshot and
-defaults its weights to FP8, as the launcher does. MiMo defaults DFlash2 only for the official
-`XiaomiMiMo/MiMo-V2.6-{Flash,Pro}-MOPD` model ids; other ids default off; explicit MTP defaults to one stage. These settings
+defaults its weights to FP8, as the launcher does. MiMo defaults DFlash2 when
+the checkpoint bundles a `dflash/` drafter or one is configured, including MC
+views and renamed snapshots; otherwise it defaults off. Drafter packing validates
+actual FP8 matrix alignment, not the target family name. Explicit MTP defaults
+to one stage. These settings
 are resolved in Rust for both config planning and launching. MiMo plan uses
 `--mimo-kv-cache int8|bf16` for its full-attention records (separate from the
 MLA `--kv-cache`), matching the launcher's `KV_CACHE`.

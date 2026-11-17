@@ -244,13 +244,6 @@
         }
       ],
       "deprecated": true,
-      "admitted_worlds": [
-        2,
-        3,
-        4,
-        5,
-        6
-      ],
       "native_layout": {
         "unit_columns": 16,
         "storage_alignment": 128,
@@ -360,13 +353,6 @@
         }
       ],
       "deprecated": true,
-      "admitted_worlds": [
-        1,
-        2,
-        3,
-        4,
-        6
-      ],
       "native_layout": {
         "unit_columns": 16,
         "storage_alignment": 128,
@@ -423,12 +409,6 @@
         }
       ],
       "deprecated": true,
-      "admitted_worlds": [
-        2,
-        3,
-        4,
-        6
-      ],
       "native_layout": {
         "unit_columns": 16,
         "storage_alignment": 128,
@@ -698,12 +678,6 @@
       "checkpoints": [],
       "deprecated": true,
       "provenance_note": "Historical native NVFP4 roles from dev 34b0d33b1985441746df5e2fe02c2ae3a9a29f6f; no checkpoint fit witness and no new width classes.",
-      "admitted_worlds": [
-        2,
-        3,
-        4,
-        6
-      ],
       "native_layout": {
         "unit_columns": 16,
         "storage_alignment": 128,
@@ -729,9 +703,6 @@
         }
       ],
       "deprecated": true,
-      "admitted_worlds": [
-        4
-      ],
       "native_layout": {
         "unit_columns": 16,
         "storage_alignment": 128,
