@@ -531,9 +531,10 @@ fn schedule_inner(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path
     if let Some(drafter) = drafter { drafter.prepare_workspace()?; }
     let mut free_slots: Vec<usize> = drafter.map_or(Vec::new(), |d| (0..d.slots).rev().collect());
     let width = drafter.map_or_else(|| engine.mtp.as_ref().map_or(0, |m| m.stages.len()), |d| d.cfg.drafts());
+    // DFlash and the native MTP chain propose tokens only: neither has a trained confidence head.
     let mut shared = if width > 0 {
         engine.arm_draft_probe()?;
-        Some(DraftPolicy::new(policy.length, width, true))
+        Some(DraftPolicy::new(policy.length, width, cuteafd_core::HeadScore::None, true))
     } else { None };
 
     let mut trace = crate::shared::speculation_trace::Trace::open()?;

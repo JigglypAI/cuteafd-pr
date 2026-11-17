@@ -648,9 +648,10 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
     let tokenizer = cuteafd_loader::LoadedTokenizer::from_snapshot(&opened.snapshot)?;
     let drafter = engine.drafter.as_ref();
     let mut free_slots: Vec<usize> = drafter.map_or(Vec::new(), |d| (0..d.slots).rev().collect());
+    // mtp_dspark and DFlash2 propose tokens only: neither has a trained confidence head.
     let mut shared = drafter.map(|d| {
         engine.arm_draft_probe()?;
-        anyhow::Ok(DraftPolicy::new(policy.length, d.cfg.drafts(), true))
+        anyhow::Ok(DraftPolicy::new(policy.length, d.cfg.drafts(), cuteafd_core::HeadScore::None, true))
     }).transpose()?;
     let mut active: Vec<Active<'_>> = Vec::new();
     // Decoding requests waiting for KV pages: they keep their slot and pages, skip rounds.

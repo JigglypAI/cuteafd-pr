@@ -185,8 +185,9 @@ pub(crate) trait Backend<'a> {
         draft: &mut Self::Draft) -> Result<()>;
     fn draft(&self, sequences: &mut [DraftSeq<'_, Self::Placement, Self::Draft>], timing: &mut DraftTiming, selector: &mut crate::shared::token_io::TokenSelector<'_>)
         -> Result<Vec<Vec<u32>>>;
-    /// The drafter's raw confidence head score of each position of the request's
-    /// current proposal, where it has a head. Trace data only.
+    /// What the drafter's trained confidence head reports; `None` without one.
+    fn draft_head_kind(&self) -> cuteafd_core::HeadScore { cuteafd_core::HeadScore::None }
+    /// The head's raw score of each position of the request's current proposal.
     fn draft_head<'d>(&self, _draft: &'d Self::Draft) -> Option<&'d [f32]> { None }
     /// Whether verification and acceptance take history-copy rows past the drafter's block.
     fn draft_copies(&self) -> bool { false }
@@ -823,7 +824,7 @@ pub(crate) fn schedule<'a, B: Backend<'a>>(engine: &B, snapshot: &std::path::Pat
         engine.selector_ready(&mut selector)?;
         let shared = if width > 0 {
             engine.arm_draft_probe()?;
-            Some(Policy::new(length, width, engine.draft_copies()))
+            Some(Policy::new(length, width, engine.draft_head_kind(), engine.draft_copies()))
         } else { None };
         let trace = Trace::open()?;
         let prefills = decode_share.queue::<Prefill<'_, B::Placement, B::Draft>>()?;

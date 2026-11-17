@@ -74,6 +74,7 @@ mod tests {
     use crate::cli::{Cli, Commands};
     use crate::shared::draft::history::Policy;
     use clap::Parser;
+    use cuteafd_core::HeadScore;
 
     fn config(command: &str, extra: &[&str]) -> DraftLength {
         let mut argv = vec!["cuteafd", command, "--snapshot", "/model", "--native-lib", "/native.so"];
@@ -111,7 +112,7 @@ mod tests {
                 let effective = requested.min(native);
                 assert_eq!(length.effective(native), effective);
                 let (mut policy, settings) = cuteafd_bench::context::capture_resolved(||
-                    Policy::new(length, native, true));
+                    Policy::new(length, native, HeadScore::None, true));
                 assert!(policy.fixed());
                 assert!(settings.0.iter().any(|(k, v)| k == "draft-mode" && v == &format!("fixed {effective}")));
                 let mut context = cuteafd_bench::context::ServerContext::default();

@@ -3,7 +3,8 @@
 //! [`history`] is the one draft policy: per-position acceptance history with
 //! exploration (`cuteafd_core::DraftHistory`), its launch configuration
 //! ([`length`]), trace records and stats. A drafter declares its native block
-//! and reports each round's outcome; nothing else. [`copy`] finds the history copies the policy may verify past
+//! and, where it has a trained confidence head, a raw score per position;
+//! nothing else. [`copy`] finds the history copies the policy may verify past
 //! an agreeing neural draft. [`clock`] and [`timing`] are profiling only.
 pub(crate) mod clock;
 pub(crate) mod copy;

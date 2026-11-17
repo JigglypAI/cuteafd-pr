@@ -157,6 +157,14 @@ impl<'a> Drafter<'a> {
         if let Self::RemoteDflash(d) = self { d.finish_terminal(drained); }
     }
 
+    /// dSpark's trained confidence head reports a sigmoid per position; DFlash2 has no head.
+    pub fn head_kind(&self) -> cuteafd_core::HeadScore {
+        match self {
+            Self::Dspark(_) => cuteafd_core::HeadScore::Probability,
+            Self::Dflash2(_) | Self::RemoteDflash(_) => cuteafd_core::HeadScore::None,
+        }
+    }
+
     /// Loads the drafter `snapshot` names (dSpark when its config says so,
     /// else DFlash2) for a target of `hidden` x `vocab` with `layers` layers:
     /// `slots` ring contexts, draft steps of up to `sequences` sequences.

@@ -490,6 +490,9 @@ impl<'e, 'a> Backend<'a> for DenseBackend<'e, 'a> {
         Ok(proposed)
     }
     // dSpark has a trained confidence head (one sigmoid per position); the MTP chain has none.
+    fn draft_head_kind(&self) -> cuteafd_core::HeadScore {
+        if self.drafter.is_some() { cuteafd_core::HeadScore::Probability } else { cuteafd_core::HeadScore::None }
+    }
     fn draft_head<'d>(&self, draft: &'d DraftState) -> Option<&'d [f32]> {
         self.drafter.as_ref().map(|_| draft.confidence.as_slice())
     }

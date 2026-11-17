@@ -1,10 +1,10 @@
 //! Host cost of the `history` draft policy per verify round, at a full lane.
 //!
-//! Each round plans, refines (recording head scores), extends a copy, settles
+//! Each round plans, refines (with a confidence head), extends a copy, settles
 //! under the row budget and observes 16 requests of a seven-position drafter.
 //! Run: `cargo test --release -p cuteafd-core --test all draft_history_host_cost_per_round
 //! -- --ignored --nocapture`; `CUTEAFD_POLICY_BENCH_MAX_US` bounds the round median.
-use cuteafd_core::{DraftControl, DraftHistory, DraftOutcome, DrafterSpec};
+use cuteafd_core::{DraftControl, DraftHistory, DraftOutcome, DrafterSpec, HeadScore};
 use std::time::Instant;
 
 fn median(mut samples: Vec<f64>) -> f64 {
@@ -16,7 +16,7 @@ fn median(mut samples: Vec<f64>) -> f64 {
 #[ignore = "release host-cost bench; run explicitly with --ignored --nocapture"]
 fn draft_history_host_cost_per_round() {
     const REQUESTS: usize = 16;
-    let spec = DrafterSpec { block: 7, copy: 32 };
+    let spec = DrafterSpec { block: 7, head: HeadScore::Logit, copy: 32 };
     let mut policy = DraftHistory::new(spec, DraftControl::History);
     let requests: Vec<(u64, usize)> = (0..REQUESTS as u64).map(|id| (id, 40)).collect();
     let ids: Vec<u64> = requests.iter().map(|request| request.0).collect();

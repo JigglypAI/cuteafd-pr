@@ -5,13 +5,14 @@
 //!
 //! A serve loop's round:
 //! 1. [`Policy::plan`] before the draft pass: drafts to ask for per request;
-//! 2. [`Policy::shape`] after it: each proposal cut to its plan, extended by
-//!    an agreeing history copy, and fitted to the verify-row budget;
+//! 2. [`Policy::shape`] after it: each proposal cut to its plan (the head may
+//!    skip the explore position), extended by an agreeing history copy, and
+//!    fitted to the verify-row budget;
 //! 3. [`Policy::observe`] after verification, with what the target accepted.
 use super::copy;
 use super::length::DraftLength;
 use crate::shared::speculation_trace::Trace;
-use cuteafd_core::{DraftControl, DraftHistory, DraftOutcome, DrafterSpec};
+use cuteafd_core::{DraftControl, DraftHistory, DraftOutcome, DrafterSpec, HeadScore};
 use std::sync::{Arc, Mutex, OnceLock};
 
 /// One active request after the draft pass, in verifier order.
@@ -19,8 +20,7 @@ pub(crate) struct Proposal<'a> {
     pub id: u64,
     /// The drafter's tokens (empty: not drafted). Cut and extended in place.
     pub tokens: &'a mut Vec<u32>,
-    /// The drafter's raw confidence head score per drafted position, where it has
-    /// one: recorded in the round trace, read by nothing in the policy.
+    /// Raw head score per drafted position, for a drafter with a trained head.
     pub head: Option<&'a [f32]>,
     /// Prompt and generated tokens with the round's anchor last, for a history copy.
     pub history: &'a [u32],
@@ -35,13 +35,13 @@ pub(crate) struct Policy {
 }
 
 impl Policy {
-    /// `block` is the drafter's native block; `copies` whether the family
-    /// verifies history copies past it.
-    pub fn new(length: DraftLength, block: usize, copies: bool) -> Self {
-        let spec = DrafterSpec { block, copy: if copies { copy::COPY_EXTENSION } else { 0 } };
+    /// `block` is the drafter's native block; `head` what its confidence head
+    /// reports; `copies` whether the family verifies history copies.
+    pub fn new(length: DraftLength, block: usize, head: HeadScore, copies: bool) -> Self {
+        let spec = DrafterSpec { block, head, copy: if copies { copy::COPY_EXTENSION } else { 0 } };
         let history = DraftHistory::new(spec, length.control());
         cuteafd_bench::context::set_resolved("draft-mode", &length.label(block));
-        tracing::info!(policy = %history.control().label(), block, copy_positions = spec.copy,
+        tracing::info!(policy = %history.control().label(), block, head = ?head, copy_positions = spec.copy,
             requested_length = ?length.draft_length, "draft policy");
         let policy = Self { history, trace: replay_trace(), rounds: 0 };
         policy.publish();
@@ -164,7 +164,7 @@ mod tests {
 
     #[test]
     fn shape_cuts_to_the_plan_extends_agreeing_copies_and_fits_the_budget() {
-        let mut policy = Policy::new(length(None), 4, true);
+        let mut policy = Policy::new(length(None), 4, HeadScore::None, true);
         let history = repeating(8);
         assert_eq!(policy.plan(&[(1, 40), (2, 40)], 64), [4, 4]);
         let (mut agreeing, mut differing) = (vec![100, 101, 102, 103], vec![100, 101, 7, 103]);
@@ -187,12 +187,12 @@ mod tests {
     #[test]
     fn fixed_length_and_off_come_from_the_launch_configuration() {
         let (mut fixed, settings) = cuteafd_bench::context::capture_resolved(||
-            Policy::new(length(Some(9)), 7, true));
+            Policy::new(length(Some(9)), 7, HeadScore::Logit, true));
         assert!(fixed.fixed() && fixed.max_positions() == 7);
         assert!(settings.0.iter().any(|(name, value)| name == "draft-mode" && value == "fixed 7"));
         assert_eq!(fixed.plan(&[(1, 40)], 64), [7]);
         let mut off = Policy::new(DraftLength { draft_policy: super::super::length::DraftPolicyChoice::Off,
-            ..Default::default() }, 7, true);
+            ..Default::default() }, 7, HeadScore::None, true);
         assert_eq!((off.plan(&[(1, 40)], 64), off.max_positions()), (vec![0], 0));
     }
 

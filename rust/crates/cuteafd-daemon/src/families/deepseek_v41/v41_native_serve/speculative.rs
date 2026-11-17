@@ -107,8 +107,8 @@ pub(crate) struct DraftRuntime<'w, 'a, C = DsparkChain<'w, 'a>> {
     request_limit: usize,
     draft_limit: usize,
     draft_width: usize,
-    // The confidence head's raw logit per drafted position, downloaded for the
-    // round trace and diagnostics. The draft policy does not read it.
+    // The confidence head's raw logit per drafted position, downloaded whenever
+    // the draft policy is bound, or for diagnostics.
     confidence_trace: std::collections::BTreeMap<u64, Vec<f32>>,
     neural_lengths: std::collections::BTreeMap<u64, usize>,
     /// `DRAFT_POLICY` and the `DRAFT_LENGTH` fixed-width override.
@@ -208,11 +208,11 @@ impl<'w, 'a, C: DraftChain<'a>> DraftRuntime<'w, 'a, C> {
         Ok(())
     }
     /// Bind the shared history draft policy before serving. The drafter declares
-    /// its native block; `local_layers` is the installed placement's RTX layer
-    /// count, for the console.
+    /// its native block and its confidence head's raw logits; `local_layers` is
+    /// the installed placement's RTX layer count, for the console.
     pub(crate) fn bind_policy(&mut self, local_layers: usize) {
         LOCAL_LAYERS.store(local_layers as u64, std::sync::atomic::Ordering::Relaxed);
-        self.policy = Some(Policy::new(self.length, self.draft_width, true));
+        self.policy = Some(Policy::new(self.length, self.draft_width, cuteafd_core::HeadScore::Logit, true));
     }
     /// What a verification round records besides its outputs: layer events under the timing profile.
     pub fn capture(&self) -> Capture {
@@ -233,8 +233,9 @@ impl<'w, 'a, C: DraftChain<'a>> DraftRuntime<'w, 'a, C> {
         self.lanes[lane].depths = depths.clone();
         depths
     }
-    /// Fit the lane's proposals to their plan after the draft pass: an agreeing
-    /// history copy extends a draft, and the verifier row budget caps the round. `members` are (identity, the
+    /// Fit the lane's proposals to their plan after the draft pass: the head may
+    /// skip an explore, an agreeing history copy extends a draft, and the
+    /// verifier row budget caps the round. `members` are (identity, the
     /// request's tokens with its anchor last, copies allowed) in lane order;
     /// `inputs` are each member's anchor followed by its drafts.
     pub fn shape(&mut self, members: &[(u64, &[u32], bool)], inputs: &mut [Vec<u32>]) {

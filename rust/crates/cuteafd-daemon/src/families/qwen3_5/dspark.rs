@@ -5,7 +5,7 @@ use crate::shared::{draft::history,
     fp8_linear::{Fp8Rows, Fp8Scales}, speculation::{block_dspark::{self, DsparkConfig, DsparkDrafter},
         target::{verify_commit, AcceptedPrefix, VerifyRequest, VerifyRow}}};
 use anyhow::{ensure, Context, Result};
-use cuteafd_core::{verify_dspark_greedy_vocab, DraftControl, DraftHistory, DrafterSpec};
+use cuteafd_core::{verify_dspark_greedy_vocab, DraftControl, DraftHistory, DrafterSpec, HeadScore};
 use cuteafd_ffi::{programs::Programs, CuteafdDeviceBuffer, NativeLibrary};
 use cuteafd_loader::{families::{glm5::draft_representation::GlmDraftRepresentation,
     qwen3_5::Qwen35Config}, plan::checkpoint::Checkpoint};
@@ -53,9 +53,9 @@ pub(super) fn weight_receipts(drafter: &DsparkDrafter<'_>,
     Ok(inventory.receipts)
 }
 
-/// The serving policy for one request over dSpark's block.
+/// The serving policy for one request: dSpark's block and its confidence head.
 fn policy(block: usize) -> DraftHistory {
-    DraftHistory::new(DrafterSpec { block, copy: 0 }, DraftControl::History)
+    DraftHistory::new(DrafterSpec { block, head: HeadScore::Probability, copy: 0 }, DraftControl::History)
 }
 
 fn argmax(row: &[f32]) -> Result<u32> {
@@ -385,7 +385,7 @@ mod tests {
     #[test]
     fn dense_draft_binding_uses_the_drafter_block_and_checkpoint_vocabulary() {
         let policy = policy(7);
-        assert_eq!(policy.spec().block, 7);
+        assert_eq!((policy.spec().block, policy.spec().head), (7, HeadScore::Probability));
         assert_eq!(argmax(&[2., 2., 1.]).unwrap(), 0);
         assert_eq!(top_margin(&[2., 2., 1.], 0), (0., vec![0, 1]));
         assert_eq!(top_margin(&[3., 2., 1.], 0), (1., vec![0]));
