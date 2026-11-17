@@ -1,5 +1,5 @@
 //! Explicit startup contribution to the family's existing coordinator push group.
-use super::{pcm_audio::PcmTowerSpec, TowerSpec};
+use super::{pcm_audio::PcmTowerSpec, ReadTransform, TowerSpec};
 use crate::shared::experts::rtx::{dense::{Job, Operand, Records, Rect, Step}, push::PushStartupError};
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::CuteafdDeviceBuffer;
@@ -65,20 +65,20 @@ impl Contribution {
             }
             for read in &spec.reads {
                 append(&mut out.records, device, address, spec.native.weight_bytes as usize,
-                    &read.path, &read.metadata, read.destination, read.vector)?;
+                    &read.path, &read.metadata, read.destination, read.transform)?;
             }
         }
         if let Some((spec, address)) = pcm {
             for read in spec.push_reads() {
                 append(&mut out.records, device, address, spec.native_spec().weight_bytes as usize,
-                    &read.path, &read.metadata, usize::try_from(read.destination)?, false)?;
+                    &read.path, &read.metadata, usize::try_from(read.destination)?, ReadTransform::Direct)?;
             }
         }
         if let Some((spec, address)) = mimo {
             for read in spec.plan().reads().values() {
                 append(&mut out.records, device, address, spec.native().weight_bytes as usize,
                     &read.path, &read.metadata, usize::try_from(read.destination)?,
-                    read.metadata.dtype == cuteafd_core::DType::Bf16)?;
+                    if read.metadata.dtype == cuteafd_core::DType::Bf16 {ReadTransform::Bf16ToF32}else{ReadTransform::Direct})?;
             }
         }
         check_destinations(&out.records, reserved)?;
@@ -141,7 +141,7 @@ fn check_destinations(records: &Records, mut ranges: Vec<(i32, usize, usize)>) -
     for step in &records.steps {
         for job in &step.jobs {
             match job {
-                Job::Widen { dst, .. } => add(dst)?,
+                Job::Widen { dst, .. } | Job::NarrowF32Bf16 { dst, .. } => add(dst)?,
                 _ => anyhow::bail!("unexpected media transform"),
             }
         }
@@ -154,9 +154,10 @@ fn check_destinations(records: &Records, mut ranges: Vec<(i32, usize, usize)>) -
 
 /// One BF16 media vector's widen windows (one staged step each), shared by the
 /// recorded contribution and the header-only host admission of its staging.
-pub(crate) fn widen_windows(path: &std::path::Path, metadata: &cuteafd_loader::SafetensorsTensorMetadata) -> Vec<Rect> {
+pub(crate) fn transform_windows(path: &std::path::Path, metadata: &cuteafd_loader::SafetensorsTensorMetadata,
+    transform:ReadTransform) -> Vec<Rect> {
     let bytes = metadata.byte_length as usize;
-    let window = crate::shared::experts::rtx::dense::TRANSFORM_BYTES & !1;
+    let window = crate::shared::experts::rtx::dense::TRANSFORM_BYTES & !(transform.source_alignment()-1);
     (0..bytes).step_by(window).map(|at| {
         let count = (bytes - at).min(window);
         Rect { name: metadata.name.clone(), path: path.into(), base: metadata.byte_offset + at as u64,
@@ -166,9 +167,9 @@ pub(crate) fn widen_windows(path: &std::path::Path, metadata: &cuteafd_loader::S
 
 fn append(records: &mut Records, device: i32, address: usize, arena_bytes: usize,
     path: &std::path::Path, metadata: &cuteafd_loader::SafetensorsTensorMetadata,
-    destination: usize, widen: bool) -> Result<()> {
+    destination: usize, transform:ReadTransform) -> Result<()> {
     let bytes = usize::try_from(metadata.byte_length)?;
-    let resident = bytes.checked_mul(if widen { 2 } else { 1 }).context("media tensor extent overflow")?;
+    let resident = transform.resident_bytes(metadata)?;
     ensure!(bytes > 0 && address != 0 && address.checked_add(arena_bytes).is_some()
         && metadata.byte_offset.checked_add(metadata.byte_length).is_some()
         && destination.checked_add(resident).is_some_and(|end| end <= arena_bytes),
@@ -176,14 +177,23 @@ fn append(records: &mut Records, device: i32, address: usize, arena_bytes: usize
     let buffer = |offset, len| CuteafdDeviceBuffer {
         ptr: (address as *mut u8).wrapping_add(offset).cast(), bytes: len, device_id: device, flags: 0,
     };
-    if widen {
-        ensure!(bytes % 2 == 0, "media BF16 tensor has an odd byte extent");
-        let mut at = 0;
-        for rect in widen_windows(path, metadata) {
-            let count = rect.bytes();
-            records.steps.push(Step { device, rects: vec![rect],
-                jobs: vec![Job::Widen { at: 0, bytes: count, dst: buffer(destination + at * 2, count * 2) }] });
-            at += count;
+    if transform!=ReadTransform::Direct {
+        let mut at=0;
+        for rect in transform_windows(path,metadata,transform) {
+            let count=rect.bytes();
+            let (offset,resident)=match transform {
+                ReadTransform::Bf16ToF32=>(at*2,count*2),
+                ReadTransform::F32ToBf16=>(at/2,count/2),
+                ReadTransform::Direct=>unreachable!(),
+            };
+            let dst=buffer(destination+offset,resident);
+            let job=match transform {
+                ReadTransform::Bf16ToF32=>Job::Widen {at:0,bytes:count,dst},
+                ReadTransform::F32ToBf16=>Job::NarrowF32Bf16 {at:0,bytes:count,dst},
+                ReadTransform::Direct=>unreachable!(),
+            };
+            records.steps.push(Step {device,rects:vec![rect],jobs:vec![job]});
+            at+=count;
         }
     } else {
         let rect = Rect { name: metadata.name.clone(), path: path.into(), base: metadata.byte_offset,
@@ -206,15 +216,15 @@ pub(crate) mod tests {
         let records = contribution.records();
         let source: u64 = spec.reads.iter().map(|read| read.metadata.byte_length).sum();
         let resident: usize = spec.reads.iter().map(|read|
-            read.metadata.byte_length as usize * if read.vector { 2 } else { 1 }).sum();
+            read.transform.resident_bytes(&read.metadata).unwrap()).sum();
         assert_records(snapshot, records, source, resident);
-        assert!(spec.reads.iter().all(|read| read.destination + read.metadata.byte_length as usize
-            * if read.vector { 2 } else { 1 } <= spec.native.weight_bytes as usize));
+        assert!(spec.reads.iter().all(|read| read.destination + read.transform.resident_bytes(&read.metadata).unwrap() <= spec.native.weight_bytes as usize));
     }
     fn assert_records(snapshot: &std::path::Path, records: Records, source: u64, resident: usize) {
         let direct: usize = records.operands.iter().map(|operand| operand.bytes).sum();
         let widened: usize = records.steps.iter().flat_map(|step| &step.jobs).map(|job| match job {
             Job::Widen { bytes, dst, .. } => { assert_eq!(dst.bytes, bytes * 2); dst.bytes },
+            Job::NarrowF32Bf16 { bytes, dst, .. } => {assert_eq!(dst.bytes,bytes/2);dst.bytes},
             _ => panic!("unexpected media transform"),
         }).sum();
         assert_eq!(direct + widened, resident);
@@ -280,8 +290,7 @@ pub(crate) mod tests {
             Some((&pcm, 4096 + vision.native.weight_bytes as usize)), None, None).unwrap().records();
         let source = vision.reads.iter().map(|read| read.metadata.byte_length).sum::<u64>()
             + pcm.push_reads().map(|read| read.metadata.byte_length).sum::<u64>();
-        let resident = vision.reads.iter().map(|read| read.metadata.byte_length as usize
-            * if read.vector { 2 } else { 1 }).sum::<usize>()
+        let resident = vision.reads.iter().map(|read| read.transform.resident_bytes(&read.metadata).unwrap()).sum::<usize>()
             + pcm.push_reads().map(|read| read.metadata.byte_length as usize).sum::<usize>();
         assert_records(root.path(), records, source, resident);
     }
@@ -295,7 +304,7 @@ pub(crate) mod tests {
         ]);
         let headers = cuteafd_loader::read_safetensors_metadata(&shard)?;
         let reads = headers.into_iter().enumerate().map(|(index, metadata)| super::super::TensorRead {
-            path: shard.clone(), metadata, destination: index * 256, vector: index == 1,
+            path: shard.clone(), metadata, destination: index * 256, transform: if index == 1 {ReadTransform::Bf16ToF32}else{ReadTransform::Direct},
         }).collect::<Vec<_>>();
         let vision = TowerSpec { native: cuteafd_ffi::vision::VisionSpec {
             abi_version: 2, head_dim: 8, inv_freq: 512, weight_bytes: 520, ..Default::default()
@@ -310,14 +319,14 @@ pub(crate) mod tests {
         // already validates every real PCM source and owner. Replay a private
         // miniature of those exact records instead of a second 236 MiB buffer.
         let mut pcm = vision.clone();
-        for read in &mut pcm.reads { read.vector = false; }
+        for read in &mut pcm.reads { read.transform = ReadTransform::Direct; }
         let expected = pcm.load_weights()?;
         assert_replayed_arena(root.path(), &expected,
             Some((pcm.constants[0].offset as usize, &pcm.constants[0].bytes)), |address| {
                 let mut records = Records::default();
                 for read in &pcm.reads {
                     append(&mut records, 0, address, pcm.native.weight_bytes as usize,
-                        &read.path, &read.metadata, read.destination, false)?;
+                        &read.path, &read.metadata, read.destination, ReadTransform::Direct)?;
                 }
                 Ok(records)
             })?;
@@ -333,7 +342,7 @@ pub(crate) mod tests {
         let mut constants = spec.clone();
         // Isolate the vector so only its widened tail can intersect native constants.
         let mut vector = constants.reads[0].clone();
-        vector.vector = true;
+        vector.transform = ReadTransform::Bf16ToF32;
         vector.metadata.byte_length = 2;
         vector.metadata.shape = vec![1];
         vector.destination = constants.native.inv_freq as usize - 3;
@@ -470,5 +479,27 @@ pub(crate) mod tests {
         let owner = Arc::new(OwnerThread::new(thread, cancel));
         let error = Contribution::prepare(0, None, None, None, Some((commit, acknowledgement, owner))).unwrap().commit().unwrap_err();
         assert!(error.downcast_ref::<PushStartupError>().is_some());
+    }
+}
+
+#[cfg(test)]
+mod narrow_tests {
+    use super::*;
+    use cuteafd_core::DType;
+    #[test]
+    fn narrowing_is_a_bounded_transient_step_not_a_second_resident_operand() -> Result<()> {
+        let metadata=cuteafd_loader::SafetensorsTensorMetadata {name:"patch".into(),dtype:DType::F32,
+            shape:vec![8],byte_offset:16,byte_length:32};
+        let mut records=Records::default();
+        append(&mut records,0,4096,256,std::path::Path::new("not-read.safetensors"),&metadata,0,ReadTransform::F32ToBf16)?;
+        assert!(records.operands.is_empty());assert_eq!(records.steps.len(),1);
+        let step=&records.steps[0];assert_eq!(step.rects[0].bytes(),32);
+        match &step.jobs[0] {
+            Job::NarrowF32Bf16 {at,bytes,dst}=> {assert_eq!((*at,*bytes,dst.bytes),(0,32,16));assert_eq!(dst.ptr as usize,4096);}
+            _=>panic!("wrong conversion job"),
+        }
+        check_destinations(&records,vec![])?;
+        assert!(append(&mut Records::default(),0,4096,8,std::path::Path::new("x"),&metadata,0,ReadTransform::F32ToBf16).is_err());
+        Ok(())
     }
 }

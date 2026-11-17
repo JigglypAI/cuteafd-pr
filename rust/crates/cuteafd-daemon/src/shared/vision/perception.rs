@@ -34,7 +34,7 @@ impl TowerSpec {
                 path: path.clone(),
                 metadata: metadata.clone(),
                 destination: cursor,
-                vector: false,
+                transform: ReadTransform::Direct,
             });
             cursor += metadata.byte_length as usize;
         }
@@ -232,7 +232,7 @@ mod tests {
             assert!(tower
                 .reads
                 .iter()
-                .all(|read| !read.vector && read.destination % 256 == 0));
+                .all(|read| read.transform==ReadTransform::Direct && read.destination % 256 == 0));
             assert_eq!(
                 tower.constants[0].bytes.len(),
                 if inkling { 64 } else { 96 }

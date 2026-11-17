@@ -13,7 +13,7 @@
 //! checkpoint's own `[IMG_BREAK]`/`[IMG_END]` embedding rows (copied from
 //! `tok_embeddings`) into those positions, so the injected span is exactly
 //! what the LM's embedding gather would produce for the marker tokens.
-use super::{ConstantRegion, Result, TensorRead, TowerSpec, VisionError};
+use super::{ReadTransform,ConstantRegion, Result, TensorRead, TowerSpec, VisionError};
 pub use cuteafd_loader::families::mistral_large4::vision::*;
 use cuteafd_core::DType;
 use cuteafd_ffi::vision::{VisionBlock, VisionSpec, NO_VISION_OFFSET};
@@ -71,7 +71,7 @@ impl TowerSpec {
             cursor = (cursor + 255) & !255;
             let destination = cursor;
             cursor += metadata.byte_length as usize * if vector { 2 } else { 1 };
-            reads.push(TensorRead { path: path.clone(), metadata: metadata.clone(), destination, vector });
+            reads.push(TensorRead { path: path.clone(), metadata: metadata.clone(), destination, transform: if vector {ReadTransform::Bf16ToF32}else{ReadTransform::Direct} });
             Ok(destination as u64)
         };
         let mut native = VisionSpec {
@@ -135,7 +135,7 @@ impl TowerSpec {
             metadata.byte_length = row;
             metadata.shape = vec![LM_HIDDEN];
             native.merger_extra[slot] = cursor as u64;
-            reads.push(TensorRead { path: path.clone(), metadata, destination: cursor, vector: false });
+            reads.push(TensorRead { path: path.clone(), metadata, destination: cursor, transform: ReadTransform::Direct });
             cursor += row as usize;
         }
         cursor = (cursor + 255) & !255;
