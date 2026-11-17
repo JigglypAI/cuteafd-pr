@@ -937,6 +937,31 @@ mod tests {
     }
 
     #[test]
+    fn fp8_body_manifest_requires_explicit_scales_and_preserves_cache_contract() {
+        for cache in [MlaCacheFormat::Bf16, MlaCacheFormat::Fp8] {
+            let mut native = specs(MlaDraftWindow::Full,1048576);
+            for (index,spec) in native.iter_mut().enumerate() {
+                spec.geometry["kv_cache"] = cache.label().into();
+                if index != 1 {
+                    spec.geometry["weight_dtype"] = "fp8".into();
+                    spec.geometry["projection_scale_k"] = 128.into();
+                    spec.geometry["batched_scale_k"] = 64.into();
+                    spec.pointers = if index == 0 { PRODUCER_FP8 } else { OUTPUT_FP8 }.iter().map(|s|(*s).to_owned()).collect();
+                }
+            }
+            assert!(validate_fp8_manifest(native.each_ref(),MlaDraftWindow::Full,cache).is_ok());
+            assert!(validate_manifest(native.each_ref(),MlaDraftWindow::Full,cache).is_err());
+            for (index,key,bad) in [(0,"projection_scale_k",64.into()),(2,"batched_scale_k",128.into()),
+                (0,"weight_dtype","bf16".into())] {
+                let mut broken=native.clone();broken[index].geometry[key]=bad;
+                assert!(validate_fp8_manifest(broken.each_ref(),MlaDraftWindow::Full,cache).is_err());
+            }
+            let mut broken=native.clone();broken[0].pointers.retain(|p|p!="s_qkv_a");
+            assert!(validate_fp8_manifest(broken.each_ref(),MlaDraftWindow::Full,cache).is_err());
+        }
+    }
+
+    #[test]
     fn context_combine_checks_h64_no_sink_and_rank_local_disjoint_extents() {
         let spec = ProgramSpec { name: "kimik3_mla_draft_lse_combine2".into(),
             capacity_rows: 64, geometry: serde_json::json!({"heads":64,"has_sink":false}),
