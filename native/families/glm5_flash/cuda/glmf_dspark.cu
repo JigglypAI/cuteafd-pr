@@ -77,11 +77,11 @@ __global__ void qk_rope_kernel(const bf16* qkv, const bf16* q_norm, const bf16* 
   }
 }
 
-// The 128-wide checkpoint path keeps the legacy 64-wide kernel unchanged.
+// Shared by GLM Flash and Kimi DSpark; preserve the legacy null-table route.
 // inv_freq contains the checkpoint's already-interpolated FP32 frequencies;
 // attention_factor scales cos/sin before their BF16 rounding (YaRN).
-template <bool fp8>
-__global__ void qk_rope128_kernel(const bf16* qkv, const bf16* q_norm, const bf16* k_norm,
+template <int dim, bool fp8>
+__global__ void qk_rope_table_kernel(const bf16* qkv, const bf16* q_norm, const bf16* k_norm,
                                   const int64_t* positions, const int32_t* slots, const float* inv_freq,
                                   bf16* q_out, bf16* k_out, bf16* v_out, int rows, int heads, int kv_heads,
                                   float attention_factor, float eps) {
@@ -92,48 +92,47 @@ __global__ void qk_rope128_kernel(const bf16* qkv, const bf16* q_norm, const bf1
   const bool is_q = head < heads;
   const int slot = slots != nullptr ? slots[row] : row;
   if (!is_q && slot < 0) return;
-  constexpr int dim = 128;
   const uint64_t width = uint64_t(heads + 2 * kv_heads) * dim;
   const bf16* in = qkv + row * width + uint64_t(head) * dim;
   const bf16* norm = is_q ? q_norm : k_norm;
-  float x[4];
+  float x[dim / 32];
   float sum = 0;
 #pragma unroll
-  for (int i = 0; i < 4; ++i) {
+  for (int i = 0; i < dim / 32; ++i) {
     x[i] = f(in[lane + i * 32]);
     sum += x[i] * x[i];
   }
   for (int o = 16; o; o >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, o);
   const float inv = rsqrtf(sum / dim + eps);
 #pragma unroll
-  for (int i = 0; i < 4; ++i) x[i] = r(r(x[i] * inv) * f(norm[lane + i * 32]));
-  float keys[4];
+  for (int i = 0; i < dim / 32; ++i) x[i] = r(r(x[i] * inv) * f(norm[lane + i * 32]));
+  float keys[dim / 32];
 #pragma unroll
-  for (int i = 0; i < 2; ++i) {
+  for (int i = 0; i < dim / 64; ++i) {
     const int index = lane + i * 32;
     const float angle = float(positions[row]) * inv_freq[index];
     const float c = r(cosf(angle) * attention_factor), s = r(sinf(angle) * attention_factor);
-    keys[i] = r(r(x[i] * c) - r(x[i + 2] * s));
-    keys[i + 2] = r(r(x[i + 2] * c) + r(x[i] * s));
+    keys[i] = r(r(x[i] * c) - r(x[i + dim / 64] * s));
+    keys[i + dim / 64] = r(r(x[i + dim / 64] * c) + r(x[i] * s));
   }
   if (is_q) {
     bf16* out = q_out + (uint64_t(row) * heads + head) * dim;
 #pragma unroll
-    for (int i = 0; i < 4; ++i) out[lane + i * 32] = __float2bfloat16(keys[i]);
+    for (int i = 0; i < dim / 32; ++i) out[lane + i * 32] = __float2bfloat16(keys[i]);
   } else {
     const int kv = head - heads;
     const bf16* source = qkv + row * width + uint64_t(heads + kv_heads + kv) * dim;
     if constexpr (fp8) {
-      float values[4];
+      float values[dim / 32];
 #pragma unroll
-      for (int i = 0; i < 4; ++i) values[i] = f(source[lane + i * 32]);
-      cuteafd::draft_kv::store<128>(k_out, slot, kv, kv_heads, keys);
-      cuteafd::draft_kv::store<128>(v_out, slot, kv, kv_heads, values);
+      for (int i = 0; i < dim / 32; ++i) values[i] = f(source[lane + i * 32]);
+      cuteafd::draft_kv::store<dim>(k_out, slot, kv, kv_heads, keys);
+      cuteafd::draft_kv::store<dim>(v_out, slot, kv, kv_heads, values);
     } else {
       bf16* k = k_out + (uint64_t(slot) * kv_heads + kv) * dim;
       bf16* v = v_out + (uint64_t(slot) * kv_heads + kv) * dim;
 #pragma unroll
-      for (int i = 0; i < 4; ++i) {
+      for (int i = 0; i < dim / 32; ++i) {
         k[lane + i * 32] = __float2bfloat16(keys[i]);
         v[lane + i * 32] = source[lane + i * 32];
       }
@@ -403,16 +402,24 @@ extern "C" int32_t cuteafd_block_dspark_qk_rope(const void* qkv, const void* q_n
   if (head_dim == 64 && inv_freq == nullptr && attention_factor == 1.0f)
     return cuteafd_glmf_dspark_qk_rope(qkv, q_norm, k_norm, positions, slots, q_out, k_out, v_out,
                                      rows, heads, kv_heads, theta, eps, stream);
-  if (head_dim != 128 || inv_freq == nullptr || rows < 1 || kv_heads < 1 || heads < 0 ||
+  if ((head_dim != 64 && head_dim != 128) || inv_freq == nullptr || rows < 1 || kv_heads < 1 || heads < 0 ||
       !isfinite(attention_factor) || attention_factor <= 0 || !isfinite(eps) || eps <= 0)
     return cudaErrorInvalidValue;
   const int64_t warps = int64_t(rows) * (int64_t(heads) + kv_heads);
   if (warps > INT32_MAX / 32) return cudaErrorInvalidValue;
-  qk_rope128_kernel<false><<<(warps * 32 + 255) / 256, 256, 0, static_cast<cudaStream_t>(stream)>>>(
-      static_cast<const bf16*>(qkv), static_cast<const bf16*>(q_norm), static_cast<const bf16*>(k_norm),
-      static_cast<const int64_t*>(positions), static_cast<const int32_t*>(slots), static_cast<const float*>(inv_freq),
-      static_cast<bf16*>(q_out), static_cast<bf16*>(k_out), static_cast<bf16*>(v_out), rows, heads, kv_heads,
-      attention_factor, eps);
+  if (head_dim == 64) {
+    qk_rope_table_kernel<64, false><<<(warps * 32 + 255) / 256, 256, 0, static_cast<cudaStream_t>(stream)>>>(
+        static_cast<const bf16*>(qkv), static_cast<const bf16*>(q_norm), static_cast<const bf16*>(k_norm),
+        static_cast<const int64_t*>(positions), static_cast<const int32_t*>(slots), static_cast<const float*>(inv_freq),
+        static_cast<bf16*>(q_out), static_cast<bf16*>(k_out), static_cast<bf16*>(v_out), rows, heads, kv_heads,
+        attention_factor, eps);
+  } else {
+    qk_rope_table_kernel<128, false><<<(warps * 32 + 255) / 256, 256, 0, static_cast<cudaStream_t>(stream)>>>(
+        static_cast<const bf16*>(qkv), static_cast<const bf16*>(q_norm), static_cast<const bf16*>(k_norm),
+        static_cast<const int64_t*>(positions), static_cast<const int32_t*>(slots), static_cast<const float*>(inv_freq),
+        static_cast<bf16*>(q_out), static_cast<bf16*>(k_out), static_cast<bf16*>(v_out), rows, heads, kv_heads,
+        attention_factor, eps);
+  }
   return cudaGetLastError();
 }
 
@@ -572,16 +579,24 @@ extern "C" int32_t cuteafd_block_dspark_qk_rope_fp8(const void* qkv, const void*
   if (head_dim == 64 && inv_freq == nullptr && attention_factor == 1.0f)
     return cuteafd_glmf_dspark_qk_rope_fp8(qkv, q_norm, k_norm, positions, slots, q_out, k_out, v_out,
                                      rows, heads, kv_heads, theta, eps, stream);
-  if (head_dim != 128 || inv_freq == nullptr || rows < 1 || kv_heads < 1 || heads < 0 ||
+  if ((head_dim != 64 && head_dim != 128) || inv_freq == nullptr || rows < 1 || kv_heads < 1 || heads < 0 ||
       !isfinite(attention_factor) || attention_factor <= 0 || !isfinite(eps) || eps <= 0)
     return cudaErrorInvalidValue;
   const int64_t warps = int64_t(rows) * (int64_t(heads) + kv_heads);
   if (warps > INT32_MAX / 32) return cudaErrorInvalidValue;
-  qk_rope128_kernel<true><<<(warps * 32 + 255) / 256, 256, 0, static_cast<cudaStream_t>(stream)>>>(
-      static_cast<const bf16*>(qkv), static_cast<const bf16*>(q_norm), static_cast<const bf16*>(k_norm),
-      static_cast<const int64_t*>(positions), static_cast<const int32_t*>(slots), static_cast<const float*>(inv_freq),
-      static_cast<bf16*>(q_out), static_cast<bf16*>(k_out), static_cast<bf16*>(v_out), rows, heads, kv_heads,
-      attention_factor, eps);
+  if (head_dim == 64) {
+    qk_rope_table_kernel<64, true><<<(warps * 32 + 255) / 256, 256, 0, static_cast<cudaStream_t>(stream)>>>(
+        static_cast<const bf16*>(qkv), static_cast<const bf16*>(q_norm), static_cast<const bf16*>(k_norm),
+        static_cast<const int64_t*>(positions), static_cast<const int32_t*>(slots), static_cast<const float*>(inv_freq),
+        static_cast<bf16*>(q_out), static_cast<bf16*>(k_out), static_cast<bf16*>(v_out), rows, heads, kv_heads,
+        attention_factor, eps);
+  } else {
+    qk_rope_table_kernel<128, true><<<(warps * 32 + 255) / 256, 256, 0, static_cast<cudaStream_t>(stream)>>>(
+        static_cast<const bf16*>(qkv), static_cast<const bf16*>(q_norm), static_cast<const bf16*>(k_norm),
+        static_cast<const int64_t*>(positions), static_cast<const int32_t*>(slots), static_cast<const float*>(inv_freq),
+        static_cast<bf16*>(q_out), static_cast<bf16*>(k_out), static_cast<bf16*>(v_out), rows, heads, kv_heads,
+        attention_factor, eps);
+  }
   return cudaGetLastError();
 }
 

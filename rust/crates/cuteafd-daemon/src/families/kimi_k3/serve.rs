@@ -117,7 +117,7 @@ pub(super) fn startup_options<'a, const RANKS: usize>(args: &'a ServeArgs,
     slots: usize, marks: usize, prefill: cuteafd_loader::serving_capacity::prefill_waves::PrefillPlan)
     -> Result<startup::Options<'a, RANKS>> {
     let draft = args.draft.as_ref().map(|snapshot| super::draft::Options {
-        snapshot: snapshot.clone(), fp8: args.draft_fp8, tp2_dflash: args.tp2_dflash, cache_format: args.kv_cache, draft_kv_cache: args.draft_kv_cache });
+        snapshot: snapshot.clone(), fp8: args.draft_fp8, tp2_dflash: args.tp2_dflash, cache_format: args.kv_cache, context_window: args.draft_length.draft_context_window, draft_kv_cache: args.draft_kv_cache });
     Ok(startup::Options { media: Some(&args.media), role: startup::Role::Serve,
         expert_usage: args.expert_usage, expert_usage_reader: args.expert_usage_reader.clone(),
         cache_format: args.kv_cache, devices, native_lib: &args.native_lib, manifest: &args.manifest,

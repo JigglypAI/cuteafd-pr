@@ -15,6 +15,7 @@ pub(crate) struct Options {
     pub fp8: bool,
     pub tp2_dflash: bool,
     pub cache_format: cuteafd_core::MlaCacheFormat,
+    pub context_window: usize,
     pub draft_kv_cache: cuteafd_loader::families::qwen4::Qwen4KvCache,
 }
 
@@ -41,14 +42,16 @@ impl Options {
     pub(crate) fn layout(&self,slots:usize,context:usize,sms:usize,head_rank:usize)->Result<DraftLayout> {
         if crate::shared::speculation::block_dspark::is_dspark(&self.snapshot)? {
             ensure!(!self.tp2_dflash,"block dSpark uses physical GQA head splits, not TP2_DFLASH");
-            if head_rank==1 {
+            if head_rank==1 && self.context_window==0 && cuteafd_loader::formats::block_dspark::BlockDsparkConfig::read(&self.snapshot)?.window.is_some() {
                 let rank=|rank|cuteafd_loader::formats::block_dspark::BlockDsparkRuntimeLayout::for_rank_representation(
                     &self.snapshot,slots,slots.min(8),sms,&format!("kimi/draft/{rank}"),self.draft_kv_cache,rank,2,head_rank,self.representation());
                 return Ok(DraftLayout::BlockTp2 { ranks:Box::new([rank(0)?,rank(1)?]),lead:head_rank });
             }
-            return Ok(DraftLayout::Block(cuteafd_loader::formats::block_dspark::BlockDsparkRuntimeLayout::with_representation(
-                &self.snapshot,slots,slots.min(8),sms,&format!("kimi/draft/{head_rank}"),self.draft_kv_cache,self.representation())?));
+            return Ok(DraftLayout::Block(cuteafd_loader::formats::block_dspark::BlockDsparkRuntimeLayout::with_context(
+                &self.snapshot,slots,slots.min(8),sms,&format!("kimi/draft/{head_rank}"),self.draft_kv_cache,self.representation(),
+                context,slots.checked_mul(context).context("block draft pool overflow")?,self.context_window)?));
         }
+        ensure!(self.context_window==0,"DRAFT_CONTEXT_WINDOW currently requires a Kimi block DSpark drafter");
         let cfg=MlaDflashConfig::read(&self.snapshot)?;
         Ok(cfg.runtime_layout(self.representation(),GlmDraftCapacity::new(slots,slots.min(8),cfg.block)?,
             context,slots.checked_mul(context).context("draft pool overflow")?,sms,Fp8Rows::W8a16.code() as u8,
@@ -230,7 +233,7 @@ impl<'a> NativeDraft<'a> {
         let window_marks=if draft.is_block() {
             let devices=streams.iter().map(|s|s.device).collect::<Vec<_>>();
             let backings=admission.allocate_block_marks(&devices)?;
-            if marks>0 {
+            if marks>0 && window_bytes>0 {
                 let readers=draft.block_readers()?;
                 let planes=draft.block_window_planes(0)?;
                 for backing in backings {
@@ -444,6 +447,7 @@ impl<'a> NativeDraft<'a> {
         Ok(parts)
     }
     pub(crate) fn move_mark(&self, mark: usize, slot: usize, capture: bool) -> Result<()> {
+        if self.window_bytes==0 { return Ok(()); }
         if self.common().is_block() {
             ensure!(mark<self.marks && !self.block_marks.is_empty(),"block marks disabled/outside admission");
             let planes=self.common().block_window_planes(slot)?;
@@ -708,8 +712,38 @@ mod tests {
     }
 
     #[test]
+    fn lithos_tp1_and_tp2_keep_one_whole_lead_local_body_and_native_taps() -> Result<()> {
+        use cuteafd_loader::{formats::block_dspark::{BlockDsparkConfig,block_dspark_weight_recipe},
+            plan::testing::{t,write_safetensors},families::qwen4::Qwen4KvCache};
+        let root=tempfile::tempdir()?;
+        let raw=include_str!("../../../../cuteafd-loader/src/families/kimi_k3/fixtures/lithos-dspark-config.json");
+        std::fs::write(root.path().join("config.json"),raw)?;
+        let config=BlockDsparkConfig::read(root.path())?;
+        let tensors=RefCell::new(Vec::new());
+        block_dspark_weight_recipe(&config,|name,shape| {
+            tensors.borrow_mut().push(t(name,"BF16",shape));Ok::<_,anyhow::Error>(())
+        },|parts,cols| { for (name,rows) in parts { tensors.borrow_mut().push(t(*name,"BF16",&[*rows,cols])); } Ok(()) })?;
+        write_safetensors(&root.path().join("model.safetensors"),&tensors.into_inner());
+        for head in [0,1] { for context_window in [0,2048] { for kv in [Qwen4KvCache::Bf16,Qwen4KvCache::Fp8] {
+            let options=Options { snapshot:root.path().to_owned(),fp8:false,tp2_dflash:false,
+                cache_format:Default::default(),draft_kv_cache:kv,context_window };
+            assert_eq!(options.kind()?,cuteafd_loader::families::kimi_k3::draft::DraftKind::BlockDspark);
+            let layout=options.layout(16,8192,188,head)?;
+            let DraftLayout::Block(local)=&layout else { anyhow::bail!("Lithos must not create body collectives") };
+            assert_eq!((local.config.heads,local.config.kv_heads,local.config.intermediate),(64,16,14336));
+            assert_eq!(layout.target_taps(),[7,23,67,83,91]);
+            assert_eq!(local.reduction_bytes,0);assert!(local.exchange_buffers.is_empty());
+            layout.validate_capacity(16,64,8192,Default::default())?;
+            let (owned,_)=layout.demands(head as u8)?;
+            assert!(owned.owned.iter().all(|d|d.gpu==head as u8));
+            assert!(Options {tp2_dflash:true,..options}.layout(16,8192,188,head).is_err());
+        } } }
+        Ok(())
+    }
+
+    #[test]
     fn precision_is_one_explicit_resident_representation() {
-        let options = Options { snapshot: PathBuf::new(), fp8: false, cache_format: Default::default(), tp2_dflash: false, draft_kv_cache: Default::default() };
+        let options = Options { snapshot: PathBuf::new(), fp8: false, cache_format: Default::default(), tp2_dflash: false, context_window: 0, draft_kv_cache: Default::default() };
         assert_eq!(options.representation(), GlmDraftRepresentation::Bf16Only);
         assert_eq!(Options { fp8: true, ..options }.representation(), GlmDraftRepresentation::Fp8Only);
     }
@@ -757,7 +791,7 @@ mod tests {
             rows: 2048, waves: 2, prefill_rows: Some(1024),
             context: cuteafd_loader::placement::planner::Context::pinned(8192), slots: 2, marks: 0, max_context: 8192, pool_tokens: Some(16384), graphs: false,
             ffn_mode: cuteafd_ffi::KimiFfnMode::default(), hosted_layers: Some(hosted_layers),
-            draft: Some(Options { snapshot: drafter, fp8: true, tp2_dflash: false, cache_format, draft_kv_cache: Default::default() }), verify_rows: 0, prefix: None,
+            draft: Some(Options { snapshot: drafter, fp8: true, tp2_dflash: false, cache_format, context_window: 0, draft_kv_cache: Default::default() }), verify_rows: 0, prefix: None,
             prove_serve_admission: false,
         }))?;
         let engine = &loaded.engine;
@@ -847,7 +881,7 @@ mod tests {
             rows: TARGET_TAP_ROWS, waves: 2, prefill_rows: None, context: cuteafd_loader::placement::planner::Context::pinned(524_288), slots: 1, marks: 1, max_context: 524_288,
             pool_tokens: Some(524_288), graphs: true, ffn_mode: cuteafd_ffi::KimiFfnMode::default(),
             hosted_layers: Some(hosted_layers),
-            draft: Some(Options { snapshot: drafter, fp8: true, tp2_dflash, cache_format, draft_kv_cache: Default::default() }), verify_rows: 0, prefix: None,
+            draft: Some(Options { snapshot: drafter, fp8: true, tp2_dflash, cache_format, context_window: 0, draft_kv_cache: Default::default() }), verify_rows: 0, prefix: None,
             prove_serve_admission: false,
         })?;
         let engine = &loaded.engine;
