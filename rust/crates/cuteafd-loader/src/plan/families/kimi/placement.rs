@@ -494,6 +494,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
             return memory;
         }
     };
+    let draft_layout = draft.clone();
     let draft = match &draft {
         Some(layout) => match kimi::draft_layout_facts(layout, page_rows, maximum_pages, head_rank as u8) {
             Ok(value) => Some(value),
@@ -543,6 +544,12 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
         report.refuse_placement(format!("Kimi packed arena inventory refused: {error:#}"),
             "Provide complete selected native weight extents.");
         return memory;
+    }
+    if let Some(layout) = &draft_layout {
+        if let Err(error) = recipe.draft_homes(layout, &model.core) {
+            report.refuse_placement(format!("Kimi draft homes refused: {error:#}"), "Supply native full-head geometry.");
+            return memory;
+        }
     }
     if let Err(error) = recipe.blas_owners(if model.core.get_weight("language_model.lm_head").is_some() {
         crate::placement::planner::serving::BlasHead::Native } else { opts.bf16_target_head }) {

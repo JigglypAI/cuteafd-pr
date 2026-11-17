@@ -231,7 +231,7 @@ impl<'a> Admission<'a> {
         scales: crate::shared::fp8_linear::Fp8Scales, rows: crate::shared::fp8_linear::Fp8Rows,
         exchange: Option<([Rc<Stream<'a>>; 2], Rc<crate::shared::peer_split::PeerExchange<'a>>)>)
         -> Result<DeviceOwner<'a, DflashDrafter<'a>>> {
-        let rank = self.devices.len() - 1;
+        let rank = usize::from(draft::home(&self.placement).context("Kimi draft home missing")?);
         let target_projection = crate::shared::speculation::dflash::TargetProjection::from_bf16(
             !self.core.projections.contains_key("language_model.lm_head"));
         self.allocate_draft_with(device.id, |layout| device.own(|| {
@@ -308,7 +308,7 @@ impl<'a> Admission<'a> {
     }
 
     fn check_draft(&self, device: i32) -> Result<&DraftLayout> {
-        let head = self.devices.len() - 1;
+        let head = usize::from(draft::home(&self.placement).context("Kimi draft home missing")?);
         ensure!(device == self.devices[head] && !self.draft_allocated,
             "Kimi draft allocation differs from admitted rank or was already attempted");
         ensure!(!self.rtx_loaded && !self.global_uploaded.iter().any(|uploaded| *uploaded)
@@ -319,7 +319,7 @@ impl<'a> Admission<'a> {
             && !self.mla_allocated.iter().any(|allocated| *allocated),
             "Kimi drafter startup peak requires allocation before target residency");
         let layout = self.draft.as_ref().context("Kimi drafter was not admitted")?;
-        ensure!(draft::home(&self.placement) == Some(head as u8), "Kimi drafter must stay on target head owner");
+        ensure!(head < self.devices.len(), "Kimi drafter selected owner absent");
         if let DraftLayout::BlockTp2 { ranks,.. }=layout {
             for (rank,local) in ranks.iter().enumerate() {
                 reconcile_arena(rank,&local.weights,MemoryKind::DrafterWeights,&self.receipt.facts)?;
@@ -349,7 +349,7 @@ impl<'a> Admission<'a> {
         allocate(layout)
     }
     fn draft_mark_bytes(&self, device: i32) -> Result<usize> {
-        let head = self.devices.len() - 1;
+        let head = usize::from(draft::home(&self.placement).context("Kimi draft home missing")?);
         ensure!(device == self.devices[head] && !self.draft_marks_allocated, "Kimi draft mark allocation owner");
         let layout = self.draft.as_ref().context("Kimi draft marks without admitted draft")?;
         let bytes = layout.window_mark_bytes()?.checked_mul(usize::try_from(self.mark_selection.slots)?)
@@ -384,6 +384,15 @@ impl<'a> Admission<'a> {
             usize::try_from(d.bytes)?.checked_mul(marks).context("block mark extent overflow")?,
             crate::shared::memory::Tag::prefix("kimi/draft-marks")).map(Rc::new)).collect()
     }
+    pub(crate) fn allocate_draft_head(&self, device: Device<'a>) -> Result<Option<super::draft::HeadReplica<'a>>> {
+        if self.devices.len() != 2 || draft::home(&self.placement) != Some(0) { return Ok(None) }
+        self.check_draft(device.id)?;
+        let layout = cuteafd_loader::placement::families::kimi::draft_head_replica(
+            &self.core, self.cfg.hidden, self.cfg.vocab_size)?;
+        reconcile_arena(0, &layout, MemoryKind::DrafterWeights, &self.receipt.facts)?;
+        super::draft::HeadReplica::allocate(device, layout, &self.core).map(Some)
+    }
+
     pub(crate) fn draft_layout(&self) -> Option<&DraftLayout> { self.draft.as_ref() }
 
     /// Hops, the peer exchange and Spark waves serve one prefill unit.
@@ -941,6 +950,7 @@ pub(crate) fn admit<'a, const RANKS: usize>(mut inputs: Inputs<'_, RANKS>) -> Re
         fixed, shaped, owners: Vec::new(),
     };
     recipe.arena_padding(cfg, &core)?;
+    if let Some(layout) = &draft { recipe.draft_homes(layout, &core)?; }
     recipe.blas_owners(crate::shared::target_head::TargetHead::configured().blas_head(
         core.get_weight("language_model.lm_head").is_none()))?;
     let modes = recipe.resolved_attention();
