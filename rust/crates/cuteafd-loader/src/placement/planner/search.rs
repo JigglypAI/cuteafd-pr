@@ -852,6 +852,9 @@ pub fn solve(
     // Generic solver fixtures declare their exact finite curve domain. Shipping
     // family paths prepare their memory-bounded policy before building curves.
     let contract = recipe.prepare(&request)?;
+    if contract.page_rows == 0 {
+        return Err(Refusal::InvalidFact("zero contract page rows".into()));
+    }
     if let Some(tokens) = requested {
         if tokens % contract.page_rows != 0 {
             return Err(Refusal::MisalignedPool { tokens, page_rows: contract.page_rows });
@@ -952,6 +955,11 @@ pub fn solve_prepared(
         Pin::Auto => target.min(compiled),
         Pin::Exact(n) => n / page,
     };
+    if wanted < minimum && matches!(request.pool, Pin::Auto) {
+        return Err(Refusal::FullContextShortfall { context: floor,
+            tokens: compiled.checked_mul(page).ok_or(Refusal::Overflow("pool domain tokens"))?,
+            limiting: Box::new(Refusal::InvalidFact("memory-derived pool domain is below the required floor".into())) });
+    }
     if wanted < minimum || wanted > compiled {
         return Err(Refusal::InvalidPin("pool exceeds compiled extent"));
     }

@@ -198,7 +198,7 @@ pub fn report_layout_lines(layout: &cuteafd_core::memory_layout::MemoryLayout, f
     }
     let mut policy = MemoryPolicy::current();
     policy.kv_target = target.or(policy.kv_target);
-    let mut bounds = policy.kv(gpu_caps.iter().copied().min().unwrap_or(0), context.maximum)?;
+    let mut bounds = policy.kv(context.maximum)?;
     bounds.target = bounds.target.max(context.required());
     bounds.min = super::PoolPolicy::normalize_request(requested).unwrap_or(bounds.min).max(context.required());
     bounds.max = super::PoolPolicy::normalize_request(requested).or(bounds.max);

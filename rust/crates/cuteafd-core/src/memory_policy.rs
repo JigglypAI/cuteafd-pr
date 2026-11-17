@@ -238,10 +238,10 @@ impl MemoryPolicy {
         self.component(DeviceKind::Gpu, self.memory_padding.unwrap_or(DEFAULT_MEMORY_PADDING))
     }
 
-    /// KV target, min and max for the smallest physical coordinator card.
+    /// Uniform KV target, minimum and optional growth cap.
     /// The default minimum is the smaller of the model context and the
     /// agentic floor, bounded by the target, independent of Spark placement.
-    pub fn kv(&self, _smallest_card: u64, context: u64) -> Result<KvBounds, PolicyError> {
+    pub fn kv(&self, context: u64) -> Result<KvBounds, PolicyError> {
         let default_target = DEFAULT_GPU_KV_TOKENS;
         // An explicit target can be below the model maximum for automatic context.
         let target = self.kv_target.unwrap_or(default_target.max(context));
@@ -262,7 +262,7 @@ impl MemoryPolicy {
                 if reserve >= cap { return Err(PolicyError::ReserveFillsCap { device: name, reserve, cap }); }
             }
         }
-        self.kv(u64::MAX, 0).map(|_| ())
+        self.kv(0).map(|_| ())
     }
 }
 
@@ -415,14 +415,12 @@ mod tests {
     #[test]
     fn kv_defaults_are_unbounded_with_one_target_on_every_card() {
         let policy = MemoryPolicy::default();
-        for bytes in [24 * GIB, 32 * GIB, 96 * GIB, 192 * GIB] {
-            assert_eq!(policy.kv(bytes, 65_536).unwrap(),
-                KvBounds { target: 2 << 20, min: 65_536, max: None });
-        }
+        assert_eq!(policy.kv(65_536).unwrap(),
+            KvBounds { target: 2 << 20, min: 65_536, max: None });
         let pinned = MemoryPolicy { kv_max: Some(4 << 20), ..policy };
-        assert_eq!(pinned.kv(32 * GIB, 1 << 20).unwrap().max, Some(4 << 20));
-        assert!(MemoryPolicy { kv_max: Some(1 << 20), ..policy }.kv(96 * GIB, 0).is_err());
-        assert!(MemoryPolicy { kv_min: Some(3 << 20), ..policy }.kv(96 * GIB, 0).is_err());
+        assert_eq!(pinned.kv(1 << 20).unwrap().max, Some(4 << 20));
+        assert!(MemoryPolicy { kv_max: Some(1 << 20), ..policy }.kv(0).is_err());
+        assert!(MemoryPolicy { kv_min: Some(3 << 20), ..policy }.kv(0).is_err());
     }
 
     #[test]

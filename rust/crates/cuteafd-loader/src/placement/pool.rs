@@ -62,8 +62,7 @@ impl<'a> PoolFacts<'a> {
 pub fn prepare_pool(facts: PoolFacts<'_>) -> Result<PoolPolicy, cuteafd_core::memory_policy::PolicyError> {
     let mut policy = MemoryPolicy::current();
     policy.kv_target = facts.target.or(policy.kv_target);
-    let smallest = facts.card_bytes.iter().copied().min().unwrap_or(u64::MAX);
-    let bounds = policy.kv(smallest, facts.context.maximum)?;
+    let bounds = policy.kv(facts.context.maximum)?;
     let raw_requested = PoolPolicy::normalize_request(facts.requested);
     let requested = raw_requested.map(|tokens| {
         // A raw pin below context must retain its typed refusal, not round into validity.
