@@ -245,8 +245,9 @@ Porting a family or changing shared serve, prefill, exchange or admission code: 
 - Optional compiler cache override: set `CUTEAFD_KACHE=/absolute/path/to/kache` (v1.0.0)
   and optionally `CUTEAFD_KACHE_REMOTE=/shared/cache/directory` for host gates.
   Build containers use local stores only; missing kache or inaccessible remote warns and falls
-  back. Cache invocations time out after 300 seconds (`CUTEAFD_KACHE_TIMEOUT_SECONDS`
-  overrides for very slow compilers), then retry plain and disable caching for the
+  back. Cache invocations time out after 900 seconds (`CUTEAFD_KACHE_TIMEOUT_SECONDS`
+  overrides for very slow compilers); a timed-out invocation retries plain once and
+  later invocations stay cached. Only a proven cache fault disables caching for the
   rest of that build. Never make kache a gate prerequisite. Never run plain and
   kache Cargo builds on the same target directory: kache restores outputs as
   read-only hardlinks into its store, so a later plain build fails with "output
