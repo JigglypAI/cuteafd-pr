@@ -24,11 +24,11 @@ def scopes(family, model, count, **extra):
     return derived
 
 
-def test_kimi_scope_requests_no_v41_or_vision_exports():
+def test_kimi_scope_requests_shared_vision_but_no_v41_exports():
     derived = scopes('kimi_k3', 'Kimi-K3-EXL3-K2', 6)
     assert derived['CUTEAFD_WIP_KIMIK3_AOT'] == 'ON'
     assert 'CUTEAFD_WIP_V41_AOT' not in derived
-    assert 'CUTEAFD_WIP_VISION_ATTENTION_AOT' not in derived
+    assert derived['CUTEAFD_WIP_VISION_ATTENTION_AOT'] == 'ON'
     assert derived['CUTEAFD_WIP_COORDINATOR_EXPERT_FAMILIES'] == 'kimik3:exl3-k23'
 
 
@@ -43,7 +43,9 @@ def test_v41_scope_requests_v41_exports_only(count, roles):
 
 @pytest.mark.parametrize('family,model', [('glm5_flash', 'GLM-5.3-Flash-NVFP4'), ('qwen4', 'Qwen3.8-Flash-Next-EXL3'),
                                           ('muse_spark', 'Muse-Spark-Open-EXL3-K4-Core-K6'),
-                                          ('mistral_large4', 'Mistral-Large-4-EXL3-K4')])
+                                          ('mistral_large4', 'Mistral-Large-4-EXL3-K4'),
+                                          ('minimax_m3', 'MiniMax-M3.1-Flash'), ('kimi_k3', 'Kimi-K3-EXL3-K2'),
+                                          ('inkling2', 'Inkling-2-Small-MXFP8'), ('step5', 'Step-5-Preview')])
 def test_vision_families_request_vision_unless_off(family, model):
     assert scopes(family, model, 4)['CUTEAFD_WIP_VISION_ATTENTION_AOT'] == 'ON'
     assert 'CUTEAFD_WIP_VISION_ATTENTION_AOT' not in scopes(family, model, 4, VISION='off')
@@ -51,7 +53,7 @@ def test_vision_families_request_vision_unless_off(family, model):
 
 
 @pytest.mark.parametrize('family,model', [('mimo_v2', 'MiMo-V2.6-Pro'), ('glm5', 'GLM-5.3-EXL3-K4'),
-                                          ('step5', 'Step-5-Preview'), ('deepseek_v4', 'DeepSeek-V4-Flash')])
+                                          ('deepseek_v4', 'DeepSeek-V4-Flash')])
 def test_towers_without_shared_vision_attention_request_none(family, model):
     derived = scopes(family, model, 4)
     assert 'CUTEAFD_WIP_VISION_ATTENTION_AOT' not in derived and 'CUTEAFD_WIP_V41_AOT' not in derived

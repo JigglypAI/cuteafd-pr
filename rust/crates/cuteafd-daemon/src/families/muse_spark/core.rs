@@ -269,7 +269,7 @@ mod tests {
         let device = Device { library: &library, id: 1 };
         for ceiling in [64, 2752] {
             let owners = [false, true].into_iter().flat_map(|fp8| [ProjectionOutput::Bf16, ProjectionOutput::F32]
-                .into_iter().map(move |output| NativeRequest { image_groups: Vec::new(),
+                .into_iter().map(move |output| NativeRequest {
                     layout: NativeLayout { stem: format!("{fp8}-{output:?}"), shape: [128,128], fp8,
                         rank: 1, ranks: 2, split: if output == ProjectionOutput::F32 { CoreSplit::Input }
                             else { CoreSplit::Output } }, output })).collect::<Vec<_>>();
