@@ -810,7 +810,7 @@ def test_shared_gqa_drafter_requested_symbols_exist_in_native_catalog(family):
 def test_kimi_w8_exports_every_residual_transition_and_situ_width(exporter):
     programs = exporter.kimi_w8_programs()
     calls = {stem: (op, params, thunk()) for stem, op, params, thunk in programs}
-    assert len(calls) == len(programs) == 48
+    assert len(calls) == len(programs) == 56
     for stem, (op, params, (module, fn, args, kwargs)) in calls.items():
         assert args == () and kwargs == params
         if op == "bf16_projection":
@@ -825,7 +825,10 @@ def test_kimi_w8_exports_every_residual_transition_and_situ_width(exporter):
             assert params == expected
             continue
         assert module == "kimi_residual"
-        if op == "situ":
+        if op == "attn_res_stream":
+            assert fn == "compile_kimi_attn_res_stream_aot"
+            assert params == {"hidden": 7168, "candidates": int(stem.removeprefix("attn_res_stream_c"))}
+        elif op == "situ":
             assert fn == "compile_kimi_situ_aot"
             assert params == {"intermediate": int(stem.removeprefix("situ_i"))}
         else:
