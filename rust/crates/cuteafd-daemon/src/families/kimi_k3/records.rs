@@ -167,7 +167,9 @@ impl<'l, 'a> KimiRecords<'l, 'a> {
             && (ranks == 1 || self.streams[0].0 != self.streams[1].0)
             && self.streams[layout.rank].0 == device.id,
             "Kimi global physical owner inventory");
-        let expected = GlobalLayout::ranks_with_core(self.cfg, self.core, ranks)?;
+        let expected = GlobalLayout::ranks_with_core(self.cfg, self.core, ranks)?.into_iter()
+            .map(|entry| entry.with_final_attn_res(self.cfg, layout.rank == 0 && layout.operands.contains_key("output.norm")))
+            .collect::<Result<Vec<_>>>()?;
         ensure!(expected[layout.rank] == *layout, "Kimi recorded global differs from admitted geometry");
         let scoped = self.scoped("global".into(), &[device], vec![layout.shared_layout().arena_tensors()?])?;
         let mut operands = BTreeMap::new();

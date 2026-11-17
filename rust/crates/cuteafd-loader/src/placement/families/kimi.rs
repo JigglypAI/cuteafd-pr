@@ -161,6 +161,7 @@ pub struct DraftOwner {
 /// transient is only the difference above them.
 #[derive(Debug, Clone)]
 pub struct Draft {
+    pub final_attn_res_layer: Option<usize>,
     pub context_split: bool,
     pub arenas: Vec<(u8, crate::serving_capacity::WeightArenaLayout)>,
     pub owners: Vec<DraftOwner>,
@@ -236,7 +237,7 @@ pub fn draft_layout_facts(layout: &DraftLayout, page_rows: u64, maximum_pages: u
         let owners=ranks.iter().enumerate().flat_map(|(rank,l)|l.demands(rank as u8)).map(|d|DraftOwner {
             gpu:d.gpu,category:d.category,group:d.group,bytes_at_first:d.bytes,bytes_per_page:0,
             weights_at_first:0,weights_per_page:0 }).collect();
-        return Ok(Draft { context_split:false,arenas:ranks.iter().enumerate()
+        return Ok(Draft { final_attn_res_layer: None, context_split:false,arenas:ranks.iter().enumerate()
             .map(|(rank,l)|(rank as u8,l.weights.clone())).collect(),owners,staging_at_first:0,staging_per_page:0 });
     }
     let multiple = if layout.context_split() && page_rows == 64 { 2 } else { 1 };
@@ -288,7 +289,8 @@ pub fn draft_layout_facts(layout: &DraftLayout, page_rows: u64, maximum_pages: u
     let owners = owners.into_iter().filter(|owner| !matches!(owner.group.as_str(), "MLA DFlash owned weights" | "block dSpark owned weights")).collect::<Vec<_>>();
     anyhow::ensure!(owners.iter().all(|owner| owner.weights_at_first == 0 && owner.weights_per_page == 0),
         "Kimi draft immutable owner outside its arena");
-    Ok(Draft { context_split: layout.context_split(), arenas: vec![(gpu, arena)], owners,
+    Ok(Draft { final_attn_res_layer: (layout.hidden_stream() == crate::families::kimi_k3::draft::DraftHiddenStream::AttnRes)
+            .then(|| layout.target_taps().last().copied()).flatten(), context_split: layout.context_split(), arenas: vec![(gpu, arena)], owners,
         staging_at_first: staging_one.checked_sub(staging_per_page * (multiple - 1)).context("Kimi draft staging intercept")?,
         staging_per_page })
 }
@@ -528,7 +530,10 @@ impl KimiRecipe {
         anyhow::ensure!(self.fixed.iter().filter(|owner| owner.category == Category::Weights)
             .all(|owner| owner.group == "Kimi global weights" || owner.group.starts_with("Kimi layer ")),
             "Kimi fixed weights contain an unknown immutable owner");
-        let globals = GlobalLayout::ranks_with_core(cfg, core, self.gpus)?;
+        let final_tap = self.draft.as_ref().and_then(|draft| draft.final_attn_res_layer)
+            == cfg.layers.checked_sub(1);
+        let globals = GlobalLayout::ranks_with_core(cfg, core, self.gpus)?.into_iter()
+            .map(|layout| layout.with_final_attn_res(cfg, final_tap)).collect::<anyhow::Result<Vec<_>>>()?;
         let profiled = self.gpus == 2 && self.placement == AttentionPlacement::Layers;
         for (option, modes) in self.attention_profiles().iter().enumerate() {
             let layers = modes.iter().enumerate().map(|(layer, &mode)|
@@ -1256,7 +1261,7 @@ mod tests {
     fn draft_resident_weights_are_counted_once_in_target_load_peak() {
         let mut recipe = recipe();
         let arena = crate::serving_capacity::WeightArenaLayout::new("kimi/draft/0", [("weights".into(), 512)]).unwrap();
-        recipe.draft = Some(Draft { context_split: false, arenas: vec![(0, arena)], owners: vec![],
+        recipe.draft = Some(Draft { final_attn_res_layer: None, context_split: false, arenas: vec![(0, arena)], owners: vec![],
             staging_at_first: 128, staging_per_page: 0 });
         let contract = recipe.prepare(&single()).unwrap();
         let selected = vec![0; contract.variables.len()];
@@ -1293,7 +1298,7 @@ mod tests {
                         let mut recipe = recipe();
                         recipe.gpus = gpus;
                         recipe.lanes = lanes;
-                        recipe.draft = draft.then(|| Draft { context_split: false, arenas: vec![], owners: vec![],
+                        recipe.draft = draft.then(|| Draft { final_attn_res_layer: None, context_split: false, arenas: vec![], owners: vec![],
                             staging_at_first: 0, staging_per_page: 0 });
                         recipe.owners.clear();
                         recipe.blas_owners(head).unwrap();
@@ -1557,7 +1562,7 @@ mod tests {
         recipe.layer_attention = vec![ModeBytes { whole: 100, split: [50; 2] }; 2];
         recipe.experts = None;
         recipe.arenas = vec![Arena { count: 0, peak: vec![0; 2], resident: vec![0; 2], weights: vec![0; 2] }];
-        recipe.draft = Some(Draft { context_split: true, arenas: vec![], staging_at_first: 100,
+        recipe.draft = Some(Draft { final_attn_res_layer: None, context_split: true, arenas: vec![], staging_at_first: 100,
             staging_per_page: 0, owners: (0..2).map(|gpu| DraftOwner { gpu,
                 category: Category::Drafter, group: "physical draft cache".into(),
                 bytes_at_first: 32, bytes_per_page: 32, weights_at_first: 0,

@@ -162,7 +162,17 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
     }
     // Weight upload extents come from checkpoint geometry, not executable
     // workspace metadata. Header-only forecasts retain the same physical owners.
-    let globals = match crate::families::kimi_k3::weight_layout::GlobalLayout::ranks_with_core(cfg, &model.core, gpus) {
+    let final_tap = (|| -> anyhow::Result<bool> {
+        let Some(snapshot) = &opts.kimi_drafter_snapshot else { return Ok(false) };
+        let raw: serde_json::Value = serde_json::from_slice(&std::fs::read(snapshot.join("config.json"))?)?;
+        let stream = crate::families::kimi_k3::draft::DraftHiddenStream::from_config(&raw)?;
+        Ok(stream == crate::families::kimi_k3::draft::DraftHiddenStream::AttnRes
+            && raw["dflash_config"]["target_layer_ids"].as_array().is_some_and(|taps|
+                taps.iter().any(|tap| tap.as_u64() == cfg.layers.checked_sub(1).map(|last| last as u64))))
+    })();
+    let globals = match final_tap.and_then(|final_tap|
+        crate::families::kimi_k3::weight_layout::GlobalLayout::ranks_with_core(cfg, &model.core, gpus)?
+            .into_iter().map(|layout| layout.with_final_attn_res(cfg, final_tap)).collect::<anyhow::Result<Vec<_>>>()) {
         Ok(value) => value, Err(error) => {
             report.refuse_placement(format!("Kimi packed global inventory refused: {error:#}"), "Check checkpoint global geometry."); return memory;
         }

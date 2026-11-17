@@ -19,6 +19,7 @@ pub fn validate_topk_vocab(vocab: u64) -> std::result::Result<(), DflashTopkVoca
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct MlaDflashConfig {
+    pub hidden_stream: crate::families::kimi_k3::draft::DraftHiddenStream,
     pub mla: MlaGeometry,
     pub intermediate: usize,
     pub eps: f64,
@@ -187,6 +188,7 @@ impl MlaDraftWeight {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MlaDraftRuntimeLayout {
     kind: cuteafd_core::coordinator_programs::MlaDraftKind,
+    hidden_stream: crate::families::kimi_k3::draft::DraftHiddenStream,
     cache_format: MlaCacheFormat,
     target_hidden: usize,
     target_vocab: usize,
@@ -241,6 +243,7 @@ impl MlaDraftRuntimeLayout {
     pub fn selector_workspace_bytes(&self) -> Result<usize> {
         draft_selector_workspace_bytes(self.kind, self.capacity.block_rows - self.capacity.max_batch_sequences)
     }
+    pub fn hidden_stream(&self) -> crate::families::kimi_k3::draft::DraftHiddenStream { self.hidden_stream }
     pub fn cache_format(&self) -> MlaCacheFormat { self.cache_format }
     pub fn target_hidden(&self) -> usize { self.target_hidden }
     pub fn target_vocab(&self) -> usize { self.target_vocab }
@@ -930,6 +933,8 @@ impl MlaDflashConfig {
 
     pub fn from_json(value: &serde_json::Value) -> Result<Self> {
         let raw: Raw = serde_json::from_value(value.clone())?;
+        let hidden_stream = crate::families::kimi_k3::draft::DraftHiddenStream::from_config(value)
+            .map_err(|error| unsupported(&error.to_string()))?;
         validate_topk_vocab(raw.vocab_size as u64)?;
         let d = raw.dflash_config;
         let causal = raw.is_causal;
@@ -982,7 +987,7 @@ impl MlaDflashConfig {
             _ => Err(unsupported("MLA draft exports require native full/4096 noncausal or all-1024 causal windows")),
         }).collect::<Result<Vec<_>>>()?;
         let rotary = raw.rope_parameters.plan(mla.rope)?;
-        Ok(Self { mla, intermediate: raw.intermediate_size, eps: raw.rms_norm_eps,
+        Ok(Self { hidden_stream, mla, intermediate: raw.intermediate_size, eps: raw.rms_norm_eps,
             block: d.block_size, group: d.conv_group_size, selector_rank: d.selector_rank,
             selector_top_k: d.selector_top_k, taps: d.target_layer_ids, vocab: raw.vocab_size,
             mask_token: d.mask_token_id, max_context: raw.max_position_embeddings, windows, rotary,
@@ -1004,7 +1009,7 @@ impl MlaDflashConfig {
         }
         let inv_freq = target.inv_freq(&vec![0.0; rope / 2])
             .map_err(|e| unsupported(&format!("mtp_dspark rotary: {e}")))?;
-        Ok(Self { mla: MlaGeometry { hidden: target.hidden, heads: target.heads, q_rank: 0,
+        Ok(Self { hidden_stream: Default::default(), mla: MlaGeometry { hidden: target.hidden, heads: target.heads, q_rank: 0,
                 kv_rank: target.kv_lora_rank, nope: target.qk_nope_head_dim, rope, value: target.v_head_dim },
             intermediate: target.dense_intermediate, eps: target.rms_norm_eps, block: dspark.depth, group: 0,
             selector_rank: 0, selector_top_k: 0, taps: dspark.taps.clone(), vocab: target.vocab_size,
@@ -1254,7 +1259,7 @@ impl MlaDflashConfig {
         } else { None };
         let weight_arena_requests = crate::families::glm5::draft_physical::mla_arena_requests(self, mode)
             .map_err(|error| unsupported(&error.to_string()))?;
-        let layout = MlaDraftRuntimeLayout { kind: self.kind, cache_format, target_hidden: h, target_vocab: self.vocab,
+        let layout = MlaDraftRuntimeLayout { kind: self.kind, hidden_stream: self.hidden_stream, cache_format, target_hidden: h, target_vocab: self.vocab,
             target_taps: self.taps.clone(), capacity, weights, cache, paged_cache, program,
             fp8_scratch, sm_count, fp8_mode, buffers, owners: Vec::new(), weight_destinations: Vec::new(),
             weight_arena_requests, context_split: false };
@@ -1368,7 +1373,7 @@ impl MlaDflashConfig {
         weights.bf16_auxiliary = weights.bf16_auxiliary.checked_add(destination_bytes.checked_sub(source_bytes)
             .ok_or_else(|| unsupported("mtp_dspark packing lost source bytes"))?)
             .ok_or_else(|| unsupported("mtp_dspark generated weight overflow"))?;
-        let layout = MlaDraftRuntimeLayout { kind: self.kind, cache_format, target_hidden: h, target_vocab: self.vocab,
+        let layout = MlaDraftRuntimeLayout { kind: self.kind, hidden_stream: self.hidden_stream, cache_format, target_hidden: h, target_vocab: self.vocab,
             target_taps: self.taps.clone(), capacity, weights, cache, paged_cache, program,
             fp8_scratch: None, sm_count, fp8_mode: 0, buffers, owners, weight_destinations,
             weight_arena_requests: Vec::new(), context_split: false };
@@ -1658,7 +1663,7 @@ mod tests {
         use crate::families::glm5::draft_representation::{GlmDraftCapacity, GlmDraftRepresentation::*};
         use cuteafd_core::memory_layout::MemoryKind::*;
         let cfg = MlaDflashConfig::from_json(&config()).unwrap();
-        let ml4 = MlaDflashConfig { mla: MlaGeometry { hidden: 6144, heads: 64, q_rank: 0,
+        let ml4 = MlaDflashConfig { hidden_stream: Default::default(), mla: MlaGeometry { hidden: 6144, heads: 64, q_rank: 0,
             kv_rank: 512, nope: 64, rope: 64, value: 128 }, intermediate: 24576, eps: 1e-5,
             block: 3, group: 0, selector_rank: 512, selector_top_k: 0, taps: vec![1,18,36,54,71],
             vocab: 204800, mask_token: 0, max_context: 1 << 20, windows: vec![Some(2048); 3],
@@ -1824,7 +1829,7 @@ mod tests {
     fn ml4_owner_and_view_receipts_match_tp1_and_five_spark_min() -> anyhow::Result<()> {
         use std::collections::{BTreeMap, BTreeSet};
         use crate::families::glm5::draft_representation::{GlmDraftCapacity, GlmDraftRepresentation::Bf16Only};
-        let cfg = MlaDflashConfig { mla: MlaGeometry { hidden: 6144, heads: 64, q_rank: 0,
+        let cfg = MlaDflashConfig { hidden_stream: Default::default(), mla: MlaGeometry { hidden: 6144, heads: 64, q_rank: 0,
             kv_rank: 512, nope: 64, rope: 64, value: 128 }, intermediate: 24576, eps: 1e-5,
             block: 3, group: 0, selector_rank: 512, selector_top_k: 0, taps: vec![1,18,36,54,71],
             vocab: 204800, mask_token: 0, max_context: 1 << 20, windows: vec![Some(2048); 3],

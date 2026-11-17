@@ -137,6 +137,7 @@ impl<'a> Bridge<'a> {
 }
 
 pub(crate) struct NativeDraft<'a> {
+    hidden_stream: cuteafd_loader::families::kimi_k3::draft::DraftHiddenStream,
     // Copy fences must retire before either rank's draft stream/planes drop.
     block_marks:Vec<crate::shared::speculation::block_dspark::WindowSnapshots<'a>>,
     owners: Owners<DeviceOwner<'a, CommonDraft<'a>>, Option<Vec<Rc<GlobalWeights<'a>>>>>,
@@ -242,7 +243,8 @@ impl<'a> NativeDraft<'a> {
             }
             None
         } else { admission.allocate_draft_marks(streams[head].device)? };
-        Ok(Self { block_marks,window_marks, window_bytes, programs, k6_head: None, cache_format: options.cache_format, marks, owners: Owners { draft, target: None }, taps: allocate("DFlash bridge taps")?,
+        Ok(Self { hidden_stream: cuteafd_loader::families::kimi_k3::draft::DraftHiddenStream::read(&options.snapshot)?,
+            block_marks,window_marks, window_bytes, programs, k6_head: None, cache_format: options.cache_format, marks, owners: Owners { draft, target: None }, taps: allocate("DFlash bridge taps")?,
             ids: allocate("DFlash bridge input ids")?, input: allocate("DFlash bridge gathered input")?,
             bridge, producer: RefCell::new(crate::shared::memory::device::Event::new(device)?),
             consumed: RefCell::new(crate::shared::memory::device::Event::new(streams[head].device)?),
@@ -334,7 +336,10 @@ impl<'a> NativeDraft<'a> {
         let offset = tap_offset(to, rows, cfg.taps.len() * cfg.hidden, self.tap_rows())?;
         ensure!(Rc::ptr_eq(local.stream(), &self.target_streams[0]),
             "Kimi draft taps exceed staging or use the wrong producer stream");
-        let hidden = local.terminal_residual(rows)?;
+        let hidden = match self.hidden_stream {
+            cuteafd_loader::families::kimi_k3::draft::DraftHiddenStream::PlainResidual => local.terminal_residual(rows)?,
+            cuteafd_loader::families::kimi_k3::draft::DraftHiddenStream::AttnRes => local.draft_stream(layer, rows)?,
+        };
         local.stream().device.run(|| {
             // SAFETY: terminal_residual and this strided copy share the exact producer
             // stream; target staging survives every reader and is not graph-captured.
@@ -560,6 +565,22 @@ mod tests {
     use super::*;
     /// Fixed lane rows for these tap fixtures, independent of serving defaults.
     const TARGET_TAP_ROWS: usize = 4096;
+
+    #[test]
+    fn checkpoint_taps_preserve_plain_and_select_read_only_attn_res() {
+        let source = include_str!("draft.rs");
+        let tap = source.split("pub(crate) fn tap_at").nth(1).unwrap()
+            .split("/// Join the previous context readers").next().unwrap();
+        assert!(tap.contains("DraftHiddenStream::PlainResidual => local.terminal_residual(rows)?"));
+        assert!(tap.contains("DraftHiddenStream::AttnRes => local.draft_stream(layer, rows)?"));
+        assert!(tap.contains("Rc::ptr_eq(local.stream(), &self.target_streams[0])"));
+        let source = include_str!("device.rs");
+        let stream = source.split("pub(crate) fn draft_stream").nth(1).unwrap()
+            .split("pub(crate) fn capture_post_ffn").next().unwrap();
+        assert!(stream.contains("draft_mix_site(&self.cfg, layer)?"));
+        assert!(stream.contains("self.global.buffer(\"output.score\")?"));
+        assert!(!stream.contains("residual_body("));
+    }
 
     #[test]
     fn block_tp2_private_flags_follow_target_producer_event_on_lead_stream() {

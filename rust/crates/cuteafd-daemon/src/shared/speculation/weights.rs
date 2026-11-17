@@ -813,7 +813,7 @@ mod tests {
     fn kimi_mla_drafter_joins_target_namespace_at_one_and_two_coordinator_ranks() -> Result<()> {
         use cuteafd_loader::formats::{dflash::MlaDflashConfig, mla::MlaGeometry,
             block_dspark::DsparkRotaryPlan};
-        let cfg = MlaDflashConfig { mla: MlaGeometry { hidden: 128, heads: 2,
+        let cfg = MlaDflashConfig { hidden_stream: Default::default(), mla: MlaGeometry { hidden: 128, heads: 2,
             q_rank: 128, kv_rank: 128, nope: 64, rope: 64, value: 64 },
             intermediate: 128, eps: 1e-5, block: 8, group: 16, selector_rank: 256,
             selector_top_k: 16, taps: vec![0, 1], vocab: 32, mask_token: 0,
@@ -1032,7 +1032,7 @@ mod tests {
         std::fs::create_dir_all(&snapshot)?;
         // Scaled source dimensions retain the native packing/rank/window recipe;
         // no target or drafter execution programs are needed for load replay.
-        let cfg = MlaDflashConfig { mla: MlaGeometry { hidden: 128, heads: 2, q_rank: 0,
+        let cfg = MlaDflashConfig { hidden_stream: Default::default(), mla: MlaGeometry { hidden: 128, heads: 2, q_rank: 0,
             kv_rank: 128, nope: 64, rope: 64, value: 128 }, intermediate: 128, eps: 1e-5,
             block: 3, group: 0, selector_rank: 512, selector_top_k: 0, taps: vec![0, 1],
             vocab: 16, mask_token: 0, max_context: 4096, windows: vec![Some(2048); 2],

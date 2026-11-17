@@ -799,7 +799,9 @@ pub(crate) fn admit<'a, const RANKS: usize>(mut inputs: Inputs<'_, RANKS>) -> Re
         .map(move |(rank, layout)| layout.shaped_owner(rank as u8, lane))).collect::<Result<Vec<_>>>()?;
     let state_slots = inputs.state_slots;
     let legacy_marks = inputs.prefix_marks;
-    let global_layouts = GlobalLayout::ranks_with_core(cfg, &core, devices.len())?;
+    let final_tap = inputs.draft.as_ref().is_some_and(|draft| draft.needs_final_attn_res(cfg.layers));
+    let global_layouts = GlobalLayout::ranks_with_core(cfg, &core, devices.len())?.into_iter()
+        .map(|layout| layout.with_final_attn_res(cfg, final_tap)).collect::<Result<Vec<_>>>()?;
     let io_layouts = (0..devices.len()).map(|rank| IoLayout::for_ranks(cfg, rank, inputs.rows, &core, devices.len()))
         .collect::<Result<Vec<_>>>()?;
     let rtx = inputs.rtx.take();
@@ -1126,6 +1128,7 @@ fn request<const RANKS: usize>(mut i: Inputs<'_, RANKS>) -> Result<PlacementRequ
         fixed.push(graph);
     }
     for layout in GlobalLayout::ranks_with_core(cfg, &i.core, RANKS)? {
+        let layout = layout.with_final_attn_res(cfg, i.draft.as_ref().is_some_and(|draft| draft.needs_final_attn_res(cfg.layers)))?;
         let demand = layout.demand()?;
         ensure!(!fixed.iter().chain(&i.startup).any(|item| item.gpu == demand.gpu && item.group == demand.group),
             "Kimi global weight charge supplied twice");

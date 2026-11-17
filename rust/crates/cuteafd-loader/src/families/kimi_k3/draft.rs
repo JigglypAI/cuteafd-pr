@@ -3,6 +3,22 @@ use crate::formats::{block_dspark::BlockDsparkRuntimeLayout, dflash::MlaDraftRun
 use crate::families::glm5::draft_representation::GlmDraftCapacity;
 use anyhow::{ensure, Result};
 
+/// A checkpoint-declared target feature, not a user-selectable execution mode.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum DraftHiddenStream { #[default] PlainResidual, AttnRes }
+impl DraftHiddenStream {
+    pub fn from_config(raw: &serde_json::Value) -> Result<Self> {
+        match raw.get("dflash_config").and_then(|config| config.get("aux_hidden_stream")) {
+            None => Ok(Self::PlainResidual),
+            Some(serde_json::Value::String(stream)) if stream == "attn_res" => Ok(Self::AttnRes),
+            Some(other) => anyhow::bail!("unsupported drafter dflash_config.aux_hidden_stream={other}; expected absent or \"attn_res\""),
+        }
+    }
+    pub fn read(snapshot: &std::path::Path) -> Result<Self> {
+        Self::from_config(&serde_json::from_slice(&std::fs::read(snapshot.join("config.json"))?)?)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DraftKind { MlaDflash, BlockDspark }
 
@@ -18,6 +34,13 @@ impl From<MlaDraftRuntimeLayout> for DraftLayout {
 }
 
 impl DraftLayout {
+    pub fn hidden_stream(&self) -> DraftHiddenStream {
+        match self { Self::Mla(layout) => layout.hidden_stream(), _ => DraftHiddenStream::PlainResidual }
+    }
+    pub fn needs_final_attn_res(&self, layers: usize) -> bool {
+        self.hidden_stream() == DraftHiddenStream::AttnRes && layers.checked_sub(1)
+            .is_some_and(|last| self.target_taps().contains(&last))
+    }
     pub fn capacity(&self) -> GlmDraftCapacity {
         match self { Self::Mla(l) => l.capacity(), Self::Block(l) => l.capacity, Self::BlockTp2 { ranks,lead }=>ranks[*lead].capacity }
     }
@@ -94,6 +117,26 @@ impl DraftLayout {
                     "block dSpark load peak including owners",peak,Basis::Exact)))
             }
 
+        }
+    }
+}
+
+#[cfg(test)]
+mod hidden_stream_tests {
+    use super::DraftHiddenStream;
+    use serde_json::json;
+
+    #[test]
+    fn checkpoint_hidden_stream_is_absent_attn_res_or_a_clear_refusal() {
+        for raw in [json!({"architectures":["DSparkDraftModel"]}),
+            json!({"architectures":["DFlash2DraftModel"], "dflash_config":{"attention_mode":"mla"}})] {
+            assert_eq!(DraftHiddenStream::from_config(&raw).unwrap(), DraftHiddenStream::PlainResidual);
+        }
+        assert_eq!(DraftHiddenStream::from_config(&json!({"dflash_config":{"aux_hidden_stream":"attn_res"}})).unwrap(),
+            DraftHiddenStream::AttnRes);
+        for value in [json!("prefix_only"), json!("other"), json!(null), json!(false), json!(3)] {
+            let error = DraftHiddenStream::from_config(&json!({"dflash_config":{"aux_hidden_stream":value}})).unwrap_err();
+            assert!(error.to_string().contains("dflash_config.aux_hidden_stream"));
         }
     }
 }

@@ -3439,7 +3439,7 @@ mod checkpoint_header_tests {
     fn mla_config() -> cuteafd_loader::formats::dflash::MlaDflashConfig {
         use cuteafd_loader::formats::{dflash::MlaDflashConfig,
             mla::MlaGeometry, block_dspark::DsparkRotaryPlan};
-        let cfg = MlaDflashConfig { mla: MlaGeometry { hidden: 7168, heads: 64,
+        let cfg = MlaDflashConfig { hidden_stream: Default::default(), mla: MlaGeometry { hidden: 7168, heads: 64,
             q_rank: 1536, kv_rank: 512, nope: 128, rope: 64, value: 128 },
             intermediate: 14336, eps: 1e-5, block: 8, group: 16, selector_rank: 256,
             selector_top_k: 16, taps: vec![19, 37, 66, 78, 90], vocab: 163840,

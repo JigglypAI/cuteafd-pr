@@ -51,6 +51,11 @@ impl GlobalLayout {
             .into_iter().map(|layout| Self { rank: layout.rank, hidden: layout.hidden, vocab: layout.vocab,
                 operands: layout.operands, core_head: layout.core_head.map(CoreWeightLayout::from_shared) }).collect())
     }
+    pub(crate) fn with_final_attn_res(mut self, cfg: &KimiK3Config, needed: bool) -> Result<Self> {
+        let layout = self.shared_layout().with_final_attn_res(cfg, needed)?;
+        self.operands = layout.operands;
+        Ok(self)
+    }
 
     pub(crate) fn bytes(&self) -> Result<usize> {
         self.operands.values().copied().chain(self.core_head.iter().map(|head|head.bytes))
@@ -67,7 +72,7 @@ impl GlobalLayout {
     #[cfg(test)]
     pub(crate) fn pack(&self, cfg: &KimiK3Config, mut read: impl FnMut(&str) -> Result<LoadedTensor>) -> Result<PackedGlobal> {
         ensure!(self.rank < 2, "Kimi global rank outside admission");
-        let whole = self.rank == 0 && self.operands.contains_key("output.norm");
+        let whole = self.rank == 0 && (self.operands.contains_key("head") || self.core_head.is_some());
         let mut expected = Self::pair(cfg)?;
         if let Some(head) = &self.core_head {
             ensure!((self.rank == 1 || whole) && head.stem == "language_model.lm_head"
@@ -82,6 +87,7 @@ impl GlobalLayout {
             entry.core_head = terminal.core_head;
             entry
         } else { expected.into_iter().nth(self.rank).unwrap() };
+        let expected = expected.with_final_attn_res(cfg, self.operands.contains_key("output.norm"))?;
         ensure!(expected == *self, "Kimi global packing differs from admitted geometry");
         let mut operands = BTreeMap::new();
         for (operand, name) in [("embedding", "language_model.model.embed_tokens.weight"),
