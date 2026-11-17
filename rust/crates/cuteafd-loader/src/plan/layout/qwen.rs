@@ -12,6 +12,12 @@ use crate::serving_capacity::qwen_graphs::QwenAdmissionInputs;
 /// (`dual_layout`); every other layout serves on rtx0 (`single_layout`).
 pub(crate) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyModel,
     input: &super::super::PlanInput, options: &mut LayoutOptions) -> MemoryLayout {
+    let stages = super::super::qwen_mtp_layers(&input.checkpoint().config);
+    if options.native_mtp_layers > 0 && stages > 1 {
+        report.refuse_placement(format!("Qwen native MTP executor requires one checkpoint layer; config declares {stages}"),
+            "Use SPECULATOR=off; executing multiple native MTP layers requires a new executor.");
+        return MemoryLayout { devices: vec![], pool_tokens: 0, waste: vec![], notes: vec![] };
+    }
     let routed = model.spec().moe_layers();
     let all_onboarded = routed > 0
         && options.resolve_onboard(routed) == Some(Onboard::Layers(routed));

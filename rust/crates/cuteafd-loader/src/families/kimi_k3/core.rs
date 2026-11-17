@@ -507,8 +507,6 @@ mod tests {
                 core.validate_runtime_groups(&cfg)?;
             }
         }
-        assert!(cfg.validate_speculation(Some(crate::families::kimi_k3::draft::DraftKind::MlaDflash)).is_err());
-        cfg.validate_speculation(None)?;
         Ok(())
     }
 

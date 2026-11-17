@@ -203,13 +203,18 @@ pub struct SolvedPhaseLedger {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pool_policy: Option<crate::placement::PoolPolicy>,
     pub served_context_tokens: u64,
+    pub draft_home: Option<u8>,
+    pub draft_traffic_bytes_per_cycle: u64,
     pub budgets: Vec<crate::placement::planner::Budget>,
     pub phases: Vec<crate::placement::planner::PhaseBudget>,
 }
 
 impl From<&crate::placement::planner::ResolvedPlan> for SolvedPhaseLedger {
     fn from(plan: &crate::placement::planner::ResolvedPlan) -> Self {
-        Self { pool_policy: plan.pool_policy, served_context_tokens: plan.served_context(), budgets: plan.budgets.clone(), phases: plan.phases.clone() }
+        Self { pool_policy: plan.pool_policy, served_context_tokens: plan.served_context(),
+            draft_home: plan.decisions.draft_home,
+            draft_traffic_bytes_per_cycle: plan.decisions.draft_traffic_bytes_per_cycle,
+            budgets: plan.budgets.clone(), phases: plan.phases.clone() }
     }
 }
 
@@ -218,6 +223,10 @@ impl SolvedPhaseLedger {
         use crate::placement::planner::{Baseline, Device, Domain};
         use std::fmt::Write;
         let _ = writeln!(out, "served context: {} tokens", self.served_context_tokens);
+        if let Some(home) = self.draft_home {
+            let _ = writeln!(out,"drafter home: coordinator GPU {home}; cross-GPU traffic: {} bytes/cycle",
+                self.draft_traffic_bytes_per_cycle);
+        }
         for budget in &self.budgets {
             let Some(peak) = self.phases.iter().filter(|row| row.budget == budget.id)
                 .reduce(|peak, row| if u128::from(row.owned) + u128::from(row.opaque)
@@ -979,41 +988,21 @@ fn family_layout(model: &dyn FamilyModel, input: &PlanInput, report: &mut PlanRe
     }
 }
 
-/// Match the qualified local paths: one native stage, EXL3 or ModelOpt's
-/// four-bit weight groups (including its FP8 MTP package).
-pub fn qualified_qwen_mtp(config: &serde_json::Value) -> bool {
-    let text = config.get("text_config").unwrap_or(config);
-    let quant = &config["quantization_config"];
-    let method = quant.get("quant_method").or_else(|| quant.get("method")).and_then(serde_json::Value::as_str);
-    text["mtp_num_hidden_layers"] == 1 && (method == Some("exl3")
-        || method == Some("modelopt") && quant["config_groups"].as_object()
-            .is_some_and(|groups| groups.values().any(|group| group["weights"]["num_bits"] == 4)))
+/// Native MTP presence comes from the checkpoint, independent of expert storage.
+pub fn qwen_mtp_layers(config: &serde_json::Value) -> usize {
+    config.get("text_config").unwrap_or(config)["mtp_num_hidden_layers"].as_u64()
+        .and_then(|layers| usize::try_from(layers).ok()).unwrap_or(0)
 }
 
 fn plan_of(input: &PlanInput, options: &PlanOptions) -> Result<PlanReport, PlanError> {
     let mut resolved = options.clone();
-    let auto = options.qwen_auto_mtp;
-    let choice = |world| {
-        if world == 0 && options.layout.as_ref().is_none_or(|layout| layout.native_mtp_layers > 0)
-            && qualified_qwen_mtp(&input.checkpoint().config) { "mtp" } else { "off" }
-    };
-    let mut selected = choice(options.placement.spark_ranks());
-    if auto { resolved.draft_ownership = Some(spec::DraftOwnership::selected("qwen4", selected)); }
-    let mut report = plan_unrestricted(input, &resolved)?;
-    if auto {
-        let admitted = choice(report.spark_expert_world());
-        if admitted != selected {
-            // Rebuild every owner, workspace and cache charge, not just the JSON flag.
-            selected = admitted;
-            resolved.draft_ownership = Some(spec::DraftOwnership::selected("qwen4", selected));
-            report = plan_unrestricted(input, &resolved)?;
-            if choice(report.spark_expert_world()) != selected {
-                report.refuse_placement("Qwen auto MTP changes the admitted expert world".into(),
-                    "Select SPECULATOR=mtp or off explicitly for this placement.");
-            }
-        }
-        report.speculator = Some(selected);
+    let selected = if options.layout.as_ref().is_none_or(|layout| layout.native_mtp_layers > 0)
+        && qwen_mtp_layers(&input.checkpoint().config) > 0 { "mtp" } else { "off" };
+    if options.qwen_auto_mtp {
+        resolved.draft_ownership = Some(spec::DraftOwnership::selected("qwen4", selected));
     }
+    let mut report = plan_unrestricted(input, &resolved)?;
+    if options.qwen_auto_mtp { report.speculator = Some(selected); }
     let _timer = PhaseTimer::new(&input.phases.admission, &[&input.phases.catalog, &input.phases.layout]);
     match spark_range::admit(input, options, &report) {
         Ok(()) => {},

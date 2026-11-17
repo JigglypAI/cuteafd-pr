@@ -935,7 +935,7 @@ mod tests {
                 Some(pool_tokens), cuteafd_loader::placement::Onboard::Layers(0), shape,
                 Operation::Serving, None, Default::default()),
             decisions: Decisions { attention: modes.clone(), onboard_layers: vec![vec![]; ranks],
-                expert_homes: Default::default(), embedding: None, draft_home: None, head_home: None,
+                expert_homes: Default::default(), embedding: None, draft_home: None, draft_traffic_bytes_per_cycle: 0, head_home: None,
                 intake_home: None, encoder: None, prefill: shape, lanes: 1, spark_reply_formats: None },
             pool_tokens, pool_page_rows: PAGE_ROWS as u64, budgets: vec![], phases: vec![],
             facts: Facts { phase_order: PhaseOrder::TARGET_THEN_DRAFT, resident_weights: vec![], allocations,

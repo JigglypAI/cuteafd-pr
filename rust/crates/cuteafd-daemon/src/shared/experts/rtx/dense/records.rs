@@ -127,6 +127,13 @@ pub(crate) fn host_operand(operand: HostOperand, policy: super::super::push::Pus
     }
 }
 
+/// The quantization unit stays K128; only final scale storage is repeated.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum ScaleRepeat { #[default] Once, Twice }
+impl ScaleRepeat {
+    pub fn count(self) -> usize { match self { Self::Once => 1, Self::Twice => 2 } }
+}
+
 /// One GPU transform of a step's staged bytes (byte offsets are into the staging).
 #[derive(Clone)]
 pub(crate) enum Job {
@@ -156,6 +163,11 @@ pub(crate) enum Job {
         rule: crate::shared::fp8_linear::Fp8Scales, target: Target },
     /// The staged `kv_b` rows of `heads` heads absorbed into `uk`/`uv`.
     Absorb { heads: usize, nope: usize, v: usize, lat: usize, uk: CuteafdDeviceBuffer, uv: CuteafdDeviceBuffer },
+    /// Absorb BF16 source into the reusable device staging backing, then apply
+    /// the shared row128 quantization directly into final row64 scale planes.
+    AbsorbQuant { heads: usize, nope: usize, v: usize, lat: usize,
+        rule: crate::shared::fp8_linear::Fp8Scales, uk: CuteafdDeviceBuffer, uk_scale: CuteafdDeviceBuffer,
+        uv: CuteafdDeviceBuffer, uv_scale: CuteafdDeviceBuffer },
     /// The staged raw F32 `A_log` keeps `heads` active heads: its padding is +0
     /// and its live values finite.
     ALog { heads: usize },
@@ -179,7 +191,7 @@ pub(crate) enum Job {
     /// FP32 scales by the row kernel (`cuteafd_fp8_row_quant_rule`, `rule`)
     /// into `q` [rows, cols] and `scale` [rows, cols / 128].
     RowQuant { rows: usize, cols: usize, rule: crate::shared::fp8_linear::Fp8Scales, q: CuteafdDeviceBuffer,
-        scale: CuteafdDeviceBuffer, block: bool },
+        scale: CuteafdDeviceBuffer, block: bool, scale_repeat: ScaleRepeat },
     /// Staged BF16 `norm` (`at..at + bytes`) and `proj` (`with..with + bytes`)
     /// promoted to F32 and multiplied once per element into `dst` (the Kimi
     /// residual score weight).
@@ -560,6 +572,37 @@ impl Step {
                     load_timing::quantize(heads * (nope + v) * lat * 2, || kernels.absorb_from(staged, heads, 0,
                         heads, nope, v, lat, uk, uv, stream))?;
                 }
+                Job::AbsorbQuant { heads, nope, v, lat, rule, uk, uk_scale, uv, uv_scale } => {
+                    let uk_values = heads.checked_mul(lat).and_then(|n| n.checked_mul(nope)).context("absorbed UK extent overflow")?;
+                    let uv_values = heads.checked_mul(v).and_then(|n| n.checked_mul(lat)).context("absorbed UV extent overflow")?;
+                    let uk_bytes = uk_values.checked_mul(2).context("absorbed UK staging overflow")?;
+                    let uv_bytes = uv_values.checked_mul(2).context("absorbed UV staging overflow")?;
+                    ensure!(heads > 0 && nope % 128 == 0 && lat % 128 == 0
+                        && uk_bytes.checked_add(uv_bytes).is_some_and(|n| n <= STEP_BYTES)
+                        && uk.bytes == uk_values && uv.bytes == uv_values
+                        && uk_scale.bytes == uk_values / 64 * 4 && uv_scale.bytes == uv_values / 64 * 4,
+                        "absorbed FP8 conversion exceeds bounded staging or final operands");
+                    if scratch.is_none() {
+                        *scratch = Some(crate::shared::memory::DeviceAllocation::new(library, STEP_BYTES,
+                            crate::shared::memory::tag(crate::shared::memory::MemoryKind::Staging,
+                                "staging/coordinator-dense-device"))?);
+                    }
+                    let arena = scratch.as_ref().context("absorbed quant staging")?.buffer;
+                    let uk_bf16 = CuteafdDeviceBuffer { bytes: uk_bytes, ..arena };
+                    let uv_bf16 = CuteafdDeviceBuffer { ptr: arena.ptr.wrapping_byte_add(uk_bytes), bytes: uv_bytes, ..arena };
+                    load_timing::quantize(self.bytes(), || {
+                        kernels.absorb_from(staged, heads, 0, heads, nope, v, lat, uk_bf16, uv_bf16, stream)?;
+                        // SAFETY: final FP8 values/scales and bounded BF16 views remain
+                        // owned until this load stream drains before scratch reuse.
+                        unsafe {
+                            library.fp8_row_quant_repeat(uk_bf16.ptr, uk.ptr, uk_scale.ptr,
+                                heads * lat, nope, rule.code(), 2, stream)?;
+                            library.fp8_row_quant_repeat(uv_bf16.ptr, uv.ptr, uv_scale.ptr,
+                                heads * v, lat, rule.code(), 2, stream)?;
+                            library.cuda_stream_synchronize(stream)
+                        }
+                    })?;
+                }
                 Job::AbsorbFp8 { at, grid_at, grid_bytes, row0, heads, nope, v, lat, uk, uk_scale, uv, uv_scale } => {
                     let rows = heads * (nope + v);
                     ensure!(heads > 0 && nope % 64 == 0 && lat % 128 == 0 && at + rows * lat <= staged.len()
@@ -590,17 +633,22 @@ impl Step {
                         library.cuda_stream_synchronize(stream)
                     })?;
                 }
-                Job::RowQuant { rows, cols, rule, q, scale, block } => {
+                Job::RowQuant { rows, cols, rule, q, scale, block, scale_repeat } => {
                     // Per-row x 128-K scales [rows, cols/128], or with `block` 128x128
                     // block scales [ceil(rows/128), ceil(cols/128)] (`cuteafd_fp8_block_quant_rule`).
-                    let scale_bytes = if block { rows.div_ceil(128) * cols.div_ceil(128) * 4 } else { rows * cols / 128 * 4 };
-                    ensure!(rows * cols * 2 <= self.bytes() && (block || cols % 128 == 0) && q.bytes >= rows * cols
+                    let repeat = scale_repeat.count();
+                    let scale_bytes = if block { rows.div_ceil(128) * cols.div_ceil(128) * 4 } else { rows * cols / 128 * 4 * repeat };
+                    ensure!((!block || repeat == 1) && rows * cols * 2 <= self.bytes() && (block || cols % 128 == 0) && q.bytes >= rows * cols
                         && scale.bytes >= scale_bytes, "row quantization outside its step or operands");
                     let source = device_copy(scratch)?;
                     // SAFETY: the staged rows are in the live device scratch; both outputs
                     // are live operands; the stream drains before return.
                     load_timing::quantize(rows * cols * 2, || unsafe {
-                        library.fp8_quant_rule(source.cast(), q.ptr, scale.ptr, rows, cols, !block, rule.code(), stream)?;
+                        if repeat == 1 {
+                            library.fp8_quant_rule(source.cast(), q.ptr, scale.ptr, rows, cols, !block, rule.code(), stream)?;
+                        } else {
+                            library.fp8_row_quant_repeat(source.cast(), q.ptr, scale.ptr, rows, cols, rule.code(), repeat, stream)?;
+                        }
                         library.cuda_stream_synchronize(stream)
                     })?;
                 }

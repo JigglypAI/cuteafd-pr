@@ -747,7 +747,7 @@ impl Search<'_> {
         &mut self,
         mut domains: Vec<Vec<usize>>,
         pages: u64,
-        best: &mut Option<((u64, u64, u64, u64), Vec<usize>)>,
+        best: &mut Option<((u64, std::cmp::Reverse<u64>, u64, u64, u64), Vec<usize>)>,
     ) -> Result<(), Refusal> {
         if !self.restrict(&mut domains, pages, pages)? {
             return Ok(());
@@ -791,8 +791,11 @@ impl Search<'_> {
         let phases = self.costs.phases(self.budgets, &assignment, pages)?;
         let encoder_preference = self.contract.variables.iter().zip(&assignment).find_map(|(variable, &option)|
             if let Variable::Encoder(values) = variable { Some((values.len() - option) as u64) } else { None }).unwrap_or(0);
+        let draft_traffic = self.contract.variables.iter().zip(&assignment).try_fold(0u64,|sum,(variable,&option)|
+            sum.checked_add(variable.draft_traffic(option)).ok_or(Refusal::Overflow("drafter traffic objective")))?;
         let score = (
             layers,
+            std::cmp::Reverse(draft_traffic),
             encoder_preference,
             coordinator_slack(&phases, self.budgets),
             remaining(&phases),

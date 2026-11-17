@@ -299,6 +299,15 @@ def test_deployment_preserves_release_container_commands(
                 position = before["command"].index("--draft-fp8")
                 assert before["command"][position + 1] == "true"
                 del before["command"][position:position + 2]
+        if old["host"] == "coordinator" and entry["family"] == "qwen4" and "--mtp" in before["command"]:
+            # Rust now forwards the recursive depth after admission. Its value
+            # and uniqueness stay contractual; only the argv position changes.
+            expected = before["command"].index("--mtp")
+            actual = after["command"].index("--mtp")
+            assert before["command"].count("--mtp") == after["command"].count("--mtp") == 1
+            assert before["command"][expected + 1] == after["command"][actual + 1] == "3"
+            del before["command"][expected:expected + 2]
+            del after["command"][actual:actual + 2]
         fingerprint = "CUTEAFD_RELEASE_CONFIG_SHA256"
         if entry["family"] == "deepseek_v41" and fingerprint in before["env"]:
             assert after["env"][fingerprint] != before["env"][fingerprint], (entry["name"], old["host"])

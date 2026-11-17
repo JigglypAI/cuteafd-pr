@@ -20,13 +20,6 @@ pub(crate) struct Options {
 }
 
 impl Options {
-    pub(crate) fn kind(&self) -> Result<cuteafd_loader::families::kimi_k3::draft::DraftKind> {
-        use cuteafd_loader::families::kimi_k3::draft::DraftKind;
-        Ok(if crate::shared::speculation::block_dspark::is_dspark(&self.snapshot)? {
-            DraftKind::BlockDspark
-        } else { DraftKind::MlaDflash })
-    }
-
     pub(crate) fn representation(&self) -> GlmDraftRepresentation {
         if self.fp8 { GlmDraftRepresentation::Fp8Only } else { GlmDraftRepresentation::Bf16Only }
     }
@@ -53,9 +46,9 @@ impl Options {
         }
         ensure!(self.context_window==0,"DRAFT_CONTEXT_WINDOW currently requires a Kimi block DSpark drafter");
         let cfg=MlaDflashConfig::read(&self.snapshot)?;
-        Ok(cfg.runtime_layout(self.representation(),GlmDraftCapacity::new(slots,slots.min(8),cfg.block)?,
+        Ok(cfg.serving_runtime_layout(self.representation(),GlmDraftCapacity::new(slots,slots.min(8),cfg.block)?,
             context,slots.checked_mul(context).context("draft pool overflow")?,sms,Fp8Rows::W8a16.code() as u8,
-            self.cache_format)?.with_context_split(self.tp2_dflash)?.into())
+            cfg.cache_format(self.draft_kv_cache))?.with_context_split(self.tp2_dflash)?.into())
     }
 
 }
@@ -139,7 +132,55 @@ impl<'a> Bridge<'a> {
     }
 }
 
+/// Startup-only peer copy preserves the checkpoint's native BF16/K4/K6/K8 bytes.
+/// All planes retain one independently admitted drafter weight arena.
+pub(super) struct HeadReplica<'a> {
+    bf16: Option<Allocation<'a>>,
+    core: Option<crate::shared::dense_trellis::CoreWeights<'a>>,
+}
+impl<'a> HeadReplica<'a> {
+    pub(super) fn allocate(device: crate::shared::memory::device::Device<'a>,
+        layout: cuteafd_loader::serving_capacity::WeightArenaLayout,
+        core: &cuteafd_loader::families::kimi_k3::core::CoreInventory) -> Result<Self> {
+        let arena = crate::shared::memory::weight_arena::DeviceWeightArena::new(device, layout,
+            cuteafd_core::memory_layout::ArenaTag::drafter_weights("kimi/draft-head"))?;
+        if let Some(head) = core.get_weight("language_model.lm_head") {
+            let layout = cuteafd_loader::formats::trellis_core::CoreWeightLayout::new(head,
+                cuteafd_loader::formats::dense_trellis::TrellisSide::Output, 0, 1)?;
+            let mut planes = layout.arena_tensors("head")?.into_iter()
+                .map(|(name, bytes)| arena.view(&name, bytes)).collect::<Result<Vec<_>>>()?.into_iter();
+            Ok(Self { bf16: None, core: Some(crate::shared::dense_trellis::CoreWeights {
+                payload: planes.next().unwrap(), suh: planes.next().unwrap(), svh: planes.next().unwrap(),
+                shape: layout.shape, side: layout.side, bits: layout.bits, codebook: layout.codebook }) })
+        } else {
+            Ok(Self { bf16: Some(arena.view("head", arena.layout().view("head").unwrap().bytes())?), core: None })
+        }
+    }
+    fn copy(&self, source: &GlobalWeights<'a>, stream: &Stream<'a>) -> Result<()> {
+        let copy = |destination: &Allocation<'a>, source: CuteafdDeviceBuffer| -> Result<()> {
+            ensure!(destination.buffer.bytes == source.bytes, "Kimi native head replica extent changed");
+            stream.device.run(|| {
+                // SAFETY: startup drained the source stream; both retained arenas survive
+                // the destination drain below, before any graph or request can read them.
+                unsafe { stream.device.library.copy_peer_async(destination.buffer, source, source.bytes, stream.raw) }
+            })
+        };
+        if let Some(destination) = &self.core {
+            let source = source.core_head.as_ref().context("Kimi native head replica source missing")?;
+            ensure!(destination.shape == source.shape && destination.bits == source.bits
+                && destination.codebook == source.codebook && destination.side == source.side,
+                "Kimi native head replica format changed");
+            copy(&destination.payload, source.payload.buffer)?;
+            copy(&destination.suh, source.suh.buffer)?;
+            copy(&destination.svh, source.svh.buffer)?;
+        } else { copy(self.bf16.as_ref().unwrap(), source.buffer("head")?)?; }
+        stream.drain()
+    }
+}
+
 pub(crate) struct NativeDraft<'a> {
+    hidden_stream: cuteafd_loader::families::kimi_k3::draft::DraftHiddenStream,
+    head_replica: Option<HeadReplica<'a>>,
     // Copy fences must retire before either rank's draft stream/planes drop.
     block_marks:Vec<crate::shared::speculation::block_dspark::WindowSnapshots<'a>>,
     owners: Owners<DeviceOwner<'a, CommonDraft<'a>>, Option<Vec<Rc<GlobalWeights<'a>>>>>,
@@ -174,7 +215,19 @@ pub(super) fn common_draft_receipts(draft: &DflashDrafter<'_>,
 impl<'a> NativeDraft<'a> {
     pub(crate) fn allocation_receipts(&self, devices: cuteafd_loader::placement::planner::CoordinatorDevices<'_>)
         -> Result<Vec<cuteafd_loader::placement::planner::Receipt>> {
-        self.owners.draft.device.run(|| self.owners.draft.allocation_receipts(devices))
+        let mut receipts = self.owners.draft.device.run(|| self.owners.draft.allocation_receipts(devices))?;
+        if let Some(replica) = &self.head_replica {
+            let mut inventory = crate::shared::memory::receipts::Inventory::new(devices, "kimi.draft-head",
+                cuteafd_loader::placement::planner::Lifetime::RESIDENT, cuteafd_core::memory_layout::Category::Drafter, "native draft head replica");
+            if let Some(owner) = &replica.bf16 { owner.inventory(&mut inventory, "head")?; }
+            if let Some(owner) = &replica.core {
+                for (name, plane) in [("trellis", &owner.payload), ("suh", &owner.suh), ("svh", &owner.svh)] {
+                    plane.inventory(&mut inventory, name)?;
+                }
+            }
+            receipts.extend(inventory.receipts);
+        }
+        Ok(receipts)
     }
 
     pub(crate) fn load(admission: &mut super::admission::Admission<'a>,
@@ -187,22 +240,29 @@ impl<'a> NativeDraft<'a> {
         programs: &'a Programs<'a>, options: &Options, streams: Vec<Rc<Stream<'a>>>,
         layout: &DraftLayout,
         exchange: Option<([Rc<Stream<'a>>; 2], Rc<crate::shared::peer_split::PeerExchange<'a>>)>) -> Result<Self> {
+        let hidden_stream = cuteafd_loader::families::kimi_k3::draft::DraftHiddenStream::read(&options.snapshot)?;
+        ensure!(hidden_stream == layout.hidden_stream(), "Kimi draft hidden stream differs from admitted checkpoint fact");
         if let DraftLayout::Mla(layout) = layout {
-            ensure!(options.cache_format == layout.cache_format(), "Kimi draft options/admission cache records differ");
+            let config=MlaDflashConfig::read(&options.snapshot)?;
+            ensure!(config.cache_format(options.draft_kv_cache) == layout.cache_format(),
+                "Kimi draft options/admission cache records differ");
         }
         ensure!(matches!(streams.len(), 1 | 2)
             && (streams.len() == 1 || streams[0].device.id != streams[1].device.id),
             "Kimi draft requires one or two distinct physical owners");
-        let head = streams.len() - 1;
+        let head = usize::from(cuteafd_loader::placement::draft::home(&admission.placement)
+            .context("Kimi admitted draft home absent")?);
+        ensure!(head < streams.len(), "Kimi admitted draft home outside physical ranks");
         let ranks = streams.iter().map(|s| RankDevice { device: s.device.id, stream: s.raw }).collect::<Vec<_>>();
         let library = streams[0].device.library;
-        let bridge = if streams.len() == 1 {
+        let bridge = if head == 0 {
             Bridge::Local { stream: Stream::new(streams[0].device)?, terminal: Cell::new(TerminalState::Active) }
         } else {
             Bridge::Remote(RemoteBridge::new(Prepared::new(library, ranks[0], ranks[head], head,
                 "kimi-remote-mla-dflash", crate::shared::draft::remote::decode_extent(
                     layout.capacity().block_rows, layout.target_hidden(), layout.target_vocab(), head)?)?))
         };
+        let head_replica = admission.allocate_draft_head(bridge.stream().device)?;
         // Recording preserves admitted allocation order; the shared group fills
         // these owners before target binding without a host payload read.
         let file = if matches!(layout,DraftLayout::Block(_)) || crate::shared::experts::rtx::dense::is_recording() { Vec::new() }
@@ -245,7 +305,9 @@ impl<'a> NativeDraft<'a> {
             }
             None
         } else { admission.allocate_draft_marks(streams[head].device)? };
-        Ok(Self { block_marks,window_marks, window_bytes, programs, k6_head: None, cache_format: options.cache_format, marks, owners: Owners { draft, target: None }, taps: allocate("DFlash bridge taps")?,
+        let cache_format=match layout { DraftLayout::Mla(layout)=>layout.cache_format(),_=>options.cache_format };
+        Ok(Self { hidden_stream, head_replica,
+            block_marks,window_marks, window_bytes, programs, k6_head: None, cache_format, marks, owners: Owners { draft, target: None }, taps: allocate("DFlash bridge taps")?,
             ids: allocate("DFlash bridge input ids")?, input: allocate("DFlash bridge gathered input")?,
             bridge, producer: RefCell::new(crate::shared::memory::device::Event::new(device)?),
             consumed: RefCell::new(crate::shared::memory::device::Event::new(streams[head].device)?),
@@ -268,6 +330,15 @@ impl<'a> NativeDraft<'a> {
         let head = target.len() - 1;
         for (rank, owner) in target.iter().enumerate() { owner.check_device(self.target_streams[rank].device)?; }
         let cfg = self.owners.draft.geometry();
+        if let Some(replica) = &self.head_replica {
+            self.target_streams[head].drain()?;
+            let copied = replica.copy(&target[head], self.bridge.stream());
+            if copied.is_err() {
+                crate::shared::decode_graph::fatal_drain(self.bridge.stream().drain(), "Kimi draft head replica startup failure");
+            }
+            copied?;
+        }
+        let execution_device = self.bridge.stream().device;
         ensure!(target[0].buffer("embedding")?.bytes == cfg.vocab * cfg.hidden * 2,
             "Kimi draft target embedding differs from admitted BF16 geometry");
         if let Some(weight) = &target[head].core_head {
@@ -276,7 +347,7 @@ impl<'a> NativeDraft<'a> {
                 "Kimi draft K6 head programs are not on the head rank");
             let rows = self.owners.draft.max_batch_sequences().checked_mul(cfg.block)
                 .context("Kimi draft head row capacity overflow")?;
-            let projection = self.target_streams[head].device.run(|| {
+            let projection = execution_device.run(|| {
                 crate::shared::dense_trellis::Projection::load_geometry_bits(self.programs,
                     cfg.hidden, cfg.vocab, 1, weight.bits, crate::shared::dense_trellis::codebook(weight),
                     rows, cuteafd_ffi::dense_trellis::TrellisDType::F32)
@@ -284,7 +355,7 @@ impl<'a> NativeDraft<'a> {
             let scratch = {
                 let _scope = cuteafd_ffi::memory_ledger::scope("drafter/kimi K6 head scratch");
                 crate::shared::dense_trellis::ProjectionLayout::new(&projection.program, rows)?
-                    .allocate(self.target_streams[head].device, Tag::drafter_workspace("kimi/draft-head-projection"))?
+                    .allocate(execution_device, Tag::drafter_workspace("kimi/draft-head-projection"))?
             };
             self.k6_head = Some((projection, scratch));
         } else {
@@ -337,7 +408,10 @@ impl<'a> NativeDraft<'a> {
         let offset = tap_offset(to, rows, cfg.taps.len() * cfg.hidden, self.tap_rows())?;
         ensure!(Rc::ptr_eq(local.stream(), &self.target_streams[0]),
             "Kimi draft taps exceed staging or use the wrong producer stream");
-        let hidden = local.terminal_residual(rows)?;
+        let hidden = match self.hidden_stream {
+            cuteafd_loader::families::kimi_k3::draft::DraftHiddenStream::PlainResidual => local.terminal_residual(rows)?,
+            cuteafd_loader::families::kimi_k3::draft::DraftHiddenStream::AttnRes => local.draft_stream(layer, rows)?,
+        };
         local.stream().device.run(|| {
             // SAFETY: terminal_residual and this strided copy share the exact producer
             // stream; target staging survives every reader and is not graph-captured.
@@ -504,8 +578,9 @@ impl<'a> NativeDraft<'a> {
             };
             let head = match &self.k6_head {
                 Some((projection, scratch)) => {
-                    let weight = target[head].core_head.as_ref().context("Kimi draft K6 target head absent")?;
-                    let device = self.target_streams[head].device.id;
+                    let weight = self.head_replica.as_ref().and_then(|replica| replica.core.as_ref())
+                        .or(target[head].core_head.as_ref()).context("Kimi draft native target head absent")?;
+                    let device = self.bridge.stream().device.id;
                     let (hidden, vocab) = (draft.geometry().hidden, draft.geometry().vocab);
                     TargetHead::Launch(Box::new(move |x, logits, rows, stream| {
                         ensure!(stream == self.bridge.stream().raw, "Kimi draft K6 head stream differs from bridge");
@@ -516,7 +591,10 @@ impl<'a> NativeDraft<'a> {
                         projection.local(rows, input, weight, scratch, output, stream)
                     }))
                 }
-                None => TargetHead::Bf16Buffer(target[head].borrowed_buffer("head")?),
+                None => TargetHead::Bf16Buffer(match self.head_replica.as_ref().and_then(|replica| replica.bf16.as_ref()) {
+                    Some(owner) => &owner.buffer,
+                    None => target[head].borrowed_buffer("head")?,
+                }),
             };
             draft.draft_device_with(sequences, &input, head)
         }))
@@ -564,6 +642,22 @@ mod tests {
     use super::*;
     /// Fixed lane rows for these tap fixtures, independent of serving defaults.
     const TARGET_TAP_ROWS: usize = 4096;
+
+    #[test]
+    fn checkpoint_taps_preserve_plain_and_select_read_only_attn_res() {
+        let source = include_str!("draft.rs");
+        let tap = source.split("pub(crate) fn tap_at").nth(1).unwrap()
+            .split("/// Join the previous context readers").next().unwrap();
+        assert!(tap.contains("DraftHiddenStream::PlainResidual => local.terminal_residual(rows)?"));
+        assert!(tap.contains("DraftHiddenStream::AttnRes => local.draft_stream(layer, rows)?"));
+        assert!(tap.contains("Rc::ptr_eq(local.stream(), &self.target_streams[0])"));
+        let source = include_str!("device.rs");
+        let stream = source.split("pub(crate) fn draft_stream").nth(1).unwrap()
+            .split("pub(crate) fn capture_post_ffn").next().unwrap();
+        assert!(stream.contains("draft_mix_site(&self.cfg, layer)?"));
+        assert!(stream.contains("self.global.buffer(\"output.score\")?"));
+        assert!(!stream.contains("residual_body("));
+    }
 
     #[test]
     fn block_tp2_private_flags_follow_target_producer_event_on_lead_stream() {
@@ -727,7 +821,7 @@ mod tests {
         for head in [0,1] { for context_window in [0,2048] { for kv in [Qwen4KvCache::Bf16,Qwen4KvCache::Fp8] {
             let options=Options { snapshot:root.path().to_owned(),fp8:false,tp2_dflash:false,
                 cache_format:Default::default(),draft_kv_cache:kv,context_window };
-            assert_eq!(options.kind()?,cuteafd_loader::families::kimi_k3::draft::DraftKind::BlockDspark);
+            assert!(crate::shared::speculation::block_dspark::is_dspark(&options.snapshot)?);
             let layout=options.layout(16,8192,188,head)?;
             let DraftLayout::Block(local)=&layout else { anyhow::bail!("Lithos must not create body collectives") };
             assert_eq!((local.config.heads,local.config.kv_heads,local.config.intermediate),(64,16,14336));
@@ -1007,6 +1101,62 @@ mod tests {
     }
 
     #[test]
+    fn native_head_replica_peer_copy_is_byte_exact_and_one_backing_for_bf16_k4_k6_k8() -> Result<()> {
+        use crate::shared::memory::{device::Device, receipts::Inventory};
+        use cuteafd_loader::{formats::{exl3_storage::Exl3Codebook, dense_trellis::TrellisSide,
+            trellis_core::{CoreProjection, CoreSplit}}, families::kimi_k3::core::CoreInventory,
+            placement::planner::{CoordinatorDevices, Lifetime}, serving_capacity::WeightArenaLayout};
+        let fixture = cuteafd_ffi::native_library_lifetime_fixture::Fixture::build_for_tests()?;
+        let library = fixture.load()?;
+        fixture.peer_ordering_model(&library)?;
+        fixture.immediate_copies(&library)?;
+        let devices = [Device { library: &library, id: 0 }, Device { library: &library, id: 1 }];
+        let stream = Stream::new(devices[0])?;
+        for bits in [0, 4, 6, 8] {
+            let mut core = CoreInventory::default();
+            if bits != 0 { core.projections.insert("language_model.lm_head".into(), CoreProjection {
+                stem: "language_model.lm_head".into(), bits, codebook: Exl3Codebook::Mcg,
+                shape: [128, 128], stored_outputs: 128, split: CoreSplit::Whole, source_bytes: 0 }); }
+            let layout = cuteafd_loader::placement::families::kimi::draft_head_replica(&core, 128, 128)?;
+            let replica = HeadReplica::allocate(devices[0], layout.clone(), &core)?;
+            let source_arena = crate::shared::memory::weight_arena::DeviceWeightArena::new(devices[1],
+                WeightArenaLayout::new("source", layout.views().iter().map(|(name,view)| (name.clone(),view.bytes())))?,
+                cuteafd_core::memory_layout::ArenaTag::weights("test-head"))?;
+            let upload = |name, bytes| -> Result<Allocation<'_>> {
+                let owner = source_arena.view(name, bytes)?;
+                let data = (0..bytes).map(|i| ((i*17+bits*3)%251) as u8).collect::<Vec<_>>();
+                devices[1].run(|| library.copy_h2d(owner.buffer, &data))?;
+                Ok(owner)
+            };
+            let source = if let Some(weight) = &replica.core {
+                GlobalWeights::draft_head_fixture(None, Some(crate::shared::dense_trellis::CoreWeights {
+                    payload: upload("head.trellis",weight.payload.buffer.bytes)?,
+                    suh: upload("head.suh",weight.suh.buffer.bytes)?, svh: upload("head.svh",weight.svh.buffer.bytes)?,
+                    shape: weight.shape, side: TrellisSide::Output, bits, codebook: weight.codebook }))
+            } else { GlobalWeights::draft_head_fixture(Some(upload("head",128*128*2)?), None) };
+            replica.copy(&source, &stream)?;
+            let mut inventory = Inventory::new(CoordinatorDevices::new(&[0,1])?, "replica", Lifetime::RESIDENT,
+                cuteafd_core::memory_layout::Category::Drafter, "replica");
+            let planes = match &replica.core {
+                Some(weight) => vec![&weight.payload,&weight.suh,&weight.svh],
+                None => vec![replica.bf16.as_ref().unwrap()],
+            };
+            for (index, owner) in planes.into_iter().enumerate() {
+                let mut data = vec![0;owner.buffer.bytes];
+                devices[0].run(||library.copy_d2h(&mut data,owner.buffer))?;
+                assert_eq!(data,(0..data.len()).map(|i| ((i*17+bits*3)%251) as u8).collect::<Vec<_>>());
+                owner.inventory(&mut inventory,&format!("plane.{index}"))?;
+            }
+            let mut census = crate::shared::memory::receipts::Census::default();
+            census.owners(inventory.receipts);
+            census.normalize(cuteafd_loader::placement::planner::PhaseOrder::DRAFT_THEN_TARGET)?;
+            assert_eq!(census.receipts.iter().filter(|r|r.allocation.view.is_none()).count(),1);
+            assert_eq!(census.receipts.iter().find(|r|r.allocation.view.is_none()).unwrap().allocation.bytes,layout.bytes() as u64);
+        }
+        Ok(())
+    }
+
+    #[test]
     fn common_drafter_drops_before_borrowed_target_owner() {
         struct Owner(&'static str, Rc<RefCell<Vec<&'static str>>>);
         impl Drop for Owner { fn drop(&mut self) { self.1.borrow_mut().push(self.0); } }
@@ -1016,10 +1166,9 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires CUTEAFD_NATIVE_LIFETIME_FIXTURE_DIR; CPU-only fake DSO"]
     fn local_bridge_drains_without_peer_waits_and_closes_after_failure() -> Result<()> {
         use cuteafd_ffi::native_library_lifetime_fixture::Fixture;
-        let fixture = Fixture::build()?;
+        let fixture = Fixture::build_for_tests()?;
         let library = fixture.load()?;
         let device = crate::shared::memory::device::Device { library: &library, id: 0 };
         fixture.immediate_copies(&library)?;

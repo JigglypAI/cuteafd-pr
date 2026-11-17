@@ -258,7 +258,7 @@ def test_kimi_tp2_dflash_plan_matches_serve_and_keeps_explicit_false(tmp_path: P
         keys += f"TP2_DFLASH={selection}\n"
     result = _kimi(tmp_path, keys)
     assert _flag(_line(result, "serve-kimi --snapshot"), "--tp2-dflash") == expected
-    assert _flag(_line(result, "cuteafd plan"), "--tp2-dflash") == expected
+    assert _flag(_line(result, "cuteafd plan"), "--tp2-dflash") == (expected if selection is not None else None)
 
 
 def test_kimi_tp2_dflash_refuses_invalid_selection(tmp_path: Path) -> None:

@@ -395,7 +395,8 @@ impl<'a> MimoLoader<'a> {
                 let scale = CuteafdDeviceBuffer { ptr: unsafe { scales.buffer.ptr.cast::<u8>().add(first * kb * 4) }.cast(),
                     bytes: n * kb * 4, ..scales.buffer };
                 self.on_rank(rank, |_| self.dense.step(Step { device, rects: vec![rect],
-                    jobs: vec![Job::RowQuant { rows: n, cols, rule: self.fp8_scales, q, scale, block: false }] }, stream))?;
+                    jobs: vec![Job::RowQuant { rows: n, cols, rule: self.fp8_scales, q, scale, block: false,
+                        scale_repeat: Default::default() }] }, stream))?;
             }
             let kscale = if kmajor_scale {
                 let kscale = self.on_rank(rank, |_| self.allocation(&format!("{name}.k_scale"), rows * kb * 4))?;

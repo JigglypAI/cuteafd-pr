@@ -1532,7 +1532,7 @@ mod tests {
     fn terminal_prefix_path_never_applies_output_mix_or_head() {
         let source = include_str!("device.rs");
         let terminal = source.split("pub(crate) fn terminal_residual").nth(1).unwrap()
-            .split("pub(crate) fn residual").next().unwrap();
+            .split("pub(crate) fn draft_stream").next().unwrap();
         assert!(terminal.contains("8 * self.lane.rows() * 7168 * 2"));
         assert!(terminal.contains("self.programs.add.launch(prefix, delta, output"));
         assert!(!terminal.contains("MixSite::Output"));
