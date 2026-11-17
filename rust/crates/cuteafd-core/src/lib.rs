@@ -23,13 +23,10 @@ pub use spark_executions::{covering_export, DecodeExecution, ExecutionAdmissionE
 pub use expert_geometry::{expert_geometry, set_expert_geometry, ExpertGeometry, Exl3RowPolicy, EXL3_CAPACITIES,
     ModelAdmissionResponse, RuntimeSample, SparkEndpoint, SparkIngress, SparkRings, SparkRuntimeInventory, SparkSlice,
     nvfp4_wire_row_bytes};
-mod draft_policy;
-pub use draft_policy::{
-    draft_expected_tokens, DraftAction, DraftCandidate, DraftCostSnapshot, DraftPolicy, DraftPolicyError, DraftPolicyStats,
-    DraftRoundObservation, DraftSelection, LayerResource, ObservedDraftRequest, PolicyGeometry, PolicySeed, ResourceClass,
-    draft_concurrency_bucket, Cutoff, DraftMode, Reliability, RowCost, SimpleDecision, SimpleRound, SimpleSelection, CUTOFF_CEILING,
-    CUTOFF_FLOOR, OFFSET_PRIOR, REPORT_GROUPS, SIMPLE_CUTOFF, CLASS_PRIOR_ROUNDS, CONCURRENCY_BUCKETS, MAX_RESOURCE_CLASSES, SURVIVAL_FLOOR,
-};
+mod draft_history;
+pub use draft_history::{DraftControl, DraftHistory, DraftHistoryStats, DraftOutcome, DrafterSpec, HeadScore, PositionTrace,
+    RequestTrace, RoundTrace, Track, COPY_COLD_RATE, KEEP_CUT, NEURAL_COLD_RATE, PRIOR_STRENGTH, REQUEST_WINDOW,
+    SERVER_WINDOW, SKIP_CUT};
 mod dspark_rng;
 pub use dspark_rng::{DsparkRng, DsparkRngReservation};
 mod target_sampling;

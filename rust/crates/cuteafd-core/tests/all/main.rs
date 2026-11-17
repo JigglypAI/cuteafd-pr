@@ -4,8 +4,6 @@
 //! file stem as the module name keeps ids readable (`<stem>::<test>`) while
 //! linking once instead of once per file.
 
-mod draft_policy_bench;
-mod draft_trace_replay;
-mod simple_draft_replay;
+mod draft_history_replay;
 mod target_sampling_bench;
 mod upstream_spec_acceptance;
