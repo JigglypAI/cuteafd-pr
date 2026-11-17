@@ -739,7 +739,7 @@ pub(crate) struct NativeExpertDaemonArgs {
     /// Explicit checkpoint revision (defaults to snapshot directory name).
     #[arg(long)]
     pub(crate) encoder_revision: Option<String>,
-    #[arg(long, default_value_t = 4096, value_parser = clap::value_parser!(u32).range(1..=4096))]
+    #[arg(long, default_value_t = 4096, value_parser = clap::value_parser!(u32).range(1..=16698))]
     pub(crate) encoder_max_tokens: u32,
     /// Load the checkpoint audio tower in this expert process.
     #[arg(long, conflicts_with = "audio_encoder_only")]
@@ -1533,6 +1533,14 @@ mod tests {
             "--rank", "7", "--world", "8"]).unwrap();
         let Commands::Expertd(args) = cli.command else { panic!("expertd-native") };
         assert_eq!((args.rank, args.world), (7, 8));
+        let encoder=["cuteafd","expertd-native","--snapshot","/model","--native-lib","/native.so",
+            "--device-budget-bytes","1000","--rank","0","--encoder-max-tokens"];
+        for rows in ["1","4096","16698"] {
+            let cli=Cli::try_parse_from(encoder.into_iter().chain([rows])).unwrap();
+            let Commands::Expertd(args)=cli.command else{panic!("expertd-native")};
+            assert_eq!(args.encoder_max_tokens,rows.parse::<u32>().unwrap());
+        }
+        for rows in ["0","16699"] {assert!(Cli::try_parse_from(encoder.into_iter().chain([rows])).is_err());}
     }
 }
 

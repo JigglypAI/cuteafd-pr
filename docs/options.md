@@ -742,7 +742,8 @@ Each key is also a global `cuteafd` flag (`--gpu-memory-cap`, `--kv-max-tokens`,
 The direct daemon's `--max-image-tokens` accepts an explicit 1-16384 per-image
 LM span cap. Omission uses the processor's default span, limited by its
 architectural ceiling: existing families default to 4096 (Qwen capped at 1024,
-Mistral at its checkpoint span), MiniMax to 576, and Kimi to 16698. An explicit
+Mistral at its checkpoint span), MiniMax to 576, and Kimi to 16698. Spark encoder workers accept this full native ceiling; each
+checkpoint tower contract still validates its own smaller shape limit. An explicit
 cap can only lower a declared ceiling; it never changes vendor resize geometry
 or silently truncates feature rows. Kimi's full default is intentionally above
 the CLI's largest explicit value. These registration limits do not qualify an
