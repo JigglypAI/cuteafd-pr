@@ -366,8 +366,14 @@ impl FamilyModel for Model {
     }
     fn accepts(&self, role: &TensorRole, stem: &str, operand: &mut QuantOperand) -> Result<(), String> {
         if role.component==Component::Vision {
-            return super::require(operand.is_plain(&[format::Encoding::Bf16])&&operand.input_scale.is_none(),
-                ||format!("{stem}: Kimi tower requires BF16"));
+            let config:serde_json::Value=crate::read_json_file(&self.snapshot.join("config.json")).map_err(|e|e.to_string())?;
+            let contract=crate::families::kimi_k3::vision::VisionContract::from_config(&config).map_err(|e|e.to_string())?;
+            let shapes=contract.tensor_shapes();
+            let expected=shapes.get(&format!("{stem}.weight")).or_else(||shapes.get(stem))
+                .ok_or_else(||format!("{stem}: outside Kimi native tower contract"))?;
+            return super::require(operand.logical==*expected&&operand.is_plain(&[format::Encoding::Bf16])
+                &&operand.input_scale.is_none()&&operand.companions.is_empty(),
+                ||format!("{stem}: Kimi tower requires BF16 {expected:?}"));
         }
         if let Some(projection) = self.core.projections.get(stem) {
             return super::require(matches!(operand.encoding, format::Encoding::Exl3 { bits } if bits == projection.bits)

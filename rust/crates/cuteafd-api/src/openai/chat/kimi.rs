@@ -119,6 +119,20 @@ fn kind(value: &Value) -> &'static str {
         Value::Array(_) => "array",
     }
 }
+fn content_literals(value:&Value,literal:&mut dyn FnMut(&str)->String)->Result<String> {
+    if let Some(parts)=value.as_array() {
+        let mut out=String::new();
+        for part in parts {
+            match part["type"].as_str() {
+                Some("text")=>out.push_str(&literal(part["text"].as_str().context("Kimi text")?)),
+                Some("image_url")=>out.push_str("<|kimi_image_placeholder|>"),
+                _=>bail!("unsupported Kimi media part"),
+            }
+        }
+        Ok(out)
+    }else{Ok(literal(&content(value)?))}
+}
+
 fn content(value: &Value) -> Result<String> {
     match value {
         Value::Null => Ok(String::new()),
@@ -399,7 +413,7 @@ fn render_literals(body: &Value, thinking: bool, literal: &mut dyn FnMut(&str) -
             }
             out.push_str(&close("think"));
             out.push_str(&open("response", &[]));
-            out.push_str(&literal(&content(&message["content"])?));
+            out.push_str(&content_literals(&message["content"],literal)?);
             out.push_str(&close("response"));
             if !calls.is_empty() {
                 out.push_str(&open("tools", &[]));
@@ -419,7 +433,7 @@ fn render_literals(body: &Value, thinking: bool, literal: &mut dyn FnMut(&str) -
                 out.push_str(&close("tools"));
             }
         } else {
-            out.push_str(&literal(&content(&message["content"])?));
+            out.push_str(&content_literals(&message["content"],literal)?);
         }
         out.push_str(&close("message"));
         out.push_str(END);
