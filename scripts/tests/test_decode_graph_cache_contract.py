@@ -41,3 +41,28 @@ def test_capture_funnel_requires_a_live_ticket():
     bank = (GRAPH / "bank.rs").read_text()
     assert 'expect("graph capture requires an attached device cache")' in bank
     assert "Arc::ptr_eq(&binding.cache, &ticket.cache)" in bank
+
+
+def test_sparse_inline_and_deferred_records_share_host_rollback():
+    family = SOURCE / "families/deepseek_v41"
+    source = (family / "v41_sparse_attention.rs").read_text()
+    # Both miss paths must enter the same transaction, never record directly.
+    finish = source.split("pub async unsafe fn finish_prepare(", 1)[1].split("unsafe fn capture_plan(", 1)[0]
+    inline = source.split("let graph = if let Some(graph) = cached", 1)[1]
+    for path in (finish, inline):
+        assert "self.capture_plan(&mut plan, &mut tail)" in path
+        assert "self.record_plan(" not in path
+    capture = source.split("unsafe fn capture_plan(", 1)[1].split("unsafe fn record_plan(", 1)[0]
+    assert capture.index("tail.checkpoint()") < capture.index("capture_transaction(")
+    assert "tail.rollback(checkpoint)" in capture
+
+
+def test_dual_tail_rolls_back_before_rejected_record_eager_retry():
+    source = (SOURCE / "families/deepseek_v41/v41_sparse_attention/dual.rs").read_text()
+    tail = source.split("pub async unsafe fn complete_owned_tail(", 1)[1].split("pub unsafe fn enqueue_cached", 1)[0]
+    assert tail.index("tail.restore_warmup()?") < tail.index("tail.checkpoint()")
+    record = tail.split("let recorded =", 1)[1].split("let (graph,nodes,width,spans,inspection) = match recorded", 1)[0]
+    assert "capture_transaction(" in record
+    assert "tail.enqueue(&attention,stream)" in record
+    assert "tail.rollback(checkpoint)" in record
+    assert tail.index("tail.rollback(checkpoint)") < tail.index("=> return tail.enqueue(&attention, stream)")
