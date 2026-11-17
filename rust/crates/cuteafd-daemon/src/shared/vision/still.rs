@@ -87,3 +87,14 @@ impl Binding {
         Ok((crate::shared::qwen::scheduler::Prompt {job,tokens:expanded.tokens,keys},media,jobs))
     }
 }
+
+/// Scatter cached BF16 features into the gathered embedding plane before its
+/// family-specific normalization/cast. Scratch is borrowed only until layer work.
+pub(crate) fn inject(stream:&crate::shared::memory::device::Stream<'_>,
+    chunk:&cuteafd_engine::media::MediaChunk,features:cuteafd_ffi::CuteafdDeviceBuffer,
+    indices:cuteafd_ffi::CuteafdDeviceBuffer,output:cuteafd_ffi::CuteafdDeviceBuffer,
+    rows:usize,width:usize)->Result<()> {
+    if chunk.indices.is_empty() {return Ok(());}
+    stream.device.run(|| Ok(stream.device.library.embedding_injection()?.inject_host(
+        &chunk.features,&chunk.indices,features,indices,output,rows,width,1,stream.raw)?))
+}
