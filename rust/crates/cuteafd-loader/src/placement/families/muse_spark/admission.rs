@@ -1075,6 +1075,17 @@ impl PreparedMuse<'_> {
 mod contract_tests {
     use super::*;
 
+    /// Pool facts from the family's real per-rank page geometry.
+    fn pool_facts<'a>(cfg: &MuseSparkConfig, cards: &'a [u64], context: impl Into<Context>,
+        requested: Option<u64>) -> crate::placement::PoolFacts<'a> {
+        let cache = crate::families::muse_spark::cache::MuseCacheLayout::with_format(cfg, cards.len(),
+            crate::families::muse_spark::cache::MuseKvCache::Bf16).unwrap();
+        let mut facts = crate::placement::PoolFacts::new(cards, context, requested, PAGE_ROWS);
+        facts.memory = cache.geometry.ranks.iter().zip(cards).map(|(rank, &available_bytes)|
+            crate::placement::PoolMemory { available_bytes, bytes_per_unit: rank.persistent_unit_bytes }).collect();
+        facts
+    }
+
     #[test]
     fn program_inventory_retains_only_the_selected_kv_modules() {
         use crate::families::muse_spark::cache::MuseKvCache;
@@ -1272,7 +1283,7 @@ mod contract_tests {
             local: LocalPackage::Unknown, drafter: None, head_backend: serving::BlasHead::Native };
         let request = || production_request(64, None, Onboard::Layers(0), prefill,
             Operation::Serving, None, SparkReplyFormats::default());
-        let pool = crate::placement::prepare_pool(crate::placement::PoolFacts::new(&[96 << 30; 2], 64, None, PAGE_ROWS)).unwrap();
+        let pool = crate::placement::prepare_pool(pool_facts(&cfg, &[96 << 30; 2], 64, None)).unwrap();
         for logical in [96 << 30, 80 << 30] {
             for sampled in [0, 674_496_512] {
                 let budgets = vec![measured_budget(0, 96 << 30, logical, 100 << 20,
@@ -1321,9 +1332,10 @@ mod contract_tests {
     }
 
     #[test]
-    fn small_card_pool_facts_do_not_inject_a_family_target() {
-        let mut facts = crate::placement::PoolFacts::new(&[32 << 30], Context::automatic(1 << 20), None, PAGE_ROWS);
-        assert_eq!(crate::placement::prepare_pool(facts).unwrap().target(), 1 << 20);
+    fn pool_facts_do_not_inject_a_family_target() {
+        let cfg = MuseSparkConfig::from_hf(&crate::plan::testing::muse_spark_config()).unwrap();
+        let mut facts = pool_facts(&cfg, &[32 << 30], Context::automatic(1 << 20), None);
+        assert_eq!(crate::placement::prepare_pool(facts.clone()).unwrap().target(), 2 << 20);
         facts.target = Some(3 << 20);
         assert_eq!(crate::placement::prepare_pool(facts).unwrap().target(), 3 << 20);
     }

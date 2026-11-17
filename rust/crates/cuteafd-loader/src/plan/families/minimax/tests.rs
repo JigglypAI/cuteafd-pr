@@ -1,6 +1,28 @@
 use super::*;
 use crate::plan::{self, testing, PlanOptions};
 
+/// Pool facts from the family's real MSA page geometry (the planner's
+/// `cache_geometry` arithmetic): two KV planes plus one index record per
+/// 64-token page, owned per rank by the head split or balanced whole layers.
+fn pool_facts(cfg: &crate::families::minimax_m3::MiniMaxM3Config, gpus: usize,
+    attention: crate::placement::AttentionPlacement, cards: &[u64],
+    context: crate::placement::planner::Context, requested: Option<u64>)
+    -> crate::placement::PoolPolicy {
+    use crate::placement::families::minimax_m3 as shared;
+    let heads = gpus == 2 && attention == crate::placement::AttentionPlacement::Heads;
+    let rank_heads = cfg.kv_heads / if heads { 2 } else { 1 };
+    let page = shared::PAGE_ROWS * cuteafd_ffi::minimax_m3::kv_plane_record_bytes(rank_heads) as u64 * 2
+        + (cfg.msa.index_dim as u64 + 4) * shared::PAGE_ROWS;
+    let owners = shared::layer_owners(cfg.layers, gpus);
+    let mut facts = crate::placement::PoolFacts::new(cards, context, requested, shared::PAGE_ROWS);
+    facts.memory = cards.iter().enumerate().map(|(gpu, &available_bytes)| {
+        let layers = if heads { cfg.layers as u64 }
+            else { owners.iter().filter(|&&owner| usize::from(owner) == gpu).count() as u64 };
+        crate::placement::PoolMemory { available_bytes, bytes_per_unit: page * layers }
+    }).collect();
+    crate::placement::prepare_pool(facts).unwrap()
+}
+
 #[test]
 fn bundled_draft_head_shares_one_blas_pool_with_target() {
     use crate::placement::{families::minimax_m3::{self as shared,Drafter},planner::*};
@@ -808,10 +830,13 @@ fn recipe_inputs(gpus: usize, ranks: usize) -> crate::placement::families::minim
         .chain([crate::placement::families::kimi::host_budget(512 << 30, 480 << 30)]).collect();
     // Executor geometry checks are release-exact (E128); the fixture keeps four experts' headers.
     let mut release = cfg.clone(); release.experts = 128;
-    MiniMaxInputs { cfg: release, gpus, split_wire: Some(crate::families::minimax_m3::execution::WirePrecision::Bf16), attention: if gpus == 2 { crate::placement::AttentionPlacement::Layers }
-        else { crate::placement::AttentionPlacement::Heads }, spark_ranks: ranks, context: Context::automatic(1 << 20),
-        pool: crate::placement::prepare_pool(crate::placement::PoolFacts::new(
-            &vec![96 << 30; gpus], Context::automatic(1 << 20), None, shared::PAGE_ROWS)).unwrap(), prefill, sequences: 16, targets: targets.clone(), owners: owners.clone(),
+    let attention = if gpus == 2 { crate::placement::AttentionPlacement::Layers }
+        else { crate::placement::AttentionPlacement::Heads };
+    let pool = pool_facts(&release, gpus, attention,
+        &vec![96 << 30; gpus], Context::automatic(1 << 20), None);
+    MiniMaxInputs { cfg: release, gpus, split_wire: Some(crate::families::minimax_m3::execution::WirePrecision::Bf16), attention,
+        spark_ranks: ranks, context: Context::automatic(1 << 20),
+        pool, prefill, sequences: 16, targets: targets.clone(), owners: owners.clone(),
         manifest, routed: routed.clone(),
         expert_backings: (0..=routed.len()).map(|count| if count == 0 { Vec::new() } else {
             let catalog = crate::read_expert_catalog(dir.path()).unwrap();
@@ -2353,14 +2378,14 @@ fn prepared_pool_growth_retains_onboarding_and_policy_after_scope_exit() {
         let inputs = recipe_inputs(gpus, 4);
         let request = shared::request(inputs.context, None, crate::placement::Onboard::Auto,
             inputs.prefill, Operation::Serving, None, Default::default());
-        let small = crate::placement::prepare_pool(crate::placement::PoolFacts::new(
-            &vec![32 << 30; gpus], inputs.context, None, shared::PAGE_ROWS)).unwrap();
-        assert_eq!(small.target(), 1 << 20);
+        let small = pool_facts(&inputs.cfg, gpus, inputs.attention,
+            &vec![32 << 30; gpus], inputs.context, None);
+        assert_eq!(small.target(), 2 << 20);
         let default = inputs.admit(request.clone()).unwrap();
         let mut growing = inputs.clone();
         growing.pool = MemoryPolicy { kv_max: Some(100_000_000), ..Default::default() }.scoped(||
-            crate::placement::prepare_pool(crate::placement::PoolFacts::new(
-                &vec![96 << 30; gpus], inputs.context, None, shared::PAGE_ROWS)).unwrap());
+            pool_facts(&inputs.cfg, gpus, inputs.attention,
+                &vec![96 << 30; gpus], inputs.context, None));
         let grown = growing.admit(request.clone()).unwrap();
         assert_eq!(grown.solved.pool_policy, Some(growing.pool));
         assert_eq!(grown.onboard, default.onboard);

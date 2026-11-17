@@ -520,6 +520,12 @@ fn placement(report: &PlanReport, input: &crate::plan::PlanInput, options: &Layo
     let mut pool_facts = crate::placement::PoolFacts::new(card_bytes,
         crate::placement::planner::Context::resolve(context, (options.context_tokens > 0).then_some(options.context_tokens)),
         options.pool_tokens, page_tokens);
+    let cache = match cfg.variant.ml4() {
+        Some(ml4) => crate::serving_capacity::mistral_large4_cache_geometry(ml4, gpus)?,
+        None => crate::serving_capacity::glm_cache_geometry(&cfg, cfg.layers, gpus)?,
+    };
+    pool_facts.memory = cache.ranks.iter().zip(card_bytes).map(|(rank, &available_bytes)|
+        crate::placement::PoolMemory { available_bytes, bytes_per_unit: rank.persistent_unit_bytes }).collect();
     pool_facts.target = options.target_pool_tokens;
     let pool = crate::placement::prepare_pool(pool_facts)?;
     let maximum_pages = pool.maximum_tokens().div_ceil(page_tokens);
@@ -710,6 +716,12 @@ pub(crate) fn native_layout_with_metadata(checkpoint: &Checkpoint, options: &Lay
     let mut pool_facts = crate::placement::PoolFacts::new(card_bytes,
         crate::placement::planner::Context::resolve(context, (options.context_tokens > 0).then_some(options.context_tokens)),
         options.pool_tokens, page_tokens);
+    let cache = match cfg.variant.ml4() {
+        Some(ml4) => crate::serving_capacity::mistral_large4_cache_geometry(ml4, gpu_count)?,
+        None => crate::serving_capacity::glm_cache_geometry(&cfg, cfg.layers, gpu_count)?,
+    };
+    pool_facts.memory = cache.ranks.iter().zip(card_bytes).map(|(rank, &available_bytes)|
+        crate::placement::PoolMemory { available_bytes, bytes_per_unit: rank.persistent_unit_bytes }).collect();
     pool_facts.target = options.target_pool_tokens;
     let pool = crate::placement::prepare_pool(pool_facts)?;
     let maximum_pages = pool.maximum_tokens().div_ceil(page_tokens);

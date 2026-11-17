@@ -668,13 +668,13 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn small_card_default_and_explicit_target_are_preparation_facts() {
+    fn default_and_explicit_target_are_preparation_facts() {
         let cfg = GlmNextConfig::from_hf(&crate::plan::testing::glm5_flash_config(4)).unwrap();
         let mut input = inputs(&cfg, 1, 32 << 30);
         let process = || admission::ProcessOwners::new((512 << 30, 512 << 30), 8 << 30)
             .with_spark_capacities(crate::serving_capacity::spark_memory::serving_bytes());
         let prepared = admission::prepare(&input, 170, true, process()).unwrap();
-        assert_eq!(prepared.pool.target(), 1 << 20);
+        assert_eq!(prepared.pool.target(), 2 << 20);
         let sampled = sampled(&input);
         assert_eq!(admission::prepare(&sampled, 188, true, process()).unwrap().pool,
             admission::prepare(&input, 188, true, process()).unwrap().pool);

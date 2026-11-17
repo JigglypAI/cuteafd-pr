@@ -161,9 +161,20 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
         ArchContext::for_device("sm_120", card.physical_bytes).context_bytes)).collect::<Vec<_>>();
     budgets.extend((0..ranks).map(|rank| shared::spark_budget(rank as u8, opts.spark_capacity(rank))));
     let card_bytes = cards.iter().map(|card| card.logical_bytes).collect::<Vec<_>>();
+    let cache = match crate::families::muse_spark::cache::MuseCacheLayout::with_format(cfg,
+        card_bytes.len(), opts.muse_kv) {
+        Ok(cache) => cache,
+        Err(error) => {
+            report.refuse_placement(format!("invalid Muse KV cache geometry: {error}"),
+                "Use one GPU or a head split over whole KV heads.");
+            return memory;
+        }
+    };
     let mut pool_facts = crate::placement::PoolFacts::new(&card_bytes,
         crate::placement::planner::Context::resolve(context, (opts.context_tokens > 0).then_some(opts.context_tokens)),
         opts.pool_tokens, shared::PAGE_ROWS);
+    pool_facts.memory = cache.geometry.ranks.iter().zip(&card_bytes).map(|(rank, &available_bytes)|
+        crate::placement::PoolMemory { available_bytes, bytes_per_unit: rank.persistent_unit_bytes }).collect();
     pool_facts.target = opts.target_pool_tokens;
     let pool = match crate::placement::prepare_pool(pool_facts) {
         Ok(pool) => pool,

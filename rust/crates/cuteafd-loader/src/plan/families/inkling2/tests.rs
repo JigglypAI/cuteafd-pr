@@ -1,6 +1,17 @@
 use super::*;
 use crate::plan::{self, testing, PlanOptions};
 
+/// Pool facts from the family's real per-rank page geometry.
+fn pool_facts<'a>(cfg: &crate::families::inkling2::Inkling2Config,
+    modes: &[crate::placement::LayerMode], page_rows: u64, cards: &'a [u64],
+    context: impl Into<crate::placement::planner::Context>, requested: Option<u64>)
+    -> crate::placement::PoolFacts<'a> {
+    let mut facts = crate::placement::PoolFacts::new(cards, context, requested, page_rows);
+    facts.memory = crate::families::inkling2::admission::pool_memory(cfg,
+        crate::families::inkling2::InklingKvCache::Bf16, modes, page_rows, cards);
+    facts
+}
+
 /// Which routed-expert storage the fixture writes.
 #[derive(Clone, Copy, PartialEq)]
 enum Fixture { Mxfp8, Mixed, Exl3 }
@@ -553,8 +564,8 @@ fn shared_recipe_charges_every_owner_once_on_one_and_two_rtx() {
             }).collect()
         }).collect() };
         let inputs = InklingInputs { cfg: cfg.clone(), kv_format: crate::families::inkling2::InklingKvCache::Bf16, gpus, spark_ranks: ranks, context: Context::automatic(1 << 20),
-            pool: crate::placement::prepare_pool(crate::placement::PoolFacts::new(
-            &vec![96 << 30; gpus], Context::automatic(1 << 20), None, shared::PAGE_ROWS)).unwrap(), prefill, sequences: 16, prefix_entries: 8, prefix_mark_budget: 2 << 30, targets: targets.clone(), placement, modes: modes.clone(),
+            pool: crate::placement::prepare_pool(pool_facts(&cfg, &modes, shared::PAGE_ROWS,
+            &vec![96 << 30; gpus], Context::automatic(1 << 20), None)).unwrap(), prefill, sequences: 16, prefix_entries: 8, prefix_mark_budget: 2 << 30, targets: targets.clone(), placement, modes: modes.clone(),
             routed: routed.clone(), experts,
             local,
             spark: (0..=routed.len()).map(charge).collect(),
@@ -669,9 +680,9 @@ fn shared_recipe_charges_every_owner_once_on_one_and_two_rtx() {
             assert!(contract.components.iter().any(|c| matches!(&c.kind, ComponentKind::Allocation { template, .. }
                 if template.id == format!("inkling2.cache.{gpu}.active"))), "rtx{gpu} marks");
         }
-        let small = crate::placement::prepare_pool(crate::placement::PoolFacts::new(
-            &vec![32 << 30; gpus], inputs.context, None, inputs.page_rows())).unwrap();
-        assert_eq!(small.target(), 1 << 20);
+        let small = crate::placement::prepare_pool(pool_facts(&inputs.cfg, &inputs.modes,
+            inputs.page_rows(), &vec![32 << 30; gpus], inputs.context, None)).unwrap();
+        assert_eq!(small.target(), 2 << 20);
         let admitted = inputs.admit(request.clone()).unwrap();
         assert_eq!(admitted.solved.pool_policy, Some(inputs.pool));
         let mut sampled = inputs.clone();
@@ -685,8 +696,8 @@ fn shared_recipe_charges_every_owner_once_on_one_and_two_rtx() {
         let grow = MemoryPolicy { kv_max: Some(100_000_000), ..Default::default() };
         let grown = grow.scoped(|| {
             let mut growing = inputs.clone();
-            growing.pool = crate::placement::prepare_pool(crate::placement::PoolFacts::new(
-                &vec![96 << 30; gpus], inputs.context, None, inputs.page_rows())).unwrap();
+            growing.pool = crate::placement::prepare_pool(pool_facts(&inputs.cfg, &inputs.modes,
+                inputs.page_rows(), &vec![96 << 30; gpus], inputs.context, None)).unwrap();
             growing.admit(request.clone()).unwrap()
         });
         assert_eq!(grown.onboard, admitted.onboard, "growth must preserve Inkling onboarding");

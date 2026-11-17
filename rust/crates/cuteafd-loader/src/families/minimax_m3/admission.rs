@@ -406,8 +406,20 @@ pub fn gather(request: &FactsRequest<'_>) -> Result<MiniMaxInputs, Refused> {
         serving::HostPrefixOwners { quota_bytes: quota, chunk_bytes: geometry.chunk_bytes().min(quota.max(1)) }
     };
     let capacities = (0..gpus).map(|gpu| request.coordinator.budget(gpu).logical_bytes).collect::<Vec<_>>();
+    // The planner's MSA page geometry (`plan::families::minimax`): two KV
+    // planes plus one index record per 64-token page, owned per rank by the
+    // selected head split or balanced whole layers.
+    let rank_heads = cfg.kv_heads / if heads { 2 } else { 1 };
+    let page = shared::PAGE_ROWS
+        * cuteafd_ffi::minimax_m3::kv_plane_record_bytes(rank_heads) as u64 * 2
+        + (cfg.msa.index_dim as u64 + 4) * shared::PAGE_ROWS;
+    let owners = shared::layer_owners(cfg.layers, gpus);
+    let rank_bytes = |gpu: usize| -> u64 { page * if heads { cfg.layers as u64 }
+        else { owners.iter().filter(|&&owner| usize::from(owner) == gpu).count() as u64 } };
     let mut pool_facts = crate::placement::PoolFacts::new(&capacities,
         Context::resolve(context, (request.context_tokens > 0).then_some(request.context_tokens)), request.pool_tokens, shared::PAGE_ROWS);
+    pool_facts.memory = capacities.iter().enumerate().map(|(gpu, &available_bytes)|
+        crate::placement::PoolMemory { available_bytes, bytes_per_unit: rank_bytes(gpu) }).collect();
     pool_facts.target = request.target_pool_tokens;
     let pool = crate::placement::prepare_pool(pool_facts).map_err(|error|
         refused(format!("invalid KV pool policy: {error}"), "Set KV min <= target <= max."))?;

@@ -198,6 +198,26 @@ pub fn spark_charges(catalog: &crate::OfficialV41Catalog, experts: &[LayerExpert
     }).collect()
 }
 
+/// One pool unit's global-layer records on each rank: a wholly owned layer
+/// carries the full page, a head- or context-split layer half of it, and a
+/// layer owned by the peer none (the shares `rank_owners` charges).
+pub(crate) fn pool_memory(cfg: &Inkling2Config, kv_format: super::InklingKvCache,
+    modes: &[crate::placement::LayerMode], page_rows: u64, capacities: &[u64])
+    -> Vec<crate::placement::PoolMemory> {
+    let record_bytes = kv_format.record_bytes(cfg.kv_heads, cfg.head_dim) as u64;
+    let rank_unit_bytes = |gpu: usize| -> u64 {
+        cfg.local.iter().zip(modes).filter(|(local, _)| !**local).map(|(_, mode)| match mode {
+            crate::placement::LayerMode::Whole { gpu: owner, .. } if usize::from(*owner) == gpu =>
+                page_rows * record_bytes,
+            crate::placement::LayerMode::Whole { .. } => 0,
+            crate::placement::LayerMode::HeadSplit | crate::placement::LayerMode::ContextSplit =>
+                page_rows * record_bytes / 2,
+        }).sum()
+    };
+    capacities.iter().enumerate().map(|(gpu, &available_bytes)|
+        crate::placement::PoolMemory { available_bytes, bytes_per_unit: rank_unit_bytes(gpu) }).collect()
+}
+
 /// Gather every admitted owner fact into the shared recipe.
 pub fn gather(request: &FactsRequest<'_>) -> Result<InklingInputs, Refused> {
     let cfg = request.cfg;
@@ -295,6 +315,7 @@ pub fn gather(request: &FactsRequest<'_>) -> Result<InklingInputs, Refused> {
     let capacities = (0..gpus).map(|gpu| request.coordinator.budget(gpu).logical_bytes).collect::<Vec<_>>();
     let mut pool_facts = crate::placement::PoolFacts::new(&capacities,
         Context::resolve(context, (request.context_tokens > 0).then_some(request.context_tokens)), request.pool_tokens, page_rows);
+    pool_facts.memory = pool_memory(cfg, request.kv_format, &modes, page_rows, &capacities);
     pool_facts.target = request.target_pool_tokens;
     let pool = crate::placement::prepare_pool(pool_facts).map_err(|error|
         refused(format!("invalid KV pool policy: {error}"), "Set KV min <= target <= max."))?;

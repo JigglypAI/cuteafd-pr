@@ -89,9 +89,14 @@ pub(crate) fn admit(options: Options<'_>) -> Result<shared::AdmittedMuse> {
     budgets.extend((0..options.spark_ranks).map(|rank| shared::spark_budget(rank as u8, options.spark_rank_bytes[rank])));
     let context = options.max_context.unwrap_or(options.cfg.max_position as u64);
     let capacities = options.measured.iter().map(|sample| sample.total_bytes).collect::<Vec<_>>();
-    let pool = cuteafd_loader::placement::prepare_pool(cuteafd_loader::placement::PoolFacts::new(
+    let cache = cuteafd_loader::families::muse_spark::cache::MuseCacheLayout::with_format(options.cfg,
+        gpus, options.kv_cache)?;
+    let mut facts = cuteafd_loader::placement::PoolFacts::new(
         &capacities, cuteafd_loader::placement::planner::Context::resolve(context, options.max_context),
-        options.pool_tokens, shared::PAGE_ROWS))?;
+        options.pool_tokens, shared::PAGE_ROWS);
+    facts.memory = cache.geometry.ranks.iter().zip(&capacities).map(|(rank, &available_bytes)|
+        cuteafd_loader::placement::PoolMemory { available_bytes, bytes_per_unit: rank.persistent_unit_bytes }).collect();
+    let pool = cuteafd_loader::placement::prepare_pool(facts)?;
     let media = options.media.unwrap_or(shared::MediaOptions { vision: cuteafd_loader::plan::MediaMode::Off,
         audio: cuteafd_loader::plan::MediaMode::Off, replicas: 1, vision_bytes: (0, 0), audio_bytes: (0, 0) });
     let prepared = shared::ProductionInput { kv_cache: options.kv_cache, cfg: options.cfg, core: options.core, projections: options.projections,
