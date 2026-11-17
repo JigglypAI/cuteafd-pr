@@ -511,6 +511,33 @@ mod arena_tests {
     use super::*;
 
     #[test]
+    fn glm_body_fp8_recipe_and_shared_roles_agree_for_every_operand() -> Result<()> {
+        use super::draft_representation::{draft_weight_role, DraftWeightRole};
+        let cfg = GlmDflashConfig { hidden:256,intermediate:256,layers:2,heads:2,kv_heads:1,head_dim:128,
+            eps:1e-6,theta:10000.,block:8,group:16,mask_token:0,rank:256,taps:vec![0,1],vocab:32,
+            window:2048,row_window:true,sample_from_anchor:false };
+        let native = gqa_arena_requests(&cfg,GlmDraftRepresentation::Bf16Only,0,1)?
+            .into_iter().collect::<std::collections::BTreeMap<_,_>>();
+        let fp8 = gqa_arena_requests(&cfg,GlmDraftRepresentation::Fp8Only,0,1)?
+            .into_iter().collect::<std::collections::BTreeMap<_,_>>();
+        gqa_weight_recipe(&cfg,0,1,|name,_| {
+            assert_ne!(draft_weight_role(name),Some(DraftWeightRole::BodyLinear),"{name}");
+            assert_eq!(fp8[name],native[name]);
+            assert!(!fp8.contains_key(&format!("{name}.payload")));
+            Ok(())
+        },|parts,cols,_| {
+            for (name,_) in parts { assert_eq!(draft_weight_role(name),Some(DraftWeightRole::BodyLinear),"{name}"); }
+            let name=parts.iter().map(|(name,_)|*name).collect::<Vec<_>>().join("+");
+            let values=parts.iter().map(|(_,rows)|rows*cols).sum::<usize>();
+            assert_eq!(fp8[&format!("{name}.payload")],values);
+            assert_eq!(fp8[&format!("{name}.scales")],values/128*4);
+            assert!(!fp8.contains_key(&name));
+            Ok(())
+        })?;
+        Ok(())
+    }
+
+    #[test]
     fn gqa_checkpoint_and_config_requests_agree_and_reject_invalid_headers() -> Result<()> {
         use crate::plan::testing::{t, write_safetensors};
         let value = serde_json::json!({"hidden_size":256, "intermediate_size":256,
