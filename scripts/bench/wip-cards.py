@@ -740,6 +740,23 @@ def speculating(values):
     return values.get('SPECULATOR', 'auto') != 'off' and values.get('DSPARK', 'on') != 'off'
 
 
+def planned_speculator(job, deployment):
+    """Attest the identity, not just that deployment admission succeeded."""
+    selected = deployment.get('speculator')
+    if selected not in {'off', 'mtp', 'dspark', 'dflash2'}:
+        raise ValueError('launcher deployment preflight returned no resolved speculator identity')
+    values = job['entry']['set']
+    requested = values.get('SPECULATOR', 'auto')
+    if requested != 'auto' and requested != selected:
+        raise ValueError(f'planned speculator {selected} differs from requested {requested}')
+    previous = job.get('planned_speculator')
+    if previous is not None and previous != selected:
+        raise ValueError(f'planned speculator changed since enqueue: {previous} -> {selected}')
+    if selected == 'off' and values.get('DRAFT_LENGTH') and speculating(values):
+        raise ValueError('DRAFT_LENGTH requested but the planned launch has no speculator')
+    job['planned_speculator'] = selected
+
+
 def preflight_at_grant(job, arm):
     """Smoke's prelaunch hook, run once it holds this card's locks: the absence of
     our containers is only meaningful then. Checked up front it would refuse a job
@@ -775,6 +792,7 @@ def preflight_deployment(job, arm):
         except ValueError:
             continue
         if isinstance(deployment, dict) and isinstance(deployment.get('spark_roles'), list):
+            planned_speculator(job, deployment)
             return deployment
     raise ValueError('launcher deployment preflight returned no typed Spark roles')
 
@@ -2157,11 +2175,32 @@ def summarize_job(job, exit_code):
     trace_path = job['entry']['set'].get('SPECULATION_TRACE')
     if trace_path and job.get('trace'):
         path = Path(trace_path)
-        records = sum(1 for line in path.open(errors='replace') if line.strip()) if path.is_file() else 0
+        records, proposed, cycles = 0, 0, 0
+        if path.is_file():
+            for line in path.open(errors='replace'):
+                if not line.strip():
+                    continue
+                records += 1
+                try:
+                    observation = json.loads(line)
+                except ValueError:
+                    continue
+                if 'depths' in observation and 'cycle_ms' in observation:
+                    cycles += 1
+                    proposed += sum(max(0, n) for n in observation['depths'])
+                elif observation.get('type') == 'draft_round':
+                    proposed += sum(max(0, r.get('verified_rows', 1) - 1) for r in observation.get('requests', []))
+        expected = speculating(job['entry']['set']) or job.get('planned_speculator', 'off') != 'off'
         row['trace'] = {'path': trace_path, 'bytes': path.stat().st_size if path.is_file() else 0, 'records': records,
-                        'expected': speculating(job['entry']['set'])}
-        if row['trace']['expected'] and not records:
+                        'expected': expected, 'proposal_evidence_rows': proposed, 'cycles': cycles}
+        if expected and not records:
             fail(row, 'speculation trace is empty after the run (' + trace_path + ')', 'measurement')
+        elif expected and cycles >= 8 and not proposed:
+            fail(row, 'speculation requested but nonempty trace contains zero proposed tokens', 'measurement')
+        if expected:
+            for log in (dest / 'smoke' / 'logs').glob('*coordinator.log'):
+                if re.search(r'DRAFT_LENGTH=.*ignored: no speculator|DRAFT_LENGTH.*no speculator', log.read_text(errors='replace')):
+                    fail(row, 'DRAFT_LENGTH ignored: launch has no speculator', 'measurement')
     sweeps = [p for p in (dest / 'reports').glob('**/sweep.json')
               if not job.get('grouped') or p.parent.name.endswith('-' + job['entry']['name']) or p.parent.name == job['entry']['name']]
     if job['entry'].get('levels') or job['entry'].get('prefill_lengths'):

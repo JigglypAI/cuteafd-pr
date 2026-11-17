@@ -34,11 +34,10 @@ pub fn glmf_draft_linear(explicit: Option<&str>, configured: Option<&str>, exter
         if external_fp8 { "w8a8" } else { "w8a16" }.into(), "w8a8 with an external FP8 drafter; w8a16 otherwise")
 }
 
-pub fn glmf_speculator(explicit: Option<&str>, configured: Option<&str>, default_drafter_present: bool) -> Resolved<String> {
+pub fn glmf_speculator(explicit: Option<&str>, configured: Option<&str>) -> Resolved<String> {
     selected(explicit.filter(|v| !v.is_empty() && *v != "auto").map(str::to_owned),
         configured.filter(|_| explicit.is_none()).filter(|v| !v.is_empty() && *v != "auto").map(str::to_owned),
-        if default_drafter_present { "dflash2" } else { "off" }.into(),
-        "DFlash2 when the default drafter is available; off otherwise")
+        "dflash2".into(), "DFlash2; the default drafter must be available")
 }
 
 /// Occupancy is a supplied live measurement, never sampled by this resolver.
@@ -134,8 +133,8 @@ mod tests {
         } } }
         assert_eq!(glmf_draft_linear(None, None, true).value, "w8a8");
         assert_eq!(glmf_draft_linear(None, Some("wide"), true).provenance, "config");
-        assert_eq!(glmf_speculator(None, None, false).value, "off");
-        assert_eq!(glmf_speculator(None, Some("dflash2"), false).value, "dflash2");
+        assert_eq!(glmf_speculator(None, None).value, "dflash2");
+        assert_eq!(glmf_speculator(None, Some("off")).value, "off");
         assert_eq!(coordinator_weight_budget(None, None, 32 << 30).value, 32.0);
         assert_eq!(coordinator_weight_budget(Some(20.0), None, 32 << 30).value, 20.0);
         assert_eq!(glmf_replay_records(Some("auto"), Some("shared"), 2, true, true).value, "own");

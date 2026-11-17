@@ -560,10 +560,8 @@ fn run_plan_with_host(mut args: PlanArgs) -> Result<()> {
     let replay_explicit = args.replay_records;
     let mut settings = resolve_settings(&mut args, family, &cfg)?;
     if family == "glm5_flash" {
-        let home = args.hf_home.clone().unwrap_or_else(default_hf_home);
         settings.insert("speculator".into(), setting(cuteafd_core::launch_settings::glmf_speculator(
-            (requested_speculator != "auto" || args.explicit_settings.contains("speculator")).then_some(requested_speculator.as_str()), cfg.get("SPECULATOR").map(String::as_str),
-            cuteafd_loader::model_cache_dir(&home, GLMF_DEFAULT_DRAFTER).is_dir())));
+            (requested_speculator != "auto" || args.explicit_settings.contains("speculator")).then_some(requested_speculator.as_str()), cfg.get("SPECULATOR").map(String::as_str))));
     }
     if family == "mimo_v2" {
         settings.insert("speculator".into(), setting(cuteafd_core::launch_settings::mimo_speculator(
@@ -858,18 +856,52 @@ const K31_TARGET_CONFIG_SHA: &str = "2c10b1b34aaf6ecc89f7e06a4a69810c8f2b2ee100c
 const K31_MC_SHA: &str = "7a44b5e07de0bc6166b3a5420bca99efe4454e5e421951afe03c176636f5f31d";
 const K31_DRAFT_CONFIG_SHA: &str = "9f1317c5767d909b7a558a28e67b0ae418e512925eb26ca9c615217283bbb9c0";
 
-fn kimi_content_matches(snapshot: &std::path::Path, draft: &std::path::Path) -> Result<bool> {
+fn kimi_target_matches(snapshot: &std::path::Path) -> Result<bool> {
     use cuteafd_loader::plan::checkpoint::{CheckpointView, CoreView};
-    use sha2::{Digest, Sha256};
+    if !snapshot.join("cuteafd-mc.json").is_file() { return Ok(false); }
     let view = CheckpointView::select(snapshot, CoreView::Original)?;
     if !view.is_mc() || view.declared_view() != Some(CoreView::Original) { return Ok(false); }
     Ok(view.metadata_sha256("config.json")? == K31_TARGET_CONFIG_SHA
-        && view.metadata_sha256("cuteafd-mc.json")? == K31_MC_SHA
+        && view.metadata_sha256("cuteafd-mc.json")? == K31_MC_SHA)
+}
+
+fn kimi_content_matches(snapshot: &std::path::Path, draft: &std::path::Path) -> Result<bool> {
+    use sha2::{Digest, Sha256};
+    Ok(kimi_target_matches(snapshot)?
         && format!("{:x}", Sha256::digest(std::fs::read(draft.join("config.json"))?)) == K31_DRAFT_CONFIG_SHA)
+}
+
+fn require_default_drafter(args: &PlanArgs, cfg: &std::collections::BTreeMap<String, String>,
+    default_model: &str, default_revision: Option<&str>) -> Result<PathBuf> {
+    let model = cfg.get("SPECULATOR_MODEL_ID").filter(|v| !v.is_empty()).map(String::as_str).unwrap_or(default_model);
+    let revision = cfg.get("SPECULATOR_MODEL_REVISION").filter(|v| !v.is_empty()).map(String::as_str)
+        .or_else(|| (model == default_model).then_some(default_revision).flatten());
+    let home = args.hf_home.clone().unwrap_or_else(default_hf_home);
+    let remedy = format!("default drafter {model}@{} is unavailable or missing config.json; run `nest hf download {model}{}` or set SPECULATOR=off",
+        revision.unwrap_or("main"), revision.map(|r| format!(" --revision {r}")).unwrap_or_default());
+    let path = if let Some(path) = &args.drafter_snapshot { path.clone() } else {
+        resolve_snapshot_at_revision(model, Some(&home), revision).with_context(|| remedy.clone())?
+            .snapshot_path.with_context(|| remedy.clone())?
+    };
+    anyhow::ensure!(path.join("config.json").is_file(), "{remedy}: {}", path.display());
+    Ok(path)
 }
 
 fn resolve_kimi_content(args: &PlanArgs, snapshot: &std::path::Path,
     cfg: &std::collections::BTreeMap<String, String>) -> Result<bool> {
+    if args.no_speculator || args.speculator == "off"
+        || (args.speculator == "auto" && cfg.get("SPECULATOR").is_some_and(|v| v == "off")) { return Ok(false); }
+    if !kimi_target_matches(snapshot)? { return Ok(false); }
+    let mut qualification = kimi_qualification(args, cfg);
+    qualification.content_qualified = true;
+    let selection = cuteafd_core::launch_settings::kimi_speculator(
+        (args.speculator != "auto").then_some(args.speculator.as_str()), cfg.get("SPECULATOR").map(String::as_str), qualification)?;
+    if args.no_speculator || selection.value == "off" { return Ok(false); }
+    if selection.provenance.starts_with("auto:") && selection.value == "dspark" {
+        let draft = require_default_drafter(args, cfg, cuteafd_core::launch_settings::KIMI_K31_DSPARK,
+            Some(cuteafd_core::launch_settings::KIMI_K31_DSPARK_REVISION))?;
+        return kimi_content_matches(snapshot, &draft);
+    }
     let home = args.hf_home.clone().unwrap_or_else(default_hf_home);
     let draft = if let Some(draft) = &args.drafter_snapshot { draft.clone() } else {
         let model = cfg.get("SPECULATOR_MODEL_ID").map(String::as_str)
@@ -898,13 +930,13 @@ fn kimi_qualification<'a>(args: &'a PlanArgs, _cfg: &'a std::collections::BTreeM
 fn resolve_speculator(args: &mut PlanArgs, snapshot: &std::path::Path, family: &str,
     cfg: &std::collections::BTreeMap<String, String>) -> Result<()> {
     if family == "kimi_k3" {
-        args.kimi_content_qualified = resolve_kimi_content(args, snapshot, cfg)?;
         if !args.explicit_settings.contains("draft_kv_cache") {
             args.draft_kv_cache = match cfg.get("DRAFT_KV_CACHE") {
                 Some(value) => value.parse()?,
                 None => args.draft_kv_cache,
             };
         }
+        args.kimi_content_qualified = resolve_kimi_content(args, snapshot, cfg)?;
         args.speculator=cuteafd_core::launch_settings::kimi_speculator(
             (args.speculator != "auto").then_some(args.speculator.as_str()),cfg.get("SPECULATOR").map(String::as_str), kimi_qualification(&args, &cfg))?.value;
     }
@@ -919,10 +951,12 @@ fn resolve_speculator(args: &mut PlanArgs, snapshot: &std::path::Path, family: &
         _ => "off",
     };
     if family == "glm5_flash" && !args.no_speculator {
-        let hf_home = args.hf_home.clone().unwrap_or_else(default_hf_home);
-        let available = cuteafd_loader::model_cache_dir(&hf_home, GLMF_DEFAULT_DRAFTER).is_dir();
-        args.speculator = cuteafd_core::launch_settings::glmf_speculator((args.speculator != "auto" || args.explicit_settings.contains("speculator")).then_some(args.speculator.as_str()),
-            cfg.get("SPECULATOR").map(String::as_str), available).value;
+        let resolved = cuteafd_core::launch_settings::glmf_speculator((args.speculator != "auto" || args.explicit_settings.contains("speculator")).then_some(args.speculator.as_str()),
+            cfg.get("SPECULATOR").map(String::as_str));
+        if resolved.provenance.starts_with("auto:") {
+            require_default_drafter(args, cfg, GLMF_DEFAULT_DRAFTER, None)?;
+        }
+        args.speculator = resolved.value;
     }
     if family == "mimo_v2" && !args.no_speculator {
         args.speculator = cuteafd_core::launch_settings::mimo_speculator(
@@ -1563,6 +1597,14 @@ mod tests {
         }
         std::fs::copy(draft_source.join("config.json"), draft.join("config.json"))?;
         assert!(kimi_content_matches(&target, &draft)?);
+        let crate::cli::Commands::Plan(mut missing) = crate::cli::Cli::try_parse_from([
+            "cuteafd", "plan", target.to_str().unwrap(), "--rtx", "2", "--hf-home", root.path().join("empty-hf").to_str().unwrap()
+        ])?.command else { panic!("plan") };
+        let error = resolve_speculator(&mut missing, &target, "kimi_k3", &Default::default()).unwrap_err();
+        assert!(error.to_string().contains(cuteafd_core::launch_settings::KIMI_K31_DSPARK_REVISION));
+        missing.speculator = "off".into();
+        resolve_speculator(&mut missing, &target, "kimi_k3", &Default::default())?;
+        assert_eq!(missing.speculator, "off");
         let crate::cli::Commands::Plan(mut request) = crate::cli::Cli::try_parse_from([
             "cuteafd", "plan", target.to_str().unwrap(), "--checkpoint-model-id", "fake/alias",
             "--rtx", "2", "--drafter-snapshot", draft.to_str().unwrap()
@@ -1578,6 +1620,36 @@ mod tests {
         changed.push(b' ');
         std::fs::write(target.join("config.json"), changed)?;
         assert!(!kimi_content_matches(&target, &draft).unwrap_or(false));
+        Ok(())
+    }
+
+    #[test]
+    fn automatic_external_drafter_requires_snapshot_and_config_but_off_does_not() -> Result<()> {
+        use clap::Parser;
+        let root = tempfile::tempdir()?;
+        let target = root.path().join("target");
+        std::fs::create_dir_all(&target)?;
+        for family in ["glm5_flash", "kimi_k3"] {
+            let crate::cli::Commands::Plan(mut request) = crate::cli::Cli::try_parse_from([
+                "cuteafd", "plan", target.to_str().unwrap(), "--rtx", "2"
+            ])?.command else { panic!("plan") };
+            request.hf_home = Some(root.path().join("hf"));
+            let model = if family == "glm5_flash" { GLMF_DEFAULT_DRAFTER } else { cuteafd_core::launch_settings::KIMI_K31_DSPARK };
+            let revision = (family == "kimi_k3").then_some(cuteafd_core::launch_settings::KIMI_K31_DSPARK_REVISION);
+            let error = require_default_drafter(&request, &Default::default(), model, revision).unwrap_err();
+            assert!(error.to_string().contains(model) && error.to_string().contains("nest hf download"));
+            if let Some(revision) = revision { assert!(error.to_string().contains(revision)); }
+            let draft = root.path().join(format!("{family}-draft"));
+            std::fs::create_dir_all(&draft)?;
+            request.drafter_snapshot = Some(draft.clone());
+            assert!(require_default_drafter(&request, &Default::default(), model, revision).unwrap_err().to_string().contains("config.json"));
+            std::fs::write(draft.join("config.json"), "{}")?;
+            assert_eq!(require_default_drafter(&request, &Default::default(), model, revision)?, draft);
+            request.drafter_snapshot = None;
+            request.speculator = "off".into();
+            resolve_speculator(&mut request, &target, family, &Default::default())?;
+            assert_eq!(request.speculator, "off");
+        }
         Ok(())
     }
 
