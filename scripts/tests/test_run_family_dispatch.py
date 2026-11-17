@@ -5780,13 +5780,13 @@ def test_spark_probe_is_bounded_by_selected_count_and_restart_stops_first(tmp_pa
         stop = result.stderr.index(f"cuteafd-spark-expert-h{rank}-")
         probe_at = next(result.stderr.index(line) for line in probes if f"h{rank} " in line)
         assert stop < probe_at
-@pytest.mark.parametrize("prewarm,donor", [("on", "off"), ("off", "on")])
-def test_graph_cache_experiment_flags_are_cli_only(tmp_path, prewarm, donor):
+@pytest.mark.parametrize("prewarm,donor,lag", [("on", "off", "0"), ("off", "on", "0"), ("off", "on", "16")])
+def test_graph_cache_experiment_flags_are_cli_only(tmp_path, prewarm, donor, lag):
     config = {"model_type": "glm5_next", "num_hidden_layers": 2,
               "mlp_layer_types": ["sparse"] * 2,
               "layer_types": ["linear_attention", "deepseek_sparse_attention"]}
     result = _family_launch_result(tmp_path, config, "test/glmf",
-        f"RTX_GPUS=1\nGRAPH_PREWARM={prewarm}\nGRAPH_DONOR_ALWAYS={donor}\n")
+        f"RTX_GPUS=1\nGRAPH_PREWARM={prewarm}\nGRAPH_DONOR_ALWAYS={donor}\nGRAPH_DONOR_COLD_LAG={lag}\n")
     assert result.returncode == 0, result.stderr
     serve = shlex.split(next(line for line in result.stderr.splitlines()
         if "serve-glmf" in line and "--snapshot" in line))
@@ -5794,6 +5794,27 @@ def test_graph_cache_experiment_flags_are_cli_only(tmp_path, prewarm, donor):
     assert ("--graph-donor-always" in serve) == (donor == "on")
     assert "CUTEAFD_GRAPH_PREWARM" not in result.stderr
     assert "CUTEAFD_GRAPH_DONOR_ALWAYS" not in result.stderr
+    assert ("--graph-donor-cold-lag" in serve) == (lag != "0")
+    if lag != "0":
+        assert serve[serve.index("--graph-donor-cold-lag") + 1] == lag
+    assert "CUTEAFD_GRAPH_DONOR_COLD_LAG" not in result.stderr
+
+
+@pytest.mark.parametrize("lag,donor,error", [
+    ("16", "off", "requires GRAPH_DONOR_ALWAYS=on"),
+    ("-1", "on", "must be a non-negative integer"),
+    ("1.5", "on", "must be a non-negative integer"),
+    ("cold", "on", "must be a non-negative integer"),
+])
+def test_graph_donor_cold_lag_refuses_invalid_launch(tmp_path, lag, donor, error):
+    config = {"model_type": "glm5_next", "num_hidden_layers": 2,
+              "mlp_layer_types": ["sparse"] * 2,
+              "layer_types": ["linear_attention", "deepseek_sparse_attention"]}
+    result = _family_launch_result(tmp_path, config, "test/glmf",
+        f"RTX_GPUS=1\nGRAPH_DONOR_ALWAYS={donor}\nGRAPH_DONOR_COLD_LAG={lag}\n")
+    assert result.returncode == 2, result.stderr
+    assert error in result.stderr
+    assert "serve-glmf --snapshot" not in result.stderr
 
 
 def test_graph_prewarm_off_refuses_unqualified_family(tmp_path):

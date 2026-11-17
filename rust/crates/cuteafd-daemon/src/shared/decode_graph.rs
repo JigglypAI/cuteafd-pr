@@ -1,13 +1,23 @@
 //! Canonical serving decode shapes and exact-key graph ownership.
 
 #[derive(Clone, Copy, Default)]
-struct Options { no_prewarm: bool, donor_always: bool }
+struct Options { no_prewarm: bool, donor_always: bool, donor_cold_lag: u64 }
+impl Options {
+    fn validate(self) -> anyhow::Result<Self> {
+        anyhow::ensure!(self.donor_always || self.donor_cold_lag == 0,
+            "--graph-donor-cold-lag requires --graph-donor-always when non-zero");
+        Ok(self)
+    }
+}
 static OPTIONS: std::sync::OnceLock<Options> = std::sync::OnceLock::new();
-pub(crate) fn configure(no_prewarm: bool, donor_always: bool) {
-    assert!(OPTIONS.set(Options { no_prewarm, donor_always }).is_ok(), "graph policy configured twice");
+pub(crate) fn configure(no_prewarm: bool, donor_always: bool, donor_cold_lag: u64) -> anyhow::Result<()> {
+    let options = Options { no_prewarm, donor_always, donor_cold_lag }.validate()?;
+    assert!(OPTIONS.set(options).is_ok(), "graph policy configured twice");
+    Ok(())
 }
 pub(crate) fn prewarm_enabled() -> bool { !OPTIONS.get().copied().unwrap_or_default().no_prewarm }
 fn donor_always() -> bool { OPTIONS.get().copied().unwrap_or_default().donor_always }
+fn donor_cold_lag() -> u64 { OPTIONS.get().copied().unwrap_or_default().donor_cold_lag }
 
 /// Object-safe control surface for a family's heterogeneous graph owners.
 /// The caller drains the complete submitted step before invoking `drain`.
@@ -159,6 +169,19 @@ pub(crate) fn real_row_moe(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn donor_cold_lag_requires_donor_always() {
+        use super::Options;
+        for donor_always in [false, true] {
+            assert!(Options { no_prewarm: false, donor_always, donor_cold_lag: 0 }.validate().is_ok());
+            let result = Options { no_prewarm: false, donor_always, donor_cold_lag: 16 }.validate();
+            assert_eq!(result.is_ok(), donor_always);
+            if let Err(error) = result {
+                assert!(error.to_string().contains("--graph-donor-cold-lag requires --graph-donor-always"));
+            }
+        }
+    }
+
     #[test]
     fn skinny_thresholds_fail_closed_with_projection_name() {
         use super::*;

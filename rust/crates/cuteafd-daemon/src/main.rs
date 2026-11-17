@@ -352,7 +352,7 @@ async fn run() -> Result<()> {
                     cuteafd_transport::wait_policy::WaitPolicy { wait: cli.host_wait,
                         idle_park: std::time::Duration::from_secs_f64(cli.idle_park_seconds) }, cuteafd_core::spark_reply::SparkReplyFormats {
                             prefill: cli.spark_prefill_reply_format, decode: cli.spark_decode_reply_format },
-                    cli.coordinator_weight_budget_gib, cli.graph_disable_low_mem, (cli.graph_no_prewarm, cli.graph_donor_always))
+                    cli.coordinator_weight_budget_gib, cli.graph_disable_low_mem, (cli.graph_no_prewarm, cli.graph_donor_always, cli.graph_donor_cold_lag))
             },
             Err(error) => error.exit(),
         }
@@ -381,7 +381,8 @@ async fn run() -> Result<()> {
     };
     anyhow::ensure!(!no_prewarm || prewarm_supported,
         "--graph-no-prewarm requires single-GPU V4.1 or GLM Flash; cross-device runtime instantiation can deadlock behind peer waits (#1878)");
-    shared::decode_graph::configure(no_prewarm, initial_graph_policy.1 || family_graph_policy.1);
+    shared::decode_graph::configure(no_prewarm, initial_graph_policy.1 || family_graph_policy.1,
+        initial_graph_policy.2.max(family_graph_policy.2))?;
     if let Some((role, directory)) = shared::memory_report::dump_location(&matches) {
         let host = std::env::var("CUTEAFD_PROFILE_HOST").unwrap_or_else(|_| {
             std::env::var("HOSTNAME").map(|name| format!("container {name}")).unwrap_or_else(|_| "unknown".into())
