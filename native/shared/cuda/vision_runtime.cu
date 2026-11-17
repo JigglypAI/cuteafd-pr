@@ -341,6 +341,15 @@ extern "C" int32_t cuteafd_vision_create(const cuteafd_vision_spec* s, int32_t d
     const cuteafd_media_tags* tags, void** out) {
   return vision_create_impl(s,device,admitted,tags,out,valid_tower);
 }
+// Internal oracle seam: exercises the actual production library, swapping only
+// the descriptor gate. Not a public header ABI or a serving registration route.
+extern "C" int32_t cuteafd_internal_vision_tower_oracle(const cuteafd_vision_spec* spec,
+    int32_t device,uint64_t admitted,const cuteafd_media_tags* tags,void** owner,
+    cuteafd_vision_ledger* ledger) {
+  int rc=vision_required_impl(spec,ledger,valid_generic_tower);
+  if(rc || !owner)return rc;
+  return vision_create_impl(spec,device,admitted,tags,owner,valid_generic_tower);
+}
 extern "C" int32_t cuteafd_vision_upload(void* owner, uint64_t offset, const void* data, uint64_t bytes) {
   if(!owner || !data)return cudaErrorInvalidValue;auto* o=static_cast<Owner*>(owner);
   if(offset>o->spec.weight_bytes || bytes>o->spec.weight_bytes-offset)return cudaErrorInvalidValue;
