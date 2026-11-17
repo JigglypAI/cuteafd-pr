@@ -1132,6 +1132,32 @@ impl MlaDflashConfig {
         Ok(layout)
     }
 
+    /// Additive inventory for fully FP8 body projections, before runtime
+    /// enablement. The actual conversion backing is one bounded load owner.
+    pub fn complete_fp8_weight_layout(&self)
+        -> Result<crate::families::glm5::draft_representation::GlmDraftWeightLayout> {
+        use crate::families::glm5::draft_representation::{draft_weight_role, DraftWeightRole, GlmDraftWeightLayout};
+        if !self.kind.is_dflash() { return Err(unsupported("complete MLA FP8 body requires DFlash2")); }
+        let overflow = || unsupported("complete MLA FP8 body inventory overflow");
+        let mut layout = GlmDraftWeightLayout { bf16_values: 0, fp8_values: 0, fp8_scales: 0,
+            bf16_auxiliary: 0, bf16_codebooks: 0, max_load_staging: crate::shared::dense_read::STEP_BYTES as u64 };
+        for (name, shape) in self.tensor_shapes() {
+            let values = shape.iter().try_fold(1u64, |n, &d| n.checked_mul(d as u64)).ok_or_else(overflow)?;
+            let role = draft_weight_role(&name).ok_or_else(|| unsupported("MLA tensor has no shared precision role"))?;
+            if role == DraftWeightRole::BodyLinear {
+                layout.fp8_values = layout.fp8_values.checked_add(values).ok_or_else(overflow)?;
+                let unit = if name.ends_with(".self_attn.kv_b_proj.weight") { 64 } else { 128 };
+                layout.fp8_scales = layout.fp8_scales.checked_add(values / unit * 4).ok_or_else(overflow)?;
+            } else if name.ends_with("_codebook") {
+                layout.bf16_codebooks = layout.bf16_codebooks.checked_add(values * 2).ok_or_else(overflow)?;
+            } else {
+                layout.bf16_auxiliary = layout.bf16_auxiliary.checked_add(values * 2).ok_or_else(overflow)?;
+            }
+        }
+        layout.loading_peak_bytes().map_err(|_| overflow())?;
+        Ok(layout)
+    }
+
     /// One checked inventory for the shared executor's common buffers and the
     /// native MLA branch. Native work is chunked, not replicated per layer or
     /// scheduler sequence. Only bounded rings and page tables scale with slots;
@@ -2075,6 +2101,45 @@ mod tests {
         assert!(layout.fp8_scratch.as_ref().unwrap().shapes.iter().any(|s| s.n == 65536 && s.k == 7168));
         cfg.mla.hidden = usize::MAX;
         assert!(cfg.runtime_layout(Bf16Only, capacity, 262144, 262144, 188, 0, MlaCacheFormat::Bf16).is_err());
+    }
+
+    #[test]
+    fn complete_mla_fp8_inventory_covers_every_body_projection_once() -> anyhow::Result<()> {
+        use crate::families::glm5::{draft_physical::mla_complete_fp8_arena_requests,
+            draft_representation::{draft_weight_role, DraftWeightRole}};
+        for raw in [config(), causal_config()] {
+            let cfg = MlaDflashConfig::from_json(&raw)?;
+            let requests = mla_complete_fp8_arena_requests(&cfg)?;
+            let arena = crate::serving_capacity::WeightArenaLayout::new("test/complete-draft", requests.clone())?;
+            let count = cfg.complete_fp8_weight_layout()?;
+            assert_eq!(arena.payload_bytes() as u64, count.resident_bytes()?);
+            assert_eq!(count.bf16_values, 0);
+            assert_eq!(count.max_load_staging, crate::shared::dense_read::STEP_BYTES as u64);
+            for (name, _) in cfg.tensor_shapes() {
+                match draft_weight_role(&name).unwrap() {
+                    DraftWeightRole::BodyLinear if name.ends_with(".self_attn.kv_b_proj.weight") => {
+                        assert!(!requests.iter().any(|(id, _)| id == &name));
+                        for part in ["uk", "uv"] {
+                            assert!(arena.view(&format!("{name}.{part}.payload")).is_some());
+                            assert!(arena.view(&format!("{name}.{part}.scales")).is_some());
+                        }
+                    }
+                    DraftWeightRole::BodyLinear => {
+                        assert!(!requests.iter().any(|(id, _)| id == &name));
+                        assert!(requests.iter().any(|(id, _)| id.ends_with(".payload") && id.contains(&name)));
+                    }
+                    _ => {
+                        assert!(arena.view(&name).is_some());
+                        assert!(arena.view(&format!("{name}.payload")).is_none());
+                    }
+                }
+            }
+            if cfg.mla.heads == 96 {
+                assert_eq!((count.fp8_values, count.fp8_scales, count.resident_bytes()?),
+                    (2_700_541_952, 86_358_016, 2_955_438_080));
+            }
+        }
+        Ok(())
     }
 
     #[test]

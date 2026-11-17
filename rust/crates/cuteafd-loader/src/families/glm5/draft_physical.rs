@@ -416,6 +416,49 @@ pub fn mla_arena_requests(cfg: &crate::formats::dflash::MlaDflashConfig,
     Ok(requests.into_inner())
 }
 
+/// Complete MLA body FP8 destinations. This is additive to the historical
+/// representation until its lossless/performance qualification enables it.
+/// Native auxiliary/prediction tensors retain their exact BF16 storage.
+pub fn mla_complete_fp8_arena_requests(cfg: &crate::formats::dflash::MlaDflashConfig)
+    -> Result<Vec<(String, usize)>> {
+    use super::draft_representation::{draft_weight_role, DraftWeightRole};
+    ensure!(cfg.kind.is_dflash(), "complete MLA FP8 body requires DFlash2");
+    let mut requests = Vec::new();
+    let mut qkv = Vec::new();
+    for (name, shape) in cfg.tensor_shapes() {
+        let values = shape.iter().try_fold(1usize, |n, &d| n.checked_mul(d))
+            .context("MLA complete FP8 extent overflow")?;
+        if name.ends_with(".self_attn.q_a_proj.weight") || name.ends_with(".self_attn.kv_a_proj_with_mqa.weight") {
+            qkv.push((name, values));
+            continue;
+        }
+        if name.ends_with(".self_attn.kv_b_proj.weight") {
+            let root = &name;
+            let m = &cfg.mla;
+            for (part, count) in [("uk", m.heads * m.kv_rank * m.nope), ("uv", m.heads * m.value * m.kv_rank)] {
+                requests.extend([(format!("{root}.{part}.payload"), count),
+                    (format!("{root}.{part}.scales"), count / 64 * 4)]);
+            }
+            continue;
+        }
+        match draft_weight_role(&name).with_context(|| format!("MLA tensor {name} has no precision role"))? {
+            DraftWeightRole::BodyLinear => {
+                ensure!(shape.len() == 2 && shape[0] % 16 == 0 && shape[1] % 128 == 0,
+                    "MLA complete FP8 matrix alignment: {name}");
+                requests.extend([(format!("{name}.payload"), values), (format!("{name}.scales"), values / 128 * 4)]);
+            }
+            _ => requests.push((name, (values * 2).max(256))),
+        }
+    }
+    for pair in qkv.chunks_exact(2) {
+        let name = format!("{}+{}", pair[0].0, pair[1].0);
+        let values = pair[0].1.checked_add(pair[1].1).context("MLA joined QKV overflow")?;
+        requests.extend([(format!("{name}.payload"), values), (format!("{name}.scales"), values / 128 * 4)]);
+    }
+    ensure!(qkv.len() == cfg.windows.len() * 2, "MLA joined QKV inventory incomplete");
+    Ok(requests)
+}
+
 /// The same MLA requests, checked against native BF16 checkpoint headers.
 pub fn mla_checkpoint_arena_requests(snapshot: &Path, representation: GlmDraftRepresentation)
     -> Result<Vec<(String, usize)>> {
