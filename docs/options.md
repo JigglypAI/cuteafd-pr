@@ -210,6 +210,17 @@ A launch reads one plain `KEY=VALUE` config file (`cuteafd.config` by default):
 - `CONCURRENCY` unset is a boot-time memory derivation; all C-dependent sizes
   follow it. Set it only to pin a value.
 
+### Kimi Request Reasoning
+
+Kimi thinking-off is simulated with an empty, preclosed native XTML `think`
+channel followed by an open `response` channel. Assistant history likewise keeps
+an empty `think` channel and drops its reasoning text when thinking is disabled.
+The API advertises `supports_thinking_off: true`: generated answer bytes appear
+as content, with no reasoning output. This preserves the trained channel shape;
+it does not use the checkpoint encoder's direct-response-only branch. Explicit
+`thinking: {"type":"disabled"}` and the supported `enable_thinking: false` aliases
+select this form. Thinking-on rendering and effort selection are unchanged.
+
 ### Inkling Request Reasoning
 
 The Inkling chat adapter reads the checkpoint's own `chat_template.jinja` and

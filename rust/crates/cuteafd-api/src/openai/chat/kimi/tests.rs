@@ -6,13 +6,22 @@ fn fixtures() -> Value {
     serde_json::from_str(include_str!("goldens.json")).unwrap()
 }
 
+fn simulated_off_golden(case: &Value) -> String {
+    let prompt = case["prompt"].as_str().unwrap();
+    if case["body"]["enable_thinking"] != false {
+        return prompt.to_owned();
+    }
+    prompt.replace("<|open|>response<|sep|>",
+        "<|open|>think<|sep|><|close|>think<|sep|><|open|>response<|sep|>")
+}
+
 #[test]
 fn prompts_match_official_cpu_encoder() {
     for case in fixtures()["prompts"].as_array().unwrap() {
         let thinking = case["body"]["enable_thinking"].as_bool().unwrap_or(true);
         assert_eq!(
             render(&case["body"], thinking).unwrap(),
-            case["prompt"].as_str().unwrap(),
+            simulated_off_golden(case),
             "{}",
             case["name"]
         );
@@ -25,19 +34,37 @@ fn thinking_disabled_bench_prompt_has_exact_response_prefix_and_greedy_sampling(
     let profile = ModelProfile::new("kimi-fixture", ModelEncoding::Kimi(std::sync::Arc::new(
         KimiEncoding { eos: vec![163586] },
     )));
-    let content = "[f8f52a874c42425f-0000000008] Write a complete Python module that implements a thread-safe LRU cache with per-entry TTL expiry, a background janitor thread, hit/miss statistics and a full pytest test suite. Output only the code.";
-    let body = json!({"model":"kimi-fixture", "messages":[{"role":"user", "content":content}],
-        "thinking":{"type":"disabled"}, "temperature":0, "max_tokens":192});
+    let fixture = fixtures();
+    let case = &fixture["simulated_off"];
+    let mut body = case["body"].clone();
+    body["model"] = json!("kimi-fixture");
     let built = build(&profile, NativeLimits::default(), &Default::default(), body)
         .unwrap_or_else(|error| panic!("{}", error.message));
-    assert_eq!(built.prompt(), format!(
-        "<|open|>message role=\"user\"<|sep|>{content}<|close|>message<|sep|><|end_of_msg|><|open|>message role=\"assistant\"<|sep|><|open|>response<|sep|>"));
+    assert_eq!(built.prompt(), case["prompt"].as_str().unwrap());
+    let expected: Vec<u32> = serde_json::from_value(case["token_ids"].clone()).unwrap();
+    assert_eq!(&expected[expected.len()-9..], &[163587,39964,163589,163588,39964,163589,163587,12092,163589]);
     assert_eq!(built.sampling.temperature(), 0.0);
     assert_eq!(built.sampling.top_p(), 1.0);
     assert_eq!(built.sampling.top_k(), None);
     assert_eq!(built.sampling.min_p(), 0.0);
     assert_eq!(built.stop_token_ids, [163586]);
     assert!(built.constraint.is_none());
+    assert!(profile.encoding.supports_thinking_off());
+}
+
+#[test]
+fn thinking_disabled_history_keeps_empty_structural_think_channels() {
+    let body = json!({"messages":[{"role":"user","content":"Question"},
+        {"role":"assistant","content":"Answer", "reasoning_content":"private", "reasoning":"also private"},
+        {"role":"user","content":"Next"}]});
+    let rendered = render(&body, false).unwrap();
+    let mut oracle = body.clone();
+    oracle["messages"][1]["reasoning_content"] = json!("");
+    oracle["messages"][1]["reasoning"] = json!("");
+    let thinking = render(&oracle, true).unwrap();
+    assert_eq!(rendered, format!("{thinking}{}{}", close("think"), open("response", &[])));
+    assert_eq!(rendered.matches("<|open|>think<|sep|><|close|>think<|sep|>").count(), 2);
+    assert!(!rendered.contains("private"));
 }
 
 /// Reuses the loader's installed TikToken oracle contract; each case also carries
@@ -312,6 +339,9 @@ async fn native_api_streams_official_reasoning_and_calls() {
             let bytes = to_bytes(response.into_body(), 1 << 20).await.unwrap();
             let text = String::from_utf8(bytes.to_vec()).unwrap();
             if streaming {
+                if case["thinking"] == false {
+                    assert!(!text.contains("reasoning_content"), "{text}");
+                }
                 assert!(text.contains("[DONE]"), "{text}");
                 assert!(!text.contains("\"error\""), "{text}");
                 assert!(
@@ -345,6 +375,9 @@ async fn native_api_streams_official_reasoning_and_calls() {
                 }
                 if case["thinking"] == true {
                     assert_eq!(choice["message"]["reasoning_content"], "reason");
+                } else {
+                    assert!(choice["message"]["reasoning_content"].as_str().is_none_or(str::is_empty));
+                    assert_eq!(value["usage"]["completion_tokens_details"]["reasoning_tokens"].as_u64().unwrap_or(0), 0);
                 }
             }
             worker.await.unwrap();
@@ -370,7 +403,7 @@ fn literal_spans_match_official_segments_without_normalizing_json() {
             })
             .unwrap();
         let (prompt, spans) = shield.finish(prompt, false);
-        assert_eq!(prompt, case["prompt"].as_str().unwrap(), "{}", case["name"]);
+        assert_eq!(prompt, simulated_off_golden(case), "{}", case["name"]);
         let expected = case["literal_spans"]
             .as_array()
             .unwrap()
