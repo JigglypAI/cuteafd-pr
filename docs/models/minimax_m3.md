@@ -16,9 +16,9 @@ older image tags. Shared settings are in [MiniMax Serving](../options.md#minimax
 Bundled native DSpark defaults on for one RTX, two-RTX Layers and two-RTX Heads:
 unset/`SPECULATOR=auto` selects `dspark`; `SPECULATOR=off` disables it. Direct
 `cuteafd serve --family minimax_m3` uses the same default, with `--dspark=false`
-as its explicit disable. MiniMax alone uses the shared concurrency-aware draft
-policy by default; explicit `DRAFT_POLICY` values still win, and `DRAFT_LENGTH`
-keeps its fixed-length override. Other families are unchanged (#2220).
+as its explicit disable. Unset `DRAFT_POLICY` resolves to `simple`, the same
+policy as every other family; `DRAFT_POLICY=shared` remains an explicit opt-in,
+and `DRAFT_LENGTH` keeps its fixed-length override (#2220).
 The example's explicit `SPECULATOR=off` stays in force until its separate line
 change joins the next placement-input publication batch; remove that line or set
 `dspark` to use the family default now. Keep `VISION=off` and `AUDIO=off`;
