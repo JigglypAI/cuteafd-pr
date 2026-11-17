@@ -14,7 +14,8 @@ def geometry(kind):
 def names(kind):
     g=geometry(kind);h,a,i,o=g["hidden"],g["attention"],g["intermediate"],g["output"]
     suffix="raster_t1" if kind=="kimi" else "group_t2"
-    result=[f"dynamic_attention_h{g['heads']}_d{g['dim']}",f"patches_{suffix}",f"tables_{suffix}",f"rotary_{suffix}",
+    rotary="vendor_rotary_raster_t1" if kind=="kimi" else "rotary_group_t2"
+    result=[f"dynamic_attention_h{g['heads']}_d{g['dim']}",f"patches_{suffix}",f"tables_{suffix}",rotary,
             f"residual_h{h}"]
     if kind=="kimi":
         result += ["tower_rms_norm_h1024","tower_rms_norm_h7168","position_h1024","group_h1024"]
@@ -45,6 +46,7 @@ def builders(kind):
     from b12x.integration.cuteafd.vision_still import compile_still_patches_aot,compile_spatial_group_aot
     from b12x.integration.cuteafd.vision_rotary_tables import compile_vision_rotary_tables_aot
     from b12x.integration.cuteafd.vision_rotary import compile_vision_qkv_rotary_aot
+    from b12x.integration.cuteafd.vision_vendor_rotary import compile_vendor_vision_qkv_rotary_aot
     from b12x.integration.cuteafd.vision_tower import compile_bilinear_position_aot
     from b12x.integration.cuteafd.vision_gelu import compile_tanh_gelu_aot
     from b12x.integration.cuteafd.vision_rms import VectorizedRms
@@ -80,7 +82,9 @@ def builders(kind):
     result={f"dynamic_attention_h{g['heads']}_d{g['dim']}":lambda:compile_dynamic_vision_attention_aot(heads=g["heads"],dim=g["dim"]),
         f"patches_{suffix}":lambda:compile_still_patches_aot(temporal=g["temporal"],group_major=g["group_major"]),
         f"tables_{suffix}":lambda:compile_vision_rotary_tables_aot(axes=axes,adjacent=kind=="kimi",group_major=g["group_major"]),
-        f"rotary_{suffix}":lambda:compile_vision_qkv_rotary_aot(heads=g["heads"],dim=g["dim"],rotated=sum(axes),adjacent=kind=="kimi"),
+        ("vendor_rotary_raster_t1" if kind=="kimi" else "rotary_group_t2"):
+            (lambda:compile_vendor_vision_qkv_rotary_aot(heads=g["heads"],dim=g["dim"])) if kind=="kimi" else
+            (lambda:compile_vision_qkv_rotary_aot(heads=g["heads"],dim=g["dim"],rotated=sum(axes),adjacent=False)),
         f"residual_h{h}":lambda:media.compile_bf16_residual_add_aot(width=h)}
     if kind=="kimi":
         result.update({"tower_rms_norm_h1024":lambda:rms(1024),"tower_rms_norm_h7168":lambda:rms(7168),
