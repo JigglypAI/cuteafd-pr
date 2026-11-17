@@ -4,8 +4,8 @@ use anyhow::{ensure, Context};
 use cuteafd_ffi::vision::{TowerExtension, TowerNorm, TowerProjector};
 use cuteafd_loader::families::minimax_m3::vision::{VisionContract, MAX_IMAGE_TOKENS};
 
-// Pinned SGLang CPU-default FP32 arange/pow/reciprocal, Torch 2.14.1+cpu.
-// Preserve these bytes rather than substituting host f64 pow and a final cast.
+// Provisional CPU capture only: vendor construction uses a CUDA default device.
+// Replace from both-architecture real-module buffers before enabling dispatch.
 const INV_FREQ_BITS: [u32; 13] = [
     0x3f800000, 0x3efc1a50, 0x3e7843d0, 0x3df47c46, 0x3d70c376, 0x3ced1928, 0x3c697d22, 0x3be5ef2c,
     0x3b626f12, 0x3adefc9d, 0x3a5b9797, 0x39d83fcc, 0x3954f507,
@@ -31,11 +31,21 @@ impl TowerSpec {
                 .get(&tensor.metadata.name)
                 .context("MiniMax tower catalog changed")?;
             offsets.insert(metadata.name.clone(), tensor.destination);
-            let transform = if metadata.dtype == DType::F32 {
-                ReadTransform::F32ToBf16
-            } else {
-                ReadTransform::Direct
-            };
+            // Only CLIPVisionEmbeddings.forward casts this FP32 checkpoint tensor.
+            let transform =
+                if metadata.name == "vision_tower.vision_model.embeddings.patch_embedding.weight" {
+                    ensure!(
+                        metadata.dtype == DType::F32,
+                        "MiniMax patch source must be FP32"
+                    );
+                    ReadTransform::F32ToBf16
+                } else {
+                    ensure!(
+                        metadata.dtype == DType::Bf16,
+                        "MiniMax non-patch source must be BF16"
+                    );
+                    ReadTransform::Direct
+                };
             ensure!(
                 transform.resident_bytes(metadata)? as u64 == tensor.resident_bytes,
                 "MiniMax tower resident extent mismatch"
@@ -225,6 +235,37 @@ mod tests {
         assert_eq!(spec.reads.len(), 523);
         assert_eq!(spec.native.depth, 32);
         assert_eq!(spec.native.weight_bytes, 1_731_134_516);
+        assert_eq!(spec.constants.len(), 1);
+        assert_eq!(spec.constants[0].name, "rotary.thw.inv_freq");
+        assert_eq!(spec.constants[0].offset + 52, spec.native.weight_bytes);
+        assert_eq!(
+            spec.reads
+                .iter()
+                .filter(|r| r.metadata.dtype == DType::F32)
+                .count(),
+            1
+        );
+        assert_eq!(
+            spec.reads
+                .iter()
+                .filter(|r| r.metadata.name.starts_with("vision_tower."))
+                .count(),
+            515
+        );
+        assert_eq!(
+            spec.reads
+                .iter()
+                .filter(|r| r.metadata.name.starts_with("multi_modal_projector."))
+                .count(),
+            4
+        );
+        assert_eq!(
+            spec.reads
+                .iter()
+                .filter(|r| r.metadata.name.starts_with("patch_merge_mlp."))
+                .count(),
+            4
+        );
         let extension = spec.native.tower.as_ref().unwrap();
         assert_eq!(extension.rotary_axis_dims, [26; 3]);
         assert_eq!(extension.passthrough_dims, 2);
