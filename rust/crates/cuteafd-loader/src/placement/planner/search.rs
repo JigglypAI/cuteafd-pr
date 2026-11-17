@@ -862,6 +862,9 @@ pub fn solve_prepared(
     recipe: &impl Recipe,
     pool: &crate::placement::PoolPolicy,
 ) -> Result<ResolvedPlan, Refusal> {
+    if matches!(request.pool, Pin::Exact(0)) {
+        return Err(Refusal::PoolBelowContext { tokens: 0, context: request.context.required() });
+    }
     let requested = match request.pool { Pin::Auto => None, Pin::Exact(tokens) => Some(tokens) };
     if pool.context() != request.context || requested != pool.raw_requested() && requested != pool.requested() {
         return Err(Refusal::InvalidFact("prepared pool differs from placement request".into()));

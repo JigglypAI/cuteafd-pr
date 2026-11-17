@@ -1072,10 +1072,11 @@ fn pool_max_grows_after_onboarding_in_every_family_planner() {
     layout.pool_tokens = None;
     layout.onboard = Some(crate::placement::OnboardSetting::Auto);
     layout.workspace_manifest = Some(manifest);
-    let package = dir.path().join("fp8/fp8-minimax-mxfp8");
-    std::fs::create_dir_all(&package).unwrap();
-    let native = json!({"abi_version":6,"projection":"bf16","activation":"silu_bf16_product",
-        "swiglu_limit":0.0,"swiglu_alpha":1.0,"swiglu_beta":0.0,"weights":"mxfp8",
+    let package = dir.path().join("fp8/fp8-minimax-nvfp4a4");
+    std::fs::create_dir_all(package.join("tp1")).unwrap();
+    std::fs::create_dir_all(package.join("tp2")).unwrap();
+    let native = json!({"abi_version":6,"projection":"bf16","activation":"swigluoai",
+        "swiglu_limit":7.0,"swiglu_alpha":1.702,"swiglu_beta":1.0,"weights":"nvfp4a4",
         "capacities":[{"capacity":4096,"scratch_bytes":4096}]});
     std::fs::write(package.join("manifest.json"), json!({"layouts":{"tp1":native,"tp2":native}}).to_string()).unwrap();
     let input = BudgetedPlanInput::open(dir.path()).unwrap();
