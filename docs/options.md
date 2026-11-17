@@ -715,6 +715,15 @@ Each key is also a global `cuteafd` flag (`--gpu-memory-cap`, `--kv-max-tokens`,
 | `MEDIA_FEATURES_DIR`, `AUDIO_FEATURES_DIR` | unset | absolute dir | Encoder feature caches. |
 | `CHAT_TEMPLATE_FROM` | checkpoint | snapshot dir | GLM Flash template source when the checkpoint's template cannot mark images. |
 
+The direct daemon's `--max-image-tokens` accepts an explicit 1-16384 per-image
+LM span cap. Omission uses the processor's default span, limited by its
+architectural ceiling: existing families default to 4096 (Qwen capped at 1024,
+Mistral at its checkpoint span), MiniMax to 576, and Kimi to 16698. An explicit
+cap can only lower a declared ceiling; it never changes vendor resize geometry
+or silently truncates feature rows. Kimi's full default is intentionally above
+the CLI's largest explicit value. These registration limits do not qualify an
+otherwise inactive tower for serving. `detail=low` remains capped at 256.
+
 Kimi K3.1 (`kimi_k31`) uses the shared Kimi engine. MC `original` (BF16),
 MC `k6-compact` and standalone native Core-K6 are launchable with real Spark
 experts after accepted full-model fidelity and partial paired scoring proof
@@ -1101,7 +1110,7 @@ original core is already FP8, not an MC publication.
 | `SPECULATOR_DEPTH` | ✗ | ✗ | ✗ | ✗ | ✓ | ✓ | ✓ | ✗ | ✓ | ✗ | ✗ |
 | `DRAFT_LENGTH` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | `SPECULATOR_FP8` | ✗ | ✗ | ✓ | ✓ | ✓ | ✓ | ✗ | ✓ | ✗ | ✗ | ✗ |
-| `DRAFT_POLICY` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ |
+| `DRAFT_POLICY` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✓ | ✗ | ✗ | ✗ |
 | `DRAFT_ROW_COST` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ |
 | `DRAFT_SURVIVAL_LENGTHS` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ |
 | `DRAFT_CONTEXT_SLOTS` | ✗ | ✗ | ✓ | ✓ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |

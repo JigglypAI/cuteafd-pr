@@ -309,7 +309,7 @@ pub(crate) mod tests {
         let vision = TowerSpec { native: cuteafd_ffi::vision::VisionSpec {
             abi_version: 2, head_dim: 8, inv_freq: 512, weight_bytes: 520, ..Default::default()
         }, reads, constants:vec![super::super::ConstantRegion::fp32("rotary.inv_freq",512,
-            [1.0,0.01],"two FP32 constants","fixture")] };
+            [1.0,0.01],"two FP32 constants","fixture")], family: None };
         seed_payloads(vision.reads.iter().map(|read| (read.path.as_path(), &read.metadata)));
         let constants = &vision.constants[0].bytes;
         assert_replayed_arena(root.path(), &vision.load_weights()?,

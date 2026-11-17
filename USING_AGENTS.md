@@ -121,7 +121,10 @@ Same build, two configurations: `--arm-wip` both arms to one sealed WIP
 instance and `--arm-set ARM:CARD:KEY=VALUE`. `--set CARD:PROFILE=...` turns
 on profiling everywhere, `--preflight-only` checks without queuing, and
 `--resume` reruns only failed jobs. Do not copy an RC driver or take outer serving
-locks: `cuteafd bench smoke` takes its own locks. CPU builds/tests run at
+locks: `cuteafd bench smoke` takes its own locks. The set follows the resolved
+layout; `wip-cards --print-locks` and `cuteafd bench smoke --print-locks` print
+it without running, and a wip-cards or smoke run nested in an `hwlock` hold that
+does not cover the whole set fails immediately instead of queueing. CPU builds/tests run at
 nice 19 with 16 jobs (`CARGO_BUILD_JOBS=16`, `RUST_TEST_THREADS=16`).
 
 **A/B rules learned in v3 (2026-10-10):**

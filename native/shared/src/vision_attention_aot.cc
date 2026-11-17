@@ -129,6 +129,17 @@ extern "C" int32_t cuteafd_vision_attention_launch(void* opaque,void* q,void* k,
   uint64_t scalars[]={bits,static_cast<uint32_t>(owner->l2_bytes)};
   return launch(owner,program,pointers,scalars,stream);
 }
+extern "C" int32_t cuteafd_vision_dynamic_attention_launch(void* opaque,void* q,void* k,void* v,
+    void* out,void* lse,void* cu,int32_t rows,float scale,void* stream) {
+  if(!opaque)return cudaErrorInitializationError;
+  if(rows<=0)return cudaErrorInvalidValue;
+  auto* owner=static_cast<Attention*>(opaque);auto& program=owner->entry->programs.front();
+  if(program.pointers!=6 || std::strcmp(program.scalars,"ifi"))return cudaErrorInvalidValue;
+  void* pointers[]={q,k,v,out,lse,cu};
+  uint32_t bits;std::memcpy(&bits,&scale,4);
+  uint64_t scalars[]={static_cast<uint32_t>(rows),bits,static_cast<uint32_t>(owner->l2_bytes)};
+  return launch(owner,program,pointers,scalars,stream);
+}
 extern "C" int32_t cuteafd_vision_pointwise_launch(void* opaque,const char* name,void* const* pointers,
     const uint64_t* scalars,void* stream) {
   if(!opaque)return cudaErrorInitializationError;

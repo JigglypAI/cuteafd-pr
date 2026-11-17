@@ -220,6 +220,39 @@ def run(cmd, **kwargs):
     return subprocess.run(cmd, check=True, text=True, capture_output=True, timeout=timeout, **kwargs)
 
 
+def card_layout(card, overrides=None):
+    """(coordinator GPUs, Spark hosts) a card launches on: its resolved layout.
+
+    The single source every lock derivation follows (#2364): COORDINATOR_GPUS
+    (defaulting to the card's gpus) and the first SPARK_COUNT ranks' hosts
+    (defaulting to the card's sparks). `overrides` are arm config values,
+    applied on top exactly as generate() does.
+    """
+    values = card.get('resolved_values')
+    if values is None:
+        values = {**config(card['config']), **card.get('set', {})}
+    if overrides:
+        values = {**values, **overrides}
+    try:
+        gpus = [int(x) for x in str(values.get('COORDINATOR_GPUS', '')).split(',') if x]
+    except ValueError:
+        raise ValueError('invalid coordinator GPUs') from None
+    gpus = gpus or list(card.get('gpus', [0]))
+    if not 1 <= len(gpus) <= 2 or len(set(gpus)) != len(gpus) or not set(gpus) <= {0, 1}:
+        raise ValueError('invalid coordinator GPUs')
+    hosts = list(card.get('sparks', []))
+    try:
+        count = int(values.get('SPARK_COUNT', len(hosts)))
+    except ValueError:
+        raise ValueError('invalid Spark count') from None
+    if not 0 <= count <= len(HOSTS):
+        raise ValueError('invalid Spark count')
+    hosts = [values.get(f'SPARK_{i}_HOST', hosts[i] if i < len(hosts) else HOSTS[i]) for i in range(count)]
+    if len(set(hosts)) != count or not set(hosts) <= set(HOSTS):
+        raise ValueError('invalid Spark inventory')
+    return gpus, hosts
+
+
 def arms_from(values, releases=()):
     arms = {}
     for value in values:
@@ -344,6 +377,7 @@ def generate(entry, arm_name, arm, state, key_file, overrides, probes, expected_
     entry = json.loads(json.dumps(entry))
     requested_panels(entry.get('profile', 'smoke'), binary=binary)
     entry['fabric'] = 'fabric' in probes
+    gpus, hosts = card_layout(entry, overrides)
     values = entry.pop('resolved_values', None)
     if values is None:
         values = config(entry['config'])
@@ -364,18 +398,8 @@ def generate(entry, arm_name, arm, state, key_file, overrides, probes, expected_
     if 'CUTEAFD_API_KEY' in values:
         raise ValueError('inline API keys are forbidden')
     # The sanitized base also removes publication-only keys from original configs.
-    # The card's GPUs, primary first, unless its config or --set names them.
-    gpus = [int(x) for x in values.get('COORDINATOR_GPUS', '').split(',') if x] or list(entry.get('gpus', [0]))
-    if not 1 <= len(gpus) <= 2 or len(set(gpus)) != len(gpus) or not set(gpus) <= {0, 1}:
-        raise ValueError('invalid coordinator GPUs')
-    hosts = list(entry.get('sparks', []))
     values.pop('SPARK_HOSTS', None)
-    count = int(values.get('SPARK_COUNT', len(hosts)))
-    if not 0 <= count <= len(HOSTS):
-        raise ValueError('invalid Spark count')
-    hosts = [values.get(f'SPARK_{i}_HOST', hosts[i] if i < len(hosts) else HOSTS[i]) for i in range(count)]
-    if len(set(hosts)) != count or not set(hosts) <= set(HOSTS):
-        raise ValueError('invalid Spark inventory')
+    count = len(hosts)
     for key in list(values):
         if re.fullmatch(r'SPARK_[0-7]_(HOST|LANE_A|LANE_B)', key):
             del values[key]
@@ -564,23 +588,34 @@ def smoke_groups(jobs, parallel):
     return [[job] for job in jobs]
 
 
-def serving_locks(jobs):
-    """Match smoke.rs locks_for, including its V4.1 exclusive default."""
+def layout_locks(layouts):
+    """The locks a serving turn needs, from resolved (GPUs, Spark hosts) layouts.
+
+    Mirrors smoke.rs locks_for: every coordinator GPU the layout resolves to,
+    `sparks` only when a pool host (ostrich/dodo/emu/kiwi) is attached, and
+    rhea/moa only when those out-of-pool hosts are used (they have their own
+    locks). `exclusive` is a scheduling rule inside one smoke run (V4.1 runs
+    alone), not a claim on both GPUs: it never widens this set (#2364). GPU0
+    no longer implies `sparks`; card_layout resolves SPARK_COUNT and the hosts
+    explicitly, so a zero-Spark layout takes no pool lock.
+    """
     names = set()
-    for job in jobs:
-        entry = job['entry']
-        gpus = entry.get('gpus', [0])
-        hosts = entry.get('sparks', [])
-        exclusive = entry.get('exclusive')
-        if exclusive is None:
-            exclusive = entry.get('family') == 'deepseek_v41'
-        if 0 in gpus or set(hosts) & set(HOSTS[:4]) or exclusive:
+    for gpus, hosts in layouts:
+        if set(hosts) & set(HOSTS[:4]):
             names.add('sparks')
-        for gpu in (0, 1):
-            if gpu in gpus or exclusive:
-                names.add(f'gpu{gpu}')
+        names.update(f'gpu{gpu}' for gpu in gpus)
         names.update(set(hosts) & {'rhea', 'moa'})
     return hwlock.canonical(names)
+
+
+def serving_locks(jobs):
+    """The serving turn's lock set; mirror of smoke.rs locks_for (parity test)."""
+    layouts = []
+    for job in jobs:
+        entry = job['entry']
+        gpus = entry.get('gpus')
+        layouts.append(([0] if gpus is None else gpus, entry.get('sparks') or []))
+    return layout_locks(layouts)
 
 
 @contextlib.contextmanager
@@ -590,9 +625,21 @@ def serving_turn(jobs, env, wait):
     The caller drains detached smokes before leaving, even on a stop signal:
     60 s smoke teardown, 75 s here, 80 s outer hwlock if used, 90 s systemd.
     Never put a build or export inside this scope.
+
+    Under an enclosing hwlock hold (`CUTEAFD_HW_LOCKS_HELD`), the turn's set
+    must already be covered: an inner ticket for a lock the outer hold does not
+    cover queues behind tickets waiting on the outer hold itself and cannot be
+    granted (#2364). Fail at once instead.
     """
     parent = hwlock.canonical(filter(None, env.get('CUTEAFD_HW_LOCKS_HELD', '').split(',')))
     locks = serving_locks(jobs)
+    if parent:
+        missing = [name for name in locks if name not in parent]
+        if missing:
+            raise ValueError(
+                f'serving turn needs {",".join(locks)}, but the enclosing hwlock holds {",".join(parent)}: '
+                f'an inner ticket for {",".join(missing)} cannot be granted while the outer hold waits. '
+                f'Rerun under: hwlock.py --locks {",".join(locks)}')
     wanted = [name for name in locks if name not in parent]
     with contextlib.ExitStack() as stack:
         if wanted:
@@ -2947,6 +2994,8 @@ def main():
                         'build-only hosts whose slots reach the serving Sparks through sparknest; a named seed is a placement request')
     parser.add_argument('--cleanup', action='store_true')
     parser.add_argument('--dry-run', action='store_true')
+    parser.add_argument('--print-locks', action='store_true',
+                        help='print the serving turn lock set this run would take and exit, without building or running')
     parser.add_argument('--observe', type=Path, help=argparse.SUPPRESS)
     parser.add_argument('--precheck', type=Path, help=argparse.SUPPRESS)
     parser.add_argument('--preflight-job', type=Path, help=argparse.SUPPRESS)
@@ -3167,6 +3216,19 @@ def main():
         if not 0 <= count <= len(HOSTS):
             raise ValueError('invalid Spark count')
         card['sparks'] = [values.get(f'SPARK_{i}_HOST', card.get('sparks', [])[i] if i < len(card.get('sparks', [])) else HOSTS[i]) for i in range(count)]
+    bindings = dict(item.split('=', 1) for item in args.card_arm)
+    if bindings and (args.interleave or set(bindings) - set(args.cards) or set(bindings.values()) - set(arms)):
+        raise ValueError('--card-arm needs selected cards/arms in matrix mode')
+    if args.print_locks:
+        layouts = []
+        for name in arms:
+            for card in cards:
+                if card['name'] in bindings and bindings[card['name']] != name:
+                    continue
+                layouts.append(card_layout(resolved_card(card, {**arm_overrides.get(name, {}).get(card['name'], {}),
+                    **arm_config.get(name, {})}, arm_unsets.get(name, set()))))
+        print(','.join(layout_locks(layouts)))
+        return 0
     # Build and stage every arm's layout, even when only one arm requests it.
     build_cards = []
     for name in arms:
@@ -3194,9 +3256,6 @@ def main():
             key.write(secrets.token_hex(32) + '\n')
     if key_file.is_symlink() or key_file.stat().st_mode & 0o077:
         raise ValueError('API key file must be private (0600), not a symlink')
-    bindings = dict(item.split('=', 1) for item in args.card_arm)
-    if bindings and (args.interleave or set(bindings) - set(args.cards) or set(bindings.values()) - set(arms)):
-        raise ValueError('--card-arm needs selected cards/arms in matrix mode')
     jobs = [generate(resolved_card(card, {**arm_overrides.get(name, {}).get(card['name'], {}), **arm_config.get(name, {})}, arm_unsets.get(name, set())), name, arm, state, key_file, {}, probes[card['name']] | arm_probes.get(name, {}).get(card['name'], set()), expected[card['name']], repeat, args.trace, shlex.split(args.exact_state) if args.exact_state else None, [h for h in (args.cold_window or '').split(',') if h] or None, binary=panel_binary(args.binary, arms)) for card, name, arm, repeat in schedule(cards, arms, args.repeats if args.interleave else 1, args.interleave) if card['name'] not in bindings or bindings[card['name']] == name]
     variants = {(c['name'], n): resolved_card(c, {**arm_overrides.get(n, {}).get(c['name'], {}),
         **arm_config.get(n, {})}, arm_unsets.get(n, set())) for c in cards for n in arms}

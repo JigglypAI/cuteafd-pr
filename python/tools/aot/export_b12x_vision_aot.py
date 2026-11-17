@@ -53,10 +53,12 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output-dir", type=Path)
     parser.add_argument("--capability", type=int, choices=(120, 121))
-    parser.add_argument("--group", choices=("legacy", "pointwise", "attention", "transformer", "perception"), default="legacy")
+    parser.add_argument("--group", choices=("legacy", "pointwise", "attention", "transformer", "perception", "tower"), default="legacy")
     parser.add_argument("--list-transformer-programs", action="store_true")
     parser.add_argument("--perception", choices=("inkling2","step5"))
     parser.add_argument("--list-perception-programs", action="store_true")
+    parser.add_argument("--tower", choices=("kimi","minimax"))
+    parser.add_argument("--list-tower-programs", action="store_true")
     parser.add_argument("--head-dim", type=int, default=96)
     parser.add_argument("--hidden", type=int, default=1536)
     parser.add_argument("--bf16-products", action="store_true")
@@ -72,6 +74,11 @@ def main():
     if args.list_perception_programs:
         if args.perception is None:parser.error("--list-perception-programs needs --perception")
         print(";".join(perception_names(args.perception)))
+        return
+    if args.list_tower_programs:
+        if args.tower is None:parser.error("--list-tower-programs needs --tower")
+        from vision_tower_programs import names
+        print(";".join(names(args.tower)))
         return
     if args.output_dir is None or args.capability is None:
         parser.error("--output-dir and --capability are required for export")
@@ -122,7 +129,11 @@ def main():
     destination = args.output_dir
     destination.mkdir(parents=True, exist_ok=True)
     if args.group != "legacy":
-        if args.group == "perception":
+        if args.group == "tower":
+            if args.tower is None:parser.error("--group tower needs --tower")
+            from vision_tower_programs import builders as tower_builders
+            declarations = tower_builders(args.tower)
+        elif args.group == "perception":
             if args.perception is None:parser.error("--group perception needs --perception")
             declarations = perception_builders(args.perception)
         else:

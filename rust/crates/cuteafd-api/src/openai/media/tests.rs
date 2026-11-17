@@ -313,3 +313,108 @@ async fn generic_route_prepares_history_and_reports_image_usage() {
         worker.await.unwrap();
     }
 }
+
+#[test]
+fn step_local_global_prepare_expands_prompt_end_to_end() {
+    use cuteafd_loader::media::{ImagePromptLayout, PreparedImageGroup};
+    let preparer=MediaPreparer::new(ProcessorConfig::for_family(ImageFamily::Step5),EncoderId([3;32]),ImageUrlFetch::Off,1).unwrap();
+    let source=MediaSource {url:format!("data:image/png;base64,{}",STANDARD.encode(include_bytes!("../fixtures/step5-group.png"))),low:false};
+    let layout=ImagePromptLayout::LocalGlobal {placeholder:7,local_start:10,local_end:11,newline:12,global_start:13,global_end:14};
+    let mut groups=preparer.prepare_groups(&[source]).unwrap();
+    assert!(groups[0].fragments.is_empty());
+    assert!(PreparedImageGroup::expand_prompt(&[1,7,2],7,&groups,32,1024).is_err());
+    preparer.config().assemble_group_prompt(&mut groups[0],&layout).unwrap();
+    let expanded=PreparedImageGroup::expand_prompt(&[1,7,2],7,&groups,32,1024).unwrap();
+    assert_eq!(groups.len(),1);let group=&groups[0];
+    assert_eq!(group.source,[896,812]);assert_eq!(group.images.len(),5);
+    assert_eq!(group.feature_rows().unwrap(),493);
+    assert_eq!(expanded.media.iter().map(|span|(span.start,span.len)).collect::<Vec<_>>(),vec![(2,81),(85,81),(169,81),(252,81),(335,169)]);
+    assert_eq!(expanded.tokens.len(),506);
+    assert_eq!(&expanded.tokens[166..169],&[11,12,10]);
+    assert_eq!(&expanded.tokens[333..335],&[11,13]);
+    assert_eq!(expanded.tokens[504],14);
+    assert_eq!(expanded.media.iter().map(|span|span.key).collect::<Vec<_>>(),group.keys_in_prompt_order().map(Into::into).collect::<Vec<_>>());
+    assert!(PreparedImageGroup::expand_prompt(&[1,7,2],7,&groups,32,505).is_err());
+    assert!(PreparedImageGroup::expand_prompt(&[1,2],7,&groups,32,1024).is_err());
+    let bad=ImagePromptLayout::LocalGlobal {placeholder:7,local_start:32,local_end:11,newline:12,global_start:13,global_end:14};
+    preparer.config().assemble_group_prompt(&mut groups[0],&bad).unwrap();
+    assert!(PreparedImageGroup::expand_prompt(&[1,7,2],7,&groups,32,1024).is_err());
+}
+
+#[test]
+fn inkling_prepare_assemble_expand_preserves_original_source_and_padding() {
+    use cuteafd_loader::media::{ImagePromptLayout, PreparedImageGroup};
+    let preparer = MediaPreparer::new(
+        ProcessorConfig::for_family(ImageFamily::Inkling2), EncoderId([4;32]), ImageUrlFetch::Off, 1,
+    ).unwrap();
+    let source = MediaSource {
+        url: format!("data:image/png;base64,{}", STANDARD.encode(include_bytes!("../fixtures/step5-group.png"))),
+        low: false,
+    };
+    let mut groups = preparer.prepare_groups(&[source]).unwrap();
+    let group = &mut groups[0];
+    assert!(group.fragments.is_empty());
+    assert_eq!(group.source, [896,812]);
+    assert_eq!(group.images.len(), 1);
+    assert_eq!(group.images[0].pixels.canvas, [920,840]);
+    assert_eq!(group.images[0].pixels.content, [0,0,896,812]);
+    assert_eq!(group.feature_rows().unwrap(), 483);
+    let key = group.images[0].key;
+    let layout = ImagePromptLayout::Single { placeholder:7 };
+    preparer.config().assemble_group_prompt(group, &layout).unwrap();
+    let expanded = PreparedImageGroup::expand_prompt(&[1,7,2], 7, &groups, 32, 485).unwrap();
+    assert_eq!(expanded.tokens.len(), 485);
+    assert_eq!(expanded.media.len(), 1);
+    assert_eq!((expanded.media[0].start, expanded.media[0].len), (1,483));
+    assert_eq!(expanded.media[0].key, key.into());
+    assert!(PreparedImageGroup::expand_prompt(&[1,7,2], 7, &groups, 32, 484).is_err());
+}
+
+#[test]
+fn kimi_shaped_fragments_can_tokenize_source_dimensions_after_preparation() {
+    use cuteafd_loader::media::{ImageFragment, PreparedImageGroup};
+    // Exercise the shared contract, not Kimi's processor: dimension tokens must
+    // be assembled from prepared sources and grids, not fixed layout constants.
+    let preparer = MediaPreparer::new(
+        ProcessorConfig::for_family(ImageFamily::Step5), EncoderId([5;32]), ImageUrlFetch::Off, 1,
+    ).unwrap();
+    let large = MediaSource {
+        url: format!("data:image/png;base64,{}", STANDARD.encode(include_bytes!("../fixtures/step5-group.png"))),
+        low: false,
+    };
+    let mut groups = preparer.prepare_groups(&[source(), large]).unwrap();
+    for group in &mut groups {
+        assert!(group.fragments.is_empty());
+        for (index, image) in group.images.iter().enumerate() {
+            // Stand-in native tokenizer ids for width,height and per-view grids.
+            group.fragments.push(ImageFragment::Tokens(vec![
+                10, group.source[0], group.source[1], image.grid.w, image.grid.h,
+            ]));
+            group.fragments.push(ImageFragment::Features { image:index, placeholder:7 });
+            group.fragments.push(ImageFragment::Tokens(vec![11]));
+        }
+    }
+    let expanded = PreparedImageGroup::expand_prompt(&[1,7,2,7,3], 7, &groups, 1024, 4096).unwrap();
+    assert_eq!(expanded.media.len(), 6);
+    for (span, (group, image)) in expanded.media.iter().zip(groups.iter().flat_map(|group|
+        group.images.iter().map(move |image| (group,image)))) {
+        assert_eq!(&expanded.tokens[span.start-5..span.start],
+            &[10,group.source[0],group.source[1],image.grid.w,image.grid.h]);
+        assert_eq!(expanded.tokens[span.start+span.len], 11);
+        assert_eq!(span.key, image.key.into());
+    }
+    assert_ne!(groups[0].source, groups[1].source);
+    assert!(PreparedImageGroup::expand_prompt(&[1,7,2,7,3], 7, &groups, 896, 4096).is_err());
+}
+
+#[test]
+fn grouped_prepare_preserves_request_decode_and_byte_bounds() {
+    let mut preparer = preparer();
+    assert!(preparer.prepare_groups(&vec![source();129]).is_err());
+    preparer.limits.decode_misses = 1;
+    assert!(preparer.prepare_groups(&[source(),source()]).is_err());
+    preparer.limits.decoded_bytes = 1;
+    assert!(preparer.prepare_groups(&[source()]).is_err());
+    preparer.limits.decoded_bytes = 64 << 20;
+    assert_eq!(preparer.prepare_groups(&[source()]).unwrap().len(), 1);
+}

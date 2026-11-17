@@ -148,7 +148,8 @@ pub(crate) fn tower(snapshot: &Path, max_output_rows: usize) -> Result<TowerSpec
         native.q_norm[layer] = NONE;
         native.k_norm[layer] = NONE;
     }
-    TowerSpec::from_parts_with_constants(native, reads, vec![constant]).map_err(Into::into)
+    TowerSpec::from_parts_with_constants(native, reads, vec![constant])
+        .map(|spec| spec.with_family(cuteafd_loader::media::ImageFamily::Kimi)).map_err(Into::into)
 }
 
 #[cfg(test)]
@@ -199,13 +200,29 @@ mod tests {
         let spec = tower(dir.path(), MAX_IMAGE_TOKENS as usize)?;
         assert_eq!(spec.native.weight_bytes, 894_718_080);
         assert_eq!(spec.native.blocks.len(), 27);
+        assert_eq!(spec.image_family(),cuteafd_loader::media::ImageFamily::Kimi);
+        let mut changed_geometry=spec.clone();
+        changed_geometry.native.tower.as_mut().unwrap().temporal_patch=2;
+        assert_eq!(changed_geometry.image_family(),cuteafd_loader::media::ImageFamily::Kimi);
         let extension = spec.native.tower.as_ref().unwrap();
         assert_eq!(extension.inv_freq[1], extension.inv_freq[2]);
         assert_eq!(extension.attention_width, 1536);
         assert_eq!(extension.final_norm.epsilon, TOWER_RMS_EPS);
         assert_eq!(spec.constant_regions().len(), 1);
+        assert_eq!(spec.constant_regions()[0].name, "rotary.spatial.inv_freq");
         assert_eq!(spec.constant_regions()[0].bytes.len(), 128);
         extension.validate(&spec.native)?;
+        crate::shared::vision::push::tests::assert_vision_plan(dir.path(), &spec);
+        assert!(spec.staged_rects().is_empty());
+        assert_eq!(spec.constant_regions()[0].offset + 128, spec.native.weight_bytes);
+        let mut k31 = cfg.clone();
+        k31["model_type"] = "kimi_k31".into();
+        std::fs::write(dir.path().join("config.json"), serde_json::to_vec(&k31)?)?;
+        let sibling = tower(dir.path(), MAX_IMAGE_TOKENS as usize)?;
+        assert_eq!(sibling.native.weight_bytes, spec.native.weight_bytes);
+        assert_eq!(sibling.native.blocks, spec.native.blocks);
+        assert_eq!(sibling.native.tower, spec.native.tower);
+        assert_eq!(sibling.constant_regions(), spec.constant_regions());
         Ok(())
     }
     #[test]

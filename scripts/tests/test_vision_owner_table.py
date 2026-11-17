@@ -46,6 +46,10 @@ def test_registry_validates_and_binds_both_export_abis(tmp_path):
     assert '_mlir_cuteafd_vision_attention_d64_entry, 8, "fi"' in text
     assert '_mlir_cuteafd_vision_attention_d96_full_entry, 6, "fi"' in text
     assert '_mlir_cuteafd_vision_axial_rotary_entry, 6, "i"' in text
+    header(tmp_path / "vision_dynamic_attention.h", "vision_dynamic_attention", pointers=6,
+           scalars=("int32_t","float","int32_t"))
+    dynamic=registry.registry([entry(tmp_path,128,programs=["vision_dynamic_attention"])])
+    assert '_mlir_cuteafd_vision_dynamic_attention_entry, 6, "ifi"' in dynamic
     with pytest.raises(ValueError, match="duplicate"):
         registry.registry(entries + entries[:1])
     with pytest.raises(ValueError, match="varlen attention"):
@@ -73,7 +77,8 @@ include(\"{ROOT}/native/cmake/shared/vision_attention.cmake\")
     assert result.returncode == 0, result.stderr
     entries = json.loads((tmp_path / "build/vision_attention/entries.json").read_text())
     assert [(e["head_dim"], e["windowed"], e["pointwise_group"]) for e in entries] == [
-        (64, False, ""), (72, False, ""), (96, False, "muse"), (96, True, "muse"), (128, False, "pixtral"), (64, False, "pe_inkling2"), (96, False, "pe_step5")]
+        (64, False, ""), (72, False, ""), (96, False, "muse"), (96, True, "muse"), (128, False, "pixtral"), (64, False, "pe_inkling2"), (96, False, "pe_step5"),
+        (128, False, "tower_kimi"), (80, False, "tower_minimax")]
     assert entries[0]["programs"] == ["vision_attention_d64"]
     assert entries[1]["programs"] == ["vision_attention_d72"]
     exporter = ROOT / "python/tools/aot/export_b12x_vision_aot.py"
@@ -86,7 +91,7 @@ include(\"{ROOT}/native/cmake/shared/vision_attention.cmake\")
     assert entries[2]["programs"][1:] == entries[3]["programs"][1:]
     rules = (tmp_path / "build/CMakeFiles/cuteafd_vision_attention_export.dir/build.make").read_text()
     exports = [line for line in rules.splitlines() if "-E env" in line and "export_b12x_vision_aot.py" in line]
-    assert len(exports) == 9, exports  # Step reuses Muse's full attention export
+    assert len(exports) == 13, exports  # Step reuses Muse; each generic tower adds two groups
     legacy = [line for line in exports if "--group" not in line]
     assert len(legacy) == 1
     assert legacy[0].endswith("--output-dir " + str(tmp_path / "build/vision_attention") + " --capability 120")
@@ -98,7 +103,7 @@ include(\"{ROOT}/native/cmake/shared/vision_attention.cmake\")
     assert pixtral["programs"][0] == "vision_attention_d128_full"
     assert [p["name"] for p in pixtral["programs"][1:]] == [
         "vision_axial_rotary_d128_bf16", "vision_rms_bf16_gamma_h2048"]
-    for item, kind, dim in zip(entries[5:], ("inkling2", "step5"), (64, 96), strict=True):
+    for item, kind, dim in zip(entries[5:7], ("inkling2", "step5"), (64, 96), strict=True):
         inventory = subprocess.check_output(["python3", str(exporter), "--list-perception-programs", "--perception", kind], text=True).strip().split(";")
         assert item["programs"][0] == f"vision_attention_d{dim}_full"
         assert [p["name"] for p in item["programs"][1:]] == inventory
@@ -119,6 +124,16 @@ include(\"{ROOT}/native/cmake/shared/vision_attention.cmake\")
         assert f'--omit-program {program["name"]}' in step_export
         assert not any(Path(p).name == program["name"] + ".o" and "pointwise_pe_step5" in p
                        for p in rules.split())
+    for item, kind, heads, dim in zip(entries[7:], ("kimi", "minimax"), (12, 16), (128, 80), strict=True):
+        inventory = subprocess.check_output(["python3", str(exporter), "--list-tower-programs", "--tower", kind], text=True).strip().split(";")
+        assert item["programs"][0] == f"vision_dynamic_attention_h{heads}_d{dim}"
+        assert [p["name"] for p in item["programs"][1:]] == inventory[1:]
+        borrowed = [p for p in item["programs"][1:] if p["directory"].endswith("pointwise_muse")]
+        assert [p["name"] for p in borrowed] == (["vision_projection_h4096_o4096", "vision_gelu_h4096"] if kind == "kimi" else [])
+        pointwise = next(line for line in exports if f"/pointwise_tower_{kind} " in line)
+        assert f"--omit-program {inventory[0]}" in pointwise
+        for program in borrowed:
+            assert f"--omit-program {program['name']}" in pointwise
     legacy_rule = rules.split("vision_attention/vision_attention_d64.h:", 1)[1].split("vision_attention/vision_attention_d64.o:", 1)[0]
     assert "--group attention" not in legacy_rule
     assert "--group pointwise" not in legacy_rule
@@ -169,7 +184,19 @@ inline int cudaLibraryUnload(void*) {++unloads;return fail_unload;}
     header(tmp_path / "vision_axial_rotary.h", "vision_axial_rotary", pointers=6, scalars=("int32_t",))
     modern = entry(tmp_path, 96, programs=["vision_attention_d96_full", "vision_axial_rotary"])
     modern["pointwise_group"] = "d96_f32"
-    (tmp_path / "vision_owner_entries.h").write_text(registry.registry([entry(tmp_path), entry(tmp_path, 72), modern]))
+    exporter = ROOT / "python/tools/aot/export_b12x_vision_aot.py"
+    generic_entries = []
+    generic_names = []
+    for kind, dim in (("kimi", 128), ("minimax", 80)):
+        names = subprocess.check_output(["python3", str(exporter), "--list-tower-programs", "--tower", kind], text=True).strip().split(";")
+        generic_names.append(names)
+        for index, name in enumerate(names):
+            header(tmp_path / (name + ".h"), name, pointers=6 if index == 0 else 4,
+                   scalars=("int32_t", "float", "int32_t") if index == 0 else ("int32_t",))
+        item = entry(tmp_path, dim, programs=names)
+        item["pointwise_group"] = "tower_" + kind
+        generic_entries.append(item)
+    (tmp_path / "vision_owner_entries.h").write_text(registry.registry([entry(tmp_path), entry(tmp_path, 72), modern, *generic_entries]))
     fixture = """
 #include <cassert>
 #include <cstring>
@@ -195,7 +222,9 @@ extern "C" void _mlir_cuteafd_vision_axial_rotary_cuda_init(void** a){initialize
 extern "C" void _mlir_cuteafd_vision_axial_rotary_cuda_load_to_device(void** a){load(a,0);}
 extern "C" void _mlir_cuteafd_vision_axial_rotary_entry(void** a,int n){
  assert(n==9);assert(*static_cast<int32_t*>(a[6])==17);*static_cast<int*>(a[8])=0;}
+GENERIC_PROGRAMS
 int main(){
+ GENERIC_CHECKS
  void *a=nullptr,*b=nullptr,*c=nullptr;
  assert(cuteafd_vision_attention_create_entry(64,0,"",&a)==0);
  assert(cuteafd_vision_attention_create_entry(64,0,"",&b)==0);
@@ -226,6 +255,30 @@ int main(){
  assert(cuteafd_vision_attention_destroy(nullptr)==0);
 }
 """
+    definitions, checks, seen = [], [], set()
+    for kind, dim, names in zip(("kimi", "minimax"), (128, 80), generic_names, strict=True):
+        for index, name in enumerate(names):
+            if name in seen:
+                continue
+            seen.add(name)
+            validation = ('assert(n==11);assert(*static_cast<int32_t*>(a[6])==16);'
+                          'assert(*static_cast<float*>(a[7])==.5f);'
+                          'assert(*static_cast<int32_t*>(a[8])==50331648);*static_cast<int*>(a[10])=0;' if index == 0 else
+                          'assert(n==7);*static_cast<int*>(a[6])=0;')
+            definitions.append(f'''extern "C" void _mlir_cuteafd_{name}_cuda_init(void** a){{initialize(a,0);}}
+extern "C" void _mlir_cuteafd_{name}_cuda_load_to_device(void** a){{load(a,0);}}
+extern "C" void _mlir_cuteafd_{name}_entry(void** a,int n){{{validation}}}''')
+        launch_checks = '\n'.join(f'assert(cuteafd_vision_pointwise_launch(g,"{name}",ptrs,&scalar,nullptr)==0);' for name in names[1:])
+        checks.append(f'''{{void* g=nullptr;assert(cuteafd_vision_attention_create_entry({dim},0,"tower_{kind}",&g)==0);
+void* ptrs[6]{{}};uint64_t scalar=16;
+assert(cuteafd_vision_pointwise_launch(g,"{names[0]}",ptrs,&scalar,nullptr)==cudaErrorInvalidValue);
+assert(cuteafd_vision_dynamic_attention_launch(g,nullptr,nullptr,nullptr,nullptr,nullptr,nullptr,16,.5f,nullptr)==0);
+assert(cuteafd_vision_dynamic_attention_launch(g,nullptr,nullptr,nullptr,nullptr,nullptr,nullptr,0,.5f,nullptr)==cudaErrorInvalidValue);
+assert(cuteafd_vision_attention_launch(g,nullptr,nullptr,nullptr,nullptr,nullptr,nullptr,.5f,nullptr)==cudaErrorInvalidValue);
+{launch_checks}
+assert(cuteafd_vision_attention_destroy(g)==0);}}
+unloads=0;init[0]=0;loads[0]=0;''')
+    fixture = fixture.replace("GENERIC_PROGRAMS", '\n'.join(definitions)).replace("GENERIC_CHECKS", '\n'.join(checks))
     (tmp_path / "fixture.cc").write_text(fixture)
     executable = tmp_path / "test-owner"
     result = subprocess.run([compiler, "-std=c++17", "-pthread", "-I", str(tmp_path), "-I",
@@ -233,3 +286,42 @@ int main(){
         str(tmp_path / "fixture.cc"), "-o", str(executable)], capture_output=True, text=True, timeout=30)
     assert result.returncode == 0, result.stderr
     subprocess.run([str(executable)], check=True, timeout=10)
+
+
+def test_inactive_generic_tower_inventory_is_unique_and_has_dynamic_attention_first():
+    path=ROOT / "python/tools/aot/vision_tower_programs.py"
+    spec=importlib.util.spec_from_file_location("generic_tower_inventory",path)
+    module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
+    for kind,count in [("kimi",18),("minimax",16)]:
+        names=module.names(kind)
+        assert len(names)==count and len(set(names))==count
+        assert names[0] == ("vision_dynamic_attention_h12_d128" if kind == "kimi" else "vision_dynamic_attention_h16_d80")
+        assert not any("65536" in name or "66792" in name for name in names)
+        assert ("vision_vendor_rotary_raster_t1" in names) == (kind=="kimi")
+        assert "vision_rotary_raster_t1" not in names
+        assert not any("cu130" in name for name in names)
+    native=(ROOT / "native/shared/cuda/vision_runtime.cu").read_text()
+    assert "if(s.tower)return false" in native
+    assert "return vision_required_impl(s,out,valid_tower);" in native
+    assert "return vision_create_impl(s,device,admitted,tags,out,valid_tower);" in native
+    seam = native.split('extern "C" int32_t cuteafd_internal_vision_tower_oracle', 1)[1].split('extern "C"', 1)[0]
+    assert "vision_required_impl(spec,ledger,valid_generic_tower)" in seam
+    assert "vision_create_impl(spec,device,admitted,tags,owner,valid_generic_tower)" in seam
+    assert "scratch_generic_tower" not in seam and "encode_generic_tower" not in seam
+    header = (ROOT / "native/shared/include/cuteafd_vision.h").read_text()
+    assert "cuteafd_internal_vision_tower_oracle" not in header
+    cmake = (ROOT / "native/CMakeLists.txt").read_text()
+    assert "add_library(cuteafd_vision_tower_oracle" not in cmake
+    assert "cuteafd_internal_vision_tower_teacher" not in header
+    assert "using TowerTeacherInput = const uint16_t* (*)(void*, int32_t, int32_t, int32_t);" in native
+    teacher = native.split('extern "C" int32_t cuteafd_internal_vision_tower_teacher', 1)[1].split('extern "C"', 1)[0]
+    assert "if(!o->spec.tower)return cudaErrorInvalidValue;" in teacher
+    assert "rc=drain(o,0);if(rc)return rc;" in teacher
+    encode = (ROOT / "native/shared/cuda/vision_tower_encode.cuh").read_text()
+    assert "if(!o->teacher_input)return 0;" in encode
+    assert "cudaMemcpyHostToDevice,o->stream" in encode
+    assert "return drain(o,rc);" in encode
+    assert "cuteafd_vision_dynamic_attention_launch(o->attention" in encode
+    assert 'generic_program(o,"vision_dynamic_attention' not in encode
+    assert "generic_teacher_boundary(o,0,b.x,n,h)" in encode
+    assert "if(layer+1<s.depth)GENERIC_RUN(generic_teacher_boundary(o,int(layer)+1,b.x,n,h));" in encode

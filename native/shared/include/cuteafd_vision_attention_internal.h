@@ -12,6 +12,9 @@ int32_t cuteafd_vision_pointwise_launch(void* owner, const char* name,
 int32_t cuteafd_vision_attention_destroy(void* owner);
 int32_t cuteafd_vision_attention_launch(void* owner, void* q, void* k, void* v,
     void* out, void* lse, void* cu_seqlens, float scale, void* stream);
+// Generic tower attention is entry zero, with runtime rows before scale/L2.
+int32_t cuteafd_vision_dynamic_attention_launch(void* owner, void* q, void* k, void* v,
+    void* out, void* lse, void* cu_seqlens, int32_t rows, float scale, void* stream);
 /* Pixtral (head 128) pointwise programs, loaded with a head-128 owner. */
 int32_t cuteafd_vision_axial_rotary_d128(void* owner, void* q, void* k, void* cos, void* sin,
     void* out_q, void* out_k, int32_t rows, void* stream);
