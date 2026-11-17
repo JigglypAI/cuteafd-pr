@@ -167,7 +167,7 @@ fn installed_flash_drafters_push_byte_identical_to_mount_within_admitted_staging
 #[test]
 fn serve_loop_holds_no_draft_policy_of_its_own() {
     // Lengths come from the shared history policy's plan, shape and observe alone.
-    let serve = include_str!("serve.rs").split_once("#[cfg(test)]").unwrap().0;
+    let serve = include_str!("serve.rs");
     for call in ["policy.plan(&requests, verify_rows)", "policy.shape(&mut shaped, verify_rows)", "policy.observe(&outcomes)"] {
         assert_eq!(serve.matches(call).count(), 1, "{call}");
     }
