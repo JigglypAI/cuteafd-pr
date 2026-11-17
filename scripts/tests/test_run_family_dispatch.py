@@ -980,7 +980,7 @@ def _family_launch_result(tmp_path: Path, family_config: dict, model: str, keys:
     if model == "wrldsuksgo2mars/Kimi-K3.1-Pro-EXL3-K2-MC" and not (
             hf / "hub/models--Inferact--Kimi-K3.1-Pro-DSpark").exists():
         _snapshot(hf, "Inferact/Kimi-K3.1-Pro-DSpark", {"speculators_model_type": "dspark"},
-                  "e4e6e6261e9f8b6d5f249f9627eb6b109d762d5f")
+                  "c197a09072916cf63172df2d9d4baef0b77ed83a")
     if checkpoint_source is not None:
         staged = hf / "hub" / f"models--{model.replace('/', '--')}" / "snapshots" / ("a" * 40 if native_v41 else "abc")
         # Header fixtures have huge sparse tensor payloads; never materialize them.
@@ -1106,7 +1106,7 @@ if "--resolve-settings-only" in args:
             print(f"SPECULATOR={selected} does not apply to kimi_k3", file=sys.stderr)
             sys.exit(2)
         print(json.dumps(dict(speculator=selected, default_drafter="Inferact/Kimi-K3.1-Pro-DSpark",
-            default_drafter_revision="e4e6e6261e9f8b6d5f249f9627eb6b109d762d5f")))
+            default_drafter_revision="c197a09072916cf63172df2d9d4baef0b77ed83a")))
         sys.exit(0)
     if checkpoint.get("model_type", "").startswith("mimo"):
         selected = "off"

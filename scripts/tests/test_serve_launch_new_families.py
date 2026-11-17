@@ -237,7 +237,7 @@ def test_kimi_dflash2_uses_one_resolved_fp8_snapshot_for_plan_and_serve(tmp_path
 
 @pytest.mark.parametrize("cache", ["bf16", "fp8"])
 def test_kimi_dspark_uses_resolved_native_weights_and_independent_draft_kv(tmp_path: Path, cache) -> None:
-    model, revision = "Inferact/Kimi-K3.1-Pro-DSpark", "e4e6e6261e9f8b6d5f249f9627eb6b109d762d5f"
+    model, revision = "Inferact/Kimi-K3.1-Pro-DSpark", "c197a09072916cf63172df2d9d4baef0b77ed83a"
     _snapshot(tmp_path / "hf", model, {}, revision=revision)
     result = _kimi(tmp_path, f"SPECULATOR=dspark\nDRAFT_KV_CACHE={cache}\n")
     serve = _line(result,"serve-kimi --snapshot")
