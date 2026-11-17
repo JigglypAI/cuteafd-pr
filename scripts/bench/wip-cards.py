@@ -84,7 +84,7 @@ ANSI = re.compile(r'\x1b\[[0-9;]*m')
 METRICS = ('C1', 'C8', '8K', 'kl', 'top1', 'pool', 'readiness_s')
 # Before -> after table: baseline card metrics, then the client sweep's levels
 # (sweep C<n>) and post-load C1, which are separate measurements.
-SUMMARY_METRICS = ('C1', 'C8', 'sweep C1', 'sweep C4', 'sweep C8', 'sweep C16', 'post-load C1', '8K', '8K w/tail', 'kl', 'top1', 'pool', 'readiness_s')
+SUMMARY_METRICS = ('C1', 'C8', 'sweep C1', 'sweep C4', 'sweep C8', 'sweep C16', 'sustained C1', 'sustained C4', 'sustained C8', 'sustained C16', 'post-load C1', '8K', '8K w/tail', 'kl', 'top1', 'pool', 'readiness_s')
 FIDELITY_PANELS = {'fidelity', 'fidelity_full'}
 LOWER_IS_BETTER = {'kl', 'readiness_s'}  # also every 'prefill N TTFT s'
 FAILURE = re.compile(r'(?i)(\berror\b|\bpanicked\b|\bfatal\b|\bfailed\b|undefined symbol|no such file|refus|exited:|timed out|out of memory|traceback)')
@@ -1971,7 +1971,8 @@ def summarize_job(job, exit_code):
                 row['fabric'].extend(p['fabric'] for p in [*sweep.get('points', []), *sweep.get('prefill', [])] if p.get('fabric'))
             row['sweep'] = sweep.get('points', [])
             for point in row['sweep']:
-                key = 'post-load C1' if point['phase'] == 'post_load' else f"sweep C{point['c']}"
+                key = (f"sustained C{point['c']}" if point['phase'] == 'sustained' else
+                       'post-load C1' if point['phase'] == 'post_load' else f"sweep C{point['c']}")
                 row[key] = point['aggregate_tok_s']
             for point in sweep.get('prefill', []):
                 row[f"prefill {point['length']}"] = point['tok_s']

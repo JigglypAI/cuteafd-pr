@@ -34,6 +34,7 @@ pub mod server;
 pub mod smoke;
 pub mod store;
 pub mod sweep;
+pub mod sustained;
 pub mod tables;
 pub mod text;
 

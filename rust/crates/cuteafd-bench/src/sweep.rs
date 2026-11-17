@@ -57,6 +57,8 @@ pub struct Point {
     /// Approximate phase deltas from asynchronous device snapshots.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expert_usage: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sustained: Option<crate::sustained::Window>,
 }
 
 /// One cold prefill at a chosen length (after one untimed warm request there).
@@ -239,7 +241,7 @@ fn measure(client: &Client, c: usize, phase: &str, repeat: Option<&Prompts>, tok
         context: c1.map(|x| x.0), seed: c1.map(|x| x.1),
         prompt_sha256: c1.map(|_| format!("{:x}", Sha256::digest(prompts.timed[0].as_bytes()))),
         prompt_tokens: c1.map(|_| ok[0].chat.timing.prompt_tokens),
-        cached_tokens: c1.map(|_| ok[0].chat.timing.cached_tokens), draft_counters };
+        cached_tokens: c1.map(|_| ok[0].chat.timing.cached_tokens), draft_counters, sustained: None };
     Ok((point, prompts))
 }
 
@@ -364,7 +366,16 @@ pub fn run_windowed(url: &str, api_key: Option<&str>, levels: &[usize], post_loa
     post_load_repeat: bool, prefill_lengths: &[u64], prefill_options: &PrefillOptions, fabric: bool, tokens: u64,
     on_timed: OnTimed) -> Result<Sweep> {
     run_configured(url, api_key, levels, post_load_c1, post_load_repeat, prefill_lengths,
-        prefill_options, fabric, tokens, on_timed, None)
+        prefill_options, fabric, tokens, on_timed, None, &Default::default())
+}
+
+/// Ordinary sweep plus separate sustained points, configured like the server panel.
+#[allow(clippy::too_many_arguments)]
+pub fn run_concurrency_windowed(url: &str, api_key: Option<&str>, levels: &[usize], post_load_c1: bool,
+    post_load_repeat: bool, prefill_lengths: &[u64], prefill_options: &PrefillOptions, fabric: bool, tokens: u64,
+    on_timed: OnTimed, options: &crate::sustained::Options) -> Result<Sweep> {
+    run_configured(url, api_key, levels, post_load_c1, post_load_repeat, prefill_lengths,
+        prefill_options, fabric, tokens, on_timed, None, options)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -372,13 +383,13 @@ pub fn run_c1_windowed(url: &str, api_key: Option<&str>, options: &C1Options,
     fabric: bool, tokens: u64, on_timed: OnTimed) -> Result<Sweep> {
     options.validate()?;
     run_configured(url, api_key, &[1], false, false, &[], &PrefillOptions::default(),
-        fabric, tokens, on_timed, Some(options))
+        fabric, tokens, on_timed, Some(options), &Default::default())
 }
 
 #[allow(clippy::too_many_arguments)]
 fn run_configured(url: &str, api_key: Option<&str>, levels: &[usize], post_load_c1: bool,
     post_load_repeat: bool, prefill_lengths: &[u64], prefill_options: &PrefillOptions, fabric: bool, tokens: u64,
-    mut on_timed: OnTimed, c1: Option<&C1Options>) -> Result<Sweep> {
+    mut on_timed: OnTimed, c1: Option<&C1Options>, concurrency: &crate::sustained::Options) -> Result<Sweep> {
     if tokens > MAX_TOKENS {
         bail!("sweep tokens must be {OMIT_TOKENS} (omit max_tokens) or 1..={MAX_TOKENS}, got {tokens}");
     }
@@ -415,6 +426,25 @@ fn run_configured(url: &str, api_key: Option<&str>, levels: &[usize], post_load_
     if post_load_c1 {
         let (phase, repeat) = if post_load_repeat { ("post_load_repeat", c1_prompts.as_ref()) } else { ("post_load", None) };
         sweep.points.push(measure(&client, 1, phase, repeat, tokens, &mut on_timed, None)?.0);
+    }
+    // Preserve the closed points' nonce sequence and post-load state by running
+    // all sustained points afterward, not between existing measurements.
+    if concurrency.sustained {
+        for &c in levels.iter().filter(|_| c1.is_none()) {
+            client.check()?;
+            let thermal_mark = client.thermal_mark();
+            let fabric_mark = client.fabric_mark();
+            let counters = phase_counters(&client);
+            let window = crate::sustained::run(&client, c, concurrency, tokens)?;
+            let after = phase_counters(&client);
+            sweep.points.push(Point { c, phase: "sustained".into(), aggregate_tok_s: window.tok_s(),
+                per_request_tok_s: window.per_request_tok_s(), ttft_s: window.ttft_s(),
+                thermal: client.thermal_since(thermal_mark),
+                fabric: client.fabric_since(fabric_mark, &format!("sustained/c{c}"), true).map(|p| serde_json::json!(p)),
+                mapped_tables: mapped_interval(&counters.mapped_tables, &after.mapped_tables),
+                expert_usage: expert_usage_interval(counters.expert_usage.as_ref(), after.expert_usage.as_ref()),
+                sustained: Some(window), ..Point::default() });
+        }
     }
     if !levels.is_empty() || post_load_c1 {
         if let Some(window) = client.thermal_since(mark) { sweep.thermal.insert("decode".into(), window); }

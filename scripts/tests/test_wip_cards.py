@@ -4047,3 +4047,15 @@ def test_warm_lossless_panel_config_reaches_matrix(entry, tmp_path, monkeypatch)
     e = json.loads(next(state.glob('*/matrix.json')).read_text())['entries'][0]
     assert e['profile'] == 'panels:spec_lossless_set' and e['baseline'] is False
     assert e['panel_config'] == {'spec_lossless_set': {'warm': True}}
+
+
+def test_sustained_levels_panel_config_reaches_matrix(entry, tmp_path, monkeypatch):
+    kit = _kit(tmp_path, entry)
+    state = tmp_path / 'sustained-state'
+    monkeypatch.setattr(sys, 'argv', ['wip-cards', '--kit', str(kit), '--cards', 'v41-min', '--matrix',
+        '--arm', 'a=b:s', '--state', str(state), '--panels', 'none', '--levels', '8,16',
+        '--panel-config', 'concurrency={"sustained":true,"multiplier":4}', '--dry-run'])
+    assert cards.main() == 0
+    e = json.loads(next(state.glob('*/matrix.json')).read_text())['entries'][0]
+    assert e['levels'] == [8, 16]
+    assert e['panel_config'] == {'concurrency': {'sustained': True, 'multiplier': 4}}
