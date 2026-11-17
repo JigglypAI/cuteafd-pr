@@ -66,9 +66,8 @@ pub(super) fn layout(
     ensure!(
         !opts.host_embedding
             && opts.drafter_bytes == 0
-            && report.vision == MediaMode::Off
             && report.audio == MediaMode::Off,
-        Unqualified("host embedding, draft or media owners")
+        Unqualified("host embedding, external draft or audio owners")
     );
     let shape = crate::plan::layout::resolve_prefill(input, report, opts, spark_ranks,
         crate::plan::Family::prefill_limits(&super::STEP5))?;

@@ -1999,7 +1999,7 @@ mod loop_abort_tests {
     fn active(dir: &tempfile::TempDir, max_tokens: usize, config: crate::shared::loop_abort::LoopAbortConfig)
         -> (Active<'static, TestPlacement, TestDraft>, mpsc::UnboundedReceiver<Result<InferenceChunk, cuteafd_api::openai::NativeFailure>>) {
         let (events, receive) = mpsc::unbounded_channel();
-        let job = NativeRequest { prefix_cache_source: Default::default(), finish_detail: Default::default(),
+        let job = NativeRequest { image_groups: Vec::new(), prefix_cache_source: Default::default(), finish_detail: Default::default(),
             literal_spans: Vec::new(), prompt: String::new(), constraint: None, images: Vec::new(),
             media: Vec::new(), audio: Vec::new(), max_tokens, sampling: Default::default(),
             stop_token_ids: Vec::new(), events, usage: None, probe: None };

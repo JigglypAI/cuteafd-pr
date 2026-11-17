@@ -1470,3 +1470,49 @@ fn installed_dense_qwen_one_and_two_rtx_publish_exact_native_owners() {
         }
     }
 }
+
+#[test]
+fn installed_pe_min_max_plans_charge_one_native_tower_arena() {
+    let hf_home = require_installed_hf_home("installed_pe_min_max_plans_charge_one_native_tower_arena",
+        std::env::var_os("CUTEAFD_DEPLOYMENT_TEST_HF_HOME"));
+    let programs = installed_example_programs(
+        std::env::var_os("CUTEAFD_DEPLOYMENT_TEST_PROGRAMS").map(Into::into),
+        &std::path::PathBuf::from(std::env::var_os("HOME").unwrap()));
+    for (model, revision, layouts, expected_weights) in [
+        ("Inkling-2-Small-EXL3-K4-MC", "6caa0ba08eb564ddc88b98df06ac73e853cc559e", [("1", "4"), ("2", "6")], 655_386_688u64),
+        ("Step-5-Preview-EXL3-K4-MC", "aedda90d25bd02bb6520bcaf88e06e6c9bc932c4", [("1", "3"), ("2", "6")], 3_962_029_664),
+    ] {
+        let snapshot = require_installed_snapshot("PE min/max tower admission",
+            &format!("wrldsuksgo2mars/{model}"), Some(revision), &hf_home);
+        for (gpus, ranks) in layouts {
+            for vision in ["auto", "off"] {
+                let output = test_command(env!("CARGO_BIN_EXE_cuteafd"))
+                    .arg("plan").arg(&snapshot).args(["--core-view", "original", "--layout", "--rtx", gpus,
+                        "--spark-ranks", ranks, "--concurrency", "16", "--max-context-tokens", "auto",
+                        "--no-speculator", "--vision", vision, "--audio", "off", "--json", "--workspace-manifest"])
+                    .arg(&programs).env("HF_HOME", &hf_home).output().unwrap();
+                assert!(output.status.success(), "{model}/{gpus}RTX/{vision}: {}", String::from_utf8_lossy(&output.stderr));
+                let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+                assert_eq!(report["placement_supported"], true, "{model}/{gpus}RTX/{vision}: {}", report["hints"]);
+                let items = report["memory_layout"]["devices"].as_array().unwrap().iter()
+                    .flat_map(|device| device["items"].as_array().unwrap()).collect::<Vec<_>>();
+                let weights = items.iter().filter(|item| item["group"] == "vision packed weight arena").collect::<Vec<_>>();
+                let scratch = items.iter().filter(|item| item["group"] == "vision scratch").collect::<Vec<_>>();
+                if vision == "auto" {
+                    assert_eq!(report["encoder"]["kind"]["kind"], "spark", "{model}/{gpus}RTX: {}", report["encoder"]);
+                    assert_eq!(report["encoder"]["weights"], expected_weights);
+                    assert_eq!(weights.len(), 1, "{model}/{gpus}RTX: packed arena charged more than once");
+                    assert_eq!(weights[0]["bytes"], expected_weights);
+                    assert_eq!(scratch.len(), 1);
+                    assert_eq!(scratch[0]["bytes"], report["encoder"]["scratch"]);
+                } else {
+                    assert!(weights.is_empty() && scratch.is_empty(), "off retains a PE charge");
+                }
+                for phase in report["phase_ledger"]["phases"].as_array().unwrap() {
+                    assert!(phase["owned"].as_u64().unwrap() + phase["opaque"].as_u64().unwrap()
+                        <= phase["available"].as_u64().unwrap(), "{model}/{gpus}RTX/{vision}: {phase}");
+                }
+            }
+        }
+    }
+}

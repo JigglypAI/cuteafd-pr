@@ -120,7 +120,7 @@ mod tests {
             assert_eq!(inventory.arena.bytes() as u64, expected);
             assert_eq!(inventory.scratch, geometry.scratch_bytes(4096).map_err(anyhow::Error::msg)?);
             assert_eq!(inventory.arena.views().len(), tensors.len()+1);
-            for (name, offset) in &inventory.arena.views() {
+            for (name, offset) in inventory.arena.views() {
                 assert_eq!(offset.offset() % 256, 0, "{name}");
             }
             assert!(StillTowerInventory::from_checkpoint(&checkpoint, 4097).is_err());
