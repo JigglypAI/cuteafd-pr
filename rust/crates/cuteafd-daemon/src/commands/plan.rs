@@ -245,6 +245,16 @@ fn resolve_settings(args: &mut PlanArgs, family: &str, cfg: &std::collections::B
         args.draft_fp8 = Some(fp8.value);
         resolved.insert("draft_fp8".into(), setting(fp8));
     }
+    if family == "qwen4" {
+        let explicit = args.explicit_settings.contains("native_mtp_layers").then_some(args.native_mtp_layers);
+        let configured = cfg.get("SPECULATOR_DEPTH").filter(|value| !value.is_empty())
+            .map(|value| value.parse().context("SPECULATOR_DEPTH")).transpose()?;
+        let enabled = matches!(args.speculator.as_str(), "auto" | "mtp");
+        let depth = defaults::selected(explicit, configured, if enabled { 3 } else { 0 },
+            "three recursive Qwen drafts when native MTP is selected; zero when disabled");
+        args.native_mtp_layers = depth.value;
+        resolved.insert("native_mtp_layers".into(), setting(depth));
+    }
     if family == "mimo_v2" {
         let configured = match cfg.get("SPECULATOR_FP8").map(String::as_str) {
             Some("on" | "auto") => Some(true), Some("off") => Some(false), None | Some("") => None,
@@ -2244,6 +2254,25 @@ mod tests {
             let draft = resolve_snapshot_at_revision(&cfg["SPECULATOR_MODEL_ID"], Some(&home),
                 Some(&cfg["SPECULATOR_MODEL_REVISION"])).unwrap().snapshot_path.unwrap();
             assert_eq!(resolved.drafter_snapshot.as_deref(), Some(draft.as_path()), "{}", config.display());
+        }
+    }
+
+    #[test]
+    fn qwen_recursive_depth_default_and_overrides_are_resolved_once() {
+        let root = tempfile::tempdir().unwrap();
+        for (mode, explicit, configured, expected) in [
+            ("auto", None, None, 3), ("mtp", None, None, 3), ("off", None, None, 0),
+            ("auto", None, Some(2), 2), ("mtp", Some(4), Some(2), 4)] {
+            let mut request = args(root.path(), 2, false);
+            request.speculator = mode.into();
+            if let Some(depth) = explicit {
+                request.native_mtp_layers = depth;
+                request.explicit_settings.insert("native_mtp_layers".into());
+            }
+            let cfg = configured.map(|depth: usize| [("SPECULATOR_DEPTH".into(), depth.to_string())].into()).unwrap_or_default();
+            let resolved = resolve_settings(&mut request, "qwen4", &cfg).unwrap();
+            assert_eq!(request.native_mtp_layers, expected);
+            assert_eq!(resolved["native_mtp_layers"].value, serde_json::json!(expected));
         }
     }
 
