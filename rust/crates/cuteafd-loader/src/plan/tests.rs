@@ -1132,6 +1132,19 @@ fn v41_full_concurrency_launcher_admission_at_the_native_draft_block() {
             let memory = report.memory_layout.as_ref().unwrap();
             assert!(memory.devices.iter().flat_map(|d| &d.items)
                 .filter(|i| i.category == Category::Drafter).map(|i| i.bytes).sum::<u64>() > 0);
+            // Compare the public plan with explicit native-seven owners, not the
+            // planner's chosen width or a nonzero aggregate that width five could pass.
+            let manifest: Value = serde_json::from_slice(&std::fs::read(dir.path().join("share/V41_FP8_AOT.json")).unwrap()).unwrap();
+            let experts: Value = serde_json::from_slice(&std::fs::read(dir.path().join("share/V41_EXPERT_AOT.json")).unwrap()).unwrap();
+            let sms = crate::placement::ArchContext::for_device("sm_120", 96 << 30).sms;
+            let programs = crate::placement::families::deepseek_v41::owners::NativePrograms::new(&manifest, sms).unwrap();
+            let expected = programs.dspark(&experts, 4096, concurrency, 7, gpus,
+                crate::placement::families::deepseek_v41::resident::Fp8Head::Packed).unwrap();
+            for owner in expected.iter().filter(|owner| owner.group == "dSpark request lanes") {
+                let actual: u64 = memory.devices[usize::from(owner.gpu)].items.iter()
+                    .filter(|item| item.group == owner.group).map(|item| item.bytes).sum();
+                assert_eq!(actual, owner.bytes, "native-seven lane owner GPU{} C{concurrency}", owner.gpu);
+            }
         }
     }
 }

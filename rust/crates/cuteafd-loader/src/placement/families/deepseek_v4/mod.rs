@@ -436,6 +436,20 @@ mod default_tests {
     }
 
     #[test]
+    fn speculating_v4_fixed_steps_do_not_charge_removed_route_probe_storage() {
+        let mut input = plan_inputs(&context_cfg());
+        let before = fixed_demands(&input).unwrap().0;
+        input.draft = vec![V4ExpertCost { resident_bytes: 1024, staging_bytes: 0 }];
+        let after = fixed_demands(&input).unwrap().0;
+        for gpu in 0..2 {
+            let steps = |items: &[Demand]| items.iter().find(|owner|
+                owner.gpu == gpu && owner.group == "steps").unwrap().bytes;
+            assert_eq!(steps(&before), steps(&after), "a drafter adds no route-probe workspace");
+        }
+        assert!(after.iter().all(|owner| !owner.group.contains("probe")));
+    }
+
+    #[test]
     fn prepared_pool_matches_plan_and_runtime_and_preserves_strict_requests() {
         use cuteafd_core::memory_policy::MemoryPolicy;
         let cfg = context_cfg();

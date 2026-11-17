@@ -929,6 +929,14 @@ mod tests {
     }
 
     #[test]
+    fn native_seven_draft_rows_select_the_wide_module_bucket_before_admission() {
+        for (requests, rows) in [(1, 16), (2, 16), (4, 16), (8, 40), (16, 80),
+            (17, 80), (23, 256), (32, 256), (64, 256)] {
+            assert_eq!(draft_rows(requests), rows, "C{requests}: seven-position lanes");
+        }
+    }
+
+    #[test]
     fn draft_chains_are_lane_local_but_windows_and_producers_are_shared() -> Result<()> {
         let manifest = manifest();
         let programs = NativePrograms::new(&manifest, 188)?;
