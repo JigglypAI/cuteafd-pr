@@ -172,10 +172,17 @@ fn serving_expert_plan(backings: &[cuteafd_loader::placement::families::minimax_
             budget: budgets[0] }] } }))
 }
 
+fn compose_media_plans<P,A>(base:(Vec<P>,Vec<A>),media:dense::Records,
+    mut plan:impl FnMut(dense::Records)->Result<(Vec<P>,Vec<A>)>)->Result<(Vec<P>,Vec<A>)> {
+    let mut base=base;
+    let extra=plan(media)?;
+    base.0.extend(extra.0);base.1.extend(extra.1);Ok(base)
+}
+
 impl<'a> PendingServing<'a> {
     pub(crate) fn with_media(mut self, snapshot: &std::path::Path, media: crate::shared::vision::push::Contribution) -> Result<Self> {
-        let (plans, arenas)=dense::plan_records(snapshot,media.records(),&self.prepared.devices,self.prepared.sparks)?;
-        self.prepared.dense.0.extend(plans);self.prepared.dense.1.extend(arenas);
+        self.prepared.dense=compose_media_plans(self.prepared.dense,media.records(),|records|
+            dense::plan_records(snapshot,records,&self.prepared.devices,self.prepared.sparks))?;
         self.prepared.media=media;Ok(self)
     }
 
@@ -352,6 +359,18 @@ mod serving_tests {
         placement::{families::minimax_m3::ExpertBacking,
             planner::{weight_arena_components, ComponentKind, Facts, Lifetime, Location, PhaseOrder}},
         serving_capacity::WeightArenaLayout};
+
+    #[test]
+    fn remote_tower_adds_no_coordinator_push_plans() -> Result<()> {
+        let mut planned=0;
+        let base=(vec![10,20],vec![30,40]);
+        let actual=compose_media_plans(base,dense::Records::default(),|_| {
+            planned+=1;Ok((vec![0,0],vec![0,0]))
+        })?;
+        assert_eq!(actual,(vec![10,20],vec![30,40]));
+        assert_eq!(planned,0,"a Spark tower must not plan a coordinator contribution");
+        Ok(())
+    }
 
     fn facts(targets: &[CoordinatorWeights], experts: &[ExpertBacking]) -> Result<Facts> {
         let mut facts = Facts { phase_order: PhaseOrder::TARGET_THEN_DRAFT,
