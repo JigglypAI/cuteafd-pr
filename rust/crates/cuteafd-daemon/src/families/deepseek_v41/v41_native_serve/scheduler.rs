@@ -34,7 +34,7 @@ pub(crate) fn exercise_distributed_decode<'t, 'd, 'a: 'd>(lib: &'a NativeLibrary
     let mut prefixes = PrefixCache::disabled();
     let image_keys = super::prefix::media_keys(tokens, &[])?;
     let mut request = Active { constraint: None, ticket: console::Ticket::new(id, 0, None), lease,
-        job: NativeRequest { prefix_cache_source: Default::default(), finish_detail: Default::default(), literal_spans: Vec::new(), prompt: String::new(), constraint: None, images: Vec::new(), media: Vec::new(), audio: Vec::new(), max_tokens: 4, sampling: Default::default(), stop_token_ids: Vec::new(), events, usage: None, probe: None },
+        job: NativeRequest { image_groups: Vec::new(), prefix_cache_source: Default::default(), finish_detail: Default::default(), literal_spans: Vec::new(), prompt: String::new(), constraint: None, images: Vec::new(), media: Vec::new(), audio: Vec::new(), max_tokens: 4, sampling: Default::default(), stop_token_ids: Vec::new(), events, usage: None, probe: None },
         decoder: cuteafd_loader::streaming_token_decoder(snapshot, false)?, anchor,
         generated: 0, buffered: 0, finished: false, cacheable: false, failed: false,
         tokens: tokens.to_vec(), image_keys, next_after_commit: None,
@@ -561,7 +561,7 @@ pub(crate) fn exercise_packed_prefill<'w, 'a: 'w>(
         if let Some(draft) = draft.as_deref_mut() { draft.admit(id)?; }
         let (events, receive) = mpsc::unbounded_channel();
         receivers.push(receive);
-        let job = NativeRequest { prefix_cache_source: Default::default(), finish_detail: Default::default(), literal_spans: Vec::new(),
+        let job = NativeRequest { image_groups: Vec::new(), prefix_cache_source: Default::default(), finish_detail: Default::default(), literal_spans: Vec::new(),
             prompt: String::new(), constraint: None, images: Vec::new(), media: Vec::new(), audio: Vec::new(),
             max_tokens: 1, sampling: Default::default(), stop_token_ids: Vec::new(), events, usage: None, probe: None };
         let images = super::prefix::media_keys(tokens, &[])?;
@@ -3690,7 +3690,7 @@ mod loop_abort_tests {
     fn active(dir: &tempfile::TempDir, max_tokens: usize, config: crate::shared::loop_abort::LoopAbortConfig)
         -> (Active<'static>, mpsc::UnboundedReceiver<Result<InferenceChunk, cuteafd_api::openai::NativeFailure>>) {
         let (events, receive) = mpsc::unbounded_channel();
-        let job = NativeRequest { prefix_cache_source: Default::default(), finish_detail: Default::default(),
+        let job = NativeRequest { image_groups: Vec::new(), prefix_cache_source: Default::default(), finish_detail: Default::default(),
             literal_spans: Vec::new(), prompt: String::new(), constraint: None, images: Vec::new(),
             media: Vec::new(), audio: Vec::new(), max_tokens, sampling: Default::default(),
             stop_token_ids: Vec::new(), events, usage: None, probe: None };
