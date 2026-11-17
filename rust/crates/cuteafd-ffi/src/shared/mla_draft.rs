@@ -86,13 +86,13 @@ fn validate_ml4_context_buffers(x: Buffer, weight: Buffer, out: Buffer, rows: us
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum MlaDraftWindow { Full, Sliding4096, BlockAnchored2048 }
+pub enum MlaDraftWindow { Full, Sliding4096, CausalSliding1024, BlockAnchored2048 }
 impl MlaDraftWindow {
     fn suffix(self) -> &'static str {
-        match self { Self::Full => "full", Self::Sliding4096 => "w4096", Self::BlockAnchored2048 => "w2048b" }
+        match self { Self::Full => "full", Self::Sliding4096 => "w4096", Self::CausalSliding1024 => "causal_w1024", Self::BlockAnchored2048 => "w2048b" }
     }
     fn rows(self) -> Option<u64> {
-        match self { Self::Full => None, Self::Sliding4096 => Some(4096), Self::BlockAnchored2048 => Some(2048) }
+        match self { Self::Full => None, Self::Sliding4096 => Some(4096), Self::CausalSliding1024 => Some(1024), Self::BlockAnchored2048 => Some(2048) }
     }
 }
 
@@ -283,11 +283,14 @@ pub struct MlaDraft<'a> {
 impl<'a> MlaDraft<'a> {
     pub fn load(programs: &'a Programs<'a>, program_namespace: &str, window: MlaDraftWindow, cache_format: MlaCacheFormat) -> Result<Self> {
         let cache = cache_format.program_suffix();
-        let producer = programs.program(&format!("{program_namespace}_mla_draft_producer{cache}_m64"), PRODUCER)?;
+        let causal = window == MlaDraftWindow::CausalSliding1024;
+        let geometry = if causal { "_causal_h96" } else { "" };
+        let producer = programs.program(&format!("{program_namespace}_mla_draft_producer{geometry}{cache}_m64"), PRODUCER)?;
         let attention = programs.program(&format!("{program_namespace}_mla_draft_attention_{}{cache}_m64", window.suffix()), ATTENTION)?;
-        let output = programs.program(&format!("{program_namespace}_mla_draft_output_m64"), OUTPUT)?;
+        let output = programs.program(&format!("{program_namespace}_mla_draft_output{geometry}_m64"), OUTPUT)?;
         let layout = validate_manifest([producer.spec(), attention.spec(), output.spec()], window, cache_format)?;
-        Ok(Self { producer, attention, output, layout, cache_format, kind: MlaDraftKind::Dflash2 })
+        Ok(Self { producer, attention, output, layout, cache_format,
+            kind: if causal { MlaDraftKind::CausalDflash2 } else { MlaDraftKind::Dflash2 } })
     }
 
     /// Mistral Large 4's bundled mtp_dspark (`ml4_draft_*`): FP8 656-byte records,
@@ -346,9 +349,10 @@ impl<'a> MlaDraft<'a> {
     /// Validate the final projection before a Context producer mutates cache.
     pub fn check_output(&self, w: MlaDraftWeights, b: MlaDraftBatch) -> Result<()> {
         let hidden = self.kind.hidden();
+        let heads = self.kind.heads();
         if !(1..=ROWS).contains(&b.rows) { return Err(MlaDraftError::Invalid("output rows")); }
-        validate_buffers(&[(b.attention, b.rows * HEADS * 512 * 2),
-            (w.uv, HEADS * 128 * 512 * 2), (w.output, hidden * HEADS * 128 * 2),
+        validate_buffers(&[(b.attention, b.rows * heads * 512 * 2),
+            (w.uv, heads * 128 * 512 * 2), (w.output, hidden * heads * 128 * 2),
             (b.output, b.rows * hidden * 2), (b.output_scratch, self.layout.scratch[2])], b.output.device_id)
     }
 
@@ -385,6 +389,8 @@ impl<'a> MlaDraft<'a> {
 }
 
 fn validate_manifest(specs: [&ProgramSpec; 3], window: MlaDraftWindow, cache_format: MlaCacheFormat) -> Result<Layout> {
+    let causal = window == MlaDraftWindow::CausalSliding1024;
+    let kind = if causal { MlaDraftKind::CausalDflash2 } else { MlaDraftKind::Dflash2 };
     for (i, spec) in specs.iter().enumerate() {
         let g = &spec.geometry;
         let pointers = [PRODUCER, ATTENTION, OUTPUT][i];
@@ -392,11 +398,11 @@ fn validate_manifest(specs: [&ProgramSpec; 3], window: MlaDraftWindow, cache_for
         if (i != 2 && g["kv_cache"].as_str() != Some(cache_format.label()))
             || spec.capacity_rows as usize != ROWS || spec.scalar_kinds != scalars
             || !spec.pointers.iter().map(String::as_str).eq(pointers.iter().copied())
-            || [("heads", 64), ("hidden", 7168), ("q_lora_rank", 1536), ("kv_lora_rank", 512),
+            || [("heads", kind.heads() as u64), ("hidden", 7168), ("q_lora_rank", 1536), ("kv_lora_rank", 512),
                 ("qk_nope_dim", 128), ("qk_rope_dim", 64), ("v_head_dim", 128), ("page_rows", 64)]
                 .iter().any(|&(key, n)| g[key].as_u64() != Some(n))
             || g["name"].as_str() != Some("mla_block_draft") || g["norm_eps"].as_f64() != Some(1e-5)
-            || (i != 1 && !g["window_size"].is_null()) {
+            || (i != 1 && if causal { g["window_size"].as_u64() != Some(1024) } else { !g["window_size"].is_null() }) {
             return Err(MlaDraftError::Invalid("manifest geometry/pointers/scalars"));
         }
     }
@@ -404,14 +410,14 @@ fn validate_manifest(specs: [&ProgramSpec; 3], window: MlaDraftWindow, cache_for
     let a = &specs[1].geometry;
     if p["rotary_style"].as_str() != Some("interleaved") || p["rotary_dim"].as_u64() != Some(64)
         || specs[2].geometry["output_gate"].as_bool() != Some(false)
-        || a["noncausal_block"].as_bool() != Some(true)
+        || a["noncausal_block"].as_bool() != Some(!causal)
         || match window.rows() { Some(n) => a["window_size"].as_u64() != Some(n),
             None => !a["window_size"].is_null() } {
         return Err(MlaDraftError::Invalid("manifest rotary/window/gate contract"));
     }
     let context = a["max_context"].as_u64().filter(|&n| n > 0 && n <= 1048576)
         .ok_or(MlaDraftError::Invalid("manifest context"))? as usize;
-    let layout = Layout::new(context).map_err(|_| MlaDraftError::Invalid("manifest context"))?;
+    let layout = Layout::for_kind(kind, context).map_err(|_| MlaDraftError::Invalid("manifest context"))?;
     if [("num_splits", layout.splits), ("chunks_per_split", layout.chunks_per_split),
         ("partial_output_bytes", layout.partial_output_bytes), ("partial_lse_bytes", layout.partial_lse_bytes),
         ("scratch_bytes", layout.scratch[1])]
@@ -478,14 +484,15 @@ fn ml4_producer_requirements(w: MlaDraftWeights, b: MlaDraftBatch, l: Layout) ->
 fn validate_producer_kind(kind: MlaDraftKind, w: MlaDraftWeights, b: MlaDraftBatch, l: Layout,
     cache_format: MlaCacheFormat) -> Result<()> {
     match kind {
-        MlaDraftKind::Dflash2 | MlaDraftKind::CausalDflash2 => validate_producer(w, b, l, cache_format),
+        MlaDraftKind::Dflash2 | MlaDraftKind::CausalDflash2 =>
+            validate_buffers(&producer_requirements(w, b, l, cache_format, kind.heads())?, b.x.device_id),
         MlaDraftKind::Ml4Dspark => validate_buffers(&ml4_producer_requirements(w, b, l)?, b.x.device_id),
     }
 }
 
 fn validate_batch_kind(kind: MlaDraftKind, w: MlaDraftWeights, b: MlaDraftBatch, l: Layout,
     cache_format: MlaCacheFormat) -> Result<()> {
-    if kind.is_dflash() { return validate_batch(w, b, l, cache_format); }
+    if kind.is_dflash() { return validate_dflash_batch(w, b, l, cache_format, kind.heads()); }
     if b.requests == 0 || b.requests > b.rows || b.page_table_width == 0
         || b.page_table_width > l.context.div_ceil(PAGE) + 1
         || b.active_splits != l.splits || !b.attention_scale.is_finite() || b.attention_scale <= 0.0 {
@@ -508,7 +515,7 @@ fn validate_batch_kind(kind: MlaDraftKind, w: MlaDraftWeights, b: MlaDraftBatch,
     Ok(())
 }
 
-fn producer_requirements(w: MlaDraftWeights, b: MlaDraftBatch, l: Layout, cache_format: MlaCacheFormat) -> Result<Vec<(Buffer, usize)>> {
+fn producer_requirements(w: MlaDraftWeights, b: MlaDraftBatch, l: Layout, cache_format: MlaCacheFormat, heads: usize) -> Result<Vec<(Buffer, usize)>> {
     if !(1..=ROWS).contains(&b.rows) || b.cache_pages == 0 || b.cache_pages > i32::MAX as usize
         || !b.rotary_factor.is_finite() || b.rotary_factor <= 0.0 {
         return Err(MlaDraftError::Invalid("producer geometry/rotary scale"));
@@ -517,30 +524,34 @@ fn producer_requirements(w: MlaDraftWeights, b: MlaDraftBatch, l: Layout, cache_
         .ok_or(MlaDraftError::Invalid("cache extent overflow"))?;
     Ok(vec![(b.x, b.rows * 7168 * 2), (b.slots, b.rows * 8), (b.positions, b.rows * 8),
         (b.inv_freq, 32 * 4), (w.qkv_a, 2112 * 7168 * 2), (w.q_a_norm, 1536 * 2),
-        (w.kv_a_norm, 512 * 2), (w.q_b, HEADS * 192 * 1536 * 2), (w.uk, HEADS * 512 * 128 * 2),
-        (b.cache, cache), (b.query, b.rows * HEADS * 576 * 2), (b.q_resid, b.rows * 1536 * 2),
+        (w.kv_a_norm, 512 * 2), (w.q_b, heads * 192 * 1536 * 2), (w.uk, heads * 512 * 128 * 2),
+        (b.cache, cache), (b.query, b.rows * heads * 576 * 2), (b.q_resid, b.rows * 1536 * 2),
         (b.producer_scratch, l.scratch[0])])
 }
 
 fn validate_producer(w: MlaDraftWeights, b: MlaDraftBatch, l: Layout, cache_format: MlaCacheFormat) -> Result<()> {
-    validate_buffers(&producer_requirements(w, b, l, cache_format)?, b.x.device_id)
+    validate_buffers(&producer_requirements(w, b, l, cache_format, HEADS)?, b.x.device_id)
 }
 
 fn validate_batch(w: MlaDraftWeights, b: MlaDraftBatch, l: Layout, cache_format: MlaCacheFormat) -> Result<()> {
+    validate_dflash_batch(w, b, l, cache_format, HEADS)
+}
+
+fn validate_dflash_batch(w: MlaDraftWeights, b: MlaDraftBatch, l: Layout, cache_format: MlaCacheFormat, heads: usize) -> Result<()> {
     if b.requests == 0 || b.requests > b.rows || b.page_table_width == 0
         || b.page_table_width > l.context.div_ceil(PAGE) + 1
         || b.active_splits != l.splits || !b.attention_scale.is_finite() || b.attention_scale <= 0.0 {
         return Err(MlaDraftError::Invalid("batch/context/split/attention scale"));
     }
-    let mut requirements = producer_requirements(w, b, l, cache_format)?;
+    let mut requirements = producer_requirements(w, b, l, cache_format, heads)?;
     // Scratch planes may share a phase-disjoint allocation; remove them while
     // checking the cross-phase live set, then check each plane against that set.
     let scratch = requirements.pop().ok_or(MlaDraftError::Invalid("producer scratch"))?;
     requirements.extend([(b.page_table, b.requests * b.page_table_width * 4),
         (b.lengths, b.requests * 4), (b.query_offsets, (b.requests + 1) * 4),
-        (b.attention, b.rows * HEADS * 512 * 2), (b.lse, b.rows * HEADS * 4),
-        (b.output, b.rows * 7168 * 2), (w.uv, HEADS * 128 * 512 * 2),
-        (w.output, 7168 * HEADS * 128 * 2)]);
+        (b.attention, b.rows * heads * 512 * 2), (b.lse, b.rows * heads * 4),
+        (b.output, b.rows * 7168 * 2), (w.uv, heads * 128 * 512 * 2),
+        (w.output, 7168 * heads * 128 * 2)]);
     validate_buffers(&requirements, b.x.device_id)?;
     for plane in [scratch, (b.attention_scratch, l.scratch[1]), (b.output_scratch, l.scratch[2])] {
         let mut phase = requirements.clone();
@@ -654,6 +665,30 @@ mod tests {
                 scalar_kinds: [b"fi".as_slice(), b"iilif".as_slice(), b"i".as_slice()][i].to_vec(),
                 scratch: [("scratch".into(), scratch[i] as u64)].into_iter().collect() }
         })
+    }
+
+    #[test]
+    fn causal_manifest_checks_h96_causal_window_and_interleaved_rope() {
+        let window = MlaDraftWindow::CausalSliding1024;
+        let context = 1048576;
+        let layout = Layout::for_kind(MlaDraftKind::CausalDflash2, context).unwrap();
+        let mut native = specs(window, context);
+        for (index, spec) in native.iter_mut().enumerate() {
+            spec.geometry["heads"] = 96.into();
+            spec.geometry["window_size"] = 1024.into();
+            spec.scratch.insert("scratch".into(), layout.scratch[index] as u64);
+        }
+        native[1].geometry["noncausal_block"] = false.into();
+        native[1].geometry["partial_output_bytes"] = layout.partial_output_bytes.into();
+        native[1].geometry["partial_lse_bytes"] = layout.partial_lse_bytes.into();
+        native[1].geometry["scratch_bytes"] = layout.scratch[1].into();
+        assert_eq!(validate_manifest(native.each_ref(), window, MlaCacheFormat::Bf16).unwrap(), layout);
+        for (index, field, bad) in [(0, "heads", 64.into()), (1, "noncausal_block", true.into()),
+            (1, "window_size", 4096.into()), (0, "rotary_style", "half".into())] {
+            let mut broken = native.clone(); broken[index].geometry[field] = bad;
+            assert!(validate_manifest(broken.each_ref(), window, MlaCacheFormat::Bf16).is_err());
+        }
+        assert!(validate_manifest(native.each_ref(), MlaDraftWindow::Sliding4096, MlaCacheFormat::Bf16).is_err());
     }
 
     #[test]
