@@ -467,7 +467,9 @@ mod tests {
                     .partition(|(name, _)| name.strip_prefix("model.layers.")
                         .and_then(|rest| rest.split('.').next()).and_then(|layer| layer.parse::<usize>().ok())
                         .is_some_and(|layer| layer >= cfg.layers));
-                testing::write_mc_snapshot_with_mtp(dir.path(), &cp.config, &tensors, &target, &mtp);
+                let mut config = cp.config.clone();
+                config["quantization_config"].as_object_mut().unwrap().remove("core_bits");
+                testing::write_mc_snapshot_with_mtp(dir.path(), &config, &tensors, &target, &mtp);
             } else {
                 let (config, tensors) = testing::step5_fixture(kind);
                 testing::write_snapshot(dir.path(), &config, &tensors, None);
