@@ -634,7 +634,7 @@ mod tests {
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
         runtime.block_on(async {
             let loaded = super::super::startup::load(&library, &programs, &checkpoint, &full, &cfg,
-                super::super::startup::Options {
+                super::super::startup::Options { media: None,
                     role: super::super::startup::Role::Golden { skip_routed_experts: true },
                     expert_usage: false, expert_usage_reader: Default::default(), cache_format: cuteafd_core::MlaCacheFormat::Fp8,
                     devices: [0, 1], attention: Some(cuteafd_loader::placement::AttentionPlacement::Context),
@@ -652,7 +652,7 @@ mod tests {
             let mut cache = PrefixCache::new(layout, PrefixConfig { entries: 8, mark_slots: 2,
                 keep_logits: true, min_tokens: 1 }, Some((Config { bytes: chunk * 6, chunk_bytes: chunk,
                     min_tokens: 1, ..Default::default() }, copy)))?;
-            let build = |units| super::super::prefix::Placement { units, slot: 0, len: 0, state_len: 0 };
+            let build = |units| super::super::prefix::Placement { media_spans: Vec::new(), units, slot: 0, len: 0, state_len: 0 };
             let tokens = (0..131).map(|token| 1000 + token).collect::<Vec<u32>>();
             let mut placement = cache.admit(&family, &tokens, 132, false, build)?.placement;
             engine.prefill_packed(&mut [(&mut placement, &tokens)], cache.pool(), &mut |_, _| Ok(Ok(())))?;

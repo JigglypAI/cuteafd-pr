@@ -52,6 +52,7 @@ impl Role {
 }
 
 pub(crate) struct Options<'a, const RANKS: usize = 2> {
+    pub media: Option<&'a crate::shared::vision::still::Options>,
     pub role: Role,
     pub expert_usage: bool,
     pub expert_usage_reader: cuteafd_core::expert_usage::Reader,
@@ -85,6 +86,7 @@ pub(crate) struct Options<'a, const RANKS: usize = 2> {
 }
 
 pub(crate) struct Loaded<'a> {
+    pub media: crate::shared::vision::still::Ready,
     pub engine: Engine<'a>,
     pub admission_free: Vec<u64>,
     pub admitted_bytes: Vec<u64>,
@@ -313,7 +315,15 @@ pub(crate) fn load<'a, const RANKS: usize>(library: &'a Arc<cuteafd_ffi::NativeL
     }).collect::<Vec<_>>().try_into().map_err(|_| anyhow::anyhow!("Kimi GPU sample count"))?;
     let peer_receive = [core.attention_receive_bytes(unit, RANKS)?,
         core.attention_receive_bytes(unit.min(64), RANKS)?];
-    let inputs = admission::Inputs { skip_routed_experts, expert_usage: options.expert_usage_reader.configure(options.expert_usage, false).map_err(anyhow::Error::msg)?, cfg, core,
+    let vision=options.media.filter(|m|m.vision!=cuteafd_loader::plan::MediaMode::Off).map(|media|->Result<_>{
+        let view=checkpoint.view.as_ref().context("Kimi media selected view")?;
+        let tower=cuteafd_loader::plan::Checkpoint::open_view_for_role(view,"Kimi still tower",|name|
+            cuteafd_loader::families::kimi_k3::vision::VisionContract::is_tensor(name))?;
+        let inventory=cuteafd_loader::media::still_tower::StillTowerInventory::from_checkpoint(&tower,16698)?;
+        let host=cuteafd_loader::formats::mapped_preload::host_memory()?.0;
+        Ok((inventory,media.vision,media.vision_replicas,media.media_cache_bytes.map_or((8<<30).min(host/20),|b|b.0 as u64)))
+    }).transpose()?;
+    let inputs = admission::Inputs { vision, skip_routed_experts, expert_usage: options.expert_usage_reader.configure(options.expert_usage, false).map_err(anyhow::Error::msg)?, cfg, core,
         resident_weight_limit: crate::shared::memory::budget::resident_weight_limit(), cache_format: options.cache_format, gpus, devices: options.devices,
         peer_access: RANKS == 2, spark_ranks, attention: options.attention, context: context_layout, serving_context: options.context, requested_pool: options.pool_tokens,
         state_slots: options.slots, prefix_marks: options.marks, rows, lanes: 1, waves: options.waves,
@@ -410,7 +420,12 @@ pub(crate) fn load<'a, const RANKS: usize>(library: &'a Arc<cuteafd_ffi::NativeL
     let draft = options.draft.as_ref().zip(draft_layout.as_ref()).map(|(options, layout)|
         super::draft::NativeDraft::load_for_ranks(&mut admitted, programs, options, lane_streams.to_vec(), layout,
             peer.as_ref().map(|peer| ([streams[0].clone(), streams[1].clone()], peer.clone())))).transpose()?;
-    let draft_records = recorder.map(|recorder| recorder.finish()).unwrap_or_default();
+    let mut draft_records = recorder.map(|recorder| recorder.finish()).unwrap_or_default();
+    let off=crate::shared::vision::still::Options {vision:cuteafd_loader::plan::MediaMode::Off,..Default::default()};
+    let mut media=crate::shared::vision::still::Ready::load(options.media.unwrap_or(&off),&checkpoint.snapshot,
+        options.native_lib,library,&options.devices,admitted.vision.clone(),cuteafd_loader::media::ImageFamily::Kimi,
+        admitted.media_cache_bytes)?;
+    draft_records.extend(media.push.records());
     memory.sample("draft-allocated-and-recorded")?;
     if memory.enabled() {
         if let Some(draft) = &draft {
@@ -430,6 +445,7 @@ pub(crate) fn load<'a, const RANKS: usize>(library: &'a Arc<cuteafd_ffi::NativeL
     let engine = Engine::load_admitted(library, streams, lane_streams, draft, draft_records, admitted, options.expert_usage_reader.clone(), checkpoint, native, context_programs, peer, hops,
         options.peers.clone(), cuteafd_transport::TcpTransportConfig { timing: cuteafd_transport::protocol_v2_timing_from_env(), ..Default::default() }, expert_modules, &mut memory)?
         .with_served_context(options.max_context)?;
+    std::mem::take(&mut media.push).commit()?;
     if let Some(dump) = super::dsa_dump::DsaDump::from_env()? {
         engine.attach_dsa_dump(dump)?;
     }
@@ -488,7 +504,7 @@ pub(crate) fn load<'a, const RANKS: usize>(library: &'a Arc<cuteafd_ffi::NativeL
             }
         }
     }
-    Ok(Loaded { engine, admission_free, admitted_bytes, ownership,
+    Ok(Loaded { media, engine, admission_free, admitted_bytes, ownership,
         #[cfg(test)] admission_proof,
     })
 }
@@ -728,7 +744,7 @@ mod tests {
         let pending = cuteafd_loader::placement::inventory::loaded_code_allowance(
             "kimik3", "exl3", false, 0, arch, Some(&selected),
         ).pending(arch.context_bytes, arch.context_bytes);
-        let admitted = super::super::admission::admit(super::super::admission::Inputs::<1> {
+        let admitted = super::super::admission::admit(super::super::admission::Inputs::<1> { vision: None,
             skip_routed_experts: true,
             expert_usage: false,
             cfg: &four_layer,
