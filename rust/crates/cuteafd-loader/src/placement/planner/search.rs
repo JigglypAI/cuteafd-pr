@@ -852,11 +852,20 @@ pub fn solve(
     // Generic solver fixtures declare their exact finite curve domain. Shipping
     // family paths prepare their memory-bounded policy before building curves.
     let contract = recipe.prepare(&request)?;
+    if let Some(tokens) = requested {
+        if tokens % contract.page_rows != 0 {
+            return Err(Refusal::MisalignedPool { tokens, page_rows: contract.page_rows });
+        }
+    }
     let mut facts = crate::placement::PoolFacts::new(&cards, request.context, requested, contract.page_rows);
     facts.encoding_limit = contract.maximum_pages.checked_mul(contract.page_rows);
     let pool = crate::placement::prepare_pool(facts)
         .map_err(|error| Refusal::InvalidFact(error.to_string()))?;
-    solve_prepared(request, budgets, recipe, &pool)
+    struct Prepared(Contract);
+    impl Recipe for Prepared {
+        fn prepare(&self, _: &Request) -> Result<Contract, Refusal> { Ok(self.0.clone()) }
+    }
+    solve_prepared(request, budgets, &Prepared(contract), &pool)
 }
 
 /// Admit a recipe using the same immutable policy that prepared its domain.

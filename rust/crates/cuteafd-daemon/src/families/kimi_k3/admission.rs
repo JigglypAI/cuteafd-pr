@@ -2076,7 +2076,9 @@ pub(super) mod tests {
         let cfg = cfg();
         MemoryPolicy { kv_max: Some(100_000_000), ..Default::default() }.scoped(|| -> Result<()> {
             let automatic = request(inputs(&cfg))?;
-            assert_eq!(automatic.pool.maximum_tokens(), 100_000_000);
+            let derived = (192u64 << 30) / (cfg.mla_layers() as u64 * MLA_PAGE_ROWS as u64
+                * cuteafd_core::MlaCacheFormat::Bf16.record_bytes() as u64) * MLA_PAGE_ROWS as u64;
+            assert_eq!(automatic.pool.maximum_tokens(), 100_000_000.min(derived));
             assert_eq!(automatic.pool.target(), 2 << 20);
             assert_eq!(automatic.pool.compiled_context(), 1 << 20);
             let mut pinned = inputs(&cfg);

@@ -622,8 +622,8 @@ mod tests {
         let (cfg, spark, no_spark) = fixture(1, 256 << 10);
         let context = 256 << 10;
         let mut facts = input(&cfg, &spark, &no_spark, 1, context);
-        facts.pool = crate::placement::prepare_pool(crate::placement::PoolFacts::new(
-            &[96 << 30], context, None, spark.pool_unit_rows)).unwrap();
+        facts.pool = crate::placement::prepare_pool(crate::plan::testing::pool_facts(
+            &[96 << 30], context, None, spark.pool_unit_rows, &[spark.devices[0].pool_unit_bytes])).unwrap();
         let prepared = facts.prepare().unwrap();
         let request = |pool| admission::production_request(context, pool, Onboard::Auto,
             prepared.recipe.prefill, crate::placement::planner::Operation::Serving,
@@ -683,8 +683,8 @@ mod tests {
         let (cfg, spark, no_spark) = fixture(1, 256 << 10);
         let context = 256 << 10;
         let mut prepared = input(&cfg, &spark, &no_spark, 1, context);
-        prepared.pool = crate::placement::prepare_pool(crate::placement::PoolFacts::new(
-            &[1 << 30], context, None, spark.pool_unit_rows)).unwrap();
+        prepared.pool = crate::placement::prepare_pool(crate::plan::testing::pool_facts(
+            &[1 << 30], context, None, spark.pool_unit_rows, &[spark.devices[0].pool_unit_bytes])).unwrap();
         prepared.budgets = admission::production_budgets(&[(1 << 30, 1 << 30)], &[0],
             vec![crate::placement::planner::Baseline::Forecast { occupied: 0,
                 source: "unit test".into(), assumed: false }], crate::plan::testing::SimulatedHost::raptor().host_ram,
