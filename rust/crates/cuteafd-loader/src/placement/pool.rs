@@ -123,31 +123,19 @@ impl PoolPolicy {
     /// `card_bytes` are the coordinator GPUs' totals; `context` the compiled
     /// serving context; `requested` 0 or `None` means automatic. KV target,
     /// min and max come from the installed memory policy.
-    pub fn resolve(card_bytes: &[u64], context: u64, requested: Option<u64>, unit_rows: u64) -> Self {
-        let requested = Self::normalize_request(requested);
-        let smallest = card_bytes.iter().copied().min().unwrap_or(u64::MAX);
-        let policy = MemoryPolicy::current();
-        let target_default = if smallest <= SMALL_CARD_BYTES { cuteafd_core::memory_policy::SMALL_CARD_KV_TARGET_TOKENS }
-            else { cuteafd_core::serving_capacity::DEFAULT_GPU_KV_TOKENS };
-        let target = policy.kv_target.unwrap_or(target_default.max(context));
-        let minimum = policy.kv_min.unwrap_or(context.min(AGENTIC_FLOOR_TOKENS).min(target));
-        let floor = match requested {
-            Some(n) => n.max(context),
-            None => context.max(minimum),
-        };
-        let max = requested.unwrap_or_else(|| policy.kv_max.unwrap_or(target).max(target));
-        Self { context: context.into(), compiled_context: context, requested, target, floor, ceiling: u64::MAX, max, unit_rows }
+    pub(super) fn resolve(card_bytes: &[u64], context: u64, requested: Option<u64>, unit_rows: u64) -> Self {
+        prepare_pool(PoolFacts::new(card_bytes, context, requested, unit_rows))
+            .expect("legacy placement fixture requires valid policy")
     }
 
-    /// Apply the shared context requirement without changing workspace extents.
-    pub fn with_context(mut self, context: super::planner::Context) -> Self {
-        self.context = context;
-        self.compiled_context = context.maximum;
-        self.target = MemoryPolicy::current().kv_target.unwrap_or(self.target).max(context.required());
-        let minimum = MemoryPolicy::current().kv_min
-            .unwrap_or(context.maximum.min(AGENTIC_FLOOR_TOKENS).min(self.target));
-        self.floor = self.requested.unwrap_or(minimum).max(context.required());
-        self
+    pub(super) fn with_context(self, context: super::planner::Context) -> Self {
+        let facts = PoolFacts { card_bytes: &[], context, requested: self.requested,
+            target: Some(self.target), unit_rows: self.unit_rows, encoding_limit: Some(self.ceiling) };
+        prepare_pool(facts).expect("legacy placement fixture requires valid policy")
+    }
+
+    pub fn bounds(&self) -> cuteafd_core::memory_policy::KvBounds {
+        cuteafd_core::memory_policy::KvBounds { target: self.target, min: self.floor, max: self.max }
     }
 
     /// Pin a selected pool for re-admission without inventing an operator request.

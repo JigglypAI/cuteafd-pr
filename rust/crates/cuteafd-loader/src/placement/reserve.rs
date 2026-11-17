@@ -194,9 +194,10 @@ pub fn log_layout(layout: &cuteafd_core::memory_layout::MemoryLayout, family: &s
 pub fn layout_lines(layout: &cuteafd_core::memory_layout::MemoryLayout, family: &str, context: u64,
     gpu_caps: &[u64], physical_card: u64) -> Vec<String> {
     use cuteafd_core::memory_layout::DeviceKind as Layout;
-    let policy = MemoryPolicy::current();
-    let smallest = physical_card;
-    let Ok(kv) = policy.kv(smallest, context) else { return Vec::new() };
+    let _ = physical_card;
+    let Ok(resolved) = super::prepare_pool(super::PoolFacts::new(gpu_caps, context, None, 1))
+        else { return Vec::new() };
+    let kv = resolved.bounds();
     let pool = cuteafd_core::memory_policy::PoolBreakdown { kv, pool_tokens: layout.pool_tokens };
     layout.devices.iter().map(|device| {
         let (kind, named) = match device.kind {
@@ -223,10 +224,8 @@ pub fn layout_lines(layout: &cuteafd_core::memory_layout::MemoryLayout, family: 
 pub fn log_plan(plan: &super::planner::ResolvedPlan, family: &str) {
     use super::planner::{Device, Domain, Location};
     let policy = MemoryPolicy::current();
-    let smallest = plan.budgets.iter().filter(|budget| budget.locations.iter()
-        .any(|location| matches!(location.device, Device::Coordinator(_))))
-        .map(|budget| budget.physical_bytes).min().unwrap_or(u64::MAX);
-    let Ok(kv) = policy.kv(smallest, plan.request.context.maximum) else { return };
+    let Some(resolved) = plan.pool_policy else { return };
+    let kv = resolved.bounds();
     let pool = cuteafd_core::memory_policy::PoolBreakdown { kv, pool_tokens: plan.pool_tokens };
     // Preserve the alias-free accepted owners across every physical domain,
     // including host/pinned/managed locations sharing a GB10 budget.
@@ -279,8 +278,7 @@ pub fn log_plan(plan: &super::planner::ResolvedPlan, family: &str) {
 /// Log the admitted per-GPU breakdown of a legacy-solver placement.
 pub fn log_placement(placement: &super::Placement, request: &super::PlacementRequest) {
     let policy = MemoryPolicy::current();
-    let smallest = request.inventory.gpus.iter().map(|gpu| gpu.capacity_bytes).min().unwrap_or(u64::MAX);
-    let Ok(kv) = policy.kv(smallest, request.pool.compiled_context) else { return };
+    let kv = request.pool.bounds();
     let pool = cuteafd_core::memory_policy::PoolBreakdown { kv, pool_tokens: placement.pool_tokens };
     for (gpu, (budget, items)) in request.inventory.gpus.iter().zip(&placement.items).enumerate() {
         let line = cuteafd_core::memory_policy::render_line(&breakdown(format!("rtx{gpu}"), DeviceKind::Gpu,
