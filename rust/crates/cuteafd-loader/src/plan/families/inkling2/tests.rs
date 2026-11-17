@@ -669,6 +669,25 @@ fn shared_recipe_charges_every_owner_once_on_one_and_two_rtx() {
                 if template.id == format!("inkling2.cache.{gpu}.active"))), "rtx{gpu} marks");
         }
         let admitted = inputs.admit(request.clone()).unwrap();
+        use cuteafd_core::memory_policy::MemoryPolicy;
+        let grow = MemoryPolicy { kv_max: Some(100_000_000), ..Default::default() };
+        let grown = grow.scoped(|| {
+            let mut growing = inputs.clone();
+            growing.maximum_pool_tokens = crate::placement::PoolPolicy::resolve(
+                &vec![96 << 30; gpus], inputs.context.maximum, None, shared::PAGE_ROWS).maximum_tokens();
+            growing.admit(request.clone()).unwrap()
+        });
+        assert_eq!(grown.onboard, admitted.onboard, "growth must preserve Inkling onboarding");
+        assert!(grown.solved.pool_tokens > admitted.solved.pool_tokens,
+            "{placement:?} on {gpus} GPUs: {} -> {}", admitted.solved.pool_tokens, grown.solved.pool_tokens);
+        let explicit = grow.scoped(|| {
+            let mut pinned = inputs.clone();
+            pinned.maximum_pool_tokens = admitted.solved.pool_tokens;
+            let mut exact = request.clone();
+            exact.pool = crate::placement::planner::Pin::Exact(admitted.solved.pool_tokens);
+            pinned.admit(exact).unwrap()
+        });
+        assert_eq!(explicit.solved.pool_tokens, admitted.solved.pool_tokens);
         let mut fp8_inputs = inputs.clone();
         fp8_inputs.kv_format = crate::families::inkling2::InklingKvCache::Fp8;
         let fp8_contract = fp8_inputs.prepare(&request).unwrap();
