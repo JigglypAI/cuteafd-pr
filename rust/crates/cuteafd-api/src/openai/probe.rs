@@ -187,8 +187,10 @@ pub fn sha256_hex(value: &str) -> bool {
 impl ProbeSpec {
     /// Only registered teacher-forced fidelity requests may supply feature rows.
     pub fn feature_scoring(&self) -> bool {
-        self.cold && self.no_speculation && self.score_from.is_some()
-            && self.prompt_ids.is_some() && !self.media.is_empty() && self.audio.is_empty()
+        self.cold && self.no_speculation && !self.media.is_empty() && self.audio.is_empty()
+            && self.prompt_ids.as_ref().zip(self.score_from).is_some_and(|(tokens, from)|
+                from > 0 && from < tokens.len() && self.media.iter().all(|span|
+                    span.start.checked_add(span.len).is_some_and(|end| end <= from)))
             && self.media.iter().all(|span| span.fixture.is_some())
     }
 
