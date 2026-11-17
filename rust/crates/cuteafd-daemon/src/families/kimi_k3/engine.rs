@@ -21,6 +21,7 @@ pub(crate) struct GraphWarmup {
 }
 
 pub(crate) struct Engine<'a> {
+    pub(crate) probe_media: RefCell<std::collections::BTreeMap<usize, cuteafd_engine::media::RequestMedia>>,
     pub max_pool_tokens_no_onboard: Option<u64>,
     pub host_prefix: Option<cuteafd_hostcache::config::Config>,
     target_view: cuteafd_loader::plan::checkpoint::CheckpointView,
@@ -340,7 +341,7 @@ impl<'a> Engine<'a> {
         let execution = Execution::new(plan, peer.as_deref(), hops.as_ref(), exchange_streams.clone(), streams)?;
         let depth = crate::shared::prefill_depth::PrefillDepth::new(prefill.waves, prefill.unit_rows)?;
         let served_context = local[0][0].max_context();
-        Ok(Self { host_prefix: None, max_pool_tokens_no_onboard: None, target_view, depth, draft: None, draft_probe: RefCell::new(None), execution, lanes: RefCell::new(Lanes { local, routed, io, experts }),
+        Ok(Self { probe_media: RefCell::new(Default::default()), host_prefix: None, max_pool_tokens_no_onboard: None, target_view, depth, draft: None, draft_probe: RefCell::new(None), execution, lanes: RefCell::new(Lanes { local, routed, io, experts }),
             prefix: RefCell::new(None), provisional: RefCell::new(None),
             hops, peer, terminal: Cell::new(TerminalState::Active), exchange_streams, prefill, packed_row_cap: Cell::new(None), coordinator_packing_cap, served_context })
     }
@@ -444,6 +445,14 @@ impl<'a> Engine<'a> {
             }).collect::<Vec<_>>();
             let tokens = sequences.iter().flat_map(|(_, tokens)| tokens.iter().copied()).collect::<Vec<_>>();
             lanes.io[0][0].embed(&tokens, lanes.local[0][0].buffer("delta")?)?;
+            let mut offset = 0;
+            for (placement, ids) in sequences.iter() {
+                if let Some(media) = self.probe_media.borrow().get(&placement.slot) {
+                    lanes.io[0][0].inject_probe(media, placement.len, ids.len(), offset,
+                        lanes.local[0][0].buffer("delta")?)?;
+                }
+                offset += ids.len();
+            }
             let Lanes { local, routed, io, experts } = &mut *lanes;
             let normalized = self.execution.run_packed(scope, self.peer.as_deref(), self.hops.as_ref(),
                 &mut local[0], &mut routed[0], &mut experts[0], &metadata, pool, self.draft.as_deref())?;
@@ -743,6 +752,14 @@ impl<'a> Engine<'a> {
             if !unit_call { for local in &mut lanes.local[0] { local.stage_attention(&metadata, pool)?; } }
             let tokens = sequences.iter().flat_map(|(_, tokens)| tokens.iter().copied()).collect::<Vec<_>>();
             lanes.io[0][0].embed(&tokens, lanes.local[0][0].buffer("delta")?)?;
+            let mut offset = 0;
+            for (placement, ids) in sequences.iter() {
+                if let Some(media) = self.probe_media.borrow().get(&placement.slot) {
+                    lanes.io[0][0].inject_probe(media, placement.len, ids.len(), offset,
+                        lanes.local[0][0].buffer("delta")?)?;
+                }
+                offset += ids.len();
+            }
             let Lanes { local, routed, io, experts } = &mut *lanes;
             for binding in &mut local[0] { binding.enable_replay(graphed); }
             let result = if unit_call {

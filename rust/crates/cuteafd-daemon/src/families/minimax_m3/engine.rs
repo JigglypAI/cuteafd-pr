@@ -538,6 +538,17 @@ impl<F: FnMut(usize, Range<usize>, DeviceLogits) -> Result<()>> SlotArithmetic f
         Head::embed_tokens(self.cfg, capacity, &self.storage.embedding, &tokens, &owner.stream,
             super::cache::view(owner.plane("route_ids")?, 0, capacity * 4)?,
             owner.dense.producer_destination(), owner.plane("residual")?)?;
+        let media = self.storage.probe_media.borrow();
+        for segment in &unit.segments {
+            let request = &requests[segment.sequence];
+            if let Some(media) = media.get(&request.placement.slot) {
+                let rows = segment.tokens.len();
+                let output = super::cache::view(owner.plane("residual")?, segment.rows.start * self.cfg.hidden * 4,
+                    rows * self.cfg.hidden * 4)?;
+                owner.stream.device.run(|| crate::shared::probe::still::inject(&owner.stream,
+                    output, media, segment.tokens.start, rows, self.cfg.hidden, true))?;
+            }
+        }
         if let Some(heads) = &self.storage.heads {
             let peer = self.storage.ranks[1].prefill[unit.slot].borrow();
             heads.replicate([&owner, &peer], "residual", unit.rows.len() * self.cfg.hidden * 4)?;

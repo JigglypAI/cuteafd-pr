@@ -147,6 +147,7 @@ pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
     })).context("Kimi serving requires --model-id for a snapshot without HF identity")?;
     let mut profile = ModelProfile::new(model, ModelEncoding::Kimi(encoding));
     profile.expert_usage = args.expert_usage_reader.clone();
+    profile = crate::shared::probe::still::install(profile, &args.snapshot, cuteafd_loader::media::ImageFamily::Kimi)?;
     let (queue, mut receive) = tokio::sync::mpsc::channel::<NativeRequest>(cuteafd_core::concurrency::queue_depth(args.max_sequences as u64) as usize);
     let stats = Arc::new(Mutex::new(serde_json::Value::Null));
     let worker_stats = stats.clone();
@@ -201,7 +202,7 @@ pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
                     None => scheduler::Drafts::None,
                 }, worker_args.draft_length, eos, worker_args.decode_share, &worker_args.prefix,
                 worker_args.loop_abort.config(), worker_args.token_io.token_select,
-                &mut super::super::qwen3_5::serve::text_media(), None, || {
+                &mut crate::shared::probe::still::admission(), None, || {
                     loaded.engine.require_live()?;
                     crate::shared::inventory::RuntimeInventory::measure(&library,
                         &physical_devices,

@@ -4,7 +4,7 @@ use crate::shared::{draft::routes::RoundRoutes, prefix::{CudaCopyEngine, PrefixA
     qwen::scheduler::{self, Backend}, token_io::DeviceLogits};
 use anyhow::{ensure, Result};
 use cuteafd_api::openai::NativeRequest;
-use cuteafd_engine::{media::{EncodeJob, EmbeddingCache, MediaKeys, RequestMedia},
+use cuteafd_engine::{media::{EncodeJob, EmbeddingCache, RequestMedia},
     prefix::{PrefixCache, PrefixConfig, PrefixFamily, RefPagePool}};
 use std::{cell::{Cell, RefCell}, path::Path};
 
@@ -70,25 +70,26 @@ impl<'e, 'a> Backend<'a> for KimiBackend<'e, 'a> {
         Ok((family, cache))
     }
     fn prepare(&self, job: NativeRequest, tokens: Vec<u32>) -> Result<(scheduler::Prompt, RequestMedia, Vec<EncodeJob>)> {
-        ensure!(job.media.is_empty(), "Kimi serving currently supports text only");
-        let keys = MediaKeys::new(&tokens, u32::try_from(self.geometry.vocab_size)?, &[])?;
-        let media = RequestMedia::new(Vec::new(), 7168, tokens.len())?;
-        Ok((scheduler::Prompt { job, tokens, keys }, media, Vec::new()))
+        crate::shared::probe::still::prepare(job, tokens, u32::try_from(self.geometry.vocab_size)?,
+            7168, self.geometry.max_context, self.engine.target_view().snapshot(), cuteafd_loader::media::ImageFamily::Kimi)
     }
     fn probe_features(&self, prompt: &scheduler::Prompt, media: &mut RequestMedia,
-        _cache: &mut EmbeddingCache, _snapshot: &Path) -> Result<()> {
-        ensure!(prompt.job.media.is_empty() && media.spans().is_empty(), "Kimi media is not admitted");
-        Ok(())
+        cache: &mut EmbeddingCache, snapshot: &Path) -> Result<()> {
+        crate::shared::probe::still::features(prompt, media, cache, snapshot, cuteafd_loader::media::ImageFamily::Kimi)
     }
-    fn coordinates(&self, _tokens: &[u32], job: &NativeRequest, media: &RequestMedia) -> Result<()> {
-        ensure!(job.media.is_empty() && media.spans().is_empty(), "Kimi text coordinates require no media");
+    fn coordinates(&self, tokens: &[u32], job: &NativeRequest, media: &RequestMedia) -> Result<()> {
+        let spans = crate::shared::probe::still::spans(job, tokens, self.geometry.vocab_size as u32,
+            self.geometry.max_context, self.engine.target_view().snapshot(), cuteafd_loader::media::ImageFamily::Kimi)?;
+        ensure!(spans == media.spans(), "Kimi probe media coordinates differ");
         Ok(())
     }
     fn placement(&self, units: Vec<u32>, slot: i32) -> Placement {
         Placement { units, slot: slot as usize, len: 0, state_len: 0 }
     }
-    fn bind_request(&self, placement: &mut Placement, _coordinates: (), _media: RequestMedia,
+    fn bind_request(&self, placement: &mut Placement, _coordinates: (), media: RequestMedia,
         _tokens: &[u32], resume: usize) -> Result<()> {
+        self.engine.probe_media.borrow_mut().remove(&placement.slot);
+        if !media.spans().is_empty() { self.engine.probe_media.borrow_mut().insert(placement.slot, media); }
         if let Some(draft) = self.engine.native_draft() {
             let (origin, end) = draft.frontier(placement.slot)?;
             ensure!(end == resume, "Kimi draft binding differs from prefix admission");
@@ -281,6 +282,7 @@ impl<'e, 'a> Backend<'a> for KimiBackend<'e, 'a> {
     }
     fn cancel(&self, placement: &Placement) -> Result<()> {
         self.engine.cancel_provisional(placement)?;
+        self.engine.probe_media.borrow_mut().remove(&placement.slot);
         if let Some(draft) = self.engine.native_draft() { draft.discard(placement.slot)?; }
         Ok(())
     }

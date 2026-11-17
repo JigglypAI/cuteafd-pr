@@ -161,7 +161,8 @@ impl ProbeMedia {
         let key = if let Some(identity) = &self.identity {
             let processor = PreprocessId(digest(&identity.processor)?);
             anyhow::ensure!(processor == image.processor, "probe image processor differs");
-            PreparedImage::key_for(EncoderId(digest(&identity.encoder)?), processor, image.grid, &image.rgb8)
+            PreparedImage::key_for_pixels(EncoderId(digest(&identity.encoder)?), processor,
+                image.grid, &image.rgb8, image.pixels)?
         } else { image.key };
         anyhow::ensure!(self.len == image.tokens && self.grid == [image.grid.t, image.grid.h, image.grid.w]
             && self.key == hex(&key.0), "probe prepared image identity differs");
@@ -185,6 +186,15 @@ pub fn sha256_hex(value: &str) -> bool {
 }
 
 impl ProbeSpec {
+    /// Only registered teacher-forced fidelity requests may supply feature rows.
+    pub fn feature_scoring(&self) -> bool {
+        self.cold && self.no_speculation && !self.media.is_empty() && self.audio.is_empty()
+            && self.prompt_ids.as_ref().zip(self.score_from).is_some_and(|(tokens, from)|
+                from > 0 && from < tokens.len() && self.media.iter().all(|span|
+                    span.start.checked_add(span.len).is_some_and(|end| end <= from)))
+            && self.media.iter().all(|span| span.fixture.is_some())
+    }
+
     pub fn validate_cold_steps(&self, len: usize, prefill_rows: usize, decode_rows: usize) -> anyhow::Result<()> {
         if self.cold_steps.is_empty() { return Ok(()); }
         anyhow::ensure!(self.cold && self.no_speculation && self.score_from.is_none(),

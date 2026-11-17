@@ -129,6 +129,8 @@ pub struct ModelProfile {
     /// Live readiness for remote vision; absent on existing local serving paths.
     pub vision_health: Option<Arc<std::sync::atomic::AtomicBool>>,
     pub media_preparer: Option<Arc<media::MediaPreparer>>,
+    /// Fidelity feature overrides only; never advertises a loaded vision encoder.
+    pub probe_media_preparer: Option<Arc<media::MediaPreparer>>,
     pub audio_preparer: Option<Arc<media::audio::AudioPreparer>>,
     pub audio_health: Option<Arc<std::sync::atomic::AtomicBool>>,
     /// Loaded encoder capabilities, not checkpoint metadata or requested placement.
@@ -170,7 +172,7 @@ impl ModelProfile {
     pub fn new(id: impl Into<String>, encoding: ModelEncoding) -> Self {
         let eos_token_ids = encoding.eos_token_ids();
         let capabilities = MediaCapabilities { vision: matches!(encoding, ModelEncoding::DeepseekV41), audio: false };
-        Self { stats_diagnostics: None, expert_usage: Default::default(), id: id.into(), encoding, eos_token_ids, capabilities, engine_health: None, media_preparer: None, vision_health: None,
+        Self { stats_diagnostics: None, expert_usage: Default::default(), id: id.into(), encoding, eos_token_ids, capabilities, engine_health: None, media_preparer: None, probe_media_preparer: None, vision_health: None,
             audio_preparer: None, audio_health: None, gateway: None, v41_turns: V41Turns::default(),
             literal_tokens: Arc::new(cuteafd_loader::LiteralTokens::new([
                 "<｜deepseek_image｜>", "<｜begin▁of▁sentence｜>", "<｜end▁of▁sentence｜>",
@@ -198,6 +200,11 @@ impl ModelProfile {
     pub fn with_loaded_vision(mut self, preparer: Arc<media::MediaPreparer>) -> Self {
         self.media_preparer = Some(preparer);
         self.capabilities.vision = true;
+        self
+    }
+
+    pub fn with_probe_media(mut self, preparer: Arc<media::MediaPreparer>) -> Self {
+        self.probe_media_preparer = Some(preparer);
         self
     }
 
@@ -441,7 +448,7 @@ pub fn router_for_model(queue: mpsc::Sender<NativeRequest>, limits: NativeLimits
         .route("/assets/cuteafd-logo.svg", get(console::logo))
         .route("/assets/cuteafd-mark.svg", get(console::mark))
         .with_state(console);
-    let body_limit = axum::extract::DefaultBodyLimit::max(if profile.media_preparer.is_some() || profile.audio_preparer.is_some() { 256 << 20 } else { images::BODY_BYTES });
+    let body_limit = axum::extract::DefaultBodyLimit::max(if profile.media_preparer.is_some() || profile.probe_media_preparer.is_some() || profile.audio_preparer.is_some() { 256 << 20 } else { images::BODY_BYTES });
     let mount = profile.gateway.clone();
     let state = NativeState { queue, limits, images, stats, tables, admission, profile: Arc::new(profile) };
     let mut routes = Router::new()
@@ -816,8 +823,10 @@ pub(crate) fn build(profile: &ModelProfile, limits: NativeLimits, headers: &axum
     }
     images::guard_content(&body, profile.capabilities).map_err(Rejection::bad)?;
     let probe = headers.get(probe::HEADER).and_then(|v| v.to_str().ok()).and_then(|id| probe::registry().claim(id));
+    let probe_preparer = probe.as_ref().filter(|p| p.spec.feature_scoring())
+        .and(profile.probe_media_preparer.as_ref());
     if let Some(p) = &probe {
-        let geometry = profile.media_preparer.as_ref().map(|p| p.config().token_geometry())
+        let geometry = profile.media_preparer.as_ref().or(probe_preparer).map(|p| p.config().token_geometry())
             .unwrap_or(cuteafd_core::media::ImageTokenGeometry::MERGED);
         let audio = profile.audio_preparer.as_ref().map(|p| p.geometry())
             .unwrap_or(cuteafd_core::media::AudioTokenGeometry::MimoRvq);
@@ -825,8 +834,8 @@ pub(crate) fn build(profile: &ModelProfile, limits: NativeLimits, headers: &axum
             p.fail(format!("{message:#}"));
             return Err(Rejection::bad(message));
         }
-        if !p.spec.media.is_empty() && (!profile.capabilities.vision || profile.media_preparer.is_none()
-            || matches!(profile.encoding, ModelEncoding::DeepseekV41)) {
+        if !p.spec.media.is_empty() && ((!profile.capabilities.vision || profile.media_preparer.is_none())
+            && probe_preparer.is_none() || matches!(profile.encoding, ModelEncoding::DeepseekV41)) {
             p.fail("probe media requires a loaded encoder");
             return Err(Rejection::bad("probe media requires a loaded encoder"));
         }
@@ -1228,7 +1237,8 @@ async fn prepare_media(profile: &ModelProfile, decoder: &images::ImageDecoder, w
         }
     };
     let media = if media_sources.is_empty() { Vec::new() } else {
-        let preparer = profile.media_preparer.as_ref().expect("sources require preparer").clone();
+        let preparer = profile.media_preparer.as_ref().or_else(|| probe.filter(|p| p.spec.feature_scoring())
+            .and(profile.probe_media_preparer.as_ref())).expect("validated media preparer").clone();
         let slot = preparer.slots.clone().acquire_owned().await
             .map_err(|_| Rejection::unavailable("image preparation is closed"))?;
         let hashes = probe.map(|p| p.spec.media.iter()
@@ -2701,6 +2711,74 @@ mod tests {
             if let Some(worker) = worker { worker.await.unwrap(); }
         }
     }
+    #[tokio::test]
+    async fn fidelity_preparer_never_enables_public_vision_or_ordinary_image_chat() {
+        use base64::Engine;
+        use sha2::{Digest, Sha256};
+        use cuteafd_loader::media::{EncoderId, ImageFamily, ProcessorConfig};
+        let preparer = Arc::new(media::MediaPreparer::new(ProcessorConfig::for_family(ImageFamily::Mimo),
+            EncoderId([1; 32]), media::ImageUrlFetch::Off, 1).unwrap());
+        let bytes = include_bytes!("openai/fixtures/black.png");
+        let url = format!("data:image/png;base64,{}", base64::engine::general_purpose::STANDARD.encode(bytes));
+        let image = preparer.prepare(&[media::MediaSource { url: url.clone(), low: false }]).unwrap().images.remove(0);
+        let spec = probe::ProbeSpec { cold: true, no_speculation: true, score_from: Some(image.tokens + 1),
+            prompt_ids: Some(vec![1; image.tokens + 3]),
+            media: vec![probe::ProbeMedia { start: 1, len: image.tokens, kind: "image".into(),
+                key: image.key.0.iter().map(|v| format!("{v:02x}")).collect(),
+                grid: [image.grid.t, image.grid.h, image.grid.w], identity: None, input_key: None,
+                fixture: Some(probe::ProbeFixture { path: "image.png".into(), sha256: format!("{:x}", Sha256::digest(bytes)) }),
+                image_url: Some(probe::ProbeImageUrl { url: url.clone(), detail: None }) }], ..Default::default() };
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("tokenizer_config.json"), json!({"added_tokens_decoder":{
+            "163587":{"content":kimi::OPEN},"163588":{"content":kimi::CLOSE},
+            "163589":{"content":kimi::SEP},"163586":{"content":kimi::END}}}).to_string()).unwrap();
+        std::fs::write(root.path().join("generation_config.json"), "{\"eos_token_id\":163586}").unwrap();
+        for encoding in [ModelEncoding::Kimi(Arc::new(kimi::KimiEncoding::from_snapshot(root.path()).unwrap())),
+            ModelEncoding::MiniMax(Arc::new(minimax::fixtures::encoding()))] {
+        let profile = ModelProfile::new(MODEL, encoding).with_probe_media(preparer.clone());
+        assert!(!profile.capabilities.vision && profile.media_preparer.is_none());
+        let (tx, mut rx) = mpsc::channel::<NativeRequest>(1);
+        let app = router_for_model(tx, NativeLimits::default(), Arc::new(Mutex::new(Value::Null)),
+            std::time::Duration::from_secs(1), ConsoleHub::disabled(), profile);
+        let response = app.clone().oneshot(axum::http::Request::get("/v1/models").body(Body::empty()).unwrap()).await.unwrap();
+        let models: Value = serde_json::from_slice(&axum::body::to_bytes(response.into_body(), 1 << 20).await.unwrap()).unwrap();
+        assert_eq!(models["data"][0]["capabilities"]["vision"], false);
+        let normal = json!({"model":MODEL,"messages":[{"role":"user","content":[
+            {"type":"image_url","image_url":{"url":url}}, {"type":"text","text":"describe"}]}],"max_tokens":1});
+        let response = app.clone().oneshot(axum::http::Request::post("/v1/chat/completions")
+            .header("content-type","application/json").body(Body::from(normal.to_string())).unwrap()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(rx.try_recv().is_err());
+        let body = json!({"model":MODEL,"messages":[{"role":"user","content":"probe"}],"max_tokens":1});
+        for index in 0..4 {
+            let mut invalid = spec.clone();
+            match index { 0 => invalid.cold = false, 1 => invalid.no_speculation = false,
+                2 => invalid.score_from = None, _ => invalid.media[0].fixture = None }
+            let (id, _) = probe::registry().register(invalid);
+            let response = app.clone().oneshot(axum::http::Request::post("/v1/chat/completions")
+                .header(probe::HEADER,id).header("content-type","application/json")
+                .body(Body::from(body.to_string())).unwrap()).await.unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            assert!(rx.try_recv().is_err());
+        }
+        let image = image.clone();
+        let worker = tokio::spawn(async move {
+            let job = rx.recv().await.unwrap();
+            assert!(job.probe.as_ref().unwrap().spec.feature_scoring());
+            assert_eq!(job.media[0].key, image.key);
+            job.events.send(Ok(InferenceChunk::Ready { system_fingerprint: None,
+                prompt_usage: PromptUsage { prompt_tokens: 1, prompt_cache_hit_tokens: 0 } })).unwrap();
+            job.events.send(Ok(InferenceChunk::Finish { finish_reason: InferenceFinishReason::Length })).unwrap();
+        });
+        let (id, _) = probe::registry().register(spec.clone());
+        let response = app.oneshot(axum::http::Request::post("/v1/chat/completions")
+            .header(probe::HEADER,id).header("content-type","application/json")
+            .body(Body::from(body.to_string())).unwrap()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        worker.await.unwrap();
+        }
+    }
+
     #[tokio::test]
     async fn expanded_media_probe_prepares_sources_without_chat_rendering() {
         use base64::Engine;

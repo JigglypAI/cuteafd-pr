@@ -6,7 +6,7 @@ use crate::shared::{draft::routes::RoundRoutes, prefix::{CudaCopyEngine, PrefixA
     qwen::scheduler::{self, Backend}, token_io::{DeviceLogits, TokenSelector}};
 use anyhow::{ensure, Context, Result};
 use cuteafd_api::openai::NativeRequest;
-use cuteafd_engine::{media::{EncodeJob, EmbeddingCache, MediaKeys, RequestMedia},
+use cuteafd_engine::{media::{EncodeJob, EmbeddingCache, RequestMedia},
     prefix::{PrefixCache, PrefixConfig, PrefixFamily, RefPagePool}};
 use cuteafd_loader::families::minimax_m3::MiniMaxM3Config;
 use cuteafd_transport::ExpertV2SourceKind;
@@ -61,8 +61,6 @@ fn validate_prefix_concurrency(requested: usize, admitted: usize) -> Result<()> 
 pub(crate) enum BackendError {
     #[error("MiniMax neural/speculative drafts are not qualified")]
     DraftsNotQualified,
-    #[error("MiniMax bundled media serving is not qualified")]
-    MediaNotQualified,
     #[error("MiniMax backend is terminal after a failed native submission")]
     Terminal,
 }
@@ -129,6 +127,7 @@ impl PolicyProbe {
 /// No allocations or placement choices here: startup passes its admitted context
 /// and host-prefix config, and the Owners borrow pins every native backing.
 pub(crate) struct MiniMaxBackend<'e, 'a> {
+    snapshot: std::path::PathBuf,
     owners: &'e Owners<'a>,
     cfg: &'e MiniMaxM3Config,
     execution: RefCell<ServingPrefill<'a>>,
@@ -146,6 +145,9 @@ pub(crate) struct MiniMaxBackend<'e, 'a> {
 }
 
 impl<'e, 'a> MiniMaxBackend<'e, 'a> {
+    pub(crate) fn with_probe_snapshot(mut self, snapshot: &Path) -> Self {
+        self.snapshot = snapshot.to_owned(); self
+    }
     pub fn new(owners: &'e Owners<'a>, cfg: &'e MiniMaxM3Config, execution: ServingPrefill<'a>,
         served_context: usize, host: Option<cuteafd_hostcache::config::Config>,
         packing: crate::shared::prefill_packing::PackingMode) -> Result<Self> {
@@ -171,7 +173,7 @@ impl<'e, 'a> MiniMaxBackend<'e, 'a> {
         }
         let schedule = Requests::new(state.capacity, served_context, cfg.layers, rank.prefill.len())?;
         drop(state);
-        Ok(Self { owners, cfg, execution: RefCell::new(execution), schedule, context: served_context,
+        Ok(Self { snapshot: Default::default(), owners, cfg, execution: RefCell::new(execution), schedule, context: served_context,
             host, profile: RefCell::new([0.0; 2]), policy_probe:RefCell::new(PolicyProbe::default()), identities: RefCell::new(BTreeMap::new()),
             next_identity: Cell::new(1), pending: RefCell::new(None), terminal: Cell::new(false),
             selector_receipts: RefCell::new(None), packing })
@@ -353,26 +355,26 @@ impl<'e, 'a> Backend<'a> for MiniMaxBackend<'e, 'a> {
         Ok((family, cache))
     }
     fn prepare(&self, job: NativeRequest, tokens: Vec<u32>) -> Result<(scheduler::Prompt, RequestMedia, Vec<EncodeJob>)> {
-        ensure!(job.media.is_empty(), BackendError::MediaNotQualified);
         self.owners.storage.embedding.check(&tokens)?;
-        let keys = MediaKeys::new(&tokens, u32::try_from(self.cfg.vocab_size)?, &[])?;
-        let media = RequestMedia::new(Vec::new(), self.cfg.hidden, tokens.len())?;
-        Ok((scheduler::Prompt { job, tokens, keys }, media, Vec::new()))
+        crate::shared::probe::still::prepare(job, tokens, u32::try_from(self.cfg.vocab_size)?, self.cfg.hidden,
+            self.context, &self.snapshot, cuteafd_loader::media::ImageFamily::MiniMax)
     }
     fn probe_features(&self, prompt: &scheduler::Prompt, media: &mut RequestMedia,
-        _: &mut EmbeddingCache, _: &Path) -> Result<()> {
-        ensure!(prompt.job.media.is_empty() && media.spans().is_empty(), BackendError::MediaNotQualified);
-        Ok(())
+        cache: &mut EmbeddingCache, snapshot: &Path) -> Result<()> {
+        crate::shared::probe::still::features(prompt, media, cache, snapshot, cuteafd_loader::media::ImageFamily::MiniMax)
     }
-    fn coordinates(&self, _: &[u32], job: &NativeRequest, media: &RequestMedia) -> Result<()> {
-        ensure!(job.media.is_empty() && media.spans().is_empty(), BackendError::MediaNotQualified);
+    fn coordinates(&self, tokens: &[u32], job: &NativeRequest, media: &RequestMedia) -> Result<()> {
+        let spans = crate::shared::probe::still::spans(job, tokens, self.cfg.vocab_size as u32,
+            self.context, &self.snapshot, cuteafd_loader::media::ImageFamily::MiniMax)?;
+        ensure!(spans == media.spans(), "MiniMax probe media coordinates differ");
         Ok(())
     }
     fn placement(&self, units: Vec<u32>, slot: i32) -> Placement { Placement { units, slot: slot as usize, len: 0 } }
     fn bind_request(&self, placement: &mut Placement, _: (), media: RequestMedia,
         tokens: &[u32], resume: usize) -> Result<()> {
         self.idle()?;
-        ensure!(media.spans().is_empty(), BackendError::MediaNotQualified);
+        self.owners.storage.probe_media.borrow_mut().remove(&placement.slot);
+        if !media.spans().is_empty() { self.owners.storage.probe_media.borrow_mut().insert(placement.slot, media); }
         ensure!(placement.len == resume && resume <= tokens.len(), "MiniMax restored request frontier differs");
         self.owners.storage.requests.borrow().ranks[0].bank.validate(placement, resume)?;
         let identity = self.next_identity.get();
@@ -580,6 +582,7 @@ impl<'e, 'a> Backend<'a> for MiniMaxBackend<'e, 'a> {
             self.pending.borrow_mut().take();
         }
         self.identities.borrow_mut().remove(&placement.slot);
+        self.owners.storage.probe_media.borrow_mut().remove(&placement.slot);
         Ok(())
     }
     fn probe_begin(&self, rows: usize) { self.policy_probe.borrow_mut().begin(rows); }
