@@ -468,7 +468,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
     let mut facts = crate::placement::PoolFacts::new(&opts.rtx_bytes[..gpus],
         crate::placement::planner::Context::resolve(context, (opts.context_tokens > 0).then_some(opts.context_tokens)),
         requested_pool, page_rows);
-    facts.target = Some(opts.target_pool_tokens.max(context));
+    facts.target = opts.target_pool_tokens;
     let pool = crate::placement::prepare_pool(facts);
     let ceiling = pool.maximum_tokens();
     let maximum_pages = ceiling.div_ceil(page_rows);

@@ -148,7 +148,7 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
     let mut facts = crate::placement::PoolFacts::new(&options.rtx_bytes,
         crate::placement::planner::Context::resolve(shape.context_tokens,
             (options.context_tokens > 0).then_some(options.context_tokens)), options.pool_tokens, 512);
-    facts.target = Some(options.target_pool_tokens.max(shape.context_tokens));
+    facts.target = options.target_pool_tokens;
     facts.encoding_limit = Some((131_072u64.saturating_sub(shape.concurrency + 2 * turns)) * 512);
     let pool = crate::placement::prepare_pool(facts);
     pool.validate_explicit()?;

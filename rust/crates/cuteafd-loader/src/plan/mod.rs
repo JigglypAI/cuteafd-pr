@@ -200,6 +200,8 @@ pub struct RoleReadiness {
 /// The admitted phase totals, separate from Ready-resident layout items.
 #[derive(Debug, Clone, Serialize)]
 pub struct SolvedPhaseLedger {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pool_policy: Option<crate::placement::PoolPolicy>,
     pub served_context_tokens: u64,
     pub budgets: Vec<crate::placement::planner::Budget>,
     pub phases: Vec<crate::placement::planner::PhaseBudget>,
@@ -207,7 +209,7 @@ pub struct SolvedPhaseLedger {
 
 impl From<&crate::placement::planner::ResolvedPlan> for SolvedPhaseLedger {
     fn from(plan: &crate::placement::planner::ResolvedPlan) -> Self {
-        Self { served_context_tokens: plan.served_context(), budgets: plan.budgets.clone(), phases: plan.phases.clone() }
+        Self { pool_policy: plan.pool_policy, served_context_tokens: plan.served_context(), budgets: plan.budgets.clone(), phases: plan.phases.clone() }
     }
 }
 

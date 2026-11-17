@@ -973,7 +973,7 @@ mod tests {
             assert_eq!(reserve, cuteafd_core::memory_policy::MemoryPolicy::current().release_padding());
             profile.steady.devices[0].reserve_bytes = reserve;
             let policy = CapacityPolicy { concurrency: 4,
-                target_pool_tokens: if total <= 32 * GIB { 1 << 20 } else { 2 << 20 },
+                target_pool_tokens: None,
                 max_context_tokens: Some(1 << 20), ..Default::default() };
             let admitted = resolve_capacity_with_startup_peaks(policy, &profile.steady,
                 &[DeviceMemory { device: 0, total_bytes: total, baseline_free_bytes: total - baseline }],
