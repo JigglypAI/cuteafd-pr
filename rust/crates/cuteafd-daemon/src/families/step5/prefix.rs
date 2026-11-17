@@ -12,6 +12,7 @@ pub(super) struct Placement {
     pub pages: Vec<u32>,
     pub sequence: u64,
     pub committed: usize,
+    pub media: Option<cuteafd_engine::media::RequestMedia>,
 }
 
 impl crate::shared::qwen::scheduler::Placement for Placement {
@@ -19,7 +20,7 @@ impl crate::shared::qwen::scheduler::Placement for Placement {
     fn set_len(&mut self, len: usize) { self.committed = len; }
     fn units(&self) -> &[u32] { &self.pages }
     fn slot(&self) -> i32 { self.sequence as i32 }
-    fn spans(&self) -> &[cuteafd_core::MediaSpan] { &[] }
+    fn spans(&self) -> &[cuteafd_core::MediaSpan] { self.media.as_ref().map_or(&[], |media| media.spans()) }
 }
 
 /// Carried by both device and host entries. Actual stage lengths are in the mark.
@@ -285,7 +286,7 @@ mod tests {
             let lease = reserve.lease(16_320, 3000, 4, Reserve::limit(&cache, &family, 1 << 20))?;
             let rows = reserve.admit(&cache, &family, &active, &stalled, &[], &lease).unwrap();
             let placement = cache.admit_cold(&family, 16_320, rows,
-                |pages| Placement { pages, sequence, committed: 16_320 })?.placement;
+                |pages| Placement { media: None, pages, sequence, committed: 16_320 })?.placement;
             let initial_rows = placement.pages.len() * 64;
             active.push(Request { placement, lease, produced: 1, initial_rows });
         }
@@ -362,7 +363,7 @@ mod tests {
         assert_ne!(family.record_format(), bf16_identity);
         family.kv_format = cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16;
         assert_eq!(family.record_format(), bf16_identity);
-        let mut placement = Placement { pages: vec![0], sequence: 0, committed: 1 };
+        let mut placement = Placement { media: None, pages: vec![0], sequence: 0, committed: 1 };
         pending.verify(|| Ok((Evidence(retired.clone()), ())))?;
         assert!(family.bind(&mut placement).is_err());
         assert_eq!(retired.get(), 1);
@@ -386,7 +387,7 @@ mod tests {
             let frontier = Frontier::at(len);
             let plan = RestorePlan { snapshot_end: len, target_end: len + 1,
                 lag: LaggedState { source_end: len, replay_start: len }, fidelity: RestoreFidelity::Exact };
-            let placement = Placement { pages: vec![37; len.div_ceil(64)], sequence: 1, committed: 0 };
+            let placement = Placement { media: None, pages: vec![37; len.div_ceil(64)], sequence: 1, committed: 0 };
             frontier.validate_restore(&placement, &plan).unwrap();
             let mut remapped = placement.clone();
             remapped.pages.fill(19);
@@ -464,7 +465,7 @@ mod tests {
                 }).collect()
             };
             let before = pristine()?;
-            let mut destination = Placement { pages: vec![0, 1], sequence: 0, committed: 0 };
+            let mut destination = Placement { media: None, pages: vec![0, 1], sequence: 0, committed: 0 };
             // Corrupt both target ranks and every predictor stage independently.
             for &(rank, span, value) in &counters {
                 let mark = ranks[rank].borrow().mark_view(0)?;
@@ -508,7 +509,7 @@ mod tests {
         let mut shared = PrefixCache::<StubCopyEngine, Frontier>::new(family.layout(), config, None)?;
         let tokens: Vec<u32> = (0..65).collect();
         let mut source = shared.admit(&family, &tokens, 65, false,
-            |pages| Placement { pages, sequence: 0, committed: 0 })?.placement;
+            |pages| Placement { media: None, pages, sequence: 0, committed: 0 })?.placement;
         source.committed = 65;
         assert!(family.capture(MarkSlot(0), &source, 64).is_err());
         assert!(family.restore(None, &mut source, 65).is_err());
@@ -594,7 +595,7 @@ mod tests {
         let mut continuation = tokens.clone();
         continuation.push(66);
         let resumed = shared.admit(&family, &continuation, 66, false,
-            |pages| Placement { pages, sequence: 1, committed: 0 })?;
+            |pages| Placement { media: None, pages, sequence: 1, committed: 0 })?;
         assert_eq!(resumed.resume, 65);
         assert_eq!(resumed.placement.committed, 65);
         assert_eq!(resumed.placement.pages[0], first);

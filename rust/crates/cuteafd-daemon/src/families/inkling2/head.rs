@@ -67,7 +67,8 @@ impl<'a> Head<'a> {
     /// head's <=64-row token/normalization storage. `first` is metadata scratch
     /// until segment_metadata publishes convolution starts before attention.
     pub fn embed_unit(&self, k: &Kernels<'a>, owner: &UnitOwner<'a>, target: &TargetWeights<'_>,
-        cfg: &Inkling2Config, tokens: &[u32], uploads: &mut crate::shared::token_table::RetainedUploads<'a>) -> Result<()> {
+        cfg: &Inkling2Config, tokens: &[u32], media: &cuteafd_engine::media::MediaChunk,
+        uploads: &mut crate::shared::token_table::RetainedUploads<'a>) -> Result<()> {
         ensure!(!tokens.is_empty() && tokens.len() <= owner.layout.rows
             && tokens.iter().all(|&token| (token as usize) < cfg.unpadded_vocab_size)
             && owner.stream.raw == self.stream.raw && owner.stream.device.id == self.stream.device.id,
@@ -80,6 +81,12 @@ impl<'a> Head<'a> {
                 uploads.upload(owner.buffer("first")?, &bytes, self.stream.raw)?;
                 self.stream.device.library.cuda_embedding_lookup_bf16_async(target.operand("model.llm.embed.weight")?.buffer,
                     owner.buffer("first")?, owner.buffer("projection_input")?, tokens.len(), cfg.vocab_size, cfg.hidden, self.stream.raw)?;
+            }
+            crate::shared::vision::still::inject(&owner.stream, media, owner.buffer("branch")?,
+                owner.buffer("route_ids")?, owner.buffer("projection_input")?, tokens.len(), cfg.hidden)?;
+            // SAFETY: gather/scatter completed in the same stream; the residual
+            // borrows the admitted feature scratch only after its scatter drains.
+            unsafe {
                 self.stream.device.library.cuda_zero_bytes_async(owner.buffer("branch")?, tokens.len()*cfg.hidden*4, self.stream.raw)?;
                 self.stream.device.library.cuda_accumulate_bf16_to_f32_async(owner.buffer("projection_input")?, owner.buffer("branch")?,
                     tokens.len()*cfg.hidden, self.stream.raw)?;

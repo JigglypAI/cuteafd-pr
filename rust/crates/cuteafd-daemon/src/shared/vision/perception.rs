@@ -297,3 +297,40 @@ mod tests {
         }
     }
 }
+
+/// Checkpoint-native PE prompt markers. Crop construction stays in the shared
+/// processor; this adapter supplies only the family's tokenizer layout.
+pub(crate) struct Binding {
+    processor: cuteafd_loader::media::ProcessorConfig,
+    layout: cuteafd_loader::media::ImagePromptLayout,
+    enabled: bool,
+}
+impl Binding {
+    pub fn new(snapshot: &Path, family: cuteafd_loader::media::ImageFamily, enabled: bool,
+        vocabulary: u32) -> anyhow::Result<Self> {
+        use cuteafd_loader::media::{ImageFamily, ImagePromptLayout, ProcessorConfig};
+        let tokenizer = cuteafd_loader::cached_tokenizer(snapshot)?;
+        let marker = |name: &str| -> anyhow::Result<u32> {
+            let ids = tokenizer.encode_ids(name)?;
+            anyhow::ensure!(ids.len() == 1 && ids[0] < vocabulary, "PE marker {name} is not one native token");
+            Ok(ids[0])
+        };
+        let layout = match family {
+            ImageFamily::Inkling2 => ImagePromptLayout::Single { placeholder: marker("<|unused_200054|>")? },
+            ImageFamily::Step5 => ImagePromptLayout::LocalGlobal { placeholder: marker("<im_patch>")?,
+                local_start: marker("<patch_start>")?, local_end: marker("<patch_end>")?,
+                newline: marker("<patch_newline>")?, global_start: marker("<im_start>")?, global_end: marker("<im_end>")? },
+            _ => anyhow::bail!("not a PE prompt family"),
+        };
+        Ok(Self { processor: ProcessorConfig::from_snapshot(snapshot, family)?, layout, enabled })
+    }
+    pub fn prepare(&self, mut job: cuteafd_api::openai::NativeRequest, tokens: Vec<u32>, vocabulary: u32,
+        hidden: usize, context: usize) -> anyhow::Result<(crate::shared::qwen::scheduler::Prompt,
+            cuteafd_engine::media::RequestMedia, Vec<cuteafd_engine::media::EncodeJob>)> {
+        anyhow::ensure!(self.enabled || (job.media.is_empty() && job.image_groups.is_empty()), "vision is disabled");
+        let mut groups = std::mem::take(&mut job.image_groups);
+        anyhow::ensure!(job.media.is_empty() || !groups.is_empty(), "PE images require grouped preparation");
+        for group in &mut groups { self.processor.assemble_group_prompt(group, &self.layout)?; }
+        super::still::Binding::prepare(job, tokens, vocabulary, hidden, context, self.layout.placeholder(), groups)
+    }
+}

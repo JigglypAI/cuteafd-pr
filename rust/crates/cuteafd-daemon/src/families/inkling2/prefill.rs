@@ -25,13 +25,23 @@ pub(crate) struct TokenIo<'s, 'a> {
     pub starts: &'s [usize],
     pub slots: &'s [usize],
     pub retained_rows: bool,
+    pub media: &'s [Option<cuteafd_engine::media::RequestMedia>],
     pub on_logits: &'s mut dyn FnMut(usize, usize, crate::shared::token_io::DeviceLogits) -> Result<()>,
 }
 impl<'a> UnitIo<'a> for TokenIo<'_, 'a> {
     fn begin(&mut self, unit: &Unit, owner: &super::owners::UnitOwner<'a>,
         uploads: &mut crate::shared::token_table::RetainedUploads<'a>) -> Result<()> {
         let tokens = unit_tokens(unit, self.tokens, self.starts)?;
-        self.head.embed_unit(self.kernels, owner, self.target, self.cfg, &tokens, uploads)
+        let mut chunk = cuteafd_engine::media::MediaChunk::default();
+        for member in members(unit) {
+            if let Some(media) = self.media.get(member.sequence).and_then(Option::as_ref) {
+                let mut part = cuteafd_engine::media::MediaChunk::default();
+                media.write_chunk(member.tokens.start, member.tokens.end, &mut part)?;
+                chunk.indices.extend(part.indices.into_iter().map(|row| row + member.rows.start as u32));
+                chunk.features.extend(part.features);
+            }
+        }
+        self.head.embed_unit(self.kernels, owner, self.target, self.cfg, &tokens, &chunk, uploads)
     }
     fn end(&mut self, unit: &Unit, owner: &super::owners::UnitOwner<'a>) -> Result<()> {
         let members = members(unit);
