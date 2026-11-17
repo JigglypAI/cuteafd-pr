@@ -278,6 +278,9 @@ impl PrefixFamily<SnapshotMeta> for KimiPrefix<'_> {
         let draft = self.0.draft.as_ref().context("Kimi draft attachment without executor")?;
         Ok(draft.common().retain_mla_pages(attachment)?)
     }
+    fn quarantine_draft_pages(&self, placement: &Placement) {
+        if let Some(draft) = &self.0.draft { draft.common().quarantine_mla_pages(placement.slot); }
+    }
     fn capture_draft_pages(&self, placement: &Placement, len: usize)
         -> Result<Option<cuteafd_engine::prefix::DraftPageAttachment>, BoxError> {
         let Some(draft) = &self.0.draft else { return Ok(None) };

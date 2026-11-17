@@ -216,7 +216,7 @@ impl<'a, C: DraftChain<'a>> PrefixFamily<V41Meta> for V41Prefix<'_, 'a, '_, C> {
     }
     fn discard(&self, placement: &mut V41Placement) -> Result<(), BoxError> {
         // Also prove draft ring writes drained before resetting either request owner.
-        self.drain()?;
+        self.drain_rollback()?;
         self.requests.borrow_mut().discard_prefix(placement.lease).map_err(boxed)?;
         if let (Some(id), Some(draft)) = (placement.draft, self.draft.borrow_mut().as_deref_mut()) {
             draft.release(id).map_err(boxed)?;
@@ -337,6 +337,9 @@ impl<'a, C: DraftChain<'a>> PrefixFamily<V41Meta> for V41Prefix<'_, 'a, '_, C> {
         requests.cache().publish_units(&[copy.to]).map_err(boxed)
     }
     fn drain(&self) -> Result<(), BoxError> {
+        self.requests.borrow().cache().prefix_drain().map_err(boxed)
+    }
+    fn drain_rollback(&self) -> Result<(), BoxError> {
         let target = self.requests.borrow().cache().prefix_drain();
         let draft = self.draft.borrow().as_deref().map_or(Ok(()), |draft| draft.drain_prefix());
         if let Err(error) = &draft { self.requests.borrow().cache().poison(error); }
@@ -587,6 +590,18 @@ mod tests {
         let hit = RestoreCandidate { common, snapshot_end, target_end: prompt.len(),
             resume: rule.skipped(common, snapshot_end), media: &[], saved_media: &[] };
         Some(RestorePlan::under(rule, hit))
+    }
+
+    #[test]
+    fn ordinary_prefix_drain_does_not_synchronize_draft_streams() {
+        let source = include_str!("prefix.rs");
+        let body = source.split_once("    fn drain(&self) -> Result<(), BoxError> {").unwrap().1
+            .split_once("\n    }").unwrap().0;
+        assert!(body.contains("prefix_drain()"));
+        assert!(!body.contains("draft"));
+        let rollback = source.split_once("    fn drain_rollback(&self) -> Result<(), BoxError> {").unwrap().1
+            .split_once("\n    }").unwrap().0;
+        assert!(rollback.contains("draft.drain_prefix()"));
     }
 
     #[test]

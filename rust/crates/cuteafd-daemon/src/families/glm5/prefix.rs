@@ -260,6 +260,10 @@ pub(crate) trait PrefixDevice {
     fn restore(&self, mark: Option<MarkSlot>, placement: &mut GlmPlacement, len: usize) -> Result<(), BoxError>;
     fn bind(&self, placement: &mut GlmPlacement) -> Result<(), BoxError>;
     fn discard(&self, placement: &mut GlmPlacement) -> Result<(), BoxError>;
+    fn quarantine_draft_pages(&self, placement: &GlmPlacement) {
+        let _ = placement;
+        debug_assert_eq!(self.draft_page_bytes(), 0, "pooled GLM drafter requires quarantine");
+    }
     fn draft_page_bytes(&self) -> usize;
     fn admit_draft_pages(&self, placement: &mut GlmPlacement, capacity: usize) -> Result<(), BoxError>;
     fn draft_pages_valid(&self, attachment: &cuteafd_engine::prefix::DraftPageAttachment) -> bool;
@@ -299,6 +303,7 @@ impl<D: PrefixDevice> PrefixFamily for Prefix<D> {
     fn restore(&self, mark: Option<MarkSlot>, placement: &mut GlmPlacement, len: usize) -> Result<(), BoxError>{ self.device.restore(mark, placement, len) }
     fn bind(&self, placement: &mut GlmPlacement) -> Result<(), BoxError>{ self.device.bind(placement) }
     fn discard(&self, placement: &mut GlmPlacement) -> Result<(), BoxError>{ self.device.discard(placement) }
+    fn quarantine_draft_pages(&self, placement: &GlmPlacement) { self.device.quarantine_draft_pages(placement) }
     fn draft_page_bytes(&self) -> usize{ self.device.draft_page_bytes() }
     fn admit_draft_pages(&self, placement: &mut GlmPlacement, capacity: usize) -> Result<(), BoxError>{ self.device.admit_draft_pages(placement, capacity) }
     fn draft_pages_valid(&self, attachment: &cuteafd_engine::prefix::DraftPageAttachment) -> bool{ self.device.draft_pages_valid(attachment) }
@@ -376,6 +381,9 @@ impl PrefixDevice for NativePrefix<'_, '_> {
         Ok(())
     }
 
+    fn quarantine_draft_pages(&self, placement: &GlmPlacement) {
+        if let Some((drafter, slot)) = self.draft_of(placement) { drafter.quarantine_mla_pages(slot); }
+    }
     fn discard(&self, placement: &mut GlmPlacement) -> Result<(), BoxError> {
         if let Some((drafter, draft_slot)) = self.draft_of(placement) { drafter.discard_context(draft_slot)?; }
         Ok(())

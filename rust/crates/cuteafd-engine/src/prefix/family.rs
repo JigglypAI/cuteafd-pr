@@ -323,6 +323,15 @@ pub trait PrefixFamily<M: Clone + Default = ()> {
         let _ = placement;
         Ok(())
     }
+    /// Retain live/provisional pooled draft ownership without device work. Normal cleanup
+    /// must not release those references after an unproved drain.
+    fn quarantine_draft_pages(&self, placement: &Self::Placement) {
+        let _ = placement;
+        debug_assert_eq!(self.draft_page_bytes(), 0,
+            "a pooled drafter must implement irreversible live-binding quarantine");
+    }
+    /// Failure cleanup may need more streams than ordinary snapshot maintenance.
+    fn drain_rollback(&self) -> Result<(), BoxError> { self.drain() }
     /// Detach host-only ownership after a fatal rollback, without touching device state.
     /// The cache keeps the page references quarantined; later caller cleanup must not release
     /// those same references through a family-owned retirement queue.

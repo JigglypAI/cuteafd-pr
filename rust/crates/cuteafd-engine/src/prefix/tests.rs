@@ -111,6 +111,7 @@ struct Fake {
     writable_lag: usize,
     fail_restore: Cell<bool>,
     fail_discard: Cell<bool>,
+    fail_draft_admission: Cell<bool>,
     fail_copy: Cell<bool>,
     fail_drain: Cell<bool>,
     record_format: Cell<&'static str>,
@@ -135,7 +136,7 @@ impl Fake {
     fn new(pages: usize, rings: usize, slots: usize) -> Self {
         let bytes = (pages * ROWS + rings * RING + slots * WINDOW) * ROW;
         let mem = Rc::new(RefCell::new(StubCopyEngine::new(CopyModel::default(), bytes, 1 << 26)));
-        Self { mem, pages, rings, slots, writable_lag: 0, queue: RefCell::new(Vec::new()), fail_restore: Cell::new(false), fail_discard: Cell::new(false), fail_copy: Cell::new(false), fail_drain: Cell::new(false), record_format: Cell::new("opaque_v1"), drains: Cell::new(0),
+        Self { mem, pages, rings, slots, writable_lag: 0, queue: RefCell::new(Vec::new()), fail_restore: Cell::new(false), fail_discard: Cell::new(false), fail_draft_admission: Cell::new(false), fail_copy: Cell::new(false), fail_drain: Cell::new(false), record_format: Cell::new("opaque_v1"), drains: Cell::new(0),
             rule: ReuseRule::EXACT, markless: false, pooled: false, reserved: 0, draft: RefCell::new(None) }
     }
     /// Marks in pool pages: no arena slot exists (any use of one panics). `pages` pages hand
@@ -244,6 +245,11 @@ impl PrefixFamily for Fake {
         }
         Ok(())
     }
+    fn quarantine_draft_pages(&self, placement: &Placement) {
+        if let Some(draft) = self.draft.borrow_mut().as_mut() {
+            if let Some(binding) = draft.bindings[placement.ring] { draft.pool.quarantine(binding).unwrap(); }
+        }
+    }
     fn draft_page_bytes(&self) -> usize {
         if self.draft.borrow().is_some() { DRAFT_PAGE_ROWS * ROW } else { 0 }
     }
@@ -259,6 +265,11 @@ impl PrefixFamily for Fake {
             }
         };
         draft.pool.admit(binding, capacity, 8)?;
+        if self.fail_draft_admission.get() {
+            let (_, end) = draft.pool.frontier(binding)?;
+            draft.pool.reserve(binding, end, 64)?;
+            return Err("injected failure after provisional draft allocation".into());
+        }
         Ok(())
     }
     fn draft_pages_valid(&self, attachment: &DraftPageAttachment) -> bool {
@@ -893,6 +904,35 @@ fn failed_restore_drain_stops_admission_and_keeps_pages_quarantined() {
     assert!(cache.admit_cold(&fake, ROWS, ROWS, |pages| Placement {
         pages, ring: 2, len: 0, ring_from: 0 }).is_err());
     cache.release(&fake, &later).unwrap();
+}
+
+#[test]
+fn fatal_rollback_holds_provisional_draft_pages_after_normal_cleanup() {
+    let fake = Fake::new(64, 3, 8);
+    *fake.draft.borrow_mut() = Some(DraftFixture {
+        pool: DraftPagePool::new(8 * 64, 3, 4096, 23).unwrap(), bindings: vec![None; 3],
+    });
+    let mut cache: PrefixCache<Shared> = PrefixCache::new_with_draft_pages(fake.layout(),
+        config(8, 8), None, fake.draft_page_bytes()).unwrap();
+    fake.fail_draft_admission.set(true);
+    fake.fail_drain.set(true);
+    assert!(matches!(cache.admit_cold(&fake, 64, 64, |pages| Placement {
+        pages, ring: 0, len: 0, ring_from: 0 }), Err(PrefixError::Rollback { .. })));
+    let held = fake.draft.borrow().as_ref().unwrap().bindings[0].unwrap();
+    fake.fail_draft_admission.set(false);
+    fake.fail_drain.set(false);
+    let mut failed = Placement { pages: Vec::new(), ring: 0, len: 0, ring_from: 0 };
+    fake.discard(&mut failed).unwrap();
+    let mut draft = fake.draft.borrow_mut();
+    let draft = draft.as_mut().unwrap();
+    assert_eq!(draft.pool.free(), 7, "normal cleanup cannot free provisional quarantined pages");
+    assert!(draft.pool.bind(0, 0).is_err(), "quarantined slot remains occupied");
+    assert!(draft.pool.frontier(held).is_err());
+    let next = draft.pool.bind(1, 0).unwrap();
+    let reservation = draft.pool.reserve(next, 0, 7 * 64).unwrap();
+    let later = draft.pool.destinations(reservation).unwrap();
+    assert!(later.iter().all(|&row| row >= 64), "first physical page never recycles");
+    assert!(draft.pool.bind(2, 0).and_then(|b| draft.pool.reserve(b, 0, 64)).is_err());
 }
 
 #[test]
