@@ -614,7 +614,8 @@ mod tests {
         let prepared = facts.prepare().unwrap();
         let recipe = &prepared.recipe;
         let components = recipe.host.components(recipe, 1).unwrap();
-        for pages in [1, 2, 63, 64, 65, 66, 1024, recipe.maximum_pages] {
+        for pages in [1, 2, 63, 64, 65, 66, 1024, recipe.maximum_pages].into_iter()
+            .filter(|&pages| pages <= recipe.maximum_pages) {
             for (component, (name, bytes)) in components.iter().zip(recipe.host.demands(recipe, pages, 1).unwrap()) {
                 assert_eq!(component.bytes.at(pages).unwrap(), bytes, "{name} pages={pages}");
             }

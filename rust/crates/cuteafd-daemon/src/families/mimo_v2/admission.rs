@@ -1016,10 +1016,10 @@ mod tests {
             };
             let memory = [DeviceMemory { device: 0, total_bytes: 96 << 30, baseline_free_bytes: 96 << 30 }];
             let capacity = resolve_capacity(policy, &profile, &memory)?;
-            assert_eq!(capacity.requested_kv_floor_tokens, pool.target);
+            assert_eq!(capacity.requested_kv_floor_tokens, pool.target());
             let report: serde_json::Value = serde_json::from_str(&reservation_report(&profile, &memory, policy)?)?;
-            assert_eq!(report["requested_pool_tokens"], pool.target);
-            assert_eq!(report["devices"][0]["requested_pool_bytes"], pool.target * 1024);
+            assert_eq!(report["requested_pool_tokens"], pool.target());
+            assert_eq!(report["devices"][0]["requested_pool_bytes"], pool.target() * 1024);
             let grown = input.plan(&options)?;
             assert!(baseline.fits && grown.fits, "{:?}", grown.hints);
             assert_eq!(grown.onboard_layers, baseline.onboard_layers);

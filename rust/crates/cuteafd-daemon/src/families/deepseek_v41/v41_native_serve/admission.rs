@@ -702,7 +702,7 @@ pub(super) fn resolve_with_owners(
     };
     let request = production_request(
         serving_context,
-        pool.requested,
+        pool.requested(),
         onboard,
         prefill,
         Operation::Serving,
