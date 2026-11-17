@@ -165,6 +165,7 @@ pub struct LayoutOptions {
     pub glmf_draft_fp8_mode: u8,
     /// Shared GQA drafter rings, independent of target KV and weight precision.
     pub draft_kv_cache: crate::families::qwen4::Qwen4KvCache,
+    pub draft_context_window: usize,
     /// Explicit MiMo DFlash context arena; does not widen its draft batch.
     pub draft_context_slots: Option<u64>,
     /// MiMo segmented decode graphs (runtime default: on).
@@ -351,6 +352,7 @@ impl Default for LayoutOptions {
             glmf_draft_representation: crate::families::glm5::draft_representation::GlmDraftRepresentation::Fp8Only,
             glmf_draft_fp8_mode: 0,
             draft_kv_cache: crate::families::qwen4::Qwen4KvCache::Fp8,
+            draft_context_window: 0,
             draft_context_slots: None,
             mimo_decode_graphs: true,
             step5_decode_graphs: true,

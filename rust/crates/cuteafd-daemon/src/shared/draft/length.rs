@@ -8,6 +8,9 @@ pub(crate) struct DraftLength {
     /// Unset keeps adaptive selection.
     #[arg(long, env = "DRAFT_LENGTH", global = true, value_parser = parse)]
     pub draft_length: Option<usize>,
+    /// Zero preserves native attention; positive values bound shared draft context.
+    #[arg(long, global = true, default_value_t = 0)]
+    pub draft_context_window: usize,
 }
 
 fn parse(value: &str) -> Result<usize, String> {
@@ -126,7 +129,7 @@ mod tests {
             (None, 7, 7, "adaptive"),
         ] {
             let geometry = resource::geometry(&[resource::LayerHome::Dense], 8, 2, 64, native, 0).unwrap();
-            let (policy, log) = capture_log(|| DraftLength { draft_length: requested }
+            let (policy, log) = capture_log(|| DraftLength { draft_length: requested, ..Default::default() }
                 .policy(geometry, PolicySeed::weak(native), native).unwrap());
             assert_eq!(log.matches("DRAFT_LENGTH policy").count(), 1, "{log}");
             for field in [format!("requested={requested:?}"), format!("native_cap={native}"),
@@ -140,7 +143,7 @@ mod tests {
     #[test]
     fn inactive_override_reports_no_speculation() {
         let ((_, settings), log) = capture_log(|| cuteafd_bench::context::capture_resolved(||
-            DraftLength { draft_length: Some(4) }.report_inactive(false)));
+            DraftLength { draft_length: Some(4), ..Default::default() }.report_inactive(false)));
         assert_eq!(log.matches("DRAFT_LENGTH=4 ignored: no speculator").count(), 1);
         let mut context = cuteafd_bench::context::ServerContext::default();
         settings.apply(&mut context);

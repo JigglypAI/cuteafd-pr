@@ -289,10 +289,12 @@ fn padded_weight_backings_replace_payload_and_activate_with_their_single_tails()
 fn exact_pools_report_typed_refusals_instead_of_shrinking_the_context() {
     let (cfg, weights, buffers, arena) = fixture();
     let input = facts(&cfg, &weights, &buffers, &arena);
+    let page_bytes = super::super::host_prefix_geometry(&cfg, input.record_bytes, 0).page_bytes;
+    let bound = ((96u64 << 30) / page_bytes * PAGE_ROWS).min(u32::MAX as u64) / PAGE_ROWS * PAGE_ROWS;
     for (pool, expected) in [
         (Pin::Exact(PAGE_ROWS), "below context"),
         (Pin::Exact(3 * PAGE_ROWS + 1), "misaligned"),
-        (Pin::Exact((32 << 20) * PAGE_ROWS), "beyond the compiled extent"),
+        (Pin::Exact((32 << 20) * PAGE_ROWS), "beyond the memory bound"),
     ] {
         let mut ask = request();
         ask.pool = pool;
@@ -300,13 +302,16 @@ fn exact_pools_report_typed_refusals_instead_of_shrinking_the_context() {
         match expected {
             "below context" => assert!(matches!(&refusal, Refusal::PoolBelowContext { .. }), "{refusal}"),
             "misaligned" => assert!(matches!(&refusal, Refusal::MisalignedPool { .. }), "{refusal}"),
-            _ => assert!(matches!(&refusal, Refusal::InvalidPin(_)), "{refusal}"),
+            _ => assert_eq!(refusal, Refusal::PoolExceedsMemoryBound {
+                requested: (32 << 20) * PAGE_ROWS, bound }),
         }
     }
-    // The compiled extent is a real ceiling, refused before any arithmetic.
+    // Exact pools above the index domain retain the same memory-bound refusal.
     let mut ask = request();
-    ask.pool = Pin::Exact((u32::MAX as u64 / PAGE_ROWS) * PAGE_ROWS + PAGE_ROWS);
-    assert!(matches!(admit(ask, budgets(), input).unwrap_err(), Refusal::InvalidPin(_)));
+    let requested = (u32::MAX as u64 / PAGE_ROWS) * PAGE_ROWS + PAGE_ROWS;
+    ask.pool = Pin::Exact(requested);
+    assert_eq!(admit(ask, budgets(), input).unwrap_err(),
+        Refusal::PoolExceedsMemoryBound { requested, bound });
 }
 
 #[test]

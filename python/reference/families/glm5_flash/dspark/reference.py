@@ -94,7 +94,8 @@ class Drafter:
                  target: Path | None = None):
         self.cfg = json.loads((draft / "config.json").read_text())
         speculators = self.cfg.get("speculators_model_type") == "dspark"
-        if not speculators and "DSparkDraftModel" not in self.cfg.get("architectures", []):
+        if not speculators and not any(a in ("DSparkDraftModel", "Qwen3DSparkModel")
+                                       for a in self.cfg.get("architectures", [])):
             raise ValueError("not a dSpark checkpoint")
         t = self.cfg["transformer_layer_config"] if speculators else self.cfg
         d = self.cfg if speculators else self.cfg["dflash_config"]
@@ -404,6 +405,11 @@ def main() -> None:
     parser.add_argument("--tap-shift", type=int, default=1, help="target layer = aux id - shift (vLLM: 1)")
     parser.add_argument("--causal", type=int, choices=(0, 1), help="override in-block causality")
     parser.add_argument("--device", default="cuda")
+    parser.add_argument("--context-window", type=int, default=0,
+                        help="explicit context-only window; 0 preserves checkpoint attention")
+    parser.add_argument("--kv-cache", choices=("bf16", "fp8"), default="bf16")
+    parser.add_argument("--fixture-rows", type=int, default=0,
+                        help="test-only: create deterministic synthetic tap inputs in --golden")
     parser.add_argument("--check-only", action="store_true", help="CPU header/config/golden preflight; no weights loaded")
     args = parser.parse_args()
     if args.live:
@@ -422,7 +428,7 @@ def main() -> None:
     if args.check_only:
         cfg = json.loads((args.draft / "config.json").read_text())
         speculators = cfg.get("speculators_model_type") == "dspark"
-        if not speculators and "DSparkDraftModel" not in cfg.get("architectures", []):
+        if not speculators and not any(a in ("DSparkDraftModel", "Qwen3DSparkModel") for a in cfg.get("architectures", [])):
             raise ValueError("not a dSpark checkpoint")
         t = cfg["transformer_layer_config"] if speculators else cfg
         d = cfg if speculators else cfg["dflash_config"]
@@ -457,6 +463,19 @@ def main() -> None:
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = False
     drafter = Drafter(args.draft, args.device, args.tap_shift, None if args.causal is None else bool(args.causal), args.target)
+    if args.context_window < 0:
+        parser.error("context window must be nonnegative")
+    if args.context_window:
+        drafter.window = args.context_window
+    if args.fixture_rows:
+        if args.fixture_rows < 2 or args.streams != 1:
+            parser.error("synthetic fixtures require at least two rows and --streams 1")
+        args.golden.mkdir(parents=True, exist_ok=True)
+        generator = torch.Generator(device="cpu").manual_seed(2396)
+        for layer in drafter.taps:
+            values = (torch.randn(args.fixture_rows,drafter.hidden,generator=generator)*0.1).bfloat16()
+            values.view(torch.int16).numpy().tofile(args.golden / f"layer{layer:02}.bin")
+        (torch.arange(args.fixture_rows,dtype=torch.int32)%1024+32).numpy().tofile(args.golden / "tokens.bin")
     tokens = torch.frombuffer(bytearray((args.golden / "tokens.bin").read_bytes()), dtype=torch.int32)
     taps = golden_taps(args.golden, drafter.taps, drafter.hidden, args.device, args.streams)
     if taps.shape[0] != len(tokens):
@@ -464,6 +483,13 @@ def main() -> None:
     rows = torch.arange(taps.shape[0], device=args.device)
     with torch.no_grad():
         ctx = drafter.context(taps, rows)
+        if args.kv_cache == "fp8":
+            def qdq(values):
+                values = values.float()
+                scale = values.abs().amax(-1,keepdim=True)/448.0
+                scale = torch.where(scale>0,scale,1.0)
+                return ((values*(1.0/scale)).to(torch.float8_e4m3fn).float()*scale).bfloat16()
+            ctx = [(qdq(k),qdq(v)) for k,v in ctx]
 
         def draft(p: int) -> tuple[list[int], list[float], torch.Tensor]:
             first = max(0, p - drafter.window) if drafter.window is not None else 0
@@ -519,7 +545,7 @@ def main() -> None:
             accepted = [next((i for i, (d, t) in enumerate(zip(ds, ts)) if d != t), len(ds))
                         for ds, ts in zip(drafts, truth)]
             (args.out / "meta.json").write_text(json.dumps({"positions": positions, "taps": drafter.taps,
-                "causal": drafter.causal, "accepted_vs_tokens": accepted,
+                "causal": drafter.causal, "window": drafter.window, "kv_cache": args.kv_cache, "accepted_vs_tokens": accepted,
                 "mean_accepted": sum(accepted) / len(accepted)}, indent=1))
             print(f"{len(positions)} anchors, mean accepted prefix vs golden tokens {sum(accepted) / len(accepted):.2f}")
 

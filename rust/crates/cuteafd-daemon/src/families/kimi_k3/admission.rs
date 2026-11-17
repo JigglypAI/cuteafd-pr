@@ -272,9 +272,10 @@ impl<'a> Admission<'a> {
             let tensors=if crate::shared::experts::rtx::dense::is_recording() { Default::default() }
                 else { crate::shared::speculation::block_dspark::prefetch(snapshot).join()
                     .map_err(|_|anyhow::anyhow!("block draft reader panicked"))?? };
-            let draft=DsparkDrafter::load_with(device.library,programs,target_projection,snapshot,tensors,stream,
+            let draft=DsparkDrafter::load_window_paged_with(device.library,programs,target_projection,snapshot,tensors,stream,
                 layout.capacity.context_slots,layout.capacity.max_batch_sequences,vec![0;layout.config.hidden*2],
-                layout.representation,Fp8Scales::Amax,Fp8Rows::W8a16,layout.kv_cache,
+                layout.representation,Fp8Scales::Amax,Fp8Rows::W8a16,layout.context_capacity,layout.target_tokens,layout.kv_cache,
+                layout.config.window.unwrap_or(0),
                 |physical,name,bytes| { ensure!(physical==device.id,"block draft physical arena changed"); arena.view(name,bytes) })?;
             draft.prepare_workspace()?;
             Ok(super::draft_common::CommonDraft::Block { draft,
@@ -1387,7 +1388,7 @@ pub(super) mod tests {
         println!("spark minimum_onboard={} max_four_expert_bytes={}", spark.minimum_rtx_layers()?,
             (0..6).map(|rank| spark.rank_bytes(rank, 4)).collect::<Result<Vec<_>>>()?.into_iter().max().unwrap());
         let context = std::env::var("CUTEAFD_KIMI_REPLAY_CONTEXT").ok().map(|v| v.parse::<usize>()).transpose()?.unwrap_or(1 << 20);
-        let draft = super::super::draft::Options { snapshot: path("CUTEAFD_KIMI_DRAFT")?, fp8: true, tp2_dflash: false, cache_format: cuteafd_core::MlaCacheFormat::Bf16, draft_kv_cache: Default::default() }.layout(8, context, 188,1)?;
+        let draft = super::super::draft::Options { snapshot: path("CUTEAFD_KIMI_DRAFT")?, fp8: true, tp2_dflash: false, cache_format: cuteafd_core::MlaCacheFormat::Bf16, context_window: 0, draft_kv_cache: Default::default() }.layout(8, context, 188,1)?;
         // Sealed program manifests and the failed card's post-module CUDA samples.
         // These are CPU arithmetic inputs, not a new hardware measurement.
         let scratch = NativeScratch { kda: 629_464_064, mla: [168_296_448, 101_056_512, 201_326_592] };
