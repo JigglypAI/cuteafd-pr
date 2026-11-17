@@ -164,6 +164,7 @@ class PackageProfileTests(unittest.TestCase):
             get_device_properties=Mock(return_value=SimpleNamespace(
                 major=compute[0], minor=compute[1], multi_processor_count=48)),
             get_device_capability=Mock(return_value=tuple(compute)),
+            current_device=Mock(return_value=0),
             empty_cache=Mock())
         jobs = ModuleType('_export_jobs')
         jobs.export_jobs = lambda: 1
