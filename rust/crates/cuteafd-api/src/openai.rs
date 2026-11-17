@@ -2793,6 +2793,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn grouped_step_image_chat_preserves_local_global_jobs_at_api_boundary() {
+        use base64::Engine;
+        use cuteafd_loader::media::{EncoderId, ImageFamily, ProcessorConfig};
+        let mut png = std::io::Cursor::new(Vec::new());
+        image::RgbImage::from_pixel(896,812,image::Rgb([83;3]))
+            .write_to(&mut png,image::ImageFormat::Png).unwrap();
+        let url = format!("data:image/png;base64,{}", base64::engine::general_purpose::STANDARD.encode(png.into_inner()));
+        let preparer = Arc::new(media::MediaPreparer::new(ProcessorConfig::for_family(ImageFamily::Step5),
+            EncoderId([4;32]), media::ImageUrlFetch::Off, 1).unwrap());
+        let profile = ModelProfile::new(MODEL, ModelEncoding::Step5(Arc::new(step5::fixtures::encoding())))
+            .with_grouped_vision(preparer);
+        let (tx, mut rx) = mpsc::channel::<NativeRequest>(1);
+        let worker = tokio::spawn(async move {
+            let job = rx.recv().await.unwrap();
+            assert_eq!(job.image_groups.len(),1);
+            assert_eq!(job.image_groups[0].source,[896,812]);
+            assert!(job.image_groups[0].fragments.is_empty());
+            assert_eq!(job.media.iter().map(|i| i.tokens).collect::<Vec<_>>(),[81,81,81,81,169]);
+            assert_eq!(job.prompt.matches("<im_patch>").count(),1);
+            job.events.send(Ok(InferenceChunk::Ready { system_fingerprint: None,
+                prompt_usage: PromptUsage { prompt_tokens: 506, prompt_cache_hit_tokens: 0 } })).unwrap();
+            job.events.send(Ok(InferenceChunk::Finish { finish_reason: InferenceFinishReason::Length })).unwrap();
+        });
+        let app = router_for_model(tx, NativeLimits::default(), Arc::new(Mutex::new(Value::Null)),
+            std::time::Duration::from_secs(1), ConsoleHub::disabled(), profile);
+        let body = json!({"model":MODEL,"messages":[{"role":"user","content":[
+            {"type":"image_url","image_url":{"url":url}},{"type":"text","text":"describe"}]}],"max_tokens":1});
+        let response = app.oneshot(axum::http::Request::post("/v1/chat/completions")
+            .header("content-type","application/json").body(Body::from(body.to_string())).unwrap()).await.unwrap();
+        assert_eq!(response.status(),StatusCode::OK);
+        worker.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn expanded_media_probe_prepares_sources_without_chat_rendering() {
         use base64::Engine;
         use cuteafd_loader::media::{EncoderId, ImageFamily, ProcessorConfig};

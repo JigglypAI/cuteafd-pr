@@ -1420,21 +1420,11 @@ case "$family" in
   muse_spark) serve=serve-muse ;;
   *) echo "run-family.sh serves DeepSeek V4, GLM 5.x, GLM 5.3 Flash, MiMo V2, Qwen 3.8, Kimi K3, Step-5 and Muse Spark checkpoints, not $family (./run.sh serves DeepSeek V4.1)" >&2; exit 2 ;;
 esac
-# Kimi K3 and Step-5 serve through their own commands: automatic attention
-# placement, text only (their bundled vision towers are not in scope) and GPU
-# token embeddings. Kimi ships no MTP head; Step-5 defaults to native MTP
-# depth 3 (SPECULATOR=off disables it).
-text_family=0
-[[ "$family" != kimi_k3 && "$family" != step5 && "$family" != inkling2 ]] || text_family=1
 # These commands own automatic context, pool and Spark budgets independently of media.
-standalone_family=$text_family
-[[ "$family" != minimax_m3 ]] || standalone_family=1
-[[ "$family" != muse_spark ]] || standalone_family=1
-if ((text_family)); then
-  case "$vision:$audio" in
-    auto:auto|auto:off|off:auto|off:off) vision=off; audio=off ;;
-    *) release_die "$family bundled media execution is not qualified; set VISION=off and AUDIO=off" ;;
-  esac
+standalone_family=0
+[[ "$family" != minimax_m3 && "$family" != kimi_k3 && "$family" != inkling2 && "$family" != step5 && "$family" != muse_spark ]] || standalone_family=1
+if [[ "$family" == kimi_k3 || "$family" == minimax_m3 || "$family" == inkling2 || "$family" == step5 ]]; then
+  case "$audio" in auto|off) audio=off ;; *) release_die "$family has no bundled audio execution owner" ;; esac
 fi
 if [[ "$family" == qwen3_5 ]]; then
   case "$vision:$audio" in
@@ -1795,8 +1785,11 @@ if [[ -n "$chat_template_from" && "$vision" != off ]]; then
   fi
   family_args+=(--chat-template-from "$chat_template_from")
 fi
-# Kimi K3 and Step-5 serve text only; their commands take no media options.
-((text_family)) || family_args+=(--vision "$vision" --audio "$audio")
+# Still towers use the shared media options and the admitted encoder owner.
+family_args+=(--vision "$vision" --audio "$audio")
+if [[ "$family" == inkling2 || "$family" == step5 ]]; then
+  family_args+=(--vision-replicas "$vision_replicas")
+fi
 
 dspark_args=()
 if [[ $family == mimo_v2 ]]; then
@@ -1882,7 +1875,7 @@ case $family in
     family_args+=(--prefix-cache-entries "$effective_prefix_entries")
     [[ "$(get HOST_CACHE_BYTES auto)" == 0 ]] || family_args+=(--host-cache-bytes "$(get HOST_CACHE_BYTES auto)") ;;
 esac
-if [[ ( $family == mimo_v2 || $family == qwen4 || $family == glm5_flash ) && $vision != off ]]; then
+if [[ ( $family == mimo_v2 || $family == qwen4 || $family == glm5_flash || $family == inkling2 || $family == step5 ) && $vision != off ]]; then
   # Text-only frozen daemons can predate the optional media-cache flag.
   [[ -z "$(get MEDIA_CACHE_BYTES)" ]] || family_args+=(--media-cache-bytes "$(get MEDIA_CACHE_BYTES)")
 fi
@@ -2730,7 +2723,7 @@ if [[ -n "$expert_input" && "$expert_input" != fp8 ]]; then
   done
 fi
 if { [[ ( "$family" == mimo_v2 || "$family" == qwen4 || "$family" == glm5_flash
-          || "$family" == muse_spark || "$family" == minimax_m3 || "$checkpoint_family" == mistral_large4 ) && "$vision" != off ]] &&
+          || "$family" == muse_spark || "$family" == minimax_m3 || "$family" == kimi_k3 || "$family" == inkling2 || "$family" == step5 || "$checkpoint_family" == mistral_large4 ) && "$vision" != off ]] &&
    python3 -c 'import json,sys; sys.exit(0 if json.load(open(sys.argv[1])).get("vision_config") else 1)' "$root/snapshots/$revision/$selected_config"; } ||
    [[ "$audio" != off ]]; then
   selected="$(python3 -c '
@@ -2738,8 +2731,8 @@ import json,sys
 p=json.load(sys.stdin); e=p.get("encoder")
 assert p["placement_supported"] and p["fits"], "encoder deployment cannot fit: "+str(p.get("hints"))
 k=e["kind"] if e else {"kind":"off"}; kind=k["kind"]; h=p["encoder_plan_hash"]
-cap=p.get("max_image_tokens") or ({"qwen4":1024,"minimax_m3":576}.get(sys.argv[1],4096))
-assert type(cap) is int and 1<=cap<=4096, "invalid encoder image cap"
+cap=p.get("max_image_tokens") or ({"qwen4":1024,"minimax_m3":576,"kimi_k3":16698,"inkling2":4096,"step5":4096}.get(sys.argv[1],4096))
+assert type(cap) is int and 1<=cap<=16698, "invalid encoder image cap"
 assert len(h)==64 and all(c in "0123456789abcdef" for c in h), "invalid encoder plan hash"
 if kind=="spark":
     ranks=[k["rank"]]+e["replicas"]

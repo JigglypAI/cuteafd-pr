@@ -23,13 +23,15 @@ pub(crate) struct PendingTarget<'a> {
     dense: (Vec<crate::shared::experts::rtx::push::DensePlan>, Vec<crate::shared::experts::rtx::dense::DenseArena<'a>>),
     device: Device<'a>,
     sparks: usize,
+    media: crate::shared::vision::push::Contribution,
 }
 
 impl<'a> PendingTarget<'a> {
     pub fn prepare(device: Device<'a>, view: &cuteafd_loader::plan::checkpoint::CheckpointView,
         checkpoint: &Checkpoint, catalog: &cuteafd_loader::OfficialV41Catalog,
         inputs: &cuteafd_loader::placement::families::inkling2::InklingInputs,
-        admitted: &cuteafd_loader::placement::families::inkling2::AdmittedInkling)
+        admitted: &cuteafd_loader::placement::families::inkling2::AdmittedInkling,
+        media: crate::shared::vision::push::Contribution)
         -> Result<(Self, (Vec<std::net::TcpStream>, crate::shared::memory::push_exl3::CoordinatorRanks))> {
         use crate::shared::experts::{layer::ExpertLayer, rtx::push::{CoordinatorExperts, CoordinatorPush, PushPolicy, WholeOwner}};
         ensure!(inputs.gpus == 1 && inputs.spark_ranks > 0 && checkpoint.snapshot == view.snapshot()
@@ -54,20 +56,22 @@ impl<'a> PendingTarget<'a> {
                 ExpertLayer::BackboneFull { layer }).collect(),
         }] }).collect::<Vec<_>>();
         let experts = (!sets.is_empty()).then_some(CoordinatorExperts::Sets(sets));
-        let (target, records) = crate::shared::experts::rtx::dense::recording(||
+        let (target, mut records) = crate::shared::experts::rtx::dense::recording(||
             TargetWeights::record_push(device, checkpoint, &inputs.targets[0]))?;
+        records.extend(media.records());
         let dense = crate::shared::experts::rtx::dense::plan_records(view.snapshot(), records, &[device], inputs.spark_ranks)?;
         let (push, streams, ranks) = CoordinatorPush::prepare_view_admitted(view, Some(catalog), 1, experts, envelope)?;
-        Ok((Self { target, push, dense, device, sparks: inputs.spark_ranks }, (streams, ranks)))
+        Ok((Self { target, push, dense, device, sparks: inputs.spark_ranks, media }, (streams, ranks)))
     }
     pub fn finish(self, catalog: &cuteafd_loader::OfficialV41Catalog,
         pending: crate::shared::placement::PendingSparkAdmission)
         -> Result<(TargetWeights<'a>, Vec<Vec<crate::shared::experts::rtx::push::PushedExperts<'a>>>)> {
-        let Self { target, push, dense, device, sparks } = self;
+        let Self { target, push, dense, device, sparks, media } = self;
         crate::shared::placement::load_while_admitting(Some(pending), || {
             let (received, ()) = push.receive_sets_with(vec![device], Some(catalog), sparks, Some(Ok(dense)), || ());
             let experts = crate::shared::experts::rtx::push::PushPolicy::Required.committed(received)?
                 .context("Inkling target push group did not commit")?;
+            media.commit()?;
             Ok((target, experts))
         })
     }

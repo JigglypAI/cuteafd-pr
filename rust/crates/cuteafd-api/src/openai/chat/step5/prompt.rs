@@ -24,8 +24,17 @@ pub fn template_context(body: &Value, options: &Step5PromptOptions, bos: &str) -
     validate_thinking(body)?;
     let raw = body.get("messages").and_then(Value::as_array).ok_or("messages must be an array")?;
     if raw.is_empty() { return Err("messages must not be empty".into()); }
-    let mut messages = raw.iter().enumerate().map(|(index, message)| template_message(message, index))
-        .collect::<Result<Vec<_>, _>>()?;
+    let mut messages = raw.iter().enumerate().map(|(index, message)| {
+        let mut message = template_message(message, index)?;
+        if let Some(parts) = message.get_mut("content").and_then(Value::as_array_mut) {
+            for part in parts {
+                if matches!(part.get("type").and_then(Value::as_str), Some("image_url" | "input_image")) {
+                    part["type"] = Value::String("image".into());
+                }
+            }
+        }
+        Ok(message)
+    }).collect::<Result<Vec<_>, String>>()?;
     let mut instructions = Vec::new();
     if let Some(text) = options.response_format.as_ref().and_then(response_format_instruction) {
         instructions.push(text);

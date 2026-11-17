@@ -3,7 +3,7 @@
 //! crates/mimo26-coordinator/src/vision.rs; weights are resident, never transient.
 mod glm_flash;
 mod muse;
-mod perception;
+pub(crate) mod perception;
 mod minimax;
 mod constants;
 pub(crate) use constants::ConstantRegion;

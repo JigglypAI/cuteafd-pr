@@ -256,3 +256,20 @@ fn snapshot_loader_uses_own_headers_without_generation_config() {
     std::fs::write(dir.path().join("generation_config.json"), "invalid").unwrap();
     assert!(Step5Encoding::from_snapshot(dir.path()).is_err());
 }
+
+
+#[test]
+fn ordinary_openai_image_parts_reach_the_native_step_placeholder() {
+    let encoding = super::fixtures::encoding();
+    let options = super::Step5PromptOptions { tool_names: vec![], tool_choice: super::Step5ToolChoice::Auto,
+        response_format: None };
+    for kind in ["image", "image_url", "input_image"] {
+        let body = serde_json::json!({"messages":[{"role":"user","content":[
+            {"type":"text","text":"before"},{"type":kind,"image_url":{"url":"data:image/png;base64,AA=="}},
+            {"type":"text","text":"after"}]}]});
+        let prompt = encoding.render(&body, &options).unwrap();
+        assert_eq!(prompt.matches("<im_patch>").count(),1,"{kind}: {prompt}");
+        assert!(prompt.find("before").unwrap() < prompt.find("<im_patch>").unwrap());
+        assert!(prompt.find("<im_patch>").unwrap() < prompt.find("after").unwrap());
+    }
+}

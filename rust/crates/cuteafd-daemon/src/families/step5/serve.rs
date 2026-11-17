@@ -66,6 +66,8 @@ fn resident_budget(peak: usize, workspace: usize) -> Result<usize> {
 
 #[derive(Debug, Clone, clap::Args)]
 pub(crate) struct ServeArgs {
+    #[command(flatten)]
+    pub(crate) vision: crate::shared::vision::still::Options,
     /// Replay bounded persistent decode/verify sections (prefill remains eager).
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     decode_graphs: bool,
@@ -255,13 +257,8 @@ fn coordinator_packing_cap(programs: &cuteafd_ffi::programs::Programs<'_>, split
     if mode == PackingMode::Exact { coordinator_row_cap(programs, inventory, rows) } else { Ok(rows) }
 }
 
-fn text_media() -> cuteafd_engine::media::MediaAdmission<scheduler::Prompt, crate::shared::qwen::Encoder> {
-    cuteafd_engine::media::MediaAdmission::new(cuteafd_engine::media::EmbeddingCache::new(0),
-        crate::shared::qwen::Encoder::Off, 16)
-}
-
 fn with_backend<T>(args: &ServeArgs,
-    run: impl FnOnce(&Step5Backend<'_, '_>, usize) -> Result<T>) -> Result<T> {
+    run: impl FnOnce(&Step5Backend<'_, '_>, usize, crate::shared::vision::still::Ready) -> Result<T>) -> Result<T> {
     let shape = args.shape()?;
     let serving_context = cuteafd_loader::placement::planner::Context::resolve(
         if args.max_context == 0 { 1_048_576 } else { args.max_context }, (args.max_context > 0).then_some(args.max_context));
@@ -276,7 +273,16 @@ fn with_backend<T>(args: &ServeArgs,
         .unwrap_or_else(|| args.attention.select(&args.snapshot))?;
     args.attention.validate_view(&view)?;
     crate::cli::publish_core_view(&view);
-    let checkpoint = Checkpoint::coordinator_view(&view, false, args.mtp > 0)?;
+    let mut checkpoint = Checkpoint::coordinator_view(&view, false, args.mtp > 0)?;
+    if args.vision.vision != cuteafd_loader::plan::MediaMode::Off {
+        let vision = cuteafd_loader::plan::files::open_role_view(&view,
+            cuteafd_loader::plan::files::ReadRole::Vision)?;
+        checkpoint.tensors.extend(vision.tensors);
+        checkpoint.tensors.sort_by(|a, b| a.meta.name.cmp(&b.meta.name));
+        checkpoint.missing_shards.extend(vision.missing_shards);
+        checkpoint.missing_shards.sort();
+        checkpoint.missing_shards.dedup();
+    }
     let cfg = Config::parse(&checkpoint)?;
     cuteafd_bench::context::set_family(cfg.family_id());
     let mut catalog = cuteafd_loader::read_expert_catalog_view(&view)?;
@@ -342,11 +348,17 @@ fn with_backend<T>(args: &ServeArgs,
             crate::shared::prefix::budget::HostBudget::Auto => None,
             crate::shared::prefix::budget::HostBudget::Bytes(bytes) => Some(bytes),
         }, args.prefix.host_cache_headroom_bytes)?;
+    inputs.vision = cuteafd_loader::placement::still_encoder::StillEncoder::planned(&checkpoint,
+        args.vision.vision, args.vision.vision_replicas, &cuteafd_loader::placement::families::step5::budgets(&inputs)?,
+        args.vision.media_cache_bytes.map_or(256 << 20, |bytes| bytes.0 as u64))?;
     tracing::info!(elapsed_s = startup.elapsed().as_secs_f64(), "Step-5 startup inventory complete");
     let planning = std::time::Instant::now();
     // One admission: the contract prices every retained owner, and native ABIs
     // are validated against the ownership it selected.
     let (admission, native_plan) = admission::admit_mtp_with_contract(&programs, &checkpoint, &inputs, usize::from(args.mtp), contract, native_selection)?;
+    let mut media = crate::shared::vision::still::Ready::load(&args.vision, &args.snapshot, &args.native_lib,
+        &library, &ids, inputs.vision.as_ref().and_then(|vision| vision.admitted(&admission.solved)),
+        cuteafd_loader::media::ImageFamily::Step5, inputs.vision.as_ref().map_or(0, |vision| vision.media_cache))?;
     publish_reconciliation(args, &ids, &admission.solved)?;
     cuteafd_bench::context::ResolvedSettings::placement(&admission.placement).publish();
     cuteafd_bench::context::set_resolved("max-context-tokens", &admission.solved.served_context().to_string());
@@ -441,7 +453,8 @@ fn with_backend<T>(args: &ServeArgs,
         ensure!(spark_admission.as_ref().is_none_or(|plan| plan.coordinator_pushes()), "Step-5 Spark admission did not select required push");
         let recorder = dense::Recorder::start(true)?.context("dense recorder")?;
         let loaded = load();
-        let records = recorder.finish();
+        let mut records = recorder.finish();
+        records.extend(media.push.records());
         let loaded = loaded?;
         let (landed, operands, staged, steps, largest, finishes) = records.summary();
         tracing::info!(landed, operands, staged, steps, largest_step_bytes = largest, finishes,
@@ -508,6 +521,7 @@ fn with_backend<T>(args: &ServeArgs,
         }?;
         Ok((embedding, native, mtp))
     })?;
+    std::mem::take(&mut media.push).commit()?;
     tracing::info!(elapsed_s = push_start.elapsed().as_secs_f64(), total_s = startup.elapsed().as_secs_f64(),
         "Step-5 startup weight delivery complete");
     if crate::shared::inventory::startup_probe_enabled() {
@@ -551,6 +565,8 @@ fn with_backend<T>(args: &ServeArgs,
             args.prefill_rows as usize)?)?
         .configure_packing(args.prefill_packing, coordinator_cap)?;
     let backend = if let Some(mtp) = &mtp { backend.with_mtp(mtp) } else { backend };
+    let backend = backend.with_vision(crate::shared::vision::perception::Binding::new(&args.snapshot,
+        cuteafd_loader::media::ImageFamily::Step5, media.preparer.is_some(), cfg.vocab as u32)?);
     if args.decode_graphs { backend.warm_decode_graphs(graph_layout)?; }
     library.cuda_set_device(args.device)?;
     tracing::info!(elapsed_s = bind_start.elapsed().as_secs_f64(), total_s = startup.elapsed().as_secs_f64(),
@@ -558,7 +574,7 @@ fn with_backend<T>(args: &ServeArgs,
     tracing::info!(rows=inputs.rows, sequences=inputs.sequences, mtp=args.mtp,
         context=backend.geometry().max_context, pool_tokens=admission.placement.pool_tokens,
         "Step-5 admitted target and native predictor depth");
-    run(&backend, inputs.sequences)
+    run(&backend, inputs.sequences, media)
 }
 
 pub(super) fn future_allocation_bytes(items: &[cuteafd_core::memory_layout::Item], gpu: &GpuBudget) -> Result<u64> {
@@ -610,14 +626,16 @@ pub(super) fn publish_reconciliation(args: &ServeArgs, ids: &[i32],
 }
 
 fn worker(args: &ServeArgs, receive: &mut tokio::sync::mpsc::Receiver<cuteafd_api::openai::NativeRequest>,
-    stats: &Arc<Mutex<serde_json::Value>>, eos: Vec<u32>, initialized: impl FnOnce(usize) -> Result<()>) -> Result<()> {
-    with_backend(args, |backend, sequences| {
+    stats: &Arc<Mutex<serde_json::Value>>, eos: Vec<u32>, initialized: impl FnOnce(usize, Option<Arc<cuteafd_api::openai::media::MediaPreparer>>) -> Result<()>) -> Result<()> {
+    with_backend(args, |backend, sequences, media| {
+        let mut media_admission = cuteafd_engine::media::MediaAdmission::new(
+            cuteafd_engine::media::EmbeddingCache::new(media.cache_bytes), media.encoder, sequences);
         let drafts = if args.mtp == 0 { scheduler::Drafts::None }
             else { scheduler::Drafts::Neural { depth: usize::from(args.mtp) } };
         scheduler::schedule(backend, &args.snapshot, receive, stats, sequences, drafts, args.draft_length,
             eos, args.decode_share, &args.prefix, args.loop_abort.config(), args.token_io.token_select,
-            &mut text_media(), None,
-            || initialized(backend.geometry().max_context))
+            &mut media_admission, None,
+            || initialized(backend.geometry().max_context, media.preparer))
     })
 }
 
@@ -644,18 +662,19 @@ pub(crate) async fn run_serve(mut args: ServeArgs) -> Result<()> {
     let stats = Arc::new(Mutex::new(serde_json::Value::Null));
     let worker_stats = stats.clone();
     let engine_args = args.clone();
-    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<Result<usize>>();
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<Result<(usize, Option<Arc<cuteafd_api::openai::media::MediaPreparer>>)>>();
     let handle = tokio::task::spawn_blocking(move || {
         let mut ready = Some(ready_tx);
-        let result = worker(&engine_args, &mut receive, &worker_stats, eos, |context| {
-            if let Some(ready) = ready.take() { let _ = ready.send(Ok(context)); }
+        let result = worker(&engine_args, &mut receive, &worker_stats, eos, |context, preparer| {
+            if let Some(ready) = ready.take() { let _ = ready.send(Ok((context, preparer))); }
             Ok(())
         });
         crate::shared::serve::forward_initialization(result, ready.is_some(), "Step-5 initialization failed", |error| {
             ready.take().expect("pending readiness").send(Err(error)).map_err(|result| match result { Err(error) => error, Ok(_) => unreachable!("sent an error") })
         })
     });
-    let context = ready_rx.await.context("Step-5 worker exited before readiness")??;
+    let (context, preparer) = ready_rx.await.context("Step-5 worker exited before readiness")??;
+    let profile = if let Some(preparer) = preparer { profile.with_grouped_vision(preparer) } else { profile };
     let limits = args.prefix.reserve.limits(context)?;
     let hub = crate::shared::console::hub(false, || Ok(crate::shared::console::Layout::new(
         "step5", profile.id.clone(), snapshot.clone())));
@@ -1023,7 +1042,7 @@ mod tests {
             .iter().map(|v| v.as_u64().context("live token id").and_then(|n| Ok(u32::try_from(n)?)))
             .collect::<Result<Vec<_>>>()?;
         ensure!(tokens.len() > 577, "live exactness needs at least 578 real tokens");
-        with_backend(&args, |backend, _| {
+        with_backend(&args, |backend, _, _| {
             backend.draft_geometry(&args.snapshot, 3)?;
             let (family, mut pool) = backend.prefix_cache(&args.prefix, 3)?;
             let prefill = |placement: &mut Placement, state: &mut super::super::mtp::DraftState,
@@ -1037,7 +1056,7 @@ mod tests {
             };
             for frontier in [63usize, 64, 65, 575, 576] {
                 let mut source = pool.admit_cold(&family, frontier, frontier + 4,
-                    |pages| Placement { pages, sequence: 0, committed: 0 })?.placement;
+                    |pages| Placement { media: None, pages, sequence: 0, committed: 0 })?.placement;
                 let mut source_draft = super::super::mtp::DraftState::default();
                 backend.bind_request(&mut source, (), cuteafd_engine::media::RequestMedia::new(Vec::new(), 4096, frontier)?,
                     &tokens, 0)?;
@@ -1047,7 +1066,7 @@ mod tests {
                 ensure!(pool.capture(&family, SnapshotKind::Prompt, &tokens[..frontier], &source, After::default())?,
                     "live exactness snapshot not retained");
                 let mut cold = pool.admit_cold(&family, frontier, frontier + 4,
-                    |pages| Placement { pages, sequence: 1, committed: 0 })?.placement;
+                    |pages| Placement { media: None, pages, sequence: 1, committed: 0 })?.placement;
                 let mut cold_draft = super::super::mtp::DraftState::default();
                 backend.bind_request(&mut cold, (), cuteafd_engine::media::RequestMedia::new(Vec::new(), 4096, frontier)?,
                     &tokens, 0)?;
@@ -1057,7 +1076,7 @@ mod tests {
                     backend.snapshot_compatible(saved, end, true);
                 let restored = pool.admit_native_compatible(&family, &tokens[..frontier + 1],
                     &tokens[..frontier + 1], &[], frontier + 4, false, Some(&compatible),
-                    |pages| Placement { pages, sequence: 2, committed: 0 })?;
+                    |pages| Placement { media: None, pages, sequence: 2, committed: 0 })?;
                 ensure!(restored.resume == frontier, "live exact prefix miss at {frontier}");
                 let mut restored = restored.placement;
                 let mut restored_draft = super::super::mtp::DraftState::default();
@@ -1099,14 +1118,14 @@ mod tests {
                 for placement in [&source, &cold, &restored] { pool.release(&family, &placement.pages)?; }
                 let next = pool.admit_native_compatible(&family, &tokens[..frontier + 2],
                     &tokens[..frontier + 2], &[], frontier + 4, false, Some(&compatible),
-                    |pages| Placement { pages, sequence: 0, committed: 0 })?;
+                    |pages| Placement { media: None, pages, sequence: 0, committed: 0 })?;
                 ensure!(next.resume == frontier + 1, "live drafting conversation missed its prior turn");
                 let mut next = next.placement;
                 backend.bind_request(&mut next, (), cuteafd_engine::media::RequestMedia::new(Vec::new(), 4096, frontier + 1)?,
                     &tokens, frontier + 1)?;
                 ensure!(continued == backend.diagnostic_state(&next)?, "live drafting turn restore differs");
                 let mut fresh = pool.admit_cold(&family, frontier + 1, frontier + 4,
-                    |pages| Placement { pages, sequence: 1, committed: 0 })?.placement;
+                    |pages| Placement { media: None, pages, sequence: 1, committed: 0 })?.placement;
                 let mut fresh_draft = super::super::mtp::DraftState::default();
                 backend.bind_request(&mut fresh, (), cuteafd_engine::media::RequestMedia::new(Vec::new(), 4096, frontier + 1)?,
                     &tokens, 0)?;
@@ -1183,10 +1202,10 @@ mod tests {
             "packed reference logit extent");
         let reference_logits = reference_bytes.chunks_exact(4)
             .map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect::<Vec<_>>();
-        with_backend(&args, |backend, _| {
+        with_backend(&args, |backend, _, _| {
             let (family, mut pool) = backend.prefix_cache(&args.prefix, 4)?;
             let mut placements = (0..4).map(|sequence| pool.admit_cold(&family, 192, 256,
-                |pages| Placement { pages, sequence, committed: 0 }).map(|a| a.placement)).collect::<std::result::Result<Vec<_>, _>>()?;
+                |pages| Placement { media: None, pages, sequence, committed: 0 }).map(|a| a.placement)).collect::<std::result::Result<Vec<_>, _>>()?;
             let mut drafts = (0..4).map(|_| DraftState::default()).collect::<Vec<_>>();
             ensure!(backend.geometry().vocab_size == vocab, "packed reference vocabulary mismatch");
             let prompts = [&tokens[..128], &tokens[..159]];

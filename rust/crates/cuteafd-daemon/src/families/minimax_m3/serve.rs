@@ -75,8 +75,6 @@ pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
     use cuteafd_api::openai::{ModelProfile, NativeRequest};
     use std::sync::Mutex;
     cuteafd_core::concurrency::validate("minimax_m3", u64::from(args.max_sequences))?;
-    // Probes and selection must resolve the same policy before either is initialized.
-    crate::shared::draft::draft_mode_with_default(cuteafd_core::DraftMode::Shared);
     ensure!(matches!(args.token_io.embed_placement, crate::shared::token_io::EmbedPlacement::Gpu)
         && args.token_io.token_select == crate::shared::token_io::SelectPlacement::Device,
         "MiniMax serving requires admitted GPU embedding and device selection");
@@ -214,12 +212,13 @@ mod tests {
     }
 
     #[test]
-    fn shared_policy_fallback_is_selected_before_probes_and_native_startup() {
-        let source = include_str!("serve.rs").split_once("pub(crate) async fn run(").unwrap().1
-            .split_once("#[cfg(test)]").unwrap().0;
-        let policy = source.find("draft_mode_with_default(cuteafd_core::DraftMode::Shared)").unwrap();
-        assert!(policy < source.find("cuteafd_ffi::NativeLibrary::load(").unwrap());
-        assert!(policy < source.find("super::startup::load(").unwrap());
+    fn minimax_resolves_the_global_draft_policy_default() {
+        let source = include_str!("serve.rs").split_once("#[cfg(test)]").unwrap().0;
+        assert!(!source.contains("draft_mode_with_default"));
+        assert!(!source.contains("DraftMode::Shared"));
+        if std::env::var("CUTEAFD_DRAFT_POLICY").unwrap_or_default().is_empty() {
+            assert_eq!(crate::shared::draft::draft_mode(), cuteafd_core::DraftMode::Simple);
+        }
     }
 
     #[test]

@@ -133,3 +133,24 @@ mod device_tests {
         Ok(())
     }
 }
+/// Replace selected F32 embedding rows with exact BF16 feature widenings.
+/// BF16 scatter and F32 output use disjoint, caller-admitted row planes.
+pub(crate) fn inject_f32(stream: &crate::shared::memory::device::Stream<'_>,
+    chunk: &cuteafd_engine::media::MediaChunk, features: cuteafd_ffi::CuteafdDeviceBuffer,
+    indices: cuteafd_ffi::CuteafdDeviceBuffer, bf16: cuteafd_ffi::CuteafdDeviceBuffer,
+    output: cuteafd_ffi::CuteafdDeviceBuffer, rows: usize, width: usize) -> Result<()> {
+    inject(stream, chunk, features, indices, bf16, rows, width)?;
+    stream.device.run(|| {
+        for &row in &chunk.indices {
+            let source = crate::shared::prefix::view(bf16, row as usize * width * 2, width * 2)?;
+            let destination = crate::shared::prefix::view(output, row as usize * width * 4, width * 4)?;
+            // SAFETY: checked scatter rows and admitted disjoint views survive
+            // all ordered writes; the unit owner drains before scratch reuse.
+            unsafe {
+                stream.device.library.cuda_zero_bytes_async(destination, width * 4, stream.raw)?;
+                stream.device.library.cuda_accumulate_bf16_to_f32_async(source, destination, width, stream.raw)?;
+            }
+        }
+        Ok(())
+    })
+}

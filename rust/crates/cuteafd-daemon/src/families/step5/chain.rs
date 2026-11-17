@@ -847,7 +847,7 @@ mod tests {
         };
         for rows in [1, 7, 8, 9, 64] {
             let mut placement = pool.borrow_mut()
-                .admit_cold(&family, 1, 1, |pages| Placement {
+                .admit_cold(&family, 1, 1, |pages| Placement { media: None,
                     pages,
                     sequence: 0,
                     committed: 0,

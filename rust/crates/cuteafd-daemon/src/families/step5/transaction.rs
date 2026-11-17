@@ -1664,9 +1664,9 @@ pub(super) mod tests {
         let mut serial_placements = Vec::new();
         for sequence in 0..2 {
             wave_placements.push(wave_pool.admit_cold(&wave_family, 1, 64,
-                |pages| Placement { pages, sequence, committed: 0 })?.placement);
+                |pages| Placement { media: None, pages, sequence, committed: 0 })?.placement);
             serial_placements.push(serial_pool.borrow_mut().admit_cold(&serial_family, 1, 64,
-                |pages| Placement { pages, sequence, committed: 0 })?.placement);
+                |pages| Placement { media: None, pages, sequence, committed: 0 })?.placement);
         }
         for (pass, (counts, accepted)) in [([7usize, 3], [7usize, 3]), ([17, 5], [9, 4])].into_iter().enumerate() {
             let total: usize = counts.iter().sum();
@@ -1806,9 +1806,9 @@ pub(super) mod tests {
             assert_ne!(first.stream.raw, second.stream.raw);
         }
         let mut first = pool.borrow_mut().admit_cold(&family, 1, 1, |pages|
-            Placement { pages, sequence: 0, committed: 0 })?.placement;
+            Placement { media: None, pages, sequence: 0, committed: 0 })?.placement;
         let mut second = pool.borrow_mut().admit_cold(&family, 1, 1, |pages|
-            Placement { pages, sequence: 1, committed: 0 })?.placement;
+            Placement { media: None, pages, sequence: 1, committed: 0 })?.placement;
         let free = pool.borrow().pool().free();
         {
             let mut first_step = Step::begin(refs.clone(), lanes.clone(), &pool, &mut first, 64)?;
@@ -1832,7 +1832,7 @@ pub(super) mod tests {
 
         for base in [0, 7, 63, 511, 575, 576] {
             let mut placement = pool.borrow_mut()
-                .admit_cold(&family, base.max(1), base.max(1), |pages| Placement {
+                .admit_cold(&family, base.max(1), base.max(1), |pages| Placement { media: None,
                     pages,
                     sequence: 0,
                     committed: base,
