@@ -510,6 +510,22 @@ def test_compare_pairs_reads_safetensors_row_dumps(tmp_path):
     assert '| False |' in table and 'row-00000001.safetensors' in table
 
 
+def test_compare_pairs_requires_matching_logit_digests(tmp_path):
+    state = dict(root=str(tmp_path), vocab=3, slots={})
+    a, b = [tmp_path / arm / 'r1' / 'logits-sha256.json' for arm in ('a', 'b')]
+    for path in (a, b):
+        path.parent.mkdir(parents=True)
+        path.write_text(json.dumps({'widths': [[1, 'a' * 64]], 'accepted_prefix': []}))
+    result, = golden.compare_pairs(state, [('a', 'b')], 1)
+    assert result['byte_identical']
+    b.write_text(json.dumps({'widths': [[1, 'b' * 64]], 'accepted_prefix': []}))
+    result, = golden.compare_pairs(state, [('a', 'b')], 1)
+    assert not result['byte_identical']
+    b.unlink()
+    result, = golden.compare_pairs(state, [('a', 'b')], 1)
+    assert result['error'] == 'logit digest receipt present in one arm only'
+
+
 @pytest.mark.parametrize('positions', [None, [1, 2], [4, 5]])
 def test_compare_pairs_aligns_bin_nll_with_scored_positions(tmp_path, positions):
     root = tmp_path / 'golden'

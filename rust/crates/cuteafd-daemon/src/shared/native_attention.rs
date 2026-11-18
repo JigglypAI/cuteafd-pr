@@ -41,20 +41,28 @@ pub(crate) fn attention_records(snapshot: &std::path::Path,
         "native attention recipe differs from selected mode");
     let [n, k] = layout.shape;
     let padded = mode == CoreView::Fp8Compact && role.pad_to.is_some();
-    if padded {
-        ensure!(layout.ranks == 1 || layout.split != CoreSplit::Output,
-            "padded output rows cannot be split between ranks");
+    let real_rows = if padded && layout.split == CoreSplit::Output {
+        ensure!(layout.ranks == 2, "padded output partition needs two ranks");
         let stored = role.stored_shape([shape[0], shape[1]])?;
-        ensure!(n == stored[0] && k == stored[1] / if layout.split == CoreSplit::Input { layout.ranks } else { 1 },
-            "native attention explicit padded shape differs from admission");
-    }
-    let (rows, cols) = match layout.split {
-        CoreSplit::Output => (layout.rank*n..(layout.rank+1)*n, 0..k),
-        CoreSplit::Input => (0..if padded { shape[0] } else { n }, layout.rank*k..(layout.rank+1)*k),
-        CoreSplit::Whole => (0..if padded { shape[0] } else { n }, 0..k),
+        let span = cuteafd_loader::shared::vocabulary::shard(stored[0], 128, layout.rank)?;
+        ensure!(n == span.len() && k == stored[1], "padded output shard differs from admission");
+        span.start..span.end.min(shape[0])
+    } else {
+        if padded {
+            let stored = role.stored_shape([shape[0], shape[1]])?;
+            ensure!(n == stored[0] && k == stored[1] / if layout.split == CoreSplit::Input { layout.ranks } else { 1 },
+                "native attention explicit padded shape differs from admission");
+        }
+        match layout.split {
+            CoreSplit::Output => layout.rank*n..(layout.rank+1)*n,
+            _ => 0..if padded { shape[0] } else { n },
+        }
     };
-    ensure!(rows.end <= shape[0] && cols.end <= shape[1]
-        && rows.len() == if padded { shape[0] } else { n } && cols.len() == k, "native attention source slice");
+    let cols = if layout.split == CoreSplit::Input { layout.rank*k..(layout.rank+1)*k } else { 0..k };
+    ensure!(real_rows.end <= shape[0] && cols.end <= shape[1]
+        && !real_rows.is_empty() && real_rows.len() <= n && cols.len() == k, "native attention source slice");
+    let source_rows = real_rows.len();
+    let rows = real_rows;
     let source = |name: &str, rows: std::ops::Range<usize>, cols: std::ops::Range<usize>, width: usize| -> Result<Rect> {
         let t = selected.tensors.iter().find(|t| t.meta.name == name).context("native attention selected tensor missing")?;
         ensure!(t.meta.shape.len() == 2 && rows.end <= t.meta.shape[0] && cols.end <= t.meta.shape[1],
@@ -91,13 +99,13 @@ pub(crate) fn attention_records(snapshot: &std::path::Path,
                 bytes: rows.len().div_ceil(128)*(k/128)*4, ..grid }, kmajor: None,
         };
         let mut jobs = Vec::new();
-        if padded && rows.end == shape[0] {
-            let start = shape[0] * k;
+        if padded && rows.end == source_rows {
+            let start = source_rows * k;
             if start < n * k {
                 jobs.push(Job::Zero { dst: CuteafdDeviceBuffer {
                     ptr: values.ptr.wrapping_byte_add(start), bytes: n*k-start, ..values } });
             }
-            let start = shape[0].div_ceil(128) * (k/128) * 4;
+            let start = source_rows.div_ceil(128) * (k/128) * 4;
             let end = (n/128) * (k/128) * 4;
             if start < end {
                 jobs.push(Job::Zero { dst: CuteafdDeviceBuffer {

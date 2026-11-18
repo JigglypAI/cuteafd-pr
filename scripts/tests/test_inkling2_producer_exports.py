@@ -76,7 +76,8 @@ def test_padded_load_exports_have_declared_static_geometries(monkeypatch):
     programs = scope['inkling2_load_programs']()
     assert [program[0] for program in programs] == [
         'padded_transpose_bf16_r16_c1024_p64', 'padded_transpose_bf16_r4608_c256_p4608',
-        'padded_transpose_f32_r32_c201088_p32']
+        'padded_transpose_f32_r32_c201088_p32',
+        'padded_transpose_f32_r32_c100608_p32', 'padded_transpose_f32_r32_c100480_p32']
     stem, op, params, compile_program = programs[0]
     assert stem == 'padded_transpose_bf16_r16_c1024_p64' and op == 'padded_transpose'
     assert params == {'dtype': 'bfloat16', 'rows': 16, 'cols': 1024, 'padded_cols': 64}

@@ -39,6 +39,10 @@ impl<'a> NativeSource<'a> {
         let mut rows = 0..count;
         let mut columns = 0..row_bytes;
         if let Some(axis) = split {
+            if name == HEAD_WEIGHT {
+                rows = crate::shared::vocabulary::shard(count, 128, rank)?;
+                return Ok(Self { name, rows, columns, row_bytes });
+            }
             ensure!(header.shape.len() >= 2 && header.shape[axis].is_multiple_of(2),
                 "Inkling native view cannot split source axis {axis}: {name}");
             let range = if axis == 0 { &mut rows } else { &mut columns };
@@ -108,6 +112,7 @@ pub struct CoordinatorWeights {
 }
 
 pub const HEAD: &str = "model.llm.unembed";
+const HEAD_WEIGHT: &str = "model.llm.unembed.weight";
 
 pub fn fp8_role(name: &str) -> Fp8Role {
     let stem = name.strip_suffix(".weight").unwrap_or(name);
@@ -155,8 +160,10 @@ impl CoordinatorWeights {
                 builder.plain(format!("{TEXT}embed_norm.weight"), DType::Bf16, &[h])?;
             }
             let head = if modes.iter().all(|mode| *mode == LayerMode::HeadSplit) { 0 } else { ranks - 1 };
+            if rank == head || ranks == 2 {
+                builder.projection(format!("{TEXT}unembed.weight"), &[v, h], 0, (ranks == 2).then_some(rank))?;
+            }
             if rank == head {
-                builder.projection(format!("{TEXT}unembed.weight"), &[v, h], 0, None)?;
                 builder.plain(format!("{TEXT}norm.weight"), DType::Bf16, &[h])?;
                 builder.plain(format!("{TEXT}attn_res.output_query"), DType::F32, &[h])?;
             }
@@ -216,7 +223,7 @@ impl CoordinatorWeights {
                     .context("Inkling compact mount lacks validated member")?;
                 let rows = header.shape.first().copied().unwrap_or(1);
                 let row_bytes = usize::try_from(header.byte_length)? / rows;
-                let width = if suffix == "trellis" && layout.side == TrellisSide::Output { row_bytes / layout.ranks }
+                let width = if suffix == "trellis" && layout.side == TrellisSide::Output { layout.shape[0] / 16 * 32 * layout.bits }
                     else { row_bytes };
                 load.merge(MountLoad::read(ReadBatch::new(rows, row_bytes, width, STEP_BYTES)?));
             }
@@ -337,8 +344,12 @@ impl Builder<'_> {
             let split_axis = match split { None => CoreSplit::Whole, Some(_) if axis == 0 => CoreSplit::Output,
                 Some(_) => CoreSplit::Input };
             if split.is_some() {
-                ensure!(stored[axis] % 256 == 0, "{name}: FP8 TP2 requires whole rank-local blocks");
-                stored[axis] /= 2;
+                if stem == HEAD {
+                    stored[0] = crate::shared::vocabulary::shard(stored[0], 128, split.unwrap())?.len();
+                } else {
+                    ensure!(stored[axis] % 256 == 0, "{name}: FP8 TP2 requires whole rank-local blocks");
+                    stored[axis] /= 2;
+                }
             }
             let layout = NativeLayout { stem: stem.to_owned(), shape: stored, fp8: true,
                 rank: split.unwrap_or(0), ranks: if split.is_some() { 2 } else { 1 }, split: split_axis };
@@ -355,12 +366,14 @@ impl Builder<'_> {
         let mut projections = crate::formats::trellis_core::read_projections(self.checkpoint, &expected,
             |member| member.strip_prefix(stem).is_some_and(|rest| rest.starts_with('.')),
             |candidate| (candidate == stem).then_some(CoreContract { family: "Inkling 2", widths: &[6, 8],
-                split: if split.is_none() { CoreSplit::Whole } else if axis == 0 { CoreSplit::Output } else { CoreSplit::Input },
-                padded_outputs: stem == "model.llm.unembed", view_varying: true }))?;
+                split: if split.is_none() || stem == HEAD { CoreSplit::Whole } else if axis == 0 { CoreSplit::Output } else { CoreSplit::Input },
+                padded_outputs: stem == HEAD, view_varying: true }))?;
         let projection = projections.remove(stem).context("Inkling core projection headers absent")?;
-        let layout = CoreWeightLayout::new(&projection,
+        let layout = if stem == HEAD && split.is_some() {
+            CoreWeightLayout::output_shard(&projection, split.unwrap())?
+        } else { CoreWeightLayout::new(&projection,
             if split.is_some() && axis == 1 { TrellisSide::Input } else { TrellisSide::Output }, split.unwrap_or(0),
-            if split.is_some() { 2 } else { 1 })?;
+            if split.is_some() { 2 } else { 1 })? };
         let prefix = projection_prefix(stem, layout.rank, layout.ranks);
         self.tensors.extend(layout.arena_tensors(&prefix)?);
         self.core.insert(stem.to_owned(), layout);
@@ -395,7 +408,10 @@ impl Builder<'_> {
         ensure!(shape[axis] % 2 == 0, "Inkling 2 arena {name}: axis {axis} of {shape:?} does not split over two ranks");
         let bytes_per_element = match dtype { DType::Bf16 => 2, DType::F32 => 4, _ => anyhow::bail!("unsupported Inkling 2 arena dtype {dtype:?}") };
         let bytes = shape.iter().try_fold(bytes_per_element, |bytes: usize, dim|
-            bytes.checked_mul(*dim).context("Inkling 2 arena tensor extent overflow"))? / 2;
+            bytes.checked_mul(*dim).context("Inkling 2 arena tensor extent overflow"))?;
+        let bytes = if name == HEAD_WEIGHT {
+            bytes / shape[0] * crate::shared::vocabulary::shard(shape[0], 128, rank)?.len()
+        } else { bytes / 2 };
         self.tensors.push((format!("{name}#rank{rank}"), bytes));
         Ok(())
     }

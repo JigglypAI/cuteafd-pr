@@ -74,6 +74,17 @@ impl CoreWeightLayout {
             |name, bytes| crate::shared::memory::weight_arena::weight_allocation(device, None, name, bytes, ArenaTag::weights("shared/k6-core")))
     }
 
+    fn output_start(&self, total: usize) -> Result<usize> {
+        let local = self.shape[0];
+        if local.checked_mul(self.ranks) == Some(total) {
+            return Ok(self.rank * local);
+        }
+        ensure!(self.ranks == 2, "uneven output shard needs two ranks");
+        let span = cuteafd_loader::shared::vocabulary::shard(total, 128, self.rank)?;
+        ensure!(span.len() == local, "uneven output shard differs from admitted width");
+        Ok(span.start)
+    }
+
     /// The shared mount/push recipe; only final named storage is injected.
     pub(crate) fn load_recorded_with<'a>(&self, device: Device<'a>, checkpoint: &cuteafd_loader::plan::Checkpoint,
         dense: &crate::shared::experts::rtx::dense::DenseLoad<'a>, stream: *mut c_void,
@@ -97,10 +108,10 @@ impl CoreWeightLayout {
         let (n, k) = (module.output_features, module.input_features);
         let [local_n, local_k] = self.shape;
         let (n0, k0) = match self.side {
-            TrellisSide::Output => (self.rank * local_n, 0),
+            TrellisSide::Output => (self.output_start(n)?, 0),
             TrellisSide::Input => (0, self.rank * local_k),
         };
-        ensure!(match self.side { TrellisSide::Output => local_k == k && local_n * self.ranks == n,
+        ensure!(match self.side { TrellisSide::Output => local_k == k,
             TrellisSide::Input => local_n == n && local_k * self.ranks == k }
             && local_n % 128 == 0 && local_k % 128 == 0, "{stem}: K6 shard geometry");
         let tile_bytes = 32 * module.bits;
@@ -132,7 +143,7 @@ impl CoreWeightLayout {
         use crate::shared::experts::rtx::dense::{Rect, TRANSFORM_BYTES};
         let [local_n, local_k] = self.shape;
         let (n0, k0) = match self.side {
-            TrellisSide::Output => (self.rank * local_n, 0),
+            TrellisSide::Output => (self.output_start(outputs)?, 0),
             TrellisSide::Input => (0, self.rank * local_k),
         };
         let tile_bytes = 32 * self.bits;

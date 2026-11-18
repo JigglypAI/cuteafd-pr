@@ -358,6 +358,7 @@ impl<'a> Backend<'a> for InklingBackend<'a> {
             let proposed=draft.drafter.draft(&rows,execution.target.operand("model.llm.embed.weight")?.buffer,
                 execution.target.operand("model.llm.embed_norm.weight")?.buffer,|sequences, anchors| {
                     draft.select(&execution.head,&execution.kernels,execution.target.projection("model.llm.unembed.weight")?,
+                        execution.peer.as_ref().map(|peer| super::head::PeerHead { kernels: &peer.kernels, target: &peer.target }),
                         sequences,anchors)
                 })?;
             for ((index,_,s),tokens) in selected.into_iter().zip(proposed){output[first+index]=tokens.tokens.into_iter().take(s.depth).collect();}

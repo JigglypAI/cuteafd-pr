@@ -53,3 +53,4 @@ pub(crate) mod thermal;
 pub(crate) mod vision;
 
 pub(crate) mod native_attention;
+pub(crate) mod distributed_head;

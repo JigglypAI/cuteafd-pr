@@ -542,7 +542,7 @@ def test_kimi_shipping_k8_inventory_preserves_every_existing_geometry():
     source = (ROOT / 'python/tools/aot/export_b12x_dense_trellis_k6_aot.py').read_text()
     tree = ast.parse(source)
     scope = {}
-    definitions = {'_bits', '_suffix', '_key', 'shapes_for', 'row_policies', 'grouped_policy', 'output_dtype'}
+    definitions = {'_bits', '_suffix', '_key', '_codebooks', 'shapes_for', 'row_policies', 'grouped_policy', 'output_dtype'}
     for node in tree.body:
         if ((isinstance(node, ast.Assign) and all(isinstance(target, ast.Name) for target in node.targets))
                 or isinstance(node, ast.FunctionDef) and node.name in definitions):
