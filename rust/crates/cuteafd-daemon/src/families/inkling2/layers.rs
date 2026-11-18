@@ -188,6 +188,17 @@ impl<'a> Kernels<'a> {
         unsafe { self.producer(Op::Router)?.launch(&[logits, bias, owner.buffer("route_ids")?,
             owner.buffer("route_weights")?], rows, None, owner.stream().raw) }
     }
+    pub fn compact_inventory(&self, inventory: &mut crate::shared::memory::receipts::Inventory<'_>, prefix: &str) -> Result<()> {
+        if let Some(c) = &self.compact {
+            if let Some(trellis) = &c.trellis_scratch {
+                let backing = &trellis._owners["projection arena"];
+                backing.inventory(inventory, &format!("{prefix}.trellis"))?;
+            }
+            if let Some(fp8) = &c.fp8_scratch { fp8.inventory(inventory, &format!("{prefix}.fp8"))?; }
+        }
+        Ok(())
+    }
+
     pub fn bind_compact(&mut self, programs: &'a Programs<'a>, stream: Rc<Stream<'a>>, target: &CoordinatorWeights,
         rows: usize, head_rows: usize, fp8_bytes: usize) -> Result<()> {
         if !target.core.is_empty() || !target.fp8.is_empty() {
@@ -199,12 +210,18 @@ impl<'a> Kernels<'a> {
     pub fn project_target(&self, owner: &impl UnitBuffers<'a>, input: Buffer, weight: ProjectionWeight<'_, '_>,
         output: Buffer, rows: usize, k: usize, n: usize) -> Result<()> {
         if let ProjectionWeight::Bf16(weight) = weight { return self.project(owner, input, weight.buffer, output, rows, k, n); }
+        self.project_compact(owner.stream(), input, weight, output, rows, k, n)
+    }
+
+    /// Compact head and attention share one ordered projection owner. The
+    /// recurrent drafter can use it without borrowing a target row unit.
+    pub fn project_compact(&self, stream: &Stream<'a>, input: Buffer, weight: ProjectionWeight<'_, '_>,
+        output: Buffer, rows: usize, k: usize, n: usize) -> Result<()> {
         let c = self.compact.as_ref().context("Inkling compact target runtime was not admitted")?;
-        let stream = owner.stream();
         ensure!(std::ptr::eq(c.stream.as_ref(), stream) && input.bytes >= rows*k*2 && output.bytes >= rows*n*4,
             "Inkling compact projection stream or extents differ from admission");
         match weight {
-            ProjectionWeight::Bf16(_) => unreachable!(),
+            ProjectionWeight::Bf16(_) => anyhow::bail!("Inkling compact projection requires compact weights"),
             ProjectionWeight::Trellis(w) => {
                 let key = trellis_geometry(w.shape, w.side, w.bits, w.codebook);
                 ensure!(w.shape == [n, k], "Inkling trellis projection geometry differs from forward");

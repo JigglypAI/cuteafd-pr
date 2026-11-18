@@ -17,6 +17,7 @@ pub(crate) struct ProgramsForRank<'a> {
     pub(super) f32: DraftProjections<'a>,
     compressed: BTreeMap<String,Projection<'a>>,
     compressed_scratch: Option<ProjectionScratch<'a>>,
+    fp8: Option<(cuteafd_ffi::native_attention::Fp8Projections<'a>, Allocation<'a>)>,
     pub mix: Primitive<'a>, pub init: Primitive<'a>, pub residual_norm: Primitive<'a>,
     pub rotary: Primitive<'a>, pub context_rotary: Primitive<'a>, pub silu: Primitive<'a>,
     pub store: Primitive<'a>,
@@ -55,13 +56,21 @@ impl<'a> ProgramsForRank<'a> {
             compressed.insert(name.clone(),projection);
         }
         let compressed_scratch=required.map(|layout|layout.allocate_packed(device,Tag::drafter_workspace("shared/recurrent-projection"))).transpose()?;
+        let fp8 = if weights.layout.fp8.is_empty() { None } else {
+            let shapes = weights.layout.fp8.values().map(|p| (p.shape[1], p.shape[0])).collect::<Vec<_>>();
+            let fp8 = cuteafd_ffi::native_attention::Fp8Projections::load(programs, &shapes, rows, ProjectionOutput::Bf16)?;
+            let bytes = shapes.iter().try_fold(0, |peak, &(k, n)| fp8.scratch_bytes(k,n).map(|size| size.max(peak)))?;
+            ensure!(layout.buffers.iter().any(|(name, admitted)| name == "projection.fp8" && *admitted == bytes),
+                "recurrent FP8 scratch differs from the admitted shape");
+            Some((fp8, Allocation::new(device, bytes, Tag::drafter_workspace("shared/recurrent-fp8"))?))
+        };
         let head=if local.rank==local.lead {Some(HeadPrograms{
             fold:Primitive::load(programs,Op::Fold)?,gate:Primitive::load(programs,Op::Gate)?,
             finish:Primitive::load(programs,Op::Finish)?,
             bias_raw:Primitive::load(programs,Op::Bias{width:768,bf16:false})?,
             bias_correction:Primitive::load(programs,Op::Bias{width:201024,bf16:true})?,
         })}else{None};
-        Ok(Self {plain,f32,compressed,compressed_scratch,head,
+        Ok(Self {plain,f32,compressed,compressed_scratch,fp8,head,
             mix:Primitive::load(programs,Op::Mix)?,init:Primitive::load(programs,Op::Mask)?,
             residual_norm:Primitive::load(programs,Op::ResidualNorm)?,
             rotary:Primitive::load(programs,Op::QkRope{query_heads:local.heads,kv_heads:local.kv_heads})?,
@@ -80,6 +89,12 @@ impl<'a> ProgramsForRank<'a> {
                 // SAFETY: input and weight extents checked; caller retains disjoint
                 // admitted destination and stream, and producer checks its extent.
                 unsafe {self.plain.launch_checked(input.ptr,weight.buffer.ptr,output,rows,k,n,stream)?;}
+            }
+            ProjectionWeight::Fp8 { values, scales } => {
+                let (fp8, scratch) = self.fp8.as_ref().context("recurrent FP8 projection not admitted")?;
+                ensure!(input.bytes >= rows*k*2 && values.buffer.bytes == n*k, "recurrent FP8 operand extent");
+                // SAFETY: the rank retains the packed weights and serializes reuse of its scratch on this stream.
+                unsafe { fp8.launch(input.ptr, values.buffer.ptr, scales.buffer.ptr, output, scratch.buffer, rows, k, n, stream)?; }
             }
             ProjectionWeight::Trellis(weight)=> {
                 let projection=self.compressed.iter().find(|(key,_)|key.as_str()==name || key.strip_prefix("mtp.")==Some(name))
@@ -125,7 +140,7 @@ impl<'a> Rank<'a> {
     pub fn allocate(weights:Weights<'a>,stream:Rc<Stream<'a>>,config:RecurrentBlockConfig,
         layout:RecurrentRuntimeLayout,programs:ProgramsForRank<'a>)->Result<Self> {
         let device=stream.device;
-        let buffers=layout.buffers.iter().map(|(name,bytes)| {
+        let buffers=layout.buffers.iter().filter(|(name, _)| !matches!(name.as_str(), "projection.trellis" | "projection.fp8")).map(|(name,bytes)| {
             let tag=if name.starts_with("cache."){Tag::drafter_kv("shared/recurrent-cache")}
                 else{Tag::drafter_workspace("shared/recurrent-workspace")};
             Ok((name.clone(),Allocation::new(device,*bytes,tag)?))

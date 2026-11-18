@@ -2123,14 +2123,16 @@ def main() -> None:
         work += [("inkling2", *item) for item in inkling2_attention_programs(args.decode_rows, args.prefill_rows)]
         work += [("inkling2", *item) for item in inkling2_producer_programs(args.prefill_rows)]
         work += [("inkling2", *item) for item in inkling2_load_programs()]
-        from export_b12x_dense_trellis_k6_aot import INKLING_TARGET_SHAPES
+        from export_b12x_dense_trellis_k6_aot import INKLING_SHAPES, INKLING_TARGET_SHAPES
         existing_fp8 = {suffix for family, suffix, *_ in work if family == "native_attention"}
-        for k, n in sorted({(k, n) for _, k, n, _ in INKLING_TARGET_SHAPES}):
+        fp8_shapes = {(k, n, "f32") for _, k, n, _ in INKLING_TARGET_SHAPES}
+        fp8_shapes.update((k, n, "bf16") for _, k, n, _ in INKLING_SHAPES if n != 201088)
+        for k, n, precision in sorted(fp8_shapes):
             for rows in ((64,) if n == 201088 else (64, 4096)):
-                suffix = f"n{n}_k{k}_m{rows}_f32"
+                suffix = f"n{n}_k{k}_m{rows}" + ("_f32" if precision == "f32" else "")
                 if suffix not in existing_fp8:
                     work.append(("native_attention", suffix, "attention_projection", dict(max_rows=rows),
-                                 functools.partial(compile_native_attention_projection, n, k, rows, "f32")))
+                                 functools.partial(compile_native_attention_projection, n, k, rows, precision)))
         work += [("inkling_draft", *item) for item in inkling_draft_programs()]
         for suffix, op, params, compile_ in inkling_fir_programs():
             family = "fir" if suffix == "fir_history_commit" else "inkling2"

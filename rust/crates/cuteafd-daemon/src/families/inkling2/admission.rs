@@ -1,5 +1,5 @@
 //! Cold partial-golden contract uses shared phase/arena/tail admission.
-use super::{experts::Mxfp8Layout, head::Head, weights::execution_arena};
+use super::{head::Head, weights::execution_arena};
 use anyhow::{Context as _, Result};
 use cuteafd_core::memory_layout::{Category, MemoryKind};
 use cuteafd_loader::{families::inkling2::{execution::UnitLayout, weight_layout::CoordinatorWeights, Inkling2Config},
@@ -13,7 +13,8 @@ fn cold_contract(facts: Facts, rows: usize) -> Contract {
 }
 
 pub(crate) fn admit(checkpoint: &Checkpoint, cfg: &Inkling2Config, target: &CoordinatorWeights,
-    expert: &Mxfp8Layout, scratch: usize, unit: &UnitLayout, head_rows: usize, fp8_bytes: usize,
+    expert_arena: &cuteafd_loader::serving_capacity::WeightArenaLayout, expert_scratch: &[(&str, usize)],
+    expert_mount: cuteafd_loader::shared::dense_read::MountLoad, unit: &UnitLayout, head_rows: usize, fp8_bytes: usize,
     free: u64, total: u64, host: (u64, u64)) -> Result<ResolvedPlan> {
     let empty = Facts { phase_order: PhaseOrder::TARGET_THEN_DRAFT, resident_weights: vec![], allocations: vec![],
         deferred: vec![], sequential: vec![], reservations: vec![], allowances: vec![],
@@ -21,13 +22,13 @@ pub(crate) fn admit(checkpoint: &Checkpoint, cfg: &Inkling2Config, target: &Coor
     let mut contract = cold_contract(empty, unit.rows);
     contract.components.extend(weight_arena_components(&execution_arena(target)?, Location::coordinator(0),
         Lifetime::RESIDENT, 1, MemoryKind::Weights)?);
-    contract.components.extend(weight_arena_components(&expert.arena, Location::coordinator(0),
+    contract.components.extend(weight_arena_components(expert_arena, Location::coordinator(0),
         Lifetime::RESIDENT, 1, MemoryKind::Experts)?);
     let mut buffers = unit.buffers.iter().map(|(name, bytes)| (format!("unit.{name}"), Location::coordinator(0),
         *bytes as u64, Lifetime::TARGET, Category::Workspace)).collect::<Vec<_>>();
     for (name, bytes) in [("head.tokens", head_rows*4), ("head.normalized", head_rows*cfg.hidden*2),
-        ("head.logits", head_rows*cfg.unpadded_vocab_size*4), ("head.workspace", Head::workspace_bytes(cfg, head_rows)?),
-        ("expert.scratch", scratch)] {
+        ("head.logits", head_rows*cfg.unpadded_vocab_size*4), ("head.workspace", Head::workspace_bytes(cfg, head_rows)?)]
+        .into_iter().chain(expert_scratch.iter().copied()) {
         buffers.push((name.into(), Location::coordinator(0), bytes as u64, Lifetime::TARGET, Category::Workspace));
     }
     let trellis = target.trellis_scratch(unit.rows, head_rows.min(64))?
@@ -37,7 +38,7 @@ pub(crate) fn admit(checkpoint: &Checkpoint, cfg: &Inkling2Config, target: &Coor
         if bytes > 0 { buffers.push((name.into(), Location::coordinator(0), bytes as u64, Lifetime::TARGET, Category::Workspace)); }
     }
     let mut mount = target.mount_load(checkpoint)?;
-    mount.merge(expert.mount);
+    mount.merge(expert_mount);
     for (name, bytes, location) in [("source", mount.pinned_source, Location::PINNED),
         ("rows", mount.full_row_cache, Location::HOST), ("tables", mount.pinned_tables, Location::PINNED)] {
         if bytes>0 { buffers.push((format!("mount.{name}"), location, bytes, Lifetime::RESIDENT, Category::Staging)); }

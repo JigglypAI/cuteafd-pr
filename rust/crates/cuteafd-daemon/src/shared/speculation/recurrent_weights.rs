@@ -12,6 +12,7 @@ use std::{collections::BTreeMap, ffi::c_void};
 pub(crate) enum ProjectionWeight<'a> {
     Bf16(Allocation<'a>),
     Trellis(CoreWeights<'a>),
+    Fp8 { values: Allocation<'a>, scales: Allocation<'a> },
 }
 
 pub(crate) struct Weights<'a> {
@@ -26,7 +27,7 @@ impl<'a> Weights<'a> {
     pub fn load(device: Device<'a>, source: &RecurrentSource, layout: RecurrentWeightLayout,
         stream: *mut c_void) -> Result<Self> {
         let checked = source.rank(layout.rank, layout.ranks, layout.lead)?;
-        ensure!(checked.arena == layout.arena && checked.core == layout.core,
+        ensure!(checked.arena == layout.arena && checked.core == layout.core && checked.fp8 == layout.fp8,
             "recurrent draft arena differs from header-validated admission");
         let dense = DenseLoad::mount(device.library);
         dense.admit_mount(source.mount_load(layout.ranks)?)?;
@@ -48,6 +49,21 @@ impl<'a> Weights<'a> {
                         let core = CoreWeightLayout::from_shared(core.clone());
                         return core.load_recorded_with(device, &source.checkpoint, &dense, stream,
                             |name, bytes| arena.view(name, bytes)).map(ProjectionWeight::Trellis);
+                    }
+                    if let Some(fp8) = layout.fp8.get(&name) {
+                        use crate::shared::native_attention::{attention_records, AttentionRecord};
+                        use cuteafd_loader::formats::native_attention::Fp8Role;
+                        let [n, k] = fp8.shape;
+                        let stem = &fp8.stem;
+                        let values = arena.view(&format!("{stem}.values"), n*k)?;
+                        let scales = arena.view(&format!("{stem}.scales"), n/128*(k/128)*4)?;
+                        for record in attention_records(&source.checkpoint.snapshot, &source.checkpoint.projection(stem)?,
+                            source.checkpoint.projection_view(stem), fp8, Fp8Role::exact("recurrent projection", true),
+                            crate::shared::fp8_linear::Fp8Scales::Amax, values.buffer, Some(scales.buffer))? {
+                            match record { AttentionRecord::Operand(op) => dense.operand(op)?,
+                                AttentionRecord::Step(step) => dense.step(step, stream)? }
+                        }
+                        return Ok(ProjectionWeight::Fp8 { values, scales });
                     }
                     let (rows, cols) = cuteafd_loader::formats::block_dspark::block_dspark_part_ranges(
                         rows, columns, axis, layout.rank, layout.ranks)?;
@@ -78,6 +94,10 @@ impl<'a> Weights<'a> {
             for (part, weight) in owners.iter().enumerate() {
                 match weight {
                     ProjectionWeight::Bf16(owner) => tensor(inventory, &format!("{name}.{part}"), owner)?,
+                    ProjectionWeight::Fp8 { values, scales } => {
+                        tensor(inventory, &format!("{name}.{part}.values"), values)?;
+                        tensor(inventory, &format!("{name}.{part}.scales"), scales)?;
+                    }
                     ProjectionWeight::Trellis(owner) => {
                         for (suffix, owner) in [("trellis", &owner.payload), ("suh", &owner.suh), ("svh", &owner.svh)] {
                             tensor(inventory, &format!("{name}.{part}.{suffix}"), owner)?;

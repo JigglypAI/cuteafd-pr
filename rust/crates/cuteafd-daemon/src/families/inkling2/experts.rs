@@ -67,6 +67,10 @@ impl<'a> Resident<'a> {
 
     /// All admitted layers of one backend share its single physical scratch
     /// and output owner; handles never instantiate a backend per layer.
+    pub fn inventory(&self, inventory: &mut Inventory<'_>, prefix: &str) -> Result<()> {
+        self.backend.borrow().allocation_receipts(inventory, prefix)
+    }
+
     pub fn for_layers(backend: Box<dyn crate::shared::experts::rtx::RtxExpertLayer + 'a>,
         stream: Rc<Stream<'a>>) -> Result<Vec<Self>> {
         let layers = backend.layers().to_vec();

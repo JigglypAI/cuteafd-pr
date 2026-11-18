@@ -24,7 +24,7 @@ pub struct DraftLayout {
 }
 impl DraftLayout {
     pub fn new(view:&CheckpointView,ranks:usize,slots:usize,sequences:usize,context:usize,pool:usize,
-        prefill:usize,waves:usize,sms:usize,format:Qwen4KvCache)->Result<Self>{
+        prefill:usize,waves:usize,sms:usize,format:Qwen4KvCache,manifest:Option<&serde_json::Value>)->Result<Self>{
         ensure!(matches!(ranks,1|2) && slots>0 && sequences>0 && prefill>0 && waves>0,"recurrent draft fact geometry");
         let source=RecurrentSource::open(view)?;
         let lead=ranks-1;
@@ -40,6 +40,10 @@ impl DraftLayout {
             }
             if let Some(projection)=projection{
                 work.buffers.push(("projection.trellis".into(),projection.packed_bytes()?));
+            }
+            if !weight.fp8.is_empty() {
+                let manifest = manifest.context("Inkling FP8 drafter requires PROGRAMS.json")?;
+                work.buffers.push(("projection.fp8".into(), weight.fp8_scratch(manifest, rows)?));
             }
         }
         let h=source.config.transformer.hidden;let taps=source.config.taps.len();

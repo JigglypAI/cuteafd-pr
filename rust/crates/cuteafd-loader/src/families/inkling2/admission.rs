@@ -238,7 +238,7 @@ pub fn gather(request: &FactsRequest<'_>) -> Result<InklingInputs, Refused> {
     let modes = shared::layer_modes(cfg, gpus, placement);
     let targets = CoordinatorWeights::plan(request.checkpoint, cfg, gpus, &modes)
         .map_err(|error| refused(format!("Inkling 2 target arena inventory refused: {error:#}"),
-            "Provide complete BF16 core headers (every shard of the selected view)."))?;
+            "Provide complete core headers for the selected view."))?;
     let target_fp8_scratch = targets.iter().map(|target| {
         if target.fp8.is_empty() { return Ok(0); }
         target.fp8_scratch(request.manifest.as_deref().context("Inkling compact FP8 requires PROGRAMS.json")?,
@@ -322,7 +322,16 @@ pub fn gather(request: &FactsRequest<'_>) -> Result<InklingInputs, Refused> {
             LocalPackage::Missing(_) if count == 0 => &[],
             LocalPackage::Missing(_) => return Ok(None),
         };
-        super::weight_layout::push_host_envelope(&catalog, backings, gpus).map(Some)
+        let mut envelope = super::weight_layout::push_host_envelope(&catalog, backings, gpus)?;
+        for (gpu, target) in targets.iter().enumerate() {
+            if target.core.is_empty() && target.fp8.is_empty() { continue; }
+            // One rank-local transform per non-overlapping source window. The
+            // shared receive check validates the actual window bound at offer.
+            let largest = cuteafd_ffi::push_ring::DEFAULT_SLOT_BYTES.max(cfg.hidden*128*2);
+            envelope.dense_bytes[gpu] = crate::push_load::admitted_push_envelope(largest as u64,
+                cuteafd_ffi::push_ring::DEFAULT_SLOTS, cuteafd_ffi::push_ring::DEFAULT_SLOT_BYTES as u64)?;
+        }
+        Ok(Some(envelope))
     }).collect::<anyhow::Result<Vec<_>>>().map_err(|error| refused(format!("Inkling push host inventory refused: {error:#}"),
         "Provide complete native push source/descriptor headers."))?;
     let capacities = (0..gpus).map(|gpu| request.coordinator.budget(gpu).logical_bytes).collect::<Vec<_>>();
@@ -341,7 +350,7 @@ pub fn gather(request: &FactsRequest<'_>) -> Result<InklingInputs, Refused> {
         let view=request.checkpoint.view.as_ref().context("bundled drafter needs selected checkpoint view")?;
         super::draft::DraftLayout::new(view,gpus,usize::try_from(request.sequences)?,
             usize::try_from(request.sequences)?.min(8),usize::try_from(context)?,usize::try_from(pool.maximum_tokens())?,
-            usize::try_from(shape.rows)?,usize::try_from(shape.waves)?,selection.sms,selection.kv_cache)
+            usize::try_from(shape.rows)?,usize::try_from(shape.waves)?,selection.sms,selection.kv_cache,request.manifest.as_deref())
             .map(|layout|shared::Drafter{layout})
     }).transpose().map_err(|error|refused(format!("bundled drafter inventory refused: {error:#}"),"Check MTP tensor headers and exports."))?;
     Ok(InklingInputs { cfg: cfg.clone(), kv_format: request.kv_format, gpus, spark_ranks: ranks,
