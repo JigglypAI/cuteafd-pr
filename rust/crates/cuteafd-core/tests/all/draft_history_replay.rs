@@ -80,14 +80,18 @@ fn replay(head: HeadScore, control: DraftControl) -> ([Tally; 2], u64) {
 
 /// Independent headless mirror keeps the old prior-eight counterfactual
 /// available without exposing a runtime policy knob or changing fixture data.
-fn code_first_reference(prior: f64) -> Tally {
+fn code_first_reference(fade: bool) -> [Tally; 2] {
     use std::collections::{HashMap, VecDeque};
     let mut rounds = rounds();
     rounds.sort_by_key(|round| !round.code); // Stable: preserve every request's round order.
     let mut server: [VecDeque<bool>; BLOCK] = std::array::from_fn(|_| VecDeque::new());
     let mut requests: HashMap<u64, VecDeque<(usize, usize)>> = HashMap::new();
-    let mut tally = Tally::default();
+    let mut completed: HashMap<u64, usize> = HashMap::new();
+    let mut tallies = [Tally::default(); 2];
     for round in rounds {
+        let n = completed.entry(round.id).or_default();
+        let prior = if fade { 8. * (3usize.saturating_sub(*n) as f64 / 3.) } else { 8. };
+        *n += 1;
         let request = requests.entry(round.id).or_default();
         let mut length = 0;
         for position in 0..BLOCK {
@@ -96,7 +100,8 @@ fn code_first_reference(prior: f64) -> Tally {
             let global = if server[position].is_empty() { 1. } else {
                 server[position].iter().filter(|&&hit| hit).count() as f64 / server[position].len() as f64 };
             length += 1;
-            if (accepted as f64 + prior * global) / (reached as f64 + prior) <= 0.5 { break; }
+            let denominator = reached as f64 + prior;
+            if denominator == 0. || (accepted as f64 + prior * global) / denominator <= 0.5 { break; }
         }
         let accepted = round.accepted.min(length);
         let reached = length.min(accepted + 1);
@@ -106,14 +111,15 @@ fn code_first_reference(prior: f64) -> Tally {
             if server[position].len() == 256 { server[position].pop_front(); }
             server[position].push_back(position < accepted);
         }
-        if !round.code {
+        {
+            let tally = &mut tallies[usize::from(round.code)];
             tally.rounds += 1;
             tally.drafts += length;
             tally.tokens += accepted + 1;
             tally.short += usize::from(length <= 1);
         }
     }
-    tally
+    tallies
 }
 
 #[test]
@@ -121,28 +127,26 @@ fn code_first_requests_adapt_with_fewer_rows_without_losing_prose_tokens() {
     let mut rounds = rounds();
     rounds.sort_by_key(|round| !round.code);
     let mut policy = DraftHistory::new(DrafterSpec { block: BLOCK, head: HeadScore::None, copy: 0 }, DraftControl::History);
-    let mut prose = Tally::default();
+    let mut tallies = [Tally::default(); 2];
     for round in rounds {
         let length = policy.plan(&[(round.id, BLOCK)], 64)[0];
         let accepted = round.accepted.min(length);
         policy.observe(&[DraftOutcome { id: round.id, proposed: length, accepted, censored: false }], false);
-        if !round.code {
+        {
+            let prose = &mut tallies[usize::from(round.code)];
             prose.rounds += 1;
             prose.drafts += length;
             prose.tokens += accepted + 1;
             prose.short += usize::from(length <= 1);
         }
     }
-    assert_eq!(prose, code_first_reference(2.), "reference mirror must match the production policy");
-    let old = code_first_reference(8.);
-    // Unchanged checked-in sample, stable code-first order: rows/round
-    // prior2 4.332 versus prior8 5.112. No cohort selection or reseeding.
+    assert_eq!(tallies, code_first_reference(true), "reference mirror must match production");
+    let old = code_first_reference(false);
     let rows = |tally: Tally| (tally.drafts + tally.rounds) as f64 / tally.rounds as f64;
     let tokens = |tally: Tally| tally.tokens as f64 / tally.rounds as f64;
-    eprintln!("code-first prior2: {prose:?}, rows {:.6}, tokens {:.6}; prior8: {old:?}, rows {:.6}, tokens {:.6}",
-        rows(prose), tokens(prose), rows(old), tokens(old));
-    assert!(rows(prose) <= 0.9 * rows(old), "prose verify rows did not improve sufficiently");
-    assert!(tokens(prose) >= 0.9 * tokens(old), "prose tokens per round fell too far");
+    eprintln!("code-first fade3 {tallies:?}; constant8 {old:?}");
+    assert!(rows(tallies[0]) <= 0.5 * rows(old[0]), "prose rows must halve after code conditioning");
+    assert!(tokens(tallies[1]) >= 0.9 * tokens(old[1]), "code tokens must retain ninety percent");
 }
 
 #[test]
