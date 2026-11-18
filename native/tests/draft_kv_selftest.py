@@ -18,7 +18,7 @@ def bind(path):
         "block_dspark_qk_rope": ([P] * 9 + [I] * 4 + [F] * 3 + [P], I),
         "glm_dflash_attention": ([P] * 10 + [I] * 7 + [F, P], I),
         "mimo_dflash_attention": ([P] * 11 + [I] * 7 + [F, P], I),
-        "block_dspark_attention": ([P] * 10 + [I] * 8 + [F, P], I),
+        "block_dspark_attention": ([P] * 10 + [I] * 9 + [F, P], I),
     }
     for name, (args, result) in signatures.items():
         for suffix in ("", "_fp8"):
@@ -129,7 +129,7 @@ def attention_check(lib):
                         common = [q.data_ptr(), kb.data_ptr(), vb.data_ptr()]
                         tables = [slots.data_ptr(), lengths.data_ptr(), ends.data_ptr()]
                         dims = [sequences, block, heads, kvh, ring, context + block]
-                        dims += [masking, dim] if family == "dspark" else [128 * masking]
+                        dims += [0, masking, dim] if family == "dspark" else [128 * masking]
                         def launch(suffix, kr, vr, out):
                             pointers = common + [kr.data_ptr(), vr.data_ptr()] + tables
                             if family == "mimo":

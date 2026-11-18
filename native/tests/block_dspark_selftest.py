@@ -23,12 +23,13 @@ def bind(path):
         "cuteafd_block_dspark_qk_rope": ([P] * 9 + [I] * 4 + [F] * 3 + [P], I),
         "cuteafd_block_dspark_qk_rope_fp8": ([P] * 9 + [I] * 4 + [F] * 3 + [P], I),
         "cuteafd_block_dspark_attention_workspace": ([I] * 6, C.c_uint64),
-        "cuteafd_block_dspark_attention": ([P] * 10 + [I] * 8 + [F, P], I),
-        "cuteafd_block_dspark_attention_paged": ([P] * 11 + [I] * 9 + [F, P], I),
-        "cuteafd_block_dspark_attention_fp8": ([P] * 10 + [I] * 8 + [F, P], I),
-        "cuteafd_block_dspark_attention_paged_fp8": ([P] * 11 + [I] * 9 + [F, P], I),
+        "cuteafd_block_dspark_attention": ([P] * 10 + [I] * 9 + [F, P], I),
+        "cuteafd_block_dspark_attention_paged": ([P] * 11 + [I] * 10 + [F, P], I),
+        "cuteafd_block_dspark_attention_fp8": ([P] * 10 + [I] * 9 + [F, P], I),
+        "cuteafd_block_dspark_attention_paged_fp8": ([P] * 11 + [I] * 10 + [F, P], I),
         "cuteafd_glmf_dspark_attention_workspace": ([I] * 3, C.c_uint64),
-        "cuteafd_glmf_dspark_attention": ([P] * 10 + [I] * 7 + [F, P], I),
+        "cuteafd_glmf_dspark_attention": ([P] * 10 + [I] * 8 + [F, P], I),
+        "cuteafd_glmf_dspark_attention_fp8": ([P] * 10 + [I] * 8 + [F, P], I),
     }
     for name, (arguments, result) in signatures.items():
         getattr(lib, name).argtypes = arguments
@@ -157,7 +158,7 @@ def attention_check(lib):
                     scratch = torch.full((size + 256,), 173, device="cuda", dtype=torch.uint8)
                     out = torch.full_like(q, float("nan"))
                     pointers = [x.data_ptr() for x in (q, k, v, kc, vc, slots, lengths, ends)]
-                    geometry = [sequences, block, heads, kvh, capacity, max_keys, int(causal)]
+                    geometry = [sequences, block, heads, kvh, capacity, max_keys, 0, int(causal)]
                     assert lib.cuteafd_block_dspark_attention(*pointers, out.data_ptr(), scratch.data_ptr(),
                         *geometry, dim, dim ** -0.5, stream) == 0
                     # Fragmented pages must preserve the exact arithmetic of the
@@ -234,6 +235,66 @@ def attention_check(lib):
                     print(f"attention dim={dim} heads={heads}/{kvh} block={block} sequences={sequences} "
                           f"context={context} causal={causal} max_abs={maximum:.4g} rel_rms={rms:.4g}")
     print("attention legacy64 bytes and 35-query/two-slice FP64 gate passed")
+
+
+def sliding_attention_check(lib):
+    """Wrapped, long-position rows must use the checkpoint's query-local mask."""
+    from draft_kv_selftest import pack, unpack
+    stream = torch.cuda.current_stream().cuda_stream
+    # 17 exercises scalar attention; 2048/3072 force WMMA. Non-default
+    # windows prevent accidentally substituting the K3.1 checkpoint's 2048.
+    for window, position in ((17, 2500), (2048, 2500), (3072, 8192)):
+        for dim, heads, kvh, block in ((64, 4, 4, 8), (128, 10, 2, 7)):
+            q = torch.zeros(1, block, heads, dim, device="cuda", dtype=torch.bfloat16)
+            k = torch.zeros(1, block, kvh, dim, device="cuda", dtype=torch.bfloat16)
+            v = torch.zeros_like(k)
+            kc = torch.zeros(window, kvh, dim, device="cuda", dtype=torch.bfloat16)
+            vc = torch.zeros_like(kc)
+            # Uniform scores make each old boundary key independently observable.
+            # The block marker also proves the denominator is exactly window.
+            for row in range(block):
+                vc[(position - window + row) % window, :, row] = 256
+            v[..., block] = 256
+            tables = torch.tensor([0, window, position], device="cuda", dtype=torch.int32)
+            size = lib.cuteafd_block_dspark_attention_workspace(1, heads, kvh, block, window + block, dim)
+            scratch = torch.full((size + 256,), 173, device="cuda", dtype=torch.uint8)
+            physical = torch.arange(position - window, position, device="cuda") % window
+            key_positions = torch.arange(position - window, position + block, device="cuda")
+            query_positions = torch.arange(position, position + block, device="cuda")
+            for fp8 in (False, True):
+                retained_k, retained_v = (pack(kc), pack(vc)) if fp8 else (kc, vc)
+                decoded_k, decoded_v = (unpack(retained_k, kvh, dim), unpack(retained_v, kvh, dim)) if fp8 else (kc, vc)
+                keys = torch.cat((decoded_k[physical], k[0])).double().repeat_interleave(heads // kvh, dim=1)
+                values = torch.cat((decoded_v[physical], v[0])).double().repeat_interleave(heads // kvh, dim=1)
+                for causal in (False, True):
+                    mask = key_positions[None] >= query_positions[:, None] - window + 1
+                    if causal:
+                        mask &= key_positions[None] <= query_positions[:, None]
+                        assert torch.all(mask.sum(-1) == window), "causal rows must see exactly window keys"
+                    else:
+                        # Noncausal dSpark keeps the whole block visible.
+                        mask[:, window:] = True
+                        assert torch.equal(mask.sum(-1), window - torch.arange(block, device="cuda") - 1 + block)
+                    scores = torch.einsum("qhd,khd->hqk", q[0].double(), keys) * dim ** -.5
+                    expected = torch.einsum("hqk,khd->qhd", scores.masked_fill(~mask[None], -torch.inf).softmax(-1), values)
+                    out = torch.empty_like(q)
+                    suffix = "_fp8" if fp8 else ""
+                    pointers = [q.data_ptr(), k.data_ptr(), v.data_ptr(), retained_k.data_ptr(), retained_v.data_ptr(),
+                                tables.data_ptr(), tables.data_ptr() + 4, tables.data_ptr() + 8,
+                                out.data_ptr(), scratch.data_ptr()]
+                    geometry = [1, block, heads, kvh, window, window + block, window, int(causal)]
+                    assert getattr(lib, "cuteafd_block_dspark_attention" + suffix)(
+                        *pointers, *geometry, dim, dim ** -.5, stream) == 0
+                    torch.cuda.synchronize()
+                    torch.testing.assert_close(out[0].double(), expected, atol=1e-5, rtol=.01)
+                    if dim == 64:
+                        legacy = torch.empty_like(out)
+                        assert getattr(lib, "cuteafd_glmf_dspark_attention" + suffix)(
+                            *pointers[:8], legacy.data_ptr(), scratch.data_ptr(), *geometry, dim ** -.5, stream) == 0
+                        torch.cuda.synchronize()
+                        assert torch.equal(out, legacy), "legacy sliding attention differs"
+                    assert torch.all(scratch[size:] == 173), "sliding workspace overrun"
+            print(f"sliding attention window={window} position={position} dim={dim}: BF16/FP8 reference masks passed")
 
 
 def markov_check(lib, baseline=None, rank=256):
@@ -321,6 +382,7 @@ def main():
     if not args.markov_only:
         rotary_check(lib, bind(args.baseline) if args.baseline else None)
         attention_check(lib)
+        sliding_attention_check(lib)
     print("block dSpark kernels: all checks passed")
 
 

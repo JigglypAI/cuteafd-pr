@@ -1640,7 +1640,7 @@ impl<'a> DsparkDrafter<'a> {
             self.library.block_dspark_attention(w.q.buffer.ptr,w.k.buffer.ptr,w.v.buffer.ptr,layer.k_ring.buffer.ptr,
                 layer.v_ring.buffer.ptr,w.tables.buffer.ptr,at(&w.tables,sequences*4),at(&w.tables,sequences*8),
                 w.attn.buffer.ptr,w.attention_workspace.buffer.ptr,sequences,c.block,c.heads,c.kv_heads,self.context_capacity,
-                max_keys,c.causal,c.head_dim,1./(c.head_dim as f32).sqrt(),
+                max_keys,c.window.unwrap_or(0),c.causal,c.head_dim,1./(c.head_dim as f32).sqrt(),
                 self.kv_cache==cuteafd_loader::families::qwen4::Qwen4KvCache::Fp8,self.stream)?;
             self.linear(w.attn.buffer.ptr,&layer.o,0,w.delta.buffer.ptr,rows,c.q_width(),c.hidden)
         }
@@ -1810,14 +1810,14 @@ impl<'a> DsparkDrafter<'a> {
                         layer.k_ring.buffer.ptr, layer.v_ring.buffer.ptr, w.tables.buffer.ptr,
                         at(&w.tables, s_count * 4), at(&w.tables, 2 * s_count * 4), context.tables.buffer.ptr,
                         w.attn.buffer.ptr, w.attention_workspace.buffer.ptr, s_count, block, c.heads,
-                        c.kv_heads, self.context_capacity, max_keys, c.causal, c.head_dim, table_width,
+                        c.kv_heads, self.context_capacity, max_keys, c.window.unwrap_or(0), c.causal, c.head_dim, table_width,
                         1.0 / (c.head_dim as f32).sqrt(),
                         self.kv_cache == cuteafd_loader::families::qwen4::Qwen4KvCache::Fp8, s)?;
                 } else {
                     l.block_dspark_attention(w.q.buffer.ptr, w.k.buffer.ptr, w.v.buffer.ptr, layer.k_ring.buffer.ptr,
                         layer.v_ring.buffer.ptr, w.tables.buffer.ptr, at(&w.tables, s_count * 4), at(&w.tables, 2 * s_count * 4),
                         w.attn.buffer.ptr, w.attention_workspace.buffer.ptr, s_count, block, c.heads, c.kv_heads, self.context_capacity,
-                        max_keys, c.causal, c.head_dim, 1.0 / (c.head_dim as f32).sqrt(), self.kv_cache == cuteafd_loader::families::qwen4::Qwen4KvCache::Fp8, s)?;
+                        max_keys, c.window.unwrap_or(0), c.causal, c.head_dim, 1.0 / (c.head_dim as f32).sqrt(), self.kv_cache == cuteafd_loader::families::qwen4::Qwen4KvCache::Fp8, s)?;
                 }
                 self.linear(w.attn.buffer.ptr, &layer.o, 0, w.delta.buffer.ptr, rows, c.q_width(), h)?;
                 if let Some(native) = &self.native {

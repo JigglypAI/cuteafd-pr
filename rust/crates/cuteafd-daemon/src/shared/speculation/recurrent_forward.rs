@@ -170,19 +170,21 @@ impl<'a> Rank<'a> {
             "local recurrent attention requires clamped committed lengths");
         // SAFETY: caller sets slot/length/end metadata for exact committed
         // context and retains every visible page/ring record through attention.
+        // Recurrent local masks are block-anchored: committed context is already
+        // clamped above, and every query sees the entire block (not a row window).
         unsafe{match self.config.context[index] {
             cuteafd_loader::formats::block_dspark::recurrent::ContextPolicy::BlockAnchoredWindow(window)=>
                 lib.block_dspark_attention(self.buffer("step.query")?.ptr,self.buffer("step.key")?.ptr,
                     self.buffer("step.value")?.ptr,key.ptr,value.ptr,tables.ptr,lengths.ptr,ends.ptr,
                     self.buffer("step.attention")?.ptr,self.buffer("step.attention_workspace")?.ptr,
-                    sequences,c.block,rank.heads,rank.kv_heads,window,max_keys.min(window+c.block),false,
+                    sequences,c.block,rank.heads,rank.kv_heads,window,max_keys.min(window+c.block),0,false,
                     c.head_dim,1./(c.head_dim as f32).sqrt(),fp8,self.stream.raw),
             cuteafd_loader::formats::block_dspark::recurrent::ContextPolicy::Full=>
                 lib.block_dspark_attention_paged(self.buffer("step.query")?.ptr,self.buffer("step.key")?.ptr,
                     self.buffer("step.value")?.ptr,key.ptr,value.ptr,tables.ptr,lengths.ptr,ends.ptr,
                     self.buffer("cache.tables")?.ptr,self.buffer("step.attention")?.ptr,
                     self.buffer("step.attention_workspace")?.ptr,sequences,c.block,rank.heads,rank.kv_heads,
-                    self.layout.cache.pages*64,max_keys,false,c.head_dim,
+                    self.layout.cache.pages*64,max_keys,0,false,c.head_dim,
                     self.layout.cache.page_table_bytes as usize/self.layout.slots/4,
                     1./(c.head_dim as f32).sqrt(),fp8,self.stream.raw),
         }}

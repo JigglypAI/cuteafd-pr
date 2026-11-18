@@ -136,11 +136,11 @@ class Native:
         output = torch.empty((8, 6144), device=q.device, dtype=torch.bfloat16)
         tables = torch.tensor([0, context, context], device=q.device, dtype=torch.int32)
         fn = self.lib.cuteafd_block_dspark_attention
-        fn.argtypes = [ct.c_void_p]*10+[ct.c_int32]*8+[ct.c_float, ct.c_void_p]
+        fn.argtypes = [ct.c_void_p]*10+[ct.c_int32]*9+[ct.c_float, ct.c_void_p]
         status = fn(q.data_ptr(), dk.data_ptr(), dv.data_ptr(), ck.data_ptr(), cv.data_ptr(),
                     tables.data_ptr(), tables.data_ptr()+4, tables.data_ptr()+8,
                     output.data_ptr(), scratch.data_ptr(), 1, 8, 48, 8, context, context+8,
-                    0, 128, 128**-.5, self.stream)
+                    0, 0, 128, 128**-.5, self.stream)
         assert status == 0, status
         return output
 

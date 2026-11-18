@@ -13,8 +13,8 @@ torch statements:
            four mHC streams (FP32 sum in stream order, then / 4)
   context  fused = RMSNorm(fc(concat(taps)), hidden_norm); per draft layer
            K = rope(k_norm(k_proj(fused))), V = v_proj(fused); the block at
-           anchor position p sees context positions p - 2048 .. p - 1 (the
-           training mask's window, the same for every block row)
+           anchor position p applies the checkpoint window relative to each
+           query position p + row, including the block's causal keys
   block    [anchor, mask x 7] embeddings at positions p .. p + 7; Qwen3 layers
            (input norm, q/k/v, per-head q/k norm, rotate_half RoPE theta 1e4,
            attention over the context and the block, causal inside the block
@@ -162,6 +162,10 @@ class Drafter:
         b = self.block
         n_ctx = ctx[0][0].shape[0]
         mask = torch.ones(b, n_ctx + b, dtype=torch.bool, device=self.device)
+        if self.window is not None:
+            keys = torch.arange(position - n_ctx, position, device=self.device)
+            lowest = torch.arange(position, position + b, device=self.device) - self.window + 1
+            mask[:, :n_ctx] = keys[None] >= lowest[:, None]
         if self.causal:
             mask[:, n_ctx:] = torch.ones(b, b, dtype=torch.bool, device=self.device).tril()
         tokens = torch.tensor([anchor] + [self.mask] * (b - 1))
