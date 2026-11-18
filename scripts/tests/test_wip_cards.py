@@ -2537,8 +2537,9 @@ def test_every_required_smoke_field_is_advertised_by_the_dry_run():
     # binary_supports looks for FIELD= in the smoke dry-run line; a field wip-cards can
     # require but smoke.rs never prints would refuse every binary, however new.
     source = (ROOT / 'scripts/bench/wip-cards.py').read_text()
-    block = source[source.index("    fields = ['fabric', 'warm_prelude']"):source.index('    for job in {j[\'launcher\'][\'repo\']')]
-    required = {name for name in re.findall(r"\['([a-z_0-9]+)'\]", block) if name not in ('entry', 'launcher', 'repo')}
+    block = source[source.index("    fields = ['fabric', 'warm_prelude']"):source.index('    # Everything checkable without hardware')]
+    required = {name for name in re.findall(r"\['([a-z_0-9]+)'\]", block)
+                if name not in ('entry', 'launcher', 'repo', 'binary', 'set')}
     dry_run = (ROOT / 'rust/crates/cuteafd-bench/src/smoke.rs').read_text()
     line = next(text for text in dry_run.splitlines() if 'api_key_file={}' in text)
     advertised = set(re.findall(r'([a-z_0-9]+)=\{', line))
