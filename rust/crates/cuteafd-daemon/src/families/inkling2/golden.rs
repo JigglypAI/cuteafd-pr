@@ -1,7 +1,9 @@
 //! Cold coordinator-only native prefix golden, with bounded layer residency.
-use super::{admission, experts::{Mxfp8, Mxfp8Layout}, head::Head, layers::{self, Kernels},
+use super::{admission, experts::{Dispatcher, Mxfp8, Mxfp8Layout, Resident}, head::Head, layers::{self, Kernels},
     owners::UnitOwner, weights::TargetWeights};
-use crate::shared::memory::device::{Device, Stream};
+use crate::shared::{experts::{self, exl3::Exl3Weights, layer::ExpertLayer,
+    rtx::{exl3::Exl3Tp2, RtxSelectionPolicy}}, memory::device::{Device, Stream}};
+use cuteafd_loader::{OfficialV41Catalog, serving_capacity::WeightArenaLayout, shared::dense_read::MountLoad};
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::fp8_moe::Fp8MoeMetadata;
 use cuteafd_loader::{families::inkling2::{execution::UnitLayout, weight_layout::CoordinatorWeights, Inkling2Config}, plan::Checkpoint};
@@ -51,13 +53,76 @@ fn raw(buffer: cuteafd_ffi::CuteafdDeviceBuffer, bytes: usize) -> Result<cuteafd
     Ok(cuteafd_ffi::CuteafdDeviceBuffer { bytes, ..buffer })
 }
 
+enum ColdExperts {
+    Mxfp8 { layout: Mxfp8Layout, scratch: usize },
+    Exl3 { arena: WeightArenaLayout, scratch: Vec<(String, usize)>, mount: MountLoad },
+}
+
+impl ColdExperts {
+    fn facts(&self) -> (&WeightArenaLayout, Vec<(String, usize)>, MountLoad) {
+        match self {
+            Self::Mxfp8 { layout, scratch } => (&layout.arena, vec![("expert.scratch".into(), *scratch)], layout.mount),
+            Self::Exl3 { arena, scratch, mount } => (arena, scratch.iter().map(|(name, bytes)|
+                (format!("experts.{name}"), *bytes)).collect(), *mount),
+        }
+    }
+    fn load<'a>(&self, stream: Rc<Stream<'a>>, catalog: &OfficialV41Catalog, metadata: Option<&Fp8MoeMetadata>,
+        package: &std::path::Path, cfg: &Inkling2Config, layer: usize, rows: usize) -> Result<ColdDispatch<'a>> {
+        let device = stream.device;
+        match self {
+            Self::Mxfp8 { layout, .. } => Ok(ColdDispatch::Mxfp8(device.run(|| Mxfp8::load(stream,
+                layout, metadata.context("Inkling MXFP8 metadata missing")?, package, cfg, rows))?)),
+            Self::Exl3 { arena, scratch, .. } => {
+                let budget = arena.bytes() + scratch.iter().map(|(_, bytes)| bytes).sum::<usize>();
+                let backend = Exl3Tp2::load_whole_weights(device, catalog, package, vec![layer], rows, budget,
+                    RtxSelectionPolicy::CanonicalDecode)?.execution()?;
+                Ok(ColdDispatch::Exl3(Resident::new(layer, Box::new(backend), stream)?))
+            }
+        }
+    }
+}
+
+enum ColdDispatch<'a> { Mxfp8(Mxfp8<'a>), Exl3(Resident<'a>) }
+impl<'a> ColdDispatch<'a> {
+    fn dispatcher(&self) -> &dyn Dispatcher {
+        match self { Self::Mxfp8(experts) => experts, Self::Exl3(experts) => experts }
+    }
+    fn inventory(&self, inventory: &mut crate::shared::memory::receipts::Inventory<'_>) -> Result<()> {
+        match self {
+            Self::Mxfp8(experts) => experts.inventory(inventory, "experts"),
+            Self::Exl3(experts) => {
+                experts.inventory(inventory, "experts")?;
+                // The shared backend returns both classes. Its arena already
+                // carries its allocation tag, so retain only resident receipts.
+                let arena = inventory.receipts.iter().find(|r| r.allocation.group == "weight arena")
+                    .context("Inkling EXL3 arena receipt missing")?.allocation.id.clone();
+                inventory.receipts.retain(|r| r.allocation.id == arena ||
+                    r.allocation.view.as_ref().is_some_and(|view| view.backing == arena));
+                Ok(())
+            }
+        }
+    }
+    fn workspace_inventory(&self, inventory: &mut crate::shared::memory::receipts::Inventory<'_>) -> Result<()> {
+        match self {
+            Self::Mxfp8(experts) => experts.workspace_inventory(inventory),
+            Self::Exl3(experts) => {
+                let first = inventory.receipts.len();
+                experts.inventory(inventory, "experts")?;
+                let mut expert = inventory.receipts.split_off(first);
+                expert.retain(|r| r.allocation.group != "weight arena" && r.allocation.view.is_none());
+                inventory.receipts.extend(expert);
+                Ok(())
+            }
+        }
+    }
+}
+
 fn run(mut args: GoldenArgs) -> Result<()> {
     if !args.width_invariance.is_empty(){return super::width_invariance::run(&mut args);}
     ensure!(args.nll, "Inkling cold golden requires --nll");
     let view = args.attention.selected_view.clone().map(Ok).unwrap_or_else(|| args.attention.select(&args.snapshot))?;
     args.attention.validate_view(&view)?;
-    ensure!(view.mode() == cuteafd_loader::plan::checkpoint::CoreView::Original, "Inkling stage2 golden currently qualifies original BF16 core only");
-    let checkpoint = Checkpoint::coordinator_view(&view, true, false)?;
+    let checkpoint = Checkpoint::open_view(&view)?;
     let cfg = Inkling2Config::from_hf(&checkpoint.config)?;
     ensure!(args.last_layer < cfg.layers, "Inkling --last-layer outside checkpoint");
     let tokens: Vec<u32> = serde_json::from_slice(&std::fs::read(&args.tokens)?)?;
@@ -67,37 +132,69 @@ fn run(mut args: GoldenArgs) -> Result<()> {
     let rows = tokens.len()-1;
     let unit_layout = UnitLayout::with_format(&cfg, rows, tokens.len().max(64), args.kv_format)?;
     let target_layout = CoordinatorWeights::golden(&checkpoint, &cfg, &(0..=args.last_layer).collect::<Vec<_>>())?;
-    let package = args.native_lib.parent().context("Inkling native library directory")?
-        .join("fp8/fp8-inkling2-mxfp8/tp1");
-    // SAFETY: only the trusted slot's generated static package ABI is queried.
-    let metadata = unsafe { Fp8MoeMetadata::read(&package) }?;
-    let expert_layouts = (0..=args.last_layer).map(|index| Mxfp8Layout::plan(&checkpoint, &cfg, index))
-        .collect::<Result<Vec<_>>>()?;
+    let catalog = cuteafd_loader::read_expert_catalog_view(&view)?;
+    let geometry = catalog.routed_experts().geometry()?;
+    ensure!(geometry == cuteafd_core::ExpertGeometry::INKLING2, "Inkling golden expert geometry differs from the released model");
+    cuteafd_core::set_expert_geometry(geometry).map_err(|previous| anyhow::anyhow!("Inkling golden requires isolated expert geometry: {previous:?}"))?;
+    let native_dir = args.native_lib.parent().context("Inkling native library directory")?;
+    let package = if catalog.exl3().is_some() { native_dir.join("exl3/exl3-inkling2-k45/rtx-tp1") }
+        else { native_dir.join("fp8/fp8-inkling2-mxfp8/tp1") };
+    // SAFETY: trusted generated package ABI metadata; no live buffer access.
+    let metadata = if catalog.exl3().is_none() { Some(unsafe { Fp8MoeMetadata::read(&package)? }) } else { None };
+    let selection = RtxSelectionPolicy::CanonicalDecode;
+    let expert_layouts = (0..=args.last_layer).map(|index| {
+        if let Some(metadata) = &metadata {
+            let layout = Mxfp8Layout::plan(&checkpoint, &cfg, index)?;
+            Ok(ColdExperts::Mxfp8 { layout, scratch: metadata.scratch_for(rows)? })
+        } else {
+            let layer = ExpertLayer::BackboneFull { layer: index };
+            let arena = experts::weight_layout::layout(args.device, "exl3", experts::exl3::regions(&catalog, [layer])?)?;
+            let load = Exl3Weights::plan(&catalog, layer)?;
+            ensure!(load.device_staging_bytes == 0, "Inkling cold EXL3 requires zero device load staging");
+            let scratch = Exl3Tp2::whole_allocation_layout(&package, rows, geometry, selection)?;
+            Ok(ColdExperts::Exl3 { arena, scratch, mount: MountLoad { pinned_source: load.pinned_host_bytes as u64,
+                full_row_cache: load.read_scratch_bytes as u64, pinned_tables: 0 } })
+        }
+    }).collect::<Result<Vec<_>>>()?;
     ensure!(!args.save_logits.exists(), "Inkling golden output must be new");
     if args.check_headers {
-        println!("Inkling golden headers: layers={} rows={} nativeMXFP8=true partial={}", args.last_layer+1, rows,
-            args.last_layer+1 != cfg.layers);
+        println!("Inkling golden headers: layers={} rows={} core={} nativeMXFP8={} partial={}", args.last_layer+1, rows,
+            view.mode(), metadata.is_some(), args.last_layer+1 != cfg.layers);
         return Ok(());
     }
     // SAFETY: library outlives every loaded program, stream and physical owner.
-    let library = unsafe { cuteafd_ffi::NativeLibrary::load(&args.native_lib) }?;
+    let library = unsafe { cuteafd_ffi::NativeLibrary::load_for_experts(&args.native_lib, geometry) }?;
     let device = Device { library: &library, id: args.device };
     let programs = device.run(|| Ok(library.programs()?.with_manifest(&args.manifest)?))?;
-    let kernels = device.run(|| Kernels::bind(&programs, args.kv_format))?;
-    // Load the expert code before the pre-weight CUDA sample, rather than
-    // attributing its module residency to an unmeasured post-admission owner.
-    // SAFETY: trusted generated package loaded on the retained device; this
-    // code-only owner launches no work and outlives every per-layer instance.
-    let _expert_code = device.run(|| unsafe { cuteafd_ffi::fp8_moe::Fp8MoeModule::load(&package) })?;
-    let (free, total) = device.run(|| library.cuda_memory_info())?;
+    let mut kernels = device.run(|| Kernels::bind(&programs, args.kv_format))?;
+    // Load expert code before taking the pre-weight CUDA sample.
+    let _expert_code = if metadata.is_some() {
+        // SAFETY: trusted generated package on the retained current device.
+        Some(device.run(|| unsafe { cuteafd_ffi::fp8_moe::Fp8MoeModule::load(&package) })?)
+    } else { None };
+    let _exl3_code = if metadata.is_none() {
+        Some(Exl3Tp2::preload_whole_modules(device, &package, rows, geometry, selection)?)
+    } else { None };
+    let manifest = serde_json::from_slice(&std::fs::read(&args.manifest)?)?;
+    let mut compact_programs = target_layout.trellis_programs(&manifest, rows, rows)?;
+    let fp8_programs = target_layout.fp8_programs(&manifest, rows, rows)?;
+    compact_programs.extend(fp8_programs.keys().cloned());
+    let (free, total) = device.run(|| {
+        let (loaded, _) = programs.load_matching(|name| compact_programs.contains(name))?;
+        ensure!(loaded == compact_programs.len(), "Inkling golden compact program table differs from manifest");
+        library.cuda_memory_info()
+    })?;
     let host = cuteafd_loader::formats::mapped_preload::host_memory_before_process()?;
-    let plan = admission::admit(&checkpoint, &cfg, &target_layout, &expert_layouts[0], metadata.scratch_for(rows)?,
-        &unit_layout, rows, free as u64, total as u64, host)?;
+    let fp8_bytes = fp8_programs.into_values().max().unwrap_or(0);
+    let (expert_arena, expert_scratch, expert_mount) = expert_layouts[0].facts();
+    let plan = admission::admit(&checkpoint, &cfg, &target_layout, expert_arena, &expert_scratch, expert_mount,
+        &unit_layout, rows, fp8_bytes, free as u64, total as u64, host)?;
     if !args.tap_layers.is_empty() { std::fs::create_dir(&args.save_logits)?; }
     let stream = Rc::new(Stream::new(device)?);
     let owner = UnitOwner::new(Rc::clone(&stream), unit_layout)?;
     let weights = TargetWeights::load(device, &checkpoint, &target_layout)?;
-    let head = Head::new(Rc::clone(&stream), &cfg, rows)?;
+    kernels.bind_compact(&programs, Rc::clone(&stream), &target_layout, rows, rows, fp8_bytes)?;
+    let head = Head::new(Rc::clone(&stream), &cfg, rows, target_layout.stored_head())?;
     let positions = (0..rows).flat_map(|n| (n as i64).to_le_bytes()).collect::<Vec<_>>();
     let rings = (0..rows).flat_map(|n| ((n%1088) as i64).to_le_bytes()).collect::<Vec<_>>();
     let pages = (0..owner.layout.buffers["page_table"]/4).flat_map(|n| (n as i32).to_le_bytes()).collect::<Vec<_>>();
@@ -136,8 +233,12 @@ fn run(mut args: GoldenArgs) -> Result<()> {
                 std::fs::write(out.join(format!("{name}.bin")), bytes)?;
             }
         }
-        let experts = device.run(|| Mxfp8::load(Rc::clone(&stream), layout, &metadata, &package, &cfg, rows))?;
-        device.run(|| super::prefill::layer(&kernels, &owner, &weights, &experts, &cfg, index, rows))?;
+        let (arena, scratch, mount) = layout.facts();
+        let layer_plan = if index == 0 { None } else { Some(admission::admit(&checkpoint, &cfg, &target_layout,
+            arena, &scratch, mount, &owner.layout, rows, fp8_bytes, free as u64, total as u64, host)?) };
+        let plan = layer_plan.as_ref().unwrap_or(&plan);
+        let experts = layout.load(Rc::clone(&stream), &catalog, metadata.as_ref(), &package, &cfg, index, rows)?;
+        device.run(|| super::prefill::layer(&kernels, &owner, &weights, experts.dispatcher(), &cfg, index, rows))?;
         stream.drain()?;
         if args.tap_layers.contains(&index) {
             let out = args.save_logits.join(format!("layer-{index}"));
@@ -161,21 +262,23 @@ fn run(mut args: GoldenArgs) -> Result<()> {
         let mut expert_inventory = crate::shared::memory::receipts::Inventory::new(devices, "inkling2",
             cuteafd_loader::placement::planner::Lifetime::RESIDENT,
             cuteafd_core::memory_layout::Category::Experts, "cold native experts");
-        experts.inventory(&mut expert_inventory, "experts")?;
+        experts.inventory(&mut expert_inventory)?;
         inventory.receipts.extend(expert_inventory.receipts);
         let mut working = crate::shared::memory::receipts::Inventory::new(devices, "inkling2",
             cuteafd_loader::placement::planner::Lifetime::TARGET,
             cuteafd_core::memory_layout::Category::Workspace, "cold native workspaces");
         owner.inventory(&mut working, "unit")?;
         head.inventory(&mut working, "head")?;
+        kernels.compact_inventory(&mut working, "target")?;
         experts.workspace_inventory(&mut working)?;
         let measured = inventory.receipts.iter().chain(&working.receipts)
             .filter(|r| r.allocation.view.is_none() && r.allocation.location == cuteafd_loader::placement::planner::Location::coordinator(0))
             .map(|r| r.allocation.bytes).sum::<u64>();
         let admitted = plan.facts.allocations.iter().filter(|a| a.view.is_none()
-            && a.location == cuteafd_loader::placement::planner::Location::coordinator(0)).map(|a| a.bytes).sum::<u64>();
+            && a.location == cuteafd_loader::placement::planner::Location::coordinator(0)
+            && a.lifetime.contains(cuteafd_loader::placement::planner::Phase::PostTargetKv, plan.facts.phase_order)).map(|a| a.bytes).sum::<u64>();
         let receipts = inventory.receipts.iter().chain(&working.receipts).cloned().collect::<Vec<_>>();
-        admission::reconcile_native(&plan, devices, &receipts)?;
+        admission::reconcile_native(plan, devices, &receipts)?;
         ensure!(measured == admitted, "Inkling measured device owners differ from cold admission: {measured}/{admitted}");
         tracing::info!(layer=index, measured_device_owner_bytes=measured, admitted_device_owner_bytes=admitted,
             native_weight_arena_aliases=inventory.receipts.len(), "Inkling native cold owner census");
@@ -227,7 +330,7 @@ fn run(mut args: GoldenArgs) -> Result<()> {
     std::fs::write(args.save_logits.join("tokens.bin"), tokens.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>())?;
     let report = serde_json::json!({"family":"inkling2","native":true,"partial":args.last_layer+1 != cfg.layers,
         "last_layer":args.last_layer,"rows":rows,"vocab":cfg.unpadded_vocab_size,"mean_nll":nll,
-        "reference_comparison":comparison});
+        "reference_comparison":comparison, "core_view":view.mode().name()});
     std::fs::write(args.save_logits.join("result.json"), serde_json::to_vec_pretty(&report)?)?;
     println!("Inkling native golden mean NLL={nll:.8} partial={} rows={rows}", args.last_layer+1 != cfg.layers);
     Ok(())

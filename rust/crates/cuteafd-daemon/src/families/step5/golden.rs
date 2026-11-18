@@ -792,7 +792,8 @@ fn layer0_run(args: &GoldenArgs, checkpoint: &Checkpoint, cfg: &Config, referenc
     let metadata = directory.join("meta.json");
     if metadata.exists() { std::fs::remove_file(&metadata)?; }
     // SAFETY: sealed runner library outlives every program, stream and allocation.
-    let library = unsafe { cuteafd_ffi::NativeLibrary::load(args.native_lib.as_ref().context("--native-lib required")?)? };
+    let library = unsafe { cuteafd_ffi::NativeLibrary::load_for_experts(
+        args.native_lib.as_ref().context("--native-lib required")?, ExpertGeometry::STEP5)? };
     library.cuda_set_device(args.device)?;
     crate::shared::inventory::preload_native_modules(&library)?;
     let programs = library.programs()?.with_manifest(&args.manifest)?;

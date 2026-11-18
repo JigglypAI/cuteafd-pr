@@ -417,6 +417,8 @@ def jobs(scope):
          ["--geometry", "dense_trellis_k6", "--dense-trellis-families", "glmf"]),
         ("step5-dense-trellis", "export_b12x_dsv4_aot.py",
          ["--geometry", "dense_trellis_k6", "--dense-trellis-families", "step5"]),
+        ("inkling2-dense-trellis", "export_b12x_dsv4_aot.py",
+         ["--geometry", "dense_trellis_k6", "--dense-trellis-families", "inkling2"]),
         ("glmf-stage", "export_b12x_dsv4_aot.py", ["--geometry", "glmf_stage"]),
         ("glmf2-stage", "export_b12x_dsv4_aot.py", ["--geometry", "glmf2_stage"]),
         ("exlr8", "export_b12x_dsv4_aot.py", ["--geometry", "exlr8", "--exlr8-family", "glm"]),

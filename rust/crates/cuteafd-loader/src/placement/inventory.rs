@@ -1296,6 +1296,18 @@ mod tests {
     }
 
     #[test]
+    fn inkling_compact_namespaces_are_distinct_from_unrelated_programs() {
+        let manifest = json!({"programs": [
+            {"name": "inkling2_head"}, {"name": "dense_trellis_k6_trellis_inkling_head_mcg"},
+            {"name": "native_attention_n201088_k4608_m64_f32"}, {"name": "native_other"},
+        ]});
+        let set = ProgramSet::from_manifest(&manifest, &["inkling2", "dense_trellis_k6", "native_attention"]);
+        assert_eq!(set.names, ["inkling2_head", "dense_trellis_k6_trellis_inkling_head_mcg",
+            "native_attention_n201088_k4608_m64_f32"]);
+        assert!(!set.contains("native_other"));
+    }
+
+    #[test]
     fn plain_glm_excludes_native_stage_names_scratch_and_module_charge() {
         let manifest = json!({"programs": std::iter::once(json!({"name": "glm_producer_m64",
             "scratch_bytes_at_capacity": {"scratch": 7}})).chain((0..32).map(|i| json!({

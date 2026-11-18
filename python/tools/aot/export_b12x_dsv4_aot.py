@@ -532,9 +532,13 @@ def inkling2_load_programs():
     import torch
     from functools import partial
     from b12x.integration.cuteafd.inkling2_glue import compile_padded_transpose_aot
-    return [("padded_transpose_bf16_r16_c1024_p64", "padded_transpose",
-             {"dtype": "bfloat16", "rows": 16, "cols": 1024, "padded_cols": 64},
-             partial(compile_padded_transpose_aot, dtype=torch.bfloat16, rows=16, cols=1024, padded_cols=64))]
+    transforms = (("bf16", "bfloat16", 16, 1024, 64),
+                  ("bf16", "bfloat16", 4608, 256, 4608),
+                  ("f32", "float32", 32, 201088, 32))
+    return [(f"padded_transpose_{suffix}_r{r}_c{c}_p{p}", "padded_transpose",
+             {"dtype": dtype, "rows": r, "cols": c, "padded_cols": p},
+             partial(compile_padded_transpose_aot, dtype=getattr(torch, dtype), rows=r, cols=c, padded_cols=p))
+            for suffix, dtype, r, c, p in transforms]
 
 
 def inkling2_input_quant_program():
@@ -1751,9 +1755,9 @@ def context_split_programs(g, decode_rows: int, max_context: int):
 
 def dense_family_scopes(families, exlr8_family):
     requested = set((families if families is not None else "kimik3").split(","))
-    if not requested or requested - {"kimik3", "glm", "glmf", "step5", "muse", "ml4"}:
-        raise ValueError("--dense-trellis-families takes kimik3, glm, glmf, step5, muse and/or ml4")
-    k6 = tuple(name for name in ("kimik3", "glm", "glmf", "step5", "muse", "ml4") if name in requested)
+    if not requested or requested - {"kimik3", "glm", "glmf", "step5", "muse", "ml4", "inkling2"}:
+        raise ValueError("--dense-trellis-families takes kimik3, glm, glmf, step5, muse, ml4 and/or inkling2")
+    k6 = tuple(name for name in ("kimik3", "glm", "glmf", "step5", "muse", "ml4", "inkling2") if name in requested)
     native = tuple(name for name in k6 if name in ("glm", "glmf")) \
         if families is not None else tuple(filter(None, (exlr8_family or "").split(",")))
     return k6, native
@@ -1779,7 +1783,7 @@ def main() -> None:
                              "dense_trellis_k6 (native K6 core projections), "
                              "native_attention (block-128 FP8 projection stages)")
     parser.add_argument("--dense-trellis-families",
-                        help="architecture tables for dense_trellis_k6 and exlr8_dense: kimik3,glm,glmf,step5,muse,ml4 "
+                        help="architecture tables for dense_trellis_k6 and exlr8_dense: kimik3,glm,glmf,step5,muse,ml4,inkling2 "
                              "(defaults: K6 kimik3; EXLR8 --exlr8-family; no checkpoint reads)")
     parser.add_argument("--native-expert-families", default="v41,dsv4f,dsv4p",
                         help="native_experts segment packages: v41,dsv4f,dsv4p")
@@ -2123,6 +2127,16 @@ def main() -> None:
         work += [("inkling2", *item) for item in inkling2_attention_programs(args.decode_rows, args.prefill_rows)]
         work += [("inkling2", *item) for item in inkling2_producer_programs(args.prefill_rows)]
         work += [("inkling2", *item) for item in inkling2_load_programs()]
+        from export_b12x_dense_trellis_k6_aot import INKLING_SHAPES, INKLING_TARGET_SHAPES
+        existing_fp8 = {suffix for family, suffix, *_ in work if family == "native_attention"}
+        fp8_shapes = {(k, n, "f32") for _, k, n, _ in INKLING_TARGET_SHAPES}
+        fp8_shapes.update((k, n, "bf16") for _, k, n, _ in INKLING_SHAPES if n != 201088)
+        for k, n, precision in sorted(fp8_shapes):
+            for rows in (64, 4096):
+                suffix = f"n{n}_k{k}_m{rows}" + ("_f32" if precision == "f32" else "")
+                if suffix not in existing_fp8:
+                    work.append(("native_attention", suffix, "attention_projection", dict(max_rows=rows),
+                                 functools.partial(compile_native_attention_projection, n, k, rows, precision)))
         work += [("inkling_draft", *item) for item in inkling_draft_programs()]
         for suffix, op, params, compile_ in inkling_fir_programs():
             family = "fir" if suffix == "fir_history_commit" else "inkling2"

@@ -587,6 +587,42 @@ impl<'a> Exl3Tp2<'a> {
             max_rows, policy, selection)
     }
 
+    /// Named physical requests for callers which reconcile each allocation.
+    pub(crate) fn whole_allocation_layout(package: &Path, rows: usize, geometry: ExpertGeometry,
+        selection: RtxSelectionPolicy) -> Result<Vec<(String, usize)>> {
+        use cuteafd_loader::serving_capacity::Exl3WorkspaceLayout;
+        let policy = Exl3RowPolicy::for_geometry(geometry);
+        let directories = selected_directories(package, rows, policy, selection)?;
+        let manifests = directories.iter().map(|path| -> Result<serde_json::Value> {
+            Ok(serde_json::from_slice(&std::fs::read(path.join("v41_exl3.json"))?)?)
+        }).collect::<Result<Vec<_>>>()?;
+        let physical = Exl3WorkspaceLayout::from_manifests(&manifests, true, Exl3Epilogue::Sum)?;
+        let capacities = selected_capacities(rows, policy, selection)?;
+        let mut next_storage = vec![0usize; capacities.len()];
+        let mut out = Vec::new();
+        for owner in physical.owners {
+            let name = if let Some(shared) = owner.name.strip_prefix("shared.") {
+                format!("execution.0.shared.{shared}.backing")
+            } else {
+                let (rows, kind) = owner.name.strip_prefix("capacity.").and_then(|n| n.split_once('.'))
+                    .context("EXL3 private allocation lacks capacity identity")?;
+                let index = capacities.iter().position(|&value| Some(value) == rows.parse().ok())
+                    .context("EXL3 private allocation capacity not selected")?;
+                if kind == "wire" { format!("execution.{index}.wire") }
+                else {
+                    let storage = next_storage[index];
+                    next_storage[index] += 1;
+                    format!("execution.{index}.storage.{storage}")
+                }
+            };
+            out.push((name, usize::try_from(owner.bytes)?));
+        }
+        out.push(("output".into(), output_bytes(geometry, rows)?));
+        ensure!(out.iter().map(|(_, bytes)| bytes).sum::<usize>() ==
+            Self::whole_workspace_bytes(package, rows, geometry, selection)?, "EXL3 named workspace total differs");
+        Ok(out)
+    }
+
     /// Complete experts on one admitted device. The same capacity bindings,
     /// scratch arena and completion protocol serve both whole and TP2 shards.
     pub(crate) fn load_whole_weights(

@@ -1,9 +1,11 @@
 //! Unchanged core tensor bytes in one caller-admitted arena per weight set.
-use crate::shared::{experts::rtx::dense::{DenseLoad, Operand, Rect},
+use crate::shared::{dense_trellis::{CoreWeightLayout, CoreWeights},
+    experts::rtx::dense::{DenseLoad, Operand, Rect},
+    native_attention::{attention_records, AttentionRecord},
     memory::{device::{Allocation, Device}, receipts::Inventory, weight_arena::DeviceWeightArena}};
 use anyhow::{ensure, Context, Result};
 use cuteafd_core::memory_layout::ArenaTag;
-use cuteafd_loader::{families::inkling2::weight_layout::CoordinatorWeights, plan::Checkpoint,
+use cuteafd_loader::{families::inkling2::weight_layout::{fp8_role, projection_prefix, CoordinatorWeights}, plan::Checkpoint,
     serving_capacity::WeightArenaLayout};
 use std::collections::BTreeMap;
 
@@ -13,6 +15,21 @@ pub(crate) struct TargetWeights<'a> {
     pub rank: usize,
     pub layers: Vec<usize>,
     operands: BTreeMap<String, Allocation<'a>>,
+    core: BTreeMap<String, CoreWeights<'a>>,
+    fp8: BTreeMap<String, Fp8Weight<'a>>,
+}
+
+pub(crate) struct Fp8Weight<'a> {
+    pub shape: [usize; 2],
+    pub values: Allocation<'a>,
+    pub scales: Allocation<'a>,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum ProjectionWeight<'s, 'a> {
+    Bf16(&'s Allocation<'a>),
+    Trellis(&'s CoreWeights<'a>),
+    Fp8(&'s Fp8Weight<'a>),
 }
 
 /// Unpublished target delivery; the only consumer requires the shared Spark
@@ -109,14 +126,13 @@ fn transpose_relative(source: &[u8]) -> Result<Vec<u8>> {
 
 impl<'a> TargetWeights<'a> {
     pub fn load(device: Device<'a>, checkpoint: &Checkpoint, layout: &CoordinatorWeights) -> Result<Self> {
-        ensure!(layout.core.is_empty(),
-            "Inkling compact core is planned; shared native trellis execution binds with the serving stage");
         ensure!(layout.rank == 0 && layout.arena.views().keys().all(|name| !name.contains('#')),
             "Inkling stage2 core mount requires whole coordinator operands");
         ensure!(!crate::shared::experts::rtx::dense::is_recording(),
             "Inkling relative transpose is a cold mount transform, not yet a push finish");
         let mut rects = BTreeMap::new();
         for (name, view) in layout.arena.views() {
+            if layout.is_specialized_view(name) { continue; }
             let rect = Rect::tensor(checkpoint, name, None, None)?;
             ensure!(rect.bytes() == view.bytes(), "Inkling core {name}: checkpoint differs from admitted view");
             rects.insert(name.clone(), rect);
@@ -131,6 +147,7 @@ impl<'a> TargetWeights<'a> {
             dense.operand(Operand { device: device.id, buffer: allocation.buffer, lands: vec![(rect, 0)], bytes })?;
             operands.insert(name, allocation);
         }
+        let (core, fp8) = load_specialized(device, checkpoint, layout, &arena, &dense)?;
         dense.release();
         for &layer in &layout.layers {
             let name = format!("model.llm.layers.{layer}.attn.rel_logits_proj");
@@ -144,20 +161,20 @@ impl<'a> TargetWeights<'a> {
                 padding_bytes = 1024*48*2, padding_zero_exact = true, "Inkling relative raw-BF16 transpose/pad load");
             operands.insert(format!("{name}.padded"), allocation);
         }
-        Ok(Self { rank: layout.rank, layers: layout.layers.clone(), operands })
+        Ok(Self { rank: layout.rank, layers: layout.layers.clone(), operands, core, fp8 })
     }
     /// Header-only delivery records plus generated final views. This entry is
     /// not used by serving until the padded-transpose fork export is pinned.
     pub fn record_push(device: Device<'a>, checkpoint: &Checkpoint, layout: &CoordinatorWeights) -> Result<Self> {
         use crate::shared::experts::rtx::dense::Finish;
         ensure!(crate::shared::experts::rtx::dense::is_recording(), "Inkling push weights require shared delivery recording");
-        ensure!(layout.core.is_empty() && layout.rank == 0
-            && layout.arena.views().keys().all(|name| !name.contains('#')),
-            "Inkling initial push requires original whole-rank target operands");
+        ensure!(layout.rank == 0 && layout.arena.views().keys().all(|name| !name.contains('#')),
+            "Inkling whole-rank push requires unsplit coordinator operands");
         let dense = DenseLoad::mount(device.library);
         let arena = DeviceWeightArena::new(device, layout.execution_arena()?, ArenaTag::weights("inkling2/target"))?;
         let mut operands = BTreeMap::new();
         for (name, view) in layout.arena.views() {
+            if layout.is_specialized_view(name) { continue; }
             let rect = Rect::tensor(checkpoint, name, None, None)?;
             ensure!(rect.bytes() == view.bytes(), "Inkling push header differs from admitted view {name}");
             let owner = arena.view(name, view.bytes())?;
@@ -172,17 +189,66 @@ impl<'a> TargetWeights<'a> {
                 rows: 16, cols: 1024, padded_cols: 64 }, std::ptr::null_mut())?;
             operands.insert(format!("{prefix}.padded"), output);
         }
+        let (core, fp8) = load_specialized(device, checkpoint, layout, &arena, &dense)?;
         // Generated views have no delivery Operand: shared DenseArena executes
         // every registered finish and drains before publishing rank Done.
-        Ok(Self { rank: layout.rank, layers: layout.layers.clone(), operands })
+        Ok(Self { rank: layout.rank, layers: layout.layers.clone(), operands, core, fp8 })
     }
     pub fn operand(&self, name: &str) -> Result<&Allocation<'a>> {
         self.operands.get(name).with_context(|| format!("Inkling target lacks operand {name}"))
     }
+    pub fn projection(&self, name: &str) -> Result<ProjectionWeight<'_, 'a>> {
+        let stem = name.strip_suffix(".weight").unwrap_or(name);
+        if let Some(weight) = self.core.get(stem) { return Ok(ProjectionWeight::Trellis(weight)); }
+        if let Some(weight) = self.fp8.get(stem) { return Ok(ProjectionWeight::Fp8(weight)); }
+        Ok(ProjectionWeight::Bf16(self.operand(name)?))
+    }
     pub fn inventory(&self, inventory: &mut Inventory<'_>, prefix: &str) -> Result<()> {
         for (name, owner) in &self.operands { owner.inventory(inventory, &format!("{prefix}.{name}"))?; }
+        for (name, w) in &self.core {
+            for (suffix, owner) in [("trellis", &w.payload), ("suh", &w.suh), ("svh", &w.svh)] {
+                owner.inventory(inventory, &format!("{prefix}.{name}.{suffix}"))?;
+            }
+        }
+        for (name, w) in &self.fp8 {
+            w.values.inventory(inventory, &format!("{prefix}.{name}.values"))?;
+            w.scales.inventory(inventory, &format!("{prefix}.{name}.scales"))?;
+        }
         Ok(())
     }
+}
+
+fn load_specialized<'a>(device: Device<'a>, checkpoint: &Checkpoint, layout: &CoordinatorWeights,
+    arena: &DeviceWeightArena<'a>, dense: &DenseLoad<'a>)
+    -> Result<(BTreeMap<String, CoreWeights<'a>>, BTreeMap<String, Fp8Weight<'a>>)> {
+    let mut core = BTreeMap::new();
+    let mut fp8 = BTreeMap::new();
+    let stream = std::ptr::null_mut();
+    for (stem, weight) in &layout.core {
+        let prefix = projection_prefix(stem, weight.rank, weight.ranks);
+        let native = CoreWeightLayout::from_shared(weight.clone());
+        let loaded = native.load_recorded_with(device, checkpoint, dense, stream, |name, bytes| {
+            let suffix = name.strip_prefix(stem).context("Inkling trellis view stem changed")?;
+            arena.view(&format!("{prefix}{suffix}"), bytes)
+        })?;
+        core.insert(stem.clone(), loaded);
+    }
+    for (stem, weight) in &layout.fp8 {
+        let prefix = projection_prefix(stem, weight.rank, weight.ranks);
+        let [n, k] = weight.shape;
+        let values = arena.view(&format!("{prefix}.values"), n*k)?;
+        let scales = arena.view(&format!("{prefix}.scales"), n/128*(k/128)*4)?;
+        let selected = checkpoint.projection(stem)?;
+        for record in attention_records(&checkpoint.snapshot, &selected, checkpoint.projection_view(stem), weight,
+            fp8_role(stem), crate::shared::fp8_linear::Fp8Scales::Amax, values.buffer, Some(scales.buffer))? {
+            match record {
+                AttentionRecord::Operand(op) => dense.operand(op)?,
+                AttentionRecord::Step(step) => dense.step(step, stream)?,
+            }
+        }
+        fp8.insert(stem.clone(), Fp8Weight { shape: weight.shape, values, scales });
+    }
+    Ok((core, fp8))
 }
 
 #[cfg(test)]
@@ -196,7 +262,7 @@ mod tests {
         write_snapshot(directory.path(), &serde_json::json!({}), &[
             t("model.llm.layers.0.attn.rel_logits_proj.proj", "BF16", &[16, 1024])], None);
         let checkpoint = Checkpoint::open(directory.path())?;
-        let layout = CoordinatorWeights { rank: 0, layers: vec![0], core: BTreeMap::new(),
+        let layout = CoordinatorWeights { rank: 0, layers: vec![0], core: BTreeMap::new(), fp8: BTreeMap::new(),
             arena: WeightArenaLayout::new("inkling2/target/0", [(
                 "model.llm.layers.0.attn.rel_logits_proj.proj".into(), 16*1024*2)])? };
         let fixture = Fixture::build_for_tests()?;

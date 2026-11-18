@@ -147,8 +147,19 @@ STEP5_SHAPES = (
     ("step5_mtp_eh", 8192, 4096, 1, 4),
     ("step5_mtp_head", 4096, 128896, 1, 4),
 )
-FAMILY_SHAPES = {"kimik3": KIMI_SHAPES, "glm": GLM_SHAPES, "glmf": GLMF_SHAPES, "step5": STEP5_SHAPES, "muse": MUSE_SHAPES, "ml4": ML4_SHAPES}
-F32_OUTPUTS = (163840, 154880, 128896, 202112, 204800)
+# Body shapes cover both target F32 and recurrent-drafter BF16 egress.
+INKLING_SHAPES = (
+    ("inkling_q", 4608, 6144, 1), ("inkling_q_tp2", 4608, 3072, 1),
+    ("inkling_rel", 4608, 768, 1), ("inkling_rel_tp2", 4608, 384, 1),
+    ("inkling_kv", 4608, 1024, 1), ("inkling_kv_tp2", 4608, 512, 1),
+    ("inkling_o", 6144, 4608, 1), ("inkling_o_tp2", 3072, 4608, 2),
+    ("inkling_mlp_up", 4608, 18432, 1), ("inkling_mlp_up_tp2", 4608, 9216, 1),
+    ("inkling_mlp_down", 18432, 4608, 1), ("inkling_mlp_down_tp2", 9216, 4608, 2),
+    ("inkling_head", 4608, 201088, 1),
+)
+INKLING_TARGET_SHAPES = INKLING_SHAPES[:8] + INKLING_SHAPES[-1:]
+FAMILY_SHAPES = {"inkling2": INKLING_SHAPES, "kimik3": KIMI_SHAPES, "glm": GLM_SHAPES, "glmf": GLMF_SHAPES, "step5": STEP5_SHAPES, "muse": MUSE_SHAPES, "ml4": ML4_SHAPES}
+F32_OUTPUTS = (163840, 154880, 128896, 202112, 204800, 201088)
 F32_GEOMETRIES = frozenset({(4096, 8192, 2), (2048, 8192, 2)})
 
 
@@ -174,7 +185,7 @@ def shapes_for(families):
     result, seen = [], set()
     for family in families:
         for item in (*FAMILY_SHAPES[family], *(tuple((*shape[:4], 8) for shape in FAMILY_SHAPES[family] if _bits(shape) == 6)
-                                                if family in ("kimik3", "glm", "glmf", "muse", "step5") else ())):
+                                                if family in ("kimik3", "glm", "glmf", "muse", "step5", "inkling2") else ())):
             if _key(item) not in seen:
                 result.append(item)
                 seen.add(_key(item))
@@ -220,6 +231,13 @@ def programs(*, families=("kimik3",), input_dtype="f16"):
             if item[0] not in seen_names:
                 result.append(item)
                 seen_names.add(item[0])
+    if "inkling2" in families:
+        from b12x.integration.cuteafd.trellis_transform import compile_trellis_output_aot
+        for n in sorted({shape[2] for shape in INKLING_TARGET_SHAPES}):
+            name = f"trellis_output_n{n}_f32"
+            if name not in seen_names:
+                params = dict(features=n, output_dtype="f32", max_rows=4096)
+                result.append((name, "trellis_output", params, partial(compile_trellis_output_aot, **params)))
     return result
 
 
