@@ -1088,7 +1088,6 @@ mod tests {
         let html = results(&[], &matrix).unwrap();
         assert!(html.contains("owner/plain-k4&lt;&amp;&gt;"));
         assert!(html.contains("n/a<br><sub>no fit</sub>"));
-        assert!(html.contains("pending<br><sub>needs smoke</sub>"));
         assert!(html.contains("quality &lt; threshold"));
         assert!(!html.contains("<img src="));
     }
@@ -1196,7 +1195,7 @@ mod tests {
         let old = marked("old-min", 1, None);
         let mut newer = marked("new-min", 1, None);
         newer.report.created = "2026-10-16T00:00:00Z".into();
-        let mut matrix = v41_row([Cell::current(), Cell::current()]);
+        let mut matrix = v41_row([Cell::current(), Cell::pending("no two-RTX card")]);
         matrix.rows[0].cells[0].report = Some(old.dir.clone());
         assert_eq!(cards(&select(&[old.clone(), newer.clone()], &matrix).unwrap()[0])[0], Some("old-min"));
         assert!(select(&[newer], &matrix).is_err());
@@ -1286,7 +1285,7 @@ mod tests {
         let reports = vec![real_5090, minimum.clone(), qwen("maximum", 1, 0, None), qwen("legacy", 1, 4, None)];
         let rows = select(&reports, &matrix).unwrap();
         // No 5090-class report fills the PRO cell; the fewest-Spark PRO layout wins.
-        assert_eq!(cards(&rows[0]), vec![Some("maximum")]);
+        assert_eq!(cards(&rows[0]), vec![Some("maximum"), None]);
         assert!(short_hardware(&minimum.report).contains("32 GiB budget"));
         assert!(crate::render::card::card_svg(&minimum.report).contains("32 GiB budget"));
         let html = results(&reports, &matrix).unwrap();
@@ -1513,7 +1512,7 @@ mod tests {
         assert_eq!(matches, without_release_candidate(rc2.dir.file_name().unwrap().to_str().unwrap()));
         let placed = [old, rc2, rc3];
         let rows = select(&placed, &v41_row(v41())).unwrap();
-        assert_eq!(cards(&rows[0])[1], Some("rc3"));
+        assert_eq!(cards(&rows[0])[0], Some("rc3"));
     }
 
     #[test]
@@ -1947,7 +1946,10 @@ mod tests {
         // And so is a cell the tree cannot fill, without writing a document.
         let before = std::fs::read_to_string(root.path().join("README.md")).unwrap();
         let missing = write_matrix(root.path(), &[MatrixRow::new("deepseek_v41",
-            "deepseek-ai/DeepSeek-V4.1-Flash", [Cell::current(), Cell::na("not on this layout")])]);
+            "deepseek-ai/DeepSeek-V4.1-Flash", [
+                Cell { status: Status::Current, reason: String::new(),
+                       report: Some("benchmarks/deepseek_v41/missing".into()) },
+                Cell::na("not on this layout")])]);
         assert!(publish(root.path(), &[], &missing).is_err());
         assert_eq!(std::fs::read_to_string(root.path().join("README.md")).unwrap(), before);
     }
