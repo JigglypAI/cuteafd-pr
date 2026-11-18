@@ -267,6 +267,9 @@ fn serving_stats<C: cuteafd_engine::media::EncoderClient>(prefixes: &PrefixCache
         // prompt's call cancelled because another prompt's call came next.
         "prefill_queue": {"prefilling": prefilling, "prefetch_waves_cancelled":
             super::prefill_target::PREFETCH_WAVES_CANCELLED.load(std::sync::atomic::Ordering::Relaxed)},
+        // Full expert-link resets (all three lanes) since startup; a client that
+        // leaves never adds one (#2475).
+        "link_resets": round_failure::resets(),
     });
     stats
 }
@@ -516,10 +519,10 @@ fn prefill_packed_admissions<'w, 'a, P: ServingTarget<'w, 'a>>(
                 let mut scores = scores.into_iter();
                 let completion = prefill_packing::finish_members(indices.len(), |_| scores.next()
                     .context("missing packed member scores"), &mut |member, scores| {
-                        let i = indices[member];
-                        let result = if admitted[i].0.job.events.is_closed() { Err(anyhow::anyhow!("client disconnected")) }
-                            else { out.insert(i, Ok(scores)); Ok(()) };
-                        Ok(result)
+                        // A member whose client left keeps its scores too: its own chunk
+                        // answers it (`queue::chunk`) after the pass drained.
+                        out.insert(indices[member], Ok(scores));
+                        Ok(Ok(()))
                     });
                 for (&i, result) in indices.iter().zip(prefill_packing::member_outcomes(indices.len(), completion)) {
                     if let Err(error) = result { out.insert(i, Err(error)); }
@@ -665,9 +668,10 @@ impl<'w, 'a, P: ServingTarget<'w, 'a>> queue::Host<Waiting<'a>, super::prefill_t
     type Output = RetainedScores;
     fn run(&mut self, waiting: &mut Waiting<'a>, cursor: &mut super::prefill_target::V41Prefill<P::Suffix>)
         -> Result<Option<RetainedScores>> {
-        let Waiting { prepared, lease, cached, hit_scores, packed, .. } = waiting;
+        let Waiting { prepared, lease, cached, hit_scores, .. } = waiting;
         let (job, prompt, lease) = (&prepared.job, prepared.prompt.as_slice(), *lease);
-        ensure!(!job.events.is_closed(), "client disconnected");
+        // `queue::chunk` already answered a stored packed result and a client
+        // that left; this prompt's next call runs now.
         let first_call = cursor.at_start();
         // A scoring probe scores before anything else (it never packs) and
         // always ends its request (`ScoringDone`).
@@ -679,7 +683,6 @@ impl<'w, 'a, P: ServingTarget<'w, 'a>> queue::Host<Waiting<'a>, super::prefill_t
                 self.draft.as_deref_mut(), &mut || prefixes.prefill_hold())?;
         }
         for (_, transport) in self.prefill.slots.iter_mut() { P::begin_request(transport)?; }
-        if let Some(scores) = packed.take() { return scores.map(Some); }
         if *cached == prompt.len() {
             return hit_scores.take().context("exact prefix has no logits").map(Some);
         }
@@ -724,9 +727,13 @@ impl<'w, 'a, P: ServingTarget<'w, 'a>> queue::Host<Waiting<'a>, super::prefill_t
         })();
         let (anchor, next_after_commit) = match result {
             Ok(value) => value,
-            Err(error) => return queue::Host::<_, super::prefill_target::V41Prefill<P::Suffix>>::fail(self,
-                Waiting { prepared: admission::Prepared { job, prompt, images: Vec::new() }, id, lease, image_keys,
-                    cached, hit_scores: None, images, ticket, constraint, decoder, packed: None, reserve }, error),
+            Err(error) => {
+                let reset = round_failure::needs_reset(&error);
+                queue::Host::<_, super::prefill_target::V41Prefill<P::Suffix>>::fail(self,
+                    Waiting { prepared: admission::Prepared { job, prompt, images: Vec::new() }, id, lease, image_keys,
+                        cached, hit_scores: None, images, ticket, constraint, decoder, packed: None, reserve }, error)?;
+                return if reset { self.reset_links() } else { Ok(()) };
+            }
         };
         // The lane it was announced on at admission (queued prompts count in `loads`).
         let lane = ticket.lane();
@@ -760,9 +767,23 @@ impl<'w, 'a, P: ServingTarget<'w, 'a>> queue::Host<Waiting<'a>, super::prefill_t
         if events.is_closed() { ticket.cancel() } else { ticket.fail(0) }
         tracing::warn!(%error, "native request admission failed");
         self.release(lease, id);
-        P::reset_connections(self.first_transport)?; P::reset_connections(self.second_transport)?;
+        Ok(())
+    }
+
+    fn reset_links(&mut self) -> Result<()> {
+        round_failure::count_reset();
+        P::reset_connections(self.first_transport)?;
+        P::reset_connections(self.second_transport)?;
         for (_, transport) in self.prefill.slots.iter_mut() { P::reset_connections(transport)?; }
         Ok(())
+    }
+
+    fn closed(&self, waiting: &Waiting<'a>) -> bool { waiting.prepared.job.events.is_closed() }
+
+    fn take_stored(&mut self, waiting: &mut Waiting<'a>) -> Option<Result<RetainedScores>> { waiting.packed.take() }
+
+    fn mark_recovered(&mut self, waiting: &mut Waiting<'a>) -> bool {
+        round_failure::mark_recovered(&mut waiting.packed)
     }
 
     fn rest(&self) -> super::prefill_target::V41Prefill<P::Suffix> { super::prefill_target::V41Prefill::new() }
@@ -771,7 +792,8 @@ impl<'w, 'a, P: ServingTarget<'w, 'a>> queue::Host<Waiting<'a>, super::prefill_t
 /// Before a round's first chunk: pack the queued cold whole-unit text
 /// prompts no call has touched yet, as the admission wave did (share 0: the
 /// queue then holds exactly that wave). Members keep their scores until
-/// their own chunk completes them.
+/// their own chunk completes them; the round recovers a failed group's links
+/// before any chunk runs (`queue::recover_packed`).
 #[allow(clippy::too_many_arguments)]
 fn pack_waiting<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, runtime: &tokio::runtime::Runtime,
     requests: &mut Requests<'a>, prefill: &mut super::prefill_target::PrefillSlots<'a, P>,
@@ -799,6 +821,17 @@ fn pack_waiting<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, runtim
         }
     }
     Ok(())
+}
+
+/// The prefill round's prologue: pack the waiting prompts, then reset the links
+/// at once if a packed group failed. The failed pass may have left a wave
+/// unlanded, so no other prompt's call, and no decode round, may run on them
+/// first: its members are answered in their own chunks, without a second reset.
+fn prepare_round<'w, 'a, P: ServingTarget<'w, 'a>>(round: &mut Round<'_, 'w, 'a, P>,
+    waiting: &mut crate::shared::prefill_share::PrefillQueue<QueuedPrompt<'a, P::Suffix>>) -> Result<()> {
+    pack_waiting::<P>(round.lib, round.runtime, round.requests, round.prefill, waiting,
+        round.args, round.draft.as_deref_mut(), round.prefixes, round.whole)?;
+    queue::recover_packed(round, waiting.iter_mut())
 }
 
 fn finish_startup<P>(decode_share: &crate::shared::prefill_share::DecodeShareArgs,
@@ -1132,7 +1165,8 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
                     active.len().div_ceil(2).min(cuteafd_core::V41_MAX_LANE_MEMBERS))?;
                 let constraint = job.constraint.as_ref().map(|spec| compiler.matcher(spec)).transpose()
                     .map_err(cuteafd_api::openai::NativeFailure::from_admission_error)?;
-                ensure!(!job.events.is_closed(), "client disconnected");
+                // Nothing dispatched yet: the failure branch below only releases.
+                ensure!(!job.events.is_closed(), ClientGone);
                 let decoder = cuteafd_loader::streaming_token_decoder(&args.snapshot, false)?;
                 job.events.send(Ok(InferenceChunk::Ready {
                     system_fingerprint: Some(if draft.is_some() { "cuteafd-native-fp4-kv-dspark" }
@@ -1169,9 +1203,7 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
                 second_transport: &mut *second_transport, requests: &mut *requests, prefill: &mut *prefill_slots,
                 draft: draft.as_deref_mut(), prefixes: &mut prefixes, times: &mut times, active: &mut active, whole };
             // The packed pass runs inside the round's timed window: its time is owed too.
-            let finished = prefills.round_with(&mut round,
-                |round, waiting| pack_waiting::<P>(round.lib, round.runtime, round.requests, round.prefill, waiting,
-                    round.args, round.draft.as_deref_mut(), round.prefixes, round.whole),
+            let finished = prefills.round_with(&mut round, prepare_round::<P>,
                 |round, entry| queue::chunk(round, entry))?;
             for (_, result) in finished { result?; }
             prefills.settle(active.iter().any(Option::is_some));
@@ -1249,6 +1281,7 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
             stall::mark(stall::Phase::Failed, active.iter().flatten().count());
             // RV3-4: answer and mark the members before a reset `?` can leave `serve`.
             round_failure::handle(&mut active, &error, || {
+                round_failure::count_reset();
                 P::reset_connections(first_transport)?; P::reset_connections(second_transport)?;
                 for (_, transport) in prefill_slots.slots.iter_mut() { P::reset_connections(transport)?; }
                 Ok(())
@@ -2835,10 +2868,16 @@ mod sampling_tests {
         assert!(round < decode, "a round runs at the boundary before the decode round");
         assert_eq!(serve.matches("P::decode_round(").count(), 1);
         assert_eq!(serve.matches("prefills.round_with(").count(), 1);
-        // The packed pass is inside the round's timed window.
+        // The packed pass (and a failed group's link recovery) is inside the
+        // round's timed window, before any chunk.
         let timed = &serve[serve.find("prefills.round_with(").unwrap()..];
-        assert!(timed[..timed.find("queue::chunk(round, entry)").unwrap()].contains("pack_waiting::<P>("));
-        assert_eq!(serve.matches("pack_waiting::<P>(").count(), 1);
+        assert!(timed[..timed.find("queue::chunk(round, entry)").unwrap()].contains("prepare_round::<P>"));
+        assert_eq!(serve.matches("prepare_round::<P>").count(), 1);
+        let prologue = &source[source.find("fn prepare_round<").unwrap()..];
+        let prologue = &prologue[..prologue.find("\n}\n").unwrap()];
+        assert!(prologue.find("pack_waiting::<P>(").unwrap() < prologue.find("queue::recover_packed(").unwrap());
+        let code = source.split("#[cfg(test)]\nmod sampling_tests").next().unwrap();
+        assert_eq!(code.matches("pack_waiting::<P>(").count(), 1);
         // A prompt deferred behind a pending snapshot wakes the lanes (#976 review A2).
         assert!(serve.contains("host_pending: (!media.full() && !media.backlog.is_empty()) || !prefix_waiters.is_empty(),"));
         // Queued prompts decode on the lane they were announced on (review A4).
