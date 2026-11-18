@@ -46,6 +46,8 @@ def image(ref):
 if args[:2] == ['image', 'inspect']:
     if args[2] == '-f':
         ref = args[4]
+        if 'toolchain.hash' in args[3]:
+            print(os.environ.get('STUB_TOOLCHAIN', 'tc1')); sys.exit(0)
         if '.RootFS.Layers' in args[3]:
             entry = image(ref)
             if not entry:
@@ -1369,3 +1371,247 @@ def test_hidden_options_take_an_operand():
     parser, _ = golden.cli_from_help(text)
     parsed = parser.parse_args(['--snapshot', '/m', '--save-logits', '/out/l', '--skip-experts'])
     assert parsed.save_logits == '/out/l' and parsed.skip_experts
+
+
+# --------------------------------------------------------------------------- --sm121-host
+
+STUB_SMI = '#!/bin/sh\nprintf "%s\\n" "${STUB_SMI:-NVIDIA GB10, 12.1}"\n'
+SM121_BASE = ['--task', 'gr', '--family', 'glmf', '--model', 'org/model', '--arm', 'a=i1:s1']
+SELFTEST = ['python3', '-u', 'native/tests/block_dspark_selftest.py', '/opt/cuteafd/lib/libcuteafd_native.so']
+
+
+def elf(path, machine=183):
+    """A minimal ELF header: e_machine 183 is aarch64, 62 x86-64."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b'\x7fELF\x02\x01\x01' + b'\0' * 11 + machine.to_bytes(2, 'little') + b'\0' * 44)
+    path.chmod(0o755)
+    return path
+
+
+@pytest.fixture
+def sm121_env(env, monkeypatch):
+    """A Spark leg sealed on the build seed itself (ssh runs locally as that host)."""
+    bindir = env['tmp'] / 'bin'
+    for name, text in (('ssh', STUB_SSH), ('nvidia-smi', STUB_SMI)):
+        (bindir / name).write_text(text)
+        (bindir / name).chmod(0o755)
+    (env['home'] / '.cache/huggingface').mkdir(parents=True)
+    (env['home'] / '.cache/huggingface/hub').symlink_to(env['tmp'] / 'hub')
+    monkeypatch.setenv('STUB_SSH_LOG', str(env['tmp'] / 'ssh.log'))
+    monkeypatch.delenv('CUTEAFD_DEV_MEMORY', raising=False)
+    root = write_spark_slot(env['home'], 'i1', packages={})
+    ws = root / 'workspace'
+    (ws / 'docker/seccomp-code-bench.json').write_text('{}')
+    (ws / 'scripts/build/dev-toolchain.py').write_text('print("tc1")\n')
+    (ws / 'scripts/build/assert-build-filesystem.py').write_text('')
+    (ws / 'BUILD_IDENTITY.json').write_text(json.dumps({'commit': 'c0ffee', 'dirty': False}))
+    build = root.parents[2] / 'build/expert/native'
+    return dict(env, ssh=env['tmp'] / 'ssh.log', root=root, build=build,
+                test=elf(build / 'cuteafd_native_selftest'))
+
+
+def sm121_run(env):
+    """The container command the runner sent to the Spark."""
+    for host, command in ssh_calls(env):
+        argv = shlex.split(command)
+        if argv[:3] == ['docker', 'run', '--rm']:
+            return host, argv
+    return None, None
+
+
+def test_sm121_command_runs_the_spark_leg_under_the_seed_locks(sm121_env, monkeypatch):
+    env = sm121_env
+    logits = env['tmp'] / 'logits.bin'
+    logits.write_bytes(b'\0' * 32)
+    monkeypatch.setenv('STUB_LOGITS', str(logits))
+    order, at_release = [], []
+    real_hold = golden.hwlock.hold
+
+    class Hold:
+        def __init__(self, names, *a, **k):
+            order.append(list(names))
+            self.inner = real_hold(names, *a, **k)
+
+        def __enter__(self):
+            return self.inner.__enter__()
+
+        def __exit__(self, *exc):
+            scratch = env['home'] / '.cache/cuteafd/builds/gr/golden-sm121'
+            at_release.append((json.loads(env['state'].read_text()), scratch.exists()))
+            return self.inner.__exit__(*exc)
+    monkeypatch.setattr(golden.hwlock, 'hold', Hold)
+    assert golden.main(SM121_BASE + ['--sm121-host', 'kakapo', '--command', '--env', 'K=V', '--', *SELFTEST]) == 0
+    assert order == [['kakapo', 'kakapo-export']]
+    assert at_release == [({}, False)]  # container and Spark scratch gone before the locks
+    host, argv = sm121_run(env)
+    assert host == 'kakapo' and not runs(dict(env, log=env['tmp'] / 'none.log'))
+    assert argv[argv.index('--memory') + 1] == argv[argv.index('--memory-swap') + 1] == '16g'
+    assert argv[argv.index('--device') + 1] == 'nvidia.com/gpu=all' and '--network' not in argv
+    assert argv[argv.index('-w') + 1] == '/workspace/cuteafd'
+    assert argv[argv.index('--label') + 1] == 'cuteafd.golden-run=gr/a'
+    mounts = [argv[i + 1] for i, a in enumerate(argv) if a == '-v']
+    leg = str(env['root'])
+    assert f'{leg}/workspace:/workspace/cuteafd:ro' in mounts
+    assert f'{leg}/workspace/.cuteafd-wip/libcuteafd_native.so:/opt/cuteafd/lib/libcuteafd_native.so:ro' in mounts
+    assert not any('/coordinator/' in m for m in mounts)
+    assert all(m.endswith(':ro') for m in mounts if not m.endswith(':/out'))
+    assert f"seccomp={leg}/workspace/docker/seccomp-code-bench.json" in argv
+    image = argv.index('spark:tc')
+    assert argv[argv.index('--entrypoint') + 1] == 'timeout' and argv[image + 1:image + 3] == ['--kill-after=30', '3660']
+    assert argv[-len(SELFTEST):] == SELFTEST and 'K=V' in argv
+    out = env['home'] / '.cache/cuteafd/builds/gr/golden/a/r1'
+    assert (out / 'logits/logits.bin').read_bytes() == b'\0' * 32  # {out} copied back from the Spark
+    record = json.loads((out / 'argv.json').read_text())
+    assert (record['host'], record['compute_cap'], record['mode'], record['exit']) == ('kakapo', '12.1', 'command', 0)
+    assert record['slot_root'] == f'kakapo:{leg}' and record['toolchain'] == 'tc1'
+    assert record['source_commit'] == 'c0ffee' and record['memory'] == '16g'
+    summary = (out.parents[1] / 'summary.md').read_text()
+    assert 'SM121 host kakapo (NVIDIA GB10), memory cap 16g, locks kakapo,kakapo-export' in summary
+
+
+@pytest.mark.parametrize('extra,environ,expected', [
+    ([], {'CUTEAFD_DEV_MEMORY': '24g'}, '24g'),
+    (['--memory-bytes', '8589934592'], {'CUTEAFD_DEV_MEMORY': '24g'}, '8589934592'),
+])
+def test_sm121_memory_cap(sm121_env, monkeypatch, extra, environ, expected):
+    for key, value in environ.items():
+        monkeypatch.setenv(key, value)
+    assert golden.main(SM121_BASE + ['--sm121-host', 'kakapo', '--command', *extra, '--', 'true']) == 0
+    _, argv = sm121_run(sm121_env)
+    assert argv[argv.index('--memory') + 1] == expected
+
+
+def test_sm121_native_test_resolves_in_the_spark_build_tree(sm121_env, monkeypatch):
+    env = sm121_env
+    monkeypatch.setenv('STUB_RUN_OUTPUT', PASSED)
+    assert golden.main(SM121_BASE + ['--sm121-host', 'kakapo', '--native-test', 'native/cuteafd_native_selftest',
+                                     '--', 'name', '--exact']) == 0
+    _, argv = sm121_run(env)
+    mounts = [argv[i + 1] for i, a in enumerate(argv) if a == '-v']
+    assert f"{env['test']}:/opt/cuteafd/test/cuteafd_native_selftest:ro" in mounts
+    assert argv[-3:] == ['/opt/cuteafd/test/cuteafd_native_selftest', 'name', '--exact']
+    record = json.loads((env['home'] / '.cache/cuteafd/builds/gr/golden/a/r1/argv.json').read_text())
+    assert record['native_test'] == str(env['test'])
+    assert record['native_test_sha256'] == hashlib.sha256(env['test'].read_bytes()).hexdigest()
+
+
+def test_sm121_native_test_needs_a_passing_summary(sm121_env, monkeypatch):
+    monkeypatch.setenv('STUB_RUN_OUTPUT', 'test result: FAILED. 0 passed; 1 failed; 0 ignored')
+    assert golden.main(SM121_BASE + ['--sm121-host', 'kakapo', '--native-test', 'native/cuteafd_native_selftest',
+                                     '--', 'name']) == 1
+    record = json.loads((sm121_env['home'] / '.cache/cuteafd/builds/gr/golden/a/r1/argv.json').read_text())
+    assert record['problem'] == 'tests failed'
+
+
+@pytest.mark.parametrize('setup,args,message', [
+    ('noslot', [], 'no sealed spark-expert slot i1:s1'),
+    ('elsewhere', [], 'wip.sh sealed this Spark leg on cassowary: use --sm121-host cassowary'),
+    ('rtx', [], 'not a single-GPU GB10 (SM121) host: NVIDIA RTX PRO 6000 12.0'),
+    ('stale', [], 'is stale: toolchain tc0, slot sources tc-tc1'),
+    ('x86', ['--native-test', 'native/x86_selftest'], 'is not an aarch64 ELF'),
+    ('', ['--native-test', '../../../../../bin/sh'], 'is outside'),
+    ('', ['--native-test', '/usr/bin/true'], 'is outside'),
+    ('', ['--native-test', 'native/missing'], 'is not an executable file on this host'),
+    ('', ['--mount', '/nonexistent/sm121'], "--mount '/nonexistent/sm121' does not exist on kakapo"),
+    ('', ['--gpus', '1'], 'drop --gpus'),
+    ('', ['--spark-hosts', 'dodo'], 'drop --spark-hosts'),
+    ('', ['--rdma'], 'drop --rdma'),
+    ('', ['--memory-bytes', '0'], 'CUTEAFD_DEV_MEMORY must be a docker size'),
+    ('golden', [], '--sm121-host runs --native-test or --command'),
+    ('raptor', [], '--sm121-host raptor is not a GB10 Spark'),
+])
+def test_sm121_refusals_precede_any_lock(sm121_env, monkeypatch, capsys, setup, args, message):
+    import shutil
+    env = sm121_env
+    host, mode = 'kakapo', ['--command']
+    if setup in ('noslot', 'elsewhere'):
+        shutil.rmtree(env['root'])
+    if setup == 'elsewhere':
+        (env['root'].parent / 'seed-host').write_text('cassowary\n')
+    if setup == 'rtx':
+        monkeypatch.setenv('STUB_SMI', 'NVIDIA RTX PRO 6000, 12.0')
+    if setup == 'stale':
+        monkeypatch.setenv('STUB_TOOLCHAIN', 'tc0')
+    if setup == 'x86':
+        elf(env['build'] / 'x86_selftest', machine=62)
+    if setup == 'golden':
+        mode = []
+    if setup == 'raptor':
+        host = 'raptor'
+    if any(a == '--native-test' for a in args):
+        mode = []
+    taken = []
+    monkeypatch.setattr(golden.hwlock, 'hold', lambda *a, **k: taken.append(a))
+    assert golden.main(SM121_BASE + ['--sm121-host', host, *mode, *args, '--', 'true']) == 2
+    assert message in capsys.readouterr().err
+    assert not taken and sm121_run(env) == (None, None)
+
+
+def test_sm121_pool_spark_takes_its_serving_lock(sm121_env, capsys):
+    assert golden.main(SM121_BASE + ['--sm121-host', 'dodo', '--command', '--dry-run', '--', 'true']) == 0
+    assert '# locks (fair queue, in order): sparks' in capsys.readouterr().out
+    assert golden.sm121_locks('rhea') == ['rhea'] and golden.sm121_locks('cassowary') == ['cassowary', 'cassowary-export']
+
+
+def test_raptor_default_gpus_unchanged(env, capsys):
+    write_slot(env['home'], 'i1')
+    assert golden.main(SM121_BASE + ['--command', '--dry-run', '--', 'true']) == 0
+    assert '# locks (fair queue, in order): gpu0,gpu1' in capsys.readouterr().out
+
+
+def test_sm121_lock_wait_expiry_runs_nothing(sm121_env, capsys):
+    with open(sm121_env['locks'] / 'kakapo-export.lock', 'a') as held:
+        fcntl.flock(held, fcntl.LOCK_EX)  # a seed export holds the GPU turn
+        assert golden.main(SM121_BASE + ['--sm121-host', 'kakapo', '--command', '--wait', '0.5', '--', 'true']) == 75
+    assert 'no turn for kakapo,kakapo-export' in capsys.readouterr().err
+    assert sm121_run(sm121_env) == (None, None)
+
+
+def test_sm121_timeout_removes_container_and_scratch(sm121_env, monkeypatch):
+    env = sm121_env
+    monkeypatch.setenv('STUB_RUN_SLEEP', '30')
+    assert golden.main(SM121_BASE + ['--sm121-host', 'kakapo', '--command', '--timeout', '1', '--', 'true']) == 1
+    record = json.loads((env['home'] / '.cache/cuteafd/builds/gr/golden/a/r1/argv.json').read_text())
+    assert record['exit'] == 124 and 'timed out' in record['problem']
+    assert json.loads(env['state'].read_text()) == {}
+    assert not (env['home'] / '.cache/cuteafd/builds/gr/golden-sm121').exists()
+
+
+def test_sm121_sigterm_removes_container_and_releases_locks(sm121_env, monkeypatch):
+    import threading
+    import time
+    env = sm121_env
+    monkeypatch.setenv('STUB_RUN_SLEEP', '30')
+
+    def signal_when_running():
+        deadline = time.monotonic() + 60
+        while time.monotonic() < deadline:
+            if env['state'].exists() and any(n.get('name') == 'golden-gr-a'
+                                             for n in json.loads(env['state'].read_text() or '{}').values()):
+                break
+            time.sleep(0.05)
+        os.kill(os.getpid(), signal.SIGTERM)
+    threading.Thread(target=signal_when_running, daemon=True).start()
+    assert golden.main(SM121_BASE + ['--sm121-host', 'kakapo', '--command', '--', 'true']) == 130
+    assert json.loads(env['state'].read_text()) == {}
+    assert not (env['home'] / '.cache/cuteafd/builds/gr/golden-sm121').exists()
+    for name in ('kakapo', 'kakapo-export'):
+        with open(env['locks'] / f'{name}.lock', 'a') as handle:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+
+def test_sm121_slot_changed_at_grant_is_refused(sm121_env, monkeypatch, capsys):
+    env = sm121_env
+    real_hold = golden.hwlock.hold
+
+    def hold(names, *a, **k):
+        meta = env['root'] / 'META.json'
+        data = json.loads(meta.read_text())
+        data['built_unix'] = 1
+        meta.write_text(json.dumps(data))
+        (env['root'] / 'FINGERPRINT').write_text(hashlib.sha256(meta.read_bytes()).hexdigest() + '\n')
+        return real_hold(names, *a, **k)
+    monkeypatch.setattr(golden.hwlock, 'hold', hold)
+    assert golden.main(SM121_BASE + ['--sm121-host', 'kakapo', '--command', '--', 'true']) == 2
+    assert 'changed since enqueue' in capsys.readouterr().err
+    assert sm121_run(env) == (None, None)
