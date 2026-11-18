@@ -82,3 +82,121 @@ fn installed_inkling_recurrent_forward_matches_real_weight_reference()->Result<(
     }
     Ok(())
 }
+
+/// Real target head weights, all nine stages of the unchanged recurrent token
+/// loop, and deterministic inputs to isolate the head from a served target.
+#[test]
+#[ignore = "requires an Inkling MC checkpoint, native programs and GPU; golden-run only"]
+fn installed_inkling_recurrent_head_baseline() -> Result<()> {
+    use super::recurrent_head::HeadStage;
+    use crate::{families::inkling2::{layers::Kernels, weights::{ProjectionWeight, TargetWeights}},
+        shared::memory::device::Event};
+    use cuteafd_loader::{families::inkling2::{Inkling2Config, InklingKvCache,
+        weight_layout::{CoordinatorWeights, HEAD}}, placement::{FfnMode, LayerMode}};
+
+    let snapshot = std::path::PathBuf::from(std::env::var("CUTEAFD_GOLDEN_SNAPSHOT")?);
+    let mode = std::env::var("CUTEAFD_TEST_CORE_VIEW")?.parse::<CoreView>()?;
+    let manifest = std::path::PathBuf::from(std::env::var("CUTEAFD_PROGRAM_MANIFEST")?);
+    // SAFETY: golden-run mounts the matching sealed trusted native library.
+    let library = unsafe { cuteafd_ffi::NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
+    let programs = library.programs()?.with_manifest(&manifest)?;
+    let device = Device { library: &library, id: 0 };
+    let stream = Rc::new(Stream::new(device)?);
+    let source = RecurrentSource::open(&CheckpointView::select(&snapshot, CoreView::Original)?)?;
+    let weights = Weights::load(device, &source, source.rank(0, 1, 0)?, stream.raw)?;
+    let config = &source.config;
+    let runtime = RecurrentRuntimeLayout::new(config, 64, 64, 512, 2048, 4096,
+        library.sm_count()? as usize, cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16, 0, 1, 0)?;
+    let native = ProgramsForRank::load(&programs, &weights, config, &runtime, device)?;
+    let rank = Rank::allocate(weights, Rc::clone(&stream), config.clone(), runtime, native)?;
+
+    let view = CheckpointView::select(&snapshot, mode)?;
+    let checkpoint = Checkpoint::open_view(&view)?;
+    let cfg = Inkling2Config::from_hf(&checkpoint.config)?;
+    let layers = vec![LayerMode::Whole { gpu: 0, ffn: FfnMode::Owner }; cfg.layers];
+    let mut layout = CoordinatorWeights::plan(&checkpoint, &cfg, 1, &layers)?.remove(0);
+    layout.layers.clear();
+    layout.core.retain(|name, _| name == HEAD);
+    layout.fp8.retain(|name, _| name == HEAD);
+    layout.arena = WeightArenaLayout::new("inkling2/recurrent-head-bench", layout.arena.views().iter()
+        .filter(|(name, _)| name.starts_with(&format!("{HEAD}.")))
+        .map(|(name, view)| (name.clone(), view.bytes())))?;
+    let target = TargetWeights::load(device, &checkpoint, &layout)?;
+    let stored = layout.stored_head().unwrap_or(config.padded_vocab);
+    let f32_stage = Allocation::new(device, 64*stored*4, Tag::drafter_workspace("head-bench/f32"))?;
+    let bf16_stage = Allocation::new(device, 64*stored*2, Tag::drafter_workspace("head-bench/bf16"))?;
+    let mut kernels = Kernels::bind(&programs, InklingKvCache::Bf16)?;
+    let fp8_bytes = layout.fp8_scratch(&serde_json::from_slice(&std::fs::read(&manifest)?)?, 64, 64)?;
+    kernels.bind_compact(&programs, Rc::clone(&stream), &layout, 64, 64, fp8_bytes)?;
+
+    // No fold is timed. Synthetic nonzero folded operands do equivalent work
+    // without adding a second head or depending on a future compact fold.
+    for (index, buffer) in [rank.buffer("step.normalized")?, rank.buffer("head.f_rnn")?,
+        rank.weights.derived("derived.fold_weight")?.buffer, rank.weights.derived("derived.fold_bias")?.buffer]
+        .into_iter().enumerate() {
+        let pattern = [0x3c00u16, 0x3b80, 0x0000, 0xbb80, 0xbc00, 0x3c80, 0xbc80];
+        let data = (0..buffer.bytes/2).flat_map(|j| pattern[(j ^ (j >> 5) ^ index) % pattern.len()].to_le_bytes())
+            .collect::<Vec<_>>();
+        library.copy_h2d(buffer, &data)?;
+    }
+    let anchors = rank.buffer("step.ids")?;
+    let mut ids = vec![0; anchors.bytes];
+    for (i, dst) in ids.chunks_exact_mut(4).take(64).enumerate() {
+        dst.copy_from_slice(&(101 + i as u32).to_le_bytes());
+    }
+    library.copy_h2d(anchors, &ids)?;
+
+    const SAMPLES: usize = 12;
+    const STAGES: usize = HeadStage::Copies as usize;
+    let predictions = config.predictions();
+    let h = config.transformer.hidden;
+    let n = config.padded_vocab;
+    let narrow = library.f32_bf16_narrow()?;
+    let head = || target.projection("model.llm.unembed.weight");
+    let head_bytes = match head()? {
+        ProjectionWeight::Bf16(w) => w.buffer.bytes,
+        ProjectionWeight::Trellis(w) => w.payload.buffer.bytes + w.suh.buffer.bytes + w.svh.buffer.bytes,
+        ProjectionWeight::Fp8(w) => w.values.buffer.bytes + w.scales.buffer.bytes,
+    };
+    for rows in [1, 4, 16, 64] {
+        let base = |hidden: Buffer, output: Buffer| -> Result<()> {
+            let weight = head()?;
+            if let ProjectionWeight::Bf16(w) = weight {
+                // SAFETY: same retained BF16 operands as the original head.
+                return unsafe { rank.programs.plain.launch_checked(hidden.ptr, w.buffer.ptr, output, rows, h, n, stream.raw) };
+            }
+            kernels.project_compact(&stream, hidden, weight, f32_stage.buffer, rows, h, stored)?;
+            // SAFETY: typed scratch covers physical row pitch; copy strips only
+            // compact padding and leaves the unchanged BF16 baseline epilogue.
+            unsafe {
+                narrow.launch(f32_stage.buffer.ptr, bf16_stage.buffer.ptr, rows*stored, stream.raw)?;
+                library.copy_d2d_2d_async(output, n*2, bf16_stage.buffer, stored*2, n*2, rows, stream.raw)
+            }
+        };
+        rank.recurrent_tokens_measured(rows, anchors, base, |_, _| Ok(()))?;
+        stream.drain()?;
+        let mut totals = [[0.0; STAGES]; 7];
+        for _ in 0..SAMPLES {
+            let mut events = (0..predictions*(STAGES+1)).map(|_| Event::timing(device)).collect::<Result<Vec<_>>>()?;
+            rank.recurrent_tokens_measured(rows, anchors, base,
+                |step, stage| events[step*(STAGES+1)+stage as usize].record(&stream))?;
+            stream.drain()?;
+            for (step, stages) in totals.iter_mut().enumerate() {
+                for (stage, total) in stages.iter_mut().enumerate() {
+                    let i = step*(STAGES+1) + stage;
+                    // SAFETY: both events are recorded and drained on this stream.
+                    *total += f64::from(unsafe { library.cuda_event_elapsed_ms(events[i].raw, events[i+1].raw)? }) * 1e3;
+                }
+            }
+        }
+        let mean = (0..STAGES).map(|stage| totals.iter().map(|step| step[stage]).sum::<f64>() / (SAMPLES*predictions) as f64)
+            .collect::<Vec<_>>();
+        eprintln!("RECURRENT_HEAD_BASELINE {}", serde_json::json!({"view": mode.name(), "rows": rows,
+            "head_bytes": head_bytes, "roof_us": head_bytes as f64 / 1_792_000.0,
+            "gather_us": mean[0], "recurrent_us": mean[1], "base_us": mean[2], "correction_us": mean[3],
+            "bias_us": mean[4], "finish_us": mean[5], "widen_us": mean[6], "argmax_us": mean[7],
+            "copies_us": mean[8], "total_us": mean.iter().sum::<f64>(),
+            "per_step_total_us": totals.iter().map(|step| step.iter().sum::<f64>() / SAMPLES as f64).collect::<Vec<_>>() }));
+    }
+    Ok(())
+}
