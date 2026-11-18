@@ -2033,6 +2033,8 @@ def test_placement_publication_rsync_host_syncs_directory_and_current_symlink(tm
 
 def test_inkling2_groups_select_its_attention_programs_and_coordinator_mxfp8_package():
     jobs = {name: (script, args) for name, script, args in compare_sm.jobs("all")}
+    assert jobs["inkling2-dense-trellis"] == ("export_b12x_dsv4_aot.py", [
+        "--geometry", "dense_trellis_k6", "--dense-trellis-families", "inkling2"])
     assert jobs["inkling2-attention"] == ("export_b12x_dsv4_aot.py", [
         "--geometry", "inkling2", "--decode-rows", "64", "--prefill-rows", "4096"])
     for geometry in ("inkling2_mxfp8", "inkling2_nvfp4"):

@@ -246,6 +246,20 @@ fn packing_inventory(core: Option<&serde_json::Value>, native: &[String])
     Ok(inventory.into_iter().collect())
 }
 
+fn packing_inventory_with_manifest<'a>(core: Option<&serde_json::Value>, native: &[String],
+    entries: impl IntoIterator<Item = (&'a str, &'a serde_json::Value)>)
+    -> Result<Vec<(String, crate::shared::prefill_packing::ProgramRows)>> {
+    let mut catalogue = packing_inventory(core, native)?.into_iter().collect::<BTreeMap<_, _>>();
+    if core.is_some() {
+        for (name, geometry) in entries {
+            if let Some(role) = crate::shared::prefill_packing::shared_trellis_egress_role(name, geometry) {
+                catalogue.entry(name.to_owned()).or_insert(role);
+            }
+        }
+    }
+    Ok(catalogue.into_iter().collect())
+}
+
 fn packing_program(name: &str, core: bool) -> bool {
     name.starts_with("kimik3_") || name.starts_with("kimik31_") || name.starts_with("kda_fused_")
         || matches!(name, "kda_commit_h96" | "kda_output_h96") || core && (name.starts_with("kda_core_")
@@ -264,7 +278,11 @@ fn classify_packing_inventory<'a>(names: impl IntoIterator<Item = &'a str>,
 }
 
 fn coordinator_packing_cap(programs: &Programs<'_>, core: bool, rows: usize, native: &[String]) -> Result<usize> {
-    let catalogue = packing_inventory(core.then(|| programs.family_metadata("dense_trellis_k6")).transpose()?, native)?;
+    use crate::shared::prefill_packing::TRELLIS_EGRESS_PREFIX;
+    let metadata = core.then(|| programs.family_metadata("dense_trellis_k6")).transpose()?;
+    let egress = programs.names().filter(|name| core && name.starts_with(TRELLIS_EGRESS_PREFIX))
+        .map(|name| Ok((name, &programs.spec(name)?.geometry))).collect::<Result<Vec<_>>>()?;
+    let catalogue = packing_inventory_with_manifest(metadata, native, egress)?;
     let inventory = classify_packing_inventory(programs.names().filter(|name| packing_program(name, core))
         .chain(native.iter().map(String::as_str)), &catalogue)?;
     crate::shared::prefill_packing::coordinator_row_cap(programs, inventory, rows)
@@ -2708,12 +2726,12 @@ mod packing_inventory_tests {
         let manifest: serde_json::Value = serde_json::from_slice(&std::fs::read(&path)
             .with_context(|| format!("required installed PROGRAMS.json: {}", path.display()))?)?;
         let programs = manifest["programs"].as_array().context("installed program inventory")?;
+        let entries = programs.iter().map(|program| Ok((program["name"].as_str()
+            .context("installed program name")?, &program["geometry"]))).collect::<Result<Vec<_>>>()?;
         for core in [false, true] {
             let metadata = core.then_some(&manifest["families"]["dense_trellis_k6"]);
-            let catalogue = packing_inventory(metadata, &[])?;
-            let required = programs.iter().map(|program| program["name"].as_str()
-                .context("installed program name")).collect::<Result<Vec<_>>>()?
-                .into_iter().filter(|name| packing_program(name, core))
+            let catalogue = packing_inventory_with_manifest(metadata, &[], entries.iter().copied())?;
+            let required = entries.iter().map(|&(name, _)| name).filter(|name| packing_program(name, core))
                 .collect::<std::collections::BTreeSet<_>>();
             ensure!(!required.is_empty(), "installed Kimi program group is empty");
             let classified = classify_packing_inventory(required.iter().copied(), &catalogue)?;
@@ -2729,6 +2747,22 @@ mod packing_inventory_tests {
                     "an unclassified export must fail the gate: {name}");
             }
         }
+        Ok(())
+    }
+
+    #[test]
+    fn shared_trellis_egress_is_classified_without_a_kimi_policy() -> Result<()> {
+        let core = serde_json::json!({"row_policies": []});
+        let name = "dense_trellis_k6_trellis_output_n2304_f32";
+        let mut geometry = serde_json::json!({"features": 2304, "output_dtype": "f32",
+            "max_rows": 4096, "exact_row_cap": 2147483647});
+        assert!(packing_program(name, true));
+        let catalogue = packing_inventory_with_manifest(Some(&core), &[], [(name, &geometry)])?;
+        assert_eq!(classify_packing_inventory([name], &catalogue)?, [(name, PackedRows)]);
+
+        geometry["features"] = 2048.into();
+        let catalogue = packing_inventory_with_manifest(Some(&core), &[], [(name, &geometry)])?;
+        assert!(classify_packing_inventory([name], &catalogue).is_err());
         Ok(())
     }
 

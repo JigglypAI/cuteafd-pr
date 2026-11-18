@@ -1,5 +1,5 @@
 //! Cold partial-golden contract uses shared phase/arena/tail admission.
-use super::{experts::Mxfp8Layout, head::Head, weights::execution_arena};
+use super::weights::execution_arena;
 use anyhow::{Context as _, Result};
 use cuteafd_core::memory_layout::{Category, MemoryKind};
 use cuteafd_loader::{families::inkling2::{execution::UnitLayout, weight_layout::CoordinatorWeights, Inkling2Config},
@@ -13,7 +13,8 @@ fn cold_contract(facts: Facts, rows: usize) -> Contract {
 }
 
 pub(crate) fn admit(checkpoint: &Checkpoint, cfg: &Inkling2Config, target: &CoordinatorWeights,
-    expert: &Mxfp8Layout, scratch: usize, unit: &UnitLayout, head_rows: usize,
+    expert_arena: &cuteafd_loader::serving_capacity::WeightArenaLayout, expert_scratch: &[(String, usize)],
+    expert_mount: cuteafd_loader::shared::dense_read::MountLoad, unit: &UnitLayout, head_rows: usize, fp8_bytes: usize,
     free: u64, total: u64, host: (u64, u64)) -> Result<ResolvedPlan> {
     let empty = Facts { phase_order: PhaseOrder::TARGET_THEN_DRAFT, resident_weights: vec![], allocations: vec![],
         deferred: vec![], sequential: vec![], reservations: vec![], allowances: vec![],
@@ -21,17 +22,32 @@ pub(crate) fn admit(checkpoint: &Checkpoint, cfg: &Inkling2Config, target: &Coor
     let mut contract = cold_contract(empty, unit.rows);
     contract.components.extend(weight_arena_components(&execution_arena(target)?, Location::coordinator(0),
         Lifetime::RESIDENT, 1, MemoryKind::Weights)?);
-    contract.components.extend(weight_arena_components(&expert.arena, Location::coordinator(0),
+    contract.components.extend(weight_arena_components(expert_arena, Location::coordinator(0),
         Lifetime::RESIDENT, 1, MemoryKind::Experts)?);
     let mut buffers = unit.buffers.iter().map(|(name, bytes)| (format!("unit.{name}"), Location::coordinator(0),
         *bytes as u64, Lifetime::TARGET, Category::Workspace)).collect::<Vec<_>>();
     for (name, bytes) in [("head.tokens", head_rows*4), ("head.normalized", head_rows*cfg.hidden*2),
-        ("head.logits", head_rows*cfg.unpadded_vocab_size*4), ("head.workspace", Head::workspace_bytes(cfg, head_rows)?),
-        ("expert.scratch", scratch)] {
+        ("head.logits", head_rows*cfg.unpadded_vocab_size*4)]
+        .into_iter().chain(expert_scratch.iter().map(|(name, bytes)| (name.as_str(), *bytes))) {
         buffers.push((name.into(), Location::coordinator(0), bytes as u64, Lifetime::TARGET, Category::Workspace));
     }
+    if target.stored_head().is_none() {
+        buffers.push(("head.workspace".into(), Location::coordinator(0),
+            cuteafd_ffi::programs::VOCABULARY_HEAD_WORKSPACE as u64, Lifetime::TARGET, Category::Workspace));
+    }
+    let trellis = target.trellis_scratch(unit.rows, head_rows.min(64))?
+        .map(|scratch| scratch.packed_bytes()).transpose()?.unwrap_or(0);
+    for (name, bytes) in [("target.trellis", trellis), ("target.fp8", fp8_bytes),
+        ("head.compact_logits", head_rows.min(64)*target.stored_head().unwrap_or(0)*4)] {
+        if bytes > 0 { buffers.push((name.into(), Location::coordinator(0), bytes as u64, Lifetime::TARGET, Category::Workspace)); }
+    }
+    if !target.core.is_empty() {
+        buffers.push(("target.load_trellis".into(), Location::coordinator(0),
+            cuteafd_loader::shared::dense_read::STEP_BYTES as u64,
+            Lifetime { first: Phase::Load, last: Phase::Load }, Category::Staging));
+    }
     let mut mount = target.mount_load(checkpoint)?;
-    mount.merge(expert.mount);
+    mount.merge(expert_mount);
     for (name, bytes, location) in [("source", mount.pinned_source, Location::PINNED),
         ("rows", mount.full_row_cache, Location::HOST), ("tables", mount.pinned_tables, Location::PINNED)] {
         if bytes>0 { buffers.push((format!("mount.{name}"), location, bytes, Lifetime::RESIDENT, Category::Staging)); }
@@ -55,7 +71,7 @@ pub(crate) fn admit(checkpoint: &Checkpoint, cfg: &Inkling2Config, target: &Coor
         kind: ComponentKind::Allowance(Allowance { location: Location::coordinator(0),
             bytes: cuda_stream_slab_bytes(1)?, lifetime: Lifetime::RESIDENT,
             source: "driver.stream-slabs: one ordered cold golden stream".into(), assumed: false }) });
-    let head = crate::shared::target_head::TargetHead::configured().blas_head(true);
+    let head = crate::shared::target_head::TargetHead::configured().blas_head(target.stored_head().is_none());
     contract.components.extend(serving::blas_components("sm_120", &[serving::BlasOwners {
         name: "inkling2/head".into(), process: "coordinator".into(), thread: "golden".into(),
         location: Location::coordinator(0), gemm: head.gemm(), lt: head.lt(), lifetime: Lifetime::TARGET,
@@ -88,12 +104,16 @@ pub(crate) fn admit(checkpoint: &Checkpoint, cfg: &Inkling2Config, target: &Coor
 pub(crate) fn reconcile_native(plan: &ResolvedPlan, devices: CoordinatorDevices<'_>,
     receipts: &[Receipt]) -> Result<()> {
     let mut projected = devices.remap_plan_weight_arenas(plan)?;
-    projected.facts.allocations.retain(|a| a.view.is_none() && a.location == Location::coordinator(0));
-    // Page-table overhead maps pinned owners; the projected device-only
-    // witness excludes those host backings, so it must exclude their mappings
-    // too. The complete admission above still charges them exactly once.
-    projected.facts.driver_page_tables.retain(|table| projected.facts.allocations.iter()
-        .any(|owner| owner.id == table.backing && owner.view.is_none()));
+    projected.facts.allocations.retain(|a| a.view.is_none() && a.location == Location::coordinator(0)
+        && a.lifetime.contains(Phase::PostTargetKv, PhaseOrder::TARGET_THEN_DRAFT));
+    // Project the overhead with its backing: pinned mappings and the
+    // load-only trellis request are still charged by the original plan.
+    let retained = |id: &str| projected.facts.allocations.iter().any(|owner| owner.id == id);
+    projected.facts.driver_page_tables.retain(|table| retained(&table.backing));
+    projected.facts.allocation_granularity.retain_mut(|owner| {
+        owner.backings.retain(|backing| retained(&backing.backing));
+        !owner.backings.is_empty()
+    });
     projected.facts.allowances.retain(|owner| owner.location == Location::coordinator(0));
     projected.facts.reservations.clear();
     projected.facts.sequential.clear();
@@ -192,6 +212,26 @@ mod tests {
             encoder: None, prefill: shape, lanes: 1, spark_reply_formats: None }, pool_tokens: 64, pool_page_rows: 64,
             phases: evaluate(&facts, &budgets).unwrap(), facts, budgets }
     }
+    #[test]
+    fn retained_reconciliation_omits_load_only_trellis_granularity() {
+        let mut plan = fixture();
+        let location = Location::coordinator(0);
+        let load_only = Lifetime { first: Phase::Load, last: Phase::Load };
+        let bytes = cuteafd_loader::shared::dense_read::STEP_BYTES as u64;
+        plan.facts.allocations.push(Allocation::buffer("target.load_trellis", location,
+            bytes, load_only, Category::Staging, "trellis repack"));
+        // Even a page-aligned request has a granularity record in the full plan.
+        plan.facts.allocation_granularity.push(AllocationGranularity {
+            id: "target.load_trellis.tail".into(), location, lifetime: load_only,
+            backings: vec![GranularityBacking { backing: "target.load_trellis".into(), requests: vec![bytes] }],
+            evidence: GranularityEvidence::Forecast,
+        });
+        plan.phases = evaluate(&plan.facts, &plan.budgets).unwrap();
+        let receipt = Receipt { allocation: plan.facts.allocations[0].clone(), address: 0x1000 };
+        let devices = CoordinatorDevices::new(&[0]).unwrap();
+        reconcile_native(&plan, devices, &[receipt]).unwrap();
+    }
+
     #[test]
     fn shared_reconcile_rejects_missing_extra_duplicate_and_wrong_extent() {
         let plan = fixture();

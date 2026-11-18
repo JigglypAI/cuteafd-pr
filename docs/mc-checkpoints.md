@@ -73,6 +73,7 @@ shape (hash values here are illustrative placeholders, not publication data):
 ```json
 {
   "schema": "cuteafd-mc-v1",
+  "required_features": [],
   "source": {"repo": "organization/original", "revision": "pinned-commit"},
   "original_core_dtype": "BF16",
   "shared_inventory_sha256": "<sha256>",
@@ -97,8 +98,15 @@ shape (hash values here are illustrative placeholders, not publication data):
 
 Required variants: `original`, plus one or both of `k8-compact`, `k6-compact`.
 `fp8-compact` is a runtime-derived selector and never a manifest variant.
-Unknown schema versions, fields, variants, duplicate variants/tensor names,
-invalid hashes, unsafe filenames or incomplete views fail closed. Core bits
+Readers ignore unknown fields in the manifest, source and variants, logging their
+names at debug level. Writers and publication validators accept only defined
+fields. Metadata that changes how weights are read must be named in the optional
+top-level `required_features` array of strings (omitted means empty); an engine
+refuses a checkpoint requiring a feature it does not support. No features are
+currently defined. Breaking changes to known fields require a schema bump.
+
+Unknown schema versions or variant names, duplicate variants/tensor names,
+invalid hashes, unsafe filenames and incomplete views still fail closed. Core bits
 are exactly 16, 8 and 6 respectively. FP8-origin declarations fail before any
 shard is opened. `original_core_dtype` is `BF16` (with source-native F32
 router-style kept parts allowed), or `F32` for a source whose core is F32;
@@ -117,10 +125,11 @@ A view fingerprint is SHA256 of the UTF-8 bytes
 `cuteafd-mc-view-v1\0<name>\0<shared_inventory_sha256>\0`, followed by
 `<filename>\0<sha256>\n` for the three metadata files sorted by filename.
 This avoids depending on JSON whitespace or object iteration order for the
-manifest identity, while binding exact selected metadata bytes. The loader's
+per-variant fingerprint, while binding exact selected metadata bytes. The loader's
 full identity additionally hashes the discovery file, selector and FP8 recipe
-when applicable. Source revision and inventories are immutable within a
-published revision.
+when applicable. Adding even advisory metadata changes this full identity, as
+expected for a new revision. Source revision and inventories are immutable
+within a published revision.
 
 ## Validation and publication
 

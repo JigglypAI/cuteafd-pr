@@ -200,10 +200,17 @@ pub fn validate_package_geometry(manifest: &serde_json::Value, input: usize, out
 /// As [`validate_package_geometry`] at an explicit trellis width (K4 MTP stages).
 pub fn validate_package_geometry_bits(manifest: &serde_json::Value, input: usize, output: usize,
     side: usize, bits: usize, codebook: &str, rows: usize, output_dtype: TrellisDType) -> Result<[String; 3]> {
+    validate_package_geometry_bits_with_egress(manifest, input, output, side, bits, codebook, rows, output_dtype, None)
+}
+
+/// Validate an alternate egress for a shared compute geometry.
+pub fn validate_package_geometry_bits_with_egress(manifest: &serde_json::Value, input: usize, output: usize,
+    side: usize, bits: usize, codebook: &str, rows: usize, output_dtype: TrellisDType,
+    egress: Option<&str>) -> Result<[String; 3]> {
     let policy = DenseTrellisPolicy::from_geometry_metadata(&manifest["families"]["dense_trellis_k6"],
         input, output, side, bits, codebook)?;
     policy.validate_rows(rows)?;
-    let names = [policy.native_input, policy.native, policy.output_program];
+    let names = [policy.native_input, policy.native, egress.map(str::to_owned).unwrap_or(policy.output_program)];
     let entries = manifest["programs"].as_array().ok_or(DenseTrellisError::Invalid("program inventory"))?;
     let specs = names.iter().map(|name| -> Result<ProgramSpec> {
         let mut matches = entries.iter().filter(|p| p["name"].as_str() == Some(name));

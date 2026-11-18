@@ -94,7 +94,7 @@ def export_jobs():
     jobs = [("programs", "export_b12x_dsv4_aot.py", [
         "--geometry", ",".join(geometries), "--max-context", "1048576",
         "--decode-rows", "64", "--prefill-rows", "4096", "--context-split", "on",
-        "--dense-trellis-families", "kimik3,glm,glmf,step5,muse,ml4",
+        "--dense-trellis-families", "kimik3,glm,glmf,step5,muse,ml4,inkling2",
         "--exlr8-family", "glm,glmf", "--exlr8-role", "coordinator"])]
     for expert in sorted(experts):
         family, kind = expert.split(":")

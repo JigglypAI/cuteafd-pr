@@ -219,8 +219,56 @@ pub(crate) fn pool_memory(cfg: &Inkling2Config, kv_format: super::InklingKvCache
         crate::placement::PoolMemory { available_bytes, bytes_per_unit: rank_unit_bytes(gpu) }).collect()
 }
 
+/// The one header-derived inventory used both for code preload and admission.
+pub struct SelectedWeights {
+    modes: Vec<crate::placement::LayerMode>,
+    pub targets: Vec<CoordinatorWeights>,
+    pub drafter: Option<(crate::formats::block_dspark::recurrent::RecurrentBlockConfig,
+        Vec<crate::formats::block_dspark::recurrent::loading::RecurrentWeightLayout>, crate::shared::dense_read::MountLoad)>,
+}
+
+impl SelectedWeights {
+    pub fn new(checkpoint: &crate::plan::Checkpoint, cfg: &Inkling2Config, gpus: usize,
+        attention: crate::placement::AttentionPlacement, draft: bool) -> anyhow::Result<Self> {
+        let placement = if gpus == 1 { crate::placement::AttentionPlacement::Heads } else { attention };
+        let modes = shared::layer_modes(cfg, gpus, placement);
+        let targets = CoordinatorWeights::plan(checkpoint, cfg, gpus, &modes)?;
+        let drafter = draft.then(|| super::draft::DraftLayout::select_weights(
+            checkpoint.view.as_ref().context("bundled drafter needs selected checkpoint view")?, gpus)).transpose()?;
+        Ok(Self { modes, targets, drafter })
+    }
+
+    pub fn compact_programs(&self, manifest: &serde_json::Value, rank: usize, prefill_rows: usize)
+        -> anyhow::Result<std::collections::BTreeSet<String>> {
+        let target = self.targets.get(rank).context("Inkling target rank missing")?;
+        let head_rows = shared::DECODE_ROWS as usize;
+        let mut programs = target.trellis_programs(manifest, prefill_rows, head_rows)?;
+        programs.extend(target.fp8_programs(manifest, prefill_rows, head_rows)?.into_keys());
+        if let Some((config, draft, _)) = &self.drafter {
+            let draft = draft.get(rank).context("Inkling drafter rank missing")?;
+            programs.extend(draft.trellis_programs(manifest, super::draft::CONTEXT_ROWS)?);
+            programs.extend(draft.fp8_programs(manifest, super::draft::CONTEXT_ROWS)?.into_keys());
+            if rank == draft.lead {
+                if let Some(stored) = target.stored_head() {
+                    programs.extend(super::draft::fold_programs(config.transformer.hidden,
+                        config.transformer.markov_rank, stored));
+                }
+            }
+        }
+        Ok(programs)
+    }
+}
+
 /// Gather every admitted owner fact into the shared recipe.
 pub fn gather(request: &FactsRequest<'_>) -> Result<InklingInputs, Refused> {
+    let weights = SelectedWeights::new(request.checkpoint, request.cfg, request.coordinator.gpus(),
+        request.attention, request.drafter.is_some()).map_err(|error| refused(
+        format!("Inkling 2 target or drafter arena inventory refused: {error:#}"),
+        "Provide complete core headers for the selected view."))?;
+    gather_with_weights(request, weights)
+}
+
+pub fn gather_with_weights(request: &FactsRequest<'_>, weights: SelectedWeights) -> Result<InklingInputs, Refused> {
     let cfg = request.cfg;
     let gpus = request.coordinator.gpus();
     let ranks = request.spark_ranks;
@@ -235,11 +283,33 @@ pub fn gather(request: &FactsRequest<'_>) -> Result<InklingInputs, Refused> {
     let shape = request.prefill;
     let routed = (0..cfg.layers).collect::<Vec<_>>();
     let placement = if gpus == 1 { crate::placement::AttentionPlacement::Heads } else { request.attention };
-    let modes = shared::layer_modes(cfg, gpus, placement);
-    let targets = CoordinatorWeights::plan(request.checkpoint, cfg, gpus, &modes)
-        .map_err(|error| refused(format!("Inkling 2 target arena inventory refused: {error:#}"),
-            "Provide complete BF16 core headers (every shard of the selected view)."))?;
-    let mount = targets.iter().map(|target| target.mount_load(request.checkpoint)).collect::<anyhow::Result<Vec<_>>>()
+    let program_sets = match (&request.coordinator, request.manifest.as_deref()) {
+        (Coordinator::Planned { .. }, Some(manifest)) => (0..gpus).map(|rank| {
+            let selected = weights.compact_programs(manifest, rank, shape.rows.max(u64::from(shared::DECODE_ROWS)) as usize)?;
+            let mut set = crate::placement::ProgramSet::from_manifest(manifest,
+                &["inkling2", "exlr8", "dense_trellis_k6", "native_attention"]);
+            let keep = |name: &str| !(name.starts_with("dense_trellis_k6_") || name.starts_with("native_attention_"))
+                || selected.contains(name);
+            set.names.retain(|name| keep(name));
+            set.scratch.retain(|(name, _)| keep(name));
+            Ok(set)
+        }).collect::<anyhow::Result<Vec<_>>>().map_err(|error| refused(format!("Inkling compact program inventory refused: {error:#}"),
+            "Install the Inkling native trellis and block-FP8 projection exports."))?,
+        _ => Vec::new(),
+    };
+    let SelectedWeights { modes, targets, drafter } = weights;
+    if targets.len() != gpus || drafter.is_some() != request.drafter.is_some() {
+        return Err(refused("Inkling selected weights differ from launch geometry", "Prepare the selected view for the launch ranks."));
+    }
+    let target_fp8_scratch = targets.iter().map(|target| {
+        if target.core.is_empty() && target.fp8.is_empty() { return Ok(0); }
+        let manifest = request.manifest.as_deref().context("Inkling compact core requires PROGRAMS.json")?;
+        target.trellis_programs(manifest, shape.rows as usize, shared::DECODE_ROWS as usize)?;
+        target.fp8_scratch(manifest,
+            shape.rows as usize, shared::DECODE_ROWS as usize)
+    }).collect::<anyhow::Result<Vec<_>>>().map_err(|error| refused(format!("Inkling compact program inventory refused: {error:#}"),
+        "Install the Inkling native trellis and block-FP8 projection exports."))?;
+    let mut mount = targets.iter().map(|target| target.mount_load(request.checkpoint)).collect::<anyhow::Result<Vec<_>>>()
         .map_err(|error| refused(format!("Inkling 2 mount inventory refused: {error:#}"), "Check checkpoint headers."))?;
     let experts = layer_experts(request.checkpoint, cfg).map_err(|error| refused(
         format!("Inkling 2 routed expert inventory refused: {error:#}"),
@@ -257,15 +327,13 @@ pub fn gather(request: &FactsRequest<'_>) -> Result<InklingInputs, Refused> {
             "Use a Spark world of 2..=8 ranks."))?;
     let links = shared::spark_link((gpus - 1) as u8, ranks, shape, request.replies, ingress)
         .map_err(|error| refused(format!("Inkling 2 Spark transport owners refused: {error}"), "Use a supported unit."))?;
-    let programs = request.manifest.as_ref().map(|manifest|
-        crate::placement::ProgramSet::from_manifest(manifest, &["inkling2", "exlr8"]));
     let mut code = Vec::new();
     let mut graph_reserve = Vec::new();
     for gpu in 0..gpus {
         code.push(match &request.coordinator {
             Coordinator::Planned { .. } => crate::placement::inventory::loaded_code_allowance("inkling2", "experts",
                 gpus == 2, gpu as u8, ArchContext::for_device("sm_120", request.coordinator.physical(gpu)),
-                programs.as_ref()).bytes,
+                program_sets.get(gpu)).bytes,
             // The measured sample follows module loading: only what it has not seen.
             Coordinator::Measured { loaded_code, .. } => loaded_code.get(gpu).copied().unwrap_or(0),
         });
@@ -287,11 +355,8 @@ pub fn gather(request: &FactsRequest<'_>) -> Result<InklingInputs, Refused> {
     let mark_bytes = (0..cfg.layers).map(|layer| shared::SequenceState::new(cfg, cfg.local[layer])
         .map(|state| state.ring_bytes + state.lag_bytes)).sum::<Result<u64, _>>()
         .map_err(|error| refused(format!("Inkling 2 sequence state refused: {error}"), "Check the window geometry."))?;
-    let draft_mark = request.drafter.map(|selection| {
-        let view=request.checkpoint.view.as_ref().context("bundled drafter needs selected checkpoint view")?;
-        let config=crate::formats::block_dspark::recurrent::RecurrentBlockConfig::from_hf(&view.config()?)?;
-        config.window_mark_bytes(selection.kv_cache,gpus-1,gpus,gpus-1)
-    }).transpose().map_err(|error|refused(format!("drafter mark inventory refused: {error:#}"),"Check bundled MTP config."))?.unwrap_or(0) as u64;
+    let draft_mark = request.drafter.zip(drafter.as_ref()).map(|(selection, (config, _, _))|
+        config.window_mark_bytes(selection.kv_cache,gpus-1,gpus,gpus-1)).transpose().map_err(|error|refused(format!("drafter mark inventory refused: {error:#}"),"Check bundled MTP config."))?.unwrap_or(0) as u64;
     let host_prefix = if request.host_cache_bytes == Some(0) || request.prefix_entries == 0 {
         serving::HostPrefixOwners { quota_bytes: 0, chunk_bytes: 0 }
     } else {
@@ -309,16 +374,12 @@ pub fn gather(request: &FactsRequest<'_>) -> Result<InklingInputs, Refused> {
         Err(error) => return Err(refused(format!("Inkling checkpoint namespace refused: {error}"),
             "Restore SparkNest namespace metadata; required push cannot fall back to mount.")),
     };
-    let push_host = (0..=routed.len()).map(|count| {
-        if !push_required { return Ok(None); }
-        let backings = match &local {
-            LocalPackage::Installed { backings } => backings[count].as_slice(),
-            LocalPackage::Missing(_) if count == 0 => &[],
-            LocalPackage::Missing(_) => return Ok(None),
-        };
-        super::weight_layout::push_host_envelope(&catalog, backings, gpus).map(Some)
-    }).collect::<anyhow::Result<Vec<_>>>().map_err(|error| refused(format!("Inkling push host inventory refused: {error:#}"),
-        "Provide complete native push source/descriptor headers."))?;
+    if !push_required {
+        if let Some((_, _, draft_mount)) = &drafter {
+            // Target and recurrent-body mount readers are serialized.
+            for rank in &mut mount { rank.merge(*draft_mount); }
+        }
+    }
     let capacities = (0..gpus).map(|gpu| request.coordinator.budget(gpu).logical_bytes).collect::<Vec<_>>();
     let mut pool_facts = crate::placement::PoolFacts::new(Context::resolve(context, (request.context_tokens > 0).then_some(request.context_tokens)), request.pool_tokens, page_rows);
     pool_facts.memory = pool_memory(cfg, request.kv_format, &modes, page_rows, &capacities);
@@ -331,17 +392,48 @@ pub fn gather(request: &FactsRequest<'_>) -> Result<InklingInputs, Refused> {
     let prefix_mark_slots=super::draft::prefix_mark_slots(request.sequences,request.prefix_entries,
         mark_bytes,draft_mark,request.prefix_mark_budget,host_prefix.quota_bytes>0)
         .map_err(|error|refused(format!("Inkling prefix slots refused: {error:#}"),"Check combined mark extent."))?;
-    let drafter=request.drafter.map(|selection| {
-        let view=request.checkpoint.view.as_ref().context("bundled drafter needs selected checkpoint view")?;
-        super::draft::DraftLayout::new(view,gpus,usize::try_from(request.sequences)?,
+    let drafter=request.drafter.zip(drafter).map(|(selection, (config, weights, _))| {
+        super::draft::DraftLayout::from_weights(config,weights,usize::try_from(request.sequences)?,
             usize::try_from(request.sequences)?.min(8),usize::try_from(context)?,usize::try_from(pool.maximum_tokens())?,
-            usize::try_from(shape.rows)?,usize::try_from(shape.waves)?,selection.sms,selection.kv_cache)
+            usize::try_from(shape.rows)?,usize::try_from(shape.waves)?,selection.sms,selection.kv_cache,request.manifest.as_deref())
             .map(|layout|shared::Drafter{layout})
     }).transpose().map_err(|error|refused(format!("bundled drafter inventory refused: {error:#}"),"Check MTP tensor headers and exports."))?;
+    let dense_push_bytes = targets.iter().enumerate().map(|(rank, target)| {
+        let draft = drafter.as_ref().map(|draft| &draft.layout.weights[rank]);
+        let trellis_window = target.core.values().chain(draft.into_iter().flat_map(|d| d.core.values()))
+            .map(|layout| {
+                let tile_row = layout.shape[0] / 16 * 32 * layout.bits;
+                tile_row * (cuteafd_ffi::push_ring::DEFAULT_SLOT_BYTES / tile_row).max(1)
+            }).max().unwrap_or(0);
+        let fp8_window = target.fp8.values().chain(draft.into_iter().flat_map(|d| d.fp8.values()))
+            .map(|layout| {
+                let block = layout.shape[1] * 2 * 128;
+                block * (cuteafd_ffi::push_ring::DEFAULT_SLOT_BYTES / block).max(1)
+            }).max().unwrap_or(0);
+        let largest = trellis_window.max(fp8_window);
+        if largest == 0 { return Ok(0); }
+        // The target and drafter land from the same ordered source. In
+        // particular, MTP down has wider BF16 source rows than any target role.
+        crate::push_load::admitted_push_envelope(largest as u64, cuteafd_ffi::push_ring::DEFAULT_SLOTS,
+            cuteafd_ffi::push_ring::DEFAULT_SLOT_BYTES as u64)
+    }).collect::<Result<Vec<_>, _>>().map_err(|error| refused(
+        format!("Inkling compact push staging refused: {error:#}"), "Check the selected projection geometry."))?;
+    let push_host = (0..=routed.len()).map(|count| {
+        if !push_required { return Ok(None); }
+        let backings = match &local {
+            LocalPackage::Installed { backings } => backings[count].as_slice(),
+            LocalPackage::Missing(_) if count == 0 => &[],
+            LocalPackage::Missing(_) => return Ok(None),
+        };
+        let mut envelope = super::weight_layout::push_host_envelope(&catalog, backings, gpus)?;
+        for (gpu, &bytes) in dense_push_bytes.iter().enumerate() { envelope.dense_bytes[gpu] = bytes; }
+        Ok(Some(envelope))
+    }).collect::<anyhow::Result<Vec<_>>>().map_err(|error| refused(format!("Inkling push host inventory refused: {error:#}"),
+        "Provide complete native push source/descriptor headers."))?;
     Ok(InklingInputs { cfg: cfg.clone(), kv_format: request.kv_format, gpus, spark_ranks: ranks,
         context: Context::resolve(context, (request.context_tokens > 0).then_some(request.context_tokens)),
         pool, prefill: shape, sequences: request.sequences, prefix_entries: request.prefix_entries,
-        prefix_mark_budget: request.prefix_mark_budget, prefix_mark_slots, targets, placement, modes,
+        prefix_mark_budget: request.prefix_mark_budget, prefix_mark_slots, targets, target_fp8_scratch, placement, modes,
         routed: routed.clone(), experts, local, spark, links,
         spark_reply_formats: request.replies, drafter, vision, budgets, code, graph_reserve,
         head: request.head, host_prefix, device_sampling: true,

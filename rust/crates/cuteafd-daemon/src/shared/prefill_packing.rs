@@ -21,6 +21,23 @@ impl PackingMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ProgramRows { PackedRows, SequenceLocal }
 
+pub(crate) const TRELLIS_EGRESS_PREFIX: &str = "dense_trellis_k6_trellis_output_n";
+
+/// Standalone trellis egress rotates and scales each row independently.
+/// Alternate output dtypes may be exported without a matching row policy.
+pub(crate) fn shared_trellis_egress_role(name: &str, geometry: &serde_json::Value) -> Option<ProgramRows> {
+    let (width, dtype) = name.strip_prefix(TRELLIS_EGRESS_PREFIX)?.split_once('_')?;
+    let width = width.parse::<u64>().ok()?;
+    if width == 0 || width % 128 != 0 || !matches!(dtype, "bf16" | "f32")
+        || geometry["features"].as_u64() != Some(width)
+        || geometry["output_dtype"].as_str() != Some(dtype)
+        || geometry.get("groups").is_some()
+    {
+        return None;
+    }
+    Some(ProgramRows::PackedRows)
+}
+
 /// Intersect the first arithmetic routes published by all packed-row programs.
 /// Missing/invalid metadata is not evidence of row invariance: run alone.
 pub(crate) fn coordinator_row_cap<'a>(programs: &cuteafd_ffi::programs::Programs<'_>,

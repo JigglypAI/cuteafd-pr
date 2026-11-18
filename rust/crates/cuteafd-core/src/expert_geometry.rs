@@ -534,13 +534,28 @@ pub fn set_expert_geometry(geometry: ExpertGeometry) -> Result<(), ExpertGeometr
     }
 }
 
-/// The process geometry (DeepSeek V4.1 unless set at startup).
+/// Geometry used by legacy V4.1 callers that do not select one. A read must
+/// not prevent a subsequent startup from explicitly choosing its geometry.
 pub fn expert_geometry() -> ExpertGeometry {
-    *GEOMETRY.get_or_init(|| ExpertGeometry::DEEPSEEK_V41)
+    expert_geometry_or_v41(&GEOMETRY)
+}
+
+fn expert_geometry_or_v41(selection: &OnceLock<ExpertGeometry>) -> ExpertGeometry {
+    selection.get().copied().unwrap_or(ExpertGeometry::DEEPSEEK_V41)
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn legacy_geometry_read_does_not_claim_the_process_slot() {
+        use super::{expert_geometry_or_v41, ExpertGeometry};
+        let selection = std::sync::OnceLock::new();
+        assert_eq!(expert_geometry_or_v41(&selection), ExpertGeometry::DEEPSEEK_V41);
+        assert!(selection.get().is_none());
+        selection.set(ExpertGeometry::INKLING2).unwrap();
+        assert_eq!(expert_geometry_or_v41(&selection), ExpertGeometry::INKLING2);
+    }
+
     #[test]
     fn runtime_detail_accepts_old_missing_and_future_optional_fields() {
         use super::SparkRuntimeDetail;
