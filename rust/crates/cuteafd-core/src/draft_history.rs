@@ -1021,10 +1021,26 @@ mod tests {
         // Three anchors plus five drafts: the explores (lowest probability) go first.
         assert_eq!(policy.plan(&requests, 8), [4, 1, 0]);
         policy.observe(&[outcome(1, 4, 4), outcome(2, 1, 1), outcome(3, 0, 0)], false);
-        // Three drafts: request 2's first position outranks request 1's second.
-        let p = |policy: &DraftHistory, id, position| policy.probability(id, position);
-        assert!(p(&policy, 2, 0) > p(&policy, 1, 1) && p(&policy, 1, 1) > p(&policy, 2, 1));
-        assert_eq!(policy.plan(&requests, 6), [2, 1, 0]);
+        // Allocate by probability, not a fixture-specific cross-position rank.
+        let mut unbounded = policy.clone();
+        let wanted = unbounded.plan(&requests, 64);
+        let granted = policy.plan(&requests, 6);
+        assert_eq!(granted.iter().sum::<usize>(), 3);
+        let mut selected = Vec::new();
+        let mut refused = Vec::new();
+        for ((&(id, _), &wanted), &granted) in requests.iter().zip(&wanted).zip(&granted) {
+            assert!(granted <= wanted, "each request must retain a prefix");
+            for position in 0..wanted {
+                let probability = unbounded.probability(id, position);
+                if position < granted { selected.push(probability); }
+                else { refused.push(probability); }
+            }
+        }
+        for &accepted in &selected {
+            for &rejected in &refused {
+                assert!(accepted >= rejected, "granted p={accepted} below refused p={rejected}");
+            }
+        }
         let cut = policy.stats().budget_cut;
         assert!(cut >= 4);
         policy.observe(&[outcome(1, 2, 2), outcome(2, 1, 1), outcome(3, 0, 0)], false);
