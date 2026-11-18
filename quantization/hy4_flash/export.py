@@ -68,6 +68,26 @@ def view_metadata(document, inventory, selection, experts, identity, *, k6_draft
     return configs, quantizes
 
 
+def verify_original_discovery(output, expected_mapping):
+    """Run the pinned Transformers default discovery without loading weights."""
+    from transformers import AutoConfig
+    from transformers.modeling_utils import _get_resolved_checkpoint_files
+
+    output = Path(output)
+    config = AutoConfig.from_pretrained(output, local_files_only=True)
+    files, metadata = _get_resolved_checkpoint_files(
+        output, variant=None, gguf_file=None, use_safetensors=True,
+        user_agent=None, is_remote_code=False, download_kwargs={"local_files_only": True})
+    if (config.model_type != "hy_v4_flash" or not metadata
+            or metadata["weight_map"] != expected_mapping
+            or {Path(path) for path in files} != {output / shard for shard in expected_mapping.values()}
+            or not all(Path(path).is_file() for path in files)):
+        raise ValueError("Transformers default discovery differs from verified Hy4 original headers")
+    return dict(status="passed", scope="default config, index and sealed header inventory",
+                reference_revision=recipe.REFERENCE_REVISION,
+                config_type=type(config).__name__, shards=len(files), tensors=len(expected_mapping))
+
+
 def model_card(path, engram, *, k6_drafter_bits, selection):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)

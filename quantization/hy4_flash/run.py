@@ -17,7 +17,7 @@ import torch.nn.functional as F
 from inkling2 import numerical
 from kimi_k3.uniform_k2.storage import atomic_json, fsync_directory, verify_receipt
 from . import recipe
-from .export import DirectMCWriter
+from .export import DirectMCWriter, verify_original_discovery
 from .forward import AttentionTap, Drafter, Layer, Model, Reader, native_projection, recalled_context, reference
 from .prepare_corpus import load_token_batches
 from .source import HeaderSource
@@ -695,6 +695,8 @@ class Runner:
         result = self.writer.finalize(core_selection=self.core, engram=tables, document=self.header.document,
                                       error_csv=error_csv, card_path=self.root / "README.md",
                                       k6_drafter_bits=self.policy["k6_drafter_bits"])
+        state = read_json(self.output / "package-state.json")
+        discovery = verify_original_discovery(self.output, state["direct_expected_mappings"]["original"])
         complete = dict(status="passed", identity=self.identity, output=str(self.output),
                         revision=recipe.BASE_REVISION, repository=recipe.TARGET_REPO,
                         completed_target_layers=recipe.LAYER_COUNT,
@@ -702,7 +704,7 @@ class Runner:
                         completed_encodes=self.total, error_csv=str(error_csv),
                         task_intermediates=[str(self.stages.root)],
                         package_validation=str(self.output / "package-validation.json"),
-                        package_status=result["status"])
+                        package_status=result["status"], original_discovery=discovery)
         atomic_json(self.root / "numerical-complete.json", complete)
         atomic_json(self.root / "status.json", dict(self.progress.base, status="passed",
                     phase="numerical_complete", updated_at=datetime.now(timezone.utc).isoformat()))
