@@ -283,6 +283,7 @@ def seed_checkpoint_metadata(hf):
     aliases = {
         "wrldsuksgo2mars/GLM-5.3-EXL3-K4-MC": GLM5,
         "wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K4-MC": GLMF,
+        "wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K3.25-MC": GLMF,
         "wrldsuksgo2mars/Step-5-Preview-EXL3-K4-MC": {"model_type": "step5_vl", "text_config": {
             "model_type": "step5", "num_hidden_layers": 92, "moe_layer_list": list(range(3, 91))}},
         "wrldsuksgo2mars/Muse-Spark-Open-EXL3-K4-MC": {"model_type": "muse_spark", "text_config": {
