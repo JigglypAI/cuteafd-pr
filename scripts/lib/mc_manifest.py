@@ -10,6 +10,7 @@ from pathlib import Path
 
 SCHEMA = "cuteafd-mc-v1"
 MANIFEST = "cuteafd-mc.json"
+SUPPORTED_FEATURES: frozenset[str] = frozenset()
 MAX_JSON_BYTES = 512 * 1024 * 1024
 FILES = {
     "original": ("model.safetensors.index.json", "config.json", "quantize_config.json", 16),
@@ -31,8 +32,10 @@ def _digest(value):
     return isinstance(value, str) and len(value) == 64 and all(c in "0123456789abcdef" for c in value)
 
 
-def _fields(value, expected):
-    _require(isinstance(value, dict) and value.keys() == set(expected), f"expected fields {sorted(expected)}")
+def _fields(value, expected, *, optional=()):
+    expected = set(expected)
+    _require(isinstance(value, dict) and expected <= value.keys() <= expected.union(optional),
+             f"expected fields {sorted(expected)}" + (f" with optional fields {sorted(optional)}" if optional else ""))
 
 
 def shared_inventory_digest(weight_map, core_tensors):
@@ -67,8 +70,14 @@ def _read(root, name):
 
 def validate(manifest, root=None, view=None):
     """Validate schema and optionally selected (or all) view metadata on disk."""
-    _fields(manifest, ("schema", "source", "original_core_dtype", "shared_inventory_sha256", "variants"))
+    _fields(manifest, ("schema", "source", "original_core_dtype", "shared_inventory_sha256", "variants"),
+            optional=("required_features",))
     _require(manifest["schema"] == SCHEMA, "unsupported MC schema")
+    features = manifest.get("required_features", [])
+    _require(isinstance(features, list) and all(isinstance(f, str) for f in features),
+             "MC required_features must be a list of strings")
+    for feature in features:
+        _require(feature in SUPPORTED_FEATURES, f"unsupported MC feature {feature!r}")
     _fields(manifest["source"], ("repo", "revision"))
     _require(all(_text(v) for v in manifest["source"].values()), "MC requires pinned source")
     _require(manifest["original_core_dtype"] in ("BF16", "F32"), "FP8-origin checkpoints must not be MC")
@@ -106,7 +115,7 @@ def validate(manifest, root=None, view=None):
     return manifest
 
 
-def build(root, *, source_repo, source_revision, core_tensors, original_core_dtype="BF16"):
+def build(root, *, source_repo, source_revision, core_tensors, original_core_dtype="BF16", required_features=None):
     """Build discovery metadata from sealed view files and their core name lists.
 
     Does not write or publish anything. `core_tensors` maps variant names to all
@@ -128,6 +137,8 @@ def build(root, *, source_repo, source_revision, core_tensors, original_core_dty
                              fingerprint=view_fingerprint(name, digest, hashes)))
     manifest = dict(schema=SCHEMA, source=dict(repo=source_repo, revision=source_revision),
                     original_core_dtype=original_core_dtype, shared_inventory_sha256=shared, variants=variants)
+    if required_features is not None:
+        manifest["required_features"] = required_features
     validate(manifest, root)
     _require(len(json.dumps(manifest).encode()) <= MAX_JSON_BYTES, "MC manifest exceeds metadata limit")
     return manifest
