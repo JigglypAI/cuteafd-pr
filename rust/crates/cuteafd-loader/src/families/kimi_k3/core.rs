@@ -549,7 +549,7 @@ impl CoreInventory {
             let stems = attention.iter().map(|leaf| format!("{root}.self_attn.{leaf}")).collect::<Vec<_>>();
             let staged = stems.iter().any(|stem| self.projections.contains_key(stem) || self.native.contains_key(stem));
             ensure!(!staged || stems.iter().all(|stem| self.projections.contains_key(stem) || self.native.contains_key(stem)),
-                "Kimi attention group lacks a validated per-projection K6/BF16 operand: {root}.self_attn");
+                "Kimi attention group lacks a validated per-projection operand: {root}.self_attn");
             let ffn = if cfg.dense[layer] { format!("{root}.mlp") } else { format!("{root}.block_sparse_moe.shared_experts") };
             self.complete_group(if cfg.dense[layer] { "dense FFN" } else { "shared FFN" },
                 ["gate_proj","up_proj","down_proj"].iter().map(|leaf|format!("{ffn}.{leaf}")))?;
@@ -563,7 +563,7 @@ impl CoreInventory {
     fn complete_group(&self,group:&str,stems:impl IntoIterator<Item=String>)->Result<()> {
         let (native,bf16):(Vec<_>,Vec<_>)=stems.into_iter().partition(|stem|self.get_weight(stem).is_some() || self.native.contains_key(stem));
         ensure!(native.is_empty() || bf16.is_empty(),
-            "Kimi {group} mixes per-tensor K6/BF16 storage; only whole-group fallback is supported; K6: {}; BF16: {}",
+            "Kimi {group} mixes staged and fused storage; only whole-group fallback is supported; staged: {}; BF16: {}",
             native.join(", "),bf16.join(", "));
         Ok(())
     }

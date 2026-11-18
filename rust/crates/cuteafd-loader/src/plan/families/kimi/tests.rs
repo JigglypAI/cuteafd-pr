@@ -937,6 +937,54 @@ fn k31_native_indexer_headers_are_required_and_never_core_quantized() -> Result<
 }
 
 #[test]
+#[ignore = "requires the published Kimi K3.1 MC and candidate FP8 placement inputs"]
+fn installed_k31_fp8_compact_exports_cover_tp1_and_tp2() -> Result<()> {
+    use crate::plan::checkpoint::{CheckpointView, CoreView};
+    use crate::placement::inventory::ProgramsManifest;
+    use crate::families::kimi_k3::weight_layout::{coordinator_arena, GlobalLayout, LayerLayout};
+    use crate::placement::{FfnMode, LayerMode};
+    let hf = std::path::PathBuf::from(std::env::var_os("CUTEAFD_DEPLOYMENT_TEST_HF_HOME")
+        .context("Kimi FP8 check requires CUTEAFD_DEPLOYMENT_TEST_HF_HOME")?);
+    let snapshot = crate::model_cache_dir(&hf, "wrldsuksgo2mars/Kimi-K3.1-Pro-EXL3-K2-MC")
+        .join("snapshots/1455b31b0acc53f36df916864fb541d9f536b3f8");
+    let path = std::env::var_os("CUTEAFD_DEPLOYMENT_TEST_PROGRAMS")
+        .context("Kimi FP8 check requires CUTEAFD_DEPLOYMENT_TEST_PROGRAMS")?;
+    let package: Value = serde_json::from_slice(&std::fs::read(path)?)?;
+    let programs = ProgramsManifest::from_manifest(&package)?;
+    let view = CheckpointView::select(&snapshot, CoreView::Fp8Compact)?;
+    let checkpoint = Checkpoint::open_view(&view)?;
+    let model = Model::open(&checkpoint)?;
+    let cfg = model.cfg();
+    let compact = &model.core;
+    assert_eq!(view.fp8_tensors().len(), 926);
+    assert_eq!(compact.native.len(), view.fp8_tensors().len());
+    assert!(compact.projections.is_empty());
+    assert!(compact.native.keys().all(|stem| !stem.contains(".indexer.") && !stem.contains(".mlp.")));
+    for ranks in [1, 2] {
+        for unit in [64, 2752] { compact.native_programs(unit, ranks, Some(&programs))?; }
+        let globals = GlobalLayout::ranks_with_core(cfg, compact, ranks)?;
+        let mode = if ranks == 1 { LayerMode::Whole { gpu: 0, ffn: FfnMode::Owner } }
+            else { LayerMode::HeadSplit };
+        let layers = (0..cfg.layers).map(|layer| LayerLayout::ranks_with_core(cfg, layer, mode, compact, ranks))
+            .collect::<Result<Vec<_>>>()?;
+        for (rank, global) in globals.iter().enumerate() {
+            let bodies = layers.iter().map(|layer| &layer[rank]).collect::<Vec<_>>();
+            let arena = coordinator_arena(rank, global, &bodies)?;
+            assert_eq!(arena.view("global.head.values").is_some(), rank == ranks - 1);
+            assert_eq!(arena.view("global.head.scales").is_some(), rank == ranks - 1);
+            assert!(arena.view("global.head").is_none());
+            assert!(bodies[0].operands.contains_key("ffn.gate_up"));
+            assert!(bodies[1].native.contains_key("ffn.down"));
+            let mla = cfg.attention.iter().position(|&kind| kind == KimiAttention::Mla).unwrap();
+            assert_eq!(bodies[mla].native["mla.kv_a"].shape, [640, cfg.hidden]);
+            assert!(bodies[mla].operands.contains_key("mla.indexer.kw"));
+            assert_eq!(bodies[1].allocation_extents(None)?.iter().sum::<u64>(), bodies[1].bytes()? as u64);
+        }
+    }
+    Ok(())
+}
+
+#[test]
 fn k31_qualified_cores_charge_index_records_once_and_unlock_serve() -> Result<()> {
     use crate::families::kimi_k3::config::KimiK3Config;
     use cuteafd_core::memory_layout::{Category, DeviceKind};

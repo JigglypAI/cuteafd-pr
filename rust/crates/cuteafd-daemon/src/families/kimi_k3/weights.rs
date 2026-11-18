@@ -145,8 +145,9 @@ impl GlobalWeights<'_> {
             [&weights.payload,&weights.suh,&weights.svh])).all(|allocation| allocation.device.id == device.id
             && std::ptr::eq(allocation.device.library, device.library)), "Kimi global weight owner differs from IO device");
         if let Some(head) = &self.fp8_head {
-            ensure!(head.values.buffer.device_id == device.id
-                && head.scales.as_ref().is_some_and(|scales| scales.buffer.device_id == device.id),
+            ensure!(head.values.buffer.device_id == device.id && std::ptr::eq(head.values.library, device.library)
+                && head.scales.as_ref().is_some_and(|scales| scales.buffer.device_id == device.id
+                    && std::ptr::eq(scales.library, device.library)),
                 "Kimi FP8 head differs from IO device");
         }
         Ok(())
@@ -212,12 +213,7 @@ impl LayerLayout {
     }
 
     pub(super) fn attention_bytes(&self) -> Result<usize> {
-        let base = self.operands.iter().filter(|(name, _)| name.starts_with("mla.") || name.starts_with("kda."))
-            .map(|(_, bytes)| *bytes).chain(self.core.iter().filter(|(name, _)|
-                name.starts_with("mla.") || name.starts_with("kda.")).map(|(_, layout)| layout.bytes))
-            .try_fold(0usize, |n, bytes| n.checked_add(bytes).context("Kimi attention extent overflow"))?;
-        self.native.values().try_fold(base, |sum, layout| sum.checked_add(usize::try_from(layout.bytes()?)?)
-            .context("Kimi native attention extent overflow"))
+        self.shared_layout().attention_bytes()
     }
 
     fn check(&self, packed: &PackedLayer) -> Result<()> {

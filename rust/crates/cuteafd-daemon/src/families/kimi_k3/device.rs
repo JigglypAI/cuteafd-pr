@@ -3954,7 +3954,7 @@ mod tests {
         }
         // The captured helper functions propagate the caller's lane stream;
         // exchange reduction touches only the retained, non-arena meet planes.
-        let source = include_str!("core_runtime.rs").split("#[cfg(test)]").next().unwrap();
+        let source = include_str!("core_runtime.rs");
         let projected = source.split("pub(crate) fn kda_projected").nth(1).unwrap()
             .split("pub(crate) struct CorePrograms").next().unwrap();
         assert!(!projected.contains("Stream::new") && !projected.contains("peer.stream"));

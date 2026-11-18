@@ -5,8 +5,6 @@ use cuteafd_ffi::{CuteafdDeviceBuffer as Buffer,programs::Programs,
     dense_trellis::{TrellisDType,
         GroupedMember,GroupedPolicy,GroupedTrellis},
     KimiKdaCore,KimiKdaCoreBatch,KimiKdaCoreWeights,KimiMlaSplit,KimiSitu,Bf16F32Add,F32Bf16Narrow,V41PeerCopy};
-#[cfg(test)]
-use cuteafd_ffi::KimiMlaRankBatch;
 use std::collections::BTreeMap;
 use std::ffi::c_void;
 
@@ -49,7 +47,7 @@ pub(crate) fn kda_projected(core:&KimiKdaCore<'_>,projections:[Projected<'_,'_>;
 /// Stored kv_a N640 is transformed in full; the split norm consumes its N576 prefix.
 #[cfg(test)]
 pub(crate) fn mla_rank_projected(core:&KimiMlaSplit<'_>,qa:Projected<'_,'_>,kv:Projected<'_,'_>,input:Buffer,
-    batch:KimiMlaRankBatch,stream:*mut c_void)->Result<()> {
+    batch:cuteafd_ffi::KimiMlaRankBatch,stream:*mut c_void)->Result<()> {
     qa.run(batch.rows,input,batch.q_a,stream)?;kv.run(batch.rows,input,batch.kv_a,stream)?;
     core.rank_norm(batch,stream)?;Ok(())
 }
@@ -160,8 +158,9 @@ impl<'a> CorePrograms<'a> {
             }else{layouts[head_rank]=Some(required);}
             projections.insert(key,projection);
         }
-        let planned=cuteafd_loader::families::kimi_k3::core::projection_scratch_for_ranks(cfg,inventory,rows,
-            programs.family_metadata("dense_trellis_k6")?,ranks)?;
+        let planned = if inventory.projections.is_empty() { vec![None; ranks] }
+            else { cuteafd_loader::families::kimi_k3::core::projection_scratch_for_ranks(cfg, inventory, rows,
+                programs.family_metadata("dense_trellis_k6")?, ranks)? };
         for rank in 0..ranks {
             ensure!(layouts[rank].as_ref().map(|p|(&p.extents,p.rows))
                 ==planned[rank].as_ref().map(|p|(&p.extents,p.rows)),
