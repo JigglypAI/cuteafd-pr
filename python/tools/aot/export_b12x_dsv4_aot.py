@@ -22,6 +22,7 @@ _sys.path[:0] = [str(_Path(__file__).resolve().parents[1] / _d) for _d in ("lib"
 
 import argparse
 import dataclasses
+import functools
 import hashlib
 import json
 import os
@@ -2145,6 +2146,28 @@ def main() -> None:
             if suffix not in existing:
                 work.append(("draft_bf16", suffix, "bf16_projection", {"max_rows": 4096},
                              lambda k=k, n=n: compile_draft_bf16_projection(k, n, "f32")))
+    # Append precision alternates without changing the shipped FP8 recipes or indices.
+    for family, suffix, op, params, _ in tuple(work):
+        if op != "sparse_mla" or family not in ("glm", "glm2", "glmf", "glmf2", "dsv4f", "dsv4f2", "dsv4p", "dsv4p2"):
+            continue
+        if selected is not None and f"{suffix}_bf16" not in selected:
+            continue
+        if family.startswith("dsv4"):
+            from b12x.integration.cuteafd import dsv4_sparse_mla as v4_mla
+            g = {"dsv4f": FLASH, "dsv4p": PRO,
+                 "dsv4f2": dsv4_half["flash2"], "dsv4p2": dsv4_half["pro2"]}[family]
+            compile_ = functools.partial(v4_mla.compile_dsv4_sparse_mla_aot, g, route=params["route"],
+                max_rows=params["max_rows"], indexed_width=params["indexed_width"],
+                indexed_page_rows=params["indexed_page_rows"], precision="bf16")
+        else:
+            from b12x.integration.cuteafd import glm_sparse_mla as glm_mla
+            g = {"glm": GLM53, "glm2": glm2, "glmf": GLM53_FLASH, "glmf2": glmf2}[family]
+            flash = family.startswith("glmf")
+            compile_ = functools.partial(glm_mla.compile_glm_sparse_mla_aot, g, route=params["route"],
+                max_rows=params["max_rows"], name="glmf_sparse_mla" if flash else "glm_sparse_mla",
+                fp32_partials=flash and params["route"] == "decode",
+                plan_capacity_rows=params.get("plan_capacity_rows"), precision="bf16")
+        work.append((family, f"{suffix}_bf16", op, {**params, "attention_precision": "bf16"}, compile_))
     print(f"program worklist setup: {time.monotonic() - setup_started:.6f} seconds", flush=True)
     if globals().get("_catalog_only"):
         catalog = []

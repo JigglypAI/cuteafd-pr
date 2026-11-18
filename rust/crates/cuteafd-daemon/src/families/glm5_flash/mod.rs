@@ -2260,7 +2260,10 @@ impl Opened {
         // m64 and m128 are execution capacities of one numerical domain.
         let attention_plan = cuteafd_core::coordinator_programs::AttentionReductionPlan::new(
             engine::DECODE_ROWS, active_drafts, args.attention_plan_rows)?;
-        let programs = self.library.programs()?.with_manifest(&args.manifest)?.with_attention_plan(
+        let programs = self.library.programs()?.with_manifest(&args.manifest)?
+            .with_sparse_mla_precision(args.attention.attention_precision, |name| glmf_startup_program(
+                name, args.split_device.is_some(), args.decode_rows > engine::DECODE_ROWS))?
+            .with_attention_plan(
             attention_plan, |name| glmf_startup_program(name, args.split_device.is_some(),
                 args.decode_rows > engine::DECODE_ROWS))?;
         programs.capacities().require_context("glm5_flash", args.max_context)?;

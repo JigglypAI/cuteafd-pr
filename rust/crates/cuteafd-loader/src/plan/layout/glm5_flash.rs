@@ -115,6 +115,8 @@ fn layout_with_native(report: &mut PlanReport, model: &dyn super::super::FamilyM
         let sms = options.physical_sms.unwrap_or(placement::ArchContext::coordinator(options.rtx_bytes[0], None).sms);
         let selected_manifest = manifest.map(|manifest| -> anyhow::Result<_> {
             let mut selected = manifest.clone();
+            cuteafd_core::attention::select_sparse_mla_manifest(&mut selected,
+                report.attention_precision.as_ref().map(|precision| precision.mode).unwrap_or_default());
             cuteafd_core::coordinator_programs::select_card_plans(&mut selected, sms)?;
             cuteafd_core::coordinator_programs::select_core_view_plans(&mut selected, attention_plan,
                 |name| (name.starts_with("glmf_") && (decode_rows > 64 || !name.ends_with("_m128")))
