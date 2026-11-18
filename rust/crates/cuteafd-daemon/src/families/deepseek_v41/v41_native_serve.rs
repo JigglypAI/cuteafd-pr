@@ -935,6 +935,19 @@ impl PrefillShape {
 #[error("teacher-forced scoring finished")]
 pub(crate) struct ScoringDone;
 
+/// The request's client left, observed at a drained boundary: no expert wave
+/// of this request is in flight on any link (every call before it landed all
+/// its waves and drained), so only the request's own owners are released and
+/// no transport is reset. A disconnect inside a call is observed once that call
+/// completes; it never aborts the call (see `prefill_target::V41PrefillStep`).
+///
+/// The Display text is byte-identical to the untyped string these sites raised
+/// before, so the log line `native request admission failed error=client
+/// disconnected` and the client-facing message do not move.
+#[derive(Debug, thiserror::Error)]
+#[error("client disconnected")]
+pub(crate) struct ClientGone;
+
 /// Rows per teacher-forced scoring chunk: the smallest target-head wave capacity.
 const SCORING_ROWS: usize = 48;
 
@@ -1042,7 +1055,8 @@ fn score<'a, P: PrefillTarget<'a>, C: DraftChain<'a>>(lib: &'a NativeLibrary, ru
     probe.row(from, &first.logits()?);
     for step in plan.steps(from, tokens.len()) {
         scheduler::stall::tick();
-        ensure!(!job.events.is_closed(), "client disconnected");
+        // The previous step committed: a drained boundary.
+        ensure!(!job.events.is_closed(), ClientGone);
         let chunk = &tokens[step.clone()];
         let selected = plan.head_rows(probe, &step)?;
         let mut batch = requests.prepare(&[RequestTokens { lease, tokens: chunk,
@@ -1285,7 +1299,8 @@ fn prefill_continuation<'a, P: PrefillTarget<'a>, C: DraftChain<'a>>(lib: &'a Na
     let mut anchor = None;
     let count = tokens.len().div_ceil(chunk_rows);
     for (index, chunk) in tokens.chunks(chunk_rows).enumerate() {
-        ensure!(!job.events.is_closed(), "client disconnected");
+        // The previous chunk committed (or none ran): a drained boundary.
+        ensure!(!job.events.is_closed(), ClientGone);
         prefill_hold(hold);
         let started = Instant::now();
         let mut batch = requests.prepare(&[RequestTokens { lease, tokens: chunk,
@@ -1294,7 +1309,6 @@ fn prefill_continuation<'a, P: PrefillTarget<'a>, C: DraftChain<'a>>(lib: &'a Na
             let bytes = runtime.block_on(unsafe { pass.prefill_logits(lib, requests, &mut batch, transport,
                 &[chunk.len() - 1], None) })?;
             let scores = RetainedScores::new(scores::VOCAB, bytes)?;
-            ensure!(!job.events.is_closed(), "client disconnected");
             runtime.block_on(pass.commit_prefill(requests, &mut batch, draft.as_deref_mut(), chunk.len() as u32))?;
             Ok(scores)
         })();
@@ -1303,6 +1317,9 @@ fn prefill_continuation<'a, P: PrefillTarget<'a>, C: DraftChain<'a>>(lib: &'a Na
         console::totals::prefill(chunk.len());
         console::Prefill::done(console::PrefillKind::Continuation, 0, index, count, chunk.len(), started);
     }
+    // The last chunk committed: a client that left meanwhile is answered here,
+    // at a drained boundary, instead of between its pass and its commit.
+    ensure!(!job.events.is_closed(), ClientGone);
     anchor.context("prefix continuation produced no logits")
 }
 

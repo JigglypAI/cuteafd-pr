@@ -277,9 +277,8 @@ and every Spark rank load in one required SparkNest push transaction.
 Planner reports mark admitted configurations Serving, independent of checkpoint
 repository, revision, MC view or fidelity measurement. Missing formats or native
 programs still refuse with their structural cause. `RTX_GPUS=2` splits target
-attention and the bundled drafter across both GPUs with the original core; the
-lead owns the vocabulary head and residual stream. Compact TP2 requires the
-rank-local projection and reduction path tracked in #2316. A matching WIP build must include the
+attention and the bundled drafter across both GPUs for every core view; the
+lead owns the vocabulary head and residual stream. A matching WIP build must include the
 Inkling padded-transpose load export and native expert packages.
 
 Inkling K4 MC uses `CORE_VIEW=original|k8-compact|k6-compact|fp8-compact`.
@@ -513,7 +512,7 @@ The option is listed in CLI help so the sealed golden runner can validate it.
 `cuteafd golden --family inkling2 --width-invariance 1,8 --tokens TOKENS.json
 --prefill N --peers HOST:PORT,... --save-logits DIR` compares teacher-forced
 serial decode with actual block verification after an identical admitted prefix.
-This path loads the selected MC original target through serving startup and its
+This path loads the selected MC core view through serving startup and its
 required push transaction with real Spark experts. `--rtx-expert-layers`,
 `--pool-tokens`, `--max-sequences`, `--prefill-rows`, `--prefill-waves`, target
 `--kv-cache`, `--draft-kv-cache` and shared prefix args select the served shape.

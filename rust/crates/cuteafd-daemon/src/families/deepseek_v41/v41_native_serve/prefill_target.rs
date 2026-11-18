@@ -24,9 +24,10 @@ pub(crate) fn exercise_prefill<'a, P: PrefillTarget<'a>, C: DraftChain<'a>>(
 }
 
 /// [`exercise_prefill`] whose client disconnects at the first unit's begin
-/// (its prefill hold drops the receiver): the units call fails mid-unit with
-/// chained work queued. Returns that error; the slots must come back at rest,
-/// windows at rows from 0 and slot 0 holding its link (C4, D1).
+/// (its prefill hold drops the receiver): that call completes and drains, and
+/// the prompt fails with [`super::ClientGone`] at the next call's boundary.
+/// Returns that error; the slots must come back at rest, windows at rows from
+/// 0 and slot 0 holding its link (C4, D1), with no link reset.
 #[cfg(test)]
 pub(crate) fn exercise_cancelled_prefill<'a, P: PrefillTarget<'a>, C: DraftChain<'a>>(
     lib: &'a NativeLibrary, runtime: &tokio::runtime::Runtime, requests: &mut Requests<'a>,
@@ -350,7 +351,8 @@ impl<'a, P: PrefillTarget<'a>, C: DraftChain<'a>> V41PrefillStep<'_, '_, 'a, P, 
         match (&unit.work, &mut cursor.state) {
             (V41Unit::ReplayChunk(range) | V41Unit::Single(range), PrefillState::Encoder { suffix, next, .. }) => {
                 let chunk = &self.tokens[range.clone()];
-                ensure!(!self.job.events.is_closed(), "client disconnected");
+                // Every earlier unit committed: a drained boundary.
+                ensure!(!self.job.events.is_closed(), super::ClientGone);
                 prefill_hold(self.hold);
                 let mut batch = self.requests.prepare(&[RequestTokens { lease: self.lease, tokens: chunk,
                     image_mask: None, kind: ExpertV2SourceKind::Prefill }])?;
@@ -359,7 +361,8 @@ impl<'a, P: PrefillTarget<'a>, C: DraftChain<'a>> V41PrefillStep<'_, '_, 'a, P, 
                 let result = (|| -> Result<()> {
                     // SAFETY: the live request owns the batch/suffix until execution and commit drain.
                     self.runtime.block_on(unsafe { pass.encoder_part(self.requests, &mut batch, transport, suffix) })?;
-                    ensure!(!self.job.events.is_closed(), "client disconnected");
+                    // A client that left during the pass is answered at the next
+                    // unit's boundary, after this commit.
                     self.runtime.block_on(pass.commit_prefill::<C>(self.requests, &mut batch, None, chunk.len() as u32))
                 })();
                 if result.is_err() { pass.discard(&mut batch)?; }
@@ -376,7 +379,6 @@ impl<'a, P: PrefillTarget<'a>, C: DraftChain<'a>> V41PrefillStep<'_, '_, 'a, P, 
                 let started = Instant::now();
                 let hold = RefCell::new(&mut *self.hold);
                 let before_unit = || -> Result<()> { prefill_hold(&mut *hold.borrow_mut()); Ok(()) };
-                let keep_running = || !self.job.events.is_closed();
                 // Slot 0 lends the prefill link to the span's calls; every
                 // slot's waves go out on it. Nothing fallible runs between the
                 // take and the loop, and every error inside the loop lands in
@@ -389,6 +391,12 @@ impl<'a, P: PrefillTarget<'a>, C: DraftChain<'a>> V41PrefillStep<'_, '_, 'a, P, 
                 while at < span.end && result.is_ok() {
                     let rows = (span.end - at).min(call_rows);
                     result = (|| -> Result<()> {
+                        // Between calls every unit of the last one landed its waves,
+                        // committed and drained: a drained boundary. A client that
+                        // leaves inside a call is not observed until the call
+                        // completes, so a disconnect never drops a wave unlanded
+                        // (which would force a reset of every expert lane).
+                        ensure!(!self.job.events.is_closed(), super::ClientGone);
                         ensure!(waves <= self.prefill.slots.len(), "{waves} prefill waves exceed the {} slots",
                             self.prefill.slots.len());
                         let unit_rows = stream_units(rows, self.chunk_rows, waves)?;
@@ -403,7 +411,7 @@ impl<'a, P: PrefillTarget<'a>, C: DraftChain<'a>> V41PrefillStep<'_, '_, 'a, P, 
                         // SAFETY: every slot's pass and the link retain the request
                         // and suffix through drained completion or cancellation.
                         self.runtime.block_on(unsafe { P::encoder_units(slots, &mut link, self.requests,
-                            self.lease, &chunks, suffix, &ahead, &keep_running, &before_unit) })?;
+                            self.lease, &chunks, suffix, &ahead, &before_unit) })?;
                         tracing::debug!(target: "cuteafd::timing", rows, units=chunks.len(), waves,
                             total_us=started.elapsed().as_micros() as u64, "target encoder units");
                         Ok(())
@@ -415,7 +423,8 @@ impl<'a, P: PrefillTarget<'a>, C: DraftChain<'a>> V41PrefillStep<'_, '_, 'a, P, 
                 *next = span.end;
             }
             (V41Unit::DecoderReplay, PrefillState::Replay { suffix } | PrefillState::Encoder { suffix, .. }) => {
-                ensure!(!self.job.events.is_closed(), "client disconnected");
+                // Every encoder unit committed: a drained boundary.
+                ensure!(!self.job.events.is_closed(), super::ClientGone);
                 let start = self.requests.begin_decoder_replay(self.lease)?;
                 let rows = (self.tokens.len() as u64 - start) as u32;
                 let mut batch = self.requests.prepare_replay(&[CacheWork { lease: self.lease, tokens: rows, kind: ExpertV2SourceKind::Prefill }])?;
@@ -426,7 +435,6 @@ impl<'a, P: PrefillTarget<'a>, C: DraftChain<'a>> V41PrefillStep<'_, '_, 'a, P, 
                     let bytes = self.runtime.block_on(unsafe { pass.prefill_logits(self.lib, self.requests,
                         &mut batch, transport, &[rows as usize - 1], Some(suffix)) })?;
                     let scores = RetainedScores::new(scores::VOCAB, bytes)?;
-                    ensure!(!self.job.events.is_closed(), "client disconnected");
                     self.runtime.block_on(pass.commit_prefill(self.requests, &mut batch, self.draft.as_deref_mut(), rows))?;
                     Ok(scores)
                 })();
@@ -434,6 +442,9 @@ impl<'a, P: PrefillTarget<'a>, C: DraftChain<'a>> V41PrefillStep<'_, '_, 'a, P, 
                 console::Prefill::done(console::PrefillKind::Replay, 0, 0, 1, rows as usize, started);
                 tracing::debug!(target: "cuteafd::timing", rows, total_us=started.elapsed().as_micros() as u64, "target decoder replay");
                 let scores = result?;
+                // Committed: a client that left during the replay is answered
+                // here, at a drained boundary, rather than admitted.
+                ensure!(!self.job.events.is_closed(), super::ClientGone);
                 cursor.state = PrefillState::Done;
                 return Ok(Some(scores));
             }
@@ -527,7 +538,7 @@ pub(crate) trait PrefillTarget<'a>: VerificationTarget<'a> + Sized {
     /// pacing, packet HC-9).
     async unsafe fn encoder_units(slots: Vec<(&mut Self, &mut Self::Transport)>, prefill: &mut Self::PrefillLink,
         requests: &mut Requests<'a>, lease: CacheLease, chunks: &[&[u32]], suffix: &mut Self::Suffix,
-        ahead: &[&[u32]], keep_running: &dyn Fn() -> bool, before_unit: &dyn Fn() -> Result<()>) -> Result<()>;
+        ahead: &[&[u32]], before_unit: &dyn Fn() -> Result<()>) -> Result<()>;
     /// # Safety
     /// Batch inputs and optional completed encoder suffix match this target.
     async unsafe fn prefill_logits(&mut self, lib: &'a NativeLibrary, requests: &mut Requests<'a>,
@@ -575,8 +586,8 @@ impl<'a> PrefillTarget<'a> for TargetPass<'_, 'a> {
     }
     async unsafe fn encoder_units(slots: Vec<(&mut Self, &mut Self::Transport)>, prefill: &mut Self::PrefillLink,
         requests: &mut Requests<'a>, lease: CacheLease, chunks: &[&[u32]], suffix: &mut Self::Suffix,
-        ahead: &[&[u32]], keep_running: &dyn Fn() -> bool, before_unit: &dyn Fn() -> Result<()>) -> Result<()> {
-        unsafe { Self::execute_encoder_units(slots, prefill, requests, lease, chunks, suffix, ahead, keep_running, before_unit).await }
+        ahead: &[&[u32]], before_unit: &dyn Fn() -> Result<()>) -> Result<()> {
+        unsafe { Self::execute_encoder_units(slots, prefill, requests, lease, chunks, suffix, ahead, before_unit).await }
     }
     async unsafe fn prefill_logits(&mut self, lib: &'a NativeLibrary, requests: &mut Requests<'a>,
         batch: &mut RequestBatch, transport: &mut Self::Transport, selected: &[usize],
@@ -647,8 +658,8 @@ impl<'a> PrefillTarget<'a> for DistributedTargetPass<'_, 'a> {
     }
     async unsafe fn encoder_units(slots: Vec<(&mut Self, &mut Self::Transport)>, prefill: &mut Self::PrefillLink,
         requests: &mut Requests<'a>, lease: CacheLease, chunks: &[&[u32]], suffix: &mut Self::Suffix,
-        ahead: &[&[u32]], keep_running: &dyn Fn() -> bool, before_unit: &dyn Fn() -> Result<()>) -> Result<()> {
-        unsafe { Self::execute_encoder_units(slots, prefill, requests, lease, chunks, suffix, ahead, keep_running, before_unit).await }
+        ahead: &[&[u32]], before_unit: &dyn Fn() -> Result<()>) -> Result<()> {
+        unsafe { Self::execute_encoder_units(slots, prefill, requests, lease, chunks, suffix, ahead, before_unit).await }
     }
     async unsafe fn prefill_logits(&mut self, _lib: &'a NativeLibrary, requests: &mut Requests<'a>,
         batch: &mut RequestBatch, transport: &mut Self::Transport, selected: &[usize],

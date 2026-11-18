@@ -160,7 +160,6 @@ struct UnitHooks<'s, 'r, 'w, 'a> {
     packed: Option<&'s [(CacheLease, &'s [u32])]>,
     chunks: &'s [&'s [u32]],
     suffix: &'s mut EncoderSuffix<'a>,
-    keep_running: &'s dyn Fn() -> bool,
     before_unit: &'s dyn Fn() -> Result<()>,
     /// The next call's leading chunks (#762 window cycles): the last units of
     /// this call prefetch their Engram rows, so the next call's units start warm.
@@ -217,7 +216,6 @@ impl<'a> UnitHooks<'_, '_, '_, 'a> {
             slot.batch.is_none() && slot.prepared.is_none(),
             "encoder unit slot occupied"
         );
-        ensure!((self.keep_running)(), "client disconnected");
         (self.before_unit)()?;
         slot.pass.resources.upload.reset()?;
         slot.started = Instant::now();
@@ -265,7 +263,6 @@ impl<'a> UnitHooks<'_, '_, '_, 'a> {
     }
     async fn attention_inner(&mut self, layer: usize, unit: &Unit) -> Result<()> {
         let slot = &mut self.slots[unit.slot];
-        ensure!((self.keep_running)(), "client disconnected");
         ensure!(slot.prepared.is_none(), "encoder attention still pending");
         let batch = slot.batch.as_mut().context("encoder unit batch absent")?;
         // SAFETY: the preceding hook has consumed the previous layer's output.
@@ -359,7 +356,6 @@ impl<'a> UnitHooks<'_, '_, '_, 'a> {
     }
     async fn end_unit_inner(&mut self, unit: &Unit) -> Result<()> {
         let slot = &mut self.slots[unit.slot];
-        ensure!((self.keep_running)(), "client disconnected");
         let batch = slot.batch.as_mut().context("encoder unit batch absent")?;
         // SAFETY: the lane's output stays live until the unit's commit drains its chain.
         unsafe { self.suffix.capture_chained(&slot.pass.resources.lane.output()?, slot.pass.resources.lane.finish_stream())?; }
@@ -525,12 +521,12 @@ impl<'w, 'a> TargetPass<'w, 'a> {
     /// completion or drained cancellation. Decode is idle during this span.
     pub(crate) async unsafe fn execute_encoder_units(
         slots: Vec<(&mut Self, &mut NativeTp4Wave<'a>)>, prefill: &mut crate::families::deepseek_v41::v41_experts::coordinator::V41Link<'a>, requests: &mut Requests<'a>,
-        lease: CacheLease, chunks: &[&[u32]], suffix: &mut EncoderSuffix<'a>, ahead: &[&[u32]], keep_running: &dyn Fn() -> bool,
+        lease: CacheLease, chunks: &[&[u32]], suffix: &mut EncoderSuffix<'a>, ahead: &[&[u32]],
         before_unit: &dyn Fn() -> Result<()>,
     ) -> Result<()> {
         // SAFETY: forwards the caller's retained slot, request and suffix contract.
         unsafe { Self::execute_encoder_units_inner(slots, prefill, requests, None,
-            lease, chunks, suffix, ahead, keep_running, before_unit).await }
+            lease, chunks, suffix, ahead, before_unit).await }
     }
     /// One packed short-prompt unit on the same waves executor as long prompts.
     /// # Safety
@@ -543,11 +539,11 @@ impl<'w, 'a> TargetPass<'w, 'a> {
         let tokens: Vec<_> = members.iter().flat_map(|(_, t)| t.iter().copied()).collect();
         // SAFETY: all member leases and the packed suffix stay live through the executor drain.
         unsafe { Self::execute_encoder_units_inner(slots, prefill, requests, Some(members),
-            members[0].0, &[&tokens], suffix, &[], &|| true, &|| Ok(())).await }
+            members[0].0, &[&tokens], suffix, &[], &|| Ok(())).await }
     }
     async unsafe fn execute_encoder_units_inner(
         slots: Vec<(&mut Self, &mut NativeTp4Wave<'a>)>, prefill: &mut crate::families::deepseek_v41::v41_experts::coordinator::V41Link<'a>, requests: &mut Requests<'a>,
-        packed: Option<&[(CacheLease, &[u32])]>, lease: CacheLease, chunks: &[&[u32]], suffix: &mut EncoderSuffix<'a>, ahead: &[&[u32]], keep_running: &dyn Fn() -> bool,
+        packed: Option<&[(CacheLease, &[u32])]>, lease: CacheLease, chunks: &[&[u32]], suffix: &mut EncoderSuffix<'a>, ahead: &[&[u32]],
         before_unit: &dyn Fn() -> Result<()>,
     ) -> Result<()> {
         if packed.is_none() { requests.prefetch_encoder(lease, &chunks.iter().chain(ahead).copied().collect::<Vec<_>>())?; }
@@ -569,7 +565,7 @@ impl<'w, 'a> TargetPass<'w, 'a> {
                 Ok(UnitSlot { published: PublishedLayers::new(pass.library()?)?, pass, transport,
                     batch: None, prepared: None, started: Instant::now() })
             }).collect::<Result<Vec<_>>>()?,
-            requests: RefCell::new(requests), lease, packed, chunks, suffix, ahead, keep_running, before_unit,
+            requests: RefCell::new(requests), lease, packed, chunks, suffix, ahead, before_unit,
         };
         run_prefill_units_async(&mut hooks, &units, waves).await?;
         // Every unit's chained work completes before the decoder replay (or a

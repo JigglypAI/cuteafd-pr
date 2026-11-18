@@ -5787,7 +5787,9 @@ mod prefill_lane_tests {
             // Fork #293 adds Inkling2Geometry and INKLING2_SMALL only (+51/-0);
             // GLM Flash geometry, projection routes and thresholds are unchanged,
             // and the all-family audit shows every glmf object identical.
-            ("integration/cuteafd/_common.py", 0x6d86_10c4_6149_d019),
+            // Fork #401 pins the host target only at AOT object emission. The engine
+            // already used that target; all GLM Flash objects remain byte-identical.
+            ("integration/cuteafd/_common.py", 0x22d4_61d0_37a3_261d),
             // 34698ec2's RowTiledBf16Projection is opt-in; skinny_config,
             // skinny_max_rows and the default GLM RoutedBf16Projection paths are unchanged.
             // Fork #71 adds Step-5 DECODE_TMA_TILES keys (4096,12288), (4096,6144), (384,4096) and
