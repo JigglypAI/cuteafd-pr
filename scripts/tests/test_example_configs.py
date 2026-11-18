@@ -725,7 +725,7 @@ def test_v6_mc_main_cards_use_the_original_core_except_kimi_1x() -> None:
 
 def test_v6_compact_mode_matrix_covers_every_mc_family() -> None:
     compact = json.loads((ROOT / V6_COMPACT).read_text())
-    assert len(compact["entries"]) == 18
+    assert len(compact["entries"]) == 21
     views: dict[str, set] = {}
     ports: dict[str, set] = {}
     for entry in compact["entries"]:
@@ -737,21 +737,12 @@ def test_v6_compact_mode_matrix_covers_every_mc_family() -> None:
             if key in values:
                 assert values[key] not in ports.setdefault(key, set()), (entry["name"], key)
                 ports[key].add(values[key])
-    blocked_checkpoints = {entry["checkpoint"] for entry in compact["unsupported"]}
-    assert set(views) == MC_CHECKPOINTS - blocked_checkpoints
+    assert set(views) == MC_CHECKPOINTS
     assert all(found == {"k8-compact", "k6-compact", "fp8-compact"} for found in views.values())
     # The compact rows run the same shipped drafter as their original max base.
     assert not any("SPECULATOR" in entry["set"] for entry in compact["entries"])
-    # Inkling compact on TP2 is blocked on #2316 (refused at plan time, #2470);
-    # the three rows stay in the set and are listed as blocked, not removed.
-    blocked = compact["unsupported"]
-    assert {(entry["checkpoint"], entry["core_view"]) for entry in blocked} == {
-        ("wrldsuksgo2mars/Inkling-2-Small-EXL3-K4-MC", view)
-        for view in ("k8-compact", "k6-compact", "fp8-compact")}
-    assert all(entry["status"] == "pending" and entry["blocker"] == "#2316"
-               and "compact TP2" in entry["reason"] for entry in blocked)
-    assert all(entry["family"] == "inkling2" for entry in blocked)
-    # A cell is either an entry or a blocked placeholder, never both.
+    # A cell is either an active entry or a blocked placeholder, never both.
+    blocked = compact.get("unsupported", [])
     active = {(entry["family"], _effective(entry, compact)["MODEL_ID"],
                _effective(entry, compact)["CORE_VIEW"]) for entry in compact["entries"]}
     placeholders = {(entry["family"], entry["checkpoint"], entry["core_view"]) for entry in blocked}

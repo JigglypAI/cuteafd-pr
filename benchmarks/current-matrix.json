@@ -274,7 +274,7 @@
       },
       "2rtx": {
         "status": "pending",
-        "reason": "2x RTX MC card (original and k8/k6/fp8-compact) blocked on #2316: Inkling compact TP2 refuses at plan time (#2470); returns when compact TP2 lands."
+        "reason": "2x RTX MC card not measured; the original core and the k8/k6/fp8 compact views plan READY on 2 RTX + 6 Sparks (#2499)."
       }
     },
     {
@@ -286,7 +286,7 @@
       },
       "2rtx": {
         "status": "pending",
-        "reason": "2x RTX MXFP8 card not measured; multi-RTX Inkling serving needs #2316."
+        "reason": "2x RTX MXFP8 card not measured; TP2 serving plans READY (#2499)."
       }
     }
   ],

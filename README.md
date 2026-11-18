@@ -217,12 +217,12 @@ concurrency point is that limit.
 <tr>
 <td width="19%" valign="top"><a href="docs/models/inkling2.md"><b>inkling2</b></a><br><sub>wrldsuksgo2mars/Inkling-2-Small-EXL3-K4-MC</sub><br><sub>exl3-k4</sub></td>
 <td width="27%" valign="top"><a href="benchmarks/inkling2/2026-11-16-smoke-inkling-2-small-exl3-k4-mc-1rtx-4spark-inkling2-exl3-min-cand-r1/card.svg"><img src="benchmarks/inkling2/2026-11-16-smoke-inkling-2-small-exl3-k4-mc-1rtx-4spark-inkling2-exl3-min-cand-r1/card.svg" alt="wrldsuksgo2mars/Inkling-2-Small-EXL3-K4-MC on 1× RTX PRO 6000 @ gpu-powerd 425 W (425–450) + 4× DGX Spark"></a><br><sub>1× RTX + 4× Spark</sub></td>
-<td width="27%" valign="top">pending<br><sub>2x RTX MC card (original and k8/k6/fp8-compact) blocked on #2316: Inkling compact TP2 refuses at plan time (#2470); returns when compact TP2 lands.</sub></td>
+<td width="27%" valign="top">pending<br><sub>2x RTX MC card not measured; the original core and the k8/k6/fp8 compact views plan READY on 2 RTX + 6 Sparks (#2499).</sub></td>
 </tr>
 <tr>
 <td width="19%" valign="top"><a href="docs/models/inkling2.md"><b>inkling2</b></a><br><sub>thinkingmachines/Inkling-2-Small-MXFP8</sub><br><sub></sub></td>
 <td width="27%" valign="top">n/a<br><sub>—</sub></td>
-<td width="27%" valign="top">pending<br><sub>2x RTX MXFP8 card not measured; multi-RTX Inkling serving needs #2316.</sub></td>
+<td width="27%" valign="top">pending<br><sub>2x RTX MXFP8 card not measured; TP2 serving plans READY (#2499).</sub></td>
 </tr>
 </table>
 
