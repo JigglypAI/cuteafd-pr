@@ -534,6 +534,42 @@ fn inkling_reference_sources(provenance: &Value, manifest: &Value) -> bool {
         && hash(&helper["helper_harness_commit"], 40)
 }
 
+const HY4_ROOT: &str = "tencent/Hy4-flash";
+const HY4_ROOT_REVISION: &str = "d88c9dfd96ba4f2e6b92adba0b8e8f1c8696f959";
+const HY4_UPSTREAM: &str = "c2ec850510a37978ea83df226589623d5f2be776";
+const HY4_SOURCE_FILES: [(&str, &str); 3] = [
+    ("models/hy_v4_flash/modeling_hy_v4_flash.py", "43341929e4bec215c224fc837b24b534b4de41954992673a0655a65060e38b9b"),
+    ("models/hy_v4_flash/configuration_hy_v4_flash.py", "dc62bd7c6bc8f57375d3f71cf4eb861e3a36887d57cd75f6b11752fcf04256cf"),
+    ("conversion_mapping.py", "dcb88ad0abf0859b27e7494c1030271740da863981bffebf19d62e470545fc90"),
+];
+
+fn hy4_reference_sources(provenance: &Value, manifest: &Value) -> bool {
+    let source = &provenance["source_pin"];
+    let evidence = &provenance["gates"]["upstream_preflight"];
+    let numeric_check = |value: &Value| value.as_f64().is_some_and(|x| (0.0..=1e-4).contains(&x));
+    let three_prompts = |value: &Value| value.as_array().is_some_and(|values|
+        values.len() == 3 && values.iter().all(numeric_check));
+    let sha256 = |value: &Value| value.as_str().is_some_and(|s| s.len() == 64 &&
+        s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)));
+    manifest["root_checkpoint"]["id"] == HY4_ROOT
+        && manifest["root_checkpoint"]["revision"] == HY4_ROOT_REVISION
+        && manifest["vocab"] == 120832
+        && provenance["source_identity_provider"] == "families.hy4_flash.golden"
+        && source["checkpoint"] == HY4_ROOT && source["revision"] == HY4_ROOT_REVISION
+        && source["transformers_revision"] == HY4_UPSTREAM
+        && source["config_sha256"] == provenance["snapshot_identity"]["config_sha256"]
+        && ["config_sha256", "index_sha256", "model_sha256", "golden_sha256", "sources_sha256", "layer_major_sha256"]
+            .iter().all(|key| sha256(&source[*key]))
+        && HY4_SOURCE_FILES.iter().all(|(path, digest)| source["transformers_files"][*path] == *digest)
+        && evidence["passed"] == true && evidence["source_pin"] == *source
+        && three_prompts(&evidence["truncated_logit_relative_l2"])
+        && three_prompts(&evidence["full_logit_relative_l2"])
+        && evidence["layers"].as_array().is_some_and(|layers| layers.len() == 42
+            && layers.iter().enumerate().all(|(i, layer)| layer["layer"] == i
+                && three_prompts(&layer["same_input_relative_l2"]))
+            && numeric_check(&layers[0]["active_indexer_relative_l2"]))
+}
+
 fn qualification_label(qualification: &Value, manifest: &Value) -> Result<&'static str> {
     ensure!(qualification["set_sha256"] == manifest["set_sha256"] && qualification["qualifies"] == true,
         "unqualified or mismatched dataset set");
@@ -563,6 +599,8 @@ fn qualification_label(qualification: &Value, manifest: &Value) -> Result<&'stat
                 && launch["official_launch_configuration"] == false && launch["num_stages"] == 1
                 && launch["block_regions"] == 16 && launch["kernel"] == "_sparse_attn_prefill_kernel"
                 && manifest["reference_execution"]["sparse_attention_launch"] == *launch
+        } else if manifest["family"] == "hy4_flash" {
+            hy4_reference_sources(provenance, manifest)
         } else if manifest["family"] == "inkling2" {
             inkling_reference_sources(provenance, manifest)
         } else if manifest["family"] == "deepseek_v41" {
@@ -770,6 +808,37 @@ mod tests {
             assert!(!reference.windows.is_empty());
             eprintln!("loaded {}: {label}", manifest["config"]);
         }
+    }
+
+    #[test]
+    fn hy4_requires_bound_upstream_evidence_through_all_layers() {
+        let (mut qualification, mut manifest) = kimi_reference_qualification();
+        manifest["family"] = json!("hy4_flash");
+        manifest["vocab"] = json!(120832);
+        manifest["root_checkpoint"] = json!({"id": HY4_ROOT, "revision": HY4_ROOT_REVISION});
+        for path in ["reference_provenance", "prefix_qualification"] {
+            qualification[path]["snapshot_identity"]["checkpoint"] = json!(HY4_ROOT);
+            qualification[path]["snapshot_identity"]["snapshot_revision"] = json!(HY4_ROOT_REVISION);
+        }
+        qualification["prefix_qualification"]["vocab"] = json!(120832);
+        let provenance = &mut qualification["reference_provenance"];
+        provenance["source_identity_provider"] = json!("families.hy4_flash.golden");
+        let mut source = json!({"checkpoint": HY4_ROOT, "revision": HY4_ROOT_REVISION,
+            "transformers_revision": HY4_UPSTREAM});
+        for key in ["index_sha256", "model_sha256", "golden_sha256", "sources_sha256", "layer_major_sha256"] {
+            source[key] = json!("d".repeat(64));
+        }
+        source["config_sha256"] = provenance["snapshot_identity"]["config_sha256"].clone();
+        source["transformers_files"] = json!(HY4_SOURCE_FILES.into_iter().collect::<std::collections::BTreeMap<_, _>>());
+        let mut layers: Vec<_> = (0..42).map(|i| json!({"layer": i, "same_input_relative_l2": [0.0, 0.0, 0.0]})).collect();
+        layers[0]["active_indexer_relative_l2"] = json!(1e-5);
+        provenance["source_pin"] = source.clone();
+        provenance["gates"] = json!({"upstream_preflight": {"passed": true, "source_pin": source,
+            "truncated_logit_relative_l2": [1e-6, 1e-6, 1e-6], "full_logit_relative_l2": [1e-5, 1e-5, 1e-5],
+            "layers": layers}});
+        assert_eq!(qualification_label(&qualification, &manifest).unwrap(), "reference");
+        qualification["reference_provenance"]["gates"]["upstream_preflight"]["layers"][41]["same_input_relative_l2"][2] = json!(0.001);
+        assert!(qualification_label(&qualification, &manifest).is_err());
     }
 
     #[test]
