@@ -134,7 +134,7 @@ pub(crate) struct Cli {
     /// Per-rank idle MemAvailable samples from the launcher (JSON, boot-keyed).
     #[arg(long, global = true)]
     pub(crate) spark_memory_samples: Option<String>,
-    /// Skip startup graph prewarm (V4.1 and GLM Flash); retain lazy runtime capture.
+    /// Skip startup prewarm of rank-local graph sites; they capture lazily. Spanning sites always prewarm.
     #[arg(long, global = true)]
     pub(crate) graph_no_prewarm: bool,
     /// Prefer a cold compatible donor even below the graph soft cap.

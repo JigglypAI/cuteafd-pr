@@ -1,4 +1,5 @@
 //! DeepSeek V4 (Flash / Pro) coordinator engine over the exported b12x programs.
+mod graph_sites;
 pub(crate) mod engine;
 pub(crate) mod admission;
 mod packed_check;

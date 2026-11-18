@@ -556,7 +556,10 @@ pub(super) fn worker(mut args: crate::cli::NativeServeArgs, mut receive: mpsc::R
     drop(visit);
     // The loader list is a best-effort preference, not a sealed capture set.
     // Other shapes remain eligible for lazy bounded capture.
-    if crate::shared::decode_graph::prewarm_enabled() {
+    // Spanning banks (gathers, declared drafter children) always prewarm; under
+    // `GRAPH_PREWARM=off` rank-local tickets are deferred to first use (#2303).
+    if let Some(_startup) = crate::shared::decode_graph::sites::startup(
+        crate::families::deepseek_v41::graph_policy::spanning_layout(2)) {
         let memory = || -> Result<Vec<usize>> {
             devices.iter().map(|device| device.run(|| lib.cuda_memory_info().map(|(free, _)| free)))
                 .collect()

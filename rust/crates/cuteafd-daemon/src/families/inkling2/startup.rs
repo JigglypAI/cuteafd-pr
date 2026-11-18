@@ -274,7 +274,7 @@ pub(crate) fn whole<'a>(library: &'a Arc<NativeLibrary>, programs: &'a Programs<
             let width = cuteafd_loader::shared::vocabulary::shard(cfg.vocab_size,128,1)?.len();
             peer_kernels.draft_head=Some(peer_stream.device.run(|| Ok(cuteafd_ffi::draft_projection::DraftProjections::load(programs,&[(cfg.hidden,width)],64)?))?);
         }
-        execution.peer = Some(super::engine::Peer { graphs: super::engine::DecodeGraphs::new(&requests, inputs.graph_reserve[1])?, exchange, requests,
+        execution.peer = Some(super::engine::Peer { graphs: super::engine::DecodeGraphs::new(&requests, 1, inputs.graph_reserve[1])?, exchange, requests,
             target: targets.next().context("Inkling peer target absent")?, kernels: peer_kernels });
     }
     ensure!(targets.next().is_none() && kernels.next().is_none(), "Inkling rank inventory not fully bound");

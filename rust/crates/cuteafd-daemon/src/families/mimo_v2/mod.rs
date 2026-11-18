@@ -1,5 +1,6 @@
 //! MiMo V2 (mimo_v2_flash) on the generic engine: weights, the coordinator
 //! programs' layer chain, and the golden comparison command.
+mod graph_sites;
 pub(crate) mod admission;
 pub(crate) mod dflash;
 pub(crate) mod engine;

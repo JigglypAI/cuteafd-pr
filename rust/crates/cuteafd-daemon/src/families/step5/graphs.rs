@@ -37,7 +37,7 @@ impl<'a> Graphs<'a> {
             .filter_map(|(rows, pin)| pin.then_some(rows)).collect();
         self.bank.get_mut().attach_device(library, device, policy.bytes, Site {
             name: "step5.section", cycle: Cycle::Other, preference: Preference::Adaptive,
-            bootstrap: 2 << 20, basis: Basis::Bytes, spans_devices: false,
+            bootstrap: 2 << 20, basis: Basis::Bytes, spans_devices: super::graph_sites::spans("step5.section", false),
         })?;
         device::set_reserve_policy(device, policy)?;
         self.device = device;

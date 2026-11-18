@@ -1,6 +1,7 @@
 //! GLM 5.x (glm_moe_dsa) on the generic engine: weights, the coordinator
 //! programs' layer chain, and the golden comparison command.
 use crate::shared::speculation::dflash;
+mod graph_sites;
 pub(crate) mod engine;
 pub(crate) mod prefix;
 mod packed_check;

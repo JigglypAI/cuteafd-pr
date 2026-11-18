@@ -485,7 +485,13 @@ pub(crate) fn load<'a, const RANKS: usize>(library: &'a Arc<cuteafd_ffi::NativeL
         tracing::info!(entries = prewarm.len(), attention_entries = prewarm.iter()
             .filter(|key| matches!(key.op, super::graphs::Op::Attention { .. })).count(),
             "Kimi selected startup prewarm keys");
-        let warmup = engine.warm_graphs(&prewarm, &reserves)?;
+        // Banks attach either way. Under `GRAPH_PREWARM=off` rank-local step banks
+        // decline startup tickets and capture on first use; context banks span
+        // and always prewarm (#2303).
+        let warmup = {
+            let _startup = crate::shared::decode_graph::sites::startup(true);
+            engine.warm_graphs(&prewarm, &reserves)?
+        };
         let captured = warmup.captured;
         let capture_elapsed_ms = capture_started.elapsed().as_millis() as u64;
         let after = engine.graph_free_bytes()?;

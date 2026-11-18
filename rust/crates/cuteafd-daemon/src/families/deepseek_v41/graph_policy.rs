@@ -95,6 +95,9 @@ fn site_name(name: &'static str) -> &'static str {
     }
 }
 
+/// Whether this layout keeps any spanning site in its startup prewarm.
+pub(crate) fn spanning_layout(ranks: usize) -> bool { ranks > 1 }
+
 pub(crate) fn attach(library: &cuteafd_ffi::NativeLibrary, ranks: usize,
     mut visit: impl FnMut(&mut crate::shared::decode_graph::device::GraphVisitor<'_>) -> Result<()>) -> Result<()> {
     use crate::shared::decode_graph::device::{Basis, Cycle, Preference, Site};
@@ -106,7 +109,7 @@ pub(crate) fn attach(library: &cuteafd_ffi::NativeLibrary, ranks: usize,
             false, base, extra).map_err(anyhow::Error::msg)?;
         bank.attach(library, device, policy.bytes, Site { name: site_name(name), cycle: Cycle::Other,
             preference: Preference::Adaptive, bootstrap: 2 << 20, basis: Basis::Bytes,
-            spans_devices: spanning::spans(name, spans)? })?;
+            spans_devices: spanning::spans(name, spans) })?;
         crate::shared::decode_graph::device::set_reserve_policy(device, policy)
     })
 }

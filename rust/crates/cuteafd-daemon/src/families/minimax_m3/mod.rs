@@ -1,4 +1,5 @@
 //! Vendor MiniMax target operands. Serving is not yet wired.
+mod graph_sites;
 pub(crate) mod weights;
 pub(crate) mod dense;
 pub(crate) mod attention;

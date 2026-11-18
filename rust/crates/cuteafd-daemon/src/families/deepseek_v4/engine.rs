@@ -1977,7 +1977,7 @@ impl<'a> Engine<'a> {
             graphs.borrow_mut().attach_device(self.library, device, reserves[rank], Site {
                 name: "deepseek_v4.segment", cycle: Cycle::Decode, preference: Preference::Adaptive,
                 bootstrap: bootstraps[rank], basis: Basis::Bytes,
-                spans_devices: self.ranks() > 1,
+                spans_devices: self.graph_spans(),
             })?;
             // Seed the growth observer before the first capture, so the startup
             // arena is measured as growth rather than absorbed into a baseline
@@ -2039,6 +2039,9 @@ impl<'a> Engine<'a> {
     pub fn warm_verify_graphs(&self, transports: &mut [SparkLink<'_>], runtime: &tokio::runtime::Runtime) -> Result<()> {
         use crate::shared::decode_graph::device::{observe_device, Cycle};
         use cuteafd_loader::serving_capacity::v4_graphs::v4_prewarm;
+        // `GRAPH_PREWARM=off` skips an all-local layout; segments capture on first
+        // use. A spanning layout always prewarms (#2303).
+        let Some(_startup) = crate::shared::decode_graph::sites::startup(self.graph_spans()) else { return Ok(()) };
         let entries = v4_prewarm(self.ranks(), self.graph_sparks.get()).map_err(anyhow::Error::msg)?;
         let units = self.shape.units;
         let (mut skipped, mut steps) = (0usize, Vec::new());
@@ -2143,10 +2146,15 @@ impl<'a> Engine<'a> {
     /// router graphs every request replays. Best effort within the reserve.
     /// Every local-expert row shape is captured at startup, without executing
     /// uninitialized routes or unmatched peer waits. Pointer ownership is fixed.
+    fn graph_spans(&self) -> bool { super::graph_sites::spans("deepseek_v4.segment", self.ranks() > 1) }
+
     pub fn warm_local_graphs(&self) -> Result<()> {
         self.prepare_workspaces()?;
         if self.local_layers() == 0 { return Ok(()); }
         self.warm_tp2_routers()?;
+        // `GRAPH_PREWARM=off` skips an all-local layout; segments capture on first
+        // use. A spanning layout always prewarms (#2303).
+        let Some(_startup) = crate::shared::decode_graph::sites::startup(self.graph_spans()) else { return Ok(()) };
         // The checked-in list's width-0 rows are the local-expert startup set.
         let rows: Vec<usize> = cuteafd_loader::serving_capacity::v4_graphs::v4_prewarm(
                 self.ranks(), self.graph_sparks.get())

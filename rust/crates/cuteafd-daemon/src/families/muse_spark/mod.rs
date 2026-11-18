@@ -1,6 +1,7 @@
 //! Muse Spark (`muse_spark`, text `muse_spark_text`): the layer chain, its CPU
 //! oracle (checked against the official transformers modules) and, next, the
 //! coordinator backend on the shared lane/prefill/decode design.
+mod graph_sites;
 pub(crate) mod admission;
 pub(crate) mod audio;
 pub(crate) mod backend;

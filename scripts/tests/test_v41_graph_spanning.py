@@ -43,7 +43,7 @@ def test_v41_site_flags_match_checked_in_classification():
     assert ", gather_site, true, &mut self.gather_graphs)" in projection
     assert "f(device, current, false," in router and "f(device, other, false," in router
     assert found == set(classes), (found - set(classes), set(classes) - found)
-    assert "spans_devices: spanning::spans(name, spans)?" in policy
+    assert "spans_devices: spanning::spans(name, spans) }" in policy
     assert "spans || ranks > 1" not in policy
 
 

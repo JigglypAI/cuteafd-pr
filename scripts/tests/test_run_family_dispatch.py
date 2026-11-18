@@ -5854,22 +5854,24 @@ def test_graph_donor_cold_lag_refuses_invalid_launch(tmp_path, lag, donor, error
     assert "serve-glmf --snapshot" not in result.stderr
 
 
-def test_graph_prewarm_off_refuses_unqualified_family(tmp_path):
+@pytest.mark.parametrize("config,model,extra,command", [
+    ({"model_type": "glm_moe_dsa", "num_hidden_layers": 4, "first_k_dense_replace": 3}, "test/glm", "", "serve-glm"),
+    ({"model_type": "glm5_next", "num_hidden_layers": 2, "mlp_layer_types": ["sparse"] * 2,
+      "layer_types": ["linear_attention", "deepseek_sparse_attention"]}, "test/glmf", "RTX_GPUS=2\n", "serve-glmf"),
+])
+def test_graph_prewarm_off_is_accepted_on_every_family_and_layout(tmp_path, config, model, extra, command):
+    result = _family_launch_result(tmp_path, config, model, f"{extra}GRAPH_PREWARM=off\n")
+    assert result.returncode == 0, result.stderr
+    serve = shlex.split(next(line for line in result.stderr.splitlines()
+        if command in line and "--snapshot" in line))
+    assert "--graph-no-prewarm" in serve
+
+
+def test_graph_prewarm_rejects_other_values(tmp_path):
     config = {"model_type": "glm_moe_dsa", "num_hidden_layers": 4, "first_k_dense_replace": 3}
-    result = _family_launch_result(tmp_path, config, "test/glm", "GRAPH_PREWARM=off\n")
+    result = _family_launch_result(tmp_path, config, "test/glm", "GRAPH_PREWARM=lazy\n")
     assert result.returncode == 2, result.stderr
-    assert "supported only for deepseek_v41 (V4.1) and glm5_flash (GLM Flash)" in result.stderr
-    assert "serve-glm --snapshot" not in result.stderr
-
-
-def test_graph_prewarm_off_refuses_cross_device_graphs(tmp_path):
-    config = {"model_type": "glm5_next", "num_hidden_layers": 2,
-              "mlp_layer_types": ["sparse"] * 2,
-              "layer_types": ["linear_attention", "deepseek_sparse_attention"]}
-    result = _family_launch_result(tmp_path, config, "test/glmf",
-        "RTX_GPUS=2\nGRAPH_PREWARM=off\n")
-    assert result.returncode == 2, result.stderr
-    assert "runtime cross-device graph instantiation can deadlock" in result.stderr
+    assert "GRAPH_PREWARM must be on or off" in result.stderr
 
 
 @pytest.mark.parametrize("precision,flag", [("on", "true"), ("off", "false")])
