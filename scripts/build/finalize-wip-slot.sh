@@ -49,7 +49,10 @@ if [[ "${CUTEAFD_WIP_EXLR8_AOT:-OFF}" == ON ]]; then
 fi
 
 slot_root="/wip/slots/$slot/$role"
-incoming="/wip/incoming/${slot}.${role}.$$"
+generation="${CUTEAFD_WIP_SLOT_GENERATION:?slot build generation required}"
+incoming="/wip/incoming/${slot}.${role}.${generation}.$$"
+trap 'rm -rf "$incoming"' EXIT
+trap 'exit 143' TERM HUP INT QUIT
 rm -rf "$incoming"
 mkdir -p "$incoming/workspace/.cuteafd-wip"
 cp -a "$source_dir/." "$incoming/workspace/"
@@ -159,7 +162,6 @@ path.write_text(json.dumps(metadata, indent=2, sort_keys=True) + "\n")
 PY
 sha256sum "$incoming/META.json" | awk '{print $1}' >"$incoming/FINGERPRINT"
 
-mkdir -p "$(dirname "$slot_root")"
-rm -rf "$slot_root"
-mv "$incoming" "$slot_root"
+python3 "$source_dir/scripts/build/wip-slot-reuse.py" publish --root /wip/ --slot "$slot" \
+  --role "$role" --generation "$generation" --incoming "$incoming"
 echo "WIP slot finalized: slot=$slot role=$role fingerprint=$(<"$slot_root/FINGERPRINT")"

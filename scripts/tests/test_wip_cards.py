@@ -810,7 +810,7 @@ def _trace_tools(tmp_path, extra=None):
         'docker': '#!/bin/sh\nprintf "docker %s\\n" "$*" >> "$TRACE"\n' + cold + 'printf "image-id\\n"\n',
         'flock': '#!/bin/sh\nprintf "flock %s\\n" "$*" >> "$TRACE"\n',
         # hwlock stand-in: record the turn, then run the command it guards.
-        'python3': '#!/bin/sh\nprintf "turn %s\\n" "$*" >> "$TRACE"\ncase "$*" in *waiting-serving*) exit 1;; esac\nwhile [ "$1" != -- ]; do shift; done; shift\nprintf "begin\\n" >> "$TRACE"\n"$@"\nrc=$?\nprintf "end\\n" >> "$TRACE"\nexit $rc\n',
+        'python3': '#!/bin/sh\ncase "$1" in */build-process.py) exec ' + sys.executable + ' "$@";; esac\nprintf "turn %s\\n" "$*" >> "$TRACE"\ncase "$*" in *waiting-serving*) exit 1;; esac\nwhile [ "$1" != -- ]; do shift; done; shift\nprintf "begin\\n" >> "$TRACE"\n"$@"\nrc=$?\nprintf "end\\n" >> "$TRACE"\nexit $rc\n',
         'timeout': '#!/bin/sh\nwhile [ "${1#-}" != "$1" ]; do shift; done; shift\nexec "$@"\n',
         **(extra or {})}
     for name, script in scripts.items():
@@ -2441,6 +2441,10 @@ def test_coordinator_only_build_claims_its_root_before_any_build_work(tmp_path, 
             return real(cmd, **kwargs, env={**os.environ, 'HOME': str(home)})
         seen.append((Path(str(cmd[0])).name, marker.is_file()))
         return subprocess.CompletedProcess(cmd, 0, '' if kwargs.get('text') else b'', '')
+    def build(cmd, **kwargs):
+        seen.append((Path(str(cmd[0])).name, marker.is_file()))
+        return 0
+    monkeypatch.setattr(cards, 'run_build', build)
     monkeypatch.setattr(cards.subprocess, 'run', run)
     cards.build_arms({'base': revision}, cards.arms_from(['base=test-base:s']), [card], tmp_path, 'task', False)
     assert seen, 'build_arms ran no build command'

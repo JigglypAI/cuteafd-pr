@@ -8,6 +8,7 @@ inside that turn; a native-cache hit never calls this helper.
 from __future__ import annotations
 
 import argparse
+import contextlib
 from contextlib import contextmanager
 import fcntl
 import importlib.util
@@ -146,6 +147,22 @@ def export_mib(smi: str, gpu: str, cgroup: str | None, baseline: int | None) -> 
 
 def watch(args) -> int:
     process = subprocess.Popen(args.command, start_new_session=True)
+    previous = {}
+
+    def stop(signum, _frame):
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(process.pid, signal.SIGTERM)
+
+    for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP, signal.SIGQUIT):
+        previous[sig] = signal.signal(sig, stop)
+    try:
+        return watch_process(args, process)
+    finally:
+        for sig, handler in previous.items():
+            signal.signal(sig, handler)
+
+
+def watch_process(args, process):
     peak = 0
     while process.poll() is None:
         try:

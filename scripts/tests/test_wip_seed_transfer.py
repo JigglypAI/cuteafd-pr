@@ -258,7 +258,7 @@ def test_source_sync_to_a_non_rdma_seed_uses_rsync_over_the_fast_cipher_and_lan(
 def test_nest_distribution_writes_once_replicates_first_hop_then_fans_out():
     nest = WIP[WIP.index('distribute_expert_slot_nest() {'):WIP.index('\ndistribute_expert_slot() {')]
     write, first, fanout, extract = (nest.index(s) for s in (
-        'zstd -T0 -1 -q', 'nest replicate --hosts \'$1\'', 'nest replicate --hosts \'$(IFS=,', 'zstd -d -q <"$archive"'))
+        'zstd -T0 -1 -q', 'nest replicate --hosts \'$1\'', 'nest replicate --hosts \'$(IFS=,', "zstd -d -q <'$archive'"))
     assert write < first < fanout < extract
     assert 'nest seal "$archive"' in nest and 'nest_settle "$archive"' in nest
     # The relay path crosses the seed's link once, then fans out from a RoCE host.

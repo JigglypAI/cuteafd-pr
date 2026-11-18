@@ -1,4 +1,5 @@
 """scripts/dev/cpu-gate: verdicts from parsed test summaries, never exit codes alone."""
+import contextlib
 import importlib.machinery
 import importlib.util
 import json
@@ -876,14 +877,30 @@ def test_build_leg_notification_records_termination(tmp_path):
             process.wait()
 
 
-def test_build_slot_does_not_detach_compilers_from_gate_process_group(tmp_path):
-    process = subprocess.Popen(['bash', str(ROOT / 'scripts/build/build-slot.sh'), 'python3', '-c',
-                                'import os; print(os.getpgrp(), flush=True)'],
+def test_build_slot_reaps_term_ignoring_descendants_in_separate_groups(tmp_path):
+    script = """import subprocess, sys, signal, os
+child = subprocess.Popen([sys.executable, '-c', 'import os,signal,time; signal.signal(signal.SIGTERM,signal.SIG_IGN); print(os.getpid(),flush=True); time.sleep(60)'], start_new_session=True)
+child.wait()
+"""
+    process = subprocess.Popen(['bash', str(ROOT / 'scripts/build/build-slot.sh'), sys.executable, '-c', script],
                                env={**os.environ, 'CUTEAFD_LOCK_DIR': str(tmp_path)},
                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True)
-    output, error = process.communicate(timeout=5)
-    assert process.returncode == 0, error
-    assert int(output.strip()) == process.pid
+    import selectors
+    with selectors.DefaultSelector() as selector:
+        selector.register(process.stdout, selectors.EVENT_READ)
+        assert selector.select(5)
+        pid = int(process.stdout.readline())
+    try:
+        process.terminate()  # only the entrypoint, not the child group
+        _, error = process.communicate(timeout=10)
+        assert process.returncode == 143, error
+        assert not Path(f'/proc/{pid}').exists()
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait()
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(pid, 9)
 
 
 def test_cpu_gate_terminated_in_lease_queue_writes_nonzero_receipt(tmp_path):
@@ -995,3 +1012,27 @@ def test_cache_stats_uses_configured_build_event_root(tmp_path, monkeypatch):
     assert receipt['event_root'] == str(root)
     assert receipt['hits'] == 14 and receipt['misses'] == 3
     assert calls[-1] == ['/kache', '--json', 'stats', '--root', str(root), '--full']
+
+
+def test_build_channel_waits_for_remote_descendants_to_stop(tmp_path):
+    # Model docker exec/SSH: the remote supervisor and exporter belong to a
+    # different session and receive only stdin EOF, not the caller's signal.
+    supervisor = str(ROOT / 'scripts/build/build-process.py')
+    remote = [sys.executable, supervisor, '--channel', '--grace', '0.5', '--',
+              sys.executable, '-c', 'import os,signal,time; signal.signal(signal.SIGTERM,signal.SIG_IGN); '
+              'print(os.getpid(),flush=True); time.sleep(30)']
+    relay = 'import subprocess,sys; sys.exit(subprocess.call(sys.argv[1:], start_new_session=True))'
+    with subprocess.Popen([sys.executable, supervisor, '--pipe', '--grace', '3', '--',
+                           sys.executable, '-c', relay, *remote], stdout=subprocess.PIPE, text=True) as process:
+        import selectors
+        with selectors.DefaultSelector() as selector:
+            selector.register(process.stdout, selectors.EVENT_READ)
+            assert selector.select(5)
+            pid = int(process.stdout.readline())
+        try:
+            process.terminate()
+            assert process.wait(timeout=5) == 143
+            assert not Path(f'/proc/{pid}').exists()
+        finally:
+            if process.poll() is None:
+                process.kill()

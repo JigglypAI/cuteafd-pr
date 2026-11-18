@@ -404,7 +404,7 @@ def test_every_cmake_export_runs_through_the_launcher():
 def test_wip_tries_cached_exports_before_any_export_turn():
     wip = (ROOT / "wip.sh").read_text()
     coordinator = wip[wip.index("build_coordinator() {"):]
-    assert coordinator.index("wip_cached_exports docker exec -e CUTEAFD_EXPORT_CACHE_REQUIRE_HIT=1") < \
+    assert coordinator.index("wip_cached_exports wip_exec docker exec -e CUTEAFD_EXPORT_CACHE_REQUIRE_HIT=1") < \
         coordinator.index("wip_coordinator_export_modes")
     expert = wip[wip.index("build_expert() ("):]
     assert expert.index("CUTEAFD_EXPORT_CACHE_REQUIRE_HIT=1") < expert.index("wip_seed_export_turn\n")

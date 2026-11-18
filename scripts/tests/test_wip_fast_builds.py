@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 
 import pytest
 
@@ -54,8 +55,9 @@ def test_adopts_a_verified_slot_and_reseals_only_its_identity(tmp_path):
     found = reuse(tmp_path, 'find', '--key', KEY, '--role', 'coordinator', '--slot', 'gate', '--exclude-root', str(root))
     assert found.returncode == 0, found.stderr
     assert Path(found.stdout.strip()) == source
+    assert reuse(tmp_path, 'claim', '--root', str(root), '--slot', 'gate', '--generation', 'fixture').returncode == 0
     adopted = reuse(tmp_path, 'adopt', '--key', KEY, '--role', 'coordinator', '--source', str(source),
-                    '--root', str(root), '--slot', 'gate', '--instance', 'mine', '--wip-root', str(root))
+                    '--root', str(root), '--slot', 'gate', '--generation', 'fixture', '--instance', 'mine', '--wip-root', str(root))
     assert adopted.returncode == 0, adopted.stderr
     target = root / 'slots/gate/coordinator'
     meta = seal_ok(target)
@@ -92,8 +94,9 @@ def test_own_slot_with_the_key_is_reused_in_place(tmp_path):
     found = reuse(tmp_path, 'find', '--key', KEY, '--role', 'coordinator', '--slot', 'gate', '--exclude-root', str(root))
     assert Path(found.stdout.strip()) == own
     before = (own / 'FINGERPRINT').read_text()
+    assert reuse(tmp_path, 'claim', '--root', str(root), '--slot', 'gate', '--generation', 'fixture').returncode == 0
     adopted = reuse(tmp_path, 'adopt', '--key', KEY, '--role', 'coordinator', '--source', str(own),
-                    '--root', str(root), '--slot', 'gate', '--instance', 'mine')
+                    '--root', str(root), '--slot', 'gate', '--generation', 'fixture', '--instance', 'mine')
     assert adopted.returncode == 0 and 'already holds' in adopted.stdout
     assert (own / 'FINGERPRINT').read_text() == before
 
@@ -148,7 +151,8 @@ def _wip_coordinator(tmp_path, hit, exports_cached=False, incomplete=False):
     cached = 'true' if exports_cached else 'false'
     for name, body in {'docker': 'printf "docker %s\\n" "$*" >> "$TRACE"\nprintf "image-id\\n"\n'
                                  'case "$*" in *CUTEAFD_EXPORT_CACHE_REQUIRE_HIT=1*) ' + cached + ' || exit 3;; esac',
-                       'python3': 'printf "turn %s\\n" "$*" >> "$TRACE"\ncase "$*" in *waiting-serving*) exit 1;; esac'}.items():
+                       'python3': 'case "$1" in */build-process.py) exec ' + sys.executable + ' "$@";; esac\n'
+                                  'printf "turn %s\\n" "$*" >> "$TRACE"\ncase "$*" in *waiting-serving*) exit 1;; esac'}.items():
         (tools / name).write_text('#!/bin/sh\n' + body + '\n')
         (tools / name).chmod(0o755)
     state = tmp_path / 'state'
@@ -402,7 +406,7 @@ def test_capable_builds_hold_no_outer_build_lock_or_seed_gate(tmp_path, monkeypa
     source = (ROOT / 'scripts/bench/wip-cards.py').read_text()
     assert "if build_role == 'both' and arm['build_lock_mode'] != 'native-phase':" in source
     wip = (ROOT / 'wip.sh').read_text()
-    assert '"$repo_root/scripts/build/build-slot.sh" "${coordinator_build[@]}" rust' in wip
+    assert 'build-slot.sh" python3 "$repo_root/scripts/build/build-process.py" --pipe' in wip
 
 
 def test_zero_spark_card_sets_build_coordinator_only(tmp_path, monkeypatch, capsys):
