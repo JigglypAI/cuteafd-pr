@@ -413,6 +413,9 @@ def test_optional_levers_are_default_off_and_documented():
                 assert lever["families"] == ["Muse"]
                 assert default == "family default"
                 assert 'muse_kv_cache="$(get KV_CACHE bf16)"' in (ROOT / "scripts/launch/run-family.sh").read_text()
+            elif key == "ATTENTION_PRECISION":
+                assert default == "bf16"
+                assert "`ATTENTION_PRECISION=fp8`" in lever["enable"]
             elif key == "SPECULATOR_FP8":
                 assert lever["families"] == ["Kimi K3"]
                 assert default == "auto"
