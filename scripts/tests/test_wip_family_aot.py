@@ -548,8 +548,13 @@ def test_kimi_shipping_k8_inventory_preserves_every_existing_geometry():
                 or isinstance(node, ast.FunctionDef) and node.name in definitions):
             exec(compile(ast.Module(body=[node], type_ignores=[]), '<trellis inventory>', 'exec'), scope)
     old_scope = dict(scope)
-    old_tree = ast.parse(source.replace('("kimik3", "glm", "glmf", "muse", "step5")',
-                                       '("glm", "glmf", "muse", "step5")'))
+    old_tree = ast.parse(source)
+    generator = next(node for node in old_tree.body if isinstance(node, ast.FunctionDef) and node.name == 'shapes_for')
+    width_families = next(node.comparators[0] for node in ast.walk(generator) if isinstance(node, ast.Compare)
+                          and isinstance(node.left, ast.Name) and node.left.id == 'family'
+                          and isinstance(node.ops[0], ast.In) and isinstance(node.comparators[0], ast.Tuple))
+    assert 'kimik3' in ast.literal_eval(width_families)
+    width_families.elts = [name for name in width_families.elts if ast.literal_eval(name) != 'kimik3']
     for node in old_tree.body:
         if isinstance(node, ast.FunctionDef) and node.name in ('shapes_for', 'row_policies'):
             exec(compile(ast.Module(body=[node], type_ignores=[]), '<old trellis inventory>', 'exec'), old_scope)
