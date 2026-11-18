@@ -753,6 +753,10 @@ mod tests {
                 assert!(body.contains(guard), "{name} lost its ownership guard {guard:?}");
             }
         }
+        // The compute stream can read a forked tail as soon as replay is published.
+        let replay = bodies(production).into_iter().find(|(name, _)| *name == "restore_encoder_prefix")
+            .expect("partial restore").1;
+        assert!(replay.find("self.prefix_drain()?").unwrap() < replay.find("request.phase =").unwrap());
         // The request layer captures only a request with no pending prefill or history.
         let requests = include_str!("../v41_requests.rs");
         for name in ["pub fn capture_mark", "pub fn queue_mark"] {

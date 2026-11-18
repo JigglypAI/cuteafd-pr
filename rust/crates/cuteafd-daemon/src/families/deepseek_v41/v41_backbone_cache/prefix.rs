@@ -111,6 +111,9 @@ impl<'a> BackboneCache<'a> {
             Ok(())
         })();
         result?; // The shared prefix engine drains and rolls back failed admissions.
+        // Replay reads forked tail rows on compute streams. Single-device
+        // publication need not drain the prefix copy stream on its own.
+        self.prefix_drain()?;
         let request = self.requests[lease.slot]
             .as_mut()
             .expect("validated fresh admission");
