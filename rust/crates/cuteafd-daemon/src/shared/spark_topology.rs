@@ -346,11 +346,13 @@ print(json.dumps(capture_real_eight_rank_launch(*map(Path, sys.argv[2:]))))
             "rust/crates/cuteafd-loader/src/families/inkling2/fixtures/config.json"))?)?;
         config.as_object_mut().unwrap().remove("vision_config");
         config.as_object_mut().unwrap().remove("mtp_config");
-        // This sweep checks count/dispatch contracts, not release-size fit.
-        // Retain real expert/hidden geometry and both local/global kinds.
-        config["text_config"]["num_hidden_layers"] = 4.into();
-        config["text_config"]["local_layer_ids"] = serde_json::json!([0, 1, 2]);
-        config["text_config"]["n_layers_per_attn_res_block"] = 2.into();
+        // Keep a subset of the real layer pattern with enough routed bytes
+        // to exercise the eight-rank size policy in every expert format.
+        let layers = if format == "mxfp8" { 12 } else { 24 };
+        let text = &mut config["text_config"];
+        text["num_hidden_layers"] = layers.into();
+        text["local_layer_ids"].as_array_mut().unwrap()
+            .retain(|id| id.as_u64().unwrap() < layers);
         if format == "exl3" { config["quantization_config"] = testing::exl3_compact(4); }
         let cfg = Inkling2Config::from_hf(&config)?;
         let mut tensors = vec![t("model.llm.embed.weight", "BF16", &[cfg.vocab_size, cfg.hidden]),
@@ -391,7 +393,7 @@ print(json.dumps(capture_real_eight_rank_launch(*map(Path, sys.argv[2:]))))
                     }
                 }
             } else {
-                let nvfp4 = format == "nvfp4" && layer < 3;
+                let nvfp4 = format == "nvfp4" && layer + 8 < cfg.layers;
                 for (name, n, k) in [("w13", 4608, 4608), ("w2", 4608, 2304)] {
                     tensors.push(t(format!("{p}.mlp.experts.{name}_weight"), if nvfp4 { "U8" } else { "F8_E4M3" },
                         &[384, n, k / if nvfp4 { 2 } else { 1 }]));
