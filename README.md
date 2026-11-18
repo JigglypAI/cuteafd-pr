@@ -39,40 +39,28 @@ record **8K w/tail**: three served prefill units plus 40 tokens (8,296 at
 2,752 rows/unit), omitted from card images and README tables.
 Decode and agentic-session workloads are unchanged.
 
-## What's new in v5.0.0
+## What's new in v6.0.0
 
-- **New models:** Mistral Large 4 (K4 experts, native K6 core, Pixtral vision)
-  and Muse Spark (vision and PCM audio, both DFlash2 drafters). Step-5 EXL3
-  gets a native K6 core, GLM 5.3 Flash EXLR8 runs natively, and Kimi K3 adds a
-  single-RTX card (1× RTX + 6 Sparks).
-- **Multi-core checkpoints:** MC repositories contain the original BF16 core
-  and complete K8/K6 trellis core views over shared EXL3 experts. `CORE_VIEW`
-  selects `original` (default), `k8-compact`, `k6-compact` or runtime-derived
-  `fp8-compact`; memory admission follows the selected view. See
-  [the MC contract](docs/mc-checkpoints.md) for availability and conversion scope.
-- **Decode CUDA graphs in every family,** in one bounded cache per GPU that
-  pre-captures the most-replayed shapes at startup. A capture that runs out of
-  memory falls back to eager instead of failing.
-- **One memory admission policy:** each device has a single cap
-  (`GPU_MEMORY_CAP`, `SPARK_MEMORY_CAP`), and every allocation is charged to a
-  named, measured owner. Weights load into one packed arena per GPU, and the
-  `/memory` dashboard shows each owner's admitted and live bytes.
-- **Speculation:** `DRAFT_LENGTH` fixes the draft length in every family;
-  DFlash2 and dSpark split across both GPUs on dual RTX.
-- **Concurrency up to 64,** with every concurrency-dependent size derived at
-  boot; KV is reserved in decode chunks, not the whole output up front.
-- **Spark-free layouts:** the planner decides whether the RTX GPUs alone can
-  hold a model (`SPARK_COUNT=0`), and GLM 5.3 and Mistral Large 4 can onboard
-  whole expert layers on one RTX.
-- **Serving:**
-  - tool-call argument streaming;
-  - loop abort;
-  - distinct 429s for a full queue and an expired wait;
-  - bad requests return 400 without stopping the server;
-  - a stall watchdog;
-  - expert-usage heat maps at `/experts`.
+- **New models:** Kimi K3.1 Pro with gated sparse attention and a native
+  dSpark drafter; MiniMax M3.1 Flash with its bundled vision tower and dSpark;
+  and Inkling 2 Small with its bundled vision tower and dSpark, native NVFP4
+  and MXFP8 checkpoints, and an EXL3 multi-core checkpoint. Inkling supports
+  both single- and dual-RTX coordinator layouts.
+- **Uniform multi-core views:** MC checkpoints support `original` (the
+  default), `k8-compact`, `k6-compact`, and `fp8-compact`. The planner fits the
+  selected view without loading a second copy of the routed experts.
+- **History-based speculation:** One draft policy works across families and
+  drafters. It adapts verification depth to each request's recent acceptance
+  rates and uses a shared prior for new requests.
+- **Attention quality tiers:** `ATTENTION_PRECISION=bf16` picks a qualified
+  BF16-quality kernel, regardless of its operand format. The opt-in `fp8`
+  tier selects the lower-precision path where supported, without changing
+  KV storage.
+- **KV pool sizing:** The planner fixes placement and expert onboarding at the
+  configured target, then grows the pool into the remaining admitted memory.
+  Set `KV_MAX_TOKENS` to cap that growth.
 
-Full notes: [v5.0.0 release](https://github.com/tpurtell/cuteafd/releases/tag/v5.0.0) ·
+Full notes: [v6.0.0 release](https://github.com/tpurtell/cuteafd/releases/tag/v6.0.0) ·
 [all releases](https://github.com/tpurtell/cuteafd/releases)
 
 ## Models
