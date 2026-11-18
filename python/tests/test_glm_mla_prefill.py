@@ -17,7 +17,8 @@ import pytest
 
 FORK = Path(__file__).resolve().parents[2] / "third_party" / "sparkinfer"
 ROWS = (64, 1536, 2048, 2688, 2752, 4096)  # 2688 is the tail of 8192 at a 2752 unit.
-ARMS = ("native-fp8", "native-bf16", "mg-bf16")
+NATIVE_ARMS = {"native-fp8": 1, "native-bf16": 2, "exact-f16": 3}
+ARMS = (*NATIVE_ARMS, "mg-bf16")
 
 
 def run_case(fmt, library, timing=False):
@@ -68,7 +69,7 @@ def run_case(fmt, library, timing=False):
         else:
             ptrs = [t.data_ptr() for t in (q, packed, indices, lengths, out)]
             rc = native(*ptrs, q.shape[0], heads, topk, rec, scale * math.log2(math.e),
-                        2 if arm == "native-bf16" else 1, torch.cuda.current_stream().cuda_stream,
+                        NATIVE_ARMS[arm], torch.cuda.current_stream().cuda_stream,
                         lse.data_ptr() if lse is not None else None)
             assert rc == 0, (fmt, arm, rc)
 
@@ -137,7 +138,7 @@ def run_case(fmt, library, timing=False):
     # nonzero-length/all-negative row independently.
     mask[1].fill_(-1)
     scores["all_negative_native"] = compare("all_negative", query(3, "spread"), mask[:3],
-                                            torch.tensor(edges[:3], device=dev, dtype=torch.int32), ARMS[:2])
+                                            torch.tensor(edges[:3], device=dev, dtype=torch.int32), NATIVE_ARMS)
     result = {"device": torch.cuda.get_device_name(), "capability": torch.cuda.get_device_capability(),
               "heads": heads, "topk": topk, "oracle": scores, "curve": {}}
     if timing:

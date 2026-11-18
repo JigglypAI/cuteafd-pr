@@ -126,16 +126,17 @@ struct Smem {
 // (swizzled 16-byte units), RoPE rows [2][kT][64] BF16 (GLM 5.x), the small
 // exchange buffers, and the FP32 partial scores [2 groups][4 warps][16][kPartStride].
 constexpr int kRopeBytes = 2 * kT * kRope * 2;
-template <bool kHasRope, bool kBf16 = false>
+template <bool kHasRope, bool kBf16 = false, bool kExactCodes = kBf16>
 __host__ __device__ constexpr int smem_bytes() {
-  return 2 * kT * kTileRowBytes + (kHasRope ? kRopeBytes : 0) + int(sizeof(Smem)) + 2 * 4 * 16 * kPartStride * 4 + (kBf16 ? 2 * kT * 16 : 0);
+  return 2 * kT * kTileRowBytes + (kHasRope ? kRopeBytes : 0) + int(sizeof(Smem)) + 2 * 4 * 16 * kPartStride * 4 + (kExactCodes ? 2 * kT * 16 : 0);
 }
 
-template <bool kHasRope, bool kBf16 = false>
+template <bool kHasRope, bool kBf16 = false, bool kExactCodes = kBf16>
 __global__ void __launch_bounds__(kThreads, 1)
 mla_prefill_kernel(const bf16* __restrict__ q, const uint8_t* __restrict__ kv, const int32_t* __restrict__ indices,
                    const int32_t* __restrict__ lengths, bf16* __restrict__ out, int heads, int topk, int rec,
                    float scale_log2, float* lse = nullptr) {
+  static_assert(!kBf16 || kExactCodes);
   constexpr int kQk = kHasRope ? kD + kRope : kD;
   extern __shared__ __align__(128) uint8_t smem[];
   uint8_t* tile = smem;                                        // [2][kT][1024]
@@ -197,6 +198,9 @@ mla_prefill_kernel(const bf16* __restrict__ q, const uint8_t* __restrict__ kv, c
     ra[3] = *reinterpret_cast<const uint32_t*>(q_hi + 8);
   }
   const float down_lo = 1.0f / up_lo, down_hi = 1.0f / up_hi;
+  // Exact-code F16 PV folds each record scale into P. A fixed power-of-two
+  // lift preserves small products for GLM-scale records; undo it at output.
+  constexpr float pv_lift = kExactCodes && !kBf16 ? 256.0f : 1.0f;
 
   // Slots of tile i into the index ring (written three tiles ahead of the mask).
   auto index = [&](int i) {
@@ -233,10 +237,10 @@ mla_prefill_kernel(const bf16* __restrict__ q, const uint8_t* __restrict__ kv, c
       cp_async_commit();
     }
   };
-  // Codes x group scale -> F16 tile buffer `buffer`.
+  // Exact-code modes keep the FP32 scales separate from the widened tile.
   auto convert = [&](int buffer) {
     uint8_t* rows = tile + (buffer * kT + my_token) * kTileRowBytes;
-    if constexpr (kBf16) {
+    if constexpr (kExactCodes) {
       if (part8 == 0) *reinterpret_cast<float4*>(tile_scales + (buffer * kT + my_token) * 4) =
           make_float4(scales[0], scales[1], scales[2], scales[3]);
     }
@@ -248,10 +252,10 @@ mla_prefill_kernel(const bf16* __restrict__ q, const uint8_t* __restrict__ kv, c
 #pragma unroll
       for (int k = 0; k < 4; ++k) {
         const float2 a = e4m3x2_to_float2(words[k]), b = e4m3x2_to_float2(words[k] >> 16);
-        if constexpr (kBf16) {
-          // E4M3 codes widen exactly; defer the FP32 record scale until after QK.
-          h[2 * k] = pack_bf16(a.x, a.y);
-          h[2 * k + 1] = pack_bf16(b.x, b.y);
+        if constexpr (kExactCodes) {
+          // E4M3 codes widen exactly to either 16-bit operand type.
+          h[2 * k] = kBf16 ? pack_bf16(a.x, a.y) : pack_f16(a.x, a.y);
+          h[2 * k + 1] = kBf16 ? pack_bf16(b.x, b.y) : pack_f16(b.x, b.y);
         } else {
           h[2 * k] = pack_f16(a.x * scales[j], a.y * scales[j]);
           h[2 * k + 1] = pack_f16(b.x * scales[j], b.y * scales[j]);
@@ -321,7 +325,7 @@ mla_prefill_kernel(const bf16* __restrict__ q, const uint8_t* __restrict__ kv, c
 #pragma unroll
     for (int n = 0; n < 4; ++n) {
       const int t0 = 8 * n + 2 * t4;
-      if constexpr (kBf16) {
+      if constexpr (kExactCodes) {
         const float s0 = tile_scales[(stage * kT + t0) * 4 + cw];
         const float s1 = tile_scales[(stage * kT + t0 + 1) * 4 + cw];
         sn[n][0] *= s0; sn[n][1] *= s1;
@@ -378,15 +382,17 @@ mla_prefill_kernel(const bf16* __restrict__ q, const uint8_t* __restrict__ kv, c
     // This warp's slice sums (its records only); the four slices meet at the end.
     l_lo = l_lo * corr_lo + e0 + e1;
     l_hi = l_hi * corr_hi + e2 + e3;
-    if constexpr (kBf16) {
+    if constexpr (kExactCodes) {
       // All score readers passed the maxima barrier; reuse their storage for four P*scale copies.
-      bf16* p = reinterpret_cast<bf16*>(part + group * 4 * 16 * kPartStride);
+      uint16_t* p = reinterpret_cast<uint16_t*>(part + group * 4 * 16 * kPartStride);
 #pragma unroll
       for (int w = 0; w < 4; ++w) {
-        const float s0 = tile_scales[(stage * kT + t0) * 4 + w];
-        const float s1 = tile_scales[(stage * kT + t0 + 1) * 4 + w];
-        *reinterpret_cast<uint32_t*>(p + (w * 16 + g) * kPStride + t0) = pack_bf16(e0 * s0, e1 * s1);
-        *reinterpret_cast<uint32_t*>(p + (w * 16 + g + 8) * kPStride + t0) = pack_bf16(e2 * s0, e3 * s1);
+        const float s0 = tile_scales[(stage * kT + t0) * 4 + w] * pv_lift;
+        const float s1 = tile_scales[(stage * kT + t0 + 1) * 4 + w] * pv_lift;
+        *reinterpret_cast<uint32_t*>(p + (w * 16 + g) * kPStride + t0) =
+            kBf16 ? pack_bf16(e0 * s0, e1 * s1) : pack_f16(e0 * s0, e1 * s1);
+        *reinterpret_cast<uint32_t*>(p + (w * 16 + g + 8) * kPStride + t0) =
+            kBf16 ? pack_bf16(e2 * s0, e3 * s1) : pack_f16(e2 * s0, e3 * s1);
       }
     } else {
       *reinterpret_cast<uint32_t*>(&s.p[group][g][t0]) = pack_f16(e0, e1);
@@ -405,7 +411,7 @@ mla_prefill_kernel(const bf16* __restrict__ q, const uint8_t* __restrict__ kv, c
 #pragma unroll
       for (int kk = 0; kk < 2; ++kk) {
         uint32_t pa[4];
-        const uint16_t* p = kBf16
+        const uint16_t* p = kExactCodes
             ? reinterpret_cast<const uint16_t*>(part + group * 4 * 16 * kPartStride) + cw * 16 * kPStride
             : reinterpret_cast<const uint16_t*>(&s.p[group][0][0]);
         ldsm_x4(pa, smem_addr(p + (r + 8 * (mi & 1)) * kPStride + 16 * kk + 8 * (mi >> 1)));
@@ -448,7 +454,7 @@ mla_prefill_kernel(const bf16* __restrict__ q, const uint8_t* __restrict__ kv, c
     lse[int64_t(row) * heads + head0 + g] = l_lo > 0 ? (m_lo + log2f(l_lo)) * CUDART_LN2_F : -CUDART_INF_F;
     lse[int64_t(row) * heads + head0 + g + 8] = l_hi > 0 ? (m_hi + log2f(l_hi)) * CUDART_LN2_F : -CUDART_INF_F;
   }
-  const float inv_lo = l_lo > 0 ? 1.0f / l_lo : 0.0f, inv_hi = l_hi > 0 ? 1.0f / l_hi : 0.0f;
+  const float inv_lo = l_lo > 0 ? (1.0f / pv_lift) / l_lo : 0.0f, inv_hi = l_hi > 0 ? (1.0f / pv_lift) / l_hi : 0.0f;
   bf16* o_lo = out + (int64_t(row) * heads + head0 + g) * kD + cw * 128 + 2 * t4;
   bf16* o_hi = o_lo + 8 * kD;
 #pragma unroll
@@ -961,56 +967,48 @@ int launch_e4m3_records(const void* q, const void* kv, const void* indices, cons
              : launch_e4m3_heads<false>(q, kv, indices, lengths, out, rows, heads, topk, record_bytes, scale_log2, s, lse);
 }
 
+template <bool kHasRope, bool kBf16, bool kExactCodes>
+int launch_16(const void* q, const void* kv, const void* indices, const void* lengths, void* out, int rows,
+              int heads, int topk, int record_bytes, float scale_log2, cudaStream_t stream, float* lse) {
+  auto kernel = mla_prefill_kernel<kHasRope, kBf16, kExactCodes>;
+  constexpr int bytes = smem_bytes<kHasRope, kBf16, kExactCodes>();
+  cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, bytes);
+  kernel<<<dim3(rows, heads / kHeads), kThreads, bytes, stream>>>(
+      static_cast<const bf16*>(q), static_cast<const uint8_t*>(kv), static_cast<const int32_t*>(indices),
+      static_cast<const int32_t*>(lengths), static_cast<bf16*>(out), heads, topk, record_bytes, scale_log2, lse);
+  return cudaGetLastError();
+}
+
+template <bool kBf16, bool kExactCodes>
+int launch_16_records(const void* q, const void* kv, const void* indices, const void* lengths, void* out,
+                      int rows, int heads, int topk, int record_bytes, float scale_log2, cudaStream_t stream, float* lse) {
+  return record_bytes == 656
+             ? launch_16<true, kBf16, kExactCodes>(q, kv, indices, lengths, out, rows, heads, topk, record_bytes, scale_log2, stream, lse)
+             : launch_16<false, kBf16, kExactCodes>(q, kv, indices, lengths, out, rows, heads, topk, record_bytes, scale_log2, stream, lse);
+}
+
 }  // namespace
 
 // out [rows, heads, 512] BF16 = sparse MLA of q [rows, heads, 576 or 512] BF16
 // over the records kv (slot * record_bytes; 656 with RoPE, 528 without) at
 // indices [rows, topk] (the first lengths[r] entries; negative ones masked).
 // scale_log2 = softmax scale * log2(e). heads must be a multiple of 32.
-// kernel: 0 F16 reference, 1 E4M3 (two-term query and P), 2 BF16 QK/PV, FP32 accumulation.
+// kernel: 0 F16 reference, 1 E4M3 (two-term query and P), 2 exact codes / BF16,
+// 3 exact codes / shifted F16. Accumulation is always FP32.
 extern "C" int32_t cuteafd_glm_mla_prefill_lse(const void* q, const void* kv, const void* indices, const void* lengths,
                                            void* out, int32_t rows, int32_t heads, int32_t topk,
                                            int32_t record_bytes, float scale_log2, int32_t kernel, void* stream, float* lse) {
   if (rows < 1 || heads % kHeads || topk < 1 || (record_bytes != 656 && record_bytes != 528) || kernel < 0 ||
-      kernel > 2) {
+      kernel > 3) {
     return cudaErrorInvalidValue;
   }
   auto s = static_cast<cudaStream_t>(stream);
   if (kernel == 1) {
     return launch_e4m3_records(q, kv, indices, lengths, out, rows, heads, topk, record_bytes, scale_log2, s, lse);
   }
-  if (kernel == 2) {
-    const dim3 grid(rows, heads / kHeads);
-    if (record_bytes == 656) {
-      constexpr int bytes = smem_bytes<true, true>();
-      cudaFuncSetAttribute(mla_prefill_kernel<true, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, bytes);
-      mla_prefill_kernel<true, true><<<grid, kThreads, bytes, s>>>(
-          static_cast<const bf16*>(q), static_cast<const uint8_t*>(kv), static_cast<const int32_t*>(indices),
-          static_cast<const int32_t*>(lengths), static_cast<bf16*>(out), heads, topk, record_bytes, scale_log2, lse);
-    } else {
-      constexpr int bytes = smem_bytes<false, true>();
-      cudaFuncSetAttribute(mla_prefill_kernel<false, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, bytes);
-      mla_prefill_kernel<false, true><<<grid, kThreads, bytes, s>>>(
-          static_cast<const bf16*>(q), static_cast<const uint8_t*>(kv), static_cast<const int32_t*>(indices),
-          static_cast<const int32_t*>(lengths), static_cast<bf16*>(out), heads, topk, record_bytes, scale_log2, lse);
-    }
-    return cudaGetLastError();
-  }
-  const bool rope = record_bytes == 656;
-  const int bytes = rope ? smem_bytes<true>() : smem_bytes<false>();
-  const dim3 grid(rows, heads / kHeads);
-  if (rope) {
-    cudaFuncSetAttribute(mla_prefill_kernel<true>, cudaFuncAttributeMaxDynamicSharedMemorySize, bytes);
-    mla_prefill_kernel<true><<<grid, kThreads, bytes, s>>>(
-        static_cast<const bf16*>(q), static_cast<const uint8_t*>(kv), static_cast<const int32_t*>(indices),
-        static_cast<const int32_t*>(lengths), static_cast<bf16*>(out), heads, topk, record_bytes, scale_log2, lse);
-  } else {
-    cudaFuncSetAttribute(mla_prefill_kernel<false>, cudaFuncAttributeMaxDynamicSharedMemorySize, bytes);
-    mla_prefill_kernel<false><<<grid, kThreads, bytes, s>>>(
-        static_cast<const bf16*>(q), static_cast<const uint8_t*>(kv), static_cast<const int32_t*>(indices),
-        static_cast<const int32_t*>(lengths), static_cast<bf16*>(out), heads, topk, record_bytes, scale_log2, lse);
-  }
-  return cudaGetLastError();
+  if (kernel == 2) return launch_16_records<true, true>(q, kv, indices, lengths, out, rows, heads, topk, record_bytes, scale_log2, s, lse);
+  if (kernel == 3) return launch_16_records<false, true>(q, kv, indices, lengths, out, rows, heads, topk, record_bytes, scale_log2, s, lse);
+  return launch_16_records<false, false>(q, kv, indices, lengths, out, rows, heads, topk, record_bytes, scale_log2, s, lse);
 }
 
 // Serving ABI: no diagnostic allocation or LSE write on the hot path.
