@@ -103,10 +103,12 @@ implements Hy4-flash and its EXL3 experts can discover the original view from
 All views index the four byte-identical native BF16 tables in dedicated
 shards ({native_gib:.2f} GiB). The separate FP8 alternate ({fp8_gib:.2f} GiB)
 packs 96 E4M3 codes and a little-endian F32 scale into each dense 100-byte row.
-The export uses the F32 per-row max magnitude / 448 scale, E4M3
-round-to-nearest-even, then compares the decoded row against the complete
-`x + (decoded - x)` roundtrip. Zero codes are stored as +0. Across
-{rows:,} source rows, the all-row F32 comparison found {mismatches} mismatches.
+The export uses stock BF16 lookup arithmetic to select E4M3 codes and
+stores the BF16-rounded scale as F32. It multiplies the stored code and scale
+in F32 and casts the result to BF16. Every decoded row is compared bitwise
+with the complete stock BF16 `x + (decoded - x)` expression, including
+signed zero. Across {rows:,} source rows, the comparison found
+{mismatches} mismatches.
 `cuteafd-mc.json` carries the alternate layout, row ranges and proof digests.
 The ordinary indexes reference the BF16 tables.
 

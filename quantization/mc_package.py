@@ -696,7 +696,7 @@ def _validate_direct_engram(output, manifest, state):
         expected_rows = hy4.ENGRAM_TABLES[tensor]
         verification = proof[tensor]
         if (verification.get('rows') != expected_rows or verification.get('mismatch_count') != 0
-                or verification.get('reference_dtype') != 'F32'
+                or verification.get('reference_dtype') != 'BF16'
                 or verification.get('expression') != 'x + (decoded - x)'):
             raise ValueError('Engram all-row proof differs')
         native = state['direct_expected_mappings']['original'][tensor]
