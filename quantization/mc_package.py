@@ -675,6 +675,59 @@ def audit_ml4(output):
     return {k:v for k,v in receipt.items() if not k.endswith('tensor_sha256')}
 
 
+def _validate_direct_engram(output, manifest, state):
+    """Bind unindexed alternate headers to all-row and streamed write receipts."""
+    engram = manifest.get('engram_fp8')
+    proof = state.get('engram_fp8_proof', {})
+    if state['identity']['family'] != 'hy4_flash':
+        if engram is not None and 'direct_expected_specs' in state:
+            raise ValueError('unexpected Engram alternate in direct package')
+        return
+    from hy4_flash import recipe as hy4
+    if engram is None or proof.keys() != hy4.ENGRAM_TABLES.keys():
+        raise ValueError('Hy4-flash requires all four proven Engram alternates')
+    if {layer['tensor'] for layer in engram['layers']} != hy4.ENGRAM_TABLES.keys():
+        raise ValueError('Engram alternate tensor set differs from the pinned sources')
+    if not engram['recipe'].endswith('; reference=' + hy4.REFERENCE_REVISION):
+        raise ValueError('Engram alternate reference revision differs')
+    table_files = set()
+    for layer in engram['layers']:
+        tensor = layer['tensor']
+        expected_rows = hy4.ENGRAM_TABLES[tensor]
+        verification = proof[tensor]
+        if (verification.get('rows') != expected_rows or verification.get('mismatch_count') != 0
+                or verification.get('reference_dtype') != 'F32'
+                or verification.get('expression') != 'x + (decoded - x)'):
+            raise ValueError('Engram all-row proof differs')
+        native = state['direct_expected_mappings']['original'][tensor]
+        header, _ = read_header(output / native)
+        if set(header) - {'__metadata__'} != {tensor}:
+            raise ValueError('BF16 Engram shard must contain only its table')
+        if (state['new_shards'][native]['original_tensor_proofs'][tensor]['sha256']
+                != layer['sha256']):
+            raise ValueError('BF16 Engram manifest tensor SHA differs from writer proof')
+        offset = 0
+        for part in layer['parts']:
+            filename = part['file']
+            table_files.add(filename)
+            record = state['new_shards'][filename]
+            header, _ = read_header(output / filename)
+            metadata = header.get('__metadata__', {})
+            spec = header.get(part['tensor'], {})
+            if (record['sha256'] != part['sha256'] or set(header) - {'__metadata__'} != {part['tensor']}
+                    or spec.get('dtype') != 'U8' or spec.get('shape') != [part['rows'], engram['row_bytes']]
+                    or metadata.get('engram_layout') != engram['layout']
+                    or metadata.get('row_start') != str(offset)):
+                raise ValueError('FP8 Engram header or writer receipt differs')
+            offset += part['rows']
+        if offset != expected_rows:
+            raise ValueError('FP8 Engram parts do not cover all source rows')
+    selected_files = {filename for mapping in state['direct_expected_mappings'].values()
+                      for filename in mapping.values()}
+    if selected_files & table_files or set(state['new_shards']) != selected_files | table_files:
+        raise ValueError('Hy4-flash alternate must be physically separate and only in the MC manifest')
+
+
 def validate(output, *, verification='full'):
     """Validate payloads by default; direct writers may reuse streaming proofs."""
     if verification not in ('full', 'streaming-receipts'):
@@ -683,12 +736,17 @@ def validate(output, *, verification='full'):
     state = load_json(output / 'package-state.json')
     if state['identity']['schema'] != 'cuteafd-core-package-v1':
         raise ValueError('unsupported package receipt')
-    if verification == 'streaming-receipts' and (state['identity'].get('family') != 'inkling2'
+    family = state['identity']['family']
+    if verification == 'streaming-receipts' and (family not in ('inkling2', 'hy4_flash')
             or 'direct_expected_specs' not in state or state.get('copies') != {}):
-        raise ValueError('streaming receipts require an independent direct Inkling package')
-    if (verification == 'streaming-receipts' and set(state['source_tensor_locations'])
-            != set(state['core_tensors']['original'])):
-        raise ValueError('original streaming proof inventory is incomplete')
+        raise ValueError('streaming receipts require an independent direct package')
+    if verification == 'streaming-receipts':
+        source_names = set(state['core_tensors']['original'])
+        if family == 'hy4_flash':
+            source_names.update(n for n in state['direct_expected_specs']['original']
+                                if '.mlp.experts.' not in n)
+        if set(state['source_tensor_locations']) != source_names:
+            raise ValueError('original streaming proof inventory is incomplete')
     for filename, receipt in state['new_shards'].items():
         verify_receipt(output / filename, receipt, checksum=verification == 'full')
     if 'direct_expected_specs' in state:
@@ -699,9 +757,9 @@ def validate(output, *, verification='full'):
                       for filename in state['new_shards'])
         if payload != state['direct_payload_bytes']:
             raise ValueError('direct physical payload differs from committed inventory')
-    family = state['identity']['family']
     if family != 'ml4':
-        mc_manifest.validate(load_json(output / mc_manifest.MANIFEST), output)
+        manifest = mc_manifest.validate(load_json(output / mc_manifest.MANIFEST), output)
+        _validate_direct_engram(output, manifest, state)
     views = {}
     for view, core in state['core_tensors'].items():
         index, config, quantize, _ = mc_manifest.FILES[view]
@@ -718,6 +776,14 @@ def validate(output, *, verification='full'):
                         raise ValueError('original direct view still declares quantized core')
                     continue
                 bits = mc_manifest.FILES[view][3]
+                if view == 'k6-compact' and module in state.get('direct_k6_bit_overrides', {}):
+                    if selected[module].get('group') != 'mtp' or state['direct_k6_bit_overrides'][module] != 8:
+                        raise ValueError('invalid K6 drafter fallback')
+                    bits = 8
+                    original_map = state['direct_expected_mappings']['k8-compact']
+                    if any(inv['mapping'].get(module + '.' + suffix) != original_map[module + '.' + suffix]
+                           for suffix in SUFFIXES):
+                        raise ValueError('K6 drafter fallback must alias the K8 shard')
                 entry = q['tensor_storage'].get(module, {})
                 if entry.get('bits_per_weight') != bits:
                     raise ValueError('direct compact core metadata width differs')

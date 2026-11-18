@@ -78,6 +78,9 @@ class DirectMCWriter:
     only their transient encode files after ``write_group`` returns.
     """
 
+    family = 'inkling2'
+    prove_shared_source = False
+
     def __init__(self, output, source_snapshot, source_repo, source_revision, identity,
                  source_inventory, *, shard_target=2_000_000_000):
         self.output = Path(output).resolve()
@@ -101,7 +104,7 @@ class DirectMCWriter:
             if set(location) != {'shard', 'source_name'} or location['shard'] != inv['mapping'][name]:
                 raise ValueError('source alias inventory differs')
             _basename(location['shard'])
-        identity = dict(deepcopy(identity), schema='cuteafd-core-package-v1', family='inkling2',
+        identity = dict(deepcopy(identity), schema='cuteafd-core-package-v1', family=self.family,
                         source_repo=source_repo, source_revision=source_revision)
         self.identity = json.loads(canonical(identity))
         self.output.mkdir(parents=True, exist_ok=True)
@@ -131,8 +134,8 @@ class DirectMCWriter:
         if not isinstance(label, str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_-]{0,95}', label):
             raise ValueError('unsafe direct group label')
         entries = dict(zip(KINDS, (shared or {}, original or {}, k8 or {}, k6 or {})))
-        references = {kind: {n: [str(Path(p).resolve()), source_name]
-                            for n, (p, source_name) in values.items()} for kind, values in entries.items()}
+        references = {kind: {name: [str(Path(entry[0]).resolve()), *entry[1:]]
+                            for name, entry in values.items()} for kind, values in entries.items()}
         previous = self.state['groups'].get(label)
         if previous and previous['entries'] != references:
             raise ValueError('direct group recovery entries differ')
@@ -152,21 +155,28 @@ class DirectMCWriter:
         headers, specs, sizes, inputs = {}, {}, {}, {}
         for kind, values in references.items():
             specs[kind], sizes[kind] = {}, {}
-            for name, (path, source_name) in values.items():
+            for name, (path, source_name, *extent) in values.items():
                 if not name or any(c in name for c in '\0\n\r'):
                     raise ValueError('invalid published tensor name')
                 p = Path(path)
                 if self.output == p or self.output in p.parents:
                     raise ValueError('direct input cannot reference output')
-                if path not in headers:
-                    headers[path], _ = read_header(p)
-                    inputs[path] = file_identity(p)
-                value = headers[path][source_name]
+                if len(extent) not in (0, 2):
+                    raise ValueError('direct input requires a complete file or an offset and length')
+                key = (path, *extent)
+                if key not in headers:
+                    if extent:
+                        headers[key], _ = read_header(p, offset=extent[0], length=extent[1])
+                    else:
+                        headers[key], _ = read_header(p)
+                    inputs.setdefault(path, file_identity(p))
+                value = headers[key][source_name]
                 specs[kind][name] = [value['dtype'], value['shape']]
                 sizes[kind][name] = value['data_offsets'][1] - value['data_offsets'][0]
-                if kind == 'original':
+                if kind == 'original' or (kind == 'shared' and self.prove_shared_source
+                                          and name in self.source_inventory['locations']):
                     location = self.source_inventory['locations'].get(name)
-                    if (not location or p != (self.source / location['shard']).resolve()
+                    if (extent or not location or p != (self.source / location['shard']).resolve()
                             or source_name != location['source_name']
                             or specs[kind][name] != self.source_inventory['specs'][name]):
                         raise ValueError('original tensor differs from reviewed source alias')
@@ -178,14 +188,20 @@ class DirectMCWriter:
         self.state['groups'][label] = group
         atomic_json(self.state_path, self.state)
         for kind, values in references.items():
-            for number, names in enumerate(package.shard_groups(values, sizes[kind], self.shard_target), 1):
-                filename = f'{kind}-{label}-{number:04d}.safetensors'
-                receipt = package.write_shard(self.output, filename, {n: values[n] for n in names},
-                    dict(producer=self.identity, group=label, kind=kind,
-                         inputs={p: inputs[p] for p in sorted({values[n][0] for n in names})}),
-                    prove_original=kind == 'original', verify_checksum=False)
-                group['shards'].append(dict(filename=filename, kind=kind, names=names, receipt=receipt))
-                atomic_json(self.state_path, self.state)
+            native = (values.keys() & self.source_inventory['locations'].keys()
+                      if kind == 'shared' and self.prove_shared_source else set())
+            # Keep immutable byte-copy proofs separate from compressed scratch
+            # extents. Only the latter can reside in an append-only segment.
+            partitions = [('native', native, True), (kind, values.keys() - native, kind == 'original')]
+            for prefix, members, prove in partitions:
+                for number, names in enumerate(package.shard_groups(members, sizes[kind], self.shard_target), 1):
+                    filename = f'{prefix}-{label}-{number:04d}.safetensors'
+                    receipt = package.write_shard(self.output, filename, {n: values[n] for n in names},
+                        dict(producer=self.identity, group=label, kind=kind,
+                             inputs={p: inputs[p] for p in sorted({values[n][0] for n in names})}),
+                        prove_original=prove, verify_checksum=False)
+                    group['shards'].append(dict(filename=filename, kind=kind, names=names, receipt=receipt))
+                    atomic_json(self.state_path, self.state)
         # Detect replacement/truncation of a producer input during the write.
         if any(file_identity(p) != value for p, value in inputs.items()):
             raise ValueError('direct group input changed during assembly')
@@ -194,7 +210,8 @@ class DirectMCWriter:
         return group
 
     def finalize(self, *, core_selection, configs, quantizes, assets=None,
-                 expected_payload_bytes=None, verification='streaming-receipts'):
+                 expected_payload_bytes=None, verification='streaming-receipts',
+                 k6_use_k8=(), engram=None, expected_shared_specs=None):
         """Seal indexes and metadata, then validate headers and durable copy proofs.
 
         ``core_selection`` maps module names (including ``mtp.*``) to logical
@@ -218,17 +235,47 @@ class DirectMCWriter:
                     mappings[kind][name] = filename
                     sizes[kind][name] = group['sizes'][kind][name]
                     specs[kind][name] = group['specs'][kind][name]
+        extra_bytes = 0
+        if engram is not None:
+            if self.family != 'hy4_flash':
+                raise ValueError('alternate Engram is only supported for direct Hy4-flash packages')
+            for name, filename in engram['tables'].items():
+                if name in mappings['shared'] or name not in self.source_inventory['locations']:
+                    raise ValueError('duplicate or unknown shared BF16 Engram table')
+                mappings['shared'][name] = filename
+                sizes['shared'][name] = self.source_inventory['sizes'][name]
+                specs['shared'][name] = self.source_inventory['specs'][name]
+            if shards.keys() & engram['files'].keys():
+                raise ValueError('duplicate Engram shard filename')
+            shards.update(engram['files'])
+            extra_bytes = sum(row['payload_bytes'] for n, row in engram['files'].items()
+                              if n not in engram['tables'].values())
+        if expected_shared_specs is not None:
+            if specs['shared'] != json.loads(canonical(expected_shared_specs)):
+                raise ValueError('direct shared tensors differ from complete reviewed inventory')
+        k6_use_k8 = set(k6_use_k8)
+        if (not k6_use_k8 <= core_selection.keys()
+                or any(core_selection[name].get('group') != 'mtp' for name in k6_use_k8)):
+            raise ValueError('only reviewed drafter modules can share K8 data with K6')
+        k6_bit_overrides = {name: 8 for name in sorted(k6_use_k8)}
+        aliases = {name for module in k6_use_k8 for name in packed_specs(module, dict(core_selection[module], bits=8))}
+        for name in aliases:
+            if name in mappings['k6-compact']:
+                raise ValueError('K6 drafter fallback must reference the existing K8 encode')
+            for rows in (mappings, sizes, specs):
+                rows['k6-compact'][name] = rows['k8-compact'][name]
         expected = {'original': {module + '.weight': ['BF16', [g['out_features'], g['in_features']]]
                                   for module, g in core_selection.items()}}
         for view, bits in (('k8-compact', 8), ('k6-compact', 6)):
             expected[view] = {n: [dtype, shape] for m, g in core_selection.items()
-                              for n, (dtype, shape) in packed_specs(m, dict(g, bits=bits)).items()}
+                              for n, (dtype, shape) in packed_specs(m, dict(g, bits=k6_bit_overrides.get(m, bits) if bits == 6 else bits)).items()}
         for view in VIEWS:
             if specs[view] != expected[view]:
                 raise ValueError('direct core view inventory differs from selected geometry: ' + view)
         if set(p.name for p in self.output.glob('*.safetensors')) != set(shards):
             raise ValueError('unowned physical weights in direct package')
-        payload = sum(sum(v.values()) for v in sizes.values())
+        payload = sum(sum(v.values()) for v in sizes.values()) + extra_bytes
+        payload -= sum(sizes['k8-compact'][name] for name in aliases)
         if expected_payload_bytes is not None and payload != expected_payload_bytes:
             raise ValueError('physical package payload differs from reviewed recipe')
         metadata_files = []
@@ -269,11 +316,17 @@ class DirectMCWriter:
                 shutil.copyfile(source_path, destination)
             metadata_files.append(name)
         manifest = package.mc_manifest.build(self.output, source_repo=self.identity['source_repo'],
-            source_revision=self.identity['source_revision'], core_tensors=core_names)
+            source_revision=self.identity['source_revision'], core_tensors=core_names,
+            **({'engram_fp8': engram['manifest']} if engram is not None else {}))
         atomic_json(self.output / package.mc_manifest.MANIFEST, manifest)
         metadata_files.append(package.mc_manifest.MANIFEST)
+        source_names = set(core_names['original'])
+        if self.prove_shared_source:
+            source_names.update(mappings['shared'].keys() & self.source_inventory['locations'].keys())
         state = dict(identity=self.identity, source_snapshot=str(self.source),
-            source_tensor_locations={n: self.source_inventory['locations'][n] for n in core_names['original']},
+            source_tensor_locations={n: self.source_inventory['locations'][n] for n in source_names},
+            direct_k6_bit_overrides=k6_bit_overrides,
+            **({'engram_fp8_proof': engram['proof']} if engram is not None else {}),
             direct_core_selection=deepcopy(core_selection), direct_expected_specs=selected_specs,
             direct_expected_mappings=selected_mappings, direct_payload_bytes=payload,
             source_payload_bytes=self.source_inventory['payload_totals'], core_tensors=core_names,
