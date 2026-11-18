@@ -1026,21 +1026,20 @@ mod tests {
         let wanted = unbounded.plan(&requests, 64);
         let granted = policy.plan(&requests, 6);
         assert_eq!(granted.iter().sum::<usize>(), 3);
-        let mut selected = Vec::new();
-        let mut refused = Vec::new();
-        for ((&(id, _), &wanted), &granted) in requests.iter().zip(&wanted).zip(&granted) {
-            assert!(granted <= wanted, "each request must retain a prefix");
-            for position in 0..wanted {
-                let probability = unbounded.probability(id, position);
-                if position < granted { selected.push(probability); }
-                else { refused.push(probability); }
-            }
+        // Only each prefix's next row is eligible: a later p=1 cannot
+        // outrank another request before its lower-p predecessor is granted.
+        let mut replayed = vec![0usize; requests.len()];
+        for _ in 0..granted.iter().sum::<usize>() {
+            let eligible: Vec<_> = requests.iter().enumerate().filter(|(index, _)| replayed[*index] < wanted[*index])
+                .map(|(index, &(id, _))| (index, unbounded.probability(id, replayed[index]))).collect();
+            let best = eligible.iter().map(|(_, p)| *p).fold(f64::NEG_INFINITY, f64::max);
+            let chosen = eligible.iter().filter(|(index, p)| *p == best && replayed[*index] < granted[*index])
+                .min_by_key(|(index, _)| (replayed[*index], requests[*index].0))
+                .expect("granted prefix must include a highest-probability eligible row").0;
+            assert!(eligible.iter().all(|(_, p)| best >= *p));
+            replayed[chosen] += 1;
         }
-        for &accepted in &selected {
-            for &rejected in &refused {
-                assert!(accepted >= rejected, "granted p={accepted} below refused p={rejected}");
-            }
-        }
+        assert_eq!(replayed, granted);
         let cut = policy.stats().budget_cut;
         assert!(cut >= 4);
         policy.observe(&[outcome(1, 2, 2), outcome(2, 1, 1), outcome(3, 0, 0)], false);
