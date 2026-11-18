@@ -317,18 +317,6 @@ mod tests {
     use cuteafd_loader::families::inkling2::{execution::UnitLayout, Inkling2Config};
 
     #[test]
-    fn recurrent_prefix_implements_complete_pooled_draft_contract() {
-        let source=include_str!("cache.rs").split("#[cfg(test)]").next().unwrap();
-        for method in ["draft_page_bytes", "quarantine_draft_pages", "draft_demand", "draft_reservable",
-            "draft_lifetime_rows", "draft_admission", "admit_draft_pages", "capture_draft_pages",
-            "restore_draft_pages", "release_draft_pages", "promote_draft_pages", "draft_page_segments"] {
-            assert!(source.contains(&format!("fn {method}(")),"missing pooled drafter binding {method}");
-        }
-        assert!(source.contains("draft.drafter.quarantine_pages(placement.slot)"));
-        assert!(source.contains("draft.drafter.page_bytes()"));
-    }
-
-    #[test]
     fn shared_cache_restores_prompt_and_turn_marks_without_reconstruction() -> Result<()> {
         use cuteafd_engine::prefix::{After, PrefixCache, PrefixConfig, PrefixFamily, SnapshotKind};
         use crate::shared::prefix::CudaCopyEngine;

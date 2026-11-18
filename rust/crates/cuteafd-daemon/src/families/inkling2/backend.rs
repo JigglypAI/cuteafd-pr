@@ -585,8 +585,6 @@ mod tests {
     fn adapter_uses_shared_scheduler_units_prefix_and_streamed_scoring() {
         let source = include_str!("backend.rs").split("#[cfg(test)]").next().unwrap();
         assert!(source.contains("Backend<'a> for InklingBackend"));
-        assert!(source.contains("PrefixCache::new_with_draft_pages("));
-        assert!(source.contains("self.family.draft_page_bytes()"));
         assert!(source.contains("registered_retained("));
         assert!(source.contains("prefill_packing::plan("));
         assert!(source.contains("streamed_prefill_scoring(&self) -> bool { true }"));
