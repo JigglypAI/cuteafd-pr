@@ -1,5 +1,12 @@
 //! Family arithmetic over caller-owned native producers and expert dispatch.
-use super::{experts::Dispatcher, owners::UnitBuffers, weights::TargetWeights};
+use super::{experts::Dispatcher, owners::UnitBuffers, weights::{ProjectionWeight, TargetWeights}};
+use crate::shared::{dense_trellis::{Projection, ProjectionLayout, ProjectionScratch},
+    memory::device::{Allocation, Stream}};
+use cuteafd_core::memory_layout::Tag;
+use cuteafd_ffi::{dense_trellis::{DenseTrellisDispatch, DenseTrellisPolicy, TrellisDType},
+    native_attention::Fp8Projections};
+use cuteafd_loader::families::inkling2::weight_layout::{CoordinatorWeights, HEAD};
+use std::rc::Rc;
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::{draft_projection::{DraftProjections, ProjectionOutput}, inkling2::{Attention, Kind, Route},
     inkling2::producers::{Op, Precision, Producer}, programs::Programs, CuteafdDeviceBuffer as Buffer};
@@ -20,7 +27,69 @@ pub(crate) struct Kernels<'a> {
     pub narrow: cuteafd_ffi::F32Bf16Narrow<'a>,
     quant: cuteafd_ffi::programs::Program<'a>,
     sms: usize,
+    compact: Option<CompactProjections<'a>>,
 }
+type TrellisGeometry = (usize, usize, usize, usize, &'static str);
+
+struct CompactProjections<'a> {
+    stream: Rc<Stream<'a>>,
+    trellis: BTreeMap<TrellisGeometry, Projection<'a>>,
+    trellis_scratch: Option<ProjectionScratch<'a>>,
+    fp8_decode: Option<Fp8Projections<'a>>,
+    fp8_prefill: Option<Fp8Projections<'a>>,
+    fp8_scratch: Option<Allocation<'a>>,
+}
+
+fn trellis_geometry(shape: [usize; 2], side: cuteafd_loader::formats::dense_trellis::TrellisSide,
+    bits: usize, codebook: cuteafd_loader::formats::exl3_storage::Exl3Codebook) -> TrellisGeometry {
+    use cuteafd_loader::formats::{dense_trellis::TrellisSide, exl3_storage::Exl3Codebook};
+    (shape[1], shape[0], match side { TrellisSide::Output => 1, TrellisSide::Input => 2 }, bits,
+        match codebook { Exl3Codebook::Mcg => "mcg", Exl3Codebook::Mul1 => "mul1" })
+}
+
+impl<'a> CompactProjections<'a> {
+    fn bind(programs: &'a Programs<'a>, stream: Rc<Stream<'a>>, target: &CoordinatorWeights,
+        rows: usize, head_rows: usize, fp8_bytes: usize) -> Result<Self> {
+        let device = stream.device;
+        let mut trellis = BTreeMap::new();
+        let mut prefill = Vec::new();
+        let mut decode = Vec::new();
+        for l in target.core.values() {
+            let key @ (k, n, side, bits, book) = trellis_geometry(l.shape, l.side, l.bits, l.codebook);
+            if trellis.contains_key(&key) { continue; }
+            let live = if l.stem == HEAD { head_rows.min(64) } else { rows };
+            let projection = device.run(|| {
+                let mut policy = DenseTrellisPolicy::from_package_geometry_bits(programs, k, n, side, bits, book)?;
+                // The recurrent drafter shares the geometry but requests BF16 egress.
+                policy.output_program = format!("dense_trellis_k6_trellis_output_n{n}_f32");
+                Ok(Projection { program: DenseTrellisDispatch::load(programs, policy, live, TrellisDType::F32)? })
+            }).with_context(|| format!("Inkling trellis program for {}", l.stem))?;
+            trellis.insert(key, projection);
+        }
+        for l in target.fp8.values() {
+            let [n, k] = l.shape;
+            decode.push((k, n));
+            if l.stem != HEAD { prefill.push((k, n)); }
+        }
+        let bind_fp8 = |shapes: &[(usize, usize)], live| -> Result<Option<Fp8Projections<'a>>> {
+            if shapes.is_empty() { return Ok(None); }
+            let programs = device.run(|| Ok(Fp8Projections::load(programs, shapes, live, ProjectionOutput::F32)?))?;
+            for &(k, n) in shapes {
+                ensure!(programs.scratch_bytes(k, n)? <= fp8_bytes, "Inkling FP8 scratch differs from admission");
+            }
+            Ok(Some(programs))
+        };
+        let fp8_decode = bind_fp8(&decode, 64)?;
+        let fp8_prefill = if rows > 64 { bind_fp8(&prefill, rows)? } else { None };
+        let fp8_scratch = (fp8_bytes > 0).then(|| Allocation::new(device, fp8_bytes,
+            Tag::workspace("inkling2/target/fp8"))).transpose()?;
+        let trellis_scratch = target.trellis_scratch(rows, head_rows.min(64))?.map(|l|
+            ProjectionLayout { extents: l.extents, rows: l.rows }.allocate_packed(device,
+                Tag::workspace("inkling2/target/trellis"))).transpose()?;
+        Ok(Self { stream, trellis, trellis_scratch, fp8_decode, fp8_prefill, fp8_scratch })
+    }
+}
+
 impl<'a> Kernels<'a> {
     pub fn bind(programs: &'a Programs<'a>, kv_format: cuteafd_loader::families::inkling2::InklingKvCache) -> Result<Self> {
         let mut ops = Vec::new();
@@ -65,7 +134,7 @@ impl<'a> Kernels<'a> {
             local_decode: Attention::load(programs, Kind::Local, Route::Decode, false)?,
             global_decode: Attention::load(programs, Kind::Global, Route::Decode, kv_format == cuteafd_loader::families::inkling2::InklingKvCache::Fp8)?, kv_format,
             add: programs.library().f32_add()?, narrow: programs.library().f32_bf16_narrow()?,
-            quant,
+            quant, compact: None,
             sms: programs.library().sm_count()? as usize, producers, strided, replay })
     }
     fn producer(&self, op: Op) -> Result<&Producer<'a>> {
@@ -119,6 +188,42 @@ impl<'a> Kernels<'a> {
         unsafe { self.producer(Op::Router)?.launch(&[logits, bias, owner.buffer("route_ids")?,
             owner.buffer("route_weights")?], rows, None, owner.stream().raw) }
     }
+    pub fn bind_compact(&mut self, programs: &'a Programs<'a>, stream: Rc<Stream<'a>>, target: &CoordinatorWeights,
+        rows: usize, head_rows: usize, fp8_bytes: usize) -> Result<()> {
+        if !target.core.is_empty() || !target.fp8.is_empty() {
+            self.compact = Some(CompactProjections::bind(programs, stream, target, rows, head_rows, fp8_bytes)?);
+        }
+        Ok(())
+    }
+
+    pub fn project_target(&self, owner: &impl UnitBuffers<'a>, input: Buffer, weight: ProjectionWeight<'_, '_>,
+        output: Buffer, rows: usize, k: usize, n: usize) -> Result<()> {
+        if let ProjectionWeight::Bf16(weight) = weight { return self.project(owner, input, weight.buffer, output, rows, k, n); }
+        let c = self.compact.as_ref().context("Inkling compact target runtime was not admitted")?;
+        let stream = owner.stream();
+        ensure!(std::ptr::eq(c.stream.as_ref(), stream) && input.bytes >= rows*k*2 && output.bytes >= rows*n*4,
+            "Inkling compact projection stream or extents differ from admission");
+        match weight {
+            ProjectionWeight::Bf16(_) => unreachable!(),
+            ProjectionWeight::Trellis(w) => {
+                let key = trellis_geometry(w.shape, w.side, w.bits, w.codebook);
+                ensure!(w.shape == [n, k], "Inkling trellis projection geometry differs from forward");
+                c.trellis.get(&key).context("Inkling trellis program missing")?.local(rows, input, w,
+                    c.trellis_scratch.as_ref().context("Inkling trellis scratch missing")?, output, stream.raw)
+            }
+            ProjectionWeight::Fp8(w) => {
+                ensure!(w.shape == [n, k], "Inkling FP8 projection geometry differs from forward");
+                let programs = if rows <= 64 { &c.fp8_decode } else { &c.fp8_prefill };
+                let scratch = c.fp8_scratch.as_ref().context("Inkling FP8 scratch missing")?.buffer;
+                // SAFETY: this ordered stream exclusively reuses the admitted scratch;
+                // resident packed weights and checked input/output extents outlive the launch.
+                unsafe { programs.as_ref().context("Inkling FP8 projection program missing")?.launch(
+                    input.ptr, w.values.buffer.ptr, w.scales.buffer.ptr, output, scratch, rows, k, n, stream.raw)?; }
+                Ok(())
+            }
+        }
+    }
+
     pub fn project(&self, owner: &impl UnitBuffers<'a>, input: Buffer, weight: Buffer, output: Buffer,
         rows: usize, k: usize, n: usize) -> Result<()> {
         ensure!(input.bytes >= rows*k*2 && weight.bytes >= n*k*2 && output.bytes >= rows*n*4,
@@ -177,7 +282,7 @@ pub(crate) fn attention<'a>(k: &Kernels<'a>, owner: &impl UnitBuffers<'a>, targe
     k.norm(owner, input, weight(norm)?, b("projection_input")?, false, Precision::Bf16, rows)?;
     for (name, out, n) in [("wq_du", "q", 6144), ("wr_du", "r", 768),
         ("gate_attn", "gate", 6144), ("attn_sink_proj", "sinks", 48)] {
-        k.project(owner, b("projection_input")?, weight(&format!("attn.{name}.weight"))?, b(out)?, rows, 4608, n)?;
+        k.project_target(owner, b("projection_input")?, target.projection(&format!("{prefix}.attn.{name}.weight"))?, b(out)?, rows, 4608, n)?;
     }
     for (branch, proj, out, convolved, history) in [("k", "wk_dv", "k", "conv_k", "k_conv_history"),
         ("v", "wv_dv", "v", "conv_v", "v_conv_history")] {
@@ -187,7 +292,7 @@ pub(crate) fn attention<'a>(k: &Kernels<'a>, owner: &impl UnitBuffers<'a>, targe
             k.norm(owner, mixed, weight(&format!("{branch}_input_norm.weight"))?, b("projection_input")?,
                 false, Precision::Bf16, rows)?;
         }
-        k.project(owner, b("projection_input")?, weight(&format!("attn.{proj}.weight"))?, b(out)?, rows, 4608, 1024)?;
+        k.project_target(owner, b("projection_input")?, target.projection(&format!("{prefix}.attn.{proj}.weight"))?, b(out)?, rows, 4608, 1024)?;
         let dynamic = if local { b(out)? } else {
             let name = format!("{branch}_dynamic");
             k.project(owner, b("projection_input")?, weight(&format!("attn.{branch}_sconv.weight_proj"))?,
@@ -240,7 +345,7 @@ pub(crate) fn attention<'a>(k: &Kernels<'a>, owner: &impl UnitBuffers<'a>, targe
             b("q_clipped")?], rows, None, owner.stream().raw)?;
         k.narrow.launch(b("q_clipped")?.ptr, b("gated")?.ptr, rows*6144, owner.stream().raw)?;
     }
-    k.project(owner, b("gated")?, weight("attn.wo_ud.weight")?, b("branch")?, rows, 6144, 4608)?;
+    k.project_target(owner, b("gated")?, target.projection(&format!("{prefix}.attn.wo_ud.weight"))?, b("branch")?, rows, 6144, 4608)?;
     k.convolution(owner, b("branch")?, weight("attn_sconv.weight")?, b("branch")?, b("attention")?,
         "attn_conv_history", 4608, false, rows)
 }

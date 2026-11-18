@@ -239,6 +239,12 @@ pub fn gather(request: &FactsRequest<'_>) -> Result<InklingInputs, Refused> {
     let targets = CoordinatorWeights::plan(request.checkpoint, cfg, gpus, &modes)
         .map_err(|error| refused(format!("Inkling 2 target arena inventory refused: {error:#}"),
             "Provide complete BF16 core headers (every shard of the selected view)."))?;
+    let target_fp8_scratch = targets.iter().map(|target| {
+        if target.fp8.is_empty() { return Ok(0); }
+        target.fp8_scratch(request.manifest.as_deref().context("Inkling compact FP8 requires PROGRAMS.json")?,
+            shape.rows as usize, shared::DECODE_ROWS as usize)
+    }).collect::<anyhow::Result<Vec<_>>>().map_err(|error| refused(format!("Inkling FP8 inventory refused: {error:#}"),
+        "Install the Inkling native block-FP8 projection exports."))?;
     let mount = targets.iter().map(|target| target.mount_load(request.checkpoint)).collect::<anyhow::Result<Vec<_>>>()
         .map_err(|error| refused(format!("Inkling 2 mount inventory refused: {error:#}"), "Check checkpoint headers."))?;
     let experts = layer_experts(request.checkpoint, cfg).map_err(|error| refused(
@@ -341,7 +347,7 @@ pub fn gather(request: &FactsRequest<'_>) -> Result<InklingInputs, Refused> {
     Ok(InklingInputs { cfg: cfg.clone(), kv_format: request.kv_format, gpus, spark_ranks: ranks,
         context: Context::resolve(context, (request.context_tokens > 0).then_some(request.context_tokens)),
         pool, prefill: shape, sequences: request.sequences, prefix_entries: request.prefix_entries,
-        prefix_mark_budget: request.prefix_mark_budget, prefix_mark_slots, targets, placement, modes,
+        prefix_mark_budget: request.prefix_mark_budget, prefix_mark_slots, targets, target_fp8_scratch, placement, modes,
         routed: routed.clone(), experts, local, spark, links,
         spark_reply_formats: request.replies, drafter, vision, budgets, code, graph_reserve,
         head: request.head, host_prefix, device_sampling: true,

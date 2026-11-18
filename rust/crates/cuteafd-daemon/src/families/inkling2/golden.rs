@@ -56,7 +56,6 @@ fn run(mut args: GoldenArgs) -> Result<()> {
     ensure!(args.nll, "Inkling cold golden requires --nll");
     let view = args.attention.selected_view.clone().map(Ok).unwrap_or_else(|| args.attention.select(&args.snapshot))?;
     args.attention.validate_view(&view)?;
-    ensure!(view.mode() == cuteafd_loader::plan::checkpoint::CoreView::Original, "Inkling stage2 golden currently qualifies original BF16 core only");
     let checkpoint = Checkpoint::coordinator_view(&view, true, false)?;
     let cfg = Inkling2Config::from_hf(&checkpoint.config)?;
     ensure!(args.last_layer < cfg.layers, "Inkling --last-layer outside checkpoint");
@@ -83,7 +82,7 @@ fn run(mut args: GoldenArgs) -> Result<()> {
     let library = unsafe { cuteafd_ffi::NativeLibrary::load(&args.native_lib) }?;
     let device = Device { library: &library, id: args.device };
     let programs = device.run(|| Ok(library.programs()?.with_manifest(&args.manifest)?))?;
-    let kernels = device.run(|| Kernels::bind(&programs, args.kv_format))?;
+    let mut kernels = device.run(|| Kernels::bind(&programs, args.kv_format))?;
     // Load the expert code before the pre-weight CUDA sample, rather than
     // attributing its module residency to an unmeasured post-admission owner.
     // SAFETY: trusted generated package loaded on the retained device; this
@@ -91,13 +90,17 @@ fn run(mut args: GoldenArgs) -> Result<()> {
     let _expert_code = device.run(|| unsafe { cuteafd_ffi::fp8_moe::Fp8MoeModule::load(&package) })?;
     let (free, total) = device.run(|| library.cuda_memory_info())?;
     let host = cuteafd_loader::formats::mapped_preload::host_memory_before_process()?;
+    let fp8_bytes = if target_layout.fp8.is_empty() { 0 } else {
+        target_layout.fp8_scratch(&serde_json::from_slice(&std::fs::read(&args.manifest)?)?, rows, rows)?
+    };
     let plan = admission::admit(&checkpoint, &cfg, &target_layout, &expert_layouts[0], metadata.scratch_for(rows)?,
-        &unit_layout, rows, free as u64, total as u64, host)?;
+        &unit_layout, rows, fp8_bytes, free as u64, total as u64, host)?;
     if !args.tap_layers.is_empty() { std::fs::create_dir(&args.save_logits)?; }
     let stream = Rc::new(Stream::new(device)?);
     let owner = UnitOwner::new(Rc::clone(&stream), unit_layout)?;
     let weights = TargetWeights::load(device, &checkpoint, &target_layout)?;
-    let head = Head::new(Rc::clone(&stream), &cfg, rows)?;
+    kernels.bind_compact(&programs, Rc::clone(&stream), &target_layout, rows, rows, fp8_bytes)?;
+    let head = Head::new(Rc::clone(&stream), &cfg, rows, target_layout.stored_head())?;
     let positions = (0..rows).flat_map(|n| (n as i64).to_le_bytes()).collect::<Vec<_>>();
     let rings = (0..rows).flat_map(|n| ((n%1088) as i64).to_le_bytes()).collect::<Vec<_>>();
     let pages = (0..owner.layout.buffers["page_table"]/4).flat_map(|n| (n as i32).to_le_bytes()).collect::<Vec<_>>();

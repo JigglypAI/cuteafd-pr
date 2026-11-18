@@ -193,11 +193,13 @@ pub(crate) fn whole<'a>(library: &'a Arc<NativeLibrary>, programs: &'a Programs<
     phase.log("inkling2 grouped weight delivery");
     cuteafd_bench::context::phase("Inkling grouped weight delivery");
     let phase = crate::shared::memory::load_timing::Split::start();
-    let Prepared { kernels, encoding, inputs, admitted, module_pins, exl3_modules, .. } = prepared;
+    let Prepared { mut kernels, encoding, inputs, admitted, module_pins, exl3_modules, .. } = prepared;
     let device = Device { library, id: options.device };
     let stream = std::rc::Rc::new(Stream::new(device)?);
     let requests = super::owners::RequestOwners::whole(stream.clone(), &inputs, &admitted)?;
-    let head = super::head::Head::new(stream.clone(), cfg, 64)?;
+    let layout = &inputs.targets[0];
+    kernels.bind_compact(programs, stream.clone(), layout, inputs.prefill.rows as usize, 64, inputs.target_fp8_scratch[0])?;
+    let head = super::head::Head::new(stream.clone(), cfg, 64, layout.stored_head())?;
     let catalog = cuteafd_loader::read_expert_catalog_view(view)?;
     let backings = match &inputs.local {
         inkling2::LocalPackage::Installed { backings } => backings[admitted.onboard].as_slice(),

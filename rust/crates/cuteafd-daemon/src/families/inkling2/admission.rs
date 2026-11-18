@@ -13,7 +13,7 @@ fn cold_contract(facts: Facts, rows: usize) -> Contract {
 }
 
 pub(crate) fn admit(checkpoint: &Checkpoint, cfg: &Inkling2Config, target: &CoordinatorWeights,
-    expert: &Mxfp8Layout, scratch: usize, unit: &UnitLayout, head_rows: usize,
+    expert: &Mxfp8Layout, scratch: usize, unit: &UnitLayout, head_rows: usize, fp8_bytes: usize,
     free: u64, total: u64, host: (u64, u64)) -> Result<ResolvedPlan> {
     let empty = Facts { phase_order: PhaseOrder::TARGET_THEN_DRAFT, resident_weights: vec![], allocations: vec![],
         deferred: vec![], sequential: vec![], reservations: vec![], allowances: vec![],
@@ -29,6 +29,12 @@ pub(crate) fn admit(checkpoint: &Checkpoint, cfg: &Inkling2Config, target: &Coor
         ("head.logits", head_rows*cfg.unpadded_vocab_size*4), ("head.workspace", Head::workspace_bytes(cfg, head_rows)?),
         ("expert.scratch", scratch)] {
         buffers.push((name.into(), Location::coordinator(0), bytes as u64, Lifetime::TARGET, Category::Workspace));
+    }
+    let trellis = target.trellis_scratch(unit.rows, head_rows.min(64))?
+        .map(|scratch| scratch.packed_bytes()).transpose()?.unwrap_or(0);
+    for (name, bytes) in [("target.trellis", trellis), ("target.fp8", fp8_bytes),
+        ("head.compact_logits", head_rows.min(64)*target.stored_head().unwrap_or(0)*4)] {
+        if bytes > 0 { buffers.push((name.into(), Location::coordinator(0), bytes as u64, Lifetime::TARGET, Category::Workspace)); }
     }
     let mut mount = target.mount_load(checkpoint)?;
     mount.merge(expert.mount);

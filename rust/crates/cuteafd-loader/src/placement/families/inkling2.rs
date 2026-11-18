@@ -142,6 +142,7 @@ pub struct InklingInputs {
     pub prefix_mark_slots: usize,
     /// Per-rank target arenas (one per coordinator GPU).
     pub targets: Vec<CoordinatorWeights>,
+    pub target_fp8_scratch: Vec<usize>,
     /// The resolved attention placement and every layer's mode under it.
     pub placement: AttentionPlacement,
     pub modes: Vec<LayerMode>,
@@ -426,6 +427,14 @@ impl InklingInputs {
         let mut out = Vec::new();
         let target = self.targets.get(gpu).ok_or_else(|| invalid("missing target arena"))?;
         out.extend(target.weight_components(maximum)?);
+        if let Some(scratch) = target.trellis_scratch(rows as usize, DECODE_ROWS as usize).map_err(refusal)? {
+            out.extend(buffer(format!("inkling2.target.{gpu}.trellis"), location, scratch.packed_bytes().map_err(refusal)? as u64,
+                Lifetime::TARGET, Category::Workspace, "serialized target trellis projection", maximum));
+        }
+        if let Some(&bytes) = self.target_fp8_scratch.get(gpu) {
+            out.extend(buffer(format!("inkling2.target.{gpu}.fp8"), location, bytes as u64,
+                Lifetime::TARGET, Category::Workspace, "serialized target FP8 projection", maximum));
+        }
         // One interleaved K/V record backing per owned global layer. Local layers
         // keep no pool pages: their window lives in the per-sequence ring.
         let record_bytes = self.kv_format.record_bytes(cfg.kv_heads, cfg.head_dim) as u64;
@@ -522,8 +531,9 @@ impl InklingInputs {
         let buffers: [(&str, u64); 4] = [("tokens", rows * 4), ("normalized", rows * cfg.hidden as u64 * 2),
             ("logits", rows * cfg.unpadded_vocab_size as u64 * 4),
             ("workspace", cuteafd_ffi::programs::VOCABULARY_HEAD_WORKSPACE as u64)];
+        let stored = self.targets[head as usize].stored_head().unwrap_or(0) as u64;
         let mut out = Vec::new();
-        for (name, bytes) in buffers {
+        for (name, bytes) in buffers.into_iter().chain([("compact_logits", rows * stored * 4)]) {
             out.extend(buffer(format!("inkling2.head.{name}"), Location::coordinator(head), bytes, Lifetime::TARGET,
                 Category::Workspace, "Inkling 2 bounded vocabulary head rows", maximum));
         }

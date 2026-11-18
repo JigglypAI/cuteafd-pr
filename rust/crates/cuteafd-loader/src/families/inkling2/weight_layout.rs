@@ -97,8 +97,8 @@ impl CoordinatorWeights {
         ensure!(matches!(ranks, 1 | 2), "Inkling 2 coordinator ranks must be 1 or 2");
         ensure!(modes.len() == cfg.layers, "Inkling 2 target layer modes must cover every layer exactly once");
         ensure!(Inkling2Config::from_hf(&checkpoint.config)? == *cfg, "Inkling 2 arena configuration differs from checkpoint");
+        // Indexed MTP matrices belong to the independently admitted drafter.
         checkpoint.validate_fp8_roles("Inkling 2", |name| {
-            // The separately admitted recurrent body validates its own roles.
             if name.starts_with("mtp.") { Fp8Role::exact("recurrent projection", true) } else { fp8_role(name) }
         })?;
         (0..ranks).map(|rank| {
@@ -207,6 +207,18 @@ impl CoordinatorWeights {
             if let Some(scratch) = &mut scratch { scratch.merge(&need)?; } else { scratch = Some(need); }
         }
         Ok(scratch)
+    }
+
+    pub fn fp8_scratch(&self, manifest: &serde_json::Value, rows: usize, head_rows: usize) -> Result<usize> {
+        use cuteafd_ffi::{draft_projection::ProjectionOutput, native_attention::validate_package_geometry};
+        self.fp8.values().try_fold(0, |peak, p| {
+            let active = if p.stem == HEAD { head_rows.min(64) } else { rows };
+            let (_, bytes) = validate_package_geometry(manifest, p.shape[1], p.shape[0], active, ProjectionOutput::F32)
+                .with_context(|| format!("{}.weight: Inkling FP8 program missing or incompatible", p.stem))?;
+            let (_, decode) = validate_package_geometry(manifest, p.shape[1], p.shape[0], active.min(64), ProjectionOutput::F32)
+                .with_context(|| format!("{}.weight: Inkling FP8 decode program missing or incompatible", p.stem))?;
+            Ok(peak.max(bytes).max(decode))
+        })
     }
 
     pub fn stored_head(&self) -> Option<usize> {

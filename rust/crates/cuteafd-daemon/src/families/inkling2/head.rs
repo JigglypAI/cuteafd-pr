@@ -1,5 +1,5 @@
 //! Trimmed vocabulary and final softcap use the shared target-head route.
-use super::{layers::Kernels, owners::{UnitBuffers, UnitOwner}, weights::TargetWeights};
+use super::{layers::Kernels, owners::{UnitBuffers, UnitOwner}, weights::{ProjectionWeight, TargetWeights}};
 use crate::shared::{memory::device::{Allocation, Stream}, target_head::{self, TargetHead}};
 use anyhow::{ensure, Result};
 use cuteafd_core::memory_layout::Tag;
@@ -13,24 +13,27 @@ pub(crate) struct Head<'a> {
     tokens: Allocation<'a>,
     normalized: Allocation<'a>,
     pub logits: Allocation<'a>,
+    compact_logits: Option<(usize, Allocation<'a>)>,
     _workspace: Allocation<'a>,
     rows: usize,
 }
 impl<'a> Head<'a> {
     /// Caller admits tokens, normalized, logits and shared BLAS workspace first.
-    pub fn new(stream: Rc<Stream<'a>>, cfg: &Inkling2Config, rows: usize) -> Result<Self> {
+    pub fn new(stream: Rc<Stream<'a>>, cfg: &Inkling2Config, rows: usize, stored_head: Option<usize>) -> Result<Self> {
         ensure!(rows>0 && rows<=4096, "Inkling head rows exceed export");
         let d = stream.device;
         let alloc = |bytes, name| Allocation::new(d, bytes, Tag::workspace(name));
         let tokens = alloc(rows*4, "inkling2/head/tokens")?;
         let normalized = alloc(rows*cfg.hidden*2, "inkling2/head/normalized")?;
         let logits = alloc(rows*cfg.unpadded_vocab_size*4, "inkling2/head/logits")?;
+        let compact_logits = stored_head.map(|stored| Ok::<_, anyhow::Error>((stored,
+            alloc(rows.min(64)*stored*4, "inkling2/head/compact_logits")?))).transpose()?;
         let workspace = alloc(Self::workspace_bytes(cfg, rows)?, "inkling2/head/blas")?;
         // SAFETY: admitted workspace survives the handle and stream drain;
         // passing unpadded vocabulary makes the stored tail rows unreachable.
         let head = d.run(|| unsafe { d.library.vocabulary_head_rows(workspace.buffer.ptr, cfg.hidden as u32,
             rows as u32, cfg.unpadded_vocab_size as u32, TargetHead::configured().native_mode()) })?;
-        Ok(Self { stream, head, tokens, normalized, logits, _workspace: workspace, rows })
+        Ok(Self { stream, head, tokens, normalized, logits, compact_logits, _workspace: workspace, rows })
     }
     pub fn workspace_bytes(_cfg: &Inkling2Config, _rows: usize) -> Result<usize> {
         Ok(cuteafd_ffi::programs::VOCABULARY_HEAD_WORKSPACE)
@@ -40,6 +43,7 @@ impl<'a> Head<'a> {
             ("logits", &self.logits), ("workspace", &self._workspace)] {
             owner.inventory(inventory, &format!("{prefix}.{name}"))?;
         }
+        if let Some((_, owner)) = &self.compact_logits { owner.inventory(inventory, &format!("{prefix}.compact_logits"))?; }
         Ok(())
     }
     pub fn embed(&self, k: &Kernels<'_>, owner: &UnitOwner<'_>, target: &TargetWeights<'_>,
@@ -110,14 +114,28 @@ impl<'a> Head<'a> {
         self.normalize(k,owner,target,rows,candidates)?;
         let logits = super::cache::view(self.logits.buffer, output_row*cfg.unpadded_vocab_size*4,
             rows*cfg.unpadded_vocab_size*4)?;
-        // SAFETY: BF16 normalized rows and trimmed weight matrix stay live;
-        // checked output-row window keeps every request's logits disjoint.
-        unsafe {
-            target_head::launch(TargetHead::configured(), &self.head, self.normalized.buffer.ptr,
-                target.operand("model.llm.unembed.weight")?.buffer.ptr, logits.ptr.cast(), rows, self.stream.raw)?;
-            self.stream.device.library.cuda_logits_softcap_f32_async(logits.ptr, rows,
-                cfg.unpadded_vocab_size, cfg.unpadded_vocab_size, cfg.final_softcap as f32, self.stream.raw)?;
+        let weight = target.projection("model.llm.unembed.weight")?;
+        let lib = self.stream.device.library;
+        if let ProjectionWeight::Bf16(weight) = weight {
+            // SAFETY: all admitted BF16 and F32 views survive the ordered stream.
+            unsafe { target_head::launch(TargetHead::configured(), &self.head, self.normalized.buffer.ptr,
+                weight.buffer.ptr, logits.ptr.cast(), rows, self.stream.raw)?; }
+        } else {
+            let (stored, stage) = self.compact_logits.as_ref().ok_or_else(|| anyhow::anyhow!("Inkling compact head scratch missing"))?;
+            for first in (0..rows).step_by(64) {
+                let count = (rows-first).min(64);
+                let input = super::cache::view(self.normalized.buffer, first*cfg.hidden*2, count*cfg.hidden*2)?;
+                let output = super::cache::view(logits, first*cfg.unpadded_vocab_size*4, count*cfg.unpadded_vocab_size*4)?;
+                k.project_target(owner, input, target.projection("model.llm.unembed.weight")?, stage.buffer, count, cfg.hidden, *stored)?;
+                // SAFETY: every staged row keeps its physical vocabulary pitch;
+                // the distinct destination strips only the padded columns.
+                unsafe { lib.copy_d2d_2d_async(output, cfg.unpadded_vocab_size*4,
+                    stage.buffer, stored*4, cfg.unpadded_vocab_size*4, count, self.stream.raw)?; }
+            }
         }
+        // SAFETY: logits are now a contiguous, valid-vocabulary F32 view.
+        unsafe { lib.cuda_logits_softcap_f32_async(logits.ptr, rows,
+            cfg.unpadded_vocab_size, cfg.unpadded_vocab_size, cfg.final_softcap as f32, self.stream.raw)?; }
         Ok(logits)
     }
     pub fn normalize(&self,k:&Kernels<'a>,owner:&impl UnitBuffers<'a>,target:&TargetWeights<'_>,
