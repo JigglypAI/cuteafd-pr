@@ -227,6 +227,29 @@ mod tests {
         }
     }
 
+    /// A prompt's wait in the queue is charged once, at its first chunk — not once per chunk,
+    /// and not again when it rotates back for a later round.
+    #[test]
+    fn a_prompt_charges_its_queue_wait_once_at_its_first_chunk() {
+        let _guard = super::super::phase_stats::TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let mut host = host(0.2, 2752, 3);
+        let closed = Rc::default();
+        let mut queue = queue(&mut host, 0.2, &[20000, 20000], &closed);
+        // Both prompts have been waiting 5 ms when the first round runs.
+        for entry in queue.iter_mut() {
+            entry.queued_at = std::time::Instant::now() - Duration::from_millis(5);
+        }
+        let wait = || super::super::phase_stats::snapshot()["prefill_queue_wait_ns_total"].as_u64().unwrap();
+        let before = wait();
+        round(&mut queue, &mut host);
+        let after_first = wait();
+        assert!(after_first - before >= 10_000_000,
+            "both prompts charged their wait: {} ns", after_first - before);
+        // A second round runs more chunks of the same prompts: nothing new is charged.
+        round(&mut queue, &mut host);
+        assert_eq!(wait(), after_first, "a prompt's wait is charged once, not per chunk");
+    }
+
     /// Share 0 makes the previous calls in the previous order: each prompt
     /// whole (`run_to_end`) in arrival order, before the next step.
     #[test]

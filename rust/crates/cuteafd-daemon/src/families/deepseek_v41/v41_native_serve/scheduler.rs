@@ -1217,9 +1217,6 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
                 |round, entry| queue::chunk(round, entry))?;
             for (_, result) in finished { result?; }
             prefills.settle(active.iter().any(Option::is_some));
-            // The round's own wall time and width, as counters (no log line).
-            phase_stats::record_prefill_round(
-                (prefills.last_round_seconds() * 1e9) as u64, prefills.last_round_prompts() as u64);
         }
         if active.iter().all(Option::is_none) {
             // Prompts still prefilling (share > 0) keep the engine busy.
@@ -1449,14 +1446,17 @@ pub(super) mod sampling_stats {
 /// monotonic counters in `/v1/stats`: a few relaxed atomic adds per round, no allocation, no
 /// lock, no log. The counters are read only by the 1 Hz stats publisher, never on the hot path.
 ///
+/// The prefill-round counters live with the round itself
+/// ([`crate::shared::prefill_share::round_stats`]), because every family prefills through that
+/// queue; this module owns the serve loop's own phases and merges the queue's numbers into the
+/// one snapshot.
+///
 /// **Overhead basis.** One `Instant::now()` pair plus one `fetch_add` per phase per round. The
 /// smallest round this bounds is a decode step, whose own floor is >= 1 ms; six relaxed adds at
 /// ~20 ns each is ~120 ns, i.e. <= 0.012 % of a 1 ms round. Nothing here allocates.
 pub(crate) mod phase_stats {
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    /// Wall time of every prefill round (the whole round, exchange included).
-    static PREFILL_ROUND_NS: AtomicU64 = AtomicU64::new(0);
     /// Wall time of every decode step.
     static DECODE_STEP_NS: AtomicU64 = AtomicU64::new(0);
     /// The part of a decode step that ran while prefill time was owed (`cycle.is_some()`).
@@ -1467,22 +1467,13 @@ pub(crate) mod phase_stats {
     /// Graph capture time, accumulated by the capture path.
     static GRAPH_CAPTURE_NS: AtomicU64 = AtomicU64::new(0);
 
-    static ROUNDS_PREFILL: AtomicU64 = AtomicU64::new(0);
     static ROUNDS_DECODE: AtomicU64 = AtomicU64::new(0);
     /// Decode rows run (the sum of every decode round's member rows).
     static ROWS_DECODE: AtomicU64 = AtomicU64::new(0);
-    /// Prompts that ran a prefill chunk (`prefill_prompts_total`).
-    static PREFILL_PROMPTS: AtomicU64 = AtomicU64::new(0);
     /// Time a prompt waited in the prefill queue before its first chunk.
     static PREFILL_QUEUE_WAIT_NS: AtomicU64 = AtomicU64::new(0);
     /// Decoding requests right now (a gauge, set by the serve loop each iteration).
     static ACTIVE_DECODE: AtomicU64 = AtomicU64::new(0);
-
-    pub(super) fn record_prefill_round(ns: u64, prompts: u64) {
-        PREFILL_ROUND_NS.fetch_add(ns, Ordering::Relaxed);
-        ROUNDS_PREFILL.fetch_add(1, Ordering::Relaxed);
-        PREFILL_PROMPTS.fetch_add(prompts, Ordering::Relaxed);
-    }
 
     pub(super) fn record_decode_step(ns: u64, owed_ns: u64, rows: u64) {
         DECODE_STEP_NS.fetch_add(ns, Ordering::Relaxed);
@@ -1499,22 +1490,27 @@ pub(crate) mod phase_stats {
     pub(super) fn set_active_decode(n: usize) { ACTIVE_DECODE.store(n as u64, Ordering::Relaxed); }
 
     pub(super) fn snapshot() -> serde_json::Value {
+        use crate::shared::prefill_share::round_stats;
         let get = |c: &AtomicU64| c.load(Ordering::Relaxed);
         serde_json::json!({
             "phase_ns_total": {
-                "prefill_round": get(&PREFILL_ROUND_NS),
+                "prefill_round": round_stats::round_ns(),
                 "decode_step": get(&DECODE_STEP_NS),
                 "decode_owed_wait": get(&DECODE_OWED_WAIT_NS),
                 "capture": get(&GRAPH_CAPTURE_NS),
                 "idle": get(&IDLE_NS),
             },
-            "rounds_total": {"prefill": get(&ROUNDS_PREFILL), "decode": get(&ROUNDS_DECODE)},
+            "rounds_total": {"prefill": round_stats::rounds(), "decode": get(&ROUNDS_DECODE)},
             "rows_total": {"decode": get(&ROWS_DECODE)},
-            "prefill_prompts_total": get(&PREFILL_PROMPTS),
+            "prefill_prompts_total": round_stats::prompts(),
             "prefill_queue_wait_ns_total": get(&PREFILL_QUEUE_WAIT_NS),
             "active_decode": get(&ACTIVE_DECODE),
         })
     }
+
+    /// The counters are process-global atomics; the delta tests must not race each other.
+    #[cfg(test)]
+    pub(crate) static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 }
 
 /// Which kernel route one row of a sampled round takes.
@@ -3889,19 +3885,24 @@ mod telemetry_tests {
 
     /// The counters are process-global atomics, so the tests that read deltas must not run
     /// concurrently with each other.
-    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    fn lock() -> std::sync::MutexGuard<'static, ()> {
+        phase_stats::TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner())
+    }
 
     fn delta(before: &serde_json::Value, after: &serde_json::Value, key: &str, sub: &str) -> u64 {
         after[key][sub].as_u64().unwrap() - before[key][sub].as_u64().unwrap()
     }
 
-    /// Every counter moves per round, and the snapshot carries the shape the stats
-    /// collector scrapes. Deltas, because the atomics are process-global.
+    /// The serve loop's own counters move per step, and the snapshot carries the shape the
+    /// stats collector scrapes. Deltas, because the atomics are process-global.
+    ///
+    /// The prefill-round numbers are recorded by the queue that runs the round
+    /// (`shared::prefill_share::round_stats`, proven by its own behavioural test); here they
+    /// are only checked to be present and numeric in the merged snapshot.
     #[test]
-    fn phase_counters_move_per_round() {
-        let _guard = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    fn decode_and_idle_counters_move_per_step() {
+        let _guard = lock();
         let before = phase_stats::snapshot();
-        phase_stats::record_prefill_round(2_000_000, 3);
         phase_stats::record_decode_step(1_500_000, 500_000, 7);
         phase_stats::record_idle(250_000);
         phase_stats::record_capture(900_000);
@@ -3909,26 +3910,26 @@ mod telemetry_tests {
         phase_stats::set_active_decode(4);
         let after = phase_stats::snapshot();
 
-        assert_eq!(delta(&before, &after, "phase_ns_total", "prefill_round"), 2_000_000);
         assert_eq!(delta(&before, &after, "phase_ns_total", "decode_step"), 1_500_000);
         assert_eq!(delta(&before, &after, "phase_ns_total", "decode_owed_wait"), 500_000);
         assert_eq!(delta(&before, &after, "phase_ns_total", "idle"), 250_000);
         assert_eq!(delta(&before, &after, "phase_ns_total", "capture"), 900_000);
-        assert_eq!(delta(&before, &after, "rounds_total", "prefill"), 1);
         assert_eq!(delta(&before, &after, "rounds_total", "decode"), 1);
         assert_eq!(delta(&before, &after, "rows_total", "decode"), 7);
-        assert_eq!(after["prefill_prompts_total"].as_u64().unwrap()
-            - before["prefill_prompts_total"].as_u64().unwrap(), 3);
         assert_eq!(after["prefill_queue_wait_ns_total"].as_u64().unwrap()
             - before["prefill_queue_wait_ns_total"].as_u64().unwrap(), 400_000);
         assert_eq!(after["active_decode"].as_u64().unwrap(), 4);
+        // The queue's numbers are merged into the same snapshot.
+        assert!(after["phase_ns_total"]["prefill_round"].is_u64());
+        assert!(after["rounds_total"]["prefill"].is_u64());
+        assert!(after["prefill_prompts_total"].is_u64());
     }
 
     /// `decode_owed_wait` is a subset of `decode_step` by construction: a decode step that ran
     /// with nothing owed contributes 0 to it, never more than the step itself.
     #[test]
     fn owed_wait_never_exceeds_the_decode_step() {
-        let _guard = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _guard = lock();
         let before = phase_stats::snapshot();
         phase_stats::record_decode_step(1_000_000, 0, 2);
         let after = phase_stats::snapshot();

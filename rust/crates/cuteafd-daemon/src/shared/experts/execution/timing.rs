@@ -627,6 +627,14 @@ mod expert_stats_tests {
     /// The counters are process-global atomics; the delta tests must not race each other.
     static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+    // These two tests are counter-level, not behavioural, and that is deliberate: the only
+    // caller of `record_unit` is `WorkerTiming::publish`, which reads CUDA events through a
+    // real `NativeLibrary`. The crate's only fake library
+    // (`cuteafd_ffi::native_library_lifetime_fixture::Fixture`) needs an allocated CPU build
+    // slot and an NVMe fixture directory, so every test that drives `publish` is `#[ignore]`d
+    // and cannot run in CI. There is no GPU-free seam to drive, so the unit conversion
+    // (microseconds in, nanoseconds out) is what is asserted here.
+
     /// One unit moves execute time, pace wait, waves and rows — the quantities the
     /// per-request `Spark expert compute` log line used to carry.
     #[test]
