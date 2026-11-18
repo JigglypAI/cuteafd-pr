@@ -22,8 +22,13 @@ SEMANTICS = {
     "engram": "The README names zero-based decoder indices; config names one-based layer IDs. The BF16 table stays "
               "BF16 on disk; HF applies per-vector E4M3 round-trip after lookup and before head RMS normalization. "
               "The hash multipliers use engram_seed and the loaded map's max + 1, not the table's row count.",
-    "scope": "The Tencent repository provides the recipe, not a separate eager text implementation. "
-             "vLLM/SGLang are serving recipes, not the F32 oracle. Vision, DFly and runtime KV cache are excluded.",
+    "serving_differences": "SGLang caches compressed indexer keys in FP8; HF pools and scores them in F32 here. "
+                           "SGLang's Engram consumes stored BF16 rows or stored FP8 plus scales, without simulating "
+                           "the HF E4M3 round-trip on BF16 rows. It also narrows Engram work to serving BF16 and "
+                           "uses a BF16 epsilon for key/query norms. Do not inherit those serving roundings.",
+    "scope": "The Tencent serving recipe points to Transformers; its finetuning patches can disable Engram, "
+             "which is not an inference setting. vLLM recipe is deployment guidance, not an eager oracle. "
+             "Vision, DFly and runtime KV cache are excluded.",
 }
 
 ROOT_ARITHMETIC = {
