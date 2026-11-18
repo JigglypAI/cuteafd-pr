@@ -24,6 +24,10 @@ extern "C" int32_t cuteafd_glm_mla_prefill_lse(const void* q, const void* kv, co
                                            void* out, int32_t rows, int32_t heads, int32_t topk,
                                            int32_t record_bytes, float scale_log2, int32_t kernel, void* stream, float* lse);
 
+extern "C" int32_t cuteafd_glm_mla_prefill_compare(const void* q, const void* kv, const void* indices,
+                                                 const void* lengths, int32_t rows, int32_t heads, int32_t topk,
+                                                 int32_t record_bytes, float scale_log2, double* stats, void* stream);
+
 #define CHECK(x)                                                                      \
   do {                                                                                \
     cudaError_t e_ = (x);                                                             \
@@ -294,6 +298,16 @@ int main(int argc, char** argv) {
                 poison_safe ? "yes" : "NO");
     failures += !finite || !same || !row_invariant || !poison_safe || rel > 0.05 || (kernel == 2 && lse_max > 3e-4);
   }
+  double stats[9];
+  std::fill_n(stats, 9, -1.0);
+  CHECK(cudaError_t(cuteafd_glm_mla_prefill_compare(dq_, dkv, dind, dlen, rows, heads, topk,
+                                                rec, scale_log2, stats, stream)));
+  const bool diagnostic = std::isfinite(stats[0]) && stats[0] >= 0 && stats[3] == 0
+      && std::isfinite(stats[5]) && stats[5] >= 0
+      && (rope ? std::isfinite(stats[6]) && stats[6] >= 0 && std::abs(stats[8] - stats[5]) <= 1e-12 * stats[5]
+               : stats[6] == -1.0 && stats[7] == -1.0 && stats[8] == -1.0);
+  std::printf("diagnostic includes exactly the supported kernels: %s\n", diagnostic ? "yes" : "NO");
+  failures += !diagnostic;
   CHECK(cudaEventDestroy(a));
   CHECK(cudaEventDestroy(b));
   CHECK(cudaStreamDestroy(stream));

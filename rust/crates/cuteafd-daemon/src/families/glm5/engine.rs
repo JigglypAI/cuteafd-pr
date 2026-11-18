@@ -3100,12 +3100,12 @@ impl<'a> GlmEngine<'a> {
             })?;
             if mla_prefill_check() {
                 // SAFETY: as above; the check synchronizes the stream.
-                let stats = self.on(rank, || unsafe {
+                let (stats, bf16) = self.on(rank, || unsafe {
                     self.library.glm_mla_prefill_check(w.query.buffer.ptr, kv.ptr, w.indices.buffer.ptr,
                         w.lengths.buffer.ptr, tables.positions.len(), heads, self.cfg.index_topk, 656,
                         scale * std::f32::consts::LOG2_E, self.stream_of(rank))
                 })?;
-                print_mla_check(index, &stats);
+                print_mla_check(index, &stats, bf16);
             }
         } else {
             let decode_scalars = [rows, Scalar::I32(self.attention_plan.rows() as i32)];
@@ -3327,15 +3327,16 @@ pub(crate) fn tensor_fp8_prefill() -> bool {
     *TENSOR.get_or_init(|| std::env::var("CUTEAFD_GLM_TENSOR_FP8").map_or(true, |v| v != "block"))
 }
 
-/// CUTEAFD_MLA_PREFILL_CHECK=1: after each prefill MLA, run both native kernels on its inputs and
-/// print the F16 kernel's difference from the E4M3 kernel (diagnostics; synchronizes, allocates).
+/// CUTEAFD_MLA_PREFILL_CHECK=1 compares the available native kernels against Q2P2
+/// on the actual prefill inputs (diagnostics; synchronizes and allocates).
 pub(crate) fn mla_prefill_check() -> bool {
     static CHECK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *CHECK.get_or_init(|| std::env::var("CUTEAFD_MLA_PREFILL_CHECK").is_ok_and(|v| v == "1"))
 }
 
-pub(crate) fn print_mla_check(layer: usize, stats: &[[f64; 3]; 2]) {
-    println!("mla check layer {layer:2} (vs e4m3-q2p2, rms {:.3e}): f16 rel {:.2e} max {:.2e}",
+pub(crate) fn print_mla_check(layer: usize, stats: &[[f64; 3]; 2], bf16: Option<[f64; 3]>) {
+    let bf16 = bf16.map_or_else(String::new, |[rel, max, _]| format!("; bf16 rel {rel:.2e} max {max:.2e}"));
+    println!("mla check layer {layer:2} (vs e4m3-q2p2, rms {:.3e}): f16 rel {:.2e} max {:.2e}{bf16}",
         stats[1][2], stats[0][0], stats[0][1]);
 }
 

@@ -1038,11 +1038,12 @@ __global__ void diff_stats(const bf16* __restrict__ a, const bf16* __restrict__ 
 
 }  // namespace
 
-// Diagnostics (CUTEAFD_MLA_PREFILL_CHECK): runs both kernels on the same inputs and writes, per
-// kernel k = 0..1, stats[3 k ..] = {relative L2, max abs difference, RMS of the reference}
-// against kernel 1 (E4M3). Synchronizes the stream;
-// allocates its own buffers.
-extern "C" int32_t cuteafd_glm_mla_prefill_check(const void* q, const void* kv, const void* indices,
+// Diagnostics (CUTEAFD_MLA_PREFILL_CHECK): compares kernels 0, 1, and (GLM 656-byte
+// records only) 2 against Q2P2 (kernel 1). For each supported kernel, stats[3 * k ..]
+// receives {relative L2, max abs difference, RMS of the reference}. The caller
+// supplies nine doubles; the third triple is left untouched for Flash.
+// Synchronizes the stream and allocates its own buffers.
+extern "C" int32_t cuteafd_glm_mla_prefill_compare(const void* q, const void* kv, const void* indices,
                                                  const void* lengths, int32_t rows, int32_t heads, int32_t topk,
                                                  int32_t record_bytes, float scale_log2, double* stats,
                                                  void* stream) {
@@ -1057,7 +1058,8 @@ extern "C" int32_t cuteafd_glm_mla_prefill_check(const void* q, const void* kv, 
     e = cudaError_t(cuteafd_glm_mla_prefill(q, kv, indices, lengths, ref, rows, heads, topk, record_bytes, scale_log2,
                                             1, stream));
   }
-  for (int k = 0; k < 2 && e == cudaSuccess; ++k) {
+  const int kernel_count = record_bytes == 656 ? 3 : 2;
+  for (int k = 0; k < kernel_count && e == cudaSuccess; ++k) {
     e = cudaError_t(cuteafd_glm_mla_prefill(q, kv, indices, lengths, out, rows, heads, topk, record_bytes, scale_log2,
                                             k, stream));
     double h[3] = {0, 0, 0};
