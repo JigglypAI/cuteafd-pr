@@ -30,7 +30,8 @@ fn compare(actual:&[u8],expected:&[u8],name:&str)->Result<()> {
 #[ignore="requires real Inkling BF16 MTP tensors, native programs and GPU; golden-run only"]
 fn installed_inkling_recurrent_forward_matches_real_weight_reference()->Result<()> {
     // SAFETY: golden-run mounts the matching sealed trusted native library.
-    let library=unsafe{cuteafd_ffi::NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)?};
+    let library=unsafe{cuteafd_ffi::NativeLibrary::load_for_experts(std::env::var("CUTEAFD_NATIVE_LIB")?,
+        cuteafd_core::ExpertGeometry::INKLING2)?};
     let programs=library.programs()?.with_manifest(Path::new(&std::env::var("CUTEAFD_PROGRAM_MANIFEST")?))?;
     let snapshot=std::path::PathBuf::from(std::env::var("CUTEAFD_TEST_DRAFT_SNAPSHOT")?);
     let fixture=std::path::PathBuf::from(std::env::var("CUTEAFD_GOLDEN_FIXTURES")?);
@@ -98,7 +99,8 @@ fn installed_inkling_recurrent_head_baseline() -> Result<()> {
     let mode = std::env::var("CUTEAFD_TEST_CORE_VIEW")?.parse::<CoreView>()?;
     let manifest = std::path::PathBuf::from(std::env::var("CUTEAFD_PROGRAM_MANIFEST")?);
     // SAFETY: golden-run mounts the matching sealed trusted native library.
-    let library = unsafe { cuteafd_ffi::NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
+    let library = unsafe { cuteafd_ffi::NativeLibrary::load_for_experts(std::env::var("CUTEAFD_NATIVE_LIB")?,
+        cuteafd_core::ExpertGeometry::INKLING2)? };
     let programs = library.programs()?.with_manifest(&manifest)?;
     let device = Device { library: &library, id: 0 };
     let stream = Rc::new(Stream::new(device)?);
