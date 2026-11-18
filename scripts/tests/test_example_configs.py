@@ -616,6 +616,17 @@ def _effective(entry: dict, matrix: dict) -> dict[str, str]:
     return {**keys(ROOT / entry["config"]), **matrix["defaults"]["set"], **entry["set"]}
 
 
+@pytest.mark.parametrize("matrix_path", [V6, V6_COMPACT])
+def test_v6_smoke_entries_use_a_matched_image_pair(matrix_path: str) -> None:
+    matrix = json.loads((ROOT / matrix_path).read_text())
+    tag = matrix["build"]
+    for entry in matrix["entries"]:
+        values = _effective(entry, matrix)
+        for key, role in (("COORDINATOR_DOCKER_INFERENCE", "coordinator"),
+                          ("SPARK_EXPERT_DOCKER_INFERENCE", "spark-expert")):
+            assert values.get(key) == f"ghcr.io/tpurtell/cuteafd-{role}:{tag}", (entry["name"], key)
+
+
 GATE_KIT = "scripts/bench/kits/gate/matrix-gate.json"
 # Each family's shipped drafter; Kimi splits by checkpoint (K3 Core-K6 DFlash2,
 # K3.1 block DSpark).
