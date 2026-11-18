@@ -174,12 +174,18 @@ impl crate::shared::qwen::scheduler::Placement for Placement {
 }
 
 #[derive(Clone)]
-pub(crate) struct InklingPrefix<'a> { bank:Rc<CacheBank<'a>>, draft:Option<Rc<super::draft::Binding<'a>>> }
+pub(crate) struct InklingPrefix<'a> { bank:Rc<CacheBank<'a>>, peer:Option<Rc<CacheBank<'a>>>, draft:Option<Rc<super::draft::Binding<'a>>> }
 impl<'a> InklingPrefix<'a> {
-    pub fn new(bank: Rc<CacheBank<'a>>) -> Self { Self {bank,draft:None} }
-    pub fn with_draft(bank:Rc<CacheBank<'a>>,draft:Option<Rc<super::draft::Binding<'a>>>)->Self{Self{bank,draft}}
+    pub fn new(bank: Rc<CacheBank<'a>>) -> Self { Self {bank,peer:None,draft:None} }
+    pub fn for_execution(execution: &super::engine::Execution<'a>) -> Self {
+        Self { bank: execution.requests.cache.clone(), peer: execution.peer.as_ref().map(|peer| peer.requests.cache.clone()),
+            draft: execution.draft.clone() }
+    }
+    fn banks(&self) -> impl Iterator<Item = &Rc<CacheBank<'a>>> {
+        std::iter::once(&self.bank).chain(self.peer.as_ref())
+    }
     pub fn snapshot_owners(&self)->Vec<Rc<dyn crate::shared::prefix::cuda_copy::SnapshotOwner+'a>>{
-        let mut owners:Vec<Rc<dyn crate::shared::prefix::cuda_copy::SnapshotOwner+'a>>=vec![self.bank.clone()];
+        let mut owners:Vec<Rc<dyn crate::shared::prefix::cuda_copy::SnapshotOwner+'a>>=self.banks().map(|bank| bank.clone() as Rc<dyn crate::shared::prefix::cuda_copy::SnapshotOwner>).collect();
         if let Some(draft)=&self.draft{owners.push(draft.clone());}owners
     }
     fn validate(&self, placement: &Placement, len: usize) -> Result<()> {
@@ -197,8 +203,8 @@ impl cuteafd_engine::prefix::PrefixFamily for InklingPrefix<'_> {
     fn layout(&self) -> cuteafd_engine::prefix::FamilyLayout {
         use cuteafd_engine::prefix::{FamilyLayout, MarkStore, ReuseRule};
         FamilyLayout { page_rows: 64, pages: self.bank.layout.pool_pages,
-            page_bytes: self.bank.layout.page_bytes * self.bank.layout.global_layers.len(),
-            mark_bytes: self.bank.layout.sequence_bytes+self.draft.as_ref().and_then(|draft|draft.marks.as_ref()).map_or(0,|marks|marks.bytes()), draft_bytes: 0,
+            page_bytes: self.banks().map(|bank| bank.layout.page_bytes * bank.layout.global_layers.len()).sum(),
+            mark_bytes: self.banks().map(|bank| bank.layout.sequence_bytes).sum::<usize>()+self.draft.as_ref().map_or(0,|draft|draft.marks.iter().map(|marks|marks.bytes()).sum()), draft_bytes: 0,
             rule: ReuseRule::EXACT, mark_store: MarkStore::Arena, page_owners: Default::default() }
     }
     fn pages<'p>(&self, placement: &'p Placement) -> &'p [u32] { &placement.units }
@@ -243,13 +249,13 @@ impl cuteafd_engine::prefix::PrefixFamily for InklingPrefix<'_> {
     }
     fn bind(&self, placement: &mut Placement) -> Result<(), cuteafd_engine::prefix::BoxError> {
         self.validate(placement, placement.len)?;
-        self.bank.reset(placement.slot)?;
+        for bank in self.banks() { bank.reset(placement.slot)?; }
         if let Some(draft)=&self.draft{draft.drafter.reset_context(placement.slot,0)?;}
         placement.state_len = 0;
         Ok(())
     }
     fn discard(&self, placement: &mut Placement) -> Result<(), cuteafd_engine::prefix::BoxError> {
-        self.bank.reset(placement.slot)?;
+        for bank in self.banks() { bank.reset(placement.slot)?; }
         if let Some(draft)=&self.draft{draft.drafter.reset_context(placement.slot,0)?;}
         placement.state_len = 0;
         Ok(())
@@ -268,12 +274,13 @@ impl cuteafd_engine::prefix::PrefixFamily for InklingPrefix<'_> {
         if len != placement.len || len != placement.state_len {
             return Err("Inkling snapshot frontier does not match committed causal state".into());
         }
-        self.bank.capture(placement.slot,slot.0 as usize)?;
+        for bank in self.banks() { bank.capture(placement.slot,slot.0 as usize)?; }
         if let Some(draft)=&self.draft{
-            let marks=draft.marks.as_ref().context("admitted draft marks absent")?;
             let (origin,frontier)=draft.drafter.frontier(placement.slot)?;
-            if frontier!=len{return Err("draft snapshot frontier differs from target".into());}
-            marks.capture(&draft.drafter.lead,placement.slot,slot.0 as usize,origin,frontier)?;
+            if frontier!=len || draft.marks.len()!=draft.ranks().count(){return Err("draft snapshot frontier or ranks differ from target".into());}
+            for (rank,marks) in draft.ranks().zip(&draft.marks){
+                rank.stream.device.run(||marks.capture(rank,placement.slot,slot.0 as usize,origin,frontier))?;
+            }
         }
         Ok(())
     }
@@ -281,9 +288,12 @@ impl cuteafd_engine::prefix::PrefixFamily for InklingPrefix<'_> {
         -> Result<(), cuteafd_engine::prefix::BoxError> {
         self.validate(placement, len)?;
         let slot = mark.context("Inkling exact restore requires its SWA/convolution mark")?;
-        self.bank.restore(slot.0 as usize, placement.slot)?;
+        for bank in self.banks() { bank.restore(slot.0 as usize, placement.slot)?; }
         if let Some(draft)=&self.draft{
-            draft.marks.as_ref().context("draft mark missing")?.restore(&draft.drafter.lead,placement.slot,slot.0 as usize,len)?;
+            if draft.marks.len()!=draft.ranks().count(){return Err("draft snapshot rank marks missing".into());}
+            for (rank,marks) in draft.ranks().zip(&draft.marks){
+                rank.stream.device.run(||marks.restore(rank,placement.slot,slot.0 as usize,len))?;
+            }
         }
         placement.len = len;
         placement.state_len = len;
@@ -291,20 +301,21 @@ impl cuteafd_engine::prefix::PrefixFamily for InklingPrefix<'_> {
     }
     fn copy_rows(&self, copy: cuteafd_engine::prefix::TailCopy) -> Result<(), cuteafd_engine::prefix::BoxError> {
         if copy.owner.is_some() { return Err("Inkling whole-rank pages have no parity owner".into()); }
-        Ok(self.bank.copy_page_rows(copy.from as usize, copy.to as usize, copy.rows)?)
+        for bank in self.banks() { bank.copy_page_rows(copy.from as usize, copy.to as usize, copy.rows)?; }
+        Ok(())
     }
     fn drain(&self) -> Result<(), cuteafd_engine::prefix::BoxError> {
-        self.bank.drain()?;
-        if let Some(draft)=&self.draft{if let Some(marks)=&draft.marks{marks.drain()?;}draft.drafter.lead.stream.drain()?;}
+        for bank in self.banks() { bank.drain()?; }
+        if let Some(draft)=&self.draft{for marks in &draft.marks{marks.drain()?;}draft.drafter.drain()?;}
         Ok(())
     }
     fn page_segments(&self, page: u32) -> Vec<cuteafd_hostcache::copy::DeviceRange> {
-        self.bank.layout.global_layers.iter().filter_map(|&layer| self.bank.page(layer, page as usize).ok())
+        self.banks().flat_map(|bank| bank.layout.global_layers.iter().filter_map(move |&layer| bank.page(layer, page as usize).ok()))
             .map(crate::shared::prefix::cuda_copy::range).collect()
     }
     fn mark_segments(&self, slot: cuteafd_engine::prefix::MarkSlot) -> Vec<cuteafd_hostcache::copy::DeviceRange> {
-        let mut segments=self.bank.mark(slot.0 as usize).ok().into_iter().map(crate::shared::prefix::cuda_copy::range).collect::<Vec<_>>();
-        if let Some(draft)=&self.draft{if let Some(marks)=&draft.marks{if let Ok(mark)=marks.mark(slot.0 as usize){segments.push(crate::shared::prefix::cuda_copy::range(mark));}}}
+        let mut segments=self.banks().filter_map(|bank| bank.mark(slot.0 as usize).ok()).map(crate::shared::prefix::cuda_copy::range).collect::<Vec<_>>();
+        if let Some(draft)=&self.draft{segments.extend(draft.marks.iter().filter_map(|marks|marks.mark(slot.0 as usize).ok()).map(crate::shared::prefix::cuda_copy::range));}
         segments
     }
 }

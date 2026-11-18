@@ -267,7 +267,7 @@ the text/image/text boundary fixture). Audio remains unsupported.
 ### Inkling Serving
 
 Inkling exposes `cuteafd serve --family inkling2` and `./run.sh --wip SLOT`
-for text-only serving on one RTX and 2-8 Spark expert endpoints. Standard
+for serving on one or two RTX GPUs and 2-8 Spark expert endpoints. Standard
 fidelity and Release smoke qualify the official mixed NVFP4/MXFP8 and EXL3 K4
 MC original checkpoints on 1 RTX + 4 Sparks, and native MXFP8 on 1 RTX + 6
 Sparks. Mixed TP4 owns and stores exactly 576 intermediate columns per rank;
@@ -276,8 +276,10 @@ and every Spark rank load in one required SparkNest push transaction.
 
 Planner reports mark admitted configurations Serving, independent of checkpoint
 repository, revision, MC view or fidelity measurement. Missing formats or native
-programs still refuse with their structural cause. The current serving executor
-owns one RTX and 2-8 Spark endpoints; target TP2 is separate implementation work (#2316), not a fidelity gate. A matching WIP build must include the
+programs still refuse with their structural cause. `RTX_GPUS=2` splits target
+attention and the bundled drafter across both GPUs with the original core; the
+lead owns the vocabulary head and residual stream. Compact TP2 requires the
+rank-local projection and reduction path tracked in #2316. A matching WIP build must include the
 Inkling padded-transpose load export and native expert packages.
 
 Inkling K4 MC uses `CORE_VIEW=original|k8-compact|k6-compact|fp8-compact`.
@@ -289,7 +291,7 @@ checkpoint precision. Gate and performance measurements for the compact
 views are pending. The cold golden accepts the same view with `--core-view`.
 
 `ATTENTION_PLACEMENT=auto|heads` and GPU embedding/device selection are supported;
-explicit `layers`, `context` and multi-RTX serving need a multi-GPU executor (#2316).
+Explicit `layers` and `context` are not implemented.
 Set `AUDIO=off`; bundled vision follows `VISION=auto` and normal encoder admission. `SPECULATOR=off|dspark` defaults to `dspark`
 (unset/`auto` selects the bundled drafter); explicit `off` wins and passes
 `--dspark=false`. Direct serving also defaults on;
@@ -809,6 +811,12 @@ when the server has no drafter or its effective draft policy is `off`.
 | `MEDIA_CACHE_BYTES` | engine | byte size | Media cache. |
 | `MEDIA_FEATURES_DIR`, `AUDIO_FEATURES_DIR` | unset | absolute dir | Encoder feature caches. |
 | `CHAT_TEMPLATE_FROM` | checkpoint | snapshot dir | GLM Flash template source when the checkpoint's template cannot mark images. |
+
+`./run.sh --dry-run` and serving both verify the native AOT exports on the
+planned media owners, without starting CUDA work. A slot or image that lacks
+required exports is refused rather than silently changing placement. Rebuild
+with `CUTEAFD_WIP_VISION_ATTENTION_AOT=ON` / `CUTEAFD_WIP_AUDIO_AOT=ON` (or the
+corresponding `CUTEAFD_RELEASE_` flags), or turn the unavailable tower off.
 
 The direct daemon's `--max-image-tokens` accepts an explicit 1-16384 per-image
 LM span cap. Omission uses the processor's default span, limited by its

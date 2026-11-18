@@ -52,7 +52,7 @@ def _flag(line: str, flag: str) -> str | None:
     return tokens[tokens.index(flag) + 1] if flag in tokens else None
 
 
-def test_inkling_native_launcher_composes_shared_argv_and_rejects_pair(tmp_path: Path) -> None:
+def test_inkling_native_launcher_composes_single_and_paired_argv(tmp_path: Path) -> None:
     config = {"model_type": "inkling2", "text_config": {"num_hidden_layers": 48}}
     keys = "SPARK_COUNT=6\nRTX_GPUS=1\nSPECULATOR=off\nVISION=off\nAUDIO=off\n" + SIX
     result = _family_launch_result(tmp_path / "whole", config, "thinkingmachines/Inkling-2-Small-MXFP8", keys,
@@ -68,8 +68,15 @@ def test_inkling_native_launcher_composes_shared_argv_and_rejects_pair(tmp_path:
     for flag in ("--split-device", "--attention-placement", "--dspark", "--prefill-packing"):
         assert flag not in shlex.split(serve)
     pair = _family_launch_result(tmp_path / "pair", config, "thinkingmachines/Inkling-2-Small-MXFP8",
-        keys.replace("RTX_GPUS=1", "RTX_GPUS=2"), extra_args=("--wip", "inkling"), encoder_plan=PLANNED)
-    assert pair.returncode == 2 and "one coordinator GPU" in pair.stderr
+        keys.replace("RTX_GPUS=1", "RTX_GPUS=2").replace("SPECULATOR=off", "SPECULATOR=dspark"),
+        physical_gpus=(0, 1), extra_args=("--wip", "inkling"), encoder_plan=PLANNED)
+    pair_serve = _line(pair, "serve-inkling2 --snapshot")
+    pair_plan = _line(pair, "cuteafd plan")
+    assert (_flag(pair_serve, "--device"), _flag(pair_serve, "--split-device")) == ("0", "1")
+    assert _flag(pair_plan, "--rtx") == "2"
+    assert _flag(pair_serve, "--peers") == _flag(serve, "--peers")
+    assert _flag(pair_plan, "--speculator") == "dspark"
+    assert "--dspark" in shlex.split(pair_serve)
 
 
 @pytest.mark.parametrize("setting, enabled", [("", True), ("auto", True), ("off", False), ("dspark", True)])
@@ -1068,3 +1075,31 @@ def test_pe_encoder_replicas_match_plan_and_runtime(tmp_path, family, model, ran
     assert _flag(serve,"--vision-replicas")=="2"
     assert _flag(_line(result,"cuteafd plan"),"--vision-replicas")=="2"
     assert _flag(serve,"--vision-peers")=="10.0.0.1:19442,10.0.0.2:19442"
+
+
+@pytest.mark.parametrize('wip', [True, False], ids=['wip-slot', 'release-image'])
+@pytest.mark.parametrize('dry_run', [True, False], ids=['plan', 'serve'])
+def test_missing_vision_attention_refuses_planned_startup(tmp_path, wip, dry_run):
+    library = tmp_path / 'libcuteafd_native.so'
+    # The unconditional C ABI is present; the generated init entrypoints are not.
+    subprocess.run(['cc', '-shared', '-fPIC', '-x', 'c', '-', '-o', str(library)], check=True,
+                   text=True, input='void cuteafd_vision_create(void) {}\n')
+    plan = {**PLANNED, 'encoder': {'kind': {'kind': 'rtx', 'gpu': 0}, 'replicas': []}}
+    result = _family_launch_result(tmp_path, KIMI, KIMI_ID, KIMI_KEYS + 'VISION=auto\n',
+        native_fixture=library, encoder_plan=plan,
+        extra_args=(('--wip', 'k3') if wip else ()) + (('--dry-run',) if dry_run else ()))
+    scope = 'WIP' if wip else 'RELEASE'
+    assert result.returncode == 2, result.stderr
+    assert f'this build lacks vision attention AOT; rebuild with CUTEAFD_{scope}_VISION_ATTENTION_AOT=ON or set VISION=off' in result.stderr
+    assert 'serve-kimik3 --snapshot' not in result.stderr and 'docker run -d' not in result.stderr
+
+
+def test_missing_pcm_audio_refuses_planned_startup(tmp_path):
+    library = tmp_path / 'libcuteafd_native.so'
+    subprocess.run(['cc', '-shared', '-fPIC', '-x', 'c', '-', '-o', str(library)], check=True,
+                   text=True, input='void cuteafd_pcm_create(void) {}\n')
+    plan = {**PLANNED, 'audio_encoder': {'kind': {'kind': 'rtx', 'gpu': 0}, 'replicas': []}}
+    result = _muse(tmp_path, 'VISION=off\nAUDIO=auto\n', native_fixture=library, encoder_plan=plan)
+    assert result.returncode == 2, result.stderr
+    assert 'this build lacks PCM audio AOT; rebuild with CUTEAFD_WIP_AUDIO_AOT=ON or set AUDIO=off' in result.stderr
+    assert 'serve-muse --snapshot' not in result.stderr

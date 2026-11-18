@@ -905,7 +905,8 @@ def _family_launch_result(tmp_path: Path, family_config: dict, model: str, keys:
                           deployment_overrides: dict | None = None,
                           probe_fails: bool = False, root_launcher: bool = False,
                           checkpoint_source: Path | None = None,
-                          execute_workers: bool = False) -> subprocess.CompletedProcess[str]:
+                          execute_workers: bool = False,
+                          native_fixture: Path | None = None) -> subprocess.CompletedProcess[str]:
     """Run the real run-family.sh up to its docker calls (docker/ssh/nest/curl are stubs
     that print their argv) and return what it would launch. nvidia-smi reports
     PHYSICAL_GPUS (default 0 and 1, V4.1 0 alone; BUSY_GPUS with 2 GiB free); the deployment plan charges each
@@ -916,6 +917,7 @@ def _family_launch_result(tmp_path: Path, family_config: dict, model: str, keys:
     if root_launcher:
         copy_input(ROOT / "run.sh", repo / "run.sh")
     copy_input(launcher_source or ROOT / "scripts" / "launch" / "run-family.sh", repo / "scripts" / "launch")
+    copy_input(ROOT / "scripts" / "launch" / "preflight-native-media.py", repo / "scripts" / "launch")
     copy_input(ROOT / "scripts" / "launch" / "preflight-fp8-bf16.py", repo / "scripts" / "launch")
     copy_input(ROOT / "scripts" / "launch" / "spark-memory-probe.py", repo / "scripts" / "launch")
     copy_input(ROOT / "scripts" / "lib" / "checkpoint-family.py", repo / "scripts" / "lib")
@@ -982,6 +984,13 @@ def _family_launch_result(tmp_path: Path, family_config: dict, model: str, keys:
     # Launcher tests model an idle host, independent of real API listeners.
     (bin_dir / "ss").write_text("#!/usr/bin/env bash\nexit 0\n")
     (bin_dir / "ss").chmod(0o755)
+    if native_fixture is None and wip:
+        native_fixture = tmp_path / 'fixture-native.so'
+        exports = ('_mlir_cuteafd_vision_attention_d64_cuda_init', '_mlir_cuteafd_vision_attention_d72_cuda_init',
+                   'cuteafd_audio_create', '_mlir_cuteafd_audio_layer_norm_1024_1_1_cuda_init',
+                   'cuteafd_pcm_create', '_mlir_cuteafd_audio_pcm_causal_conv7_h256_cuda_init')
+        subprocess.run(['cc', '-shared', '-fPIC', '-x', 'c', '-', '-o', str(native_fixture)],
+                       input=''.join(f'void {name}(void) {{}}\n' for name in exports), text=True, check=True)
     audio_backend = ("pcm-bf16-aot-v1" if family_config.get("model_type") == "muse_spark" else
                      "mimo_audio_fp32_v1/cuda13000/cufft12000/cublas13.0.0/cute_aot_sm121/export" + "cd" * 32)
     for tool in ("docker", "ssh", "nest") if with_nest else ("docker", "ssh"):
@@ -997,7 +1006,8 @@ def _family_launch_result(tmp_path: Path, family_config: dict, model: str, keys:
                                     '"${STUB_AUDIO_BACKEND:-' + audio_backend + '}" ;; esac\n' +
                                     ('case "$*" in image\\ inspect*) echo test-pin ;; '
                                      'cp\\ *) dst="${@: -1}"; mkdir -p "$dst"; '
-                                     'touch "$dst/cuteafd" "$dst/libcuteafd_native.so" "$dst/release-entrypoint.sh"; '
+                                     'touch "$dst/cuteafd" "$dst/release-entrypoint.sh"; '
+                                     f'cp {shlex.quote(str(native_fixture))} "$dst/libcuteafd_native.so"; '
                                      'if [[ "$2" == *verify-sparkinfer-source.py ]]; then printf "print(42)\\n" > "$dst/verify-sparkinfer-source.py"; fi ;; esac\n'
                                      if tool == "docker" and wip else '') +
                                     (f"case \"$*\" in *\"cuteafd plan\"*) echo '{{\"spark_ranks\":{preferred_ranks}}}' ;; esac\n"
@@ -1025,6 +1035,10 @@ def _family_launch_result(tmp_path: Path, family_config: dict, model: str, keys:
             stub = (bin_dir / tool).read_text()
             intercept = ('case "$*" in *" plan "*"--resolve-settings-only"*|*" plan "*"--deployment"*) exec python3 "$STUB_DEPLOYMENT" "$@" ;; '
                          'inspect*State.Status*) echo running; exit 0 ;; esac\n')
+            if native_fixture is not None and not wip:
+                intercept += ('case "$*" in *"python3"*"/opt/cuteafd/lib/libcuteafd_native.so RELEASE"*) '
+                              'while [[ $1 != /opt/cuteafd/lib/libcuteafd_native.so ]]; do shift; done; shift; '
+                              f'exec python3 - {shlex.quote(str(native_fixture))} "$@" ;; esac\n')
             if probe_fails:
                 # A slot binary that predates the family's serve command rejects it.
                 intercept += 'case "$*" in *"/opt/cuteafd-serve-probe"*) exit 2 ;; esac\n'

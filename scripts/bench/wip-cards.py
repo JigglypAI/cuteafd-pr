@@ -6,7 +6,7 @@ the last smoke has torn down. Children inherit CUTEAFD_HW_LOCKS_HELD, so smoke
 does not take those locks again. Builds (including legacy builds and seed/GPU
 exports) finish before this turn; dry-run prints the turn and is CPU-only.
 
-Stopping: SIGTERM, SIGINT or SIGHUP is forwarded to every running smoke, which
+Stopping: SIGTERM, SIGINT or SIGHUP stops the active build or reaches every running smoke, which
 tears down its coordinator and Spark workers (bounded, 60 s) before it exits;
 wip-cards waits for that (75 s, up to SMOKE_STOP_GRACE_S), starts no further job
 and exits 128 + the signal. This fits hwlock.py's 80 s outer stop grace (if
@@ -3166,8 +3166,11 @@ def build_arms(builds, arms, cards, state, task, dry, seed=DEFAULT_SEED):
                         # takes the lock itself for the native phase, so release it at once.
                         seed_wait = int(os.environ.get('CUTEAFD_WIP_SEED_WAIT_S', '14400'))
                         # A fair turn (hwlock), so a seed wait never overtakes an older queued job.
-                        subprocess.run([sys.executable, str(REPO / 'scripts/hw/hwlock.py'), '--locks', seed,
-                                        '--wait', str(seed_wait), '--', 'true'], check=True, timeout=seed_wait + 60)
+                        seed_command = [sys.executable, str(REPO / 'scripts/hw/hwlock.py'), '--locks', seed,
+                                        '--wait', str(seed_wait), '--', 'true']
+                        status = run_build(seed_command, timeout=seed_wait + 60)
+                        if status:
+                            raise subprocess.CalledProcessError(status, seed_command)
                     env = {**os.environ, **scopes, 'WIP_INSTANCE': arm['instance'], 'WIP_ROOT': str(root)}
                     env.pop('WIP_SEED_HOST', None)
                     env.pop('WIP_SEED_ADDR', None)
@@ -3177,14 +3180,37 @@ def build_arms(builds, arms, cards, state, task, dry, seed=DEFAULT_SEED):
                     if arm['build_lock_mode'] == 'legacy-full-build':
                         env.pop('CUTEAFD_WIP_EXPORT_LOCKS', None)
                     save(state / ('build-' + name + '.json'), dict(revision=revision, lock_mode=arm['build_lock_mode'], scopes=scopes, command=cmd))
-                    result = subprocess.run(cmd, env=env, cwd=source, timeout=14400)
-                    if result.returncode:
+                    if run_build(cmd, env=env, cwd=source, timeout=14400):
                         raise ValueError('build failed: ' + name)
                 else:
                     # Recursive submodule checkout of a fresh worktree outlasts run()'s 120 s.
-                    subprocess.run(cmd, check=True, text=True, capture_output=True, timeout=1800)
+                    status = run_build(cmd, timeout=1800)
+                    if status:
+                        raise subprocess.CalledProcessError(status, cmd)
         if dry:
             print('# identical build scopes ' + json.dumps(scopes, sort_keys=True))
+
+
+def run_build(cmd, *, env=None, cwd=None, timeout):
+    """Forward cancellation during build (including historical arm checkouts)."""
+    if stopped_code():
+        raise hwlock.Cancelled()
+    supervisor = REPO / 'scripts/build/build-process.py'
+    process = subprocess.Popen([sys.executable, str(supervisor), '--grace', '85',
+                                '--timeout', str(timeout), '--', *cmd],
+                               env=env, cwd=cwd, start_new_session=True)
+    with _LIVE_LOCK:
+        _LIVE[id(process)] = process
+    try:
+        if STOP['signal'] is not None:
+            _signal_live(STOP['signal'])
+        status = process.wait()
+        if stopped_code():
+            raise hwlock.Cancelled()
+        return status
+    finally:
+        with _LIVE_LOCK:
+            _LIVE.pop(id(process), None)
 
 
 def parse_panel_config(text):
@@ -3527,7 +3553,13 @@ def main():
             variant = resolved_card(card, {**arm_overrides.get(name, {}).get(card['name'], {}),
                 **arm_config.get(name, {})}, arm_unsets.get(name, set()))
             build_cards.append(variant)
-    build_arms(builds, arms, build_cards, state, args.task, args.dry_run, args.seed_host)
+    install_stop_handlers()
+    try:
+        build_arms(builds, arms, build_cards, state, args.task, args.dry_run, args.seed_host)
+    except hwlock.Cancelled:
+        return stopped_code() or 1
+    if stopped_code():
+        return stopped_code()
     adopt_roots(arms)
     if args.build_only:
         save(state / 'plan.json', {'task': args.task, 'arms': arms, 'jobs': []})
@@ -3662,9 +3694,6 @@ def main():
         return 0
     env = {**os.environ, 'CUTEAFD_API_KEY': key_file.read_text().strip()}
     env.pop('CUTEAFD_BENCH_NONCE_SEED', None)
-    # From here on a stop signal reaches every running smoke (which tears down)
-    # and no further job starts.
-    install_stop_handlers()
     if args.nonce_seed is not None:
         env['CUTEAFD_BENCH_NONCE_SEED'] = args.nonce_seed
     def cancelled_row(job):

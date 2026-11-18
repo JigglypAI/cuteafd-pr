@@ -1676,9 +1676,8 @@ if [[ "$split" != off ]]; then
   elif [[ "$family" == qwen3_5 && "$explicit_coordinator_gpus" != *,* ]]; then coordinator_gpu_count=1
   fi
 fi
-if [[ "$family" == inkling2 ]]; then
-  [[ "$rtx_gpus" != 2 && "$split" != heads && "$explicit_coordinator_gpus" != *,* ]] ||
-    release_die "Inkling serving requires one coordinator GPU; multi-GPU target and bundled drafter execution are not implemented (#2316)"
+if [[ "$family" == inkling2 && "$coordinator_gpu_count" == auto && "$explicit_coordinator_gpus" != *,* ]]; then
+  # Preserve the one-card automatic layout. Explicit pairs use head splitting.
   coordinator_gpu_count=1
 fi
 release_resolve_coordinator_gpus "$explicit_coordinator_gpus" "$coordinator_gpu_count"
@@ -2142,7 +2141,7 @@ fi
 split_hint=""
 split_opt_in=""
 case "$family:$model_type" in
-  deepseek_v4:*|glm5:*|glm5_flash:*|mimo_v2:mimo_v2|mimo_v2:mimo_v2_flash|kimi_k3:*|step5:*|muse_spark:*|minimax_m3:*) ;;
+  deepseek_v4:*|glm5:*|glm5_flash:*|mimo_v2:mimo_v2|mimo_v2:mimo_v2_flash|kimi_k3:*|step5:*|muse_spark:*|minimax_m3:*|inkling2:*) ;;
   qwen4:*|qwen3_5:*) ;; # Shared admission selects contiguous whole-layer owners.
   mimo_v2:*) split_hint="add MiMo head-split attention/projection kernels for $model_type" ;;
   *) split_hint="add coordinator head-split kernels for $model_type" ;;
@@ -2806,9 +2805,56 @@ if [[ "$package_requirements" != '{}' ]]; then
       release_die "$host is missing deployment Spark packages (before startup)"
   done
 fi
+# Check the exact owners selected by the CPU planner, including replicas.
+# WIP uses the sealed file; release probes run in the selected image without GPUs.
+media_check="$repo_root/scripts/launch/preflight-native-media.py"
+media_capabilities() {
+  local wants_vision="$1" wants_audio="$2"
+  media_caps=()
+  if [[ "$wants_vision" == true ]]; then
+    case "$checkpoint_family" in
+      qwen4|glm5_flash|muse_spark|mistral_large4|minimax_m3|kimi_k3|inkling2|step5) media_caps+=(vision) ;;
+    esac
+  fi
+  if [[ "$wants_audio" == true ]]; then
+    case "$checkpoint_family" in
+      mimo_v2) media_caps+=(mimo-audio) ;;
+      muse_spark) media_caps+=(pcm-audio) ;;
+    esac
+  fi
+  return 0
+}
+media_capabilities "$([[ "$vision" == rtx:* ]] && echo true || echo false)" "$([[ "$audio" == rtx:* ]] && echo true || echo false)"
+if ((${#media_caps[@]})); then
+  if [[ -n "$wip_slot" ]]; then
+    python3 "$media_check" "$wip_layout/lib/libcuteafd_native.so" WIP "${media_caps[@]}"
+  else
+    timeout 120 docker run --rm --network none -i --entrypoint python3 "$coordinator_image" \
+      - /opt/cuteafd/lib/libcuteafd_native.so RELEASE "${media_caps[@]}" <"$media_check"
+  fi
+fi
+for rank in "${spark_worker_ranks[@]}"; do
+  media_capabilities "$([[ " ${encoder_ranks[*]} " == *" $rank "* ]] && echo true || echo false)" \
+    "$([[ " ${audio_encoder_ranks[*]} " == *" $rank "* ]] && echo true || echo false)"
+  ((${#media_caps[@]})) || continue
+  host="$(get "SPARK_${rank}_HOST")"
+  if [[ -n "$wip_slot" ]]; then
+    # Resolve the remote home (or actual container mount) on its owner, not here.
+    slot_path="slots/$wip_slot/spark-expert/workspace/.cuteafd-wip/libcuteafd_native.so"
+    printf -v media_args '%q ' WIP "${media_caps[@]}"
+    printf -v media_command 'root=$(docker inspect -f %q %q 2>/dev/null || true); exec python3 - "${root:-%s}/%s" %s' \
+      '{{range .Mounts}}{{if eq .Destination "/wip"}}{{.Source}}{{end}}{{end}}' "$wip_spark_container" \
+      "${WIP_ROOT:-\$HOME/.cache/cuteafd/builds/wip${WIP_INSTANCE:+-$WIP_INSTANCE}}" "$slot_path" "$media_args"
+  else
+    printf -v media_command '%q ' docker run --rm --network none -i --entrypoint python3 "$spark_image" \
+      - /opt/cuteafd/lib/libcuteafd_native.so RELEASE "${media_caps[@]}"
+  fi
+  timeout 120 ssh -T -o BatchMode=yes -o ConnectTimeout=10 "$host" "$media_command" <"$media_check" ||
+    release_die "$host cannot supply deployment media capabilities (before startup)"
+done
 if ((dry_run)); then
   # No serving container, restart or remote staging below this point is allowed
-  # during validation. Runtime-only proofs (including audio exports) stay pending.
+  # during validation. Native media exports were checked on the planned owners.
   printf '%s\n' "$deployment_json"
   exit 0
 fi
