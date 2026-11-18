@@ -55,10 +55,8 @@ impl Family for DeepSeek {
         }
     }
     fn decode_lanes(&self) -> crate::plan::decode_lanes::LaneSupport { self.decode_lanes }
-    fn attention_prefill_precision(&self) -> crate::plan::attention_precision::PrefillPrecisionSupport {
-        crate::plan::attention_precision::PrefillPrecisionSupport {
-            modes: &[crate::plan::attention_precision::AttentionPrecision::Bf16QkFp8Pv], fp8_core_auto: None,
-            source: "the sparse-MLA MG prefill export runs BF16 QK and FP8 PV (fork 4af78b86)" }
+    fn attention_precision(&self) -> crate::plan::attention_precision::PrecisionSupport {
+        crate::plan::attention_precision::MLA
     }
     fn spark_decode(&self) -> Option<crate::plan::spark_executions::SparkDecode> {
         Some(crate::plan::spark_executions::SparkDecode { rows: self.decode_rows })

@@ -22,6 +22,9 @@ use std::time::{Duration, Instant};
 /// What every DeepSeek V4 command needs to stand up the engine.
 #[derive(Debug, Clone, clap::Args)]
 pub(crate) struct EngineArgs {
+    /// Shared MLA QK/PV operand precision, independent of KV storage.
+    #[arg(long, default_value = "bf16")]
+    pub attention_precision: cuteafd_core::attention::AttentionPrecision,
     /// Count executed backbone expert routes by phase (disable with =false).
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set, num_args = 0..=1,
         default_missing_value = "true", require_equals = true)]

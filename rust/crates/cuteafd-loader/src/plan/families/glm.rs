@@ -82,10 +82,8 @@ impl Family for Glm {
     }
     fn exlr8_execution(&self) -> Exlr8Execution { self.exlr8 }
     fn decode_lanes(&self) -> crate::plan::decode_lanes::LaneSupport { self.decode_lanes }
-    fn attention_prefill_precision(&self) -> crate::plan::attention_precision::PrefillPrecisionSupport {
-        crate::plan::attention_precision::PrefillPrecisionSupport {
-            modes: &[crate::plan::attention_precision::AttentionPrecision::Fp8], fp8_core_auto: None,
-            source: "sparse-MLA prefill runs the native E4M3 kernel (glm_mla_prefill.cu), not the MG export; the measured MG BF16 mode is about 3x slower (#2146)" }
+    fn attention_precision(&self) -> crate::plan::attention_precision::PrecisionSupport {
+        crate::plan::attention_precision::MLA
     }
     fn spark_decode(&self) -> Option<crate::plan::spark_executions::SparkDecode> {
         Some(crate::plan::spark_executions::SparkDecode { rows: self.decode_rows })

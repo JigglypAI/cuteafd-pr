@@ -159,7 +159,7 @@ fn planned_backend(plan: cuteafd_core::coordinator_programs::AttentionReductionP
     rows: usize, heads: usize, compressed: bool, aot_available: bool, aligned: bool) -> Result<bool> {
     ensure!((1..=plan.capacity_rows()).contains(&rows), "sparse rows exceed admitted execution capacity");
     let recipe = plan.sparse_recipe(compressed);
-    let aot = recipe.backend == cuteafd_core::coordinator_programs::SparseAttentionBackend::Bf16Aot;
+    let aot = recipe.backend == cuteafd_core::coordinator_programs::SparseAttentionBackend::NativeBf16Aot;
     ensure!(!aot || (aot_available && aligned),
         "V4.1 admitted BF16 AOT attention shape rows={rows} heads={heads} requires an aligned view and loaded AOT kernel; refusing backend switch");
     Ok(aot)

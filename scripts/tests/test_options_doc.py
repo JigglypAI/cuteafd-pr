@@ -536,3 +536,16 @@ def test_every_family_accepts_the_shared_draft_policy_key():
                    "muse_spark", "minimax_m3", "inkling2"):
         assert "DRAFT_POLICY" in family_keys(family), family
 
+
+
+def test_attention_precision_is_shared_and_has_no_legacy_alias():
+    assert "ATTENTION_PRECISION" in MATRIX
+    for family in FAMILIES.values():
+        keys = family_keys(family)
+        assert "ATTENTION_PRECISION" in keys
+        assert "ATTENTION_PREFILL_PRECISION" not in keys
+    rows = [row for _, header, rows in tables(DOC.read_text().splitlines())
+            if header[:3] == ["Key", "Default", "Values"] for row in rows
+            if row[0] == "`ATTENTION_PRECISION`"]
+    assert len(rows) == 1
+    assert rows[0][1:3] == ["`bf16`", "`bf16`, `fp8`"]

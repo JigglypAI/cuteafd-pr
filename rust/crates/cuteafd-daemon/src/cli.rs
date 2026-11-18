@@ -341,6 +341,9 @@ pub(crate) fn exlr8_prefill_activations_parser()
 /// Model-lifetime core selection shared by planner, serve and golden commands.
 #[derive(Debug, Clone, Default, Args)]
 pub(crate) struct CoreViewArgs {
+    /// Attention QK and PV operand precision, independent of weights and KV storage.
+    #[arg(long, default_value = "bf16")]
+    pub attention_precision: cuteafd_core::attention::AttentionPrecision,
     #[arg(skip)]
     pub selected_view: Option<cuteafd_loader::plan::checkpoint::CheckpointView>,
     /// Select a complete dense-core view; compact widths require an MC checkpoint.
@@ -597,9 +600,6 @@ pub(crate) struct PlanArgs {
     /// Decode views: V4.1 requires 2, MiMo accepts 1 or 2, other families require 1.
     #[arg(long, value_parser = clap::value_parser!(u8).range(1..=2))]
     pub(crate) decode_lanes: Option<u8>,
-    /// Prefill attention QK/PV precision: auto is the family default for the checkpoint's core view.
-    #[arg(long, default_value = "auto", value_parser = ["auto", "bf16", "fp8"])]
-    pub(crate) attention_prefill_precision: String,
     /// Rows one continuous prefill call streams for --layout (0: the family
     /// default). Shared by every units-span family (launcher PREFILL_SPAN_ROWS).
     #[arg(long, default_value_t = 0)]
@@ -1558,6 +1558,9 @@ mod tests {
 
 #[derive(Debug, Args)]
 pub(crate) struct NativeServeArgs {
+    /// Shared MLA QK/PV operand precision, independent of KV storage.
+    #[arg(long, default_value = "bf16")]
+    pub attention_precision: cuteafd_core::attention::AttentionPrecision,
     /// Count executed backbone expert routes by phase (disable with =false).
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set, num_args = 0..=1,
         default_missing_value = "true", require_equals = true)]
