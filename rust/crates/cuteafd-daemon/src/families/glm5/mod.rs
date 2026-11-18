@@ -1693,7 +1693,6 @@ impl Opened {
         let mut engine = engine::GlmEngine::new(&self.library, &programs, self.cfg.clone(), model, stream,
             max_context, args.prefill_rows, pages, embedding, depth, context.filter(|_| context_kv), rotary.remove(0))?;
         engine.initialize_usage(admitted.expert_usage.clone(), args.expert_usage_reader.clone())?;
-        engine.attention_precision = args.attention.attention_precision;
         engine.max_pool_tokens_no_onboard = placement.max_pool_tokens_no_onboard;
         engine.admitted_host_config = host_config;
         engine.exlr8_prefill_activations = args.exlr8_prefill_activations;

@@ -535,7 +535,6 @@ enum StepLogits {
 }
 
 pub(crate) struct GlmEngine<'a> {
-    pub(crate) attention_precision: cuteafd_core::attention::AttentionPrecision,
     pub(crate) spark_bf16: bool,
     /// Per rank: bound native dense programs and the prefill unpack staging
     /// (EXLR8 checkpoint dense operands); empty on the official path.
@@ -781,7 +780,7 @@ impl<'a> GlmEngine<'a> {
         let local = if context_mode.is_some() { pages / 2 } else { pages };
         let (kv, index, cos_sin) = caches(library, &cfg, &weights.layers, local, max_context, weights.rope_alpha.as_ref(), cos_sin)?;
         let device = library.cuda_get_device()?;
-        Ok(Self { attention_precision: Default::default(), admitted_host_config: None, max_pool_tokens_no_onboard: None, packed_row_cap: Cell::new(None), packed_fallback_reason: RefCell::new(String::new()), quantize_grid, device, exlr8_prefill_activations: super::Exlr8PrefillActivations::A16, native_experts: Vec::new(), native_dense: Vec::new(), native_scratch: Vec::new(), core_programs: Vec::new(), core_admission: None, peer: None, exchange: None, tp2: None, whole: None, tp2_exchange: ExchangeDtype::Bf16, force_route_check: Cell::new(false), context_mode, context: None, layer_execution: None,
+        Ok(Self { admitted_host_config: None, max_pool_tokens_no_onboard: None, packed_row_cap: Cell::new(None), packed_fallback_reason: RefCell::new(String::new()), quantize_grid, device, exlr8_prefill_activations: super::Exlr8PrefillActivations::A16, native_experts: Vec::new(), native_dense: Vec::new(), native_scratch: Vec::new(), core_programs: Vec::new(), core_admission: None, peer: None, exchange: None, tp2: None, whole: None, tp2_exchange: ExchangeDtype::Bf16, force_route_check: Cell::new(false), context_mode, context: None, layer_execution: None,
             context_units: RefCell::new(Vec::new()), library, programs, cfg, weights, stream, max_context, prefill_rows, pages, kv, index, cos_sin,
             decode_workspace: RefCell::new(None), prefill_slots: RefCell::new(Vec::new()),
             prefill_lanes, depth,
@@ -3089,14 +3088,15 @@ impl<'a> GlmEngine<'a> {
                 &[rows, Scalar::I32(tables.table_width as i32), Scalar::I32(tables.table_stride as i32)])?;
         }
         // Shared-indexer layers read the previous full layer's `indices`.
-        if let (false, Some(kernel)) = (tables.decode, native_mla_prefill(self.attention_precision)) {
+        // Neither quality tier has a faster native prefill route than BF16 here.
+        if !tables.decode {
             let scale = ((self.cfg.qk_nope_head_dim + self.cfg.qk_rope_head_dim) as f32).powf(-0.5);
             // SAFETY: query, cache, indices, lengths and the attention output are
             // live buffers of the step's rows on this rank's stream.
             self.on(rank, || unsafe {
                 self.library.glm_mla_prefill(w.query.buffer.ptr, kv.ptr, w.indices.buffer.ptr,
                     w.lengths.buffer.ptr, w.attn.buffer.ptr, tables.positions.len(), heads,
-                    self.cfg.index_topk, 656, scale * std::f32::consts::LOG2_E, kernel, self.stream_of(rank))
+                    self.cfg.index_topk, 656, scale * std::f32::consts::LOG2_E, cuteafd_ffi::MlaPrefillKernel::Bf16, self.stream_of(rank))
             })?;
             if mla_prefill_check() {
                 // SAFETY: as above; the check synchronizes the stream.
@@ -3325,18 +3325,6 @@ impl<'a> GlmEngine<'a> {
 pub(crate) fn tensor_fp8_prefill() -> bool {
     static TENSOR: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *TENSOR.get_or_init(|| std::env::var("CUTEAFD_GLM_TENSOR_FP8").map_or(true, |v| v != "block"))
-}
-
-/// The native prefill path uses the same typed precision as decode and plan.
-pub(crate) fn native_mla_prefill(precision: cuteafd_core::attention::AttentionPrecision)
-    -> Option<cuteafd_ffi::MlaPrefillKernel> {
-    use cuteafd_core::attention::AttentionPrecision;
-    use cuteafd_ffi::MlaPrefillKernel;
-    // Native Q2P2 meets the BF16-tier accuracy bound. The prefill tier
-    // selector can add a different FP8 route once it is qualified.
-    match precision {
-        AttentionPrecision::Bf16 | AttentionPrecision::Fp8 => Some(MlaPrefillKernel::Fp8),
-    }
 }
 
 /// CUTEAFD_MLA_PREFILL_CHECK=1: after each prefill MLA, run both native kernels on its inputs and

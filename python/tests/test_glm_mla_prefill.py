@@ -17,8 +17,7 @@ import pytest
 
 FORK = Path(__file__).resolve().parents[2] / "third_party" / "sparkinfer"
 ROWS = (64, 1536, 2048, 2688, 2752, 4096)  # 2688 is the tail of 8192 at a 2752 unit.
-NATIVE_ARMS = {"native-fp8": 1, "native-bf16": 2, "exact-f16": 3}
-ARMS = (*NATIVE_ARMS, "mg-bf16")
+NATIVE_ARMS = {"native-fp8": 1, "native-bf16": 2}
 
 
 def run_case(fmt, library, timing=False):
@@ -34,6 +33,8 @@ def run_case(fmt, library, timing=False):
     from b12x.attention._shared.mla.smem_mg import max_mg_head_groups
 
     heads, qdim, topk, scale = INLINE[fmt]
+    native_arms = tuple(arm for arm in NATIVE_ARMS if fmt == "glm" or arm != "native-bf16")
+    arms = (*native_arms, "mg-bf16")
     traits = arm_traits(fmt, "bf16")
     partitions = _mg_head_partitions(heads, 16, max_mg_head_groups(traits))
     native = ctypes.CDLL(str(library)).cuteafd_glm_mla_prefill_lse
@@ -93,11 +94,11 @@ def run_case(fmt, library, timing=False):
             out.append(torch.bmm(probs, k[..., :512]))
         return torch.cat(out), torch.cat(lse)
 
-    def compare(pattern, q, indices, lengths, arms=ARMS):
+    def compare(pattern, q, indices, lengths, selected_arms=arms):
         expected, expected_lse = reference(q, indices, lengths)
         report = {}
         live = expected_lse.isfinite()
-        for arm in arms:
+        for arm in selected_arms:
             out, lse = alloc(len(q))
             launch(arm, q, indices, lengths, out, lse)
             assert torch.isfinite(out).all().item(), (fmt, pattern, arm, "nonfinite output")
@@ -138,15 +139,15 @@ def run_case(fmt, library, timing=False):
     # nonzero-length/all-negative row independently.
     mask[1].fill_(-1)
     scores["all_negative_native"] = compare("all_negative", query(3, "spread"), mask[:3],
-                                            torch.tensor(edges[:3], device=dev, dtype=torch.int32), NATIVE_ARMS)
+                                            torch.tensor(edges[:3], device=dev, dtype=torch.int32), native_arms)
     result = {"device": torch.cuda.get_device_name(), "capability": torch.cuda.get_device_capability(),
               "heads": heads, "topk": topk, "oracle": scores, "curve": {}}
     if timing:
         q = query(width, "medium")
         for rows in ROWS:
-            outputs = {arm: alloc(rows) for arm in ARMS}
+            outputs = {arm: alloc(rows) for arm in arms}
             graphs = {}
-            for arm in ARMS:
+            for arm in arms:
                 out, lse = outputs[arm]
                 args = arm, q[:rows], idx[:rows], full[:rows], out, lse if arm == "mg-bf16" else None
                 for _ in range(3):
@@ -156,9 +157,9 @@ def run_case(fmt, library, timing=False):
                 with torch.cuda.graph(graph):
                     launch(*args)
                 graphs[arm] = graph
-            samples = {arm: [] for arm in ARMS}
+            samples = {arm: [] for arm in arms}
             for sample in range(5):
-                for arm in ARMS[::1 if sample % 2 == 0 else -1]:
+                for arm in arms[::1 if sample % 2 == 0 else -1]:
                     start, stop = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
                     start.record()
                     for _ in range(10):

@@ -12,15 +12,6 @@ pub enum MlaPrefillKernel {
     Bf16 = 2,
 }
 
-impl From<cuteafd_core::attention::AttentionPrecision> for MlaPrefillKernel {
-    fn from(precision: cuteafd_core::attention::AttentionPrecision) -> Self {
-        match precision {
-            cuteafd_core::attention::AttentionPrecision::Bf16 => Self::Bf16,
-            cuteafd_core::attention::AttentionPrecision::Fp8 => Self::Fp8,
-        }
-    }
-}
-
 impl NativeLibrary {
     /// `out` [rows, heads, 512] BF16 = softmax(scale * q . k) v over each row's
     /// first `lengths[r]` entries of `indices` [rows, topk] (record slots;

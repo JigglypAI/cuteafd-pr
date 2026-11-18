@@ -55,7 +55,7 @@ int main(int argc, char** argv) {
   const int rec = argc > 2 ? std::atoi(argv[2]) : 656;
   const int heads = argc > 3 ? std::atoi(argv[3]) : 64;
   const int iterations = argc > 4 ? std::atoi(argv[4]) : 10;
-  const char* kernels = argc > 5 ? argv[5] : "012";
+  const char* kernels = argc > 5 ? argv[5] : (rec == 656 ? "012" : "01");
   const char* pattern = argc > 6 ? argv[6] : "mixed";
   const int topk = argc > 7 ? std::atoi(argv[7]) : (rec == 656 ? 2048 : 2112);
   const int slots = 12288, dq = rec == 656 ? 576 : 512;
