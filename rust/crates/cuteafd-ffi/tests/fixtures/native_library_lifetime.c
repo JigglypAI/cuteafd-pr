@@ -71,13 +71,14 @@ void fixture_extent_only(void) { extent_only = 1; immediate_copies = 1; }
 struct fixture_program_info {
     char name[64]; uint32_t pointers, scalars; char scalar_kinds[16];
 };
-static struct fixture_program_info draft_programs[2048];
-static struct { uint32_t ready; char event; } program_replies[2048];
+enum { FIXTURE_PROGRAM_CAPACITY = 4096 };
+static struct fixture_program_info draft_programs[FIXTURE_PROGRAM_CAPACITY];
+static struct { uint32_t ready; char event; } program_replies[FIXTURE_PROGRAM_CAPACITY];
 static uint32_t draft_program_count;
 static void event(char value);
 int fixture_register_program(uint32_t index, const char *name, uint32_t pointers,
                              const char *scalar_kinds, uint32_t scalars) {
-    if (index >= 2048 || strlen(name) >= 64 || scalars > 16) return 1;
+    if (index >= FIXTURE_PROGRAM_CAPACITY || strlen(name) >= 64 || scalars > 16) return 1;
     struct fixture_program_info *info = &draft_programs[index];
     memset(info, 0, sizeof(*info));
     memset(&program_replies[index], 0, sizeof(program_replies[index]));
