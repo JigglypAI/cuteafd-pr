@@ -38,16 +38,16 @@ impl Rank<'_> {
     /// `step.normalized` is the final full-hidden block, replicated at the lead.
     /// Request-local f_rnn rows are already gathered from committed target taps.
     pub fn recurrent_tokens(&self,sequences:usize,anchor_ids:Buffer,target_head:Buffer)->Result<Buffer> {
-        self.recurrent_tokens_measured(sequences, anchor_ids, |hidden, output| {
+        self.recurrent_tokens_measured(sequences, anchor_ids, Some(sequences*self.config.predictions()), |hidden, output, rows| {
             // SAFETY: native BF16 head and admitted inputs/output outlive the stream.
-            unsafe { self.programs.plain.launch_checked(hidden.ptr, target_head.ptr, output, sequences,
+            unsafe { self.programs.plain.launch_checked(hidden.ptr, target_head.ptr, output, rows,
                 self.config.transformer.hidden, self.config.padded_vocab, self.stream.raw)?; }
             Ok(())
         }, |_, _| Ok(()))
     }
 
     pub(super) fn recurrent_tokens_measured(&self, sequences:usize, anchor_ids:Buffer,
-        base: impl Fn(Buffer, Buffer) -> Result<()>, mut stamp: impl FnMut(usize, HeadStage) -> Result<()>) -> Result<Buffer> {
+        base_tile: Option<usize>, base: impl Fn(Buffer, Buffer, usize) -> Result<()>, mut stamp: impl FnMut(usize, HeadStage) -> Result<()>) -> Result<Buffer> {
         let c=&self.config.transformer;let lib=self.stream.device.library;let stream=self.stream.raw;
         ensure!(sequences>0 && sequences<=self.layout.sequences,"recurrent head live sequences exceed admission");
         let head=self.weights.tensors.head.as_ref().context("peer has no recurrent head")?;
@@ -61,17 +61,43 @@ impl Rank<'_> {
             lib.copy_d2d_async(ids,anchor_ids,sequences*4,stream)?;}
         let input_width=self.config.recurrent_input_width()?;
         let input=self.buffer("head.inputs")?;
+        let predictions=self.config.predictions();
+        let hidden_pitch=c.hidden*2;
+        let base_pitch=self.config.padded_vocab*2;
+        let hidden_rows=self.buffer("head.hidden")?;
+        let base_rows=self.buffer("head.base")?;
+        let source=self.buffer("step.normalized")?;
+        let gather=|step:usize, output:Buffer| -> Result<()> {
+            let offset=(step+1)*hidden_pitch;
+            // SAFETY: skip the anchor and pack one independent mask row per
+            // sequence while retaining the fully reduced source block.
+            unsafe {lib.copy_d2d_2d_async(output,hidden_pitch,
+                part(source,offset,source.bytes-offset)?,c.block*hidden_pitch,
+                hidden_pitch,sequences,stream)}
+        };
+        let step_hidden=|step:usize| part(hidden_rows,step*sequences*hidden_pitch,sequences*hidden_pitch);
+        let step_base=|step:usize| part(base_rows,step*sequences*base_pitch,sequences*base_pitch);
+        if let Some(tile)=base_tile {
+            ensure!(tile>0,"recurrent head projection tile must be nonzero");
+            // The draft block is already complete: all base logits depend
+            // only on mask hidden rows. Markov state and feedback start below.
+            for step in 0..predictions { gather(step,step_hidden(step)?)?; }
+            let live=sequences*predictions;
+            for first in (0..live).step_by(tile) {
+                let rows=(live-first).min(tile);
+                base(part(hidden_rows,first*hidden_pitch,rows*hidden_pitch)?,
+                    part(base_rows,first*base_pitch,rows*base_pitch)?,rows)?;
+            }
+        }
         for step in 0..self.config.predictions() {
             stamp(step, HeadStage::Begin)?;
-            let hidden=self.buffer("head.hidden")?;
-            let source=self.buffer("step.normalized")?;
-            // SAFETY: skip anchor row; each row is one sequence's mask at the
-            // same position, copied to a contiguous step-major head input.
-            unsafe{lib.copy_d2d_2d_async(hidden,c.hidden*2,
-                part(source,(step+1)*c.hidden*2,source.bytes-(step+1)*c.hidden*2)?,
-                c.block*c.hidden*2,c.hidden*2,sequences,stream)?;
-                lib.cuda_embedding_lookup_bf16_async(head.token_embedding.buffer,ids,
-                    self.buffer("head.previous_embedding")?,sequences,self.config.padded_vocab,c.markov_rank,stream)?;}
+            let row=if base_tile.is_some(){step}else{0};
+            let hidden=step_hidden(row)?;
+            let base_logits=step_base(row)?;
+            if base_tile.is_none(){gather(step,hidden)?;}
+            // SAFETY: the previous token is produced in stream order.
+            unsafe{lib.cuda_embedding_lookup_bf16_async(head.token_embedding.buffer,ids,
+                self.buffer("head.previous_embedding")?,sequences,self.config.padded_vocab,c.markov_rank,stream)?;}
             let mut offset=0;
             for (source,width) in [(state,c.markov_rank),(self.buffer("head.previous_embedding")?,c.markov_rank),
                 (hidden,c.hidden),(self.buffer("head.f_rnn")?,c.hidden)] {
@@ -91,7 +117,7 @@ impl Rank<'_> {
                 programs.gate.launch(&[self.buffer("head.raw")?,state,next_state,self.buffer("head.latent")?],
                     sequences,c.rms_norm_eps as f32,0,stream)?;
                 stamp(step, HeadStage::Recurrent)?;
-                base(hidden, self.buffer("head.base")?)?;
+                if base_tile.is_none(){ base(hidden,base_logits,sequences)?; }
                 stamp(step, HeadStage::Base)?;
                 self.programs.f32.launch_checked(self.buffer("head.latent")?.ptr,
                     self.weights.derived("derived.fold_weight")?.buffer.ptr,self.buffer("head.correction_f32")?,
@@ -101,7 +127,7 @@ impl Rank<'_> {
                     self.weights.derived("derived.fold_bias")?.buffer,self.buffer("head.correction")?],
                     sequences,c.rms_norm_eps as f32,0,stream)?;
                 stamp(step, HeadStage::Bias)?;
-                programs.finish.launch(&[self.buffer("head.base")?,self.buffer("head.correction")?,
+                programs.finish.launch(&[base_logits,self.buffer("head.correction")?,
                     self.buffer("head.logits_bf16")?],sequences,c.rms_norm_eps as f32,0,stream)?;
                 stamp(step, HeadStage::Finish)?;
                 lib.load_widen_bf16_f32(self.buffer("head.logits_bf16")?.ptr,self.buffer("head.logits")?.ptr,

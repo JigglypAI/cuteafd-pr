@@ -139,6 +139,9 @@ fn installed_inkling_recurrent_head_baseline() -> Result<()> {
     }
     library.copy_h2d(anchors, &ids)?;
 
+    if mode == CoreView::Original && std::env::var_os("CUTEAFD_TEST_BATCHED_HEAD").is_some() {
+        crate::shared::thermal::monitor("recurrent-head-oracle");
+    }
     const SAMPLES: usize = 12;
     const STAGES: usize = HeadStage::Copies as usize;
     let predictions = config.predictions();
@@ -152,7 +155,7 @@ fn installed_inkling_recurrent_head_baseline() -> Result<()> {
         ProjectionWeight::Fp8(w) => w.values.buffer.bytes + w.scales.buffer.bytes,
     };
     for rows in [1, 4, 16, 64] {
-        let base = |hidden: Buffer, output: Buffer| -> Result<()> {
+        let base = |hidden: Buffer, output: Buffer, rows: usize| -> Result<()> {
             let weight = head()?;
             if let ProjectionWeight::Bf16(w) = weight {
                 // SAFETY: same retained BF16 operands as the original head.
@@ -167,12 +170,12 @@ fn installed_inkling_recurrent_head_baseline() -> Result<()> {
                 library.copy_d2d_2d_async(output, n*2, bf16_stage.buffer, stored*2, n*2, rows, stream.raw)
             }
         };
-        rank.recurrent_tokens_measured(rows, anchors, base, |_, _| Ok(()))?;
+        rank.recurrent_tokens_measured(rows, anchors, None, base, |_, _| Ok(()))?;
         stream.drain()?;
         let mut totals = [[0.0; STAGES]; 7];
         for _ in 0..SAMPLES {
             let mut events = (0..predictions*(STAGES+1)).map(|_| Event::timing(device)).collect::<Result<Vec<_>>>()?;
-            rank.recurrent_tokens_measured(rows, anchors, base,
+            rank.recurrent_tokens_measured(rows, anchors, None, base,
                 |step, stage| events[step*(STAGES+1)+stage as usize].record(&stream))?;
             stream.drain()?;
             for (step, stages) in totals.iter_mut().enumerate() {
@@ -182,6 +185,42 @@ fn installed_inkling_recurrent_head_baseline() -> Result<()> {
                     *total += f64::from(unsafe { library.cuda_event_elapsed_ms(events[i].raw, events[i+1].raw)? }) * 1e3;
                 }
             }
+        }
+        if mode == CoreView::Original && std::env::var_os("CUTEAFD_TEST_BATCHED_HEAD").is_some() {
+            let read_tokens = |out: Buffer| -> Result<Vec<u8>> {
+                let mut bytes = vec![0; rows*predictions*4];
+                library.copy_d2h(&mut bytes, Buffer { bytes: rows*predictions*4, ..out })?;
+                Ok(bytes)
+            };
+            let old = rank.recurrent_tokens_measured(rows, anchors, None, base, |_, _| Ok(()))?;
+            stream.drain()?;
+            let expected = read_tokens(old)?;
+            let new = rank.recurrent_tokens(rows, anchors, match head()? {
+                ProjectionWeight::Bf16(w) => w.buffer,
+                _ => unreachable!("original uses a BF16 head"),
+            })?;
+            stream.drain()?;
+            ensure!(expected == read_tokens(new)?, "batched original head changed recurrent tokens at M={rows}");
+            let time = |batch: bool| -> Result<(f64, serde_json::Value)> {
+                use cuteafd_core::thermal;
+                let mut begin = Event::timing(device)?;
+                let mut end = Event::timing(device)?;
+                let from = thermal::now_s();
+                begin.record(&stream)?;
+                for _ in 0..64 {
+                    rank.recurrent_tokens_measured(rows, anchors, batch.then_some(rows*predictions), base, |_, _| Ok(()))?;
+                }
+                end.record(&stream)?;
+                stream.drain()?;
+                // SAFETY: both events finished on the ordered CUDA stream.
+                let us = f64::from(unsafe { library.cuda_event_elapsed_ms(begin.raw, end.raw)? }) * 1e3 / 64.0;
+                Ok((us, thermal::window(from, thermal::now_s())))
+            };
+            let (old, old_thermal) = time(false)?;
+            let (new, new_thermal) = time(true)?;
+            eprintln!("RECURRENT_HEAD_BF16_PAIR {}", serde_json::json!({"rows": rows,
+                "serial_round_us": old, "batched_round_us": new, "serial_thermal": old_thermal,
+                "batched_thermal": new_thermal, "exact_tokens": true}));
         }
         let mean = (0..STAGES).map(|stage| totals.iter().map(|step| step[stage]).sum::<f64>() / (SAMPLES*predictions) as f64)
             .collect::<Vec<_>>();
