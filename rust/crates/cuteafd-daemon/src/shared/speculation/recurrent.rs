@@ -23,7 +23,7 @@ impl<'a> Drafter<'a> {
     pub fn frontier(&self,slot:usize)->Result<(usize,usize)>{
         let state=self.context.state.borrow();Ok(state.pool.frontier(state.binding(slot)?)?)
     }
-    pub fn draft(&self,sequences:&[DraftSeq],embedding:Buffer,embed_norm:Buffer,head:Buffer)->Result<Vec<Draft>> {
+    pub fn draft(&self,sequences:&[DraftSeq],embedding:Buffer,embed_norm:Buffer,select:impl FnOnce(usize,Buffer)->Result<Buffer>)->Result<Vec<Draft>> {
         ensure!(self.live.get(),"recurrent drafter is terminal");
         let result=(||{
             let pages=self.context.state.borrow().pages(sequences)?;
@@ -46,11 +46,11 @@ impl<'a> Drafter<'a> {
                 Some(split)=>super::recurrent_tp2::forward(&self.lead,split,sequences,&pages)?,
                 None=>self.lead.forward_whole(sequences,&pages)?,
             }
-            self.lead.recurrent_tokens(sequences.len(),self.lead.buffer("step.ids")?,head)?;
+            let selected=select(sequences.len(),self.lead.buffer("step.ids")?)?;
             self.lead.stream.drain()?;
             let count=sequences.len()*self.lead.config.predictions()*4;
             let mut bytes=vec![0;count];
-            lib.copy_d2h(&mut bytes,Buffer{bytes:count,..self.lead.buffer("head.tokens")?})?;
+            lib.copy_d2h(&mut bytes,Buffer{bytes:count,..selected})?;
             let tokens=bytes.chunks_exact(4).map(|v|u32::from_le_bytes(v.try_into().unwrap())).collect::<Vec<_>>();
             Ok(tokens.chunks_exact(self.lead.config.predictions()).map(|tokens|Draft{tokens:tokens.to_vec(),features:vec![],confidence:vec![]}).collect())
         })();

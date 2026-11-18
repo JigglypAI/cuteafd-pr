@@ -532,9 +532,13 @@ def inkling2_load_programs():
     import torch
     from functools import partial
     from b12x.integration.cuteafd.inkling2_glue import compile_padded_transpose_aot
-    return [("padded_transpose_bf16_r16_c1024_p64", "padded_transpose",
-             {"dtype": "bfloat16", "rows": 16, "cols": 1024, "padded_cols": 64},
-             partial(compile_padded_transpose_aot, dtype=torch.bfloat16, rows=16, cols=1024, padded_cols=64))]
+    transforms = (("bf16", "bfloat16", 16, 1024, 64),
+                  ("bf16", "bfloat16", 4608, 256, 4608),
+                  ("f32", "float32", 32, 201088, 32))
+    return [(f"padded_transpose_{suffix}_r{r}_c{c}_p{p}", "padded_transpose",
+             {"dtype": dtype, "rows": r, "cols": c, "padded_cols": p},
+             partial(compile_padded_transpose_aot, dtype=getattr(torch, dtype), rows=r, cols=c, padded_cols=p))
+            for suffix, dtype, r, c, p in transforms]
 
 
 def inkling2_input_quant_program():
@@ -2128,7 +2132,7 @@ def main() -> None:
         fp8_shapes = {(k, n, "f32") for _, k, n, _ in INKLING_TARGET_SHAPES}
         fp8_shapes.update((k, n, "bf16") for _, k, n, _ in INKLING_SHAPES if n != 201088)
         for k, n, precision in sorted(fp8_shapes):
-            for rows in ((64,) if n == 201088 else (64, 4096)):
+            for rows in (64, 4096):
                 suffix = f"n{n}_k{k}_m{rows}" + ("_f32" if precision == "f32" else "")
                 if suffix not in existing_fp8:
                     work.append(("native_attention", suffix, "attention_projection", dict(max_rows=rows),

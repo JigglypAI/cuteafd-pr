@@ -25,6 +25,7 @@ pub(crate) struct Fp8Weight<'a> {
     pub scales: Allocation<'a>,
 }
 
+#[derive(Clone, Copy)]
 pub(crate) enum ProjectionWeight<'s, 'a> {
     Bf16(&'s Allocation<'a>),
     Trellis(&'s CoreWeights<'a>),

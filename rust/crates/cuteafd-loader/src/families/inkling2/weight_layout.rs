@@ -87,6 +87,14 @@ pub fn projection_prefix(stem: &str, rank: usize, ranks: usize) -> String {
 }
 
 impl CoordinatorWeights {
+    #[cfg(feature = "test-support")]
+    pub fn head_only(checkpoint: &Checkpoint, cfg: &Inkling2Config) -> Result<Self> {
+        let mut builder = Builder { checkpoint, tensors: Vec::new(), core: BTreeMap::new(), fp8: BTreeMap::new() };
+        builder.projection(format!("{HEAD}.weight"), &[cfg.vocab_size, cfg.hidden], 0, None)?;
+        Ok(Self { rank: 0, layers: vec![], core: builder.core, fp8: builder.fp8,
+            arena: WeightArenaLayout::new("inkling2/recurrent-head-bench", builder.tensors)? })
+    }
+
     /// Layer modes come from placement. A whole layer lives on its owner; a
     /// head- or context-split layer keeps half its heads' projections on each
     /// rank and replicates the per-layer norms, convolutions, router and

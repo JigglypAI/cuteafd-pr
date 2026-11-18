@@ -244,10 +244,16 @@ impl SelectedWeights {
         let head_rows = shared::DECODE_ROWS as usize;
         let mut programs = target.trellis_programs(manifest, prefill_rows, head_rows)?;
         programs.extend(target.fp8_programs(manifest, prefill_rows, head_rows)?.into_keys());
-        if let Some((_, draft, _)) = &self.drafter {
+        if let Some((config, draft, _)) = &self.drafter {
             let draft = draft.get(rank).context("Inkling drafter rank missing")?;
             programs.extend(draft.trellis_programs(manifest, super::draft::CONTEXT_ROWS)?);
             programs.extend(draft.fp8_programs(manifest, super::draft::CONTEXT_ROWS)?.into_keys());
+            if rank == draft.lead {
+                if let Some(stored) = target.stored_head() {
+                    programs.extend(super::draft::fold_programs(config.transformer.hidden,
+                        config.transformer.markov_rank, stored));
+                }
+            }
         }
         Ok(programs)
     }

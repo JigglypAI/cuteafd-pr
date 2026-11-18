@@ -701,7 +701,7 @@ def test_inkling2_dispatch_package_codes_cmake_and_placement_scopes_agree(monkey
             assert op == "bf16_projection" and family == "draft_bf16"
             assert thunk()[2] == "f32"
     expected_fp8 = {(k, n, rows, "f32") for _, k, n, _ in compact.INKLING_TARGET_SHAPES
-        for rows in ((64,) if n == 201088 else (64, 4096))}
+        for rows in (64, 4096)}
     expected_fp8.update((k, n, rows, "bf16") for _, k, n, _ in compact.INKLING_SHAPES
         if n != 201088 for rows in (64, 4096))
     assert fp8 == expected_fp8

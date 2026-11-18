@@ -13,6 +13,13 @@ pub fn prefix_mark_slots(sequences:u64,entries:u64,target_bytes:u64,draft_bytes:
 
 pub const CONTEXT_ROWS: usize = 2048;
 
+pub const FOLD_TILE: usize = 32;
+
+pub fn fold_programs(hidden: usize, rank: usize, stored: usize) -> [String; 2] {
+    [format!("inkling2_padded_transpose_bf16_r{hidden}_c{rank}_p{hidden}"),
+        format!("inkling2_padded_transpose_f32_r{FOLD_TILE}_c{stored}_p{FOLD_TILE}")]
+}
+
 #[derive(Debug,Clone,Copy)]
 pub struct Selection {pub kv_cache:Qwen4KvCache,pub sms:usize}
 

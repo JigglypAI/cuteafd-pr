@@ -252,7 +252,8 @@ pub(crate) fn whole<'a>(library: &'a Arc<NativeLibrary>, programs: &'a Programs<
             rank.buffers.extend(projection);
         }
         execution.draft=Some(std::rc::Rc::new(super::draft::Binding::new(programs,stream.clone(),weights,layout,
-            &admitted.solved,execution.target.operand("model.llm.unembed.weight")?.buffer,
+            &admitted.solved,execution.target.projection("model.llm.unembed.weight")?,
+            &execution.head,&execution.kernels,
             usize::try_from(inputs.prefill.rows)?,usize::try_from(inputs.prefill.waves)?,inputs.prefix_mark_slots)?));
     }
     let physical = [options.device];
