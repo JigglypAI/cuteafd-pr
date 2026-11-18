@@ -724,7 +724,7 @@ mod tests {
 
     #[test]
     fn trellis_staging_is_shared_by_target_and_predictor_on_one_rank() -> Result<()> {
-        use crate::{placement::families::step5 as family, serving_capacity::WeightArenaLayout};
+        use crate::{placement::{families::step5 as family, planner::Recipe}, serving_capacity::WeightArenaLayout};
         use cuteafd_core::memory_layout::MemoryKind;
         let cfg = config();
         let input = inputs(2);

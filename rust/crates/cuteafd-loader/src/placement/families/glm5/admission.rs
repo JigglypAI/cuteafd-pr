@@ -2324,9 +2324,9 @@ impl Recipe for GlmRecipe<'_> {
                 .map_err(|error| invalid(&error.to_string()))?;
             let mut components = weights.components(self.maximum_pages)?;
             components.extend(weights.loading_components(self.maximum_pages)?);
-            // #1242's K4-v1 census had routed trellises only. Its untracked
-            // after-weights samples also followed receiver/mount retirement,
-            // so the measured stage rows do not cover this transient backing.
+            // #1242's K4-v1 census had no target trellises and predates
+            // the recorded GLM core uploader (ec7a1b96d4). Its post-load
+            // untracked samples do not cover this transient backing.
             for rank in 0..self.gpus {
                 if weights.owners.iter().any(|owner| owner.allocation.location == Location::coordinator(rank as u8)
                     && owner.format == "exl3-k6") {

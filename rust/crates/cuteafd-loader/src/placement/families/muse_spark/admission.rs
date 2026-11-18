@@ -1111,7 +1111,8 @@ mod contract_tests {
                 prefill: PrefillPlan { unit_rows: 64, waves: 1, span_rows: 64 }, bf16_target_head: serving::BlasHead::TensorLt,
                 slots: 1, mark_slots: 1, context: 64,
                 pool: crate::placement::prepare_pool(pool_facts(&cfg, &cards, 64, Some(64)))?,
-                partial_bf16_max_rows: 0, partial_reply_formats: Default::default(), local: LocalPackage::Unknown,
+                partial_bf16_max_rows: crate::families::muse_spark::replies::DEFAULT_BF16_MAX_ROWS,
+                partial_reply_formats: Default::default(), local: LocalPackage::Unknown,
                 drafter: None, fixed: vec![], media: MediaOptions::from_checkpoint(checkpoint, MediaMode::Off, MediaMode::Off, 2)?,
             }.prepare()?;
             let request = production_request(64, Some(64), crate::placement::Onboard::Auto,

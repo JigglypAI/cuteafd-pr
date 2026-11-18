@@ -1192,6 +1192,7 @@ mod tests {
             let mut recipe = recipe();
             recipe.owners.clear();
             recipe.gpus = 2;
+            recipe.attention.fill(LayerMode::HeadSplit);
             recipe.records_per_page.push(0);
             recipe.experts.as_mut().unwrap().destination = vec![0, 1];
             for arena in &mut recipe.arenas {
