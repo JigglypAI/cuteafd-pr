@@ -1817,11 +1817,9 @@ def build_sm121_state(args, arms, task_root, snapshot, container_path, hub, mode
     locks = sm121_locks(host)
     if mode == 'golden':
         raise ValueError('--sm121-host runs --native-test or --command (family goldens need the coordinator)')
-    conflicts = [flag for flag, value in (('--gpus', args.gpus), ('--spark-hosts', args.spark_hosts), ('--rdma', args.rdma),
-                                          ('--fixtures', args.fixtures), ('--expert-layers', args.expert_layers),
-                                          ('--worker-env', args.worker_env), ('--arm-worker-env', args.arm_worker_env),
-                                          ('--worker-arg', args.worker_arg),
-                                          ('--worker-memory-bytes', args.worker_memory_bytes is not None)) if value]
+    raptor_only = ('gpus', 'spark_hosts', 'rdma', 'fixtures', 'expert_layers', 'worker_env', 'arm_worker_env',
+                   'worker_arg', 'worker_memory_bytes')
+    conflicts = ['--' + key.replace('_', '-') for key in raptor_only if getattr(args, key) not in (None, False, [])]
     if conflicts:
         raise ValueError(f'--sm121-host runs on one Spark GPU alone: drop {", ".join(conflicts)}')
     native_test = args.native_test
