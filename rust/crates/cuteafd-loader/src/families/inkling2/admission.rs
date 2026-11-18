@@ -338,8 +338,11 @@ pub fn gather(request: &FactsRequest<'_>) -> Result<InklingInputs, Refused> {
     }).transpose().map_err(|error|refused(format!("bundled drafter inventory refused: {error:#}"),"Check MTP tensor headers and exports."))?;
     let dense_push_bytes = targets.iter().enumerate().map(|(rank, target)| {
         let draft = drafter.as_ref().map(|draft| &draft.layout.weights[rank]);
-        let trellis_window = if target.core.is_empty() && draft.is_none_or(|d| d.core.is_empty()) { 0 }
-            else { cuteafd_ffi::push_ring::DEFAULT_SLOT_BYTES };
+        let trellis_window = target.core.values().chain(draft.into_iter().flat_map(|d| d.core.values()))
+            .map(|layout| {
+                let tile_row = layout.shape[0] / 16 * 32 * layout.bits;
+                tile_row * (cuteafd_ffi::push_ring::DEFAULT_SLOT_BYTES / tile_row).max(1)
+            }).max().unwrap_or(0);
         let fp8_window = target.fp8.values().chain(draft.into_iter().flat_map(|d| d.fp8.values()))
             .map(|layout| {
                 let block = layout.shape[1] * 2 * 128;
