@@ -27,6 +27,7 @@ pub const PUBLICATIONS: &[Publication] = &[
     Publication { root: "meta-models/Muse-Spark-Open-816B-A42B", siblings: &["meta-models/Muse-Spark-Open-816B-A42B"], revision: dataset::MUSE_SPARK_REVISION, config: dataset::MUSE_SPARK_CONFIG },
     // Official native NVFP4/MXFP8 release; MiniMax publishes no BF16 master.
     Publication { root: "MiniMaxAI/MiniMax-M3.1-Flash", siblings: &["MiniMaxAI/MiniMax-M3.1-Flash"], revision: dataset::MINIMAX_M3_REVISION, config: dataset::MINIMAX_M3_CONFIG },
+    Publication { root: "tencent/Hy4-flash", siblings: &["tencent/Hy4-flash"], revision: dataset::HY4_REVISION, config: dataset::HY4_CONFIG },
     Publication { root: "thinkingmachines/Inkling-2-Small-MXFP8", siblings: &["thinkingmachines/Inkling-2-Small-MXFP8", "thinkingmachines/Inkling-2-Small"], revision: dataset::INKLING2_REVISION, config: dataset::INKLING2_CONFIG },
     // Official FP8 block-128 release; Mistral publishes no BF16 master.
     Publication { root: "mistralai/Mistral-Large-4-1T-A52B", siblings: &["mistralai/Mistral-Large-4-1T-A52B"], revision: dataset::MISTRAL_LARGE4_REVISION, config: dataset::MISTRAL_LARGE4_CONFIG },
@@ -50,6 +51,7 @@ pub const OFFICIAL_ROOTS: &[(&str, &[&str])] = &[
     ("mistralai/Mistral-Large-4-1T-A52B", &["mistralai/Mistral-Large-4-1T-A52B"]),
     ("MiniMaxAI/MiniMax-M3.1-Flash", &["MiniMaxAI/MiniMax-M3.1-Flash"]),
     ("moonshotai/Kimi-K3.1-Pro", &["moonshotai/Kimi-K3.1-Pro"]),
+    ("tencent/Hy4-flash", &["tencent/Hy4-flash"]),
     ("thinkingmachines/Inkling-2-Small-MXFP8", &["thinkingmachines/Inkling-2-Small-MXFP8", "thinkingmachines/Inkling-2-Small"]),
 ];
 
@@ -400,6 +402,22 @@ mod tests {
         assert_eq!((r.reference_root.as_str(), r.revision.as_str(), r.config.as_str()),
             (root, dataset::MISTRAL_LARGE4_REVISION, dataset::MISTRAL_LARGE4_CONFIG));
         assert!(resolve_in("someone/Mistral-Large-4-1T-A52B-EXL3", None, tmp.path()).is_err());
+    }
+
+    #[test]
+    fn hy4_root_and_declared_quants_resolve_to_the_pinned_reference() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = "tencent/Hy4-flash";
+        assert_eq!(official_root(root), Some(root));
+        let quant = add(tmp.path(), "test/hy4-quant", "base_model: tencent/Hy4-flash\nbase_model_relation: quantized");
+        for (model, snapshot, matched_by) in [(root, None, "name"),
+            ("test/hy4-quant", Some(quant.as_path()), "base_model")] {
+            let reference = resolve_in(model, snapshot, tmp.path()).unwrap();
+            assert_eq!(reference.reference_match, matched_by);
+            assert_eq!((reference.reference_root.as_str(), reference.revision.as_str(), reference.config.as_str()),
+                (root, dataset::HY4_REVISION, dataset::HY4_CONFIG));
+        }
+        assert!(resolve_in("someone/Hy4-flash-unverified", None, tmp.path()).is_err());
     }
 
     #[test]

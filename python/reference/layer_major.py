@@ -278,6 +278,7 @@ def run(a, family, *, extras_root=None, media_adapter=None):
         return run_trace(a, family, manifest)
 
     checking = getattr(a, "_prefix_probe", False)
+    pilot_layers = getattr(a, "pilot_layers", None)
     started = time.monotonic()
     a.out.mkdir(parents=True, exist_ok=True)
     arithmetic = family.configure()
@@ -303,7 +304,7 @@ def run(a, family, *, extras_root=None, media_adapter=None):
     if media_present:
         pins = {**pins, "media": media_adapter.provenance(a, manifest)}
     marker = a.out / "qualified-gate.json"
-    if official_full:
+    if official_full or pilot_layers is not None:
         proof = None
     elif not checking and marker.exists():
         # Resume: the prefix proof and official arm already passed for this exact binding.
@@ -356,12 +357,16 @@ def run(a, family, *, extras_root=None, media_adapter=None):
                 atomic_json(a.out / "media-reference.json", media_identity)
             pending = state.begin(-1)
             for window in windows:
-                state.save(pending, window["id"], {"hidden": embed_window(family, window, features)})
+                carry = family.initial_carry(window) if hasattr(family, "initial_carry") else {}
+                state.save(pending, window["id"], {"hidden": embed_window(family, window, features), **carry})
             del features
             family.release_outer()
             state.commit(pending)
         print(f"resume after layer {state.latest['layer']}; {len(windows)} windows", flush=True)
-        for index in range(state.latest["layer"] + 1, family.layers):
+        stop = family.layers if pilot_layers is None else pilot_layers
+        for index in range(state.latest["layer"] + 1, stop):
+            if pilot_layers is None and hasattr(family, "begin_layer_memory"):
+                family.begin_layer_memory()
             tick = time.monotonic()
             read_before, read_seconds_before = family.checkpoint.read_bytes, family.checkpoint.read_seconds
             wait_for_shards(family, index, getattr(a, "wait_shards", 0))
@@ -417,6 +422,10 @@ def run(a, family, *, extras_root=None, media_adapter=None):
                 log_reference_cuda_memory(torch.cuda, f"after layer {index}")
             print(f"layer {index + 1}/{family.layers} committed; {seconds:.1f}s (load {load_seconds:.1f}s); "
                   f"read {(family.checkpoint.read_bytes - read_before) / 1e9:.2f} GB", flush=True)
+            if pilot_layers is None and hasattr(family, "end_layer_memory"):
+                family.end_layer_memory("prefix" if checking else "panel", index)
+        if pilot_layers is not None:
+            return state.latest["seconds_per_layer"]
         wait_for_tensors(family, family.outer_tensors("final"), getattr(a, "wait_shards", 0))
         equality = None
         if official_full and getattr(a, "official_state", None):
@@ -443,7 +452,9 @@ def run(a, family, *, extras_root=None, media_adapter=None):
                     del tiled_logits
                 del full_logits
             else:
-                logits = family.final(selected).float().cpu().numpy()
+                use_official_head = wid == "official_short" and getattr(family, "compare_official_head", False)
+                head = family.official_final if use_official_head else family.final
+                logits = head(selected).float().cpu().numpy()
             if not np.isfinite(logits).all():
                 raise ValueError("non-finite reference logits")
             if wid in ("official_short", "adapted_short"):
