@@ -350,7 +350,7 @@ impl NativeLaneLayout {
     /// remain separate allocations because the exchange stream reads them.
     pub fn with_core_stages(mut self, stages: BTreeMap<&'static str, usize>) -> Result<Self> {
         let mut transient = stages.iter().filter(|(name, _)| !CORE_MEET_PLANES.contains(name)
-            && !matches!(**name, "native attention F32 partial" | "native attention FP8 scratch"))
+            && !matches!(**name, "native attention F32 partial" | "native FFN F32 partial" | "native attention FP8 scratch"))
             .map(|(&name, &bytes)| (name, bytes)).collect::<Vec<_>>();
         transient.sort_by_key(|&(name, bytes)| (std::cmp::Reverse(bytes), name));
         ensure!(stages.keys().all(|name| !self.operands.contains_key(name)), "duplicate Kimi core arena operand");
@@ -729,7 +729,7 @@ pub fn baseline_demands_for_ranks(cfg: &KimiK3Config, manifest: &serde_json::Val
         demands.push(Demand::new(rank as u8, Category::Workspace, "Kimi lane 0 native operands",
             layout.bytes()? as u64, Basis::Exact));
         demands.push(Demand::new(rank as u8, Category::Workspace, "Kimi lane 0 token IO",
-            io_extents_for_ranks(cfg.vocab_size, rank, rows, core.get_weight("language_model.lm_head").is_some(), physical_ranks)?
+            io_extents_for_ranks(cfg.vocab_size, rank, rows, core.compact_head(), physical_ranks)?
                 .into_iter().sum::<usize>() as u64, Basis::Exact));
         if physical_ranks == 2 {
             demands.push(exchange_demand(unit, rank as u8, 0)?);

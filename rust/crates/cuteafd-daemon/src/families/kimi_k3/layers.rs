@@ -806,10 +806,10 @@ impl<'e, 'a, 's> Bindings<'e, 'a, 's> {
         }
         Ok(())
     }
-    /// Native K6 and fused FFN partials both cross the peer link as BF16.
+    /// Trellis and fused FFN partials use BF16; native FP8 down retains F32.
     fn publish_ffn(&self, layer: usize) -> Result<()> {
         if self.local[0].native_ffn(layer)? {
-            ensure!(self.local[1].native_ffn(layer)?, "Kimi K6 FFN rank formats differ");
+            ensure!(self.local[1].native_ffn(layer)?, "Kimi compact FFN rank formats differ");
             self.publish_core(layer,true)
         } else {
             self.publish("ffn output")

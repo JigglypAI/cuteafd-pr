@@ -524,8 +524,9 @@ mod family_tests {
         let fp8 = Checkpoint::open_view(&CheckpointView::select(dir.path(), CoreView::Fp8Compact)?)?;
         let cfg = KimiK3Config::from_hf(&fp8.config)?;
         let expected = tensors.iter().map(|(name, _, shape)| (name.clone(), shape.clone())).collect();
-        let error = CoreInventory::from_checkpoint(&cfg, &fp8, &expected).unwrap_err().to_string();
-        assert!(error.contains("lm_head.weight") && error.contains("vocabulary head") && error.contains("Kimi"), "{error}");
+        let core = CoreInventory::from_checkpoint(&cfg, &fp8, &expected)?;
+        assert!(core.projections.is_empty() && core.native.len() == shapes.len());
+        assert!(core.native.values().all(|p| p.fp8));
         Ok(())
     }
 
@@ -569,8 +570,15 @@ mod family_tests {
         assert!(bytes[0] > bytes[1] && bytes[1] > bytes[2], "{bytes:?}");
         let fp8 = Checkpoint::open_view(&CheckpointView::select(dir.path(), CoreView::Fp8Compact)?)?;
         let expected = tensors.iter().map(|(name, _, shape)| (name.clone(), shape.clone())).collect();
-        let error = CoreInventory::from_checkpoint(&cfg, &fp8, &expected).unwrap_err().to_string();
-        assert!(error.contains("lm_head.weight") && error.contains("Kimi"), "{error}");
+        let core = CoreInventory::from_checkpoint(&cfg, &fp8, &expected)?;
+        let layouts = LayerLayout::pair_with_core(&cfg, 3, crate::placement::LayerMode::ContextSplit, &core)?;
+        let fp8_bytes = layouts.iter().map(|layout| layout.bytes()).collect::<Result<Vec<_>>>()?.into_iter().sum::<usize>();
+        assert!(bytes[0] > fp8_bytes);
+        for layout in layouts {
+            assert_eq!(layout.native["mla.kv_a"].shape, [640, cfg.hidden]);
+            assert!(layout.operands.contains_key("mla.indexer.kw"));
+            assert!(!layout.native.contains_key("mla.indexer.kw"));
+        }
         let plain = tempfile::tempdir()?;
         testing::write_snapshot(plain.path(), &config, &tensors, None);
         assert!(CheckpointView::select(plain.path(), CoreView::Fp8Compact).unwrap_err().to_string()

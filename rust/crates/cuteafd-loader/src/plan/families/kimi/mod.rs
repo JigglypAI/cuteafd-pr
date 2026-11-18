@@ -188,15 +188,19 @@ impl Model {
                 if model.core.projections.contains_key(format::split_stem(&tensor.meta.name).0) { continue; }
                 if let Some((layer, rest)) = text(&tensor.meta.name).and_then(|r| indexed(r, "layers."))
                     .filter(|_| role.component != Component::RoutedExpert) {
+                    let stem = format::split_stem(&tensor.meta.name).0;
+                    let bytes = if let Some(p) = model.core.native.get(stem).filter(|p| p.fp8) {
+                        crate::families::kimi_k3::core::native_layout(stem, p, 0, 1)?.bytes()?
+                    } else { tensor.meta.byte_length };
                     if matches!(role.component, Component::LatentProjection | Component::Router) {
                         let ordinal = model.cfg.dense[..layer].iter().filter(|dense| !**dense).count();
-                        model.frontends[ordinal % 2] += tensor.meta.byte_length;
+                        model.frontends[ordinal % 2] += bytes;
                     }
                     let residency = if matches!(role.component, Component::Attention | Component::Indexer) && model.cfg.attention[layer] == KimiAttention::Mla {
                         &mut model.mla[layer]
                     } else { &mut model.coordinator };
                     let bucket = if replicated(rest) { &mut residency.replicated } else { &mut residency.split };
-                    *bucket += tensor.meta.byte_length;
+                    *bucket += bytes;
                 } else if matches!(role.component, Component::Norm | Component::ResidualMix) {
                     model.coordinator.replicated += tensor.meta.byte_length;
                 }
