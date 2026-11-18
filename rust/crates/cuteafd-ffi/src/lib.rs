@@ -2395,9 +2395,8 @@ impl Drop for NativeLibrary {
 
 /// Hands the process expert hidden size to the native pack and route-reduce
 /// helpers, which instantiate their indexing per supported size.
-fn sync_expert_hidden(lib: &Library) -> Result<()> {
+fn sync_expert_hidden(lib: &Library, hidden: u32) -> Result<()> {
     type SetExpertHiddenFn = unsafe extern "C" fn(u32) -> i32;
-    let hidden = cuteafd_core::expert_geometry().hidden;
     match unsafe { lib.get::<SetExpertHiddenFn>(b"cuteafd_set_expert_hidden") } {
         Ok(set) => {
             let status = unsafe { set(hidden) };
@@ -2416,6 +2415,21 @@ fn sync_expert_hidden(lib: &Library) -> Result<()> {
 
 impl NativeLibrary {
     pub unsafe fn load(path: impl AsRef<Path>) -> Result<Self> {
+        // SAFETY: the caller supplies a trusted native artifact.
+        unsafe { Self::load_with_hidden(path, cuteafd_core::expert_geometry().hidden) }
+    }
+
+    /// Load a family artifact with its explicitly selected expert geometry.
+    /// # Safety
+    /// The caller supplies a trusted native artifact for this geometry.
+    pub unsafe fn load_for_experts(path: impl AsRef<Path>, geometry: cuteafd_core::ExpertGeometry) -> Result<Self> {
+        cuteafd_core::set_expert_geometry(geometry).map_err(|configured|
+            anyhow::anyhow!("native expert geometry already {configured:?}, requested {geometry:?}"))?;
+        // SAFETY: the caller supplies a trusted native artifact for this geometry.
+        unsafe { Self::load_with_hidden(path, geometry.hidden) }
+    }
+
+    unsafe fn load_with_hidden(path: impl AsRef<Path>, hidden: u32) -> Result<Self> {
         let artifact_root = path.as_ref().parent().context("native library has no parent")?.to_owned();
         // The host-ISA variant beside `path` when one is installed (host_isa.rs).
         let path = host_isa::native_library(path.as_ref());
@@ -2423,7 +2437,7 @@ impl NativeLibrary {
             .with_context(|| format!("loading native library {}", path.display()))?);
         let rdma_rc_endpoint_try_poll_fn =
             unsafe { *lib.get::<RdmaRcEndpointTryPollFn>(b"cuteafd_rdma_rc_endpoint_try_poll")? };
-        sync_expert_hidden(&lib)?;
+        sync_expert_hidden(&lib, hidden)?;
         memory_ledger::fault::install(&lib);
         Ok(Self {
             artifact_root,

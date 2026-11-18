@@ -133,14 +133,15 @@ fn run(mut args: GoldenArgs) -> Result<()> {
     let unit_layout = UnitLayout::with_format(&cfg, rows, tokens.len().max(64), args.kv_format)?;
     let target_layout = CoordinatorWeights::golden(&checkpoint, &cfg, &(0..=args.last_layer).collect::<Vec<_>>())?;
     let catalog = cuteafd_loader::read_expert_catalog_view(&view)?;
+    let geometry = catalog.routed_experts().geometry()?;
+    ensure!(geometry == cuteafd_core::ExpertGeometry::INKLING2, "Inkling golden expert geometry differs from the released model");
+    cuteafd_core::set_expert_geometry(geometry).map_err(|previous| anyhow::anyhow!("Inkling golden requires isolated expert geometry: {previous:?}"))?;
     let native_dir = args.native_lib.parent().context("Inkling native library directory")?;
     let package = if catalog.exl3().is_some() { native_dir.join("exl3/exl3-inkling2-k45/rtx-tp1") }
         else { native_dir.join("fp8/fp8-inkling2-mxfp8/tp1") };
     // SAFETY: trusted generated package ABI metadata; no live buffer access.
     let metadata = if catalog.exl3().is_none() { Some(unsafe { Fp8MoeMetadata::read(&package)? }) } else { None };
     let selection = RtxSelectionPolicy::CanonicalDecode;
-    let geometry = cuteafd_core::ExpertGeometry::INKLING2;
-    cuteafd_core::set_expert_geometry(geometry).map_err(|previous| anyhow::anyhow!("Inkling golden requires isolated expert geometry: {previous:?}"))?;
     let expert_layouts = (0..=args.last_layer).map(|index| {
         if let Some(metadata) = &metadata {
             let layout = Mxfp8Layout::plan(&checkpoint, &cfg, index)?;
@@ -162,7 +163,7 @@ fn run(mut args: GoldenArgs) -> Result<()> {
         return Ok(());
     }
     // SAFETY: library outlives every loaded program, stream and physical owner.
-    let library = unsafe { cuteafd_ffi::NativeLibrary::load(&args.native_lib) }?;
+    let library = unsafe { cuteafd_ffi::NativeLibrary::load_for_experts(&args.native_lib, geometry) }?;
     let device = Device { library: &library, id: args.device };
     let programs = device.run(|| Ok(library.programs()?.with_manifest(&args.manifest)?))?;
     let mut kernels = device.run(|| Kernels::bind(&programs, args.kv_format))?;
