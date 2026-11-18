@@ -69,7 +69,7 @@ release_die() { echo "$*" >&2; exit 2; }
 
     def test_unadapted_families_accept_policy_without_enabling_native_telemetry(self) -> None:
         text = FAMILY.read_text()
-        start = text.index('case "$(get EXPERT_USAGE on)" in', text.index('family_args=(--embedding-placement'))
+        start = text.index('case "$(get EXPERT_USAGE on)" in', text.index('\nfamily_args=('))
         block = text[start:text.index('\nfi', start) + 3]
         for family in ['glm5_flash', 'muse_spark', 'step5', 'qwen4', 'qwen3_5']:
             for setting in ['', 'on', 'off', 'invalid']:

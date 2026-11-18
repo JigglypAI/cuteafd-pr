@@ -1362,6 +1362,7 @@ fn output_rows(rows: usize, rank: usize) -> (usize, usize) {
 }
 
 pub(crate) struct GlmfEngine<'a> {
+    pub(crate) attention_precision: cuteafd_core::attention::AttentionPrecision,
     core: Vec<Option<core::Rank<'a>>>,
     native: Vec<native::Rank<'a>>,
     core_admission: Option<cuteafd_loader::families::glm5_flash::core_admission::CoreCharges>,
@@ -1763,7 +1764,7 @@ impl<'a> GlmfEngine<'a> {
         let device = library.cuda_get_device()?;
         let (table_pages, table_pool_pages) = glmf_table_pages(max_context as u64);
         let (table_pages, table_pool_pages) = (usize::try_from(table_pages)?, usize::try_from(table_pool_pages)?);
-        Ok(Self { max_pool_tokens_no_onboard: None, core: Vec::new(), native: Vec::new(), core_admission: None, core_head: None, draft_core_head: None, step_experts, quantize_grid, library, programs, cfg, weights, stream, max_context, prefill_rows, prefill_waves,
+        Ok(Self { attention_precision: Default::default(), max_pool_tokens_no_onboard: None, core: Vec::new(), native: Vec::new(), core_admission: None, core_head: None, draft_core_head: None, step_experts, quantize_grid, library, programs, cfg, weights, stream, max_context, prefill_rows, prefill_waves,
             prefill_span_rows, pages, slots, decode_rows, verify_rows,
             attention_plan: cuteafd_core::coordinator_programs::AttentionReductionPlan::new(DECODE_ROWS, None, None)?,
             buckets: DecodeBuckets::new(verify_rows),
@@ -2771,7 +2772,7 @@ impl<'a> GlmfEngine<'a> {
 
     /// One masked row of the native MLA prefill on rank `rank` (loads its kernel there).
     fn warm_mla_prefill(&self, rank: usize) -> Result<()> {
-        let Some(kernel) = crate::families::glm5::engine::native_mla_prefill()? else { return Ok(()) };
+        let Some(kernel) = crate::families::glm5::engine::native_mla_prefill(self.attention_precision) else { return Ok(()) };
         let layers = if rank == 0 { &self.weights.layers } else { &self.peer()?.layers };
         for heads in mla_prefill_head_widths(self.cfg.heads,
             layers.iter().map(|layer| (layer.attention, layer.attention_share))) {
@@ -2780,7 +2781,7 @@ impl<'a> GlmfEngine<'a> {
         Ok(())
     }
 
-    fn warm_mla_prefill_width(&self, rank: usize, heads: usize, kernel: i32) -> Result<()> {
+    fn warm_mla_prefill_width(&self, rank: usize, heads: usize, kernel: cuteafd_ffi::MlaPrefillKernel) -> Result<()> {
         let tag = Tag::workspace("glmf/mla-warmup");
         let q = self.alloc(heads * self.cfg.kv_lora_rank * 2, tag)?;
         let kv = self.alloc(PAGE_ROWS * RECORD_BYTES, tag)?;
@@ -5094,7 +5095,7 @@ impl<'a> GlmfEngine<'a> {
             let kv = caches.kv[index].as_ref().context("MLA trace without a record pool")?;
             std::fs::write(dir.join("mla_kv.bin"), self.download(kv, kv.buffer.bytes)?)?;
         }
-        if let (false, Some(kernel)) = (tables.decode, crate::families::glm5::engine::native_mla_prefill()?) {
+        if let (false, Some(kernel)) = (tables.decode, crate::families::glm5::engine::native_mla_prefill(self.attention_precision)) {
             let scale = (self.cfg.qk_nope_dim as f32).powf(-0.5);
             let stream = self.stream_of(rank);
             let launch = || self.on(rank, || {

@@ -169,6 +169,7 @@ pub(super) fn native_plan_of(input: &super::PlanInput, selected: &str,
     let snapshot = &checkpoint.snapshot;
     let mut report = super::empty_report(input, options)?;
     report.family = Some(family.id().into());
+    report.attention_precision = Some(super::attention_precision::resolve(family, options.attention_precision)?);
     report.spec = Some(model.spec().clone());
     report.cache_requirements = crate::serving_capacity::cache_requirements(model.as_ref(), &checkpoint.config)?;
     // Shared encoder admission precedes native dense/expert accounting.

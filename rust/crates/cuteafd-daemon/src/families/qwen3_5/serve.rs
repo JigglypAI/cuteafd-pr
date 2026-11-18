@@ -535,6 +535,8 @@ impl<'e, 'a> Backend<'a> for DenseBackend<'e, 'a> {
 
 #[derive(Debug, Clone, clap::Args)]
 pub(crate) struct ServeArgs {
+    #[arg(long, default_value = "bf16")]
+    pub(crate) attention_precision: cuteafd_core::attention::AttentionPrecision,
     #[arg(long)]
     pub snapshot: std::path::PathBuf,
     #[arg(long, env = "CUTEAFD_NATIVE_LIB")]

@@ -4,6 +4,23 @@ use crate::NativeLibrary;
 use anyhow::{ensure, Result};
 use std::ffi::c_void;
 
+/// Native sparse-MLA operand precision; discriminants are the CUDA ABI ids.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(i32)]
+pub enum MlaPrefillKernel {
+    Fp8 = 1,
+    Bf16 = 2,
+}
+
+impl From<cuteafd_core::attention::AttentionPrecision> for MlaPrefillKernel {
+    fn from(precision: cuteafd_core::attention::AttentionPrecision) -> Self {
+        match precision {
+            cuteafd_core::attention::AttentionPrecision::Bf16 => Self::Bf16,
+            cuteafd_core::attention::AttentionPrecision::Fp8 => Self::Fp8,
+        }
+    }
+}
+
 impl NativeLibrary {
     /// `out` [rows, heads, 512] BF16 = softmax(scale * q . k) v over each row's
     /// first `lengths[r]` entries of `indices` [rows, topk] (record slots;
@@ -17,13 +34,13 @@ impl NativeLibrary {
     #[allow(clippy::too_many_arguments)]
     pub unsafe fn glm_mla_prefill(&self, q: *const c_void, kv: *const c_void, indices: *const c_void,
         lengths: *const c_void, out: *mut c_void, rows: usize, heads: usize, topk: usize, record_bytes: usize,
-        scale_log2: f32, kernel: i32, stream: *mut c_void) -> Result<()> {
+        scale_log2: f32, kernel: MlaPrefillKernel, stream: *mut c_void) -> Result<()> {
         type F = unsafe extern "C" fn(*const c_void, *const c_void, *const c_void, *const c_void, *mut c_void, i32, i32,
             i32, i32, f32, i32, *mut c_void) -> i32;
         let f = *unsafe { self.lib.get::<F>(b"cuteafd_glm_mla_prefill") }?;
         let status = unsafe {
             f(q, kv, indices, lengths, out, i32::try_from(rows)?, i32::try_from(heads)?, i32::try_from(topk)?,
-                i32::try_from(record_bytes)?, scale_log2, kernel, stream)
+                i32::try_from(record_bytes)?, scale_log2, kernel as i32, stream)
         };
         ensure!(status == 0, "sparse MLA prefill failed with {status}");
         Ok(())

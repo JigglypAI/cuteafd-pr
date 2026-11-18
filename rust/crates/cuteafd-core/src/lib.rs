@@ -10,6 +10,7 @@ pub use tap_site::TapSite;
 pub mod tp_units;
 pub mod mxfp4_layouts;
 pub mod dense_attention;
+pub mod attention;
 pub mod ffn_activation;
 pub use ffn_activation::FfnActivation;
 pub mod coordinator_programs;

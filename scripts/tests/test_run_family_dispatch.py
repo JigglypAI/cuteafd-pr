@@ -2099,6 +2099,23 @@ def test_shared_concurrency_default_reaches_plan_and_serve(tmp_path, family, bud
     assert f"{flag} {expected}" in serving
 
 
+@pytest.mark.parametrize("value", ["fp8", "invalid"])
+def test_glm_attention_precision_reaches_plan_and_serve(tmp_path, value):
+    result = _family_launch_result(tmp_path,
+        {"model_type": "glm_moe_dsa", "num_hidden_layers": 4, "first_k_dense_replace": 3},
+        "test/model", f"SPECULATOR=off\nVISION=off\nAUDIO=off\nATTENTION_PRECISION={value}\n")
+    if value == "invalid":
+        assert result.returncode != 0
+        assert "ATTENTION_PRECISION must be bf16 or fp8" in result.stderr
+        return
+    assert result.returncode == 0, result.stderr
+    lines = result.stderr.splitlines()
+    plan = next(line for line in lines if "cuteafd plan" in line and "--deployment" in line)
+    serve = next(line for line in lines if "serve-glm" in line and "--snapshot" in line)
+    assert "--attention-precision fp8" in plan
+    assert "--attention-precision fp8" in serve
+
+
 def test_mimo_worker_selection_is_default_on_both_ends(tmp_path):
     config = {"model_type": "mimo_v2_flash", "num_hidden_layers": 2, "moe_layer_freq": [0, 1]}
     result = _family_launch_result(

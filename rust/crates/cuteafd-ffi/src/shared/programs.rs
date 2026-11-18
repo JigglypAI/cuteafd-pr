@@ -328,6 +328,41 @@ impl<'a> Programs<'a> {
         Ok(self)
     }
 
+    /// Bind the chosen arithmetic to logical program names once, before
+    /// admission and graph capture. Do not load both implementations.
+    pub fn with_sparse_mla_precision(mut self, precision: cuteafd_core::attention::AttentionPrecision,
+        keep: impl Fn(&str) -> bool) -> Result<Self> {
+        use cuteafd_core::attention::{AttentionPrecision, sparse_mla_precision_stem};
+        let logical = self.programs.keys().filter_map(|name| {
+            let (stem, mode) = sparse_mla_precision_stem(name)?;
+            (mode == AttentionPrecision::Fp8 && keep(stem)).then(|| stem.to_owned())
+        }).collect::<Vec<_>>();
+        for stem in logical {
+            let alternate = format!("{stem}_bf16");
+            let program = self.programs.remove(&alternate);
+            let card_specs = self.card_specs.remove(&alternate);
+            if precision == AttentionPrecision::Bf16 {
+                let (index, mut spec) = program.with_context(|| format!(
+                    "ATTENTION_PRECISION=bf16 requires missing coordinator export {alternate}"))?;
+                ensure!(spec.geometry["attention_precision"] == "bf16",
+                    "{alternate}: missing BF16 arithmetic metadata");
+                spec.name.clone_from(&stem);
+                self.programs.insert(stem.clone(), (index, spec));
+                self.card_specs.remove(&stem);
+                if let Some(mut specs) = card_specs {
+                    for spec in &mut specs { spec.name.clone_from(&stem); }
+                    self.card_specs.insert(stem, specs);
+                }
+            }
+        }
+        // Alternate programs of unrelated namespaces are never loaded by a
+        // broad startup matcher; the family selects its own namespace above.
+        self.programs.retain(|name, _| !sparse_mla_precision_stem(name)
+            .is_some_and(|(_, mode)| mode == AttentionPrecision::Bf16));
+        self.card_specs.retain(|name, _| self.programs.contains_key(name));
+        Ok(self)
+    }
+
     /// Set recipe scratch before any serving owner allocates workspaces.
     /// Retained per-card specs are narrowed independently; native ABI is unchanged.
     pub fn with_attention_plan(mut self, plan: cuteafd_core::coordinator_programs::AttentionReductionPlan,

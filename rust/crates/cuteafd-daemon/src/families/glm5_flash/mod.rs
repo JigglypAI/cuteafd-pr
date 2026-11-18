@@ -2260,7 +2260,10 @@ impl Opened {
         // m64 and m128 are execution capacities of one numerical domain.
         let attention_plan = cuteafd_core::coordinator_programs::AttentionReductionPlan::new(
             engine::DECODE_ROWS, active_drafts, args.attention_plan_rows)?;
-        let programs = self.library.programs()?.with_manifest(&args.manifest)?.with_attention_plan(
+        let programs = self.library.programs()?.with_manifest(&args.manifest)?
+            .with_sparse_mla_precision(args.attention.attention_precision, |name| glmf_startup_program(
+                name, args.split_device.is_some(), args.decode_rows > engine::DECODE_ROWS))?
+            .with_attention_plan(
             attention_plan, |name| glmf_startup_program(name, args.split_device.is_some(),
                 args.decode_rows > engine::DECODE_ROWS))?;
         programs.capacities().require_context("glm5_flash", args.max_context)?;
@@ -2363,7 +2366,9 @@ impl Opened {
                 && args.manifest.file_name() == Some("PROGRAMS.json".as_ref()) && fallback.exists() {
                 &fallback
             } else { &args.manifest };
-            Some(serde_json::from_slice::<serde_json::Value>(&std::fs::read(path)?)?)
+            let mut manifest = serde_json::from_slice(&std::fs::read(path)?)?;
+            cuteafd_core::attention::select_sparse_mla_manifest(&mut manifest, args.attention.attention_precision);
+            Some(manifest)
         } else { None };
         let available = available_manifest.as_ref().map(|manifest| -> Result<_> {
             let sms = std::iter::once(args.device).chain(split_device).map(|device|
@@ -2919,6 +2924,7 @@ impl Opened {
             &execution, step_experts)?;
         probe("engine")?;
         engine.admitted_host = admitted_host;
+        engine.attention_precision = args.attention.attention_precision;
         engine.max_pool_tokens_no_onboard = placement.max_pool_tokens_no_onboard;
         engine.attention_plan = attention_plan;
         engine.spark_bf16 = self.checkpoint.spark_input_is_bf16();

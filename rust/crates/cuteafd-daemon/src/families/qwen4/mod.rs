@@ -27,6 +27,8 @@ use std::time::Instant;
 /// What every Qwen 3.8 Flash Next command needs to stand up the engine.
 #[derive(Debug, Clone, clap::Args)]
 pub(crate) struct EngineArgs {
+    #[arg(long, default_value = "bf16")]
+    pub(crate) attention_precision: cuteafd_core::attention::AttentionPrecision,
     /// Checkpoint snapshot (coordinator weights, PLE table, config, tokenizer).
     #[arg(long)]
     pub snapshot: PathBuf,

@@ -22,6 +22,9 @@ use std::time::{Duration, Instant};
 /// What every DeepSeek V4 command needs to stand up the engine.
 #[derive(Debug, Clone, clap::Args)]
 pub(crate) struct EngineArgs {
+    /// Shared MLA QK/PV operand precision, independent of KV storage.
+    #[arg(long, default_value = "bf16")]
+    pub attention_precision: cuteafd_core::attention::AttentionPrecision,
     /// Count executed backbone expert routes by phase (disable with =false).
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set, num_args = 0..=1,
         default_missing_value = "true", require_equals = true)]
@@ -401,6 +404,7 @@ pub(crate) fn load(args: &EngineArgs) -> Result<Loaded> {
         .with_context(|| format!("reading {}", args.manifest.display()))?)?;
     cuteafd_core::coordinator_programs::select_card_plans(&mut manifest,
         library.sm_count()?.try_into().context("runtime SM count exceeds u32")?)?;
+    cuteafd_core::attention::select_sparse_mla_manifest(&mut manifest, args.attention_precision);
     Ok(Loaded { snapshot: args.snapshot.clone(), catalog, library, cfg, family, manifest })
 }
 
@@ -416,7 +420,12 @@ pub(crate) fn with_engine<T>(
     body: impl FnOnce(&engine::Engine<'_>, &mut [SparkLink<'_>], &tokio::runtime::Runtime,
         Option<cuteafd_hostcache::config::Config>) -> Result<T>,
 ) -> Result<T> {
-    let programs = loaded.library.programs()?.with_manifest(&args.manifest)?;
+    let selected = cuteafd_core::coordinator_programs::CoordinatorPrograms {
+        family: loaded.family,
+        split_family: args.split_device.map(|_| if loaded.family == "dsv4f" { "dsv4f2" } else { "dsv4p2" }),
+    };
+    let programs = loaded.library.programs()?.with_manifest(&args.manifest)?
+        .with_sparse_mla_precision(args.attention_precision, |name| selected.contains(name))?;
     let caps = &loaded.manifest["capacities"];
     let stream = loaded.library.cuda_stream_create()?;
     // The head split's second GPU and its stream (load kernels, then the engine's).

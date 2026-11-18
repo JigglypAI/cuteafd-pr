@@ -1005,6 +1005,8 @@ impl Shape {
     /// manifest without one for this card leaves the placement unsupported.
     pub fn select_card_plans(&mut self, report: &mut PlanReport, options: &LayoutOptions, notes: &mut Vec<String>) {
         if let Some(manifest) = self.manifest.as_mut() {
+            cuteafd_core::attention::select_sparse_mla_manifest(std::sync::Arc::make_mut(manifest),
+                report.attention_precision.as_ref().map(|precision| precision.mode).unwrap_or_default());
             let sms = options.physical_sms.unwrap_or_else(|| crate::placement::ArchContext::for_device(
                 "sm_120", options.rtx_bytes[0]).sms);
             if let Err(error) = cuteafd_core::coordinator_programs::select_card_plans(std::sync::Arc::make_mut(manifest), sms) {

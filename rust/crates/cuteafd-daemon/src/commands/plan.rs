@@ -26,8 +26,7 @@ fn options(args: &PlanArgs) -> Result<PlanOptions, PlanError> {
     let mut options = PlanOptions {
         fp8_prefill: args.fp8_prefill.clone(),
         decode_lanes: args.decode_lanes,
-        attention_prefill_precision: args.attention_prefill_precision.parse().map_err(|reason| PlanError::InvalidOption {
-            option: cuteafd_loader::plan::attention_precision::OPTION, reason })?,
+        attention_precision: args.attention.attention_precision,
         mapped_scale_preload_bytes: cuteafd_loader::plan::mapped_scale_preload_bytes(args.mapped_scale_preload_gib)?,
         mapped_scale_host_budget_bytes: None,
         draft_ownership: None,
@@ -346,6 +345,9 @@ fn resolve_config(args: &mut PlanArgs, cfg: &std::collections::BTreeMap<String, 
     if args.exlr8_manifest.is_none() { args.exlr8_manifest = get("EXLR8_MANIFEST").cloned(); }
     if args.exlr8_prefill_activations.is_none() { args.exlr8_prefill_activations = get("EXLR8_PREFILL_ACTIVATIONS").map(|v| v.parse().context("EXLR8_PREFILL_ACTIVATIONS")).transpose()?; }
     if args.chat_template_from.is_none() { args.chat_template_from = get("CHAT_TEMPLATE_FROM").cloned(); }
+    if !args.explicit_settings.contains("attention_precision") {
+        if let Some(value) = get("ATTENTION_PRECISION") { args.attention.attention_precision = value.parse()?; }
+    }
     if !args.explicit_settings.contains("core_view") {
         if let Some(value) = get("CORE_VIEW") { args.attention.core_view = value.parse()?; }
     }
@@ -2081,7 +2083,6 @@ mod tests {
             context_tokens: Some(262144),
             prefill_rows: 0, expert_usage: Some(false),
             prefill_waves: 0, prefill_span_rows: 0, decode_lanes: None,
-            attention_prefill_precision: "auto".into(),
             decode_rows: 64,
             index_cache: Some(crate::families::glm5_flash::engine::IndexCache::Keys),
             replay_records: Some(crate::cli::PlanReplayRecords::Own),

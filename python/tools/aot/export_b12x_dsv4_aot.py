@@ -22,6 +22,7 @@ _sys.path[:0] = [str(_Path(__file__).resolve().parents[1] / _d) for _d in ("lib"
 
 import argparse
 import dataclasses
+import functools
 import hashlib
 import json
 import os
@@ -1158,8 +1159,7 @@ def ml4_programs(g, decode_rows: int, prefill_rows: int, max_context: int):
                  lambda r=rows, rope=rope: ml4.compile_index_post_aot(g, rope=rope, max_rows=r)),
                 (f"sparse_mla{tag}_{mode}_m{rows}", "sparse_mla", {"rope": rope, "route": mode, "max_rows": rows},
                  # Decode exports one card plan per SM count (the exporter passes sm_count).
-                 lambda r=rows, rope=rope, mode=mode, sm_count=None: ml4.compile_sparse_mla_aot(
-                     g, rope=rope, route=mode, max_rows=r, sm_count=sm_count)),
+                 functools.partial(ml4.compile_sparse_mla_aot, g, rope=rope, route=mode, max_rows=rows)),
             ]
         out += [
             (f"values_m{rows}", "values", {"max_rows": rows},
@@ -1216,8 +1216,7 @@ def ml4_head_split_programs(g, decode_rows: int, prefill_rows: int, max_context:
                  lambda r=rows, rope=rope, c=combined: ml4.compile_kv_b_aot(g, stage="absorb", rope=rope,
                                                                             max_rows=r, query_row=c)),
                 (f"sparse_mla{tag}_{mode}_m{rows}", "sparse_mla", {"rope": rope, "route": mode, "max_rows": rows},
-                 lambda r=rows, rope=rope, mode=mode, sm_count=None: ml4.compile_sparse_mla_aot(
-                     g, rope=rope, route=mode, max_rows=r, sm_count=sm_count)),
+                 functools.partial(ml4.compile_sparse_mla_aot, g, rope=rope, route=mode, max_rows=rows)),
             ]
             if rope:
                 # NoPE layers write no RoPE tail: their query scale has no output to place.
@@ -1262,8 +1261,8 @@ def ml4_context_split_programs(g, decode_rows: int, max_context: int):
                             {"max_rows": decode_rows, "head_begin": begin, "head_count": half,
                              "num_splits": splits, "device_sm_counts": sms_served, "rope": not tag,
                              "row_caps": {str(sm): [cap for s2, cap in served if s2 == sm] for sm in sms_served}},
-                            lambda a=attention, begin=begin, splits=splits: split.compile_sparse_mla_partial_aot(
-                                a, max_rows=decode_rows, head_begin=begin, head_count=half, num_splits=splits)))
+                            functools.partial(split.compile_sparse_mla_partial_aot, attention, max_rows=decode_rows,
+                                head_begin=begin, head_count=half, num_splits=splits)))
     for kind, attention in (("index", None), ("kv", rope_g), ("kv_nope", nope_g)):
         row_bytes, page_bytes = (128, 8448) if attention is None else (attention.record_bytes, attention.kv_page_bytes)
         out.append((f"paged_staging_gather_{kind}", "paged_staging_gather",
@@ -1731,8 +1730,8 @@ def context_split_programs(g, decode_rows: int, max_context: int):
                         {"max_rows": decode_rows, "head_begin": begin, "head_count": g.heads // 2,
                          "num_splits": splits, "device_sm_counts": sms_served,
                          "row_caps": {str(sm): [cap for s2, cap in served if s2 == sm] for sm in sms_served}},
-                        lambda begin=begin, splits=splits: split.compile_sparse_mla_partial_aot(
-                            g, max_rows=decode_rows, head_begin=begin, head_count=g.heads // 2, num_splits=splits)))
+                        functools.partial(split.compile_sparse_mla_partial_aot, g, max_rows=decode_rows,
+                            head_begin=begin, head_count=g.heads // 2, num_splits=splits)))
     layouts = [("index", 128, 64, 8448)]
     layouts += ([("swa", 584, 256, 149760), ("c4", 584, 64, 37440)] if v4 else
                 [("kv", g.record_bytes, g.page_rows, g.kv_page_bytes)])
@@ -2145,6 +2144,33 @@ def main() -> None:
             if suffix not in existing:
                 work.append(("draft_bf16", suffix, "bf16_projection", {"max_rows": 4096},
                              lambda k=k, n=n: compile_draft_bf16_projection(k, n, "f32")))
+    # Append precision alternates without changing the shipped FP8 recipes or indices.
+    for family, suffix, op, params, original in tuple(work):
+        if selected is not None and f"{suffix}_bf16" not in selected:
+            continue
+        if (op == "sparse_mla_partial" and family in ("glm", "glmf", "dsv4f", "dsv4p", "ml4")) or (
+                op == "sparse_mla" and family in ("ml4", "ml42")):
+            compile_ = functools.partial(original, precision="bf16")
+        elif op != "sparse_mla" or family not in ("glm", "glm2", "glmf", "glmf2", "dsv4f", "dsv4f2", "dsv4p", "dsv4p2"):
+            continue
+        elif family in ("glm", "glm2", "glmf", "glmf2") and params["route"] == "prefill":
+            continue  # Native Q2P2 serves both precision tiers.
+        elif family.startswith("dsv4"):
+            from b12x.integration.cuteafd import dsv4_sparse_mla as v4_mla
+            g = {"dsv4f": FLASH, "dsv4p": PRO,
+                 "dsv4f2": dsv4_half["flash2"], "dsv4p2": dsv4_half["pro2"]}[family]
+            compile_ = functools.partial(v4_mla.compile_dsv4_sparse_mla_aot, g, route=params["route"],
+                max_rows=params["max_rows"], indexed_width=params["indexed_width"],
+                indexed_page_rows=params["indexed_page_rows"], precision="bf16")
+        else:
+            from b12x.integration.cuteafd import glm_sparse_mla as glm_mla
+            g = {"glm": GLM53, "glm2": glm2, "glmf": GLM53_FLASH, "glmf2": glmf2}[family]
+            flash = family.startswith("glmf")
+            compile_ = functools.partial(glm_mla.compile_glm_sparse_mla_aot, g, route=params["route"],
+                max_rows=params["max_rows"], name="glmf_sparse_mla" if flash else "glm_sparse_mla",
+                fp32_partials=flash and params["route"] == "decode",
+                plan_capacity_rows=params.get("plan_capacity_rows"), precision="bf16")
+        work.append((family, f"{suffix}_bf16", op, {**params, "attention_precision": "bf16"}, compile_))
     print(f"program worklist setup: {time.monotonic() - setup_started:.6f} seconds", flush=True)
     if globals().get("_catalog_only"):
         catalog = []

@@ -983,13 +983,15 @@ impl Opened {
             && args.manifest.file_name() == Some("PROGRAMS.json".as_ref()) && legacy_manifest.exists() {
             &legacy_manifest
         } else { &args.manifest };
-        let manifest: serde_json::Value = serde_json::from_slice(&std::fs::read(manifest_path)?)?;
+        let mut manifest: serde_json::Value = serde_json::from_slice(&std::fs::read(manifest_path)?)?;
+        cuteafd_core::attention::select_sparse_mla_manifest(&mut manifest, args.attention.attention_precision);
         // GLM 5.3's own programs (`glm_*`, and the head split's `glm2_*`), sampled as the runtime
         // inventory; the image's other families are never launched here.
         // Mistral Large 4 runs its own `ml4_*` programs (whole attention on each GPU).
         let selected = cuteafd_core::coordinator_programs::CoordinatorPrograms { family: self.cfg.program_family(),
             split_family: args.split_device.and(self.cfg.split_program_family()) };
-        let programs = programs.with_attention_plan(attention_plan, |name| selected.contains(name))?;
+        let programs = programs.with_sparse_mla_precision(args.attention.attention_precision, |name| selected.contains(name))?
+            .with_attention_plan(attention_plan, |name| selected.contains(name))?;
         let stream = self.library.cuda_stream_create()?;
         // The head split's second GPU and its stream (load kernels, then the engine's).
         // A head split needs its share's programs (`glm2`) in this build.
@@ -1691,6 +1693,7 @@ impl Opened {
         let mut engine = engine::GlmEngine::new(&self.library, &programs, self.cfg.clone(), model, stream,
             max_context, args.prefill_rows, pages, embedding, depth, context.filter(|_| context_kv), rotary.remove(0))?;
         engine.initialize_usage(admitted.expert_usage.clone(), args.expert_usage_reader.clone())?;
+        engine.attention_precision = args.attention.attention_precision;
         engine.max_pool_tokens_no_onboard = placement.max_pool_tokens_no_onboard;
         engine.admitted_host_config = host_config;
         engine.exlr8_prefill_activations = args.exlr8_prefill_activations;

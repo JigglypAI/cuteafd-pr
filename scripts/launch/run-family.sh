@@ -114,6 +114,14 @@ done < <(grep -E '^[A-Z_0-9]+=' "$config")
 [[ -z "${SPARK_COUNT:-}" ]] || { cfg[SPARK_COUNT]="$SPARK_COUNT"; cfg_file[SPARK_COUNT]=1; }
 [[ -z "${SPARK_HOSTS:-}" ]] || { cfg[SPARK_HOSTS]="$SPARK_HOSTS"; cfg_file[SPARK_HOSTS]=1; }
 get() { printf '%s' "${cfg[$1]:-${2:-}}"; }
+# Attention compute never inherits a weight or cache format.
+attention_precision="$(get ATTENTION_PRECISION)"
+attention_precision_args=()
+case "$attention_precision" in
+  "") ;; # The typed CLI owns the shared BF16 default.
+  bf16|fp8) attention_precision_args=(--attention-precision "$attention_precision") ;;
+  *) release_die "ATTENTION_PRECISION must be bf16 or fp8" ;;
+esac
 # Validate precision syntax before planner containers, SSH, or namespace work.
 fp8_prefill="$(get FP8_PREFILL auto)"
 case "$fp8_prefill" in
@@ -789,9 +797,7 @@ count_args+=(--config /run/cuteafd-plan.config)
 v41_decode_lanes="$(get DECODE_LANES)"
 [[ -z "$v41_decode_lanes" || "$v41_decode_lanes" =~ ^[12]$ ]] || release_die "DECODE_LANES must be 1 or 2"
 [[ -z "$v41_decode_lanes" ]] || count_args+=(--decode-lanes "$v41_decode_lanes")
-# The planner resolves auto per family and core view and refuses a mode with no exported program.
-case "${ATTENTION_PREFILL_PRECISION:=auto}" in auto|bf16|fp8) ;; *) release_die "ATTENTION_PREFILL_PRECISION must be auto, bf16 or fp8" ;; esac
-[[ "$ATTENTION_PREFILL_PRECISION" == auto ]] || count_args+=(--attention-prefill-precision "$ATTENTION_PREFILL_PRECISION")
+count_args+=("${attention_precision_args[@]}")
 ((RELEASE_SPARK_COUNT_EXPLICIT == 0)) || count_args+=(--spark-ranks "$SPARK_COUNT")
 # Keep checkpoint paths unchanged inside the full namespace mount.
 count_mounts=(-e "HF_HOME=$container_hf_home" ${v41_fp8_head_args[@]+"${v41_fp8_head_args[@]}"} "${namespace_mount_args[@]}"
@@ -1146,7 +1152,7 @@ fi
 
 start_coordinator() {
 echo "== starting native RTX coordinator =="
-local -a args=(--vision "$VISION" --audio "$AUDIO" serve-native "${vision_args[@]}" --snapshot "$(readlink -f "$hf_home/$snapshot_rel")" --native-lib /opt/cuteafd/lib/libcuteafd_native.so --peers "$peers" --rtx-gpus "$RELEASE_RTX_GPUS" --embedding-placement "$EMBEDDING" --listen "$ADDR" --prefill-batch-tokens "$PREFILL_BATCH_TOKENS" --concurrency "$CONCURRENCY" --prefix-cache-entries "$PREFIX_CACHE_ENTRIES" --max-context-tokens "$MAX_CONTEXT_TOKENS" --max-output-tokens "$MAX_OUTPUT_TOKENS" --mapped-scale-preload-gib "$(get MAPPED_SCALE_PRELOAD_GIB 0)")
+local -a args=(--vision "$VISION" --audio "$AUDIO" serve-native "${attention_precision_args[@]}" "${vision_args[@]}" --snapshot "$(readlink -f "$hf_home/$snapshot_rel")" --native-lib /opt/cuteafd/lib/libcuteafd_native.so --peers "$peers" --rtx-gpus "$RELEASE_RTX_GPUS" --embedding-placement "$EMBEDDING" --listen "$ADDR" --prefill-batch-tokens "$PREFILL_BATCH_TOKENS" --concurrency "$CONCURRENCY" --prefix-cache-entries "$PREFIX_CACHE_ENTRIES" --max-context-tokens "$MAX_CONTEXT_TOKENS" --max-output-tokens "$MAX_OUTPUT_TOKENS" --mapped-scale-preload-gib "$(get MAPPED_SCALE_PRELOAD_GIB 0)")
 case "$(get EXPERT_USAGE on)" in
   on) args+=(--expert-usage) ;;
   off) args+=(--expert-usage=false) ;;
@@ -1704,14 +1710,11 @@ fi
 case "$embedding" in host|gpu) ;; *) echo "EMBEDDING must be host or gpu" >&2; exit 2 ;; esac
 [[ "$family" != qwen3_5 || "$embedding" == gpu ]] || release_die "dense Qwen requires device token embedding"
 ((standalone_family == 0)) || [[ "$embedding" == gpu ]] || release_die "$family serves GPU token embeddings only (EMBEDDING=gpu)"
-# The planner resolves auto per family and core view and refuses a mode with no exported program.
-attention_prefill_precision="$(get ATTENTION_PREFILL_PRECISION auto)"
-case "$attention_prefill_precision" in auto|bf16|fp8) ;; *) release_die "ATTENTION_PREFILL_PRECISION must be auto, bf16 or fp8" ;; esac
 decode_lanes="$(get DECODE_LANES)"
 if [[ -n "$decode_lanes" ]]; then
   [[ "$decode_lanes" =~ ^[12]$ ]] || release_die "DECODE_LANES must be 1 or 2"
 fi
-family_args=(--embedding-placement "$embedding" "${exlr8_plan_args[@]}" "${serve_core_view_args[@]}")
+family_args=("${attention_precision_args[@]}" --embedding-placement "$embedding" "${exlr8_plan_args[@]}" "${serve_core_view_args[@]}")
 case "$(get EXPERT_USAGE on)" in
   on|off) ;;
   *) release_die "EXPERT_USAGE must be on or off" ;;
@@ -2396,7 +2399,7 @@ audio_encoder_hash=""
     plan_draft_args+=(--tp2-dflash "$tp2_dflash_bool")
   fi
   [[ -z "$decode_lanes" ]] || plan_draft_args+=(--decode-lanes "$decode_lanes")
-  [[ "$attention_prefill_precision" == auto ]] || plan_draft_args+=(--attention-prefill-precision "$attention_prefill_precision")
+  plan_draft_args+=("${attention_precision_args[@]}")
   if [[ "$family:$speculator" == qwen3_5:dspark ]]; then
     plan_draft_args+=(--drafter-snapshot "$draft_snapshot")
   fi

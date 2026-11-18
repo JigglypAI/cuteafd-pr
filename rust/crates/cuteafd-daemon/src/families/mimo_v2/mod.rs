@@ -33,6 +33,8 @@ use std::time::Instant;
 /// What every MiMo command needs to stand up the engine.
 #[derive(Debug, Clone, clap::Args)]
 pub(crate) struct EngineArgs {
+    #[arg(long, default_value = "bf16")]
+    pub(crate) attention_precision: cuteafd_core::attention::AttentionPrecision,
     /// Count executed backbone expert routes by phase (disable with =false).
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set, num_args = 0..=1,
         default_missing_value = "true", require_equals = true)]

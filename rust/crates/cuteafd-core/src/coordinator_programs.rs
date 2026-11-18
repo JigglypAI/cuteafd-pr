@@ -35,7 +35,7 @@ impl AttentionReductionPlan {
     /// Alignment is a load contract, never a reason to change the reduction.
     pub fn sparse_recipe(self, compressed: bool) -> SparseAttentionRecipe {
         SparseAttentionRecipe { parts: if compressed { 10 } else { 2 },
-            backend: if compressed { SparseAttentionBackend::Bf16Aot } else { SparseAttentionBackend::NativeFp32 } }
+            backend: if compressed { SparseAttentionBackend::NativeBf16Aot } else { SparseAttentionBackend::NativeFp32 } }
     }
 
     /// A row without indexed records must retain the window-only fold even when
@@ -187,7 +187,7 @@ pub struct MlaDraftLayoutError;
 pub enum SparseAttentionBackend {
     NativeFp32,
     /// Native FP8/FP4 records dequantized for BF16 QK/PV, with ten BF16 splits.
-    Bf16Aot,
+    NativeBf16Aot,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -530,7 +530,7 @@ mod tests {
                     assert_eq!(plan.validate_loaded(Some(5)).unwrap(), plan);
                 }
                 assert_eq!(expected.parts, if compressed { 10 } else { 2 });
-                assert_eq!(expected.backend, if compressed { SparseAttentionBackend::Bf16Aot }
+                assert_eq!(expected.backend, if compressed { SparseAttentionBackend::NativeBf16Aot }
                     else { SparseAttentionBackend::NativeFp32 });
             }
             assert!(plan.validate_loaded(Some(7)).is_err());
