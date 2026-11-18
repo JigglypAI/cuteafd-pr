@@ -60,6 +60,9 @@ pub const MINIMAX_M3_MANIFEST_SHA256: &str = "6bb6ea8153f0484aa711ed932573092ea7
 pub const INKLING2_REVISION: &str = "a09a542737757710542b2460b5e1334ef6f79853";
 pub const INKLING2_CONFIG: &str = "inkling2-small-v1_20261113_own-text-mxfp8-f32";
 pub const INKLING2_MANIFEST_SHA256: &str = "68449d10abf27137a7ab805f74cf9f618303d6eaf33a5a1351a81f3a3d5af4ce";
+pub const HY4_REVISION: &str = "0b1a914773c77072e768ee20ea2899806f554476";
+pub const HY4_CONFIG: &str = "hy4-flash-v1_20261118_own-text-bf16-f32";
+pub const HY4_MANIFEST_SHA256: &str = "9ffaf7dac6afa70d5360b1bc9c54c3ade21c3a26d1d234531fc53b9f44bbef87";
 
 /// Sealed bench subset v1: agentic A at three context lengths, human code C,
 /// structured/tool D, plain E and the frozen context anchor. Never resample.
@@ -363,6 +366,7 @@ pub fn download(agent: &ureq::Agent, cache: &Path, repo: &str, commit: &str, con
             (MISTRAL_LARGE4_REVISION, MISTRAL_LARGE4_CONFIG) => Some(MISTRAL_LARGE4_MANIFEST_SHA256),
             (MINIMAX_M3_REVISION, MINIMAX_M3_CONFIG) => Some(MINIMAX_M3_MANIFEST_SHA256),
             (INKLING2_REVISION, INKLING2_CONFIG) => Some(INKLING2_MANIFEST_SHA256),
+            (HY4_REVISION, HY4_CONFIG) => Some(HY4_MANIFEST_SHA256),
             (MIMO_PRO_MEDIA_REVISION, MIMO_PRO_MEDIA_CONFIG) => Some(MIMO_PRO_MEDIA_MANIFEST_SHA256),
             (GLM_REVISION, GLM_CONFIG) => Some("cc973cec8df82119ccd53367d014c73b271808a561f81d3629b06093de3b00e0"),
             (V4PRO_REVISION, V4PRO_CONFIG) => Some("7b4fd7b51670ff03fbfab6a21b72d999163ddee9bd3eec34c89f1d6c2f83488f"),
@@ -1277,7 +1281,8 @@ mod tests {
             (V41_1017_REVISION, V41_1017_CONFIG), (KIMI_K3_REVISION, KIMI_K3_CONFIG),
             (KIMI_K31_REVISION, KIMI_K31_CONFIG),
             (MUSE_SPARK_REVISION, MUSE_SPARK_CONFIG), (MISTRAL_LARGE4_REVISION, MISTRAL_LARGE4_CONFIG),
-            (MINIMAX_M3_REVISION, MINIMAX_M3_CONFIG), (INKLING2_REVISION, INKLING2_CONFIG)] {
+            (MINIMAX_M3_REVISION, MINIMAX_M3_CONFIG), (INKLING2_REVISION, INKLING2_CONFIG),
+            (HY4_REVISION, HY4_CONFIG)] {
             let root = temporary.path().join("wrldsuksgo2mars--cuteafd-fidelity").join(revision);
             std::fs::create_dir_all(root.join(config)).unwrap();
             let manifest = b"{}";
@@ -1349,6 +1354,15 @@ mod tests {
             let balance = standard_balance(&reference);
             assert_eq!(balance["decode"]["generated_positions"], 11435);
             assert_eq!(balance["prefill"]["generated_positions"], 10678);
+        }
+        if commit == HY4_REVISION && config == HY4_CONFIG {
+            assert_eq!(reference.checkpoint, HY4_ROOT);
+            assert_eq!(reference.windows.len(), 70);
+            assert_eq!(identity["qualification"], "reference");
+            assert_eq!(identity["text_checkpoint"], HY4_ROOT);
+            let balance = standard_balance(&reference);
+            assert_eq!(balance["decode"]["generated_positions"], 12645);
+            assert_eq!(balance["prefill"]["generated_positions"], 11731);
         }
         if commit == INKLING2_REVISION && config == INKLING2_CONFIG {
             assert_eq!(reference.checkpoint, "thinkingmachines/Inkling-2-Small-MXFP8");
