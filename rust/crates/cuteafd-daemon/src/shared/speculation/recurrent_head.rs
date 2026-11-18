@@ -38,7 +38,7 @@ impl Rank<'_> {
     /// once into the admitted folded arena. The caller lends idle target head
     /// stages, which remain live through the startup stream drain.
     pub fn fold_compact_head(&self, programs: &cuteafd_ffi::programs::Programs<'_>, stored: usize,
-        stage: Buffer, transpose: Buffer, project: impl Fn(Buffer, Buffer, usize) -> Result<()>) -> Result<()> {
+        stage: Buffer, transpose: Buffer, mut project: impl FnMut(Buffer, Buffer, usize) -> Result<()>) -> Result<()> {
         use crate::shared::experts::rtx::dense::Finish;
         use cuteafd_core::DType;
         const TILE: usize = 32;
