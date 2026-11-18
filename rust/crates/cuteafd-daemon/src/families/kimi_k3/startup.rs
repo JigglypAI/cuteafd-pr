@@ -153,7 +153,7 @@ pub(crate) fn load<'a, const RANKS: usize>(library: &'a Arc<cuteafd_ffi::NativeL
     // peer exchange, hop and Spark wave serves one unit.
     let unit = cuteafd_loader::families::kimi_k3::allocation::prefill_shape_with(rows, options.waves,
         options.prefill_rows)?.unit_rows as usize;
-    let native_manifest = super::device::native_manifest(programs)?;
+    let native_manifest = devices[0].run(|| super::device::native_manifest(programs))?;
     let native_exports = core.native_programs(unit, RANKS, Some(&native_manifest))?;
     let native = devices.iter().map(|&device| NativePrograms::load_resolved(device, full, programs, options.ffn_mode,
         options.cache_format, &core, unit, RANKS, &native_exports).map(Rc::new)).collect::<Result<Vec<_>>>()?;
