@@ -178,10 +178,9 @@ re-run when BF16 attention lands (#2146).
   MoE layer for the burst (`glmf-golden --packed-check N` compares each sequence with its own
   pass). A packed prompt whose own grammar or sampling fails fails alone; the others keep
   their first tokens. Adaptive verification uses only the shared draft policy.
-- Sparse-MLA prefill runs the native E4M3 kernel with a two-term query and
-  two-term P (`e4m3-q2p2`, about 7 significant bits each). The diagnostic
-  environment override `CUTEAFD_MLA_PREFILL` selects the F16 reference kernel
-  (`f16`) or the b12x program (`b12x`); other values are refused.
+- Sparse-MLA prefill uses native two-term E4M3 QK and PV (`e4m3-q2p2`) under
+  both `ATTENTION_PRECISION` settings. It meets the BF16-tier accuracy target;
+  there is no separate lower tier for native prefill.
 
 ## Launcher defaults
 
