@@ -1,7 +1,7 @@
 //! Kimi physical-owner admission with checkpoint residency and shared native allocation layouts.
 use super::Model;
 use anyhow::Context;
-use crate::families::kimi_k3::allocation;
+use crate::families::kimi_k3::{allocation, core};
 use crate::placement::families::kimi::{self, ExpertProfile, FixedOwner, KimiRecipe, SparkOwner, tp2_arenas, whole_arenas};
 use crate::{placement::*, plan::{Component, ExpertPlacement, PlanReport}};
 use cuteafd_core::memory_layout::{Basis, Category, DeviceKind, DeviceLayout, Item, MemoryLayout};
@@ -78,8 +78,11 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
     let modes = if gpus == 1 { &[WHOLE][..] } else { MODES };
     let requested_pool = opts.pool_tokens.filter(|n| *n > 0);
     let edge = |c| *model.bytes.get(&c).unwrap_or(&0);
-    let (embedding, head) = (edge(Component::Embedding), model.core.projections.get("language_model.lm_head")
-        .map_or(edge(Component::LmHead), |p| p.resident_bytes(1).expect("validated core dimensions")));
+    let embedding = edge(Component::Embedding);
+    let head = if let Some(head) = model.core.fp8_head().expect("validated FP8 head geometry") {
+        head.bytes().expect("validated FP8 head extent")
+    } else { model.core.projections.get(core::HEAD_STEM)
+        .map_or(edge(Component::LmHead), |p| p.resident_bytes(1).expect("validated core dimensions")) };
     let residency = model.coordinator;
     if !model.core.projections.is_empty() {
         memory.notes.push(format!("Kimi K6 core: {} header-native projections; payload + H128 scale vectors charged without BF16 expansion",
@@ -171,7 +174,6 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
     let mut shaped = Vec::new();
     if let Some(manifest) = &manifest {
         let extra = (|| -> anyhow::Result<_> {
-            use crate::families::kimi_k3::{allocation, core};
             // Speculative verify graphs replay at each exact width up to the drafter's block.
             let verify = opts.kimi_drafter_snapshot.as_ref().map(|snapshot| -> anyhow::Result<usize> {
                 let raw: serde_json::Value = serde_json::from_slice(&std::fs::read(snapshot.join("config.json"))?)?;
@@ -213,11 +215,12 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
                 baseline[rank] = Baseline::Planned { context_bytes: arch.context_bytes, loaded_bytes: 0 };
                 demands.push(allocation::code_demand(rank, code.bytes, gpus)?);
             }
-            if !model.core.projections.is_empty() {
+            if model.core.has_split_core() {
                 // The baseline already includes the full peer receive allocation.
                 let charges = core::CoreCharges::from_package_with_native(cfg, &model.core, rows, unit,
                     manifest, &native_manifest, gpus)?;
-                let mut stages = core::package_lane_extents_with_base(manifest, cfg, rows, unit, gpus, &lane)?;
+                let mut stages = model.core.split_stages(core::package_lane_extents_with_base(manifest, cfg, rows, unit, gpus, &lane)?,
+                    unit, gpus, cfg.dense_intermediate);
                 stages.extend(model.core.native_stages_from_manifest(&native_manifest, rows, unit, gpus)?);
                 lane = lane.with_core_stages(stages)?;
                 for rank in 0..gpus {
@@ -245,9 +248,9 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
                 "Supply complete matching native and EXL3 workspace manifests."); return memory; }
         }
         memory.notes[0] = "Kimi shared runtime allocation ledger; the bounded graph reserve is charged once as a configured per-device arena".into();
-    } else if !model.core.projections.is_empty() {
-        report.refuse_placement("Kimi native K6 requires installed workspace inventory".into(),
-            "Supply the matching K6 PROGRAMS.json through --workspace-manifest.");
+    } else if model.core.has_split_core() {
+        report.refuse_placement("Kimi compact core requires installed workspace inventory".into(),
+            "Supply the matching PROGRAMS.json through --workspace-manifest.");
         return memory;
     }
     let inventory = (|| -> anyhow::Result<_> {
@@ -328,6 +331,13 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
         if let Some(manifest) = &manifest {
             if let Some(mut demand) = crate::families::kimi_k3::core::draft_head_demand(&model.core,
                 layout.capacity().block_rows, &manifest["families"]["dense_trellis_k6"])? {
+                demand.gpu = head_rank as u8;
+                fixed.push(demand);
+            }
+        }
+        if model.core.native.contains_key(core::HEAD_STEM) {
+            let programs = input.programs_manifest(path)?;
+            if let Some(mut demand) = core::draft_fp8_head_demand(&model.core, &programs)? {
                 demand.gpu = head_rank as u8;
                 fixed.push(demand);
             }

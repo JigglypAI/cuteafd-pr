@@ -2,11 +2,49 @@
 //! differ: a TP shard replicates the opposite-side H128 sign/scale vector.
 use super::config::KimiK3Config;
 use crate::plan::checkpoint::Checkpoint;
+use crate::formats::native_attention::{Fp8Role, NativeLayout, NativeProjection};
 pub use crate::formats::trellis_core::{CoreProjection, CoreSplit, ProjectionScratchLayout, ProjectionStorageLayout};
 use anyhow::{ensure, Context, Result};
 use std::collections::BTreeMap;
 
 pub(crate) const NATIVE_CORE_WIDTHS: &[usize] = &[4, 6, 8];
+pub const HEAD_STEM: &str = "language_model.lm_head";
+
+pub fn fp8_role(stem: &str) -> Fp8Role {
+    let axis = split(stem).or_else(|| dense_ffn_split(stem));
+    if stem == HEAD_STEM { return Fp8Role::exact("vocabulary head", true); }
+    if stem.ends_with(".self_attn.kv_a_proj_with_mqa") {
+        return Fp8Role::padded("MLA KV-A", axis.is_some(), 128);
+    }
+    let role = if stem.contains(".self_attn.") { "attention projection" }
+        else if stem.contains(".shared_experts.") { "shared FFN projection" }
+        else if stem.contains(".routed_expert_") { "routed latent projection" }
+        else if stem.contains(".mlp.") { "dense FFN projection" }
+        else { "non-core" };
+    Fp8Role::exact(role, axis.is_some())
+}
+
+fn dense_ffn_split(stem: &str) -> Option<CoreSplit> {
+    let (layer, leaf) = stem.strip_prefix("language_model.model.layers.")?.split_once('.')?;
+    layer.parse::<usize>().ok()?;
+    match leaf {
+        "mlp.gate_proj" | "mlp.up_proj" => Some(CoreSplit::Output),
+        "mlp.down_proj" => Some(CoreSplit::Input),
+        _ => None,
+    }
+}
+
+pub fn native_layout(stem: &str, p: &NativeProjection, rank: usize, ranks: usize) -> Result<NativeLayout> {
+    ensure!(ranks > 0 && rank < ranks, "{stem}: invalid TP rank");
+    let [mut n, mut k] = if p.fp8 { fp8_role(stem).stored_shape(p.shape)? } else { p.shape };
+    match p.split {
+        CoreSplit::Output => { ensure!(n % ranks == 0, "{stem}: uneven output split"); n /= ranks; }
+        CoreSplit::Input => { ensure!(k % ranks == 0, "{stem}: uneven input split"); k /= ranks; }
+        CoreSplit::Whole => ensure!(ranks == 1, "{stem}: whole projection cannot be split"),
+    }
+    ensure!(!p.fp8 || n % 128 == 0 && k % 128 == 0, "{stem}: TP slice breaks FP8 blocks");
+    Ok(NativeLayout { stem: stem.into(), shape: [n, k], fp8: p.fp8, rank, ranks, split: p.split })
+}
 
 /// Only this explicit list can replace a BF16 core matrix. Everything else
 /// (including layer-zero dense FFN, kv_b, KDA recurrence, router and embedding)
@@ -120,7 +158,15 @@ pub fn exchange_recv_bytes(rows: usize) -> Result<usize> {
 }
 
 impl CoreInventory {
-    /// All native projection routes that placement may select, resolved before allocation.
+    pub fn has_split_core(&self) -> bool { !self.projections.is_empty() || !self.native.is_empty() }
+
+    pub fn compact_head(&self) -> bool { self.projections.contains_key(HEAD_STEM) || self.native.contains_key(HEAD_STEM) }
+
+    pub fn fp8_head(&self) -> Result<Option<NativeLayout>> {
+        self.native.get(HEAD_STEM).map(|p| native_layout(HEAD_STEM, p, 0, 1)).transpose()
+    }
+
+    /// All native body projection routes that placement may select, resolved before allocation.
     /// Tuple fields are (K, N, FP8 storage, F32 TP2 partial output).
     pub fn native_geometries(&self, ranks: usize) -> Result<Vec<(usize, usize, bool, bool)>> {
         Ok(self.native_layouts(ranks)?.iter().map(|layout| (layout.shape[1], layout.shape[0], layout.fp8,
@@ -133,20 +179,15 @@ impl CoreInventory {
         ensure!(matches!(ranks, 1 | 2), "Kimi native attention physical rank count");
         let mut layouts = Vec::new();
         for (stem, projection) in &self.native {
-            let mla = stem.ends_with(".q_b_proj") || (stem.ends_with(".o_proj")
-                && self.projections.contains_key(&format!("{}.q_a_proj", stem.rsplit_once('.').unwrap().0)));
+            if stem == HEAD_STEM { continue; }
+            let mla = stem.ends_with(".q_b_proj") || (stem.contains(".self_attn.") && stem.rsplit_once('.').is_some_and(|(group, _)| {
+                let qa = format!("{group}.q_a_proj");
+                self.projections.contains_key(&qa) || self.native.contains_key(&qa)
+            }));
             let worlds: &[usize] = if ranks == 1 || projection.split == CoreSplit::Whole { &[1] }
                 else if mla { &[1, 2] } else { &[2] };
             for &world in worlds {
-                let [mut n, mut k] = projection.shape;
-                match projection.split {
-                    CoreSplit::Input => k /= world,
-                    CoreSplit::Output => n /= world,
-                    CoreSplit::Whole => {},
-                }
-                layouts.push(crate::formats::native_attention::NativeLayout {
-                    stem: stem.clone(), shape: [n, k], fp8: projection.fp8,
-                    rank: 0, ranks: world, split: projection.split });
+                layouts.push(native_layout(stem, projection, 0, world)?);
             }
         }
         Ok(layouts)
@@ -193,7 +234,24 @@ impl CoreInventory {
         ensure!(matches!(ranks, 1 | 2), "Kimi native attention physical rank count");
         if !self.native_attention_split(ranks) { return Ok(BTreeMap::new()); }
         let bytes = rows.checked_mul(7168 * 4).context("Kimi native attention partial overflow")?;
-        Ok(BTreeMap::from([("native attention F32 partial", bytes)]))
+        let mut stages = BTreeMap::new();
+        if self.native.iter().any(|(stem, p)| stem.contains(".self_attn.") && p.split == CoreSplit::Input) {
+            stages.insert("native attention F32 partial", bytes);
+        }
+        if self.native.iter().any(|(stem, p)| !stem.contains(".self_attn.") && p.split == CoreSplit::Input) {
+            stages.insert("native FFN F32 partial", bytes);
+        }
+        Ok(stages)
+    }
+
+    pub fn has_dense_fp8_ffn(&self) -> bool { self.native.keys().any(|stem| dense_ffn_split(stem).is_some()) }
+
+    pub fn split_stages(&self, mut stages: BTreeMap<&'static str, usize>, unit: usize, ranks: usize, dense_width: usize)
+        -> BTreeMap<&'static str, usize> {
+        if self.has_dense_fp8_ffn() {
+            for name in ["K6 FFN gate", "K6 FFN up"] { stages.insert(name, unit * (dense_width / ranks) * 2); }
+        }
+        stages
     }
 
     pub fn native_programs(&self, unit: usize, ranks: usize,
@@ -206,7 +264,13 @@ impl CoreInventory {
             output: if layout.ranks == 2 && layout.split == CoreSplit::Input {
                 ProjectionOutput::F32
             } else { ProjectionOutput::Bf16 } }).collect::<Vec<_>>();
-        Ok(NativePrograms::resolve(&requests, unit.max(64), manifest)?)
+        let mut programs = NativePrograms::resolve(&requests, unit.max(64), manifest)?;
+        if let Some(head) = self.fp8_head()? {
+            let head = NativePrograms::resolve(&[NativeProgram { layout: &head, output: ProjectionOutput::F32 }], 64, manifest)?;
+            programs.programs.extend(head.programs);
+            programs.fp8_scratch_bytes = programs.fp8_scratch_bytes.max(head.fp8_scratch_bytes);
+        }
+        Ok(programs)
     }
 
     pub fn native_package_stages(&self, manifest: &serde_json::Value, rows: usize, unit: usize,
@@ -265,8 +329,8 @@ impl CoreCharges {
         manifest: &serde_json::Value, native: &crate::placement::inventory::ProgramsManifest,
         ranks: usize) -> Result<Self> {
         ensure!(matches!(ranks, 1 | 2), "Kimi K6 charge physical rank count");
-        let mut stages = if core.projections.is_empty() { BTreeMap::new() }
-            else { package_lane_extents_for_config(manifest,cfg,rows,unit,ranks)? };
+        let mut stages = if !core.has_split_core() { BTreeMap::new() }
+            else { core.split_stages(package_lane_extents_for_config(manifest,cfg,rows,unit,ranks)?, unit, ranks, cfg.dense_intermediate) };
         let native_stages = core.native_stages_from_manifest(native, rows, unit, ranks)?;
         let native_stage_bytes = native_stages.values().sum::<usize>();
         stages.extend(native_stages);
@@ -295,7 +359,7 @@ impl CoreCharges {
             demands.push(crate::placement::Demand::new(gpu as u8,Category::Workspace,
                 "Kimi K6 split-stage operands",(self.stage_bytes - self.native_stage_bytes) as u64,Basis::Exact));
             for (name, bytes) in &self.stages {
-                if name.starts_with("native attention ") {
+                if name.starts_with("native ") {
                     demands.push(crate::placement::Demand::new(gpu as u8, Category::Workspace,
                         format!("Kimi {name}"), *bytes as u64, Basis::Exact));
                 }
@@ -367,6 +431,17 @@ pub fn projection_scratch_for_ranks(cfg: &KimiK3Config, core: &CoreInventory, ro
     Ok(combined)
 }
 
+pub fn draft_fp8_head_demand(core: &CoreInventory, manifest: &crate::placement::inventory::ProgramsManifest)
+    -> Result<Option<crate::placement::Demand>> {
+    use crate::placement::planner::native_attention::{NativeProgram, NativePrograms};
+    use cuteafd_core::memory_layout::{Basis, Category};
+    let Some(head) = core.fp8_head()? else { return Ok(None) };
+    let native = NativePrograms::resolve(&[NativeProgram { layout: &head,
+        output: cuteafd_ffi::draft_projection::ProjectionOutput::F32 }], 64, Some(manifest))?;
+    Ok(Some(crate::placement::Demand::new(1, Category::Drafter,
+        "Kimi FP8 draft head scratch", native.fp8_scratch_bytes, Basis::Exact)))
+}
+
 /// The drafter's own K6 vocabulary-head scratch at its `rows` (<= 64) head
 /// rows, or `None` when the head is BF16. The drafter projects through the
 /// target's K6 head on its bridge stream; the target lane scratch is never shared.
@@ -411,11 +486,10 @@ impl CoreInventory {
     pub fn from_checkpoint(cfg: &KimiK3Config, checkpoint: &Checkpoint,
         expected: &BTreeMap<String, Vec<usize>>) -> Result<Self> {
         checkpoint.validate_fp8_roles("Kimi", |name| {
-            let stem = name.strip_suffix(".weight").unwrap_or(name);
-            let role = if stem.ends_with("lm_head") { "vocabulary head" }
-                else if stem.contains(".self_attn.") { "attention projection" }
-                else if stem.contains(".mlp.") { "FFN projection" } else { "non-core" };
-            crate::formats::native_attention::Fp8Role::exact(role, false)
+            let Some(stem) = name.strip_suffix(".weight") else { return Fp8Role::exact("non-core", false); };
+            let mut role = fp8_role(stem);
+            role.supported &= expected.contains_key(name);
+            role
         })?;
         let projections = crate::formats::trellis_core::read_projections(checkpoint, expected,
             |name| !name.contains(".experts.")
@@ -428,6 +502,15 @@ impl CoreInventory {
         let mut native = BTreeMap::new();
         for (name, shape) in expected {
             let Some(stem) = name.strip_suffix(".weight") else { continue; };
+            if checkpoint.converts_to_fp8(name) {
+                let actual = &checkpoint.header(name).context("validated Kimi FP8 header disappeared")?.shape;
+                ensure!(actual == shape, "{name}: Kimi FP8 expected {shape:?}, found {actual:?}");
+                let axis = split(stem).or_else(|| dense_ffn_split(stem)).context("Kimi FP8 split missing")?;
+                let projection = NativeProjection { shape: [shape[0], shape[1]], split: axis, fp8: true };
+                native_layout(stem, &projection, 0, if axis == CoreSplit::Whole { 1 } else { 2 })?;
+                native.insert(stem.into(), projection);
+                continue;
+            }
             if !stem.contains(".self_attn.") || split(stem).is_none()
                 || projections.contains_key(stem) || !checkpoint.contains_tensor(name) { continue; }
             let group = stem.rsplit_once('.').context("Kimi attention group")?.0;
@@ -442,7 +525,7 @@ impl CoreInventory {
                 "{stem}: Kimi native attention requires BF16 {shape:?}, found {dtype:?} {actual:?}");
             native.insert(stem.into(), crate::formats::native_attention::NativeProjection {
                 shape: [shape[0], shape[1]], split: split(stem).unwrap(),
-                fp8: checkpoint.converts_to_fp8(&format!("{stem}.weight")) });
+                fp8: false });
         }
         let largest_selected_dense_bytes = (!native.is_empty()).then(|| checkpoint.weight_map.keys()
             .filter(|name| !name.contains(".experts."))
@@ -467,9 +550,10 @@ impl CoreInventory {
             let staged = stems.iter().any(|stem| self.projections.contains_key(stem) || self.native.contains_key(stem));
             ensure!(!staged || stems.iter().all(|stem| self.projections.contains_key(stem) || self.native.contains_key(stem)),
                 "Kimi attention group lacks a validated per-projection K6/BF16 operand: {root}.self_attn");
+            let ffn = if cfg.dense[layer] { format!("{root}.mlp") } else { format!("{root}.block_sparse_moe.shared_experts") };
+            self.complete_group(if cfg.dense[layer] { "dense FFN" } else { "shared FFN" },
+                ["gate_proj","up_proj","down_proj"].iter().map(|leaf|format!("{ffn}.{leaf}")))?;
             if !cfg.dense[layer] {
-                self.complete_group("shared FFN",["gate_proj","up_proj","down_proj"].iter()
-                    .map(|leaf|format!("{root}.block_sparse_moe.shared_experts.{leaf}")))?;
                 self.complete_group("latent",["routed_expert_down_proj","routed_expert_up_proj"].iter()
                     .map(|leaf|format!("{root}.block_sparse_moe.{leaf}")))?;
             }
@@ -477,7 +561,7 @@ impl CoreInventory {
         Ok(())
     }
     fn complete_group(&self,group:&str,stems:impl IntoIterator<Item=String>)->Result<()> {
-        let (native,bf16):(Vec<_>,Vec<_>)=stems.into_iter().partition(|stem|self.get_weight(stem).is_some());
+        let (native,bf16):(Vec<_>,Vec<_>)=stems.into_iter().partition(|stem|self.get_weight(stem).is_some() || self.native.contains_key(stem));
         ensure!(native.is_empty() || bf16.is_empty(),
             "Kimi {group} mixes per-tensor K6/BF16 storage; only whole-group fallback is supported; K6: {}; BF16: {}",
             native.join(", "),bf16.join(", "));

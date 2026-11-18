@@ -30,13 +30,14 @@ pub(crate) struct GlobalLayout {
     vocab: usize,
     operands: BTreeMap<&'static str, usize>,
     core_head: Option<CoreWeightLayout>,
+    pub(crate) fp8_head: Option<cuteafd_loader::formats::native_attention::NativeLayout>,
 }
 
 impl GlobalLayout {
     pub(crate) fn shared_layout(&self) -> cuteafd_loader::families::kimi_k3::weight_layout::GlobalLayout {
         cuteafd_loader::families::kimi_k3::weight_layout::GlobalLayout {
             rank: self.rank, hidden: self.hidden, vocab: self.vocab, operands: self.operands.clone(),
-            core_head: self.core_head.as_ref().map(CoreWeightLayout::shared_layout),
+            core_head: self.core_head.as_ref().map(CoreWeightLayout::shared_layout), fp8_head: self.fp8_head.clone(),
         }
     }
 
@@ -49,7 +50,7 @@ impl GlobalLayout {
     pub(crate) fn ranks_with_core(cfg: &KimiK3Config, inventory: &CoreInventory, ranks: usize) -> Result<Vec<Self>> {
         Ok(cuteafd_loader::families::kimi_k3::weight_layout::GlobalLayout::ranks_with_core(cfg, inventory, ranks)?
             .into_iter().map(|layout| Self { rank: layout.rank, hidden: layout.hidden, vocab: layout.vocab,
-                operands: layout.operands, core_head: layout.core_head.map(CoreWeightLayout::from_shared) }).collect())
+                operands: layout.operands, core_head: layout.core_head.map(CoreWeightLayout::from_shared), fp8_head: layout.fp8_head }).collect())
     }
     pub(crate) fn with_final_attn_res(mut self, cfg: &KimiK3Config, needed: bool) -> Result<Self> {
         let layout = self.shared_layout().with_final_attn_res(cfg, needed)?;
@@ -58,9 +59,7 @@ impl GlobalLayout {
     }
 
     pub(crate) fn bytes(&self) -> Result<usize> {
-        self.operands.values().copied().chain(self.core_head.iter().map(|head|head.bytes))
-            .try_fold(0usize, |sum, bytes| sum.checked_add(bytes)
-            .context("Kimi global weight extent overflow"))
+        self.shared_layout().bytes()
     }
 
     pub(crate) fn demand(&self) -> Result<Demand> {
@@ -130,12 +129,13 @@ pub(crate) struct PackedGlobal {
 pub(crate) struct GlobalWeights<'a> {
     operands: BTreeMap<&'static str, Allocation<'a>>,
     pub(crate) core_head: Option<CoreWeights<'a>>,
+    pub(crate) fp8_head: Option<crate::shared::native_attention::NativeAttentionWeights<'a>>,
 }
 
 #[cfg(test)]
 impl<'a> GlobalWeights<'a> {
     pub(super) fn draft_head_fixture(head: Option<Allocation<'a>>, core_head: Option<CoreWeights<'a>>) -> Self {
-        Self { operands: head.into_iter().map(|owner| ("head", owner)).collect(), core_head }
+        Self { operands: head.into_iter().map(|owner| ("head", owner)).collect(), core_head, fp8_head: None }
     }
 }
 
@@ -144,6 +144,11 @@ impl GlobalWeights<'_> {
         ensure!(self.operands.values().chain(self.core_head.iter().flat_map(|weights|
             [&weights.payload,&weights.suh,&weights.svh])).all(|allocation| allocation.device.id == device.id
             && std::ptr::eq(allocation.device.library, device.library)), "Kimi global weight owner differs from IO device");
+        if let Some(head) = &self.fp8_head {
+            ensure!(head.values.buffer.device_id == device.id
+                && head.scales.as_ref().is_some_and(|scales| scales.buffer.device_id == device.id),
+                "Kimi FP8 head differs from IO device");
+        }
         Ok(())
     }
 

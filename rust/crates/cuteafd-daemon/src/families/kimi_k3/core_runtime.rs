@@ -1,11 +1,12 @@
-//! Inert K6 projection owners and projected attention/FFN seams.
-//! Serving admission remains closed until full-layer and TP2 gates qualify it.
+//! Admitted compact projection owners and projected attention/FFN seams.
 use crate::shared::dense_trellis::{CoreWeightLayout, CoreWeights, Projection, ProjectionLayout, ProjectionScratch};
 use anyhow::{ensure,Context,Result};
 use cuteafd_ffi::{CuteafdDeviceBuffer as Buffer,programs::Programs,
     dense_trellis::{TrellisDType,
         GroupedMember,GroupedPolicy,GroupedTrellis},
-    KimiKdaCore,KimiKdaCoreBatch,KimiKdaCoreWeights,KimiMlaSplit,KimiMlaRankBatch,KimiSitu,Bf16F32Add,F32Bf16Narrow,V41PeerCopy};
+    KimiKdaCore,KimiKdaCoreBatch,KimiKdaCoreWeights,KimiMlaSplit,KimiSitu,Bf16F32Add,F32Bf16Narrow,V41PeerCopy};
+#[cfg(test)]
+use cuteafd_ffi::KimiMlaRankBatch;
 use std::collections::BTreeMap;
 use std::ffi::c_void;
 
@@ -46,15 +47,18 @@ pub(crate) fn kda_projected(core:&KimiKdaCore<'_>,projections:[Projected<'_,'_>;
     core.launch(weights,batch,stream)?;Ok(())
 }
 /// Stored kv_a N640 is transformed in full; the split norm consumes its N576 prefix.
+#[cfg(test)]
 pub(crate) fn mla_rank_projected(core:&KimiMlaSplit<'_>,qa:Projected<'_,'_>,kv:Projected<'_,'_>,input:Buffer,
     batch:KimiMlaRankBatch,stream:*mut c_void)->Result<()> {
     qa.run(batch.rows,input,batch.q_a,stream)?;kv.run(batch.rows,input,batch.kv_a,stream)?;
     core.rank_norm(batch,stream)?;Ok(())
 }
+#[cfg(test)]
 pub(crate) fn mla_query_projected(core:&KimiMlaSplit<'_>,qb:Projected<'_,'_>,rows:usize,q_residual:Buffer,
     q_b:Buffer,uk:Buffer,query:Buffer,stream:*mut c_void)->Result<()> {
     qb.run(rows,q_residual,q_b,stream)?;core.query(rows,q_b,uk,query,stream)?;Ok(())
 }
+#[cfg(test)]
 pub(crate) fn mla_gate_projected(core:&KimiMlaSplit<'_>,gate:Projected<'_,'_>,rows:usize,input:Buffer,
     attention:Buffer,uv:Buffer,gates:Buffer,normalized:Buffer,stream:*mut c_void)->Result<()> {
     gate.run(rows,input,gates,stream)?;core.gate_output(rows,attention,uv,gates,normalized,stream)?;Ok(())
@@ -87,6 +91,8 @@ pub(crate) struct CorePrograms<'a> {
     native_bf16:[cuteafd_ffi::draft_projection::DraftProjections<'a>;2],
     native_fp8:[cuteafd_ffi::native_attention::Fp8Projections<'a>;2],
     pub native_scratch:usize,
+    pub fp8_head: Option<crate::shared::target_head::BlockFp8Head<'a>>,
+    pub dense_situ: Option<KimiSitu<'a>>,
     pub native_add:cuteafd_ffi::F32Add<'a>,
     pub kda:[KimiKdaCore<'a>;2],
     pub mla:BTreeMap<(usize,usize,usize),KimiMlaSplit<'a>>,
@@ -107,7 +113,7 @@ impl<'a> CorePrograms<'a> {
         use cuteafd_loader::placement::{LayerMode,FfnMode};
         ensure!(matches!(ranks,1|2),"Kimi K6 physical rank count");
         inventory.validate_runtime_groups(cfg)?;
-        if inventory.projections.is_empty() {return Ok(None);}
+        if !inventory.has_split_core() {return Ok(None);}
         let mut projections=BTreeMap::new();
         let mut grouped=BTreeMap::new();
         let mut layout:Option<ProjectionLayout>=None;
@@ -173,6 +179,9 @@ impl<'a> CorePrograms<'a> {
         for (k, n, fp8, partial) in geometries {
             if fp8 { native_scratch = native_scratch.max(native_fp8[usize::from(partial)].scratch_bytes(k, n)?); }
         }
+        let fp8_head = inventory.fp8_head()?.map(|head| crate::shared::target_head::BlockFp8Head::load(programs, head.shape)).transpose()?;
+        if let Some(head) = &fp8_head { native_scratch = native_scratch.max(head.scratch_bytes()?); }
+        let dense_situ = inventory.has_dense_fp8_ffn().then(|| KimiSitu::load(programs, cfg.dense_intermediate / ranks)).transpose()?;
         let heads=cfg.kda_heads/ranks;
         let kda=[KimiKdaCore::load(programs,&format!("kda_core_h{heads}_m64"),64,true)?,
             KimiKdaCore::load(programs,&format!("kda_core_h{heads}_m4096"),4096,false)?];
@@ -186,7 +195,7 @@ impl<'a> CorePrograms<'a> {
             mla.insert((heads,stride,capacity),load(programs,
                 [&names[0],&names[1],&names[2]],heads,capacity,stride,cache_format)?);
         }}}
-        Ok(Some(Self{projections,grouped,grouped_enabled:std::cell::Cell::new(true),layouts,native_inventory:inventory.clone(),native_bf16,native_fp8,native_scratch,native_add:programs.library().f32_add()?,kda,mla,norm:cuteafd_ffi::KimiRmsNorm::load(programs,3584)?,situ:KimiSitu::load(programs,6144/ranks)?,
+        Ok(Some(Self{projections,grouped,grouped_enabled:std::cell::Cell::new(true),layouts,native_inventory:inventory.clone(),native_bf16,native_fp8,native_scratch,fp8_head,dense_situ,native_add:programs.library().f32_add()?,kda,mla,norm:cuteafd_ffi::KimiRmsNorm::load(programs,3584)?,situ:KimiSitu::load(programs,6144/ranks)?,
             copy:programs.library().v41_peer_copy()?,narrow:programs.library().f32_bf16_narrow()?,
             core_add:programs.library().bf16_f32_add()?}))
     }

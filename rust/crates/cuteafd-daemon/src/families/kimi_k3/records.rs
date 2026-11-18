@@ -175,6 +175,7 @@ impl<'l, 'a> KimiRecords<'l, 'a> {
         let mut operands = BTreeMap::new();
         let [vocab, hidden] = [layout.vocab, layout.hidden];
         let core_head = layout.core_head.as_ref().map(|head| scoped.core(device, "head", head)).transpose()?;
+        let fp8_head = layout.fp8_head.as_ref().map(|head| scoped.native(device, "head", head)).transpose()?;
         for (key, name) in [("embedding", "language_model.model.embed_tokens.weight"),
             ("head", "language_model.lm_head.weight")] {
             if layout.operands.contains_key(key) {
@@ -189,7 +190,7 @@ impl<'l, 'a> KimiRecords<'l, 'a> {
         ensure!(operands.len() == layout.operands.len() && layout.operands.iter().all(|(name, bytes)|
             operands.get(name).is_some_and(|a: &Allocation<'_>| a.buffer.bytes == *bytes)),
             "Kimi recorded global operands differ from admission");
-        Ok(GlobalWeights { operands, core_head })
+        Ok(GlobalWeights { operands, core_head, fp8_head })
     }
 
     /// One layer's weights on both ranks, allocated from `layouts` (the
@@ -255,8 +256,8 @@ impl<'l, 'a> KimiRecords<'l, 'a> {
                     [cfg.hidden, width], TrellisSide::Input, ranks, rank)?);
             }
         } else {
-            let root = format!("{base}.block_sparse_moe.shared_experts");
-            let width = cfg.moe_intermediate * cfg.shared_experts;
+            let root = if cfg.dense[layer] { format!("{base}.mlp") } else { format!("{base}.block_sparse_moe.shared_experts") };
+            let width = if cfg.dense[layer] { cfg.dense_intermediate } else { cfg.moe_intermediate * cfg.shared_experts };
             for (name, leaf, shape, side) in [("ffn.gate", "gate_proj", [width, cfg.hidden], TrellisSide::Output),
                 ("ffn.up", "up_proj", [width, cfg.hidden], TrellisSide::Output),
                 ("ffn.down", "down_proj", [cfg.hidden, width], TrellisSide::Input)] {
@@ -267,7 +268,7 @@ impl<'l, 'a> KimiRecords<'l, 'a> {
             let owner = cuteafd_loader::families::kimi_k3::weight_layout::routed_owner_for(cfg, layer, ranks)?;
             let device = devices[owner];
             let root = format!("{base}.block_sparse_moe");
-            if layouts[owner].core.contains_key("latent.down") {
+            if layouts[owner].core.contains_key("latent.down") || layouts[owner].native.contains_key("latent.down") {
                 for (name, leaf, shape) in [("latent.down", "routed_expert_down_proj", [cfg.latent, cfg.hidden]),
                     ("latent.up", "routed_expert_up_proj", [cfg.hidden, cfg.latent])] {
                     scoped.projection(devices, layouts, &mut ops, &mut core, name, &format!("{root}.{leaf}"), shape,
@@ -293,33 +294,7 @@ impl<'l, 'a> KimiRecords<'l, 'a> {
         }
         let native = layouts.iter().zip(devices).map(|(layout, &device)| {
             layout.native.iter().map(|(&name, layout)| {
-                use crate::shared::native_attention::{attention_records, AttentionRecord, NativeAttentionWeights};
-                use crate::shared::memory::DeviceAllocation;
-                let selected = scoped.checkpoint.projection(&layout.stem)?;
-                let [n, k] = layout.shape;
-                let (values, scales) = device.run(|| Ok((
-                    DeviceAllocation::from_allocation(scoped.allocate(device, &format!("{name}.values"), (n * k * if layout.fp8 { 1 } else { 2 }).max(256))?),
-                    if layout.fp8 { Some(DeviceAllocation::from_allocation(scoped.allocate(device, &format!("{name}.scales"), (n.div_ceil(128) * k.div_ceil(128) * 4).max(256))?)) } else { None },
-                )))?;
-                let records = attention_records(&scoped.checkpoint.snapshot, &selected, scoped.checkpoint.projection_view(&layout.stem),
-                    layout, cuteafd_loader::formats::native_attention::Fp8Role::exact("projection", true), crate::shared::fp8_linear::Fp8Scales::Amax, values.buffer,
-                    scales.as_ref().map(|scales| scales.buffer))?;
-                let stream = scoped.streams.iter().find(|(id, _)| *id == device.id)
-                    .context("Kimi native attention load stream")?.1;
-                let admitted = scoped.core.native_mount_load(devices.len())?;
-                for record in records {
-                    match record {
-                        AttentionRecord::Operand(record) => {
-                            admitted.validate(record.mount_load()?)?;
-                            scoped.dense.operand(record)?;
-                        }
-                        AttentionRecord::Step(record) => {
-                            admitted.validate(record.mount_load()?)?;
-                            scoped.dense.step(record, stream)?;
-                        }
-                    }
-                }
-                Ok((name, NativeAttentionWeights { layout: layout.clone(), values, scales }))
+                Ok((name, scoped.native(device, name, layout)?))
             }).collect::<Result<BTreeMap<_, _>>>()
         }).collect::<Result<Vec<_>>>()?;
         let weights = ops.into_iter().zip(core).zip(shares).zip(native)
@@ -327,6 +302,38 @@ impl<'l, 'a> KimiRecords<'l, 'a> {
             .collect::<Vec<_>>();
         for (layout, weights) in layouts.iter().zip(&weights) { layout.check_owned(weights)?; }
         Ok(weights)
+    }
+
+    fn native(&self, device: Device<'a>, name: &str,
+        layout: &cuteafd_loader::formats::native_attention::NativeLayout)
+        -> Result<crate::shared::native_attention::NativeAttentionWeights<'a>> {
+        use crate::shared::native_attention::{attention_records, AttentionRecord, NativeAttentionWeights};
+        use crate::shared::memory::DeviceAllocation;
+        let selected = self.checkpoint.projection(&layout.stem)?;
+        let extents = layout.allocation_extents()?;
+        let (values, scales) = device.run(|| Ok((
+            DeviceAllocation::from_allocation(self.allocate(device, &format!("{name}.values"), usize::try_from(extents[0])?)?),
+            extents.get(1).map(|&bytes| Ok::<_, anyhow::Error>(DeviceAllocation::from_allocation(
+                self.allocate(device, &format!("{name}.scales"), usize::try_from(bytes)?)?))).transpose()?,
+        )))?;
+        let records = attention_records(&self.checkpoint.snapshot, &selected, self.checkpoint.projection_view(&layout.stem),
+            layout, cuteafd_loader::families::kimi_k3::core::fp8_role(&layout.stem), crate::shared::fp8_linear::Fp8Scales::Amax,
+            values.buffer, scales.as_ref().map(|scales| scales.buffer))?;
+        let stream = self.streams.iter().find(|(id, _)| *id == device.id).context("Kimi native load stream")?.1;
+        let admitted = self.core.native_mount_load(self.streams.len())?;
+        for record in records {
+            match record {
+                AttentionRecord::Operand(record) => {
+                    admitted.validate(record.mount_load()?)?;
+                    self.dense.operand(record)?;
+                }
+                AttentionRecord::Step(record) => {
+                    admitted.validate(record.mount_load()?)?;
+                    self.dense.step(record, stream)?;
+                }
+            }
+        }
+        Ok(NativeAttentionWeights { layout: layout.clone(), values, scales })
     }
 
     #[allow(clippy::too_many_arguments)]
