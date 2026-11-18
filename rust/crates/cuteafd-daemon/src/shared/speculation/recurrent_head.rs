@@ -41,7 +41,7 @@ impl Rank<'_> {
         stage: Buffer, transpose: Buffer, mut project: impl FnMut(Buffer, Buffer, usize) -> Result<()>) -> Result<()> {
         use crate::shared::experts::rtx::dense::Finish;
         use cuteafd_core::DType;
-        const TILE: usize = 32;
+        use cuteafd_loader::families::inkling2::draft::{fold_programs, FOLD_TILE as TILE};
         let c = &self.config.transformer;
         let n = self.config.padded_vocab;
         let (h, r) = (c.hidden, c.markov_rank);
@@ -62,8 +62,8 @@ impl Rank<'_> {
         let mut guard = self.stream.cancellation_guard("compact recurrent startup fold");
         Finish::PaddedTranspose { source: hidden_out.buffer, output: input, dtype: DType::Bf16,
             rows: h, cols: r, padded_cols: h }.run(lib, stream)?;
-        let egress = programs.program(&format!("inkling2_padded_transpose_f32_r{TILE}_c{stored}_p{TILE}"),
-            &["source", "output"])?;
+        let [_, egress_name] = fold_programs(h, r, stored);
+        let egress = programs.program(&egress_name, &["source", "output"])?;
         ensure!(egress.spec().scalar_kinds.is_empty(), "compact fold egress ABI");
         for first in (0..r).step_by(TILE) {
             project(part(input, first*h*2, TILE*h*2)?, stage, TILE)?;
