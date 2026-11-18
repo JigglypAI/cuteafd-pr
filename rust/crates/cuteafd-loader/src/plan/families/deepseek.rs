@@ -56,7 +56,8 @@ impl Family for DeepSeek {
     }
     fn decode_lanes(&self) -> crate::plan::decode_lanes::LaneSupport { self.decode_lanes }
     fn attention_precision(&self) -> crate::plan::attention_precision::PrecisionSupport {
-        crate::plan::attention_precision::MLA
+        if self.id == "deepseek_v41" { crate::plan::attention_precision::MLA_BF16_ONLY }
+        else { crate::plan::attention_precision::MLA }
     }
     fn spark_decode(&self) -> Option<crate::plan::spark_executions::SparkDecode> {
         Some(crate::plan::spark_executions::SparkDecode { rows: self.decode_rows })

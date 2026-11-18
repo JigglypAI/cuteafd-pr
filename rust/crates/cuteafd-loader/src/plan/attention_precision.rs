@@ -15,6 +15,11 @@ pub const BF16_ONLY: PrecisionSupport = PrecisionSupport {
     modes: &[AttentionPrecision::Bf16],
     source: "BF16 attention; no FP8 attention program is exported (#2146)",
 };
+/// The key is accepted, but this MLA family has no qualified lower tier.
+pub const MLA_BF16_ONLY: PrecisionSupport = PrecisionSupport {
+    modes: &[AttentionPrecision::Bf16, AttentionPrecision::Fp8],
+    source: "no qualified lower attention tier; both settings use BF16-tier attention (#2146)",
+};
 pub const MLA: PrecisionSupport = PrecisionSupport {
     modes: &[AttentionPrecision::Bf16, AttentionPrecision::Fp8],
     source: "shared MLA BF16-tier default; faster, lower-quality FP8 attention is opt-in (#2146)",
@@ -29,7 +34,8 @@ pub struct Resolved {
 pub fn resolve(family: &dyn super::Family, requested: AttentionPrecision) -> Result<Resolved, PlanError> {
     let support = family.attention_precision();
     if support.modes.contains(&requested) {
-        Ok(Resolved { mode: requested, reason: support.source.into() })
+        let mode = if support == MLA_BF16_ONLY { AttentionPrecision::Bf16 } else { requested };
+        Ok(Resolved { mode, reason: support.source.into() })
     } else {
         Err(PlanError::UnsupportedValue {
             option: OPTION, value: requested.name().into(), family: family.id().into(),
@@ -56,7 +62,9 @@ mod tests {
         for family in crate::plan::family::registry() {
             let result = resolve(*family, AttentionPrecision::Fp8);
             if family.attention_precision().modes.contains(&AttentionPrecision::Fp8) {
-                assert_eq!(result.unwrap().mode, AttentionPrecision::Fp8);
+                let support = family.attention_precision();
+                let expected = if support == MLA_BF16_ONLY { AttentionPrecision::Bf16 } else { AttentionPrecision::Fp8 };
+                assert_eq!(result.unwrap().mode, expected);
             } else {
                 let error = result.unwrap_err().to_string();
                 assert!(error.contains(OPTION) && error.contains("fp8") && error.contains(family.id()), "{error}");
