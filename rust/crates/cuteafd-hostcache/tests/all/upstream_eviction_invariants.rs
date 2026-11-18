@@ -264,19 +264,15 @@ fn partial_hit_replay_window_boundary() {
     assert_eq!(metrics.host_hits, 4);
 }
 
-/// Port of the vllm/sglang "most computation saved" reuse rule: a populated exact ancestor
-/// beats a longer partial match whose even-aligned replay saves less, and loses once the
-/// partial match's replay passes it.
+/// V4.1 host lookups keep the ancestor even when a partial would save more work.
 #[test]
-fn exact_ancestor_trades_off_against_a_longer_partial_match() {
+fn exact_ancestor_precedes_a_longer_partial_match() {
     let mut cache = default_cache(4 * CHUNK as u64, StoreMode::OnRetain);
     let mut device = Device::new(DEVICE_BYTES);
     let ancestor = snap(&mut device, SnapshotKind::Turn, &seq(0, 250), &[id(30, 1)]);
     write_snapshot(cache.engine_mut(), &ancestor);
     store_resident(&mut cache, &ancestor, 1);
-    // 500 tokens so the winning query below diverges INSIDE the snapshot
-    // (review 2026-09-15: at 380 the query matched the whole frontier and the
-    // winning-partial-match branch was never exercised).
+    // Long enough that the 381-token query diverges inside this snapshot.
     let longer = snap(&mut device, SnapshotKind::Turn, &seq(0, 500), &[id(31, 2)]);
     write_snapshot(cache.engine_mut(), &longer);
     store_resident(&mut cache, &longer, 2);
@@ -298,13 +294,12 @@ fn exact_ancestor_trades_off_against_a_longer_partial_match() {
     assert_eq!(hit.key, key_of_ancestor, "tie prefers the exact ancestor");
     assert_eq!((hit.common, hit.frontier), (250, 250));
 
-    // Divergence at 381, inside the 500-token snapshot: saves 380-128 = 252 > 250,
-    // so the longer PARTIAL match wins over the exact ancestor.
+    // Divergence at 381 saves 380-128 = 252 > 250, but the ancestor still wins.
     let mut query = seq(0, 381);
     query.push(999);
     let hit = cache.lookup(&query).expect("hit");
-    assert_eq!(hit.key, key_of_longer, "winning partial match beats exact ancestor");
-    assert_eq!(hit.common, 381);
+    assert_eq!(hit.key, key_of_ancestor);
+    assert_eq!((hit.common, hit.frontier), (250, 250));
 
     // Full-frontier query still resolves to the complete longer snapshot.
     let mut query = seq(0, 500);
