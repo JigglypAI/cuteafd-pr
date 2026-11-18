@@ -23,6 +23,10 @@ pub(in crate::families::deepseek_v41::v41_native_serve) struct Queued<T, C> {
     pub slot: usize,
     pub request: Option<T>,
     pub cursor: C,
+    /// When the prompt entered the queue (`prefill_queue_wait_ns_total`).
+    pub queued_at: std::time::Instant,
+    /// Whether its first chunk has run; the wait is recorded exactly once.
+    pub started: bool,
 }
 
 impl<T, C> Queued<T, C> {
@@ -75,6 +79,11 @@ pub(in crate::families::deepseek_v41::v41_native_serve) fn recover_packed<'q, T:
 pub(in crate::families::deepseek_v41::v41_native_serve) fn chunk<T, C, H: Host<T, C>>(host: &mut H,
     entry: &mut Queued<T, C>) -> Result<Chunk> {
     let request = entry.request.as_mut().context("a queued prompt already left")?;
+    // The prompt's wait in the queue, recorded once at its first chunk.
+    if !entry.started {
+        entry.started = true;
+        super::phase_stats::record_prefill_queue_wait(entry.queued_at.elapsed().as_nanos() as u64);
+    }
     // A packed group's stored result first, so a packed fault is reported as
     // itself; then a client that left, at this drained boundary (no call of
     // this prompt is in flight between chunks).
@@ -207,7 +216,7 @@ mod tests {
         for (id, &tokens) in prompts.iter().enumerate() {
             host.leases.insert(id);
             queue.push(Queued { slot: 10 + id, request: Some(Prompt { id, tokens, closed: closed.clone(), packed: None }),
-                cursor: Cursor::default() });
+                cursor: Cursor::default(), queued_at: std::time::Instant::now(), started: false });
         }
         queue
     }

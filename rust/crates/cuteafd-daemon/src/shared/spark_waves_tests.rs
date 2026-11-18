@@ -2025,3 +2025,24 @@ fn native_wait_guard_reuses_preweight_load_on_each_device() -> Result<()> {
     assert_eq!(fixture.native_initializations(&library)?, 2);
     Ok(())
 }
+
+/// A landed wave moves all three host times and its payload, so `/v1/stats` `exchange`
+/// describes the same interval the `spark exchange wave` log line used to.
+/// The counters are process-global atomics, so the delta tests take a lock.
+#[test]
+fn a_landed_wave_moves_every_exchange_counter() {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _guard = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let before = exchange_stats::snapshot();
+    let times = WaveTimes { staged: 0.000_002, posted: 0.000_003, received: 0.000_005 };
+    exchange_stats::record_wave(&times, 4096);
+    let after = exchange_stats::snapshot();
+    let d = |key: &str, sub: &str| after[key][sub].as_u64().unwrap() - before[key][sub].as_u64().unwrap();
+    assert_eq!(d("exchange_ns_total", "staging"), 2_000);
+    assert_eq!(d("exchange_ns_total", "post"), 3_000);
+    assert_eq!(d("exchange_ns_total", "wait"), 5_000);
+    assert_eq!(after["exchange_bytes_total"].as_u64().unwrap()
+        - before["exchange_bytes_total"].as_u64().unwrap(), 4096);
+    assert_eq!(after["exchange_waves_total"].as_u64().unwrap()
+        - before["exchange_waves_total"].as_u64().unwrap(), 1);
+}

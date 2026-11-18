@@ -121,13 +121,23 @@ pub(crate) struct PrefillQueue<P> {
     share: f64,
     owed: f64,
     last_round: f64,
+    /// Prompts that ran a chunk in the last round (finished + still waiting).
+    /// The always-on `prefill_prompts_total` counter reads it, so the round's
+    /// width is exported without a log line.
+    last_round_prompts: usize,
     round_s: f64,
 }
 
 impl<P> PrefillQueue<P> {
     pub fn new(share: f64) -> Self {
-        Self { waiting: VecDeque::new(), share, owed: 0.0, last_round: 0.0, round_s: ROUND_S }
+        Self { waiting: VecDeque::new(), share, owed: 0.0, last_round: 0.0, last_round_prompts: 0, round_s: ROUND_S }
     }
+
+    /// The last round's wall time in seconds (`phase_ns_total.prefill_round`).
+    pub fn last_round_seconds(&self) -> f64 { self.last_round }
+
+    /// Prompts that ran a chunk in the last round (`prefill_prompts_total`).
+    pub fn last_round_prompts(&self) -> usize { self.last_round_prompts }
 
     /// Limit a family round to one completed wave without changing its row plan.
     pub fn one_wave_rounds(mut self) -> Self {
@@ -205,6 +215,7 @@ impl<P> PrefillQueue<P> {
                 break;
             }
         }
+        self.last_round_prompts = out.len() + ran.len();
         self.waiting.extend(ran);
         self.last_round = started.elapsed().as_secs_f64();
         out
@@ -243,6 +254,7 @@ impl<P> PrefillQueue<P> {
             for prompt in unfinished.into_iter().rev() { self.waiting.push_front(prompt); }
             steps += 1;
         }
+        self.last_round_prompts = out.len() + ran.len();
         self.waiting.extend(ran);
         self.last_round = started.elapsed().as_secs_f64();
         out
@@ -292,6 +304,7 @@ impl<P> PrefillQueue<P> {
             for prompt in unfinished.into_iter().rev() { self.waiting.push_front(prompt); }
             steps += 1;
         }
+        self.last_round_prompts = out.len() + ran.len();
         self.waiting.extend(ran);
         self.last_round = started.elapsed().as_secs_f64();
         out
@@ -462,6 +475,19 @@ mod tests {
         assert_eq!(log, vec![0, 0, 0, 1, 1]);
         queue.settle(true);
         assert!(!queue.due(true));
+    }
+
+    /// The round's width is exported, so `prefill_prompts_total` counts the prompts that
+    /// actually ran a chunk — finished ones plus the ones rotated back to wait.
+    #[test]
+    fn a_round_reports_the_prompts_that_ran() {
+        let mut queue = PrefillQueue::new(0.0);
+        queue.push(Prompt { id: 0, left: 1 });
+        queue.push(Prompt { id: 1, left: 1 });
+        let mut log = Vec::new();
+        assert_eq!(run(&mut queue, &mut log, 0), vec![0, 1]);
+        assert_eq!(queue.last_round_prompts(), 2, "both prompts ran a chunk");
+        assert!(queue.last_round_seconds() >= 0.0);
     }
 
     #[test]
