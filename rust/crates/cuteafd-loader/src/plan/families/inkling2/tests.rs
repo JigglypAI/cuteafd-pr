@@ -586,6 +586,30 @@ fn compact_core_headers_preserve_native_keeps_and_plan_exact_trellis_arenas() ->
 }
 
 #[test]
+fn planner_refuses_each_compact_view_on_tp2_by_name() -> anyhow::Result<()> {
+    use crate::plan::checkpoint::{CheckpointView, CoreView};
+    let (_, config, tensors) = fixture(Fixture::Exl3);
+    let dir = tempfile::tempdir()?;
+    let head = tensors.iter().find(|(name, _, _)| name == "model.llm.unembed.weight").unwrap();
+    testing::write_mc_snapshot_with_mtp(dir.path(), &config, &tensors,
+        &std::collections::BTreeMap::from([(head.0.clone(), head.2.clone())]), &Default::default());
+    for mode in [CoreView::K8Compact, CoreView::K6Compact, CoreView::Fp8Compact] {
+        let selected = CheckpointView::select(dir.path(), mode)?;
+        let input = testing::BudgetedPlanInput::from_checkpoint(Checkpoint::open_view(&selected)?);
+        let report = input.plan(&PlanOptions {
+            placement: plan::ExpertPlacement::from_spark_ranks(6),
+            vision: plan::MediaMode::Off, audio: plan::MediaMode::Off,
+            layout: Some(plan::layout::LayoutOptions { rtx_bytes: vec![96 << 30; 2], ..Default::default() }),
+            ..Default::default()
+        })?;
+        assert!(!report.executable() && !report.wip_launchable(), "{mode}: {:?}", report.hints);
+        assert!(report.hints.iter().any(|hint| hint.what.contains(&format!("CORE_VIEW={mode}"))
+            && hint.what.contains("TP2") && hint.what.contains("#2316")), "{mode}: {:?}", report.hints);
+    }
+    Ok(())
+}
+
+#[test]
 fn installed_inkling_mc_views_have_native_target_and_draft_programs() -> anyhow::Result<()> {
     use crate::{families::inkling2::{draft::DraftLayout, weight_layout::{CoordinatorWeights, HEAD}},
         placement::{families::inkling2::layer_modes, AttentionPlacement}, plan::checkpoint::{CheckpointView, CoreView}};

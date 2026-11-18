@@ -29,6 +29,10 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
         report.refuse_placement(format!("Inkling 2 needs one or two coordinator GPUs, not {gpus}"), "Use --rtx 1 or --rtx 2.");
         return empty(notes);
     }
+    if let Err(error) = crate::families::inkling2::admission::check_core_view_ranks(input.checkpoint().core_view(), gpus) {
+        report.refuse_placement(error.what, error.how);
+        return empty(notes);
+    }
     if report.requested_attention.is_some_and(|mode| mode != AttentionPlacement::Heads) {
         report.refuse_placement("Inkling 2 only implements heads attention".into(), "Use ATTENTION_PLACEMENT=auto or heads.");
         return empty(notes);

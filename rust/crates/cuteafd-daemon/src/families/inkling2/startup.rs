@@ -5,7 +5,7 @@ use crate::shared::{inventory::{InventoryPhase, RuntimeInventory}, prefix::{budg
 use anyhow::{ensure, Context, Result};
 use cuteafd_api::openai::{chat::inkling2::InklingEncoding, ModelEncoding};
 use cuteafd_ffi::{programs::Programs, NativeLibrary};
-use cuteafd_loader::{families::inkling2::{admission::{gather_with_weights, Coordinator, FactsRequest, SelectedWeights}, Inkling2Config},
+use cuteafd_loader::{families::inkling2::{admission::{check_core_view_ranks, gather_with_weights, Coordinator, FactsRequest, SelectedWeights}, Inkling2Config},
     placement::{families::inkling2::{self, AdmittedInkling, InklingInputs}, planner::PrefillShape,
         AttentionPlacement, Onboard, ResidentWeights}, plan::Checkpoint};
 use std::{net::SocketAddr, path::Path, sync::Arc};
@@ -64,6 +64,7 @@ fn validate(options: &Options<'_>, cfg: &Inkling2Config) -> Result<()> {
 pub(crate) fn prepare<'a>(library: &'a NativeLibrary, programs: &'a Programs<'a>, checkpoint: &Checkpoint,
     cfg: &Inkling2Config, options: Options<'_>) -> Result<Prepared<'a>> {
     validate(&options, cfg)?;
+    check_core_view_ranks(checkpoint.core_view(), 1 + usize::from(options.split_device.is_some()))?;
     cfg.release_geometry()?;
     // Checkpoint-native chat resolution happens before CUDA or target loading.
     let encoding = ModelEncoding::Inkling(Arc::new(InklingEncoding::from_snapshot(&checkpoint.snapshot)?));
@@ -83,9 +84,6 @@ pub(crate) fn prepare<'a>(library: &'a NativeLibrary, programs: &'a Programs<'a>
     }).transpose()?;
     let devices = std::iter::once(options.device).chain(peers).collect::<Vec<_>>();
     let gpus = devices.len();
-    ensure!(gpus == 1 || checkpoint.view.as_ref().is_none_or(|view|
-        view.mode() == cuteafd_loader::plan::checkpoint::CoreView::Original),
-        "Inkling compact core on two RTX requires rank-local projection and reduction support");
     let selected_weights = SelectedWeights::new(checkpoint, cfg, gpus, AttentionPlacement::Heads, options.drafter.is_some())?;
     let compact_programs = (0..gpus).map(|rank|
         selected_weights.compact_programs(&manifest, rank, options.prefill.rows.max(64) as usize))
