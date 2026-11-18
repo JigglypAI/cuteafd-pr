@@ -105,6 +105,27 @@ class Family:
     def state_bytes(self, tokens):
         return tokens * self.config.hidden_size * self.config.hc_mult * 4 + tokens * 8
 
+    def begin_layer_memory(self):
+        if self.device.type == "cuda":
+            import torch
+            torch.cuda.reset_peak_memory_stats(self.device)
+
+    def end_layer_memory(self, stage, index):
+        if self.device.type != "cuda":
+            return
+        import torch
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize(self.device)
+        available = next(int(line.split()[1]) * 1024 for line in Path("/proc/meminfo").read_text().splitlines()
+                         if line.startswith("MemAvailable:"))
+        allocated = torch.cuda.max_memory_allocated(self.device)
+        reserved = torch.cuda.max_memory_reserved(self.device)
+        gib = 2 ** 30
+        print(f"Hy4 {stage} layer {index}: CUDA peak allocated={allocated/gib:.3f} GiB "
+              f"reserved={reserved/gib:.3f} GiB MemAvailable={available/gib:.3f} GiB", flush=True)
+        if available < 12 * gib:
+            raise RuntimeError(f"Hy4 MemAvailable guard stopped at {stage} layer {index}; no next layer launched")
+
     def initial_carry(self, window):
         import torch
         return {"tokens": torch.tensor(window["tokens"], dtype=torch.long)}
@@ -284,6 +305,7 @@ def preflight(family, snapshot, out):
     family.release_outer()
     checks = []
     for index in range(family.layers):
+        family.begin_layer_memory()
         module = family.load_layer(index)
         local = []
         for j, ids in enumerate(tokens):
@@ -305,8 +327,7 @@ def preflight(family, snapshot, out):
             raise ValueError(f"Hy4 upstream layer {index} fails F32 parity: {evidence}")
         family.release_layer(module)
         del module
-        if family.device.type == "cuda":
-            torch.cuda.empty_cache()
+        family.end_layer_memory("upstream preflight", index)
         if index == 2:
             family.load_final()
             truncated = [rel_l2(family.final(a[0]).to(family.device), family.official_final(n[0]))

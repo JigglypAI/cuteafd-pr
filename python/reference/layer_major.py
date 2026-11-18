@@ -365,6 +365,8 @@ def run(a, family, *, extras_root=None, media_adapter=None):
         print(f"resume after layer {state.latest['layer']}; {len(windows)} windows", flush=True)
         stop = family.layers if pilot_layers is None else pilot_layers
         for index in range(state.latest["layer"] + 1, stop):
+            if pilot_layers is None and hasattr(family, "begin_layer_memory"):
+                family.begin_layer_memory()
             tick = time.monotonic()
             read_before, read_seconds_before = family.checkpoint.read_bytes, family.checkpoint.read_seconds
             wait_for_shards(family, index, getattr(a, "wait_shards", 0))
@@ -420,6 +422,8 @@ def run(a, family, *, extras_root=None, media_adapter=None):
                 log_reference_cuda_memory(torch.cuda, f"after layer {index}")
             print(f"layer {index + 1}/{family.layers} committed; {seconds:.1f}s (load {load_seconds:.1f}s); "
                   f"read {(family.checkpoint.read_bytes - read_before) / 1e9:.2f} GB", flush=True)
+            if pilot_layers is None and hasattr(family, "end_layer_memory"):
+                family.end_layer_memory("prefix" if checking else "panel", index)
         if pilot_layers is not None:
             return state.latest["seconds_per_layer"]
         wait_for_tensors(family, family.outer_tensors("final"), getattr(a, "wait_shards", 0))
