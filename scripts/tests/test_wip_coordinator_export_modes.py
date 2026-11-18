@@ -162,6 +162,7 @@ def test_native_cache_hit_restores_without_gpu_placement(tmp_path):
     script = """set -euo pipefail
 sync_local_source() { :; }
 docker() { echo "docker $*"; }
+wip_exec() { "$@"; }
 native_store_sync() { :; }
 native_store_has() { return 0; }
 release_die() { exit 9; }
@@ -220,6 +221,7 @@ CUTEAFD_EXPORT_HOST=maxq
 coordinator_build=(docker exec -e CUTEAFD_SCOPE=ON container)
 wip_serving_export_priority() {{ return 1; }}
 docker() {{ echo image; }}
+wip_exec() {{ "$@"; }}
 native_store_nest() {{ :; }}
 native_store_sync() {{ :; }}
 {_function('wip_remote_export')}

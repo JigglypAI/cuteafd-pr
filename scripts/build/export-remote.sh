@@ -64,7 +64,7 @@ if [[ ! -f "$archive" ]]; then
   timeout 900 nest replicate --hosts "$host" --wait "$area" >/dev/null
   echo "export-remote: staged source on $host in $((SECONDS - started))s"
   set +e
-  timeout --kill-after=30 7200 "${ssh_host[@]}" bash -s -- "$area" "$image" "$key" "$archive" "${CUTEAFD_REMOTE_EXPORT_SLOTS:-}" <<'REMOTE'
+  remote_script="$(cat <<'REMOTE'
 set -euo pipefail
 area="$1" image="$2" key="$3" archive="$4" slots="${5:-}"
 NO_TURN=75
@@ -160,7 +160,27 @@ if ((status == 0)); then
 fi
 exit "$status"
 REMOTE
+)"
+  # The remote supervisor reads the SSH channel, not the script. Closing the
+  # channel asks it to drain the exporter and its EXIT cleanup before ssh exits.
+  supervisor="$(cat "$(dirname "$0")/build-process.py")"
+  remote_client=
+  cancel_remote_client() {
+    trap '' TERM HUP INT QUIT
+    if [[ -n "$remote_client" ]]; then
+      kill -TERM "$remote_client" 2>/dev/null || true
+      wait "$remote_client" 2>/dev/null || true
+    fi
+    exit 143
+  }
+  trap cancel_remote_client TERM HUP INT QUIT
+  python3 "$(dirname "$0")/build-process.py" --pipe --timeout 7200 --grace 70 -- \
+    "${ssh_host[@]}" "$(printf '%q ' python3 -c "$supervisor" --channel --grace 65 -- \
+      bash -c "$remote_script" export-remote "$area" "$image" "$key" "$archive" "${CUTEAFD_REMOTE_EXPORT_SLOTS:-}")" &
+  remote_client=$!
+  wait "$remote_client"
   status=$?
+  trap - TERM HUP INT QUIT
   set -e
   nest rm -r "$area" >/dev/null 2>&1 || true
   ((status == 0)) || { echo "export-remote: $host export exited $status" >&2; exit "$NO_TURN"; }
