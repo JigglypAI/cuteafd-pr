@@ -1306,6 +1306,15 @@ def image_partial_fidelity(url, dest, dump_root, variant, model, prefix, image, 
         cached = record['cached_tokens']
         if not (cached == 0 if cold else 0 < cached < start):
             raise ValueError(f'{variant}/{arm}: unexpected scoring cache hit of {cached} tokens')
+        restore = (record.get('provenance') or {}).get('prefix_restore')
+        if not cold and restore is not None and restore.get('partial') is not True:
+            raise ValueError(f'{variant}/{arm}: scoring used an exact ancestor, not partial replay')
+        if not cold and record.get('engine') == 'deepseek_v41':
+            plan = (restore or {}).get('plan') or {}
+            lag = plan.get('lag') or {}
+            if (plan.get('fidelity') != 'ApproximateReplay' or plan.get('target_end') != start
+                    or lag.get('replay_start') != cached or not cached < lag.get('source_end', 0) < start):
+                raise ValueError(f'{variant}/{arm}: scoring did not attest bounded replay: {restore}')
     if records['cold']['prompt_ids'] != records['partial']['prompt_ids']:
         raise ValueError(f'{variant}: scored prompt IDs differ across cold and partial arms')
     receipt = dest / f'{variant}-partial-kl.json'

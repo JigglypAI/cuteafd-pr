@@ -4217,7 +4217,7 @@ def test_image_prefix_probe_receipts_and_http_failure(tmp_path, monkeypatch, fai
         thread.join()
 
 
-@pytest.mark.parametrize('failure', [None, 'miss', 'tokens', 'row'])
+@pytest.mark.parametrize('failure', [None, 'miss', 'tokens', 'row', 'exact'])
 def test_partial_image_probe_scores_the_same_continuation_on_a_divergent_seed(tmp_path, monkeypatch, failure):
     import math
     import struct
@@ -4241,7 +4241,10 @@ def test_partial_image_probe_scores_the_same_continuation_on_a_divergent_seed(tm
                 continue
             probabilities = (0.75, 0.25) if cold or i else (0.25, 0.75)
             (root / f'row-{i:08}.safetensors').write_bytes(raw + struct.pack('<ff', *map(math.log, probabilities)))
-        return {'probe': dict(cold=cold, no_speculation=True, score_path='decode', error=None, generated=[],
+        restore = None if cold else {'prefix_restore': {'partial': failure != 'exact', 'plan': {
+            'fidelity': 'ApproximateReplay', 'target_end': positions[0], 'lag': {'replay_start': 3, 'source_end': 6}}}}
+        return {'probe': dict(engine='deepseek_v41', provenance=restore,
+                              cold=cold, no_speculation=True, score_path='decode', error=None, generated=[],
                               scored=len(positions), rows=[dict(position=i, finite=True) for i in positions],
                               prompt_ids=[int(failure == 'tokens' and not cold)] * 40,
                               cached_tokens=0 if cold or failure == 'miss' else 3)}
@@ -4249,7 +4252,8 @@ def test_partial_image_probe_scores_the_same_continuation_on_a_divergent_seed(tm
     args = ('fixture', tmp_path, tmp_path, 'even', 'test', 'quality namespace', 'data:image/png;base64,xx',
             'divergent seed', 'diverged target')
     if failure:
-        reason = {'miss': 'unexpected scoring cache hit', 'tokens': 'prompt IDs differ', 'row': 'dumps do not cover'}[failure]
+        reason = {'miss': 'unexpected scoring cache hit', 'tokens': 'prompt IDs differ', 'row': 'dumps do not cover',
+                  'exact': 'scoring used an exact ancestor'}[failure]
         with pytest.raises(ValueError, match=reason):
             cards.image_partial_fidelity(*args)
     else:

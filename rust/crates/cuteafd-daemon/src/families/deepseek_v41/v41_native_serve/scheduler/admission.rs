@@ -28,6 +28,12 @@ impl Prepared {
             ).map_err(|error| cuteafd_api::openai::NativeFailure::BadRequest(format!("{error:#}")))?;
             (expanded.tokens, expanded.images)
         };
+        if let Some(from) = super::super::scoring_frontier(&job.probe, prompt.len()) {
+            if images.iter().any(|span| span.start + span.image.grid().tokens() > from) {
+                return Err(cuteafd_api::openai::NativeFailure::BadRequest(
+                    "image spans must precede V4.1 teacher-forced scoring".into()).into());
+            }
+        }
         // An oversized prompt is the client's fault, not the replica's: report it
         // as a bad request so the gateway does not mark this replica down.
         job.max_tokens = limits.output_for_prompt(prompt.len(), job.max_tokens)
