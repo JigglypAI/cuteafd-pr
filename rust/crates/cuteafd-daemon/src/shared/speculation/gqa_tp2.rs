@@ -25,6 +25,30 @@ impl<'a,D> GqaHeadSplit<'a,D> {
         Ok(Self { peer,exchange,lead,reduced,peer_reduced })
     }
 
+    /// Exchange complete F32 partials and deliver them in physical rank order
+    /// to a local reducer. Both receivers acknowledge before the slot is reused.
+    pub fn reduce_f32(&self, partials: [CuteafdDeviceBuffer; 2], elements: usize,
+        mut reduce: impl FnMut(usize, [CuteafdDeviceBuffer; 2]) -> Result<()>) -> Result<()> {
+        let exchange = &self.exchange;
+        let bytes = elements.checked_mul(4).ok_or_else(|| anyhow::anyhow!("draft F32 reduction extent overflow"))?;
+        ensure!(bytes > 0 && bytes <= exchange.slot_bytes() && partials.iter().enumerate().all(|(index, partial)|
+            !partial.ptr.is_null() && partial.device_id == exchange.device(index ^ self.lead) && partial.bytes >= bytes),
+            "GQA F32 TP2 reduction exceeds retained owners");
+        for (index, partial) in partials.iter().enumerate() {
+            exchange.push(index ^ self.lead, 0, partial.ptr, bytes)?;
+        }
+        for (index, &local) in partials.iter().enumerate() {
+            let rank = index ^ self.lead;
+            exchange.wait(rank, 0)?;
+            let remote = CuteafdDeviceBuffer { ptr: exchange.recv(rank, 0)?, bytes, ..local };
+            let ordered = if rank == 0 { [local, remote] } else { [remote, local] };
+            exchange.on(rank, || reduce(index, ordered))?;
+        }
+        for rank in 0..2 { exchange.signal(rank, DIRECT)?; }
+        for rank in 0..2 { exchange.wait(rank, DIRECT)?; }
+        Ok(())
+    }
+
     /// Same push/add/ack ordering as the existing DFlash TP2 path. Each caller
     /// retains these local partials through both waits; no host payload staging.
     pub fn reduce(&self,partials:[CuteafdDeviceBuffer;2],elements:usize)->Result<()> {

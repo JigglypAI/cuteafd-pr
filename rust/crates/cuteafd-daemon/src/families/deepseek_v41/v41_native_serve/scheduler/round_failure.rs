@@ -22,6 +22,7 @@
 use super::super::prefix::V41Cache as PrefixCache;
 use super::super::speculative::{DraftChain, DraftRuntime};
 use super::{retire_request, Active};
+use super::super::ClientGone;
 use crate::families::deepseek_v41::v41_requests::Requests;
 use crate::families::deepseek_v41::v41_backbone_cache::CacheLease;
 
@@ -66,6 +67,42 @@ pub(super) fn fail_request<M: RoundMember>(active: &mut [Option<M>],
     if !member.is_done() { member.fail(failure.retry()); }
     true
 }
+
+/// A packed pass's failure after the round's prologue reset the links once
+/// (`queue::recover_packed`): its members are answered without another reset.
+/// The text is the original failure's, unchanged.
+#[derive(Debug)]
+pub(super) struct PackedRecovered(anyhow::Error);
+impl std::fmt::Display for PackedRecovered {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { write!(f, "{:#}", self.0) }
+}
+impl std::error::Error for PackedRecovered {}
+
+/// Mark a stored packed failure recovered; true when it was not yet.
+pub(super) fn mark_recovered<T>(stored: &mut Option<anyhow::Result<T>>) -> bool {
+    match stored.take() {
+        Some(Err(error)) if error.downcast_ref::<PackedRecovered>().is_none() => {
+            *stored = Some(Err(anyhow::Error::new(PackedRecovered(error))));
+            true
+        }
+        other => { *stored = other; false }
+    }
+}
+
+/// Whether a prompt's failed chunk must reset every expert link. Only a failure
+/// that may have left a wave unlanded does: a client that left is observed at
+/// a drained boundary ([`ClientGone`]), a finished scoring probe dispatched
+/// nothing more, and a recovered packed failure already reset.
+pub(super) fn needs_reset(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<ClientGone>().is_none()
+        && error.downcast_ref::<super::super::ScoringDone>().is_none()
+        && error.downcast_ref::<PackedRecovered>().is_none()
+}
+
+static RESETS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Count one full reset of the expert links (`/v1/stats` `link_resets`).
+pub(super) fn count_reset() { RESETS.fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
+pub(super) fn resets() -> u64 { RESETS.load(std::sync::atomic::Ordering::Relaxed) }
 
 /// Reset only after a round-wide fault; callers invoke this after both lanes
 /// drain. The callback keeps the classification and reset decision inseparable.
@@ -581,5 +618,21 @@ pub(super) mod tests {
         let source = include_str!("../scheduler.rs");
         assert_eq!(source.matches("round_failure::handle(").count(), 1);
         assert_eq!(source.matches("round_failure::retire_done(").count(), 1);
+    }
+
+    /// The reset classification: only a failure that may have left a wave in
+    /// flight resets; the client-gone text is the untyped string it replaced.
+    #[test]
+    fn only_a_possibly_in_flight_failure_resets_the_links() {
+        assert!(!needs_reset(&anyhow::Error::new(ClientGone)));
+        assert!(!needs_reset(&anyhow::Error::new(super::super::super::ScoringDone)));
+        assert!(needs_reset(&fault("native GPU execution failed")));
+        let mut stored: Option<anyhow::Result<()>> = Some(Err(fault("packed prefill of 2 prompts: wire down")));
+        assert!(mark_recovered(&mut stored));
+        assert!(!mark_recovered(&mut stored), "a recovered failure is marked once");
+        let error = stored.unwrap().unwrap_err();
+        assert!(!needs_reset(&error));
+        assert_eq!(format!("{error:#}"), "packed prefill of 2 prompts: wire down", "the client text is unchanged");
+        assert_eq!(ClientGone.to_string(), "client disconnected", "the log line and client message do not move");
     }
 }

@@ -269,11 +269,17 @@ def golden_root(family):
     return module.Family.golden_meta(None)['root_arithmetic']
 
 
+def hy4_root():
+    from families.hy4_flash.sources import ROOT_ARITHMETIC
+    return ROOT_ARITHMETIC
+
+
 ROOT_PRECISIONS = [
     (lambda: KIMI_F32_ROOT, KIMI_F32_PRECISION),
     (lambda: KIMI_K31_F32_ROOT, KIMI_F32_PRECISION),
     (lambda: V41_ROOT, V41_PRECISION),
     (lambda: golden_root('muse_spark'), 'BF16 checkpoint (F32 computation)'),
+    (hy4_root, 'BF16 checkpoint (F32 computation; native Engram FP8 round-trip)'),
     (lambda: golden_root('mistral_large4'), 'official FP8 block-128 (no vendor BF16 master), computed in F32'),
 ]
 
@@ -297,7 +303,11 @@ def root_description(meta, panel):
     if root is None:
         return ('BF16 root', 'Checkpoint-native BF16/F32 tensors and family activation arithmetic, bounded attention, '
                 'fixed GEMM rows 128, MTP/cache off.', 'Transformers source')
-    return (f'root ({reference_precision(meta, panel)})', root['arithmetic'], root['source'])
+    arithmetic = root['arithmetic']
+    if panel.get('family') == 'hy4_flash' and root == hy4_root():
+        arithmetic += (' The golden performs Engram E4M3 quantize-dequantize in F32, '
+                       'not the stock Transformers BF16 lookup arithmetic.')
+    return (f'root ({reference_precision(meta, panel)})', arithmetic, root['source'])
 
 
 def validate_runtime_platform(runtime):

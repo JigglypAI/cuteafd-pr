@@ -28,7 +28,7 @@ from checkpoint_tokenizer import load_tokenizer, tokenizer_identity
 from fidelity_generation import token_ids
 
 FAMILIES = ("deepseek_v41", "mimo_v2", "qwen4", "qwen3_5", "glm5_flash", "deepseek_v4", "glm5", "step5", "kimi_k3", "kimi_k31",
-            "muse_spark", "mistral_large4", "minimax_m3", "inkling2")
+            "muse_spark", "mistral_large4", "minimax_m3", "inkling2", "hy4_flash")
 REPO_FILES = ["rust/crates/cuteafd-api/src/openai/probe.rs", "scripts/bench/bench-agentic-session.py",
               "python/reference/families/deepseek_v41/golden.py", "rust/crates/cuteafd-bench/src/client.rs",
               "scripts/bench/make-fidelity-reference.py", "rust/crates/cuteafd-bench/src/reference.rs",
@@ -510,14 +510,18 @@ def build_set(*, family: str, model: str, checkpoint: str, version: str, arm: di
         raise ValueError("top-up windows are defined for recipe v2 sets only")
     for i in range(12 + topup_b):
         generate(f"b{i:02d}", "B", [{"role": "user", "content": f"Explain invariants and propose a small safe modification to {files[i % len(files)]}.\n" + (root / files[i % len(files)]).read_text()}], 10240 + (i % 3) * 1024)
+    # Hy4's hosted prompts use only the small public fixture repo. Plain-code
+    # windows are scored locally and can use the usual longer source files.
+    code_files = REPO_FILES if family == "hy4_flash" and probe.identity.get("text_source") == "api" else files
+    code_sources = [source(root, path) for path in code_files] if code_files is not files else sources
     for i in range(10):
-        ids = token_ids(tokenizer, (root / files[i % len(files)]).read_text())
+        ids = token_ids(tokenizer, (root / code_files[i % len(code_files)]).read_text())
         if len(ids) < 1024:
-            raise ValueError(f"{files[i % len(files)]}: plain code needs >=1024 tokens; choose a longer file")
+            raise ValueError(f"{code_files[i % len(code_files)]}: plain code needs >=1024 tokens; choose a longer file")
         start = min(len(ids) - 512, 512 + (i % 4) * 512)
         tokens = ids[:start + 512]
         windows.append({"id": f"c{i:02d}", "block": "C", "bucket": bucket(start), "tokens": tokens,
-                        "roles": ["ctx"] * len(tokens), "score_from": start, "provenance": sources[i % len(files)]})
+                        "roles": ["ctx"] * len(tokens), "score_from": start, "provenance": code_sources[i % len(code_files)]})
     for i in range(6):
         prompt = STRUCTURED[i] + " Reply in JSON." if i < 3 else "Select and call the correct tool to read, search or edit the fixture repository. " + agentic.TASKS[(i - 3) % len(agentic.TASKS)]["prompt"]
         generate(f"d{i:02d}", "D", [{"role": "user", "content": prompt}], 1024 + (i % 3) * 512,
@@ -534,7 +538,7 @@ def build_set(*, family: str, model: str, checkpoint: str, version: str, arm: di
                 "version": version, "quick_windows": quick, "generation_arm": arm,
                 "generation_server": servers[0] if servers else {}, "precision_policy": "attested; recognized server head setting cross-checked if present",
                 "builder_sha256": hashlib.sha256(pathlib.Path(__file__).read_bytes()).hexdigest(),
-                "sources": sources + [source(root, "scripts/bench/bench-agentic-session.py"),
+                "sources": sources + [row for row in code_sources if row not in sources] + [source(root, "scripts/bench/bench-agentic-session.py"),
                     source(root, "rust/crates/cuteafd-bench/src/panels/quality.rs")],
                 "recording_sha256": [hashlib.sha256(canonical(r)).hexdigest() for r in recordings or []],
                 "recipe": {"windows": 64, "positions_per_window": 512, "max_tokens": 1024,

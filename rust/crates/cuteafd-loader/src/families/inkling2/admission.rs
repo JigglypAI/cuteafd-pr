@@ -24,15 +24,6 @@ pub struct Refused {
 
 fn refused(what: impl Into<String>, how: impl Into<String>) -> Refused { Refused { what: what.into(), how: how.into() } }
 
-/// Structural capability shared by the planner and direct serving startup.
-pub fn check_core_view_ranks(view: crate::plan::checkpoint::CoreView, gpus: usize) -> Result<(), Refused> {
-    if gpus == 2 && view != crate::plan::checkpoint::CoreView::Original {
-        return Err(refused(format!("Inkling CORE_VIEW={view} is not implemented on two RTX (TP2); tracked by #2316"),
-            "Use --rtx 1 for this core view, or CORE_VIEW=original for TP2."));
-    }
-    Ok(())
-}
-
 /// The coordinator edge: planned cards or measured samples.
 #[derive(Debug, Clone)]
 pub enum Coordinator {

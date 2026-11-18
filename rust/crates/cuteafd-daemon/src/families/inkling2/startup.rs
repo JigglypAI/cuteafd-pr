@@ -5,7 +5,7 @@ use crate::shared::{inventory::{InventoryPhase, RuntimeInventory}, prefix::{budg
 use anyhow::{ensure, Context, Result};
 use cuteafd_api::openai::{chat::inkling2::InklingEncoding, ModelEncoding};
 use cuteafd_ffi::{programs::Programs, NativeLibrary};
-use cuteafd_loader::{families::inkling2::{admission::{check_core_view_ranks, gather_with_weights, Coordinator, FactsRequest, SelectedWeights}, Inkling2Config},
+use cuteafd_loader::{families::inkling2::{admission::{gather_with_weights, Coordinator, FactsRequest, SelectedWeights}, Inkling2Config},
     placement::{families::inkling2::{self, AdmittedInkling, InklingInputs}, planner::PrefillShape,
         AttentionPlacement, Onboard, ResidentWeights}, plan::Checkpoint};
 use std::{net::SocketAddr, path::Path, sync::Arc};
@@ -64,7 +64,6 @@ fn validate(options: &Options<'_>, cfg: &Inkling2Config) -> Result<()> {
 pub(crate) fn prepare<'a>(library: &'a NativeLibrary, programs: &'a Programs<'a>, checkpoint: &Checkpoint,
     cfg: &Inkling2Config, options: Options<'_>) -> Result<Prepared<'a>> {
     validate(&options, cfg)?;
-    check_core_view_ranks(checkpoint.core_view(), 1 + usize::from(options.split_device.is_some()))?;
     cfg.release_geometry()?;
     // Checkpoint-native chat resolution happens before CUDA or target loading.
     let encoding = ModelEncoding::Inkling(Arc::new(InklingEncoding::from_snapshot(&checkpoint.snapshot)?));
@@ -261,15 +260,18 @@ pub(crate) fn whole<'a>(library: &'a Arc<NativeLibrary>, programs: &'a Programs<
         let requests = super::owners::RequestOwners::rank(peer_stream.clone(), &inputs, &admitted, 1)?;
         let exchange = PeerExchange::new_abortable(library, ranks, 1,
             usize::try_from(inputs.prefill.rows.max(64))? * cfg.hidden * 4, 64 * cfg.hidden * 4)?;
+        let mut peer_kernels = kernels.next().context("Inkling peer kernels absent")?;
+        peer_kernels.bind_compact(programs, peer_stream.clone(), &inputs.targets[1],
+            inputs.prefill.rows as usize, 64, inputs.target_fp8_scratch[1])?;
         execution.peer = Some(super::engine::Peer { graphs: super::engine::DecodeGraphs::new(&requests, inputs.graph_reserve[1])?, exchange, requests,
-            target: targets.next().context("Inkling peer target absent")?, kernels: kernels.next().context("Inkling peer kernels absent")? });
+            target: targets.next().context("Inkling peer target absent")?, kernels: peer_kernels });
     }
     ensure!(targets.next().is_none() && kernels.next().is_none(), "Inkling rank inventory not fully bound");
     if !draft_weights.is_empty() {
         let facts=inputs.drafter.as_ref().context("delivered drafter has no admission facts")?;
         let mut layout=facts.layout.clone();
         for rank in &mut layout.runtime{
-            let projection = rank.buffers.iter().filter(|(name, _)| matches!(name.as_str(), "projection.trellis" | "projection.fp8")).cloned().collect::<Vec<_>>();
+            let projection = rank.buffers.iter().filter(|(name, _)| matches!(name.as_str(), "projection.trellis" | "projection.fp8" | "step.partial_f32")).cloned().collect::<Vec<_>>();
             *rank=cuteafd_loader::formats::block_dspark::recurrent::runtime::RecurrentRuntimeLayout::new(&layout.config,
                 rank.slots,rank.sequences,rank.context_rows,usize::try_from(inputs.context.maximum)?,
                 usize::try_from(admitted.solved.pool_tokens)?,library.sm_count()? as usize,rank.kv_cache,
@@ -300,8 +302,10 @@ pub(crate) fn whole<'a>(library: &'a Arc<NativeLibrary>, programs: &'a Programs<
         cuteafd_loader::placement::planner::Lifetime::TARGET, cuteafd_core::memory_layout::Category::Workspace, "Inkling requests");
     let mut census = crate::shared::memory::receipts::Census::default();
     execution.requests.allocation_receipts(&mut inventory, &mut census, devices)?;
+    execution.kernels.compact_inventory(&mut inventory, "inkling2.target.0")?;
     if let Some(peer) = &execution.peer {
         peer.requests.allocation_receipts(&mut inventory, &mut census, devices)?;
+        peer.kernels.compact_inventory(&mut inventory, "inkling2.target.1")?;
         for (rank, name, buffer) in peer.exchange.allocation_buffers() {
             inventory.device(&format!("inkling2.attention.{rank}.{name}"), buffer)?;
         }

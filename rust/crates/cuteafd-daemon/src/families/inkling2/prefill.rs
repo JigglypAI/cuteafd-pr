@@ -147,11 +147,7 @@ impl<'a> PeerUnits<'_, 'a> {
         self.exchange.wait(0, 0)?;
         let remote = cuteafd_ffi::CuteafdDeviceBuffer { ptr: self.exchange.recv(0, 0)?,
             bytes, device_id: lead.stream().device.id, flags: 0 };
-        let reduced = lead.buffer("mlp")?;
-        // SAFETY: outputs are disjoint F32 rows; the matching wait published
-        // the receive slot. Rank 1 cannot overwrite it until the next input
-        // push on this same lead stream, after the reduction consumes it.
-        unsafe { kernels.add.launch(lead.buffer("branch")?, remote, reduced, rows * cfg.hidden, lead.stream().raw)?; }
+        let reduced = kernels.reduce_heads(lead, layers::output_weight(target, layer)?, remote, rows, cfg.hidden)?;
         layers::finish_attention(kernels, lead, target, cfg, layer, rows, reduced)?;
         layers::prepare_ffn_input(kernels, lead, target, cfg, layer, rows)
     }
