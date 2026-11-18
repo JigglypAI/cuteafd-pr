@@ -4,7 +4,7 @@ use anyhow::{ensure,Context,Result};
 use cuteafd_ffi::CuteafdDeviceBuffer as Buffer;
 
 #[derive(Clone, Copy, Debug)]
-pub(super) enum HeadStage {
+pub(crate) enum HeadStage {
     Begin, Gather, Recurrent, Base, Correction, Bias, Finish, Widen, Argmax, Copies,
 }
 
@@ -34,6 +34,56 @@ impl Rank<'_> {
         Ok(())
     }
 
+    /// Project tiles of H_out^T through the borrowed packed head, then round
+    /// once into the admitted folded arena. The caller lends idle target head
+    /// stages, which remain live through the startup stream drain.
+    pub fn fold_compact_head(&self, programs: &cuteafd_ffi::programs::Programs<'_>, stored: usize,
+        stage: Buffer, transpose: Buffer, project: impl Fn(Buffer, Buffer, usize) -> Result<()>) -> Result<()> {
+        use crate::shared::experts::rtx::dense::Finish;
+        use cuteafd_core::DType;
+        const TILE: usize = 32;
+        let c = &self.config.transformer;
+        let n = self.config.padded_vocab;
+        let (h, r) = (c.hidden, c.markov_rank);
+        ensure!(r % TILE == 0 && stored >= n, "invalid compact fold geometry");
+        let lib = self.stream.device.library;
+        let stream = self.stream.raw;
+        let head = self.weights.tensors.head.as_ref().context("peer has no recurrent head")?;
+        let ProjectionWeight::Bf16(hidden_out) = &head.hidden_out[0] else {
+            anyhow::bail!("recurrent hidden_out must remain native BF16");
+        };
+        let input = part(self.buffer("projection.bf16")?, 0, h*r*2)?;
+        let fold = self.weights.derived("derived.fold_weight")?.buffer;
+        let bias = self.weights.derived("derived.fold_bias")?.buffer;
+        let narrow = lib.f32_bf16_narrow()?;
+        let stage = part(stage, 0, stored*TILE*4)?;
+        let transpose = part(transpose, 0, stored*TILE*4)?;
+        let output = part(stage, 0, stored*TILE*2)?;
+        let mut guard = self.stream.cancellation_guard("compact recurrent startup fold");
+        Finish::PaddedTranspose { source: hidden_out.buffer, output: input, dtype: DType::Bf16,
+            rows: h, cols: r, padded_cols: h }.run(lib, stream)?;
+        let egress = programs.program(&format!("inkling2_padded_transpose_f32_r{TILE}_c{stored}_p{TILE}"),
+            &["source", "output"])?;
+        ensure!(egress.spec().scalar_kinds.is_empty(), "compact fold egress ABI");
+        for first in (0..r).step_by(TILE) {
+            project(part(input, first*h*2, TILE*h*2)?, stage, TILE)?;
+            // SAFETY: the stage and transpose spans are disjoint. The narrowed
+            // tile only overwrites the stage after the ordered transpose reads it.
+            unsafe {
+                egress.launch(&[stage.ptr, transpose.ptr], &[], stream)?;
+                narrow.launch(transpose.ptr, output.ptr, stored*TILE, stream)?;
+                lib.copy_d2d_2d_async(part(fold, first*2, fold.bytes-first*2)?, r*2,
+                    output, TILE*2, TILE*2, n, stream)?;
+            }
+        }
+        project(head.hidden_out_bias.buffer, stage, 1)?;
+        // SAFETY: only the logical vocabulary is written; source and bias are disjoint.
+        unsafe { narrow.launch(stage.ptr, bias.ptr, n, stream)?; }
+        self.stream.drain()?;
+        guard.complete = true;
+        Ok(())
+    }
+
     /// Returns device U32 [sequences,predictions] after the seven Markov steps.
     /// `step.normalized` is the final full-hidden block, replicated at the lead.
     /// Request-local f_rnn rows are already gathered from committed target taps.
@@ -46,7 +96,7 @@ impl Rank<'_> {
         }, |_, _| Ok(()))
     }
 
-    pub(super) fn recurrent_tokens_measured(&self, sequences:usize, anchor_ids:Buffer,
+    pub(crate) fn recurrent_tokens_measured(&self, sequences:usize, anchor_ids:Buffer,
         base_tile: Option<usize>, base: impl Fn(Buffer, Buffer, usize) -> Result<()>, mut stamp: impl FnMut(usize, HeadStage) -> Result<()>) -> Result<Buffer> {
         let c=&self.config.transformer;let lib=self.stream.device.library;let stream=self.stream.raw;
         ensure!(sequences>0 && sequences<=self.layout.sequences,"recurrent head live sequences exceed admission");

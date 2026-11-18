@@ -356,7 +356,10 @@ impl<'a> Backend<'a> for InklingBackend<'a> {
             let rows=selected.iter().map(|(_,anchor,s)|crate::shared::speculation::dflash::DraftSeq{
                 slot:s.placement.slot,anchor:*anchor,position:s.placement.len,valid_from:0}).collect::<Vec<_>>();
             let proposed=draft.drafter.draft(&rows,execution.target.operand("model.llm.embed.weight")?.buffer,
-                execution.target.operand("model.llm.embed_norm.weight")?.buffer,execution.target.operand("model.llm.unembed.weight")?.buffer)?;
+                execution.target.operand("model.llm.embed_norm.weight")?.buffer,|sequences, anchors| {
+                    draft.select(&execution.head,&execution.kernels,execution.target.projection("model.llm.unembed.weight")?,
+                        sequences,anchors)
+                })?;
             for ((index,_,s),tokens) in selected.into_iter().zip(proposed){output[first+index]=tokens.tokens.into_iter().take(s.depth).collect();}
         }
         timing.steps+=1;timing.seconds+=start.elapsed().as_secs_f64();Ok(output)

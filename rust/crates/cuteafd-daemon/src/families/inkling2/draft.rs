@@ -1,6 +1,6 @@
 //! Inkling binding of shared recurrent speculation, exact local marks and FIR
 //! verifier storage. No scheduling, sampling policy or private exchange here.
-use super::{draft_taps::TapBuffer,verify::Verify};
+use super::{draft_taps::TapBuffer,head::Head,layers::Kernels,verify::Verify,weights::ProjectionWeight};
 use crate::shared::{memory::device::Stream,speculation::{recurrent::Drafter,recurrent_forward::{Rank,ProgramsForRank},
     recurrent_weights::Weights,recurrent_cache::{ContextBank,ContextState},recurrent_snapshots::Marks}};
 use anyhow::{ensure,Context,Result};
@@ -36,7 +36,8 @@ impl crate::shared::prefix::cuda_copy::SnapshotOwner for Binding<'_>{
 }
 impl<'a> Binding<'a>{
     pub fn new(programs:&'a Programs<'a>,stream:Rc<Stream<'a>>,weights:Weights<'a>,layout:DraftLayout,
-        admitted:&ResolvedPlan,target_head:Buffer,prefill_rows:usize,waves:usize,mark_slots:usize)->Result<Self>{
+        admitted:&ResolvedPlan,target_head:ProjectionWeight<'_, 'a>,head:&Head<'a>,target_kernels:&Kernels<'a>,
+        prefill_rows:usize,waves:usize,mark_slots:usize)->Result<Self>{
         ensure!(layout.weights.len()==1 && layout.runtime.len()==1,"Inkling target binding currently runs whole rank");
         let runtime=&layout.runtime[0];
         let check=|id:&str,bytes:usize|->Result<()>{
@@ -49,7 +50,16 @@ impl<'a> Binding<'a>{
         if mark_slots>0{check("inkling2.draft.0.marks",runtime.window_mark_bytes*mark_slots)?;}
         let kernels=ProgramsForRank::load(programs,&weights,&layout.config,runtime,stream.device)?;
         let rank=Rank::allocate(weights,Rc::clone(&stream),layout.config.clone(),runtime.clone(),kernels)?;
-        rank.initialize_derived()?;rank.fold_head(target_head)?;
+        rank.initialize_derived()?;
+        match target_head {
+            ProjectionWeight::Bf16(w) => rank.fold_head(w.buffer)?,
+            weight => {
+                let (stored, stage, transpose) = head.compact_stages()?;
+                let h = rank.config.transformer.hidden;
+                rank.fold_compact_head(programs, stored, stage, transpose, |input, output, rows|
+                    target_kernels.project_compact(&stream, input, weight, output, rows, h, stored))?;
+            }
+        }
         let context=ContextBank{state:RefCell::new(ContextState::new(runtime.slots,
             usize::try_from(admitted.served_context())?,runtime.cache.target_tokens,0x494e4b4d5450)?)};
         let drafter=Rc::new(Drafter::whole(rank,context)?);
@@ -60,6 +70,27 @@ impl<'a> Binding<'a>{
         stream.drain()?;
         Ok(Self{drafter,marks,verify,prefill,decode,layout})
     }
+    pub fn select(&self, head:&Head<'a>, kernels:&Kernels<'a>, weight:ProjectionWeight<'_, 'a>,
+        sequences:usize, anchors:Buffer) -> Result<Buffer> {
+        let rank=&self.drafter.lead;
+        if let ProjectionWeight::Bf16(w)=weight { return rank.recurrent_tokens(sequences,anchors,w.buffer); }
+        let (stored, stage, narrowed)=head.compact_stages()?;
+        let (h,n)=(rank.config.transformer.hidden,rank.config.padded_vocab);
+        let stream=&rank.stream;
+        let lib=stream.device.library;
+        rank.recurrent_tokens_measured(sequences,anchors,Some(64),|input,output,rows| {
+            ensure!(n<=stored && rows*stored*2<=narrowed.bytes && rows*n*2<=output.bytes,
+                "compact recurrent head staging extent");
+            kernels.project_compact(stream,input,weight,stage,rows,h,stored)?;
+            // SAFETY: these idle verifier stages are disjoint and exclusively
+            // borrowed on the same ordered stream; only physical padding is removed.
+            unsafe {
+                kernels.narrow.launch(stage.ptr,narrowed.ptr,rows*stored,stream.raw)?;
+                lib.copy_d2d_2d_async(output,n*2,narrowed,stored*2,n*2,rows,stream.raw)
+            }
+        },|_,_|Ok(()))
+    }
+
     pub fn taps(&self,decode:bool,unit:usize)->Result<&TapBuffer<'a>>{
         if decode{Ok(&self.decode)}else{self.prefill.get(unit).context("drafter prefill tap unit outside admission")}
     }

@@ -37,6 +37,12 @@ impl<'a> Head<'a> {
         } else { None };
         Ok(Self { stream, bf16_head, tokens, normalized, logits, compact_logits, rows })
     }
+    /// The recurrent head borrows the verifier's idle, same-stream stages.
+    pub(super) fn compact_stages(&self) -> Result<(usize, Buffer, Buffer)> {
+        let (stored, stage) = self.compact_logits.as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Inkling compact head scratch missing"))?;
+        Ok((*stored, stage.buffer, self.logits.buffer))
+    }
     pub fn inventory(&self, inventory: &mut crate::shared::memory::receipts::Inventory<'_>, prefix: &str) -> Result<()> {
         for (name, owner) in [("tokens", &self.tokens), ("normalized", &self.normalized),
             ("logits", &self.logits)] {

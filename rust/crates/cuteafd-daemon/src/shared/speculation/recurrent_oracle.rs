@@ -154,7 +154,66 @@ fn installed_inkling_recurrent_head_baseline() -> Result<()> {
         ProjectionWeight::Trellis(w) => w.payload.buffer.bytes + w.suh.buffer.bytes + w.svh.buffer.bytes,
         ProjectionWeight::Fp8(w) => w.values.buffer.bytes + w.scales.buffer.bytes,
     };
-    for rows in [1, 4, 16, 64] {
+    if mode != CoreView::Original && std::env::var_os("CUTEAFD_TEST_WIDE_HEAD").is_some() {
+        use cuteafd_ffi::{draft_projection::ProjectionOutput, native_attention::Fp8Projections};
+        use crate::shared::dense_trellis::{Projection, ProjectionLayout};
+        use cuteafd_ffi::dense_trellis::{DenseTrellisDispatch, DenseTrellisPolicy, TrellisDType};
+        let live = 448;
+        let input = Allocation::new(device, live*h*2, Tag::drafter_workspace("head-screen/input"))?;
+        let data = (0..live*h).flat_map(|i| [0x3b80u16, 0xbb80, 0x3c00, 0xbc00][(i ^ (i >> 6)) % 4].to_le_bytes())
+            .collect::<Vec<_>>();
+        library.copy_h2d(input.buffer, &data)?;
+        let output = Allocation::new(device, live*stored*4, Tag::drafter_workspace("head-screen/output"))?;
+        let (mut trellis, mut fp8) = (None, None);
+        match head()? {
+            ProjectionWeight::Trellis(w) => {
+                let mut policy = DenseTrellisPolicy::from_package_geometry_bits(&programs, h, stored, 1, w.bits, "mcg")?;
+                policy.output_program = format!("dense_trellis_k6_trellis_output_n{stored}_f32");
+                let projection = Projection { program: DenseTrellisDispatch::load(&programs, policy, live, TrellisDType::F32)? };
+                let scratch = ProjectionLayout::new(&projection.program, live)?.allocate_packed(device, Tag::drafter_workspace("head-screen/trellis"))?;
+                trellis = Some((projection, scratch));
+            }
+            ProjectionWeight::Fp8(_) => {
+                let fp8_kernel = Fp8Projections::load(&programs, &[(h, stored)], live, ProjectionOutput::F32)?;
+                let scratch = Allocation::new(device, fp8_kernel.scratch_bytes(h, stored)?, Tag::drafter_workspace("head-screen/fp8"))?;
+                fp8 = Some((fp8_kernel, scratch));
+            }
+            ProjectionWeight::Bf16(_) => unreachable!(),
+        }
+        for rows in [7, 14, 28, 56, 64, 112, 224, 448] {
+            let project = || -> Result<()> {
+                match head()? {
+                    ProjectionWeight::Trellis(w) => {
+                        let (projection, scratch) = trellis.as_ref().unwrap();
+                        projection.local(rows, input.buffer, w, scratch, output.buffer, stream.raw)?;
+                    }
+                    ProjectionWeight::Fp8(w) if rows<=64 => {
+                        kernels.project_compact(&stream, input.buffer, ProjectionWeight::Fp8(w), output.buffer, rows, h, stored)?;
+                    }
+                    ProjectionWeight::Fp8(w) => {
+                        let (project, scratch) = fp8.as_ref().unwrap();
+                        // SAFETY: all active views are checked for this retained, same-stream projection.
+                        unsafe { project.launch(input.buffer.ptr, w.values.buffer.ptr, w.scales.buffer.ptr,
+                            output.buffer, scratch.buffer, rows, h, stored, stream.raw)?; }
+                    }
+                    ProjectionWeight::Bf16(_) => unreachable!(),
+                }
+                Ok(())
+            };
+            project()?;
+            let mut start = Event::timing(device)?;
+            let mut end = Event::timing(device)?;
+            start.record(&stream)?;
+            for _ in 0..64 { project()?; }
+            end.record(&stream)?;
+            stream.drain()?;
+            // SAFETY: both events were recorded and drained on the same stream.
+            let us = f64::from(unsafe { library.cuda_event_elapsed_ms(start.raw, end.raw)? }) * 1000.0 / 64.0;
+            eprintln!("RECURRENT_HEAD_WIDTH {}", serde_json::json!({"view": mode.name(), "rows": rows,
+                "base_us": us, "roof_us": head_bytes as f64 / 1_792_000.0}));
+        }
+    }
+    for rows in [1, 4, 8, 16, 64] {
         let base = |hidden: Buffer, output: Buffer, rows: usize| -> Result<()> {
             let weight = head()?;
             if let ProjectionWeight::Bf16(w) = weight {
