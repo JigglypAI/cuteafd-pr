@@ -95,7 +95,7 @@ impl<'a> InklingBackend<'a> {
         let vocab = execution.cfg.unpadded_vocab_size;
         let selector = plan.facts.allocations.iter().filter(|owner| owner.id.starts_with("selector.")).cloned().collect::<Vec<_>>();
         ensure!(!selector.is_empty(), "Inkling selector was not admitted before startup");
-        let family=InklingPrefix::with_draft(cache,execution.draft.clone());
+        let family=InklingPrefix::for_execution(&execution);
         Ok(Self { execution: RefCell::new(execution), family, library,
             context, concurrency, unit_rows, waves, vocab, host, profile: RefCell::new([0.; 2]),
             pending: RefCell::new(None), selector, vision: None, selector_ready: std::cell::Cell::new(false) })
@@ -397,7 +397,7 @@ impl<'a> Backend<'a> for InklingBackend<'a> {
     fn cancel(&self,_:&Placement)->Result<()>{
         let execution=self.execution.borrow();
         if let Some(Pending::Spec{mark,..})=self.pending.borrow_mut().take(){
-            execution.draft.as_ref().context("cancelled draft missing")?.verify.restore(&mark.conv,execution.requests.cache.conv_backing())?;
+            execution.restore_verify(&mark)?;
         }
         execution.requests.cache.drain()?;Ok(())
     }

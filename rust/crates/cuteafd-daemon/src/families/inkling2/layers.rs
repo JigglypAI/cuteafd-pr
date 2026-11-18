@@ -20,6 +20,7 @@ pub(crate) struct Kernels<'a> {
     local_decode: Attention<'a>,
     global_decode: Attention<'a>,
     kv_format: cuteafd_loader::families::inkling2::InklingKvCache,
+    head_parts: usize,
     producers: BTreeMap<String, Producer<'a>>,
     strided: BTreeMap<(usize, bool), cuteafd_ffi::fir_strided::Convolution<'a>>,
     replay: BTreeMap<(usize, bool), cuteafd_ffi::fir_replay::Convolution<'a>>,
@@ -92,9 +93,16 @@ impl<'a> CompactProjections<'a> {
 
 impl<'a> Kernels<'a> {
     pub fn bind(programs: &'a Programs<'a>, kv_format: cuteafd_loader::families::inkling2::InklingKvCache) -> Result<Self> {
+        Self::bind_rank(programs, kv_format, 1)
+    }
+    pub fn bind_rank(programs: &'a Programs<'a>, kv_format: cuteafd_loader::families::inkling2::InklingKvCache,
+        head_parts: usize) -> Result<Self> {
+        ensure!(matches!(head_parts, 1 | 2), "Inkling kernel head partition differs");
+        let kv = 1024 / head_parts;
+        let fir = [(4608, false), (kv, false), (kv, true)];
         let mut ops = Vec::new();
         for precision in [Precision::Bf16, Precision::F32] {
-            for (width, dynamic) in [(4608, false), (1024, false), (1024, true)] {
+            for (width, dynamic) in fir {
                 ops.push(Op::Convolution { width, dynamic, precision });
             }
             for (relative, key, global) in [(false, false, false), (false, true, false),
@@ -113,32 +121,32 @@ impl<'a> Kernels<'a> {
         }
         ops.push(Op::Router);
         let mut producers = BTreeMap::new();
-        for op in ops { producers.insert(op.name()?, Producer::load(programs, op)?); }
+        for op in ops { producers.insert(op.rank_name(head_parts)?, Producer::load_rank(programs, op, head_parts)?); }
         let quant = programs.program("inkling2_expert_input_quant", &["source_ptr", "values_ptr", "scale_rows_ptr", "scale_mma_ptr"])?;
         let spec = quant.spec();
         ensure!(spec.capacity_rows == 4096 && spec.scalar_kinds == b"ii" && spec.scratch.is_empty()
             && spec.geometry["hidden"] == 4608 && spec.geometry["row_bytes"] == 4752
             && spec.geometry["amax_floor"] == 0.0 && spec.geometry["expected_m"] == 80,
             "Inkling wire quantizer ABI/geometry/floor differs");
-        let strided = [(4608, false), (1024, false), (1024, true)].into_iter().map(|geometry|
+        let strided = fir.into_iter().map(|geometry|
             Ok((geometry, cuteafd_ffi::fir_strided::Convolution::load(programs, geometry.0, geometry.1)?)))
             .collect::<Result<BTreeMap<_, _>>>()?;
-        let replay = [(4608, false), (1024, false), (1024, true)].into_iter().map(|geometry|
+        let replay = fir.into_iter().map(|geometry|
             Ok((geometry, cuteafd_ffi::fir_replay::Convolution::load(programs, geometry.0, geometry.1)?)))
             .collect::<Result<BTreeMap<_, _>>>()?;
         Ok(Self { projections: DraftProjections::load_with_output(programs, &[
-            (4608, 6144), (4608, 768), (4608, 1024), (4608, 48), (4608, 32),
-            (4608, 384), (6144, 4608), (64, 1024)], 4096, ProjectionOutput::F32)?,
-            local: Attention::load(programs, Kind::Local, Route::Prefill, false)?,
-            global: Attention::load(programs, Kind::Global, Route::Prefill, kv_format == cuteafd_loader::families::inkling2::InklingKvCache::Fp8)?,
-            local_decode: Attention::load(programs, Kind::Local, Route::Decode, false)?,
-            global_decode: Attention::load(programs, Kind::Global, Route::Decode, kv_format == cuteafd_loader::families::inkling2::InklingKvCache::Fp8)?, kv_format,
+            (4608, 6144 / head_parts), (4608, 768 / head_parts), (4608, kv),
+            (4608, 48 / head_parts), (4608, 32 / head_parts), (4608, 384), (6144 / head_parts, 4608), (64, 1024)], 4096, ProjectionOutput::F32)?,
+            local: Attention::load_rank(programs, Kind::Local, Route::Prefill, false, head_parts)?,
+            global: Attention::load_rank(programs, Kind::Global, Route::Prefill, kv_format == cuteafd_loader::families::inkling2::InklingKvCache::Fp8, head_parts)?,
+            local_decode: Attention::load_rank(programs, Kind::Local, Route::Decode, false, head_parts)?,
+            global_decode: Attention::load_rank(programs, Kind::Global, Route::Decode, kv_format == cuteafd_loader::families::inkling2::InklingKvCache::Fp8, head_parts)?, kv_format, head_parts,
             add: programs.library().f32_add()?, narrow: programs.library().f32_bf16_narrow()?,
             quant, compact: None,
             sms: programs.library().sm_count()? as usize, producers, strided, replay })
     }
     fn producer(&self, op: Op) -> Result<&Producer<'a>> {
-        self.producers.get(&op.name()?).context("Inkling producer not bound at startup")
+        self.producers.get(&op.rank_name(self.head_parts)?).context("Inkling producer not bound at startup")
     }
     pub fn norm(&self, owner: &impl UnitBuffers<'a>, input: Buffer, weight: Buffer, output: Buffer,
         value: bool, precision: Precision, rows: usize) -> Result<()> {
@@ -289,16 +297,21 @@ fn slice(buffer: Buffer, offset: usize, bytes: usize) -> Result<Buffer> {
 
 /// Cold one-sequence attention: every cache row is produced before the native
 /// ring/paged attention program, without host synchronization on the layer path.
-pub(crate) fn attention<'a>(k: &Kernels<'a>, owner: &impl UnitBuffers<'a>, target: &TargetWeights<'_>,
+pub(crate) fn attend_heads<'a>(k: &Kernels<'a>, owner: &impl UnitBuffers<'a>, target: &TargetWeights<'_>,
     cfg: &Inkling2Config, layer: usize, rows: usize, input: Buffer) -> Result<()> {
+    ensure!(k.head_parts == owner.layout().head_parts, "Inkling attention owner head partition differs");
+    let heads = cfg.heads / k.head_parts;
+    let q_width = heads * cfg.head_dim;
+    let kv_width = cfg.kv_heads / k.head_parts * cfg.head_dim;
+    let rel_width = heads * cfg.d_rel;
     let local = cfg.local[layer];
     let prefix = format!("model.llm.layers.{layer}");
     let weight = |name: &str| -> Result<Buffer> { Ok(target.operand(&format!("{prefix}.{name}"))?.buffer) };
     let b = |name: &str| owner.buffer(name);
     let norm = if local { "attn_norm.weight" } else { "q_input_norm.weight" };
     k.norm(owner, input, weight(norm)?, b("projection_input")?, false, Precision::Bf16, rows)?;
-    for (name, out, n) in [("wq_du", "q", 6144), ("wr_du", "r", 768),
-        ("gate_attn", "gate", 6144), ("attn_sink_proj", "sinks", 48)] {
+    for (name, out, n) in [("wq_du", "q", q_width), ("wr_du", "r", rel_width),
+        ("gate_attn", "gate", q_width), ("attn_sink_proj", "sinks", heads)] {
         k.project_target(owner, b("projection_input")?, target.projection(&format!("{prefix}.attn.{name}.weight"))?, b(out)?, rows, 4608, n)?;
     }
     for (branch, proj, out, convolved, history) in [("k", "wk_dv", "k", "conv_k", "k_conv_history"),
@@ -309,15 +322,15 @@ pub(crate) fn attention<'a>(k: &Kernels<'a>, owner: &impl UnitBuffers<'a>, targe
             k.norm(owner, mixed, weight(&format!("{branch}_input_norm.weight"))?, b("projection_input")?,
                 false, Precision::Bf16, rows)?;
         }
-        k.project_target(owner, b("projection_input")?, target.projection(&format!("{prefix}.attn.{proj}.weight"))?, b(out)?, rows, 4608, 1024)?;
+        k.project_target(owner, b("projection_input")?, target.projection(&format!("{prefix}.attn.{proj}.weight"))?, b(out)?, rows, 4608, kv_width)?;
         let dynamic = if local { b(out)? } else {
             let name = format!("{branch}_dynamic");
             k.project(owner, b("projection_input")?, weight(&format!("attn.{branch}_sconv.weight_proj"))?,
-                b(&name)?, rows, 4608, 32)?;
+                b(&name)?, rows, 4608, cfg.kv_heads / k.head_parts * cfg.sconv_kernel)?;
             b(&name)?
         };
         k.convolution(owner, b(out)?, weight(&format!("attn.{branch}_sconv.{}", if local { "weight" } else { "static_w" }))?,
-            dynamic, b(convolved)?, history, 1024, !local, rows)?;
+            dynamic, b(convolved)?, history, kv_width, !local, rows)?;
     }
     for (name, source, output, relative, key) in [("q", "q", "q_clipped", false, false),
         ("r", "r", "r_clipped", true, false), ("k", "conv_k", "k_clipped", false, true)] {
@@ -332,39 +345,61 @@ pub(crate) fn attention<'a>(k: &Kernels<'a>, owner: &impl UnitBuffers<'a>, targe
     // SAFETY: retained unit owns disjoint source/destination planes. The padded
     // relative row starts zero and only its logical16 columns are overwritten.
     unsafe {
-        k.narrow.launch(b("q_clipped")?.ptr, b("q_bf16")?.ptr, rows*6144, owner.stream().raw)?;
-        k.narrow.launch(b("r_clipped")?.ptr, b("relative_source")?.ptr, rows*768, owner.stream().raw)?;
-        l.cuda_zero_bytes_async(b("relative_input")?, rows*48*64*2, owner.stream().raw)?;
+        k.narrow.launch(b("q_clipped")?.ptr, b("q_bf16")?.ptr, rows*q_width, owner.stream().raw)?;
+        k.narrow.launch(b("r_clipped")?.ptr, b("relative_source")?.ptr, rows*rel_width, owner.stream().raw)?;
+        l.cuda_zero_bytes_async(b("relative_input")?, rows*heads*64*2, owner.stream().raw)?;
         // Disjoint source and destination; columns16..63 stay exact zero.
-        l.copy_d2d_2d_async(b("relative_input")?, 64*2, b("relative_source")?, 16*2, 16*2, rows*48, owner.stream().raw)?;
+        l.copy_d2d_2d_async(b("relative_input")?, 64*2, b("relative_source")?, 16*2, 16*2, rows*heads, owner.stream().raw)?;
     }
-    // A token contributes48 independent head rows. Bound each projection call
+    // A token contributes one independent relative row per local head. Bound each projection call
     // by its4096-row export without changing the ordered-K16 reduction.
     let mut first = 0;
-    while first < rows*48 {
-        let count = (rows*48-first).min(4096);
+    while first < rows*heads {
+        let count = (rows*heads-first).min(4096);
         k.project(owner, slice(b("relative_input")?, first*64*2, count*64*2)?,
             weight("attn.rel_logits_proj.padded")?, slice(b("relative_f32")?, first*1024*4, count*1024*4)?,
             count, 64, 1024)?;
         first += count;
     }
     // SAFETY: retained F32 relative biases narrow into the whole-unit BF16 plane.
-    unsafe { k.narrow.launch(b("relative_f32")?.ptr, b("relative")?.ptr, rows*48*1024, owner.stream().raw)?; }
+    unsafe { k.narrow.launch(b("relative_f32")?.ptr, b("relative")?.ptr, rows*heads*1024, owner.stream().raw)?; }
     attention_cache(k, owner, cfg, layer, rows)?;
+    Ok(())
+}
+
+/// Fixed-shape private epilogue: no cache, metadata, or peer operands.
+pub(crate) fn project_heads<'a>(k: &Kernels<'a>, owner: &impl UnitBuffers<'a>, target: &TargetWeights<'_>,
+    cfg: &Inkling2Config, layer: usize, rows: usize) -> Result<()> {
+    let q_width = cfg.heads / k.head_parts * cfg.head_dim;
+    let b = |name: &str| owner.buffer(name);
+    let l = owner.stream().device.library;
     // F32 gate producer consumes F32 attended values. Widen BF16 through a
     // zeroed F32 destination before gating; no host data path.
-    // SAFETY: q has6144 F32 values per row and is no longer read by attention;
+    // SAFETY: q holds the local heads and is no longer read by attention;
     // it is safely reused as widened attention scratch on the same stream.
     unsafe {
-        l.cuda_zero_bytes_async(b("q")?, rows*6144*4, owner.stream().raw)?;
-        l.cuda_accumulate_bf16_to_f32_async(b("attended")?, b("q")?, rows*6144, owner.stream().raw)?;
+        l.cuda_zero_bytes_async(b("q")?, rows*q_width*4, owner.stream().raw)?;
+        l.cuda_accumulate_bf16_to_f32_async(b("attended")?, b("q")?, rows*q_width, owner.stream().raw)?;
         k.producer(Op::Gate { situ: false, precision: Precision::F32 })?.launch(&[b("q")?, b("gate")?, b("gate")?,
             b("q_clipped")?], rows, None, owner.stream().raw)?;
-        k.narrow.launch(b("q_clipped")?.ptr, b("gated")?.ptr, rows*6144, owner.stream().raw)?;
+        k.narrow.launch(b("q_clipped")?.ptr, b("gated")?.ptr, rows*q_width, owner.stream().raw)?;
     }
-    k.project_target(owner, b("gated")?, target.projection(&format!("{prefix}.attn.wo_ud.weight"))?, b("branch")?, rows, 6144, 4608)?;
-    k.convolution(owner, b("branch")?, weight("attn_sconv.weight")?, b("branch")?, b("attention")?,
-        "attn_conv_history", 4608, false, rows)
+    k.project_target(owner, b("gated")?, target.projection(&format!("model.llm.layers.{layer}.attn.wo_ud.weight"))?, b("branch")?, rows, q_width, cfg.hidden)
+}
+
+pub(crate) fn finish_attention<'a>(k: &Kernels<'a>, owner: &impl UnitBuffers<'a>, target: &TargetWeights<'_>,
+    cfg: &Inkling2Config, layer: usize, rows: usize, projected: Buffer) -> Result<()> {
+    let weight = target.operand(&format!("model.llm.layers.{layer}.attn_sconv.weight"))?.buffer;
+    k.convolution(owner, projected, weight, projected, owner.buffer("attention")?,
+        "attn_conv_history", cfg.hidden, false, rows)
+}
+
+pub(crate) fn attention<'a>(k: &Kernels<'a>, owner: &impl UnitBuffers<'a>, target: &TargetWeights<'_>,
+    cfg: &Inkling2Config, layer: usize, rows: usize, input: Buffer) -> Result<()> {
+    ensure!(k.head_parts == 1, "Inkling split attention needs F32 reduction before FIR");
+    attend_heads(k, owner, target, cfg, layer, rows, input)?;
+    project_heads(k, owner, target, cfg, layer, rows)?;
+    finish_attention(k, owner, target, cfg, layer, rows, owner.buffer("branch")?)
 }
 
 fn attention_cache<'a>(k: &Kernels<'a>, owner: &impl UnitBuffers<'a>, cfg: &Inkling2Config,
@@ -381,7 +416,7 @@ fn attention_cache<'a>(k: &Kernels<'a>, owner: &impl UnitBuffers<'a>, cfg: &Inkl
     let (tiles, tables, table_width, ring_stride_records) = if let Some((unit, cache, _, members)) = owner.packed() {
         (members.iter().map(|member| member.rows.len().div_ceil(tile_rows)).sum(),
             members.len(), unit.layout.buffers["page_table"]/(cache.layout.sequences*4),
-            cache.layout.ring_sequence_bytes/4096)
+            cache.layout.ring_stride_records())
     } else { (rows.div_ceil(10), 1, owner.layout().buffers["page_table"]/4, 1088) };
     let batch = Batch { rows, tiles, tile_rows: b("tile_rows")?, q: b("q_bf16")?, kv: if local { b("kv_step")? } else { b("global_cache")? },
         positions: b("positions")?, relative: b("relative")?, sinks: b("sinks")?, output: b("attended")?, scratch: b("attention_scratch")? };
@@ -391,25 +426,36 @@ fn attention_cache<'a>(k: &Kernels<'a>, owner: &impl UnitBuffers<'a>, cfg: &Inkl
     } else {
         let attention=if decode{&k.global_decode}else{&k.global};
         attention.global(batch, Global {
-            pages: b("global_cache")?.bytes/(64*k.kv_format.record_bytes(cfg.kv_heads, cfg.head_dim)), page_table: b("page_table")?,
+            pages: b("global_cache")?.bytes/(64*k.kv_format.record_bytes(cfg.kv_heads / k.head_parts, cfg.head_dim)), page_table: b("page_table")?,
             table_width, tables, table_indices: b("table_indices")?, first: b("first")?, splits: 1 }, owner.stream().raw)
     }
 }
 
 /// Complete layer over a cold, contiguous one-sequence unit. Embedding and
 /// completed six-layer block values remain F32 throughout residual mixing.
+pub(crate) fn mix_attention_input<'a>(k: &Kernels<'a>, owner: &impl UnitBuffers<'a>, target: &TargetWeights<'_>,
+    cfg: &Inkling2Config, index: usize, rows: usize) -> Result<Buffer> {
+    let partial = owner.buffer("partial")?;
+    if index == 0 { return Ok(partial); }
+    let site = residual_site(cfg, index)?;
+    let query = target.operand(&format!("model.llm.attn_res.attn_queries.{}", index-1))?.buffer;
+    let output = owner.buffer(if site.queries == 3 { "global_mixes" } else { "mixed" })?;
+    k.residual(owner, query, partial, output, rows, site.queries, site.attention_candidates, false)?;
+    slice(output, 0, rows*cfg.hidden*4)
+}
+
 pub(crate) fn begin_layer<'a>(k: &Kernels<'a>, owner: &impl UnitBuffers<'a>, target: &TargetWeights<'_>,
+    cfg: &Inkling2Config, index: usize, rows: usize) -> Result<()> {
+    let input = mix_attention_input(k, owner, target, cfg, index, rows)?;
+    attention(k, owner, target, cfg, index, rows, input)?;
+    prepare_ffn_input(k, owner, target, cfg, index, rows)
+}
+
+pub(crate) fn prepare_ffn_input<'a>(k: &Kernels<'a>, owner: &impl UnitBuffers<'a>, target: &TargetWeights<'_>,
     cfg: &Inkling2Config, index: usize, rows: usize) -> Result<()> {
     let site = residual_site(cfg, index)?;
     let b = |name: &str| owner.buffer(name);
     let partial = b("partial")?;
-    let input = if index == 0 { partial } else {
-        let query = target.operand(&format!("model.llm.attn_res.attn_queries.{}", index-1))?.buffer;
-        let output = if site.queries == 3 { b("global_mixes")? } else { b("mixed")? };
-        k.residual(owner, query, partial, output, rows, site.queries, site.attention_candidates, false)?;
-        slice(output, 0, rows*cfg.hidden*4)?
-    };
-    attention(k, owner, target, cfg, index, rows, input)?;
     let library = owner.stream().device.library;
     let stride = owner.layout().rows*cfg.hidden*4;
     let arena = b("residual_arena")?;

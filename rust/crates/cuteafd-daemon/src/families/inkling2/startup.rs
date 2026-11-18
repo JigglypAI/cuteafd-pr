@@ -5,7 +5,7 @@ use crate::shared::{inventory::{InventoryPhase, RuntimeInventory}, prefix::{budg
 use anyhow::{ensure, Context, Result};
 use cuteafd_api::openai::{chat::inkling2::InklingEncoding, ModelEncoding};
 use cuteafd_ffi::{programs::Programs, NativeLibrary};
-use cuteafd_loader::{families::inkling2::{admission::{gather_with_weights, Coordinator, FactsRequest, SelectedWeights}, Inkling2Config},
+use cuteafd_loader::{families::inkling2::{admission::{check_core_view_ranks, gather_with_weights, Coordinator, FactsRequest, SelectedWeights}, Inkling2Config},
     placement::{families::inkling2::{self, AdmittedInkling, InklingInputs}, planner::PrefillShape,
         AttentionPlacement, Onboard, ResidentWeights}, plan::Checkpoint};
 use std::{net::SocketAddr, path::Path, sync::Arc};
@@ -13,6 +13,7 @@ use std::{net::SocketAddr, path::Path, sync::Arc};
 #[derive(Clone, Copy)]
 pub(crate) struct Options<'a> {
     pub device: i32,
+    pub split_device: Option<i32>,
     pub peers: &'a [SocketAddr],
     pub manifest: &'a Path,
     pub native_lib: &'a Path,
@@ -32,7 +33,7 @@ pub(crate) struct Options<'a> {
 /// Prepared owner facts, not readiness. No target/cache/transport allocation
 /// escapes this edge, and no measured sample is taken after loading weights.
 pub(crate) struct Prepared<'a> {
-    pub kernels: Kernels<'a>,
+    pub kernels: Vec<Kernels<'a>>,
     pub encoding: ModelEncoding,
     pub eos: Vec<u32>,
     pub inputs: InklingInputs,
@@ -45,7 +46,7 @@ pub(crate) struct Prepared<'a> {
 
 fn validate(options: &Options<'_>, cfg: &Inkling2Config) -> Result<()> {
     ensure!(options.device >= 0 && (2..=8).contains(&options.peers.len()),
-        "Inkling initial distributed startup requires one coordinator GPU and 2..8 Spark endpoints");
+        "Inkling distributed startup requires 2..8 Spark endpoints");
     ensure!(options.peers.iter().collect::<std::collections::BTreeSet<_>>().len() == options.peers.len(),
         "Inkling Spark endpoints must be distinct");
     cuteafd_core::concurrency::validate("inkling2", options.sequences)?;
@@ -63,6 +64,7 @@ fn validate(options: &Options<'_>, cfg: &Inkling2Config) -> Result<()> {
 pub(crate) fn prepare<'a>(library: &'a NativeLibrary, programs: &'a Programs<'a>, checkpoint: &Checkpoint,
     cfg: &Inkling2Config, options: Options<'_>) -> Result<Prepared<'a>> {
     validate(&options, cfg)?;
+    check_core_view_ranks(checkpoint.core_view(), 1 + usize::from(options.split_device.is_some()))?;
     cfg.release_geometry()?;
     // Checkpoint-native chat resolution happens before CUDA or target loading.
     let encoding = ModelEncoding::Inkling(Arc::new(InklingEncoding::from_snapshot(&checkpoint.snapshot)?));
@@ -75,36 +77,47 @@ pub(crate) fn prepare<'a>(library: &'a NativeLibrary, programs: &'a Programs<'a>
         None => cuteafd_loader::read_expert_catalog(&checkpoint.snapshot)?,
     };
     let manifest = Arc::new(serde_json::from_slice(&std::fs::read(options.manifest)?)?);
-    let selected_weights = SelectedWeights::new(checkpoint, cfg, 1, AttentionPlacement::Heads, options.drafter.is_some())?;
-    let compact_programs = selected_weights.compact_programs(&manifest, 0, options.prefill.rows.max(64) as usize)?;
     let mut module_pins = Vec::new();
     let mut exl3_modules = Vec::new();
-    let mut kernels = None;
-    let runtime = RuntimeInventory::measure(library, &[options.device], InventoryPhase::PreWeight, |_| {
+    let peers = options.split_device.map(|peer| {
+        crate::shared::peer_split::probed_device(library, options.device, Some(peer))?.context("Inkling heads split requires bidirectional GPU peer access")
+    }).transpose()?;
+    let devices = std::iter::once(options.device).chain(peers).collect::<Vec<_>>();
+    let gpus = devices.len();
+    let selected_weights = SelectedWeights::new(checkpoint, cfg, gpus, AttentionPlacement::Heads, options.drafter.is_some())?;
+    let compact_programs = (0..gpus).map(|rank|
+        selected_weights.compact_programs(&manifest, rank, options.prefill.rows.max(64) as usize))
+        .collect::<Result<Vec<_>>>()?;
+    let mut kernels = Vec::with_capacity(gpus);
+    let runtime = RuntimeInventory::measure(library, &devices, InventoryPhase::PreWeight, |id| {
         // Static load finish is explicitly checked before any push owner exists.
         // Missing pin/export is a named startup error, never a host fallback.
         programs.program("inkling2_padded_transpose_bf16_r16_c1024_p64", &["source", "output"])?;
-        kernels = Some(Kernels::bind(programs, options.kv_format)?);
-        let (loaded, _) = programs.load_matching(|name| compact_programs.contains(name))?;
-        ensure!(loaded == compact_programs.len(), "Inkling compact pre-weight program inventory differs from manifest");
+        kernels.push(Kernels::bind_rank(programs, options.kv_format, gpus)?);
+        let rank = devices.iter().position(|&device| device == id).context("Inkling rank not in the prepared device list")?;
+        let names = &compact_programs[rank];
+        let (loaded, _) = programs.load_matching(|name| names.contains(name))?;
+        ensure!(loaded == names.len(), "Inkling compact pre-weight program inventory differs from manifest");
         if options.drafter.is_some(){
             programs.load_matching(|name|name.starts_with("inkling_draft_")||name.starts_with("draft_bf16_")||name=="fir_history_commit")?;
         }
         if let Some(tensors) = catalog.fp8() {
             let layers = (0..cfg.layers).collect::<Vec<_>>();
             for (view, _) in tensors.homogeneous_layers(&layers)? {
-                let directory = crate::shared::experts::fp8::package_directory(options.native_lib, 1, view.format());
+                let directory = crate::shared::experts::fp8::package_directory(options.native_lib, gpus, view.format());
                 // SAFETY: trusted installed static expert package; retained
                 // across sampling and final backend binding, no weight storage.
                 module_pins.push(unsafe { cuteafd_ffi::fp8_moe::Fp8MoeModule::load(&directory)? });
             }
         } else if catalog.exl3().is_some() {
             let directory = options.native_lib.parent().context("Inkling native library directory absent")?
-                .join("exl3/exl3-inkling2-k45/rtx-tp1");
-            exl3_modules = crate::shared::experts::rtx::exl3::Exl3Tp2::preload_whole_modules(
-                crate::shared::memory::device::Device { library, id: options.device }, &directory,
+                .join(format!("exl3/exl3-inkling2-k45/rtx-tp{gpus}"));
+            let preload = if gpus == 2 { crate::shared::experts::rtx::exl3::Exl3Tp2::preload_tp2_modules }
+                else { crate::shared::experts::rtx::exl3::Exl3Tp2::preload_whole_modules };
+            exl3_modules.extend(preload(
+                crate::shared::memory::device::Device { library, id }, &directory,
                 usize::try_from(options.prefill.rows.max(64))?, cuteafd_core::ExpertGeometry::INKLING2,
-                crate::shared::experts::rtx::RtxSelectionPolicy::CanonicalDecode)?;
+                crate::shared::experts::rtx::RtxSelectionPolicy::CanonicalDecode)?);
         }
         Ok(())
     })?;
@@ -119,7 +132,7 @@ pub(crate) fn prepare<'a>(library: &'a NativeLibrary, programs: &'a Programs<'a>
         vision_replicas: options.vision.vision_replicas,
         media_cache_bytes: options.vision.media_cache_bytes.map(|bytes| bytes.0 as u64), kv_format: options.kv_format, drafter: options.drafter.map(|kv_cache|cuteafd_loader::families::inkling2::draft::Selection{
         kv_cache,sms:library.sm_count().unwrap_or(1) as usize}), checkpoint, catalog: &catalog, cfg, manifest_path: Some(options.manifest), manifest: Some(manifest),
-        coordinator: Coordinator::Measured { samples, loaded_code: vec![0] }, attention: AttentionPlacement::Heads,
+        coordinator: Coordinator::Measured { samples, loaded_code: vec![0; gpus] }, attention: AttentionPlacement::Heads,
         spark_ranks: options.peers.len(), spark_bytes: cuteafd_loader::serving_capacity::spark_memory::runtime_bytes(&options.peers.iter().map(ToString::to_string).collect::<Vec<_>>())?.into_iter().max().unwrap_or(0),
         prefill: options.prefill, context_tokens: options.context_tokens, pool_tokens: options.pool_tokens,
         sequences: options.sequences, host, host_cache_bytes,
@@ -134,18 +147,21 @@ pub(crate) fn prepare<'a>(library: &'a NativeLibrary, programs: &'a Programs<'a>
     let admitted = inputs.admit(inkling2::request(inputs.context, options.pool_tokens, options.onboard,
         options.prefill, cuteafd_loader::placement::planner::Operation::Serving,
         inputs.resident_weight_limit, request.replies))?;
-    let baseline = admitted.solved.budgets.iter().find(|budget| budget.locations.contains(
-        &cuteafd_loader::placement::planner::Location::coordinator(0)))
-        .context("Inkling admission missing measured coordinator budget")?;
-    let sampled_free = runtime.gpus[0].free_bytes;
-    ensure!(matches!(baseline.baseline, cuteafd_loader::placement::planner::Baseline::Sampled { free, .. }
-        if free == sampled_free) && inputs.code[0] == 0, "Inkling admission must charge preloaded compact code in the sampled baseline exactly once");
-    tracing::info!(selected = compact_programs.len(), sampled_free, module_bytes = runtime.gpus[0].module_bytes,
-        "Inkling compact programs included in admitted pre-weight sample");
-    runtime.record("inkling2", &[sampled_free]);
+    let sampled_free = runtime.gpus.iter().map(|gpu| gpu.free_bytes).collect::<Vec<_>>();
+    for (rank, sample) in runtime.gpus.iter().enumerate() {
+        let baseline = admitted.solved.budgets.iter().find(|budget| budget.locations.contains(
+            &cuteafd_loader::placement::planner::Location::coordinator(rank as u8)))
+            .context("Inkling admission missing measured coordinator budget")?;
+        ensure!(matches!(baseline.baseline, cuteafd_loader::placement::planner::Baseline::Sampled { free, .. }
+            if free == sample.free_bytes) && inputs.code[rank] == 0,
+            "Inkling admission must charge preloaded compact code in rank {rank}'s sampled baseline exactly once");
+        tracing::info!(rank, selected = compact_programs[rank].len(), sampled_free = sample.free_bytes,
+            module_bytes = sample.module_bytes, "Inkling compact programs included in admitted pre-weight sample");
+    }
+    runtime.record("inkling2", &sampled_free);
     cuteafd_bench::context::ResolvedSettings::placement(&admitted.placement).publish();
     cuteafd_bench::context::set_resolved("max-context-tokens", &admitted.solved.served_context().to_string());
-    Ok(Prepared { kernels: kernels.context("Inkling kernel preload did not run")?, encoding, eos, inputs, admitted, runtime, module_pins, exl3_modules })
+    Ok(Prepared { kernels, encoding, eos, inputs, admitted, runtime, module_pins, exl3_modules })
 }
 
 /// Admitted grouped delivery entry, still not a public serving executor. The
@@ -154,8 +170,8 @@ pub(crate) fn prepare<'a>(library: &'a NativeLibrary, programs: &'a Programs<'a>
 pub(crate) fn deliver<'a>(library: &'a NativeLibrary,
     view: &cuteafd_loader::plan::checkpoint::CheckpointView, checkpoint: &Checkpoint,
     prepared: &Prepared<'a>, options: &Options<'_>, media: crate::shared::vision::push::Contribution)
-    -> Result<(super::weights::TargetWeights<'a>, Vec<Vec<crate::shared::experts::rtx::push::PushedExperts<'a>>>,
-        Option<crate::shared::speculation::recurrent_weights::Weights<'a>>)> {
+    -> Result<(Vec<super::weights::TargetWeights<'a>>, Vec<Vec<crate::shared::experts::rtx::push::PushedExperts<'a>>>,
+        Vec<crate::shared::speculation::recurrent_weights::Weights<'a>>)> {
     use crate::shared::{memory::device::Device, placement::{spark_rings, SparkAdmission}};
     use cuteafd_core::{ExpertGeometry, SparkEndpoint};
     use cuteafd_loader::placement::SparkWorkingSet;
@@ -177,15 +193,14 @@ pub(crate) fn deliver<'a>(library: &'a NativeLibrary,
         inkling2::spark_executions(inputs.prefill, catalog.exl3().is_some())?)?;
     let spark = SparkAdmission::plan_view(view, ExpertGeometry::INKLING2, Some(&catalog),
         &working, inputs.spark_ranks, model, None)?;
-    let (target, membership) = super::weights::PendingTarget::prepare(Device { library, id: options.device },
+    let devices = std::iter::once(options.device).chain(options.split_device).map(|id| Device { library, id }).collect();
+    let (target, membership) = super::weights::PendingTarget::prepare(devices,
         view, checkpoint, &catalog, inputs, admitted, media)?;
     let pending = spark.start_with(options.peers, Some(membership))?;
     target.finish(&catalog, pending)
 }
 
-/// Construct only the initial whole-rank execution after exact shared
-/// admission and required grouped delivery. The public scheduler/readiness
-/// edge is intentionally separate and remains unqualified until native gates.
+/// Construct the execution after exact shared admission and grouped delivery.
 pub(crate) fn whole<'a>(library: &'a Arc<NativeLibrary>, programs: &'a Programs<'a>,
     view: &cuteafd_loader::plan::checkpoint::CheckpointView, checkpoint: &Checkpoint,
     cfg: &Inkling2Config, options: Options<'_>) -> Result<(super::engine::Execution<'a>, InklingInputs, AdmittedInkling, ModelEncoding, crate::shared::vision::still::Ready)> {
@@ -197,20 +212,20 @@ pub(crate) fn whole<'a>(library: &'a Arc<NativeLibrary>, programs: &'a Programs<
     phase.log("inkling2 code and admission");
     cuteafd_bench::context::phase("Inkling code and admission");
     let phase = crate::shared::memory::load_timing::Split::start();
+    let physical = std::iter::once(options.device).chain(options.split_device).collect::<Vec<_>>();
     let mut media = crate::shared::vision::still::Ready::load(options.vision, &checkpoint.snapshot,
-        options.native_lib, library, &[options.device], prepared.inputs.vision.as_ref()
+        options.native_lib, library, &physical, prepared.inputs.vision.as_ref()
             .and_then(|vision| vision.admitted(&prepared.admitted.solved)),
         cuteafd_loader::media::ImageFamily::Inkling2, prepared.inputs.vision.as_ref().map_or(0, |vision| vision.media_cache))?;
-    let (target, pushed, draft_weights) = deliver(library, view, checkpoint, &prepared, &options, std::mem::take(&mut media.push))?;
+    let (targets, pushed, draft_weights) = deliver(library, view, checkpoint, &prepared, &options, std::mem::take(&mut media.push))?;
     phase.log("inkling2 grouped weight delivery");
     cuteafd_bench::context::phase("Inkling grouped weight delivery");
     let phase = crate::shared::memory::load_timing::Split::start();
-    let Prepared { mut kernels, encoding, inputs, admitted, module_pins, exl3_modules, .. } = prepared;
+    let Prepared { kernels, encoding, inputs, admitted, module_pins, exl3_modules, .. } = prepared;
     let device = Device { library, id: options.device };
     let stream = std::rc::Rc::new(Stream::new(device)?);
-    let requests = super::owners::RequestOwners::whole(stream.clone(), &inputs, &admitted)?;
+    let requests = super::owners::RequestOwners::rank(stream.clone(), &inputs, &admitted, 0)?;
     let layout = &inputs.targets[0];
-    kernels.bind_compact(programs, stream.clone(), layout, inputs.prefill.rows as usize, 64, inputs.target_fp8_scratch[0])?;
     let head = super::head::Head::new(stream.clone(), cfg, 64, layout.stored_head())?;
     let catalog = cuteafd_loader::read_expert_catalog_view(view)?;
     let backings = match &inputs.local {
@@ -218,15 +233,9 @@ pub(crate) fn whole<'a>(library: &'a Arc<NativeLibrary>, programs: &'a Programs<
         _ if admitted.onboard == 0 => &[],
         _ => anyhow::bail!("Inkling admitted resident backend absent"),
     };
-    let mut ranks = pushed.into_iter();
-    let sets = ranks.next().context("Inkling committed coordinator rank absent")?;
-    ensure!(ranks.next().is_none() && sets.len() == backings.len(), "Inkling pushed expert set/rank count differs");
-    let mut local = Vec::<Box<dyn super::experts::Dispatcher + 'a>>::new();
-    for (backing, set) in backings.iter().zip(sets) {
-        let handles = super::experts::Resident::from_pushed(stream.clone(), &catalog, options.native_lib,
-            backing, usize::try_from(inputs.prefill.rows.max(64))?, set)?;
-        local.extend(handles.into_iter().map(|owner| Box::new(owner) as Box<dyn super::experts::Dispatcher>));
-    }
+    let peer_stream = options.split_device.map(|id| Stream::new(Device { library, id }).map(std::rc::Rc::new)).transpose()?;
+    let local = super::experts::serving_dispatchers(stream.clone(), peer_stream.clone(), &catalog,
+        options.native_lib, backings, usize::try_from(inputs.prefill.rows.max(64))?, pushed, cfg, &admitted.solved)?;
     ensure!(local.len() == admitted.onboard, "Inkling resident layer handle count differs");
     let geometry = inputs.links.first().context("Inkling admitted Spark link absent")?.clone();
     let mut link = device.run(|| SparkLink::prepared(library, SparkWorld::canonical(options.peers.len())?,
@@ -238,9 +247,25 @@ pub(crate) fn whole<'a>(library: &'a Arc<NativeLibrary>, programs: &'a Programs<
         } else { ExpertV2Dtype::Bf16 })?;
     session.flags |= EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16;
     device.run(|| link.bootstrap(&session))?;
-    let mut execution = super::engine::Execution::new(link, requests, head, target, kernels, local, cfg.clone(), inputs.graph_reserve[0],
+    let mut targets = targets.into_iter();
+    let mut kernels = kernels.into_iter();
+    let mut lead_kernels = kernels.next().context("Inkling lead kernels absent")?;
+    lead_kernels.bind_compact(programs, stream.clone(), layout, inputs.prefill.rows as usize, 64, inputs.target_fp8_scratch[0])?;
+    let mut execution = super::engine::Execution::new(link, requests, head,
+        targets.next().context("Inkling lead target absent")?, lead_kernels,
+        local, cfg.clone(), inputs.graph_reserve[0],
         inputs.experts.iter().map(|layer| inkling2::ingress(layer.storage)).collect())?;
-    if let Some(weights)=draft_weights{
+    if let Some(peer_stream) = &peer_stream {
+        use crate::shared::peer_split::{PeerExchange, RankDevice};
+        let ranks = [&stream, peer_stream].map(|stream| RankDevice { device: stream.device.id, stream: stream.raw });
+        let requests = super::owners::RequestOwners::rank(peer_stream.clone(), &inputs, &admitted, 1)?;
+        let exchange = PeerExchange::new_abortable(library, ranks, 1,
+            usize::try_from(inputs.prefill.rows.max(64))? * cfg.hidden * 4, 64 * cfg.hidden * 4)?;
+        execution.peer = Some(super::engine::Peer { graphs: super::engine::DecodeGraphs::new(&requests, inputs.graph_reserve[1])?, exchange, requests,
+            target: targets.next().context("Inkling peer target absent")?, kernels: kernels.next().context("Inkling peer kernels absent")? });
+    }
+    ensure!(targets.next().is_none() && kernels.next().is_none(), "Inkling rank inventory not fully bound");
+    if !draft_weights.is_empty() {
         let facts=inputs.drafter.as_ref().context("delivered drafter has no admission facts")?;
         let mut layout=facts.layout.clone();
         for rank in &mut layout.runtime{
@@ -251,18 +276,38 @@ pub(crate) fn whole<'a>(library: &'a Arc<NativeLibrary>, programs: &'a Programs<
                 rank.rank.rank,rank.rank.ranks,rank.rank.lead)?;
             rank.buffers.extend(projection);
         }
-        execution.draft=Some(std::rc::Rc::new(super::draft::Binding::new(programs,stream.clone(),weights,layout,
+        let streams=std::iter::once(stream.clone()).chain(peer_stream.clone()).collect();
+        execution.draft=Some(std::rc::Rc::new(super::draft::Binding::new(programs,streams,draft_weights,layout,
             &admitted.solved,execution.target.projection("model.llm.unembed.weight")?,
-            &execution.head,&execution.kernels,
+            &execution.head, &execution.kernels,
             usize::try_from(inputs.prefill.rows)?,usize::try_from(inputs.prefill.waves)?,inputs.prefix_mark_slots)?));
     }
-    let physical = [options.device];
     let devices = cuteafd_loader::placement::planner::CoordinatorDevices::new(&physical)?;
+    let mut weights = crate::shared::memory::receipts::Inventory::new(devices, "inkling_target",
+        cuteafd_loader::placement::planner::Lifetime::RESIDENT, cuteafd_core::memory_layout::Category::Weights, "Inkling target");
+    execution.target.inventory(&mut weights, "lead")?;
+    if let Some(peer) = &execution.peer { peer.target.inventory(&mut weights, "peer")?; }
+    for receipt in weights.receipts.iter().filter(|receipt| receipt.allocation.view.is_none()) {
+        let actual = &receipt.allocation;
+        let planned = admitted.solved.facts.allocations.iter().find(|owner| owner.id == actual.id)
+            .context("Inkling target arena backing not admitted")?;
+        ensure!(actual.bytes == planned.bytes && actual.location == planned.location,
+            "Inkling target arena backing differs: {}", actual.id);
+    }
+    ensure!(weights.receipts.iter().filter(|receipt| receipt.allocation.view.is_none()).count() == inputs.gpus,
+        "Inkling one target arena per physical rank differs");
     let mut inventory = crate::shared::memory::receipts::Inventory::new(devices, "retained",
         cuteafd_loader::placement::planner::Lifetime::TARGET, cuteafd_core::memory_layout::Category::Workspace, "Inkling requests");
     let mut census = crate::shared::memory::receipts::Census::default();
     execution.requests.allocation_receipts(&mut inventory, &mut census, devices)?;
+    if let Some(peer) = &execution.peer {
+        peer.requests.allocation_receipts(&mut inventory, &mut census, devices)?;
+        for (rank, name, buffer) in peer.exchange.allocation_buffers() {
+            inventory.device(&format!("inkling2.attention.{rank}.{name}"), buffer)?;
+        }
+    }
     super::admission::reconcile_requests(&admitted.solved, &inputs, &inventory.receipts)?;
+    execution.prewarm()?;
     // Runtime backends now retain the same code sampled before weights.
     drop(module_pins); drop(exl3_modules);
     phase.log("inkling2 request owners and transport bootstrap");
@@ -286,7 +331,7 @@ mod tests {
         assert!(source.contains("Coordinator::Measured"));
         assert_eq!(source.matches("SelectedWeights::new(").count(), 1);
         assert!(source.contains("gather_with_weights(&request, selected_weights)"));
-        assert!(source.find("programs.load_matching(|name| compact_programs.contains(name))").unwrap()
+        assert!(source.find("programs.load_matching(|name| names.contains(name))").unwrap()
             < source.find("Coordinator::Measured { samples").unwrap());
         assert!(source.contains("inputs.admit(inkling2::request("));
         assert!(!source.contains("ready_tx"));

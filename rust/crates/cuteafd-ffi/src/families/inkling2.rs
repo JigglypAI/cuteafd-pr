@@ -30,6 +30,7 @@ pub struct Attention<'a> {
     route: Route,
     scratch: usize,
     fp8: bool,
+    head_parts: usize,
 }
 
 /// One stream-ordered step. Metadata is device resident and validated by its
@@ -73,14 +74,21 @@ pub struct Global {
 
 impl<'a> Attention<'a> {
     pub fn load(programs: &'a Programs<'a>, kind: Kind, route: Route, fp8: bool) -> Result<Self> {
+        Self::load_rank(programs, kind, route, fp8, 1)
+    }
+
+    pub fn load_rank(programs: &'a Programs<'a>, kind: Kind, route: Route, fp8: bool,
+        head_parts: usize) -> Result<Self> {
+        ensure!(matches!(head_parts, 1 | 2), "Inkling attention head partition differs");
         ensure!(!fp8 || kind == Kind::Global, "Inkling FP8 local ring unsupported");
-        let name = format!("inkling2_{}_attention_{}_{}_v2_m{}", kind.name(), route.name(),
-            if fp8 { "fp8" } else { "bf16" }, route.capacity());
+        let name = format!("inkling2_{}_attention_{}_{}_v2_m{}{}", kind.name(), route.name(),
+            if fp8 { "fp8" } else { "bf16" }, route.capacity(), if head_parts == 2 { "_tp2" } else { "" });
         let pointers = if kind == Kind::Local { LOCAL } else { GLOBAL };
         let program = programs.program(&name, pointers)?;
-        let scratch = validate_manifest(program.spec(), kind, route, fp8)?;
-        Ok(Self { program, kind, route, scratch, fp8 })
+        let scratch = validate_manifest(program.spec(), kind, route, fp8, head_parts)?;
+        Ok(Self { program, kind, route, scratch, fp8, head_parts })
     }
+
     pub fn scratch_bytes(&self) -> usize { self.scratch }
 
     pub fn local(&self, b: Batch, local: Local, stream: *mut c_void) -> Result<()> {
@@ -88,8 +96,9 @@ impl<'a> Attention<'a> {
         let mut buffers = self.common(b)?;
         ensure!(local.ring_stride_records >= RING_ROWS, "Inkling ring stride is shorter than window");
         let ring_bytes = local.ring.bytes;
-        ensure!(ring_bytes >= RING_ROWS*RECORD_BYTES, "Inkling ring bank is shorter than window");
-        buffers.extend([(b.kv, b.rows * RECORD_BYTES, 16), (local.ring, ring_bytes, 16),
+        let record_bytes = RECORD_BYTES / self.head_parts;
+        ensure!(ring_bytes >= RING_ROWS*record_bytes, "Inkling ring bank is shorter than window");
+        buffers.extend([(b.kv, b.rows * record_bytes, 16), (local.ring, ring_bytes, 16),
             (local.ring_slots, b.rows * 8, 8), (local.first, b.rows * 4, 4)]);
         validate_buffers(&buffers, &[b.output, b.scratch, local.ring])?;
         // SAFETY: checked extents, device, alignment and exclusive writers;
@@ -107,7 +116,7 @@ impl<'a> Attention<'a> {
             && (1..=32).contains(&global.splits)
             && (self.route == Route::Decode || global.splits == 1), "Inkling page/split geometry differs");
         let mut buffers = self.common(b)?;
-        let cache = global.pages.checked_mul(PAGE_ROWS).and_then(|n| n.checked_mul(if self.fp8 { 2112 } else { RECORD_BYTES }))
+        let cache = global.pages.checked_mul(PAGE_ROWS).and_then(|n| n.checked_mul((if self.fp8 { 2112 } else { RECORD_BYTES }) / self.head_parts))
             .context("Inkling cache extent overflow")?;
         let stride = global.table_width;
         let tables = global.tables;
@@ -128,13 +137,14 @@ impl<'a> Attention<'a> {
 
     fn common(&self, b: Batch) -> Result<Vec<(Buffer, usize, usize)>> {
         ensure!((1..=self.route.capacity()).contains(&b.rows) && (1..=b.rows).contains(&b.tiles), "Inkling attention live rows exceed export");
-        Ok(vec![(b.tile_rows, b.tiles*4, 4), (b.q, b.rows * 48 * 128 * 2, 16), (b.positions, b.rows * 8, 8),
-            (b.relative, b.rows * 48 * 1024 * 2, 16), (b.sinks, b.rows * 48 * 4, 4),
-            (b.output, b.rows * 48 * 128 * 2, 16), (b.scratch, self.scratch, 16)])
+        let heads = 48 / self.head_parts;
+        Ok(vec![(b.tile_rows, b.tiles*4, 4), (b.q, b.rows * heads * 128 * 2, 16), (b.positions, b.rows * 8, 8),
+            (b.relative, b.rows * heads * 1024 * 2, 16), (b.sinks, b.rows * heads * 4, 4),
+            (b.output, b.rows * heads * 128 * 2, 16), (b.scratch, self.scratch, 16)])
     }
 }
 
-fn validate_manifest(spec: &ProgramSpec, kind: Kind, route: Route, fp8: bool) -> Result<usize> {
+fn validate_manifest(spec: &ProgramSpec, kind: Kind, route: Route, fp8: bool, parts: usize) -> Result<usize> {
     let pointers = if kind == Kind::Local { LOCAL } else { GLOBAL };
     let scalars: &[u8] = match (kind, route) { (Kind::Local, _) => b"ii",
         (Kind::Global, Route::Prefill) => b"iii", (Kind::Global, Route::Decode) => b"iiii" };
@@ -142,9 +152,9 @@ fn validate_manifest(spec: &ProgramSpec, kind: Kind, route: Route, fp8: bool) ->
         && spec.scalar_kinds == scalars && spec.capacity_rows as usize == route.capacity(),
         "Inkling attention export ABI/capacity differs");
     let g = &spec.geometry;
-    for (key, value) in [("heads", 48), ("kv_heads", 8), ("head_dim", 128), ("record_elems", 2048),
-        ("record_bytes", if fp8 { 2112 } else { RECORD_BYTES }), ("cache_abi", 2),
-        ("scale_offset", if fp8 { 2048 } else { 0 }), ("page_rows", PAGE_ROWS), ("ring_rows", RING_ROWS),
+    for (key, value) in [("heads", 48 / parts), ("kv_heads", 8 / parts), ("head_dim", 128), ("record_elems", 2048 / parts),
+        ("record_bytes", (if fp8 { 2112 } else { RECORD_BYTES }) / parts), ("cache_abi", 2),
+        ("scale_offset", if fp8 { 2048 / parts } else { 0 }), ("page_rows", PAGE_ROWS), ("ring_rows", RING_ROWS),
         ("extent", 1024), ("max_rows", route.capacity()),
         ("window", if kind == Kind::Local { 1024 } else { 0 }),
         ("max_splits", if kind == Kind::Global && route == Route::Decode { 32 } else { 1 }),
@@ -155,7 +165,7 @@ fn validate_manifest(spec: &ProgramSpec, kind: Kind, route: Route, fp8: bool) ->
         && g["kind"] == kind.name() && g["route"] == route.name() && g["sinks"] == "per_row_head",
         "Inkling attention export bias/sink convention differs");
     let expected = if kind == Kind::Global && route == Route::Decode {
-        route.capacity() * 32 * 48 * (128 * 4 + 4)
+        route.capacity() * 32 * (48 / parts) * (128 * 4 + 4)
     } else { 1024 };
     ensure!(spec.scratch.len() == 1 && spec.scratch.get("scratch") == Some(&(expected as u64)),
         "Inkling attention scratch differs");
@@ -205,28 +215,46 @@ mod tests {
                 "rows_per_cta": if route == Route::Decode { 1 } else { 10 } }) }
     }
     #[test]
+    fn half_head_fp8_decode_checks_rank_local_record_and_scratch() {
+        let route = Route::Decode;
+        let kind = Kind::Global;
+        let mut rank = spec(kind, route);
+        for (key, value) in [("heads", 24), ("kv_heads", 4), ("record_elems", 1024),
+            ("record_bytes", 1056), ("scale_offset", 1024)] {
+            rank.geometry[key] = serde_json::json!(value);
+        }
+        rank.geometry["kv_format"] = serde_json::json!("fp8");
+        let scratch = 64 * 32 * 24 * (128 * 4 + 4);
+        rank.scratch.insert("scratch".into(), scratch as u64);
+        assert_eq!(validate_manifest(&rank, kind, route, true, 2).unwrap(), scratch);
+        assert!(validate_manifest(&rank, kind, route, true, 1).is_err());
+        rank.geometry["record_bytes"] = serde_json::json!(2112);
+        assert!(validate_manifest(&rank, kind, route, true, 2).is_err());
+    }
+
+    #[test]
     fn manifest_accepts_only_checkpoint_bias_sink_geometry() {
         for kind in [Kind::Local, Kind::Global] {
             for route in [Route::Decode, Route::Prefill] {
                 let good = spec(kind, route);
-                validate_manifest(&good, kind, route, false).unwrap();
+                validate_manifest(&good, kind, route, false, 1).unwrap();
                 for key in ["heads", "kv_heads", "head_dim", "ring_rows", "page_rows", "extent", "window", "max_splits"] {
                     let mut wrong = good.clone();
                     wrong.geometry[key] = serde_json::json!(999);
-                    assert!(validate_manifest(&wrong, kind, route, false).is_err(), "{key}");
+                    assert!(validate_manifest(&wrong, kind, route, false, 1).is_err(), "{key}");
                 }
                 let mut wrong = good.clone();
                 wrong.geometry["sinks"] = serde_json::json!("per_head");
-                assert!(validate_manifest(&wrong, kind, route, false).is_err());
+                assert!(validate_manifest(&wrong, kind, route, false, 1).is_err());
                 let mut wrong = good.clone();
                 wrong.scratch.insert("scratch".into(), 0);
-                assert!(validate_manifest(&wrong, kind, route, false).is_err());
+                assert!(validate_manifest(&wrong, kind, route, false, 1).is_err());
                 let mut wrong = good.clone();
                 wrong.pointers.swap(0, 1);
-                assert!(validate_manifest(&wrong, kind, route, false).is_err());
+                assert!(validate_manifest(&wrong, kind, route, false, 1).is_err());
                 let mut wrong = good.clone();
                 wrong.scalar_kinds[0] = b'l';
-                assert!(validate_manifest(&wrong, kind, route, false).is_err());
+                assert!(validate_manifest(&wrong, kind, route, false, 1).is_err());
             }
         }
     }

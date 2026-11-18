@@ -7,8 +7,8 @@ use std::ffi::c_void;
 pub struct Convolution<'a>{program:Program<'a>,width:usize,heads:usize,dynamic:bool}
 impl<'a> Convolution<'a>{
     pub fn load(programs:&'a Programs<'a>,width:usize,dynamic:bool)->Result<Self>{
-        ensure!(matches!((width,dynamic),(4608,false)|(1024,false)|(1024,true)),"Inkling replay convolution geometry");
-        let heads=if dynamic{8}else{1};
+        ensure!(matches!((width,dynamic),(4608,false)|(1024,false)|(1024,true)|(512,false)|(512,true)),"Inkling replay convolution geometry");
+        let heads=if dynamic{width/128}else{1};
         let name=format!("inkling2_conv_{}_h{width}_f32_replay",if dynamic{"dynamic"}else{"static"});
         let program=programs.program(&name,&["x","weight","dynamic","history","first","slots","out","replay"])?;
         let spec=program.spec();let g=&spec.geometry;

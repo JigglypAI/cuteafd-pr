@@ -21,15 +21,20 @@ pub enum Op {
 }
 impl Op {
     pub fn name(self) -> Result<String> {
+        self.rank_name(1)
+    }
+    pub fn rank_name(self, parts: usize) -> Result<String> {
+        ensure!(matches!(parts, 1 | 2), "Inkling producer head partition differs");
+        let tp = if parts == 2 { "_tp2" } else { "" };
         Ok(format!("inkling2_{}", match self {
             Self::Convolution { width, dynamic, precision } => {
-                ensure!(matches!((width, dynamic), (4608, false) | (1024, false) | (1024, true)),
+                ensure!(matches!((width, dynamic), (4608, false) | (1024, false) | (1024, true) | (512, false) | (512, true)),
                     "Inkling convolution geometry unsupported");
                 format!("conv_{}_h{width}_{}_v2", if dynamic { "dynamic" } else { "static" }, precision.suffix())
             }
             Self::Clip { relative, key, global, precision } => {
                 ensure!(!(relative && key) && !(key && global), "Inkling clip site unsupported");
-                format!("clip_{}_{}_{}", if global { "global" } else { "local" },
+                format!("clip_{}_{}_{}{tp}", if global { "global" } else { "local" },
                     if key { "k" } else if relative { "r" } else { "q" }, precision.suffix())
             }
             Self::Residual { queries, addend } => {
@@ -38,9 +43,11 @@ impl Op {
             }
             Self::Router => "router_e384_k8".into(),
             Self::Gate { situ, precision } => format!("{}_h{}_{}", if situ { "situ" } else { "gate" },
-                if situ { 2304 } else { 6144 }, precision.suffix()),
-            Self::Norm { value, precision } => format!("norm_{}_{}", if value { "v_h8_d128" } else { "h4608" }, precision.suffix()),
-            Self::KvPack { precision, fp8 } => format!("kv_pack_{}_{}_v2", if fp8 { "fp8" } else { "bf16" }, precision.suffix()),
+                if situ { 2304 } else { 6144 / parts }, precision.suffix()),
+            Self::Norm { value, precision } => if value {
+                format!("norm_v_h{}_d128_{}", 8 / parts, precision.suffix())
+            } else { format!("norm_h4608_{}", precision.suffix()) },
+            Self::KvPack { precision, fp8 } => format!("kv_pack_{}_{}_v2{tp}", if fp8 { "fp8" } else { "bf16" }, precision.suffix()),
         }))
     }
     fn pointers(self) -> &'static [&'static str] {
@@ -59,7 +66,10 @@ impl Op {
 pub struct Producer<'a> { program: Program<'a>, op: Op, rows: usize }
 impl<'a> Producer<'a> {
     pub fn load(programs: &'a Programs<'a>, op: Op) -> Result<Self> {
-        let program = programs.program(&op.name()?, op.pointers())?;
+        Self::load_rank(programs, op, 1)
+    }
+    pub fn load_rank(programs: &'a Programs<'a>, op: Op, parts: usize) -> Result<Self> {
+        let program = programs.program(&op.rank_name(parts)?, op.pointers())?;
         let spec = program.spec();
         let kinds: &[u8] = if matches!(op, Op::Residual { .. }) { b"iii" } else if matches!(op, Op::Convolution { .. }) { b"il" } else { b"i" };
         ensure!(spec.capacity_rows > 0 && spec.capacity_rows <= 4096 && spec.scalar_kinds == kinds
@@ -72,11 +82,11 @@ impl<'a> Producer<'a> {
             Op::Convolution { width, dynamic, .. } => {
                 equal("cache_abi", 2.into())?;
                 equal("width", width.into())?; equal("taps", 4.into())?;
-                equal("heads", if dynamic { 8.into() } else { 1.into() })?;
+                equal("heads", if dynamic { (width / 128).into() } else { 1.into() })?;
                 equal("dynamic", dynamic.into())?; equal("history", "newest_first".into())?;
             }
             Op::Clip { relative, key, global, .. } => {
-                equal("heads", if key { 8.into() } else { 48.into() })?;
+                equal("heads", (if key { 8 / parts } else { 48 / parts }).into())?;
                 equal("dim", if relative { 16.into() } else { 128.into() })?;
                 equal("scaled", (!key).into())?;
                 let threshold = if relative { 8. } else { 128f64.sqrt()*2. };
@@ -94,21 +104,21 @@ impl<'a> Producer<'a> {
                 equal("experts", 384.into())?; equal("topk", 8.into())?; equal("route_scale", 8.0.into())?;
             }
             Op::Gate { situ, .. } => {
-                equal("width", if situ { 2304.into() } else { 6144.into() })?;
+                equal("width", if situ { 2304.into() } else { (6144 / parts).into() })?;
                 equal("situ", situ.into())?; equal("gate_cap", 4.0.into())?; equal("up_cap", 25.0.into())?;
             }
             Op::Norm { value, precision } => {
                 equal("width", if value { 128.into() } else { 4608.into() })?;
-                equal("heads", if value { 8.into() } else { 1.into() })?;
+                equal("heads", if value { (8 / parts).into() } else { 1.into() })?;
                 equal("weighted", (!value).into())?; equal("eps", 1e-6.into())?;
                 equal("output_dtype", match precision { Precision::Bf16 => "torch.bfloat16", Precision::F32 => "torch.float32" }.into())?;
             }
             Op::KvPack { precision, fp8 } => {
                 equal("cache_abi", 2.into())?;
                 equal("kv_format", if fp8 { "fp8" } else { "bf16" }.into())?;
-                equal("record_bytes", if fp8 { 2112 } else { 4096 }.into())?;
-                equal("scale_offset", if fp8 { 2048 } else { 0 }.into())?;
-                equal("heads", 8.into())?; equal("dim", 128.into())?;
+                equal("record_bytes", ((if fp8 { 2112 } else { 4096 }) / parts).into())?;
+                equal("scale_offset", (if fp8 { 2048 / parts } else { 0 }).into())?;
+                equal("heads", (8 / parts).into())?; equal("dim", 128.into())?;
                 equal("input_dtype", match precision { Precision::Bf16 => "torch.bfloat16", Precision::F32 => "torch.float32" }.into())?;
             }
         }
