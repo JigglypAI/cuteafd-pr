@@ -219,8 +219,50 @@ pub(crate) fn pool_memory(cfg: &Inkling2Config, kv_format: super::InklingKvCache
         crate::placement::PoolMemory { available_bytes, bytes_per_unit: rank_unit_bytes(gpu) }).collect()
 }
 
+/// The one header-derived inventory used both for code preload and admission.
+pub struct SelectedWeights {
+    modes: Vec<crate::placement::LayerMode>,
+    pub targets: Vec<CoordinatorWeights>,
+    pub drafter: Option<(crate::formats::block_dspark::recurrent::RecurrentBlockConfig,
+        Vec<crate::formats::block_dspark::recurrent::loading::RecurrentWeightLayout>)>,
+}
+
+impl SelectedWeights {
+    pub fn new(checkpoint: &crate::plan::Checkpoint, cfg: &Inkling2Config, gpus: usize,
+        attention: crate::placement::AttentionPlacement, draft: bool) -> anyhow::Result<Self> {
+        let placement = if gpus == 1 { crate::placement::AttentionPlacement::Heads } else { attention };
+        let modes = shared::layer_modes(cfg, gpus, placement);
+        let targets = CoordinatorWeights::plan(checkpoint, cfg, gpus, &modes)?;
+        let drafter = draft.then(|| super::draft::DraftLayout::select_weights(
+            checkpoint.view.as_ref().context("bundled drafter needs selected checkpoint view")?, gpus)).transpose()?;
+        Ok(Self { modes, targets, drafter })
+    }
+
+    pub fn compact_programs(&self, manifest: &serde_json::Value, rank: usize, prefill_rows: usize)
+        -> anyhow::Result<std::collections::BTreeSet<String>> {
+        let target = self.targets.get(rank).context("Inkling target rank missing")?;
+        let head_rows = shared::DECODE_ROWS as usize;
+        let mut programs = target.trellis_programs(manifest, prefill_rows, head_rows)?;
+        programs.extend(target.fp8_programs(manifest, prefill_rows, head_rows)?.into_keys());
+        if let Some((_, draft)) = &self.drafter {
+            let draft = draft.get(rank).context("Inkling drafter rank missing")?;
+            programs.extend(draft.trellis_programs(manifest, super::draft::CONTEXT_ROWS)?);
+            programs.extend(draft.fp8_programs(manifest, super::draft::CONTEXT_ROWS)?.into_keys());
+        }
+        Ok(programs)
+    }
+}
+
 /// Gather every admitted owner fact into the shared recipe.
 pub fn gather(request: &FactsRequest<'_>) -> Result<InklingInputs, Refused> {
+    let weights = SelectedWeights::new(request.checkpoint, request.cfg, request.coordinator.gpus(),
+        request.attention, request.drafter.is_some()).map_err(|error| refused(
+        format!("Inkling 2 target or drafter arena inventory refused: {error:#}"),
+        "Provide complete core headers for the selected view."))?;
+    gather_with_weights(request, weights)
+}
+
+pub fn gather_with_weights(request: &FactsRequest<'_>, weights: SelectedWeights) -> Result<InklingInputs, Refused> {
     let cfg = request.cfg;
     let gpus = request.coordinator.gpus();
     let ranks = request.spark_ranks;
@@ -235,10 +277,10 @@ pub fn gather(request: &FactsRequest<'_>) -> Result<InklingInputs, Refused> {
     let shape = request.prefill;
     let routed = (0..cfg.layers).collect::<Vec<_>>();
     let placement = if gpus == 1 { crate::placement::AttentionPlacement::Heads } else { request.attention };
-    let modes = shared::layer_modes(cfg, gpus, placement);
-    let targets = CoordinatorWeights::plan(request.checkpoint, cfg, gpus, &modes)
-        .map_err(|error| refused(format!("Inkling 2 target arena inventory refused: {error:#}"),
-            "Provide complete core headers for the selected view."))?;
+    let SelectedWeights { modes, targets, drafter } = weights;
+    if targets.len() != gpus || drafter.is_some() != request.drafter.is_some() {
+        return Err(refused("Inkling selected weights differ from launch geometry", "Prepare the selected view for the launch ranks."));
+    }
     let target_fp8_scratch = targets.iter().map(|target| {
         if target.core.is_empty() && target.fp8.is_empty() { return Ok(0); }
         let manifest = request.manifest.as_deref().context("Inkling compact core requires PROGRAMS.json")?;
@@ -295,11 +337,8 @@ pub fn gather(request: &FactsRequest<'_>) -> Result<InklingInputs, Refused> {
     let mark_bytes = (0..cfg.layers).map(|layer| shared::SequenceState::new(cfg, cfg.local[layer])
         .map(|state| state.ring_bytes + state.lag_bytes)).sum::<Result<u64, _>>()
         .map_err(|error| refused(format!("Inkling 2 sequence state refused: {error}"), "Check the window geometry."))?;
-    let draft_mark = request.drafter.map(|selection| {
-        let view=request.checkpoint.view.as_ref().context("bundled drafter needs selected checkpoint view")?;
-        let config=crate::formats::block_dspark::recurrent::RecurrentBlockConfig::from_hf(&view.config()?)?;
-        config.window_mark_bytes(selection.kv_cache,gpus-1,gpus,gpus-1)
-    }).transpose().map_err(|error|refused(format!("drafter mark inventory refused: {error:#}"),"Check bundled MTP config."))?.unwrap_or(0) as u64;
+    let draft_mark = request.drafter.zip(drafter.as_ref()).map(|(selection, (config, _))|
+        config.window_mark_bytes(selection.kv_cache,gpus-1,gpus,gpus-1)).transpose().map_err(|error|refused(format!("drafter mark inventory refused: {error:#}"),"Check bundled MTP config."))?.unwrap_or(0) as u64;
     let host_prefix = if request.host_cache_bytes == Some(0) || request.prefix_entries == 0 {
         serving::HostPrefixOwners { quota_bytes: 0, chunk_bytes: 0 }
     } else {
@@ -329,9 +368,8 @@ pub fn gather(request: &FactsRequest<'_>) -> Result<InklingInputs, Refused> {
     let prefix_mark_slots=super::draft::prefix_mark_slots(request.sequences,request.prefix_entries,
         mark_bytes,draft_mark,request.prefix_mark_budget,host_prefix.quota_bytes>0)
         .map_err(|error|refused(format!("Inkling prefix slots refused: {error:#}"),"Check combined mark extent."))?;
-    let drafter=request.drafter.map(|selection| {
-        let view=request.checkpoint.view.as_ref().context("bundled drafter needs selected checkpoint view")?;
-        super::draft::DraftLayout::new(view,gpus,usize::try_from(request.sequences)?,
+    let drafter=request.drafter.zip(drafter).map(|(selection, (config, weights))| {
+        super::draft::DraftLayout::from_weights(config,weights,usize::try_from(request.sequences)?,
             usize::try_from(request.sequences)?.min(8),usize::try_from(context)?,usize::try_from(pool.maximum_tokens())?,
             usize::try_from(shape.rows)?,usize::try_from(shape.waves)?,selection.sms,selection.kv_cache,request.manifest.as_deref())
             .map(|layout|shared::Drafter{layout})

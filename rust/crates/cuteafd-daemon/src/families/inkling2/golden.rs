@@ -174,11 +174,17 @@ fn run(mut args: GoldenArgs) -> Result<()> {
     let _exl3_code = if metadata.is_none() {
         Some(Exl3Tp2::preload_whole_modules(device, &package, rows, geometry, selection)?)
     } else { None };
-    let (free, total) = device.run(|| library.cuda_memory_info())?;
+    let manifest = serde_json::from_slice(&std::fs::read(&args.manifest)?)?;
+    let mut compact_programs = target_layout.trellis_programs(&manifest, rows, rows)?;
+    let fp8_programs = target_layout.fp8_programs(&manifest, rows, rows)?;
+    compact_programs.extend(fp8_programs.keys().cloned());
+    let (free, total) = device.run(|| {
+        let (loaded, _) = programs.load_matching(|name| compact_programs.contains(name))?;
+        ensure!(loaded == compact_programs.len(), "Inkling golden compact program table differs from manifest");
+        library.cuda_memory_info()
+    })?;
     let host = cuteafd_loader::formats::mapped_preload::host_memory_before_process()?;
-    let fp8_bytes = if target_layout.fp8.is_empty() { 0 } else {
-        target_layout.fp8_scratch(&serde_json::from_slice(&std::fs::read(&args.manifest)?)?, rows, rows)?
-    };
+    let fp8_bytes = fp8_programs.into_values().max().unwrap_or(0);
     let (expert_arena, expert_scratch, expert_mount) = expert_layouts[0].facts();
     let plan = admission::admit(&checkpoint, &cfg, &target_layout, expert_arena, &expert_scratch, expert_mount,
         &unit_layout, rows, fp8_bytes, free as u64, total as u64, host)?;

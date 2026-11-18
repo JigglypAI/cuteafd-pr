@@ -140,29 +140,34 @@ pub struct RecurrentWeightLayout {
 }
 
 impl RecurrentWeightLayout {
-    pub fn validate_trellis(&self, manifest: &serde_json::Value, rows: usize) -> Result<()> {
+    pub fn trellis_programs(&self, manifest: &serde_json::Value, rows: usize) -> Result<std::collections::BTreeSet<String>> {
         use cuteafd_ffi::dense_trellis::{validate_package_geometry_bits, TrellisDType};
         use crate::formats::exl3_storage::Exl3Codebook;
         let mut seen = std::collections::BTreeSet::new();
+        let mut programs = std::collections::BTreeSet::new();
         for (name, l) in &self.core {
             let [n, k] = l.shape;
             let side = if l.side == TrellisSide::Input { 2 } else { 1 };
             let book = if l.codebook == Exl3Codebook::Mcg { "mcg" } else { "mul1" };
             if seen.insert((k, n, side, l.bits, book)) {
-                validate_package_geometry_bits(manifest, k, n, side, l.bits, book, rows, TrellisDType::Bf16)
-                    .with_context(|| format!("{name}: recurrent trellis program missing or incompatible"))?;
+                programs.extend(validate_package_geometry_bits(manifest, k, n, side, l.bits, book, rows, TrellisDType::Bf16)
+                    .with_context(|| format!("{name}: recurrent trellis program missing or incompatible"))?);
             }
         }
-        Ok(())
+        Ok(programs)
+    }
+
+    pub fn fp8_programs(&self, manifest: &serde_json::Value, rows: usize) -> Result<BTreeMap<String, usize>> {
+        use cuteafd_ffi::{draft_projection::ProjectionOutput, native_attention::validate_package_geometry};
+        let mut seen = std::collections::BTreeSet::new();
+        self.fp8.iter().filter(|(_, p)| seen.insert(p.shape)).map(|(name, p)| {
+            validate_package_geometry(manifest, p.shape[1], p.shape[0], rows, ProjectionOutput::Bf16)
+                .with_context(|| format!("{name}: recurrent FP8 program missing or incompatible"))
+        }).collect()
     }
 
     pub fn fp8_scratch(&self, manifest: &serde_json::Value, rows: usize) -> Result<usize> {
-        use cuteafd_ffi::{draft_projection::ProjectionOutput, native_attention::validate_package_geometry};
-        self.fp8.iter().try_fold(0, |peak, (name, p)| {
-            let (_, bytes) = validate_package_geometry(manifest, p.shape[1], p.shape[0], rows, ProjectionOutput::Bf16)
-                .with_context(|| format!("{name}: recurrent FP8 program missing or incompatible"))?;
-            Ok(peak.max(bytes))
-        })
+        Ok(self.fp8_programs(manifest, rows)?.into_values().max().unwrap_or(0))
     }
 }
 

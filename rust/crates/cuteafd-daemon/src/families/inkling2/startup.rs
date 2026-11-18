@@ -5,7 +5,7 @@ use crate::shared::{inventory::{InventoryPhase, RuntimeInventory}, prefix::{budg
 use anyhow::{ensure, Context, Result};
 use cuteafd_api::openai::{chat::inkling2::InklingEncoding, ModelEncoding};
 use cuteafd_ffi::{programs::Programs, NativeLibrary};
-use cuteafd_loader::{families::inkling2::{admission::{gather, Coordinator, FactsRequest}, Inkling2Config},
+use cuteafd_loader::{families::inkling2::{admission::{gather_with_weights, Coordinator, FactsRequest, SelectedWeights}, Inkling2Config},
     placement::{families::inkling2::{self, AdmittedInkling, InklingInputs}, planner::PrefillShape,
         AttentionPlacement, Onboard, ResidentWeights}, plan::Checkpoint};
 use std::{net::SocketAddr, path::Path, sync::Arc};
@@ -74,6 +74,9 @@ pub(crate) fn prepare<'a>(library: &'a NativeLibrary, programs: &'a Programs<'a>
         Some(view) => cuteafd_loader::read_expert_catalog_view(view)?,
         None => cuteafd_loader::read_expert_catalog(&checkpoint.snapshot)?,
     };
+    let manifest = Arc::new(serde_json::from_slice(&std::fs::read(options.manifest)?)?);
+    let selected_weights = SelectedWeights::new(checkpoint, cfg, 1, AttentionPlacement::Heads, options.drafter.is_some())?;
+    let compact_programs = selected_weights.compact_programs(&manifest, 0, options.prefill.rows.max(64) as usize)?;
     let mut module_pins = Vec::new();
     let mut exl3_modules = Vec::new();
     let mut kernels = None;
@@ -82,6 +85,8 @@ pub(crate) fn prepare<'a>(library: &'a NativeLibrary, programs: &'a Programs<'a>
         // Missing pin/export is a named startup error, never a host fallback.
         programs.program("inkling2_padded_transpose_bf16_r16_c1024_p64", &["source", "output"])?;
         kernels = Some(Kernels::bind(programs, options.kv_format)?);
+        let (loaded, _) = programs.load_matching(|name| compact_programs.contains(name))?;
+        ensure!(loaded == compact_programs.len(), "Inkling compact pre-weight program inventory differs from manifest");
         if options.drafter.is_some(){
             programs.load_matching(|name|name.starts_with("inkling_draft_")||name.starts_with("draft_bf16_")||name=="fir_history_commit")?;
         }
@@ -110,7 +115,6 @@ pub(crate) fn prepare<'a>(library: &'a NativeLibrary, programs: &'a Programs<'a>
     let host_cache_bytes = match options.prefix.host_cache_bytes {
         HostBudget::Auto => None, HostBudget::Bytes(bytes) => Some(bytes),
     };
-    let manifest = Arc::new(serde_json::from_slice(&std::fs::read(options.manifest)?)?);
     let request = FactsRequest { target_pool_tokens: None, vision: options.vision.vision,
         vision_replicas: options.vision.vision_replicas,
         media_cache_bytes: options.vision.media_cache_bytes.map(|bytes| bytes.0 as u64), kv_format: options.kv_format, drafter: options.drafter.map(|kv_cache|cuteafd_loader::families::inkling2::draft::Selection{
@@ -124,13 +128,21 @@ pub(crate) fn prepare<'a>(library: &'a NativeLibrary, programs: &'a Programs<'a>
         replies: cuteafd_core::spark_reply::requested(),
         head: crate::shared::target_head::TargetHead::configured().blas_head(true),
         expert_usage: options.expert_usage, resident_weight_limit: options.resident_weights };
-    let mut inputs = gather(&request)?;
+    let mut inputs = gather_with_weights(&request, selected_weights)?;
     cuteafd_loader::serving_capacity::spark_memory::apply_rank_budgets(&mut inputs.budgets,
         &cuteafd_loader::serving_capacity::spark_memory::runtime_bytes(&options.peers.iter().map(ToString::to_string).collect::<Vec<_>>())?)?;
     let admitted = inputs.admit(inkling2::request(inputs.context, options.pool_tokens, options.onboard,
         options.prefill, cuteafd_loader::placement::planner::Operation::Serving,
         inputs.resident_weight_limit, request.replies))?;
-    runtime.record("inkling2", &runtime.gpus.iter().map(|sample| sample.free_bytes).collect::<Vec<_>>());
+    let baseline = admitted.solved.budgets.iter().find(|budget| budget.locations.contains(
+        &cuteafd_loader::placement::planner::Location::coordinator(0)))
+        .context("Inkling admission missing measured coordinator budget")?;
+    let sampled_free = runtime.gpus[0].free_bytes;
+    ensure!(matches!(baseline.baseline, cuteafd_loader::placement::planner::Baseline::Sampled { free, .. }
+        if free == sampled_free) && inputs.code[0] == 0, "Inkling admission must charge preloaded compact code in the sampled baseline exactly once");
+    tracing::info!(selected = compact_programs.len(), sampled_free, module_bytes = runtime.gpus[0].module_bytes,
+        "Inkling compact programs included in admitted pre-weight sample");
+    runtime.record("inkling2", &[sampled_free]);
     cuteafd_bench::context::ResolvedSettings::placement(&admitted.placement).publish();
     cuteafd_bench::context::set_resolved("max-context-tokens", &admitted.solved.served_context().to_string());
     Ok(Prepared { kernels: kernels.context("Inkling kernel preload did not run")?, encoding, eos, inputs, admitted, runtime, module_pins, exl3_modules })
@@ -271,7 +283,10 @@ mod tests {
         assert!(resident.contains("RtxSelectionPolicy::CanonicalDecode"));
         assert!(!resident.contains("RtxSelectionPolicy::FirstCapacity"));
         assert!(source.contains("Coordinator::Measured"));
-        assert!(source.contains("gather(&request)"));
+        assert_eq!(source.matches("SelectedWeights::new(").count(), 1);
+        assert!(source.contains("gather_with_weights(&request, selected_weights)"));
+        assert!(source.find("programs.load_matching(|name| compact_programs.contains(name))").unwrap()
+            < source.find("Coordinator::Measured { samples").unwrap());
         assert!(source.contains("inputs.admit(inkling2::request("));
         assert!(!source.contains("ready_tx"));
         assert!(!source.contains("TargetWeights::load"));

@@ -229,16 +229,26 @@ impl CoordinatorWeights {
         Ok(names)
     }
 
-    pub fn fp8_scratch(&self, manifest: &serde_json::Value, rows: usize, head_rows: usize) -> Result<usize> {
+    pub fn fp8_programs(&self, manifest: &serde_json::Value, rows: usize, head_rows: usize)
+        -> Result<BTreeMap<String, usize>> {
         use cuteafd_ffi::{draft_projection::ProjectionOutput, native_attention::validate_package_geometry};
-        self.fp8.values().try_fold(0, |peak, p| {
+        let mut programs = BTreeMap::new();
+        let mut seen = std::collections::BTreeSet::new();
+        for p in self.fp8.values() {
             let active = if p.stem == HEAD { head_rows.min(64) } else { rows };
-            let (_, bytes) = validate_package_geometry(manifest, p.shape[1], p.shape[0], active, ProjectionOutput::F32)
-                .with_context(|| format!("{}.weight: Inkling FP8 program missing or incompatible", p.stem))?;
-            let (_, decode) = validate_package_geometry(manifest, p.shape[1], p.shape[0], active.min(64), ProjectionOutput::F32)
-                .with_context(|| format!("{}.weight: Inkling FP8 decode program missing or incompatible", p.stem))?;
-            Ok(peak.max(bytes).max(decode))
-        })
+            for live in [active, active.min(64)] {
+                if seen.insert((p.shape, live)) {
+                    let (name, bytes) = validate_package_geometry(manifest, p.shape[1], p.shape[0], live, ProjectionOutput::F32)
+                        .with_context(|| format!("{}.weight: Inkling FP8 program missing or incompatible", p.stem))?;
+                    programs.insert(name, bytes);
+                }
+            }
+        }
+        Ok(programs)
+    }
+
+    pub fn fp8_scratch(&self, manifest: &serde_json::Value, rows: usize, head_rows: usize) -> Result<usize> {
+        Ok(self.fp8_programs(manifest, rows, head_rows)?.into_values().max().unwrap_or(0))
     }
 
     pub fn stored_head(&self) -> Option<usize> {

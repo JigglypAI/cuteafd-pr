@@ -11,6 +11,8 @@ pub fn prefix_mark_slots(sequences:u64,entries:u64,target_bytes:u64,draft_bytes:
     Ok(usize::try_from(cuteafd_core::prefix::mark_slots_with_host(sequences,entries,bytes,budget,host))?)
 }
 
+pub const CONTEXT_ROWS: usize = 2048;
+
 #[derive(Debug,Clone,Copy)]
 pub struct Selection {pub kv_cache:Qwen4KvCache,pub sms:usize}
 
@@ -25,21 +27,35 @@ pub struct DraftLayout {
 impl DraftLayout {
     pub fn new(view:&CheckpointView,ranks:usize,slots:usize,sequences:usize,context:usize,pool:usize,
         prefill:usize,waves:usize,sms:usize,format:Qwen4KvCache,manifest:Option<&serde_json::Value>)->Result<Self>{
-        ensure!(matches!(ranks,1|2) && slots>0 && sequences>0 && prefill>0 && waves>0,"recurrent draft fact geometry");
-        let source=RecurrentSource::open(view)?;
-        let lead=ranks-1;
-        let weights=(0..ranks).map(|rank|source.rank(rank,ranks,lead)).collect::<Result<Vec<_>>>()?;
-        let mut runtime=(0..ranks).map(|rank|RecurrentRuntimeLayout::new(&source.config,slots,sequences,2048,context,pool,
+        let (config, weights) = Self::select_weights(view, ranks)?;
+        Self::from_weights(config, weights, slots, sequences, context, pool, prefill, waves, sms, format, manifest)
+    }
+
+    pub fn select_weights(view: &CheckpointView, ranks: usize) -> Result<(RecurrentBlockConfig, Vec<RecurrentWeightLayout>)> {
+        ensure!(matches!(ranks, 1 | 2), "recurrent draft rank geometry");
+        let source = RecurrentSource::open(view)?;
+        let weights = (0..ranks).map(|rank| source.rank(rank, ranks, ranks - 1)).collect::<Result<Vec<_>>>()?;
+        Ok((source.config, weights))
+    }
+
+    pub fn from_weights(config: RecurrentBlockConfig, weights: Vec<RecurrentWeightLayout>, slots: usize,
+        sequences: usize, context: usize, pool: usize, prefill: usize, waves: usize, sms: usize,
+        format: Qwen4KvCache, manifest: Option<&serde_json::Value>) -> Result<Self> {
+        let ranks = weights.len();
+        ensure!(matches!(ranks, 1 | 2) && slots > 0 && sequences > 0 && prefill > 0 && waves > 0,
+            "recurrent draft fact geometry");
+        let lead = ranks - 1;
+        let mut runtime=(0..ranks).map(|rank|RecurrentRuntimeLayout::new(&config,slots,sequences,CONTEXT_ROWS,context,pool,
             sms,format,rank,ranks,lead)).collect::<Result<Vec<_>>>()?;
         for (weight,work) in weights.iter().zip(&mut runtime){
-            let rows=work.context_rows.max(work.sequences*source.config.transformer.block);
+            let rows=work.context_rows.max(work.sequences*config.transformer.block);
             let mut projection:Option<crate::formats::trellis_core::ProjectionScratchLayout>=None;
             for core in weight.core.values(){
                 let need=crate::formats::trellis_core::ProjectionScratchLayout::new(core.shape[1],core.shape[0],rows)?;
                 if let Some(projection)=&mut projection{projection.merge(&need)?;}else{projection=Some(need);}
             }
             if let Some(projection)=projection{
-                weight.validate_trellis(manifest.context("Inkling trellis drafter requires PROGRAMS.json")?, rows)?;
+                weight.trellis_programs(manifest.context("Inkling trellis drafter requires PROGRAMS.json")?, rows)?;
                 work.buffers.push(("projection.trellis".into(),projection.packed_bytes()?));
             }
             if !weight.fp8.is_empty() {
@@ -47,7 +63,7 @@ impl DraftLayout {
                 work.buffers.push(("projection.fp8".into(), weight.fp8_scratch(manifest, rows)?));
             }
         }
-        let h=source.config.transformer.hidden;let taps=source.config.taps.len();
+        let h=config.transformer.hidden;let taps=config.taps.len();
         let extent=|values:&[usize]|values.iter().try_fold(1usize,|n,value|n.checked_mul(*value)).context("draft target owner overflow");
         let mut target=Vec::new();
         for wave in 0..waves{
@@ -60,6 +76,6 @@ impl DraftLayout {
         target.push(("verify.checkpoint".into(),conv.bytes()?));
         target.push(("verify.replay".into(),extent(&[48,64,conv.width,4])?));
         target.push(("verify.table".into(),64*12));
-        Ok(Self{config:source.config,weights,runtime,target})
+        Ok(Self{config,weights,runtime,target})
     }
 }
