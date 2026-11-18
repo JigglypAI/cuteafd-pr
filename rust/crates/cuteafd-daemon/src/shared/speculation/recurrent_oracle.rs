@@ -122,6 +122,39 @@ fn installed_inkling_recurrent_head_baseline() -> Result<()> {
     let fp8_bytes = layout.fp8_scratch(&serde_json::from_slice(&std::fs::read(&manifest)?)?, 64, 64)?;
     kernels.bind_compact(&programs, Rc::clone(&stream), &layout, 64, 64, fp8_bytes)?;
 
+    if mode != CoreView::Original && std::env::var_os("CUTEAFD_TEST_FOLD_HEAD").is_some() {
+        const SAMPLE: usize = 128;
+        let root = std::path::PathBuf::from(std::env::var("CUTEAFD_GOLDEN_OUT")?);
+        let h = config.transformer.hidden;
+        let r = config.transformer.markov_rank;
+        let transpose = Allocation::new(device, 32*stored*4, Tag::drafter_workspace("head-fold-oracle/transpose"))?;
+        let weight = target.projection("model.llm.unembed.weight")?;
+        let download = |buffer:Buffer, bytes:usize| -> Result<Vec<u8>> {
+            ensure!(bytes<=buffer.bytes,"fold oracle download extent");
+            let mut host=vec![0;bytes];
+            library.copy_d2h(&mut host,Buffer{bytes,..buffer})?;
+            Ok(host)
+        };
+        if let ProjectionWeight::Fp8(w)=weight {
+            std::fs::write(root.join("fold-fp8.bin"),download(w.values.buffer,SAMPLE*h)?)?;
+            std::fs::write(root.join("fold-scales.bin"),download(w.scales.buffer,h/128*4)?)?;
+        }
+        let mut f32 = Vec::new();
+        rank.fold_compact_head(&programs, stored, f32_stage.buffer, transpose.buffer, |input,output,rows| {
+            kernels.project_compact(&stream,input,weight,output,rows,h,stored)?;
+            stream.drain()?;
+            let data = download(output,rows*stored*4)?;
+            for row in data.chunks_exact(stored*4) { f32.extend_from_slice(&row[..SAMPLE*4]); }
+            Ok(())
+        })?;
+        ensure!(f32.len()==(r+1)*SAMPLE*4,"compact fold oracle projection count differs");
+        std::fs::write(root.join("fold-f32.bin"),f32)?;
+        std::fs::write(root.join("fold-weight.bin"),download(rank.weights.derived("derived.fold_weight")?.buffer,SAMPLE*r*2)?)?;
+        std::fs::write(root.join("fold-bias.bin"),download(rank.weights.derived("derived.fold_bias")?.buffer,SAMPLE*2)?)?;
+        eprintln!("RECURRENT_HEAD_FOLD_CAPTURE {mode} {SAMPLE} rows");
+        if std::env::var_os("CUTEAFD_TEST_WIDE_HEAD").is_none() { return Ok(()); }
+    }
+
     // No fold is timed. Synthetic nonzero folded operands do equivalent work
     // without adding a second head or depending on a future compact fold.
     for (index, buffer) in [rank.buffer("step.normalized")?, rank.buffer("head.f_rnn")?,

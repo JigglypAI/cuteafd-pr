@@ -145,17 +145,70 @@ class Native:
         return output
 
 
+def compact_fold_reference(snapshot, mode, captures):
+    """Compare sampled native F32 fold rows to W reconstructed from the view."""
+    import runpy
+    import numpy as np
+
+    suffix = {"k6-compact": ".k6", "k8-compact": ".k8", "fp8-compact": ""}[mode]
+    target = json.loads((snapshot/f"model{suffix}.safetensors.index.json").read_text())["weight_map"]
+    original = json.loads((snapshot/"model.safetensors.index.json").read_text())["weight_map"]
+    fold_names = ("mtp.markov_head.hidden_out.weight", "mtp.markov_head.hidden_out.bias")
+    with safe_open(str(snapshot/original[fold_names[0]]), framework="pt", device="cpu") as source:
+        hidden_out = source.get_tensor(fold_names[0]).float()
+        hidden_bias = source.get_tensor(fold_names[1]).float()
+    h = hidden_out.shape[0]
+    if mode == "fp8-compact":
+        raw = torch.from_numpy(np.fromfile(captures/"fold-fp8.bin", dtype=np.uint8).reshape(128, h))
+        scales = torch.from_numpy(np.fromfile(captures/"fold-scales.bin", dtype="<f4"))
+        weight = (raw.view(torch.float8_e4m3fn).float() * scales.repeat_interleave(128)).bfloat16().float()
+    else:
+        # Read only one H128 output block. Reuse the fork's independent
+        # serialized-tile decoder, not the serving repack or CUDA projection.
+        reference = runpy.run_path(str(Path(__file__).resolve().parents[2]/
+            "third_party/sparkinfer/tests/gemm/test_trellis_linear.py"))
+        stem = "model.llm.unembed"
+        with safe_open(str(snapshot/target[f"{stem}.trellis"]), framework="pt", device="cpu") as source:
+            packed = source.get_slice(f"{stem}.trellis")[:, :8, :]
+            suh = source.get_tensor(f"{stem}.suh").float()
+            svh = source.get_slice(f"{stem}.svh")[:128].float()
+        raw = reference["_reconstruct_native"](packed).float()
+        had = torch.ones(1, 1)
+        while had.shape[0] < 128:
+            had = torch.cat((torch.cat((had, had), 1), torch.cat((had, -had), 1)), 0)
+        had /= 128**0.5
+        unrotated = (had @ raw.view(-1, 128, 128)).view(h, 128) * suh[:, None]
+        weight = ((unrotated @ had) * svh).T.contiguous()
+    reference = torch.cat((weight @ hidden_out, (weight @ hidden_bias)[:, None]), dim=1)
+    actual = torch.from_numpy(np.fromfile(captures/"fold-f32.bin", dtype="<f4").reshape(-1, 128).T.copy())
+    derived = torch.from_numpy(np.fromfile(captures/"fold-weight.bin", dtype="<i2")).view(torch.bfloat16).reshape(128, -1)
+    bias = torch.from_numpy(np.fromfile(captures/"fold-bias.bin", dtype="<i2")).view(torch.bfloat16)
+    assert torch.equal(torch.cat((derived, bias[:, None]), dim=1), actual.bfloat16()), "fold egress rounded or transposed incorrectly"
+    error = actual - reference
+    relative_l2 = float(error.double().norm()/reference.double().norm())
+    print(json.dumps(dict(view=mode, sampled_vocab_rows=128, relative_l2=relative_l2, max_abs=float(error.abs().max()))))
+    assert relative_l2 < 0.005, f"compact fold relative L2 {relative_l2}"
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--snapshot", type=Path, required=True)
-    parser.add_argument("--fixtures", type=Path, required=True)
-    parser.add_argument("--vendor-test", type=Path, required=True)
-    parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--fixtures", type=Path)
+    parser.add_argument("--vendor-test", type=Path)
+    parser.add_argument("--output", type=Path)
+    parser.add_argument("--fold-captures", type=Path)
+    parser.add_argument("--core-view", choices=("k6-compact", "k8-compact", "fp8-compact"))
     parser.add_argument("--attention-reference", action="store_true",
                         help="diagnostic: use pinned vendor FP32 attention after measuring native stage")
     parser.add_argument("--teacher-force-markov", action="store_true",
                         help="diagnostic: keep reference previous token to remove recurrent cascade")
     args = parser.parse_args()
+    if args.fold_captures:
+        if not args.core_view:
+            parser.error("--fold-captures requires --core-view")
+        return compact_fold_reference(args.snapshot, args.core_view, args.fold_captures)
+    if not (args.fixtures and args.vendor_test and args.output):
+        parser.error("--fixtures, --vendor-test and --output are required for stage validation")
     vendor = Vendor(args.vendor_test)
     native = Native(os.environ["CUTEAFD_NATIVE_LIB"])
     torch.backends.cuda.matmul.allow_tf32 = False
