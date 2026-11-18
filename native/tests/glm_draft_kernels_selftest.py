@@ -886,7 +886,7 @@ def attention_check(lib, args):
         "cuteafd_glm_dflash_attention_workspace": ([C.c_int32] * 3, C.c_uint64),
         "cuteafd_glm_dflash_attention": ([P] * 10 + [C.c_int32] * 7 + [C.c_float, P], C.c_int32),
         "cuteafd_glmf_dspark_attention_workspace": ([C.c_int32] * 3, C.c_uint64),
-        "cuteafd_glmf_dspark_attention": ([P] * 10 + [C.c_int32] * 7 + [C.c_float, P], C.c_int32),
+        "cuteafd_glmf_dspark_attention": ([P] * 10 + [C.c_int32] * 8 + [C.c_float, P], C.c_int32),
     }
     baseline = C.CDLL(args.fp8_baseline) if args.fp8_baseline else None
     for native in [lib] + ([baseline] if baseline else []):
@@ -952,7 +952,7 @@ def attention_check(lib, args):
                     pointers.append(sinks.data_ptr() if sinks is not None else None)
                 return getattr(native, prefix + "_attention")(*pointers, output.data_ptr(),
                     workspace.data_ptr(), sequences, block, heads, kvh, ring, max_keys,
-                    int(causal) if family == "glmf" else window, dim ** -0.5, stream)
+                    *([window, int(causal)] if family == "glmf" else [window]), dim ** -0.5, stream)
 
             assert launch(lib, out, scratch) == 0
             torch.cuda.synchronize()

@@ -65,7 +65,8 @@ impl NativeLibrary {
 
     /// Shared attention over context capacity and the noise block. Full-context
     /// callers admit the complete position extent before allocation; no ring
-    /// truncation is implied by this API.
+    /// truncation is implied by this API. `window` is the checkpoint sliding
+    /// window (zero for full attention), applied relative to each block row.
     ///
     /// # Safety
     /// As [`Self::glmf_dspark_attention`], with `head_dim` replacing 64 and
@@ -73,10 +74,10 @@ impl NativeLibrary {
     #[allow(clippy::too_many_arguments)]
     pub unsafe fn block_dspark_attention(&self, q: P, k_block: P, v_block: P, k_context: P, v_context: P,
         slots: P, lengths: P, ends: P, out: M, workspace: M, sequences: usize, block: usize, heads: usize,
-        kv_heads: usize, capacity: usize, max_keys: usize, causal: bool, head_dim: usize, scale: f32,
+        kv_heads: usize, capacity: usize, max_keys: usize, window: usize, causal: bool, head_dim: usize, scale: f32,
         fp8_kv: bool, stream: M) -> Result<()> {
         type F = unsafe extern "C" fn(P, P, P, P, P, P, P, P, M, M,
-            i32, i32, i32, i32, i32, i32, i32, i32, f32, M) -> i32;
+            i32, i32, i32, i32, i32, i32, i32, i32, i32, f32, M) -> i32;
         // SAFETY: the symbol has the native signature above.
         let symbol: &[u8] = if fp8_kv { b"cuteafd_block_dspark_attention_fp8" } else { b"cuteafd_block_dspark_attention" };
         // SAFETY: both format-specific symbols have the native signature above.
@@ -84,7 +85,7 @@ impl NativeLibrary {
         // SAFETY: caller supplies live and correctly sized device buffers.
         // SAFETY: the caller supplies live buffers in the selected record format.
         check(unsafe { f(q, k_block, v_block, k_context, v_context, slots, lengths, ends, out, workspace,
-            i(sequences)?, i(block)?, i(heads)?, i(kv_heads)?, i(capacity)?, i(max_keys)?,
+            i(sequences)?, i(block)?, i(heads)?, i(kv_heads)?, i(capacity)?, i(max_keys)?, i(window)?,
             i32::from(causal), i(head_dim)?, scale, stream) }, "block attention")
     }
 
@@ -98,10 +99,10 @@ impl NativeLibrary {
     pub unsafe fn block_dspark_attention_paged(&self, q: P, k_block: P, v_block: P,
         k_context: P, v_context: P, slots: P, lengths: P, ends: P, pages: P,
         out: M, workspace: M, sequences: usize, block: usize, heads: usize,
-        kv_heads: usize, capacity: usize, max_keys: usize, causal: bool,
+        kv_heads: usize, capacity: usize, max_keys: usize, window: usize, causal: bool,
         head_dim: usize, table_width: usize, scale: f32, fp8_kv: bool, stream: M) -> Result<()> {
         type F = unsafe extern "C" fn(P, P, P, P, P, P, P, P, P, M, M,
-            i32, i32, i32, i32, i32, i32, i32, i32, i32, f32, M) -> i32;
+            i32, i32, i32, i32, i32, i32, i32, i32, i32, i32, f32, M) -> i32;
         let symbol: &[u8] = if fp8_kv { b"cuteafd_block_dspark_attention_paged_fp8" }
             else { b"cuteafd_block_dspark_attention_paged" };
         // SAFETY: both format-specific symbols have the native signature above.
@@ -109,7 +110,7 @@ impl NativeLibrary {
         // SAFETY: caller retains all visible pages and workspaces on the owned stream.
         check(unsafe { f(q, k_block, v_block, k_context, v_context, slots, lengths,
             ends, pages, out, workspace, i(sequences)?, i(block)?, i(heads)?,
-            i(kv_heads)?, i(capacity)?, i(max_keys)?, i32::from(causal), i(head_dim)?,
+            i(kv_heads)?, i(capacity)?, i(max_keys)?, i(window)?, i32::from(causal), i(head_dim)?,
             i(table_width)?, scale, stream) }, "paged block attention")
     }
 
@@ -147,14 +148,14 @@ impl NativeLibrary {
     #[allow(clippy::too_many_arguments)]
     pub unsafe fn glmf_dspark_attention(&self, q: P, k_block: P, v_block: P, k_ring: P, v_ring: P, seq_slots: P,
         ctx_lengths: P, ctx_ends: P, out: M, workspace: M, sequences: usize, block_rows: usize, heads: usize,
-        kv_heads: usize, ring: usize, max_keys: usize, causal: bool, scale: f32, fp8_kv: bool, stream: M) -> Result<()> {
-        type F = unsafe extern "C" fn(P, P, P, P, P, P, P, P, M, M, i32, i32, i32, i32, i32, i32, i32, f32, M) -> i32;
+        kv_heads: usize, ring: usize, max_keys: usize, window: usize, causal: bool, scale: f32, fp8_kv: bool, stream: M) -> Result<()> {
+        type F = unsafe extern "C" fn(P, P, P, P, P, P, P, P, M, M, i32, i32, i32, i32, i32, i32, i32, i32, f32, M) -> i32;
         let symbol: &[u8] = if fp8_kv { b"cuteafd_glmf_dspark_attention_fp8" } else { b"cuteafd_glmf_dspark_attention" };
         // SAFETY: both format-specific symbols have the native signature above.
         let f = *unsafe { self.lib.get::<F>(symbol) }?;
         check(unsafe {
             f(q, k_block, v_block, k_ring, v_ring, seq_slots, ctx_lengths, ctx_ends, out, workspace, i(sequences)?,
-                i(block_rows)?, i(heads)?, i(kv_heads)?, i(ring)?, i(max_keys)?, i32::from(causal), scale, stream)
+                i(block_rows)?, i(heads)?, i(kv_heads)?, i(ring)?, i(max_keys)?, i(window)?, i32::from(causal), scale, stream)
         }, "attention")
     }
 

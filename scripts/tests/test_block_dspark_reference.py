@@ -187,3 +187,38 @@ def test_lithos_parity_fixture_uses_native_config_and_explicit_context_only_wind
     assert 'drafter.causal =' not in source
     body = next(node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef) and node.name == "body")
     assert 'self.causal' in ast.unparse(body)
+
+
+def test_checkpoint_window_reaches_every_block_attention_entrypoint():
+    source = (ROOT / "native/families/glm5_flash/cuda/glmf_dspark.cu").read_text()
+    launches = source.split("return cuteafd::draft_attention::launch(")[1:]
+    assert len(launches) == 6
+    for launch in launches:
+        arguments = launch.split(";", 1)[0]
+        assert "max_keys, window, causal != 0" in arguments
+    runtime = (ROOT / "rust/crates/cuteafd-daemon/src/shared/speculation/block_dspark.rs").read_text()
+    calls = runtime.split(".block_dspark_attention(")[1:] + runtime.split(".block_dspark_attention_paged(")[1:]
+    assert len(calls) == 3  # TP2 partial, paged full, window ring
+    for call in calls:
+        assert "c.window.unwrap_or(0)" in call.split("?;", 1)[0]
+
+
+@pytest.mark.container_torch
+@pytest.mark.parametrize("window,position", [(17, 2500), (2048, 2500), (3072, 8192)])
+def test_reference_block_mask_is_query_relative(window, position):
+    torch = pytest.importorskip("torch")
+    # Exercise the mask statements used by body(), without loading any weights.
+    body = next(node for node in ast.walk(ast.parse(ORACLE.read_text()))
+                if isinstance(node, ast.FunctionDef) and node.name == "body")
+    start = next(i for i, node in enumerate(body.body)
+                 if isinstance(node, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "mask" for t in node.targets))
+    from types import SimpleNamespace
+    scope = dict(torch=torch, b=8, n_ctx=window, position=position,
+                 self=SimpleNamespace(window=window, causal=True, device="cpu"))
+    exec(compile(ast.Module(body=body.body[start:start + 3], type_ignores=[]), str(ORACLE), "exec"), scope)
+    mask = scope["mask"]
+    keys = torch.arange(position - window, position + 8)
+    queries = torch.arange(position, position + 8)
+    expected = (keys[None] > queries[:, None] - window) & (keys[None] <= queries[:, None])
+    assert torch.equal(mask, expected)
+    assert torch.all(mask.sum(-1) == window)
