@@ -677,7 +677,7 @@ fn installed_inkling_mc_tp2(mode: crate::plan::checkpoint::CoreView) -> anyhow::
     let draft_o = "mtp.layers.0.self_attn.o_proj.weight";
     let draft_down = "mtp.layers.0.mlp.down_proj.weight";
     for (rank, (target, drafter)) in weights.targets.iter().zip(&draft.weights).enumerate() {
-        assert_eq!(target.stored_head(), (rank == 0).then_some(201088));
+        assert_eq!(target.stored_head(), Some([100608, 100480][rank]));
         assert_eq!(drafter.arena.view("derived.fold_weight").is_some(), rank == 0);
         assert!(drafter.arena.view(&format!("{HEAD}.weight")).is_none());
         let programs = weights.compact_programs(&exports, rank, 2048)?;
@@ -998,6 +998,14 @@ fn head_split_native_sources_select_disjoint_rows_and_columns() -> anyhow::Resul
             assert_eq!(target.arena.view(&view).unwrap().bytes(), rows * row_bytes / 2);
             assert!(NativeSource::new(&checkpoint, &view, 1 - rank).is_err());
         }
+    }
+    let vocab = cfg.vocab_size;
+    for (rank, target) in targets.iter().enumerate() {
+        let view = format!("model.llm.unembed.weight#rank{rank}");
+        let source = NativeSource::new(&checkpoint, &view, rank)?;
+        assert_eq!(source.rows, if rank == 0 { 0..100608 } else { 100608..vocab });
+        assert_eq!(target.arena.view(&view).unwrap().bytes(), source.rows.len() * cfg.hidden * 2);
+        assert!(target.arena.view("model.llm.unembed.weight").is_none());
     }
     assert!(targets[0].mount_load(&checkpoint)?.full_row_cache > 0);
     Ok(())

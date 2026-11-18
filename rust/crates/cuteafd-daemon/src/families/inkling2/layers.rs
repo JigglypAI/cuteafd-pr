@@ -28,6 +28,7 @@ pub(crate) struct Kernels<'a> {
     pub narrow: cuteafd_ffi::F32Bf16Narrow<'a>,
     quant: cuteafd_ffi::programs::Program<'a>,
     sms: usize,
+    pub(super) draft_head: Option<DraftProjections<'a>>,
     compact: Option<CompactProjections<'a>>,
 }
 type TrellisGeometry = (usize, usize, usize, usize, &'static str);
@@ -142,7 +143,7 @@ impl<'a> Kernels<'a> {
             local_decode: Attention::load_rank(programs, Kind::Local, Route::Decode, false, head_parts)?,
             global_decode: Attention::load_rank(programs, Kind::Global, Route::Decode, kv_format == cuteafd_loader::families::inkling2::InklingKvCache::Fp8, head_parts)?, kv_format, head_parts,
             add: programs.library().f32_add()?, narrow: programs.library().f32_bf16_narrow()?,
-            quant, compact: None,
+            quant, compact: None, draft_head: None,
             sms: programs.library().sm_count()? as usize, producers, strided, replay })
     }
     fn producer(&self, op: Op) -> Result<&Producer<'a>> {

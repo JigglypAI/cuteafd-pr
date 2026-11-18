@@ -90,7 +90,8 @@ def test_arenas_are_single_backings_and_head_is_shared():
     assert 'padding_zero_exact = true' in weights
     head = (FAMILY/'head.rs').read_text()
     assert 'target_head::launch(' in head
-    assert 'cfg.unpadded_vocab_size as u32' in head
+    assert 'Self::with_local(stream, cfg, rows, stored_head, cfg.unpadded_vocab_size)' in head
+    assert 'split.handoff.copy_columns(' in head
     assert 'cuda_logits_softcap_f32_async' in head
     assert 'drain_or_abort' in head
     assert 'drain_or_abort' in (FAMILY/'owners.rs').read_text()

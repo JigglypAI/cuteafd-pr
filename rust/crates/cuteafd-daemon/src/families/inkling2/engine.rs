@@ -142,15 +142,16 @@ pub(crate) struct Peer<'a> {
     pub target: TargetWeights<'a>,
 }
 impl<'a> Peer<'a> {
-    fn units(&mut self, decode: bool) -> super::prefill::PeerUnits<'_, 'a> {
+    fn units(&mut self, decode: bool) -> (super::head::PeerHead<'_, 'a>, super::prefill::PeerUnits<'_, 'a>) {
         let (owners, uploads) = if decode {
             (std::slice::from_ref(&self.requests.decode), std::slice::from_mut(&mut self.requests.decode_uploads))
         } else {
             (self.requests.prefill.as_slice(), self.requests.prefill_uploads.as_mut_slice())
         };
+        (super::head::PeerHead { kernels: &self.kernels, target: &self.target },
         super::prefill::PeerUnits { exchange: &self.exchange, cache: &self.requests.cache,
             target: &self.target, kernels: &self.kernels, owners, uploads,
-            graphs: decode.then_some(&mut self.graphs) }
+            graphs: decode.then_some(&mut self.graphs) })
     }
 }
 
@@ -203,9 +204,10 @@ impl<'a> Execution<'a> {
         let media = placements.iter().map(|placement| placement.media.clone()).collect::<Vec<_>>();
         let result = (|| {
             let waves = self.link.exchange()?;
-            let mut io = TokenIo { kernels: &self.kernels, head: &self.head, cache: &self.requests.cache,
+            let (peer_head, peer_units) = self.peer.as_mut().map(|peer| peer.units(false)).unzip();
+            let mut io = TokenIo { kernels: &self.kernels, head: &self.head, peer_head, cache: &self.requests.cache,
                 target: &self.target, cfg: &self.cfg, tokens, media: &media, starts: &starts, slots: &slots, retained_rows: false, draft:self.draft.as_deref(),publish_draft:true,trace:None,on_logits };
-            Stateful { graphs: None, peer: self.peer.as_mut().map(|peer| peer.units(false)), kernels: &self.kernels, owners: &self.requests.prefill, cache: &self.requests.cache,
+            Stateful { graphs: None, peer: peer_units, kernels: &self.kernels, owners: &self.requests.prefill, cache: &self.requests.cache,
                 target: &self.target, cfg: &self.cfg, ingress: &self.ingress, placements, uploads: &mut self.requests.prefill_uploads,
                 waves, onboarded: self.local.len(), local: &self.local, next_identity: &mut self.next_identity,
                 placement_version: version, kind: cuteafd_transport::ExpertV2SourceKind::Prefill, io: &mut io }.run(units)?;
@@ -227,10 +229,11 @@ impl<'a> Execution<'a> {
         let media = placements.iter().map(|placement| placement.media.clone()).collect::<Vec<_>>();
         let result = (|| {
             let waves = self.link.exchange()?;
-            let mut io = TokenIo { kernels: &self.kernels, head: &self.head, cache: &self.requests.cache,
+            let (peer_head, peer_units) = self.peer.as_mut().map(|peer| peer.units(true)).unzip();
+            let mut io = TokenIo { kernels: &self.kernels, head: &self.head, peer_head, cache: &self.requests.cache,
                 target: &self.target, cfg: &self.cfg, tokens, media: &media, starts: &starts, slots: &slots, retained_rows: true, draft:self.draft.as_deref(),publish_draft:false,trace:self.width_trace.as_ref(),
                 on_logits: &mut |_, _, _| Ok(()) };
-            Stateful { graphs: self.graphs.as_mut(), peer: self.peer.as_mut().map(|peer| peer.units(true)), kernels: &self.kernels, owners: std::slice::from_ref(&self.requests.decode),
+            Stateful { graphs: self.graphs.as_mut(), peer: peer_units, kernels: &self.kernels, owners: std::slice::from_ref(&self.requests.decode),
                 cache: &self.requests.cache, target: &self.target, cfg: &self.cfg, ingress: &self.ingress, placements,
                 uploads: std::slice::from_mut(&mut self.requests.decode_uploads), waves,
                 onboarded: self.local.len(), local: &self.local, next_identity: &mut self.next_identity,

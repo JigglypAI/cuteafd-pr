@@ -94,7 +94,13 @@ impl<'a> Primitive<'a> {
         ensure!(rows>0 && rows<=cap,"recurrent primitive rows exceed export capacity");
         ensure!(eps.is_finite() && eps>0.,"recurrent primitive epsilon invalid");
         if self.op==Op::Fold { ensure!(first.checked_add(rows).is_some_and(|end|end<=201024),"fold row tile exceeds head"); }
-        let extents=self.op.shapes(rows)?;
+        let mut extents=self.op.shapes(rows)?;
+        if self.op==Op::Fold {
+            let end=first+rows;
+            extents[0]=end*4608*2;
+            extents[3]=end*256*2;
+            extents[4]=end*2;
+        }
         ensure!(buffers.len()==extents.len(),"recurrent primitive pointer count");
         let device=buffers[0].device_id;
         for (index,(&buffer,&bytes)) in buffers.iter().zip(&extents).enumerate() {
