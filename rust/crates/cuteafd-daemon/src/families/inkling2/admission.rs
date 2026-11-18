@@ -101,7 +101,7 @@ pub(crate) fn reconcile_native(plan: &ResolvedPlan, devices: CoordinatorDevices<
     receipts: &[Receipt]) -> Result<()> {
     let mut projected = devices.remap_plan_weight_arenas(plan)?;
     projected.facts.allocations.retain(|a| a.view.is_none() && a.location == Location::coordinator(0)
-        && a.lifetime.last >= Phase::PostTargetKv);
+        && a.lifetime.contains(Phase::PostTargetKv, PhaseOrder::TARGET_THEN_DRAFT));
     // Page-table overhead maps pinned owners; the projected device-only
     // witness excludes those host backings, so it must exclude their mappings
     // too. The complete admission above still charges them exactly once.
