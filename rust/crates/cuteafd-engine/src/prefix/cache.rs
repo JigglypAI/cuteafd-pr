@@ -409,10 +409,10 @@ impl<E: CopyEngine, M: Clone + Default> PrefixCache<E, M> {
                 promoted = restored.is_some();
                 // Promotion can evict the previous device candidate before failing.
                 // Do not fall back to approximate replay if an ancestor was available.
-                hit = if host_ancestor && !promoted { None }
+                hit = if promoted || host_ancestor { restored }
                 else if let Some(compatible) = compatible {
                     self.device_compatible_hit(tokens, media, sampled, compatible)
-                } else { restored };
+                } else { None };
             }
             if let Some(hit) = hit {
                 if compatible.is_some() {
@@ -420,9 +420,14 @@ impl<E: CopyEngine, M: Clone + Default> PrefixCache<E, M> {
                     if let Some(entry) = self.entries.get_mut(&hit.id) { entry.last_use = self.clock; }
                 }
                 let context = RestoreContext { native_tokens: native, media };
-                match self.restore_hit(family, &hit, tokens, &context, total, capacity.max(tokens.len()), promoted, &mut build) {
+                let result = self.restore_hit(family, &hit, tokens, &context, total, capacity.max(tokens.len()), promoted, &mut build);
+                if promoted {
+                    let mark = self.entries.get_mut(&hit.id).and_then(|e| e.mark.take());
+                    self.give_back(family, mark)?;
+                }
+                match result {
                     Ok(Some(admitted)) => return Ok(admitted),
-                    Ok(None) => self.stats.fork_no_room += 1,
+                    Ok(None) => {},
                     Err(PrefixError::Family { what, source }) => {
                         tracing::warn!(target: "cuteafd::prefix", what, error = %source, "prefix restore abandoned; prefilling");
                         self.stats.restore_failures += 1;
@@ -656,6 +661,7 @@ impl<E: CopyEngine, M: Clone + Default> PrefixCache<E, M> {
         let writable = family.write_frontier(source_end);
         let need = self.pool.fork_need_writable(source_end, total, writable);
         if !self.make_room_for(family, need, Some(hit.id))? {
+            self.stats.fork_no_room += 1;
             return Ok(None);
         }
         let entry = self.entries.get(&hit.id).expect("the hit is kept while making room");
@@ -715,10 +721,6 @@ impl<E: CopyEngine, M: Clone + Default> PrefixCache<E, M> {
             unreachable!("rollback always returns the admission error");
         }
         if temporary { self.give_back(family, mark)?; }
-        if promoted {
-            let mark = self.entries.get_mut(&hit.id).and_then(|e| e.mark.take());
-            self.give_back(family, mark)?;
-        }
         let host_hit = promoted || temporary;
         self.stats.host_hits += u64::from(host_hit);
         self.stats.device_hits += u64::from(!host_hit);
@@ -1599,7 +1601,7 @@ impl<E: CopyEngine, M: Clone + Default> PrefixCache<E, M> {
         let session = payload.session.clone();
         let meta = payload.family.clone();
         let saved_draft = payload.draft.clone();
-        let (resume, _, collision) = media_resume(self.layout.rule, tokens, media, &snapshot_tokens,
+        let (resume, common, collision) = media_resume(self.layout.rule, tokens, media, &snapshot_tokens,
             &saved_media, &after, sampled);
         if resume == 0 {
             self.stats.media_key_collisions += u64::from(collision);
@@ -1741,9 +1743,7 @@ impl<E: CopyEngine, M: Clone + Default> PrefixCache<E, M> {
             self.evict(family, evicted)?;
         }
         self.stats.host_promotions += 1;
-        Ok(if let Some(compatible) = compatible {
-            self.device_compatible_hit(tokens, media, sampled, compatible)
-        } else { self.lookup_media(tokens, media, sampled) })
+        Ok(Some(Hit { id, kind: hit.kind, resume, common, frontier: len }))
     }
 }
 
@@ -1763,7 +1763,16 @@ fn media_resume(rule: cuteafd_core::prefix::ReuseRule, tokens: &[u32], media: &[
     // restore starts empty, so rounding further down is safe (never claim an exact mark).
     // `common` stays raw: the family's plan picks its frontiers from it, and `restore_hit`
     // verifies both against the media of either prompt before forking a row.
-    resume = round_frontier(round_frontier(resume, media), saved_media);
-    if !verify_media(resume, saved_media, media) { return (0, common, true); }
+    let hit = RestoreCandidate { common, snapshot_end: saved_tokens.len(), target_end: tokens.len(),
+        resume, media, saved_media };
+    let verified = if rule == cuteafd_core::prefix::ReuseRule::V41 {
+        let plan = RestorePlan::under(rule, hit);
+        resume = plan.resume();
+        plan.lag.source_end
+    } else {
+        resume = hit.media_safe(resume);
+        resume
+    };
+    if !verify_media(verified, saved_media, media) { return (0, common, true); }
     (resume, common, false)
 }

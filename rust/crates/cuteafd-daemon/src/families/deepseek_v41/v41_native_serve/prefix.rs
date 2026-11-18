@@ -42,7 +42,7 @@ use crate::shared::memory::device::{Allocation, Device};
 use crate::shared::prefix::{cuda_copy::range, CudaCopyEngine};
 use cuteafd_engine::prefix::{
     After, BoxError, CaptureTicket, Captured, Eviction, FamilyLayout, Mark, MarkSlot, MarkStore,
-    PrefixCache, PrefixConfig, PrefixFamily, RestoreCandidate, RestoreContext, RestoreFidelity, RestorePlan, ReuseRule, TailCopy,
+    PrefixCache, PrefixConfig, PrefixFamily, RestoreCandidate, RestoreContext, RestorePlan, ReuseRule, TailCopy,
 };
 use cuteafd_hostcache::copy::DeviceRange;
 use serde::{Deserialize, Serialize};
@@ -173,18 +173,7 @@ pub(crate) fn layout(units: usize, draft: bool) -> FamilyLayout {
 /// Both frontiers must be outside images. Align again after media rounding because an
 /// image may start on an odd token, but ratio-two sources require complete groups.
 pub(crate) fn plan(hit: RestoreCandidate<'_>) -> RestorePlan {
-    if hit.common == hit.snapshot_end { return RestorePlan::under(ReuseRule::V41, hit); }
-    let mut source_end = hit.common;
-    loop {
-        let safe = hit.media_safe(source_end / 2 * 2);
-        if safe == source_end { break; }
-        source_end = safe;
-    }
-    let replay_start = hit.media_safe(source_end.saturating_sub(128));
-    RestorePlan { snapshot_end: hit.snapshot_end, target_end: hit.target_end,
-        lag: cuteafd_engine::prefix::LaggedState {
-            source_end: if replay_start == 0 { 0 } else { source_end }, replay_start },
-        fidelity: RestoreFidelity::ApproximateReplay }
+    RestorePlan::under(ReuseRule::V41, hit)
 }
 
 impl<'r, 'a, 'w, C: DraftChain<'a>> V41Prefix<'r, 'a, 'w, C> {
@@ -762,10 +751,6 @@ mod tests {
                 assert!(body.contains(guard), "{name} lost its ownership guard {guard:?}");
             }
         }
-        // The compute stream can read a forked tail as soon as replay is published.
-        let replay = bodies(production).into_iter().find(|(name, _)| *name == "restore_encoder_prefix")
-            .expect("partial restore").1;
-        assert!(replay.find("self.prefix_drain()?").unwrap() < replay.find("request.phase = CachePhase::EncoderReplay").unwrap());
         // The request layer captures only a request with no pending prefill or history.
         let requests = include_str!("../v41_requests.rs");
         for name in ["pub fn capture_mark", "pub fn queue_mark"] {

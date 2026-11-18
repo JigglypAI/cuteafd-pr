@@ -239,6 +239,68 @@ fn a_host_ancestor_beats_a_deeper_device_media_partial() {
 }
 
 #[test]
+fn odd_image_end_collapse_does_not_promote_or_spend_a_mark() {
+    for (start, expected) in [(15, 0), (129, 0), (131, 2)] {
+        let mut fake = Fake::new(512, 3, 8);
+        fake.rule = ReuseRule::V41;
+        let mut cache = cache(&fake, 1, 1 << 20);
+        let end = start + 192;
+        let first = seq(100, end + 100);
+        let media = [MediaSpan { start, len: 192, key: ImageKey([7; 32]).into() }];
+        let key = |tokens: &[u32]| MediaKeys::new(tokens, 5000, &media).unwrap();
+        let keyed = key(&first);
+        let p = media_capture(&mut cache, &fake, &keyed, &first, 0);
+        cache.release(&fake, &p.pages).unwrap();
+        fake.mem.borrow_mut().advance(10_000_000);
+        cache.tick();
+        let (_, _, filler) = serve(&mut cache, &fake, 1, &seq(3200, 32), &[], 32);
+        cache.release(&fake, &filler.pages).unwrap();
+        fake.mem.borrow_mut().advance(10_000_000);
+        cache.tick();
+        let mut branch = first;
+        branch[end] = 4999;
+        let keyed = key(&branch);
+        let before = cache.stats();
+        assert_eq!(cache.peek_media(keyed.tokens(), keyed.spans(), false), expected);
+        let hit = cache.admit_native(&fake, keyed.tokens(), &branch, keyed.spans(), branch.len(), false,
+            |pages| media_place(pages, 2)).unwrap();
+        assert_eq!(hit.resume, expected);
+        assert_eq!(hit.source.as_ref().map(|s| (s.host, s.partial)), (expected > 0).then_some((true, true)));
+        let after = cache.stats();
+        assert_eq!(after.host_promotions - before.host_promotions, u64::from(expected > 0));
+        assert_eq!(after.fork_no_room, before.fork_no_room);
+        assert_eq!(after.marks_in_use, before.marks_in_use);
+        cache.release(&fake, &hit.placement.pages).unwrap();
+    }
+}
+
+#[test]
+fn media_ranking_uses_the_plan_that_keeps_the_whole_image() {
+    let mut fake = Fake::new(1024, 3, 8);
+    fake.rule = ReuseRule::V41;
+    let mut cache = cache(&fake, 4, 0);
+    let media = [MediaSpan { start: 501, len: 192, key: ImageKey([8; 32]).into() }];
+    let key = |tokens: &[u32]| MediaKeys::new(tokens, 5000, &media).unwrap();
+    let query = seq(100, 800);
+    for (ring, kind, len, common) in [(0, SnapshotKind::Turn, 800, 693), (1, SnapshotKind::Prompt, 750, 694)] {
+        let mut tokens = query[..len].to_vec();
+        tokens[common] = 4999;
+        let keyed = key(&tokens);
+        let mut p = cache.admit_cold(&fake, len, len, |pages| media_place(pages, ring)).unwrap().placement;
+        let logits = fake.forward(&mut p, &tokens).unwrap();
+        assert!(cache.capture_media(&fake, kind, keyed.tokens(), keyed.spans(), &p, After::from_logits(&logits, true)).unwrap());
+        cache.release(&fake, &p.pages).unwrap();
+    }
+    let keyed = key(&query);
+    let hit = cache.admit_native(&fake, keyed.tokens(), &query, keyed.spans(), query.len(), false,
+        |pages| media_place(pages, 2)).unwrap();
+    let source = hit.source.unwrap();
+    assert_eq!(source.kind, SnapshotKind::Prompt);
+    assert_eq!(source.plan.lag, LaggedState { source_end: 694, replay_start: 501 });
+    cache.release(&fake, &hit.placement.pages).unwrap();
+}
+
+#[test]
 fn page_boundary_partial_is_exact_and_not_counted_as_replay() {
     let mut fake = Fake::new(64, 4, 8);
     fake.rule = ReuseRule::paged(ROWS);

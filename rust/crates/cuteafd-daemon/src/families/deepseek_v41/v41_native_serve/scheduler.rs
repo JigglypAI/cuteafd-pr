@@ -1056,9 +1056,7 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
                     &prompt[..prefill_end], image_keys.spans(), rows, cold)?;
                 job.prefix_cache_source.set(restored.cached, restored.source.as_ref().is_some_and(|source| source.host));
                 if let (Some(probe), Some(source)) = (&job.probe, &restored.source) {
-                    if probe.spec.record_state || scoring.is_some() {
-                        probe.provenance(serde_json::json!({"prefix_restore": source}));
-                    }
+                    probe.provenance(serde_json::json!({"prefix_restore": source}));
                     if probe.spec.record_state && requests.cache().stage(lease)? == crate::families::deepseek_v41::v41_backbone_cache::CacheStage::Full {
                         requests.record_state(lease, &job.probe, "restore")?;
                     }

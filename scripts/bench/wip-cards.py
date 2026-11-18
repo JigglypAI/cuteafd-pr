@@ -1223,17 +1223,11 @@ def image_prefix_attempt(url, dest, dump_root=None):
         for label, body in exact_bodies:
             # A turn ancestor inherits decode-produced KV, and image-b may have
             # approximate SWA state. Exact restores must match the capture, not cold.
-            reference = None
-            if label == 'next-turn' or dump_root:
-                reference = http(url, '/v1/bench/probe', dict(body=body,
-                    spec=dict(no_speculation=True, pair_exempt=True, record_state=True,
-                              record_rows=1, top_k=5)), timeout=600)
-                save(dest / f'image-prefix-{variant}-{label}-reference.json', reference)
             probes = []
-            for name, cold in [('cold', True), ('warm', False)] + ([('warm-repeat', False)] if reference else []):
+            for name, cold in [('reference', False), ('cold', True), ('warm', False), ('warm-repeat', False)]:
                 reply = http(url, '/v1/bench/probe', dict(body=body,
                     spec=dict(cold=cold, no_speculation=True, pair_exempt=True,
-                              record_state=reference is not None, record_rows=1, top_k=5)), timeout=600)
+                              record_state=True, record_rows=1, top_k=5)), timeout=600)
                 save(dest / f'image-prefix-{variant}-{label}-{name}.json', reply)
                 record = reply.get('probe') or {}
                 if record.get('cold') is not cold or record.get('no_speculation') is not True:
@@ -1241,12 +1235,9 @@ def image_prefix_attempt(url, dest, dump_root=None):
                 if not record.get('generated'):
                     raise ValueError(f'{variant}/{label}: exact probe omitted generated token IDs')
                 probes.append(record)
-            if reference is None:
-                if probes[0]['generated'] != probes[1]['generated']:
-                    raise ValueError(f'{variant}/{label}: cold/warm image output token IDs differ')
-            else:
-                image_next_turn_fidelity(reference['probe'], probes[1], probes[2])
-            if probes[1].get('cached_tokens', 0) < len(probes[0].get('prompt_ids') or []):
+            reference, cold, warm, repeat = probes
+            image_next_turn_fidelity(reference, warm, repeat)
+            if warm.get('cached_tokens', 0) < len(cold.get('prompt_ids') or []):
                 raise ValueError(f'{variant}/{label}: exact image prompt was not fully restored')
         if dump_root:
             # This namespace has only the divergent seed, never an exact image-b hit.

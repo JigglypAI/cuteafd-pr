@@ -552,6 +552,68 @@ mod rollback_tests {
     }
 
     #[test]
+    fn bounded_replay_drains_forked_tail_before_publishing() -> Result<()> {
+        let fixture = Fixture::build_for_tests()?;
+        let lib = fixture.load()?;
+        // This fixture defers device-to-device copies until their stream drains.
+        let mut bank = BackboneCache::new(&lib, 1, [4, 4, 4, 8], usize::MAX)?;
+        bank.use_engine_pages()?;
+        let lease = bank.begin_request(0, 7)?;
+        let from = bank.unit_pages(&[0]);
+        let to = bank.unit_pages(&[1]);
+        for (i, state) in bank.sources.iter().enumerate() {
+            for (page, byte) in [(from[i][0], 0x2a), (to[i][0], 0x59)] {
+                for segment in state.source_cache().page_segments(page) {
+                    lib.copy_h2d(segment, &vec![byte; segment.bytes])?;
+                }
+            }
+        }
+        bank.copy_unit_rows(0, 1, 200)?;
+        let tail = bank.sources[0].source_cache().page_segments(to[0][0])[0];
+        let mut bytes = vec![0; tail.bytes];
+        lib.copy_d2h(&mut bytes, tail)?;
+        assert_eq!(bytes[0], 0x59, "fork is not visible before the copy drains");
+        bank.bind_sources(lease, [&to[0], &to[1], &to[2], &to[3]], bank.source_rows(200))?;
+        assert_eq!(bank.restore_encoder_prefix(lease, 200, 72, 225)?, 72);
+        lib.copy_d2h(&mut bytes, tail)?;
+        assert_eq!(bytes[0], 0x2a, "replay can read the copied tail at publication");
+        assert_eq!(bank.history_end(lease)?, 72);
+        assert_eq!(bank.committed_end(lease)?, 200);
+        let request = bank.request(lease)?;
+        for (i, (state, &window)) in bank.windows.iter().zip(&request.windows).enumerate() {
+            let start = if i < 20 { 72 } else { 0 };
+            assert_eq!(state.span(window)?, (start, start));
+        }
+        bank.release(&[lease])?;
+        Ok(())
+    }
+
+    #[test]
+    fn replay_upload_failure_at_layer_k_keeps_the_lease_for_cold_rebind() -> Result<()> {
+        let fixture = Fixture::build_for_tests()?;
+        let lib = fixture.load()?;
+        fixture.immediate_copies(&lib)?;
+        let mut bank = BackboneCache::new(&lib, 1, [4, 4, 4, 8], usize::MAX)?;
+        bank.use_engine_pages()?;
+        let lease = bank.begin_request(0, 7)?;
+        let pages = bank.unit_pages(&[0]);
+        bank.bind_sources(lease, [&pages[0], &pages[1], &pages[2], &pages[3]], bank.source_rows(200))?;
+        fixture.fail_h2d_after(&lib, 7)?;
+        assert!(bank.restore_encoder_prefix(lease, 200, 72, 225).is_err());
+        let request = bank.request(lease)?;
+        assert_eq!(bank.windows[6].span(request.windows[6])?, (72, 72));
+        assert_eq!(bank.windows[7].span(request.windows[7])?, (0, 0));
+        bank.reset_prefix(lease)?;
+        let pages = bank.unit_pages(&[1]);
+        bank.bind_sources(lease, [&pages[0], &pages[1], &pages[2], &pages[3]], [0; 4])?;
+        assert_eq!(bank.request_id(lease)?, 7);
+        assert_eq!(bank.history_end(lease)?, 0);
+        bank.begin_encoder(lease, 225)?;
+        bank.release(&[lease])?;
+        Ok(())
+    }
+
+    #[test]
     fn failed_restore_keeps_lease_and_cold_rebinds_after_partial_layers() -> Result<()> {
         let fixture = Fixture::build_for_tests()?;
         let lib = fixture.load()?;

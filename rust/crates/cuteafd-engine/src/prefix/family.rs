@@ -74,7 +74,7 @@ pub enum Eviction {
 /// Whether a restore reproduces the state a prefill of the same tokens would have.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum RestoreFidelity {
-    /// The restored state has no approximate replay lineage.
+    /// The restore neither runs approximate replay nor inherits recorded approximation.
     Exact,
     /// Shared pages hold exact rows through `source_end`, but positional state restarts empty
     /// at `replay_start` and the replayed rows rebuild it approximately (a partial match),
@@ -135,11 +135,26 @@ impl RestorePlan {
     /// resumes at the rule's replay start with no mark, its pages forked through the same point.
     pub fn under(rule: ReuseRule, hit: RestoreCandidate<'_>) -> Self {
         let exact = hit.common == hit.snapshot_end;
-        let resume = if exact { hit.snapshot_end } else { hit.resume };
+        let lag = if exact {
+            LaggedState { source_end: hit.snapshot_end, replay_start: hit.snapshot_end }
+        } else if rule == ReuseRule::V41 {
+            // Source groups must be even and outside both sets of image spans.
+            // Calculate this before subtracting the window, including for lookup ranking.
+            let mut source_end = hit.common;
+            loop {
+                let safe = hit.media_safe(source_end / 2 * 2);
+                if safe == source_end { break; }
+                source_end = safe;
+            }
+            let replay_start = hit.media_safe(source_end.saturating_sub(rule.replay.unwrap_or(0)));
+            LaggedState { source_end: if replay_start == 0 { 0 } else { source_end }, replay_start }
+        } else {
+            LaggedState { source_end: hit.resume, replay_start: hit.resume }
+        };
         Self {
             snapshot_end: hit.snapshot_end,
             target_end: hit.target_end,
-            lag: LaggedState { source_end: resume, replay_start: resume },
+            lag,
             fidelity: if !exact && rule.replay.is_some() { RestoreFidelity::ApproximateReplay } else { RestoreFidelity::Exact },
         }
     }

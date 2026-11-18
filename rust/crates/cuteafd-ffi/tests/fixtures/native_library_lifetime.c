@@ -1065,7 +1065,11 @@ int cuteafd_cuda_set_device(int device) {
     return 0;
 }
 
+static int fail_h2d_after = -1;
+void fixture_fail_h2d_after(int successful) { fail_h2d_after = successful; }
+
 int cuteafd_copy_h2d(struct device_buffer dst, const void *source, size_t bytes) {
+    if (fail_h2d_after >= 0 && fail_h2d_after-- == 0) return 1;
     if (bytes > dst.bytes) return 1;
     if (extent_only) return 0;
     memcpy(dst.ptr, source, bytes);

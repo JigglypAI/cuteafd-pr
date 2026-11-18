@@ -148,17 +148,15 @@ impl<'a> WindowState<'a> {
         ensure!(position <= 1048576, "invalid window replay start");
         ensure!(
             self.slots[slot].end == 0 && self.slots[slot].version == 0,
-            "decoder replay requires a fresh window lease"
+            "replay requires a fresh window lease"
         );
         let written=self.ends.library.copy_h2d(
             slice(self.ends.buffer, slot * 8, 8), &position.to_ne_bytes()).and_then(|()| {
                 if let Some(replica)=&self.replica { replica.storage.reset_end(slot,position)?; }
                 Ok(())
             });
-        if let Err(error) = written {
-            self.slots[slot].request = None;
-            return Err(error);
-        }
+        // The backbone still owns this lease and will release/rebind it on failure.
+        written?;
         self.slots[slot].begin = position;
         self.slots[slot].end = position;
         self.slots[slot].version = 1;

@@ -397,6 +397,13 @@ impl Fixture {
         Ok(())
     }
 
+    /// Fail one synchronous upload after the given number of successful calls.
+    pub fn fail_h2d_after(&self, library: &NativeLibrary, successful: i32) -> Result<()> {
+        // SAFETY: this export belongs to the CPU-only fixture loaded above.
+        unsafe { library.lib.get::<unsafe extern "C" fn(i32)>(b"fixture_fail_h2d_after")?(successful); }
+        Ok(())
+    }
+
     pub fn configure_bind_after(&self, library: &NativeLibrary, completed: i32) -> Result<()> {
         // SAFETY: this export belongs to the CPU-only fixture loaded above.
         unsafe {
