@@ -30,8 +30,12 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
                     crate::placement::families::glm5::DECODE_ROWS as usize, drafts, options.glm5_attention_plan_rows)?;
                 let sms = options.physical_sms.unwrap_or_else(|| crate::placement::ArchContext::for_device(
                     "sm_120", options.rtx_bytes[0]).sms) as usize;
-                manifest.as_ref().map(|manifest| crate::placement::families::glm5::manifest_context_for_cards(
-                    &cfg, manifest, &[sms], plan)).transpose().map(Option::flatten)
+                manifest.as_ref().map(|manifest| {
+                    let mut manifest = (**manifest).clone();
+                    cuteafd_core::attention::select_sparse_mla_manifest(&mut manifest,
+                        report.attention_precision.as_ref().map(|precision| precision.mode).unwrap_or_default());
+                    crate::placement::families::glm5::manifest_context_for_cards(&cfg, &manifest, &[sms], plan)
+                }).transpose().map(Option::flatten)
             })();
             match selected {
                 Ok(context) => context_programs = context,

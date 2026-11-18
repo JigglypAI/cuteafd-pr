@@ -2366,7 +2366,9 @@ impl Opened {
                 && args.manifest.file_name() == Some("PROGRAMS.json".as_ref()) && fallback.exists() {
                 &fallback
             } else { &args.manifest };
-            Some(serde_json::from_slice::<serde_json::Value>(&std::fs::read(path)?)?)
+            let mut manifest = serde_json::from_slice(&std::fs::read(path)?)?;
+            cuteafd_core::attention::select_sparse_mla_manifest(&mut manifest, args.attention.attention_precision);
+            Some(manifest)
         } else { None };
         let available = available_manifest.as_ref().map(|manifest| -> Result<_> {
             let sms = std::iter::once(args.device).chain(split_device).map(|device|

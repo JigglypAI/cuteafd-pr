@@ -19,20 +19,30 @@ impl std::fmt::Display for AttentionPrecision {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str(self.name()) }
 }
 
-/// Accept only the shared AOT sparse MLA ABI, not context partials or other
+/// Accept only the shared AOT sparse MLA ABI, not unrelated
 /// programs which also use BF16/FP8 in their names.
 pub fn sparse_mla_precision_stem(name: &str) -> Option<(&str, AttentionPrecision)> {
     let (stem, precision) = name.strip_suffix("_bf16").map_or((name, AttentionPrecision::Fp8),
         |stem| (stem, AttentionPrecision::Bf16));
     let (family, suffix) = stem.split_once("_sparse_mla_")?;
     let (kind, rows) = suffix.rsplit_once("_m")?;
-    if rows.is_empty() || !rows.bytes().all(|x| x.is_ascii_digit()) { return None; }
-    let supported = match family {
+    let digits = |text: &str| !text.is_empty() && text.bytes().all(|x| x.is_ascii_digit());
+    if !digits(rows) { return None; }
+    let partial = kind.strip_prefix("partial_h").or_else(|| kind.strip_prefix("nope_partial_h"));
+    let supported = if let Some(shape) = partial {
+        let (heads, splits) = shape.split_once("_s")?;
+        digits(heads) && digits(splits) && match family {
+            "ml4" => true,
+            "glm" | "glmf" | "dsv4f" | "dsv4p" => kind.starts_with("partial_h"),
+            _ => false,
+        }
+    } else { match family {
         "glm" | "glm2" | "glmf" | "glmf2" => matches!(kind, "decode" | "prefill"),
+        "ml4" | "ml42" => matches!(kind, "decode" | "prefill" | "nope_decode" | "nope_prefill"),
         "dsv4f" | "dsv4f2" | "dsv4p" | "dsv4p2" => matches!(kind,
             "decode_win" | "decode_c4" | "decode_c128" | "prefill_win" | "prefill_c4" | "prefill_c128"),
         _ => false,
-    };
+    }};
     supported.then_some((stem, precision))
 }
 
@@ -80,7 +90,8 @@ mod tests {
         let original = serde_json::json!({"programs": [
             {"name": base, "scratch": 12},
             {"name": "glm_sparse_mla_decode_m64_bf16", "scratch": 34},
-            {"name": "glm_sparse_mla_partial_h0_s1_m64", "scratch": 56},
+            {"name": "ml4_sparse_mla_nope_partial_h0_s1_m64", "scratch": 56},
+            {"name": "ml4_sparse_mla_nope_partial_h0_s1_m64_bf16", "scratch": 78},
         ]});
         for (mode, bytes) in [(AttentionPrecision::Bf16, 34), (AttentionPrecision::Fp8, 12)] {
             let mut manifest = original.clone();
@@ -88,7 +99,8 @@ mod tests {
             let programs = manifest["programs"].as_array().unwrap();
             assert_eq!(programs.len(), 2);
             assert_eq!(programs.iter().find(|p| p["name"] == base).unwrap()["scratch"], bytes);
-            assert!(programs.iter().any(|p| p["scratch"] == 56));
+            let partial_bytes = if mode == AttentionPrecision::Bf16 { 78 } else { 56 };
+            assert_eq!(programs.iter().find(|p| p["name"] == "ml4_sparse_mla_nope_partial_h0_s1_m64").unwrap()["scratch"], partial_bytes);
         }
     }
 
