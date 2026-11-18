@@ -92,7 +92,7 @@ fn installed_inkling_recurrent_head_baseline() -> Result<()> {
     use crate::{families::inkling2::{layers::Kernels, weights::{ProjectionWeight, TargetWeights}},
         shared::memory::device::Event};
     use cuteafd_loader::{families::inkling2::{Inkling2Config, InklingKvCache,
-        weight_layout::{CoordinatorWeights, HEAD}}, placement::{FfnMode, LayerMode}};
+        weight_layout::{CoordinatorWeights, HEAD}}};
 
     let snapshot = std::path::PathBuf::from(std::env::var("CUTEAFD_GOLDEN_SNAPSHOT")?);
     let mode = std::env::var("CUTEAFD_TEST_CORE_VIEW")?.parse::<CoreView>()?;
@@ -111,16 +111,9 @@ fn installed_inkling_recurrent_head_baseline() -> Result<()> {
     let rank = Rank::allocate(weights, Rc::clone(&stream), config.clone(), runtime, native)?;
 
     let view = CheckpointView::select(&snapshot, mode)?;
-    let checkpoint = Checkpoint::open_view(&view)?;
+    let checkpoint = Checkpoint::open_view_for_role(&view, "recurrent-head-bench", |name| name.starts_with(HEAD))?;
     let cfg = Inkling2Config::from_hf(&checkpoint.config)?;
-    let layers = vec![LayerMode::Whole { gpu: 0, ffn: FfnMode::Owner }; cfg.layers];
-    let mut layout = CoordinatorWeights::plan(&checkpoint, &cfg, 1, &layers)?.remove(0);
-    layout.layers.clear();
-    layout.core.retain(|name, _| name == HEAD);
-    layout.fp8.retain(|name, _| name == HEAD);
-    layout.arena = WeightArenaLayout::new("inkling2/recurrent-head-bench", layout.arena.views().iter()
-        .filter(|(name, _)| name.starts_with(&format!("{HEAD}.")))
-        .map(|(name, view)| (name.clone(), view.bytes())))?;
+    let layout = CoordinatorWeights::head_only(&checkpoint, &cfg)?;
     let target = TargetWeights::load(device, &checkpoint, &layout)?;
     let stored = layout.stored_head().unwrap_or(config.padded_vocab);
     let f32_stage = Allocation::new(device, 64*stored*4, Tag::drafter_workspace("head-bench/f32"))?;
