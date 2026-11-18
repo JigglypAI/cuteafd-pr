@@ -113,14 +113,36 @@ impl Client {
 
     /// Ask this serving instance for its once-per-launch conditioning receipt.
     pub(crate) fn warm_prelude(&self, tokens: u64) -> Result<Value> {
-        let response = self.authorize(self.agent.post(&format!("{}/v1/bench/prelude", self.base)))
-            .timeout(Duration::from_secs(900)).send_json(json!({"tokens":tokens}))
-            .context("timed benchmark requires this server's warm prelude endpoint")?;
+        self.server_prelude(tokens, false)?.context("timed benchmark requires this server's warm prelude endpoint")
+    }
+
+    fn server_prelude(&self, tokens: u64, allow_legacy: bool) -> Result<Option<Value>> {
+        let response = match self.authorize(self.agent.post(&format!("{}/v1/bench/prelude", self.base)))
+            .timeout(Duration::from_secs(900)).send_json(json!({"tokens":tokens})) {
+            Ok(response) => response,
+            Err(ureq::Error::Status(404, _)) if allow_legacy => return Ok(None),
+            Err(error) => return Err(error).context("timed benchmark requires this server's warm prelude endpoint"),
+        };
         let receipt: Value = response.into_json()?;
         crate::prelude::validate(&receipt)?;
         let status = self.get("/v1/bench/status")?;
         anyhow::ensure!(status["server_instance"] == receipt["server_instance"], "warm prelude belongs to a different server instance");
-        Ok(receipt)
+        Ok(Some(receipt))
+    }
+
+    /// Frozen servers lack the endpoint; replay the same conditioning traffic.
+    pub(crate) fn matched_prelude(&mut self, tokens: u64) -> Result<(Value, &'static str)> {
+        anyhow::ensure!((1..=crate::sweep::MAX_TOKENS).contains(&tokens), "invalid matched prelude token limit");
+        if let Some(receipt) = self.server_prelude(tokens, true)? {
+            anyhow::ensure!(receipt["tokens"] == tokens, "server conditioned with a different token limit");
+            return Ok((receipt, "server-v1"));
+        }
+        self.discover()?;
+        let mut receipt = crate::prelude::run(self, tokens)?;
+        receipt["tokens"] = json!(tokens);
+        receipt["rounds"] = json!(crate::prelude::ROUNDS);
+        receipt["complete"] = json!(true);
+        Ok((receipt, "client-v1"))
     }
 
     /// The served model id and its `/v1/models` record; sets `self.model`.
@@ -457,6 +479,75 @@ fn merge_tool_calls(calls: &mut Vec<Value>, deltas: &[Value]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn matched_prelude_replays_the_server_sequence_only_on_endpoint_not_found() {
+        use std::io::Write;
+        for (code, expected_path) in [(200, Some("server-v1")), (404, Some("client-v1")), (500, None)] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let worker = std::thread::spawn(move || {
+                let serve = |method: &str, path: &str, code: u16, reply: &str| {
+                    let (mut socket, _) = listener.accept().unwrap();
+                    socket.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                    let mut reader = BufReader::new(socket.try_clone().unwrap());
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    assert!(line.starts_with(&format!("{method} {path} ")), "unexpected request: {line}");
+                    let mut length = 0;
+                    loop {
+                        line.clear();
+                        assert!(reader.read_line(&mut line).unwrap() > 0);
+                        if line == "\r\n" { break; }
+                        if let Some(value) = line.to_lowercase().strip_prefix("content-length:") {
+                            length = value.trim().parse::<usize>().unwrap();
+                        }
+                    }
+                    let mut body = vec![0; length];
+                    reader.read_exact(&mut body).unwrap();
+                    write!(socket, "HTTP/1.1 {code} fixture\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}", reply.len()).unwrap();
+                    if body.is_empty() { Value::Null } else { serde_json::from_slice(&body).unwrap() }
+                };
+                let tokens = 192;
+                let receipt = json!({"schema":crate::prelude::SCHEMA,"tokens":tokens,"complete":true,
+                    "requests":vec![Value::Null;6],"server_instance":"fixed"});
+                let body = serve("POST", "/v1/bench/prelude", code, &receipt.to_string());
+                assert_eq!(body["tokens"], tokens);
+                if code == 200 {
+                    serve("GET", "/v1/bench/status", 200, r#"{"server_instance":"fixed"}"#);
+                } else if code == 404 {
+                    serve("GET", "/v1/models", 200, r#"{"data":[{"id":"model","supports_thinking_off":true}]}"#);
+                    let mut requests = 0;
+                    for round in 0..crate::prelude::ROUNDS {
+                        for (kind, prompt) in crate::baseline::CONTENT {
+                            serve("GET", "/v1/stats", 200, "{}");
+                            serve("GET", "/v1/console/snapshot", 200, "{}");
+                            let body = serve("POST", "/v1/chat/completions", 200,
+                                "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1}}\n\ndata: [DONE]\n\n");
+                            assert_eq!(body["messages"][0]["content"], format!("[cuteafd-bench-prelude-v1-{round}-{kind}] {prompt}"));
+                            assert_eq!(body["max_tokens"], tokens);
+                            assert_eq!(body["temperature"], 0);
+                            requests += 1;
+                            serve("GET", "/v1/stats", 200, "{}");
+                            serve("GET", "/v1/console/snapshot", 200, "{}");
+                        }
+                    }
+                    assert_eq!(requests, 6);
+                    serve("GET", "/v1/stats", 200, "{}");
+                }
+            });
+            let mut client = Client::new(&format!("http://{address}"), None, Default::default());
+            let result = client.matched_prelude(192);
+            worker.join().unwrap();
+            if let Some(path) = expected_path {
+                let (receipt, actual_path) = result.unwrap();
+                assert_eq!(actual_path, path);
+                assert_eq!(receipt["requests"].as_array().unwrap().len(), 6);
+            } else {
+                assert!(result.unwrap_err().to_string().contains("requires this server's warm prelude endpoint"));
+            }
+        }
+    }
 
     #[test]
     fn assistant_replay_preserves_reasoning_and_tool_calls_without_inventing_text() {

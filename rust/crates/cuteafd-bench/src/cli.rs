@@ -189,12 +189,23 @@ fn check_panel_config(report: &mut Report, configs: &crate::panel_config::PanelC
 
 /// Starts a run on `options.url`, follows it to the end and writes the exports.
 pub fn run(options: &RunOptions) -> Result<(Report, PathBuf)> {
+    run_conditioned(options, None)
+}
+
+pub(crate) fn run_conditioned(options: &RunOptions, conditioning: Option<(&Value, &str)>) -> Result<(Report, PathBuf)> {
     crate::panel_config::validate(&options.panel_config)?;
     let base = options.url.trim_end_matches('/').to_string();
     let agent = agent();
     let key = options.api_key.as_deref().map(cuteafd_api::openai::auth::ApiKey::new).transpose().map_err(anyhow::Error::msg)?;
     let client = crate::client::Client::new(&base, None, Default::default()).with_api_key(key);
-    let prelude = client.warm_prelude(crate::sweep::TOKENS)?;
+    let native_prelude;
+    let (prelude, path) = match conditioning {
+        Some(value) => value,
+        None => {
+            native_prelude = client.warm_prelude(crate::sweep::TOKENS)?;
+            (&native_prelude, "server-v1")
+        }
+    };
     let mut body = json!({});
     if let Some(profile) = &options.profile {
         body["profile"] = json!(profile);
@@ -256,7 +267,12 @@ pub fn run(options: &RunOptions) -> Result<(Report, PathBuf)> {
     // run's own gate check and a run recovered from the local store after the
     // server went away cannot carry a verdict the data no longer earns.
     let mut report = crate::quality::under_current_rule(&report);
-    anyhow::ensure!(report.prelude.as_ref() == Some(&prelude), "timed report omitted or changed this server's warm prelude receipt");
+    if path == "client-v1" {
+        anyhow::ensure!(report.prelude.is_none(), "legacy server unexpectedly ran a second warm prelude");
+        report.prelude = Some(prelude.clone());
+    } else {
+        anyhow::ensure!(report.prelude.as_ref() == Some(prelude), "timed report omitted or changed this server's warm prelude receipt");
+    }
     check_context_suffix(&mut report, options.context_suffix.unwrap_or(0));
     check_panel_config(&mut report, &options.panel_config);
     let written = write_exports(&report, &dir, &options.export)?;

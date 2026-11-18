@@ -88,6 +88,7 @@ SUMMARY_METRICS = ('C1', 'C8', 'sweep C1', 'sweep C4', 'sweep C8', 'sweep C16', 
 FIDELITY_PANELS = {'fidelity', 'fidelity_full'}
 IMAGE_PREFIX_PROBES = {'image-prefix', 'image-prefix-partial'}
 IMAGE_PROBES = {'image'} | IMAGE_PREFIX_PROBES
+SCOPED_PANELS = {'hardware', 'configuration', 'decode_content', 'concurrency', 'spec_lossless_set'}
 LOWER_IS_BETTER = {'kl', 'readiness_s'}  # also every 'prefill N TTFT s'
 FAILURE = re.compile(r'(?i)(\berror\b|\bpanicked\b|\bfatal\b|\bfailed\b|undefined symbol|no such file|refus|exited:|timed out|out of memory|traceback)')
 @functools.lru_cache(maxsize=None)
@@ -724,6 +725,8 @@ def binary_supports(binary, repo, job, needs):
                             capture_output=True, text=True, timeout=120)
     if result.returncode:
         raise ValueError(f"{binary} bench smoke --dry-run failed: {(result.stderr or result.stdout).strip().splitlines()[-1:]}")
+    if 'matched_panel_window' in needs and 'matched_panel_window=true' not in result.stderr:
+        raise ValueError(f'{binary} lacks matched panel windows; pass a current shared host runner with --binary')
     if 'warm_prelude' in needs and 'warm_prelude=server-v1' not in result.stderr:
         raise ValueError(f'{binary} lacks the server-owned warm prelude; build a current cuteafd and pass --binary before using hardware')
     missing = [field for field in needs if field + '=' not in result.stderr]
@@ -2178,6 +2181,7 @@ def summarize_job(job, exit_code):
             fail(row, f'final census evidence: {error}', 'measurement')
     if 'artifacts' in job: row['artifacts'] = job['artifacts']
     if 'launcher' in job: row['launcher'] = job['launcher']
+    report = None
     reports = list((dest / 'reports').glob('**/report.json'))
     if job.get('grouped'):
         reports = [path for path in reports if path.parent.name.endswith('-' + job['entry']['name'])]
@@ -2343,6 +2347,19 @@ def summarize_job(job, exit_code):
     if job.get('nonce_seed'):
         text = '\n'.join(ANSI.sub('', p.read_text(errors='replace')) for p in (dest / 'smoke' / 'logs').glob('*.coordinator.log'))
         hashes = prompt_token_hashes(text)
+        all_hashes = hashes
+        window = outcome.get('matched_panel_window')
+        if job['entry'].get('matched_panel_window'):
+            try:
+                measured, untimed = measured_prompt_hashes(text, window, report)
+                hashes = [h for wave in measured for h in wave]
+                row['measured_prompt_waves'] = measured
+                row['matched_panel_window'] = window
+                row['untimed_prompt_token_hashes'] = untimed
+            except (ValueError, KeyError, TypeError) as error:
+                hashes = []
+                fail(row, f'matched timed prompt attestation: {error}', 'measurement')
+        row['all_prompt_token_hashes'] = all_hashes
         # Concurrent admission reorders requests, so pairs match on the whole
         # set of shared input-determined prompts; follow-up and arm-local
         # diagnostic prompts are reported but not compared.
@@ -2397,6 +2414,64 @@ def prompt_token_hashes(text):
     return MATCHED_PROMPT.findall(text)
 
 
+def measured_prompt_hashes(text, window, report):
+    """Legacy servers lack per-request phase tags. The host brackets the run;
+    the two measured panel protocols provide exact counts and order within it.
+    Fail closed if a panel, an admission, or its timestamp is missing."""
+    if not window or not report:
+        raise ValueError('missing host measurement window or report')
+    if window['prelude_path'] not in {'server-v1', 'client-v1'}:
+        raise ValueError('unknown warm prelude path')
+    lo, hi = window['start_unix_s'], window['end_unix_s']
+    if not (math.isfinite(lo) and math.isfinite(hi) and 0 < lo < hi):
+        raise ValueError('invalid host measurement window')
+    inside, untimed = [], []
+    for line in text.splitlines():
+        match = MATCHED_PROMPT.search(line)
+        if not match:
+            continue
+        stamp = datetime.datetime.fromisoformat(line.split()[0].replace('Z', '+00:00'))
+        if stamp.tzinfo is None:
+            raise ValueError('missing coordinator timestamp time zone')
+        (inside if lo <= stamp.timestamp() <= hi else untimed).append(match[1])
+    phases = []
+    for panel in report['panels']:
+        name = panel['id']
+        if name not in SCOPED_PANELS:
+            raise ValueError(f'cannot attest measurement panel {name!r}')
+        if name not in {'decode_content', 'concurrency'}:
+            continue
+        if panel['status'] != 'done' or not panel['passes']:
+            raise ValueError(f'incomplete measurement panel {name!r}')
+        for result in panel['passes']:
+            if name == 'decode_content':
+                phases.extend((0, 1) for _ in result['rows'])
+            else:
+                for point in result['points']:
+                    c = point['c']
+                    if type(c) is not int or c < 1 or point.get('errors') != 0 or point.get('prompts') != 'distinct-v1' or point.get('phase'):
+                        raise ValueError('concurrency point is not a successful distinct-v1 closed batch')
+                    phases.append((c, c))
+    if not phases or any(n <= 0 for _, n in phases) or sum(a + b for a, b in phases) != len(inside):
+        raise ValueError(f'expected {sum(a + b for a, b in phases)} panel admissions, got {len(inside)}')
+    measured, start = [], 0
+    for warm, timed in phases:
+        untimed.extend(inside[start:start + warm])
+        start += warm
+        measured.append(sorted(inside[start:start + timed]))
+        start += timed
+    return measured, untimed
+
+
+def scoped_panel_window(card):
+    profile = card.get('profile', '')
+    panels = set(profile[7:].split(',')) if profile.startswith('panels:') else set()
+    return (card.get('baseline') is False and panels <= SCOPED_PANELS
+            and bool(panels & {'decode_content', 'concurrency'})
+            and not card.get('levels') and not card.get('prefill_lengths')
+            and not card.get('panel_config', {}).get('concurrency', {}).get('sustained'))
+
+
 def follow_up_prompts(text):
     """Output-dependent prompts reported, which pairs do not compare."""
     return len(FOLLOW_UP_PROMPT.findall(text))
@@ -2441,8 +2516,8 @@ def validate_matched_pairs(rows, arm_names):
         pair = [r for r in rows if r['card'] == card and r['repeat'] == repeat]
         if {r['arm'] for r in pair} != set(arm_names):
             continue  # Not all arms have completed yet.
-        hashes = [tuple(r.get('prompt_token_hashes') or ()) for r in pair]
-        if not all(hashes) or len(set(hashes)) != 1:
+        hashes = [r.get('measured_prompt_waves', r.get('prompt_token_hashes')) for r in pair]
+        if not all(hashes) or any(h != hashes[0] for h in hashes[1:]):
             for row in pair:
                 fail(row, 'matched pair missing or mismatched prompt token hashes', 'measurement')
                 row['exit_code'] = row.get('exit_code') or 81
@@ -2513,6 +2588,10 @@ def write_summary(state, rows, arms):
     text = f'# wip-cards summary: {state.name}\n\n'
     failed = [r for r in rows if r['status'] != 'pass']
     text += f'{len(rows) - len(failed)} of {len(rows)} jobs passed.\n\n'
+    warm_paths = [f"{r['card']}/{r['arm']}/r{r['repeat']}: {r['matched_panel_window']['prelude_path']}"
+                  for r in rows if r.get('matched_panel_window')]
+    if warm_paths:
+        text += 'Matched prelude paths: ' + ', '.join(warm_paths) + '.\n\n'
     # Before -> after per card and metric: medians of passing real-hardware rows,
     # ratio after/before, and the paired median where pairs exist.
     if len(names) > 1:
@@ -3520,7 +3599,7 @@ def main():
         raise ValueError('override/probe names must be selected cards')
     for card in cards:
         if args.matched_prompts or args.nonce_seed is not None:
-            if args.matched_prompts and any(
+            if not scoped_panel_window(card) and args.matched_prompts and any(
                     (probes[card['name']] | arm_probes.get(arm, {}).get(card['name'], set()))
                     & IMAGE_PROBES for arm in arms):
                 raise ValueError('--matched-prompts cannot precede its first benchmark request with an image probe')
@@ -3594,6 +3673,9 @@ def main():
         job['binary'] = resolve_binary(args.binary, arms[job['arm']], args.dry_run)
         if arm_env.get(job['arm']):
             job['arm_env'] = arm_env[job['arm']]
+        if (args.matched_prompts or args.nonce_seed is not None) and scoped_panel_window(job['entry']):
+            job['entry']['matched_panel_window'] = True
+            save(Path(job['state']) / 'matrix.json', dict(build='wip-cards', entries=[job['entry']]))
         save(Path(job['state']) / 'job.json', {**job, 'probes': sorted(job['probes'])})
     parallel_safe(jobs, args.parallel)
     for job in jobs:
@@ -3672,9 +3754,10 @@ def main():
         (['context_suffix'] if args.context_suffix is not None else []) + \
         (['panel_config'] if panel_config else []) + \
         (['worker_stop'] if any(job['entry']['set'].get('PROFILE_SPARK') for job in jobs) else [])
-    for job in {j['launcher']['repo']: j for j in reversed(jobs)}.values():
+    for job in {(j['launcher']['repo'], bool(j['entry'].get('matched_panel_window'))): j for j in reversed(jobs)}.values():
         requested_panels(job['entry'].get('profile', 'smoke'), binary=job['binary'])
-        binary_supports(job['binary'], job['launcher']['repo'], job, fields)
+        binary_supports(job['binary'], job['launcher']['repo'], job,
+                        fields + (['matched_panel_window'] if job['entry'].get('matched_panel_window') else []))
     # Everything checkable without hardware, before any queue ticket.
     problems = []
     for job in jobs:

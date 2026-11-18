@@ -22,7 +22,7 @@ use std::process::{Child, Command, Stdio};
 use std::os::unix::process::CommandExt;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone, clap::Args)]
 pub struct SmokeArgs {
@@ -154,6 +154,9 @@ pub struct Entry {
     /// + quick quality); default true. Needs a server build that honours it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub baseline: Option<bool>,
+    /// Attest a panel-only matched run on either a current or a frozen server.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub matched_panel_window: Option<bool>,
     /// A measurement window around the timed part of the sweep (needs levels or
     /// prefill_lengths), e.g. a profiler's capture range.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -531,6 +534,7 @@ impl Entry {
             sweep_tokens: self.sweep_tokens.or(defaults.sweep_tokens),
             sweep_c1: self.sweep_c1.clone().or_else(|| defaults.sweep_c1.clone()),
             baseline: self.baseline.or(defaults.baseline),
+            matched_panel_window: self.matched_panel_window.or(defaults.matched_panel_window),
             window: self.window.clone().or_else(|| defaults.window.clone()),
             lossless_set: self.lossless_set.clone().or_else(|| defaults.lossless_set.clone()),
             lossless_dump: self.lossless_dump.clone().or_else(|| defaults.lossless_dump.clone()),
@@ -598,6 +602,19 @@ pub struct Outcome {
     pub caveats: Vec<String>,
     #[serde(default)]
     pub ab_verdict: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub matched_panel_window: Option<MatchedPanelWindow>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MatchedPanelWindow {
+    pub start_unix_s: f64,
+    pub end_unix_s: f64,
+    pub prelude_path: String,
+}
+
+fn unix_seconds() -> Result<f64> {
+    Ok(SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs_f64())
 }
 
 fn expand(path: &str) -> PathBuf {
@@ -1108,13 +1125,13 @@ pub fn run(args: SmokeArgs) -> Result<()> {
     check_nested_holds(&pending)?;
     if args.dry_run {
         for e in &pending {
-            eprintln!("  {} api_key_file={} family={} gpus={:?} sparks={:?} locks={:?} levels={:?} post_load_c1={} post_load_repeat={} prefill_lengths={:?} prefill_repeat={} prefill_idle_seconds={} prefill_purge={} sweep_tokens={} baseline={} window={} lossless_set={} lossless_dump={:?} lossless_concurrency={} context_lengths={:?} context_levels={:?} context_suffix={} panel_config={} fabric={} worker_stop={} warm_prelude=server-v1 set={:?}",
+            eprintln!("  {} api_key_file={} family={} gpus={:?} sparks={:?} locks={:?} levels={:?} post_load_c1={} post_load_repeat={} prefill_lengths={:?} prefill_repeat={} prefill_idle_seconds={} prefill_purge={} sweep_tokens={} baseline={} window={} lossless_set={} lossless_dump={:?} lossless_concurrency={} context_lengths={:?} context_levels={:?} context_suffix={} panel_config={} fabric={} worker_stop={} warm_prelude=server-v1 matched_panel_window={} set={:?}",
                 e.name, e.set.get("API_KEY_FILE").map_or("-", String::as_str), e.family.as_deref().unwrap_or("?"), e.gpus, e.sparks, locks_for(e), e.levels,
                 e.post_load_c1.unwrap_or(false), e.post_load_repeat.unwrap_or(false), e.prefill_lengths,
                 e.prefill_repeat.unwrap_or(false), e.prefill_idle_seconds.unwrap_or(0.0), e.prefill_purge.is_some(),
                 e.sweep_tokens.unwrap_or(crate::sweep::TOKENS), e.baseline.unwrap_or(true), e.window.is_some(),
                 e.lossless_set.as_deref().unwrap_or("default"), e.lossless_dump, e.lossless_concurrency.unwrap_or(1), e.context_lengths, e.context_levels, e.context_suffix.unwrap_or(0), serde_json::json!(e.panel_config), e.fabric.unwrap_or(true),
-                WORKER_STOP, e.set);
+                WORKER_STOP, e.matched_panel_window.unwrap_or(false), e.set);
         }
         return Ok(());
     }
@@ -1637,11 +1654,18 @@ fn run_entry(entry: &Entry, repo: &Path, out_root: &Path, configs: &Path, logs: 
         let api_key = std::env::var("CUTEAFD_API_KEY").ok().or_else(|| config.get("API_KEY_FILE")
             .and_then(|file| std::fs::read_to_string(file).ok()).map(|key| key.trim().to_string()).filter(|k| !k.is_empty()));
         let sweeping = entry.levels.is_some() || entry.prefill_lengths.is_some();
-        let prelude = {
+        let (prelude, prelude_path) = {
             let key = api_key.as_deref().map(cuteafd_api::openai::auth::ApiKey::new).transpose().map_err(anyhow::Error::msg)?;
-            let client = crate::client::Client::new(&url, None, Arc::new(AtomicBool::new(false))).with_api_key(key);
+            let mut client = crate::client::Client::new(&url, None, Arc::new(AtomicBool::new(false))).with_api_key(key);
             let tokens = entry.sweep_tokens.unwrap_or(crate::sweep::TOKENS);
-            client.warm_prelude(if tokens == 0 { crate::sweep::TOKENS } else { tokens })?
+            let tokens = if tokens == 0 { crate::sweep::TOKENS } else { tokens };
+            if entry.matched_panel_window == Some(true) {
+                anyhow::ensure!(!sweeping && panels.as_ref().is_some_and(|list| !list.is_empty()) && entry.baseline == Some(false),
+                    "matched panel windows require explicit standalone panels, without a baseline or sweep");
+                client.matched_prelude(tokens)?
+            } else {
+                (client.warm_prelude(tokens)?, "server-v1")
+            }
         };
         let run_sweep = || -> Result<crate::sweep::Sweep> {
             let open: crate::sweep::OnTimed = entry.window.as_ref().map(|window| -> Box<dyn FnOnce() -> Result<()> + '_> {
@@ -1689,7 +1713,16 @@ fn run_entry(entry: &Entry, repo: &Path, out_root: &Path, configs: &Path, logs: 
             deadline: Some(Duration::from_secs(entry.run_timeout_s.unwrap_or(900))),
             lossless_set: entry.lossless_set.as_ref().map(|p| crate::panels::lossless::CaseSet::load(&repo.join(p)))
                 .transpose()?, lossless_dump: entry.lossless_dump.clone(), lossless_concurrency: entry.lossless_concurrency, context_lengths: entry.context_lengths.clone(), context_levels: entry.context_levels.clone(), context_suffix: entry.context_suffix, panel_config: entry.panel_config.clone() };
-        let (mut report, dir) = crate::cli::run(&options)?;
+        let (mut report, dir) = if entry.matched_panel_window == Some(true) {
+            let start_unix_s = unix_seconds()?;
+            let result = crate::cli::run_conditioned(&options, Some((&prelude, prelude_path)));
+            outcome.matched_panel_window = Some(MatchedPanelWindow {
+                start_unix_s, end_unix_s: unix_seconds()?, prelude_path: prelude_path.into(),
+            });
+            result?
+        } else {
+            crate::cli::run(&options)?
+        };
         anyhow::ensure!(report.prelude.as_ref() == Some(&prelude), "server changed warm prelude receipt before timing");
         // Publication markers are runner metadata, not serving defaults. This
         // also works against images built before these markers existed.

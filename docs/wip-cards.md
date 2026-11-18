@@ -68,7 +68,15 @@ with their fixed token limits. Authenticated console rounds report per-request
 emitted tok/s (first-token-to-retirement decode time), tokens/step and ms/step
 (round service time); round-service tok/s is reported separately. Missing or different first-request token hashes fail the pair. This
 requires arm images with opt-in prompt-hash telemetry; release cards without
-the flag keep their existing prompts.
+the flag keep their existing prompts. For cross-version pairs, use a current
+shared `--binary` and `--panels decode_content,concurrency,spec_lossless_set`
+(or either speed panel alone, without the basic card). The host runs the same
+six untimed conditioning requests through the server endpoint when present,
+or replays them as chat on a legacy server. It records `server-v1` or
+`client-v1` per arm and compares admitted prompt token hashes per timed wave;
+prechecks, conditioning, the closed-batch warm waves and arm-local lossless
+probes are recorded but not compared. An unsupported panel combination uses
+the ordinary whole-run hash contract and still needs the server endpoint.
 
 Optional `--build baseline=REV --build candidate=REV` freezes separate source
 worktrees, uses identical family scopes, stages sealed slots to the union of
