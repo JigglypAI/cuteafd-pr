@@ -596,7 +596,8 @@ impl KimiRecipe {
             let layers = modes.iter().enumerate().map(|(layer, &mode)|
                 LayerLayout::ranks_with_core(cfg, layer, mode, core, self.gpus)).collect::<anyhow::Result<Vec<_>>>()?;
             for (rank, global) in globals.iter().enumerate() {
-                let layout = coordinator_arena(rank, global, &layers.iter().map(|pair| &pair[rank]).collect::<Vec<_>>())?;
+                let rank_layers = layers.iter().map(|pair| &pair[rank]).collect::<Vec<_>>();
+                let layout = coordinator_arena(rank, global, &rank_layers)?;
                 let fixed = self.fixed.iter().filter(|owner| owner.rank as usize == rank && owner.category == Category::Weights)
                     .try_fold(0u64, |sum, owner| sum.checked_add(owner.bytes).ok_or_else(|| anyhow::anyhow!("Kimi fixed weight overflow")))?;
                 let attention = modes.iter().zip(&self.layer_attention).try_fold(0u64, |sum, (mode, weights)| {
@@ -611,6 +612,9 @@ impl KimiRecipe {
                     "Kimi arena differs from selected native payload");
                 let mut components = weight_arena_components(&layout, Location::coordinator(rank as u8),
                     Lifetime::RESIDENT, self.maximum_pages, cuteafd_core::memory_layout::MemoryKind::Weights)?;
+                if global.core_head.is_some() || rank_layers.iter().any(|layer| !layer.core.is_empty()) {
+                    components.push(crate::shared::dense_read::trellis_device_staging(rank as u8, self.maximum_pages));
+                }
                 if profiled {
                     for component in &mut components { component.activation = Activation::choice(0, option); }
                 }
@@ -1170,6 +1174,48 @@ pub fn request(context: impl Into<crate::placement::planner::Context>, pool: Opt
 mod tests {
     use super::*;
     use crate::placement::FfnMode;
+
+    #[test]
+    fn trellis_staging_follows_the_selected_target_rank() -> anyhow::Result<()> {
+        use crate::families::kimi_k3::{config::KimiK3Config,
+            core::{CoreInventory, CoreProjection, CoreSplit}, weight_layout::{GlobalLayout, LayerLayout}};
+        use crate::formats::exl3_storage::Exl3Codebook;
+        let cfg = KimiK3Config::from_hf(&crate::families::kimi_k3::config::tests::release_config())?;
+        for compact in [false, true] {
+            let mut core = CoreInventory::default();
+            if compact {
+                let stem = "language_model.lm_head";
+                core.projections.insert(stem.into(), CoreProjection { stem: stem.into(), bits: 6,
+                    shape: [cfg.vocab_size, cfg.hidden], stored_outputs: cfg.vocab_size.div_ceil(128) * 128,
+                    split: CoreSplit::Whole, codebook: Exl3Codebook::Mcg, source_bytes: 0 });
+            }
+            let mut recipe = recipe();
+            recipe.owners.clear();
+            recipe.gpus = 2;
+            recipe.attention.fill(LayerMode::HeadSplit);
+            recipe.records_per_page.push(0);
+            recipe.experts.as_mut().unwrap().destination = vec![0, 1];
+            for arena in &mut recipe.arenas {
+                arena.peak.push(0);
+                arena.resident.push(0);
+                arena.weights.push(0);
+            }
+            for (rank, global) in GlobalLayout::ranks_with_core(&cfg, &core, 2)?.iter().enumerate() {
+                let bytes = recipe.attention.iter().enumerate().try_fold(global.bytes()?, |bytes, (layer, &mode)| {
+                    Ok::<_, anyhow::Error>(bytes + LayerLayout::ranks_with_core(&cfg, layer, mode, &core, 2)?[rank].bytes()?)
+                })? as u64;
+                recipe.fixed.push(FixedOwner { rank: rank as u8, category: Category::Weights,
+                    group: "Kimi global weights".into(), bytes, weights: bytes,
+                    lifetime: Lifetime::RESIDENT, basis: Basis::Exact });
+            }
+            recipe.layer_attention.fill(ModeBytes { whole: 0, split: [0; 2] });
+            recipe.arena_padding(&cfg, &core)?;
+            let contract = recipe.prepare(&single())?;
+            let facts = contract.facts(&vec![0; contract.variables.len()], 1)?;
+            crate::shared::dense_read::assert_trellis_device_staging(&facts, if compact { &[1] } else { &[] });
+        }
+        Ok(())
+    }
 
     #[test]
     fn expert_usage_recipe_charges_exact_canonical_device_and_host_owners() {

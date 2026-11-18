@@ -432,6 +432,12 @@ impl<'a> Step5Recipe<'a> {
             let mut backings = Vec::new();
             let reservation =
                 Reservation::new(&cache, rank, inputs.sequences as u64, marks, 1, usize::MAX)?;
+            // Target and predictor load before the same recorded delivery (or
+            // on serial mounts), so a rank with both uses only one backing.
+            if native[rank].weight_arenas.iter().any(|(arena, _, _)|
+                arena.views().keys().any(|name| name.ends_with(".trellis"))) {
+                weights.push(crate::shared::dense_read::trellis_device_staging(rank as u8, maximum_pages));
+            }
             for (arena, logical, kind) in &native[rank].weight_arenas {
                 ensure!(logical.0 <= arena.bytes() as u64, "Step-5 logical weights exceed arena");
                 let mut components = weight_arena_components(arena, Location::coordinator(rank as u8),

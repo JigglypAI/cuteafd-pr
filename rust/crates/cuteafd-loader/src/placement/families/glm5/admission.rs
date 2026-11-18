@@ -2324,6 +2324,15 @@ impl Recipe for GlmRecipe<'_> {
                 .map_err(|error| invalid(&error.to_string()))?;
             let mut components = weights.components(self.maximum_pages)?;
             components.extend(weights.loading_components(self.maximum_pages)?);
+            // #1242's K4-v1 census had no target trellises and predates
+            // the recorded GLM core uploader (ec7a1b96d4). Its post-load
+            // untracked samples do not cover this transient backing.
+            for rank in 0..self.gpus {
+                if weights.owners.iter().any(|owner| owner.allocation.location == Location::coordinator(rank as u8)
+                    && owner.format == "exl3-k6") {
+                    components.push(crate::shared::dense_read::trellis_device_staging(rank as u8, self.maximum_pages));
+                }
+            }
             domains.append(&mut contract, &case.when, components)?;
         }
         for case in &self.graphs {
