@@ -557,7 +557,9 @@ def inkling2_load_programs():
     from b12x.integration.cuteafd.inkling2_glue import compile_padded_transpose_aot
     transforms = (("bf16", "bfloat16", 16, 1024, 64),
                   ("bf16", "bfloat16", 4608, 256, 4608),
-                  ("f32", "float32", 32, 201088, 32))
+                  ("f32", "float32", 32, 201088, 32),
+                  ("f32", "float32", 32, 100608, 32),
+                  ("f32", "float32", 32, 100480, 32))
     return [(f"padded_transpose_{suffix}_r{r}_c{c}_p{p}", "padded_transpose",
              {"dtype": dtype, "rows": r, "cols": c, "padded_cols": p},
              partial(compile_padded_transpose_aot, dtype=getattr(torch, dtype), rows=r, cols=c, padded_cols=p))
@@ -2154,7 +2156,7 @@ def main() -> None:
         from export_b12x_dense_trellis_k6_aot import INKLING_SHAPES, INKLING_TARGET_SHAPES
         existing_fp8 = {suffix for family, suffix, *_ in work if family == "native_attention"}
         fp8_shapes = {(k, n, "f32") for _, k, n, _ in INKLING_TARGET_SHAPES}
-        fp8_shapes.update((k, n, "bf16") for _, k, n, _ in INKLING_SHAPES if n != 201088)
+        fp8_shapes.update((k, n, "bf16") for _, k, n, _ in INKLING_SHAPES if n not in (201088, 100608, 100480))
         for k, n, precision in sorted(fp8_shapes):
             for rows in (64, 4096):
                 suffix = f"n{n}_k{k}_m{rows}" + ("_f32" if precision == "f32" else "")
@@ -2166,7 +2168,7 @@ def main() -> None:
             family = "fir" if suffix == "fir_history_commit" else "inkling2"
             name = "history_commit" if family == "fir" else suffix
             work.append((family, name, op, params, compile_))
-        for k, n in sorted(inkling_draft_projection_shapes(1) | inkling_draft_projection_shapes(2)):
+        for k, n in sorted(inkling_draft_projection_shapes(1) | inkling_draft_projection_shapes(2) | {(4608, 100608), (4608, 100416)}):
             work.append(("draft_bf16", f"k{k}_n{n}", "bf16_projection", {"max_rows": 4096},
                          lambda k=k, n=n: compile_draft_bf16_projection(k, n)))
         for k, n in ((9728, 768), (256, 201024)):

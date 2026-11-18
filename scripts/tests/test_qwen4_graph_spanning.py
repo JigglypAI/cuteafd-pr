@@ -8,16 +8,16 @@ FAMILY = ROOT / "rust/crates/cuteafd-daemon/src/families/qwen4"
 
 def test_qwen4_site_flags_match_checked_in_classification():
     classification = (FAMILY / "graph_spanning.rs").read_text()
-    classes = dict(re.findall(r'\("([^"]+)", (true|false),', classification))
-    assert classes == {"qwen4.segment": "false"}
+    classes = dict(re.findall(r'\("([^"]+)", Scope::(Local|Declared|Spanning),', classification))
+    assert classes == {"qwen4.segment": "Local"}
     engine = (FAMILY / "engine.rs").read_text()
     configure = engine.split("pub fn configure_graph_cache(", 1)[1].split("fn visit_graphs(", 1)[0]
     observer = engine.split("fn visit_graphs(", 1)[1].split("fn graph_completed(", 1)[0]
-    assert 'spans_devices: super::graph_spanning::spans("qwen4.segment")?' in configure
-    assert 'super::graph_spanning::spans("qwen4.segment")?, bank)?' in observer
+    assert 'spans_devices: super::graph_spanning::spans("qwen4.segment"),' in configure
+    assert 'super::graph_spanning::spans("qwen4.segment"), bank)?' in observer
     assert "self.gdn_banks.len() > 1" not in configure + observer
-    assert 'unclassified Qwen4 graph site {name}' in classification
-    assert 'spans("new-unreviewed-site").is_err()' in classification
+    assert '("qwen4.segment", Scope::Local,' in classification
+    assert 'assert!(super::spans("new-unreviewed-site"))' in classification
 
 
 def test_qwen4_peer_operations_stay_outside_replay():

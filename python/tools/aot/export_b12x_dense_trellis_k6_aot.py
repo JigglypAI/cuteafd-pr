@@ -156,10 +156,12 @@ INKLING_SHAPES = (
     ("inkling_mlp_up", 4608, 18432, 1), ("inkling_mlp_up_tp2", 4608, 9216, 1),
     ("inkling_mlp_down", 18432, 4608, 1), ("inkling_mlp_down_tp2", 9216, 4608, 2),
     ("inkling_head", 4608, 201088, 1),
+    ("inkling_head_rank0", 4608, 100608, 1),
+    ("inkling_head_rank1", 4608, 100480, 1),
 )
-INKLING_TARGET_SHAPES = INKLING_SHAPES[:8] + INKLING_SHAPES[-1:]
+INKLING_TARGET_SHAPES = INKLING_SHAPES[:8] + INKLING_SHAPES[-3:]
 FAMILY_SHAPES = {"inkling2": INKLING_SHAPES, "kimik3": KIMI_SHAPES, "glm": GLM_SHAPES, "glmf": GLMF_SHAPES, "step5": STEP5_SHAPES, "muse": MUSE_SHAPES, "ml4": ML4_SHAPES}
-F32_OUTPUTS = (163840, 154880, 128896, 202112, 204800, 201088)
+F32_OUTPUTS = (163840, 154880, 128896, 202112, 204800, 201088, 100608, 100480)
 F32_GEOMETRIES = frozenset({(4096, 8192, 2), (2048, 8192, 2)})
 
 
@@ -197,11 +199,15 @@ GROUPED_SHAPES = {"kda_qkvg_tp2": 4}
 GROUPED_MAX_ROWS = 4096
 
 
+def _codebooks(name):
+    return ("mcg",) if name.startswith("inkling_head_rank") else ("mcg", "mul1")
+
+
 def row_policies(families=("kimik3",)):
     result = []
     for item in shapes_for(families):
         name, k, n, side = item[:4]
-        for book in ("mcg", "mul1"):
+        for book in _codebooks(name):
             result.append(dict(shape=name, input_features=k, output_features=n,
                 sharded_side=side, codebook=book,
                 **({} if _bits(item) == 6 else {"bits": _bits(item)}),
@@ -254,10 +260,12 @@ def programs_for_shapes(shapes, *, max_rows=4096, f32_outputs=F32_OUTPUTS, input
     result = []
     for item in shapes:
         name, k, n, side = item[:4]
-        for codebook in ("mcg", "mul1"):
+        for codebook in _codebooks(name):
             params = dict(input_features=k, output_features=n, bits=_bits(item),
                           codebook=codebook, sharded_side=side,
                           rotation_count=1, max_rows=max_rows, **core_dtype)
+            if name.startswith("inkling_head_rank"):
+                params.update(compact_head_shard=True, input_dtype="bf16")
             result.append((f"trellis_{name}_{codebook}{_suffix(item)}", "trellis_linear", params,
                            partial(compile_trellis_linear_aot, **params)))
     for k in sorted({item[1] for item in shapes}):

@@ -192,6 +192,10 @@ impl<'r, 'a> MuseBackend<'r, 'a> {
         }
         self.graph_enabled.set(enabled);
         if !enabled { return Ok(()); }
+        // Every Muse segment is rank-local: `GRAPH_PREWARM=off` leaves them to
+        // first-use capture (#2303).
+        let Some(_startup) = crate::shared::decode_graph::sites::startup(
+            super::graph_sites::spans("muse_spark.segment", false)) else { return Ok(()) };
         let Some(layout) = cuteafd_loader::serving_capacity::muse_graphs::layout(self.ranks.len(), onboard_layers) else {
             tracing::warn!(ranks = self.ranks.len(), onboard_layers,
                 "Muse layout has no graph trace; bootstrap is empty and unpinned");

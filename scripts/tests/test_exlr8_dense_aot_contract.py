@@ -683,6 +683,7 @@ def test_inkling2_dispatch_package_codes_cmake_and_placement_scopes_agree(monkey
                 and "kimi_split" in ast.unparse(node.value))
     names = []
     fp8 = set()
+    draft_head_shards = set()
     for family, suffix, op, params, thunk in namespace["work"]:
         namespace.update(family=family, suffix=suffix, op=op)
         exec(compile(ast.Module(body=[stem], type_ignores=[]), "stem", "exec"), namespace)
@@ -702,13 +703,18 @@ def test_inkling2_dispatch_package_codes_cmake_and_placement_scopes_agree(monkey
             fp8.add((k, n, rows, output))
         else:
             assert op == "bf16_projection" and family == "draft_bf16"
-            assert thunk()[2] == "f32"
+            k, n, output = thunk()
+            if output == "bf16":
+                draft_head_shards.add((k, n))
+            else:
+                assert output == "f32"
+    assert draft_head_shards == {(4608, 100608), (4608, 100416)}
     expected_fp8 = {(k, n, rows, "f32") for _, k, n, _ in compact.INKLING_TARGET_SHAPES
         for rows in (64, 4096)}
     expected_fp8.update((k, n, rows, "bf16") for _, k, n, _ in compact.INKLING_SHAPES
-        if n != 201088 for rows in (64, 4096))
+        if n not in (201088, 100608, 100480) for rows in (64, 4096))
     assert fp8 == expected_fp8
-    assert len(namespace["work"]) == 12 + 1 + 13 + 2 + len(expected_fp8)
+    assert len(namespace["work"]) == 12 + 1 + 13 + 2 + len(expected_fp8) + len(draft_head_shards)
     assert names == [
         (f"inkling2_{kind}_attention_{route}_{fmt}_v2_m{rows}{tp}",
          dict(kind=kind, route=route, max_rows=rows, kv_format=fmt))

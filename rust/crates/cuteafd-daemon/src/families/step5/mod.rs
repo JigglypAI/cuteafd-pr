@@ -1,4 +1,5 @@
 //! Native Step-5 storage owners; execution remains unavailable until admitted.
+mod graph_sites;
 mod admission;
 mod backend;
 mod cache;

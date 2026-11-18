@@ -1,5 +1,6 @@
 //! GLM 5.3 Flash (glm5_next) on the generic engine: weights, the coordinator
 //! programs' layer chain, and the golden comparison command.
+mod graph_sites;
 pub(crate) mod dspark;
 #[cfg(test)]
 mod draft_push_tests;

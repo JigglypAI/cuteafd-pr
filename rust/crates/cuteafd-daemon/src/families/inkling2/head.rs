@@ -15,10 +15,39 @@ pub(crate) struct Head<'a> {
     pub logits: Allocation<'a>,
     compact_logits: Option<(usize, Allocation<'a>)>,
     rows: usize,
+    local_vocab: usize,
+    split: Option<Split<'a>>,
 }
+
+struct Split<'a> {
+    handoff: crate::shared::distributed_head::Handoff<'a>,
+    peer: HeadShard<'a>,
+    lead_logits: Allocation<'a>,
+}
+
+struct HeadShard<'a> {
+    stream: Rc<Stream<'a>>,
+    input: Allocation<'a>,
+    logits: Allocation<'a>,
+    weight: Option<(VocabularyHead<'a>, Allocation<'a>)>,
+    draft_output: Option<Allocation<'a>>,
+    valid: usize,
+    pitch: usize,
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct PeerHead<'s, 'a> {
+    pub kernels: &'s Kernels<'a>,
+    pub target: &'s TargetWeights<'a>,
+}
+
 impl<'a> Head<'a> {
     /// Caller admits tokens, normalized, logits and shared BLAS workspace first.
     pub fn new(stream: Rc<Stream<'a>>, cfg: &Inkling2Config, rows: usize, stored_head: Option<usize>) -> Result<Self> {
+        Self::with_local(stream, cfg, rows, stored_head, cfg.unpadded_vocab_size)
+    }
+    fn with_local(stream: Rc<Stream<'a>>, cfg: &Inkling2Config, rows: usize,
+        stored_head: Option<usize>, local_vocab: usize) -> Result<Self> {
         ensure!(rows>0 && rows<=4096, "Inkling head rows exceed export");
         let d = stream.device;
         let alloc = |bytes, name| Allocation::new(d, bytes, Tag::workspace(name));
@@ -27,15 +56,47 @@ impl<'a> Head<'a> {
         let logits = alloc(rows*cfg.unpadded_vocab_size*4, "inkling2/head/logits")?;
         let compact_logits = stored_head.map(|stored| Ok::<_, anyhow::Error>((stored,
             alloc(rows.min(64)*stored*4, "inkling2/head/compact_logits")?))).transpose()?;
-        let bf16_head = if stored_head.is_none() {
-            let workspace = alloc(cuteafd_ffi::programs::VOCABULARY_HEAD_WORKSPACE, "inkling2/head/blas")?;
-            // SAFETY: the admitted workspace outlives every launch, and the
-            // unpadded vocabulary makes the stored tail rows unreachable.
-            let head = d.run(|| unsafe { d.library.vocabulary_head_rows(workspace.buffer.ptr, cfg.hidden as u32,
-                rows as u32, cfg.unpadded_vocab_size as u32, TargetHead::configured().native_mode()) })?;
-            Some((head, workspace))
-        } else { None };
-        Ok(Self { stream, bf16_head, tokens, normalized, logits, compact_logits, rows })
+        let bf16_head = if stored_head.is_none() { Some(blas(&stream, cfg.hidden, rows, local_vocab)?) } else { None };
+        Ok(Self { stream, bf16_head, tokens, normalized, logits, compact_logits, rows, local_vocab, split: None })
+    }
+    pub fn pair(stream: Rc<Stream<'a>>, peer_stream: Rc<Stream<'a>>, cfg: &Inkling2Config,
+        rows: usize, stored: [Option<usize>;2], draft: bool) -> Result<Self> {
+        let valid = super::vocab_span(cfg, 0)?.len();
+        let peer_valid = super::vocab_span(cfg, 1)?.len();
+        let mut head = Self::with_local(stream.clone(), cfg, rows, stored[0], valid)?;
+        let local = |bytes, name| Allocation::new(stream.device, bytes, Tag::workspace(name));
+        let remote = |bytes, name| Allocation::new(peer_stream.device, bytes, Tag::workspace(name));
+        let lead_logits = local(rows*valid*4, "inkling2/head/local_logits")?;
+        let pitch = stored[1].unwrap_or(peer_valid);
+        let peer = HeadShard {
+            input: remote(rows*cfg.hidden*2, "inkling2/head/peer_input")?,
+            logits: remote(rows*pitch*4, "inkling2/head/peer_logits")?,
+            weight: if stored[1].is_none() { Some(blas(&peer_stream, cfg.hidden, rows, peer_valid)?) } else { None },
+            draft_output: if draft && stored[1].is_some() {
+                Some(remote(rows*pitch*2,"inkling2/head/peer_draft_output")?)
+            } else { None },
+            stream: peer_stream.clone(), valid: peer_valid, pitch,
+        };
+        head.split = Some(Split { handoff: crate::shared::distributed_head::Handoff::new(stream, peer_stream)?, peer, lead_logits });
+        Ok(head)
+    }
+    pub(super) fn peer_weight(&self) -> Option<usize> { self.split.as_ref().map(|s| s.peer.pitch) }
+    pub(super) fn stream(&self) -> &Stream<'a> { &self.stream }
+    pub(super) fn local_stage(&self) -> Result<Buffer> {
+        self.split.as_ref().map(|s| s.lead_logits.buffer).ok_or_else(|| anyhow::anyhow!("Inkling local shard stage missing"))
+    }
+    pub(super) fn peer_stream(&self) -> Option<&Stream<'a>> { self.split.as_ref().map(|s| s.peer.stream.as_ref()) }
+    pub(super) fn peer_draft_output(&self) -> Result<Buffer> {
+        self.split.as_ref().and_then(|s| s.peer.draft_output.as_ref()).map(|a| a.buffer)
+            .ok_or_else(|| anyhow::anyhow!("Inkling peer draft stage missing"))
+    }
+    pub(super) fn peer_stages(&self) -> Result<(Buffer,Buffer)> {
+        let split = self.split.as_ref().ok_or_else(|| anyhow::anyhow!("Inkling peer head missing"))?;
+        Ok((split.peer.input.buffer,split.peer.logits.buffer))
+    }
+    pub(super) fn handoff(&self) -> Option<&crate::shared::distributed_head::Handoff<'a>> {
+        self.split.as_ref().map(|s| &s.handoff)
+
     }
     /// The recurrent head borrows the verifier's idle, same-stream stages.
     pub(super) fn compact_stages(&self) -> Result<(usize, Buffer, Buffer)> {
@@ -50,9 +111,16 @@ impl<'a> Head<'a> {
         }
         if let Some((_, workspace)) = &self.bf16_head { workspace.inventory(inventory, &format!("{prefix}.workspace"))?; }
         if let Some((_, owner)) = &self.compact_logits { owner.inventory(inventory, &format!("{prefix}.compact_logits"))?; }
+        if let Some(split) = &self.split {
+            split.lead_logits.inventory(inventory, &format!("{prefix}.local_logits"))?;
+            split.peer.input.inventory(inventory, &format!("{prefix}.peer_input"))?;
+            if let Some(output) = &split.peer.draft_output { output.inventory(inventory, &format!("{prefix}.peer_draft_output"))?; }
+            split.peer.logits.inventory(inventory, &format!("{prefix}.peer_logits"))?;
+            if let Some((_, owner)) = &split.peer.weight { owner.inventory(inventory, &format!("{prefix}.peer_workspace"))?; }
+        }
         Ok(())
     }
-    pub fn embed(&self, k: &Kernels<'_>, owner: &UnitOwner<'_>, target: &TargetWeights<'_>,
+    pub fn embed(&self, k: &Kernels<'_>, owner: &UnitOwner<'_>, target: &TargetWeights<'a>,
         cfg: &Inkling2Config, tokens: &[u32]) -> Result<()> {
         ensure!(!tokens.is_empty() && tokens.len()<=self.rows && tokens.iter().all(|&t| (t as usize)<cfg.unpadded_vocab_size),
             "Inkling embedding token bounds");
@@ -76,7 +144,7 @@ impl<'a> Head<'a> {
     /// Prefill embedding uses existing unit planes, not the bounded vocabulary
     /// head's <=64-row token/normalization storage. `first` is metadata scratch
     /// until segment_metadata publishes convolution starts before attention.
-    pub fn embed_unit(&self, k: &Kernels<'a>, owner: &UnitOwner<'a>, target: &TargetWeights<'_>,
+    pub fn embed_unit(&self, k: &Kernels<'a>, owner: &UnitOwner<'a>, target: &TargetWeights<'a>,
         cfg: &Inkling2Config, tokens: &[u32], media: &cuteafd_engine::media::MediaChunk,
         uploads: &mut crate::shared::token_table::RetainedUploads<'a>) -> Result<()> {
         ensure!(!tokens.is_empty() && tokens.len() <= owner.layout.rows
@@ -108,18 +176,40 @@ impl<'a> Head<'a> {
                 tokens.len(), cfg.hidden)
         })
     }
-    pub fn project(&self, k: &Kernels<'a>, owner: &impl UnitBuffers<'a>, target: &TargetWeights<'_>,
+    pub fn project(&self, k: &Kernels<'a>, owner: &impl UnitBuffers<'a>, target: &TargetWeights<'a>,
         cfg: &Inkling2Config, rows: usize, candidates: usize) -> Result<Buffer> {
-        self.project_at(k, owner, target, cfg, rows, candidates, 0)
+        self.project_at(k, owner, target, None, cfg, rows, candidates, 0)
     }
-    pub fn project_at(&self, k: &Kernels<'a>, owner: &impl UnitBuffers<'a>, target: &TargetWeights<'_>,
-        cfg: &Inkling2Config, rows: usize, candidates: usize, output_row: usize) -> Result<Buffer> {
+    pub fn project_at(&self, k: &Kernels<'a>, owner: &impl UnitBuffers<'a>, target: &TargetWeights<'a>,
+        peer: Option<PeerHead<'_, 'a>>, cfg: &Inkling2Config, rows: usize, candidates: usize, output_row: usize) -> Result<Buffer> {
         ensure!(rows>0 && output_row.checked_add(rows).is_some_and(|end| end <= self.rows) && owner.stream().raw == self.stream.raw
             && owner.stream().device.id == self.stream.device.id,
             "Inkling head rows/producer stream differ from admitted owner");
         self.normalize(k,owner,target,rows,candidates)?;
         let logits = super::cache::view(self.logits.buffer, output_row*cfg.unpadded_vocab_size*4,
             rows*cfg.unpadded_vocab_size*4)?;
+        if let Some(split) = &self.split {
+            let peer = peer.ok_or_else(|| anyhow::anyhow!("Inkling split head must bind its peer"))?;
+            let input = self.normalized(rows)?;
+            let local = self.compact_logits.as_ref().map_or(split.lead_logits.buffer, |(_, b)| b.buffer);
+            let pitch = self.compact_logits.as_ref().map_or(self.local_vocab, |(stored, _)| *stored);
+            let remote = split.peer.logits.buffer;
+            let peer_input = split.peer.input.buffer;
+            split.handoff.project(input, peer_input,
+                || self.project_shard(&self.stream,k,target,input,local,rows,cfg.hidden,pitch,self.bf16_head.as_ref()),
+                || self.project_shard(&split.peer.stream,peer.kernels,peer.target,peer_input,remote,rows,cfg.hidden,
+                    split.peer.pitch,split.peer.weight.as_ref()),
+                || {
+                    let dst_pitch = cfg.unpadded_vocab_size*4;
+                    let local_bytes = self.local_vocab*4;
+                    split.handoff.copy_columns(logits,local,rows,dst_pitch,pitch*4,local_bytes)?;
+                    split.handoff.copy_columns(super::cache::view(logits,local_bytes,logits.bytes-local_bytes)?,remote,
+                        rows,dst_pitch,split.peer.pitch*4,split.peer.valid*4)
+                })?;
+            self.softcap(logits,rows,cfg)?;
+            return Ok(logits);
+        }
+        ensure!(peer.is_none(), "Inkling whole head got a peer");
         let weight = target.projection("model.llm.unembed.weight")?;
         let lib = self.stream.device.library;
         if let ProjectionWeight::Bf16(weight) = weight {
@@ -140,10 +230,25 @@ impl<'a> Head<'a> {
                     stage.buffer, stored*4, cfg.unpadded_vocab_size*4, count, self.stream.raw)?; }
             }
         }
-        // SAFETY: logits are now a contiguous, valid-vocabulary F32 view.
-        unsafe { lib.cuda_logits_softcap_f32_async(logits.ptr, rows,
-            cfg.unpadded_vocab_size, cfg.unpadded_vocab_size, cfg.final_softcap as f32, self.stream.raw)?; }
+        self.softcap(logits,rows,cfg)?;
         Ok(logits)
+    }
+    fn project_shard(&self, stream: &Stream<'a>, kernels: &Kernels<'a>, target: &TargetWeights<'a>, input: Buffer,
+        output: Buffer, rows: usize, hidden: usize, pitch: usize, blas: Option<&(VocabularyHead<'a>, Allocation<'a>)>) -> Result<()> {
+        let weight = target.projection("model.llm.unembed.weight")?;
+        if let ProjectionWeight::Bf16(weight) = weight {
+            let (head, _) = blas.ok_or_else(|| anyhow::anyhow!("Inkling BF16 shard workspace missing"))?;
+            // SAFETY: the admitted local input, weights, and output outlive the ordered stream.
+            unsafe { target_head::launch(TargetHead::configured(),head,input.ptr,weight.buffer.ptr,output.ptr.cast(),rows,stream.raw) }
+        } else {
+            kernels.project_compact(stream,input,weight,output,rows,hidden,pitch)
+        }
+    }
+    fn softcap(&self, logits: Buffer, rows: usize, cfg: &Inkling2Config) -> Result<()> {
+        // SAFETY: logits are now a contiguous, valid-vocabulary F32 view.
+        unsafe { self.stream.device.library.cuda_logits_softcap_f32_async(logits.ptr, rows,
+            cfg.unpadded_vocab_size, cfg.unpadded_vocab_size, cfg.final_softcap as f32, self.stream.raw) }?;
+        Ok(())
     }
     pub fn normalize(&self,k:&Kernels<'a>,owner:&impl UnitBuffers<'a>,target:&TargetWeights<'_>,
         rows:usize,candidates:usize)->Result<Buffer> {
@@ -161,7 +266,7 @@ impl<'a> Head<'a> {
     /// Vocabulary storage remains <=64 rows regardless of prompt length. The
     /// shared consumer finishes each tile before the next overwrites it.
     pub fn project_spans(&self, k: &Kernels<'a>, owner: &UnitOwner<'a>, cache: &super::cache::CacheBank<'a>,
-        sequence: usize, target: &TargetWeights<'_>, cfg: &Inkling2Config, rows: usize, candidates: usize,
+        sequence: usize, target: &TargetWeights<'a>, cfg: &Inkling2Config, rows: usize, candidates: usize,
         consume: &mut dyn FnMut(usize, crate::shared::token_io::DeviceLogits) -> Result<()>) -> Result<()> {
         ensure!(self.rows <= 64 && rows <= owner.layout.rows && rows > 0,
             "Inkling serving head must be bounded to <=64 rows");
@@ -175,15 +280,27 @@ impl<'a> Head<'a> {
         Ok(())
     }
     pub fn project_scoring(&self, k: &Kernels<'a>, owner: &UnitOwner<'a>, cache: &super::cache::CacheBank<'a>,
-        sequence: usize, target: &TargetWeights<'_>, cfg: &Inkling2Config, rows: usize, candidates: usize,
+        sequence: usize, target: &TargetWeights<'a>, cfg: &Inkling2Config, rows: usize, candidates: usize,
         scoring: crate::shared::probe::ScoringRows<'_>) -> Result<crate::shared::probe::ScoreLogits> {
         self.project_spans(k, owner, cache, sequence, target, cfg, rows, candidates,
             &mut |offset, logits| scoring.record(self.stream.device.library, offset, &logits))?;
         Ok(crate::shared::probe::ScoreLogits::Recorded)
     }
 }
+fn blas<'a>(stream: &Stream<'a>, hidden: usize, rows: usize, vocab: usize) -> Result<(VocabularyHead<'a>,Allocation<'a>)> {
+    let d = stream.device;
+    let workspace = Allocation::new(d,cuteafd_ffi::programs::VOCABULARY_HEAD_WORKSPACE,Tag::workspace("inkling2/head/blas"))?;
+    // SAFETY: the admitted local workspace outlives all launches.
+    let head = d.run(|| unsafe { d.library.vocabulary_head_rows(workspace.buffer.ptr, hidden as u32,
+        rows as u32,vocab as u32,TargetHead::configured().native_mode()) })?;
+    Ok((head,workspace))
+}
+
 impl Drop for Head<'_> {
-    fn drop(&mut self) { self.stream.drain_or_abort("Inkling head handle/workspace retirement"); }
+    fn drop(&mut self) {
+        self.stream.drain_or_abort("Inkling head handle/workspace retirement");
+        if let Some(split) = &self.split { split.peer.stream.drain_or_abort("Inkling peer head retirement"); }
+    }
 }
 
 

@@ -225,7 +225,7 @@ pub(crate) fn whole<'a>(library: &'a Arc<NativeLibrary>, programs: &'a Programs<
     let stream = std::rc::Rc::new(Stream::new(device)?);
     let requests = super::owners::RequestOwners::rank(stream.clone(), &inputs, &admitted, 0)?;
     let layout = &inputs.targets[0];
-    let head = super::head::Head::new(stream.clone(), cfg, 64, layout.stored_head())?;
+
     let catalog = cuteafd_loader::read_expert_catalog_view(view)?;
     let backings = match &inputs.local {
         inkling2::LocalPackage::Installed { backings } => backings[admitted.onboard].as_slice(),
@@ -233,6 +233,9 @@ pub(crate) fn whole<'a>(library: &'a Arc<NativeLibrary>, programs: &'a Programs<
         _ => anyhow::bail!("Inkling admitted resident backend absent"),
     };
     let peer_stream = options.split_device.map(|id| Stream::new(Device { library, id }).map(std::rc::Rc::new)).transpose()?;
+    let head = if let Some(peer) = &peer_stream {
+        super::head::Head::pair(stream.clone(),peer.clone(),cfg,64,[layout.stored_head(), inputs.targets[1].stored_head()], !draft_weights.is_empty())?
+    } else { super::head::Head::new(stream.clone(),cfg,64,layout.stored_head())? };
     let local = super::experts::serving_dispatchers(stream.clone(), peer_stream.clone(), &catalog,
         options.native_lib, backings, usize::try_from(inputs.prefill.rows.max(64))?, pushed, cfg, &admitted.solved)?;
     ensure!(local.len() == admitted.onboard, "Inkling resident layer handle count differs");
@@ -250,6 +253,10 @@ pub(crate) fn whole<'a>(library: &'a Arc<NativeLibrary>, programs: &'a Programs<
     let mut kernels = kernels.into_iter();
     let mut lead_kernels = kernels.next().context("Inkling lead kernels absent")?;
     lead_kernels.bind_compact(programs, stream.clone(), layout, inputs.prefill.rows as usize, 64, inputs.target_fp8_scratch[0])?;
+    if peer_stream.is_some() && !draft_weights.is_empty() && layout.stored_head().is_none() {
+        let width = cuteafd_loader::shared::vocabulary::shard(cfg.vocab_size,128,0)?.len();
+        lead_kernels.draft_head=Some(device.run(|| Ok(cuteafd_ffi::draft_projection::DraftProjections::load(programs,&[(cfg.hidden,width)],64)?))?);
+    }
     let mut execution = super::engine::Execution::new(link, requests, head,
         targets.next().context("Inkling lead target absent")?, lead_kernels,
         local, cfg.clone(), inputs.graph_reserve[0],
@@ -263,7 +270,11 @@ pub(crate) fn whole<'a>(library: &'a Arc<NativeLibrary>, programs: &'a Programs<
         let mut peer_kernels = kernels.next().context("Inkling peer kernels absent")?;
         peer_kernels.bind_compact(programs, peer_stream.clone(), &inputs.targets[1],
             inputs.prefill.rows as usize, 64, inputs.target_fp8_scratch[1])?;
-        execution.peer = Some(super::engine::Peer { graphs: super::engine::DecodeGraphs::new(&requests, inputs.graph_reserve[1])?, exchange, requests,
+        if !draft_weights.is_empty() && inputs.targets[1].stored_head().is_none() {
+            let width = cuteafd_loader::shared::vocabulary::shard(cfg.vocab_size,128,1)?.len();
+            peer_kernels.draft_head=Some(peer_stream.device.run(|| Ok(cuteafd_ffi::draft_projection::DraftProjections::load(programs,&[(cfg.hidden,width)],64)?))?);
+        }
+        execution.peer = Some(super::engine::Peer { graphs: super::engine::DecodeGraphs::new(&requests, 1, inputs.graph_reserve[1])?, exchange, requests,
             target: targets.next().context("Inkling peer target absent")?, kernels: peer_kernels });
     }
     ensure!(targets.next().is_none() && kernels.next().is_none(), "Inkling rank inventory not fully bound");
@@ -281,7 +292,7 @@ pub(crate) fn whole<'a>(library: &'a Arc<NativeLibrary>, programs: &'a Programs<
         let streams=std::iter::once(stream.clone()).chain(peer_stream.clone()).collect();
         execution.draft=Some(std::rc::Rc::new(super::draft::Binding::new(programs,streams,draft_weights,layout,
             &admitted.solved,execution.target.projection("model.llm.unembed.weight")?,
-            &execution.head, &execution.kernels,
+            &execution.head, &execution.kernels, execution.peer.as_ref().map(|peer| super::head::PeerHead { kernels: &peer.kernels, target: &peer.target }),
             usize::try_from(inputs.prefill.rows)?,usize::try_from(inputs.prefill.waves)?,inputs.prefix_mark_slots)?));
     }
     let devices = cuteafd_loader::placement::planner::CoordinatorDevices::new(&physical)?;
@@ -302,6 +313,7 @@ pub(crate) fn whole<'a>(library: &'a Arc<NativeLibrary>, programs: &'a Programs<
         cuteafd_loader::placement::planner::Lifetime::TARGET, cuteafd_core::memory_layout::Category::Workspace, "Inkling requests");
     let mut census = crate::shared::memory::receipts::Census::default();
     execution.requests.allocation_receipts(&mut inventory, &mut census, devices)?;
+    execution.head.inventory(&mut inventory, "inkling2.head")?;
     execution.kernels.compact_inventory(&mut inventory, "inkling2.target.0")?;
     if let Some(peer) = &execution.peer {
         peer.requests.allocation_receipts(&mut inventory, &mut census, devices)?;

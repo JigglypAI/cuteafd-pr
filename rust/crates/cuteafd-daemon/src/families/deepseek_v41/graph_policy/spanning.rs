@@ -7,11 +7,10 @@
 //! hop.rs:1). A distributed drafter wrapper may conservatively promote any
 //! child to spanning: never erase that caller-provided dependency information.
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum Scope { Local, Declared, Spanning }
+use crate::shared::decode_graph::sites::{Scope, Table};
 
 // (visitor site, intrinsic scope, capture/dependency evidence).
-pub(super) const SITES: &[(&str, Scope, &str)] = &[
+pub(super) const SITES: &Table = &[
     ("window", Scope::Local, "v41_window.rs:659 local norm/project/pack; peer publication is outside capture at :397"),
     ("compressor", Scope::Local, "v41_compressor.rs:903 local project/pool/index; capture :1172 excludes peer copy :587"),
     ("index_selection", Scope::Local, "v41_index_selection.rs:455 score/top-k; :634 requires local query; proposal replica binds local keys"),
@@ -44,24 +43,29 @@ pub(super) const SITES: &[(&str, Scope, &str)] = &[
     ("dspark_confidence", Scope::Local, "v41_experts/dspark/confidence.rs:73 local confidence projection"),
 ];
 
-pub(super) fn spans(name: &str, declared: bool) -> anyhow::Result<bool> {
-    let (_, scope, _) = SITES.iter().find(|(site, _, _)| *site == name)
-        .ok_or_else(|| anyhow::anyhow!("unclassified V4.1 graph site {name}"))?;
-    Ok(declared || *scope == Scope::Spanning)
+/// An unclassified site is spanning: it stays prewarmed and sealed (#2303).
+pub(super) fn spans(name: &str, declared: bool) -> bool {
+    crate::shared::decode_graph::sites::spans(SITES, name, declared)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     #[test]
-    fn every_classification_preserves_peer_overrides() {
-        let mut names = std::collections::HashSet::new();
-        for &(name, scope, evidence) in SITES {
-            assert!(names.insert(name), "duplicate site {name}");
-            assert!(evidence.contains(".rs:"), "missing source evidence {name}");
-            assert_eq!(spans(name, false).unwrap(), scope == Scope::Spanning);
-            assert!(spans(name, true).unwrap(), "must preserve composite peer hazard {name}");
+    fn every_v41_site_is_classified_and_unknown_sites_span() {
+        crate::shared::decode_graph::sites::testing::assert_classified("deepseek_v41", super::SITES);
+        assert!(super::spans("new-unreviewed-site", false));
+    }
+
+    #[test]
+    fn graph_prewarm_off_warms_spanning_and_defers_local() {
+        let off = |name, declared| crate::shared::decode_graph::sites::testing::assert_off_transitions(super::SITES, name, declared);
+        // Two-GPU layout: gathers always span; rank-local children stay lazy;
+        // a distributed drafter promotes its declared children.
+        for &(name, _, _) in super::SITES {
+            let spanning = off(name, false);
+            assert_eq!(spanning, name.ends_with(".gather"), "V4.1 {name}");
         }
-        assert!(spans("new-unreviewed-site", false).is_err());
+        assert!(off("dspark_ffn", true) && off("dspark_chain", true));
+        assert!(!super::super::spanning_layout(1) && super::super::spanning_layout(2));
     }
 }

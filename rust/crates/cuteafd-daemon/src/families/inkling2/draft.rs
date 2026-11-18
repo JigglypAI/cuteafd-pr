@@ -44,6 +44,7 @@ impl<'a> Binding<'a>{
     }
     pub fn new(programs:&'a Programs<'a>,streams:Vec<Rc<Stream<'a>>>,weights:Vec<Weights<'a>>,layout:DraftLayout,
         admitted:&ResolvedPlan,target_head:ProjectionWeight<'_, 'a>,head:&Head<'a>,target_kernels:&Kernels<'a>,
+        peer:Option<super::head::PeerHead<'_, 'a>>,
         prefill_rows:usize,waves:usize,mark_slots:usize)->Result<Self>{
         let count=streams.len();
         ensure!(matches!(count,1|2) && weights.len()==count && layout.weights.len()==count && layout.runtime.len()==count,
@@ -64,7 +65,9 @@ impl<'a> Binding<'a>{
                 let rank=Rank::allocate(weights,Rc::clone(stream),layout.config.clone(),runtime.clone(),kernels)?;
                 rank.initialize_derived()?;
                 if index == runtime.rank.lead {
-                    match target_head {
+                    if let Some(peer) = peer {
+                        fold_split(programs,&rank,head,target_kernels,target_head,peer)?;
+                    } else { match target_head {
                         ProjectionWeight::Bf16(w) => rank.fold_head(w.buffer)?,
                         weight => {
                             let (stored, stage, transpose) = head.compact_stages()?;
@@ -72,7 +75,7 @@ impl<'a> Binding<'a>{
                             rank.fold_compact_head(programs, stored, stage, transpose, |input, output, rows|
                                 target_kernels.project_compact(stream, input, weight, output, rows, h, stored))?;
                         }
-                    }
+                    } }
                 }
                 stream.drain()?;
                 Ok(rank)
@@ -103,8 +106,11 @@ impl<'a> Binding<'a>{
         Ok(Self{drafter,marks,verify,prefill,decode,layout})
     }
     pub fn select(&self, head:&Head<'a>, kernels:&Kernels<'a>, weight:ProjectionWeight<'_, 'a>,
-        sequences:usize, anchors:Buffer) -> Result<Buffer> {
+        peer:Option<super::head::PeerHead<'_, 'a>>, sequences:usize, anchors:Buffer) -> Result<Buffer> {
         let rank=&self.drafter.lead;
+        if let Some(peer) = peer {
+            return select_split(rank,head,kernels,weight,peer,sequences,anchors);
+        }
         if let ProjectionWeight::Bf16(w)=weight { return rank.recurrent_tokens(sequences,anchors,w.buffer); }
         let (stored, stage, narrowed)=head.compact_stages()?;
         let (h,n)=(rank.config.transformer.hidden,rank.config.padded_vocab);
@@ -137,6 +143,94 @@ impl<'a> Binding<'a>{
                 Buffer{ptr:output.ptr.wrapping_byte_add(position),bytes:count*pitch,..output},count)?;
         }Ok(())
     }
+}
+
+fn fold_split<'a>(programs:&'a Programs<'a>, rank:&Rank<'a>, head:&Head<'a>, kernels:&Kernels<'a>,
+    lead:ProjectionWeight<'_, 'a>, peer:super::head::PeerHead<'_, 'a>)->Result<()> {
+    let peer_weight=peer.target.projection("model.llm.unembed.weight")?;
+    let (h,n)=(rank.config.transformer.hidden,rank.config.padded_vocab);
+    let left=cuteafd_loader::shared::vocabulary::shard(n,128,0)?.len();
+    let stream=head.stream();
+    let lib=stream.device.library;
+    let handoff=head.handoff().context("Inkling draft split handoff missing")?;
+    let peer_stream=head.peer_stream().context("Inkling draft peer stream missing")?;
+    match (lead,peer_weight) {
+        (ProjectionWeight::Bf16(a),ProjectionWeight::Bf16(b)) => {
+            let stage=head.local_stage()?;
+            for (first,width,source) in [(0,left,a.buffer),(left,n-left,b.buffer)] {
+                for row in (0..width).step_by(2048) {
+                    let count=(width-row).min(2048);
+                    let weights=super::cache::view(source,row*h*2,count*h*2)?;
+                    let weights=if first==0 { weights } else {
+                        let output=super::cache::view(stage,0,count*h*2)?;
+                        // SAFETY: startup is serialized, both arenas persist through
+                        // fold, and no online work can mutate or reuse this tile.
+                        unsafe { lib.copy_peer_async(output,weights,weights.bytes,stream.raw)?; }
+                        output
+                    };
+                    rank.fold_bf16_rows(weights,first+row,count)?;
+                }
+            }
+            Ok(())
+        }
+        (a,b) => {
+            let (stored,stage,transpose)=head.compact_stages()?;
+            let remote=head.peer_weight().context("Inkling compact peer width missing")?;
+            let (remote_input,remote_stage)=head.peer_stages()?;
+            rank.fold_compact_shard(programs,0,left,stored,stage,transpose,|input,output,rows|
+                kernels.project_compact(stream,input,a,output,rows,h,stored))?;
+            rank.fold_compact_shard(programs,left,n-left,remote,stage,transpose,|input,output,rows| {
+                handoff.project(input,remote_input,|| Ok(()),
+                    || peer.kernels.project_compact(peer_stream,remote_input,b,remote_stage,rows,h,remote),
+                    || handoff.copy_columns(output,remote_stage,rows,remote*4,remote*4,remote*4))
+            })
+        }
+    }
+}
+
+fn select_split<'a>(rank:&Rank<'a>, head:&Head<'a>, kernels:&Kernels<'a>, weight:ProjectionWeight<'_, 'a>,
+    peer:super::head::PeerHead<'_, 'a>, sequences:usize, anchors:Buffer)->Result<Buffer> {
+    use cuteafd_ffi::draft_projection::DraftProjections;
+    let (h,n)=(rank.config.transformer.hidden,rank.config.padded_vocab);
+    let left=cuteafd_loader::shared::vocabulary::shard(n,128,0)?.len();
+    let right=n-left;
+    let handoff=head.handoff().context("Inkling draft split handoff missing")?;
+    let peer_stream=head.peer_stream().context("Inkling draft peer stream missing")?;
+    let stream=head.stream();
+    let (remote_input,remote_stage)=head.peer_stages()?;
+    let peer_weight=peer.target.projection("model.llm.unembed.weight")?;
+    let local=head.local_stage()?;
+    rank.recurrent_tokens_measured(sequences,anchors,Some(64),|input,out,rows| {
+        let projection=|remote:bool| -> Result<(Buffer,usize)> {
+            let (stream,kernels,weight,input,stage,width,programs):(_,_,_,_,_,_,Option<&DraftProjections<'_>>)=if remote {
+                (peer_stream,peer.kernels,peer_weight,remote_input,remote_stage,right,peer.kernels.draft_head.as_ref())
+            } else { (stream,kernels,weight,input,local,left,kernels.draft_head.as_ref()) };
+            if let ProjectionWeight::Bf16(w)=weight {
+                // SAFETY: rank-local selected weight shard and input/stage outlive the launch.
+                unsafe { programs.context("Inkling recurrent BF16 vocabulary shard not bound")?
+                    .launch_checked(input.ptr,w.buffer.ptr,stage,rows,h,width,stream.raw)?; }
+                Ok((stage,width))
+            } else {
+                let (stored,raw)=if remote { (head.peer_weight().unwrap(),remote_stage) }
+                    else { let (stored,b,_)=head.compact_stages()?; (stored,b) };
+                // Match the whole head's single F32 to BF16 narrowing before gathering.
+                kernels.project_compact(stream,input,weight,raw,rows,h,stored)?;
+                let dst=if remote { head.peer_draft_output()? } else { stage };
+                // SAFETY: F32 and BF16 stages are disjoint and stream-owned.
+                unsafe { kernels.narrow.launch(raw.ptr,dst.ptr,rows*stored,stream.raw)?; }
+                Ok((dst,stored))
+            }
+        };
+        let a=std::cell::Cell::new(None);
+        let b=std::cell::Cell::new(None);
+        handoff.project(input,remote_input,|| {a.set(Some(projection(false)?));Ok(())},
+            || {b.set(Some(projection(true)?));Ok(())},|| {
+                let (a,ap)=a.get().context("Inkling draft local shard missing")?;
+                let (b,bp)=b.get().context("Inkling draft peer shard missing")?;
+                handoff.copy_columns(out,a,rows,n*2,ap*2,left*2)?;
+                handoff.copy_columns(super::cache::view(out,left*2,out.bytes-left*2)?,b,rows,n*2,bp*2,right*2)
+            })
+    },|_,_| Ok(()))
 }
 
 #[cfg(test)]

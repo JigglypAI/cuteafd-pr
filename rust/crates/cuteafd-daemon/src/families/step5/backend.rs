@@ -246,6 +246,10 @@ impl<'e, 'a> Step5Backend<'e, 'a> {
         let selected = cuteafd_loader::serving_capacity::step5_graphs::selected_rows(
             layout, self.prefill.0.min(self.rows).min(self.context))?;
         if selected.is_empty() { return Ok(()); }
+        // Every Step-5 section is rank-local: `GRAPH_PREWARM=off` leaves them to
+        // first-use capture (#2303).
+        let Some(_startup) = crate::shared::decode_graph::sites::startup(
+            super::graph_sites::spans("step5.section", false)) else { return Ok(()) };
         self.state.retire();
         let page_count = usize::try_from(self.ranks[0].borrow().page_count())?;
         let mut pool = RefPagePool::new(page_count, 64);

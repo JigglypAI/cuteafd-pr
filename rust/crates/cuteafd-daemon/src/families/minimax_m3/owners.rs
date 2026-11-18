@@ -290,6 +290,10 @@ impl Owners<'_> {
     /// Initialize only persistent section scratch. No synthetic KV page or
     /// request enters the logical prefix cache, transport or usage counters.
     pub fn prewarm(&self, cfg: &cuteafd_loader::families::minimax_m3::MiniMaxM3Config) -> Result<()> {
+        // A split layout's banks span and always prewarm; whole and heads layouts
+        // are rank-local and capture on first use under `GRAPH_PREWARM=off` (#2303).
+        let Some(_startup) = crate::shared::decode_graph::sites::startup(
+            super::graph_sites::spans("minimax_m3.section", self.storage.split.is_some())) else { return Ok(()) };
         if self.storage.heads.is_some() { return self.prewarm_heads(cfg); }
         if self.storage.split.is_some() { return self.prewarm_split(cfg); }
         ensure!(self.storage.ranks.len() == 1, "MiniMax whole graph prewarm requires one rank");

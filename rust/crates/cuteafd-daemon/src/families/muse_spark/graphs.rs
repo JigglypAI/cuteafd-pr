@@ -30,7 +30,7 @@ impl<'a> Graphs<'a> {
         let mut bank = GraphBank::new();
         bank.attach_device(device.library, device.id, reserve.bytes, Site {
             name: "muse_spark.segment", cycle: Cycle::Decode, preference: Preference::Adaptive,
-            bootstrap: 2 << 20, basis: Basis::Bytes, spans_devices: false,
+            bootstrap: 2 << 20, basis: Basis::Bytes, spans_devices: super::graph_sites::spans("muse_spark.segment", false),
         })?;
         decode_graph::device::set_reserve_policy(device.id, reserve)?;
         Ok(Self { device, bank: RefCell::new(bank), singleton: RefCell::new(HashSet::new()), pins: RefCell::new(HashSet::new()) })

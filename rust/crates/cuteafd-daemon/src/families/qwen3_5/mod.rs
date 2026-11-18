@@ -1,4 +1,5 @@
 //! Native dense Qwen execution, serving and qualification.
+mod graph_sites;
 mod programs;
 mod weights;
 mod block;

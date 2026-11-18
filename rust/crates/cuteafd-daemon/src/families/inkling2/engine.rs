@@ -5,37 +5,90 @@ use crate::shared::{prefill_pipeline::Unit, spark_intake::SparkLink, token_io::D
 use anyhow::{ensure, Result};
 use cuteafd_loader::families::inkling2::Inkling2Config;
 
+/// Startup and first-use capture row buckets of the private heads epilogue.
+const PREWARM_ROWS: [usize; 4] = [1, 4, 16, 64];
+
 /// Keep transport ahead of every consumer's retirement. On failure the owner
 /// releases device waits, drains consumers, then releases registered buffers.
 pub(crate) struct DecodeGraphs<'a> {
     bank: crate::shared::decode_graph::GraphBank<(usize, usize), crate::shared::decode_graph::GraphOwner<'a, ()>>,
     stream: std::rc::Rc<crate::shared::memory::device::Stream<'a>>,
+    rank: usize,
 }
 impl<'a> DecodeGraphs<'a> {
-    pub fn new(requests: &RequestOwners<'a>, reserve: u64) -> Result<Self> {
+    pub fn new(requests: &RequestOwners<'a>, rank: usize, reserve: u64) -> Result<Self> {
         use crate::shared::decode_graph::{GraphBank, device::{Basis, Cycle, Preference, Site}};
         let stream = requests.decode.stream.clone();
         let mut bank = GraphBank::with_family("inkling2");
         bank.attach_device(stream.device.library, stream.device.id, reserve,
             Site { name: "inkling2.heads.output", cycle: Cycle::Decode, preference: Preference::Capture,
-                bootstrap: 2 << 20, basis: Basis::Bytes, spans_devices: false })?;
-        Ok(Self { bank, stream })
+                bootstrap: 2 << 20, basis: Basis::Bytes,
+                spans_devices: super::graph_sites::spans("inkling2.heads.output", false) })?;
+        Ok(Self { bank, stream, rank })
     }
-    pub fn project(&mut self, layer: usize, rows: usize, work: impl FnOnce() -> Result<()>) -> Result<()> {
+    pub fn project(&mut self, layer: usize, rows: usize, work: impl Fn() -> Result<()>) -> Result<()> {
         if let Some(owner) = self.bank.cached_launch(&(layer, rows)) {
             // SAFETY: startup captured this same issuing stream, fixed unit
             // planes and immutable layer weights. No mutable cache is captured.
-            unsafe { crate::shared::decode_graph::launch(self.stream.device.library, owner.raw, self.stream.raw) }
-        } else { work() }
+            return unsafe { crate::shared::decode_graph::launch(self.stream.device.library, owner.raw, self.stream.raw) };
+        }
+        // Startup's row buckets capture on first use (`GRAPH_PREWARM=off`, or a
+        // startup ticket the reserve declined); other row counts stay eager.
+        if !PREWARM_ROWS.contains(&rows) { return work(); }
+        let key = (layer, rows);
+        let Some(mut ticket) = self.bank.cache_ticket(&key, false, None) else { return work() };
+        use crate::shared::decode_graph::{self, GraphOwner};
+        let stream = &self.stream;
+        let lib = stream.device.library;
+        let raw = stream.device.run(|| {
+            // SAFETY: the private epilogue records only this stream's launches
+            // over the fixed decode unit and immutable weights; no peer operand.
+            if let Err(error) = unsafe { decode_graph::begin_capture(lib, stream.raw, &ticket) } {
+                self.bank.cache_ticket_failed(ticket, &error);
+                return Ok(None);
+            }
+            let executed = work();
+            // SAFETY: close the owned capture even when recording failed.
+            let captured = unsafe { decode_graph::end_capture(lib, stream.raw, &mut ticket) };
+            if let Err(error) = executed {
+                if let Ok((raw, ..)) = captured {
+                    // SAFETY: recording failed; executable never launched.
+                    unsafe { lib.cuda_graph_exec_destroy(raw)?; }
+                }
+                self.bank.cache_ticket_failed(ticket, &error);
+                return Err(error);
+            }
+            let (raw, nodes, width, spans, inspection) = match captured {
+                Ok(result) => result,
+                Err(error) => { self.bank.cache_ticket_failed(ticket, &error); return Ok(None); }
+            };
+            // SAFETY: executable uses only the persistent decode unit and target
+            // arena; the executor drains before dropping them.
+            let owner = unsafe { GraphOwner::new(lib, stream.device.id, raw, ())? };
+            if nodes > 1 && !spans && inspection.is_none() {
+                self.bank.census_capture_key("heads.output", self.rank as i32, None, &key, raw);
+                self.bank.cache_commit(key, owner, ticket, nodes as u64, width, false);
+                Ok(Some(raw))
+            } else { Ok(None) }
+        })?;
+        match raw {
+            // SAFETY: the committed executable is retained by the bank until a drained boundary.
+            Some(raw) => stream.device.run(|| unsafe { decode_graph::launch(lib, raw, stream.raw) }),
+            // Recording executed nothing: run the epilogue eagerly.
+            None => work(),
+        }
     }
     fn prewarm(&mut self, rank: usize, requests: &RequestOwners<'a>, kernels: &Kernels<'a>,
         target: &TargetWeights<'a>, cfg: &Inkling2Config) -> Result<()> {
         use crate::shared::decode_graph::{self, GraphOwner};
-        if !decode_graph::prewarm_enabled() { return Ok(()); }
+        // Every Inkling site is rank-local: `GRAPH_PREWARM=off` leaves the row
+        // buckets to first-use capture (#2303).
+        let Some(_startup) = decode_graph::sites::startup(
+            super::graph_sites::spans("inkling2.heads.output", false)) else { return Ok(()) };
         let unit = &requests.decode;
         let stream = &self.stream;
         stream.drain()?;
-        for rows in [1, 4, 16, 64] {
+        for rows in PREWARM_ROWS {
             for layer in 0..cfg.layers {
                 let key = (layer, rows);
                 let Some(mut ticket) = self.bank.cache_ticket(&key, false, None) else { continue; };
@@ -89,15 +142,16 @@ pub(crate) struct Peer<'a> {
     pub target: TargetWeights<'a>,
 }
 impl<'a> Peer<'a> {
-    fn units(&mut self, decode: bool) -> super::prefill::PeerUnits<'_, 'a> {
+    fn units(&mut self, decode: bool) -> (super::head::PeerHead<'_, 'a>, super::prefill::PeerUnits<'_, 'a>) {
         let (owners, uploads) = if decode {
             (std::slice::from_ref(&self.requests.decode), std::slice::from_mut(&mut self.requests.decode_uploads))
         } else {
             (self.requests.prefill.as_slice(), self.requests.prefill_uploads.as_mut_slice())
         };
+        (super::head::PeerHead { kernels: &self.kernels, target: &self.target },
         super::prefill::PeerUnits { exchange: &self.exchange, cache: &self.requests.cache,
             target: &self.target, kernels: &self.kernels, owners, uploads,
-            graphs: decode.then_some(&mut self.graphs) }
+            graphs: decode.then_some(&mut self.graphs) })
     }
 }
 
@@ -136,7 +190,7 @@ impl<'a> Execution<'a> {
         ensure!(target.rank == 0 && target.layers.iter().copied().eq(0..cfg.layers)
             && !requests.prefill.is_empty() && local.len() <= cfg.layers && ingress.len() == cfg.layers,
             "Inkling whole execution differs from admitted owners");
-        let graphs = (requests.decode.layout.head_parts == 2).then(|| DecodeGraphs::new(&requests, graph_reserve)).transpose()?;
+        let graphs = (requests.decode.layout.head_parts == 2).then(|| DecodeGraphs::new(&requests, 0, graph_reserve)).transpose()?;
         Ok(Self { graphs, link, requests, peer: None, head, target, kernels, local, cfg, ingress, next_identity: 1, terminal: false, draft:None, width_trace:None })
     }
 
@@ -150,9 +204,10 @@ impl<'a> Execution<'a> {
         let media = placements.iter().map(|placement| placement.media.clone()).collect::<Vec<_>>();
         let result = (|| {
             let waves = self.link.exchange()?;
-            let mut io = TokenIo { kernels: &self.kernels, head: &self.head, cache: &self.requests.cache,
+            let (peer_head, peer_units) = self.peer.as_mut().map(|peer| peer.units(false)).unzip();
+            let mut io = TokenIo { kernels: &self.kernels, head: &self.head, peer_head, cache: &self.requests.cache,
                 target: &self.target, cfg: &self.cfg, tokens, media: &media, starts: &starts, slots: &slots, retained_rows: false, draft:self.draft.as_deref(),publish_draft:true,trace:None,on_logits };
-            Stateful { graphs: None, peer: self.peer.as_mut().map(|peer| peer.units(false)), kernels: &self.kernels, owners: &self.requests.prefill, cache: &self.requests.cache,
+            Stateful { graphs: None, peer: peer_units, kernels: &self.kernels, owners: &self.requests.prefill, cache: &self.requests.cache,
                 target: &self.target, cfg: &self.cfg, ingress: &self.ingress, placements, uploads: &mut self.requests.prefill_uploads,
                 waves, onboarded: self.local.len(), local: &self.local, next_identity: &mut self.next_identity,
                 placement_version: version, kind: cuteafd_transport::ExpertV2SourceKind::Prefill, io: &mut io }.run(units)?;
@@ -174,10 +229,11 @@ impl<'a> Execution<'a> {
         let media = placements.iter().map(|placement| placement.media.clone()).collect::<Vec<_>>();
         let result = (|| {
             let waves = self.link.exchange()?;
-            let mut io = TokenIo { kernels: &self.kernels, head: &self.head, cache: &self.requests.cache,
+            let (peer_head, peer_units) = self.peer.as_mut().map(|peer| peer.units(true)).unzip();
+            let mut io = TokenIo { kernels: &self.kernels, head: &self.head, peer_head, cache: &self.requests.cache,
                 target: &self.target, cfg: &self.cfg, tokens, media: &media, starts: &starts, slots: &slots, retained_rows: true, draft:self.draft.as_deref(),publish_draft:false,trace:self.width_trace.as_ref(),
                 on_logits: &mut |_, _, _| Ok(()) };
-            Stateful { graphs: self.graphs.as_mut(), peer: self.peer.as_mut().map(|peer| peer.units(true)), kernels: &self.kernels, owners: std::slice::from_ref(&self.requests.decode),
+            Stateful { graphs: self.graphs.as_mut(), peer: peer_units, kernels: &self.kernels, owners: std::slice::from_ref(&self.requests.decode),
                 cache: &self.requests.cache, target: &self.target, cfg: &self.cfg, ingress: &self.ingress, placements,
                 uploads: std::slice::from_mut(&mut self.requests.decode_uploads), waves,
                 onboarded: self.local.len(), local: &self.local, next_identity: &mut self.next_identity,
@@ -243,7 +299,10 @@ mod tests {
         assert!(source.contains(".run(units)"));
         assert!(source.contains("self.link.exchange()?"));
         assert!(source.contains("bank.attach_device("));
-        assert!(source.contains("spans_devices: false"));
+        assert!(source.contains("graph_sites::spans(\"inkling2.heads.output\", false)"));
+        let project = source.split("pub fn project(").nth(1).unwrap().split("fn prewarm(").next().unwrap();
+        assert!(project.contains("PREWARM_ROWS.contains(&rows)") && project.contains("begin_capture("),
+            "first-use capture of the startup row buckets");
         assert!(source.contains("device::observe_completed("));
         assert!(!source.split("pub fn decode(").nth(1).unwrap().contains("begin_capture("));
         let terminal = source.split("pub fn terminate(").nth(1).unwrap();

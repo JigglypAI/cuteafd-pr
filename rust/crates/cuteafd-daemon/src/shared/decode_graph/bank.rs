@@ -35,6 +35,8 @@ pub(crate) fn missing_variants() -> Vec<MissingVariant> {
 /// The context is built only on its first miss; family owners share this
 /// diagnostic entry point and /v1/stats inventory.
 pub(crate) fn note_eager(family: &'static str, shape: &str, context: impl FnOnce() -> String) -> bool {
+    // `GRAPH_PREWARM=off` defers rank-local startup shapes; they are not misses.
+    if super::sites::deferring() { return false; }
     if !note_missing(family, shape) { return false; }
     // Built outside the macro so the description is produced even when the
     // current subscriber filters this target out.
@@ -247,6 +249,9 @@ impl<K: Hash + Eq + Clone + std::fmt::Debug, E> GraphBank<K, E> {
     pub fn cache_miss(&mut self, key: &K, pinned: bool, node_estimate: Option<super::device::Estimate>) -> super::device::Miss {
         if self.entries.contains_key(key) && !self.valid_entry(key) { self.entries.remove(key); }
         let Some(binding) = &self.device else { return super::device::Miss::Eager };
+        // `GRAPH_PREWARM=off`: a rank-local startup shape leaves no record and
+        // captures on its first serving miss. Spanning sites still prewarm.
+        if super::sites::defers(binding.site.spans_devices) { return super::device::Miss::Eager; }
         let identity = if let Some(identity) = self.cache_keys.get(key) { identity.clone() } else {
             self.next_cache_key = self.next_cache_key.checked_add(1).expect("graph key identity exhausted");
             let identity = super::device::Identity { bank: binding.bank, site: binding.site.name,

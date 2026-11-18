@@ -35,7 +35,7 @@ impl Config {
     fn site(&self) -> Site {
         Site { name: "minimax_m3.section", cycle: Cycle::Other,
             preference: Preference::Adaptive, bootstrap: self.bootstrap,
-            basis: self.basis, spans_devices: self.spans_devices }
+            basis: self.basis, spans_devices: super::graph_sites::spans("minimax_m3.section", self.spans_devices) }
     }
 }
 

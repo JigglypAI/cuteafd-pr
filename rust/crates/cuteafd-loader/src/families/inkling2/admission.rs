@@ -258,6 +258,10 @@ impl SelectedWeights {
                 if let Some(stored) = target.stored_head() {
                     programs.extend(super::draft::fold_programs(config.transformer.hidden,
                         config.transformer.markov_rank, stored));
+                    if let Some(peer_stored) = self.targets.get(1).and_then(CoordinatorWeights::stored_head) {
+                        programs.extend(super::draft::fold_programs(config.transformer.hidden,
+                            config.transformer.markov_rank, peer_stored));
+                    }
                 }
             }
         }

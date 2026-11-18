@@ -79,6 +79,18 @@ impl CoreWeightLayout {
         Ok(tensors)
     }
 
+    /// Vocabulary checkpoints may have an odd number of H128 blocks.
+    pub fn output_shard(projection: &CoreProjection, rank: usize) -> Result<Self> {
+        use crate::formats::dense_trellis::TrellisSide;
+        let n = crate::shared::vocabulary::shard(projection.stored_outputs, 128, rank)?.len();
+        let mut local = projection.clone();
+        local.stored_outputs = n;
+        let mut layout = Self::new(&local, TrellisSide::Output, 0, 1)?;
+        layout.rank = rank;
+        layout.ranks = 2;
+        Ok(layout)
+    }
+
     pub fn new(projection: &CoreProjection,
         side: crate::formats::dense_trellis::TrellisSide, rank: usize, ranks: usize) -> Result<Self> {
         ensure!(matches!(ranks,1|2) && rank<ranks,"dense trellis native rank geometry");

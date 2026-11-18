@@ -471,13 +471,8 @@ graph_census_args=()
 graph_policy_args=()
 case "$(get GRAPH_PREWARM on)" in
   on) ;;
-  off)
-    [[ "$family" == deepseek_v41 || "$family" == glm5_flash ]] || release_die 'GRAPH_PREWARM=off is supported only for deepseek_v41 (V4.1) and glm5_flash (GLM Flash)'
-    local graph_ranks
-    if [[ "$family" == deepseek_v41 ]]; then graph_ranks="$RELEASE_RTX_GPUS"
-    else graph_ranks="${#coordinator_uuids[@]}"; fi
-    ((graph_ranks == 1)) || release_die 'GRAPH_PREWARM=off requires single-GPU graph sites: runtime cross-device graph instantiation can deadlock behind peer waits (#1878)'
-    graph_policy_args+=(--graph-no-prewarm) ;;
+  # Rank-local sites capture lazily; spanning sites always prewarm (#2303).
+  off) graph_policy_args+=(--graph-no-prewarm) ;;
   *) release_die 'GRAPH_PREWARM must be on or off' ;;
 esac
 graph_donor_always="$(get GRAPH_DONOR_ALWAYS off)"
