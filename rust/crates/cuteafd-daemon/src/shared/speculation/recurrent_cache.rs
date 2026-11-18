@@ -22,6 +22,11 @@ impl ContextState {
         if let Some(binding)=self.bindings[slot].take(){self.pool.release(binding)?;}
         self.bindings[slot]=Some(self.pool.bind(slot,origin)?);Ok(())
     }
+    pub fn quarantine(&mut self,slot:usize) {
+        if let Some(binding)=self.bindings.get(slot).copied().flatten() {
+            self.pool.quarantine(binding).expect("live recurrent binding belongs to its pool");
+        }
+    }
     pub fn install(&mut self,slot:usize,binding:DraftBinding)->Result<()> {
         ensure!(slot<self.slots,"recurrent restored binding slot exceeds admission");
         self.bindings[slot]=Some(binding);Ok(())
@@ -36,6 +41,27 @@ impl ContextState {
             ensure!((origin,frontier)==(seq.valid_from,seq.position),"recurrent draft differs from committed context frontier");
             Ok(self.pool.committed_page_table(binding)?)
         }).collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn quarantined_recurrent_destinations_survive_normal_cleanup() -> Result<()> {
+        let mut state=ContextState::new(2,1024,8*64,88)?;
+        state.reset(0,0)?;
+        let binding=state.binding(0)?;
+        let pending=state.pool.reserve(binding,0,3*64)?;
+        let destinations=state.pool.destinations(pending)?;
+        state.quarantine(0);
+        assert!(state.reset(0,0).is_err(),"quarantined slot must never be rebound");
+        assert_eq!(state.pool.free(),5);
+        state.reset(1,0)?;
+        let next=state.pool.reserve(state.binding(1)?,0,5*64)?;
+        assert!(state.pool.destinations(next)?.iter().all(|row|!destinations.contains(row)));
+        assert_eq!(state.pool.free(),0);
+        Ok(())
     }
 }
 

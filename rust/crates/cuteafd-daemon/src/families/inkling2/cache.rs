@@ -202,6 +202,18 @@ impl cuteafd_engine::prefix::PrefixFamily for InklingPrefix<'_> {
             rule: ReuseRule::EXACT, mark_store: MarkStore::Arena, page_owners: Default::default() }
     }
     fn pages<'p>(&self, placement: &'p Placement) -> &'p [u32] { &placement.units }
+    fn draft_page_bytes(&self)->usize {self.draft.as_ref().map_or(0,|draft|draft.drafter.page_bytes())}
+    fn quarantine_draft_pages(&self,placement:&Placement) {
+        if let Some(draft)=&self.draft {draft.drafter.quarantine_pages(placement.slot);}
+    }
+    fn draft_demand(&self,placement:&Placement)->Option<cuteafd_engine::reserve::DraftDemand> {
+        self.draft.as_ref()?.drafter.reservation(placement.slot)
+    }
+    fn draft_reservable(&self)->Option<usize> {Some(self.draft.as_ref()?.drafter.reservable())}
+    fn draft_lifetime_rows(&self)->Option<usize> {Some(self.draft.as_ref()?.drafter.lifetime_rows())}
+    fn draft_admission(&self,origin:usize)->Option<cuteafd_engine::reserve::DraftDemand> {
+        Some(self.draft.as_ref()?.drafter.admission(origin))
+    }
     fn admit_draft_pages(&self,p:&mut Placement,capacity:usize)->Result<(),cuteafd_engine::prefix::BoxError>{
         if let Some(draft)=&self.draft{draft.drafter.admit_pages(p.slot,capacity)?;}Ok(())
     }
