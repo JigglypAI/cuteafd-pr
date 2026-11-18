@@ -41,6 +41,8 @@ SEGMENT_BYTES = 4 * (1 << 30)
 EXPERT_GROUP = 32
 EXPERT_ROWS = 2048
 PILOT_POLICY = {"include_head", "include_kv_b", "k6_drafter_bits"}
+LEGACY_EXPERT_SPOOL_COMMIT = "3c5ee4bb0cecedacdf87006bf336f96719ffc3d2"
+LEGACY_EXPERT_SPOOL_FILES = ("quantization/hy4_flash/run.py", "quantization/hy4_flash/storage.py")
 
 
 def read_json(path):
@@ -93,6 +95,39 @@ def identity(source, corpus, pilot):
                 expert_rows=EXPERT_ROWS, expert_group=EXPERT_GROUP,
                 replay_weights="serialized-exl3-reconstructed-bf16-promoted-fp32",
                 drafter_anchor="last-committed-target-state-k8-head-greedy-bonus")
+
+
+def checkpoint_identity(root, candidate, *, resume_legacy):
+    """Keep the sealed numerical identity and record the resident replay code."""
+    identity_path = root / "identity.json"
+    recovery_path = root / "resident-expert-recovery.json"
+    if not identity_path.exists():
+        if resume_legacy or recovery_path.exists():
+            raise ValueError("Hy4 resident recovery requires an existing numerical identity")
+        atomic_json(identity_path, candidate)
+        return candidate
+    frozen = read_json(identity_path)
+    if frozen == candidate and not recovery_path.exists():
+        return frozen
+    if not resume_legacy:
+        raise ValueError("Hy4 legacy expert recovery requires --resume-legacy-expert-spool")
+
+    files = candidate["code"]["files"].copy()
+    for path in LEGACY_EXPERT_SPOOL_FILES:
+        original = subprocess.check_output(["git", "show", f"{LEGACY_EXPERT_SPOOL_COMMIT}:{path}"], cwd=REPO)
+        files[path] = hashlib.sha256(original).hexdigest()
+    legacy = candidate | {"code": candidate["code"] | {"files": files}}
+    if frozen != legacy:
+        raise ValueError("Hy4 numerical or unrelated code identity differs from the sealed run")
+    expected = dict(schema="hy4-resident-experts-v1", legacy_commit=LEGACY_EXPERT_SPOOL_COMMIT,
+                    code={path: candidate["code"]["files"][path] for path in LEGACY_EXPERT_SPOOL_FILES},
+                    frozen_identity_sha256=hashlib.sha256(identity_path.read_bytes()).hexdigest())
+    if recovery_path.exists():
+        if read_json(recovery_path) != expected:
+            raise ValueError("Hy4 resident recovery code differs from the committed backend")
+    else:
+        atomic_json(recovery_path, expected)
+    return frozen
 
 
 class Progress:
@@ -148,13 +183,9 @@ class Runner:
         self.header = HeaderSource(args.source)
         self.pilot = load_pilot(args.pilot)
         self.policy = self.pilot["core_policy"]
-        self.identity = identity(self.header, args.corpus, self.pilot)
-        identity_path = self.root / "identity.json"
-        if identity_path.exists():
-            if read_json(identity_path) != self.identity:
-                raise ValueError("Hy4 numerical identity differs; diagnose before reusing stages")
-        else:
-            atomic_json(identity_path, self.identity)
+        self.identity = checkpoint_identity(
+            self.root, identity(self.header, args.corpus, self.pilot),
+            resume_legacy=args.resume_legacy_expert_spool)
         self.core = recipe.reviewed_core_modules(
             include_head=self.policy["include_head"], include_kv_b=self.policy["include_kv_b"])
         self.total = len(self.core) * 2 + recipe.EXPERT_MODULE_COUNT
@@ -371,23 +402,18 @@ class Runner:
                     yield number, dict(latent=latent, ids=ids, gamma=gamma)
             self.save(route_stage, routes)
             spool = Routes(self.stages.records(route_stage), recipe.EXPERTS_PER_LAYER,
-                           sum(len(tokens) for tokens in self.records))
-            packed, extra_metrics, expert_stages = self.experts(label, layer, spool)
-            def weighted_outputs():
-                for start, stage in enumerate(expert_stages):
-                    for ordinal, values in self.stages.records(stage, keys=("weighted",)):
-                        yield start * EXPERT_GROUP + ordinal, values["weighted"]
-            combined = spool.combined(weighted_outputs())
+                           sum(len(tokens) for tokens in self.records), device=self.device)
+            packed, extra_metrics, expert_stages, combined = self.experts(label, layer, spool)
             del spool
             fit_stages.append(self.core_fit(label + "-latent-up", layer,
                 [(p + "mlp.routed_expert_up_proj",)],
-                lambda: ((rows.to(self.device),) for rows in combined.split(EXPERT_ROWS)), overrides))
+                lambda: ((rows,) for rows in combined.split(EXPERT_ROWS)), overrides))
 
         def finish():
             routed = iter(combined.split([len(tokens) for tokens in self.records])) if moe else None
             for number, values in self.rows(mlp_stage, "state", "post", "inputs"):
                 result = self.model.mlp_finish(values["state"], values["post"], values["inputs"],
-                    layer, next(routed).to(self.device) if moe else None, project)
+                    layer, next(routed) if moe else None, project)
                 yield number, dict(state=result)
 
         self.save(successor, finish)
@@ -406,69 +432,101 @@ class Runner:
 
     def experts(self, label, layer, spool):
         packed, errors, stages = {}, [], []
+        combined = torch.zeros_like(spool.latent)
         for start in range(0, recipe.EXPERTS_PER_LAYER, EXPERT_GROUP):
             stage = f"{label}-expert-{start:03d}"
             metrics = []
             tick = time.monotonic()
-            def encode_group():
-                for expert in range(start, min(start + EXPERT_GROUP, recipe.EXPERTS_PER_LAYER)):
-                    yield expert - start, self.expert(layer, spool, expert, metrics)
-            manifest = self.stages.write_batches(stage, encode_group(), {"metrics": metrics},
-                                                  segment_bytes=SEGMENT_BYTES, segment_batches=EXPERT_GROUP)
+            manifest = self.stages.load(stage)
+            if manifest is None:
+                def encode_group():
+                    for expert in range(start, min(start + EXPERT_GROUP, recipe.EXPERTS_PER_LAYER)):
+                        yield expert - start, self.expert(layer, spool, expert, metrics, combined)
+
+                manifest = self.stages.write_batches(stage, encode_group(), {"metrics": metrics},
+                                                      segment_bytes=SEGMENT_BYTES, segment_batches=EXPERT_GROUP)
+            else:
+                for entry in manifest["entries"]:
+                    self.replay_expert(layer, spool, start + entry["index"], combined, stage, entry["index"])
             for entry in manifest["entries"]:
                 ordinal = entry["index"]
-                prefix = layer.prefix + f"mlp.experts.{start + ordinal}."
-                for leaf in ("gate_proj", "up_proj", "down_proj"):
+                for name in self.expert_names(layer, start + ordinal):
                     for suffix in recipe.SUFFIXES:
-                        name = f"{prefix}{leaf}.{suffix}"
-                        packed[name] = self.stages.reference(stage, ordinal, f"k4.{name}")
+                        tensor = f"{name}.{suffix}"
+                        packed[tensor] = self.stages.reference(stage, ordinal, f"k4.{tensor}")
             errors.extend(manifest["metadata"]["metrics"])
             stages.append(stage)
             self.progress.base["expert_projections"] = len(errors)
-            self.progress.event("expert_group_complete", current_layer=layer.index,
-                                expert_group_seconds=time.monotonic() - tick if metrics else None,
+            phase = "expert_group_complete" if metrics else "expert_group_replayed"
+            self.progress.event(phase, current_layer=layer.index,
+                                expert_group_seconds=time.monotonic() - tick,
                                 new_expert_projections=len(metrics))
-        return packed, errors, stages
+        return packed, errors, stages, combined
 
-    def expert(self, layer, spool, expert, metrics):
+    @staticmethod
+    def expert_names(layer, expert):
+        prefix = f"{layer.prefix}mlp.experts.{expert}."
+        return tuple(prefix + leaf for leaf in ("gate_proj", "up_proj", "down_proj"))
+
+    def expert_activations(self, spool, rows, names, gate, up):
+        limit = self.model.config.swiglu_limit
+        for selection in rows.split(EXPERT_ROWS):
+            chunk = spool.latent.index_select(0, selection)
+            g = native_projection(names[0], chunk, gate).clamp_max(limit)
+            u = native_projection(names[1], chunk, up).clamp(-limit, limit)
+            yield F.silu(g) * u
+
+    def accumulate_expert(self, combined, rows, gamma, name, down, activations):
+        finite = torch.ones((), dtype=torch.bool, device=self.device)
+        for selection, coefficients, chunk in zip(
+                rows.split(EXPERT_ROWS), gamma.split(EXPERT_ROWS), activations, strict=True):
+            weighted = native_projection(name, chunk, down) * coefficients[:, None]
+            finite.logical_and_(torch.isfinite(weighted).all())
+            # Every expert visits a token at most once. Add in ascending expert
+            # order, as the stock reference and the legacy CPU reduction do.
+            combined.index_copy_(0, selection, combined.index_select(0, selection) + weighted)
+        if not bool(finite):
+            raise ValueError(f"nonfinite Hy4 expert output: {name}")
+
+    def replay_expert(self, layer, spool, expert, combined, stage, ordinal):
+        rows, gamma = spool.expert(expert)
+        rows, gamma = rows.to(self.device), gamma.to(self.device)
+        names = self.expert_names(layer, expert)
+        keys = tuple(f"k4.{name}.{suffix}" for name in names for suffix in recipe.SUFFIXES)
+        # Select only packed weights, including when a frozen group still
+        # contains the legacy unsummed output. Replaying needs no Hessian.
+        values = self.stages.fields(stage, ordinal, keys)
+        latent = spool.latent.shape[-1]
+        intermediate = self.model.config.moe_intermediate_size
+        gate, up, down = (reconstruction(values, name, 4, shape, self.device)
+                          for name, shape in zip(names, ((intermediate, latent), (intermediate, latent),
+                                                        (latent, intermediate)), strict=True))
+        activated = self.expert_activations(spool, rows, names, gate, up)
+        self.accumulate_expert(combined, rows, gamma, names[2], down, activated)
+
+    def expert(self, layer, spool, expert, metrics, combined):
         rows, gamma = spool.expert(expert)
         if not len(rows):
             raise ValueError(f"Hy4 layer {layer.index} expert {expert} has no natural calibration rows")
-        prefix = layer.prefix + f"mlp.experts.{expert}."
-        names = [prefix + leaf for leaf in ("gate_proj", "up_proj", "down_proj")]
+        rows, gamma = rows.to(self.device), gamma.to(self.device)
+        names = self.expert_names(layer, expert)
         weights = self.reader.expert_weights(layer.index, expert)
-        def inputs():
-            for part in rows.split(EXPERT_ROWS):
-                yield spool.latent.index_select(0, part).to(self.device)
         acc = numerical.covariance_accumulator(weights[0].shape[-1], device=self.device)
-        for chunk in inputs():
-            acc.add(chunk)
+        for part in rows.split(EXPERT_ROWS):
+            acc.add(spool.latent.index_select(0, part))
         covariance = raw(acc)
         values = {}
         for name, weight in zip(names[:2], weights[:2], strict=True):
             values.update(encode(name, weight.to(self.device), covariance, (4,), self.device, metrics))
         gate, up = (reconstruction(values, name, 4, weight.shape, self.device)
                     for name, weight in zip(names[:2], weights[:2], strict=True))
-        def activated():
-            limit = self.model.config.swiglu_limit
-            for chunk in inputs():
-                g = native_projection(names[0], chunk, gate).clamp_max(limit)
-                u = native_projection(names[1], chunk, up).clamp(-limit, limit)
-                yield F.silu(g) * u
         acc = numerical.covariance_accumulator(weights[2].shape[-1], device=self.device)
-        for chunk in activated():
+        for chunk in self.expert_activations(spool, rows, names, gate, up):
             acc.add(chunk)
         values.update(encode(names[2], weights[2].to(self.device), raw(acc), (4,), self.device, metrics))
         down = reconstruction(values, names[2], 4, weights[2].shape, self.device)
-        output = torch.empty((len(rows), weights[2].shape[0]), dtype=torch.float32)
-        for start, chunk in enumerate(activated()):
-            low = start * EXPERT_ROWS
-            high = low + len(chunk)
-            output[low:high].copy_(native_projection(names[2], chunk, down)
-                                   * gamma[low:high, None].to(self.device))
-        if not bool(torch.isfinite(output).all()):
-            raise ValueError(f"nonfinite Hy4 expert output: {prefix}")
-        values["weighted"] = output
+        activated = self.expert_activations(spool, rows, names, gate, up)
+        self.accumulate_expert(combined, rows, gamma, names[2], down, activated)
         return values
 
     def recover_complete_group(self, label, successor, **frontier):
@@ -705,6 +763,9 @@ class Runner:
                         task_intermediates=[str(self.stages.root)],
                         package_validation=str(self.output / "package-validation.json"),
                         package_status=result["status"], original_discovery=discovery)
+        recovery = self.root / "resident-expert-recovery.json"
+        if recovery.is_file():
+            complete["resident_expert_recovery"] = read_json(recovery)
         atomic_json(self.root / "numerical-complete.json", complete)
         atomic_json(self.root / "status.json", dict(self.progress.base, status="passed",
                     phase="numerical_complete", updated_at=datetime.now(timezone.utc).isoformat()))
@@ -716,6 +777,8 @@ def main():
     for name in ("source", "corpus", "pilot", "root", "output", "engram-dir", "engram-receipt"):
         parser.add_argument("--" + name, type=Path, required=True)
     parser.add_argument("--device", choices=("cuda:0",), default="cuda:0")
+    parser.add_argument("--resume-legacy-expert-spool", action="store_true",
+                        help="resume the sealed legacy production run with resident expert replay")
     args = parser.parse_args()
     complete = args.root / "numerical-complete.json"
     if complete.exists():

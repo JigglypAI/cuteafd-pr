@@ -108,3 +108,116 @@ def test_both_encodes_receive_same_hessian_and_only_serialized_k8_replays(tmp_pa
 
     runner.core_fit(fit, layer, [(name,)], should_not_run, overrides)
     assert len(attempts) == 2
+
+
+@pytest.mark.parametrize("device", ("cpu", "cuda:0"))
+def test_resident_expert_replay_uses_only_sealed_weights_and_preserves_sum(tmp_path, monkeypatch, device):
+    if device.startswith("cuda") and not torch.cuda.is_available():
+        pytest.skip("CUDA is required for the former CPU versus resident GPU reduction witness")
+
+    monkeypatch.setattr(run, "EXPERT_GROUP", 1)
+    monkeypatch.setattr(run, "EXPERT_ROWS", 2)
+    monkeypatch.setattr(run.recipe, "EXPERTS_PER_LAYER", 3)
+    batch = dict(latent=torch.tensor([[1., -2.], [-3., 4.], [5., 6.], [7., -8.]]),
+                 ids=torch.tensor([[2, 1], [0, 1], [1, 2], [0, 2]]),
+                 gamma=torch.tensor([[.5, .3], [.3, .2], [.2, .5], [.9, .2]]))
+    cpu_routes = Routes([(0, batch)], experts=3, tokens=4)
+    device_routes = Routes([(0, batch)], experts=3, tokens=4, device=device)
+    layer = SimpleNamespace(prefix="model.layers.1.", index=1)
+    runner = run.Runner.__new__(run.Runner)
+    runner.device = torch.device(device)
+    runner.stages = Stages(tmp_path / "stages", {"test": True})
+    runner.progress = SimpleNamespace(base={}, event=lambda *args, **kwargs: None)
+    runner.model = SimpleNamespace(config=SimpleNamespace(swiglu_limit=10., moe_intermediate_size=2))
+    weights = {
+        expert: tuple(torch.tensor([[expert + 1, p - 2], [3 - p, -expert]], dtype=torch.int16)
+                      for p in range(3))
+        for expert in range(3)
+    }
+    runner.reader = SimpleNamespace(expert_weights=lambda _, expert: weights[expert])
+    encodes = []
+
+    def packed(name, weight):
+        return {f"k4.{name}.trellis": weight.to(torch.int16).cpu(),
+                f"k4.{name}.suh": torch.ones(2, dtype=torch.float16),
+                f"k4.{name}.svh": torch.ones(2, dtype=torch.float16),
+                f"k4.{name}.mcg": torch.tensor(1, dtype=torch.int32)}
+
+    def encode(name, weight, covariance, bits, device, metrics):
+        encodes.append(name)
+        metrics.append(dict(module=name, bits=bits))
+        return packed(name, weight)
+
+    def reconstruct(values, name, bits, shape, device):
+        assert bits == 4 and tuple(shape) == (2, 2)
+        return values[f"k4.{name}.trellis"].to(device=device, dtype=torch.float32)
+
+    monkeypatch.setattr(run, "encode", encode)
+    monkeypatch.setattr(run, "reconstruction", reconstruct)
+    run.reference.configure_f32()
+    legacy_parts = []
+    with torch.inference_mode():
+        for expert, matrices in weights.items():
+            rows, coefficients = cpu_routes.expert(expert)
+            names = runner.expert_names(layer, expert)
+            gate, up, down = (w.to(device=device, dtype=torch.float32) for w in matrices)
+            chunks = []
+            for row_indices, gamma in zip(rows.split(2), coefficients.split(2), strict=True):
+                inputs = cpu_routes.latent[row_indices].to(device)
+                gated = run.native_projection(names[0], inputs, gate).clamp_max(10.)
+                lifted = run.native_projection(names[1], inputs, up).clamp(-10., 10.)
+                activated = torch.nn.functional.silu(gated) * lifted
+                chunks.append((run.native_projection(names[2], activated, down) * gamma.to(device)[:, None]).cpu())
+            legacy_parts.append(torch.cat(chunks))
+
+        saved_names = runner.expert_names(layer, 0)
+        legacy_record = {"weighted": torch.full_like(legacy_parts[0], float("nan"))}
+        for name, weight in zip(saved_names, weights[0], strict=True):
+            legacy_record.update(packed(name, weight))
+        legacy = runner.stages.write_batches("mixed-expert-000", [(0, legacy_record)],
+            {"metrics": [dict(module=name, bits=4) for name in saved_names]})
+        expected = cpu_routes.combined(enumerate(legacy_parts))
+        references, errors, stages, observed = runner.experts("mixed", layer, device_routes)
+        assert torch.equal(observed.cpu().view(torch.int32), expected.view(torch.int32))
+        assert len(references) == 36 and len(errors) == 9 and len(encodes) == 6
+        assert runner.stages.load(stages[0]) == legacy
+        for stage in stages[1:]:
+            assert "weighted" not in runner.stages.load(stage)["entries"][0]["tensors"]
+
+        _, _, _, replayed = runner.experts("mixed", layer, device_routes)
+        assert torch.equal(replayed.cpu().view(torch.int32), expected.view(torch.int32))
+        assert len(encodes) == 6
+
+
+def test_resident_recovery_keeps_numerical_identity_and_rejects_other_changes(tmp_path, monkeypatch):
+    import hashlib
+    import json
+
+    paths = run.LEGACY_EXPERT_SPOOL_FILES
+    old_code = {path: hashlib.sha256(path.encode()).hexdigest() for path in paths}
+
+    def get_original(command, cwd):
+        assert command[:2] == ["git", "show"] and cwd == run.REPO
+        anchor, path = command[2].split(":", 1)
+        assert anchor == run.LEGACY_EXPERT_SPOOL_COMMIT and path in paths
+        return path.encode()
+
+    monkeypatch.setattr(run.subprocess, "check_output", get_original)
+    identity = {"seed": 787, "code": {"fork": "pinned", "files": old_code | {"other.py": "unchanged"}}}
+    identity_path = tmp_path / "identity.json"
+    identity_path.write_text(json.dumps(identity))
+    candidate = {"seed": 787, "code": {"fork": "pinned",
+                 "files": {path: "resident:" + path for path in paths} | {"other.py": "unchanged"}}}
+    with pytest.raises(ValueError, match="requires --resume-legacy-expert-spool"):
+        run.checkpoint_identity(tmp_path, candidate, resume_legacy=False)
+    digest = hashlib.sha256(identity_path.read_bytes()).hexdigest()
+    assert run.checkpoint_identity(tmp_path, candidate, resume_legacy=True) == identity
+    assert hashlib.sha256(identity_path.read_bytes()).hexdigest() == digest
+    assert run.checkpoint_identity(tmp_path, candidate, resume_legacy=True) == identity
+    unexpected = candidate | {"seed": 42}
+    with pytest.raises(ValueError, match="numerical or unrelated code identity differs"):
+        run.checkpoint_identity(tmp_path, unexpected, resume_legacy=True)
+    changed = candidate | {"code": candidate["code"] |
+                           {"files": candidate["code"]["files"] | {paths[0]: "different replay"}}}
+    with pytest.raises(ValueError, match="recovery code differs"):
+        run.checkpoint_identity(tmp_path, changed, resume_legacy=True)

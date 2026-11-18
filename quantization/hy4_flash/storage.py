@@ -7,7 +7,8 @@ from kimi_k3.core_k6.storage import StageStore
 from kimi_k3.uniform_k2.storage import read_header, verify_receipt
 
 
-_FIELDS = {"F32": torch.float32, "I64": torch.int64, "I32": torch.int32}
+_FIELDS = {"F32": torch.float32, "F16": torch.float16, "I64": torch.int64,
+           "I32": torch.int32, "I16": torch.int16}
 
 
 class Stages(StageStore):
@@ -58,7 +59,7 @@ class Stages(StageStore):
 class Routes:
     """Stable expert-major view of immutable token-major route records."""
 
-    def __init__(self, batches, experts, tokens):
+    def __init__(self, batches, experts, tokens, *, device="cpu"):
         self.latent = None
         count = 0
         for _, batch in batches:
@@ -70,7 +71,7 @@ class Routes:
                     or not bool(torch.isfinite(gamma).all())):
                 raise ValueError("invalid Hy4 natural-route record")
             if self.latent is None:
-                self.latent = torch.empty((tokens, latent.shape[-1]), dtype=latent.dtype)
+                self.latent = torch.empty((tokens, latent.shape[-1]), dtype=latent.dtype, device=device)
                 choices = torch.empty((tokens, ids.shape[-1]), dtype=ids.dtype)
                 weights = torch.empty_like(choices, dtype=gamma.dtype)
             stop = count + len(latent)
