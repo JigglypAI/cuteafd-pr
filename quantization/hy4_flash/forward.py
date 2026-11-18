@@ -69,7 +69,11 @@ class Reader(reference.Checkpoint):
     def __init__(self, snapshot, device="cpu"):
         super().__init__(snapshot, device)
         self.document = json.loads((self.snapshot / "config.json").read_bytes())
-        self.config = reference.Config.parse(self.document)
+        config = reference.Config.parse(self.document)
+        # The released multimodal config declares the bundled drafter at the
+        # root. Text dimensions and MLA geometry still come from text_config.
+        drafter = {key: value for key, value in self.document.items() if key.startswith("dfly_")}
+        self.config = reference.Config(config.text | drafter, config.masked_tokens)
 
     def load_layer(self, index):
         prefix = f"model.layers.{index}."
