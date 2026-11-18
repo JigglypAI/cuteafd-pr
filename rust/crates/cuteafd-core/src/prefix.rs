@@ -1,10 +1,8 @@
 //! Token-prefix radix retention shared by the in-memory snapshot cache
 //! (`cuteafd-daemon::v41_native_serve::prefix`) and the disk persistence index (`cuteafd-persist`).
 //!
-//! Moved here verbatim from the daemon so both tiers apply one reuse rule: the most computation
-//! saved wins, where a partial match replays from an even-aligned position minus a 128-token
-//! window and a populated exact ancestor can beat a slightly longer partial match
-//! (`Reusable::skipped`). Prompt repeats and completed turns keep separate bounded banks
+//! Both tiers apply the same reuse rule. V4.1 prefers retained ancestors to partial matches;
+//! within either class the most computation saved wins. Prompt repeats and completed turns keep separate bounded banks
 //! (`Retention`); a tie prefers the completed turn.
 //!
 //! The reuse rule is a parameter ([`ReuseRule`]) so the generic engine's families share this
@@ -280,6 +278,15 @@ impl ReuseRule {
     pub const fn partial(self) -> bool {
         self.align > 0
     }
+    /// V4.1 only uses bounded replay when no retained ancestor is usable.
+    pub fn prefers_ancestors(self) -> bool { self == Self::V41 }
+
+    /// Rank a usable match after any media rounding, keeping ancestor priority separate
+    /// from the amount of computation saved.
+    pub fn rank(self, common: usize, frontier: usize, resume: usize) -> (bool, usize) {
+        (self.prefers_ancestors() && common == frontier && resume > 0, resume)
+    }
+
     /// Tokens a match of `common` against a frontier at `frontier` saves.
     pub fn skipped(self, common: usize, frontier: usize) -> usize {
         if common == frontier {
@@ -306,6 +313,9 @@ struct Reusable {
 impl Reusable {
     fn skipped(self, rule: ReuseRule) -> usize {
         rule.skipped(self.common, self.frontier)
+    }
+    fn rank(self, rule: ReuseRule) -> (bool, usize) {
+        rule.rank(self.common, self.frontier, self.skipped(rule))
     }
 }
 impl<T> Node<T> {
@@ -404,7 +414,7 @@ impl<T> Node<T> {
                     })
             };
             if let Some(candidate) = candidate {
-                if best.is_none_or(|old| candidate.skipped(rule) > old.skipped(rule)) {
+                if best.is_none_or(|old| candidate.rank(rule) > old.rank(rule)) {
                     best = Some(candidate);
                 }
             }
@@ -527,8 +537,7 @@ impl<T> Radix<T> {
             .expect("prefix access clock exhausted");
         self.root.lookup(tokens, 0, self.clock)
     }
-    /// Prefer the most computation saved: a populated exact ancestor can beat
-    /// a slightly longer partial match which needs a complete replay window.
+    /// Select under the reuse rule: V4.1 prefers exact ancestors before ranking by saved rows.
     pub fn lookup_reusable(&mut self, tokens: &[u32]) -> Option<(usize, usize, &T)> {
         let found = self.root.find_reusable(tokens, 0, self.rule)?;
         self.clock = self
@@ -638,7 +647,7 @@ impl<T> Retention<T> {
         let turn = self.turns.root.find_reusable(tokens, 0, self.turns.rule);
         // Prefer completed turns on a tie. Refresh only the chosen bank's LRU.
         let kind = match (prompt, turn) {
-            (Some(p), Some(t)) if p.skipped(rule) > t.skipped(rule) => SnapshotKind::Prompt,
+            (Some(p), Some(t)) if p.rank(rule) > t.rank(rule) => SnapshotKind::Prompt,
             (_, Some(_)) => SnapshotKind::Turn,
             (Some(_), None) => SnapshotKind::Prompt,
             (None, None) => return None,
@@ -650,7 +659,8 @@ impl<T> Retention<T> {
         let prompt = self.prompts.peek_reusable(tokens);
         let turn = self.turns.peek_reusable(tokens);
         match (prompt, turn) {
-            (Some(p), Some(t)) if self.rule().skipped(p.0, p.1) > self.rule().skipped(t.0, t.1) => Some(p),
+            (Some(p), Some(t)) if self.rule().rank(p.0, p.1, self.rule().skipped(p.0, p.1))
+                > self.rule().rank(t.0, t.1, self.rule().skipped(t.0, t.1)) => Some(p),
             (_, Some(t)) => Some(t),
             (p, None) => p,
         }
@@ -804,27 +814,21 @@ mod tests {
         );
     }
 
-    /// A partial completed turn longer than the 128-token replay window can still
-    /// save more than the prompt ancestor; the reported frontier is then the
-    /// aligned LCP minus the replay window. That is the v9 262144 shape
-    /// (`hit = 262158 = 262144 + 14` for a 147-token turn matching 142 tokens).
     #[test]
-    fn partial_completed_turn_that_saves_more_than_the_prompt_is_reused_from_its_window() {
-        let context = 4096usize;
-        let prompt: Vec<u32> = (1..=context as u32).collect();
-        let mut turn = prompt.clone();
-        turn.extend(10_000..10_147); // 147-token completed turn (v9 262144 shape)
-        let mut retained = Retention::new(8);
-        retained.bank_mut(SnapshotKind::Prompt).insert(&prompt, "prompt");
-        retained.bank_mut(SnapshotKind::Turn).insert(&turn, "turn");
-        let mut divergent = turn.clone();
-        divergent[context + 142] = 77_777; // matches 142 of 147 generated tokens
-        divergent.extend(20_000..20_044);
-        let (common, frontier, value) = retained.lookup_reusable(&divergent).unwrap();
-        assert_eq!((common, frontier, value), (context + 142, context + 147, &"turn"));
-        // `v41_native_serve::prefix::restore` reports the replay start for a
-        // partial match: `(common / 2 * 2) - 128`.
-        assert_eq!((common / 2 * 2) - 128, context + 14);
+    fn v41_prefers_an_ancestor_across_banks_even_when_partial_would_save_more() {
+        let prompt: Vec<u32> = (1..=512).collect();
+        let mut branch = prompt.clone();
+        branch.extend(513..=1500);
+        let mut divergent = branch.clone();
+        divergent[1001] = 77_777;
+        for kind in [SnapshotKind::Prompt, SnapshotKind::Turn] {
+            let mut retained = Retention::new(8);
+            retained.bank_mut(kind).insert(&prompt, "ancestor");
+            retained.bank_mut(SnapshotKind::Prompt).insert(&branch, "branch");
+            assert!(ReuseRule::V41.skipped(1001, 1500) > prompt.len());
+            assert_eq!(retained.peek_reusable(&divergent), Some((512, 512, &"ancestor")));
+            assert_eq!(retained.lookup_reusable(&divergent), Some((512, 512, &"ancestor")));
+        }
     }
 
     #[test]

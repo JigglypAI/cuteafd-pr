@@ -109,7 +109,8 @@ Porting a family or changing shared serve, prefill, exchange or admission code: 
   its official Encoder SWA Bounded Replay (paper section 3.2.2): global KV is
   reused and encoder SWA is rebuilt approximately from the last 128 tokens,
   extending replay before overlapping images. Label this approximate in metrics
-  and traces. Exact ancestor hits still restore every captured byte exactly.
+  and traces, including descendants of an approximate replay. Ancestor hits
+  take precedence and still restore every captured byte exactly.
 - Device-driven exchange: routes, requests and replies move GPU-to-GPU and
   GPU-to-NIC with no host hop and no idle CPU burn on a request's hot path.
   The host launches work and waits on it; it does not shuttle bytes between

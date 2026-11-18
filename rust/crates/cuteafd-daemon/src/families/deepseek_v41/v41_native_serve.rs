@@ -151,7 +151,7 @@ fn normalize_serving(args: &mut crate::cli::NativeServeArgs) -> Result<u8> {
     args.expert_usage_enabled()?;
     cuteafd_core::concurrency::validate("deepseek_v41", u64::from(args.concurrency))?;
     ensure!(args.prefix.prefix_partial == crate::shared::prefix::Toggle::Off,
-        "V4.1 restores exact prefix frontiers only (--prefix-partial off)");
+        "V4.1 uses built-in bounded replay for partial matches; --prefix-partial is MiMo-only");
     args.prefix.resolve_entries(args.concurrency as usize);
     cuteafd_bench::context::set_resolved("max-context-tokens", &args.max_context_tokens.to_string());
     let lanes = cuteafd_loader::plan::resolve_decode_lanes("deepseek_v41", Some(args.decode_lanes), u64::from(args.concurrency))?;

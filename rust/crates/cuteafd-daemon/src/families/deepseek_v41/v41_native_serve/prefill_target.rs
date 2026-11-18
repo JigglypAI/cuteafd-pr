@@ -99,6 +99,10 @@ pub(crate) enum V41Unit {
 }
 
 impl V41Unit {
+    fn uses_encoder_staging(&self) -> bool {
+        matches!(self, Self::ReplayChunk(_) | Self::Single(_) | Self::Stream(_))
+    }
+
     fn kind(&self) -> usize {
         match self {
             Self::ReplayChunk(_) => 0,
@@ -337,7 +341,7 @@ impl<'a, P: PrefillTarget<'a>, C: DraftChain<'a>> V41PrefillStep<'_, '_, 'a, P, 
         super::scheduler::stall::tick();
         use crate::families::deepseek_v41::v41_backbone_cache::CacheWork;
         self.initialize(cursor)?;
-        if self.interleaved && matches!(unit.work, V41Unit::Single(_) | V41Unit::Stream(_)) {
+        if self.interleaved && unit.work.uses_encoder_staging() {
             // Another prompt's held prefetch waves would hold the pinned prefill
             // staging this call's units gather into.
             let cancelled = self.requests.cancel_foreign_prefetch(self.lease);
@@ -360,11 +364,11 @@ impl<'a, P: PrefillTarget<'a>, C: DraftChain<'a>> V41PrefillStep<'_, '_, 'a, P, 
                 })();
                 if result.is_err() { pass.discard(&mut batch)?; }
                 result?;
-                if matches!(unit.work, V41Unit::Single(_)) {
-                    console::totals::prefill(chunk.len());
-                    console::Prefill::done(console::PrefillKind::Single, 0, 0, 1, chunk.len(), started);
-                    tracing::debug!(target: "cuteafd::timing", rows=chunk.len(), total_us=started.elapsed().as_micros() as u64, "target encoder step");
-                }
+                let kind = if matches!(unit.work, V41Unit::ReplayChunk(_)) { console::PrefillKind::Replay }
+                    else { console::PrefillKind::Single };
+                console::totals::prefill(chunk.len());
+                console::Prefill::done(kind, 0, 0, 1, chunk.len(), started);
+                tracing::debug!(target: "cuteafd::timing", rows=chunk.len(), total_us=started.elapsed().as_micros() as u64, "target encoder step");
                 *next = range.end;
             }
             (V41Unit::Stream(ranges), PrefillState::Encoder { suffix, next, .. }) => {
@@ -819,7 +823,9 @@ mod prefill_tests {
     #[test]
     fn history_replay_stops_at_cached_frontier_before_the_encoder_stream() {
         let times = V41PrefillTimes::default();
-        assert!(matches!(times.encoder_unit(1024, 80, 1, 128, 256, true, ChunkBudget::WHOLE), V41Unit::ReplayChunk(range) if range == (128..208)));
+        let replay = times.encoder_unit(1024, 80, 1, 128, 256, true, ChunkBudget::WHOLE);
+        assert!(replay.uses_encoder_staging(), "decode-share must cancel foreign prefetch before replay can gather");
+        assert!(matches!(replay, V41Unit::ReplayChunk(range) if range == (128..208)));
         assert!(matches!(times.encoder_unit(1024, 80, 1, 208, 256, true, ChunkBudget::WHOLE), V41Unit::ReplayChunk(range) if range == (208..256)));
         assert!(matches!(times.encoder_unit(1024, 80, 1, 1024, 256, true, ChunkBudget::WHOLE), V41Unit::DecoderReplay));
     }
