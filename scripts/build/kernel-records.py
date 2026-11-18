@@ -115,7 +115,7 @@ def elf_resources(blob):
 # Keep explicit absent values too; the source-scan regression guards new reads.
 EXPORT_ENVIRONMENT_NAMES = frozenset("""
 B12X_COMPILE_DISK_CACHE B12X_COMPILE_MEMORY_CACHE CUDA_VISIBLE_DEVICES TRITON_CACHE_DIR
-CUTEAFD_BUILD_KIND CUTEAFD_CUTE_HOST_TARGET CUTEAFD_EXL3_ROUTE_BLOCKS
+CUTEAFD_BUILD_KIND CUTEAFD_EXL3_ROUTE_BLOCKS
 CUTEAFD_EXPORT_NARROW_AOT CUTEAFD_EXPORT_HC_LAGGED CUTEAFD_EXPORT_IMAGE_ID
 CUTEAFD_SOURCE_ROOT CUTEAFD_SPARKINFER_SOURCE_DIR CUTEAFD_SPARKINFER_LOCK_FILE
 CUTEAFD_EXPORT_HOST_CLASS CUTEAFD_EXPORT_HOST_CONTEXTS CUTEAFD_EXPORT_HOST_WORKERS
@@ -224,7 +224,6 @@ def backend_identity():
             "runtime": compiler._runtime_toolchain_key(),
             "environment": compiler._compile_environment_key(),
             "static_environment": static_environment(),
-            "host_target": os.environ.get("CUTEAFD_CUTE_HOST_TARGET", "<portable-default>"),
             "ptxas_sha256": digest(Path(ptxas).read_bytes())}
 
 
