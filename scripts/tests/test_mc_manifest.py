@@ -76,6 +76,34 @@ def test_manifest_fails_closed(damage):
         mc.validate(manifest, FIXTURE)
 
 
+@pytest.mark.parametrize("scope", ["source", "variant"])
+def test_writer_refuses_undefined_nested_fields(scope):
+    manifest = json.loads((FIXTURE / mc.MANIFEST).read_text())
+    target = manifest["source"] if scope == "source" else manifest["variants"][0]
+    target["extra"] = True
+    with pytest.raises(ValueError, match="expected fields"):
+        mc.validate(manifest, FIXTURE)
+
+
+def test_writer_can_emit_empty_required_features():
+    manifest = json.loads((FIXTURE / mc.MANIFEST).read_text())
+    assert mc.build(FIXTURE, source_repo=manifest["source"]["repo"],
+                    source_revision=manifest["source"]["revision"],
+                    core_tensors={v["name"]: v["core_tensors"] for v in manifest["variants"]},
+                    required_features=[]) == dict(manifest, required_features=[])
+
+
+@pytest.mark.parametrize(("features", "error"), [
+    (None, "list of strings"), ("example-layout", "list of strings"),
+    ([1], "list of strings"), (["example-layout"], "unsupported MC feature 'example-layout'"),
+])
+def test_writer_refuses_invalid_required_features(features, error):
+    manifest = json.loads((FIXTURE / mc.MANIFEST).read_text())
+    manifest["required_features"] = features
+    with pytest.raises(ValueError, match=error):
+        mc.validate(manifest, FIXTURE)
+
+
 def test_selected_view_does_not_read_other_views(tmp_path):
     manifest = json.loads((FIXTURE / mc.MANIFEST).read_text())
     for filename in mc.FILES["k8-compact"][:3]:
