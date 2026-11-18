@@ -1,0 +1,233 @@
+from copy import deepcopy
+from hashlib import sha256
+import os
+from pathlib import Path
+
+import pytest
+
+from hy4_flash import handoff, publish, recipe
+from inkling2 import handoff as nest
+from inkling2 import publish as hub
+from kimi_k3.uniform_k2.storage import atomic_json, file_identity
+
+REVISION = 'a' * 40
+SNAPSHOT = nest.NAMESPACE / handoff.MODEL / 'snapshots' / REVISION
+REF = SNAPSHOT.parent.parent / 'refs/main'
+PINS = tuple(f'engram-fp8-layer-{layer:02d}-part-00000.safetensors' for layer in recipe.ENGRAM_ROWS)
+
+
+def test_hy4_publication_rejects_f32_only_or_changed_engram_proof(tmp_path):
+    identity = dict(source_repo=recipe.BASE_REPO, source_revision=recipe.BASE_REVISION)
+    tensors = list(recipe.ENGRAM_TABLES)
+    proof = {t: dict(rows=recipe.ENGRAM_TABLES[t], reference_dtype='BF16', mismatch_count=0) for t in tensors}
+    parts = [dict(file=name, rows=recipe.ENGRAM_TABLES[t], sha256='0' * 64) for name, t in zip(PINS, tensors)]
+    manifest = dict(source=dict(repo=recipe.BASE_REPO, revision=recipe.BASE_REVISION),
+                    original_core_dtype='BF16',
+                    variants=[dict(name=n) for n in ('original', 'k8-compact', 'k6-compact')],
+                    engram_fp8=dict(recipe='test; reference=' + recipe.REFERENCE_REVISION,
+                                   layers=[dict(tensor=t, parts=[p]) for t, p in zip(tensors, parts)]))
+    path = tmp_path / 'cuteafd-mc.json'
+    atomic_json(path, manifest)
+    validation = dict(new_file_sha256={path.name: hub.metadata_identity(path)['sha256']})
+    state = dict(identity=identity, engram_fp8_proof=proof,
+                 new_shards={p['file']: dict(sha256=p['sha256']) for p in parts})
+    publish._validate_package(tmp_path, state, validation)
+    proof[tensors[0]]['reference_dtype'] = 'F32'
+    with pytest.raises(ValueError, match='BF16 proof'):
+        publish._validate_package(tmp_path, state, validation)
+    proof[tensors[0]]['reference_dtype'] = 'BF16'
+    state['new_shards'][PINS[0]]['sha256'] = '1' * 64
+    with pytest.raises(ValueError, match='sealed shard'):
+        publish._validate_package(tmp_path, state, validation)
+
+
+@pytest.fixture
+def published(tmp_path):
+    root, output, source, managed = (tmp_path / n for n in ('production', 'package', 'source', 'managed'))
+    for p in (root, output, source):
+        p.mkdir()
+    files = {}
+    for name in (*PINS, *(f'weight-{i:02d}.safetensors' for i in range(8))):
+        path = output / name
+        contents = name.encode().ljust(100, b'0')
+        path.write_bytes(contents)
+        files[name] = dict(path=str(path), bytes=len(contents), sha256=sha256(contents).hexdigest(),
+                           git_blob=None, file_identity=file_identity(path), device=path.stat().st_dev)
+    identity = dict(family=publish.FAMILY)
+    atomic_json(output / 'package-state.json', dict(identity=identity))
+    metadata = dict(schema=publish.TARGET.schema('complete'), status='passed',
+                    repo_id=publish.TARGET_REPO, revision=REVISION, output=str(output),
+                    source_snapshot=str(source), files=files, identity=identity,
+                    manifest_sha256=hub.manifest_digest(files))
+    atomic_json(root / 'publication-complete.json', metadata)
+    ref = managed / handoff.MODEL / 'refs/main'
+    ref.parent.mkdir(parents=True)
+    ref.write_text(REVISION)
+    return root, output, managed, metadata
+
+
+class Native:
+    def __init__(self, files):
+        self.files = files
+        self.calls = []
+        self.rules = {}
+        self.plans = {}
+        self.placements = {name: {'maxq'} for name in (*files, 'refs/main')}
+        self.jobs = {}
+        self.fail_wait = None
+        self.change_show = False
+        self.fail_submit = False
+
+    def _job(self, count, *, what, host='maxq', importing=False, eviction=False):
+        job = dict(id=len(self.jobs) + 1, what=what, finished=True, hosts={host: dict(finished=not eviction, total_files=count,
+                                                   done_files=count, done_bytes=0, total_bytes=0)})
+        result = dict(job=job)
+        if importing:
+            result['import'] = dict(finished=True, errors=[], copied_bytes=0, adopted=count)
+        self.jobs[len(self.jobs) + 1] = result
+        return len(self.jobs)
+
+    def _plan(self, args):
+        offgrid = args[0] == '--offgrid'
+        goal = dict(goal='offgrid' if offgrid else 'place', selector='hf:' + publish.TARGET_REPO,
+                    hub=str(nest.NAMESPACE), hosts=[] if offgrid else list(nest.TARGET_ARGS),
+                    factor=1 / 8, by_speed=False)
+        rows = {name: dict(path=str(SNAPSHOT / name), group=publish.TARGET_REPO, name=name, size=row['bytes'])
+                for name, row in self.files.items()}
+        rows['refs/main'] = dict(path=str(REF), size=len(REVISION), name='main', group=str(REF.parent))
+        if offgrid:
+            steps = [dict(kind='evict', host='maxq', copies=list(rows.values()))]
+        else:
+            steps = [dict(kind='replicate', host=host, copies=[rows[f'weight-{i:02d}.safetensors']])
+                     for i, host in enumerate(nest.TARGETS)]
+            steps[0]['copies'].extend([rows['refs/main'], *(rows[name] for name in PINS)])
+        plan = dict(id=2 if offgrid else 1, feasible=True, blocked=[], goal=goal, steps=steps)
+        self.plans[plan['id']] = plan
+        return deepcopy(plan)
+
+    def __call__(self, *args):
+        self.calls.append(args)
+        match args:
+            case ('hf', 'import', repo, '--offline', '--no-copy'):
+                assert repo.name == handoff.MODEL
+                return {'job': self._job(len(self.files), what=f'hf import {repo} -> {nest.NAMESPACE}', importing=True)}
+            case ('jobs',):
+                return dict(jobs=[result['job'] for result in self.jobs.values()])
+            case ('jobs', number, '--wait'):
+                if number == self.fail_wait:
+                    self.fail_wait = None
+                    raise TimeoutError('interrupted native job wait')
+                return self.jobs[number]
+            case ('rule', 'ls'):
+                return dict(rules=list(self.rules.values()))
+            case ('rule', 'set', name, selector, '--hosts', host, '--auto'):
+                assert host == 'raptor'
+                self.rules[name] = dict(name=name, selector=selector, hosts=[host], auto=True,
+                    summary=dict(files=1, bytes=self.files[Path(selector).name]['bytes'], models=[publish.TARGET_REPO]))
+                return {}
+            case ('reconcile', rule):
+                self.placements[Path(self.rules[rule]['selector']).name].add('raptor')
+                return {'jobs': [self._job(1, host='raptor', what='replicate ' + self.rules[rule]['selector'])]}
+            case ('plan', '--place' | '--offgrid', *_):
+                return self._plan(args[1:])
+            case ('plan', 'skip', number, *paths):
+                assert set(paths) == {SNAPSHOT / n for n in PINS}
+                for step in self.plans[number]['steps']:
+                    for row in step['copies']:
+                        if Path(row['path']) in paths:
+                            row['skip'] = True
+                return {}
+            case ('plan', 'show', number, '--files'):
+                plan = deepcopy(self.plans[number])
+                if self.change_show:
+                    plan['steps'][0]['copies'][0]['size'] += 1
+                return plan
+            case ('plan', 'apply', number):
+                self.placements = handoff._project(self.plans[number], self.placements)
+                count = sum(not row.get('skip') for step in self.plans[number]['steps'] for row in step['copies'])
+                job = self._job(count, what=f'apply plan {number}', eviction=number == 2)
+                if self.fail_submit:
+                    self.fail_submit = False
+                    raise TimeoutError('native job accepted before client lost reply')
+                return {'job': job}
+            case ('ls', path) if path == SNAPSHOT.parent:
+                return dict(entries=[dict(name=REVISION, kind='directory')])
+            case ('ls', path) if path == REF.parent:
+                return dict(entries=[dict(name='main', kind='regular', size=len(REVISION),
+                                          hosts=sorted(self.placements['refs/main']))])
+            case ('ls', path) if path == SNAPSHOT:
+                return dict(entries=[dict(name=name, kind='regular', sealed=True, size=row['bytes'],
+                                          hosts=sorted(self.placements[name])) for name, row in self.files.items()])
+            case _:
+                pytest.fail('unexpected simulated SparkNest operation ' + repr(args))
+
+
+def test_hy4_no_copy_import_pin_spread_resume_and_cleanup(published, monkeypatch):
+    root, output, managed, record = published
+    call = Native(record['files'])
+    call.fail_wait = len(PINS) + 2  # pause after the native spread job has been submitted
+    stage = root / 'handoff-stage'
+    with pytest.raises(TimeoutError, match='interrupted'):
+        handoff.handoff(root, output, stage, call=call, managed=managed)
+    source = output / PINS[0]
+    engram_stage = root.parent / 'output'
+    engram_stage.mkdir()
+    os.link(source, engram_stage / source.name)
+    (engram_stage / 'engram-export-complete.json').write_text('{}')
+    assert source.samefile(stage / handoff.MODEL / 'snapshots' / REVISION / source.name)
+    result = handoff.handoff(root, output, stage, call=call, managed=managed)
+    assert result['pinned_host'] == 'raptor'
+    assert result['pinned_files'] == sorted(PINS)
+    assert set(result['distribution_bytes'].values()) == {100}
+    assert [args for args in call.calls if args[:2] == ('plan', 'apply')] == [
+        ('plan', 'apply', 1), ('plan', 'apply', 2)]
+    assert [args for args in call.calls if args[:2] == ('hf', 'import')] == [
+        ('hf', 'import', stage / handoff.MODEL, '--offline', '--no-copy')]
+    assert all(call.placements[name] == {'raptor'} for name in PINS)
+    assert output.is_dir() and stage.is_dir()
+    original_retire = nest.retire
+    monkeypatch.setattr(nest, 'retire', lambda *a, **kw: original_retire(*a, **kw, inspect=lambda paths: None))
+    retired = handoff.retire(root, output, engram_stage=engram_stage)
+    assert handoff.retire(root, output, engram_stage=engram_stage) == retired
+    assert retired['status'] == 'passed'
+    assert not output.exists() and not stage.exists() and not engram_stage.exists()
+    assert (root / 'retired-receipts/output/package-state.json').exists()
+    assert (root / 'retired-receipts/verified-staging/engram-export-complete.json').exists()
+    before = list(call.calls)
+    assert handoff.handoff(root, output, stage, call=call, managed=managed) == result
+    assert call.calls == before
+
+
+def test_hy4_changed_native_plan_stops_before_apply(published):
+    root, output, managed, record = published
+    call = Native(record['files'])
+    call.change_show = True
+    with pytest.raises(ValueError, match='unreviewed file'):
+        handoff.handoff(root, output, root / 'stage', call=call, managed=managed)
+    assert not any(args[:2] == ('plan', 'apply') for args in call.calls)
+    assert not (root / 'handoff-complete.json').exists()
+    assert output.exists()
+
+
+def test_hy4_recovers_plan_accepted_before_reply(published):
+    root, output, managed, record = published
+    call = Native(record['files'])
+    call.fail_submit = True
+    stage = root / 'stage'
+    with pytest.raises(TimeoutError, match='lost reply'):
+        handoff.handoff(root, output, stage, call=call, managed=managed)
+    assert 'placement-job' not in hub.load(root / 'handoff-state.json')
+    assert handoff.handoff(root, output, stage, call=call, managed=managed)['status'] == 'passed'
+    assert call.calls.count(('plan', 'apply', 1)) == 1
+
+
+def test_hy4_cleanup_protects_unrelated_engram_staging(published):
+    root, output, managed, record = published
+    call = Native(record['files'])
+    handoff.handoff(root, output, root / 'stage', call=call, managed=managed)
+    engram_stage = root.parent / 'output'
+    engram_stage.mkdir()
+    (engram_stage / 'unrelated.safetensors').write_bytes(b'not an adopted hardlink')
+    with pytest.raises(ValueError, match='unowned or unadopted'):
+        handoff.retire(root, output, engram_stage=engram_stage)
+    assert output.exists() and engram_stage.exists()

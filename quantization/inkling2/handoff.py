@@ -28,11 +28,11 @@ MANAGED = Path('/mnt/sparknest/hf-home/hub')
 MODEL = 'models--' + TARGET_REPO.replace('/', '--')
 
 
-def native(*args, timeout=21600):
+def native(*args, timeout=21600, repo_id=TARGET_REPO):
     result = subprocess.run(['nest', '--json', *map(str, args)], check=True,
                             capture_output=True, text=True, timeout=timeout)
     raw = result.stdout
-    notice = TARGET_REPO + ': mirrored\n'
+    notice = repo_id + ': mirrored\n'
     if args[:2] == ('hf', 'import') and raw.startswith(notice):
         raw = raw[len(notice):]
     return json.loads(raw)
@@ -64,14 +64,15 @@ def successful(result, *, importing_files=None, eviction_files=None):
     return result
 
 
-def check_plan(plan, revision, files, *, offgrid=False):
+def check_plan(plan, revision, files, *, offgrid=False, repo_id=TARGET_REPO,
+               skipped=(), evict_hosts=None):
     goal = plan.get('goal', {})
     # Native goals retain CLI disk selectors; execution steps use display names.
     disk_names = dict(zip(TARGET_ARGS[:2], TARGETS[:2]))
     hosts = [disk_names.get(host, host) for host in goal.get('hosts', [])]
     if (plan.get('feasible') is not True or plan.get('blocked')
             or goal.get('goal') != ('offgrid' if offgrid else 'place')
-            or goal.get('selector') != 'hf:' + TARGET_REPO or goal.get('hub') != str(NAMESPACE)):
+            or goal.get('selector') != 'hf:' + repo_id or goal.get('hub') != str(NAMESPACE)):
         raise ValueError('placement is not restricted to this checkpoint')
     if offgrid:
         if goal.get('hosts') != []:
@@ -79,32 +80,34 @@ def check_plan(plan, revision, files, *, offgrid=False):
     elif (len(hosts) != 8 or set(hosts) != set(TARGETS)
             or goal.get('factor') != 1 / 8 or goal.get('by_speed', False)):
         raise ValueError('placement must use the authorized even eight-place spread')
-    snapshot = NAMESPACE / MODEL / 'snapshots' / revision
-    refs = NAMESPACE / MODEL / 'refs'
+    model = NAMESPACE / ('models--' + repo_id.replace('/', '--'))
+    snapshot, refs = model / 'snapshots' / revision, model / 'refs'
     for step in plan.get('steps', []):
         if step.get('kind') not in (('evict',) if offgrid else ('replicate', 'evict')):
             raise ValueError('unexpected native placement operation')
         if step.get('kind') == 'replicate' and step.get('host') not in TARGETS:
             raise ValueError('placement writes to unauthorized disk')
-        if offgrid and step.get('host') in TARGETS:
-            raise ValueError('off-grid retirement cannot evict an authorized fabric copy')
+        if step.get('kind') == 'evict' and (
+                (offgrid and step.get('host') in TARGETS)
+                or (evict_hosts is not None and step.get('host') not in evict_hosts)):
+            raise ValueError('placement evicts from an unauthorized disk')
         for copy in step.get('copies', []):
             path = copy.get('path')
+            name = copy.get('name', '')
             if path == str(refs / 'main'):
                 valid = copy.get('group') == str(refs) and copy.get('size') == len(revision)
             else:
-                name = copy.get('name', '')
                 relative(name)
                 valid = (name in files and path == str(snapshot / name)
-                    and copy.get('group') == TARGET_REPO and copy.get('size') == files[name]['bytes'])
-            if not valid or copy.get('skip'):
+                    and copy.get('group') == repo_id and copy.get('size') == files[name]['bytes'])
+            if not valid or bool(copy.get('skip')) != (name in skipped):
                 raise ValueError('placement touches an unreviewed file or revision')
     return plan
 
 
-def stage_snapshot(published, stage_root):
+def stage_snapshot(published, stage_root, *, repo_id=TARGET_REPO, family='inkling2'):
     """Create a conventional HF snapshot using hardlinks only; EXDEV is fatal."""
-    if (published.get('status') != 'passed' or published.get('repo_id') != TARGET_REPO
+    if (published.get('status') != 'passed' or published.get('repo_id') != repo_id
             or not re.fullmatch('[0-9a-f]{40,64}', published.get('revision', ''))
             or manifest_digest(published['files']) != published.get('manifest_sha256')):
         raise ValueError('matching verified publication required')
@@ -114,8 +117,8 @@ def stage_snapshot(published, stage_root):
             raise ValueError('stage root cannot traverse a symlink')
     if stage_root == Path(published['output']) or stage_root in Path(published['output']).parents or Path(published['output']) in stage_root.parents:
         raise ValueError('standalone stage and export must be disjoint')
-    stamp = dict(repo_id=TARGET_REPO, revision=published['revision'], manifest_sha256=published['manifest_sha256'])
-    owner = stage_root / '.inkling2-owned-stage.json'
+    stamp = dict(repo_id=repo_id, revision=published['revision'], manifest_sha256=published['manifest_sha256'])
+    owner = stage_root / f'.{family}-owned-stage.json'
     if owner.exists():
         regular(owner)
         if load(owner) != stamp:
@@ -132,7 +135,7 @@ def stage_snapshot(published, stage_root):
                 or source.stat().st_dev != device):
             raise ValueError('staging source changed or crosses filesystems; no copy fallback')
     atomic_json(owner, stamp)
-    repo = stage_root / MODEL
+    repo = stage_root / ('models--' + repo_id.replace('/', '--'))
     snapshot = repo / 'snapshots' / published['revision']
     if any(p.is_symlink() for p in (snapshot, *snapshot.parents)):
         raise ValueError('stage directories cannot traverse symlinks')
@@ -202,6 +205,42 @@ def verify_managed(files, revision, *, call=native, managed=MANAGED, allow_offgr
     return distribution
 
 
+def run_job(root, state_path, state, call, key, command, *, job_description=None, **checks):
+    """Recover a submitted native job by id and record its terminal validation."""
+    complete = root / (key + '-complete.json')
+    if complete.exists():
+        terminal = successful(load(complete), **checks)
+    else:
+        terminal = None
+    if terminal is None and key not in state:
+        number = None
+        intent = key + '-submission'
+        if intent in state:
+            if not job_description or job_description != state[intent]:
+                raise ValueError('native job submission identity differs')
+            found = [job['id'] for job in call('jobs')['jobs'] if job['what'] == job_description]
+            if len(found) > 1:
+                raise ValueError('multiple native jobs match the submitted operation')
+            number = next(iter(found), None)
+        elif job_description:
+            state[intent] = job_description
+            atomic_json(state_path, state)
+        if number is None:
+            number = call(*command).get('job')
+        if type(number) is not int or number <= 0:
+            raise ValueError('native job id missing')
+        state[key] = number
+        atomic_json(state_path, state)
+    if terminal is None:
+        terminal = successful(call('jobs', state[key], '--wait'), **checks)
+    if job_description and (terminal['job'].get('id') != state.get(key)
+                            or terminal['job'].get('what') != job_description):
+        raise ValueError('terminal native job identity differs')
+    if not complete.exists():
+        atomic_json(complete, terminal)
+    return terminal
+
+
 def handoff(root, stage_root, *, call=native, managed=MANAGED):
     root, stage_root = Path(root).resolve(), Path(stage_root).absolute()
     published = load(root / 'publication-complete.json')
@@ -224,25 +263,11 @@ def handoff(root, stage_root, *, call=native, managed=MANAGED):
             raise ValueError('handoff recovery identity differs')
         atomic_json(state_path, state)
 
-        def job(key, command, **checks):
-            complete = root / (key + '-complete.json')
-            if complete.exists():
-                return successful(load(complete), **checks)
-            if key not in state:
-                number = call(*command).get('job')
-                if type(number) is not int or number <= 0:
-                    raise ValueError('native job id missing')
-                state[key] = number
-                atomic_json(state_path, state)
-            result = successful(call('jobs', state[key], '--wait'), **checks)
-            atomic_json(complete, result)
-            return result
-
         if 'import-job' not in state:
             repo = stage_snapshot(published, stage_root)
         else:
             repo = stage_root / MODEL
-        job('import-job', ('hf', 'import', repo, '--offline', '--no-copy'), importing_files=len(published['files']))
+        run_job(root, state_path, state, call, 'import-job', ('hf', 'import', repo, '--offline', '--no-copy'), importing_files=len(published['files']))
 
         def placement(key, arguments, *, offgrid=False):
             path = root / (key + '.json')
@@ -257,7 +282,7 @@ def handoff(root, stage_root, *, call=native, managed=MANAGED):
                 if shown != plan:
                     raise ValueError('native plan changed before apply')
                 eviction = sum(len(s['copies']) for s in plan['steps']) if all(s['kind'] == 'evict' for s in plan['steps']) else None
-                job(key + '-job', ('plan', 'apply', plan['id']), eviction_files=eviction)
+                run_job(root, state_path, state, call, key + '-job', ('plan', 'apply', plan['id']), eviction_files=eviction)
             return plan
 
         placement('placement', ('--place', 'hf:' + TARGET_REPO, '--factor', '1/8',
@@ -332,11 +357,11 @@ def assert_unused(paths):
             raise RuntimeError('task leaf is in use by a process or container: ' + str(path))
 
 
-def retain_metadata(root, identity, leaves):
+def retain_metadata(root, identity, leaves, *, family='inkling2'):
     """Hardlink task receipts before payload removal, without reading payload bytes."""
     archive = root / 'retired-receipts'
-    marker = archive / '.inkling2-owned-archive.json'
-    stamp = dict(schema='cuteafd-inkling2-retired-receipts-v1', identity=identity)
+    marker = archive / f'.{family}-owned-archive.json'
+    stamp = dict(schema=f'cuteafd-{family}-retired-receipts-v1', identity=identity)
 
     def owned_directory(path):
         for parent in (path, *path.parents):
@@ -359,7 +384,7 @@ def retain_metadata(root, identity, leaves):
     links = {}
     for leaf, category, stage_only in leaves:
         if stage_only:
-            candidates = [leaf / '.inkling2-owned-stage.json']
+            candidates = [leaf / f'.{family}-owned-stage.json']
         else:
             candidates = []
             for directory, _, names in os.walk(leaf, followlinks=False, onerror=failed_walk):
@@ -388,16 +413,18 @@ def retain_metadata(root, identity, leaves):
     return archive, len(links)
 
 
-def retire(root, *, intermediates=(), build_root=None, inspect=assert_unused):
+def retire(root, *, intermediates=(), build_root=None, inspect=assert_unused, repo_id=TARGET_REPO,
+           family='inkling2', build_prefix='inkling2-', verified_staging=None):
     """Retain receipts, then delete explicit payload leaves after native placement."""
     root = Path(root).resolve()
     published, complete = (load(root / n) for n in ('publication-complete.json', 'handoff-complete.json'))
     identity = {k: published[k] for k in ('repo_id', 'revision', 'manifest_sha256')}
-    if (published.get('status') != 'passed' or complete.get('status') != 'passed'
+    if (published.get('repo_id') != repo_id or published.get('status') != 'passed'
+            or complete.get('status') != 'passed'
             or complete.get('identity') != identity or complete.get('one_copy_per_file') is not True):
         raise ValueError('verified matching handoff is required for retirement')
     output, stage = Path(published['output']), Path(complete['stage_root'])
-    if stage.exists() and load(stage / '.inkling2-owned-stage.json') != identity:
+    if stage.exists() and load(stage / f'.{family}-owned-stage.json') != identity:
         raise ValueError('stage ownership differs before retirement')
     if output.exists() and load(output / 'package-state.json').get('identity') != published['identity']:
         raise ValueError('standalone output ownership differs before retirement')
@@ -411,9 +438,15 @@ def retire(root, *, intermediates=(), build_root=None, inspect=assert_unused):
             raise ValueError('intermediate must be an explicit task-owned payload leaf')
         paths.append(p)
         categories[p] = (Path('intermediates') / p.relative_to(root), False)
+    if verified_staging is not None:
+        staging = Path(verified_staging).absolute()
+        if staging.parent != root.parent or staging in (root, output, stage):
+            raise ValueError('separate staging must be a verified sibling task payload')
+        paths.append(staging)
+        categories[staging] = (Path('verified-staging'), False)
     if build_root is not None:
         build = Path(build_root).absolute()
-        if build.parent != Path.home() / '.cache/cuteafd/builds' or not build.name.startswith('inkling2-'):
+        if build.parent != Path.home() / '.cache/cuteafd/builds' or not build.name.startswith(build_prefix):
             raise ValueError('build cleanup requires this task build root')
         for p in build.iterdir():
             if p.name.startswith('target') or p.name in ('exllamav3', 'tmp', 'release-staging', 'torch-extensions', 'cuda-cache'):
@@ -433,7 +466,7 @@ def retire(root, *, intermediates=(), build_root=None, inspect=assert_unused):
         categories[resolved] = categories[path]
     inspect(present)
     archive, retained = retain_metadata(root, identity,
-        [(path, *categories[path]) for path in present])
+        [(path, *categories[path]) for path in present], family=family)
     for path in sorted(set(present), key=lambda p: len(p.parts), reverse=True):
         shutil.rmtree(path)
     record = dict(status='passed', identity=identity, paths=list(map(str, present)),
@@ -452,6 +485,8 @@ def main():
     args = parser.parse_args()
     if args.cleanup:
         request = load(args.cleanup_request) if args.cleanup_request else {}
+        if set(request) - {'intermediates', 'build_root'}:
+            parser.error('unsupported cleanup request field')
         result = retire(args.root, **request)
     elif args.stage_root:
         result = handoff(args.root, args.stage_root)
