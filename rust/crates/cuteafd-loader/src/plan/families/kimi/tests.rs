@@ -936,6 +936,36 @@ fn k31_native_indexer_headers_are_required_and_never_core_quantized() -> Result<
     Ok(())
 }
 
+fn installed_k31_mc_snapshot() -> Result<std::path::PathBuf> {
+    let hf = std::path::PathBuf::from(std::env::var_os("CUTEAFD_DEPLOYMENT_TEST_HF_HOME")
+        .context("Kimi installed check requires CUTEAFD_DEPLOYMENT_TEST_HF_HOME")?);
+    Ok(crate::model_cache_dir(&hf, "wrldsuksgo2mars/Kimi-K3.1-Pro-EXL3-K2-MC")
+        .join("snapshots/1455b31b0acc53f36df916864fb541d9f536b3f8"))
+}
+
+#[test]
+#[ignore = "requires the published Kimi K3.1 MC checkpoint headers"]
+fn installed_k31_mc_spark_role_classifies_every_core_view() -> Result<()> {
+    use crate::plan::{checkpoint::{CheckpointView, CoreView}, files::{self, ReadRole}};
+    let snapshot = installed_k31_mc_snapshot()?;
+    let role = ReadRole::Spark { rank: 0, world: 6 };
+    let mut original = None;
+    for mode in [CoreView::Original, CoreView::K6Compact, CoreView::K8Compact, CoreView::Fp8Compact] {
+        let view = CheckpointView::select(&snapshot, mode)?;
+        let inventory = Checkpoint::inventory_view(&view)?;
+        let names = files::required_tensors(&inventory, role).with_context(|| format!("{mode} Spark metadata classifier"))?;
+        assert!(!names.is_empty());
+        assert!(names.iter().all(|name| name.contains(".block_sparse_moe.experts.")));
+        if let Some(original) = &original { assert!(original == &names, "{mode} changed Spark payloads"); }
+        else { original = Some(names); }
+        let worker = files::open_role_view(&view, role).with_context(|| format!("{mode} Spark role headers"))?;
+        assert!(worker.tensors.iter().all(|tensor| tensor.meta.name.contains(".block_sparse_moe.experts.")));
+        assert_eq!(crate::plan::experts::checkpoint_spark_recipe(&worker, 6, &[1])?,
+            crate::plan::experts::spark_recipe(super::PACKAGE, 3072, 6)?);
+    }
+    Ok(())
+}
+
 #[test]
 #[ignore = "requires the published Kimi K3.1 MC and candidate FP8 placement inputs"]
 fn installed_k31_fp8_compact_exports_cover_tp1_and_tp2() -> Result<()> {
@@ -943,10 +973,7 @@ fn installed_k31_fp8_compact_exports_cover_tp1_and_tp2() -> Result<()> {
     use crate::placement::inventory::ProgramsManifest;
     use crate::families::kimi_k3::weight_layout::{coordinator_arena, GlobalLayout, LayerLayout};
     use crate::placement::{FfnMode, LayerMode};
-    let hf = std::path::PathBuf::from(std::env::var_os("CUTEAFD_DEPLOYMENT_TEST_HF_HOME")
-        .context("Kimi FP8 check requires CUTEAFD_DEPLOYMENT_TEST_HF_HOME")?);
-    let snapshot = crate::model_cache_dir(&hf, "wrldsuksgo2mars/Kimi-K3.1-Pro-EXL3-K2-MC")
-        .join("snapshots/1455b31b0acc53f36df916864fb541d9f536b3f8");
+    let snapshot = installed_k31_mc_snapshot()?;
     let path = std::env::var_os("CUTEAFD_DEPLOYMENT_TEST_PROGRAMS")
         .context("Kimi FP8 check requires CUTEAFD_DEPLOYMENT_TEST_PROGRAMS")?;
     let package: Value = serde_json::from_slice(&std::fs::read(path)?)?;
