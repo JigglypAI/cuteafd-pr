@@ -15,7 +15,26 @@ pub(crate) fn configure(no_prewarm: bool, donor_always: bool, donor_cold_lag: u6
     assert!(OPTIONS.set(options).is_ok(), "graph policy configured twice");
     Ok(())
 }
-pub(crate) fn prewarm_enabled() -> bool { !OPTIONS.get().copied().unwrap_or_default().no_prewarm }
+pub(crate) fn prewarm_enabled() -> bool {
+    #[cfg(test)]
+    if let Some(enabled) = testing::PREWARM.with(std::cell::Cell::get) { return enabled; }
+    !OPTIONS.get().copied().unwrap_or_default().no_prewarm
+}
+
+#[cfg(test)]
+pub(crate) mod testing {
+    use std::cell::Cell;
+    thread_local! { pub(super) static PREWARM: Cell<Option<bool>> = const { Cell::new(None) }; }
+    /// Restores this thread's previous prewarm policy on drop.
+    pub(crate) struct PrewarmOverride(Option<bool>);
+    impl Drop for PrewarmOverride {
+        fn drop(&mut self) { PREWARM.with(|prewarm| prewarm.set(self.0)); }
+    }
+    /// `GRAPH_PREWARM=off` for this test thread only; the process policy is global.
+    pub(crate) fn prewarm_off_on_this_thread() -> PrewarmOverride {
+        PrewarmOverride(PREWARM.with(|prewarm| prewarm.replace(Some(false))))
+    }
+}
 fn donor_always() -> bool { OPTIONS.get().copied().unwrap_or_default().donor_always }
 fn donor_cold_lag() -> u64 { OPTIONS.get().copied().unwrap_or_default().donor_cold_lag }
 
@@ -62,6 +81,7 @@ mod bank;
 pub(crate) mod device;
 pub(crate) mod census;
 mod owner;
+pub(crate) mod sites;
 mod native;
 mod binding;
 pub(crate) use binding::BindingGraphs;

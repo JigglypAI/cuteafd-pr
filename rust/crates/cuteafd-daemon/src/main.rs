@@ -437,14 +437,8 @@ async fn run() -> Result<()> {
         command => (command, matches, initial_budget, initial_vision, initial_audio, initial_image_cap, initial_fetch,
             initial_wait, initial_reply, initial_weight_budget, initial_graph_floor.clone(), initial_graph_policy),
     };
+    // Spanning graph sites always prewarm, so `off` is safe on every layout (#2303).
     let no_prewarm = initial_graph_policy.0 || family_graph_policy.0;
-    let prewarm_supported = match &command {
-        Commands::ServeNative(args) => args.rtx_gpus == 1,
-        Commands::ServeGlmf(args) => args.engine.split_device.is_none(),
-        _ => false,
-    };
-    anyhow::ensure!(!no_prewarm || prewarm_supported,
-        "--graph-no-prewarm requires single-GPU V4.1 or GLM Flash; cross-device runtime instantiation can deadlock behind peer waits (#1878)");
     shared::decode_graph::configure(no_prewarm, initial_graph_policy.1 || family_graph_policy.1,
         initial_graph_policy.2.max(family_graph_policy.2))?;
     if let Some((role, directory)) = shared::memory_report::dump_location(&matches) {

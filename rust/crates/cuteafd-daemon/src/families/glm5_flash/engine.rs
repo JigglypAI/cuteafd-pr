@@ -1817,11 +1817,12 @@ impl<'a> GlmfEngine<'a> {
     pub fn warm_decode_graphs(&self, sequences: usize, speculation: bool) -> Result<bool> {
         if !self.use_graphs { return Ok(false); }
         check_decode_thresholds(&self.buckets, sequences, speculation)?;
-        if !crate::shared::decode_graph::prewarm_enabled() {
-            // Startup is skipped, not graphing: permit first-use runtime tickets.
+        // `GRAPH_PREWARM=off` skips an all-local layout: permit first-use runtime
+        // tickets. A spanning layout always prewarms (#2303).
+        let Some(_startup) = crate::shared::decode_graph::sites::startup(self.graph_spans()) else {
             self.graphs_warmed.set(true);
             return Ok(false);
-        }
+        };
         tracing::info!(plain_rows = ?self.buckets.plain, spec_rows = ?self.buckets.spec, decode_rows = self.decode_rows,
             verify_rows = self.verify_rows, "GLM Flash decode buckets pass the projection thresholds");
         let layout = self.graph_layout();
@@ -1879,12 +1880,16 @@ impl<'a> GlmfEngine<'a> {
             self.graphs_of(rank).borrow_mut().attach_device(self.library, device, charged[rank], Site {
                 name: "glm5_flash.decode", cycle: Cycle::Decode, preference: Preference::Adaptive,
                 bootstrap: bootstraps[rank], basis,
-                spans_devices: self.ranks() > 1 || self.peer.is_some(),
+                spans_devices: self.graph_spans(),
             })?;
             let policy = cuteafd_loader::placement::graph_reserve::current(rank, false, bases[rank], tail)?;
             crate::shared::decode_graph::device::set_reserve_policy(device, policy)?;
         }
         Ok(())
+    }
+
+    fn graph_spans(&self) -> bool {
+        super::graph_sites::spans("glm5_flash.decode", self.ranks() > 1 || self.peer.is_some())
     }
 
     /// #1612 calibrated no GLM Flash route, so every device estimates in bytes: the site's

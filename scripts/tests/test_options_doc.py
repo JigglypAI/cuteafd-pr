@@ -396,7 +396,7 @@ def test_optional_levers_are_default_off_and_documented():
             assert key in DEFAULTS, f"lever {key} has no documented default"
             default = DEFAULTS[key]
             if key == "GRAPH_PREWARM":
-                assert lever["families"] == ["V4.1", "GLM Flash"]
+                assert lever["families"] == COLUMNS
                 assert default == "on"
                 assert "`GRAPH_PREWARM=off`" in DOC.read_text()
                 assert 'case "$(get GRAPH_PREWARM on)"' in (ROOT / "scripts/launch/run-family.sh").read_text()

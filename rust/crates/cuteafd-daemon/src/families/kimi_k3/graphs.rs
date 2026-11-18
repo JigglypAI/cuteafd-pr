@@ -293,7 +293,7 @@ impl<'a> Graphs<'a> {
     fn site(&self, name: &'static str, ranks: usize, rank: usize) -> Result<Site> {
         Ok(Site { name, cycle: Cycle::Other, preference: Preference::Adaptive,
             bootstrap: kimi_bootstrap(ranks, rank), basis: Basis::Bytes,
-            spans_devices: super::graph_spanning::spans(name, self.spans_devices)? })
+            spans_devices: super::graph_spanning::spans(name, self.spans_devices) })
     }
 
     #[cfg(test)]
@@ -326,9 +326,9 @@ impl<'a> Graphs<'a> {
     /// Control surface for the engine's completed-step measurement and eviction.
     pub(crate) fn visit(&mut self, visit: &mut crate::shared::decode_graph::device::GraphVisitor<'_>) -> Result<()> {
         visit(self.device, "kimi_k3.step",
-            super::graph_spanning::spans("kimi_k3.step", self.spans_devices)?, &mut self.bank)?;
+            super::graph_spanning::spans("kimi_k3.step", self.spans_devices), &mut self.bank)?;
         visit(self.device, "kimi_k3.context",
-            super::graph_spanning::spans("kimi_k3.context", self.spans_devices)?, &mut self.context_bank)
+            super::graph_spanning::spans("kimi_k3.context", self.spans_devices), &mut self.context_bank)
     }
 
     fn bank(&self, op: Op) -> &GraphBank<Key, GraphOwner<'a, ()>> {
@@ -436,7 +436,7 @@ impl<'a> Graphs<'a> {
                     stream.raw as usize, key.rank as i32, Some(key.lane), &key, owner.raw);
                 let spanning = spans || super::graph_spanning::spans(
                     if matches!(key.op, Op::Context { .. }) { "kimi_k3.context" } else { "kimi_k3.step" },
-                    self.spans_devices)?;
+                    self.spans_devices);
                 self.bank_mut(key.op).cache_commit(key, owner, ticket, nodes as u64, width, spanning);
                 self.captured += 1;
                 Ok(true)

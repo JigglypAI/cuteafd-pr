@@ -740,7 +740,9 @@ fn worker(
     unsafe { // SAFETY: V4.1 graph owners borrow persistent engine storage only.
         crate::shared::decode_graph::device::observe_completed(&lib, &mut visit) }?;
     drop(visit);
-    if crate::shared::decode_graph::prewarm_enabled() {
+    // One rank has no spanning site: `GRAPH_PREWARM=off` captures on first use.
+    if let Some(_startup) = crate::shared::decode_graph::sites::startup(
+        super::graph_policy::spanning_layout(1)) {
     let local = std::array::from_fn(|layer| transport.has_local_layer(layer));
     for (site, result) in [("target pass 0", pass.capture_startup(requests.cache(), &local)),
         ("target pass 1", second.capture_startup(requests.cache(), &local))] {

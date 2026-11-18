@@ -261,7 +261,7 @@ pub(crate) fn whole<'a>(library: &'a Arc<NativeLibrary>, programs: &'a Programs<
         let requests = super::owners::RequestOwners::rank(peer_stream.clone(), &inputs, &admitted, 1)?;
         let exchange = PeerExchange::new_abortable(library, ranks, 1,
             usize::try_from(inputs.prefill.rows.max(64))? * cfg.hidden * 4, 64 * cfg.hidden * 4)?;
-        execution.peer = Some(super::engine::Peer { graphs: super::engine::DecodeGraphs::new(&requests, inputs.graph_reserve[1])?, exchange, requests,
+        execution.peer = Some(super::engine::Peer { graphs: super::engine::DecodeGraphs::new(&requests, 1, inputs.graph_reserve[1])?, exchange, requests,
             target: targets.next().context("Inkling peer target absent")?, kernels: kernels.next().context("Inkling peer kernels absent")? });
     }
     ensure!(targets.next().is_none() && kernels.next().is_none(), "Inkling rank inventory not fully bound");

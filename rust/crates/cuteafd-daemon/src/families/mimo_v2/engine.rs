@@ -2292,7 +2292,8 @@ impl<'a> MimoEngine<'a> {
             let device = self.on(rank, || self.library.cuda_get_device())?;
             graphs.borrow_mut().attach_device(self.library, device, reserves[rank], Site {
                 name: "mimo_v2.segment", cycle: Cycle::Decode, preference: Preference::Adaptive,
-                bootstrap: bootstraps[rank], basis: Basis::Bytes, spans_devices: self.ranks() > 1,
+                bootstrap: bootstraps[rank], basis: Basis::Bytes,
+                spans_devices: super::graph_sites::spans("mimo_v2.segment", self.ranks() > 1),
             })?;
             crate::shared::decode_graph::device::set_reserve_policy(device, policies[rank])?;
         }
@@ -2431,6 +2432,13 @@ impl<'a> MimoEngine<'a> {
         ensure!(!self.graphs_warmed.get() && self.graphs.borrow().len() == 0
             && self.peer.as_ref().is_none_or(|peer| peer.graphs.borrow().len() == 0),
             "MiMo startup graph inventory already captured");
+        // `GRAPH_PREWARM=off` skips an all-local layout; segments capture on first
+        // use. A spanning layout always prewarms (#2303).
+        let Some(_startup) = crate::shared::decode_graph::sites::startup(
+            super::graph_sites::spans("mimo_v2.segment", self.ranks() > 1)) else {
+            self.graphs_warmed.set(true);
+            return Ok(0);
+        };
         let layout = self.graph_layout.as_ref().context("MiMo decode graph layout was not admitted")?.clone();
         if layout.reserves.iter().all(|&bytes| bytes == 0) {
             tracing::info!("MiMo graph reserves are zero; decode segments run eagerly");

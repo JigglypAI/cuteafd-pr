@@ -1584,6 +1584,13 @@ impl<'a> GlmEngine<'a> {
         ensure!(!self.graphs_warmed.get() && self.graphs.borrow().len() == 0
             && self.peer.as_ref().is_none_or(|peer| peer.graphs.borrow().len() == 0),
             "GLM startup graph inventory already captured");
+        // `GRAPH_PREWARM=off` skips an all-local layout; segments capture on first
+        // use. A spanning layout always prewarms (#2303).
+        let Some(_startup) = crate::shared::decode_graph::sites::startup(
+            super::graph_sites::spans("glm5.segment", self.ranks() > 1)) else {
+            self.graphs_warmed.set(true);
+            return Ok(Vec::new());
+        };
         let all_shapes = glm_prewarm_shapes(self.prewarm_family(), self.ranks(), self.max_context, self.pages);
         let (base, tail) = cuteafd_loader::placement::graph_reserve::glm_default(self.prewarm_family(), self.ranks());
         let policies = (0..self.ranks()).map(|rank|
@@ -1673,7 +1680,7 @@ impl<'a> GlmEngine<'a> {
                 name: "glm5.segment", cycle: Cycle::Decode, preference: Preference::Adaptive,
                 bootstrap: bootstraps[rank],
                 basis: self.graph_basis(),
-                spans_devices: self.ranks() > 1,
+                spans_devices: super::graph_sites::spans("glm5.segment", self.ranks() > 1),
             })?;
             let (base, tail) = cuteafd_loader::placement::graph_reserve::glm_default(self.prewarm_family(), self.ranks());
             let policy = cuteafd_loader::placement::graph_reserve::current(rank, false, base, tail)?;

@@ -45,7 +45,8 @@ impl<'a> Graphs<'a> {
         let mut bank = GraphBank::new();
         bank.attach_device(device.library, device.id, reserve.bytes, Site {
             name: "qwen3_5.segment", cycle: Cycle::Other, preference: Preference::Adaptive,
-            bootstrap: qwen35_graphs::BOOTSTRAP_BYTES, basis: Basis::Bytes, spans_devices: false,
+            bootstrap: qwen35_graphs::BOOTSTRAP_BYTES, basis: Basis::Bytes,
+            spans_devices: super::super::graph_sites::spans("qwen3_5.segment", false),
         })?;
         device::set_reserve_policy(device.id, reserve)?;
         tracing::warn!(%variant, reserve = reserve.bytes,
@@ -257,6 +258,14 @@ impl DenseEngine<'_> {
 
     pub(crate) fn warm_decode_graphs(&mut self) -> Result<()> {
         if !self.graphs.enabled { return Ok(()); }
+        // Every dense Qwen site is rank-local: `GRAPH_PREWARM=off` opens lazy
+        // capture without a startup pass (#2303).
+        let Some(_startup) = crate::shared::decode_graph::sites::startup(
+            super::super::graph_sites::spans("qwen3_5.segment", false)) else {
+            self.graphs.capture_ready.set(true);
+            if let Some(peer) = &self.peer { peer.graphs.capture_ready.set(true); }
+            return Ok(());
+        };
         let entries = qwen35_graphs::layout(&self.graphs.variant).map_or_else(Vec::new, |layout| layout.entries.clone());
         self.graphs.warming.set(true);
         if let Some(peer) = &self.peer { peer.graphs.warming.set(true); }

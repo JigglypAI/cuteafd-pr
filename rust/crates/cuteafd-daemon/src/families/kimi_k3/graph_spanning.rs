@@ -10,34 +10,35 @@
 //! context_pair_with queues both context protocols before producer joins
 //! (layers.rs:326,1008); their peer flag waits must never be lazily captured.
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum Scope { ContextLayout, Spanning }
+use crate::shared::decode_graph::sites::{Scope, Table};
 
-// (visitor site, intrinsic scope, capture/dependency evidence).
-pub(super) const SITES: &[(&str, Scope, &str)] = &[
-    ("kimi_k3.step", Scope::ContextLayout, "device.rs:1140-1185 local residual/attention; :2006-2021 local FFN; layers.rs:931,1049,1105 issue local steps before publication"),
+// (visitor site, intrinsic scope, capture/dependency evidence). The declared
+// dependency is the context layout.
+pub(super) const SITES: &Table = &[
+    ("kimi_k3.step", Scope::Declared, "device.rs:1140-1185 local residual/attention; :2006-2021 local FFN; layers.rs:931,1049,1105 issue local steps before publication"),
     ("kimi_k3.context", Scope::Spanning, "device.rs:1409-1445 context_step captures peer flags via shared/peer_split/attention.rs context_decode; both rank protocols required"),
 ];
 
-pub(super) fn spans(name: &str, context: bool) -> anyhow::Result<bool> {
-    let (_, scope, _) = SITES.iter().find(|(site, _, _)| *site == name)
-        .ok_or_else(|| anyhow::anyhow!("unclassified Kimi graph site {name}"))?;
-    Ok(context || *scope == Scope::Spanning)
+/// An unclassified site is spanning: it stays prewarmed and sealed (#2303).
+pub(super) fn spans(name: &str, context: bool) -> bool {
+    crate::shared::decode_graph::sites::spans(SITES, name, context)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    #[test]
+    fn every_kimi_site_is_classified_and_context_stays_sealed() {
+        crate::shared::decode_graph::sites::testing::assert_classified("kimi_k3", super::SITES);
+        assert!(super::spans("kimi_k3.step", true) && !super::spans("kimi_k3.step", false));
+        assert!(super::spans("kimi_k3.context", false));
+        assert!(super::spans("new-unreviewed-site", false));
+    }
 
     #[test]
-    fn every_classification_keeps_context_sealed() {
-        let mut names = std::collections::HashSet::new();
-        for &(name, scope, evidence) in SITES {
-            assert!(names.insert(name), "duplicate site {name}");
-            assert!(evidence.contains(".rs:"), "missing source evidence {name}");
-            assert_eq!(spans(name, false).unwrap(), scope == Scope::Spanning);
-            assert!(spans(name, true).unwrap());
-        }
-        assert!(spans("new-unreviewed-site", false).is_err());
+    fn graph_prewarm_off_warms_spanning_and_defers_local() {
+        let off = |name, declared| crate::shared::decode_graph::sites::testing::assert_off_transitions(super::SITES, name, declared);
+        assert!(!off("kimi_k3.step", false), "Kimi heads/1-GPU step banks capture lazily");
+        assert!(off("kimi_k3.step", true), "Kimi context layout seals its step banks");
+        assert!(off("kimi_k3.context", false), "Kimi context banks always prewarm");
     }
 }

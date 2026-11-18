@@ -1222,7 +1222,7 @@ impl<'a> Qwen4Engine<'a> {
                 name: "qwen4.segment", cycle: Cycle::Decode, preference: Preference::Adaptive,
                 bootstrap: cuteafd_loader::serving_capacity::qwen_graphs::QWEN_GRAPH_BYTES_PER_GRAPH,
                 basis: Basis::Bytes,
-                spans_devices: super::graph_spanning::spans("qwen4.segment")?,
+                spans_devices: super::graph_spanning::spans("qwen4.segment"),
             })?;
             crate::shared::decode_graph::device::set_reserve_policy(self.gdn_banks[owner].device.id, resolved)?;
             tracing::info!(rank = owner, reserve = resolved.bytes, source = resolved.source,
@@ -1245,7 +1245,7 @@ impl<'a> Qwen4Engine<'a> {
         let mut graphs = self.graphs.borrow_mut();
         for (owner, bank) in graphs.iter_mut().enumerate() {
             visit(self.gdn_banks[owner].device.id, "qwen4.segment",
-                super::graph_spanning::spans("qwen4.segment")?, bank)?;
+                super::graph_spanning::spans("qwen4.segment"), bank)?;
         }
         Ok(())
     }
@@ -1458,6 +1458,13 @@ impl<'a> Qwen4Engine<'a> {
         ensure!(!self.graph_warmed.get(), "Qwen prewarm already captured");
         if !self.use_graphs { return Ok(0); }
         ensure!(self.graph_capture.get(), "Qwen graphs must be configured before the prewarm");
+        // `GRAPH_PREWARM=off` skips an all-local layout; segments capture on first
+        // use. A spanning layout always prewarms (#2303).
+        let Some(_startup) = crate::shared::decode_graph::sites::startup(
+            super::graph_spanning::spans("qwen4.segment")) else {
+            self.graph_warmed.set(true);
+            return Ok(0);
+        };
         cuteafd_core::concurrency::validate("qwen4", sequences as u64)?;
         check_bucket_thresholds(PLAIN_BUCKETS, DECODE_PROJECTION_THRESHOLDS)?;
         check_bucket_thresholds(SPEC_BUCKETS, DECODE_PROJECTION_THRESHOLDS)?;
