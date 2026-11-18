@@ -56,3 +56,27 @@ def test_fp8_read_roundtrips_rows_without_upcasting_the_table(tmp_path):
     assert torch.equal(model.fp8_roundtrip(chosen[:1]), model.fp8_roundtrip(chosen)[:1])
     with pytest.raises(ValueError, match="shape"):
         ckpt.check({name: ([4, 6], "BF16")})
+
+
+def test_fp8_codes_and_scale_match_full_roundtrip_at_bf16_boundaries():
+    # Choose BF16 values on both sides of every positive E4M3FN midpoint,
+    # spanning both sides of the row scale floor and the BF16 exponent range.
+    fp8 = torch.float8_e4m3fn
+    levels = torch.arange(127, dtype=torch.uint8).view(fp8).float()
+    midpoints = (levels[:-1] + levels[1:]) / 2
+    exponents = torch.arange(-133, 128, dtype=torch.float32)
+    peaks = (torch.exp2(exponents[:, None]) * torch.tensor([1., 1.0078125, 1.5, 1.9921875])).bfloat16().float().flatten()
+    scale = peaks[:, None].clamp_min(1e-12) / 448.
+    boundary = (scale * midpoints).bfloat16().view(torch.int16).int()
+    around = (boundary[..., None] + torch.arange(-2, 3)).clamp(0, 0x7f7f)
+    values = around.to(torch.int16).view(torch.bfloat16).float().flatten(1)
+    values = torch.minimum(values, peaks[:, None])
+    values = torch.cat((values, -values), dim=1)
+    values = torch.nn.functional.pad(values, (0, -values.shape[1] % 95))
+    rows = torch.cat((peaks[:, None, None].expand(-1, values.shape[1] // 95, -1),
+                      values.reshape(len(peaks), -1, 95)), dim=-1).reshape(-1, 96)
+    scale = rows.abs().amax(-1, keepdim=True).clamp_min(1e-12) / 448.
+    codes = (rows / scale).clamp(-448., 448.).to(fp8).view(torch.uint8)
+    codes = torch.where(codes == 0x80, 0, codes)
+    decoded = codes.view(fp8).float() * scale
+    assert torch.equal(decoded.view(torch.int32), model.fp8_roundtrip(rows).view(torch.int32))
