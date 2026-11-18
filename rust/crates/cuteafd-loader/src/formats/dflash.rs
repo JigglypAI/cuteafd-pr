@@ -990,7 +990,9 @@ impl MlaDflashConfig {
         }).collect::<Result<Vec<_>>>()?;
         let rotary = raw.rope_parameters.plan(mla.rope)?;
         Ok(Self { hidden_stream, mla, intermediate: raw.intermediate_size, eps: raw.rms_norm_eps,
-            block: d.block_size, group: d.conv_group_size, selector_rank: d.selector_rank,
+            // block_size validates the trained checkpoint, not the causal sampling horizon.
+            block: if causal { cuteafd_core::coordinator_programs::MlaDraftKind::CAUSAL_VERIFY_ROWS }
+                else { d.block_size }, group: d.conv_group_size, selector_rank: d.selector_rank,
             selector_top_k: d.selector_top_k, taps: d.target_layer_ids, vocab: raw.vocab_size,
             mask_token: d.mask_token_id, max_context: raw.max_position_embeddings, windows, rotary,
             kind: if causal { cuteafd_core::coordinator_programs::MlaDraftKind::CausalDflash2 }
@@ -1190,7 +1192,9 @@ impl MlaDflashConfig {
         if capacity != GlmDraftCapacity::new(capacity.context_slots, capacity.max_batch_sequences, self.block)
             .map_err(|_| invalid())? || capacity.max_batch_sequences > 32
             || !(1..=4096).contains(&sm_count) || fp8_mode > 2
-            || self.block != if self.kind == cuteafd_core::coordinator_programs::MlaDraftKind::CausalDflash2 { 5 } else { 8 }
+            || self.block != if self.kind == cuteafd_core::coordinator_programs::MlaDraftKind::CausalDflash2 {
+                cuteafd_core::coordinator_programs::MlaDraftKind::CAUSAL_VERIFY_ROWS
+            } else { 8 }
             || self.group != 16 || self.selector_rank != 256 || self.selector_top_k != self.kind.selector_top_k()
             || self.mla != (MlaGeometry { hidden: 7168, heads: self.kind.heads(), q_rank: 1536,
                 kv_rank: 512, nope: 128, rope: 64, value: 128 })
@@ -1722,7 +1726,10 @@ mod tests {
         let raw = causal_config();
         let cfg = MlaDflashConfig::from_json(&raw)?;
         assert_eq!(cfg.kind, cuteafd_core::coordinator_programs::MlaDraftKind::CausalDflash2);
-        assert_eq!((cfg.mla.heads, cfg.block, cfg.drafts(), cfg.selector_top_k), (96,5,4,32));
+        assert_eq!(raw["dflash_config"]["block_size"], 5);
+        assert_eq!((cfg.mla.heads, cfg.block, cfg.drafts(), cfg.selector_top_k), (96,8,7,32));
+        let mut wrong_block = raw.clone(); wrong_block["dflash_config"]["block_size"] = 8.into();
+        assert!(MlaDflashConfig::from_json(&wrong_block).is_err());
         assert_eq!(cfg.taps, [7,23,51,67,83,91]);
         assert_eq!(cfg.windows, vec![Some(1024);5]);
         let shapes: std::collections::BTreeMap<_,_> = cfg.tensor_shapes().into_iter().collect();
@@ -1744,6 +1751,34 @@ mod tests {
         }
         let mut wrong = raw.clone(); wrong["dflash_config"]["aux_hidden_stream"] = "terminal".into();
         assert!(MlaDflashConfig::from_json(&wrong).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn causal_width_eight_admits_seven_drafts_per_sequence_exactly() -> anyhow::Result<()> {
+        use crate::families::glm5::draft_representation::{GlmDraftCapacity, GlmDraftRepresentation};
+        let cfg = MlaDflashConfig::from_json(&causal_config())?;
+        for sequences in [1, 8] {
+            let capacity = GlmDraftCapacity::new(16, sequences, cfg.block)?;
+            assert_eq!(capacity.block_rows, sequences * 8);
+            assert!(capacity.block_rows <= cuteafd_core::coordinator_programs::MlaDraftProgramLayout::ROWS);
+            let layout = cfg.serving_runtime_layout(GlmDraftRepresentation::Fp8Only,
+                capacity, 8192, 16 * 8192, 188, 0, MlaCacheFormat::Fp8)?;
+            let bytes = |name: &str| layout.buffers().iter().find(|b| b.name == name).unwrap().bytes;
+            assert_eq!(bytes("logits"), sequences * 8 * cfg.vocab * 4);
+            assert_eq!(bytes("unary"), sequences * 7 * 32 * 4);
+            assert_eq!(bytes("candidates"), sequences * 7 * 32 * 4);
+            assert_eq!(bytes("topk_workspace"), sequences * 7 * 64 * 32 * 8);
+            assert_eq!(layout.selector_workspace_bytes()?, bytes("topk_workspace"));
+            let (demand, peak) = layout.demands(1)?;
+            let resident: u64 = demand.owned.iter().map(|d| d.bytes).sum();
+            assert_eq!(resident, layout.resident_bytes()?);
+            assert_eq!(peak.bytes, resident + layout.weights().max_load_staging);
+            let old_capacity = GlmDraftCapacity::new(16, sequences, 5)?;
+            assert!(cfg.serving_runtime_layout(GlmDraftRepresentation::Fp8Only,
+                old_capacity, 8192, 16 * 8192, 188, 0, MlaCacheFormat::Fp8).is_err());
+        }
+        assert_eq!(MlaDflashConfig::from_json(&config())?.block, 8);
         Ok(())
     }
 

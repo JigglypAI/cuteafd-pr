@@ -846,6 +846,11 @@ BF16 after scratch, independently of draft KV. Closed-batch C16 has a substantia
 uneven-completion drain penalty; sustained C8/C16 measurements in #2261 select
 the throughput arm. Sampled acceptance is not directly comparable to Inferact's
 reported 4.16 because its draft sampling/rejection method differs (#2312). `TP2_DFLASH` does not select this GQA split.
+The optional causal `RadixArk/Kimi-K3.1-Dflash2-Preview` MLA drafter verifies
+8 tokens (current token plus 7 drafts). Its checkpoint `block_size=5` describes
+the trained block; causal path sampling extends it to width 8. Admission and
+startup graph inventories use the full verification width. Noncausal DFlash2
+block-8 drafters are unchanged.
 
 MiniMax and Kimi default to their bundled still-image towers (`VISION=auto`), placed
 Spark-first with RTX fallback by joint admission. `VISION=off` keeps text-only

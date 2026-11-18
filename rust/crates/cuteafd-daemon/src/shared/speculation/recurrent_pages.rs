@@ -6,6 +6,26 @@ use cuteafd_ffi::CuteafdDeviceBuffer as Buffer;
 use cuteafd_loader::formats::block_dspark::recurrent::ContextPolicy;
 
 impl Drafter<'_>{
+    pub fn page_bytes(&self)->usize {
+        let rank_bytes=|rank:&super::recurrent_forward::Rank<'_>| {
+            let cache=&rank.layout.cache;
+            cache.page_rows*cache.record_bytes*cache.full_layers
+        };
+        rank_bytes(&self.lead)+self.split.as_ref().map_or(0,|split|rank_bytes(&split.peer))
+    }
+    pub fn quarantine_pages(&self,slot:usize) {self.context.state.borrow_mut().quarantine(slot);}
+    pub fn reservation(&self,slot:usize)->Option<cuteafd_engine::reserve::DraftDemand> {
+        let state=self.context.state.borrow();
+        state.pool.reservation(state.binding(slot).ok()?,self.lead.config.transformer.block).ok()
+    }
+    pub fn reservable(&self)->usize {self.context.state.borrow().pool.reservable()}
+    pub fn lifetime_rows(&self)->usize {
+        self.context.state.borrow().pool.lifetime_rows(self.lead.config.transformer.block)
+    }
+    pub fn admission(&self,origin:usize)->cuteafd_engine::reserve::DraftDemand {
+        cuteafd_engine::reserve::DraftDemand {origin,
+            headroom:self.lead.config.transformer.block.div_ceil(cuteafd_engine::prefix::DRAFT_PAGE_ROWS)+1,held:0}
+    }
     fn copies(&self,copies:Vec<cuteafd_engine::prefix::TailCopy>)->Result<()> {
         for copy in copies {
             self.lead.full_tail_copy(copy)?;

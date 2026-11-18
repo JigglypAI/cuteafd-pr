@@ -161,16 +161,16 @@ def test_every_pooled_draft_family_overrides_live_binding_quarantine():
             continue
         pooled.add(source.relative_to(families).as_posix())
         assert "fn quarantine_draft_pages(&self" in text, source
-    assert pooled == {"glm5/prefix.rs", "kimi_k3/prefix.rs", "qwen3_5/prefix.rs"}
+    assert pooled == {"glm5/prefix.rs", "kimi_k3/prefix.rs", "qwen3_5/prefix.rs", "inkling2/cache.rs"}
     # Fixed draft rings/arrays are not DraftPagePool owners. A new owner must extend this audit.
     owners = set()
     daemon = root / "rust/crates/cuteafd-daemon/src"
     for source in daemon.rglob("*.rs"):
         text = source.read_text()
-        if re.search(r"(?m)^\s+pool: (?:cuteafd_engine::prefix::)?DraftPagePool,", text):
+        if re.search(r"(?m)^\s+(?:pub(?:\([^)]*\))?\s+)?pool:\s*(?:cuteafd_engine::prefix::)?DraftPagePool,", text):
             owners.add(source.relative_to(daemon).as_posix())
     assert owners == {"shared/speculation/dflash.rs", "shared/speculation/block_dspark.rs",
-                      "families/qwen3_5/mtp.rs"}
+                      "shared/speculation/recurrent_cache.rs", "families/qwen3_5/mtp.rs"}
     trait = (root / "rust/crates/cuteafd-engine/src/prefix/family.rs").read_text()
     default = trait.split("fn quarantine_draft_pages", 1)[1].split("\n    }", 1)[0]
     assert "debug_assert_eq!(self.draft_page_bytes(), 0" in default
