@@ -20,7 +20,9 @@ SEMANTICS = {
     "moe": "Expert down projects into latent space and expert up returns to hidden width (HF F.linear convention). "
            "Fused gate/up are contiguous halves. Only the routed expert gates/up channels are clipped.",
     "engram": "The README names zero-based decoder indices; config names one-based layer IDs. The BF16 table stays "
-              "BF16 on disk; HF applies per-vector E4M3 round-trip after lookup and before head RMS normalization. "
+              "BF16 on disk. HF casts the fetched row to the hidden-state dtype before per-vector E4M3 QDQ. "
+              "Stock BF16 inference therefore performs QDQ in BF16; the golden deliberately upcasts the rows "
+              "and performs QDQ in F32 before head RMS normalization. Those paths are not bitwise equivalent. "
               "The hash multipliers use engram_seed and the loaded map's max + 1, not the table's row count.",
     "serving_differences": "SGLang caches compressed indexer keys in FP8; HF pools and scores them in F32 here. "
                            "SGLang's Engram consumes stored BF16 rows or stored FP8 plus scales, without simulating "

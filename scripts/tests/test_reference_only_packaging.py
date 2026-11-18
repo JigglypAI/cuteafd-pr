@@ -429,6 +429,13 @@ def test_family_golden_roots_map_to_their_precision(family, fragment):
     assert fragment in packager.reference_precision(dict(root_arithmetic=root), dict())
 
 
+def test_hy4_readme_distinguishes_f32_engram_qdq_from_stock_bf16():
+    root = packager.hy4_root()
+    _, arithmetic, _ = packager.root_description({'root_arithmetic': root}, {'family': 'hy4_flash'})
+    assert 'Engram E4M3 quantize-dequantize in F32' in arithmetic
+    assert 'not the stock Transformers BF16 lookup arithmetic' in arithmetic
+
+
 def test_v41_root_arithmetic_maps_to_official_fp8_mxfp4():
     precision = packager.reference_precision(dict(root_arithmetic=dict(packager.V41_ROOT)), dict())
     assert precision.startswith('official FP8 block dense + MXFP4 experts')

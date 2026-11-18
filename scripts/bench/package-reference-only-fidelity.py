@@ -303,7 +303,11 @@ def root_description(meta, panel):
     if root is None:
         return ('BF16 root', 'Checkpoint-native BF16/F32 tensors and family activation arithmetic, bounded attention, '
                 'fixed GEMM rows 128, MTP/cache off.', 'Transformers source')
-    return (f'root ({reference_precision(meta, panel)})', root['arithmetic'], root['source'])
+    arithmetic = root['arithmetic']
+    if panel.get('family') == 'hy4_flash' and root == hy4_root():
+        arithmetic += (' The golden performs Engram E4M3 quantize-dequantize in F32, '
+                       'not the stock Transformers BF16 lookup arithmetic.')
+    return (f'root ({reference_precision(meta, panel)})', arithmetic, root['source'])
 
 
 def validate_runtime_platform(runtime):

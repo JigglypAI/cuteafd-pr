@@ -58,7 +58,8 @@ def test_fp8_read_roundtrips_rows_without_upcasting_the_table(tmp_path):
         ckpt.check({name: ([4, 6], "BF16")})
 
 
-def test_fp8_codes_and_scale_match_full_roundtrip_at_bf16_boundaries():
+def test_fp8_codes_and_scale_match_f32_roundtrip_at_bf16_input_boundaries():
+    # BF16 describes input storage only: this exercises the golden F32 QDQ, not stock BF16 QDQ.
     # Choose BF16 values on both sides of every positive E4M3FN midpoint,
     # spanning both sides of the row scale floor and the BF16 exponent range.
     fp8 = torch.float8_e4m3fn
