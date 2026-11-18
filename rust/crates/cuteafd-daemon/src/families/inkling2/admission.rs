@@ -106,11 +106,14 @@ pub(crate) fn reconcile_native(plan: &ResolvedPlan, devices: CoordinatorDevices<
     let mut projected = devices.remap_plan_weight_arenas(plan)?;
     projected.facts.allocations.retain(|a| a.view.is_none() && a.location == Location::coordinator(0)
         && a.lifetime.contains(Phase::PostTargetKv, PhaseOrder::TARGET_THEN_DRAFT));
-    // Page-table overhead maps pinned owners; the projected device-only
-    // witness excludes those host backings, so it must exclude their mappings
-    // too. The complete admission above still charges them exactly once.
-    projected.facts.driver_page_tables.retain(|table| projected.facts.allocations.iter()
-        .any(|owner| owner.id == table.backing && owner.view.is_none()));
+    // Project the overhead with its backing: pinned mappings and the
+    // load-only trellis request are still charged by the original plan.
+    let retained = |id: &str| projected.facts.allocations.iter().any(|owner| owner.id == id);
+    projected.facts.driver_page_tables.retain(|table| retained(&table.backing));
+    projected.facts.allocation_granularity.retain_mut(|owner| {
+        owner.backings.retain(|backing| retained(&backing.backing));
+        !owner.backings.is_empty()
+    });
     projected.facts.allowances.retain(|owner| owner.location == Location::coordinator(0));
     projected.facts.reservations.clear();
     projected.facts.sequential.clear();
@@ -209,6 +212,26 @@ mod tests {
             encoder: None, prefill: shape, lanes: 1, spark_reply_formats: None }, pool_tokens: 64, pool_page_rows: 64,
             phases: evaluate(&facts, &budgets).unwrap(), facts, budgets }
     }
+    #[test]
+    fn retained_reconciliation_omits_load_only_trellis_granularity() {
+        let mut plan = fixture();
+        let location = Location::coordinator(0);
+        let load_only = Lifetime { first: Phase::Load, last: Phase::Load };
+        let bytes = cuteafd_loader::shared::dense_read::STEP_BYTES as u64;
+        plan.facts.allocations.push(Allocation::buffer("target.load_trellis", location,
+            bytes, load_only, Category::Staging, "trellis repack"));
+        // Even a page-aligned request has a granularity record in the full plan.
+        plan.facts.allocation_granularity.push(AllocationGranularity {
+            id: "target.load_trellis.tail".into(), location, lifetime: load_only,
+            backings: vec![GranularityBacking { backing: "target.load_trellis".into(), requests: vec![bytes] }],
+            evidence: GranularityEvidence::Forecast,
+        });
+        plan.phases = evaluate(&plan.facts, &plan.budgets).unwrap();
+        let receipt = Receipt { allocation: plan.facts.allocations[0].clone(), address: 0x1000 };
+        let devices = CoordinatorDevices::new(&[0]).unwrap();
+        reconcile_native(&plan, devices, &[receipt]).unwrap();
+    }
+
     #[test]
     fn shared_reconcile_rejects_missing_extra_duplicate_and_wrong_extent() {
         let plan = fixture();
