@@ -22,6 +22,7 @@ fn lease_slot(slots: &[Option<Request>], lease: CacheLease) -> Result<usize> {
 struct Request {
     lease: CacheLease,
     history: EngramHistory,
+    approximate_prefix: bool,
     prefill: Option<EngramPrefillCursor>,
     images: RequestImages,
     /// The prompt's Engram rows being read ahead (`Requests::start_lookahead`):
@@ -269,9 +270,17 @@ impl<'a> Requests<'a> {
         );
         let history = self.pipeline.new_history()?;
         let lease = self.cache.begin_request(slot, id)?;
-        self.slots[slot] = Some(Request { lease, history, prefill: None, images: RequestImages::default(),
+        self.slots[slot] = Some(Request { lease, history, approximate_prefix: false, prefill: None, images: RequestImages::default(),
             lookahead: None });
         Ok(lease)
+    }
+    pub fn approximate_prefix(&self, lease: CacheLease) -> Result<bool> {
+        Ok(self.request(lease)?.approximate_prefix)
+    }
+    pub fn set_approximate_prefix(&mut self, lease: CacheLease, approximate: bool) -> Result<()> {
+        let slot = lease_slot(&self.slots, lease)?;
+        self.slots[slot].as_mut().expect("validated request slot").approximate_prefix = approximate;
+        Ok(())
     }
     pub fn attach_images(&mut self, lease: CacheLease, images: RequestImages) -> Result<()> {
         let request = self.request(lease)?;
@@ -492,16 +501,43 @@ impl<'a> Requests<'a> {
         self.units.detach(slot);
         let request = self.slots[slot].as_mut().expect("validated prefix request");
         request.history = self.pipeline.new_history()?;
+        request.approximate_prefix = false;
         request.prefill = None;
         request.lookahead = None;
         Ok(())
+    }
+    fn encoder_history_at(&self, lease: CacheLease, start: usize, prompt: &[u32]) -> Result<EngramHistory> {
+        ensure!(start <= prompt.len(), "encoder history position exceeds prompt");
+        let recent_start = start.saturating_sub(3);
+        let image_mask = self.request(lease)?.images.mask(recent_start as u64, start - recent_start)?
+            .map(|m| m.into_iter().map(u8::from).collect::<Vec<_>>());
+        self.pipeline.history_at(start as u64, &prompt[recent_start..start], image_mask.as_deref())
+    }
+    /// A partial hit: sources hold the snapshot's rows through the even-aligned `end`; encoder
+    /// windows restart empty at the planned image-safe `start` and Engram history is rebuilt there from the
+    /// prompt's native token ids. Returns the replay start.
+    pub fn restore_encoder_prefix(&mut self, lease: CacheLease, end: usize, start: usize, prompt: &[u32]) -> Result<usize> {
+        let request = self.request(lease)?;
+        ensure!(
+            request.history.position() == 0 && request.prefill.is_none() && start < end && end <= prompt.len(),
+            "invalid encoder history restore"
+        );
+        let history = self.encoder_history_at(lease, start, prompt)?;
+        self.cache.restore_encoder_prefix(lease, end as u64, start as u64, prompt.len() as u64)?;
+        self.slots
+            .iter_mut()
+            .flatten()
+            .find(|r| r.lease == lease)
+            .expect("validated restored request")
+            .history = history;
+        Ok(start)
     }
     pub fn validate(&self, batch: &RequestBatch) -> Result<()> {
         ensure!(!batch.finished, "request batch finished");
         self.cache.validate_batch(&batch.cache)?;
         for &lease in &batch.leases {
             ensure!(
-                self.request(lease)?.history.position() == self.cache.committed_end(lease)?,
+                self.request(lease)?.history.position() == self.cache.history_end(lease)?,
                 "engram and backbone history differ"
             );
         }
@@ -561,7 +597,7 @@ impl<'a> Requests<'a> {
             ensure!(request.prefill.is_none(), "reserved encoder requires reservation preparation");
             let history = &request.history;
             ensure!(
-                history.position() == self.cache.committed_end(r.lease)?,
+                history.position() == self.cache.history_end(r.lease)?,
                 "request histories differ"
             );
             ensure!(

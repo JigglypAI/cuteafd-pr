@@ -4141,8 +4141,9 @@ def test_warm_lossless_panel_config_reaches_matrix(entry, tmp_path, monkeypatch)
     assert e['panel_config'] == {'spec_lossless_set': {'warm': True}}
 
 
-@pytest.mark.parametrize('fail_fourth,short_hit', [(False, False), (True, False), (False, True)])
-def test_image_prefix_probe_receipts_and_http_failure(tmp_path, monkeypatch, fail_fourth, short_hit):
+@pytest.mark.parametrize('fail_fourth,short_hit,require_partial', [(False, False, False), (True, False, False),
+    (False, True, False), (False, False, True)])
+def test_image_prefix_probe_receipts_and_http_failure(tmp_path, monkeypatch, fail_fourth, short_hit, require_partial):
     import threading
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
     calls = []
@@ -4168,7 +4169,7 @@ def test_image_prefix_probe_receipts_and_http_failure(tmp_path, monkeypatch, fai
                 self.end_headers()
                 state = dict(end=3, sha256='capture', bytes=12)
                 self.wfile.write(json.dumps(dict(probe=dict(cold=cold, no_speculation=True,
-                    generated=[7, 8, 9], prompt_ids=[1, 2, 3], rows=[],
+                    generated=[6 if cold else 7, 8, 9], prompt_ids=[1, 2, 3], rows=[],
                     states=[dict(kind='prompt', **state)] + ([] if cold else [dict(kind='restore', **state)]),
                     cached_tokens=0 if cold else 3))).encode())
                 return
@@ -4197,12 +4198,16 @@ def test_image_prefix_probe_receipts_and_http_failure(tmp_path, monkeypatch, fai
                 cards.image_prefix_probe(url, tmp_path)
             assert 'HTTP 500' in json.loads((tmp_path / 'image-prefix-attempt-1/image-prefix-even-image-b.json').read_text())['error']
             assert len(calls) == 4
+        elif require_partial:
+            with pytest.raises(ValueError, match='request 4 did not partially hit'):
+                cards.image_prefix_probe(url, tmp_path, tmp_path / 'rows')
+            assert len(calls) == 4
         elif short_hit:
             with pytest.raises(ValueError, match='exact image ancestor did not hit'):
                 cards.image_prefix_probe(url, tmp_path)
         else:
             assert len(cards.image_prefix_probe(url, tmp_path)) == 15
-            assert len(list((tmp_path / 'image-prefix-attempt-1').glob('image-prefix-*.json'))) == 36
+            assert len(list((tmp_path / 'image-prefix-attempt-1').glob('image-prefix-*.json'))) == 42
             assert calls[0]['messages'][0]['content'][0] == calls[3]['messages'][0]['content'][0]
             assert len(calls[10]['messages'][0]['content'][0]['text']) > 100_000
             assert len(calls[4]['messages']) == 3
@@ -4212,7 +4217,79 @@ def test_image_prefix_probe_receipts_and_http_failure(tmp_path, monkeypatch, fai
         thread.join()
 
 
-@pytest.mark.parametrize('probe', ['image', 'image-prefix'])
+@pytest.mark.parametrize('failure', [None, 'miss', 'tokens', 'row', 'exact'])
+def test_partial_image_probe_scores_the_same_continuation_on_a_divergent_seed(tmp_path, monkeypatch, failure):
+    import math
+    import struct
+
+    calls = []
+    def http(url, path, body=None, timeout=120):
+        calls.append((path, body))
+        if path == '/v1/responses/input_tokens':
+            return {'exact_token_count': True, 'input_tokens': 8}
+        if path == '/v1/chat/completions':
+            return {'usage': {'prompt_cache_hit_tokens': 0, 'prefix_cache_source': 'miss'}}
+        spec = body['spec']
+        cold = spec['cold']
+        assert spec['score_reuse_prefix'] is not cold
+        root = Path(spec['dump_rows'])
+        root.mkdir()
+        positions = spec['score_positions']
+        h = json.dumps({'log_probs': {'dtype': 'F32', 'shape': [2], 'data_offsets': [0, 8]}}).encode()
+        raw = struct.pack('<Q', len(h)) + h
+        for i, _ in enumerate(positions):
+            if failure == 'row' and not cold and i == 0:
+                continue
+            probabilities = (0.75, 0.25) if cold or i else (0.25, 0.75)
+            (root / f'row-{i:08}.safetensors').write_bytes(raw + struct.pack('<ff', *map(math.log, probabilities)))
+        restore = None if cold else {'prefix_restore': {'partial': failure != 'exact', 'plan': {
+            'fidelity': 'ApproximateReplay', 'target_end': positions[0], 'lag': {'replay_start': 3, 'source_end': 6}}}}
+        return {'probe': dict(engine='deepseek_v41', provenance=restore,
+                              cold=cold, no_speculation=True, score_path='decode', error=None, generated=[],
+                              scored=len(positions), rows=[dict(position=i, finite=True) for i in positions],
+                              prompt_ids=[int(failure == 'tokens' and not cold)] * 40,
+                              cached_tokens=0 if cold or failure == 'miss' else 3)}
+    monkeypatch.setattr(cards, 'http', http)
+    args = ('fixture', tmp_path, tmp_path, 'even', 'test', 'quality namespace', 'data:image/png;base64,xx',
+            'divergent seed', 'diverged target')
+    if failure:
+        reason = {'miss': 'unexpected scoring cache hit', 'tokens': 'prompt IDs differ', 'row': 'dumps do not cover',
+                  'exact': 'scoring used an exact ancestor'}[failure]
+        with pytest.raises(ValueError, match=reason):
+            cards.image_partial_fidelity(*args)
+    else:
+        result = cards.image_partial_fidelity(*args)
+        assert result == {'variant': 'even', 'cached': 3, 'rows': 24,
+                          'mean_kl': pytest.approx(math.log(3) / 48), 'max_kl': pytest.approx(math.log(3) / 2),
+                          'top1_agreement': pytest.approx(23 / 24)}
+    assert [path for path, _ in calls] == ['/v1/responses/input_tokens', '/v1/bench/probe',
+                                          '/v1/chat/completions', '/v1/bench/probe']
+    seed = calls[2][1]['messages']
+    fixed = calls[1][1]['body']['messages']
+    assert calls[1][1]['body'] == calls[3][1]['body']
+    assert fixed[-1] == {'role': 'assistant', 'content': cards.IMAGE_CONTINUATION}
+    assert seed[0]['content'][:-1] == fixed[0]['content'][:-1]
+    assert seed[0]['content'][-1]['text'] == 'divergent seed'
+    assert fixed[0]['content'][-1]['text'] == 'diverged target'
+
+
+def test_arm_scoped_image_prefix_partial_mounts_row_dumps_only_on_candidate(entry, tmp_path, monkeypatch):
+    kit = tmp_path / 'kit'
+    kit.mkdir()
+    (kit / 'matrix-main.json').write_text(json.dumps(dict(entries=[entry])))
+    state = tmp_path / 'state'
+    monkeypatch.setattr(sys, 'argv', ['wip-cards', '--kit', str(kit), '--cards', 'v41-min',
+        '--interleave', '--arm', 'candidate=test:s', '--arm', 'base=base:s', '--probe', 'v41-min:image-prefix',
+        '--probe', 'candidate:v41-min:image-prefix-partial', '--state', str(state), '--dry-run'])
+    assert cards.main() == 0
+    jobs = {j['arm']: j for j in json.loads((state / 'plan.json').read_text())['jobs']}
+    candidate = jobs['candidate']
+    assert candidate['entry']['precheck']['required']
+    assert Path(candidate['entry']['set']['PROBE_DUMP_ROOT']).is_dir()
+    assert 'PROBE_DUMP_ROOT' not in jobs['base']['entry']['set']
+
+
+@pytest.mark.parametrize('probe', ['image', 'image-prefix', 'image-prefix-partial'])
 def test_matched_prompts_refuses_arm_scoped_image_probe(entry, tmp_path, monkeypatch, probe):
     kit = tmp_path / 'kit'
     kit.mkdir()
@@ -4224,31 +4301,8 @@ def test_matched_prompts_refuses_arm_scoped_image_probe(entry, tmp_path, monkeyp
         cards.main()
 
 
-def test_image_prefix_probe_rejects_cold_warm_token_drift(tmp_path, monkeypatch):
-    # Exercise the exactness comparison directly without depending on language answers.
-    def http(url, path, body=None, timeout=120):
-        if path == '/v1/models':
-            return {'data': [{'id': 'test'}]}
-        if path == '/v1/responses/input_tokens':
-            return dict(exact_token_count=True, input_tokens=1200)
-        if path == '/v1/bench/probe':
-            cold = body['spec'].get('cold', False)
-            return dict(probe=dict(cold=cold, no_speculation=True, generated=[1 if cold else 2],
-                                  prompt_ids=[1], cached_tokens=0 if cold else 1))
-        messages = body['messages']
-        question = messages[-1]['content']
-        if isinstance(question, list): question = question[-1]['text']
-        answer = '21' if 'entry 3' in question else '35' if 'entry 5' in question else 'Red and blue' if 'colours' in question else 'Yes'
-        return {'choices': [{'message': {'content': answer}}], 'usage': {
-            'prompt_tokens': 1200, 'prompt_cache_hit_tokens': 1200 if len(messages) == 3 else 0,
-            'prefix_cache_source': 'device' if len(messages) == 3 else 'miss'}}
-    monkeypatch.setattr(cards, 'http', http)
-    with pytest.raises(ValueError, match='cold/warm image output token IDs differ'):
-        cards.image_prefix_probe('fixture', tmp_path)
-
-
 def test_image_prefix_attempts_preserve_failed_verdict_and_receipts(tmp_path, monkeypatch):
-    def attempt(url, dest):
+    def attempt(url, dest, dump_root):
         cards.save(dest / 'response.json', {'cached_tokens': 7})
         raise ValueError('next-turn exactness injected')
     monkeypatch.setattr(cards, 'image_prefix_attempt', attempt)

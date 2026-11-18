@@ -23,7 +23,7 @@ use super::chain::{content_id, page_chain_media};
 use crate::media::{round_frontier, snapshot_media, verify_media, MediaError, MediaSpan};
 use super::entry::{victim, After, Entry, EntryId, Mark};
 use super::family::{BoxError, CaptureTicket, Eviction, FamilyLayout, MarkStore, PageOwners, PrefixFamily, RestoreCandidate,
-    RestoreContext, RestorePlan};
+    RestoreContext, RestoreFidelity, RestorePlan};
 use super::marks::MarkArena;
 use super::pages::{Need, PoolExhausted, RefPagePool};
 use cuteafd_core::prefix::{Retention, SnapshotKind};
@@ -103,8 +103,7 @@ pub struct Source {
     pub frontier: usize,
     /// Restored pages or positional state from the host tier by this admission.
     pub host: bool,
-    /// A partial match: the positional state restarts empty at `resume`, which lies the rule's
-    /// replay window before the aligned common prefix (approximate; exact frontiers are exact).
+    /// A divergent match, not a retained ancestor. Numerical fidelity is separate.
     pub partial: bool,
     /// The family's restore plan.
     pub plan: RestorePlan,
@@ -138,10 +137,12 @@ pub struct PrefixStats {
     /// Rejected radix matches whose full image identities differ.
     pub media_key_collisions: u64,
     pub hits: u64,
-    /// Hits that restored the whole prompt (first token from the snapshot's logits).
+    /// Hits that restored the whole prompt with exact fidelity.
     pub exact_hits: u64,
-    /// Hits on a partial match (replay window, approximate positional state).
+    /// Hits on a divergent match, including exactly reusable paged state.
     pub partial_hits: u64,
+    /// Restores explicitly labelled ApproximateReplay by the family plan.
+    pub approximate_replay_hits: u64,
     pub hit_tokens: u64,
     /// Host-tier restores: a lookup that re-inserted the entry from the host cache
     /// (`host_mark: Some(..)`). Not [`Self::mark_promotions`], which counts host mark
@@ -395,16 +396,23 @@ impl<E: CopyEngine, M: Clone + Default> PrefixCache<E, M> {
             let mut hit = if let Some(compatible) = compatible {
                 self.device_compatible_hit(tokens, media, sampled, compatible)
             } else { self.lookup_media(tokens, media, sampled) };
+            let rule = self.layout.rule;
             let host_deeper = compatible.is_some_and(|compatible| self.host_compatible_hit(tokens, media,
-                sampled, compatible).is_some_and(|(_, resume)| resume > hit.as_ref().map_or(0, |h| h.resume)));
-            if hit.is_none() || host_deeper {
+                sampled, compatible).is_some_and(|(host, resume)| rule.rank(host.common, host.frontier, resume)
+                    > hit.as_ref().map_or((false, 0), |h| rule.rank(h.common, h.frontier, h.resume))));
+            let host_ancestor = self.layout.rule.prefers_ancestors()
+                && hit.as_ref().is_some_and(|h| h.common < h.frontier)
+                && self.host_verified_hit(tokens, media, sampled, compatible)
+                    .is_some_and(|(h, _)| h.common == h.frontier);
+            if hit.is_none() || host_deeper || host_ancestor {
                 let restored = self.promote(family, tokens, media, sampled, compatible)?;
                 promoted = restored.is_some();
-                // Promotion can evict the previous device candidate before
-                // failing admission. Re-select rather than keeping a stale id.
-                hit = if let Some(compatible) = compatible {
+                // Promotion can evict the previous device candidate before failing.
+                // Do not fall back to approximate replay if an ancestor was available.
+                hit = if promoted || host_ancestor { restored }
+                else if let Some(compatible) = compatible {
                     self.device_compatible_hit(tokens, media, sampled, compatible)
-                } else { restored };
+                } else { None };
             }
             if let Some(hit) = hit {
                 if compatible.is_some() {
@@ -412,9 +420,14 @@ impl<E: CopyEngine, M: Clone + Default> PrefixCache<E, M> {
                     if let Some(entry) = self.entries.get_mut(&hit.id) { entry.last_use = self.clock; }
                 }
                 let context = RestoreContext { native_tokens: native, media };
-                match self.restore_hit(family, &hit, tokens, &context, total, capacity.max(tokens.len()), promoted, &mut build) {
+                let result = self.restore_hit(family, &hit, tokens, &context, total, capacity.max(tokens.len()), promoted, &mut build);
+                if promoted {
+                    let mark = self.entries.get_mut(&hit.id).and_then(|e| e.mark.take());
+                    self.give_back(family, mark)?;
+                }
+                match result {
                     Ok(Some(admitted)) => return Ok(admitted),
-                    Ok(None) => self.stats.fork_no_room += 1,
+                    Ok(None) => {},
                     Err(PrefixError::Family { what, source }) => {
                         tracing::warn!(target: "cuteafd::prefix", what, error = %source, "prefix restore abandoned; prefilling");
                         self.stats.restore_failures += 1;
@@ -502,40 +515,37 @@ impl<E: CopyEngine, M: Clone + Default> PrefixCache<E, M> {
 
     pub fn peek_media(&self, tokens: &[u32], media: &[MediaSpan], sampled: bool) -> usize {
         if !self.enabled() { return 0; }
+        let rule = self.layout.rule;
         let device = if media.is_empty() {
             let mut query = tokens;
             loop {
-                let Some((common, frontier, &id)) = self.retained.peek_reusable(query) else { break 0 };
-                let Some(entry) = self.entries.get(&id) else { break 0 };
+                let Some((common, frontier, &id)) = self.retained.peek_reusable(query) else { break (false, 0) };
+                let Some(entry) = self.entries.get(&id) else { break (false, 0) };
                 let resume = self.layout.rule.skipped(common, frontier);
-                if !verify_media(resume, &entry.media, media) { break 0; }
+                if !verify_media(resume, &entry.media, media) { break (false, 0); }
                 if resume == tokens.len() && !entry.after.serves(sampled) {
-                    if query.len() < tokens.len() || tokens.len() < 2 { break 0; }
+                    if query.len() < tokens.len() || tokens.len() < 2 { break (false, 0); }
                     query = &tokens[..tokens.len() - 1];
-                } else { break resume; }
+                } else { break rule.rank(common, frontier, resume); }
             }
         } else {
-            self.device_media_hit(tokens, media, sampled).0.map_or(0, |h| h.resume)
+            self.device_media_hit(tokens, media, sampled).0.map_or((false, 0), |h| rule.rank(h.common, h.frontier, h.resume))
         };
-        let host = self.host.as_ref().and_then(|host| {
-            if media.is_empty() {
-                let hit = host.peek(tokens)?;
-                let payload = host.payload(hit.key)?;
-                let resume = self.layout.rule.skipped(hit.common, hit.frontier);
-                (verify_media(resume, &payload.media, media)
-                    && (resume != tokens.len() || payload.after.serves(sampled))).then_some(resume)
-            } else { self.host_media_hit(tokens, media, sampled).0.map(|h| h.1) }
-        }).unwrap_or(0);
-        device.max(host)
+        let host = self.host_verified_hit(tokens, media, sampled, None)
+            .map_or((false, 0), |(h, resume)| rule.rank(h.common, h.frontier, resume));
+        device.max(host).1
     }
 
     /// A compatible ancestor may be shallower than an incompatible token match.
     pub fn peek_media_compatible(&self, tokens: &[u32], media: &[MediaSpan], sampled: bool,
         compatible: &dyn Fn(&M, usize) -> bool) -> usize {
         if !self.enabled() { return 0; }
-        let device = self.device_compatible_hit(tokens, media, sampled, compatible).map_or(0, |h| h.resume);
-        let host = self.host_compatible_hit(tokens, media, sampled, compatible).map_or(0, |h| h.1);
-        device.max(host)
+        let rule = self.layout.rule;
+        let device = self.device_compatible_hit(tokens, media, sampled, compatible)
+            .map_or((false, 0), |h| rule.rank(h.common, h.frontier, h.resume));
+        let host = self.host_compatible_hit(tokens, media, sampled, compatible)
+            .map_or((false, 0), |(h, resume)| rule.rank(h.common, h.frontier, resume));
+        device.max(host).1
     }
 
     fn device_compatible_hit(&self, tokens: &[u32], media: &[MediaSpan], sampled: bool,
@@ -544,7 +554,7 @@ impl<E: CopyEngine, M: Clone + Default> PrefixCache<E, M> {
             let (resume, common, _) = media_resume(self.layout.rule, tokens, media, &entry.tokens,
                 &entry.media, &entry.after, sampled);
             (resume > 0 && compatible(&entry.meta, entry.len())).then_some((
-                (resume, entry.kind == SnapshotKind::Turn, entry.last_use),
+                (self.layout.rule.rank(common, entry.len(), resume), entry.kind == SnapshotKind::Turn, entry.last_use),
                 Hit { id, kind: entry.kind, resume, common, frontier: entry.len() }))
         }).max_by_key(|(rank, _)| *rank).map(|(_, hit)| hit)
     }
@@ -555,7 +565,7 @@ impl<E: CopyEngine, M: Clone + Default> PrefixCache<E, M> {
             let (resume, common, _) = media_resume(self.layout.rule, tokens, media, &meta.tokens,
                 &payload.media, &payload.after, sampled);
             (resume > 0 && compatible(&payload.family, meta.tokens.len())).then_some((
-                (resume, meta.kind == SnapshotKind::Turn, key),
+                (self.layout.rule.rank(common, meta.tokens.len(), resume), meta.kind == SnapshotKind::Turn, key),
                 (cuteafd_hostcache::snapshot::Hit { key, kind: meta.kind, common,
                     frontier: meta.tokens.len() }, resume)))
         }).max_by_key(|(rank, _)| *rank).map(|(_, hit)| hit)
@@ -563,13 +573,13 @@ impl<E: CopyEngine, M: Clone + Default> PrefixCache<E, M> {
 
     fn device_media_hit(&self, tokens: &[u32], media: &[MediaSpan], sampled: bool) -> (Option<Hit>, u64) {
         let mut best = None;
-        let mut rank = (0, false, 0);
+        let mut rank = ((false, 0), false, 0);
         let mut collisions = 0;
         for (&id, entry) in &self.entries {
             let (resume, common, collision) = media_resume(self.layout.rule, tokens, media, &entry.tokens,
                 &entry.media, &entry.after, sampled);
             collisions += u64::from(collision);
-            let candidate = (resume, entry.kind == SnapshotKind::Turn, entry.last_use);
+            let candidate = (self.layout.rule.rank(common, entry.len(), resume), entry.kind == SnapshotKind::Turn, entry.last_use);
             if resume > 0 && candidate > rank {
                 rank = candidate;
                 best = Some(Hit { id, kind: entry.kind, resume, common, frontier: entry.len() });
@@ -593,16 +603,15 @@ impl<E: CopyEngine, M: Clone + Default> PrefixCache<E, M> {
         -> (Option<(cuteafd_hostcache::snapshot::Hit, usize)>, u64) {
         let Some(host) = &self.host else { return (None, 0) };
         let mut best = None;
-        let mut rank = (0, false, 0);
+        let mut rank = ((false, 0), false, 0);
         let mut collisions = 0;
         for (meta, key, payload) in host.resident_payloads() {
-            let (resume, _, collision) = media_resume(self.layout.rule, tokens, media, &meta.tokens,
+            let (resume, common, collision) = media_resume(self.layout.rule, tokens, media, &meta.tokens,
                 &payload.media, &payload.after, sampled);
             collisions += u64::from(collision);
-            let candidate = (resume, meta.kind == SnapshotKind::Turn, key);
+            let candidate = (self.layout.rule.rank(common, meta.tokens.len(), resume), meta.kind == SnapshotKind::Turn, key);
             if resume > 0 && candidate > rank {
                 rank = candidate;
-                let common = common_prefix(tokens, &meta.tokens);
                 best = Some((cuteafd_hostcache::snapshot::Hit {
                     key, kind: meta.kind, common, frontier: meta.tokens.len(),
                 }, resume));
@@ -611,18 +620,34 @@ impl<E: CopyEngine, M: Clone + Default> PrefixCache<E, M> {
         (best, collisions)
     }
 
+    fn host_verified_hit(&self, tokens: &[u32], media: &[MediaSpan], sampled: bool,
+        compatible: Option<&dyn Fn(&M, usize) -> bool>) -> Option<(cuteafd_hostcache::snapshot::Hit, usize)> {
+        if let Some(compatible) = compatible {
+            return self.host_compatible_hit(tokens, media, sampled, compatible);
+        }
+        if !media.is_empty() { return self.host_media_hit(tokens, media, sampled).0; }
+        let host = self.host.as_ref()?;
+        let hit = host.peek(tokens)?;
+        let payload = host.payload(hit.key)?;
+        let resume = self.layout.rule.skipped(hit.common, hit.frontier);
+        (resume > 0 && verify_media(resume, &payload.media, media)
+            && (resume != tokens.len() || payload.after.serves(sampled))).then_some((hit, resume))
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn restore_hit<F: PrefixFamily<M, Placement = P>, P>(&mut self, family: &F, hit: &Hit, tokens: &[u32],
         context: &RestoreContext<'_>, total: usize, draft_capacity: usize, promoted: bool, build: &mut impl FnMut(Vec<u32>) -> P)
         -> Result<Option<Admitted<P>>, PrefixError> {
         let saved_media = self.entries[&hit.id].media.clone();
-        let plan = family.plan_restore(RestoreCandidate { common: hit.common, snapshot_end: hit.frontier,
+        let mut plan = family.plan_restore(RestoreCandidate { common: hit.common, snapshot_end: hit.frontier,
             target_end: tokens.len(), resume: hit.resume, media: context.media, saved_media: &saved_media });
         // Media atomicity holds at both frontiers: shared rows never end inside an image, and a
         // replay never starts inside one. An exact plan is verified at the snapshot's frontier.
         let media_safe = |at: usize| round_frontier(at, context.media) == at && round_frontier(at, &saved_media) == at;
         let checked = plan.check(hit.common).map_err(|e| PrefixError::Family { what: "plan", source: e.into() })
-            .and_then(|()| if plan.exact() != (hit.common == hit.frontier) || hit.common < plan.lag.source_end
+            .and_then(|()| if plan.restores_mark() != (hit.common == hit.frontier)
+                || (!plan.restores_mark() && self.layout.rule.replay.is_some() && plan.exact())
+                || hit.common < plan.lag.source_end
                 || !media_safe(plan.lag.source_end) || !media_safe(plan.lag.replay_start)
                 || !verify_media(plan.lag.source_end, &self.entries[&hit.id].media, context.media) {
                 Err(PrefixError::Family { what: "plan", source: "restore plan crosses a media span or claims exactness \
@@ -636,16 +661,18 @@ impl<E: CopyEngine, M: Clone + Default> PrefixCache<E, M> {
         let writable = family.write_frontier(source_end);
         let need = self.pool.fork_need_writable(source_end, total, writable);
         if !self.make_room_for(family, need, Some(hit.id))? {
+            self.stats.fork_no_room += 1;
             return Ok(None);
         }
         let entry = self.entries.get(&hit.id).expect("the hit is kept while making room");
         let (fork_pages, copies) = self.pool.fork_writable(&entry.pages, source_end, total, writable)?;
-        let exact = plan.exact();
-        let (mut mark, meta) = if exact { (entry.mark.clone(), Some(entry.meta.clone())) } else { (None, None) };
-        let host_mark = if exact && self.layout.mark_bytes > 0 && mark.is_none() { entry.host_mark } else { None };
+        let ancestor = plan.restores_mark();
+        if family.approximate_snapshot(&entry.meta) { plan.fidelity = RestoreFidelity::ApproximateReplay; }
+        let (mut mark, meta) = if ancestor { (entry.mark.clone(), Some(entry.meta.clone())) } else { (None, None) };
+        let host_mark = if ancestor && self.layout.mark_bytes > 0 && mark.is_none() { entry.host_mark } else { None };
         let after = (resume == tokens.len()).then(|| entry.after.clone());
         let session = entry.session.clone();
-        let draft = exact.then(|| entry.draft.clone()).flatten()
+        let draft = ancestor.then(|| entry.draft.clone()).flatten()
             .filter(|draft| family.draft_pages_valid(draft));
         let pages = fork_pages.clone();
         let temporary = host_mark.is_some();
@@ -694,23 +721,20 @@ impl<E: CopyEngine, M: Clone + Default> PrefixCache<E, M> {
             unreachable!("rollback always returns the admission error");
         }
         if temporary { self.give_back(family, mark)?; }
-        if promoted {
-            let mark = self.entries.get_mut(&hit.id).and_then(|e| e.mark.take());
-            self.give_back(family, mark)?;
-        }
         let host_hit = promoted || temporary;
         self.stats.host_hits += u64::from(host_hit);
         self.stats.device_hits += u64::from(!host_hit);
         self.stats.hits += 1;
         self.stats.hit_tokens += resume as u64;
-        self.stats.exact_hits += u64::from(after.is_some());
-        self.stats.partial_hits += u64::from(!exact);
+        self.stats.exact_hits += u64::from(after.is_some() && plan.exact());
+        self.stats.partial_hits += u64::from(!ancestor);
+        self.stats.approximate_replay_hits += u64::from(plan.fidelity == RestoreFidelity::ApproximateReplay);
         self.restored_session = session.clone();
         Ok(Some(Admitted {
             placement,
             resume,
             after,
-            source: Some(Source { session, kind: hit.kind, frontier: hit.frontier, host: host_hit, partial: !exact, plan }),
+            source: Some(Source { session, kind: hit.kind, frontier: hit.frontier, host: host_hit, partial: !ancestor, plan }),
         }))
     }
 
@@ -1490,8 +1514,8 @@ impl<E: CopyEngine, M: Clone + Default> PrefixCache<E, M> {
     /// Token-only page identities are safe only when all paged state follows the target
     /// frontier. Predictor-inclusive pages can differ for the same tokens (a no-spec writer),
     /// so use allocation identities rather than deduplicating their canonical state.
-    fn identities<F: PrefixFamily<M>>(&self, family: &F, tokens: &[u32], media: &[MediaSpan], pages: &[u32]) -> Vec<DevicePageId> {
-        let chain = if family.write_frontier(tokens.len()) == tokens.len() {
+    fn identities<F: PrefixFamily<M>>(&self, family: &F, tokens: &[u32], media: &[MediaSpan], pages: &[u32], meta: &M) -> Vec<DevicePageId> {
+        let chain = if !family.approximate_snapshot(meta) && family.write_frontier(tokens.len()) == tokens.len() {
             page_chain_media(tokens, media, self.layout.page_rows)
         } else { Vec::new() };
         pages
@@ -1512,7 +1536,7 @@ impl<E: CopyEngine, M: Clone + Default> PrefixCache<E, M> {
         self.drain(family)?;
         let entry = self.entries.get(&id).expect("stored entry is retained");
         self.check_owners(family, &entry.pages).map_err(|source| PrefixError::Family { what: "page owners", source })?;
-        let ids = self.identities(family, &entry.tokens, &entry.media, &entry.pages);
+        let ids = self.identities(family, &entry.tokens, &entry.media, &entry.pages, &entry.meta);
         let mut pages: [Vec<DevicePage>; cuteafd_hostcache::PAGE_BANKS] = Default::default();
         pages[0] = entry.pages.iter().zip(ids).map(|(&page, id)| DevicePage { id, segments: family.page_segments(page) }).collect();
         if let Some(draft) = &entry.draft {
@@ -1577,7 +1601,7 @@ impl<E: CopyEngine, M: Clone + Default> PrefixCache<E, M> {
         let session = payload.session.clone();
         let meta = payload.family.clone();
         let saved_draft = payload.draft.clone();
-        let (resume, _, collision) = media_resume(self.layout.rule, tokens, media, &snapshot_tokens,
+        let (resume, common, collision) = media_resume(self.layout.rule, tokens, media, &snapshot_tokens,
             &saved_media, &after, sampled);
         if resume == 0 {
             self.stats.media_key_collisions += u64::from(collision);
@@ -1624,7 +1648,7 @@ impl<E: CopyEngine, M: Clone + Default> PrefixCache<E, M> {
             self.give_back(family, mark)?;
             return Ok(None);
         }
-        let ids = self.identities(family, &snapshot_tokens, &saved_media, &pages);
+        let ids = self.identities(family, &snapshot_tokens, &saved_media, &pages, &meta);
         let mut target_pages: [Vec<DevicePage>; cuteafd_hostcache::PAGE_BANKS] = Default::default();
         target_pages[0] = pages.iter().zip(ids).map(|(&page, id)| DevicePage { id, segments: family.page_segments(page) }).collect();
         let tail = match Self::mark_segments(family, mark.as_ref()) {
@@ -1719,9 +1743,7 @@ impl<E: CopyEngine, M: Clone + Default> PrefixCache<E, M> {
             self.evict(family, evicted)?;
         }
         self.stats.host_promotions += 1;
-        Ok(if let Some(compatible) = compatible {
-            self.device_compatible_hit(tokens, media, sampled, compatible)
-        } else { self.lookup_media(tokens, media, sampled) })
+        Ok(Some(Hit { id, kind: hit.kind, resume, common, frontier: len }))
     }
 }
 
@@ -1741,7 +1763,16 @@ fn media_resume(rule: cuteafd_core::prefix::ReuseRule, tokens: &[u32], media: &[
     // restore starts empty, so rounding further down is safe (never claim an exact mark).
     // `common` stays raw: the family's plan picks its frontiers from it, and `restore_hit`
     // verifies both against the media of either prompt before forking a row.
-    resume = round_frontier(round_frontier(resume, media), saved_media);
-    if !verify_media(resume, saved_media, media) { return (0, common, true); }
+    let hit = RestoreCandidate { common, snapshot_end: saved_tokens.len(), target_end: tokens.len(),
+        resume, media, saved_media };
+    let verified = if rule == cuteafd_core::prefix::ReuseRule::V41 {
+        let plan = RestorePlan::under(rule, hit);
+        resume = plan.resume();
+        plan.lag.source_end
+    } else {
+        resume = hit.media_safe(resume);
+        resume
+    };
+    if !verify_media(verified, saved_media, media) { return (0, common, true); }
     (resume, common, false)
 }

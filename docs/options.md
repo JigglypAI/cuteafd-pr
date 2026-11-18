@@ -734,7 +734,7 @@ Each key is also a global `cuteafd` flag (`--gpu-memory-cap`, `--kv-max-tokens`,
 | `DRAFT_KV_CACHE` | `fp8` | `bf16`, `fp8` | Drafter ring storage (GLM 5.3, GLM Flash, MiMo, Muse, Kimi GQA block dSpark and MLA DFlash2, Inkling). Every drafter selects BF16/FP8 independently of target KV and body weights; default FP8. |
 | `PREFIX_CACHE_ENTRIES` | `auto` | `auto`, non-negative | Snapshot entries; auto derives from context × concurrency. |
 | `PREFIX_CACHE_MARK_MIB` | unset | MiB | Recurrent/ring state retained per mark. |
-| `PREFIX_PARTIAL` | `off` | `on`, `off` | MiMo approximate partial reuse; off keeps exact restores only. Every other family, V4.1 included, restores exact snapshot frontiers only and refuses `on`. |
+| `PREFIX_PARTIAL` | `off` | `on`, `off` | MiMo approximate partial reuse; off keeps exact restores only. V4.1 prefers retained ancestors and uses its official bounded replay only for partial divergence without one (approximate encoder SWA; 128 tokens, extended before overlapping images). Ancestor restores copy the retained state byte-exactly and preserve any prior approximate lineage. Other families restore exact snapshot frontiers only and refuse `on`. |
 | `PREFIX_POINT_BOUNDARIES` | `1` | `0`, `1` | Dense Qwen: retain the exact frontier before the generation message. |
 | `GLM5_FLASH_PREFIX_MARKS` | unset | `arena`, `pool` | GLM Flash KDA state marks. |
 | `GLM5_FLASH_KDA_STATE` | `f32` | `f32`, `bf16` | GLM Flash KDA recurrent state. |

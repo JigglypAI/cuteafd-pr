@@ -74,10 +74,11 @@ pub enum Eviction {
 /// Whether a restore reproduces the state a prefill of the same tokens would have.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum RestoreFidelity {
-    /// Every byte the model reads is the snapshot's (AGENTS "Exact prefix-cache restores").
+    /// The restore neither runs approximate replay nor inherits recorded approximation.
     Exact,
     /// Shared pages hold exact rows through `source_end`, but positional state restarts empty
-    /// at `replay_start` and the replayed rows rebuild it approximately (a partial match).
+    /// at `replay_start` and the replayed rows rebuild it approximately (a partial match),
+    /// or a retained ancestor already contains that approximate state.
     ApproximateReplay,
 }
 
@@ -133,14 +134,28 @@ impl RestorePlan {
     /// The default plan under `rule`: an exact frontier restores its mark; a partial match
     /// resumes at the rule's replay start with no mark, its pages forked through the same point.
     pub fn under(rule: ReuseRule, hit: RestoreCandidate<'_>) -> Self {
-        let _ = rule;
         let exact = hit.common == hit.snapshot_end;
-        let resume = if exact { hit.snapshot_end } else { hit.resume };
+        let lag = if exact {
+            LaggedState { source_end: hit.snapshot_end, replay_start: hit.snapshot_end }
+        } else if rule == ReuseRule::V41 {
+            // Source groups must be even and outside both sets of image spans.
+            // Calculate this before subtracting the window, including for lookup ranking.
+            let mut source_end = hit.common;
+            loop {
+                let safe = hit.media_safe(source_end / 2 * 2);
+                if safe == source_end { break; }
+                source_end = safe;
+            }
+            let replay_start = hit.media_safe(source_end.saturating_sub(rule.replay.unwrap_or(0)));
+            LaggedState { source_end: if replay_start == 0 { 0 } else { source_end }, replay_start }
+        } else {
+            LaggedState { source_end: hit.resume, replay_start: hit.resume }
+        };
         Self {
             snapshot_end: hit.snapshot_end,
             target_end: hit.target_end,
-            lag: LaggedState { source_end: resume, replay_start: resume },
-            fidelity: if exact { RestoreFidelity::Exact } else { RestoreFidelity::ApproximateReplay },
+            lag,
+            fidelity: if !exact && rule.replay.is_some() { RestoreFidelity::ApproximateReplay } else { RestoreFidelity::Exact },
         }
     }
     /// Where prefill resumes.
@@ -150,16 +165,21 @@ impl RestorePlan {
     pub fn exact(&self) -> bool {
         self.fidelity == RestoreFidelity::Exact
     }
+    /// Whether this operation copies a retained ancestor mark. This is independent
+    /// of fidelity: the mark may contain approximate state from a previous replay.
+    pub fn restores_mark(&self) -> bool {
+        self.lag.source_end == self.snapshot_end && self.lag.replay_start == self.snapshot_end
+    }
     /// The invariants every plan keeps: replay never starts past the shared source frontier,
-    /// nor the source frontier past the snapshot or the prompt, and an exact plan resumes at the
+    /// nor the source frontier past the snapshot or the prompt, and an ancestor plan resumes at the
     /// snapshot's own frontier.
     pub fn check(&self, common: usize) -> Result<(), &'static str> {
         let LaggedState { source_end, replay_start } = self.lag;
         if replay_start > source_end || source_end > common.min(self.snapshot_end) || source_end > self.target_end {
             return Err("restore plan frontiers out of order");
         }
-        if self.exact() && (source_end != self.snapshot_end || replay_start != source_end) {
-            return Err("an exact restore resumes at its snapshot's frontier");
+        if common == self.snapshot_end && !self.restores_mark() {
+            return Err("an ancestor restore resumes at its snapshot's frontier");
         }
         Ok(())
     }
@@ -305,10 +325,14 @@ pub trait PrefixFamily<M: Clone + Default = ()> {
         let _ = (placement, len);
         Ok(M::default())
     }
+    /// True when a snapshot carries state descended from an approximate restore.
+    /// Such pages cannot be deduplicated by token identity in the host tier.
+    fn approximate_snapshot(&self, _: &M) -> bool { false }
+
     /// How to restore a selected snapshot. The default follows the layout's [`ReuseRule`]:
     /// exact frontiers restore the mark, partial matches replay. A family may resume an exact
-    /// ancestor differently (V4.1 continues its encoder past a long suffix) but never plans an
-    /// approximate restore for an exact frontier.
+    /// ancestor differently (V4.1 continues its encoder past a long suffix) and the engine
+    /// propagates saved approximation independently of the operation.
     fn plan_restore(&self, hit: RestoreCandidate<'_>) -> RestorePlan {
         RestorePlan::under(self.layout().rule, hit)
     }

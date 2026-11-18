@@ -218,16 +218,20 @@ pub(super) fn check(serve: crate::cli::NativeServeArgs, tokens: &[u32], at: &[us
                 }
 
                 if !image {
-                    // Exact restores only: a branch inside every retained frontier is a miss,
-                    // never an approximate replay of the shared part.
+                    // A branch inside the retained frontier uses official bounded replay.
                     let mut branch = prompt[..p - 37].to_vec();
                     branch.extend(&tokens[p + 1..p + 1 + 64]);
-                    let missed = run(&queue, &branch, rows, false, false, false, Vec::new())?;
-                    cases.push(serde_json::json!({"name": format!("{label} branch inside a frontier misses"),
-                        "required": true, "cached_tokens": missed.cached, "pass": missed.cached == 0}));
-                    ensure!(missed.cached == 0, "{label}: a branch inside the retained frontier reused {} tokens",
-                        missed.cached);
-                    println!("{label}: branch inside the retained frontier is a cold miss PASS");
+                    let replayed = run(&queue, &branch, rows, false, false, false, Vec::new())?;
+                    let replay = replayed.record.provenance.as_ref().and_then(|v| v.get("prefix_restore"))
+                        .and_then(|v| v.get("plan"));
+                    let approximate = replay.and_then(|p| p.get("fidelity")).and_then(|v| v.as_str()) == Some("ApproximateReplay");
+                    // Very short prefixes cannot save a complete replay window.
+                    let expected = p.saturating_sub(37) / 2 * 2;
+                    let pass = if expected <= 128 { replayed.cached == 0 } else { replayed.cached > 0 && approximate };
+                    cases.push(serde_json::json!({"name": format!("{label} bounded partial replay"),
+                        "required": true, "cached_tokens": replayed.cached, "plan": replay, "pass": pass}));
+                    ensure!(pass, "{label}: partial divergence did not use bounded replay: {:?}", replay);
+                    println!("{label}: bounded partial replay cached {} PASS", replayed.cached);
                 }
             }
         }

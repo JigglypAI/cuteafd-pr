@@ -151,7 +151,7 @@ fn normalize_serving(args: &mut crate::cli::NativeServeArgs) -> Result<u8> {
     args.expert_usage_enabled()?;
     cuteafd_core::concurrency::validate("deepseek_v41", u64::from(args.concurrency))?;
     ensure!(args.prefix.prefix_partial == crate::shared::prefix::Toggle::Off,
-        "V4.1 restores exact prefix frontiers only (--prefix-partial off)");
+        "V4.1 uses built-in bounded replay for partial matches; --prefix-partial is MiMo-only");
     args.prefix.resolve_entries(args.concurrency as usize);
     cuteafd_bench::context::set_resolved("max-context-tokens", &args.max_context_tokens.to_string());
     let lanes = cuteafd_loader::plan::resolve_decode_lanes("deepseek_v41", Some(args.decode_lanes), u64::from(args.concurrency))?;
@@ -997,6 +997,17 @@ impl ScoringPlan {
     }
 }
 
+/// Scoring defaults to cold for calibration; the paired replay probe explicitly
+/// opts in to reuse only on its warm arm. Scoring bypasses snapshot capture.
+fn prefill_cold(probe: &crate::shared::probe::ProbeRef) -> bool {
+    probe.as_ref().is_some_and(|p| p.spec.cold || (p.spec.score_from.is_some() && !p.spec.score_reuse_prefix))
+}
+
+/// The same prompt frontier is used by prefix admission and teacher-forced prefill.
+fn scoring_frontier(probe: &crate::shared::probe::ProbeRef, len: usize) -> Option<usize> {
+    crate::shared::probe::scoring(probe).map(|from| from.clamp(1, len.saturating_sub(1).max(1)).min(len))
+}
+
 /// Teacher-forced scoring: prefill the prefix, then record rows from the
 /// explicitly selected decode-shaped verification or legacy prefill-shaped
 /// continuation. The first row comes from prefix prefill in either path.
@@ -1009,16 +1020,18 @@ fn score<'a, P: PrefillTarget<'a>, C: DraftChain<'a>>(lib: &'a NativeLibrary, ru
     requests: &mut Requests<'a>, decode_lane: (&mut P, &mut P::Transport),
     prefill_slots: &mut prefill_target::PrefillSlots<'a, P>,
     lease: crate::families::deepseek_v41::v41_backbone_cache::CacheLease,
-    tokens: &[u32], from: usize, shape: PrefillShape, job: &NativeRequest,
+    tokens: &[u32], from: usize, retained: Option<RetainedScores>, shape: PrefillShape, job: &NativeRequest,
     mut draft: Option<&mut DraftRuntime<'_, 'a, C>>, hold: &mut dyn FnMut() -> Result<()>) -> Result<()> {
     let probe = job.probe.as_ref().context("scoring without a probe")?;
     let plan = ScoringPlan::for_probe(&probe.spec, shape.rows)?;
-    ensure!(tokens.len() >= 2, "scoring needs at least two tokens");
+    ensure!((1..tokens.len()).contains(&from), "scoring needs at least two tokens");
     probe.selected_score_path(plan.path.name());
-    let from = from.clamp(1, tokens.len() - 1);
     let (decode_pass, decode_transport) = decode_lane;
-    let first = prefill(lib, runtime, requests, prefill_slots, Some((&mut *decode_pass, &mut *decode_transport)), lease, &tokens[..from],
-        shape, job, draft.as_deref_mut(), hold)?;
+    let first = match retained {
+        Some(scores) => scores,
+        None => prefill(lib, runtime, requests, prefill_slots, Some((&mut *decode_pass, &mut *decode_transport)),
+            lease, &tokens[..from], shape, job, draft.as_deref_mut(), hold)?,
+    };
     let (slot_pass, slot_transport) = prefill_slots.slot0();
     let (pass, transport) = match plan.path {
         crate::shared::probe::ScorePath::Decode => (decode_pass, decode_transport),
@@ -1164,6 +1177,24 @@ mod scoring_tests {
     use super::*;
     use crate::shared::probe::ScorePath;
     use cuteafd_api::openai::probe::{Probe, ProbeSpec};
+
+    #[test]
+    fn scoring_reuse_is_explicit_and_cold_takes_precedence() {
+        assert!(!prefill_cold(&None));
+        for (cold, reuse, expected) in [(false, false, true), (false, true, false), (true, true, true)] {
+            let probe = Some(Probe::new(ProbeSpec { cold, score_reuse_prefix: reuse, score_from: Some(4), ..Default::default() }));
+            assert_eq!(prefill_cold(&probe), expected);
+        }
+    }
+
+    #[test]
+    fn scoring_frontier_is_the_first_teacher_forced_position() {
+        for (from, len, expected) in [(0, 128, 1), (24, 128, 24), (128, 128, 127), (24, 1, 1), (24, 0, 0)] {
+            let probe = Some(Probe::new(ProbeSpec { score_from: Some(from), ..Default::default() }));
+            assert_eq!(scoring_frontier(&probe, len), Some(expected));
+        }
+        assert_eq!(scoring_frontier(&None, 128), None);
+    }
 
     #[test]
     fn scoring_path_is_explicit_and_legacy_default_is_unchanged() {

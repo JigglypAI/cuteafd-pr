@@ -81,6 +81,53 @@ impl<'a> BackboneCache<'a> {
         Ok((meta, bytes))
     }
 
+    /// Start a fresh request at the complete-group frontier `end` of source pages the prefix
+    /// engine forked and bound, with empty encoder windows at the bounded replay start
+    /// `start` (the media-safe frontier chosen by the family plan). Decoder windows remain fresh. Replay reads the shared source rows without
+    /// producing them. Returns the replay start.
+    pub fn restore_encoder_prefix(&mut self, lease: CacheLease, end: u64, start: u64, prompt_end: u64) -> Result<u64> {
+        let request = self.request(lease)?;
+        ensure!(
+            end > 0
+                && start < end
+                && end % 2 == 0
+                && end <= prompt_end
+                && prompt_end <= 1048576
+                && request.end == 0
+                && request.version == 0
+                && request.phase == CachePhase::Full
+                && request.publication.is_empty(),
+            "invalid encoder prefix restore frontier"
+        );
+        let windows = request.windows;
+        let sources = request.sources;
+        let result = (|| -> Result<()> {
+            for layer in 0..20 {
+                self.windows[layer].begin_encoder_replay(windows[layer], start)?;
+            }
+            for (state, lease) in self.sources.iter_mut().zip(sources) {
+                state.restore_compressed_prefix(lease, end)?;
+            }
+            Ok(())
+        })();
+        result?; // The shared prefix engine drains and rolls back failed admissions.
+        // Replay reads forked tail rows on compute streams. Single-device
+        // publication need not drain the prefix copy stream on its own.
+        self.prefix_drain()?;
+        let request = self.requests[lease.slot]
+            .as_mut()
+            .expect("validated fresh admission");
+        request.end = end;
+        request.phase = CachePhase::EncoderReplay {
+            prefix: end,
+            target: prompt_end,
+            end: start,
+        };
+        request.version = 1;
+        self.committed_end(lease)?;
+        Ok(start)
+    }
+
     /// Copy a fully committed request's windows and carry into `mark` (synchronously). Only a
     /// complete frontier is captured, after all producer/consumer streams drained.
     pub fn capture_mark(&mut self, lease: CacheLease, mark: CuteafdDeviceBuffer) -> Result<BackboneMark> {
@@ -501,6 +548,68 @@ mod rollback_tests {
             assert!(receive.try_recv().is_err(), "health must not require another admission");
             anyhow::Ok(())
         })?;
+        Ok(())
+    }
+
+    #[test]
+    fn bounded_replay_drains_forked_tail_before_publishing() -> Result<()> {
+        let fixture = Fixture::build_for_tests()?;
+        let lib = fixture.load()?;
+        // This fixture defers device-to-device copies until their stream drains.
+        let mut bank = BackboneCache::new(&lib, 1, [4, 4, 4, 8], usize::MAX)?;
+        bank.use_engine_pages()?;
+        let lease = bank.begin_request(0, 7)?;
+        let from = bank.unit_pages(&[0]);
+        let to = bank.unit_pages(&[1]);
+        for (i, state) in bank.sources.iter().enumerate() {
+            for (page, byte) in [(from[i][0], 0x2a), (to[i][0], 0x59)] {
+                for segment in state.source_cache().page_segments(page) {
+                    lib.copy_h2d(segment, &vec![byte; segment.bytes])?;
+                }
+            }
+        }
+        bank.copy_unit_rows(0, 1, 200)?;
+        let tail = bank.sources[0].source_cache().page_segments(to[0][0])[0];
+        let mut bytes = vec![0; tail.bytes];
+        lib.copy_d2h(&mut bytes, tail)?;
+        assert_eq!(bytes[0], 0x59, "fork is not visible before the copy drains");
+        bank.bind_sources(lease, [&to[0], &to[1], &to[2], &to[3]], bank.source_rows(200))?;
+        assert_eq!(bank.restore_encoder_prefix(lease, 200, 72, 225)?, 72);
+        lib.copy_d2h(&mut bytes, tail)?;
+        assert_eq!(bytes[0], 0x2a, "replay can read the copied tail at publication");
+        assert_eq!(bank.history_end(lease)?, 72);
+        assert_eq!(bank.committed_end(lease)?, 200);
+        let request = bank.request(lease)?;
+        for (i, (state, &window)) in bank.windows.iter().zip(&request.windows).enumerate() {
+            let start = if i < 20 { 72 } else { 0 };
+            assert_eq!(state.span(window)?, (start, start));
+        }
+        bank.release(&[lease])?;
+        Ok(())
+    }
+
+    #[test]
+    fn replay_upload_failure_at_layer_k_keeps_the_lease_for_cold_rebind() -> Result<()> {
+        let fixture = Fixture::build_for_tests()?;
+        let lib = fixture.load()?;
+        fixture.immediate_copies(&lib)?;
+        let mut bank = BackboneCache::new(&lib, 1, [4, 4, 4, 8], usize::MAX)?;
+        bank.use_engine_pages()?;
+        let lease = bank.begin_request(0, 7)?;
+        let pages = bank.unit_pages(&[0]);
+        bank.bind_sources(lease, [&pages[0], &pages[1], &pages[2], &pages[3]], bank.source_rows(200))?;
+        fixture.fail_h2d_after(&lib, 7)?;
+        assert!(bank.restore_encoder_prefix(lease, 200, 72, 225).is_err());
+        let request = bank.request(lease)?;
+        assert_eq!(bank.windows[6].span(request.windows[6])?, (72, 72));
+        assert_eq!(bank.windows[7].span(request.windows[7])?, (0, 0));
+        bank.reset_prefix(lease)?;
+        let pages = bank.unit_pages(&[1]);
+        bank.bind_sources(lease, [&pages[0], &pages[1], &pages[2], &pages[3]], [0; 4])?;
+        assert_eq!(bank.request_id(lease)?, 7);
+        assert_eq!(bank.history_end(lease)?, 0);
+        bank.begin_encoder(lease, 225)?;
+        bank.release(&[lease])?;
         Ok(())
     }
 

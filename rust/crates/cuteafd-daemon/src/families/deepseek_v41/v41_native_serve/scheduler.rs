@@ -202,8 +202,6 @@ fn retire_request<'a, C: DraftChain<'a>>(mut request: Active<'a>, requests: &mut
 pub(super) fn prepare_prefix_cache<'a>(lib: &'a NativeLibrary, args: &crate::cli::NativeServeArgs,
     requests: &Requests<'a>, arenas: super::prefix::Arenas<'a>, draft: bool, admitted: &super::admission::Admitted) -> Result<PrefixCache<'a>> {
     let prefix = &args.prefix;
-    ensure!(prefix.prefix_partial == crate::shared::prefix::Toggle::Off,
-        "V4.1 restores exact prefix frontiers only (--prefix-partial off)");
     let units = requests.cache().unit_capacity();
     let layout = super::prefix::layout(units, draft);
     let entries = prefix.prefix_cache_entries;
@@ -673,11 +671,11 @@ impl<'w, 'a, P: ServingTarget<'w, 'a>> queue::Host<Waiting<'a>, super::prefill_t
         let first_call = cursor.at_start();
         // A scoring probe scores before anything else (it never packs) and
         // always ends its request (`ScoringDone`).
-        if let Some(from) = crate::shared::probe::scoring(&job.probe).filter(|_| first_call) {
+        if let Some(from) = super::scoring_frontier(&job.probe, prompt.len()).filter(|_| first_call) {
             for (_, transport) in self.prefill.slots.iter_mut() { P::begin_request(transport)?; }
             let prefixes = &mut *self.prefixes;
             super::score(self.lib, self.runtime, self.requests, (&mut *self.first, &mut *self.first_transport),
-                &mut *self.prefill, lease, prompt, from, super::PrefillShape::from_args(self.args), job,
+                &mut *self.prefill, lease, prompt, from, hit_scores.take(), super::PrefillShape::from_args(self.args), job,
                 self.draft.as_deref_mut(), &mut || prefixes.prefill_hold())?;
         }
         for (_, transport) in self.prefill.slots.iter_mut() { P::begin_request(transport)?; }
@@ -1048,23 +1046,25 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
                 let restore_started = Instant::now();
                 // Units for the prompt and one decode chunk (the shared reservation rule) are
                 // allocated here and the best snapshot restored into them.
-                let cold = crate::shared::probe::cold(&job.probe);
+                let cold = super::prefill_cold(&job.probe);
                 let draft_id = draft_id(&draft, id);
-                let restored = prefixes.admit(requests, draft.as_deref_mut(), lease, draft_id, image_keys.tokens(),
-                    prompt, image_keys.spans(), rows, cold)?;
+                // Teacher forcing pre-fills only through the first scored row. The
+                // remainder needs capacity, but must not extend the CED restore target.
+                let scoring = super::scoring_frontier(&job.probe, prompt.len());
+                let prefill_end = scoring.unwrap_or(prompt.len());
+                let restored = prefixes.admit(requests, draft.as_deref_mut(), lease, draft_id, &image_keys.tokens()[..prefill_end],
+                    &prompt[..prefill_end], image_keys.spans(), rows, cold)?;
                 job.prefix_cache_source.set(restored.cached, restored.source.as_ref().is_some_and(|source| source.host));
-                if let Some(probe) = job.probe.as_ref().filter(|probe| probe.spec.record_state) {
-                    if let Some(source) = &restored.source {
-                        probe.provenance(serde_json::json!({"prefix_restore": source}));
-                        if requests.cache().stage(lease)? == crate::families::deepseek_v41::v41_backbone_cache::CacheStage::Full {
-                            requests.record_state(lease, &job.probe, "restore")?;
-                        }
+                if let (Some(probe), Some(source)) = (&job.probe, &restored.source) {
+                    probe.provenance(serde_json::json!({"prefix_restore": source}));
+                    if probe.spec.record_state && requests.cache().stage(lease)? == crate::families::deepseek_v41::v41_backbone_cache::CacheStage::Full {
+                        requests.record_state(lease, &job.probe, "restore")?;
                     }
                 }
                 let hit = (restored.cached > 0).then_some((restored.cached, restored.scores));
                 let restore = (restore_started, Instant::now());
                 let resume = if images.is_empty() { prompt.len() } else {
-                    let source_end = requests.cache().committed_end(lease)? as usize;
+                    let source_end = requests.cache().history_end(lease)? as usize;
                     // Encode only when a span from the restored frontier on lacks features.
                     if requests.images(lease)?.needed(source_end, prompt.len())?.is_empty() { prompt.len() } else { source_end }
                 };
@@ -1113,7 +1113,8 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
             held_slots.insert(slot);
             // Its rows depend only on its tokens and restored frontier, both known
             // now: fetch them while it waits behind earlier members, packed or not.
-            start_admission_lookahead(requests, lease, &prepared.prompt, args);
+            let prefill_end = super::scoring_frontier(&prepared.job.probe, prepared.prompt.len()).unwrap_or(prepared.prompt.len());
+            start_admission_lookahead(requests, lease, &prepared.prompt[..prefill_end], args);
             admitted.push_back((prepared, id, lease, slot, image_keys, hit, restore));
         }
         prefix_waiters.extend(next_wave);
@@ -2029,10 +2030,11 @@ fn prepare_decode_lane<'a>(requests: &mut Requests<'a>, active: &[Option<Active<
 fn start_admission_lookahead(requests: &mut Requests<'_>, lease: CacheLease, prompt: &[u32],
     args: &crate::cli::NativeServeArgs) {
     let shape = super::PrefillShape::from_args(args);
+    let replay_end = requests.cache().committed_end(lease).map_or(0, |end| end as usize);
     let result = requests.start_lookahead(lease, prompt, |start| {
-        if prompt.len() - start <= shape.rows {
+        if start >= replay_end && prompt.len() - start <= shape.rows {
             Ok(cuteafd_loader::TableUnitPlan::new(vec![prompt.len() as u64], 1))
-        } else { super::prefill_target::prompt_units(start, prompt.len(), shape.rows, shape.waves) }
+        } else { super::prefill_target::prompt_units(start, replay_end, prompt.len(), shape.rows, shape.waves) }
     });
     if let Err(error) = result { tracing::warn!(%error, "Engram look-ahead not started; rows load on demand"); }
 }

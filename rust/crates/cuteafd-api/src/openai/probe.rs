@@ -51,6 +51,10 @@ pub struct ProbeSpec {
     /// ends without generating.
     #[serde(default)]
     pub score_from: Option<usize>,
+    /// Opt in to cache lookup for a scored prefix on V4.1. Scoring stays cold by
+    /// default and `cold: true` always takes precedence. Scoring never captures.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub score_reuse_prefix: bool,
     /// Decode-shaped scoring width, bounded by the family's verify capacity.
     #[serde(default)]
     pub verify_rows: Option<usize>,
