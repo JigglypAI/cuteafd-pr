@@ -22,6 +22,7 @@
 use super::super::prefix::V41Cache as PrefixCache;
 use super::super::speculative::{DraftChain, DraftRuntime};
 use super::{retire_request, Active};
+use super::super::ClientGone;
 use crate::families::deepseek_v41::v41_requests::Requests;
 use crate::families::deepseek_v41::v41_backbone_cache::CacheLease;
 
@@ -67,15 +68,41 @@ pub(super) fn fail_request<M: RoundMember>(active: &mut [Option<M>],
     true
 }
 
-/// The client left before this prompt's first transport call: nothing was
-/// dispatched, so only this request's owners are released.
-///
-/// The Display text is byte-identical to the string this site produced before
-/// the type existed, so the log line `native request admission failed
-/// error=client disconnected` and the client-facing message do not move.
-#[derive(Debug, thiserror::Error)]
-#[error("client disconnected")]
-pub(super) struct ClientGone;
+/// A packed pass's failure after the round's prologue reset the links once
+/// (`queue::recover_packed`): its members are answered without another reset.
+/// The text is the original failure's, unchanged.
+#[derive(Debug)]
+pub(super) struct PackedRecovered(anyhow::Error);
+impl std::fmt::Display for PackedRecovered {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { write!(f, "{:#}", self.0) }
+}
+impl std::error::Error for PackedRecovered {}
+
+/// Mark a stored packed failure recovered; true when it was not yet.
+pub(super) fn mark_recovered<T>(stored: &mut Option<anyhow::Result<T>>) -> bool {
+    match stored.take() {
+        Some(Err(error)) if error.downcast_ref::<PackedRecovered>().is_none() => {
+            *stored = Some(Err(anyhow::Error::new(PackedRecovered(error))));
+            true
+        }
+        other => { *stored = other; false }
+    }
+}
+
+/// Whether a prompt's failed chunk must reset every expert link. Only a failure
+/// that may have left a wave unlanded does: a client that left is observed at
+/// a drained boundary ([`ClientGone`]), a finished scoring probe dispatched
+/// nothing more, and a recovered packed failure already reset.
+pub(super) fn needs_reset(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<ClientGone>().is_none()
+        && error.downcast_ref::<super::super::ScoringDone>().is_none()
+        && error.downcast_ref::<PackedRecovered>().is_none()
+}
+
+static RESETS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Count one full reset of the expert links (`/v1/stats` `link_resets`).
+pub(super) fn count_reset() { RESETS.fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
+pub(super) fn resets() -> u64 { RESETS.load(std::sync::atomic::Ordering::Relaxed) }
 
 /// Reset only after a round-wide fault; callers invoke this after both lanes
 /// drain. The callback keeps the classification and reset decision inseparable.
@@ -91,15 +118,6 @@ pub(super) fn handle<M: RoundMember>(active: &mut [Option<M>], error: &anyhow::E
         }
     }
     fail_round(active, error);
-    reset()
-}
-
-/// An admission that never dispatched a wave needs no transport recovery: only
-/// a [`ClientGone`] is skipped, every other admission failure keeps the reset.
-/// The callback is the caller's whole reset block, so one call = one teardown.
-pub(super) fn admission_failed(error: &anyhow::Error,
-    reset: impl FnOnce() -> anyhow::Result<()>) -> anyhow::Result<()> {
-    if error.downcast_ref::<ClientGone>().is_some() { return Ok(()); }
     reset()
 }
 
@@ -602,34 +620,19 @@ pub(super) mod tests {
         assert_eq!(source.matches("round_failure::retire_done(").count(), 1);
     }
 
-    /// `Round::fail` used to reset every transport for every admission error, so
-    /// one abandoned request cost three lane rebuilds (12 `expert RoCE endpoint
-    /// selected`, 3 `Spark exchange worker started`, ~2.8 s of serve-loop stall).
-    /// A client that left before the prompt's first transport call dispatched
-    /// nothing, so it must reset nothing.
+    /// The reset classification: only a failure that may have left a wave in
+    /// flight resets; the client-gone text is the untyped string it replaced.
     #[test]
-    fn a_client_gone_admission_failure_resets_no_transport() {
-        let mut resets = 0;
-        admission_failed(&anyhow::Error::new(ClientGone), || { resets += 1; Ok(()) }).unwrap();
-        assert_eq!(resets, 0, "a client that left before dispatch must not tear down the lanes");
-        admission_failed(&anyhow::anyhow!("native GPU execution failed"), || { resets += 1; Ok(()) }).unwrap();
-        assert_eq!(resets, 1, "every other admission failure keeps today's reset");
-        assert_eq!(format!("{}", ClientGone), "client disconnected",
-            "the log line and the client message must not move");
-    }
-
-    /// The guard must be WIRED, not merely available: `Round::fail`'s three
-    /// resets live inside `admission_failed`'s closure and nowhere else.
-    #[test]
-    fn round_fail_routes_every_reset_through_the_client_gone_guard() {
-        let source = include_str!("../scheduler.rs");
-        let start = source.find("fn fail(&mut self, waiting: Waiting<'a>").expect("Round::fail");
-        let end = start + source[start..].find("fn rest(&self)").expect("end of Round::fail");
-        let fail = &source[start..end];
-        let (before, after) = fail.split_once("admission_failed(&error, || {")
-            .expect("a client-gone admission failure must not reset the transports");
-        assert!(!before.contains("P::reset_connections"), "a reset outside the guard: {before}");
-        assert_eq!(after.matches("P::reset_connections").count(), 3,
-            "all three resets stay inside the guard: {after}");
+    fn only_a_possibly_in_flight_failure_resets_the_links() {
+        assert!(!needs_reset(&anyhow::Error::new(ClientGone)));
+        assert!(!needs_reset(&anyhow::Error::new(super::super::super::ScoringDone)));
+        assert!(needs_reset(&fault("native GPU execution failed")));
+        let mut stored: Option<anyhow::Result<()>> = Some(Err(fault("packed prefill of 2 prompts: wire down")));
+        assert!(mark_recovered(&mut stored));
+        assert!(!mark_recovered(&mut stored), "a recovered failure is marked once");
+        let error = stored.unwrap().unwrap_err();
+        assert!(!needs_reset(&error));
+        assert_eq!(format!("{error:#}"), "packed prefill of 2 prompts: wire down", "the client text is unchanged");
+        assert_eq!(ClientGone.to_string(), "client disconnected", "the log line and client message do not move");
     }
 }

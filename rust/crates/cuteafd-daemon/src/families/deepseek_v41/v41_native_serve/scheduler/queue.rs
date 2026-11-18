@@ -9,6 +9,11 @@
 //! finishes joins the running requests in its own chunk; one that fails or
 //! whose client left is answered and released in its own chunk, so the next
 //! prompt's call starts on reset connections, as before.
+//!
+//! Links are reset only when a call could have left a wave in flight: a failed
+//! call (or a failed packed pass, recovered once in the round's prologue). A
+//! client that left is answered at a drained boundary, never mid-call, so it
+//! releases only its own owners (#2475).
 use crate::shared::prefill_share::{run_to_end, run_unit, Chunk, PrefillDriver};
 use anyhow::{Context, Result};
 
@@ -33,11 +38,36 @@ pub(in crate::families::deepseek_v41::v41_native_serve) trait Host<T, C> {
     /// The prefilled prompt joins the running requests. An error is fatal to
     /// the serve loop (a release that failed), as before the queue.
     fn admit(&mut self, slot: usize, request: T, output: Self::Output) -> Result<()>;
-    /// Answer the client and release every owner (lease, draft, connections).
+    /// Answer the client and release the request's owners (lease, draft).
     fn fail(&mut self, request: T, error: anyhow::Error) -> Result<()>;
+    /// Stop, reset and restart every expert link (both decode lanes and the
+    /// prefill slots): a failed call may have left a wave unlanded.
+    fn reset_links(&mut self) -> Result<()>;
+    /// The request's client left.
+    fn closed(&self, request: &T) -> bool;
+    /// A packed group's stored result for this prompt, taken.
+    fn take_stored(&mut self, request: &mut T) -> Option<Result<Self::Output>>;
+    /// Mark a stored packed failure as recovered (its links were reset); true
+    /// when it was an unrecovered failure.
+    fn mark_recovered(&mut self, request: &mut T) -> bool;
     /// A fresh cursor: the left prompt's state (its suffix arena) drops now.
     fn rest(&self) -> C;
 }
+
+/// A packed pass that failed (every member stores the error) may have left a
+/// wave unlanded on the prefill link. Reset once, here, before any other
+/// prompt's call or a decode round reuses the links; its members are then
+/// answered in their own chunks without a second reset.
+pub(in crate::families::deepseek_v41::v41_native_serve) fn recover_packed<'q, T: 'q, C: 'q, H: Host<T, C>>(
+    host: &mut H, waiting: impl Iterator<Item = &'q mut Queued<T, C>>) -> Result<()> {
+    let mut failed = false;
+    for entry in waiting {
+        if let Some(request) = entry.request.as_mut() { failed |= host.mark_recovered(request); }
+    }
+    if failed { host.reset_links()?; }
+    Ok(())
+}
+
 
 /// One round chunk of `entry`; a prompt that leaves (admitted or answered)
 /// reports `Done`, so the queue never holds a released request. `Err` only
@@ -45,7 +75,15 @@ pub(in crate::families::deepseek_v41::v41_native_serve) trait Host<T, C> {
 pub(in crate::families::deepseek_v41::v41_native_serve) fn chunk<T, C, H: Host<T, C>>(host: &mut H,
     entry: &mut Queued<T, C>) -> Result<Chunk> {
     let request = entry.request.as_mut().context("a queued prompt already left")?;
-    let outcome = host.run(request, &mut entry.cursor);
+    // A packed group's stored result first, so a packed fault is reported as
+    // itself; then a client that left, at this drained boundary (no call of
+    // this prompt is in flight between chunks).
+    let outcome = match host.take_stored(request).transpose() {
+        Err(error) => Err(error),
+        Ok(_) if host.closed(request) => Err(super::super::ClientGone.into()),
+        Ok(Some(output)) => Ok(Some(output)),
+        Ok(None) => host.run(request, &mut entry.cursor),
+    };
     // Watchdog progress: a chunk (a call, or a whole prompt) completed.
     super::stall::tick();
     if matches!(outcome, Ok(None)) { return Ok(Chunk::More); }
@@ -53,7 +91,11 @@ pub(in crate::families::deepseek_v41::v41_native_serve) fn chunk<T, C, H: Host<T
     entry.cursor = host.rest();
     match outcome {
         Ok(Some(output)) => host.admit(entry.slot, request, output)?,
-        Err(error) => host.fail(request, error)?,
+        Err(error) => {
+            let reset = super::round_failure::needs_reset(&error);
+            host.fail(request, error)?;
+            if reset { host.reset_links()?; }
+        }
         Ok(None) => unreachable!(),
     }
     Ok(Chunk::Done)
@@ -111,14 +153,23 @@ mod tests {
         fn abort_and_drain(&mut self, _: &mut Cursor) -> Result<()> { Ok(()) }
     }
 
-    /// A prompt of `tokens`; `closed` once its client left.
-    struct Prompt { id: usize, tokens: usize, closed: Rc<RefCell<BTreeSet<usize>>> }
+    /// A prompt of `tokens`; `closed` once its client left; `packed` a packed
+    /// group's stored result.
+    struct Prompt { id: usize, tokens: usize, closed: Rc<RefCell<BTreeSet<usize>>>, packed: Option<Result<usize>> }
+    /// The links as the serve loop sees them: a call that fails part-way may
+    /// leave a wave unlanded (`dirty`) until `reset_links`; a call on dirty
+    /// links is the bug #2475's review found, so it panics.
     struct FakeHost { whole: bool, rows: usize, waves: usize, log: Rc<RefCell<Vec<(usize, Range<usize>)>>>,
-        leases: BTreeSet<usize>, admitted: Vec<(usize, usize)>, failed: Vec<usize>, sleep: Duration }
+        leases: BTreeSet<usize>, admitted: Vec<(usize, usize)>, failed: Vec<(usize, String)>, sleep: Duration,
+        resets: usize, dirty: bool, fault: Option<usize> }
     impl Host<Prompt, Cursor> for FakeHost {
         type Output = usize;
         fn run(&mut self, request: &mut Prompt, cursor: &mut Cursor) -> Result<Option<usize>> {
-            anyhow::ensure!(!request.closed.borrow().contains(&request.id), "client disconnected");
+            assert!(!self.dirty, "prompt {}'s call dispatched on links a failed pass left unreset", request.id);
+            if self.fault == Some(request.id) {
+                self.dirty = true;
+                anyhow::bail!("Spark exchange failed with waves in flight");
+            }
             let mut driver = Driver { tokens: request.tokens, rows: self.rows, waves: self.waves, id: request.id,
                 log: self.log.clone(), sleep: self.sleep };
             advance(&mut driver, cursor, self.whole)
@@ -128,24 +179,34 @@ mod tests {
             self.admitted.push((slot, request.id));
             Ok(())
         }
-        fn fail(&mut self, request: Prompt, _: anyhow::Error) -> Result<()> {
+        fn fail(&mut self, request: Prompt, error: anyhow::Error) -> Result<()> {
             assert!(self.leases.remove(&request.id), "released twice");
-            self.failed.push(request.id);
+            self.failed.push((request.id, format!("{error:#}")));
             Ok(())
+        }
+        fn reset_links(&mut self) -> Result<()> {
+            self.resets += 1;
+            self.dirty = false;
+            Ok(())
+        }
+        fn closed(&self, request: &Prompt) -> bool { request.closed.borrow().contains(&request.id) }
+        fn take_stored(&mut self, request: &mut Prompt) -> Option<Result<usize>> { request.packed.take() }
+        fn mark_recovered(&mut self, request: &mut Prompt) -> bool {
+            super::super::round_failure::mark_recovered(&mut request.packed)
         }
         fn rest(&self) -> Cursor { Cursor::default() }
     }
 
     fn host(share: f64, rows: usize, waves: usize) -> FakeHost {
         FakeHost { whole: share == 0.0, rows, waves, log: Rc::default(), leases: BTreeSet::new(), admitted: Vec::new(),
-            failed: Vec::new(), sleep: Duration::ZERO }
+            failed: Vec::new(), sleep: Duration::ZERO, resets: 0, dirty: false, fault: None }
     }
     fn queue(host: &mut FakeHost, share: f64, prompts: &[usize], closed: &Rc<RefCell<BTreeSet<usize>>>)
         -> PrefillQueue<Queued<Prompt, Cursor>> {
         let mut queue = PrefillQueue::new(share);
         for (id, &tokens) in prompts.iter().enumerate() {
             host.leases.insert(id);
-            queue.push(Queued { slot: 10 + id, request: Some(Prompt { id, tokens, closed: closed.clone() }),
+            queue.push(Queued { slot: 10 + id, request: Some(Prompt { id, tokens, closed: closed.clone(), packed: None }),
                 cursor: Cursor::default() });
         }
         queue
@@ -242,11 +303,88 @@ mod tests {
         assert!(queue.iter().all(|entry| entry.cursor.suffix.is_some()), "both mid-encoder");
         closed.borrow_mut().insert(0);
         round(&mut queue, &mut host);
-        assert_eq!(host.failed, [0]);
+        assert_eq!(host.failed, [(0, "client disconnected".to_owned())]);
+        assert_eq!(host.resets, 0, "a client that left between calls resets no link");
         assert!(!host.leases.contains(&0) && host.leases.contains(&1));
         assert_eq!(queue.iter().map(|entry| entry.slot).collect::<Vec<_>>(), [11], "slot 10 is free");
         while !queue.is_empty() { round(&mut queue, &mut host); }
         assert_eq!(host.admitted, [(11, 1)]);
         assert!(host.log.borrow().iter().filter(|(id, _)| *id == 0).count() == 1, "no call after the cancel");
+    }
+
+    fn ids(failed: &[(usize, String)]) -> Vec<usize> { failed.iter().map(|(id, _)| *id).collect() }
+
+    /// A client that left before its prompt's first call: no call runs and no
+    /// link resets (dev reset all three lanes here, #2475). Whole and shared.
+    #[test]
+    fn a_client_gone_before_dispatch_resets_nothing() {
+        for share in [0.0, 0.2] {
+            let mut host = host(share, 2752, 3);
+            let closed: Rc<RefCell<BTreeSet<usize>>> = Rc::new(RefCell::new(BTreeSet::from([0])));
+            let mut queue = queue(&mut host, share, &[20000, 900], &closed);
+            while !queue.is_empty() { round(&mut queue, &mut host); }
+            assert_eq!(host.failed, [(0, "client disconnected".to_owned())]);
+            assert_eq!(host.resets, 0);
+            assert!(host.log.borrow().iter().all(|(id, _)| *id == 1), "the closed prompt dispatched nothing");
+            assert_eq!(host.admitted, [(11, 1)]);
+        }
+    }
+
+    /// A call that fails part-way resets every link once, before the next
+    /// prompt's call; that prompt is unaffected.
+    #[test]
+    fn a_transport_fault_resets_once_before_the_next_call() {
+        let mut host = host(0.2, 2752, 3);
+        host.fault = Some(0);
+        let closed = Rc::default();
+        let mut queue = queue(&mut host, 0.2, &[20000, 900], &closed);
+        while !queue.is_empty() { round(&mut queue, &mut host); }
+        assert_eq!(ids(&host.failed), [0]);
+        assert_eq!(host.resets, 1);
+        assert_eq!(host.admitted, [(11, 1)]);
+    }
+
+    /// A packed pass that failed and a member whose client left: the links
+    /// reset once in the round's prologue, before the ineligible prompt packed
+    /// across (`C`) dispatches; every member reports the packed fault itself,
+    /// never "client disconnected", and nobody resets again. The review's
+    /// scenario on #2475: `A`, `C`, `B` queued, `A`+`B` packed, `A` left.
+    #[test]
+    fn a_packed_fault_with_a_departed_member_resets_once_before_any_call() {
+        for share in [0.0, 0.2] {
+            let mut host = host(share, 2752, 3);
+            let closed: Rc<RefCell<BTreeSet<usize>>> = Rc::new(RefCell::new(BTreeSet::from([0])));
+            let mut queue = queue(&mut host, share, &[600, 20000, 700], &closed);
+            for entry in queue.iter_mut().filter(|entry| entry.slot != 11) {
+                entry.request.as_mut().unwrap().packed = Some(Err(anyhow::anyhow!("packed prefill of 2 prompts: wire down")));
+            }
+            host.dirty = true;
+            recover_packed(&mut host, queue.iter_mut()).unwrap();
+            assert_eq!(host.resets, 1, "the failed group resets in the prologue");
+            while !queue.is_empty() { round(&mut queue, &mut host); }
+            assert_eq!(host.resets, 1, "its members are answered without a second reset");
+            assert_eq!(host.failed, [(0, "packed prefill of 2 prompts: wire down".to_owned()),
+                (2, "packed prefill of 2 prompts: wire down".to_owned())]);
+            assert_eq!(host.admitted, [(11, 1)]);
+        }
+    }
+
+    /// A packed pass that succeeded for a member whose client left: answered
+    /// as client-gone in its own chunk, no reset; its peer is admitted.
+    #[test]
+    fn a_departed_member_of_a_good_packed_pass_resets_nothing() {
+        let mut host = host(0.2, 2752, 3);
+        let closed: Rc<RefCell<BTreeSet<usize>>> = Rc::new(RefCell::new(BTreeSet::from([0])));
+        let mut queue = queue(&mut host, 0.2, &[600, 700], &closed);
+        for entry in queue.iter_mut() {
+            let request = entry.request.as_mut().unwrap();
+            request.packed = Some(Ok(request.id));
+        }
+        recover_packed(&mut host, queue.iter_mut()).unwrap();
+        round(&mut queue, &mut host);
+        assert_eq!(host.failed, [(0, "client disconnected".to_owned())]);
+        assert_eq!(host.admitted, [(11, 1)]);
+        assert_eq!(host.resets, 0);
+        assert!(host.log.borrow().is_empty(), "packed members make no call of their own");
     }
 }

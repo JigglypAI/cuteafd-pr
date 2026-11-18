@@ -1677,8 +1677,9 @@ mod tests {
             eprintln!("PASS serving distributed prefill chunk_rows={chunk_rows}: encoder/replay, draft handoff, cached continuation, target/draft commits");
         }
         {
-            // C1/C4/D1: a client disconnect mid-unit (queued chained work, the
-            // link lent out, windows selected on passes and their TP2 FFN).
+            // C1/C4/D1: a client disconnect during a units call (the link lent
+            // out, windows selected on passes and their TP2 FFN): the call
+            // drains and the prompt fails at the next call's boundary.
             use crate::shared::memory::row_window::RowWindow;
 
             let lease = requests.admit(0, 93500)?;
@@ -1805,7 +1806,7 @@ mod tests {
                     let mut link = DistributedTargetPass::take_link(&mut prefill_slots.slots[0].1)?;
                     let [(slot0, transport0), (slot1, transport1)] = &mut prefill_slots.slots[..] else { unreachable!() };
                     let result = runtime.block_on(unsafe {
-                        DistributedTargetPass::execute_encoder_units(vec![(slot0, transport0), (slot1, transport1)], &mut link, &mut requests, lease, &chunks, &mut suffix, &[], &|| true, &|| Ok(()))
+                        DistributedTargetPass::execute_encoder_units(vec![(slot0, transport0), (slot1, transport1)], &mut link, &mut requests, lease, &chunks, &mut suffix, &[], &|| Ok(()))
                     });
                     DistributedTargetPass::restore_link(&mut prefill_slots.slots[0].1, link)?;
                     result?;
@@ -1977,17 +1978,20 @@ mod tests {
             let [(slot0, transport0), (slot1, transport1)] = &mut prefill_slots.slots[..] else { unreachable!() };
             runtime.block_on(unsafe {
                 DistributedTargetPass::execute_encoder_units(vec![(slot0, transport0), (slot1, transport1)], &mut link, &mut requests, lease, &[&prompt[..3], &prompt[3..]], &mut cancelled_suffix, &[], &|| {
+                        // A fault injected at the second unit's begin, with the
+                        // first unit's chained work and waves still queued.
                         calls.set(calls.get() + 1);
-                        calls.get() < 12
-                    }, &|| Ok(()))
+                        anyhow::ensure!(calls.get() < 2, "injected encoder unit failure");
+                        Ok(())
+                    })
             })
         };
         DistributedTargetPass::restore_link(&mut prefill_slots.slots[0].1, link)?;
-        assert!(result.is_err(), "disconnected encoder units succeeded");
+        assert!(result.is_err(), "failed encoder units succeeded");
         assert!(requests.cache().request_id(lease).is_err());
         assert!(prefill_slots.slots.iter().all(|(slot, _)| slot.state == State::Idle));
         assert_eq!(lib.cuda_get_device()?, 0);
-        eprintln!("PASS disconnected distributed encoder stream revoked both active chunks");
+        eprintln!("PASS failed distributed encoder stream revoked both active chunks");
         // Cancel a reserved pass at a cooperative suspension. The guard revokes
         // its admission and resets both GPU-local lanes for subsequent reuse.
         let cancelled = requests.admit(0, 92002)?;
