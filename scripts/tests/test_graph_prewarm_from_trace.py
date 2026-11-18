@@ -2110,7 +2110,7 @@ def test_dense_qwen_engine_graph_lifetime_reconciliation_contract():
     assert 'self.enter_layer(index, step.rows)?' in graph
     assert 'capture("first_request")' in scheduler
     assert "nodes < 2" in graph
-    assert "spans_devices: false" in graph
+    assert 'spans_devices: super::super::graph_sites::spans("qwen3_5.segment", false)' in graph
     assert graph.count("device::observe_completed(") == 1
     assert "cache_ticket" in graph and "cache_commit" in graph
     assert "GraphOwner" in graph and "struct Executable" not in graph
