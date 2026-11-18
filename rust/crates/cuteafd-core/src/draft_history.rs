@@ -19,7 +19,7 @@
 //! the target judged it; a round that stopped for another reason (stop token,
 //! output limit, cancellation) is censored at its accepted prefix.
 //!
-//! **Length.** Positions are kept while their own `p_ik > 0.5`, each judged
+//! **Length.** Positions are kept while their own `p_ik > 0.3`, each judged
 //! alone (no running product), up to the first at or below one half.
 //!
 //! **Exploration.** One position past the stop is always verified, up to the
@@ -43,12 +43,9 @@
 //! starts at [`COPY_COLD_RATE`], so a cold copy verifies one explored position
 //! and grows as copies are accepted.
 //!
-//! `m = 8` equals the request window: a request whose whole window disagrees
-//! with the server moves a position's probability exactly half way from the
-//! server rate to its own, so eight straight misses at a position the server
-//! accepts 95% of the time give 0.475 (stop, keep exploring) and a single miss
-//! gives 0.84 (keep). Smaller `m` lets one or two misses cut a good position;
-//! larger `m` cannot suppress a position a request really keeps missing.
+//! The server prior fades to zero after three completed request rounds.
+//! Thereafter only the request's rolling eight-round window decides; an
+//! unreached position is unknown and becomes the explored stop.
 use serde::Serialize;
 use std::collections::{HashMap, VecDeque};
 
@@ -56,17 +53,26 @@ use std::collections::{HashMap, VecDeque};
 pub const REQUEST_WINDOW: usize = 8;
 /// Rounds that reached a position, server wide.
 pub const SERVER_WINDOW: usize = 256;
-/// Weight `m` of the server rate against the request's own counts, in rounds.
+/// Initial server pseudo-rounds before request-local evidence takes over.
+/// V4.1 full-trace card-order replay (20 requests/content):
+/// fade | prose tokens/rows | code-after-prose tokens/rows | mixed tokens/rows
+/// none | 1.97/6.77         | 4.96/6.61                    | 2.84/6.93
+/// 8    | 1.71/1.99         | 4.68/5.58                    | 2.50/3.20
+/// 3    | 1.70/1.84         | 4.65/5.41                    | 2.47/2.96
+/// 1    | 1.70/1.73         | 4.64/5.36                    | 2.43/2.77
 pub const PRIOR_STRENGTH: f64 = 8.;
+/// Completed verify rounds until server influence is exactly zero.
+pub const FADE_ROUNDS: u64 = 3;
 /// A position is kept while its probability is above this.
-pub const KEEP_CUT: f64 = 0.5;
+pub const KEEP_CUT: f64 = 0.3;
 /// A head-calibrated explore position below this is skipped for the round.
 /// The one place this threshold lives: retune it here from card data.
 pub const SKIP_CUT: f64 = 0.3;
 /// Server rate of a neural position nobody has reached yet.
 pub const NEURAL_COLD_RATE: f64 = 1.;
-/// Server rate of a copy position nobody has reached yet.
-pub const COPY_COLD_RATE: f64 = 0.5;
+/// Server rate of an unreached copy position: below KEEP_CUT=0.3 so a
+/// cold agreeing copy verifies only its explored first row, never all 32.
+pub const COPY_COLD_RATE: f64 = 0.25;
 
 /// What a drafter's confidence head reports per drafted position.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -335,11 +341,16 @@ struct Pending {
 
 #[derive(Clone, Debug, Default)]
 struct Request {
+    completed_rounds: u64,
     rounds: VecDeque<Round>,
     pending: Option<Pending>,
 }
 
 impl Request {
+    fn prior_strength(&self) -> f64 {
+        PRIOR_STRENGTH * (FADE_ROUNDS.saturating_sub(self.completed_rounds) as f64 / FADE_ROUNDS as f64)
+    }
+
     /// (accepted, reached) rounds of `position` in the request's window.
     fn counts(&self, track: usize, position: usize) -> (u32, u32) {
         let (mut accepted, mut reached) = (0, 0);
@@ -404,7 +415,11 @@ impl DraftHistory {
         let (accepted, reached) = request.counts(track, position);
         let window = &self.server[track][position];
         let server = window.rate(Self::cold(track));
-        Planned { p: (f64::from(accepted) + PRIOR_STRENGTH * server) / (f64::from(reached) + PRIOR_STRENGTH),
+        let prior = request.prior_strength();
+        let denominator = f64::from(reached) + prior;
+        // Unknown after the fade: stop here and explore this position.
+        let p = if denominator == 0. { 0. } else { (f64::from(accepted) + prior * server) / denominator };
+        Planned { p,
             accepted, reached, server, server_reached: window.len as u32 }
     }
 
@@ -584,6 +599,7 @@ impl DraftHistory {
             self.stats.short_rounds += u64::from(proposed <= 1 && pending.room.min(self.spec.block) > 1);
             if let Some(bucket) = self.stats.length_histogram.get_mut(proposed) { *bucket += 1; }
             if request.rounds.len() == REQUEST_WINDOW { request.rounds.pop_front(); }
+            request.completed_rounds = request.completed_rounds.saturating_add(1);
             request.rounds.push_back(Round { reached: reached.map(|n| n as u8), accepted: kept.map(|n| n as u8) });
             if trace {
                 let mut positions = Vec::with_capacity(proposed);
@@ -633,7 +649,7 @@ impl DraftHistory {
         serde_json::json!({
             "policy": self.control.label(), "block": self.spec.block, "head": self.spec.head,
             "copy_positions": self.spec.copy, "request_window": REQUEST_WINDOW, "server_window": SERVER_WINDOW,
-            "prior_strength": PRIOR_STRENGTH, "active_requests": self.requests.len(),
+            "prior_strength": PRIOR_STRENGTH, "fade_rounds": FADE_ROUNDS, "active_requests": self.requests.len(),
             "rounds": self.stats.rounds, "verified_drafts": self.stats.verified_drafts,
             "accepted_drafts": self.stats.accepted_drafts, "short_rounds": self.stats.short_rounds,
             "short_share": self.stats.short_share(),
@@ -704,8 +720,8 @@ mod tests {
             policy.plan(&[(1, 1)], 64);
             policy.observe(&[outcome(1, 1, accepted)], false);
         }
-        let server = (3. + 2.) / (4. + 3.);
-        assert!((policy.probability(1, 0) - (2. + PRIOR_STRENGTH * server) / (3. + PRIOR_STRENGTH)).abs() < 1e-12);
+        assert_eq!(policy.requests[&1].prior_strength(), 0.);
+        assert!((policy.probability(1, 0) - 2. / 3.).abs() < 1e-12);
     }
 
     #[test]
@@ -726,6 +742,40 @@ mod tests {
         assert_eq!(positions.iter().map(|p| p.outcome).collect::<Vec<_>>(), [Some(true), Some(true), Some(false)]);
         // Position 2 was explored from the second round on: one miss already puts it under the cut.
         assert_eq!((policy.stats().explored, policy.stats().explore_accepted), (8, 0));
+    }
+
+    #[test]
+    fn server_prior_fades_exactly_to_zero_and_unknown_positions_explore() {
+        let mut policy = policy(7);
+        assert_eq!(Request::default().prior_strength(), 8.);
+        for round in 0..12 {
+            policy.plan(&[(1, 1)], 64);
+            policy.observe(&[outcome(1, 1, 1)], false);
+            let request = &policy.requests[&1];
+            if round + 1 >= FADE_ROUNDS as usize { assert_eq!(request.prior_strength(), 0.); }
+        }
+        assert_eq!(policy.probability(1, 1), 0., "unreached suffix must not inherit the server after fade");
+        assert_eq!(policy.plan(&[(1, 7)], 64), [2], "one known position plus unknown explore");
+    }
+
+    #[test]
+    fn prose_request_overcomes_code_conditioned_server_within_its_window() {
+        let mut policy = policy(7);
+        for _ in 0..40 {
+            policy.plan(&[(9, 7)], 64);
+            policy.observe(&[outcome(9, 7, 7)], false);
+        }
+        // First position always agrees; each subsequent position agrees with
+        // probability .3. This deterministic ten-round cycle reaches P2 on
+        // every round and accepts it exactly three times.
+        let accepted = [1, 1, 2, 1, 1, 2, 1, 1, 2, 1];
+        let mut shortened = None;
+        for round in 0..REQUEST_WINDOW {
+            let depth = policy.plan(&[(1, 7)], 64)[0];
+            policy.observe(&[outcome(1, depth, accepted[round].min(depth))], false);
+            if policy.plan(&[(1, 7)], 64)[0] <= 3 { shortened = Some(round + 1); break; }
+        }
+        assert!(shortened.is_some(), "code-conditioned prior prevents request adaptation");
     }
 
     #[test]
@@ -977,10 +1027,25 @@ mod tests {
         // Three anchors plus five drafts: the explores (lowest probability) go first.
         assert_eq!(policy.plan(&requests, 8), [4, 1, 0]);
         policy.observe(&[outcome(1, 4, 4), outcome(2, 1, 1), outcome(3, 0, 0)], false);
-        // Three drafts: request 2's first position outranks request 1's second.
-        let p = |policy: &DraftHistory, id, position| policy.probability(id, position);
-        assert!(p(&policy, 2, 0) > p(&policy, 1, 1) && p(&policy, 1, 1) > p(&policy, 2, 1));
-        assert_eq!(policy.plan(&requests, 6), [2, 1, 0]);
+        // Allocate by probability, not a fixture-specific cross-position rank.
+        let mut unbounded = policy.clone();
+        let wanted = unbounded.plan(&requests, 64);
+        let granted = policy.plan(&requests, 6);
+        assert_eq!(granted.iter().sum::<usize>(), 3);
+        // Only each prefix's next row is eligible: a later p=1 cannot
+        // outrank another request before its lower-p predecessor is granted.
+        let mut replayed = vec![0usize; requests.len()];
+        for _ in 0..granted.iter().sum::<usize>() {
+            let eligible: Vec<_> = requests.iter().enumerate().filter(|(index, _)| replayed[*index] < wanted[*index])
+                .map(|(index, &(id, _))| (index, unbounded.probability(id, replayed[index]))).collect();
+            let best = eligible.iter().map(|(_, p)| *p).fold(f64::NEG_INFINITY, f64::max);
+            let chosen = eligible.iter().filter(|(index, p)| *p == best && replayed[*index] < granted[*index])
+                .min_by_key(|(index, _)| (replayed[*index], requests[*index].0))
+                .expect("granted prefix must include a highest-probability eligible row").0;
+            assert!(eligible.iter().all(|(_, p)| best >= *p));
+            replayed[chosen] += 1;
+        }
+        assert_eq!(replayed, granted);
         let cut = policy.stats().budget_cut;
         assert!(cut >= 4);
         policy.observe(&[outcome(1, 2, 2), outcome(2, 1, 1), outcome(3, 0, 0)], false);
