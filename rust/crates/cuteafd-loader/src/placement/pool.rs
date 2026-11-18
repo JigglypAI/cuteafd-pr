@@ -58,14 +58,19 @@ impl PoolFacts {
 
 pub(super) fn resolve_bounds(context: u64, target: Option<u64>)
     -> Result<cuteafd_core::memory_policy::KvBounds, cuteafd_core::memory_policy::PolicyError> {
+    resolve_bounds_with_source(context, target).map(|(bounds, _)| bounds)
+}
+
+fn resolve_bounds_with_source(context: u64, target: Option<u64>)
+    -> Result<(cuteafd_core::memory_policy::KvBounds, bool), cuteafd_core::memory_policy::PolicyError> {
     let mut policy = MemoryPolicy::current();
     policy.kv_target = target.or(policy.kv_target);
-    policy.kv(context)
+    Ok((policy.kv(context)?, policy.kv_min.is_some()))
 }
 
 /// The only policy resolution entry point for plan and runtime preparation.
 pub fn prepare_pool(facts: PoolFacts) -> Result<PoolPolicy, cuteafd_core::memory_policy::PolicyError> {
-    let bounds = resolve_bounds(facts.context.maximum, facts.target)?;
+    let (bounds, floor_configured) = resolve_bounds_with_source(facts.context.maximum, facts.target)?;
     let raw_requested = PoolPolicy::normalize_request(facts.requested);
     let requested = raw_requested.map(|tokens| {
         // A raw pin below context must retain its typed refusal, not round into validity.
@@ -87,6 +92,7 @@ pub fn prepare_pool(facts: PoolFacts) -> Result<PoolPolicy, cuteafd_core::memory
         context: facts.context, compiled_context: facts.context.maximum, raw_requested, requested,
         target: bounds.target.max(facts.context.required()),
         floor: requested.unwrap_or(bounds.min).max(facts.context.required()),
+        floor_configured,
         ceiling: extent,
         max: requested.or(bounds.max), unit_rows: facts.unit_rows,
     })
@@ -104,6 +110,8 @@ pub struct PoolPolicy {
     pub(super) target: u64,
     /// Admission refuses below this (`KV_MIN_TOKENS` and any pinned context).
     pub(super) floor: u64,
+    #[serde(default)]
+    pub(super) floor_configured: bool,
     /// The largest pool the build can index; a fixed onboard fills up to it.
     pub(super) ceiling: u64,
     /// After an automatic layout is fixed for the target, the pool grows into
