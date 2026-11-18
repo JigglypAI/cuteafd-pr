@@ -517,7 +517,7 @@ fn prefill_packed_admissions<'w, 'a, P: ServingTarget<'w, 'a>>(
                 let completion = prefill_packing::finish_members(indices.len(), |_| scores.next()
                     .context("missing packed member scores"), &mut |member, scores| {
                         let i = indices[member];
-                        let result = if admitted[i].0.job.events.is_closed() { Err(anyhow::anyhow!("client disconnected")) }
+                        let result = if admitted[i].0.job.events.is_closed() { Err(round_failure::ClientGone.into()) }
                             else { out.insert(i, Ok(scores)); Ok(()) };
                         Ok(result)
                     });
@@ -667,7 +667,7 @@ impl<'w, 'a, P: ServingTarget<'w, 'a>> queue::Host<Waiting<'a>, super::prefill_t
         -> Result<Option<RetainedScores>> {
         let Waiting { prepared, lease, cached, hit_scores, packed, .. } = waiting;
         let (job, prompt, lease) = (&prepared.job, prepared.prompt.as_slice(), *lease);
-        ensure!(!job.events.is_closed(), "client disconnected");
+        ensure!(!job.events.is_closed(), round_failure::ClientGone);
         let first_call = cursor.at_start();
         // A scoring probe scores before anything else (it never packs) and
         // always ends its request (`ScoringDone`).
@@ -760,8 +760,16 @@ impl<'w, 'a, P: ServingTarget<'w, 'a>> queue::Host<Waiting<'a>, super::prefill_t
         if events.is_closed() { ticket.cancel() } else { ticket.fail(0) }
         tracing::warn!(%error, "native request admission failed");
         self.release(lease, id);
-        P::reset_connections(self.first_transport)?; P::reset_connections(self.second_transport)?;
-        for (_, transport) in self.prefill.slots.iter_mut() { P::reset_connections(transport)?; }
+        // A client that left before this prompt's first transport call dispatched
+        // nothing, so there is no half-sent wave to recover from: resetting here
+        // tore down all three expert RoCE lanes (~2.8 s each) for every abandoned
+        // request. Every other admission failure keeps today's reset.
+        round_failure::admission_failed(&error, || {
+            P::reset_connections(self.first_transport)?;
+            P::reset_connections(self.second_transport)?;
+            for (_, transport) in self.prefill.slots.iter_mut() { P::reset_connections(transport)?; }
+            Ok(())
+        })?;
         Ok(())
     }
 

@@ -67,6 +67,16 @@ pub(super) fn fail_request<M: RoundMember>(active: &mut [Option<M>],
     true
 }
 
+/// The client left before this prompt's first transport call: nothing was
+/// dispatched, so only this request's owners are released.
+///
+/// The Display text is byte-identical to the string this site produced before
+/// the type existed, so the log line `native request admission failed
+/// error=client disconnected` and the client-facing message do not move.
+#[derive(Debug, thiserror::Error)]
+#[error("client disconnected")]
+pub(super) struct ClientGone;
+
 /// Reset only after a round-wide fault; callers invoke this after both lanes
 /// drain. The callback keeps the classification and reset decision inseparable.
 pub(super) fn handle<M: RoundMember>(active: &mut [Option<M>], error: &anyhow::Error,
@@ -81,6 +91,15 @@ pub(super) fn handle<M: RoundMember>(active: &mut [Option<M>], error: &anyhow::E
         }
     }
     fail_round(active, error);
+    reset()
+}
+
+/// An admission that never dispatched a wave needs no transport recovery: only
+/// a [`ClientGone`] is skipped, every other admission failure keeps the reset.
+/// The callback is the caller's whole reset block, so one call = one teardown.
+pub(super) fn admission_failed(error: &anyhow::Error,
+    reset: impl FnOnce() -> anyhow::Result<()>) -> anyhow::Result<()> {
+    if error.downcast_ref::<ClientGone>().is_some() { return Ok(()); }
     reset()
 }
 
@@ -581,5 +600,36 @@ pub(super) mod tests {
         let source = include_str!("../scheduler.rs");
         assert_eq!(source.matches("round_failure::handle(").count(), 1);
         assert_eq!(source.matches("round_failure::retire_done(").count(), 1);
+    }
+
+    /// `Round::fail` used to reset every transport for every admission error, so
+    /// one abandoned request cost three lane rebuilds (12 `expert RoCE endpoint
+    /// selected`, 3 `Spark exchange worker started`, ~2.8 s of serve-loop stall).
+    /// A client that left before the prompt's first transport call dispatched
+    /// nothing, so it must reset nothing.
+    #[test]
+    fn a_client_gone_admission_failure_resets_no_transport() {
+        let mut resets = 0;
+        admission_failed(&anyhow::Error::new(ClientGone), || { resets += 1; Ok(()) }).unwrap();
+        assert_eq!(resets, 0, "a client that left before dispatch must not tear down the lanes");
+        admission_failed(&anyhow::anyhow!("native GPU execution failed"), || { resets += 1; Ok(()) }).unwrap();
+        assert_eq!(resets, 1, "every other admission failure keeps today's reset");
+        assert_eq!(format!("{}", ClientGone), "client disconnected",
+            "the log line and the client message must not move");
+    }
+
+    /// The guard must be WIRED, not merely available: `Round::fail`'s three
+    /// resets live inside `admission_failed`'s closure and nowhere else.
+    #[test]
+    fn round_fail_routes_every_reset_through_the_client_gone_guard() {
+        let source = include_str!("../scheduler.rs");
+        let start = source.find("fn fail(&mut self, waiting: Waiting<'a>").expect("Round::fail");
+        let end = start + source[start..].find("fn rest(&self)").expect("end of Round::fail");
+        let fail = &source[start..end];
+        let (before, after) = fail.split_once("admission_failed(&error, || {")
+            .expect("a client-gone admission failure must not reset the transports");
+        assert!(!before.contains("P::reset_connections"), "a reset outside the guard: {before}");
+        assert_eq!(after.matches("P::reset_connections").count(), 3,
+            "all three resets stay inside the guard: {after}");
     }
 }
