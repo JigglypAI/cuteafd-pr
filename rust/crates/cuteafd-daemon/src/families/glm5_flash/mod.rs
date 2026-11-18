@@ -2919,6 +2919,7 @@ impl Opened {
             &execution, step_experts)?;
         probe("engine")?;
         engine.admitted_host = admitted_host;
+        engine.attention_precision = args.attention.attention_precision;
         engine.max_pool_tokens_no_onboard = placement.max_pool_tokens_no_onboard;
         engine.attention_plan = attention_plan;
         engine.spark_bf16 = self.checkpoint.spark_input_is_bf16();

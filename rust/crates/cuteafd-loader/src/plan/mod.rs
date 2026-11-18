@@ -356,7 +356,7 @@ pub struct PlanReport {
     pub max_pool_tokens_no_onboard: Option<u64>,
     /// Resolved decode views, independent of prefill units in flight.
     pub decode_lanes: u8,
-    /// Resolved prefill attention precision (`ATTENTION_PRECISION`); absent without a family.
+    /// Resolved attention QK/PV precision (`ATTENTION_PRECISION`); absent without a family.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub attention_precision: Option<attention_precision::Resolved>,
     /// This layout captures CUDA graphs whose kernel nodes run on more than
