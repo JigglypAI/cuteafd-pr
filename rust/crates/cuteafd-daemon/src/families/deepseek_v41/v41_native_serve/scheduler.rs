@@ -978,6 +978,16 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
                     if let Some(live) = console::live() {
                         live.push(console_gauges(&active, requests, &prefixes, receive.len(), Some(false)));
                     }
+                    // The throttled stats publish above can be up to 1 s stale and
+                    // the loop is about to block with nothing admitted, so publish
+                    // the final serving stats too: otherwise `/v1/stats` keeps a
+                    // non-zero `prefill_queue.prefilling` while the queue is empty.
+                    // `prefills.len()` is 0 here (it counts in `busy_slots`).
+                    if let Ok(mut slot) = stats.lock() {
+                        *slot = serving_stats(&prefixes, &kv_waiter, &media, prefills.len(), &reserve,
+                            active.iter().flatten().filter(|r| r.stalled).count());
+                        stats_published = Instant::now();
+                    }
                     match receive.blocking_recv() {
                         Some(job) => {
                             stall::mark(stall::Phase::Admission, 1);
@@ -2908,6 +2918,22 @@ mod sampling_tests {
         assert!(serve.contains("+ prefills.len();"));
         assert!(serve.contains("media_slots: media.len() + prefills.len(),"));
         assert!(serve.contains("&& prefills.is_empty() { break; }"));
+    }
+
+    /// `/v1/stats` is refreshed by a throttled (1 s) publish in the serve loop.
+    /// When the last prompt finishes less than 1 s after that publish, the loop
+    /// blocks in `receive.blocking_recv()` with nothing admitted and the stats
+    /// keep the old non-zero `prefill_queue.prefilling` until the next request
+    /// arrives. Going idle must publish the serving stats, as it already pushes
+    /// the console gauges.
+    #[test]
+    fn going_idle_publishes_the_serving_stats() {
+        let source = include_str!("scheduler.rs");
+        let code = source.split("#[cfg(test)]\nmod sampling_tests").next().unwrap();
+        let start = code.find("// Going idle: publish final occupancy").expect("the idle site");
+        let idle = &code[start..start + code[start..].find("receive.blocking_recv()").expect("the idle wait")];
+        assert!(idle.contains("stats.lock()") && idle.contains("serving_stats("),
+            "going idle must publish the serving stats (prefill_queue.prefilling stays stale otherwise): {idle}");
     }
 
     /// The lanes stop at their first completed boundary past the debt: an independent
