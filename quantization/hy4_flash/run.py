@@ -43,6 +43,9 @@ EXPERT_ROWS = 2048
 PILOT_POLICY = {"include_head", "include_kv_b", "k6_drafter_bits"}
 LEGACY_EXPERT_SPOOL_COMMIT = "3c5ee4bb0cecedacdf87006bf336f96719ffc3d2"
 LEGACY_EXPERT_SPOOL_FILES = ("quantization/hy4_flash/run.py", "quantization/hy4_flash/storage.py")
+RESIDENT_EXPERTS_COMMIT = "495873eaa903490d11bdb2df80392520204dc83a"
+LEGACY_GPTQMODEL_COMMIT = "6b7f7c48d6be9a3737958e1dac3b94b8ce251695"
+BATCHED_HESSIAN_COMMIT = "d606eaccc7fe026b8c83e97a8a8693f6e364e21b"
 
 
 def read_json(path):
@@ -97,31 +100,50 @@ def identity(source, corpus, pilot):
                 drafter_anchor="last-committed-target-state-k8-head-greedy-bonus")
 
 
+def resident_code_at(commit):
+    return {path: hashlib.sha256(subprocess.check_output(
+        ["git", "show", f"{commit}:{path}"], cwd=REPO)).hexdigest()
+        for path in LEGACY_EXPERT_SPOOL_FILES}
+
+
 def checkpoint_identity(root, candidate, *, resume_legacy):
-    """Keep the sealed numerical identity and record the resident replay code."""
+    """Retain the sealed numerical identity across reviewed backend transitions."""
     identity_path = root / "identity.json"
     recovery_path = root / "resident-expert-recovery.json"
+    batched_path = root / "batched-hessian-recovery.json"
     if not identity_path.exists():
-        if resume_legacy or recovery_path.exists():
+        if resume_legacy or recovery_path.exists() or batched_path.exists():
             raise ValueError("Hy4 resident recovery requires an existing numerical identity")
         atomic_json(identity_path, candidate)
         return candidate
     frozen = read_json(identity_path)
-    if frozen == candidate and not recovery_path.exists():
+    if frozen == candidate and not recovery_path.exists() and not batched_path.exists():
         return frozen
     if not resume_legacy:
         raise ValueError("Hy4 legacy expert recovery requires --resume-legacy-expert-spool")
 
-    files = candidate["code"]["files"].copy()
-    for path in LEGACY_EXPERT_SPOOL_FILES:
-        original = subprocess.check_output(["git", "show", f"{LEGACY_EXPERT_SPOOL_COMMIT}:{path}"], cwd=REPO)
-        files[path] = hashlib.sha256(original).hexdigest()
-    legacy = candidate | {"code": candidate["code"] | {"files": files}}
+    frozen_fork, candidate_fork = frozen["code"]["fork"], candidate["code"]["fork"]
+    batched = frozen_fork != candidate_fork
+    if batched and (frozen_fork, candidate_fork) != (LEGACY_GPTQMODEL_COMMIT, BATCHED_HESSIAN_COMMIT):
+        raise ValueError("Hy4 recovery only accepts the reviewed batched Hessian fork change")
+    files = candidate["code"]["files"] | resident_code_at(LEGACY_EXPERT_SPOOL_COMMIT)
+    legacy = candidate | {"code": candidate["code"] | {"files": files, "fork": frozen_fork}}
     if frozen != legacy:
         raise ValueError("Hy4 numerical or unrelated code identity differs from the sealed run")
+
     expected = dict(schema="hy4-resident-experts-v1", legacy_commit=LEGACY_EXPERT_SPOOL_COMMIT,
                     code={path: candidate["code"]["files"][path] for path in LEGACY_EXPERT_SPOOL_FILES},
                     frozen_identity_sha256=hashlib.sha256(identity_path.read_bytes()).hexdigest())
+    if batched:
+        previous = expected | {"code": resident_code_at(RESIDENT_EXPERTS_COMMIT)}
+        if not recovery_path.is_file() or read_json(recovery_path) != previous:
+            raise ValueError("Hy4 batched Hessian recovery needs the sealed resident backend receipt")
+        recovery_path = batched_path
+        expected = expected | dict(schema="hy4-batched-hessian-v1", fork_commit=candidate_fork,
+                                   prior_backend_commit=RESIDENT_EXPERTS_COMMIT)
+    elif batched_path.exists():
+        raise ValueError("Hy4 batched Hessian recovery already owns this run")
+
     if recovery_path.exists():
         if read_json(recovery_path) != expected:
             raise ValueError("Hy4 resident recovery code differs from the committed backend")
@@ -766,6 +788,9 @@ class Runner:
         recovery = self.root / "resident-expert-recovery.json"
         if recovery.is_file():
             complete["resident_expert_recovery"] = read_json(recovery)
+        batched = self.root / "batched-hessian-recovery.json"
+        if batched.is_file():
+            complete["batched_hessian_recovery"] = read_json(batched)
         atomic_json(self.root / "numerical-complete.json", complete)
         atomic_json(self.root / "status.json", dict(self.progress.base, status="passed",
                     phase="numerical_complete", updated_at=datetime.now(timezone.utc).isoformat()))
