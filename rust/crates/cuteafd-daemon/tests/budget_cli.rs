@@ -1230,7 +1230,7 @@ fn installed_release_and_example_families_match_dev_d6aecfcb7() {
         (expected_absent.0.to_owned(), expected_absent.1.to_owned())]));
     assert_eq!(installed.iter().map(|(model, revision)| (model.as_str(), revision.as_str()))
         .collect::<std::collections::BTreeSet<_>>(), expected_installed);
-    assert_eq!(tested, 38, "installed checkpoint revision set changed (including repaired MC and three live Inkling revisions)");
+    assert_eq!(tested, 39, "installed checkpoint revision set changed (including repaired MC, K3.25 MC and three live Inkling revisions)");
     eprintln!("family detection baseline d6aecfcb7 plus deliberate MiniMax (#2081), Muse MC, Kimi K3.1 MC, repaired MC and three live Inkling entries: {tested} installed checkpoint revisions verified");
 }
 
