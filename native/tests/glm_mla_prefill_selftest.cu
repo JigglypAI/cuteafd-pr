@@ -59,7 +59,7 @@ int main(int argc, char** argv) {
   const char* pattern = argc > 6 ? argv[6] : "mixed";
   const int topk = argc > 7 ? std::atoi(argv[7]) : (rec == 656 ? 2048 : 2112);
   const int slots = 12288, dq = rec == 656 ? 576 : 512;
-  if (rows < 1 || iterations < 1 || topk < 1 || topk > slots || heads < 32 || heads % 32 ||
+  if (rows < 1 || iterations < 1 || topk < 1 || topk >= slots || heads < 32 || heads % 32 ||
       (rec != 656 && rec != 528) || (std::strcmp(pattern, "mixed") && std::strcmp(pattern, "spread") &&
       std::strcmp(pattern, "medium") && std::strcmp(pattern, "peaked"))) return 2;
   const bool rope = rec == 656;
@@ -100,11 +100,12 @@ int main(int argc, char** argv) {
   }
   // Selections: most rows full, some short; ~1% masked entries.
   std::vector<int32_t> indices(size_t(rows) * topk, -1), lengths(rows);
-  std::vector<int32_t> perm(slots);
-  for (int i = 0; i < slots; ++i) perm[i] = i;
+  // Slot zero is never selected, so poisoning it tests masked-record isolation.
+  std::vector<int32_t> perm(slots - 1);
+  for (int i = 0; i < slots - 1; ++i) perm[i] = i + 1;
   for (int row = 0; row < rows; ++row) {
     lengths[row] = uniform(rng) < 0.8f ? topk : 1 + int(uniform(rng) * (topk - 1));
-    for (int i = 0; i < lengths[row]; ++i) std::swap(perm[i], perm[i + int(uniform(rng) * (slots - i))]);
+    for (int i = 0; i < lengths[row]; ++i) std::swap(perm[i], perm[i + int(uniform(rng) * (slots - 1 - i))]);
     for (int i = 0; i < lengths[row]; ++i) indices[size_t(row) * topk + i] = uniform(rng) < 0.01f ? -1 : perm[i];
   }
   if (rows > 1) lengths[0] = 0;
@@ -255,6 +256,23 @@ int main(int argc, char** argv) {
     CHECK(cudaStreamSynchronize(stream));
     CHECK(cudaMemcpy(again.data(), dout, out_elems * 2, cudaMemcpyDeviceToHost));
     const bool same = std::memcmp(again.data(), out.data(), out_elems * 2) == 0;
+    // Rebase the final row onto a one-row launch; it must keep the same arithmetic.
+    const int last = rows - 1;
+    CHECK(cudaError_t(cuteafd_glm_mla_prefill_lse(static_cast<uint16_t*>(dq_) + size_t(last) * heads * dq,
+        dkv, static_cast<int32_t*>(dind) + size_t(last) * topk, static_cast<int32_t*>(dlen) + last,
+        dout, 1, heads, topk, rec, scale_log2, kernel, stream, dlse)));
+    CHECK(cudaStreamSynchronize(stream));
+    CHECK(cudaMemcpy(again.data(), dout, size_t(heads) * 512 * 2, cudaMemcpyDeviceToHost));
+    const bool row_invariant = std::memcmp(again.data(), out.data() + size_t(last) * heads * 512,
+                                          size_t(heads) * 512 * 2) == 0;
+    CHECK(cudaMemsetAsync(dkv, 0x7f, rec, stream));
+    CHECK(cudaError_t(cuteafd_glm_mla_prefill_lse(dq_, dkv, dind, dlen, dout, rows, heads, topk, rec, scale_log2,
+                                                kernel, stream, dlse)));
+    CHECK(cudaStreamSynchronize(stream));
+    CHECK(cudaMemcpy(again.data(), dout, out_elems * 2, cudaMemcpyDeviceToHost));
+    const bool poison_safe = std::memcmp(again.data(), out.data(), out_elems * 2) == 0;
+    CHECK(cudaMemcpyAsync(dkv, kv.data(), rec, cudaMemcpyHostToDevice, stream));
+    CHECK(cudaStreamSynchronize(stream));
     std::vector<float> times;
     for (int it = 0; it < iterations + 2; ++it) {
       CHECK(cudaEventRecord(a, stream));
@@ -266,13 +284,15 @@ int main(int argc, char** argv) {
       if (it >= 2) times.push_back(ms);
     }
     std::sort(times.begin(), times.end());
-    const double rel = std::sqrt(err2 / ref2);
+    const double rel = ref2 > 0 ? std::sqrt(err2 / ref2) : std::sqrt(err2);
     std::printf("%-10s rec %d heads %d rows %d: max abs err %.3e rel RMS %.3e vs F32%s LSE max %.3e | rel L2 vs f16 %.3e | "
                 "deterministic %s | %.3f ms (min %.3f)\n",
                 names[kernel], rec, heads, rows, max_abs, rel, finite ? "" : " NON-FINITE", lse_max,
                 base_ref2 > 0 ? std::sqrt(base_err2 / base_ref2) : 0.0, same ? "yes" : "NO", times[times.size() / 2],
                 times[0]);
-    failures += !finite || !same || rel > 0.05;
+    std::printf("  row invariant %s | slot-zero poison %s\n", row_invariant ? "yes" : "NO",
+                poison_safe ? "yes" : "NO");
+    failures += !finite || !same || !row_invariant || !poison_safe || rel > 0.05 || (kernel == 2 && lse_max > 3e-4);
   }
   CHECK(cudaEventDestroy(a));
   CHECK(cudaEventDestroy(b));
