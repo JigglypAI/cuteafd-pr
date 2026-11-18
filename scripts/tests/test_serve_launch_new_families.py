@@ -470,8 +470,9 @@ def test_kimi_example_config_launches_through_run_family(tmp_path: Path) -> None
     assert _flag(serve, "--max-context-tokens") == "auto"
 
 
-@pytest.mark.parametrize("recipe", ["example", "release", "gate"])
+@pytest.mark.parametrize("recipe", ["example", "release"])
 def test_kimi_min_recipe_launches_one_physical_owner_with_pinned_prefill_shape(tmp_path: Path, recipe: str) -> None:
+    # The gate kit retired the K3 min card in v6 (K3 keeps its max card only).
     path = ROOT / "examples/configs/kimi-k3-exl3-k6-min.config"
     values = _keys(path)
     if recipe != "example":
@@ -515,13 +516,22 @@ def test_kimi_min_recipe_launches_one_physical_owner_with_pinned_prefill_shape(t
 
 # --- the gate card -------------------------------------------------------------
 
-@pytest.mark.parametrize("size,gpus", [("min", [0]), ("max", [0, 1])])
-def test_kimi_gate_card_lists_and_generates_a_wip_launch(tmp_path: Path, size: str, gpus: list[int]) -> None:
-    card = cards.load_cards(ROOT / "scripts/bench/kits/gate", [f"kimi-k3-{size}"])[0]
+KIMI_K31_ID = "wrldsuksgo2mars/Kimi-K3.1-Pro-EXL3-K2-MC"
+
+
+@pytest.mark.parametrize("stem,size,gpus", [
+    ("kimi-k3", "max", [0, 1]),
+    ("kimi-k31-mc", "min", [0]),
+    ("kimi-k31-mc", "max", [0, 1]),
+])
+def test_kimi_gate_card_lists_and_generates_a_wip_launch(tmp_path: Path, stem: str, size: str,
+                                                         gpus: list[int]) -> None:
+    card = cards.load_cards(ROOT / "scripts/bench/kits/gate", [f"{stem}-{size}"])[0]
     assert card["family"] == "kimi_k3" and card["gpus"] == gpus
     assert card["sparks"] == ["ostrich", "dodo", "emu", "kiwi", "rhea", "moa"]
     assert card["profile"] == "smoke"
-    assert cards.config(card["config"])["MODEL_ID"] == "wrldsuksgo2mars/Kimi-K3-EXL3-K2-Core-K6"
+    k3 = stem == "kimi-k3"
+    assert cards.config(card["config"])["MODEL_ID"] == (KIMI_K6_ID if k3 else KIMI_K31_ID)
     assert cards.slot_needs(card)["coordinator"] == cards.slot_needs(card)["spark"] == ["exl3/exl3-kimik3-k23"]
     key = tmp_path / "key"
     key.write_text("k" * 64 + "\n")
@@ -529,11 +539,18 @@ def test_kimi_gate_card_lists_and_generates_a_wip_launch(tmp_path: Path, size: s
     job = cards.generate(card, "cand", {"instance": "t", "slot": "s"}, tmp_path, key, {}, {"fabric"}, None, 1)
     values = cards.config(Path(job["entry"]["config"]))
     assert job["entry"]["run_args"] == ["--wip", "s"]
-    assert (values["SPARK_COUNT"], values["RTX_GPUS"], values["SPECULATOR"]) == ("6", str(len(gpus)), "dflash2")
+    assert (values["SPARK_COUNT"], values["RTX_GPUS"]) == ("6", str(len(gpus)))
     assert values["COORDINATOR_GPUS"] == ",".join(map(str, gpus))
-    if size == "min":
-        assert values["SPARK_MEMORY_CAP"] == str(110 << 30)
+    if k3:
+        assert values["SPECULATOR"] == "dflash2"
+        if size == "min":
+            assert values["SPARK_MEMORY_CAP"] == str(110 << 30)
+        else:
+            assert "SPARK_MEMORY_CAP" not in values
     else:
+        # The shipped K3.1 config selects the checkpoint's block DSpark.
+        assert values["SPECULATOR"] == "auto"
+        assert values["CORE_VIEW"] == ("k6-compact" if size == "min" else "original")
         assert "SPARK_MEMORY_CAP" not in values
     assert not any(key.endswith("_LANE_B") for key in values)
 
