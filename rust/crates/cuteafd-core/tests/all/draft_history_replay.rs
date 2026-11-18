@@ -144,8 +144,8 @@ fn code_first_requests_adapt_with_fewer_rows_without_losing_prose_tokens() {
     let old = code_first_reference(false);
     let rows = |tally: Tally| (tally.drafts + tally.rounds) as f64 / tally.rounds as f64;
     let tokens = |tally: Tally| tally.tokens as f64 / tally.rounds as f64;
-    // Stable unchanged sample: adaptive prose rows4.3993 vs constant8 5.1124
-    // (0.8605x), code tokens3094/3138 (0.986x), prose2006/2030 (0.988x).
+    // Stable unchanged sample: fade3/stop.3 prose rows4.0935 vs constant8 5.1124
+    // (0.801x), code tokens3108/3138 (0.990x), prose2087/2030 (1.028x).
     eprintln!("code-first fade3-stop03 {tallies:?}; constant8 {old:?}");
     assert!(rows(tallies[0]) <= 0.90 * rows(old[0]), "prose rows must fall by at least ten percent");
     assert!(tokens(tallies[1]) >= 0.95 * tokens(old[1]), "code tokens must retain ninety-five percent");
@@ -159,19 +159,24 @@ fn history_drafts_long_on_code_and_short_on_prose() {
     assert_eq!(fixed_code, Tally { rounds: 646, tokens: 3154, drafts: 4522, short: 0 });
     let ([prose, code], skips) = replay(HeadScore::None, DraftControl::History);
     assert_eq!(skips, 0);
-    // With adaptive trust: code keeps 98.1% of fixed tokens at 6.51 drafts, never stuck short,
+    // Fade3/stop.3: code keeps 98.4% of fixed tokens at 6.51 drafts, never stuck short,
     // although it starts from a server window that 1,112 prose rounds taught.
-    assert_eq!(code, Tally { rounds: 646, tokens: 3094, drafts: 4205, short: 0 });
-    // Prose: 87.7% of fixed tokens for 29.0% of its verified drafts.
-    assert_eq!(prose, Tally { rounds: 1112, tokens: 1950, drafts: 2242, short: 384 });
-    assert!(code.drafts * prose.rounds > 3 * prose.drafts * code.rounds);
+    assert_eq!(code, Tally { rounds: 646, tokens: 3104, drafts: 4207, short: 0 });
+    // Prose: 94.1% of fixed tokens for 43.6% of its verified drafts.
+    assert_eq!(prose, Tally { rounds: 1112, tokens: 2087, drafts: 3395, short: 126 });
+    // Measured prose token retention .941 with .436 of fixed drafted rows;
+    // code retention .984. KEEP_CUT=.3 deliberately retains more useful prose.
+    assert!(prose.tokens * 100 >= fixed_prose.tokens * 90);
+    assert!(prose.drafts * 2 <= fixed_prose.drafts);
+    assert!(code.tokens * 100 >= fixed_code.tokens * 97);
+    assert!(code.drafts * prose.rounds > prose.drafts * code.rounds);
 }
 
 /// The dSpark head skip, booked as a miss: bounds, not exact counts (the fit
 /// is floating point). It fires on prose, not on code, and spends fewer verify
-/// rows on prose for nearly the same tokens. With adaptive trust, this
-/// sample has 473 skips: prose drafts 2,242 -> 1,501 and tokens 1,950 ->
-/// 1,855; code drafts 4,205 -> 4,128 and tokens 3,094 -> 3,090.
+/// rows on prose for nearly the same tokens. With fade3/stop.3, this
+/// sample has 641 skips: prose drafts 3,395 -> 2,591 and tokens 2,087 ->
+/// 2,039; code drafts 4,207 -> 4,189 and tokens 3,104 -> 3,104.
 #[test]
 fn the_head_skip_saves_prose_rows_and_leaves_code_alone() {
     let ([prose, code], _) = replay(HeadScore::None, DraftControl::History);
