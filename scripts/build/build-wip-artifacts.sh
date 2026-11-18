@@ -243,9 +243,6 @@ wip_native_key() {
     printf 'expert-families %s\nbf16-families %s\nspark-tp-roles %s\nhost-isas %s\n' \
       "$expert_families" "$bf16_families" "$spark_tp_roles" "${host_isas[*]}"
     wip_native_required_items
-    # The CuTe DSL host target the exporters pin (#127; python/tools/lib/_pinned_sparkinfer.py):
-    # an override, or "native", changes every exported object's host code.
-    printf 'cute-host-target %s\n' "${CUTEAFD_CUTE_HOST_TARGET-<pinned default>}"
     # Pinned submodule trees by their verified lock digests (sparkinfer, xgrammar,
     # transformers), then every native, exporter and build-helper file that is a
     # build input: kernel-input-rules.json's ignore list (tests, benchmarks, docs,

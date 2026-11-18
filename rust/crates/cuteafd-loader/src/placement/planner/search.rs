@@ -947,6 +947,13 @@ pub fn solve_prepared(
     let aligned = |tokens: u64| tokens.div_ceil(page).div_ceil(multiple).checked_mul(multiple)
         .ok_or(Refusal::Overflow("target pool pages"));
     let floor = request.context.required().max(if matches!(request.pool, Pin::Auto) { pool.floor() } else { 0 });
+    let requirement = if request.context.required() == floor {
+        ContextRequirement::Pinned
+    } else if pool.floor_configured {
+        ContextRequirement::ConfiguredKvMin
+    } else {
+        ContextRequirement::DefaultKvMin
+    };
     let minimum = aligned(floor)?;
     let compiled = contract.maximum_pages.min(pool.ceiling() / page) / multiple * multiple;
     let target = aligned(pool.target().max(request.context.required()))?;
@@ -956,7 +963,7 @@ pub fn solve_prepared(
         Pin::Exact(n) => n / page,
     };
     if wanted < minimum && matches!(request.pool, Pin::Auto) {
-        return Err(Refusal::FullContextShortfall { context: floor,
+        return Err(Refusal::FullContextShortfall { context: floor, requirement,
             tokens: compiled.checked_mul(page).ok_or(Refusal::Overflow("pool domain tokens"))?,
             limiting: Box::new(Refusal::InvalidFact("memory-derived pool domain is below the required floor".into())) });
     }
@@ -1048,7 +1055,7 @@ pub fn solve_prepared(
         if !matches!(search.last, Refusal::Capacity { .. }) {
             return Err(search.last);
         }
-        return Err(Refusal::FullContextShortfall { context: floor,
+        return Err(Refusal::FullContextShortfall { context: floor, requirement,
             tokens: pages.checked_mul(page).ok_or(Refusal::Overflow("feasible pool tokens"))?,
             limiting: Box::new(search.last) });
     }
