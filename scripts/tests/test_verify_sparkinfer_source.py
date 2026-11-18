@@ -370,6 +370,9 @@ def test_standalone_bootstrap_honors_explicit_verified_source(
     tmp_path: Path,
 ) -> None:
     source = make_source(tmp_path / "verified")
+    module = source / "b12x" / "_lib" / "aot_host.py"
+    module.parent.mkdir()
+    module.write_text("def pin_aot_host_target():\n    raise ModuleNotFoundError(name='cutlass')\n", encoding="utf-8")
     lock = tmp_path / "sparkinfer.lock.json"
     write_lock(source, lock)
     env = os.environ.copy()
