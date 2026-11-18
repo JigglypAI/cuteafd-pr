@@ -578,6 +578,303 @@ def worker_command(state, arm, rank, record):
     return cmd
 
 
+# --------------------------------------------------------------------------- one Spark GPU (SM121)
+
+# --sm121-host: the build seeds (off the fabric, approved for single-Spark kernel
+# work) and the pool Sparks. A seed's GPU is guarded by its counting build lease
+# umbrella (SEED.lock, shared by Cargo leases and seed-hosted GPU encodes) and its
+# GPU-export turn (SEED-export): both are taken, so no build, encode or export
+# shares the GPU. A pool Spark takes its serving lock, so no card runs beside it.
+SM121_HOSTS = ('kakapo', 'cassowary', *HOST_LOCKS)
+DEFAULT_SM121_MEMORY = '16g'
+SM121_SCRATCH = 'golden-sm121'  # under ~/.cache/cuteafd/builds/TASK/ on the Spark; removed after the turn
+
+
+def sm121_locks(host):
+    if host not in SM121_HOSTS:
+        raise ValueError(f'--sm121-host {host} is not a GB10 Spark ({", ".join(SM121_HOSTS)})')
+    return hwlock.canonical([host, f'{host}-export'] if host in hwlock.LAN_SEEDS else [HOST_LOCKS[host]])
+
+
+def sm121_memory(memory_bytes):
+    """--memory-bytes, else CUTEAFD_DEV_MEMORY, else 16g (docker --memory/--memory-swap)."""
+    memory = str(memory_bytes) if memory_bytes is not None else os.environ.get('CUTEAFD_DEV_MEMORY') or DEFAULT_SM121_MEMORY
+    if not re.fullmatch(r'[1-9][0-9]*[kmg]?', memory):
+        raise ValueError(f'CUTEAFD_DEV_MEMORY must be a docker size such as 16g: {memory}')
+    return memory
+
+
+# Runs on the --sm121-host (python3 -c, argv: slot instance task native_test candidates_json
+# REMOTE_CHECK_ARGS_JSON): a single GB10 (SM121) GPU, then REMOTE_CHECK on the slot in this
+# host's own WIP root (where wip.sh seals a seed's Spark leg and copies it to the serving
+# Sparks), then the dev image's toolchain against the slot's, the --native-test executable
+# (an aarch64 ELF under ~/.cache/cuteafd/builds there; a relative path resolves in the
+# instance's Spark build tree, WIP_ROOT/build/expert/, e.g. native/cuteafd_native_selftest),
+# host paths for --mount and argument mounts, and the run scratch. One JSON line.
+SM121_CHECK = r'''import hashlib,json,os,pathlib,subprocess,sys
+slot,instance,task,test,cands,check_args=sys.argv[1:7]
+home=pathlib.Path.home()
+def fail(m):
+    print(json.dumps({'error':m})); sys.exit(0)
+g=subprocess.run(['nvidia-smi','--query-gpu=name,compute_cap','--format=csv,noheader'],capture_output=True,text=True)
+gpus=[[x.strip() for x in l.split(',')] for l in g.stdout.splitlines() if l.strip()] if g.returncode==0 else []
+if len(gpus)!=1 or len(gpus[0])!=2 or gpus[0][1]!='12.1' or 'GB10' not in gpus[0][0]:
+    fail('not a single-GPU GB10 (SM121) host: '+(', '.join(' '.join(x) for x in gpus) if gpus else 'nvidia-smi failed'))
+r=subprocess.run([sys.executable,'-c',REMOTE_CHECK,*json.loads(check_args)],capture_output=True,text=True)
+try: rec=json.loads(r.stdout.strip().splitlines()[-1])
+except (ValueError,IndexError): fail('slot check failed: '+((r.stderr.strip().splitlines() or ['no output'])[-1]))
+if rec.get('error'): fail(rec['error'])
+p=pathlib.Path(rec['root']); ws=p/'workspace'; wiproot=p.parents[2]
+seccomp=ws/'docker/seccomp-code-bench.json'
+if not seccomp.is_file(): fail('slot lacks docker/seccomp-code-bench.json')
+t=subprocess.run([sys.executable,str(ws/'scripts/build/dev-toolchain.py')],capture_output=True,text=True)
+want=t.stdout.strip()
+if t.returncode or not want: fail('slot dev-toolchain.py failed')
+label=subprocess.run(['docker','image','inspect','-f','{{index .Config.Labels "io.cuteafd.toolchain.hash"}}',rec['image_id']],capture_output=True,text=True).stdout.strip()
+if label!=want: fail(f'dev image {rec["image_id"]} is stale: toolchain {label or "<unlabelled>"}, slot sources tc-{want} (scripts/build/build-dev-images.sh, then rebuild the slot)')
+native=None
+if test!='-':
+    tree=(wiproot/'build/expert').resolve() if not test.startswith('/') else (home/'.cache/cuteafd/builds').resolve()
+    exe=(pathlib.Path(test) if test.startswith('/') else tree/test).resolve()
+    if not exe.is_relative_to(tree): fail('--native-test '+test+' is outside '+str(tree)+' (a Spark build tree)')
+    if not exe.is_file() or not os.access(exe,os.X_OK): fail('--native-test '+str(exe)+' is not an executable file on this host')
+    with open(exe,'rb') as f: head=f.read(20)
+    if head[:4]!=b'\x7fELF' or int.from_bytes(head[18:20],'little')!=183: fail('--native-test '+str(exe)+' is not an aarch64 ELF (build it in the Spark dev image)')
+    h=hashlib.sha256()
+    with open(exe,'rb') as f:
+        while c:=f.read(1<<24): h.update(c)
+    native={'path':str(exe),'sha256':h.hexdigest()}
+stats={}
+for c in json.loads(cands):
+    q=pathlib.Path(c)
+    stats[c]={'exists':q.exists(),'file':q.is_file(),'exec':q.is_file() and os.access(q,os.X_OK),'resolved':str(q.resolve())}
+builds=home/'.cache/cuteafd/builds'
+a=subprocess.run([sys.executable,str(ws/'scripts/build/assert-build-filesystem.py'),str(builds)],capture_output=True,text=True)
+if a.returncode: fail((a.stderr.strip().splitlines() or ['unsafe build filesystem'])[0])
+rec.update(gpu=gpus[0][0],compute_cap=gpus[0][1],toolchain=want,seccomp=str(seccomp),native_test=native,stats=stats,
+           scratch=str(builds/task/'golden-sm121'),wip_root=str(wiproot))
+print(json.dumps(rec))
+'''
+
+
+def sm121_candidates(state):
+    """Absolute host paths in ARGS and --mount values, stat'ed on the Spark."""
+    values = list(state['sm121']['mounts'])
+    for arg in state['golden']:
+        value = arg.split('=', 1)[1] if arg.startswith('--') and '=' in arg else arg
+        if value.startswith('/') and not value.startswith(OUT) and '{' not in value:
+            values.append(value)
+    return list(dict.fromkeys(values))
+
+
+def seed_record(arm):
+    """The host wip.sh sealed ARM's Spark leg on (its raptor seed-host record), or None."""
+    path = Path.home() / '.cache/cuteafd/builds' / f"wip-{arm['instance']}" / 'slots' / arm['slot'] / 'seed-host'
+    try:
+        return path.read_text().strip() or None
+    except OSError:
+        return None
+
+
+def check_sm121(state, name, arm):
+    """The arm's sealed Spark leg on --sm121-host, its image and the run inputs (raises
+    ValueError naming the host)."""
+    sm = state['sm121']
+    host = sm['host']
+    check_args = ['-', arm['slot'], arm['instance'], '-', '-', json.dumps([container_name(state['task'], name)]),
+                  '-', state['snapshot_container'], '-']
+    script = f'REMOTE_CHECK = {REMOTE_CHECK!r}\n' + SM121_CHECK
+    argv = ['python3', '-c', script, arm['slot'], arm['instance'], state['task'], sm['native_test'] or '-',
+            json.dumps(sm121_candidates(state)), json.dumps(check_args)]
+    try:
+        out = ssh(host, shlex.join(argv), timeout=600).stdout
+        record = json.loads(out.strip().splitlines()[-1])
+    except (subprocess.SubprocessError, json.JSONDecodeError, IndexError) as error:
+        detail = (getattr(error, 'stderr', None) or str(error)).strip().splitlines()
+        raise ValueError(f'{host}: SM121 check failed: {detail[-1] if detail else error}') from None
+    if record.get('error'):
+        message = f"{host}: {record['error']}"
+        sealed_on = seed_record(arm)
+        if record['error'].startswith('no sealed spark-expert slot') and sealed_on and sealed_on != host:
+            message += f' (wip.sh sealed this Spark leg on {sealed_on}: use --sm121-host {sealed_on})'
+        raise ValueError(message)
+    for value in sm['mounts']:
+        if not record['stats'][value]['exists']:
+            raise ValueError(f'--mount {value!r} does not exist on {host}')
+    return record
+
+
+def sm121_mounts(state, record):
+    """--mount values plus existing non-executable data paths in ARGS, on the Spark
+    (path_mounts' rule, with the Spark's view of each path)."""
+    stats = record['stats']
+    covered = [Path(namespace_root()), Path(record['hub']), Path(record['snapshot'])]
+    mounts = []
+    for value in sm121_candidates(state):
+        stat = stats[value]
+        explicit = value in state['sm121']['mounts']
+        if not explicit and (any(Path(value).is_relative_to(r) for r in IMAGE_ROOTS)
+                             or not stat['exists'] or stat['exec']):
+            continue
+        resolved = Path(stat['resolved'])
+        if any(resolved.is_relative_to(c) for c in covered + ([] if explicit else list(IMAGE_ROOTS))):
+            continue
+        if value not in mounts:
+            mounts.append(value)
+    return mounts
+
+
+def sm121_docker_command(state, name, arm, record, remote_out, golden):
+    """The raw-mode container on the Spark: the slot's sealed aarch64 artifacts and
+    source tree, read-only, in its sealed dev image, one GPU, capped memory."""
+    root = Path(record['root'])
+    art = root / 'workspace/.cuteafd-wip'
+    mode = state['mode']
+    mounts = [(art / 'cuteafd', f'{SLOT_BIN}/cuteafd'), (art / 'libcuteafd_native.so', f'{SLOT_LIB}/libcuteafd_native.so')]
+    for kind, target in (('bin-variants', SLOT_BIN), ('lib-variants', SLOT_LIB)):
+        for variant in record['variants'].get(kind, ()):
+            mounts.append((art / kind / variant, f'{target}/{variant}'))
+    for kind in sorted({p.split('/')[0] for p in record['packages']}):
+        mounts.append((art / kind, f'{SLOT_LIB}/{kind}'))
+    mounts += [(art, SLOT_SHARE), (root / 'workspace/docker/release-entrypoint.sh', ENTRYPOINT),
+               (root / 'workspace/third_party/sparkinfer', '/source/third_party/sparkinfer'),
+               (namespace_root(), namespace_root()), (root / 'workspace', SOURCE)]
+    hub = Path(record['hub'])
+    if not hub.is_relative_to(namespace_root()):
+        mounts.append((hub, hub))
+    mounts += [(p, p) for p in sm121_mounts(state, record)]
+    if mode == 'native-test':
+        test = record['native_test']['path']
+        mounts.append((test, f'{TEST_DIR}/{Path(test).name}'))
+    # The Spark's serving identity (release_serving_docker_args: uid, groups, --init, caches).
+    cmd = ['docker', 'run', '--rm', '--name', container_name(state['task'], name),
+           '--label', f"{WORKER_LABEL}={state['task']}/{name}", *record['serving_args'],
+           '--device', 'nvidia.com/gpu=all', '--ipc', 'host', '--ulimit', 'memlock=-1:-1',
+           '--security-opt', f"seccomp={record['seccomp']}",
+           '--memory', state['sm121']['memory'], '--memory-swap', state['sm121']['memory']]
+    for source, target in mounts:
+        cmd += ['-v', f'{source}:{target}:ro']
+    cmd += ['-v', f'{remote_out}:{OUT}', '-w', SOURCE]
+    env = {'PATH': f'{SLOT_BIN}:/usr/local/sbin:/usr/local/bin:/usr/local/cuda/bin:/usr/sbin:/usr/bin:/sbin:/bin',
+           'PYTHONPATH': f'/source/third_party/sparkinfer:{SOURCE}/python/reference', 'PYTHONDONTWRITEBYTECODE': '1',
+           'CUTEAFD_NATIVE_LIB': f'{SLOT_LIB}/libcuteafd_native.so', 'RUST_LOG': 'info',
+           'HF_HOME': namespace_root() + '/hf-home'}
+    if 'PROGRAMS.json' in record['artifacts']:
+        env['CUTEAFD_PROGRAM_MANIFEST'] = f'{SLOT_SHARE}/PROGRAMS.json'
+    env['CUTEAFD_GOLDEN_SNAPSHOT'] = state['snapshot_container']
+    env['CUTEAFD_GOLDEN_OUT'] = OUT
+    values = placeholder_values(state)
+    for key, value in arm['env'].items():
+        env[key] = substitute([value], state['snapshot_container'], **values)[0]
+    env['CUTEAFD_REFERENCE_IMAGE'] = record['image_id']
+    env['CUTEAFD_REFERENCE_IMAGE_SHA256'] = record['image_id']
+    for key, value in env.items():
+        cmd += ['-e', f'{key}={value}']
+    check = (f'mkdir -p "$HOME"; n=$(nvidia-smi -L 2>&1 | grep -c "^GPU "); nvidia-smi -L >&2; '
+             f'if [ "$n" -ne 1 ]; then echo "golden-run: GPU access check failed: saw $n of 1 GPUs" >&2; '
+             f'exit {GPU_CHECK_EXIT}; fi; exec "$@"')
+    program = [f"{TEST_DIR}/{Path(record['native_test']['path']).name}"] if mode == 'native-test' else []
+    # Bounded by itself: a killed driver still frees the Spark after the arm's budget.
+    cmd += ['--entrypoint', 'timeout', record['image_id'], '--kill-after=30', str(state['timeout'] + 60),
+            'bash', '-c', check, 'golden-run', ENTRYPOINT, *program, *golden]
+    return cmd, env
+
+
+def preflight_sm121(state, arms):
+    records = {name: check_sm121(state, name, arm) for name, arm in arms.items()}
+    previous = state.get('slots')
+    for name, record in records.items():
+        if previous and (record['seal_sha256'], record['artifacts'], (record['native_test'] or {}).get('sha256')) != (
+                previous[name]['seal_sha256'], previous[name]['artifacts'], (previous[name]['native_test'] or {}).get('sha256')):
+            raise ValueError(f"arm {name}: sealed Spark leg or --native-test on {state['sm121']['host']} changed since enqueue")
+    return records
+
+
+def copy_back(host, remote, local):
+    """The run's {out} from the Spark into the raptor arm directory."""
+    source = subprocess.Popen(['ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=15', host,
+                               shlex.join(['tar', '-C', remote, '-cf', '-', '.'])], stdout=subprocess.PIPE)
+    try:
+        sink = subprocess.run(['tar', '-C', str(local), '-xf', '-'], stdin=source.stdout, capture_output=True, timeout=3600)
+    finally:
+        source.stdout.close()
+        code = source.wait(timeout=60)
+    if code or sink.returncode:
+        return f'could not copy {host}:{remote} back (ssh {code}, tar {sink.returncode})'
+    return None
+
+
+def run_arm_sm121(state, name, repeat, arms):
+    arm, record = arms[name], state['slots'][name]
+    host = state['sm121']['host']
+    out_dir = Path(state['root']) / name / f'r{repeat}'
+    out_dir.mkdir(parents=True, exist_ok=False)
+    remote_out = f"{record['scratch']}/{name}/r{repeat}"
+    golden = run_args(state, arm)
+    cmd, env = sm121_docker_command(state, name, arm, record, remote_out, golden)
+    container = container_name(state['task'], name)
+    native = record['native_test'] or {}
+    rec = dict(arm=name, repeat=repeat, argv=cmd, golden=golden, container=container, mode=state['mode'],
+               host=host, host_gpu=record['gpu'], compute_cap=record['compute_cap'],
+               native_test=native.get('path'), native_test_sha256=native.get('sha256'), fixtures=None, workers=[],
+               image=record['image'], image_id=record['image_id'], sealed_image_id=record['sealed_image_id'],
+               toolchain=record['toolchain'], image_tags=[], seal_sha256=record['seal_sha256'],
+               artifact_manifest_sha256=record['artifact_manifest_sha256'], slot=f"{arm['instance']}:{arm['slot']}",
+               slot_root=f"{host}:{record['root']}", source_commit=record.get('source_commit'),
+               source_manifest_sha256=record['source_manifest_sha256'], env=env, arm_env=arm['env'],
+               arm_args=arm['args'], gpus=[], memory=state['sm121']['memory'], locks=state['locks'],
+               snapshot=state['snapshot'], timeout_s=state['timeout'], power_before=None, power_samples={})
+    print(f"golden-run: {name} r{repeat} on {host} -> {out_dir}", flush=True)
+    started = time.time()
+    code, problem, proc, timed_out = None, None, None, False
+    with open(out_dir / 'log', 'w') as log:
+        try:
+            # Fresh, ours: Docker would create a missing bind source as root.
+            ssh(host, shlex.join(['bash', '-c', 'rm -rf -- "$1" && mkdir -p -- "$1"', 'mk', remote_out]), timeout=120)
+            proc = subprocess.Popen(['ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=15', host, shlex.join(cmd)],
+                                    stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+            code = proc.wait(timeout=state['timeout'])
+        except subprocess.TimeoutExpired:
+            problem, timed_out = f"timed out after {state['timeout']} s", True
+        except subprocess.SubprocessError as error:
+            problem = f'{host}: {error}'
+        finally:
+            if proc is not None and proc.poll() is None:
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                proc.wait()
+            # A dead ssh client does not stop the remote container: remove it (ours only).
+            removal = teardown_worker(host, container, f"{state['task']}/{name}", out_dir / 'teardown.log')
+            copied = copy_back(host, remote_out, out_dir) if proc is not None else None
+            problem = '; '.join(filter(None, [problem, removal, copied])) or None
+    if code == 255 and problem is None:
+        problem = f'ssh to {host} failed'
+    if code == GPU_CHECK_EXIT:
+        problem = 'GPU access check failed inside the container'
+    elif code == 0 and problem is None and state['mode'] == 'native-test':
+        problem = test_verdict(out_dir / 'log')
+    exit_code = code if problem is None else 124 if timed_out else code if code not in (None, 0) else 1
+    rec.update(started=started, seconds=round(time.time() - started, 1), exit=exit_code, problem=problem)
+    (out_dir / 'exit').write_text(f"{rec['exit']}\n")
+    (out_dir / 'argv.json').write_text(json.dumps(rec, indent=2) + '\n')
+    return rec
+
+
+def remove_sm121_scratch(state):
+    """The Spark-side run scratch (outputs already copied back); never the task's other files."""
+    scratch = {r['scratch'] for r in (state.get('slots') or {}).values() if r.get('scratch')}
+    for path in scratch:
+        if Path(path).name != SM121_SCRATCH:
+            continue
+        try:
+            ssh(state['sm121']['host'], shlex.join(['bash', '-c', 'rm -rf -- "$1" && rmdir --ignore-fail-on-non-empty -- "$(dirname "$1")"',
+                                                    'rm', path]), timeout=300, check=False)
+        except subprocess.SubprocessError:
+            pass
+
+
 WORKER_STATE = ('n={name}; if docker logs "$n" 2>&1 | grep -qF {marker}; then echo ready; '
                 'elif [ "$(docker inspect -f {{{{.State.Running}}}} "$n" 2>/dev/null)" = true ]; then echo starting; '
                 'else echo exited; fi')
@@ -1342,8 +1639,10 @@ def compare_one(state, python, tool, args, out, record):
 
 
 def write_summary(state, records, comparisons):
+    where = (f"SM121 host {state['sm121']['host']} ({next(iter(state['slots'].values()), {}).get('gpu', 'GB10')}), "
+             f"memory cap {state['sm121']['memory']}" if state.get('sm121') else f"GPUs {state['gpus']}")
     lines = [f"# golden-run {state['task']}", '',
-             f"family `{state['family']}`, checkpoint `{state['snapshot']}`, GPUs {state['gpus']}, locks "
+             f"family `{state['family']}`, checkpoint `{state['snapshot']}`, {where}, locks "
              f"{','.join(state['locks'])}", '', f"golden args: `{shlex.join(state['golden'])}`", '',
              '| arm | repeat | exit | seconds | slot | seal | image | env | GPU limit W (mean) |',
              '|---|---|---|---|---|---|---|---|---|']
@@ -1359,8 +1658,9 @@ def write_summary(state, records, comparisons):
                   f"(port {sparks['port']}, peers `{sparks['peers_csv']}`), expert layers "
                   f"{','.join(map(str, sparks['layers'])) or 'unspecified'}"]
     if state['mode'] != 'golden':
-        lines += ['', f"mode `{state['mode']}`" + (f", test `{state['native_test']}` sha256 "
-                                                    f"{state['native_test_sha256'][:12]}" if state.get('native_test') else '')]
+        test = next((r for r in records if r.get('native_test')), None) if state.get('sm121') else state
+        lines += ['', f"mode `{state['mode']}`" + (f", test `{test['native_test']}` sha256 "
+                                                    f"{test['native_test_sha256'][:12]}" if test and test.get('native_test') else '')]
     for r in records:
         run_dir = Path(state['root']) / r['arm'] / f"r{r['repeat']}"
         lines += ['', f"## {r['arm']} r{r['repeat']} (exit {r['exit']})", '', '```',
@@ -1446,6 +1746,8 @@ def build_state(args, arms):
     elif args.expert_layers or args.worker_env or args.arm_worker_env or args.worker_arg or args.worker_memory_bytes is not None:
         raise ValueError('--expert-layers, --worker-env, --arm-worker-env, --worker-arg and --worker-memory-bytes need --spark-hosts')
     mode = 'native-test' if args.native_test else 'command' if args.command else 'golden'
+    if args.sm121_host:
+        return build_sm121_state(args, arms, task_root, snapshot, container_path, hub, mode)
     if mode == 'golden' and snapshot.is_relative_to(namespace_root()) and not (args.rdma or sparks):
         raise ValueError('SparkNest snapshots require push loading: add --rdma (host network and verbs)')
     if mode == 'golden':
@@ -1464,7 +1766,7 @@ def build_state(args, arms):
     covered = [hub, Path(namespace_root()), snapshot] + ([Path(fixtures)] if fixtures else [])
     explicit = resolve_mounts(getattr(args, 'mount', ()), covered + [Path(p) for p in extra])
     extra_mounts = extra + explicit + path_mounts(golden, covered + [Path(p) for p in extra + explicit])
-    state = dict(task=args.task, family=args.family, root=str(task_root / 'golden'), gpus=parse_gpus(args.gpus), memory=args.memory_bytes,
+    state = dict(task=args.task, family=args.family, root=str(task_root / 'golden'), gpus=parse_gpus(args.gpus or '0,1'), memory=args.memory_bytes,
                  snapshot=str(snapshot), snapshot_container=container_path, hub=str(hub), timeout=args.timeout,
                  golden=golden, extra_mounts=extra_mounts,
                  mode=mode, native_test=native_test, native_test_sha256=native_digest, fixtures=fixtures,
@@ -1475,6 +1777,40 @@ def build_state(args, arms):
     for arm in arms.values():
         run_args(state, arm)  # every placeholder resolves, per arm
     for arm in arms.values():
+        for value in arm['env'].values():
+            substitute([value], container_path, **placeholder_values(state))
+    return state
+
+
+def build_sm121_state(args, arms, task_root, snapshot, container_path, hub, mode):
+    """--sm121-host: a raw mode on one Spark GPU from each arm's sealed Spark leg."""
+    host = args.sm121_host
+    locks = sm121_locks(host)
+    if mode == 'golden':
+        raise ValueError('--sm121-host runs --native-test or --command (family goldens need the coordinator)')
+    conflicts = [flag for flag, value in (('--gpus', args.gpus), ('--spark-hosts', args.spark_hosts), ('--rdma', args.rdma),
+                                          ('--fixtures', args.fixtures), ('--expert-layers', args.expert_layers),
+                                          ('--worker-env', args.worker_env), ('--arm-worker-env', args.arm_worker_env),
+                                          ('--worker-arg', args.worker_arg),
+                                          ('--worker-memory-bytes', args.worker_memory_bytes is not None)) if value]
+    if conflicts:
+        raise ValueError(f'--sm121-host runs on one Spark GPU alone: drop {", ".join(conflicts)}')
+    native_test = args.native_test
+    if native_test is not None and (not native_test or '\n' in native_test):
+        raise ValueError('--native-test needs a path (absolute on the Spark, or relative to its WIP build/expert tree)')
+    for value in args.mount:
+        if not value.startswith('/') or '{' in value:
+            raise ValueError(f'--mount {value!r} is not an absolute host path')
+    golden = list(args.golden)
+    state = dict(task=args.task, family=args.family, root=str(task_root / 'golden'), gpus=[], memory=None,
+                 snapshot=str(snapshot), snapshot_container=container_path, hub=str(hub), timeout=args.timeout,
+                 golden=golden, extra_mounts=[], mode=mode, native_test=native_test, native_test_sha256=None,
+                 fixtures=None, fixtures_writable=False, sparks=None, rdma=False, locks=locks,
+                 sm121=dict(host=host, memory=sm121_memory(args.memory_bytes), native_test=native_test,
+                            mounts=list(dict.fromkeys(args.mount))))
+    state['vocab'] = args.vocab or (vocab_size(snapshot) if args.compare_logits else None)
+    for arm in arms.values():
+        run_args(state, arm)
         for value in arm['env'].values():
             substitute([value], container_path, **placeholder_values(state))
     return state
@@ -1501,7 +1837,10 @@ def main(argv=None):
     parser.add_argument('--arm-arg', action='append', default=[], metavar='ARM:TOKEN',
                         help='one extra argv token appended for that arm only (repeatable, in order)')
     parser.add_argument('--env', action='append', default=[], metavar='KEY=VALUE', help='environment for every arm')
-    parser.add_argument('--gpus', default='0,1', help='raptor GPUs, locked gpu0 then gpu1 (default 0,1)')
+    parser.add_argument('--gpus', help='raptor GPUs, locked gpu0 then gpu1 (default 0,1)')
+    parser.add_argument('--sm121-host', metavar='HOST', help='run --native-test/--command on this Spark\'s GB10 GPU '
+                        '(SM121) from the arm\'s sealed Spark leg instead of raptor: kakapo or cassowary (their build '
+                        'lease and export turn), or a pool Spark (its serving lock)')
     raw = parser.add_mutually_exclusive_group()
     raw.add_argument('--native-test', metavar='EXE', help='run this test executable (built in the coordinator dev '
                      'image from the slot commit) with ARGS instead of a golden subcommand')
@@ -1523,7 +1862,8 @@ def main(argv=None):
     parser.add_argument('--worker-arg', action='append', default=[], metavar='ARG',
                         help='extra expertd-native argument (repeatable; e.g. --worker-arg=--exl3-schedule)')
     parser.add_argument('--memory-bytes', type=int, metavar='N',
-                        help='host memory cap for the coordinator container (docker --memory/--memory-swap)')
+                        help='host memory cap for the coordinator container (docker --memory/--memory-swap); with '
+                        '--sm121-host the Spark container\'s cap (default CUTEAFD_DEV_MEMORY, else 16g)')
     parser.add_argument('--worker-budget-bytes', type=int, default=DEFAULT_WORKER_BUDGET)
     parser.add_argument('--worker-memory-bytes', type=int, metavar='N',
                         help='container memory cap per worker (docker --memory/--memory-swap); above the device budget')
@@ -1569,8 +1909,11 @@ def main(argv=None):
         for name in arms:
             if len(container_name(args.task, name)) > 128:
                 raise ValueError('task and arm names make a container name over 128 characters')
-        state['slots'] = preflight(state, arms, at_grant=False)
-        state['serving_args'] = serving_args()
+        if state.get('sm121'):
+            state['slots'] = preflight_sm121(state, arms)
+        else:
+            state['slots'] = preflight(state, arms, at_grant=False)
+            state['serving_args'] = serving_args()
         if not args.preflight_at_grant:
             hwlock.check_preflight(args.preflight, args.preflight_timeout)
     except (ValueError, OSError, subprocess.SubprocessError, hwlock.PreflightFailed) as error:
@@ -1601,10 +1944,14 @@ def main(argv=None):
 
     def body():
         # At grant: the slots are still what was checked at enqueue.
-        state['slots'] = preflight(state, arms)
+        state['slots'] = preflight_sm121(state, arms) if state.get('sm121') else preflight(state, arms)
         print(f"golden-run: locks {','.join(state['locks'])} held; {len(order)} runs", flush=True)
-        for name, repeat in order:
-            records.append(run_arm(state, name, repeat, arms))
+        try:
+            for name, repeat in order:
+                records.append((run_arm_sm121 if state.get('sm121') else run_arm)(state, name, repeat, arms))
+        finally:
+            if state.get('sm121'):
+                remove_sm121_scratch(state)
 
     code = 0
     try:
