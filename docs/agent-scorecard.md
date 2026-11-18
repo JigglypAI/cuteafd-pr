@@ -27,6 +27,36 @@ Rubric, each 1–5 (5 best), plus wall time:
 
 ## Log
 
+### 2026-11-18 BF16 Sparse MLA Duel: Target 1
+
+Astra wins split decode at `58667f58` (fork #391, engine #2459 follow-up).
+On matched raptor RTX PRO 6000 sweeps, all 1,792 row/plan cases at rows 1–64
+fit FP8 timing spread and preserve the first BF16 version's F32 output RMS and
+LSE errors exactly. GLM h64/h32 and GLMF h64/h32 median latency is
+0.949/0.950/0.958/0.888× FP8; V4 1M C128 is 0.861–0.870×. The winning design
+combines once-per-tile widening for V4 and pipelined whole-record loads for
+longer GLM splits. R4's 48 V4 objects are identical to R3's. All four cold
+capture controls passed; the SM120 integration suite has only the six known
+#2458 failures and two intentional skips. No thermal slowdown in the paired
+GLM sweep, with 12.09 s of power capping across both arms.
+
+Carbon's `93399325` removes Full-variant register spills from `b7e3d378` and
+reduces the V4 Flash h32 window median to 0.747× its earlier version. Most
+other medians improve by 0–5% on the same raptor GPU. It does not correct
+accuracy: 56 GLM h32 row/plan cases still have higher F32 RMS than the first
+BF16 implementation (maximum +0.00006222), and some V4 cases also exceed the
+bound. Carbon's tested cold capture and legacy FP8 exports pass, but R1 is
+not a qualified winner. The occupancy design required multiple steering
+passes before a measurable commit; keep later work scoped to one route at a
+time. Context partials are a separate, still-open target.
+
+Target-1 scores (correctness / judgment / quality / creativity): Astra
+5 / 5 / 5 / 5; Carbon 2 / 3 / 3 / 4. Astra finished four measured rounds;
+Carbon needed more than 45 minutes to reach its first implementation
+checkpoint. Evidence: organizer Max-Q and raptor row tables under
+`~/.cache/cuteafd/builds/attention-precision/`, fork #386 and #391.
+
+
 ### 2026-11-15 Muse Scaled FP8 KV Attention Duel: Owner Retained
 
 Owner `69f63362` (harness `ec1182cb`, merged as fork #343 `c3402908`)
