@@ -2,6 +2,10 @@
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [[ "${1:-}" != --wip-supervised ]]; then
+  exec python3 "$repo_root/scripts/build/build-process.py" --grace 85 -- bash "$0" --wip-supervised "$@"
+fi
+shift
 source "$repo_root/scripts/lib/release-common.sh"
 source "$repo_root/scripts/lib/cdi-gpus.sh"
 source "$repo_root/scripts/build/compiler-cache.sh"
@@ -375,6 +379,7 @@ wip_build_resource_acquire() {
       wip_pin_spark_host "$seed_host"
     fi
     ensure_remote_container "$seed_host"
+    wip_claim_spark "$seed_host"
   fi
 }
 
@@ -395,6 +400,41 @@ fi
 staging_dir="$state_dir/source-staging"
 hf_home="${HF_HOME:-$HOME/.cache/huggingface}"
 mkdir -p "$state_dir" "$hf_home"
+
+# The persistent source, build and output paths are shared by all slots in
+# this instance. Serialize their writers, not independent WIP instances.
+exec {wip_instance_lock}>"$HOME/.cache/cuteafd/builds/.${coordinator_container}.lock"
+flock -w 14400 "$wip_instance_lock" || release_die "timed out waiting for $coordinator_container build lock"
+exec {wip_root_lock}>"$state_dir/.build.lock"
+flock -w 14400 "$wip_root_lock" || release_die "timed out waiting for $state_dir build lock"
+wip_generation="$(</proc/sys/kernel/random/uuid)"
+wip_slot_writer() {
+  local host="$1"; shift
+  if [[ -n "$host" ]]; then
+    ssh -o BatchMode=yes "$host" "$(printf '%q ' python3 - "$@")" <"$repo_root/scripts/build/wip-slot-reuse.py"
+  else
+    python3 "$repo_root/scripts/build/wip-slot-reuse.py" "$@"
+  fi
+}
+wip_spark_mount() {
+  local root
+  root="$(ssh -o BatchMode=yes "$1" "docker inspect -f '{{range .Mounts}}{{if eq .Destination \"/wip\"}}{{.Source}}{{end}}{{end}}' '$spark_container'")"
+  [[ -n "$root" ]] || release_die "$1: cannot resolve WIP mount"
+  printf '%s\n' "$root"
+}
+wip_claim_spark() {
+  local host="$1" root
+  root="$(wip_spark_mount "$host")"
+  wip_slot_writer "$host" claim --root "$root" --slot "$slot" --generation "$wip_generation"
+}
+wip_publish_expert() {
+  local host="$1" root="$2" incoming="$3" status=0
+  wip_slot_writer "$host" publish --root "$root" --slot "$slot" --generation "$wip_generation" \
+    --role spark-expert --incoming "$incoming" || status=$?
+  ssh -o BatchMode=yes "$host" "rm -rf '$incoming'"
+  return "$status"
+}
+wip_slot_writer '' claim --root "$state_dir" --slot "$slot" --generation "$wip_generation"
 
 snapshot_args=(
   -a --delete --delete-excluded
@@ -558,6 +598,10 @@ else
     coordinator ensure_local_image cancel_local_dev_image coordinator.log )
 fi
 trap wip_build_resource_release EXIT
+trap 'exit 143' TERM
+trap 'exit 130' INT
+trap 'exit 129' HUP
+trap 'exit 131' QUIT
 
 # A local dev-image rebuild moves the shared default tags immediately. Freeze
 # this invocation before container checks or cache keys can observe a retag.
@@ -982,7 +1026,7 @@ wip_reuse_role() {
   [[ -n "$key" ]] || return 1
   local -a find_cmd=(python3 - find --key "$key" --role "$role" --slot "$slot" --exclude-root "$root")
   local -a adopt_cmd=(python3 - adopt --key "$key" --role "$role" --root "$root"
-    --slot "$slot" --instance "${WIP_INSTANCE:-}" --wip-root "${WIP_ROOT:-}")
+    --slot "$slot" --generation "$wip_generation" --instance "${WIP_INSTANCE:-}" --wip-root "${WIP_ROOT:-}")
   if [[ -z "$host" ]]; then
     found="$("${find_cmd[@]}" <"$repo_root/scripts/build/wip-slot-reuse.py")" || return 1
     "${adopt_cmd[@]}" --source "$found" <"$repo_root/scripts/build/wip-slot-reuse.py"
@@ -1005,6 +1049,7 @@ done
 remote_failed=0
 for pid in "${remote_pids[@]}"; do wait "$pid" || remote_failed=1; done
 ((remote_failed == 0)) || release_die "one or more Spark WIP containers could not be prepared"
+for host in "${wip_hosts_for_containers[@]}"; do wip_claim_spark "$host"; done
 
 wip_coordinator_processes_active() {
   docker exec "$coordinator_container" bash -lc '
@@ -1047,69 +1092,19 @@ elif wip_coordinator_processes_active || wip_expert_processes_active; then
   release_die "a WIP CUTEAFD process is active; stop it before synchronizing or building"
 fi
 
+wip_clone_role() {
+  local host="$1" role="$2" root="$state_dir"
+  if [[ -n "$host" ]]; then
+    root="$(wip_spark_mount "$host")"
+  fi
+  wip_slot_writer "$host" clone --root "$root" --slot "$slot" --generation "$wip_generation" \
+    --role "$role" --source "$root/slots/$from_slot/$role"
+}
 if [[ -n "$from_slot" ]]; then
   echo "== cloning WIP slot $from_slot -> $slot =="
-  docker exec -i "$coordinator_container" bash -s -- "$from_slot" "$slot" "$(hostname -s)" <<'CONTAINER'
-set -euo pipefail
-from="$1"
-to="$2"
-test -d "/wip/slots/$from/coordinator" || { echo "${3:-coordinator}: missing source directory /wip/slots/$from/coordinator" >&2; exit 1; }
-test ! -e "/wip/slots/$to" || { echo "$3: destination already exists: /wip/slots/$to" >&2; exit 1; }
-CONTAINER
-  if ((wip_spark_leg)); then
-  ssh -o BatchMode=yes "$seed_host" docker exec -i "$spark_container" bash -s -- "$from_slot" "$slot" "$seed_host" <<'CONTAINER'
-set -euo pipefail
-from="$1"
-to="$2"
-test -d "/wip/slots/$from/spark-expert" || { echo "${3:-seed}: missing source directory /wip/slots/$from/spark-expert" >&2; exit 1; }
-test ! -e "/wip/slots/$to" || { echo "$3: destination already exists: /wip/slots/$to" >&2; exit 1; }
-CONTAINER
-  fi
-  docker exec -i "$coordinator_container" bash -s -- "$from_slot" "$slot" "$(hostname -s)" <<'CONTAINER'
-set -euo pipefail
-from="$1"
-to="$2"
-mkdir -p "/wip/slots/$to"
-cp -a "/wip/slots/$from/coordinator" "/wip/slots/$to/coordinator"
-python3 - "/wip/slots/$to/coordinator" "$to" <<'RESEAL'
-import hashlib, json, pathlib, sys
-# A cloned role keeps its measured artifacts but was sealed for the source slot:
-# re-seal it as this slot (recording the source) so launch identity checks pass.
-d, to = pathlib.Path(sys.argv[1]), sys.argv[2]
-raw = (d / "META.json").read_bytes()
-assert hashlib.sha256(raw).hexdigest() == (d / "FINGERPRINT").read_text().strip(), "cloned role seal mismatch"
-meta = json.loads(raw)
-meta["cloned_from"] = meta.get("cloned_from") or meta["slot"]
-meta["slot"] = to
-body = json.dumps(meta, indent=2, sort_keys=True).encode() + b"\n"
-(d / "META.json").write_bytes(body)
-(d / "FINGERPRINT").write_text(hashlib.sha256(body).hexdigest() + "\n")
-RESEAL
-CONTAINER
-  if ((wip_spark_leg)); then
-  ssh -o BatchMode=yes "$seed_host" docker exec -i "$spark_container" bash -s -- "$from_slot" "$slot" "$seed_host" <<'CONTAINER'
-set -euo pipefail
-from="$1"
-to="$2"
-test -d "/wip/slots/$from/spark-expert" || { echo "${3:-seed}: missing source directory /wip/slots/$from/spark-expert" >&2; exit 1; }
-mkdir -p "/wip/slots/$to"
-cp -a "/wip/slots/$from/spark-expert" "/wip/slots/$to/spark-expert"
-python3 - "/wip/slots/$to/spark-expert" "$to" <<'RESEAL'
-import hashlib, json, pathlib, sys
-# A cloned role keeps its measured artifacts but was sealed for the source slot:
-# re-seal it as this slot (recording the source) so launch identity checks pass.
-d, to = pathlib.Path(sys.argv[1]), sys.argv[2]
-raw = (d / "META.json").read_bytes()
-assert hashlib.sha256(raw).hexdigest() == (d / "FINGERPRINT").read_text().strip(), "cloned role seal mismatch"
-meta = json.loads(raw)
-meta["cloned_from"] = meta.get("cloned_from") or meta["slot"]
-meta["slot"] = to
-body = json.dumps(meta, indent=2, sort_keys=True).encode() + b"\n"
-(d / "META.json").write_bytes(body)
-(d / "FINGERPRINT").write_text(hashlib.sha256(body).hexdigest() + "\n")
-RESEAL
-CONTAINER
-  fi
+  [[ ! -e "$state_dir/slots/$slot" ]] || release_die "destination already exists: $state_dir/slots/$slot"
+  wip_clone_role '' coordinator
+  if ((wip_spark_leg)); then wip_clone_role "$seed_host" spark-expert; fi
 fi
 
 # Reuse needs each role's slot on the host that builds it: raptor and the seed.
@@ -1311,6 +1306,18 @@ wip_coordinator_export_modes() {
   esac
 }
 
+# Docker exec and SSH do not forward client's signals to the actual build.
+# Leave stdin open until cancellation, then wait for the remote supervisor to
+# close the channel after its process group (including exporters) has drained.
+wip_pipe() {
+  python3 "$repo_root/scripts/build/build-process.py" --pipe --grace 20 "$@"
+}
+wip_exec() {
+  local docker_cli="$1" verb="$2"
+  shift 2
+  wip_pipe -- "$docker_cli" "$verb" -i "$@"
+}
+
 # wip_cached_exports BUILD...: the native phase with every AOT export required
 # to come from the export cache (scripts/build/export-cache.py exits 3 before an
 # exporter would start). CMake and host C++ run; no export touches a GPU. On a
@@ -1355,7 +1362,7 @@ wip_remote_export() {
   rm -f "$env_file"
   native_store_nest raptor x86_64 "$(realpath "$state_dir")" coordinator import
   native_store_sync "" "$state_dir" "$(uname -m)" coordinator import
-  docker exec -e CUTEAFD_WIP_NATIVE_REQUIRE_HIT=1 "${coordinator_build[@]:2}" native || return 75
+  wip_exec docker exec -e CUTEAFD_WIP_NATIVE_REQUIRE_HIT=1 "${coordinator_build[@]:2}" native || return 75
   echo "WIP phase coordinator export-remote: $((SECONDS - started))s ($host)"
 }
 
@@ -1499,6 +1506,7 @@ build_coordinator() {
     -e "CUTEAFD_WIP_GENERIC_SPARK_COUNTS=${CUTEAFD_WIP_GENERIC_SPARK_COUNTS:-}" \
     -e "CUTEAFD_WIP_FP8_MOE_BF16_FAMILIES=$bf16_families" \
     "$coordinator_container" \
+    python3 /wip/source/scripts/build/build-process.py --channel --timeout 7200 -- \
     /wip/source/scripts/build/build-wip-artifacts.sh \
     /wip/source coordinator 120 /wip/build/coordinator /wip/output/coordinator)
   # Cargo first, holding no hardware; then the bounded native/AOT export.
@@ -1514,9 +1522,9 @@ build_coordinator() {
     for attempt in 1 2; do
       rust_status=0
       if [[ "${CUTEAFD_WIP_BUILD_SLOT:-off}" == on ]]; then
-        "$repo_root/scripts/build/build-slot.sh" "${coordinator_build[@]}" rust || rust_status=$?
+        CUTEAFD_BUILD_STOP_GRACE=25 "$repo_root/scripts/build/build-slot.sh" python3 "$repo_root/scripts/build/build-process.py" --pipe --grace 15 -- "${coordinator_build[@]:0:2}" -i "${coordinator_build[@]:2}" rust || rust_status=$?
       else
-        "${coordinator_build[@]}" rust || rust_status=$?
+        wip_exec "${coordinator_build[@]}" rust || rust_status=$?
       fi
       ((rust_status != 0 && attempt == 1)) || break
       echo "WIP coordinator Rust phase exited $rust_status; retrying once" >&2
@@ -1528,13 +1536,13 @@ build_coordinator() {
   [[ "$phase" != rust ]] || return 0
   native_store_sync "" "${state_dir:-/nonexistent}" "$(uname -m)" coordinator import
   if [[ "${wip_export_locks:-off}" != on ]]; then
-    "${coordinator_build[@]}" native
+    wip_exec "${coordinator_build[@]}" native
   elif native_store_has "" "${state_dir:-/nonexistent}" coordinator; then
     echo "WIP coordinator export: native cache hit, no GPU turn"
     # The build re-verifies the entry; one that vanished fails rather than exporting unlocked.
-    docker exec -e CUTEAFD_WIP_NATIVE_REQUIRE_HIT=1 "${coordinator_build[@]:2}" native ||
+    wip_exec docker exec -e CUTEAFD_WIP_NATIVE_REQUIRE_HIT=1 "${coordinator_build[@]:2}" native ||
       release_die "coordinator WIP native restore failed"
-  elif wip_cached_exports docker exec -e CUTEAFD_EXPORT_CACHE_REQUIRE_HIT=1 "${coordinator_build[@]:2}" native; then
+  elif wip_cached_exports wip_exec docker exec -e CUTEAFD_EXPORT_CACHE_REQUIRE_HIT=1 "${coordinator_build[@]:2}" native; then
     echo "WIP coordinator export: every export restored from the export cache, no GPU turn"
   else
     # Remote first when configured; otherwise take one bounded fair GPU turn.
@@ -1561,8 +1569,9 @@ build_coordinator() {
     ((exported)) || release_die "no coordinator export mode succeeded"
   fi
   native_store_sync "" "${state_dir:-/nonexistent}" "$(uname -m)" coordinator publish
-  docker exec -e "CUTEAFD_WIP_BUILD_KEY=${wip_coordinator_key:-}" ${wip_exlr8_env[@]+"${wip_exlr8_env[@]}"} \
+  wip_exec docker exec -e "CUTEAFD_WIP_SLOT_GENERATION=${wip_generation:-}" -e "CUTEAFD_WIP_BUILD_KEY=${wip_coordinator_key:-}" ${wip_exlr8_env[@]+"${wip_exlr8_env[@]}"} \
     -e "CUTEAFD_WIP_PROGRAM_FAMILY=${wip_program_family:-}" "$coordinator_container" \
+    python3 /wip/source/scripts/build/build-process.py --channel --timeout 300 -- \
     /wip/source/scripts/build/finalize-wip-slot.sh \
     /wip/source coordinator "$slot" /wip/output/coordinator \
     "$COORDINATOR_DOCKER_DEV" "$image_id" "$image_layers"
@@ -1608,8 +1617,8 @@ build_expert() (
   # The role list and build-scope opt-ins travel inside a single quoted remote
   # command so a `tp2;tp3` value is never split by the remote shell.
   local build_command
-  build_command="docker exec -e 'CUTEAFD_WIP_DEV_IMAGE_ID=$image_id' -e 'CUTEAFD_WIP_NATIVE_CACHE=${CUTEAFD_WIP_NATIVE_CACHE:-on}' -e 'CUTEAFD_WIP_EXPORT_CACHE=${CUTEAFD_WIP_EXPORT_CACHE:-on}' -e 'CUTEAFD_WIP_EXPORT_LINEINFO=${CUTEAFD_WIP_EXPORT_LINEINFO:-OFF}' -e 'CUTEAFD_EXPORT_JOBS=${CUTEAFD_EXPORT_JOBS:-}' -e 'CUTEAFD_EXPORT_HOST_CONTEXTS=${CUTEAFD_EXPORT_HOST_CONTEXTS:-}' -e 'CUTEAFD_EXPORT_WORKER_RAM_MIB=${CUTEAFD_EXPORT_WORKER_RAM_MIB:-}' -e 'CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS:-}' -e 'RUST_TEST_THREADS=${RUST_TEST_THREADS:-}' -e 'CMAKE_BUILD_PARALLEL_LEVEL=${CMAKE_BUILD_PARALLEL_LEVEL:-}' -e 'CUTEAFD_BUILD_CACHES=${CUTEAFD_BUILD_CACHES:-on}' -e 'CUTEAFD_SCCACHE_CUDA=$cuda_cache' -e 'CUTEAFD_KACHE=$cache_wrapper' -e 'CUTEAFD_WIP_SPARK_TP_ROLES=$wip_spark_tp_roles' -e 'CUTEAFD_WIP_EXPERT_FAMILIES=${CUTEAFD_WIP_EXPERT_FAMILIES:-}' -e 'CUTEAFD_WIP_GENERIC_SPARK_COUNTS=${CUTEAFD_WIP_GENERIC_SPARK_COUNTS:-}' -e 'CUTEAFD_WIP_FP8_MOE_BF16_FAMILIES=$bf16_families' -e 'CUTEAFD_WIP_EXL3_AOT=${CUTEAFD_WIP_EXL3_AOT:-ON}' -e 'CUTEAFD_WIP_NVFP4_AOT=${CUTEAFD_WIP_NVFP4_AOT:-ON}' -e 'CUTEAFD_WIP_V41_AOT=${CUTEAFD_WIP_V41_AOT:-OFF}' -e 'CUTEAFD_WIP_VISION_ATTENTION_AOT=${CUTEAFD_WIP_VISION_ATTENTION_AOT:-OFF}' -e 'CUTEAFD_WIP_AUDIO_AOT=$audio_aot'${wip_exlr8_env[1]:+ -e '${wip_exlr8_env[1]}' -e 'CUTEAFD_WIP_EXLR8_FAMILIES=${CUTEAFD_WIP_EXLR8_FAMILIES}'} '$spark_container' timeout --kill-after=30 7200 /wip/source/scripts/build/build-wip-artifacts.sh /wip/source expert 121 /wip/build/expert /wip/output/expert"
-  timeout --kill-after=30 7260 ssh -o BatchMode=yes "$seed_host" "$build_command rust" ||
+  build_command="docker exec -i -e 'CUTEAFD_WIP_DEV_IMAGE_ID=$image_id' -e 'CUTEAFD_WIP_NATIVE_CACHE=${CUTEAFD_WIP_NATIVE_CACHE:-on}' -e 'CUTEAFD_WIP_EXPORT_CACHE=${CUTEAFD_WIP_EXPORT_CACHE:-on}' -e 'CUTEAFD_WIP_EXPORT_LINEINFO=${CUTEAFD_WIP_EXPORT_LINEINFO:-OFF}' -e 'CUTEAFD_EXPORT_JOBS=${CUTEAFD_EXPORT_JOBS:-}' -e 'CUTEAFD_EXPORT_HOST_CONTEXTS=${CUTEAFD_EXPORT_HOST_CONTEXTS:-}' -e 'CUTEAFD_EXPORT_WORKER_RAM_MIB=${CUTEAFD_EXPORT_WORKER_RAM_MIB:-}' -e 'CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS:-}' -e 'RUST_TEST_THREADS=${RUST_TEST_THREADS:-}' -e 'CMAKE_BUILD_PARALLEL_LEVEL=${CMAKE_BUILD_PARALLEL_LEVEL:-}' -e 'CUTEAFD_BUILD_CACHES=${CUTEAFD_BUILD_CACHES:-on}' -e 'CUTEAFD_SCCACHE_CUDA=$cuda_cache' -e 'CUTEAFD_KACHE=$cache_wrapper' -e 'CUTEAFD_WIP_SPARK_TP_ROLES=$wip_spark_tp_roles' -e 'CUTEAFD_WIP_EXPERT_FAMILIES=${CUTEAFD_WIP_EXPERT_FAMILIES:-}' -e 'CUTEAFD_WIP_GENERIC_SPARK_COUNTS=${CUTEAFD_WIP_GENERIC_SPARK_COUNTS:-}' -e 'CUTEAFD_WIP_FP8_MOE_BF16_FAMILIES=$bf16_families' -e 'CUTEAFD_WIP_EXL3_AOT=${CUTEAFD_WIP_EXL3_AOT:-ON}' -e 'CUTEAFD_WIP_NVFP4_AOT=${CUTEAFD_WIP_NVFP4_AOT:-ON}' -e 'CUTEAFD_WIP_V41_AOT=${CUTEAFD_WIP_V41_AOT:-OFF}' -e 'CUTEAFD_WIP_VISION_ATTENTION_AOT=${CUTEAFD_WIP_VISION_ATTENTION_AOT:-OFF}' -e 'CUTEAFD_WIP_AUDIO_AOT=$audio_aot'${wip_exlr8_env[1]:+ -e '${wip_exlr8_env[1]}' -e 'CUTEAFD_WIP_EXLR8_FAMILIES=${CUTEAFD_WIP_EXLR8_FAMILIES}'} '$spark_container' python3 /wip/source/scripts/build/build-process.py --channel --timeout 7200 -- /wip/source/scripts/build/build-wip-artifacts.sh /wip/source expert 121 /wip/build/expert /wip/output/expert"
+  wip_pipe --timeout 7260 -- ssh -T -o BatchMode=yes "$seed_host" "$build_command rust" ||
     release_die "Spark WIP Rust phase on $seed_host failed (exit $?)"
   local seed_root
   seed_root="$(ssh -o BatchMode=yes "$seed_host" "docker inspect -f '{{range .Mounts}}{{if eq .Destination \"/wip\"}}{{.Source}}{{end}}{{end}}' '$spark_container'")"
@@ -1617,12 +1626,12 @@ build_expert() (
   native_store_sync "$seed_host" "$seed_root" aarch64 expert import
   local restore_command="${build_command/docker exec /docker exec -e CUTEAFD_WIP_NATIVE_REQUIRE_HIT=1 } native"
   if [[ "${wip_export_locks:-off}" != on ]]; then
-    timeout --kill-after=30 7260 ssh -o BatchMode=yes "$seed_host" "$build_command native"
+    wip_pipe --timeout 7260 -- ssh -T -o BatchMode=yes "$seed_host" "$build_command native"
   elif native_store_has "$seed_host" "$seed_root" expert; then
     echo "WIP Spark export: native cache hit, no export turn"
-    timeout --kill-after=30 7260 ssh -o BatchMode=yes "$seed_host" "$restore_command" ||
+    wip_pipe --timeout 7260 -- ssh -T -o BatchMode=yes "$seed_host" "$restore_command" ||
       release_die "Spark WIP native restore on $seed_host failed"
-  elif wip_cached_exports timeout --kill-after=30 7260 ssh -o BatchMode=yes "$seed_host" \
+  elif wip_cached_exports wip_pipe --timeout 7260 -- ssh -T -o BatchMode=yes "$seed_host" \
       "${build_command/docker exec /docker exec -e CUTEAFD_EXPORT_CACHE_REQUIRE_HIT=1 } native"; then
     echo "WIP Spark export: every export restored from the export cache, no export turn"
   else
@@ -1633,10 +1642,10 @@ build_expert() (
     native_store_sync "$seed_host" "$seed_root" aarch64 expert import
     if native_store_has "$seed_host" "$seed_root" expert; then
       echo "WIP Spark export: native cache hit after the export turn"
-      timeout --kill-after=30 7260 ssh -o BatchMode=yes "$seed_host" "$restore_command" ||
+      wip_pipe --timeout 7260 -- ssh -T -o BatchMode=yes "$seed_host" "$restore_command" ||
         release_die "Spark WIP native restore on $seed_host failed"
     else
-      timeout --kill-after=30 7260 ssh -o BatchMode=yes "$seed_host" "$build_command native" ||
+      wip_pipe --timeout 7260 -- ssh -T -o BatchMode=yes "$seed_host" "$build_command native" ||
         release_die "Spark WIP export on $seed_host failed"
     fi
     # Publish to the host store (hardlinks) before the next export on this seed.
@@ -1650,7 +1659,8 @@ build_expert() (
   local exlr8_remote=()
   local arg
   for arg in ${wip_exlr8_env[@]+"${wip_exlr8_env[@]}"}; do exlr8_remote+=("$(printf '%q' "$arg")"); done
-  timeout --kill-after=30 300 ssh -o BatchMode=yes "$seed_host" docker exec -e "CUTEAFD_WIP_BUILD_KEY=${wip_expert_key:-}" ${exlr8_remote[@]+"${exlr8_remote[@]}"} "$spark_container" \
+  wip_pipe --timeout 330 -- ssh -T -o BatchMode=yes "$seed_host" docker exec -i -e "CUTEAFD_WIP_SLOT_GENERATION=${wip_generation:-}" -e "CUTEAFD_WIP_BUILD_KEY=${wip_expert_key:-}" ${exlr8_remote[@]+"${exlr8_remote[@]}"} "$spark_container" \
+    python3 /wip/source/scripts/build/build-process.py --channel --timeout 300 -- \
     /wip/source/scripts/build/finalize-wip-slot.sh \
     /wip/source spark-expert "$slot" /wip/output/expert \
     "$image_id" "$image_id" "$(printf '%q' "$image_layers")"
@@ -1658,61 +1668,12 @@ build_expert() (
 
 # Role builders end here.
 wip_retain_counterpart() {
-# A named slot is launchable only when both role artifacts are present. A
-# role-specific rebuild must retain the cloned counterpart even if its build
-# helper stages or replaces only the selected role.
-if [[ -n "$from_slot" && "$role" == expert ]]; then
-  docker exec -i "$coordinator_container" bash -s -- "$from_slot" "$slot" "$(hostname -s)" <<'CONTAINER'
-set -euo pipefail
-from="$1"
-to="$2"
-if [ ! -d "/wip/slots/$to/coordinator" ]; then
-  test -d "/wip/slots/$from/coordinator" || { echo "${3:-coordinator}: missing source directory /wip/slots/$from/coordinator" >&2; exit 1; }
-  mkdir -p "/wip/slots/$to"
-  cp -a "/wip/slots/$from/coordinator" "/wip/slots/$to/coordinator"
-python3 - "/wip/slots/$to/coordinator" "$to" <<'RESEAL'
-import hashlib, json, pathlib, sys
-# A cloned role keeps its measured artifacts but was sealed for the source slot:
-# re-seal it as this slot (recording the source) so launch identity checks pass.
-d, to = pathlib.Path(sys.argv[1]), sys.argv[2]
-raw = (d / "META.json").read_bytes()
-assert hashlib.sha256(raw).hexdigest() == (d / "FINGERPRINT").read_text().strip(), "cloned role seal mismatch"
-meta = json.loads(raw)
-meta["cloned_from"] = meta.get("cloned_from") or meta["slot"]
-meta["slot"] = to
-body = json.dumps(meta, indent=2, sort_keys=True).encode() + b"\n"
-(d / "META.json").write_bytes(body)
-(d / "FINGERPRINT").write_text(hashlib.sha256(body).hexdigest() + "\n")
-RESEAL
-fi
-CONTAINER
-elif [[ -n "$from_slot" && "$role" == coordinator ]] && ((wip_spark_leg)); then
-  ssh -o BatchMode=yes "$seed_host" docker exec -i "$spark_container" bash -s -- "$from_slot" "$slot" "$seed_host" <<'CONTAINER'
-set -euo pipefail
-from="$1"
-to="$2"
-if [ ! -d "/wip/slots/$to/spark-expert" ]; then
-  test -d "/wip/slots/$from/spark-expert" || { echo "${3:-seed}: missing source directory /wip/slots/$from/spark-expert" >&2; exit 1; }
-  mkdir -p "/wip/slots/$to"
-  cp -a "/wip/slots/$from/spark-expert" "/wip/slots/$to/spark-expert"
-python3 - "/wip/slots/$to/spark-expert" "$to" <<'RESEAL'
-import hashlib, json, pathlib, sys
-# A cloned role keeps its measured artifacts but was sealed for the source slot:
-# re-seal it as this slot (recording the source) so launch identity checks pass.
-d, to = pathlib.Path(sys.argv[1]), sys.argv[2]
-raw = (d / "META.json").read_bytes()
-assert hashlib.sha256(raw).hexdigest() == (d / "FINGERPRINT").read_text().strip(), "cloned role seal mismatch"
-meta = json.loads(raw)
-meta["cloned_from"] = meta.get("cloned_from") or meta["slot"]
-meta["slot"] = to
-body = json.dumps(meta, indent=2, sort_keys=True).encode() + b"\n"
-(d / "META.json").write_bytes(body)
-(d / "FINGERPRINT").write_text(hashlib.sha256(body).hexdigest() + "\n")
-RESEAL
-fi
-CONTAINER
-fi
-
+  # When the lease balances to another seed, clone the counterpart on that seed.
+  if [[ -n "$from_slot" && "$role" == coordinator ]] && ((wip_spark_leg)); then
+    if ! ssh -o BatchMode=yes "$seed_host" docker exec "$spark_container" test -d "/wip/slots/$slot/spark-expert"; then
+      wip_clone_role "$seed_host" spark-expert
+    fi
+  fi
 }
 
 # How a sealed Spark slot reaches the serving Sparks. A seed on the RoCE fabric
@@ -1743,12 +1704,13 @@ distribute_expert_slot_from() {
   for host in "$@"; do
     (
       set -o pipefail
-      ssh -o BatchMode=yes "$host" \
-        "docker exec '$spark_container' bash -lc 'rm -rf /wip/incoming/$slot.spark-expert && mkdir -p /wip/incoming/$slot.spark-expert'"
+      local root incoming
+      root="$(wip_spark_mount "$host")"
+      incoming="$root/incoming/$slot.spark-expert.$wip_generation"
+      ssh -o BatchMode=yes "$host" "mkdir -p '$incoming'"
       stream_between_hosts "$src" "docker exec '$spark_container' tar -C '/wip/slots/$slot/spark-expert' -cf - ." \
-        "$host" "docker exec -i '$spark_container' tar -C '/wip/incoming/$slot.spark-expert' -xf -"
-      ssh -o BatchMode=yes "$host" \
-        "docker exec '$spark_container' bash -lc 'mkdir -p /wip/slots/$slot; rm -rf /wip/slots/$slot/spark-expert; mv /wip/incoming/$slot.spark-expert /wip/slots/$slot/spark-expert'"
+        "$host" "tar -C '$incoming' -xf -"
+      wip_publish_expert "$host" "$root" "$incoming"
     ) &
     pids+=("$!")
   done
@@ -1804,13 +1766,13 @@ nest seal "$archive" >/dev/null
   local host
   local -a pids=()
   for host in "$@"; do
-    ssh -o BatchMode=yes "$host" bash -s -- "$archive" "$spark_container" "$slot" <<'EXTRACT' &
-set -euo pipefail
-archive="$1"; container="$2"; slot="$3"
-docker exec "$container" bash -lc "rm -rf /wip/incoming/$slot.spark-expert && mkdir -p /wip/incoming/$slot.spark-expert"
-zstd -d -q <"$archive" | docker exec -i "$container" tar -C "/wip/incoming/$slot.spark-expert" -xf -
-docker exec "$container" bash -lc "mkdir -p /wip/slots/$slot; rm -rf /wip/slots/$slot/spark-expert; mv /wip/incoming/$slot.spark-expert /wip/slots/$slot/spark-expert"
-EXTRACT
+    (
+      local root incoming
+      root="$(wip_spark_mount "$host")"
+      incoming="$root/incoming/$slot.spark-expert.$wip_generation"
+      ssh -o BatchMode=yes "$host" "set -o pipefail; mkdir -p '$incoming' && zstd -d -q <'$archive' | tar -C '$incoming' -xf -"
+      wip_publish_expert "$host" "$root" "$incoming"
+    ) &
     pids+=("$!")
   done
   local failed=0 pid

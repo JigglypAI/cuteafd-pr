@@ -447,6 +447,13 @@ python3 "$build_root/source/scripts/build/sparkinfer-release-provenance.py" \
 )
 test -x "$output_dir/cuteafd"
 test -s "$output_dir/libcuteafd_native.so"
+# Audit the shipped AOT host code before image assembly: coordinator wrappers
+# link into the base native library, EXL3 and FP8 packages. The v4 pair is gated
+# separately at runtime; the Rust daemon also has dispatched CRC routines.
+if [[ "$role" == coordinator && "$(uname -m)" == x86_64 ]]; then
+  python3 "$source_dir/scripts/build/check-host-isa.py" \
+    "$output_dir/libcuteafd_native.so" "$output_dir/exl3" "$output_dir/fp8"
+fi
 # EXLR8 images: the engine's fail-closed loader validates the built table and
 # its manifest, and the role's EXLR8 programs must all be present.
 if [[ "${CUTEAFD_RELEASE_EXLR8_AOT:-OFF}" == ON ]]; then

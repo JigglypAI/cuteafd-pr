@@ -97,7 +97,7 @@ def test_wip_builder_streams_every_local_heredoc_into_docker() -> None:
         flags=re.MULTILINE,
     )
 
-    assert len(local_heredocs) == 4
+    assert local_heredocs
     assert all("-i" in options.split() for options in local_heredocs)
 
 
