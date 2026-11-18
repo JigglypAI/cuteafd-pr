@@ -48,7 +48,7 @@ BF16 implementation (maximum +0.00006222), and some V4 cases also exceed the
 bound. Carbon's tested cold capture and legacy FP8 exports pass, but R1 is
 not a qualified winner. The occupancy design required multiple steering
 passes before a measurable commit; keep later work scoped to one route at a
-time. Context partials are a separate, still-open target.
+time. The separate context-partial duel is recorded next.
 
 Target-1 scores (correctness / judgment / quality / creativity): Astra
 5 / 5 / 5 / 5; Carbon 2 / 3 / 3 / 4. Astra finished four measured rounds;
@@ -56,6 +56,45 @@ Carbon needed more than 45 minutes to reach its first implementation
 checkpoint. Evidence: organizer Max-Q and raptor row tables under
 `~/.cache/cuteafd/builds/attention-precision/`, fork #386 and #391.
 
+
+### 2026-11-18 BF16 Sparse MLA Duel: Target 2
+
+Astra `d707d5a7` retains token-sharded context decode (fork #397; engine
+#2477). The guarded #386 sweep (`7ad4434a`) covers 4,608 live row/plan cases
+on one RTX PRO 6000 (188 SMs), using alternating warmed CUDA graph blocks
+and the slower rank per block. Astra matches the first version's FP8 and
+BF16 RMS/LSE metrics in all cases and reaches FP8 latency within measured
+spread after the focused GLM row-34 repeat. Two-shard integration is 120/120
+and the independent FP64/poison probe has no failures. From Astra R1 to R2,
+only the two ML4 RoPE s11 BF16 context objects changed.
+
+Carbon final `8b0a9a4f`, measured on the same fork base `578cbb5c`, passes all
+120 integration cases, the independent FP64/poison probe and all three cold
+first-launch capture cases. The integration suite includes an empty shard
+with negative-infinity LSE. Balanced/asymmetric median Carbon/Astra latency:
+GLM 0.789/0.819x, GLMF 0.906/0.888x, V4 Flash 0.907/0.918x, V4 Pro
+0.982/0.973x, ML4 RoPE 0.838/0.856x, and ML4 NoPE 0.886/0.886x.
+Eight cases are slower than Astra outside the observed spread (worst 1.059x,
+ML4 NoPE); none is outside its own FP8 spread. FP8 and BF16 LSE metrics
+match the first version, but BF16 output RMS is higher in 400/4,608 cases
+(worst +5.425e-8, GLMF asymmetric, plan 64, live row 9, head begin 0).
+The difference is small but fails the predeclared no-worse numerical bar.
+
+The targeted audit found all 54 FP8 context partials byte-identical. Carbon
+changes 54 BF16 context partials and 42 BF16 whole/head decode siblings
+relative to Astra, with no additions, removals or ABI changes in 1,696
+compared objects. Neither suite recorded thermal slowdown; GPU power-cap
+time across the full probe/test/sweep window was 6.14 s for Astra and
+9.65 s for Carbon. No busy-window clock or T.Limit series was recorded for
+these microbenchmarks. Do not promote Carbon or schedule another round on
+this evidence. Keep the low-row speedup as a lead for a numerically exact,
+context-only change if the route needs further work.
+
+Target-2 scores (correctness / judgment / quality / creativity): Astra
+5 / 5 / 5 / 5; Carbon 3 / 3 / 3 / 5. Both reached a measured second round;
+Carbon's broader dispatch/merge design was faster in most cases but missed
+the error and per-cell speed bars and touched the already-qualified target.
+See #2459 for the verdict and organizer receipts.
 
 ### 2026-11-15 Muse Scaled FP8 KV Attention Duel: Owner Retained
 
