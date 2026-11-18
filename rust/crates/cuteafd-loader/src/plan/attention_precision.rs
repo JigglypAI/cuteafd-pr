@@ -1,10 +1,10 @@
-//! Shared attention QK/PV precision, independent of core and KV storage.
+//! Shared attention quality tier, independent of core and KV storage.
 use super::PlanError;
 pub use cuteafd_core::attention::AttentionPrecision;
 
 pub const OPTION: &str = "--attention-precision";
 
-/// The attention operand modes provided by a family's programs.
+/// The attention quality tiers provided by a family's programs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PrecisionSupport {
     pub modes: &'static [AttentionPrecision],
@@ -17,7 +17,7 @@ pub const BF16_ONLY: PrecisionSupport = PrecisionSupport {
 };
 pub const MLA: PrecisionSupport = PrecisionSupport {
     modes: &[AttentionPrecision::Bf16, AttentionPrecision::Fp8],
-    source: "shared MLA BF16 QK/PV default; FP8 attention is opt-in (#2146)",
+    source: "shared MLA BF16-tier default; faster, lower-quality FP8 attention is opt-in (#2146)",
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]

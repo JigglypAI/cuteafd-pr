@@ -1,6 +1,6 @@
-//! Attention operand precision, independent of weights and KV storage.
+//! Attention quality tiers, independent of weights and KV storage.
 
-/// Operand precision of both attention QK and PV products (FP32 accumulation).
+/// Attention quality tier; implementations need not use the tier name's operand type.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum AttentionPrecision {

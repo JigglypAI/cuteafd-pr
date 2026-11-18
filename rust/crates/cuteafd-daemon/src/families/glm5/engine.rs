@@ -3330,7 +3330,14 @@ pub(crate) fn tensor_fp8_prefill() -> bool {
 /// The native prefill path uses the same typed precision as decode and plan.
 pub(crate) fn native_mla_prefill(precision: cuteafd_core::attention::AttentionPrecision)
     -> Option<cuteafd_ffi::MlaPrefillKernel> {
-    Some(precision.into())
+    use cuteafd_core::attention::AttentionPrecision;
+    use cuteafd_ffi::MlaPrefillKernel;
+    // Native Q2P2 meets BF16-tier accuracy. For the optional lower tier use
+    // the separate AOT prefill recipe, not a different label for Q2P2.
+    match precision {
+        AttentionPrecision::Bf16 => Some(MlaPrefillKernel::Fp8),
+        AttentionPrecision::Fp8 => None,
+    }
 }
 
 /// CUTEAFD_MLA_PREFILL_CHECK=1: after each prefill MLA, run both native kernels on its inputs and

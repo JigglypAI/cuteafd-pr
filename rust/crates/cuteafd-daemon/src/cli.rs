@@ -341,7 +341,7 @@ pub(crate) fn exlr8_prefill_activations_parser()
 /// Model-lifetime core selection shared by planner, serve and golden commands.
 #[derive(Debug, Clone, Default, Args)]
 pub(crate) struct CoreViewArgs {
-    /// Attention QK and PV operand precision, independent of weights and KV storage.
+    /// Attention quality tier, independent of weights and KV storage.
     #[arg(long, default_value = "bf16")]
     pub attention_precision: cuteafd_core::attention::AttentionPrecision,
     #[arg(skip)]
@@ -1558,7 +1558,7 @@ mod tests {
 
 #[derive(Debug, Args)]
 pub(crate) struct NativeServeArgs {
-    /// Shared MLA QK/PV operand precision, independent of KV storage.
+    /// Shared MLA quality tier, independent of KV storage.
     #[arg(long, default_value = "bf16")]
     pub attention_precision: cuteafd_core::attention::AttentionPrecision,
     /// Count executed backbone expert routes by phase (disable with =false).
