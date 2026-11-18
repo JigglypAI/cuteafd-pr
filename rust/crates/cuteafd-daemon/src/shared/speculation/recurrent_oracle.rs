@@ -163,7 +163,8 @@ fn installed_inkling_recurrent_head_baseline() -> Result<()> {
             let weight = head()?;
             if let ProjectionWeight::Bf16(w) = weight {
                 // SAFETY: same retained BF16 operands as the original head.
-                return unsafe { rank.programs.plain.launch_checked(hidden.ptr, w.buffer.ptr, output, rows, h, n, stream.raw) };
+                unsafe { rank.programs.plain.launch_checked(hidden.ptr, w.buffer.ptr, output, rows, h, n, stream.raw)?; }
+                return Ok(());
             }
             kernels.project_compact(&stream, hidden, weight, f32_stage.buffer, rows, h, stored)?;
             // SAFETY: typed scratch covers physical row pitch; copy strips only

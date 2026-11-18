@@ -41,7 +41,8 @@ impl Rank<'_> {
         self.recurrent_tokens_measured(sequences, anchor_ids, |hidden, output| {
             // SAFETY: native BF16 head and admitted inputs/output outlive the stream.
             unsafe { self.programs.plain.launch_checked(hidden.ptr, target_head.ptr, output, sequences,
-                self.config.transformer.hidden, self.config.padded_vocab, self.stream.raw) }
+                self.config.transformer.hidden, self.config.padded_vocab, self.stream.raw)?; }
+            Ok(())
         }, |_, _| Ok(()))
     }
 
