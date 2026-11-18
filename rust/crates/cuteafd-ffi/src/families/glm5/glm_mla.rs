@@ -1,4 +1,4 @@
-//! Sparse MLA prefill on F16 or E4M3 tensor cores (`native/families/glm5/cuda/glm_mla_prefill.cu`):
+//! Sparse MLA prefill on BF16 or E4M3 tensor cores (`native/families/glm5/cuda/glm_mla_prefill.cu`):
 //! GLM 5.x 656-byte and GLM 5.3 Flash 528-byte FP8 latent records.
 use crate::NativeLibrary;
 use anyhow::{ensure, Result};
@@ -26,8 +26,8 @@ impl NativeLibrary {
     /// first `lengths[r]` entries of `indices` [rows, topk] (record slots;
     /// negative entries masked) in `kv` (slot * `record_bytes`: 656 with RoPE,
     /// 528 without); `q` [rows, heads, 576 or 512] BF16. `scale_log2` is the
-    /// softmax scale times log2(e). `kernel`: 0 F16, 1 E4M3 (two-term
-    /// query and P).
+    /// softmax scale times log2(e). BF16 uses exact widened codes with FP32
+    /// record scales after QK and BF16 P*scale for PV; FP8 uses two-term E4M3 Q/P.
     ///
     /// # Safety
     /// Every pointer is live device memory of those shapes on the stream's device.
