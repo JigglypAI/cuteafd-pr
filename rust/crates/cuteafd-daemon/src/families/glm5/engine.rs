@@ -3332,11 +3332,10 @@ pub(crate) fn native_mla_prefill(precision: cuteafd_core::attention::AttentionPr
     -> Option<cuteafd_ffi::MlaPrefillKernel> {
     use cuteafd_core::attention::AttentionPrecision;
     use cuteafd_ffi::MlaPrefillKernel;
-    // Native Q2P2 meets BF16-tier accuracy. For the optional lower tier use
-    // the separate AOT prefill recipe, not a different label for Q2P2.
+    // Native Q2P2 meets the BF16-tier accuracy bound. The prefill tier
+    // selector can add a different FP8 route once it is qualified.
     match precision {
-        AttentionPrecision::Bf16 => Some(MlaPrefillKernel::Fp8),
-        AttentionPrecision::Fp8 => None,
+        AttentionPrecision::Bf16 | AttentionPrecision::Fp8 => Some(MlaPrefillKernel::Fp8),
     }
 }
 
