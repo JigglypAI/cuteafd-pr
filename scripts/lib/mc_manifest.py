@@ -7,11 +7,18 @@ from __future__ import annotations
 import hashlib
 import json
 from pathlib import Path
+import re
 
 SCHEMA = "cuteafd-mc-v1"
 MANIFEST = "cuteafd-mc.json"
 SUPPORTED_FEATURES: frozenset[str] = frozenset()
 MAX_JSON_BYTES = 512 * 1024 * 1024
+ENGRAM_LAYOUT = "fp8_e4m3_f32scale_row_interleaved_v1"
+ENGRAM_ROW_BYTES = 100
+ENGRAM_MAX_PART_BYTES = 45_000_000_000
+ENGRAM_RECIPE = ("vendor BF16 per-row E4M3 round trip, BF16 scale held in F32, "
+                 "decode = BF16(F32 code*scale)")
+ENGRAM_TENSOR = re.compile(r"model\.layers\.(0|[1-9][0-9]{0,3})\.engram_layer\.multi_head_embedding\.embedding\.weight")
 FILES = {
     "original": ("model.safetensors.index.json", "config.json", "quantize_config.json", 16),
     "k8-compact": ("model.k8.safetensors.index.json", "config.k8.json", "quantize_config.k8.json", 8),
@@ -32,10 +39,70 @@ def _digest(value):
     return isinstance(value, str) and len(value) == 64 and all(c in "0123456789abcdef" for c in value)
 
 
-def _fields(value, expected, *, optional=()):
+def _fields(value, expected, *, optional=(), strict=True):
     expected = set(expected)
-    _require(isinstance(value, dict) and expected <= value.keys() <= expected.union(optional),
+    _require(isinstance(value, dict) and expected <= value.keys()
+             and (not strict or value.keys() <= expected.union(optional)),
              f"expected fields {sorted(expected)}" + (f" with optional fields {sorted(optional)}" if optional else ""))
+
+
+def engram_layer(tensor):
+    match = ENGRAM_TENSOR.fullmatch(tensor) if isinstance(tensor, str) else None
+    _require(match is not None, "invalid Engram BF16 tensor name")
+    return int(match[1])
+
+
+def engram_part_names(tensor, layer, number):
+    return (tensor.removesuffix(".weight") + f".strided_{number:05d}",
+            f"engram-fp8-layer-{layer:02d}-part-{number:05d}.safetensors")
+
+
+def validate_engram_fp8(engram, *, strict=False):
+    """Validate the optional alternate without opening tensor files."""
+    _fields(engram, ("layout", "row_bytes", "code_dtype", "scale_dtype", "recipe", "layers"),
+            strict=strict)
+    _require(engram["layout"] == ENGRAM_LAYOUT
+             and type(engram["row_bytes"]) is int and engram["row_bytes"] == ENGRAM_ROW_BYTES
+             and engram["code_dtype"] == "F8_E4M3" and engram["scale_dtype"] == "F32",
+             "invalid FP8 Engram layout")
+    recipe = engram["recipe"]
+    _require(isinstance(recipe, str)
+             and re.fullmatch(re.escape(ENGRAM_RECIPE) + r"; reference=[0-9a-f]{40}", recipe),
+             "invalid FP8 Engram recipe or pinned reference")
+    layers = engram["layers"]
+    _require(isinstance(layers, list) and bool(layers), "FP8 Engram requires layers")
+    previous = -1
+    for layer in layers:
+        _fields(layer, ("tensor", "sha256", "parts"), strict=strict)
+        number = engram_layer(layer["tensor"])
+        _require(number > previous and _digest(layer["sha256"]),
+                 "FP8 Engram layers must be ordered and carry BF16 tensor SHA256")
+        previous = number
+        parts = layer["parts"]
+        _require(isinstance(parts, list) and 0 < len(parts) <= 100_000,
+                 "FP8 Engram requires ordered row parts")
+        for i, part in enumerate(parts):
+            _fields(part, ("tensor", "file", "rows", "sha256"), strict=strict)
+            _require((part["tensor"], part["file"]) == engram_part_names(layer["tensor"], number, i),
+                     "invalid FP8 Engram part tensor or filename order")
+            _require(type(part["rows"]) is int and 0 < part["rows"] * ENGRAM_ROW_BYTES < ENGRAM_MAX_PART_BYTES,
+                     "invalid FP8 Engram part extent")
+            _require(_digest(part["sha256"]), "invalid FP8 Engram part SHA256")
+    return engram
+
+
+def _check_engram_index(engram, weights, core):
+    if engram is None:
+        return
+    shards = set(weights.values())
+    core = set(core)
+    for layer in engram["layers"]:
+        name = layer["tensor"]
+        filename = f"engram-bf16-layer-{engram_layer(name):02d}.safetensors"
+        _require(weights.get(name) == filename and name not in core,
+                 "BF16 Engram table missing from shared index")
+        _require(all(part["tensor"] not in weights and part["file"] not in shards
+                     for part in layer["parts"]), "FP8 Engram part leaked into standard index")
 
 
 def shared_inventory_digest(weight_map, core_tensors):
@@ -71,7 +138,8 @@ def _read(root, name):
 def validate(manifest, root=None, view=None):
     """Validate schema and optionally selected (or all) view metadata on disk."""
     _fields(manifest, ("schema", "source", "original_core_dtype", "shared_inventory_sha256", "variants"),
-            optional=("required_features",))
+            optional=("required_features", "engram_fp8"))
+    engram = validate_engram_fp8(manifest["engram_fp8"]) if "engram_fp8" in manifest else None
     _require(manifest["schema"] == SCHEMA, "unsupported MC schema")
     features = manifest.get("required_features", [])
     _require(isinstance(features, list) and all(isinstance(f, str) for f in features),
@@ -109,13 +177,15 @@ def validate(manifest, root=None, view=None):
             _require(all(hashlib.sha256(contents[n]).hexdigest() == d for n, d in hashes.items()), "MC metadata digest mismatch")
             weights = json.loads(contents[index])["weight_map"]
             _require(shared_inventory_digest(weights, core) == shared, "MC shared inventory digest mismatch")
+            _check_engram_index(engram, weights, core)
     _require("original" in names, "MC requires original view")
     if view is not None:
         _require(("original" if view == "fp8-compact" else view) in names, f"CORE_VIEW={view} is absent")
     return manifest
 
 
-def build(root, *, source_repo, source_revision, core_tensors, original_core_dtype="BF16", required_features=None):
+def build(root, *, source_repo, source_revision, core_tensors, original_core_dtype="BF16",
+          required_features=None, engram_fp8=None):
     """Build discovery metadata from sealed view files and their core name lists.
 
     Does not write or publish anything. `core_tensors` maps variant names to all
@@ -139,6 +209,8 @@ def build(root, *, source_repo, source_revision, core_tensors, original_core_dty
                     original_core_dtype=original_core_dtype, shared_inventory_sha256=shared, variants=variants)
     if required_features is not None:
         manifest["required_features"] = required_features
+    if engram_fp8 is not None:
+        manifest["engram_fp8"] = engram_fp8
     validate(manifest, root)
     _require(len(json.dumps(manifest).encode()) <= MAX_JSON_BYTES, "MC manifest exceeds metadata limit")
     return manifest

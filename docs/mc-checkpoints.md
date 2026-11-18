@@ -105,6 +105,12 @@ top-level `required_features` array of strings (omitted means empty); an engine
 refuses a checkpoint requiring a feature it does not support. No features are
 currently defined. Breaking changes to known fields require a schema bump.
 
+The optional `engram_fp8` inventory records Hy4-flash alternate embedding shards.
+Each 100-byte row has 96 E4M3 codes and a BF16-rounded scale stored as F32.
+Decode multiplies in F32 and casts to BF16. The exporter compares every row
+bitwise with the pinned stock BF16 lookup expression, including signed zero.
+All standard indexes use the original BF16 tables.
+
 Unknown schema versions or variant names, duplicate variants/tensor names,
 invalid hashes, unsafe filenames and incomplete views still fail closed. Core bits
 are exactly 16, 8 and 6 respectively. FP8-origin declarations fail before any
