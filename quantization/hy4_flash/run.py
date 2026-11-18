@@ -48,6 +48,10 @@ LEGACY_GPTQMODEL_COMMIT = "6b7f7c48d6be9a3737958e1dac3b94b8ce251695"
 BATCHED_HESSIAN_COMMIT = "d606eaccc7fe026b8c83e97a8a8693f6e364e21b"
 
 
+PACED_GPTQMODEL_COMMIT = "43180de6cee3e6398d367d639dddacda0b02f3f1"
+BATCHED_RUNNER_COMMIT = "988f8f40281bbc72114486b48100f72f4ab212b1"
+
+
 def read_json(path):
     return json.loads(path.read_text())
 
@@ -124,8 +128,9 @@ def checkpoint_identity(root, candidate, *, resume_legacy):
 
     frozen_fork, candidate_fork = frozen["code"]["fork"], candidate["code"]["fork"]
     batched = frozen_fork != candidate_fork
-    if batched and (frozen_fork, candidate_fork) != (LEGACY_GPTQMODEL_COMMIT, BATCHED_HESSIAN_COMMIT):
-        raise ValueError("Hy4 recovery only accepts the reviewed batched Hessian fork change")
+    paced = candidate_fork == PACED_GPTQMODEL_COMMIT
+    if batched and (frozen_fork != LEGACY_GPTQMODEL_COMMIT or candidate_fork not in (BATCHED_HESSIAN_COMMIT, PACED_GPTQMODEL_COMMIT)):
+        raise ValueError("Hy4 recovery only accepts reviewed fork revisions")
     files = candidate["code"]["files"] | resident_code_at(LEGACY_EXPERT_SPOOL_COMMIT)
     legacy = candidate | {"code": candidate["code"] | {"files": files, "fork": frozen_fork}}
     if frozen != legacy:
@@ -141,6 +146,17 @@ def checkpoint_identity(root, candidate, *, resume_legacy):
         recovery_path = batched_path
         expected = expected | dict(schema="hy4-batched-hessian-v1", fork_commit=candidate_fork,
                                    prior_backend_commit=RESIDENT_EXPERTS_COMMIT)
+        if paced:
+            prior = expected | dict(code=resident_code_at(BATCHED_RUNNER_COMMIT),
+                                    fork_commit=BATCHED_HESSIAN_COMMIT)
+            if not batched_path.is_file() or read_json(batched_path) != prior:
+                raise ValueError("paced resume requires the verified batched Hessian receipt")
+            pause_ms = float(os.environ.get("GPTQMODEL_EXL3_SPAN_PAUSE_MS", "0"))
+            if pause_ms != 1.0:
+                raise ValueError("paced Hy4 production requires a 1 ms gap per LDLQ span")
+            recovery_path = root / "paced-trellis-recovery.json"
+            expected = expected | dict(schema="hy4-paced-trellis-v1", span_pause_ms=pause_ms,
+                                       prior_backend_commit=BATCHED_RUNNER_COMMIT)
     elif batched_path.exists():
         raise ValueError("Hy4 batched Hessian recovery already owns this run")
 
@@ -791,6 +807,9 @@ class Runner:
         batched = self.root / "batched-hessian-recovery.json"
         if batched.is_file():
             complete["batched_hessian_recovery"] = read_json(batched)
+        paced = self.root / "paced-trellis-recovery.json"
+        if paced.is_file():
+            complete["paced_trellis_recovery"] = read_json(paced)
         atomic_json(self.root / "numerical-complete.json", complete)
         atomic_json(self.root / "status.json", dict(self.progress.base, status="passed",
                     phase="numerical_complete", updated_at=datetime.now(timezone.utc).isoformat()))

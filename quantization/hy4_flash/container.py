@@ -39,6 +39,8 @@ def command(arguments, phase):
         "-e", "HF_HUB_OFFLINE=1",
         "-e", "PYTHONUNBUFFERED=1",
     ]
+    if phase == "production":
+        argv[image:image] = ["-e", "GPTQMODEL_EXL3_SPAN_PAUSE_MS=1"]
     return argv
 
 
