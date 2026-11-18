@@ -25,8 +25,11 @@ STARTING = re.compile(r"^(?P<model>[a-z0-9.-]+)-(?P<profile>min|max)(?:-(?:fp8|n
 ML4_QUALIFICATION = {f"mistral-large4-exl3-k4-{size}.config" for size in ("min", "max")}
 NEW_PUBLICATIONS = {f"{model}-{size}.config" for model in
                     ("mistral-large4-exl3-k4", "glm53-flash-exl3-k4-mc",
+                     "glm53-flash-exl3-k325-mc",
                      "glm53-exl3-k4-mc", "step5-exl3-k4-mc", "muse-spark-exl3-k4-mc") for size in ("min", "max")}
-QUALIFICATION = {"inkling2-mxfp8-min.config", "inkling2-nvfp4-min.config", "inkling2-exl3-min.config", "kimi-k31-exl3-k2-mc-max.config", "minimax-m31-flash-nvfp4-min.config", "minimax-m31-flash-nvfp4-max.config", "kimi-k3-exl3-max.config", "kimi-k3-exl3-k6-min.config", "kimi-k3-exl3-k6-max.config", "step5-fp8-max.config", "step5-nvfp4-min.config",
+QUALIFICATION = {"inkling2-mxfp8-min.config", "inkling2-mxfp8-max.config",
+                 "inkling2-nvfp4-min.config", "inkling2-exl3-min.config", "inkling2-exl3-max.config",
+                 "kimi-k31-exl3-k2-mc-min.config", "kimi-k31-exl3-k2-mc-max.config", "minimax-m31-flash-nvfp4-min.config", "minimax-m31-flash-nvfp4-max.config", "kimi-k3-exl3-max.config", "kimi-k3-exl3-k6-min.config", "kimi-k3-exl3-k6-max.config", "step5-fp8-max.config", "step5-nvfp4-min.config",
                  "muse-spark-exl3-min.config", "muse-spark-exl3-max.config",
                  "step5-exl3-k6core-min.config", "step5-exl3-k6core-max.config"} | ML4_QUALIFICATION | NEW_PUBLICATIONS
 V4_PREP = {"qwen35-9b-bf16-min.config", "glm53-exlr8-min.config", "glm53-exlr8-max.config",
@@ -468,9 +471,9 @@ def test_published_matrix_pins_current_reports() -> None:
         identity = row["family"], row["checkpoint"]
         assert all(identity) and identity not in identities
         identities.add(identity)
-        assert set(row) == {"family", "checkpoint", "5090", "1rtx", "2rtx"}
+        assert set(row) == {"family", "checkpoint", "1rtx", "2rtx"}
         current = []
-        for column in ("5090", "1rtx", "2rtx"):
+        for column in ("1rtx", "2rtx"):
             cell = row[column]
             assert cell["status"] in {"current", "held", "pending", "na"}
             if cell["status"] != "current":
@@ -489,22 +492,18 @@ def test_published_matrix_pins_current_reports() -> None:
             assert (server["family"], repo) == identity
             assert report["profile"] in {"smoke", "share"}
             settings = {s["name"]: s.get("value") for s in server["configuration"].get("settings", [])}
-            simulated = settings.get("simulated") == "5090"
-            small_column = simulated or settings.get("hardware.class") == "5090"
+            assert settings.get("simulated") != "5090" and settings.get("hardware.class") != "5090", \
+                "a 5090-class card never fills a PRO column"
             gpus = server["hardware"]["gpus"]
             used = [gpu for gpu in gpus if gpu.get("used")] or gpus
-            if column == "5090":
-                assert small_column and len(used) == 1
-                assert simulated or all("RTX 5090" in gpu["name"] for gpu in used)
-            else:
-                assert not small_column and len(used) == int(column[0])
-            assert report.get("baseline") or column == "5090" and settings.get("qualification.no-fit")
+            assert len(used) == int(column[0])
+            assert report.get("baseline")
             assert f'href="{directory.as_posix()}/card.svg"' in results
             assert (ROOT / directory / "card.svg").is_file()
             current.append(cell)
         if not current:
             assert row["checkpoint"] in results, "Unmeasured checkpoints remain visible"
-            for column in ("5090", "1rtx", "2rtx"):
+            for column in ("1rtx", "2rtx"):
                 assert html.escape(row[column]["reason"]).replace("&#x27;", "&#39;") in results
     retired_names = set()
     for entry in matrix["retired"]:
@@ -520,7 +519,7 @@ def test_published_matrix_pins_current_reports() -> None:
         label = build["release"] or build["commit"][:12] + ("+dirty" if build.get("dirty") else "")
         assert f'build {label}; commit {build["commit"]};' in row
         assert f'href="{entry["report"]}/card.svg"' in results
-    assert "simulated-5090" not in json.dumps(matrix)
+    assert all("5090" not in row for row in matrix["cells"]), "the 5090 column is retired"
 
 
 def assert_archived_config(entry: dict) -> None:
@@ -597,6 +596,157 @@ def test_v5_smoke_card_inventory() -> None:
     assert len({(family, model) for family, model, _ in cards}) == 20
     assert sum(column == "5090" for _, _, column in cards) == 6
     assert not names.intersection(entry["name"] for entry in smoke["retired"])
+
+
+V6 = "scripts/bench/release-smoke-v6.json"
+V6_COMPACT = "scripts/bench/release-smoke-v6-mc-compact.json"
+
+MC_CHECKPOINTS = {
+    "wrldsuksgo2mars/GLM-5.3-EXL3-K4-MC",
+    "wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K4-MC",
+    "wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K3.25-MC",
+    "wrldsuksgo2mars/Kimi-K3.1-Pro-EXL3-K2-MC",
+    "wrldsuksgo2mars/Muse-Spark-Open-EXL3-K4-MC",
+    "wrldsuksgo2mars/Step-5-Preview-EXL3-K4-MC",
+    "wrldsuksgo2mars/Inkling-2-Small-EXL3-K4-MC",
+}
+
+
+def _effective(entry: dict, matrix: dict) -> dict[str, str]:
+    return {**keys(ROOT / entry["config"]), **matrix["defaults"]["set"], **entry["set"]}
+
+
+GATE_KIT = "scripts/bench/kits/gate/matrix-gate.json"
+# Each family's shipped drafter; Kimi splits by checkpoint (K3 Core-K6 DFlash2,
+# K3.1 block DSpark).
+GATE_SPECULATOR_DEFAULTS = {"deepseek_v41": "dspark", "deepseek_v4": "dspark",
+                            "glm5": "dflash2", "glm5_flash": "dflash2",
+                            "mimo_v2": "dflash2", "qwen4": "mtp", "step5": "mtp",
+                            "muse_spark": "dflash2", "minimax_m3": "dspark"}
+# Card name -> why it intentionally differs from the family default. Empty:
+# no gate card overrides its family's shipped drafter.
+GATE_SPECULATOR_EXCEPTIONS: dict[str, str] = {}
+
+
+def _default_speculator(family: str, model: str) -> str:
+    if family == "kimi_k3":
+        return "dspark" if "K3.1" in model else "dflash2"
+    return GATE_SPECULATOR_DEFAULTS[family]
+
+
+def test_gate_kit_cards_resolve_each_family_default_speculator() -> None:
+    matrix = json.loads((ROOT / GATE_KIT).read_text())
+    names = set()
+    kimi = set()
+    for entry in matrix["entries"]:
+        assert entry["name"] not in names, entry["name"]
+        names.add(entry["name"])
+        values = {**keys(ROOT / entry["config"]), **entry.get("set", {})}
+        if entry["family"] == "kimi_k3":
+            kimi.add(values["MODEL_ID"])
+        if entry["name"] in GATE_SPECULATOR_EXCEPTIONS:
+            assert GATE_SPECULATOR_EXCEPTIONS[entry["name"]].strip(), entry["name"]
+            continue
+        declared = values.get("SPECULATOR", "auto")
+        expected = _default_speculator(entry["family"], values["MODEL_ID"])
+        assert declared != "off", f"{entry['name']}: cards run the family's shipped drafter"
+        assert (expected if declared == "auto" else declared) == expected, entry["name"]
+        assert "SPECULATOR_MODEL_ID" not in entry.get("set", {}), entry["name"]
+    # Both Kimi generations have their own cards, on their own shipped drafters.
+    assert kimi == {"wrldsuksgo2mars/Kimi-K3-EXL3-K2-Core-K6",
+                    "wrldsuksgo2mars/Kimi-K3.1-Pro-EXL3-K2-MC"}
+
+
+def test_v6_smoke_matrix_retires_the_5090_column() -> None:
+    smoke = json.loads((ROOT / V6).read_text())
+    names, ports, cards = set(), set(), set()
+    for entry in smoke["entries"]:
+        name = entry["name"]
+        assert name not in names, name
+        names.add(name)
+        assert "5090" not in name
+        assert (ROOT / entry["config"]).is_file()
+        values = _effective(entry, smoke)
+        assert re.fullmatch(r"[a-f0-9]{40}", values["MODEL_REVISION"]), entry["name"]
+        assert not {"BENCH_HARDWARE_CLASS", "BENCH_SIMULATED", "GPU_MEMORY_CAP"}.intersection(values)
+        assert not any("5090" in value for value in values.values()), entry["name"]
+        assert len(entry["gpus"]) == int(values["RTX_GPUS"])
+        assert values["COORDINATOR_GPUS"] == ",".join(map(str, entry["gpus"]))
+        assert len(entry["sparks"]) == int(values["SPARK_COUNT"])
+        for rank, host in enumerate(entry["sparks"]):
+            assert host == values[f"SPARK_{rank}_HOST"] == f"REPLACE-ME-spark-{rank}"
+        if entry["sparks"]:
+            assert "REPLACE-ME-v6-rc" in values["SPARK_EXPERT_DOCKER_INFERENCE"], entry["name"]
+        for key in ("ADDR", "EXPERT_PORT"):
+            if key in values:
+                assert values[key] not in ports, (entry["name"], key)
+                ports.add(values[key])
+        column = f"{len(entry['gpus'])}rtx"
+        identity = (entry["family"], values["MODEL_ID"], column)
+        assert identity not in cards, identity
+        cards.add(identity)
+    assert len(names) == len(smoke["entries"]) == 35
+    # The approved v6 families and their columns.
+    assert {(family, column) for family, _, column in cards} >= {
+        ("deepseek_v41", "1rtx"), ("deepseek_v41", "2rtx"),
+        ("kimi_k3", "1rtx"), ("kimi_k3", "2rtx"),
+        ("glm5_flash", "1rtx"), ("glm5_flash", "2rtx"),
+        ("mimo_v2", "1rtx"), ("mimo_v2", "2rtx"),
+        ("qwen4", "1rtx"), ("qwen3_5", "1rtx"),
+        ("mistral_large4", "1rtx"), ("mistral_large4", "2rtx"),
+        ("muse_spark", "1rtx"), ("muse_spark", "2rtx"),
+        ("step5", "1rtx"), ("step5", "2rtx"),
+        ("minimax_m3", "1rtx"), ("minimax_m3", "2rtx"),
+        ("inkling2", "1rtx"), ("inkling2", "2rtx"),
+    }
+    assert not names.intersection(entry["name"] for entry in smoke["retired"])
+
+
+def test_v6_mc_main_cards_use_the_original_core_except_kimi_1x() -> None:
+    smoke = json.loads((ROOT / V6).read_text())
+    seen = set()
+    for entry in smoke["entries"]:
+        values = _effective(entry, smoke)
+        if values["MODEL_ID"] not in MC_CHECKPOINTS:
+            continue
+        seen.add(values["MODEL_ID"])
+        view = values.get("CORE_VIEW", "original")
+        if entry["name"] == "kimi-k31-mc-k6-compact-min":
+            assert entry["gpus"] == [1] and view == "k6-compact"
+        else:
+            assert view == "original", entry["name"]
+    assert seen == MC_CHECKPOINTS
+    entries = {entry["name"]: entry for entry in smoke["entries"]}
+    for name in ("kimi-k31-mc-original-max", "kimi-k31-mc-k6-compact-min", "minimax-m31-flash-min"):
+        assert "SPECULATOR" not in entries[name]["set"], name
+    # Qwen3.5-9B has no shipped drafter, so its explicit off is the default.
+    assert entries["qwen35-9b-bf16-min"]["set"]["SPECULATOR"] == "off"
+
+
+def test_v6_compact_mode_matrix_covers_every_mc_family() -> None:
+    compact = json.loads((ROOT / V6_COMPACT).read_text())
+    assert len(compact["entries"]) == 21
+    views: dict[str, set] = {}
+    ports: dict[str, set] = {}
+    for entry in compact["entries"]:
+        values = _effective(entry, compact)
+        assert entry["gpus"] == [0, 1]
+        assert re.fullmatch(r"[a-f0-9]{40}", values["MODEL_REVISION"])
+        views.setdefault(values["MODEL_ID"], set()).add(values["CORE_VIEW"])
+        for key in ("ADDR", "EXPERT_PORT"):
+            if key in values:
+                assert values[key] not in ports.setdefault(key, set()), (entry["name"], key)
+                ports[key].add(values[key])
+    assert set(views) == MC_CHECKPOINTS
+    assert all(found == {"k8-compact", "k6-compact", "fp8-compact"} for found in views.values())
+    # The compact rows run the same shipped drafter as their original max base.
+    assert not any("SPECULATOR" in entry["set"] for entry in compact["entries"])
+    # A cell is either an active entry or a blocked placeholder, never both.
+    blocked = compact.get("unsupported", [])
+    active = {(entry["family"], _effective(entry, compact)["MODEL_ID"],
+               _effective(entry, compact)["CORE_VIEW"]) for entry in compact["entries"]}
+    placeholders = {(entry["family"], entry["checkpoint"], entry["core_view"]) for entry in blocked}
+    assert not active & placeholders
 
 
 @pytest.mark.parametrize("path", starting_configs(), ids=lambda p: p.name)
@@ -780,6 +930,8 @@ def test_new_publications_preserve_pinned_recipe_layouts(name: str) -> None:
         assert values["SPARK_COUNT"] == ("5" if minimum else "6")
         assert values["RTX_GPUS"] == ("1" if minimum else "2")
         assert values["SPECULATOR"] == "dspark" and values["POOL_TOKENS"] == "auto"
+    elif name.startswith("glm53-flash-exl3-k325-mc-"):
+        expected = keys(EXAMPLES / name.replace("k325-mc-", "k4-mc-"))
     elif name.startswith("glm53-exl3-k4-mc-"):
         expected = keys(EXAMPLES / name.replace("exl3-k4-mc-", "exl3-"))
     elif name.startswith("step5-exl3-k4-mc-"):
@@ -792,6 +944,8 @@ def test_new_publications_preserve_pinned_recipe_layouts(name: str) -> None:
         expected = keys(EXAMPLES / name.replace("exl3-k4-mc-", "exl3-k6-"))
     publication = next((model, revision, doc) for stem, model, revision, doc in [
         ("mistral-", "Mistral-Large-4-EXL3-K4", "9c354cee78cd6feddb057549b8edde6e3b319822", "mistral_large4"),
+        ("glm53-flash-exl3-k325-mc-", "GLM-5.3-Flash-EXL3-K3.25-MC",
+         "83da6981e57e110fd1ba166e0a989c411e4289b6", "glm5_flash"),
         ("glm53-flash-", "GLM-5.3-Flash-EXL3-K4-MC", "558931fe149f59b49d19b2376a692bd7a12fb8b7", "glm5_flash"),
         ("glm53-exl3-k4-mc-", "GLM-5.3-EXL3-K4-MC", "2e42b53e61f0f59f664c915fe2424ce9c9fa5f8e", "glm5"),
         ("step5-exl3-k4-mc-", "Step-5-Preview-EXL3-K4-MC", "aedda90d25bd02bb6520bcaf88e06e6c9bc932c4", "step5"),
@@ -1001,9 +1155,9 @@ def test_v4_matrix_card_set_and_retired_pins() -> None:
     published = {entry["name"]: entry for entry in
                  json.loads((ROOT / "benchmarks/current-matrix.json").read_text())["retired"]}
     assert all(published.get(entry["name"], {}).get("report") == entry["report"] for entry in retired)
-    v5 = json.loads((ROOT / "scripts/bench/release-smoke-v5.json").read_text())
+    v6 = json.loads((ROOT / "scripts/bench/release-smoke-v6.json").read_text())
     assert {name: entry["report"] for name, entry in published.items()} == {
-        entry["name"]: entry["report"] for entry in v5["retired"]
+        entry["name"]: entry["report"] for entry in v6["retired"]
     }
     assert set(published) - {entry["name"] for entry in retired} == {
         "v41-flash-reference-tp4", "glm53f-exl3-5090", "v4-flash-reference-tp4",
@@ -1012,6 +1166,9 @@ def test_v4_matrix_card_set_and_retired_pins() -> None:
         "glm53-exl3-k6core-max", "step5-exl3-k6core-min", "step5-exl3-k6core-max",
         "muse-spark-exl3-min", "muse-spark-exl3-max",
         "glm53f-exl3-k6-5090", "glm53f-exl3-k6-min", "glm53f-exl3-k6-max",
+        # v6 retirements.
+        "kimi-k3-min", "glm53-exlr8-max", "glmf-exlr8-k4-min",
+        "glm53f-exl3-min", "glm53f-exl3-max",
     }
     reports = [(path, json.loads(path.read_text())) for path in (ROOT / "benchmarks").glob("*/*/report.json")]
     for entry in retired:
@@ -1092,7 +1249,6 @@ def test_glmf_mc_comparison_keeps_compact_modes_supplementary() -> None:
     published = json.loads((ROOT / "benchmarks/current-matrix.json").read_text())
     assert not any(row["checkpoint"] == old_model for row in published["cells"])
     current = next(row for row in published["cells"] if row["checkpoint"] == config["MODEL_ID"])
-    assert current["5090"]["status"] == "pending" and current["5090"]["reason"]
     for column in ("1rtx", "2rtx"):
         assert current[column]["status"] == "current"
         report = json.loads((ROOT / current[column]["report"] / "report.json").read_text())
@@ -1181,9 +1337,9 @@ def test_kimi_k31_mc_cards_keep_original_primary_and_k6_supplementary() -> None:
     published = json.loads((ROOT / "benchmarks/current-matrix.json").read_text())
     row, = [row for row in published["cells"] if row["checkpoint"] == model]
     assert row["family"] == "kimi_k3"
-    assert row["5090"]["status"] == row["1rtx"]["status"] == "na"
-    assert "original BF16 core" in row["1rtx"]["reason"]
-    assert row["2rtx"]["status"] in {"pending", "current"}
+    assert row["1rtx"]["status"] == "pending"
+    assert "k6-compact" in row["1rtx"]["reason"]
+    assert row["2rtx"]["status"] == "current"
     assert any(row["checkpoint"] == "wrldsuksgo2mars/Kimi-K3-EXL3-K2-Core-K6" for row in published["cells"])
 
 

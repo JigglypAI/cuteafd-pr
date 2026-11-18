@@ -190,6 +190,11 @@
       "model": "wrldsuksgo2mars/Inkling-2-Small-EXL3-K4-MC",
       "revision": "6caa0ba08eb564ddc88b98df06ac73e853cc559e",
       "family": "inkling2"
+    },
+    {
+      "model": "wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K3.25-MC",
+      "revision": "83da6981e57e110fd1ba166e0a989c411e4289b6",
+      "family": "glm5_flash"
     }
   ],
   "not_installed": [

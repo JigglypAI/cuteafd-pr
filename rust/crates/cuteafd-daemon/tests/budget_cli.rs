@@ -1230,7 +1230,7 @@ fn installed_release_and_example_families_match_dev_d6aecfcb7() {
         (expected_absent.0.to_owned(), expected_absent.1.to_owned())]));
     assert_eq!(installed.iter().map(|(model, revision)| (model.as_str(), revision.as_str()))
         .collect::<std::collections::BTreeSet<_>>(), expected_installed);
-    assert_eq!(tested, 38, "installed checkpoint revision set changed (including repaired MC and three live Inkling revisions)");
+    assert_eq!(tested, 39, "installed checkpoint revision set changed (including repaired MC, K3.25 MC and three live Inkling revisions)");
     eprintln!("family detection baseline d6aecfcb7 plus deliberate MiniMax (#2081), Muse MC, Kimi K3.1 MC, repaired MC and three live Inkling entries: {tested} installed checkpoint revisions verified");
 }
 
@@ -1242,7 +1242,7 @@ fn retired_configs(matrix: &serde_json::Value) -> std::collections::BTreeSet<Str
 fn live_release_entries(root: &std::path::Path, matrix: &serde_json::Value) -> Vec<serde_json::Value> {
     let mut entries = Vec::new();
     for cell in matrix["cells"].as_array().unwrap() {
-        for column in ["5090", "1rtx", "2rtx"] {
+        for column in ["1rtx", "2rtx"] {
             let card = &cell[column];
             if card["status"] != "current" { continue; }
             let report_path = root.join(card["report"].as_str().unwrap()).join("report.json");
@@ -1359,7 +1359,7 @@ fn installed_inventory_filters_retired_examples_but_keeps_live_release_cells() {
         "revision": "pinned", "hardware": {"sparks": [{}, {}]}}}).to_string()).unwrap();
     let matrix = serde_json::json!({"retired": [{"config": "examples/configs/old.config"}], "cells": [{
         "checkpoint": "test/current", "1rtx": {"status": "current", "report": "benchmarks/live"},
-        "5090": {"status": "na"}, "2rtx": {"status": "retired", "report": "missing"}}]});
+        "2rtx": {"status": "na", "reason": "not a v6 column"}}]});
     let retired = retired_configs(&matrix);
     assert!(retired.contains("examples/configs/old.config"));
     assert!(!retired.contains("examples/configs/live.config"));
