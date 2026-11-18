@@ -997,6 +997,12 @@ impl ScoringPlan {
     }
 }
 
+/// Scoring defaults to cold for calibration; the paired replay probe explicitly
+/// opts in to reuse only on its warm arm. Scoring bypasses snapshot capture.
+fn prefill_cold(probe: &crate::shared::probe::ProbeRef) -> bool {
+    probe.as_ref().is_some_and(|p| p.spec.cold || (p.spec.score_from.is_some() && !p.spec.score_reuse_prefix))
+}
+
 /// The same prompt frontier is used by prefix admission and teacher-forced prefill.
 fn scoring_frontier(probe: &crate::shared::probe::ProbeRef, len: usize) -> Option<usize> {
     crate::shared::probe::scoring(probe).map(|from| from.clamp(1, len.saturating_sub(1).max(1)).min(len))
@@ -1171,6 +1177,15 @@ mod scoring_tests {
     use super::*;
     use crate::shared::probe::ScorePath;
     use cuteafd_api::openai::probe::{Probe, ProbeSpec};
+
+    #[test]
+    fn scoring_reuse_is_explicit_and_cold_takes_precedence() {
+        assert!(!prefill_cold(&None));
+        for (cold, reuse, expected) in [(false, false, true), (false, true, false), (true, true, true)] {
+            let probe = Some(Probe::new(ProbeSpec { cold, score_reuse_prefix: reuse, score_from: Some(4), ..Default::default() }));
+            assert_eq!(prefill_cold(&probe), expected);
+        }
+    }
 
     #[test]
     fn scoring_frontier_is_the_first_teacher_forced_position() {

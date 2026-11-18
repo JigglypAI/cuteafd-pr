@@ -1046,7 +1046,7 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
                 let restore_started = Instant::now();
                 // Units for the prompt and one decode chunk (the shared reservation rule) are
                 // allocated here and the best snapshot restored into them.
-                let cold = crate::shared::probe::cold(&job.probe);
+                let cold = super::prefill_cold(&job.probe);
                 let draft_id = draft_id(&draft, id);
                 // Teacher forcing pre-fills only through the first scored row. The
                 // remainder needs capacity, but must not extend the CED restore target.

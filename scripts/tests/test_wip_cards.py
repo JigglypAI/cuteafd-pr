@@ -4231,6 +4231,7 @@ def test_partial_image_probe_scores_the_same_continuation_on_a_divergent_seed(tm
             return {'usage': {'prompt_cache_hit_tokens': 0, 'prefix_cache_source': 'miss'}}
         spec = body['spec']
         cold = spec['cold']
+        assert spec['score_reuse_prefix'] is not cold
         root = Path(spec['dump_rows'])
         root.mkdir()
         positions = spec['score_positions']

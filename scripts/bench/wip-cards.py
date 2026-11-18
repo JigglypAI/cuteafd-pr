@@ -1284,7 +1284,7 @@ def image_partial_fidelity(url, dest, dump_root, variant, model, prefix, image, 
             if usage.get('prompt_cache_hit_tokens') != 0 or usage.get('prefix_cache_source') != 'miss':
                 raise ValueError(f'{variant}: quality seed did not prefill cold: {usage}')
         reply = http(url, '/v1/bench/probe', dict(body=score_body, spec=dict(cold=cold,
-            no_speculation=True, pair_exempt=True, score_from=start, score_path='decode',
+            no_speculation=True, pair_exempt=True, score_from=start, score_reuse_prefix=not cold, score_path='decode',
             score_positions=positions, dump_rows=str(path), top_k=1)), timeout=600)
         save(dest / f'{variant}-score-{arm}.json', reply)
         record = records[arm] = reply['probe']
