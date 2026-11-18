@@ -1,0 +1,753 @@
+{
+  "build": "REPLACE-ME-v6-rc",
+  "profile": "smoke",
+  "defaults": {
+    "timeout_s": 1200,
+    "run_timeout_s": 1800,
+    "set": {
+      "ENABLE_BENCH": "on",
+      "COORDINATOR_DOCKER_INFERENCE": "ghcr.io/tpurtell/cuteafd-coordinator:REPLACE-ME-v6-rc"
+    },
+    "fabric": true
+  },
+  "entries": [
+    {
+      "name": "glm53-mc-k8-compact-max",
+      "family": "glm5",
+      "config": "examples/configs/glm53-exl3-k4-mc-max.config",
+      "gpus": [
+        0,
+        1
+      ],
+      "sparks": [
+        "REPLACE-ME-spark-0",
+        "REPLACE-ME-spark-1",
+        "REPLACE-ME-spark-2",
+        "REPLACE-ME-spark-3",
+        "REPLACE-ME-spark-4",
+        "REPLACE-ME-spark-5"
+      ],
+      "set": {
+        "ADDR": "0.0.0.0:8860",
+        "RTX_GPUS": "2",
+        "COORDINATOR_GPUS": "0,1",
+        "SPARK_COUNT": "6",
+        "MODEL_ID": "wrldsuksgo2mars/GLM-5.3-EXL3-K4-MC",
+        "MODEL_REVISION": "c39486376dee84e5faa4904e014e07d7b6e76405",
+        "CORE_VIEW": "k8-compact",
+        "SPECULATOR": "off",
+        "SPARK_0_HOST": "REPLACE-ME-spark-0",
+        "SPARK_0_LANE_A": "192.0.2.1",
+        "SPARK_1_HOST": "REPLACE-ME-spark-1",
+        "SPARK_1_LANE_A": "192.0.2.2",
+        "SPARK_2_HOST": "REPLACE-ME-spark-2",
+        "SPARK_2_LANE_A": "192.0.2.3",
+        "SPARK_3_HOST": "REPLACE-ME-spark-3",
+        "SPARK_3_LANE_A": "192.0.2.4",
+        "SPARK_4_HOST": "REPLACE-ME-spark-4",
+        "SPARK_4_LANE_A": "192.0.2.5",
+        "SPARK_5_HOST": "REPLACE-ME-spark-5",
+        "SPARK_5_LANE_A": "192.0.2.6",
+        "EXPERT_BACKEND": "spark",
+        "EXPERT_PORT": "28000",
+        "SPARK_EXPERT_DOCKER_INFERENCE": "ghcr.io/tpurtell/cuteafd-spark-expert:REPLACE-ME-v6-rc"
+      }
+    },
+    {
+      "name": "glm53-mc-k6-compact-max",
+      "family": "glm5",
+      "config": "examples/configs/glm53-exl3-k4-mc-max.config",
+      "gpus": [
+        0,
+        1
+      ],
+      "sparks": [
+        "REPLACE-ME-spark-0",
+        "REPLACE-ME-spark-1",
+        "REPLACE-ME-spark-2",
+        "REPLACE-ME-spark-3",
+        "REPLACE-ME-spark-4",
+        "REPLACE-ME-spark-5"
+      ],
+      "set": {
+        "ADDR": "0.0.0.0:8861",
+        "RTX_GPUS": "2",
+        "COORDINATOR_GPUS": "0,1",
+        "SPARK_COUNT": "6",
+        "MODEL_ID": "wrldsuksgo2mars/GLM-5.3-EXL3-K4-MC",
+        "MODEL_REVISION": "c39486376dee84e5faa4904e014e07d7b6e76405",
+        "CORE_VIEW": "k6-compact",
+        "SPECULATOR": "off",
+        "SPARK_0_HOST": "REPLACE-ME-spark-0",
+        "SPARK_0_LANE_A": "192.0.2.1",
+        "SPARK_1_HOST": "REPLACE-ME-spark-1",
+        "SPARK_1_LANE_A": "192.0.2.2",
+        "SPARK_2_HOST": "REPLACE-ME-spark-2",
+        "SPARK_2_LANE_A": "192.0.2.3",
+        "SPARK_3_HOST": "REPLACE-ME-spark-3",
+        "SPARK_3_LANE_A": "192.0.2.4",
+        "SPARK_4_HOST": "REPLACE-ME-spark-4",
+        "SPARK_4_LANE_A": "192.0.2.5",
+        "SPARK_5_HOST": "REPLACE-ME-spark-5",
+        "SPARK_5_LANE_A": "192.0.2.6",
+        "EXPERT_BACKEND": "spark",
+        "EXPERT_PORT": "28200",
+        "SPARK_EXPERT_DOCKER_INFERENCE": "ghcr.io/tpurtell/cuteafd-spark-expert:REPLACE-ME-v6-rc"
+      }
+    },
+    {
+      "name": "glm53-mc-fp8-compact-max",
+      "family": "glm5",
+      "config": "examples/configs/glm53-exl3-k4-mc-max.config",
+      "gpus": [
+        0,
+        1
+      ],
+      "sparks": [
+        "REPLACE-ME-spark-0",
+        "REPLACE-ME-spark-1",
+        "REPLACE-ME-spark-2",
+        "REPLACE-ME-spark-3",
+        "REPLACE-ME-spark-4",
+        "REPLACE-ME-spark-5"
+      ],
+      "set": {
+        "ADDR": "0.0.0.0:8862",
+        "RTX_GPUS": "2",
+        "COORDINATOR_GPUS": "0,1",
+        "SPARK_COUNT": "6",
+        "MODEL_ID": "wrldsuksgo2mars/GLM-5.3-EXL3-K4-MC",
+        "MODEL_REVISION": "c39486376dee84e5faa4904e014e07d7b6e76405",
+        "CORE_VIEW": "fp8-compact",
+        "SPECULATOR": "off",
+        "SPARK_0_HOST": "REPLACE-ME-spark-0",
+        "SPARK_0_LANE_A": "192.0.2.1",
+        "SPARK_1_HOST": "REPLACE-ME-spark-1",
+        "SPARK_1_LANE_A": "192.0.2.2",
+        "SPARK_2_HOST": "REPLACE-ME-spark-2",
+        "SPARK_2_LANE_A": "192.0.2.3",
+        "SPARK_3_HOST": "REPLACE-ME-spark-3",
+        "SPARK_3_LANE_A": "192.0.2.4",
+        "SPARK_4_HOST": "REPLACE-ME-spark-4",
+        "SPARK_4_LANE_A": "192.0.2.5",
+        "SPARK_5_HOST": "REPLACE-ME-spark-5",
+        "SPARK_5_LANE_A": "192.0.2.6",
+        "EXPERT_BACKEND": "spark",
+        "EXPERT_PORT": "28400",
+        "SPARK_EXPERT_DOCKER_INFERENCE": "ghcr.io/tpurtell/cuteafd-spark-expert:REPLACE-ME-v6-rc"
+      }
+    },
+    {
+      "name": "glmf-mc-k8-compact-max",
+      "family": "glm5_flash",
+      "config": "examples/configs/glm53-flash-exl3-k4-mc-max.config",
+      "gpus": [
+        0,
+        1
+      ],
+      "sparks": [],
+      "set": {
+        "ADDR": "0.0.0.0:8863",
+        "RTX_GPUS": "2",
+        "COORDINATOR_GPUS": "0,1",
+        "SPARK_COUNT": "0",
+        "MODEL_ID": "wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K4-MC",
+        "MODEL_REVISION": "558931fe149f59b49d19b2376a692bd7a12fb8b7",
+        "CORE_VIEW": "k8-compact",
+        "SPECULATOR": "off",
+        "EXPERT_BACKEND": "local"
+      }
+    },
+    {
+      "name": "glmf-mc-k6-compact-max",
+      "family": "glm5_flash",
+      "config": "examples/configs/glm53-flash-exl3-k4-mc-max.config",
+      "gpus": [
+        0,
+        1
+      ],
+      "sparks": [],
+      "set": {
+        "ADDR": "0.0.0.0:8864",
+        "RTX_GPUS": "2",
+        "COORDINATOR_GPUS": "0,1",
+        "SPARK_COUNT": "0",
+        "MODEL_ID": "wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K4-MC",
+        "MODEL_REVISION": "558931fe149f59b49d19b2376a692bd7a12fb8b7",
+        "CORE_VIEW": "k6-compact",
+        "SPECULATOR": "off",
+        "EXPERT_BACKEND": "local"
+      }
+    },
+    {
+      "name": "glmf-mc-fp8-compact-max",
+      "family": "glm5_flash",
+      "config": "examples/configs/glm53-flash-exl3-k4-mc-max.config",
+      "gpus": [
+        0,
+        1
+      ],
+      "sparks": [],
+      "set": {
+        "ADDR": "0.0.0.0:8865",
+        "RTX_GPUS": "2",
+        "COORDINATOR_GPUS": "0,1",
+        "SPARK_COUNT": "0",
+        "MODEL_ID": "wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K4-MC",
+        "MODEL_REVISION": "558931fe149f59b49d19b2376a692bd7a12fb8b7",
+        "CORE_VIEW": "fp8-compact",
+        "SPECULATOR": "off",
+        "EXPERT_BACKEND": "local"
+      }
+    },
+    {
+      "name": "glmf-k325-mc-k8-compact-max",
+      "family": "glm5_flash",
+      "config": "examples/configs/glm53-flash-exl3-k325-mc-max.config",
+      "gpus": [
+        0,
+        1
+      ],
+      "sparks": [],
+      "set": {
+        "ADDR": "0.0.0.0:8866",
+        "RTX_GPUS": "2",
+        "COORDINATOR_GPUS": "0,1",
+        "SPARK_COUNT": "0",
+        "MODEL_ID": "wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K3.25-MC",
+        "MODEL_REVISION": "83da6981e57e110fd1ba166e0a989c411e4289b6",
+        "CORE_VIEW": "k8-compact",
+        "SPECULATOR": "off",
+        "EXPERT_BACKEND": "local"
+      }
+    },
+    {
+      "name": "glmf-k325-mc-k6-compact-max",
+      "family": "glm5_flash",
+      "config": "examples/configs/glm53-flash-exl3-k325-mc-max.config",
+      "gpus": [
+        0,
+        1
+      ],
+      "sparks": [],
+      "set": {
+        "ADDR": "0.0.0.0:8867",
+        "RTX_GPUS": "2",
+        "COORDINATOR_GPUS": "0,1",
+        "SPARK_COUNT": "0",
+        "MODEL_ID": "wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K3.25-MC",
+        "MODEL_REVISION": "83da6981e57e110fd1ba166e0a989c411e4289b6",
+        "CORE_VIEW": "k6-compact",
+        "SPECULATOR": "off",
+        "EXPERT_BACKEND": "local"
+      }
+    },
+    {
+      "name": "glmf-k325-mc-fp8-compact-max",
+      "family": "glm5_flash",
+      "config": "examples/configs/glm53-flash-exl3-k325-mc-max.config",
+      "gpus": [
+        0,
+        1
+      ],
+      "sparks": [],
+      "set": {
+        "ADDR": "0.0.0.0:8868",
+        "RTX_GPUS": "2",
+        "COORDINATOR_GPUS": "0,1",
+        "SPARK_COUNT": "0",
+        "MODEL_ID": "wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K3.25-MC",
+        "MODEL_REVISION": "83da6981e57e110fd1ba166e0a989c411e4289b6",
+        "CORE_VIEW": "fp8-compact",
+        "SPECULATOR": "off",
+        "EXPERT_BACKEND": "local"
+      }
+    },
+    {
+      "name": "kimi-k31-mc-k8-compact-max",
+      "family": "kimi_k3",
+      "config": "examples/configs/kimi-k31-exl3-k2-mc-max.config",
+      "gpus": [
+        0,
+        1
+      ],
+      "sparks": [
+        "REPLACE-ME-spark-0",
+        "REPLACE-ME-spark-1",
+        "REPLACE-ME-spark-2",
+        "REPLACE-ME-spark-3",
+        "REPLACE-ME-spark-4",
+        "REPLACE-ME-spark-5"
+      ],
+      "set": {
+        "ADDR": "0.0.0.0:8869",
+        "RTX_GPUS": "2",
+        "COORDINATOR_GPUS": "0,1",
+        "SPARK_COUNT": "6",
+        "MODEL_ID": "wrldsuksgo2mars/Kimi-K3.1-Pro-EXL3-K2-MC",
+        "MODEL_REVISION": "1455b31b0acc53f36df916864fb541d9f536b3f8",
+        "CORE_VIEW": "k8-compact",
+        "SPECULATOR": "off",
+        "SPARK_0_HOST": "REPLACE-ME-spark-0",
+        "SPARK_0_LANE_A": "192.0.2.1",
+        "SPARK_1_HOST": "REPLACE-ME-spark-1",
+        "SPARK_1_LANE_A": "192.0.2.2",
+        "SPARK_2_HOST": "REPLACE-ME-spark-2",
+        "SPARK_2_LANE_A": "192.0.2.3",
+        "SPARK_3_HOST": "REPLACE-ME-spark-3",
+        "SPARK_3_LANE_A": "192.0.2.4",
+        "SPARK_4_HOST": "REPLACE-ME-spark-4",
+        "SPARK_4_LANE_A": "192.0.2.5",
+        "SPARK_5_HOST": "REPLACE-ME-spark-5",
+        "SPARK_5_LANE_A": "192.0.2.6",
+        "EXPERT_BACKEND": "spark",
+        "EXPERT_PORT": "28600",
+        "SPARK_EXPERT_DOCKER_INFERENCE": "ghcr.io/tpurtell/cuteafd-spark-expert:REPLACE-ME-v6-rc"
+      }
+    },
+    {
+      "name": "kimi-k31-mc-k6-compact-max",
+      "family": "kimi_k3",
+      "config": "examples/configs/kimi-k31-exl3-k2-mc-max.config",
+      "gpus": [
+        0,
+        1
+      ],
+      "sparks": [
+        "REPLACE-ME-spark-0",
+        "REPLACE-ME-spark-1",
+        "REPLACE-ME-spark-2",
+        "REPLACE-ME-spark-3",
+        "REPLACE-ME-spark-4",
+        "REPLACE-ME-spark-5"
+      ],
+      "set": {
+        "ADDR": "0.0.0.0:8870",
+        "RTX_GPUS": "2",
+        "COORDINATOR_GPUS": "0,1",
+        "SPARK_COUNT": "6",
+        "MODEL_ID": "wrldsuksgo2mars/Kimi-K3.1-Pro-EXL3-K2-MC",
+        "MODEL_REVISION": "1455b31b0acc53f36df916864fb541d9f536b3f8",
+        "CORE_VIEW": "k6-compact",
+        "SPECULATOR": "off",
+        "SPARK_0_HOST": "REPLACE-ME-spark-0",
+        "SPARK_0_LANE_A": "192.0.2.1",
+        "SPARK_1_HOST": "REPLACE-ME-spark-1",
+        "SPARK_1_LANE_A": "192.0.2.2",
+        "SPARK_2_HOST": "REPLACE-ME-spark-2",
+        "SPARK_2_LANE_A": "192.0.2.3",
+        "SPARK_3_HOST": "REPLACE-ME-spark-3",
+        "SPARK_3_LANE_A": "192.0.2.4",
+        "SPARK_4_HOST": "REPLACE-ME-spark-4",
+        "SPARK_4_LANE_A": "192.0.2.5",
+        "SPARK_5_HOST": "REPLACE-ME-spark-5",
+        "SPARK_5_LANE_A": "192.0.2.6",
+        "EXPERT_BACKEND": "spark",
+        "EXPERT_PORT": "28800",
+        "SPARK_EXPERT_DOCKER_INFERENCE": "ghcr.io/tpurtell/cuteafd-spark-expert:REPLACE-ME-v6-rc"
+      }
+    },
+    {
+      "name": "kimi-k31-mc-fp8-compact-max",
+      "family": "kimi_k3",
+      "config": "examples/configs/kimi-k31-exl3-k2-mc-max.config",
+      "gpus": [
+        0,
+        1
+      ],
+      "sparks": [
+        "REPLACE-ME-spark-0",
+        "REPLACE-ME-spark-1",
+        "REPLACE-ME-spark-2",
+        "REPLACE-ME-spark-3",
+        "REPLACE-ME-spark-4",
+        "REPLACE-ME-spark-5"
+      ],
+      "set": {
+        "ADDR": "0.0.0.0:8871",
+        "RTX_GPUS": "2",
+        "COORDINATOR_GPUS": "0,1",
+        "SPARK_COUNT": "6",
+        "MODEL_ID": "wrldsuksgo2mars/Kimi-K3.1-Pro-EXL3-K2-MC",
+        "MODEL_REVISION": "1455b31b0acc53f36df916864fb541d9f536b3f8",
+        "CORE_VIEW": "fp8-compact",
+        "SPECULATOR": "off",
+        "SPARK_0_HOST": "REPLACE-ME-spark-0",
+        "SPARK_0_LANE_A": "192.0.2.1",
+        "SPARK_1_HOST": "REPLACE-ME-spark-1",
+        "SPARK_1_LANE_A": "192.0.2.2",
+        "SPARK_2_HOST": "REPLACE-ME-spark-2",
+        "SPARK_2_LANE_A": "192.0.2.3",
+        "SPARK_3_HOST": "REPLACE-ME-spark-3",
+        "SPARK_3_LANE_A": "192.0.2.4",
+        "SPARK_4_HOST": "REPLACE-ME-spark-4",
+        "SPARK_4_LANE_A": "192.0.2.5",
+        "SPARK_5_HOST": "REPLACE-ME-spark-5",
+        "SPARK_5_LANE_A": "192.0.2.6",
+        "EXPERT_BACKEND": "spark",
+        "EXPERT_PORT": "29000",
+        "SPARK_EXPERT_DOCKER_INFERENCE": "ghcr.io/tpurtell/cuteafd-spark-expert:REPLACE-ME-v6-rc"
+      }
+    },
+    {
+      "name": "muse-mc-k8-compact-max",
+      "family": "muse_spark",
+      "config": "examples/configs/muse-spark-exl3-k4-mc-max.config",
+      "gpus": [
+        0,
+        1
+      ],
+      "sparks": [
+        "REPLACE-ME-spark-0",
+        "REPLACE-ME-spark-1",
+        "REPLACE-ME-spark-2",
+        "REPLACE-ME-spark-3",
+        "REPLACE-ME-spark-4",
+        "REPLACE-ME-spark-5"
+      ],
+      "set": {
+        "ADDR": "0.0.0.0:8872",
+        "RTX_GPUS": "2",
+        "COORDINATOR_GPUS": "0,1",
+        "SPARK_COUNT": "6",
+        "MODEL_ID": "wrldsuksgo2mars/Muse-Spark-Open-EXL3-K4-MC",
+        "MODEL_REVISION": "cc5dc2537083177e3f02ea0b2d9dfc179d40425c",
+        "CORE_VIEW": "k8-compact",
+        "SPECULATOR": "off",
+        "SPARK_0_HOST": "REPLACE-ME-spark-0",
+        "SPARK_0_LANE_A": "192.0.2.1",
+        "SPARK_1_HOST": "REPLACE-ME-spark-1",
+        "SPARK_1_LANE_A": "192.0.2.2",
+        "SPARK_2_HOST": "REPLACE-ME-spark-2",
+        "SPARK_2_LANE_A": "192.0.2.3",
+        "SPARK_3_HOST": "REPLACE-ME-spark-3",
+        "SPARK_3_LANE_A": "192.0.2.4",
+        "SPARK_4_HOST": "REPLACE-ME-spark-4",
+        "SPARK_4_LANE_A": "192.0.2.5",
+        "SPARK_5_HOST": "REPLACE-ME-spark-5",
+        "SPARK_5_LANE_A": "192.0.2.6",
+        "EXPERT_BACKEND": "spark",
+        "EXPERT_PORT": "29200",
+        "SPARK_EXPERT_DOCKER_INFERENCE": "ghcr.io/tpurtell/cuteafd-spark-expert:REPLACE-ME-v6-rc"
+      }
+    },
+    {
+      "name": "muse-mc-k6-compact-max",
+      "family": "muse_spark",
+      "config": "examples/configs/muse-spark-exl3-k4-mc-max.config",
+      "gpus": [
+        0,
+        1
+      ],
+      "sparks": [
+        "REPLACE-ME-spark-0",
+        "REPLACE-ME-spark-1",
+        "REPLACE-ME-spark-2",
+        "REPLACE-ME-spark-3",
+        "REPLACE-ME-spark-4",
+        "REPLACE-ME-spark-5"
+      ],
+      "set": {
+        "ADDR": "0.0.0.0:8873",
+        "RTX_GPUS": "2",
+        "COORDINATOR_GPUS": "0,1",
+        "SPARK_COUNT": "6",
+        "MODEL_ID": "wrldsuksgo2mars/Muse-Spark-Open-EXL3-K4-MC",
+        "MODEL_REVISION": "cc5dc2537083177e3f02ea0b2d9dfc179d40425c",
+        "CORE_VIEW": "k6-compact",
+        "SPECULATOR": "off",
+        "SPARK_0_HOST": "REPLACE-ME-spark-0",
+        "SPARK_0_LANE_A": "192.0.2.1",
+        "SPARK_1_HOST": "REPLACE-ME-spark-1",
+        "SPARK_1_LANE_A": "192.0.2.2",
+        "SPARK_2_HOST": "REPLACE-ME-spark-2",
+        "SPARK_2_LANE_A": "192.0.2.3",
+        "SPARK_3_HOST": "REPLACE-ME-spark-3",
+        "SPARK_3_LANE_A": "192.0.2.4",
+        "SPARK_4_HOST": "REPLACE-ME-spark-4",
+        "SPARK_4_LANE_A": "192.0.2.5",
+        "SPARK_5_HOST": "REPLACE-ME-spark-5",
+        "SPARK_5_LANE_A": "192.0.2.6",
+        "EXPERT_BACKEND": "spark",
+        "EXPERT_PORT": "29400",
+        "SPARK_EXPERT_DOCKER_INFERENCE": "ghcr.io/tpurtell/cuteafd-spark-expert:REPLACE-ME-v6-rc"
+      }
+    },
+    {
+      "name": "muse-mc-fp8-compact-max",
+      "family": "muse_spark",
+      "config": "examples/configs/muse-spark-exl3-k4-mc-max.config",
+      "gpus": [
+        0,
+        1
+      ],
+      "sparks": [
+        "REPLACE-ME-spark-0",
+        "REPLACE-ME-spark-1",
+        "REPLACE-ME-spark-2",
+        "REPLACE-ME-spark-3",
+        "REPLACE-ME-spark-4",
+        "REPLACE-ME-spark-5"
+      ],
+      "set": {
+        "ADDR": "0.0.0.0:8874",
+        "RTX_GPUS": "2",
+        "COORDINATOR_GPUS": "0,1",
+        "SPARK_COUNT": "6",
+        "MODEL_ID": "wrldsuksgo2mars/Muse-Spark-Open-EXL3-K4-MC",
+        "MODEL_REVISION": "cc5dc2537083177e3f02ea0b2d9dfc179d40425c",
+        "CORE_VIEW": "fp8-compact",
+        "SPECULATOR": "off",
+        "SPARK_0_HOST": "REPLACE-ME-spark-0",
+        "SPARK_0_LANE_A": "192.0.2.1",
+        "SPARK_1_HOST": "REPLACE-ME-spark-1",
+        "SPARK_1_LANE_A": "192.0.2.2",
+        "SPARK_2_HOST": "REPLACE-ME-spark-2",
+        "SPARK_2_LANE_A": "192.0.2.3",
+        "SPARK_3_HOST": "REPLACE-ME-spark-3",
+        "SPARK_3_LANE_A": "192.0.2.4",
+        "SPARK_4_HOST": "REPLACE-ME-spark-4",
+        "SPARK_4_LANE_A": "192.0.2.5",
+        "SPARK_5_HOST": "REPLACE-ME-spark-5",
+        "SPARK_5_LANE_A": "192.0.2.6",
+        "EXPERT_BACKEND": "spark",
+        "EXPERT_PORT": "29600",
+        "SPARK_EXPERT_DOCKER_INFERENCE": "ghcr.io/tpurtell/cuteafd-spark-expert:REPLACE-ME-v6-rc"
+      }
+    },
+    {
+      "name": "step5-mc-k8-compact-max",
+      "family": "step5",
+      "config": "examples/configs/step5-exl3-k4-mc-max.config",
+      "gpus": [
+        0,
+        1
+      ],
+      "sparks": [
+        "REPLACE-ME-spark-0",
+        "REPLACE-ME-spark-1",
+        "REPLACE-ME-spark-2",
+        "REPLACE-ME-spark-3",
+        "REPLACE-ME-spark-4",
+        "REPLACE-ME-spark-5"
+      ],
+      "set": {
+        "ADDR": "0.0.0.0:8875",
+        "RTX_GPUS": "2",
+        "COORDINATOR_GPUS": "0,1",
+        "SPARK_COUNT": "6",
+        "MODEL_ID": "wrldsuksgo2mars/Step-5-Preview-EXL3-K4-MC",
+        "MODEL_REVISION": "aedda90d25bd02bb6520bcaf88e06e6c9bc932c4",
+        "CORE_VIEW": "k8-compact",
+        "SPECULATOR": "off",
+        "SPARK_0_HOST": "REPLACE-ME-spark-0",
+        "SPARK_0_LANE_A": "192.0.2.1",
+        "SPARK_1_HOST": "REPLACE-ME-spark-1",
+        "SPARK_1_LANE_A": "192.0.2.2",
+        "SPARK_2_HOST": "REPLACE-ME-spark-2",
+        "SPARK_2_LANE_A": "192.0.2.3",
+        "SPARK_3_HOST": "REPLACE-ME-spark-3",
+        "SPARK_3_LANE_A": "192.0.2.4",
+        "SPARK_4_HOST": "REPLACE-ME-spark-4",
+        "SPARK_4_LANE_A": "192.0.2.5",
+        "SPARK_5_HOST": "REPLACE-ME-spark-5",
+        "SPARK_5_LANE_A": "192.0.2.6",
+        "EXPERT_BACKEND": "spark",
+        "EXPERT_PORT": "29800",
+        "SPARK_EXPERT_DOCKER_INFERENCE": "ghcr.io/tpurtell/cuteafd-spark-expert:REPLACE-ME-v6-rc"
+      }
+    },
+    {
+      "name": "step5-mc-k6-compact-max",
+      "family": "step5",
+      "config": "examples/configs/step5-exl3-k4-mc-max.config",
+      "gpus": [
+        0,
+        1
+      ],
+      "sparks": [
+        "REPLACE-ME-spark-0",
+        "REPLACE-ME-spark-1",
+        "REPLACE-ME-spark-2",
+        "REPLACE-ME-spark-3",
+        "REPLACE-ME-spark-4",
+        "REPLACE-ME-spark-5"
+      ],
+      "set": {
+        "ADDR": "0.0.0.0:8876",
+        "RTX_GPUS": "2",
+        "COORDINATOR_GPUS": "0,1",
+        "SPARK_COUNT": "6",
+        "MODEL_ID": "wrldsuksgo2mars/Step-5-Preview-EXL3-K4-MC",
+        "MODEL_REVISION": "aedda90d25bd02bb6520bcaf88e06e6c9bc932c4",
+        "CORE_VIEW": "k6-compact",
+        "SPECULATOR": "off",
+        "SPARK_0_HOST": "REPLACE-ME-spark-0",
+        "SPARK_0_LANE_A": "192.0.2.1",
+        "SPARK_1_HOST": "REPLACE-ME-spark-1",
+        "SPARK_1_LANE_A": "192.0.2.2",
+        "SPARK_2_HOST": "REPLACE-ME-spark-2",
+        "SPARK_2_LANE_A": "192.0.2.3",
+        "SPARK_3_HOST": "REPLACE-ME-spark-3",
+        "SPARK_3_LANE_A": "192.0.2.4",
+        "SPARK_4_HOST": "REPLACE-ME-spark-4",
+        "SPARK_4_LANE_A": "192.0.2.5",
+        "SPARK_5_HOST": "REPLACE-ME-spark-5",
+        "SPARK_5_LANE_A": "192.0.2.6",
+        "EXPERT_BACKEND": "spark",
+        "EXPERT_PORT": "30000",
+        "SPARK_EXPERT_DOCKER_INFERENCE": "ghcr.io/tpurtell/cuteafd-spark-expert:REPLACE-ME-v6-rc"
+      }
+    },
+    {
+      "name": "step5-mc-fp8-compact-max",
+      "family": "step5",
+      "config": "examples/configs/step5-exl3-k4-mc-max.config",
+      "gpus": [
+        0,
+        1
+      ],
+      "sparks": [
+        "REPLACE-ME-spark-0",
+        "REPLACE-ME-spark-1",
+        "REPLACE-ME-spark-2",
+        "REPLACE-ME-spark-3",
+        "REPLACE-ME-spark-4",
+        "REPLACE-ME-spark-5"
+      ],
+      "set": {
+        "ADDR": "0.0.0.0:8877",
+        "RTX_GPUS": "2",
+        "COORDINATOR_GPUS": "0,1",
+        "SPARK_COUNT": "6",
+        "MODEL_ID": "wrldsuksgo2mars/Step-5-Preview-EXL3-K4-MC",
+        "MODEL_REVISION": "aedda90d25bd02bb6520bcaf88e06e6c9bc932c4",
+        "CORE_VIEW": "fp8-compact",
+        "SPECULATOR": "off",
+        "SPARK_0_HOST": "REPLACE-ME-spark-0",
+        "SPARK_0_LANE_A": "192.0.2.1",
+        "SPARK_1_HOST": "REPLACE-ME-spark-1",
+        "SPARK_1_LANE_A": "192.0.2.2",
+        "SPARK_2_HOST": "REPLACE-ME-spark-2",
+        "SPARK_2_LANE_A": "192.0.2.3",
+        "SPARK_3_HOST": "REPLACE-ME-spark-3",
+        "SPARK_3_LANE_A": "192.0.2.4",
+        "SPARK_4_HOST": "REPLACE-ME-spark-4",
+        "SPARK_4_LANE_A": "192.0.2.5",
+        "SPARK_5_HOST": "REPLACE-ME-spark-5",
+        "SPARK_5_LANE_A": "192.0.2.6",
+        "EXPERT_BACKEND": "spark",
+        "EXPERT_PORT": "30200",
+        "SPARK_EXPERT_DOCKER_INFERENCE": "ghcr.io/tpurtell/cuteafd-spark-expert:REPLACE-ME-v6-rc"
+      }
+    },
+    {
+      "name": "inkling2-mc-k8-compact-max",
+      "family": "inkling2",
+      "config": "examples/configs/inkling2-exl3-max.config",
+      "gpus": [
+        0,
+        1
+      ],
+      "sparks": [
+        "REPLACE-ME-spark-0",
+        "REPLACE-ME-spark-1",
+        "REPLACE-ME-spark-2",
+        "REPLACE-ME-spark-3"
+      ],
+      "set": {
+        "ADDR": "0.0.0.0:8878",
+        "RTX_GPUS": "2",
+        "COORDINATOR_GPUS": "0,1",
+        "SPARK_COUNT": "4",
+        "MODEL_ID": "wrldsuksgo2mars/Inkling-2-Small-EXL3-K4-MC",
+        "MODEL_REVISION": "6caa0ba08eb564ddc88b98df06ac73e853cc559e",
+        "CORE_VIEW": "k8-compact",
+        "SPECULATOR": "off",
+        "SPARK_0_HOST": "REPLACE-ME-spark-0",
+        "SPARK_0_LANE_A": "192.0.2.1",
+        "SPARK_1_HOST": "REPLACE-ME-spark-1",
+        "SPARK_1_LANE_A": "192.0.2.2",
+        "SPARK_2_HOST": "REPLACE-ME-spark-2",
+        "SPARK_2_LANE_A": "192.0.2.3",
+        "SPARK_3_HOST": "REPLACE-ME-spark-3",
+        "SPARK_3_LANE_A": "192.0.2.4",
+        "EXPERT_BACKEND": "spark",
+        "EXPERT_PORT": "30400",
+        "SPARK_EXPERT_DOCKER_INFERENCE": "ghcr.io/tpurtell/cuteafd-spark-expert:REPLACE-ME-v6-rc"
+      }
+    },
+    {
+      "name": "inkling2-mc-k6-compact-max",
+      "family": "inkling2",
+      "config": "examples/configs/inkling2-exl3-max.config",
+      "gpus": [
+        0,
+        1
+      ],
+      "sparks": [
+        "REPLACE-ME-spark-0",
+        "REPLACE-ME-spark-1",
+        "REPLACE-ME-spark-2",
+        "REPLACE-ME-spark-3"
+      ],
+      "set": {
+        "ADDR": "0.0.0.0:8879",
+        "RTX_GPUS": "2",
+        "COORDINATOR_GPUS": "0,1",
+        "SPARK_COUNT": "4",
+        "MODEL_ID": "wrldsuksgo2mars/Inkling-2-Small-EXL3-K4-MC",
+        "MODEL_REVISION": "6caa0ba08eb564ddc88b98df06ac73e853cc559e",
+        "CORE_VIEW": "k6-compact",
+        "SPECULATOR": "off",
+        "SPARK_0_HOST": "REPLACE-ME-spark-0",
+        "SPARK_0_LANE_A": "192.0.2.1",
+        "SPARK_1_HOST": "REPLACE-ME-spark-1",
+        "SPARK_1_LANE_A": "192.0.2.2",
+        "SPARK_2_HOST": "REPLACE-ME-spark-2",
+        "SPARK_2_LANE_A": "192.0.2.3",
+        "SPARK_3_HOST": "REPLACE-ME-spark-3",
+        "SPARK_3_LANE_A": "192.0.2.4",
+        "EXPERT_BACKEND": "spark",
+        "EXPERT_PORT": "30600",
+        "SPARK_EXPERT_DOCKER_INFERENCE": "ghcr.io/tpurtell/cuteafd-spark-expert:REPLACE-ME-v6-rc"
+      }
+    },
+    {
+      "name": "inkling2-mc-fp8-compact-max",
+      "family": "inkling2",
+      "config": "examples/configs/inkling2-exl3-max.config",
+      "gpus": [
+        0,
+        1
+      ],
+      "sparks": [
+        "REPLACE-ME-spark-0",
+        "REPLACE-ME-spark-1",
+        "REPLACE-ME-spark-2",
+        "REPLACE-ME-spark-3"
+      ],
+      "set": {
+        "ADDR": "0.0.0.0:8880",
+        "RTX_GPUS": "2",
+        "COORDINATOR_GPUS": "0,1",
+        "SPARK_COUNT": "4",
+        "MODEL_ID": "wrldsuksgo2mars/Inkling-2-Small-EXL3-K4-MC",
+        "MODEL_REVISION": "6caa0ba08eb564ddc88b98df06ac73e853cc559e",
+        "CORE_VIEW": "fp8-compact",
+        "SPECULATOR": "off",
+        "SPARK_0_HOST": "REPLACE-ME-spark-0",
+        "SPARK_0_LANE_A": "192.0.2.1",
+        "SPARK_1_HOST": "REPLACE-ME-spark-1",
+        "SPARK_1_LANE_A": "192.0.2.2",
+        "SPARK_2_HOST": "REPLACE-ME-spark-2",
+        "SPARK_2_LANE_A": "192.0.2.3",
+        "SPARK_3_HOST": "REPLACE-ME-spark-3",
+        "SPARK_3_LANE_A": "192.0.2.4",
+        "EXPERT_BACKEND": "spark",
+        "EXPERT_PORT": "30800",
+        "SPARK_EXPERT_DOCKER_INFERENCE": "ghcr.io/tpurtell/cuteafd-spark-expert:REPLACE-ME-v6-rc"
+      }
+    }
+  ]
+}

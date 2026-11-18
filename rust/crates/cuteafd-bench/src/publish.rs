@@ -71,8 +71,6 @@ pub fn scan(root: &Path) -> Result<Vec<Placed>> {
 /// The reference columns of the published table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Column {
-    /// One RTX 5090 with the fewest Sparks the checkpoint fits.
-    Rtx5090,
     /// One RTX PRO 6000 with the fewest Sparks the checkpoint fits.
     OneRtx,
     /// Two RTX PRO 6000 with four or six Sparks (or none, when the GPUs hold it).
@@ -80,21 +78,21 @@ pub enum Column {
 }
 
 impl Column {
-    pub const ALL: [Column; 3] = [Column::Rtx5090, Column::OneRtx, Column::TwoRtx];
+    pub const ALL: [Column; 2] = [Column::OneRtx, Column::TwoRtx];
 
     /// The matrix key.
     fn key(self) -> &'static str {
-        match self { Column::Rtx5090 => "5090", Column::OneRtx => "1rtx", Column::TwoRtx => "2rtx" }
+        match self { Column::OneRtx => "1rtx", Column::TwoRtx => "2rtx" }
     }
 
     /// The README heading.
     fn title(self) -> &'static str {
-        match self { Column::Rtx5090 => "5090", Column::OneRtx => "1× RTX", Column::TwoRtx => "2× RTX" }
+        match self { Column::OneRtx => "1× RTX", Column::TwoRtx => "2× RTX" }
     }
 
     /// The reference layout a labelled smoke directory carries for this column.
     fn reference(self) -> Option<u8> {
-        match self { Column::Rtx5090 => None, Column::OneRtx => Some(1), Column::TwoRtx => Some(2) }
+        match self { Column::OneRtx => Some(1), Column::TwoRtx => Some(2) }
     }
 }
 
@@ -144,11 +142,11 @@ impl Cell {
 pub struct MatrixRow {
     pub family: String,
     pub checkpoint: String,
-    pub cells: [Cell; 3],
+    pub cells: [Cell; 2],
 }
 
 impl MatrixRow {
-    pub fn new(family: &str, checkpoint: &str, cells: [Cell; 3]) -> Self {
+    pub fn new(family: &str, checkpoint: &str, cells: [Cell; 2]) -> Self {
         MatrixRow { family: family.into(), checkpoint: checkpoint.into(), cells }
     }
 }
@@ -215,8 +213,6 @@ struct RawMatrix {
 struct RawRow {
     family: String,
     checkpoint: String,
-    #[serde(rename = "5090")]
-    rtx_5090: RawCell,
     #[serde(rename = "1rtx")]
     one_rtx: RawCell,
     #[serde(rename = "2rtx")]
@@ -272,13 +268,13 @@ impl Matrix {
             if rows.iter().any(|seen| seen.family == row.family && seen.checkpoint == row.checkpoint) {
                 bail!("{}/{} is listed twice", row.family, row.checkpoint);
             }
-            let raw = [row.rtx_5090, row.one_rtx, row.two_rtx];
-            let mut cells = Vec::with_capacity(3);
+            let raw = [row.one_rtx, row.two_rtx];
+            let mut cells = Vec::with_capacity(2);
             for (column, raw) in Column::ALL.iter().zip(raw) {
                 cells.push(cell(*column, raw, &row.family, &row.checkpoint)?);
             }
             rows.push(MatrixRow::new(&row.family, &row.checkpoint,
-                cells.try_into().map_err(|_| anyhow::anyhow!("three cells per row"))?));
+                cells.try_into().map_err(|_| anyhow::anyhow!("two cells per row"))?));
         }
         validate_retired(&raw.retired)?;
         Ok(Matrix { rows, retired: raw.retired })
@@ -316,7 +312,7 @@ fn cell(column: Column, raw: RawCell, family: &str, checkpoint: &str) -> Result<
 
 /// A one-row matrix: the table and page renderers' test scaffolding.
 #[cfg(test)]
-pub fn one_row(family: &str, checkpoint: &str, cells: [Cell; 3]) -> Matrix {
+pub fn one_row(family: &str, checkpoint: &str, cells: [Cell; 2]) -> Matrix {
     Matrix { rows: vec![MatrixRow::new(family, checkpoint, cells)], retired: Vec::new() }
 }
 
@@ -529,11 +525,10 @@ fn reference_layout(p: &Placed) -> Option<u8> {
     else { None }
 }
 
-/// Whether a report may fill a cell: the basic profile, measured, or a planner
-/// rejection of the 5090 card (which is a result in its own right).
+/// Whether a report may fill a cell: the basic profile, measured. A small-card
+/// (5090-class) report never fills either PRO column, whether simulated or real.
 fn accepted(report: &Report) -> bool {
-    matches!(report.profile.as_str(), "smoke" | "share")
-        && (report.baseline.is_some() || (report.no_fit_reason().is_some() && report.server.column_5090()))
+    matches!(report.profile.as_str(), "smoke" | "share") && report.baseline.is_some()
 }
 
 fn newest<'a>(items: impl IntoIterator<Item = &'a Placed>) -> Option<&'a Placed> {
@@ -550,32 +545,18 @@ fn card_for<'a>(placed: &'a [Placed], row: &MatrixRow, column: Column, pinned: O
     let candidates = || -> Vec<&'a Placed> {
         placed.iter().filter(|p| {
             let report = &p.report;
-            let in_column = match column {
-                // A real RTX 5090, or our simulated one (a PRO 6000 capped at 31.8 GiB),
-                // which the card and caption label as simulated.
-                Column::Rtx5090 => report.server.column_5090()
-                    && report.server.hardware.used_gpus() == 1
-                    && (report.server.simulated_5090() || report.server.hardware.gpus.iter()
-                        .filter(|g| g.used || !report.server.hardware.gpus.iter().any(|g| g.used))
-                        .all(|g| g.name.contains("RTX 5090"))),
-                Column::OneRtx => !report.server.column_5090() && report.server.hardware.used_gpus() == 1,
-                Column::TwoRtx => !report.server.column_5090() && report.server.hardware.used_gpus() == 2,
-            };
+            let in_column = !report.server.column_5090() && report.server.hardware.used_gpus()
+                == match column { Column::OneRtx => 1, Column::TwoRtx => 2 };
             accepted(report) && in_column
                 && report.server.family.as_deref().unwrap_or("unknown") == row.family
                 && report.server.checkpoint() == row.checkpoint
-                && (column == Column::Rtx5090 || !report.server.simulated_5090())
+                && !report.server.simulated_5090()
                 && pinned.is_none_or(|dir| p.dir == dir)
         }).collect()
     };
     let reports = candidates();
     if pinned.is_some() {
         return newest(reports);
-    }
-    if column == Column::Rtx5090 {
-        // Real 5090 hardware supersedes our simulated card whenever one exists.
-        let (simulated, real): (Vec<_>, Vec<_>) = reports.into_iter().partition(|p| p.report.server.simulated_5090());
-        return newest(if real.is_empty() { simulated } else { real });
     }
     if let Some(reference) = column.reference() {
         if reports.iter().any(|p| reference_layout(p) == Some(reference)) {
@@ -597,7 +578,7 @@ pub struct Row<'a> {
     pub family: String,
     /// `GLM-5.3-NVFP4 (nvfp4-g16)`: the checkpoint and its routed-expert format.
     pub label: String,
-    pub cells: [Resolved<'a>; 3],
+    pub cells: [Resolved<'a>; 2],
 }
 
 /// What one cell publishes.
@@ -616,7 +597,7 @@ pub enum Resolved<'a> {
 pub fn select<'a>(placed: &'a [Placed], matrix: &Matrix) -> Result<Vec<Row<'a>>> {
     let mut rows = Vec::new();
     for row in &matrix.rows {
-        let cells: [Resolved<'_>; 3] = std::array::from_fn(|i| {
+        let cells: [Resolved<'_>; 2] = std::array::from_fn(|i| {
             let (column, cell) = (Column::ALL[i], &row.cells[i]);
             match cell.status {
                 Status::Current =>
@@ -683,11 +664,6 @@ fn status_cell(label: &str, reason: &str) -> String {
 fn grid_cell(cell: &Resolved) -> String {
     match cell {
         Resolved::Card(p) => {
-            if let Some(reason) = p.report.no_fit_reason() {
-                return format!("<td width=\"27%\" valign=\"top\"><a href=\"{}\">doesn't fit 1× 5090 (32 GB) + {} Sparks</a>\
-                    <br><sub>{}</sub>{}</td>", link(&p.dir, "report.json"), p.report.server.hardware.sparks.len(),
-                    crate::render::svg::escape(reason), caveat(p));
-            }
             let svg = link(&p.dir, "card.svg");
             let hardware = p.report.server.setting("qualification.hardware-label").map(str::to_string)
                 .unwrap_or_else(|| short_hardware(&p.report));
@@ -712,7 +688,7 @@ pub fn results(placed: &[Placed], matrix: &Matrix) -> Result<String> {
     if rows.is_empty() {
         return Ok(format!("_Pending the first published run._\n{retired}"));
     }
-    let mut out = String::from("<table>\n<tr><th>Model · quant</th><th>5090</th><th>1× RTX</th><th>2× RTX</th></tr>\n");
+    let mut out = String::from("<table>\n<tr><th>Model · quant</th><th>1× RTX</th><th>2× RTX</th></tr>\n");
     for row in &rows {
         let name = row.cells.iter().find_map(|cell| match cell {
             Resolved::Card(p) => Some(p.report.server.checkpoint()), _ => None })
@@ -955,15 +931,12 @@ pub fn publish(root: &Path, dirs: &[PathBuf], matrix_path: &Path) -> Result<(Pat
 pub fn one_row_of(placed: &Placed) -> Matrix {
     let report = &placed.report;
     let cell = |column: Column| {
-        let in_column = match column {
-            Column::Rtx5090 => report.server.column_5090(),
-            Column::OneRtx => !report.server.column_5090() && report.server.hardware.used_gpus() == 1,
-            Column::TwoRtx => !report.server.column_5090() && report.server.hardware.used_gpus() == 2,
-        };
+        let in_column = !report.server.column_5090() && report.server.hardware.used_gpus()
+            == match column { Column::OneRtx => 1, Column::TwoRtx => 2 };
         if !in_column { return Cell::pending("not measured on this hardware") }
         Cell::current()
     };
-    let cells = [cell(Column::Rtx5090), cell(Column::OneRtx), cell(Column::TwoRtx)];
+    let cells = [cell(Column::OneRtx), cell(Column::TwoRtx)];
     Matrix { rows: vec![MatrixRow::new(report.server.family.as_deref().unwrap_or("unknown"),
         &report.server.checkpoint(), cells)], retired: Vec::new() }
 }
@@ -1056,12 +1029,12 @@ mod tests {
             Resolved::Card(p) => Some(p.report.id.as_str()), _ => None }).collect()
     }
 
-    /// No real RTX 5090 exists yet, so the 5090 cell has no card in these fixtures.
-    fn v41() -> [Cell; 3] {
-        [Cell::pending("no 5090 card yet"), Cell::current(), Cell::pending("no two-RTX card")]
+    /// The reference row: one-RTX current, two-RTX not measured yet.
+    fn v41() -> [Cell; 2] {
+        [Cell::current(), Cell::pending("no two-RTX card")]
     }
 
-    fn v41_row(cells: [Cell; 3]) -> Matrix {
+    fn v41_row(cells: [Cell; 2]) -> Matrix {
         one_row("deepseek_v41", "deepseek-ai/DeepSeek-V4.1-Flash", cells)
     }
 
@@ -1072,13 +1045,14 @@ mod tests {
         let mut newer = marked("newer", 1, None);
         newer.report.created = "2026-10-10T00:00:00Z".into();
         let reports = vec![newer, older, marked("sim", 1, Some(("hardware.class", "5090"))), marked("two", 2, None)];
-        let matrix = v41_row([Cell::current(), Cell::current(), Cell::current()]);
+        let matrix = v41_row([Cell::current(), Cell::current()]);
         let rows = select(&reports, &matrix).unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(cards(&rows[0]), vec![Some("sim"), Some("newer"), Some("two")]);
+        assert_eq!(cards(&rows[0]), vec![Some("newer"), Some("two")]);
         let html = results(&reports, &matrix).unwrap();
-        assert!(html.contains("<th>5090</th><th>1× RTX</th><th>2× RTX</th>"));
-        assert_eq!(html.matches("<img src=").count(), 3);
+        assert!(html.contains("<th>1× RTX</th><th>2× RTX</th>"));
+        assert!(!html.contains("<th>5090</th>"), "{html}");
+        assert_eq!(html.matches("<img src=").count(), 2);
         // A cell the matrix gives to another card does not publish this one.
         assert!(!html.contains("older/card.svg"));
         assert!(index(&reports).contains("older/report.svg"));
@@ -1089,29 +1063,28 @@ mod tests {
     #[test]
     fn a_measured_cell_without_a_report_refuses_to_publish() {
         let reports = vec![marked("one", 1, None)];
-        let matrix = v41_row([Cell::pending("no 5090 card yet"), Cell::current(), Cell::current()]);
+        let matrix = v41_row([Cell::current(), Cell::current()]);
         let error = results(&reports, &matrix).unwrap_err().to_string();
         assert!(error.contains("no accepted report"), "{error}");
         assert!(error.contains("2× RTX"), "{error}");
         // Pending and n/a are the ways to say a cell has no card.
-        let matrix = v41_row([Cell::pending("no 5090 card yet"), Cell::current(), Cell::na("no two-GPU split")]);
+        let matrix = v41_row([Cell::pending("no one-RTX split"), Cell::na("no two-GPU split")]);
         let html = results(&reports, &matrix).unwrap();
-        assert!(html.contains("pending<br><sub>no 5090 card yet</sub>"), "{html}");
+        assert!(html.contains("pending<br><sub>no one-RTX split</sub>"), "{html}");
         assert!(html.contains("n/a<br><sub>no two-GPU split</sub>"), "{html}");
-        assert!(!html.contains("pending Hugh"), "{html}");
-        assert_eq!(html.matches("<img src=").count(), 1);
+        assert_eq!(html.matches("<img src=").count(), 0);
         // A row with no measured cell uses the matrix's checkpoint.
-        let matrix = v41_row([Cell::pending("a"), Cell::pending("b"), Cell::pending("c")]);
+        let matrix = v41_row([Cell::pending("a"), Cell::pending("b")]);
         let html = results(&reports, &matrix).unwrap();
         assert!(html.contains("deepseek-ai/DeepSeek-V4.1-Flash"));
-        assert_eq!(html.matches("pending<br>").count(), 3);
+        assert_eq!(html.matches("pending<br>").count(), 2);
         assert!(!html.contains("<img src="));
     }
 
     #[test]
     fn unmeasured_row_preserves_all_status_reasons() {
         let matrix = one_row("mistral_large4", "owner/plain-k4<&>", [
-            Cell::na("no fit"), Cell::pending("needs smoke"), Cell::held("quality < threshold")]);
+            Cell::na("no fit"), Cell::held("quality < threshold")]);
         let html = results(&[], &matrix).unwrap();
         assert!(html.contains("owner/plain-k4&lt;&amp;&gt;"));
         assert!(html.contains("n/a<br><sub>no fit</sub>"));
@@ -1123,7 +1096,7 @@ mod tests {
     #[test]
     fn mixed_row_keeps_the_report_checkpoint_label() {
         let reports = vec![marked("one", 1, None)];
-        let matrix = v41_row([Cell::pending("not measured"), Cell::current(), Cell::na("not supported")]);
+        let matrix = v41_row([Cell::current(), Cell::na("not supported")]);
         let rows = select(&reports, &matrix).unwrap();
         assert_eq!(rows[0].label, checkpoint(&reports[0].report));
         let html = results(&reports, &matrix).unwrap();
@@ -1133,19 +1106,19 @@ mod tests {
 
     #[test]
     fn held_cells_render_their_reason() {
-        let reports = vec![marked("sim", 1, Some(("hardware.class", "5090"))), marked("one", 1, None), marked("two", 2, None)];
+        let reports = vec![marked("one", 1, None), marked("two", 2, None)];
         let held = "W4A4 small-M path costs 13% per verify row vs the rc3 W4A16 card (#233)";
-        let matrix = v41_row([Cell::current(), Cell::held(held), Cell::current()]);
+        let matrix = v41_row([Cell::held(held), Cell::current()]);
         let html = results(&reports, &matrix).unwrap();
         let grid = &html;
         assert!(grid.contains(&format!("held<br><sub>{held}</sub>")), "{grid}");
         assert!(!grid.contains("one/card.svg"), "a held cell publishes no card");
-        // The 5090 cell of the same row still publishes: holding is per cell.
-        assert!(grid.contains("sim/card.svg"));
-        assert_eq!(html.matches("<img src=").count(), 2);
+        // The measured cell of the same row still publishes: holding is per cell.
+        assert!(grid.contains("two/card.svg"));
+        assert_eq!(html.matches("<img src=").count(), 1);
         assert!(html.contains("benchmarks/README.md"), "{html}");
         // Escaped like every other cell.
-        let matrix = v41_row([Cell::current(), Cell::held("weights < layout | over budget"), Cell::current()]);
+        let matrix = v41_row([Cell::held("weights < layout | over budget"), Cell::current()]);
         let html = results(&reports, &matrix).unwrap();
         assert!(html.contains("weights &lt; layout | over budget"), "{html}");
     }
@@ -1161,7 +1134,7 @@ mod tests {
         let matrix = v41_row(v41());
         let reports = vec![archived.clone(), reference.clone()];
         let rows = select(&reports, &matrix).unwrap();
-        assert_eq!(cards(&rows[0])[1], Some("reference"));
+        assert_eq!(cards(&rows[0])[0], Some("reference"));
         let html = results(&reports, &matrix).unwrap();
         assert!(html.contains(&link(&reference.dir, "card.svg")), "{html}");
         assert!(!html.contains("vision"), "a supplementary layout never reaches the table");
@@ -1178,12 +1151,12 @@ mod tests {
     fn the_reference_layout_wins_each_column() {
         let one = labelled(marked("one", 1, None), "model-min");
         let two = labelled(marked("two", 2, None), "model-rc2");
-        let matrix = v41_row([Cell::pending("no 5090 card yet"), Cell::current(), Cell::current()]);
+        let matrix = v41_row([Cell::current(), Cell::current()]);
         assert_eq!(reference_layout(&one), Some(1));
         assert_eq!(reference_layout(&two), None);
         let placed = [one.clone(), two.clone()];
         let rows = select(&placed, &matrix).unwrap();
-        assert_eq!(cards(&rows[0]), vec![None, Some("one"), Some("two")]);
+        assert_eq!(cards(&rows[0]), vec![Some("one"), Some("two")]);
         assert_eq!(results(&[one.clone(), two.clone()], &matrix).unwrap().matches("<img src=").count(), 2);
         // Without a reference marker the column's extreme Spark count decides.
         let fewer = labelled(marked("fewer", 1, None), "model");
@@ -1192,30 +1165,29 @@ mod tests {
         more.report.created = "2026-10-11T00:00:00Z".into();
         let placed = [more.clone(), fewer.clone()];
         let rows = select(&placed, &matrix).unwrap();
-        assert_eq!(cards(&rows[0]), vec![None, Some("fewer"), Some("more")]);
+        assert_eq!(cards(&rows[0]), vec![Some("fewer"), Some("more")]);
         // The marker is per column: a one-GPU layout marked -max fills the one-RTX cell.
         let historical = labelled(marked("historical", 1, None), "model-max");
         assert_eq!(reference_layout(&historical), Some(2));
-        let one_column = v41_row([Cell::pending("no 5090 card yet"), Cell::current(), Cell::pending("no two-RTX card")]);
-        assert_eq!(cards(&select(&[historical], &one_column).unwrap()[0])[1], Some("historical"));
+        let one_column = v41_row([Cell::current(), Cell::pending("no two-RTX card")]);
+        assert_eq!(cards(&select(&[historical], &one_column).unwrap()[0])[0], Some("historical"));
     }
 
     #[test]
-    fn simulated_cards_fill_only_the_5090_column() {
+    fn small_card_reports_never_fill_a_pro_column() {
         let sim = marked("sim", 1, Some(("simulated", "5090")));
         let real = marked("real", 1, Some(("hardware.class", "5090")));
-        let matrix = v41_row([Cell::current(), Cell::pending("no PRO card"), Cell::pending("no dual card")]);
-        assert_eq!(cards(&select(&[sim.clone()], &matrix).unwrap()[0])[0], Some("sim"));
-        // A simulated card never fills a PRO column.
-        let pro = v41_row([Cell::pending("no 5090"), Cell::current(), Cell::pending("no dual card")]);
-        assert!(select(&[sim.clone()], &pro).is_err());
+        // Neither a simulated nor a real 5090-class report is a PRO column card.
+        let matrix = v41_row([Cell::current(), Cell::current()]);
+        assert!(select(&[sim.clone()], &matrix).is_err());
+        assert!(select(&[real.clone()], &matrix).is_err());
         let mut mislabelled = real.clone();
         mislabelled.report.server.hardware.gpus[0].name = "NVIDIA RTX PRO 6000 Blackwell".into();
         assert!(select(&[mislabelled], &matrix).is_err());
         let mut dual = real.clone();
         dual.report.server.hardware.gpus.push(dual.report.server.hardware.gpus[0].clone());
         assert!(select(&[dual], &matrix).is_err());
-        assert_eq!(cards(&select(&[sim.clone(), real], &matrix).unwrap()[0])[0], Some("real"));
+        // History stays in the index.
         assert!(index(&[sim]).contains("sim/report.svg"));
     }
 
@@ -1224,26 +1196,23 @@ mod tests {
         let old = marked("old-min", 1, None);
         let mut newer = marked("new-min", 1, None);
         newer.report.created = "2026-10-16T00:00:00Z".into();
-        let mut matrix = v41_row(v41());
-        matrix.rows[0].cells[1].report = Some(old.dir.clone());
-        assert_eq!(cards(&select(&[old.clone(), newer.clone()], &matrix).unwrap()[0])[1], Some("old-min"));
+        let mut matrix = v41_row([Cell::current(), Cell::current()]);
+        matrix.rows[0].cells[0].report = Some(old.dir.clone());
+        assert_eq!(cards(&select(&[old.clone(), newer.clone()], &matrix).unwrap()[0])[0], Some("old-min"));
         assert!(select(&[newer], &matrix).is_err());
-        matrix.rows[0].cells[1].report = Some("benchmarks/deepseek_v41/wrong-gpu".into());
+        matrix.rows[0].cells[0].report = Some("benchmarks/deepseek_v41/wrong-gpu".into());
         let wrong = marked("wrong-gpu", 2, None);
         assert!(select(&[old, wrong], &matrix).is_err());
     }
 
     #[test]
-    fn no_fit_cards_publish_their_rejection() {
+    fn no_fit_cards_stay_in_the_index_and_never_fill_a_cell() {
         let mut rejection = marked("no-fit-5090", 1, Some(("hardware.class", "5090")));
         rejection.report.status = crate::report::RunStatus::Failed;
         rejection.report.baseline = None;
         marker(&mut rejection, "qualification.no-fit", "rtx0 weights < layout | over budget");
-        let matrix = v41_row([Cell::current(), Cell::pending("no one-RTX card"), Cell::pending("no two-RTX card")]);
-        let html = results(&[rejection.clone()], &matrix).unwrap();
-        assert!(html.contains("doesn't fit 1× 5090 (32 GB) + 4 Sparks"));
-        assert!(html.contains("weights &lt; layout"));
-        assert!(html.contains("no-fit-5090/report.json"));
+        let matrix = v41_row([Cell::current(), Cell::current()]);
+        assert!(select(&[rejection.clone()], &matrix).is_err());
         let card = crate::render::card::card_svg(&rejection.report);
         assert!(card.contains("Doesn&#39;t fit"));
         assert!(!card.contains("tps"));
@@ -1277,7 +1246,7 @@ mod tests {
             } },
         ];
         let matrix = Matrix { rows: vec![MatrixRow::new("mimo_v2", "XiaomiMiMo/MiMo-V2.6-Flash-MOPD",
-            [Cell::pending("no 5090 card yet"), Cell::current(), Cell::pending("no two-RTX card")])], retired: Vec::new() };
+            [Cell::current(), Cell::pending("no two-RTX card")])], retired: Vec::new() };
         let rows = select(&placed, &matrix).unwrap();
         assert_eq!(rows.len(), 1);
         assert!(!rows.iter().any(|row| row.label.contains("MiMo-V2-Flash")));
@@ -1296,10 +1265,10 @@ mod tests {
         let mut extra = labelled(qwen("uuid-extra", 1, 0, None), "qwen38-exl3-nospark-vision");
         extra.report.created = "2026-10-10T00:00:00Z".into();
         let matrix = one_row("qwen4", "org/Qwen3.8-EXL3",
-            [Cell::pending("no 5090 card yet"), Cell::current(), Cell::na("fits one RTX; no two-GPU split")]);
+            [Cell::current(), Cell::na("fits one RTX; no two-GPU split")]);
         let reports = vec![extra.clone(), minimum.clone()];
         let rows = select(&reports, &matrix).unwrap();
-        assert_eq!(cards(&rows[0])[1], Some("uuid-min"));
+        assert_eq!(cards(&rows[0])[0], Some("uuid-min"));
         let html = results(&reports, &matrix).unwrap();
         assert!(html.contains(&link(&minimum.dir, "card.svg")));
         assert!(!html.contains(&link(&extra.dir, "card.svg")), "an extra layout is not the cell");
@@ -1313,11 +1282,11 @@ mod tests {
         let mut real_5090 = qwen("real_5090", 1, 1, Some("31.8"));
         marker(&mut real_5090, "hardware.class", "5090");
         let matrix = one_row("qwen4", "org/Qwen3.8-EXL3",
-            [Cell::current(), Cell::current(), Cell::na("fits one RTX (no two-GPU split for Qwen)")]);
+            [Cell::current(), Cell::na("fits one RTX (no two-GPU split for Qwen)")]);
         let reports = vec![real_5090, minimum.clone(), qwen("maximum", 1, 0, None), qwen("legacy", 1, 4, None)];
         let rows = select(&reports, &matrix).unwrap();
-        // Real 5090 hardware fills its own cell; a legacy 4-Spark layout never does.
-        assert_eq!(cards(&rows[0]), vec![Some("real_5090"), Some("maximum"), None]);
+        // No 5090-class report fills the PRO cell; the fewest-Spark PRO layout wins.
+        assert_eq!(cards(&rows[0]), vec![Some("maximum")]);
         assert!(short_hardware(&minimum.report).contains("32 GiB budget"));
         assert!(crate::render::card::card_svg(&minimum.report).contains("32 GiB budget"));
         let html = results(&reports, &matrix).unwrap();
@@ -1326,25 +1295,24 @@ mod tests {
         assert!(!html.contains("benchmarks/qwen4/legacy/card.svg"));
         // A two-GPU card is not a one-RTX cell, whatever the matrix says.
         let matrix = one_row("qwen4", "org/Qwen3.8-EXL3",
-            [Cell::pending("no 5090 card yet"), Cell::na("no one-RTX split for Qwen"),
-                Cell::current()]);
+            [Cell::na("no one-RTX split for Qwen"), Cell::current()]);
         let reports = vec![qwen("legacy-two", 2, 4, None), qwen("max-two", 2, 0, None)];
-        assert_eq!(cards(&select(&reports, &matrix).unwrap()[0]), vec![None, None, Some("legacy-two")]);
+        assert_eq!(cards(&select(&reports, &matrix).unwrap()[0]), vec![None, Some("legacy-two")]);
     }
 
     #[test]
     fn matrix_files_are_validated_before_use() {
-        let row = r#"{"family":"glm5","checkpoint":"nvidia/GLM-5.3-NVFP4","5090":"current","1rtx":"current","2rtx":"current"}"#;
-        let held = r##"{"family":"glm5","checkpoint":"nvidia/GLM-5.3-NVFP4","5090":"current","1rtx":{"status":"held","reason":"#233: +13% per verify row"},"2rtx":"current"}"##;
+        let row = r#"{"family":"glm5","checkpoint":"nvidia/GLM-5.3-NVFP4","1rtx":"current","2rtx":"current"}"#;
+        let held = r##"{"family":"glm5","checkpoint":"nvidia/GLM-5.3-NVFP4","1rtx":{"status":"held","reason":"#233: +13% per verify row"},"2rtx":"current"}"##;
         let held_cell = r##""1rtx":{"status":"held","reason":"#233: +13% per verify row"}"##;
         let doc = |cells: &str| format!(r#"{{"schema":"{MATRIX_SCHEMA}","cells":[{cells}]}}"#);
         let error = |text: String| Matrix::parse(&text).unwrap_err().to_string();
         let swap = |to: &str| doc(&held.replace(held_cell, to));
         assert_eq!(Matrix::parse(&doc(row)).unwrap().rows.len(), 1);
         let matrix = Matrix::parse(&doc(held)).unwrap();
-        assert_eq!(matrix.rows[0].cells[1].status, Status::Held);
-        assert_eq!(matrix.rows[0].cells[1].reason, "#233: +13% per verify row");
-        assert_eq!(matrix.rows[0].cells[0].status, Status::Current);
+        assert_eq!(matrix.rows[0].cells[0].status, Status::Held);
+        assert_eq!(matrix.rows[0].cells[0].reason, "#233: +13% per verify row");
+        assert_eq!(matrix.rows[0].cells[1].status, Status::Current);
         assert!(Matrix::parse(&doc("")).unwrap().rows.is_empty());
         assert!(error(format!(r#"{{"schema":"cuteafd.bench.matrix/2","cells":[{row}]}}"#)).contains("schema"));
         assert!(error(doc(&format!("{row},{row}"))).contains("twice"));
@@ -1356,10 +1324,11 @@ mod tests {
         assert!(error(swap(r#""1rtx":{"status":"held","reason":"x","extra":1}"#)).contains("unknown field"));
         assert!(error(swap(r#""1rtx":{"status":"current","reason":"x"}"#)).contains("takes no reason"));
         assert!(error(doc(&held.replace(r#""family":"glm5""#, r#""family":"""#))).contains("family and a checkpoint"));
-        assert!(error(doc(&row.replace(r#""5090":"current""#, r#""5090":"simulated-5090""#))).contains("unknown status"));
+        assert!(error(doc(&row.replace(r#""2rtx":"current""#, r#""2rtx":"simulated-5090""#))).contains("unknown status"));
         assert!(error(swap(r#""1rtx":{"status":"current","report":"../archive"}"#)).contains("relative"));
         assert!(error(swap(r#""1rtx":{"status":"held","reason":"wait","report":"benchmarks/glm5/run"}"#)).contains("only current"));
-        assert!(error(doc(&row.replace(r#""5090":"current""#, r#""5090":"current","reason":"x""#)))
+        // The retired 5090 column is no longer a matrix key.
+        assert!(error(doc(&row.replace(r#""1rtx":"current""#, r#""5090":"current","1rtx":"current""#)))
             .contains("unknown field"));
         // A matrix that is not where the publisher looks is an error, not a default.
         let root = tempfile::tempdir().unwrap();
@@ -1458,7 +1427,7 @@ mod tests {
         let old: crate::smoke::Matrix = serde_json::from_str(&std::fs::read_to_string(
             root.join("scripts/bench/release-smoke-v4.json")).unwrap()).unwrap();
         let current: crate::smoke::Matrix = serde_json::from_str(&std::fs::read_to_string(
-            root.join("scripts/bench/release-smoke-v5.json")).unwrap()).unwrap();
+            root.join("scripts/bench/release-smoke-v6.json")).unwrap()).unwrap();
         let pins = |entries: &[Retired]| entries.iter()
             .map(|entry| (entry.name.clone(), entry.report.clone())).collect::<BTreeMap<_, _>>();
         let archived_ml4: Vec<_> = old.retired.iter().filter(|entry|
@@ -1481,7 +1450,11 @@ mod tests {
             "qwen38-27b-fp8-min-nospec", "glm53-exl3-min", "glm53-exl3-max",
             "glm53-exl3-k6core-min", "glm53-exl3-k6core-max", "step5-exl3-k6core-min",
             "step5-exl3-k6core-max", "muse-spark-exl3-min", "muse-spark-exl3-max",
-            "glm53f-exl3-k6-5090", "glm53f-exl3-k6-min", "glm53f-exl3-k6-max"]));
+            "glm53f-exl3-k6-5090", "glm53f-exl3-k6-min", "glm53f-exl3-k6-max",
+            // v6 retirements: the cells the v6 set replaces. The 5090 column retires
+            // without entries: those cards share a live min/max recipe's config.
+            "kimi-k3-min", "glm53-exlr8-max", "glmf-exlr8-k4-min",
+            "glm53f-exl3-min", "glm53f-exl3-max"]));
     }
 
     /// Writes `benchmarks/current-matrix.json` from rows: the real file, re-parsed by the real loader.
@@ -1495,7 +1468,7 @@ mod tests {
         };
         let cells: Vec<_> = rows.iter().map(|row| serde_json::json!({
             "family": row.family, "checkpoint": row.checkpoint,
-            "5090": raw(&row.cells[0]), "1rtx": raw(&row.cells[1]), "2rtx": raw(&row.cells[2]),
+            "1rtx": raw(&row.cells[0]), "2rtx": raw(&row.cells[1]),
         })).collect();
         std::fs::write(&path, serde_json::to_string_pretty(&serde_json::json!({
             "schema": MATRIX_SCHEMA, "cells": cells })).unwrap()).unwrap();
@@ -1567,8 +1540,10 @@ mod tests {
         p.report.status = crate::report::RunStatus::Failed;
         marker(&mut p, "qualification.no-fit", "over budget");
         marker(&mut p, "hardware.class", "5090");
-        let matrix = v41_row([Cell::current(), Cell::pending("no one-RTX card"), Cell::pending("no two-RTX card")]);
-        assert!(results(&[p.clone()], &matrix).unwrap().contains(&caveat(&p)));
+        // A planner rejection is an index entry only: publication never publishes
+        // a no-fit card as a table cell.
+        assert!(!accepted(&p.report));
+        assert!(crate::render::card::card_svg(&p.report).contains("Doesn&#39;t fit"));
         // A panel a later policy reclassifies: the same note, quality that now
         // passes, so the caption drops the verdict sentence and keeps its prose.
         let mut ok = marked("reclassified-min", 1, None);
@@ -1621,7 +1596,7 @@ mod tests {
     /// The matrix for `published_qwen_repo`: its one run uses one RTX.
     fn qwen_matrix(root: &Path) -> PathBuf {
         write_matrix(root, &[MatrixRow::new("qwen4", "nvidia/Qwen3.8-Flash-Next-NVFP4",
-            [Cell::pending("no 5090 card"), Cell::current(), Cell::pending("no two-RTX card")])])
+            [Cell::current(), Cell::pending("no two-RTX card")])])
     }
 
     #[test]
@@ -1792,7 +1767,7 @@ mod tests {
         std::fs::write(archive.join("card.svg"), "archived image, not a rendering under today's rule").unwrap();
         let before = tree(&archive);
         let mut cells = v41();
-        cells[1].report = Some(current.dir.clone());
+        cells[0].report = Some(current.dir.clone());
         let matrix = write_matrix(root.path(), &[MatrixRow::new("deepseek_v41",
             "deepseek-ai/DeepSeek-V4.1-Flash", cells)]);
         let (readme, index, _) = publish(root.path(), &[], &matrix).unwrap();
@@ -1804,7 +1779,7 @@ mod tests {
         std::fs::write(current_dir.join("card.svg"), "not yet rerendered").unwrap();
         let before_current = tree(&current_dir);
         let mut missing = v41();
-        missing[1].report = Some("benchmarks/deepseek_v41/missing-min".into());
+        missing[0].report = Some("benchmarks/deepseek_v41/missing-min".into());
         let matrix = write_matrix(root.path(), &[MatrixRow::new("deepseek_v41",
             "deepseek-ai/DeepSeek-V4.1-Flash", missing)]);
         assert!(publish(root.path(), &[], &matrix).is_err());
@@ -1870,7 +1845,7 @@ mod tests {
             let dir = crate::cli::labeled_dir(root.path(), &new, Some("new-min"));
             crate::cli::write_exports(&new, &dir, &["json".into()]).unwrap();
             let matrix = write_matrix(root.path(), &[MatrixRow::new("deepseek_v41",
-                "deepseek-ai/DeepSeek-V4.1-Flash", [Cell::pending("no 5090 card yet"), Cell::current(), Cell::current()])]);
+                "deepseek-ai/DeepSeek-V4.1-Flash", [Cell::current(), Cell::current()])]);
             publish(root.path(), &[dir], &matrix).unwrap();
             let page = std::fs::read_to_string(&page_path).unwrap();
             assert!(page.contains(v0), "{page}");
@@ -1898,7 +1873,7 @@ mod tests {
             let mut old = marked("old-max", 2, None);
             old.report.server.build.release = Some("v1.0.0".into());
             let reports = [current, old];
-            let matrix = v41_row([Cell::pending("no 5090 card yet"), Cell::current(), Cell::current()]);
+            let matrix = v41_row([Cell::current(), Cell::current()]);
             family_pages_with_row(root.path(), &reports, &matrix, Some("v2"), Some(row)).unwrap();
             let page = std::fs::read_to_string(&path).unwrap();
             let target = page.lines().find(|line| line.starts_with(&format!("| {row} |"))).unwrap();
@@ -1972,7 +1947,7 @@ mod tests {
         // And so is a cell the tree cannot fill, without writing a document.
         let before = std::fs::read_to_string(root.path().join("README.md")).unwrap();
         let missing = write_matrix(root.path(), &[MatrixRow::new("deepseek_v41",
-            "deepseek-ai/DeepSeek-V4.1-Flash", [Cell::current(), Cell::current(), Cell::current()])]);
+            "deepseek-ai/DeepSeek-V4.1-Flash", [Cell::current(), Cell::na("not on this layout")])]);
         assert!(publish(root.path(), &[], &missing).is_err());
         assert_eq!(std::fs::read_to_string(root.path().join("README.md")).unwrap(), before);
     }

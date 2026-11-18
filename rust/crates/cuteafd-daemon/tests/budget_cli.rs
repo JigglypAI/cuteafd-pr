@@ -1242,7 +1242,7 @@ fn retired_configs(matrix: &serde_json::Value) -> std::collections::BTreeSet<Str
 fn live_release_entries(root: &std::path::Path, matrix: &serde_json::Value) -> Vec<serde_json::Value> {
     let mut entries = Vec::new();
     for cell in matrix["cells"].as_array().unwrap() {
-        for column in ["5090", "1rtx", "2rtx"] {
+        for column in ["1rtx", "2rtx"] {
             let card = &cell[column];
             if card["status"] != "current" { continue; }
             let report_path = root.join(card["report"].as_str().unwrap()).join("report.json");
@@ -1359,7 +1359,7 @@ fn installed_inventory_filters_retired_examples_but_keeps_live_release_cells() {
         "revision": "pinned", "hardware": {"sparks": [{}, {}]}}}).to_string()).unwrap();
     let matrix = serde_json::json!({"retired": [{"config": "examples/configs/old.config"}], "cells": [{
         "checkpoint": "test/current", "1rtx": {"status": "current", "report": "benchmarks/live"},
-        "5090": {"status": "na"}, "2rtx": {"status": "retired", "report": "missing"}}]});
+        "2rtx": {"status": "na", "reason": "not a v6 column"}}]});
     let retired = retired_configs(&matrix);
     assert!(retired.contains("examples/configs/old.config"));
     assert!(!retired.contains("examples/configs/live.config"));
