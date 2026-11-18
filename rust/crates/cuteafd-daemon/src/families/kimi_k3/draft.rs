@@ -136,6 +136,7 @@ impl<'a> Bridge<'a> {
 /// All planes retain one independently admitted drafter weight arena.
 pub(super) struct HeadReplica<'a> {
     bf16: Option<Allocation<'a>>,
+    fp8: Option<crate::shared::native_attention::NativeAttentionWeights<'a>>,
     core: Option<crate::shared::dense_trellis::CoreWeights<'a>>,
 }
 impl<'a> HeadReplica<'a> {
@@ -149,20 +150,26 @@ impl<'a> HeadReplica<'a> {
                 cuteafd_loader::formats::dense_trellis::TrellisSide::Output, 0, 1)?;
             let mut planes = layout.arena_tensors("head")?.into_iter()
                 .map(|(name, bytes)| arena.view(&name, bytes)).collect::<Result<Vec<_>>>()?.into_iter();
-            Ok(Self { bf16: None, core: Some(crate::shared::dense_trellis::CoreWeights {
+            Ok(Self { bf16: None, fp8: None, core: Some(crate::shared::dense_trellis::CoreWeights {
                 payload: planes.next().unwrap(), suh: planes.next().unwrap(), svh: planes.next().unwrap(),
                 shape: layout.shape, side: layout.side, bits: layout.bits, codebook: layout.codebook }) })
+        } else if let Some(layout) = core.fp8_head()? {
+            let plane = |name| -> Result<_> { Ok(crate::shared::memory::DeviceAllocation::from_allocation(
+                arena.view(name, arena.layout().view(name).context("Kimi FP8 replica plane missing")?.bytes())?)) };
+            Ok(Self { bf16: None, core: None, fp8: Some(crate::shared::native_attention::NativeAttentionWeights {
+                layout, values: plane("head.values")?, scales: Some(plane("head.scales")?),
+            }) })
         } else {
-            Ok(Self { bf16: Some(arena.view("head", arena.layout().view("head").unwrap().bytes())?), core: None })
+            Ok(Self { bf16: Some(arena.view("head", arena.layout().view("head").unwrap().bytes())?), core: None, fp8: None })
         }
     }
     fn copy(&self, source: &GlobalWeights<'a>, stream: &Stream<'a>) -> Result<()> {
-        let copy = |destination: &Allocation<'a>, source: CuteafdDeviceBuffer| -> Result<()> {
-            ensure!(destination.buffer.bytes == source.bytes, "Kimi native head replica extent changed");
+        let copy = |destination: CuteafdDeviceBuffer, source: CuteafdDeviceBuffer| -> Result<()> {
+            ensure!(destination.bytes == source.bytes, "Kimi native head replica extent changed");
             stream.device.run(|| {
                 // SAFETY: startup drained the source stream; both retained arenas survive
                 // the destination drain below, before any graph or request can read them.
-                unsafe { stream.device.library.copy_peer_async(destination.buffer, source, source.bytes, stream.raw) }
+                unsafe { stream.device.library.copy_peer_async(destination, source, source.bytes, stream.raw) }
             })
         };
         if let Some(destination) = &self.core {
@@ -170,10 +177,16 @@ impl<'a> HeadReplica<'a> {
             ensure!(destination.shape == source.shape && destination.bits == source.bits
                 && destination.codebook == source.codebook && destination.side == source.side,
                 "Kimi native head replica format changed");
-            copy(&destination.payload, source.payload.buffer)?;
-            copy(&destination.suh, source.suh.buffer)?;
-            copy(&destination.svh, source.svh.buffer)?;
-        } else { copy(self.bf16.as_ref().unwrap(), source.buffer("head")?)?; }
+            copy(destination.payload.buffer, source.payload.buffer)?;
+            copy(destination.suh.buffer, source.suh.buffer)?;
+            copy(destination.svh.buffer, source.svh.buffer)?;
+        } else if let Some(destination) = &self.fp8 {
+            let source = source.fp8_head.as_ref().context("Kimi FP8 replica source absent")?;
+            ensure!(destination.layout == source.layout, "Kimi FP8 replica layout changed");
+            copy(destination.values.buffer, source.values.buffer)?;
+            copy(destination.scales.as_ref().context("Kimi FP8 replica scales absent")?.buffer,
+                source.scales.as_ref().context("Kimi FP8 source scales absent")?.buffer)?;
+        } else { copy(self.bf16.as_ref().unwrap().buffer, source.buffer("head")?)?; }
         stream.drain()
     }
 }
@@ -198,6 +211,7 @@ pub(crate) struct NativeDraft<'a> {
     programs: &'a Programs<'a>,
     /// The drafter owns a head program and scratch at its admitted row capacity;
     /// only the immutable target head weights are shared with the target lane.
+    fp8_head: Option<(crate::shared::target_head::BlockFp8Head<'a>, Allocation<'a>)>,
     k6_head: Option<(crate::shared::dense_trellis::Projection<'a>, crate::shared::dense_trellis::ProjectionScratch<'a>)>,
     cache_format: cuteafd_core::MlaCacheFormat,
     marks: usize,
@@ -224,6 +238,10 @@ impl<'a> NativeDraft<'a> {
                 for (name, plane) in [("trellis", &owner.payload), ("suh", &owner.suh), ("svh", &owner.svh)] {
                     plane.inventory(&mut inventory, name)?;
                 }
+            }
+            if let Some(head) = &replica.fp8 {
+                head.values.inventory(&mut inventory, "head.values")?;
+                head.scales.as_ref().context("Kimi FP8 replica scales absent")?.inventory(&mut inventory, "head.scales")?;
             }
             receipts.extend(inventory.receipts);
         }
@@ -307,7 +325,7 @@ impl<'a> NativeDraft<'a> {
         } else { admission.allocate_draft_marks(streams[head].device)? };
         let cache_format=match layout { DraftLayout::Mla(layout)=>layout.cache_format(),_=>options.cache_format };
         Ok(Self { hidden_stream, head_replica,
-            block_marks,window_marks, window_bytes, programs, k6_head: None, cache_format, marks, owners: Owners { draft, target: None }, taps: allocate("DFlash bridge taps")?,
+            block_marks,window_marks, window_bytes, programs, k6_head: None, fp8_head: None, cache_format, marks, owners: Owners { draft, target: None }, taps: allocate("DFlash bridge taps")?,
             ids: allocate("DFlash bridge input ids")?, input: allocate("DFlash bridge gathered input")?,
             bridge, producer: RefCell::new(crate::shared::memory::device::Event::new(device)?),
             consumed: RefCell::new(crate::shared::memory::device::Event::new(streams[head].device)?),
@@ -358,6 +376,11 @@ impl<'a> NativeDraft<'a> {
                     .allocate(execution_device, Tag::drafter_workspace("kimi/draft-head-projection"))?
             };
             self.k6_head = Some((projection, scratch));
+        } else if let Some(weight) = &target[head].fp8_head {
+            ensure!(weight.layout.shape == [cfg.vocab, cfg.hidden], "Kimi draft FP8 head geometry differs");
+            let projection = execution_device.run(|| crate::shared::target_head::BlockFp8Head::load(self.programs, weight.layout.shape))?;
+            let scratch = Allocation::new(execution_device, projection.scratch_bytes()?, Tag::drafter_workspace("kimi/draft-head-fp8"))?;
+            self.fp8_head = Some((projection, scratch));
         } else {
             ensure!(target[head].buffer("head")?.bytes == cfg.vocab * cfg.hidden * 2,
                 "Kimi draft target head differs from admitted BF16 geometry");
@@ -576,8 +599,8 @@ impl<'a> NativeDraft<'a> {
                     Bridge::Local { .. } => self.bridge.copy_local(output, self.input.buffer, bytes, None),
                 }
             };
-            let head = match &self.k6_head {
-                Some((projection, scratch)) => {
+            let head = match (&self.k6_head, &self.fp8_head) {
+                (Some((projection, scratch)), None) => {
                     let weight = self.head_replica.as_ref().and_then(|replica| replica.core.as_ref())
                         .or(target[head].core_head.as_ref()).context("Kimi draft native target head absent")?;
                     let device = self.bridge.stream().device.id;
@@ -591,7 +614,20 @@ impl<'a> NativeDraft<'a> {
                         projection.local(rows, input, weight, scratch, output, stream)
                     }))
                 }
-                None => TargetHead::Bf16Buffer(match self.head_replica.as_ref().and_then(|replica| replica.bf16.as_ref()) {
+                (None, Some((projection, scratch))) => {
+                    let weight = self.head_replica.as_ref().and_then(|replica| replica.fp8.as_ref())
+                        .or(target[head].fp8_head.as_ref()).context("Kimi draft FP8 target head absent")?;
+                    let device = self.bridge.stream().device.id;
+                    let (hidden, vocab) = (draft.geometry().hidden, draft.geometry().vocab);
+                    TargetHead::Launch(Box::new(move |x, logits, rows, stream| {
+                        ensure!(stream == self.bridge.stream().raw, "Kimi draft FP8 head stream differs from bridge");
+                        let input = CuteafdDeviceBuffer { ptr: x.cast_mut(), bytes: rows * hidden * 2, device_id: device, flags: 0 };
+                        let output = CuteafdDeviceBuffer { ptr: logits.cast(), bytes: rows * vocab * 4, device_id: device, flags: 0 };
+                        projection.launch(rows, input, weight, output, scratch.buffer, stream)
+                    }))
+                }
+                (Some(_), Some(_)) => anyhow::bail!("Kimi draft head has multiple formats"),
+                (None, None) => TargetHead::Bf16Buffer(match self.head_replica.as_ref().and_then(|replica| replica.bf16.as_ref()) {
                     Some(owner) => &owner.buffer,
                     None => target[head].borrowed_buffer("head")?,
                 }),

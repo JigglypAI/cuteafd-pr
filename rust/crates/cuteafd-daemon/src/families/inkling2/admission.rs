@@ -42,9 +42,7 @@ pub(crate) fn admit(checkpoint: &Checkpoint, cfg: &Inkling2Config, target: &Coor
         if bytes > 0 { buffers.push((name.into(), Location::coordinator(0), bytes as u64, Lifetime::TARGET, Category::Workspace)); }
     }
     if !target.core.is_empty() {
-        buffers.push(("target.load_trellis".into(), Location::coordinator(0),
-            cuteafd_loader::shared::dense_read::STEP_BYTES as u64,
-            Lifetime { first: Phase::Load, last: Phase::Load }, Category::Staging));
+        contract.components.push(cuteafd_loader::shared::dense_read::trellis_device_staging(0, 1));
     }
     let mut mount = target.mount_load(checkpoint)?;
     mount.merge(expert_mount);
@@ -215,19 +213,21 @@ mod tests {
     #[test]
     fn retained_reconciliation_omits_load_only_trellis_granularity() {
         let mut plan = fixture();
-        let location = Location::coordinator(0);
-        let load_only = Lifetime { first: Phase::Load, last: Phase::Load };
-        let bytes = cuteafd_loader::shared::dense_read::STEP_BYTES as u64;
-        plan.facts.allocations.push(Allocation::buffer("target.load_trellis", location,
-            bytes, load_only, Category::Staging, "trellis repack"));
-        // Even a page-aligned request has a granularity record in the full plan.
-        plan.facts.allocation_granularity.push(AllocationGranularity {
-            id: "target.load_trellis.tail".into(), location, lifetime: load_only,
-            backings: vec![GranularityBacking { backing: "target.load_trellis".into(), requests: vec![bytes] }],
-            evidence: GranularityEvidence::Forecast,
-        });
-        plan.phases = evaluate(&plan.facts, &plan.budgets).unwrap();
         let receipt = Receipt { allocation: plan.facts.allocations[0].clone(), address: 0x1000 };
+        let mut contract = cold_contract(plan.facts.clone(), 64);
+        contract.components.push(cuteafd_loader::shared::dense_read::trellis_device_staging(0, 1));
+        fixed_request_tails(&mut contract.components, 1, &[]).unwrap();
+        plan.facts = contract.facts(&[0, 0], 1).unwrap();
+        // The aligned request still gets a tail record, which must follow its backing.
+        let [tail] = plan.facts.allocation_granularity.as_slice() else { panic!("one staging tail") };
+        assert_eq!(tail.requests(), [32 << 20]);
+        assert_eq!(tail.bytes().unwrap(), 0);
+        let phases = evaluate(&plan.facts, &plan.budgets).unwrap();
+        for (before, after) in plan.phases.iter().zip(&phases) {
+            assert_eq!(after.owned - before.owned, if before.phase == Phase::Load { 32 << 20 } else { 0 });
+            assert_eq!(after.opaque, before.opaque);
+        }
+        plan.phases = phases;
         let devices = CoordinatorDevices::new(&[0]).unwrap();
         reconcile_native(&plan, devices, &[receipt]).unwrap();
     }

@@ -303,6 +303,8 @@ pub fn draft_head_replica(core: &crate::families::kimi_k3::core::CoreInventory,
     let tensors = if let Some(head) = core.get_weight("language_model.lm_head") {
         crate::formats::trellis_core::CoreWeightLayout::new(head,
             crate::formats::dense_trellis::TrellisSide::Output, 0, 1)?.arena_tensors("head")?
+    } else if let Some(head) = core.fp8_head()? {
+        crate::families::kimi_k3::weight_layout::native_tensors("head", &head)?
     } else {
         vec![("head".into(), hidden.checked_mul(vocab).and_then(|n| n.checked_mul(2))
             .ok_or_else(|| anyhow::anyhow!("Kimi BF16 head replica overflow"))?)]
@@ -387,7 +389,7 @@ impl KimiRecipe {
         anyhow::ensure!(base.homes.is_empty(), "Kimi draft alternatives prepared twice");
         let mut base = base.clone();
         let movable = |group: &str| matches!(group, "DFlash bridge exchange" |
-            "Kimi K6 draft head scratch" | "Kimi exact draft windows");
+            "Kimi K6 draft head scratch" | "Kimi FP8 draft head scratch" | "Kimi exact draft windows");
         base.fixed = self.fixed.iter().filter(|owner| movable(&owner.group)).cloned().collect();
         self.fixed.retain(|owner| !movable(&owner.group));
         let replica = draft_head_replica(core, layout.target_hidden(), layout.target_vocab())?;
