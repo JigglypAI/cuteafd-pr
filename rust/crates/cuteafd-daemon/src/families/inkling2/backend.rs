@@ -460,6 +460,44 @@ mod tests {
     }
 
     #[test]
+    fn cold_decode_probe_commits_once_before_prefill_draft_binding() -> Result<()> {
+        let scheduler = include_str!("../../shared/qwen/scheduler.rs");
+        let cold = scheduler.split("let decode = p.job.probe.as_ref()").nth(1).unwrap()
+            .split("p.done += chunk.len();").next().unwrap();
+        assert!(cold.contains("step.decode"));
+        assert!(cold.contains("UngraphedKind::Scoring"));
+        assert!(cold.contains("engine.prefill_draft(&p.placement, start, chunk"));
+        assert!(!cold.contains("engine.accept("), "cold replay must not accept twice");
+        assert!(!cold.contains("lanes::commit("));
+        let backend = include_str!("backend.rs").split("#[cfg(test)]").next().unwrap();
+        let replay = backend.split("fn verify_device_ungraphed(").nth(1).unwrap()
+            .split("fn verify_bucket_rows(").next().unwrap();
+        assert!(replay.contains("scoring_replay(sequences, speculative"));
+        assert!(replay.contains("self.accept(verified, false)"));
+
+        let mut placement = Placement { media: None, units: vec![], slot: 0, len: 8, state_len: 8 };
+        let frontier = std::cell::Cell::new(8);
+        let commits = std::cell::Cell::new(0);
+        for rows in [&[10, 11][..], &[12][..]] {
+            scoring_replay(&mut [(&mut placement, rows)], false, |sequences| {
+                for (p, rows) in sequences { p.len += rows.len(); p.state_len = p.len; }
+                Ok(None)
+            }, |verified| {
+                assert_eq!(verified.len(), 1);
+                assert_eq!(verified[0].start, frontier.get());
+                frontier.set(verified[0].placement.len);
+                commits.set(commits.get()+1);
+                Ok(())
+            })?;
+            // Inkling prefill_draft binds the existing, already published taps.
+            assert_eq!(frontier.get(), placement.len);
+        }
+        assert_eq!(commits.get(), 2);
+        assert_eq!(frontier.get(), 11);
+        Ok(())
+    }
+
+    #[test]
     fn recurrent_native_seven_history_always_explores_and_never_head_skips() -> Result<()> {
         use cuteafd_core::{DraftControl, DraftHistory, DraftOutcome, DrafterSpec, HeadScore};
         let config = cuteafd_loader::formats::block_dspark::recurrent::RecurrentBlockConfig::from_hf(
