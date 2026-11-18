@@ -27,6 +27,30 @@ Rubric, each 1–5 (5 best), plus wall time:
 
 ## Log
 
+### 2026-11-18 Kimi/Inkling RTX Trellis Decode Duel
+
+[The selective composite](https://github.com/tpurtell/sparkinfer-glmrt/pull/402)
+combines Astra's K8 and Inkling compact head kernels with Fable's fastest
+Kimi K6 routes. Astra's exact local fold and transposed M8 tail cut the
+K6 M49–56 band 7.6% versus Astra's prior composite. Fable's fused
+narrow and single-fragment wide routes win Kimi K6 M1–8 and shared gate/up
+at M9–16; its wider changes to 113 engine export entries did not land.
+Neither entrant's branch landed wholesale.
+
+In the final four-arm GPU1 replay the winner cuts Kimi K6 M1 by 17.3%
+(matches Fable within paired spread), and the ranked Inkling K6/K8 head
+means by 17.0%/17.1% (matches Astra). All 2,560 oracle cells per arm are
+bitwise baseline-exact and row-invariant, with no F32 error regression.
+Only 19 Kimi and two Inkling head objects change out of 567. The K6
+M48→49 head step is still 12.4%, down from 29.5%; engine card timings
+are not part of this verdict.
+
+Scores (correctness / judgment / quality / creativity): Astra 5 / 4 / 4 / 5;
+Fable 5 / 4 / 4 / 4. Astra used four rounds and addressed both disputed
+head bands; Fable used one round and supplied the measured K6 route wins.
+[Measured tables and verdict](https://github.com/tpurtell/cuteafd/issues/2462#issuecomment-6978700762).
+
+
 ### 2026-11-18 Kimi K2 Spark Small-M Duel
 
 [Carbon R2](https://github.com/tpurtell/sparkinfer-glmrt/pull/399) wins

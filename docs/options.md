@@ -812,6 +812,12 @@ when the server has no drafter or its effective draft policy is `off`.
 | `MEDIA_FEATURES_DIR`, `AUDIO_FEATURES_DIR` | unset | absolute dir | Encoder feature caches. |
 | `CHAT_TEMPLATE_FROM` | checkpoint | snapshot dir | GLM Flash template source when the checkpoint's template cannot mark images. |
 
+`./run.sh --dry-run` and serving both verify the native AOT exports on the
+planned media owners, without starting CUDA work. A slot or image that lacks
+required exports is refused rather than silently changing placement. Rebuild
+with `CUTEAFD_WIP_VISION_ATTENTION_AOT=ON` / `CUTEAFD_WIP_AUDIO_AOT=ON` (or the
+corresponding `CUTEAFD_RELEASE_` flags), or turn the unavailable tower off.
+
 The direct daemon's `--max-image-tokens` accepts an explicit 1-16384 per-image
 LM span cap. Omission uses the processor's default span, limited by its
 architectural ceiling: existing families default to 4096 (Qwen capped at 1024,

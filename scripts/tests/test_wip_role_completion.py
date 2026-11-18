@@ -57,7 +57,7 @@ def test_wip_audio_opt_in_is_validated_before_operations_and_forwarded(value):
                'sync_local_source() { :; }; sync_seed_source() { :; }\n'
                'docker() { printf "docker %s\\n" "$*"; }\n'
                'ssh() { printf "ssh %s\\n" "$*"; }\n'
-               'timeout() { shift 2; "$@"; }\n' + helpers + 'native_store_has() { return 1; }\n' + coordinator + '\n' + expert + '\n'
+               'timeout() { shift 2; "$@"; }\n' + helpers + 'wip_pipe() { shift 3; \"$@\"; }; wip_exec() { \"$@\"; }; native_store_has() { return 1; }\n' + coordinator + '\n' + expert + '\n'
                'build_coordinator all /frozen/source\nbuild_expert\n')
     result = subprocess.run(['bash', '-c', command], env=env, capture_output=True, text=True, timeout=10)
     if value not in (None, 'ON', 'OFF'):
@@ -371,7 +371,7 @@ def test_finalizer_retains_checked_programs_and_frozen_transformers_identity(tmp
     shutil.copyfile(lock, source / 'third_party/transformers.lock.json')
     scripts = source / 'scripts/build'
     scripts.mkdir(parents=True)
-    for name in ('verify-transformers-source.py', 'verify-release-source-manifest.py'):
+    for name in ('verify-transformers-source.py', 'verify-release-source-manifest.py', 'wip-slot-reuse.py'):
         shutil.copyfile(ROOT / 'scripts/build' / name, scripts / name)
     (scripts / 'verify-sparkinfer-source.py').write_text('print("fixture-sparkinfer")\n')
     output = tmp_path / 'output'
@@ -387,15 +387,34 @@ def test_finalizer_retains_checked_programs_and_frozen_transformers_identity(tmp
     (output / 'ARTIFACT_SHA256SUMS').write_text(sums)
     script = (ROOT / 'scripts/build/finalize-wip-slot.sh').read_text().replace('/wip/', str(tmp_path / 'wip') + '/')
     command = ['bash', '-c', script, 'finalize', str(source), role, 'WP9', str(output), 'base', 'sha256:base']
-    result = subprocess.run(command, capture_output=True, text=True, timeout=10)
+    claim = [sys.executable, str(scripts / 'wip-slot-reuse.py'), 'claim', '--root', str(tmp_path / 'wip'),
+             '--slot', 'WP9', '--generation']
+    subprocess.run([*claim, 'first'], check=True)
+    env = {**os.environ, 'CUTEAFD_WIP_SLOT_GENERATION': 'first'}
+    result = subprocess.run(command, capture_output=True, text=True, timeout=10, env=env)
     assert result.returncode == 0, result.stderr
     frozen = tmp_path / 'wip/slots/WP9' / role
     assert (frozen / 'workspace/.cuteafd-wip/PROGRAMS.json').read_bytes() == (output / 'PROGRAMS.json').read_bytes()
     meta = json.loads((frozen / 'META.json').read_text())
     assert meta['transformers_revision'] == 'a' * 40
     assert meta['transformers_source_sha256'] == module.source_tree_sha256(transformers)
+    subprocess.run([*claim, 'second'], check=True)
+    incumbent = (frozen / 'FINGERPRINT').read_bytes()
+    late = subprocess.run(command, capture_output=True, text=True, timeout=10, env=env)
+    assert late.returncode and "slot WP9 was claimed by build second" in late.stderr
+    assert (frozen / 'FINGERPRINT').read_bytes() == incumbent
+    assert not list((tmp_path / 'wip/incoming').iterdir())
+    env['CUTEAFD_WIP_SLOT_GENERATION'] = 'second'
+    (output / 'cuteafd').write_text('new daemon')
+    sums = ''.join(hashlib.sha256((output / name).read_bytes()).hexdigest() + '  ' + name + '\n'
+                   for name in (line.split('  ', 1)[1] for line in sums.splitlines()))
+    (output / 'ARTIFACT_SHA256SUMS').write_text(sums)
+    replaced = subprocess.run(command, capture_output=True, text=True, timeout=10, env=env)
+    assert replaced.returncode == 0, replaced.stderr
+    assert (frozen / 'workspace/.cuteafd-wip/cuteafd').read_text() == 'new daemon'
+    assert (frozen / 'FINGERPRINT').read_bytes() != incumbent
     (output / 'PROGRAMS.json').write_text('corrupted')
-    assert subprocess.run(command, capture_output=True, text=True).returncode != 0
+    assert subprocess.run(command, capture_output=True, text=True, env=env).returncode != 0
 
 
 def test_wip_verifies_transformers_before_both_role_builds_and_frozen_source(tmp_path):
