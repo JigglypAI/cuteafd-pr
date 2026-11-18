@@ -17,6 +17,7 @@ pub(crate) struct ProgramsForRank<'a> {
     pub(super) f32: DraftProjections<'a>,
     compressed: BTreeMap<String,Projection<'a>>,
     compressed_scratch: Option<ProjectionScratch<'a>>,
+    pub(super) trellis_add: Option<cuteafd_ffi::F32Add<'a>>,
     fp8: Option<(cuteafd_ffi::native_attention::Fp8Projections<'a>, Allocation<'a>)>,
     pub mix: Primitive<'a>, pub init: Primitive<'a>, pub residual_norm: Primitive<'a>,
     pub rotary: Primitive<'a>, pub context_rotary: Primitive<'a>, pub silu: Primitive<'a>,
@@ -55,6 +56,9 @@ impl<'a> ProgramsForRank<'a> {
             if let Some(required)=&mut required {required.merge(&need)?;} else {required=Some(need);}
             compressed.insert(name.clone(),projection);
         }
+        let trellis_add = weights.layout.core.values().any(|core|
+            core.side == cuteafd_loader::formats::dense_trellis::TrellisSide::Input)
+            .then(|| device.library.f32_add()).transpose()?;
         let compressed_scratch=required.map(|layout|layout.allocate_packed(device,Tag::drafter_workspace("shared/recurrent-projection"))).transpose()?;
         let fp8 = if weights.layout.fp8.is_empty() { None } else {
             let shapes = weights.layout.fp8.values().map(|p| (p.shape[1], p.shape[0])).collect::<Vec<_>>();
@@ -70,7 +74,7 @@ impl<'a> ProgramsForRank<'a> {
             bias_raw:Primitive::load(programs,Op::Bias{width:768,bf16:false})?,
             bias_correction:Primitive::load(programs,Op::Bias{width:201024,bf16:true})?,
         })}else{None};
-        Ok(Self {plain,f32,compressed,compressed_scratch,fp8,head,
+        Ok(Self {plain,f32,compressed,compressed_scratch,trellis_add,fp8,head,
             mix:Primitive::load(programs,Op::Mix)?,init:Primitive::load(programs,Op::Mask)?,
             residual_norm:Primitive::load(programs,Op::ResidualNorm)?,
             rotary:Primitive::load(programs,Op::QkRope{query_heads:local.heads,kv_heads:local.kv_heads})?,
@@ -97,13 +101,29 @@ impl<'a> ProgramsForRank<'a> {
                 unsafe { fp8.launch(input.ptr, values.buffer.ptr, scales.buffer.ptr, output, scratch.buffer, rows, k, n, stream)?; }
             }
             ProjectionWeight::Trellis(weight)=> {
-                let projection=self.compressed.iter().find(|(key,_)|key.as_str()==name || key.strip_prefix("mtp.")==Some(name))
-                    .map(|(_,value)|value).context("recurrent compact projection not bound")?;
-                let scratch=self.compressed_scratch.as_ref().context("recurrent compact scratch not admitted")?;
+                let (projection, scratch) = self.trellis_parts(name)?;
                 projection.local(rows,input,weight,scratch,output,stream)?;
             }
         }
         Ok(())
+    }
+
+    pub(super) fn project_row_parallel(&self, name: &str, weights: &ProjectionWeight<'_>,
+        input: Buffer, output: Buffer, rows: usize, shape: Shape, stream: *mut c_void) -> Result<()> {
+        match weights {
+            ProjectionWeight::Trellis(w) if w.side == cuteafd_loader::formats::dense_trellis::TrellisSide::Input => {
+                let (projection, scratch) = self.trellis_parts(name)?;
+                projection.core_into(rows, input, w, scratch, output, stream)
+            }
+            _ => self.project(name, weights, input, output, rows, shape, stream),
+        }
+    }
+
+    pub(super) fn trellis_parts(&self, name: &str) -> Result<(&Projection<'a>, &ProjectionScratch<'a>)> {
+        let projection = self.compressed.get(name).or_else(|| self.compressed.get(&format!("mtp.{name}")))
+            .context("recurrent compact projection not bound")?;
+        let scratch = self.compressed_scratch.as_ref().context("recurrent compact scratch not admitted")?;
+        Ok((projection, scratch))
     }
 
     /// Concatenated parts preserve independent compressed rotations/calibrations.
@@ -157,6 +177,14 @@ impl<'a> Rank<'a> {
             self.weights.tensors.layers[0].input_norm.buffer,self.buffer("step.normalized")?,i32::try_from(rows)?,
             i32::try_from(self.config.transformer.hidden)?,self.config.transformer.rms_norm_eps as f32,self.stream.raw)}
     }
+    pub(super) fn row_partial(&self, weight: &ProjectionWeight<'_>) -> Result<Buffer> {
+        let name = if matches!(weight, ProjectionWeight::Trellis(w)
+            if w.side == cuteafd_loader::formats::dense_trellis::TrellisSide::Input) {
+            "step.partial_f32"
+        } else { "step.partial" };
+        self.buffer(name)
+    }
+
     pub fn attention_partial(&self,index:usize,sequences:usize,max_keys:usize)->Result<()> {
         let c=&self.config.transformer; let rank=self.layout.rank;
         let layer=&self.weights.tensors.layers[index];
@@ -172,8 +200,8 @@ impl<'a> Rank<'a> {
             self.buffer("step.positions")?,self.buffer("rotary.frequencies")?,self.buffer("step.query")?,
             self.buffer("step.key")?,self.buffer("step.value")?],rows,eps,0,self.stream.raw)?;}
         self.attend(index,sequences,max_keys)?;
-        self.programs.project(&format!("{a}.o_proj.weight"),&layer.output[0],self.buffer("step.attention")?,
-            self.buffer("step.partial")?,rows,(q,c.hidden),self.stream.raw)
+        self.programs.project_row_parallel(&format!("{a}.o_proj.weight"),&layer.output[0],self.buffer("step.attention")?,
+            self.row_partial(&layer.output[0])?,rows,(q,c.hidden),self.stream.raw)
     }
     fn attend(&self,index:usize,sequences:usize,max_keys:usize)->Result<()> {
         let c=&self.config.transformer;let rank=self.layout.rank;let lib=self.stream.device.library;
@@ -222,8 +250,8 @@ impl<'a> Rank<'a> {
             rows,c.hidden,&[i,i],self.stream.device.library,self.buffer("projection.bf16")?,self.stream.raw)?;
         // SAFETY: packed gate/up and activation planes are admitted and disjoint.
         unsafe{self.programs.silu.launch(&[self.buffer("step.gate_up")?,self.buffer("step.activated")?],rows,eps,0,self.stream.raw)?;}
-        self.programs.project(&format!("layers.{index}.mlp.down_proj.weight"),&layer.down[0],self.buffer("step.activated")?,
-            self.buffer("step.partial")?,rows,(i,c.hidden),self.stream.raw)
+        self.programs.project_row_parallel(&format!("layers.{index}.mlp.down_proj.weight"),&layer.down[0],self.buffer("step.activated")?,
+            self.row_partial(&layer.down[0])?,rows,(i,c.hidden),self.stream.raw)
     }
     pub fn finish_layer(&self,index:usize,sequences:usize,reduced:Buffer)->Result<()> {
         let rows=sequences*self.config.transformer.block;

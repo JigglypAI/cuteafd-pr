@@ -586,7 +586,7 @@ fn compact_core_headers_preserve_native_keeps_and_plan_exact_trellis_arenas() ->
 }
 
 #[test]
-fn planner_refuses_each_compact_view_on_tp2_by_name() -> anyhow::Result<()> {
+fn planner_reaches_compact_program_validation_on_tp2() -> anyhow::Result<()> {
     use crate::plan::checkpoint::{CheckpointView, CoreView};
     let (_, config, tensors) = fixture(Fixture::Exl3);
     let dir = tempfile::tempdir()?;
@@ -603,8 +603,8 @@ fn planner_refuses_each_compact_view_on_tp2_by_name() -> anyhow::Result<()> {
             ..Default::default()
         })?;
         assert!(!report.executable() && !report.wip_launchable(), "{mode}: {:?}", report.hints);
-        assert!(report.hints.iter().any(|hint| hint.what.contains(&format!("CORE_VIEW={mode}"))
-            && hint.what.contains("TP2") && hint.what.contains("#2316")), "{mode}: {:?}", report.hints);
+        assert!(report.hints.iter().any(|hint| hint.what.contains("Inkling compact core requires PROGRAMS.json")),
+            "{mode}: {:?}", report.hints);
     }
     Ok(())
 }
@@ -656,6 +656,73 @@ fn installed_inkling_mc_views_have_native_target_and_draft_programs() -> anyhow:
         assert!(report.fits && report.wip_launchable(), "{mode}: {:?}", report.hints);
     }
     Ok(())
+}
+
+fn installed_inkling_mc_tp2(mode: crate::plan::checkpoint::CoreView) -> anyhow::Result<()> {
+    use crate::{families::inkling2::{admission::SelectedWeights, draft::DraftLayout, weight_layout::HEAD},
+        formats::{dense_trellis::TrellisSide, trellis_core::CoreSplit}, placement::AttentionPlacement,
+        plan::checkpoint::{CheckpointView, CoreView}};
+    let home = std::path::PathBuf::from(std::env::var("CUTEAFD_DEPLOYMENT_TEST_HF_HOME")?);
+    let snapshot = crate::model_cache_dir(&home, "wrldsuksgo2mars/Inkling-2-Small-EXL3-K4-MC")
+        .join("snapshots/6caa0ba08eb564ddc88b98df06ac73e853cc559e");
+    let manifest = std::path::PathBuf::from(std::env::var("CUTEAFD_DEPLOYMENT_TEST_PROGRAMS")?);
+    let exports = serde_json::from_slice(&std::fs::read(&manifest)?)?;
+    let view = CheckpointView::select(&snapshot, mode)?;
+    let checkpoint = Checkpoint::open_view(&view)?;
+    let cfg = Inkling2Config::from_hf(&checkpoint.config)?;
+    let weights = SelectedWeights::new(&checkpoint, &cfg, 2, AttentionPlacement::Heads, true)?;
+    let draft = DraftLayout::new(&view, 2, 16, 8, 262144, 2_097_152, 2048, 3, 188,
+        Default::default(), Some(&exports))?;
+    let target_o = "model.llm.layers.0.attn.wo_ud";
+    let draft_o = "mtp.layers.0.self_attn.o_proj.weight";
+    let draft_down = "mtp.layers.0.mlp.down_proj.weight";
+    for (rank, (target, drafter)) in weights.targets.iter().zip(&draft.weights).enumerate() {
+        assert_eq!(target.stored_head(), (rank == 0).then_some(201088));
+        assert_eq!(drafter.arena.view("derived.fold_weight").is_some(), rank == 0);
+        assert!(drafter.arena.view(&format!("{HEAD}.weight")).is_none());
+        let programs = weights.compact_programs(&exports, rank, 2048)?;
+        assert!(programs.iter().any(|name| name.contains("padded_transpose_f32")) == (rank == 0));
+        let partial = draft.runtime[rank].buffers.iter().find(|(name, _)| name == "step.partial_f32");
+        if mode == CoreView::Fp8Compact {
+            assert_eq!((target.fp8[target_o].split, target.fp8[target_o].shape), (CoreSplit::Input, [4608, 3072]));
+            for (name, k) in [(draft_o, 3072), (draft_down, 9216)] {
+                assert_eq!((drafter.fp8[name].split, drafter.fp8[name].shape), (CoreSplit::Input, [4608, k]));
+            }
+            assert!(partial.is_none());
+        } else {
+            let bits = if mode == CoreView::K8Compact { 8 } else { 6 };
+            let check = |core: &crate::formats::trellis_core::CoreWeightLayout, k| {
+                assert_eq!((core.side, core.shape, core.bits, core.rank, core.ranks),
+                    (TrellisSide::Input, [4608, k], bits, rank, 2));
+            };
+            check(&target.core[target_o], 3072);
+            check(&drafter.core[draft_o], 3072);
+            check(&drafter.core[draft_down], 9216);
+            assert_eq!(partial.map(|(_, bytes)| *bytes), Some(8 * 8 * 4608 * 4));
+        }
+    }
+    let input = testing::BudgetedPlanInput::from_checkpoint(checkpoint);
+    let report = input.plan(&PlanOptions { placement: plan::ExpertPlacement::from_spark_ranks(6),
+        vision: plan::MediaMode::Off, audio: plan::MediaMode::Off,
+        layout: Some(plan::layout::LayoutOptions { rtx_bytes: vec![96 << 30; 2], workspace_manifest: Some(manifest),
+            inkling_dspark: true, ..Default::default() }), ..Default::default() })?;
+    assert!(report.fits && report.executable() && report.wip_launchable(), "{mode}: {:?}", report.hints);
+    Ok(())
+}
+
+#[test]
+fn installed_inkling_mc_tp2_k8_compact() -> anyhow::Result<()> {
+    installed_inkling_mc_tp2(crate::plan::checkpoint::CoreView::K8Compact)
+}
+
+#[test]
+fn installed_inkling_mc_tp2_k6_compact() -> anyhow::Result<()> {
+    installed_inkling_mc_tp2(crate::plan::checkpoint::CoreView::K6Compact)
+}
+
+#[test]
+fn installed_inkling_mc_tp2_fp8_compact() -> anyhow::Result<()> {
+    installed_inkling_mc_tp2(crate::plan::checkpoint::CoreView::Fp8Compact)
 }
 
 #[test]
