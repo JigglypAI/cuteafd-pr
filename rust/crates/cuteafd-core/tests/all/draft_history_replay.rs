@@ -80,18 +80,14 @@ fn replay(head: HeadScore, control: DraftControl) -> ([Tally; 2], u64) {
 
 /// Independent headless mirror keeps the old prior-eight counterfactual
 /// available without exposing a runtime policy knob or changing fixture data.
-fn code_first_reference(fade: bool) -> [Tally; 2] {
+fn code_first_reference(adaptive: bool) -> [Tally; 2] {
     use std::collections::{HashMap, VecDeque};
     let mut rounds = rounds();
     rounds.sort_by_key(|round| !round.code); // Stable: preserve every request's round order.
     let mut server: [VecDeque<bool>; BLOCK] = std::array::from_fn(|_| VecDeque::new());
     let mut requests: HashMap<u64, VecDeque<(usize, usize)>> = HashMap::new();
-    let mut completed: HashMap<u64, usize> = HashMap::new();
     let mut tallies = [Tally::default(); 2];
     for round in rounds {
-        let n = completed.entry(round.id).or_default();
-        let prior = if fade { 8. * (3usize.saturating_sub(*n) as f64 / 3.) } else { 8. };
-        *n += 1;
         let request = requests.entry(round.id).or_default();
         let mut length = 0;
         for position in 0..BLOCK {
@@ -99,6 +95,11 @@ fn code_first_reference(fade: bool) -> [Tally; 2] {
             let accepted = request.iter().filter(|(reached, accepted)| position < *reached && position < *accepted).count();
             let global = if server[position].is_empty() { 1. } else {
                 server[position].iter().filter(|&&hit| hit).count() as f64 / server[position].len() as f64 };
+            let prior = if adaptive && reached > 0 {
+                let t = reached as f64;
+                let z = (accepted as f64 - t * global) / (t * global * (1. - global)).sqrt().max(1e-6);
+                16. * (-0.5 * z * z).exp()
+            } else if adaptive { 16. } else { 8. };
             length += 1;
             let denominator = reached as f64 + prior;
             if denominator == 0. || (accepted as f64 + prior * global) / denominator <= 0.5 { break; }
@@ -144,9 +145,9 @@ fn code_first_requests_adapt_with_fewer_rows_without_losing_prose_tokens() {
     let old = code_first_reference(false);
     let rows = |tally: Tally| (tally.drafts + tally.rounds) as f64 / tally.rounds as f64;
     let tokens = |tally: Tally| tally.tokens as f64 / tally.rounds as f64;
-    eprintln!("code-first fade3 {tallies:?}; constant8 {old:?}");
-    assert!(rows(tallies[0]) <= 0.5 * rows(old[0]), "prose rows must halve after code conditioning");
-    assert!(tokens(tallies[1]) >= 0.9 * tokens(old[1]), "code tokens must retain ninety percent");
+    eprintln!("code-first adaptive16 {tallies:?}; constant8 {old:?}");
+    assert!(rows(tallies[0]) <= 0.75 * rows(old[0]), "prose rows must fall by at least one quarter");
+    assert!(tokens(tallies[1]) >= 0.95 * tokens(old[1]), "code tokens must retain ninety-five percent");
 }
 
 #[test]

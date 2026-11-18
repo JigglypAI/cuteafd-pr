@@ -43,9 +43,9 @@
 //! starts at [`COPY_COLD_RATE`], so a cold copy verifies one explored position
 //! and grows as copies are accepted.
 //!
-//! The server prior fades to zero after three completed request rounds.
-//! Thereafter only the request's rolling eight-round window decides; an
-//! unreached position is unknown and becomes the explored stop.
+//! Server evidence is trusted while the request agrees with it. A standardized
+//! disagreement reduces prior strength exponentially, leaving the request's
+//! rolling eight-round evidence in control when its content differs.
 use serde::Serialize;
 use std::collections::{HashMap, VecDeque};
 
@@ -53,16 +53,14 @@ use std::collections::{HashMap, VecDeque};
 pub const REQUEST_WINDOW: usize = 8;
 /// Rounds that reached a position, server wide.
 pub const SERVER_WINDOW: usize = 256;
-/// Initial server pseudo-rounds before request-local evidence takes over.
-/// V4.1 full-trace card-order replay (20 requests/content):
-/// fade | prose tokens/rows | code-after-prose tokens/rows | mixed tokens/rows
-/// none | 1.97/6.77         | 4.96/6.61                    | 2.84/6.93
-/// 8    | 1.71/1.99         | 4.68/5.58                    | 2.50/3.20
-/// 3    | 1.70/1.84         | 4.65/5.41                    | 2.47/2.96
-/// 1    | 1.70/1.73         | 4.64/5.36                    | 2.43/2.77
-pub const PRIOR_STRENGTH: f64 = 8.;
-/// Completed verify rounds until server influence is exactly zero.
-pub const FADE_ROUNDS: u64 = 3;
+/// Maximum server pseudo-rounds; request/server disagreement discounts it.
+/// V4.1 full-trace replay, tokens/rows per round:
+/// scenario     | constant8 | fade3     | adaptive16
+/// code->prose  | 1.94/6.81 | 1.69/1.85 | 1.79/3.13
+/// prose->prose | 1.71/2.10 | 1.65/1.63 | 1.71/2.08
+/// prose->code  | 5.13/6.64 | 4.93/5.82 | 5.12/6.65
+/// code->code   | 5.24/7.00 | 4.89/5.57 | 5.09/6.35
+pub const PRIOR_STRENGTH: f64 = 16.;
 /// A position is kept while its probability is above this.
 pub const KEEP_CUT: f64 = 0.5;
 /// A head-calibrated explore position below this is skipped for the round.
@@ -340,16 +338,11 @@ struct Pending {
 
 #[derive(Clone, Debug, Default)]
 struct Request {
-    completed_rounds: u64,
     rounds: VecDeque<Round>,
     pending: Option<Pending>,
 }
 
 impl Request {
-    fn prior_strength(&self) -> f64 {
-        PRIOR_STRENGTH * (FADE_ROUNDS.saturating_sub(self.completed_rounds) as f64 / FADE_ROUNDS as f64)
-    }
-
     /// (accepted, reached) rounds of `position` in the request's window.
     fn counts(&self, track: usize, position: usize) -> (u32, u32) {
         let (mut accepted, mut reached) = (0, 0);
@@ -359,6 +352,14 @@ impl Request {
         }
         (accepted, reached)
     }
+}
+
+fn adaptive_prior(accepted: u32, reached: u32, server: f64) -> f64 {
+    if reached == 0 { return PRIOR_STRENGTH; }
+    let t = f64::from(reached);
+    let denominator = (t * server * (1. - server)).sqrt().max(1e-6);
+    let z = (f64::from(accepted) - t * server) / denominator;
+    PRIOR_STRENGTH * (-0.5 * z * z).exp()
 }
 
 const NEURAL: usize = 0;
@@ -414,10 +415,10 @@ impl DraftHistory {
         let (accepted, reached) = request.counts(track, position);
         let window = &self.server[track][position];
         let server = window.rate(Self::cold(track));
-        let prior = request.prior_strength();
-        let denominator = f64::from(reached) + prior;
-        // Unknown after the fade: stop here and explore this position.
-        let p = if denominator == 0. { 0. } else { (f64::from(accepted) + prior * server) / denominator };
+        let prior = adaptive_prior(accepted, reached, server);
+        let p = if reached == 0 { server } else {
+            (f64::from(accepted) + prior * server) / (f64::from(reached) + prior)
+        };
         Planned { p,
             accepted, reached, server, server_reached: window.len as u32 }
     }
@@ -598,7 +599,6 @@ impl DraftHistory {
             self.stats.short_rounds += u64::from(proposed <= 1 && pending.room.min(self.spec.block) > 1);
             if let Some(bucket) = self.stats.length_histogram.get_mut(proposed) { *bucket += 1; }
             if request.rounds.len() == REQUEST_WINDOW { request.rounds.pop_front(); }
-            request.completed_rounds = request.completed_rounds.saturating_add(1);
             request.rounds.push_back(Round { reached: reached.map(|n| n as u8), accepted: kept.map(|n| n as u8) });
             if trace {
                 let mut positions = Vec::with_capacity(proposed);
@@ -648,7 +648,7 @@ impl DraftHistory {
         serde_json::json!({
             "policy": self.control.label(), "block": self.spec.block, "head": self.spec.head,
             "copy_positions": self.spec.copy, "request_window": REQUEST_WINDOW, "server_window": SERVER_WINDOW,
-            "prior_strength": PRIOR_STRENGTH, "fade_rounds": FADE_ROUNDS, "active_requests": self.requests.len(),
+            "prior_strength": PRIOR_STRENGTH, "active_requests": self.requests.len(),
             "rounds": self.stats.rounds, "verified_drafts": self.stats.verified_drafts,
             "accepted_drafts": self.stats.accepted_drafts, "short_rounds": self.stats.short_rounds,
             "short_share": self.stats.short_share(),
@@ -719,8 +719,9 @@ mod tests {
             policy.plan(&[(1, 1)], 64);
             policy.observe(&[outcome(1, 1, accepted)], false);
         }
-        assert_eq!(policy.requests[&1].prior_strength(), 0.);
-        assert!((policy.probability(1, 0) - 2. / 3.).abs() < 1e-12);
+        let server = 5. / 7.;
+        let prior = adaptive_prior(2, 3, server);
+        assert!((policy.probability(1, 0) - (2. + prior * server) / (3. + prior)).abs() < 1e-12);
     }
 
     #[test]
@@ -744,17 +745,11 @@ mod tests {
     }
 
     #[test]
-    fn server_prior_fades_exactly_to_zero_and_unknown_positions_explore() {
-        let mut policy = policy(7);
-        assert_eq!(Request::default().prior_strength(), 8.);
-        for round in 0..12 {
-            policy.plan(&[(1, 1)], 64);
-            policy.observe(&[outcome(1, 1, 1)], false);
-            let request = &policy.requests[&1];
-            if round + 1 >= FADE_ROUNDS as usize { assert_eq!(request.prior_strength(), 0.); }
-        }
-        assert_eq!(policy.probability(1, 1), 0., "unreached suffix must not inherit the server after fade");
-        assert_eq!(policy.plan(&[(1, 7)], 64), [2], "one known position plus unknown explore");
+    fn agreeing_request_retains_server_trust_but_disagreement_discounts_it() {
+        assert!(adaptive_prior(6, 8, 0.75) >= 0.6 * PRIOR_STRENGTH);
+        assert!(adaptive_prior(5, 8, 0.75) >= 0.6 * PRIOR_STRENGTH);
+        assert!(adaptive_prior(2, 8, 0.9) < 0.1 * PRIOR_STRENGTH);
+        assert_eq!(adaptive_prior(0, 0, 0.75), PRIOR_STRENGTH);
     }
 
     #[test]
