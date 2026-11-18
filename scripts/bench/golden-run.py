@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """Run a family golden subcommand, a native test or a command from sealed WIP slots
-on raptor's RTX GPUs, optionally against real expert workers on Sparks.
+on raptor's RTX GPUs, optionally against real expert workers on Sparks, or a native
+test or command on one Spark's GB10 GPU (SM121, --sm121-host).
 
   scripts/bench/golden-run.py --task NAME --family dsv4|glm|glmf|mimo|qwen4|qwen35|step5|kimi|muse|minimax \\
       --model HF_ID_OR_SNAPSHOT_DIR --arm A=WIP_INSTANCE:SLOT [--arm B=...] \\
       [--arm-env A:KEY=VALUE] [--arm-arg A:TOKEN] [--env KEY=VALUE] [--gpus 0,1] [--repeats N] \\
       [--timeout SECONDS] [--preflight CMD] [--compare-logits A:B] \\
       [--native-test TEST_EXECUTABLE | --command] [--fixtures DIR [--fixtures-writable]] [--mount PATH] [--rdma] \\
+      [--sm121-host HOST [--memory-bytes N]] \\
       [--spark-hosts H1,H2,... [--expert-layers 3,5-7] [--worker-env KEY=VALUE] [--arm-worker-env A:KEY=VALUE] [--worker-arg ARG]] \\
       -- ARGS...
 
@@ -29,6 +31,30 @@ same-host verbs loopback test); --spark-hosts implies it.
 Both raw modes run in the slot's sealed source tree, mounted read-only at
 /workspace/cuteafd (the working directory, PYTHONPATH with the reference packages,
 PYTHONDONTWRITEBYTECODE=1), with CUTEAFD_NATIVE_LIB and CUTEAFD_PROGRAM_MANIFEST set.
+
+SM121 (--sm121-host HOST, with --native-test or --command): the same raw modes on one
+Spark's GB10 GPU instead of raptor, from each arm's sealed Spark leg (the spark-expert
+slot `./wip.sh --role both|expert` seals) in HOST's own WIP root, where wip.sh seals a
+seed's leg and copies it to the serving Sparks. HOST is a build seed, kakapo or cassowary
+(approved for single-Spark kernel work; off the fabric), or a pool Spark when its lock is
+free. Locks: a seed's build umbrella and GPU-export turn (SEED, SEED-export: no build
+lease, seed encode or export shares the GPU), a pool Spark's serving lock (sparks for
+ostrich/dodo/emu/kiwi, rhea, moa). The container runs the slot's sealed dev image and
+aarch64 artifacts with the same source tree, mounts, environment and working directory
+as raptor, plus `--device nvidia.com/gpu=all`, the serving identity and a memory cap
+(--memory-bytes, else CUTEAFD_DEV_MEMORY, else 16g, swap equally), bounded by an
+in-container timeout. --native-test names an aarch64 test executable on HOST under
+~/.cache/cuteafd/builds; a relative path resolves in the instance's Spark build tree
+(WIP_ROOT/build/expert/, e.g. native/cuteafd_native_selftest from the native CMake tree).
+--mount and argument paths are HOST paths. Before enqueue and at grant, HOST must be a
+single GB10 (compute 12.1), the slot sealed and unchanged (REMOTE_CHECK, as for real
+experts), its dev image's toolchain label equal to the slot's dev-toolchain.py (a stale
+image is refused) and the executable an aarch64 ELF; a slot sealed on another host is
+refused with the host named. {out} is a fresh scratch under ~/.cache/cuteafd/builds/TASK/
+golden-sm121 on HOST, copied back into ARM/rN/ and removed with the container (ours only,
+by label) on every exit, timeouts and signals included, before the locks go. Receipts and
+summary.md take the raptor layout; argv.json adds host, host_gpu, compute_cap, memory and
+toolchain. Not with --gpus, --spark-hosts, --rdma, --fixtures or family goldens.
 
 Placeholders in ARGS and in --env/--arm-env values: {snapshot} (the checkpoint's
 container path), {hub} (the resolved host hub path), {out} (the run's writable output directory, e.g.
@@ -651,7 +677,9 @@ for c in json.loads(cands):
 builds=home/'.cache/cuteafd/builds'
 a=subprocess.run([sys.executable,str(ws/'scripts/build/assert-build-filesystem.py'),str(builds)],capture_output=True,text=True)
 if a.returncode: fail((a.stderr.strip().splitlines() or ['unsafe build filesystem'])[0])
-rec.update(gpu=gpus[0][0],compute_cap=gpus[0][1],toolchain=want,seccomp=str(seccomp),native_test=native,stats=stats,
+try: ident=json.loads((ws/'BUILD_IDENTITY.json').read_text())
+except (OSError,ValueError): ident={}
+rec.update(gpu=gpus[0][0],compute_cap=gpus[0][1],toolchain=want,source_commit=ident.get('commit'),source_dirty=ident.get('dirty'),seccomp=str(seccomp),native_test=native,stats=stats,
            scratch=str(builds/task/'golden-sm121'),wip_root=str(wiproot))
 print(json.dumps(rec))
 '''
@@ -821,6 +849,7 @@ def run_arm_sm121(state, name, repeat, arms):
                toolchain=record['toolchain'], image_tags=[], seal_sha256=record['seal_sha256'],
                artifact_manifest_sha256=record['artifact_manifest_sha256'], slot=f"{arm['instance']}:{arm['slot']}",
                slot_root=f"{host}:{record['root']}", source_commit=record.get('source_commit'),
+               source_dirty=record.get('source_dirty'),
                source_manifest_sha256=record['source_manifest_sha256'], env=env, arm_env=arm['env'],
                arm_args=arm['args'], gpus=[], memory=state['sm121']['memory'], locks=state['locks'],
                snapshot=state['snapshot'], timeout_s=state['timeout'], power_before=None, power_samples={})
@@ -1843,7 +1872,8 @@ def main(argv=None):
                         'lease and export turn), or a pool Spark (its serving lock)')
     raw = parser.add_mutually_exclusive_group()
     raw.add_argument('--native-test', metavar='EXE', help='run this test executable (built in the coordinator dev '
-                     'image from the slot commit) with ARGS instead of a golden subcommand')
+                     'image from the slot commit; with --sm121-host an aarch64 one on that host, relative to its '
+                     'Spark build tree) with ARGS instead of a golden subcommand')
     raw.add_argument('--command', action='store_true', help='run ARGS verbatim in the slot source tree')
     parser.add_argument('--fixtures', metavar='DIR', help='fixture directory, mounted at its own path; {fixtures}')
     parser.add_argument('--fixtures-writable', action='store_true',
