@@ -213,7 +213,8 @@ fn installed_inkling_recurrent_head_baseline() -> Result<()> {
             }
             ProjectionWeight::Bf16(_) => unreachable!(),
         }
-        for rows in [7, 14, 28, 56, 64, 112, 224, 448] {
+        let mut prefix = None;
+        for rows in [7, 14, 21, 28, 35, 42, 49, 56, 64, 112, 224, 448] {
             let project = || -> Result<()> {
                 match head()? {
                     ProjectionWeight::Trellis(w) => {
@@ -234,6 +235,17 @@ fn installed_inkling_recurrent_head_baseline() -> Result<()> {
                 Ok(())
             };
             project()?;
+            if rows<=56 {
+                stream.drain()?;
+                let mut values=vec![0;rows*stored*4];
+                let bytes=values.len();
+                library.copy_d2h(&mut values,Buffer{bytes,..output.buffer})?;
+                if let Some(previous)=&prefix {
+                    let previous: &Vec<u8> = previous;
+                    ensure!(values.starts_with(previous), "{mode} head prefix changes at M={rows}");
+                }
+                prefix=Some(values);
+            }
             let mut start = Event::timing(device)?;
             let mut end = Event::timing(device)?;
             start.record(&stream)?;
@@ -243,7 +255,7 @@ fn installed_inkling_recurrent_head_baseline() -> Result<()> {
             // SAFETY: both events were recorded and drained on the same stream.
             let us = f64::from(unsafe { library.cuda_event_elapsed_ms(start.raw, end.raw)? }) * 1000.0 / 64.0;
             eprintln!("RECURRENT_HEAD_WIDTH {}", serde_json::json!({"view": mode.name(), "rows": rows,
-                "base_us": us, "roof_us": head_bytes as f64 / 1_792_000.0}));
+                "base_us": us, "roof_us": head_bytes as f64 / 1_792_000.0, "prefix_exact": (rows<=56).then_some(true)}));
         }
     }
     for rows in [1, 4, 8, 16, 64] {
