@@ -37,6 +37,11 @@ pub(crate) fn admit(checkpoint: &Checkpoint, cfg: &Inkling2Config, target: &Coor
         ("head.compact_logits", head_rows.min(64)*target.stored_head().unwrap_or(0)*4)] {
         if bytes > 0 { buffers.push((name.into(), Location::coordinator(0), bytes as u64, Lifetime::TARGET, Category::Workspace)); }
     }
+    if !target.core.is_empty() {
+        buffers.push(("target.load_trellis".into(), Location::coordinator(0),
+            cuteafd_loader::shared::dense_read::STEP_BYTES as u64,
+            Lifetime { first: Phase::Load, last: Phase::Load }, Category::Staging));
+    }
     let mut mount = target.mount_load(checkpoint)?;
     mount.merge(expert_mount);
     for (name, bytes, location) in [("source", mount.pinned_source, Location::PINNED),
@@ -95,7 +100,8 @@ pub(crate) fn admit(checkpoint: &Checkpoint, cfg: &Inkling2Config, target: &Coor
 pub(crate) fn reconcile_native(plan: &ResolvedPlan, devices: CoordinatorDevices<'_>,
     receipts: &[Receipt]) -> Result<()> {
     let mut projected = devices.remap_plan_weight_arenas(plan)?;
-    projected.facts.allocations.retain(|a| a.view.is_none() && a.location == Location::coordinator(0));
+    projected.facts.allocations.retain(|a| a.view.is_none() && a.location == Location::coordinator(0)
+        && a.lifetime.last >= Phase::PostTargetKv);
     // Page-table overhead maps pinned owners; the projected device-only
     // witness excludes those host backings, so it must exclude their mappings
     // too. The complete admission above still charges them exactly once.

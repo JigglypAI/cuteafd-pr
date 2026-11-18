@@ -427,6 +427,14 @@ impl InklingInputs {
         let mut out = Vec::new();
         let target = self.targets.get(gpu).ok_or_else(|| invalid("missing target arena"))?;
         out.extend(target.weight_components(maximum)?);
+        let draft_trellis = self.drafter.as_ref().and_then(|draft| draft.layout.weights.get(gpu))
+            .is_some_and(|draft| !draft.core.is_empty());
+        if !target.core.is_empty() || draft_trellis {
+            // The grouped receive reuses one GPU transform buffer for both arenas.
+            out.extend(buffer(format!("inkling2.target.{gpu}.load_trellis"), location,
+                crate::shared::dense_read::STEP_BYTES as u64, Lifetime { first: Phase::Load, last: Phase::Load },
+                Category::Staging, "serialized dense trellis tile repacking", maximum));
+        }
         if let Some(scratch) = target.trellis_scratch(rows as usize, DECODE_ROWS as usize).map_err(refusal)? {
             out.extend(buffer(format!("inkling2.target.{gpu}.trellis"), location, scratch.packed_bytes().map_err(refusal)? as u64,
                 Lifetime::TARGET, Category::Workspace, "serialized target trellis projection", maximum));

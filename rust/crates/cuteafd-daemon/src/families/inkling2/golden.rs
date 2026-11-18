@@ -274,7 +274,8 @@ fn run(mut args: GoldenArgs) -> Result<()> {
             .filter(|r| r.allocation.view.is_none() && r.allocation.location == cuteafd_loader::placement::planner::Location::coordinator(0))
             .map(|r| r.allocation.bytes).sum::<u64>();
         let admitted = plan.facts.allocations.iter().filter(|a| a.view.is_none()
-            && a.location == cuteafd_loader::placement::planner::Location::coordinator(0)).map(|a| a.bytes).sum::<u64>();
+            && a.location == cuteafd_loader::placement::planner::Location::coordinator(0)
+            && a.lifetime.last >= cuteafd_loader::placement::planner::Phase::PostTargetKv).map(|a| a.bytes).sum::<u64>();
         let receipts = inventory.receipts.iter().chain(&working.receipts).cloned().collect::<Vec<_>>();
         admission::reconcile_native(plan, devices, &receipts)?;
         ensure!(measured == admitted, "Inkling measured device owners differ from cold admission: {measured}/{admitted}");
