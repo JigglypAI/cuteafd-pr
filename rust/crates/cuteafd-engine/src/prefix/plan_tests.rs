@@ -145,6 +145,7 @@ fn a_lagged_partial_restore_shares_pages_through_source_end_and_replays_from_rep
         .unwrap();
     let source = admitted.source.clone().unwrap();
     assert!(source.partial);
+    assert_eq!(cache.stats().approximate_replay_hits, 1);
     assert_eq!(source.plan.lag, LaggedState { source_end: 32, replay_start: 24 });
     assert_eq!(source.plan.fidelity, RestoreFidelity::ApproximateReplay);
     assert_eq!(admitted.resume, 24);

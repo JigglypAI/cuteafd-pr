@@ -142,6 +142,8 @@ pub struct PrefixStats {
     pub exact_hits: u64,
     /// Hits on a partial match (replay window, approximate positional state).
     pub partial_hits: u64,
+    /// Restores explicitly labelled ApproximateReplay by the family plan.
+    pub approximate_replay_hits: u64,
     pub hit_tokens: u64,
     /// Host-tier restores: a lookup that re-inserted the entry from the host cache
     /// (`host_mark: Some(..)`). Not [`Self::mark_promotions`], which counts host mark
@@ -705,6 +707,7 @@ impl<E: CopyEngine, M: Clone + Default> PrefixCache<E, M> {
         self.stats.hit_tokens += resume as u64;
         self.stats.exact_hits += u64::from(after.is_some());
         self.stats.partial_hits += u64::from(!exact);
+        self.stats.approximate_replay_hits += u64::from(!exact);
         self.restored_session = session.clone();
         Ok(Some(Admitted {
             placement,

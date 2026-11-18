@@ -105,7 +105,11 @@ Porting a family or changing shared serve, prefill, exchange or admission code: 
   both single-shot and multi-turn agentic traffic hit. Logit or greedy-text
   differences from floating-point reordering elsewhere (chunk-size changes,
   kernel route switches) are acceptable; a cache that changes the model's
-  actual state is not.
+  actual state is not. Exception: DeepSeek V4.1 partial-divergence reuse follows
+  its official Encoder SWA Bounded Replay (paper section 3.2.2): global KV is
+  reused and encoder SWA is rebuilt approximately from the last 128 tokens,
+  extending replay before overlapping images. Label this approximate in metrics
+  and traces. Exact ancestor hits still restore every captured byte exactly.
 - Device-driven exchange: routes, requests and replies move GPU-to-GPU and
   GPU-to-NIC with no host hop and no idle CPU burn on a request's hot path.
   The host launches work and waits on it; it does not shuttle bytes between

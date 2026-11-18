@@ -202,8 +202,6 @@ fn retire_request<'a, C: DraftChain<'a>>(mut request: Active<'a>, requests: &mut
 pub(super) fn prepare_prefix_cache<'a>(lib: &'a NativeLibrary, args: &crate::cli::NativeServeArgs,
     requests: &Requests<'a>, arenas: super::prefix::Arenas<'a>, draft: bool, admitted: &super::admission::Admitted) -> Result<PrefixCache<'a>> {
     let prefix = &args.prefix;
-    ensure!(prefix.prefix_partial == crate::shared::prefix::Toggle::Off,
-        "V4.1 restores exact prefix frontiers only (--prefix-partial off)");
     let units = requests.cache().unit_capacity();
     let layout = super::prefix::layout(units, draft);
     let entries = prefix.prefix_cache_entries;
@@ -1064,7 +1062,7 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
                 let hit = (restored.cached > 0).then_some((restored.cached, restored.scores));
                 let restore = (restore_started, Instant::now());
                 let resume = if images.is_empty() { prompt.len() } else {
-                    let source_end = requests.cache().committed_end(lease)? as usize;
+                    let source_end = requests.cache().history_end(lease)? as usize;
                     // Encode only when a span from the restored frontier on lacks features.
                     if requests.images(lease)?.needed(source_end, prompt.len())?.is_empty() { prompt.len() } else { source_end }
                 };
@@ -2029,10 +2027,11 @@ fn prepare_decode_lane<'a>(requests: &mut Requests<'a>, active: &[Option<Active<
 fn start_admission_lookahead(requests: &mut Requests<'_>, lease: CacheLease, prompt: &[u32],
     args: &crate::cli::NativeServeArgs) {
     let shape = super::PrefillShape::from_args(args);
+    let replay_end = requests.cache().committed_end(lease).map_or(0, |end| end as usize);
     let result = requests.start_lookahead(lease, prompt, |start| {
-        if prompt.len() - start <= shape.rows {
+        if start >= replay_end && prompt.len() - start <= shape.rows {
             Ok(cuteafd_loader::TableUnitPlan::new(vec![prompt.len() as u64], 1))
-        } else { super::prefill_target::prompt_units(start, prompt.len(), shape.rows, shape.waves) }
+        } else { super::prefill_target::prompt_units(start, replay_end, prompt.len(), shape.rows, shape.waves) }
     });
     if let Err(error) = result { tracing::warn!(%error, "Engram look-ahead not started; rows load on demand"); }
 }

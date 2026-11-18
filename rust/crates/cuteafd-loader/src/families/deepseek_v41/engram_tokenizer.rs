@@ -60,6 +60,17 @@ impl EngramTokenMap {
         Ok(history.prepare(start, &compressed?, max_rows)?)
     }
 
+    /// Rebuild bounded native-token history at the replay start, preserving image barriers.
+    pub(crate) fn history_at(&self, position: u64, recent: &[u32], image_mask: Option<&[u8]>) -> Result<cuteafd_core::EngramHistory> {
+        ensure!(recent.len() == position.min(3) as usize
+            && image_mask.is_none_or(|mask| mask.len() == recent.len()),
+            "engram resume token or image lookback differs");
+        let compressed = recent.iter().enumerate().map(|(i, &token)|
+            self.compress(token, image_mask.is_some_and(|mask| mask[i] != 0)))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(cuteafd_core::EngramHistory::from_recent(self.pad_id(), position, &compressed)?)
+    }
+
     pub fn pad_id(&self) -> u32 {
         self.pad_id
     }
@@ -120,6 +131,30 @@ fn compressed_ids(tokenizer: &Tokenizer) -> Result<Vec<u32>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn replay_lookback_rebuilds_full_engram_hashes_at_image_boundaries() -> Result<()> {
+        let map = EngramTokenMap { ids: (0..100).map(|id| id / 2).collect(), pad_id: 1 };
+        let tokens: Vec<_> = (0..600).map(|i| (i % 100) as u32).collect();
+        for image_start in [101, 102] {
+            let mask: Vec<_> = (0..600).map(|i| (image_start..image_start + 184).contains(&i)).collect();
+            let mut full = cuteafd_core::EngramHistory::new(map.pad_id())?;
+            for start in 0..tokens.len() {
+                let recent = start.saturating_sub(3);
+                let resumed = map.history_at(start as u64, &tokens[recent..start],
+                    Some(&mask[recent..start].iter().copied().map(u8::from).collect::<Vec<_>>()))?;
+                let end = (start + 128).min(tokens.len());
+                let expected = map.prepare_batch(&full, start as u64, &tokens[start..end], Some(&mask[start..end]), 128)?;
+                let actual = map.prepare_batch(&resumed, start as u64, &tokens[start..end], Some(&mask[start..end]), 128)?;
+                assert_eq!(actual.hashes(), expected.hashes(), "image {image_start}, replay {start}");
+                assert_eq!(resumed.lookback(), full.lookback());
+                full.commit(&expected, 1)?;
+            }
+        }
+        assert!(map.history_at(100, &[1, 2], None).is_err());
+        assert!(map.history_at(100, &[1, 2, 3], Some(&[0])).is_err());
+        Ok(())
+    }
+
     #[test]
     fn compression_preserves_spaces_and_normalizes_accents() -> Result<()> {
         let vocab: tokenizers::models::wordlevel::WordLevel = serde_json::from_str(&serde_json::json!({

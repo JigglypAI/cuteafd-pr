@@ -81,6 +81,50 @@ impl<'a> BackboneCache<'a> {
         Ok((meta, bytes))
     }
 
+    /// Start a fresh request at the complete-group frontier `end` of source pages the prefix
+    /// engine forked and bound, with empty encoder windows at the bounded replay start
+    /// `start` (the media-safe frontier chosen by the family plan). Decoder windows remain fresh. Replay reads the shared source rows without
+    /// producing them. Returns the replay start.
+    pub fn restore_encoder_prefix(&mut self, lease: CacheLease, end: u64, start: u64, prompt_end: u64) -> Result<u64> {
+        let request = self.request(lease)?;
+        ensure!(
+            end > 0
+                && start < end
+                && end % 2 == 0
+                && end <= prompt_end
+                && prompt_end <= 1048576
+                && request.end == 0
+                && request.version == 0
+                && request.phase == CachePhase::Full
+                && request.publication.is_empty(),
+            "invalid encoder prefix restore frontier"
+        );
+        let windows = request.windows;
+        let sources = request.sources;
+        let result = (|| -> Result<()> {
+            for layer in 0..20 {
+                self.windows[layer].begin_encoder_replay(windows[layer], start)?;
+            }
+            for (state, lease) in self.sources.iter_mut().zip(sources) {
+                state.restore_compressed_prefix(lease, end)?;
+            }
+            Ok(())
+        })();
+        result?; // The shared prefix engine drains and rolls back failed admissions.
+        let request = self.requests[lease.slot]
+            .as_mut()
+            .expect("validated fresh admission");
+        request.end = end;
+        request.phase = CachePhase::EncoderReplay {
+            prefix: end,
+            target: prompt_end,
+            end: start,
+        };
+        request.version = 1;
+        self.committed_end(lease)?;
+        Ok(start)
+    }
+
     /// Copy a fully committed request's windows and carry into `mark` (synchronously). Only a
     /// complete frontier is captured, after all producer/consumer streams drained.
     pub fn capture_mark(&mut self, lease: CacheLease, mark: CuteafdDeviceBuffer) -> Result<BackboneMark> {

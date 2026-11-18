@@ -14,9 +14,12 @@
 //! precedent). [`V41Meta`] describes it as plain data: window spans, the frontier, the Engram
 //! lookback and the drafter's frontier.
 //!
-//! **Restores are exact** (`ReuseRule::EXACT`, AGENTS "Exact prefix-cache restores"): only a
-//! retained frontier that is a prefix of the prompt is selected, and its mark restores
-//! byte-exactly. An exact ancestor followed by a suffix of at least 128 tokens resumes as an
+//! **Exact ancestors, bounded partial replay** (`ReuseRule::V41`). A retained frontier that
+//! is a prefix of the prompt restores its mark byte-exactly. Partial divergence follows
+//! DeepSeek's official Encoder SWA Bounded Replay: reuse global KV, restart encoder windows
+//! empty 128 tokens before the aligned common frontier, rounding before any overlapping image.
+//! The plan passes that single replay start through to the encoder and Engram restore; image
+//! features from there are re-encoded consistently. This partial state is explicitly approximate. An exact ancestor followed by a suffix of at least 128 tokens resumes as an
 //! encoder continuation (encoder rings and carry restored, decoder rings rebuilt by the suffix's
 //! final replay, which covers the whole decoder window): still the state a cold prefill reaches.
 //!
@@ -37,7 +40,7 @@ use crate::shared::memory::device::{Allocation, Device};
 use crate::shared::prefix::{cuda_copy::range, CudaCopyEngine};
 use cuteafd_engine::prefix::{
     After, BoxError, CaptureTicket, Captured, Eviction, FamilyLayout, Mark, MarkSlot, MarkStore,
-    PrefixCache, PrefixConfig, PrefixFamily, RestoreContext, RestorePlan, ReuseRule, TailCopy,
+    PrefixCache, PrefixConfig, PrefixFamily, RestoreCandidate, RestoreContext, RestoreFidelity, RestorePlan, ReuseRule, TailCopy,
 };
 use cuteafd_hostcache::copy::DeviceRange;
 use serde::{Deserialize, Serialize};
@@ -149,7 +152,7 @@ pub(crate) fn mark_bytes(draft: bool) -> usize {
     BackboneMark::BYTES + if draft { super::speculative::DRAFT_MARK_BYTES } else { 0 }
 }
 
-/// V4.1's geometry for the prefix engine over `units` 512-token units: exact frontiers only.
+/// V4.1 geometry: exact ancestor marks and vendor-specified bounded partial replay.
 pub(crate) fn layout(units: usize, draft: bool) -> FamilyLayout {
     FamilyLayout {
         page_rows: UNIT_TOKENS,
@@ -157,10 +160,28 @@ pub(crate) fn layout(units: usize, draft: bool) -> FamilyLayout {
         page_bytes: UNIT_BYTES,
         mark_bytes: mark_bytes(draft),
         draft_bytes: 0,
-        rule: ReuseRule::EXACT,
+        rule: ReuseRule::V41,
         mark_store: MarkStore::Arena,
         page_owners: cuteafd_engine::prefix::PageOwners::Uniform,
     }
+}
+
+/// Preserve exact ancestor marks; partial hits reuse global KV and rebuild encoder SWA.
+/// Both frontiers must be outside images. Align again after media rounding because an
+/// image may start on an odd token, but ratio-two sources require complete groups.
+pub(crate) fn plan(hit: RestoreCandidate<'_>) -> RestorePlan {
+    if hit.common == hit.snapshot_end { return RestorePlan::under(ReuseRule::V41, hit); }
+    let mut source_end = hit.common;
+    loop {
+        let safe = hit.media_safe(source_end / 2 * 2);
+        if safe == source_end { break; }
+        source_end = safe;
+    }
+    let replay_start = hit.media_safe(source_end.saturating_sub(128));
+    RestorePlan { snapshot_end: hit.snapshot_end, target_end: hit.target_end,
+        lag: cuteafd_engine::prefix::LaggedState {
+            source_end: if replay_start == 0 { 0 } else { source_end }, replay_start },
+        fidelity: RestoreFidelity::ApproximateReplay }
 }
 
 impl<'r, 'a, 'w, C: DraftChain<'a>> V41Prefix<'r, 'a, 'w, C> {
@@ -192,6 +213,7 @@ impl<'a, C: DraftChain<'a>> PrefixFamily<V41Meta> for V41Prefix<'_, 'a, '_, C> {
     fn eviction(&self) -> Eviction {
         Eviction::FreesPages
     }
+    fn plan_restore(&self, hit: RestoreCandidate<'_>) -> RestorePlan { plan(hit) }
     fn capture_meta(&self, placement: &V41Placement, len: usize) -> Result<V41Meta, BoxError> {
         let requests = self.requests.borrow();
         let backbone = requests.cache().mark_meta(placement.lease).map_err(boxed)?;
@@ -228,30 +250,34 @@ impl<'a, C: DraftChain<'a>> PrefixFamily<V41Meta> for V41Prefix<'_, 'a, '_, C> {
     }
     fn restore_with(&self, mark: Option<&Mark>, saved: Option<&V41Meta>, placement: &mut V41Placement,
         plan: &RestorePlan, context: &RestoreContext<'_>) -> Result<(), BoxError> {
-        if !plan.exact() {
-            return Err("V4.1 restores exact snapshot frontiers only".into());
-        }
-        let (Some(Mark::Slot(slot)), Some(saved)) = (mark, saved) else {
-            return Err("an exact V4.1 restore needs its arena mark and metadata".into());
-        };
-        let _ = context;
-        // The forked rows through the snapshot's frontier are initialized in the bound pages.
         self.bind_units(placement, plan.lag.source_end).map_err(boxed)?;
         let mut requests = self.requests.borrow_mut();
-        // Tail copies of forked units were enqueued on the prefix stream; restores below read
-        // the pages only through later kernels on the same stream or after its drain.
-        let continuation = (plan.target_end - plan.snapshot_end >= 128).then_some(plan.target_end as u64);
-        let target = self.arena.target(*slot).map_err(boxed)?;
-        requests.restore_mark(placement.lease, &saved.request, target, continuation).map_err(boxed)?;
-        if continuation.is_none() {
-            let mut draft = self.draft.borrow_mut();
-            match (placement.draft, draft.as_deref_mut(), saved.draft_end, self.arena.draft(*slot).map_err(boxed)?) {
-                (Some(id), Some(draft), Some(end), Some(ring)) => draft.restore_mark(id, end, ring).map_err(boxed)?,
-                (None, None, None, _) | (None, None, _, None) => {}
-                _ => return Err("retained execution mode differs".into()),
+        if plan.exact() {
+            let (Some(Mark::Slot(slot)), Some(saved)) = (mark, saved) else {
+                return Err("an exact V4.1 restore needs its arena mark and metadata".into());
+            };
+            // The forked rows through the snapshot's frontier are initialized in the bound pages.
+            // Tail copies of forked units were enqueued on the prefix stream; restores below read
+            // the pages only through later kernels on the same stream or after its drain.
+            let continuation = (plan.target_end - plan.snapshot_end >= 128).then_some(plan.target_end as u64);
+            let target = self.arena.target(*slot).map_err(boxed)?;
+            requests.restore_mark(placement.lease, &saved.request, target, continuation).map_err(boxed)?;
+            if continuation.is_none() {
+                let mut draft = self.draft.borrow_mut();
+                match (placement.draft, draft.as_deref_mut(), saved.draft_end, self.arena.draft(*slot).map_err(boxed)?) {
+                    (Some(id), Some(draft), Some(end), Some(ring)) => draft.restore_mark(id, end, ring).map_err(boxed)?,
+                    (None, None, None, _) | (None, None, _, None) => {}
+                    _ => return Err("retained execution mode differs".into()),
+                }
             }
+            placement.len = plan.snapshot_end;
+        } else {
+            requests.restore_encoder_prefix(placement.lease, plan.lag.source_end,
+                plan.lag.replay_start, context.native_tokens).map_err(boxed)?;
+            placement.len = plan.lag.replay_start;
         }
-        placement.len = plan.snapshot_end;
+        tracing::info!(fidelity = ?plan.fidelity, source_end = plan.lag.source_end,
+            replay_start = plan.lag.replay_start, "V4.1 prefix restored");
         placement.plan = Some(*plan);
         Ok(())
     }
@@ -377,7 +403,7 @@ pub(crate) struct Restored {
 impl<'a> V41Cache<'a> {
     pub fn new(arenas: Arenas<'a>, config: PrefixConfig,
         host: Option<(cuteafd_hostcache::config::Config, CudaCopyEngine<'a>)>, layout: FamilyLayout) -> Result<Self> {
-        ensure!(layout.rule == ReuseRule::EXACT, "V4.1 restores exact snapshot frontiers only");
+        ensure!(layout.rule == ReuseRule::V41, "V4.1 requires its bounded replay reuse rule");
         let cache = PrefixCache::new(layout, config, host).map_err(|e| anyhow::anyhow!("{e}"))?;
         Ok(Self { cache, arenas, pending: [None, None], capture_session: None })
     }
@@ -589,7 +615,7 @@ mod tests {
         let (common, snapshot_end, _) = banks.lookup_reusable(prompt)?;
         let hit = RestoreCandidate { common, snapshot_end, target_end: prompt.len(),
             resume: rule.skipped(common, snapshot_end), media: &[], saved_media: &[] };
-        Some(RestorePlan::under(rule, hit))
+        Some(plan(hit))
     }
 
     #[test]
@@ -605,70 +631,79 @@ mod tests {
     }
 
     #[test]
-    fn layout_reuses_exact_frontiers_only() {
+    fn layout_uses_official_bounded_replay() {
         for draft in [false, true] {
             let layout = layout(4, draft);
-            assert_eq!(layout.rule, ReuseRule::EXACT);
-            assert!(!layout.rule.partial());
+            assert_eq!(layout.rule, ReuseRule::V41);
+            assert!(layout.rule.partial());
             assert_eq!(layout.mark_bytes, mark_bytes(draft));
         }
-        // A partial match saves nothing; only an exact ancestor is reusable.
-        for (common, frontier) in [(1001, 1500), (1000, 1002), (128, 4096), (1, 2)] {
-            assert_eq!(ReuseRule::EXACT.skipped(common, frontier), 0, "{common}/{frontier}");
-        }
-        assert_eq!(ReuseRule::EXACT.skipped(777, 777), 777);
     }
 
     #[test]
-    fn an_exact_restore_never_selects_approximate_replay() {
+    fn text_partial_divergence_replays_but_ancestors_remain_exact() {
         let tokens: Vec<u32> = (0..2048).collect();
         let mut branch = tokens[..1500].to_vec();
         branch[1001] = 99_999;
-        branch.extend(3000..3100);
-        // Prompt end, turn end and a long continuation all restore the exact frontier.
-        for (frontiers, prompt, end) in [
-            (vec![&tokens[..1001]], &tokens[..1001], 1001),
-            (vec![&tokens[..1001]], &tokens[..1038], 1001),
-            (vec![&tokens[..777]], &tokens[..2000], 777),
-            (vec![&tokens[..512], &tokens[..1500]], &branch[..], 512),
-        ] {
-            let plan = selected(&frontiers, prompt).expect("an exact ancestor is selected");
-            assert_eq!(plan.fidelity, RestoreFidelity::Exact);
-            assert_eq!((plan.snapshot_end, plan.resume(), plan.lag.source_end), (end, end, end));
-            assert!(plan.check(end).is_ok());
-        }
-        // A branch inside the only retained frontier is a miss, not an approximate replay.
-        assert!(selected(&[&tokens[..1500]], &branch).is_none());
-        assert!(selected(&[&tokens[..1500]], &tokens[..1499]).is_none());
-    }
-
-    #[test]
-    fn image_straddling_divergence_declines_instead_of_planning_inexact_replay() {
-        // #2340: the old even-aligned common frontier's 128-token replay began inside
-        // this image and rounded to 972, while the encoder restarted at 1044.
-        for common in [1172, 1173, 290_001] {
-            let tokens: Vec<u32> = (0..common + 12).collect();
-            let mut branch = tokens.clone();
-            branch[common as usize] = u32::MAX;
-            assert!(selected(&[&tokens], &branch).is_none());
-            let end = common as usize;
-            let span = MediaSpan { start: end - 200, len: 192,
-                key: cuteafd_core::ImageKey([7; 32]).into() };
-            let hit = RestoreCandidate { common: end, snapshot_end: end,
-                target_end: branch.len(), resume: end, media: std::slice::from_ref(&span),
-                saved_media: std::slice::from_ref(&span) };
-            let plan = RestorePlan::under(ReuseRule::EXACT, hit);
-            assert!(plan.exact());
-            assert_eq!((plan.resume(), hit.media_safe(plan.resume())), (end, end));
+        let partial = selected(&[&tokens[..1500]], &branch).unwrap();
+        assert_eq!(partial.fidelity, RestoreFidelity::ApproximateReplay);
+        assert_eq!((partial.lag.source_end, partial.resume()), (1000, 872));
+        for (prompt, end) in [(&tokens[..777], 777), (&tokens[..1001], 1001), (&tokens[..2000], 1001)] {
+            let exact = selected(&[&tokens[..end]], prompt).unwrap();
+            assert!(exact.exact());
+            assert_eq!((exact.lag.source_end, exact.resume()), (end, end));
+            exact.check(end).unwrap();
         }
     }
 
     #[test]
-    fn the_cache_refuses_a_partial_reuse_rule() {
+    fn image_divergence_and_replay_frontiers_never_split_a_span() {
+        // #2340: end-128 was 1044, inside the image beginning at 972.
+        // Include odd starts, divergence inside an image and immediately around it.
+        for start in [972, 973, 289_801, 289_802] {
+            let image = MediaSpan { start, len: 192, key: cuteafd_core::ImageKey([7; 32]).into() };
+            let media = std::slice::from_ref(&image);
+            for common in [start - 1, start, start + 1, start + 191, start + 192,
+                start + 200, start + 201, start + 400] {
+                let hit = RestoreCandidate { common, snapshot_end: start + 500,
+                    target_end: start + 600, resume: ReuseRule::V41.skipped(common, start + 500),
+                    media, saved_media: media };
+                let replay = plan(hit);
+                replay.check(common).unwrap();
+                assert!(!replay.exact());
+                assert_eq!(replay.lag.source_end % 2, 0);
+                assert_eq!(replay.lag.source_end, hit.media_safe(replay.lag.source_end));
+                assert_eq!(replay.resume(), hit.media_safe(replay.resume()));
+                if common == start + 200 || common == start + 201 {
+                    assert_eq!(replay.resume(), start);
+                    assert!(replay.lag.source_end - replay.resume() > 128);
+                }
+                if common > start && common < start + 192 {
+                    assert!(replay.lag.source_end <= start);
+                }
+                let exact = plan(RestoreCandidate { common: start + 500, ..hit });
+                assert!(exact.exact());
+                assert_eq!(exact.resume(), start + 500);
+            }
+        }
+    }
+
+    #[test]
+    fn source_alignment_rechecks_overlapping_saved_and_incoming_media() {
+        let images = [MediaSpan { start: 501, len: 190, key: cuteafd_core::ImageKey([7; 32]).into() },
+            MediaSpan { start: 310, len: 192, key: cuteafd_core::ImageKey([8; 32]).into() }];
+        let hit = RestoreCandidate { common: 600, snapshot_end: 800, target_end: 900,
+            resume: 472, media: &images[..1], saved_media: &images[1..] };
+        let replay = plan(hit);
+        assert_eq!((replay.lag.source_end, replay.resume()), (310, 182));
+    }
+
+    #[test]
+    fn cache_accepts_only_its_official_reuse_rule() {
         let config = PrefixConfig { entries: 4, mark_slots: 0, keep_logits: true, min_tokens: 64 };
-        let mut partial = layout(1, false);
-        partial.rule = ReuseRule { align: 2, replay: Some(128) };
-        assert!(V41Cache::new(Arenas { target: None, draft: None, slots: 0 }, config, None, partial).is_err());
+        let mut invalid = layout(1, false);
+        invalid.rule = ReuseRule::EXACT;
+        assert!(V41Cache::new(Arenas { target: None, draft: None, slots: 0 }, config, None, invalid).is_err());
         assert!(V41Cache::new(Arenas { target: None, draft: None, slots: 0 }, config, None, layout(1, false)).is_ok());
     }
 
@@ -733,7 +768,6 @@ mod tests {
             let uses = production.matches(["prefix_stream", ".raw"].concat().as_str()).count();
             assert_eq!(uses, 0, "{file} queues on the private prefix stream outside its guarded owners");
         }
-        assert!(!include_str!("prefix.rs").contains(["Approximate", "Replay"].concat().as_str()));
     }
 
     #[test]
