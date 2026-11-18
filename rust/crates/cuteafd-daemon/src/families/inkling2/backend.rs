@@ -40,6 +40,27 @@ impl scheduler::DraftState for Draft {
     fn close(&mut self, token: u32) {self.anchor=Some(token);}
 }
 
+fn scoring_replay(
+    sequences: &mut [(&mut Placement, &[u32])], speculative: bool,
+    decode: impl FnOnce(&mut [(&mut Placement, &[u32])]) -> Result<Option<DeviceLogits>>,
+    accept: impl FnOnce(&mut [scheduler::Verified<'_, Placement, Draft, usize>]) -> Result<()>,
+) -> Result<Option<DeviceLogits>> {
+    ensure!(!speculative, "Inkling scoring replay cannot speculate");
+    let logits = decode(sequences)?;
+    // Teacher-forced rows (including cold prompt replay) have no scheduler
+    // accept round. Commit their receipt and draft taps before the next tile.
+    let mut drafts = (0..sequences.len()).map(|_| Draft::default()).collect::<Vec<_>>();
+    let mut verified = sequences.iter_mut().zip(&mut drafts).scan(0, |first_row, ((placement, rows), seq)| {
+        let verified = scheduler::Verified { start: placement.len-rows.len(), history: placement.slot,
+            placement: &mut **placement, seq, rows: *rows, first_row: *first_row,
+            kept: None, finished: false, neural: false };
+        *first_row += rows.len();
+        Some(verified)
+    }).collect::<Vec<_>>();
+    accept(&mut verified)?;
+    Ok(logits)
+}
+
 enum Pending<'a>{
     Plain(Vec<(usize,usize,Vec<u32>)>),
     Spec{mark:super::verify::TargetMark<'a>,tokens:Vec<Vec<u32>>},
@@ -307,7 +328,11 @@ impl<'a> Backend<'a> for InklingBackend<'a> {
         self.decode(sequences, speculative, pool)
     }
     fn verify_device_ungraphed(&self, sequences: &mut [(&mut Placement, &[u32])], speculative: bool,
-        _: scheduler::UngraphedKind, pool: &RefPagePool) -> Result<Option<DeviceLogits>> { self.decode(sequences, speculative, pool) }
+        kind: scheduler::UngraphedKind, pool: &RefPagePool) -> Result<Option<DeviceLogits>> {
+        if kind == scheduler::UngraphedKind::Decode { return self.decode(sequences, speculative, pool); }
+        scoring_replay(sequences, speculative, |sequences| self.decode(sequences, false, pool),
+            |verified| self.accept(verified, false))
+    }
     fn verify_bucket_rows(&self, rows: usize, _: bool, _: bool) -> usize { rows }
     fn verify_attention_trace(&self, _: &[Vec<usize>], rows: usize) -> crate::shared::speculation_trace::Deferred {
         crate::shared::speculation_trace::Deferred::new(move || serde_json::json!({"kind":"inkling2", "rows":rows, "attention":"eager"}))
@@ -378,6 +403,99 @@ impl<'a> Backend<'a> for InklingBackend<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn teacher_forced_windows_commit_receipts_and_draft_taps_before_next_decode() -> Result<()> {
+        use std::cell::Cell;
+        let pending = RefCell::new(None);
+        let frontiers = RefCell::new([11, 29]);
+        let commits = Cell::new(0);
+        let mut first = Placement { media: None, units: vec![], slot: 0, len: 11, state_len: 11 };
+        let mut second = Placement { slot: 1, len: 29, state_len: 29, ..first.clone() };
+        let mut decode = |sequences: &mut [(&mut Placement, &[u32])]| -> Result<Option<DeviceLogits>> {
+            ensure!(pending.borrow().is_none(), "Inkling target decode requires admitted requests and prior commit");
+            let receipt = sequences.iter().map(|(p, rows)| (p.slot, p.len, rows.to_vec())).collect::<Vec<_>>();
+            for (p, rows) in sequences {
+                p.len += rows.len(); p.state_len = p.len;
+            }
+            *pending.borrow_mut() = Some(receipt);
+            Ok(None)
+        };
+        let mut accept = |verified: &mut [scheduler::Verified<'_, Placement, Draft, usize>]| -> Result<()> {
+            let sent = pending.borrow_mut().take().context("missing receipt")?;
+            ensure!(sent.len() == verified.len(), "member count differs");
+            let mut first_row = 0;
+            for ((slot, start, rows), v) in sent.iter().zip(verified) {
+                assert_eq!((*slot, *start, rows.as_slice()), (v.history, v.start, v.rows));
+                assert_eq!(v.first_row, first_row);
+                assert_eq!(v.placement.state_len, v.start+v.rows.len());
+                assert!(!v.neural && v.kept.is_none());
+                let mut frontiers = frontiers.borrow_mut();
+                assert_eq!(frontiers[*slot], *start, "drafter taps must remain contiguous");
+                frontiers[*slot] += rows.len();
+                first_row += rows.len();
+            }
+            commits.set(commits.get()+1);
+            Ok(())
+        };
+        // Reproduce the old scoring path's refusal on its second window.
+        decode(&mut [(&mut first, &[1, 2])])?;
+        assert!(decode(&mut [(&mut first, &[3])]).err().unwrap().to_string().contains("prior commit"));
+        *pending.borrow_mut() = None;
+        first.len = 11; first.state_len = 11;
+        for _ in 0..3 {
+            scoring_replay(&mut [(&mut first, &[1, 2]), (&mut second, &[3, 4, 5])], false,
+                &mut decode, &mut accept)?;
+            assert!(pending.borrow().is_none());
+        }
+        assert_eq!(commits.get(), 3);
+        assert_eq!(*frontiers.borrow(), [17, 38]);
+        assert!(scoring_replay(&mut [(&mut first, &[1])], true, &mut decode, &mut accept).is_err());
+        assert_eq!(commits.get(), 3);
+        let failure = scoring_replay(&mut [(&mut first, &[1])], false,
+            |_| anyhow::bail!("decode failed"), &mut accept).err().unwrap();
+        assert_eq!(failure.to_string(), "decode failed");
+        assert_eq!(commits.get(), 3);
+        Ok(())
+    }
+
+    #[test]
+    fn cold_decode_probe_commits_once_before_prefill_draft_binding() -> Result<()> {
+        let scheduler = include_str!("../../shared/qwen/scheduler.rs");
+        let cold = scheduler.split("let decode = p.job.probe.as_ref()").nth(1).unwrap()
+            .split("p.done += chunk.len();").next().unwrap();
+        assert!(cold.contains("step.decode"));
+        assert!(cold.contains("UngraphedKind::Scoring"));
+        assert!(cold.contains("engine.prefill_draft(&p.placement, start, chunk"));
+        assert!(!cold.contains("engine.accept("), "cold replay must not accept twice");
+        assert!(!cold.contains("lanes::commit("));
+        let backend = include_str!("backend.rs").split("#[cfg(test)]").next().unwrap();
+        let replay = backend.split("fn verify_device_ungraphed(").nth(1).unwrap()
+            .split("fn verify_bucket_rows(").next().unwrap();
+        assert!(replay.contains("scoring_replay(sequences, speculative"));
+        assert!(replay.contains("self.accept(verified, false)"));
+
+        let mut placement = Placement { media: None, units: vec![], slot: 0, len: 8, state_len: 8 };
+        let frontier = std::cell::Cell::new(8);
+        let commits = std::cell::Cell::new(0);
+        for rows in [&[10, 11][..], &[12][..]] {
+            scoring_replay(&mut [(&mut placement, rows)], false, |sequences| {
+                for (p, rows) in sequences { p.len += rows.len(); p.state_len = p.len; }
+                Ok(None)
+            }, |verified| {
+                assert_eq!(verified.len(), 1);
+                assert_eq!(verified[0].start, frontier.get());
+                frontier.set(verified[0].placement.len);
+                commits.set(commits.get()+1);
+                Ok(())
+            })?;
+            // Inkling prefill_draft binds the existing, already published taps.
+            assert_eq!(frontier.get(), placement.len);
+        }
+        assert_eq!(commits.get(), 2);
+        assert_eq!(frontier.get(), 11);
+        Ok(())
+    }
 
     #[test]
     fn recurrent_native_seven_history_always_explores_and_never_head_skips() -> Result<()> {
