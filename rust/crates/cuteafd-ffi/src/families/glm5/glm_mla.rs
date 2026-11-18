@@ -1,4 +1,4 @@
-//! Sparse MLA prefill on F16 or E4M3 tensor cores (`native/families/glm5/cuda/glm_mla_prefill.cu`):
+//! Sparse MLA prefill on BF16 or E4M3 tensor cores (`native/families/glm5/cuda/glm_mla_prefill.cu`):
 //! GLM 5.x 656-byte and GLM 5.3 Flash 528-byte FP8 latent records.
 use crate::NativeLibrary;
 use anyhow::{ensure, Result};
@@ -12,22 +12,13 @@ pub enum MlaPrefillKernel {
     Bf16 = 2,
 }
 
-impl From<cuteafd_core::attention::AttentionPrecision> for MlaPrefillKernel {
-    fn from(precision: cuteafd_core::attention::AttentionPrecision) -> Self {
-        match precision {
-            cuteafd_core::attention::AttentionPrecision::Bf16 => Self::Bf16,
-            cuteafd_core::attention::AttentionPrecision::Fp8 => Self::Fp8,
-        }
-    }
-}
-
 impl NativeLibrary {
     /// `out` [rows, heads, 512] BF16 = softmax(scale * q . k) v over each row's
     /// first `lengths[r]` entries of `indices` [rows, topk] (record slots;
     /// negative entries masked) in `kv` (slot * `record_bytes`: 656 with RoPE,
     /// 528 without); `q` [rows, heads, 576 or 512] BF16. `scale_log2` is the
-    /// softmax scale times log2(e). `kernel`: 0 F16, 1 E4M3 (two-term
-    /// query and P).
+    /// softmax scale times log2(e). BF16 uses exact widened codes with FP32
+    /// record scales after QK and BF16 P*scale for PV; FP8 uses two-term E4M3 Q/P.
     ///
     /// # Safety
     /// Every pointer is live device memory of those shapes on the stream's device.
@@ -46,24 +37,26 @@ impl NativeLibrary {
         Ok(())
     }
 
-    /// Diagnostics: both prefill kernels on the same inputs against kernel 1 (E4M3); per
-    /// kernel 0..=1 [relative L2, max abs difference, RMS of the reference]. Synchronizes.
+    /// Compares each supported native prefill kernel against Q2P2 on the same inputs.
+    /// Returns [relative L2, max abs difference, reference RMS] per kernel (F16,
+    /// Q2P2, BF16); the BF16 entry is `None` for Flash records. Synchronizes.
     ///
     /// # Safety
     /// As [`Self::glm_mla_prefill`].
     #[allow(clippy::too_many_arguments)]
     pub unsafe fn glm_mla_prefill_check(&self, q: *const c_void, kv: *const c_void, indices: *const c_void,
         lengths: *const c_void, rows: usize, heads: usize, topk: usize, record_bytes: usize, scale_log2: f32,
-        stream: *mut c_void) -> Result<[[f64; 3]; 2]> {
+        stream: *mut c_void) -> Result<([[f64; 3]; 2], Option<[f64; 3]>)> {
         type F = unsafe extern "C" fn(*const c_void, *const c_void, *const c_void, *const c_void, i32, i32, i32, i32,
             f32, *mut f64, *mut c_void) -> i32;
-        let f = *unsafe { self.lib.get::<F>(b"cuteafd_glm_mla_prefill_check") }?;
-        let mut stats = [[0f64; 3]; 2];
+        let f = *unsafe { self.lib.get::<F>(b"cuteafd_glm_mla_prefill_compare") }?;
+        let mut stats = [[0f64; 3]; 3];
         let status = unsafe {
             f(q, kv, indices, lengths, i32::try_from(rows)?, i32::try_from(heads)?, i32::try_from(topk)?,
                 i32::try_from(record_bytes)?, scale_log2, stats.as_mut_ptr().cast(), stream)
         };
         ensure!(status == 0, "sparse MLA prefill check failed with {status}");
-        Ok(stats)
+        let [f16, q2p2, bf16] = stats;
+        Ok(([f16, q2p2], (record_bytes == 656).then_some(bf16)))
     }
 }
