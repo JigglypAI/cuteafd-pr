@@ -4305,6 +4305,54 @@ def test_matched_prompts_refuses_arm_scoped_image_probe(entry, tmp_path, monkeyp
         cards.main()
 
 
+
+@pytest.mark.parametrize('base_path', ['server-v1', 'client-v1'])
+def test_matched_speed_waves_ignore_prelude_and_prechecks(tmp_path, base_path):
+    report = {'panels': [
+        {'id': 'decode_content', 'status': 'done', 'passes': [{'rows': [{}]}]},
+        {'id': 'concurrency', 'status': 'done', 'passes': [{'points': [{'c': 2, 'errors': 0, 'prompts': 'distinct-v1'}]}]},
+        {'id': 'spec_lossless_set', 'status': 'done', 'passes': [{}]},
+    ]}
+    start = 1_800_000_000
+    rows = []
+    def line(second, value):
+        stamp = cards.datetime.datetime.fromtimestamp(second, cards.datetime.timezone.utc).isoformat()
+        return f'{stamp} INFO matched benchmark prompt prompt_token_hash={value:016x}'
+    for arm, path, timed in [('base', base_path, [5, 6]), ('dev', 'server-v1', [6, 5])]:
+        dest = tmp_path / arm
+        dest.mkdir()
+        window = {'start_unix_s': start, 'end_unix_s': start + 8, 'prelude_path': path}
+        phase = [1, *([2, 3] if arm == 'base' else [3, 9]), *timed]
+        log = '\n'.join([line(start - 1, 7 if arm == 'base' else 8),
+                         *(line(start + i, value) for i, value in enumerate(phase)),
+                         'INFO benchmark arm-local prompt'])
+        measured, untimed = cards.measured_prompt_hashes(log, window, report)
+        assert len(untimed) == 3
+        rows.append(dict(card='card', arm=arm, repeat=1, state=str(dest), nonce_seed='same',
+                         status='pass', simulated=False, measured_prompt_waves=measured, matched_panel_window=window))
+    cards.write_summary(tmp_path, rows, {'base': {}, 'dev': {}})
+    assert all(row['status'] == 'pass' for row in rows)
+    assert f'card/base/r1: {base_path}' in (tmp_path / 'summary.md').read_text()
+    rows[0]['measured_prompt_waves'][0], rows[1]['measured_prompt_waves'][0] = ['different'], ['first']
+    cards.validate_matched_pairs(rows, ['base', 'dev'])
+    assert all(row['exit_code'] == 81 for row in rows)
+    with pytest.raises(ValueError, match='expected 5 panel admissions, got 0'):
+        cards.measured_prompt_hashes('', window, report)
+
+
+def test_scoped_matched_panels_accept_arm_local_image_prefix(entry, tmp_path, monkeypatch):
+    kit = _kit(tmp_path, entry)
+    state = tmp_path / 'scoped-state'
+    monkeypatch.setattr(sys, 'argv', ['wip-cards', '--kit', str(kit), '--cards', 'v41-min',
+        '--interleave', '--matched-prompts', '--arm', 'candidate=test:s', '--arm', 'base=base:s',
+        '--panels', 'decode_content,concurrency,spec_lossless_set', '--probe', 'candidate:v41-min:image-prefix',
+        '--state', str(state), '--repeats', '1', '--dry-run'])
+    assert cards.main() == 0
+    jobs = json.loads((state / 'plan.json').read_text())['jobs']
+    assert all(job['entry']['matched_panel_window'] for job in jobs)
+    assert len({job['nonce_seed'] for job in jobs}) == 1
+    assert jobs[0]['entry']['precheck']['required']
+
 def test_image_prefix_attempts_preserve_failed_verdict_and_receipts(tmp_path, monkeypatch):
     def attempt(url, dest, dump_root):
         cards.save(dest / 'response.json', {'cached_tokens': 7})
