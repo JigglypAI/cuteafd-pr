@@ -30,18 +30,20 @@ pub struct DraftLayout {
     pub runtime:Vec<RecurrentRuntimeLayout>,
     /// Target-side tap and exact FIR verification storage, independent of pool.
     pub target:Vec<(String,usize)>,
+    pub peer: Vec<(String,usize)>,
+    pub exchange: Vec<(String,usize)>,
 }
 impl DraftLayout {
     pub fn new(view:&CheckpointView,ranks:usize,slots:usize,sequences:usize,context:usize,pool:usize,
         prefill:usize,waves:usize,sms:usize,format:Qwen4KvCache,manifest:Option<&serde_json::Value>)->Result<Self>{
-        let (config, weights, _) = Self::select_weights(view, ranks)?;
+        let (config, weights, _) = Self::select_weights(view, ranks, 0)?;
         Self::from_weights(config, weights, slots, sequences, context, pool, prefill, waves, sms, format, manifest)
     }
 
-    pub fn select_weights(view: &CheckpointView, ranks: usize) -> Result<(RecurrentBlockConfig, Vec<RecurrentWeightLayout>, crate::shared::dense_read::MountLoad)> {
+    pub fn select_weights(view: &CheckpointView, ranks: usize, lead: usize) -> Result<(RecurrentBlockConfig, Vec<RecurrentWeightLayout>, crate::shared::dense_read::MountLoad)> {
         ensure!(matches!(ranks, 1 | 2), "recurrent draft rank geometry");
         let source = RecurrentSource::open(view)?;
-        let weights = (0..ranks).map(|rank| source.rank(rank, ranks, ranks - 1)).collect::<Result<Vec<_>>>()?;
+        let weights = (0..ranks).map(|rank| source.rank(rank, ranks, lead)).collect::<Result<Vec<_>>>()?;
         let mount = source.mount_load(ranks)?;
         Ok((source.config, weights, mount))
     }
@@ -52,7 +54,9 @@ impl DraftLayout {
         let ranks = weights.len();
         ensure!(matches!(ranks, 1 | 2) && slots > 0 && sequences > 0 && prefill > 0 && waves > 0,
             "recurrent draft fact geometry");
-        let lead = ranks - 1;
+        let lead = weights[0].lead;
+        ensure!(lead < ranks && weights.iter().enumerate().all(|(rank, layout)|
+            layout.rank == rank && layout.ranks == ranks && layout.lead == lead), "Inkling draft weight rank ownership differs");
         let mut runtime=(0..ranks).map(|rank|RecurrentRuntimeLayout::new(&config,slots,sequences,CONTEXT_ROWS,context,pool,
             sms,format,rank,ranks,lead)).collect::<Result<Vec<_>>>()?;
         for (weight,work) in weights.iter().zip(&mut runtime){
@@ -80,10 +84,17 @@ impl DraftLayout {
         }
         target.push(("decode.taps".into(),extent(&[64,taps,h,2])?));
         target.push(("decode.narrow".into(),extent(&[64,h,2])?));
-        let conv=super::conv::ConvLayout::new(slots,48,h,1024)?;
-        target.push(("verify.checkpoint".into(),conv.bytes()?));
-        target.push(("verify.replay".into(),extent(&[48,64,conv.width,4])?));
-        target.push(("verify.table".into(),64*12));
-        Ok(Self{config,weights,runtime,target})
+        let conv=super::conv::ConvLayout::new(slots,48,h,1024/ranks)?;
+        let verify = vec![("verify.checkpoint".into(),conv.bytes()?),
+            ("verify.replay".into(),extent(&[48,64,conv.width,4])?), ("verify.table".into(),64*12)];
+        target.extend(verify.iter().cloned());
+        let (peer,exchange)=if ranks==2 {
+            let bytes=runtime[0].buffers.iter().find(|(name,_)|name=="step.partial").context("draft partial owner missing")?.1;
+            let storage=crate::serving_capacity::PeerStorageLayout::new(1,bytes,crate::serving_capacity::peer_wait_diagnostics())?;
+            (verify,[("reduced",bytes),("peer.recv.0",storage.receive_bytes),("peer.control",storage.control_bytes),
+                ("peer.progress",storage.progress_bytes),("peer.abort",256)].into_iter()
+                .filter(|(_,bytes)|*bytes>0).map(|(name,bytes)|(name.into(),bytes)).collect())
+        } else {(Vec::new(),Vec::new())};
+        Ok(Self{config,weights,runtime,target,peer,exchange})
     }
 }

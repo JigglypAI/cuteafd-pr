@@ -22,51 +22,83 @@ fn snapshot_buffers(config:&cuteafd_loader::formats::block_dspark::recurrent::Re
 
 pub(crate) struct Binding<'a>{
     pub drafter:Rc<Drafter<'a>>,
-    pub marks:Option<Marks<'a>>,
-    pub verify:Verify<'a>,
+    pub marks:Vec<Marks<'a>>,
+    pub verify:Vec<Verify<'a>>,
     pub prefill:Vec<TapBuffer<'a>>,
     pub decode:TapBuffer<'a>,
     pub layout:DraftLayout,
 }
 impl crate::shared::prefix::cuda_copy::SnapshotOwner for Binding<'_>{
     fn snapshot_buffers(&self)->Result<Vec<Buffer>>{
-        snapshot_buffers(&self.layout.config,&self.drafter.lead.buffers,
-            self.marks.as_ref().map(|marks|marks.backing().buffer))
+        let mut output=Vec::new();
+        for (index, rank) in self.ranks().enumerate() {
+            output.extend(snapshot_buffers(&self.layout.config,&rank.buffers,
+                self.marks.get(index).map(|marks|marks.backing().buffer))?);
+        }
+        Ok(output)
     }
 }
 impl<'a> Binding<'a>{
-    pub fn new(programs:&'a Programs<'a>,stream:Rc<Stream<'a>>,weights:Weights<'a>,layout:DraftLayout,
+    pub fn ranks(&self) -> impl Iterator<Item=&Rank<'a>> {
+        std::iter::once(&self.drafter.lead).chain(self.drafter.split.as_ref().map(|split| &**split.peer))
+    }
+    pub fn new(programs:&'a Programs<'a>,streams:Vec<Rc<Stream<'a>>>,weights:Vec<Weights<'a>>,layout:DraftLayout,
         admitted:&ResolvedPlan,target_head:ProjectionWeight<'_, 'a>,head:&Head<'a>,target_kernels:&Kernels<'a>,
         prefill_rows:usize,waves:usize,mark_slots:usize)->Result<Self>{
-        ensure!(layout.weights.len()==1 && layout.runtime.len()==1,"Inkling target binding currently runs whole rank");
-        let runtime=&layout.runtime[0];
-        let check=|id:&str,bytes:usize|->Result<()>{
+        let count=streams.len();
+        ensure!(matches!(count,1|2) && weights.len()==count && layout.weights.len()==count && layout.runtime.len()==count,
+            "Inkling target and draft rank counts differ");
+        let check=|id:&str,bytes:usize,rank:usize|->Result<()>{
             let owner=admitted.facts.allocations.iter().find(|owner|owner.id==id).with_context(||format!("unadmitted drafter owner {id}"))?;
-            ensure!(owner.bytes==bytes as u64,"drafter runtime owner differs from admission {id}");Ok(())
+            ensure!(owner.bytes==bytes as u64 && owner.location==cuteafd_loader::placement::planner::Location::coordinator(rank as u8),
+                "drafter runtime owner differs from admission {id}");Ok(())
         };
-        check(layout.weights[0].arena.id(),layout.weights[0].arena.bytes())?;
-        for (name,bytes) in &runtime.buffers{check(&format!("inkling2.draft.0.{name}"),*bytes)?;}
-        for (name,bytes) in &layout.target{check(&format!("inkling2.draft.target.{name}"),*bytes)?;}
-        if mark_slots>0{check("inkling2.draft.0.marks",runtime.window_mark_bytes*mark_slots)?;}
-        let kernels=ProgramsForRank::load(programs,&weights,&layout.config,runtime,stream.device)?;
-        let rank=Rank::allocate(weights,Rc::clone(&stream),layout.config.clone(),runtime.clone(),kernels)?;
-        rank.initialize_derived()?;
-        match target_head {
-            ProjectionWeight::Bf16(w) => rank.fold_head(w.buffer)?,
-            weight => {
-                let (stored, stage, transpose) = head.compact_stages()?;
-                let h = rank.config.transformer.hidden;
-                rank.fold_compact_head(programs, stored, stage, transpose, |input, output, rows|
-                    target_kernels.project_compact(&stream, input, weight, output, rows, h, stored))?;
-            }
+        let mut ranks=Vec::new();
+        for (index,(stream,weights)) in streams.iter().zip(weights).enumerate(){
+            let runtime=&layout.runtime[index];
+            check(layout.weights[index].arena.id(),layout.weights[index].arena.bytes(),index)?;
+            for (name,bytes) in &runtime.buffers{check(&format!("inkling2.draft.{index}.{name}"),*bytes,index)?;}
+            if mark_slots>0{check(&format!("inkling2.draft.{index}.marks"),runtime.window_mark_bytes*mark_slots,index)?;}
+            ranks.push(stream.device.run(||{
+                let kernels=ProgramsForRank::load(programs,&weights,&layout.config,runtime,stream.device)?;
+                let rank=Rank::allocate(weights,Rc::clone(stream),layout.config.clone(),runtime.clone(),kernels)?;
+                rank.initialize_derived()?;
+                if index == runtime.rank.lead {
+                    match target_head {
+                        ProjectionWeight::Bf16(w) => rank.fold_head(w.buffer)?,
+                        weight => {
+                            let (stored, stage, transpose) = head.compact_stages()?;
+                            let h = rank.config.transformer.hidden;
+                            rank.fold_compact_head(programs, stored, stage, transpose, |input, output, rows|
+                                target_kernels.project_compact(stream, input, weight, output, rows, h, stored))?;
+                        }
+                    }
+                }
+                stream.drain()?;
+                Ok(rank)
+            })?);
         }
+        for (name,bytes) in &layout.target{check(&format!("inkling2.draft.target.{name}"),*bytes,0)?;}
+        for (name,bytes) in &layout.peer{check(&format!("inkling2.draft.peer.{name}"),*bytes,1)?;}
+        for rank in 0..count {
+            for (name,bytes) in &layout.exchange {check(&format!("inkling2.draft.{rank}.{name}"),*bytes,rank)?;}
+        }
+        let runtime=&layout.runtime[0];
         let context=ContextBank{state:RefCell::new(ContextState::new(runtime.slots,
             usize::try_from(admitted.served_context())?,runtime.cache.target_tokens,0x494e4b4d5450)?)};
-        let drafter=Rc::new(Drafter::whole(rank,context)?);
-        let marks=(mark_slots>0).then(||Marks::new(&drafter.lead,mark_slots)).transpose()?;
-        let verify=Verify::new(programs,Rc::clone(&stream),runtime.slots,11264)?;
-        let prefill=(0..waves).map(|_|TapBuffer::new(Rc::clone(&stream),&layout.config,prefill_rows)).collect::<Result<Vec<_>>>()?;
-        let decode=TapBuffer::new(Rc::clone(&stream),&layout.config,64)?;
+        let mut ranks=ranks.into_iter();
+        let lead=ranks.next().context("Inkling lead draft rank absent")?;
+        let drafter=Rc::new(if let Some(peer)=ranks.next(){Drafter::pair(lead,peer,context)?}else{Drafter::whole(lead,context)?});
+        let local=std::iter::once(&drafter.lead).chain(drafter.split.as_ref().map(|split|&**split.peer));
+        let marks=if mark_slots==0{Vec::new()}else{
+            local.map(|rank|rank.stream.device.run(||Marks::new(rank,mark_slots))).collect::<Result<_>>()?
+        };
+        let width=9216+2048/count;
+        let verify=streams.iter().map(|stream|stream.device.run(||Verify::new(programs,Rc::clone(stream),runtime.slots,width)))
+            .collect::<Result<Vec<_>>>()?;
+        let stream=&streams[0];
+        let prefill=(0..waves).map(|_|TapBuffer::new(Rc::clone(stream),&layout.config,prefill_rows)).collect::<Result<Vec<_>>>()?;
+        let decode=TapBuffer::new(Rc::clone(stream),&layout.config,64)?;
         stream.drain()?;
         Ok(Self{drafter,marks,verify,prefill,decode,layout})
     }
@@ -101,7 +133,7 @@ impl<'a> Binding<'a>{
             let position=(first+offset)*pitch;
             let output=taps.output.buffer;
             ensure!(position.checked_add(count*pitch).is_some_and(|end|end<=output.bytes),"drafter target taps outside owner");
-            self.drafter.context.append(&self.drafter.lead,slot,start+offset,
+            self.drafter.append_context(slot,start+offset,
                 Buffer{ptr:output.ptr.wrapping_byte_add(position),bytes:count*pitch,..output},count)?;
         }Ok(())
     }

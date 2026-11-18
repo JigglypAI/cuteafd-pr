@@ -38,8 +38,8 @@ impl<'a> UnitBuffers<'a> for PackedLayerUnit<'_, 'a> {
     fn decode_attention(&self)->bool {self.unit.decode_attention}
     fn convolution_replay(&self, field: &str) -> Result<Option<(Buffer, usize)>> {
         let Some((backing, width)) = self.unit.replay.get() else { return Ok(None) };
-        let offset = match field { "attn_conv_history" => 0, "mlp_conv_history" => 4608,
-            "k_conv_history" => 9216, "v_conv_history" => 10240, _ => anyhow::bail!("unknown convolution replay field") };
+        let (range, _) = self.cache.layout.conv.field(0, 0, field)?;
+        let offset = range.start / 4;
         let offset = (self.layer*64*width+offset)*4;
         Ok(Some((super::cache::view(backing, offset, backing.bytes-offset)?, width)))
     }
@@ -118,7 +118,7 @@ pub(crate) struct UnitOwner<'a> {
 impl<'a> UnitOwner<'a> {
     /// The caller retains replay storage through every queued convolution and commit.
     pub fn set_replay(&self, replay: Option<(Buffer, usize)>) -> Result<()> {
-        ensure!(replay.is_none_or(|(buffer,width)| width==11264 && buffer.device_id==self.stream.device.id
+        ensure!(replay.is_none_or(|(buffer,width)| width == 9216 + 2048 / self.layout.head_parts && buffer.device_id==self.stream.device.id
             && buffer.bytes>=48*64*width*4), "convolution replay backing differs from admitted geometry");
         self.replay.set(replay);
         Ok(())
@@ -168,7 +168,7 @@ impl<'a> UnitOwner<'a> {
     }
     pub fn packed_metadata(&self, layer: usize, cache: &super::cache::CacheBank<'a>, members: &[PackedMember],
         uploads: &mut crate::shared::token_table::RetainedUploads<'a>) -> Result<()> {
-        ensure!(cache.layout.ring_sequence_bytes % 4096 == 0,
+        ensure!(cache.layout.ring_sequence_bytes % cache.layout.ring_record_bytes() == 0,
             "Inkling sequence bank must have an integral record stride");
         ensure!(members.len() <= cache.layout.sequences
             && members.iter().all(|member| member.sequence < cache.layout.sequences)
@@ -188,7 +188,7 @@ impl<'a> UnitOwner<'a> {
             local.extend(member.metadata.local_slots.iter().map(|&slot| slot + member.rows.start as i64));
             global.extend_from_slice(&member.metadata.global_slots);
             ring.extend(member.metadata.ring_slots.iter().map(|&slot|
-                slot + (member.sequence * cache.layout.ring_sequence_bytes / 4096) as i64));
+                slot + (member.sequence * cache.layout.ring_stride_records()) as i64));
             conv.extend(std::iter::repeat_n(member.sequence as i64, member.rows.len()));
             first.extend(std::iter::repeat_n(member.rows.start as i32, member.rows.len()));
         }
@@ -248,7 +248,8 @@ impl<'a> UnitOwner<'a> {
     }
     pub fn uploads(&self, cfg: &cuteafd_loader::families::inkling2::Inkling2Config, members: usize)
         -> Result<crate::shared::token_table::RetainedUploads<'a>> {
-        crate::shared::token_table::RetainedUploads::new(self.stream.device, self.layout.upload_shape(cfg, members)?)
+        self.stream.device.run(|| crate::shared::token_table::RetainedUploads::new(
+            self.stream.device, self.layout.upload_shape(cfg, members)?))
     }
     pub fn inventory(&self, inventory: &mut Inventory<'_>, prefix: &str) -> Result<()> {
         for (name, owner) in &self.buffers { owner.inventory(inventory, &format!("{prefix}.{name}"))?; }
@@ -263,21 +264,23 @@ pub(crate) struct RequestOwners<'a> {
     pub decode: UnitOwner<'a>,
     pub prefill: Vec<UnitOwner<'a>>,
     pub cache: Rc<super::cache::CacheBank<'a>>,
+    rank: usize,
 }
 impl<'a> RequestOwners<'a> {
     pub fn allocation_receipts(&self, inventory: &mut Inventory<'_>,
         census: &mut crate::shared::memory::receipts::Census,
         devices: cuteafd_loader::placement::planner::CoordinatorDevices<'_>) -> Result<()> {
         self.cache.inventory(inventory)?;
-        self.decode.inventory(inventory, "inkling2.decode.0")?;
-        self.decode_uploads.allocation_receipts(inventory, "inkling2.decode.0.uploads")?;
+        let decode = format!("inkling2.decode.{}", self.rank);
+        self.decode.inventory(inventory, &decode)?;
+        self.decode_uploads.allocation_receipts(inventory, &format!("{decode}.uploads"))?;
         for (slot, (owner, uploads)) in self.prefill.iter().zip(&self.prefill_uploads).enumerate() {
-            let prefix = format!("inkling2.unit.0.{slot}");
+            let prefix = format!("inkling2.unit.{}.{slot}", self.rank);
             owner.inventory(inventory, &prefix)?;
             uploads.allocation_receipts(inventory, &format!("{prefix}.uploads"))?;
         }
-        for (name, uploads) in std::iter::once(("inkling2.decode.0.uploads".to_owned(), &self.decode_uploads))
-            .chain(self.prefill_uploads.iter().enumerate().map(|(slot, uploads)| (format!("inkling2.unit.0.{slot}.uploads"), uploads))) {
+        for (name, uploads) in std::iter::once((format!("{decode}.uploads"), &self.decode_uploads))
+            .chain(self.prefill_uploads.iter().enumerate().map(|(slot, uploads)| (format!("inkling2.unit.{}.{slot}.uploads", self.rank), uploads))) {
             let backing = inventory.receipts.iter().find(|receipt| receipt.allocation.id.ends_with(&format!(".{name}"))
                 && receipt.allocation.bytes == uploads.mapped_alias().bytes as u64
                 && receipt.allocation.location == cuteafd_loader::placement::planner::Location::PINNED)
@@ -286,19 +289,22 @@ impl<'a> RequestOwners<'a> {
         }
         Ok(())
     }
-    pub fn whole(stream: Rc<Stream<'a>>, inputs: &cuteafd_loader::placement::families::inkling2::InklingInputs,
-        admitted: &cuteafd_loader::placement::families::inkling2::AdmittedInkling) -> Result<Self> {
+    pub fn rank(stream: Rc<Stream<'a>>, inputs: &cuteafd_loader::placement::families::inkling2::InklingInputs,
+        admitted: &cuteafd_loader::placement::families::inkling2::AdmittedInkling, rank: usize) -> Result<Self> {
         use cuteafd_loader::placement::{LayerMode, planner::Location};
-        ensure!(inputs.gpus == 1 && admitted.placement.layers.iter().all(|layer|
-            matches!(layer.mode, LayerMode::Whole { gpu: 0, .. })), "Inkling request owner requires admitted whole rank");
+        ensure!(rank < inputs.gpus && admitted.placement.layers.iter().all(|layer| match inputs.gpus {
+            1 => matches!(layer.mode, LayerMode::Whole { gpu: 0, .. }),
+            2 => layer.mode == LayerMode::HeadSplit,
+            _ => false,
+        }), "Inkling request owner requires admitted whole rank or head split");
         let cfg = &inputs.cfg;
         let sequences = usize::try_from(inputs.sequences)?;
         let context = usize::try_from(inputs.context.maximum)?;
         let pages = usize::try_from(admitted.solved.pool_tokens.div_ceil(64))?;
-        let cache_layout = cuteafd_loader::families::inkling2::execution::CacheLayout::with_format(cfg, sequences, pages, inputs.kv_format)?;
+        let cache_layout = cuteafd_loader::families::inkling2::execution::CacheLayout::with_head_parts(cfg, sequences, pages, inputs.kv_format, inputs.gpus)?;
         let mark_slots = inputs.prefix_mark_slots;
-        let decode_layout = UnitLayout::serving_format(cfg, 64, context, inputs.kv_format, sequences)?;
-        let prefill_layout = UnitLayout::serving_format(cfg, usize::try_from(inputs.prefill.rows)?, context, inputs.kv_format, sequences)?;
+        let decode_layout = UnitLayout::serving_head_parts(cfg, 64, context, inputs.kv_format, sequences, inputs.gpus)?;
+        let prefill_layout = UnitLayout::serving_head_parts(cfg, usize::try_from(inputs.prefill.rows)?, context, inputs.kv_format, sequences, inputs.gpus)?;
         let owner = |id: &str, bytes: usize, location| -> Result<()> {
             let allocation = admitted.solved.facts.allocations.iter().find(|allocation| allocation.id == id)
                 .with_context(|| format!("Inkling unadmitted runtime owner {id}"))?;
@@ -306,16 +312,16 @@ impl<'a> RequestOwners<'a> {
                 "Inkling runtime owner differs from admission: {id} {bytes}/{}", allocation.bytes);
             Ok(())
         };
-        let device = Location::coordinator(0);
-        owner("inkling2.cache.0.active", cache_layout.active_bytes()?, device)?;
-        owner("inkling2.cache.0.conv", cache_layout.conv.bytes()?, device)?;
-        if mark_slots > 0 { owner("inkling2.cache.0.marks", cache_layout.retained_bytes(mark_slots)?, device)?; }
+        let device = Location::coordinator(u8::try_from(rank)?);
+        owner(&format!("inkling2.cache.{rank}.active"), cache_layout.active_bytes()?, device)?;
+        owner(&format!("inkling2.cache.{rank}.conv"), cache_layout.conv.bytes()?, device)?;
+        if mark_slots > 0 { owner(&format!("inkling2.cache.{rank}.marks"), cache_layout.retained_bytes(mark_slots)?, device)?; }
         for &layer in &cache_layout.global_layers {
             let bytes = usize::try_from(cuteafd_loader::placement::planner::sm120_request_backing(cache_layout.layer_page_bytes()? as u64)?)?;
-            owner(&format!("inkling2.kv.{layer}.0.records"), bytes, device)?;
+            owner(&format!("inkling2.kv.{layer}.{rank}.records"), bytes, device)?;
         }
-        for (prefix, layout) in std::iter::once(("inkling2.decode.0".to_owned(), &decode_layout))
-            .chain((0..inputs.prefill.waves).map(|slot| (format!("inkling2.unit.0.{slot}"), &prefill_layout))) {
+        for (prefix, layout) in std::iter::once((format!("inkling2.decode.{rank}"), &decode_layout))
+            .chain((0..inputs.prefill.waves).map(|slot| (format!("inkling2.unit.{rank}.{slot}"), &prefill_layout))) {
             for (name, bytes) in &layout.buffers { owner(&format!("{prefix}.{name}"), *bytes, device)?; }
             let uploads = layout.upload_shape(cfg, sequences.min(layout.rows))?;
             owner(&format!("{prefix}.uploads"), uploads.capacity_bytes()?, Location::PINNED)?;
@@ -329,7 +335,7 @@ impl<'a> RequestOwners<'a> {
         let decode_uploads = decode.uploads(cfg, sequences.min(decode.layout.rows))?;
         let prefill_uploads = prefill.iter().map(|owner| owner.uploads(cfg, sequences.min(owner.layout.rows)))
             .collect::<Result<Vec<_>>>()?;
-        Ok(Self { decode_uploads, prefill_uploads, decode, prefill, cache })
+        Ok(Self { decode_uploads, prefill_uploads, decode, prefill, cache, rank })
     }
 }
 

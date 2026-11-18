@@ -12,6 +12,7 @@ pub(crate) struct ServeArgs {
     #[arg(long, env="CUTEAFD_NATIVE_LIB")] pub native_lib: PathBuf,
     #[arg(long, default_value="/opt/cuteafd/share/PROGRAMS.json")] pub manifest: PathBuf,
     #[arg(long, default_value_t=0)] pub device: i32,
+    #[arg(long)] pub split_device: Option<i32>,
     #[arg(long, value_delimiter=',')] pub peers: Vec<SocketAddr>,
     #[arg(long)] pub pool_tokens: Option<u64>,
     #[arg(long="kv-cache", default_value="fp8")] pub kv_format: cuteafd_loader::families::inkling2::InklingKvCache,
@@ -83,7 +84,7 @@ pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
             let library = Arc::new(unsafe { cuteafd_ffi::NativeLibrary::load(&worker_args.native_lib)? });
             let programs = library.programs()?.with_manifest(&worker_args.manifest)?;
             let (execution, inputs, admitted, _, media) = super::startup::whole(&library, &programs, &view, &checkpoint, &cfg,
-                super::startup::Options { device: worker_args.device, peers: &worker_args.peers,
+                super::startup::Options { device: worker_args.device, split_device: worker_args.split_device, peers: &worker_args.peers,
                     native_lib: &worker_args.native_lib, manifest: &worker_args.manifest,
                     prefill: PrefillShape { rows: prefill.unit_rows, waves: prefill.waves },
                     sequences: worker_args.max_sequences as u64, context_tokens: worker_args.max_context.unwrap_or(0) as u64,
@@ -91,7 +92,7 @@ pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
                     prefix: &worker_args.prefix, resident_weights: crate::shared::memory::budget::resident_weight_limit(),
                     expert_usage: false, vision: &worker_args.vision })?;
             let context = usize::try_from(admitted.solved.served_context())?;
-            let family = super::cache::InklingPrefix::with_draft(execution.requests.cache.clone(),execution.draft.clone());
+            let family = super::cache::InklingPrefix::for_execution(&execution);
             let host = (inputs.host_prefix.quota_bytes > 0).then(|| {
                 use cuteafd_engine::prefix::PrefixFamily;
                 worker_args.prefix.host_config_for(family.layout(), context, inputs.host_prefix.quota_bytes)
@@ -109,7 +110,8 @@ pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
                 worker_args.decode_share, &worker_args.prefix, worker_args.loop_abort.config(),
                 worker_args.token_io.token_select, &mut media_admission, None, || {
                     backend.require_live()?;
-                    RuntimeInventory::measure(&library, &[worker_args.device], InventoryPhase::PostLoad,
+                    let devices = std::iter::once(worker_args.device).chain(worker_args.split_device).collect::<Vec<_>>();
+                    RuntimeInventory::measure(&library, &devices, InventoryPhase::PostLoad,
                         |_| Ok(()))?.record("inkling2-serving-loaded", &[]);
                     if let Some(ready) = ready.take() { let _ = ready.send(Ok((context, media.preparer.clone()))); }
                     Ok(())

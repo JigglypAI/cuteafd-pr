@@ -63,9 +63,9 @@ def test_fir_exports_keep_wide_prefill_separate_from_bounded_replay(monkeypatch)
     namespace = {}
     exec(compile(ast.Module(body=[node], type_ignores=[]), str(path), "exec"), namespace)
     exports = namespace["inkling_fir_programs"]()
-    assert len(exports) == 7
+    assert len(exports) == 11
     assert exports[0][0] == "fir_history_commit" and exports[0][2] == {"max_rows": 64}
     for name, op, params, compile_ in exports[1:]:
         assert params["max_rows"] == (64 if name.endswith("replay") else 4096)
-        assert compile_()[1]["width"] in (1024, 4608)
+        assert compile_()[1]["width"] in (512, 1024, 4608)
         assert op in ("convolution_replay", "convolution_strided")

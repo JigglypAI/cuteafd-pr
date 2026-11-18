@@ -310,9 +310,9 @@ def inkling_fir_programs():
     from b12x.integration.cuteafd.inkling2_convolution_replay import compile_inkling2_convolution_replay_aot
     from b12x.integration.cuteafd.inkling2_convolution_strided import compile_inkling2_convolution_strided_aot
     out = [("fir_history_commit", "fir_history_commit", {"max_rows": 64}, compile_fir_history_commit_aot)]
-    for width, dynamic in ((4608, False), (1024, False), (1024, True)):
+    for width, dynamic in ((4608, False), (1024, False), (1024, True), (512, False), (512, True)):
         kind = "dynamic" if dynamic else "static"
-        params = dict(width=width, heads=8 if dynamic else 1, dynamic=dynamic)
+        params = dict(width=width, heads=width // 128 if dynamic else 1, dynamic=dynamic)
         for suffix, capacity, compile_ in (("replay", 64, compile_inkling2_convolution_replay_aot),
                                           ("strided", 4096, compile_inkling2_convolution_strided_aot)):
             out.append((f"conv_{kind}_h{width}_f32_{suffix}", f"convolution_{suffix}", {"max_rows": capacity},
@@ -328,10 +328,12 @@ def inkling_draft_projection_shapes(ranks):
             (9728, 768), (256, 201024), (4608, 201024)}
 
 
-def inkling2_projection_shapes():
-    """(K,N) of released native core operands, including small sink/tap projections."""
-    return {(4608, 6144), (4608, 768), (4608, 1024), (4608, 48),
-            (4608, 32), (4608, 384), (6144, 4608), (64, 1024)}
+def inkling2_projection_shapes(parts=1):
+    """(K,N) of native core operands, including small sink/tap projections."""
+    if parts not in (1, 2):
+        raise ValueError("Inkling target projections require one or two head parts")
+    return {(4608, width // parts) for width in (6144, 768, 1024, 48, 32)} | {
+        (6144 // parts, 4608), (4608, 384), (64, 1024)}
 
 
 def compile_draft_bf16_projection(k, n, output="bf16"):
@@ -468,21 +470,29 @@ def minimax_wire_programs(prefill_rows: int):
 
 
 def inkling2_attention_programs(decode_rows: int, prefill_rows: int):
-    """Inkling 2 Small biased-sink GQA attention: local (window 1024 ring) and global (paged) layers."""
+    """Inkling biased-sink GQA, for a whole or half head set."""
+    import dataclasses
     from functools import partial
+    from b12x.integration.cuteafd import INKLING2_SMALL
     from b12x.integration.cuteafd.inkling2_attention import compile_inkling2_attention_aot
 
     result = []
-    for kind in ("local", "global"):
-        for kv_format in (("bf16", "fp8") if kind == "global" else ("bf16",)):
-            for route, rows in (("decode", decode_rows), ("prefill", prefill_rows)):
-                params = dict(kind=kind, route=route, max_rows=rows, kv_format=kv_format)
-                result.append((f"{kind}_attention_{route}_{kv_format}_v2_m{rows}", "attention", params,
-                               partial(compile_inkling2_attention_aot, **params)))
+    for parts in (1, 2):
+        g = dataclasses.replace(INKLING2_SMALL, heads=24, kv_heads=4) if parts == 2 else INKLING2_SMALL
+        suffix = "_tp2" if parts == 2 else ""
+        for kind in ("local", "global"):
+            for kv_format in (("bf16", "fp8") if kind == "global" else ("bf16",)):
+                for route, rows in (("decode", decode_rows), ("prefill", prefill_rows)):
+                    params = dict(kind=kind, route=route, max_rows=rows, kv_format=kv_format)
+                    compiler = partial(compile_inkling2_attention_aot, **params)
+                    if parts == 2:
+                        compiler = partial(compiler, g=g)
+                    result.append((f"{kind}_attention_{route}_{kv_format}_v2_m{rows}{suffix}",
+                                   "attention", params, compiler))
     return result
 
 
-def inkling2_producer_programs(prefill_rows: int):
+def inkling2_producer_programs(prefill_rows: int, parts=1):
     """Predeclared producer stems; never widen another family's program group."""
     from functools import partial
     import torch
@@ -491,39 +501,49 @@ def inkling2_producer_programs(prefill_rows: int):
     from b12x.integration.cuteafd.inkling2_residual import compile_inkling2_residual_aot
     from b12x.integration.cuteafd.inkling2_router import compile_inkling2_router_aot, compile_inkling2_gate_aot
     from b12x.integration.cuteafd.inkling2_glue import compile_inkling2_norm_aot, compile_inkling2_kv_pack_aot
+    if parts not in (1, 2):
+        raise ValueError("Inkling producers require one or two head parts")
     result = []
+    q_heads, kv_heads, kv_width, q_width = 48 // parts, 8 // parts, 1024 // parts, 6144 // parts
     def add(stem, op, compiler, **params):
         params = {**params, "max_rows": prefill_rows}
         serial = {key: str(value).removeprefix("torch.") if isinstance(value, torch.dtype) else value
                   for key, value in params.items()}
         result.append((stem, op, serial, partial(compiler, **params)))
     for dtype, suffix in [(torch.bfloat16, "bf16"), (torch.float32, "f32")]:
-        for width, dynamic in [(4608, False), (1024, False), (1024, True)]:
+        conv = [(kv_width, False), (kv_width, True)]
+        if parts == 1:
+            conv.insert(0, (4608, False))
+        for width, dynamic in conv:
             kind = "dynamic" if dynamic else "static"
             add(f"conv_{kind}_h{width}_{suffix}_v2", "convolution", compile_inkling2_convolution_aot,
-                width=width, heads=8 if dynamic else 1, dynamic=dynamic, dtype=dtype)
+                width=width, heads=kv_heads if dynamic else 1, dynamic=dynamic, dtype=dtype)
+        tp = "_tp2" if parts == 2 else ""
         for local in [True, False]:
-            for name, heads, dim, threshold, scaled in [("q", 48, 128, 128**.5*2, True),
-                    ("k", 8, 128, 128**.5*2, False), ("r", 48, 16, 8., True)]:
+            for name, heads, dim, threshold, scaled in [("q", q_heads, 128, 128**.5*2, True),
+                    ("k", kv_heads, 128, 128**.5*2, False), ("r", q_heads, 16, 8., True)]:
                 if name == "k" and not local:
                     continue
                 kind = "local" if local else "global"
-                add(f"clip_{kind}_{name}_{suffix}", "l2_clip", compile_inkling2_clip_aot,
+                add(f"clip_{kind}_{name}_{suffix}{tp}", "l2_clip", compile_inkling2_clip_aot,
                     heads=heads, dim=dim, threshold=threshold, scaled=scaled, dtype=dtype,
                     log_floor=0 if local else 128000, log_alpha=0. if local else 0.1)
-        add(f"gate_h6144_{suffix}", "gate", compile_inkling2_gate_aot, width=6144, dtype=dtype)
-        add(f"situ_h2304_{suffix}", "situ", compile_inkling2_gate_aot, width=2304, situ=True, dtype=dtype)
-        add(f"norm_h4608_{suffix}", "rms_norm", compile_inkling2_norm_aot, output_dtype=dtype)
-        add(f"norm_v_h8_d128_{suffix}", "rms_norm", compile_inkling2_norm_aot,
-            width=128, heads=8, weighted=False, output_dtype=dtype)
+        add(f"gate_h{q_width}_{suffix}", "gate", compile_inkling2_gate_aot, width=q_width, dtype=dtype)
+        if parts == 1:
+            add(f"situ_h2304_{suffix}", "situ", compile_inkling2_gate_aot, width=2304, situ=True, dtype=dtype)
+            add(f"norm_h4608_{suffix}", "rms_norm", compile_inkling2_norm_aot, output_dtype=dtype)
+        add(f"norm_v_h{kv_heads}_d128_{suffix}", "rms_norm", compile_inkling2_norm_aot,
+            width=128, heads=kv_heads, weighted=False, output_dtype=dtype)
         for kv_format in ("bf16", "fp8"):
-            add(f"kv_pack_{kv_format}_{suffix}_v2", "kv_pack", compile_inkling2_kv_pack_aot,
-                input_dtype=dtype, kv_format=kv_format)
-    for queries in [1, 3]:
-        for addend in [False, True]:
-            add(f"residual_q{queries}_{'add' if addend else 'keep'}", "attn_res",
-                compile_inkling2_residual_aot, queries=queries, addend=addend)
-    add("router_e384_k8", "router", compile_inkling2_router_aot, route_scale=8.)
+            kw = dict(heads=kv_heads) if parts == 2 else {}
+            add(f"kv_pack_{kv_format}_{suffix}_v2{tp}", "kv_pack", compile_inkling2_kv_pack_aot,
+                input_dtype=dtype, kv_format=kv_format, **kw)
+    if parts == 1:
+        for queries in [1, 3]:
+            for addend in [False, True]:
+                add(f"residual_q{queries}_{'add' if addend else 'keep'}", "attn_res",
+                    compile_inkling2_residual_aot, queries=queries, addend=addend)
+        add("router_e384_k8", "router", compile_inkling2_router_aot, route_scale=8.)
     return result
 
 
@@ -2125,7 +2145,8 @@ def main() -> None:
         from b12x.integration.cuteafd import INKLING2_SMALL
         manifest["families"]["inkling2"] = dataclasses.asdict(INKLING2_SMALL)
         work += [("inkling2", *item) for item in inkling2_attention_programs(args.decode_rows, args.prefill_rows)]
-        work += [("inkling2", *item) for item in inkling2_producer_programs(args.prefill_rows)]
+        for parts in (1, 2):
+            work += [("inkling2", *item) for item in inkling2_producer_programs(args.prefill_rows, parts)]
         work += [("inkling2", *item) for item in inkling2_load_programs()]
         from export_b12x_dense_trellis_k6_aot import INKLING_SHAPES, INKLING_TARGET_SHAPES
         existing_fp8 = {suffix for family, suffix, *_ in work if family == "native_attention"}
@@ -2153,7 +2174,7 @@ def main() -> None:
         # Share DraftProjections unchanged. The D16 relative bias projection
         # uses zero-padded K64 inputs/weight columns (the same BF16 values).
         existing = {suffix for family, suffix, *_ in work if family == "draft_bf16"}
-        for k, n in sorted(inkling2_projection_shapes()):
+        for k, n in sorted(inkling2_projection_shapes() | inkling2_projection_shapes(2)):
             suffix = f"k{k}_n{n}_f32"
             if suffix not in existing:
                 work.append(("draft_bf16", suffix, "bf16_projection", {"max_rows": 4096},

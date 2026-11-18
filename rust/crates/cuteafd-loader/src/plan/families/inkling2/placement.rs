@@ -25,9 +25,12 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
     let mut notes = vec![
         "Inkling 2 shared contract: one solve over named physical owners".to_string(),
     ];
-    if gpus != 1 {
-        report.refuse_placement("Inkling multi-GPU serving executor not implemented (#2316)".into(),
-            "Use one coordinator GPU; the shared planner can describe TP2 owners, but serving cannot execute them yet.");
+    if !matches!(gpus, 1 | 2) {
+        report.refuse_placement(format!("Inkling 2 needs one or two coordinator GPUs, not {gpus}"), "Use --rtx 1 or --rtx 2.");
+        return empty(notes);
+    }
+    if report.requested_attention.is_some_and(|mode| mode != AttentionPlacement::Heads) {
+        report.refuse_placement("Inkling 2 only implements heads attention".into(), "Use ATTENTION_PLACEMENT=auto or heads.");
         return empty(notes);
     }
     if opts.host_embedding {
@@ -49,7 +52,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
         Ok(attention) => attention,
         Err(error) => {
             report.refuse_placement(format!("Inkling 2 attention placement refused: {error}"),
-                "Use ATTENTION_PLACEMENT=auto, heads, context or layers on two RTX; one RTX runs heads.");
+                "Use ATTENTION_PLACEMENT=auto or heads.");
             return empty(notes);
         }
     };
@@ -141,7 +144,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
     }).collect::<Vec<_>>().join(" + ");
     let mode_note = match (gpus, attention) {
         (1, _) => "every layer on rtx0",
-        (_, AttentionPlacement::Heads) => "24/4 heads per GPU on every layer; KV pages, window rings and conv lags split by head, residual replicated",
+        (_, AttentionPlacement::Heads) => "24 Q / 4 KV heads per GPU on every layer; KV pages, window rings and K/V FIR split by head; lead owns the residual",
         (_, AttentionPlacement::Context) => "global layers page-parity KV with the shared context exchange, window layers head-split",
         (_, AttentionPlacement::Layers) => "contiguous whole-layer owners (24/24, one boundary hop)",
     };

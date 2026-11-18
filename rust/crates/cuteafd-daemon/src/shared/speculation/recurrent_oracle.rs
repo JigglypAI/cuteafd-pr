@@ -62,7 +62,7 @@ fn installed_inkling_recurrent_forward_matches_real_weight_reference()->Result<(
         library.copy_h2d(rank.buffer("context.taps")?,&features)?;
         let bank=ContextBank{state:std::cell::RefCell::new(ContextState::new(1,2048,4096,rows as u64)?)};
         bank.state.borrow_mut().reset(0,0)?;
-        bank.append(&rank,0,0,rank.buffer("context.taps")?,rows)?;
+        bank.append_ranked(&rank,None,0,0,rank.buffer("context.taps")?,rows)?;
         let sequence=[DraftSeq{slot:0,position:rows,anchor:101,valid_from:0}];
         let pages=bank.state.borrow().pages(&sequence)?;
         library.copy_h2d(rank.buffer("step.ids")?,&101u32.to_le_bytes())?;

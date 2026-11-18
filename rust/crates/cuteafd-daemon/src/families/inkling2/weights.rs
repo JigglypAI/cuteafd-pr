@@ -5,7 +5,7 @@ use crate::shared::{dense_trellis::{CoreWeightLayout, CoreWeights},
     memory::{device::{Allocation, Device}, receipts::Inventory, weight_arena::DeviceWeightArena}};
 use anyhow::{ensure, Context, Result};
 use cuteafd_core::memory_layout::ArenaTag;
-use cuteafd_loader::{families::inkling2::weight_layout::{fp8_role, projection_prefix, CoordinatorWeights}, plan::Checkpoint,
+use cuteafd_loader::{families::inkling2::weight_layout::{fp8_role, projection_prefix, CoordinatorWeights, NativeSource}, plan::Checkpoint,
     serving_capacity::WeightArenaLayout};
 use std::collections::BTreeMap;
 
@@ -35,32 +35,35 @@ pub(crate) enum ProjectionWeight<'s, 'a> {
 /// Unpublished target delivery; the only consumer requires the shared Spark
 /// validation barrier and whole-group committed receive before returning views.
 pub(crate) struct PendingTarget<'a> {
-    target: TargetWeights<'a>,
-    draft: Option<crate::shared::speculation::recurrent_weights::Weights<'a>>,
+    targets: Vec<TargetWeights<'a>>,
+    draft: Vec<crate::shared::speculation::recurrent_weights::Weights<'a>>,
     push: crate::shared::experts::rtx::push::CoordinatorPush,
     dense: (Vec<crate::shared::experts::rtx::push::DensePlan>, Vec<crate::shared::experts::rtx::dense::DenseArena<'a>>),
-    device: Device<'a>,
+    devices: Vec<Device<'a>>,
     sparks: usize,
     media: crate::shared::vision::push::Contribution,
 }
 
 impl<'a> PendingTarget<'a> {
-    pub fn prepare(device: Device<'a>, view: &cuteafd_loader::plan::checkpoint::CheckpointView,
+    pub fn prepare(devices: Vec<Device<'a>>, view: &cuteafd_loader::plan::checkpoint::CheckpointView,
         checkpoint: &Checkpoint, catalog: &cuteafd_loader::OfficialV41Catalog,
         inputs: &cuteafd_loader::placement::families::inkling2::InklingInputs,
         admitted: &cuteafd_loader::placement::families::inkling2::AdmittedInkling,
         media: crate::shared::vision::push::Contribution)
         -> Result<(Self, (Vec<std::net::TcpStream>, crate::shared::memory::push_exl3::CoordinatorRanks))> {
         use crate::shared::experts::{layer::ExpertLayer, rtx::push::{CoordinatorExperts, CoordinatorPush, PushPolicy, WholeOwner}};
-        ensure!(inputs.gpus == 1 && inputs.spark_ranks > 0 && checkpoint.snapshot == view.snapshot()
-            && PushPolicy::for_snapshot(view.snapshot())? == PushPolicy::Required,
-            "Inkling target transaction requires admitted whole-rank SparkNest push");
-        let target_layout = inputs.targets.first().context("Inkling target layout absent")?.execution_arena()?;
-        let planned = admitted.solved.facts.allocations.iter().find(|owner| owner.id == target_layout.id())
-            .context("Inkling target arena absent from solved admission")?;
-        ensure!(planned.bytes == target_layout.bytes() as u64
-            && planned.location == cuteafd_loader::placement::planner::Location::coordinator(0),
-            "Inkling target backing differs from solved admission");
+        ensure!(devices.len() == inputs.gpus && inputs.targets.len() == inputs.gpus && inputs.spark_ranks > 0
+            && checkpoint.snapshot == view.snapshot() && PushPolicy::for_snapshot(view.snapshot())? == PushPolicy::Required,
+            "Inkling target transaction requires admitted SparkNest push ranks");
+        let check = |rank: usize, layout: &WeightArenaLayout| -> Result<()> {
+            let planned = admitted.solved.facts.allocations.iter().find(|owner| owner.id == layout.id())
+                .context("Inkling target or drafter arena absent from solved admission")?;
+            ensure!(planned.bytes == layout.bytes() as u64
+                && planned.location == cuteafd_loader::placement::planner::Location::coordinator(rank as u8),
+                "Inkling weight backing differs from solved admission: {}", layout.id());
+            Ok(())
+        };
+        for (rank, target) in inputs.targets.iter().enumerate() { check(rank, &target.execution_arena()?)?; }
         let envelope = inputs.push_host.get(admitted.onboard).and_then(Option::as_ref)
             .context("Inkling target transaction has no admitted push host owners")?.clone();
         let backings = match &inputs.local {
@@ -69,43 +72,58 @@ impl<'a> PendingTarget<'a> {
             _ if admitted.onboard == 0 => &[],
             _ => anyhow::bail!("Inkling selected local expert backend missing"),
         };
-        let sets = backings.iter().map(|backing| CoordinatorExperts::Whole { owners: vec![WholeOwner {
-            rank: 0, budget: backing.arena.bytes(), selections: backing.layers.iter().map(|&layer|
-                ExpertLayer::BackboneFull { layer }).collect(),
-        }] }).collect::<Vec<_>>();
+        let sets = local_groups(backings, inputs.gpus)?.into_iter().map(|group| {
+            if inputs.gpus == 2 {
+                CoordinatorExperts::Tp2 { layers: group[0].layers.clone(),
+                    budgets: group.iter().map(|owner| owner.arena.bytes()).collect() }
+            } else {
+                CoordinatorExperts::Whole { owners: vec![WholeOwner { rank: 0, budget: group[0].arena.bytes(),
+                    selections: group[0].layers.iter().map(|&layer| ExpertLayer::BackboneFull { layer }).collect() }] }
+            }
+        }).collect::<Vec<_>>();
         let experts = (!sets.is_empty()).then_some(CoordinatorExperts::Sets(sets));
-        let ((target, draft), mut records) = crate::shared::experts::rtx::dense::recording(|| {
-            let target = TargetWeights::record_push(device, checkpoint, &inputs.targets[0])?;
-            let draft = inputs.drafter.as_ref().map(|draft| {
-                let layout = draft.layout.weights.first().context("admitted drafter rank absent")?;
-                let planned = admitted.solved.facts.allocations.iter().find(|owner|owner.id==layout.arena.id())
-                    .context("drafter weight arena absent from solved admission")?;
-                ensure!(planned.bytes==layout.arena.bytes() as u64
-                    && planned.location==cuteafd_loader::placement::planner::Location::coordinator(0),
-                    "drafter backing differs from pre-allocation admission");
+        let ((targets, draft), mut records) = crate::shared::experts::rtx::dense::recording(|| {
+            let targets = devices.iter().zip(&inputs.targets).map(|(&device, layout)|
+                TargetWeights::record_push(device, checkpoint, layout)).collect::<Result<Vec<_>>>()?;
+            let draft = if let Some(draft) = &inputs.drafter {
+                ensure!(draft.layout.weights.len() == devices.len(), "Inkling admitted drafter ranks differ");
                 let source = cuteafd_loader::formats::block_dspark::recurrent::loading::RecurrentSource::open(view)?;
-                crate::shared::speculation::recurrent_weights::Weights::load(device,&source,layout.clone(),std::ptr::null_mut())
-            }).transpose()?;
-            Ok((target,draft))
+                devices.iter().zip(&draft.layout.weights).enumerate().map(|(rank, (&device, layout))| {
+                    check(rank, &layout.arena)?;
+                    crate::shared::speculation::recurrent_weights::Weights::load(device, &source, layout.clone(), std::ptr::null_mut())
+                }).collect::<Result<Vec<_>>>()?
+            } else { Vec::new() };
+            Ok((targets, draft))
         })?;
         records.extend(media.records());
-        let dense = crate::shared::experts::rtx::dense::plan_records(view.snapshot(), records, &[device], inputs.spark_ranks)?;
-        let (push, streams, ranks) = CoordinatorPush::prepare_view_admitted(view, Some(catalog), 1, experts, envelope)?;
-        Ok((Self { target, draft, push, dense, device, sparks: inputs.spark_ranks, media }, (streams, ranks)))
+        let dense = crate::shared::experts::rtx::dense::plan_records(view.snapshot(), records, &devices, inputs.spark_ranks)?;
+        let (push, streams, ranks) = CoordinatorPush::prepare_view_admitted(view, Some(catalog), inputs.gpus, experts, envelope)?;
+        Ok((Self { targets, draft, push, dense, devices, sparks: inputs.spark_ranks, media }, (streams, ranks)))
     }
+
     pub fn finish(self, catalog: &cuteafd_loader::OfficialV41Catalog,
         pending: crate::shared::placement::PendingSparkAdmission)
-        -> Result<(TargetWeights<'a>, Vec<Vec<crate::shared::experts::rtx::push::PushedExperts<'a>>>,
-            Option<crate::shared::speculation::recurrent_weights::Weights<'a>>)> {
-        let Self { target, draft, push, dense, device, sparks, media } = self;
+        -> Result<(Vec<TargetWeights<'a>>, Vec<Vec<crate::shared::experts::rtx::push::PushedExperts<'a>>>,
+            Vec<crate::shared::speculation::recurrent_weights::Weights<'a>>)> {
+        let Self { targets, draft, push, dense, devices, sparks, media } = self;
         crate::shared::placement::load_while_admitting(Some(pending), || {
-            let (received, ()) = push.receive_sets_with(vec![device], Some(catalog), sparks, Some(Ok(dense)), || ());
+            let (received, ()) = push.receive_sets_with(devices, Some(catalog), sparks, Some(Ok(dense)), || ());
             let experts = crate::shared::experts::rtx::push::PushPolicy::Required.committed(received)?
                 .context("Inkling target push group did not commit")?;
             media.commit()?;
-            Ok((target, experts, draft))
+            Ok((targets, experts, draft))
         })
     }
+}
+
+pub(crate) fn local_groups(backings: &[cuteafd_loader::placement::families::inkling2::LocalBacking], gpus: usize)
+    -> Result<Vec<&[cuteafd_loader::placement::families::inkling2::LocalBacking]>> {
+    ensure!(matches!(gpus, 1 | 2) && backings.len().is_multiple_of(gpus), "Inkling expert backing rank count differs");
+    backings.chunks_exact(gpus).map(|group| {
+        ensure!(!group[0].layers.is_empty() && group.iter().enumerate().all(|(rank, owner)|
+            owner.gpu == rank && owner.layers == group[0].layers), "Inkling grouped expert backing differs from rank assignment");
+        Ok(group)
+    }).collect()
 }
 
 pub(crate) fn execution_arena(layout: &CoordinatorWeights) -> Result<WeightArenaLayout> {
@@ -124,28 +142,32 @@ fn transpose_relative(source: &[u8]) -> Result<Vec<u8>> {
     Ok(output)
 }
 
+fn native_rect(checkpoint: &Checkpoint, view: &str, rank: usize) -> Result<(String, Rect)> {
+    let source = NativeSource::new(checkpoint, view, rank)?;
+    let rect = Rect::tensor(checkpoint, source.name, Some(source.rows), Some(source.columns))?;
+    Ok((source.name.to_owned(), rect))
+}
+
 impl<'a> TargetWeights<'a> {
     pub fn load(device: Device<'a>, checkpoint: &Checkpoint, layout: &CoordinatorWeights) -> Result<Self> {
-        ensure!(layout.rank == 0 && layout.arena.views().keys().all(|name| !name.contains('#')),
-            "Inkling stage2 core mount requires whole coordinator operands");
         ensure!(!crate::shared::experts::rtx::dense::is_recording(),
             "Inkling relative transpose is a cold mount transform, not yet a push finish");
         let mut rects = BTreeMap::new();
         for (name, view) in layout.arena.views() {
             if layout.is_specialized_view(name) { continue; }
-            let rect = Rect::tensor(checkpoint, name, None, None)?;
+            let (operand, rect) = native_rect(checkpoint, name, layout.rank)?;
             ensure!(rect.bytes() == view.bytes(), "Inkling core {name}: checkpoint differs from admitted view");
-            rects.insert(name.clone(), rect);
+            rects.insert(name.clone(), (operand, rect));
         }
         let dense = DenseLoad::mount(device.library);
         dense.admit_mount(layout.mount_load(checkpoint)?)?;
         let arena = DeviceWeightArena::new(device, execution_arena(layout)?, ArenaTag::weights("inkling2/target"))?;
         let mut operands = BTreeMap::new();
-        for (name, rect) in rects {
+        for (name, (operand, rect)) in rects {
             let bytes = rect.bytes();
             let allocation = arena.view(&name, bytes)?;
             dense.operand(Operand { device: device.id, buffer: allocation.buffer, lands: vec![(rect, 0)], bytes })?;
-            operands.insert(name, allocation);
+            operands.insert(operand, allocation);
         }
         let (core, fp8) = load_specialized(device, checkpoint, layout, &arena, &dense)?;
         dense.release();
@@ -168,18 +190,16 @@ impl<'a> TargetWeights<'a> {
     pub fn record_push(device: Device<'a>, checkpoint: &Checkpoint, layout: &CoordinatorWeights) -> Result<Self> {
         use crate::shared::experts::rtx::dense::Finish;
         ensure!(crate::shared::experts::rtx::dense::is_recording(), "Inkling push weights require shared delivery recording");
-        ensure!(layout.rank == 0 && layout.arena.views().keys().all(|name| !name.contains('#')),
-            "Inkling whole-rank push requires unsplit coordinator operands");
         let dense = DenseLoad::mount(device.library);
         let arena = DeviceWeightArena::new(device, layout.execution_arena()?, ArenaTag::weights("inkling2/target"))?;
         let mut operands = BTreeMap::new();
         for (name, view) in layout.arena.views() {
             if layout.is_specialized_view(name) { continue; }
-            let rect = Rect::tensor(checkpoint, name, None, None)?;
+            let (operand, rect) = native_rect(checkpoint, name, layout.rank)?;
             ensure!(rect.bytes() == view.bytes(), "Inkling push header differs from admitted view {name}");
             let owner = arena.view(name, view.bytes())?;
             dense.operand(Operand { device: device.id, buffer: owner.buffer, lands: vec![(rect, 0)], bytes: view.bytes() })?;
-            operands.insert(name.clone(), owner);
+            operands.insert(operand, owner);
         }
         for &layer in &layout.layers {
             let prefix = format!("model.llm.layers.{layer}.attn.rel_logits_proj");

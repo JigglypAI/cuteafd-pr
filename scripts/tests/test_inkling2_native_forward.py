@@ -81,7 +81,10 @@ def test_arenas_are_single_backings_and_head_is_shared():
     assert 'PushPolicy::Required.committed(received)' in weights
     assert 'load_while_admitting(Some(pending)' in weights
     assert 'dense.operand(' in push and 'dense.finish(' in push
-    assert 'Rect::tensor(' in push
+    assert 'native_rect(checkpoint, name, layout.rank)?' in push
+    rectangle = weights.split('fn native_rect(')[1].split("impl<'a> TargetWeights")[0]
+    assert 'NativeSource::new(checkpoint, view, rank)?' in rectangle
+    assert 'Rect::tensor(checkpoint, source.name, Some(source.rows), Some(source.columns))?' in rectangle
     assert 'transpose_relative(' not in push and '.read(' not in push and 'copy_h2d(' not in push
     assert 'transpose_relative' in weights
     assert 'padding_zero_exact = true' in weights

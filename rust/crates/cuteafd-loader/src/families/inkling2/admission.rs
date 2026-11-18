@@ -91,6 +91,10 @@ pub fn local_package(catalog: &crate::OfficialV41Catalog, manifest: Option<&Path
     let workspace = || -> anyhow::Result<LocalPackage> {
         anyhow::ensure!((1..=2).contains(&gpus), "Inkling local package requires one or two ranks");
         let routed = catalog.routed_experts();
+        let tp2_rows = |wire, partial| {
+            (gpus == 2).then(|| crate::serving_capacity::OwnerTp2Rows::with_partial(
+                routed.hidden as u64, routed.topk as u64, rows, wire, partial)).transpose()
+        };
         let layers = (routed.first_layer..routed.layers).collect::<Vec<_>>();
         let exl3_requests = if catalog.exl3().is_some() { Some(crate::placement::rtx_onboard::expert_workspace_requests(
             catalog, manifest, rows, gpus, "inkling2")?) } else { None };
@@ -127,7 +131,8 @@ pub fn local_package(catalog: &crate::OfficialV41Catalog, manifest: Option<&Path
                         let id = crate::serving_capacity::expert_weight_arena_id("fp8", gpu as i32, &regions)?;
                         owners.push(crate::placement::families::inkling2::LocalBacking { gpu,
                             layers: group_layers.clone(), arena: crate::serving_capacity::WeightArenaLayout::new(id, regions)?,
-                            workspace: vec![("scratch".into(), scratch as u64), ("output".into(), output as u64)] });
+                            workspace: vec![("scratch".into(), scratch as u64), ("output".into(), output as u64)],
+                            tp2_rows: tp2_rows(view.format() == crate::formats::fp8_experts::ExpertFormat::Mxfp8, 2)? });
                     }
                 }
             } else {
@@ -139,7 +144,7 @@ pub fn local_package(catalog: &crate::OfficialV41Catalog, manifest: Option<&Path
                     let workspace = requests.iter().enumerate().map(|(index, &bytes)|
                         (if index == last { "output".into() } else { format!("scratch.{index}") }, bytes)).collect();
                     owners.push(crate::placement::families::inkling2::LocalBacking { gpu, layers: selected.to_vec(),
-                        arena: crate::serving_capacity::WeightArenaLayout::new(id, regions)?, workspace });
+                        arena: crate::serving_capacity::WeightArenaLayout::new(id, regions)?, workspace, tp2_rows: tp2_rows(true, 4)? });
                 }
             }
             backings.push(owners);
@@ -234,7 +239,8 @@ impl SelectedWeights {
         let modes = shared::layer_modes(cfg, gpus, placement);
         let targets = CoordinatorWeights::plan(checkpoint, cfg, gpus, &modes)?;
         let drafter = draft.then(|| super::draft::DraftLayout::select_weights(
-            checkpoint.view.as_ref().context("bundled drafter needs selected checkpoint view")?, gpus)).transpose()?;
+            checkpoint.view.as_ref().context("bundled drafter needs selected checkpoint view")?, gpus,
+            InklingInputs::head_rank(gpus, &modes))).transpose()?;
         Ok(Self { modes, targets, drafter })
     }
 
@@ -325,7 +331,8 @@ pub fn gather_with_weights(request: &FactsRequest<'_>, weights: SelectedWeights)
     let spark = spark_charges(&catalog, &experts, &routed, ranks, shape, ingress)
         .map_err(|error| refused(format!("Inkling 2 Spark inventory refused: {error:#}"),
             "Use a Spark world of 2..=8 ranks."))?;
-    let links = shared::spark_link((gpus - 1) as u8, ranks, shape, request.replies, ingress)
+    let head = InklingInputs::head_rank(gpus, &modes);
+    let links = shared::spark_link(head as u8, ranks, shape, request.replies, ingress)
         .map_err(|error| refused(format!("Inkling 2 Spark transport owners refused: {error}"), "Use a supported unit."))?;
     let mut code = Vec::new();
     let mut graph_reserve = Vec::new();
@@ -337,9 +344,10 @@ pub fn gather_with_weights(request: &FactsRequest<'_>, weights: SelectedWeights)
             // The measured sample follows module loading: only what it has not seen.
             Coordinator::Measured { loaded_code, .. } => loaded_code.get(gpu).copied().unwrap_or(0),
         });
-        // No traced Inkling 2 prewarm layout yet: base zero, the shared runtime
-        // headroom is the whole canonical reserve (graph-cache stage 4).
-        graph_reserve.push(crate::placement::graph_reserve::current(gpu, false, 0, 0)
+        // Initial TP2 reserve for the bounded private decode epilogues. No
+        // graph ever captures the peer exchange or paged attention state.
+        let base = if gpus == 2 && placement == crate::placement::AttentionPlacement::Heads { 256 << 20 } else { 0 };
+        graph_reserve.push(crate::placement::graph_reserve::current(gpu, false, base, 0)
             .map_err(|error| refused(format!("Inkling 2 graph reserve refused: {error}"), "Fix GPU_GRAPH_RESERVE."))?.bytes);
     }
     let mut budgets = (0..gpus).map(|gpu| request.coordinator.budget(gpu)).collect::<Vec<_>>();
@@ -350,13 +358,17 @@ pub fn gather_with_weights(request: &FactsRequest<'_>, weights: SelectedWeights)
         else { shared::PAGE_ROWS };
     // Host prefix pages hold the global layers' K/V; marks hold the rings and
     // conv lags of every layer (byte-identical restores).
-    let kv_row = (cfg.kv_heads * cfg.head_dim * 2) as u64;
-    let page_bytes = shared::PAGE_ROWS * 2 * kv_row * cfg.global_layers().len() as u64;
-    let mark_bytes = (0..cfg.layers).map(|layer| shared::SequenceState::new(cfg, cfg.local[layer])
-        .map(|state| state.ring_bytes + state.lag_bytes)).sum::<Result<u64, _>>()
+    let page_bytes = shared::PAGE_ROWS * request.kv_format.record_bytes(cfg.kv_heads, cfg.head_dim) as u64
+        * cfg.global_layers().len() as u64;
+    let mark_bytes = modes.iter().enumerate().map(|(layer, mode)| {
+        let parts = if matches!(mode, crate::placement::LayerMode::Whole { .. }) { 1 } else { 2 };
+        super::execution::SequenceLayout::new(cfg, cfg.local[layer], parts)
+            .map(|layout| (layout.bytes * parts) as u64)
+    }).sum::<anyhow::Result<u64>>()
         .map_err(|error| refused(format!("Inkling 2 sequence state refused: {error}"), "Check the window geometry."))?;
     let draft_mark = request.drafter.zip(drafter.as_ref()).map(|(selection, (config, _, _))|
-        config.window_mark_bytes(selection.kv_cache,gpus-1,gpus,gpus-1)).transpose().map_err(|error|refused(format!("drafter mark inventory refused: {error:#}"),"Check bundled MTP config."))?.unwrap_or(0) as u64;
+        (0..gpus).map(|rank| config.window_mark_bytes(selection.kv_cache, rank, gpus, head))
+            .sum::<anyhow::Result<usize>>()).transpose().map_err(|error|refused(format!("drafter mark inventory refused: {error:#}"),"Check bundled MTP config."))?.unwrap_or(0) as u64;
     let host_prefix = if request.host_cache_bytes == Some(0) || request.prefix_entries == 0 {
         serving::HostPrefixOwners { quota_bytes: 0, chunk_bytes: 0 }
     } else {

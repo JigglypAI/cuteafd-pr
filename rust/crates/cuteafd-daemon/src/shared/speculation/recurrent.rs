@@ -16,8 +16,31 @@ impl<'a> Drafter<'a> {
         ensure!(lead.layout.rank.ranks==1,"whole recurrent constructor requires one rank");
         Ok(Self{lead,split:None,context,live:Cell::new(true)})
     }
-    pub fn reset_context(&self,slot:usize,origin:usize)->Result<()> {
+    pub fn pair(lead:Rank<'a>,peer:Rank<'a>,context:ContextBank)->Result<Self>{
+        use crate::shared::{memory::Tag,peer_split::{PeerExchange,RankDevice}};
+        ensure!(lead.layout.rank.ranks==2 && lead.layout.rank.rank==0 && lead.layout.rank.lead==0
+            && peer.layout.rank.ranks==2 && peer.layout.rank.rank==1 && peer.layout.rank.lead==0,
+            "recurrent TP2 needs lead rank 0 and peer rank 1");
+        let streams=[&lead.stream,&peer.stream];
+        let endpoints=streams.map(|s|RankDevice{device:s.device.id,stream:s.raw});
+        let bytes=lead.buffer("step.partial")?.bytes;
+        let exchange=Rc::new(lead.stream.device.run(||PeerExchange::new_abortable(
+            lead.stream.device.library,endpoints,1,bytes,bytes))?);
+        let device=peer.stream.device;
+        let split=GqaHeadSplit::new(device.own(||Ok(Box::new(peer)))?,exchange,0,bytes,
+            [Tag::drafter_workspace("recurrent/tp2-reduce");2])?;
+        Ok(Self{lead,split:Some(split),context,live:Cell::new(true)})
+    }
+    pub fn drain(&self)->Result<()> {
         self.lead.stream.drain()?;
+        if let Some(split)=&self.split{split.peer.stream.drain()?;}
+        Ok(())
+    }
+    pub fn append_context(&self,slot:usize,start:usize,features:Buffer,rows:usize)->Result<()> {
+        self.context.append_ranked(&self.lead,self.split.as_ref(),slot,start,features,rows)
+    }
+    pub fn reset_context(&self,slot:usize,origin:usize)->Result<()> {
+        self.drain()?;
         self.context.state.borrow_mut().reset(slot,origin)
     }
     pub fn frontier(&self,slot:usize)->Result<(usize,usize)>{
@@ -54,8 +77,15 @@ impl<'a> Drafter<'a> {
             let tokens=bytes.chunks_exact(4).map(|v|u32::from_le_bytes(v.try_into().unwrap())).collect::<Vec<_>>();
             Ok(tokens.chunks_exact(self.lead.config.predictions()).map(|tokens|Draft{tokens:tokens.to_vec(),features:vec![],confidence:vec![]}).collect())
         })();
-        if result.is_err(){self.live.set(false);self.lead.stream.drain_or_abort("recurrent drafter failed step");
-            if let Some(split)=&self.split{split.peer.stream.drain_or_abort("recurrent drafter failed peer step");}}
+        if result.is_err(){
+            self.live.set(false);
+            if let Some(split)=&self.split {
+                let drained=(||{split.exchange.publish_abort()?;split.exchange.drain_compute()})();
+                split.exchange.finish_terminal(drained.is_ok());
+                crate::shared::decode_graph::fatal_drain(drained,"recurrent drafter failed peer step");
+            }
+            self.lead.stream.drain_or_abort("recurrent drafter failed step");
+        }
         result
     }
 }

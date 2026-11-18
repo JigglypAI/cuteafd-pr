@@ -134,21 +134,26 @@ fn layout_reuses_one_immutable_catalog_across_candidates() -> anyhow::Result<()>
 }
 
 #[test]
-fn serving_refuses_missing_multi_gpu_executor_with_or_without_drafter() {
-    let (dir, _, _) = fixture(Fixture::Mxfp8);
-    for (gpus, draft, expected) in [(2, false, "multi-GPU serving executor not implemented (#2316)"),
-        (2, true, "multi-GPU serving executor not implemented (#2316)")] {
+fn serving_pair_selects_heads_and_refuses_unimplemented_attention() {
+    use crate::placement::AttentionPlacement;
+    let (dir, _, _) = fixture_with_experts(Fixture::Mxfp8, 384, 8);
+    for requested in [None, Some(AttentionPlacement::Heads), Some(AttentionPlacement::Context), Some(AttentionPlacement::Layers)] {
         let report = plan::plan(dir.path(), &PlanOptions {
             placement: plan::ExpertPlacement::from_spark_ranks(4),
-            draft_ownership: Some(if draft { crate::plan::spec::DraftOwnership::NativeMtp }
-                else { crate::plan::spec::DraftOwnership::None }),
+            attention_placement: requested,
+            draft_ownership: Some(crate::plan::spec::DraftOwnership::None),
             vision: plan::MediaMode::Off, audio: plan::MediaMode::Off,
-            layout: Some(plan::layout::LayoutOptions { rtx_bytes: vec![96 << 30; gpus],
-                native_mtp_layers: usize::from(draft), ..Default::default() }), ..Default::default()
+            layout: Some(plan::layout::LayoutOptions { rtx_bytes: vec![96 << 30; 2], ..Default::default() }),
+            ..Default::default()
         }).unwrap();
         assert_eq!(report.runtime, Some(RuntimeStatus::Serving));
-        assert!(!report.executable());
-        assert!(report.hints.iter().any(|hint| hint.what.contains(expected)), "{:?}", report.hints);
+        if matches!(requested, None | Some(AttentionPlacement::Heads)) {
+            assert!(report.executable(), "{:?}", report.hints);
+            assert_eq!(report.attention_placement, AttentionPlacement::Heads);
+        } else {
+            assert!(!report.executable());
+            assert!(report.hints.iter().any(|hint| hint.what.contains("only implements heads")), "{:?}", report.hints);
+        }
     }
 }
 
@@ -662,7 +667,8 @@ fn shared_recipe_charges_every_owner_once_on_one_and_two_rtx() {
                     &layers, gpus, gpu, crate::formats::fp8_experts::Slicing::Blocks(128)).unwrap();
                 let id = crate::serving_capacity::expert_weight_arena_id("fp8", gpu as i32, &regions).unwrap();
                 shared::LocalBacking { gpu, layers, arena: crate::serving_capacity::WeightArenaLayout::new(id, regions).unwrap(),
-                    workspace: vec![("scratch".into(), (64 << 20) - 1024*4608*2), ("output".into(), 1024*4608*2)] }
+                    workspace: vec![("scratch".into(), (64 << 20) - 1024*4608*2), ("output".into(), 1024*4608*2)],
+                    tp2_rows: None }
             }).collect()
         }).collect() };
         let inputs = InklingInputs { cfg: cfg.clone(), kv_format: crate::families::inkling2::InklingKvCache::Bf16, gpus, spark_ranks: ranks, context: Context::automatic(1 << 20),
@@ -724,7 +730,9 @@ fn shared_recipe_charges_every_owner_once_on_one_and_two_rtx() {
         for gpu in 0..gpus {
             for (prefix, rows) in std::iter::once((format!("inkling2.decode.{gpu}"), 64usize))
                 .chain((0..prefill.waves).map(|slot| (format!("inkling2.unit.{gpu}.{slot}"), prefill.rows as usize))) {
-                let expected = crate::families::inkling2::execution::UnitLayout::serving_format(&cfg, rows, 1 << 20, inputs.kv_format, inputs.sequences as usize).unwrap();
+                let parts = if gpus == 2 && placement == AttentionPlacement::Heads { 2 } else { 1 };
+                let expected = crate::families::inkling2::execution::UnitLayout::serving_head_parts(
+                    &cfg, rows, 1 << 20, inputs.kv_format, inputs.sequences as usize, parts).unwrap();
                 let actual = contract.components.iter().filter_map(|component| match &component.kind {
                     ComponentKind::Allocation { template, .. } if template.location == Location::coordinator(gpu as u8) => template.id.strip_prefix(&format!("{prefix}."))
                         .filter(|name| *name != "uploads")
@@ -865,6 +873,43 @@ fn shared_recipe_charges_every_owner_once_on_one_and_two_rtx() {
             assert_eq!(admitted.placement.peer_row_bytes > 0, placement == AttentionPlacement::Context);
         }
     }
+}
+
+#[test]
+fn head_split_native_sources_select_disjoint_rows_and_columns() -> anyhow::Result<()> {
+    use crate::families::inkling2::weight_layout::{CoordinatorWeights, NativeSource};
+    use crate::placement::{families::inkling2::layer_modes, AttentionPlacement};
+    let (dir, config, _) = fixture(Fixture::Exl3);
+    let checkpoint = Checkpoint::open(dir.path())?;
+    let cfg = Inkling2Config::from_hf(&config)?;
+    let targets = CoordinatorWeights::plan(&checkpoint, &cfg, 2, &layer_modes(&cfg, 2, AttentionPlacement::Heads))?;
+    for (name, rows, row_bytes, column_split) in [
+        ("model.llm.layers.0.attn.wq_du.weight", 6144, 4608 * 2, false),
+        ("model.llm.layers.0.attn.wo_ud.weight", 4608, 6144 * 2, true),
+        ("model.llm.layers.3.attn.k_sconv.static_w", 4, 1024 * 2, true),
+        ("model.llm.layers.0.attn.v_sconv.weight", 1024, 4 * 2, false),
+        ("model.llm.layers.3.attn.v_sconv.weight_proj", 32, 4608 * 2, false),
+    ] {
+        for (rank, target) in targets.iter().enumerate() {
+            let view = format!("{name}#rank{rank}");
+            let source = NativeSource::new(&checkpoint, &view, rank)?;
+            assert_eq!(source.name, name);
+            assert_eq!(source.row_bytes, row_bytes);
+            let half = if column_split { row_bytes } else { rows } / 2;
+            let expected = rank * half..(rank + 1) * half;
+            if column_split {
+                assert_eq!(source.rows, 0..rows);
+                assert_eq!(source.columns, expected);
+            } else {
+                assert_eq!(source.rows, expected);
+                assert_eq!(source.columns, 0..row_bytes);
+            }
+            assert_eq!(target.arena.view(&view).unwrap().bytes(), rows * row_bytes / 2);
+            assert!(NativeSource::new(&checkpoint, &view, 1 - rank).is_err());
+        }
+    }
+    assert!(targets[0].mount_load(&checkpoint)?.full_row_cache > 0);
+    Ok(())
 }
 
 #[test]

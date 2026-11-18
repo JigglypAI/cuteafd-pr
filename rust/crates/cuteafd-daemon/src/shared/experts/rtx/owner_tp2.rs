@@ -146,6 +146,15 @@ impl<'a> OwnerTp2<'a> {
         Ok(())
     }
 
+    pub(crate) fn transport_buffers(&self) -> Vec<(usize, String, cuteafd_ffi::CuteafdDeviceBuffer)> {
+        let mut buffers = self.exchange.allocation_buffers();
+        for rank in 0..2 {
+            buffers.push((rank, "send".into(), self.send[rank].buffer));
+            buffers.push((rank, "reduced".into(), self.reduced[rank].buffer));
+        }
+        buffers
+    }
+
     fn input(&self, ptr: *mut c_void) -> crate::shared::experts::rtx::ExpertInput {
         if self.wire { crate::shared::experts::rtx::ExpertInput::Fp8K32(ptr) }
         else { crate::shared::experts::rtx::ExpertInput::Bf16(ptr) }
