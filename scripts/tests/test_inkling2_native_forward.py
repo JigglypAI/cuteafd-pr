@@ -18,6 +18,7 @@ def test_native_golden_uses_shared_executor_and_native_expert_dispatch():
     golden = (FAMILY/'golden.rs').read_text()
     assert 'super::prefill::layer(' in golden
     assert 'Mxfp8::load(' in golden
+    assert golden.index('set_expert_geometry(geometry)') < golden.index('experts::exl3::regions(')
     assert 'rms<=0.02 && cosine>=0.999' in golden
     assert '(nll-reference_nll).abs() <= 0.03' in golden
     assert 'python' not in golden.lower()

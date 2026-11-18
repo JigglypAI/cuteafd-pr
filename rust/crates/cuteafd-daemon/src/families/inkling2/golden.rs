@@ -140,6 +140,7 @@ fn run(mut args: GoldenArgs) -> Result<()> {
     let metadata = if catalog.exl3().is_none() { Some(unsafe { Fp8MoeMetadata::read(&package)? }) } else { None };
     let selection = RtxSelectionPolicy::CanonicalDecode;
     let geometry = cuteafd_core::ExpertGeometry::INKLING2;
+    cuteafd_core::set_expert_geometry(geometry).map_err(|previous| anyhow::anyhow!("Inkling golden requires isolated expert geometry: {previous:?}"))?;
     let expert_layouts = (0..=args.last_layer).map(|index| {
         if let Some(metadata) = &metadata {
             let layout = Mxfp8Layout::plan(&checkpoint, &cfg, index)?;
@@ -165,7 +166,6 @@ fn run(mut args: GoldenArgs) -> Result<()> {
     let device = Device { library: &library, id: args.device };
     let programs = device.run(|| Ok(library.programs()?.with_manifest(&args.manifest)?))?;
     let mut kernels = device.run(|| Kernels::bind(&programs, args.kv_format))?;
-    cuteafd_core::set_expert_geometry(geometry).map_err(|previous| anyhow::anyhow!("Inkling golden requires isolated expert geometry: {previous:?}"))?;
     // Load expert code before taking the pre-weight CUDA sample.
     let _expert_code = if metadata.is_some() {
         // SAFETY: trusted generated package on the retained current device.
