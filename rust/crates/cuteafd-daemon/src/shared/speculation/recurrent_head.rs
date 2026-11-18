@@ -16,36 +16,47 @@ fn part(buffer:Buffer,offset:usize,bytes:usize)->Result<Buffer> {
 impl Rank<'_> {
     /// Called once after all push records commit and before readiness.
     pub fn fold_head(&self,target_head:Buffer)->Result<()> {
+        let n=self.config.padded_vocab;
+        let h=self.config.transformer.hidden;
+        ensure!(target_head.bytes==n*h*2,"recurrent fold requires native borrowed target head");
+        for first in (0..n).step_by(4096) {
+            let rows=4096.min(n-first);
+            self.fold_bf16_rows(part(target_head,first*h*2,rows*h*2)?,first,rows)?;
+        }
+        Ok(())
+    }
+
+    pub fn fold_bf16_rows(&self, weights:Buffer, first:usize, rows:usize)->Result<()> {
         let c=&self.config.transformer;
+        ensure!(first+rows <= self.config.padded_vocab,"recurrent folded target slice out of bounds");
         let head=self.weights.tensors.head.as_ref().context("peer has no recurrent head")?;
         let programs=self.programs.head.as_ref().context("head programs not bound")?;
         let ProjectionWeight::Bf16(hidden_out)=&head.hidden_out[0] else {
             anyhow::bail!("recurrent hidden_out must remain native BF16");
         };
-        ensure!(target_head.bytes==self.config.padded_vocab*c.hidden*2,"recurrent fold requires native borrowed target head");
-        for first in (0..self.config.padded_vocab).step_by(4096) {
-            let rows=4096.min(self.config.padded_vocab-first);
-            // SAFETY: input head is borrowed native BF16; all folded output
-            // views retain the admitted drafter backing through readiness/drain.
-            unsafe{programs.fold.launch(&[target_head,hidden_out.buffer,head.hidden_out_bias.buffer,
-                self.weights.derived("derived.fold_weight")?.buffer,self.weights.derived("derived.fold_bias")?.buffer],
-                rows,c.rms_norm_eps as f32,first,self.stream.raw)?;}
-        }
-        Ok(())
+        // SAFETY: retained local BF16 tile and folded arena windows are disjoint
+        // and kept live through the ordered startup stream.
+        unsafe { programs.fold.launch(&[weights,hidden_out.buffer,head.hidden_out_bias.buffer,
+            part(self.weights.derived("derived.fold_weight")?.buffer,first*c.markov_rank*2,rows*c.markov_rank*2)?,
+            part(self.weights.derived("derived.fold_bias")?.buffer,first*2,rows*2)?],
+            rows,c.rms_norm_eps as f32,0,self.stream.raw) }
     }
 
     /// Project tiles of H_out^T through the borrowed packed head, then round
     /// once into the admitted folded arena. The caller lends idle target head
     /// stages, which remain live through the startup stream drain.
     pub fn fold_compact_head(&self, programs: &cuteafd_ffi::programs::Programs<'_>, stored: usize,
-        stage: Buffer, transpose: Buffer, mut project: impl FnMut(Buffer, Buffer, usize) -> Result<()>) -> Result<()> {
+        stage: Buffer, transpose: Buffer, project: impl FnMut(Buffer, Buffer, usize) -> Result<()>) -> Result<()> {
+        self.fold_compact_shard(programs,0,self.config.padded_vocab,stored,stage,transpose,project)
+    }
+    pub fn fold_compact_shard(&self, programs: &cuteafd_ffi::programs::Programs<'_>, first_token: usize,
+        n: usize, stored: usize, stage: Buffer, transpose: Buffer, mut project: impl FnMut(Buffer, Buffer, usize) -> Result<()>) -> Result<()> {
         use crate::shared::experts::rtx::dense::Finish;
         use cuteafd_core::DType;
         use cuteafd_loader::families::inkling2::draft::{fold_programs, FOLD_TILE as TILE};
         let c = &self.config.transformer;
-        let n = self.config.padded_vocab;
         let (h, r) = (c.hidden, c.markov_rank);
-        ensure!(r % TILE == 0 && stored >= n, "invalid compact fold geometry");
+        ensure!(r % TILE == 0 && stored >= n && first_token + n <= self.config.padded_vocab, "invalid compact fold geometry");
         let lib = self.stream.device.library;
         let stream = self.stream.raw;
         let head = self.weights.tensors.head.as_ref().context("peer has no recurrent head")?;
@@ -53,8 +64,8 @@ impl Rank<'_> {
             anyhow::bail!("recurrent hidden_out must remain native BF16");
         };
         let input = part(self.buffer("projection.bf16")?, 0, h*r*2)?;
-        let fold = self.weights.derived("derived.fold_weight")?.buffer;
-        let bias = self.weights.derived("derived.fold_bias")?.buffer;
+        let fold = part(self.weights.derived("derived.fold_weight")?.buffer,first_token*r*2,n*r*2)?;
+        let bias = part(self.weights.derived("derived.fold_bias")?.buffer,first_token*2,n*2)?;
         let narrow = lib.f32_bf16_narrow()?;
         let stage = part(stage, 0, stored*TILE*4)?;
         let transpose = part(transpose, 0, stored*TILE*4)?;

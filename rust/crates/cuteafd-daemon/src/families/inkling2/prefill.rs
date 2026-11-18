@@ -19,6 +19,7 @@ pub(crate) trait UnitIo<'a> {
 pub(crate) struct TokenIo<'s, 'a> {
     pub kernels: &'s Kernels<'a>,
     pub head: &'s super::head::Head<'a>,
+    pub peer_head: Option<super::head::PeerHead<'s, 'a>>,
     pub cache: &'s super::cache::CacheBank<'a>,
     pub target: &'s TargetWeights<'a>,
     pub cfg: &'s Inkling2Config,
@@ -65,7 +66,7 @@ impl<'a> UnitIo<'a> for TokenIo<'_, 'a> {
         for span in crate::shared::probe::head_spans(unit.rows.len(), 64)? {
             let state = owner.segment(self.cache, sequence, self.cfg.layers-1, span.clone())?;
             let output_row = if self.retained_rows { span.start } else { 0 };
-            let logits = if head {Some(self.head.project_at(self.kernels,&state,self.target,self.cfg,span.len(),
+            let logits = if head {Some(self.head.project_at(self.kernels,&state,self.target,self.peer_head,self.cfg,span.len(),
                 self.cfg.residual_blocks()+1,output_row)?)} else {
                 self.head.normalize(self.kernels,&state,self.target,span.len(),self.cfg.residual_blocks()+1)?;None
             };

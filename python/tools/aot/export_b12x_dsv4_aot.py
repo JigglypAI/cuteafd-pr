@@ -557,7 +557,9 @@ def inkling2_load_programs():
     from b12x.integration.cuteafd.inkling2_glue import compile_padded_transpose_aot
     transforms = (("bf16", "bfloat16", 16, 1024, 64),
                   ("bf16", "bfloat16", 4608, 256, 4608),
-                  ("f32", "float32", 32, 201088, 32))
+                  ("f32", "float32", 32, 201088, 32),
+                  ("f32", "float32", 32, 100608, 32),
+                  ("f32", "float32", 32, 100480, 32))
     return [(f"padded_transpose_{suffix}_r{r}_c{c}_p{p}", "padded_transpose",
              {"dtype": dtype, "rows": r, "cols": c, "padded_cols": p},
              partial(compile_padded_transpose_aot, dtype=getattr(torch, dtype), rows=r, cols=c, padded_cols=p))
