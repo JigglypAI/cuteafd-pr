@@ -19,7 +19,7 @@
 //! the target judged it; a round that stopped for another reason (stop token,
 //! output limit, cancellation) is censored at its accepted prefix.
 //!
-//! **Length.** Positions are kept while their own `p_ik > 0.5`, each judged
+//! **Length.** Positions are kept while their own `p_ik > 0.3`, each judged
 //! alone (no running product), up to the first at or below one half.
 //!
 //! **Exploration.** One position past the stop is always verified, up to the
@@ -70,8 +70,9 @@ pub const KEEP_CUT: f64 = 0.3;
 pub const SKIP_CUT: f64 = 0.3;
 /// Server rate of a neural position nobody has reached yet.
 pub const NEURAL_COLD_RATE: f64 = 1.;
-/// Server rate of a copy position nobody has reached yet.
-pub const COPY_COLD_RATE: f64 = 0.5;
+/// Server rate of an unreached copy position: below KEEP_CUT=0.3 so a
+/// cold agreeing copy verifies only its explored first row, never all 32.
+pub const COPY_COLD_RATE: f64 = 0.25;
 
 /// What a drafter's confidence head reports per drafted position.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
