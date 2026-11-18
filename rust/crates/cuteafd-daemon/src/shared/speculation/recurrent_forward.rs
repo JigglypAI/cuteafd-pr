@@ -140,6 +140,9 @@ impl<'a> Rank<'a> {
     pub fn allocate(weights:Weights<'a>,stream:Rc<Stream<'a>>,config:RecurrentBlockConfig,
         layout:RecurrentRuntimeLayout,programs:ProgramsForRank<'a>)->Result<Self> {
         let device=stream.device;
+        let mut names = std::collections::BTreeSet::new();
+        ensure!(layout.buffers.iter().all(|(name, _)| names.insert(name.as_str())),
+            "recurrent runtime layout has duplicate buffers");
         let buffers=layout.buffers.iter().filter(|(name, _)| !matches!(name.as_str(), "projection.trellis" | "projection.fp8")).map(|(name,bytes)| {
             let tag=if name.starts_with("cache."){Tag::drafter_kv("shared/recurrent-cache")}
                 else{Tag::drafter_workspace("shared/recurrent-workspace")};

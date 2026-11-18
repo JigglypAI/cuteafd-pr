@@ -61,6 +61,11 @@ impl RecurrentSource {
             for &(relative, rows) in parts {
                 let name = self.name(relative);
                 let stem = name.strip_suffix(".weight").context("draft matrix suffix")?;
+                if relative.starts_with("markov_head.") {
+                    ensure!(!self.checkpoint.converts_to_fp8(&name)
+                        && !self.checkpoint.contains_tensor(&format!("{stem}.trellis")),
+                        "{name}: recurrent Markov head requires native BF16 weights");
+                }
                 let (row, column) = super::super::block_dspark_part_ranges(rows, columns, axis, rank, ranks)?;
                 if self.checkpoint.converts_to_fp8(&name) {
                     let header = self.checkpoint.header(&name).with_context(|| format!("drafter lacks {name}"))?;

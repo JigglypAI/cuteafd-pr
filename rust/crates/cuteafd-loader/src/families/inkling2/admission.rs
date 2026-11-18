@@ -224,7 +224,7 @@ pub struct SelectedWeights {
     modes: Vec<crate::placement::LayerMode>,
     pub targets: Vec<CoordinatorWeights>,
     pub drafter: Option<(crate::formats::block_dspark::recurrent::RecurrentBlockConfig,
-        Vec<crate::formats::block_dspark::recurrent::loading::RecurrentWeightLayout>)>,
+        Vec<crate::formats::block_dspark::recurrent::loading::RecurrentWeightLayout>, crate::shared::dense_read::MountLoad)>,
 }
 
 impl SelectedWeights {
@@ -244,7 +244,7 @@ impl SelectedWeights {
         let head_rows = shared::DECODE_ROWS as usize;
         let mut programs = target.trellis_programs(manifest, prefill_rows, head_rows)?;
         programs.extend(target.fp8_programs(manifest, prefill_rows, head_rows)?.into_keys());
-        if let Some((_, draft)) = &self.drafter {
+        if let Some((_, draft, _)) = &self.drafter {
             let draft = draft.get(rank).context("Inkling drafter rank missing")?;
             programs.extend(draft.trellis_programs(manifest, super::draft::CONTEXT_ROWS)?);
             programs.extend(draft.fp8_programs(manifest, super::draft::CONTEXT_ROWS)?.into_keys());
@@ -277,6 +277,20 @@ pub fn gather_with_weights(request: &FactsRequest<'_>, weights: SelectedWeights)
     let shape = request.prefill;
     let routed = (0..cfg.layers).collect::<Vec<_>>();
     let placement = if gpus == 1 { crate::placement::AttentionPlacement::Heads } else { request.attention };
+    let program_sets = match (&request.coordinator, request.manifest.as_deref()) {
+        (Coordinator::Planned { .. }, Some(manifest)) => (0..gpus).map(|rank| {
+            let selected = weights.compact_programs(manifest, rank, shape.rows.max(u64::from(shared::DECODE_ROWS)) as usize)?;
+            let mut set = crate::placement::ProgramSet::from_manifest(manifest,
+                &["inkling2", "exlr8", "dense_trellis_k6", "native_attention"]);
+            let keep = |name: &str| !(name.starts_with("dense_trellis_k6_") || name.starts_with("native_attention_"))
+                || selected.contains(name);
+            set.names.retain(|name| keep(name));
+            set.scratch.retain(|(name, _)| keep(name));
+            Ok(set)
+        }).collect::<anyhow::Result<Vec<_>>>().map_err(|error| refused(format!("Inkling compact program inventory refused: {error:#}"),
+            "Install the Inkling native trellis and block-FP8 projection exports."))?,
+        _ => Vec::new(),
+    };
     let SelectedWeights { modes, targets, drafter } = weights;
     if targets.len() != gpus || drafter.is_some() != request.drafter.is_some() {
         return Err(refused("Inkling selected weights differ from launch geometry", "Prepare the selected view for the launch ranks."));
@@ -289,7 +303,7 @@ pub fn gather_with_weights(request: &FactsRequest<'_>, weights: SelectedWeights)
             shape.rows as usize, shared::DECODE_ROWS as usize)
     }).collect::<anyhow::Result<Vec<_>>>().map_err(|error| refused(format!("Inkling compact program inventory refused: {error:#}"),
         "Install the Inkling native trellis and block-FP8 projection exports."))?;
-    let mount = targets.iter().map(|target| target.mount_load(request.checkpoint)).collect::<anyhow::Result<Vec<_>>>()
+    let mut mount = targets.iter().map(|target| target.mount_load(request.checkpoint)).collect::<anyhow::Result<Vec<_>>>()
         .map_err(|error| refused(format!("Inkling 2 mount inventory refused: {error:#}"), "Check checkpoint headers."))?;
     let experts = layer_experts(request.checkpoint, cfg).map_err(|error| refused(
         format!("Inkling 2 routed expert inventory refused: {error:#}"),
@@ -307,15 +321,13 @@ pub fn gather_with_weights(request: &FactsRequest<'_>, weights: SelectedWeights)
             "Use a Spark world of 2..=8 ranks."))?;
     let links = shared::spark_link((gpus - 1) as u8, ranks, shape, request.replies, ingress)
         .map_err(|error| refused(format!("Inkling 2 Spark transport owners refused: {error}"), "Use a supported unit."))?;
-    let programs = request.manifest.as_ref().map(|manifest|
-        crate::placement::ProgramSet::from_manifest(manifest, &["inkling2", "exlr8"]));
     let mut code = Vec::new();
     let mut graph_reserve = Vec::new();
     for gpu in 0..gpus {
         code.push(match &request.coordinator {
             Coordinator::Planned { .. } => crate::placement::inventory::loaded_code_allowance("inkling2", "experts",
                 gpus == 2, gpu as u8, ArchContext::for_device("sm_120", request.coordinator.physical(gpu)),
-                programs.as_ref()).bytes,
+                program_sets.get(gpu)).bytes,
             // The measured sample follows module loading: only what it has not seen.
             Coordinator::Measured { loaded_code, .. } => loaded_code.get(gpu).copied().unwrap_or(0),
         });
@@ -337,7 +349,7 @@ pub fn gather_with_weights(request: &FactsRequest<'_>, weights: SelectedWeights)
     let mark_bytes = (0..cfg.layers).map(|layer| shared::SequenceState::new(cfg, cfg.local[layer])
         .map(|state| state.ring_bytes + state.lag_bytes)).sum::<Result<u64, _>>()
         .map_err(|error| refused(format!("Inkling 2 sequence state refused: {error}"), "Check the window geometry."))?;
-    let draft_mark = request.drafter.zip(drafter.as_ref()).map(|(selection, (config, _))|
+    let draft_mark = request.drafter.zip(drafter.as_ref()).map(|(selection, (config, _, _))|
         config.window_mark_bytes(selection.kv_cache,gpus-1,gpus,gpus-1)).transpose().map_err(|error|refused(format!("drafter mark inventory refused: {error:#}"),"Check bundled MTP config."))?.unwrap_or(0) as u64;
     let host_prefix = if request.host_cache_bytes == Some(0) || request.prefix_entries == 0 {
         serving::HostPrefixOwners { quota_bytes: 0, chunk_bytes: 0 }
@@ -356,6 +368,12 @@ pub fn gather_with_weights(request: &FactsRequest<'_>, weights: SelectedWeights)
         Err(error) => return Err(refused(format!("Inkling checkpoint namespace refused: {error}"),
             "Restore SparkNest namespace metadata; required push cannot fall back to mount.")),
     };
+    if !push_required {
+        if let Some((_, _, draft_mount)) = &drafter {
+            // Target and recurrent-body mount readers are serialized.
+            for rank in &mut mount { rank.merge(*draft_mount); }
+        }
+    }
     let capacities = (0..gpus).map(|gpu| request.coordinator.budget(gpu).logical_bytes).collect::<Vec<_>>();
     let mut pool_facts = crate::placement::PoolFacts::new(Context::resolve(context, (request.context_tokens > 0).then_some(request.context_tokens)), request.pool_tokens, page_rows);
     pool_facts.memory = pool_memory(cfg, request.kv_format, &modes, page_rows, &capacities);
@@ -368,7 +386,7 @@ pub fn gather_with_weights(request: &FactsRequest<'_>, weights: SelectedWeights)
     let prefix_mark_slots=super::draft::prefix_mark_slots(request.sequences,request.prefix_entries,
         mark_bytes,draft_mark,request.prefix_mark_budget,host_prefix.quota_bytes>0)
         .map_err(|error|refused(format!("Inkling prefix slots refused: {error:#}"),"Check combined mark extent."))?;
-    let drafter=request.drafter.zip(drafter).map(|(selection, (config, weights))| {
+    let drafter=request.drafter.zip(drafter).map(|(selection, (config, weights, _))| {
         super::draft::DraftLayout::from_weights(config,weights,usize::try_from(request.sequences)?,
             usize::try_from(request.sequences)?.min(8),usize::try_from(context)?,usize::try_from(pool.maximum_tokens())?,
             usize::try_from(shape.rows)?,usize::try_from(shape.waves)?,selection.sms,selection.kv_cache,request.manifest.as_deref())

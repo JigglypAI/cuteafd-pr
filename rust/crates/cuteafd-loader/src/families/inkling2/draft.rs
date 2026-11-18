@@ -27,15 +27,16 @@ pub struct DraftLayout {
 impl DraftLayout {
     pub fn new(view:&CheckpointView,ranks:usize,slots:usize,sequences:usize,context:usize,pool:usize,
         prefill:usize,waves:usize,sms:usize,format:Qwen4KvCache,manifest:Option<&serde_json::Value>)->Result<Self>{
-        let (config, weights) = Self::select_weights(view, ranks)?;
+        let (config, weights, _) = Self::select_weights(view, ranks)?;
         Self::from_weights(config, weights, slots, sequences, context, pool, prefill, waves, sms, format, manifest)
     }
 
-    pub fn select_weights(view: &CheckpointView, ranks: usize) -> Result<(RecurrentBlockConfig, Vec<RecurrentWeightLayout>)> {
+    pub fn select_weights(view: &CheckpointView, ranks: usize) -> Result<(RecurrentBlockConfig, Vec<RecurrentWeightLayout>, crate::shared::dense_read::MountLoad)> {
         ensure!(matches!(ranks, 1 | 2), "recurrent draft rank geometry");
         let source = RecurrentSource::open(view)?;
         let weights = (0..ranks).map(|rank| source.rank(rank, ranks, ranks - 1)).collect::<Result<Vec<_>>>()?;
-        Ok((source.config, weights))
+        let mount = source.mount_load(ranks)?;
+        Ok((source.config, weights, mount))
     }
 
     pub fn from_weights(config: RecurrentBlockConfig, weights: Vec<RecurrentWeightLayout>, slots: usize,

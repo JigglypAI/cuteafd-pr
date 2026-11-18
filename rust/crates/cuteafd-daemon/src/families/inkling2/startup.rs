@@ -244,7 +244,7 @@ pub(crate) fn whole<'a>(library: &'a Arc<NativeLibrary>, programs: &'a Programs<
         let facts=inputs.drafter.as_ref().context("delivered drafter has no admission facts")?;
         let mut layout=facts.layout.clone();
         for rank in &mut layout.runtime{
-            let projection = rank.buffers.iter().filter(|(name, _)| name.starts_with("projection.")).cloned().collect::<Vec<_>>();
+            let projection = rank.buffers.iter().filter(|(name, _)| matches!(name.as_str(), "projection.trellis" | "projection.fp8")).cloned().collect::<Vec<_>>();
             *rank=cuteafd_loader::formats::block_dspark::recurrent::runtime::RecurrentRuntimeLayout::new(&layout.config,
                 rank.slots,rank.sequences,rank.context_rows,usize::try_from(inputs.context.maximum)?,
                 usize::try_from(admitted.solved.pool_tokens)?,library.sm_count()? as usize,rank.kv_cache,

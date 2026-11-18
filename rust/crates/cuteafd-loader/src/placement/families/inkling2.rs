@@ -536,12 +536,14 @@ impl InklingInputs {
         let head = self.head_gpu();
         let cfg = &self.cfg;
         let rows = u64::from(DECODE_ROWS);
-        let buffers: [(&str, u64); 4] = [("tokens", rows * 4), ("normalized", rows * cfg.hidden as u64 * 2),
-            ("logits", rows * cfg.unpadded_vocab_size as u64 * 4),
-            ("workspace", cuteafd_ffi::programs::VOCABULARY_HEAD_WORKSPACE as u64)];
-        let stored = self.targets[head as usize].stored_head().unwrap_or(0) as u64;
+        let head_workspace = match self.targets[head as usize].stored_head() {
+            Some(stored) => ("compact_logits", rows * stored as u64 * 4),
+            None => ("workspace", cuteafd_ffi::programs::VOCABULARY_HEAD_WORKSPACE as u64),
+        };
+        let buffers = [("tokens", rows * 4), ("normalized", rows * cfg.hidden as u64 * 2),
+            ("logits", rows * cfg.unpadded_vocab_size as u64 * 4), head_workspace];
         let mut out = Vec::new();
-        for (name, bytes) in buffers.into_iter().chain([("compact_logits", rows * stored * 4)]) {
+        for (name, bytes) in buffers {
             out.extend(buffer(format!("inkling2.head.{name}"), Location::coordinator(head), bytes, Lifetime::TARGET,
                 Category::Workspace, "Inkling 2 bounded vocabulary head rows", maximum));
         }
@@ -705,7 +707,7 @@ impl Recipe for InklingInputs {
             vision.require_spark_worker(&contract_variables, &mut requires);
         }
         // BLAS: the BF16 vocabulary head borrows one serving-thread pool.
-        if self.head.bf16() {
+        if self.targets[head as usize].stored_head().is_none() && self.head.bf16() {
             components.extend(serving::blas_components("sm_120", &[serving::BlasOwners { name: "Inkling 2 target head".into(),
                 process: "coordinator".into(), thread: "inkling2/blas/serve".into(), location: Location::coordinator(head),
                 gemm: self.head.gemm(), lt: self.head.lt(), lifetime: Lifetime::TARGET, activation: Activation::always() }],

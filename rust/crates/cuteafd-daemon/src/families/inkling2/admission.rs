@@ -1,5 +1,5 @@
 //! Cold partial-golden contract uses shared phase/arena/tail admission.
-use super::{head::Head, weights::execution_arena};
+use super::weights::execution_arena;
 use anyhow::{Context as _, Result};
 use cuteafd_core::memory_layout::{Category, MemoryKind};
 use cuteafd_loader::{families::inkling2::{execution::UnitLayout, weight_layout::CoordinatorWeights, Inkling2Config},
@@ -27,9 +27,13 @@ pub(crate) fn admit(checkpoint: &Checkpoint, cfg: &Inkling2Config, target: &Coor
     let mut buffers = unit.buffers.iter().map(|(name, bytes)| (format!("unit.{name}"), Location::coordinator(0),
         *bytes as u64, Lifetime::TARGET, Category::Workspace)).collect::<Vec<_>>();
     for (name, bytes) in [("head.tokens", head_rows*4), ("head.normalized", head_rows*cfg.hidden*2),
-        ("head.logits", head_rows*cfg.unpadded_vocab_size*4), ("head.workspace", Head::workspace_bytes(cfg, head_rows)?)]
+        ("head.logits", head_rows*cfg.unpadded_vocab_size*4)]
         .into_iter().chain(expert_scratch.iter().map(|(name, bytes)| (name.as_str(), *bytes))) {
         buffers.push((name.into(), Location::coordinator(0), bytes as u64, Lifetime::TARGET, Category::Workspace));
+    }
+    if target.stored_head().is_none() {
+        buffers.push(("head.workspace".into(), Location::coordinator(0),
+            cuteafd_ffi::programs::VOCABULARY_HEAD_WORKSPACE as u64, Lifetime::TARGET, Category::Workspace));
     }
     let trellis = target.trellis_scratch(unit.rows, head_rows.min(64))?
         .map(|scratch| scratch.packed_bytes()).transpose()?.unwrap_or(0);
@@ -67,7 +71,7 @@ pub(crate) fn admit(checkpoint: &Checkpoint, cfg: &Inkling2Config, target: &Coor
         kind: ComponentKind::Allowance(Allowance { location: Location::coordinator(0),
             bytes: cuda_stream_slab_bytes(1)?, lifetime: Lifetime::RESIDENT,
             source: "driver.stream-slabs: one ordered cold golden stream".into(), assumed: false }) });
-    let head = crate::shared::target_head::TargetHead::configured().blas_head(true);
+    let head = crate::shared::target_head::TargetHead::configured().blas_head(target.stored_head().is_none());
     contract.components.extend(serving::blas_components("sm_120", &[serving::BlasOwners {
         name: "inkling2/head".into(), process: "coordinator".into(), thread: "golden".into(),
         location: Location::coordinator(0), gemm: head.gemm(), lt: head.lt(), lifetime: Lifetime::TARGET,

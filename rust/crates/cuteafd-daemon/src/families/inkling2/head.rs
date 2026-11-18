@@ -9,12 +9,11 @@ use std::rc::Rc;
 
 pub(crate) struct Head<'a> {
     stream: Rc<Stream<'a>>,
-    head: VocabularyHead<'a>,
+    bf16_head: Option<(VocabularyHead<'a>, Allocation<'a>)>,
     tokens: Allocation<'a>,
     normalized: Allocation<'a>,
     pub logits: Allocation<'a>,
     compact_logits: Option<(usize, Allocation<'a>)>,
-    _workspace: Allocation<'a>,
     rows: usize,
 }
 impl<'a> Head<'a> {
@@ -28,21 +27,22 @@ impl<'a> Head<'a> {
         let logits = alloc(rows*cfg.unpadded_vocab_size*4, "inkling2/head/logits")?;
         let compact_logits = stored_head.map(|stored| Ok::<_, anyhow::Error>((stored,
             alloc(rows.min(64)*stored*4, "inkling2/head/compact_logits")?))).transpose()?;
-        let workspace = alloc(Self::workspace_bytes(cfg, rows)?, "inkling2/head/blas")?;
-        // SAFETY: admitted workspace survives the handle and stream drain;
-        // passing unpadded vocabulary makes the stored tail rows unreachable.
-        let head = d.run(|| unsafe { d.library.vocabulary_head_rows(workspace.buffer.ptr, cfg.hidden as u32,
-            rows as u32, cfg.unpadded_vocab_size as u32, TargetHead::configured().native_mode()) })?;
-        Ok(Self { stream, head, tokens, normalized, logits, compact_logits, _workspace: workspace, rows })
-    }
-    pub fn workspace_bytes(_cfg: &Inkling2Config, _rows: usize) -> Result<usize> {
-        Ok(cuteafd_ffi::programs::VOCABULARY_HEAD_WORKSPACE)
+        let bf16_head = if stored_head.is_none() {
+            let workspace = alloc(cuteafd_ffi::programs::VOCABULARY_HEAD_WORKSPACE, "inkling2/head/blas")?;
+            // SAFETY: the admitted workspace outlives every launch, and the
+            // unpadded vocabulary makes the stored tail rows unreachable.
+            let head = d.run(|| unsafe { d.library.vocabulary_head_rows(workspace.buffer.ptr, cfg.hidden as u32,
+                rows as u32, cfg.unpadded_vocab_size as u32, TargetHead::configured().native_mode()) })?;
+            Some((head, workspace))
+        } else { None };
+        Ok(Self { stream, bf16_head, tokens, normalized, logits, compact_logits, rows })
     }
     pub fn inventory(&self, inventory: &mut crate::shared::memory::receipts::Inventory<'_>, prefix: &str) -> Result<()> {
         for (name, owner) in [("tokens", &self.tokens), ("normalized", &self.normalized),
-            ("logits", &self.logits), ("workspace", &self._workspace)] {
+            ("logits", &self.logits)] {
             owner.inventory(inventory, &format!("{prefix}.{name}"))?;
         }
+        if let Some((_, workspace)) = &self.bf16_head { workspace.inventory(inventory, &format!("{prefix}.workspace"))?; }
         if let Some((_, owner)) = &self.compact_logits { owner.inventory(inventory, &format!("{prefix}.compact_logits"))?; }
         Ok(())
     }
@@ -117,8 +117,9 @@ impl<'a> Head<'a> {
         let weight = target.projection("model.llm.unembed.weight")?;
         let lib = self.stream.device.library;
         if let ProjectionWeight::Bf16(weight) = weight {
+            let (head, _) = self.bf16_head.as_ref().ok_or_else(|| anyhow::anyhow!("Inkling BF16 head not admitted"))?;
             // SAFETY: all admitted BF16 and F32 views survive the ordered stream.
-            unsafe { target_head::launch(TargetHead::configured(), &self.head, self.normalized.buffer.ptr,
+            unsafe { target_head::launch(TargetHead::configured(), head, self.normalized.buffer.ptr,
                 weight.buffer.ptr, logits.ptr.cast(), rows, self.stream.raw)?; }
         } else {
             let (stored, stage) = self.compact_logits.as_ref().ok_or_else(|| anyhow::anyhow!("Inkling compact head scratch missing"))?;
