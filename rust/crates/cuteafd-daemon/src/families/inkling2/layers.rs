@@ -249,6 +249,34 @@ impl<'a> Kernels<'a> {
         }
     }
 
+    fn trellis_parts(&self, stream: &Stream<'a>, weight: &crate::shared::dense_trellis::CoreWeights<'_>)
+        -> Result<(&Projection<'a>, &ProjectionScratch<'a>)> {
+        let c = self.compact.as_ref().context("Inkling trellis runtime was not admitted")?;
+        ensure!(std::ptr::eq(c.stream.as_ref(), stream), "Inkling trellis scratch is bound to another stream");
+        let key = trellis_geometry(weight.shape, weight.side, weight.bits, weight.codebook);
+        Ok((c.trellis.get(&key).context("Inkling trellis program missing")?,
+            c.trellis_scratch.as_ref().context("Inkling trellis scratch missing")?))
+    }
+
+    pub fn reduce_heads(&self, owner: &impl UnitBuffers<'a>, weight: ProjectionWeight<'_, '_>,
+        remote: Buffer, rows: usize, hidden: usize) -> Result<Buffer> {
+        let local = owner.buffer("branch")?;
+        let sum = owner.buffer("mlp")?;
+        let stream = owner.stream().raw;
+        if let ProjectionWeight::Trellis(w) = weight {
+            let (projection, _) = self.trellis_parts(owner.stream(), w)?;
+            // The incoming attention mix is dead before either W_O partial is published.
+            let output = owner.buffer("mixed")?;
+            projection.reduced_f32(&self.add, rows, local, remote, sum, w, output, stream)?;
+            Ok(output)
+        } else {
+            // SAFETY: a matching peer wait publishes the retained remote partial.
+            // All three F32 planes are disjoint and the caller orders slot reuse.
+            unsafe { self.add.launch(local, remote, sum, rows * hidden, stream)?; }
+            Ok(sum)
+        }
+    }
+
     pub fn project(&self, owner: &impl UnitBuffers<'a>, input: Buffer, weight: Buffer, output: Buffer,
         rows: usize, k: usize, n: usize) -> Result<()> {
         ensure!(input.bytes >= rows*k*2 && weight.bytes >= n*k*2 && output.bytes >= rows*n*4,
@@ -384,7 +412,21 @@ pub(crate) fn project_heads<'a>(k: &Kernels<'a>, owner: &impl UnitBuffers<'a>, t
             b("q_clipped")?], rows, None, owner.stream().raw)?;
         k.narrow.launch(b("q_clipped")?.ptr, b("gated")?.ptr, rows*q_width, owner.stream().raw)?;
     }
-    k.project_target(owner, b("gated")?, target.projection(&format!("model.llm.layers.{layer}.attn.wo_ud.weight"))?, b("branch")?, rows, q_width, cfg.hidden)
+    let weight = output_weight(target, layer)?;
+    if let ProjectionWeight::Trellis(w) = weight {
+        if k.head_parts == 2 {
+            ensure!(w.side == cuteafd_loader::formats::dense_trellis::TrellisSide::Input,
+                "Inkling TP2 W_O requires an input-sharded trellis core");
+            ensure!(w.shape == [cfg.hidden, q_width], "Inkling TP2 W_O geometry differs from forward");
+            let (projection, scratch) = k.trellis_parts(owner.stream(), w)?;
+            return projection.core_into(rows, b("gated")?, w, scratch, b("branch")?, owner.stream().raw);
+        }
+    }
+    k.project_target(owner, b("gated")?, weight, b("branch")?, rows, q_width, cfg.hidden)
+}
+
+pub(crate) fn output_weight<'s, 'a>(target: &'s TargetWeights<'a>, layer: usize) -> Result<ProjectionWeight<'s, 'a>> {
+    target.projection(&format!("model.llm.layers.{layer}.attn.wo_ud.weight"))
 }
 
 pub(crate) fn finish_attention<'a>(k: &Kernels<'a>, owner: &impl UnitBuffers<'a>, target: &TargetWeights<'_>,

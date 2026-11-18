@@ -70,6 +70,12 @@ impl DraftLayout {
                 weight.trellis_programs(manifest.context("Inkling trellis drafter requires PROGRAMS.json")?, rows)?;
                 work.buffers.push(("projection.trellis".into(),projection.packed_bytes()?));
             }
+            if weight.core.values().any(|core| core.side == crate::formats::dense_trellis::TrellisSide::Input) {
+                let bytes = work.sequences.checked_mul(config.transformer.block)
+                    .and_then(|rows| rows.checked_mul(config.transformer.hidden))
+                    .and_then(|elements| elements.checked_mul(4)).context("draft F32 partial extent overflow")?;
+                work.buffers.push(("step.partial_f32".into(), crate::serving_capacity::WeightArenaLayout::allocation_bytes(bytes)));
+            }
             if !weight.fp8.is_empty() {
                 let manifest = manifest.context("Inkling FP8 drafter requires PROGRAMS.json")?;
                 work.buffers.push(("projection.fp8".into(), weight.fp8_scratch(manifest, rows)?));
@@ -90,7 +96,8 @@ impl DraftLayout {
         target.extend(verify.iter().cloned());
         let (peer,exchange)=if ranks==2 {
             let bytes=runtime[0].buffers.iter().find(|(name,_)|name=="step.partial").context("draft partial owner missing")?.1;
-            let storage=crate::serving_capacity::PeerStorageLayout::new(1,bytes,crate::serving_capacity::peer_wait_diagnostics())?;
+            let slot = runtime[0].buffers.iter().find(|(name,_)|name=="step.partial_f32").map_or(bytes, |(_, bytes)| *bytes);
+            let storage=crate::serving_capacity::PeerStorageLayout::new(1,slot,crate::serving_capacity::peer_wait_diagnostics())?;
             (verify,[("reduced",bytes),("peer.recv.0",storage.receive_bytes),("peer.control",storage.control_bytes),
                 ("peer.progress",storage.progress_bytes),("peer.abort",256)].into_iter()
                 .filter(|(_,bytes)|*bytes>0).map(|(name,bytes)|(name.into(),bytes)).collect())

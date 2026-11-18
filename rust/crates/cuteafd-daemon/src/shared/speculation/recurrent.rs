@@ -24,8 +24,11 @@ impl<'a> Drafter<'a> {
         let streams=[&lead.stream,&peer.stream];
         let endpoints=streams.map(|s|RankDevice{device:s.device.id,stream:s.raw});
         let bytes=lead.buffer("step.partial")?.bytes;
+        let slot = lead.buffers.get("step.partial_f32").map_or(bytes, |owner| owner.buffer.bytes);
+        ensure!(peer.buffers.get("step.partial_f32").map_or(bytes, |owner| owner.buffer.bytes) == slot,
+            "recurrent TP2 partial storage differs");
         let exchange=Rc::new(lead.stream.device.run(||PeerExchange::new_abortable(
-            lead.stream.device.library,endpoints,1,bytes,bytes))?);
+            lead.stream.device.library,endpoints,1,slot,slot))?);
         let device=peer.stream.device;
         let split=GqaHeadSplit::new(device.own(||Ok(Box::new(peer)))?,exchange,0,bytes,
             [Tag::drafter_workspace("recurrent/tp2-reduce");2])?;

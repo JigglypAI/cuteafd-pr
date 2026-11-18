@@ -156,7 +156,8 @@ pub(crate) fn reconcile_requests(plan: &ResolvedPlan, inputs: &cuteafd_loader::p
     use std::collections::BTreeMap;
     let contract = inputs.prepare(&plan.request)?;
     let selected = |id: &str| id.starts_with("inkling2.cache.") || id.starts_with("inkling2.kv.")
-        || id.starts_with("inkling2.decode.") || id.starts_with("inkling2.unit.") || id.starts_with("inkling2.attention.");
+        || id.starts_with("inkling2.decode.") || id.starts_with("inkling2.unit.") || id.starts_with("inkling2.attention.")
+        || id.starts_with("inkling2.target.");
     let planned = plan.facts.allocations.iter().filter(|allocation| allocation.view.is_none() && selected(&allocation.id))
         .map(|allocation| (allocation.id.as_str(), allocation)).collect::<BTreeMap<_, _>>();
     let actual = receipts.iter().filter(|receipt| receipt.allocation.view.is_none()
