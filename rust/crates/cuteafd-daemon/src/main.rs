@@ -105,6 +105,44 @@ fn select_command_attention(command: &mut Commands,
     Ok(())
 }
 
+fn resolve_command_attention_precision(command: &mut Commands) -> Result<()> {
+    let (id, requested) = match command {
+        Commands::ServeNative(args) => ("deepseek_v41", &mut args.attention_precision),
+        Commands::V41Golden(args) => ("deepseek_v41", &mut args.serve.attention_precision),
+        Commands::ServeDsv4(args) => ("deepseek_v4", &mut args.engine.attention_precision),
+        Commands::Dsv4Golden(args) => ("deepseek_v4", &mut args.engine.attention_precision),
+        Commands::ServeGlm(args) => ("glm5", &mut args.engine.attention.attention_precision),
+        Commands::GlmGolden(args) => ("glm5", &mut args.engine.attention.attention_precision),
+        Commands::ServeGlmf(args) => ("glm5_flash", &mut args.engine.attention.attention_precision),
+        Commands::GlmfGolden(args) => ("glm5_flash", &mut args.engine.attention.attention_precision),
+        Commands::ServeMimo(args) => ("mimo_v2", &mut args.engine.attention_precision),
+        Commands::MimoGolden(args) => ("mimo_v2", &mut args.engine.attention_precision),
+        Commands::ServeQwen4(args) => ("qwen4", &mut args.engine.attention_precision),
+        Commands::Qwen4Golden(args) => ("qwen4", &mut args.engine.attention_precision),
+        Commands::ServeQwen35(args) => ("qwen3_5", &mut args.attention_precision),
+        Commands::Qwen35Golden(args) => ("qwen3_5", &mut args.attention_precision),
+        Commands::ServeKimi(args) => ("kimi_k3", &mut args.attention.attention_precision),
+        Commands::KimiGolden(args) => ("kimi_k3", &mut args.attention.attention_precision),
+        Commands::ServeStep5(args) => ("step5", &mut args.attention.attention_precision),
+        Commands::Step5Golden(args) => ("step5", &mut args.attention.attention_precision),
+        Commands::ServeMinimax(args) => ("minimax_m3", &mut args.attention.attention_precision),
+        Commands::MinimaxGolden(args) => ("minimax_m3", &mut args.attention.attention_precision),
+        Commands::ServeMuse(args) => ("muse_spark", &mut args.attention.attention_precision),
+        Commands::MuseGolden(args) => ("muse_spark", &mut args.engine.attention.attention_precision),
+        Commands::ServeInkling2(args) => ("inkling2", &mut args.attention.attention_precision),
+        Commands::Inkling2Golden(args) => ("inkling2", &mut args.attention.attention_precision),
+        _ => return Ok(()),
+    };
+    let family = cuteafd_loader::plan::family::registry().iter().copied()
+        .find(|family| family.id() == id).context("missing attention family descriptor")?;
+    let resolved = cuteafd_loader::plan::attention_precision::resolve(family, *requested)?;
+    tracing::info!(family = id, requested = %requested, effective = %resolved.mode,
+        reason = %resolved.reason, "resolved attention precision");
+    *requested = resolved.mode;
+    cuteafd_bench::context::set_resolved("attention-precision", resolved.mode.name());
+    Ok(())
+}
+
 fn resolve_serve_media(command: &mut Commands, vision: cuteafd_loader::plan::MediaMode,
     audio: cuteafd_loader::plan::MediaMode) -> Result<(cuteafd_loader::plan::MediaMode, cuteafd_loader::plan::MediaMode)> {
     use cuteafd_loader::plan::MediaMode;
@@ -420,6 +458,7 @@ async fn run() -> Result<()> {
         tracing::warn!("memory failure dump unavailable: no configured instance usage directory or profile output directory");
     }
     select_command_attention(&mut command, selected_view)?;
+    resolve_command_attention_precision(&mut command)?;
     cuteafd_core::spark_reply::set_requested(cuteafd_core::spark_reply::SparkReplyFormats {
         prefill: family_reply.prefill.or(initial_reply.prefill),
         decode: family_reply.decode.or(initial_reply.decode),

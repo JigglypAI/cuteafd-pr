@@ -37,7 +37,7 @@ pub fn sparse_mla_precision_stem(name: &str) -> Option<(&str, AttentionPrecision
             _ => false,
         }
     } else { match family {
-        "glm" | "glm2" | "glmf" | "glmf2" => matches!(kind, "decode" | "prefill"),
+        "glm" | "glm2" | "glmf" | "glmf2" => kind == "decode",
         "ml4" | "ml42" => matches!(kind, "decode" | "prefill" | "nope_decode" | "nope_prefill"),
         "dsv4f" | "dsv4f2" | "dsv4p" | "dsv4p2" => matches!(kind,
             "decode_win" | "decode_c4" | "decode_c128" | "prefill_win" | "prefill_c4" | "prefill_c128"),

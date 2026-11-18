@@ -666,6 +666,9 @@ pub(crate) fn native_layout_with_metadata(checkpoint: &Checkpoint, options: &Lay
     let precision = report.as_ref().and_then(|report| report.attention_precision.as_ref())
         .map(|precision| precision.mode).unwrap_or_default();
     cuteafd_core::attention::select_sparse_mla_manifest(&mut manifest, precision);
+    let sms = options.physical_sms.unwrap_or_else(|| crate::placement::ArchContext::for_device(
+        "sm_120", options.rtx_bytes[0]).sms);
+    cuteafd_core::coordinator_programs::select_card_plans(&mut manifest, sms)?;
     cuteafd_core::coordinator_programs::select_core_view_plans(&mut manifest, plan,
         |name| cuteafd_core::coordinator_programs::CoordinatorPrograms {
             family: "glm", split_family: Some("glm2") }.contains(name))?;

@@ -12,8 +12,8 @@ pub struct PrecisionSupport {
 }
 
 pub const BF16_ONLY: PrecisionSupport = PrecisionSupport {
-    modes: &[AttentionPrecision::Bf16],
-    source: "BF16 attention; no FP8 attention program is exported (#2146)",
+    modes: &[AttentionPrecision::Bf16, AttentionPrecision::Fp8],
+    source: "no qualified FP8 attention tier; both settings retain native attention (#2146)",
 };
 /// The key is accepted, but this MLA family has no qualified lower tier.
 pub const MLA_BF16_ONLY: PrecisionSupport = PrecisionSupport {
@@ -34,7 +34,7 @@ pub struct Resolved {
 pub fn resolve(family: &dyn super::Family, requested: AttentionPrecision) -> Result<Resolved, PlanError> {
     let support = family.attention_precision();
     if support.modes.contains(&requested) {
-        let mode = if support == MLA_BF16_ONLY { AttentionPrecision::Bf16 } else { requested };
+        let mode = if support != MLA { AttentionPrecision::Bf16 } else { requested };
         Ok(Resolved { mode, reason: support.source.into() })
     } else {
         Err(PlanError::UnsupportedValue {
@@ -63,7 +63,7 @@ mod tests {
             let result = resolve(*family, AttentionPrecision::Fp8);
             if family.attention_precision().modes.contains(&AttentionPrecision::Fp8) {
                 let support = family.attention_precision();
-                let expected = if support == MLA_BF16_ONLY { AttentionPrecision::Bf16 } else { AttentionPrecision::Fp8 };
+                let expected = if support != MLA { AttentionPrecision::Bf16 } else { AttentionPrecision::Fp8 };
                 assert_eq!(result.unwrap().mode, expected);
             } else {
                 let error = result.unwrap_err().to_string();

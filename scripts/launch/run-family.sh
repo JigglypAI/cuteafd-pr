@@ -114,6 +114,14 @@ done < <(grep -E '^[A-Z_0-9]+=' "$config")
 [[ -z "${SPARK_COUNT:-}" ]] || { cfg[SPARK_COUNT]="$SPARK_COUNT"; cfg_file[SPARK_COUNT]=1; }
 [[ -z "${SPARK_HOSTS:-}" ]] || { cfg[SPARK_HOSTS]="$SPARK_HOSTS"; cfg_file[SPARK_HOSTS]=1; }
 get() { printf '%s' "${cfg[$1]:-${2:-}}"; }
+# Attention compute never inherits a weight or cache format.
+attention_precision="$(get ATTENTION_PRECISION)"
+attention_precision_args=()
+case "$attention_precision" in
+  "") ;; # The typed CLI owns the shared BF16 default.
+  bf16|fp8) attention_precision_args=(--attention-precision "$attention_precision") ;;
+  *) release_die "ATTENTION_PRECISION must be bf16 or fp8" ;;
+esac
 # Validate precision syntax before planner containers, SSH, or namespace work.
 fp8_prefill="$(get FP8_PREFILL auto)"
 case "$fp8_prefill" in
@@ -789,14 +797,6 @@ count_args+=(--config /run/cuteafd-plan.config)
 v41_decode_lanes="$(get DECODE_LANES)"
 [[ -z "$v41_decode_lanes" || "$v41_decode_lanes" =~ ^[12]$ ]] || release_die "DECODE_LANES must be 1 or 2"
 [[ -z "$v41_decode_lanes" ]] || count_args+=(--decode-lanes "$v41_decode_lanes")
-# Attention compute never inherits a weight or cache format.
-attention_precision="$(get ATTENTION_PRECISION)"
-attention_precision_args=()
-case "$attention_precision" in
-  "") ;; # The typed CLI owns the shared BF16 default.
-  bf16|fp8) attention_precision_args=(--attention-precision "$attention_precision") ;;
-  *) release_die "ATTENTION_PRECISION must be bf16 or fp8" ;;
-esac
 count_args+=("${attention_precision_args[@]}")
 ((RELEASE_SPARK_COUNT_EXPLICIT == 0)) || count_args+=(--spark-ranks "$SPARK_COUNT")
 # Keep checkpoint paths unchanged inside the full namespace mount.

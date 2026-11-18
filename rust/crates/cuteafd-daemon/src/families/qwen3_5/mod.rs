@@ -13,6 +13,8 @@ use cuteafd_loader::families::qwen3_5::Qwen35Checkpoint;
 
 #[derive(Debug, Clone, clap::Args)]
 pub(crate) struct GoldenArgs {
+    #[arg(long, default_value = "bf16")]
+    pub(crate) attention_precision: cuteafd_core::attention::AttentionPrecision,
     #[arg(long)]
     pub snapshot: PathBuf,
     /// Hugging Face identity for a snapshot outside the standard hub layout.

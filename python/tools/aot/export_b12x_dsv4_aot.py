@@ -2153,6 +2153,8 @@ def main() -> None:
             compile_ = functools.partial(original, precision="bf16")
         elif op != "sparse_mla" or family not in ("glm", "glm2", "glmf", "glmf2", "dsv4f", "dsv4f2", "dsv4p", "dsv4p2"):
             continue
+        elif family in ("glm", "glm2", "glmf", "glmf2") and params["route"] == "prefill":
+            continue  # Native Q2P2 serves both precision tiers.
         elif family.startswith("dsv4"):
             from b12x.integration.cuteafd import dsv4_sparse_mla as v4_mla
             g = {"dsv4f": FLASH, "dsv4p": PRO,
