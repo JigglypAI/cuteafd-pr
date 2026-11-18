@@ -107,7 +107,7 @@ class Pilot:
     def expert_witness(self, vectors, layer):
         # Use rows of actual routed activations in the native expert order.
         first = vectors[0][1].reshape(-1)
-        hits = first.bincount(minlength=self.reader.config.num_local_experts)
+        hits = first.bincount(minlength=self.reader.config.n_routed_experts)
         candidates = hits.argsort(descending=True).tolist()
         for expert in candidates:
             selected = [latent[torch.where(ids == expert)[0]] for latent, ids in vectors]
