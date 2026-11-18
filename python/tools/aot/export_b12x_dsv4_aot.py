@@ -1751,9 +1751,9 @@ def context_split_programs(g, decode_rows: int, max_context: int):
 
 def dense_family_scopes(families, exlr8_family):
     requested = set((families if families is not None else "kimik3").split(","))
-    if not requested or requested - {"kimik3", "glm", "glmf", "step5", "muse", "ml4"}:
-        raise ValueError("--dense-trellis-families takes kimik3, glm, glmf, step5, muse and/or ml4")
-    k6 = tuple(name for name in ("kimik3", "glm", "glmf", "step5", "muse", "ml4") if name in requested)
+    if not requested or requested - {"kimik3", "glm", "glmf", "step5", "muse", "ml4", "inkling2"}:
+        raise ValueError("--dense-trellis-families takes kimik3, glm, glmf, step5, muse, ml4 and/or inkling2")
+    k6 = tuple(name for name in ("kimik3", "glm", "glmf", "step5", "muse", "ml4", "inkling2") if name in requested)
     native = tuple(name for name in k6 if name in ("glm", "glmf")) \
         if families is not None else tuple(filter(None, (exlr8_family or "").split(",")))
     return k6, native
@@ -1779,7 +1779,7 @@ def main() -> None:
                              "dense_trellis_k6 (native K6 core projections), "
                              "native_attention (block-128 FP8 projection stages)")
     parser.add_argument("--dense-trellis-families",
-                        help="architecture tables for dense_trellis_k6 and exlr8_dense: kimik3,glm,glmf,step5,muse,ml4 "
+                        help="architecture tables for dense_trellis_k6 and exlr8_dense: kimik3,glm,glmf,step5,muse,ml4,inkling2 "
                              "(defaults: K6 kimik3; EXLR8 --exlr8-family; no checkpoint reads)")
     parser.add_argument("--native-expert-families", default="v41,dsv4f,dsv4p",
                         help="native_experts segment packages: v41,dsv4f,dsv4p")
@@ -2123,6 +2123,14 @@ def main() -> None:
         work += [("inkling2", *item) for item in inkling2_attention_programs(args.decode_rows, args.prefill_rows)]
         work += [("inkling2", *item) for item in inkling2_producer_programs(args.prefill_rows)]
         work += [("inkling2", *item) for item in inkling2_load_programs()]
+        from export_b12x_dense_trellis_k6_aot import INKLING_TARGET_SHAPES
+        existing_fp8 = {suffix for family, suffix, *_ in work if family == "native_attention"}
+        for k, n in sorted({(k, n) for _, k, n, _ in INKLING_TARGET_SHAPES}):
+            for rows in ((64,) if n == 201088 else (64, 4096)):
+                suffix = f"n{n}_k{k}_m{rows}_f32"
+                if suffix not in existing_fp8:
+                    work.append(("native_attention", suffix, "attention_projection", dict(max_rows=rows),
+                                 functools.partial(compile_native_attention_projection, n, k, rows, "f32")))
         work += [("inkling_draft", *item) for item in inkling_draft_programs()]
         for suffix, op, params, compile_ in inkling_fir_programs():
             family = "fir" if suffix == "fir_history_commit" else "inkling2"

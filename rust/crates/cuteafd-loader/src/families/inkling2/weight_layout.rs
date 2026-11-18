@@ -9,6 +9,7 @@ use crate::{plan::checkpoint::Checkpoint, serving_capacity::WeightArenaLayout};
 use anyhow::{ensure, Context, Result};
 use cuteafd_core::DType;
 use crate::formats::{dense_trellis::TrellisSide,
+    native_attention::{Fp8Role, NativeLayout},
     trellis_core::{CoreContract, CoreSplit, CoreWeightLayout}};
 use std::collections::BTreeMap;
 
@@ -67,6 +68,22 @@ pub struct CoordinatorWeights {
     pub layers: Vec<usize>,
     pub arena: WeightArenaLayout,
     pub core: BTreeMap<String, CoreWeightLayout>,
+    pub fp8: BTreeMap<String, NativeLayout>,
+}
+
+pub const HEAD: &str = "model.llm.unembed";
+
+pub fn fp8_role(name: &str) -> Fp8Role {
+    let stem = name.strip_suffix(".weight").unwrap_or(name);
+    if stem == HEAD { return Fp8Role::padded("vocabulary head", true, 128); }
+    let attn = stem.strip_prefix("model.llm.layers.").and_then(|s| s.split_once('.'))
+        .is_some_and(|(layer, role)| layer.parse::<usize>().is_ok() && matches!(role,
+            "attn.wq_du" | "attn.wr_du" | "attn.wk_dv" | "attn.wv_dv" | "attn.wo_ud"));
+    Fp8Role::exact("target projection", attn)
+}
+
+pub fn projection_prefix(stem: &str, rank: usize, ranks: usize) -> String {
+    if ranks > 1 { format!("{stem}#rank{rank}") } else { stem.to_owned() }
 }
 
 impl CoordinatorWeights {
@@ -80,12 +97,16 @@ impl CoordinatorWeights {
         ensure!(matches!(ranks, 1 | 2), "Inkling 2 coordinator ranks must be 1 or 2");
         ensure!(modes.len() == cfg.layers, "Inkling 2 target layer modes must cover every layer exactly once");
         ensure!(Inkling2Config::from_hf(&checkpoint.config)? == *cfg, "Inkling 2 arena configuration differs from checkpoint");
+        checkpoint.validate_fp8_roles("Inkling 2", |name| {
+            // The separately admitted recurrent body validates its own roles.
+            if name.starts_with("mtp.") { Fp8Role::exact("recurrent projection", true) } else { fp8_role(name) }
+        })?;
         (0..ranks).map(|rank| {
             let layers = modes.iter().enumerate().filter_map(|(layer, mode)| match mode {
                 LayerMode::Whole { gpu, .. } => (usize::from(*gpu) == rank).then_some(layer),
                 LayerMode::HeadSplit | LayerMode::ContextSplit => Some(layer),
             }).collect::<Vec<_>>();
-            let mut builder = Builder { checkpoint, tensors: Vec::new(), core: BTreeMap::new() };
+            let mut builder = Builder { checkpoint, tensors: Vec::new(), core: BTreeMap::new(), fp8: BTreeMap::new() };
             let (h, v) = (cfg.hidden, cfg.vocab_size);
             if rank == 0 {
                 builder.plain(format!("{TEXT}embed.weight"), DType::Bf16, &[v, h])?;
@@ -102,7 +123,7 @@ impl CoordinatorWeights {
                 builder.layer(cfg, layer, if split { Some(rank) } else { None })?;
             }
             Ok(Self { rank, layers, arena: WeightArenaLayout::new(format!("inkling2/target/{rank}"), builder.tensors)?,
-                core: builder.core })
+                core: builder.core, fp8: builder.fp8 })
         }).collect()
     }
 
@@ -125,11 +146,13 @@ impl CoordinatorWeights {
             }
             true
         }).map(|(name, view)| (name.clone(), view.bytes())).collect::<Vec<_>>();
-        let core = whole.core.into_iter().filter(|(stem, _)| {
+        let keep_projection = |stem: &str| {
             stem.strip_prefix(&format!("{TEXT}layers.")).and_then(|rest| rest.split('.').next())
                 .and_then(|layer| layer.parse::<usize>().ok()).is_none_or(|layer| layers.contains(&layer))
-        }).collect();
-        Ok(Self { rank: 0, layers: layers.to_vec(), arena: WeightArenaLayout::new("inkling2/golden/target", selected)?, core })
+        };
+        let core = whole.core.into_iter().filter(|(stem, _)| keep_projection(stem)).collect();
+        let fp8 = whole.fp8.into_iter().filter(|(stem, _)| keep_projection(stem)).collect();
+        Ok(Self { rank: 0, layers: layers.to_vec(), arena: WeightArenaLayout::new("inkling2/golden/target", selected)?, core, fp8 })
     }
 
     /// Raw checkpoint operands need only a bounded reused source buffer: no
@@ -138,11 +161,7 @@ impl CoordinatorWeights {
         use crate::shared::dense_read::{MountLoad, ReadBatch, STEP_BYTES};
         let mut load = MountLoad::default();
         for (view_name, view) in self.arena.views() {
-            if self.core.values().any(|layout| {
-                let prefix = if layout.ranks == 2 { format!("{}#rank{}.", layout.stem, layout.rank) }
-                    else { format!("{}.", layout.stem) };
-                view_name.starts_with(&prefix)
-            }) { continue; }
+            if self.is_specialized_view(view_name) { continue; }
             let (name, share) = match view_name.split_once('#') { Some((name, _)) => (name, 2), None => (view_name.as_str(), 1) };
             let header = checkpoint.header(name).with_context(|| format!("Inkling 2 mount lacks {name}"))?;
             ensure!(header.byte_length == view.bytes() as u64 * share, "Inkling 2 mount {name}: admitted bytes differ");
@@ -161,7 +180,37 @@ impl CoordinatorWeights {
                 load.merge(MountLoad::read(ReadBatch::new(rows, width, width, STEP_BYTES)?));
             }
         }
+        for layout in self.fp8.values() {
+            let header = checkpoint.header(&format!("{}.weight", layout.stem)).context("Inkling FP8 source missing")?;
+            let width = layout.shape[1] * 2;
+            let rows = (cuteafd_ffi::push_ring::DEFAULT_SLOT_BYTES / (width * 128)).max(1) * 128;
+            load.merge(MountLoad::read(ReadBatch::new(rows.min(header.shape[0]), header.shape[1] * 2, width, STEP_BYTES)?));
+            load.pinned_tables = load.pinned_tables.max(cuteafd_ffi::programs::fp8_load_table_bytes(rows, 128)? as u64);
+        }
         Ok(load)
+    }
+
+    pub fn is_specialized_view(&self, view_name: &str) -> bool {
+        let Some((prefix, _)) = view_name.rsplit_once('.') else { return false; };
+        let stem = prefix.split_once('#').map_or(prefix, |(stem, _)| stem);
+        self.core.contains_key(stem) || self.fp8.contains_key(stem)
+    }
+
+    pub fn trellis_scratch(&self, rows: usize, head_rows: usize)
+        -> Result<Option<crate::formats::trellis_core::ProjectionScratchLayout>> {
+        use crate::formats::trellis_core::ProjectionScratchLayout;
+        let mut scratch = None::<ProjectionScratchLayout>;
+        for layout in self.core.values() {
+            let active = if layout.stem == HEAD { head_rows } else { rows };
+            let mut need = ProjectionScratchLayout::new(layout.shape[1], layout.shape[0], active)?;
+            need.rows = rows.max(head_rows);
+            if let Some(scratch) = &mut scratch { scratch.merge(&need)?; } else { scratch = Some(need); }
+        }
+        Ok(scratch)
+    }
+
+    pub fn stored_head(&self) -> Option<usize> {
+        self.core.get(HEAD).map(|l| l.shape[0]).or_else(|| self.fp8.get(HEAD).map(|l| l.shape[0]))
     }
 
     /// Native ordered-K16 relative projection consumes a padded transpose in
@@ -190,11 +239,32 @@ struct Builder<'a> {
     checkpoint: &'a Checkpoint,
     tensors: Vec<(String, usize)>,
     core: BTreeMap<String, CoreWeightLayout>,
+    fp8: BTreeMap<String, NativeLayout>,
 }
 
 impl Builder<'_> {
     fn projection(&mut self, name: String, shape: &[usize], axis: usize, split: Option<usize>) -> Result<()> {
         let stem = name.strip_suffix(".weight").context("Inkling projection suffix")?;
+        if self.checkpoint.converts_to_fp8(&name) {
+            let header = self.checkpoint.header(&name).with_context(|| format!("Inkling FP8 source missing {name}"))?;
+            ensure!(header.dtype == DType::Bf16 && header.shape == shape,
+                "{name}: Inkling FP8 source must be BF16 {shape:?}");
+            let mut stored = fp8_role(&name).stored_shape([shape[0], shape[1]])
+                .with_context(|| format!("{name}: Inkling FP8 role or geometry"))?;
+            let split_axis = match split { None => CoreSplit::Whole, Some(_) if axis == 0 => CoreSplit::Output,
+                Some(_) => CoreSplit::Input };
+            if split.is_some() {
+                ensure!(stored[axis] % 256 == 0, "{name}: FP8 TP2 requires whole rank-local blocks");
+                stored[axis] /= 2;
+            }
+            let layout = NativeLayout { stem: stem.to_owned(), shape: stored, fp8: true,
+                rank: split.unwrap_or(0), ranks: if split.is_some() { 2 } else { 1 }, split: split_axis };
+            let prefix = projection_prefix(stem, layout.rank, layout.ranks);
+            self.tensors.extend([("values", stored[0]*stored[1]), ("scales", stored[0]/128*(stored[1]/128)*4)]
+                .into_iter().map(|(suffix, bytes)| (format!("{prefix}.{suffix}"), bytes)));
+            self.fp8.insert(stem.to_owned(), layout);
+            return Ok(());
+        }
         if !self.checkpoint.contains_tensor(&format!("{stem}.trellis")) {
             return self.shard(name, DType::Bf16, shape, axis, split);
         }
@@ -208,7 +278,7 @@ impl Builder<'_> {
         let layout = CoreWeightLayout::new(&projection,
             if axis == 0 { TrellisSide::Output } else { TrellisSide::Input }, split.unwrap_or(0),
             if split.is_some() { 2 } else { 1 })?;
-        let prefix = if let Some(rank) = split { format!("{stem}#rank{rank}") } else { stem.to_owned() };
+        let prefix = projection_prefix(stem, layout.rank, layout.ranks);
         self.tensors.extend(layout.arena_tensors(&prefix)?);
         self.core.insert(stem.to_owned(), layout);
         Ok(())
