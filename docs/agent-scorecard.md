@@ -27,6 +27,31 @@ Rubric, each 1–5 (5 best), plus wall time:
 
 ## Log
 
+### 2026-11-18 Kimi K2 Spark Small-M Duel
+
+[Carbon R2](https://github.com/tpurtell/sparkinfer-glmrt/pull/399) wins
+with K256 fetch slabs and runtime expert spans. Across two GB10s, it beats
+production at all 65 tested row counts (1–64 and 80), with paired m64
+speedups of 1.118x / 1.122x. Directly against Astra R3 it wins the
+476-observed-wave weighted comparison by 1.055x / 1.048x. Both finalists
+pass the two-bank bitwise row-invariance and per-row F32 gates. Carbon R1
+had the faster m64 but regressed low rows and changed an unintended TP7
+export; R2 fixed both. The full audit leaves all 740 RTX objects and
+2,922 of 2,924 Spark objects unchanged, including TP7. The two changed
+objects are the TP6-width512 m1/m80 cores.
+
+[Astra R3](https://github.com/tpurtell/sparkinfer-glmrt/pull/394) combines
+adjacent M8 pairs and rotates live routes. R1 needed a compile fix and
+then lost every m64 pair; R2 beat production and R3 again beat R2 at m64
+in all ten direct blocks, retaining bitwise results. R3 reaches
+1.065x / 1.041x over production at m64 but loses the weighted comparison.
+
+Scores (correctness / judgment / quality / creativity): Carbon 5 / 4 / 4 / 5;
+Astra 5 / 4 / 4 / 5. From first submitted commit to finalist commit,
+Carbon took about 77 min and Astra about 28 min (includes round feedback;
+not a measure of coding time). [Measured table and final verdict](https://github.com/tpurtell/cuteafd/issues/2462#issuecomment-6975064084).
+
+
 ### 2026-11-18 BF16 Sparse MLA Duel: Target 1
 
 Astra wins split decode at `58667f58` (fork #391, engine #2459 follow-up).
