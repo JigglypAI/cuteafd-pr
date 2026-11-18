@@ -630,6 +630,7 @@ def test_minimax_producer_fixture_matches_pinned_fork_without_cuda():
 
 def test_inkling2_dispatch_package_codes_cmake_and_placement_scopes_agree(monkeypatch, tmp_path):
     import dataclasses
+    import functools
     import json
     import subprocess
     import pytest
@@ -655,8 +656,16 @@ def test_inkling2_dispatch_package_codes_cmake_and_placement_scopes_agree(monkey
     monkeypatch.setitem(sys.modules, attention.__name__, attention)
     shapes = next(node for node in tree.body if isinstance(node, ast.FunctionDef)
                   and node.name == "inkling2_projection_shapes")
+    compact_file = ROOT / "python/tools/aot/export_b12x_dense_trellis_k6_aot.py"
+    compact = types.ModuleType(compact_file.stem)
+    compact_defs = [node for node in ast.parse(compact_file.read_text()).body if isinstance(node, ast.Assign)
+        and any(isinstance(target, ast.Name) and target.id in {"INKLING_SHAPES", "INKLING_TARGET_SHAPES"}
+                for target in node.targets)]
+    exec(compile(ast.Module(body=compact_defs, type_ignores=[]), str(compact_file), "exec"), vars(compact))
+    monkeypatch.setitem(sys.modules, compact.__name__, compact)
     namespace = {"geometries": ["inkling2"], "manifest": {"families": {}}, "work": [], "dataclasses": dataclasses,
-                 "args": types.SimpleNamespace(decode_rows=64, prefill_rows=4096),
+                 "args": types.SimpleNamespace(decode_rows=64, prefill_rows=4096), "functools": functools,
+                 "compile_native_attention_projection": lambda n, k, rows, output: (k, n, rows, output),
                  # Full producer inventory is checked by test_inkling2_producer_exports;
                  # this isolated dispatcher test needs no CUDA/compiler imports.
                  "inkling2_producer_programs": lambda rows: [],
@@ -673,6 +682,7 @@ def test_inkling2_dispatch_package_codes_cmake_and_placement_scopes_agree(monkey
                 and any(isinstance(target, ast.Name) and target.id == "stem" for target in node.targets)
                 and "kimi_split" in ast.unparse(node.value))
     names = []
+    fp8 = set()
     for family, suffix, op, params, thunk in namespace["work"]:
         namespace.update(family=family, suffix=suffix, op=op)
         exec(compile(ast.Module(body=[stem], type_ignores=[]), "stem", "exec"), namespace)
@@ -681,10 +691,21 @@ def test_inkling2_dispatch_package_codes_cmake_and_placement_scopes_agree(monkey
             names.append((namespace["stem"], params))
         elif op == "expert_input_quant":
             assert namespace["stem"] == "inkling2_expert_input_quant" and thunk() == "native-wire"
+        elif op == "attention_projection":
+            assert family == "native_attention"
+            k, n, rows, output = thunk()
+            assert params == {"max_rows": rows}
+            assert namespace["stem"] == f"native_attention_n{n}_k{k}_m{rows}" + ("_f32" if output == "f32" else "")
+            fp8.add((k, n, rows, output))
         else:
             assert op == "bf16_projection" and family == "draft_bf16"
             assert thunk()[2] == "f32"
-    assert len(namespace["work"]) == 6 + 1 + 8 + 2
+    expected_fp8 = {(k, n, rows, "f32") for _, k, n, _ in compact.INKLING_TARGET_SHAPES
+        for rows in ((64,) if n == 201088 else (64, 4096))}
+    expected_fp8.update((k, n, rows, "bf16") for _, k, n, _ in compact.INKLING_SHAPES
+        if n != 201088 for rows in (64, 4096))
+    assert fp8 == expected_fp8
+    assert len(namespace["work"]) == 6 + 1 + 8 + 2 + len(expected_fp8)
     assert names == [
         (f"inkling2_{kind}_attention_{route}_{fmt}_v2_m{rows}",
          dict(kind=kind, route=route, max_rows=rows, kv_format=fmt))
@@ -753,7 +774,7 @@ def test_inkling2_dispatch_package_codes_cmake_and_placement_scopes_agree(monkey
     assert derived["CUTEAFD_RELEASE_MINIMAX_AOT"] == "OFF"
     assert derived["CUTEAFD_RELEASE_EXPERT_FAMILIES"] == "inkling2:mxfp8"
     required = release.requirements(tmp_path, matrix, "inkling2")[0]
-    assert required["programs"] == ["inkling2"] and required["experts"] == ["inkling2:mxfp8"]
+    assert required["programs"] == ["dense_trellis_k6", "inkling2", "native_attention"] and required["experts"] == ["inkling2:mxfp8"]
     assert required["spark_experts"] == ["inkling2:mxfp8"]
 
     placement = load("inkling2_placement_inputs", "scripts/build/export-placement-inputs.py")
@@ -768,9 +789,9 @@ def test_inkling2_dispatch_package_codes_cmake_and_placement_scopes_agree(monkey
         assert f'set(package "${{CMAKE_CURRENT_BINARY_DIR}}/fp8/{package}")' in (
             ROOT / "native/cmake/shared/fp8_moe.cmake").read_text()
 
-    for flags, expected in (({"CUTEAFD_ENABLE_INKLING2_AOT": "ON"}, "inkling2,expert_reply"),
+    for flags, expected in (({"CUTEAFD_ENABLE_INKLING2_AOT": "ON"}, "dense_trellis_k6,inkling2,expert_reply"),
                             ({"CUTEAFD_ENABLE_MINIMAX_AOT": "ON", "CUTEAFD_ENABLE_INKLING2_AOT": "ON"},
-                             "minimax,inkling2,expert_reply")):
+                             "minimax,dense_trellis_k6,inkling2,expert_reply")):
         root = tmp_path / "-".join(sorted(flags))
         root.mkdir()
         (root / "CMakeLists.txt").write_text("\n".join([
@@ -784,7 +805,7 @@ def test_inkling2_dispatch_package_codes_cmake_and_placement_scopes_agree(monkey
         result = subprocess.run(["cmake", "-S", str(root), "-B", str(root / "build")],
                                 capture_output=True, text=True, timeout=30)
         assert result.returncode == 0, result.stdout + result.stderr
-        assert (root / "build/scope.json").read_text() == expected + "||"
+        assert (root / "build/scope.json").read_text() == expected + "|inkling2|"
     fp8 = (ROOT / "native/cmake/shared/fp8_moe.cmake").read_text()
     assert 'set(package "${CMAKE_CURRENT_BINARY_DIR}/fp8/fp8-inkling2-mxfp8")' in fp8
     for script in ("build-wip-artifacts.sh", "build-release-artifacts.sh"):
