@@ -723,6 +723,34 @@ mod tests {
     }
 
     #[test]
+    fn trellis_staging_is_shared_by_target_and_predictor_on_one_rank() -> Result<()> {
+        use crate::{placement::families::step5 as family, serving_capacity::WeightArenaLayout};
+        use cuteafd_core::memory_layout::MemoryKind;
+        let cfg = config();
+        let input = inputs(2);
+        for compact in [false, true] {
+            let recipe = family::Step5Recipe::new(&cfg, &input, 0, |ownership| {
+                (0..ownership.ranks()).map(|rank| {
+                    let mut weight_arenas = Vec::new();
+                    for (id, kind) in [("target", MemoryKind::Weights), ("mtp", MemoryKind::DrafterWeights)] {
+                        let name = if compact && rank == 1 { "q.trellis" } else { "q.weight" };
+                        let arena = WeightArenaLayout::new(format!("{id}.{rank}"), [(name.into(), 256)])?;
+                        weight_arenas.push((arena, ResidentWeights(256), kind));
+                    }
+                    Ok(RankAdmission { resident_weights: ResidentWeights(512), weight_arenas,
+                        immutable: 0, private_requests: vec![], drafter_requests: vec![], vocabulary_heads: vec![],
+                        projection_bytes: 0, workspace: 1 << 20 })
+                }).collect()
+            })?;
+            let request = recipe.request();
+            let contract = recipe.prepare(&request)?;
+            let facts = contract.facts(&vec![0; contract.variables.len()], 1)?;
+            crate::shared::dense_read::assert_trellis_device_staging(&facts, if compact { &[1] } else { &[] });
+        }
+        Ok(())
+    }
+
+    #[test]
     fn spark_solver_uses_each_measured_or_explicit_capacity() {
         let mut input = inputs(1);
         input.spark_bytes = vec![123, 456, 789, 1011];

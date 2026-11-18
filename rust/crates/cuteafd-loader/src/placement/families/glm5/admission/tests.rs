@@ -115,6 +115,33 @@ fn blas_target_and_bridge_share_root_while_media_owns_its_thread() {
 }
 
 #[test]
+fn trellis_staging_is_additive_to_the_glm_census() -> anyhow::Result<()> {
+    use super::super::weights::WeightOwner;
+    let cfg = cfg();
+    for ranks in [&[][..], &[0][..], &[0, 1][..]] {
+        let mut input = production_input(&cfg, 2, 2, PrefillShape { rows: 64, waves: 1 });
+        for &rank in ranks {
+            for suffix in ["payload", "suh", "svh"] {
+                input.target.weights[0].1.owners.push(WeightOwner {
+                    allocation: Allocation::buffer(format!("glm.weights.gpu.{rank}.q_a.{suffix}"),
+                        Location::coordinator(rank), 256, Lifetime::RESIDENT, Category::Weights, "GLM target weights"),
+                    group: "attention".into(), format: "exl3-k6".into(),
+                });
+            }
+        }
+        let prepared = input.prepare()?;
+        let contract = prepared.recipe.prepare(&request())?;
+        let facts = contract.facts(&vec![0; contract.variables.len()], 1)?;
+        crate::shared::dense_read::assert_trellis_device_staging(&facts, ranks);
+        for (rank, bytes) in [269_002_112, 140_074_880].into_iter().enumerate() {
+            assert!(facts.allowances.iter().any(|owner| owner.location == Location::coordinator(rank as u8)
+                && owner.source.contains("target weight load device staging") && owner.bytes == bytes));
+        }
+    }
+    Ok(())
+}
+
+#[test]
 fn target_checkpoint_facts_use_exact_inventory_and_preserve_embedding_alternatives() {
     use crate::plan::{testing, Checkpoint};
     let dir = tempfile::tempdir().unwrap();

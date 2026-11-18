@@ -1,8 +1,41 @@
 //! Loading-only row windows shared by native dense admission and the mount reader.
+use crate::placement::planner::{Allocation, ByteCurve, Component, Lifetime, Location, Phase};
 use anyhow::{ensure, Context, Result};
+use cuteafd_core::memory_layout::Category;
 
 pub use cuteafd_ffi::SYNC_H2D_CHUNK_BYTES as STEP_BYTES;
 pub const PINNED_FLOOR_BYTES: usize = 1 << 20;
+pub const DEVICE_STAGING_OWNER: &str = "staging/coordinator-dense-device";
+
+/// Trellis tile transforms reuse one device scratch request per physical rank
+/// during target loading. STEP_BYTES is already SM120 backing-page aligned.
+pub fn trellis_device_staging(rank: u8, maximum_pages: u64) -> Component {
+    let bytes = STEP_BYTES as u64;
+    let owner = Allocation::buffer(format!("{DEVICE_STAGING_OWNER}/gpu{rank}"),
+        Location::coordinator(rank), bytes, Lifetime { first: Phase::Load, last: Phase::Load },
+        Category::Staging, DEVICE_STAGING_OWNER);
+    Component::allocation(owner, ByteCurve::fixed(bytes, maximum_pages), false, maximum_pages)
+}
+
+#[cfg(test)]
+pub(crate) fn assert_trellis_device_staging(facts: &crate::placement::planner::Facts, ranks: &[u8]) {
+    let mut actual = Vec::new();
+    for owner in facts.allocations.iter().filter(|owner| owner.group == DEVICE_STAGING_OWNER) {
+        let crate::placement::planner::Device::Coordinator(rank) = owner.location.device else {
+            panic!("trellis staging outside the coordinator");
+        };
+        assert_eq!(owner.location, Location::coordinator(rank));
+        assert_eq!(owner.bytes, 32 << 20);
+        assert_eq!(owner.category, Category::Staging);
+        assert!(owner.view.is_none());
+        for &phase in facts.phase_order.phases() {
+            assert_eq!(owner.lifetime.contains(phase, facts.phase_order), phase == Phase::Load);
+        }
+        actual.push(rank);
+    }
+    actual.sort_unstable();
+    assert_eq!(actual, ranks);
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReadBatch {

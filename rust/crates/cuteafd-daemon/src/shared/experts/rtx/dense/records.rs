@@ -15,7 +15,7 @@ use crate::shared::memory::Tag;
 pub(crate) use cuteafd_loader::shared::dense_read::STEP_BYTES;
 /// Preferred transform window; indivisible scale units still fit STEP_BYTES.
 pub(crate) const TRANSFORM_BYTES: usize = cuteafd_ffi::push_ring::DEFAULT_SLOT_BYTES;
-use cuteafd_loader::shared::dense_read::{MountLoad, ReadBatch, PINNED_FLOOR_BYTES};
+use cuteafd_loader::shared::dense_read::{MountLoad, ReadBatch, DEVICE_STAGING_OWNER, PINNED_FLOOR_BYTES};
 
 /// Rows `rows` of a checkpoint tensor (rows of `row_bytes` at `base` in `path`),
 /// bytes `cols` of each, packed row by row.
@@ -468,7 +468,7 @@ impl Step {
         let mut device_copy = |scratch: &mut Option<crate::shared::memory::DeviceAllocation<'l>>| -> Result<*const u8> {
             if let Some(ptr) = on_device { return Ok(ptr); }
             if scratch.is_none() {
-                *scratch = Some(crate::shared::memory::DeviceAllocation::new(library, STEP_BYTES, crate::shared::memory::tag(crate::shared::memory::MemoryKind::Staging, "staging/coordinator-dense-device"))?);
+                *scratch = Some(crate::shared::memory::DeviceAllocation::new(library, STEP_BYTES, crate::shared::memory::tag(crate::shared::memory::MemoryKind::Staging, DEVICE_STAGING_OWNER))?);
             }
             let buffer = scratch.as_ref().context("dense device scratch")?.buffer;
             load_timing::upload(self.bytes(), || library.copy_h2d(buffer, &staged[..self.bytes()]))?;
@@ -585,7 +585,7 @@ impl Step {
                     if scratch.is_none() {
                         *scratch = Some(crate::shared::memory::DeviceAllocation::new(library, STEP_BYTES,
                             crate::shared::memory::tag(crate::shared::memory::MemoryKind::Staging,
-                                "staging/coordinator-dense-device"))?);
+                                DEVICE_STAGING_OWNER))?);
                     }
                     let arena = scratch.as_ref().context("absorbed quant staging")?.buffer;
                     let uk_bf16 = CuteafdDeviceBuffer { bytes: uk_bytes, ..arena };

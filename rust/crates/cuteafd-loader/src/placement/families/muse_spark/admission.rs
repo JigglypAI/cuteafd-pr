@@ -446,6 +446,9 @@ impl<'a> ProductionInput<'a> {
             let arena = crate::families::muse_spark::weight_layout::coordinator_arena(
                 gpu, gpus, &global, &rank_layers).map_err(anyhow_refusal)?;
             components.extend(weight_arena_components(&arena, location, Lifetime::RESIDENT, maximum_pages, cuteafd_core::memory_layout::MemoryKind::Weights)?);
+            if (gpu + 1 == gpus && global.head.is_some()) || rank_layers.iter().any(|layer| !layer.core.is_empty()) {
+                components.push(crate::shared::dense_read::trellis_device_staging(gpu as u8, maximum_pages));
+            }
             let mount = crate::families::muse_spark::weight_layout::native_mount_load(
                 layouts.iter().flat_map(|ranks| ranks[gpu].native.values())
                     .chain((gpu + 1 == gpus).then_some(global.head_native.as_ref()).flatten()))
@@ -1082,6 +1085,42 @@ mod contract_tests {
             crate::families::muse_spark::cache::MuseKvCache::Bf16).unwrap();
         let units = cache.geometry.ranks.iter().map(|rank| rank.persistent_unit_bytes).collect::<Vec<_>>();
         crate::plan::testing::pool_facts(cards, context, requested, PAGE_ROWS, &units)
+    }
+
+    #[test]
+    fn trellis_staging_follows_each_muse_target_rank() -> anyhow::Result<()> {
+        use crate::families::muse_spark::{cache::MuseKvCache, weight_layout::projections};
+        use crate::plan::{testing, MediaMode};
+        let dir = tempfile::tempdir()?;
+        testing::write_muse_spark_complete_headers(dir.path());
+        let model = testing::BudgetedPlanInput::open(dir.path())?;
+        let checkpoint = model.checkpoint();
+        let cfg = MuseSparkConfig::from_hf(&checkpoint.config)?;
+        let compact = CoreInventory::from_checkpoint(&cfg, checkpoint)?;
+        let mut head_only = compact.clone();
+        head_only.projections.retain(|name, _| name == "lm_head");
+        for (core, expected) in [(&CoreInventory::default(), &[][..]), (&head_only, &[1][..]), (&compact, &[0, 1][..])] {
+            let cards = [96 << 30; 2];
+            let mut budgets = cards.iter().enumerate().map(|(rank, &bytes)|
+                planned_budget(rank as u8, bytes, bytes, 0, 0)).collect::<Vec<_>>();
+            budgets.extend((0..6).map(|rank| spark_budget(rank, 120 << 30)));
+            let prepared = ProductionInput { kv_cache: MuseKvCache::Bf16, cfg: &cfg, core,
+                projections: projections(&cfg, core, 2, 64)?, catalog: model.expert_catalog()?, budgets,
+                host: HostInput { total: 256 << 30, available: 256 << 30, reserve: 0, prefix_bytes: Some(0),
+                    prefix_entries: 0, media_bytes: None, device_sampling: true },
+                prefill: PrefillPlan { unit_rows: 64, waves: 1, span_rows: 64 }, bf16_target_head: serving::BlasHead::TensorLt,
+                slots: 1, mark_slots: 1, context: 64,
+                pool: crate::placement::prepare_pool(pool_facts(&cfg, &cards, 64, Some(64)))?,
+                partial_bf16_max_rows: 0, partial_reply_formats: Default::default(), local: LocalPackage::Unknown,
+                drafter: None, fixed: vec![], media: MediaOptions::from_checkpoint(checkpoint, MediaMode::Off, MediaMode::Off, 2)?,
+            }.prepare()?;
+            let request = production_request(64, Some(64), crate::placement::Onboard::Auto,
+                PrefillShape { rows: 64, waves: 1 }, Operation::Serving, None, Default::default());
+            let contract = prepared.recipe.prepare(&request)?;
+            let facts = contract.facts(&vec![0; contract.variables.len()], 1)?;
+            crate::shared::dense_read::assert_trellis_device_staging(&facts, expected);
+        }
+        Ok(())
     }
 
     #[test]
