@@ -339,6 +339,8 @@ def main():
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--check-only", action="store_true")
     mode.add_argument("--preflight-only", action="store_true")
+    mode.add_argument("--pilot-layers", type=int, choices=(2,),
+                      help="profile the dense and first MoE/Engram layers; no logits")
     a = parser.parse_args()
     family = Family(a.snapshot, "cpu" if a.check_only else a.device)
     checked = family.check_all()
@@ -351,6 +353,19 @@ def main():
     import torch
     a.out.mkdir(parents=True, exist_ok=True)
     family.configure()
+    layer_major.DEVICE = a.device
+    if a.pilot_layers is not None:
+        import resource
+        if a.device == "cuda":
+            torch.cuda.reset_peak_memory_stats()
+        timing = layer_major.run(a, family)
+        peak = Path("/sys/fs/cgroup/memory.peak")
+        record = {"layers": timing, "peak_rss_bytes": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024,
+                  "cgroup_peak_bytes": int(peak.read_text()) if peak.is_file() else None,
+                  "cuda_peak_reserved_bytes": torch.cuda.max_memory_reserved() if a.device == "cuda" else 0}
+        layer_major.atomic_json(a.out / "pilot.json", record)
+        print(json.dumps(record), flush=True)
+        return
     family.initialize_official()
     report = a.out / "upstream-preflight.json"
     if report.exists():
@@ -364,7 +379,6 @@ def main():
           f"full logits max {max(evidence['full_logit_relative_l2']):.3e}", flush=True)
     family.upstream_preflight = evidence
     if not a.preflight_only:
-        layer_major.DEVICE = a.device
         layer_major.run(a, family)
 
 

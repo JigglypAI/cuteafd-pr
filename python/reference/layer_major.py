@@ -278,6 +278,7 @@ def run(a, family, *, extras_root=None, media_adapter=None):
         return run_trace(a, family, manifest)
 
     checking = getattr(a, "_prefix_probe", False)
+    pilot_layers = getattr(a, "pilot_layers", None)
     started = time.monotonic()
     a.out.mkdir(parents=True, exist_ok=True)
     arithmetic = family.configure()
@@ -303,7 +304,7 @@ def run(a, family, *, extras_root=None, media_adapter=None):
     if media_present:
         pins = {**pins, "media": media_adapter.provenance(a, manifest)}
     marker = a.out / "qualified-gate.json"
-    if official_full:
+    if official_full or pilot_layers is not None:
         proof = None
     elif not checking and marker.exists():
         # Resume: the prefix proof and official arm already passed for this exact binding.
@@ -362,7 +363,8 @@ def run(a, family, *, extras_root=None, media_adapter=None):
             family.release_outer()
             state.commit(pending)
         print(f"resume after layer {state.latest['layer']}; {len(windows)} windows", flush=True)
-        for index in range(state.latest["layer"] + 1, family.layers):
+        stop = family.layers if pilot_layers is None else pilot_layers
+        for index in range(state.latest["layer"] + 1, stop):
             tick = time.monotonic()
             read_before, read_seconds_before = family.checkpoint.read_bytes, family.checkpoint.read_seconds
             wait_for_shards(family, index, getattr(a, "wait_shards", 0))
@@ -418,6 +420,8 @@ def run(a, family, *, extras_root=None, media_adapter=None):
                 log_reference_cuda_memory(torch.cuda, f"after layer {index}")
             print(f"layer {index + 1}/{family.layers} committed; {seconds:.1f}s (load {load_seconds:.1f}s); "
                   f"read {(family.checkpoint.read_bytes - read_before) / 1e9:.2f} GB", flush=True)
+        if pilot_layers is not None:
+            return state.latest["seconds_per_layer"]
         wait_for_tensors(family, family.outer_tensors("final"), getattr(a, "wait_shards", 0))
         equality = None
         if official_full and getattr(a, "official_state", None):
