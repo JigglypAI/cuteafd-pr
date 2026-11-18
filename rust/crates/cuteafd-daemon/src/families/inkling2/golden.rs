@@ -55,15 +55,15 @@ fn raw(buffer: cuteafd_ffi::CuteafdDeviceBuffer, bytes: usize) -> Result<cuteafd
 
 enum ColdExperts {
     Mxfp8 { layout: Mxfp8Layout, scratch: usize },
-    Exl3 { arena: WeightArenaLayout, scratch: [usize; 2], mount: MountLoad },
+    Exl3 { arena: WeightArenaLayout, scratch: Vec<(String, usize)>, mount: MountLoad },
 }
 
 impl ColdExperts {
-    fn facts(&self) -> (&WeightArenaLayout, Vec<(&'static str, usize)>, MountLoad) {
+    fn facts(&self) -> (&WeightArenaLayout, Vec<(String, usize)>, MountLoad) {
         match self {
-            Self::Mxfp8 { layout, scratch } => (&layout.arena, vec![("expert.scratch", *scratch)], layout.mount),
-            Self::Exl3 { arena, scratch, mount } => (arena, vec![("experts.execution.0.shared.workspace", scratch[0]),
-                ("experts.output", scratch[1])], *mount),
+            Self::Mxfp8 { layout, scratch } => (&layout.arena, vec![("expert.scratch".into(), *scratch)], layout.mount),
+            Self::Exl3 { arena, scratch, mount } => (arena, scratch.iter().map(|(name, bytes)|
+                (format!("experts.{name}"), *bytes)).collect(), *mount),
         }
     }
     fn load<'a>(&self, stream: Rc<Stream<'a>>, catalog: &OfficialV41Catalog, metadata: Option<&Fp8MoeMetadata>,
@@ -73,7 +73,7 @@ impl ColdExperts {
             Self::Mxfp8 { layout, .. } => Ok(ColdDispatch::Mxfp8(device.run(|| Mxfp8::load(stream,
                 layout, metadata.context("Inkling MXFP8 metadata missing")?, package, cfg, rows))?)),
             Self::Exl3 { arena, scratch, .. } => {
-                let budget = arena.bytes() + scratch.iter().sum::<usize>();
+                let budget = arena.bytes() + scratch.iter().map(|(_, bytes)| bytes).sum::<usize>();
                 let backend = Exl3Tp2::load_whole_weights(device, catalog, package, vec![layer], rows, budget,
                     RtxSelectionPolicy::CanonicalDecode)?.execution()?;
                 Ok(ColdDispatch::Exl3(Resident::new(layer, Box::new(backend), stream)?))
@@ -94,7 +94,10 @@ impl<'a> ColdDispatch<'a> {
                 experts.inventory(inventory, "experts")?;
                 // The shared backend returns both classes. Its arena already
                 // carries its allocation tag, so retain only resident receipts.
-                inventory.receipts.retain(|r| r.allocation.group == "weight arena" || r.allocation.view.is_some());
+                let arena = inventory.receipts.iter().find(|r| r.allocation.group == "weight arena")
+                    .context("Inkling EXL3 arena receipt missing")?.allocation.id.clone();
+                inventory.receipts.retain(|r| r.allocation.id == arena ||
+                    r.allocation.view.as_ref().is_some_and(|view| view.backing == arena));
                 Ok(())
             }
         }
@@ -107,11 +110,6 @@ impl<'a> ColdDispatch<'a> {
                 experts.inventory(inventory, "experts")?;
                 let mut expert = inventory.receipts.split_off(first);
                 expert.retain(|r| r.allocation.group != "weight arena" && r.allocation.view.is_none());
-                // All selected capacities alias the same physical scratch;
-                // Inventory already deduplicates by backing address.
-                let scratch = expert.iter_mut().find(|r| r.allocation.id.contains(".execution."))
-                    .context("Inkling EXL3 workspace receipt missing")?;
-                scratch.allocation.id = "experts.execution.0.shared.workspace".into();
                 inventory.receipts.extend(expert);
                 Ok(())
             }
@@ -124,7 +122,7 @@ fn run(mut args: GoldenArgs) -> Result<()> {
     ensure!(args.nll, "Inkling cold golden requires --nll");
     let view = args.attention.selected_view.clone().map(Ok).unwrap_or_else(|| args.attention.select(&args.snapshot))?;
     args.attention.validate_view(&view)?;
-    let checkpoint = Checkpoint::coordinator_view(&view, true, false)?;
+    let checkpoint = Checkpoint::open_view(&view)?;
     let cfg = Inkling2Config::from_hf(&checkpoint.config)?;
     ensure!(args.last_layer < cfg.layers, "Inkling --last-layer outside checkpoint");
     let tokens: Vec<u32> = serde_json::from_slice(&std::fs::read(&args.tokens)?)?;
@@ -151,8 +149,7 @@ fn run(mut args: GoldenArgs) -> Result<()> {
             let arena = experts::weight_layout::layout(args.device, "exl3", experts::exl3::regions(&catalog, [layer])?)?;
             let load = Exl3Weights::plan(&catalog, layer)?;
             ensure!(load.device_staging_bytes == 0, "Inkling cold EXL3 requires zero device load staging");
-            let scratch = Exl3Tp2::allocation_sizes_for_selection(&package, cfg.hidden, rows,
-                cuteafd_core::Exl3RowPolicy::for_geometry(geometry), selection)?;
+            let scratch = Exl3Tp2::whole_allocation_layout(&package, rows, geometry, selection)?;
             Ok(ColdExperts::Exl3 { arena, scratch, mount: MountLoad { pinned_source: load.pinned_host_bytes as u64,
                 full_row_cache: load.read_scratch_bytes as u64, pinned_tables: 0 } })
         }

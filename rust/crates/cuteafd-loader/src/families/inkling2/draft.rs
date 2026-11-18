@@ -39,6 +39,7 @@ impl DraftLayout {
                 if let Some(projection)=&mut projection{projection.merge(&need)?;}else{projection=Some(need);}
             }
             if let Some(projection)=projection{
+                weight.validate_trellis(manifest.context("Inkling trellis drafter requires PROGRAMS.json")?, rows)?;
                 work.buffers.push(("projection.trellis".into(),projection.packed_bytes()?));
             }
             if !weight.fp8.is_empty() {

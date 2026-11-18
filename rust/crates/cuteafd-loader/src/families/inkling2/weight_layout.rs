@@ -78,7 +78,7 @@ pub fn fp8_role(name: &str) -> Fp8Role {
     if stem == HEAD { return Fp8Role::padded("vocabulary head", true, 128); }
     let attn = stem.strip_prefix("model.llm.layers.").and_then(|s| s.split_once('.'))
         .is_some_and(|(layer, role)| layer.parse::<usize>().is_ok() && matches!(role,
-            "attn.wq_du" | "attn.wr_du" | "attn.wk_dv" | "attn.wv_dv" | "attn.wo_ud"));
+            "attn.gate_attn" | "attn.wq_du" | "attn.wr_du" | "attn.wk_dv" | "attn.wv_dv" | "attn.wo_ud"));
     Fp8Role::exact("target projection", attn)
 }
 
@@ -97,10 +97,8 @@ impl CoordinatorWeights {
         ensure!(matches!(ranks, 1 | 2), "Inkling 2 coordinator ranks must be 1 or 2");
         ensure!(modes.len() == cfg.layers, "Inkling 2 target layer modes must cover every layer exactly once");
         ensure!(Inkling2Config::from_hf(&checkpoint.config)? == *cfg, "Inkling 2 arena configuration differs from checkpoint");
-        // Indexed MTP matrices belong to the independently admitted drafter.
-        checkpoint.validate_fp8_roles("Inkling 2", |name| {
-            if name.starts_with("mtp.") { Fp8Role::exact("recurrent projection", true) } else { fp8_role(name) }
-        })?;
+        // The recurrent drafter owns MTP source validation and allocation.
+        checkpoint.validate_fp8_roles_where("Inkling 2", |name| !name.starts_with("mtp."), fp8_role)?;
         (0..ranks).map(|rank| {
             let layers = modes.iter().enumerate().filter_map(|(layer, mode)| match mode {
                 LayerMode::Whole { gpu, .. } => (usize::from(*gpu) == rank).then_some(layer),
@@ -209,6 +207,26 @@ impl CoordinatorWeights {
         Ok(scratch)
     }
 
+    pub fn trellis_programs(&self, manifest: &serde_json::Value, rows: usize, head_rows: usize)
+        -> Result<std::collections::BTreeSet<String>> {
+        use cuteafd_ffi::dense_trellis::{validate_package_geometry_bits_with_egress, TrellisDType};
+        use crate::formats::exl3_storage::Exl3Codebook;
+        let mut names = std::collections::BTreeSet::new();
+        let mut shapes = std::collections::BTreeSet::new();
+        for l in self.core.values() {
+            let [n, k] = l.shape;
+            let side = if l.side == TrellisSide::Input { 2 } else { 1 };
+            let book = if l.codebook == Exl3Codebook::Mcg { "mcg" } else { "mul1" };
+            let active = if l.stem == HEAD { head_rows.min(64) } else { rows };
+            if shapes.insert((k, n, side, l.bits, book, active)) {
+                names.extend(validate_package_geometry_bits_with_egress(manifest, k, n, side, l.bits, book,
+                    active, TrellisDType::F32, Some(&format!("dense_trellis_k6_trellis_output_n{n}_f32")))
+                    .with_context(|| format!("{}.weight: Inkling trellis program missing or incompatible", l.stem))?);
+            }
+        }
+        Ok(names)
+    }
+
     pub fn fp8_scratch(&self, manifest: &serde_json::Value, rows: usize, head_rows: usize) -> Result<usize> {
         use cuteafd_ffi::{draft_projection::ProjectionOutput, native_attention::validate_package_geometry};
         self.fp8.values().try_fold(0, |peak, p| {
@@ -288,7 +306,7 @@ impl Builder<'_> {
                 padded_outputs: stem == "model.llm.unembed", view_varying: true }))?;
         let projection = projections.remove(stem).context("Inkling core projection headers absent")?;
         let layout = CoreWeightLayout::new(&projection,
-            if axis == 0 { TrellisSide::Output } else { TrellisSide::Input }, split.unwrap_or(0),
+            if split.is_some() && axis == 1 { TrellisSide::Input } else { TrellisSide::Output }, split.unwrap_or(0),
             if split.is_some() { 2 } else { 1 })?;
         let prefix = projection_prefix(stem, layout.rank, layout.ranks);
         self.tensors.extend(layout.arena_tensors(&prefix)?);

@@ -240,11 +240,13 @@ pub fn gather(request: &FactsRequest<'_>) -> Result<InklingInputs, Refused> {
         .map_err(|error| refused(format!("Inkling 2 target arena inventory refused: {error:#}"),
             "Provide complete core headers for the selected view."))?;
     let target_fp8_scratch = targets.iter().map(|target| {
-        if target.fp8.is_empty() { return Ok(0); }
-        target.fp8_scratch(request.manifest.as_deref().context("Inkling compact FP8 requires PROGRAMS.json")?,
+        if target.core.is_empty() && target.fp8.is_empty() { return Ok(0); }
+        let manifest = request.manifest.as_deref().context("Inkling compact core requires PROGRAMS.json")?;
+        target.trellis_programs(manifest, shape.rows as usize, shared::DECODE_ROWS as usize)?;
+        target.fp8_scratch(manifest,
             shape.rows as usize, shared::DECODE_ROWS as usize)
-    }).collect::<anyhow::Result<Vec<_>>>().map_err(|error| refused(format!("Inkling FP8 inventory refused: {error:#}"),
-        "Install the Inkling native block-FP8 projection exports."))?;
+    }).collect::<anyhow::Result<Vec<_>>>().map_err(|error| refused(format!("Inkling compact program inventory refused: {error:#}"),
+        "Install the Inkling native trellis and block-FP8 projection exports."))?;
     let mount = targets.iter().map(|target| target.mount_load(request.checkpoint)).collect::<anyhow::Result<Vec<_>>>()
         .map_err(|error| refused(format!("Inkling 2 mount inventory refused: {error:#}"), "Check checkpoint headers."))?;
     let experts = layer_experts(request.checkpoint, cfg).map_err(|error| refused(

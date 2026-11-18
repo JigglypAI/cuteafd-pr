@@ -89,6 +89,7 @@ INSTALLED_PLANNERS = (
     'openai::chat::muse::tests::served_snapshot_matches_the_fixture_when_present',
     'openai::chat::glm5::tests::served_snapshot_template_matches_the_fixture_when_present',
     'openai::chat::glm5::tests::vision_template::installed_official_and_mc_templates_follow_vision_policy_when_present',
+    'installed_inkling_mc_views_have_native_target_and_draft_programs',
     'installed_mc_views_cover_executable_projection_manifests',
     'installed_qwen_hybrid_min_sim_and_dual_publish_exact_layer_homes',
     'installed_dense_qwen_one_and_two_rtx_publish_exact_native_owners',

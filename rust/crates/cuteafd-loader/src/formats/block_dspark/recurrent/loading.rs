@@ -75,7 +75,7 @@ impl RecurrentSource {
                     requests.borrow_mut().extend([(format!("{stem}.values"), n*k), (format!("{stem}.scales"), n/128*(k/128)*4)]);
                     fp8.borrow_mut().insert(name, layout);
                 } else if self.checkpoint.contains_tensor(&format!("{stem}.trellis")) {
-                    let side = if matches!(axis, Some(ShardAxis::Columns)) { TrellisSide::Input } else { TrellisSide::Output };
+                    let side = if ranks > 1 && matches!(axis, Some(ShardAxis::Columns)) { TrellisSide::Input } else { TrellisSide::Output };
                     let split = match axis { Some(ShardAxis::Rows) => CoreSplit::Output,
                         Some(ShardAxis::Columns) => CoreSplit::Input, None => CoreSplit::Whole };
                     let mut projections = crate::formats::trellis_core::read_projections(&self.checkpoint,
@@ -110,6 +110,9 @@ impl RecurrentSource {
             arena: WeightArenaLayout::new(format!("block-dspark/recurrent/weights/{rank}"), requests)?,
             core: core.into_inner(), fp8: fp8.into_inner() };
         self.validate_inventory()?;
+        self.checkpoint.validate_fp8_roles_where("recurrent block drafter", |name| name.starts_with(&self.prefix), |name| {
+            Fp8Role::exact("recurrent projection", result.fp8.contains_key(name) || (rank != lead && name.contains(".markov_head.")))
+        })?;
         Ok(result)
     }
 
@@ -137,6 +140,22 @@ pub struct RecurrentWeightLayout {
 }
 
 impl RecurrentWeightLayout {
+    pub fn validate_trellis(&self, manifest: &serde_json::Value, rows: usize) -> Result<()> {
+        use cuteafd_ffi::dense_trellis::{validate_package_geometry_bits, TrellisDType};
+        use crate::formats::exl3_storage::Exl3Codebook;
+        let mut seen = std::collections::BTreeSet::new();
+        for (name, l) in &self.core {
+            let [n, k] = l.shape;
+            let side = if l.side == TrellisSide::Input { 2 } else { 1 };
+            let book = if l.codebook == Exl3Codebook::Mcg { "mcg" } else { "mul1" };
+            if seen.insert((k, n, side, l.bits, book)) {
+                validate_package_geometry_bits(manifest, k, n, side, l.bits, book, rows, TrellisDType::Bf16)
+                    .with_context(|| format!("{name}: recurrent trellis program missing or incompatible"))?;
+            }
+        }
+        Ok(())
+    }
+
     pub fn fp8_scratch(&self, manifest: &serde_json::Value, rows: usize) -> Result<usize> {
         use cuteafd_ffi::{draft_projection::ProjectionOutput, native_attention::validate_package_geometry};
         self.fp8.iter().try_fold(0, |peak, (name, p)| {

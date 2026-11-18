@@ -13,7 +13,7 @@ fn cold_contract(facts: Facts, rows: usize) -> Contract {
 }
 
 pub(crate) fn admit(checkpoint: &Checkpoint, cfg: &Inkling2Config, target: &CoordinatorWeights,
-    expert_arena: &cuteafd_loader::serving_capacity::WeightArenaLayout, expert_scratch: &[(&str, usize)],
+    expert_arena: &cuteafd_loader::serving_capacity::WeightArenaLayout, expert_scratch: &[(String, usize)],
     expert_mount: cuteafd_loader::shared::dense_read::MountLoad, unit: &UnitLayout, head_rows: usize, fp8_bytes: usize,
     free: u64, total: u64, host: (u64, u64)) -> Result<ResolvedPlan> {
     let empty = Facts { phase_order: PhaseOrder::TARGET_THEN_DRAFT, resident_weights: vec![], allocations: vec![],
@@ -28,7 +28,7 @@ pub(crate) fn admit(checkpoint: &Checkpoint, cfg: &Inkling2Config, target: &Coor
         *bytes as u64, Lifetime::TARGET, Category::Workspace)).collect::<Vec<_>>();
     for (name, bytes) in [("head.tokens", head_rows*4), ("head.normalized", head_rows*cfg.hidden*2),
         ("head.logits", head_rows*cfg.unpadded_vocab_size*4), ("head.workspace", Head::workspace_bytes(cfg, head_rows)?)]
-        .into_iter().chain(expert_scratch.iter().copied()) {
+        .into_iter().chain(expert_scratch.iter().map(|(name, bytes)| (name.as_str(), *bytes))) {
         buffers.push((name.into(), Location::coordinator(0), bytes as u64, Lifetime::TARGET, Category::Workspace));
     }
     let trellis = target.trellis_scratch(unit.rows, head_rows.min(64))?

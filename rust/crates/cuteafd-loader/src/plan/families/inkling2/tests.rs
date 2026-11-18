@@ -581,6 +581,55 @@ fn compact_core_headers_preserve_native_keeps_and_plan_exact_trellis_arenas() ->
 }
 
 #[test]
+fn installed_inkling_mc_views_have_native_target_and_draft_programs() -> anyhow::Result<()> {
+    use crate::{families::inkling2::{draft::DraftLayout, weight_layout::{CoordinatorWeights, HEAD}},
+        placement::{families::inkling2::layer_modes, AttentionPlacement}, plan::checkpoint::{CheckpointView, CoreView}};
+    let home = std::path::PathBuf::from(std::env::var("CUTEAFD_DEPLOYMENT_TEST_HF_HOME")?);
+    let snapshot = crate::model_cache_dir(&home, "wrldsuksgo2mars/Inkling-2-Small-EXL3-K4-MC")
+        .join("snapshots/6caa0ba08eb564ddc88b98df06ac73e853cc559e");
+    let manifest = std::path::PathBuf::from(std::env::var("CUTEAFD_DEPLOYMENT_TEST_PROGRAMS")?);
+    let exports = serde_json::from_slice(&std::fs::read(&manifest)?)?;
+    for mode in [CoreView::Original, CoreView::K8Compact, CoreView::K6Compact, CoreView::Fp8Compact] {
+        let view = CheckpointView::select(&snapshot, mode)?;
+        let checkpoint = Checkpoint::open_view(&view)?;
+        let cfg = Inkling2Config::from_hf(&checkpoint.config)?;
+        let target = CoordinatorWeights::plan(&checkpoint, &cfg, 1,
+            &layer_modes(&cfg, 1, AttentionPlacement::Heads))?.remove(0);
+        let drafts = DraftLayout::new(&view, 1, 16, 8, 262144, 2_097_152, 2048, 3, 188,
+            Default::default(), Some(&exports))?;
+        let draft = &drafts.weights[0];
+        let compact = mode != CoreView::Original;
+        assert_eq!(target.stored_head(), compact.then_some(201088));
+        assert_eq!(target.arena.view(&format!("{HEAD}.weight")).is_none(), compact);
+        assert!(target.arena.view("model.llm.embed.weight").is_some());
+        assert!(target.arena.views().keys().all(|name| !name.starts_with("mtp.") && !name.starts_with("model.visual.")));
+        assert!(draft.arena.view("derived.fold_weight").is_some());
+        assert!(draft.arena.view(&format!("{HEAD}.weight")).is_none());
+        match mode {
+            CoreView::Original => assert!(target.core.is_empty() && target.fp8.is_empty() && draft.core.is_empty() && draft.fp8.is_empty()),
+            CoreView::K6Compact | CoreView::K8Compact => {
+                let bits = if mode == CoreView::K6Compact { 6 } else { 8 };
+                assert_eq!((target.core.len(), draft.core.len()), (289,45));
+                assert!(target.core.values().chain(draft.core.values()).all(|p| p.bits == bits
+                    && p.side == crate::formats::dense_trellis::TrellisSide::Output));
+                assert!(!target.trellis_programs(&exports, 2048, 64)?.is_empty());
+            }
+            CoreView::Fp8Compact => {
+                assert_eq!((target.fp8.len(), draft.fp8.len()), (289,45));
+                assert!(target.fp8_scratch(&exports, 2048, 64)? > 0);
+            }
+        }
+        let input = testing::BudgetedPlanInput::from_checkpoint(checkpoint);
+        let report = input.plan(&PlanOptions { placement: plan::ExpertPlacement::from_spark_ranks(4),
+            vision: plan::MediaMode::Off, audio: plan::MediaMode::Off,
+            layout: Some(plan::layout::LayoutOptions { workspace_manifest: Some(manifest.clone()),
+                inkling_dspark: true, ..Default::default() }), ..Default::default() })?;
+        assert!(report.fits && report.wip_launchable(), "{mode}: {:?}", report.hints);
+    }
+    Ok(())
+}
+
+#[test]
 fn shared_recipe_charges_every_owner_once_on_one_and_two_rtx() {
     use crate::families::inkling2::{experts::layer_experts, weight_layout::CoordinatorWeights};
     use crate::placement::families::inkling2::{self as shared, InklingInputs, LocalPackage, SparkCharge};
