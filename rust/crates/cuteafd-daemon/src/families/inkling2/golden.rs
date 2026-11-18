@@ -21,6 +21,7 @@ pub(crate) struct GoldenArgs {
     /// Prefix stops after this zero-based layer; no full-model claim if <47.
     #[arg(long, default_value_t=0)] last_layer: usize,
     #[arg(long, default_value_t=0)] pub device: i32,
+    #[arg(long, requires="width_invariance")] pub split_device: Option<i32>,
     /// Existing parent; files are created below this new directory.
     #[arg(long)] pub save_logits: PathBuf,
     #[arg(long)] nll: bool,

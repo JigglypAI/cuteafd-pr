@@ -43,6 +43,13 @@ def test_predeclared_inkling_producer_stems(monkeypatch):
     expected += ['residual_q1_keep', 'residual_q1_add', 'residual_q3_keep', 'residual_q3_add', 'router_e384_k8']
     assert stems == expected
     assert len(stems) == len(set(stems)) == 33
+    split = {stem: compiler() for stem, _, _, compiler in scope['inkling2_producer_programs'](4096, 2)}
+    assert len(split) == 22 and not set(split).intersection(stems)
+    assert split['clip_local_q_f32_tp2']['heads'] == 24
+    assert split['clip_local_k_f32_tp2']['heads'] == 4
+    assert split['kv_pack_fp8_f32_v2_tp2']['heads'] == 4
+    assert split['conv_dynamic_h512_f32_v2']['heads'] == 4
+
     for stem, _, params, compiler in programs:
         import json
         json.dumps(params)
@@ -84,6 +91,9 @@ def test_inkling_projection_and_wire_quantization_inventory():
     assert scope['inkling2_projection_shapes']() == {
         (4608, 6144), (4608, 768), (4608, 1024), (4608, 48), (4608, 32), (4608, 384),
         (6144, 4608), (64, 1024)}
+    assert scope['inkling2_projection_shapes'](2) == {
+        (4608, 3072), (4608, 384), (4608, 512), (4608, 24), (4608, 16),
+        (3072, 4608), (64, 1024)}
     quant = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name=='inkling2_input_quant_program')
     calls = [n for n in ast.walk(quant) if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
              and n.func.id=='compile_mxfp8_rows_quant_aot']

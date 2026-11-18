@@ -668,7 +668,7 @@ def test_inkling2_dispatch_package_codes_cmake_and_placement_scopes_agree(monkey
                  "compile_native_attention_projection": lambda n, k, rows, output: (k, n, rows, output),
                  # Full producer inventory is checked by test_inkling2_producer_exports;
                  # this isolated dispatcher test needs no CUDA/compiler imports.
-                 "inkling2_producer_programs": lambda rows: [],
+                 "inkling2_producer_programs": lambda rows, parts: [],
                  "inkling2_load_programs": lambda: [],
                  # Recurrent primitive and TP geometry inventories have their own tests.
                  "inkling_draft_programs": lambda: [],
@@ -687,7 +687,10 @@ def test_inkling2_dispatch_package_codes_cmake_and_placement_scopes_agree(monkey
         namespace.update(family=family, suffix=suffix, op=op)
         exec(compile(ast.Module(body=[stem], type_ignores=[]), "stem", "exec"), namespace)
         if op == "attention":
-            assert thunk() == params
+            actual = thunk()
+            geo = actual.pop("g", None)
+            assert geo == (Geometry(24, 4) if suffix.endswith("_tp2") else None)
+            assert actual == params
             names.append((namespace["stem"], params))
         elif op == "expert_input_quant":
             assert namespace["stem"] == "inkling2_expert_input_quant" and thunk() == "native-wire"
@@ -705,10 +708,11 @@ def test_inkling2_dispatch_package_codes_cmake_and_placement_scopes_agree(monkey
     expected_fp8.update((k, n, rows, "bf16") for _, k, n, _ in compact.INKLING_SHAPES
         if n != 201088 for rows in (64, 4096))
     assert fp8 == expected_fp8
-    assert len(namespace["work"]) == 6 + 1 + 8 + 2 + len(expected_fp8)
+    assert len(namespace["work"]) == 12 + 1 + 13 + 2 + len(expected_fp8)
     assert names == [
-        (f"inkling2_{kind}_attention_{route}_{fmt}_v2_m{rows}",
+        (f"inkling2_{kind}_attention_{route}_{fmt}_v2_m{rows}{tp}",
          dict(kind=kind, route=route, max_rows=rows, kv_format=fmt))
+        for tp in ("", "_tp2")
         for kind in ("local", "global")
         for fmt in (("bf16", "fp8") if kind == "global" else ("bf16",))
         for route, rows in (("decode", 64), ("prefill", 4096))
@@ -716,7 +720,8 @@ def test_inkling2_dispatch_package_codes_cmake_and_placement_scopes_agree(monkey
     # Non-default capacities reach the pinned compiler and the stem.
     custom = namespace["inkling2_attention_programs"](16, 2048)
     assert [(suffix, thunk()["max_rows"]) for suffix, _, _, thunk in custom] == [
-        (f"{kind}_attention_{route}_{fmt}_v2_m{rows}", rows)
+        (f"{kind}_attention_{route}_{fmt}_v2_m{rows}{tp}", rows)
+        for tp in ("", "_tp2")
         for kind in ("local", "global")
         for fmt in (("bf16", "fp8") if kind == "global" else ("bf16",))
         for route, rows in (("decode", 16), ("prefill", 2048))

@@ -97,7 +97,69 @@ impl<'a> UnitIo<'a> for TokenIo<'_, 'a> {
     }
 }
 
+pub(crate) struct PeerUnits<'s, 'a> {
+    pub exchange: &'s crate::shared::peer_split::PeerExchange<'a>,
+    pub graphs: Option<&'s mut super::engine::DecodeGraphs<'a>>,
+    pub kernels: &'s Kernels<'a>,
+    pub target: &'s TargetWeights<'a>,
+    pub cache: &'s super::cache::CacheBank<'a>,
+    pub owners: &'s [super::owners::UnitOwner<'a>],
+    pub uploads: &'s mut [crate::shared::token_table::RetainedUploads<'a>],
+}
+
+impl<'a> PeerUnits<'_, 'a> {
+    fn attention(&mut self, kernels: &Kernels<'a>, lead_graphs: Option<&mut super::engine::DecodeGraphs<'a>>,
+        lead: &impl UnitBuffers<'a>, target: &TargetWeights<'_>,
+        cfg: &Inkling2Config, layer: usize, unit: &Unit, members: &[super::owners::PackedMember]) -> Result<()> {
+        use crate::shared::peer_split::DIRECT;
+        let peer = &self.owners[unit.slot];
+        let rows = unit.rows.len();
+        let bytes = rows * cfg.hidden * 4;
+        let input = layers::mix_attention_input(kernels, lead, target, cfg, layer, rows)?;
+        let source = if layer == 0 { "partial" } else if cfg.local[layer] { "mixed" } else { "global_mixes" };
+        let dst = peer.buffer(source)?;
+        if layer == 0 || cfg.local[layer] {
+            self.exchange.push_to(0, DIRECT, input.ptr, dst.ptr, bytes)?;
+        } else {
+            let src = lead.buffer(source)?;
+            let pitch = peer.layout.rows * cfg.hidden * 4;
+            ensure!(pitch == lead.layout().rows * cfg.hidden * 4 && src.bytes >= 3 * pitch && dst.bytes >= 3 * pitch,
+                "Inkling peer attention input plane geometry differs");
+            self.exchange.push_planes(0, DIRECT, &[cuteafd_ffi::peer_exchange::PeerPlane {
+                destination: dst.ptr, source: src.ptr, rows: 3, row_bytes: bytes as u64,
+                destination_pitch: pitch as u64, source_pitch: pitch as u64,
+            }])?;
+        }
+        self.exchange.on(1, || peer.packed_metadata(layer, self.cache, members, &mut self.uploads[unit.slot]))?;
+        self.exchange.wait(1, DIRECT)?;
+        let peer_state = super::owners::PackedLayerUnit { unit: peer, cache: self.cache, layer, members,
+            uploads: std::cell::RefCell::new(&mut self.uploads[unit.slot]) };
+        // Both ranks consume rank-local KV and write an F32 output partial.
+        self.exchange.on(1, || {
+            layers::attend_heads(self.kernels, &peer_state, self.target, cfg, layer, rows, dst)?;
+            let work = || layers::project_heads(self.kernels, &peer_state, self.target, cfg, layer, rows);
+            if let Some(graphs) = &mut self.graphs { graphs.project(layer, rows, work) } else { work() }
+        })?;
+        self.exchange.push(1, 0, peer.buffer("branch")?.ptr, bytes)?;
+        layers::attend_heads(kernels, lead, target, cfg, layer, rows, input)?;
+        let work = || layers::project_heads(kernels, lead, target, cfg, layer, rows);
+        if let Some(graphs) = lead_graphs { graphs.project(layer, rows, work)?; } else { work()?; }
+        self.exchange.wait(0, 0)?;
+        let remote = cuteafd_ffi::CuteafdDeviceBuffer { ptr: self.exchange.recv(0, 0)?,
+            bytes, device_id: lead.stream().device.id, flags: 0 };
+        let reduced = lead.buffer("mlp")?;
+        // SAFETY: outputs are disjoint F32 rows; the matching wait published
+        // the receive slot. Rank 1 cannot overwrite it until the next input
+        // push on this same lead stream, after the reduction consumes it.
+        unsafe { kernels.add.launch(lead.buffer("branch")?, remote, reduced, rows * cfg.hidden, lead.stream().raw)?; }
+        layers::finish_attention(kernels, lead, target, cfg, layer, rows, reduced)?;
+        layers::prepare_ffn_input(kernels, lead, target, cfg, layer, rows)
+    }
+}
+
 pub(crate) struct Stateful<'s, 'a> {
+    pub graphs: Option<&'s mut super::engine::DecodeGraphs<'a>>,
+    pub peer: Option<PeerUnits<'s, 'a>>,
     pub kernels: &'s Kernels<'a>,
     pub owners: &'s [super::owners::UnitOwner<'a>],
     pub cache: &'s super::cache::CacheBank<'a>,
@@ -183,7 +245,11 @@ impl PrefillHooks for Stateful<'_, '_> {
         owner.packed_metadata(layer, self.cache, &members, &mut self.uploads[unit.slot])?;
         let state = super::owners::PackedLayerUnit { unit: owner, cache: self.cache, layer, members: &members,
             uploads: std::cell::RefCell::new(&mut self.uploads[unit.slot]) };
-        layers::begin_layer(self.kernels, &state, self.target, self.cfg, layer, unit.rows.len())?;
+        if let Some(peer) = &mut self.peer {
+            peer.attention(self.kernels, self.graphs.as_deref_mut(), &state, self.target, self.cfg, layer, unit, &members)?;
+        } else {
+            layers::begin_layer(self.kernels, &state, self.target, self.cfg, layer, unit.rows.len())?;
+        }
         self.io.stage(layer,"attention",unit,owner)
     }
     fn local_ffn(&mut self, layer: usize, unit: &Unit) -> Result<()> {

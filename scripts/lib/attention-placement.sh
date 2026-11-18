@@ -30,7 +30,7 @@ release_check_attention_placement() {
     auto:step5|heads:step5|auto:muse_spark|heads:muse_spark|auto:inkling2|heads:inkling2) ;;
     *:step5) release_die "Step-5 has no context/layers attention executor: SWA splits heads and CSA uses whole owners" ;;
     *:muse_spark) release_die "Muse has no context/layers attention executor: native attention splits heads" ;;
-    *:inkling2) release_die "inkling2 serving has one whole-layer attention coordinator executor; context/layers require a multi-GPU executor" ;;
+    *:inkling2) release_die "inkling2 supports heads attention only; context and layers are not implemented" ;;
     auto:*|heads:*|context:glm5|context:glm5_flash|context:deepseek_v4|layers:qwen4|layers:qwen3_5) ;;
     # K4/P7 qualified explicit layers; context remains the recorded auto default.
     # The planner still requires the selected image's executor and native programs.
