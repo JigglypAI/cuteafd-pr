@@ -214,7 +214,7 @@ fn a_host_ancestor_beats_a_deeper_device_media_partial() {
     let mut cache = cache(&fake, 1, 1 << 20);
     let original = seq(100, 1500);
     let image = media_span(ImageKey([7; 32]));
-    let keys = |tokens| MediaKeys::new(tokens, 5000, &[image]).unwrap();
+    let keys = |tokens: &[u32]| MediaKeys::new(tokens, 5000, &[image]).unwrap();
     for (ring, tokens) in [(0, &original[..512]), (1, original.as_slice())] {
         let keyed = keys(tokens);
         // Seed both snapshots cold; the deeper snapshot then evicts the ancestor.
