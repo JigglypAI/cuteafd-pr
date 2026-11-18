@@ -80,6 +80,101 @@ impl<'a> Resident<'a> {
         Ok(layers.into_iter().map(|layer| Self { layer, backend: owner.backend.clone(), stream: owner.stream.clone() }).collect())
     }
 }
+struct SplitResident<'a> {
+    layer: usize,
+    owner: Rc<std::cell::RefCell<crate::shared::experts::rtx::owner_tp2::OwnerTp2<'a>>>,
+    // The shared owner holds raw stream handles through its terminal drain.
+    _streams: [Rc<Stream<'a>>; 2],
+}
+impl Dispatcher for SplitResident<'_> {
+    fn wire_input(&self) -> bool { self.owner.borrow().wire }
+    fn enqueue(&self, input: Buffer, ids: Buffer, weights: Buffer, output: Buffer,
+        rows: usize, stream: &Stream<'_>) -> Result<()> {
+        let mut owner = self.owner.borrow_mut();
+        ensure!(owner.exchange.stream(0) == stream.raw && owner.exchange.device(0) == stream.device.id
+            && [input, ids, weights, output].iter().all(|part| part.device_id == stream.device.id)
+            && input.bytes >= rows * if owner.wire { 4752 } else { 4608 * 2 }
+            && ids.bytes >= rows * 8 * 4 && weights.bytes >= rows * 8 * 4 && output.bytes >= rows * 4608 * 2,
+            "Inkling TP2 routed operand differs from the issuing owner");
+        // SAFETY: admitted private unit planes remain live through both peer
+        // streams, and the shared executor serializes its retained scratch.
+        unsafe { owner.enqueue_routed(0, self.layer, rows, input.ptr,
+            crate::shared::experts::rtx::Routes { ids: ids.ptr, weights: weights.ptr }, output.ptr) }
+    }
+}
+
+pub(crate) fn serving_dispatchers<'a>(stream: Rc<Stream<'a>>, peer: Option<Rc<Stream<'a>>>,
+    catalog: &cuteafd_loader::OfficialV41Catalog, native: &Path,
+    backings: &[cuteafd_loader::placement::families::inkling2::LocalBacking], rows: usize,
+    pushed: Vec<Vec<crate::shared::experts::rtx::push::PushedExperts<'a>>>, cfg: &Inkling2Config,
+    admitted: &cuteafd_loader::placement::planner::ResolvedPlan)
+    -> Result<Vec<Box<dyn Dispatcher + 'a>>> {
+    use crate::shared::experts::rtx::{exl3::Exl3Tp2, fp8moe::Fp8MoeTp2, owner_tp2::OwnerTp2,
+        push::PushedExperts, RtxExpertLayer, RtxSelectionPolicy};
+    use crate::shared::peer_split::RankDevice;
+    let gpus = 1 + usize::from(peer.is_some());
+    let groups = super::weights::local_groups(backings, gpus)?;
+    ensure!(pushed.len() == gpus && pushed.iter().all(|rank| rank.len() == groups.len()),
+        "Inkling expert push rank/group dimensions differ");
+    let mut pushed = pushed.into_iter().map(Vec::into_iter).collect::<Vec<_>>();
+    let mut dispatchers = Vec::<(usize, Box<dyn Dispatcher + 'a>)>::new();
+    for (group_index, group) in groups.into_iter().enumerate() {
+        let layers = group[0].layers.clone();
+        let lead = pushed[0].next().context("Inkling pushed lead expert set absent")?;
+        if let Some(peer) = &peer {
+            let peer_set = pushed[1].next().context("Inkling pushed peer expert set absent")?;
+            let devices = [stream.device, peer.device];
+            let workspace = |rank: usize| group[rank].workspace.iter().try_fold(0usize, |n, (_, bytes)|
+                n.checked_add(usize::try_from(*bytes)?).context("Inkling TP2 expert workspace overflow"));
+            let expected = [workspace(0)?, workspace(1)?];
+            let budgets = [group[0].arena.bytes() + expected[0], group[1].arena.bytes() + expected[1]];
+            let experts: [Box<dyn RtxExpertLayer + 'a>; 2] = match (lead, peer_set) {
+                (PushedExperts::Fp8(left), PushedExperts::Fp8(right)) => {
+                    let tensors = catalog.fp8().context("Inkling native pushed catalog missing")?.for_layer_metadata(layers[0])?;
+                    let dir = crate::shared::experts::fp8::package_directory(native, 2, tensors.format());
+                    Fp8MoeTp2::pushed_pair(devices, &tensors, &dir, layers.clone(), rows, budgets, [left, right])?
+                        .map(|rank| Box::new(rank) as Box<dyn RtxExpertLayer>)
+                }
+                (PushedExperts::Exl3(left), PushedExperts::Exl3(right)) => {
+                    let dir = native.parent().context("Inkling native directory missing")?.join("exl3/exl3-inkling2-k45/rtx-tp2");
+                    let [left, right] = Exl3Tp2::pushed_pair_weights(devices, catalog, cuteafd_core::ExpertGeometry::INKLING2,
+                        [&dir, &dir], layers.clone(), rows, budgets, RtxSelectionPolicy::CanonicalDecode, [left, right])?;
+                    [Box::new(left.execution()?), Box::new(right.execution()?)]
+                }
+                _ => anyhow::bail!("Inkling TP2 pushed expert formats differ"),
+            };
+            ensure!(experts.iter().zip(expected).all(|(expert, bytes)| expert.workspace_bytes() == bytes),
+                "Inkling TP2 native workspace differs from admission");
+            let wire = experts[0].uses_fp8_input();
+            let endpoints = [&stream, peer].map(|s| RankDevice { device: s.device.id, stream: s.raw });
+            let owner = OwnerTp2::new(stream.device.library, endpoints, experts,
+                cfg.hidden, cfg.topk, rows, 64, wire, "inkling2")?;
+            let prefix = format!("inkling2.tp2.{}.", group_index * 2);
+            let transport = owner.transport_buffers();
+            let selected = admitted.facts.allocations.iter().filter(|a| a.id.starts_with(&prefix)
+                || a.id.starts_with(&format!("inkling2.tp2.{}.", group_index * 2 + 1))).count();
+            ensure!(transport.len() == selected, "Inkling TP2 expert exchange backing count differs from admission");
+            for (rank, name, buffer) in transport {
+                let id = format!("inkling2.tp2.{}.{name}", group_index * 2 + rank);
+                let spec = admitted.facts.allocations.iter().find(|allocation| allocation.id == id)
+                    .with_context(|| format!("Inkling TP2 expert exchange owner not admitted: {id}"))?;
+                ensure!(spec.bytes == buffer.bytes as u64 && buffer.device_id == devices[rank].id
+                    && spec.location == cuteafd_loader::placement::planner::Location::coordinator(rank as u8),
+                    "Inkling TP2 expert exchange owner differs: {id}");
+            }
+            let owner = Rc::new(std::cell::RefCell::new(owner));
+            for layer in layers { dispatchers.push((layer, Box::new(SplitResident { layer, owner: owner.clone(), _streams: [stream.clone(), peer.clone()] }))); }
+        } else {
+            let resident = Resident::from_pushed(stream.clone(), catalog, native, &group[0], rows, lead)?;
+            dispatchers.extend(layers.into_iter().zip(resident.into_iter().map(|owner| Box::new(owner) as Box<dyn Dispatcher>)));
+        }
+    }
+    dispatchers.sort_by_key(|(layer, _)| *layer);
+    ensure!(dispatchers.iter().enumerate().all(|(index, (layer, _))| index == *layer),
+        "Inkling resident layers are not the admitted ordered prefix");
+    Ok(dispatchers.into_iter().map(|(_, owner)| owner).collect())
+}
+
 impl Dispatcher for Resident<'_> {
     fn wire_input(&self) -> bool { self.backend.borrow().uses_fp8_input() }
     fn enqueue(&self, input: Buffer, ids: Buffer, weights: Buffer, output: Buffer,

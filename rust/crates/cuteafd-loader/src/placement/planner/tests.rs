@@ -2450,11 +2450,35 @@ fn pool_pins_are_exact_and_context_is_never_clamped() {
         let text = refusal.to_string();
         assert!(text.contains(&format!("maximum feasible pool is {tokens} tokens")), "{text}");
         assert!(text.contains("lower explicit context"), "{text}");
-        let Refusal::FullContextShortfall { context: actual, tokens: maximum, limiting } = refusal else {
+        let Refusal::FullContextShortfall { context: actual, requirement, tokens: maximum, limiting } = refusal else {
             panic!("expected a full-context refusal");
         };
+        assert_eq!(requirement, ContextRequirement::Pinned);
         assert_eq!((actual, maximum), (context, tokens));
         assert!(matches!(*limiting, Refusal::Capacity { phase: Phase::PostTargetKv, .. }));
+    }
+}
+
+#[test]
+fn automatic_pool_shortfall_reports_the_source_of_the_kv_min_floor() {
+    use cuteafd_core::memory_policy::{AGENTIC_FLOOR_TOKENS, MemoryPolicy};
+    let recipe = Linear::new();
+    let pool = 204_544;
+    for (configured, source, requirement) in [
+        (None, "KV_MIN_TOKENS default", ContextRequirement::DefaultKvMin),
+        (Some(AGENTIC_FLOOR_TOKENS), "configured KV_MIN_TOKENS", ContextRequirement::ConfiguredKvMin),
+    ] {
+        MemoryPolicy { kv_min: configured, ..Default::default() }.scoped(|| {
+            for context in [Context::automatic(1 << 20), Context::resolve(1 << 20, Some(pool))] {
+                let refusal = solve(Request { context, ..request() }, vec![budget(pool)], &recipe).unwrap_err();
+                let text = refusal.to_string();
+                assert!(text.starts_with(&format!("minimum context floor {AGENTIC_FLOOR_TOKENS} ({source}) cannot fit: maximum feasible pool is {pool} tokens; limiting constraint:")), "{text}");
+                assert!(!text.contains("lower explicit context"), "{text}");
+                assert!(matches!(refusal, Refusal::FullContextShortfall { context: AGENTIC_FLOOR_TOKENS,
+                    requirement: actual, tokens, limiting } if actual == requirement && tokens == pool
+                    && matches!(*limiting, Refusal::Capacity { .. })));
+            }
+        });
     }
 }
 

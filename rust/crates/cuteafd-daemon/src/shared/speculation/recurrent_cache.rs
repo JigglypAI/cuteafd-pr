@@ -69,7 +69,8 @@ pub(crate) struct ContextBank { pub state:RefCell<ContextState> }
 impl ContextBank {
     /// Context inputs are one contiguous causal sequence span. The caller
     /// tiles prefill and packed members through this shared operation.
-    pub fn append(&self,rank:&Rank<'_>,slot:usize,start:usize,features:Buffer,rows:usize)->Result<()> {
+    pub fn append_ranked(&self,rank:&Rank<'_>,split:Option<&super::gqa_tp2::GqaHeadSplit<'_,Rank<'_>>>,
+        slot:usize,start:usize,features:Buffer,rows:usize)->Result<()> {
         ensure!(rows>0 && rows<=rank.layout.context_rows,"recurrent context append row capacity");
         let (reservation,physical)={
             let mut state=self.state.borrow_mut();let binding=state.binding(slot)?;
@@ -85,6 +86,15 @@ impl ContextBank {
                 (start..start+rows).map(|p|(slot*window+p%window) as i64).collect(),
         }).collect::<Vec<_>>();
         let result=(||{
+            if let Some(split)=split {
+                use crate::shared::peer_split::DIRECT;
+                let input=split.peer.buffer("context.taps")?;
+                let bytes=rows*rank.config.taps.len()*rank.config.transformer.hidden*2;
+                ensure!(features.bytes>=bytes && input.bytes>=bytes,"recurrent peer feature extent differs");
+                split.exchange.push_to(split.lead,DIRECT,features.ptr,input.ptr,bytes)?;
+                split.exchange.wait(1-split.lead,DIRECT)?;
+                split.peer.stream.device.run(||split.peer.store_context(input,&positions,&destinations))?;
+            }
             rank.store_context(features,&positions,&destinations)?;
             if rank.layout.rank.rank==rank.layout.rank.lead {
                 let width=rank.config.transformer.hidden*2;
@@ -94,11 +104,17 @@ impl ContextBank {
                 rank.recurrent_feature(last,Buffer{ptr:f.ptr.wrapping_byte_add(slot*width),bytes:width,..f})?;
             }
             rank.stream.drain()?;
+            if let Some(split)=split{split.peer.stream.drain()?;}
             self.state.borrow_mut().pool.commit(reservation,rows)?;Ok(())
         })();
         if result.is_err(){
             // A failed producer may still read/write the provisional pages.
             // Never return them to the pool until native stream retirement.
+            if let Some(split)=split {
+                let drained=(||{split.exchange.publish_abort()?;split.exchange.drain_compute()})();
+                split.exchange.finish_terminal(drained.is_ok());
+                crate::shared::decode_graph::fatal_drain(drained,"recurrent failed peer context append");
+            }
             rank.stream.drain_or_abort("recurrent failed context append");
             self.state.borrow_mut().pool.commit(reservation,0)?;
         }

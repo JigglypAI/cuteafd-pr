@@ -103,6 +103,7 @@ pub struct LocalBacking {
     pub arena: WeightArenaLayout,
     /// Named physical requests, never an aggregate CUDA allocation.
     pub workspace: Vec<(String, u64)>,
+    pub tp2_rows: Option<crate::serving_capacity::OwnerTp2Rows>,
 }
 
 /// One Spark rank's charges at one onboarding count (layers `count..` remote).
@@ -285,7 +286,10 @@ impl InklingInputs {
 
     fn modes(&self) -> Vec<LayerMode> { self.modes.clone() }
 
-    fn head_gpu(&self) -> u8 { (self.gpus - 1) as u8 }
+    pub(crate) fn head_rank(gpus: usize, modes: &[LayerMode]) -> usize {
+        if modes.iter().all(|mode| *mode == LayerMode::HeadSplit) { 0 } else { gpus - 1 }
+    }
+    fn head_gpu(&self) -> u8 { Self::head_rank(self.gpus, &self.modes) as u8 }
 
     /// Context pages are parity-interleaved over the pair: twice the rows per page.
     pub fn page_rows(&self) -> u64 {
@@ -316,7 +320,7 @@ impl InklingInputs {
         // Whole owners hand the residual to the last owner; split layers keep
         // a replicated residual on both ranks (no hop).
         let terminal = if self.modes.iter().all(|mode| matches!(mode, LayerMode::Whole { .. })) {
-            TerminalHome::AttentionOwner } else { TerminalHome::Replicated };
+            TerminalHome::AttentionOwner } else { TerminalHome::Head };
         HopSpec { storage: HopStorage::ReceiveSlots, row_bytes: rows * self.cfg.hidden as u64 * 4,
             rows: self.prefill.rows.max(u64::from(DECODE_ROWS)), lanes: LANES, entry_gpu: 0,
             head_gpu: self.head_gpu(), terminal }
@@ -402,7 +406,8 @@ impl InklingInputs {
     fn unit_owners(&self, prefix: &str, gpu: usize, rows: u32, maximum: u64) -> Result<Vec<Component>, Refusal> {
         let location = Location::coordinator(gpu as u8);
         let context = usize::try_from(self.context.maximum).map_err(|_| Refusal::Overflow("Inkling context"))?;
-        let layout = crate::families::inkling2::execution::UnitLayout::serving_format(&self.cfg, rows as usize, context, self.kv_format, self.sequences as usize)
+        let parts = if self.modes.iter().all(|mode| *mode == LayerMode::HeadSplit) { 2 } else { 1 };
+        let layout = crate::families::inkling2::execution::UnitLayout::serving_head_parts(&self.cfg, rows as usize, context, self.kv_format, self.sequences as usize, parts)
             .map_err(refusal)?;
         let mut out = Vec::new();
         let uploads = layout.upload_shape(&self.cfg, usize::try_from(self.sequences).map_err(|_| Refusal::Overflow("Inkling upload members"))?
@@ -500,15 +505,15 @@ impl InklingInputs {
         for slot in 0..self.prefill.waves {
             out.extend(self.unit_owners(&format!("inkling2.unit.{gpu}.{slot}"), gpu, rows, maximum)?);
         }
-        if self.gpus == 2 {
-            // TP2 expert exchange (shared `OwnerTp2Rows` ABI: BF16 rows, two
-            // abortable slots, reduction, peer control and abort word), one
-            // unit wide; decode rows fit within it.
-            let rows = crate::serving_capacity::OwnerTp2Rows::new(cfg.hidden as u64, cfg.topk as u64,
-                self.prefill.rows.max(u64::from(DECODE_ROWS)), false).map_err(refusal)?;
-            for demand in rows.demands().map_err(refusal)?.into_iter().filter(|d| usize::from(d.gpu) == gpu) {
-                out.extend(buffer(format!("inkling2.tp2.{gpu}.{}", demand.group.replace(' ', "_")), location,
-                    demand.bytes, Lifetime::TARGET, demand.category, &demand.group, maximum));
+        if self.modes.iter().all(|mode| *mode == LayerMode::HeadSplit) {
+            let bytes = self.prefill.rows.max(u64::from(DECODE_ROWS)) * cfg.hidden as u64 * 4;
+            let peer = crate::serving_capacity::PeerStorageLayout::new(1, usize::try_from(bytes)
+                .map_err(|_| Refusal::Overflow("Inkling head exchange"))?,
+                crate::serving_capacity::peer_wait_diagnostics()).map_err(refusal)?;
+            for (name, bytes) in [("recv.0", peer.receive_bytes), ("control", peer.control_bytes),
+                ("progress", peer.progress_bytes), ("abort", 256)] {
+                out.extend(buffer(format!("inkling2.attention.{gpu}.peer.{name}"), location, bytes as u64,
+                    Lifetime::TARGET, Category::Transport, "head-parallel F32 attention exchange", maximum));
             }
         }
         out.extend(allowance(location, self.graph_reserve[gpu], Lifetime { first: Phase::Warmup, last: Phase::Growth },
@@ -637,6 +642,19 @@ impl Recipe for InklingInputs {
                     let location = Location::coordinator(backing.gpu as u8);
                     components.extend(with(weight_arena_components(&backing.arena, location, Lifetime::RESIDENT,
                         maximum, MemoryKind::Experts)?, &activation));
+                    if let Some(rows) = backing.tp2_rows {
+                        let peer = crate::serving_capacity::PeerStorageLayout::new(2, usize::try_from(rows.exchange_slot_bytes)
+                            .map_err(|_| Refusal::Overflow("Inkling expert peer slot"))?,
+                            crate::serving_capacity::peer_wait_diagnostics()).map_err(refusal)?;
+                        for (name, bytes) in [("send", rows.bytes), ("reduced", rows.reduction_bytes),
+                            ("peer.recv.0", peer.receive_bytes as u64), ("peer.recv.1", peer.receive_bytes as u64),
+                            ("peer.control", peer.control_bytes as u64), ("peer.progress", peer.progress_bytes as u64),
+                            ("peer.abort", 256)] {
+                            components.extend(with(buffer(format!("inkling2.tp2.{group}.{name}"), location, bytes,
+                                Lifetime::TARGET, Category::Transport, "shared resident expert exchange", maximum)
+                                .into_iter().collect(), &activation));
+                        }
+                    }
                     for (name, bytes) in &backing.workspace {
                         components.extend(with(buffer(format!("inkling2.expert_workspace.{}.{}.{}.{}", backing.gpu, count, group, name),
                             location, *bytes, Lifetime::RESIDENT, Category::Workspace,
@@ -693,6 +711,16 @@ impl Recipe for InklingInputs {
                     let bytes=work.window_mark_bytes.checked_mul(self.prefix_mark_slots).ok_or(Refusal::Overflow("draft marks"))? as u64;
                     components.extend(buffer(format!("inkling2.draft.{rank}.marks"),location,bytes,lifetime,Category::Drafter,
                         "exact drafter window and last-feature marks",maximum));
+                }
+            }
+            for (name,bytes) in &draft.layout.peer {
+                components.extend(buffer(format!("inkling2.draft.peer.{name}"),Location::coordinator(1),*bytes as u64,lifetime,
+                    Category::Drafter,"peer exact accepted-prefix FIR owner",maximum));
+            }
+            for rank in 0..self.gpus {
+                for (name,bytes) in &draft.layout.exchange {
+                    components.extend(buffer(format!("inkling2.draft.{rank}.{name}"),Location::coordinator(rank as u8),
+                        *bytes as u64,lifetime,Category::Drafter,"recurrent head exchange and reduction",maximum));
                 }
             }
             for (name,bytes) in &draft.layout.target {

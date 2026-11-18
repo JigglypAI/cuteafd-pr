@@ -13,6 +13,42 @@ use crate::formats::{dense_trellis::TrellisSide,
     trellis_core::{CoreContract, CoreSplit, CoreWeightLayout}};
 use std::collections::BTreeMap;
 
+/// Checkpoint rectangle for a native arena view; column ranges are in bytes.
+pub struct NativeSource<'a> {
+    pub name: &'a str,
+    pub rows: std::ops::Range<usize>,
+    pub columns: std::ops::Range<usize>,
+    pub row_bytes: usize,
+}
+
+impl<'a> NativeSource<'a> {
+    pub fn new(checkpoint: &Checkpoint, view: &'a str, rank: usize) -> Result<Self> {
+        let (name, split) = match view.split_once("#rank") {
+            Some((name, owner)) => {
+                ensure!(rank < 2 && owner.parse::<usize>()? == rank, "Inkling native view rank differs: {view}");
+                let axis = usize::from(name.ends_with(".attn.wo_ud.weight") || name.ends_with("_sconv.static_w"));
+                (name, Some(axis))
+            }
+            None => (view, None),
+        };
+        let header = checkpoint.header(name).with_context(|| format!("Inkling native view lacks {name}"))?;
+        let count = if header.shape.len() >= 2 { header.shape[0] } else { 1 };
+        let bytes = usize::try_from(header.byte_length)?;
+        ensure!(count > 0 && bytes.is_multiple_of(count), "Inkling native view has invalid source rows: {name}");
+        let row_bytes = bytes / count;
+        let mut rows = 0..count;
+        let mut columns = 0..row_bytes;
+        if let Some(axis) = split {
+            ensure!(header.shape.len() >= 2 && header.shape[axis].is_multiple_of(2),
+                "Inkling native view cannot split source axis {axis}: {name}");
+            let range = if axis == 0 { &mut rows } else { &mut columns };
+            let half = range.len() / 2;
+            *range = rank * half..(rank + 1) * half;
+        }
+        Ok(Self { name, rows, columns, row_bytes })
+    }
+}
+
 /// Header-only shared push receive owners for one onboarding candidate.
 /// Dense core sources land unchanged; the relative transpose writes its final
 /// generated device view without any additional host staging.
@@ -118,7 +154,8 @@ impl CoordinatorWeights {
                 builder.plain(format!("{TEXT}embed.weight"), DType::Bf16, &[v, h])?;
                 builder.plain(format!("{TEXT}embed_norm.weight"), DType::Bf16, &[h])?;
             }
-            if rank + 1 == ranks {
+            let head = if modes.iter().all(|mode| *mode == LayerMode::HeadSplit) { 0 } else { ranks - 1 };
+            if rank == head {
                 builder.projection(format!("{TEXT}unembed.weight"), &[v, h], 0, None)?;
                 builder.plain(format!("{TEXT}norm.weight"), DType::Bf16, &[h])?;
                 builder.plain(format!("{TEXT}attn_res.output_query"), DType::F32, &[h])?;
@@ -168,14 +205,10 @@ impl CoordinatorWeights {
         let mut load = MountLoad::default();
         for (view_name, view) in self.arena.views() {
             if self.is_specialized_view(view_name) { continue; }
-            let (name, share) = match view_name.split_once('#') { Some((name, _)) => (name, 2), None => (view_name.as_str(), 1) };
-            let header = checkpoint.header(name).with_context(|| format!("Inkling 2 mount lacks {name}"))?;
-            ensure!(header.byte_length == view.bytes() as u64 * share, "Inkling 2 mount {name}: admitted bytes differ");
-            let rows = if header.shape.len() >= 2 { header.shape[0] } else { 1 };
-            let rows = rows.div_ceil(share as usize).max(1);
-            ensure!(view.bytes() % rows == 0, "Inkling 2 mount {name}: invalid row extent");
-            let row_bytes = view.bytes() / rows;
-            load.merge(MountLoad::read(ReadBatch::new(rows, row_bytes, row_bytes, STEP_BYTES)?));
+            let source = NativeSource::new(checkpoint, view_name, self.rank)?;
+            let (rows, width) = (source.rows.len(), source.columns.len());
+            ensure!(rows.checked_mul(width) == Some(view.bytes()), "Inkling 2 mount {view_name}: admitted bytes differ");
+            load.merge(MountLoad::read(ReadBatch::new(rows, source.row_bytes, width, STEP_BYTES)?));
         }
         for layout in self.core.values() {
             for suffix in ["trellis", "suh", "svh"] {

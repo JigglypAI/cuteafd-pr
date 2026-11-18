@@ -7,7 +7,8 @@ use std::{cell::{Cell,RefCell},rc::Rc,sync::atomic::{AtomicU64,Ordering}};
 
 static NEXT_OWNER:AtomicU64=AtomicU64::new(1);
 pub(crate) struct Mark<'a>{owner:u64,generation:u64,checkpoint:Rc<Allocation<'a>>,pub slots:Vec<(usize,usize)>}
-pub(crate) struct TargetMark<'a>{pub conv:Mark<'a>,pub placements:Vec<super::cache::Placement>}
+pub(crate) struct TargetMark<'a>{pub conv:Vec<Mark<'a>>,pub placements:Vec<super::cache::Placement>}
+#[derive(Clone)]
 pub(crate) struct Submitted{pub slot:usize,pub start:usize,pub first:usize,pub rows:usize}
 pub(crate) struct Verify<'a>{
  pub checkpoint:Rc<Allocation<'a>>,pub replay:Allocation<'a>,table:Allocation<'a>,
@@ -21,6 +22,9 @@ impl<'a> Verify<'a>{
   let mark_layout=MarkLayout::new(&[(stream.device.id,layout.history_bytes()?)])?;
   let checkpoint=Rc::new(Allocation::new(stream.device,layout.history_bytes()?,Tag::kv("inkling2/verify-conv-checkpoint"))?);
   let replay=Allocation::new(stream.device,layout.replay_bytes()?,Tag::workspace("inkling2/verify-conv-replay"))?;
+  // The attention peer produces only its K/V replay channels. Its unused
+  // hidden FIR lanes remain exact zeros across every accepted-prefix commit.
+  if width<11264{stream.device.library.cuda_zero_bytes(replay.buffer,replay.buffer.bytes)?;}
   let table=Allocation::new(stream.device,64*12,Tag::workspace("inkling2/verify-conv-table"))?;
   let owner=NEXT_OWNER.fetch_update(Ordering::Relaxed,Ordering::Relaxed,|id|id.checked_add(1))
    .map_err(|_|anyhow::anyhow!("Inkling verify owner identity exhausted"))?;

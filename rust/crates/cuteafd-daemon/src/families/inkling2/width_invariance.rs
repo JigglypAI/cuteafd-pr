@@ -10,17 +10,17 @@ pub(crate) struct Trace{pub samples:Vec<Sample>}
 pub(crate) struct Sample{layer:usize,stage:String,rows:usize,buffers:BTreeMap<String,Vec<u8>>}
 impl Trace{
     pub fn capture(&mut self,layer:usize,stage:&str,rows:usize,owner:&UnitOwner<'_>)->Result<()>{
-        let fields:&[(&str,usize)]=match stage{
-            "entry"=>&[("partial",4608*4)],
-            "attention"=>&[("q_bf16",6144*2),("k",1024*4),("v",1024*4),
-                ("conv_k",1024*4),("conv_v",1024*4),("k_clipped",1024*4),("v_norm",1024*4),
-                ("relative",48*1024*2),("sinks",48*4),("attended",6144*2),
-                ("gated",6144*2),("attention",4608*4),("projection_input",4608*2)],
-            "experts"=>&[("projection_input",4608*2),("expert_wire",4752),("route_logits",384*4),("route_ids",8*4),("route_weights",8*4),("expert_output",4608*2)],
-            "exit"=>&[("partial",4608*4)],_=>anyhow::bail!("unknown Inkling width trace stage {stage}")};
+        let fields:&[&str]=match stage{
+            "entry"|"exit"=>&["partial"],
+            "attention"=>&["q_bf16","k","v","conv_k","conv_v","k_clipped","v_norm",
+                "relative","sinks","attended","gated","attention","projection_input"],
+            "experts"=>&["projection_input","expert_wire","route_logits","route_ids","route_weights","expert_output"],
+            _=>anyhow::bail!("unknown Inkling width trace stage {stage}")};
         owner.stream.drain()?;
-        let buffers=fields.iter().map(|&(name,stride)|{
-            let buffer=owner.buffer(name)?;let bytes=rows.checked_mul(stride).context("width trace extent overflow")?;
+        let buffers=fields.iter().map(|&name|{
+            let buffer=owner.buffer(name)?;
+            ensure!(buffer.bytes.is_multiple_of(owner.layout.rows),"width trace {name} has an invalid rank-local row stride");
+            let bytes=rows.checked_mul(buffer.bytes/owner.layout.rows).context("width trace extent overflow")?;
             ensure!(bytes<=buffer.bytes,"width trace {name} outside owner");
             let mut data=vec![0;bytes];owner.stream.device.library.copy_d2h(&mut data,Buffer{bytes,..buffer})?;
             Ok((name.to_owned(),data))
@@ -61,31 +61,42 @@ fn verify_kept(execution:&mut Execution<'_>,placement:&mut Placement,tokens:&[u3
     Ok(result)
 }
 fn state(execution:&Execution<'_>,placement:&Placement)->Result<BTreeMap<String,Vec<u8>>>{
-    let bank=&execution.requests.cache;let library=execution.requests.decode.stream.device.library;
-    execution.requests.decode.stream.drain()?;
-    let read=|buffer:Buffer|->Result<Vec<u8>>{let mut bytes=vec![0;buffer.bytes];library.copy_d2h(&mut bytes,buffer)?;Ok(bytes)};
     let mut output=BTreeMap::new();
     output.insert("bookkeeping".into(),serde_json::to_vec(&(placement.len,placement.state_len,&placement.units))?);
-    output.insert("conv".into(),read(bank.conv_for_sequence(placement.slot)?)?);
-    for &layer in &bank.layout.global_layers{
-        let stride=bank.layout.page_bytes/64;let mut bytes=Vec::new();
-        for position in (0..placement.len).step_by(64){
-            let page=bank.page(layer,placement.units[position/64] as usize)?;
-            bytes.extend(read(Buffer{bytes:(placement.len-position).min(64)*stride,..page})?);
-        }
-        output.insert(format!("global.layer.{layer}"),bytes);
+    for (rank,requests) in execution.request_ranks().enumerate(){
+        let bank=&requests.cache;
+        let stream=&requests.decode.stream;
+        stream.drain()?;
+        stream.device.run(||{
+            let read=|buffer:Buffer|->Result<Vec<u8>>{let mut bytes=vec![0;buffer.bytes];stream.device.library.copy_d2h(&mut bytes,buffer)?;Ok(bytes)};
+            output.insert(format!("rank.{rank}.conv"),read(bank.conv_for_sequence(placement.slot)?)?);
+            for &layer in &bank.layout.global_layers{
+                let stride=bank.layout.page_bytes/64;let mut bytes=Vec::new();
+                for position in (0..placement.len).step_by(64){
+                    let page=bank.page(layer,placement.units[position/64] as usize)?;
+                    bytes.extend(read(Buffer{bytes:(placement.len-position).min(64)*stride,..page})?);
+                }
+                output.insert(format!("rank.{rank}.global.layer.{layer}"),bytes);
+            }
+            for (layer,geometry) in bank.layout.layers.iter().enumerate(){if geometry.ring_rows==0{continue;}
+                let ring=bank.field(placement.slot,layer,"ring")?;let stride=geometry.kv_width*4;
+                let mut bytes=Vec::new();
+                for position in placement.len.saturating_sub(execution.cfg.window)..placement.len{
+                    let offset=position%geometry.ring_rows*stride;
+                    bytes.extend(read(Buffer{ptr:ring.ptr.wrapping_byte_add(offset),bytes:stride,..ring})?);
+                }
+                output.insert(format!("rank.{rank}.ring.layer.{layer}"),bytes);
+            }
+            Ok(())
+        })?;
     }
-    for (layer,geometry) in bank.layout.layers.iter().enumerate(){if geometry.ring_rows==0{continue;}
-        let ring=bank.field(placement.slot,layer,"ring")?;let stride=geometry.kv_width*4;
-        let mut bytes=Vec::new();
-        // Rejected rows outside the live horizon are not model state.
-        for position in placement.len.saturating_sub(execution.cfg.window)..placement.len{
-            let offset=position%geometry.ring_rows*stride;
-            bytes.extend(read(Buffer{ptr:ring.ptr.wrapping_byte_add(offset),bytes:stride,..ring})?);
-        }
-        output.insert(format!("ring.layer.{layer}"),bytes);
-    }Ok(output)
+    Ok(output)
 }
+fn restore(execution:&Execution<'_>)->Result<()> {
+    for requests in execution.request_ranks(){requests.cache.restore(0,0)?;requests.cache.drain()?;}
+    Ok(())
+}
+
 fn state_difference(actual:&BTreeMap<String,Vec<u8>>,expected:&BTreeMap<String,Vec<u8>>)->Option<serde_json::Value>{
     actual.iter().find_map(|(owner,bytes)|{let reference=expected.get(owner)?;
         if bytes==reference{return None;}
@@ -95,14 +106,14 @@ fn state_difference(actual:&BTreeMap<String,Vec<u8>>,expected:&BTreeMap<String,V
     })
 }
 fn commit_sweep(execution:&mut Execution<'_>,saved:&Placement,tokens:&[u32],widths:&[usize])->Result<serde_json::Value>{
-    let bank=execution.requests.cache.clone();let mut passes=Vec::new();let mut clean=true;
+    let mut passes=Vec::new();let mut clean=true;
     execution.width_trace=None;
     for &width in widths{for keep in 0..=width{
-        bank.restore(0,0)?;bank.drain()?;let mut reference=saved.clone();
+        restore(execution)?;let mut reference=saved.clone();
         for token in &tokens[..keep]{decode(execution,&mut reference,std::slice::from_ref(token))?;}
         let expected=state(execution,&reference)?;
         let next_reference=decode(execution,&mut reference,&tokens[keep..keep+1])?;
-        bank.restore(0,0)?;bank.drain()?;let mut candidate=saved.clone();
+        restore(execution)?;let mut candidate=saved.clone();
         verify_kept(execution,&mut candidate,&tokens[..width],Some(keep))?;
         let actual=state(execution,&candidate)?;let difference=state_difference(&actual,&expected);
         let next=decode(execution,&mut candidate,&tokens[keep..keep+1])?;
@@ -197,13 +208,14 @@ pub(crate) fn run(args:&mut GoldenArgs)->Result<()>{
     let programs=library.programs()?.with_manifest(&args.manifest)?;
     let vision=crate::shared::vision::still::Options { vision:cuteafd_loader::plan::MediaMode::Off,..Default::default() };
     let (mut execution,inputs,admitted,_,_media)=super::startup::whole(&library,&programs,&view,&checkpoint,&cfg,super::startup::Options{
-        device:args.device,peers:&args.peers,manifest:&args.manifest,native_lib:&args.native_lib,
+        device:args.device,split_device:args.split_device,peers:&args.peers,manifest:&args.manifest,native_lib:&args.native_lib,
         prefill:PrefillShape{rows:args.prefill_rows as u64,waves:args.prefill_waves},sequences:args.max_sequences as u64,
         context_tokens:0,pool_tokens:args.pool_tokens,kv_format:args.kv_format,drafter:Some(args.draft_kv_cache),
         onboard:args.rtx_expert_layers.resolve(cfg.layers),prefix:&args.prefix,
         resident_weights:crate::shared::memory::budget::resident_weight_limit(),expert_usage:false,vision:&vision})?;
     ensure!(inputs.prefix_mark_slots>0,"width oracle has no admitted target mark");
-    let bank=execution.requests.cache.clone();bank.reset(0)?;
+    let bank=execution.requests.cache.clone();
+    for requests in execution.request_ranks(){requests.cache.reset(0)?;}
     execution.draft.as_ref().unwrap().drafter.reset_context(0,0)?;
     let mut placement=Placement{media:None,units:(0..(args.prefill+maximum+usize::from(args.commit_invariance)).div_ceil(64)).map(|page|page as u32).collect(),slot:0,len:0,state_len:0};
     ensure!(placement.units.len()<=bank.layout.pool_pages,"width oracle prefix exceeds admitted target pages");
@@ -211,7 +223,7 @@ pub(crate) fn run(args:&mut GoldenArgs)->Result<()>{
     let mut units=crate::shared::prefill_pipeline::sequence_units(args.prefill,args.prefill_rows,args.prefill_waves as usize,cfg.layers)?;
     for unit in &mut units{unit.segments=vec![UnitSegment{sequence:0,rows:0..unit.rows.len(),tokens:unit.rows.clone(),prompt_end:false,snapshot:false,head:false}];}
     execution.prefill(std::slice::from_mut(&mut placement),&[&tokens[..args.prefill]],&units,1,&mut|_,_,_|Ok(()))?;
-    bank.capture(0,0)?;bank.drain()?;
+    for requests in execution.request_ranks(){requests.cache.capture(0,0)?;requests.cache.drain()?;}
     let saved=placement.clone();
     let mut reference=Vec::new();let mut base_logits=Vec::new();
     for row in 0..maximum{
@@ -223,7 +235,7 @@ pub(crate) fn run(args:&mut GoldenArgs)->Result<()>{
     let mut passes=Vec::new();let mut clean=true;
     let widths=std::iter::once(1).chain(args.width_invariance.iter().copied().filter(|&width|width>1)).chain(std::iter::once(1));
     for width in widths{
-        bank.restore(0,0)?;bank.drain()?;placement=saved.clone();
+        restore(&execution)?;placement=saved.clone();
         execution.width_trace=Some(RefCell::new(Trace::default()));
         let logits=verify(&mut execution,&mut placement,&tokens[args.prefill..args.prefill+width])?;
         let trace=execution.width_trace.take().unwrap().into_inner();
