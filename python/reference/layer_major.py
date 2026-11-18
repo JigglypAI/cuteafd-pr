@@ -356,7 +356,8 @@ def run(a, family, *, extras_root=None, media_adapter=None):
                 atomic_json(a.out / "media-reference.json", media_identity)
             pending = state.begin(-1)
             for window in windows:
-                state.save(pending, window["id"], {"hidden": embed_window(family, window, features)})
+                carry = family.initial_carry(window) if hasattr(family, "initial_carry") else {}
+                state.save(pending, window["id"], {"hidden": embed_window(family, window, features), **carry})
             del features
             family.release_outer()
             state.commit(pending)
@@ -443,7 +444,9 @@ def run(a, family, *, extras_root=None, media_adapter=None):
                     del tiled_logits
                 del full_logits
             else:
-                logits = family.final(selected).float().cpu().numpy()
+                use_official_head = wid == "official_short" and getattr(family, "compare_official_head", False)
+                head = family.official_final if use_official_head else family.final
+                logits = head(selected).float().cpu().numpy()
             if not np.isfinite(logits).all():
                 raise ValueError("non-finite reference logits")
             if wid in ("official_short", "adapted_short"):

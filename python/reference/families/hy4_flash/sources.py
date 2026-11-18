@@ -1,0 +1,33 @@
+"""Pinned Hy4 source and known differences from the released metadata."""
+
+CHECKPOINT = "tencent/Hy4-flash"
+REVISION = "d88c9dfd96ba4f2e6b92adba0b8e8f1c8696f959"
+TRANSFORMERS_REVISION = "c2ec850510a37978ea83df226589623d5f2be776"  # PR 50903
+TRANSFORMERS_FILES = {
+    "models/hy_v4_flash/modeling_hy_v4_flash.py": "43341929e4bec215c224fc837b24b534b4de41954992673a0655a65060e38b9b",
+    "models/hy_v4_flash/configuration_hy_v4_flash.py": "dc62bd7c6bc8f57375d3f71cf4eb861e3a36887d57cd75f6b11752fcf04256cf",
+    "conversion_mapping.py": "dcb88ad0abf0859b27e7494c1030271740da863981bffebf19d62e470545fc90",
+}
+TENCENT_REVISION = "7ab20f35602b1d3fc863f85aee20cb87eb8e53c5"
+VLLM_RECIPE_REVISION = "51d9b9ab07f18797c5db0092671b20171a621728"
+SGLANG_REVISION = "ccb8d9ccaa309f71dda42e37517a7b0ee6afae8d"  # PR 51159
+
+SEMANTICS = {
+    "namespace": "Checkpoint HC, linear_gate and learnable_sink_param keys are renamed by HF conversion_mapping; "
+                 "this oracle reads the original keys directly. deepseek_sparse_attention is indexed_attention in HF.",
+    "attention": "The raw qk_norm flag does not introduce additional per-head norms in HF; q_a and kv_a are normalized. "
+                 "HF expands MLA KV-B before attention; serving recipes may absorb it. Text uses the same position on all M-RoPE axes.",
+    "moe": "Expert down projects into latent space and expert up returns to hidden width (HF F.linear convention). "
+           "Fused gate/up are contiguous halves. Only the routed expert gates/up channels are clipped.",
+    "engram": "The README names zero-based decoder indices; config names one-based layer IDs. The BF16 table stays "
+              "BF16 on disk; HF applies per-vector E4M3 round-trip after lookup and before head RMS normalization. "
+              "The hash multipliers use engram_seed and the loaded map's max + 1, not the table's row count.",
+    "scope": "The Tencent repository provides the recipe, not a separate eager text implementation. "
+             "vLLM/SGLang are serving recipes, not the F32 oracle. Vision, DFly and runtime KV cache are excluded.",
+}
+
+ROOT_ARITHMETIC = {
+    "source": "Transformers PR 50903 pinned eager F32 text semantics, ported independently",
+    "arithmetic": "BF16 checkpoint, IEEE F32 forward; per-vector Engram E4M3 QDQ; "
+                  "fixed-M128 projections and query tiles; vision, cache and DFly off.",
+}
