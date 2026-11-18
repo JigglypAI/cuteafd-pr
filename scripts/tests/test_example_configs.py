@@ -616,6 +616,47 @@ def _effective(entry: dict, matrix: dict) -> dict[str, str]:
     return {**keys(ROOT / entry["config"]), **matrix["defaults"]["set"], **entry["set"]}
 
 
+GATE_KIT = "scripts/bench/kits/gate/matrix-gate.json"
+# Each family's shipped drafter; Kimi splits by checkpoint (K3 Core-K6 DFlash2,
+# K3.1 block DSpark).
+GATE_SPECULATOR_DEFAULTS = {"deepseek_v41": "dspark", "deepseek_v4": "dspark",
+                            "glm5": "dflash2", "glm5_flash": "dflash2",
+                            "mimo_v2": "dflash2", "qwen4": "mtp", "step5": "mtp",
+                            "muse_spark": "dflash2", "minimax_m3": "dspark"}
+# Card name -> why it intentionally differs from the family default. Empty:
+# no gate card overrides its family's shipped drafter.
+GATE_SPECULATOR_EXCEPTIONS: dict[str, str] = {}
+
+
+def _default_speculator(family: str, model: str) -> str:
+    if family == "kimi_k3":
+        return "dspark" if "K3.1" in model else "dflash2"
+    return GATE_SPECULATOR_DEFAULTS[family]
+
+
+def test_gate_kit_cards_resolve_each_family_default_speculator() -> None:
+    matrix = json.loads((ROOT / GATE_KIT).read_text())
+    names = set()
+    kimi = set()
+    for entry in matrix["entries"]:
+        assert entry["name"] not in names, entry["name"]
+        names.add(entry["name"])
+        values = {**keys(ROOT / entry["config"]), **entry.get("set", {})}
+        if entry["family"] == "kimi_k3":
+            kimi.add(values["MODEL_ID"])
+        if entry["name"] in GATE_SPECULATOR_EXCEPTIONS:
+            assert GATE_SPECULATOR_EXCEPTIONS[entry["name"]].strip(), entry["name"]
+            continue
+        declared = values.get("SPECULATOR", "auto")
+        expected = _default_speculator(entry["family"], values["MODEL_ID"])
+        assert declared != "off", f"{entry['name']}: cards run the family's shipped drafter"
+        assert (expected if declared == "auto" else declared) == expected, entry["name"]
+        assert "SPECULATOR_MODEL_ID" not in entry.get("set", {}), entry["name"]
+    # Both Kimi generations have their own cards, on their own shipped drafters.
+    assert kimi == {"wrldsuksgo2mars/Kimi-K3-EXL3-K2-Core-K6",
+                    "wrldsuksgo2mars/Kimi-K3.1-Pro-EXL3-K2-MC"}
+
+
 def test_v6_smoke_matrix_retires_the_5090_column() -> None:
     smoke = json.loads((ROOT / V6).read_text())
     names, ports, cards = set(), set(), set()
