@@ -317,25 +317,6 @@ pub fn gather(request: &FactsRequest<'_>) -> Result<InklingInputs, Refused> {
         Err(error) => return Err(refused(format!("Inkling checkpoint namespace refused: {error}"),
             "Restore SparkNest namespace metadata; required push cannot fall back to mount.")),
     };
-    let push_host = (0..=routed.len()).map(|count| {
-        if !push_required { return Ok(None); }
-        let backings = match &local {
-            LocalPackage::Installed { backings } => backings[count].as_slice(),
-            LocalPackage::Missing(_) if count == 0 => &[],
-            LocalPackage::Missing(_) => return Ok(None),
-        };
-        let mut envelope = super::weight_layout::push_host_envelope(&catalog, backings, gpus)?;
-        for (gpu, target) in targets.iter().enumerate() {
-            if target.core.is_empty() && target.fp8.is_empty() { continue; }
-            // One rank-local transform per non-overlapping source window. The
-            // shared receive check validates the actual window bound at offer.
-            let largest = cuteafd_ffi::push_ring::DEFAULT_SLOT_BYTES.max(cfg.hidden*128*2);
-            envelope.dense_bytes[gpu] = crate::push_load::admitted_push_envelope(largest as u64,
-                cuteafd_ffi::push_ring::DEFAULT_SLOTS, cuteafd_ffi::push_ring::DEFAULT_SLOT_BYTES as u64)?;
-        }
-        Ok(Some(envelope))
-    }).collect::<anyhow::Result<Vec<_>>>().map_err(|error| refused(format!("Inkling push host inventory refused: {error:#}"),
-        "Provide complete native push source/descriptor headers."))?;
     let capacities = (0..gpus).map(|gpu| request.coordinator.budget(gpu).logical_bytes).collect::<Vec<_>>();
     let mut pool_facts = crate::placement::PoolFacts::new(Context::resolve(context, (request.context_tokens > 0).then_some(request.context_tokens)), request.pool_tokens, page_rows);
     pool_facts.memory = pool_memory(cfg, request.kv_format, &modes, page_rows, &capacities);
@@ -355,6 +336,35 @@ pub fn gather(request: &FactsRequest<'_>) -> Result<InklingInputs, Refused> {
             usize::try_from(shape.rows)?,usize::try_from(shape.waves)?,selection.sms,selection.kv_cache,request.manifest.as_deref())
             .map(|layout|shared::Drafter{layout})
     }).transpose().map_err(|error|refused(format!("bundled drafter inventory refused: {error:#}"),"Check MTP tensor headers and exports."))?;
+    let dense_push_bytes = targets.iter().enumerate().map(|(rank, target)| {
+        let draft = drafter.as_ref().map(|draft| &draft.layout.weights[rank]);
+        let trellis_window = if target.core.is_empty() && draft.is_none_or(|d| d.core.is_empty()) { 0 }
+            else { cuteafd_ffi::push_ring::DEFAULT_SLOT_BYTES };
+        let fp8_window = target.fp8.values().chain(draft.into_iter().flat_map(|d| d.fp8.values()))
+            .map(|layout| {
+                let block = layout.shape[1] * 2 * 128;
+                block * (cuteafd_ffi::push_ring::DEFAULT_SLOT_BYTES / block).max(1)
+            }).max().unwrap_or(0);
+        let largest = trellis_window.max(fp8_window);
+        if largest == 0 { return Ok(0); }
+        // The target and drafter land from the same ordered source. In
+        // particular, MTP down has wider BF16 source rows than any target role.
+        crate::push_load::admitted_push_envelope(largest as u64, cuteafd_ffi::push_ring::DEFAULT_SLOTS,
+            cuteafd_ffi::push_ring::DEFAULT_SLOT_BYTES as u64)
+    }).collect::<Result<Vec<_>, _>>().map_err(|error| refused(
+        format!("Inkling compact push staging refused: {error:#}"), "Check the selected projection geometry."))?;
+    let push_host = (0..=routed.len()).map(|count| {
+        if !push_required { return Ok(None); }
+        let backings = match &local {
+            LocalPackage::Installed { backings } => backings[count].as_slice(),
+            LocalPackage::Missing(_) if count == 0 => &[],
+            LocalPackage::Missing(_) => return Ok(None),
+        };
+        let mut envelope = super::weight_layout::push_host_envelope(&catalog, backings, gpus)?;
+        for (gpu, &bytes) in dense_push_bytes.iter().enumerate() { envelope.dense_bytes[gpu] = bytes; }
+        Ok(Some(envelope))
+    }).collect::<anyhow::Result<Vec<_>>>().map_err(|error| refused(format!("Inkling push host inventory refused: {error:#}"),
+        "Provide complete native push source/descriptor headers."))?;
     Ok(InklingInputs { cfg: cfg.clone(), kv_format: request.kv_format, gpus, spark_ranks: ranks,
         context: Context::resolve(context, (request.context_tokens > 0).then_some(request.context_tokens)),
         pool, prefill: shape, sequences: request.sequences, prefix_entries: request.prefix_entries,

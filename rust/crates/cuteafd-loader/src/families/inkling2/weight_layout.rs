@@ -153,8 +153,8 @@ impl CoordinatorWeights {
         Ok(Self { rank: 0, layers: layers.to_vec(), arena: WeightArenaLayout::new("inkling2/golden/target", selected)?, core, fp8 })
     }
 
-    /// Raw checkpoint operands need only a bounded reused source buffer: no
-    /// dequantization, row repacking, scale conversion or device staging.
+    /// Reuse the mount buffers across native copies, trellis tile packing,
+    /// and selected BF16-to-block-FP8 transforms.
     pub fn mount_load(&self, checkpoint: &Checkpoint) -> Result<crate::shared::dense_read::MountLoad> {
         use crate::shared::dense_read::{MountLoad, ReadBatch, STEP_BYTES};
         let mut load = MountLoad::default();
@@ -174,8 +174,10 @@ impl CoordinatorWeights {
                 let header = checkpoint.header(&format!("{}.{}", layout.stem, suffix))
                     .context("Inkling compact mount lacks validated member")?;
                 let rows = header.shape.first().copied().unwrap_or(1);
-                let width = usize::try_from(header.byte_length)? / rows;
-                load.merge(MountLoad::read(ReadBatch::new(rows, width, width, STEP_BYTES)?));
+                let row_bytes = usize::try_from(header.byte_length)? / rows;
+                let width = if suffix == "trellis" && layout.side == TrellisSide::Output { row_bytes / layout.ranks }
+                    else { row_bytes };
+                load.merge(MountLoad::read(ReadBatch::new(rows, row_bytes, width, STEP_BYTES)?));
             }
         }
         for layout in self.fp8.values() {
