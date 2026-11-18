@@ -675,11 +675,15 @@ def test_v6_mc_main_cards_use_the_original_core_except_kimi_1x() -> None:
         else:
             assert view == "original", entry["name"]
     assert seen == MC_CHECKPOINTS
+    entries = {entry["name"]: entry for entry in smoke["entries"]}
+    for name in ("kimi-k31-mc-original-max", "kimi-k31-mc-k6-compact-min", "minimax-m31-flash-min"):
+        assert "SPECULATOR" not in entries[name]["set"], name
+    # Qwen3.5-9B has no shipped drafter, so its explicit off is the default.
+    assert entries["qwen35-9b-bf16-min"]["set"]["SPECULATOR"] == "off"
 
 
 def test_v6_compact_mode_matrix_covers_every_mc_family() -> None:
     compact = json.loads((ROOT / V6_COMPACT).read_text())
-    assert "unsupported" not in compact
     assert len(compact["entries"]) == 21
     views: dict[str, set] = {}
     ports: dict[str, set] = {}
@@ -694,7 +698,17 @@ def test_v6_compact_mode_matrix_covers_every_mc_family() -> None:
                 ports[key].add(values[key])
     assert set(views) == MC_CHECKPOINTS
     assert all(found == {"k8-compact", "k6-compact", "fp8-compact"} for found in views.values())
-    assert not any(cell in json.dumps(compact) for cell in ('"status"', '"na"', '"unsupported"'))
+    # The compact rows run the same shipped drafter as their original max base.
+    assert not any("SPECULATOR" in entry["set"] for entry in compact["entries"])
+    # Inkling compact on TP2 is blocked on #2316 (refused at plan time, #2470);
+    # the three rows stay in the set and are listed as blocked, not removed.
+    blocked = compact["unsupported"]
+    assert {(entry["checkpoint"], entry["core_view"]) for entry in blocked} == {
+        ("wrldsuksgo2mars/Inkling-2-Small-EXL3-K4-MC", view)
+        for view in ("k8-compact", "k6-compact", "fp8-compact")}
+    assert all(entry["status"] == "pending" and entry["blocker"] == "#2316"
+               and "compact TP2" in entry["reason"] for entry in blocked)
+    assert all(entry["family"] == "inkling2" for entry in blocked)
 
 
 @pytest.mark.parametrize("path", starting_configs(), ids=lambda p: p.name)
