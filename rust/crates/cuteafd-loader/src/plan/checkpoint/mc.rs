@@ -1,11 +1,12 @@
 //! Small, metadata-only multi-core checkpoint discovery.
 use super::{view::metadata_bytes, MAX_JSON_BYTES};
 use anyhow::{ensure, Context, Result};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::IgnoredAny};
 use sha2::{Digest, Sha256};
 use std::{collections::{BTreeMap, BTreeSet}, fmt, path::Path, str::FromStr};
 
 pub const MC_MANIFEST: &str = "cuteafd-mc.json";
+const SUPPORTED_FEATURES: &[&str] = &[];
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -50,11 +51,14 @@ impl FromStr for CoreView {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Source { repo: String, revision: String }
+struct Source {
+    repo: String,
+    revision: String,
+    #[serde(flatten)]
+    extra: BTreeMap<String, IgnoredAny>,
+}
 
 #[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub(super) struct Variant {
     pub name: CoreView,
     pub index: String,
@@ -64,16 +68,21 @@ pub(super) struct Variant {
     pub(super) core_tensors: Vec<String>,
     metadata_sha256: BTreeMap<String, String>,
     fingerprint: String,
+    #[serde(flatten)]
+    extra: BTreeMap<String, IgnoredAny>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub(super) struct Manifest {
     schema: String,
+    #[serde(default)]
+    required_features: Vec<String>,
     source: Source,
     pub(super) original_core_dtype: String,
     shared_inventory_sha256: String,
     variants: Vec<Variant>,
+    #[serde(flatten)]
+    extra: BTreeMap<String, IgnoredAny>,
 }
 
 fn is_digest(value: &str) -> bool {
@@ -143,6 +152,10 @@ impl Manifest {
         ensure!(bytes.len() as u64 <= MAX_JSON_BYTES, "MC manifest exceeds metadata size limit");
         let manifest: Self = serde_json::from_slice(&bytes).context("decoding cuteafd-mc.json")?;
         ensure!(manifest.schema == "cuteafd-mc-v1", "unsupported MC schema {}", manifest.schema);
+        for feature in &manifest.required_features {
+            ensure!(SUPPORTED_FEATURES.contains(&feature.as_str()),
+                "checkpoint requires MC feature {feature}; this engine doesn't support it");
+        }
         ensure!(safe_text(&manifest.source.repo) && safe_text(&manifest.source.revision), "MC requires a pinned source repo and revision");
         ensure!(matches!(manifest.original_core_dtype.as_str(), "BF16" | "F32"), "FP8-origin checkpoints must not be MC or contain quantized core tensors");
         ensure!(is_digest(&manifest.shared_inventory_sha256), "invalid MC shared inventory SHA256");
@@ -153,7 +166,21 @@ impl Manifest {
             ensure!(names.insert(variant.name.name()), "duplicate MC variant {}", variant.name);
         }
         ensure!(names.contains("original"), "MC requires an original view");
+        if !manifest.extra.is_empty() || !manifest.source.extra.is_empty()
+            || manifest.variants.iter().any(|variant| !variant.extra.is_empty())
+        {
+            tracing::debug!(path = %path.display(), fields = ?manifest.unknown_fields(),
+                "ignoring unknown MC manifest fields");
+        }
         Ok(Some((manifest, bytes)))
+    }
+    fn unknown_fields(&self) -> Vec<String> {
+        self.extra.keys().cloned()
+            .chain(self.source.extra.keys().map(|key| format!("source.{key}")))
+            .chain(self.variants.iter().flat_map(|variant| {
+                variant.extra.keys().map(move |key| format!("variants[{}].{key}", variant.name))
+            }))
+            .collect()
     }
     pub(super) fn select(&self, view: CoreView) -> Result<&Variant> {
         let selected = if view == CoreView::Fp8Compact { CoreView::Original } else { view };
@@ -234,6 +261,63 @@ mod tests {
         assert!(CheckpointView::select(dir.path(), CoreView::Original).is_err());
         Ok(())
     }
+    #[test]
+    fn unknown_manifest_fields_leave_selected_weights_unchanged_but_change_identity() -> Result<()> {
+        let dir = copy_fixture();
+        let before = CheckpointView::select(dir.path(), CoreView::K8Compact)?;
+        let path = dir.path().join(MC_MANIFEST);
+        let mut manifest: serde_json::Value = serde_json::from_slice(&std::fs::read(&path)?)?;
+        manifest["perf_hints"] = serde_json::json!({"prefill_rows": 2048});
+        manifest["source"]["license"] = "example".into();
+        let variant = manifest["variants"].as_array_mut().unwrap().iter_mut()
+            .find(|variant| variant["name"] == "k8-compact").unwrap();
+        variant["preferred_tile"] = 128.into();
+        std::fs::write(&path, manifest.to_string())?;
+
+        let after = CheckpointView::select(dir.path(), CoreView::K8Compact)?;
+        assert_eq!(before.weight_map(), after.weight_map());
+        assert_ne!(before.fingerprint(), after.fingerprint());
+        let (parsed, _) = Manifest::read(dir.path())?.unwrap();
+        assert_eq!(parsed.unknown_fields(), ["perf_hints", "source.license", "variants[k8-compact].preferred_tile"]);
+        Ok(())
+    }
+
+    #[test]
+    fn required_features_must_be_supported() -> Result<()> {
+        let dir = copy_fixture();
+        let path = dir.path().join(MC_MANIFEST);
+        let mut manifest: serde_json::Value = serde_json::from_slice(&std::fs::read(&path)?)?;
+        manifest["required_features"] = serde_json::json!([]);
+        std::fs::write(&path, manifest.to_string())?;
+        CheckpointView::select(dir.path(), CoreView::Original)?;
+
+        manifest["required_features"] = serde_json::json!(["example-weight-layout"]);
+        std::fs::write(&path, manifest.to_string())?;
+        let error = CheckpointView::select(dir.path(), CoreView::Original).unwrap_err();
+        assert_eq!(error.to_string(),
+            "checkpoint requires MC feature example-weight-layout; this engine doesn't support it");
+        Ok(())
+    }
+
+    #[test]
+    fn unknown_manifest_fields_do_not_relax_known_field_validation() -> Result<()> {
+        let dir = copy_fixture();
+        let path = dir.path().join(MC_MANIFEST);
+        let mut manifest: serde_json::Value = serde_json::from_slice(&std::fs::read(&path)?)?;
+        manifest["perf_hints"] = serde_json::json!({});
+        for (field, value, expected) in [
+            ("fingerprint", "bad-sha256", "fingerprint mismatch"),
+            ("config", "../config.json", "noncanonical metadata filenames"),
+        ] {
+            let mut invalid = manifest.clone();
+            invalid["variants"][0][field] = value.into();
+            std::fs::write(&path, invalid.to_string())?;
+            let error = CheckpointView::select(dir.path(), CoreView::Original).unwrap_err();
+            assert!(error.to_string().contains(expected), "{error:#}");
+        }
+        Ok(())
+    }
+
     #[test]
     fn missing_view_plain_checkpoint_and_fp8_origin_refusal() -> Result<()> {
         let dir = copy_fixture();
@@ -440,8 +524,9 @@ mod family_tests {
         let fp8 = Checkpoint::open_view(&CheckpointView::select(dir.path(), CoreView::Fp8Compact)?)?;
         let cfg = KimiK3Config::from_hf(&fp8.config)?;
         let expected = tensors.iter().map(|(name, _, shape)| (name.clone(), shape.clone())).collect();
-        let error = CoreInventory::from_checkpoint(&cfg, &fp8, &expected).unwrap_err().to_string();
-        assert!(error.contains("lm_head.weight") && error.contains("vocabulary head") && error.contains("Kimi"), "{error}");
+        let core = CoreInventory::from_checkpoint(&cfg, &fp8, &expected)?;
+        assert!(core.projections.is_empty() && core.native.len() == shapes.len());
+        assert!(core.native.values().all(|p| p.fp8));
         Ok(())
     }
 
@@ -485,8 +570,15 @@ mod family_tests {
         assert!(bytes[0] > bytes[1] && bytes[1] > bytes[2], "{bytes:?}");
         let fp8 = Checkpoint::open_view(&CheckpointView::select(dir.path(), CoreView::Fp8Compact)?)?;
         let expected = tensors.iter().map(|(name, _, shape)| (name.clone(), shape.clone())).collect();
-        let error = CoreInventory::from_checkpoint(&cfg, &fp8, &expected).unwrap_err().to_string();
-        assert!(error.contains("lm_head.weight") && error.contains("Kimi"), "{error}");
+        let core = CoreInventory::from_checkpoint(&cfg, &fp8, &expected)?;
+        let layouts = LayerLayout::pair_with_core(&cfg, 3, crate::placement::LayerMode::ContextSplit, &core)?;
+        let fp8_bytes = layouts.iter().map(|layout| layout.bytes()).collect::<Result<Vec<_>>>()?.into_iter().sum::<usize>();
+        assert!(bytes[0] > fp8_bytes);
+        for layout in layouts {
+            assert_eq!(layout.native["mla.kv_a"].shape, [640, cfg.hidden]);
+            assert!(layout.operands.contains_key("mla.indexer.kw"));
+            assert!(!layout.native.contains_key("mla.indexer.kw"));
+        }
         let plain = tempfile::tempdir()?;
         testing::write_snapshot(plain.path(), &config, &tensors, None);
         assert!(CheckpointView::select(plain.path(), CoreView::Fp8Compact).unwrap_err().to_string()

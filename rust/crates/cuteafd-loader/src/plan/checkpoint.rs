@@ -171,7 +171,13 @@ impl Checkpoint {
     /// Families declare executable roles, never a second conversion selection.
     pub fn validate_fp8_roles(&self, family: &str,
         role: impl Fn(&str) -> crate::formats::native_attention::Fp8Role) -> Result<()> {
-        for name in self.view.iter().flat_map(|view| view.fp8_tensors()).filter(|name| self.converts_to_fp8(name)) {
+        self.validate_fp8_roles_where(family, |_| true, role)
+    }
+
+    pub fn validate_fp8_roles_where(&self, family: &str, owns: impl Fn(&str) -> bool,
+        role: impl Fn(&str) -> crate::formats::native_attention::Fp8Role) -> Result<()> {
+        for name in self.view.iter().flat_map(|view| view.fp8_tensors())
+            .filter(|name| owns(name) && self.converts_to_fp8(name)) {
             let declaration = role(name);
             let (role, supported) = (declaration.name, declaration.supported);
             ensure!(supported, "{name}: role {role} cannot execute block FP8 in family {family}");

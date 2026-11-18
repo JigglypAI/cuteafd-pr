@@ -78,6 +78,8 @@ mod tests {
         let bytes = |name: &str| runtime.buffers.iter().find(|(id, _)| id == name).unwrap().1;
         assert_eq!(bytes("step.ids"), 256);
         assert_eq!(bytes("head.tokens"), 16 * 7 * 4);
+        assert_eq!(bytes("head.hidden"), 16 * 7 * config.transformer.hidden * 2);
+        assert_eq!(bytes("head.base"), 16 * 7 * config.padded_vocab * 2);
         assert_eq!(bytes("step.tables"), 256);
         assert!(runtime.buffers.iter().all(|(id, _)| !id.contains("probe") && !id.contains("route")));
         Ok(())
@@ -173,10 +175,10 @@ impl RecurrentRuntimeLayout {
         // Immutable rotary frequencies are tiny, unlike a max-position cos/sin table.
         add("rotary.frequencies".into(), c.head_dim/2*4);
         if rank == lead {
-            for (name, width, element) in [("hidden", h, 2), ("f_rnn", h, 2), ("state", r, 2),
+            for (name, width, element) in [("hidden", (c.block-1)*h, 2), ("f_rnn", h, 2), ("state", r, 2),
                 ("next_state", r, 2), ("latent", r, 2), ("previous_embedding", r, 2),
                 ("inputs", config.recurrent_input_width()?, 2), ("projection", 3*r, 4),
-                ("raw", 3*r, 4), ("base", config.padded_vocab, 2),
+                ("raw", 3*r, 4), ("base", (c.block-1)*config.padded_vocab, 2),
                 ("correction_f32", config.padded_vocab, 4), ("correction", config.padded_vocab, 2),
                 ("logits_bf16", config.valid_vocab, 2), ("logits", config.valid_vocab, 4),
                 ("tokens", c.block-1, 4), ("previous", 1, 4), ("status", 1, 4)] {

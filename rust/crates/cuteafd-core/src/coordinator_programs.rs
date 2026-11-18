@@ -233,7 +233,7 @@ pub struct CoordinatorPrograms<'a> {
 /// Compound namespaces precede the ordinary first-underscore boundary. Keep
 /// runtime selection and manifest admission on the same namespace contract.
 pub fn program_namespace(name: &str) -> Option<&str> {
-    for family in ["glm_stage", "glm2_stage"] {
+    for family in ["glm_stage", "glm2_stage", "dense_trellis_k6", "native_attention"] {
         if name.strip_prefix(family).is_some_and(|suffix| suffix.starts_with('_') && suffix.len() > 1) {
             return Some(&name[..family.len()]);
         }

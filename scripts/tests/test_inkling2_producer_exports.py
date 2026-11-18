@@ -54,9 +54,10 @@ def test_predeclared_inkling_producer_stems(monkeypatch):
             assert runtime['route_scale'] == 8.
 
 
-def test_padded_relative_load_export_is_static_and_has_one_declared_stem(monkeypatch):
+def test_padded_load_exports_have_declared_static_geometries(monkeypatch):
     torch = types.ModuleType('torch')
     torch.bfloat16 = object()
+    torch.float32 = object()
     monkeypatch.setitem(sys.modules, 'torch', torch)
     glue = types.ModuleType('b12x.integration.cuteafd.inkling2_glue')
     glue.compile_padded_transpose_aot = lambda **kwargs: kwargs
@@ -66,7 +67,9 @@ def test_padded_relative_load_export_is_static_and_has_one_declared_stem(monkeyp
     scope = {}
     exec(compile(ast.Module(body=[function], type_ignores=[]), '<load>', 'exec'), scope)
     programs = scope['inkling2_load_programs']()
-    assert len(programs) == 1
+    assert [program[0] for program in programs] == [
+        'padded_transpose_bf16_r16_c1024_p64', 'padded_transpose_bf16_r4608_c256_p4608',
+        'padded_transpose_f32_r32_c201088_p32']
     stem, op, params, compile_program = programs[0]
     assert stem == 'padded_transpose_bf16_r16_c1024_p64' and op == 'padded_transpose'
     assert params == {'dtype': 'bfloat16', 'rows': 16, 'cols': 1024, 'padded_cols': 64}

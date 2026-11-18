@@ -792,7 +792,8 @@ fn layer0_run(args: &GoldenArgs, checkpoint: &Checkpoint, cfg: &Config, referenc
     let metadata = directory.join("meta.json");
     if metadata.exists() { std::fs::remove_file(&metadata)?; }
     // SAFETY: sealed runner library outlives every program, stream and allocation.
-    let library = unsafe { cuteafd_ffi::NativeLibrary::load(args.native_lib.as_ref().context("--native-lib required")?)? };
+    let library = unsafe { cuteafd_ffi::NativeLibrary::load_for_experts(
+        args.native_lib.as_ref().context("--native-lib required")?, ExpertGeometry::STEP5)? };
     library.cuda_set_device(args.device)?;
     crate::shared::inventory::preload_native_modules(&library)?;
     let programs = library.programs()?.with_manifest(&args.manifest)?;
@@ -1320,7 +1321,7 @@ fn run(args: GoldenArgs) -> Result<()> {
     // the dense receiver drops; BF16 cores do not allocate this owner.
     let rank_weights = cuteafd_loader::plan::families::step5::coordinator::RankWeightLayout::from_checkpoint(&checkpoint, 0, 1)?;
     let transform_bytes = if rank_weights.core.is_empty() { 0 } else {
-        super::chain::physical_bytes(&[crate::shared::experts::rtx::dense::STEP_BYTES as u64])?
+        cuteafd_loader::shared::dense_read::trellis_device_staging(0, 1).bytes.at(1)?
     };
     let reserve = pending.checked_add(transport).and_then(|n| n.checked_add(transform_bytes))
         .context("golden reserve")?;

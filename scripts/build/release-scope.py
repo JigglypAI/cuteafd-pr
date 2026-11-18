@@ -245,7 +245,7 @@ def requirements(repo, matrix, scope):
         elif family == 'minimax_m3':
             programs = {'minimax'}
         elif family == 'inkling2':
-            programs = {'inkling2'}
+            programs = {'inkling2', 'dense_trellis_k6', 'native_attention'}
         elif family == 'muse_spark':
             programs = {'muse', 'dense_trellis_k6', 'expert_partial'} | ({'muse2'} if dual else set())
         spark_experts = sorted(tokens(scopes['CUTEAFD_WIP_EXPERT_FAMILIES']))

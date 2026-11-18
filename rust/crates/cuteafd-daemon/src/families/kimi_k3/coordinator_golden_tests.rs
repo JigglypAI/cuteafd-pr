@@ -136,7 +136,7 @@ pub(crate) fn baseline_global<'a>(device: Device<'a>, layout: &GlobalLayout, pac
     layout.check(&packed)?;
     let operands = baseline_operands(device, packed.operands)?;
     let core_head = packed.core_head.map(|head| layout.core_head.as_ref().unwrap().upload(device, head)).transpose()?;
-    Ok(GlobalWeights { operands, core_head })
+    Ok(GlobalWeights { operands, core_head, fp8_head: None })
 }
 
 pub(in crate::families::kimi_k3) fn baseline_layer<'a>(device: Device<'a>, layout: &LayerLayout, packed: PackedLayer)

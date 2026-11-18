@@ -1325,7 +1325,7 @@ mod tests {
     }
 
     #[test]
-    fn golden_provenance_binds_selected_mode_bundle_and_fp8_refusal() -> Result<()> {
+    fn golden_provenance_binds_selected_mode_bundle_and_fp8_recipe() -> Result<()> {
         use clap::Parser;
         use cuteafd_loader::plan::checkpoint::{CoreView, CheckpointView};
         let dir = tempfile::tempdir()?;
@@ -1365,10 +1365,11 @@ mod tests {
         assert!(fingerprints.insert(view.fingerprint().to_owned()));
         let checkpoint = cuteafd_loader::plan::Checkpoint::open_view(&view)?;
         let cfg = KimiK3Config::from_hf(&checkpoint.config)?;
-        let error = cuteafd_loader::families::kimi_k3::core::CoreInventory::from_checkpoint(
-            &cfg, &checkpoint, &expected).unwrap_err().to_string();
-        assert!(error.contains("language_model.lm_head.weight")
-            && error.contains("role vocabulary head") && error.contains("family Kimi"), "{error}");
+        let core = cuteafd_loader::families::kimi_k3::core::CoreInventory::from_checkpoint(&cfg, &checkpoint, &expected)?;
+        assert!(core.projections.is_empty());
+        assert_eq!(core.native.len(), shapes.len());
+        assert!(core.native.keys().all(|stem| shapes.contains_key(&format!("{stem}.weight"))));
+        assert_eq!(core.fp8_head()?.expect("selected vocabulary head").shape, [cfg.vocab_size, cfg.hidden]);
         Ok(())
     }
 

@@ -18,6 +18,8 @@ def test_native_golden_uses_shared_executor_and_native_expert_dispatch():
     golden = (FAMILY/'golden.rs').read_text()
     assert 'super::prefill::layer(' in golden
     assert 'Mxfp8::load(' in golden
+    assert golden.index('set_expert_geometry(geometry)') < golden.index('experts::exl3::regions(')
+    assert 'NativeLibrary::load_for_experts(&args.native_lib, geometry)' in golden
     assert 'rms<=0.02 && cosine>=0.999' in golden
     assert '(nll-reference_nll).abs() <= 0.03' in golden
     assert 'python' not in golden.lower()
@@ -37,7 +39,9 @@ def test_persistent_layer_state_is_borrowed_and_metadata_uses_retained_uploads()
     assert 'fatal_drain(self.copies.drain()' in cache
     layer = (FAMILY/'layers.rs').read_text()
     assert "owner: &impl UnitBuffers<'a>" in layer
-    assert 'Allocation::new' not in layer
+    # Binding may allocate admitted scratch; per-request math may not.
+    arithmetic = layer.split('    pub fn project_target(')[1].split('#[cfg(test)]')[0]
+    assert 'Allocation::new' not in arithmetic
     head = (FAMILY/'head.rs').read_text()
     assert 'self.rows <= 64' in head
     assert 'probe::head_spans(rows, self.rows)' in head
@@ -96,7 +100,8 @@ def test_owner_reconciliation_is_per_id_and_stream_slabs_are_allowances():
     assert 'ComponentKind::Allowance(Allowance' in admission
     assert 'driver.stream-slabs: one ordered cold golden stream' in admission
     golden = (FAMILY/'golden.rs').read_text()
-    assert 'admission::reconcile_native(&plan, devices, &receipts)' in golden
+    assert 'admission::reconcile_native(' in golden
+    assert 'devices, &receipts)' in golden
     assert 'measured == admitted' in golden
     assert 'measured <= admitted' not in golden
 

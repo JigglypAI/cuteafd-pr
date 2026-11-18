@@ -932,6 +932,11 @@ fn prepare_fixed<'a>(i: &'a GlmfInputs<'a>, sms: usize, rtx_experts: bool, proce
         let activation = p::Activation::choice(embedding_variable, home);
         for (rank, layout) in layouts.iter().enumerate() {
             add_arena(&mut contract, layout, rank, p::Lifetime::RESIDENT, &activation, cuteafd_core::memory_layout::MemoryKind::Weights)?;
+            if layout.views().keys().any(|name| name.ends_with(".trellis")) {
+                let mut owner = crate::shared::dense_read::trellis_device_staging(rank as u8, maximum);
+                owner.activation = activation.clone();
+                contract.components.push(owner);
+            }
             for (name, view) in layout.views().iter().filter(|(name, _)|
                 name.as_str() == "embedding.table" && embedding > 0 && process.shared_arenas.is_empty()
                     || name.starts_with("embedding.") && name.as_str() != "embedding.table") {
@@ -1245,6 +1250,36 @@ mod tests {
         process
     }
     use crate::plan::exlr8::residency::{ExpertSet, Residency};
+
+    #[test]
+    fn trellis_staging_is_target_only_and_rank_local() -> anyhow::Result<()> {
+        use p::Recipe;
+        use crate::serving_capacity::WeightArenaLayout;
+        let cfg = GlmNextConfig::from_hf(&crate::plan::testing::glm5_flash_config(4))?;
+        let input = crate::placement::families::glm5_flash::tests::inputs(&cfg, 2, 96 << 30);
+        for ranks in [&[][..], &[0][..], &[0, 1][..]] {
+            let mut process = measured_process((512 << 30, 512 << 30), 8 << 30);
+            let embedding = input.resident.iter().map(|rank| rank.embedding).sum::<u64>() as usize;
+            let homes = if embedding == 0 { 1 } else { 2 };
+            for home in 0..homes {
+                let mut layouts = Vec::new();
+                for rank in 0..2 {
+                    let mut tensors = vec![("weights".into(), input.resident[rank].weights as usize)];
+                    if ranks.contains(&(rank as u8)) {
+                        tensors.extend([("q.trellis".into(), 1 << 20), ("o.trellis".into(), 1 << 20)]);
+                    }
+                    if embedding > 0 && home == rank { tensors.push(("embedding.table".into(), embedding)); }
+                    layouts.push(WeightArenaLayout::new(format!("target.{rank}"), tensors)?);
+                }
+                process.target_arenas.push(layouts);
+            }
+            let prepared = prepare(&input, 188, true, process)?;
+            let contract = prepared.recipe.prepare(&prepared.request)?;
+            let facts = contract.facts(&vec![0; contract.variables.len()], 1)?;
+            crate::shared::dense_read::assert_trellis_device_staging(&facts, ranks);
+        }
+        Ok(())
+    }
 
     #[test]
     fn sampled_preweight_is_one_protected_capacity_neutral_owner_per_rank() {

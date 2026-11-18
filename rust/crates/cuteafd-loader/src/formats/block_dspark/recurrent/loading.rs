@@ -2,7 +2,7 @@
 //! Native bundles have an unindexed bare-name file; MC bundles index `mtp.*`.
 use super::{rank_recipe, source_shapes, RecurrentBlockConfig};
 use anyhow::{ensure, Context, Result};
-use crate::{formats::{dense_trellis::TrellisSide, trellis_core::{CoreContract, CoreSplit, CoreWeightLayout}},
+use crate::{formats::{dense_trellis::TrellisSide, native_attention::{NativeLayout, Fp8Role}, trellis_core::{CoreContract, CoreSplit, CoreWeightLayout}},
     families::glm5::draft_physical::ShardAxis,
     plan::checkpoint::{Checkpoint, CheckpointTensor, CheckpointView}, serving_capacity::WeightArenaLayout};
 use cuteafd_core::DType;
@@ -47,6 +47,7 @@ impl RecurrentSource {
         self.config.rank(rank, ranks, lead)?;
         let requests = RefCell::new(Vec::new());
         let core = RefCell::new(BTreeMap::new());
+        let fp8 = RefCell::new(BTreeMap::new());
         rank_recipe(&self.config, rank, ranks, lead, |relative, shape| {
             let name = self.name(relative);
             let header = self.checkpoint.header(&name).with_context(|| format!("drafter lacks {name}"))?;
@@ -60,9 +61,26 @@ impl RecurrentSource {
             for &(relative, rows) in parts {
                 let name = self.name(relative);
                 let stem = name.strip_suffix(".weight").context("draft matrix suffix")?;
+                if relative.starts_with("markov_head.") {
+                    ensure!(!self.checkpoint.converts_to_fp8(&name)
+                        && !self.checkpoint.contains_tensor(&format!("{stem}.trellis")),
+                        "{name}: recurrent Markov head requires native BF16 weights");
+                }
                 let (row, column) = super::super::block_dspark_part_ranges(rows, columns, axis, rank, ranks)?;
-                if self.checkpoint.contains_tensor(&format!("{stem}.trellis")) {
-                    let side = if matches!(axis, Some(ShardAxis::Columns)) { TrellisSide::Input } else { TrellisSide::Output };
+                if self.checkpoint.converts_to_fp8(&name) {
+                    let header = self.checkpoint.header(&name).with_context(|| format!("drafter lacks {name}"))?;
+                    ensure!(header.dtype == DType::Bf16 && header.shape == [rows, columns],
+                        "{name}: recurrent FP8 requires BF16 [{rows},{columns}]");
+                    let [n, k] = Fp8Role::exact("recurrent projection", true).stored_shape([row.len(), column.len()])
+                        .with_context(|| format!("{name}: recurrent FP8 rank-local shape"))?;
+                    let split = match axis { Some(ShardAxis::Rows) => CoreSplit::Output,
+                        Some(ShardAxis::Columns) => CoreSplit::Input, None => CoreSplit::Whole };
+                    let layout = NativeLayout { stem: stem.to_owned(), shape: [n, k], fp8: true,
+                        rank: if axis.is_some() { rank } else { 0 }, ranks: if axis.is_some() { ranks } else { 1 }, split };
+                    requests.borrow_mut().extend([(format!("{stem}.values"), n*k), (format!("{stem}.scales"), n/128*(k/128)*4)]);
+                    fp8.borrow_mut().insert(name, layout);
+                } else if self.checkpoint.contains_tensor(&format!("{stem}.trellis")) {
+                    let side = if ranks > 1 && matches!(axis, Some(ShardAxis::Columns)) { TrellisSide::Input } else { TrellisSide::Output };
                     let split = match axis { Some(ShardAxis::Rows) => CoreSplit::Output,
                         Some(ShardAxis::Columns) => CoreSplit::Input, None => CoreSplit::Whole };
                     let mut projections = crate::formats::trellis_core::read_projections(&self.checkpoint,
@@ -95,8 +113,11 @@ impl RecurrentSource {
             .map(|(name, view)| (name.clone(), view.bytes())));
         let result = RecurrentWeightLayout { rank, ranks, lead,
             arena: WeightArenaLayout::new(format!("block-dspark/recurrent/weights/{rank}"), requests)?,
-            core: core.into_inner() };
+            core: core.into_inner(), fp8: fp8.into_inner() };
         self.validate_inventory()?;
+        self.checkpoint.validate_fp8_roles_where("recurrent block drafter", |name| name.starts_with(&self.prefix), |name| {
+            Fp8Role::exact("recurrent projection", result.fp8.contains_key(name) || (rank != lead && name.contains(".markov_head.")))
+        })?;
         Ok(result)
     }
 
@@ -120,6 +141,39 @@ pub struct RecurrentWeightLayout {
     pub lead: usize,
     pub arena: WeightArenaLayout,
     pub core: BTreeMap<String, CoreWeightLayout>,
+    pub fp8: BTreeMap<String, NativeLayout>,
+}
+
+impl RecurrentWeightLayout {
+    pub fn trellis_programs(&self, manifest: &serde_json::Value, rows: usize) -> Result<std::collections::BTreeSet<String>> {
+        use cuteafd_ffi::dense_trellis::{validate_package_geometry_bits, TrellisDType};
+        use crate::formats::exl3_storage::Exl3Codebook;
+        let mut seen = std::collections::BTreeSet::new();
+        let mut programs = std::collections::BTreeSet::new();
+        for (name, l) in &self.core {
+            let [n, k] = l.shape;
+            let side = if l.side == TrellisSide::Input { 2 } else { 1 };
+            let book = if l.codebook == Exl3Codebook::Mcg { "mcg" } else { "mul1" };
+            if seen.insert((k, n, side, l.bits, book)) {
+                programs.extend(validate_package_geometry_bits(manifest, k, n, side, l.bits, book, rows, TrellisDType::Bf16)
+                    .with_context(|| format!("{name}: recurrent trellis program missing or incompatible"))?);
+            }
+        }
+        Ok(programs)
+    }
+
+    pub fn fp8_programs(&self, manifest: &serde_json::Value, rows: usize) -> Result<BTreeMap<String, usize>> {
+        use cuteafd_ffi::{draft_projection::ProjectionOutput, native_attention::validate_package_geometry};
+        let mut seen = std::collections::BTreeSet::new();
+        self.fp8.iter().filter(|(_, p)| seen.insert(p.shape)).map(|(name, p)| {
+            validate_package_geometry(manifest, p.shape[1], p.shape[0], rows, ProjectionOutput::Bf16)
+                .with_context(|| format!("{name}: recurrent FP8 program missing or incompatible"))
+        }).collect()
+    }
+
+    pub fn fp8_scratch(&self, manifest: &serde_json::Value, rows: usize) -> Result<usize> {
+        Ok(self.fp8_programs(manifest, rows)?.into_values().max().unwrap_or(0))
+    }
 }
 
 #[cfg(test)]

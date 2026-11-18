@@ -176,7 +176,8 @@ impl CheckpointView {
                     || name.ends_with(".weight_scale") || name.ends_with(".input_scale"))
                 && (name.contains(".self_attn.") || name.contains(".attention.") || name.contains(".mlp.") || name.starts_with("lm_head.")
                     || name.starts_with("language_model.lm_head.") || name.starts_with("output.")
-                    || name.contains(".shared_experts.") || name.contains(".feed_forward.")))
+                    || name.contains(".shared_experts.") || name.contains(".feed_forward.")
+                    || name.contains(".block_sparse_moe.routed_expert_")))
     }
     pub(crate) fn check_metadata_bytes(&self, name: &str, bytes: &[u8]) -> Result<()> {
         let expected = self.metadata_digests.get(name).context("metadata was not selected")?;

@@ -1,6 +1,6 @@
 //! Packed device weight extents shared by checkpoint admission and runtime owners.
 use crate::formats::trellis_core::CoreWeightLayout;
-use super::{config::{KimiAttention, KimiK3Config}, core::CoreInventory, kda};
+use super::{config::{KimiAttention, KimiK3Config}, core::{self, CoreInventory}, kda};
 use crate::{placement::{Demand, LayerMode, ResidentWeights}, formats::dense_trellis::TrellisSide};
 use anyhow::{ensure, Context, Result};
 use cuteafd_core::memory_layout::{Basis, Category};
@@ -46,11 +46,13 @@ pub fn routed_owner_for(cfg: &KimiK3Config, layer: usize, ranks: usize) -> Resul
 pub struct GlobalLayout {
     pub rank: usize, pub hidden: usize, pub vocab: usize,
     pub operands: BTreeMap<&'static str, usize>, pub core_head: Option<CoreWeightLayout>,
+    pub fp8_head: Option<crate::formats::native_attention::NativeLayout>,
 }
 impl GlobalLayout {
     pub fn arena_tensors(&self) -> Result<Vec<(String, usize)>> {
         let mut tensors = self.operands.iter().map(|(name, bytes)| (format!("global.{name}"), *bytes)).collect::<Vec<_>>();
         if let Some(head) = &self.core_head { tensors.extend(head.arena_tensors("global.head")?); }
+        if let Some(head) = &self.fp8_head { tensors.extend(native_tensors("global.head", head)?); }
         Ok(tensors)
     }
 
@@ -60,6 +62,7 @@ impl GlobalLayout {
         if ranks == 2 { return Ok(vec![entry, terminal]); }
         entry.operands.extend(terminal.operands);
         entry.core_head = terminal.core_head;
+        entry.fp8_head = terminal.fp8_head;
         Ok(vec![entry])
     }
 
@@ -77,9 +80,9 @@ impl GlobalLayout {
         ensure!(!cfg.tie_embeddings, "Kimi global weights require the checkpoint's untied head");
         let matrix = extent(&[cfg.vocab_size, cfg.hidden, 2])?;
         Ok([Self { rank: 0, hidden: cfg.hidden, vocab: cfg.vocab_size,
-                core_head: None, operands: BTreeMap::from([("embedding", matrix)]) },
+                core_head: None, fp8_head: None, operands: BTreeMap::from([("embedding", matrix)]) },
             Self { rank: 1, hidden: cfg.hidden, vocab: cfg.vocab_size,
-                core_head: None, operands: BTreeMap::from([("head", matrix), ("output.score", extent(&[cfg.hidden, 4])?),
+                core_head: None, fp8_head: None, operands: BTreeMap::from([("head", matrix), ("output.score", extent(&[cfg.hidden, 4])?),
                     ("output.norm", extent(&[cfg.hidden, 2])?)]) }])
     }
 
@@ -90,18 +93,24 @@ impl GlobalLayout {
             pair[1].operands.remove("head");
             pair[1].core_head=Some(CoreWeightLayout::new(head,TrellisSide::Output,0,1)?);
         }
+        if let Some(head) = inventory.fp8_head()? {
+            ensure!(head.shape == [cfg.vocab_size, cfg.hidden], "Kimi FP8 head geometry");
+            pair[1].operands.remove("head");
+            pair[1].fp8_head = Some(head);
+        }
         Ok(pair)
     }
 
     pub fn bytes(&self) -> Result<usize> {
-        self.operands.values().copied().chain(self.core_head.iter().map(|head|head.bytes))
-            .try_fold(0usize, |sum, bytes| sum.checked_add(bytes)
-            .context("Kimi global weight extent overflow"))
+        self.allocation_extents()?.into_iter().try_fold(0usize, |sum, bytes|
+            sum.checked_add(usize::try_from(bytes)?).context("Kimi global weight extent overflow"))
     }
 
-    pub fn allocation_extents(&self) -> Vec<u64> {
-        self.operands.values().map(|&bytes| bytes as u64)
-            .chain(self.core_head.iter().flat_map(CoreWeightLayout::allocation_extents)).collect()
+    pub fn allocation_extents(&self) -> Result<Vec<u64>> {
+        let mut extents = self.operands.values().map(|&bytes| bytes as u64)
+            .chain(self.core_head.iter().flat_map(CoreWeightLayout::allocation_extents)).collect::<Vec<_>>();
+        if let Some(head) = &self.fp8_head { extents.extend(head.allocation_extents()?); }
+        Ok(extents)
     }
 
     pub fn demand(&self) -> Result<Demand> {
@@ -123,14 +132,7 @@ impl LayerLayout {
         let mut tensors = self.operands.iter().map(|(name, bytes)| (format!("{prefix}.{name}"), *bytes)).collect::<Vec<_>>();
         for (name, layout) in &self.core { tensors.extend(layout.arena_tensors(&format!("{prefix}.{name}"))?); }
         for (name, layout) in &self.native {
-            let [n, k] = layout.shape;
-            let values = n.checked_mul(k).and_then(|v| v.checked_mul(if layout.fp8 { 1 } else { 2 }))
-                .context("Kimi native arena extent overflow")?.max(256);
-            tensors.push((format!("{prefix}.{name}.values"), values));
-            if layout.fp8 {
-                let scales = usize::try_from(layout.bytes()?)?.checked_sub(values).context("Kimi native arena scales")?;
-                tensors.push((format!("{prefix}.{name}.scales"), scales));
-            }
+            tensors.extend(native_tensors(&format!("{prefix}.{name}"), layout)?);
         }
         Ok(tensors)
     }
@@ -218,11 +220,11 @@ impl LayerLayout {
         inventory: &CoreInventory, ranks: usize) -> Result<Vec<Self>> {
         let mut pair = Self::ranks(cfg, layer, mode, ranks)?;
         let root = format!("language_model.model.layers.{layer}");
-        let shared = format!("{root}.block_sparse_moe.shared_experts");
+        let ffn = if cfg.dense[layer] { format!("{root}.mlp") } else { format!("{root}.block_sparse_moe.shared_experts") };
         let attn = format!("{root}.self_attn");
-        let native = |stem: &str| inventory.get_weight(stem).is_some();
-        let ffn_split = !cfg.dense[layer] && ["gate_proj", "up_proj", "down_proj"].iter()
-            .any(|leaf| native(&format!("{shared}.{leaf}")));
+        let native = |stem: &str| inventory.get_weight(stem).is_some() || inventory.native.contains_key(stem);
+        let ffn_split = ["gate_proj", "up_proj", "down_proj"].iter()
+            .any(|leaf| native(&format!("{ffn}.{leaf}")));
         let attention_split = ["q_proj", "k_proj", "v_proj", "g_proj", "o_proj", "q_a_proj",
             "q_b_proj", "kv_a_proj_with_mqa"].iter().any(|leaf| native(&format!("{attn}.{leaf}")));
         let attention_ranks = pair.iter().filter(|layout| layout.attention.present()).count();
@@ -230,12 +232,12 @@ impl LayerLayout {
             if ffn_split {
                 layout.operands.remove("ffn.gate_up");
                 layout.operands.remove("ffn.down");
-                let width = cfg.moe_intermediate * cfg.shared_experts;
+                let width = if cfg.dense[layer] { cfg.dense_intermediate } else { cfg.moe_intermediate * cfg.shared_experts };
                 for (name, leaf, shape, side) in [
                     ("ffn.gate", "gate_proj", [width, cfg.hidden], TrellisSide::Output),
                     ("ffn.up", "up_proj", [width, cfg.hidden], TrellisSide::Output),
                     ("ffn.down", "down_proj", [cfg.hidden, width], TrellisSide::Input),
-                ] { layout.projection(name, &format!("{shared}.{leaf}"), shape, side, rank, ranks, inventory)?; }
+                ] { layout.projection(name, &format!("{ffn}.{leaf}"), shape, side, rank, ranks, inventory)?; }
             }
             if !cfg.dense[layer] && rank==routed_owner_for(cfg,layer,ranks)? {
                 let root=format!("{root}.block_sparse_moe");
@@ -291,9 +293,7 @@ impl LayerLayout {
             match side { TrellisSide::Output => n /= ranks, TrellisSide::Input => k /= ranks }
             if let Some(projection) = inventory.native.get(stem) {
                 ensure!(projection.shape == shape, "Kimi {stem} native inventory differs from layer geometry");
-                self.native.insert(name, crate::formats::native_attention::NativeLayout {
-                    stem: stem.into(), shape: [n, k], fp8: projection.fp8,
-                    rank, ranks, split: projection.split });
+                self.native.insert(name, core::native_layout(stem, projection, rank, ranks)?);
             } else {
                 self.insert(name, &[n, k, 2])?;
             }
@@ -333,11 +333,18 @@ impl LayerLayout {
             .map(|(_, bytes)| *bytes).chain(self.core.iter().filter(|(name, _)|
                 name.starts_with("mla.") || name.starts_with("kda.")).map(|(_, layout)| layout.bytes))
             .try_fold(0usize, |n, bytes| n.checked_add(bytes).context("Kimi attention extent overflow"))?;
-        self.native.values().try_fold(base, |sum, layout| sum.checked_add(usize::try_from(layout.bytes()?)?)
-            .context("Kimi native attention extent overflow"))
+        self.native.iter().filter(|(name, _)| name.starts_with("mla.") || name.starts_with("kda."))
+            .try_fold(base, |sum, (_, layout)| sum.checked_add(usize::try_from(layout.bytes()?)?)
+                .context("Kimi native attention extent overflow"))
     }
 
 }
+pub(crate) fn native_tensors(prefix: &str, layout: &crate::formats::native_attention::NativeLayout)
+    -> Result<Vec<(String, usize)>> {
+    ["values", "scales"].into_iter().zip(layout.allocation_extents()?)
+        .map(|(name, bytes)| Ok((format!("{prefix}.{name}"), usize::try_from(bytes)?))).collect()
+}
+
 fn extent(dimensions: &[usize]) -> Result<usize> {
     ensure!(dimensions.iter().all(|n| *n > 0), "Kimi weight extent is empty");
     dimensions.iter().try_fold(1usize, |n, dim| n.checked_mul(*dim)).context("Kimi weight extent overflow")
@@ -380,7 +387,7 @@ mod tests {
         for inventory in [&CoreInventory::default(), &core] {
             for ranks in [1, 2] {
                 for global in GlobalLayout::ranks_with_core(&cfg, inventory, ranks)? {
-                    assert_eq!(global.allocation_extents().iter().sum::<u64>(), global.bytes()? as u64);
+                    assert_eq!(global.allocation_extents()?.iter().sum::<u64>(), global.bytes()? as u64);
                 }
                 let modes = if ranks == 1 { vec![LayerMode::Whole { gpu: 0, ffn: FfnMode::Owner }] }
                     else { vec![LayerMode::HeadSplit, LayerMode::ContextSplit,
