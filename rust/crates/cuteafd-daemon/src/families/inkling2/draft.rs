@@ -88,6 +88,66 @@ mod tests{
         snapshot_buffers(&self.config,&self.buffers,Some(self.marks.backing().buffer))
     }}
     #[test]
+    fn full_context_attachment_is_host_stored_and_restored_byte_exact()->Result<()> {
+        use cuteafd_engine::prefix::{DraftPagePool, SnapshotKind};
+        use cuteafd_hostcache::{cache::{DevicePage, DeviceSnapshot, HostCache, RestoreOutcome,
+            RestoreTarget, SkipReason, StoreOutcome}, config::Config, pool::Layout,
+            snapshot::{DevicePageId, SnapshotMeta}, DRAFT_PAGE_BANK};
+        let fixture=cuteafd_ffi::native_library_lifetime_fixture::Fixture::build_for_tests()?;
+        let library=fixture.load()?;fixture.immediate_copies(&library)?;
+        let device=Device{library:&library,id:0};let stream=Rc::new(Stream::new(device)?);
+        let config=cuteafd_loader::formats::block_dspark::recurrent::RecurrentBlockConfig::from_hf(&serde_json::from_str(include_str!(
+            "../../../../cuteafd-loader/src/families/inkling2/fixtures/config.json"))?)?;
+        let mut buffers=std::collections::BTreeMap::new();
+        for (layer,policy) in config.context.iter().enumerate(){if matches!(policy,
+            cuteafd_loader::formats::block_dspark::recurrent::ContextPolicy::Full){
+            for plane in ["k","v"]{buffers.insert(format!("cache.layer.{layer}.{plane}"),
+                Allocation::new(device,2*64*32,Tag::drafter_kv("test/host-full-pages"))?);}
+        }}
+        let owner=Rc::new(SnapshotFixture{config,buffers,marks:WindowSnapshots::new(&stream,vec![256],2)?});
+        let mut pool=DraftPagePool::new(128,1,128,77)?;
+        let binding=pool.bind(0,0)?;
+        let reservation=pool.reserve(binding,0,64)?;
+        pool.commit(reservation,64)?;
+        let (saved,copies)=pool.capture(binding)?;
+        assert!(copies.is_empty());
+        let attachment=pool.attachment(saved)?;
+        let mark=owner.marks.mark(0)?;
+        let full=owner.buffers.values().map(|buffer|Buffer{bytes:64*32,..buffer.buffer}).collect::<Vec<_>>();
+        let originals=full.iter().enumerate().map(|(i,b)|vec![i as u8+31;b.bytes]).collect::<Vec<_>>();
+        for (buffer,bytes) in full.iter().zip(&originals){library.copy_h2d(*buffer,bytes)?;}
+        let mark_bytes=vec![73;mark.bytes];library.copy_h2d(mark,&mark_bytes)?;
+        let mut pages=Default::default();
+        let bank:&mut [Vec<DevicePage>;cuteafd_hostcache::PAGE_BANKS]=&mut pages;
+        bank[DRAFT_PAGE_BANK]=attachment.pages.iter().map(|page|DevicePage{
+            id:DevicePageId{compressor:DRAFT_PAGE_BANK as u8,page:page.index,generation:page.generation},
+            segments:full.iter().copied().map(range).collect()}).collect();
+        let snapshot=DeviceSnapshot{meta:SnapshotMeta{kind:SnapshotKind::Prompt,tokens:vec![1;64],end:64,has_draft:false},
+            pages,tail:vec![range(mark)],draft:None,scores:vec![]};
+        let config=Config{bytes:1<<20,chunk_bytes:8192,min_tokens:1,..Default::default()};
+        let engine=||CudaCopyEngine::registered_retained(&library,vec![],vec![owner.clone()]);
+        let layout=Layout::family(1,mark.bytes,0);
+        let mut broken=HostCache::new(config.clone(),layout,engine()?)?;
+        assert!(matches!(broken.store(&snapshot,attachment.clone()),StoreOutcome::Skipped(SkipReason::Malformed)));
+        let mut host=HostCache::new(config,layout.with_draft_pages(full.iter().map(|b|b.bytes).sum()),engine()?)?;
+        let ticket=match host.store(&snapshot,attachment.clone()) {
+            StoreOutcome::Issued(ticket)=>ticket,other=>anyhow::bail!("full draft attachment was not stored: {other:?}"),
+        };
+        host.engine_mut().synchronize(CopyStream::Store)?;
+        assert!(host.tick().completed.contains(&ticket));
+        assert_eq!(host.metrics().stores_completed,1);
+        for buffer in &full{library.copy_h2d(*buffer,&vec![0;buffer.bytes])?;}
+        library.copy_h2d(mark,&vec![0;mark.bytes])?;
+        let hit=host.lookup(&snapshot.meta.tokens).context("host attachment missing")?;
+        assert!(matches!(host.restore(hit.key,&RestoreTarget{pages:snapshot.pages.clone(),tail:snapshot.tail.clone(),
+            draft:None,scores:vec![]}),RestoreOutcome::Done{..}));
+        for (buffer,expected) in full.iter().zip(&originals){let mut actual=vec![0;buffer.bytes];library.copy_d2h(&mut actual,*buffer)?;assert_eq!(&actual,expected);}
+        let mut actual=vec![0;mark.bytes];library.copy_d2h(&mut actual,mark)?;assert_eq!(actual,mark_bytes);
+        pool.check_attachment(&attachment)?;
+        Ok(())
+    }
+
+    #[test]
     fn registered_draft_marks_and_full_pages_restore_exact_bytes()->Result<()>{
         let fixture=cuteafd_ffi::native_library_lifetime_fixture::Fixture::build_for_tests()?;
         let library=fixture.load()?;fixture.immediate_copies(&library)?;

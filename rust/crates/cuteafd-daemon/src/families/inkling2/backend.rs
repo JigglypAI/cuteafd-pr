@@ -228,8 +228,9 @@ impl<'a> Backend<'a> for InklingBackend<'a> {
         }).transpose()?;
         let host_bytes = host.as_ref().map_or(0, |(config, _)| config.bytes);
         let layout = self.family.layout();
-        let cache = PrefixCache::new(layout, PrefixConfig { entries: args.prefix_cache_entries,
-            mark_slots: bank.mark_slots(), keep_logits: true, min_tokens: args.prefix_cache_min_tokens }, host)?;
+        let cache = PrefixCache::new_with_draft_pages(layout, PrefixConfig { entries: args.prefix_cache_entries,
+            mark_slots: bank.mark_slots(), keep_logits: true, min_tokens: args.prefix_cache_min_tokens }, host,
+            self.family.draft_page_bytes())?;
         cuteafd_bench::context::set_kv((layout.pages * layout.page_rows) as u64,
             Some((layout.pages * layout.page_rows) as u64), layout.pages as u64,
             self.family.record_format(), host_bytes);
@@ -584,7 +585,8 @@ mod tests {
     fn adapter_uses_shared_scheduler_units_prefix_and_streamed_scoring() {
         let source = include_str!("backend.rs").split("#[cfg(test)]").next().unwrap();
         assert!(source.contains("Backend<'a> for InklingBackend"));
-        assert!(source.contains("PrefixCache::new("));
+        assert!(source.contains("PrefixCache::new_with_draft_pages("));
+        assert!(source.contains("self.family.draft_page_bytes()"));
         assert!(source.contains("registered_retained("));
         assert!(source.contains("prefill_packing::plan("));
         assert!(source.contains("streamed_prefill_scoring(&self) -> bool { true }"));
