@@ -1355,9 +1355,14 @@ def test_kimi_k31_mc_cards_keep_original_primary_and_k6_supplementary() -> None:
     published = json.loads((ROOT / "benchmarks/current-matrix.json").read_text())
     row, = [row for row in published["cells"] if row["checkpoint"] == model]
     assert row["family"] == "kimi_k3"
-    assert row["1rtx"]["status"] == "pending"
-    assert "k6-compact" in row["1rtx"]["reason"]
-    assert row["2rtx"]["status"] == "current"
+    # v6 adds a K6 minimum card and keeps original as the reference maximum.
+    assert row["1rtx"]["status"] == row["2rtx"]["status"] == "current"
+    assert row["1rtx"]["report"].endswith("-kimi-k31-mc-k6-compact-min")
+    assert row["2rtx"]["report"].endswith("-kimi-k31-mc-original-max")
+    study, = [entry for entry in published["mc_views"] if entry["checkpoint"] == model]
+    assert study["views"]["original"] == row["2rtx"]["report"]
+    for view in ("k8-compact", "k6-compact", "fp8-compact"):
+        assert study["views"][view].endswith(f"-kimi-k31-mc-{view}-max")
     assert any(row["checkpoint"] == "wrldsuksgo2mars/Kimi-K3-EXL3-K2-Core-K6" for row in published["cells"])
 
 
