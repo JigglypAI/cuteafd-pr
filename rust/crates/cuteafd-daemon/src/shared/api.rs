@@ -211,6 +211,11 @@ pub(crate) fn catch_scheduler_panic(work: impl FnOnce() -> anyhow::Result<()>) -
         .unwrap_or_else(|_| Err(anyhow::anyhow!("scheduler panicked")))
 }
 /// Borrow scheduler request owners from outside `work`, so fatal diagnostics precede channel closure.
+/// Publish while the caller still owns the in-flight reply channels.
+pub(crate) fn publish_scheduler_failure(error: &anyhow::Error) {
+    cuteafd_transport::health::record_failure(format!("scheduler stopped: {error:#}"));
+}
+
 pub(crate) fn run_scheduler(work: impl FnOnce() -> anyhow::Result<()>) -> anyhow::Result<()> {
     run_scheduler_with_health(work, |reason| cuteafd_transport::health::record_failure(reason))
 }

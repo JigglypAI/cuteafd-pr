@@ -1029,7 +1029,12 @@ pub(crate) fn schedule<'a, B: Backend<'a>>(engine: &B, snapshot: &std::path::Pat
                         engine.verify_device_ungraphed(&mut [(placement, chunk)], false,
                             UngraphedKind::Scoring, cache.pool())?.context("scoring needs every layer")
                     });
-                turn.check()?;
+                if let Err(stall) = turn.check() {
+                    let error = anyhow::Error::from(stall);
+                    crate::shared::api::publish_scheduler_failure(&error);
+                    let _ = job.events.send(Err(NativeFailure::Worker(format!("{error:#}"))));
+                    return Err(error);
+                }
                 match scored {
                     Ok(_) => { let _ = job.events.send(Ok(InferenceChunk::Finish { finish_reason: InferenceFinishReason::Length })); }
                     Err(error) => { let _ = job.events.send(Err(NativeFailure::Worker(format!("scoring: {error:#}")))); }
@@ -1152,7 +1157,14 @@ pub(crate) fn schedule<'a, B: Backend<'a>>(engine: &B, snapshot: &std::path::Pat
                 Ok(if p.done == p.tokens.len() { Chunk::Done } else { Chunk::More })
                     }).collect()
                 });
-            turn.check()?;
+            if let Err(stall) = turn.check() {
+                let error = anyhow::Error::from(stall);
+                crate::shared::api::publish_scheduler_failure(&error);
+                for (prompt, _) in &finished {
+                    let _ = prompt.job.events.send(Err(NativeFailure::Worker(format!("{error:#}"))));
+                }
+                return Err(error);
+            }
             for (mut p, prefilled) in finished {
                 let (placement, resume) = (p.placement.clone(), p.resume);
                 if let Err(error) = &prefilled {
