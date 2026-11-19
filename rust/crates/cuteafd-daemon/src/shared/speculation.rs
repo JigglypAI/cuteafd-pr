@@ -42,30 +42,31 @@ mod tests {
     use super::*;
 
     #[test]
-    fn serving_dflash_does_not_download_or_compute_policy_features() {
-        let source = include_str!("speculation/dflash.rs");
-        let gate = "downloads_selector_features(serving, self.trace_features.get(), matches!(self.head_ops, DraftHeadOps::Selector { .. }))";
-        assert!(source.contains(&format!("if {gate}")));
-        assert!(source.contains(&format!("let selector = {gate}")));
-        // Serving lands features only for an open trace, and never without a selector.
-        use dflash::downloads_selector_features as lands;
-        assert!(!lands(true, false, true), "untraced serving must not download features");
-        assert!(lands(true, true, true) && lands(false, false, true));
-        assert!(!lands(false, true, false) && !lands(true, true, false));
-        // Only serve loops that hold an open trace arm it.
-        for (family, serve) in [("glm5", include_str!("../families/glm5/serve.rs")),
-            ("glm5_flash", include_str!("../families/glm5_flash/serve.rs")),
-            ("mimo_v2", include_str!("../families/mimo_v2/serve.rs"))] {
-            assert_eq!(serve.matches("set_trace_features(").count(), 1, "{family}");
-            assert!(serve.contains("set_trace_features(trace.is_some())"), "{family}");
+    fn serving_families_route_the_declared_score_sources() {
+        // These are wiring checks for adapters whose constructors require an
+        // admitted accelerator. The policy itself is exercised with CPU replays.
+        for (family, source, declaration) in [
+            ("GLM 5.3 / ML4", include_str!("../families/glm5/serve.rs"), "d.score_source(), true"),
+            ("GLM Flash", include_str!("../families/glm5_flash/serve.rs"), "drafter.head_kind(), true"),
+            ("GLM Flash routes", include_str!("../families/glm5_flash/dspark.rs"), "Self::Dflash2(d) => d.score_source()"),
+            ("Kimi", include_str!("../families/kimi_k3/draft_common.rs"), "Self::Block { .. } => cuteafd_core::HeadScore::Probability"),
+            ("Kimi DFlash2", include_str!("../families/kimi_k3/draft_common.rs"), "Self::Mla(d) => d.score_source()"),
+            ("Muse", include_str!("../families/muse_spark/backend.rs"), "|d| d.drafter.score_source()"),
+            ("V4.1", include_str!("../families/deepseek_v41/v41_native_serve/speculative.rs"), "self.draft_width, cuteafd_core::HeadScore::Logit"),
+            ("MiniMax", include_str!("../families/minimax_m3/backend.rs"), "HeadScore { cuteafd_core::HeadScore::Probability }"),
+            ("Qwen dense", include_str!("../families/qwen3_5/serve.rs"), "self.drafter.is_some() { cuteafd_core::HeadScore::Probability }"),
+            ("DeepSeek V4", include_str!("../families/deepseek_v4/serve.rs"), "engine.draft_block(), cuteafd_core::HeadScore::None"),
+            ("Inkling", include_str!("../families/inkling2/backend.rs"), "HeadScore { cuteafd_core::HeadScore::None }"),
+            ("Qwen Next", include_str!("../families/qwen4/engine.rs"), "head: HeadScore::None"),
+        ] {
+            assert!(source.contains(declaration), "{family} score source");
         }
-        let mimo = include_str!("../families/mimo_v2/dflash.rs");
-        // MiMo lands its top-16 logits (and computes features) only for an open trace.
-        let unary = "..output.unary.buffer },";
-        assert_eq!(mimo.matches(unary).count(), 1);
-        let gated = mimo.split("if traced {").nth(1).expect("traced landing block");
-        assert!(gated.find(unary).is_some_and(|at| !gated[..at].contains('}')), "unary landing outside the trace gate");
-        assert!(mimo.contains("features: if !traced { Vec::new() }"));
+        let flash = include_str!("../families/glm5_flash/dspark.rs");
+        assert!(flash.contains("Self::Dspark(_) => cuteafd_core::HeadScore::Probability"));
+        assert!(flash.contains("Self::RemoteDflash(d) => d.draft.score_source()"));
+        let selector = include_str!("speculation/dflash.rs");
+        assert!(selector.contains("DraftHeadOps::Selector { .. } => cuteafd_core::HeadScore::CandidateProbability"));
+        assert!(selector.contains("DraftHeadOps::RnnMarkov { .. } | DraftHeadOps::Peer => cuteafd_core::HeadScore::None"));
     }
 
     #[test]

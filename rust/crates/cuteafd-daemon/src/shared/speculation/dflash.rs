@@ -770,20 +770,14 @@ impl MlaContextUpdate {
 }
 
 /// The drafted tokens after one anchor and the selector's per-token
-/// features (margin, best probability, entropy, rank among the 16); a dSpark
-/// draft has no selector and carries its confidence head's predicted
-/// acceptance per token instead (empty for DFlash2).
+/// diagnostic features (margin, best probability, entropy, rank among the 16).
+/// The policy scores are either selector probability or a trained head score,
+/// as declared by the drafter's `HeadScore`.
 #[derive(Debug, Clone)]
 pub(crate) struct Draft {
     pub tokens: Vec<u32>,
     pub features: Vec<[f32; 4]>,
     pub confidence: Vec<f32>,
-}
-
-/// Whether a draft round lands the selector's features: the golden oracle
-/// (`!serving`) or an open speculation trace, and only for a selector head.
-pub(crate) fn downloads_selector_features(serving: bool, traced: bool, selector: bool) -> bool {
-    selector && (!serving || traced)
 }
 
 /// FP32 logits `[rows, vocab]` of BF16 rows `[rows, hidden]` on a stream: `(x, logits, rows, stream)`.
@@ -877,6 +871,7 @@ pub(crate) struct DflashDrafter<'a> {
     /// The speculation trace is open: serving rounds also land the selector
     /// features for the trace (diagnostic only; no decision reads them).
     trace_features: Cell<bool>,
+    policy_scores: Cell<bool>,
     representation: GlmDraftRepresentation,
     fp8_workspace: Option<Dev<'a>>,
     /// How the borrowed BF16 head runs past one draft block ([`DraftHead`]; GLM 5.3
@@ -1266,7 +1261,7 @@ impl<'a> DflashDrafter<'a> {
             mask_rows: None,
             markov_workspace: None,
             target_projection, workspace: RefCell::new(None),
-            startup_primed: Cell::new(false), trace_features: Cell::new(false),
+            startup_primed: Cell::new(false), trace_features: Cell::new(false), policy_scores: Cell::new(false),
             representation,
             fp8_workspace,
             timing: crate::shared::draft::timing::DraftTiming::from_env(library, "glm-dflash")?,
@@ -1386,7 +1381,7 @@ impl<'a> DflashDrafter<'a> {
             context_positions: owners.take("context_positions")?,
             context: DraftContext::Mla(MlaContext { cfg: native, state: RefCell::new(MlaPagedState::new(&layout)?),
                 split, layout, slots: owners.take("context_slots")? }),
-            mask_row: Vec::new(), mask_rows: None, markov_workspace: None, target_projection, workspace: RefCell::new(Some(workspace)), startup_primed: Cell::new(false), trace_features: Cell::new(false), representation,
+            mask_row: Vec::new(), mask_rows: None, markov_workspace: None, target_projection, workspace: RefCell::new(Some(workspace)), startup_primed: Cell::new(false), trace_features: Cell::new(false), policy_scores: Cell::new(false), representation,
             fp8_workspace: if representation == GlmDraftRepresentation::Fp8Only { Some(owners.take("fp8_scratch")?) } else { None },
             head_mode: Cell::new(DraftHead::Exact), fp8_rows: Cell::new(fp8_rows), fp8_admitted: fp8_rows,
             timing: crate::shared::draft::timing::DraftTiming::from_env(library, "mla-dflash")?, cfg,
@@ -1508,7 +1503,7 @@ impl<'a> DflashDrafter<'a> {
             context: DraftContext::Mla(MlaContext { cfg: native, state: RefCell::new(MlaPagedState::new(&layout)?),
                 split: None, layout, slots: owners.take("context_slots")? }),
             mask_row: Vec::new(), mask_rows: Some(masks), markov_workspace: Some(markov_workspace),
-            target_projection, workspace: RefCell::new(Some(workspace)), startup_primed: Cell::new(false), trace_features: Cell::new(false),
+            target_projection, workspace: RefCell::new(Some(workspace)), startup_primed: Cell::new(false), trace_features: Cell::new(false), policy_scores: Cell::new(false),
             representation: GlmDraftRepresentation::Bf16Only, fp8_workspace: None,
             head_mode: Cell::new(DraftHead::Exact), fp8_rows: Cell::new(fp8_linear::Fp8Rows::default()),
             fp8_admitted: fp8_linear::Fp8Rows::default(),
@@ -1537,10 +1532,17 @@ impl<'a> DflashDrafter<'a> {
         self.head_mode.set(mode);
     }
 
-    /// Land each round's selector features for an open speculation trace. Only the
-    /// trace records them; tokens and every policy input are unchanged.
-    pub(crate) fn set_trace_features(&self, traced: bool) {
+    /// Land selector features for diagnostics and/or candidate probabilities for history.
+    pub(crate) fn set_selector_readback(&self, traced: bool, scored: bool) {
         self.trace_features.set(traced);
+        self.policy_scores.set(scored);
+    }
+
+    pub(crate) fn score_source(&self) -> cuteafd_core::HeadScore {
+        match self.head_ops {
+            DraftHeadOps::Selector { .. } => cuteafd_core::HeadScore::CandidateProbability,
+            DraftHeadOps::RnnMarkov { .. } | DraftHeadOps::Peer => cuteafd_core::HeadScore::None,
+        }
     }
 
     pub(crate) fn draft_head_mode(&self) -> DraftHead {
@@ -2598,6 +2600,10 @@ impl<'a> DflashDrafter<'a> {
     fn draft_from_rank(&self, sequences: &[DraftSeq], input: DraftInput<'_, '_>, head: HeadCall<'_>,
         serving: bool, paired: bool) -> Result<Vec<Draft>> {
         ensure!(!matches!(head, HeadCall::Bf16(p) if p.is_null()), "DFlash has no borrowed target head");
+        let selector = self.score_source() == cuteafd_core::HeadScore::CandidateProbability;
+        let trace_features = selector && (!serving || self.trace_features.get());
+        let policy_scores = selector && self.policy_scores.get();
+        let read_features = trace_features || policy_scores;
         let c = &self.cfg;
         let (s_count, block, h) = (sequences.len(), c.block, c.hidden);
         ensure!(!matches!((&self.context, input), (DraftContext::Mla(_), DraftInput::Rows(_))),
@@ -2866,10 +2872,13 @@ impl<'a> DflashDrafter<'a> {
                 } else { draft_view(w.head()?.tokens.buffer, 0, drafted * 4)? }
             } else { draft_view(w.head()?.tokens.buffer, 0, drafted * 4)? };
             l.copy_d2h_host_buffer_async(landing(0, drafted * 4), token_buffer, drafted * 4, s)?;
-            // Only the golden selector oracle and an open speculation trace read these features.
-            if downloads_selector_features(serving, self.trace_features.get(), matches!(self.head_ops, DraftHeadOps::Selector { .. })) {
+            if read_features {
+                // Four interleaved fields; a single contiguous DMA avoids a gather
+                // kernel or a per-row copy. No additional stream wait.
+                let span = self.timing.begin("candidate_features_d2h", None, drafted, s)?;
                 l.copy_d2h_host_buffer_async(landing(drafted * 4, drafted * 16),
                     CuteafdDeviceBuffer { bytes: drafted * 16, ..w.head()?.features.as_ref().context("selector workspace missing")?.buffer }, drafted * 16, s)?;
+                self.timing.end(span, s)?;
             }
             self.round.borrow_mut().wait(s)?;
         }
@@ -2885,18 +2894,20 @@ impl<'a> DflashDrafter<'a> {
         self.timing.publish_completed()?;
         self.timing.dump_head_input(w.n.buffer, rows, h)?;
         let drafted = s_count * c.drafts();
-        let selector = downloads_selector_features(serving, self.trace_features.get(), matches!(self.head_ops, DraftHeadOps::Selector { .. }));
-        let landing_bytes = drafted * if selector { 20 } else { 4 };
+        let landing_bytes = drafted * if read_features { 20 } else { 4 };
         let (tokens, features) = w.head()?.landing.bytes()[..landing_bytes].split_at(drafted * 4);
         let word = |b: &[u8], i: usize| u32::from_le_bytes(b[i * 4..i * 4 + 4].try_into().unwrap());
         Ok((0..s_count).map(|i| Draft {
-            tokens: (0..c.drafts()).map(|j| word(&tokens, i * c.drafts() + j)).collect(),
+            tokens: (0..c.drafts()).map(|j| word(tokens, i * c.drafts() + j)).collect(),
             // A token-only drafter (mtp_dspark) carries no selector features.
-            features: if !selector { Vec::new() } else { (0..c.drafts()).map(|j| {
+            features: if !trace_features { Vec::new() } else { (0..c.drafts()).map(|j| {
                 let n = (i * c.drafts() + j) * 4;
-                [0, 1, 2, 3].map(|k| f32::from_bits(word(&features, n + k)))
+                [0, 1, 2, 3].map(|k| f32::from_bits(word(features, n + k)))
             }).collect() },
-            confidence: Vec::new(),
+            confidence: if policy_scores { (0..c.drafts()).map(|j| {
+                let row = i * c.drafts() + j;
+                f32::from_bits(word(features, row * 4 + 1))
+            }).collect() } else { Vec::new() },
         }).collect())
     }
 

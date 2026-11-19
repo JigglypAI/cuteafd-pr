@@ -27,7 +27,7 @@ pub use expert_geometry::{expert_geometry, set_expert_geometry, ExpertGeometry, 
 mod draft_history;
 pub use draft_history::{DraftControl, DraftHistory, DraftHistoryStats, DraftOutcome, DrafterSpec, HeadScore, PositionTrace,
     RequestTrace, RoundTrace, Track, COPY_COLD_RATE, KEEP_CUT, NEURAL_COLD_RATE, PRIOR_STRENGTH, REQUEST_WINDOW,
-    SERVER_WINDOW, SKIP_CUT};
+    SERVER_WINDOW};
 mod dspark_rng;
 pub use dspark_rng::{DsparkRng, DsparkRngReservation};
 mod target_sampling;

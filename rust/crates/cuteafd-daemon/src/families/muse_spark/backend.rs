@@ -83,6 +83,7 @@ pub(crate) struct DraftState {
     anchor: Option<u32>,
     ready: bool,
     valid_from: usize,
+    confidence: Vec<f32>,
 }
 impl scheduler::DraftState for DraftState {
     fn pending_rows(&self) -> usize { usize::from(self.ready && self.anchor.is_some()) }
@@ -506,6 +507,7 @@ impl<'r, 'a> Backend<'a> for MuseBackend<'r, 'a> {
             let draft = self.draft.as_ref().context("Muse drafter was not admitted")?;
             let started = std::time::Instant::now();
             let mut output = vec![Vec::new(); sequences.len()];
+            for seq in sequences.iter_mut() { seq.seq.confidence.clear(); }
             let selected = sequences.iter().enumerate().filter(|(_, seq)| seq.depth > 0).map(|(index, seq)| {
                 ensure!(seq.seq.ready && seq.depth < draft.block, "Muse draft continuation is cold or too wide");
                 Ok((index, crate::shared::speculation::dflash::DraftSeq { slot: seq.placement.slot,
@@ -518,6 +520,7 @@ impl<'r, 'a> Backend<'a> for MuseBackend<'r, 'a> {
             let proposals = draft.draft(self.cfg, &self.ranks[last], self.table, &rows)?;
             ensure!(proposals.len() == batch.len(), "Muse draft output count differs from its batch");
             for ((index, _), proposal) in batch.iter().zip(proposals) {
+                sequences[*index].seq.confidence = proposal.confidence;
                 output[*index] = proposal.tokens.into_iter().take(sequences[*index].depth).collect();
             }
             timing.steps += 1;
@@ -526,6 +529,14 @@ impl<'r, 'a> Backend<'a> for MuseBackend<'r, 'a> {
         Ok(output)
         })
     }
+    fn draft_head_kind(&self) -> cuteafd_core::HeadScore {
+        self.draft.as_ref().map_or(cuteafd_core::HeadScore::None, |d| d.drafter.score_source())
+    }
+    fn configure_draft_scores(&self, enabled: bool) {
+        if let Some(d) = &self.draft { d.drafter.set_selector_readback(false, enabled); }
+    }
+    fn draft_head<'d>(&self, draft: &'d DraftState) -> Option<&'d [f32]> { Some(&draft.confidence) }
+
     /// The frontier advances by the kept rows; a drafting sequence's kept rows
     /// (tapped by the verify step at its offset) become drafter context.
     fn accept(&self, verified: &mut [scheduler::Verified<'_, Placement, DraftState, ()>], speculative: bool) -> Result<()> {

@@ -157,11 +157,12 @@ impl<'a> Drafter<'a> {
         if let Self::RemoteDflash(d) = self { d.finish_terminal(drained); }
     }
 
-    /// dSpark's trained confidence head reports a sigmoid per position; DFlash2 has no head.
+    /// dSpark reports a trained sigmoid; DFlash2 reports raw candidate probability.
     pub fn head_kind(&self) -> cuteafd_core::HeadScore {
         match self {
             Self::Dspark(_) => cuteafd_core::HeadScore::Probability,
-            Self::Dflash2(_) | Self::RemoteDflash(_) => cuteafd_core::HeadScore::None,
+            Self::Dflash2(d) => d.score_source(),
+            Self::RemoteDflash(d) => d.draft.score_source(),
         }
     }
 
@@ -258,12 +259,11 @@ impl<'a> Drafter<'a> {
         }
     }
 
-    /// Tokens one draft proposes per sequence.
-    /// Arm selector-feature landing for an open speculation trace (DFlash2 only).
-    pub fn set_trace_features(&self, traced: bool) {
+    /// Arm the selector readback independently for tracing and policy input.
+    pub fn set_selector_readback(&self, traced: bool, scored: bool) {
         match self {
-            Self::Dflash2(d) => d.set_trace_features(traced),
-            Self::RemoteDflash(d) => d.draft.set_trace_features(traced),
+            Self::Dflash2(d) => d.set_selector_readback(traced, scored),
+            Self::RemoteDflash(d) => d.draft.set_selector_readback(traced, scored),
             Self::Dspark(_) => {}
         }
     }

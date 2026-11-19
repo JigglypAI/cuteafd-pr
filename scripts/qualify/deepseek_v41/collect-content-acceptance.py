@@ -5,7 +5,8 @@ This reads an existing SPECULATION_TRACE from any family; it never launches
 traffic. --report joins request-local speculation usage to trace HTTP request ids;
 --request-content instead accepts an explicit id-to-content JSON mapping.
 Terminal rounds retain their verified counts; per-position acceptance uses only
-positions the verifier reached, excluding censored suffixes and synthetic skips.
+positions the verifier reached, excluding censored suffixes and any synthetic
+skips found in historical traces.
 """
 import argparse
 from collections import defaultdict
@@ -36,17 +37,15 @@ def summarize_history(records, content=None):
         copy_accepted = sum(p['outcome'] for p in copies)
         positions = defaultdict(lambda: [0, 0, 0, 0])
         for request in requests:
+            skipped = request.get('explore_skipped') is not None
             for position in request['positions']:
                 counts = positions[(position['track'], position['position'])]
-                if (position['outcome'] is not None
-                        and not (position['track'] == 'neural' and position['explore']
-                                 and request['explore_skipped'] is not None)):
+                if skipped and position['track'] == 'neural' and position['explore']:
+                    counts[3] += 1
+                elif position['outcome'] is not None:
                     counts[0] += 1
                     counts[1] += int(position['outcome'])
                     counts[2] += int(position['explore'])
-                if (position['track'] == 'neural' and position['explore']
-                        and request['explore_skipped'] is not None):
-                    counts[3] += 1
         result[name] = dict(
             request_rounds=len(requests), requests=len({r['id'] for r in requests}),
             proposed=proposed, accepted=accepted,
@@ -54,7 +53,7 @@ def summarize_history(records, content=None):
             rows_per_round=1 + proposed / len(requests),
             short_rounds=sum(r['proposed'] <= 1 for r in eligible),
             short_share=sum(r['proposed'] <= 1 for r in eligible) / len(requests),
-            explore_skipped=sum(r['explore_skipped'] is not None for r in requests),
+            explore_skipped=sum(r.get('explore_skipped') is not None for r in requests),
             copy_reached=len(copies), copy_accepted=copy_accepted,
             copy_acceptance=copy_accepted / len(copies) if copies else None,
             positions=[dict(track=track, position=position, reached=n, accepted=ok,

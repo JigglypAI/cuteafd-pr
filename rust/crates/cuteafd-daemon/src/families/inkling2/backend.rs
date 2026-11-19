@@ -503,7 +503,7 @@ mod tests {
     }
 
     #[test]
-    fn recurrent_native_seven_history_always_explores_and_never_head_skips() -> Result<()> {
+    fn recurrent_native_seven_token_only_history_always_explores() -> Result<()> {
         use cuteafd_core::{DraftControl, DraftHistory, DraftOutcome, DrafterSpec, HeadScore};
         let config = cuteafd_loader::formats::block_dspark::recurrent::RecurrentBlockConfig::from_hf(
             &serde_json::from_str(include_str!("../../../../cuteafd-loader/src/families/inkling2/fixtures/config.json"))?)?;
@@ -518,14 +518,12 @@ mod tests {
             policy.observe(&[DraftOutcome { id: 1, proposed: kept, accepted: 0, censored: false }], false);
         }
         assert_eq!(policy.plan(&[(1, width)], 64), [1]);
-        assert_eq!(policy.stats().head_skips, 0);
         assert!(policy.stats().explored > 0);
         for _ in 0..32 {
             let depth = policy.plan(&[(1, width)], 64)[0];
             policy.observe(&[DraftOutcome { id: 1, proposed: depth, accepted: depth, censored: false }], false);
         }
         assert_eq!(policy.plan(&[(1, width)], 64), [7]);
-        assert_eq!(policy.stats().head_skips, 0);
         Ok(())
     }
 

@@ -648,9 +648,8 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
     let tokenizer = cuteafd_loader::LoadedTokenizer::from_snapshot(&opened.snapshot)?;
     let drafter = engine.drafter.as_ref();
     let mut free_slots: Vec<usize> = drafter.map_or(Vec::new(), |d| (0..d.slots).rev().collect());
-    // mtp_dspark and DFlash2 propose tokens only: neither has a trained confidence head.
     let mut shared = drafter.map(|d| {
-        anyhow::Ok(DraftPolicy::new(policy.length, d.cfg.drafts(), cuteafd_core::HeadScore::None, true))
+        anyhow::Ok(DraftPolicy::new(policy.length, d.cfg.drafts(), d.score_source(), true))
     }).transpose()?;
     let mut active: Vec<Active<'_>> = Vec::new();
     // Decoding requests waiting for KV pages: they keep their slot and pages, skip rounds.
@@ -664,8 +663,9 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
     // then steps and verified rows.
     let mut phases = [0f64; 8];
     let mut trace = Trace::open()?;
-    // Selector features land only for the open trace's cycle records.
-    if let Some(drafter) = drafter { drafter.set_trace_features(trace.is_some()); }
+    if let Some(drafter) = drafter {
+        drafter.set_selector_readback(trace.is_some(), policy.length.control() == cuteafd_core::DraftControl::History);
+    }
     let mut prefills = policy.decode_share.queue::<Prefill<'_>>()?;
     // A request waits here for KV (and before that, with images, in `media` for its features).
     let mut kv_waiter = cuteafd_engine::prefix::DeferredAdmission::<Admit>::default();
@@ -1203,8 +1203,8 @@ async fn decode_round(lease: LaneLease<'_>, engine: &GlmEngine<'_>, opened: &Ope
         draft.as_ref().map_or_else(Vec::new, |d| d.tokens[..depth.min(d.tokens.len())].to_vec())).collect();
     let neural_lengths = match shared.as_mut() {
         Some(policy) => {
-            let mut shaped: Vec<_> = active.iter().zip(proposals.iter_mut()).map(|(a, tokens)| Proposal {
-                id: a.ticket.id(), tokens, head: None, history: &a.history, greedy: a.job.sampling.is_greedy() }).collect();
+            let mut shaped: Vec<_> = active.iter().zip(proposals.iter_mut()).zip(&drafted).map(|((a, tokens), d)| Proposal {
+                id: a.ticket.id(), tokens, head: d.as_ref().map(|d| d.confidence.as_slice()), history: &a.history, greedy: a.job.sampling.is_greedy() }).collect();
             policy.shape(&mut shaped, DECODE_ROWS)
         }
         None => vec![0; active.len()],

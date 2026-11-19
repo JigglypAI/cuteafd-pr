@@ -233,8 +233,8 @@ impl<'w, 'a, C: DraftChain<'a>> DraftRuntime<'w, 'a, C> {
         self.lanes[lane].depths = depths.clone();
         depths
     }
-    /// Fit the lane's proposals to their plan after the draft pass: the head may
-    /// skip an explore, an agreeing history copy extends a draft, and the
+    /// Fit the lane's proposals to their plan after the draft pass: keep the
+    /// calibrated prefix and its explore, extend an agreeing copy, and let the
     /// verifier row budget caps the round. `members` are (identity, the
     /// request's tokens with its anchor last, copies allowed) in lane order;
     /// `inputs` are each member's anchor followed by its drafts.

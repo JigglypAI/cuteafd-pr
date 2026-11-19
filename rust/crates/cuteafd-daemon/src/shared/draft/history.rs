@@ -5,8 +5,8 @@
 //!
 //! A serve loop's round:
 //! 1. [`Policy::plan`] before the draft pass: drafts to ask for per request;
-//! 2. [`Policy::shape`] after it: each proposal cut to its plan (the head may
-//!    skip the explore position), extended by an agreeing history copy, and
+//! 2. [`Policy::shape`] after it: each proposal cut to its keep prefix and one
+//!    explore, extended by an agreeing history copy, and
 //!    fitted to the verify-row budget;
 //! 3. [`Policy::observe`] after verification, with what the target accepted.
 use super::copy;
@@ -20,7 +20,7 @@ pub(crate) struct Proposal<'a> {
     pub id: u64,
     /// The drafter's tokens (empty: not drafted). Cut and extended in place.
     pub tokens: &'a mut Vec<u32>,
-    /// Raw head score per drafted position, for a drafter with a trained head.
+    /// Per-token score, in the drafter's declared score format.
     pub head: Option<&'a [f32]>,
     /// Prompt and generated tokens with the round's anchor last, for a history copy.
     pub history: &'a [u32],
@@ -35,8 +35,8 @@ pub(crate) struct Policy {
 }
 
 impl Policy {
-    /// `block` is the drafter's native block; `head` what its confidence head
-    /// reports; `copies` whether the family verifies history copies.
+    /// `block` is the drafter's native block; `head` its score source;
+    /// `copies` whether the family verifies history copies.
     pub fn new(length: DraftLength, block: usize, head: HeadScore, copies: bool) -> Self {
         let spec = DrafterSpec { block, head, copy: if copies { copy::COPY_EXTENSION } else { 0 } };
         let history = DraftHistory::new(spec, length.control());
@@ -138,9 +138,7 @@ fn attach_request_ids(record: &mut cuteafd_core::RoundTrace) {
 
 /// One `SPECULATION_TRACE` line per observed round: the policy, the running
 /// short-round share and explore counts, and per request every planned position
-/// with the probability used, its history counts, whether it was an explore,
-/// the head score where the drafter has one, and a skipped explore's
-/// calibrated probability (`explore_skipped`).
+/// with its per-token score, history counts, exploration and target outcome.
 #[derive(serde::Serialize)]
 struct RoundRecord {
     r#type: &'static str,
@@ -256,9 +254,8 @@ mod tests {
         let request = &value["requests"][0];
         assert_eq!((request["id"].as_u64(), request["proposed"].as_u64(), request["accepted_drafts"].as_u64()),
             (Some(7), Some(3), Some(1)));
-        assert!(request["explore_skipped"].is_null());
         let position = &request["positions"][1];
-        for field in ["p", "accepted", "reached", "server", "server_reached", "explore", "head", "calibrated", "outcome"] {
+        for field in ["p", "score", "accepted", "reached", "server", "server_reached", "explore", "head", "calibrated", "outcome"] {
             assert!(position.get(field).is_some(), "{field}");
         }
         assert_eq!((position["head"].as_f64().map(|x| (x * 10.).round()), position["outcome"].as_bool()), (Some(8.), Some(false)));

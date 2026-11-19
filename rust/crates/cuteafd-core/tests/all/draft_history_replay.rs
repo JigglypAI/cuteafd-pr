@@ -9,26 +9,8 @@
 //! 1-7 is .91 .87 .83 .82 .80 .76 .73 on the code and .55 .47 .43 .44 .43 .43
 //! .70 on the prose.
 //!
-//! Reference, over the full traces (tokens kept against fixed width / drafts
-//! verified per round / rounds at one draft or fewer):
-//! - code-heavy fixed-width cards: Kimi K6 fixed 5, 9,608 rounds, 99.91% /
-//!   4.98 / 0.14%; V4.1 fixed 5, 4,314 rounds, 99.87% / 4.94 / 0.63%; MiniMax
-//!   fixed 7, 2,399 rounds, 99.62% / 6.85 / 0.96%. (The rule as first replayed
-//!   with a 3-in-4 cold server prior: 99.9 / 4.98 / 0.1, 99.9 / 4.95 / 0.6,
-//!   99.5 / 6.79 / 1.0.)
-//! - this fixture's trace by content (37k rounds): code 99.4% at 6.87 of 7
-//!   drafts, none short; prose 91.2% at 2.19 of 7 drafts (rejected rows per
-//!   round 1.42, against about 6 at fixed width), 26% of rounds short.
-//! - the dSpark explore skip (calibrated head probability below `SKIP_CUT`,
-//!   0.3), booked as a miss at the skipped position, replayed on that trace:
-//!   18.5% fewer verify rows for 3.2% fewer tokens; tokens per verified row
-//!   0.706 -> 0.839; of the explores skipped, 9,572 would have failed and
-//!   1,478 passed. Prose rounds at one draft or fewer rise from 26% to 59%:
-//!   the head keeps saying those explores would miss, it is not a lock (the
-//!   explore returns as soon as the head scores it at 0.3 or above). At 0.2:
-//!   8.5% fewer rows (13.8% on prose) for 1.1% fewer tokens. Without the
-//!   booking the skip left the position's history unchanged, later rounds
-//!   drafted deeper and rows rose 0.8%.
+//! The replay compares fixed width, the count-based fallback, and scored
+//! history with online per-position calibration.
 use cuteafd_core::{DraftControl, DraftHistory, DraftOutcome, DrafterSpec, HeadScore};
 
 const BLOCK: usize = 7;
@@ -58,8 +40,8 @@ struct Tally {
     short: usize,
 }
 
-/// (prose, code) tallies and the head's skips.
-fn replay(head: HeadScore, control: DraftControl) -> ([Tally; 2], u64) {
+/// (prose, code) tallies.
+fn replay(head: HeadScore, control: DraftControl) -> [Tally; 2] {
     let mut policy = DraftHistory::new(DrafterSpec { block: BLOCK, head, copy: 0 }, control);
     let mut tallies = [Tally::default(); 2];
     for round in rounds() {
@@ -75,7 +57,8 @@ fn replay(head: HeadScore, control: DraftControl) -> ([Tally; 2], u64) {
         tally.short += usize::from(length <= 1);
     }
     assert_eq!(policy.stats().short_rounds as usize, tallies[0].short + tallies[1].short);
-    (tallies, policy.stats().head_skips)
+    assert_eq!(policy.stats().verified_drafts as usize, tallies[0].drafts + tallies[1].drafts);
+    tallies
 }
 
 /// Independent headless mirror keeps the old prior-eight counterfactual
@@ -154,11 +137,10 @@ fn code_first_requests_adapt_with_fewer_rows_without_losing_prose_tokens() {
 
 #[test]
 fn history_drafts_long_on_code_and_short_on_prose() {
-    let ([fixed_prose, fixed_code], _) = replay(HeadScore::None, DraftControl::Fixed(BLOCK));
+    let [fixed_prose, fixed_code] = replay(HeadScore::None, DraftControl::Fixed(BLOCK));
     assert_eq!(fixed_prose, Tally { rounds: 1112, tokens: 2219, drafts: 7784, short: 0 });
     assert_eq!(fixed_code, Tally { rounds: 646, tokens: 3154, drafts: 4522, short: 0 });
-    let ([prose, code], skips) = replay(HeadScore::None, DraftControl::History);
-    assert_eq!(skips, 0);
+    let [prose, code] = replay(HeadScore::None, DraftControl::History);
     // Fade3/stop.3: code keeps 98.4% of fixed tokens at 6.51 drafts, never stuck short,
     // although it starts from a server window that 1,112 prose rounds taught.
     assert_eq!(code, Tally { rounds: 646, tokens: 3104, drafts: 4207, short: 0 });
@@ -172,24 +154,9 @@ fn history_drafts_long_on_code_and_short_on_prose() {
     assert!(code.drafts * prose.rounds > prose.drafts * code.rounds);
 }
 
-/// The dSpark head skip, booked as a miss: bounds, not exact counts (the fit
-/// is floating point). It fires on prose, not on code, and spends fewer verify
-/// rows on prose for nearly the same tokens. With fade3/stop.3, this
-/// sample has 641 skips: prose drafts 3,395 -> 2,591 and tokens 2,087 ->
-/// 2,039; code drafts 4,207 -> 4,189 and tokens 3,104 -> 3,104.
 #[test]
-fn the_head_skip_saves_prose_rows_and_leaves_code_alone() {
-    let ([prose, code], _) = replay(HeadScore::None, DraftControl::History);
-    let ([skip_prose, skip_code], skips) = replay(HeadScore::Probability, DraftControl::History);
-    eprintln!("head skip: {skips} skips; prose {prose:?} -> {skip_prose:?}; code {code:?} -> {skip_code:?}");
-    assert!(skips >= 50, "{skips} skips");
-    assert!(skip_code.tokens.abs_diff(code.tokens) * 100 <= code.tokens);
-    assert!(skip_code.drafts.abs_diff(code.drafts) * 50 <= code.drafts);
-    assert!(skip_prose.drafts < prose.drafts, "prose drafts {} -> {}", prose.drafts, skip_prose.drafts);
-    assert!(skip_prose.tokens * 100 >= prose.tokens * 90, "prose tokens {} -> {}", prose.tokens, skip_prose.tokens);
-    // More prose rounds stop at one draft, and the explore still comes back: not a lock.
-    assert!(skip_prose.short > prose.short && skip_prose.short < skip_prose.rounds);
-    // Tokens per verified row (anchors included) do not fall.
-    let efficiency = |tally: Tally| tally.tokens as f64 / (tally.drafts + tally.rounds) as f64;
-    assert!(efficiency(skip_prose) >= efficiency(prose));
+fn calibrated_confidence_replays_prose_and_code() {
+    let [prose, code] = replay(HeadScore::Probability, DraftControl::History);
+    assert_eq!(prose, Tally { rounds: 1112, tokens: 2158, drafts: 3142, short: 287 });
+    assert_eq!(code, Tally { rounds: 646, tokens: 3144, drafts: 4291, short: 3 });
 }

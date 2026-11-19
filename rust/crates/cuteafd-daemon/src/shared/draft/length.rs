@@ -4,7 +4,7 @@ use cuteafd_core::DraftControl;
 /// `DRAFT_POLICY`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum)]
 pub(crate) enum DraftPolicyChoice {
-    /// Per-position acceptance history with exploration.
+    /// Per-token confidence (position history for token-only drafters) with exploration.
     #[default]
     History,
     /// Verify no drafts.
