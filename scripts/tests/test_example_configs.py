@@ -482,8 +482,7 @@ def test_published_matrix_pins_current_reports() -> None:
             assert not cell.get("reason")
             directory = Path(cell["report"])
             assert not directory.is_absolute() and ".." not in directory.parts
-            report_family = "kimi_k31" if row["checkpoint"] == "wrldsuksgo2mars/Kimi-K3.1-Pro-EXL3-K2-MC" else row["family"]
-            assert len(directory.parts) == 3 and directory.parts[:2] == ("benchmarks", report_family)
+            assert len(directory.parts) == 3 and directory.parts[:2] == ("benchmarks", row["family"])
             report = json.loads((ROOT / directory / "report.json").read_text())
             server = report["server"]
             snapshot = server.get("configuration", {}).get("snapshot") or ""
@@ -1354,9 +1353,18 @@ def test_kimi_k31_mc_cards_keep_original_primary_and_k6_supplementary() -> None:
     published = json.loads((ROOT / "benchmarks/current-matrix.json").read_text())
     row, = [row for row in published["cells"] if row["checkpoint"] == model]
     assert row["family"] == "kimi_k3"
-    assert row["1rtx"]["status"] == "pending"
-    assert "k6-compact" in row["1rtx"]["reason"]
-    assert row["2rtx"]["status"] == "current"
+    # v6 adds a K6 minimum card and keeps original as the reference maximum.
+    assert row["1rtx"]["status"] == row["2rtx"]["status"] == "current"
+    assert row["1rtx"]["report"].endswith("-kimi-k31-mc-k6-compact-min")
+    assert row["2rtx"]["report"].endswith("-kimi-k31-mc-original-max")
+    for column, expected_view in (("1rtx", "k6-compact"), ("2rtx", "original")):
+        directory = Path(row[column]["report"])
+        assert len(directory.parts) == 3 and directory.parts[:2] == ("benchmarks", "kimi_k3")
+        report = json.loads((ROOT / directory / "report.json").read_text())
+        assert report["server"]["family"] == row["family"]
+        assert report["server"]["model"] == model
+        settings = {setting["name"]: setting.get("value") for setting in report["server"]["configuration"]["settings"]}
+        assert settings["core-view"] == expected_view
     assert any(row["checkpoint"] == "wrldsuksgo2mars/Kimi-K3-EXL3-K2-Core-K6" for row in published["cells"])
 
 
