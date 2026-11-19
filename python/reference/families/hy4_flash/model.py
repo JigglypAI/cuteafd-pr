@@ -414,14 +414,14 @@ def fp8_roundtrip(x):
     return x + (decoded - x)
 
 
-def engram(x, tokens, w, c, index):
+def engram(x, tokens, w, c, index, *, round_trip=fp8_roundtrip):
     p = "engram_layer."
     rows = engram_rows(tokens, w[p + "lookup_table"], c, index)
     table = w[TABLE]
     embeddings = table.index_select(0, rows.flatten().to(table.device)).to(x.device, dtype=torch.float32)
     embeddings = embeddings.reshape(*rows.shape, -1)
     if c.engram_fp8_embedding:
-        embeddings = fp8_roundtrip(embeddings)
+        embeddings = round_trip(embeddings)
     eps = torch.finfo(torch.float32).eps  # nn.RMSNorm defaults, not text_config.rms_norm_eps.
     embedding = torch.cat([norm(embeddings[:, j], w[f"{p}lookup_per_head_norms.{j}.weight"], eps)
                            for j in range(rows.shape[-1])], dim=-1)

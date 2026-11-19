@@ -72,3 +72,22 @@ def test_dfly_context_uses_last_committed_recall_without_duplication():
     assert recalled_context(AttentionTap(kv, rope_key, groups), 3, 2).tolist() == [0, 1, 2]
     dense = groups[:, :0]
     assert recalled_context(AttentionTap(kv, rope_key, dense), 5, 2).tolist() == [0, 1, 2, 3, 4]
+
+
+def test_engram_calibration_rounds_fetched_rows_in_bf16(monkeypatch):
+    from hy4_flash import forward
+
+    rows = torch.linspace(-3.3, 2.6, 192).bfloat16().reshape(2, 96).float()
+    calls = []
+    def vendor(x):
+        calls.append(x.dtype)
+        cap = torch.finfo(torch.float8_e4m3fn).max
+        scale = x.abs().amax(dim=-1, keepdim=True).clamp_min(1e-12) / cap
+        decoded = (x / scale).clamp(-cap, cap).to(torch.float8_e4m3fn).to(x.dtype) * scale
+        return x + (decoded - x)
+    monkeypatch.setattr(forward, "vendor_round_trip", lambda: vendor)
+    result = forward.source_engram_round_trip(rows)
+    assert calls == [torch.bfloat16]
+    assert result.dtype == torch.float32
+    assert torch.equal(result, vendor(rows.bfloat16()).float())
+    assert not torch.equal(result, reference.fp8_roundtrip(rows))

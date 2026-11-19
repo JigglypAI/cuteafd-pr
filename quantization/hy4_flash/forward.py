@@ -21,10 +21,16 @@ if str(REFERENCE) not in sys.path:
     sys.path.insert(0, str(REFERENCE))
 from families.hy4_flash import model as reference
 from shape_invariant import linear
+from .engram import vendor_round_trip
 
 DRAFT_BLOCK_SIZE = 6
 DRAFT_SOURCE_REVISION = "ccb8d9ccaa309f71dda42e37517a7b0ee6afae8d"
 Project = Callable[[str, torch.Tensor, torch.Tensor], torch.Tensor]
+
+
+def source_engram_round_trip(rows):
+    """Stock Hy4 rounds fetched BF16 rows before the calibration forward resumes in F32."""
+    return vendor_round_trip()(rows.to(torch.bfloat16)).float()
 
 
 def native_projection(name, inputs, weight):
@@ -136,7 +142,7 @@ class Model:
     def attention_start(self, state, tokens, layer):
         c, w, index = self.config, layer.weights, layer.index
         if index + 1 in c.engram_layer_ids:
-            state = state + reference.engram(state, tokens, w, c, index)
+            state = state + reference.engram(state, tokens, w, c, index, round_trip=source_engram_round_trip)
         collapsed, post = reference.hyper(state, w, "hc_attn_layer", c)
         return state, post, reference.norm(collapsed, w["input_layernorm.weight"], c.rms_norm_eps)
 
