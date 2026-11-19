@@ -14,6 +14,8 @@ from kimi_k3.uniform_k2.storage import (
 
 SUFFIXES = ('trellis', 'suh', 'svh', 'mcg')
 MCG = 0xCBAC1FED
+MUL1 = 0x83DCD12D
+CODEBOOK_MULTIPLIERS = {"mcg": MCG, "mul1": MUL1}
 REPO = Path(__file__).resolve().parents[1]
 
 
@@ -24,9 +26,12 @@ def packed_specs(module, geometry):
     if (type(bits) is not int or not 1 <= bits <= 8 or inputs <= 0 or inputs % 128
             or outputs <= 0 or outputs % 128 or not 0 < geometry['out_features'] <= outputs):
         raise ValueError('invalid dense core geometry')
+    codebook = geometry.get('codebook', 'mcg')
+    if codebook not in CODEBOOK_MULTIPLIERS:
+        raise ValueError(f'unknown EXL3 codebook: {codebook}')
     return {module + '.trellis': ('I16', [inputs // 16, outputs // 16, bits * 16]),
             module + '.suh': ('F16', [inputs]), module + '.svh': ('F16', [outputs]),
-            module + '.mcg': ('I32', [])}
+            module + '.' + codebook: ('I32', [])}
 
 
 def check_projection(path, module, geometry):
@@ -35,9 +40,10 @@ def check_projection(path, module, geometry):
     if {n: (v['dtype'], v['shape']) for n, v in header.items() if n != '__metadata__'} != expected:
         raise ValueError(f'core projection tensor inventory differs: {module}')
     with Path(path).open('rb') as stream:
-        stream.seek(base + header[module + '.mcg']['data_offsets'][0])
-        if struct.unpack('<I', stream.read(4))[0] != MCG:
-            raise ValueError('core projection MCG multiplier differs')
+        codebook = geometry.get('codebook', 'mcg')
+        stream.seek(base + header[module + '.' + codebook]['data_offsets'][0])
+        if struct.unpack('<I', stream.read(4))[0] != CODEBOOK_MULTIPLIERS[codebook]:
+            raise ValueError(f'core projection {codebook.upper()} multiplier differs')
     return expected
 
 
@@ -145,10 +151,11 @@ def sampled_packed_oracle(path, module, geometry, *, device='cuda:0'):
     spec = importlib.util.spec_from_file_location('_core_trellis_reference', oracle_path)
     reference = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(reference)
-    expected = reference.Reference('mcg').decode_tiles(raw, geometry['bits']).astype(np.float16)
+    codebook = geometry.get('codebook', 'mcg')
+    expected = reference.Reference(codebook).decode_tiles(raw, geometry['bits']).astype(np.float16)
     packed = torch.from_numpy(np.frombuffer(raw, dtype='<i2').copy()).reshape(1, 8, -1).to(device)
     output = torch.empty((16, 128), dtype=torch.float16, device=device)
-    _quantizer().ext.reconstruct(output, packed, geometry['bits'], True, False)
+    _quantizer().ext.reconstruct(output, packed, geometry['bits'], codebook == 'mcg', codebook == 'mul1')
     actual = output.cpu().numpy().reshape(16, 8, 16).transpose(1, 0, 2).copy()
     if not np.array_equal(actual.view(np.uint16), expected.view(np.uint16)):
         raise ValueError(f'packed-byte reference decode differs: {module}')

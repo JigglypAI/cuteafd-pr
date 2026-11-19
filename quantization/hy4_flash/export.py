@@ -2,10 +2,12 @@
 from __future__ import annotations
 
 from copy import deepcopy
+from collections import Counter
 from pathlib import Path
 import re
 
 import mc_package as package
+from inkling2.publish import LFS_ATTRIBUTES
 from inkling2.export import DirectMCWriter as SharedDirectMCWriter, VIEWS
 from . import recipe
 
@@ -19,7 +21,7 @@ def _storage_entry(module, geometry):
     stored = {name: dict(shape=shape, torch_dtype=package.DTYPES[dtype])
               for name, (dtype, shape) in recipe.packed_specs(module, geometry).items()}
     return package.tensor_storage_entry(geometry, stored, side=1,
-                                       mcg_multiplier=recipe.MCG_MULTIPLIER)
+                                       mcg_multiplier=None, mul1_multiplier=package.MUL1)
 
 
 def _native_specs(source_inventory, selection):
@@ -35,7 +37,8 @@ def view_metadata(document, inventory, selection, experts, identity, *, k6_draft
         index, _, quantize, bits = package.mc_manifest.FILES[view]
         compact = view != 'original'
         config = deepcopy(document)
-        declaration = dict(quant_method='exl3', format='mcg', per_module_metadata=f'{quantize}:tensor_storage')
+        declaration = dict(quant_method='exl3', format='exl3', codebook='mul1', codebook_multiplier=package.MUL1,
+                           per_module_metadata=f'{quantize}:tensor_storage')
         config['quantization_config'] = declaration
         core = {}
         if compact:
@@ -57,7 +60,7 @@ def view_metadata(document, inventory, selection, experts, identity, *, k6_draft
             provenance=identity, core_view=view, upstream_activations='k8-compact',
             engram_checkpoint_dtype='BF16')
         meta, config = package.gptqmodel_mc_view(config, meta, bits=4,
-            core_bits=bits if compact else None, module_include=patterns)
+            core_bits=bits if compact else None, module_include=patterns, codebook='mul1')
         config['quantization_config']['safetensors_index'] = index
         meta['safetensors_index'] = index
         if compact:
@@ -88,7 +91,7 @@ def verify_original_discovery(output, expected_mapping):
                 config_type=type(config).__name__, shards=len(files), tensors=len(expected_mapping))
 
 
-def model_card(path, engram, *, k6_drafter_bits, selection):
+def model_card(path, engram, *, k6_drafter_bits, selection, identity, view_bytes):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     mismatches = sum(row['mismatch_count'] for row in engram['proof'].values())
@@ -98,10 +101,16 @@ def model_card(path, engram, *, k6_drafter_bits, selection):
     native_gib = rows * 192 / (1 << 30)
     fp8_gib = rows * 100 / (1 << 30)
     head = 'with a compact head' if 'lm_head' in selection else 'with the original BF16 head'
+    dataset = identity['dataset']
+    agentic = identity['components']['agentic']
+    standard = identity['components']['exl3_standard']
+    gib = {view: count / (1 << 30) for view, count in view_bytes.items()}
     text = f"""---
 library_name: cuteafd
 license: tencent-hy-license
 base_model: tencent/Hy4-flash
+datasets:
+- {dataset['repo_id']}
 tags:
 - exl3
 - mixture-of-experts
@@ -109,40 +118,72 @@ tags:
 
 # Hy4-flash EXL3 K4 MC
 
-One checkpoint with K4 MCG routed experts and three indexed core views. The
-`original` view is the default and keeps the source core and bundled DFly2
-weights. `k8-compact` and `k6-compact` contain compact target matrices
-{head}. They select K8 and K{k6_drafter_bits} DFly2 matrices respectively.
-The K4 experts, both Engram representations, iHC, compressed indexers, router,
-native drafter tensors, vision tower and projector are shared. A loader that
-implements Hy4-flash and its EXL3 experts can discover the original view from
-`config.json` and `model.safetensors.index.json` alone.
+## What multi-core means
+
+All three indexes share the K4 MUL1 experts, router, embeddings, compressed
+indexer, iHC tensors, vision tower and projector. The core view selects the
+precision of the target and eligible DFly2 matrices {head}.
+
+| View | Indexed weight payload | When to use it |
+| --- | ---: | --- |
+| `original` (default) | {gib['original']:.2f} GiB | Source-native core and byte-identical original drafter |
+| `k8-compact` | {gib['k8-compact']:.2f} GiB | Compact K8 target and K8 drafter |
+| `k6-compact` | {gib['k6-compact']:.2f} GiB | Smallest indexed target, with K{k6_drafter_bits} drafter matrices |
+
+The table counts tensor payload in the selected index. Each index includes
+the BF16 Engram tables. The FP8 alternate adds {fp8_gib:.2f} GiB to disk.
+
+## How it was made
+
+Source `{recipe.BASE_REPO}@{recipe.BASE_REVISION}`. The panel includes
+token-budgeted real source code, worked mathematics, function-call schemas
+and multilingual text. Hy4's own chat template rendered the agentic prompts
+with high reasoning effort. The second component uses the standard ExLlamaV3
+raw-text and random-token packing. The 2,709-token DSA and SWA-wrap witnesses
+checked reference parity separately. Calibration does not exercise DSA selection
+beyond the top-2,048 cutoff.
+
+One causal pass propagated the serialized K8 core and K4 expert reconstructions.
+K6 used the same core Hessians. DFly2 used the target hidden states, KV and
+indexer selections at layers 25, 29, 33, 37 and 41.
+
+| Recipe | Value |
+| --- | --- |
+| EXL3 | MUL1 (`0x83DCD12D`), side 1, automatic output scales |
+| Bits | Shared experts K4, compact core K8 and K6 |
+| Search | Seed {identity['seed']}, sigma {identity['sigma']}, checked FP64 Hadamard congruence |
+| Hessian | At most 128 rows per FP32 product, FP64 sum, FP32 storage |
+| Panel | `{dataset['repo_id']}@{dataset['revision']}` |
+| Calibration order | {agentic['count']:,} agentic prompts ({agentic['tokens']:,} tokens), then {standard['count']:,} standard rows ({standard['tokens']:,} tokens) |
+| Total calibration | {agentic['tokens'] + standard['tokens']:,} tokens |
+| Standard input ID SHA256 | `{standard['input_ids_sha256']}` |
+| Routed recovery | Keep all natural rows. Below 1,024, fill from ranks 17–32 in rank and corpus order, normalizing hypothetical gamma over 15 native routes plus the candidate. Fill any remaining deficit with raw-XTX identity observations. |
+| Causal combine | Ordered FP32 sum on the GPU over native routes only |
+| Replay | Decode serialized trellis and scales to BF16 and promote to FP32 |
+| Encoder | `tpurtell/GPTQModel@{identity['code']['fork']}` |
+
+Per-projection errors and routed coverage are in `per-module-errors.csv`.
 
 ## Engram tables
 
-All views index the four byte-identical native BF16 tables in dedicated
-shards ({native_gib:.2f} GiB). The separate FP8 alternate ({fp8_gib:.2f} GiB)
-packs 96 E4M3 codes and a little-endian F32 scale into each dense 100-byte row.
-The export uses stock BF16 lookup arithmetic to select E4M3 codes and
-stores the BF16-rounded scale as F32. It multiplies the stored code and scale
-in F32 and casts the result to BF16. Every decoded row is compared bitwise
-with the complete stock BF16 `x + (decoded - x)` expression, including
-signed zero. Across {rows:,} source rows, the comparison found
-{mismatches} mismatches.
-`cuteafd-mc.json` carries the alternate layout, row ranges and proof digests.
-The ordinary indexes reference the BF16 tables.
+The four dedicated BF16 shards contain {native_gib:.2f} GiB of source-identical
+table data. The alternate stores 96 E4M3 codes followed by the BF16-rounded
+scale in a little-endian F32 field per 100-byte row. Lookup multiplies code and
+scale in F32 and casts to BF16. Every one of the {rows:,} rows was compared
+bit for bit to the complete stock BF16 lookup round trip, including signed
+zero, with {mismatches} mismatches. The ordinary indexes select BF16. The
+`engram_fp8` field in `cuteafd-mc.json` identifies the FP8 part files.
 
-## Calibration
+## Running it
 
-Source `{recipe.BASE_REPO}@{recipe.BASE_REVISION}`. Calibration uses the
-source tokenizer and chat template with the standard own-text panel,
-including long-sequence coverage. One causal pass feeds reconstructed K8 core
-and K4 expert activations downstream. K6 encodes reuse the Hessians captured
-on that path. DFly2 uses the reference target hidden-state, KV and indexer
-taps at layers 25, 29, 33, 37 and 41.
+Use `config.json` and `model.safetensors.index.json` for the default view.
+MC-aware loaders select `k8-compact` or `k6-compact` through `cuteafd-mc.json`.
+Serving requires Hy4-flash architecture support and MUL1 routed-expert kernels.
+CuteAFD tracks bring-up and serving qualification in [issue #2478](https://github.com/tpurtell/cuteafd/issues/2478).
 
-Hy4-flash serving and end-to-end runtime qualification are separate work.
-See [CuteAFD #2478](https://github.com/tpurtell/cuteafd/issues/2478).
+## License
+
+The [Tencent HY License](LICENSE) accompanies this checkpoint.
 """
     path.write_text(text, encoding='utf-8')
     return path
@@ -155,6 +196,8 @@ class DirectMCWriter(SharedDirectMCWriter):
     prove_shared_source = True
 
     def __init__(self, output, source_snapshot, identity, source_inventory, **kwargs):
+        if identity.get('codebook') != 'mul1' or identity.get('codebook_multiplier') != package.MUL1:
+            raise ValueError('Hy4 direct writer requires the frozen MUL1 producer identity')
         super().__init__(output, source_snapshot, recipe.BASE_REPO, recipe.BASE_REVISION,
                          identity, source_inventory, **kwargs)
 
@@ -183,11 +226,25 @@ class DirectMCWriter(SharedDirectMCWriter):
         if not {'LICENSE', 'tokenizer.json', 'tokenizer_config.json', 'chat_template.jinja',
                 'generation_config.json', 'processor_config.json'} <= assets.keys():
             raise ValueError('source license, tokenizer or processor assets are incomplete')
-        assets['README.md'] = model_card(card_path, engram,
-                                        k6_drafter_bits=k6_drafter_bits, selection=core_selection)
-        assets['per-module-errors.csv'] = Path(error_csv)
         aliases = {module for module, geometry in core_selection.items()
                    if geometry['group'] == 'mtp'} if k6_drafter_bits == 8 else ()
+        alias_tensors = {name for module in aliases for name in recipe.packed_specs(
+            module, core_selection[module], bits=8)}
+        sizes = Counter()
+        for group in self.state['groups'].values():
+            for kind, members in group['sizes'].items():
+                sizes[kind] += sum(members.values())
+                if kind == 'k8-compact':
+                    sizes['k6-compact'] += sum(members[n] for n in alias_tensors.intersection(members))
+        sizes['shared'] += sum(self.source_inventory['sizes'][n] for n in engram['tables'])
+        assets['README.md'] = model_card(card_path, engram, k6_drafter_bits=k6_drafter_bits,
+                                        selection=core_selection, identity=self.identity,
+                                        view_bytes={view: sizes[view] + sizes['shared'] for view in VIEWS})
+        attributes = Path(card_path).parent / 'hy4-hub.gitattributes'
+        attributes.write_bytes(LFS_ATTRIBUTES)
+        assets['.gitattributes'] = attributes
+        assets['per-module-errors.csv'] = Path(error_csv)
         return super().finalize(core_selection=core_selection, configs=configs, quantizes=quantizes,
                                assets=assets, engram=engram, k6_use_k8=aliases,
-                               expected_shared_specs=shared)
+                               expected_shared_specs=shared,
+                               exl3_codebook=dict(name="mul1", multiplier=package.MUL1))

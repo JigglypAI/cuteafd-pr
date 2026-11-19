@@ -60,11 +60,19 @@ def regular(path):
 
 def metadata_identity(path):
     path = regular(path)
-    if path.stat().st_size > MAX_METADATA_BYTES:
+    # Hy4 has more than 62k routed projections. Their full diagnostic CSV
+    # and per-view storage declarations can exceed the ordinary asset cap.
+    large_tables = {'per-module-errors.csv', 'quantize_config.json',
+                    'quantize_config.k6.json', 'quantize_config.k8.json'}
+    size = path.stat().st_size
+    if size > (512 << 20 if path.name in large_tables else MAX_METADATA_BYTES):
         raise ValueError('non-weight metadata exceeds bounded size')
-    raw = path.read_bytes()
-    return dict(sha256=hashlib.sha256(raw).hexdigest(),
-                git_blob=hashlib.sha1(f'blob {len(raw)}\0'.encode() + raw).hexdigest())
+    digest, git = hashlib.sha256(), hashlib.sha1(f'blob {size}\0'.encode())
+    with path.open('rb') as stream:
+        while chunk := stream.read(1 << 20):
+            digest.update(chunk)
+            git.update(chunk)
+    return dict(sha256=digest.hexdigest(), git_blob=git.hexdigest())
 
 
 def manifest_digest(files):

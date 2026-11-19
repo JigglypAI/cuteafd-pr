@@ -19,7 +19,7 @@ import struct
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'scripts/lib'))
 import mc_manifest
-from core_export import MCG, SUFFIXES, packed_specs
+from core_export import CODEBOOK_MULTIPLIERS, MCG, MUL1, SUFFIXES, packed_specs
 from kimi_k3.uniform_k2.storage import (
     assemble_shard, atomic_json, canonical, file_identity, fsync_directory, read_header, sha256_file, verify_receipt,
 )
@@ -40,10 +40,11 @@ def tensor_storage_entry(geometry, stored_tensors, *, mcg_multiplier=MCG,
                          mul1_multiplier=None, **extra):
     """Build the common EXL3 record without discarding family-specific fields."""
     entry = dict(quant_format='exl3', bits_per_weight=geometry['bits'],
-                 mcg_multiplier=mcg_multiplier,
                  **{key: geometry[key] for key in
                     ('in_features', 'out_features', 'stored_out_features')},
                  stored_tensors=stored_tensors, **extra)
+    if mcg_multiplier is not None:
+        entry['mcg_multiplier'] = mcg_multiplier
     if mul1_multiplier is not None:
         entry['mul1_multiplier'] = mul1_multiplier
     return entry
@@ -54,12 +55,16 @@ def quantize_config_for_view(quantization_config, **metadata):
     return dict(metadata, **deepcopy(quantization_config))
 
 
-def gptqmodel_mc_view(config, metadata, *, bits, core_bits=None, module_include):
+def gptqmodel_mc_view(config, metadata, *, bits, core_bits=None, module_include, codebook="mcg"):
     """Package MC storage using GPTQModel's declaration and provenance schema."""
     config, metadata = deepcopy(config), deepcopy(metadata)
     previous = config['quantization_config']
     declaration = dict(quant_method='exl3', format='exl3', checkpoint_format='exl3',
                        bits=bits, per_module_metadata=previous['per_module_metadata'])
+    if codebook not in CODEBOOK_MULTIPLIERS:
+        raise ValueError('unknown GPTQModel MC codebook')
+    if codebook != 'mcg':
+        declaration.update(codebook=codebook, codebook_multiplier=CODEBOOK_MULTIPLIERS[codebook])
     if core_bits is not None:
         declaration['core_bits'] = core_bits
     config['quantization_config'] = declaration
@@ -70,7 +75,7 @@ def gptqmodel_mc_view(config, metadata, *, bits, core_bits=None, module_include)
             meta[key] = metadata.pop(key)
     metadata.pop('format', None)
     storage = metadata['tensor_storage']
-    metadata.update(method='exl3', codebook='mcg', out_scales='auto', group_size=-1,
+    metadata.update(method='exl3', codebook=codebook, out_scales='auto', group_size=-1,
                     desc_act=False, module_include=list(module_include),
                     lm_head=any(name == 'lm_head' or name.endswith('.lm_head') or name == 'output'
                                 for name in storage))
@@ -124,11 +129,11 @@ def inventory(root, index_name='model.safetensors.index.json', *, reviewed_paylo
     root = Path(root)
     index = load_json(root / index_name)
     mapping = index['weight_map']
-    headers, specs, sizes = {}, {}, {}
+    headers, bases, specs, sizes = {}, {}, {}, {}
     for shard in sorted(set(mapping.values())):
         if Path(shard).name != shard or not shard.endswith('.safetensors'):
             raise ValueError('index shard must be a safetensors basename')
-        headers[shard], _ = read_header(root / shard)
+        headers[shard], bases[shard] = read_header(root / shard)
     for name, shard in mapping.items():
         value = headers[shard][name]
         specs[name] = (value['dtype'], value['shape'])
@@ -139,7 +144,7 @@ def inventory(root, index_name='model.safetensors.index.json', *, reviewed_paylo
             raise ValueError('source header payload differs from reviewed recipe')
     elif index.get('metadata', {}).get('total_size') != measured:
         raise ValueError('selected index total_size differs from headers')
-    return dict(root=root, index=index, mapping=mapping, headers=headers, specs=specs, sizes=sizes)
+    return dict(root=root, index=index, mapping=mapping, headers=headers, bases=bases, specs=specs, sizes=sizes)
 
 
 def full_parent_inventory(root):
@@ -728,6 +733,50 @@ def _validate_direct_engram(output, manifest, state):
         raise ValueError('Hy4-flash alternate must be physically separate and only in the MC manifest')
 
 
+def _check_direct_markers(output, inv, markers, checked):
+    """Read four bytes per physical scalar, sharing shard handles across modules."""
+    by_shard = {}
+    for name, codebook in markers.items():
+        filename = inv['mapping'][name]
+        if (filename, name) not in checked:
+            offset = inv['headers'][filename][name]['data_offsets'][0]
+            by_shard.setdefault(filename, []).append((offset, name, codebook))
+    for filename, extents in by_shard.items():
+        with (output / filename).open('rb', buffering=0) as stream:
+            for offset, name, codebook in sorted(extents):
+                stream.seek(inv['bases'][filename] + offset)
+                if stream.read(4) != struct.pack('<I', CODEBOOK_MULTIPLIERS[codebook]):
+                    raise ValueError(f'direct {codebook.upper()} multiplier differs: {name}')
+                checked.add((filename, name))
+
+
+def _hy4_markers(inv, quantize, config, core, view):
+    """Require full metadata for every indexed shared expert and compact projection."""
+    if any(value.get('codebook') != 'mul1' or value.get('codebook_multiplier') != MUL1
+           for value in (quantize, config['quantization_config'])):
+        raise ValueError('Hy4 view differs from frozen MUL1 codebook')
+    packed = {name.rsplit('.', 1)[0] for name in inv['mapping'] if name.endswith('.trellis')}
+    if packed != quantize['tensor_storage'].keys():
+        raise ValueError('Hy4 tensor_storage does not cover every selected EXL3 module')
+    markers = {}
+    for module, entry in quantize['tensor_storage'].items():
+        width = entry.get('bits_per_weight')
+        if module not in core and width != 4:
+            raise ValueError('Hy4 routed expert requires K4')
+        if (entry.get('quant_format') != 'exl3' or entry.get('side') != 1
+                or entry.get('mul1_multiplier') != MUL1 or 'mcg_multiplier' in entry):
+            raise ValueError('Hy4 EXL3 module codebook or side differs')
+        geometry = dict(entry, bits=width, codebook='mul1')
+        specs = packed_specs(module, geometry)
+        if set(specs) != set(entry['stored_tensors']) or any(inv['specs'].get(n) != spec for n, spec in specs.items()):
+            raise ValueError('Hy4 packed tensor geometry differs: ' + module)
+        markers[module + '.mul1'] = 'mul1'
+    native = set(inv['mapping']) - {n for e in quantize['tensor_storage'].values() for n in e['stored_tensors']}
+    if native != quantize.get('retained_native_tensors', {}).keys():
+        raise ValueError(f'Hy4 retained-native inventory differs in {view}')
+    return markers
+
+
 def validate(output, *, verification='full'):
     """Validate payloads by default; direct writers may reuse streaming proofs."""
     if verification not in ('full', 'streaming-receipts'):
@@ -760,7 +809,12 @@ def validate(output, *, verification='full'):
     if family != 'ml4':
         manifest = mc_manifest.validate(load_json(output / mc_manifest.MANIFEST), output)
         _validate_direct_engram(output, manifest, state)
+    if family == 'hy4_flash' and (state['identity'].get('codebook') != 'mul1'
+            or state['identity'].get('codebook_multiplier') != MUL1
+            or manifest.get('exl3_codebook') != dict(name='mul1', multiplier=MUL1)):
+        raise ValueError('Hy4 package, manifest and producer must agree on MUL1')
     views = {}
+    checked_markers = set()
     for view, core in state['core_tensors'].items():
         index, config, quantize, _ = mc_manifest.FILES[view]
         inv = inventory(output, index)
@@ -770,6 +824,8 @@ def validate(output, *, verification='full'):
             if inv['specs'] != expected or inv['mapping'] != state['direct_expected_mappings'][view]:
                 raise ValueError('direct selected index differs from committed tensor inventory')
             selected = state['direct_core_selection']
+            markers = (_hy4_markers(inv, q, load_json(output / config), selected, view)
+                       if family == 'hy4_flash' else {})
             for module, geometry in selected.items():
                 if view == 'original':
                     if module in q['tensor_storage']:
@@ -781,8 +837,8 @@ def validate(output, *, verification='full'):
                         raise ValueError('invalid K6 drafter fallback')
                     bits = 8
                     original_map = state['direct_expected_mappings']['k8-compact']
-                    if any(inv['mapping'].get(module + '.' + suffix) != original_map[module + '.' + suffix]
-                           for suffix in SUFFIXES):
+                    if any(inv['mapping'].get(name) != original_map[name]
+                           for name in packed_specs(module, dict(geometry, bits=8))):
                         raise ValueError('K6 drafter fallback must alias the K8 shard')
                 entry = q['tensor_storage'].get(module, {})
                 if entry.get('bits_per_weight') != bits:
@@ -790,12 +846,9 @@ def validate(output, *, verification='full'):
                 required = packed_specs(module, dict(geometry, bits=bits))
                 if set(entry.get('stored_tensors', {})) != set(required):
                     raise ValueError('direct compact core metadata inventory differs')
-                marker = module + '.mcg'
-                header, base = read_header(output / inv['mapping'][marker])
-                with (output / inv['mapping'][marker]).open('rb') as stream:
-                    stream.seek(base + header[marker]['data_offsets'][0])
-                    if struct.unpack('<I', stream.read(4))[0] != MCG:
-                        raise ValueError('direct compact core MCG multiplier differs')
+                codebook = geometry.get('codebook', 'mcg')
+                markers[module + '.' + codebook] = codebook
+            _check_direct_markers(output, inv, markers, checked_markers)
         declared = {}
         for module, entry in q['tensor_storage'].items():
             for name, tensor in entry['stored_tensors'].items():

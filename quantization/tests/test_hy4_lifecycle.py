@@ -17,12 +17,13 @@ PINS = tuple(f'engram-fp8-layer-{layer:02d}-part-00000.safetensors' for layer in
 
 
 def test_hy4_publication_rejects_f32_only_or_changed_engram_proof(tmp_path):
-    identity = dict(source_repo=recipe.BASE_REPO, source_revision=recipe.BASE_REVISION)
+    identity = dict(source_repo=recipe.BASE_REPO, source_revision=recipe.BASE_REVISION,
+                    codebook="mul1", codebook_multiplier=recipe.MUL1_MULTIPLIER)
     tensors = list(recipe.ENGRAM_TABLES)
     proof = {t: dict(rows=recipe.ENGRAM_TABLES[t], reference_dtype='BF16', mismatch_count=0) for t in tensors}
     parts = [dict(file=name, rows=recipe.ENGRAM_TABLES[t], sha256='0' * 64) for name, t in zip(PINS, tensors)]
     manifest = dict(source=dict(repo=recipe.BASE_REPO, revision=recipe.BASE_REVISION),
-                    original_core_dtype='BF16',
+                    original_core_dtype='BF16', exl3_codebook=dict(name='mul1', multiplier=recipe.MUL1_MULTIPLIER),
                     variants=[dict(name=n) for n in ('original', 'k8-compact', 'k6-compact')],
                     engram_fp8=dict(recipe='test; reference=' + recipe.REFERENCE_REVISION,
                                    layers=[dict(tensor=t, parts=[p]) for t, p in zip(tensors, parts)]))

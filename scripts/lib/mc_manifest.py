@@ -138,7 +138,13 @@ def _read(root, name):
 def validate(manifest, root=None, view=None):
     """Validate schema and optionally selected (or all) view metadata on disk."""
     _fields(manifest, ("schema", "source", "original_core_dtype", "shared_inventory_sha256", "variants"),
-            optional=("required_features", "engram_fp8"))
+            optional=("required_features", "engram_fp8", "exl3_codebook"))
+    if "exl3_codebook" in manifest:
+        declaration = manifest["exl3_codebook"]
+        _fields(declaration, ("name", "multiplier"))
+        _require(declaration in ({"name": "mcg", "multiplier": 0xCBAC1FED},
+                                 {"name": "mul1", "multiplier": 0x83DCD12D}),
+                 "invalid MC EXL3 codebook declaration")
     engram = validate_engram_fp8(manifest["engram_fp8"]) if "engram_fp8" in manifest else None
     _require(manifest["schema"] == SCHEMA, "unsupported MC schema")
     features = manifest.get("required_features", [])
@@ -185,7 +191,7 @@ def validate(manifest, root=None, view=None):
 
 
 def build(root, *, source_repo, source_revision, core_tensors, original_core_dtype="BF16",
-          required_features=None, engram_fp8=None):
+          required_features=None, engram_fp8=None, exl3_codebook=None):
     """Build discovery metadata from sealed view files and their core name lists.
 
     Does not write or publish anything. `core_tensors` maps variant names to all
@@ -209,6 +215,8 @@ def build(root, *, source_repo, source_revision, core_tensors, original_core_dty
                     original_core_dtype=original_core_dtype, shared_inventory_sha256=shared, variants=variants)
     if required_features is not None:
         manifest["required_features"] = required_features
+    if exl3_codebook is not None:
+        manifest["exl3_codebook"] = exl3_codebook
     if engram_fp8 is not None:
         manifest["engram_fp8"] = engram_fp8
     validate(manifest, root)

@@ -29,6 +29,9 @@ def _validate_package(output, state, validation):
     if hub.metadata_identity(manifest_path)['sha256'] != validation['new_file_sha256'].get(manifest_path.name):
         raise ValueError('Hy4 manifest differs from package validation')
     manifest = hub.load(manifest_path)
+    if (identity.get('codebook') != 'mul1' or identity.get('codebook_multiplier') != recipe.MUL1_MULTIPLIER
+            or manifest.get('exl3_codebook') != dict(name='mul1', multiplier=recipe.MUL1_MULTIPLIER)):
+        raise ValueError('Hy4 publication requires the validated MUL1 package')
     if (manifest.get('source') != dict(repo=recipe.BASE_REPO, revision=recipe.BASE_REVISION)
             or manifest.get('original_core_dtype') != 'BF16'):
         raise ValueError('Hy4 publication requires the sealed three-view manifest')

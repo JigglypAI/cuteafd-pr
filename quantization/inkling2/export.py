@@ -7,6 +7,7 @@ required. Only one bounded output shard is assembled at a time.
 from __future__ import annotations
 
 from copy import deepcopy
+import filecmp
 import json
 from pathlib import Path
 import re
@@ -211,7 +212,7 @@ class DirectMCWriter:
 
     def finalize(self, *, core_selection, configs, quantizes, assets=None,
                  expected_payload_bytes=None, verification='streaming-receipts',
-                 k6_use_k8=(), engram=None, expected_shared_specs=None):
+                 k6_use_k8=(), engram=None, expected_shared_specs=None, exl3_codebook=None):
         """Seal indexes and metadata, then validate headers and durable copy proofs.
 
         ``core_selection`` maps module names (including ``mtp.*``) to logical
@@ -300,8 +301,10 @@ class DirectMCWriter:
                 _basename(component)
             if Path(name).as_posix() != name:
                 raise ValueError('asset path must be canonical and relative')
+            size_limit = (package.mc_manifest.MAX_JSON_BYTES
+                          if name == 'per-module-errors.csv' else 64 << 20)
             if (name in reserved or name.endswith(('.safetensors', '.receipt.json'))
-                    or Path(source_path).stat().st_size > 64 * 1024 * 1024):
+                    or Path(source_path).stat().st_size > size_limit):
                 raise ValueError('assets must be small non-weight package files')
             destination = self.output / name
             if any(parent.is_symlink() for parent in destination.parents
@@ -309,14 +312,14 @@ class DirectMCWriter:
                 raise ValueError('refuse asset directory symlink')
             if destination.is_symlink():
                 raise ValueError('refuse asset output symlink')
-            if destination.exists() and destination.read_bytes() != Path(source_path).read_bytes():
+            if destination.exists() and not filecmp.cmp(destination, source_path, shallow=False):
                 raise ValueError('existing package asset differs')
             if not destination.exists():
                 destination.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copyfile(source_path, destination)
             metadata_files.append(name)
         manifest = package.mc_manifest.build(self.output, source_repo=self.identity['source_repo'],
-            source_revision=self.identity['source_revision'], core_tensors=core_names,
+            source_revision=self.identity['source_revision'], core_tensors=core_names, exl3_codebook=exl3_codebook,
             **({'engram_fp8': engram['manifest']} if engram is not None else {}))
         atomic_json(self.output / package.mc_manifest.MANIFEST, manifest)
         metadata_files.append(package.mc_manifest.MANIFEST)

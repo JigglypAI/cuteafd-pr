@@ -17,18 +17,18 @@ def packed(module, geometry, bits):
     values = {}
     dtypes = {'I16': torch.int16, 'I32': torch.int32, 'F16': torch.float16}
     for name, (dtype, shape) in recipe.packed_specs(module, geometry, bits=bits).items():
-        value = recipe.MCG_MULTIPLIER - 2**32 if name.endswith('.mcg') else 0
+        value = recipe.MUL1_MULTIPLIER - 2**32 if name.endswith('.mul1') else 0
         values[name] = torch.full(shape, value, dtype=dtypes[dtype])
     return values
 
 
-@pytest.mark.parametrize('drafter_bits', [6, 8])
-def test_direct_hy4_engram_and_drafter_indexes(tmp_path, monkeypatch, drafter_bits):
+@pytest.mark.parametrize(('drafter_bits', 'corrupt_expert'), [(6, False), (8, False), (6, True)])
+def test_direct_hy4_engram_and_drafter_indexes(tmp_path, monkeypatch, drafter_bits, corrupt_expert):
     source = tmp_path / 'source'
     source.mkdir()
     base, draft, expert = 'lm_head', 'model.dfly_layers.0.mlp.down_proj', 'model.layers.1.mlp.experts.0.down_proj'
     table = engram.TENSOR_TEMPLATE.format(1)
-    first = {'in_features': 128, 'out_features': 128, 'stored_out_features': 128, 'bits': 6}
+    first = {'in_features': 128, 'out_features': 128, 'stored_out_features': 128, 'bits': 6, 'codebook': 'mul1'}
     selection = {base: dict(first, group='core'), draft: dict(first, group='mtp')}
     experts = {expert: dict(first, bits=4, group='routed')}
     monkeypatch.setattr(recipe, 'reviewed_core_modules', lambda **_: selection)
@@ -54,7 +54,11 @@ def test_direct_hy4_engram_and_drafter_indexes(tmp_path, monkeypatch, drafter_bi
     for name in export.ASSETS:
         (source / name).write_text('asset')
     output = tmp_path / 'out'
-    writer = export.DirectMCWriter(output, source, {'run': 1}, inv)
+    identity = dict(codebook='mul1', codebook_multiplier=recipe.MUL1_MULTIPLIER, seed=787,
+                    sigma=.025, code={'fork':'a' * 40}, dataset={'repo_id':'test/panel', 'revision':'b' * 40},
+                    components=dict(agentic=dict(count=2, tokens=123),
+                                    exl3_standard=dict(count=1, tokens=2048, input_ids_sha256='c' * 64)))
+    writer = export.DirectMCWriter(output, source, identity, inv)
 
     def write_inputs(filename, tensors):
         path = tmp_path / filename
@@ -66,7 +70,10 @@ def test_direct_hy4_engram_and_drafter_indexes(tmp_path, monkeypatch, drafter_bi
     if drafter_bits == 6:
         k6_data.update(packed(draft, first, 6))
     k6 = write_inputs('k6.safetensors', k6_data)
-    shared = write_inputs('k4.safetensors', packed(expert, first, 4))
+    k4 = packed(expert, first, 4)
+    if corrupt_expert:
+        k4[expert + '.mul1'].zero_()
+    shared = write_inputs('k4.safetensors', k4)
     lookup = 'model.layers.1.engram_layer.lookup_table'
     shared[lookup] = (weights, lookup)
     writer.write_group('all', shared=shared, original={name + '.weight': (weights, name + '.weight')
@@ -74,11 +81,26 @@ def test_direct_hy4_engram_and_drafter_indexes(tmp_path, monkeypatch, drafter_bi
     alt = engram.export_tables(output, {table: weights}, recipe.REFERENCE_REVISION)
     errors = tmp_path / 'errors.csv'
     errors.write_text('module,bits\n')
+    if corrupt_expert:
+        with pytest.raises(ValueError, match='MUL1 multiplier differs'):
+            writer.finalize(core_selection=selection, engram=alt, document={'model_type': 'hy_v4_flash'},
+                            error_csv=errors, card_path=tmp_path / 'card.md', k6_drafter_bits=drafter_bits)
+        return
     result = writer.finalize(core_selection=selection, engram=alt, document={'model_type': 'hy_v4_flash'},
                              error_csv=errors, card_path=tmp_path / 'card.md',
                              k6_drafter_bits=drafter_bits)
     manifest = json.loads((output / 'cuteafd-mc.json').read_bytes())
     assert manifest['engram_fp8'] == alt['manifest']
+    assert manifest['exl3_codebook'] == dict(name='mul1', multiplier=recipe.MUL1_MULTIPLIER)
+    assert not (output / '.gitattributes').is_symlink() and (output / '.gitattributes').is_file()
+    card = (output / 'README.md').read_text()
+    assert '2,171 tokens' in card and '0x83DCD12D' in card
+    for view in export.VIEWS:
+        q = json.loads((output / package.mc_manifest.FILES[view][2]).read_text())
+        assert q['codebook'] == 'mul1' and q['codebook_multiplier'] == recipe.MUL1_MULTIPLIER
+        assert set(q['tensor_storage']) == ({expert} if view == 'original' else {expert, base, draft})
+        assert all('mcg_multiplier' not in e and e['mul1_multiplier'] == recipe.MUL1_MULTIPLIER
+                   for e in q['tensor_storage'].values())
     assert result['status'] == 'validated-headers-and-byte-exactness'
     assert set(result['original_core_tensor_sha256']) == set(native)
     original, k8_map, k6_map = [json.loads((output / package.mc_manifest.FILES[view][0]).read_bytes())['weight_map']
