@@ -317,7 +317,7 @@
       "views": {
         "original": "benchmarks/glm5_flash/2026-11-19-smoke-glm-5-3-flash-exl3-k4-mc-2rtx-glmf-mc-original-max",
         "k8-compact": "benchmarks/glm5_flash/2026-11-19-smoke-glm-5-3-flash-exl3-k4-mc-2rtx-glmf-mc-k8-compact-max",
-        "k6-compact": "benchmarks/glm5_flash/2026-11-19-smoke-glm-5-3-flash-exl3-k4-mc-2rtx-glmf-mc-k6-compact-max",
+        "k6-compact": "benchmarks/glm5_flash/2026-11-19-smoke-glm-5-3-flash-exl3-k4-mc-2rtx-glmf-mc-k6-compact-max-recard",
         "fp8-compact": "benchmarks/glm5_flash/2026-11-19-smoke-glm-5-3-flash-exl3-k4-mc-2rtx-glmf-mc-fp8-compact-max"
       }
     },
