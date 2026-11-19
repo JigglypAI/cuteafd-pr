@@ -339,18 +339,25 @@ def dense(x, w, prefix):
                    w, prefix + "down_proj")
 
 
-def routing(x, w, c):
+def routing_scores(x, w, c):
     scores = project(x, w, "mlp.gate").sigmoid()
     choice = scores + w["mlp.gate.e_score_correction_bias"]
     group_scores = choice.reshape(len(x), c.n_group, -1).topk(2, dim=-1).values.sum(dim=-1)
     groups = group_scores.topk(c.topk_group, dim=-1, sorted=False).indices
     valid = torch.zeros_like(group_scores, dtype=torch.bool).scatter_(1, groups, True)
-    ids = choice.masked_fill(~valid.repeat_interleave(scores.shape[-1] // c.n_group, dim=1), -torch.inf).topk(
-        c.num_experts_per_tok, dim=-1, sorted=False).indices
+    return scores, choice.masked_fill(~valid.repeat_interleave(scores.shape[-1] // c.n_group, dim=1), -torch.inf)
+
+
+def native_routes(scores, choice, c):
+    ids = choice.topk(c.num_experts_per_tok, dim=-1, sorted=False).indices
     probs = scores.gather(1, ids)
     if c.norm_topk_prob:
         probs = probs / (probs.sum(dim=-1, keepdim=True) + 1e-20)
     return ids, probs * c.routed_scaling_factor
+
+
+def routing(x, w, c):
+    return native_routes(*routing_scores(x, w, c), c)
 
 
 def feed_forward(x, w, c, index):
@@ -407,14 +414,14 @@ def fp8_roundtrip(x):
     return x + (decoded - x)
 
 
-def engram(x, tokens, w, c, index):
+def engram(x, tokens, w, c, index, *, round_trip=fp8_roundtrip):
     p = "engram_layer."
     rows = engram_rows(tokens, w[p + "lookup_table"], c, index)
     table = w[TABLE]
     embeddings = table.index_select(0, rows.flatten().to(table.device)).to(x.device, dtype=torch.float32)
     embeddings = embeddings.reshape(*rows.shape, -1)
     if c.engram_fp8_embedding:
-        embeddings = fp8_roundtrip(embeddings)
+        embeddings = round_trip(embeddings)
     eps = torch.finfo(torch.float32).eps  # nn.RMSNorm defaults, not text_config.rms_norm_eps.
     embedding = torch.cat([norm(embeddings[:, j], w[f"{p}lookup_per_head_norms.{j}.weight"], eps)
                            for j in range(rows.shape[-1])], dim=-1)

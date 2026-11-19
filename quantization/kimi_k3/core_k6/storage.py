@@ -115,13 +115,13 @@ class StageStore:
         return record
 
     def write_batches(self, name, batches, metadata=None, *, segment_bytes=512 * 1024 * 1024,
-                      segment_batches=32):
+                      segment_batches=32, record_bytes=None, resume=None):
         """Seal bounded groups, then publish the existing complete-phase barrier.
 
-        The byte target is checked between records: one large batch may exceed
-        it. Payload memory stays bounded by the caller's batch and serializer's
-        chunk. A crash before manifest publication replays the entire phase;
-        segment seals alone never authorize reuse of numerical state.
+        By default the historical format replays the entire incomplete phase.
+        A caller can supply a serialized record size for pre-append rollover.
+        A resumable activation producer supplies a journal and accepts a starting
+        record ordinal. Packed fit groups retain their phase-level metric commit.
         """
         if (type(segment_bytes) is not int or segment_bytes <= 0 or
                 type(segment_batches) is not int or segment_batches <= 0):
@@ -131,17 +131,20 @@ class StageStore:
             return prior
         directory = self.directory(name)
         directory.mkdir(parents=True, exist_ok=True)
+        if resume is None:
+            entries, ordinal = [], 0
+        else:
+            entries, ordinal = resume.recover(directory)
         # Validate every leaf before removing any. Never delete unknown source,
         # symlink, or committed manifest data while cleaning an aborted phase.
-        leaves = list(directory.iterdir())
+        leaves = list(directory.iterdir()) if resume is None else []
         owned = re.compile(r"(?:[0-9]{5}\.safetensors(?:\.partial)?|segment-[0-9]{5}\.bin(?:\.partial)?|"
                            r"\.manifest\.json\.[a-z0-9_]{8}\.tmp|\.json-[a-z0-9_]{8})")
         if any(path.is_symlink() or not path.is_file() or not owned.fullmatch(path.name) for path in leaves):
             raise ValueError("unexpected uncommitted phase leaf")
         for path in leaves:
             path.unlink()
-        entries, pending, stream = [], [], None
-        ordinal = 0
+        pending, stream = [], None
 
         def seal():
             nonlocal stream, pending, ordinal
@@ -154,23 +157,37 @@ class StageStore:
             path = directory / f"segment-{ordinal:05d}.bin"
             os.replace(path.with_suffix(".bin.partial"), path)
             identity = file_identity(path)
-            entries.extend(dict(entry, file_identity=identity) for entry in pending)
+            sealed = [dict(entry, file_identity=identity) for entry in pending]
+            if resume is not None:
+                resume.seal(directory, ordinal, sealed)
+            entries.extend(sealed)
             pending = []
             ordinal += 1
 
         try:
-            for index, values in batches:
+            source = batches if resume is None else (() if len(entries) == resume.count else batches(len(entries)))
+            for index, values in source:
                 if type(index) is not int or index != len(entries) + len(pending):
                     raise ValueError("phase batch indices must be contiguous from zero")
+                if record_bytes is not None:
+                    size = record_bytes(values)
+                    if resume is not None and (index >= resume.count or size > segment_bytes):
+                        raise ValueError("activation record exceeds the declared count or segment limit")
+                    if stream is not None and stream.tell() + size > segment_bytes:
+                        seal()
                 if stream is None:
                     filename = f"segment-{ordinal:05d}.bin"
                     stream = (directory / (filename + ".partial")).open("xb")
                 receipt = checkpoint_io().append_safetensors(stream,
                     {key: value.detach().cpu().contiguous() for key, value in values.items()})
+                if record_bytes is not None and receipt["bytes"] != size:
+                    raise ValueError("serialized checkpoint size differs from its planned size")
                 pending.append(dict(filename=filename, index=index,
                                     storage_format="safetensors-segment-v1", **receipt))
                 if stream.tell() >= segment_bytes or len(pending) >= segment_batches:
                     seal()
+            if resume is not None and len(entries) + len(pending) != resume.count:
+                raise ValueError("incomplete activation record inventory")
             seal()
             # Persist every segment rename together before the manifest refers
             # to them. atomic_json supplies the later manifest/file+dir barrier.

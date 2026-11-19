@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import argparse
+from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import datetime, timezone
 import fcntl
 import hashlib
@@ -21,6 +23,20 @@ from kimi_k3.uniform_k2.storage import atomic_json, canonical, file_identity, fs
 TARGET_REPO = 'wrldsuksgo2mars/Inkling-2-Small-EXL3-K4-MC'
 MAX_METADATA_BYTES = 64 << 20
 LFS_ATTRIBUTES = b'*.safetensors filter=lfs diff=lfs merge=lfs -text\n'
+
+
+@dataclass(frozen=True)
+class PublicationTarget:
+    repo_id: str
+    family: str
+    commit_message: str
+    validate: Callable | None = None
+
+    def schema(self, role):
+        return f'cuteafd-{self.family}-publication-{role}-v1'
+
+
+INKLING = PublicationTarget(TARGET_REPO, 'inkling2', 'Publish calibrated Inkling 2 K4 MC checkpoint')
 
 
 def load(path):
@@ -44,11 +60,19 @@ def regular(path):
 
 def metadata_identity(path):
     path = regular(path)
-    if path.stat().st_size > MAX_METADATA_BYTES:
+    # Hy4 has more than 62k routed projections. Their full diagnostic CSV
+    # and per-view storage declarations can exceed the ordinary asset cap.
+    large_tables = {'per-module-errors.csv', 'quantize_config.json',
+                    'quantize_config.k6.json', 'quantize_config.k8.json'}
+    size = path.stat().st_size
+    if size > (512 << 20 if path.name in large_tables else MAX_METADATA_BYTES):
         raise ValueError('non-weight metadata exceeds bounded size')
-    raw = path.read_bytes()
-    return dict(sha256=hashlib.sha256(raw).hexdigest(),
-                git_blob=hashlib.sha1(f'blob {len(raw)}\0'.encode() + raw).hexdigest())
+    digest, git = hashlib.sha256(), hashlib.sha1(f'blob {size}\0'.encode())
+    with path.open('rb') as stream:
+        while chunk := stream.read(1 << 20):
+            digest.update(chunk)
+            git.update(chunk)
+    return dict(sha256=digest.hexdigest(), git_blob=git.hexdigest())
 
 
 def manifest_digest(files):
@@ -56,19 +80,21 @@ def manifest_digest(files):
                                      for n, v in sorted(files.items())}).encode()).hexdigest()
 
 
-def _validated_package(output):
+def _validated_package(output, target):
     state, validation = (load(regular(output / n)) for n in ('package-state.json', 'package-validation.json'))
     if (state.get('identity') != validation.get('identity') or state.get('copies') != {}
-            or state['identity'].get('family') != 'inkling2' or 'direct_core_selection' not in state
+            or state.get('identity', {}).get('family') != target.family or 'direct_core_selection' not in state
             or validation.get('status') != 'validated-headers-and-byte-exactness'):
-        raise ValueError('publication requires validated independent Inkling MC package')
+        raise ValueError('publication requires a validated independent MC package')
+    if target.validate is not None:
+        target.validate(output, state, validation)
     return state, validation
 
 
-def prepare_publication_metadata(output, root):
+def prepare_publication_metadata(output, root, *, target=INKLING):
     """Supply Hub protocol metadata without rewriting the sealed numerical package."""
     output, root = Path(output).absolute(), Path(root)
-    state, _ = _validated_package(output)
+    state, _ = _validated_package(output, target)
     if '.gitattributes' in state['new_files']:
         return  # Already sealed: publication_inventory verifies its original hash.
     path = output / '.gitattributes'
@@ -89,7 +115,7 @@ def prepare_publication_metadata(output, root):
     if regular(path).read_bytes() != LFS_ATTRIBUTES:
         raise ValueError('unsealed publication attributes differ from canonical LFS rules')
     fsync_directory(output)
-    record = dict(schema='cuteafd-inkling2-publication-metadata-v1',
+    record = dict(schema=target.schema('metadata'),
         role='publication-only-protocol-metadata', filename=path.name,
         package_identity=state['identity'], file_identity=file_identity(path), **metadata_identity(path))
     marker = root / 'publication-metadata.json'
@@ -99,10 +125,10 @@ def prepare_publication_metadata(output, root):
         atomic_json(marker, record)
 
 
-def publication_inventory(output):
+def publication_inventory(output, *, target=INKLING):
     """Use validated streaming receipts for weights; read only small metadata."""
     output = Path(output).resolve(strict=True)
-    state, validation = _validated_package(output)
+    state, validation = _validated_package(output, target)
     names = set(state['new_files']) | {'package-validation.json', 'package-provenance.json'}
     if '.gitattributes' not in names:
         if regular(output / '.gitattributes').read_bytes() != LFS_ATTRIBUTES:
@@ -133,7 +159,7 @@ def publication_inventory(output):
             raise ValueError('invalid writer SHA receipt')
         files[name] = dict(path=str(path), bytes=identity['bytes'], file_identity=identity,
                            device=path.stat().st_dev, **hashes)
-    return dict(schema='cuteafd-inkling2-publication-plan-v1', repo_id=TARGET_REPO,
+    return dict(schema=target.schema('plan'), repo_id=target.repo_id,
         output=str(output), identity=state['identity'], source_snapshot=state['source_snapshot'],
         files=files, manifest_sha256=manifest_digest(files))
 
@@ -142,11 +168,11 @@ def _field(value, key):
     return value.get(key) if isinstance(value, dict) else getattr(value, key, None)
 
 
-def verify_hub(api, revision, files, *, partial=False):
+def verify_hub(api, revision, files, *, partial=False, repo_id=TARGET_REPO):
     """Compare every pinned Hub LFS SHA256/Git blob and size; fetch no payloads."""
     if not re.fullmatch('[0-9a-f]{40,64}', revision or ''):
         raise ValueError('immutable Hub revision required')
-    info = api.model_info(TARGET_REPO, revision=revision, files_metadata=True)
+    info = api.model_info(repo_id, revision=revision, files_metadata=True)
     if _field(info, 'sha') != revision or _field(info, 'private') is not False:
         raise ValueError('published repository must be public at the pinned revision')
     siblings = _field(info, 'siblings') or []
@@ -164,9 +190,9 @@ def verify_hub(api, revision, files, *, partial=False):
     return info
 
 
-def _attribute_files(api, revision, files, root, fetch_metadata):
+def _attribute_files(api, revision, files, root, fetch_metadata, *, repo_id=TARGET_REPO):
     """Allow only Hub-appended literal LFS rules; read that tiny metadata file."""
-    info = api.model_info(TARGET_REPO, revision=revision, files_metadata=True)
+    info = api.model_info(repo_id, revision=revision, files_metadata=True)
     remote = {_field(v, 'rfilename'): v for v in (_field(info, 'siblings') or [])}
     name = '.gitattributes'
     row = remote.get(name)
@@ -204,7 +230,7 @@ def _check_sources(files):
             raise ValueError('publication source changed since receipt')
 
 
-def _upload_with_writer_hashes(api, arguments, files):
+def _upload_with_writer_hashes(api, arguments, files, *, target=INKLING):
     """Keep the native folder pipeline, supplying its lazy SHA fields from receipts."""
     require_qualified_hub()
     builder = getattr(api, '_prepare_upload_folder_additions', None)
@@ -236,8 +262,7 @@ def _upload_with_writer_hashes(api, arguments, files):
     # Only this task-owned client is adapted, for this synchronous upload call.
     setattr(api, name, prepared)
     try:
-        return api.upload_folder(**arguments,
-            commit_message='Publish calibrated Inkling 2 K4 MC checkpoint')
+        return api.upload_folder(**arguments, commit_message=target.commit_message)
     finally:
         if prior is missing:
             delattr(api, name)
@@ -245,7 +270,7 @@ def _upload_with_writer_hashes(api, arguments, files):
             setattr(api, name, prior)
 
 
-def publish(output, root, *, api=None, anonymous_api=None, fetch_metadata=None):
+def publish(output, root, *, api=None, anonymous_api=None, fetch_metadata=None, target=INKLING):
     """Resume native Hub upload, then seal a metadata-verified publication receipt.
 
     Call only after numerical completion. Native folder/Xet upload handles
@@ -254,6 +279,7 @@ def publish(output, root, *, api=None, anonymous_api=None, fetch_metadata=None):
     from huggingface_hub import HfApi, hf_hub_download
     from huggingface_hub.errors import RepositoryNotFoundError
 
+    repo_id = target.repo_id
     root = Path(root).expanduser().resolve()
     output = Path(output).expanduser().absolute()
     if root == output or root in output.parents or output in root.parents:
@@ -262,20 +288,20 @@ def publish(output, root, *, api=None, anonymous_api=None, fetch_metadata=None):
     api = api or HfApi()
     anonymous_api = anonymous_api or HfApi(token=False)
     fetch_metadata = fetch_metadata or (lambda revision, name: Path(hf_hub_download(
-        TARGET_REPO, name, revision=revision, token=api.token,
+        repo_id, name, revision=revision, token=api.token,
         local_dir=root / 'hub-metadata')).read_bytes())
     with (root / 'publication.lock').open('a') as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         marker = root / 'publication-complete.json'
         if marker.exists():
             saved = load(marker)
-            if (saved.get('repo_id') != TARGET_REPO or saved.get('status') != 'passed'
+            if (saved.get('schema') != target.schema('complete') or saved.get('repo_id') != repo_id or saved.get('status') != 'passed'
                     or saved.get('output') != str(output) or saved.get('manifest_sha256') != manifest_digest(saved['files'])):
                 raise ValueError('publication completion receipt differs')
-            verify_hub(anonymous_api, saved['revision'], saved['files'])
+            verify_hub(anonymous_api, saved['revision'], saved['files'], repo_id=repo_id)
             return saved  # Completed jobs stay complete even after standalone cleanup.
-        prepare_publication_metadata(output, root)
-        packet = publication_inventory(output)
+        prepare_publication_metadata(output, root, target=target)
+        packet = publication_inventory(output, target=target)
         plan_path = root / 'publication-plan.json'
         if plan_path.exists() and load(plan_path) != packet:
             raise ValueError('publication recovery plan differs from sealed output')
@@ -283,36 +309,40 @@ def publish(output, root, *, api=None, anonymous_api=None, fetch_metadata=None):
         guard = root / 'publication-destination.json'
         if not guard.exists():
             try:
-                info = api.model_info(TARGET_REPO, files_metadata=True)
+                info = api.model_info(repo_id, files_metadata=True)
             except RepositoryNotFoundError:
-                api.create_repo(TARGET_REPO, repo_type='model', private=False, exist_ok=False)
-                info = api.model_info(TARGET_REPO, files_metadata=True)
+                api.create_repo(repo_id, repo_type='model', private=False, exist_ok=False)
+                info = api.model_info(repo_id, files_metadata=True)
             if (_field(info, 'private') is not False
                     or {_field(v, 'rfilename') for v in (_field(info, 'siblings') or [])} - {'.gitattributes'}):
                 raise ValueError('destination must be new, empty and public')
-            atomic_json(guard, dict(repo_id=TARGET_REPO, initial_revision=_field(info, 'sha')))
-        elif load(guard).get('repo_id') != TARGET_REPO:
+            atomic_json(guard, dict(repo_id=repo_id, initial_revision=_field(info, 'sha')))
+        elif load(guard).get('repo_id') != repo_id:
             raise ValueError('destination recovery guard differs')
         # Native resumable upload may have published a subset before interruption.
-        head = api.model_info(TARGET_REPO, files_metadata=True)
+        head = api.model_info(repo_id, files_metadata=True)
         if _field(head, 'private') is not False:
             raise ValueError('destination became private')
         current = {_field(v, 'rfilename'): v for v in (_field(head, 'siblings') or [])}
         if set(current) - {'.gitattributes'}:
-            partial_files = _attribute_files(api, _field(head, 'sha'), packet['files'], root, fetch_metadata)
-            verify_hub(api, _field(head, 'sha'), partial_files, partial=True)
+            partial_files = _attribute_files(api, _field(head, 'sha'), packet['files'], root, fetch_metadata, repo_id=repo_id)
+            verify_hub(api, _field(head, 'sha'), partial_files, partial=True, repo_id=repo_id)
         _check_sources(packet['files'])
-        arguments = dict(repo_id=TARGET_REPO, repo_type='model', folder_path=str(output),
+        arguments = dict(repo_id=repo_id, repo_type='model', folder_path=str(output),
                          allow_patterns=sorted(packet['files']))
-        _upload_with_writer_hashes(api, arguments, packet['files'])
+        _upload_with_writer_hashes(api, arguments, packet['files'], target=target)
         _check_sources(packet['files'])
-        head = api.model_info(TARGET_REPO, files_metadata=True)
+        head = api.model_info(repo_id, files_metadata=True)
         revision = _field(head, 'sha')
-        published_files = _attribute_files(api, revision, packet['files'], root, fetch_metadata)
-        verify_hub(api, revision, published_files)
-        verify_hub(anonymous_api, revision, published_files)
-        record = dict(schema='cuteafd-inkling2-publication-complete-v1', status='passed',
-            repo_id=TARGET_REPO, revision=revision, url=f'https://huggingface.co/{TARGET_REPO}/tree/{revision}',
+        published_files = _attribute_files(api, revision, packet['files'], root, fetch_metadata, repo_id=repo_id)
+        verify_hub(api, revision, published_files, repo_id=repo_id)
+        verified = verify_hub(anonymous_api, revision, published_files, repo_id=repo_id)
+        for entry in _field(verified, 'siblings'):
+            lfs = _field(entry, 'lfs')
+            oid = _field(lfs, 'sha256') if lfs is not None else _field(entry, 'blob_id')
+            published_files[_field(entry, 'rfilename')]['hub_oid'] = oid
+        record = dict(schema=target.schema('complete'), status='passed',
+            repo_id=repo_id, revision=revision, url=f'https://huggingface.co/{repo_id}/tree/{revision}',
             output=str(output), identity=packet['identity'], source_snapshot=packet['source_snapshot'],
             files=published_files, manifest_sha256=manifest_digest(published_files),
             verification='Hub metadata LFS SHA256/Git blob and size; no remote weight reads',

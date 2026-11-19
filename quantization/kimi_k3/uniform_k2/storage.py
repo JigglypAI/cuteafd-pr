@@ -114,16 +114,25 @@ def scratch_receipt(path):
                 file_identity=file_identity(path))
 
 
-def read_header(path):
+def read_header(path, *, offset=0, length=None):
+    """Validate one whole file or one bounded safetensors record in a segment."""
     with Path(path).open("rb") as file:
+        size_on_disk = os.fstat(file.fileno()).st_size
+        if (type(offset) is not int or offset < 0
+                or (length is None and offset != 0)
+                or (length is not None and (type(length) is not int or length < 10))
+                or offset + (length or 0) > size_on_disk):
+            raise ValueError("invalid safetensors record extent")
+        region = size_on_disk if length is None else length
+        file.seek(offset)
         raw = file.read(8)
         if len(raw) != 8:
             raise ValueError("truncated safetensors prefix")
         size, = struct.unpack("<Q", raw)
-        if not 2 <= size <= 64 * 1024 * 1024:
+        if not 2 <= size <= min(64 * 1024 * 1024, region - 8):
             raise ValueError("invalid safetensors header size")
         header = json.loads(file.read(size))
-        payload_size = os.fstat(file.fileno()).st_size - 8 - size
+        payload_size = region - 8 - size
     cursor = 0
     for start, end in sorted(value["data_offsets"] for key, value in header.items() if key != "__metadata__"):
         if start != cursor or end < start:
@@ -144,7 +153,7 @@ def read_header(path):
             count *= dimension
         if value["dtype"] not in widths or count * widths[value["dtype"]] != value["data_offsets"][1] - value["data_offsets"][0]:
             raise ValueError("safetensors tensor shape/dtype extent differs")
-    return header, size + 8
+    return header, offset + size + 8
 
 
 def assemble_shard(entries, path, *, chunk_bytes=16 * 1024 * 1024):
@@ -155,11 +164,19 @@ def assemble_shard(entries, path, *, chunk_bytes=16 * 1024 * 1024):
     if not entries or not 1 <= chunk_bytes <= 64 * 1024 * 1024:
         raise ValueError("invalid shard entries/chunk bound")
     sources, spans, header, offset = {}, [], {}, 0
-    for name, (source_path, source_name) in sorted(entries.items()):
+    for name, entry in sorted(entries.items()):
+        if len(entry) == 2:
+            source_path, source_name = entry
+            start_record, record_length = 0, None
+        elif len(entry) == 4:
+            source_path, source_name, start_record, record_length = entry
+        else:
+            raise ValueError("invalid shard source entry")
         source_path = Path(source_path)
-        if source_path not in sources:
-            sources[source_path] = read_header(source_path)
-        source_header, base = sources[source_path]
+        key = (source_path, start_record, record_length)
+        if key not in sources:
+            sources[key] = read_header(source_path, offset=start_record, length=record_length)
+        source_header, base = sources[key]
         value = source_header[source_name]
         start, end = value["data_offsets"]
         header[name] = dict(dtype=value["dtype"], shape=value["shape"], data_offsets=[offset, offset + end - start])

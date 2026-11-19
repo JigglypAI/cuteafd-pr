@@ -8,6 +8,8 @@ before → after tables with conditions.
 
 Porting a family or changing shared serve, prefill, exchange or admission code: read [docs/architecture/shared-engine.md](docs/architecture/shared-engine.md) first.
 
+Writing a quantization brief: start from [docs/quantization/brief-template.md](docs/quantization/brief-template.md), keep every section, and append only a model addendum. Its rules (low-row expert recovery, GPU-resident expert reduction, log-style recovery, batched finiteness checks, MUL1, direct MC) were each paid for by a stopped or restarted quant.
+
 ## Working method
 
 - Disk: builds live on raptor's root NVMe and fill it fast (1.4 TB of

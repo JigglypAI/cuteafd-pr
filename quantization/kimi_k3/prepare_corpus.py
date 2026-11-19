@@ -88,10 +88,10 @@ def download_corpus(root=DEFAULT_CORPUS, *, allow_download=True):
     return root
 
 
-def read_panel(root):
+def read_panel(root, *, payload_sha256=PAYLOAD_SHA256):
     """Validate original bytes, ordered row provenance and split separation."""
     root = Path(root)
-    for name, expected in PAYLOAD_SHA256.items():
+    for name, expected in payload_sha256.items():
         if sha256_file(root / name) != expected:
             raise ValueError(f"dataset hash differs: {name}")
     provenance = json.loads((root / "manifest.json").read_text())
@@ -274,7 +274,7 @@ def prepare_corpus(source_snapshot, output, corpus=DEFAULT_CORPUS):
     return manifest
 
 
-def load_token_records(root, split="calibration", *, schema=SCHEMA, contract=CONTRACT):
+def load_token_records(root, split="calibration", *, schema=SCHEMA, contract=CONTRACT, dataset=None):
     """Verify a prepared split and return ordered IDs without re-tokenizing."""
     import torch
     from safetensors.torch import load_file
@@ -283,9 +283,11 @@ def load_token_records(root, split="calibration", *, schema=SCHEMA, contract=CON
         raise ValueError(f"unknown split: {split}")
     root = Path(root)
     manifest = json.loads((root / "manifest.json").read_text())
+    if dataset is None:
+        dataset = dict(repo_id=REPO_ID, revision=REVISION, files=PAYLOAD_SHA256)
     if (manifest.get("schema") != schema or manifest.get("status") != "passed"
             or manifest.get("contract") != contract
-            or manifest.get("dataset") != dict(repo_id=REPO_ID, revision=REVISION, files=PAYLOAD_SHA256)):
+            or manifest.get("dataset") != dataset):
         raise ValueError("prepared corpus contract differs")
     report = manifest["splits"][split]
     if report.get("file") != split + ".safetensors":
@@ -320,10 +322,10 @@ def load_token_records(root, split="calibration", *, schema=SCHEMA, contract=CON
     return result
 
 
-def load_token_batches(root, split="calibration", *, schema=SCHEMA, contract=CONTRACT):
+def load_token_batches(root, split="calibration", *, schema=SCHEMA, contract=CONTRACT, dataset=None):
     """Yield GPTQModel calibration dictionaries, one unpadded CPU batch each."""
     import torch
-    for row in load_token_records(root, split, schema=schema, contract=contract):
+    for row in load_token_records(root, split, schema=schema, contract=contract, dataset=dataset):
         ids = torch.tensor([row["input_ids"]], dtype=torch.int64)
         yield dict(input_ids=ids, attention_mask=torch.ones_like(ids))
 
