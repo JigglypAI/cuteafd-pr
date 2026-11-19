@@ -582,6 +582,15 @@ fn reply_encode(healthy: &AtomicBool, reply: &mpsc::SyncSender<Result<Vec<u16>>>
     terminal
 }
 
+/// Check cancellation after acquiring the turn; measure only the encode itself.
+fn encode_live<T>(cancelled: &AtomicBool, encode_ns: &AtomicU64, encode: impl FnOnce() -> Result<T>) -> Result<T> {
+    if cancelled.load(Ordering::Acquire) { return Err(VisionError::Cancelled); }
+    let started = std::time::Instant::now();
+    let result = encode();
+    encode_ns.store(started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64, Ordering::Release);
+    result.and_then(|output| if cancelled.load(Ordering::Acquire) { Err(VisionError::Cancelled) } else { Ok(output) })
+}
+
 /// Bounded shared media queue, one clip/image at a time. CUDA stays on this thread.
 /// Dropping the service closes admission, drains accepted jobs and joins owner.
 pub struct EncoderService {
@@ -610,7 +619,7 @@ impl EncoderService {
         admitted_bytes: u64,
         audio: Option<audio::AudioOwnerConfig>,
     ) -> Result<Self> {
-        Self::start_media(Some((spec, admitted_bytes)), library, device, audio, false).map(|(service, _)| service)
+        Self::start_media(Some((spec, admitted_bytes)), library, device, audio, false, None).map(|(service, _)| service)
     }
     /// Audio-only deployment keeps the same owner/queue, without vision weights.
     pub fn start_audio(
@@ -618,16 +627,16 @@ impl EncoderService {
         device: i32,
         audio: audio::AudioOwnerConfig,
     ) -> Result<Self> {
-        Self::start_media(None, library, device, Some(audio), false).map(|(service, _)| service)
+        Self::start_media(None, library, device, Some(audio), false, None).map(|(service, _)| service)
     }
     /// Coordinator-only deferred load. Spark owners retain the existing mount startup.
     pub(crate) fn start_coordinator(
         snapshot: &Path, vision: Option<(TowerSpec, u64)>, library: PathBuf, device: i32,
-        audio: Option<audio::AudioOwnerConfig>,
+        audio: Option<audio::AudioOwnerConfig>, turn: Option<Arc<crate::shared::gpu_turn::GpuTurn>>,
     ) -> anyhow::Result<(Self, push::Contribution)> {
         use crate::shared::experts::rtx::push::{PushPolicy, PushStartupError};
         let defer = PushPolicy::for_snapshot(snapshot)? == PushPolicy::Required;
-        Self::start_media(vision, library, device, audio, defer)
+        Self::start_media(vision, library, device, audio, defer, turn)
             .map_err(|error| PushStartupError::Planning(error.into()).into())
     }
     fn start_media(
@@ -636,6 +645,7 @@ impl EncoderService {
         device: i32,
         audio: Option<audio::AudioOwnerConfig>,
         defer: bool,
+        turn: Option<Arc<crate::shared::gpu_turn::GpuTurn>>,
     ) -> Result<(Self, push::Contribution)> {
         // Query and admit every enabled component before either allocates.
         if let Some((spec, admitted)) = &vision {
@@ -731,39 +741,39 @@ impl EncoderService {
                     if ack.send(result).is_err() || failed { return; }
                 }
                 while let Ok(work) = jobs.recv() {
-                    let started = std::time::Instant::now();
-                    let result = if work.cancelled.load(Ordering::Acquire) {
-                        Err(VisionError::Cancelled)
+                    if work.cancelled.load(Ordering::Acquire) {
+                        let _ = work.reply.send(Err(VisionError::Cancelled));
+                        continue;
+                    }
+                    let turn = turn.as_deref().map(crate::shared::gpu_turn::GpuTurn::media);
+                    // The native owners unwind before the turn if an encode fails or panics.
+                    let (mut vision, mut audio) = (runtime.take(), audio_runtime.take());
+                    let result = if turn.as_ref().is_some_and(|turn| turn.stalled) {
+                        Err(VisionError::Unavailable)
                     } else {
-                        // Under a head split, encode only between the scheduler's engine calls,
-                        // never against a half-issued two-GPU step (see gpu_turn).
-                        let _turn = crate::shared::gpu_turn::GPU_TURN.media();
-                        let encoded = match work.job {
-                            EncoderJob::Vision(mut job) => match runtime.as_mut() {
+                        encode_live(&work.cancelled, &work.encode_ns, || match work.job {
+                            EncoderJob::Vision(mut job) => match vision.as_mut() {
                                 Some(runtime) => match job.pixels {
                                     Some(pixels) => runtime.native.encode_pixels_into(&job.rgb,job.grid,pixels,&job.lut,&mut job.output).map_err(VisionError::from),
                                     None => runtime.encode_into(&job.rgb,job.grid,&job.lut,&mut job.output),
                                 }.map(|()| job.output),
                                 None => Err(VisionError::Unsupported("vision encoder is not loaded".into())),
                             },
-                            EncoderJob::Audio(job) => match audio_runtime.as_mut() {
+                            EncoderJob::Audio(job) => match audio.as_mut() {
                                 Some(runtime) => runtime.encode(job),
                                 None => Err(VisionError::Unsupported("audio encoder is not loaded".into())),
                             },
-                        };
-                        encoded.and_then(|output| {
-                            if work.cancelled.load(Ordering::Acquire) {
-                                Err(VisionError::Cancelled)
-                            } else { Ok(output) }
                         })
                     };
-                    work.encode_ns.store(started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64, Ordering::Release);
                     if let Err(ref error) = result {
                         tracing::debug!(%error, "media job failed");
                     }
                     // CUDA errors poison this owner: queued tickets fail closed.
-                    if reply_encode(&owner_health, &work.reply, result) { break; }
+                    if reply_encode(&owner_health, &work.reply, result) { return; }
+                    (runtime, audio_runtime) = (vision, audio);
                 }
+                let _turn = turn.as_deref().map(crate::shared::gpu_turn::GpuTurn::media);
+                drop((runtime, audio_runtime));
             })?;
         match readiness.recv() {
             Ok(Ok((ledger, audio_ledger, vision_arena, pcm_arena))) => {
@@ -888,6 +898,20 @@ mod tests {
             let ctypes: Vec<u64> = serde_json::from_slice(&output.stdout).unwrap();
             assert_eq!(values, ctypes, "Rust/ctypes tower spec differs for {family}");
         }
+    }
+
+    #[test]
+    fn cancellation_while_waiting_skips_cuda_and_encode_timing() {
+        let turn = crate::shared::gpu_turn::GpuTurn::new();
+        let cancelled = AtomicBool::new(false);
+        let encode_ns = AtomicU64::new(0);
+        // Simulate cancellation after admission but before the waiting owner can encode.
+        assert!(!cancelled.load(Ordering::Acquire));
+        cancelled.store(true, Ordering::Release);
+        let _media = turn.media();
+        let result = encode_live(&cancelled, &encode_ns, || -> Result<()> { panic!("cancelled job reached CUDA") });
+        assert!(matches!(result, Err(VisionError::Cancelled)));
+        assert_eq!(encode_ns.load(Ordering::Acquire), 0);
     }
 
     #[test]

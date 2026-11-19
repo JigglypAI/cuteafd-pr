@@ -134,7 +134,8 @@ impl ReadyVision {
 
     pub fn load(args: &super::EngineArgs, view: &cuteafd_loader::plan::checkpoint::CheckpointView,
         library: &cuteafd_ffi::NativeLibrary, mode: MediaMode,
-        cache_bytes: usize, remote: Option<RemoteVision>) -> Result<Option<Self>> {
+        cache_bytes: usize, remote: Option<RemoteVision>,
+        turn: Option<Arc<crate::shared::gpu_turn::GpuTurn>>) -> Result<Option<Self>> {
         let Some(config) = vision_config_view(mode, view)? else { return Ok(None); };
         let admitted = args.serving_encoder.as_ref().context("Flash vision lacks admitted physical owners")?;
         let processor = ProcessorConfig::from_snapshot(&args.snapshot, ImageFamily::GlmFlash)?;
@@ -184,7 +185,7 @@ impl ReadyVision {
         library.cuda_set_device(gpu)?;
         let admitted = admitted.admitted_bytes();
         let loaded = crate::shared::vision::EncoderService::start_coordinator(&args.snapshot,
-            Some((spec, admitted)), args.native_lib.clone(), gpu, None);
+            Some((spec, admitted)), args.native_lib.clone(), gpu, None, turn);
         let restored = library.cuda_set_device(args.device);
         let (service, push) = loaded?;
         restored?;

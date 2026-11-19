@@ -23,6 +23,7 @@
 //! at its last chunk; a decode whose client left is not retained.
 //! `prompt_cache_hit_tokens` reports the restored rows; `/v1/stats` carries
 //! the cache's counters.
+use crate::shared::gpu_turn::{GpuTurn, MediaStalled};
 use crate::shared::draft::history::{self, Policy as DraftPolicy, Proposal};
 use super::engine::{GlmfEngine, GlmfPlacement, DECODE_ROWS, PAGE_ROWS, WIDE_DECODE_ROWS};
 use super::prefix::{GlmfPrefix, PrefixMarks};
@@ -296,8 +297,13 @@ fn serve_loop(mut args: super::EngineArgs, mut receive: mpsc::Receiver<NativeReq
     args.serving_media_bytes = bytes as u64;
     let prepared = std::cell::RefCell::new(None);
     let mut ready = Some(ready);
-    let result = opened.with_engine_media(&args, || {
-        let vision = super::media::ReadyVision::load(&args, &opened.view, &opened.library, vision, bytes, remote)?;
+    let gpu_turn = std::cell::OnceCell::new();
+    let result = opened.with_engine_media(&args, |split_device| {
+        use cuteafd_loader::plan::encoder::EncoderKind;
+        let local = args.serving_encoder.as_ref().is_some_and(|p| matches!(p.kind, EncoderKind::Rtx { .. }));
+        let turn = (split_device.is_some() && local)
+            .then(|| gpu_turn.get_or_init(|| Arc::new(GpuTurn::new())).clone());
+        let vision = super::media::ReadyVision::load(&args, &opened.view, &opened.library, vision, bytes, remote, turn)?;
         let records = vision.as_ref().map(|vision| vision.push.records()).unwrap_or_default();
         *prepared.borrow_mut() = vision;
         Ok(records)
@@ -323,7 +329,7 @@ fn serve_loop(mut args: super::EngineArgs, mut receive: mpsc::Receiver<NativeReq
         let spark = matches!(engine.experts(), Some(super::engine::Experts::Spark { .. }));
         console::layer_classes(engine.weights.layers.iter().map(|l| console::layer_class(l.dense, spark)).collect());
         schedule(engine, &opened, &args.snapshot, &mut receive, &stats, lanes, policy, decode_share, &prefix,
-            loop_abort, (args.prefix_marks, args.mark_arena), args.token_io.token_select, &mut media, preparer.as_deref(),
+            loop_abort, (args.prefix_marks, args.mark_arena), args.token_io.token_select, &mut media, preparer.as_deref(), gpu_turn.get().map(Arc::as_ref),
             || {
                 // Ready once the prefix cache and the token selector exist: the ledger then lists
                 // every start-up allocation.
@@ -832,7 +838,7 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
     loop_abort: crate::shared::loop_abort::LoopAbortConfig,
     marks: (PrefixMarks, super::prefix::ArenaMarks), select: SelectPlacement,
     media: &mut MediaAdmission<super::media::Prompt, super::media::Encoder>,
-    preparer: Option<&cuteafd_api::openai::media::MediaPreparer>, ready: impl FnOnce())
+    preparer: Option<&cuteafd_api::openai::media::MediaPreparer>, gpu_turn: Option<&GpuTurn>, ready: impl FnOnce())
     -> Result<()> {
     let (family, mut cache) = prefix_cache(engine, prefix, marks, max_sequences)?;
     // Made before the KV pool when start-up admitted it from measured memory.
@@ -880,15 +886,19 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
     let mut kv_waiter = cuteafd_engine::prefix::DeferredAdmission::<MediaReady<super::media::Prompt>>::default();
     publish(stats, requests, generated_total, 0, 0, ring_misses, &cache, media, preparer, &lane.stats,
         &memory_boundaries, &reserve, 0);
+    let turn = gpu_turn.map(GpuTurn::scheduler).transpose()?;
+    let offer = || -> Result<()> {
+        if let Some(turn) = &turn {
+            engine.require_live()?;
+            turn.offer()?;
+        }
+        Ok(())
+    };
     ready();
     crate::shared::api::run_scheduler(|| {
-    // Under a head split, media encodes run only between complete engine calls, never against a
-    // half-issued two-GPU step (see gpu_turn). Offered at the top of the loop and before each
-    // prefill and decode round.
-    let mut turn = crate::shared::gpu_turn::GPU_TURN.scheduler(engine.ranks() > 1)?;
     loop {
-        turn.offer()?;
         engine.require_live()?;
+        offer()?;
         if let Some(reason) = cuteafd_transport::health::failure_reason() {
             anyhow::bail!("expert wire unavailable until restart: {reason}");
         }
@@ -909,7 +919,11 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
                         publish(stats, requests, generated_total, active.len(), prefills.len(), ring_misses, &cache,
                             media, preparer, &lane.stats, &memory_boundaries, &reserve, stalled.len());
                         let job = if !busy && media.is_empty() {
-                            match turn.idle(|| receive.blocking_recv())? { Some(job) => job, None => return Ok(()) }
+                            let next = match &turn {
+                                Some(turn) => runtime.block_on(turn.idle(receive.recv()))?,
+                                None => receive.blocking_recv(),
+                            };
+                            match next { Some(job) => job, None => return Ok(()) }
                         } else {
                             match receive.try_recv() {
                                 Ok(job) => job,
@@ -1090,9 +1104,8 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
             let caching = cache.enabled();
             // One chunk (a lane wave) of each waiting prompt (whole prompts with --decode-share 0); with
             // --prefill-packing, adjacent prompts whose chunks fit one pass prefill together.
-            turn.offer()?;
             let cx = PrefillCx { engine, library: &opened.library, family: &family, caching,
-                first_prefill_seen: &first_prefill_seen, memory_boundaries: &memory_boundaries };
+                first_prefill_seen: &first_prefill_seen, memory_boundaries: &memory_boundaries, offer: &offer };
             let finished = if engine.packs_prefill() {
                 let limits = engine.packed_limits();
                 prefills.round_packed(limits.rows, DECODE_ROWS,
@@ -1105,6 +1118,8 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
             } else {
                 prefills.round(|p| prefill_chunk(&cx, &mut selector, &mut cache, p))
             };
+            // The queue reports per-prompt errors, but a turn stall must stop the entire engine.
+            if let Some(turn) = &turn { turn.check()?; }
             for (mut p, prefilled) in finished {
                 let (slot, placement, resume) = (p.slot, p.placement.clone(), p.resume);
                 if let Err(error) = &prefilled {
@@ -1230,7 +1245,7 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
             if !media.is_empty() || !stalled.is_empty() { std::thread::park_timeout(Duration::from_millis(1)); }
             continue;
         }
-        turn.offer()?;
+        offer()?;
         let cycle = Instant::now();
         let Some(finished) = runtime.block_on(lanes.run_one(|lease| decode_round(lease, engine, opened,
             verify_rows, &mut lane, &mut active, &mut shared, &mut selector, &family, &mut cache, &mut free_kda,
@@ -1274,6 +1289,11 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
             receive.len() + kv_waiter.len() + media.len()));
         prefills.stepped(cycle.elapsed().as_secs_f64());
     }
+    }).inspect_err(|error| {
+        // The owner may still be blocked in CUDA, so the scheduler's join is not a health signal.
+        if let Some(stall) = error.downcast_ref::<MediaStalled>() {
+            cuteafd_transport::health::record_failure(stall.to_string());
+        }
     })
 }
 
@@ -1558,13 +1578,14 @@ struct PrefillCx<'r, 'e, 'a> {
     caching: bool,
     first_prefill_seen: &'r std::cell::Cell<[bool; 2]>,
     memory_boundaries: &'r std::cell::RefCell<Vec<serde_json::Value>>,
+    offer: &'r dyn Fn() -> Result<()>,
 }
 
 /// One chunk of prompt `p` through its own pass (a lane wave where Spark prefill runs in lanes):
 /// the first token after its last chunk, the chunk's drafter context, its snapshot points.
 fn prefill_chunk<'a>(cx: &PrefillCx<'_, '_, 'a>, selector: &mut TokenSelector<'_>,
     cache: &mut PrefixCache<CudaCopyEngine<'a>>, p: &mut Prefill<'_>) -> Result<Chunk> {
-    let PrefillCx { engine, library, family, caching, first_prefill_seen, memory_boundaries } = *cx;
+    let PrefillCx { engine, library, family, caching, first_prefill_seen, memory_boundaries, offer } = *cx;
     let drafter = engine.drafter.as_ref();
     if p.done == p.tokens.len() {
         return Ok(Chunk::Done);
@@ -1573,6 +1594,7 @@ fn prefill_chunk<'a>(cx: &PrefillCx<'_, '_, 'a>, selector: &mut TokenSelector<'_
         p.cancelled = true;
         anyhow::bail!("client went away");
     }
+    offer()?;
     let timer = Instant::now();
     let end = chunk_end(p);
     let draft_end = draft_context_end(p, p.placement.len);
@@ -1688,6 +1710,10 @@ fn prefill_group<'a>(cx: &PrefillCx<'_, '_, 'a>, selector: &mut TokenSelector<'_
     cache: &mut PrefixCache<CudaCopyEngine<'a>>, group: &mut [Prefill<'_>]) -> Vec<Result<Chunk>> {
     if !group.iter().all(packs) {
         return group.iter_mut().map(|p| prefill_chunk(cx, selector, cache, p)).collect();
+    }
+    if let Err(error) = (cx.offer)() {
+        let reason = error.to_string();
+        return group.iter().map(|_| Err(anyhow::anyhow!(reason.clone()))).collect();
     }
     let engine = cx.engine;
     let timer = Instant::now();

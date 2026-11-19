@@ -433,13 +433,13 @@ impl Ready {
         if let Some(spec) = local_image.take() {
             let (service, contribution) = EncoderService::start_coordinator(&args.snapshot,
                 Some((spec, admitted.vision.admitted_bytes())), args.native_lib.clone(), image_gpu.context("vision GPU")?,
-                if shared_local { local_audio.take() } else { None })?;
+                if shared_local { local_audio.take() } else { None }, None)?;
             push.extend(contribution);
             image_encoder = Encoder::Local(LocalEncoder::new(service, &processor, 8192, 4096));
         }
         if let Some(audio) = local_audio {
             let (service, contribution) = EncoderService::start_coordinator(&args.snapshot, None,
-                args.native_lib.clone(), audio_gpu.context("audio GPU")?, Some(audio))?;
+                args.native_lib.clone(), audio_gpu.context("audio GPU")?, Some(audio), None)?;
             push.extend(contribution);
             audio_encoder = Encoder::Local(LocalEncoder::new(service, &processor, 8192, 4096));
         }
