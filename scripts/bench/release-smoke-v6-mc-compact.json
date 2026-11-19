@@ -6,8 +6,7 @@
     "run_timeout_s": 1800,
     "set": {
       "ENABLE_BENCH": "on",
-      "COORDINATOR_DOCKER_INFERENCE": "ghcr.io/tpurtell/cuteafd-coordinator:REPLACE-ME-v6-rc",
-      "SPARK_EXPERT_DOCKER_INFERENCE": "ghcr.io/tpurtell/cuteafd-spark-expert:REPLACE-ME-v6-rc"
+      "COORDINATOR_DOCKER_INFERENCE": "ghcr.io/tpurtell/cuteafd-coordinator:REPLACE-ME-v6-rc"
     },
     "fabric": true
   },
@@ -272,6 +271,7 @@
         "REPLACE-ME-spark-5"
       ],
       "set": {
+        "SPARK_EXPERT_DOCKER_INFERENCE": "ghcr.io/tpurtell/cuteafd-spark-expert:REPLACE-ME-v6-rc",
         "ADDR": "0.0.0.0:8880",
         "EXPERT_PORT": "30800",
         "RTX_GPUS": "2",
@@ -312,6 +312,7 @@
         "REPLACE-ME-spark-5"
       ],
       "set": {
+        "SPARK_EXPERT_DOCKER_INFERENCE": "ghcr.io/tpurtell/cuteafd-spark-expert:REPLACE-ME-v6-rc",
         "ADDR": "0.0.0.0:8879",
         "EXPERT_PORT": "30600",
         "RTX_GPUS": "2",
@@ -352,6 +353,7 @@
         "REPLACE-ME-spark-5"
       ],
       "set": {
+        "SPARK_EXPERT_DOCKER_INFERENCE": "ghcr.io/tpurtell/cuteafd-spark-expert:REPLACE-ME-v6-rc",
         "ADDR": "0.0.0.0:8878",
         "EXPERT_PORT": "30400",
         "RTX_GPUS": "2",

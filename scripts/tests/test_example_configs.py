@@ -622,9 +622,15 @@ def test_v6_smoke_entries_use_a_matched_image_pair(matrix_path: str) -> None:
     tag = matrix["build"]
     for entry in matrix["entries"]:
         values = _effective(entry, matrix)
-        for key, role in (("COORDINATOR_DOCKER_INFERENCE", "coordinator"),
-                          ("SPARK_EXPERT_DOCKER_INFERENCE", "spark-expert")):
-            assert values.get(key) == f"ghcr.io/tpurtell/cuteafd-{role}:{tag}", (entry["name"], key)
+        assert values["COORDINATOR_DOCKER_INFERENCE"] == f"ghcr.io/tpurtell/cuteafd-coordinator:{tag}", entry["name"]
+        spark_image = "SPARK_EXPERT_DOCKER_INFERENCE"
+        assert spark_image not in matrix["defaults"]["set"]
+        if entry["sparks"]:
+            assert values[spark_image] == f"ghcr.io/tpurtell/cuteafd-spark-expert:{tag}", entry["name"]
+        else:
+            assert spark_image not in entry["set"], entry["name"]
+            if entry["family"] == "qwen3_5":
+                assert spark_image not in values, entry["name"]
 
 
 GATE_KIT = "scripts/bench/kits/gate/matrix-gate.json"
