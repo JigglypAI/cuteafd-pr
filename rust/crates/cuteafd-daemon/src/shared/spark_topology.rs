@@ -232,6 +232,12 @@ print(json.dumps(capture_real_eight_rank_launch(*map(Path, sys.argv[2:]))))
                 Commands::ServeGlmf(a) => a.engine.peers.as_deref().unwrap().split(',').count(),
                 Commands::ServeMimo(a) => a.engine.peers.as_deref().unwrap().split(',').count(),
                 Commands::ServeKimi(a) => a.peers.len(),
+                Commands::ServeInkling2(a) => {
+                    assert_eq!(family, "inkling2", "{key}: wrong Inkling dispatch");
+                    assert_eq!(a.prefill_waves, Some(deployment.prefill_waves as _),
+                        "{key}: launch must preserve the admitted prefill wave count");
+                    a.peers.len()
+                }
                 Commands::ServeMuse(a) => {
                     assert_eq!(family, "muse", "{key}: wrong Muse dispatch");
                     assert_eq!(a.prefill_waves, Some(deployment.prefill_waves as _),
