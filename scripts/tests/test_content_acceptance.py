@@ -7,8 +7,7 @@ summarize = runpy.run_path(str(Path(__file__).parents[1] /
 
 
 def request(identity=1, **changes):
-    value = dict(id=identity, room=7, proposed=3, accepted_drafts=2,
-                 explore_skipped=None, positions=[
+    value = dict(id=identity, room=7, proposed=3, accepted_drafts=2, positions=[
                      dict(track='neural', position=0, outcome=True, explore=False),
                      dict(track='neural', position=1, outcome=True, explore=False),
                      dict(track='neural', position=2, outcome=False, explore=True),
@@ -27,6 +26,8 @@ def test_content_counts_and_censored_copy_positions():
     assert result['all']['acceptance'] == 0.5
     assert result['all']['short_share'] == 1 / 3
     assert result['all']['explore_skipped'] == 1
+    explore = next(p for p in result['all']['positions'] if p['track'] == 'neural' and p['position'] == 2)
+    assert (explore['reached'], explore['accepted'], explore['explored'], explore['explore_skipped']) == (1, 0, 1, 1)
     assert result['code']['requests'] == 2
     assert result['code']['copy_reached'] == 0
     assert result['code']['copy_acceptance'] is None

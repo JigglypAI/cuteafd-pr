@@ -520,6 +520,16 @@ fn schedule(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path::Path
         &mut owners, media, preparer, ready)
 }
 
+fn draft_score_source(dflash2: bool) -> cuteafd_core::HeadScore {
+    if dflash2 { cuteafd_core::HeadScore::CandidateProbability } else { cuteafd_core::HeadScore::None }
+}
+
+#[test]
+fn mimo_dflash2_and_mtp_declare_distinct_score_sources() {
+    assert_eq!(draft_score_source(true), cuteafd_core::HeadScore::CandidateProbability);
+    assert_eq!(draft_score_source(false), cuteafd_core::HeadScore::None);
+}
+
 #[allow(clippy::too_many_arguments)]
 fn schedule_inner(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path::Path,
     receive: &mut mpsc::Receiver<NativeRequest>, stats: &Mutex<serde_json::Value>, max_sequences: usize,
@@ -531,14 +541,14 @@ fn schedule_inner(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path
     if let Some(drafter) = drafter { drafter.prepare_workspace()?; }
     let mut free_slots: Vec<usize> = drafter.map_or(Vec::new(), |d| (0..d.slots).rev().collect());
     let width = drafter.map_or_else(|| engine.mtp.as_ref().map_or(0, |m| m.stages.len()), |d| d.cfg.drafts());
-    // DFlash and the native MTP chain propose tokens only: neither has a trained confidence head.
     let mut shared = if width > 0 {
-        Some(DraftPolicy::new(policy.length, width, cuteafd_core::HeadScore::None, true))
+        Some(DraftPolicy::new(policy.length, width, draft_score_source(drafter.is_some()), true))
     } else { None };
 
     let mut trace = crate::shared::speculation_trace::Trace::open()?;
-    // Top-16 logits land only for the open trace's round records.
-    if let Some(drafter) = drafter { drafter.set_trace_features(trace.is_some()); }
+    if let Some(drafter) = drafter {
+        drafter.set_selector_readback(trace.is_some(), policy.length.control() == cuteafd_core::DraftControl::History);
+    }
     let (family, cache, selector) = owners.parts();
     // Messages start with `<|im_start|>`: a snapshot right before one is a message boundary.
     let message_start = *QwenEncoding::from_snapshot(snapshot)?.tokens().turn_markers.first()
@@ -1136,7 +1146,7 @@ async fn decode_round(lease: LaneLease<'_>, engine: &MimoEngine<'_>, prefix_draf
                 Ok(drafts) => {
                     let mut out = vec![None; active.len()];
                     for (i, tokens) in indices.into_iter().zip(drafts) {
-                        out[i] = Some(super::dflash::Draft { tokens, features: Vec::new() });
+                        out[i] = Some(super::dflash::Draft { tokens, features: Vec::new(), confidence: Vec::new() });
                     }
                     out
                 },
@@ -1164,8 +1174,8 @@ async fn decode_round(lease: LaneLease<'_>, engine: &MimoEngine<'_>, prefix_draf
         draft.as_ref().map_or_else(Vec::new, |d| d.tokens[..depth.min(d.tokens.len())].to_vec())).collect();
     let neural_lengths = match shared.as_mut() {
         Some(policy) => {
-            let mut shaped: Vec<_> = active.iter().zip(proposals.iter_mut()).map(|(a, tokens)| Proposal {
-                id: a.ticket.id(), tokens, head: None, history: &a.history, greedy: a.job.sampling.is_greedy() }).collect();
+            let mut shaped: Vec<_> = active.iter().zip(proposals.iter_mut()).zip(&drafted).map(|((a, tokens), d)| Proposal {
+                id: a.ticket.id(), tokens, head: d.as_ref().map(|d| d.confidence.as_slice()), history: &a.history, greedy: a.job.sampling.is_greedy() }).collect();
             policy.shape(&mut shaped, DECODE_ROWS)
         }
         None => vec![0; active.len()],

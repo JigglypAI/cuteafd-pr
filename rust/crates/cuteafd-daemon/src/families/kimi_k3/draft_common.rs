@@ -30,6 +30,15 @@ impl<'a> CommonDraft<'a> {
         }
     }
     pub fn is_block(&self) -> bool { matches!(self,Self::Block { .. }) }
+    pub fn score_source(&self) -> cuteafd_core::HeadScore {
+        match self {
+            Self::Mla(d) => d.score_source(),
+            Self::Block { .. } => cuteafd_core::HeadScore::Probability,
+        }
+    }
+    pub fn configure_scores(&self, enabled: bool) {
+        if let Self::Mla(d) = self { d.set_selector_readback(false, enabled); }
+    }
     pub fn is_windowed_block(&self) -> bool { matches!(self,Self::Block { draft,.. } if draft.cfg.window.is_some()) }
     pub fn tap_index(&self, layer: usize) -> Option<usize> { self.geometry().taps.iter().position(|&l| l == layer) }
     pub fn taps(&self) -> CuteafdDeviceBuffer {

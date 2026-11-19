@@ -254,14 +254,13 @@ impl<'e, 'a> Backend<'a> for KimiBackend<'e, 'a> {
         timing.seconds += started.elapsed().as_secs_f64();
         Ok(output)
     }
-    // Block dSpark has a trained confidence head; DFlash2 proposes tokens only.
     fn draft_head_kind(&self) -> cuteafd_core::HeadScore {
-        if self.engine.native_draft().is_some_and(|d| d.common().is_block()) { cuteafd_core::HeadScore::Probability }
-        else { cuteafd_core::HeadScore::None }
+        self.engine.native_draft().map_or(cuteafd_core::HeadScore::None, |d| d.common().score_source())
     }
-    fn draft_head<'d>(&self, draft: &'d DraftState) -> Option<&'d [f32]> {
-        self.engine.native_draft().filter(|d| d.common().is_block()).map(|_| draft.confidence.as_slice())
+    fn configure_draft_scores(&self, enabled: bool) {
+        if let Some(d) = self.engine.native_draft() { d.common().configure_scores(enabled); }
     }
+    fn draft_head<'d>(&self, draft: &'d DraftState) -> Option<&'d [f32]> { Some(&draft.confidence) }
     fn accept(&self, verified: &mut [scheduler::Verified<'_, Placement, DraftState, ()>], speculative: bool)
         -> Result<()> {
         if speculative {
