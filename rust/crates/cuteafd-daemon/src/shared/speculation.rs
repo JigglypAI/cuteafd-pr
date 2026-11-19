@@ -44,11 +44,28 @@ mod tests {
     #[test]
     fn serving_dflash_does_not_download_or_compute_policy_features() {
         let source = include_str!("speculation/dflash.rs");
-        assert!(source.contains("if !serving && matches!(self.head_ops, DraftHeadOps::Selector"));
-        assert!(source.contains("let selector = !serving && matches!(self.head_ops, DraftHeadOps::Selector"));
+        let gate = "downloads_selector_features(serving, self.trace_features.get(), matches!(self.head_ops, DraftHeadOps::Selector { .. }))";
+        assert!(source.contains(&format!("if {gate}")));
+        assert!(source.contains(&format!("let selector = {gate}")));
+        // Serving lands features only for an open trace, and never without a selector.
+        use dflash::downloads_selector_features as lands;
+        assert!(!lands(true, false, true), "untraced serving must not download features");
+        assert!(lands(true, true, true) && lands(false, false, true));
+        assert!(!lands(false, true, false) && !lands(true, true, false));
+        // Only serve loops that hold an open trace arm it.
+        for (family, serve) in [("glm5", include_str!("../families/glm5/serve.rs")),
+            ("glm5_flash", include_str!("../families/glm5_flash/serve.rs")),
+            ("mimo_v2", include_str!("../families/mimo_v2/serve.rs"))] {
+            assert_eq!(serve.matches("set_trace_features(").count(), 1, "{family}");
+            assert!(serve.contains("set_trace_features(trace.is_some())"), "{family}");
+        }
         let mimo = include_str!("../families/mimo_v2/dflash.rs");
-        assert!(!mimo.contains("fn features("));
-        assert!(!mimo.contains("..output.unary.buffer },"));
+        // MiMo lands its top-16 logits (and computes features) only for an open trace.
+        let unary = "..output.unary.buffer },";
+        assert_eq!(mimo.matches(unary).count(), 1);
+        let gated = mimo.split("if traced {").nth(1).expect("traced landing block");
+        assert!(gated.find(unary).is_some_and(|at| !gated[..at].contains('}')), "unary landing outside the trace gate");
+        assert!(mimo.contains("features: if !traced { Vec::new() }"));
     }
 
     #[test]

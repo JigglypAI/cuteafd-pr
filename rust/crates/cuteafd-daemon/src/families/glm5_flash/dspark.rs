@@ -259,6 +259,15 @@ impl<'a> Drafter<'a> {
     }
 
     /// Tokens one draft proposes per sequence.
+    /// Arm selector-feature landing for an open speculation trace (DFlash2 only).
+    pub fn set_trace_features(&self, traced: bool) {
+        match self {
+            Self::Dflash2(d) => d.set_trace_features(traced),
+            Self::RemoteDflash(d) => d.draft.set_trace_features(traced),
+            Self::Dspark(_) => {}
+        }
+    }
+
     pub fn drafts(&self) -> usize {
         match self {
             Self::Dflash2(d) => d.cfg.drafts(),

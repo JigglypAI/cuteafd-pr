@@ -537,6 +537,8 @@ fn schedule_inner(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path
     } else { None };
 
     let mut trace = crate::shared::speculation_trace::Trace::open()?;
+    // Top-16 logits land only for the open trace's round records.
+    if let Some(drafter) = drafter { drafter.set_trace_features(trace.is_some()); }
     let (family, cache, selector) = owners.parts();
     // Messages start with `<|im_start|>`: a snapshot right before one is a message boundary.
     let message_start = *QwenEncoding::from_snapshot(snapshot)?.tokens().turn_markers.first()
@@ -1134,7 +1136,7 @@ async fn decode_round(lease: LaneLease<'_>, engine: &MimoEngine<'_>, prefix_draf
                 Ok(drafts) => {
                     let mut out = vec![None; active.len()];
                     for (i, tokens) in indices.into_iter().zip(drafts) {
-                        out[i] = Some(super::dflash::Draft { tokens });
+                        out[i] = Some(super::dflash::Draft { tokens, features: Vec::new() });
                     }
                     out
                 },
@@ -1289,6 +1291,8 @@ async fn decode_round(lease: LaneLease<'_>, engine: &MimoEngine<'_>, prefix_draf
             neural_lengths: drafted.iter().map(|d| d.as_ref().map_or(0, |d| d.tokens.len())).collect::<Vec<_>>(),
             request_ids: active.iter().map(|a| a.ticket.id()).collect::<Vec<_>>(),
             neural_tokens: drafted.iter().map(|d| d.as_ref().map(|d| d.tokens.clone())).collect::<Vec<_>>(),
+            // DFlash2 [margin, best probability, entropy, rank] per drafted token (pre-#2443 features).
+            neural_features: drafted.iter().map(|d| d.as_ref().map(|d| d.features.clone())).collect::<Vec<_>>(),
             copy_windows: copy_windows.as_ref().map(|windows| windows.iter().map(|(start, suffix, tokens)|
                 crate::shared::speculation_trace::record! {start: *start, matched_suffix: *suffix, tokens: tokens.clone()}).collect::<Vec<_>>()),
             committed_tokens: active.iter().zip(&before).map(|(a, &n)| a.history[n..].to_vec()).collect::<Vec<_>>(),

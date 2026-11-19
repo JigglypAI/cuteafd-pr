@@ -780,6 +780,12 @@ pub(crate) struct Draft {
     pub confidence: Vec<f32>,
 }
 
+/// Whether a draft round lands the selector's features: the golden oracle
+/// (`!serving`) or an open speculation trace, and only for a selector head.
+pub(crate) fn downloads_selector_features(serving: bool, traced: bool, selector: bool) -> bool {
+    selector && (!serving || traced)
+}
+
 /// FP32 logits `[rows, vocab]` of BF16 rows `[rows, hidden]` on a stream: `(x, logits, rows, stream)`.
 pub(crate) type HeadLaunch<'h> = Box<dyn Fn(*const c_void, *mut f32, usize, *mut c_void) -> Result<()> + 'h>;
 
@@ -868,6 +874,9 @@ pub(crate) struct DflashDrafter<'a> {
     target_projection: TargetProjection,
     workspace: RefCell<Option<Workspace<'a>>>,
     startup_primed: Cell<bool>,
+    /// The speculation trace is open: serving rounds also land the selector
+    /// features for the trace (diagnostic only; no decision reads them).
+    trace_features: Cell<bool>,
     representation: GlmDraftRepresentation,
     fp8_workspace: Option<Dev<'a>>,
     /// How the borrowed BF16 head runs past one draft block ([`DraftHead`]; GLM 5.3
@@ -1257,7 +1266,7 @@ impl<'a> DflashDrafter<'a> {
             mask_rows: None,
             markov_workspace: None,
             target_projection, workspace: RefCell::new(None),
-            startup_primed: Cell::new(false),
+            startup_primed: Cell::new(false), trace_features: Cell::new(false),
             representation,
             fp8_workspace,
             timing: crate::shared::draft::timing::DraftTiming::from_env(library, "glm-dflash")?,
@@ -1377,7 +1386,7 @@ impl<'a> DflashDrafter<'a> {
             context_positions: owners.take("context_positions")?,
             context: DraftContext::Mla(MlaContext { cfg: native, state: RefCell::new(MlaPagedState::new(&layout)?),
                 split, layout, slots: owners.take("context_slots")? }),
-            mask_row: Vec::new(), mask_rows: None, markov_workspace: None, target_projection, workspace: RefCell::new(Some(workspace)), startup_primed: Cell::new(false), representation,
+            mask_row: Vec::new(), mask_rows: None, markov_workspace: None, target_projection, workspace: RefCell::new(Some(workspace)), startup_primed: Cell::new(false), trace_features: Cell::new(false), representation,
             fp8_workspace: if representation == GlmDraftRepresentation::Fp8Only { Some(owners.take("fp8_scratch")?) } else { None },
             head_mode: Cell::new(DraftHead::Exact), fp8_rows: Cell::new(fp8_rows), fp8_admitted: fp8_rows,
             timing: crate::shared::draft::timing::DraftTiming::from_env(library, "mla-dflash")?, cfg,
@@ -1499,7 +1508,7 @@ impl<'a> DflashDrafter<'a> {
             context: DraftContext::Mla(MlaContext { cfg: native, state: RefCell::new(MlaPagedState::new(&layout)?),
                 split: None, layout, slots: owners.take("context_slots")? }),
             mask_row: Vec::new(), mask_rows: Some(masks), markov_workspace: Some(markov_workspace),
-            target_projection, workspace: RefCell::new(Some(workspace)), startup_primed: Cell::new(false),
+            target_projection, workspace: RefCell::new(Some(workspace)), startup_primed: Cell::new(false), trace_features: Cell::new(false),
             representation: GlmDraftRepresentation::Bf16Only, fp8_workspace: None,
             head_mode: Cell::new(DraftHead::Exact), fp8_rows: Cell::new(fp8_linear::Fp8Rows::default()),
             fp8_admitted: fp8_linear::Fp8Rows::default(),
@@ -1526,6 +1535,12 @@ impl<'a> DflashDrafter<'a> {
     /// ignores it).
     pub fn set_draft_head(&self, mode: DraftHead) {
         self.head_mode.set(mode);
+    }
+
+    /// Land each round's selector features for an open speculation trace. Only the
+    /// trace records them; tokens and every policy input are unchanged.
+    pub(crate) fn set_trace_features(&self, traced: bool) {
+        self.trace_features.set(traced);
     }
 
     pub(crate) fn draft_head_mode(&self) -> DraftHead {
@@ -2851,8 +2866,8 @@ impl<'a> DflashDrafter<'a> {
                 } else { draft_view(w.head()?.tokens.buffer, 0, drafted * 4)? }
             } else { draft_view(w.head()?.tokens.buffer, 0, drafted * 4)? };
             l.copy_d2h_host_buffer_async(landing(0, drafted * 4), token_buffer, drafted * 4, s)?;
-            // Only the explicit golden selector oracle consumes these features.
-            if !serving && matches!(self.head_ops, DraftHeadOps::Selector { .. }) {
+            // Only the golden selector oracle and an open speculation trace read these features.
+            if downloads_selector_features(serving, self.trace_features.get(), matches!(self.head_ops, DraftHeadOps::Selector { .. })) {
                 l.copy_d2h_host_buffer_async(landing(drafted * 4, drafted * 16),
                     CuteafdDeviceBuffer { bytes: drafted * 16, ..w.head()?.features.as_ref().context("selector workspace missing")?.buffer }, drafted * 16, s)?;
             }
@@ -2870,7 +2885,7 @@ impl<'a> DflashDrafter<'a> {
         self.timing.publish_completed()?;
         self.timing.dump_head_input(w.n.buffer, rows, h)?;
         let drafted = s_count * c.drafts();
-        let selector = !serving && matches!(self.head_ops, DraftHeadOps::Selector { .. });
+        let selector = downloads_selector_features(serving, self.trace_features.get(), matches!(self.head_ops, DraftHeadOps::Selector { .. }));
         let landing_bytes = drafted * if selector { 20 } else { 4 };
         let (tokens, features) = w.head()?.landing.bytes()[..landing_bytes].split_at(drafted * 4);
         let word = |b: &[u8], i: usize| u32::from_le_bytes(b[i * 4..i * 4 + 4].try_into().unwrap());
