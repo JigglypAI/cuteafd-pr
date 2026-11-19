@@ -30,6 +30,18 @@ def slice_group_rows(source: Path) -> int:
     return next(iter(groups))
 
 
+def native_slice_group_rows(pipeline, default: int, *, stream: bool) -> int:
+    """Report the selected pipeline's expert route grouping, not its capacity."""
+    if stream:
+        return 128
+    if getattr(pipeline, "narrow_prefill", False):
+        fc1, fc2 = pipeline.narrow_fc1, pipeline.narrow_fc2
+        if fc1.tile_m != fc2.tile_m or fc1.tile_m != 128:
+            raise ValueError("inconsistent narrow prefill route grouping")
+        return fc1.tile_m
+    return default
+
+
 def native_group_macros(variants: list[dict]) -> list[str]:
     """rows=0 queries the compiled tile; positive rows select the executed path."""
     terms = []
