@@ -203,3 +203,74 @@ def test_resume_requires_same_frozen_identity(tmp_path):
     assert run.checkpoint_identity(tmp_path, fresh) == fresh
     with pytest.raises(ValueError, match="numerical identity"):
         run.checkpoint_identity(tmp_path, fresh | {"codebook": "mcg"})
+
+
+def test_activation_segment_recovery_seeks_producer_and_honors_byte_limit(tmp_path):
+    store = Stages(tmp_path / "states", {"panel": "v2"})
+    record = {"state": torch.arange(64, dtype=torch.float32)}
+    from hy4_flash.storage import record_bytes
+    size = record_bytes(record)
+    generated = []
+
+    def crash(start):
+        assert start == 0
+        for i in range(3):
+            generated.append(i)
+            yield i, record
+        raise RuntimeError("interrupted")
+
+    # Two records fit, a third must open a fresh segment before writing.
+    with pytest.raises(RuntimeError, match="interrupted"):
+        store.write_activations("wave", crash, 5, segment_bytes=2 * size + 1)
+    directory = store.directory("wave")
+    sealed = directory / "segment-00000.bin"
+    first_inode = sealed.stat().st_ino
+    assert sealed.stat().st_size == 2 * size
+    assert (directory / "segment-00001.bin.partial").stat().st_size == size
+    assert store.load("wave") is None
+
+    recovered = Stages(store.root, {"panel": "v2"})
+    def finish(start):
+        assert start == 2
+        for i in range(start, 5):
+            generated.append(i)
+            yield i, {"state": record["state"] + i}
+
+    manifest = recovered.write_activations("wave", finish, 5, segment_bytes=2 * size + 1)
+    assert first_inode == sealed.stat().st_ino
+    assert generated == [0, 1, 2, 2, 3, 4]
+    assert all(e["file_identity"]["bytes"] <= 2 * size + 1 for e in manifest["entries"])
+    assert [i for i, _ in recovered.records("wave", start=3)] == [3, 4]
+    for i in range(5):
+        assert torch.equal(recovered.read_batch("wave", i)["state"], record["state"] + (i if i >= 2 else 0))
+    recovered.load("wave", checksum=True)
+
+
+def test_activation_resume_refuses_changed_identity_and_oversize_activation(tmp_path):
+    store = Stages(tmp_path / "states", {"panel": 1})
+    value = {"v": torch.ones(80)}
+    def crash(start):
+        yield start, value
+        raise RuntimeError("interrupted")
+    with pytest.raises(RuntimeError, match="interrupted"):
+        store.write_activations("wave", crash, 2, segment_batches=1)
+    other = Stages(store.root, {"panel": 2})
+    with pytest.raises(ValueError, match="provenance differs"):
+        other.write_activations("wave", crash, 2)
+    with pytest.raises(ValueError, match="limit"):
+        store.write_activations("wide", lambda start: [(start, value)], 1, segment_bytes=32)
+    # A single packed module is indivisible and owns its own file when oversize.
+    packed = store.write_batches("weights", [(0, value), (1, value)], segment_bytes=32)
+    assert packed["entries"][0]["filename"] != packed["entries"][1]["filename"]
+
+
+def test_live_activation_writer_keeps_ownership_of_partial_tail(tmp_path):
+    store = Stages(tmp_path, {"test": True})
+    other = Stages(tmp_path, store.identity)
+    def produce(start):
+        yield 0, {"v": torch.ones(2)}
+        with pytest.raises(BlockingIOError):
+            other.write_activations("wave", produce, 2)
+        yield 1, {"v": torch.zeros(2)}
+    store.write_activations("wave", produce, 2)
+    assert torch.equal(store.read_batch("wave", 0)["v"], torch.ones(2))

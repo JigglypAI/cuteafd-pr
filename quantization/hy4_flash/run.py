@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import csv
 from datetime import datetime, timezone
+from itertools import islice
 import hashlib
 import json
 import math
@@ -239,17 +240,17 @@ class Runner:
                                   committed_encodes=self.frontier["encodes"])
         self.stages.retire(*old_stages)
 
-    def rows(self, stage, *keys):
-        return self.stages.records(stage, device=str(self.device), keys=keys or None)
+    def rows(self, stage, *keys, start=0):
+        return self.stages.records(stage, device=str(self.device), keys=keys or None, start=start)
 
     def save(self, name, batches):
-        def checked():
-            for index, values in batches():
+        def checked(start):
+            for index, values in batches(start):
                 checks = [torch.isfinite(value).all() for value in values.values() if value.is_floating_point()]
                 if checks and not bool(torch.stack(checks).all()):
                     raise ValueError("nonfinite Hy4 calibration stage")
                 yield index, values
-        self.stages.write_batches(name, checked(), segment_bytes=SEGMENT_BYTES, segment_batches=32)
+        self.stages.write_activations(name, checked, len(self.records), segment_bytes=SEGMENT_BYTES)
 
     def core_fit(self, stage, layer, groups, samples, overrides):
         """Fit one shared covariance per input boundary and replay serialized K8."""
@@ -383,8 +384,8 @@ class Runner:
         route_stage = label + "-routes"
         fit_stages = []
 
-        def attention_input():
-            for number, values in self.rows(incoming):
+        def attention_input(start):
+            for number, values in self.rows(incoming, start=start):
                 tokens = self.records[number].to(self.device)
                 residual, post, inputs = self.model.attention_start(values["state"], tokens, layer)
                 yield number, dict(residual=residual, post=post, inputs=inputs)
@@ -393,8 +394,8 @@ class Runner:
         fit_stages.append(self.core_fit(label + "-attn-first", layer, [self.first_names(a)],
             lambda: ((values["inputs"],) for _, values in self.rows(a_start, "inputs")), overrides))
 
-        def attention_first(*keys):
-            for number, values in self.rows(a_start, *keys):
+        def attention_first(*keys, start=0):
+            for number, values in self.rows(a_start, *keys, start=start):
                 first = self.model.attention_first(values["inputs"], layer, project)
                 yield number, values, first
 
@@ -402,8 +403,8 @@ class Runner:
             [(a + "q_b_proj",), (a + "kv_b_proj",)],
             lambda: ((first.normalized_q, first.kv) for _, _, first in attention_first("inputs")), overrides))
 
-        def attention_output(*keys):
-            for number, values, first in attention_first(*keys):
+        def attention_output(*keys, start=0):
+            for number, values, first in attention_first(*keys, start=start):
                 output, tap = self.model.attention_output_inputs(
                     values["inputs"], first, layer, project, capture_tap=capture)
                 yield number, values, output, tap
@@ -411,8 +412,8 @@ class Runner:
         fit_stages.append(self.core_fit(label + "-attn-out", layer, [(a + "o_proj",)],
             lambda: ((o,) for _, _, o, _ in attention_output("inputs")), overrides))
 
-        def attention_finish():
-            for number, values, output, tap in attention_output():
+        def attention_finish(start):
+            for number, values, output, tap in attention_output(start=start):
                 attended = self.model.attention_finish(output, layer, project)
                 state, post, inputs = self.model.mlp_start(values["residual"], values["post"],
                                                            attended, layer)
@@ -424,7 +425,7 @@ class Runner:
         self.save(mlp_stage, attention_finish)
         if capture:
             tap_stage = f"tap-{index:03d}"
-            self.save(tap_stage, lambda: self.stages.records(mlp_stage, keys=("kv", "rope_key", "groups")))
+            self.save(tap_stage, lambda start: self.stages.records(mlp_stage, keys=("kv", "rope_key", "groups"), start=start))
 
         entry = [mlp + "gate_proj", mlp + "up_proj"]
         if moe:
@@ -441,8 +442,8 @@ class Runner:
         packed, extra_metrics, expert_stages = {}, [], []
         combined = None
         if moe:
-            def routes():
-                for number, values in self.rows(mlp_stage, "inputs"):
+            def routes(start):
+                for number, values in self.rows(mlp_stage, "inputs", start=start):
                     inputs = values["inputs"]
                     config = self.model.config
                     scores, choice = reference.routing_scores(inputs, layer.weights, config)
@@ -475,9 +476,9 @@ class Runner:
                 [(p + "mlp.routed_expert_up_proj",)],
                 lambda: ((rows,) for rows in routed_batches()), overrides))
 
-        def finish():
-            routed = routed_batches() if moe else None
-            for number, values in self.rows(mlp_stage, "state", "post", "inputs"):
+        def finish(start):
+            routed = islice(routed_batches(), start, None) if moe else None
+            for number, values in self.rows(mlp_stage, "state", "post", "inputs", start=start):
                 result = self.model.mlp_finish(values["state"], values["post"], values["inputs"],
                     layer, next(routed) if moe else None, project)
                 yield number, dict(state=result)
@@ -657,8 +658,8 @@ class Runner:
             layers=[self.reader.load_draft_layer(index) for index in range(recipe.MTP_LAYER_COUNT)],
             aux=aux)
 
-        def anchors():
-            for number, row in self.rows(incoming):
+        def anchors(start):
+            for number, row in self.rows(incoming, start=start):
                 features = self.model.head_features(row["state"][-1:], weights)
                 bonus = self.model.head(features, project=weights_project(overrides),
                                         weight=weights["lm_head.weight"]).argmax()
@@ -702,16 +703,16 @@ class Runner:
         overrides = {}
         project = weights_project(overrides)
 
-        def inputs():
-            for number, values in self.rows(incoming):
+        def inputs(start=0):
+            for number, values in self.rows(incoming, start=start):
                 state = values["state"]
                 yield number, state, drafter.attention_inputs(state, index)
 
         fit_stages = [self.core_fit(label + "-attn-first", layer, [self.first_names(a)],
             lambda: ((boundary,) for _, _, boundary in inputs()), overrides)]
 
-        def first():
-            for number, state, boundary in inputs():
+        def first(start=0):
+            for number, state, boundary in inputs(start):
                 yield number, state, self.model.attention_first(boundary, layer, project)
 
         def expansions():
@@ -728,8 +729,8 @@ class Runner:
         fit_stages.append(self.core_fit(label + "-attn-expand", layer,
             [(a + "q_b_proj",), (a + "kv_b_proj",)], expansions, overrides))
 
-        def attention():
-            for number, state, projected in first():
+        def attention(start=0):
+            for number, state, projected in first(start):
                 taps = self.draft_taps(drafter, index, number)
                 end = len(self.records[number])
                 boundary = drafter.attention_output_inputs(projected, index, taps, end, project)
@@ -739,8 +740,8 @@ class Runner:
             lambda: ((out,) for _, _, out in attention()), overrides))
 
         mlp_stage = label + "-mlp"
-        def after_attention():
-            for number, state, out in attention():
+        def after_attention(start):
+            for number, state, out in attention(start):
                 result = self.model.attention_finish(out, layer, project)
                 residual, normalized = drafter.ffn_inputs(state, result, index)
                 yield number, dict(residual=residual, inputs=normalized)
@@ -759,7 +760,7 @@ class Runner:
         fit_stages.append(self.core_fit(label + "-mlp-down", layer, [(mlp + "down_proj",)],
                                        down_inputs, overrides))
 
-        def finish():
+        def finish(start):
             alternatives = {}
             for stage in filter(None, fit_stages):
                 for order, name in enumerate(self.stages.load(stage)["metadata"]["names"]):
@@ -769,7 +770,7 @@ class Runner:
                     alternatives[name] = reconstruction(self.stages.read_batch(stage, order), name, 6,
                                                         weight.shape, self.device)
             project_k6 = weights_project(alternatives)
-            for number, v in self.rows(mlp_stage):
+            for number, v in self.rows(mlp_stage, start=start):
                 result = self.model.ffn_parts(v["inputs"], layer, "mlp.", project)
                 record = dict(state=v["residual"] + result)
                 if number >= self.calibration_count:
@@ -894,9 +895,9 @@ class Runner:
         reference.configure_f32()
         self.globals()
         if not self.frontier["target"]:
-            self.save("initial", lambda: ((index, {"state": self.model.initial(tokens.to(self.device),
-                                               self.embedding)})
-                                         for index, tokens in enumerate(self.records)))
+            self.save("initial", lambda start: (
+                (i, {"state": self.model.initial(self.records[i].to(self.device), self.embedding)})
+                for i in range(start, len(self.records))))
         for layer in range(self.frontier["target"], recipe.LAYER_COUNT):
             self.target(layer)
         if not self.frontier["head"]:

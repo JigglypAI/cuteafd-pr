@@ -1,26 +1,110 @@
 """Sequential Hy4 scratch stages and ordered expert dispatch."""
 from __future__ import annotations
 
+import fcntl
+import json
+import os
+import re
+
 import numpy as np
 import torch
 import xxhash
 
 from kimi_k3.core_k6.storage import StageStore
-from kimi_k3.uniform_k2.storage import read_header, verify_receipt
+from kimi_k3.uniform_k2.storage import atomic_json, canonical, checkpoint_io, fsync_directory, read_header, verify_receipt
 
 
 _FIELDS = {"F32": torch.float32, "F16": torch.float16, "I64": torch.int64,
            "I32": torch.int32, "I16": torch.int16}
 
 
+def record_bytes(values):
+    """Size of the pinned checkpoint_io safetensors document, without touching tensor data."""
+    header, offset = {}, 0
+    for key, value in sorted(values.items()):
+        end = offset + value.numel() * value.element_size()
+        header[key] = dict(dtype=checkpoint_io()._DTYPES[str(value.dtype)], shape=list(value.shape),
+                           data_offsets=[offset, end])
+        offset = end
+    size = len(json.dumps(header, separators=(",", ":"), ensure_ascii=False).encode())
+    return 8 + size + (-size % 8) + offset
+
+
+class ActivationJournal:
+    """A durable contiguous segment prefix, bound to its exact stage and numerical identity."""
+    def __init__(self, identity, stage, count):
+        self.count = count
+        self.key = xxhash.xxh3_128_hexdigest(canonical(dict(
+            schema="hy4-activation-segments-v1", identity=identity, stage=stage, count=count)).encode())
+
+    def recover(self, directory):
+        entries, committed = [], set()
+        receipts = sorted(directory.glob("segment-*.json"))
+        for ordinal, receipt in enumerate(receipts):
+            stem = f"segment-{ordinal:05d}"
+            payload = directory / (stem + ".bin")
+            if receipt.name != stem + ".json" or receipt.is_symlink() or payload.is_symlink():
+                raise ValueError("invalid activation segment sequence")
+            saved = json.loads(receipt.read_text())
+            group = saved["entries"]
+            if (saved.get("key") != self.key or not group or
+                    any(e["filename"] != payload.name for e in group)):
+                raise ValueError("activation segment provenance differs")
+            verify_receipt(payload, group[0])
+            entries.extend(group)
+            committed.update((receipt, payload))
+        if entries:
+            StageStore._validate_entries(entries)
+        if len(entries) > self.count:
+            raise ValueError("activation segment prefix exceeds the frozen prompt count")
+        # A failure can leave only the next unreceipted payload, its partial,
+        # or an unfinished atomic JSON rename. Never remove an unknown leaf.
+        ordinal = len(receipts)
+        allowed = {f"segment-{ordinal:05d}.bin", f"segment-{ordinal:05d}.bin.partial"}
+        orphans = set(directory.iterdir()) - committed
+        if any(p.is_symlink() or not p.is_file() or (p.name not in allowed and
+               not re.fullmatch(r"\.json-[a-z0-9_]{8}", p.name)) for p in orphans):
+            raise ValueError("unexpected uncommitted activation segment")
+        for path in orphans:
+            path.unlink()
+        return entries, ordinal
+
+    def seal(self, directory, ordinal, entries):
+        atomic_json(directory / f"segment-{ordinal:05d}.json", dict(key=self.key, entries=entries))
+
+
 class Stages(StageStore):
     """Expose committed record extents directly to the MC writer."""
 
-    def records(self, name, *, device="cpu", keys=None):
+    def write_batches(self, name, batches, metadata=None, *, segment_bytes=256 << 20, segment_batches=32):
+        # A packed head can exceed the limit as one indivisible safetensors record.
+        return super().write_batches(name, batches, metadata, segment_bytes=segment_bytes,
+                                     segment_batches=segment_batches, record_bytes=record_bytes)
+
+    def write_activations(self, name, batches, count, *, segment_bytes=256 << 20, segment_batches=32):
+        directory = self.directory(name)
+        if not directory.exists():
+            directory.mkdir(exist_ok=True)
+            fsync_directory(self.root)
+        fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            # Reclaiming an incomplete tail requires exclusive ownership of this
+            # stage. The directory lock is local to this filesystem transaction.
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            journal = ActivationJournal(self.identity, name, count)
+            result = super().write_batches(name, batches, segment_bytes=segment_bytes,
+                                           segment_batches=segment_batches, record_bytes=record_bytes, resume=journal)
+        finally:
+            os.close(fd)
+        if len(result["entries"]) != count:
+            raise ValueError("committed activation count differs from the frozen prompt count")
+        return result
+
+    def records(self, name, *, device="cpu", keys=None, start=0):
         manifest = self.load(name)
         if manifest is None:
             raise ValueError(f"Hy4 stage is missing: {name}")
-        for index in range(len(manifest["entries"])):
+        for index in range(start, len(manifest["entries"])):
             if keys is None:
                 values = self.read_batch(name, index, device=device)
             else:
