@@ -91,6 +91,20 @@ def test_expert_hessians_weight_down_and_exclude_recovery_from_causal_sum(monkey
         assert torch.equal(combined, expected)
 
 
+def test_all_natural_rows_above_the_1024_floor_survive_in_corpus_order():
+    count = 1031
+    records = [(0, dict(latent=torch.ones(count, 1), ids=torch.zeros(count, 1, dtype=torch.long),
+                        gamma=torch.linspace(.5, 1., count)[:, None],
+                        candidate_ids=torch.ones(count, 1, dtype=torch.int32),
+                        candidate_gamma=torch.full((count, 1), .25)))]
+    spool = storage.Routes(records, experts=2, tokens=count, recover=True)
+    rows, weights, proof = spool.calibration(0)
+    assert torch.equal(rows, torch.arange(count))
+    assert torch.equal(weights, records[0][1]["gamma"][:, 0])
+    assert proof["natural_rows"] == proof["effective_rows"] == count
+    assert proof["augmented_rows"] == proof["identity_rows"] == 0
+
+
 def test_duplicate_candidate_or_missing_evidence_fails_closed():
     b = dict(latent=torch.ones(2, 1), ids=torch.tensor([[0], [1]]), gamma=torch.ones(2, 1))
     with pytest.raises(ValueError, match="duplicate"):
