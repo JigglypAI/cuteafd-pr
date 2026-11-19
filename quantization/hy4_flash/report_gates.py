@@ -159,7 +159,13 @@ def seal_event(row, label):
 
 def report(root):
     receipts = sorted((root / "gates").glob("*.json"), key=lambda p: p.stat().st_mtime_ns)
-    if not receipts:
+    status_path = root / "status.json"
+    status = json.loads(status_path.read_bytes()) if status_path.exists() else {}
+    error = status.get("error", "")
+    failed = (status.get("status") == "blocked" and error.startswith("ValueError:")
+              and any(key in error for key in (" K4 held-out NMSE ", " K6 training error ",
+                                               "nonfinite or zero-energy held-out projection")))
+    if not receipts and not failed:
         return
     identity_bytes = (root / "identity.json").read_bytes()
     identity = json.loads(identity_bytes)
@@ -172,6 +178,22 @@ def report(root):
         fcntl.flock(lock, fcntl.LOCK_EX)
         remote = None
         events = read_events(root / "events.jsonl")
+        if failed:
+            # A hard projection gate stops before its group can seal. Report
+            # the observed alarm as such, never advertise that stage as passed.
+            digest = xxhash.xxh3_128_hexdigest(error.encode())
+            local = directory / f"failure-{digest}.json"
+            if not local.exists():
+                remote = posted_parts()
+                marker = f"{MARK}{run_id}/failed/{digest}/1 -->"
+                if marker not in remote:
+                    body = (marker + "\n\n**Hy4 production stopped at a projection gate**\n\n" +
+                            error + f"\n\nLayer {status.get('current_layer', 'unknown')}, "
+                            f"{status.get('expert_projections', 0)} sealed expert projections. "
+                            "Time remaining and Asia/Taipei completion time unavailable while blocked.")
+                    remote[marker] = int(gh(ISSUE, "--method", "POST", "--input", "-", "--jq", ".id",
+                                            data=json.dumps({"body": body})))
+                atomic_json(local, dict(run=run_id, error=error, comment_ids=[remote[marker]]))
         for path in receipts:
             payload = path.read_bytes()
             receipt = json.loads(payload)

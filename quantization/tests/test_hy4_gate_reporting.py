@@ -66,3 +66,18 @@ def test_timing_excludes_dense_and_replayed_moe_layers():
     text = reporting.forecast(events, "target-003", as_of)
     assert "38 left" in text and "0.95 h" in text and "15:57" in text
     assert "2 uninterrupted" in text and "0.63–1.27 h" in text
+
+
+def test_projection_failure_before_first_layer_seals(tmp_path, monkeypatch):
+    (tmp_path / "identity.json").write_text('{"schema":"cuteafd-hy4-causal-mc-v2","codebook":"mul1"}')
+    (tmp_path / "status.json").write_text(json.dumps(dict(status="blocked", current_layer=0,
+        error="ValueError: model.layers.0.test K6 training error 0.1 outside [0, 0.001]")))
+    posts = []
+    def post(*args, data):
+        posts.append(json.loads(data)["body"])
+        return 42
+    monkeypatch.setattr(reporting, "posted_parts", lambda: {})
+    monkeypatch.setattr(reporting, "gh", post)
+    reporting.report(tmp_path)
+    reporting.report(tmp_path)
+    assert len(posts) == 1 and "stopped" in posts[0] and "0.1" in posts[0]
