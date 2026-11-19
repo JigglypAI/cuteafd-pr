@@ -735,6 +735,9 @@ impl EncoderService {
                     let result = if work.cancelled.load(Ordering::Acquire) {
                         Err(VisionError::Cancelled)
                     } else {
+                        // Under a head split, encode only between the scheduler's engine calls,
+                        // never against a half-issued two-GPU step (see gpu_turn).
+                        let _turn = crate::shared::gpu_turn::GPU_TURN.media();
                         let encoded = match work.job {
                             EncoderJob::Vision(mut job) => match runtime.as_mut() {
                                 Some(runtime) => match job.pixels {
