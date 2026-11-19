@@ -90,6 +90,9 @@ mod tests {
             .unwrap_or_else(|| std::path::PathBuf::from(std::env::var_os("HOME").expect("HOME"))
                 .join(".cache/cuteafd/gate-venv/bin/python"));
         ensure!(python.is_file(), "CUTEAFD_TEST_PYTHON must name the gate Python");
+        let mut spark_rank_bytes = cuteafd_loader::serving_capacity::spark_memory::serving_bytes();
+        // The two simulated ranks repeat the first measured serving host.
+        spark_rank_bytes.extend([spark_rank_bytes[0]; 2]);
         let mut tested = Vec::new();
         for (key, _) in data["entries"].as_object().unwrap() {
             let (family, format) = key.split_once(':').unwrap();
@@ -164,6 +167,7 @@ mod tests {
                 mapped_scale_host_budget_bytes: Some(64 << 30),
                 layout: Some(LayoutOptions { host_memory: Some(cuteafd_loader::plan::testing::SimulatedHost::raptor().host_ram),
                     rtx_bytes: vec![cuteafd_loader::placement::inventory::PRO_TOTAL_BYTES; gpus], host_cache_bytes: Some(0), pool_tokens: Some(262_144),
+                    spark_rank_bytes: spark_rank_bytes.clone(),
                     context_tokens: 262_144, prefill_rows: 4096, prefill_lanes: 1,
                     workspace_manifest: manifest, glm5_drafter_disabled: true, glmf_drafter_disabled: true,
                     ..Default::default() }), ..Default::default()
@@ -201,7 +205,7 @@ mod tests {
                 .filter(|device| device.kind == cuteafd_core::memory_layout::DeviceKind::Spark).collect::<Vec<_>>();
             assert_eq!(spark_devices.len(), 8, "{key}");
             for device in spark_devices {
-                assert_eq!(device.worker_budget_bytes, (if family == "muse" { 100 } else { 108 }) << 30, "{key}");
+                assert_eq!(device.worker_budget_bytes, spark_rank_bytes[device.index as usize], "{key} rank {}", device.index);
                 assert!(device.worker_budget_bytes <= device.capacity_bytes && device.worker_budget_bytes <= 121 << 30,
                     "{key}: worker ceiling exceeds device capacity");
             }
