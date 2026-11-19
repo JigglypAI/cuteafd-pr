@@ -25,6 +25,8 @@ def command(arguments, phase):
     python = TASK / "environment/bin/python"
     argv = sm120_command(arguments, name="cuteafd-hy4-flash-" + phase,
                          memory_gib=80, build_root=BUILD / "exllamav3")
+    gpu = argv.index("--gpus")
+    argv[gpu:gpu + 2] = ["--device", "nvidia.com/gpu=all"]
     argv[argv.index("--workdir") + 1] = str(REPO)
     argv[argv.index("--entrypoint") + 1] = str(python)
     for i, value in enumerate(argv):
@@ -37,10 +39,9 @@ def command(arguments, phase):
         "-e", f"TORCH_EXTENSIONS_DIR={BUILD}/torch-extensions",
         "-e", f"CUDA_CACHE_PATH={BUILD}/cuda-cache",
         "-e", "HF_HUB_OFFLINE=1",
+        "-e", "NVIDIA_TF32_OVERRIDE=0",
         "-e", "PYTHONUNBUFFERED=1",
     ]
-    if phase == "production":
-        argv[image:image] = ["-e", "GPTQMODEL_EXL3_SPAN_PAUSE_MS=1"]
     return argv
 
 

@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import runpy
 import subprocess
 import time
 
@@ -29,7 +30,7 @@ CODE = (
     "quantization/hy4_flash/run.py", "quantization/hy4_flash/storage.py",
     "quantization/hy4_flash/recipe.py", "quantization/hy4_flash/forward.py",
     "quantization/hy4_flash/source.py", "quantization/hy4_flash/prepare_corpus.py",
-    "quantization/hy4_flash/pilot.py", "quantization/hy4_flash/export.py",
+    "quantization/hy4_flash", "quantization/hy4_flash/export.py",
     "quantization/inkling2/numerical.py",
     "quantization/inkling2/export.py", "quantization/kimi_k3/core_k6/storage.py",
     "quantization/kimi_k3/uniform_k2/storage.py", "quantization/kimi_k3/prepare_corpus.py",
@@ -37,49 +38,18 @@ CODE = (
     "scripts/lib/mc_manifest.py",
     "python/reference/families/hy4_flash", "python/reference/shape_invariant.py",
 )
-SEGMENT_BYTES = 4 * (1 << 30)
+SEGMENT_BYTES = 256 * (1 << 20)
 EXPERT_GROUP = 32
 EXPERT_ROWS = 2048
-PILOT_POLICY = {"include_head", "include_kv_b", "k6_drafter_bits"}
-LEGACY_EXPERT_SPOOL_COMMIT = "3c5ee4bb0cecedacdf87006bf336f96719ffc3d2"
-LEGACY_EXPERT_SPOOL_FILES = ("quantization/hy4_flash/run.py", "quantization/hy4_flash/storage.py")
-RESIDENT_EXPERTS_COMMIT = "495873eaa903490d11bdb2df80392520204dc83a"
-LEGACY_GPTQMODEL_COMMIT = "6b7f7c48d6be9a3737958e1dac3b94b8ce251695"
-BATCHED_HESSIAN_COMMIT = "d606eaccc7fe026b8c83e97a8a8693f6e364e21b"
-
-
-PACED_GPTQMODEL_COMMIT = "43180de6cee3e6398d367d639dddacda0b02f3f1"
-BATCHED_RUNNER_COMMIT = "988f8f40281bbc72114486b48100f72f4ab212b1"
-
-
 def read_json(path):
     return json.loads(path.read_text())
-
-
-def load_pilot(path):
-    pilot = read_json(path)
-    policy = pilot.get("core_policy", {})
-    paths = (Path(__file__).with_name("pilot.py"), Path(__file__).with_name("forward.py"),
-             Path(reference.__file__), Path(recipe.__file__))
-    tested = {path.name: hashlib.sha256(path.read_bytes()).hexdigest() for path in paths}
-    if (pilot.get("status") != "passed"
-            or pilot.get("completed_layers") != recipe.LAYER_COUNT or pilot.get("source_revision") != recipe.BASE_REVISION
-            or pilot.get("reference_revision") != recipe.REFERENCE_REVISION
-            or pilot.get("code_identity") != tested or not pilot.get("checks")
-            or set(policy) != PILOT_POLICY
-            or type(policy["include_head"]) is not bool
-            or type(policy["include_kv_b"]) is not bool
-            or type(policy["k6_drafter_bits"]) is not int
-            or policy["k6_drafter_bits"] not in (6, 8)):
-        raise ValueError("Hy4 production requires a passing pinned pilot and explicit compact-view policy")
-    return pilot
 
 
 def git(*args, cwd=REPO):
     return subprocess.check_output(["git", *args], cwd=cwd, text=True).strip()
 
 
-def identity(source, corpus, pilot):
+def identity(source, corpus, preflight):
     if os.environ.get("INKLING_GPTQMODEL_ROOT"):
         raise ValueError("Hy4 production requires the committed GPTQModel pin")
     if git("status", "--porcelain", "--", *CODE):
@@ -89,14 +59,21 @@ def identity(source, corpus, pilot):
     if (git("status", "--porcelain", cwd=submodule)
             or git("ls-tree", "HEAD", "third_party/gptqmodel").split()[2] != fork):
         raise ValueError("Hy4 GPTQModel differs from the committed fork pin")
+    lock = read_json(REPO / "third_party/gptqmodel.lock.json")
+    digest = runpy.run_path(str(REPO / "scripts/build/verify-sparkinfer-source.py"))["source_tree_sha256"](submodule)
+    if lock["revision"] != fork or lock["source_tree_sha256"] != digest:
+        raise ValueError("GPTQModel differs from the committed source lock")
+    manifest = read_json(corpus / "manifest.json")
     paths = git("ls-files", "--", *CODE).splitlines()
-    return dict(schema="cuteafd-hy4-causal-mc-v1", source_repo=recipe.BASE_REPO,
+    return dict(schema="cuteafd-hy4-causal-mc-v2", source_repo=recipe.BASE_REPO,
                 source_revision=recipe.BASE_REVISION, reference_revision=recipe.REFERENCE_REVISION,
                 source_fingerprints=source.source_fingerprints,
                 corpus_manifest_sha256=hashlib.sha256((corpus / "manifest.json").read_bytes()).hexdigest(),
                 code=dict(fork=fork, files={path: hashlib.sha256((REPO / path).read_bytes()).hexdigest()
                                            for path in paths}),
-                pilot=pilot, seed=787, sigma=.025, expert_bits=4, core_bits=[8, 6],
+                preflight=preflight, dataset=manifest["dataset"], components=manifest["components"],
+                codebook="mul1", codebook_multiplier=recipe.MUL1_MULTIPLIER, expert_minimum_rows=1024,
+                seed=787, sigma=.025, expert_bits=4, core_bits=[8, 6],
                 upstream_core_bits=8, calibration="ieee-fp32-reference",
                 covariance=numerical.ACCUMULATION_CONTRACT,
                 expert_rows=EXPERT_ROWS, expert_group=EXPERT_GROUP,
@@ -104,68 +81,16 @@ def identity(source, corpus, pilot):
                 drafter_anchor="last-committed-target-state-k8-head-greedy-bonus")
 
 
-def resident_code_at(commit):
-    return {path: hashlib.sha256(subprocess.check_output(
-        ["git", "show", f"{commit}:{path}"], cwd=REPO)).hexdigest()
-        for path in LEGACY_EXPERT_SPOOL_FILES}
-
-
-def checkpoint_identity(root, candidate, *, resume_legacy):
-    """Retain the sealed numerical identity across reviewed backend transitions."""
-    identity_path = root / "identity.json"
-    recovery_path = root / "resident-expert-recovery.json"
-    batched_path = root / "batched-hessian-recovery.json"
-    if not identity_path.exists():
-        if resume_legacy or recovery_path.exists() or batched_path.exists():
-            raise ValueError("Hy4 resident recovery requires an existing numerical identity")
-        atomic_json(identity_path, candidate)
-        return candidate
-    frozen = read_json(identity_path)
-    if frozen == candidate and not recovery_path.exists() and not batched_path.exists():
-        return frozen
-    if not resume_legacy:
-        raise ValueError("Hy4 legacy expert recovery requires --resume-legacy-expert-spool")
-
-    frozen_fork, candidate_fork = frozen["code"]["fork"], candidate["code"]["fork"]
-    batched = frozen_fork != candidate_fork
-    paced = candidate_fork == PACED_GPTQMODEL_COMMIT
-    if batched and (frozen_fork != LEGACY_GPTQMODEL_COMMIT or candidate_fork not in (BATCHED_HESSIAN_COMMIT, PACED_GPTQMODEL_COMMIT)):
-        raise ValueError("Hy4 recovery only accepts reviewed fork revisions")
-    files = candidate["code"]["files"] | resident_code_at(LEGACY_EXPERT_SPOOL_COMMIT)
-    legacy = candidate | {"code": candidate["code"] | {"files": files, "fork": frozen_fork}}
-    if frozen != legacy:
-        raise ValueError("Hy4 numerical or unrelated code identity differs from the sealed run")
-
-    expected = dict(schema="hy4-resident-experts-v1", legacy_commit=LEGACY_EXPERT_SPOOL_COMMIT,
-                    code={path: candidate["code"]["files"][path] for path in LEGACY_EXPERT_SPOOL_FILES},
-                    frozen_identity_sha256=hashlib.sha256(identity_path.read_bytes()).hexdigest())
-    if batched:
-        previous = expected | {"code": resident_code_at(RESIDENT_EXPERTS_COMMIT)}
-        if not recovery_path.is_file() or read_json(recovery_path) != previous:
-            raise ValueError("Hy4 batched Hessian recovery needs the sealed resident backend receipt")
-        recovery_path = batched_path
-        expected = expected | dict(schema="hy4-batched-hessian-v1", fork_commit=candidate_fork,
-                                   prior_backend_commit=RESIDENT_EXPERTS_COMMIT)
-        if paced:
-            prior = expected | dict(code=resident_code_at(BATCHED_RUNNER_COMMIT),
-                                    fork_commit=BATCHED_HESSIAN_COMMIT)
-            if not batched_path.is_file() or read_json(batched_path) != prior:
-                raise ValueError("paced resume requires the verified batched Hessian receipt")
-            pause_ms = float(os.environ.get("GPTQMODEL_EXL3_SPAN_PAUSE_MS", "0"))
-            if pause_ms != 1.0:
-                raise ValueError("paced Hy4 production requires a 1 ms gap per LDLQ span")
-            recovery_path = root / "paced-trellis-recovery.json"
-            expected = expected | dict(schema="hy4-paced-trellis-v1", span_pause_ms=pause_ms,
-                                       prior_backend_commit=BATCHED_RUNNER_COMMIT)
-    elif batched_path.exists():
-        raise ValueError("Hy4 batched Hessian recovery already owns this run")
-
-    if recovery_path.exists():
-        if read_json(recovery_path) != expected:
-            raise ValueError("Hy4 resident recovery code differs from the committed backend")
+def checkpoint_identity(root, candidate):
+    path = root / "identity.json"
+    if path.exists():
+        if read_json(path) != candidate:
+            raise ValueError("Hy4 numerical identity differs from the frozen v2 run")
     else:
-        atomic_json(recovery_path, expected)
-    return frozen
+        if (root / "frontier.json").exists() or (root / "stages").exists():
+            raise ValueError("Hy4 stages without a frozen v2 identity")
+        atomic_json(path, candidate)
+    return candidate
 
 
 class Progress:
@@ -219,11 +144,12 @@ class Runner:
         self.device = torch.device(args.device)
         self.root.mkdir(parents=True, exist_ok=True)
         self.header = HeaderSource(args.source)
-        self.pilot = load_pilot(args.pilot)
-        self.policy = self.pilot["core_policy"]
-        self.identity = checkpoint_identity(
-            self.root, identity(self.header, args.corpus, self.pilot),
-            resume_legacy=args.resume_legacy_expert_spool)
+        preflight = read_json(args.preflight)
+        if (preflight.get("status") != "passed" or preflight.get("source_revision") != recipe.BASE_REVISION
+                or preflight.get("reference_revision") != recipe.REFERENCE_REVISION):
+            raise ValueError("Hy4 v2 requires passing pinned reference-forward parity")
+        self.policy = dict(include_head=True, include_kv_b=True, k6_drafter_bits=6)
+        self.identity = checkpoint_identity(self.root, identity(self.header, args.corpus, preflight))
         self.core = recipe.reviewed_core_modules(
             include_head=self.policy["include_head"], include_kv_b=self.policy["include_kv_b"])
         self.total = len(self.core) * 2 + recipe.EXPERT_MODULE_COUNT
@@ -278,11 +204,11 @@ class Runner:
     def save(self, name, batches):
         def checked():
             for index, values in batches():
-                if any(value.is_floating_point() and not bool(torch.isfinite(value).all())
-                       for value in values.values()):
+                checks = [torch.isfinite(value).all() for value in values.values() if value.is_floating_point()]
+                if checks and not bool(torch.stack(checks).all()):
                     raise ValueError("nonfinite Hy4 calibration stage")
                 yield index, values
-        self.stages.write_batches(name, checked(), segment_bytes=SEGMENT_BYTES, segment_batches=128)
+        self.stages.write_batches(name, checked(), segment_bytes=SEGMENT_BYTES, segment_batches=32)
 
     def core_fit(self, stage, layer, groups, samples, overrides):
         """Fit one shared covariance per input boundary and replay serialized K8."""
@@ -784,7 +710,7 @@ class Runner:
             del drafter
         self.reader.close()
         if self.frontier["encodes"] != self.total:
-            raise ValueError("Hy4 completed encode count differs from the pilot-selected recipe")
+            raise ValueError("Hy4 completed encode count differs from the production recipe")
         error_csv = self.write_error_csv()
         tables = self.export_engram()
         self.progress.event("package_audit")
@@ -801,15 +727,6 @@ class Runner:
                         task_intermediates=[str(self.stages.root)],
                         package_validation=str(self.output / "package-validation.json"),
                         package_status=result["status"], original_discovery=discovery)
-        recovery = self.root / "resident-expert-recovery.json"
-        if recovery.is_file():
-            complete["resident_expert_recovery"] = read_json(recovery)
-        batched = self.root / "batched-hessian-recovery.json"
-        if batched.is_file():
-            complete["batched_hessian_recovery"] = read_json(batched)
-        paced = self.root / "paced-trellis-recovery.json"
-        if paced.is_file():
-            complete["paced_trellis_recovery"] = read_json(paced)
         atomic_json(self.root / "numerical-complete.json", complete)
         atomic_json(self.root / "status.json", dict(self.progress.base, status="passed",
                     phase="numerical_complete", updated_at=datetime.now(timezone.utc).isoformat()))
@@ -818,11 +735,9 @@ class Runner:
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    for name in ("source", "corpus", "pilot", "root", "output", "engram-dir", "engram-receipt"):
+    for name in ("source", "corpus", "preflight", "root", "output", "engram-dir", "engram-receipt"):
         parser.add_argument("--" + name, type=Path, required=True)
     parser.add_argument("--device", choices=("cuda:0",), default="cuda:0")
-    parser.add_argument("--resume-legacy-expert-spool", action="store_true",
-                        help="resume the sealed legacy production run with resident expert replay")
     args = parser.parse_args()
     complete = args.root / "numerical-complete.json"
     if complete.exists():

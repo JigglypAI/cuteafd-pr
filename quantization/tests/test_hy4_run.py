@@ -189,35 +189,9 @@ def test_resident_expert_replay_uses_only_sealed_weights_and_preserves_sum(tmp_p
         assert len(encodes) == 6
 
 
-def test_resident_recovery_keeps_numerical_identity_and_rejects_other_changes(tmp_path, monkeypatch):
-    import hashlib
-    import json
-
-    paths = run.LEGACY_EXPERT_SPOOL_FILES
-    old_code = {path: hashlib.sha256(path.encode()).hexdigest() for path in paths}
-
-    def get_original(command, cwd):
-        assert command[:2] == ["git", "show"] and cwd == run.REPO
-        anchor, path = command[2].split(":", 1)
-        assert anchor == run.LEGACY_EXPERT_SPOOL_COMMIT and path in paths
-        return path.encode()
-
-    monkeypatch.setattr(run.subprocess, "check_output", get_original)
-    identity = {"seed": 787, "code": {"fork": "pinned", "files": old_code | {"other.py": "unchanged"}}}
-    identity_path = tmp_path / "identity.json"
-    identity_path.write_text(json.dumps(identity))
-    candidate = {"seed": 787, "code": {"fork": "pinned",
-                 "files": {path: "resident:" + path for path in paths} | {"other.py": "unchanged"}}}
-    with pytest.raises(ValueError, match="requires --resume-legacy-expert-spool"):
-        run.checkpoint_identity(tmp_path, candidate, resume_legacy=False)
-    digest = hashlib.sha256(identity_path.read_bytes()).hexdigest()
-    assert run.checkpoint_identity(tmp_path, candidate, resume_legacy=True) == identity
-    assert hashlib.sha256(identity_path.read_bytes()).hexdigest() == digest
-    assert run.checkpoint_identity(tmp_path, candidate, resume_legacy=True) == identity
-    unexpected = candidate | {"seed": 42}
-    with pytest.raises(ValueError, match="numerical or unrelated code identity differs"):
-        run.checkpoint_identity(tmp_path, unexpected, resume_legacy=True)
-    changed = candidate | {"code": candidate["code"] |
-                           {"files": candidate["code"]["files"] | {paths[0]: "different replay"}}}
-    with pytest.raises(ValueError, match="recovery code differs"):
-        run.checkpoint_identity(tmp_path, changed, resume_legacy=True)
+def test_resume_requires_same_frozen_identity(tmp_path):
+    fresh = {"schema": "cuteafd-hy4-causal-mc-v2", "codebook": "mul1"}
+    assert run.checkpoint_identity(tmp_path, fresh) == fresh
+    assert run.checkpoint_identity(tmp_path, fresh) == fresh
+    with pytest.raises(ValueError, match="numerical identity"):
+        run.checkpoint_identity(tmp_path, fresh | {"codebook": "mcg"})
