@@ -465,6 +465,8 @@ def test_published_matrix_pins_current_reports() -> None:
     matrix = json.loads((ROOT / "benchmarks/current-matrix.json").read_text())
     readme = (ROOT / "README.md").read_text()
     results = readme.split("<!-- results:begin -->", 1)[1].split("<!-- results:end -->", 1)[0]
+    main_table_header = "<tr><th>Model · quant</th><th>1× RTX</th><th>2× RTX</th></tr>"
+    main, retired_results = results.split(main_table_header, 1)[1].split("### Retired", 1)
     identities = set()
     assert matrix["cells"]
     for row in matrix["cells"]:
@@ -482,8 +484,7 @@ def test_published_matrix_pins_current_reports() -> None:
             assert not cell.get("reason")
             directory = Path(cell["report"])
             assert not directory.is_absolute() and ".." not in directory.parts
-            report_family = "kimi_k31" if row["checkpoint"] == "wrldsuksgo2mars/Kimi-K3.1-Pro-EXL3-K2-MC" else row["family"]
-            assert len(directory.parts) == 3 and directory.parts[:2] == ("benchmarks", report_family)
+            assert len(directory.parts) == 3 and directory.parts[:2] == ("benchmarks", row["family"])
             report = json.loads((ROOT / directory / "report.json").read_text())
             server = report["server"]
             snapshot = server.get("configuration", {}).get("snapshot") or ""
@@ -498,13 +499,13 @@ def test_published_matrix_pins_current_reports() -> None:
             used = [gpu for gpu in gpus if gpu.get("used")] or gpus
             assert len(used) == int(column[0])
             assert report.get("baseline")
-            assert f'href="{directory.as_posix()}/card.svg"' in results
+            assert f'href="{directory.as_posix()}/card.svg"' in main
             assert (ROOT / directory / "card.svg").is_file()
             current.append(cell)
         if not current:
-            assert row["checkpoint"] in results, "Unmeasured checkpoints remain visible"
+            assert row["checkpoint"] in main, "Unmeasured checkpoints remain visible"
             for column in ("1rtx", "2rtx"):
-                assert html.escape(row[column]["reason"]).replace("&#x27;", "&#39;") in results
+                assert html.escape(row[column]["reason"]).replace("&#x27;", "&#39;") in main
     retired_names = set()
     for entry in matrix["retired"]:
         assert entry["name"] and entry["name"] not in retired_names
@@ -513,12 +514,12 @@ def test_published_matrix_pins_current_reports() -> None:
         report = json.loads((ROOT / entry["report"] / "report.json").read_text())
         assert report["profile"] == "smoke" and report.get("baseline")
         assert_retired_release(entry, report)
-        row = next(line for line in results.splitlines() if f'href="{entry["report"]}/card.svg"' in line)
+        row = next(line for line in retired_results.splitlines() if f'href="{entry["report"]}/card.svg"' in line)
         assert f'>{entry["release"]}</td>' in row
         build = report["server"]["build"]
         label = build["release"] or build["commit"][:12] + ("+dirty" if build.get("dirty") else "")
         assert f'build {label}; commit {build["commit"]};' in row
-        assert f'href="{entry["report"]}/card.svg"' in results
+        assert f'href="{entry["report"]}/card.svg"' in retired_results
     assert all("5090" not in row for row in matrix["cells"]), "the 5090 column is retired"
 
 
