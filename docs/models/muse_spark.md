@@ -74,6 +74,8 @@ and on #923.
 
 ## Core views
 
+The old `-HQA` checkpoint was withdrawn from Hugging Face. Use the published MC checkpoint for selectable core views.
+
 `wrldsuksgo2mars/Muse-Spark-Open-EXL3-K4-MC` provides the original BF16 core
 and complete `k8-compact` / `k6-compact` cores at revision
 `cc5dc2537083177e3f02ea0b2d9dfc179d40425c`. Select with `CORE_VIEW` (default

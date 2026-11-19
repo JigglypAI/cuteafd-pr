@@ -65,6 +65,8 @@ states exact, zero mismatches, with matching Serve/Golden admission. This is
 
 ## Core views
 
+The old Kimi K3 `-HQA` checkpoint was withdrawn from Hugging Face.
+
 `wrldsuksgo2mars/Kimi-K3.1-Pro-EXL3-K2-MC` uses the [MC contract](../mc-checkpoints.md).
 `CORE_VIEW=original` retains the complete source-native BF16 core, not a mixture
 of native attention outputs and trellis inputs. `k8-compact` and `k6-compact`

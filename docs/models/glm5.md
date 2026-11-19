@@ -39,6 +39,8 @@ Historical, retired standalone recipes remain available: EXL3
 
 ## Core views
 
+The old `-HQA` checkpoint was withdrawn from Hugging Face. Use the published MC checkpoint for selectable core views.
+
 The published MC follows the [MC contract](../mc-checkpoints.md).
 `CORE_VIEW=original` (default) restores the source-native BF16 core;
 `k8-compact` and `k6-compact` select complete native trellis cores, including

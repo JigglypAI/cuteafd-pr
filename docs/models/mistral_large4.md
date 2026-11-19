@@ -22,6 +22,8 @@ Core-K6 was retired on 2026-11-12; its v5 cards remain archived in the changelog
 
 ## Original mixed-precision core
 
+The old `-HQA` checkpoint was withdrawn from Hugging Face. Use the original mixed-precision checkpoint below.
+
 `wrldsuksgo2mars/Mistral-Large-4-EXL3-K4` is a plain checkpoint, not MC.
 Its complete original mixed-precision core is restored, including native E4M3
 `wq`/`wo` and F32 block-128 `qscale_weight`; routed experts remain EXL3 K4.
