@@ -859,7 +859,12 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
                         engine.verify_scoring_media(placement, chunk, transport.as_deref_mut().map(|t| (t, runtime)),
                             &request_media)?.context("scoring needs every layer")
                     });
-                turn.check()?;
+                if let Err(stall) = turn.check() {
+                    let error = anyhow::Error::from(stall);
+                    crate::shared::api::publish_scheduler_failure(&error);
+                    let _ = job.events.send(Err(NativeFailure::Worker(format!("{error:#}"))));
+                    return Err(error);
+                }
                 match scored {
                     Ok(_) => { let _ = job.events.send(Ok(InferenceChunk::Finish { finish_reason: InferenceFinishReason::Length })); }
                     Err(error) => { let _ = job.events.send(Err(NativeFailure::Worker(format!("scoring: {error:#}")))); }
@@ -962,7 +967,14 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
                         Ok(if p.done == p.tokens.len() { Chunk::Done } else { Chunk::More })
                     }).collect()
                 });
-            turn.check()?;
+            if let Err(stall) = turn.check() {
+                let error = anyhow::Error::from(stall);
+                crate::shared::api::publish_scheduler_failure(&error);
+                for (prompt, _) in &finished {
+                    let _ = prompt.job.events.send(Err(NativeFailure::Worker(format!("{error:#}"))));
+                }
+                return Err(error);
+            }
             for (mut p, prefilled) in finished {
                 let (slot, placement, resume) = (p.slot, p.placement.clone(), p.resume);
                 if p.cancelled || p.job.events.is_closed() {

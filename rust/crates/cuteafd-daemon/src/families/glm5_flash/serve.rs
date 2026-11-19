@@ -1059,7 +1059,12 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
                         engine.verify_media_device(&mut [(placement, chunk.len())], chunk, &request_media)?
                             .context("scoring needs every layer")
                     });
-                turn.check()?;
+                if let Err(stall) = turn.check() {
+                    let error = anyhow::Error::from(stall);
+                    crate::shared::api::publish_scheduler_failure(&error);
+                    let _ = job.events.send(Err(NativeFailure::Worker(format!("{error:#}"))));
+                    return Err(error);
+                }
                 match scored {
                     Ok(_) => { let _ = job.events.send(Ok(InferenceChunk::Finish { finish_reason: InferenceFinishReason::Length })); }
                     Err(error) => { let _ = job.events.send(Err(NativeFailure::Worker(format!("scoring: {error:#}")))); }
@@ -1112,7 +1117,14 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
                 prefills.round_excluding(excluded, |p| prefill_chunk(&cx, &mut selector, &mut cache, p))
             };
             // The queue reports per-prompt errors, but a turn stall must stop the entire engine.
-            turn.check()?;
+            if let Err(stall) = turn.check() {
+                let error = anyhow::Error::from(stall);
+                crate::shared::api::publish_scheduler_failure(&error);
+                for (prompt, _) in &finished {
+                    let _ = prompt.job.events.send(Err(NativeFailure::Worker(format!("{error:#}"))));
+                }
+                return Err(error);
+            }
             for (mut p, prefilled) in finished {
                 let (slot, placement, resume) = (p.slot, p.placement.clone(), p.resume);
                 if let Err(error) = &prefilled {
