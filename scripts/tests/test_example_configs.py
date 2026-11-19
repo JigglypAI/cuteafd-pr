@@ -616,6 +616,23 @@ def _effective(entry: dict, matrix: dict) -> dict[str, str]:
     return {**keys(ROOT / entry["config"]), **matrix["defaults"]["set"], **entry["set"]}
 
 
+@pytest.mark.parametrize("matrix_path", [V6, V6_COMPACT])
+def test_v6_smoke_entries_use_a_matched_image_pair(matrix_path: str) -> None:
+    matrix = json.loads((ROOT / matrix_path).read_text())
+    tag = matrix["build"]
+    for entry in matrix["entries"]:
+        values = _effective(entry, matrix)
+        assert values["COORDINATOR_DOCKER_INFERENCE"] == f"ghcr.io/tpurtell/cuteafd-coordinator:{tag}", entry["name"]
+        spark_image = "SPARK_EXPERT_DOCKER_INFERENCE"
+        assert spark_image not in matrix["defaults"]["set"]
+        if entry["sparks"]:
+            assert values[spark_image] == f"ghcr.io/tpurtell/cuteafd-spark-expert:{tag}", entry["name"]
+        else:
+            assert spark_image not in entry["set"], entry["name"]
+            if entry["family"] == "qwen3_5":
+                assert spark_image not in values, entry["name"]
+
+
 GATE_KIT = "scripts/bench/kits/gate/matrix-gate.json"
 # Each family's shipped drafter; Kimi splits by checkpoint (K3 Core-K6 DFlash2,
 # K3.1 block DSpark).

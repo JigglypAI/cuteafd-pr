@@ -90,6 +90,9 @@ mod tests {
             .unwrap_or_else(|| std::path::PathBuf::from(std::env::var_os("HOME").expect("HOME"))
                 .join(".cache/cuteafd/gate-venv/bin/python"));
         ensure!(python.is_file(), "CUTEAFD_TEST_PYTHON must name the gate Python");
+        let mut spark_rank_bytes = cuteafd_loader::serving_capacity::spark_memory::serving_bytes();
+        // The two simulated ranks repeat the first measured serving host.
+        spark_rank_bytes.extend([spark_rank_bytes[0]; 2]);
         let mut tested = Vec::new();
         for (key, _) in data["entries"].as_object().unwrap() {
             let (family, format) = key.split_once(':').unwrap();
@@ -164,11 +167,21 @@ mod tests {
                 mapped_scale_host_budget_bytes: Some(64 << 30),
                 layout: Some(LayoutOptions { host_memory: Some(cuteafd_loader::plan::testing::SimulatedHost::raptor().host_ram),
                     rtx_bytes: vec![cuteafd_loader::placement::inventory::PRO_TOTAL_BYTES; gpus], host_cache_bytes: Some(0), pool_tokens: Some(262_144),
+                    spark_rank_bytes: spark_rank_bytes.clone(),
                     context_tokens: 262_144, prefill_rows: 4096, prefill_lanes: 1,
                     workspace_manifest: manifest, glm5_drafter_disabled: true, glmf_drafter_disabled: true,
                     ..Default::default() }), ..Default::default()
             };
             let report = testing::BudgetedPlanInput::open(&snapshot)?.plan(&options)?;
+            if key == "inkling2:nvfp4" {
+                // The mixed checkpoint's MXFP8 and NVFP4 rows use incompatible TP8 ownership.
+                assert!(!report.placement_supported && !report.executable(), "{key}: TP8 must be refused");
+                assert!(report.hints.iter().any(|hint| hint.what ==
+                    "mixed Spark packages inkling2:mxfp8 + inkling2:nvfp4a4 require incompatible row ownership at TP8"),
+                    "{key}: wrong refusal: {:?}", report.hints);
+                tested.push(key.clone());
+                continue;
+            }
             if key == "minimax:nvfp4" {
                 // When MiniMax becomes servable, replace this refusal witness with the
                 // complete N8 launch/count-cap chain below rather than silently accepting it.
@@ -201,7 +214,7 @@ mod tests {
                 .filter(|device| device.kind == cuteafd_core::memory_layout::DeviceKind::Spark).collect::<Vec<_>>();
             assert_eq!(spark_devices.len(), 8, "{key}");
             for device in spark_devices {
-                assert_eq!(device.worker_budget_bytes, (if family == "muse" { 100 } else { 108 }) << 30, "{key}");
+                assert_eq!(device.worker_budget_bytes, spark_rank_bytes[device.index as usize], "{key} rank {}", device.index);
                 assert!(device.worker_budget_bytes <= device.capacity_bytes && device.worker_budget_bytes <= 121 << 30,
                     "{key}: worker ceiling exceeds device capacity");
             }
@@ -228,6 +241,12 @@ print(json.dumps(capture_real_eight_rank_launch(*map(Path, sys.argv[2:]))))
                 Commands::ServeGlmf(a) => a.engine.peers.as_deref().unwrap().split(',').count(),
                 Commands::ServeMimo(a) => a.engine.peers.as_deref().unwrap().split(',').count(),
                 Commands::ServeKimi(a) => a.peers.len(),
+                Commands::ServeInkling2(a) => {
+                    assert_eq!(family, "inkling2", "{key}: wrong Inkling dispatch");
+                    assert_eq!(a.prefill_waves, Some(deployment.prefill_waves as _),
+                        "{key}: launch must preserve the admitted prefill wave count");
+                    a.peers.len()
+                }
                 Commands::ServeMuse(a) => {
                     assert_eq!(family, "muse", "{key}: wrong Muse dispatch");
                     assert_eq!(a.prefill_waves, Some(deployment.prefill_waves as _),
@@ -297,6 +316,18 @@ print(json.dumps(capture_real_eight_rank_launch(*map(Path, sys.argv[2:]))))
                 assert!(ledger.budgets.iter().any(|budget| budget.id == "coordinator host RAM"), "{key}");
                 assert!(ledger.phases.iter().any(|row| row.budget == "coordinator host RAM" && row.owned > 0), "{key}");
                 assert!(ledger.phases.iter().all(|phase| phase.owned + phase.opaque <= phase.available));
+            } else if family == "inkling2" {
+                // The joint ledger owns coordinator device planes, not a generic host intake.
+                assert!(report.host_ledger.is_none(), "{key}: unexpected generic host ledger");
+                let planes = deployment.memory_layout.devices.iter()
+                    .filter(|device| device.kind == cuteafd_core::memory_layout::DeviceKind::Rtx)
+                    .flat_map(|device| &device.items)
+                    .filter(|item| item.group == "Spark intake"
+                        && item.category == cuteafd_core::memory_layout::Category::Transport)
+                    .map(|item| item.bytes).sum::<u64>();
+                assert_eq!(planes, intake, "{key}: one admitted intake plane per rank");
+                let ledger = report.phase_ledger.as_ref().expect("Inkling joint physical ledger");
+                assert!(ledger.phases.iter().all(|phase| phase.owned + phase.opaque <= phase.available));
             } else if family != "kimik3" {
                 let host = report.host_ledger.as_ref().expect("full host intake ledger");
                 let (group, expected) = if matches!(family, "mimo" | "mimof" | "mimop") {
@@ -346,11 +377,13 @@ print(json.dumps(capture_real_eight_rank_launch(*map(Path, sys.argv[2:]))))
             "rust/crates/cuteafd-loader/src/families/inkling2/fixtures/config.json"))?)?;
         config.as_object_mut().unwrap().remove("vision_config");
         config.as_object_mut().unwrap().remove("mtp_config");
-        // This sweep checks count/dispatch contracts, not release-size fit.
-        // Retain real expert/hidden geometry and both local/global kinds.
-        config["text_config"]["num_hidden_layers"] = 4.into();
-        config["text_config"]["local_layer_ids"] = serde_json::json!([0, 1, 2]);
-        config["text_config"]["n_layers_per_attn_res_block"] = 2.into();
+        // Keep a subset of the real layer pattern with enough routed bytes
+        // to exercise the eight-rank size policy in every expert format.
+        let layers = if format == "mxfp8" { 12 } else { 24 };
+        let text = &mut config["text_config"];
+        text["num_hidden_layers"] = layers.into();
+        text["local_layer_ids"].as_array_mut().unwrap()
+            .retain(|id| id.as_u64().unwrap() < layers);
         if format == "exl3" { config["quantization_config"] = testing::exl3_compact(4); }
         let cfg = Inkling2Config::from_hf(&config)?;
         let mut tensors = vec![t("model.llm.embed.weight", "BF16", &[cfg.vocab_size, cfg.hidden]),
@@ -391,7 +424,7 @@ print(json.dumps(capture_real_eight_rank_launch(*map(Path, sys.argv[2:]))))
                     }
                 }
             } else {
-                let nvfp4 = format == "nvfp4" && layer < 3;
+                let nvfp4 = format == "nvfp4" && layer + 8 < cfg.layers;
                 for (name, n, k) in [("w13", 4608, 4608), ("w2", 4608, 2304)] {
                     tensors.push(t(format!("{p}.mlp.experts.{name}_weight"), if nvfp4 { "U8" } else { "F8_E4M3" },
                         &[384, n, k / if nvfp4 { 2 } else { 1 }]));

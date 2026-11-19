@@ -260,6 +260,7 @@ lossless speculation. No launch defaults change.
 
 | Date | Change | Evidence |
 | --- | --- | --- |
+| 2026-11-19 | v6 reference cards for native MXFP8/NVFP4 serving with DSpark. | [1 RTX + 3 Sparks](../../benchmarks/minimax_m3/2026-11-19-smoke-minimax-m3-1-flash-1rtx-3spark-minimax-m31-flash-min/report.svg), [2 RTX + 6 Sparks](../../benchmarks/minimax_m3/2026-11-19-smoke-minimax-m3-1-flash-2rtx-6spark-minimax-m31-flash-max/report.svg) |
 | 2026-11-16 | Select six Sparks for the two-RTX Heads max card; retain dSpark, auto pool and zero onboarded layers. | One warmed Release smoke at `234a3be51`: C1/C16 70.57/213.99 tok/s, 1.183x/1.322x the same-day published four-Spark card; zero power-cap/thermal slowdown. Standard generated decode/prefill fidelity passes; #1856. |
 | 2026-11-14 | Qualify public one-RTX native serving, exact prefix restores, tool grammar and named baseline/graph memory owners. | Basic card at `3a70a3768`, generated aggregate fidelity pass; two-RTX and narrow heads remain gated by #1856. |
 | 2026-11-14 | Qualify public two-RTX contiguous attention and FP32 split FFNs; eager split sections, native TP2 experts and exact shared prefix state. | Golden and mixed card at `60831478b`; narrow heads/media/drafts remain pending #1856. |

@@ -22,6 +22,8 @@ Core-K6 was retired on 2026-11-12; its v5 cards remain archived in the changelog
 
 ## Original mixed-precision core
 
+The old `-HQA` checkpoint was withdrawn from Hugging Face. Use the original mixed-precision checkpoint below.
+
 `wrldsuksgo2mars/Mistral-Large-4-EXL3-K4` is a plain checkpoint, not MC.
 Its complete original mixed-precision core is restored, including native E4M3
 `wq`/`wo` and F32 block-128 `qscale_weight`; routed experts remain EXL3 K4.
@@ -94,3 +96,4 @@ names.
 | Version | Date | Change | Basic eval |
 | --- | --- | --- | --- |
 | v5 | 2026-11-10 | Published benchmarks | <a href="../../benchmarks/mistral_large4/2026-11-10-smoke-mistral-large-4-exl3-k4-core-k6-1rtx-5spark-ml4-exl3-min/report.svg"><img src="../../benchmarks/mistral_large4/2026-11-10-smoke-mistral-large-4-exl3-k4-core-k6-1rtx-5spark-ml4-exl3-min/card.svg" width="360" alt="Mistral-Large-4-EXL3-K4-Core-K6 (exl3-k4) (1× RTX)"></a> <a href="../../benchmarks/mistral_large4/2026-11-10-smoke-mistral-large-4-exl3-k4-core-k6-2rtx-6spark-ml4-exl3-max/report.svg"><img src="../../benchmarks/mistral_large4/2026-11-10-smoke-mistral-large-4-exl3-k4-core-k6-2rtx-6spark-ml4-exl3-max/card.svg" width="360" alt="Mistral-Large-4-EXL3-K4-Core-K6 (exl3-k4) (2× RTX)"></a> |
+| v6 | 2026-11-19 | Published benchmarks | <a href="../../benchmarks/mistral_large4/2026-11-19-smoke-mistral-large-4-exl3-k4-1rtx-5spark-ml4-exl3-min/report.svg"><img src="../../benchmarks/mistral_large4/2026-11-19-smoke-mistral-large-4-exl3-k4-1rtx-5spark-ml4-exl3-min/card.svg" width="360" alt="Mistral-Large-4-EXL3-K4 (exl3-k4) (1× RTX)"></a> <a href="../../benchmarks/mistral_large4/2026-11-19-smoke-mistral-large-4-exl3-k4-2rtx-6spark-ml4-exl3-max/report.svg"><img src="../../benchmarks/mistral_large4/2026-11-19-smoke-mistral-large-4-exl3-k4-2rtx-6spark-ml4-exl3-max/card.svg" width="360" alt="Mistral-Large-4-EXL3-K4 (exl3-k4) (2× RTX)"></a> |

@@ -732,6 +732,8 @@ Each key is also a global `cuteafd` flag (`--gpu-memory-cap`, `--kv-max-tokens`,
 
 ## Attention and KV
 
+The old `-HQA` checkpoints were withdrawn from Hugging Face. Historical results remain in the [benchmark archive](../benchmarks/README.md#v5-hqa-comparison).
+
 | Key | Default | Values | Notes |
 | --- | --- | --- | --- |
 | `CORE_VIEW` | unset (= `original`) | `original`, `k8-compact`, `k6-compact`, `fp8-compact` | Immutable MC dense-core view. Plain checkpoints support original only. FP8 converts exactly original `core_tensors` from its BF16 index with the shared block-128 recipe; no alternate index reads. Flash supports its full MC core. Muse supports its full MC selection (q/k/v/o, optional gate, pre/post-expert projections and padded vocabulary head); it stays explicit, not default. Kimi K3.1 supports its full MC selection (KDA/MLA projections, shared FFN, routed latent projections and vocabulary head). GLM/Step support their selected target core; Step includes MTP core, never routed experts. Unselected operands stay native. GLM and Step require v52e coordinator exports. Measured speed/quality costs are in Optional performance levers; original stays default, FP8 stays opt-in. Already-FP8 sources refuse. |

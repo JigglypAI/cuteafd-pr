@@ -50,6 +50,8 @@ fidelity views are measured ([#1906](https://github.com/tpurtell/cuteafd/issues/
 
 ## Core views
 
+The old `-HQA` checkpoint was withdrawn from Hugging Face. Use the published MC checkpoint for selectable core views.
+
 The published MC follows the [MC contract](../mc-checkpoints.md):
 `CORE_VIEW=original` (default) restores the BF16 target core and, in repaired
 revisions, the BF16 MTP core (attention, FFN, EH and private vocabulary heads).
@@ -218,4 +220,5 @@ whole-layer onboarding and two GPUs support native TP2 onboarding.
 | Version | Date | Change | Basic eval |
 | --- | --- | --- | --- |
 | v5.1 WIP | 2026-11-13 | MC original min/max Release smoke, max K8/K6 cards and published Standard fidelity (#1906). | [Original min](../../benchmarks/step5/2026-11-13-smoke-step-5-preview-exl3-k4-mc-1rtx-3spark-step5-mc-original-min-cand-r1/report.svg) |
+| v6 | 2026-11-19 | Published benchmarks | <a href="../../benchmarks/step5/2026-11-19-smoke-step-5-preview-exl3-k4-mc-1rtx-3spark-step5-mc-original-min/report.svg"><img src="../../benchmarks/step5/2026-11-19-smoke-step-5-preview-exl3-k4-mc-1rtx-3spark-step5-mc-original-min/card.svg" width="360" alt="Step-5-Preview-EXL3-K4-MC (exl3-k4+exl3-k6) (1× RTX)"></a> <a href="../../benchmarks/step5/2026-11-19-smoke-step-5-preview-exl3-k4-mc-2rtx-6spark-step5-mc-original-max/report.svg"><img src="../../benchmarks/step5/2026-11-19-smoke-step-5-preview-exl3-k4-mc-2rtx-6spark-step5-mc-original-max/card.svg" width="360" alt="Step-5-Preview-EXL3-K4-MC (exl3-k4+exl3-k6) (2× RTX)"></a> |
 | v5 | 2026-11-10 | Published benchmarks | <a href="../../benchmarks/step5/2026-11-10-smoke-step-5-preview-exl3-k4-core-k6-1rtx-3spark-step5-exl3-k6core-min/report.svg"><img src="../../benchmarks/step5/2026-11-10-smoke-step-5-preview-exl3-k4-core-k6-1rtx-3spark-step5-exl3-k6core-min/card.svg" width="360" alt="Step-5-Preview-EXL3-K4-Core-K6 (exl3-k4+exl3-k6) (1× RTX)"></a> <a href="../../benchmarks/step5/2026-11-10-smoke-step-5-preview-exl3-k4-core-k6-2rtx-6spark-step5-exl3-k6core-max/report.svg"><img src="../../benchmarks/step5/2026-11-10-smoke-step-5-preview-exl3-k4-core-k6-2rtx-6spark-step5-exl3-k6core-max/card.svg" width="360" alt="Step-5-Preview-EXL3-K4-Core-K6 (exl3-k4+exl3-k6) (2× RTX)"></a> |
