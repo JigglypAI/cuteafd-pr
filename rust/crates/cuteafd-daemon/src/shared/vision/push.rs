@@ -3,11 +3,13 @@ use super::{pcm_audio::PcmTowerSpec, ReadTransform, TowerSpec};
 use crate::shared::experts::rtx::{dense::{Job, Operand, Records, Rect, Step}, push::PushStartupError};
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::CuteafdDeviceBuffer;
-use std::{sync::{mpsc, Arc, Mutex}, thread::JoinHandle};
+use std::{sync::{atomic::{AtomicBool, Ordering}, mpsc, Arc, Mutex}, thread::JoinHandle};
+use crate::shared::gpu_turn::GpuTurn;
 
 pub(crate) struct OwnerThread {
     thread: Mutex<Option<JoinHandle<()>>>,
     cancel: mpsc::Sender<bool>,
+    media: Option<(Arc<AtomicBool>, Option<Arc<GpuTurn>>)>,
 }
 impl OwnerThread {
     #[cfg(test)]
@@ -15,7 +17,11 @@ impl OwnerThread {
         Arc::new(Self::new(thread, mpsc::channel().0))
     }
     pub(super) fn new(thread: JoinHandle<()>, cancel: mpsc::Sender<bool>) -> Self {
-        Self { thread: Mutex::new(Some(thread)), cancel }
+        Self { thread: Mutex::new(Some(thread)), cancel, media: None }
+    }
+    pub(super) fn coordinator(thread: JoinHandle<()>, cancel: mpsc::Sender<bool>, healthy: Arc<AtomicBool>,
+        turn: Option<Arc<GpuTurn>>) -> Self {
+        Self { thread: Mutex::new(Some(thread)), cancel, media: Some((healthy, turn)) }
     }
     pub(crate) fn is_finished(&self) -> bool {
         self.thread.lock().unwrap().as_ref().is_none_or(JoinHandle::is_finished)
@@ -23,6 +29,10 @@ impl OwnerThread {
 }
 impl Drop for OwnerThread {
     fn drop(&mut self) {
+        let _turn = self.media.as_ref().and_then(|(healthy, turn)| {
+            healthy.store(false, Ordering::Release);
+            turn.as_deref().map(GpuTurn::joining)
+        });
         let _ = self.cancel.send(false);
         if let Some(thread) = self.thread.get_mut().unwrap().take() { let _ = thread.join(); }
     }

@@ -1,19 +1,21 @@
-//! One paired RTX scheduler and its resident media owner take turns issuing CUDA work.
+//! One paired RTX scheduler and its resident media owners take turns issuing CUDA work.
 //!
 //! A host driver call in the media owner can wait for a device to settle. If that device is
 //! already spinning on a peer push that the scheduler has yet to issue, both hosts can stall.
 //! The scheduler offers the turn only once all pushes of its current submission are queued.
 //! Pending device work can then complete on its own; Spark exchange never takes this turn.
 
+use std::cell::Cell;
 use std::future::Future;
-use std::sync::{Condvar, Mutex, MutexGuard};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 use tokio::sync::Notify;
 
 #[derive(Default)]
 struct State {
     scheduler: bool,
-    media_waiting: bool,
+    media_waiting: usize,
+    joining: usize,
     media_deadline: Option<Instant>,
     stalled: bool,
     closed: bool,
@@ -77,7 +79,7 @@ impl GpuTurn {
                     .wait_timeout(state, left)
                     .unwrap_or_else(|p| p.into_inner())
                     .0
-            } else if state.media_waiting {
+            } else if state.media_waiting != 0 || state.joining != 0 {
                 self.changed.wait(state).unwrap_or_else(|p| p.into_inner())
             } else {
                 state.scheduler = true;
@@ -91,19 +93,30 @@ impl GpuTurn {
         self.changed.notify_all();
     }
 
-    /// Used by the single local owner for both encoding and native teardown.
+    /// Used by each local owner for both encoding and native teardown.
     pub(crate) fn media(&self) -> MediaTurn<'_> {
         let mut state = self.lock();
-        state.media_waiting = true;
-        while state.scheduler {
+        state.media_waiting += 1;
+        while state.scheduler || state.media_deadline.is_some() {
             state = self.changed.wait(state).unwrap_or_else(|p| p.into_inner());
         }
-        state.media_waiting = false;
+        state.media_waiting -= 1;
         state.media_deadline = Some(Instant::now() + self.stall);
         let closed = state.stalled || state.closed;
         self.changed.notify_all();
         self.idle_changed.notify_one();
         MediaTurn { turn: self, closed }
+    }
+
+    /// Block new paired submissions through the thread join. This is not a
+    /// media permit: the closing thread must still be free to drain and exit.
+    pub(crate) fn joining(&self) -> JoinTurn<'_> {
+        let mut state = self.lock();
+        state.joining += 1;
+        while state.scheduler {
+            state = self.changed.wait(state).unwrap_or_else(|p| p.into_inner());
+        }
+        JoinTurn(self)
     }
 
     async fn watch_idle(&self) -> MediaStalled {
@@ -141,7 +154,7 @@ impl SchedulerTurn<'_> {
         {
             let mut state = self.0.lock();
             self.0.check(&mut state)?;
-            if !state.media_waiting {
+            if state.media_waiting == 0 && state.joining == 0 {
                 return Ok(Duration::ZERO);
             }
             state.scheduler = false;
@@ -176,6 +189,15 @@ impl Drop for SchedulerTurn<'_> {
     }
 }
 
+pub(crate) struct JoinTurn<'a>(&'a GpuTurn);
+
+impl Drop for JoinTurn<'_> {
+    fn drop(&mut self) {
+        self.0.lock().joining -= 1;
+        self.0.changed.notify_all();
+    }
+}
+
 pub(crate) struct MediaTurn<'a> {
     turn: &'a GpuTurn,
     pub(crate) closed: bool,
@@ -193,6 +215,59 @@ impl Drop for MediaTurn<'_> {
     }
 }
 
+/// Scheduler-side adapter; absent on a single GPU or without a local tower.
+pub(crate) struct SchedulerMedia<'a> {
+    turn: Option<SchedulerTurn<'a>>,
+    excluded: Cell<Duration>,
+}
+
+impl<'a> SchedulerMedia<'a> {
+    pub(crate) fn new(turn: Option<&'a GpuTurn>) -> Result<Self, MediaStalled> {
+        Ok(Self {
+            turn: turn.map(GpuTurn::scheduler).transpose()?,
+            excluded: Cell::default(),
+        })
+    }
+
+    pub(crate) fn offer(
+        &self,
+        require_live: impl FnOnce() -> anyhow::Result<()>,
+    ) -> anyhow::Result<()> {
+        if let Some(turn) = &self.turn {
+            require_live()?;
+            let waited = turn.offer()?;
+            if !waited.is_zero() {
+                self.excluded.set(self.excluded.get() + waited);
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn prefill_excluded(&self) -> &Cell<Duration> {
+        self.excluded.set(Duration::ZERO);
+        &self.excluded
+    }
+
+    pub(crate) fn check(&self) -> Result<(), MediaStalled> {
+        self.turn.as_ref().map_or(Ok(()), SchedulerTurn::check)
+    }
+
+    pub(crate) fn receive<T>(
+        &self,
+        runtime: &tokio::runtime::Runtime,
+        receive: &mut tokio::sync::mpsc::Receiver<T>,
+    ) -> Result<Option<T>, MediaStalled> {
+        match &self.turn {
+            Some(turn) => runtime.block_on(turn.idle(receive.recv())),
+            None => Ok(receive.blocking_recv()),
+        }
+    }
+}
+
+pub(crate) fn paired_turn(paired: bool) -> Option<Arc<GpuTurn>> {
+    paired.then(|| Arc::new(GpuTurn::new()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -203,7 +278,7 @@ mod tests {
 
     fn until_waiting(turn: &GpuTurn) {
         let deadline = Instant::now() + TEST_WAIT;
-        while !turn.lock().media_waiting {
+        while turn.lock().media_waiting == 0 {
             assert!(Instant::now() < deadline, "media did not queue");
             thread::yield_now();
         }
@@ -251,6 +326,48 @@ mod tests {
         until_waiting(&turn);
         drop(scheduler);
         owner.join().unwrap();
+    }
+
+    #[test]
+    fn two_owners_and_join_share_a_completed_boundary() {
+        let turn = Arc::new(GpuTurn::with_stall(TEST_WAIT));
+        let scheduler = turn.scheduler().unwrap();
+        let (done, finished) = mpsc::channel();
+        let owners: Vec<_> = (0..2)
+            .map(|id| {
+                let (turn, done) = (turn.clone(), done.clone());
+                thread::spawn(move || {
+                    let _media = turn.media();
+                    assert!(!turn.lock().scheduler);
+                    done.send(id).unwrap();
+                })
+            })
+            .collect();
+        let joiner = {
+            let turn = turn.clone();
+            thread::spawn(move || {
+                let _join = turn.joining();
+                for owner in owners {
+                    owner.join().unwrap();
+                }
+                assert!(!turn.lock().scheduler);
+            })
+        };
+        let deadline = Instant::now() + TEST_WAIT;
+        loop {
+            let state = turn.lock();
+            if state.joining == 1 && state.media_waiting == 2 {
+                break;
+            }
+            drop(state);
+            assert!(Instant::now() < deadline, "owner or join did not queue");
+            thread::yield_now();
+        }
+        assert!(finished.try_recv().is_err());
+        scheduler.offer().unwrap();
+        joiner.join().unwrap();
+        assert_eq!(finished.try_iter().count(), 2);
+        assert!(turn.lock().scheduler);
     }
 
     #[test]

@@ -562,10 +562,14 @@ fn schedule_inner(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path
     let mut failures = FailureRecipients::default();
     publish(stats, requests, generated_total, 0, 0, cache, media, preparer, &reserve, 0);
     // The API may advertise capacity only after every fallible startup owner exists.
+    let gpu_turn = media.encoder().gpu_turn();
+    let turn = crate::shared::gpu_turn::SchedulerMedia::new(gpu_turn.as_deref())?;
+    let offer = || turn.offer(|| engine.require_live());
     ready();
     // Keep admitted request owners alive until a fatal cause has reached every
     // affected client, including requests waiting for prefill or KV admission.
     let result = crate::shared::api::run_scheduler(|| { loop {
+        offer()?;
         if let Some(reason) = cuteafd_transport::health::failure_reason() {
             anyhow::bail!("expert wire unavailable until restart: {reason}");
         }
@@ -592,7 +596,7 @@ fn schedule_inner(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path
                         publish(stats, requests, generated_total, active.len(), prefills.len(), cache, media, preparer,
                             &reserve, stalled.len());
                         let job = if !busy && media.is_empty() {
-                            match receive.blocking_recv() { Some(job) => job, None => return Ok(()) }
+                            match turn.receive(&runtime, receive)? { Some(job) => job, None => return Ok(()) }
                         } else {
                             match receive.try_recv() {
                                 Ok(job) => job,
@@ -738,6 +742,7 @@ fn schedule_inner(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path
                     engine.prefill_capacity(),
                     DECODE_ROWS, probe::verify_rows(&job.probe), true, &mut placement,
                     |placement, chunk, rows, position| {
+                        offer()?;
                         if rows > 1 {
                             engine.prefill_streamed_scoring(placement, chunk, &request_media,
                                 probe::ScoringRows { consumer: &job.probe, position })
@@ -746,8 +751,12 @@ fn schedule_inner(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path
                                 .map(probe::ScoreLogits::Device))
                         }
                     },
-                    |placement, chunk| engine.verify_media_device(&mut [(placement, chunk.len())], chunk, None, Some(&request_media))?
-                        .context("scoring needs every layer"));
+                    |placement, chunk| {
+                        offer()?;
+                        engine.verify_media_device(&mut [(placement, chunk.len())], chunk, None, Some(&request_media))?
+                            .context("scoring needs every layer")
+                    });
+                turn.check()?;
                 match scored {
                     Ok(_) => { let _ = job.events.send(Ok(InferenceChunk::Finish { finish_reason: InferenceFinishReason::Length })); }
                     Err(error) => {
@@ -802,12 +811,16 @@ fn schedule_inner(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path
             }
             // One chunk of each waiting prompt (whole prompts with --decode-share 0).
             let limits = engine.packed_limits();
-            let finished = prefills.round_packed(limits.rows, DECODE_ROWS,
+            let finished = prefills.round_packed_excluding(limits.rows, DECODE_ROWS, turn.prefill_excluded(),
                 |p| packed_chunk(p).map(|(_, rows)| rows),
                 |group, next| crate::shared::prefill_packing::plan(&group.iter().chain([next])
                     .filter_map(packed_chunk).collect::<Vec<_>>(), &limits).is_ok(),
                 |group| {
                     if group.len() > 1 && group.iter().all(|p| packed_chunk(p).is_some()) {
+                        if let Err(error) = offer() {
+                            let reason = error.to_string();
+                            return group.iter().map(|_| Err(anyhow::anyhow!(reason.clone()))).collect();
+                        }
                         let rows: usize = group.iter().filter_map(packed_chunk).map(|(_, rows)| rows).sum();
                         let clock = Instant::now();
                         let outcomes = prefill_group(engine, family, cache, selector, group);
@@ -817,6 +830,7 @@ fn schedule_inner(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path
                         return outcomes;
                     }
                     group.iter_mut().map(|prompt| {
+                        offer()?;
                         if policy.chunk_s.is_none() { return prefill_one(engine, family, cache, selector, prompt); }
                         let rows = prompt.plan.chunks.get(prompt.chunks).copied().unwrap_or(prompt.tokens.len()) - prompt.done;
                         let clock = Instant::now();
@@ -840,6 +854,7 @@ fn schedule_inner(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path
                 }
                 return Err(error);
             }
+            turn.check()?;
             for (mut p, prefilled) in finished {
                 let (slot, placement, resume) = (p.slot, p.placement.clone(), p.resume);
                 if let Err(error) = &prefilled {
@@ -970,6 +985,7 @@ fn schedule_inner(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path
             if !media.is_empty() || !stalled.is_empty() { std::thread::park_timeout(Duration::from_millis(1)); }
             continue;
         }
+        offer()?;
         let cycle = Instant::now();
         let Some(finished) = runtime.block_on(lanes.run_one(|lease| decode_round(lease, engine,
             prefix.mimo_prefix_draft, &mut lane, &mut active, &mut shared, selector, family, cache,

@@ -675,10 +675,14 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
         let devices = engine.census_physical_devices()?;
         opened.startup_probe(&devices, "glm/ready", Some(&census), true)?;
     }
+    let gpu_turn = media.encoder().gpu_turn();
+    let turn = crate::shared::gpu_turn::SchedulerMedia::new(gpu_turn.as_deref())?;
+    let offer = || turn.offer(|| engine.require_live());
     ready();
     crate::shared::api::run_scheduler(|| {
     loop {
         engine.require_live()?;
+        offer()?;
         if let Some(reason) = cuteafd_transport::health::failure_reason() {
             anyhow::bail!("expert wire unavailable until restart: {reason}");
         }
@@ -707,7 +711,7 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
                             cache.tick();
                             publish(stats, requests, generated_total, 0, 0, &cache, &reserve, 0);
                             console::gauges_now(|| console::Gauges::prefix_cache(&cache, 0, 0, 0));
-                            match receive.blocking_recv() {
+                            match turn.receive(runtime, receive)? {
                                 Some(job) => job,
                                 None => return Ok(()),
                             }
@@ -838,6 +842,7 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
                 let scored = probe::score(&opened.library, &job.probe, &tokens, from, prefill_rows,
                     DECODE_ROWS, probe::verify_rows(&job.probe), true, &mut state,
                     |(placement, transport), chunk, rows, position| {
+                        offer()?;
                         let experts = transport.as_deref_mut().map(|t| (t, runtime));
                         if rows > 1 {
                             engine.prefill_streamed_scoring(placement, chunk, experts, &request_media,
@@ -847,8 +852,12 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
                             Ok(engine.prefill_media_device(placement, chunk, experts, 1, Some(&request_media))?.map(probe::ScoreLogits::Device))
                         }
                     },
-                    |(placement, transport), chunk| engine.verify_scoring_media(placement, chunk,
-                        transport.as_deref_mut().map(|t| (t, runtime)), &request_media)?.context("scoring needs every layer"));
+                    |(placement, transport), chunk| {
+                        offer()?;
+                        engine.verify_scoring_media(placement, chunk, transport.as_deref_mut().map(|t| (t, runtime)),
+                            &request_media)?.context("scoring needs every layer")
+                    });
+                turn.check()?;
                 match scored {
                     Ok(_) => { let _ = job.events.send(Ok(InferenceChunk::Finish { finish_reason: InferenceFinishReason::Length })); }
                     Err(error) => { let _ = job.events.send(Err(NativeFailure::Worker(format!("scoring: {error:#}")))); }
@@ -884,12 +893,16 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
         if prefills.due(!active.is_empty()) {
             // One chunk (a lane wave) of each waiting prompt (whole prompts with --decode-share 0).
             let limits = engine.packed_limits();
-            let finished = prefills.round_packed(limits.rows, DECODE_ROWS,
+            let finished = prefills.round_packed_excluding(limits.rows, DECODE_ROWS, turn.prefill_excluded(),
                 |p| packed_chunk(p).map(|(_, rows)| rows),
                 |group, next| crate::shared::prefill_packing::plan(&group.iter().chain([next])
                     .filter_map(packed_chunk).collect::<Vec<_>>(), &limits).is_ok(),
                 |group| {
                     if group.len() > 1 && group.iter().all(|p| packed_chunk(p).is_some()) {
+                        if let Err(error) = offer() {
+                            let reason = error.to_string();
+                            return group.iter().map(|_| Err(anyhow::anyhow!(reason.clone()))).collect();
+                        }
                         return prefill_group(engine, &family, &mut cache, &mut selector, group);
                     }
                     group.iter_mut().map(|p| {
@@ -900,6 +913,7 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
                             p.cancelled = true;
                             anyhow::bail!("client went away");
                         }
+                        offer()?;
                         let timer = Instant::now();
                         let end = p.plan.chunks.get(p.chunks).copied().unwrap_or(p.tokens.len());
                         let chunk = &p.tokens[p.done..end];
@@ -946,6 +960,7 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
                         Ok(if p.done == p.tokens.len() { Chunk::Done } else { Chunk::More })
                     }).collect()
                 });
+            turn.check()?;
             for (mut p, prefilled) in finished {
                 let (slot, placement, resume) = (p.slot, p.placement.clone(), p.resume);
                 if p.cancelled || p.job.events.is_closed() {
@@ -1074,6 +1089,7 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
             }
             continue;
         }
+        offer()?;
         let cycle = Instant::now();
         let Some(finished) = runtime.block_on(lanes.run_one(|lease| decode_round(lease, engine, opened,
             &mut transport, runtime, &mut phases, &mut active, &mut shared, &mut selector, &family, &mut cache,

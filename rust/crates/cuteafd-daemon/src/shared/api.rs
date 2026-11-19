@@ -212,9 +212,15 @@ pub(crate) fn catch_scheduler_panic(work: impl FnOnce() -> anyhow::Result<()>) -
 }
 /// Borrow scheduler request owners from outside `work`, so fatal diagnostics precede channel closure.
 pub(crate) fn run_scheduler(work: impl FnOnce() -> anyhow::Result<()>) -> anyhow::Result<()> {
+    run_scheduler_with_health(work, |reason| cuteafd_transport::health::record_failure(reason))
+}
+
+fn run_scheduler_with_health(work: impl FnOnce() -> anyhow::Result<()>, publish: impl FnOnce(String)) -> anyhow::Result<()> {
     let result = catch_scheduler_panic(work);
     if let Err(error) = &result {
-        tracing::error!(reason = %format_args!("scheduler stopped: {error:#}"));
+        let reason = format!("scheduler stopped: {error:#}");
+        publish(reason.clone());
+        tracing::error!(%reason);
     }
     result
 }
@@ -413,7 +419,7 @@ mod tests {
     }
 
     #[test]
-    fn scheduler_error_is_logged_before_request_owners_close() {
+    fn scheduler_error_is_published_before_request_owners_close() {
         use tracing_subscriber::{layer::SubscriberExt, Layer};
         use std::sync::Mutex;
         struct Observe {
@@ -441,10 +447,15 @@ mod tests {
         let subscriber = tracing_subscriber::registry().with(Observe {
             client: client.clone(), messages: messages.clone(),
         });
-        let result = tracing::subscriber::with_default(subscriber, || run_scheduler(|| {
+        let published = std::cell::RefCell::new(None);
+        let result = tracing::subscriber::with_default(subscriber, || run_scheduler_with_health(|| {
             assert!(!owner.is_closed());
             Err(anyhow::anyhow!("underlying CUDA failure")).context("decode scheduler")
+        }, |reason| {
+            assert!(!client.lock().unwrap().is_closed());
+            published.replace(Some(reason));
         }));
+        assert_eq!(published.into_inner().as_deref(), Some("scheduler stopped: decode scheduler: underlying CUDA failure"));
         assert_eq!(format!("{:#}", result.unwrap_err()), "decode scheduler: underlying CUDA failure");
         let messages = messages.lock().unwrap();
         assert_eq!(messages.len(), 1);
@@ -452,6 +463,14 @@ mod tests {
         assert!(!client.lock().unwrap().is_closed());
         drop(owner);
         assert!(client.lock().unwrap().is_closed());
+    }
+
+    #[test]
+    fn scheduler_panic_publishes_health_without_touching_the_process_latch() {
+        let mut published = None;
+        let result = run_scheduler_with_health(|| panic!("scheduler fixture"), |reason| published = Some(reason));
+        assert!(result.is_err());
+        assert_eq!(published.as_deref(), Some("scheduler stopped: scheduler panicked"));
     }
 
     #[tokio::test]

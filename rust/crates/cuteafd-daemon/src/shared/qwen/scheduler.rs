@@ -36,6 +36,7 @@ pub(crate) struct Prompt {
 
 pub(crate) trait Encoder: EncoderClient {
     fn available(&self) -> bool;
+    fn gpu_turn(&self) -> Option<std::sync::Arc<crate::shared::gpu_turn::GpuTurn>>;
 }
 
 pub(crate) trait Placement: Clone {
@@ -805,6 +806,8 @@ pub(crate) fn schedule<'a, B: Backend<'a>>(engine: &B, snapshot: &std::path::Pat
         && max_sequences <= geometry.slots, "scheduler lanes exceed target decode/state capacity");
     let width = match drafts { Drafts::Neural { depth, .. } => depth, Drafts::None => 0 };
     // Publish readiness only after all fallible scheduler-owned startup work.
+    let gpu_turn = media.encoder().gpu_turn();
+    let turn = crate::shared::gpu_turn::SchedulerMedia::new(gpu_turn.as_deref())?;
     let (family, mut cache, markers, mut grammars, tokenizer, mut selector, mut shared, mut trace, mut prefills) = initialize(|| {
         let (family, cache) = engine.prefix_cache(prefix, max_sequences)?;
         if streamed_scoring {
@@ -837,9 +840,11 @@ pub(crate) fn schedule<'a, B: Backend<'a>>(engine: &B, snapshot: &std::path::Pat
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
     let neural = matches!(drafts, Drafts::Neural { .. });
     let mut kv_waiter = cuteafd_engine::prefix::DeferredAdmission::<MediaReady<Prompt>>::default();
+    let offer = || turn.offer(|| engine.require_live());
     crate::shared::api::run_scheduler(|| {
     loop {
         engine.require_live()?;
+        offer()?;
         if let Some(reason) = cuteafd_transport::health::failure_reason() {
             anyhow::bail!("expert wire unavailable until restart: {reason}");
         }
@@ -860,7 +865,7 @@ pub(crate) fn schedule<'a, B: Backend<'a>>(engine: &B, snapshot: &std::path::Pat
                         publish(stats, requests, generated_total, active.len(), prefills.len(), &cache, media, preparer, &lane.stats,
                             &reserve, stalled.len());
                         let job = if !busy && media.is_empty() {
-                            match receive.blocking_recv() { Some(job) => job, None => return Ok(()) }
+                            match turn.receive(&runtime, receive)? { Some(job) => job, None => return Ok(()) }
                         } else {
                             match receive.try_recv() {
                                 Ok(job) => job,
@@ -1012,15 +1017,19 @@ pub(crate) fn schedule<'a, B: Backend<'a>>(engine: &B, snapshot: &std::path::Pat
                     geometry.decode_rows, probe::verify_rows(&job.probe),
                     streamed_scoring, &mut placement,
                     |placement, chunk, rows, position| {
+                        offer()?;
                         if streamed_scoring {
                             engine.prefill_scoring(placement, chunk, rows, position, &job.probe, cache.pool())
                         } else {
                             Ok(engine.prefill_device(placement, chunk, rows, cache.pool())?.map(probe::ScoreLogits::Device))
                         }
                     },
-                    |placement, chunk| engine.verify_device_ungraphed(&mut [(placement, chunk)], false,
-                        UngraphedKind::Scoring, cache.pool())?
-                        .context("scoring needs every layer"));
+                    |placement, chunk| {
+                        offer()?;
+                        engine.verify_device_ungraphed(&mut [(placement, chunk)], false,
+                            UngraphedKind::Scoring, cache.pool())?.context("scoring needs every layer")
+                    });
+                turn.check()?;
                 match scored {
                     Ok(_) => { let _ = job.events.send(Ok(InferenceChunk::Finish { finish_reason: InferenceFinishReason::Length })); }
                     Err(error) => { let _ = job.events.send(Err(NativeFailure::Worker(format!("scoring: {error:#}")))); }
@@ -1064,12 +1073,16 @@ pub(crate) fn schedule<'a, B: Backend<'a>>(engine: &B, snapshot: &std::path::Pat
             let caching = cache.enabled();
             // One chunk of each waiting prompt (whole prompts with --decode-share 0).
             let limits = engine.checked_packed_limits()?;
-            let finished = prefills.round_packed(limits.map_or(0, |l| l.rows), max_sequences,
+            let finished = prefills.round_packed_excluding(limits.map_or(0, |l| l.rows), max_sequences, turn.prefill_excluded(),
                 |p| packed_chunk(p).map(|(_, rows)| rows),
                 |group, next| limits.is_some_and(|limits| crate::shared::prefill_packing::plan(
                     &group.iter().chain([next]).filter_map(packed_chunk).collect::<Vec<_>>(), &limits).is_ok()),
                 |group| {
                     if group.len() > 1 {
+                        if let Err(error) = offer() {
+                            let reason = error.to_string();
+                            return group.iter().map(|_| Err(anyhow::anyhow!(reason.clone()))).collect();
+                        }
                         return prefill_group(engine, &family, &mut cache, &mut selector, group, neural);
                     }
                     group.iter_mut().map(|p| {
@@ -1080,6 +1093,7 @@ pub(crate) fn schedule<'a, B: Backend<'a>>(engine: &B, snapshot: &std::path::Pat
                     p.cancelled = true;
                     anyhow::bail!("client went away");
                 }
+                offer()?;
                 let timer = Instant::now();
                 let end = p.plan.chunks.get(p.chunks).copied().unwrap_or(p.tokens.len());
                 let chunk = &p.tokens[p.done..end];
@@ -1138,6 +1152,7 @@ pub(crate) fn schedule<'a, B: Backend<'a>>(engine: &B, snapshot: &std::path::Pat
                 Ok(if p.done == p.tokens.len() { Chunk::Done } else { Chunk::More })
                     }).collect()
                 });
+            turn.check()?;
             for (mut p, prefilled) in finished {
                 let (placement, resume) = (p.placement.clone(), p.resume);
                 if let Err(error) = &prefilled {
@@ -1263,6 +1278,7 @@ pub(crate) fn schedule<'a, B: Backend<'a>>(engine: &B, snapshot: &std::path::Pat
             if !media.is_empty() || !stalled.is_empty() { std::thread::sleep(Duration::from_millis(1)); }
             continue;
         }
+        offer()?;
         let cycle = Instant::now();
         let Some(finished) = runtime.block_on(lanes.run_one(|lease| decode_round(lease, engine, &geometry, drafts,
             &mut lane, &mut active, &mut shared, &mut selector, &mut cache, &family, &mut free_slots, &mut trace,

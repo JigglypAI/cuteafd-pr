@@ -57,7 +57,7 @@ impl Ready {
                 let sm=u32::try_from(info.compute_capability_major*10+info.compute_capability_minor)?;
                 let revision=snapshot.file_name().and_then(|s|s.to_str()).context("still tower revision")?;
                 let id=spec.encoder_id(revision,sm);
-                let (service,contribution)=EncoderService::start_coordinator(snapshot,Some((spec,placement.admitted_bytes())),library_path.to_owned(),device,None,None)?;
+                let (service,contribution)=EncoderService::start_coordinator(snapshot,Some((spec,placement.admitted_bytes())),library_path.to_owned(),device,None,crate::shared::gpu_turn::paired_turn(devices.len() > 1))?;
                 push=contribution;
                 (id,Encoder::Local(LocalEncoder::new(service,&processor,width,rows)))
             },

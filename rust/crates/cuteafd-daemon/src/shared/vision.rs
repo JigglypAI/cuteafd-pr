@@ -559,6 +559,13 @@ struct Work {
     encode_ns: Arc<AtomicU64>,
     cancelled: Arc<AtomicBool>,
 }
+struct OwnerPanicHealth<'a>(&'a AtomicBool);
+impl Drop for OwnerPanicHealth<'_> {
+    fn drop(&mut self) {
+        if thread::panicking() { self.0.store(false, Ordering::Release); }
+    }
+}
+
 struct OwnerHealth(Arc<AtomicBool>);
 impl Drop for OwnerHealth {
     fn drop(&mut self) { self.0.store(false, Ordering::Release); }
@@ -600,6 +607,7 @@ pub struct EncoderService {
     pub audio_ledger: Option<cuteafd_ffi::audio::AudioLedger>,
     audio_geometry: Option<cuteafd_core::media::AudioTokenGeometry>,
     healthy: Arc<AtomicBool>,
+    turn: Option<Arc<crate::shared::gpu_turn::GpuTurn>>,
 }
 impl EncoderService {
     pub fn start(
@@ -674,10 +682,12 @@ impl EncoderService {
         let (ready, readiness) = mpsc::sync_channel(1);
         let healthy = Arc::new(AtomicBool::new(false));
         let owner_health = healthy.clone();
+        let owner_turn = turn.clone();
         let owner = thread::Builder::new()
             .name("media-owner".into())
             .spawn(move || {
                 let _health = OwnerHealth(owner_health.clone());
+                let turn = owner_turn;
                 // Query in the allocating owner/context, before loading either tower.
                 let vision_bytes = vision.as_ref().map_or(0, |(_, bytes)| *bytes);
                 let audio_bytes = audio.as_ref().map_or(0, |config| config.admitted_bytes());
@@ -748,6 +758,7 @@ impl EncoderService {
                     let turn = turn.as_deref().map(crate::shared::gpu_turn::GpuTurn::media);
                     // The native owners unwind before the turn if an encode fails or panics.
                     let (mut vision, mut audio) = (runtime.take(), audio_runtime.take());
+                    let _panic_health = OwnerPanicHealth(&owner_health);
                     let result = if turn.as_ref().is_some_and(|turn| turn.closed) {
                         Err(VisionError::Unavailable)
                     } else {
@@ -773,11 +784,12 @@ impl EncoderService {
                     (runtime, audio_runtime) = (vision, audio);
                 }
                 let _turn = turn.as_deref().map(crate::shared::gpu_turn::GpuTurn::media);
+                owner_health.store(false, Ordering::Release);
                 drop((runtime, audio_runtime));
             })?;
         match readiness.recv() {
             Ok(Ok((ledger, audio_ledger, vision_arena, pcm_arena))) => {
-                let owner = Arc::new(push::OwnerThread::new(owner, commit.clone()));
+                let owner = Arc::new(push::OwnerThread::coordinator(owner, commit.clone(), healthy.clone(), turn.clone()));
                 let contribution = push::Contribution::prepare(device, vision_plan.as_ref().zip(vision_arena),
                     pcm_plan.as_ref().zip(pcm_arena), mimo_plan.as_ref().zip(pcm_arena), defer.then_some((commit, acknowledgement, owner.clone())))
                     .map_err(|error| VisionError::Unsupported(error.to_string()))?;
@@ -788,6 +800,7 @@ impl EncoderService {
                 audio_ledger,
                 audio_geometry,
                 healthy,
+                turn,
             }, contribution))
             },
             Ok(Err(error)) => {
@@ -806,6 +819,7 @@ impl EncoderService {
         self.healthy.load(Ordering::Acquire) && self.owner.as_ref().is_some_and(|owner| !owner.is_finished())
     }
     pub fn health_handle(&self) -> Arc<AtomicBool> { self.healthy.clone() }
+    pub(crate) fn gpu_turn(&self) -> Option<Arc<crate::shared::gpu_turn::GpuTurn>> { self.turn.clone() }
     pub fn submit(&self, job: EncodeJob) -> Result<EncoderTicket> {
         self.submit_job(EncoderJob::Vision(job))
     }
@@ -843,6 +857,7 @@ impl EncoderService {
 }
 impl Drop for EncoderService {
     fn drop(&mut self) {
+        self.healthy.store(false, Ordering::Release);
         self.queue.take();
         self.owner.take();
     }
@@ -973,7 +988,7 @@ mod tests {
         let (queue, jobs) = mpsc::sync_channel(2);
         let mut service = EncoderService { queue: Some(queue), owner: None,
             ledger: Default::default(), audio_ledger: None, audio_geometry: None,
-            healthy: Arc::new(AtomicBool::new(true)) };
+            healthy: Arc::new(AtomicBool::new(true)), turn: None };
         let audio_job = || audio::AudioEncodeJob { pcm: vec![0.0; 481].into(),
             output: vec![0; 4096], fp32_scratch: vec![0.0; 4096] };
         assert!(matches!(service.submit_audio(audio_job()), Err(VisionError::Unsupported(_))));

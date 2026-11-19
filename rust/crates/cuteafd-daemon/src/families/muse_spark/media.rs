@@ -430,16 +430,17 @@ impl Ready {
         let mut local_audio = ready_audio.and_then(|audio| audio.local);
         let mut push = vision::push::Contribution::default();
         let shared_local = local_image.is_some() && local_audio.is_some() && image_gpu == audio_gpu;
+        let turn = crate::shared::gpu_turn::paired_turn(args.split_device.is_some() && (local_image.is_some() || local_audio.is_some()));
         if let Some(spec) = local_image.take() {
             let (service, contribution) = EncoderService::start_coordinator(&args.snapshot,
                 Some((spec, admitted.vision.admitted_bytes())), args.native_lib.clone(), image_gpu.context("vision GPU")?,
-                if shared_local { local_audio.take() } else { None }, None)?;
+                if shared_local { local_audio.take() } else { None }, turn.clone())?;
             push.extend(contribution);
             image_encoder = Encoder::Local(LocalEncoder::new(service, &processor, 8192, 4096));
         }
         if let Some(audio) = local_audio {
             let (service, contribution) = EncoderService::start_coordinator(&args.snapshot, None,
-                args.native_lib.clone(), audio_gpu.context("audio GPU")?, Some(audio), None)?;
+                args.native_lib.clone(), audio_gpu.context("audio GPU")?, Some(audio), turn)?;
             push.extend(contribution);
             audio_encoder = Encoder::Local(LocalEncoder::new(service, &processor, 8192, 4096));
         }
