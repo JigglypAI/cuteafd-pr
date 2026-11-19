@@ -31,7 +31,8 @@ CODE = (
     "quantization/hy4_flash/run.py", "quantization/hy4_flash/storage.py",
     "quantization/hy4_flash/gates.py", "quantization/hy4_flash/recipe.py", "quantization/hy4_flash/forward.py",
     "quantization/hy4_flash/source.py", "quantization/hy4_flash/prepare_corpus.py",
-    "quantization/hy4_flash", "quantization/hy4_flash/export.py",
+    "quantization/hy4_flash/parity.py", "quantization/hy4_flash/engram.py",
+    "quantization/hy4_flash/export.py", "quantization/core_export.py",
     "quantization/inkling2/numerical.py",
     "quantization/inkling2/export.py", "quantization/kimi_k3/core_k6/storage.py",
     "quantization/kimi_k3/uniform_k2/storage.py", "quantization/kimi_k3/prepare_corpus.py",
@@ -42,12 +43,30 @@ CODE = (
 SEGMENT_BYTES = 256 * (1 << 20)
 EXPERT_GROUP = 32
 EXPERT_ROWS = 2048
+
+
 def read_json(path):
     return json.loads(path.read_text())
 
 
 def git(*args, cwd=REPO):
     return subprocess.check_output(["git", *args], cwd=cwd, text=True).strip()
+
+
+def verify_preflight(report, corpus_digest):
+    reference_dir = REPO / "python/reference/families/hy4_flash"
+    files = [Path(__file__).with_name("parity.py"), Path(__file__).with_name("forward.py"),
+             reference_dir / "model.py", reference_dir / "golden.py"]
+    hashes = {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in files}
+    if (report.get("schema") != "cuteafd-hy4-forward-parity-v2" or report.get("status") != "passed"
+            or report.get("code_identity") != hashes or report.get("corpus_manifest_sha256") != corpus_digest
+            or report.get("source_revision") != recipe.BASE_REVISION
+            or report.get("reference_revision") != recipe.REFERENCE_REVISION
+            or [r["layer"] for r in report.get("layers", [])] != list(range(recipe.LAYER_COUNT))
+            or len(report.get("head", [])) != 3 or len(report.get("dfly2", [])) != 3
+            or any(len(r["layers"]) != recipe.MTP_LAYER_COUNT for r in report["dfly2"])
+            or {r["tokens"] for r in report.get("context", []) if r["hessian_eligible"] is False} != {2709, 513}):
+        raise ValueError("Hy4 requires completed parity on these source files, calibration corpus and references")
 
 
 def identity(source, corpus, preflight):
@@ -65,15 +84,17 @@ def identity(source, corpus, preflight):
     if lock["revision"] != fork or lock["source_tree_sha256"] != digest:
         raise ValueError("GPTQModel differs from the committed source lock")
     manifest = read_json(corpus / "manifest.json")
+    corpus_digest = hashlib.sha256((corpus / "manifest.json").read_bytes()).hexdigest()
+    verify_preflight(preflight, corpus_digest)
     paths = git("ls-files", "--", *CODE).splitlines()
     return dict(schema="cuteafd-hy4-causal-mc-v2", source_repo=recipe.BASE_REPO,
                 source_revision=recipe.BASE_REVISION, reference_revision=recipe.REFERENCE_REVISION,
                 source_fingerprints=source.source_fingerprints,
-                corpus_manifest_sha256=hashlib.sha256((corpus / "manifest.json").read_bytes()).hexdigest(),
+                corpus_manifest_sha256=corpus_digest,
                 code=dict(fork=fork, files={path: hashlib.sha256((REPO / path).read_bytes()).hexdigest()
                                            for path in paths}),
                 preflight=preflight, dataset=manifest["dataset"], components=manifest["components"],
-                codebook="mul1", codebook_multiplier=recipe.MUL1_MULTIPLIER, expert_minimum_rows=1024,
+                codebook="mul1", codebook_multiplier=recipe.MUL1_MULTIPLIER,
                 seed=787, sigma=.025, expert_bits=4, core_bits=[8, 6],
                 upstream_core_bits=8, calibration="ieee-fp32-reference",
                 covariance=numerical.ACCUMULATION_CONTRACT,
@@ -157,9 +178,6 @@ class Runner:
         self.root.mkdir(parents=True, exist_ok=True)
         self.header = HeaderSource(args.source)
         preflight = read_json(args.preflight)
-        if (preflight.get("status") != "passed" or preflight.get("source_revision") != recipe.BASE_REVISION
-                or preflight.get("reference_revision") != recipe.REFERENCE_REVISION):
-            raise ValueError("Hy4 v2 requires passing pinned reference-forward parity")
         self.policy = dict(include_head=True, include_kv_b=True, k6_drafter_bits=6)
         self.identity = checkpoint_identity(self.root, identity(self.header, args.corpus, preflight))
         self.core = recipe.reviewed_core_modules(
