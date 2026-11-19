@@ -17,7 +17,7 @@ import re
 from pathlib import Path
 
 from v41_spark_tp3_launch_geometry import launch_geometry
-from expert_grouping import native_group_macros, slice_group_rows
+from expert_grouping import native_group_macros, native_slice_group_rows, slice_group_rows
 from mxfp4_layouts import (stored_width, native_slice_width, native_fc1_k_splits,
                           native_prefill, native_prefill_scratch, assert_native_scratch_variant)
 from spark_packages import native_spark_artifacts, native_width_role
@@ -460,7 +460,7 @@ def export(output, capacities, width, atomic_min_capacity=None, role="spark", *,
             dict(
                 name=label,
                 implementation="native_stream" if stream_prefill else "hybrid" if compact else "slices",
-                group_rows=128 if stream_prefill else group_rows,
+                group_rows=native_slice_group_rows(pipeline, group_rows, stream=stream_prefill),
                 compact_group_rows=1 if compact else None,
                 compact_live_rows=min(capacity, compact_live_rows) if compact else None,
                 width=selected_width,

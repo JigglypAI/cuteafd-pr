@@ -1,6 +1,7 @@
 """CPU-only grouping contracts use the actual pinned route/compute authority."""
 import importlib.util
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -19,6 +20,26 @@ def test_group_macro_covers_each_compiled_capacity(capacity):
     macro = grouping.native_group_macros([{"capacity_rows": capacity, "group_rows": 16}])[0]
     assert f"((capacity)=={capacity}) ? 16u" in macro
     assert macro.endswith("0u)")
+
+
+def test_narrow_prefill_grouping_is_emitted_only_for_selected_pipeline():
+    tile = SimpleNamespace(tile_m=128)
+    narrow = SimpleNamespace(narrow_prefill=True, narrow_fc1=tile, narrow_fc2=tile)
+    unselected = SimpleNamespace(narrow_prefill=False, narrow_fc1=None, narrow_fc2=None)
+    legacy = SimpleNamespace()
+    assert grouping.native_slice_group_rows(legacy, 16, stream=False) == 16
+    assert grouping.native_slice_group_rows(unselected, 16, stream=False) == 16
+    assert grouping.native_slice_group_rows(legacy, 16, stream=True) == 128
+    selected = grouping.native_slice_group_rows(narrow, 16, stream=False)
+    macro = grouping.native_group_macros([
+        {"capacity_rows": 1024, "group_rows": 16},
+        {"capacity_rows": 4096, "group_rows": selected},
+    ])[0]
+    assert "((capacity)==1024) ? 16u" in macro
+    assert "((capacity)==4096) ? 128u" in macro
+    narrow.narrow_fc2 = SimpleNamespace(tile_m=64)
+    with pytest.raises(ValueError, match="inconsistent narrow prefill"):
+        grouping.native_slice_group_rows(narrow, 16, stream=False)
 
 
 def test_hybrid_macro_keeps_compiled_tile_and_compact_live_cutoff():
