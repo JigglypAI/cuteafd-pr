@@ -307,6 +307,18 @@ print(json.dumps(capture_real_eight_rank_launch(*map(Path, sys.argv[2:]))))
                 assert!(ledger.budgets.iter().any(|budget| budget.id == "coordinator host RAM"), "{key}");
                 assert!(ledger.phases.iter().any(|row| row.budget == "coordinator host RAM" && row.owned > 0), "{key}");
                 assert!(ledger.phases.iter().all(|phase| phase.owned + phase.opaque <= phase.available));
+            } else if family == "inkling2" {
+                // The joint ledger owns coordinator device planes, not a generic host intake.
+                assert!(report.host_ledger.is_none(), "{key}: unexpected generic host ledger");
+                let planes = deployment.memory_layout.devices.iter()
+                    .filter(|device| device.kind == cuteafd_core::memory_layout::DeviceKind::Rtx)
+                    .flat_map(|device| &device.items)
+                    .filter(|item| item.group == "Spark intake"
+                        && item.category == cuteafd_core::memory_layout::Category::Transport)
+                    .map(|item| item.bytes).sum::<u64>();
+                assert_eq!(planes, intake, "{key}: one admitted intake plane per rank");
+                let ledger = report.phase_ledger.as_ref().expect("Inkling joint physical ledger");
+                assert!(ledger.phases.iter().all(|phase| phase.owned + phase.opaque <= phase.available));
             } else if family != "kimik3" {
                 let host = report.host_ledger.as_ref().expect("full host intake ledger");
                 let (group, expected) = if matches!(family, "mimo" | "mimof" | "mimop") {
