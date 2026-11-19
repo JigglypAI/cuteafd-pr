@@ -105,6 +105,22 @@ top-level `required_features` array of strings (omitted means empty); an engine
 refuses a checkpoint requiring a feature it does not support. No features are
 currently defined. Breaking changes to known fields require a schema bump.
 
+The optional top-level `exl3_codebook` object records the uniform EXL3
+codebook used by a direct MC package. Its fields are `name` and `multiplier`.
+Hy4-flash uses `mul1` with unsigned multiplier `0x83DCD12D` throughout.
+The declaration is advisory. Each indexed projection carries its own scalar
+I32 `.mul1` tensor alongside `.trellis`, `.suh` and `.svh`. The writer
+verifies the scalar's 32-bit value and binds the codebook to each view's
+quantization metadata and the producer identity. Hy4 compact DFly2 target
+matrices follow the view's declared drafter width. The original view carries
+the source-native drafter.
+
+The optional `engram_fp8` inventory records Hy4-flash alternate embedding shards.
+Each 100-byte row has 96 E4M3 codes and a BF16-rounded scale stored as F32.
+Decode multiplies in F32 and casts to BF16. The exporter compares every row
+bitwise with the pinned stock BF16 lookup expression, including signed zero.
+All standard indexes use the original BF16 tables.
+
 Unknown schema versions or variant names, duplicate variants/tensor names,
 invalid hashes, unsafe filenames and incomplete views still fail closed. Core bits
 are exactly 16, 8 and 6 respectively. FP8-origin declarations fail before any

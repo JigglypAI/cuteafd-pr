@@ -10,6 +10,16 @@ results are appended in natural-row order to one contiguous file per expert;
 prompt reads combine only legacy-committed slots with new committed payloads.
 No numerical file, projection receipt or frozen expert receipt is rewritten.
 """
+
+#        / \  //\
+#  |\___/|   /  \\
+#  / O O  \__  /\__/
+# /     /  \_\/
+# HERE BE DRAGONS. Compatibility shim for frozen Inkling runs.
+# This is the wrong design for new quants. Do not copy or use it.
+# It still persists every unsummed expert output. Hy4 copied this mistake.
+# Reduce in memory and recover by replaying sealed expert weights.
+
 from __future__ import annotations
 
 import fcntl

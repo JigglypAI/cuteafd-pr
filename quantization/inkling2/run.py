@@ -294,6 +294,15 @@ class Runner:
         self.reader.clear()
         expert_store = ProjectionStore(self.root/'packed'/label/'experts', self.root/'errors'/'experts',
             self.identity, self.experts, self.progress, numerical, self.device)
+        #        / \  //\
+        #  |\___/|   /  \\
+        #  / O O  \__  /\__/
+        # /     /  \_\/
+        # HERE BE DRAGONS. Frozen Inkling recovery code only.
+        # This is the wrong design for new quants. Do not copy or use it.
+        # It saves every unsummed expert output and rereads it for reduction.
+        # Hy4 copied that mistake even after switching to sequential writes.
+        # Keep the ordered sum in memory and replay sealed expert weights on resume.
         outputs_path = self.root/'routes'/label/'outputs.bf16'
         output_bytes = self.tokens * 8 * 4608 * 2
         scatter_binding_path = outputs_path.with_suffix('.identity.json')

@@ -19,7 +19,7 @@ import struct
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'scripts/lib'))
 import mc_manifest
-from core_export import MCG, SUFFIXES, packed_specs
+from core_export import CODEBOOK_MULTIPLIERS, MCG, MUL1, SUFFIXES, packed_specs
 from kimi_k3.uniform_k2.storage import (
     assemble_shard, atomic_json, canonical, file_identity, fsync_directory, read_header, sha256_file, verify_receipt,
 )
@@ -40,10 +40,11 @@ def tensor_storage_entry(geometry, stored_tensors, *, mcg_multiplier=MCG,
                          mul1_multiplier=None, **extra):
     """Build the common EXL3 record without discarding family-specific fields."""
     entry = dict(quant_format='exl3', bits_per_weight=geometry['bits'],
-                 mcg_multiplier=mcg_multiplier,
                  **{key: geometry[key] for key in
                     ('in_features', 'out_features', 'stored_out_features')},
                  stored_tensors=stored_tensors, **extra)
+    if mcg_multiplier is not None:
+        entry['mcg_multiplier'] = mcg_multiplier
     if mul1_multiplier is not None:
         entry['mul1_multiplier'] = mul1_multiplier
     return entry
@@ -54,12 +55,16 @@ def quantize_config_for_view(quantization_config, **metadata):
     return dict(metadata, **deepcopy(quantization_config))
 
 
-def gptqmodel_mc_view(config, metadata, *, bits, core_bits=None, module_include):
+def gptqmodel_mc_view(config, metadata, *, bits, core_bits=None, module_include, codebook="mcg"):
     """Package MC storage using GPTQModel's declaration and provenance schema."""
     config, metadata = deepcopy(config), deepcopy(metadata)
     previous = config['quantization_config']
     declaration = dict(quant_method='exl3', format='exl3', checkpoint_format='exl3',
                        bits=bits, per_module_metadata=previous['per_module_metadata'])
+    if codebook not in CODEBOOK_MULTIPLIERS:
+        raise ValueError('unknown GPTQModel MC codebook')
+    if codebook != 'mcg':
+        declaration.update(codebook=codebook, codebook_multiplier=CODEBOOK_MULTIPLIERS[codebook])
     if core_bits is not None:
         declaration['core_bits'] = core_bits
     config['quantization_config'] = declaration
@@ -70,7 +75,7 @@ def gptqmodel_mc_view(config, metadata, *, bits, core_bits=None, module_include)
             meta[key] = metadata.pop(key)
     metadata.pop('format', None)
     storage = metadata['tensor_storage']
-    metadata.update(method='exl3', codebook='mcg', out_scales='auto', group_size=-1,
+    metadata.update(method='exl3', codebook=codebook, out_scales='auto', group_size=-1,
                     desc_act=False, module_include=list(module_include),
                     lm_head=any(name == 'lm_head' or name.endswith('.lm_head') or name == 'output'
                                 for name in storage))
@@ -124,11 +129,11 @@ def inventory(root, index_name='model.safetensors.index.json', *, reviewed_paylo
     root = Path(root)
     index = load_json(root / index_name)
     mapping = index['weight_map']
-    headers, specs, sizes = {}, {}, {}
+    headers, bases, specs, sizes = {}, {}, {}, {}
     for shard in sorted(set(mapping.values())):
         if Path(shard).name != shard or not shard.endswith('.safetensors'):
             raise ValueError('index shard must be a safetensors basename')
-        headers[shard], _ = read_header(root / shard)
+        headers[shard], bases[shard] = read_header(root / shard)
     for name, shard in mapping.items():
         value = headers[shard][name]
         specs[name] = (value['dtype'], value['shape'])
@@ -139,7 +144,7 @@ def inventory(root, index_name='model.safetensors.index.json', *, reviewed_paylo
             raise ValueError('source header payload differs from reviewed recipe')
     elif index.get('metadata', {}).get('total_size') != measured:
         raise ValueError('selected index total_size differs from headers')
-    return dict(root=root, index=index, mapping=mapping, headers=headers, specs=specs, sizes=sizes)
+    return dict(root=root, index=index, mapping=mapping, headers=headers, bases=bases, specs=specs, sizes=sizes)
 
 
 def full_parent_inventory(root):
@@ -675,6 +680,103 @@ def audit_ml4(output):
     return {k:v for k,v in receipt.items() if not k.endswith('tensor_sha256')}
 
 
+def _validate_direct_engram(output, manifest, state):
+    """Bind unindexed alternate headers to all-row and streamed write receipts."""
+    engram = manifest.get('engram_fp8')
+    proof = state.get('engram_fp8_proof', {})
+    if state['identity']['family'] != 'hy4_flash':
+        if engram is not None and 'direct_expected_specs' in state:
+            raise ValueError('unexpected Engram alternate in direct package')
+        return
+    from hy4_flash import recipe as hy4
+    if engram is None or proof.keys() != hy4.ENGRAM_TABLES.keys():
+        raise ValueError('Hy4-flash requires all four proven Engram alternates')
+    if {layer['tensor'] for layer in engram['layers']} != hy4.ENGRAM_TABLES.keys():
+        raise ValueError('Engram alternate tensor set differs from the pinned sources')
+    if not engram['recipe'].endswith('; reference=' + hy4.REFERENCE_REVISION):
+        raise ValueError('Engram alternate reference revision differs')
+    table_files = set()
+    for layer in engram['layers']:
+        tensor = layer['tensor']
+        expected_rows = hy4.ENGRAM_TABLES[tensor]
+        verification = proof[tensor]
+        if (verification.get('rows') != expected_rows or verification.get('mismatch_count') != 0
+                or verification.get('reference_dtype') != 'BF16'
+                or verification.get('expression') != 'x + (decoded - x)'):
+            raise ValueError('Engram all-row proof differs')
+        native = state['direct_expected_mappings']['original'][tensor]
+        header, _ = read_header(output / native)
+        if set(header) - {'__metadata__'} != {tensor}:
+            raise ValueError('BF16 Engram shard must contain only its table')
+        if (state['new_shards'][native]['original_tensor_proofs'][tensor]['sha256']
+                != layer['sha256']):
+            raise ValueError('BF16 Engram manifest tensor SHA differs from writer proof')
+        offset = 0
+        for part in layer['parts']:
+            filename = part['file']
+            table_files.add(filename)
+            record = state['new_shards'][filename]
+            header, _ = read_header(output / filename)
+            metadata = header.get('__metadata__', {})
+            spec = header.get(part['tensor'], {})
+            if (record['sha256'] != part['sha256'] or set(header) - {'__metadata__'} != {part['tensor']}
+                    or spec.get('dtype') != 'U8' or spec.get('shape') != [part['rows'], engram['row_bytes']]
+                    or metadata.get('engram_layout') != engram['layout']
+                    or metadata.get('row_start') != str(offset)):
+                raise ValueError('FP8 Engram header or writer receipt differs')
+            offset += part['rows']
+        if offset != expected_rows:
+            raise ValueError('FP8 Engram parts do not cover all source rows')
+    selected_files = {filename for mapping in state['direct_expected_mappings'].values()
+                      for filename in mapping.values()}
+    if selected_files & table_files or set(state['new_shards']) != selected_files | table_files:
+        raise ValueError('Hy4-flash alternate must be physically separate and only in the MC manifest')
+
+
+def _check_direct_markers(output, inv, markers, checked):
+    """Read four bytes per physical scalar, sharing shard handles across modules."""
+    by_shard = {}
+    for name, codebook in markers.items():
+        filename = inv['mapping'][name]
+        if (filename, name) not in checked:
+            offset = inv['headers'][filename][name]['data_offsets'][0]
+            by_shard.setdefault(filename, []).append((offset, name, codebook))
+    for filename, extents in by_shard.items():
+        with (output / filename).open('rb', buffering=0) as stream:
+            for offset, name, codebook in sorted(extents):
+                stream.seek(inv['bases'][filename] + offset)
+                if stream.read(4) != struct.pack('<I', CODEBOOK_MULTIPLIERS[codebook]):
+                    raise ValueError(f'direct {codebook.upper()} multiplier differs: {name}')
+                checked.add((filename, name))
+
+
+def _hy4_markers(inv, quantize, config, core, view):
+    """Require full metadata for every indexed shared expert and compact projection."""
+    if any(value.get('codebook') != 'mul1' or value.get('codebook_multiplier') != MUL1
+           for value in (quantize, config['quantization_config'])):
+        raise ValueError('Hy4 view differs from frozen MUL1 codebook')
+    packed = {name.rsplit('.', 1)[0] for name in inv['mapping'] if name.endswith('.trellis')}
+    if packed != quantize['tensor_storage'].keys():
+        raise ValueError('Hy4 tensor_storage does not cover every selected EXL3 module')
+    markers = {}
+    for module, entry in quantize['tensor_storage'].items():
+        width = entry.get('bits_per_weight')
+        if module not in core and width != 4:
+            raise ValueError('Hy4 routed expert requires K4')
+        if (entry.get('quant_format') != 'exl3' or entry.get('side') != 1
+                or entry.get('mul1_multiplier') != MUL1 or 'mcg_multiplier' in entry):
+            raise ValueError('Hy4 EXL3 module codebook or side differs')
+        geometry = dict(entry, bits=width, codebook='mul1')
+        specs = packed_specs(module, geometry)
+        if set(specs) != set(entry['stored_tensors']) or any(inv['specs'].get(n) != spec for n, spec in specs.items()):
+            raise ValueError('Hy4 packed tensor geometry differs: ' + module)
+        markers[module + '.mul1'] = 'mul1'
+    native = set(inv['mapping']) - {n for e in quantize['tensor_storage'].values() for n in e['stored_tensors']}
+    if native != quantize.get('retained_native_tensors', {}).keys():
+        raise ValueError(f'Hy4 retained-native inventory differs in {view}')
+    return markers
+
+
 def validate(output, *, verification='full'):
     """Validate payloads by default; direct writers may reuse streaming proofs."""
     if verification not in ('full', 'streaming-receipts'):
@@ -683,12 +785,17 @@ def validate(output, *, verification='full'):
     state = load_json(output / 'package-state.json')
     if state['identity']['schema'] != 'cuteafd-core-package-v1':
         raise ValueError('unsupported package receipt')
-    if verification == 'streaming-receipts' and (state['identity'].get('family') != 'inkling2'
+    family = state['identity']['family']
+    if verification == 'streaming-receipts' and (family not in ('inkling2', 'hy4_flash')
             or 'direct_expected_specs' not in state or state.get('copies') != {}):
-        raise ValueError('streaming receipts require an independent direct Inkling package')
-    if (verification == 'streaming-receipts' and set(state['source_tensor_locations'])
-            != set(state['core_tensors']['original'])):
-        raise ValueError('original streaming proof inventory is incomplete')
+        raise ValueError('streaming receipts require an independent direct package')
+    if verification == 'streaming-receipts':
+        source_names = set(state['core_tensors']['original'])
+        if family == 'hy4_flash':
+            source_names.update(n for n in state['direct_expected_specs']['original']
+                                if '.mlp.experts.' not in n)
+        if set(state['source_tensor_locations']) != source_names:
+            raise ValueError('original streaming proof inventory is incomplete')
     for filename, receipt in state['new_shards'].items():
         verify_receipt(output / filename, receipt, checksum=verification == 'full')
     if 'direct_expected_specs' in state:
@@ -699,10 +806,15 @@ def validate(output, *, verification='full'):
                       for filename in state['new_shards'])
         if payload != state['direct_payload_bytes']:
             raise ValueError('direct physical payload differs from committed inventory')
-    family = state['identity']['family']
     if family != 'ml4':
-        mc_manifest.validate(load_json(output / mc_manifest.MANIFEST), output)
+        manifest = mc_manifest.validate(load_json(output / mc_manifest.MANIFEST), output)
+        _validate_direct_engram(output, manifest, state)
+    if family == 'hy4_flash' and (state['identity'].get('codebook') != 'mul1'
+            or state['identity'].get('codebook_multiplier') != MUL1
+            or manifest.get('exl3_codebook') != dict(name='mul1', multiplier=MUL1)):
+        raise ValueError('Hy4 package, manifest and producer must agree on MUL1')
     views = {}
+    checked_markers = set()
     for view, core in state['core_tensors'].items():
         index, config, quantize, _ = mc_manifest.FILES[view]
         inv = inventory(output, index)
@@ -712,24 +824,31 @@ def validate(output, *, verification='full'):
             if inv['specs'] != expected or inv['mapping'] != state['direct_expected_mappings'][view]:
                 raise ValueError('direct selected index differs from committed tensor inventory')
             selected = state['direct_core_selection']
+            markers = (_hy4_markers(inv, q, load_json(output / config), selected, view)
+                       if family == 'hy4_flash' else {})
             for module, geometry in selected.items():
                 if view == 'original':
                     if module in q['tensor_storage']:
                         raise ValueError('original direct view still declares quantized core')
                     continue
                 bits = mc_manifest.FILES[view][3]
+                if view == 'k6-compact' and module in state.get('direct_k6_bit_overrides', {}):
+                    if selected[module].get('group') != 'mtp' or state['direct_k6_bit_overrides'][module] != 8:
+                        raise ValueError('invalid K6 drafter fallback')
+                    bits = 8
+                    original_map = state['direct_expected_mappings']['k8-compact']
+                    if any(inv['mapping'].get(name) != original_map[name]
+                           for name in packed_specs(module, dict(geometry, bits=8))):
+                        raise ValueError('K6 drafter fallback must alias the K8 shard')
                 entry = q['tensor_storage'].get(module, {})
                 if entry.get('bits_per_weight') != bits:
                     raise ValueError('direct compact core metadata width differs')
                 required = packed_specs(module, dict(geometry, bits=bits))
                 if set(entry.get('stored_tensors', {})) != set(required):
                     raise ValueError('direct compact core metadata inventory differs')
-                marker = module + '.mcg'
-                header, base = read_header(output / inv['mapping'][marker])
-                with (output / inv['mapping'][marker]).open('rb') as stream:
-                    stream.seek(base + header[marker]['data_offsets'][0])
-                    if struct.unpack('<I', stream.read(4))[0] != MCG:
-                        raise ValueError('direct compact core MCG multiplier differs')
+                codebook = geometry.get('codebook', 'mcg')
+                markers[module + '.' + codebook] = codebook
+            _check_direct_markers(output, inv, markers, checked_markers)
         declared = {}
         for module, entry in q['tensor_storage'].items():
             for name, tensor in entry['stored_tensors'].items():
