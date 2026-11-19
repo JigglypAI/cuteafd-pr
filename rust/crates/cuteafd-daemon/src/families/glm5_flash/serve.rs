@@ -878,7 +878,12 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
         &memory_boundaries, &reserve, 0);
     ready();
     crate::shared::api::run_scheduler(|| {
+    // Under a head split, media encodes run only between complete engine calls, never against a
+    // half-issued two-GPU step (see gpu_turn). Offered at the top of the loop and before each
+    // prefill and decode round.
+    let mut turn = crate::shared::gpu_turn::GPU_TURN.scheduler(engine.ranks() > 1)?;
     loop {
+        turn.offer()?;
         engine.require_live()?;
         if let Some(reason) = cuteafd_transport::health::failure_reason() {
             anyhow::bail!("expert wire unavailable until restart: {reason}");
@@ -900,7 +905,7 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
                         publish(stats, requests, generated_total, active.len(), prefills.len(), ring_misses, &cache,
                             media, preparer, &lane.stats, &memory_boundaries, &reserve, stalled.len());
                         let job = if !busy && media.is_empty() {
-                            match receive.blocking_recv() { Some(job) => job, None => return Ok(()) }
+                            match turn.idle(|| receive.blocking_recv())? { Some(job) => job, None => return Ok(()) }
                         } else {
                             match receive.try_recv() {
                                 Ok(job) => job,
@@ -1081,6 +1086,7 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
             let caching = cache.enabled();
             // One chunk (a lane wave) of each waiting prompt (whole prompts with --decode-share 0); with
             // --prefill-packing, adjacent prompts whose chunks fit one pass prefill together.
+            turn.offer()?;
             let cx = PrefillCx { engine, library: &opened.library, family: &family, caching,
                 first_prefill_seen: &first_prefill_seen, memory_boundaries: &memory_boundaries };
             let finished = if engine.packs_prefill() {
@@ -1220,6 +1226,7 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
             if !media.is_empty() || !stalled.is_empty() { std::thread::park_timeout(Duration::from_millis(1)); }
             continue;
         }
+        turn.offer()?;
         let cycle = Instant::now();
         let Some(finished) = runtime.block_on(lanes.run_one(|lease| decode_round(lease, engine, opened,
             verify_rows, &mut lane, &mut active, &mut shared, &mut selector, &family, &mut cache, &mut free_kda,

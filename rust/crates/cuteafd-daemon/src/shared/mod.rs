@@ -14,6 +14,7 @@ pub(crate) mod experts;
 pub(crate) mod fault;
 pub(crate) mod fp8_linear;
 pub(crate) mod fp8_load_quant;
+pub(crate) mod gpu_turn;
 pub(crate) mod golden_scores;
 pub(crate) mod host_heap;
 pub(crate) mod inventory;
