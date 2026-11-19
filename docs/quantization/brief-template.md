@@ -46,14 +46,21 @@ These rules come from past runs: Inkling 2, Kimi K3/K3.1, GLM 5.3/Flash, ML4, Mu
 - **Don't use an E4M3-rounded codebook at K6.** **Why:** it failed all 20 pilot tensors at 2.28–2.39× NMSE.
 
 ## 3. Calibration data
-- **Corpus:** the pinned panel `wrldsuksgo2mars/agentic-quant-panel-v1@875ff1d3`, hash-attested. Its calibration, screening and heldout splits are disjoint by group and prompt hash. It's 1,426 prompts, about 1.08M tokens, records of 512–1,024 tokens covering code/agentic, multilingual wiki, math, reasoning-termination and structured/function-call traffic. Every family reuses `quantization/kimi_k3/prepare_corpus.py`.
-  - Optional, TJ's call: add the ExLlamaV3 standard set (`exllamav3/conversion/standard_cal_data`, 250 × 2,048 tokens by default; wiki, C4, code, multilingual, technical, plus 15% random-token rows) as a separate, labelled, hashed component. It adds about 47% tokens.
-  - Its rows are **raw text, not chat-rendered**, and the random rows are calibration-only.
-  - Gate it with a pilot-layer A/B: held-out NMSE plus the §4 recovery distribution, with and without it.
-- **Rendering:** use **this checkpoint's own** tokenizer and chat template. One unpadded prompt per batch, in dataset order. No truncation, padding, sorting or packing. Freeze the template date.
+- **Corpus (TJ 2026-11-19):** the pinned panel `wrldsuksgo2mars/agentic-quant-panel-v2@54683731eb`, hash-attested. It has two components; the **calibration stream is both, in this order**:
+  1. **`agentic`**: the v1 panel, byte for byte (`calibration.jsonl`, `screening.jsonl`, `heldout.jsonl`, `manifest.json`, the parquets). That's 1,426 prompts, about 1.08M tokens, records of 512–1,024 tokens covering code/agentic, multilingual wiki, math, reasoning-termination and structured/function-call traffic.
+     - **Rendering:** chat-rendered, as below.
+     - **Splits:** calibration, screening and heldout, disjoint by group and prompt hash.
+     - **Existing code:** every family's loader (`quantization/kimi_k3/prepare_corpus.py`) still validates it unchanged.
+  2. **`exl3_standard`**: the ExLlamaV3 standard calibration data (C4, code, multilingual, technical, wiki, tiny stories, plus random-token rows), pre-split into ordered segments (`exl3_standard/segments.jsonl`, `data/exl3_standard.parquet`).
+     - **Packing:** pack it with this checkpoint's tokenizer using `reproduction/pack_exl3_standard.py` (contract `exl3-standard-pack-v1`), at the defaults of 250 rows × 2,048 tokens, about 512K tokens. That reproduces ExLlamaV3's `get_default_calibration` exactly: source order, row counts, alternating BOS/EOS article packing, raw-stream slices and seed-0 random rows.
+     - **Raw text, never chat-rendered.** The packed rows are fixed-width, one row per batch, so §3's no-packing rule applies to `agentic` only.
+     - **Calibration only:** it has no screening or heldout split. Random rows aren't language, so they never go into held-out metrics or diagnostics.
+  - **Totals:** together about 1.59M calibration tokens, about 1.47× v1, and activation and Hessian accumulation time scales with it. Record per-component token counts and both hashes (the panel revision and the packed `input_ids_sha256`) in the frozen identity.
+  - **What the panel isn't:** neither component holds model outputs or reasoning traces. Every token is a prompt or raw text, so thinking mode only changes the template's control tokens and the open `<think>` at the end (see below).
+- **Rendering (`agentic`):** use **this checkpoint's own** tokenizer and chat template. One unpadded prompt per batch, in dataset order. No truncation, padding, sorting or packing. Freeze the template date.
   - **Never re-encode rendered text.** Re-encoding erases special-token permissions (`kimi_k3/prepare_corpus.py:143`).
   - Never reuse another model's token IDs.
-- **Thinking/effort mode:** state it explicitly in the addendum. Kimi, GLM and Inkling used effort `max`.
+- **Thinking/effort mode:** state it explicitly in the addendum, as a value the checkpoint's template actually accepts. It only changes the `agentic` prompts' control tokens and generation-prompt ending, so calibrate in the mode the engine serves by default. Kimi, GLM and Inkling used effort `max`.
 - **Long-context witnesses** (past the SWA window or the sparse top-k cutoff) are `hessian_eligible=False`, and used only for parity checks.
   - The panel's longest prompt is about 1.2K tokens, so long attention paths aren't exercised in the Hessians. If the addendum needs them in the Hessians, it must add them explicitly. Otherwise say that they aren't.
 - **Pilot slices** use real prompt **tails**, not prefixes, because prefixes are mostly the shared template preamble (`f48ad65c5b`).
@@ -115,9 +122,9 @@ These rules come from past runs: Inkling 2, Kimi K3/K3.1, GLM 5.3/Flash, ML4, Mu
 
 ## 8. GPU, host and throughput on maxq
 - **maxq's GPU is also the WSL display GPU.**
-  - Don't flood the PCIe/driver queue with huge host↔device ping-pong, or the host hangs: screen, keyboard, ssh and gpu-powerd. `dmesg` shows `dxgkio_escape` floods.
+  - Don't flood the PCIe/driver queue with huge host↔device ping-pong. During Hy4, the host hung (screen, keyboard, ssh, gpu-powerd) with `dxgkio_escape` floods in `dmesg`.
   - Structure work like Kimi's: bounded spans, resident buffers, few syncs.
-  - Pace LDLQ spans with the fork's `GPTQMODEL_EXL3_SPAN_PAUSE_MS=1` (TJ-requested, `43180de6c`): "you are fucking the pci bus… structure it more like kimi".
+  - **No sleep-based pacing.** Hy4's `GPTQMODEL_EXL3_SPAN_PAUSE_MS=1` (`43180de6c`) had no measurable benefit; only a host reboot cleared the hang (TJ 2026-11-19). Don't add pacing, and remove that knob from the fork. If the host wedges, stop cleanly, report it, and let TJ reboot; then resume.
 - **Memory and GPU access:**
   - **Memory:** 94 GiB RAM with no swap, so cap containers at about 80G. Page cache from mmapped scratch counts against the cap.
   - **GPU access:** request GPUs via CDI, not `--gpus`, because `daemon-reload` kills `--gpus` containers. Keep timeouts in the supervisor's process group.
@@ -175,6 +182,7 @@ These rules come from past runs: Inkling 2, Kimi K3/K3.1, GLM 5.3/Flash, ML4, Mu
 - **Hub folder limits:** bundle large diagnostic sets to stay under them (`5b15c6d5d3`).
 
 ## 11. Preflight and pilot gates (report before the full run)
+*(The addendum may replace the separate pilot with production gating, as Hy4 does. When it does, the preflight below still runs, and the full run checks the same bars on its first layers of each kind, stopping on any miss.)*
 - **Preflight:** a full header and source audit over the complete download, with a fail-closed inventory and byte totals. Then the reference-forward match on a few prompts, covering every special path.
 - **Pilot:** representative layers (first dense, first MoE, a mid layer of each attention type, the last layer, and the drafter target). Arms per core module are K8, K6 and keep-native; experts run at the addendum's bits. Keep it under about 15–30 minutes of GPU time. Report:
   - held-out NMSE per arm;
