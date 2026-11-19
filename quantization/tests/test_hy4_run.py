@@ -122,7 +122,9 @@ def test_resident_expert_replay_uses_only_sealed_weights_and_preserves_sum(tmp_p
                  ids=torch.tensor([[2, 1], [0, 1], [1, 2], [0, 2]]),
                  gamma=torch.tensor([[.5, .3], [.3, .2], [.2, .5], [.9, .2]]))
     cpu_routes = Routes([(0, batch)], experts=3, tokens=4)
-    device_routes = Routes([(0, batch)], experts=3, tokens=4, device=device)
+    near = torch.tensor([[0], [2], [0], [1]], dtype=torch.int32)
+    device_routes = Routes([(0, batch | dict(candidate_ids=near, candidate_gamma=torch.ones(4, 1)))],
+                           experts=3, tokens=4, device=device, recover=True)
     layer = SimpleNamespace(prefix="model.layers.1.", index=1)
     runner = run.Runner.__new__(run.Runner)
     runner.device = torch.device(device)

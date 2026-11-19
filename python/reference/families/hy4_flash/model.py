@@ -339,18 +339,25 @@ def dense(x, w, prefix):
                    w, prefix + "down_proj")
 
 
-def routing(x, w, c):
+def routing_scores(x, w, c):
     scores = project(x, w, "mlp.gate").sigmoid()
     choice = scores + w["mlp.gate.e_score_correction_bias"]
     group_scores = choice.reshape(len(x), c.n_group, -1).topk(2, dim=-1).values.sum(dim=-1)
     groups = group_scores.topk(c.topk_group, dim=-1, sorted=False).indices
     valid = torch.zeros_like(group_scores, dtype=torch.bool).scatter_(1, groups, True)
-    ids = choice.masked_fill(~valid.repeat_interleave(scores.shape[-1] // c.n_group, dim=1), -torch.inf).topk(
-        c.num_experts_per_tok, dim=-1, sorted=False).indices
+    return scores, choice.masked_fill(~valid.repeat_interleave(scores.shape[-1] // c.n_group, dim=1), -torch.inf)
+
+
+def native_routes(scores, choice, c):
+    ids = choice.topk(c.num_experts_per_tok, dim=-1, sorted=False).indices
     probs = scores.gather(1, ids)
     if c.norm_topk_prob:
         probs = probs / (probs.sum(dim=-1, keepdim=True) + 1e-20)
     return ids, probs * c.routed_scaling_factor
+
+
+def routing(x, w, c):
+    return native_routes(*routing_scores(x, w, c), c)
 
 
 def feed_forward(x, w, c, index):

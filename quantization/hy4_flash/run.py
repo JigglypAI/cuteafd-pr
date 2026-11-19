@@ -22,7 +22,7 @@ from .export import DirectMCWriter, verify_original_discovery
 from .forward import AttentionTap, Drafter, Layer, Model, Reader, native_projection, recalled_context, reference
 from .prepare_corpus import load_token_batches
 from .source import HeaderSource
-from .storage import Routes, Stages
+from .storage import CANDIDATE_GAMMA_CONTRACT, IDENTITY_CONTRACT, MINIMUM_EXPERT_ROWS, Routes, Stages, candidate_routes
 
 
 REPO = Path(__file__).resolve().parents[2]
@@ -76,7 +76,8 @@ def identity(source, corpus, preflight):
                 seed=787, sigma=.025, expert_bits=4, core_bits=[8, 6],
                 upstream_core_bits=8, calibration="ieee-fp32-reference",
                 covariance=numerical.ACCUMULATION_CONTRACT,
-                expert_rows=EXPERT_ROWS, expert_group=EXPERT_GROUP,
+                expert_rows=EXPERT_ROWS, expert_group=EXPERT_GROUP, minimum_expert_rows=MINIMUM_EXPERT_ROWS,
+                candidate_gamma=CANDIDATE_GAMMA_CONTRACT, expert_identity=IDENTITY_CONTRACT,
                 replay_weights="serialized-exl3-reconstructed-bf16-promoted-fp32",
                 drafter_anchor="last-committed-target-state-k8-head-greedy-bonus")
 
@@ -109,10 +110,14 @@ class Progress:
         print(json.dumps(row), flush=True)
 
 
-def raw(acc):
-    if acc.count == 0:
-        raise ValueError("Hy4 projection has no natural calibration rows")
-    return dict(H=acc.snapshot(), count=acc.count, finalized=False)
+@torch.inference_mode()
+def raw(acc, identity_rows=0):
+    if acc.count + identity_rows == 0:
+        raise ValueError("Hy4 projection has no calibration rows")
+    matrix = acc.snapshot()
+    if identity_rows:
+        matrix.diagonal().add_(identity_rows)
+    return dict(H=matrix, count=acc.count + identity_rows, finalized=False, identity_rows=identity_rows)
 
 
 def reconstruction(values, name, bits, shape, device):
@@ -362,11 +367,17 @@ class Runner:
         if moe:
             def routes():
                 for number, values in self.rows(mlp_stage, "inputs"):
-                    latent, ids, gamma = self.model.moe_route(values["inputs"], layer, project)
-                    yield number, dict(latent=latent, ids=ids, gamma=gamma)
+                    inputs = values["inputs"]
+                    config = self.model.config
+                    scores, choice = reference.routing_scores(inputs, layer.weights, config)
+                    ids, gamma = reference.native_routes(scores, choice, config)
+                    near, near_gamma = candidate_routes(scores, choice, ids, config)
+                    latent = layer.project("mlp.routed_expert_down_proj", inputs, project)
+                    yield number, dict(latent=latent, ids=ids, gamma=gamma,
+                                       candidate_ids=near, candidate_gamma=near_gamma)
             self.save(route_stage, routes)
             spool = Routes(self.stages.records(route_stage), recipe.EXPERTS_PER_LAYER,
-                           sum(len(tokens) for tokens in self.records), device=self.device)
+                           sum(len(tokens) for tokens in self.records), device=self.device, recover=True)
             packed, extra_metrics, expert_stages, combined = self.experts(label, layer, spool)
             del spool
             fit_stages.append(self.core_fit(label + "-latent-up", layer,
@@ -454,6 +465,8 @@ class Runner:
 
     def replay_expert(self, layer, spool, expert, combined, stage, ordinal):
         rows, gamma = spool.expert(expert)
+        if not len(rows):
+            return
         rows, gamma = rows.to(self.device), gamma.to(self.device)
         names = self.expert_names(layer, expert)
         keys = tuple(f"k4.{name}.{suffix}" for name in names for suffix in recipe.SUFFIXES)
@@ -469,28 +482,39 @@ class Runner:
         self.accumulate_expert(combined, rows, gamma, names[2], down, activated)
 
     def expert(self, layer, spool, expert, metrics, combined):
-        rows, gamma = spool.expert(expert)
-        if not len(rows):
-            raise ValueError(f"Hy4 layer {layer.index} expert {expert} has no natural calibration rows")
-        rows, gamma = rows.to(self.device), gamma.to(self.device)
+        selected, coefficients, evidence = spool.calibration(expert)
+        rows, gamma = selected.to(self.device), coefficients.to(self.device)
+        natural = evidence["natural_rows"]
+        identity = evidence["identity_rows"]
+        metric_start = len(metrics)
         names = self.expert_names(layer, expert)
         weights = self.reader.expert_weights(layer.index, expert)
         acc = numerical.covariance_accumulator(weights[0].shape[-1], device=self.device)
-        for part in rows.split(EXPERT_ROWS):
-            acc.add(spool.latent.index_select(0, part))
-        covariance = raw(acc)
+        if len(rows):
+            for part in rows.split(EXPERT_ROWS):
+                acc.add(spool.latent.index_select(0, part))
+        covariance = raw(acc, identity)
         values = {}
         for name, weight in zip(names[:2], weights[:2], strict=True):
             values.update(encode(name, weight.to(self.device), covariance, (4,), self.device, metrics))
         gate, up = (reconstruction(values, name, 4, weight.shape, self.device)
                     for name, weight in zip(names[:2], weights[:2], strict=True))
         acc = numerical.covariance_accumulator(weights[2].shape[-1], device=self.device)
-        for chunk in self.expert_activations(spool, rows, names, gate, up):
-            acc.add(chunk)
-        values.update(encode(names[2], weights[2].to(self.device), raw(acc), (4,), self.device, metrics))
+        if len(rows):
+            activations = self.expert_activations(spool, rows, names, gate, up)
+            # Gamma scales the linear down output in Hy4's native forward. In
+            # its Hessian, scale the input by the same coefficient to measure
+            # the error on that weighted output; gate/up observe latent inputs.
+            for chunk, scale in zip(activations, gamma.split(EXPERT_ROWS), strict=True):
+                acc.add(chunk * scale[:, None])
+        values.update(encode(names[2], weights[2].to(self.device), raw(acc, identity),
+                             (4,), self.device, metrics))
+        for metric in metrics[metric_start:]:
+            metric.update(evidence)
         down = reconstruction(values, names[2], 4, weights[2].shape, self.device)
-        activated = self.expert_activations(spool, rows, names, gate, up)
-        self.accumulate_expert(combined, rows, gamma, names[2], down, activated)
+        if natural:
+            activated = self.expert_activations(spool, rows[:natural], names, gate, up)
+            self.accumulate_expert(combined, rows[:natural], gamma[:natural], names[2], down, activated)
         return values
 
     def recover_complete_group(self, label, successor, **frontier):
