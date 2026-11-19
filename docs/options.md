@@ -796,8 +796,8 @@ without multiplying the scores along the prefix:
   and 0.25 for copies.
 
 Scored drafters can propose their full native block (7 drafts for V4.1).
-Neither branch skips the first position at or below the cutoff: the plan
-includes it as an explore if that position exists. If the round's verify-row
+The plan includes the first position at or below the cutoff as an explore if
+that position exists; there is no separate head skip. If the round's verify-row
 budget cannot fit the plan, the next position of each request's prefix competes
 for rows by the same score or history estimate, highest first.
 
