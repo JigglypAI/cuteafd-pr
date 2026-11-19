@@ -103,6 +103,8 @@ but bounded engineering still goes to Sol. TJ (2026-10-25): Sol is the primary a
 
 ## Writing a brief
 
+Quantization briefs are built from [docs/quantization/brief-template.md](docs/quantization/brief-template.md): copy it whole, then append a **Model addendum** with only the checkpoint's specifics (source, architecture, top-k and routing for low-row recovery, module lists, special tensors, published name). Never restate or weaken a template rule in the addendum.
+
 Hardware-card briefs use `scripts/bench/wip-cards.py`; see
 [WIP hardware cards](docs/wip-cards.md) for the shared kit, arm, probe,
 build and cleanup contract. Two commands cover most briefs; paste them:
