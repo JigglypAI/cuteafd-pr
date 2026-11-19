@@ -1057,11 +1057,11 @@ mod tests {
         let mut policy = DraftHistory::new(spec, DraftControl::History);
         for _ in 0..4 {
             policy.plan(&[(1, 3)], 64);
-            policy.refine(1, 3, Some(&[3., 1., 0.]));
-            policy.observe(&[outcome(1, 3, 1)], false);
+            assert_eq!(policy.refine(1, 3, Some(&[3., -2., 0.])), 2);
+            policy.observe(&[outcome(1, 2, 1)], false);
         }
-        assert_eq!(policy.plan(&[(1, 3)], 64), [2]);
-        policy.refine(1, 2, Some(&[3., 1.]));
+        assert_eq!(policy.plan(&[(1, 3)], 64), [3]);
+        assert_eq!(policy.refine(1, 3, Some(&[3., -2., 0.])), 2);
         let trace = policy.observe(&[outcome(1, 2, 2)], true).unwrap();
         let value = serde_json::to_value(&trace).unwrap();
         assert_eq!(value["policy"], "history");
@@ -1072,13 +1072,13 @@ mod tests {
         assert_eq!(explore["server_reached"], 4);
         assert_eq!(explore["p"], 0.);
         assert_eq!(explore["explore"], true);
-        assert_eq!(explore["head"], 1.);
-        assert!(explore["calibrated"].as_f64().unwrap() > 0.);
+        assert_eq!(explore["head"], -2.);
+        assert_eq!(explore["score"], explore["calibrated"]);
+        assert!(explore["calibrated"].as_f64().unwrap() < TRAINED_HEAD_KEEP_CUT);
         assert_eq!(explore["outcome"], true);
         let snapshot = policy.snapshot();
         assert_eq!(snapshot["positions"][0]["reached"], 5);
-        assert_eq!(snapshot["explored"], 4);
-        // One of five rounds drafted a single position with room for three.
+        assert_eq!(snapshot["explored"], 5);
         assert_eq!((value["rounds"].as_u64(), value["short_rounds"].as_u64()), (Some(5), Some(0)));
         assert_eq!(value["short_share"], 0.);
         assert_eq!(snapshot["short_share"], 0.);
