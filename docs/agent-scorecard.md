@@ -27,6 +27,35 @@ Rubric, each 1–5 (5 best), plus wall time:
 
 ## Log
 
+### 2026-11-19 Spark EXL3 K4 Small-M Duel
+
+On cassowary (GB10, SM121), the scoped Neon R3 candidate `2b033ac4` cuts
+m1–m8 latency 20.43% pooled versus rebuilt rc1 kernels. Inkling2 TP8,
+Step5 TP5 and GLM TP8 improve 23.02%, 16.99% and 21.16%; their geometric
+mean ratios to the nominal one-read floor remain 1.353x, 1.372x and 1.295x.
+A same-session ABBA tie-break puts R3 3.07% ahead of Neon R2, which had
+cut latency 18.32% versus baseline. R3 uses a persistent work-stealing
+kernel for the narrow waves and retains R2's PDL path for larger waves.
+The organizer restricted dispatch to seven measured shard geometries so
+Qwen4 and other unqualified layouts keep the existing kernel.
+
+Fable R1 `ab7ef545` uses the existing cooperative kernel with N128 tiles,
+evict-first staging and two CTAs per SM. It improves latency 13.38% pooled
+(16.41%, 11.62% and 12.03% in the same order), leaving floor ratios of
+1.469x, 1.460x and 1.445x. Both candidates match all 144 production output
+digests and pass all eight prefix and eager/graph checks. A focused rerun
+resolved the two borderline Neon R3 guards on unchanged objects: Inkling2
+m2048 +0.68%, ML4 m128 +0.93%. The final scoped replay showed no overages
+on changed guard objects. No power-cap or thermal-slowdown counter increase
+was observed in the final Neon or Fable timing run.
+
+Neon R1 was disqualified for attempting prohibited hardware checks and
+made no submission. R2 and R3 ran CPU-only in a hardware-denied sandbox
+and delivered kernel-only commits in roughly 28 minutes each. R2's
+projected floor ratios were more optimistic than the organizer's numbers.
+Fable took 3h57m for R1, submitted kernel code only, and correctly separated
+its latency forecast from measurement. [Duel measurements](https://github.com/tpurtell/cuteafd/issues/2511).
+
 ### 2026-11-18 Kimi/Inkling RTX Trellis Decode Duel
 
 [The selective composite](https://github.com/tpurtell/sparkinfer-glmrt/pull/402)
