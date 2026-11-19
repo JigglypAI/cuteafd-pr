@@ -173,6 +173,15 @@ mod tests {
                     ..Default::default() }), ..Default::default()
             };
             let report = testing::BudgetedPlanInput::open(&snapshot)?.plan(&options)?;
+            if key == "inkling2:nvfp4" {
+                // The mixed checkpoint's MXFP8 and NVFP4 rows use incompatible TP8 ownership.
+                assert!(!report.placement_supported && !report.executable(), "{key}: TP8 must be refused");
+                assert!(report.hints.iter().any(|hint| hint.what ==
+                    "mixed Spark packages inkling2:mxfp8 + inkling2:nvfp4a4 require incompatible row ownership at TP8"),
+                    "{key}: wrong refusal: {:?}", report.hints);
+                tested.push(key.clone());
+                continue;
+            }
             if key == "minimax:nvfp4" {
                 // When MiniMax becomes servable, replace this refusal witness with the
                 // complete N8 launch/count-cap chain below rather than silently accepting it.
