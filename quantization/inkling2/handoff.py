@@ -65,7 +65,7 @@ def successful(result, *, importing_files=None, eviction_files=None):
 
 
 def check_plan(plan, revision, files, *, offgrid=False, repo_id=TARGET_REPO,
-               skipped=(), evict_hosts=None):
+               skipped=(), evict_hosts=None, blob_paths=False, keep_ref=None):
     goal = plan.get('goal', {})
     # Native goals retain CLI disk selectors; execution steps use display names.
     disk_names = dict(zip(TARGET_ARGS[:2], TARGETS[:2]))
@@ -94,18 +94,21 @@ def check_plan(plan, revision, files, *, offgrid=False, repo_id=TARGET_REPO,
         for copy in step.get('copies', []):
             path = copy.get('path')
             name = copy.get('name', '')
-            if path == str(refs / 'main'):
-                valid = copy.get('group') == str(refs) and copy.get('size') == len(revision)
+            if path == str(refs / 'main') or (keep_ref and path == str(refs / keep_ref)):
+                ref = Path(path)
+                valid = (copy.get('group') == str(ref.parent) and name == ref.name
+                         and copy.get('size') == len(revision))
             else:
                 relative(name)
-                valid = (name in files and path == str(snapshot / name)
+                physical = model / 'blobs' / files[name]['hub_oid'] if blob_paths and name in files else snapshot / name
+                valid = (name in files and path == str(physical)
                     and copy.get('group') == repo_id and copy.get('size') == files[name]['bytes'])
             if not valid or bool(copy.get('skip')) != (name in skipped):
                 raise ValueError('placement touches an unreviewed file or revision')
     return plan
 
 
-def stage_snapshot(published, stage_root, *, repo_id=TARGET_REPO, family='inkling2'):
+def stage_snapshot(published, stage_root, *, repo_id=TARGET_REPO, family='inkling2', hub_blobs=False, keep_ref=None):
     """Create a conventional HF snapshot using hardlinks only; EXDEV is fatal."""
     if (published.get('status') != 'passed' or published.get('repo_id') != repo_id
             or not re.fullmatch('[0-9a-f]{40,64}', published.get('revision', ''))
@@ -134,41 +137,83 @@ def stage_snapshot(published, stage_root, *, repo_id=TARGET_REPO, family='inklin
         if (file_identity(source) != row['file_identity'] or source.stat().st_dev != row['device']
                 or source.stat().st_dev != device):
             raise ValueError('staging source changed or crosses filesystems; no copy fallback')
+    if hub_blobs:
+        blob_rows = {}
+        for row in published['files'].values():
+            oid = row.get('hub_oid')
+            if (not isinstance(oid, str) or not re.fullmatch(r'(?:[a-f0-9]{40}|[a-f0-9]{64})', oid)
+                    or oid != row['sha256' if len(oid) == 64 else 'git_blob']):
+                raise ValueError('staging requires verified Hub blob OIDs')
+            old = blob_rows.setdefault(oid, row)
+            if old['sha256'] != row['sha256'] or old['bytes'] != row['bytes']:
+                raise ValueError('conflicting publication rows for one blob')
     atomic_json(owner, stamp)
     repo = stage_root / ('models--' + repo_id.replace('/', '--'))
     snapshot = repo / 'snapshots' / published['revision']
     if any(p.is_symlink() for p in (snapshot, *snapshot.parents)):
         raise ValueError('stage directories cannot traverse symlinks')
-    if repo.exists() and {p.name for p in repo.iterdir()} - {'snapshots', 'refs'}:
+    allowed = {'snapshots', 'refs', 'blobs'} if hub_blobs else {'snapshots', 'refs'}
+    if repo.exists() and {p.name for p in repo.iterdir()} - allowed:
         raise ValueError('unexpected files in owned HF staging repository')
     if (repo / 'snapshots').exists() and {p.name for p in (repo / 'snapshots').iterdir()} - {published['revision']}:
         raise ValueError('unexpected revision in owned HF staging repository')
     snapshot.mkdir(parents=True, exist_ok=True)
-    if any(p.is_symlink() for p in snapshot.rglob('*')) or {
-            p.relative_to(snapshot).as_posix() for p in snapshot.rglob('*') if p.is_file()} - set(published['files']):
-        raise ValueError('unexpected files in staged snapshot')
+    for p in snapshot.rglob('*'):
+        if (p.is_symlink() or not p.is_dir()) and p.relative_to(snapshot).as_posix() not in published['files']:
+            raise ValueError('unexpected files in staged snapshot')
+    if hub_blobs:
+        blobs = repo / 'blobs'
+        if blobs.is_symlink() or (blobs.exists() and {p.name for p in blobs.iterdir()} - blob_rows.keys()):
+            raise ValueError('unexpected staged HF blobs')
+        blobs.mkdir(exist_ok=True)
+        for oid, row in blob_rows.items():
+            blob = blobs / oid
+            if blob.is_symlink() or (blob.exists() and not blob.samefile(row['path'])):
+                raise ValueError('existing stage blob is not the published hardlink')
+            if not blob.exists():
+                os.link(row['path'], blob)
+            if file_identity(blob) != row['file_identity']:
+                raise ValueError('staged Hub blob identity changed')
     for name, row in published['files'].items():
         source, target = Path(row['path']), snapshot / name
-        if any(p.is_symlink() for p in (target, *target.parents)):
-            raise ValueError('stage file cannot traverse symlinks')
+        if any(p.is_symlink() for p in target.parents):
+            raise ValueError('stage file cannot traverse symlink parents')
         target.parent.mkdir(parents=True, exist_ok=True)
-        if target.exists():
-            if not os.path.samefile(source, target):
-                raise ValueError('existing stage file is not the published hardlink')
+        if hub_blobs:
+            link = os.path.relpath(blobs / row['hub_oid'], target.parent)
+            if target.is_symlink() and os.readlink(target) == link:
+                continue
+            if target.exists() or target.is_symlink():
+                raise ValueError('existing snapshot link differs from verified Hub OID')
+            target.symlink_to(link)
         else:
-            os.link(source, target)  # Never copy/reflink/download behind the caller's back.
-        if file_identity(target) != row['file_identity']:
-            raise ValueError('stage hardlink identity changed')
+            if target.is_symlink() or (target.exists() and not source.samefile(target)):
+                raise ValueError('existing stage file is not the published hardlink')
+            if not target.exists():
+                os.link(source, target)
+            if file_identity(target) != row['file_identity']:
+                raise ValueError('stage hardlink identity changed')
     refs = repo / 'refs'
-    if refs.is_symlink() or (refs.exists() and {p.name for p in refs.iterdir()} - {'main'}):
+    wanted = {'main'}
+    if keep_ref is not None:
+        if not re.fullmatch(r'keep/[a-zA-Z0-9_-]+', keep_ref):
+            raise ValueError('unsafe pinned revision ref')
+        wanted.add(keep_ref)
+    if refs.is_symlink() or any(p.is_symlink() or p.relative_to(refs).as_posix() not in (
+            wanted | ({'keep'} if keep_ref else set())) for p in refs.rglob('*')):
         raise ValueError('unexpected staged HF refs')
-    refs.mkdir(exist_ok=True)
-    main = refs / 'main'
-    if main.is_symlink() or (main.exists() and main.read_text() != published['revision']):
-        raise ValueError('existing stage main ref differs')
-    with main.open('w') as stream:
-        stream.write(published['revision']); stream.flush(); os.fsync(stream.fileno())
-    fsync_directory(refs)
+    for name in sorted(wanted):
+        ref = refs / name
+        ref.parent.mkdir(parents=True, exist_ok=True)
+        if ref.exists():
+            if not ref.is_file() or ref.read_bytes() != published['revision'].encode('ascii'):
+                raise ValueError('existing staged ref differs from publication')
+        else:
+            with ref.open('xb') as stream:
+                stream.write(published['revision'].encode('ascii'))
+                stream.flush()
+                os.fsync(stream.fileno())
+            fsync_directory(ref.parent)
     return repo
 
 
@@ -226,7 +271,11 @@ def run_job(root, state_path, state, call, key, command, *, job_description=None
             state[intent] = job_description
             atomic_json(state_path, state)
         if number is None:
-            number = call(*command).get('job')
+            submission = call(*command)
+            number = submission.get('job')
+            if isinstance(number, dict):  # Native apply --wait returned the terminal job.
+                terminal = successful(submission, **checks)
+                number = terminal['job'].get('id')
         if type(number) is not int or number <= 0:
             raise ValueError('native job id missing')
         state[key] = number
@@ -414,14 +463,15 @@ def retain_metadata(root, identity, leaves, *, family='inkling2'):
 
 
 def retire(root, *, intermediates=(), build_root=None, inspect=assert_unused, repo_id=TARGET_REPO,
-           family='inkling2', build_prefix='inkling2-', verified_staging=None):
+           family='inkling2', build_prefix='inkling2-', verified_staging=None,
+           placement_check='one_copy_per_file'):
     """Retain receipts, then delete explicit payload leaves after native placement."""
     root = Path(root).resolve()
     published, complete = (load(root / n) for n in ('publication-complete.json', 'handoff-complete.json'))
     identity = {k: published[k] for k in ('repo_id', 'revision', 'manifest_sha256')}
     if (published.get('repo_id') != repo_id or published.get('status') != 'passed'
             or complete.get('status') != 'passed'
-            or complete.get('identity') != identity or complete.get('one_copy_per_file') is not True):
+            or complete.get('identity') != identity or complete.get(placement_check) is not True):
         raise ValueError('verified matching handoff is required for retirement')
     output, stage = Path(published['output']), Path(complete['stage_root'])
     if stage.exists() and load(stage / f'.{family}-owned-stage.json') != identity:

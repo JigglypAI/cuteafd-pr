@@ -336,7 +336,11 @@ def publish(output, root, *, api=None, anonymous_api=None, fetch_metadata=None, 
         revision = _field(head, 'sha')
         published_files = _attribute_files(api, revision, packet['files'], root, fetch_metadata, repo_id=repo_id)
         verify_hub(api, revision, published_files, repo_id=repo_id)
-        verify_hub(anonymous_api, revision, published_files, repo_id=repo_id)
+        verified = verify_hub(anonymous_api, revision, published_files, repo_id=repo_id)
+        for entry in _field(verified, 'siblings'):
+            lfs = _field(entry, 'lfs')
+            oid = _field(lfs, 'sha256') if lfs is not None else _field(entry, 'blob_id')
+            published_files[_field(entry, 'rfilename')]['hub_oid'] = oid
         record = dict(schema=target.schema('complete'), status='passed',
             repo_id=repo_id, revision=revision, url=f'https://huggingface.co/{repo_id}/tree/{revision}',
             output=str(output), identity=packet['identity'], source_snapshot=packet['source_snapshot'],
