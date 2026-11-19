@@ -748,7 +748,7 @@ impl EncoderService {
                     let turn = turn.as_deref().map(crate::shared::gpu_turn::GpuTurn::media);
                     // The native owners unwind before the turn if an encode fails or panics.
                     let (mut vision, mut audio) = (runtime.take(), audio_runtime.take());
-                    let result = if turn.as_ref().is_some_and(|turn| turn.stalled) {
+                    let result = if turn.as_ref().is_some_and(|turn| turn.closed) {
                         Err(VisionError::Unavailable)
                     } else {
                         encode_live(&work.cancelled, &work.encode_ns, || match work.job {

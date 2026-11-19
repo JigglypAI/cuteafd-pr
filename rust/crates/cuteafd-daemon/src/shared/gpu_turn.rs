@@ -16,6 +16,7 @@ struct State {
     media_waiting: bool,
     media_deadline: Option<Instant>,
     stalled: bool,
+    closed: bool,
 }
 
 pub(crate) struct GpuTurn {
@@ -99,13 +100,10 @@ impl GpuTurn {
         }
         state.media_waiting = false;
         state.media_deadline = Some(Instant::now() + self.stall);
-        let stalled = state.stalled;
+        let closed = state.stalled || state.closed;
         self.changed.notify_all();
         self.idle_changed.notify_one();
-        MediaTurn {
-            turn: self,
-            stalled,
-        }
+        MediaTurn { turn: self, closed }
     }
 
     async fn watch_idle(&self) -> MediaStalled {
@@ -139,17 +137,19 @@ impl SchedulerTurn<'_> {
     }
 
     /// Call only between complete submissions. If the owner is not waiting, retain the turn.
-    pub(crate) fn offer(&self) -> Result<(), MediaStalled> {
+    pub(crate) fn offer(&self) -> Result<Duration, MediaStalled> {
         {
             let mut state = self.0.lock();
             self.0.check(&mut state)?;
             if !state.media_waiting {
-                return Ok(());
+                return Ok(Duration::ZERO);
             }
             state.scheduler = false;
         }
+        let started = Instant::now();
         self.0.changed.notify_all();
-        self.0.take()
+        self.0.take()?;
+        Ok(started.elapsed())
     }
 
     /// Allow media while idle, but report a stall even if no request wakes the scheduler.
@@ -167,13 +167,18 @@ impl SchedulerTurn<'_> {
 
 impl Drop for SchedulerTurn<'_> {
     fn drop(&mut self) {
-        self.0.release();
+        {
+            let mut state = self.0.lock();
+            state.closed = true;
+            state.scheduler = false;
+        }
+        self.0.changed.notify_all();
     }
 }
 
 pub(crate) struct MediaTurn<'a> {
     turn: &'a GpuTurn,
-    pub(crate) stalled: bool,
+    pub(crate) closed: bool,
 }
 
 impl Drop for MediaTurn<'_> {
@@ -232,6 +237,23 @@ mod tests {
     }
 
     #[test]
+    fn scheduler_exit_allows_teardown_but_not_a_queued_encode() {
+        let turn = Arc::new(GpuTurn::new());
+        let scheduler = turn.scheduler().unwrap();
+        let owner = {
+            let turn = turn.clone();
+            thread::spawn(move || {
+                let media = turn.media();
+                assert!(media.closed);
+                assert!(!turn.lock().scheduler);
+            })
+        };
+        until_waiting(&turn);
+        drop(scheduler);
+        owner.join().unwrap();
+    }
+
+    #[test]
     fn idle_reports_stall_before_receiving_a_request_or_joining_media() {
         let turn = Arc::new(GpuTurn::with_stall(Duration::from_millis(50)));
         let scheduler = turn.scheduler().unwrap();
@@ -270,6 +292,6 @@ mod tests {
             turn.scheduler().is_err(),
             "late completion must not hide a stall"
         );
-        assert!(turn.media().stalled, "a stalled turn stays terminal");
+        assert!(turn.media().closed, "a stalled turn stays terminal");
     }
 }
