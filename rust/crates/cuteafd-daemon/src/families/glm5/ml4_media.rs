@@ -91,7 +91,7 @@ impl ReadyVision {
                 &[cuteafd_core::serving_capacity::MemoryReservation { name: "vision.resident_weights_scratch".into(),
                     bytes: admitted }], cuteafd_loader::placement::reserve::gpu("glm5"))?;
             // The LM recipe charges this tower explicitly after its early allocation.
-            Ok(crate::shared::vision::EncoderService::start_coordinator(&args.snapshot, Some((spec, admitted)), args.native_lib.clone(), gpu, None)?)
+            Ok(crate::shared::vision::EncoderService::start_coordinator(&args.snapshot, Some((spec, admitted)), args.native_lib.clone(), gpu, None, None)?)
         })();
         let restored = library.cuda_set_device(args.device);
         let (service, push) = loaded?;
