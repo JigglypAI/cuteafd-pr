@@ -203,8 +203,12 @@ These rules come from past runs: Inkling 2, Kimi K3/K3.1, GLM 5.3/Flash, ML4, Mu
 - **Off limits:** don't touch power settings, raptor's GPUs or the serving Sparks.
 
 ## 13. Code delivery and report
-- **Engine code:** `quantization/<family>/`, `mc_package.py` changes, docs and tests go on a branch, with a PR against `dev` (`scripts/dev/pr-sync init`). Keep it pushed during the run; main reviews and merges.
-- **GPTQModel changes:** merged to fork main and pushed before encoding. The engine PR bumps the pin and lock, and main merges it after the quant.
+- **Nothing lives only on maxq.** Push every green step. Code that exists only in a local checkout or a run directory is lost work: the next quant can't reuse it, and main can't review it.
+- **Engine code:** `quantization/<family>/`, `mc_package.py` changes, docs and tests go on a branch, with a PR against **cuteafd `dev`** (`scripts/dev/pr-sync init`). Main reviews and merges; the quant agent never merges.
+  - **Merge incrementally.** Once a part is proven (its tests pass and the run uses it), main merges it to dev during the run. Shared fixes (I/O, recovery, numerics) especially shouldn't wait for the quant to finish. The final PR carries what's left: the export, the card and the receipts.
+- **GPTQModel changes:** merged to **`tpurtell/GPTQModel` main** and pushed *before* the encode that uses them. The engine branch bumps the `third_party/gptqmodel` pin and `third_party/gptqmodel.lock.json` to that main commit in the same PR. Production refuses anything else.
+  - **Removals count too.** Deleting a knob or a dead path is a fork-main commit plus a pin bump, like any other change.
+- **Before the final report,** list the open PRs, the fork-main commits and the pin state: dev's pin vs. fork main, from `git ls-remote`.
 - **Report** on a GitHub issue:
   - per-layer time and total;
   - sizes per view;
