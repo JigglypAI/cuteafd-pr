@@ -1864,6 +1864,7 @@ def capture_real_eight_rank_launch(snapshot: Path, deployment_path: Path, tempor
         listener.bind(("127.0.0.1", 0))
         api_port = listener.getsockname()[1]
     keys = (f"ADDR=127.0.0.1:{api_port}\nSPARK_COUNT=8\nSPECULATOR=off\nVISION=off\nAUDIO=off\nMODEL_REVISION=\n"
+            "COORDINATOR_DOCKER_INFERENCE=coordinator:test\nSPARK_EXPERT_DOCKER_INFERENCE=spark:test\n"
             "MAX_CONTEXT_TOKENS=262144\nMAX_OUTPUT_TOKENS=32768\nHOST_CACHE_BYTES=0\nPOOL_TOKENS=262144\n"
             f"RTX_GPUS={deployment['rtx_gpus']}\nSPARK_HOSTS=" +
             ",".join(f"worker-{rank}" for rank in range(8)) + "\n")
@@ -1877,7 +1878,7 @@ def capture_real_eight_rank_launch(snapshot: Path, deployment_path: Path, tempor
         checkpoint_source=snapshot,
         extra_env={"STUB_REAL_DEPLOYMENT": str(deployment_path),
                    "STUB_SPARK_ROLES": "tp2;tp3;tp6;tp8", "CUTEAFD_CDI_CHECK": "off"})
-    assert result.returncode == 0, result.stderr
+    assert result.returncode == 0, result.stderr + result.stdout
     lines = _coordinator_launches(result.stderr)
     assert len(lines) == 1, result.stderr
     tokens = lines[0]
