@@ -1130,7 +1130,15 @@ if os.environ.get("STUB_REAL_PLANNER"):
     print(result.stderr, end="", file=sys.stderr)
     sys.exit(result.returncode)
 if os.environ.get("STUB_REAL_DEPLOYMENT"):
-    print(open(os.environ["STUB_REAL_DEPLOYMENT"]).read())
+    with open(os.environ["STUB_REAL_DEPLOYMENT"]) as stream:
+        deployment = json.load(stream)
+    if os.environ.get("STUB_APPLY_CLI_SETTINGS") == "1":
+        # The Rust fixture supplies the plan; the CLI normally adds resolved settings.
+        resolved = fake_resolved_settings(args, deployment["family"], deployment["spark_ranks"])
+        if deployment["family"] == "glm5_flash" and deployment.get("replay_records"):
+            resolved["replay_records"]["value"] = deployment["replay_records"]
+        deployment.setdefault("resolved_settings", resolved)
+    print(json.dumps(deployment))
     sys.exit(0)
 def value(flag, default=None):
     return args[args.index(flag) + 1] if flag in args else default
@@ -1877,7 +1885,8 @@ def capture_real_eight_rank_launch(snapshot: Path, deployment_path: Path, tempor
         physical_gpus=tuple(range(deployment["rtx_gpus"])), root_launcher=True,
         checkpoint_source=snapshot,
         extra_env={"STUB_REAL_DEPLOYMENT": str(deployment_path),
-                   "STUB_SPARK_ROLES": "tp2;tp3;tp6;tp8", "CUTEAFD_CDI_CHECK": "off"})
+                   "STUB_APPLY_CLI_SETTINGS": "1", "STUB_SPARK_ROLES": "tp2;tp3;tp6;tp8",
+                   "CUTEAFD_CDI_CHECK": "off"})
     assert result.returncode == 0, result.stderr + result.stdout
     lines = _coordinator_launches(result.stderr)
     assert len(lines) == 1, result.stderr
