@@ -23,7 +23,7 @@
 //! at its last chunk; a decode whose client left is not retained.
 //! `prompt_cache_hit_tokens` reports the restored rows; `/v1/stats` carries
 //! the cache's counters.
-use crate::shared::gpu_turn::{GpuTurn, MediaStalled};
+use crate::shared::gpu_turn::GpuTurn;
 use crate::shared::draft::history::{self, Policy as DraftPolicy, Proposal};
 use super::engine::{GlmfEngine, GlmfPlacement, DECODE_ROWS, PAGE_ROWS, WIDE_DECODE_ROWS};
 use super::prefix::{GlmfPrefix, PrefixMarks};
@@ -883,10 +883,12 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
     publish(stats, requests, generated_total, 0, 0, ring_misses, &cache, media, preparer, &lane.stats,
         &memory_boundaries, &reserve, 0);
     let turn = gpu_turn.map(GpuTurn::scheduler).transpose()?;
+    let excluded = std::cell::Cell::new(Duration::ZERO);
     let offer = || -> Result<()> {
         if let Some(turn) = &turn {
             engine.require_live()?;
-            turn.offer()?;
+            let waited = turn.offer()?;
+            excluded.set(excluded.get() + waited);
         }
         Ok(())
     };
@@ -1054,6 +1056,7 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
                 let scored = probe::score(&opened.library, &job.probe, &tokens, from, engine.prefill_capacity(),
                     DECODE_ROWS, probe::verify_rows(&job.probe), true, &mut placement,
                     |placement, chunk, rows, position| {
+                        offer()?;
                         if rows > 1 {
                             engine.prefill_streamed_scoring(placement, chunk, &request_media,
                                 probe::ScoringRows { consumer: &job.probe, position })
@@ -1062,8 +1065,12 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
                             Ok(engine.prefill_media_device(placement, chunk, &request_media)?.map(probe::ScoreLogits::Device))
                         }
                     },
-                    |placement, chunk| engine.verify_media_device(&mut [(placement, chunk.len())], chunk, &request_media)?
-                        .context("scoring needs every layer"));
+                    |placement, chunk| {
+                        offer()?;
+                        engine.verify_media_device(&mut [(placement, chunk.len())], chunk, &request_media)?
+                            .context("scoring needs every layer")
+                    });
+                if let Some(turn) = &turn { turn.check()?; }
                 match scored {
                     Ok(_) => { let _ = job.events.send(Ok(InferenceChunk::Finish { finish_reason: InferenceFinishReason::Length })); }
                     Err(error) => { let _ = job.events.send(Err(NativeFailure::Worker(format!("scoring: {error:#}")))); }
@@ -1097,6 +1104,7 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
                 started: Instant::now(), busy: 0.0, phases: [0.0; 3], packed: 0, ticket });
         }
         if prefills.due(!active.is_empty()) {
+            excluded.set(Duration::ZERO);
             let caching = cache.enabled();
             // One chunk (a lane wave) of each waiting prompt (whole prompts with --decode-share 0); with
             // --prefill-packing, adjacent prompts whose chunks fit one pass prefill together.
@@ -1104,7 +1112,7 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
                 first_prefill_seen: &first_prefill_seen, memory_boundaries: &memory_boundaries, offer: &offer };
             let finished = if engine.packs_prefill() {
                 let limits = engine.packed_limits();
-                prefills.round_packed(limits.rows, DECODE_ROWS,
+                prefills.round_packed_excluding(limits.rows, DECODE_ROWS, &excluded,
                     |p| packs(p).then(|| chunk_end(p) - p.done), |group, next| packable(group, next, &limits),
                     |group| if group.len() == 1 {
                         vec![prefill_chunk(&cx, &mut selector, &mut cache, &mut group[0])]
@@ -1112,7 +1120,7 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
                         prefill_group(&cx, &mut selector, &mut cache, group)
                     })
             } else {
-                prefills.round(|p| prefill_chunk(&cx, &mut selector, &mut cache, p))
+                prefills.round_excluding(&excluded, |p| prefill_chunk(&cx, &mut selector, &mut cache, p))
             };
             // The queue reports per-prompt errors, but a turn stall must stop the entire engine.
             if let Some(turn) = &turn { turn.check()?; }
@@ -1287,8 +1295,8 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
     }
     }).inspect_err(|error| {
         // The owner may still be blocked in CUDA, so the scheduler's join is not a health signal.
-        if let Some(stall) = error.downcast_ref::<MediaStalled>() {
-            cuteafd_transport::health::record_failure(stall.to_string());
+        if turn.is_some() {
+            cuteafd_transport::health::record_failure(format!("scheduler stopped: {error:#}"));
         }
     })
 }
