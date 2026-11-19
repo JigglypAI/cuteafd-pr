@@ -1583,8 +1583,12 @@ mod tests {
         assert_eq!(published.len(), compact.entries.len());
         let index = std::fs::read_to_string(root.join("benchmarks/README.md")).unwrap();
         for entry in &compact.entries {
+            // A re-carded view keeps its smoke entry name and adds a `-recard` suffix.
             let suffix = format!("-{}", entry.name);
-            let dir = published.iter().find(|path| path.to_string_lossy().ends_with(&suffix))
+            let dir = published.iter().find(|path| {
+                let path = path.to_string_lossy();
+                path.ends_with(&suffix) || path.ends_with(&format!("{suffix}-recard"))
+            })
                 .unwrap_or_else(|| panic!("{} is missing from mc_views", entry.name));
             assert!(root.join(dir).join("card.svg").is_file());
             assert!(index.contains(&link(dir.strip_prefix("benchmarks").unwrap(), "report.svg")));
