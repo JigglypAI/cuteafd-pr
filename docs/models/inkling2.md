@@ -52,3 +52,9 @@ MXFP8 W8A8, NVFP4 W4A4 and EXL3 trellis.
 
 Serving status, layouts, configs and measurements land here stage by stage;
 see the tracking issue for the current state.
+
+## Changelog
+
+| Release | Date | Changes | Cards |
+| --- | --- | --- | --- |
+| v6 | 2026-11-19 | Native NVFP4 and MXFP8, EXL3 multi-core views, bundled drafter, and dual-RTX serving. | [NVFP4 1 RTX](../../benchmarks/inkling2/2026-11-19-smoke-inkling-2-small-1rtx-4spark-inkling2-nvfp4-min/report.svg), [EXL3 1 RTX](../../benchmarks/inkling2/2026-11-19-smoke-inkling-2-small-exl3-k4-mc-1rtx-4spark-inkling2-exl3-min/report.svg), [EXL3 2 RTX](../../benchmarks/inkling2/2026-11-19-smoke-inkling-2-small-exl3-k4-mc-2rtx-6spark-inkling2-exl3-max/report.svg), [MXFP8 2 RTX](../../benchmarks/inkling2/2026-11-19-smoke-inkling-2-small-mxfp8-2rtx-4spark-inkling2-mxfp8-max/report.svg) |
