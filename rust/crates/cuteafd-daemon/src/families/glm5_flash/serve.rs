@@ -23,7 +23,7 @@
 //! at its last chunk; a decode whose client left is not retained.
 //! `prompt_cache_hit_tokens` reports the restored rows; `/v1/stats` carries
 //! the cache's counters.
-use crate::shared::gpu_turn::GpuTurn;
+use crate::shared::gpu_turn::SchedulerMedia;
 use crate::shared::draft::history::{self, Policy as DraftPolicy, Proposal};
 use super::engine::{GlmfEngine, GlmfPlacement, DECODE_ROWS, PAGE_ROWS, WIDE_DECODE_ROWS};
 use super::prefix::{GlmfPrefix, PrefixMarks};
@@ -297,13 +297,8 @@ fn serve_loop(mut args: super::EngineArgs, mut receive: mpsc::Receiver<NativeReq
     args.serving_media_bytes = bytes as u64;
     let prepared = std::cell::RefCell::new(None);
     let mut ready = Some(ready);
-    let gpu_turn = std::cell::OnceCell::new();
     let result = opened.with_engine_media(&args, |split_device| {
-        use cuteafd_loader::plan::encoder::EncoderKind;
-        let local = args.serving_encoder.as_ref().is_some_and(|p| matches!(p.kind, EncoderKind::Rtx { .. }));
-        let turn = (split_device.is_some() && local)
-            .then(|| gpu_turn.get_or_init(|| Arc::new(GpuTurn::new())).clone());
-        let vision = super::media::ReadyVision::load(&args, &opened.view, &opened.library, vision, bytes, remote, turn)?;
+        let vision = super::media::ReadyVision::load(&args, &opened.view, &opened.library, vision, bytes, remote, split_device.is_some())?;
         let records = vision.as_ref().map(|vision| vision.push.records()).unwrap_or_default();
         *prepared.borrow_mut() = vision;
         Ok(records)
@@ -329,7 +324,7 @@ fn serve_loop(mut args: super::EngineArgs, mut receive: mpsc::Receiver<NativeReq
         let spark = matches!(engine.experts(), Some(super::engine::Experts::Spark { .. }));
         console::layer_classes(engine.weights.layers.iter().map(|l| console::layer_class(l.dense, spark)).collect());
         schedule(engine, &opened, &args.snapshot, &mut receive, &stats, lanes, policy, decode_share, &prefix,
-            loop_abort, (args.prefix_marks, args.mark_arena), args.token_io.token_select, &mut media, preparer.as_deref(), gpu_turn.get().map(Arc::as_ref),
+            loop_abort, (args.prefix_marks, args.mark_arena), args.token_io.token_select, &mut media, preparer.as_deref(),
             || {
                 // Ready once the prefix cache and the token selector exist: the ledger then lists
                 // every start-up allocation.
@@ -838,7 +833,7 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
     loop_abort: crate::shared::loop_abort::LoopAbortConfig,
     marks: (PrefixMarks, super::prefix::ArenaMarks), select: SelectPlacement,
     media: &mut MediaAdmission<super::media::Prompt, super::media::Encoder>,
-    preparer: Option<&cuteafd_api::openai::media::MediaPreparer>, gpu_turn: Option<&GpuTurn>, ready: impl FnOnce())
+    preparer: Option<&cuteafd_api::openai::media::MediaPreparer>, ready: impl FnOnce())
     -> Result<()> {
     let (family, mut cache) = prefix_cache(engine, prefix, marks, max_sequences)?;
     // Made before the KV pool when start-up admitted it from measured memory.
@@ -886,16 +881,9 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
     let mut kv_waiter = cuteafd_engine::prefix::DeferredAdmission::<MediaReady<super::media::Prompt>>::default();
     publish(stats, requests, generated_total, 0, 0, ring_misses, &cache, media, preparer, &lane.stats,
         &memory_boundaries, &reserve, 0);
-    let turn = gpu_turn.map(GpuTurn::scheduler).transpose()?;
-    let excluded = std::cell::Cell::new(Duration::ZERO);
-    let offer = || -> Result<()> {
-        if let Some(turn) = &turn {
-            engine.require_live()?;
-            let waited = turn.offer()?;
-            excluded.set(excluded.get() + waited);
-        }
-        Ok(())
-    };
+    let gpu_turn = media.encoder().gpu_turn();
+    let turn = SchedulerMedia::new(gpu_turn.as_deref())?;
+    let offer = || turn.offer(|| engine.require_live());
     ready();
     crate::shared::api::run_scheduler(|| {
     loop {
@@ -921,10 +909,7 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
                         publish(stats, requests, generated_total, active.len(), prefills.len(), ring_misses, &cache,
                             media, preparer, &lane.stats, &memory_boundaries, &reserve, stalled.len());
                         let job = if !busy && media.is_empty() {
-                            let next = match &turn {
-                                Some(turn) => runtime.block_on(turn.idle(receive.recv()))?,
-                                None => receive.blocking_recv(),
-                            };
+                            let next = turn.receive(&runtime, receive)?;
                             match next { Some(job) => job, None => return Ok(()) }
                         } else {
                             match receive.try_recv() {
@@ -1074,7 +1059,7 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
                         engine.verify_media_device(&mut [(placement, chunk.len())], chunk, &request_media)?
                             .context("scoring needs every layer")
                     });
-                if let Some(turn) = &turn { turn.check()?; }
+                turn.check()?;
                 match scored {
                     Ok(_) => { let _ = job.events.send(Ok(InferenceChunk::Finish { finish_reason: InferenceFinishReason::Length })); }
                     Err(error) => { let _ = job.events.send(Err(NativeFailure::Worker(format!("scoring: {error:#}")))); }
@@ -1108,7 +1093,7 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
                 started: Instant::now(), busy: 0.0, phases: [0.0; 3], packed: 0, ticket });
         }
         if prefills.due(!active.is_empty()) {
-            excluded.set(Duration::ZERO);
+            let excluded = turn.prefill_excluded();
             let caching = cache.enabled();
             // One chunk (a lane wave) of each waiting prompt (whole prompts with --decode-share 0); with
             // --prefill-packing, adjacent prompts whose chunks fit one pass prefill together.
@@ -1116,7 +1101,7 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
                 first_prefill_seen: &first_prefill_seen, memory_boundaries: &memory_boundaries, offer: &offer };
             let finished = if engine.packs_prefill() {
                 let limits = engine.packed_limits();
-                prefills.round_packed_excluding(limits.rows, DECODE_ROWS, &excluded,
+                prefills.round_packed_excluding(limits.rows, DECODE_ROWS, excluded,
                     |p| packs(p).then(|| chunk_end(p) - p.done), |group, next| packable(group, next, &limits),
                     |group| if group.len() == 1 {
                         vec![prefill_chunk(&cx, &mut selector, &mut cache, &mut group[0])]
@@ -1124,10 +1109,10 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
                         prefill_group(&cx, &mut selector, &mut cache, group)
                     })
             } else {
-                prefills.round_excluding(&excluded, |p| prefill_chunk(&cx, &mut selector, &mut cache, p))
+                prefills.round_excluding(excluded, |p| prefill_chunk(&cx, &mut selector, &mut cache, p))
             };
             // The queue reports per-prompt errors, but a turn stall must stop the entire engine.
-            if let Some(turn) = &turn { turn.check()?; }
+            turn.check()?;
             for (mut p, prefilled) in finished {
                 let (slot, placement, resume) = (p.slot, p.placement.clone(), p.resume);
                 if let Err(error) = &prefilled {
@@ -1297,11 +1282,6 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
             receive.len() + kv_waiter.len() + media.len()));
         prefills.stepped(cycle.elapsed().as_secs_f64());
     }
-    }).inspect_err(|error| {
-        // The owner may still be blocked in CUDA, so the scheduler's join is not a health signal.
-        if turn.is_some() {
-            cuteafd_transport::health::record_failure(format!("scheduler stopped: {error:#}"));
-        }
     })
 }
 

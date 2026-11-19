@@ -117,7 +117,7 @@ impl ReadyVision {
             &[cuteafd_core::serving_capacity::MemoryReservation { name: "vision.resident_weights_scratch".into(), bytes: admitted }], cuteafd_loader::placement::reserve::gpu("qwen4"))?;
         // Start before LM preflight: its live baseline already includes the admitted tower.
         // Single and dual Qwen both append the tower to their coordinator push group.
-        Ok(crate::shared::vision::EncoderService::start_coordinator(&args.snapshot, Some((spec, admitted)), args.native_lib.clone(), gpu, None, None)?)
+        Ok(crate::shared::vision::EncoderService::start_coordinator(&args.snapshot, Some((spec, admitted)), args.native_lib.clone(), gpu, None, crate::shared::gpu_turn::paired_turn(args.split_device.is_some()))?)
         })();
         let restored = library.cuda_set_device(args.device);
         let (service, push) = loaded?;
