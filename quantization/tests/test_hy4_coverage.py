@@ -56,6 +56,7 @@ def test_expert_hessians_weight_down_and_exclude_recovery_from_causal_sum(monkey
     spool = storage.Routes([(0, batch)], experts=4, tokens=3, recover=True)
     layer = SimpleNamespace(prefix="layer.", index=1)
     runner = run.Runner.__new__(run.Runner)
+    runner.expert_witness = None
     runner.device = torch.device("cpu")
     runner.model = SimpleNamespace(config=SimpleNamespace(swiglu_limit=10.))
     runner.reader = SimpleNamespace(expert_weights=lambda *_: (torch.eye(2),) * 3)

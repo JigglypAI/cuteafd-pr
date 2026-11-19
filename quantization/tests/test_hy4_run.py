@@ -78,6 +78,9 @@ def test_both_encodes_receive_same_hessian_and_only_serialized_k8_replays(tmp_pa
     runner = run.Runner.__new__(run.Runner)
     runner.device = torch.device("cpu")
     runner.core = {name: dict(in_features=2, out_features=2)}
+    runner.records = [0, 1]
+    runner.calibration_count = 1
+    runner.native_modules = set()
     runner.stages = Stages(tmp_path / "stages", {"test": True})
     runner.progress = SimpleNamespace(event=lambda *args, **kwargs: None)
     attempts, reloads = [], []
@@ -86,7 +89,7 @@ def test_both_encodes_receive_same_hessian_and_only_serialized_k8_replays(tmp_pa
         assert codebook == "mul1"
         assert weight is source
         attempts.append((bits, raw))
-        return {suffix: torch.full((2, 2), bits) for suffix in run.recipe.SUFFIXES}, {}, {"bits": bits}
+        return {suffix: torch.full((2, 2), bits) for suffix in run.recipe.SUFFIXES}, {"hessian_weighted_relative_error": 0.}, {"bits": bits}
 
     def reconstruct(packed, shape, *, device, dtype, codebook):
         assert codebook == "mul1"
@@ -96,9 +99,9 @@ def test_both_encodes_receive_same_hessian_and_only_serialized_k8_replays(tmp_pa
     numerical = SimpleNamespace(quantize_projection=quantize, reconstruct_projection=reconstruct,
                                 covariance_accumulator=run.numerical.covariance_accumulator)
     monkeypatch.setattr(run, "numerical", numerical)
-    layer = Layer(0, "layer.", {"gate_proj.weight": source})
+    layer = Layer(7, "layer.", {"gate_proj.weight": source})
     overrides = {}
-    fit = runner.core_fit("phase", layer, [(name,)], lambda: [(inputs,)], overrides)
+    fit = runner.core_fit("phase", layer, [(name,)], lambda: [(inputs,), (inputs * 100,)], overrides)
     assert [bits for bits, _ in attempts] == [8, 6]
     assert attempts[0][1] is attempts[1][1]
     assert torch.equal(attempts[0][1]["H"], inputs.T @ inputs)
@@ -138,6 +141,7 @@ def test_resident_expert_replay_uses_only_sealed_weights_and_preserves_sum(tmp_p
                       for p in range(3))
         for expert in range(3)
     }
+    runner.expert_witness = None
     runner.reader = SimpleNamespace(expert_weights=lambda _, expert: weights[expert])
     encodes = []
 

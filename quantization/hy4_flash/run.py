@@ -6,6 +6,7 @@ import csv
 from datetime import datetime, timezone
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import runpy
@@ -17,7 +18,7 @@ import torch.nn.functional as F
 
 from inkling2 import numerical
 from kimi_k3.uniform_k2.storage import atomic_json, fsync_directory, verify_receipt
-from . import recipe
+from . import gates, recipe
 from .export import DirectMCWriter, verify_original_discovery
 from .forward import AttentionTap, Drafter, Layer, Model, Reader, native_projection, recalled_context, reference
 from .prepare_corpus import load_token_batches
@@ -28,7 +29,7 @@ from .storage import CANDIDATE_GAMMA_CONTRACT, IDENTITY_CONTRACT, MINIMUM_EXPERT
 REPO = Path(__file__).resolve().parents[2]
 CODE = (
     "quantization/hy4_flash/run.py", "quantization/hy4_flash/storage.py",
-    "quantization/hy4_flash/recipe.py", "quantization/hy4_flash/forward.py",
+    "quantization/hy4_flash/gates.py", "quantization/hy4_flash/recipe.py", "quantization/hy4_flash/forward.py",
     "quantization/hy4_flash/source.py", "quantization/hy4_flash/prepare_corpus.py",
     "quantization/hy4_flash", "quantization/hy4_flash/export.py",
     "quantization/inkling2/numerical.py",
@@ -132,7 +133,13 @@ def encode(name, weight, covariance, bits, device, metrics):
         packed, measured, evidence = numerical.quantize_projection(
             weight, covariance, bits=width, device=str(device), codebook="mul1")
         values.update({f"k{width}.{name}.{key}": value for key, value in packed.items()})
-        metrics.append(evidence | measured | dict(module=name, bits=width))
+        if width == 6:
+            error = measured.get("hessian_weighted_relative_error")
+            if (not isinstance(error, (float, int)) or not math.isfinite(error)
+                    or not 0 <= error <= gates.BARS[6]):
+                raise ValueError(f"{name} K6 training error {error} outside [0, {gates.BARS[6]}]")
+        metrics.append(evidence | measured | dict(module=name, bits=width,
+            effective_bits_per_weight=gates.packed_bpw(values, name, width, weight.shape)))
     return values
 
 
@@ -166,6 +173,17 @@ class Runner:
                         for r in load_token_batches(args.corpus, split="calibration")]
         if not self.records or any(not len(tokens) for tokens in self.records):
             raise ValueError("Hy4 needs nonempty causal calibration prompts")
+        self.calibration_count = len(self.records)
+        heldout = [r["input_ids"].reshape(-1).cpu()
+                   for r in load_token_batches(args.corpus, split="heldout")]
+        if not heldout or any(not len(tokens) for tokens in heldout):
+            raise ValueError("Hy4 production gates need the disjoint agentic held-out split")
+        self.records.extend(heldout)
+        self.native_modules = set()
+        self.expert_witness = None
+        for path in (self.root / "gates").glob("*.json"):
+            self.native_modules.update(row["module"] for row in read_json(path)["projections"]
+                                       if row.get("kept_native"))
         self.reader = Reader(self.header.snapshot, self.device)
         self.model = Model(self.reader)
         self.embedding = self.reader.raw(reference.OUTER_NAMES[0])
@@ -222,28 +240,56 @@ class Runner:
         if not names:
             return None
         metrics = []
+        gate = (layer.index in gates.TARGET_GATES or layer.prefix.startswith("model.dfly_layers.")
+                or not layer.prefix)
         def fit():
             accumulators = [numerical.covariance_accumulator(
                 self.core[group[0]]["in_features"], device=self.device) if group else None
                 for group in groups]
-            for sample in samples():
-                for acc, inputs in zip(accumulators, sample, strict=True):
+            # One sample per forward record. Held-out tails observe the same
+            # upstream K8 activations but never contribute to a covariance.
+            witnesses = [[] for _ in groups]
+            count = 0
+            for count, sample in enumerate(samples(), 1):
+                for acc, inputs, tails in zip(accumulators, sample, witnesses, strict=True):
                     if acc is not None:
-                        acc.add(inputs)
+                        if count <= self.calibration_count:
+                            acc.add(inputs)
+                        elif gate:
+                            tails.append(inputs.reshape(-1, inputs.shape[-1])[-gates.TAIL:].clone())
+            if count != len(self.records):
+                raise ValueError(f"{stage} fit samples differ from the frozen prompt partition")
             ordinal = 0
-            for group, acc in zip(groups, accumulators, strict=True):
+            for group, acc, tails in zip(groups, accumulators, witnesses, strict=True):
                 if acc is None:
                     continue
                 covariance = raw(acc)
                 for name in group:
                     self.progress.event("core_projection", stage=stage, projection=name)
                     weight = layer.weights[name.removeprefix(layer.prefix) + ".weight"]
-                    yield ordinal, encode(name, weight, covariance, (8, 6), self.device, metrics)
+                    values = encode(name, weight, covariance, (8, 6), self.device, metrics)
+                    if gate:
+                        inputs = torch.cat(tails)
+                        pair = metrics[-2:]
+                        for row in pair:
+                            matrix = reconstruction(values, name, row["bits"], weight.shape, self.device)
+                            gates.evaluated(row, inputs, weight, matrix, "last-16-rows-each-heldout-prompt")
+                        draft = layer.prefix.startswith("model.dfly_layers.")
+                        # A K6-only drafter miss triggers the whole-drafter K8 alias.
+                        fallback = any(not row["heldout_passed"] for row in pair
+                                       if not draft or row["bits"] == 8)
+                        for row in pair:
+                            row["kept_native"] = fallback
+                    yield ordinal, values
                     ordinal += 1
         manifest = self.stages.write_batches(stage, fit(), {"names": names, "metrics": metrics})
         if manifest["metadata"]["names"] != names:
             raise ValueError("Hy4 compact scratch inventory differs")
+        self.native_modules.update(row["module"] for row in manifest["metadata"]["metrics"]
+                                   if row.get("kept_native"))
         for index, name in enumerate(names):
+            if name in self.native_modules:
+                continue
             geometry = self.core[name]
             overrides[name] = reconstruction(self.stages.read_batch(stage, index), name, 8,
                 (geometry["out_features"], geometry["in_features"]), self.device)
@@ -260,6 +306,8 @@ class Runner:
             manifest = self.stages.load(stage)
             metrics.extend(manifest["metadata"]["metrics"])
             for index, name in enumerate(manifest["metadata"]["names"]):
+                if name in self.native_modules:
+                    continue
                 for bits in (8, 6):
                     if draft and bits == 6 and self.policy["k6_drafter_bits"] == 8:
                         continue
@@ -278,8 +326,18 @@ class Runner:
         else:
             atomic_json(path, metrics)
 
+    def selected_core(self):
+        return {name: g for name, g in self.core.items() if name not in self.native_modules}
+
+    def save_gate(self, label, metrics, tick, **fields):
+        sizes = recipe.size_report(self.header, self.selected_core(),
+                                   k6_drafter_bits=self.policy["k6_drafter_bits"])
+        gates.gate_report(self.root, label, metrics, sizes, time.monotonic() - tick, **fields)
+        self.progress.event("production_gate", snapshot=False, group=label,
+                            receipt=str(self.root / "gates" / f"{label}.json"))
+
     def source_group(self, prefix, *, exclude=()):
-        original = {recipe.source_tensor(name)[0] for name in self.core if name.startswith(prefix)}
+        original = {recipe.source_tensor(name)[0] for name in self.core if name.startswith(prefix) and name not in self.native_modules}
         native = {name for name in self.header.specs if name.startswith(prefix)}
         native -= original | set(exclude) | recipe.ENGRAM_TABLES.keys()
         return self.header.source_entries(native), self.header.source_entries(original)
@@ -371,21 +429,36 @@ class Runner:
                     config = self.model.config
                     scores, choice = reference.routing_scores(inputs, layer.weights, config)
                     ids, gamma = reference.native_routes(scores, choice, config)
-                    near, near_gamma = candidate_routes(scores, choice, ids, config)
                     latent = layer.project("mlp.routed_expert_down_proj", inputs, project)
-                    yield number, dict(latent=latent, ids=ids, gamma=gamma,
-                                       candidate_ids=near, candidate_gamma=near_gamma)
+                    record = dict(latent=latent, ids=ids, gamma=gamma)
+                    if number < self.calibration_count:
+                        near, near_gamma = candidate_routes(scores, choice, ids, config)
+                        record.update(candidate_ids=near, candidate_gamma=near_gamma)
+                    yield number, record
             self.save(route_stage, routes)
-            spool = Routes(self.stages.records(route_stage), recipe.EXPERTS_PER_LAYER,
-                           sum(len(tokens) for tokens in self.records), device=self.device, recover=True)
+            def route_batches(start, stop):
+                for number in range(start, stop):
+                    yield number - start, self.stages.read_batch(route_stage, number)
+            held = self.calibration_count
+            lengths = list(map(len, self.records))
+            spool = Routes(route_batches(0, held), recipe.EXPERTS_PER_LAYER,
+                           sum(lengths[:held]), device=self.device, recover=True)
+            witness = Routes(route_batches(held, len(lengths)), recipe.EXPERTS_PER_LAYER,
+                             sum(lengths[held:]), device=self.device)
+            self.expert_witness = gates.ExpertWitness(witness, index, self.model.config.swiglu_limit)
             packed, extra_metrics, expert_stages, combined = self.experts(label, layer, spool)
-            del spool
+            heldout_combined = self.expert_witness.combined
+            del spool, witness
+            self.expert_witness = None
+            def routed_batches():
+                yield from combined.split(lengths[:held])
+                yield from heldout_combined.split(lengths[held:])
             fit_stages.append(self.core_fit(label + "-latent-up", layer,
                 [(p + "mlp.routed_expert_up_proj",)],
-                lambda: ((rows,) for rows in combined.split(EXPERT_ROWS)), overrides))
+                lambda: ((rows,) for rows in routed_batches()), overrides))
 
         def finish():
-            routed = iter(combined.split([len(tokens) for tokens in self.records])) if moe else None
+            routed = routed_batches() if moe else None
             for number, values in self.rows(mlp_stage, "state", "post", "inputs"):
                 result = self.model.mlp_finish(values["state"], values["post"], values["inputs"],
                     layer, next(routed) if moe else None, project)
@@ -395,6 +468,12 @@ class Runner:
         views, metrics = self.compact_entries(fit_stages)
         metrics += extra_metrics
         self.save_metrics(label, metrics)
+        if index in gates.TARGET_GATES or index in recipe.ENGRAM_ROWS:
+            engram = gates.engram_coverage(self.model.config, layer, self.records[:self.calibration_count])
+            if index in gates.TARGET_GATES:
+                self.save_gate(label, metrics, tick, recovery=gates.recovery_distribution(metrics), engram=engram)
+            elif engram:
+                atomic_json(self.root / "metrics" / f"engram-coverage-{index:03d}.receipt", engram)
         fused = {p + leaf for leaf in reference.EXPERTS} if moe else ()
         native, original = self.source_group(p, exclude=fused)
         self.writer.write_group(label, shared=native | packed, original=original,
@@ -465,7 +544,7 @@ class Runner:
 
     def replay_expert(self, layer, spool, expert, combined, stage, ordinal):
         rows, gamma = spool.expert(expert)
-        if not len(rows):
+        if not len(rows) and self.expert_witness is None:
             return
         rows, gamma = rows.to(self.device), gamma.to(self.device)
         names = self.expert_names(layer, expert)
@@ -478,6 +557,10 @@ class Runner:
         gate, up, down = (reconstruction(values, name, 4, shape, self.device)
                           for name, shape in zip(names, ((intermediate, latent), (intermediate, latent),
                                                         (latent, intermediate)), strict=True))
+        if self.expert_witness is not None:
+            self.expert_witness.add(expert, (gate, up, down))
+        if not len(rows):
+            return
         activated = self.expert_activations(spool, rows, names, gate, up)
         self.accumulate_expert(combined, rows, gamma, names[2], down, activated)
 
@@ -488,7 +571,7 @@ class Runner:
         identity = evidence["identity_rows"]
         metric_start = len(metrics)
         names = self.expert_names(layer, expert)
-        weights = self.reader.expert_weights(layer.index, expert)
+        weights = tuple(w.to(self.device) for w in self.reader.expert_weights(layer.index, expert))
         acc = numerical.covariance_accumulator(weights[0].shape[-1], device=self.device)
         if len(rows):
             for part in rows.split(EXPERT_ROWS):
@@ -496,7 +579,7 @@ class Runner:
         covariance = raw(acc, identity)
         values = {}
         for name, weight in zip(names[:2], weights[:2], strict=True):
-            values.update(encode(name, weight.to(self.device), covariance, (4,), self.device, metrics))
+            values.update(encode(name, weight, covariance, (4,), self.device, metrics))
         gate, up = (reconstruction(values, name, 4, weight.shape, self.device)
                     for name, weight in zip(names[:2], weights[:2], strict=True))
         acc = numerical.covariance_accumulator(weights[2].shape[-1], device=self.device)
@@ -507,7 +590,7 @@ class Runner:
             # the error on that weighted output; gate/up observe latent inputs.
             for chunk, scale in zip(activations, gamma.split(EXPERT_ROWS), strict=True):
                 acc.add(chunk * scale[:, None])
-        values.update(encode(names[2], weights[2].to(self.device), raw(acc, identity),
+        values.update(encode(names[2], weights[2], raw(acc, identity),
                              (4,), self.device, metrics))
         for metric in metrics[metric_start:]:
             metric.update(evidence)
@@ -515,6 +598,8 @@ class Runner:
         if natural:
             activated = self.expert_activations(spool, rows[:natural], names, gate, up)
             self.accumulate_expert(combined, rows[:natural], gamma[:natural], names[2], down, activated)
+        if self.expert_witness is not None:
+            self.expert_witness.add(expert, (gate, up, down), names=names, native=weights, metrics=metrics)
         return values
 
     def recover_complete_group(self, label, successor, **frontier):
@@ -526,6 +611,9 @@ class Runner:
         # available. Retire only after committing the adoption.
         discard = [path.name for path in self.stages.root.iterdir()
                    if path.name.startswith(label + "-") and path.name != successor]
+        if "drafter" in frontier:
+            discard = [name for name in discard if name not in
+                       {f"{label}-{stage}" for stage in gates.DRAFT_STAGES}]
         discard.append(self.frontier["stage"])
         self.advance(completed=len(metrics), old_stages=discard, stage=successor, **frontier)
         self.progress.event("group_frontier_recovered", group=label)
@@ -537,6 +625,7 @@ class Runner:
         if self.writer.group_complete(label):
             self.recover_complete_group(label, starter, head=True)
             return
+        tick = time.monotonic()
         weights = {name: self.reader.load(name) for name in reference.OUTER_NAMES[1:5]}
         weights["lm_head.weight"] = self.reader.load("lm_head.weight")
         layer = Layer(recipe.LAYER_COUNT, "", weights)
@@ -556,11 +645,16 @@ class Runner:
                 bonus = self.model.head(features, project=weights_project(overrides),
                                         weight=weights["lm_head.weight"]).argmax()
                 state = drafter.start(bonus, features[0], self.embedding)
-                yield number, dict(state=state)
+                result = dict(state=state)
+                if number >= self.calibration_count:
+                    result.update(native=state, k6=state, bonus=bonus.reshape(1))
+                yield number, result
 
         self.save(starter, anchors)
         views, metrics = self.compact_entries([fit])
         self.save_metrics(label, metrics)
+        if metrics:
+            self.save_gate(label, metrics, tick)
         native, original = self.source_group("lm_head.")
         self.writer.write_group(label, shared=native, original=original, k8=views[8], k6=views[6])
         self.advance(completed=len(metrics), head=True, stage=starter,
@@ -648,19 +742,81 @@ class Runner:
                                        down_inputs, overrides))
 
         def finish():
+            alternatives = {}
+            for stage in filter(None, fit_stages):
+                for order, name in enumerate(self.stages.load(stage)["metadata"]["names"]):
+                    if name in self.native_modules:
+                        continue
+                    weight = layer.weights[name.removeprefix(layer.prefix) + ".weight"]
+                    alternatives[name] = reconstruction(self.stages.read_batch(stage, order), name, 6,
+                                                        weight.shape, self.device)
+            project_k6 = weights_project(alternatives)
             for number, v in self.rows(mlp_stage):
                 result = self.model.ffn_parts(v["inputs"], layer, "mlp.", project)
-                yield number, dict(state=v["residual"] + result)
+                record = dict(state=v["residual"] + result)
+                if number >= self.calibration_count:
+                    prior = self.stages.fields(incoming, number, ("native", "k6", "bonus"),
+                                               device=self.device)
+                    taps = self.draft_taps(drafter, index, number)
+                    end = len(self.records[number])
+                    record.update(native=drafter.layer(prior["native"], index, taps, end),
+                                  k6=drafter.layer(prior["k6"], index, taps, end, project_k6),
+                                  bonus=prior["bonus"])
+                yield number, record
 
         self.save(successor, finish)
         views, metrics = self.compact_entries(fit_stages, draft=True)
         self.save_metrics(label, metrics)
+        extra = {"hidden_correction": "retained native", "hidden_correction_parameters":
+                 sum(t.numel() for key, t in drafter.aux.items() if key.startswith("hidden_correction."))}
+        if index == recipe.MTP_LAYER_COUNT - 1:
+            head = self.reader.load("lm_head.weight")
+            matches = torch.zeros(2, dtype=torch.int64, device=self.device)
+            count = 0
+            for number in range(self.calibration_count, len(self.records)):
+                saved = self.stages.read_batch(successor, number, device=self.device)
+                bonus = saved["bonus"].reshape(())
+                def proposals(state):
+                    return drafter.proposals(drafter.finish(state), bonus, self.embedding,
+                                             head_weight=head).argmax(-1)
+                expected = proposals(saved["native"])
+                matches += torch.stack([(proposals(saved[key]) == expected).sum() for key in ("state", "k6")])
+                count += expected.numel()
+            agreement = {str(bits): hits/count for bits, hits in zip((8, 6), matches.tolist(), strict=True)}
+            extra.update(dfly_top1_agreement=agreement, compared_slots=count,
+                         comparison="native drafter on identical K8 target anchors, taps and common native head")
+            if agreement["8"] < .98:
+                self.save_gate(label, metrics, tick, extra=extra | {"status": "failed-dfly-k8-top1"})
+                raise ValueError(f"DFly2 K8 held-out top-1 agreement {agreement['8']} below 0.98")
+            failed_k6 = any(row["bits"] == 6 and not row["heldout_passed"]
+                            for n in range(recipe.MTP_LAYER_COUNT)
+                            for row in read_json(self.root / "metrics" / f"draft-{n:03d}.json"))
+            extra["published_k6_drafter_bits"] = 8 if failed_k6 or agreement["6"] < .98 else 6
+            self.policy["k6_drafter_bits"] = extra["published_k6_drafter_bits"]
+        self.save_gate(label, metrics, tick, extra=extra)
         native, original = self.source_group(p)
-        self.writer.write_group(label, shared=native, original=original, k8=views[8], k6=views[6])
+        # K6 drafter publication depends on the final full-drafter top-1 gate.
+        # Keep only its small packed fit stages until that decision is durable.
+        self.writer.write_group(label, shared=native, original=original, k8=views[8])
         self.advance(completed=len(metrics), drafter=index + 1, stage=successor,
-                     old_stages=[incoming, mlp_stage, *filter(None, fit_stages)])
+                     old_stages=[incoming, mlp_stage])
         self.progress.event("drafter_layer_complete", current_drafter_layer=index,
                             layer_seconds=time.monotonic() - tick)
+
+    def seal_draft_k6(self):
+        final = read_json(self.root / "gates" / f"draft-{recipe.MTP_LAYER_COUNT-1:03d}.json")
+        self.policy["k6_drafter_bits"] = final["published_k6_drafter_bits"]
+        for index in range(recipe.MTP_LAYER_COUNT):
+            label = f"draft-{index:03d}"
+            fit_stages = [f"{label}-{suffix}" for suffix in gates.DRAFT_STAGES]
+            group = label + "-k6"
+            selected = any(name.startswith(f"model.dfly_layers.{index}.") for name in self.selected_core())
+            if selected and self.policy["k6_drafter_bits"] == 6 and not self.writer.group_complete(group):
+                views, _ = self.compact_entries(fit_stages, draft=True)
+                if not views[6]:
+                    raise ValueError(f"{group} missing selected K6 drafter modules")
+                self.writer.write_group(group, k6=views[6])
+            self.stages.retire(*fit_stages)
 
     def globals(self):
         if self.writer.group_complete("globals"):
@@ -735,12 +891,14 @@ class Runner:
         self.reader.close()
         if self.frontier["encodes"] != self.total:
             raise ValueError("Hy4 completed encode count differs from the production recipe")
+        self.seal_draft_k6()
         error_csv = self.write_error_csv()
         tables = self.export_engram()
         self.progress.event("package_audit")
-        result = self.writer.finalize(core_selection=self.core, engram=tables, document=self.header.document,
+        result = self.writer.finalize(core_selection=self.selected_core(), engram=tables, document=self.header.document,
                                       error_csv=error_csv, card_path=self.root / "README.md",
-                                      k6_drafter_bits=self.policy["k6_drafter_bits"])
+                                      k6_drafter_bits=self.policy["k6_drafter_bits"],
+                                      retained_by_gate=self.native_modules)
         state = read_json(self.output / "package-state.json")
         discovery = verify_original_discovery(self.output, state["direct_expected_mappings"]["original"])
         complete = dict(status="passed", identity=self.identity, output=str(self.output),

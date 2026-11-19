@@ -159,19 +159,19 @@ class DirectMCWriter(SharedDirectMCWriter):
                          identity, source_inventory, **kwargs)
 
     def finalize(self, *, core_selection, engram, document, error_csv, card_path,
-                 k6_drafter_bits=6):
+                 k6_drafter_bits=6, retained_by_gate=()):
         """Seal and independently validate exact complete per-view inventories."""
         if set(engram['tables']) != recipe.ENGRAM_TABLES.keys() or k6_drafter_bits not in (6, 8):
             raise ValueError('Hy4-flash requires all dedicated Engram tables and a reviewed drafter width')
         reviewed = recipe.reviewed_core_modules(
-            include_head='lm_head' in core_selection,
-            include_kv_b='model.layers.0.self_attn.kv_b_proj' in core_selection)
+            include_head='lm_head' in core_selection or 'lm_head' in retained_by_gate,
+            include_kv_b=any(name.endswith('.kv_b_proj') for name in (*core_selection, *retained_by_gate)))
         if any(module not in reviewed or any(g[key] != reviewed[module][key] for key in
                ('in_features', 'out_features', 'stored_out_features', 'group'))
                for module, g in core_selection.items()):
             raise ValueError('unreviewed selected core')
         if {n for n in core_selection if n.startswith('model.dfly_layers.')} != {
-                n for n in reviewed if n.startswith('model.dfly_layers.')}:
+                n for n in reviewed if n.startswith('model.dfly_layers.') and n not in retained_by_gate}:
             raise ValueError('compact views require every selected DFly2 matrix')
         native = _native_specs(self.source_inventory, core_selection)
         experts = recipe.reviewed_expert_modules()
