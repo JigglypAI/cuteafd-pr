@@ -893,8 +893,10 @@ class Runner:
 
     def run(self):
         reference.configure_f32()
+        self.progress.event("global_tensors")
         self.globals()
         if not self.frontier["target"]:
+            self.progress.event("initial_activations")
             self.save("initial", lambda start: (
                 (i, {"state": self.model.initial(self.records[i].to(self.device), self.embedding)})
                 for i in range(start, len(self.records))))
