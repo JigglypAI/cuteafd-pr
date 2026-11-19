@@ -159,13 +159,71 @@ impl MatrixRow {
 /// layout, a card from an earlier release, or a simulation where no real card
 /// exists cannot take a cell the matrix gives to another card. Rows without
 /// measured cells use the matrix checkpoint until a report can name them.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct Matrix {
     pub rows: Vec<MatrixRow>,
+    pub mc_views: Vec<McViews>,
     pub retired: Vec<Retired>,
 }
 
-/// A historical card, pinned independently of the current three-column set.
+/// A checkpoint's four views, each pinned to a measured two-RTX report.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct McViews {
+    family: String,
+    checkpoint: String,
+    views: McViewReports,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+struct McViewReports {
+    original: PathBuf,
+    k8_compact: PathBuf,
+    k6_compact: PathBuf,
+    fp8_compact: PathBuf,
+}
+
+impl McViewReports {
+    fn ordered(&self) -> [(&'static str, &Path); 4] {
+        [("original", &self.original), ("k8-compact", &self.k8_compact),
+            ("k6-compact", &self.k6_compact), ("fp8-compact", &self.fp8_compact)]
+    }
+}
+
+fn validate_mc_views(rows: &[MatrixRow], entries: &[McViews]) -> Result<()> {
+    let mut checkpoints = BTreeSet::new();
+    for entry in entries {
+        let (family, checkpoint) = (&entry.family, &entry.checkpoint);
+        if !checkpoints.insert((family, checkpoint)) {
+            bail!("{family}/{checkpoint}: listed twice in mc_views");
+        }
+        let parent = Path::new("benchmarks").join(family);
+        let mut reports = BTreeSet::new();
+        for (view, report) in entry.views.ordered() {
+            if !report_directory(report) || report.parent() != Some(parent.as_path()) {
+                bail!("{checkpoint} {view}: report must be benchmarks/{family}/<directory>");
+            }
+            if !reports.insert(report) {
+                bail!("{checkpoint} {view}: each MC view needs a distinct report");
+            }
+        }
+        let max = rows.iter().find(|row| &row.family == family && &row.checkpoint == checkpoint)
+            .map(|row| &row.cells[1]);
+        if !max.is_some_and(|cell| cell.status == Status::Current
+            && cell.report.as_deref() == Some(entry.views.original.as_path())) {
+            bail!("{family}/{checkpoint}: original must pin the same report as the current 2rtx cell");
+        }
+    }
+    Ok(())
+}
+
+fn report_directory(path: &Path) -> bool {
+    path.starts_with("benchmarks") && path.components().count() == 3
+        && path.components().all(|p| matches!(p, std::path::Component::Normal(_)))
+}
+
+/// A historical card, pinned independently of the current reference columns.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Retired {
@@ -183,8 +241,7 @@ pub fn validate_retired(entries: &[Retired]) -> Result<()> {
             bail!("retired cards need nonempty, unique names");
         }
         let normal = |path: &Path| path.components().all(|p| matches!(p, std::path::Component::Normal(_)));
-        if !normal(&entry.report) || entry.report.components().count() != 3
-            || !entry.report.starts_with("benchmarks") {
+        if !report_directory(&entry.report) {
             bail!("retired report must be benchmarks/<family>/<directory>");
         }
         if !normal(&entry.config) || entry.config.components().count() != 3
@@ -204,6 +261,8 @@ pub fn validate_retired(entries: &[Retired]) -> Result<()> {
 struct RawMatrix {
     schema: String,
     cells: Vec<RawRow>,
+    #[serde(default)]
+    mc_views: Vec<McViews>,
     #[serde(default)]
     retired: Vec<Retired>,
 }
@@ -276,8 +335,9 @@ impl Matrix {
             rows.push(MatrixRow::new(&row.family, &row.checkpoint,
                 cells.try_into().map_err(|_| anyhow::anyhow!("two cells per row"))?));
         }
+        validate_mc_views(&rows, &raw.mc_views)?;
         validate_retired(&raw.retired)?;
-        Ok(Matrix { rows, retired: raw.retired })
+        Ok(Matrix { rows, mc_views: raw.mc_views, retired: raw.retired })
     }
 }
 
@@ -302,8 +362,7 @@ fn cell(column: Column, raw: RawCell, family: &str, checkpoint: &str) -> Result<
         if status != Status::Current {
             bail!("{family}/{checkpoint} {}: only current cells take a report", column.key());
         }
-        if path.components().count() != 3 || !path.starts_with("benchmarks")
-            || !path.components().all(|part| matches!(part, std::path::Component::Normal(_))) {
+        if !report_directory(path) {
             bail!("report must be benchmarks/<family>/<directory>, relative to the repository");
         }
     }
@@ -313,7 +372,7 @@ fn cell(column: Column, raw: RawCell, family: &str, checkpoint: &str) -> Result<
 /// A one-row matrix: the table and page renderers' test scaffolding.
 #[cfg(test)]
 pub fn one_row(family: &str, checkpoint: &str, cells: [Cell; 2]) -> Matrix {
-    Matrix { rows: vec![MatrixRow::new(family, checkpoint, cells)], retired: Vec::new() }
+    Matrix { rows: vec![MatrixRow::new(family, checkpoint, cells)], ..Matrix::default() }
 }
 
 /// Re-renders the images a published run already carries from its own
@@ -678,18 +737,21 @@ fn grid_cell(cell: &Resolved) -> String {
     }
 }
 
-/// The root README's results: one row per checkpoint of the published matrix
-/// (the checkpoint and quant linking to its family page, then its three
-/// reference-column cards, each linking to the card SVG), then a link to the
-/// benchmarks index for everything older.
+/// The root README's results: the multi-core comparisons, the reference
+/// cards, a link to the benchmarks index, and the retired cards.
 pub fn results(placed: &[Placed], matrix: &Matrix) -> Result<String> {
     let rows = select(placed, matrix)?;
+    render_results(placed, matrix, &rows)
+}
+
+fn render_results(placed: &[Placed], matrix: &Matrix, rows: &[Row]) -> Result<String> {
+    let mut out = mc_view_results(placed, matrix)?;
     let retired = retired_results(placed, &matrix.retired)?;
     if rows.is_empty() {
         return Ok(format!("_Pending the first published run._\n{retired}"));
     }
-    let mut out = String::from("<table>\n<tr><th>Model · quant</th><th>1× RTX</th><th>2× RTX</th></tr>\n");
-    for row in &rows {
+    out.push_str("<table>\n<tr><th>Model · quant</th><th>1× RTX</th><th>2× RTX</th></tr>\n");
+    for row in rows {
         let name = row.cells.iter().find_map(|cell| match cell {
             Resolved::Card(p) => Some(p.report.server.checkpoint()), _ => None })
             .unwrap_or_else(|| row.label.clone());
@@ -710,6 +772,51 @@ pub fn results(placed: &[Placed], matrix: &Matrix) -> Result<String> {
         restore exactness and lossless speculation. Older releases, other profiles and every report: \
         [benchmarks](benchmarks/README.md).\n");
     out.push_str(&retired);
+    Ok(out)
+}
+
+fn mc_view_results(placed: &[Placed], matrix: &Matrix) -> Result<String> {
+    validate_mc_views(&matrix.rows, &matrix.mc_views)?;
+    if matrix.mc_views.is_empty() { return Ok(String::new()); }
+    let escape = crate::render::svg::escape;
+    let mut out = String::from("\n### Multi-core views\n\nEach multi-core checkpoint shares one set of routed experts \
+        across four core precisions selectable via `CORE_VIEW`.\n\n\
+        <table>\n<tr><th>Model · quant</th><th>original</th><th>k8-compact</th><th>k6-compact</th><th>fp8-compact</th></tr>\n");
+    for entry in &matrix.mc_views {
+        let checkpoint = &entry.checkpoint;
+        let views = entry.views.ordered();
+        let mut reports = Vec::with_capacity(views.len());
+        for (view, dir) in views {
+            let p = placed.iter().find(|p| p.dir == dir)
+                .with_context(|| format!("{checkpoint} {view}: missing MC report {}", dir.display()))?;
+            let report = &p.report;
+            let server = &report.server;
+            if report.profile != "smoke" || report.baseline.is_none() || server.hardware.used_gpus() != 2
+                || server.simulated_5090() || server.column_5090()
+                || server.family.as_deref() != Some(entry.family.as_str()) || server.checkpoint() != *checkpoint
+                || server.setting("core-view").or_else(|| server.setting("CUTEAFD_CORE_VIEW")) != Some(view) {
+                bail!("{checkpoint} {view}: {} must be a measured two-RTX Release-smoke report for this checkpoint and view",
+                    dir.display());
+            }
+            reports.push((view, p));
+        }
+        let original = &reports[0].1.report;
+        let sparks = original.server.hardware.sparks.len();
+        let hardware = short_hardware(original);
+        out.push_str(&format!("<tr>\n<td width=\"20%\" valign=\"top\"><b>{}</b><br><sub>{}</sub></td>\n",
+            escape(checkpoint), escape(&hardware)));
+        for (view, p) in reports {
+            if p.report.server.hardware.sparks.len() != sparks {
+                bail!("{checkpoint} {view}: MC views must use the same layout as original");
+            }
+            let svg = escape(&link(&p.dir, "card.svg"));
+            let alt = escape(&format!("{checkpoint} ({view}) on {hardware}"));
+            out.push_str(&format!("<td width=\"20%\" valign=\"top\"><a href=\"{svg}\"><img src=\"{svg}\" alt=\"{alt}\"></a>{}{}</td>\n",
+                quality_note(p), caveat(p)));
+        }
+        out.push_str("</tr>\n");
+    }
+    out.push_str("</table>\n\n");
     Ok(out)
 }
 
@@ -897,8 +1004,7 @@ pub fn publish(root: &Path, dirs: &[PathBuf], matrix_path: &Path) -> Result<(Pat
     // Resolve first: a missing pinned report must fail before any file is touched.
     // Superseded exports remain archived unchanged, including their images.
     let rows = select(&placed, &matrix)?;
-    // Validate historical pins before touching any generated document or image.
-    retired_results(&placed, &matrix.retired)?;
+    let results = render_results(&placed, &matrix, &rows)?;
     for p in &placed {
         slim_placed(&root.join(&p.dir))?;
     }
@@ -914,7 +1020,7 @@ pub fn publish(root: &Path, dirs: &[PathBuf], matrix_path: &Path) -> Result<(Pat
     });
     let readme = root.join("README.md");
     let text = std::fs::read_to_string(&readme).with_context(|| format!("{}", readme.display()))?;
-    crate::cli::write_if_changed(&readme, &splice(&text, RESULTS_BEGIN, RESULTS_END, &results(&placed, &matrix)?)?)?;
+    crate::cli::write_if_changed(&readme, &splice(&text, RESULTS_BEGIN, RESULTS_END, &results)?)?;
     let index_path = root.join("benchmarks/README.md");
     std::fs::create_dir_all(root.join("benchmarks"))?;
     let current = std::fs::read_to_string(&index_path)
@@ -938,7 +1044,7 @@ pub fn one_row_of(placed: &Placed) -> Matrix {
     };
     let cells = [cell(Column::OneRtx), cell(Column::TwoRtx)];
     Matrix { rows: vec![MatrixRow::new(report.server.family.as_deref().unwrap_or("unknown"),
-        &report.server.checkpoint(), cells)], retired: Vec::new() }
+        &report.server.checkpoint(), cells)], ..Matrix::default() }
 }
 
 #[cfg(test)]
@@ -1057,7 +1163,7 @@ mod tests {
         assert!(!html.contains("older/card.svg"));
         assert!(index(&reports).contains("older/report.svg"));
         // An empty matrix publishes nothing, and says so.
-        assert_eq!(results(&reports, &Matrix { rows: Vec::new(), retired: Vec::new() }).unwrap(), "_Pending the first published run._\n");
+        assert_eq!(results(&reports, &Matrix::default()).unwrap(), "_Pending the first published run._\n");
     }
 
     #[test]
@@ -1245,7 +1351,7 @@ mod tests {
             } },
         ];
         let matrix = Matrix { rows: vec![MatrixRow::new("mimo_v2", "XiaomiMiMo/MiMo-V2.6-Flash-MOPD",
-            [Cell::current(), Cell::pending("no two-RTX card")])], retired: Vec::new() };
+            [Cell::current(), Cell::pending("no two-RTX card")])], ..Matrix::default() };
         let rows = select(&placed, &matrix).unwrap();
         assert_eq!(rows.len(), 1);
         assert!(!rows.iter().any(|row| row.label.contains("MiMo-V2-Flash")));
@@ -1374,18 +1480,116 @@ mod tests {
         assert!(Matrix::parse(&unknown.to_string()).is_err());
     }
 
+    /// One MC checkpoint with distinct report pins in the declared view order.
+    fn mc_fixture() -> (Vec<Placed>, Value) {
+        let mut reports: Vec<_> = ["original", "k8-compact", "k6-compact", "fp8-compact"].into_iter()
+            .map(|view| {
+                let mut p = marked(view, 2, Some(("core-view", view)));
+                p.report.profile = "smoke".into();
+                p.report.server.model = "org/MC-<&\"".into();
+                p.report.server.configuration.snapshot = None;
+                p
+            }).collect();
+        reports[1].dir = "benchmarks/deepseek_v41/k8<&\"".into();
+        let doc = serde_json::json!({"schema": MATRIX_SCHEMA,
+            "cells": [{"family": "deepseek_v41", "checkpoint": reports[0].report.server.checkpoint(),
+                "1rtx": {"status": "na", "reason": "not measured"},
+                "2rtx": {"status": "current", "report": reports[0].dir}}],
+            "mc_views": [{"family": "deepseek_v41", "checkpoint": reports[0].report.server.checkpoint(),
+                "views": {"original": reports[0].dir, "k8-compact": reports[1].dir,
+                    "k6-compact": reports[2].dir, "fp8-compact": reports[3].dir}}],
+            "retired": [{"name": "old", "config": "examples/configs/old.config", "report": reports[0].dir,
+                "release": "v5.0.0", "release_note": "last release"}]});
+        (reports, doc)
+    }
+
     #[test]
-    fn current_exports_dry_render_only_adds_retired_section() {
+    fn mc_views_precede_the_main_table_and_escape_card_links_and_labels() {
+        let (reports, doc) = mc_fixture();
+        let html = results(&reports, &Matrix::parse(&doc.to_string()).unwrap()).unwrap();
+        let (mc, rest) = html.split_once("\n<table>\n<tr><th>Model · quant</th><th>1× RTX</th>").unwrap();
+        let (main, retired) = rest.split_once("\n### Retired\n").unwrap();
+        assert!(mc.trim_start().starts_with("### Multi-core views\n"));
+        assert!(mc.contains("<th>original</th><th>k8-compact</th><th>k6-compact</th><th>fp8-compact</th>"));
+        assert!(mc.contains("<b>org/MC-&lt;&amp;&quot;</b>"));
+        assert!(mc.contains("alt=\"org/MC-&lt;&amp;&quot; (k8-compact) on "));
+        assert!(mc.contains("href=\"benchmarks/deepseek_v41/k8&lt;&amp;&quot;/card.svg\""));
+        assert!(mc.contains("src=\"benchmarks/deepseek_v41/k8&lt;&amp;&quot;/card.svg\""));
+        assert!(!mc.contains("org/MC-<&"));
+        assert_eq!(mc.matches("<img ").count(), 4);
+        assert_eq!(main.matches("original/card.svg").count(), 2);
+        assert!(!main.contains("compact/card.svg"));
+        assert!(retired.contains("Last card"));
+    }
+
+    #[test]
+    fn mc_views_reject_missing_or_mislabeled_reports() {
+        let (mut reports, doc) = mc_fixture();
+        let matrix = Matrix::parse(&doc.to_string()).unwrap();
+        let fp8 = reports.pop().unwrap();
+        let error = results(&reports, &matrix).unwrap_err().to_string();
+        assert!(error.contains("fp8-compact: missing MC report benchmarks/deepseek_v41/fp8-compact"), "{error}");
+        reports.push(fp8);
+        reports.swap(1, 2);
+        let dir = reports[1].dir.clone();
+        reports[1].dir = reports[2].dir.clone();
+        reports[2].dir = dir;
+        let error = results(&reports, &matrix).unwrap_err().to_string();
+        assert!(error.contains("k8-compact:") && error.contains("for this checkpoint and view"), "{error}");
+    }
+
+    #[test]
+    fn mc_views_schema_requires_exact_view_keys_and_distinct_paths_in_the_same_family() {
+        let (_, doc) = mc_fixture();
+        for bad in ["../escape", "/benchmarks/deepseek_v41/outside", "benchmarks/glm5/different-family",
+            "benchmarks/deepseek_v41/nested/report.json", "benchmarks/deepseek_v41/original"] {
+            let mut invalid = doc.clone();
+            invalid["mc_views"][0]["views"]["k8-compact"] = bad.into();
+            assert!(Matrix::parse(&invalid.to_string()).is_err(), "{bad}");
+        }
+        let mut missing = doc.clone();
+        missing["mc_views"][0]["views"].as_object_mut().unwrap().remove("fp8-compact");
+        assert!(Matrix::parse(&missing.to_string()).unwrap_err().to_string().contains("missing field"));
+        let mut unknown = doc.clone();
+        unknown["mc_views"][0]["views"]["bf16"] = "benchmarks/deepseek_v41/unknown".into();
+        assert!(Matrix::parse(&unknown.to_string()).unwrap_err().to_string().contains("unknown field"));
+        let mut free_form = doc.clone();
+        free_form["mc_views"][0]["views"] = "unmeasured".into();
+        assert!(Matrix::parse(&free_form.to_string()).is_err());
+        let mut duplicate = doc.clone();
+        duplicate["mc_views"].as_array_mut().unwrap().push(doc["mc_views"][0].clone());
+        assert!(Matrix::parse(&duplicate.to_string()).unwrap_err().to_string().contains("listed twice"));
+        let mut different_original = doc;
+        different_original["mc_views"][0]["views"]["original"] = "benchmarks/deepseek_v41/not-the-main-card".into();
+        assert!(Matrix::parse(&different_original.to_string()).unwrap_err().to_string().contains("current 2rtx cell"));
+    }
+
+    #[test]
+    fn current_exports_dry_render_matches_the_published_results() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
         let matrix = Matrix::load(&root.join(MATRIX_FILE)).unwrap();
         let placed = scan(&root).unwrap();
         let rendered = results(&placed, &matrix).unwrap();
         let readme = std::fs::read_to_string(root.join("README.md")).unwrap();
         let existing = readme.split_once(RESULTS_BEGIN).unwrap().1.split_once(RESULTS_END).unwrap().0.trim();
-        let current = rendered.split_once("\n### Retired").unwrap().0.trim();
-        // Once the generated README carries Retired, compare the same main section.
-        assert_eq!(current, existing.split_once("\n### Retired").map_or(existing, |(main, _)| main).trim());
-        let retired = rendered.split_once("\n### Retired").unwrap().1;
+        assert_eq!(rendered.trim(), existing);
+        let (mc, rest) = rendered.split_once("</table>\n\n<table>\n<tr><th>Model · quant</th><th>1× RTX</th>").unwrap();
+        assert!(mc.trim_start().starts_with("### Multi-core views"));
+        assert_eq!(mc.matches("<img ").count(), 4 * matrix.mc_views.len());
+        let compact: crate::smoke::Matrix = serde_json::from_str(&std::fs::read_to_string(
+            root.join("scripts/bench/release-smoke-v6-mc-compact.json")).unwrap()).unwrap();
+        let published: BTreeSet<_> = matrix.mc_views.iter().flat_map(|entry| entry.views.ordered())
+            .filter(|(view, _)| *view != "original").map(|(_, path)| path).collect();
+        assert_eq!(published.len(), compact.entries.len());
+        let index = std::fs::read_to_string(root.join("benchmarks/README.md")).unwrap();
+        for entry in &compact.entries {
+            let suffix = format!("-{}", entry.name);
+            let dir = published.iter().find(|path| path.to_string_lossy().ends_with(&suffix))
+                .unwrap_or_else(|| panic!("{} is missing from mc_views", entry.name));
+            assert!(root.join(dir).join("card.svg").is_file());
+            assert!(index.contains(&link(dir.strip_prefix("benchmarks").unwrap(), "report.svg")));
+        }
+        let retired = rest.split_once("\n### Retired").unwrap().1;
         assert_eq!(retired.matches("<tr><td>").count(), matrix.retired.len());
         let digits = |s: &str| !s.is_empty() && s.bytes().all(|c| c.is_ascii_digit());
         let version = |s: &str| -> Option<Vec<String>> {
@@ -1964,7 +2168,7 @@ mod tests {
         let full = placed(before.clone());
         let slimmed_placed = placed(after.clone());
         let matrix = if accepted(&full[0].report) { one_row_of(&full[0]) }
-            else { Matrix { rows: Vec::new(), retired: Vec::new() } };
+            else { Matrix::default() };
         assert_eq!(results(&full, &matrix).unwrap(), results(&slimmed_placed, &matrix).unwrap());
         assert_eq!(index(&full), index(&slimmed_placed));
         let published = BTreeSet::from([full[0].dir.clone()]);
