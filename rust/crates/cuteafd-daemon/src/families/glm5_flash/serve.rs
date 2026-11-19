@@ -866,6 +866,8 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
     let mut reserve = Reserve::new(prefix.reserve.config(engine.max_context)?, cache.pool().page_rows());
     let (mut requests, mut generated_total) = (0u64, 0u64);
     let mut trace = crate::shared::speculation_trace::Trace::open()?;
+    // DFlash2 selector features land only for the open trace's round records.
+    if let Some(drafter) = drafter { drafter.set_trace_features(trace.is_some()); }
     let memory_boundaries = std::cell::RefCell::new(Vec::<serde_json::Value>::new());
     let first_prefill_seen = std::cell::Cell::new([false; 2]);
     let mut lane = DecodeLane::default();
@@ -1511,6 +1513,8 @@ async fn decode_round(lease: LaneLease<'_>, engine: &GlmfEngine<'_>, opened: &Op
             lengths: sequences.iter().map(|s| s.len() - 1).collect::<Vec<_>>(),
             accepted: verified.iter().map(|v| v.1.saturating_sub(1)).collect::<Vec<_>>(),
             neural_tokens: drafted.iter().map(|d| d.as_ref().map(|d| d.tokens.clone())).collect::<Vec<_>>(),
+            // DFlash2 selector [margin, best probability, entropy, rank] per drafted token.
+            neural_features: drafted.iter().map(|d| d.as_ref().map(|d| d.features.clone())).collect::<Vec<_>>(),
             copy_windows: copy_windows,
             verify_tokens: sequences.clone(),
             committed_tokens: active.iter().zip(&before).map(|(a, &n)| a.history[n..].to_vec()).collect::<Vec<_>>(),

@@ -128,10 +128,12 @@ pub(crate) struct ContextRow {
     pub position: usize,
 }
 
-/// The drafted tokens after one anchor.
+/// The drafted tokens after one anchor, and (only while a speculation trace
+/// is open) each token's [`features`] for that trace.
 #[derive(Debug, Clone)]
 pub(crate) struct Draft {
     pub tokens: Vec<u32>,
+    pub features: Vec<[f32; 4]>,
 }
 
 pub(crate) struct MimoDrafter<'a> {
@@ -162,6 +164,9 @@ pub(crate) struct MimoDrafter<'a> {
     mask_row: Vec<u8>,
     mask_device: Dev<'a>,
     workspace: RefCell<Option<Workspace<'a>>>,
+    /// The speculation trace is open: rounds also land the top-16 logits so the
+    /// trace records [`features`] (diagnostic only; no decision reads them).
+    trace_features: std::cell::Cell<bool>,
     representation: MimoDraftRepresentation,
     bf16_head: bool,
     fp8_workspace: Option<Dev<'a>>,
@@ -291,6 +296,16 @@ mod mask_tests {
     use super::*;
     use std::io::Write;
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn trace_features_match_pre_2443_selector_row() {
+        // Two equal leaders and a far tail: margin 0, p = 1/2, entropy ln 2.
+        let mut top = vec![-80.0f32; 16];
+        top[0] = 3.0; top[1] = 3.0;
+        let [margin, best, entropy, rank] = features(&top);
+        assert_eq!((margin, rank), (0.0, 0.0));
+        assert!((best - 0.5).abs() < 1e-6 && (entropy - std::f32::consts::LN_2).abs() < 1e-5);
+    }
 
     #[test]
     fn trained_mask_missing_is_typed_and_corrupt_is_an_error() {
@@ -677,6 +692,7 @@ impl<'a> MimoDrafter<'a> {
             },
             mask_row,
             workspace: RefCell::new(None),
+            trace_features: std::cell::Cell::new(false),
             representation,
             bf16_head,
             fp8_workspace,
@@ -684,6 +700,12 @@ impl<'a> MimoDrafter<'a> {
             cfg,
             rank, ranks, peer: None, exchange: None,
         })
+    }
+
+    /// Land each round's top-16 logits for an open speculation trace. Only the
+    /// trace records the features; tokens and every policy input are unchanged.
+    pub(crate) fn set_trace_features(&self, traced: bool) {
+        self.trace_features.set(traced);
     }
 
     pub(crate) fn prepare_workspace(&self) -> Result<()> {
@@ -1036,22 +1058,31 @@ impl<'a> MimoDrafter<'a> {
         let landing = |offset: usize| cuteafd_ffi::CuteafdHostBuffer {
             // SAFETY: both halves stay inside the 2 x drafted x 64-byte landing.
             ptr: unsafe { output.landing.buffer.ptr.cast::<u8>().add(offset) }.cast(), bytes: drafted * 64, ..output.landing.buffer };
-        // Only candidate ids are consumed; history needs no logit features.
+        // Serving consumes only candidate ids; an open trace also lands the top-16 logits.
+        let traced = self.trace_features.get();
         // SAFETY: the device buffers hold `drafted` 64-byte rows; the landing
         // is pinned, owned by the workspace, and read only after the wait.
         unsafe {
+            if traced {
+                l.copy_d2h_host_buffer_async(landing(0), CuteafdDeviceBuffer { bytes: drafted * 64, ..output.unary.buffer },
+                    drafted * 64, s)?;
+            }
             l.copy_d2h_host_buffer_async(landing(drafted * 64),
                 CuteafdDeviceBuffer { bytes: drafted * 64, ..output.candidates.buffer }, drafted * 64, s)?;
             self.round.borrow_mut().wait(s)?;
         }
         self.timing.publish_completed()?;
         self.timing.dump_head_input(w.n.buffer, rows, h)?;
-        let candidates = &output.landing.bytes()[drafted * 64..2 * drafted * 64];
+        let (unary, candidates) = output.landing.bytes()[..2 * drafted * 64].split_at(drafted * 64);
         let word = |b: &[u8], i: usize| u32::from_le_bytes(b[i * 4..i * 4 + 4].try_into().unwrap());
         let drafts = (0..s_count).map(|i| {
             let rows = (0..c.drafts()).map(|j| i * c.drafts() + j);
             Draft {
-                tokens: rows.map(|r| word(candidates, r * 16)).collect(),
+                tokens: rows.clone().map(|r| word(candidates, r * 16)).collect(),
+                features: if !traced { Vec::new() } else { rows.map(|r| {
+                    let values: Vec<f32> = (0..16).map(|k| f32::from_bits(word(unary, r * 16 + k))).collect();
+                    features(&values)
+                }).collect() },
             }
         }).collect();
         Ok(drafts)
@@ -1145,6 +1176,18 @@ impl<'a> MimoDrafter<'a> {
     pub fn put_taps(&self, rows: &[u8]) -> Result<()> {
         self.put(&self.taps, rows)
     }
+}
+
+/// [margin, best probability, entropy, rank] of one drafted row from its top-16
+/// logits (best first), for the speculation trace only. Copied unchanged from
+/// the pre-#2443 MiMo drafter (206d36a323 `mimo_v2/dflash.rs` `features`); rank
+/// is always 0 because MiMo drafts the top candidate.
+pub(crate) fn features(top: &[f32]) -> [f32; 4] {
+    let best = top[0];
+    let mass: Vec<f32> = top.iter().map(|&u| (u - best).exp()).collect();
+    let total: f32 = mass.iter().sum();
+    let entropy = total.ln() - top.iter().zip(&mass).map(|(&u, &m)| m * (u - best)).sum::<f32>() / total;
+    [best - top.get(1).copied().unwrap_or(f32::NEG_INFINITY), 1.0 / total, entropy.max(0.0), 0.0]
 }
 
 impl crate::shared::speculation::dflash::ReplayDrafter for MimoDrafter<'_> {

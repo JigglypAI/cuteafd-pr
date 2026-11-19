@@ -664,6 +664,8 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
     // then steps and verified rows.
     let mut phases = [0f64; 8];
     let mut trace = Trace::open()?;
+    // Selector features land only for the open trace's cycle records.
+    if let Some(drafter) = drafter { drafter.set_trace_features(trace.is_some()); }
     let mut prefills = policy.decode_share.queue::<Prefill<'_>>()?;
     // A request waits here for KV (and before that, with images, in `media` for its features).
     let mut kv_waiter = cuteafd_engine::prefix::DeferredAdmission::<Admit>::default();
