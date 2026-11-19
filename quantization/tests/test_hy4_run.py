@@ -82,12 +82,14 @@ def test_both_encodes_receive_same_hessian_and_only_serialized_k8_replays(tmp_pa
     runner.progress = SimpleNamespace(event=lambda *args, **kwargs: None)
     attempts, reloads = [], []
 
-    def quantize(weight, raw, *, bits, device):
+    def quantize(weight, raw, *, bits, device, codebook):
+        assert codebook == "mul1"
         assert weight is source
         attempts.append((bits, raw))
         return {suffix: torch.full((2, 2), bits) for suffix in run.recipe.SUFFIXES}, {}, {"bits": bits}
 
-    def reconstruct(packed, shape, *, device, dtype):
+    def reconstruct(packed, shape, *, device, dtype, codebook):
+        assert codebook == "mul1"
         reloads.append(dtype)
         return packed["trellis"].to(dtype)
 
@@ -143,7 +145,7 @@ def test_resident_expert_replay_uses_only_sealed_weights_and_preserves_sum(tmp_p
         return {f"k4.{name}.trellis": weight.to(torch.int16).cpu(),
                 f"k4.{name}.suh": torch.ones(2, dtype=torch.float16),
                 f"k4.{name}.svh": torch.ones(2, dtype=torch.float16),
-                f"k4.{name}.mcg": torch.tensor(1, dtype=torch.int32)}
+                f"k4.{name}.mul1": torch.tensor(1, dtype=torch.int32)}
 
     def encode(name, weight, covariance, bits, device, metrics):
         encodes.append(name)

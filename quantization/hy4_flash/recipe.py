@@ -5,7 +5,8 @@ from collections import Counter
 import hashlib
 import re
 
-from glm5.core_k6.recipe import packed_bytes, packed_specs
+from glm5.core_k6.recipe import packed_bytes
+from core_export import packed_specs as core_packed_specs
 from kimi_k3.uniform_k2.storage import canonical
 
 BASE_REPO = "tencent/Hy4-flash"
@@ -23,8 +24,8 @@ SWA_LAYERS = tuple(layer for layer in range(LAYER_COUNT) if layer not in SPARSE_
 ENGRAM_ROWS = {1: 164_994_380, 11: 164_999_008, 21: 165_004_086, 31: 165_008_942}
 ENGRAM_TABLES = {f"model.layers.{layer}.engram_layer.multi_head_embedding.embedding.weight": rows
                  for layer, rows in ENGRAM_ROWS.items()}
-MCG_MULTIPLIER = 0xCBAC1FED
-SUFFIXES = ("trellis", "suh", "svh", "mcg")
+MUL1_MULTIPLIER = 0x83DCD12D
+SUFFIXES = ("trellis", "suh", "svh", "mul1")
 EXPERT_MODULE_COUNT = (LAYER_COUNT - 1) * EXPERTS_PER_LAYER * 3
 BASE_CORE_MODULE_COUNT, MTP_CORE_MODULE_COUNT = 461, 45
 CORE_MODULE_COUNT = BASE_CORE_MODULE_COUNT + MTP_CORE_MODULE_COUNT
@@ -34,7 +35,12 @@ _EXPERT = re.compile(r"model\.layers\.(\d+)\.mlp\.experts\.(\d+)\.(gate_proj|up_
 
 def _geometry(inputs, outputs, bits, group):
     return dict(in_features=inputs, out_features=outputs, stored_out_features=(outputs + 127) // 128 * 128,
-                bits=bits, group=group)
+                bits=bits, group=group, codebook="mul1")
+
+
+def packed_specs(module, geometry, *, bits=None):
+    width = geometry["bits"] if bits is None else bits
+    return core_packed_specs(module, dict(geometry, bits=width, codebook="mul1"))
 
 
 def _attention(heads, include_kv_b):

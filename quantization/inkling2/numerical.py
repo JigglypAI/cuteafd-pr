@@ -24,11 +24,13 @@ def fork_module(name):
     return importlib.import_module('gptqmodel.' + name)
 
 
-def quantize_projection(weight, raw_hessian, *, bits=6, seed=787, sigma=.025, device='cuda:0'):
+def quantize_projection(weight, raw_hessian, *, bits=6, seed=787, sigma=.025, device='cuda:0', codebook='mcg'):
     if type(bits) is not int or bits not in (4, 6, 8):
         raise ValueError('Inkling production encodes are K4, K6 and K8')
+    # Old MCG-only pins predate the optional keyword.
+    options = {} if codebook == 'mcg' else {'codebook': codebook}
     return fork_module('utils.glm5_core').quantize_projection(
-        weight, raw_hessian, bits=bits, seed=seed, sigma=sigma, device=device)
+        weight, raw_hessian, bits=bits, seed=seed, sigma=sigma, device=device, **options)
 
 
 def covariance_accumulator(width, device='cuda:0'):

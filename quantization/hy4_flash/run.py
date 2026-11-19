@@ -123,14 +123,14 @@ def raw(acc, identity_rows=0):
 def reconstruction(values, name, bits, shape, device):
     packed = {suffix: values[f"k{bits}.{name}.{suffix}"] for suffix in recipe.SUFFIXES}
     return numerical.reconstruct_projection(packed, list(shape), device=str(device),
-                                            dtype=torch.bfloat16).float()
+                                            dtype=torch.bfloat16, codebook="mul1").float()
 
 
 def encode(name, weight, covariance, bits, device, metrics):
     values = {}
     for width in bits:
         packed, measured, evidence = numerical.quantize_projection(
-            weight, covariance, bits=width, device=str(device))
+            weight, covariance, bits=width, device=str(device), codebook="mul1")
         values.update({f"k{width}.{name}.{key}": value for key, value in packed.items()})
         metrics.append(evidence | measured | dict(module=name, bits=width))
     return values
