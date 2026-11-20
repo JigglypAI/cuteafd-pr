@@ -88,8 +88,19 @@ impl cuteafd_engine::media::EncoderClient for Encoder {
         }
     }
 }
+impl Encoder {
+    pub(crate) fn gpu_turn(&self) -> Option<std::sync::Arc<crate::shared::gpu_turn::GpuTurn>> {
+        match self {
+            Self::Local(client) => client.gpu_turn(),
+            Self::Split { image, audio } => image.gpu_turn().or_else(|| audio.gpu_turn()),
+            _ => None,
+        }
+    }
+}
+
 impl scheduler::Encoder for Encoder {
     fn available(&self) -> bool { self.available() }
+    fn gpu_turn(&self) -> Option<std::sync::Arc<crate::shared::gpu_turn::GpuTurn>> { self.gpu_turn() }
 }
 
 type Dev<'a> = Rc<Allocation<'a>>;

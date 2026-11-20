@@ -134,7 +134,8 @@ impl ReadyVision {
 
     pub fn load(args: &super::EngineArgs, view: &cuteafd_loader::plan::checkpoint::CheckpointView,
         library: &cuteafd_ffi::NativeLibrary, mode: MediaMode,
-        cache_bytes: usize, remote: Option<RemoteVision>) -> Result<Option<Self>> {
+        cache_bytes: usize, remote: Option<RemoteVision>,
+        paired: bool) -> Result<Option<Self>> {
         let Some(config) = vision_config_view(mode, view)? else { return Ok(None); };
         let admitted = args.serving_encoder.as_ref().context("Flash vision lacks admitted physical owners")?;
         let processor = ProcessorConfig::from_snapshot(&args.snapshot, ImageFamily::GlmFlash)?;
@@ -184,7 +185,7 @@ impl ReadyVision {
         library.cuda_set_device(gpu)?;
         let admitted = admitted.admitted_bytes();
         let loaded = crate::shared::vision::EncoderService::start_coordinator(&args.snapshot,
-            Some((spec, admitted)), args.native_lib.clone(), gpu, None);
+            Some((spec, admitted)), args.native_lib.clone(), gpu, None, crate::shared::gpu_turn::paired_turn(paired));
         let restored = library.cuda_set_device(args.device);
         let (service, push) = loaded?;
         restored?;
@@ -200,6 +201,9 @@ pub(crate) enum Encoder {
     Off,
 }
 impl Encoder {
+    pub(crate) fn gpu_turn(&self) -> Option<Arc<crate::shared::gpu_turn::GpuTurn>> {
+        match self { Self::Local(client) => client.gpu_turn(), _ => None }
+    }
     pub fn health_handle(&self) -> Option<Arc<std::sync::atomic::AtomicBool>> {
         match self { Self::Remote(client) => Some(client.health_handle()), Self::Local(client) => Some(client.health_handle()), Self::Off => None }
     }

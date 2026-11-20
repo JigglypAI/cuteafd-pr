@@ -64,6 +64,9 @@ impl LocalEncoder {
             next: 0,
         }
     }
+    pub(crate) fn gpu_turn(&self) -> Option<Arc<crate::shared::gpu_turn::GpuTurn>> {
+        self.service.gpu_turn()
+    }
     pub fn healthy(&self) -> bool {
         self.service.healthy()
     }
@@ -214,6 +217,7 @@ mod tests {
             audio_ledger: None,
             audio_geometry: None,
             healthy: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            turn: None,
         };
         let config = ProcessorConfig::for_family(cuteafd_loader::media::ImageFamily::Qwen);
         let encoder = LocalEncoder::with_limits(service, &config, 1, limits);
@@ -294,6 +298,7 @@ mod tests {
             audio_ledger: Some(Default::default()),
             audio_geometry: Some(geometry),
             healthy: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            turn: None,
         };
         let config = ProcessorConfig::for_family(cuteafd_loader::media::ImageFamily::Mimo);
         let mut encoder = LocalEncoder::new(service, &config, 8192, 256);
@@ -337,6 +342,7 @@ mod tests {
                 audio_ledger: None,
                 audio_geometry: None,
                 healthy: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            turn: None,
             };
             let config = ProcessorConfig::for_family(family);
             let encoder = LocalEncoder::new(service, &config, 2, 256);
@@ -370,6 +376,7 @@ mod tests {
             audio_ledger: None,
             audio_geometry: None,
             healthy: health,
+            turn: None,
         };
         let config = ProcessorConfig::for_family(cuteafd_loader::media::ImageFamily::Qwen);
         let encoder = LocalEncoder::new(service, &config, 2, 256);
@@ -400,6 +407,7 @@ mod tests {
             audio_ledger: None,
             audio_geometry: None,
             healthy: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            turn: None,
         };
         let config = ProcessorConfig::for_family(cuteafd_loader::media::ImageFamily::Mimo);
         let mut encoder = LocalEncoder::new(service, &config, 2, 256);
@@ -461,6 +469,7 @@ mod tests {
             audio_ledger: None,
             audio_geometry: None,
             healthy: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            turn: None,
         };
         let config = ProcessorConfig::for_family(cuteafd_loader::media::ImageFamily::Mimo);
         let mut encoder = LocalEncoder::new(service, &config, 2, 256);

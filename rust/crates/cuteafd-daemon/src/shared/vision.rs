@@ -559,6 +559,13 @@ struct Work {
     encode_ns: Arc<AtomicU64>,
     cancelled: Arc<AtomicBool>,
 }
+struct OwnerPanicHealth<'a>(&'a AtomicBool);
+impl Drop for OwnerPanicHealth<'_> {
+    fn drop(&mut self) {
+        if thread::panicking() { self.0.store(false, Ordering::Release); }
+    }
+}
+
 struct OwnerHealth(Arc<AtomicBool>);
 impl Drop for OwnerHealth {
     fn drop(&mut self) { self.0.store(false, Ordering::Release); }
@@ -582,6 +589,15 @@ fn reply_encode(healthy: &AtomicBool, reply: &mpsc::SyncSender<Result<Vec<u16>>>
     terminal
 }
 
+/// Check cancellation after acquiring the turn; measure only the encode itself.
+fn encode_live<T>(cancelled: &AtomicBool, encode_ns: &AtomicU64, encode: impl FnOnce() -> Result<T>) -> Result<T> {
+    if cancelled.load(Ordering::Acquire) { return Err(VisionError::Cancelled); }
+    let started = std::time::Instant::now();
+    let result = encode();
+    encode_ns.store(started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64, Ordering::Release);
+    result.and_then(|output| if cancelled.load(Ordering::Acquire) { Err(VisionError::Cancelled) } else { Ok(output) })
+}
+
 /// Bounded shared media queue, one clip/image at a time. CUDA stays on this thread.
 /// Dropping the service closes admission, drains accepted jobs and joins owner.
 pub struct EncoderService {
@@ -591,6 +607,7 @@ pub struct EncoderService {
     pub audio_ledger: Option<cuteafd_ffi::audio::AudioLedger>,
     audio_geometry: Option<cuteafd_core::media::AudioTokenGeometry>,
     healthy: Arc<AtomicBool>,
+    turn: Option<Arc<crate::shared::gpu_turn::GpuTurn>>,
 }
 impl EncoderService {
     pub fn start(
@@ -610,7 +627,7 @@ impl EncoderService {
         admitted_bytes: u64,
         audio: Option<audio::AudioOwnerConfig>,
     ) -> Result<Self> {
-        Self::start_media(Some((spec, admitted_bytes)), library, device, audio, false).map(|(service, _)| service)
+        Self::start_media(Some((spec, admitted_bytes)), library, device, audio, false, None).map(|(service, _)| service)
     }
     /// Audio-only deployment keeps the same owner/queue, without vision weights.
     pub fn start_audio(
@@ -618,16 +635,16 @@ impl EncoderService {
         device: i32,
         audio: audio::AudioOwnerConfig,
     ) -> Result<Self> {
-        Self::start_media(None, library, device, Some(audio), false).map(|(service, _)| service)
+        Self::start_media(None, library, device, Some(audio), false, None).map(|(service, _)| service)
     }
     /// Coordinator-only deferred load. Spark owners retain the existing mount startup.
     pub(crate) fn start_coordinator(
         snapshot: &Path, vision: Option<(TowerSpec, u64)>, library: PathBuf, device: i32,
-        audio: Option<audio::AudioOwnerConfig>,
+        audio: Option<audio::AudioOwnerConfig>, turn: Option<Arc<crate::shared::gpu_turn::GpuTurn>>,
     ) -> anyhow::Result<(Self, push::Contribution)> {
         use crate::shared::experts::rtx::push::{PushPolicy, PushStartupError};
         let defer = PushPolicy::for_snapshot(snapshot)? == PushPolicy::Required;
-        Self::start_media(vision, library, device, audio, defer)
+        Self::start_media(vision, library, device, audio, defer, turn)
             .map_err(|error| PushStartupError::Planning(error.into()).into())
     }
     fn start_media(
@@ -636,6 +653,7 @@ impl EncoderService {
         device: i32,
         audio: Option<audio::AudioOwnerConfig>,
         defer: bool,
+        turn: Option<Arc<crate::shared::gpu_turn::GpuTurn>>,
     ) -> Result<(Self, push::Contribution)> {
         // Query and admit every enabled component before either allocates.
         if let Some((spec, admitted)) = &vision {
@@ -664,10 +682,12 @@ impl EncoderService {
         let (ready, readiness) = mpsc::sync_channel(1);
         let healthy = Arc::new(AtomicBool::new(false));
         let owner_health = healthy.clone();
+        let owner_turn = turn.clone();
         let owner = thread::Builder::new()
             .name("media-owner".into())
             .spawn(move || {
                 let _health = OwnerHealth(owner_health.clone());
+                let turn = owner_turn;
                 // Query in the allocating owner/context, before loading either tower.
                 let vision_bytes = vision.as_ref().map_or(0, |(_, bytes)| *bytes);
                 let audio_bytes = audio.as_ref().map_or(0, |config| config.admitted_bytes());
@@ -731,40 +751,45 @@ impl EncoderService {
                     if ack.send(result).is_err() || failed { return; }
                 }
                 while let Ok(work) = jobs.recv() {
-                    let started = std::time::Instant::now();
-                    let result = if work.cancelled.load(Ordering::Acquire) {
-                        Err(VisionError::Cancelled)
+                    if work.cancelled.load(Ordering::Acquire) {
+                        let _ = work.reply.send(Err(VisionError::Cancelled));
+                        continue;
+                    }
+                    let turn = turn.as_deref().map(crate::shared::gpu_turn::GpuTurn::media);
+                    // The native owners unwind before the turn if an encode fails or panics.
+                    let (mut vision, mut audio) = (runtime.take(), audio_runtime.take());
+                    let _panic_health = OwnerPanicHealth(&owner_health);
+                    let result = if turn.as_ref().is_some_and(|turn| turn.closed) {
+                        Err(VisionError::Unavailable)
                     } else {
-                        let encoded = match work.job {
-                            EncoderJob::Vision(mut job) => match runtime.as_mut() {
+                        encode_live(&work.cancelled, &work.encode_ns, || match work.job {
+                            EncoderJob::Vision(mut job) => match vision.as_mut() {
                                 Some(runtime) => match job.pixels {
                                     Some(pixels) => runtime.native.encode_pixels_into(&job.rgb,job.grid,pixels,&job.lut,&mut job.output).map_err(VisionError::from),
                                     None => runtime.encode_into(&job.rgb,job.grid,&job.lut,&mut job.output),
                                 }.map(|()| job.output),
                                 None => Err(VisionError::Unsupported("vision encoder is not loaded".into())),
                             },
-                            EncoderJob::Audio(job) => match audio_runtime.as_mut() {
+                            EncoderJob::Audio(job) => match audio.as_mut() {
                                 Some(runtime) => runtime.encode(job),
                                 None => Err(VisionError::Unsupported("audio encoder is not loaded".into())),
                             },
-                        };
-                        encoded.and_then(|output| {
-                            if work.cancelled.load(Ordering::Acquire) {
-                                Err(VisionError::Cancelled)
-                            } else { Ok(output) }
                         })
                     };
-                    work.encode_ns.store(started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64, Ordering::Release);
                     if let Err(ref error) = result {
                         tracing::debug!(%error, "media job failed");
                     }
                     // CUDA errors poison this owner: queued tickets fail closed.
-                    if reply_encode(&owner_health, &work.reply, result) { break; }
+                    if reply_encode(&owner_health, &work.reply, result) { return; }
+                    (runtime, audio_runtime) = (vision, audio);
                 }
+                let _turn = turn.as_deref().map(crate::shared::gpu_turn::GpuTurn::media);
+                owner_health.store(false, Ordering::Release);
+                drop((runtime, audio_runtime));
             })?;
         match readiness.recv() {
             Ok(Ok((ledger, audio_ledger, vision_arena, pcm_arena))) => {
-                let owner = Arc::new(push::OwnerThread::new(owner, commit.clone()));
+                let owner = Arc::new(push::OwnerThread::coordinator(owner, commit.clone(), healthy.clone(), turn.clone()));
                 let contribution = push::Contribution::prepare(device, vision_plan.as_ref().zip(vision_arena),
                     pcm_plan.as_ref().zip(pcm_arena), mimo_plan.as_ref().zip(pcm_arena), defer.then_some((commit, acknowledgement, owner.clone())))
                     .map_err(|error| VisionError::Unsupported(error.to_string()))?;
@@ -775,6 +800,7 @@ impl EncoderService {
                 audio_ledger,
                 audio_geometry,
                 healthy,
+                turn,
             }, contribution))
             },
             Ok(Err(error)) => {
@@ -793,6 +819,7 @@ impl EncoderService {
         self.healthy.load(Ordering::Acquire) && self.owner.as_ref().is_some_and(|owner| !owner.is_finished())
     }
     pub fn health_handle(&self) -> Arc<AtomicBool> { self.healthy.clone() }
+    pub(crate) fn gpu_turn(&self) -> Option<Arc<crate::shared::gpu_turn::GpuTurn>> { self.turn.clone() }
     pub fn submit(&self, job: EncodeJob) -> Result<EncoderTicket> {
         self.submit_job(EncoderJob::Vision(job))
     }
@@ -830,6 +857,7 @@ impl EncoderService {
 }
 impl Drop for EncoderService {
     fn drop(&mut self) {
+        self.healthy.store(false, Ordering::Release);
         self.queue.take();
         self.owner.take();
     }
@@ -885,6 +913,20 @@ mod tests {
             let ctypes: Vec<u64> = serde_json::from_slice(&output.stdout).unwrap();
             assert_eq!(values, ctypes, "Rust/ctypes tower spec differs for {family}");
         }
+    }
+
+    #[test]
+    fn cancellation_while_waiting_skips_cuda_and_encode_timing() {
+        let turn = crate::shared::gpu_turn::GpuTurn::new();
+        let cancelled = AtomicBool::new(false);
+        let encode_ns = AtomicU64::new(0);
+        // Simulate cancellation after admission but before the waiting owner can encode.
+        assert!(!cancelled.load(Ordering::Acquire));
+        cancelled.store(true, Ordering::Release);
+        let _media = turn.media();
+        let result = encode_live(&cancelled, &encode_ns, || -> Result<()> { panic!("cancelled job reached CUDA") });
+        assert!(matches!(result, Err(VisionError::Cancelled)));
+        assert_eq!(encode_ns.load(Ordering::Acquire), 0);
     }
 
     #[test]
@@ -946,7 +988,7 @@ mod tests {
         let (queue, jobs) = mpsc::sync_channel(2);
         let mut service = EncoderService { queue: Some(queue), owner: None,
             ledger: Default::default(), audio_ledger: None, audio_geometry: None,
-            healthy: Arc::new(AtomicBool::new(true)) };
+            healthy: Arc::new(AtomicBool::new(true)), turn: None };
         let audio_job = || audio::AudioEncodeJob { pcm: vec![0.0; 481].into(),
             output: vec![0; 4096], fp32_scratch: vec![0.0; 4096] };
         assert!(matches!(service.submit_audio(audio_job()), Err(VisionError::Unsupported(_))));

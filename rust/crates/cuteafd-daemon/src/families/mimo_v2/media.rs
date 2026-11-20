@@ -187,7 +187,7 @@ impl ReadyVision {
                     &[cuteafd_core::serving_capacity::MemoryReservation { name: "vision.resident_weights_scratch".into(), bytes: vision_bytes },
                       cuteafd_core::serving_capacity::MemoryReservation { name: "audio.resident_weights_scratch".into(), bytes: audio_bytes }], cuteafd_loader::placement::reserve::gpu("mimo_v2"))?;
                 let (service, contribution) = crate::shared::vision::EncoderService::start_coordinator(&args.snapshot,
-                    spec.map(|spec| (spec, vision_bytes)), args.native_lib.clone(), gpu, audio)?;
+                    spec.map(|spec| (spec, vision_bytes)), args.native_lib.clone(), gpu, audio, crate::shared::gpu_turn::paired_turn(args.split_device.is_some()))?;
                 push.extend(contribution);
                 Ok(Encoder::Local(crate::shared::vision::local::LocalEncoder::new(service, &processor, width, 4096)))
             })();

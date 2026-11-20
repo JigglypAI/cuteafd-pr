@@ -23,6 +23,7 @@
 //! at its last chunk; a decode whose client left is not retained.
 //! `prompt_cache_hit_tokens` reports the restored rows; `/v1/stats` carries
 //! the cache's counters.
+use crate::shared::gpu_turn::SchedulerMedia;
 use crate::shared::draft::history::{self, Policy as DraftPolicy, Proposal};
 use super::engine::{GlmfEngine, GlmfPlacement, DECODE_ROWS, PAGE_ROWS, WIDE_DECODE_ROWS};
 use super::prefix::{GlmfPrefix, PrefixMarks};
@@ -296,8 +297,8 @@ fn serve_loop(mut args: super::EngineArgs, mut receive: mpsc::Receiver<NativeReq
     args.serving_media_bytes = bytes as u64;
     let prepared = std::cell::RefCell::new(None);
     let mut ready = Some(ready);
-    let result = opened.with_engine_media(&args, || {
-        let vision = super::media::ReadyVision::load(&args, &opened.view, &opened.library, vision, bytes, remote)?;
+    let result = opened.with_engine_media(&args, |split_device| {
+        let vision = super::media::ReadyVision::load(&args, &opened.view, &opened.library, vision, bytes, remote, split_device.is_some())?;
         let records = vision.as_ref().map(|vision| vision.push.records()).unwrap_or_default();
         *prepared.borrow_mut() = vision;
         Ok(records)
@@ -880,10 +881,14 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
     let mut kv_waiter = cuteafd_engine::prefix::DeferredAdmission::<MediaReady<super::media::Prompt>>::default();
     publish(stats, requests, generated_total, 0, 0, ring_misses, &cache, media, preparer, &lane.stats,
         &memory_boundaries, &reserve, 0);
+    let gpu_turn = media.encoder().gpu_turn();
+    let turn = SchedulerMedia::new(gpu_turn.as_deref())?;
+    let offer = || turn.offer(|| engine.require_live());
     ready();
     crate::shared::api::run_scheduler(|| {
     loop {
         engine.require_live()?;
+        offer()?;
         if let Some(reason) = cuteafd_transport::health::failure_reason() {
             anyhow::bail!("expert wire unavailable until restart: {reason}");
         }
@@ -904,7 +909,8 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
                         publish(stats, requests, generated_total, active.len(), prefills.len(), ring_misses, &cache,
                             media, preparer, &lane.stats, &memory_boundaries, &reserve, stalled.len());
                         let job = if !busy && media.is_empty() {
-                            match receive.blocking_recv() { Some(job) => job, None => return Ok(()) }
+                            let next = turn.receive(&runtime, receive)?;
+                            match next { Some(job) => job, None => return Ok(()) }
                         } else {
                             match receive.try_recv() {
                                 Ok(job) => job,
@@ -1039,6 +1045,7 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
                 let scored = probe::score(&opened.library, &job.probe, &tokens, from, engine.prefill_capacity(),
                     DECODE_ROWS, probe::verify_rows(&job.probe), true, &mut placement,
                     |placement, chunk, rows, position| {
+                        offer()?;
                         if rows > 1 {
                             engine.prefill_streamed_scoring(placement, chunk, &request_media,
                                 probe::ScoringRows { consumer: &job.probe, position })
@@ -1047,8 +1054,17 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
                             Ok(engine.prefill_media_device(placement, chunk, &request_media)?.map(probe::ScoreLogits::Device))
                         }
                     },
-                    |placement, chunk| engine.verify_media_device(&mut [(placement, chunk.len())], chunk, &request_media)?
-                        .context("scoring needs every layer"));
+                    |placement, chunk| {
+                        offer()?;
+                        engine.verify_media_device(&mut [(placement, chunk.len())], chunk, &request_media)?
+                            .context("scoring needs every layer")
+                    });
+                if let Err(stall) = turn.check() {
+                    let error = anyhow::Error::from(stall);
+                    crate::shared::api::publish_scheduler_failure(&error);
+                    let _ = job.events.send(Err(NativeFailure::Worker(format!("{error:#}"))));
+                    return Err(error);
+                }
                 match scored {
                     Ok(_) => { let _ = job.events.send(Ok(InferenceChunk::Finish { finish_reason: InferenceFinishReason::Length })); }
                     Err(error) => { let _ = job.events.send(Err(NativeFailure::Worker(format!("scoring: {error:#}")))); }
@@ -1082,14 +1098,15 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
                 started: Instant::now(), busy: 0.0, phases: [0.0; 3], packed: 0, ticket });
         }
         if prefills.due(!active.is_empty()) {
+            let excluded = turn.prefill_excluded();
             let caching = cache.enabled();
             // One chunk (a lane wave) of each waiting prompt (whole prompts with --decode-share 0); with
             // --prefill-packing, adjacent prompts whose chunks fit one pass prefill together.
             let cx = PrefillCx { engine, library: &opened.library, family: &family, caching,
-                first_prefill_seen: &first_prefill_seen, memory_boundaries: &memory_boundaries };
+                first_prefill_seen: &first_prefill_seen, memory_boundaries: &memory_boundaries, offer: &offer };
             let finished = if engine.packs_prefill() {
                 let limits = engine.packed_limits();
-                prefills.round_packed(limits.rows, DECODE_ROWS,
+                prefills.round_packed_excluding(limits.rows, DECODE_ROWS, excluded,
                     |p| packs(p).then(|| chunk_end(p) - p.done), |group, next| packable(group, next, &limits),
                     |group| if group.len() == 1 {
                         vec![prefill_chunk(&cx, &mut selector, &mut cache, &mut group[0])]
@@ -1097,8 +1114,17 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
                         prefill_group(&cx, &mut selector, &mut cache, group)
                     })
             } else {
-                prefills.round(|p| prefill_chunk(&cx, &mut selector, &mut cache, p))
+                prefills.round_excluding(excluded, |p| prefill_chunk(&cx, &mut selector, &mut cache, p))
             };
+            // The queue reports per-prompt errors, but a turn stall must stop the entire engine.
+            if let Err(stall) = turn.check() {
+                let error = anyhow::Error::from(stall);
+                crate::shared::api::publish_scheduler_failure(&error);
+                for (prompt, _) in &finished {
+                    let _ = prompt.job.events.send(Err(NativeFailure::Worker(format!("{error:#}"))));
+                }
+                return Err(error);
+            }
             for (mut p, prefilled) in finished {
                 let (slot, placement, resume) = (p.slot, p.placement.clone(), p.resume);
                 if let Err(error) = &prefilled {
@@ -1224,6 +1250,7 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
             if !media.is_empty() || !stalled.is_empty() { std::thread::park_timeout(Duration::from_millis(1)); }
             continue;
         }
+        offer()?;
         let cycle = Instant::now();
         let Some(finished) = runtime.block_on(lanes.run_one(|lease| decode_round(lease, engine, opened,
             verify_rows, &mut lane, &mut active, &mut shared, &mut selector, &family, &mut cache, &mut free_kda,
@@ -1551,13 +1578,14 @@ struct PrefillCx<'r, 'e, 'a> {
     caching: bool,
     first_prefill_seen: &'r std::cell::Cell<[bool; 2]>,
     memory_boundaries: &'r std::cell::RefCell<Vec<serde_json::Value>>,
+    offer: &'r dyn Fn() -> Result<()>,
 }
 
 /// One chunk of prompt `p` through its own pass (a lane wave where Spark prefill runs in lanes):
 /// the first token after its last chunk, the chunk's drafter context, its snapshot points.
 fn prefill_chunk<'a>(cx: &PrefillCx<'_, '_, 'a>, selector: &mut TokenSelector<'_>,
     cache: &mut PrefixCache<CudaCopyEngine<'a>>, p: &mut Prefill<'_>) -> Result<Chunk> {
-    let PrefillCx { engine, library, family, caching, first_prefill_seen, memory_boundaries } = *cx;
+    let PrefillCx { engine, library, family, caching, first_prefill_seen, memory_boundaries, offer } = *cx;
     let drafter = engine.drafter.as_ref();
     if p.done == p.tokens.len() {
         return Ok(Chunk::Done);
@@ -1566,6 +1594,7 @@ fn prefill_chunk<'a>(cx: &PrefillCx<'_, '_, 'a>, selector: &mut TokenSelector<'_
         p.cancelled = true;
         anyhow::bail!("client went away");
     }
+    offer()?;
     let timer = Instant::now();
     let end = chunk_end(p);
     let draft_end = draft_context_end(p, p.placement.len);
@@ -1681,6 +1710,10 @@ fn prefill_group<'a>(cx: &PrefillCx<'_, '_, 'a>, selector: &mut TokenSelector<'_
     cache: &mut PrefixCache<CudaCopyEngine<'a>>, group: &mut [Prefill<'_>]) -> Vec<Result<Chunk>> {
     if !group.iter().all(packs) {
         return group.iter_mut().map(|p| prefill_chunk(cx, selector, cache, p)).collect();
+    }
+    if let Err(error) = (cx.offer)() {
+        let reason = error.to_string();
+        return group.iter().map(|_| Err(anyhow::anyhow!(reason.clone()))).collect();
     }
     let engine = cx.engine;
     let timer = Instant::now();

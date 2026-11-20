@@ -18,7 +18,7 @@
 //! chunks are cut at the same rows; only when other sequences step moves.
 //! After Hugh Madden's glm53f-afd decode share (MIT, v1.1.0 49392af).
 use anyhow::Result;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
@@ -171,7 +171,13 @@ impl<P> PrefillQueue<P> {
     /// Returns the prompts that finished (`Ok`) or failed (`Err`); call
     /// [`Self::settle`] once the finished ones joined the running requests.
     pub fn round(&mut self, chunk: impl FnMut(&mut P) -> Result<Chunk>) -> Vec<(P, Result<()>)> {
-        self.round_since(Instant::now(), chunk)
+        self.round_since(Instant::now(), &Cell::default(), chunk)
+    }
+
+    /// `excluded` tracks time spent on non-prefill owners between chunks of this round.
+    pub(crate) fn round_excluding(&mut self, excluded: &Cell<Duration>, chunk: impl FnMut(&mut P) -> Result<Chunk>)
+        -> Vec<(P, Result<()>)> {
+        self.round_since(Instant::now(), excluded, chunk)
     }
 
     /// [`Self::round`] after `prepare` (e.g. a family's packed pass over the
@@ -183,15 +189,15 @@ impl<P> PrefillQueue<P> {
         mut chunk: impl FnMut(&mut C, &mut P) -> Result<Chunk>) -> Result<Vec<(P, Result<()>)>> {
         let started = Instant::now();
         prepare(context, self)?;
-        Ok(self.round_since(started, |prompt| chunk(context, prompt)))
+        Ok(self.round_since(started, &Cell::default(), |prompt| chunk(context, prompt)))
     }
 
-    fn round_since(&mut self, started: Instant, mut chunk: impl FnMut(&mut P) -> Result<Chunk>) -> Vec<(P, Result<()>)> {
+    fn round_since(&mut self, started: Instant, excluded: &Cell<Duration>, mut chunk: impl FnMut(&mut P) -> Result<Chunk>) -> Vec<(P, Result<()>)> {
         let whole = self.share == 0.0;
         let mut out = Vec::new();
         let mut ran = VecDeque::new();
         while let Some(mut prompt) = self.waiting.pop_front() {
-            if !whole && (!ran.is_empty() || !out.is_empty()) && started.elapsed().as_secs_f64() >= self.round_s {
+            if !whole && (!ran.is_empty() || !out.is_empty()) && started.elapsed().saturating_sub(excluded.get()).as_secs_f64() >= self.round_s {
                 self.waiting.push_front(prompt);
                 break;
             }
@@ -206,7 +212,7 @@ impl<P> PrefillQueue<P> {
             }
         }
         self.waiting.extend(ran);
-        self.last_round = started.elapsed().as_secs_f64();
+        self.last_round = started.elapsed().saturating_sub(excluded.get()).as_secs_f64();
         out
     }
 
@@ -254,7 +260,13 @@ impl<P> PrefillQueue<P> {
     pub fn round_packed(&mut self, cap: usize, most: usize, rows: impl Fn(&P) -> Option<usize>,
         fits: impl Fn(&[P], &P) -> bool,
         chunk: impl FnMut(&mut [P]) -> Vec<Result<Chunk>>) -> Vec<(P, Result<()>)> {
-        self.round_groups(most, |group, next| {
+        self.round_packed_excluding(cap, most, &Cell::default(), rows, fits, chunk)
+    }
+
+    pub(crate) fn round_packed_excluding(&mut self, cap: usize, most: usize, excluded: &Cell<Duration>,
+        rows: impl Fn(&P) -> Option<usize>, fits: impl Fn(&[P], &P) -> bool,
+        chunk: impl FnMut(&mut [P]) -> Vec<Result<Chunk>>) -> Vec<(P, Result<()>)> {
+        self.round_groups_excluding(most, excluded, |group, next| {
             group.iter().chain([next]).try_fold(0usize, |total, p|
                 rows(p).filter(|&n| n > 0).and_then(|n| total.checked_add(n)))
                 .is_some_and(|total| total <= cap) && fits(group, next)
@@ -266,7 +278,13 @@ impl<P> PrefillQueue<P> {
     /// receives the group and returns one outcome per member (a member without one fails). No
     /// prompt is pulled past an ineligible one. A group consumes one elapsed-time budget, with
     /// one chunk per member; with share 0 unfinished members go back to the front.
+    #[cfg(test)]
     pub fn round_groups(&mut self, most: usize, eligible: impl Fn(&[P], &P) -> bool,
+        chunk: impl FnMut(&mut [P]) -> Vec<Result<Chunk>>) -> Vec<(P, Result<()>)> {
+        self.round_groups_excluding(most, &Cell::default(), eligible, chunk)
+    }
+
+    fn round_groups_excluding(&mut self, most: usize, excluded: &Cell<Duration>, eligible: impl Fn(&[P], &P) -> bool,
         mut chunk: impl FnMut(&mut [P]) -> Vec<Result<Chunk>>) -> Vec<(P, Result<()>)> {
         let started = Instant::now();
         let whole = self.share == 0.0;
@@ -274,7 +292,7 @@ impl<P> PrefillQueue<P> {
         let mut ran = VecDeque::new();
         let mut steps = 0;
         while !self.waiting.is_empty() {
-            if !whole && steps > 0 && started.elapsed().as_secs_f64() >= self.round_s { break; }
+            if !whole && steps > 0 && started.elapsed().saturating_sub(excluded.get()).as_secs_f64() >= self.round_s { break; }
             let mut group = vec![self.waiting.pop_front().expect("nonempty prefill queue")];
             while group.len() < most && self.waiting.front().is_some_and(|next| eligible(&group, next)) {
                 group.push(self.waiting.pop_front().expect("eligible adjacent prompt"));
@@ -293,7 +311,7 @@ impl<P> PrefillQueue<P> {
             steps += 1;
         }
         self.waiting.extend(ran);
-        self.last_round = started.elapsed().as_secs_f64();
+        self.last_round = started.elapsed().saturating_sub(excluded.get()).as_secs_f64();
         out
     }
 
@@ -609,6 +627,33 @@ mod tests {
             p.left -= 1;
             Ok(if p.left == 0 { Chunk::Done } else { Chunk::More })
         }).collect()
+    }
+
+    #[test]
+    fn media_time_is_excluded_from_prefill_cutoff_and_decode_credit() {
+        for packed in [false, true] {
+            let mut queue = PrefillQueue::new(0.2);
+            queue.round_s = 0.001;
+            for id in 0..2 { queue.push(Prompt { id, left: 2 }); }
+            let excluded = Cell::default();
+            let mut seen = Vec::new();
+            let mut step = |p: &mut Prompt| {
+                seen.push(p.id);
+                // Simulate already-accounted non-prefill wall time without sleeping.
+                excluded.set(Duration::from_secs(60));
+                Ok(Chunk::More)
+            };
+            let done = if packed {
+                queue.round_packed_excluding(0, 2, &excluded, |_| Some(1), |_, _| true,
+                    |group| group.iter_mut().map(&mut step).collect())
+            } else {
+                queue.round_excluding(&excluded, step)
+            };
+            queue.settle(true);
+            assert!(done.is_empty());
+            assert_eq!(seen, [0, 1]);
+            assert_eq!(queue.owed, 0.0);
+        }
     }
 
     #[test]

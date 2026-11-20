@@ -2203,10 +2203,10 @@ impl Opened {
     /// the engine serves (`engine.mark_slots`).
     pub fn with_engine<'s, T>(&'s self, args: &EngineArgs, body: impl FnOnce(&engine::GlmfEngine<'_>) -> Result<T>)
         -> Result<T> {
-        self.with_engine_media(args, || Ok(Default::default()), body)
+        self.with_engine_media(args, |_| Ok(Default::default()), body)
     }
     pub(super) fn with_engine_media<'s, T>(&'s self, args: &EngineArgs,
-        prepare_media: impl FnOnce() -> Result<crate::shared::experts::rtx::dense::Records>,
+        prepare_media: impl FnOnce(Option<i32>) -> Result<crate::shared::experts::rtx::dense::Records>,
         body: impl FnOnce(&engine::GlmfEngine<'_>) -> Result<T>) -> Result<T> {
         // A head split whose GPUs lack peer access serves from --device alone, decided before any load or
         // admission. The arena is counted after both decisions (below), on the layout this engine serves:
@@ -2463,7 +2463,7 @@ impl Opened {
                 &inventory.gpus, working.spark_ranks, &admitted_plan.decisions.onboard_layers,
                 &admitted_plan.decisions.prefill)?
         }));
-        let media = prepare_media()?;
+        let media = prepare_media(split_device)?;
         cuteafd_loader::placement::families::GLM5_FLASH.check(&placement)?;
         if native_admission.is_some() {
             use cuteafd_loader::plan::family::Family;
