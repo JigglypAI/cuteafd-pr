@@ -546,6 +546,18 @@ impl<'a> Hy4Engine<'a> {
     /// Run a contiguous chunk of `tokens` starting at `self.committed_pos` through layers `0..=last_layer`.
     /// Returns FP32 logits `[tokens.len(), vocab_size]` if `last_layer == self.cfg.layers - 1`, else empty.
     pub(crate) fn forward_chunk(&mut self, tokens: &[u32], last_layer: usize) -> Result<Vec<f32>> {
+        self.forward_chunk_opts(tokens, last_layer, true)
+    }
+
+    /// Run a contiguous chunk of `tokens` starting at `self.committed_pos` through layers `0..=last_layer`,
+    /// optionally skipping the terminal `hc_head` + `lm_head` projection when `compute_head == false`
+    /// (used for prefix prefill before serving-shaped `N=1` decode steps).
+    pub(crate) fn forward_chunk_opts(
+        &mut self,
+        tokens: &[u32],
+        last_layer: usize,
+        compute_head: bool,
+    ) -> Result<Vec<f32>> {
         let rows = tokens.len();
         ensure!(rows > 0 && rows <= self.max_rows, "Hy4 chunk rows {rows} outside 1..={}", self.max_rows);
         ensure!(last_layer < self.cfg.layers, "last_layer {last_layer} >= {}", self.cfg.layers);
@@ -1281,7 +1293,7 @@ impl<'a> Hy4Engine<'a> {
 
         self.committed_pos = pos_end;
 
-        if last_layer + 1 < self.cfg.layers {
+        if !compute_head || last_layer + 1 < self.cfg.layers {
             for r in &self.ranks {
                 r.stream.drain()?;
             }

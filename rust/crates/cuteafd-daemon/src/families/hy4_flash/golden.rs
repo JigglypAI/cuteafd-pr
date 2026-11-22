@@ -56,6 +56,9 @@ pub(crate) struct GoldenArgs {
     /// Chunk size (rows per unit) for unit-exactness verification (`N=1` vs chunked).
     #[arg(long)]
     pub(crate) prefill_units: Option<usize>,
+    /// Serving-shaped N=1 decode parity: prefill `0..score_from-1` in chunks, then step 1 token at a time.
+    #[arg(long)]
+    pub(crate) decode: bool,
     /// Save FP32 logits (`logits.bin`) to this directory.
     #[arg(long, hide = true)]
     pub(crate) save_logits: Option<PathBuf>,
@@ -328,24 +331,46 @@ pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
         let mut all_records = Vec::new();
         for win in &windows {
             engine.reset()?;
-            let mut logits = Vec::with_capacity(win.tokens.len() * vocab);
-            for chunk in win.tokens.chunks(unit) {
-                let part = engine.forward_chunk(chunk, args.last_layer)?;
-                logits.extend_from_slice(&part);
+            let mut full_logits: Option<Vec<f32>> = None;
+            let mut scored_slices: Vec<(usize, Vec<f32>)> = Vec::with_capacity(win.positions.len());
+            if args.decode {
+                let prefix = win.score_from.saturating_sub(1);
+                for chunk in win.tokens[..prefix].chunks(unit) {
+                    let _ = engine.forward_chunk_opts(chunk, args.last_layer, false)?;
+                }
+                let wanted_set: std::collections::BTreeSet<usize> =
+                    win.positions.iter().map(|p| p.pos).collect();
+                for pos in prefix..(win.tokens.len() - 1) {
+                    let next_pos = pos + 1;
+                    let need = wanted_set.contains(&next_pos);
+                    let row = engine.forward_chunk_opts(&win.tokens[pos..pos + 1], args.last_layer, need)?;
+                    if need {
+                        scored_slices.push((next_pos, row));
+                    }
+                }
+            } else {
+                let mut logits = Vec::with_capacity(win.tokens.len() * vocab);
+                for chunk in win.tokens.chunks(unit) {
+                    let part = engine.forward_chunk(chunk, args.last_layer)?;
+                    logits.extend_from_slice(&part);
+                }
+                for pos in &win.positions {
+                    let row_idx = pos.pos - 1;
+                    scored_slices.push((pos.pos, logits[row_idx * vocab..(row_idx + 1) * vocab].to_vec()));
+                }
+                full_logits = Some(logits);
             }
             let want = win.want();
             let mut rows = Vec::with_capacity(win.positions.len());
-            for pos in &win.positions {
-                let row_idx = pos.pos - 1;
-                let slice = &logits[row_idx * vocab..(row_idx + 1) * vocab];
-                rows.push(build_probe_row(pos.pos, slice, &want[&pos.pos]));
+            let mut scored_flat = Vec::with_capacity(win.positions.len() * vocab);
+            for (pos_id, slice) in &scored_slices {
+                rows.push(build_probe_row(*pos_id, slice, &want[pos_id]));
+                scored_flat.extend_from_slice(slice);
             }
             let mut score = win.score(&rows);
             // Recompute each row's KL and NLL using direct engine tail in f64 (matching
             // `cuteafd_bench::fidelity_rows::score_compact`, avoiding `1 - q_mass` cancellation).
-            for (rec, pos) in score.records.iter_mut().zip(&win.positions) {
-                let row_idx = pos.pos - 1;
-                let slice = &logits[row_idx * vocab..(row_idx + 1) * vocab];
+            for ((rec, pos), (_, slice)) in score.records.iter_mut().zip(&win.positions).zip(&scored_slices) {
                 let max_v = slice.iter().copied().fold(f32::NEG_INFINITY, f32::max);
                 let max_f64 = f64::from(max_v);
                 let lse = max_f64 + slice.iter().map(|&v| (f64::from(v) - max_f64).exp()).sum::<f64>().ln();
@@ -386,11 +411,19 @@ pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
             let ctx_win = cuteafd_bench::reference::Fidelity::from_records(
                 score.records.iter().filter(|r| r.role == "ctx").cloned().collect(),
             );
+            let mode = if args.decode { "decode" } else { "prefill" };
+            let digest_str = full_logits
+                .as_deref()
+                .map(digest_f32)
+                .unwrap_or_else(|| digest_f32(&scored_flat));
+            let scored_digest = digest_f32(&scored_flat);
             println!(
-                "hy4f-golden window={} rows={} digest={} mean NLL={:.6} (ref {:.6}) mean KL={:.6} (gen={:.6}/{:.2}%/{} ctx={:.6}/{:.2}%/{}) top-1={:.2}% top-3={:.2}%",
+                "hy4f-golden mode={} window={} rows={} digest={} scored_digest={} mean NLL={:.6} (ref {:.6}) mean KL={:.6} (gen={:.6}/{:.2}%/{} ctx={:.6}/{:.2}%/{}) top-1={:.2}% top-3={:.2}%",
+                mode,
                 win.id,
                 score.positions,
-                digest_f32(&logits),
+                digest_str,
+                scored_digest,
                 score.nll,
                 score.ref_nll,
                 score.kl,
@@ -427,7 +460,8 @@ pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
             if let Some(out_dir) = &args.save_logits {
                 if windows.len() == 1 {
                     std::fs::create_dir_all(out_dir)?;
-                    let out_bytes: Vec<u8> = logits.iter().flat_map(|v| v.to_le_bytes()).collect();
+                    let to_save = full_logits.as_deref().unwrap_or(&scored_flat);
+                    let out_bytes: Vec<u8> = to_save.iter().flat_map(|v| v.to_le_bytes()).collect();
                     std::fs::write(out_dir.join("logits.bin"), out_bytes)?;
                 }
             }
