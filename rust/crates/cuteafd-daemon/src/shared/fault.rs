@@ -96,6 +96,27 @@ pub(crate) fn fire(site: Site) -> bool {
     }
 }
 
+/// Test-only device peer-wait timeout for a `DropPeerPush` repro (#2542). A
+/// feature build armed with `CUTEAFD_DIAG_FAULT_DROP_PEER_PUSH` shortens the
+/// 60 s device wait to `CUTEAFD_DIAG_FAULT_PEER_WAIT_TIMEOUT_MS` (default 1000),
+/// below the Spark exchange's 5 s no-progress watchdog, so the device records the
+/// skipped wait before a Spark-backed card fails its wire. Always `None` in
+/// release builds and when the site is not armed.
+pub(crate) fn drop_push_wait_timeout() -> Option<std::time::Duration> {
+    #[cfg(feature = "dev-fault-hooks")]
+    {
+        let armed = std::env::var(Site::DropPeerPush.env()).ok()
+            .and_then(|value| value.parse::<u32>().ok()).is_some_and(|nth| nth > 0);
+        if !armed { return None; }
+        let ms = std::env::var("CUTEAFD_DIAG_FAULT_PEER_WAIT_TIMEOUT_MS").ok()
+            .and_then(|value| value.parse::<u64>().ok()).filter(|&ms| ms > 0).unwrap_or(1000);
+        tracing::warn!(ms, "dev fault hook shortens the device peer-wait timeout");
+        Some(std::time::Duration::from_millis(ms))
+    }
+    #[cfg(not(feature = "dev-fault-hooks"))]
+    { None }
+}
+
 /// Arms `site` on this thread to fire on its `nth` visit (1: the next one).
 #[cfg(test)]
 pub(crate) fn arm_for_test(site: Site, nth: u32) { armed::arm(site, nth) }

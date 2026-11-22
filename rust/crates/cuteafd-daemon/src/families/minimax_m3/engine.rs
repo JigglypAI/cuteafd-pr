@@ -180,7 +180,11 @@ impl<'a> SplitExecution<'a> {
                 "MiniMax split prefill differs from its HopLink stream");
             rank.decode.borrow().stream.device.run(|| {
                 library.peer_exchange_initialize()?;
-                library.peer_abort_initialize()
+                library.peer_abort_initialize()?;
+                match crate::shared::fault::drop_push_wait_timeout() {
+                    Some(timeout) => library.peer_wait_timeout_configure(timeout),
+                    None => Ok(()),
+                }
             })?;
         }
         let peak = 1 + cuteafd_loader::push_load::COPY_STREAMS as u64 + 1 + 1;

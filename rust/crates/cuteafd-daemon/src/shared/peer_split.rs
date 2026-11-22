@@ -321,6 +321,9 @@ impl<'a> PeerExchange<'a> {
                     library, &[ranks[rank].device], stage, Default::default());
                 probe("peer-abort-before-preload")?;
                 library.peer_abort_initialize()?;
+                if let Some(timeout) = crate::shared::fault::drop_push_wait_timeout() {
+                    library.peer_wait_timeout_configure(timeout)?;
+                }
                 probe("peer-abort-after-preload")?;
                 let word = DeviceAllocation::new(library, 256, Tag::transport("shared/peer-abort-word"))?;
                 library.cuda_zero_bytes(word.buffer, word.buffer.bytes)?;
