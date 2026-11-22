@@ -170,16 +170,29 @@ def reference_role_metrics(validation):
             ('nll_gen', 'nll_ctx', 'gen_top1', 'scored_tokens_gen', 'scored_tokens_ctx')}
 
 
-def reference_role_note(metrics):
+def reference_role_note(metrics, provider_limitation=None):
     def number(value):
         return f'{value:.9f}' if value is not None else 'n/a (no rows)'
     top1 = f'{100 * metrics["gen_top1"]:.4f}%' if metrics['gen_top1'] is not None else 'n/a (no rows)'
+    limitation = ''
+    if provider_limitation:
+        validate_public_text(provider_limitation, scored_text=True)
+        limitation = f'Provider limitation: {provider_limitation.strip()}\n'
     return (f'Generated-row NLL {number(metrics["nll_gen"])} nat/token '
             f'({metrics["scored_tokens_gen"]:,} rows); context-row NLL {number(metrics["nll_ctx"])} nat/token '
             f'({metrics["scored_tokens_ctx"]:,} rows); reference top-1 agreement with generated text {top1}.\n'
+            f'{limitation}'
             'Aggregate NLL includes trailing-context rows appended after short completions; '
             'these can be out-of-distribution and make aggregate NLL non-comparable across models. '
             'They remain valid teacher-forced fidelity probes: engine and reference score the same tokens.\n')
+
+
+def load_text_source_provenance(path):
+    data = json.loads(Path(path).read_text())
+    if not isinstance(data, dict) or not data:
+        raise ValueError('text-source provenance must be a non-empty JSON object')
+    validate_public_metadata(data)
+    return data
 
 
 def own_text(panel):
@@ -401,7 +414,7 @@ def official_forward_note(meta):
 
 
 def package(source, out, config, tokenizer_path, license_path, identity=None, *, expected_source_pins=None,
-            text_source_description=None):
+            text_source_description=None, text_source_provenance=None):
     if out.exists() or not config or any(c not in 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_.' for c in config) or config in ('.', '..'):
         raise ValueError('output must be fresh and config must be a safe component')
     read = lambda name: json.loads(contained(source, name).read_text())
@@ -490,12 +503,15 @@ def package(source, out, config, tokenizer_path, license_path, identity=None, *,
     generated_rows = standard_generated_rows(panel)
     require_new_set_generated_rows(generated_rows)
     role_metrics = reference_role_metrics(validation)
+    provider_provenance = load_text_source_provenance(text_source_provenance) if text_source_provenance else None
     qualification = dict(schema='cuteafd.fidelity.qualification/1', kind='reference', qualifies=True,
                          **role_metrics, standard_generated_rows=generated_rows,
                          engine_parity=False, qualification_scope='reference logits, storage and prefix invariance',
                          set_sha256=set_id, nll=meta['nll'], scored_tokens=meta['scored_tokens'],
                          prefix_qualification=meta['prefix_qualification'], reference_validation=validation,
                          reference_provenance=provenance, panel_caveat=caveat)
+    if provider_provenance is not None:
+        qualification['text_source_provenance'] = provider_provenance
     validate_public_metadata(qualification)
     (destination / 'qualification.json').write_bytes(canonical(qualification) + b'\n')
     snapshot = meta['snapshot_identity']
@@ -520,6 +536,13 @@ def package(source, out, config, tokenizer_path, license_path, identity=None, *,
                          'Provisional foreign-text panel: chat windows use the target chat template; all 64 windows were retokenized with character-span roles.\n'
                          if panel.get('retokenized_text_source') else
                          'All 64 windows, tokens, roles and score geometry are unchanged from the pinned shared panel.\n')
+    provider_limitation = provider_provenance.get('provider_limitation') if provider_provenance else None
+    provider_json_block = (
+        '\nCaptured text-source endpoint metadata:\n\n```json\n'
+        + json.dumps(provider_provenance, indent=2, sort_keys=True)
+        + '\n```\n\n'
+        if provider_provenance else ''
+    )
     card = (f'# {config}\n\nNumerical fidelity reference dataset, not a training corpus or a general quality ranking.\n\n'
             f'Official {precision}: `{snapshot["checkpoint"]}` at `{snapshot["snapshot_revision"]}`.\n'
             f'{text_description}'
@@ -527,7 +550,7 @@ def package(source, out, config, tokenizer_path, license_path, identity=None, *,
             'The bench quick subset is legacy,a00,a04,a08,a20,c00,d00,e00 (4,096 rows).\n\n'
             '## Qualification\n\n'
             f'{meta["scored_tokens"]:,} scored positions; reference NLL {meta["nll"]:.15f} nat/token.\n'
-            f'{reference_role_note(role_metrics)}'
+            f'{reference_role_note(role_metrics, provider_limitation=provider_limitation)}'
             f'{standard_generated_note(generated_rows)}'
             'The 576/640-token prefix probes have 512 byte-identical common F32 rows and zero argmax disagreements.\n'
             f'{arithmetic_note(meta, arithmetic)}\n'
@@ -543,6 +566,7 @@ def package(source, out, config, tokenizer_path, license_path, identity=None, *,
             + (f'## Panel Caveat\n\n{caveat}\n\n' if caveat else '') +
             '## Provenance And Privacy\n\n'
             f'Source set: `{set_id}`. Raw deployment settings and local paths are omitted.\n'
+            + provider_json_block
             + (f'Equivalent set: `{equivalence["equivalent_set_sha256"]}` (recipe rules `{equivalence["equivalent_rules_sha256"][:12]}`; '
                f'computed under `{equivalence["computed_rules_sha256"][:12]}`) has byte-identical tokens, roles and score geometry '
                f'in all {equivalence["windows"]} windows; audit proof sha256 `{equivalence["proof_sha256"]}`.\n' if equivalence else '') +
@@ -563,9 +587,11 @@ def main():
     parser.add_argument('--config', required=True)
     parser.add_argument('--identity-proof', type=Path, help='audited token-identity proof to a later manifest')
     parser.add_argument('--text-source-description', help='public text provenance; required for API text: model, provider, effort, hosted precision and independent reference logits')
+    parser.add_argument('--text-source-provenance', type=Path, help='optional JSON file recording captured text-source endpoint/provider metadata and any provider limitation')
     args = parser.parse_args()
     print(json.dumps(package(args.source, args.out, args.config, args.tokenizer, args.license,
-                             args.identity_proof, text_source_description=args.text_source_description), indent=2))
+                             args.identity_proof, text_source_description=args.text_source_description,
+                             text_source_provenance=args.text_source_provenance), indent=2))
     print('Staged only; no upload or engine qualification performed.')
 
 

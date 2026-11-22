@@ -436,6 +436,26 @@ def test_hy4_full_root_maps_to_bf16_f32():
     assert 'adjacent-pair RoPE' in arithmetic and 'adjacent-pair RoPE' in source
 
 
+def test_text_source_provenance_places_limitation_next_to_top1(tmp_path):
+    metrics = packager.reference_role_metrics(dict(
+        nll=.8, scored_tokens=10, nll_gen=.4, nll_ctx=1.4, gen_top1=.9407,
+        scored_tokens_gen=6, scored_tokens_ctx=4))
+    limitation = 'OpenRouter tencent/hy4 Tencent endpoint reports quantization=fp4; scoring is F32 on BF16.'
+    note = packager.reference_role_note(metrics, provider_limitation=limitation)
+    lines = note.splitlines()
+    assert '94.0700%' in lines[0]
+    assert lines[1] == f'Provider limitation: {limitation}'
+    path = tmp_path / 'endpoint.json'
+    payload = {'endpoint': 'https://openrouter.ai/api/v1/chat/completions', 'model': 'tencent/hy4',
+               'provider': 'Tencent', 'quantization': 'fp4', 'provider_limitation': limitation}
+    path.write_text(json.dumps(payload))
+    assert packager.load_text_source_provenance(path) == payload
+    empty = tmp_path / 'empty.json'
+    empty.write_text('{}')
+    with pytest.raises(ValueError, match='non-empty'):
+        packager.load_text_source_provenance(empty)
+
+
 def test_hy4_readme_distinguishes_f32_engram_qdq_from_stock_bf16():
     root = packager.hy4_root()
     _, arithmetic, _ = packager.root_description({'root_arithmetic': root}, {'family': 'hy4_flash'})
