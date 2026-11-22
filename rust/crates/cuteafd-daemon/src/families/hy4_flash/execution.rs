@@ -306,6 +306,7 @@ pub(crate) struct Hy4Engine<'a> {
     pub(crate) max_pages: usize,
     pub(crate) engram: Hy4EngramHost,
     pub(crate) skip_routed_experts: bool,
+    pub(crate) dump_dir: Option<std::path::PathBuf>,
     ranks: Vec<RankRuntime<'a>>,
     dsa_index_of: BTreeMap<usize, usize>,
     swa_index_of: BTreeMap<usize, usize>,
@@ -416,6 +417,7 @@ impl<'a> Hy4Engine<'a> {
             max_pages,
             engram,
             skip_routed_experts,
+            dump_dir: None,
             ranks,
             dsa_index_of,
             swa_index_of,
@@ -423,6 +425,36 @@ impl<'a> Hy4Engine<'a> {
             engram_histories,
             committed_pos: 0,
         })
+    }
+
+    fn dump_bf16(&self, name: &str, buf: CuteafdDeviceBuffer, elems: usize) -> Result<()> {
+        let Some(dir) = &self.dump_dir else { return Ok(()); };
+        let r0 = &self.ranks[0];
+        r0.stream.drain()?;
+        std::fs::create_dir_all(dir)?;
+        let mut raw = vec![0u8; elems * 2];
+        r0.device.run(|| {
+            r0.device.library.copy_d2h(&mut raw, CuteafdDeviceBuffer { bytes: elems * 2, ..buf })
+        })?;
+        let f32_bytes: Vec<u8> = raw
+            .chunks_exact(2)
+            .flat_map(|b| (u32::from(u16::from_le_bytes([b[0], b[1]])) << 16).to_le_bytes())
+            .collect();
+        std::fs::write(dir.join(format!("{name}.f32")), f32_bytes)?;
+        Ok(())
+    }
+
+    fn dump_f32(&self, name: &str, buf: CuteafdDeviceBuffer, elems: usize) -> Result<()> {
+        let Some(dir) = &self.dump_dir else { return Ok(()); };
+        let r0 = &self.ranks[0];
+        r0.stream.drain()?;
+        std::fs::create_dir_all(dir)?;
+        let mut raw = vec![0u8; elems * 4];
+        r0.device.run(|| {
+            r0.device.library.copy_d2h(&mut raw, CuteafdDeviceBuffer { bytes: elems * 4, ..buf })
+        })?;
+        std::fs::write(dir.join(format!("{name}.f32")), raw)?;
+        Ok(())
     }
 
     pub(crate) fn reset(&mut self) -> Result<()> {
@@ -618,6 +650,19 @@ impl<'a> Hy4Engine<'a> {
             })?;
         }
 
+        let dump_rows = if self.dump_dir.is_some() && pos_start == 0 {
+            rows.min(16)
+        } else {
+            0
+        };
+        if dump_rows > 0 {
+            let dir = self.dump_dir.as_ref().unwrap();
+            std::fs::create_dir_all(dir)?;
+            let tok_bytes: Vec<u8> = tokens[..dump_rows].iter().flat_map(|t| t.to_le_bytes()).collect();
+            std::fs::write(dir.join("tokens.u32"), tok_bytes)?;
+            self.dump_bf16("embed", self.ranks[0].scratch.r_a.buffer, dump_rows * HC * H)?;
+        }
+
         let mut use_a = true;
         let gpus = self.ranks.len();
 
@@ -670,6 +715,10 @@ impl<'a> Hy4Engine<'a> {
                         }
                         Ok(())
                     })?;
+                }
+                if dump_rows > 0 && layer <= 3 {
+                    let r_cur = if use_a { self.ranks[0].scratch.r_a.buffer } else { self.ranks[0].scratch.r_b.buffer };
+                    self.dump_bf16(&format!("l{layer:02}_after_engram"), r_cur, dump_rows * HC * H)?;
                 }
             }
 
@@ -941,6 +990,16 @@ impl<'a> Hy4Engine<'a> {
                 })?;
             }
             self.reduce_tp2_f32_to_bf16(rows, H, Some(&format!("{p}.self_attn.o_proj")))?;
+            if dump_rows > 0 && layer <= 3 {
+                let s0 = &self.ranks[0].scratch;
+                self.dump_bf16(&format!("l{layer:02}_attn_y"), s0.y.buffer, dump_rows * H)?;
+                self.dump_bf16(&format!("l{layer:02}_attn_q_resid"), s0.q_resid.buffer, dump_rows * Q_LORA)?;
+                self.dump_bf16(&format!("l{layer:02}_attn_query"), s0.query.buffer, dump_rows * local_heads * 576)?;
+                self.dump_bf16(&format!("l{layer:02}_attn_out"), s0.attn_out.buffer, dump_rows * local_heads * 512)?;
+                self.dump_f32(&format!("l{layer:02}_attn_lse"), s0.lse_out.buffer, dump_rows * local_heads)?;
+                self.dump_bf16(&format!("l{layer:02}_attn_uv"), s0.uv_out.buffer, dump_rows * local_heads * 256)?;
+                self.dump_bf16(&format!("l{layer:02}_attn_delta"), s0.delta.buffer, dump_rows * H)?;
+            }
 
             // (C) post_proj_norm + fused attention iHC post + FFN iHC pre + FFN
             for r in &mut self.ranks {
@@ -1204,6 +1263,20 @@ impl<'a> Hy4Engine<'a> {
                 })?;
             }
             use_a = !use_a;
+            if dump_rows > 0 {
+                let r_cur = if use_a { self.ranks[0].scratch.r_a.buffer } else { self.ranks[0].scratch.r_b.buffer };
+                self.dump_bf16(&format!("l{layer:02}_out"), r_cur, dump_rows * HC * H)?;
+                if layer <= 3 {
+                    let s0 = &self.ranks[0].scratch;
+                    self.dump_bf16(&format!("l{layer:02}_ffn_y"), s0.y.buffer, dump_rows * H)?;
+                    self.dump_bf16(&format!("l{layer:02}_ffn_delta"), s0.delta.buffer, dump_rows * H)?;
+                    self.dump_bf16(&format!("l{layer:02}_ffn_delta_norm"), s0.delta_norm.buffer, dump_rows * H)?;
+                    if !self.cfg.dense_layer[layer] {
+                        self.dump_bf16(&format!("l{layer:02}_ffn_routed_latent"), s0.routed_latent.buffer, dump_rows * LATENT_H)?;
+                        self.dump_bf16(&format!("l{layer:02}_ffn_shared_out"), s0.shared_out.buffer, dump_rows * H)?;
+                    }
+                }
+            }
         }
 
         self.committed_pos = pos_end;
@@ -1239,6 +1312,9 @@ impl<'a> Hy4Engine<'a> {
                 )
             })?;
             r0.peer_ready.record(&r0.stream)?;
+        }
+        if dump_rows > 0 {
+            self.dump_bf16("hc_head_y", self.ranks[0].scratch.y.buffer, dump_rows * H)?;
         }
         if gpus == 2 {
             let bytes = rows * H * 2;

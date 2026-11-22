@@ -59,6 +59,9 @@ pub(crate) struct GoldenArgs {
     /// Save FP32 logits (`logits.bin`) to this directory.
     #[arg(long, hide = true)]
     pub(crate) save_logits: Option<PathBuf>,
+    /// Dump per-layer and layer 0..3 sub-block F32 tensors for bisection against python/reference.
+    #[arg(long)]
+    pub(crate) dump_dir: Option<PathBuf>,
     /// Diagnostic: zero routed experts to isolate non-expert backbone (iHC, Engram, MLA, indexer, shared FFN).
     #[arg(long, hide = true)]
     pub(crate) skip_routed_experts: bool,
@@ -299,6 +302,7 @@ pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
         args.skip_routed_experts,
         onboarded,
     )?;
+    engine.dump_dir = args.dump_dir.clone();
 
     let vocab = cfg.vocab_size;
     if let Some(windows) = selected_windows {
