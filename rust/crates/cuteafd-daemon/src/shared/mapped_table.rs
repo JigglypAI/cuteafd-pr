@@ -248,13 +248,14 @@ impl<'a> MappedTableDevice<'a> {
     pub fn log_interval(&self, event: &str) {
         let now = self.lookahead.table().table().stats().snapshot();
         let d = now.since(&self.logged.replace(now));
-        if d.cache_hit_rows + d.cache_wait_rows + d.lookahead_rows + d.stall_prefill_fallback_rows
+        if d.cache_hit_rows + d.distinct_rows + d.cache_wait_rows + d.lookahead_rows + d.stall_prefill_fallback_rows
             + d.stall_decode_fallback_rows == 0 { return; }
         // Gather side: rows the gathers read themselves (fallback) or waited for
         // another reader to fill (pending); cache_wait_rows also counts the
         // look-ahead finding a gather ahead of it. Device side: rows read from
         // the table and their summed service time.
         tracing::info!(table = self.name, event, cache_hit_rows = d.cache_hit_rows, cache_wait_rows = d.cache_wait_rows,
+            distinct_rows = d.distinct_rows, demand_rows = d.demand_rows, demand_hit_rows = d.demand_hit_rows,
             lookahead_rows = d.lookahead_rows, prefill_fallback_rows = d.stall_prefill_fallback_rows,
             prefill_pending_rows = d.stall_prefill_pending_rows, decode_fallback_rows = d.stall_decode_fallback_rows,
             decode_pending_rows = d.stall_decode_pending_rows, device_rows = d.page_misses,
