@@ -471,6 +471,12 @@ impl Step {
             requests: Vec::new(), tally: [0; 5] }
     }
 
+    /// When the round began and on which lane (for the speculation trace's round times).
+    #[inline]
+    pub fn started(&self) -> Instant { self.started }
+    #[inline]
+    pub fn lane(&self) -> usize { usize::from(self.lane) }
+
     /// Whether the round event will be built (callers skip extra timing otherwise).
     #[inline]
     pub fn live(&self) -> bool { self.live.is_some() }
