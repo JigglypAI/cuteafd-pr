@@ -122,6 +122,10 @@ pub fn fp8_role(name: &str) -> Fp8Role {
     if stem.starts_with("model.dfly_layers.") {
         return Fp8Role::exact("dfly2 drafter", false);
     }
+    if stem.ends_with(".self_attn.kv_b_proj") {
+        // Absorbed MLA keeps W_UK and W_UV in BF16 inside the packed target arena.
+        return Fp8Role::exact("hy4 absorbed kv_b_proj", false);
+    }
     if stem.ends_with(".self_attn.kv_a_proj_with_mqa") {
         return Fp8Role::padded("hy4 kv_a_proj_with_mqa", true, 128);
     }
@@ -251,12 +255,16 @@ pub fn target_arenas(
             let local_heads = attn.heads / layer_ranks;
             views.push((format!("{p}.self_attn.learnable_sink_param"), local_heads * 4));
 
-            // Attention linear projections
-            let attn_projs: [(&str, [usize; 2], CoreSplit); 6] = [
+            // Attention linear projections (`kv_b_proj` lives absorbed as BF16 W_UK+W_UV in the arena
+            // across all MC views; compact EXL3 checkpoints dequantize it via transient storage at load).
+            views.push((
+                format!("{p}.self_attn.kv_b_proj.weight"),
+                local_heads * (attn.qk_nope_dim + attn.v_head_dim) * cfg.kv_lora_rank * 2,
+            ));
+            let attn_projs: [(&str, [usize; 2], CoreSplit); 5] = [
                 ("self_attn.q_a_proj", [cfg.q_lora_rank, h], CoreSplit::Whole),
                 ("self_attn.q_b_proj", [attn.heads * attn.qk_head_dim(), cfg.q_lora_rank], CoreSplit::Output),
                 ("self_attn.kv_a_proj_with_mqa", [cfg.kv_lora_rank + attn.qk_rope_dim, h], CoreSplit::Whole),
-                ("self_attn.kv_b_proj", [attn.heads * (attn.qk_nope_dim + attn.v_head_dim), cfg.kv_lora_rank], CoreSplit::Output),
                 ("self_attn.linear_gate", [attn.heads * attn.v_head_dim, h], CoreSplit::Output),
                 ("self_attn.o_proj", [h, attn.heads * attn.v_head_dim], CoreSplit::Input),
             ];

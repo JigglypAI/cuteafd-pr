@@ -1,5 +1,6 @@
 //! Full 42-layer Hy4-flash coordinator forward pass (1x RTX TP1 and 2x RTX TP2).
 use super::cache::Hy4CacheRank;
+use super::native::Hy4NativeScratch;
 use super::programs::Hy4Programs;
 use super::weights::{Hy4EngramHost, Hy4RankWeights};
 use crate::shared::experts::rtx::exl3::Exl3Tp2;
@@ -9,19 +10,20 @@ use crate::shared::memory::device::{Allocation, Device, Event, Stream};
 use crate::shared::memory::Tag;
 use crate::shared::target_head::{self, TargetHead};
 use anyhow::{ensure, Context, Result};
-use cuteafd_ffi::programs::{Programs, Scalar};
+use cuteafd_ffi::programs::{Program, Programs, Scalar};
 use cuteafd_ffi::{Bf16Add, CuteafdDeviceBuffer, F32Add};
 use cuteafd_loader::families::hy4_flash::engram::Hy4EngramHistory;
 use cuteafd_loader::families::hy4_flash::execution::PAGE_ROWS;
 use cuteafd_loader::families::hy4_flash::{Hy4FlashConfig, Hy4KvCache};
+use cuteafd_loader::formats::trellis_core::ProjectionScratchLayout;
 use cuteafd_loader::plan::checkpoint::Checkpoint;
 use std::collections::BTreeMap;
-use std::ffi::c_void;
 
 const H: usize = 3072;
 const HC: usize = 4;
 const Q_LORA: usize = 1024;
 const KV_A_DIM: usize = 576;
+const KV_A_PADDED: usize = 640;
 const LATENT_H: usize = 1536;
 const EXPERTS: usize = 512;
 const TOPK: usize = 16;
@@ -52,6 +54,7 @@ struct RankScratch<'a> {
     // MLA
     q_a: Allocation<'a>,
     kv_a: Allocation<'a>,
+    kv_a_padded: Allocation<'a>,
     q_resid: Allocation<'a>,
     q_raw: Allocation<'a>,
     gate: Allocation<'a>,
@@ -91,9 +94,10 @@ struct RankScratch<'a> {
     routed_out: Allocation<'a>,
     shared_out: Allocation<'a>,
     shared_f32: Allocation<'a>,
-    zero_f32: Allocation<'a>,
     // Head logits tile (<=64 rows)
     logits_tile: Allocation<'a>,
+    // Compact-core serialized scratch (`k8-compact`, `k6-compact`, `fp8-compact`)
+    native: Option<Hy4NativeScratch<'a>>,
 }
 
 impl<'a> RankScratch<'a> {
@@ -104,6 +108,7 @@ impl<'a> RankScratch<'a> {
         max_pages: usize,
         local_vocab: usize,
         attn_scratch_bytes: usize,
+        native_layout: Option<&ProjectionScratchLayout>,
     ) -> Result<Self> {
         let alloc = |bytes: usize, label: &'static str| {
             Allocation::new(device, bytes.max(256), Tag::workspace(label))
@@ -112,6 +117,9 @@ impl<'a> RankScratch<'a> {
         let max_inter = 13824 / tp;
         let max_groups = max_pages * (PAGE_ROWS / 4);
         let wire_row = LATENT_H + LATENT_H / 32;
+        let native = native_layout
+            .map(|l| Hy4NativeScratch::allocate(device, l))
+            .transpose()?;
         Ok(Self {
             ids: alloc(max_rows * 4, "ids")?,
             positions_i64: alloc(max_rows * 8, "pos-i64")?,
@@ -132,6 +140,7 @@ impl<'a> RankScratch<'a> {
             engram_keys: alloc(max_rows * HC * H * 2, "engram-keys")?,
             q_a: alloc(max_rows * Q_LORA * 2, "q-a")?,
             kv_a: alloc(max_rows * KV_A_DIM * 2, "kv-a")?,
+            kv_a_padded: alloc(max_rows * KV_A_PADDED * 2, "kv-a-padded")?,
             q_resid: alloc(max_rows * Q_LORA * 2, "q-resid")?,
             q_raw: alloc(max_rows * max_heads * 256 * 2, "q-raw")?,
             gate: alloc(max_rows * max_heads * 256 * 2, "gate")?,
@@ -169,9 +178,93 @@ impl<'a> RankScratch<'a> {
             routed_out: alloc(max_rows * H * 2, "routed-out")?,
             shared_out: alloc(max_rows * H * 2, "shared-out")?,
             shared_f32: alloc(max_rows * H * 4, "shared-f32")?,
-            zero_f32: alloc(max_rows * H * 4, "zero-f32")?,
             logits_tile: alloc(64 * local_vocab * 4, "logits-tile")?,
+            native,
         })
+    }
+}
+
+fn launch_proj_out(
+    r: &RankRuntime<'_>,
+    stem: &str,
+    bf16_prog: &Program<'_>,
+    rows: usize,
+    input: CuteafdDeviceBuffer,
+    output: CuteafdDeviceBuffer,
+) -> Result<()> {
+    if let Some(linear) = r.weights.native.get(stem) {
+        let ns = r.scratch.native.as_ref().context("Hy4 native core missing scratch")?;
+        return linear.launch(rows, input, output, &ns.scratch, r.stream.raw);
+    }
+    // SAFETY: caller ensures device active and all buffers live through stream drain.
+    unsafe {
+        bf16_prog.launch(
+            &[input.ptr, r.weights.weight(stem)?.ptr, output.ptr],
+            &[Scalar::I32(rows as i32)],
+            r.stream.raw,
+        )
+    }
+}
+
+fn launch_proj_kv_a(
+    r: &RankRuntime<'_>,
+    stem: &str,
+    rows: usize,
+    input: CuteafdDeviceBuffer,
+    output_576: CuteafdDeviceBuffer,
+) -> Result<()> {
+    if let Some(linear) = r.weights.native.get(stem) {
+        let ns = r.scratch.native.as_ref().context("Hy4 native core missing scratch")?;
+        linear.launch(rows, input, r.scratch.kv_a_padded.buffer, &ns.scratch, r.stream.raw)?;
+        // SAFETY: kv_a_padded [rows, 640] BF16 and output_576 [rows, 576] BF16 are disjoint admitted buffers.
+        return unsafe {
+            r.device.library.copy_d2d_2d_async(
+                output_576,
+                KV_A_DIM * 2,
+                r.scratch.kv_a_padded.buffer,
+                KV_A_PADDED * 2,
+                KV_A_DIM * 2,
+                rows,
+                r.stream.raw,
+            )
+        };
+    }
+    // SAFETY: caller ensures device active and all buffers live through stream drain.
+    unsafe {
+        r.programs.proj_kv_a.launch(
+            &[input.ptr, r.weights.weight(stem)?.ptr, output_576.ptr],
+            &[Scalar::I32(rows as i32)],
+            r.stream.raw,
+        )
+    }
+}
+
+fn launch_proj_split(
+    r: &RankRuntime<'_>,
+    gpus: usize,
+    stem: &str,
+    bf16_prog: &Program<'_>,
+    rows: usize,
+    input: CuteafdDeviceBuffer,
+    out_tp1_bf16: CuteafdDeviceBuffer,
+    out_tp2_f32: CuteafdDeviceBuffer,
+) -> Result<()> {
+    if let Some(linear) = r.weights.native.get(stem) {
+        let ns = r.scratch.native.as_ref().context("Hy4 native core missing scratch")?;
+        return if gpus == 1 {
+            linear.launch(rows, input, out_tp1_bf16, &ns.scratch, r.stream.raw)
+        } else {
+            linear.partial(rows, input, out_tp2_f32, &ns.scratch, r.stream.raw)
+        };
+    }
+    let out = if gpus == 1 { out_tp1_bf16.ptr } else { out_tp2_f32.ptr };
+    // SAFETY: caller ensures device active and all buffers live through stream drain.
+    unsafe {
+        bf16_prog.launch(
+            &[input.ptr, r.weights.weight(stem)?.ptr, out],
+            &[Scalar::I32(rows as i32)],
+            r.stream.raw,
+        )
     }
 }
 
@@ -234,7 +327,7 @@ impl<'a> Hy4Engine<'a> {
             );
         }
 
-        let weights_all = Hy4RankWeights::load_all(devices, checkpoint, &cfg, max_rows.min(64))?;
+        let weights_all = Hy4RankWeights::load_all(devices, programs, checkpoint, &cfg, max_rows, max_rows.min(64))?;
         // SAFETY: checkpoint shard files remain immutable for the duration of the engine.
         let engram = unsafe { Hy4EngramHost::open(checkpoint, &cfg, force_engram_bf16)? };
         let engram_histories = engram.start_histories();
@@ -250,7 +343,16 @@ impl<'a> Hy4Engine<'a> {
                 .max(progs.swa_decode_scratch_bytes)
                 .max(progs.swa_extend_scratch_bytes);
             let cache = Hy4CacheRank::new(device, &cfg, kv_format, max_pages, 1, max_rows, 0, &stream)?;
-            let scratch = RankScratch::new(device, gpus, max_rows, max_pages, weights.local_vocab, attn_scratch)?;
+            let native_layout = weights.native.scratch_layout(max_rows)?;
+            let scratch = RankScratch::new(
+                device,
+                gpus,
+                max_rows,
+                max_pages,
+                weights.local_vocab,
+                attn_scratch,
+                native_layout.as_ref(),
+            )?;
             let bf16_add = device.run(|| device.library.bf16_add())?;
             let f32_add = device.run(|| device.library.f32_add())?;
             let quantize_grid = Fp8QuantizeGrid::new(device.run(|| device.library.sm_count())?, None)?;
@@ -309,8 +411,9 @@ impl<'a> Hy4Engine<'a> {
     }
 
     /// Device-driven GPU-to-GPU P2P sum of `scratch.delta_f32 [rows, width]` across TP2 ranks,
-    /// written to `scratch.delta [rows, width]` BF16 on both ranks with zero host hop.
-    fn reduce_tp2_f32_to_bf16(&mut self, rows: usize, width: usize) -> Result<()> {
+    /// followed by native `egress` (`svh` + BF16 narrow for EXL3, or BF16 narrow for FP8/BF16)
+    /// into `scratch.delta [rows, width]` on both ranks with zero host hop.
+    fn reduce_tp2_f32_to_bf16(&mut self, rows: usize, width: usize, egress_stem: Option<&str>) -> Result<()> {
         if self.ranks.len() == 1 {
             return Ok(());
         }
@@ -348,38 +451,36 @@ impl<'a> Hy4Engine<'a> {
         }
         let cp0 = self.ranks[0].peer_ready.raw;
         let cp1 = self.ranks[1].peer_ready.raw;
-        self.ranks[0].device.run(|| unsafe {
-            self.ranks[0].device.library.cuda_stream_wait_event(self.ranks[0].stream.raw, cp1)?;
-            self.ranks[0].f32_add.launch(
-                self.ranks[0].scratch.delta_f32.buffer,
-                self.ranks[0].scratch.delta_peer_f32.buffer,
-                self.ranks[0].scratch.delta_f32.buffer,
-                elems,
-                self.ranks[0].stream.raw,
-            )?;
-            self.ranks[0].device.library.cuda_f32_to_bf16_async(
-                self.ranks[0].scratch.delta_f32.buffer,
-                self.ranks[0].scratch.delta.buffer,
-                elems,
-                self.ranks[0].stream.raw,
-            )
-        })?;
-        self.ranks[1].device.run(|| unsafe {
-            self.ranks[1].device.library.cuda_stream_wait_event(self.ranks[1].stream.raw, cp0)?;
-            self.ranks[1].f32_add.launch(
-                self.ranks[1].scratch.delta_f32.buffer,
-                self.ranks[1].scratch.delta_peer_f32.buffer,
-                self.ranks[1].scratch.delta_f32.buffer,
-                elems,
-                self.ranks[1].stream.raw,
-            )?;
-            self.ranks[1].device.library.cuda_f32_to_bf16_async(
-                self.ranks[1].scratch.delta_f32.buffer,
-                self.ranks[1].scratch.delta.buffer,
-                elems,
-                self.ranks[1].stream.raw,
-            )
-        })?;
+        let waits = [cp1, cp0];
+        for (idx, r) in self.ranks.iter().enumerate() {
+            let wait_ev = waits[idx];
+            r.device.run(|| {
+                // SAFETY: peer copy into delta_peer_f32 completed before wait_ev; buffers are disjoint.
+                unsafe {
+                    r.device.library.cuda_stream_wait_event(r.stream.raw, wait_ev)?;
+                    r.f32_add.launch(
+                        r.scratch.delta_f32.buffer,
+                        r.scratch.delta_peer_f32.buffer,
+                        r.scratch.delta_f32.buffer,
+                        elems,
+                        r.stream.raw,
+                    )?;
+                }
+                if let Some(linear) = egress_stem.and_then(|s| r.weights.native.get(s)) {
+                    linear.egress(rows, r.scratch.delta_f32.buffer, r.scratch.delta.buffer, r.stream.raw)
+                } else {
+                    // SAFETY: delta_f32 sum finished in stream order before narrowing into disjoint delta.
+                    unsafe {
+                        r.device.library.cuda_f32_to_bf16_async(
+                            r.scratch.delta_f32.buffer,
+                            r.scratch.delta.buffer,
+                            elems,
+                            r.stream.raw,
+                        )
+                    }
+                }
+            })?;
+        }
         Ok(())
     }
 
@@ -527,8 +628,9 @@ impl<'a> Hy4Engine<'a> {
                     r.cache.swa_ring(0, self.swa_index_of[&layer])?
                 };
                 let (w_uk, w_uv) = r.weights.kv_b_absorbed(layer, local_heads)?;
+                let dev = r.device;
 
-                r.device.run(|| {
+                dev.run(|| {
                     r.device.library.copy_h2d(CuteafdDeviceBuffer { bytes: kv_slots_bytes.len(), ..r.scratch.slots_i64.buffer }, kv_slots_bytes)?;
                     // SAFETY: all arena weight views, cache planes, and scratch stay live through stream drain.
                     unsafe {
@@ -544,13 +646,20 @@ impl<'a> Hy4Engine<'a> {
                             ],
                             &s_rows, r.stream.raw,
                         )?;
-                        r.programs.proj_q_a.launch(
-                            &[r.scratch.y.buffer.ptr, r.weights.weight(&format!("{p}.self_attn.q_a_proj"))?.ptr, r.scratch.q_a.buffer.ptr],
-                            &s_rows, r.stream.raw,
+                        launch_proj_out(
+                            r,
+                            &format!("{p}.self_attn.q_a_proj"),
+                            &r.programs.proj_q_a,
+                            rows,
+                            r.scratch.y.buffer,
+                            r.scratch.q_a.buffer,
                         )?;
-                        r.programs.proj_kv_a.launch(
-                            &[r.scratch.y.buffer.ptr, r.weights.weight(&format!("{p}.self_attn.kv_a_proj_with_mqa"))?.ptr, r.scratch.kv_a.buffer.ptr],
-                            &s_rows, r.stream.raw,
+                        launch_proj_kv_a(
+                            r,
+                            &format!("{p}.self_attn.kv_a_proj_with_mqa"),
+                            rows,
+                            r.scratch.y.buffer,
+                            r.scratch.kv_a.buffer,
                         )?;
                         r.programs.mla_rank_norm_pack.launch(
                             &[
@@ -571,13 +680,21 @@ impl<'a> Hy4Engine<'a> {
                         } else {
                             (&r.programs.proj_q_b_swa, &r.programs.proj_linear_gate_swa, &r.programs.mla_q_absorb_swa, &r.programs.mla_sink_gate_uv_swa, &r.programs.proj_o_swa)
                         };
-                        proj_qb.launch(
-                            &[r.scratch.q_resid.buffer.ptr, r.weights.weight(&format!("{p}.self_attn.q_b_proj"))?.ptr, r.scratch.q_raw.buffer.ptr],
-                            &s_rows, r.stream.raw,
+                        launch_proj_out(
+                            r,
+                            &format!("{p}.self_attn.q_b_proj"),
+                            proj_qb,
+                            rows,
+                            r.scratch.q_resid.buffer,
+                            r.scratch.q_raw.buffer,
                         )?;
-                        proj_gate.launch(
-                            &[r.scratch.y.buffer.ptr, r.weights.weight(&format!("{p}.self_attn.linear_gate"))?.ptr, r.scratch.gate.buffer.ptr],
-                            &s_rows, r.stream.raw,
+                        launch_proj_out(
+                            r,
+                            &format!("{p}.self_attn.linear_gate"),
+                            proj_gate,
+                            rows,
+                            r.scratch.y.buffer,
+                            r.scratch.gate.buffer,
                         )?;
                         q_abs.launch(
                             &[r.scratch.q_raw.buffer.ptr, w_uk, r.scratch.positions_i64.buffer.ptr, inv_freq, r.scratch.query.buffer.ptr],
@@ -757,16 +874,21 @@ impl<'a> Hy4Engine<'a> {
                             ],
                             &s_rows, r.stream.raw,
                         )?;
-                        let o_out = if gpus == 1 { r.scratch.delta.buffer.ptr } else { r.scratch.delta_f32.buffer.ptr };
-                        proj_o.launch(
-                            &[r.scratch.uv_out.buffer.ptr, r.weights.weight(&format!("{p}.self_attn.o_proj"))?.ptr, o_out],
-                            &s_rows, r.stream.raw,
+                        launch_proj_split(
+                            r,
+                            gpus,
+                            &format!("{p}.self_attn.o_proj"),
+                            proj_o,
+                            rows,
+                            r.scratch.uv_out.buffer,
+                            r.scratch.delta.buffer,
+                            r.scratch.delta_f32.buffer,
                         )?;
                     }
                     Ok(())
                 })?;
             }
-            self.reduce_tp2_f32_to_bf16(rows, H)?;
+            self.reduce_tp2_f32_to_bf16(rows, H, Some(&format!("{p}.self_attn.o_proj")))?;
 
             // (C) post_proj_norm + fused attention iHC post + FFN iHC pre + FFN
             for r in &mut self.ranks {
@@ -776,7 +898,8 @@ impl<'a> Hy4Engine<'a> {
                     (r.scratch.r_b.buffer, r.scratch.r_a.buffer)
                 };
                 let s_rows = [Scalar::I32(rows as i32)];
-                r.device.run(|| {
+                let dev = r.device;
+                dev.run(|| {
                     // SAFETY: all buffers live through stream drain.
                     unsafe {
                         let ppn = r.weights.buf(&format!("{p}.self_attn.post_proj_norm.weight"))?.ptr;
@@ -801,22 +924,35 @@ impl<'a> Hy4Engine<'a> {
                         )?;
 
                         if self.cfg.dense_layer[layer] {
-                            r.programs.proj_dense_gate_up.launch(
-                                &[r.scratch.y.buffer.ptr, r.weights.weight(&format!("{p}.mlp.gate_proj"))?.ptr, r.scratch.ffn_gate.buffer.ptr],
-                                &s_rows, r.stream.raw,
+                            launch_proj_out(
+                                r,
+                                &format!("{p}.mlp.gate_proj"),
+                                &r.programs.proj_dense_gate_up,
+                                rows,
+                                r.scratch.y.buffer,
+                                r.scratch.ffn_gate.buffer,
                             )?;
-                            r.programs.proj_dense_gate_up.launch(
-                                &[r.scratch.y.buffer.ptr, r.weights.weight(&format!("{p}.mlp.up_proj"))?.ptr, r.scratch.ffn_up.buffer.ptr],
-                                &s_rows, r.stream.raw,
+                            launch_proj_out(
+                                r,
+                                &format!("{p}.mlp.up_proj"),
+                                &r.programs.proj_dense_gate_up,
+                                rows,
+                                r.scratch.y.buffer,
+                                r.scratch.ffn_up.buffer,
                             )?;
                             r.programs.post_silu_split_dense.launch(
                                 &[r.scratch.ffn_gate.buffer.ptr, r.scratch.ffn_up.buffer.ptr, r.scratch.ffn_act.buffer.ptr],
                                 &s_rows, r.stream.raw,
                             )?;
-                            let d_out = if gpus == 1 { r.scratch.delta.buffer.ptr } else { r.scratch.delta_f32.buffer.ptr };
-                            r.programs.proj_dense_down.launch(
-                                &[r.scratch.ffn_act.buffer.ptr, r.weights.weight(&format!("{p}.mlp.down_proj"))?.ptr, d_out],
-                                &s_rows, r.stream.raw,
+                            launch_proj_split(
+                                r,
+                                gpus,
+                                &format!("{p}.mlp.down_proj"),
+                                &r.programs.proj_dense_down,
+                                rows,
+                                r.scratch.ffn_act.buffer,
+                                r.scratch.delta.buffer,
+                                r.scratch.delta_f32.buffer,
                             )?;
                         } else {
                             // LatentMoE: router + shared expert + routed experts (EXL3 K4 MUL1 onboarded or skipped)
@@ -849,9 +985,13 @@ impl<'a> Hy4Engine<'a> {
                                 &[r.scratch.router_logits.buffer.ptr, bias, r.scratch.route_ids.buffer.ptr, r.scratch.route_weights.buffer.ptr],
                                 &s_rows, r.stream.raw,
                             )?;
-                            r.programs.proj_latent_down.launch(
-                                &[r.scratch.y.buffer.ptr, r.weights.weight(&format!("{p}.mlp.routed_expert_down_proj"))?.ptr, r.scratch.latent_in.buffer.ptr],
-                                &s_rows, r.stream.raw,
+                            launch_proj_out(
+                                r,
+                                &format!("{p}.mlp.routed_expert_down_proj"),
+                                &r.programs.proj_latent_down,
+                                rows,
+                                r.scratch.y.buffer,
+                                r.scratch.latent_in.buffer,
                             )?;
                             let grid = r.quantize_grid.blocks(rows, LATENT_H);
                             r.programs.expert_input_quant.launch(
@@ -859,7 +999,7 @@ impl<'a> Hy4Engine<'a> {
                                     r.scratch.latent_in.buffer.ptr,
                                     r.scratch.wire_in.buffer.ptr,
                                     r.scratch.wire_in.buffer.ptr.wrapping_byte_add(LATENT_H),
-                                    r.scratch.zero_f32.buffer.ptr,
+                                    r.scratch.wire_in.buffer.ptr,
                                 ],
                                 &[Scalar::I32(rows as i32), Scalar::I32(grid as i32)],
                                 r.stream.raw,
@@ -912,22 +1052,35 @@ impl<'a> Hy4Engine<'a> {
                             }
 
                             // Shared expert
-                            r.programs.proj_shared_gate_up.launch(
-                                &[r.scratch.y.buffer.ptr, r.weights.weight(&format!("{p}.mlp.shared_experts.gate_proj"))?.ptr, r.scratch.ffn_gate.buffer.ptr],
-                                &s_rows, r.stream.raw,
+                            launch_proj_out(
+                                r,
+                                &format!("{p}.mlp.shared_experts.gate_proj"),
+                                &r.programs.proj_shared_gate_up,
+                                rows,
+                                r.scratch.y.buffer,
+                                r.scratch.ffn_gate.buffer,
                             )?;
-                            r.programs.proj_shared_gate_up.launch(
-                                &[r.scratch.y.buffer.ptr, r.weights.weight(&format!("{p}.mlp.shared_experts.up_proj"))?.ptr, r.scratch.ffn_up.buffer.ptr],
-                                &s_rows, r.stream.raw,
+                            launch_proj_out(
+                                r,
+                                &format!("{p}.mlp.shared_experts.up_proj"),
+                                &r.programs.proj_shared_gate_up,
+                                rows,
+                                r.scratch.y.buffer,
+                                r.scratch.ffn_up.buffer,
                             )?;
                             r.programs.post_silu_split_shared.launch(
                                 &[r.scratch.ffn_gate.buffer.ptr, r.scratch.ffn_up.buffer.ptr, r.scratch.ffn_act.buffer.ptr],
                                 &s_rows, r.stream.raw,
                             )?;
-                            let sh_out = if gpus == 1 { r.scratch.shared_out.buffer.ptr } else { r.scratch.shared_f32.buffer.ptr };
-                            r.programs.proj_shared_down.launch(
-                                &[r.scratch.ffn_act.buffer.ptr, r.weights.weight(&format!("{p}.mlp.shared_experts.down_proj"))?.ptr, sh_out],
-                                &s_rows, r.stream.raw,
+                            launch_proj_split(
+                                r,
+                                gpus,
+                                &format!("{p}.mlp.shared_experts.down_proj"),
+                                &r.programs.proj_shared_down,
+                                rows,
+                                r.scratch.ffn_act.buffer,
+                                r.scratch.shared_out.buffer,
+                                r.scratch.shared_f32.buffer,
                             )?;
                         }
                     }
@@ -937,18 +1090,18 @@ impl<'a> Hy4Engine<'a> {
             use_a = !use_a;
 
             if self.cfg.dense_layer[layer] {
-                self.reduce_tp2_f32_to_bf16(rows, H)?;
+                self.reduce_tp2_f32_to_bf16(rows, H, Some(&format!("{p}.mlp.down_proj")))?;
             } else {
                 // On TP2, reduce routed latent (1536) and shared expert (3072) across ranks before latent_up + combine.
                 if gpus == 2 {
-                    self.reduce_tp2_f32_to_bf16(rows, LATENT_H)?;
+                    self.reduce_tp2_f32_to_bf16(rows, LATENT_H, None)?;
                     for r in &self.ranks {
                         r.device.run(|| unsafe {
                             r.device.library.copy_d2d_async(r.scratch.routed_latent.buffer, r.scratch.delta.buffer, rows * LATENT_H * 2, r.stream.raw)?;
                             r.device.library.copy_d2d_async(r.scratch.delta_f32.buffer, r.scratch.shared_f32.buffer, rows * H * 4, r.stream.raw)
                         })?;
                     }
-                    self.reduce_tp2_f32_to_bf16(rows, H)?;
+                    self.reduce_tp2_f32_to_bf16(rows, H, Some(&format!("{p}.mlp.shared_experts.down_proj")))?;
                     for r in &self.ranks {
                         r.device.run(|| unsafe {
                             r.device.library.copy_d2d_async(r.scratch.shared_out.buffer, r.scratch.delta.buffer, rows * H * 2, r.stream.raw)
@@ -956,13 +1109,19 @@ impl<'a> Hy4Engine<'a> {
                     }
                 }
                 for r in &self.ranks {
-                    let s_rows = [Scalar::I32(rows as i32)];
-                    r.device.run(|| unsafe {
-                        r.programs.proj_latent_up.launch(
-                            &[r.scratch.routed_latent.buffer.ptr, r.weights.weight(&format!("{p}.mlp.routed_expert_up_proj"))?.ptr, r.scratch.routed_out.buffer.ptr],
-                            &s_rows, r.stream.raw,
+                    r.device.run(|| {
+                        launch_proj_out(
+                            r,
+                            &format!("{p}.mlp.routed_expert_up_proj"),
+                            &r.programs.proj_latent_up,
+                            rows,
+                            r.scratch.routed_latent.buffer,
+                            r.scratch.routed_out.buffer,
                         )?;
-                        r.bf16_add.launch(r.scratch.routed_out.buffer, r.scratch.shared_out.buffer, r.scratch.delta.buffer, rows * H, r.stream.raw)
+                        // SAFETY: routed_out and shared_out finished in stream order into disjoint delta.
+                        unsafe {
+                            r.bf16_add.launch(r.scratch.routed_out.buffer, r.scratch.shared_out.buffer, r.scratch.delta.buffer, rows * H, r.stream.raw)
+                        }
                     })?;
                 }
             }
@@ -1044,26 +1203,40 @@ impl<'a> Hy4Engine<'a> {
             })?;
         }
         for (rank_idx, r) in self.ranks.iter().enumerate() {
-            let head = r.weights.head.as_ref().context("missing VocabularyHead")?;
-            let lm_head_w = r.weights.weight("lm_head")?;
             let local_v = r.weights.local_vocab;
             let mut rank_logits = vec![0f32; rows * local_v];
             for start in (0..rows).step_by(64) {
                 let count = (rows - start).min(64);
                 let x_ptr = r.scratch.y.buffer.ptr.cast::<u8>().wrapping_add(start * H * 2).cast();
-                r.device.run(|| unsafe {
-                    target_head::launch(
-                        TargetHead::configured(),
-                        head,
-                        x_ptr,
-                        lm_head_w.ptr,
-                        r.scratch.logits_tile.buffer.ptr.cast(),
-                        count,
-                        r.stream.raw,
-                    )
-                })?;
-                r.stream.drain()?;
                 let bytes = count * local_v * 4;
+                if let Some(native_head) = r.weights.native.get("lm_head") {
+                    let ns = r.scratch.native.as_ref().context("Hy4 native lm_head missing scratch")?;
+                    let x_buf = CuteafdDeviceBuffer {
+                        ptr: x_ptr,
+                        bytes: count * H * 2,
+                        ..r.scratch.y.buffer
+                    };
+                    let out_buf = CuteafdDeviceBuffer {
+                        bytes,
+                        ..r.scratch.logits_tile.buffer
+                    };
+                    r.device.run(|| native_head.launch(count, x_buf, out_buf, &ns.scratch, r.stream.raw))?;
+                } else {
+                    let head = r.weights.head.as_ref().context("missing VocabularyHead")?;
+                    let lm_head_w = r.weights.weight("lm_head")?;
+                    r.device.run(|| unsafe {
+                        target_head::launch(
+                            TargetHead::configured(),
+                            head,
+                            x_ptr,
+                            lm_head_w.ptr,
+                            r.scratch.logits_tile.buffer.ptr.cast(),
+                            count,
+                            r.stream.raw,
+                        )
+                    })?;
+                }
+                r.stream.drain()?;
                 let mut tile_bytes = vec![0u8; bytes];
                 r.device.run(|| {
                     r.device.library.copy_d2h(&mut tile_bytes, CuteafdDeviceBuffer { bytes, ..r.scratch.logits_tile.buffer })

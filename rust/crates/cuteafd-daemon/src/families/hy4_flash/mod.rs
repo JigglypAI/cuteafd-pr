@@ -9,5 +9,6 @@
 pub(crate) mod cache;
 pub(crate) mod execution;
 pub(crate) mod golden;
+pub(crate) mod native;
 pub(crate) mod programs;
 pub(crate) mod weights;
