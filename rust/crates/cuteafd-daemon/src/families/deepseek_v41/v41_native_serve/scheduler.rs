@@ -272,9 +272,8 @@ fn serving_stats<C: cuteafd_engine::media::EncoderClient>(prefixes: &PrefixCache
         "link_resets": round_failure::resets(),
         // Always-on per-phase / per-round counters (no log lines).
         "phases": phase_stats::snapshot(),
-        // The coordinator<->expert exchange, always on (the `spark exchange wave` log line
-        // stays behind CUTEAFD_PROTOCOL_V2_TCP_TIMING).
-        "exchange": crate::shared::spark_waves::exchange_stats::snapshot(),
+        // The coordinator<->expert exchange and each rank's prefill unit pace.
+        "exchange": crate::shared::spark_waves::exchange_stats::GLOBAL.snapshot(),
     });
     stats
 }
