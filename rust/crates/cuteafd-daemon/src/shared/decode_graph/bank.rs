@@ -151,12 +151,13 @@ impl CaptureTicket {
         // Instantiation/upload and budget sampling may block. Telemetry and
         // physical observers must not wait on CUDA while holding this mutex.
         drop(cache);
-        // The capture's own cost (instantiate + upload), as a counter rather than a log line.
-        // `graph_captures` counts them; this is the time they took.
-        let capture_started = std::time::Instant::now();
-        let exec = source.instantiate(stream)?;
-        crate::families::deepseek_v41::v41_native_serve::scheduler::phase_stats::record_capture(
-            capture_started.elapsed().as_nanos() as u64);
+        // Time inside instantiation (instantiate and upload), counted whether or not it
+        // succeeds: `phases.phase_ns_total.graph_instantiate`.
+        let instantiate_started = std::time::Instant::now();
+        let exec = source.instantiate(stream);
+        crate::families::deepseek_v41::v41_native_serve::scheduler::phase_stats::GLOBAL
+            .record_graph_instantiate(instantiate_started.elapsed().as_nanos() as u64);
+        let exec = exec?;
         self.cache.lock().unwrap_or_else(|p| p.into_inner())
             .register_native(self.id, exec as usize, source.signature.clone());
         Ok((exec, source.nodes, source.width, source.spans_devices, inspection_error))

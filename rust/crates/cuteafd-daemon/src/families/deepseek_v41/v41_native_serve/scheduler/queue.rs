@@ -56,6 +56,8 @@ pub(in crate::families::deepseek_v41::v41_native_serve) trait Host<T, C> {
     fn mark_recovered(&mut self, request: &mut T) -> bool;
     /// A fresh cursor: the left prompt's state (its suffix arena) drops now.
     fn rest(&self) -> C;
+    /// Where this host's queue waits are counted (the serve loop's counters).
+    fn phases(&self) -> &super::phase_stats::PhaseStats { &super::phase_stats::GLOBAL }
 }
 
 /// A packed pass that failed (every member stores the error) may have left a
@@ -82,7 +84,7 @@ pub(in crate::families::deepseek_v41::v41_native_serve) fn chunk<T, C, H: Host<T
     // The prompt's wait in the queue, recorded once at its first chunk.
     if !entry.started {
         entry.started = true;
-        super::phase_stats::record_prefill_queue_wait(entry.queued_at.elapsed().as_nanos() as u64);
+        host.phases().record_prefill_queue_wait(entry.queued_at.elapsed().as_nanos() as u64);
     }
     // A packed group's stored result first, so a packed fault is reported as
     // itself; then a client that left, at this drained boundary (no call of
@@ -170,7 +172,7 @@ mod tests {
     /// links is the bug #2475's review found, so it panics.
     struct FakeHost { whole: bool, rows: usize, waves: usize, log: Rc<RefCell<Vec<(usize, Range<usize>)>>>,
         leases: BTreeSet<usize>, admitted: Vec<(usize, usize)>, failed: Vec<(usize, String)>, sleep: Duration,
-        resets: usize, dirty: bool, fault: Option<usize> }
+        resets: usize, dirty: bool, fault: Option<usize>, phases: super::super::phase_stats::PhaseStats }
     impl Host<Prompt, Cursor> for FakeHost {
         type Output = usize;
         fn run(&mut self, request: &mut Prompt, cursor: &mut Cursor) -> Result<Option<usize>> {
@@ -204,11 +206,13 @@ mod tests {
             super::super::round_failure::mark_recovered(&mut request.packed)
         }
         fn rest(&self) -> Cursor { Cursor::default() }
+        fn phases(&self) -> &super::super::phase_stats::PhaseStats { &self.phases }
     }
 
     fn host(share: f64, rows: usize, waves: usize) -> FakeHost {
         FakeHost { whole: share == 0.0, rows, waves, log: Rc::default(), leases: BTreeSet::new(), admitted: Vec::new(),
-            failed: Vec::new(), sleep: Duration::ZERO, resets: 0, dirty: false, fault: None }
+            failed: Vec::new(), sleep: Duration::ZERO, resets: 0, dirty: false, fault: None,
+            phases: super::super::phase_stats::PhaseStats::new() }
     }
     fn queue(host: &mut FakeHost, share: f64, prompts: &[usize], closed: &Rc<RefCell<BTreeSet<usize>>>)
         -> PrefillQueue<Queued<Prompt, Cursor>> {
@@ -228,10 +232,10 @@ mod tests {
     }
 
     /// A prompt's wait in the queue is charged once, at its first chunk — not once per chunk,
-    /// and not again when it rotates back for a later round.
+    /// and not again when it rotates back for a later round. The host owns its counters, so
+    /// only this test's prompts are in them.
     #[test]
     fn a_prompt_charges_its_queue_wait_once_at_its_first_chunk() {
-        let _guard = super::super::phase_stats::TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let mut host = host(0.2, 2752, 3);
         let closed = Rc::default();
         let mut queue = queue(&mut host, 0.2, &[20000, 20000], &closed);
@@ -239,15 +243,13 @@ mod tests {
         for entry in queue.iter_mut() {
             entry.queued_at = std::time::Instant::now() - Duration::from_millis(5);
         }
-        let wait = || super::super::phase_stats::snapshot()["prefill_queue_wait_ns_total"].as_u64().unwrap();
-        let before = wait();
+        assert_eq!(host.phases.prefill_queue_wait_ns(), 0);
         round(&mut queue, &mut host);
-        let after_first = wait();
-        assert!(after_first - before >= 10_000_000,
-            "both prompts charged their wait: {} ns", after_first - before);
+        let first = host.phases.prefill_queue_wait_ns();
+        assert!(first >= 10_000_000, "both prompts charged their wait: {first} ns");
         // A second round runs more chunks of the same prompts: nothing new is charged.
         round(&mut queue, &mut host);
-        assert_eq!(wait(), after_first, "a prompt's wait is charged once, not per chunk");
+        assert_eq!(host.phases.prefill_queue_wait_ns(), first, "a prompt's wait is charged once, not per chunk");
     }
 
     /// Share 0 makes the previous calls in the previous order: each prompt

@@ -246,7 +246,8 @@ pub(super) fn prepare_prefix_cache<'a>(lib: &'a NativeLibrary, args: &crate::cli
 /// the previous key shape when one is bound.
 fn serving_stats<C: cuteafd_engine::media::EncoderClient>(prefixes: &PrefixCache<'_>,
     kv_waiter: &cuteafd_engine::prefix::DeferredAdmission<admission::Prepared>,
-    media: &admission::Media<C>, prefilling: usize, reserve: &KvReserve, stalled: usize) -> serde_json::Value {
+    media: &admission::Media<C>, prefilling: usize, reserve: &KvReserve, stalled: usize, decoding: usize)
+    -> serde_json::Value {
     // Deliberately exports the cache's whole effective `Config` under
     // `host_cache_config` (packet HC-9), not just `store_pace_ns`: fleet
     // operators tune several of these knobs, and one key keeps the export
@@ -270,8 +271,8 @@ fn serving_stats<C: cuteafd_engine::media::EncoderClient>(prefixes: &PrefixCache
         // Full expert-link resets (all three lanes) since startup; a client that
         // leaves never adds one (#2475).
         "link_resets": round_failure::resets(),
-        // Always-on per-phase / per-round counters (no log lines).
-        "phases": phase_stats::snapshot(),
+        // Serve-loop phase counters, and the requests decoding at this publish.
+        "phases": phase_stats::GLOBAL.snapshot(&crate::shared::prefill_share::round_stats::GLOBAL, decoding),
         // The coordinator<->expert exchange and each rank's prefill unit pace.
         "exchange": crate::shared::spark_waves::exchange_stats::GLOBAL.snapshot(),
     });
@@ -900,10 +901,6 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
     let mut prefills = finish_startup::<QueuedPrompt<'a, P::Suffix>>(&args.decode_share, ready)?;
     let result = crate::shared::api::run_scheduler(|| {
     loop {
-        // The loop iteration's start (the idle branch charges its wait to it) and the live
-        // decoding gauge.
-        let loop_started = Instant::now();
-        phase_stats::set_active_decode(active.iter().flatten().count());
         unsafe { // SAFETY: V4.1 graph owners borrow persistent engine storage only.
             crate::shared::decode_graph::device::observe_completed(lib, |f| {
             first.visit_graph_banks(f)?;
@@ -921,8 +918,10 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
         if stats_published.elapsed() >= std::time::Duration::from_secs(1) {
             stats_published = Instant::now();
             if let Ok(mut slot) = stats.lock() {
+                // Requests finished in the last round are retired just below: not decoding.
                 *slot = serving_stats(&prefixes, &kv_waiter, &media, prefills.len(), &reserve,
-                    active.iter().flatten().filter(|r| r.stalled).count());
+                    active.iter().flatten().filter(|r| r.stalled).count(),
+                    active.iter().flatten().filter(|r| !(r.finished || r.job.events.is_closed())).count());
             }
         }
         if let Some(live) = console::live().filter(|live| live.gauges_due()) {
@@ -996,11 +995,17 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
                     // non-zero `prefill_queue.prefilling` while the queue is empty.
                     // `prefills.len()` is 0 here (it counts in `busy_slots`).
                     if let Ok(mut slot) = stats.lock() {
+                        // `active` is empty here (it counts in `busy_slots`), so the
+                        // published `phases.active_decode` is 0 across the wait.
                         *slot = serving_stats(&prefixes, &kv_waiter, &media, prefills.len(), &reserve,
-                            active.iter().flatten().filter(|r| r.stalled).count());
+                            active.iter().flatten().filter(|r| r.stalled).count(), active.iter().flatten().count());
                         stats_published = Instant::now();
                     }
-                    match receive.blocking_recv() {
+                    let idle_started = Instant::now();
+                    let received = receive.blocking_recv();
+                    // Idle is exactly this wait: nothing admitted, nothing queued.
+                    phase_stats::GLOBAL.record_idle_wait(idle_started.elapsed().as_nanos() as u64);
+                    match received {
                         Some(job) => {
                             stall::mark(stall::Phase::Admission, 1);
                             crate::shared::decode_graph::census::idle();
@@ -1240,8 +1245,6 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
             }
             if closed && media.is_empty() && kv_waiter.is_empty() && prefix_waiters.is_empty() && prefills.is_empty() { break; }
             if media.len() > 0 { std::thread::sleep(Duration::from_millis(1)); }
-            // The whole iteration was idle (nothing decoding, nothing to prefill).
-            phase_stats::record_idle(loop_started.elapsed().as_nanos() as u64);
             continue;
         }
         // Reservation top-ups at this drained boundary; stalled requests sit this round out.
@@ -1297,11 +1300,9 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
                 host_pending: (!media.full() && !media.backlog.is_empty()) || !prefix_waiters.is_empty(),
                 retry: kv_waiter.pending().map(|prepared| (&prepared.job, requests.release_epoch())),
                 prefill_due: cycle.map(|started| started + Duration::from_secs_f64(prefills.decode_seconds())) }));
-        // The decode step's wall time, the part of it that ran while prefill time was owed,
-        // and its rows — counters, not log lines.
-        phase_stats::record_decode_step(
-            decode_started.elapsed().as_nanos() as u64,
-            cycle.map_or(0, |started| started.elapsed().as_nanos() as u64),
+        // The round's wall time, whether prompts were waiting to prefill behind it, and
+        // its member rows.
+        phase_stats::GLOBAL.record_decode_round(decode_started.elapsed().as_nanos() as u64, cycle.is_some(),
             members.iter().map(Vec::len).sum::<usize>() as u64);
         if let Some(started) = cycle { prefills.stepped(started.elapsed().as_secs_f64()); }
         if let Some(started) = census_started {
@@ -1453,78 +1454,87 @@ pub(super) mod sampling_stats {
     }
 }
 
-/// Always-on per-phase / per-round engine telemetry.
+/// Always-on serve-loop phase counters, published in `/v1/stats` `phases`.
 ///
-/// Carries the quantities the `CUTEAFD_EXPERT_TIMING` / `CUTEAFD_PROTOCOL_V2_TCP_TIMING` log
-/// lines used to print — which wrote gigabytes per hour per expert to syslog at load — as
-/// monotonic counters in `/v1/stats`: a few relaxed atomic adds per round, no allocation, no
-/// lock, no log. The counters are read only by the 1 Hz stats publisher, never on the hot path.
+/// Monotonic counters read by the stats publisher: a clock pair and a few relaxed adds per
+/// decode round, per idle wait, per graph instantiation and per queued prompt. No
+/// allocation, no lock, no log line.
 ///
 /// The prefill-round counters live with the round itself
-/// ([`crate::shared::prefill_share::round_stats`]), because every family prefills through that
-/// queue; this module owns the serve loop's own phases and merges the queue's numbers into the
-/// one snapshot.
-///
-/// **Overhead basis.** One `Instant::now()` pair plus one `fetch_add` per phase per round. The
-/// smallest round this bounds is a decode step, whose own floor is >= 1 ms; six relaxed adds at
-/// ~20 ns each is ~120 ns, i.e. <= 0.012 % of a 1 ms round. Nothing here allocates.
+/// ([`crate::shared::prefill_share::round_stats`]) and are merged into the one snapshot.
+/// The three time counters `prefill_round`, `decode_round` and `idle_wait` never overlap;
+/// `decode_round_with_prefill_waiting` is a part of `decode_round`, and `graph_instantiate`
+/// is spent wherever a capture runs (startup warm-up, or inside a round).
 pub(crate) mod phase_stats {
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    /// Wall time of every decode step.
-    static DECODE_STEP_NS: AtomicU64 = AtomicU64::new(0);
-    /// The part of a decode step that ran while prefill time was owed (`cycle.is_some()`).
-    /// Always <= `DECODE_STEP_NS`; the difference is decode that ran with nothing owed.
-    static DECODE_OWED_WAIT_NS: AtomicU64 = AtomicU64::new(0);
-    /// Wall time the serve loop spent with nothing to do (the idle branch).
-    static IDLE_NS: AtomicU64 = AtomicU64::new(0);
-    /// Graph capture time, accumulated by the capture path.
-    static GRAPH_CAPTURE_NS: AtomicU64 = AtomicU64::new(0);
-
-    static ROUNDS_DECODE: AtomicU64 = AtomicU64::new(0);
-    /// Decode rows run (the sum of every decode round's member rows).
-    static ROWS_DECODE: AtomicU64 = AtomicU64::new(0);
-    /// Time a prompt waited in the prefill queue before its first chunk.
-    static PREFILL_QUEUE_WAIT_NS: AtomicU64 = AtomicU64::new(0);
-    /// Decoding requests right now (a gauge, set by the serve loop each iteration).
-    static ACTIVE_DECODE: AtomicU64 = AtomicU64::new(0);
-
-    pub(super) fn record_decode_step(ns: u64, owed_ns: u64, rows: u64) {
-        DECODE_STEP_NS.fetch_add(ns, Ordering::Relaxed);
-        DECODE_OWED_WAIT_NS.fetch_add(owed_ns, Ordering::Relaxed);
-        ROUNDS_DECODE.fetch_add(1, Ordering::Relaxed);
-        ROWS_DECODE.fetch_add(rows, Ordering::Relaxed);
+    /// One serve loop's counters. Serving uses [`GLOBAL`]; a test host owns its own.
+    pub(crate) struct PhaseStats {
+        /// Wall time of every decode round.
+        decode_round_ns: AtomicU64,
+        /// The wall time of the decode rounds that ran while prompts waited in the prefill
+        /// queue (rounds the decode share pays for). A part of `decode_round_ns`.
+        decode_round_with_prefill_waiting_ns: AtomicU64,
+        /// Time blocked waiting for a request with nothing admitted and nothing queued.
+        idle_wait_ns: AtomicU64,
+        /// Time inside decode-graph instantiation (instantiate and upload) of the captures
+        /// that reached it, failed ones included.
+        graph_instantiate_ns: AtomicU64,
+        decode_rounds: AtomicU64,
+        /// Member rows of every decode round (one row per request per round it ran in).
+        decode_rows: AtomicU64,
+        /// From a prompt's entry into the prefill queue to its first chunk, summed over the
+        /// prompts that started.
+        prefill_queue_wait_ns: AtomicU64,
     }
 
-    pub(super) fn record_idle(ns: u64) { IDLE_NS.fetch_add(ns, Ordering::Relaxed); }
-    /// Called from the graph-capture path (`shared/decode_graph/bank.rs`), which is outside this
-    /// module, so it is `pub(crate)`.
-    pub(crate) fn record_capture(ns: u64) { GRAPH_CAPTURE_NS.fetch_add(ns, Ordering::Relaxed); }
-    pub(super) fn record_prefill_queue_wait(ns: u64) { PREFILL_QUEUE_WAIT_NS.fetch_add(ns, Ordering::Relaxed); }
-    pub(super) fn set_active_decode(n: usize) { ACTIVE_DECODE.store(n as u64, Ordering::Relaxed); }
+    pub(crate) static GLOBAL: PhaseStats = PhaseStats::new();
 
-    pub(super) fn snapshot() -> serde_json::Value {
-        use crate::shared::prefill_share::round_stats;
-        let get = |c: &AtomicU64| c.load(Ordering::Relaxed);
-        serde_json::json!({
-            "phase_ns_total": {
-                "prefill_round": round_stats::round_ns(),
-                "decode_step": get(&DECODE_STEP_NS),
-                "decode_owed_wait": get(&DECODE_OWED_WAIT_NS),
-                "capture": get(&GRAPH_CAPTURE_NS),
-                "idle": get(&IDLE_NS),
-            },
-            "rounds_total": {"prefill": round_stats::rounds(), "decode": get(&ROUNDS_DECODE)},
-            "rows_total": {"decode": get(&ROWS_DECODE)},
-            "prefill_prompts_total": round_stats::prompts(),
-            "prefill_queue_wait_ns_total": get(&PREFILL_QUEUE_WAIT_NS),
-            "active_decode": get(&ACTIVE_DECODE),
-        })
+    impl PhaseStats {
+        pub(crate) const fn new() -> Self {
+            const ZERO: AtomicU64 = AtomicU64::new(0);
+            Self { decode_round_ns: ZERO, decode_round_with_prefill_waiting_ns: ZERO, idle_wait_ns: ZERO,
+                graph_instantiate_ns: ZERO, decode_rounds: ZERO, decode_rows: ZERO, prefill_queue_wait_ns: ZERO }
+        }
+
+        pub(super) fn record_decode_round(&self, ns: u64, prefill_waiting: bool, rows: u64) {
+            self.decode_round_ns.fetch_add(ns, Ordering::Relaxed);
+            if prefill_waiting { self.decode_round_with_prefill_waiting_ns.fetch_add(ns, Ordering::Relaxed); }
+            self.decode_rounds.fetch_add(1, Ordering::Relaxed);
+            self.decode_rows.fetch_add(rows, Ordering::Relaxed);
+        }
+        pub(super) fn record_idle_wait(&self, ns: u64) { self.idle_wait_ns.fetch_add(ns, Ordering::Relaxed); }
+        /// Called from the graph bank (`shared/decode_graph/bank.rs`).
+        pub(crate) fn record_graph_instantiate(&self, ns: u64) {
+            self.graph_instantiate_ns.fetch_add(ns, Ordering::Relaxed);
+        }
+        pub(super) fn record_prefill_queue_wait(&self, ns: u64) {
+            self.prefill_queue_wait_ns.fetch_add(ns, Ordering::Relaxed);
+        }
+        #[cfg(test)]
+        pub(super) fn prefill_queue_wait_ns(&self) -> u64 { self.prefill_queue_wait_ns.load(Ordering::Relaxed) }
+
+        /// `decoding` is the number of requests decoding at this publish: a value of the
+        /// publish, not a stored gauge, so it cannot outlive the requests it counted.
+        pub(super) fn snapshot(&self, rounds: &crate::shared::prefill_share::round_stats::RoundStats, decoding: usize)
+            -> serde_json::Value {
+            let get = |c: &AtomicU64| c.load(Ordering::Relaxed);
+            serde_json::json!({
+                "phase_ns_total": {
+                    "prefill_round": rounds.round_ns(),
+                    "decode_round": get(&self.decode_round_ns),
+                    "decode_round_with_prefill_waiting": get(&self.decode_round_with_prefill_waiting_ns),
+                    "graph_instantiate": get(&self.graph_instantiate_ns),
+                    "idle_wait": get(&self.idle_wait_ns),
+                },
+                "rounds_total": {"prefill": rounds.rounds(), "decode": get(&self.decode_rounds)},
+                "decode_rows_total": get(&self.decode_rows),
+                "prefill_prompt_rounds_total": rounds.prompt_rounds(),
+                "prefill_queue_wait_ns_total": get(&self.prefill_queue_wait_ns),
+                "active_decode": decoding,
+            })
+        }
     }
-
-    /// The counters are process-global atomics; the delta tests must not race each other.
-    #[cfg(test)]
-    pub(crate) static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 }
 
 /// Which kernel route one row of a sampled round takes.
@@ -3542,7 +3552,7 @@ mod sampling_tests {
         let mut encoder = cuteafd_engine::media::FakeEncoder::default();
         let media = admission::Media::new(&mut encoder, 4).unwrap();
         let reserve = KvReserve::new(cuteafd_engine::reserve::ReserveConfig::new(16_384, 0, -1, 131_072).unwrap(), UNIT_TOKENS);
-        let snapshot = serving_stats(&disabled, &waiter, &media, 2, &reserve, 2);
+        let snapshot = serving_stats(&disabled, &waiter, &media, 2, &reserve, 2, 0);
         assert!(snapshot["admission"]["deferred"].is_u64(), "missing admission deferred in {snapshot}");
         for key in ["top_ups", "stalls", "early_terminations", "deadlock_breaks", "admission_waits"] {
             assert!(snapshot["kv_reserve"]["stats"][key].is_u64(), "missing kv_reserve {key} in {snapshot}");
@@ -3560,7 +3570,7 @@ mod sampling_tests {
         }
         // A configured bank keeps the **full** key set (the host keys stay null
         // here, because this fixture has no host cache attached either).
-        let configured = serving_stats(&PrefixCache::configured(8), &waiter, &media, 0, &reserve, 0);
+        let configured = serving_stats(&PrefixCache::configured(8), &waiter, &media, 0, &reserve, 0, 0);
         assert!(configured["prefix"]["promotions"].is_u64(), "{configured}");
         assert!(configured["host_cache"].is_null(), "{configured}");
         assert!(configured["host_cache_config"].is_null(), "{configured}");
@@ -3979,59 +3989,53 @@ mod loop_abort_tests {
 
 #[cfg(test)]
 mod telemetry_tests {
-    use super::phase_stats;
+    use super::phase_stats::PhaseStats;
+    use crate::shared::prefill_share::round_stats::RoundStats;
 
-    /// The counters are process-global atomics, so the tests that read deltas must not run
-    /// concurrently with each other.
-    fn lock() -> std::sync::MutexGuard<'static, ()> {
-        phase_stats::TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner())
-    }
+    // The serve loop itself needs the native library and both GPUs, so its decode-round,
+    // idle-wait and graph-instantiate sites have no CPU seam; these two tests cover the
+    // counters' arithmetic and the published shape on their own instance (no shared state).
+    // The sites with a seam are driven for real: the prefill round and the queue wait
+    // (`shared::prefill_share`, `scheduler::queue`), the exchange and the unit pace
+    // (`shared::spark_waves_tests`), and `active_decode` through `serving_stats` below.
 
-    fn delta(before: &serde_json::Value, after: &serde_json::Value, key: &str, sub: &str) -> u64 {
-        after[key][sub].as_u64().unwrap() - before[key][sub].as_u64().unwrap()
-    }
-
-    /// The serve loop's own counters move per step, and the snapshot carries the shape the
-    /// stats collector scrapes. Deltas, because the atomics are process-global.
-    ///
-    /// The prefill-round numbers are recorded by the queue that runs the round
-    /// (`shared::prefill_share::round_stats`, proven by its own behavioural test); here they
-    /// are only checked to be present and numeric in the merged snapshot.
     #[test]
-    fn decode_and_idle_counters_move_per_step() {
-        let _guard = lock();
-        let before = phase_stats::snapshot();
-        phase_stats::record_decode_step(1_500_000, 500_000, 7);
-        phase_stats::record_idle(250_000);
-        phase_stats::record_capture(900_000);
-        phase_stats::record_prefill_queue_wait(400_000);
-        phase_stats::set_active_decode(4);
-        let after = phase_stats::snapshot();
-
-        assert_eq!(delta(&before, &after, "phase_ns_total", "decode_step"), 1_500_000);
-        assert_eq!(delta(&before, &after, "phase_ns_total", "decode_owed_wait"), 500_000);
-        assert_eq!(delta(&before, &after, "phase_ns_total", "idle"), 250_000);
-        assert_eq!(delta(&before, &after, "phase_ns_total", "capture"), 900_000);
-        assert_eq!(delta(&before, &after, "rounds_total", "decode"), 1);
-        assert_eq!(delta(&before, &after, "rows_total", "decode"), 7);
-        assert_eq!(after["prefill_queue_wait_ns_total"].as_u64().unwrap()
-            - before["prefill_queue_wait_ns_total"].as_u64().unwrap(), 400_000);
-        assert_eq!(after["active_decode"].as_u64().unwrap(), 4);
-        // The queue's numbers are merged into the same snapshot.
-        assert!(after["phase_ns_total"]["prefill_round"].is_u64());
-        assert!(after["rounds_total"]["prefill"].is_u64());
-        assert!(after["prefill_prompts_total"].is_u64());
+    fn the_phase_counters_publish_what_was_recorded() {
+        let (stats, rounds) = (PhaseStats::new(), RoundStats::new());
+        stats.record_decode_round(1_500_000, true, 7);
+        stats.record_decode_round(1_000_000, false, 2);
+        stats.record_idle_wait(250_000);
+        stats.record_graph_instantiate(900_000);
+        stats.record_prefill_queue_wait(400_000);
+        let published = stats.snapshot(&rounds, 4);
+        assert_eq!(published, serde_json::json!({
+            "phase_ns_total": {"prefill_round": 0, "decode_round": 2_500_000,
+                "decode_round_with_prefill_waiting": 1_500_000, "graph_instantiate": 900_000, "idle_wait": 250_000},
+            "rounds_total": {"prefill": 0, "decode": 2},
+            "decode_rows_total": 9,
+            "prefill_prompt_rounds_total": 0,
+            "prefill_queue_wait_ns_total": 400_000,
+            "active_decode": 4,
+        }));
     }
 
-    /// `decode_owed_wait` is a subset of `decode_step` by construction: a decode step that ran
-    /// with nothing owed contributes 0 to it, never more than the step itself.
+    /// `active_decode` is the count handed to each publish, so the idle publish (an empty
+    /// running set) reports 0 whatever an earlier publish reported: nothing is stored that
+    /// could stay set across the idle wait.
     #[test]
-    fn owed_wait_never_exceeds_the_decode_step() {
-        let _guard = lock();
-        let before = phase_stats::snapshot();
-        phase_stats::record_decode_step(1_000_000, 0, 2);
-        let after = phase_stats::snapshot();
-        assert_eq!(delta(&before, &after, "phase_ns_total", "decode_step"), 1_000_000);
-        assert_eq!(delta(&before, &after, "phase_ns_total", "decode_owed_wait"), 0);
+    fn active_decode_is_the_running_set_at_each_publish() {
+        use super::*;
+        let waiter = cuteafd_engine::prefix::DeferredAdmission::default();
+        let mut encoder = cuteafd_engine::media::FakeEncoder::default();
+        let media = admission::Media::new(&mut encoder, 4).unwrap();
+        let reserve = KvReserve::new(cuteafd_engine::reserve::ReserveConfig::new(16_384, 0, -1, 131_072).unwrap(), UNIT_TOKENS);
+        let prefixes = PrefixCache::disabled();
+        let busy = serving_stats(&prefixes, &waiter, &media, 0, &reserve, 0, 3);
+        assert_eq!(busy["phases"]["active_decode"], 3);
+        let idle = serving_stats(&prefixes, &waiter, &media, 0, &reserve, 0, 0);
+        assert_eq!(idle["phases"]["active_decode"], 0, "the idle publish must not keep the busy count");
+        // The exchange group is published beside it, per rank.
+        assert_eq!(idle["exchange"]["expert_prefill_units"]["units_total"].as_array().unwrap().len(),
+            cuteafd_core::MAX_SPARK_WORLD);
     }
 }
