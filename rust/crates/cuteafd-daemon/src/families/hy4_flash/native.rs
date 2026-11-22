@@ -249,14 +249,15 @@ impl<'a> Hy4NativeCore<'a> {
                 payload.buffer,
                 Some(scales.buffer),
             )?;
-            dense.admit_mount(cuteafd_loader::shared::dense_read::MountLoad::from_headers(
+            let fp8_dense = DenseLoad::mount(device.library);
+            fp8_dense.admit_mount(cuteafd_loader::shared::dense_read::MountLoad::from_headers(
                 selected.tensors.iter().map(|t| &t.meta),
                 native.ranks,
             )?)?;
             for record in records {
                 device.run(|| match record {
-                    AttentionRecord::Operand(op) => dense.operand(op),
-                    AttentionRecord::Step(step) => dense.step(step, std::ptr::null_mut()),
+                    AttentionRecord::Operand(op) => fp8_dense.operand(op),
+                    AttentionRecord::Step(step) => fp8_dense.step(step, std::ptr::null_mut()),
                 })?;
             }
             linears.insert(
