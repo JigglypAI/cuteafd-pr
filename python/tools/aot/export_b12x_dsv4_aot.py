@@ -2202,8 +2202,8 @@ def main() -> None:
         from export_b12x_dense_trellis_k6_aot import HY4F_SHAPES
         existing_fp8 = {suffix for family, suffix, *_ in work if family == "native_attention"}
         for name, k, n, side in HY4F_SHAPES:
-            if name.startswith("hy4f_kv_b"):
-                continue  # absorbed BF16 kv_b_proj stays BF16 in fp8-compact
+            if name.startswith("hy4f_kv_b") or name in ("hy4f_dense_down", "hy4f_dense_down_tp2", "hy4f_shared_down_tp2"):
+                continue  # absorbed kv_b_proj and TP2 K-split down_proj (K=6912/768 not 512-aligned) stay BF16 in fp8-compact
             is_head = n in (120832, 60416)
             precision = "f32" if (is_head or side == 2) else "bf16"
             for rows in ((64,) if is_head else (64, 4096)):
