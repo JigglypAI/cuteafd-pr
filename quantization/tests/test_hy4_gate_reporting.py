@@ -27,7 +27,7 @@ def prepare(tmp_path):
 def test_dedup_after_partial_post_and_lost_response(tmp_path, monkeypatch):
     prepare(tmp_path)
     remote = {}
-    monkeypatch.setattr(reporting, "posted_parts", lambda: dict(remote))
+    monkeypatch.setattr(reporting, "posted_parts", lambda issue_path: dict(remote))
     def post(*args, data):
         marker = json.loads(data)["body"].splitlines()[0]
         assert marker not in remote
@@ -76,7 +76,7 @@ def test_projection_failure_before_first_layer_seals(tmp_path, monkeypatch):
     def post(*args, data):
         posts.append(json.loads(data)["body"])
         return 42
-    monkeypatch.setattr(reporting, "posted_parts", lambda: {})
+    monkeypatch.setattr(reporting, "posted_parts", lambda issue_path: {})
     monkeypatch.setattr(reporting, "gh", post)
     reporting.report(tmp_path)
     reporting.report(tmp_path)
