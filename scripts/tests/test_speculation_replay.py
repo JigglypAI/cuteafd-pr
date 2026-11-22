@@ -73,7 +73,11 @@ def test_measured_table_interpolates_rows_within_a_context_band():
     for k, (n, t) in enumerate([(8, 70_000), (8, 70_000), (8, 72_000), (32, 150_000), (32, 152_000),
                                  (32, 154_000), (64, 230_000), (64, 230_000), (64, 236_000)]):
         rows.append(row([False], rnd=k, context=500, proposed=n - 1, round_us=t, batch_rows=n))
-    table = replay.fit_table(rows)
+    replay.MIN_POINT_ROUNDS, saved = 3, replay.MIN_POINT_ROUNDS
+    try:
+        table = replay.fit_table(rows)
+    finally:
+        replay.MIN_POINT_ROUNDS = saved
     assert table['0'] == {8: 70_000, 32: 152_000, 64: 230_000}
     fit = {'coef': [0.] * 5, 'table': table}
     assert replay.predict(fit, 20, 1, 0.) == pytest.approx(70_000 + 82_000 * 12 / 24)
@@ -145,3 +149,25 @@ def test_settle_grants_the_row_budget_by_next_score_keeping_prefixes():
     # budget 6 drafts (8 rows - 2 anchors): b's 0.99 first, then a's 0.9 run beats b's 0.2s
     assert replay.settle([7, 7], [a, b], max_rows=8) == [5, 1]
     assert replay.settle([2, 3], [a, b], max_rows=64) == [2, 3]
+
+
+def test_tidy_joins_family_round_features_as_raw_candidate_p(tmp_path):
+    job = tmp_path / 'job'
+    job.mkdir()
+    (job / 'job.json').write_text(json.dumps({'card': 'glmf', 'entry': {'family': 'glm5_flash', 'set': {}}}))
+    record = {'type': 'draft_round', 'round': 0, 'policy': 'fixed 7', 'block': 7, 'lane': 0, 'round_us': 30000,
+              'draft_us': 2000, 'verify_us': 26000, 'context': [67],
+              'requests': [{'id': 1, 'room': 63, 'keep': 7, 'neural': 7, 'copy': 0, 'proposed': 2, 'accepted_drafts': 1,
+                            'censored': False, 'positions': [{'p': 1.0, 'score': None, 'outcome': o} for o in (True, False)]}]}
+    family = {'round': 1, 'request_ids': [1], 'neural_features': [[[1.6, 0.79, 0.68, 0.0], [2.9, 0.94, 0.24, 2.0]]]}
+    (job / 'speculation-trace.jsonl').write_text(json.dumps(record) + '\n' + json.dumps(family) + '\n')
+    r = replay.tidy_job(job)[0]
+    assert (r['score'], r['score_source'], r['round_us']) == ([0.79, 0.94], 'raw candidate p (cycle features)', 30000)
+
+
+def test_rows_below_a_long_band_take_the_short_curve_shape_scaled_at_its_anchor():
+    table = {'0': {1: 10_000, 8: 20_000, 64: 100_000}, '128K': {8: 40_000, 64: 160_000}}
+    fit = {'coef': [0.] * 5, 'table': table}
+    assert replay.predict(fit, 1, 1, 128.) == pytest.approx(20_000)  # 10k * 40k/20k
+    assert replay.predict(fit, 8, 1, 128.) == 40_000
+    assert replay.predict(fit, 36, 1, 128.) == pytest.approx(100_000)

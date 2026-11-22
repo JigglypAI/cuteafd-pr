@@ -121,9 +121,10 @@ def tidy_job(job_dir):
             cycles.append(None)
         elif kind == 'cycle':  # GLM 5.3: one line per verified sequence
             glm_cycles[record['id']].append(record)
-        elif 'cycle_ms' in record and rounds and cycles[-1] is None:
-            # The shared scheduler writes its cycle record right after observe's round record.
-            ids = record.get('ids') or []
+        elif rounds and cycles[-1] is None and ('cycle_ms' in record or 'neural_features' in record):
+            # The family's own round record (shared scheduler `cycle`, GLM Flash/MiMo) follows
+            # observe's round record and names the same members.
+            ids = record.get('ids') or record.get('request_ids') or []
             if sorted(ids) == sorted(q['id'] for q in rounds[-1]['requests']):
                 cycles[-1] = record
     paired = True
@@ -132,17 +133,22 @@ def tidy_job(job_dir):
     rows = []
     for k, record in enumerate(rounds):
         cycle = cycles[k]
-        times = round_times(record) if 'round_us' in record else (round_times(cycle) if cycle else (None, None, None))
+        times = round_times(record) if 'round_us' in record else (
+            round_times(cycle) if cycle and 'cycle_ms' in cycle else (None, None, None))
         requests = record['requests']
         contexts = record.get('context')
         if contexts is None and cycle and cycle.get('contexts'):
             contexts = [c[0] - 1 if c else None for c in cycle['contexts']]
         batch_rows = sum(q['proposed'] + 1 for q in requests)
+        member = {}
+        if cycle and cycle.get('neural_features') is not None:
+            ids = cycle.get('ids') or cycle.get('request_ids') or []
+            member = {rid: f for rid, f in zip(ids, cycle['neural_features']) if f}
         for i, q in enumerate(requests):
             meta = index.get(q.get('request_id') or '', {})
             context = contexts[i] if contexts and i < len(contexts) else None
             verify_ms = None
-            features = []
+            features = member.get(q['id']) or []
             if glm_cycles.get(q['id']):
                 n = seen[q['id']]
                 if n < len(glm_cycles[q['id']]):
@@ -207,6 +213,16 @@ def manifest(job_dir):
             for p in panel.get('passes', []):
                 if isinstance(p, dict) and p.get('thermal'):
                     thermal.append(dict(panel=panel.get('id'), thermal=summarize_thermal(p['thermal'])))
+    measured = []
+    for report in sorted(job_dir.glob('reports/**/report.json')):
+        for panel in json.loads(report.read_text()).get('panels', []):
+            if panel.get('id') == 'concurrency':
+                for p in panel.get('passes', []):
+                    for point in p.get('points') or []:
+                        measured.append(dict(context='0', c=point.get('c'), tok_s=point.get('aggregate_tok_s')))
+    for point in context_points:
+        if point['status'] == 'ok':
+            measured.append(dict(context=context_band(point['context']), c=point['c'], tok_s=point['aggregate_tok_s']))
     highest = {}
     for point in context_points:
         if point['status'] == 'ok':
@@ -214,7 +230,7 @@ def manifest(job_dir):
     return dict(card=job['card'], family=job['entry']['family'], status=result.get('status'),
         error=result.get('error'), launcher=result.get('launcher'), artifacts=result.get('artifacts'),
         settings={k: v for k, v in job['entry']['set'].items() if k in keep}, thermal=thermal,
-        context_points=context_points, highest_concurrency_by_context=highest,
+        context_points=context_points, highest_concurrency_by_context=highest, measured_fixed=measured,
         notes=KNOWN_NOTES.get(job['card'], []))
 
 
@@ -351,9 +367,24 @@ def fit_table(rows):
         cells[(band, rws)].append(t)
     table = {}
     for (band, rws), ts in cells.items():
-        if len(ts) >= 3:
+        if len(ts) >= MIN_POINT_ROUNDS:
             table.setdefault(band, {})[rws] = statistics.median(ts)
     return table
+
+
+MIN_POINT_ROUNDS = 10
+
+
+def interpolate(curve, rows):
+    """Piecewise-linear in rows over a measured {rows: us} curve, flat beyond its ends."""
+    xs = sorted(curve)
+    if rows <= xs[0]:
+        return curve[xs[0]]
+    if rows >= xs[-1]:
+        return curve[xs[-1]]
+    lo = max(x for x in xs if x <= rows)
+    hi = min(x for x in xs if x >= rows)
+    return curve[lo] if hi == lo else curve[lo] + (curve[hi] - curve[lo]) * (rows - lo) / (hi - lo)
 
 
 def predict(fit, rows, requests, ctx_k):
@@ -363,17 +394,13 @@ def predict(fit, rows, requests, ctx_k):
     if table:
         band = context_band(ctx_k * 1000)
         curve = table.get(band) or table.get(min(table, key=lambda b: abs(BAND_K[b] - ctx_k)))
-        xs = sorted(curve)
-        if rows <= xs[0]:
-            lo, hi = xs[0], xs[1] if len(xs) > 1 else xs[0]
-        elif rows >= xs[-1]:
-            lo, hi = xs[-2] if len(xs) > 1 else xs[-1], xs[-1]
-        else:
-            lo = max(x for x in xs if x <= rows)
-            hi = min(x for x in xs if x >= rows)
-        if hi == lo:
-            return curve[lo]
-        return max(1., curve[lo] + (curve[hi] - curve[lo]) * (rows - lo) / (hi - lo))
+        base = table.get('0')
+        if base is None or curve is base or rows >= min(curve):
+            return max(1., interpolate(curve, rows))
+        # Below the band's smallest measured row count, take the 0-context curve's
+        # shape scaled by the band's measured ratio at that row count.
+        anchor = min(curve)
+        return max(1., interpolate(base, rows) * curve[anchor] / interpolate(base, anchor))
     a, b, c, d, e = fit['coef']
     return max(1., a + b * rows + c * rows * ctx_k + d * requests * ctx_k + e * requests)
 
@@ -387,19 +414,24 @@ def rule_fixed(n):
     return lambda row: min(n, row['proposed'])
 
 
-def rule_history(cut=0.5, trained_cut=0.3):
-    """Dev `history`: keep while the per-token score clears its cut, plus one explore.
+def rule_history(candidate_cut=0.5, head_cut=0.3, history_cut=0.3):
+    """Dev `history` (draft_history.rs): keep while the per-token score clears its
+    cut, plus one explore. Raw DFlash2 candidate p uses CANDIDATE_KEEP_CUT 0.5, a
+    trained (calibrated) head TRAINED_HEAD_KEEP_CUT 0.3, and a token-only drafter
+    its history estimate against KEEP_CUT 0.3.
 
-    Token-only drafters (no score) use the history estimate with the 0.3 cut.
-    The keep prefix is followed by one explored position.
+    Replay caveat: the history estimate in a fixed-length trace saw every position
+    of every round, so for token-only drafters it is the estimate a fixed policy
+    would have, not the one `history`'s own shorter rounds would have produced.
     """
     def length(row):
         scores = row['score']
+        source = row.get('score_source') or ''
         if any(s is not None for s in scores):
-            c = cut
+            c = head_cut if source.startswith('head') else candidate_cut
             vals = scores
         else:
-            c = trained_cut
+            c = history_cut
             vals = row['history']
         keep = 0
         for v in vals:
@@ -573,8 +605,13 @@ RULES = {
 }
 
 
-def analyze(rows, weights=None):
-    """Everything the report needs, from tidy rows only."""
+def analyze(rows, weights=None, manifests=()):
+    """Everything the report needs, from tidy rows (and, for calibration, the
+    manifests' measured fixed-length tok/s per context x concurrency)."""
+    measured = {}
+    for m in manifests:
+        for point in m.get('measured_fixed') or []:
+            measured[(m['family'], point['context'], point['c'])] = point['tok_s']
     fits = {}
     by_family = collections.defaultdict(list)
     for r in rows:
@@ -598,6 +635,11 @@ def analyze(rows, weights=None):
             for name, rule in RULES.items():
                 row[name] = replay(group, fit, rule)['tok_s']
             row['marginal'] = replay(group, fit, None, rule_marginal)['tok_s']
+            # The replay prices verify rounds only; scale every rule by measured / replayed
+            # fixed-length tok/s in this cell so fixed-7 reproduces the measurement.
+            fixed_name = f"fixed-{max(g['block'] for g in group)}"
+            got = measured.get((family, band, c))
+            row['calibration'] = got / row[fixed_name] if got and row.get(fixed_name) else None
             best = max((k for k in row if k.startswith(('fixed', 'history', 'product', 'marginal'))), key=lambda k: row[k])
             row['best'] = best
             cells.append(row)
@@ -648,12 +690,15 @@ def render(result):
             lines.append(f'- {family} {band}: {pts}')
     rules = ['history', 'fixed-1', 'fixed-2', 'fixed-3', 'fixed-4', 'fixed-7', 'product>0.3', 'product>0.5', 'marginal']
     lines += ['', '## Replay tok/s by family x context x concurrency', '',
-              '| Family | Context | C | rounds | trunc | ' + ' | '.join(rules) + ' | best |',
-              '|' + '---|' * (len(rules) + 6)]
+              'Replayed verify-round tok/s. `calib` is measured / replayed fixed-length tok/s for the cell (prefill, ramp and tail',
+              'overheads the replay does not price); multiply a rule by it for an absolute estimate. Ratios between rules need no calibration.', '',
+              '| Family | Context | C | rounds | trunc | calib | ' + ' | '.join(rules) + ' | best |',
+              '|' + '---|' * (len(rules) + 7)]
     for c in result['cells']:
         if c['rounds'] < 20:
             continue
-        lines.append(f"| {label(c['family'])} | {c['context']} | {c['c']} | {c['rounds']} | {c['truncated']:.2f} | "
+        cal = '' if c.get('calibration') is None else f"{c['calibration']:.2f}"
+        lines.append(f"| {label(c['family'])} | {c['context']} | {c['c']} | {c['rounds']} | {c['truncated']:.2f} | {cal} | "
                      + ' | '.join(f"{c[r]:.1f}" for r in rules) + f" | {c['best']} |")
     lines += ['', '## Traffic mix (25% 0, 25% 8K, 30% 32K, 20% 128K)', '', '| Family | ' + ' | '.join(rules) + ' |',
               '|' + '---|' * (len(rules) + 1)]
@@ -738,7 +783,8 @@ def main(argv=None):
                       f"{sum(r['context'] is not None for r in rows)} with context")
     else:
         rows = list(read_jsonl(Path(args.dataset) / 'tidy.jsonl'))
-        result = analyze(rows)
+        manifests = [json.loads(p.read_text()) for p in sorted((Path(args.dataset) / 'manifests').glob('*.json'))]
+        result = analyze(rows, manifests=manifests)
         (out / 'analysis.json').write_text(json.dumps(result, indent=1, default=str))
         (out / 'report.md').write_text(render(result))
         if args.plot:
