@@ -27,7 +27,17 @@ pub fn serving_bytes() -> Vec<u64> {
 
 static LIVE: OnceLock<Vec<u64>> = OnceLock::new();
 
+/// Per-rank Spark capacity: idle `MemAvailable` plus the GB10 display carveout
+/// a validated spark-attic would lend this host's routed-expert arena
+/// (`carveout_bytes`, absent or 0 where none is reachable; #2546). The
+/// carveout lies outside `MemAvailable`, so the two never overlap; the worker
+/// maps it only into its routed-expert arena, so it never backs another owner.
 pub fn sample_bytes(samples: &str) -> Result<Vec<u64>> {
+    Ok(sample_parts(samples)?.into_iter().map(|(available, carveout)| available.saturating_add(carveout)).collect())
+}
+
+/// `(MemAvailable, carveout)` per rank; the carveout counts only while enabled.
+pub fn sample_parts(samples: &str) -> Result<Vec<(u64, u64)>> {
     let rows: Vec<serde_json::Value> = serde_json::from_str(samples)?;
     anyhow::ensure!(!rows.is_empty() && rows.len() <= 8, "Spark samples require 1..8 ranks");
     rows.iter().map(|row| {
@@ -36,9 +46,19 @@ pub fn sample_bytes(samples: &str) -> Result<Vec<u64>> {
         anyhow::ensure!(row["boot_id"].as_str().is_some_and(|id| !id.is_empty())
             && row["age_seconds"].as_f64().is_some_and(|age| age >= 0.0),
             "Spark sample requires boot_id and age_seconds");
-        Ok(bytes)
+        let carveout = match row.get("carveout_bytes") {
+            None | Some(serde_json::Value::Null) => 0,
+            Some(value) => value.as_u64().context("carveout_bytes must be a byte count")?,
+        };
+        anyhow::ensure!(carveout % (2 << 20) == 0, "carveout_bytes must be whole 2 MiB slices");
+        Ok((bytes, if cuteafd_ffi_attic_enabled() { carveout } else { 0 }))
     }).collect()
 }
+
+/// `--spark-carveout off` (process-wide) plans without the carveout.
+fn cuteafd_ffi_attic_enabled() -> bool { CARVEOUT_ENABLED.load(std::sync::atomic::Ordering::SeqCst) }
+static CARVEOUT_ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+pub fn set_carveout_enabled(enabled: bool) { CARVEOUT_ENABLED.store(enabled, std::sync::atomic::Ordering::SeqCst); }
 
 pub fn install_samples(samples: &str) -> Result<()> {
     let bytes = sample_bytes(samples)?;
@@ -102,6 +122,18 @@ mod tests {
         assert_eq!(sample_bytes(samples).unwrap(), vec![123, 456]);
         for invalid in ["[]", r#"[{"bytes":0,"boot_id":"a","age_seconds":0}]"#,
             r#"[{"bytes":123,"age_seconds":0}]"#, r#"[{"bytes":123,"boot_id":"a"}]"#] {
+            assert!(sample_bytes(invalid).is_err(), "{invalid}");
+        }
+    }
+
+    #[test]
+    fn carveout_is_added_per_rank_and_validated() {
+        let samples = r#"[{"bytes":1000,"boot_id":"a","age_seconds":0,"carveout_bytes":2143289344},
+            {"bytes":2000,"boot_id":"b","age_seconds":1},{"bytes":3000,"boot_id":"c","age_seconds":1,"carveout_bytes":0}]"#;
+        assert_eq!(sample_parts(samples).unwrap(), vec![(1000, 2143289344), (2000, 0), (3000, 0)]);
+        assert_eq!(sample_bytes(samples).unwrap(), vec![2143290344, 2000, 3000]);
+        for invalid in [r#"[{"bytes":1,"boot_id":"a","age_seconds":0,"carveout_bytes":3}]"#,
+            r#"[{"bytes":1,"boot_id":"a","age_seconds":0,"carveout_bytes":"x"}]"#] {
             assert!(sample_bytes(invalid).is_err(), "{invalid}");
         }
     }

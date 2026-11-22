@@ -109,13 +109,14 @@ PYPROFILE
 # The one device memory policy (rust/crates/cuteafd-core/src/memory_policy.rs):
 # launch keys and the global cuteafd flags they become, in one order.
 RELEASE_MEMORY_KEYS=(GPU_MEMORY_CAP SPARK_MEMORY_CAP GPU_RESERVE SPARK_RESERVE FAMILY_RESERVE MEMORY_PADDING GRAPH_DISABLE_LOW_MEM GRAPH_NODE_PADDING
-  KV_TARGET_TOKENS KV_MIN_TOKENS KV_MAX_TOKENS)
+  KV_TARGET_TOKENS KV_MIN_TOKENS KV_MAX_TOKENS SPARK_CARVEOUT)
 release_memory_flag() {
   case "$1" in
     GPU_MEMORY_CAP) printf -- --gpu-memory-cap ;; SPARK_MEMORY_CAP) printf -- --spark-memory-cap ;;
     GPU_RESERVE) printf -- --gpu-reserve ;; SPARK_RESERVE) printf -- --spark-reserve ;;
     FAMILY_RESERVE) printf -- --family-reserve ;; MEMORY_PADDING) printf -- --memory-padding ;; GRAPH_DISABLE_LOW_MEM) printf -- --graph-disable-low-mem ;; GRAPH_NODE_PADDING) printf -- --graph-node-padding ;; KV_TARGET_TOKENS) printf -- --kv-target-tokens ;;
     KV_MIN_TOKENS) printf -- --kv-min-tokens ;; KV_MAX_TOKENS) printf -- --kv-max-tokens ;;
+    SPARK_CARVEOUT) printf -- --spark-carveout ;;
     *) return 1 ;;
   esac
 }
@@ -140,6 +141,8 @@ release_validate_memory_value() {
     GPU_RESERVE|SPARK_RESERVE|FAMILY_RESERVE|MEMORY_PADDING)
       [[ "$value" =~ ^[0-9]+([.][0-9]{1,6})?(B|MB|GB|MiB|GiB)?$ ]] ||
         release_die "$key must be a size in B, MB, GB, MiB or GiB" ;;
+    SPARK_CARVEOUT)
+      [[ "$value" == auto || "$value" == off ]] || release_die "SPARK_CARVEOUT must be auto or off" ;;
     *) release_die "unknown memory policy key: $key" ;;
   esac
 }
@@ -643,6 +646,24 @@ release_serving_docker_args() {
   for group in "${groups[@]}"; do
     [[ "$group" == "$primary_group" ]] || RELEASE_SERVING_ARGS+=(--group-add "$group")
   done
+  # spark-attic (GB10 display carveout, #2546), the project's stock interface:
+  # its socket directory and key read-only at their own paths (or the documented
+  # SPARK_ATTIC_SOCK / SPARK_ATTIC_KEY_FILE overrides), plus the socket's own
+  # group, so a non-root container connects where the operator applied the
+  # documented --socket-group step. A root-only install still mounts; the
+  # worker then refuses with one line naming that step and runs without it.
+  local attic_sock="${SPARK_ATTIC_SOCK:-/run/spark-attic/attic.sock}"
+  local attic_key="${SPARK_ATTIC_KEY_FILE:-/etc/spark-attic/key}" attic_gid
+  if [[ "${SPARK_CARVEOUT:-auto}" != off && -S "$attic_sock" && -f "$attic_key" ]]; then
+    RELEASE_SERVING_ARGS+=(--mount "type=bind,src=$(dirname "$attic_sock"),dst=$(dirname "$attic_sock"),readonly"
+      --mount "type=bind,src=$attic_key,dst=$attic_key,readonly"
+      -e "SPARK_ATTIC_SOCK=$attic_sock" -e "SPARK_ATTIC_KEY_FILE=$attic_key")
+    attic_gid="$(stat -c %g "$attic_sock" 2>/dev/null || true)"
+    if [[ "$attic_gid" =~ ^[0-9]+$ && "$attic_gid" != 0 && "$attic_gid" != "$primary_group" ]] &&
+        [[ " ${groups[*]} " != *" $attic_gid "* ]]; then
+      RELEASE_SERVING_ARGS+=(--group-add "$attic_gid")
+    fi
+  fi
 }
 
 # Shared host stores mounted into the coordinator must be ours: a missing bind
@@ -1083,7 +1104,7 @@ release_known_key() {
     MIMO_WEIGHT_POLICY|MIMO_FP8_HEAD|MIMO_FP8_O_PROJ|QWEN_FP8_DECODE|QWEN_FP8_HEAD|POOL_TOKENS|PREFIX_PARTIAL|KV_CACHE|SWA_KV_CACHE|DECODE_GRAPHS|EXPERT_INPUT|DECODE_SHARE|L2_PREFETCH|FP8_SCALES|DRAFT_CONTEXT_WINDOW|DRAFT_CONTEXT_SLOTS|DRAFT_SEQUENCES|DRAFT_KV_CACHE|SERVED_MODEL_ID|COORDINATOR_GPUS|COORDINATOR_SPLIT|INSTANCE|WIP_INSTANCE|WIP_ROOT|FP8_PREFILL|SPARK_INTAKE|CONSOLE_TEXT|THERMAL|EXPERT_BACKEND) return 0 ;;
     HOST_WAIT|IDLE_PARK_SECONDS) return 0 ;;
     GPU_GRAPH_RESERVE|GPU_GRAPH_RESERVE_EXTRA|GPU_GRAPH_RESERVE_EXTRA_CAP|SPARK_GRAPH_RESERVE|GRAPH_TRACE|GRAPH_PREWARM|GRAPH_DONOR_ALWAYS|GRAPH_DONOR_COLD_LAG) return 0 ;; # Bounded graph cache.
-    GPU_MEMORY_CAP|SPARK_MEMORY_CAP|GPU_RESERVE|SPARK_RESERVE|FAMILY_RESERVE|MEMORY_PADDING|GRAPH_DISABLE_LOW_MEM|GRAPH_NODE_PADDING|KV_TARGET_TOKENS|KV_MIN_TOKENS|KV_MAX_TOKENS) return 0 ;; # One device memory policy (docs/options.md).
+    GPU_MEMORY_CAP|SPARK_MEMORY_CAP|GPU_RESERVE|SPARK_RESERVE|FAMILY_RESERVE|MEMORY_PADDING|GRAPH_DISABLE_LOW_MEM|GRAPH_NODE_PADDING|KV_TARGET_TOKENS|KV_MIN_TOKENS|KV_MAX_TOKENS|SPARK_CARVEOUT) return 0 ;; # One device memory policy (docs/options.md).
     EXPERT_PARTIAL_BF16_MAX_ROWS|SPARK_PREFILL_REPLY_FORMAT|SPARK_DECODE_REPLY_FORMAT) return 0 ;; # Partial-reply cutoff and shared Spark reply format.
     VISION|VISION_REPLICAS|AUDIO|EMBEDDING|MEDIA_CACHE_BYTES|CHAT_TEMPLATE_FROM|TP2_ATTENTION|TP2_QUERY_PROJECTION|TP2_OUTPUT_PROJECTION|TP2_DSPARK_EXPERTS|TP2_DFLASH) return 0 ;;
     GLM5_FLASH_DRAFT_HEAD) return 0 ;;

@@ -420,6 +420,7 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
         }
     };
     census.sample("after_expert_modules_before_weights", Some(&library))?;
+    borrow_carveout();
     let loaded = {
         let _memory_scope = cuteafd_ffi::memory_ledger::scope("experts/weights");
         super::push::catch_startup("weight loading", || load_weights(&library, &catalog, &config, &mut modules,
@@ -1328,5 +1329,21 @@ mod owner_tests {
     fn the_owner_loop_parks_after_the_shared_idle_time() {
         let source = include_str!("local.rs");
         assert!(source.contains("let idle_spin = cuteafd_transport::wait_policy::wait_policy().idle_park;"));
+    }
+}
+
+/// Borrow the GB10 display carveout for this worker's routed-expert arena, fail
+/// open: every refusal logs one line and the worker loads exactly as before.
+fn borrow_carveout() {
+    if !cuteafd_ffi::attic::enabled() { return; }
+    let settings = cuteafd_ffi::attic::Settings::from_env();
+    match cuteafd_ffi::attic::borrow(&settings, u64::MAX) {
+        Ok(Some(lease)) => {
+            tracing::info!(bytes = lease.bytes(), version = %lease.version,
+                socket = %settings.socket.display(), "spark-attic: borrowed the display carveout for routed experts");
+            cuteafd_ffi::attic::install(lease);
+        }
+        Ok(None) => tracing::info!("spark-attic: nothing free to lend; running without the display carveout"),
+        Err(error) => tracing::info!(%error, "spark-attic: running without the display carveout"),
     }
 }

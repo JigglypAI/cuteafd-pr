@@ -131,6 +131,13 @@ pub(crate) struct Allocation<'a> {
     arena_registration: Option<cuteafd_ffi::memory_ledger::fault::ArenaRegistration>,
 }
 
+/// The process's borrowed carveout, for the first Spark routed-expert arena
+/// large enough to hold it. Only expert weights live there (#2546).
+fn carveout_lease(tag: super::Tag, bytes: usize) -> Option<cuteafd_ffi::attic::Lease> {
+    if tag.kind != super::MemoryKind::Experts || !tag.owner.starts_with("experts/spark-") { return None; }
+    cuteafd_ffi::attic::take_for(bytes as u64)
+}
+
 pub(crate) struct WeightArenaBacking<'b> {
     pub id: &'b str,
     pub buffer: CuteafdDeviceBuffer,
@@ -166,9 +173,36 @@ impl<'a> Allocation<'a> {
 
     #[track_caller]
     pub(super) fn weight_arena(device: Device<'a>, bytes: usize, id: &str, tag: super::Tag) -> Result<Self> {
-        let mut allocation = Self::new(device, bytes, tag)?;
+        let mut allocation = Self::expert_backing(device, bytes, id, tag)?;
         allocation.weight_id = Some((id.into(), tag.kind));
         Ok(allocation)
+    }
+
+    /// One physical backing: a Spark routed-expert arena takes the process's
+    /// borrowed display carveout first (`[carveout | tail]`, fail-open);
+    /// everything else is an ordinary device allocation.
+    #[track_caller]
+    pub(super) fn expert_backing(device: Device<'a>, bytes: usize, id: &str, tag: super::Tag) -> Result<Self> {
+        Ok(match carveout_lease(tag, bytes) {
+            // One range, carveout first: the arena's layout and views are unchanged.
+            Some(lease) => {
+                let _site = cuteafd_ffi::memory_ledger::allocation_site(std::panic::Location::caller());
+                match device.run(|| device.library.alloc_carveout_device_buffer(bytes, &lease, tag)) {
+                    Ok((buffer, tail)) => {
+                        tracing::info!(arena = id, carveout_bytes = lease.bytes(), tail_bytes = tail,
+                            attic_version = %lease.version, "expert weight arena backed by the GB10 display carveout");
+                        cuteafd_ffi::attic::retain(lease);
+                        Self { device, buffer, backing: None, weight_id: None, arena_registration: None }
+                    }
+                    Err(error) => {
+                        tracing::warn!(arena = id, %error, "spark-attic: mapping the display carveout failed; running without it");
+                        cuteafd_ffi::attic::release(lease);
+                        Self::new(device, bytes, tag)?
+                    }
+                }
+            }
+            None => Self::new(device, bytes, tag)?,
+        })
     }
 
     pub(super) fn register_weight_arena(&mut self, registration: cuteafd_ffi::memory_ledger::fault::ArenaRegistration) {

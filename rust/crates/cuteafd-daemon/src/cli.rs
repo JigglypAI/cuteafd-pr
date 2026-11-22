@@ -87,7 +87,15 @@ pub(crate) struct MemoryArgs {
     /// Cap pool growth after the layout is fixed (default: all remaining memory).
     #[arg(long, global = true)]
     pub(crate) kv_max_tokens: Option<u64>,
+    /// Spark routed-expert weights in the GB10 display carveout lent by a
+    /// validated spark-attic atticd (`SPARK_CARVEOUT`, default auto: used where
+    /// present, fail-open); `off` never connects and plans without it.
+    #[arg(long, global = true, value_enum)]
+    pub(crate) spark_carveout: Option<SparkCarveout>,
 }
+
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SparkCarveout { Auto, Off }
 
 impl MemoryArgs {
     /// The family argv wins key by key over the outer `serve`/`golden` argv.
@@ -103,6 +111,7 @@ impl MemoryArgs {
             kv_target_tokens: self.kv_target_tokens.or(outer.kv_target_tokens),
             kv_min_tokens: self.kv_min_tokens.or(outer.kv_min_tokens),
             kv_max_tokens: self.kv_max_tokens.or(outer.kv_max_tokens),
+            spark_carveout: self.spark_carveout.or(outer.spark_carveout),
         }
     }
 
