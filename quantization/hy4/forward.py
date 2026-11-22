@@ -7,9 +7,20 @@ import torch
 import torch.nn.functional as F
 
 from hy4_flash import forward as flash
-from hy4_flash.forward import AttentionFirst, AttentionTap, Layer, native_projection, reference
+from hy4_flash.forward import AttentionFirst, AttentionTap, reference
 
 DRAFT_BLOCK_SIZE = 7
+
+
+def native_projection(name, inputs, weight):
+    return F.linear(inputs, weight)
+
+
+class Layer(flash.Layer):
+    def project(self, name, inputs, project):
+        if project is flash.native_projection:
+            project = native_projection
+        return super().project(name, inputs, project)
 
 
 class Config(reference.Config):
@@ -50,6 +61,10 @@ class Reader(flash.Reader):
         self.document = json.loads((self.snapshot / "config.json").read_bytes())
         self.config = Config.parse(self.document)
 
+    def load_draft_layer(self, index):
+        layer = super().load_draft_layer(index)
+        return Layer(layer.index, layer.prefix, layer.weights)
+
     def load_layer(self, index):
         prefix = f"model.layers.{index}."
         weights = {}
@@ -81,7 +96,7 @@ class Model(flash.Model):
         return super().initial(tokens, embedding).to(torch.bfloat16)
 
     def attention_start(self, state, tokens, layer):
-        hidden, post = reference.hyper(state.float(), layer.weights, "hc_attn_layer", self.config)
+        hidden, post = reference.hyper(state.float(), layer.weights, "hc_attn_layer", self.config, F.linear)
         return state, post, reference.norm(hidden, layer.weights["input_layernorm.weight"], self.config.rms_norm_eps)
 
     def index_selection(self, inputs, q_resid, layer, positions):
@@ -144,11 +159,19 @@ class Model(flash.Model):
 
     def mlp_start(self, residual, attention_post, output, layer):
         state = self.apply_residual(residual, attention_post, output)
-        hidden, post = reference.hyper(state.float(), layer.weights, "hc_mlp_layer", self.config)
+        hidden, post = reference.hyper(state.float(), layer.weights, "hc_mlp_layer", self.config, F.linear)
         return state, post, reference.norm(hidden, layer.weights["post_attention_layernorm.weight"], self.config.rms_norm_eps)
 
+    def routing_scores(self, inputs, layer):
+        return reference.routing_scores(inputs, layer.weights, self.config, F.linear)
+
     def moe_route(self, inputs, layer, project=native_projection):
-        return inputs, *reference.routing(inputs, layer.weights, self.config)
+        return inputs, *reference.native_routes(*self.routing_scores(inputs, layer), self.config)
+
+    def expert(self, index, latent, layer, project=native_projection):
+        if project is flash.native_projection:
+            project = native_projection
+        return super().expert(index, latent, layer, project)
 
     def mlp_finish(self, state, post, inputs, layer, routed=None, project=native_projection):
         sparse = self.config.mlp_layer_types[layer.index] == "sparse"
@@ -158,11 +181,19 @@ class Model(flash.Model):
         return self.apply_residual(state, post, output if routed is None else routed + output)
 
     def head_features(self, states, weights=None):
-        return super().head_features(states.float(), weights)
+        if weights is None:
+            weights = {n: self.reader.load(n) for n in reference.OUTER_NAMES[1:5]}
+        return reference.head_features(states.float(), weights, self.config, F.linear)
+
+    def head(self, features, project=native_projection, weight=None):
+        if project is flash.native_projection:
+            project = native_projection
+        return super().head(features, project, weight)
 
 
 
 class Drafter(flash.Drafter):
+    linear = staticmethod(F.linear)
     block_size = DRAFT_BLOCK_SIZE
     target_layers = staticmethod(draft_targets)
 
