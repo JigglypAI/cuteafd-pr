@@ -805,7 +805,7 @@ if [[ -n "${CUTEAFD_RELEASE_DEV_IMAGE:-}" ]]; then
     --source "$repo_root" --manifest "$release_dev_reuse_manifest"
 else
   COORDINATOR_DOCKER_DEV="$(python3 "$repo_root/scripts/build/select-dev-image.py" select \
-    --source "$repo_root" --arch amd64 --local-tag "$COORDINATOR_DOCKER_DEV" \
+    --source "$repo_root" --arch amd64 \
     --engine-commit "$engine_commit" --mode "$release_dev_image_source" \
     --output "$release_dev_reuse_manifest")"
 fi
@@ -1058,7 +1058,7 @@ python3 scripts/build/verify-sparkinfer-source.py \
   --lock third_party/sparkinfer.lock.json \
   --require-no-python-cache
 python3 scripts/build/select-dev-image.py select \
-  --source "$remote_dir" --arch arm64 --local-tag "$dev_image" \
+  --source "$remote_dir" --arch arm64 \
   --engine-commit "$engine_commit" --mode "${19:-registry}" --output "$dev_manifest"
 else
 dev_image="$(python3 scripts/build/select-dev-image.py image --manifest "$dev_manifest")"
