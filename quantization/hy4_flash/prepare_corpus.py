@@ -28,14 +28,14 @@ CONTRACT = dict(renderer="native-chat-template",
                 batch_size=1, packing=False, order="dataset", **CHAT)
 
 
-def long_witness(tokenizer):
+def long_witness(tokenizer, chat=CHAT):
     for length in (48, 72, 96, 128):
         prompt = "\n".join(
             f"Observation {i}: The airship records the position and colour of every star. "
             "The archivist compares the last recorded coordinate with the first."
             for i in range(length)
         )
-        ids = tokenizer.apply_chat_template([dict(role="user", content=prompt)], **CHAT)
+        ids = tokenizer.apply_chat_template([dict(role="user", content=prompt)], **chat)
         if len(ids) > 2048:
             return dict(input_ids=ids, tokens=len(ids), hessian_eligible=False,
                         input_ids_sha256=panel.ids_sha256(ids))
@@ -97,12 +97,13 @@ def append_standard(root, source, stage, ids, offsets, report, tokenizer_sha256)
                 input_ids_sha256=digest, receipt="exl3_standard.json")
 
 
-def prepare(source, corpus, output):
+def prepare(source, corpus, output, *, source_repo="tencent/Hy4-flash",
+            source_revision=SOURCE_REVISION, schema=SCHEMA, contract=CONTRACT, chat=CHAT):
     import torch
     from transformers import PreTrainedTokenizerFast
 
     source, output = Path(source).absolute(), Path(output).absolute()
-    if source.name != SOURCE_REVISION or output.exists():
+    if source.name != source_revision or output.exists():
         raise ValueError("require the pinned source and a fresh corpus directory")
     identity = {name: panel.sha256_file(source / name) for name in ASSETS}
     tokenizer = PreTrainedTokenizerFast.from_pretrained(source, local_files_only=True)
@@ -111,16 +112,16 @@ def prepare(source, corpus, output):
         raise ValueError("native tokenizer did not load the pinned chat template")
     corpus = Path(corpus)
     rows, provenance = read_v2(corpus)
-    manifest = dict(schema=SCHEMA, status="passed", contract=CONTRACT,
+    manifest = dict(schema=schema, status="passed", contract=contract,
         dataset=DATASET, components={},
         historical_selection=provenance["selection"],
-        source=dict(repo_id="tencent/Hy4-flash", revision=SOURCE_REVISION, files=identity),
+        source=dict(repo_id=source_repo, revision=source_revision, files=identity),
         software=panel.software_identity(), tokenizer=dict(vocab_size=len(tokenizer)), splits={})
     output.parent.mkdir(parents=True, exist_ok=True)
     stage = Path(tempfile.mkdtemp(prefix=output.name + ".partial-", dir=output.parent))
     try:
         for split in panel.SPLITS:
-            ids, offsets, report = panel.tokenize_rows(rows[split], tokenizer, chat_kwargs=CHAT)
+            ids, offsets, report = panel.tokenize_rows(rows[split], tokenizer, chat_kwargs=chat)
             if split == "calibration":
                 manifest["components"]["agentic"] = dict(count=report["count"], tokens=report["tokens"],
                     token_stream_sha256=report["token_stream_sha256"])
@@ -130,9 +131,9 @@ def prepare(source, corpus, output):
             receipt = checkpoint_io().write_safetensors(path,
                 dict(input_ids=torch.frombuffer(ids, dtype=torch.int64).clone(),
                      offsets=torch.tensor(offsets, dtype=torch.int64)),
-                metadata=dict(schema=SCHEMA, split=split), hash_algorithm="sha256")
+                metadata=dict(schema=schema, split=split), hash_algorithm="sha256")
             manifest["splits"][split] = dict(report, file=path.name, sha256=receipt["sha256"])
-        witness = long_witness(tokenizer)
+        witness = long_witness(tokenizer, chat)
         atomic_json(stage / "long-context-smoke.json", witness)
         manifest["long_context_smoke"] = dict(file="long-context-smoke.json", tokens=witness["tokens"],
             sha256=panel.sha256_file(stage / "long-context-smoke.json"), hessian_eligible=False)
@@ -140,7 +141,7 @@ def prepare(source, corpus, output):
             raise ValueError("source tokenizer changed during preparation")
         atomic_json(stage / "manifest.json", manifest)
         for split in panel.SPLITS:
-            panel.load_token_records(stage, split, schema=SCHEMA, contract=CONTRACT, dataset=DATASET)
+            panel.load_token_records(stage, split, schema=schema, contract=contract, dataset=DATASET)
         stage.rename(output)
         fsync_directory(output.parent)
     finally:
@@ -149,15 +150,19 @@ def prepare(source, corpus, output):
     return manifest
 
 
-def main():
+def run_cli(prepare_fn):
     parser = argparse.ArgumentParser(description=__doc__)
     for key in ("source", "corpus", "output"):
         parser.add_argument("--" + key, type=Path, required=True)
     args = parser.parse_args()
-    manifest = prepare(args.source, args.corpus, args.output)
+    manifest = prepare_fn(args.source, args.corpus, args.output)
     print(json.dumps({"splits": {name: {key: value[key] for key in ("count", "tokens", "longest")}
                                 for name, value in manifest["splits"].items()},
                       "long_context_smoke": manifest["long_context_smoke"]}), flush=True)
+
+
+def main():
+    run_cli(prepare)
 
 
 if __name__ == "__main__":
