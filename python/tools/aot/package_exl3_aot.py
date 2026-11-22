@@ -86,6 +86,8 @@ def verify(package: Path, revision: str | None = None, runtime: Path | None = No
             raise ValueError(f'EXL3 variant target differs from package target: {directory}')
         if manifest.get('geometry') not in GEOMETRIES:
             raise ValueError('unsupported EXL3 package geometry')
+        if manifest['geometry'] in MUL1_ONLY_GEOMETRIES and package_codebook != 'mul1':
+            raise ValueError(f"EXL3 geometry {manifest['geometry']} requires codebook 'mul1'")
         if meta.get('hidden') != GEOMETRIES[manifest['geometry']][0]:
             raise ValueError(f'EXL3 variant hidden size does not match the package geometry: {directory}')
         for key in ('capacity', 'intermediate', 'experts', 'top_k', 'output_dtype', 'bits'):
@@ -300,7 +302,11 @@ GEOMETRIES = {
     # Step-5: 352 experts, top-8, post-SiLU clamp at 7 (K4 experts, K6 tails 88-90).
     'step5': (4096, 1536, 352, 8),
     'inkling2': (4608, 2304, 384, 8),
+    # Hy4-flash LatentMoE: 512 experts, top-16 on the 1536 latent, SwiGLU clamped at 10, K4 MUL1 only.
+    'hy4f': (1536, 1536, 512, 16),
 }
+# Geometries whose published checkpoints ship MUL1 routed experts only (no MCG).
+MUL1_ONLY_GEOMETRIES = frozenset({'hy4f'})
 # SwiGLU clamp per geometry; None is the unclamped SwiGLU (b12x const-expr
 # elides the clamp). DeepSeek clamps at 10.
 SWIGLU_LIMITS = {'glm': None, 'qwen4': None, 'kimik3': None, 'step5': 7.0, 'muse': None, 'ml4': None, 'inkling2': None}
@@ -1158,6 +1164,8 @@ def build(args: argparse.Namespace) -> None:
         raise ValueError(f'unsupported EXL3 codebook: {codebook}')
     validate_destination(args.output)
     geometry = getattr(args, 'geometry', 'dsv4p')
+    if geometry in MUL1_ONLY_GEOMETRIES and codebook != 'mul1':
+        raise ValueError(f"EXL3 geometry {geometry} requires --codebook mul1 (checkpoint ships no MCG)")
     hidden = GEOMETRIES[geometry][0]
     capacities = package_capacities(geometry, args.capacities)
     all_counts = getattr(args, 'all_spark_counts', False)

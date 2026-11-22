@@ -2114,7 +2114,7 @@ def test_opt_in_exl3_mul1_groups_stay_out_of_default_jobs_and_cover_all_geometri
                for _, exporter, args in opt_in)
 
     geometries = {args[args.index("--geometry") + 1] for _, _, args in opt_in}
-    assert geometries == {"dsv4p", "glm", "glmf", "qwen4", "kimik3", "step5", "muse", "ml4", "inkling2"}
+    assert geometries == {"dsv4p", "glm", "glmf", "qwen4", "kimik3", "step5", "muse", "ml4", "inkling2", "hy4f"}
     assert {"exl3-compact-glmf-k34-mul1", "exl3-glmf-spark-mul1", "exl3-glm-k45-spark-mul1",
             "exl3-inkling2-k45-mul1", "exl3-step5-k46-mul1", "exl3-muse-k45-mul1"} <= set(opt_in_names)
 
@@ -2128,6 +2128,10 @@ def test_opt_in_exl3_mul1_groups_stay_out_of_default_jobs_and_cover_all_geometri
     assert listed.count("exl3-glmf-mul1") == 1
     assert listed.count("exl3-glmf-spark-mul1") == 1
     assert listed.count("exl3-inkling2-k45-mul1") == 1
+    assert listed.count("exl3-hy4f-k45-mul1") == 1
+    assert listed.count("exl3-compact-hy4f-k45-mul1") == 1
+    assert not any(name.startswith("exl3-hy4f") and not name.endswith("-mul1") for name, *_ in compare_sm.jobs("all"))
+    assert not any(name.startswith("exl3-compact-hy4f") for name, *_ in compare_sm.jobs("all"))
 
     # Un-grouped runs keep the default MCG inventory only; --groups opts into MUL1.
     real_load = compare_sm.load_file

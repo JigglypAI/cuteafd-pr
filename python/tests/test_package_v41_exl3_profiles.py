@@ -1158,7 +1158,8 @@ class PackageProfileTests(unittest.TestCase):
                 with self.subTest(geometry=geometry, bits=bits), tempfile.TemporaryDirectory() as temporary:
                     _, _, calls, _ = self.build_fixture(
                         Path(temporary), 'coordinator', bits, geometry=geometry,
-                        capacities=(80, 256, 2752))
+                        capacities=(80, 256, 2752),
+                        codebook='mul1' if geometry in package.MUL1_ONLY_GEOMETRIES else 'mcg')
                     for call in calls:
                         ws = call.args[3] > 80 and (geometry, call.args[1], call.args[3]) not in package.COOPERATIVE_PREFILL_CELLS
                         self.assertEqual(call.kwargs.get('warp_specialized', False), ws)
@@ -1594,6 +1595,26 @@ class PackageProfileTests(unittest.TestCase):
             (mul1_out / 'manifest.json').write_text(json.dumps(mul1_manifest))
             with self.assertRaisesRegex(ValueError, 'variant codebook mismatch'):
                 package.verify(mul1_out)
+
+    def test_hy4f_geometry_profiles_and_mul1_only_contract(self):
+        self.assertEqual(package.GEOMETRIES['hy4f'], (1536, 1536, 512, 16))
+        self.assertEqual(package.activation('hy4f'), 'silu')
+        self.assertEqual(package.swiglu_limit('hy4f'), 10.0)
+        coord = [(p, w) for p, w, *_ in package.profiles_for_role('coordinator', 'hy4f')]
+        self.assertEqual(coord, [('rtx-tp1', 1536), ('rtx-tp2', 768)])
+        with tempfile.TemporaryDirectory() as mcg_dir, tempfile.TemporaryDirectory() as mul1_dir:
+            with self.assertRaisesRegex(ValueError, 'requires --codebook mul1'):
+                self.build_fixture(
+                    Path(mcg_dir), 'coordinator', (4, 5), geometry='hy4f',
+                    capacities=(1, 80), profiles=('rtx-tp1',), codebook='mcg')
+            _, manifest, calls, _ = self.build_fixture(
+                Path(mul1_dir), 'coordinator', (4, 5), geometry='hy4f',
+                capacities=(1, 80, 1024), profiles=('rtx-tp1', 'rtx-tp2'), codebook='mul1')
+            self.assertEqual(manifest['geometry'], 'hy4f')
+            self.assertEqual(manifest['codebook'], 'mul1')
+            self.assertTrue(all(c.kwargs.get('codebook') == 'mul1' for c in calls))
+            self.assertTrue(all(c.kwargs.get('hidden') == 1536 for c in calls))
+            self.assertTrue(all('swiglu_limit' not in c.kwargs for c in calls))
 
 
 if __name__ == '__main__':

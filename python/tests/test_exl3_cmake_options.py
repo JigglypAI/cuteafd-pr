@@ -292,11 +292,29 @@ class Exl3CmakeOptionsTests(unittest.TestCase):
             self.assertIn('--codebook mul1', mul1_cmd)
             self.assertTrue((build / 'exl3_glmf_k34_config.stamp').read_text().endswith('tiles=\n'))
             self.assertTrue((build / 'exl3_glmf_k34_mul1_config.stamp').read_text().endswith('|codebook=mul1\n'))
-        for invalid in ('glmf:exl3-k34-mcg', 'glmf:exl3-k34-3inst', 'glmf:exl3-k34-mul2'):
+        for invalid in ('glmf:exl3-k34-mcg', 'glmf:exl3-k34-3inst', 'glmf:exl3-k34-mul2', 'hy4f:exl3-k45'):
             with self.subTest(invalid=invalid):
                 result, _ = self.configure(f'-DCUTEAFD_EXPERT_FAMILIES={invalid}')
                 self.assertNotEqual(result.returncode, 0, invalid)
                 self.assertIn('EXL3 expert family', result.stderr)
+
+    def test_hy4f_exl3_configures_mul1_only_on_sm120_and_sm121(self):
+        for architecture, layouts in (
+            ('120', ['rtx-tp1', 'rtx-tp2']),
+            ('121', [f'tp{world}-rank{rank}' for world in range(1, 7) for rank in range(world)]),
+        ):
+            with self.subTest(architecture=architecture), tempfile.TemporaryDirectory() as temporary:
+                root, build = Path(temporary), Path(temporary) / 'build'
+                (root / 'CMakeLists.txt').write_text(harness(architecture))
+                result = self.cmake(root, build, ['-DCUTEAFD_EXPERT_FAMILIES=hy4f:exl3-k45-mul1'])
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                rules = (build / 'build.ninja').read_text()
+                self.assertIn('--geometry hy4f', rules)
+                self.assertIn('--codebook mul1', rules)
+                self.assertIn('--require-layout ' + ','.join(layouts), rules)
+                self.assertIn('exl3-hy4f-k45-mul1/manifest.json', rules)
+                stamp = (build / 'exl3_hy4f_k45_mul1_config.stamp').read_text()
+                self.assertTrue(stamp.endswith('|codebook=mul1\n'))
 
 if __name__ == '__main__':
     unittest.main()
