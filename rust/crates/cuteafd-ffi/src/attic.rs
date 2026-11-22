@@ -380,7 +380,9 @@ mod tests {
         assert!(matches!(client.alloc(2 << 20), Err(AtticError::Protocol(_))));
         assert!(matches!(client.alloc(2 << 20), Err(AtticError::Protocol(_))));
         worker.join().unwrap();
-        assert_eq!(open_fds(), before);
+        // Only the peer's own socket (dropped with its thread) is gone: every
+        // descriptor the four replies carried was closed, none leaked.
+        assert_eq!(open_fds(), before - 1);
         assert!(client.alloc(3).is_err());
     }
 
@@ -391,7 +393,7 @@ mod tests {
         let worker = std::thread::spawn(move || {
             request(&server);
             reply(&server, &serde_json::json!({"ok": true, "size": 10u64, "free": 8u64, "largest": 6u64}), &[]);
-            request(&server);
+            drop(server); // the daemon goes away: the next request must fail, not hang
         });
         assert_eq!(client.info().unwrap(), Info { size: 10, free: 8, largest: 6 });
         worker.join().unwrap();
