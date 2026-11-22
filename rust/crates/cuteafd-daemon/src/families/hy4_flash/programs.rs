@@ -109,17 +109,17 @@ impl<'a> Hy4Programs<'a> {
         Ok(Self {
             tp,
             kv_format,
-            ihc_pre: load("ihc_pre", &["r", "hc_fn", "hc_scale", "hc_base", "norm", "post_out", "y_out"])?,
-            ihc_post: load("ihc_post", &["delta", "r_in", "post", "r_out"])?,
+            ihc_pre: load("ihc_pre", &["residual", "fn", "scale", "base", "norm", "post_out", "y_out"])?,
+            ihc_post: load("ihc_post", &["delta", "residual", "prev_post", "out"])?,
             ihc_post_pre: load(
                 "ihc_post_pre",
-                &["delta", "r_in", "post_in", "hc_fn", "hc_scale", "hc_base", "norm", "r_out", "post_out", "y_out"],
+                &["delta", "residual", "prev_post", "fn", "scale", "base", "norm", "residual_out", "post_out", "y_out"],
             )?,
-            hc_head: load("hc_head", &["r", "hc_fn", "hc_scale", "hc_base", "norm", "out"])?,
+            hc_head: load("hc_head", &["residual", "fn", "scale", "base", "norm", "collapsed", "out"])?,
             engram_head_norm: load("engram_head_norm", &["raw", "weights", "out"])?,
             engram_gate_add: load(
                 "engram_gate_add",
-                &["res", "keys", "val", "norm_k", "norm_q", "post_gate", "hyper_scales", "masked"],
+                &["residual", "keys", "value", "norm_key", "norm_query", "pre_gamma", "hc_scales", "masked"],
             )?,
             mla_rank_norm_pack: load(
                 &format!("mla_rank_norm_pack_{kv}"),

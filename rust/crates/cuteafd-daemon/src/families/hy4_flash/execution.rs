@@ -1008,6 +1008,7 @@ impl<'a> Hy4Engine<'a> {
                         r.weights.buf("model.hc_head.hc_head_scale")?.ptr,
                         r.weights.buf("model.hc_head.hc_head_base")?.ptr,
                         r.weights.buf("model.norm.weight")?.ptr,
+                        r.scratch.delta_norm.buffer.ptr,
                         r.scratch.y.buffer.ptr,
                     ],
                     &[Scalar::I32(rows as i32)],
