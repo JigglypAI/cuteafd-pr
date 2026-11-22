@@ -76,7 +76,7 @@ fn code_first_reference(fade: bool) -> [Tally; 2] {
         let prior = if fade { 8. * (3usize.saturating_sub(*n) as f64 / 3.) } else { 8. };
         *n += 1;
         let request = requests.entry(round.id).or_default();
-        let mut length = 0;
+        let (mut length, mut survival) = (0, 1.);
         for position in 0..BLOCK {
             let reached = request.iter().filter(|(reached, _)| position < *reached).count();
             let accepted = request.iter().filter(|(reached, accepted)| position < *reached && position < *accepted).count();
@@ -84,7 +84,12 @@ fn code_first_reference(fade: bool) -> [Tally; 2] {
                 server[position].iter().filter(|&&hit| hit).count() as f64 / server[position].len() as f64 };
             length += 1;
             let denominator = reached as f64 + prior;
-            if denominator == 0. || (accepted as f64 + prior * global) / denominator <= if fade { 0.3 } else { 0.5 } { break; }
+            if denominator == 0. { break; }
+            let p = (accepted as f64 + prior * global) / denominator;
+            // Production keeps while the product of estimates stays above 0.3; the
+            // constant-eight counterfactual keeps its old per-position 0.5 rule.
+            survival = if fade { survival * p } else { p };
+            if survival <= if fade { 0.3 } else { 0.5 } { break; }
         }
         let accepted = round.accepted.min(length);
         let reached = length.min(accepted + 1);
@@ -127,11 +132,12 @@ fn code_first_requests_adapt_with_fewer_rows_without_losing_prose_tokens() {
     let old = code_first_reference(false);
     let rows = |tally: Tally| (tally.drafts + tally.rounds) as f64 / tally.rounds as f64;
     let tokens = |tally: Tally| tally.tokens as f64 / tally.rounds as f64;
-    // Stable unchanged sample: fade3/stop.3 prose rows4.0935 vs constant8 5.1124
-    // (0.801x), code tokens3108/3138 (0.990x), prose2087/2030 (1.028x).
-    eprintln!("code-first fade3-stop03 {tallies:?}; constant8 {old:?}");
-    assert!(rows(tallies[0]) <= 0.90 * rows(old[0]), "prose rows must fall by at least ten percent");
-    assert!(tokens(tallies[1]) >= 0.95 * tokens(old[1]), "code tokens must retain ninety-five percent");
+    // Product > .3 (#2460): prose rows 3.37 vs constant8 5.11 (0.66x; per-token
+    // stop.3 was 4.09, 0.80x), code tokens 2959/3138 (0.943x; was 0.990x), prose
+    // 2041/2030 (1.005x; was 1.028x). The product gives up the unlikely tail.
+    eprintln!("code-first fade3-product03 {tallies:?}; constant8 {old:?}");
+    assert!(rows(tallies[0]) <= 0.75 * rows(old[0]), "prose rows must fall by at least a quarter");
+    assert!(tokens(tallies[1]) >= 0.93 * tokens(old[1]), "code tokens must retain ninety-three percent");
     assert!(tokens(tallies[0]) >= 0.95 * tokens(old[0]), "prose tokens must retain ninety-five percent");
 }
 
@@ -141,22 +147,23 @@ fn history_drafts_long_on_code_and_short_on_prose() {
     assert_eq!(fixed_prose, Tally { rounds: 1112, tokens: 2219, drafts: 7784, short: 0 });
     assert_eq!(fixed_code, Tally { rounds: 646, tokens: 3154, drafts: 4522, short: 0 });
     let [prose, code] = replay(HeadScore::None, DraftControl::History);
-    // Fade3/stop.3: code keeps 98.4% of fixed tokens at 6.51 drafts, never stuck short,
-    // although it starts from a server window that 1,112 prose rounds taught.
-    assert_eq!(code, Tally { rounds: 646, tokens: 3104, drafts: 4207, short: 0 });
-    // Prose: 94.1% of fixed tokens for 43.6% of its verified drafts.
-    assert_eq!(prose, Tally { rounds: 1112, tokens: 2087, drafts: 3395, short: 126 });
-    // Measured prose token retention .941 with .436 of fixed drafted rows;
-    // code retention .984. KEEP_CUT=.3 deliberately retains more useful prose.
+    // Product > .3: code keeps 93.3% of fixed tokens at 5.44 drafts (per-token stop.3:
+    // 98.4% at 6.51), never stuck short, although it starts from a prose-taught window.
+    assert_eq!(code, Tally { rounds: 646, tokens: 2944, drafts: 3516, short: 0 });
+    // Prose: 92.0% of fixed tokens for 33.5% of its verified drafts (per-token stop.3:
+    // 94.1% for 43.6%).
+    assert_eq!(prose, Tally { rounds: 1112, tokens: 2041, drafts: 2609, short: 126 });
     assert!(prose.tokens * 100 >= fixed_prose.tokens * 90);
     assert!(prose.drafts * 2 <= fixed_prose.drafts);
-    assert!(code.tokens * 100 >= fixed_code.tokens * 97);
+    assert!(code.tokens * 100 >= fixed_code.tokens * 92);
     assert!(code.drafts * prose.rounds > prose.drafts * code.rounds);
 }
 
 #[test]
 fn calibrated_confidence_replays_prose_and_code() {
     let [prose, code] = replay(HeadScore::Probability, DraftControl::History);
-    assert_eq!(prose, Tally { rounds: 1112, tokens: 2158, drafts: 3142, short: 287 });
-    assert_eq!(code, Tally { rounds: 646, tokens: 3144, drafts: 4291, short: 3 });
+    // Product of calibrated heads > .3 (per-token .3 was 2158 tokens / 3142 drafts
+    // prose and 3144 / 4291 code).
+    assert_eq!(prose, Tally { rounds: 1112, tokens: 2119, drafts: 2449, short: 287 });
+    assert_eq!(code, Tally { rounds: 646, tokens: 3064, drafts: 3442, short: 3 });
 }

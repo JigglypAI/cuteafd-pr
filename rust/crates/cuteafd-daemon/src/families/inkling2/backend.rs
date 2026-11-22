@@ -341,16 +341,14 @@ impl<'a> Backend<'a> for InklingBackend<'a> {
         crate::shared::speculation_trace::Deferred::new(move || serde_json::json!({"kind":"inkling2", "rows":rows, "attention":"eager"}))
     }
     // The recurrent block dSpark has no trained confidence head (the checkpoint
-    // ships none). Its per-token score is the target-head argmax probability,
-    // recorded and calibrated for the trace only: `history` keeps Inkling's
-    // position-history rule.
+    // ships none); its per-token score is the target-head argmax probability,
+    // calibrated online like every other score.
     fn draft_head_kind(&self) -> cuteafd_core::HeadScore {
-        if self.execution.borrow().draft.is_some() { cuteafd_core::HeadScore::RecordedProbability }
+        if self.execution.borrow().draft.is_some() { cuteafd_core::HeadScore::CandidateProbability }
         else { cuteafd_core::HeadScore::None }
     }
-    fn configure_draft_scores(&self, traced: bool, _scored: bool) {
-        // The policy never keys on Inkling's candidate probability: read it only for a trace.
-        if let Some(draft) = &self.execution.borrow().draft { draft.drafter.set_score_readback(traced); }
+    fn configure_draft_scores(&self, _traced: bool, scored: bool) {
+        if let Some(draft) = &self.execution.borrow().draft { draft.drafter.set_score_readback(scored); }
     }
     fn draft_head<'d>(&self, draft: &'d Draft) -> Option<&'d [f32]> {
         (!draft.confidence.is_empty()).then_some(draft.confidence.as_slice())
