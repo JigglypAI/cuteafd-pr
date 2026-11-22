@@ -376,7 +376,7 @@ mod tests {
         }
         // Each request's next context is its committed length plus what it accepted.
         assert_eq!(policy.contexts[&0], 40_000 + 63 + 1);
-        // N = 10 ms, e = 2 ms/row: at C8 x = 0.625, 3.8 / 2.625 clamps to HI.
+        // N = 10 ms, e = 2 ms/row: at C8 x = 0.625, 3.4 / 1.625 clamps to HI.
         policy.plan(&(0..8).map(|id| (id, 4)).collect::<Vec<_>>(), 64);
         assert_eq!(policy.history.round_cut(), cuteafd_core::clamped::HI);
         // A short-context round is in another, still-cold band: the history cut.

@@ -35,14 +35,19 @@ pub const KEEP_CUT: f64 = 0.3;
 /// calibrated product keep as `history`, but each round's cut is
 /// `clamp(K / (x + M), LO, HI)`, where `x` is the round's non-row time per
 /// request over its per-row time, learned online per context band from the
-/// engine's own round times (see [`RoundCost`]). Fitted on the #2460 fixed-7
-/// replay of 2026-11-22 (`~/.cache/cuteafd/speculation-dataset/2026-11-22`,
-/// two-term pricing, 25/25/30/20 context mix); a refit changes these four.
+/// engine's own round times (see [`RoundCost`]). Refit approved by TJ on
+/// 2026-11-23 over the #2460 fixed-7 replay of 2026-11-22
+/// (`~/.cache/cuteafd/speculation-dataset/2026-11-22/analysis4/refit.txt`,
+/// `refit_clamped.py`): full product sweep 0.1..0.9, measured-table pricing,
+/// 25/25/30/20 context mix, six scored families; score 0.9911 of the per-cell
+/// best cut, held-out (fit 4 families, score 2, 15 rotations) mean 0.9898.
+/// Replaces the first fit K = 3.8, M = 2, LO = 0.3, HI = 0.6 (sweep edge at
+/// 0.6). A refit changes these four.
 pub mod clamped {
-    pub const K: f64 = 3.8;
-    pub const M: f64 = 2.;
+    pub const K: f64 = 3.4;
+    pub const M: f64 = 1.;
     pub const LO: f64 = 0.3;
-    pub const HI: f64 = 0.6;
+    pub const HI: f64 = 0.7;
     /// Rounds a context band needs before its line sets the cut (before that: [`super::KEEP_CUT`]).
     pub const WARM_ROUNDS: u32 = 32;
     // The fit's x: (N / requests) / e, with (N, e) the OLS line of round time
@@ -1067,7 +1072,7 @@ mod tests {
         feed(&mut cost, 40_000, 0.040, 0.002, &[8, 32, 64], 20);
         let expect = |n: usize| (clamped::K / ((0.040 / n as f64) / 0.002 + clamped::M)).clamp(clamped::LO, clamped::HI);
         for n in [1, 2, 4, 8, 16] { assert!((cost.cut(40_000, n) - expect(n)).abs() < 1e-9, "C{n}"); }
-        // C1: x = 20, 3.8 / 22 < LO, so the cut is LO. C16: x = 1.25, 3.8 / 3.25 > HI, so HI.
+        // C1: x = 20, 3.4 / 21 < LO, so the cut is LO. C16: x = 1.25, 3.4 / 2.25 > HI, so HI.
         assert_eq!((cost.cut(40_000, 1), cost.cut(40_000, 16)), (clamped::LO, clamped::HI));
         assert!(cost.cut(40_000, 4) > clamped::LO && cost.cut(40_000, 4) < clamped::HI);
     }
@@ -1094,7 +1099,7 @@ mod tests {
             assert_eq!(policy.refine(1, 4, Some(&scores)), 4);
             policy.observe(&[outcome(1, 4, 4)], false);
         }
-        // Warm the cost so C8 lands on HI = 0.6: 0.9*0.8 = 0.72 > 0.6, *0.7 = 0.504 < 0.6.
+        // Warm the cost so C8 lands on HI = 0.7: 0.9*0.8 = 0.72 > 0.7, *0.7 = 0.504 < 0.7.
         for r in [8, 32, 64] { for _ in 0..20 { clamped.observe_cost(0, r, 0.010 + 0.002 * r as f64); } }
         clamped.begin_round(0, 8);
         assert_eq!(clamped.round_cut(), clamped::HI);
