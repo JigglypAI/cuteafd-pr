@@ -14,7 +14,7 @@ from kimi_k3.core_k6.storage import StageStore
 from kimi_k3.uniform_k2.storage import atomic_json, canonical, checkpoint_io, fsync_directory, read_header, verify_receipt
 
 
-_FIELDS = {"F32": torch.float32, "F16": torch.float16, "I64": torch.int64,
+_FIELDS = {"BF16": torch.bfloat16, "F32": torch.float32, "F16": torch.float16, "I64": torch.int64,
            "I32": torch.int32, "I16": torch.int16}
 
 

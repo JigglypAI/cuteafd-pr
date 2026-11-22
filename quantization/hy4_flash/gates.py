@@ -49,7 +49,8 @@ def evaluated(row, inputs, weight, restored, selection):
 class ExpertWitness:
     """Independent natural-route combine for held-out prompts, including across group recovery."""
 
-    def __init__(self, routes, layer, limit):
+    def __init__(self, routes, layer, limit, *, target_gates=TARGET_GATES):
+        self.target_gates = target_gates
         self.routes = routes
         self.combined = torch.zeros_like(routes.latent)
         self.layer, self.limit = layer, limit
@@ -58,7 +59,7 @@ class ExpertWitness:
         rows, gamma = self.routes.expert(expert)
         rows = rows.to(self.combined.device)
         inputs = self.routes.latent.index_select(0, rows)
-        check = self.layer in TARGET_GATES and metrics is not None
+        check = self.layer in self.target_gates and metrics is not None
         selection = "heldout-natural-routes"
         if not len(rows):
             if not check:
