@@ -1383,4 +1383,19 @@ def test_mimo_routed_exl3_scopes_fail_early_as_unsupported(tmp_path, monkeypatch
     assert fp8_env['CUTEAFD_WIP_EXPERT_FAMILIES'] == expected_fp8
 
 
+def test_hy4_flash_wip_scope_requires_mul1_routed_index(tmp_path, monkeypatch):
+    monkeypatch.setenv('HF_HOME', str(tmp_path))
+    mul1_model = 'wrldsuksgo2mars/Hy4-flash-EXL3-K4-MC'
+    seed_exl3_index(tmp_path, mul1_model, codebook='mul1')
+    _, scopes = aot.config_scopes({'FAMILY': 'hy4_flash', 'MODEL_ID': mul1_model, 'SPARK_COUNT': '2'})
+    assert scopes['CUTEAFD_WIP_COORDINATOR_EXPERT_FAMILIES'] == 'hy4f:exl3-k45-mul1'
+    assert scopes['CUTEAFD_WIP_EXPERT_FAMILIES'] == 'hy4f:exl3-k45-mul1'
+    assert scopes['CUTEAFD_WIP_GENERIC_SPARK_COUNTS'] == 'hy4f=2'
+
+    mcg_model = 'test/Hy4-flash-EXL3-MCG-Invalid'
+    seed_exl3_index(tmp_path, mcg_model, codebook='mcg')
+    with pytest.raises(ValueError, match='MUL1 only'):
+        aot.config_scopes({'FAMILY': 'hy4_flash', 'MODEL_ID': mcg_model, 'SPARK_COUNT': '2'})
+
+
 

@@ -50,7 +50,7 @@ NATIVE_FP8_SLUGS = {
 
 
 def require_mapping(family):
-    if family != 'deepseek_v41' and family not in PROGRAM_SWITCHES:
+    if family not in ('deepseek_v41', 'hy4_flash') and family not in PROGRAM_SWITCHES:
         raise ValueError(f'no WIP AOT scope mapping for {family}')
 
 
@@ -589,6 +589,13 @@ def family_scopes(cards, config_reader):
             scopes.add('ml4:exl3-k45' + exl3_codebook_suffix(family, values))
             if count:
                 counts.add(f"ml4={count}")
+        if family == 'hy4_flash':
+            suffix = exl3_codebook_suffix(family, values)
+            if suffix != '-mul1':
+                raise ValueError('hy4_flash routed EXL3 checkpoints ship MUL1 only')
+            scopes.add('hy4f:exl3-k45-mul1')
+            if count:
+                counts.add(f"hy4f={count}")
         # EXLR8 checkpoints retain family coordinator programs without expert packages.
         exlr8 = bool(values.get('EXLR8_MANIFEST'))
         if exlr8:
