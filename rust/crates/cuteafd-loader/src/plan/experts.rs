@@ -210,7 +210,8 @@ pub fn spark_recipe(package: &str, intermediate: usize, world: usize) -> Result<
     let exl3 = exl3_tiers.is_some_and(|bits| (1..=2).contains(&bits.len())
         && bits.bytes().all(|bit| (b'2'..=b'6').contains(&bit))
         && (bits.len() == 1 || bits.as_bytes()[0] != bits.as_bytes()[1]))
-        && matches!(family, "dsv4p" | "glm" | "glmf" | "qwen4" | "kimik3" | "step5" | "muse" | "ml4" | "inkling2");
+        && (matches!(family, "dsv4p" | "glm" | "glmf" | "qwen4" | "kimik3" | "step5" | "muse" | "ml4" | "inkling2")
+            || (family == "hy4f" && format.ends_with("-mul1")));
     let nvfp4 = (matches!(format, "nvfp4" | "nvfp4a4") && matches!(family, "v41" | "glm" | "glmf" | "qwen4" | "minimax" | "inkling2"))
         || (family == "step5" && format == "nvfp4");
     // Inkling 2 MXFP8 experts (E4M3 + UE8M0 K32, W8A8) are an FP8-family package with a K32 wire.
