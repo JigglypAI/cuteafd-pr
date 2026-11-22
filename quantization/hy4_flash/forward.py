@@ -263,6 +263,9 @@ class Model:
         active = F.silu(gate) * up
         return layer.project(prefix + "down_proj", active, project)
 
+    def routing_scores(self, inputs, layer):
+        return reference.routing_scores(inputs, layer.weights, self.config)
+
     def moe_route(self, inputs, layer, project=native_projection):
         # Router and shared expert see full-width states. Only routed experts
         # see the hidden -> latent projection.
@@ -364,6 +367,7 @@ class Drafter:
     target bonus token, not a replacement for the final committed token.
     """
 
+    linear = staticmethod(linear)
     block_size = DRAFT_BLOCK_SIZE
     target_layers = staticmethod(draft_targets)
 
@@ -398,7 +402,7 @@ class Drafter:
             reference.norm(anchor, w[p + "enorm.weight"], c.rms_norm_eps),
             reference.norm(target_hidden, w[p + "hnorm.weight"], c.rms_norm_eps),
         ))
-        states[0] = anchor + w[p + "gate"] * linear(joined, w[p + "eh_proj.weight"])
+        states[0] = anchor + w[p + "gate"] * self.linear(joined, w[p + "eh_proj.weight"])
         return states
 
     def attention_inputs(self, hidden, stage):
@@ -444,9 +448,9 @@ class Drafter:
             reference.norm(hidden, w[p + "hidden_norm.weight"], c.rms_norm_eps),
             reference.norm(previous_embed, w[p + "embed_norm.weight"], c.rms_norm_eps),
         ))
-        gate = linear(joined, w[p + "gate_proj.weight"])
-        up = linear(joined, w[p + "up_proj.weight"])
-        return hidden + linear(F.silu(gate) * up, w[p + "down_proj.weight"])
+        gate = self.linear(joined, w[p + "gate_proj.weight"])
+        up = self.linear(joined, w[p + "up_proj.weight"])
+        return hidden + self.linear(F.silu(gate) * up, w[p + "down_proj.weight"])
 
     def proposals(self, hidden, bonus, embedding, *, head=native_projection, head_weight=None):
         """Return the sequentially corrected FP32 logits of draft slots 1..m."""

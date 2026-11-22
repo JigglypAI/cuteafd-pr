@@ -34,7 +34,7 @@ def sha(path):
 
 def code_hashes():
     files = (Path(__file__), Path(forward.__file__), Path(forward.flash.__file__),
-             Path(forward.reference.__file__), Path(inspect.getfile(forward.native_projection.__globals__["linear"])))
+             Path(forward.reference.__file__), Path(inspect.getfile(forward.flash.linear)))
     return {str(path.relative_to(Path(__file__).resolve().parents[2])): sha(path) for path in files}
 
 
