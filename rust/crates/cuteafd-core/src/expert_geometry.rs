@@ -341,6 +341,10 @@ impl ExpertGeometry {
     /// 8192 residual); 62 routed layers, sigmoid top-8, each expert's output
     /// RMS-normalized before its routing weight.
     pub const MUSE_SPARK: Self = Self { hidden: 4096, experts: 256, topk: 8, intermediate: 4096, layers: 62 };
+    /// Hy4-flash (`hy_v4_flash`): latent MoE experts see the 1536-wide
+    /// `routed_expert_down_proj` stream (not the 3072 residual); routed layers
+    /// 1..42 (41 layers, layer 0 dense), sigmoid top-16, SwiGLU clamped at 10.
+    pub const HY4_FLASH: Self = Self { hidden: 1536, experts: 512, topk: 16, intermediate: 1536, layers: 42 };
 
     /// BF16 bytes of one hidden-width row (a routed input or a rank partial).
     pub const fn row_bytes(&self) -> u32 {
@@ -429,6 +433,7 @@ impl ExpertGeometry {
             (Self::MISTRAL_LARGE4, "ml4"),
             (Self::MINIMAX_M3, "minimax"),
             (Self::INKLING2, "inkling2"),
+            (Self::HY4_FLASH, "hy4f"),
         ]
         .into_iter()
         .find_map(|(shape, family)| self.same_shape(&shape).then_some(family))
@@ -777,6 +782,15 @@ mod tests {
         assert_eq!(muse.activation(), crate::FfnActivation::SiluBf16Product { limit: None });
         // Rows on the wire are the 4096-wide pre-expert stream, not the 8192 residual.
         assert_eq!(muse.row_bytes(), 8192);
+        let hy4 = ExpertGeometry::HY4_FLASH;
+        assert_eq!(hy4.family(), Some("hy4f"));
+        assert_eq!(hy4.swiglu_limit(), Some(10.0));
+        assert_eq!(hy4.activation(), crate::FfnActivation::SiluBf16Product { limit: Some(10.0) });
+        assert_eq!(hy4.row_bytes(), 3072);
+        assert_eq!(hy4.slice(2), Some(768));
+        assert_eq!(hy4.slice(3), Some(512));
+        assert_eq!(hy4.slice(4), Some(384));
+        assert_eq!(hy4.slice(6), Some(256));
     }
 
     #[test]
