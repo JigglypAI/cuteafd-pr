@@ -1852,9 +1852,9 @@ def main() -> None:
     except ValueError as error:
         raise SystemExit(str(error)) from error
     if not geometries or any(name not in ("flash", "flash2", "pro", "pro2", "glm", "glm2", "mimo", "mimo2", "mimop",
-                                          "mimop2", "mimof", "mimof2", "glmf", "glmf2", "qwen4", "qwen35", "qwen38", "step5", "step52", "muse", "muse2", "ml4", "expert_partial", "expert_reply", "native_experts", "exlr8", "exlr8_dense", "minimax", "inkling2", "glm_stage", "glm2_stage", "glmf_stage", "glmf2_stage", "dense_trellis_k6", "kimi_split", "kimik3", "kimik31", "native_attention") for name in geometries):
+                                          "mimop2", "mimof", "mimof2", "glmf", "glmf2", "qwen4", "qwen35", "qwen38", "step5", "step52", "muse", "muse2", "ml4", "expert_partial", "expert_reply", "native_experts", "exlr8", "exlr8_dense", "minimax", "inkling2", "hy4f", "hy4f2", "glm_stage", "glm2_stage", "glmf_stage", "glmf2_stage", "dense_trellis_k6", "kimi_split", "kimik3", "kimik31", "native_attention") for name in geometries):
         raise SystemExit("--geometry takes flash, flash2, pro, pro2, glm, glm2, mimo, mimo2, mimop, mimop2, mimof, mimof2, "
-                         "glmf, glmf2, qwen4, qwen35, qwen38, step5, step52, muse, muse2, ml4, expert_partial, exlr8, exlr8_dense, minimax, inkling2, glm_stage, glm2_stage, glmf_stage, glmf2_stage, dense_trellis_k6, kimi_split, kimik3, kimik31 and/or native_attention")
+                         "glmf, glmf2, qwen4, qwen35, qwen38, step5, step52, muse, muse2, ml4, expert_partial, exlr8, exlr8_dense, minimax, inkling2, hy4f, hy4f2, glm_stage, glm2_stage, glmf_stage, glmf2_stage, dense_trellis_k6, kimi_split, kimik3, kimik31 and/or native_attention")
     if args.context_split_only and any(name not in ("flash", "pro", "glm", "glmf", "kimik3") for name in geometries):
         raise SystemExit("--context-split-only takes flash, pro, glm, glmf and/or kimik3")
     kimi_kda = None
@@ -1986,7 +1986,7 @@ def main() -> None:
             }
             work += [(name, *item) for item in dense_programs(families=dense_families, input_dtype="bf16")]
             continue
-        if name in ("minimax", "inkling2"):
+        if name in ("minimax", "inkling2", "hy4f", "hy4f2"):
             continue  # appended after existing programs to preserve their indices
         if name == "exlr8_dense":
             from export_b12x_exlr8_dense_aot import programs as dense_programs
@@ -2163,6 +2163,18 @@ def main() -> None:
                 if suffix not in existing_fp8:
                     work.append(("native_attention", suffix, "attention_projection", dict(max_rows=rows),
                                  functools.partial(compile_native_attention_projection, n, k, rows, precision)))
+    for hy4_name in ("hy4f", "hy4f2"):
+        if hy4_name in geometries:
+            from export_b12x_hy4_aot import programs as hy4_programs
+            tp = 1 if hy4_name == "hy4f" else 2
+            extent = min(int(args.max_context), 262144)
+            manifest["families"][hy4_name] = {
+                "tp": tp, "hidden": 3072, "dsa_heads": 32 // tp, "swa_heads": 64 // tp,
+                "indexer_heads": 16, "q_lora_rank": 1024, "kv_lora_rank": 512,
+                "qk_nope_dim": 192, "qk_rope_dim": 64, "v_head_dim": 256,
+            }
+            manifest["family_capacities"][hy4_name] = {"max_context": extent}
+            work += [(hy4_name, *item) for item in hy4_programs(tp, args.decode_rows, args.prefill_rows, extent)]
         work += [("inkling_draft", *item) for item in inkling_draft_programs()]
         for suffix, op, params, compile_ in inkling_fir_programs():
             family = "fir" if suffix == "fir_history_commit" else "inkling2"

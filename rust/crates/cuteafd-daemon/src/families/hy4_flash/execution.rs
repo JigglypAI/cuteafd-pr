@@ -1,0 +1,1071 @@
+//! Full 42-layer Hy4-flash coordinator forward pass (1x RTX TP1 and 2x RTX TP2).
+use super::cache::Hy4CacheRank;
+use super::programs::Hy4Programs;
+use super::weights::{Hy4EngramHost, Hy4RankWeights};
+use crate::shared::experts::rtx::exl3::Exl3Tp2;
+use crate::shared::experts::rtx::{ExpertInput, Routes, RtxExpertLayer};
+use crate::shared::launch_grid::Fp8QuantizeGrid;
+use crate::shared::memory::device::{Allocation, Device, Event, Stream};
+use crate::shared::memory::Tag;
+use crate::shared::target_head::{self, TargetHead};
+use anyhow::{ensure, Context, Result};
+use cuteafd_ffi::programs::{Programs, Scalar};
+use cuteafd_ffi::{Bf16Add, CuteafdDeviceBuffer, F32Add};
+use cuteafd_loader::families::hy4_flash::engram::Hy4EngramHistory;
+use cuteafd_loader::families::hy4_flash::execution::{PAGE_ROWS, SWA_RING_PAGES, SWA_RING_ROWS};
+use cuteafd_loader::families::hy4_flash::{Hy4FlashConfig, Hy4KvCache};
+use cuteafd_loader::plan::checkpoint::Checkpoint;
+use std::collections::BTreeMap;
+use std::ffi::c_void;
+
+const H: usize = 3072;
+const HC: usize = 4;
+const Q_LORA: usize = 1024;
+const KV_A_DIM: usize = 576;
+const LATENT_H: usize = 1536;
+const EXPERTS: usize = 512;
+const TOPK: usize = 16;
+const IDX_HEADS: usize = 16;
+const IDX_DIM: usize = 128;
+const CANDIDATE_TOPK: usize = 2048;
+
+/// Per-rank sequential scratch workspace for one Hy4-flash prefill/decode chunk.
+struct RankScratch<'a> {
+    ids: Allocation<'a>,
+    positions_i64: Allocation<'a>,
+    positions_i32: Allocation<'a>,
+    slots_i64: Allocation<'a>,
+    r_a: Allocation<'a>,
+    r_b: Allocation<'a>,
+    post: Allocation<'a>,
+    y: Allocation<'a>,
+    delta: Allocation<'a>,
+    delta_f32: Allocation<'a>,
+    delta_peer_f32: Allocation<'a>,
+    delta_norm: Allocation<'a>,
+    // Engram
+    engram_raw: Allocation<'a>,
+    engram_masked: Allocation<'a>,
+    engram_normed: Allocation<'a>,
+    engram_val: Allocation<'a>,
+    engram_keys: Allocation<'a>,
+    // MLA
+    q_a: Allocation<'a>,
+    kv_a: Allocation<'a>,
+    q_resid: Allocation<'a>,
+    q_raw: Allocation<'a>,
+    gate: Allocation<'a>,
+    query: Allocation<'a>,
+    attn_out: Allocation<'a>,
+    lse_out: Allocation<'a>,
+    uv_out: Allocation<'a>,
+    attn_scratch: Allocation<'a>,
+    page_table: Allocation<'a>,
+    seqlens: Allocation<'a>,
+    cu_seqlens: Allocation<'a>,
+    // Indexer
+    idx_q_raw: Allocation<'a>,
+    idx_q_rot: Allocation<'a>,
+    idx_w_raw: Allocation<'a>,
+    idx_w_out: Allocation<'a>,
+    idx_tk_raw: Allocation<'a>,
+    idx_tk: Allocation<'a>,
+    idx_group_tok: Allocation<'a>,
+    idx_group_pos: Allocation<'a>,
+    idx_group_slots: Allocation<'a>,
+    idx_scores: Allocation<'a>,
+    idx_limits: Allocation<'a>,
+    idx_cand_slots: Allocation<'a>,
+    idx_cand_lens: Allocation<'a>,
+    // FFN / LatentMoE
+    ffn_gate: Allocation<'a>,
+    ffn_up: Allocation<'a>,
+    ffn_act: Allocation<'a>,
+    router_logits: Allocation<'a>,
+    router_select: Allocation<'a>,
+    route_ids: Allocation<'a>,
+    route_weights: Allocation<'a>,
+    latent_in: Allocation<'a>,
+    wire_in: Allocation<'a>,
+    routed_latent: Allocation<'a>,
+    routed_out: Allocation<'a>,
+    shared_out: Allocation<'a>,
+    zero_f32: Allocation<'a>,
+    // Head logits tile (<=64 rows)
+    logits_tile: Allocation<'a>,
+}
+
+impl<'a> RankScratch<'a> {
+    fn new(
+        device: Device<'a>,
+        tp: usize,
+        max_rows: usize,
+        max_pages: usize,
+        local_vocab: usize,
+        attn_scratch_bytes: usize,
+    ) -> Result<Self> {
+        let alloc = |bytes: usize, label: &'static str| {
+            Allocation::new(device, bytes.max(256), Tag::workspace(label))
+        };
+        let max_heads = 64 / tp;
+        let max_inter = 13824 / tp;
+        let max_groups = max_pages * (PAGE_ROWS / 4);
+        let wire_row = LATENT_H + LATENT_H / 32;
+        Ok(Self {
+            ids: alloc(max_rows * 4, "ids")?,
+            positions_i64: alloc(max_rows * 8, "pos-i64")?,
+            positions_i32: alloc(max_rows * 4, "pos-i32")?,
+            slots_i64: alloc(max_rows * 8, "slots-i64")?,
+            r_a: alloc(max_rows * HC * H * 2, "r-a")?,
+            r_b: alloc(max_rows * HC * H * 2, "r-b")?,
+            post: alloc(max_rows * HC * 4, "post")?,
+            y: alloc(max_rows * H * 2, "y")?,
+            delta: alloc(max_rows * H * 2, "delta")?,
+            delta_f32: alloc(max_rows * H * 4, "delta-f32")?,
+            delta_peer_f32: alloc(max_rows * H * 4, "delta-peer-f32")?,
+            delta_norm: alloc(max_rows * H * 2, "delta-norm")?,
+            engram_raw: alloc(max_rows * 16 * 96 * 2, "engram-raw")?,
+            engram_masked: alloc(max_rows, "engram-masked")?,
+            engram_normed: alloc(max_rows * 1536 * 2, "engram-normed")?,
+            engram_val: alloc(max_rows * H * 2, "engram-val")?,
+            engram_keys: alloc(max_rows * HC * H * 2, "engram-keys")?,
+            q_a: alloc(max_rows * Q_LORA * 2, "q-a")?,
+            kv_a: alloc(max_rows * KV_A_DIM * 2, "kv-a")?,
+            q_resid: alloc(max_rows * Q_LORA * 2, "q-resid")?,
+            q_raw: alloc(max_rows * max_heads * 256 * 2, "q-raw")?,
+            gate: alloc(max_rows * max_heads * 256 * 2, "gate")?,
+            query: alloc(max_rows * max_heads * 576 * 2, "query")?,
+            attn_out: alloc(max_rows * max_heads * 512 * 2, "attn-out")?,
+            lse_out: alloc(max_rows * max_heads * 4, "lse-out")?,
+            uv_out: alloc(max_rows * max_heads * 256 * 2, "uv-out")?,
+            attn_scratch: alloc(attn_scratch_bytes, "attn-scratch")?,
+            page_table: alloc(max_rows * max_pages.max(SWA_RING_PAGES) * 4, "page-table")?,
+            seqlens: alloc(max_rows * 4, "seqlens")?,
+            cu_seqlens: alloc((max_rows + 1) * 4, "cu-seqlens")?,
+            idx_q_raw: alloc(max_rows * IDX_HEADS * IDX_DIM * 2, "idx-q-raw")?,
+            idx_q_rot: alloc(max_rows * IDX_HEADS * IDX_DIM * 2, "idx-q-rot")?,
+            idx_w_raw: alloc(max_rows * IDX_HEADS * 2, "idx-w-raw")?,
+            idx_w_out: alloc(max_rows * IDX_HEADS * 4, "idx-w-out")?,
+            idx_tk_raw: alloc(max_rows * IDX_DIM * 2, "idx-tk-raw")?,
+            idx_tk: alloc(max_rows * IDX_DIM * 2, "idx-tk")?,
+            idx_group_tok: alloc((max_rows + 4) * IDX_DIM * 2, "idx-group-tok")?,
+            idx_group_pos: alloc((max_rows / 4 + 2) * 8, "idx-group-pos")?,
+            idx_group_slots: alloc((max_rows / 4 + 2) * 8, "idx-group-slots")?,
+            idx_scores: alloc(max_rows * max_groups.max(1) * 4, "idx-scores")?,
+            idx_limits: alloc(max_rows * 4, "idx-limits")?,
+            idx_cand_slots: alloc(max_rows * CANDIDATE_TOPK * 4, "idx-cand-slots")?,
+            idx_cand_lens: alloc(max_rows * 4, "idx-cand-lens")?,
+            ffn_gate: alloc(max_rows * max_inter * 2, "ffn-gate")?,
+            ffn_up: alloc(max_rows * max_inter * 2, "ffn-up")?,
+            ffn_act: alloc(max_rows * max_inter * 2, "ffn-act")?,
+            router_logits: alloc(max_rows * EXPERTS * 4, "router-logits")?,
+            router_select: alloc(max_rows * EXPERTS * 4, "router-select")?,
+            route_ids: alloc(max_rows * TOPK * 4, "route-ids")?,
+            route_weights: alloc(max_rows * TOPK * 4, "route-weights")?,
+            latent_in: alloc(max_rows * LATENT_H * 2, "latent-in")?,
+            wire_in: alloc(max_rows * wire_row, "wire-in")?,
+            routed_latent: alloc(max_rows * LATENT_H * 2, "routed-latent")?,
+            routed_out: alloc(max_rows * H * 2, "routed-out")?,
+            shared_out: alloc(max_rows * H * 2, "shared-out")?,
+            zero_f32: alloc(max_rows * H * 4, "zero-f32")?,
+            logits_tile: alloc(64 * local_vocab * 4, "logits-tile")?,
+        })
+    }
+}
+
+struct RankRuntime<'a> {
+    device: Device<'a>,
+    stream: Stream<'a>,
+    peer_ready: Event<'a>,
+    programs: Hy4Programs<'a>,
+    weights: Hy4RankWeights<'a>,
+    cache: Hy4CacheRank<'a>,
+    scratch: RankScratch<'a>,
+    bf16_add: Bf16Add<'a>,
+    f32_add: F32Add<'a>,
+    quantize_grid: Fp8QuantizeGrid,
+    onboarded_experts: Option<Exl3Tp2<'a>>,
+}
+
+/// Coordinator-only Hy4-flash execution engine (1x RTX TP1 or 2x RTX TP2).
+pub(crate) struct Hy4Engine<'a> {
+    pub(crate) cfg: Hy4FlashConfig,
+    pub(crate) max_rows: usize,
+    pub(crate) max_pages: usize,
+    pub(crate) engram: Hy4EngramHost,
+    pub(crate) skip_routed_experts: bool,
+    ranks: Vec<RankRuntime<'a>>,
+    dsa_index_of: BTreeMap<usize, usize>,
+    swa_index_of: BTreeMap<usize, usize>,
+    engram_histories: BTreeMap<usize, Hy4EngramHistory>,
+    committed_pos: usize,
+}
+
+impl<'a> Hy4Engine<'a> {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        devices: &[Device<'a>],
+        programs: &'a Programs<'a>,
+        checkpoint: &Checkpoint,
+        cfg: Hy4FlashConfig,
+        kv_format: Hy4KvCache,
+        max_rows: usize,
+        max_pages: usize,
+        force_engram_bf16: bool,
+        skip_routed_experts: bool,
+        mut onboarded_experts: Vec<Option<Exl3Tp2<'a>>>,
+    ) -> Result<Self> {
+        let gpus = devices.len();
+        ensure!(matches!(gpus, 1 | 2), "Hy4Engine supports 1 or 2 GPUs, got {gpus}");
+        ensure!(onboarded_experts.len() == gpus, "onboarded_experts rank count mismatch");
+        if gpus == 2 {
+            let probed = crate::shared::peer_split::probed_device(
+                devices[0].library,
+                devices[0].id,
+                Some(devices[1].id),
+            )?;
+            ensure!(
+                probed == Some(devices[1].id),
+                "Hy4Engine TP2 requires bidirectional GPU-to-GPU peer access between devices {} and {}",
+                devices[0].id,
+                devices[1].id
+            );
+        }
+
+        let weights_all = Hy4RankWeights::load_all(devices, checkpoint, &cfg, max_rows.min(64))?;
+        // SAFETY: checkpoint shard files remain immutable for the duration of the engine.
+        let engram = unsafe { Hy4EngramHost::open(checkpoint, &cfg, force_engram_bf16)? };
+        let engram_histories = engram.start_histories();
+
+        let mut ranks = Vec::with_capacity(gpus);
+        for (rank, weights) in weights_all.into_iter().enumerate() {
+            let device = devices[rank];
+            let stream = Stream::new(device)?;
+            let peer_ready = Event::new(device)?;
+            let progs = device.run(|| Hy4Programs::load(programs, gpus, kv_format, max_rows))?;
+            let attn_scratch = progs
+                .dsa_scratch_bytes
+                .max(progs.swa_decode_scratch_bytes)
+                .max(progs.swa_extend_scratch_bytes);
+            let cache = Hy4CacheRank::new(device, &cfg, kv_format, max_pages, 1, 0, &stream)?;
+            let scratch = RankScratch::new(device, gpus, max_rows, max_pages, weights.local_vocab, attn_scratch)?;
+            let bf16_add = device.run(|| device.library.bf16_add())?;
+            let f32_add = device.run(|| device.library.f32_add())?;
+            let quantize_grid = Fp8QuantizeGrid::new(device.run(|| device.library.sm_count())?, None)?;
+            ranks.push(RankRuntime {
+                device,
+                stream,
+                peer_ready,
+                programs: progs,
+                weights,
+                cache,
+                scratch,
+                bf16_add,
+                f32_add,
+                quantize_grid,
+                onboarded_experts: onboarded_experts[rank].take(),
+            });
+        }
+
+        let dsa_index_of: BTreeMap<usize, usize> = cfg
+            .sparse_layers()
+            .into_iter()
+            .enumerate()
+            .map(|(i, l)| (l, i))
+            .collect();
+        let swa_index_of: BTreeMap<usize, usize> = cfg
+            .swa_layers()
+            .into_iter()
+            .enumerate()
+            .map(|(i, l)| (l, i))
+            .collect();
+
+        Ok(Self {
+            cfg,
+            max_rows,
+            max_pages,
+            engram,
+            skip_routed_experts,
+            ranks,
+            dsa_index_of,
+            swa_index_of,
+            engram_histories,
+            committed_pos: 0,
+        })
+    }
+
+    pub(crate) fn reset(&mut self) -> Result<()> {
+        for r in &mut self.ranks {
+            r.cache.zero_all(&r.stream)?;
+            for seq in &mut r.cache.pending_counts {
+                seq.fill(0);
+            }
+        }
+        self.engram_histories = self.engram.start_histories();
+        self.committed_pos = 0;
+        Ok(())
+    }
+
+    /// Device-driven GPU-to-GPU P2P sum of `scratch.delta_f32 [rows, width]` across TP2 ranks,
+    /// written to `scratch.delta [rows, width]` BF16 on both ranks with zero host hop.
+    fn reduce_tp2_f32_to_bf16(&mut self, rows: usize, width: usize) -> Result<()> {
+        if self.ranks.len() == 1 {
+            return Ok(());
+        }
+        let elems = rows * width;
+        let bytes = elems * 4;
+        for r in &mut self.ranks {
+            r.peer_ready.record(&r.stream)?;
+        }
+        let ev0 = self.ranks[0].peer_ready.raw;
+        let ev1 = self.ranks[1].peer_ready.raw;
+        let src0 = CuteafdDeviceBuffer { bytes, ..self.ranks[0].scratch.delta_f32.buffer };
+        let src1 = CuteafdDeviceBuffer { bytes, ..self.ranks[1].scratch.delta_f32.buffer };
+        // Wait for peer partial to finish, then copy GPU-to-GPU directly into delta_peer_f32.
+        self.ranks[0].device.run(|| unsafe {
+            self.ranks[0].device.library.cuda_stream_wait_event(self.ranks[0].stream.raw, ev1)?;
+            self.ranks[0].device.library.copy_peer_async(
+                CuteafdDeviceBuffer { bytes, ..self.ranks[0].scratch.delta_peer_f32.buffer },
+                src1,
+                bytes,
+                self.ranks[0].stream.raw,
+            )
+        })?;
+        self.ranks[1].device.run(|| unsafe {
+            self.ranks[1].device.library.cuda_stream_wait_event(self.ranks[1].stream.raw, ev0)?;
+            self.ranks[1].device.library.copy_peer_async(
+                CuteafdDeviceBuffer { bytes, ..self.ranks[1].scratch.delta_peer_f32.buffer },
+                src0,
+                bytes,
+                self.ranks[1].stream.raw,
+            )
+        })?;
+        // Ensure both peer copies finished reading the source buffers before summing in-place.
+        for r in &mut self.ranks {
+            r.peer_ready.record(&r.stream)?;
+        }
+        let cp0 = self.ranks[0].peer_ready.raw;
+        let cp1 = self.ranks[1].peer_ready.raw;
+        self.ranks[0].device.run(|| unsafe {
+            self.ranks[0].device.library.cuda_stream_wait_event(self.ranks[0].stream.raw, cp1)?;
+            self.ranks[0].f32_add.launch(
+                self.ranks[0].scratch.delta_f32.buffer,
+                self.ranks[0].scratch.delta_peer_f32.buffer,
+                self.ranks[0].scratch.delta_f32.buffer,
+                elems,
+                self.ranks[0].stream.raw,
+            )?;
+            self.ranks[0].device.library.cuda_f32_to_bf16_async(
+                self.ranks[0].scratch.delta_f32.buffer,
+                self.ranks[0].scratch.delta.buffer,
+                elems,
+                self.ranks[0].stream.raw,
+            )
+        })?;
+        self.ranks[1].device.run(|| unsafe {
+            self.ranks[1].device.library.cuda_stream_wait_event(self.ranks[1].stream.raw, cp0)?;
+            self.ranks[1].f32_add.launch(
+                self.ranks[1].scratch.delta_f32.buffer,
+                self.ranks[1].scratch.delta_peer_f32.buffer,
+                self.ranks[1].scratch.delta_f32.buffer,
+                elems,
+                self.ranks[1].stream.raw,
+            )?;
+            self.ranks[1].device.library.cuda_f32_to_bf16_async(
+                self.ranks[1].scratch.delta_f32.buffer,
+                self.ranks[1].scratch.delta.buffer,
+                elems,
+                self.ranks[1].stream.raw,
+            )
+        })?;
+        Ok(())
+    }
+
+    /// Run a contiguous chunk of `tokens` starting at `self.committed_pos` through layers `0..=last_layer`.
+    /// Returns FP32 logits `[tokens.len(), vocab_size]` if `last_layer == self.cfg.layers - 1`, else empty.
+    pub(crate) fn forward_chunk(&mut self, tokens: &[u32], last_layer: usize) -> Result<Vec<f32>> {
+        let rows = tokens.len();
+        ensure!(rows > 0 && rows <= self.max_rows, "Hy4 chunk rows {rows} outside 1..={}", self.max_rows);
+        ensure!(last_layer < self.cfg.layers, "last_layer {last_layer} >= {}", self.cfg.layers);
+        let pos_start = self.committed_pos;
+        let pos_end = pos_start + rows;
+        let total_pages = pos_end.div_ceil(PAGE_ROWS);
+        ensure!(total_pages <= self.max_pages, "sequence length {pos_end} exceeds cache pages {}", self.max_pages);
+
+        // 1. Upload positions and DSA KV slots; embed tokens into 4-stream iHC residual r_a.
+        let pos_i64: Vec<u8> = (pos_start..pos_end).flat_map(|p| (p as i64).to_le_bytes()).collect();
+        let pos_i32: Vec<u8> = (pos_start..pos_end).flat_map(|p| (p as i32).to_le_bytes()).collect();
+        let swa_slots_i64: Vec<u8> = (pos_start..pos_end)
+            .flat_map(|p| ((p % SWA_RING_ROWS) as i64).to_le_bytes())
+            .collect();
+        let cu_singleton: Vec<u8> = (0..=rows).flat_map(|i| (i as i32).to_le_bytes()).collect();
+        let identity_pt_row: Vec<i32> = (0..total_pages as i32).collect();
+        let mut dsa_pt_bytes = Vec::with_capacity(rows * total_pages * 4);
+        for _ in 0..rows {
+            for &p in &identity_pt_row {
+                dsa_pt_bytes.extend_from_slice(&p.to_le_bytes());
+            }
+        }
+        let swa_pt_bytes: Vec<u8> = (0..SWA_RING_PAGES as i32).flat_map(|p| p.to_le_bytes()).collect();
+        let swa_seqlens_bytes: Vec<u8> = (pos_end as i32).to_le_bytes().to_vec();
+        let swa_cu_bytes: Vec<u8> = [0i32, rows as i32].into_iter().flat_map(i32::to_le_bytes).collect();
+
+        // Embed on rank 0 into r_a [rows, 4, H] BF16, replicate GPU-to-GPU to rank 1 if TP2.
+        {
+            let r0 = &mut self.ranks[0];
+            let emb = r0.weights.embedding.as_ref().context("rank 0 missing TokenEmbedding")?;
+            r0.device.run(|| {
+                emb.embed(tokens, r0.scratch.ids.buffer, HC, r0.scratch.r_a.buffer, r0.stream.raw)
+            })?;
+            r0.peer_ready.record(&r0.stream)?;
+        }
+        if self.ranks.len() == 2 {
+            let bytes = rows * HC * H * 2;
+            let ev0 = self.ranks[0].peer_ready.raw;
+            let src0 = CuteafdDeviceBuffer { bytes, ..self.ranks[0].scratch.r_a.buffer };
+            self.ranks[1].device.run(|| unsafe {
+                self.ranks[1].device.library.cuda_stream_wait_event(self.ranks[1].stream.raw, ev0)?;
+                self.ranks[1].device.library.copy_peer_async(
+                    CuteafdDeviceBuffer { bytes, ..self.ranks[1].scratch.r_a.buffer },
+                    src0,
+                    bytes,
+                    self.ranks[1].stream.raw,
+                )
+            })?;
+        }
+        for r in &self.ranks {
+            r.device.run(|| {
+                r.device.library.copy_h2d(CuteafdDeviceBuffer { bytes: pos_i64.len(), ..r.scratch.positions_i64.buffer }, &pos_i64)?;
+                r.device.library.copy_h2d(CuteafdDeviceBuffer { bytes: pos_i32.len(), ..r.scratch.positions_i32.buffer }, &pos_i32)?;
+                Ok(())
+            })?;
+        }
+
+        // Precompute Engram lookups on host for every Engram layer we will visit.
+        let mut engram_chunks: BTreeMap<usize, (Vec<u8>, Vec<u8>)> = BTreeMap::new();
+        for &layer in &self.cfg.engram_layers {
+            if layer <= last_layer {
+                let hist = self.engram_histories.get_mut(&layer).context("missing engram history")?;
+                let (bf16, masked) = self.engram.lookup_chunk(layer, hist, tokens)?;
+                let raw_bytes: Vec<u8> = bf16.iter().flat_map(|v| v.to_le_bytes()).collect();
+                engram_chunks.insert(layer, (raw_bytes, masked));
+            }
+        }
+
+        let mut use_a = true;
+        let gpus = self.ranks.len();
+
+        for layer in 0..=last_layer {
+            let p = format!("model.layers.{layer}");
+            let is_sparse = self.cfg.sparse_layer[layer];
+            let attn = self.cfg.attention(layer);
+            let local_heads = attn.heads / gpus;
+
+            // (A) Engram layer (in-place update on active residual stream r_cur)
+            if let Some((raw_bytes, masked)) = engram_chunks.get(&layer) {
+                for r in &self.ranks {
+                    let r_cur = if use_a { r.scratch.r_a.buffer } else { r.scratch.r_b.buffer };
+                    r.device.run(|| {
+                        r.device.library.copy_h2d(CuteafdDeviceBuffer { bytes: raw_bytes.len(), ..r.scratch.engram_raw.buffer }, raw_bytes)?;
+                        r.device.library.copy_h2d(CuteafdDeviceBuffer { bytes: masked.len(), ..r.scratch.engram_masked.buffer }, masked)?;
+                        let ep = format!("{p}.engram_layer");
+                        let s = [Scalar::I32(rows as i32)];
+                        // SAFETY: admitted arena weight views & rank scratch live through stream drain.
+                        unsafe {
+                            r.programs.engram_head_norm.launch(
+                                &[r.scratch.engram_raw.buffer.ptr, r.weights.buf(&format!("{ep}.head_norm_weights"))?.ptr, r.scratch.engram_normed.buffer.ptr],
+                                &s, r.stream.raw,
+                            )?;
+                            r.programs.proj_engram_value.launch(
+                                &[r.scratch.engram_normed.buffer.ptr, r.weights.buf(&format!("{ep}.value_proj"))?.ptr, r.scratch.engram_val.buffer.ptr],
+                                &s, r.stream.raw,
+                            )?;
+                            r.programs.proj_engram_key.launch(
+                                &[r.scratch.engram_normed.buffer.ptr, r.weights.buf(&format!("{ep}.key_proj"))?.ptr, r.scratch.engram_keys.buffer.ptr],
+                                &s, r.stream.raw,
+                            )?;
+                            r.programs.engram_gate_add.launch(
+                                &[
+                                    r_cur.ptr,
+                                    r.scratch.engram_keys.buffer.ptr,
+                                    r.scratch.engram_val.buffer.ptr,
+                                    r.weights.buf(&format!("{ep}.norm_keys"))?.ptr,
+                                    r.weights.buf(&format!("{ep}.norm_queries"))?.ptr,
+                                    r.weights.buf(&format!("{ep}.post_gate_norm.weight"))?.ptr,
+                                    r.weights.buf(&format!("{ep}.unified_per_hc_scales"))?.ptr,
+                                    r.scratch.engram_masked.buffer.ptr,
+                                ],
+                                &s, r.stream.raw,
+                            )?;
+                        }
+                        Ok(())
+                    })?;
+                }
+            }
+
+            // (B) Attention iHC pre + absorbed MLA + compressed indexer (if DSA) + sink/gate W_UV + o_proj
+            for r in &mut self.ranks {
+                let r_cur = if use_a { r.scratch.r_a.buffer } else { r.scratch.r_b.buffer };
+                let s_rows = [Scalar::I32(rows as i32)];
+                let inv_freq = if is_sparse { r.weights.inv_freq_dsa.buffer.ptr } else { r.weights.inv_freq_swa.buffer.ptr };
+                let kv_slots_bytes = if is_sparse { &pos_i64 } else { &swa_slots_i64 };
+                let kv_cache_buf = if is_sparse {
+                    r.cache.dsa_kv_layer(self.dsa_index_of[&layer])?
+                } else {
+                    r.cache.swa_ring(0, self.swa_index_of[&layer])?
+                };
+                let (w_uk, w_uv) = r.weights.kv_b_absorbed(layer, local_heads)?;
+
+                r.device.run(|| {
+                    r.device.library.copy_h2d(CuteafdDeviceBuffer { bytes: kv_slots_bytes.len(), ..r.scratch.slots_i64.buffer }, kv_slots_bytes)?;
+                    // SAFETY: all arena weight views, cache planes, and scratch stay live through stream drain.
+                    unsafe {
+                        r.programs.ihc_pre.launch(
+                            &[
+                                r_cur.ptr,
+                                r.weights.buf(&format!("{p}.hc_attn_layer.hc_pre.hc_fn"))?.ptr,
+                                r.weights.buf(&format!("{p}.hc_attn_layer.hc_pre.hc_scale"))?.ptr,
+                                r.weights.buf(&format!("{p}.hc_attn_layer.hc_pre.hc_base"))?.ptr,
+                                r.weights.buf(&format!("{p}.input_layernorm.weight"))?.ptr,
+                                r.scratch.post.buffer.ptr,
+                                r.scratch.y.buffer.ptr,
+                            ],
+                            &s_rows, r.stream.raw,
+                        )?;
+                        r.programs.proj_q_a.launch(
+                            &[r.scratch.y.buffer.ptr, r.weights.buf(&format!("{p}.self_attn.q_a_proj"))?.ptr, r.scratch.q_a.buffer.ptr],
+                            &s_rows, r.stream.raw,
+                        )?;
+                        r.programs.proj_kv_a.launch(
+                            &[r.scratch.y.buffer.ptr, r.weights.buf(&format!("{p}.self_attn.kv_a_proj_with_mqa"))?.ptr, r.scratch.kv_a.buffer.ptr],
+                            &s_rows, r.stream.raw,
+                        )?;
+                        r.programs.mla_rank_norm_pack.launch(
+                            &[
+                                r.scratch.q_a.buffer.ptr,
+                                r.scratch.kv_a.buffer.ptr,
+                                r.weights.buf(&format!("{p}.self_attn.q_a_layernorm.weight"))?.ptr,
+                                r.weights.buf(&format!("{p}.self_attn.kv_a_layernorm.weight"))?.ptr,
+                                r.scratch.slots_i64.buffer.ptr,
+                                r.scratch.positions_i64.buffer.ptr,
+                                inv_freq,
+                                r.scratch.q_resid.buffer.ptr,
+                                kv_cache_buf.ptr,
+                            ],
+                            &s_rows, r.stream.raw,
+                        )?;
+                        let (proj_qb, proj_gate, q_abs, sink_uv, proj_o) = if is_sparse {
+                            (&r.programs.proj_q_b_dsa, &r.programs.proj_linear_gate_dsa, &r.programs.mla_q_absorb_dsa, &r.programs.mla_sink_gate_uv_dsa, &r.programs.proj_o_dsa)
+                        } else {
+                            (&r.programs.proj_q_b_swa, &r.programs.proj_linear_gate_swa, &r.programs.mla_q_absorb_swa, &r.programs.mla_sink_gate_uv_swa, &r.programs.proj_o_swa)
+                        };
+                        proj_qb.launch(
+                            &[r.scratch.q_resid.buffer.ptr, r.weights.buf(&format!("{p}.self_attn.q_b_proj"))?.ptr, r.scratch.q_raw.buffer.ptr],
+                            &s_rows, r.stream.raw,
+                        )?;
+                        proj_gate.launch(
+                            &[r.scratch.y.buffer.ptr, r.weights.buf(&format!("{p}.self_attn.linear_gate"))?.ptr, r.scratch.gate.buffer.ptr],
+                            &s_rows, r.stream.raw,
+                        )?;
+                        q_abs.launch(
+                            &[r.scratch.q_raw.buffer.ptr, w_uk, r.scratch.positions_i64.buffer.ptr, inv_freq, r.scratch.query.buffer.ptr],
+                            &s_rows, r.stream.raw,
+                        )?;
+
+                        if is_sparse {
+                            let dsa_idx = self.dsa_index_of[&layer];
+                            let idx_cache = r.cache.dsa_index_layer(dsa_idx)?;
+                            let ip = format!("{p}.self_attn.compressed_indexer");
+                            // Token keys + RMSNorm -> complete 4-token groups into group_cache.
+                            r.programs.proj_indexer_wk.launch(
+                                &[r.scratch.y.buffer.ptr, r.weights.buf(&format!("{ip}.token_key_projection"))?.ptr, r.scratch.idx_tk_raw.buffer.ptr],
+                                &s_rows, r.stream.raw,
+                            )?;
+                            let tk_w = r.weights.buf(&format!("{ip}.token_key_norm.weight"))?.ptr;
+                            r.programs.rms_norm_128.launch(
+                                &[r.scratch.idx_tk_raw.buffer.ptr, tk_w, tk_w, tk_w, tk_w, tk_w, r.scratch.idx_tk.buffer.ptr],
+                                &s_rows, r.stream.raw,
+                            )?;
+
+                            let pending = r.cache.pending_counts[0][dsa_idx];
+                            let total_avail = pending + rows;
+                            let complete_groups = total_avail / 4;
+                            let new_pending = total_avail % 4;
+                            let pending_buf = r.cache.pending_key_slot(0, dsa_idx)?;
+                            if complete_groups > 0 {
+                                if pending > 0 {
+                                    r.device.library.copy_d2d_async(
+                                        r.scratch.idx_group_tok.buffer,
+                                        pending_buf,
+                                        pending * IDX_DIM * 2,
+                                        r.stream.raw,
+                                    )?;
+                                }
+                                let copy_from_cur = complete_groups * 4 - pending;
+                                let dst_cur = CuteafdDeviceBuffer {
+                                    ptr: r.scratch.idx_group_tok.buffer.ptr.cast::<u8>().wrapping_add(pending * IDX_DIM * 2).cast(),
+                                    bytes: copy_from_cur * IDX_DIM * 2,
+                                    ..r.scratch.idx_group_tok.buffer
+                                };
+                                r.device.library.copy_d2d_async(dst_cur, r.scratch.idx_tk.buffer, copy_from_cur * IDX_DIM * 2, r.stream.raw)?;
+                                let first_gid = (pos_start - pending) / 4;
+                                let g_pos: Vec<u8> = (0..complete_groups).flat_map(|g| (((first_gid + g) * 4) as i64).to_le_bytes()).collect();
+                                let g_slots: Vec<u8> = (0..complete_groups).flat_map(|g| ((first_gid + g) as i64).to_le_bytes()).collect();
+                                r.device.library.copy_h2d(CuteafdDeviceBuffer { bytes: g_pos.len(), ..r.scratch.idx_group_pos.buffer }, &g_pos)?;
+                                r.device.library.copy_h2d(CuteafdDeviceBuffer { bytes: g_slots.len(), ..r.scratch.idx_group_slots.buffer }, &g_slots)?;
+                                r.programs.indexer_pool_group.launch(
+                                    &[
+                                        r.scratch.idx_group_tok.buffer.ptr,
+                                        r.weights.buf(&format!("{ip}.key_value_projection"))?.ptr,
+                                        r.weights.buf(&format!("{ip}.key_gate_projection"))?.ptr,
+                                        r.weights.buf(&format!("{ip}.intra_group_ape"))?.ptr,
+                                        r.weights.buf(&format!("{ip}.key_norm.weight"))?.ptr,
+                                        r.scratch.idx_group_pos.buffer.ptr,
+                                        r.scratch.idx_group_slots.buffer.ptr,
+                                        inv_freq,
+                                        idx_cache.ptr,
+                                    ],
+                                    &[Scalar::I32(complete_groups as i32)],
+                                    r.stream.raw,
+                                )?;
+                            }
+                            if new_pending > 0 {
+                                if complete_groups == 0 {
+                                    let dst = CuteafdDeviceBuffer {
+                                        ptr: pending_buf.ptr.cast::<u8>().wrapping_add(pending * IDX_DIM * 2).cast(),
+                                        bytes: rows * IDX_DIM * 2,
+                                        ..pending_buf
+                                    };
+                                    r.device.library.copy_d2d_async(dst, r.scratch.idx_tk.buffer, rows * IDX_DIM * 2, r.stream.raw)?;
+                                } else {
+                                    let tail_off = (complete_groups * 4 - pending) * IDX_DIM * 2;
+                                    let src = CuteafdDeviceBuffer {
+                                        ptr: r.scratch.idx_tk.buffer.ptr.cast::<u8>().wrapping_add(tail_off).cast(),
+                                        bytes: new_pending * IDX_DIM * 2,
+                                        ..r.scratch.idx_tk.buffer
+                                    };
+                                    r.device.library.copy_d2d_async(pending_buf, src, new_pending * IDX_DIM * 2, r.stream.raw)?;
+                                }
+                            }
+                            r.cache.pending_counts[0][dsa_idx] = new_pending;
+
+                            r.device.library.copy_h2d(CuteafdDeviceBuffer { bytes: dsa_pt_bytes.len(), ..r.scratch.page_table.buffer }, &dsa_pt_bytes)?;
+                            let total_groups = pos_end / 4;
+                            if pos_end > CANDIDATE_TOPK && total_groups > 0 {
+                                r.programs.proj_indexer_wq_b.launch(
+                                    &[r.scratch.q_resid.buffer.ptr, r.weights.buf(&format!("{ip}.query_projection"))?.ptr, r.scratch.idx_q_raw.buffer.ptr],
+                                    &s_rows, r.stream.raw,
+                                )?;
+                                r.programs.proj_indexer_weights.launch(
+                                    &[r.scratch.y.buffer.ptr, r.weights.buf(&format!("{ip}.head_weight_projection"))?.ptr, r.scratch.idx_w_raw.buffer.ptr],
+                                    &s_rows, r.stream.raw,
+                                )?;
+                                r.programs.indexer_query_rope.launch(
+                                    &[
+                                        r.scratch.idx_q_raw.buffer.ptr,
+                                        r.scratch.idx_w_raw.buffer.ptr,
+                                        r.scratch.positions_i64.buffer.ptr,
+                                        inv_freq,
+                                        r.scratch.idx_q_rot.buffer.ptr,
+                                        r.scratch.idx_w_out.buffer.ptr,
+                                    ],
+                                    &s_rows, r.stream.raw,
+                                )?;
+                                let limits_bytes: Vec<u8> = (pos_start..pos_end).flat_map(|p| ((p / 4) as i32).to_le_bytes()).collect();
+                                r.device.library.copy_h2d(CuteafdDeviceBuffer { bytes: limits_bytes.len(), ..r.scratch.idx_limits.buffer }, &limits_bytes)?;
+                                r.programs.indexer_score_groups.launch(
+                                    &[
+                                        r.scratch.idx_q_rot.buffer.ptr,
+                                        r.scratch.idx_w_out.buffer.ptr,
+                                        idx_cache.ptr,
+                                        r.scratch.page_table.buffer.ptr,
+                                        r.scratch.idx_limits.buffer.ptr,
+                                        r.scratch.idx_scores.buffer.ptr,
+                                    ],
+                                    &[Scalar::I32(rows as i32), Scalar::I32(total_groups as i32), Scalar::I32(total_pages as i32)],
+                                    r.stream.raw,
+                                )?;
+                            }
+                            r.programs.indexer_topk_expand.launch(
+                                &[
+                                    r.scratch.idx_scores.buffer.ptr,
+                                    r.scratch.positions_i32.buffer.ptr,
+                                    r.scratch.page_table.buffer.ptr,
+                                    r.scratch.idx_cand_slots.buffer.ptr,
+                                    r.scratch.idx_cand_lens.buffer.ptr,
+                                ],
+                                &[Scalar::I32(rows as i32), Scalar::I32(total_groups.max(1) as i32), Scalar::I32(total_pages as i32)],
+                                r.stream.raw,
+                            )?;
+                            r.device.library.copy_h2d(CuteafdDeviceBuffer { bytes: cu_singleton.len(), ..r.scratch.cu_seqlens.buffer }, &cu_singleton)?;
+                            r.programs.mla_dsa_decode.launch(
+                                &[
+                                    r.scratch.query.buffer.ptr,
+                                    kv_cache_buf.ptr,
+                                    r.scratch.idx_cand_slots.buffer.ptr,
+                                    r.scratch.idx_cand_lens.buffer.ptr,
+                                    r.scratch.cu_seqlens.buffer.ptr,
+                                    r.scratch.attn_out.buffer.ptr,
+                                    r.scratch.lse_out.buffer.ptr,
+                                    r.scratch.attn_scratch.buffer.ptr,
+                                ],
+                                &[Scalar::I32(rows as i32), Scalar::I32(rows as i32), Scalar::I64(CANDIDATE_TOPK as i64), Scalar::I32(1)],
+                                r.stream.raw,
+                            )?;
+                        } else {
+                            // SWA-512 circular ring attention
+                            r.device.library.copy_h2d(CuteafdDeviceBuffer { bytes: swa_pt_bytes.len(), ..r.scratch.page_table.buffer }, &swa_pt_bytes)?;
+                            r.device.library.copy_h2d(CuteafdDeviceBuffer { bytes: swa_seqlens_bytes.len(), ..r.scratch.seqlens.buffer }, &swa_seqlens_bytes)?;
+                            r.device.library.copy_h2d(CuteafdDeviceBuffer { bytes: swa_cu_bytes.len(), ..r.scratch.cu_seqlens.buffer }, &swa_cu_bytes)?;
+                            let swa_prog = if rows == 1 { &r.programs.mla_swa_decode } else { &r.programs.mla_swa_extend };
+                            swa_prog.launch(
+                                &[
+                                    r.scratch.query.buffer.ptr,
+                                    kv_cache_buf.ptr,
+                                    r.scratch.page_table.buffer.ptr,
+                                    r.scratch.seqlens.buffer.ptr,
+                                    r.scratch.cu_seqlens.buffer.ptr,
+                                    r.scratch.attn_out.buffer.ptr,
+                                    r.scratch.lse_out.buffer.ptr,
+                                    r.scratch.attn_scratch.buffer.ptr,
+                                ],
+                                &[Scalar::I32(rows as i32), Scalar::I32(1), Scalar::I64(SWA_RING_PAGES as i64), Scalar::I32(1)],
+                                r.stream.raw,
+                            )?;
+                        }
+
+                        sink_uv.launch(
+                            &[
+                                r.scratch.attn_out.buffer.ptr,
+                                w_uv,
+                                r.scratch.gate.buffer.ptr,
+                                r.scratch.lse_out.buffer.ptr,
+                                r.weights.buf(&format!("{p}.self_attn.learnable_sink_param"))?.ptr,
+                                r.scratch.uv_out.buffer.ptr,
+                            ],
+                            &s_rows, r.stream.raw,
+                        )?;
+                        let o_out = if gpus == 1 { r.scratch.delta.buffer.ptr } else { r.scratch.delta_f32.buffer.ptr };
+                        proj_o.launch(
+                            &[r.scratch.uv_out.buffer.ptr, r.weights.buf(&format!("{p}.self_attn.o_proj"))?.ptr, o_out],
+                            &s_rows, r.stream.raw,
+                        )?;
+                    }
+                    Ok(())
+                })?;
+            }
+            self.reduce_tp2_f32_to_bf16(rows, H)?;
+
+            // (C) post_proj_norm + fused attention iHC post + FFN iHC pre + FFN
+            for r in &mut self.ranks {
+                let (r_in, r_out) = if use_a {
+                    (r.scratch.r_a.buffer, r.scratch.r_b.buffer)
+                } else {
+                    (r.scratch.r_b.buffer, r.scratch.r_a.buffer)
+                };
+                let s_rows = [Scalar::I32(rows as i32)];
+                r.device.run(|| {
+                    // SAFETY: all buffers live through stream drain.
+                    unsafe {
+                        let ppn = r.weights.buf(&format!("{p}.self_attn.post_proj_norm.weight"))?.ptr;
+                        r.programs.rms_norm_3072.launch(
+                            &[r.scratch.delta.buffer.ptr, ppn, ppn, ppn, ppn, ppn, r.scratch.delta_norm.buffer.ptr],
+                            &s_rows, r.stream.raw,
+                        )?;
+                        r.programs.ihc_post_pre.launch(
+                            &[
+                                r.scratch.delta_norm.buffer.ptr,
+                                r_in.ptr,
+                                r.scratch.post.buffer.ptr,
+                                r.weights.buf(&format!("{p}.hc_mlp_layer.hc_pre.hc_fn"))?.ptr,
+                                r.weights.buf(&format!("{p}.hc_mlp_layer.hc_pre.hc_scale"))?.ptr,
+                                r.weights.buf(&format!("{p}.hc_mlp_layer.hc_pre.hc_base"))?.ptr,
+                                r.weights.buf(&format!("{p}.post_attention_layernorm.weight"))?.ptr,
+                                r_out.ptr,
+                                r.scratch.post.buffer.ptr,
+                                r.scratch.y.buffer.ptr,
+                            ],
+                            &s_rows, r.stream.raw,
+                        )?;
+
+                        if self.cfg.dense_layer[layer] {
+                            r.programs.proj_dense_gate_up.launch(
+                                &[r.scratch.y.buffer.ptr, r.weights.buf(&format!("{p}.mlp.gate_proj"))?.ptr, r.scratch.ffn_gate.buffer.ptr],
+                                &s_rows, r.stream.raw,
+                            )?;
+                            r.programs.proj_dense_gate_up.launch(
+                                &[r.scratch.y.buffer.ptr, r.weights.buf(&format!("{p}.mlp.up_proj"))?.ptr, r.scratch.ffn_up.buffer.ptr],
+                                &s_rows, r.stream.raw,
+                            )?;
+                            r.programs.post_silu_split_dense.launch(
+                                &[r.scratch.ffn_gate.buffer.ptr, r.scratch.ffn_up.buffer.ptr, r.scratch.ffn_act.buffer.ptr],
+                                &s_rows, r.stream.raw,
+                            )?;
+                            let d_out = if gpus == 1 { r.scratch.delta.buffer.ptr } else { r.scratch.delta_f32.buffer.ptr };
+                            r.programs.proj_dense_down.launch(
+                                &[r.scratch.ffn_act.buffer.ptr, r.weights.buf(&format!("{p}.mlp.down_proj"))?.ptr, d_out],
+                                &s_rows, r.stream.raw,
+                            )?;
+                        } else {
+                            // LatentMoE: router + shared expert + routed experts (EXL3 K4 MUL1 onboarded or skipped)
+                            r.programs.proj_router.launch(
+                                &[r.scratch.y.buffer.ptr, r.weights.buf(&format!("{p}.mlp.gate"))?.ptr, r.scratch.router_logits.buffer.ptr],
+                                &s_rows, r.stream.raw,
+                            )?;
+                            let bias = r.weights.buf(&format!("{p}.mlp.gate.e_score_correction_bias"))?.ptr;
+                            r.device.library.copy_d2d_async(
+                                r.scratch.router_select.buffer,
+                                r.scratch.router_logits.buffer,
+                                rows * EXPERTS * 4,
+                                r.stream.raw,
+                            )?;
+                            r.device.library.router_select(
+                                r.scratch.router_select.buffer.ptr,
+                                bias,
+                                std::ptr::null(),
+                                std::ptr::null(),
+                                r.scratch.route_ids.buffer.ptr,
+                                r.scratch.route_weights.buffer.ptr,
+                                rows,
+                                EXPERTS,
+                                TOPK,
+                                self.cfg.routed_scaling_factor as f32,
+                                true,
+                                r.stream.raw,
+                            )?;
+                            r.programs.route_weights.launch(
+                                &[r.scratch.router_logits.buffer.ptr, bias, r.scratch.route_ids.buffer.ptr, r.scratch.route_weights.buffer.ptr],
+                                &s_rows, r.stream.raw,
+                            )?;
+                            r.programs.proj_latent_down.launch(
+                                &[r.scratch.y.buffer.ptr, r.weights.buf(&format!("{p}.mlp.routed_expert_down_proj"))?.ptr, r.scratch.latent_in.buffer.ptr],
+                                &s_rows, r.stream.raw,
+                            )?;
+                            let grid = r.quantize_grid.blocks(rows, LATENT_H);
+                            r.programs.expert_input_quant.launch(
+                                &[
+                                    r.scratch.latent_in.buffer.ptr,
+                                    r.scratch.wire_in.buffer.ptr,
+                                    r.scratch.wire_in.buffer.ptr.wrapping_byte_add(LATENT_H),
+                                    r.scratch.zero_f32.buffer.ptr,
+                                ],
+                                &[Scalar::I32(rows as i32), Scalar::I32(grid as i32)],
+                                r.stream.raw,
+                            )?;
+
+                            if !self.skip_routed_experts {
+                                if let Some(experts) = &mut r.onboarded_experts {
+                                    experts.enqueue(
+                                        layer,
+                                        rows,
+                                        ExpertInput::Fp8K32(r.scratch.wire_in.buffer.ptr),
+                                        Routes {
+                                            ids: r.scratch.route_ids.buffer.ptr,
+                                            weights: r.scratch.route_weights.buffer.ptr,
+                                        },
+                                        r.stream.raw,
+                                        &mut || (),
+                                    )?;
+                                    let exp_out = CuteafdDeviceBuffer {
+                                        ptr: experts.output(),
+                                        bytes: rows * LATENT_H * 4,
+                                        device_id: r.device.id,
+                                        flags: 0,
+                                    };
+                                    if gpus == 1 {
+                                        r.device.library.cuda_f32_to_bf16_async(
+                                            exp_out,
+                                            r.scratch.routed_latent.buffer,
+                                            rows * LATENT_H,
+                                            r.stream.raw,
+                                        )?;
+                                    } else {
+                                        r.device.library.copy_d2d_async(
+                                            r.scratch.delta_f32.buffer,
+                                            exp_out,
+                                            rows * LATENT_H * 4,
+                                            r.stream.raw,
+                                        )?;
+                                    }
+                                } else {
+                                    anyhow::bail!(
+                                        "layer {layer}: no onboarded hy4f:exl3-k45-mul1 expert package loaded (pass --expert-package or --skip-routed-experts for non-expert diagnostics)"
+                                    );
+                                }
+                            } else {
+                                r.device.library.cuda_zero_bytes_async(r.scratch.routed_latent.buffer, rows * LATENT_H * 2, r.stream.raw)?;
+                                if gpus == 2 {
+                                    r.device.library.cuda_zero_bytes_async(r.scratch.delta_f32.buffer, rows * LATENT_H * 4, r.stream.raw)?;
+                                }
+                            }
+
+                            // Shared expert
+                            r.programs.proj_shared_gate_up.launch(
+                                &[r.scratch.y.buffer.ptr, r.weights.buf(&format!("{p}.mlp.shared_experts.gate_proj"))?.ptr, r.scratch.ffn_gate.buffer.ptr],
+                                &s_rows, r.stream.raw,
+                            )?;
+                            r.programs.proj_shared_gate_up.launch(
+                                &[r.scratch.y.buffer.ptr, r.weights.buf(&format!("{p}.mlp.shared_experts.up_proj"))?.ptr, r.scratch.ffn_up.buffer.ptr],
+                                &s_rows, r.stream.raw,
+                            )?;
+                            r.programs.post_silu_split_shared.launch(
+                                &[r.scratch.ffn_gate.buffer.ptr, r.scratch.ffn_up.buffer.ptr, r.scratch.ffn_act.buffer.ptr],
+                                &s_rows, r.stream.raw,
+                            )?;
+                            let sh_out = if gpus == 1 { r.scratch.shared_out.buffer.ptr } else { r.scratch.delta_peer_f32.buffer.ptr };
+                            r.programs.proj_shared_down.launch(
+                                &[r.scratch.ffn_act.buffer.ptr, r.weights.buf(&format!("{p}.mlp.shared_experts.down_proj"))?.ptr, sh_out],
+                                &s_rows, r.stream.raw,
+                            )?;
+                        }
+                    }
+                    Ok(())
+                })?;
+            }
+            use_a = !use_a;
+
+            if self.cfg.dense_layer[layer] {
+                self.reduce_tp2_f32_to_bf16(rows, H)?;
+            } else {
+                // On TP2, reduce routed latent (1536) and shared expert (3072) across ranks before latent_up + combine.
+                if gpus == 2 {
+                    self.reduce_tp2_f32_to_bf16(rows, LATENT_H)?;
+                    for r in &self.ranks {
+                        r.device.run(|| unsafe {
+                            r.device.library.copy_d2d_async(r.scratch.routed_latent.buffer, r.scratch.delta.buffer, rows * LATENT_H * 2, r.stream.raw)?;
+                            r.device.library.copy_d2d_async(r.scratch.delta_f32.buffer, r.scratch.delta_peer_f32.buffer, rows * H * 4, r.stream.raw)
+                        })?;
+                    }
+                    self.reduce_tp2_f32_to_bf16(rows, H)?;
+                    for r in &self.ranks {
+                        r.device.run(|| unsafe {
+                            r.device.library.copy_d2d_async(r.scratch.shared_out.buffer, r.scratch.delta.buffer, rows * H * 2, r.stream.raw)
+                        })?;
+                    }
+                }
+                for r in &self.ranks {
+                    let s_rows = [Scalar::I32(rows as i32)];
+                    r.device.run(|| unsafe {
+                        r.programs.proj_latent_up.launch(
+                            &[r.scratch.routed_latent.buffer.ptr, r.weights.buf(&format!("{p}.mlp.routed_expert_up_proj"))?.ptr, r.scratch.routed_out.buffer.ptr],
+                            &s_rows, r.stream.raw,
+                        )?;
+                        r.bf16_add.launch(r.scratch.routed_out.buffer, r.scratch.shared_out.buffer, r.scratch.delta.buffer, rows * H, r.stream.raw)
+                    })?;
+                }
+            }
+
+            // (D) Post-FFN norm (`post_fc2_norm` on dense layer 0, `combine_output_norm` on MoE) + FFN iHC post
+            let ffn_norm_name = if self.cfg.dense_layer[layer] {
+                format!("{p}.mlp.post_fc2_norm.weight")
+            } else {
+                format!("{p}.mlp.combine_output_norm.weight")
+            };
+            for r in &self.ranks {
+                let (r_in, r_out) = if use_a {
+                    (r.scratch.r_a.buffer, r.scratch.r_b.buffer)
+                } else {
+                    (r.scratch.r_b.buffer, r.scratch.r_a.buffer)
+                };
+                let s_rows = [Scalar::I32(rows as i32)];
+                r.device.run(|| unsafe {
+                    let nw = r.weights.buf(&ffn_norm_name)?.ptr;
+                    r.programs.rms_norm_3072.launch(
+                        &[r.scratch.delta.buffer.ptr, nw, nw, nw, nw, nw, r.scratch.delta_norm.buffer.ptr],
+                        &s_rows, r.stream.raw,
+                    )?;
+                    r.programs.ihc_post.launch(
+                        &[r.scratch.delta_norm.buffer.ptr, r_in.ptr, r.scratch.post.buffer.ptr, r_out.ptr],
+                        &s_rows, r.stream.raw,
+                    )
+                })?;
+            }
+            use_a = !use_a;
+        }
+
+        self.committed_pos = pos_end;
+
+        if last_layer + 1 < self.cfg.layers {
+            for r in &self.ranks {
+                r.stream.drain()?;
+            }
+            return Ok(Vec::new());
+        }
+
+        // Terminal hc_head + final RMSNorm + FP32 vocabulary head (sharded across TP2 if 2 GPUs).
+        let vocab = self.cfg.vocab_size;
+        let mut all_logits = vec![0f32; rows * vocab];
+        let mut r_host_tiles: Vec<Vec<f32>> = vec![Vec::new(); gpus];
+        for (rank_idx, r) in self.ranks.iter().enumerate() {
+            let r_cur = if use_a { r.scratch.r_a.buffer } else { r.scratch.r_b.buffer };
+            let head = r.weights.head.as_ref().context("missing VocabularyHead")?;
+            let lm_head_w = r.weights.buf("lm_head")?;
+            r.device.run(|| unsafe {
+                r.programs.hc_head.launch(
+                    &[
+                        r_cur.ptr,
+                        r.weights.buf("model.hc_head.hc_head_fn")?.ptr,
+                        r.weights.buf("model.hc_head.hc_head_scale")?.ptr,
+                        r.weights.buf("model.hc_head.hc_head_base")?.ptr,
+                        r.weights.buf("model.norm.weight")?.ptr,
+                        r.scratch.y.buffer.ptr,
+                    ],
+                    &[Scalar::I32(rows as i32)],
+                    r.stream.raw,
+                )
+            })?;
+            let local_v = r.weights.local_vocab;
+            let mut rank_logits = vec![0f32; rows * local_v];
+            for start in (0..rows).step_by(64) {
+                let count = (rows - start).min(64);
+                let x_ptr = r.scratch.y.buffer.ptr.cast::<u8>().wrapping_add(start * H * 2).cast();
+                r.device.run(|| unsafe {
+                    target_head::launch(
+                        TargetHead::configured(),
+                        head,
+                        x_ptr,
+                        lm_head_w.ptr,
+                        r.scratch.logits_tile.buffer.ptr.cast(),
+                        count,
+                        r.stream.raw,
+                    )
+                })?;
+                r.stream.drain()?;
+                let bytes = count * local_v * 4;
+                let mut tile_bytes = vec![0u8; bytes];
+                r.device.run(|| {
+                    r.device.library.copy_d2h(&mut tile_bytes, CuteafdDeviceBuffer { bytes, ..r.scratch.logits_tile.buffer })
+                })?;
+                for (i, chunk) in tile_bytes.chunks_exact(4).enumerate() {
+                    rank_logits[start * local_v + i] = f32::from_le_bytes(chunk.try_into().unwrap());
+                }
+            }
+            r_host_tiles[rank_idx] = rank_logits;
+        }
+        for row in 0..rows {
+            for (rank_idx, r) in self.ranks.iter().enumerate() {
+                let local_v = r.weights.local_vocab;
+                let dst_off = row * vocab + rank_idx * local_v;
+                let src_off = row * local_v;
+                all_logits[dst_off..dst_off + local_v]
+                    .copy_from_slice(&r_host_tiles[rank_idx][src_off..src_off + local_v]);
+            }
+        }
+        Ok(all_logits)
+    }
+
+    /// Return the active 4-stream residual `[rows, 4, H]` F32 from rank 0 (for layer-0 boundary checks).
+    pub(crate) fn read_residual_f32(&self, rows: usize) -> Result<Vec<f32>> {
+        let r0 = &self.ranks[0];
+        r0.stream.drain()?;
+        let bytes = rows * HC * H * 2;
+        let mut raw = vec![0u8; bytes];
+        r0.device.run(|| {
+            r0.device.library.copy_d2h(&mut raw, CuteafdDeviceBuffer { bytes, ..r0.scratch.r_a.buffer })
+        })?;
+        Ok(raw
+            .chunks_exact(2)
+            .map(|b| f32::from_bits(u32::from(u16::from_le_bytes([b[0], b[1]])) << 16))
+            .collect())
+    }
+}
