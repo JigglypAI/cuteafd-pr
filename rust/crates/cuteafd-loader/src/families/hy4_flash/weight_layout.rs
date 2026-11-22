@@ -42,7 +42,13 @@ pub fn core_split(stem: &str) -> CoreSplit {
                 _ => CoreSplit::Whole,
             };
         }
-        if stem.contains(".mlp.shared_experts.") || (stem.contains(".mlp.") && !stem.contains(".experts.") && !stem.contains("routed_expert_") && !stem.contains(".mlp.gate")) {
+        if stem.contains(".mlp.shared_experts.")
+            || (stem.contains(".mlp.")
+                && !stem.contains(".experts.")
+                && !stem.contains("routed_expert_")
+                && !stem.ends_with(".mlp.gate")
+                && !stem.contains(".mlp.gate."))
+        {
             return match leaf {
                 "gate_proj" | "up_proj" => CoreSplit::Output,
                 "down_proj" => CoreSplit::Input,

@@ -308,6 +308,8 @@ impl Hy4FlashConfig {
             .context("Hy4-flash config lacks engram_seed")?;
         let engram_fp8_embedding = v["engram_fp8_embedding"].as_bool()
             .context("Hy4-flash config lacks engram_fp8_embedding")?;
+        ensure!(engram_fp8_embedding,
+            "Hy4-flash requires text_config.engram_fp8_embedding=true (both engram_fp8 and BF16 fallback apply FP8 QDQ)");
         let engram_lookup_table_size = v.get("engram_lookup_table_size")
             .and_then(Value::as_u64)
             .map(|n| n as usize)
@@ -430,8 +432,11 @@ impl Hy4FlashConfig {
         [self.image_token_id, self.video_token_id, self.engram_pad_id]
     }
 
-    pub fn activation(&self) -> cuteafd_core::FfnActivation {
-        cuteafd_core::FfnActivation::SiluBf16Product { limit: Some(self.swiglu_limit as f32) }
+    /// SwiGLU clamp (`swiglu_limit`) applies to routed experts only; dense layer 0
+    /// and shared experts are unclamped (matches `python/reference/families/hy4_flash/model.py`).
+    pub fn activation(&self, layer: usize, shared: bool) -> cuteafd_core::FfnActivation {
+        let limit = (!self.dense_layer[layer] && !shared).then_some(self.swiglu_limit as f32);
+        cuteafd_core::FfnActivation::SiluBf16Product { limit }
     }
 
     pub fn release_geometry(&self) -> Result<()> {

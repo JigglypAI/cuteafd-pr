@@ -27,7 +27,8 @@ pub const ENGRAM_EMBED_WIDTH: usize = 96;
 pub const ENGRAM_FP8_ROW_BYTES: usize = 100;
 /// Bytes per row in the standard BF16 table (`96 * 2`).
 pub const ENGRAM_BF16_ROW_BYTES: usize = ENGRAM_EMBED_WIDTH * 2;
-const DEFAULT_CACHE_SHARES: [usize; 2] = [4096, 1024];
+/// Default per-layer `RowCache` shares (hot + probation = 5120 rows).
+pub const DEFAULT_CACHE_SHARES: [usize; 2] = [4096, 1024];
 
 // ---------------------------------------------------------------------------
 // Pure-Rust NumPy SeedSequence + PCG64 + Lemire bounded uint64
@@ -455,6 +456,11 @@ impl Hy4EngramTable {
     /// # Safety
     /// Checkpoint shard files must remain immutable while this table is mapped.
     pub unsafe fn open(checkpoint: &Checkpoint, cfg: &Hy4FlashConfig, layer: usize) -> Result<Self> {
+        ensure!(
+            cfg.engram_head_width() == ENGRAM_EMBED_WIDTH,
+            "Hy4-flash Engram head width {} differs from expected {ENGRAM_EMBED_WIDTH}",
+            cfg.engram_head_width()
+        );
         let expected_rows = cfg.engram_rows(layer)
             .with_context(|| format!("Hy4-flash layer {layer} is not an Engram layer"))?;
         if let Some(engram_fp8) = checkpoint.view.as_ref().and_then(|v| v.engram_fp8()) {
@@ -575,8 +581,10 @@ pub fn read_lookup_table(checkpoint: &Checkpoint, layer: usize, expected_len: us
 }
 
 /// Total on-disk Engram table bytes across all declared layers for the active storage mode.
+/// Cross-checks `cuteafd-mc.json`'s `engram_fp8.total_bytes()` when present (fail-closed).
 pub fn mapped_engram_bytes(checkpoint: &Checkpoint, cfg: &Hy4FlashConfig) -> Result<(Hy4EngramStorage, u64, BTreeMap<usize, u64>)> {
-    let storage = if checkpoint.view.as_ref().and_then(|v| v.engram_fp8()).is_some() {
+    let engram_fp8 = checkpoint.view.as_ref().and_then(|v| v.engram_fp8());
+    let storage = if engram_fp8.is_some() {
         Hy4EngramStorage::Fp8Strided
     } else {
         Hy4EngramStorage::Bf16Fallback
@@ -588,6 +596,14 @@ pub fn mapped_engram_bytes(checkpoint: &Checkpoint, cfg: &Hy4FlashConfig) -> Res
         let bytes = rows.checked_mul(storage.row_bytes() as u64).context("engram bytes overflow")?;
         per_layer.insert(layer, bytes);
         total = total.checked_add(bytes).context("total engram bytes overflow")?;
+    }
+    if let Some(fp8) = engram_fp8 {
+        let declared = fp8.total_bytes().context("invalid cuteafd-mc.json engram_fp8 byte total")?;
+        ensure!(
+            declared == total,
+            "cuteafd-mc.json engram_fp8 total bytes ({declared}) differs from config rows * {} ({total})",
+            storage.row_bytes()
+        );
     }
     Ok((storage, total, per_layer))
 }

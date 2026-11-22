@@ -164,6 +164,7 @@ pub(crate) fn catalog_owner_bytes(catalog: &crate::OfficialV41Catalog, family: &
     let package_family = match family {
         "glm5" => "glm", "glm5_flash" => "glmf", "kimi_k3" | "kimi_k31" => "kimik3",
         "muse_spark" => "muse", "mistral_large4" => "ml4", "deepseek_v4" => "dsv4p",
+        "hy4_flash" => "hy4f",
         other => other,
     };
     let exl3 = catalog.exl3().context("EXL3 worker needs its catalog")?;

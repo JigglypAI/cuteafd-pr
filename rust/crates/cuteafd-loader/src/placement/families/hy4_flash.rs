@@ -29,10 +29,9 @@ pub const DECODE_ROWS: u32 = 64;
 const WHOLE: LayerMode = LayerMode::Whole { gpu: 0, ffn: FfnMode::Owner };
 
 /// Supported coordinator attention placements for Hy4-flash:
-/// - `heads` (default on 2 GPUs): 16 DSA / 32 SWA heads per GPU; KV pages replicated
-///   or context-split; SWA rings split/replicated cleanly; TP2 routed experts split 768+768.
-/// - `context`: head-split projections with page-parity DSA KV across GPUs.
-/// - `layers`: contiguous whole-layer halves (21/21, one boundary hop).
+/// - `context` (default on 2 GPUs): head-split SWA + context-split DSA (page-parity KV across GPUs, zero KV replication).
+/// - `layers`: contiguous whole-layer halves (21/21, one boundary hop, zero KV replication).
+/// - `heads`: explicit opt-in head-split across both GPUs (replicates DSA KV).
 pub const HY4_FLASH: ExecutorModes = ExecutorModes {
     family: "hy4_flash",
     modes: &[
@@ -42,7 +41,7 @@ pub const HY4_FLASH: ExecutorModes = ExecutorModes {
         LayerMode::Whole { gpu: 1, ffn: FfnMode::Owner },
     ],
     hops: true,
-    attention: AttentionPlacement::Heads,
+    attention: AttentionPlacement::Context,
 };
 
 pub fn layer_modes(cfg: &Hy4FlashConfig, gpus: usize, placement: AttentionPlacement) -> Vec<LayerMode> {
@@ -154,11 +153,11 @@ pub struct Hy4Inputs {
     pub code: Vec<u64>,
     pub graph_reserve: Vec<u64>,
     pub host_prefix: serving::HostPrefixOwners,
-    /// Host-mapped Engram tables (61.47 GiB FP8 strided default, or 118.02 GiB BF16 fallback),
+    /// Host-mapped Engram preload policy (`MappedPlacement`, 61.47 GiB FP8 strided default or 118.02 GiB BF16),
     /// charged strictly to raptor host RAM (never GPU memory).
-    pub engram_table_bytes: u64,
-    /// Host mapped-table staging + reactor + row-cache bytes (4 Engram layers).
-    pub engram_host_bytes: u64,
+    pub engram_mapped: crate::formats::mapped_preload::MappedPlacement,
+    /// Measured per-layer `RowCache` host bytes (`4 * RowCache::host_bytes(row_bytes, DEFAULT_CACHE_SHARES)`).
+    pub engram_row_cache_bytes: u64,
     pub resident_weight_limit: Option<ResidentWeights>,
 }
 
@@ -652,25 +651,35 @@ impl Recipe for Hy4Inputs {
             }
             .components(maximum)?,
         );
-        // Host-mapped Engram tables (61.5 GiB FP8 strided default, or 118.0 GiB BF16 fallback)
-        // charged strictly to raptor host RAM (never GPU memory).
+        // Real measured host Engram owners (never GPU memory):
+        // 1. Preloaded tables via MappedPlacement (`mapped-tables/preloaded (coordinator local)`)
+        // 2. Shared table-read reactor workspace (`table_reactor_workspace_bytes`) for any mapped tables
+        // 3. Per-layer `RowCache` (`RowCache::host_bytes(row_bytes, DEFAULT_CACHE_SHARES)`)
         components.extend(buffer(
-            "hy4_flash.engram.tables",
+            "hy4_flash.engram.preloaded",
             Location::HOST,
-            self.engram_table_bytes,
+            self.engram_mapped.preloaded_bytes,
             Lifetime::RESIDENT,
             Category::Tables,
-            "Hy4-flash host-mapped Engram tables",
+            "mapped-tables/preloaded (coordinator local)",
             maximum,
         ));
-        // Host Engram mapped-table staging + reactor + bounded row cache.
         components.extend(buffer(
-            "hy4_flash.engram.host_staging",
-            Location::PINNED,
-            self.engram_host_bytes,
+            "hy4_flash.engram.reactor",
+            Location::HOST,
+            crate::formats::mapped_table::table_reactor_workspace_bytes(self.engram_mapped.mapped) as u64,
             Lifetime::RESIDENT,
-            Category::Staging,
-            "Hy4-flash Engram mapped-table staging and reactor",
+            Category::Workspace,
+            "workspace/table-read-reactor",
+            maximum,
+        ));
+        components.extend(buffer(
+            "hy4_flash.engram.row_cache",
+            Location::HOST,
+            self.engram_row_cache_bytes,
+            Lifetime::RESIDENT,
+            Category::Workspace,
+            "hy4_flash/engram-row-cache",
             maximum,
         ));
 

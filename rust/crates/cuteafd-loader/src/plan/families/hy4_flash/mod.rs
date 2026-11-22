@@ -67,6 +67,7 @@ pub(super) struct Model {
 impl Model {
     fn open(checkpoint: &Checkpoint) -> Result<Self> {
         let cfg = Hy4FlashConfig::from_hf(&checkpoint.config)?;
+        cfg.release_geometry()?;
         let dfly = Hy4DflyConfig::from_hf(&checkpoint.config, &cfg)?;
         let vision = Hy4VisionConfig::from_hf(&checkpoint.config)?;
         let (h, v, hc) = (cfg.hidden, cfg.vocab_size, cfg.hc_mult);
@@ -484,8 +485,7 @@ impl Family for Hy4Flash {
         matches!(component, Component::Vision | Component::Speculator)
     }
     fn expert_catalog(&self) -> bool {
-        // Routed MUL1 catalog support arrives with #2538; enabled once merged.
-        false
+        true
     }
 }
 
@@ -493,8 +493,8 @@ impl FamilyModel for Model {
     fn spec(&self) -> &ModelSpec { &self.spec }
     fn contract_admission(&self) -> bool { true }
     fn native_serving_admission(&self) -> bool { false }
-    fn activation(&self, layer: usize, _shared: bool) -> Option<cuteafd_core::FfnActivation> {
-        (layer < self.cfg.layers).then(|| self.cfg.activation())
+    fn activation(&self, layer: usize, shared: bool) -> Option<cuteafd_core::FfnActivation> {
+        (layer < self.cfg.layers).then(|| self.cfg.activation(layer, shared))
     }
     fn accepts(&self, role: &TensorRole, stem: &str, operand: &mut QuantOperand) -> Result<(), String> {
         // Selected EXL3 compact core projections (K8/K6 MUL1 or MCG) on target and DFly2.
@@ -574,13 +574,20 @@ impl FamilyModel for Model {
     }
     fn experts(&self, operand: &QuantOperand) -> Option<ExpertContract> {
         match operand.encoding {
-            Encoding::Exl3 { bits: 4 } => Some(ExpertContract {
-                package: "hy4f:exl3-k45".into(),
-                block: 128,
-                // 1536 / 128 = 12 blocks -> divides evenly across TP2/3/4/6.
-                spark_worlds: vec![2, 3, 4, 6],
-                local: Ok("Hy4-flash RTX EXL3 K4 MUL1 onboarding (whole 1x or TP2 768+768)".into()),
-            }),
+            Encoding::Exl3 { bits: 4 } => {
+                let is_mul1 = operand.companions.iter().any(|c| c == "mul1");
+                Some(ExpertContract {
+                    package: if is_mul1 { "hy4f:exl3-k45-mul1".into() } else { "hy4f:exl3-k45".into() },
+                    block: 128,
+                    // 1536 / 128 = 12 blocks -> matches spark-package-ranges.json hy4f:exl3 worlds 1..=6.
+                    spark_worlds: vec![1, 2, 3, 4, 5, 6],
+                    local: if is_mul1 {
+                        Ok("Hy4-flash RTX EXL3 K4 MUL1 onboarding (whole 1x or TP2 768+768)".into())
+                    } else {
+                        Err("Hy4-flash routed experts ship MUL1 only; MCG has no hy4f package".into())
+                    },
+                })
+            }
             _ => None,
         }
     }
