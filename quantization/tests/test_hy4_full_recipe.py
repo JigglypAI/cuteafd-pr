@@ -36,3 +36,27 @@ def test_selective_bf16_residual_read_is_bitwise_exact(tmp_path):
     restored = store.fields("layer-boundary", 0, ("state",))["state"]
     assert restored.dtype == torch.bfloat16
     assert torch.equal(restored.view(torch.int16), residual.view(torch.int16))
+
+
+def test_full_hy4_gate_recovery_is_bound_to_the_failed_receipt(tmp_path):
+    from hashlib import sha256
+    import json
+    from hy4.gates import check_recovery
+
+    directory = tmp_path / "gates"
+    directory.mkdir()
+    gate = directory / "target-005.json"
+    gate.write_text(json.dumps({"projections": [{"module": "test", "heldout_passed": True}]}))
+    check_recovery(tmp_path, "target-005")
+    gate.write_text(json.dumps({"projections": [{"module": "test", "heldout_passed": False}]}))
+    with pytest.raises(ValueError, match="needs review"):
+        check_recovery(tmp_path, "target-005")
+    (tmp_path / "recoveries").mkdir()
+    (tmp_path / "recoveries" / gate.name).write_text(json.dumps({
+        "gate_sha256": sha256(gate.read_bytes()).hexdigest(),
+        "action": "apply-recorded-fallback", "diagnosis": "retain this projection in BF16",
+    }))
+    check_recovery(tmp_path, "target-005")
+    gate.write_text(json.dumps({"projections": [{"module": "different", "heldout_passed": False}]}))
+    with pytest.raises(ValueError, match="needs review"):
+        check_recovery(tmp_path, "target-005")

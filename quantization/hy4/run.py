@@ -4,6 +4,7 @@ from __future__ import annotations
 from hy4_flash import run as shared
 from . import forward, recipe
 from .export import DirectMCWriter, verify_original_discovery
+from .gates import check_recovery
 from .parity import verify_preflight
 from .prepare_corpus import load_token_batches
 from .source import HeaderSource
@@ -12,7 +13,7 @@ from .source import HeaderSource
 def identity(source, corpus, preflight):
     code = (*shared.CODE, "quantization/hy4_family_source.py",
             *(f"quantization/hy4/{name}.py" for name in
-              ("run", "recipe", "forward", "parity", "source", "prepare_corpus", "export")))
+              ("run", "recipe", "forward", "parity", "source", "prepare_corpus", "export", "gates")))
     return shared.identity(source, corpus, preflight, model_recipe=recipe, code=code,
                            check=verify_preflight, extra=dict(rope="adjacent-pair-mla-and-indexer",
                            residual_storage="bf16", expert_input="full-post-attention-norm"))
@@ -30,6 +31,13 @@ class Runner(shared.Runner):
     use_expert_latent = False
     persist_projected_routes = False
     store_attention_residual = False
+
+    def save_gate(self, label, metrics, tick, **fields):
+        extra = fields.setdefault("extra", {})
+        if any(r.get("heldout_passed") is False for r in metrics) or extra.get("published_k6_drafter_bits") == 8:
+            extra.setdefault("status", "failed-review-recorded-fallback")
+        super().save_gate(label, metrics, tick, **fields)
+        check_recovery(self.root, label)
 
     def __init__(self, args):
         super().__init__(args)
