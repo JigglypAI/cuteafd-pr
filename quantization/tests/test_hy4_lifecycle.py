@@ -46,24 +46,28 @@ def test_hy4_publication_rejects_f32_only_or_changed_engram_proof(tmp_path):
 
 @pytest.fixture
 def published(tmp_path):
+    return publication_fixture(tmp_path, handoff.FLASH, PINS)
+
+
+def publication_fixture(tmp_path, layout, pins):
     root, output, source, managed = (tmp_path / n for n in ('production', 'package', 'source', 'managed'))
     for p in (root, output, source):
         p.mkdir()
     files = {}
-    for name in (*PINS, *(f'weight-{i:02d}.safetensors' for i in range(8))):
+    for name in (*pins, *(f'weight-{i:02d}.safetensors' for i in range(8))):
         path = output / name
         contents = name.encode().ljust(100, b'0')
         path.write_bytes(contents)
         files[name] = dict(path=str(path), bytes=len(contents), sha256=sha256(contents).hexdigest(),
                            git_blob=None, hub_oid=sha256(contents).hexdigest(), file_identity=file_identity(path), device=path.stat().st_dev)
-    identity = dict(family=publish.FAMILY)
+    identity = dict(family=layout.target.family)
     atomic_json(output / 'package-state.json', dict(identity=identity))
-    metadata = dict(schema=publish.TARGET.schema('complete'), status='passed',
-                    repo_id=publish.TARGET_REPO, revision=REVISION, output=str(output),
+    metadata = dict(schema=layout.target.schema('complete'), status='passed',
+                    repo_id=layout.target.repo_id, revision=REVISION, output=str(output),
                     source_snapshot=str(source), files=files, identity=identity,
                     manifest_sha256=hub.manifest_digest(files))
     atomic_json(root / 'publication-complete.json', metadata)
-    ref = managed / handoff.MODEL / 'refs/main'
+    ref = managed / layout.model / 'refs/main'
     ref.parent.mkdir(parents=True)
     ref.write_text(REVISION)
     keep = ref.parent / handoff.KEEP_REF
@@ -73,7 +77,13 @@ def published(tmp_path):
 
 
 class Native:
-    def __init__(self, files, *, shared_blobs=False):
+    def __init__(self, files, *, shared_blobs=False, layout=handoff.FLASH):
+        self.layout = layout
+        self.pins = PINS if layout.engram else ()
+        self.snapshot = nest.NAMESPACE / layout.model / "snapshots" / REVISION
+        self.blobs = self.snapshot.parent.parent / "blobs"
+        self.ref = self.snapshot.parent.parent / "refs/main"
+        self.keep = self.ref.parent / handoff.KEEP_REF
         self.files = files
         self.shared_blobs = shared_blobs
         self.physical = {}
@@ -81,7 +91,7 @@ class Native:
             oid = row['hub_oid']
             key = sha256(('shared ' + oid).encode()).hexdigest()
             self.physical[name] = (nest.NAMESPACE / 'blobs' / key[:2] / key
-                                   if shared_blobs else BLOBS / oid)
+                                   if shared_blobs else self.blobs / oid)
         self.calls = []
         self.rules = {}
         self.plans = {}
@@ -102,14 +112,14 @@ class Native:
 
     def _plan(self, args):
         assert args[0] == '--place'
-        goal = dict(goal='place', selector='hf:' + publish.TARGET_REPO,
+        goal = dict(goal='place', selector='hf:' + self.layout.target.repo_id,
                     hub=str(nest.NAMESPACE), hosts=list(nest.TARGET_ARGS), factor=1/8, by_speed=False)
-        rows = {name: dict(path=str(self.physical[name]), group=publish.TARGET_REPO, name=name, size=row['bytes'])
+        rows = {name: dict(path=str(self.physical[name]), group=self.layout.target.repo_id, name=name, size=row['bytes'])
                 for name, row in self.files.items()}
         steps = [dict(kind='replicate', host=host, copies=[rows[f'weight-{i:02d}.safetensors']])
                  for i, host in enumerate(nest.TARGETS)]
-        steps[0]['copies'].extend([rows[name] for name in PINS])
-        for ref in (REF, KEEP):
+        steps[0]['copies'].extend([rows[name] for name in self.pins])
+        for ref in (self.ref, self.keep):
             steps[0]['copies'].append(dict(path=str(ref), size=len(REVISION), name=ref.name, group=str(ref.parent)))
         plan = dict(id=1, feasible=True, blocked=[], goal=goal, steps=steps)
         self.plans[plan['id']] = plan
@@ -119,7 +129,7 @@ class Native:
         self.calls.append(args)
         match args:
             case ('hf', 'import', repo, '--offline', '--no-copy'):
-                assert repo.name == handoff.MODEL
+                assert repo.name == self.layout.model
                 return {'job': self._job(len(self.files), what=f'hf import {repo} -> {nest.NAMESPACE}', importing=True)}
             case ('jobs',):
                 return dict(jobs=[result['job'] for result in self.jobs.values()])
@@ -133,7 +143,7 @@ class Native:
             case ('rule', 'set', name, selector, '--hosts', host, '--auto'):
                 assert host == 'raptor'
                 self.rules[name] = dict(name=name, selector=selector, hosts=[host], auto=True,
-                    summary=dict(files=1, bytes=self.files[Path(selector).name]['bytes'], models=[publish.TARGET_REPO]))
+                    summary=dict(files=1, bytes=self.files[Path(selector).name]['bytes'], models=[self.layout.target.repo_id]))
                 return {}
             case ('reconcile', rule):
                 self.placements[Path(self.rules[rule]['selector']).name].add('raptor')
@@ -141,7 +151,7 @@ class Native:
             case ('plan', '--place', *_):
                 return self._plan(args[1:])
             case ('plan', 'skip', number, *paths):
-                assert set(paths) == {self.physical[n] for n in PINS}
+                assert set(paths) == {self.physical[n] for n in self.pins}
                 for step in self.plans[number]['steps']:
                     for row in step['copies']:
                         if Path(row['path']) in paths:
@@ -153,7 +163,7 @@ class Native:
                     plan['steps'][0]['copies'][0]['size'] += 1
                 return plan
             case ('plan', 'apply', number, '--wait'):
-                self.placements = handoff._project(self.plans[number], self.placements, self.files, self.physical)
+                self.placements = handoff._project(self.plans[number], self.placements, self.files, self.physical, self.layout.model)
                 count = sum(not row.get('skip') for step in self.plans[number]['steps'] for row in step['copies'])
                 job = self._job(count, what=f'apply plan {number}', eviction=number == 2)
                 if self.fail_submit:
@@ -163,21 +173,21 @@ class Native:
                     self.fail_wait = None
                     raise TimeoutError('interrupted native job wait')
                 return self.jobs[job]
-            case ('ls', path) if path == SNAPSHOT.parent:
+            case ('ls', path) if path == self.snapshot.parent:
                 return dict(entries=[dict(name=REVISION, kind='directory')])
-            case ('ls', path) if path == REF.parent:
+            case ('ls', path) if path == self.ref.parent:
                 return dict(entries=[dict(name='main', kind='regular', size=len(REVISION),
                                           hosts=sorted(self.placements['refs/main'])), dict(name='keep', kind='directory')])
-            case ('ls', path) if path == KEEP.parent:
-                return dict(entries=[dict(name=KEEP.name, kind='regular', size=len(REVISION),
+            case ('ls', path) if path == self.keep.parent:
+                return dict(entries=[dict(name=self.keep.name, kind='regular', size=len(REVISION),
                                           hosts=sorted(self.placements['refs/' + handoff.KEEP_REF]))])
-            case ('ls', path) if path == SNAPSHOT:
+            case ('ls', path) if path == self.snapshot:
                 return dict(entries=[dict(name=name, kind='symlink', target='../../blobs/' + row['hub_oid'])
                                      for name, row in self.files.items()])
-            case ('ls', path) if path == BLOBS:
+            case ('ls', path) if path == self.blobs:
                 if self.shared_blobs:
                     return dict(entries=[dict(name=row['hub_oid'], kind='symlink',
-                                              target=os.path.relpath(self.physical[name], BLOBS))
+                                              target=os.path.relpath(self.physical[name], self.blobs))
                                          for name, row in self.files.items()])
                 return dict(entries=[dict(name=row['hub_oid'], kind='regular', sealed=True, size=row['bytes'],
                                           hosts=sorted(self.placements[name])) for name, row in self.files.items()])
@@ -318,3 +328,21 @@ def test_hy4_refuses_adoption_eviction_before_any_apply(published):
         handoff.handoff(root, output, root / 'stage', call=call, managed=managed)
     assert not any(args[:2] == ('plan', 'apply') for args in call.calls)
     assert output.is_dir() and not (root / 'handoff-complete.json').exists()
+
+def test_full_hy4_places_once_without_pin_rules(tmp_path, monkeypatch):
+    from hy4.handoff import LAYOUT
+
+    root, output, managed, record = publication_fixture(tmp_path, LAYOUT, ())
+    native = Native(record["files"], shared_blobs=True, layout=LAYOUT)
+    stage = root / "handoff-stage"
+    result = handoff.handoff(root, output, stage, layout=LAYOUT, call=native, managed=managed)
+    assert result["revision"] == REVISION and result["schema"] == "cuteafd-hy4-handoff-complete-v2"
+    assert result["one_fabric_copy_per_file"] and result["distribution_bytes"] == dict.fromkeys(nest.TARGETS, 100)
+    assert result["pinned_files"] == [] and result["pinned_host"] is None and result["pinned_bytes"] == 0
+    assert not any(args[0] in ("rule", "reconcile") for args in native.calls)
+    assert [args for args in native.calls if args[:2] == ("plan", "apply")] == [("plan", "apply", 1, "--wait")]
+    original_retire = nest.retire
+    monkeypatch.setattr(nest, "retire", lambda *a, **kw: original_retire(*a, **kw, inspect=lambda paths: None))
+    receipt = handoff.retire(root, output, layout=LAYOUT)
+    assert receipt["source_and_shared_stores_preserved"]
+    assert (root / "retired-receipts/output/package-state.json").is_file()

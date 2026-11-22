@@ -7,6 +7,7 @@ from pathlib import Path
 import re
 import sys
 
+from core_export import MUL1
 from inkling2 import publish as hub
 
 from . import recipe
@@ -20,23 +21,28 @@ def pinned_files(files):
     return {name for name in files if ENGRAM_FILE.fullmatch(name)}
 
 
-def _validate_package(output, state, validation):
+def validate_mc(output, state, validation, *, repo, revision):
     identity = state['identity']
-    if (identity.get('source_repo') != recipe.BASE_REPO
-            or identity.get('source_revision') != recipe.BASE_REVISION):
+    if (identity.get('source_repo') != repo
+            or identity.get('source_revision') != revision):
         raise ValueError('Hy4 publication requires the pinned source')
     manifest_path = hub.regular(output / 'cuteafd-mc.json')
     if hub.metadata_identity(manifest_path)['sha256'] != validation['new_file_sha256'].get(manifest_path.name):
         raise ValueError('Hy4 manifest differs from package validation')
     manifest = hub.load(manifest_path)
-    if (identity.get('codebook') != 'mul1' or identity.get('codebook_multiplier') != recipe.MUL1_MULTIPLIER
-            or manifest.get('exl3_codebook') != dict(name='mul1', multiplier=recipe.MUL1_MULTIPLIER)):
+    if (identity.get('codebook') != 'mul1' or identity.get('codebook_multiplier') != MUL1
+            or manifest.get('exl3_codebook') != dict(name='mul1', multiplier=MUL1)):
         raise ValueError('Hy4 publication requires the validated MUL1 package')
-    if (manifest.get('source') != dict(repo=recipe.BASE_REPO, revision=recipe.BASE_REVISION)
+    if (manifest.get('source') != dict(repo=repo, revision=revision)
             or manifest.get('original_core_dtype') != 'BF16'):
         raise ValueError('Hy4 publication requires the sealed three-view manifest')
     if {row['name'] for row in manifest['variants']} != {'original', 'k8-compact', 'k6-compact'}:
         raise ValueError('Hy4 publication requires all three core views')
+    return manifest
+
+
+def _validate_package(output, state, validation):
+    manifest = validate_mc(output, state, validation, repo=recipe.BASE_REPO, revision=recipe.BASE_REVISION)
     proof = state.get('engram_fp8_proof', {})
     engram = manifest.get('engram_fp8', {})
     layers = engram.get('layers', [])
@@ -66,18 +72,18 @@ TARGET = hub.PublicationTarget(TARGET_REPO, FAMILY, 'Publish calibrated Hy4-flas
                                _validate_package)
 
 
-def _check_numerical_completion(root, output):
+def _check_numerical_completion(root, output, target=TARGET, revision=recipe.BASE_REVISION):
     complete = hub.load(hub.regular(root / 'numerical-complete.json'))
     state = hub.load(hub.regular(output / 'package-state.json'))
-    identity = dict(complete['identity'], schema='cuteafd-core-package-v1', family=FAMILY)
+    identity = dict(complete['identity'], schema='cuteafd-core-package-v1', family=target.family)
     if (complete.get('status') != 'passed' or complete.get('output') != str(output)
-            or complete.get('repository') != TARGET_REPO or complete.get('revision') != recipe.BASE_REVISION
+            or complete.get('repository') != target.repo_id or complete.get('revision') != revision
             or complete.get('package_validation') != str(output / 'package-validation.json')
             or identity != state['identity']):
         raise ValueError('numerical completion does not match the Hy4 export')
 
 
-def main():
+def run_cli(target, revision):
     from huggingface_hub import HfApi
 
     parser = argparse.ArgumentParser(description=__doc__)
@@ -88,14 +94,18 @@ def main():
     root, output = args.root.resolve(), args.output.absolute()
     token = None
     if not (root / 'publication-complete.json').is_file():
-        _check_numerical_completion(root, output)
+        _check_numerical_completion(root, output, target, revision)
         if sys.stdin.isatty():
             parser.error('provide the write token through stdin')
         token = sys.stdin.readline(1024).strip()
         if not re.fullmatch(r'hf_[A-Za-z0-9]+', token):
             parser.error('the write token on stdin is missing or malformed')
-    result = hub.publish(output, root, api=HfApi(token=token or False), target=TARGET)
+    result = hub.publish(output, root, api=HfApi(token=token or False), target=target)
     print(json.dumps({key: result[key] for key in ('status', 'repo_id', 'revision', 'url')}), flush=True)
+
+
+def main():
+    run_cli(TARGET, recipe.BASE_REVISION)
 
 
 if __name__ == '__main__':
