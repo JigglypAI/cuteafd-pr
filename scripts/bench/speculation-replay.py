@@ -195,24 +195,50 @@ def manifest(job_dir):
     result = json.loads((job_dir / 'result.json').read_text()) if (job_dir / 'result.json').is_file() else {}
     keep = ('MODEL_ID', 'MODEL_REVISION', 'SPECULATOR', 'SPECULATOR_MODEL_ID', 'CORE_VIEW', 'DRAFT_LENGTH',
             'RTX_GPUS', 'SPARK_COUNT', 'GLM5_FLASH_DECODE_ROWS', 'COORDINATOR_DOCKER_INFERENCE')
-    thermal = []
+    thermal, context_points = [], []
     for report in sorted(job_dir.glob('reports/**/report.json')):
         for panel in json.loads(report.read_text()).get('panels', []):
+            if panel.get('id') == 'context_load':
+                for p in panel.get('passes', []):
+                    for point in p.get('points') or []:
+                        context_points.append(dict(context=point.get('context'), c=point.get('c'),
+                            status=point.get('status'), aggregate_tok_s=point.get('aggregate_tok_s'),
+                            reason=point.get('reason') or ((point.get('warm_errors') or [None])[0])))
             for p in panel.get('passes', []):
                 if isinstance(p, dict) and p.get('thermal'):
                     thermal.append(dict(panel=panel.get('id'), thermal=summarize_thermal(p['thermal'])))
+    highest = {}
+    for point in context_points:
+        if point['status'] == 'ok':
+            highest[point['context']] = max(highest.get(point['context'], 0), point['c'] or 0)
     return dict(card=job['card'], family=job['entry']['family'], status=result.get('status'),
-        launcher=result.get('launcher'), artifacts=result.get('artifacts'),
-        settings={k: v for k, v in job['entry']['set'].items() if k in keep}, thermal=thermal)
+        error=result.get('error'), launcher=result.get('launcher'), artifacts=result.get('artifacts'),
+        settings={k: v for k, v in job['entry']['set'].items() if k in keep}, thermal=thermal,
+        context_points=context_points, highest_concurrency_by_context=highest,
+        notes=KNOWN_NOTES.get(job['card'], []))
+
+
+# Known per-card caveats recorded in the dataset manifest.
+KNOWN_NOTES = {
+    'qwen38-exl3-min': ['128K C16 failed: packed prefill of 16 prompts charged full per-member page tables '
+                        '(shared estimate 143K of a 1.12M pool) and left the engine unusable; #2570. '
+                        'Highest level at 128K is C8.'],
+    'muse-spark-exl3-k4-mc-max': ['context_load requests often stop at EOS after 8-100 of 256 tokens; '
+                                  'long-context cells have fewer rounds.'],
+}
 
 
 def summarize_thermal(window):
     """Per-GPU power-cap and thermal seconds, peak temperature and min T.Limit headroom."""
     out = []
     for gpu in (window.get('gpus') or []) if isinstance(window, dict) else []:
-        out.append({k: gpu.get(k) for k in ('index', 'power_cap_s', 'sw_thermal_s', 'hw_thermal_s',
-            'power_brake_s', 'max_temperature_c', 'min_tlimit_margin_c', 'busy_sm_clock_mean_mhz',
-            'min_power_limit_w') if k in gpu})
+        throttle = gpu.get('throttle_s') or {}
+        out.append(dict(index=gpu.get('index'), power_cap_s=throttle.get('sw_power_cap'),
+            sw_thermal_s=throttle.get('sw_thermal'), hw_thermal_s=throttle.get('hw_thermal'),
+            power_brake_s=throttle.get('hw_power_brake'), max_temperature_c=(gpu.get('temperature_c') or {}).get('max'),
+            min_tlimit_margin_c=(gpu.get('tlimit_margin_c') or {}).get('min'),
+            busy_sm_clock_mean_mhz=(gpu.get('busy') or {}).get('sm_clock_mean_mhz'),
+            min_power_limit_w=(gpu.get('power_limit_w') or {}).get('min')))
     return out
 
 
