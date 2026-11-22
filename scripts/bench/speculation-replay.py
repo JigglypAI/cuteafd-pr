@@ -173,8 +173,20 @@ def tidy_job(job_dir):
                 outcome=[p.get('outcome') for p in positions],
                 round_us=times[0], verify_us=times[1] if times[1] is not None else (
                     None if verify_ms is None else int(1000 * verify_ms)), draft_us=times[2]))
+            rows[-1]['score_source'] = score_source(family, positions, features)
             generated[q['id']] += q['accepted_drafts'] + 1
     return rows
+
+
+def score_source(family, positions, features):
+    """Which per-position signal a row's `score` holds."""
+    if any(p.get('head') is not None for p in positions):
+        return 'head (dSpark/trained, calibrated)'
+    if any(p.get('score') is not None for p in positions):
+        return 'raw candidate p (DFlash2 selector)'
+    if features:
+        return 'raw candidate p (cycle features)'
+    return 'history p (position acceptance)'
 
 
 def manifest(job_dir):
@@ -544,6 +556,7 @@ def analyze(rows, weights=None):
     for family, fam_rows in by_family.items():
         fits[family] = fit_cycle(fam_rows)
     cells = []
+    acceptance_rows = acceptance_table(rows)
     for family, fam_rows in by_family.items():
         fit = fits[family]
         if fit is None:
@@ -562,7 +575,13 @@ def analyze(rows, weights=None):
             best = max((k for k in row if k.startswith(('fixed', 'history', 'product', 'marginal'))), key=lambda k: row[k])
             row['best'] = best
             cells.append(row)
-    return dict(fits=fits, cells=cells, acceptance=acceptance_table(rows),
+    sources = {}
+    for r in rows:
+        sources.setdefault(r['family'], collections.Counter())[r.get('score_source') or '?'] += 1
+    sources = {f: c.most_common(1)[0][0] for f, c in sources.items()}
+    for row in acceptance_rows:
+        row['score_source'] = sources.get(row['family'])
+    return dict(fits=fits, cells=cells, sources=sources, acceptance=acceptance_rows,
                 reliability=reliability(rows), mix=traffic_mix(cells, weights))
 
 
@@ -591,7 +610,10 @@ def traffic_mix(cells, weights=None):
 
 def render(result):
     """Markdown tables: cycle curves, replay cells and the traffic mix."""
-    lines = ['## Cycle time (median ms per batch round, by verify rows)', '']
+    src = result.get('sources', {})
+    label = lambda f: f"{f} [{src.get(f, '?')}]"
+    lines = ['## Score source per family', ''] + [f'- {f}: {s}' for f, s in sorted(src.items())]
+    lines += ['', '## Cycle time (median ms per batch round, by verify rows)', '']
     for family, fit in sorted(result['fits'].items()):
         if not fit:
             continue
@@ -605,13 +627,60 @@ def render(result):
     for c in result['cells']:
         if c['rounds'] < 20:
             continue
-        lines.append(f"| {c['family']} | {c['context']} | {c['c']} | {c['rounds']} | {c['truncated']:.2f} | "
+        lines.append(f"| {label(c['family'])} | {c['context']} | {c['c']} | {c['rounds']} | {c['truncated']:.2f} | "
                      + ' | '.join(f"{c[r]:.1f}" for r in rules) + f" | {c['best']} |")
     lines += ['', '## Traffic mix (25% 0, 25% 8K, 30% 32K, 20% 128K)', '', '| Family | ' + ' | '.join(rules) + ' |',
               '|' + '---|' * (len(rules) + 1)]
     for family, row in sorted(result['mix'].items()):
-        lines.append(f'| {family} | ' + ' | '.join('' if row.get(r) is None else f'{row[r]:.1f}' for r in rules) + ' |')
+        lines.append(f'| {label(family)} | ' + ' | '.join('' if row.get(r) is None else f'{row[r]:.1f}' for r in rules) + ' |')
     return '\n'.join(lines) + '\n'
+
+
+CONTEXT_STEPS = {'0': '#86b6ef', '8K': '#5598e7', '32K': '#256abf', '128K': '#104281'}  # one hue, light -> dark
+
+
+def plot_cycles(result, path):
+    """Small multiples, one panel per family on shared axes: median ms per batch round
+    vs verify rows, one line per context band (sequential, light = short)."""
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    fits = {f: fit for f, fit in sorted(result['fits'].items()) if fit and fit.get('table')}
+    n = len(fits)
+    cols = min(5, n)
+    rows = (n + cols - 1) // cols
+    fig, axes = plt.subplots(rows, cols, figsize=(3.2 * cols, 2.7 * rows + 0.6), sharex=False, sharey=True,
+                             squeeze=False, facecolor='#fcfcfb')
+    for ax in axes.flat:
+        ax.set_visible(False)
+    for ax, (family, fit) in zip(axes.flat, fits.items()):
+        ax.set_visible(True)
+        ax.set_facecolor('#fcfcfb')
+        for band in ('0', '8K', '32K', '128K'):
+            curve = fit['table'].get(band)
+            if not curve:
+                continue
+            xs = sorted(x for x in curve if x <= 64)
+            ax.plot(xs, [curve[x] / 1000 for x in xs], color=CONTEXT_STEPS[band], lw=2, marker='o', ms=3,
+                    label=f'{band} context')
+        ax.set_title(family, fontsize=10, color='#0b0b0b', loc='left')
+        ax.grid(True, color='#e6e5e0', lw=0.6)
+        for side in ('top', 'right'):
+            ax.spines[side].set_visible(False)
+        for side in ('left', 'bottom'):
+            ax.spines[side].set_color('#b7b6b0')
+        ax.tick_params(colors='#52514e', labelsize=8)
+        ax.set_xlim(0, 68)
+        ax.set_xticks([0, 16, 32, 48, 64])
+        ax.set_xlabel('verify rows per batch round', fontsize=8, color='#52514e')
+    for ax in axes[:, 0]:
+        ax.set_ylabel('ms per round (median)', fontsize=8, color='#52514e')
+    handles, labels = next(ax for ax in axes.flat if ax.get_visible()).get_legend_handles_labels()
+    fig.suptitle('Round time vs verify rows, by context (DRAFT_LENGTH = native block, dev)', y=0.99,
+                 fontsize=11, color='#0b0b0b')
+    fig.legend(handles, labels, loc='upper center', bbox_to_anchor=(0.5, 0.955), ncol=4, frameon=False, fontsize=9)
+    fig.tight_layout(rect=(0, 0, 1, 0.9))
+    fig.savefig(path, dpi=150)
 
 
 # ---------------------------------------------------------------- CLI
@@ -625,6 +694,7 @@ def main(argv=None):
     a = sub.add_parser('analyze')
     a.add_argument('dataset')
     a.add_argument('--out', required=True)
+    a.add_argument('--plot', action='store_true', help='also write cycle-curves.png (needs matplotlib)')
     args = parser.parse_args(argv)
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
@@ -645,6 +715,8 @@ def main(argv=None):
         result = analyze(rows)
         (out / 'analysis.json').write_text(json.dumps(result, indent=1, default=str))
         (out / 'report.md').write_text(render(result))
+        if args.plot:
+            plot_cycles(result, out / 'cycle-curves.png')
         print(json.dumps({'families': list(result['fits']), 'cells': len(result['cells'])}))
     return 0
 
