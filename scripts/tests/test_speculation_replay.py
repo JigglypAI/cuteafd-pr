@@ -132,7 +132,7 @@ def test_tidy_pairs_shared_scheduler_cycles_with_their_rounds(tmp_path):
                                   'accepted_drafts': 1, 'censored': False,
                                   'positions': [{'p': 1.0, 'head': 0.7, 'calibrated': 0.7, 'outcome': o}
                                                 for o in (True, False, None)]}]}
-    cycle = {'rows': 4, 'seqs': 1, 'contexts': [[33000, 33001, 33002, 33003]], 'verify_ms': 80.0,
+    cycle = {'ids': [1], 'rows': 4, 'seqs': 1, 'contexts': [[33000, 33001, 33002, 33003]], 'verify_ms': 80.0,
              'draft_ms': 2.0, 'cycle_ms': 90.5}
     (job / 'speculation-trace.jsonl').write_text(json.dumps(round_record) + '\n' + json.dumps(cycle) + '\n')
     r = replay.tidy_job(job)[0]

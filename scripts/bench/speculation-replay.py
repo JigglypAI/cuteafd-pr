@@ -118,17 +118,20 @@ def tidy_job(job_dir):
         kind = record.get('type') or record.get('kind')
         if kind == 'draft_round':
             rounds.append(record)
+            cycles.append(None)
         elif kind == 'cycle':  # GLM 5.3: one line per verified sequence
             glm_cycles[record['id']].append(record)
-        elif 'cycle_ms' in record or 'verify_ms' in record:
-            cycles.append(record)
-    # The shared scheduler writes its cycle record after observe: same order, same members.
-    paired = len(cycles) == len(rounds)
+        elif 'cycle_ms' in record and rounds and cycles[-1] is None:
+            # The shared scheduler writes its cycle record right after observe's round record.
+            ids = record.get('ids') or []
+            if sorted(ids) == sorted(q['id'] for q in rounds[-1]['requests']):
+                cycles[-1] = record
+    paired = True
     seen = collections.Counter()  # per-request round counter, for GLM 5.3 cycle lines
     generated = collections.Counter()
     rows = []
     for k, record in enumerate(rounds):
-        cycle = cycles[k] if paired else None
+        cycle = cycles[k]
         times = round_times(record) if 'round_us' in record else (round_times(cycle) if cycle else (None, None, None))
         requests = record['requests']
         contexts = record.get('context')
