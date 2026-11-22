@@ -22,8 +22,12 @@ def packed(module, geometry, bits):
     return values
 
 
+@pytest.mark.parametrize("full", [False, True])
 @pytest.mark.parametrize(('drafter_bits', 'corrupt_expert'), [(6, False), (8, False), (6, True)])
-def test_direct_hy4_engram_and_drafter_indexes(tmp_path, monkeypatch, drafter_bits, corrupt_expert):
+def test_direct_hy4_engram_and_drafter_indexes(tmp_path, monkeypatch, drafter_bits, corrupt_expert, full):
+    from hy4 import export as full_export, recipe as full_recipe
+    writer_cls = full_export.DirectMCWriter if full else export.DirectMCWriter
+    family_recipe = full_recipe if full else recipe
     source = tmp_path / 'source'
     source.mkdir()
     base, draft, expert = 'lm_head', 'model.dfly_layers.0.mlp.down_proj', 'model.layers.1.mlp.experts.0.down_proj'
@@ -31,8 +35,8 @@ def test_direct_hy4_engram_and_drafter_indexes(tmp_path, monkeypatch, drafter_bi
     first = {'in_features': 128, 'out_features': 128, 'stored_out_features': 128, 'bits': 6, 'codebook': 'mul1'}
     selection = {base: dict(first, group='core'), draft: dict(first, group='mtp')}
     experts = {expert: dict(first, bits=4, group='routed')}
-    monkeypatch.setattr(recipe, 'reviewed_core_modules', lambda **_: selection)
-    monkeypatch.setattr(recipe, 'reviewed_expert_modules', lambda: experts)
+    monkeypatch.setattr(family_recipe, 'reviewed_core_modules', lambda **_: selection)
+    monkeypatch.setattr(family_recipe, 'reviewed_expert_modules', lambda: experts)
     monkeypatch.setattr(recipe, 'ENGRAM_TABLES', {table: 2})
     monkeypatch.setattr(engram, 'TABLE_ROWS', {1: 2})
     native = {
@@ -41,6 +45,9 @@ def test_direct_hy4_engram_and_drafter_indexes(tmp_path, monkeypatch, drafter_bi
         table: torch.ones((2, 96), dtype=torch.bfloat16),
         'model.layers.1.engram_layer.lookup_table': torch.zeros((3,), dtype=torch.int32),
     }
+    if full:
+        del native[table]
+        native['model.norm.weight'] = native.pop('model.layers.1.engram_layer.lookup_table')
     weights = source / 'model.safetensors'
     save_file(native, weights)
     header, _ = read_header(weights)
@@ -58,7 +65,7 @@ def test_direct_hy4_engram_and_drafter_indexes(tmp_path, monkeypatch, drafter_bi
                     sigma=.025, code={'fork':'a' * 40}, dataset={'repo_id':'test/panel', 'revision':'b' * 40},
                     components=dict(agentic=dict(count=2, tokens=123),
                                     exl3_standard=dict(count=1, tokens=2048, input_ids_sha256='c' * 64)))
-    writer = export.DirectMCWriter(output, source, identity, inv)
+    writer = writer_cls(output, source, identity, inv)
 
     def write_inputs(filename, tensors):
         path = tmp_path / filename
@@ -75,26 +82,30 @@ def test_direct_hy4_engram_and_drafter_indexes(tmp_path, monkeypatch, drafter_bi
         k4[expert + '.mul1'].zero_()
     shared = write_inputs('k4.safetensors', k4)
     lookup = 'model.layers.1.engram_layer.lookup_table'
+    if full:
+        lookup = 'model.norm.weight'
     shared[lookup] = (weights, lookup)
     writer.write_group('all', shared=shared, original={name + '.weight': (weights, name + '.weight')
         for name in selection}, k8=k8, k6=k6)
-    alt = engram.export_tables(output, {table: weights}, recipe.REFERENCE_REVISION)
+    alt = None if full else engram.export_tables(output, {table: weights}, recipe.REFERENCE_REVISION)
     errors = tmp_path / 'errors.csv'
     errors.write_text('module,bits\n')
     if corrupt_expert:
         with pytest.raises(ValueError, match='MUL1 multiplier differs'):
-            writer.finalize(core_selection=selection, engram=alt, document={'model_type': 'hy_v4_flash'},
+            writer.finalize(core_selection=selection, engram=alt, document={'model_type': 'hy_v4_vl' if full else 'hy_v4_flash'},
                             error_csv=errors, card_path=tmp_path / 'card.md', k6_drafter_bits=drafter_bits)
         return
-    result = writer.finalize(core_selection=selection, engram=alt, document={'model_type': 'hy_v4_flash'},
+    result = writer.finalize(core_selection=selection, engram=alt, document={'model_type': 'hy_v4_vl' if full else 'hy_v4_flash'},
                              error_csv=errors, card_path=tmp_path / 'card.md',
                              k6_drafter_bits=drafter_bits)
     manifest = json.loads((output / 'cuteafd-mc.json').read_bytes())
-    assert manifest['engram_fp8'] == alt['manifest']
+    assert manifest.get('engram_fp8') == (None if full else alt['manifest'])
     assert manifest['exl3_codebook'] == dict(name='mul1', multiplier=recipe.MUL1_MULTIPLIER)
     assert not (output / '.gitattributes').is_symlink() and (output / '.gitattributes').is_file()
     card = (output / 'README.md').read_text()
-    assert '2,171 tokens' in card and '0x83DCD12D' in card
+    assert '0x83DCD12D' in card
+    if not full:
+        assert '2,171 tokens' in card
     for view in export.VIEWS:
         q = json.loads((output / package.mc_manifest.FILES[view][2]).read_text())
         assert q['codebook'] == 'mul1' and q['codebook_multiplier'] == recipe.MUL1_MULTIPLIER
@@ -106,8 +117,9 @@ def test_direct_hy4_engram_and_drafter_indexes(tmp_path, monkeypatch, drafter_bi
     original, k8_map, k6_map = [json.loads((output / package.mc_manifest.FILES[view][0]).read_bytes())['weight_map']
                                 for view in export.VIEWS]
     assert draft + '.weight' in original and draft + '.trellis' not in original
-    assert original[table] == k8_map[table] == k6_map[table] == alt['tables'][table]
+    if not full:
+        assert original[table] == k8_map[table] == k6_map[table] == alt['tables'][table]
     assert (k6_map[draft + '.trellis'] == k8_map[draft + '.trellis']) == (drafter_bits == 8)
-    for part in manifest['engram_fp8']['layers'][0]['parts']:
+    for part in (alt['manifest']['layers'][0]['parts'] if alt else []):
         assert all(part['file'] not in mapping.values() for mapping in (original, k8_map, k6_map))
     assert original[lookup] == k8_map[lookup] == k6_map[lookup]
