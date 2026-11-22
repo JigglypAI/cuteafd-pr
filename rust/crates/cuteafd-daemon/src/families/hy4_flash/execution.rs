@@ -36,7 +36,8 @@ struct RankScratch<'a> {
     ids: Allocation<'a>,
     positions_i64: Allocation<'a>,
     positions_i32: Allocation<'a>,
-    slots_i64: Allocation<'a>,
+    dsa_slots_i64: Allocation<'a>,
+    swa_slots_i64: Allocation<'a>,
     r_a: Allocation<'a>,
     r_b: Allocation<'a>,
     post: Allocation<'a>,
@@ -47,9 +48,9 @@ struct RankScratch<'a> {
     delta_peer_f32: Allocation<'a>,
     delta_sum_f32: Allocation<'a>,
     delta_norm: Allocation<'a>,
-    // Engram
-    engram_raw: Allocation<'a>,
-    engram_masked: Allocation<'a>,
+    // Engram (one staging slot per Engram layer so all 4 upload once before the layer loop)
+    engram_raw: Vec<Allocation<'a>>,
+    engram_masked: Vec<Allocation<'a>>,
     engram_normed: Allocation<'a>,
     engram_val: Allocation<'a>,
     engram_keys: Allocation<'a>,
@@ -65,9 +66,11 @@ struct RankScratch<'a> {
     lse_out: Allocation<'a>,
     uv_out: Allocation<'a>,
     attn_scratch: Allocation<'a>,
-    page_table: Allocation<'a>,
-    seqlens: Allocation<'a>,
-    cu_seqlens: Allocation<'a>,
+    dsa_page_table: Allocation<'a>,
+    swa_page_table: Allocation<'a>,
+    swa_seqlens: Allocation<'a>,
+    dsa_cu_seqlens: Allocation<'a>,
+    swa_cu_seqlens: Allocation<'a>,
     // Indexer
     idx_q_raw: Allocation<'a>,
     idx_q_rot: Allocation<'a>,
@@ -108,6 +111,7 @@ impl<'a> RankScratch<'a> {
         tp: usize,
         max_rows: usize,
         max_pages: usize,
+        engram_count: usize,
         local_vocab: usize,
         attn_scratch_bytes: usize,
         native_layout: Option<&ProjectionScratchLayout>,
@@ -122,11 +126,18 @@ impl<'a> RankScratch<'a> {
         let native = native_layout
             .map(|l| Hy4NativeScratch::allocate(device, l))
             .transpose()?;
+        let mut engram_raw = Vec::with_capacity(engram_count);
+        let mut engram_masked = Vec::with_capacity(engram_count);
+        for _ in 0..engram_count {
+            engram_raw.push(alloc(max_rows * 16 * 96 * 2, "engram-raw")?);
+            engram_masked.push(alloc(max_rows, "engram-masked")?);
+        }
         Ok(Self {
             ids: alloc(max_rows * 4, "ids")?,
             positions_i64: alloc(max_rows * 8, "pos-i64")?,
             positions_i32: alloc(max_rows * 4, "pos-i32")?,
-            slots_i64: alloc(max_rows * 8, "slots-i64")?,
+            dsa_slots_i64: alloc(max_rows * 8, "dsa-slots-i64")?,
+            swa_slots_i64: alloc(max_rows * 8, "swa-slots-i64")?,
             r_a: alloc(max_rows * HC * H * 2, "r-a")?,
             r_b: alloc(max_rows * HC * H * 2, "r-b")?,
             post: alloc(max_rows * HC * 4, "post")?,
@@ -137,8 +148,8 @@ impl<'a> RankScratch<'a> {
             delta_peer_f32: alloc(max_rows * H * 4, "delta-peer-f32")?,
             delta_sum_f32: alloc(max_rows * H * 4, "delta-sum-f32")?,
             delta_norm: alloc(max_rows * H * 2, "delta-norm")?,
-            engram_raw: alloc(max_rows * 16 * 96 * 2, "engram-raw")?,
-            engram_masked: alloc(max_rows, "engram-masked")?,
+            engram_raw,
+            engram_masked,
             engram_normed: alloc(max_rows * 1536 * 2, "engram-normed")?,
             engram_val: alloc(max_rows * H * 2, "engram-val")?,
             engram_keys: alloc(max_rows * HC * H * 2, "engram-keys")?,
@@ -153,9 +164,11 @@ impl<'a> RankScratch<'a> {
             lse_out: alloc(max_rows * max_heads * 4, "lse-out")?,
             uv_out: alloc(max_rows * max_heads * 256 * 2, "uv-out")?,
             attn_scratch: alloc(attn_scratch_bytes, "attn-scratch")?,
-            page_table: alloc(max_rows * max_pages.max(16) * 4, "page-table")?,
-            seqlens: alloc(max_rows * 4, "seqlens")?,
-            cu_seqlens: alloc((max_rows + 1) * 4, "cu-seqlens")?,
+            dsa_page_table: alloc(max_rows * max_pages.max(16) * 4, "dsa-page-table")?,
+            swa_page_table: alloc(max_pages.max(16) * 4, "swa-page-table")?,
+            swa_seqlens: alloc(4, "swa-seqlens")?,
+            dsa_cu_seqlens: alloc((max_rows + 1) * 4, "dsa-cu-seqlens")?,
+            swa_cu_seqlens: alloc(2 * 4, "swa-cu-seqlens")?,
             idx_q_raw: alloc(max_rows * IDX_HEADS * IDX_DIM * 2, "idx-q-raw")?,
             idx_q_rot: alloc(max_rows * IDX_HEADS * IDX_DIM * 2, "idx-q-rot")?,
             idx_w_raw: alloc(max_rows * IDX_HEADS * 2, "idx-w-raw")?,
@@ -296,6 +309,7 @@ pub(crate) struct Hy4Engine<'a> {
     ranks: Vec<RankRuntime<'a>>,
     dsa_index_of: BTreeMap<usize, usize>,
     swa_index_of: BTreeMap<usize, usize>,
+    engram_index_of: BTreeMap<usize, usize>,
     engram_histories: BTreeMap<usize, Hy4EngramHistory>,
     committed_pos: usize,
 }
@@ -353,6 +367,7 @@ impl<'a> Hy4Engine<'a> {
                 gpus,
                 max_rows,
                 max_pages,
+                cfg.engram_layers.len(),
                 weights.local_vocab,
                 attn_scratch,
                 native_layout.as_ref(),
@@ -387,6 +402,13 @@ impl<'a> Hy4Engine<'a> {
             .enumerate()
             .map(|(i, l)| (l, i))
             .collect();
+        let engram_index_of: BTreeMap<usize, usize> = cfg
+            .engram_layers
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(i, l)| (l, i))
+            .collect();
 
         Ok(Self {
             cfg,
@@ -397,6 +419,7 @@ impl<'a> Hy4Engine<'a> {
             ranks,
             dsa_index_of,
             swa_index_of,
+            engram_index_of,
             engram_histories,
             committed_pos: 0,
         })
@@ -520,6 +543,29 @@ impl<'a> Hy4Engine<'a> {
             .collect();
         let swa_seqlens_bytes: Vec<u8> = (pos_end as i32).to_le_bytes().to_vec();
         let swa_cu_bytes: Vec<u8> = [0i32, rows as i32].into_iter().flat_map(i32::to_le_bytes).collect();
+        let limits_bytes: Vec<u8> = (pos_start..pos_end).flat_map(|p| ((p / 4) as i32).to_le_bytes()).collect();
+        // Every DSA layer processes the same token stream in lockstep, so pending/complete_groups match.
+        let pending_common = self.ranks[0].cache.pending_counts[0].first().copied().unwrap_or(0);
+        let complete_groups_common = (pending_common + rows) / 4;
+        let (g_pos_bytes, g_slots_bytes) = if complete_groups_common > 0 {
+            let first_gid = (pos_start - pending_common) / 4;
+            let gp: Vec<u8> = (0..complete_groups_common).flat_map(|g| (((first_gid + g) * 4) as i64).to_le_bytes()).collect();
+            let gs: Vec<u8> = (0..complete_groups_common).flat_map(|g| ((first_gid + g) as i64).to_le_bytes()).collect();
+            (gp, gs)
+        } else {
+            (Vec::new(), Vec::new())
+        };
+
+        // Precompute Engram lookups on host for every Engram layer we will visit.
+        let mut engram_chunks: BTreeMap<usize, (Vec<u8>, Vec<u8>)> = BTreeMap::new();
+        for &layer in &self.cfg.engram_layers {
+            if layer <= last_layer {
+                let hist = self.engram_histories.get_mut(&layer).context("missing engram history")?;
+                let (bf16, masked) = self.engram.lookup_chunk(layer, hist, tokens)?;
+                let raw_bytes: Vec<u8> = bf16.iter().flat_map(|v| v.to_le_bytes()).collect();
+                engram_chunks.insert(layer, (raw_bytes, masked));
+            }
+        }
 
         // Embed on rank 0 into r_a [rows, 4, H] BF16, replicate GPU-to-GPU to rank 1 if TP2.
         {
@@ -544,23 +590,32 @@ impl<'a> Hy4Engine<'a> {
                 )
             })?;
         }
+        // Upload every chunk metadata & Engram staging buffer ONCE on each rank's non-blocking
+        // stream with copy_h2d_ordered (whole admitted destinations, zero stream-0 races).
         for r in &self.ranks {
-            r.device.run(|| {
-                r.device.library.copy_h2d(CuteafdDeviceBuffer { bytes: pos_i64.len(), ..r.scratch.positions_i64.buffer }, &pos_i64)?;
-                r.device.library.copy_h2d(CuteafdDeviceBuffer { bytes: pos_i32.len(), ..r.scratch.positions_i32.buffer }, &pos_i32)?;
+            r.device.run(|| unsafe {
+                let s = r.stream.raw;
+                r.device.library.copy_h2d_ordered(r.scratch.positions_i64.buffer, &pos_i64, s)?;
+                r.device.library.copy_h2d_ordered(r.scratch.positions_i32.buffer, &pos_i32, s)?;
+                r.device.library.copy_h2d_ordered(r.scratch.dsa_slots_i64.buffer, &pos_i64, s)?;
+                r.device.library.copy_h2d_ordered(r.scratch.swa_slots_i64.buffer, &swa_slots_i64, s)?;
+                r.device.library.copy_h2d_ordered(r.scratch.dsa_page_table.buffer, &dsa_pt_bytes, s)?;
+                r.device.library.copy_h2d_ordered(r.scratch.swa_page_table.buffer, &swa_pt_bytes, s)?;
+                r.device.library.copy_h2d_ordered(r.scratch.dsa_cu_seqlens.buffer, &cu_singleton, s)?;
+                r.device.library.copy_h2d_ordered(r.scratch.swa_cu_seqlens.buffer, &swa_cu_bytes, s)?;
+                r.device.library.copy_h2d_ordered(r.scratch.swa_seqlens.buffer, &swa_seqlens_bytes, s)?;
+                r.device.library.copy_h2d_ordered(r.scratch.idx_limits.buffer, &limits_bytes, s)?;
+                if !g_pos_bytes.is_empty() {
+                    r.device.library.copy_h2d_ordered(r.scratch.idx_group_pos.buffer, &g_pos_bytes, s)?;
+                    r.device.library.copy_h2d_ordered(r.scratch.idx_group_slots.buffer, &g_slots_bytes, s)?;
+                }
+                for (&layer, (raw_bytes, masked)) in &engram_chunks {
+                    let slot = self.engram_index_of[&layer];
+                    r.device.library.copy_h2d_ordered(r.scratch.engram_raw[slot].buffer, raw_bytes, s)?;
+                    r.device.library.copy_h2d_ordered(r.scratch.engram_masked[slot].buffer, masked, s)?;
+                }
                 Ok(())
             })?;
-        }
-
-        // Precompute Engram lookups on host for every Engram layer we will visit.
-        let mut engram_chunks: BTreeMap<usize, (Vec<u8>, Vec<u8>)> = BTreeMap::new();
-        for &layer in &self.cfg.engram_layers {
-            if layer <= last_layer {
-                let hist = self.engram_histories.get_mut(&layer).context("missing engram history")?;
-                let (bf16, masked) = self.engram.lookup_chunk(layer, hist, tokens)?;
-                let raw_bytes: Vec<u8> = bf16.iter().flat_map(|v| v.to_le_bytes()).collect();
-                engram_chunks.insert(layer, (raw_bytes, masked));
-            }
         }
 
         let mut use_a = true;
@@ -573,19 +628,17 @@ impl<'a> Hy4Engine<'a> {
             let local_heads = attn.heads / gpus;
 
             // (A) Engram layer (in-place update on active residual stream r_cur)
-            if let Some((raw_bytes, masked)) = engram_chunks.get(&layer) {
+            if let Some(&slot) = self.engram_index_of.get(&layer) {
                 for r in &self.ranks {
                     let r_cur = if use_a { r.scratch.r_a.buffer } else { r.scratch.r_b.buffer };
                     r.device.run(|| {
-                        r.device.library.copy_h2d(CuteafdDeviceBuffer { bytes: raw_bytes.len(), ..r.scratch.engram_raw.buffer }, raw_bytes)?;
-                        r.device.library.copy_h2d(CuteafdDeviceBuffer { bytes: masked.len(), ..r.scratch.engram_masked.buffer }, masked)?;
                         let ep = format!("{p}.engram_layer");
                         let s = [Scalar::I32(rows as i32)];
                         // SAFETY: admitted arena weight views & rank scratch live through stream drain.
                         unsafe {
                             r.programs.engram_head_norm.launch(
                                 &[
-                                    r.scratch.engram_raw.buffer.ptr,
+                                    r.scratch.engram_raw[slot].buffer.ptr,
                                     r.weights.buf(&format!("{ep}.lookup_per_head_norms.packed"))?.ptr,
                                     r.scratch.engram_normed.buffer.ptr,
                                 ],
@@ -610,7 +663,7 @@ impl<'a> Hy4Engine<'a> {
                                     r.weights.buf(&format!("{ep}.norm_query.packed"))?.ptr,
                                     r.weights.buf(&format!("{ep}.unified_pre_gamma"))?.ptr,
                                     r.weights.buf(&format!("{ep}.unified_per_hc_scales.packed"))?.ptr,
-                                    r.scratch.engram_masked.buffer.ptr,
+                                    r.scratch.engram_masked[slot].buffer.ptr,
                                 ],
                                 &s, r.stream.raw,
                             )?;
@@ -625,7 +678,11 @@ impl<'a> Hy4Engine<'a> {
                 let r_cur = if use_a { r.scratch.r_a.buffer } else { r.scratch.r_b.buffer };
                 let s_rows = [Scalar::I32(rows as i32)];
                 let inv_freq = if is_sparse { r.weights.inv_freq_dsa.buffer.ptr } else { r.weights.inv_freq_swa.buffer.ptr };
-                let kv_slots_bytes = if is_sparse { &pos_i64 } else { &swa_slots_i64 };
+                let kv_slots_ptr = if is_sparse {
+                    r.scratch.dsa_slots_i64.buffer.ptr
+                } else {
+                    r.scratch.swa_slots_i64.buffer.ptr
+                };
                 let kv_cache_buf = if is_sparse {
                     r.cache.dsa_kv_layer(self.dsa_index_of[&layer])?
                 } else {
@@ -635,7 +692,6 @@ impl<'a> Hy4Engine<'a> {
                 let dev = r.device;
 
                 dev.run(|| {
-                    r.device.library.copy_h2d(CuteafdDeviceBuffer { bytes: kv_slots_bytes.len(), ..r.scratch.slots_i64.buffer }, kv_slots_bytes)?;
                     // SAFETY: all arena weight views, cache planes, and scratch stay live through stream drain.
                     unsafe {
                         r.programs.ihc_pre.launch(
@@ -671,7 +727,7 @@ impl<'a> Hy4Engine<'a> {
                                 r.scratch.kv_a.buffer.ptr,
                                 r.weights.buf(&format!("{p}.self_attn.q_a_layernorm.weight"))?.ptr,
                                 r.weights.buf(&format!("{p}.self_attn.kv_a_layernorm.weight"))?.ptr,
-                                r.scratch.slots_i64.buffer.ptr,
+                                kv_slots_ptr,
                                 r.scratch.positions_i64.buffer.ptr,
                                 inv_freq,
                                 r.scratch.q_resid.buffer.ptr,
@@ -721,6 +777,10 @@ impl<'a> Hy4Engine<'a> {
                             )?;
 
                             let pending = r.cache.pending_counts[0][dsa_idx];
+                            ensure!(
+                                pending == pending_common,
+                                "Hy4 DSA layer {layer} pending count {pending} diverged from {pending_common}"
+                            );
                             let total_avail = pending + rows;
                             let complete_groups = total_avail / 4;
                             let new_pending = total_avail % 4;
@@ -741,11 +801,6 @@ impl<'a> Hy4Engine<'a> {
                                     ..r.scratch.idx_group_tok.buffer
                                 };
                                 r.device.library.copy_d2d_async(dst_cur, r.scratch.idx_tk.buffer, copy_from_cur * IDX_DIM * 2, r.stream.raw)?;
-                                let first_gid = (pos_start - pending) / 4;
-                                let g_pos: Vec<u8> = (0..complete_groups).flat_map(|g| (((first_gid + g) * 4) as i64).to_le_bytes()).collect();
-                                let g_slots: Vec<u8> = (0..complete_groups).flat_map(|g| ((first_gid + g) as i64).to_le_bytes()).collect();
-                                r.device.library.copy_h2d(CuteafdDeviceBuffer { bytes: g_pos.len(), ..r.scratch.idx_group_pos.buffer }, &g_pos)?;
-                                r.device.library.copy_h2d(CuteafdDeviceBuffer { bytes: g_slots.len(), ..r.scratch.idx_group_slots.buffer }, &g_slots)?;
                                 r.programs.indexer_pool_group.launch(
                                     &[
                                         r.scratch.idx_group_tok.buffer.ptr,
@@ -782,7 +837,6 @@ impl<'a> Hy4Engine<'a> {
                             }
                             r.cache.pending_counts[0][dsa_idx] = new_pending;
 
-                            r.device.library.copy_h2d(CuteafdDeviceBuffer { bytes: dsa_pt_bytes.len(), ..r.scratch.page_table.buffer }, &dsa_pt_bytes)?;
                             let total_groups = pos_end / 4;
                             if pos_end > CANDIDATE_TOPK && total_groups > 0 {
                                 r.programs.proj_indexer_wq_b.launch(
@@ -804,14 +858,12 @@ impl<'a> Hy4Engine<'a> {
                                     ],
                                     &s_rows, r.stream.raw,
                                 )?;
-                                let limits_bytes: Vec<u8> = (pos_start..pos_end).flat_map(|p| ((p / 4) as i32).to_le_bytes()).collect();
-                                r.device.library.copy_h2d(CuteafdDeviceBuffer { bytes: limits_bytes.len(), ..r.scratch.idx_limits.buffer }, &limits_bytes)?;
                                 r.programs.indexer_score_groups.launch(
                                     &[
                                         r.scratch.idx_q_rot.buffer.ptr,
                                         r.scratch.idx_w_out.buffer.ptr,
                                         idx_cache.ptr,
-                                        r.scratch.page_table.buffer.ptr,
+                                        r.scratch.dsa_page_table.buffer.ptr,
                                         r.scratch.idx_limits.buffer.ptr,
                                         r.scratch.idx_scores.buffer.ptr,
                                     ],
@@ -823,21 +875,20 @@ impl<'a> Hy4Engine<'a> {
                                 &[
                                     r.scratch.idx_scores.buffer.ptr,
                                     r.scratch.positions_i32.buffer.ptr,
-                                    r.scratch.page_table.buffer.ptr,
+                                    r.scratch.dsa_page_table.buffer.ptr,
                                     r.scratch.idx_cand_slots.buffer.ptr,
                                     r.scratch.idx_cand_lens.buffer.ptr,
                                 ],
                                 &[Scalar::I32(rows as i32), Scalar::I32(total_groups.max(1) as i32), Scalar::I32(total_pages as i32)],
                                 r.stream.raw,
                             )?;
-                            r.device.library.copy_h2d(CuteafdDeviceBuffer { bytes: cu_singleton.len(), ..r.scratch.cu_seqlens.buffer }, &cu_singleton)?;
                             r.programs.mla_dsa_decode.launch(
                                 &[
                                     r.scratch.query.buffer.ptr,
                                     kv_cache_buf.ptr,
                                     r.scratch.idx_cand_slots.buffer.ptr,
                                     r.scratch.idx_cand_lens.buffer.ptr,
-                                    r.scratch.cu_seqlens.buffer.ptr,
+                                    r.scratch.dsa_cu_seqlens.buffer.ptr,
                                     r.scratch.attn_out.buffer.ptr,
                                     r.scratch.lse_out.buffer.ptr,
                                     r.scratch.attn_scratch.buffer.ptr,
@@ -847,17 +898,14 @@ impl<'a> Hy4Engine<'a> {
                             )?;
                         } else {
                             // SWA-512 circular ring attention
-                            r.device.library.copy_h2d(CuteafdDeviceBuffer { bytes: swa_pt_bytes.len(), ..r.scratch.page_table.buffer }, &swa_pt_bytes)?;
-                            r.device.library.copy_h2d(CuteafdDeviceBuffer { bytes: swa_seqlens_bytes.len(), ..r.scratch.seqlens.buffer }, &swa_seqlens_bytes)?;
-                            r.device.library.copy_h2d(CuteafdDeviceBuffer { bytes: swa_cu_bytes.len(), ..r.scratch.cu_seqlens.buffer }, &swa_cu_bytes)?;
                             let swa_prog = if rows == 1 { &r.programs.mla_swa_decode } else { &r.programs.mla_swa_extend };
                             swa_prog.launch(
                                 &[
                                     r.scratch.query.buffer.ptr,
                                     kv_cache_buf.ptr,
-                                    r.scratch.page_table.buffer.ptr,
-                                    r.scratch.seqlens.buffer.ptr,
-                                    r.scratch.cu_seqlens.buffer.ptr,
+                                    r.scratch.swa_page_table.buffer.ptr,
+                                    r.scratch.swa_seqlens.buffer.ptr,
+                                    r.scratch.swa_cu_seqlens.buffer.ptr,
                                     r.scratch.attn_out.buffer.ptr,
                                     r.scratch.lse_out.buffer.ptr,
                                     r.scratch.attn_scratch.buffer.ptr,
