@@ -19,9 +19,9 @@ import torch.nn.functional as F
 
 from inkling2 import numerical
 from kimi_k3.uniform_k2.storage import atomic_json, fsync_directory, verify_receipt
-from . import gates, recipe
+from . import gates, recipe, forward
 from .export import DirectMCWriter, verify_original_discovery
-from .forward import AttentionTap, Drafter, Layer, Model, Reader, native_projection, recalled_context, reference
+from .forward import native_projection, reference, recalled_context
 from .prepare_corpus import load_token_batches
 from .source import HeaderSource
 from .storage import CANDIDATE_GAMMA_CONTRACT, IDENTITY_CONTRACT, MINIMUM_EXPERT_ROWS, Routes, Stages, candidate_routes
@@ -70,10 +70,10 @@ def verify_preflight(report, corpus_digest):
         raise ValueError("Hy4 requires completed parity on these source files, calibration corpus and references")
 
 
-def identity(source, corpus, preflight):
+def identity(source, corpus, preflight, *, model_recipe=recipe, code=CODE, check=verify_preflight, extra=None):
     if os.environ.get("INKLING_GPTQMODEL_ROOT"):
         raise ValueError("Hy4 production requires the committed GPTQModel pin")
-    if git("status", "--porcelain", "--", *CODE):
+    if git("status", "--porcelain", "--", *code):
         raise ValueError("Hy4 producer files must be committed before production")
     submodule = REPO / "third_party/gptqmodel"
     fork = git("rev-parse", "HEAD", cwd=submodule)
@@ -86,23 +86,23 @@ def identity(source, corpus, preflight):
         raise ValueError("GPTQModel differs from the committed source lock")
     manifest = read_json(corpus / "manifest.json")
     corpus_digest = hashlib.sha256((corpus / "manifest.json").read_bytes()).hexdigest()
-    verify_preflight(preflight, corpus_digest)
-    paths = git("ls-files", "--", *CODE).splitlines()
-    return dict(schema="cuteafd-hy4-causal-mc-v2", source_repo=recipe.BASE_REPO,
-                source_revision=recipe.BASE_REVISION, reference_revision=recipe.REFERENCE_REVISION,
+    check(preflight, corpus_digest)
+    paths = git("ls-files", "--", *code).splitlines()
+    return dict(schema="cuteafd-hy4-causal-mc-v2", source_repo=model_recipe.BASE_REPO,
+                source_revision=model_recipe.BASE_REVISION, reference_revision=model_recipe.REFERENCE_REVISION,
                 source_fingerprints=source.source_fingerprints,
                 corpus_manifest_sha256=corpus_digest,
                 code=dict(fork=fork, files={path: hashlib.sha256((REPO / path).read_bytes()).hexdigest()
                                            for path in paths}),
                 preflight=preflight, dataset=manifest["dataset"], components=manifest["components"],
-                codebook="mul1", codebook_multiplier=recipe.MUL1_MULTIPLIER,
+                codebook="mul1", codebook_multiplier=model_recipe.MUL1_MULTIPLIER,
                 seed=787, sigma=.025, expert_bits=4, core_bits=[8, 6],
                 upstream_core_bits=8, calibration="ieee-fp32-reference",
                 covariance=numerical.ACCUMULATION_CONTRACT,
                 expert_rows=EXPERT_ROWS, expert_group=EXPERT_GROUP, minimum_expert_rows=MINIMUM_EXPERT_ROWS,
                 candidate_gamma=CANDIDATE_GAMMA_CONTRACT, expert_identity=IDENTITY_CONTRACT,
                 replay_weights="serialized-exl3-reconstructed-bf16-promoted-fp32",
-                drafter_anchor="last-committed-target-state-k8-head-greedy-bonus")
+                drafter_anchor="last-committed-target-state-k8-head-greedy-bonus", **(extra or {}))
 
 
 def checkpoint_identity(root, candidate):
@@ -118,9 +118,9 @@ def checkpoint_identity(root, candidate):
 
 
 class Progress:
-    def __init__(self, root, total):
+    def __init__(self, root, total, *, model_recipe=recipe):
         self.root, self.total = root, total
-        self.base = dict(target_layers=recipe.LAYER_COUNT, drafter_layers=recipe.MTP_LAYER_COUNT,
+        self.base = dict(target_layers=model_recipe.LAYER_COUNT, drafter_layers=model_recipe.MTP_LAYER_COUNT,
                          total_encode_operations=total, completed_target_layers=0,
                          completed_drafter_layers=0, committed_encodes=0)
 
@@ -172,29 +172,42 @@ def weights_project(overrides):
 
 
 class Runner:
+    recipe = recipe
+    forward = forward
+    target_gates = gates.TARGET_GATES
+    header_type = HeaderSource
+    writer_type = DirectMCWriter
+    load_batches = staticmethod(load_token_batches)
+    frozen_identity = staticmethod(identity)
+    verify_discovery = staticmethod(verify_original_discovery)
+    use_expert_latent = True
+    persist_projected_routes = True
+    # Flash Engram can modify the residual at attention entry.
+    store_attention_residual = True
+
     def __init__(self, args):
         self.args, self.root = args, args.root.resolve()
         self.output = args.output.resolve()
         self.device = torch.device(args.device)
         self.root.mkdir(parents=True, exist_ok=True)
-        self.header = HeaderSource(args.source)
+        self.header = self.header_type(args.source)
         preflight = read_json(args.preflight)
         self.policy = dict(include_head=True, include_kv_b=True, k6_drafter_bits=6)
-        self.identity = checkpoint_identity(self.root, identity(self.header, args.corpus, preflight))
-        self.core = recipe.reviewed_core_modules(
+        self.identity = checkpoint_identity(self.root, self.frozen_identity(self.header, args.corpus, preflight))
+        self.core = self.recipe.reviewed_core_modules(
             include_head=self.policy["include_head"], include_kv_b=self.policy["include_kv_b"])
-        self.total = len(self.core) * 2 + recipe.EXPERT_MODULE_COUNT
-        self.progress = Progress(self.root, self.total)
+        self.total = len(self.core) * 2 + self.recipe.EXPERT_MODULE_COUNT
+        self.progress = Progress(self.root, self.total, model_recipe=self.recipe)
         self.stages = Stages(self.root / "stages", self.identity)
-        self.writer = DirectMCWriter(self.output, self.header.snapshot, self.identity,
+        self.writer = self.writer_type(self.output, self.header.snapshot, self.identity,
                                      self.header.as_inventory())
         self.records = [r["input_ids"].reshape(-1).cpu()
-                        for r in load_token_batches(args.corpus, split="calibration")]
+                        for r in self.load_batches(args.corpus, split="calibration")]
         if not self.records or any(not len(tokens) for tokens in self.records):
             raise ValueError("Hy4 needs nonempty causal calibration prompts")
         self.calibration_count = len(self.records)
         heldout = [r["input_ids"].reshape(-1).cpu()
-                   for r in load_token_batches(args.corpus, split="heldout")]
+                   for r in self.load_batches(args.corpus, split="heldout")]
         if not heldout or any(not len(tokens) for tokens in heldout):
             raise ValueError("Hy4 production gates need the disjoint agentic held-out split")
         self.records.extend(heldout)
@@ -203,9 +216,9 @@ class Runner:
         for path in (self.root / "gates").glob("*.json"):
             self.native_modules.update(row["module"] for row in read_json(path)["projections"]
                                        if row.get("kept_native"))
-        self.reader = Reader(self.header.snapshot, self.device)
-        self.model = Model(self.reader)
-        self.embedding = self.reader.raw(reference.OUTER_NAMES[0])
+        self.reader = self.forward.Reader(self.header.snapshot, self.device)
+        self.model = self.forward.Model(self.reader)
+        self.embedding = self.reader.raw(self.forward.reference.OUTER_NAMES[0])
         self.frontier_path = self.root / "frontier.json"
         self.frontier = self.load_frontier()
         self.progress.base.update(completed_target_layers=self.frontier["target"],
@@ -219,10 +232,10 @@ class Runner:
         if frontier.pop("identity") != self.identity:
             raise ValueError("Hy4 frontier numerical identity differs")
         target, draft, head = (frontier[key] for key in ("target", "drafter", "head"))
-        if (type(target) is not int or not 0 <= target <= recipe.LAYER_COUNT
-                or type(draft) is not int or not 0 <= draft <= recipe.MTP_LAYER_COUNT
+        if (type(target) is not int or not 0 <= target <= self.recipe.LAYER_COUNT
+                or type(draft) is not int or not 0 <= draft <= self.recipe.MTP_LAYER_COUNT
                 or type(head) is not bool or (draft and not head)
-                or (head and target != recipe.LAYER_COUNT)):
+                or (head and target != self.recipe.LAYER_COUNT)):
             raise ValueError("invalid Hy4 rolling frontier")
         expected = ["initial"] if target == 0 else [f"target-{target - 1:03d}-next"]
         if head:
@@ -259,7 +272,7 @@ class Runner:
         if not names:
             return None
         metrics = []
-        gate = (layer.index in gates.TARGET_GATES or layer.prefix.startswith("model.dfly_layers.")
+        gate = (layer.index in self.target_gates or layer.prefix.startswith("model.dfly_layers.")
                 or not layer.prefix)
         def fit():
             accumulators = [numerical.covariance_accumulator(
@@ -330,7 +343,7 @@ class Runner:
                 for bits in (8, 6):
                     if draft and bits == 6 and self.policy["k6_drafter_bits"] == 8:
                         continue
-                    for suffix in recipe.SUFFIXES:
+                    for suffix in self.recipe.SUFFIXES:
                         key = f"{name}.{suffix}"
                         entries[bits][key] = self.stages.reference(stage, index, f"k{bits}.{key}")
         return entries, metrics
@@ -349,16 +362,16 @@ class Runner:
         return {name: g for name, g in self.core.items() if name not in self.native_modules}
 
     def save_gate(self, label, metrics, tick, **fields):
-        sizes = recipe.size_report(self.header, self.selected_core(),
+        sizes = self.recipe.size_report(self.header, self.selected_core(),
                                    k6_drafter_bits=self.policy["k6_drafter_bits"])
         gates.gate_report(self.root, label, metrics, sizes, time.monotonic() - tick, **fields)
         self.progress.event("production_gate", snapshot=False, group=label,
                             receipt=str(self.root / "gates" / f"{label}.json"))
 
     def source_group(self, prefix, *, exclude=()):
-        original = {recipe.source_tensor(name)[0] for name in self.core if name.startswith(prefix) and name not in self.native_modules}
+        original = {self.recipe.source_tensor(name)[0] for name in self.core if name.startswith(prefix) and name not in self.native_modules}
         native = {name for name in self.header.specs if name.startswith(prefix)}
-        native -= original | set(exclude) | recipe.ENGRAM_TABLES.keys()
+        native -= original | set(exclude) | self.recipe.ENGRAM_TABLES.keys()
         return self.header.source_entries(native), self.header.source_entries(original)
 
     def target(self, index):
@@ -370,13 +383,13 @@ class Runner:
             self.recover_complete_group(label, successor, target=index + 1)
             return
         self.progress.base.update(current_layer=index, expert_projections=0,
-                                  total_expert_projections=recipe.EXPERTS_PER_LAYER * 3 if index else 0)
+                                  total_expert_projections=self.recipe.EXPERTS_PER_LAYER * 3 if index else 0)
         self.progress.event("target_layer")
         layer = self.model.load_layer(index)
         p, a = layer.prefix, layer.prefix + "self_attn."
         overrides = {}
         project = weights_project(overrides)
-        capture = index in recipe.DFLY_TARGET_LAYERS
+        capture = index in self.recipe.DFLY_TARGET_LAYERS
         moe = index > 0
         mlp = p + ("mlp.shared_experts." if moe else "mlp.")
         a_start = label + "-attention-input"
@@ -388,7 +401,10 @@ class Runner:
             for number, values in self.rows(incoming, start=start):
                 tokens = self.records[number].to(self.device)
                 residual, post, inputs = self.model.attention_start(values["state"], tokens, layer)
-                yield number, dict(residual=residual, post=post, inputs=inputs)
+                record = dict(post=post, inputs=inputs)
+                if self.store_attention_residual:
+                    record["residual"] = residual
+                yield number, record
 
         self.save(a_start, attention_input)
         fit_stages.append(self.core_fit(label + "-attn-first", layer, [self.first_names(a)],
@@ -415,8 +431,9 @@ class Runner:
         def attention_finish(start):
             for number, values, output, tap in attention_output(start=start):
                 attended = self.model.attention_finish(output, layer, project)
-                state, post, inputs = self.model.mlp_start(values["residual"], values["post"],
-                                                           attended, layer)
+                residual = values["residual"] if self.store_attention_residual else self.stages.fields(
+                    incoming, number, ("state",), device=self.device)["state"]
+                state, post, inputs = self.model.mlp_start(residual, values["post"], attended, layer)
                 result = dict(state=state, post=post, inputs=inputs)
                 if tap is not None:
                     result.update(kv=tap.kv, rope_key=tap.rope_key, groups=tap.groups)
@@ -428,7 +445,7 @@ class Runner:
             self.save(tap_stage, lambda start: self.stages.records(mlp_stage, keys=("kv", "rope_key", "groups"), start=start))
 
         entry = [mlp + "gate_proj", mlp + "up_proj"]
-        if moe:
+        if moe and self.use_expert_latent:
             entry.append(p + "mlp.routed_expert_down_proj")
         fit_stages.append(self.core_fit(label + "-mlp-first", layer, [entry],
             lambda: ((values["inputs"],) for _, values in self.rows(mlp_stage, "inputs")), overrides))
@@ -446,25 +463,36 @@ class Runner:
                 for number, values in self.rows(mlp_stage, "inputs", start=start):
                     inputs = values["inputs"]
                     config = self.model.config
-                    scores, choice = reference.routing_scores(inputs, layer.weights, config)
-                    ids, gamma = reference.native_routes(scores, choice, config)
-                    latent = layer.project("mlp.routed_expert_down_proj", inputs, project)
+                    scores, choice = self.forward.reference.routing_scores(inputs, layer.weights, config)
+                    ids, gamma = self.forward.reference.native_routes(scores, choice, config)
+                    latent = (layer.project("mlp.routed_expert_down_proj", inputs, project)
+                              if self.use_expert_latent else inputs)
                     record = dict(latent=latent, ids=ids, gamma=gamma)
                     if number < self.calibration_count:
                         near, near_gamma = candidate_routes(scores, choice, ids, config)
                         record.update(candidate_ids=near, candidate_gamma=near_gamma)
                     yield number, record
-            self.save(route_stage, routes)
-            def route_batches(start, stop):
-                for number in range(start, stop):
-                    yield number - start, self.stages.read_batch(route_stage, number)
+            if self.persist_projected_routes:
+                self.save(route_stage, routes)
+                def route_batches(start, stop):
+                    for number in range(start, stop):
+                        yield number - start, self.stages.read_batch(route_stage, number)
+            else:
+                # Full Hy4 routes the already sealed MLP inputs directly.
+                # Fill the device spool once. Only integer routes and weights
+                # cross to the CPU for stable ordering and coverage selection.
+                stream = routes(0)
+                def route_batches(start, stop):
+                    for number, record in islice(stream, stop - start):
+                        yield number - start, {key: value if key == "latent" else value.cpu()
+                                               for key, value in record.items()}
             held = self.calibration_count
             lengths = list(map(len, self.records))
-            spool = Routes(route_batches(0, held), recipe.EXPERTS_PER_LAYER,
+            spool = Routes(route_batches(0, held), self.recipe.EXPERTS_PER_LAYER,
                            sum(lengths[:held]), device=self.device, recover=True)
-            witness = Routes(route_batches(held, len(lengths)), recipe.EXPERTS_PER_LAYER,
+            witness = Routes(route_batches(held, len(lengths)), self.recipe.EXPERTS_PER_LAYER,
                              sum(lengths[held:]), device=self.device)
-            self.expert_witness = gates.ExpertWitness(witness, index, self.model.config.swiglu_limit)
+            self.expert_witness = gates.ExpertWitness(witness, index, self.model.config.swiglu_limit, target_gates=self.target_gates)
             packed, extra_metrics, expert_stages, combined = self.experts(label, layer, spool)
             heldout_combined = self.expert_witness.combined
             del spool, witness
@@ -472,9 +500,10 @@ class Runner:
             def routed_batches():
                 yield from combined.split(lengths[:held])
                 yield from heldout_combined.split(lengths[held:])
-            fit_stages.append(self.core_fit(label + "-latent-up", layer,
-                [(p + "mlp.routed_expert_up_proj",)],
-                lambda: ((rows,) for rows in routed_batches()), overrides))
+            if self.use_expert_latent:
+                fit_stages.append(self.core_fit(label + "-latent-up", layer,
+                    [(p + "mlp.routed_expert_up_proj",)],
+                    lambda: ((rows,) for rows in routed_batches()), overrides))
 
         def finish(start):
             routed = islice(routed_batches(), start, None) if moe else None
@@ -487,13 +516,14 @@ class Runner:
         views, metrics = self.compact_entries(fit_stages)
         metrics += extra_metrics
         self.save_metrics(label, metrics)
-        if index in gates.TARGET_GATES or index in recipe.ENGRAM_ROWS:
-            engram = gates.engram_coverage(self.model.config, layer, self.records[:self.calibration_count])
-            if index in gates.TARGET_GATES:
+        if index in self.target_gates or index in self.recipe.ENGRAM_ROWS:
+            engram = (gates.engram_coverage(self.model.config, layer, self.records[:self.calibration_count])
+                      if index in self.recipe.ENGRAM_ROWS else None)
+            if index in self.target_gates:
                 self.save_gate(label, metrics, tick, recovery=gates.recovery_distribution(metrics), engram=engram)
             elif engram:
                 atomic_json(self.root / "metrics" / f"engram-coverage-{index:03d}.receipt", engram)
-        fused = {p + leaf for leaf in reference.EXPERTS} if moe else ()
+        fused = {p + leaf for leaf in self.forward.reference.EXPERTS} if moe else ()
         native, original = self.source_group(p, exclude=fused)
         self.writer.write_group(label, shared=native | packed, original=original,
                                 k8=views[8], k6=views[6])
@@ -506,14 +536,14 @@ class Runner:
     def experts(self, label, layer, spool):
         packed, errors, stages = {}, [], []
         combined = torch.zeros_like(spool.latent)
-        for start in range(0, recipe.EXPERTS_PER_LAYER, EXPERT_GROUP):
+        for start in range(0, self.recipe.EXPERTS_PER_LAYER, EXPERT_GROUP):
             stage = f"{label}-expert-{start:03d}"
             metrics = []
             tick = time.monotonic()
             manifest = self.stages.load(stage)
             if manifest is None:
                 def encode_group():
-                    for expert in range(start, min(start + EXPERT_GROUP, recipe.EXPERTS_PER_LAYER)):
+                    for expert in range(start, min(start + EXPERT_GROUP, self.recipe.EXPERTS_PER_LAYER)):
                         yield expert - start, self.expert(layer, spool, expert, metrics, combined)
 
                 manifest = self.stages.write_batches(stage, encode_group(), {"metrics": metrics},
@@ -524,7 +554,7 @@ class Runner:
             for entry in manifest["entries"]:
                 ordinal = entry["index"]
                 for name in self.expert_names(layer, start + ordinal):
-                    for suffix in recipe.SUFFIXES:
+                    for suffix in self.recipe.SUFFIXES:
                         tensor = f"{name}.{suffix}"
                         packed[tensor] = self.stages.reference(stage, ordinal, f"k4.{tensor}")
             errors.extend(manifest["metadata"]["metrics"])
@@ -567,7 +597,7 @@ class Runner:
             return
         rows, gamma = rows.to(self.device), gamma.to(self.device)
         names = self.expert_names(layer, expert)
-        keys = tuple(f"k4.{name}.{suffix}" for name in names for suffix in recipe.SUFFIXES)
+        keys = tuple(f"k4.{name}.{suffix}" for name in names for suffix in self.recipe.SUFFIXES)
         # Select only packed weights, including when a frozen group still
         # contains the legacy unsummed output. Replaying needs no Hessian.
         values = self.stages.fields(stage, ordinal, keys)
@@ -645,17 +675,17 @@ class Runner:
             self.recover_complete_group(label, starter, head=True)
             return
         tick = time.monotonic()
-        weights = {name: self.reader.load(name) for name in reference.OUTER_NAMES[1:5]}
+        weights = {name: self.reader.load(name) for name in self.forward.reference.OUTER_NAMES[1:5]}
         weights["lm_head.weight"] = self.reader.load("lm_head.weight")
-        layer = Layer(recipe.LAYER_COUNT, "", weights)
+        layer = self.forward.Layer(self.recipe.LAYER_COUNT, "", weights)
         overrides = {}
         self.progress.event("head_calibration")
         fit = self.core_fit(label + "-fit", layer, [("lm_head",)],
             lambda: ((self.model.head_features(row["state"], weights),)
                      for _, row in self.rows(incoming)), overrides)
         aux = self.reader.load_draft_aux()
-        drafter = Drafter(self.model,
-            layers=[self.reader.load_draft_layer(index) for index in range(recipe.MTP_LAYER_COUNT)],
+        drafter = self.forward.Drafter(self.model,
+            layers=[self.reader.load_draft_layer(index) for index in range(self.recipe.MTP_LAYER_COUNT)],
             aux=aux)
 
         def anchors(start):
@@ -685,7 +715,7 @@ class Runner:
         taps = {}
         for source in {drafter.kv_layers[index], drafter.index_layers[index]}:
             values = self.stages.read_batch(f"tap-{source:03d}", prompt, device=str(self.device))
-            taps[source] = AttentionTap(values["kv"], values["rope_key"], values["groups"])
+            taps[source] = self.forward.AttentionTap(values["kv"], values["rope_key"], values["groups"])
         return taps
 
     def draft(self, drafter, index):
@@ -716,7 +746,7 @@ class Runner:
                 yield number, state, self.model.attention_first(boundary, layer, project)
 
         def expansions():
-            ratio = drafter.config.compressed_indexer_compress_ratio
+            ratio = drafter.config.text.get("compressed_indexer_compress_ratio", 1)
             for number, _, projected in first():
                 kv = projected.kv
                 if self.policy["include_kv_b"]:
@@ -788,7 +818,7 @@ class Runner:
         self.save_metrics(label, metrics)
         extra = {"hidden_correction": "retained native", "hidden_correction_parameters":
                  sum(t.numel() for key, t in drafter.aux.items() if key.startswith("hidden_correction."))}
-        if index == recipe.MTP_LAYER_COUNT - 1:
+        if index == self.recipe.MTP_LAYER_COUNT - 1:
             head = self.reader.load("lm_head.weight")
             matches = torch.zeros(2, dtype=torch.int64, device=self.device)
             count = 0
@@ -808,7 +838,7 @@ class Runner:
                 self.save_gate(label, metrics, tick, extra=extra | {"status": "failed-dfly-k8-top1"})
                 raise ValueError(f"DFly2 K8 held-out top-1 agreement {agreement['8']} below 0.98")
             failed_k6 = any(row["bits"] == 6 and not row["heldout_passed"]
-                            for n in range(recipe.MTP_LAYER_COUNT)
+                            for n in range(self.recipe.MTP_LAYER_COUNT)
                             for row in read_json(self.root / "metrics" / f"draft-{n:03d}.json"))
             extra["published_k6_drafter_bits"] = 8 if failed_k6 or agreement["6"] < .98 else 6
             self.policy["k6_drafter_bits"] = extra["published_k6_drafter_bits"]
@@ -823,9 +853,9 @@ class Runner:
                             layer_seconds=time.monotonic() - tick)
 
     def seal_draft_k6(self):
-        final = read_json(self.root / "gates" / f"draft-{recipe.MTP_LAYER_COUNT-1:03d}.json")
+        final = read_json(self.root / "gates" / f"draft-{self.recipe.MTP_LAYER_COUNT-1:03d}.json")
         self.policy["k6_drafter_bits"] = final["published_k6_drafter_bits"]
-        for index in range(recipe.MTP_LAYER_COUNT):
+        for index in range(self.recipe.MTP_LAYER_COUNT):
             label = f"draft-{index:03d}"
             fit_stages = [f"{label}-{suffix}" for suffix in gates.DRAFT_STAGES]
             group = label + "-k6"
@@ -843,14 +873,14 @@ class Runner:
         native = {name for name in self.header.specs
                   if not name.startswith(("model.layers.", "lm_head."))
                   and not any(name.startswith(f"model.dfly_layers.{index}.")
-                              for index in range(recipe.MTP_LAYER_COUNT))}
+                              for index in range(self.recipe.MTP_LAYER_COUNT))}
         self.writer.write_group("globals", shared=self.header.source_entries(native))
 
     def write_error_csv(self):
         rows = [row for path in sorted((self.root / "metrics").glob("*.json"))
                 for row in read_json(path)]
         expected = {(module, bits) for module in self.core for bits in (8, 6)}
-        expected.update((module, 4) for module in recipe.reviewed_expert_modules())
+        expected.update((module, 4) for module in self.recipe.reviewed_expert_modules())
         if len(rows) != len(expected) or {(row["module"], row["bits"]) for row in rows} != expected:
             raise ValueError("Hy4 calibration metrics do not cover every expected encode")
         names = ["module", "bits"] + sorted(set().union(*(row.keys() for row in rows)) - {"module", "bits"})
@@ -875,7 +905,7 @@ class Runner:
         tables = receipt["tables"]
         expected = set(tables.values()) | {part["file"] for layer in receipt["manifest"]["layers"]
                                            for part in layer["parts"]}
-        if tables.keys() != recipe.ENGRAM_TABLES.keys() or receipt["files"].keys() != expected:
+        if tables.keys() != self.recipe.ENGRAM_TABLES.keys() or receipt["files"].keys() != expected:
             raise ValueError("Hy4 Engram receipt has an unexpected file inventory")
         for name, proof in receipt["files"].items():
             if Path(name).name != name or not name.startswith("engram-") or not name.endswith(".safetensors"):
@@ -892,7 +922,7 @@ class Runner:
         return receipt
 
     def run(self):
-        reference.configure_f32()
+        self.forward.reference.configure_f32()
         self.progress.event("global_tensors")
         self.globals()
         if not self.frontier["target"]:
@@ -900,13 +930,13 @@ class Runner:
             self.save("initial", lambda start: (
                 (i, {"state": self.model.initial(self.records[i].to(self.device), self.embedding)})
                 for i in range(start, len(self.records))))
-        for layer in range(self.frontier["target"], recipe.LAYER_COUNT):
+        for layer in range(self.frontier["target"], self.recipe.LAYER_COUNT):
             self.target(layer)
         if not self.frontier["head"]:
             self.head_and_draft_anchors()
-        if self.frontier["drafter"] < recipe.MTP_LAYER_COUNT:
-            drafter = Drafter(self.model)
-            for index in range(self.frontier["drafter"], recipe.MTP_LAYER_COUNT):
+        if self.frontier["drafter"] < self.recipe.MTP_LAYER_COUNT:
+            drafter = self.forward.Drafter(self.model)
+            for index in range(self.frontier["drafter"], self.recipe.MTP_LAYER_COUNT):
                 self.draft(drafter, index)
             del drafter
         self.reader.close()
@@ -914,18 +944,18 @@ class Runner:
             raise ValueError("Hy4 completed encode count differs from the production recipe")
         self.seal_draft_k6()
         error_csv = self.write_error_csv()
-        tables = self.export_engram()
+        alternates = {"engram": self.export_engram()} if self.recipe.ENGRAM_TABLES else {}
         self.progress.event("package_audit")
-        result = self.writer.finalize(core_selection=self.selected_core(), engram=tables, document=self.header.document,
+        result = self.writer.finalize(core_selection=self.selected_core(), **alternates, document=self.header.document,
                                       error_csv=error_csv, card_path=self.root / "README.md",
                                       k6_drafter_bits=self.policy["k6_drafter_bits"],
                                       retained_by_gate=self.native_modules)
         state = read_json(self.output / "package-state.json")
-        discovery = verify_original_discovery(self.output, state["direct_expected_mappings"]["original"])
+        discovery = self.verify_discovery(self.output, state["direct_expected_mappings"]["original"])
         complete = dict(status="passed", identity=self.identity, output=str(self.output),
-                        revision=recipe.BASE_REVISION, repository=recipe.TARGET_REPO,
-                        completed_target_layers=recipe.LAYER_COUNT,
-                        completed_drafter_layers=recipe.MTP_LAYER_COUNT,
+                        revision=self.recipe.BASE_REVISION, repository=self.recipe.TARGET_REPO,
+                        completed_target_layers=self.recipe.LAYER_COUNT,
+                        completed_drafter_layers=self.recipe.MTP_LAYER_COUNT,
                         completed_encodes=self.total, error_csv=str(error_csv),
                         task_intermediates=[str(self.stages.root)],
                         package_validation=str(self.output / "package-validation.json"),
@@ -936,9 +966,12 @@ class Runner:
         return complete
 
 
-def main():
+def main(runner_type=Runner):
     parser = argparse.ArgumentParser(description=__doc__)
-    for name in ("source", "corpus", "preflight", "root", "output", "engram-dir", "engram-receipt"):
+    paths = ["source", "corpus", "preflight", "root", "output"]
+    if runner_type.recipe.ENGRAM_TABLES:
+        paths.extend(("engram-dir", "engram-receipt"))
+    for name in paths:
         parser.add_argument("--" + name, type=Path, required=True)
     parser.add_argument("--device", choices=("cuda:0",), default="cuda:0")
     args = parser.parse_args()
@@ -956,7 +989,7 @@ def main():
     runner = None
     try:
         with torch.inference_mode():
-            runner = Runner(args)
+            runner = runner_type(args)
             result = runner.run()
         print(json.dumps(result), flush=True)
     except Exception as error:
