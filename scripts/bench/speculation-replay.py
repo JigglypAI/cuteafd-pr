@@ -84,10 +84,14 @@ def request_index(report):
             continue
         for p in panel.get('passes', []):
             for point in (p.get('points') or []):
-                for r in point.get('requests') or []:
-                    rid = ((r.get('timing') or {}).get('speculation') or {}).get('request_id')
-                    if rid in index:
-                        index[rid].update(context=point.get('context'), c=point.get('c'), content='context')
+                waves = [('timed', [r.get('timing') or {} for r in point.get('requests') or []]),
+                         ('warm', point.get('warm_requests') or [])]
+                for phase, timings in waves:
+                    for timing in timings:
+                        rid = (timing.get('speculation') or {}).get('request_id')
+                        if rid:
+                            index[rid] = dict(panel='context_load', content='context', c=point.get('c'),
+                                phase=phase, prompt_tokens=timing.get('prompt_tokens'), context=point.get('context'))
     return index
 
 
@@ -135,12 +139,14 @@ def tidy_job(job_dir):
             meta = index.get(q.get('request_id') or '', {})
             context = contexts[i] if contexts and i < len(contexts) else None
             verify_ms = None
+            features = []
             if glm_cycles.get(q['id']):
                 n = seen[q['id']]
                 if n < len(glm_cycles[q['id']]):
                     line = glm_cycles[q['id']][n]
                     context = line.get('position', context)
                     verify_ms = line.get('verify_ms')
+                    features = line.get('features') or []
                 seen[q['id']] += 1
             if context is None and meta.get('prompt_tokens') is not None:
                 context = meta['prompt_tokens'] + generated[q['id']]
@@ -153,11 +159,13 @@ def tidy_job(job_dir):
             rows.append(dict(
                 family=family, card=job['card'], round=record['round'], lane=record.get('lane'),
                 request=q['id'], request_id=q.get('request_id'),
-                panel=panel, content=content, c=c,
+                panel=panel, content=content, c=c, phase=meta.get('phase'),
                 context=context, batch_requests=len(requests), batch_rows=batch_rows,
                 block=record['block'], policy=record['policy'], room=q['room'],
                 proposed=q['proposed'], accepted=q['accepted_drafts'], censored=q['censored'],
-                score=[p.get('score') if p.get('score') is not None else p.get('calibrated') for p in positions],
+                score=[p.get('score') if p.get('score') is not None else p.get('calibrated') if p.get('calibrated') is not None
+                       else (features[k][1] if k < len(features) and len(features[k]) > 1 else None)
+                       for k, p in enumerate(positions)],
                 history=[p.get('p') for p in positions],
                 outcome=[p.get('outcome') for p in positions],
                 round_us=times[0], verify_us=times[1] if times[1] is not None else (
@@ -225,21 +233,20 @@ def concurrency_band(n):
 
 
 def fit_cycle(rows):
+    """Linear model plus the measured table (see `fit_table`); `predict` prefers the table."""
+    fit = fit_linear(rows)
+    if fit is not None:
+        fit['table'] = fit_table(rows)
+    return fit
+
+
+def fit_linear(rows):
     """Least squares round_us ~ a + b*rows + c*rows*ctx_k + d*requests*ctx_k + e*requests per family.
 
     ctx_k is the batch's mean context in thousands of tokens. Returns
     coefficients and the R^2 over rounds (one sample per round, not per request).
     """
-    rounds = {}
-    for r in rows:
-        if r['round_us'] is None:
-            continue
-        key = (r['card'], r['round'], r['lane'])
-        entry = rounds.setdefault(key, dict(t=r['round_us'], rows=r['batch_rows'], n=r['batch_requests'], ctx=[]))
-        if r['context'] is not None:
-            entry['ctx'].append(r['context'])
-    samples = [(e['t'], e['rows'], e['n'], statistics.fmean(e['ctx']) / 1000 if e['ctx'] else 0.)
-               for e in rounds.values()]
+    samples = [(t, rws, n, BAND_K[band]) for t, rws, n, band in round_samples(rows)]
     if len(samples) < 8:
         return None
     X = [[1., rws, rws * ck, n * ck, n] for (_, rws, n, ck) in samples]
@@ -274,9 +281,63 @@ def lstsq(X, y, ridge=1e-6):
     return b
 
 
+def round_samples(rows, timed_only=True):
+    """One (round_us, rows, requests, context band) per batch round."""
+    rounds = {}
+    for r in rows:
+        if timed_only and r.get('phase') == 'warm':
+            continue
+        t = r['round_us'] if r['round_us'] is not None else r['verify_us']
+        if t is None:
+            continue
+        key = (r['card'], r['round'], r['lane'])
+        e = rounds.setdefault(key, dict(t=t, rows=r['batch_rows'], n=r['batch_requests'], ctx=[]))
+        if r['context'] is not None:
+            e['ctx'].append(r['context'])
+    return [(e['t'], e['rows'], e['n'], context_band(statistics.fmean(e['ctx']) if e['ctx'] else None))
+            for e in rounds.values()]
+
+
+def fit_table(rows):
+    """Measured median round time by (context band, rows): the curve the replay prices.
+
+    Rounds at every concurrency contribute to their row count, so a C8 round
+    of 64 rows and a C16 round of 64 rows share one point; the request count is
+    kept as a column for review but the replay prices rows within a band.
+    """
+    cells = collections.defaultdict(list)
+    for t, rws, n, band in round_samples(rows):
+        cells[(band, rws)].append(t)
+    table = {}
+    for (band, rws), ts in cells.items():
+        if len(ts) >= 3:
+            table.setdefault(band, {})[rws] = statistics.median(ts)
+    return table
+
+
 def predict(fit, rows, requests, ctx_k):
+    """Round microseconds at `rows`: interpolate the measured table of the
+    nearest context band when present, else the linear model."""
+    table = fit.get('table') if isinstance(fit, dict) else None
+    if table:
+        band = context_band(ctx_k * 1000)
+        curve = table.get(band) or table.get(min(table, key=lambda b: abs(BAND_K[b] - ctx_k)))
+        xs = sorted(curve)
+        if rows <= xs[0]:
+            lo, hi = xs[0], xs[1] if len(xs) > 1 else xs[0]
+        elif rows >= xs[-1]:
+            lo, hi = xs[-2] if len(xs) > 1 else xs[-1], xs[-1]
+        else:
+            lo = max(x for x in xs if x <= rows)
+            hi = min(x for x in xs if x >= rows)
+        if hi == lo:
+            return curve[lo]
+        return max(1., curve[lo] + (curve[hi] - curve[lo]) * (rows - lo) / (hi - lo))
     a, b, c, d, e = fit['coef']
     return max(1., a + b * rows + c * rows * ctx_k + d * requests * ctx_k + e * requests)
+
+
+BAND_K = {'0': 0., '8K': 8., '32K': 32., '128K': 128., 'unknown': 0.}
 
 
 # -- rules: each maps a row to the number of drafts it would verify (a prefix length).
@@ -339,7 +400,30 @@ def calibrated(row):
     return [h if h is not None else 0. for h in row['history']]
 
 
-def replay(rows, fit, rule, batch_rule=None):
+def settle(lengths, members, max_rows=64):
+    """Dev `settle`: fit the round into `max_rows` (anchors included), granting
+    positions across requests by highest next score, each keeping a prefix."""
+    budget = max_rows - len(members)
+    if sum(lengths) <= budget:
+        return lengths
+    scores = [m['score'] if any(v is not None for v in m['score']) else m['history'] for m in members]
+    granted = [0] * len(members)
+    for _ in range(max(budget, 0)):
+        best = None
+        for i, m in enumerate(members):
+            if granted[i] >= lengths[i]:
+                continue
+            v = scores[i][granted[i]] if granted[i] < len(scores[i]) and scores[i][granted[i]] is not None else 0.
+            key = (v, -granted[i], -m['request'])
+            if best is None or key > best[0]:
+                best = (key, i)
+        if best is None:
+            break
+        granted[best[1]] += 1
+    return granted
+
+
+def replay(rows, fit, rule, batch_rule=None, max_rows=64):
     """Expected emitted tok/s of `rule` over the rows' batches, with time from `fit`.
 
     A batch round is the set of rows sharing (card, round, lane). Its replayed
@@ -351,7 +435,7 @@ def replay(rows, fit, rule, batch_rule=None):
         rounds[(r['card'], r['round'], r['lane'])].append(r)
     tokens = seconds = verify_rows = 0.
     for members in rounds.values():
-        lengths = batch_rule(members, fit) if batch_rule else [rule(m) for m in members]
+        lengths = batch_rule(members, fit) if batch_rule else settle([rule(m) for m in members], members, max_rows)
         committed = sum(1 + min(L, accepted_run(m)) for L, m in zip(lengths, members))
         nrows = sum(1 + L for L in lengths)
         ctx = [m['context'] for m in members if m['context'] is not None]
@@ -502,6 +586,31 @@ def traffic_mix(cells, weights=None):
     return out
 
 
+def render(result):
+    """Markdown tables: cycle curves, replay cells and the traffic mix."""
+    lines = ['## Cycle time (median ms per batch round, by verify rows)', '']
+    for family, fit in sorted(result['fits'].items()):
+        if not fit:
+            continue
+        for band, curve in sorted(fit['table'].items(), key=lambda kv: BAND_K.get(kv[0], 0)):
+            pts = ', '.join(f'{r}:{t / 1000:.1f}' for r, t in sorted(curve.items()) if r in (1, 2, 4, 8, 16, 24, 32, 48, 56, 64, 96, 128))
+            lines.append(f'- {family} {band}: {pts}')
+    rules = ['history', 'fixed-1', 'fixed-2', 'fixed-3', 'fixed-4', 'fixed-7', 'product>0.3', 'product>0.5', 'marginal']
+    lines += ['', '## Replay tok/s by family x context x concurrency', '',
+              '| Family | Context | C | rounds | trunc | ' + ' | '.join(rules) + ' | best |',
+              '|' + '---|' * (len(rules) + 6)]
+    for c in result['cells']:
+        if c['rounds'] < 20:
+            continue
+        lines.append(f"| {c['family']} | {c['context']} | {c['c']} | {c['rounds']} | {c['truncated']:.2f} | "
+                     + ' | '.join(f"{c[r]:.1f}" for r in rules) + f" | {c['best']} |")
+    lines += ['', '## Traffic mix (25% 0, 25% 8K, 30% 32K, 20% 128K)', '', '| Family | ' + ' | '.join(rules) + ' |',
+              '|' + '---|' * (len(rules) + 1)]
+    for family, row in sorted(result['mix'].items()):
+        lines.append(f'| {family} | ' + ' | '.join('' if row.get(r) is None else f'{row[r]:.1f}' for r in rules) + ' |')
+    return '\n'.join(lines) + '\n'
+
+
 # ---------------------------------------------------------------- CLI
 
 def main(argv=None):
@@ -532,6 +641,7 @@ def main(argv=None):
         rows = list(read_jsonl(Path(args.dataset) / 'tidy.jsonl'))
         result = analyze(rows)
         (out / 'analysis.json').write_text(json.dumps(result, indent=1, default=str))
+        (out / 'report.md').write_text(render(result))
         print(json.dumps({'families': list(result['fits']), 'cells': len(result['cells'])}))
     return 0
 

@@ -57,14 +57,27 @@ def test_cycle_fit_recovers_a_linear_cost_model():
     for k in range(40):
         n = 1 + k % 8
         drafts = k % 7
-        ctx = 1000 * (k % 5)
-        t = 5000 + 300 * n * (drafts + 1) + 0.002 * n * (drafts + 1) * ctx + 50 * n
+        ctx = (0, 8000, 32000, 128000)[k % 4]
+        ctx_k = replay.BAND_K[replay.context_band(ctx)]
+        t = 5000 + 300 * n * (drafts + 1) + 2 * n * (drafts + 1) * ctx_k + 50 * n
         for i in range(n):
             rows.append(row([True] * drafts + [False], rnd=k, request=i, context=ctx, proposed=drafts,
                             round_us=t, batch_rows=n * (drafts + 1), batch_requests=n))
-    fit = replay.fit_cycle(rows)
+    fit = replay.fit_linear(rows)
     assert fit['r2'] > 0.999
-    assert replay.predict(fit, 16, 2, 4.0) == pytest.approx(5000 + 300 * 16 + 2 * 16 * 4 + 100, rel=1e-3)
+    assert replay.predict(fit, 16, 2, 32.0) == pytest.approx(5000 + 300 * 16 + 2 * 16 * 32 + 100, rel=1e-3)
+
+
+def test_measured_table_interpolates_rows_within_a_context_band():
+    rows = []
+    for k, (n, t) in enumerate([(8, 70_000), (8, 70_000), (8, 72_000), (32, 150_000), (32, 152_000),
+                                 (32, 154_000), (64, 230_000), (64, 230_000), (64, 236_000)]):
+        rows.append(row([False], rnd=k, context=500, proposed=n - 1, round_us=t, batch_rows=n))
+    table = replay.fit_table(rows)
+    assert table['0'] == {8: 70_000, 32: 152_000, 64: 230_000}
+    fit = {'coef': [0.] * 5, 'table': table}
+    assert replay.predict(fit, 20, 1, 0.) == pytest.approx(70_000 + 82_000 * 12 / 24)
+    assert replay.predict(fit, 64, 8, 0.) == 230_000
 
 
 def test_marginal_rule_stops_when_rows_cost_more_than_they_return():
@@ -124,3 +137,11 @@ def test_tidy_pairs_shared_scheduler_cycles_with_their_rounds(tmp_path):
     (job / 'speculation-trace.jsonl').write_text(json.dumps(round_record) + '\n' + json.dumps(cycle) + '\n')
     r = replay.tidy_job(job)[0]
     assert (r['context'], r['round_us'], r['verify_us'], r['draft_us'], r['score']) == (32999, 90500, 80000, 2000, [0.7, 0.7, 0.7])
+
+
+def test_settle_grants_the_row_budget_by_next_score_keeping_prefixes():
+    a = row([True] * 7, score=[0.9] * 7, request=1)
+    b = row([True] * 7, score=[0.99, 0.2, 0.2, 0.2, 0.2, 0.2, 0.2], request=2)
+    # budget 6 drafts (8 rows - 2 anchors): b's 0.99 first, then a's 0.9 run beats b's 0.2s
+    assert replay.settle([7, 7], [a, b], max_rows=8) == [5, 1]
+    assert replay.settle([2, 3], [a, b], max_rows=64) == [2, 3]
