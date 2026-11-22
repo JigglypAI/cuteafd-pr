@@ -189,6 +189,12 @@ if(CUTEAFD_ENABLE_INKLING2_AOT)
     set(CUTEAFD_PROGRAM_GEOMETRY "${CUTEAFD_PROGRAM_GEOMETRY},inkling2")
   endif()
 endif()
+if(CUTEAFD_ENABLE_HY4F_AOT)
+  list(APPEND CUTEAFD_DENSE_TRELLIS_FAMILIES hy4f)
+  if(NOT CUTEAFD_PROGRAM_GEOMETRY MATCHES "(^|,)dense_trellis_k6(,|$)")
+    set(CUTEAFD_PROGRAM_GEOMETRY "${CUTEAFD_PROGRAM_GEOMETRY},dense_trellis_k6")
+  endif()
+endif()
 if(CUTEAFD_ENABLE_V41_EXPERT_AOT)
   # Coordinator planning reads Spark segment geometry from its own manifest;
   # both images must carry the same native width inventory.
