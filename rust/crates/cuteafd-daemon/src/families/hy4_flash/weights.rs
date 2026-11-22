@@ -126,6 +126,38 @@ fn read_tensor_bytes(checkpoint: &Checkpoint, name: &str) -> Result<(Vec<u8>, DT
     Ok((bytes, entry.meta.dtype.clone(), entry.meta.shape.clone()))
 }
 
+fn read_packed_engram(checkpoint: &Checkpoint, cfg: &Hy4FlashConfig, name: &str) -> Result<Option<Vec<u8>>> {
+    let pack = |prefix: &str, count: usize, suffix: &str| -> Result<Vec<u8>> {
+        let mut out = Vec::new();
+        for j in 0..count {
+            let tname = format!("{prefix}.{j}{suffix}");
+            let (raw, dtype, _) = read_tensor_bytes(checkpoint, &tname)?;
+            ensure!(dtype == DType::Bf16, "Hy4-flash Engram tensor {tname} expected BF16, got {dtype:?}");
+            out.extend_from_slice(&raw);
+        }
+        Ok(out)
+    };
+    if let Some(p) = name.strip_suffix(".lookup_per_head_norms.packed") {
+        return Ok(Some(pack(&format!("{p}.lookup_per_head_norms"), cfg.engram_total_heads(), ".weight")?));
+    }
+    if let Some(p) = name.strip_suffix(".key_projs.packed.weight") {
+        return Ok(Some(pack(&format!("{p}.key_projs"), cfg.hc_mult, ".weight")?));
+    }
+    if let Some(p) = name.strip_suffix(".key_projs.packed.bias") {
+        return Ok(Some(pack(&format!("{p}.key_projs"), cfg.hc_mult, ".bias")?));
+    }
+    if let Some(p) = name.strip_suffix(".norm_key.packed") {
+        return Ok(Some(pack(&format!("{p}.norm_key"), cfg.hc_mult, ".weight")?));
+    }
+    if let Some(p) = name.strip_suffix(".norm_query.packed") {
+        return Ok(Some(pack(&format!("{p}.norm_query"), cfg.hc_mult, ".weight")?));
+    }
+    if let Some(p) = name.strip_suffix(".unified_per_hc_scales.packed") {
+        return Ok(Some(pack(&format!("{p}.unified_per_hc_scales"), cfg.hc_mult, "")?));
+    }
+    Ok(None)
+}
+
 fn pack_kv_b_absorbed(
     raw: &[u8],
     local_heads: usize,
@@ -239,50 +271,54 @@ impl<'a> Hy4RankWeights<'a> {
                 }
 
                 let alloc = arena.view(name, view_meta.bytes())?;
-                // Resolve checkpoint tensor name (matrices carry `.weight`, F32 iHC/sinks/ape are bare).
-                let ckpt_name = if checkpoint.contains_tensor(name) {
-                    name.clone()
+                let upload_bytes: Vec<u8> = if let Some(packed) = read_packed_engram(checkpoint, cfg, name)? {
+                    packed
                 } else {
-                    format!("{name}.weight")
-                };
-                let (raw, dtype, shape) = read_tensor_bytes(checkpoint, &ckpt_name)?;
-                let elem = match dtype {
-                    DType::Bf16 | DType::F16 => 2usize,
-                    DType::F32 => 4usize,
-                    other => bail!("Hy4-flash unsupported target tensor dtype {other:?} for {ckpt_name}"),
-                };
+                    let stem = name.strip_suffix(".weight").unwrap_or(name);
+                    let ckpt_name = if checkpoint.contains_tensor(name) {
+                        name.clone()
+                    } else {
+                        format!("{name}.weight")
+                    };
+                    let (raw, dtype, shape) = read_tensor_bytes(checkpoint, &ckpt_name)?;
+                    let elem = match dtype {
+                        DType::Bf16 | DType::F16 => 2usize,
+                        DType::F32 => 4usize,
+                        other => bail!("Hy4-flash unsupported target tensor dtype {other:?} for {ckpt_name}"),
+                    };
 
-                let upload_bytes: Vec<u8> = if name.ends_with(".self_attn.learnable_sink_param") {
-                    ensure!(dtype == DType::F32 && shape.len() == 1, "bad sink shape for {name}");
-                    let local_heads = shape[0] / gpus;
-                    let start = rank * local_heads * 4;
-                    raw[start..start + local_heads * 4].to_vec()
-                } else if name.ends_with(".self_attn.kv_b_proj") {
-                    ensure!(dtype == DType::Bf16 && shape.len() == 2, "bad kv_b_proj shape for {name}");
-                    let sliced = if gpus == 2 {
-                        slice_2d(&raw, shape[0], shape[1], elem, Axis::Rows, rank, gpus)
+                    if stem.ends_with(".self_attn.learnable_sink_param") {
+                        ensure!(dtype == DType::F32 && shape.len() == 1, "bad sink shape for {name}");
+                        let local_heads = shape[0] / gpus;
+                        let start = rank * local_heads * 4;
+                        raw[start..start + local_heads * 4].to_vec()
+                    } else if stem.ends_with(".self_attn.kv_b_proj") {
+                        ensure!(dtype == DType::Bf16 && shape.len() == 2, "bad kv_b_proj shape for {name}");
+                        let sliced = if gpus == 2 {
+                            slice_2d(&raw, shape[0], shape[1], elem, Axis::Rows, rank, gpus)
+                        } else {
+                            raw
+                        };
+                        let local_heads = (shape[0] / gpus) / (cfg.qk_nope_dim + cfg.v_head_dim);
+                        pack_kv_b_absorbed(&sliced, local_heads, cfg.qk_nope_dim, cfg.v_head_dim, cfg.kv_lora_rank)?
+                    } else if stem == "lm_head" || (gpus == 2 && shape.len() == 2) {
+                        let split = if stem == "lm_head" {
+                            CoreSplit::Output
+                        } else {
+                            core_split(stem)
+                        };
+                        match split {
+                            CoreSplit::Output if gpus == 2 => {
+                                slice_2d(&raw, shape[0], shape[1], elem, Axis::Rows, rank, gpus)
+                            }
+                            CoreSplit::Input if gpus == 2 => {
+                                slice_2d(&raw, shape[0], shape[1], elem, Axis::Cols, rank, gpus)
+                            }
+                            _ => raw,
+                        }
                     } else {
                         raw
-                    };
-                    let local_heads = (shape[0] / gpus) / (cfg.qk_nope_dim + cfg.v_head_dim);
-                    pack_kv_b_absorbed(&sliced, local_heads, cfg.qk_nope_dim, cfg.v_head_dim, cfg.kv_lora_rank)?
-                } else if name == "lm_head" || (gpus == 2 && shape.len() == 2) {
-                    let split = if name == "lm_head" {
-                        CoreSplit::Output
-                    } else {
-                        core_split(name)
-                    };
-                    match split {
-                        CoreSplit::Output if gpus == 2 => {
-                            slice_2d(&raw, shape[0], shape[1], elem, Axis::Rows, rank, gpus)
-                        }
-                        CoreSplit::Input if gpus == 2 => {
-                            slice_2d(&raw, shape[0], shape[1], elem, Axis::Cols, rank, gpus)
-                        }
-                        _ => raw,
                     }
-                } else {
-                    raw
                 };
 
                 ensure!(
@@ -299,7 +335,7 @@ impl<'a> Hy4RankWeights<'a> {
             let inv_freq_swa = make_inv_freq(device, cfg.swa_qk_rope_dim, cfg.swa_rope_theta)?;
 
             let local_vocab = cfg.vocab_size / gpus;
-            let (head_ws, head) = if views.contains_key("lm_head") {
+            let (head_ws, head) = if views.contains_key("lm_head.weight") {
                 let ws = Allocation::new(device, HEAD_WS_BYTES, Tag::workspace("hy4_flash/head-cublas-ws"))?;
                 let h = device.run(|| {
                     // SAFETY: `ws` stays alive in `Hy4RankWeights` for the full lifetime of `head`.
@@ -343,12 +379,73 @@ impl<'a> Hy4RankWeights<'a> {
             .with_context(|| format!("Hy4-flash rank {} missing weight view {name}", self.rank))
     }
 
+    pub(crate) fn weight(&self, stem: &str) -> Result<CuteafdDeviceBuffer> {
+        self.buf(&format!("{stem}.weight"))
+    }
+
     /// Return `(w_uk [local_heads, 512, 192], w_uv [local_heads, 256, 512])` pointers inside `kv_b_proj`.
     pub(crate) fn kv_b_absorbed(&self, layer: usize, local_heads: usize) -> Result<(*mut std::ffi::c_void, *mut std::ffi::c_void)> {
-        let buf = self.buf(&format!("model.layers.{layer}.self_attn.kv_b_proj"))?;
+        let buf = self.weight(&format!("model.layers.{layer}.self_attn.kv_b_proj"))?;
         let uk_bytes = local_heads * 512 * 192 * 2;
         let uv_bytes = local_heads * 256 * 512 * 2;
         ensure!(buf.bytes == uk_bytes + uv_bytes, "kv_b_proj absorbed view size mismatch");
         Ok((buf.ptr, buf.ptr.cast::<u8>().wrapping_add(uk_bytes).cast()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cuteafd_loader::plan::checkpoint::CheckpointView;
+
+    #[test]
+    #[ignore = "requires installed Hy4-flash-EXL3-K4-MC checkpoint in HF_HOME"]
+    fn installed_hy4_target_arena_views_match_checkpoint_headers() -> Result<()> {
+        let snap = std::path::PathBuf::from(std::env::var("HOME")?).join(
+            ".cache/huggingface/hub/models--wrldsuksgo2mars--Hy4-flash-EXL3-K4-MC/snapshots/cc72179113573d751ed3245e3e58d3640694378d",
+        );
+        let selected = CheckpointView::select(&snap, cuteafd_loader::plan::checkpoint::CoreView::Original)?;
+        let checkpoint = Checkpoint::open_view(&selected)?;
+        let cfg = Hy4FlashConfig::read(&snap)?;
+        let model = hy4_plan::Model::open(&checkpoint)?;
+        for gpus in [1usize, 2usize] {
+            let modes = hy4_placement::layer_modes(&cfg, gpus, AttentionPlacement::Heads);
+            let layouts = target_arenas(&checkpoint, &cfg, &model.core, &modes, gpus)?;
+            assert_eq!(layouts.len(), gpus);
+            for (rank, layout) in layouts.iter().enumerate() {
+                for (name, view_meta) in layout.arena.views() {
+                    if name == "model.embed_tokens.weight" {
+                        assert!(checkpoint.contains_tensor(name));
+                        continue;
+                    }
+                    if name.ends_with(".packed") || name.ends_with(".packed.weight") || name.ends_with(".packed.bias") {
+                        let packed = read_packed_engram(&checkpoint, &cfg, name)?
+                            .with_context(|| format!("missing packed handler for {name}"))?;
+                        assert_eq!(packed.len(), view_meta.bytes(), "rank {rank}/{gpus} {name}");
+                        continue;
+                    }
+                    let stem = name.strip_suffix(".weight").unwrap_or(name);
+                    let entry = checkpoint
+                        .tensors
+                        .iter()
+                        .find(|t| t.meta.name == *name)
+                        .with_context(|| format!("rank {rank}/{gpus} missing checkpoint tensor {name}"))?;
+                    let raw_bytes = usize::try_from(entry.meta.byte_length)?;
+                    let expected = if stem.ends_with(".self_attn.learnable_sink_param") {
+                        raw_bytes / gpus
+                    } else if gpus == 2 && entry.meta.shape.len() == 2 {
+                        let split = if stem == "lm_head" { CoreSplit::Output } else { core_split(stem) };
+                        match split {
+                            CoreSplit::Output | CoreSplit::Input => raw_bytes / 2,
+                            CoreSplit::Whole => raw_bytes,
+                        }
+                    } else {
+                        raw_bytes
+                    };
+                    assert_eq!(expected, view_meta.bytes(), "rank {rank}/{gpus} {name}");
+                }
+            }
+        }
+        Ok(())
     }
 }

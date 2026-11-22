@@ -6,7 +6,7 @@ use crate::shared::memory::{
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::CuteafdDeviceBuffer;
 use cuteafd_loader::families::hy4_flash::{
-    execution::{CacheLayout, PAGE_ROWS, SWA_RING_PAGES, SWA_RING_ROWS},
+    execution::{CacheLayout, PAGE_ROWS, SWA_RING_PAGES},
     Hy4FlashConfig, Hy4KvCache,
 };
 
@@ -19,11 +19,13 @@ pub(crate) struct Hy4CacheRank<'a> {
     pub(crate) swa_layers: usize,
     pub(crate) pages: usize,
     pub(crate) sequences: usize,
+    pub(crate) swa_ring_pages: usize,
+    pub(crate) swa_ring_rows: usize,
     /// `[dsa_layers, pages, 64, record_bytes]`
     pub(crate) dsa_kv: Allocation<'a>,
     /// `[dsa_layers, pages, 16 * 132]`
     pub(crate) dsa_index: Allocation<'a>,
-    /// `[sequences, swa_layers, SWA_RING_ROWS (640), record_bytes]`
+    /// `[sequences, swa_layers, swa_ring_rows, record_bytes]`
     pub(crate) swa_rings: Allocation<'a>,
     /// `[sequences, dsa_layers, 3, 128]` BF16 pending incomplete indexer token keys.
     pub(crate) pending_keys: Allocation<'a>,
@@ -53,6 +55,7 @@ impl<'a> Hy4CacheRank<'a> {
         kv_format: Hy4KvCache,
         pages: usize,
         sequences: usize,
+        max_chunk_rows: usize,
         mark_slots: usize,
         stream: &Stream<'a>,
     ) -> Result<Self> {
@@ -60,6 +63,15 @@ impl<'a> Hy4CacheRank<'a> {
         let dsa_layers = cfg.sparse_layers().len();
         let swa_layers = cfg.swa_layers().len();
         let layout = CacheLayout::new(cfg, kv_format, sequences, dsa_layers, swa_layers)?;
+        // Ring holds the live 512-token window plus one full prefill chunk without overwriting
+        // any token still needed by queries earlier in the same chunk.
+        let swa_ring_pages = ((cfg.sliding_window + max_chunk_rows).div_ceil(PAGE_ROWS) + 1).max(SWA_RING_PAGES);
+        let swa_ring_rows = swa_ring_pages * PAGE_ROWS;
+        let swa_rings_bytes = sequences
+            .checked_mul(swa_layers)
+            .and_then(|v| v.checked_mul(swa_ring_rows))
+            .and_then(|v| v.checked_mul(kv_format.record_bytes()))
+            .context("Hy4-flash SWA ring pool overflow")?;
 
         let dsa_kv_bytes = dsa_layers
             .checked_mul(pages)
@@ -72,7 +84,7 @@ impl<'a> Hy4CacheRank<'a> {
 
         let dsa_kv = Allocation::new(device, dsa_kv_bytes, Tag::kv("hy4_flash/dsa-kv"))?;
         let dsa_index = Allocation::new(device, dsa_index_bytes, Tag::kv("hy4_flash/dsa-index"))?;
-        let swa_rings = Allocation::new(device, layout.active_swa_ring_bytes, Tag::kv("hy4_flash/swa-rings"))?;
+        let swa_rings = Allocation::new(device, swa_rings_bytes, Tag::kv("hy4_flash/swa-rings"))?;
         let pending_keys = Allocation::new(
             device,
             layout.active_indexer_pending_bytes,
@@ -95,6 +107,8 @@ impl<'a> Hy4CacheRank<'a> {
             swa_layers,
             pages,
             sequences,
+            swa_ring_pages,
+            swa_ring_rows,
             dsa_kv,
             dsa_index,
             swa_rings,
@@ -134,7 +148,7 @@ impl<'a> Hy4CacheRank<'a> {
 
     pub(crate) fn swa_ring(&self, seq: usize, swa_idx: usize) -> Result<CuteafdDeviceBuffer> {
         ensure!(seq < self.sequences && swa_idx < self.swa_layers, "SWA ring ({seq}, {swa_idx}) out of range");
-        let ring_bytes = SWA_RING_ROWS * self.kv_format.record_bytes();
+        let ring_bytes = self.swa_ring_rows * self.kv_format.record_bytes();
         let seq_stride = self.swa_layers * ring_bytes;
         slice_buf(self.swa_rings.buffer, seq * seq_stride + swa_idx * ring_bytes, ring_bytes)
     }

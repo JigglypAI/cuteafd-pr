@@ -119,7 +119,18 @@ impl<'a> Hy4Programs<'a> {
             engram_head_norm: load("engram_head_norm", &["raw", "weights", "out"])?,
             engram_gate_add: load(
                 "engram_gate_add",
-                &["residual", "keys", "value", "norm_key", "norm_query", "pre_gamma", "hc_scales", "masked"],
+                &[
+                    "residual",
+                    "keys",
+                    "key_bias",
+                    "value",
+                    "value_bias",
+                    "norm_key",
+                    "norm_query",
+                    "pre_gamma",
+                    "hc_scales",
+                    "masked",
+                ],
             )?,
             mla_rank_norm_pack: load(
                 &format!("mla_rank_norm_pack_{kv}"),

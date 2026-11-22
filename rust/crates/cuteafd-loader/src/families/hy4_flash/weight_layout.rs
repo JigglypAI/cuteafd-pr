@@ -315,7 +315,7 @@ pub fn target_arenas(
                 views.push((format!("{p}.mlp.combine_output_norm.weight"), h * 2));
             }
 
-            // Engram small GPU projections/norms (table itself stays host-mapped)
+            // Engram small GPU projections/norms (packed contiguously inside target arena; table itself stays host-mapped)
             if cfg.engram_layers.contains(&layer) {
                 let ep = format!("{p}.engram_layer");
                 let w = cfg.engram_head_width();
@@ -323,16 +323,12 @@ pub fn target_arenas(
                 views.push((format!("{ep}.unified_pre_gamma"), h * 2));
                 views.push((format!("{ep}.value_proj.weight"), h * concat * 2));
                 views.push((format!("{ep}.value_proj.bias"), h * 2));
-                for j in 0..cfg.engram_total_heads() {
-                    views.push((format!("{ep}.lookup_per_head_norms.{j}.weight"), w * 2));
-                }
-                for j in 0..hc {
-                    views.push((format!("{ep}.key_projs.{j}.weight"), h * concat * 2));
-                    views.push((format!("{ep}.key_projs.{j}.bias"), h * 2));
-                    views.push((format!("{ep}.norm_key.{j}.weight"), h * 2));
-                    views.push((format!("{ep}.norm_query.{j}.weight"), h * 2));
-                    views.push((format!("{ep}.unified_per_hc_scales.{j}"), h * 2));
-                }
+                views.push((format!("{ep}.lookup_per_head_norms.packed"), cfg.engram_total_heads() * w * 2));
+                views.push((format!("{ep}.key_projs.packed.weight"), hc * h * concat * 2));
+                views.push((format!("{ep}.key_projs.packed.bias"), hc * h * 2));
+                views.push((format!("{ep}.norm_key.packed"), hc * h * 2));
+                views.push((format!("{ep}.norm_query.packed"), hc * h * 2));
+                views.push((format!("{ep}.unified_per_hc_scales.packed"), hc * h * 2));
             }
         }
 

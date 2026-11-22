@@ -84,6 +84,57 @@ fn digest_f32(values: &[f32]) -> String {
     format!("{:x}", h.finalize())
 }
 
+fn load_published_hy4_reference(root: &Path, vocab: usize) -> Result<cuteafd_bench::reference::Reference> {
+    use cuteafd_bench::fidelity_dataset;
+    let bytes = std::fs::read(root.join("manifest.json"))
+        .with_context(|| format!("reading {}", root.join("manifest.json").display()))?;
+    let manifest: serde_json::Value = serde_json::from_slice(&bytes)?;
+    let digest = format!("{:x}", Sha256::digest(&bytes));
+    ensure!(
+        manifest["config"].as_str() == Some(fidelity_dataset::HY4_CONFIG)
+            && digest == fidelity_dataset::HY4_MANIFEST_SHA256,
+        "Hy4-flash fidelity manifest mismatch: config={:?} sha256={digest}",
+        manifest["config"]
+    );
+    let reference = fidelity_dataset::load(root, &manifest)?;
+    ensure!(reference.vocab == vocab, "Hy4-flash fidelity vocab {} != {vocab}", reference.vocab);
+    Ok(reference)
+}
+
+fn build_probe_row(position: usize, logits: &[f32], wanted_ids: &[u32]) -> cuteafd_api::openai::probe::ProbeRow {
+    let finite = logits.iter().all(|v| v.is_finite());
+    let mut max_v = f32::NEG_INFINITY;
+    let mut argmax = 0u32;
+    for (i, &v) in logits.iter().enumerate() {
+        if v > max_v {
+            max_v = v;
+            argmax = i as u32;
+        }
+    }
+    let max_f64 = f64::from(max_v);
+    let sum_exp: f64 = logits.iter().map(|&v| (f64::from(v) - max_f64).exp()).sum();
+    let lse = max_f64 + sum_exp.ln();
+    let wanted: Vec<(u32, f32)> = wanted_ids
+        .iter()
+        .map(|&id| (id, (f64::from(logits[id as usize]) - lse) as f32))
+        .collect();
+    let mut fnv = 0xcbf2_9ce4_8422_2325u64;
+    for &v in logits {
+        for b in v.to_le_bytes() {
+            fnv ^= u64::from(b);
+            fnv = fnv.wrapping_mul(0x0100_0000_01b3);
+        }
+    }
+    cuteafd_api::openai::probe::ProbeRow {
+        position,
+        hash: format!("{fnv:016x}"),
+        argmax,
+        top: Vec::new(),
+        wanted,
+        finite,
+    }
+}
+
 fn check_headers_only(args: &GoldenArgs) -> Result<()> {
     let view = args.attention.core_view;
     let selected = CheckpointView::select(&args.snapshot, view)?;
@@ -129,13 +180,45 @@ pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
         .golden
         .as_ref()
         .context("hy4f-golden requires --golden <DIR> (unless --check-headers)")?;
-    let window_dir = match &args.window {
-        Some(w) => golden_dir.join(w),
-        None => golden_dir.clone(),
+
+    // Two reference layouts: published cuteafd-fidelity dataset (manifest.json + *.safetensors)
+    // or raw window directory (tokens.bin + optional logits.bin).
+    let published = if golden_dir.join("manifest.json").is_file() {
+        Some(load_published_hy4_reference(golden_dir, cfg.vocab_size)?)
+    } else {
+        None
     };
-    let tokens = read_u32_bin(&window_dir.join("tokens.bin"))?;
-    let unit = args.prefill_units.unwrap_or(tokens.len()).min(4096);
-    let max_pages = tokens.len().div_ceil(64).max(16);
+    let (selected_windows, raw_tokens, raw_window_dir) = if let Some(ref_set) = &published {
+        let wanted: Vec<String> = match &args.window {
+            Some(w) => w.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect(),
+            None => ref_set.quick_windows.clone(),
+        };
+        let mut wins = Vec::with_capacity(wanted.len());
+        for id in &wanted {
+            let win = ref_set
+                .windows
+                .iter()
+                .find(|w| w.id == *id)
+                .with_context(|| format!("Hy4-flash fidelity window {id:?} not found"))?;
+            wins.push(win.clone());
+        }
+        ensure!(!wins.is_empty(), "Hy4-flash fidelity run selected zero windows");
+        (Some(wins), Vec::new(), golden_dir.clone())
+    } else {
+        let window_dir = match &args.window {
+            Some(w) => golden_dir.join(w),
+            None => golden_dir.clone(),
+        };
+        let tokens = read_u32_bin(&window_dir.join("tokens.bin"))?;
+        (None, tokens, window_dir)
+    };
+
+    let max_seq = selected_windows
+        .as_ref()
+        .map(|ws| ws.iter().map(|w| w.tokens.len()).max().unwrap_or(1))
+        .unwrap_or(raw_tokens.len());
+    let unit = args.prefill_units.unwrap_or(max_seq).min(4096);
+    let max_pages = max_seq.div_ceil(64).max(16);
 
     let lib_path = args
         .native_lib
@@ -210,6 +293,55 @@ pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
         onboarded,
     )?;
 
+    let vocab = cfg.vocab_size;
+    if let Some(windows) = selected_windows {
+        let mut all_records = Vec::new();
+        for win in &windows {
+            engine.reset()?;
+            let mut logits = Vec::with_capacity(win.tokens.len() * vocab);
+            for chunk in win.tokens.chunks(unit) {
+                let part = engine.forward_chunk(chunk, args.last_layer)?;
+                logits.extend_from_slice(&part);
+            }
+            let want = win.want();
+            let mut rows = Vec::with_capacity(win.positions.len());
+            for pos in &win.positions {
+                let row_idx = pos.pos - 1;
+                let slice = &logits[row_idx * vocab..(row_idx + 1) * vocab];
+                rows.push(build_probe_row(pos.pos, slice, &want[&pos.pos]));
+            }
+            let score = win.score(&rows);
+            println!(
+                "hy4f-golden window={} rows={} digest={} mean NLL={:.6} (ref {:.6}) mean KL={:.6} top-1={:.2}% top-3={:.2}%",
+                win.id,
+                score.positions,
+                digest_f32(&logits),
+                score.nll,
+                score.ref_nll,
+                score.kl,
+                score.top1 * 100.0,
+                score.top3_contained * 100.0,
+            );
+            all_records.extend(score.records);
+        }
+        let agg = cuteafd_bench::reference::Fidelity::from_records(all_records);
+        println!(
+            "hy4f-golden aggregate ({} windows, {} rows): mean NLL={:.6} (ref {:.6}, delta {:+.6}) mean KL={:.6} top-1={:.2}% confident-top-1={:.2}% top-3={:.2}%",
+            windows.len(),
+            agg.positions,
+            agg.nll,
+            agg.ref_nll,
+            agg.nll - agg.ref_nll,
+            agg.kl,
+            agg.top1 * 100.0,
+            agg.confident_top1.unwrap_or(0.0) * 100.0,
+            agg.top3_contained * 100.0,
+        );
+        return Ok(());
+    }
+
+    let tokens = raw_tokens;
+    let window_dir = raw_window_dir;
     let mut logits = Vec::new();
     for chunk in tokens.chunks(unit) {
         let part = engine.forward_chunk(chunk, args.last_layer)?;
@@ -227,7 +359,6 @@ pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
         return Ok(());
     }
 
-    let vocab = cfg.vocab_size;
     let digest = digest_f32(&logits);
     println!(
         "hy4f-golden logits digest={} rows={} vocab={} unit={} engram={}",
@@ -311,5 +442,28 @@ mod tests {
         assert!(args.engram_bf16);
         assert!(args.skip_routed_experts);
         assert_eq!(args.last_layer, 41);
+    }
+
+    #[test]
+    #[ignore = "requires published Hy4-flash fidelity dataset in ~/.cache/cuteafd/fidelity"]
+    fn installed_hy4_published_fidelity_dataset_validates() -> anyhow::Result<()> {
+        let root = std::path::PathBuf::from(std::env::var("HOME")?)
+            .join(".cache/cuteafd/fidelity/wrldsuksgo2mars--cuteafd-fidelity")
+            .join(cuteafd_bench::fidelity_dataset::HY4_REVISION)
+            .join(cuteafd_bench::fidelity_dataset::HY4_CONFIG);
+        let reference = super::load_published_hy4_reference(&root, 120_832)?;
+        assert_eq!(reference.windows.len(), 70);
+        assert!(reference.quick_windows.iter().any(|w| w == "a00"));
+        let mut nll_sum = 0.0f64;
+        let mut nll_rows = 0usize;
+        for w in &reference.windows {
+            for p in &w.positions {
+                nll_sum += -p.next_lp;
+                nll_rows += 1;
+            }
+        }
+        assert_eq!(nll_rows, 35_840);
+        assert!((nll_sum / nll_rows as f64 - 1.283684105385722).abs() < 1e-6);
+        Ok(())
     }
 }

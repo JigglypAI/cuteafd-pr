@@ -12,7 +12,7 @@ use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::programs::{Programs, Scalar};
 use cuteafd_ffi::{Bf16Add, CuteafdDeviceBuffer, F32Add};
 use cuteafd_loader::families::hy4_flash::engram::Hy4EngramHistory;
-use cuteafd_loader::families::hy4_flash::execution::{PAGE_ROWS, SWA_RING_PAGES, SWA_RING_ROWS};
+use cuteafd_loader::families::hy4_flash::execution::PAGE_ROWS;
 use cuteafd_loader::families::hy4_flash::{Hy4FlashConfig, Hy4KvCache};
 use cuteafd_loader::plan::checkpoint::Checkpoint;
 use std::collections::BTreeMap;
@@ -90,6 +90,7 @@ struct RankScratch<'a> {
     routed_latent: Allocation<'a>,
     routed_out: Allocation<'a>,
     shared_out: Allocation<'a>,
+    shared_f32: Allocation<'a>,
     zero_f32: Allocation<'a>,
     // Head logits tile (<=64 rows)
     logits_tile: Allocation<'a>,
@@ -139,7 +140,7 @@ impl<'a> RankScratch<'a> {
             lse_out: alloc(max_rows * max_heads * 4, "lse-out")?,
             uv_out: alloc(max_rows * max_heads * 256 * 2, "uv-out")?,
             attn_scratch: alloc(attn_scratch_bytes, "attn-scratch")?,
-            page_table: alloc(max_rows * max_pages.max(SWA_RING_PAGES) * 4, "page-table")?,
+            page_table: alloc(max_rows * max_pages.max(16) * 4, "page-table")?,
             seqlens: alloc(max_rows * 4, "seqlens")?,
             cu_seqlens: alloc((max_rows + 1) * 4, "cu-seqlens")?,
             idx_q_raw: alloc(max_rows * IDX_HEADS * IDX_DIM * 2, "idx-q-raw")?,
@@ -167,6 +168,7 @@ impl<'a> RankScratch<'a> {
             routed_latent: alloc(max_rows * LATENT_H * 2, "routed-latent")?,
             routed_out: alloc(max_rows * H * 2, "routed-out")?,
             shared_out: alloc(max_rows * H * 2, "shared-out")?,
+            shared_f32: alloc(max_rows * H * 4, "shared-f32")?,
             zero_f32: alloc(max_rows * H * 4, "zero-f32")?,
             logits_tile: alloc(64 * local_vocab * 4, "logits-tile")?,
         })
@@ -247,7 +249,7 @@ impl<'a> Hy4Engine<'a> {
                 .dsa_scratch_bytes
                 .max(progs.swa_decode_scratch_bytes)
                 .max(progs.swa_extend_scratch_bytes);
-            let cache = Hy4CacheRank::new(device, &cfg, kv_format, max_pages, 1, 0, &stream)?;
+            let cache = Hy4CacheRank::new(device, &cfg, kv_format, max_pages, 1, max_rows, 0, &stream)?;
             let scratch = RankScratch::new(device, gpus, max_rows, max_pages, weights.local_vocab, attn_scratch)?;
             let bf16_add = device.run(|| device.library.bf16_add())?;
             let f32_add = device.run(|| device.library.f32_add())?;
@@ -392,11 +394,13 @@ impl<'a> Hy4Engine<'a> {
         let total_pages = pos_end.div_ceil(PAGE_ROWS);
         ensure!(total_pages <= self.max_pages, "sequence length {pos_end} exceeds cache pages {}", self.max_pages);
 
-        // 1. Upload positions and DSA KV slots; embed tokens into 4-stream iHC residual r_a.
+        // 1. Upload positions and DSA/SWA KV slots; embed tokens into 4-stream iHC residual r_a.
+        let swa_ring_pages = self.ranks[0].cache.swa_ring_pages;
+        let swa_ring_rows = self.ranks[0].cache.swa_ring_rows;
         let pos_i64: Vec<u8> = (pos_start..pos_end).flat_map(|p| (p as i64).to_le_bytes()).collect();
         let pos_i32: Vec<u8> = (pos_start..pos_end).flat_map(|p| (p as i32).to_le_bytes()).collect();
         let swa_slots_i64: Vec<u8> = (pos_start..pos_end)
-            .flat_map(|p| ((p % SWA_RING_ROWS) as i64).to_le_bytes())
+            .flat_map(|p| ((p % swa_ring_rows) as i64).to_le_bytes())
             .collect();
         let cu_singleton: Vec<u8> = (0..=rows).flat_map(|i| (i as i32).to_le_bytes()).collect();
         let identity_pt_row: Vec<i32> = (0..total_pages as i32).collect();
@@ -406,7 +410,9 @@ impl<'a> Hy4Engine<'a> {
                 dsa_pt_bytes.extend_from_slice(&p.to_le_bytes());
             }
         }
-        let swa_pt_bytes: Vec<u8> = (0..SWA_RING_PAGES as i32).flat_map(|p| p.to_le_bytes()).collect();
+        let swa_pt_bytes: Vec<u8> = (0..total_pages)
+            .flat_map(|p| ((p % swa_ring_pages) as i32).to_le_bytes())
+            .collect();
         let swa_seqlens_bytes: Vec<u8> = (pos_end as i32).to_le_bytes().to_vec();
         let swa_cu_bytes: Vec<u8> = [0i32, rows as i32].into_iter().flat_map(i32::to_le_bytes).collect();
 
@@ -473,26 +479,32 @@ impl<'a> Hy4Engine<'a> {
                         // SAFETY: admitted arena weight views & rank scratch live through stream drain.
                         unsafe {
                             r.programs.engram_head_norm.launch(
-                                &[r.scratch.engram_raw.buffer.ptr, r.weights.buf(&format!("{ep}.head_norm_weights"))?.ptr, r.scratch.engram_normed.buffer.ptr],
+                                &[
+                                    r.scratch.engram_raw.buffer.ptr,
+                                    r.weights.buf(&format!("{ep}.lookup_per_head_norms.packed"))?.ptr,
+                                    r.scratch.engram_normed.buffer.ptr,
+                                ],
                                 &s, r.stream.raw,
                             )?;
                             r.programs.proj_engram_value.launch(
-                                &[r.scratch.engram_normed.buffer.ptr, r.weights.buf(&format!("{ep}.value_proj"))?.ptr, r.scratch.engram_val.buffer.ptr],
+                                &[r.scratch.engram_normed.buffer.ptr, r.weights.weight(&format!("{ep}.value_proj"))?.ptr, r.scratch.engram_val.buffer.ptr],
                                 &s, r.stream.raw,
                             )?;
                             r.programs.proj_engram_key.launch(
-                                &[r.scratch.engram_normed.buffer.ptr, r.weights.buf(&format!("{ep}.key_proj"))?.ptr, r.scratch.engram_keys.buffer.ptr],
+                                &[r.scratch.engram_normed.buffer.ptr, r.weights.buf(&format!("{ep}.key_projs.packed.weight"))?.ptr, r.scratch.engram_keys.buffer.ptr],
                                 &s, r.stream.raw,
                             )?;
                             r.programs.engram_gate_add.launch(
                                 &[
                                     r_cur.ptr,
                                     r.scratch.engram_keys.buffer.ptr,
+                                    r.weights.buf(&format!("{ep}.key_projs.packed.bias"))?.ptr,
                                     r.scratch.engram_val.buffer.ptr,
-                                    r.weights.buf(&format!("{ep}.norm_keys"))?.ptr,
-                                    r.weights.buf(&format!("{ep}.norm_queries"))?.ptr,
-                                    r.weights.buf(&format!("{ep}.post_gate_norm.weight"))?.ptr,
-                                    r.weights.buf(&format!("{ep}.unified_per_hc_scales"))?.ptr,
+                                    r.weights.buf(&format!("{ep}.value_proj.bias"))?.ptr,
+                                    r.weights.buf(&format!("{ep}.norm_key.packed"))?.ptr,
+                                    r.weights.buf(&format!("{ep}.norm_query.packed"))?.ptr,
+                                    r.weights.buf(&format!("{ep}.unified_pre_gamma"))?.ptr,
+                                    r.weights.buf(&format!("{ep}.unified_per_hc_scales.packed"))?.ptr,
                                     r.scratch.engram_masked.buffer.ptr,
                                 ],
                                 &s, r.stream.raw,
@@ -533,11 +545,11 @@ impl<'a> Hy4Engine<'a> {
                             &s_rows, r.stream.raw,
                         )?;
                         r.programs.proj_q_a.launch(
-                            &[r.scratch.y.buffer.ptr, r.weights.buf(&format!("{p}.self_attn.q_a_proj"))?.ptr, r.scratch.q_a.buffer.ptr],
+                            &[r.scratch.y.buffer.ptr, r.weights.weight(&format!("{p}.self_attn.q_a_proj"))?.ptr, r.scratch.q_a.buffer.ptr],
                             &s_rows, r.stream.raw,
                         )?;
                         r.programs.proj_kv_a.launch(
-                            &[r.scratch.y.buffer.ptr, r.weights.buf(&format!("{p}.self_attn.kv_a_proj_with_mqa"))?.ptr, r.scratch.kv_a.buffer.ptr],
+                            &[r.scratch.y.buffer.ptr, r.weights.weight(&format!("{p}.self_attn.kv_a_proj_with_mqa"))?.ptr, r.scratch.kv_a.buffer.ptr],
                             &s_rows, r.stream.raw,
                         )?;
                         r.programs.mla_rank_norm_pack.launch(
@@ -560,11 +572,11 @@ impl<'a> Hy4Engine<'a> {
                             (&r.programs.proj_q_b_swa, &r.programs.proj_linear_gate_swa, &r.programs.mla_q_absorb_swa, &r.programs.mla_sink_gate_uv_swa, &r.programs.proj_o_swa)
                         };
                         proj_qb.launch(
-                            &[r.scratch.q_resid.buffer.ptr, r.weights.buf(&format!("{p}.self_attn.q_b_proj"))?.ptr, r.scratch.q_raw.buffer.ptr],
+                            &[r.scratch.q_resid.buffer.ptr, r.weights.weight(&format!("{p}.self_attn.q_b_proj"))?.ptr, r.scratch.q_raw.buffer.ptr],
                             &s_rows, r.stream.raw,
                         )?;
                         proj_gate.launch(
-                            &[r.scratch.y.buffer.ptr, r.weights.buf(&format!("{p}.self_attn.linear_gate"))?.ptr, r.scratch.gate.buffer.ptr],
+                            &[r.scratch.y.buffer.ptr, r.weights.weight(&format!("{p}.self_attn.linear_gate"))?.ptr, r.scratch.gate.buffer.ptr],
                             &s_rows, r.stream.raw,
                         )?;
                         q_abs.launch(
@@ -578,7 +590,7 @@ impl<'a> Hy4Engine<'a> {
                             let ip = format!("{p}.self_attn.compressed_indexer");
                             // Token keys + RMSNorm -> complete 4-token groups into group_cache.
                             r.programs.proj_indexer_wk.launch(
-                                &[r.scratch.y.buffer.ptr, r.weights.buf(&format!("{ip}.token_key_projection"))?.ptr, r.scratch.idx_tk_raw.buffer.ptr],
+                                &[r.scratch.y.buffer.ptr, r.weights.weight(&format!("{ip}.token_key_projection"))?.ptr, r.scratch.idx_tk_raw.buffer.ptr],
                                 &s_rows, r.stream.raw,
                             )?;
                             let tk_w = r.weights.buf(&format!("{ip}.token_key_norm.weight"))?.ptr;
@@ -616,8 +628,8 @@ impl<'a> Hy4Engine<'a> {
                                 r.programs.indexer_pool_group.launch(
                                     &[
                                         r.scratch.idx_group_tok.buffer.ptr,
-                                        r.weights.buf(&format!("{ip}.key_value_projection"))?.ptr,
-                                        r.weights.buf(&format!("{ip}.key_gate_projection"))?.ptr,
+                                        r.weights.weight(&format!("{ip}.key_value_projection"))?.ptr,
+                                        r.weights.weight(&format!("{ip}.key_gate_projection"))?.ptr,
                                         r.weights.buf(&format!("{ip}.intra_group_ape"))?.ptr,
                                         r.weights.buf(&format!("{ip}.key_norm.weight"))?.ptr,
                                         r.scratch.idx_group_pos.buffer.ptr,
@@ -653,11 +665,11 @@ impl<'a> Hy4Engine<'a> {
                             let total_groups = pos_end / 4;
                             if pos_end > CANDIDATE_TOPK && total_groups > 0 {
                                 r.programs.proj_indexer_wq_b.launch(
-                                    &[r.scratch.q_resid.buffer.ptr, r.weights.buf(&format!("{ip}.query_projection"))?.ptr, r.scratch.idx_q_raw.buffer.ptr],
+                                    &[r.scratch.q_resid.buffer.ptr, r.weights.weight(&format!("{ip}.query_projection"))?.ptr, r.scratch.idx_q_raw.buffer.ptr],
                                     &s_rows, r.stream.raw,
                                 )?;
                                 r.programs.proj_indexer_weights.launch(
-                                    &[r.scratch.y.buffer.ptr, r.weights.buf(&format!("{ip}.head_weight_projection"))?.ptr, r.scratch.idx_w_raw.buffer.ptr],
+                                    &[r.scratch.y.buffer.ptr, r.weights.weight(&format!("{ip}.head_weight_projection"))?.ptr, r.scratch.idx_w_raw.buffer.ptr],
                                     &s_rows, r.stream.raw,
                                 )?;
                                 r.programs.indexer_query_rope.launch(
@@ -729,7 +741,7 @@ impl<'a> Hy4Engine<'a> {
                                     r.scratch.lse_out.buffer.ptr,
                                     r.scratch.attn_scratch.buffer.ptr,
                                 ],
-                                &[Scalar::I32(rows as i32), Scalar::I32(1), Scalar::I64(SWA_RING_PAGES as i64), Scalar::I32(1)],
+                                &[Scalar::I32(rows as i32), Scalar::I32(1), Scalar::I64(total_pages as i64), Scalar::I32(1)],
                                 r.stream.raw,
                             )?;
                         }
@@ -747,7 +759,7 @@ impl<'a> Hy4Engine<'a> {
                         )?;
                         let o_out = if gpus == 1 { r.scratch.delta.buffer.ptr } else { r.scratch.delta_f32.buffer.ptr };
                         proj_o.launch(
-                            &[r.scratch.uv_out.buffer.ptr, r.weights.buf(&format!("{p}.self_attn.o_proj"))?.ptr, o_out],
+                            &[r.scratch.uv_out.buffer.ptr, r.weights.weight(&format!("{p}.self_attn.o_proj"))?.ptr, o_out],
                             &s_rows, r.stream.raw,
                         )?;
                     }
@@ -790,11 +802,11 @@ impl<'a> Hy4Engine<'a> {
 
                         if self.cfg.dense_layer[layer] {
                             r.programs.proj_dense_gate_up.launch(
-                                &[r.scratch.y.buffer.ptr, r.weights.buf(&format!("{p}.mlp.gate_proj"))?.ptr, r.scratch.ffn_gate.buffer.ptr],
+                                &[r.scratch.y.buffer.ptr, r.weights.weight(&format!("{p}.mlp.gate_proj"))?.ptr, r.scratch.ffn_gate.buffer.ptr],
                                 &s_rows, r.stream.raw,
                             )?;
                             r.programs.proj_dense_gate_up.launch(
-                                &[r.scratch.y.buffer.ptr, r.weights.buf(&format!("{p}.mlp.up_proj"))?.ptr, r.scratch.ffn_up.buffer.ptr],
+                                &[r.scratch.y.buffer.ptr, r.weights.weight(&format!("{p}.mlp.up_proj"))?.ptr, r.scratch.ffn_up.buffer.ptr],
                                 &s_rows, r.stream.raw,
                             )?;
                             r.programs.post_silu_split_dense.launch(
@@ -803,13 +815,13 @@ impl<'a> Hy4Engine<'a> {
                             )?;
                             let d_out = if gpus == 1 { r.scratch.delta.buffer.ptr } else { r.scratch.delta_f32.buffer.ptr };
                             r.programs.proj_dense_down.launch(
-                                &[r.scratch.ffn_act.buffer.ptr, r.weights.buf(&format!("{p}.mlp.down_proj"))?.ptr, d_out],
+                                &[r.scratch.ffn_act.buffer.ptr, r.weights.weight(&format!("{p}.mlp.down_proj"))?.ptr, d_out],
                                 &s_rows, r.stream.raw,
                             )?;
                         } else {
                             // LatentMoE: router + shared expert + routed experts (EXL3 K4 MUL1 onboarded or skipped)
                             r.programs.proj_router.launch(
-                                &[r.scratch.y.buffer.ptr, r.weights.buf(&format!("{p}.mlp.gate"))?.ptr, r.scratch.router_logits.buffer.ptr],
+                                &[r.scratch.y.buffer.ptr, r.weights.weight(&format!("{p}.mlp.gate"))?.ptr, r.scratch.router_logits.buffer.ptr],
                                 &s_rows, r.stream.raw,
                             )?;
                             let bias = r.weights.buf(&format!("{p}.mlp.gate.e_score_correction_bias"))?.ptr;
@@ -838,7 +850,7 @@ impl<'a> Hy4Engine<'a> {
                                 &s_rows, r.stream.raw,
                             )?;
                             r.programs.proj_latent_down.launch(
-                                &[r.scratch.y.buffer.ptr, r.weights.buf(&format!("{p}.mlp.routed_expert_down_proj"))?.ptr, r.scratch.latent_in.buffer.ptr],
+                                &[r.scratch.y.buffer.ptr, r.weights.weight(&format!("{p}.mlp.routed_expert_down_proj"))?.ptr, r.scratch.latent_in.buffer.ptr],
                                 &s_rows, r.stream.raw,
                             )?;
                             let grid = r.quantize_grid.blocks(rows, LATENT_H);
@@ -901,20 +913,20 @@ impl<'a> Hy4Engine<'a> {
 
                             // Shared expert
                             r.programs.proj_shared_gate_up.launch(
-                                &[r.scratch.y.buffer.ptr, r.weights.buf(&format!("{p}.mlp.shared_experts.gate_proj"))?.ptr, r.scratch.ffn_gate.buffer.ptr],
+                                &[r.scratch.y.buffer.ptr, r.weights.weight(&format!("{p}.mlp.shared_experts.gate_proj"))?.ptr, r.scratch.ffn_gate.buffer.ptr],
                                 &s_rows, r.stream.raw,
                             )?;
                             r.programs.proj_shared_gate_up.launch(
-                                &[r.scratch.y.buffer.ptr, r.weights.buf(&format!("{p}.mlp.shared_experts.up_proj"))?.ptr, r.scratch.ffn_up.buffer.ptr],
+                                &[r.scratch.y.buffer.ptr, r.weights.weight(&format!("{p}.mlp.shared_experts.up_proj"))?.ptr, r.scratch.ffn_up.buffer.ptr],
                                 &s_rows, r.stream.raw,
                             )?;
                             r.programs.post_silu_split_shared.launch(
                                 &[r.scratch.ffn_gate.buffer.ptr, r.scratch.ffn_up.buffer.ptr, r.scratch.ffn_act.buffer.ptr],
                                 &s_rows, r.stream.raw,
                             )?;
-                            let sh_out = if gpus == 1 { r.scratch.shared_out.buffer.ptr } else { r.scratch.delta_peer_f32.buffer.ptr };
+                            let sh_out = if gpus == 1 { r.scratch.shared_out.buffer.ptr } else { r.scratch.shared_f32.buffer.ptr };
                             r.programs.proj_shared_down.launch(
-                                &[r.scratch.ffn_act.buffer.ptr, r.weights.buf(&format!("{p}.mlp.shared_experts.down_proj"))?.ptr, sh_out],
+                                &[r.scratch.ffn_act.buffer.ptr, r.weights.weight(&format!("{p}.mlp.shared_experts.down_proj"))?.ptr, sh_out],
                                 &s_rows, r.stream.raw,
                             )?;
                         }
@@ -933,7 +945,7 @@ impl<'a> Hy4Engine<'a> {
                     for r in &self.ranks {
                         r.device.run(|| unsafe {
                             r.device.library.copy_d2d_async(r.scratch.routed_latent.buffer, r.scratch.delta.buffer, rows * LATENT_H * 2, r.stream.raw)?;
-                            r.device.library.copy_d2d_async(r.scratch.delta_f32.buffer, r.scratch.delta_peer_f32.buffer, rows * H * 4, r.stream.raw)
+                            r.device.library.copy_d2d_async(r.scratch.delta_f32.buffer, r.scratch.shared_f32.buffer, rows * H * 4, r.stream.raw)
                         })?;
                     }
                     self.reduce_tp2_f32_to_bf16(rows, H)?;
@@ -947,7 +959,7 @@ impl<'a> Hy4Engine<'a> {
                     let s_rows = [Scalar::I32(rows as i32)];
                     r.device.run(|| unsafe {
                         r.programs.proj_latent_up.launch(
-                            &[r.scratch.routed_latent.buffer.ptr, r.weights.buf(&format!("{p}.mlp.routed_expert_up_proj"))?.ptr, r.scratch.routed_out.buffer.ptr],
+                            &[r.scratch.routed_latent.buffer.ptr, r.weights.weight(&format!("{p}.mlp.routed_expert_up_proj"))?.ptr, r.scratch.routed_out.buffer.ptr],
                             &s_rows, r.stream.raw,
                         )?;
                         r.bf16_add.launch(r.scratch.routed_out.buffer, r.scratch.shared_out.buffer, r.scratch.delta.buffer, rows * H, r.stream.raw)
@@ -992,29 +1004,48 @@ impl<'a> Hy4Engine<'a> {
             return Ok(Vec::new());
         }
 
-        // Terminal hc_head + final RMSNorm + FP32 vocabulary head (sharded across TP2 if 2 GPUs).
+        // Terminal hc_head + final RMSNorm on rank 0 (head_rank = 0), replicated GPU-to-GPU to rank 1
+        // on TP2, followed by FP32 vocabulary head sharded across ranks.
         let vocab = self.cfg.vocab_size;
         let mut all_logits = vec![0f32; rows * vocab];
         let mut r_host_tiles: Vec<Vec<f32>> = vec![Vec::new(); gpus];
-        for (rank_idx, r) in self.ranks.iter().enumerate() {
-            let r_cur = if use_a { r.scratch.r_a.buffer } else { r.scratch.r_b.buffer };
-            let head = r.weights.head.as_ref().context("missing VocabularyHead")?;
-            let lm_head_w = r.weights.buf("lm_head")?;
-            r.device.run(|| unsafe {
-                r.programs.hc_head.launch(
+        {
+            let r0 = &mut self.ranks[0];
+            let r_cur = if use_a { r0.scratch.r_a.buffer } else { r0.scratch.r_b.buffer };
+            r0.device.run(|| unsafe {
+                r0.programs.hc_head.launch(
                     &[
                         r_cur.ptr,
-                        r.weights.buf("model.hc_head.hc_head_fn")?.ptr,
-                        r.weights.buf("model.hc_head.hc_head_scale")?.ptr,
-                        r.weights.buf("model.hc_head.hc_head_base")?.ptr,
-                        r.weights.buf("model.norm.weight")?.ptr,
-                        r.scratch.delta_norm.buffer.ptr,
-                        r.scratch.y.buffer.ptr,
+                        r0.weights.buf("model.hc_head.hc_head_fn")?.ptr,
+                        r0.weights.buf("model.hc_head.hc_head_scale")?.ptr,
+                        r0.weights.buf("model.hc_head.hc_head_base")?.ptr,
+                        r0.weights.buf("model.norm.weight")?.ptr,
+                        r0.scratch.delta_norm.buffer.ptr,
+                        r0.scratch.y.buffer.ptr,
                     ],
                     &[Scalar::I32(rows as i32)],
-                    r.stream.raw,
+                    r0.stream.raw,
                 )
             })?;
+            r0.peer_ready.record(&r0.stream)?;
+        }
+        if gpus == 2 {
+            let bytes = rows * H * 2;
+            let ev0 = self.ranks[0].peer_ready.raw;
+            let src0 = CuteafdDeviceBuffer { bytes, ..self.ranks[0].scratch.y.buffer };
+            self.ranks[1].device.run(|| unsafe {
+                self.ranks[1].device.library.cuda_stream_wait_event(self.ranks[1].stream.raw, ev0)?;
+                self.ranks[1].device.library.copy_peer_async(
+                    CuteafdDeviceBuffer { bytes, ..self.ranks[1].scratch.y.buffer },
+                    src0,
+                    bytes,
+                    self.ranks[1].stream.raw,
+                )
+            })?;
+        }
+        for (rank_idx, r) in self.ranks.iter().enumerate() {
+            let head = r.weights.head.as_ref().context("missing VocabularyHead")?;
+            let lm_head_w = r.weights.weight("lm_head")?;
             let local_v = r.weights.local_vocab;
             let mut rank_logits = vec![0f32; rows * local_v];
             for start in (0..rows).step_by(64) {
