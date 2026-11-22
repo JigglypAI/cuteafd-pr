@@ -165,9 +165,9 @@ def encode(name, weight, covariance, bits, device, metrics):
     return values
 
 
-def weights_project(overrides):
+def weights_project(overrides, projection=native_projection):
     def project(name, inputs, weight):
-        return native_projection(name, inputs, overrides.get(name, weight))
+        return projection(name, inputs, overrides.get(name, weight))
     return project
 
 
@@ -305,7 +305,8 @@ class Runner:
                         pair = metrics[-2:]
                         for row in pair:
                             matrix = reconstruction(values, name, row["bits"], weight.shape, self.device)
-                            gates.evaluated(row, inputs, weight, matrix, "last-16-rows-each-heldout-prompt")
+                            gates.evaluated(row, inputs, weight, matrix, "last-16-rows-each-heldout-prompt",
+                                            projection=self.forward.native_projection)
                         draft = layer.prefix.startswith("model.dfly_layers.")
                         # A K6-only drafter miss triggers the whole-drafter K8 alias.
                         fallback = any(not row["heldout_passed"] for row in pair
@@ -369,8 +370,9 @@ class Runner:
                             receipt=str(self.root / "gates" / f"{label}.json"))
 
     def source_group(self, prefix, *, exclude=()):
-        original = {self.recipe.source_tensor(name)[0] for name in self.core if name.startswith(prefix) and name not in self.native_modules}
         native = {name for name in self.header.specs if name.startswith(prefix)}
+        selected = {self.recipe.source_tensor(name)[0] for name in self.core if name not in self.native_modules}
+        original = native & selected
         native -= original | set(exclude) | self.recipe.ENGRAM_TABLES.keys()
         return self.header.source_entries(native), self.header.source_entries(original)
 
@@ -388,7 +390,7 @@ class Runner:
         layer = self.model.load_layer(index)
         p, a = layer.prefix, layer.prefix + "self_attn."
         overrides = {}
-        project = weights_project(overrides)
+        project = weights_project(overrides, self.forward.native_projection)
         capture = index in self.recipe.DFLY_TARGET_LAYERS
         moe = index > 0
         mlp = p + ("mlp.shared_experts." if moe else "mlp.")
@@ -463,7 +465,7 @@ class Runner:
                 for number, values in self.rows(mlp_stage, "inputs", start=start):
                     inputs = values["inputs"]
                     config = self.model.config
-                    scores, choice = self.forward.reference.routing_scores(inputs, layer.weights, config)
+                    scores, choice = self.model.routing_scores(inputs, layer)
                     ids, gamma = self.forward.reference.native_routes(scores, choice, config)
                     latent = (layer.project("mlp.routed_expert_down_proj", inputs, project)
                               if self.use_expert_latent else inputs)
@@ -492,7 +494,9 @@ class Runner:
                            sum(lengths[:held]), device=self.device, recover=True)
             witness = Routes(route_batches(held, len(lengths)), self.recipe.EXPERTS_PER_LAYER,
                              sum(lengths[held:]), device=self.device)
-            self.expert_witness = gates.ExpertWitness(witness, index, self.model.config.swiglu_limit, target_gates=self.target_gates)
+            self.expert_witness = gates.ExpertWitness(
+                witness, index, self.model.config.swiglu_limit, target_gates=self.target_gates,
+                projection=self.forward.native_projection)
             packed, extra_metrics, expert_stages, combined = self.experts(label, layer, spool)
             heldout_combined = self.expert_witness.combined
             del spool, witness
@@ -575,15 +579,15 @@ class Runner:
         limit = self.model.config.swiglu_limit
         for selection in rows.split(EXPERT_ROWS):
             chunk = spool.latent.index_select(0, selection)
-            g = native_projection(names[0], chunk, gate).clamp_max(limit)
-            u = native_projection(names[1], chunk, up).clamp(-limit, limit)
+            g = self.forward.native_projection(names[0], chunk, gate).clamp_max(limit)
+            u = self.forward.native_projection(names[1], chunk, up).clamp(-limit, limit)
             yield F.silu(g) * u
 
     def accumulate_expert(self, combined, rows, gamma, name, down, activations):
         finite = torch.ones((), dtype=torch.bool, device=self.device)
         for selection, coefficients, chunk in zip(
                 rows.split(EXPERT_ROWS), gamma.split(EXPERT_ROWS), activations, strict=True):
-            weighted = native_projection(name, chunk, down) * coefficients[:, None]
+            weighted = self.forward.native_projection(name, chunk, down) * coefficients[:, None]
             finite.logical_and_(torch.isfinite(weighted).all())
             # Every expert visits a token at most once. Add in ascending expert
             # order, as the stock reference and the legacy CPU reduction do.
@@ -691,7 +695,7 @@ class Runner:
         def anchors(start):
             for number, row in self.rows(incoming, start=start):
                 features = self.model.head_features(row["state"][-1:], weights)
-                bonus = self.model.head(features, project=weights_project(overrides),
+                bonus = self.model.head(features, project=weights_project(overrides, self.forward.native_projection),
                                         weight=weights["lm_head.weight"]).argmax()
                 state = drafter.start(bonus, features[0], self.embedding)
                 result = dict(state=state)
@@ -731,7 +735,7 @@ class Runner:
         p = layer.prefix
         a, mlp = p + "self_attn.", p + "mlp."
         overrides = {}
-        project = weights_project(overrides)
+        project = weights_project(overrides, self.forward.native_projection)
 
         def inputs(start=0):
             for number, values in self.rows(incoming, start=start):
@@ -799,7 +803,7 @@ class Runner:
                     weight = layer.weights[name.removeprefix(layer.prefix) + ".weight"]
                     alternatives[name] = reconstruction(self.stages.read_batch(stage, order), name, 6,
                                                         weight.shape, self.device)
-            project_k6 = weights_project(alternatives)
+            project_k6 = weights_project(alternatives, self.forward.native_projection)
             for number, v in self.rows(mlp_stage, start=start):
                 result = self.model.ffn_parts(v["inputs"], layer, "mlp.", project)
                 record = dict(state=v["residual"] + result)
