@@ -296,7 +296,8 @@ def rel_l2(actual, expected):
 
 
 def rope_ab(family, snapshot, out):
-    """Settle split-half vs adjacent-pair RoPE (MLA + indexer) and q_a/kv_a norm eps with real-weights NLL."""
+    """Settle split-half vs adjacent-pair RoPE (full 2x2 MLA x indexer grid) and q_a/kv_a norm eps with real-weights NLL."""
+    import time
     import torch
     import torch.nn.functional as F
     from checkpoint_tokenizer import load_tokenizer
@@ -333,15 +334,30 @@ def rope_ab(family, snapshot, out):
     long_arms = {
         "mla_interleaved_idx_interleaved": ("interleaved", "interleaved", 1e-6),
         "mla_interleaved_idx_split_half": ("interleaved", "split_half", 1e-6),
+        "mla_split_half_idx_interleaved": ("split_half", "interleaved", 1e-6),
+        "mla_split_half_idx_split_half": ("split_half", "split_half", 1e-6),
     }
-    states = {arm: [family.embed(ids)[0] for ids in token_lists] for arm in short_arms}
-    long_states = {arm: family.embed(long_ids)[0] for arm in long_arms}
-    family.release_outer()
-    topks = {arm: [None] * len(token_lists) for arm in short_arms}
-    long_topks = {arm: None for arm in long_arms}
-    for index in range(family.layers):
+    ckpt_path = out.parent / "rope-ab-state.pt"
+    if ckpt_path.exists():
+        saved = torch.load(ckpt_path, map_location=family.device, weights_only=True)
+        start_layer = int(saved["next_layer"])
+        states = saved["states"]
+        long_states = saved["long_states"]
+        topks = saved["topks"]
+        long_topks = saved["long_topks"]
+        print(f"Hy4 RoPE A/B resuming at layer {start_layer}/{family.layers}", flush=True)
+    else:
+        start_layer = 0
+        states = {arm: [family.embed(ids)[0] for ids in token_lists] for arm in short_arms}
+        long_states = {arm: family.embed(long_ids)[0] for arm in long_arms}
+        family.release_outer()
+        topks = {arm: [None] * len(token_lists) for arm in short_arms}
+        long_topks = {arm: None for arm in long_arms}
+    for index in range(start_layer, family.layers):
+        tick = time.monotonic()
         family.begin_layer_memory()
         module = family.load_layer(index, stream_experts=False)
+        load_s = time.monotonic() - tick
         w = module["weights"]
         for arm, (rope_style, idx_style, qa_eps) in short_arms.items():
             for j in range(len(token_lists)):
@@ -358,9 +374,19 @@ def rope_ab(family, snapshot, out):
             )
         family.release_layer(module)
         del module, w
-        if (index + 1) % 10 == 0 or index + 1 == family.layers:
-            print(f"Hy4 RoPE A/B layer {index + 1}/{family.layers} done", flush=True)
+        tot_s = time.monotonic() - tick
+        print(f"Hy4 RoPE A/B layer {index + 1}/{family.layers}: {tot_s:.1f}s (load {load_s:.1f}s)", flush=True)
         family.end_layer_memory("rope-ab", index)
+        if (index + 1) % 6 == 0 or index + 1 == family.layers:
+            tmp_ckpt = ckpt_path.with_suffix(".tmp")
+            torch.save({
+                "next_layer": index + 1,
+                "states": {a: [t.cpu() for t in v] for a, v in states.items()},
+                "long_states": {a: t.cpu() for a, t in long_states.items()},
+                "topks": {a: [t.cpu() if t is not None else None for t in v] for a, v in topks.items()},
+                "long_topks": {a: (t.cpu() if t is not None else None) for a, t in long_topks.items()},
+            }, tmp_ckpt)
+            tmp_ckpt.replace(ckpt_path)
     family.load_final()
     summary = {"prompts": [len(ids) for ids in token_lists], "long_prompt_tokens": len(long_ids),
                "arms": {}, "indexer_long_arms": {}}
@@ -387,18 +413,27 @@ def rope_ab(family, snapshot, out):
         }
     tail_start = family.config.index_topk
     long_targets = torch.tensor(long_ids[tail_start:], dtype=torch.long)
+    long_all_targets = torch.tensor(long_ids[1:], dtype=torch.long)
     for arm, (rope_style, idx_style, qa_eps) in long_arms.items():
-        # Score the 256 tail positions [2048..2303] where the DSA indexer actively prunes keys.
-        logits = family.final(long_states[arm][tail_start - 1:-1])
-        nll = float(F.cross_entropy(logits, long_targets, reduction="mean"))
-        top1 = float((logits.argmax(dim=-1) == long_targets).float().mean())
+        # Score both all positions [1..2303] and the 256 tail positions [2048..2303]
+        # where the DSA indexer actively prunes keys.
+        full_logits = family.final(long_states[arm][:-1])
+        all_nll = float(F.cross_entropy(full_logits, long_all_targets, reduction="mean"))
+        all_top1 = float((full_logits.argmax(dim=-1) == long_all_targets).float().mean())
+        tail_logits = full_logits[tail_start - 1:]
+        tail_nll = float(F.cross_entropy(tail_logits, long_targets, reduction="mean"))
+        tail_top1 = float((tail_logits.argmax(dim=-1) == long_targets).float().mean())
         summary["indexer_long_arms"][arm] = {
             "rope_style": rope_style, "indexer_rope_style": idx_style, "qa_kva_eps": qa_eps,
-            "tail_start": tail_start, "scored_tokens": len(long_targets), "tail_nll": nll, "tail_top1": top1,
+            "all_scored_tokens": len(long_all_targets), "all_nll": all_nll, "all_top1": all_top1,
+            "tail_start": tail_start, "tail_scored_tokens": len(long_targets),
+            "tail_nll": tail_nll, "tail_top1": tail_top1,
         }
     eps_delta = [rel_l2(a, b) for a, b in zip(logits_cache["interleaved_eps1e6"], logits_cache["interleaved_eps1e5"])]
     summary["eps_1e6_vs_1e5_interleaved_rel_l2"] = eps_delta
     family.release_final()
+    if ckpt_path.exists():
+        ckpt_path.unlink()
     layer_major.atomic_json(out, summary)
     print(json.dumps(summary, indent=2), flush=True)
     return summary

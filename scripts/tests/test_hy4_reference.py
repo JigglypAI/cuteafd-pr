@@ -144,5 +144,7 @@ def test_tensor_contract_matches_full_and_shared_indexer_layers(tmp_path):
     (tmp_path / "model.safetensors.index.json").write_text(json.dumps({"weight_map": {name: path.name}}))
     ckpt = model.Hy4Checkpoint(tmp_path)
     ckpt.check({name: shared_keys[name]})
+    assert torch.equal(ckpt.load(name, native=True), tensor)
+    assert torch.equal(ckpt.load(name), tensor.float())
     with pytest.raises(ValueError, match="shape"):
         ckpt.check({name: ([1, 1, 1], "BF16")})

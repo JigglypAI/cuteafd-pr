@@ -1,8 +1,10 @@
 """Shared IEEE-F32 arithmetic primitives for Hy4 and Hy4-flash references."""
 from __future__ import annotations
 
+import concurrent.futures
 import json
 import math
+import os
 from pathlib import Path
 import struct
 
@@ -15,6 +17,7 @@ OUTER_NAMES = ("model.embed_tokens.weight", "model.hc_head.hc_head_fn", "model.h
                "model.hc_head.hc_head_scale", "model.norm.weight", "lm_head.weight")
 EXPERTS = ("mlp.experts.gate_up_proj", "mlp.experts.down_proj")
 SPARSE = "deepseek_sparse_attention"
+_TORCH_DTYPES = {"BF16": torch.bfloat16, "F32": torch.float32, "I32": torch.int32}
 
 
 class Checkpoint:
@@ -22,7 +25,7 @@ class Checkpoint:
         self.snapshot = Path(snapshot)
         self.device = torch.device(device)
         self.index = json.loads((self.snapshot / "model.safetensors.index.json").read_bytes())["weight_map"]
-        self.headers, self.maps = {}, {}
+        self.headers, self.header_offsets, self.maps = {}, {}, {}
         self.read_bytes, self.read_seconds = 0, 0.
 
     def descriptor(self, name):
@@ -40,6 +43,7 @@ class Checkpoint:
             if max(entry["data_offsets"][1] for key, entry in header.items() if key != "__metadata__") + 8 + size != path.stat().st_size:
                 raise ValueError(f"incomplete Hy4 shard: {shard}")
             self.headers[shard] = header
+            self.header_offsets[shard] = 8 + size
         return self.headers[shard][name]
 
     def check(self, contract):
@@ -57,12 +61,55 @@ class Checkpoint:
             self.maps[shard] = safe_open(str(self.snapshot / shard), framework="pt", device="cpu")
         return self.maps[shard].get_tensor(name)
 
+    def read_tensor(self, name):
+        """Read a tensor directly via pread into a freshly allocated CPU tensor (avoids FUSE mmap stalls)."""
+        d = self.descriptor(name)
+        shard = self.index[name]
+        dtype = _TORCH_DTYPES[d["dtype"]]
+        first, last = d["data_offsets"]
+        nbytes = last - first
+        base = self.header_offsets[shard] + first
+        tensor = torch.empty(d["shape"], dtype=dtype)
+        mv = memoryview(tensor.view(torch.uint8).numpy().ravel())
+        fd = os.open(self.snapshot / shard, os.O_RDONLY)
+        try:
+            if nbytes < 64 * 2**20:
+                pos = 0
+                while pos < nbytes:
+                    chunk = os.pread(fd, min(16 * 2**20, nbytes - pos), base + pos)
+                    if not chunk:
+                        raise ValueError(f"short read on {name}")
+                    mv[pos:pos + len(chunk)] = chunk
+                    pos += len(chunk)
+            else:
+                stripe = 64 * 2**20
+
+                def read_stripe(start):
+                    end = min(start + stripe, nbytes)
+                    pos = start
+                    while pos < end:
+                        chunk = os.pread(fd, min(16 * 2**20, end - pos), base + pos)
+                        if not chunk:
+                            raise ValueError(f"short read on {name}")
+                        mv[pos:pos + len(chunk)] = chunk
+                        pos += len(chunk)
+
+                with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+                    list(pool.map(read_stripe, range(0, nbytes, stripe)))
+        finally:
+            os.close(fd)
+        return tensor
+
     def load(self, name, *, native=False):
         import time
         tick = time.monotonic()
-        value = self.raw(name)
+        value = self.read_tensor(name)
         self.read_bytes += value.numel() * value.element_size()
-        value = value.to(self.device, dtype=value.dtype if native else torch.float32, copy=True)
+        target_dtype = value.dtype if native else torch.float32
+        if self.device.type == "cpu" and value.dtype == target_dtype:
+            pass
+        else:
+            value = value.to(self.device, dtype=target_dtype, copy=True)
         if self.device.type == "cuda":
             torch.cuda.synchronize(self.device)
         self.read_seconds += time.monotonic() - tick
