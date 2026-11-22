@@ -429,6 +429,13 @@ def test_family_golden_roots_map_to_their_precision(family, fragment):
     assert fragment in packager.reference_precision(dict(root_arithmetic=root), dict())
 
 
+def test_hy4_full_root_maps_to_bf16_f32():
+    root = packager.hy4_full_root()
+    assert packager.reference_precision(dict(root_arithmetic=root), dict()) == 'BF16 checkpoint (F32 computation)'
+    _, arithmetic, source = packager.root_description({'root_arithmetic': root}, {'family': 'hy4'})
+    assert 'adjacent-pair RoPE' in arithmetic and 'adjacent-pair RoPE' in source
+
+
 def test_hy4_readme_distinguishes_f32_engram_qdq_from_stock_bf16():
     root = packager.hy4_root()
     _, arithmetic, _ = packager.root_description({'root_arithmetic': root}, {'family': 'hy4_flash'})

@@ -51,7 +51,7 @@ SEMANTICS = {
 }
 
 ROOT_ARITHMETIC = {
-    "source": "Transformers main 2f1bc5e321b9 pinned eager F32 text semantics with verified RoPE convention, ported independently",
-    "arithmetic": "BF16 checkpoint, IEEE F32 forward; F32 DSA indexer with IndexCache top-2048 reuse; "
+    "source": "Transformers main 2f1bc5e321b9 pinned eager F32 text semantics with adjacent-pair RoPE (PR 50589, settled by 78-layer A/B), ported independently",
+    "arithmetic": "BF16 checkpoint, IEEE F32 forward; adjacent-pair RoPE; F32 DSA indexer with IndexCache top-2048 reuse; "
                   "fixed-M128 projections and query tiles; vision, cache and DFly off.",
 }

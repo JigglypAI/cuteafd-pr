@@ -274,12 +274,18 @@ def hy4_root():
     return ROOT_ARITHMETIC
 
 
+def hy4_full_root():
+    from families.hy4.sources import ROOT_ARITHMETIC
+    return ROOT_ARITHMETIC
+
+
 ROOT_PRECISIONS = [
     (lambda: KIMI_F32_ROOT, KIMI_F32_PRECISION),
     (lambda: KIMI_K31_F32_ROOT, KIMI_F32_PRECISION),
     (lambda: V41_ROOT, V41_PRECISION),
     (lambda: golden_root('muse_spark'), 'BF16 checkpoint (F32 computation)'),
     (hy4_root, 'BF16 checkpoint (F32 computation; native Engram FP8 round-trip)'),
+    (hy4_full_root, 'BF16 checkpoint (F32 computation)'),
     (lambda: golden_root('mistral_large4'), 'official FP8 block-128 (no vendor BF16 master), computed in F32'),
 ]
 
