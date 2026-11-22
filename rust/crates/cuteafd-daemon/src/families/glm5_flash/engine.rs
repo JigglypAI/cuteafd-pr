@@ -2156,11 +2156,6 @@ impl<'a> GlmfEngine<'a> {
     fn publish_tp2_abort(&self) -> Result<()> {
         let mut failures = Vec::new();
         for exchange in self.exchange.iter().map(|exchange| exchange.as_ref()).chain(self.tp2.iter().map(|tp2| &tp2.routes)) {
-            match exchange.terminal_state() {
-                crate::shared::peer_split::TerminalState::Aborting
-                | crate::shared::peer_split::TerminalState::Drained => continue,
-                _ => {}
-            }
             if let Err(error) = exchange.publish_abort() { failures.push(format!("{error:#}")); }
         }
         if let Some(drafter) = &self.drafter {

@@ -11,6 +11,9 @@ use std::{path::Path, rc::Rc};
 /// The forward knows only normalized inputs/routes and the stream-ordered
 /// output. EXL3 K4 can supply the same boundary without editing layer math.
 pub(crate) trait Dispatcher {
+    /// A dispatcher whose launches queue peer waits; the engine's terminal path
+    /// publishes, drains and finishes it with every other wait owner (#2543).
+    fn terminal(&self) -> Option<&dyn crate::shared::peer_split::TerminalOwner> { None }
     fn wire_input(&self) -> bool { true }
     fn enqueue(&self, input: Buffer, ids: Buffer, weights: Buffer, output: Buffer,
         rows: usize, stream: &Stream<'_>) -> Result<()>;
@@ -86,7 +89,21 @@ struct SplitResident<'a> {
     // The shared owner holds raw stream handles through its terminal drain.
     _streams: [Rc<Stream<'a>>; 2],
 }
+/// Every layer of a TP2 group shares one owner; repeated terminal calls are idempotent.
+impl crate::shared::peer_split::TerminalOwner for SplitResident<'_> {
+    fn publish_abort(&self) -> Result<()> {
+        crate::shared::peer_split::TerminalOwner::publish_abort(&*self.owner.try_borrow()?.exchange)
+    }
+    fn drain_terminal(&self) -> Result<()> { self.owner.try_borrow()?.exchange.drain_terminal() }
+    fn finish_terminal(&self, drained: bool) {
+        match self.owner.try_borrow() {
+            Ok(owner) => crate::shared::peer_split::TerminalOwner::finish_terminal(&*owner.exchange, drained),
+            Err(error) => tracing::error!(%error, "Inkling TP2 owner borrowed during terminal finish"),
+        }
+    }
+}
 impl Dispatcher for SplitResident<'_> {
+    fn terminal(&self) -> Option<&dyn crate::shared::peer_split::TerminalOwner> { Some(self) }
     fn wire_input(&self) -> bool { self.owner.borrow().wire }
     fn enqueue(&self, input: Buffer, ids: Buffer, weights: Buffer, output: Buffer,
         rows: usize, stream: &Stream<'_>) -> Result<()> {

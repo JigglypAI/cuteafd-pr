@@ -266,21 +266,23 @@ impl<'a> Execution<'a> {
     pub fn terminate(&mut self) {
         if self.terminal { return; }
         self.terminal = true;
-        let drained = (|| {
-            if let Some(peer) = &self.peer { peer.exchange.publish_abort()?; }
-            self.link.terminal_quiesce()?;
-            if let Some(peer) = &self.peer {
-                peer.exchange.drain_compute()?;
-                peer.requests.cache.drain()?;
-            }
+        // Every owner that queues peer waits on either rank's streams: the head
+        // split, each TP2 expert owner and the TP2 drafter (#2543).
+        use crate::shared::peer_split::TerminalOwner;
+        let mut owners: Vec<&dyn TerminalOwner> = Vec::new();
+        if let Some(peer) = &self.peer { owners.push(&peer.exchange); }
+        owners.extend(self.local.iter().filter_map(|local| local.terminal()));
+        if let Some(draft) = &self.draft { owners.push(&*draft.drafter); }
+        let link = std::cell::RefCell::new(&mut self.link);
+        let drained = crate::shared::peer_split::terminal_sequence(&owners, || link.borrow_mut().terminal_quiesce(), || {
+            if let Some(peer) = &self.peer { peer.requests.cache.drain()?; }
             self.requests.decode.stream.drain()?;
             for owner in &self.requests.prefill { owner.stream.drain()?; }
             self.requests.cache.drain()?;
-            self.link.terminal_drain_copies()?;
-            self.link.terminal_release()?;
-            if let Some(peer) = &self.peer { peer.exchange.finish_terminal(true); }
-            Ok(())
-        })();
+            let mut link = link.borrow_mut();
+            link.terminal_drain_copies()?;
+            link.terminal_release()
+        });
         crate::shared::decode_graph::fatal_drain(drained, "Inkling request executor retirement");
         if let Some(graphs) = &mut self.graphs { graphs.bank.cache_clear_drained(); }
         if let Some(peer) = &mut self.peer { peer.graphs.bank.cache_clear_drained(); }
@@ -306,6 +308,11 @@ mod tests {
         assert!(source.contains("device::observe_completed("));
         assert!(!source.split("pub fn decode(").nth(1).unwrap().contains("begin_capture("));
         let terminal = source.split("pub fn terminate(").nth(1).unwrap();
+        // #2543: the head split, every TP2 expert owner and the drafter are aborted together.
+        for owner in ["owners.push(&peer.exchange)", "self.local.iter().filter_map(|local| local.terminal())",
+            "owners.push(&*draft.drafter)", "terminal_sequence(&owners"] {
+            assert!(terminal.contains(owner), "{owner}");
+        }
         assert!(terminal.find("terminal_quiesce").unwrap() < terminal.find("decode.stream.drain").unwrap());
         assert!(terminal.find("cache.drain").unwrap() < terminal.find("terminal_release").unwrap());
         assert!(!source.split("pub fn decode(").nth(1).unwrap().contains("for layer in"));

@@ -282,9 +282,9 @@ impl<'a> Exchange<'a> {
     fn publish_abort(&self) -> Result<()> {
         match self {
             Self::Pair { peer, .. } => peer.publish_abort(),
+            // Idempotent like the peer exchange: only a retained owner refuses.
             Self::Local(state) => {
-                ensure!(matches!(state.get(), TerminalState::Active | TerminalState::Drained),
-                    "Step-5 local execution is already terminal");
+                ensure!(state.get() != TerminalState::Retained, "Step-5 local execution is retained");
                 if state.get() == TerminalState::Active { state.set(TerminalState::Aborting); }
                 Ok(())
             }
@@ -845,10 +845,7 @@ impl<'e, 'a> MainExecution<'e, 'a> {
         let result = pair::teardown(&mut pair::Teardown {
             abort: || {
                 // The TP2 route exchange first: its waits block the same lane streams.
-                let routes = self.tp2.as_ref().map_or(Ok(()), |tp2| match tp2.pair.routes.terminal_state() {
-                    TerminalState::Active => tp2.pair.routes.publish_abort(),
-                    _ => Ok(()),
-                });
+                let routes = self.tp2.as_ref().map_or(Ok(()), |tp2| tp2.pair.routes.publish_abort());
                 let exchange = self.exchange.publish_abort();
                 routes.and(exchange)
             },
@@ -2283,6 +2280,8 @@ mod admission_tests {
         assert!(local.push_entry(0, std::ptr::null(), std::ptr::null_mut(), 1).is_err());
         assert!(local.wait_entry(0).is_err());
         assert!(local.send(0, 1, std::ptr::null(), 1).is_err());
+        local.publish_abort()?;
+        assert_eq!(local.terminal_state(), TerminalState::Aborting);
         local.publish_abort()?;
         assert_eq!(local.terminal_state(), TerminalState::Aborting);
         assert!(local.require_live().is_err());

@@ -105,12 +105,7 @@ impl<'a> RemoteBridge<'a> {
 
     pub fn require_live(&self) -> Result<()> { self.exchange.require_live() }
 
-    pub fn publish_abort(&self) -> Result<()> {
-        match self.exchange.terminal_state() {
-            TerminalState::Aborting | TerminalState::Drained => Ok(()),
-            _ => self.exchange.publish_abort(),
-        }
-    }
+    pub fn publish_abort(&self) -> Result<()> { self.exchange.publish_abort() }
 
     /// No owner is released on an unproved drain; the engine's fatal-drain
     /// boundary also retains every target graph and peer-exchange operand.
