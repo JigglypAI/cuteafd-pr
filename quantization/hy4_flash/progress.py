@@ -117,6 +117,8 @@ def main():
                       target_layers=78, committed_encodes=0, completed_drafter_layers=0, drafter_layers=5)
     if not events and status.get("status") != "blocked":
         parity = read(ROOT / "reference-forward-passed.json")
+        if full and parity.get("status") == "failed":
+            status.update(phase="reference preflight", status="blocked", error=parity.get("error"))
         if parity.get("status") == "passed":
             status.update(phase="production preparation")
         status.update(preflight_layers=len(parity.get("layers", [])), preflight_status=parity.get("status"))
