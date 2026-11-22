@@ -40,10 +40,12 @@ struct RankScratch<'a> {
     r_a: Allocation<'a>,
     r_b: Allocation<'a>,
     post: Allocation<'a>,
+    post_ffn: Allocation<'a>,
     y: Allocation<'a>,
     delta: Allocation<'a>,
     delta_f32: Allocation<'a>,
     delta_peer_f32: Allocation<'a>,
+    delta_sum_f32: Allocation<'a>,
     delta_norm: Allocation<'a>,
     // Engram
     engram_raw: Allocation<'a>,
@@ -128,10 +130,12 @@ impl<'a> RankScratch<'a> {
             r_a: alloc(max_rows * HC * H * 2, "r-a")?,
             r_b: alloc(max_rows * HC * H * 2, "r-b")?,
             post: alloc(max_rows * HC * 4, "post")?,
+            post_ffn: alloc(max_rows * HC * 4, "post-ffn")?,
             y: alloc(max_rows * H * 2, "y")?,
             delta: alloc(max_rows * H * 2, "delta")?,
             delta_f32: alloc(max_rows * H * 4, "delta-f32")?,
             delta_peer_f32: alloc(max_rows * H * 4, "delta-peer-f32")?,
+            delta_sum_f32: alloc(max_rows * H * 4, "delta-sum-f32")?,
             delta_norm: alloc(max_rows * H * 2, "delta-norm")?,
             engram_raw: alloc(max_rows * 16 * 96 * 2, "engram-raw")?,
             engram_masked: alloc(max_rows, "engram-masked")?,
@@ -455,24 +459,24 @@ impl<'a> Hy4Engine<'a> {
         for (idx, r) in self.ranks.iter().enumerate() {
             let wait_ev = waits[idx];
             r.device.run(|| {
-                // SAFETY: peer copy into delta_peer_f32 completed before wait_ev; buffers are disjoint.
+                // SAFETY: peer copy into delta_peer_f32 completed before wait_ev; all three buffers are disjoint.
                 unsafe {
                     r.device.library.cuda_stream_wait_event(r.stream.raw, wait_ev)?;
                     r.f32_add.launch(
                         r.scratch.delta_f32.buffer,
                         r.scratch.delta_peer_f32.buffer,
-                        r.scratch.delta_f32.buffer,
+                        r.scratch.delta_sum_f32.buffer,
                         elems,
                         r.stream.raw,
                     )?;
                 }
                 if let Some(linear) = egress_stem.and_then(|s| r.weights.native.get(s)) {
-                    linear.egress(rows, r.scratch.delta_f32.buffer, r.scratch.delta.buffer, r.stream.raw)
+                    linear.egress(rows, r.scratch.delta_sum_f32.buffer, r.scratch.delta.buffer, r.stream.raw)
                 } else {
-                    // SAFETY: delta_f32 sum finished in stream order before narrowing into disjoint delta.
+                    // SAFETY: delta_sum_f32 sum finished in stream order before narrowing into disjoint delta.
                     unsafe {
                         r.device.library.cuda_f32_to_bf16_async(
-                            r.scratch.delta_f32.buffer,
+                            r.scratch.delta_sum_f32.buffer,
                             r.scratch.delta.buffer,
                             elems,
                             r.stream.raw,
@@ -917,7 +921,7 @@ impl<'a> Hy4Engine<'a> {
                                 r.weights.buf(&format!("{p}.hc_mlp_layer.hc_pre.hc_base"))?.ptr,
                                 r.weights.buf(&format!("{p}.post_attention_layernorm.weight"))?.ptr,
                                 r_out.ptr,
-                                r.scratch.post.buffer.ptr,
+                                r.scratch.post_ffn.buffer.ptr,
                                 r.scratch.y.buffer.ptr,
                             ],
                             &s_rows, r.stream.raw,
@@ -1146,7 +1150,7 @@ impl<'a> Hy4Engine<'a> {
                         &s_rows, r.stream.raw,
                     )?;
                     r.programs.ihc_post.launch(
-                        &[r.scratch.delta_norm.buffer.ptr, r_in.ptr, r.scratch.post.buffer.ptr, r_out.ptr],
+                        &[r.scratch.delta_norm.buffer.ptr, r_in.ptr, r.scratch.post_ffn.buffer.ptr, r_out.ptr],
                         &s_rows, r.stream.raw,
                     )
                 })?;
