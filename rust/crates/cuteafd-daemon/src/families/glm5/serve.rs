@@ -664,7 +664,8 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
     let mut phases = [0f64; 8];
     let mut trace = Trace::open()?;
     if let Some(drafter) = drafter {
-        drafter.set_selector_readback(trace.is_some(), policy.length.control() == cuteafd_core::DraftControl::History);
+        { let (traced, scored) = crate::shared::draft::history::score_readback(policy.length.control());
+            drafter.set_selector_readback(traced && trace.is_some(), scored); }
     }
     let mut prefills = policy.decode_share.queue::<Prefill<'_>>()?;
     // A request waits here for KV (and before that, with images, in `media` for its features).

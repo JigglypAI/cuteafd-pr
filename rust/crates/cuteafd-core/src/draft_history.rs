@@ -47,14 +47,20 @@ pub enum HeadScore {
     Probability,
     /// Raw, uncalibrated probability from the drafter's token selector.
     CandidateProbability,
+    /// A candidate probability the policy calibrates and records but never keys on:
+    /// `history` keeps its position-history rule, exactly as for `None`.
+    RecordedProbability,
 }
 
 impl HeadScore {
     fn trained(self) -> bool { matches!(self, Self::Logit | Self::Probability) }
+    /// Every per-token score gets the online per-position calibration; only
+    /// trained heads key `history` on it unless a calibrated keep cut is set.
+    fn calibrated(self) -> bool { !matches!(self, Self::None) }
 
     fn cut(self) -> Option<f64> {
         match self {
-            Self::None => None,
+            Self::None | Self::RecordedProbability => None,
             Self::Logit | Self::Probability => Some(TRAINED_HEAD_KEEP_CUT),
             Self::CandidateProbability => Some(CANDIDATE_KEEP_CUT),
         }
@@ -289,6 +295,8 @@ struct Round {
 struct Planned {
     p: f64,
     score: Option<f64>,
+    /// The engine's online calibration of this position's per-token score.
+    calibrated: Option<f64>,
     accepted: u32,
     reached: u32,
     server: f64,
@@ -352,7 +360,7 @@ impl DraftHistory {
         Self {
             spec, control,
             server: [vec![Window::new(); spec.block], vec![Window::new(); spec.copy]],
-            platt: if spec.head.trained() { vec![Platt::new(); spec.block] } else { Vec::new() },
+            platt: if spec.head.calibrated() { vec![Platt::new(); spec.block] } else { Vec::new() },
             requests: HashMap::new(),
             stats: DraftHistoryStats {
                 length_histogram: vec![0; spec.block + spec.copy + 1],
@@ -386,7 +394,7 @@ impl DraftHistory {
         let denominator = f64::from(reached) + prior;
         // Unknown after the fade: stop here and explore this position.
         let p = if denominator == 0. { 0. } else { (f64::from(accepted) + prior * server) / denominator };
-        Planned { p, score: None,
+        Planned { p, score: None, calibrated: None,
             accepted, reached, server, server_reached: window.len as u32 }
     }
 
@@ -451,18 +459,28 @@ impl DraftHistory {
         planned.truncate(drafted);
         if let Some(cut) = self.spec.head.cut() {
             let scores = scores.unwrap_or_default();
-            if self.spec.head.trained() {
-                pending.head = scores[..scores.len().min(planned.len())].to_vec();
-            }
+            pending.head = scores[..scores.len().min(planned.len())].to_vec();
+            let trained = self.spec.head.trained();
             for (position, (entry, &score)) in planned.iter_mut().zip(scores).enumerate() {
-                entry.score = score.is_finite().then(|| {
-                    if self.spec.head.trained() { self.platt[position].apply(logit(self.spec.head, score)) }
-                    else { f64::from(score) }
-                });
+                if !score.is_finite() { continue; }
+                let calibrated = self.platt[position].apply(logit(self.spec.head, score));
+                entry.calibrated = Some(calibrated);
+                // `score` is what the keep test reads: a trained head's calibrated value,
+                // or the raw candidate probability (its calibration is recorded only).
+                entry.score = Some(if trained { calibrated } else { f64::from(score) });
             }
             if self.control == DraftControl::History {
                 pending.keep = planned.iter().take_while(|entry| entry.score.is_some_and(|p| p > cut)).count();
                 planned.truncate(pending.keep + 1);
+            }
+        }
+        if self.spec.head == HeadScore::RecordedProbability {
+            let scores = scores.unwrap_or_default();
+            pending.head = scores[..scores.len().min(planned.len())].to_vec();
+            for (position, (entry, &score)) in planned.iter_mut().zip(scores).enumerate() {
+                if score.is_finite() {
+                    entry.calibrated = Some(self.platt[position].apply(logit(self.spec.head, score)));
+                }
             }
         }
         pending.granted[NEURAL] = planned.len();
@@ -551,7 +569,7 @@ impl DraftHistory {
                     } else { (&mut self.stats.copy_reached, &mut self.stats.copy_accepted) };
                     reached[position] += 1;
                     accepted[position] += u64::from(hit);
-                    if track == NEURAL && self.spec.head.trained() {
+                    if track == NEURAL && self.spec.head.calibrated() {
                         if let Some(&score) = pending.head.get(position).filter(|score| score.is_finite()) {
                             self.platt[position].observe(logit(self.spec.head, score), hit);
                         }
@@ -581,7 +599,7 @@ impl DraftHistory {
                             server_reached: planned.server_reached,
                             explore: explores && if track == NEURAL { position >= pending.keep }
                                 else { position + 1 == pending.planned[COPY].len() && planned.p <= KEEP_CUT },
-                            head, calibrated: head.and(planned.score),
+                            head, calibrated: planned.calibrated,
                             outcome: (position < reached[track]).then_some(position < kept[track]) });
                     }
                 }
@@ -606,7 +624,7 @@ impl DraftHistory {
             self.server[track].iter().enumerate().map(|(position, window)| serde_json::json!({
                 "position": position + 1, "window_rate": window.rate(Self::cold(track)), "window_rounds": window.len,
                 "reached": reached[position], "accepted": accepted[position],
-                "calibration": (track == NEURAL && self.spec.head.trained())
+                "calibration": (track == NEURAL && self.spec.head.calibrated())
                     .then(|| self.platt[position].theta),
             })).collect()
         };
@@ -629,12 +647,12 @@ impl DraftHistory {
 fn logit(kind: HeadScore, score: f32) -> f64 {
     let score = f64::from(score);
     match kind {
-        HeadScore::Probability => {
+        HeadScore::Probability | HeadScore::CandidateProbability | HeadScore::RecordedProbability => {
             let p = score.clamp(1e-6, 1. - 1e-6);
             (p / (1. - p)).ln()
         }
         HeadScore::Logit => score.clamp(-30., 30.),
-        HeadScore::None | HeadScore::CandidateProbability => unreachable!("not a trained head"),
+        HeadScore::None => unreachable!("no per-token score"),
     }
 }
 
@@ -876,7 +894,7 @@ mod tests {
     }
 
     #[test]
-    fn raw_probability_uses_a_strict_cut_without_calibration_or_history() {
+    fn raw_probability_keeps_its_strict_cut_and_records_its_online_calibration() {
         let spec = DrafterSpec { block: 4, head: HeadScore::CandidateProbability, copy: 0 };
         let mut policy = DraftHistory::new(spec, DraftControl::History);
         for _ in 0..REQUEST_WINDOW {
@@ -885,13 +903,43 @@ mod tests {
             policy.observe(&[outcome(1, 1, 0)], false);
         }
         assert_eq!(policy.probability(1, 0), 0.);
+        // Only reached positions train: the first position saw eight misses, the rest nothing.
+        assert!(policy.platt[0].theta != [1., 0.] && policy.platt[1].theta == [1., 0.]);
         assert_eq!(policy.plan(&[(1, 4)], 64), [4]);
+        // The keep rule is unchanged: raw 0.6, 0.6 pass the 0.5 cut, raw 0.5 stops them.
         assert_eq!(policy.refine(1, 4, Some(&[0.6, 0.6, 0.5, 0.99])), 3);
         let trace = policy.observe(&[outcome(1, 3, 3)], true).unwrap();
         assert_eq!(trace.requests[0].keep, 2);
+        let first = &trace.requests[0].positions[0];
+        // The keep test read the raw 0.6; the trace records position 0's trained calibration,
+        // which eight misses at 0.1 moved off the identity (and pushes 0.1 itself lower).
+        assert!((first.score.unwrap() - 0.6).abs() < 1e-6);
+        assert!((first.calibrated.unwrap() - first.score.unwrap()).abs() > 1e-4);
+        assert!(policy.platt[0].apply(logit(HeadScore::CandidateProbability, 0.1)) < 0.1);
         let explore = &trace.requests[0].positions[2];
-        assert_eq!((explore.score, explore.calibrated, explore.outcome), (Some(0.5), None, Some(true)));
-        assert!(policy.platt.is_empty());
+        assert_eq!((explore.score, explore.outcome), (Some(0.5), Some(true)));
+        // An untrained position calibrates as the identity.
+        assert!((explore.calibrated.unwrap() - 0.5).abs() < 1e-9);
+        assert_eq!(explore.head, Some(0.5));
+    }
+
+    #[test]
+    fn recorded_probability_records_calibration_but_keeps_the_position_rule() {
+        let recorded = DrafterSpec { block: 4, head: HeadScore::RecordedProbability, copy: 0 };
+        let none = DrafterSpec { head: HeadScore::None, ..recorded };
+        let (mut a, mut b) = (DraftHistory::new(recorded, DraftControl::History), DraftHistory::new(none, DraftControl::History));
+        for round in 0..3 * REQUEST_WINDOW {
+            let (pa, pb) = (a.plan(&[(1, 4)], 64), b.plan(&[(1, 4)], 64));
+            assert_eq!(pa, pb, "round {round}");
+            let scores = [0.2, 0.9, 0.4, 0.7];
+            let (ka, kb) = (a.refine(1, pa[0], Some(&scores)), b.refine(1, pb[0], Some(&scores)));
+            assert_eq!(ka, kb, "round {round}");
+            let accepted = round % 3;
+            let (ta, _) = (a.observe(&[outcome(1, ka, accepted.min(ka))], true).unwrap(),
+                b.observe(&[outcome(1, kb, accepted.min(kb))], false));
+            assert!(ta.requests[0].positions.iter().all(|p| p.score.is_none() && p.calibrated.is_some()));
+        }
+        assert_eq!(a.stats().length_histogram, b.stats().length_histogram);
     }
 
     #[test]

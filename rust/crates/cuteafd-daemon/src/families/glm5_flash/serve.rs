@@ -869,7 +869,8 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
     let mut trace = crate::shared::speculation_trace::Trace::open()?;
     // DFlash2 selector features land only for the open trace's round records.
     if let Some(drafter) = drafter {
-        drafter.set_selector_readback(trace.is_some(), policy.length.control() == cuteafd_core::DraftControl::History);
+        { let (traced, scored) = crate::shared::draft::history::score_readback(policy.length.control());
+            drafter.set_selector_readback(traced && trace.is_some(), scored); }
     }
     let memory_boundaries = std::cell::RefCell::new(Vec::<serde_json::Value>::new());
     let first_prefill_seen = std::cell::Cell::new([false; 2]);
